@@ -71,7 +71,7 @@ import {
   TrackMode,
   trackableStart,
 } from "./branch-tracking.js";
-import { abbrevLengths, coreBool, worktreeModeTrust } from "./core-config.js";
+import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { OperationState } from "./merge-support.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { restoreWorktreeHard } from "./reset-command.js";
@@ -902,14 +902,11 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       const left = await this.getCurrentBranch();
       // the base's label: the branch left, else its commit uniquely abbreviated
       // (strbuf_add_unique_abbrev, DEFAULT_ABBREV)
-      const abbrev = left?.startsWith("refs/heads/")
-        ? undefined
-        : (await abbrevLengths(this.workingCopy, [headId])).get(headId);
       this.autostashSwitch = {
         label: autostashLabel(switchTo),
         base: left?.startsWith("refs/heads/")
           ? shortBranchName(left)
-          : headId.slice(0, abbrev ?? 7),
+          : await this.abbreviateObjectId(headId),
       };
     }
     if (local.length + untracked.length + untrackedRemoved.length + lostDirs.length > 0) {

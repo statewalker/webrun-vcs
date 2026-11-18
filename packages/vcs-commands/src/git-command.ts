@@ -23,6 +23,7 @@ import {
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import {
+  configLoadError,
   createIdAbbreviator,
   type IdAbbreviator,
   worktreeModeTrust,
@@ -36,9 +37,15 @@ import {
   withoutCrud,
 } from "./commands/git-ident.js";
 import { reflogLine } from "./commands/reflog-messages.js";
+import type { ArgumentFiles } from "./commands/revision-filenames.js";
 import { type ResolveOptions, RevisionResolver } from "./commands/revision-resolver.js";
 
-import { NoHeadError, NotACommitError, RefNotFoundError } from "./errors/index.js";
+import {
+  InvalidConfigError,
+  NoHeadError,
+  NotACommitError,
+  RefNotFoundError,
+} from "./errors/index.js";
 
 /**
  * Extended Trees interface with legacy method names for command compatibility.
@@ -399,10 +406,28 @@ export abstract class GitCommand<T> {
   }
 
   /**
-   * Mark command as no longer callable.
+   * Mark command as no longer callable. Commands do this as they start, so this is where
+   * the configuration is checked as git checks it on loading it (see
+   * {@link checkConfigOnLoad}).
    */
   protected setCallable(value: boolean): void {
     this.callable = value;
+    if (!value) this.checkConfigOnLoad();
+  }
+
+  private configChecked = false;
+
+  /**
+   * What every git command dies on before it runs, `status` included: configuration git's
+   * `git_default_config` refuses (an unknown `core.disambiguate`, see {@link configLoadError}).
+   *
+   * @throws InvalidConfigError with git's `error:` and `fatal:` lines
+   */
+  protected checkConfigOnLoad(): void {
+    if (this.configChecked) return;
+    this.configChecked = true;
+    const failure = configLoadError(this._workingCopy);
+    if (failure) throw new InvalidConfigError(failure.key, failure.message);
   }
 
   /**
@@ -447,7 +472,47 @@ export abstract class GitCommand<T> {
       workingCopy: this._workingCopy,
       objects: this._workingCopy.history?.objects,
       abbreviate: (ids) => this.idAbbreviator().lengths(ids),
+      ...this.worktreeSources(),
     });
+  }
+
+  /**
+   * The worktree as git's checks of revision-or-path arguments see it (`check_filename`),
+   * from the current directory `prefix` below the top.
+   */
+  protected argumentFiles(prefix = ""): ArgumentFiles {
+    const exists = this.worktreeSources().fileExists;
+    return {
+      inWorktree: exists !== undefined,
+      prefix,
+      exists: exists ?? (async () => false),
+    };
+  }
+
+  /** What a resolver checks in the worktree (git's `lstat` of an argument). */
+  protected worktreeSources(): {
+    fileExists?: (path: string) => Promise<boolean>;
+    worktreeHostPath?: string;
+  } {
+    let worktree: Worktree | undefined;
+    try {
+      worktree = this._workingCopy.worktree;
+    } catch {
+      // a bare repository's admin copy refuses its worktree (no work tree)
+      return {};
+    }
+    if (!worktree) return {};
+    const host = (worktree as { hostPath?: string }).hostPath;
+    return {
+      fileExists: async (path) => {
+        try {
+          return await worktree.exists(path);
+        } catch {
+          return false;
+        }
+      },
+      ...(host !== undefined ? { worktreeHostPath: host } : {}),
+    };
   }
 
   private abbreviator?: IdAbbreviator;

@@ -20,7 +20,7 @@ import type { ObjectId } from "@statewalker/vcs-core";
 import { MissingArgumentError, RefNotFoundError, RevisionError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { commitsBaseSource, MergeBaseGraph } from "./merge-bases.js";
-import { unknownRevisionMessage } from "./revision-range.js";
+import { verifyFilename } from "./revision-filenames.js";
 import type { RevisionResolver } from "./revision-resolver.js";
 
 /** What {@link RevParseCommand} found. */
@@ -113,12 +113,34 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
     return { objectId, warnings: resolver.warnings, lines: [] };
   }
 
-  /** `git rev-parse <args>...` (builtin/rev-parse.c: try_difference, try_parent_shorthands). */
+  /**
+   * `git rev-parse <args>...` (builtin/rev-parse.c: try_difference, try_parent_shorthands,
+   * then a revision, else a path): `--` and everything after it printed as they are (with a
+   * `--` an argument before it that names nothing is git's `bad revision`); without it the
+   * first argument that is no revision is printed as a path that must exist
+   * (`verify_filename`, diagnosed as a misspelt revision: `path 'x' does not exist in
+   * 'HEAD'`, `'../x' is outside repository at '<dir>'`), and the arguments after it are
+   * paths too (`x: no such path in the working tree.`).
+   */
   private async parseArgs(): Promise<RevParseResult> {
     const resolver = this.revisionResolver();
     resolver.cwdPrefix = this.prefix;
+    const files = this.argumentFiles(this.prefix);
+    const hasDashdash = this.args.includes("--");
     const lines: string[] = [];
+    // git's as_is: 1 after the first path (later ones verified), 2 after `--`
+    let asIs = 0;
     for (const arg of this.args) {
+      if (asIs) {
+        lines.push(arg);
+        if (asIs < 2) await verifyFilename(files, resolver, arg, false, lines);
+        continue;
+      }
+      if (arg === "--") {
+        asIs = 2;
+        lines.push(arg);
+        continue;
+      }
       if (await this.tryDifference(resolver, arg, lines)) continue;
       if (await this.tryParentShorthands(resolver, arg, lines)) continue;
       const reversed = arg.startsWith("^");
@@ -131,24 +153,23 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
         }
         throw error;
       }
-      if (id === undefined) {
-        // git prints the argument as a path, finds no such path and, before it dies, reads
-        // it again quietly (maybe_die_on_misspelt_object_name): what it prints regardless of
-        // GET_OID_QUIETLY (`error: object x is a tree, not a commit`) comes out twice
-        if (!(arg.startsWith(":") && !/^[A-Za-z0-9]/.test(arg.slice(1)))) {
-          try {
-            await resolver.resolve(arg, { quiet: true });
-          } catch {
-            // git exits quietly where this read dies
-          }
-        }
+      if (id !== undefined) {
+        lines.push(reversed ? `^${id}` : id);
+        continue;
+      }
+      if (hasDashdash) {
         throw new RevisionError(
           arg,
-          [...resolver.warnings, unknownRevisionMessage(arg)].join("\n"),
-          [...lines, arg],
+          [...resolver.warnings, `fatal: bad revision '${arg}'`].join("\n"),
+          lines,
         );
       }
-      lines.push(reversed ? `^${id}` : id);
+      // printed as a path, which must exist; before it dies git reads it again quietly
+      // (maybe_die_on_misspelt_object_name): what it prints regardless of GET_OID_QUIETLY
+      // (`error: object x is a tree, not a commit`) comes out twice
+      asIs = 1;
+      lines.push(arg);
+      await verifyFilename(files, resolver, arg, true, lines);
     }
     const first = lines[0] ?? "";
     return {

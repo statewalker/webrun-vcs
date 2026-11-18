@@ -80,3 +80,18 @@ export class StoreNotAvailableError extends GitApiError {
     this.storeName = storeName;
   }
 }
+
+/**
+ * Thrown where git dies on loading its configuration, before a command runs (an unknown
+ * `core.disambiguate`): git's `error:` and `fatal:` lines as the message.
+ */
+export class InvalidConfigError extends GitApiError {
+  /** The variable git refused */
+  readonly key: string;
+
+  constructor(key: string, message: string) {
+    super(message);
+    this.name = "InvalidConfigError";
+    this.key = key;
+  }
+}

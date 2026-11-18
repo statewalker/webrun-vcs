@@ -16,13 +16,12 @@ import {
 } from "../errors/merge-errors.js";
 import { NotACommitError, RefNotFoundError } from "../errors/ref-errors.js";
 import type { CommandCommits, CommandRefs, CommandTrees } from "../git-command.js";
-import { coreBool } from "./core-config.js";
+import { coreBool, createIdAbbreviator, type IdAbbreviator } from "./core-config.js";
 import { authorIdentOf, committerIdentOf } from "./git-ident.js";
 import { UNMERGED_FILES_MESSAGE } from "./merge-command.js";
 import { conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
 import {
-  abbrev,
   conflictsComment,
   FlatTreeCache,
   indexChangesFromTree,
@@ -111,12 +110,15 @@ export class PickSequencer {
   private readonly flats: FlatTreeCache;
   /** The clock of this run's identities and reflog lines, read again for each commit */
   private clock?: number;
+  /** git's find_unique_abbrev (`core.abbrev`) for labels, messages and the todo */
+  private readonly abbreviator: IdAbbreviator;
 
   constructor(
     private readonly deps: SequencerDeps,
     private readonly options: PickOptions,
   ) {
     this.flats = new FlatTreeCache(deps.trees);
+    this.abbreviator = createIdAbbreviator(deps.workingCopy);
   }
 
   private get name(): string {
@@ -244,7 +246,9 @@ export class PickSequencer {
     }
     const parentTreeId = parentId ? await deps.commits.getTree(parentId) : undefined;
     const subject = subjectOf(commit.message);
-    const label = `${abbrev(item.id)} (${subject})`;
+    // get_message: short_commit_name, repo_find_unique_abbrev with DEFAULT_ABBREV
+    const short = await this.abbreviator.abbreviate(item.id);
+    const label = `${short} (${subject})`;
     const parentLabel = parentId ? `parent of ${label}` : "(empty tree)";
     const [base, theirs, baseLabel, theirsLabel] =
       action === "pick"
@@ -312,7 +316,7 @@ export class PickSequencer {
         picked: [],
         output,
         message: [
-          `error: could not ${action === "pick" ? "apply" : "revert"} ${abbrev(item.id)}... ${subject}`,
+          `error: could not ${action === "pick" ? "apply" : "revert"} ${short}... ${subject}`,
           ...advice,
         ].join("\n"),
       };
@@ -549,7 +553,8 @@ export class PickSequencer {
     const lines: string[] = [];
     for (const item of todo) {
       const commit = await this.deps.commits.load(item.id);
-      lines.push(`${item.action} ${abbrev(item.id)} ${subjectOf(commit?.message ?? "")}\n`);
+      const short = await this.abbreviator.abbreviate(item.id);
+      lines.push(`${item.action} ${short} ${subjectOf(commit?.message ?? "")}\n`);
     }
     await this.deps.state.write("sequencer/todo", lines.join(""));
   }

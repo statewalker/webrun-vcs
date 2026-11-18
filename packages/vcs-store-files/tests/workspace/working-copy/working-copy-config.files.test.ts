@@ -392,8 +392,13 @@ describe("GitWorkingCopyConfig", () => {
       expect(config.get("remote.up.stream.url")).toBeUndefined();
     });
 
-    it("tolerates extra whitespace around the header parts", async () => {
+    it("refuses whitespace after `[` or before `]`, as git does", async () => {
+      // git: "fatal: bad config line 1 in file ..." (only blanks between the name and `"`)
       files.set(PATH, '[ remote   "origin" ]\n\turl = https://example.com/x.git\n');
+      await expect(new GitWorkingCopyConfig(files, PATH).load()).rejects.toThrow(
+        `bad config line 1 in file ${PATH.replace(/^\/+/, "")}`,
+      );
+      files.set(PATH, '[remote   "origin"]\n\turl = https://example.com/x.git\n');
       const config = new GitWorkingCopyConfig(files, PATH);
       await config.load();
 

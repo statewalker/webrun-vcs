@@ -172,17 +172,18 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     // 3. Create working tree interface
     const worktree = context.createWorktree(worktreePath);
 
-    // 4. Create stash store (refs/stash in the history's ref store, under its locks)
+    // 4. Create config
+    const config = await this.openConfig(repositoryPath);
+
+    // 5. Create stash store (refs/stash in the history's ref store, under its locks)
     const stash = createGitStashStore({
       history: context.history,
       staging: checkout.staging,
       worktree: worktree,
       getHead: async () => checkout.getHeadCommit(),
       getBranch: async () => checkout.getCurrentBranch(),
+      coreAbbrev: () => configString(config, "core.abbrev"),
     });
-
-    // 5. Create config
-    const config = await this.openConfig(repositoryPath);
 
     // 6. The repository's worktrees, when the context gives its FilesApi
     const worktrees = context.files
@@ -393,6 +394,9 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
     // Create working tree interface
     const worktree = context.createWorktree(worktreePath);
 
+    // Create config: the repository's, with this worktree's config.worktree
+    const config = await this.openConfig(worktreeGitDir, gitDir);
+
     // Create stash store (the main repository's refs/stash, as git shares it across worktrees)
     const stash = createGitStashStore({
       history: context.history,
@@ -400,10 +404,8 @@ export class GitWorkingCopyFactory implements WorkingCopyFactory {
       worktree: worktree,
       getHead: async () => checkout.getHeadCommit(),
       getBranch: async () => checkout.getCurrentBranch(),
+      coreAbbrev: () => configString(config, "core.abbrev"),
     });
-
-    // Create config: the repository's, with this worktree's config.worktree
-    const config = await this.openConfig(worktreeGitDir, gitDir);
 
     return new GitWorkingCopy({
       history: context.history,
@@ -433,4 +435,10 @@ export function createGitWorkingCopyFactory(
   setup: GitWorkingCopyFactorySetup = {},
 ): WorkingCopyFactory {
   return new GitWorkingCopyFactory(files, createContext, setup);
+}
+
+/** A configuration value as a string (a key without `=` reads as unset). */
+function configString(config: { get(key: string): unknown }, key: string): string | undefined {
+  const value = config.get(key);
+  return typeof value === "string" ? value : undefined;
 }

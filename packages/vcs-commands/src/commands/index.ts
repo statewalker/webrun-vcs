@@ -44,6 +44,7 @@ export * from "./reset-command.js";
 export * from "./rev-list-command.js";
 export * from "./rev-parse-command.js";
 export * from "./revert-command.js";
+export * from "./revision-filenames.js";
 export * from "./revision-range.js";
 export * from "./revision-resolver.js";
 export * from "./rm-command.js";

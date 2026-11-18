@@ -48,6 +48,50 @@ export function worktreeModeTrust(workingCopy: WorkingCopy, worktree: Worktree):
   };
 }
 
+/** The values git's `core.disambiguate` takes (`set_disambiguate_hint_config`). */
+export const DISAMBIGUATE_HINTS: readonly string[] = [
+  "none",
+  "commit",
+  "committish",
+  "tree",
+  "treeish",
+  "blob",
+];
+
+/**
+ * What git dies with on loading its configuration (`git_default_core_config`, which every
+ * command runs before it does anything, `status` included), else undefined: a
+ * `core.disambiguate` it does not know, the first bad value in the configuration's order
+ * (`error: unknown hint type for 'core.disambiguate': foo`, or for a variable without `=`
+ * `error: missing value for 'core.disambiguate'`, then `fatal: bad config variable
+ * 'core.disambiguate' in file '<file>' at line <n>`). A value with no file (set in memory)
+ * fails as git's command-line config does.
+ *
+ * @example
+ * ```typescript
+ * const message = configLoadError(workingCopy);
+ * if (message) throw new InvalidConfigError("core.disambiguate", message);
+ * ```
+ */
+export function configLoadError(
+  workingCopy: WorkingCopy,
+): { key: string; message: string } | undefined {
+  const key = "core.disambiguate";
+  for (const { text, file, line } of RemoteConfigStore.from(workingCopy).valuesWithOrigin(key)) {
+    if (text !== undefined && DISAMBIGUATE_HINTS.includes(text.toLowerCase())) continue;
+    const error =
+      text === undefined
+        ? `error: missing value for '${key}'`
+        : `error: unknown hint type for '${key}': ${text}`;
+    const fatal =
+      file !== undefined && line !== undefined
+        ? `fatal: bad config variable '${key}' in file '${file}' at line ${line}`
+        : `fatal: unable to parse '${key}' from command-line config`;
+    return { key, message: `${error}\n${fatal}` };
+  }
+  return undefined;
+}
+
 /**
  * `id` abbreviated as git prints it (`repo_find_unique_abbrev(id, DEFAULT_ABBREV)`): to
  * `core.abbrev` digits (auto: from the approximate object count, at least 7), lengthened until

@@ -891,8 +891,3 @@ export function subjectOf(message: string): string {
     .filter((l) => l.length > 0)
     .join(" ");
 }
-
-/** An abbreviated object id (git's default 7 hex digits). */
-export function abbrev(id: ObjectId): string {
-  return id.slice(0, 7);
-}

@@ -18,11 +18,14 @@
  */
 
 import {
+  DEFAULT_ABBREV_LENGTH,
+  findAbbrevLengths,
   formatPersonIdent,
   type History,
   isSymbolicRef,
   type ObjectId,
   type PersonIdent,
+  parseCoreAbbrev,
   type Refs,
 } from "@statewalker/vcs-core";
 import type {
@@ -70,6 +73,11 @@ export interface GitStashStoreOptions {
   author?: Omit<PersonIdent, "timestamp">;
   /** `core.filemode` / `core.symlinks`; defaults to what the worktree can represent */
   trust?: WorktreeModeTrust;
+  /**
+   * `core.abbrev`, read at each push, for the `<abbrev>` of the stash messages (git's
+   * find_unique_abbrev); unset is git's automatic length
+   */
+  coreAbbrev?: () => string | undefined;
 }
 
 /**
@@ -98,8 +106,10 @@ export class GitStashStore implements StashStore {
   private readonly defaultAuthor?: Omit<PersonIdent, "timestamp">;
   private readonly identity?: (role: "author" | "committer") => PersonIdent;
   private readonly trust?: WorktreeModeTrust;
+  private readonly coreAbbrev?: () => string | undefined;
 
   constructor(options: GitStashStoreOptions) {
+    this.coreAbbrev = options.coreAbbrev;
     this.history = options.history;
     this.staging = options.staging;
     this.worktree = options.worktree;
@@ -132,6 +142,17 @@ export class GitStashStore implements StashStore {
     }
   }
 
+  /** `id` as git's find_unique_abbrev (`core.abbrev`, unique among the stored objects) */
+  private async abbreviate(id: ObjectId): Promise<string> {
+    const objects = this.history.objects;
+    const start = parseCoreAbbrev(this.coreAbbrev?.()) ?? -1;
+    if (typeof objects?.list !== "function") {
+      return id.slice(0, start < 0 ? DEFAULT_ABBREV_LENGTH : start);
+    }
+    const length = (await findAbbrevLengths(objects, [id], start)).get(id);
+    return id.slice(0, length ?? DEFAULT_ABBREV_LENGTH);
+  }
+
   /**
    * Push current changes to stash, as `git stash push`: the stash commits, then
    * `refs/stash` updated with a reflog line whose message is the stash commit's
@@ -152,7 +173,7 @@ export class GitStashStore implements StashStore {
     const { author, committer } = this.identities();
     const headCommit = await this.history.commits.load(head).catch(() => undefined);
     const subject = headCommit?.message.split("\n")[0] ?? "";
-    const onHead = `${branch}: ${head.slice(0, 7)} ${subject}`;
+    const onHead = `${branch}: ${await this.abbreviate(head)} ${subject}`;
 
     // 1. The index tree, and its commit (parent: HEAD)
     const source = this.treesSource;

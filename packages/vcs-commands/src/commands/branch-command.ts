@@ -101,6 +101,7 @@ export class CreateBranchCommand extends GitCommand<Ref> {
    */
   async call(): Promise<Ref> {
     this.checkCallable();
+    this.checkConfigOnLoad();
 
     if (!this.name) {
       throw new InvalidRefNameError("", "Branch name is required");
@@ -444,6 +445,7 @@ export class RenameBranchCommand extends GitCommand<Ref> {
    */
   async call(): Promise<Ref> {
     this.checkCallable();
+    this.checkConfigOnLoad();
 
     if (!this.newName) {
       throw new InvalidRefNameError("", "New branch name is required");

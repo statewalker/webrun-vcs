@@ -458,12 +458,13 @@ export function formatGitDate(ident: PersonIdent): string {
 /**
  * git's `SQUASH_MSG`: `Squashed commit of the following:` and the commits `src` has that
  * `head` has not, newest first, as `git log` prints them. Several heads (an octopus) list
- * what any of them has.
+ * what any of them has. `abbreviate` shortens the parents of `Merge:` lines.
  */
 export async function squashMessage(
   commits: CommandCommits,
   headId: ObjectId,
   srcId: ObjectId | ObjectId[],
+  abbreviate: (id: ObjectId) => Promise<string>,
 ): Promise<string> {
   const reachable = new Set<ObjectId>();
   const stack = [headId];
@@ -493,7 +494,10 @@ export async function squashMessage(
     if (!commit) continue;
     out += `\ncommit ${id}\n`;
     if (commit.parents.length > 1) {
-      out += `Merge: ${commit.parents.map((p) => p.slice(0, 7)).join(" ")}\n`;
+      // pp_header: each parent through repo_find_unique_abbrev (DEFAULT_ABBREV)
+      const parents: string[] = [];
+      for (const p of commit.parents) parents.push(await abbreviate(p));
+      out += `Merge: ${parents.join(" ")}\n`;
     }
     out += `Author: ${commit.author.name} <${commit.author.email}>\n`;
     out += `Date:   ${formatGitDate(commit.author)}\n\n`;

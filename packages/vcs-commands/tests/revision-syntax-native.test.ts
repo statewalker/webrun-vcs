@@ -5,7 +5,6 @@
  * `@{<date>}` lookups land between them for both.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +17,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { approxidateCareful } from "../src/commands/git-date.js";
 import { Git, ResetMode, RevisionError } from "../src/index.js";
+import { craft, objectId } from "./craft-objects.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -578,18 +578,6 @@ describeGit("approxidate against native git, one timezone for both", () => {
 
 // ---------------------------------------------------------------- abbreviated ids (P4.25)
 
-/** git's object id of `type` with `body` (SHA-1 of the header and the bytes). */
-const objectId = (type: string, body: Buffer) =>
-  createHash("sha1").update(`${type} ${body.length}\0`).update(body).digest("hex");
-
-/** The first `make(i)` whose id (as `type`) starts with `prefix`. */
-function craft(type: string, prefix: string, make: (i: number) => Buffer): Buffer {
-  for (let i = 0; ; i++) {
-    const body = make(i);
-    if (objectId(type, body).startsWith(prefix)) return body;
-  }
-}
-
 const IDENT = "Interop Tester <interop@example.com> 1112911993 +0000";
 
 /**
@@ -1037,9 +1025,8 @@ describeGit("revision ranges and sets, native rev-parse and log", () => {
       } catch (error) {
         ours = { status: 128, out: "", err: `${(error as Error).message}\n` };
       }
-      // git names the worktree's absolute path, which ours does not know
-      const err = n.stderr.replace(/ at '[^']*'\n$/, "\n");
-      expect([rev, ours]).toEqual([rev, { status: n.status, out: n.stdout, err }]);
+      // git names the worktree's absolute path, as ours does (its FilesApi's root)
+      expect([rev, ours]).toEqual([rev, { status: n.status, out: n.stdout, err: n.stderr }]);
     }
   });
 });
