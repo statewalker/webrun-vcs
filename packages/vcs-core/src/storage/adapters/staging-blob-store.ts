@@ -24,6 +24,16 @@ export interface SpooledContent {
   dispose(): Promise<void>;
 }
 
+/** Options of `StagingBlobStore.putStaged`. */
+export interface PutStagedOptions {
+  /**
+   * The caller asked `isFresh` for the id `idOf` returns and got false just before: the store
+   * need not look for the object again and may store it at once (a concurrent writer of the
+   * same object is answered as ever: both hold the same bytes).
+   */
+  notFresh?: boolean;
+}
+
 export interface StagingBlobStore {
   /**
    * Store `bytes` under the id `idOf()` returns once the stream has ended. If
@@ -33,6 +43,7 @@ export interface StagingBlobStore {
   putStaged(
     bytes: AsyncIterable<Uint8Array>,
     idOf: () => string | Promise<string>,
+    options?: PutStagedOptions,
   ): Promise<{ id: string; stored: boolean }>;
   /**
    * Write `content` to temporary storage next to the objects and report its
@@ -42,9 +53,11 @@ export interface StagingBlobStore {
    */
   spool?(content: AsyncIterable<Uint8Array>): Promise<SpooledContent>;
   /**
-   * Whether `id` is stored and a write of it again would change nothing (git's
-   * `freshen_object` finding a fresh copy). Optional: with it, the object kernel hashes
-   * content held in memory first and skips the write of an object already there.
+   * Whether a write of `id` can be skipped (git's `odb_freshen_object`): it is stored, and
+   * fresh, or freshened by this call (a store that can renew an old copy's modification time
+   * does so here, as git's `utime`). False when it is absent, or old and not renewed: the write
+   * then stores it again. Optional: with it, the object kernel hashes content held in memory
+   * (and takes `putRaw`'s id) first and skips the write of an object already there.
    */
   isFresh?(id: string): Promise<boolean>;
   /** The stored bytes; empty if absent. */
@@ -170,11 +183,11 @@ function rawStorageQuarantine(
   };
 
   const store: StagingBlobStore = {
-    async putStaged(bytes, idOf) {
+    async putStaged(bytes, idOf, putOptions) {
       checkOpen();
       touch();
       try {
-        const r = await inner.putStaged(bytes, idOf);
+        const r = await inner.putStaged(bytes, idOf, putOptions);
         written.add(r.id);
         return r;
       } finally {
@@ -336,9 +349,10 @@ export function rawStorageStaging(
   async function putCollected(
     chunks: Uint8Array[],
     idOf: () => string | Promise<string>,
+    notFresh = false,
   ): Promise<{ id: string; stored: boolean }> {
     const id = await idOf();
-    if (await raw.has(id)) return { id, stored: false };
+    if (!notFresh && (await raw.has(id))) return { id, stored: false };
     await raw.store(
       id,
       (async function* () {
@@ -352,6 +366,7 @@ export function rawStorageStaging(
     move: NonNullable<RawStorage["move"]>,
     bytes: AsyncIterable<Uint8Array>,
     idOf: () => string | Promise<string>,
+    notFresh = false,
   ): Promise<{ id: string; stored: boolean }> {
     const tmp = tmpKey();
     inFlight.add(tmp);
@@ -359,7 +374,7 @@ export function rawStorageStaging(
     try {
       await raw.store(tmp, bytes);
       const id = await idOf();
-      if (await raw.has(id)) return { id, stored: false };
+      if (!notFresh && (await raw.has(id))) return { id, stored: false };
       moved = await move.call(raw, tmp, id);
       if (!moved) throw new Error(`could not move ${tmp} to ${id}`);
       return { id, stored: true };
@@ -370,7 +385,8 @@ export function rawStorageStaging(
   }
 
   return {
-    async putStaged(bytes, idOf) {
+    async putStaged(bytes, idOf, putOptions) {
+      const notFresh = putOptions?.notFresh === true;
       // Read up to the threshold; what ends there is stored from memory.
       const it = bytes[Symbol.asyncIterator]();
       const head: Uint8Array[] = [];
@@ -385,7 +401,7 @@ export function rawStorageStaging(
         head.push(r.value);
         size += r.value.length;
       }
-      if (ended) return putCollected(head, idOf);
+      if (ended) return putCollected(head, idOf, notFresh);
       let settled = false;
       async function* rest() {
         let done = false;
@@ -401,10 +417,10 @@ export function rawStorageStaging(
       }
       const remaining = rest();
       try {
-        if (raw.move) return await putMoving(raw.move, remaining, idOf);
+        if (raw.move) return await putMoving(raw.move, remaining, idOf, notFresh);
         const chunks: Uint8Array[] = [];
         for await (const chunk of remaining) chunks.push(chunk);
-        return await putCollected(chunks, idOf);
+        return await putCollected(chunks, idOf, notFresh);
       } catch (error) {
         // A store that failed before reading never started `rest`, whose finally would release
         // the source: release it here (a suspended `rest` is closed, which runs its finally).
@@ -460,6 +476,8 @@ export function rawStorageStaging(
       for (let r = await chunks.next(); !r.done; r = await chunks.next()) yield r.value;
     },
     has: (id) => raw.has(id),
+    // content addressed and never expired: a stored id needs no write
+    isFresh: (id) => raw.has(id),
     remove: (id) => raw.remove(id),
     list: () => raw.keys(),
     listPrefix: (prefix) => rawKeysWithPrefix(raw, prefix),

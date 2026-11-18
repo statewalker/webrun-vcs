@@ -457,7 +457,7 @@ describe("P2.6 review: unreachable packed objects get the grace period (repack -
     expect(await b.looseStorage.has(topic.commit)).toBe(true);
   });
 
-  it("an object of a pack older than the freshen window is written loose again", async () => {
+  it("an object of a pack older than the freshen window renews the pack's mtime (git's freshen_packed_object)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gc-freshen-"));
     dirs.push(dir);
     const files = createNodeFilesApi({ rootDir: dir });
@@ -468,9 +468,29 @@ describe("P2.6 review: unreachable packed objects get the grace period (repack -
     // in a young pack: the write is skipped (git's freshen_packed_object)
     await fresh.history.blobs.store([enc.encode("old content\n")]);
     expect(await fresh.looseStorage.has(blob)).toBe(false);
-    // in a pack older than an hour: written loose, so a gc keeps it as a young object
+    // in a pack older than an hour: the pack is touched, so a gc keeps it as a young pack
     const t = new Date(Date.now() - 2 * 3600_000);
     for (const name of await packNames(files, ".pack")) utimesSync(join(dir, PACK_DIR, name), t, t);
+    const later = await open(files, false);
+    const before = Date.now() - 1000;
+    await later.history.blobs.store([enc.encode("old content\n")]);
+    expect(await later.looseStorage.has(blob)).toBe(false);
+    for (const name of await packNames(files, ".pack")) {
+      const mtime = (await files.stats(`${PACK_DIR}/${name}`))?.lastModified ?? 0;
+      expect(mtime).toBeGreaterThanOrEqual(before);
+    }
+  });
+
+  it("an object of an old pack is written loose again where the FilesApi cannot set times", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gc-freshen-"));
+    dirs.push(dir);
+    const files = createNodeFilesApi({ rootDir: dir });
+    const b = await open(files);
+    const { blob } = await commit(b, "main", "a.txt", "old content\n");
+    await repack(b);
+    const t = new Date(Date.now() - 2 * 3600_000);
+    for (const name of await packNames(files, ".pack")) utimesSync(join(dir, PACK_DIR, name), t, t);
+    (files as { touch?: unknown }).touch = undefined;
     const later = await open(files, false);
     await later.history.blobs.store([enc.encode("old content\n")]);
     expect(await later.looseStorage.has(blob)).toBe(true);
@@ -644,7 +664,10 @@ describe("P2.6 second review: writes freshen old loose objects (git's freshen_lo
       const s = await stats(p);
       return s && p.includes(unknown.blob.slice(2)) ? { ...s, lastModified: undefined } : s;
     };
-    await unknown.b.history.blobs.store([enc.encode("unknown age\n")]);
+    // the store reads through its own lstat-cache view: opened without one, it sees the stub
+    (unknown.files as { withLstatCache?: unknown }).withLstatCache = undefined;
+    const reopened = await open(unknown.files, false);
+    await reopened.history.blobs.store([enc.encode("unknown age\n")]);
     unknown.files.stats = stats;
     expect(Math.abs(statSync(unknown.path).mtimeMs - old)).toBeLessThan(1000);
   });

@@ -155,7 +155,10 @@ export async function createGitFilesBackend(
   // zlib files for gc and repack.
   const looseStorage = new FileRawStorage(files, objectsDir);
   const { freshenMaxAgeMs } = options;
-  const staging = filesStagingStore(files, objectsDir, { freshenMaxAgeMs });
+  const staging = filesStagingStore(files, objectsDir, {
+    freshenMaxAgeMs,
+    cacheDirectoryChecks: true,
+  });
   const looseOnly = createGitObjects(staging);
   const packs = await openPackSet(files, packDir, {
     externalBase: (id) => looseOnly.get(id),

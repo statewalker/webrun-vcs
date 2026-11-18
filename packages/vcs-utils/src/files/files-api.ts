@@ -114,6 +114,17 @@ export interface FilesApi {
    * with `code` "EISDIR" when a directory is at `path`.
    */
   append?(path: string, content: Iterable<Uint8Array> | AsyncIterable<Uint8Array>): Promise<void>;
+
+  /**
+   * Set the modification time of the existing file at `path` to `mtimeMs` (default: now),
+   * leaving its content alone, as `utime(2)` does; false when it was not set: no file is there
+   * (a directory, a missing path, a symbolic link, which is never followed), or the storage
+   * behind a composite FilesApi cannot set times. A caller then writes the file again. git renews the mtime of
+   * an object it was about to write again so (`freshen_loose_object`, `freshen_packed_object`),
+   * keeping a concurrent gc from pruning it. Optional: storage that cannot set times (a
+   * browser's) leaves it out, and callers rewrite the file instead.
+   */
+  touch?(path: string, mtimeMs?: number): Promise<boolean>;
 }
 
 /**

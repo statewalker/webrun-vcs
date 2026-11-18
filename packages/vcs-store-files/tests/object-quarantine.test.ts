@@ -143,7 +143,7 @@ describe("files quarantine freshens objects the repository already has (git's fr
     });
   }
 
-  it("an object only in an old pack, re-pushed, gets a fresh loose copy", async () => {
+  it("an object only in an old pack, re-pushed, renews the pack's mtime (git's freshen_packed_object)", async () => {
     const { join } = await import("node:path");
     const { rmSync } = await import("node:fs");
     const repo = await nodeRepo();
@@ -154,12 +154,14 @@ describe("files quarantine freshens objects the repository already has (git's fr
       await makeOld(join(repo.dir, `.git/objects/pack/pack-${installed.packId}.pack`));
       const loose = join(repo.dir, ".git/objects", id.slice(0, 2), id.slice(2));
       rmSync(loose);
-      expect(await repo.packs.freshen(id)).toBe(false);
+      const packPath = join(repo.dir, `.git/objects/pack/pack-${installed.packId}.pack`);
+      expect(await ageHours(packPath)).toBeGreaterThan(1);
       const r = await importPack(repo.objects, await packOf(repo.objects, [id]), {
         quarantine: true,
       });
       await r.quarantine?.commit();
-      expect(await ageHours(loose)).toBeLessThan(1);
+      expect(await ageHours(packPath)).toBeLessThan(1);
+      expect(await repo.objects.has(id)).toBe(true);
     } finally {
       repo.cleanup();
     }

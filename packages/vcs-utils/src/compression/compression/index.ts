@@ -28,6 +28,7 @@ import {
 import { collectStream, streamFromBuffer } from "./utils.js";
 import { deflateWeb, inflateWeb } from "./web-streams.js";
 
+export * from "./deflate-sync.js";
 export * from "./pako-compression.js";
 export * from "./stream-inflater.js";
 // Re-export types

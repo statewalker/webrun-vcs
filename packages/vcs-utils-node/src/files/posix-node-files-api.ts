@@ -22,8 +22,13 @@ import {
   constants as fsConstants,
   fstatSync,
   lstatSync,
+  lutimesSync,
   openSync,
   readSync,
+  renameSync,
+  unlinkSync,
+  write as writeCb,
+  writeSync,
 } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
@@ -162,8 +167,11 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
    * link: `BeyondSymlinkError` if one is. A missing component ends the check.
    */
   private async realNoLinks(virtualPath: string): Promise<string> {
-    const segments = this.segments(virtualPath);
     const real = this.real(virtualPath);
+    // a verified parent was verified with its ancestors (in order, here and in mkdirs; a listed
+    // directory was reached so), and the cache is dropped whole: nothing more to check
+    if (this.verified?.size && this.verified.has(nodePath.dirname(real))) return real;
+    const segments = this.segments(virtualPath);
     let current = this.root;
     for (let i = 0; i < segments.length - 1; i++) {
       current = nodePath.join(current, segments[i]);
@@ -180,6 +188,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
 
   /** Creates `real` and its missing parents below the root, never through a link. */
   private async mkdirs(real: string, virtualPath: string): Promise<void> {
+    if (this.verified?.has(real)) return;
     const relative = nodePath.relative(this.root, real);
     if (relative === "") return;
     let current = this.root;
@@ -338,25 +347,20 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     const real = await this.realNoLinks(path);
     if (real === this.root) return false;
     await this.mkdirs(nodePath.dirname(real), path);
-    let handle: fs.FileHandle;
+    let fd: number | undefined;
     try {
-      handle = await fs.open(fsPath(real), "wx", 0o666);
+      fd = openNewSync(real);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-      throw error;
+      // a directory the batch cache vouched for is gone: check the path afresh, once
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !this.verified) throw error;
+      this.verified.clear();
+      await this.realNoLinks(path);
+      await this.mkdirs(nodePath.dirname(real), path);
+      fd = openNewSync(real);
     }
-    let done = false;
-    try {
-      await writeBatched(handle, content);
-      await handle.close();
-      done = true;
-      return true;
-    } finally {
-      if (!done) {
-        await handle.close().catch(() => {});
-        await fs.unlink(fsPath(real)).catch(() => {});
-      }
-    }
+    if (fd === undefined) return false;
+    await fillNewFile(fd, real, content);
+    return true;
   }
 
   /**
@@ -512,15 +516,42 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   override async move(source: string, target: string): Promise<boolean> {
     const from = await this.realNoLinks(source);
     const to = await this.realNoLinks(target);
-    if (!(await lstatOrUndefined(from))) return false;
-    this.verified?.clear();
+    const stat = await lstatOrUndefined(from);
+    if (!stat) return false;
+    // a directory moved takes verified directories with it; a file moved changes none, unless
+    // it lands on one (which the rename refuses) or a directory vanished (ENOENT, below)
+    if (stat.isDirectory()) this.verified?.clear();
     try {
       await this.mkdirs(nodePath.dirname(to), target);
-      await fs.rename(fsPath(from), fsPath(to));
+      // a metadata call, synchronous as the lstats are
+      renameSync(fsPath(from), fsPath(to));
       return true;
     } catch (error) {
       if (error instanceof BeyondSymlinkError) throw error;
+      this.verified?.clear();
       return false;
+    }
+  }
+
+  /**
+   * `utimes(2)` of the entry itself (`lutimes`: a link at the path is never followed, and
+   * refused): its modification and access times set to `mtimeMs` (default: now), its content
+   * left alone. False when no regular file is there.
+   */
+  async touch(path: string, mtimeMs?: number): Promise<boolean> {
+    const real = await this.realNoLinks(path);
+    if (!(await lstatOrUndefined(real))?.isFile()) return false;
+    const time = mtimeMs === undefined ? new Date() : new Date(mtimeMs);
+    try {
+      // a metadata call, synchronous as the lstats are
+      lutimesSync(fsPath(real), time, time);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR" || code === "EPERM" || code === "EACCES") {
+        return false;
+      }
+      throw error;
     }
   }
 
@@ -662,6 +693,78 @@ async function bigintLstatOrUndefined(
 
 /** Reads of at most this many bytes are synchronous (`readSmallSync`). */
 const SYNC_READ_MAX = 64 * 1024;
+/** Bytes gathered per write of a new file; the last write is synchronous (`fillNewFile`). */
+const SYNC_WRITE_MAX = 64 * 1024;
+
+/** Writes all of `bytes` to `fd` at its current position, synchronously. */
+function writeAllSync(fd: number, bytes: Uint8Array): void {
+  let offset = 0;
+  while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+}
+
+/** Writes all of `bytes` to `fd` at its current position, through libuv's thread pool. */
+async function writeAll(fd: number, bytes: Uint8Array): Promise<void> {
+  let offset = 0;
+  while (offset < bytes.length) {
+    offset += await new Promise<number>((resolve, reject) =>
+      writeCb(fd, bytes, offset, bytes.length - offset, null, (error, written) =>
+        error ? reject(error) : resolve(written),
+      ),
+    );
+  }
+}
+
+/**
+ * Opens a new file `real` exclusively (`O_CREAT | O_EXCL`, so nothing there, a link
+ * included, is written through), synchronously; undefined when anything is at the path.
+ */
+function openNewSync(real: string): number | undefined {
+  try {
+    return openSync(fsPath(real), "wx", 0o666);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return undefined;
+    throw error;
+  }
+}
+
+/**
+ * Writes `content` into the new file open at `fd` and closes it; a failure part way removes
+ * the file. Content is gathered into 64 KiB writes; the last write (all of a small file: a
+ * loose object, a lock file) and the close are synchronous calls, as small reads are
+ * (`readSmallSync`): round trips through libuv's thread pool cost far more than writing a few
+ * kilobytes to the page cache.
+ */
+async function fillNewFile(fd: number, real: string, content: Content): Promise<void> {
+  let done = false;
+  try {
+    const batch: Uint8Array[] = [];
+    let batched = 0;
+    const joined = () =>
+      batch.length === 1 ? (batch[0] as Uint8Array) : Buffer.concat(batch, batched);
+    for await (const chunk of content) {
+      if (chunk.length === 0) continue;
+      batch.push(chunk);
+      batched += chunk.length;
+      if (batched >= SYNC_WRITE_MAX) {
+        await writeAll(fd, joined());
+        batch.length = 0;
+        batched = 0;
+      }
+    }
+    if (batched > 0) writeAllSync(fd, joined());
+    done = true;
+  } finally {
+    closeSync(fd);
+    if (!done) {
+      try {
+        unlinkSync(fsPath(real));
+      } catch {
+        // already gone
+      }
+    }
+  }
+}
+
 /** `readSmallSync`'s answer for a file that grew past `SYNC_READ_MAX` since it was looked at. */
 const LARGE = Symbol("large");
 
