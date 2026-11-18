@@ -14,6 +14,8 @@ import {
   IndexFile,
   type IndexStatUpdate,
   type IndexVersion,
+  keepMatchingEntries,
+  keepMatchingMode,
   MergeStage,
   type MergeStageValue,
   type RacyCheck,
@@ -336,13 +338,17 @@ export class FileStagingStore implements Staging {
   async readTree(
     trees: Trees,
     treeId: ObjectId,
-    options?: { keepResolveUndo?: boolean },
+    options?: { keepResolveUndo?: boolean; keepMatching?: boolean | "flags" },
   ): Promise<void> {
+    const before = this._entries;
     this._entries = [];
     // a whole tree replaces the index: git's read-tree and unpack-trees drop resolve-undo
     if (!options?.keepResolveUndo) this.indexFile.clearResolveUndo();
     await this.addTreeRecursive(trees, treeId, "", MergeStage.MERGED);
     this.sortEntries();
+    if (options?.keepMatching) {
+      this._entries = keepMatchingEntries(before, this._entries, keepMatchingMode(options));
+    }
   }
 
   private async addTreeRecursive(

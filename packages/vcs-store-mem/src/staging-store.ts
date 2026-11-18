@@ -13,6 +13,8 @@ import type {
 } from "@statewalker/vcs-working-tree";
 import {
   EntriesAsRead,
+  keepMatchingEntries,
+  keepMatchingMode,
   MergeStage,
   type RacyCheck,
   smudgeRacilyClean,
@@ -269,6 +271,7 @@ export class MemoryStagingStore implements Staging {
   }
 
   async readTree(trees: Trees, treeId: ObjectId, options?: ReadTreeOptions): Promise<void> {
+    const before = options?.keepMatching ? this._entries : undefined;
     if (!options?.keepExisting) {
       this._entries = [];
     }
@@ -278,6 +281,9 @@ export class MemoryStagingStore implements Staging {
 
     await this.addTreeRecursive(trees, treeId, prefix, stage);
     this.sortEntries();
+    if (before) {
+      this._entries = keepMatchingEntries(before, this._entries, keepMatchingMode(options));
+    }
     this.updateTime = Date.now();
   }
 

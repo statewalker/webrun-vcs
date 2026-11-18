@@ -338,3 +338,64 @@ export function parseCacheTree(data: Uint8Array): CacheTree {
   if (at !== data.length) throw new Error("TREE extension: trailing bytes");
   return root;
 }
+
+/**
+ * Check a cache-tree against the index it is written with, for tests and fsck: every valid
+ * node must count the tree entries of its directory (stage-0 entries, intent-to-add ones
+ * excepted) and name a stored tree holding exactly them (path, mode as the store reads it,
+ * object id). A valid node may name a tree stored with other modes (100664) than the index
+ * computes, as git keeps such a tree. Returns one line per problem; none: the cache-tree
+ * describes the index.
+ *
+ * @example
+ * ```typescript
+ * expect(await verifyCacheTree(trees, staging.getCacheTree(), staging.entryList())).toEqual([]);
+ * ```
+ */
+export async function verifyCacheTree(
+  trees: Pick<Trees, "load">,
+  tree: CacheTree | undefined,
+  entries: readonly {
+    path: string;
+    mode: number;
+    objectId: ObjectId;
+    stage: number;
+    intentToAdd?: boolean;
+    skipWorktree?: boolean;
+  }[],
+): Promise<string[]> {
+  const problems: string[] = [];
+  if (!tree) return problems;
+  const inTree = entries.filter((e) => e.stage === 0 && !(e.intentToAdd && !e.skipWorktree));
+  const flatten = async (id: ObjectId, prefix: string, out: string[]): Promise<boolean> => {
+    const list = await trees.load(id);
+    if (!list) return false;
+    for await (const e of list) {
+      const path = prefix ? `${prefix}/${e.name}` : e.name;
+      if (e.mode === FileMode.TREE) {
+        if (!(await flatten(e.id, path, out))) return false;
+      } else out.push(`${e.mode.toString(8)} ${e.id} ${path}`);
+    }
+    return true;
+  };
+  const check = async (node: CacheTree, dir: string): Promise<void> => {
+    if (node.entryCount >= 0) {
+      const under = inTree.filter((e) => (dir ? e.path.startsWith(`${dir}/`) : true));
+      if (under.length !== node.entryCount) {
+        problems.push(`'${dir}': counts ${node.entryCount} entries, the index has ${under.length}`);
+      }
+      const stored: string[] = [];
+      if (!node.id || !(await flatten(node.id, dir, stored))) {
+        problems.push(`'${dir}': tree ${node.id ?? "(none)"} is not stored`);
+      } else {
+        const expected = under.map((e) => `${e.mode.toString(8)} ${e.objectId} ${e.path}`);
+        if (stored.join("\n") !== expected.join("\n")) {
+          problems.push(`'${dir}': tree ${node.id} does not hold the index's entries`);
+        }
+      }
+    }
+    for (const sub of node.subtrees) await check(sub.tree, dir ? `${dir}/${sub.name}` : sub.name);
+  };
+  await check(tree, "");
+  return problems;
+}

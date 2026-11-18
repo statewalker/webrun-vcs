@@ -14,7 +14,7 @@ import {
 import { GitCommand } from "../git-command.js";
 import { AddCommand } from "./add-command.js";
 import { withoutCrud } from "./git-ident.js";
-import { OperationState } from "./merge-support.js";
+import { OperationState, writeIndexAsTree } from "./merge-support.js";
 import {
   CleanupMode,
   cleanupWith,
@@ -499,8 +499,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
       // --only mode: combine parent tree with specified paths from staging
       treeId = await this.buildOnlyTree(parents[0]);
     } else {
-      // Normal mode: use full staging area
-      treeId = await this.staging.writeTree(this.trees);
+      // Normal mode: use full staging area; as git's prepare_index, the index is written
+      // again with a fully valid cache-tree (cache_tree_update, which keeps the valid nodes:
+      // a stored subtree no edit touched stays the one stored)
+      // (an index another writer replaced since it was read is not overwritten)
+      treeId = await writeIndexAsTree(this.staging, this.trees, { keepChangedIndex: true });
     }
 
     // Check for empty commit (a merge may record HEAD's tree)

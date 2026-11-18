@@ -281,6 +281,7 @@ export class GitStaging implements Staging {
   }
 
   async readTree(trees: Trees, treeId: ObjectId, options?: ReadTreeOptions): Promise<void> {
+    const before = options?.keepMatching ? this._entries : undefined;
     if (!options?.keepExisting) {
       this._entries = [];
       // a whole tree replaces the index: git's read-tree and unpack-trees drop resolve-undo
@@ -292,6 +293,9 @@ export class GitStaging implements Staging {
 
     await this.addTreeRecursive(trees, treeId, prefix, stage);
     this.sortEntries();
+    if (before) {
+      this._entries = keepMatchingEntries(before, this._entries, keepMatchingMode(options));
+    }
   }
 
   private async addTreeRecursive(
@@ -748,6 +752,41 @@ function comparePaths(a: string, b: string): number {
 }
 
 // ========== Helper Functions ==========
+
+/** What `ReadTreeOptions.keepMatching` keeps of an unchanged entry. */
+export function keepMatchingMode(options?: ReadTreeOptions): "entry" | "flags" {
+  return options?.keepMatching === "flags" ? "flags" : "entry";
+}
+
+/**
+ * `entries` (a tree read into the index) as unpack-trees' one-way merge leaves them over the
+ * index `before` (see `ReadTreeOptions.keepMatching`): an unchanged stage-0 entry is the old
+ * entry itself, a changed one keeps the old skip-worktree bit.
+ */
+export function keepMatchingEntries<T extends StagingEntry>(
+  before: readonly T[],
+  entries: readonly T[],
+  keep: "entry" | "flags" = "entry",
+): T[] {
+  const old = new Map<string, T>();
+  for (const e of before) if (e.stage === MergeStage.MERGED) old.set(e.path, e);
+  if (old.size === 0) return entries.slice();
+  return entries.map((e) => {
+    const o = e.stage === MergeStage.MERGED ? old.get(e.path) : undefined;
+    if (!o) return e;
+    if (o.mode === e.mode && o.objectId === e.objectId) {
+      if (keep === "entry") return o;
+      if (!o.skipWorktree && !o.assumeValid && !o.intentToAdd) return e;
+      return {
+        ...e,
+        ...(o.skipWorktree ? { skipWorktree: true } : {}),
+        ...(o.assumeValid ? { assumeValid: true } : {}),
+        ...(o.intentToAdd ? { intentToAdd: true } : {}),
+      };
+    }
+    return o.skipWorktree ? { ...e, skipWorktree: true } : e;
+  });
+}
 
 /**
  * Store tree entries using Trees interface.

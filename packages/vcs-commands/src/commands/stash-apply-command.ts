@@ -1,5 +1,4 @@
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
-import { mergeLines } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
@@ -20,10 +19,12 @@ import { GitCommand } from "../git-command.js";
 import { type ContentMergeStrategy, MergeStrategy } from "../results/merge-result.js";
 import type { StashApplyResult } from "../results/stash-result.js";
 import { StashApplyStatus } from "../results/stash-result.js";
+import { ApplyCommand } from "./apply/index.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { DiffCommand } from "./diff-command.js";
 import { conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
-import { type OrtConflict, ortMerge, ortResultEntries, readBlob } from "./ort-merge.js";
+import { type OrtConflict, ortMerge, ortResultEntries } from "./ort-merge.js";
 import { STASH_REF } from "./stash-list-command.js";
 import {
   planTreeRestore,
@@ -315,7 +316,11 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
         a.size !== b.size || [...a].some(([p, e]) => !sameEntry(e, b.get(p)));
       if (differs(stashIndex, base) && differs(stashIndex, ours)) {
         // the stash's index change applied to the index as `git apply --cached` applies it
-        const applied = await this.applyCached(base, ours, stashIndex);
+        const applied = await this.applyCached(
+          stashHeadCommitObj.tree,
+          stashIndexCommitObj?.tree ?? stashHeadCommitObj.tree,
+          ours,
+        );
         if (applied.errors.length > 0) {
           throw new StashApplyFailedError(
             stashId,
@@ -607,83 +612,42 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
   }
 
   /**
-   * `git apply --cached` of the change `from` -> `to` onto `index`: a path the change adds
-   * must not be in the index, a path it deletes or modifies must be there; a deletion needs
-   * the index to hold the deleted version, a modification applies where the index holds
-   * the old version or its edit merges cleanly with the index's (the patch's context
-   * matches). Errors as git's apply reports them.
+   * The stash's index change applied to the index as git's `do_apply_stash` does it:
+   * `git diff-tree --binary` of the stash's base and index trees, applied with
+   * `git apply --cached` (no merge: a hunk whose context the index no longer has fails).
+   * Errors as git's apply reports them.
    */
   private async applyCached(
-    from: Map<string, CheckedEntry>,
+    fromTree: ObjectId,
+    toTree: ObjectId,
     index: Map<string, CheckedEntry>,
-    to: Map<string, CheckedEntry>,
   ): Promise<{ result: Map<string, CheckedEntry>; errors: string[]; failed: string[] }> {
-    const result = new Map(index);
-    const errors: string[] = [];
-    const failed: string[] = [];
-    const paths = [...new Set([...from.keys(), ...to.keys()])].sort(compareBytes);
-    for (const path of paths) {
-      const b = from.get(path);
-      const t = to.get(path);
-      if (sameEntry(b, t)) continue;
-      const current = index.get(path);
-      if (!b && t) {
-        if (current) {
-          errors.push(`error: ${path}: already exists in index`);
-          failed.push(path);
-        } else result.set(path, t);
-        continue;
-      }
-      if (!current) {
-        errors.push(`error: ${path}: does not exist in index`);
-        failed.push(path);
-        continue;
-      }
-      if (b && !t) {
-        if (current.objectId !== b.objectId) {
-          errors.push(`error: ${path}: patch does not apply`);
-          failed.push(path);
-        } else result.delete(path);
-        continue;
-      }
-      if (!b || !t) continue;
-      // the mode: the patch's new mode where it changes it, else the index's
-      const mode = b.mode !== t.mode ? t.mode : current.mode;
-      if (current.objectId === b.objectId || b.objectId === t.objectId) {
-        result.set(path, {
-          objectId: b.objectId === t.objectId ? current.objectId : t.objectId,
-          mode,
-        });
-        continue;
-      }
-      const merged = mergeLines(
-        await readBlob(this.blobs, b.objectId),
-        await readBlob(this.blobs, current.objectId),
-        await readBlob(this.blobs, t.objectId),
-        { oursLabel: "", theirsLabel: "" },
-      );
-      if (merged.conflicts > 0) {
-        errors.push(`error: ${path}: patch does not apply`);
-        failed.push(path);
-        continue;
-      }
-      result.set(path, { objectId: await this.blobs.store([merged.content]), mode });
+    const diff = await new DiffCommand(this.workingCopy)
+      .setOldTree(fromTree)
+      .setNewTree(toTree)
+      .setRenames(false)
+      .setOptions({ binaryPatch: true, fullIndex: true, srcPrefix: "a/", dstPrefix: "b/" })
+      .callFormats(["patch"]);
+    const result = new Map<string, CheckedEntry>();
+    if (!diff.bytes || diff.bytes.length === 0)
+      return { result: new Map(index), errors: [], failed: [] };
+    const temporary = new Map<string, { mode: number; objectId: string }>();
+    for (const [path, e] of index) temporary.set(path, { mode: e.mode, objectId: e.objectId });
+    const applied = await new ApplyCommand(this.workingCopy)
+      .setTemporaryIndex(temporary)
+      .addPatch(diff.bytes)
+      .call();
+    if (applied.exitCode !== 0) {
+      const errors = applied.errors.split("\n").filter((l) => l.length > 0);
+      const failed = errors
+        .map((l) => /^error: (.*): patch does not apply$/.exec(l)?.[1])
+        .filter((p): p is string => p !== undefined);
+      return { result, errors, failed };
     }
-    // an added path cannot sit beneath a file of the index, nor over a directory of it
-    for (const path of paths) {
-      if (from.has(path) || !to.has(path) || !result.has(path)) continue;
-      const parts = path.split("/");
-      const underFile = parts.slice(1).some((_, k) => result.has(parts.slice(0, k + 1).join("/")));
-      const overDir = [...result.keys()].some((p) => p.startsWith(`${path}/`));
-      if (underFile || overDir) {
-        errors.push(
-          `error: '${path}' appears as both a file and as a directory`,
-          `error: unable to add cache entry for ${path}`,
-        );
-        failed.push(path);
-      }
+    for (const [path, e] of applied.index ?? temporary) {
+      result.set(path, { mode: e.mode, objectId: e.objectId });
     }
-    return { result, errors, failed };
+    return { result, errors: [], failed: [] };
   }
 
   /** Stores a flat path map as a tree. */

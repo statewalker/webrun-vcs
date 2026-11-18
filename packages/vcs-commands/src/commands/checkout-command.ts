@@ -43,7 +43,9 @@ import {
 import { parseGitBool } from "@statewalker/vcs-utils";
 import {
   attributesIndexOf,
+  cacheTreeOfTree,
   entryStatOf,
+  type StagingEntry,
   UpdateStagingEntry,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
@@ -72,19 +74,20 @@ import {
   trackableStart,
 } from "./branch-tracking.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
-import { OperationState } from "./merge-support.js";
+import { OperationState, updateIndexCacheTree } from "./merge-support.js";
 import { reflogMessages } from "./reflog-messages.js";
-import { restoreWorktreeHard } from "./reset-command.js";
+import { checkFlaggedEntries, restoreWorktreeHard } from "./reset-command.js";
 import { removeBranchState } from "./sequencer-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
 import { StashCreateCommand } from "./stash-create-command.js";
 import { STASH_REF } from "./stash-list-command.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import {
+  entryNotUptodate,
   findInTheWay,
+  flaggedEntryDiffers,
   overwriteMessage,
   pruneEmptyParents,
-  worktreeDiffers,
 } from "./worktree-overwrite-checks.js";
 import { refuseIfCheckedOut, shortBranchName } from "./worktree-support.js";
 
@@ -646,16 +649,40 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     if (!treeId) throw new RefNotFoundError(headId, `unable to read tree (${headId})`);
     const trackedBefore = new Set<string>();
     for await (const entry of this.staging.entries()) trackedBefore.add(entry.path);
-    await this.staging.readTree(this.trees, treeId);
-    await this.staging.write();
     const worktree = this.worktreeAccess;
+    // unpack-trees' one-way merge: unchanged entries keep their flags, a skip-worktree file
+    // the tree keeps is left alone
+    const { keptOut } = await checkFlaggedEntries(
+      {
+        trees: this.trees,
+        staging: this.staging,
+        workingCopy: this.workingCopy,
+        worktree,
+      },
+      treeId,
+    );
+    await this.staging.readTree(this.trees, treeId, { keepMatching: "flags" });
+    // reset_head's prime_cache_tree: the index is HEAD's tree
+    this.staging.setCacheTree?.(await cacheTreeOfTree(this.trees, treeId));
+    await this.staging.write();
     if (worktree) {
       await restoreWorktreeHard(
         { trees: this.trees, blobs: this.blobs, workingCopy: this.workingCopy, worktree },
         treeId,
         trackedBefore,
+        keptOut,
       );
     }
+  }
+
+  /**
+   * The index a switch leaves, written as git's `merge_working_tree` writes it: with the
+   * cache-tree updated (`cache_tree_update` with `WRITE_TREE_REPAIR`, as unpack-trees and
+   * checkout do before the write).
+   */
+  private async writeSwitchedIndex(): Promise<void> {
+    await updateIndexCacheTree(this.staging, this.trees);
+    await this.staging.write();
   }
 
   /** This checkout's settings on a new command (without `merge`). */
@@ -824,6 +851,10 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       if (!this.force && sameSide(h, t)) continue;
       const i = index.get(path);
       if (this.force) {
+        // oneway_merge leaves a skip-worktree entry the target keeps (and its file) alone
+        if ((i as { skipWorktree?: boolean } | undefined)?.skipWorktree && sameSide(i, t)) {
+          continue;
+        }
         if (!sameSide(i, t) || t) switched.push(path);
         continue;
       }
@@ -843,7 +874,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       if (
         i !== undefined &&
         worktree &&
-        (await worktreeDiffers(worktree, path, i, trust, this.staging.getUpdateTime()))
+        (await entryNotUptodate(worktree, path, i, trust, this.staging.getUpdateTime()))
       ) {
         local.push(path);
         continue;
@@ -892,6 +923,27 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           ref: null,
           message: lines.map((l) => l.line).join("\n"),
         };
+      }
+    }
+    // a forced checkout is a one-way reset, but an entry whose flags cheat (assume-unchanged,
+    // skip-worktree) is still checked: one the target changes or deletes over a changed file
+    // is refused (verify_uptodate_1), as git's "Entry '<path>' not uptodate. Cannot merge."
+    if (this.force && !keepAll && worktree) {
+      const indexTime = this.staging.getUpdateTime();
+      for (const [path, i] of index) {
+        const e = i as StagingEntry;
+        if (!e.assumeValid && !e.skipWorktree) continue;
+        if (sameSide(i, target.get(path))) continue;
+        if (await flaggedEntryDiffers(worktree, path, e, trust, indexTime)) {
+          return {
+            status: CheckoutStatus.CONFLICTS,
+            updated: [],
+            removed: [],
+            conflicts: [path],
+            ref: null,
+            message: `error: Entry '${path}' not uptodate. Cannot merge.`,
+          };
+        }
       }
     }
     // git 2.55+ `checkout -m`: a two-way merge that fails (local changes, untracked files
@@ -991,14 +1043,16 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // git's switch writes a new index (unpack-trees): no resolve-undo records survive it
     this.staging.clearResolveUndo?.();
     if (targetTreeId && this.force) {
-      await this.staging.readTree(this.trees as any, targetTreeId);
-      await this.staging.write();
+      // oneway_merge: an unchanged entry keeps its flags and stat, a changed one its
+      // skip-worktree bit
+      await this.staging.readTree(this.trees as any, targetTreeId, { keepMatching: "flags" });
+      await this.writeSwitchedIndex();
     } else if (this.force && !keepAll) {
       // forced onto the empty tree (switch --orphan --discard-changes): an empty index
       const editor = this.staging.createEditor();
       for (const path of index.keys()) editor.remove(path);
       await editor.finish();
-      await this.staging.write();
+      await this.writeSwitchedIndex();
     } else if (switched.length > 0) {
       const editor = this.staging.createEditor();
       for (const path of switched) {
@@ -1008,17 +1062,20 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           continue;
         }
         const stats = worktree ? await worktree.getEntry(path) : undefined;
+        // merged_entry: the replaced entry's skip-worktree bit migrates over
+        const old = index.get(path) as { skipWorktree?: boolean } | undefined;
         editor.upsert({
           path,
           objectId: t.objectId,
           mode: t.mode,
           ...entryStatOf(stats ?? {}),
+          ...(old?.skipWorktree ? { skipWorktree: true } : {}),
         });
       }
       await editor.finish();
-      await this.staging.write();
+      await this.writeSwitchedIndex();
     } else {
-      await this.staging.write();
+      await this.writeSwitchedIndex();
     }
 
     // HEAD's reflog line (git's update_refs_for_switch): "checkout: moving from <branch

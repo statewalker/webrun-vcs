@@ -19,6 +19,8 @@ import type {
 } from "@statewalker/vcs-working-tree";
 import {
   EntriesAsRead,
+  keepMatchingEntries,
+  keepMatchingMode,
   MergeStage,
   type RacyCheck,
   smudgeRacilyClean,
@@ -379,6 +381,22 @@ export class KVStaging implements Staging {
   }
 
   async readTree(trees: Trees, treeId: ObjectId, options?: ReadTreeOptions): Promise<void> {
+    const before: StagingEntry[] = [];
+    if (options?.keepMatching) for await (const e of this.entries()) before.push(e);
+    await this.readTreeEntries(trees, treeId, options);
+    if (before.length === 0) return;
+    // unpack-trees' one-way merge: unchanged entries keep their flags and stat data
+    const read: StagingEntry[] = [];
+    for await (const e of this.entries()) read.push(e);
+    const kept = keepMatchingEntries(before, read, keepMatchingMode(options));
+    for (let i = 0; i < kept.length; i++) if (kept[i] !== read[i]) await this.setEntry(kept[i]);
+  }
+
+  private async readTreeEntries(
+    trees: Trees,
+    treeId: ObjectId,
+    options?: ReadTreeOptions,
+  ): Promise<void> {
     if (!options?.keepExisting) {
       await this.clear();
     }

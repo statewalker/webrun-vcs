@@ -53,6 +53,16 @@ export interface ReadTreeOptions {
   keepResolveUndo?: boolean;
   /** Keep existing entries not in tree */
   keepExisting?: boolean;
+  /**
+   * Read the tree over the index as unpack-trees' one-way merge does (`reset --hard`,
+   * `checkout -f`; git's `oneway_merge` and `merged_entry`): a stage-0 entry the tree holds
+   * unchanged (same mode and object id) stays as it was, its flags (skip-worktree,
+   * assume-unchanged, intent-to-add) and stat data kept; one the tree changes takes the
+   * tree's entry with the old skip-worktree bit ("Migrate old flags over"). `"flags"` keeps
+   * the flags of an unchanged entry but not its stat data (for a caller that writes every
+   * file again). Default: every entry is the tree's, without flags or stat data.
+   */
+  keepMatching?: boolean | "flags";
 }
 
 /**

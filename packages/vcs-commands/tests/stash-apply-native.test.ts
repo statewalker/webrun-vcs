@@ -218,9 +218,10 @@ describeGit("stash apply against native git", () => {
     const { expected, actual } = await bothApply(dir, true);
     expect(expected.ok).toBe(false);
     expect(expected.message).toContain("Try without --index");
-    // git apply --cached reports the path it could not patch, then the refusal
+    // git apply --cached reports the hunk and the path it could not patch, then the refusal
     expect(actual.message).toBe(
-      "error: a.txt: patch does not apply\nerror: conflicts in index. Try without --index.",
+      "error: patch failed: a.txt:1\nerror: a.txt: patch does not apply\n" +
+        "error: conflicts in index. Try without --index.",
     );
   });
 

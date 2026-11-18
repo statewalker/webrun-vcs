@@ -4,6 +4,8 @@ import {
   copyCacheTree,
   invalidateCacheTreePath,
   type ResolveUndoRecord,
+  type Staging,
+  type StagingEntry,
   type WorkingCopy,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
@@ -13,10 +15,11 @@ import { RefNotFoundError } from "../errors/ref-errors.js";
 import { type CommandTrees, GitCommand } from "../git-command.js";
 import { ResetMode } from "../types.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
-import { OperationState } from "./merge-support.js";
+import { flatTree, OperationState } from "./merge-support.js";
 import { reflogMessages, updateHead } from "./reflog-messages.js";
 import { removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
+import { flaggedEntryDiffers } from "./worktree-overwrite-checks.js";
 
 /** Names this operation in restore failure messages. */
 const RESET_HARD = "reset --hard";
@@ -167,6 +170,31 @@ export class ResetCommand extends GitCommand<Ref> {
       if (refused) throw new ResetRefusedError(refused.message, refused.paths);
     }
 
+    // --hard: unpack-trees' one-way merge checks the entries whose flags cheat (assume-unchanged,
+    // skip-worktree) before anything changes; a file kept outside the worktree stays so
+    let flagged: FlaggedEntries | undefined;
+    if (this.mode === ResetMode.HARD) {
+      const commit = await this.commits.load(targetId);
+      if (commit) {
+        flagged = await checkFlaggedEntries(
+          {
+            trees: this.trees,
+            staging: this.staging,
+            workingCopy: this.workingCopy,
+            worktree: this.worktreeAccess,
+          },
+          commit.tree,
+        );
+        if (flagged.refused !== undefined) {
+          throw new ResetRefusedError(
+            `error: Entry '${flagged.refused}' not uptodate. Cannot merge.\n` +
+              `fatal: Could not reset index file to revision '${targetRef}'.`,
+            [flagged.refused],
+          );
+        }
+      }
+    }
+
     // Move HEAD/branch, the old HEAD kept in ORIG_HEAD (git's reset_refs)
     if (headId && state.supported) await state.setRef("ORIG_HEAD", headId);
     // git's set_reflog_message: "reset: moving to <rev>", or "<action>: updating HEAD"
@@ -182,7 +210,7 @@ export class ResetCommand extends GitCommand<Ref> {
 
     // Reset working tree (for HARD) - this DESTROYS uncommitted changes
     if (this.mode === ResetMode.HARD) {
-      await this.resetWorkingTree(targetId, trackedBefore ?? new Set());
+      await this.resetWorkingTree(targetId, trackedBefore ?? new Set(), flagged?.keptOut);
     }
 
     // git's remove_branch_state: a merge, cherry-pick or revert in progress is forgotten
@@ -268,7 +296,11 @@ export class ResetCommand extends GitCommand<Ref> {
    * @param targetId Commit to reset the working tree to
    * @param trackedBefore Paths tracked before staging was reset
    */
-  private async resetWorkingTree(targetId: ObjectId, trackedBefore: Set<string>): Promise<void> {
+  private async resetWorkingTree(
+    targetId: ObjectId,
+    trackedBefore: Set<string>,
+    keptOut?: ReadonlySet<string>,
+  ): Promise<void> {
     const worktree = this.worktreeAccess;
     if (!worktree) {
       // Bare repository: there is no working tree to reset.
@@ -283,6 +315,7 @@ export class ResetCommand extends GitCommand<Ref> {
       { trees: this.trees, blobs: this.blobs, workingCopy: this.workingCopy, worktree },
       commit.tree,
       trackedBefore,
+      keptOut,
     );
   }
 
@@ -293,7 +326,9 @@ export class ResetCommand extends GitCommand<Ref> {
     const commit = await this.commits.load(commitId);
     if (commit) {
       if (this.mode !== ResetMode.MIXED) {
-        await this.staging.readTree(this.trees, commit.tree);
+        // oneway_merge: an unchanged entry keeps its flags, a changed one its skip-worktree
+        // bit (the stat data goes: every file is written again)
+        await this.staging.readTree(this.trees, commit.tree, { keepMatching: "flags" });
         await this.primeCacheTree(commit.tree);
         await this.staging.write();
         return;
@@ -323,7 +358,12 @@ export class ResetCommand extends GitCommand<Ref> {
         record.modes[entry.stage - 1] = entry.mode;
         record.objectIds[entry.stage - 1] = entry.objectId;
       }
-      await this.staging.readTree(this.trees, commit.tree, { keepResolveUndo: true });
+      // read_from_tree leaves the entries it does not change alone (their flags and stat), and
+      // a changed entry keeps its skip-worktree bit (update_index_from_diff)
+      await this.staging.readTree(this.trees, commit.tree, {
+        keepResolveUndo: true,
+        keepMatching: true,
+      });
       if (unmerged.size > 0) this.staging.recordResolveUndo?.([...unmerged.values()]);
       if (cached && this.staging.setCacheTree) {
         const tree = copyCacheTree(cached);
@@ -391,16 +431,26 @@ export async function restoreWorktreeHard(
   deps: { trees: CommandTrees; blobs: Blobs; workingCopy: WorkingCopy; worktree: Worktree },
   treeId: ObjectId,
   trackedBefore: Set<string>,
+  keptOut?: ReadonlySet<string>,
 ): Promise<void> {
   const { trees, blobs, workingCopy, worktree } = deps;
   // Plan the whole restore first. Anything unrestorable then fails while the
   // working tree is still untouched, instead of half-way through rewriting it.
-  const plan = await planTreeRestore(trees, blobs, treeId, RESET_HARD, {
+  const fullPlan = await planTreeRestore(trees, blobs, treeId, RESET_HARD, {
     symlinks: true,
     ...(await restoreCaseOptions(worktree, coreBool(workingCopy, "ignorecase", false))),
     windows: worktree.capabilities?.windowsPaths === true,
     reservedNames: worktree.capabilities?.reservedNames,
   });
+  // a skip-worktree entry the tree keeps is not checked out (oneway_merge skips it)
+  const plan =
+    keptOut && keptOut.size > 0
+      ? {
+          ...fullPlan,
+          entries: fullPlan.entries.filter((e) => !keptOut.has(e.path)),
+          gitlinks: fullPlan.gitlinks.filter((e) => !keptOut.has(e.path)),
+        }
+      : fullPlan;
 
   // Delete the files that were tracked but are not in the target tree first, as git's
   // unpack-trees does: a tracked file or symlink `d` then makes way for `d/x`, and is
@@ -418,4 +468,52 @@ export async function restoreWorktreeHard(
     // git's reset --hard overwrites untracked files (UNPACK_RESET_OVERWRITE_UNTRACKED)
     discardUntracked: true,
   });
+}
+
+/** What {@link checkFlaggedEntries} found. */
+export interface FlaggedEntries {
+  /** The first path whose flagged entry the tree changes or deletes over a changed file. */
+  refused?: string;
+  /** The skip-worktree entries the tree keeps: their files are left alone. */
+  keptOut: Set<string>;
+}
+
+/**
+ * The index entries whose flags cheat (assume-unchanged, skip-worktree) before a one-way
+ * reset onto `treeId` (`reset --hard`, `checkout -f`): unpack-trees checks them even when it
+ * resets (`verify_uptodate_1`: "CE_VALID and CE_SKIP_WORKTREE cheat"), so one the tree
+ * changes or deletes is refused while its file differs from it (by stat, as
+ * `ie_match_stat`; a missing file is fine). A skip-worktree entry the tree keeps is not
+ * checked out (`oneway_merge`).
+ */
+export async function checkFlaggedEntries(
+  deps: {
+    trees: CommandTrees;
+    staging: Staging;
+    workingCopy: WorkingCopy;
+    worktree?: Worktree;
+  },
+  treeId: ObjectId,
+): Promise<FlaggedEntries> {
+  const flagged: StagingEntry[] = [];
+  for await (const entry of deps.staging.entries()) {
+    if (entry.stage === 0 && (entry.assumeValid || entry.skipWorktree)) flagged.push(entry);
+  }
+  const keptOut = new Set<string>();
+  if (flagged.length === 0) return { keptOut };
+  const target = await flatTree(deps.trees, treeId);
+  const worktree = deps.worktree;
+  const trust = worktree ? worktreeModeTrust(deps.workingCopy, worktree) : undefined;
+  const indexTime = deps.staging.getUpdateTime();
+  for (const entry of flagged) {
+    const t = target.get(entry.path);
+    if (t && t.mode === entry.mode && t.objectId === entry.objectId) {
+      if (entry.skipWorktree) keptOut.add(entry.path);
+      continue;
+    }
+    if (worktree && (await flaggedEntryDiffers(worktree, entry.path, entry, trust, indexTime))) {
+      return { refused: entry.path, keptOut };
+    }
+  }
+  return { keptOut };
 }

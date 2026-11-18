@@ -46,7 +46,7 @@ import { stripspace } from "../message-cleanup.js";
 import { ortResultEntries } from "../ort-merge.js";
 import { mergeStoredTrees, storedBase } from "../ort-recursive.js";
 import { updateHead } from "../reflog-messages.js";
-import { resetMerge, resetUnmergedToHead } from "../sequencer-support.js";
+import { removeBranchState, resetMerge, resetUnmergedToHead } from "../sequencer-support.js";
 import { appendSignoff } from "../trailers.js";
 import { mailinfo, mailsplit } from "./mailinfo.js";
 import {
@@ -339,11 +339,9 @@ export class AmCommand extends GitCommand<AmResult> {
       if (mode === "abort") return this.abort();
       const st = await this.load();
       if (mode === "skip") {
+        // am_skip: clean_index(HEAD, HEAD), then the next patch
         const head = await this.headId();
-        if (head) {
-          const refused = await resetMerge(this.sequencerContext(), head, "HEAD");
-          if (refused) this.fatal(refused.message);
-        }
+        await this.cleanIndex(head, head);
         await this.next(st);
         return this.amRun(st, false);
       }
@@ -934,23 +932,31 @@ export class AmCommand extends GitCommand<AmResult> {
       return this.result(0);
     }
     const orig = await state.ref("ORIG_HEAD");
-    // clean_index: conflicted entries reset to HEAD (a two-way merge from HEAD to HEAD that
-    // leaves every other entry, staged changes and deletions included, as it is), then the
-    // index moved to ORIG_HEAD (a two-way merge from the index's own tree, so a one-way
-    // reset with git's up-to-date and untracked checks); unpack-trees' error, then the stop
-    const cleanFailed = (message: string): never => {
-      this.err += `${message.replace(/\nfatal: Could not reset index file to revision '[^\n]*'\.$/, "")}\n`;
-      this.fatal("failed to clean index");
-    };
-    await resetUnmergedToHead(this.sequencerContext(), head);
-    const target = orig ?? head;
-    if (target) {
-      const refused = await resetMerge(this.sequencerContext(), target, "ORIG_HEAD");
-      if (refused) cleanFailed(refused.message);
-    }
+    await this.cleanIndex(head, orig ?? head);
     if (orig) await updateHead(this.refsStore, orig, this.reflogLine("am --abort"));
     await state.remove(DIR);
     return this.result(0);
+  }
+
+  /**
+   * git's `clean_index(head, remote)` (`am --skip`, `am --abort`): conflicted entries reset to
+   * HEAD (a two-way merge from HEAD to HEAD that leaves every other entry, staged changes and
+   * deletions included, as it is), then the index moved to `remote` (a two-way merge from
+   * the index's own tree, so a one-way reset with git's up-to-date and untracked checks),
+   * then a merge in progress forgotten (`remove_branch_state`). A refusal prints
+   * unpack-trees' error, then dies with "failed to clean index".
+   */
+  private async cleanIndex(head: ObjectId | undefined, remote: ObjectId | undefined) {
+    const ctx = this.sequencerContext();
+    await resetUnmergedToHead(ctx, head);
+    if (remote) {
+      const refused = await resetMerge(ctx, remote, "HEAD");
+      if (refused) {
+        this.err += `${refused.message.replace(/\nfatal: Could not reset index file to revision '[^\n]*'\.$/, "")}\n`;
+        this.fatal("failed to clean index");
+      }
+    }
+    await removeBranchState({ commits: this.commits, refs: this.refsStore }, this.state());
   }
 
   private sequencerContext() {

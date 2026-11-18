@@ -151,8 +151,9 @@ describe("GitStaging rewrites git's index through index.lock, keeping what still
 
     expect(existsSync(join(dir, ".git/index.lock"))).toBe(false);
     const after = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
-    // the entries changed: the cache-tree and untracked cache go, resolve-undo stays
-    expect(after.extensions).toEqual(["REUC"]);
+    // the entries changed: the untracked cache goes, the cache-tree stays with the changed
+    // path's directories invalid (as git's add_index_entry leaves it), resolve-undo stays
+    expect(after.extensions).toEqual(["TREE", "REUC"]);
     expect(git(dir, ["ls-files", "--resolve-undo"])).toBe(undoBefore);
     expect(git(dir, ["ls-files", "--stage", "h.txt"])).toBe(`100644 ${hId} 0\th.txt`);
     git(dir, ["status", "--porcelain"]);
@@ -181,7 +182,7 @@ describe("GitStaging rewrites git's index through index.lock, keeping what still
     await staging.removeEntry("f.txt");
     await staging.write();
     const after = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
-    expect(after.extensions).toEqual(["REUC"]);
+    expect(after.extensions).toEqual(["TREE", "REUC"]);
     expect(git(dir, ["ls-files", "--resolve-undo"])).toBe(undoBefore);
   });
 
@@ -275,13 +276,20 @@ describe("native git and the extensions we keep", () => {
     return dir;
   }
 
-  it("a changed entry drops TREE, and git write-tree equals the tree we compute", async () => {
+  it("a changed entry invalidates its path in TREE, as git, and git write-tree equals ours", async () => {
     const dir = treeRepo();
     expect(
       (await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))))).extensions,
     ).toEqual(["TREE"]);
     writeFileSync(join(dir, "d/e/c.txt"), "changed\n");
     const cId = git(dir, ["hash-object", "-w", "d/e/c.txt"]);
+    // native git makes the same edit in a copy of the index
+    const twinIndex = join(dir, ".git/index-twin");
+    writeFileSync(twinIndex, readFileSync(join(dir, ".git/index")));
+    execFileSync("git", ["update-index", "--cacheinfo", `100644,${cId},d/e/c.txt`], {
+      cwd: dir,
+      env: { ...process.env, GIT_INDEX_FILE: twinIndex },
+    });
 
     const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
     await staging.read();
@@ -289,7 +297,12 @@ describe("native git and the extensions we keep", () => {
     await staging.write();
 
     const after = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
-    expect(after.extensions).toEqual([]);
+    const twin = await parseIndexFile(new Uint8Array(readFileSync(twinIndex)));
+    rmSync(twinIndex);
+    expect(after.extensions).toEqual(["TREE"]);
+    // the cache-tree as git leaves it: d and d/e invalid, the other directories valid
+    const tree = (x: typeof after) => x.extensionData.find((e) => e.signature === "TREE")?.data;
+    expect(Buffer.from(tree(after) ?? []).equals(Buffer.from(tree(twin) ?? []))).toBe(true);
     const ours = await staging.writeTree(hashingTrees);
     expect(git(dir, ["write-tree"])).toBe(ours);
     expect(ours).not.toBe(git(dir, ["rev-parse", "HEAD^{tree}"]));

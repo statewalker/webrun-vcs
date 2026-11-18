@@ -11,7 +11,12 @@ import {
   type PersonIdent,
 } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
-import { entryStatOf, type IndexEntryOptions, type Worktree } from "@statewalker/vcs-working-tree";
+import {
+  entryStatOf,
+  type IndexEntryOptions,
+  type StagingEntry,
+  type Worktree,
+} from "@statewalker/vcs-working-tree";
 
 import type { CommandCommits, CommandRefs } from "../git-command.js";
 import { StashApplyStatus } from "../results/stash-result.js";
@@ -31,6 +36,7 @@ import { STASH_REF } from "./stash-list-command.js";
 import { writeTreeRestorePlan } from "./tree-restore.js";
 import {
   type CheckedEntry,
+  flaggedEntryDiffers,
   pruneEmptyParents,
   untrackedUnder,
   worktreeDiffers,
@@ -89,6 +95,16 @@ export async function resetMerge(
     paths: [path],
   });
   const notUptodate = (path: string) => refuse(`Entry '${path}' not uptodate. Cannot merge.`, path);
+  // verify_uptodate_1: an entry whose flags cheat (assume-unchanged, skip-worktree) is checked
+  // by its stat even by a hard reset; any other only when not resetting hard
+  const notUptodateEntry = async (i: CheckedEntry): Promise<boolean> => {
+    if (!worktree) return false;
+    const e = i as StagingEntry;
+    if (e.assumeValid || e.skipWorktree) {
+      return flaggedEntryDiffers(worktree, e.path, e, trust, indexTime);
+    }
+    return checkUptodate && worktreeDiffers(worktree, e.path, i, trust, indexTime);
+  };
   const changes: string[] = [];
   /** Paths the reset removes from the index (git's CE_REMOVE in the result) */
   const removing = new Set<string>();
@@ -105,19 +121,19 @@ export async function resetMerge(
       if (worktree && !gitlink && (await directoryLosesUntracked(worktree, path, inIndex))) {
         return refuse(`Updating '${path}' would lose untracked files in it`, path);
       }
-      if (!conflicted && i && checkUptodate && worktree) {
-        if (await worktreeDiffers(worktree, path, i, trust, indexTime)) return notUptodate(path);
-      }
+      if (!conflicted && i && worktree && (await notUptodateEntry(i))) return notUptodate(path);
       removing.add(path);
       changes.push(path);
       continue;
     }
     if (!conflicted && sameEntry(i, t)) {
-      // reset --hard writes a modified or missing file again
+      // reset --hard writes a modified or missing file again (a skip-worktree entry is left
+      // alone: oneway_merge)
       if (
         options.hard &&
         i &&
         worktree &&
+        !(i as StagingEntry).skipWorktree &&
         (await worktreeModified(worktree, path, i, trust, indexTime))
       ) {
         changes.push(path);
@@ -135,8 +151,8 @@ export async function resetMerge(
         notUptodate,
       });
       if (refusal) return refusal;
-    } else if (worktree && i && !conflicted && checkUptodate) {
-      if (await worktreeDiffers(worktree, path, i, trust, indexTime)) return notUptodate(path);
+    } else if (worktree && i && !conflicted && (await notUptodateEntry(i))) {
+      return notUptodate(path);
     }
     changes.push(path);
   }
@@ -168,18 +184,25 @@ export async function resetMerge(
       continue;
     }
     const stats = worktree ? await worktree.getEntry(path) : undefined;
+    // an unchanged entry rewritten keeps its flags (oneway_merge keeps the old entry); a
+    // changed one keeps the skip-worktree bit (merged_entry)
+    const old = index.get(path) as StagingEntry | undefined;
+    const same = old !== undefined && !unmerged.has(path) && sameEntry(old, t);
     edits.set(path, [
       {
         path,
         objectId: t.objectId,
         mode: t.mode,
         ...entryStatOf(stats && !stats.isDirectory ? stats : {}),
+        ...(old?.skipWorktree && !unmerged.has(path) ? { skipWorktree: true } : {}),
+        ...(same && old?.assumeValid ? { assumeValid: true } : {}),
+        ...(same && old?.intentToAdd ? { intentToAdd: true } : {}),
       },
     ]);
   }
   // unpack-trees writes a new index: no resolve-undo record survives the reset
   ctx.staging.clearResolveUndo?.();
-  await rewriteIndex(ctx.staging, edits);
+  await rewriteIndex(ctx.staging, edits, { updateCacheTreeWith: ctx.trees });
   return undefined;
 }
 
@@ -242,7 +265,7 @@ export async function resetUnmergedToHead(
     ]);
   }
   ctx.staging.clearResolveUndo?.();
-  await rewriteIndex(ctx.staging, edits);
+  await rewriteIndex(ctx.staging, edits, { updateCacheTreeWith: ctx.trees });
 }
 
 /**
@@ -292,8 +315,14 @@ export async function resetKeep(
       if (sameEntry(i, t)) continue;
       return refuse(`Entry '${path}' would be overwritten by merge. Cannot merge.`, path);
     }
-    if (worktree && i && (await worktreeDiffers(worktree, path, i, trust, indexTime))) {
-      return notUptodate(path);
+    if (worktree && i) {
+      // verify_uptodate_1: an entry whose flags cheat is checked by its stat
+      const e = i as StagingEntry;
+      const differs =
+        e.assumeValid || e.skipWorktree
+          ? await flaggedEntryDiffers(worktree, path, e, trust, indexTime)
+          : await worktreeDiffers(worktree, path, i, trust, indexTime);
+      if (differs) return notUptodate(path);
     }
     if (!t) {
       removing.add(path);
@@ -337,17 +366,20 @@ export async function resetKeep(
   for (const [path, t] of target) {
     if (sameEntry(index.get(path), t) && !written.has(path)) continue;
     const stats = worktree && written.has(path) ? await worktree.getEntry(path) : undefined;
+    // merged_entry: the replaced entry's skip-worktree bit migrates over
+    const old = index.get(path) as StagingEntry | undefined;
     edits.set(path, [
       {
         path,
         objectId: t.objectId,
         mode: t.mode,
         ...entryStatOf(stats && !stats.isDirectory ? stats : {}),
+        ...(old?.skipWorktree ? { skipWorktree: true } : {}),
       },
     ]);
   }
   ctx.staging.clearResolveUndo?.();
-  await rewriteIndex(ctx.staging, edits);
+  await rewriteIndex(ctx.staging, edits, { updateCacheTreeWith: ctx.trees });
   return undefined;
 }
 

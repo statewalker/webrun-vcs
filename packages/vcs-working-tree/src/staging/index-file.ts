@@ -24,7 +24,12 @@ import { readFile } from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
-import { type CacheTree, encodeCacheTree, parseCacheTree } from "./cache-tree.js";
+import {
+  type CacheTree,
+  encodeCacheTree,
+  invalidateCacheTreePath,
+  parseCacheTree,
+} from "./cache-tree.js";
 import {
   assertWritableIndexExtensions,
   carryIndexExtensions,
@@ -328,14 +333,17 @@ export class IndexFile {
    */
   cacheTree(entries: readonly StagingEntry[]): CacheTree | undefined {
     const ext = this.extensions.find((e) => e.signature === "TREE");
-    if (!ext || this.entriesKept === undefined || !sameIndexEntries(this.entriesKept, entries)) {
-      return undefined;
-    }
+    if (!ext || this.entriesKept === undefined) return undefined;
+    let tree: CacheTree;
     try {
-      return parseCacheTree(ext.data);
+      tree = parseCacheTree(ext.data);
     } catch {
       return undefined;
     }
+    // the entries changed since: each path changed invalid, as git's index edits invalidate
+    // it (cache_tree_invalidate_path from add_index_entry and remove_index_entry_at)
+    invalidateChangedPaths(tree, this.entriesKept, entries);
+    return tree;
   }
 
   /**
@@ -349,7 +357,9 @@ export class IndexFile {
     // what indexEntriesDigest compares: path, stage, mode, object id, intent-to-add
     const changed = this.entriesKept === undefined || !sameIndexEntries(this.entriesKept, entries);
     let extensions = carryIndexExtensions(this.extensions, entries, changed);
-    const tree = this.pendingCacheTree;
+    // without a cache-tree computed for these entries, the one read or last written goes on
+    // with each changed path invalid (git keeps the nodes no edit touched valid)
+    const tree = this.pendingCacheTree ?? (changed ? this.cacheTree(entries) : undefined);
     this.pendingCacheTree = undefined;
     if (tree && describesEntries(tree, entries)) {
       // git writes the cache-tree first
@@ -398,4 +408,52 @@ function sameIndexEntries(a: readonly StagingEntry[], b: readonly StagingEntry[]
     }
   }
   return true;
+}
+
+/**
+ * Invalidate in `tree` (the cache-tree of the entries `before`) every path whose entries
+ * differ in `after` (path, stage, mode, object id, intent-to-add): one added, removed or
+ * changed, as git's index edits invalidate it. Both lists are sorted by path and stage.
+ */
+export function invalidateChangedPaths(
+  tree: CacheTree,
+  before: readonly StagingEntry[],
+  after: readonly StagingEntry[],
+): void {
+  let i = 0;
+  let j = 0;
+  while (i < before.length || j < after.length) {
+    const x = before[i];
+    const y = after[j];
+    if (x === y) {
+      i++;
+      j++;
+      continue;
+    }
+    const order =
+      x === undefined
+        ? 1
+        : y === undefined
+          ? -1
+          : compareGitPaths(x.path, y.path) || x.stage - y.stage;
+    if (order < 0) {
+      invalidateCacheTreePath(tree, x.path);
+      i++;
+    } else if (order > 0) {
+      invalidateCacheTreePath(tree, (y as StagingEntry).path);
+      j++;
+    } else {
+      const a = x as StagingEntry;
+      const b = y as StagingEntry;
+      if (
+        a.mode !== b.mode ||
+        a.objectId !== b.objectId ||
+        (a.intentToAdd ? 1 : 0) !== (b.intentToAdd ? 1 : 0)
+      ) {
+        invalidateCacheTreePath(tree, b.path);
+      }
+      i++;
+      j++;
+    }
+  }
 }

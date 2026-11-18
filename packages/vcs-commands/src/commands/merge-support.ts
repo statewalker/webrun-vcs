@@ -20,6 +20,7 @@ import {
   type Checkout,
   cacheTreeFullyValid,
   entryStatOf,
+  IndexChangedError,
   type IndexEntryOptions,
   invalidateCacheTreeAgainstIndex,
   invalidateCacheTreeForIntentToAdd,
@@ -42,10 +43,10 @@ import {
 } from "./tree-restore.js";
 import {
   type CheckedEntry,
+  entryNotUptodate,
   findInTheWay,
   overwriteMessage,
   pruneEmptyParents,
-  worktreeDiffers,
 } from "./worktree-overwrite-checks.js";
 
 const sameEntry = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
@@ -473,7 +474,11 @@ export async function readIndex(
  * one. That write smudges racily clean entries and gives the index a new timestamp, which
  * later overwrite checks compare entries with (an entry as new as it is read again).
  */
-export async function writeIndexAsTree(staging: Staging, trees: CommandTrees): Promise<ObjectId> {
+export async function writeIndexAsTree(
+  staging: Staging,
+  trees: CommandTrees,
+  options: { keepChangedIndex?: boolean } = {},
+): Promise<ObjectId> {
   if (!staging.getCacheTree || !staging.setCacheTree) return staging.writeTree(trees);
   const previous = staging.getCacheTree();
   const treeId = await staging.writeTree(trees);
@@ -486,9 +491,37 @@ export async function writeIndexAsTree(staging: Staging, trees: CommandTrees): P
       }
     }
     staging.setCacheTree(cacheTree);
-    await staging.write();
+    try {
+      await staging.write();
+    } catch (error) {
+      // an index another writer replaced since it was read is left as it is
+      if (!(options.keepChangedIndex && error instanceof IndexChangedError)) throw error;
+      staging.setCacheTree(undefined);
+    }
   }
   return treeId;
+}
+
+/**
+ * git's `cache_tree_update(WRITE_TREE_SILENT | WRITE_TREE_REPAIR)` before an index write
+ * (`checkout` after its unpack-trees): unless the cache-tree is fully valid, the invalid
+ * directories are computed from the index (the valid ones kept, a stored tree included), the
+ * directories of intent-to-add entries left invalid; nothing where the index has conflicts.
+ * Sets the cache-tree the next `write` writes.
+ */
+export async function updateIndexCacheTree(staging: Staging, trees: CommandTrees): Promise<void> {
+  if (!staging.getCacheTree || !staging.setCacheTree) return;
+  if (await staging.hasConflicts()) return;
+  const previous = staging.getCacheTree();
+  if (previous && cacheTreeFullyValid(previous)) return;
+  const treeId = await staging.writeTree(trees);
+  const cacheTree = await updateCacheTree(trees, treeId, previous);
+  for (const entry of await indexEntryList(staging)) {
+    if (entry.intentToAdd && !entry.skipWorktree) {
+      invalidateCacheTreeForIntentToAdd(cacheTree, entry.path);
+    }
+  }
+  staging.setCacheTree(cacheTree);
 }
 
 /** Every index entry in the index's order, at once where the staging can give them so. */
@@ -510,6 +543,7 @@ export type IndexEntryInput = IndexEntryOptions;
 export async function rewriteIndex(
   staging: Staging,
   changes: Map<string, IndexEntryInput[]>,
+  options: { updateCacheTreeWith?: CommandTrees } = {},
 ): Promise<void> {
   // the kept entries are in the index's order already: only the changes are sorted, then
   // both merged (git's order: the paths' bytes, then the stage)
@@ -555,6 +589,8 @@ export async function rewriteIndex(
   }
   while (a < added.length) builder.add(added[a++]);
   await builder.finish();
+  // unpack-trees' cache_tree_update before its index write
+  if (options.updateCacheTreeWith) await updateIndexCacheTree(staging, options.updateCacheTreeWith);
   await staging.write();
 }
 
@@ -719,7 +755,7 @@ export async function switchTrees(
         staged.push(path);
         continue;
       }
-      if (worktree && (await worktreeDiffers(worktree, path, i, trust, indexTime))) {
+      if (worktree && (await entryNotUptodate(worktree, path, i, trust, indexTime))) {
         local.push(path);
         continue;
       }

@@ -343,3 +343,56 @@ export function overwriteMessage(
   }
   return parts.length > 0 ? [...parts, "Aborting"].join("\n") : undefined;
 }
+
+/**
+ * Whether the worktree file at `path` differs from an index entry whose flags cheat
+ * (assume-unchanged, skip-worktree), as git's `verify_uptodate_1` checks such an entry
+ * before overwriting or removing its file: `ie_match_stat` with `CE_MATCH_IGNORE_VALID`, so
+ * a stat that no longer matches is a change (the content is not compared), and a matching
+ * one on a racy entry has its content checked. A missing file is no change.
+ */
+export async function flaggedEntryDiffers(
+  worktree: Worktree,
+  path: string,
+  entry: StagingEntry,
+  trust?: WorktreeModeTrust,
+  indexTime?: number,
+): Promise<boolean> {
+  const current = await worktree.getEntry(path);
+  if (!current) return false;
+  if (current.isDirectory) return entry.mode !== FileMode.GITLINK;
+  if (entry.mode === FileMode.GITLINK) return false;
+  if ((current.mode === FileMode.SYMLINK) !== (entry.mode === FileMode.SYMLINK)) return true;
+  if (
+    trust?.executable &&
+    entry.mode !== FileMode.SYMLINK &&
+    (current.mode === FileMode.EXECUTABLE_FILE) !== (entry.mode === FileMode.EXECUTABLE_FILE)
+  ) {
+    return true;
+  }
+  if (!basicStatMatches(entry, current, trust)) return true;
+  const racy =
+    indexTime === undefined ||
+    indexTime <= 0 ||
+    wholeSeconds(entry.mtime, entry.mtimeNs) >= wholeSeconds(indexTime);
+  return racy && (await worktree.computeHash(path)) !== entry.objectId;
+}
+
+/**
+ * git's `verify_uptodate` of an index entry before a switch overwrites or removes its file:
+ * an entry whose flags cheat (assume-unchanged, skip-worktree) by its stat
+ * ({@link flaggedEntryDiffers}), any other as {@link worktreeDiffers} (git refreshed it).
+ */
+export async function entryNotUptodate(
+  worktree: Worktree,
+  path: string,
+  entry: CheckedEntry,
+  trust?: WorktreeModeTrust,
+  indexTime?: number,
+): Promise<boolean> {
+  const e = entry as StagingEntry;
+  if (e.assumeValid || e.skipWorktree) {
+    return flaggedEntryDiffers(worktree, path, e, trust, indexTime);
+  }
+  return worktreeDiffers(worktree, path, entry, trust, indexTime);
+}
