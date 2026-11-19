@@ -16,7 +16,7 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { worktreeModeTrust } from "./core-config.js";
-import { AddToIndexError, IndexAdder, readGitlinkHead } from "./index-adder.js";
+import { AddToIndexError, gitlinkHeadState, IndexAdder, readGitlinkHead } from "./index-adder.js";
 import { configBool } from "./merge-config.js";
 import {
   DO_MATCH_DIRECTORY,
@@ -522,6 +522,7 @@ export class AddCommand extends GitCommand<AddResult> {
           failed,
           undefined,
           output,
+          warnings,
         );
       }
       const removal = await this.removalState(worktree, first, current);
@@ -539,7 +540,14 @@ export class AddCommand extends GitCommand<AddResult> {
       if (gone && !unmerged) continue;
       if (!current) {
         // an unmerged path asked to be added (`--no-all`) that is not there
-        throw new AddFailedError(`fatal: unable to stat '${path}': No such file or directory`);
+        throw new AddFailedError(
+          [...errors, `fatal: unable to stat '${path}': No such file or directory`].join("\n"),
+          [],
+          [...failed, path],
+          undefined,
+          output,
+          warnings,
+        );
       }
       // an unpopulated submodule is no change (no commit checked out to compare)
       if (!unmerged && first.mode === FileMode.GITLINK && current.isDirectory) {
@@ -552,6 +560,7 @@ export class AddCommand extends GitCommand<AddResult> {
           failed,
           undefined,
           output,
+          warnings,
         );
       }
     }
@@ -588,6 +597,7 @@ export class AddCommand extends GitCommand<AddResult> {
             failed,
             undefined,
             output,
+            warnings,
           );
         }
         continue;
@@ -615,7 +625,14 @@ export class AddCommand extends GitCommand<AddResult> {
       output,
     };
     if (ignored.length > 0 || failed.length > 0) {
-      throw new AddFailedError([...messages, ...errors].join("\n"), ignored, failed, result);
+      throw new AddFailedError(
+        [...messages, ...errors].join("\n"),
+        ignored,
+        failed,
+        result,
+        output,
+        warnings,
+      );
     }
     return result;
   }
@@ -623,9 +640,10 @@ export class AddCommand extends GitCommand<AddResult> {
   /**
    * git's `check_removed` for the index entry `entry` and what the worktree has at its path
    * (`current`): `"removed"` when missing, or a directory where a file was that is no
-   * repository with a commit checked out (a gitlink keeps its directory, populated or not);
-   * `"unknown"` for a directory whose repository cannot be read here (its `.git` names a
-   * place beyond the worktree's storage), which git would stage as a gitlink.
+   * repository with a commit checked out (a gitlink keeps its directory, populated or not):
+   * no repository, or one without a commit; `"unknown"` for a directory whose repository
+   * cannot be read here (its `.git`, commondir or HEAD names a place beyond the worktree's
+   * storage, or cannot be read), which git might stage as a gitlink.
    */
   private async removalState(
     worktree: Worktree,
@@ -634,9 +652,9 @@ export class AddCommand extends GitCommand<AddResult> {
   ): Promise<"removed" | "present" | "unknown"> {
     if (!current) return "removed";
     if (!current.isDirectory || entry.mode === FileMode.GITLINK) return "present";
-    if (await readGitlinkHead(worktree, entry.path)) return "present";
-    if ((await worktree.repositoryState?.(entry.path)) === "unknown") return "unknown";
-    return "removed";
+    const head = await gitlinkHeadState(worktree, entry.path);
+    if (head.state === "commit") return "present";
+    return head.state === "unknown" ? "unknown" : "removed";
   }
 
   /** The index's entries, every stage, grouped by path in the index's order. */
@@ -852,11 +870,12 @@ export class AddCommand extends GitCommand<AddResult> {
         // git's add_file_to_index dies on a tracked file it cannot stat (the index is left
         // as it was)
         throw new AddFailedError(
-          `fatal: unable to stat '${path}': No such file or directory`,
+          [...errors, `fatal: unable to stat '${path}': No such file or directory`].join("\n"),
           [],
-          [path],
+          [...failed, path],
           undefined,
           output,
+          warnings,
         );
       }
       try {
@@ -886,7 +905,7 @@ export class AddCommand extends GitCommand<AddResult> {
       output,
     };
     if (failed.length > 0) {
-      throw new AddFailedError(errors.join("\n"), [], failed, result, output);
+      throw new AddFailedError(errors.join("\n"), [], failed, result, output, warnings);
     }
     return result;
   }

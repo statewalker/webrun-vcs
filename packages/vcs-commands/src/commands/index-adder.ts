@@ -2,13 +2,20 @@
  * git's `add_to_index` and `remove_file_from_index` over one index editor: what `git add`
  * and a partial commit's `add_remove_files` do to each path, applied together at `finish`.
  */
-import { type Blobs, EMPTY_BLOB_ID, FileMode, type ObjectId } from "@statewalker/vcs-core";
+import {
+  type Blobs,
+  EMPTY_BLOB_ID,
+  FileMode,
+  isValidWorktreePath,
+  type ObjectId,
+} from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   basicStatMatches,
   DeleteStagingEntry,
   type EntryStat,
   entryStatOf,
+  type GitlinkHeadState,
   type IndexEditor,
   invalidateCacheTreePath,
   MergeStage,
@@ -64,6 +71,24 @@ export async function readGitlinkHead(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The commit checked out in the repository at `path` (git's `resolve_gitlink_ref`), or
+ * `"none"` (no repository, or no commit: git's `check_removed` takes a tracked file's
+ * directory for its removal) or `"unknown"` (it cannot be read here).
+ *
+ * @throws Error where git dies reading the repository (an empty `commondir`)
+ */
+export async function gitlinkHeadState(
+  worktree: Worktree,
+  path: string,
+): Promise<GitlinkHeadState> {
+  if (worktree.gitlinkHeadState) return worktree.gitlinkHeadState(path);
+  const head = await readGitlinkHead(worktree, path);
+  if (head) return { state: "commit", head };
+  const unknown = (await worktree.repositoryState?.(path)) === "unknown";
+  return unknown ? { state: "unknown" } : { state: "none" };
 }
 
 /**
@@ -170,7 +195,8 @@ export class IndexAdder {
    * @returns `"unchanged"` when the entry was found up to date (nothing done), `"same"` when
    * it was hashed again to what the index has (git's `was_same`: `add -v` prints nothing),
    * `"added"` otherwise
-   * @throws AddToIndexError when the path cannot be added (a repository without a commit)
+   * @throws AddToIndexError when the path cannot be added (a repository without a commit, a
+   * path git's `verify_path` refuses)
    */
   async add(
     worktree: Worktree,
@@ -180,6 +206,17 @@ export class IndexAdder {
   ): Promise<AddOutcome> {
     const indexed = this.hasStage0(path) ? await this.staging.getEntry(path) : undefined;
     if (entry.isDirectory) return this.addGitlink(worktree, path, entry, indexed, options);
+    // add_index_entry's verify_path (after the file is hashed; never with ADD_CACHE_PRETEND)
+    if (!this.pretend) {
+      const mode = modeFromWorktree(entry.mode, indexed?.mode, this.trust);
+      if (!isValidWorktreePath(path, mode)) {
+        const name = options.displayPath ?? path;
+        throw new AddToIndexError(path, [
+          `error: invalid path '${name}'`,
+          `error: unable to add '${name}' to index`,
+        ]);
+      }
+    }
     if (options.intentToAdd) {
       // ADD_CACHE_NEW_ONLY: a path with a stage-0 entry (tracked, or already intent-to-add)
       // keeps its entry; unless its stat matches, git invalidates its cache-tree path all the
@@ -254,7 +291,10 @@ export class IndexAdder {
     // ie_match_stat of a gitlink compares the commit checked out (ce_compare_gitlink), with
     // the entry as edited so far (`add .` meets a file turned repository twice: as a tracked
     // path, then as an untracked directory)
-    if (this.stagedGitlinks.get(path) === head && this.added.has(path)) return "unchanged";
+    // (`add -n .` tells of it both times: `add 'a'`, then `add 'a/'`)
+    if (this.stagedGitlinks.get(path) === head && this.added.has(path)) {
+      return this.pretend ? "added" : "unchanged";
+    }
     if (
       indexed &&
       !this.added.has(path) &&

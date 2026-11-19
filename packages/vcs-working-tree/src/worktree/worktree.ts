@@ -55,6 +55,16 @@ export interface WorktreeWalkOptions {
 /** Whether a directory holds a repository of its own, as far as the worktree can tell. */
 export type NestedRepositoryState = "repository" | "none" | "unknown";
 
+/**
+ * The commit checked out in a nested repository (git's `resolve_gitlink_ref` of its HEAD):
+ * `"none"` when there is no repository or no commit there (git's `check_removed` then takes
+ * a tracked file's directory for its removal), `"unknown"` when it cannot be read here.
+ */
+export type GitlinkHeadState =
+  | { state: "commit"; head: ObjectId }
+  | { state: "none" }
+  | { state: "unknown" };
+
 /** Options for removing a worktree entry. */
 export interface WorktreeRemoveOptions {
   /** Remove a directory with everything in it */
@@ -273,6 +283,12 @@ export interface Worktree {
    * directory or `gitdir:` file; undefined when it is not populated or cannot be read.
    */
   readGitlinkHead?(path: string): Promise<ObjectId | undefined>;
+
+  /**
+   * The commit checked out in the repository at `path`, or whether there is none
+   * (`"none"`: no repository, or no commit) or it cannot be read here (`"unknown"`).
+   */
+  gitlinkHeadState?(path: string): Promise<GitlinkHeadState>;
 
   /**
    * The repository checked out in the submodule at `path`, opened as a working copy (its

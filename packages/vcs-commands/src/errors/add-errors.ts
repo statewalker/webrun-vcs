@@ -53,6 +53,11 @@ export class AddFailedError<R = unknown> extends GitApiError {
      * `add '<path>'`, `remove '<path>'`), also when nothing was written
      */
     readonly output: readonly string[] = [],
+    /**
+     * The warnings git printed on its standard error before it failed (an embedded
+     * repository added, line endings converted), also when nothing was written
+     */
+    readonly warnings: readonly string[] = [],
   ) {
     super(message);
     this.name = "AddFailedError";

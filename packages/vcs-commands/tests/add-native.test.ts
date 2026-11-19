@@ -16,7 +16,10 @@
  * - linked worktrees inside the repository (gitlinks), a `.git` beyond the storage (skipped),
  *   a tracked file turned repository or turned directory with a `.git` that is none, elements
  *   beyond a symbolic link or ending in "/", `--renormalize`'s checks and output, a tracked
- *   file turned FIFO.
+ *   file turned FIFO;
+ * - a nested repository found as git's is_git_directory finds it (a HEAD or `.git` that is a
+ *   link, objects and refs in its commondir, an empty commondir fatal), paths verify_path
+ *   refuses, and the errors, output and warnings printed before a failure.
  */
 
 import { execFileSync } from "node:child_process";
@@ -733,5 +736,169 @@ describeGit("git add, as native git stages paths", () => {
       expect(withoutHints(error?.message ?? "")).toBe(withoutHints(r.stderr));
       await same(ours, native);
     }
+  });
+
+  it("stages a tracked file turned repository whose HEAD or .git is a link (-u, -A, .)", async () => {
+    const variants: Array<(dir: string) => void> = [
+      // core.preferSymlinkRefs: HEAD a link into refs/
+      (dir) => {
+        fileToRepository(true)(dir);
+        unlinkSync(join(dir, "a/.git/HEAD"));
+        symlinkSync("refs/heads/main", join(dir, "a/.git/HEAD"));
+      },
+      // `a/.git` a link to a repository inside the worktree
+      (dir) => {
+        fileAndX(dir);
+        unlinkSync(join(dir, "a"));
+        nestedRepository(dir, "real");
+        mkdirSync(join(dir, "a"));
+        symlinkSync("../real/.git", join(dir, "a/.git"));
+      },
+    ];
+    for (const make of variants) {
+      for (const args of [["-u"], ["-A"], ["-v", "."]]) {
+        const { native, ours } = twins(make);
+        const r = git(root, native, "add", ...args);
+        expect(r.status).toBe(0);
+        expect(gitOk(root, native, "ls-files", "-s", "a")).toMatch(/^160000 /);
+        const result = await ourAdd(await g(ours), args);
+        if (args[0] === "-v") expect(result.output).toEqual(stdoutLines(r.stdout));
+        expect(withoutHints(result.warnings.join("\n"))).toBe(withoutHints(r.stderr));
+        await same(ours, native);
+      }
+    }
+  });
+
+  it("adds the files of a directory whose .git names no git directory (objects, refs, commondir)", async () => {
+    const corrupt: Array<(dir: string) => void> = [
+      // a gitfile naming a directory with only a HEAD
+      (dir) => {
+        put(dir, "g/HEAD", "ref: refs/heads/main\n");
+        put(dir, "a/.git", "gitdir: ../g\n");
+      },
+      // a linked worktree's gitdir whose commondir is gone
+      (dir) => {
+        put(dir, "g/HEAD", "ref: refs/heads/main\n");
+        put(dir, "g/commondir", "../missing\n");
+        put(dir, "a/.git", "gitdir: ../g\n");
+      },
+      // a `.git` link to a directory that is no repository
+      (dir) => {
+        put(dir, "plain/p", "p\n");
+        mkdirSync(join(dir, "a"));
+        symlinkSync("../plain", join(dir, "a/.git"));
+      },
+    ];
+    for (const make of corrupt) {
+      for (const args of [["-v", "."], ["-u"], ["-A"]]) {
+        const { native, ours } = twins((dir) => {
+          fileAndX(dir);
+          unlinkSync(join(dir, "a"));
+          make(dir);
+          put(dir, "a/inner", "i\n");
+        });
+        const r = git(root, native, "add", ...args);
+        expect(r.status).toBe(0);
+        const result = await ourAdd(await g(ours), args);
+        if (args[0] === "-v") expect(result.output).toEqual(stdoutLines(r.stdout));
+        await same(ours, native);
+      }
+    }
+  });
+
+  it("dies on an empty commondir, as git's get_common_dir, changing nothing", async () => {
+    for (const args of [["-u"], ["-v", "."]]) {
+      const { native, ours } = twins((dir) => {
+        fileAndX(dir);
+        unlinkSync(join(dir, "a"));
+        mkdirSync(join(dir, "g/objects"), { recursive: true });
+        mkdirSync(join(dir, "g/refs"));
+        put(dir, "g/HEAD", "ref: refs/heads/main\n");
+        put(dir, "g/commondir", "");
+        put(dir, "a/.git", "gitdir: ../g\n");
+      });
+      const index = (dir: string) => readFileSync(join(dir, ".git/index")).toString("hex");
+      const before = { native: index(native), ours: index(ours) };
+      const r = git(root, native, "add", ...args);
+      expect(r.status).toBe(128);
+      const error = await failure(ourAdd(await g(ours), args));
+      // git's errno text follows (a stale one: it varies)
+      expect(error?.message).toBe("fatal: failed to read a/../g/commondir");
+      expect(r.stderr.startsWith(`${error?.message}:`)).toBe(true);
+      // git status dies there too: each index is left as it was
+      expect({ native: index(native), ours: index(ours) }).toEqual(before);
+      expect(gitOk(root, ours, "ls-files", "-s")).toBe(gitOk(root, native, "ls-files", "-s"));
+    }
+  });
+
+  it("-n . tells of a tracked file turned repository twice, as tracked and as untracked", async () => {
+    const { native, ours } = twins(fileToRepository(true));
+    const r = git(root, native, "add", "-n", ".");
+    expect(r.status).toBe(0);
+    const result = await ourAdd(await g(ours), ["-n", "."]);
+    expect(result.output).toEqual(stdoutLines(r.stdout));
+    await same(ours, native);
+  });
+
+  it("--renormalize keeps the errors printed before a tracked file it cannot stat", async () => {
+    const { native, ours } = twins((dir) => {
+      fileAndX(dir);
+      unlinkSync(join(dir, "a"));
+      put(dir, "a/i", "i\n");
+      unlinkSync(join(dir, "x"));
+    });
+    const r = git(root, native, "add", "--renormalize", ".");
+    expect(r.status).toBe(128);
+    const error = await failure(ourAdd(await g(ours), ["--renormalize", "."]));
+    expect(error).toBeInstanceOf(AddFailedError);
+    expect(errorLines(error?.message ?? "")).toEqual(errorLines(r.stderr));
+    await same(ours, native);
+  });
+
+  it("refuses a path with a .GIT component as git's verify_path, --ignore-errors going on", async () => {
+    for (const args of [
+      ["-v", "."],
+      ["--ignore-errors", "-v", "."],
+      ["u/.GIT/x"],
+      ["-A"],
+      ["-n", "."],
+    ]) {
+      const { native, ours } = twins((dir) => {
+        fileAndX(dir);
+        put(dir, "x", "changed\n");
+        put(dir, "u/.GIT/x", "x\n");
+        put(dir, "b", "b\n");
+        put(dir, "u/y", "y\n");
+      });
+      const r = git(root, native, "add", ...args);
+      const run = failure(ourAdd(await g(ours), args));
+      const error = await run;
+      if (r.status === 0) expect(error).toBeUndefined();
+      else {
+        expect(error).toBeInstanceOf(AddFailedError);
+        expect(error?.message).toBe(r.stderr.trim());
+        const failed = error as AddFailedError<AddResult>;
+        const printed = r.status === 1 ? failed.result?.output : failed.output;
+        if (args.includes("-v")) expect(printed).toEqual(stdoutLines(r.stdout));
+        expect(r.status).toBe(args[0] === "--ignore-errors" ? 1 : 128);
+      }
+      await same(ours, native);
+    }
+  });
+
+  it("AddFailedError carries the warnings printed before the failure", async () => {
+    const { native, ours } = twins((dir) => {
+      fileAndX(dir);
+      nestedRepository(dir, "sub");
+      put(dir, "u/.GIT/x", "x\n");
+    });
+    const r = git(root, native, "add", ".");
+    expect(r.status).toBe(128);
+    const error = await failure(ourAdd(await g(ours), ["."]));
+    expect(error).toBeInstanceOf(AddFailedError);
+    const before = r.stderr.slice(0, r.stderr.indexOf("error: "));
+    expect(before).toContain("warning: adding embedded git repository: sub");
+    expect(withoutHints((error as AddFailedError).warnings.join("\n"))).toBe(withoutHints(before));
+    await same(ours, native);
   });
 });
