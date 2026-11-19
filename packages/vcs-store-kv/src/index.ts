@@ -17,3 +17,4 @@ export * from "./kv-staging-store.js";
 export * from "./kv-store.js";
 // Object storage (new architecture)
 export * from "./object-storage/index.js";
+// incremental-tests probe: reverted in the next commit
