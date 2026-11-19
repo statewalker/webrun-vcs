@@ -442,6 +442,22 @@ export class IndexAdder {
   }
 
   /**
+   * git's `add_index_entry` (`ADD_CACHE_OK_TO_ADD | ADD_CACHE_OK_TO_REPLACE`) of an entry
+   * built elsewhere (`git mv`'s `rename_index_entry_at`): staged at stage 0 as given, its
+   * flags and stat data kept, replacing the path's conflict stages (kept as resolve-undo)
+   * and the stage-0 entries it clashes with as a file or a directory.
+   */
+  put(entry: StagingEntry): void {
+    if (this.pretend) return;
+    const path = entry.path;
+    this.resolve(path);
+    this.clearConflicts(path);
+    const staged: StagingEntry = { ...entry, stage: MergeStage.MERGED };
+    this.editor.add({ path, apply: () => staged });
+    this.markAdded(path);
+  }
+
+  /**
    * The edits applied, and the resolve-undo records kept. Each path given an entry (even
    * one with the same content: a racily clean file read again) or removed has its
    * cache-tree path invalidated, as git's `add_index_entry` and `remove_file_from_index`

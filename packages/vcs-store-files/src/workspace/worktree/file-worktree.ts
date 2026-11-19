@@ -1085,6 +1085,31 @@ export class FileWorktree implements Worktree {
     return head === "file" ? resolved : undefined;
   }
 
+  async gitlinkRepository(path: string): Promise<string | undefined> {
+    return this.gitlinkDir(path).catch(() => undefined);
+  }
+
+  async connectGitlink(path: string, gitDir: string): Promise<void> {
+    assertValidWorktreePath(path, undefined, this.pathRules);
+    const workTree = joinPath(this.rootPath, path);
+    const encoder = new TextEncoder();
+    await this.files.write(joinPath(workTree, ".git"), [
+      encoder.encode(`gitdir: ${relativeFilesPath(gitDir, workTree)}\n`),
+    ]);
+    const files = this.rootFiles;
+    const config = await createWorkingCopyConfig(
+      {
+        read: async (p) => ((await files.exists(p)) ? readFile(files, p) : undefined),
+        write: (p, content) => files.write(p, [content]),
+      },
+      gitDir,
+      undefined,
+      this.environment ? { environment: this.environment } : {},
+    );
+    config.set("core.worktree", relativeFilesPath(workTree, gitDir));
+    await config.save();
+  }
+
   async readGitlinkHead(path: string): Promise<ObjectId | undefined> {
     const state = await this.gitlinkHeadState(path);
     return state.state === "commit" ? state.head : undefined;
@@ -1652,4 +1677,14 @@ function isInside(path: string, root: string): boolean {
   if (p.split("/").includes("..")) return false;
   if (r === "") return true;
   return p.startsWith(`${r}/`);
+}
+
+/** git's `relative_path(path, base)` for two paths of one FilesApi. */
+function relativeFilesPath(path: string, base: string): string {
+  const a = path.split("/").filter((p) => p && p !== ".");
+  const b = base.split("/").filter((p) => p && p !== ".");
+  let k = 0;
+  while (k < a.length && k < b.length && a[k] === b[k]) k++;
+  const rel = [...b.slice(k).map(() => ".."), ...a.slice(k)].join("/");
+  return rel || ".";
 }

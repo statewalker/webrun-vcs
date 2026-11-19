@@ -69,11 +69,15 @@ export async function resetMerge(
   ctx: SequencerContext,
   targetId: ObjectId,
   label: string,
-  options: { hard?: boolean } = {},
+  options: OnewayMergeOptions = {},
 ): Promise<MergeRefusal | undefined> {
   // in a sparse checkout: unpack-trees with its patterns; reset prints its sparse warnings
-  // as plain errors (no porcelain messages)
-  const sparse = await SparseUnpack.start(ctx);
+  // as plain errors (no porcelain messages). Without update the patterns are not applied
+  // (`skip_sparse_checkout` when `!o->update`)
+  const sparse =
+    options.update === false || options.skipSparseCheckout
+      ? undefined
+      : await SparseUnpack.start(ctx);
   const done = await resetMergeWith(ctx, targetId, label, options, sparse);
   if (done.refused) return done.refused;
   if (sparse) {
@@ -86,18 +90,37 @@ export async function resetMerge(
   return undefined;
 }
 
+/** Options of {@link resetMerge}, git's `oneway_merge` settings. */
+export interface OnewayMergeOptions {
+  /** `o->reset`: local changes are no refusal, modified or missing files written again */
+  hard?: boolean;
+  /** `o->update` (default true); false: files are checked (`verify_uptodate`), never written */
+  update?: boolean;
+  /** `UNPACK_RESET_OVERWRITE_UNTRACKED` (`read-tree --reset -u`): untracked files written over */
+  overwriteUntracked?: boolean;
+  /** `--no-sparse-checkout` */
+  skipSparseCheckout?: boolean;
+  /**
+   * The tree to read (`targetId` is then only a label): `read-tree -m <tree>` takes any
+   * tree-ish
+   */
+  targetTree?: ObjectId;
+  /** `read-tree`'s refusal: the `error:` line alone, without `fatal: Could not reset ...` */
+  plain?: boolean;
+}
+
 async function resetMergeWith(
   ctx: SequencerContext,
   targetId: ObjectId,
   label: string,
-  options: { hard?: boolean },
+  options: OnewayMergeOptions,
   sparse: SparseUnpack | undefined,
 ): Promise<{ refused?: MergeRefusal; written: Set<string> }> {
   const refusedWith = (refused: MergeRefusal) => ({ refused, written: new Set<string>() });
   // a path staying outside the sparse checkout: neither checked nor touched in the worktree
   const quiet = (path: string) => sparse?.leavesAlone(path) === true;
   const checkUptodate = !options.hard;
-  const targetTree = await ctx.commits.getTree(targetId);
+  const targetTree = options.targetTree ?? (await ctx.commits.getTree(targetId));
   const target = await flatTree(ctx.trees, targetTree);
   const index = new Map<string, CheckedEntry>();
   const unmerged = new Set<string>();
@@ -112,18 +135,26 @@ async function resetMergeWith(
       }
     }
   }
-  const worktree = ctx.worktree;
+  const update = options.update !== false;
+  // without update the files are still checked (verify_uptodate), never written; untracked
+  // files are not looked for (verify_absent returns early)
+  const checkedWorktree = ctx.worktree;
+  const worktree = update ? ctx.worktree : undefined;
+  const absentWorktree = options.overwriteUntracked ? undefined : worktree;
   const checked = conflictEntries.size > 0 ? new Map([...index, ...conflictEntries]) : index;
-  const trust = worktree ? worktreeModeTrust(ctx.workingCopy, worktree) : undefined;
+  const trust = checkedWorktree ? worktreeModeTrust(ctx.workingCopy, checkedWorktree) : undefined;
   const indexTime = ctx.staging.getUpdateTime();
   const refuse = (message: string, path: string): MergeRefusal => ({
-    message: `error: ${message}\nfatal: Could not reset index file to revision '${label}'.`,
+    message: options.plain
+      ? `error: ${message}`
+      : `error: ${message}\nfatal: Could not reset index file to revision '${label}'.`,
     paths: [path],
   });
   const notUptodate = (path: string) => refuse(`Entry '${path}' not uptodate. Cannot merge.`, path);
   // verify_uptodate_1: an entry whose flags cheat (assume-unchanged, skip-worktree) is checked
   // by its stat even by a hard reset; any other only when not resetting hard
   const notUptodateEntry = async (i: CheckedEntry): Promise<boolean> => {
+    const worktree = checkedWorktree;
     if (!worktree) return false;
     const e = i as StagingEntry;
     if (e.assumeValid || e.skipWorktree) {
@@ -145,14 +176,14 @@ async function resetMergeWith(
       // (a submodule's directory is not touched)
       const gitlink = i?.mode === FileMode.GITLINK;
       if (
-        worktree &&
+        absentWorktree &&
         !gitlink &&
         !quiet(path) &&
-        (await directoryLosesUntracked(worktree, path, inIndex))
+        (await directoryLosesUntracked(absentWorktree, path, inIndex))
       ) {
         return refusedWith(refuse(`Updating '${path}' would lose untracked files in it`, path));
       }
-      if (!conflicted && i && worktree && !quiet(path) && (await notUptodateEntry(i))) {
+      if (!conflicted && i && !quiet(path) && (await notUptodateEntry(i))) {
         return refusedWith(notUptodate(path));
       }
       removing.add(path);
@@ -176,16 +207,18 @@ async function resetMergeWith(
     }
     if (worktree && !i && !conflicted && !quiet(path)) {
       // a new path: verify_absent
-      const refusal = await verifyAbsent(worktree, path, t, checked, removing, {
-        hard: options.hard === true,
-        tracked: inIndex,
-        trust,
-        indexTime,
-        refuse,
-        notUptodate,
-      });
+      const refusal = absentWorktree
+        ? await verifyAbsent(absentWorktree, path, t, checked, removing, {
+            hard: options.hard === true,
+            tracked: inIndex,
+            trust,
+            indexTime,
+            refuse,
+            notUptodate,
+          })
+        : undefined;
       if (refusal) return refusedWith(refusal);
-    } else if (worktree && i && !conflicted && !quiet(path) && (await notUptodateEntry(i))) {
+    } else if (i && !conflicted && !quiet(path) && (await notUptodateEntry(i))) {
       return refusedWith(notUptodate(path));
     }
     changes.push(path);
@@ -218,6 +251,7 @@ async function resetMergeWith(
         symlinks: trust?.symlinks ?? true,
         gitlinks: true,
         replaceInTheWay: true,
+        ...(options.overwriteUntracked ? { discardUntracked: true } : {}),
       });
     }
   }
