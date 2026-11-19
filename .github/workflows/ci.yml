@@ -19,6 +19,10 @@ jobs:
       # Fails a breaking API change (against npm's latest) that no changeset or version bump
       # declares: minor on 0.x, major from 1.0.
       api-diff: true
+      # Incremental tests (scripts/tested.mjs): only the packages whose inputs (files, locked
+      # dependencies, workspace dependencies, .tested/config.json) changed since they last passed
+      # here, as recorded in .tested/. `pnpm test` still runs everything.
+      test-command: node scripts/tested.mjs run --no-bail
 
   # The lockfile-only pull request that .github/workflows/statewalker-update.yml opens: merged
   # once every other check on it passes, after checking it changes pnpm-lock.yaml alone
@@ -35,6 +39,55 @@ jobs:
       actions: read
     uses: statewalker/statewalker-ci/.github/workflows/merge-lockfile.yml@main
     secrets: inherit
+
+  # After a green run on a pull request from this repository, every package passed at the hashes
+  # of the merge commit CI tested: record them in .tested/ and push them to the pull request's
+  # branch. Merging brings them to main, whose run then skips those packages. Only this job
+  # writes .tested/ records. Not on the lockfile pull request, which must change pnpm-lock.yaml
+  # alone, nor on the version pull request, which changesets rewrites.
+  tested-record:
+    needs: ci
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.head_ref != 'deps/statewalker-lockfile'
+      && !startsWith(github.head_ref, 'changeset-release/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # The statewalker-release App's token when this repository has it: GitHub runs CI on what it
+      # pushes (it skips everything, the records being no test input), so the new head has checks.
+      # GITHUB_TOKEN otherwise: its push starts no run.
+      - name: Push token
+        id: token
+        if: ${{ vars.RELEASE_APP_CLIENT_ID != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          permission-contents: write
+      # The merge commit the ci job tested.
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ steps.token.outputs.token || github.token }}
+      - name: Record the tested hashes
+        run: node scripts/tested.mjs record
+      - name: Push the records to the pull request branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          mv .tested "$RUNNER_TEMP/tested"
+          git fetch --depth=1 origin "$HEAD_REF"
+          git checkout -B "$HEAD_REF" FETCH_HEAD
+          rm -rf .tested && mv "$RUNNER_TEMP/tested" .tested
+          git add .tested
+          if git diff --cached --quiet; then echo "records up to date"; exit 0; fi
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "chore: record tested packages"
+          # A commit pushed to the branch meanwhile wins: its own run records.
+          git push origin "HEAD:$HEAD_REF" || echo "::warning::branch moved; records left to the next run"
 
   # Releases to npm in three jobs: `version` opens the version pull request, `pack` packs what
   # npm lacks once it is merged, `publish` uploads the tarballs. Nobody approves the upload:

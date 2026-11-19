@@ -1,0 +1,8 @@
+{
+  "globalFiles": ["tsconfig.base.json", "tsconfig.json", "vitest.config.ts", "scripts/tested.mjs"],
+  "globalDeps": ["vitest", "typescript", "@types/node"],
+  "ignore": ["CHANGELOG.md", "README.md"],
+  "links": {
+    "packages/vcs-core": ["packages/vcs-store-mem"]
+  }
+}
