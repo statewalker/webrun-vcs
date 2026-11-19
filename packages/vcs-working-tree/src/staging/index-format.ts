@@ -364,14 +364,19 @@ export function encodeIndexFile(
   version: IndexVersion = INDEX_VERSION_2,
   extensions: readonly IndexExtension[] = [],
 ): Iterable<Uint8Array> {
-  const sortedEntries = checkedSorted(entries, extensions);
-  return encodeSorted(sortedEntries, writtenVersion(sortedEntries, version), extensions);
+  const written = writtenVersion(entries, version);
+  const sortedEntries = checkedSorted(entries, extensions, written === INDEX_VERSION_4);
+  if (written === INDEX_VERSION_4) return encodeSorted(sortedEntries, written, extensions);
+  // encoded (and so checked) now, before the first chunk is asked for
+  const { out, size } = encodeFlat(sortedEntries, written, extensions, 0);
+  return chunked(out, size);
 }
 
 /**
  * The index file's bytes as one buffer, the checksum hashed by Web Crypto where the runtime
  * has it (the bytes `encodeIndexFile` yields, joined). For a write of the whole file at once
  * (an index lock created holding it): a large index is copied once and hashed natively.
+ * The buffer is the caller's own: changing it never reaches a later encode.
  *
  * @example
  * ```typescript
@@ -385,29 +390,93 @@ export async function encodeIndexFileBytes(
   version: IndexVersion = INDEX_VERSION_2,
   extensions: readonly IndexExtension[] = [],
 ): Promise<{ bytes: Uint8Array; checksum: Uint8Array }> {
-  const sortedEntries = checkedSorted(entries, extensions);
-  const written = writtenVersion(sortedEntries, version);
+  const written = writtenVersion(entries, version);
+  const sortedEntries = checkedSorted(entries, extensions, written === INDEX_VERSION_4);
   if (written === INDEX_VERSION_4) {
     const bytes = concatBytes([...encodeSorted(sortedEntries, written, extensions)]);
     return { bytes, checksum: bytes.subarray(bytes.length - 20) };
   }
-  const parts: Uint8Array[] = [];
+  const { out, size } = encodeFlat(sortedEntries, written, extensions, 20);
+  const checksum = await sha1(out.subarray(0, size));
+  out.set(checksum, size);
+  // the entries' records point into `out` (a later encode copies their bytes from there):
+  // the caller gets a copy, so changing it cannot slip into a later index under a valid
+  // checksum
+  const bytes = out.slice();
+  return { bytes, checksum: bytes.subarray(size) };
+}
+
+/**
+ * A version 2/3 index without its checksum, written into one buffer (with `spare` bytes
+ * left at its end for the checksum): the sizes summed first, then each entry written in
+ * place (an ASCII path character by character, the object id from its hex), no buffer per
+ * entry. An entry written before is copied from where its bytes were last written.
+ */
+function encodeFlat(
+  sortedEntries: readonly StagingEntry[],
+  version: IndexVersion,
+  extensions: readonly IndexExtension[],
+  spare: number,
+): { out: Uint8Array; size: number } {
+  const count = sortedEntries.length;
+  // the path's bytes for a path that is not ASCII (undefined: ASCII, written as it is)
+  const encodedPaths: Array<Uint8Array | undefined> = new Array(count);
+  const known: Array<EncodedEntry | undefined> = new Array(count);
   let size = HEADER_SIZE;
-  for (const entry of sortedEntries) {
-    const bytes = serializeEntry(entry, written, "");
-    parts.push(bytes);
-    size += bytes.length;
+  for (let i = 0; i < count; i++) {
+    const entry = sortedEntries[i] as StagingEntry;
+    const record = encodedEntries.get(entry);
+    // (a buffer handed away since, detached, holds nothing any more)
+    if (record && record.version === version && record.buffer.length > 0) {
+      known[i] = record;
+      size += record.length;
+      continue;
+    }
+    const path = entry.path;
+    validatePath(path);
+    let pathLength = path.length;
+    if (!isAscii(path)) {
+      const bytes = encodeGitPath(path);
+      encodedPaths[i] = bytes;
+      pathLength = bytes.length;
+    }
+    const infoLen = hasExtendedFlags(entry) ? INFO_LEN_EXTENDED : INFO_LEN;
+    size += (infoLen + pathLength + 8) & ~7;
   }
   for (const ext of extensions) size += 8 + ext.data.length;
-  const out = new Uint8Array(size + 20);
+
+  const out = new Uint8Array(size + spare);
   const view = new DataView(out.buffer);
   view.setUint32(0, INDEX_SIGNATURE);
-  view.setUint32(4, written);
-  view.setUint32(8, sortedEntries.length);
+  view.setUint32(4, version);
+  view.setUint32(8, count);
   let at = HEADER_SIZE;
-  for (const bytes of parts) {
-    out.set(bytes, at);
-    at += bytes.length;
+  for (let i = 0; i < count; i++) {
+    const entry = sortedEntries[i] as StagingEntry;
+    const record = known[i];
+    if (record) {
+      out.set(record.buffer.subarray(record.offset, record.offset + record.length), at);
+      // the bytes now live here: the record follows them, so an older buffer is let go
+      record.buffer = out;
+      record.offset = at;
+      at += record.length;
+      continue;
+    }
+    const hasExtended = hasExtendedFlags(entry);
+    const infoLen = hasExtended ? INFO_LEN_EXTENDED : INFO_LEN;
+    const bytes = encodedPaths[i];
+    const path = entry.path;
+    const pathLength = bytes ? bytes.length : path.length;
+    writeEntryHeader(view, at, entry, pathLength, hasExtended);
+    // objectIdToBytes throws the error for an id that is none
+    if (!writeObjectId(out, at + P_OBJECTID, entry.objectId)) objectIdToBytes(entry.objectId);
+    const pathAt = at + infoLen;
+    if (bytes) out.set(bytes, pathAt);
+    else for (let k = 0; k < pathLength; k++) out[pathAt + k] = path.charCodeAt(k);
+    // the NUL and the padding are zero already
+    const length = (infoLen + pathLength + 8) & ~7;
+    encodedEntries.set(entry, { version, buffer: out, offset: at, length });
+    at += length;
   }
   for (const ext of extensions) {
     for (let i = 0; i < 4; i++) out[at + i] = ext.signature.charCodeAt(i);
@@ -415,17 +484,52 @@ export async function encodeIndexFileBytes(
     out.set(ext.data, at + 8);
     at += 8 + ext.data.length;
   }
-  const checksum = await sha1(out.subarray(0, size));
-  out.set(checksum, size);
-  return { bytes: out, checksum };
+  return { out, size };
+}
+
+/** Whether `s` holds a surrogate (where UTF-16 order and byte order may disagree). */
+const hasSurrogate = (s: string) => SURROGATE_CHAR.test(s);
+const SURROGATE_CHAR = /[\ud800-\udfff]/;
+
+/** Whether `s` is all ASCII (its UTF-8 bytes are its characters). */
+function isAscii(s: string): boolean {
+  for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) > 0x7f) return false;
+  return true;
+}
+
+/** The value of each hex digit by character code (-1: none; lowercase only, as git writes). */
+const HEX_DIGIT = (() => {
+  const table = new Int8Array(128).fill(-1);
+  for (let i = 0; i < 10; i++) table[48 + i] = i;
+  for (let i = 0; i < 6; i++) table[97 + i] = 10 + i;
+  return table;
+})();
+
+/**
+ * The 20 bytes of the object id `id` written at `at`; false (bytes undefined) when it is
+ * not 40 lowercase hex digits.
+ */
+function writeObjectId(out: Uint8Array, at: number, id: string): boolean {
+  if (typeof id !== "string" || id.length !== 40) return false;
+  for (let i = 0; i < 20; i++) {
+    const c1 = id.charCodeAt(2 * i);
+    const c2 = id.charCodeAt(2 * i + 1);
+    const hi = c1 < 128 ? (HEX_DIGIT[c1] as number) : -1;
+    const lo = c2 < 128 ? (HEX_DIGIT[c2] as number) : -1;
+    if ((hi | lo) < 0) return false;
+    out[at + i] = (hi << 4) | lo;
+  }
+  return true;
 }
 
 /** The entries checked (paths, ids, extension names) and in the index's order. */
 function checkedSorted(
   entries: readonly StagingEntry[],
   extensions: readonly IndexExtension[],
+  checkEntries: boolean,
 ): StagingEntry[] {
-  for (const entry of entries) {
+  // versions 2 and 3 check each entry as they write it (encodeFlat), before any byte is out
+  for (const entry of checkEntries ? entries : []) {
     // an entry encoded before was checked then (entries are never changed in place)
     if (encodedEntries.has(entry)) continue;
     validatePath(entry.path);
@@ -441,10 +545,15 @@ function checkedSorted(
     if (pathCmp !== 0) return pathCmp;
     return a.stage - b.stage;
   };
-  // an index is mostly given in its order already: checked in one pass before a sort
+  // an index is mostly given in its order already: checked in one pass before a sort. The
+  // engine's string order (UTF-16 code units) is the bytes' order unless a surrogate makes
+  // the difference: a pair it calls ordered is checked again only then
   let sorted = true;
   for (let i = 1; i < entries.length && sorted; i++) {
-    sorted = order(entries[i - 1] as StagingEntry, entries[i] as StagingEntry) < 0;
+    const a = entries[i - 1] as StagingEntry;
+    const b = entries[i] as StagingEntry;
+    sorted = a.path < b.path && !hasSurrogate(a.path) && !hasSurrogate(b.path);
+    if (!sorted) sorted = order(a, b) < 0;
   }
   return sorted ? [...entries] : [...entries].sort(order);
 }
@@ -462,6 +571,18 @@ function writtenVersion(entries: readonly StagingEntry[], version: IndexVersion)
 /** Whether an entry needs the extended flags word (git's CE_EXTENDED_FLAGS). */
 function hasExtendedFlags(entry: StagingEntry): boolean {
   return entry.intentToAdd === true || entry.skipWorktree === true;
+}
+
+/** The first `size` bytes of `out` in chunks of {@link INDEX_CHUNK_SIZE}, then their SHA-1. */
+function* chunked(out: Uint8Array, size: number): Generator<Uint8Array> {
+  const hasher = createSha1();
+  for (let at = 0; at < size; at += INDEX_CHUNK_SIZE) {
+    // a copy: the entries' records point into `out` (see encodeIndexFileBytes)
+    const chunk = out.slice(at, Math.min(size, at + INDEX_CHUNK_SIZE));
+    hasher.update(chunk);
+    yield chunk;
+  }
+  yield hasher.digest();
 }
 
 function* encodeSorted(
@@ -489,7 +610,7 @@ function* encodeSorted(
 
   let previousPath = "";
   for (const entry of sortedEntries) {
-    const entryBytes = serializeEntry(entry, version, previousPath);
+    const entryBytes = serializeEntry(entry, previousPath);
     pending.push(entryBytes);
     pendingLength += entryBytes.length;
     previousPath = entry.path;
@@ -542,7 +663,19 @@ function comparePaths(a: string, b: string): number {
  * written again and again (a rebase's picks) keeps most of its entry objects: only the
  * entries a command replaced are encoded afresh. Entries are never changed in place.
  */
-const encodedEntries = new WeakMap<StagingEntry, { version: IndexVersion; bytes: Uint8Array }>();
+const encodedEntries = new WeakMap<StagingEntry, EncodedEntry>();
+
+/**
+ * Where an entry's version 2/3 bytes were last written: `length` bytes at `offset` of
+ * `buffer` (an index file's bytes). Moved to each new buffer the entry is written to, so a
+ * buffer is kept only by the entries last written there.
+ */
+interface EncodedEntry {
+  version: IndexVersion;
+  buffer: Uint8Array;
+  offset: number;
+  length: number;
+}
 
 /**
  * Lets `copy`, a new entry object built from `source` (an index builder copies the entries
@@ -575,41 +708,10 @@ export function reuseEntryEncoding(source: object, copy: StagingEntry): void {
   }
 }
 
-function serializeEntry(
-  entry: StagingEntry,
-  version: IndexVersion,
-  previousPath: string,
-): Uint8Array {
-  if (version !== INDEX_VERSION_4) {
-    const known = encodedEntries.get(entry);
-    if (known && known.version === version) return known.bytes;
-  }
+function serializeEntry(entry: StagingEntry, previousPath: string): Uint8Array {
   const pathBytes = encodeGitPath(entry.path);
   // only an entry with an extended flag carries the word ("reduce extended entries")
-  const hasExtended = hasExtendedFlags(entry);
-
-  if (version === INDEX_VERSION_4) {
-    // Version 4: path compression
-    return serializeEntryV4(entry, pathBytes, previousPath, hasExtended);
-  }
-
-  // Version 2/3: uncompressed
-  const infoLen = hasExtended ? INFO_LEN_EXTENDED : INFO_LEN;
-  const baseLen = infoLen + pathBytes.length + 1; // +1 for null terminator
-  const alignedLen = (baseLen + 7) & ~7;
-  const _padding = alignedLen - baseLen;
-
-  const buffer = new Uint8Array(alignedLen);
-  const view = new DataView(buffer.buffer);
-
-  writeEntryHeader(view, entry, pathBytes.length, hasExtended);
-
-  // Path + null terminator
-  buffer.set(pathBytes, infoLen);
-  // Remaining bytes are already 0 (null terminator + padding)
-
-  encodedEntries.set(entry, { version, bytes: buffer });
-  return buffer;
+  return serializeEntryV4(entry, pathBytes, previousPath, hasExtendedFlags(entry));
 }
 
 /**
@@ -642,7 +744,8 @@ function serializeEntryV4(
   const buffer = new Uint8Array(totalLen);
   const view = new DataView(buffer.buffer);
 
-  writeEntryHeader(view, entry, pathBytes.length, hasExtended);
+  writeEntryHeader(view, 0, entry, pathBytes.length, hasExtended);
+  buffer.set(objectIdToBytes(entry.objectId), P_OBJECTID);
 
   let offset = infoLen;
   buffer.set(varintBytes, offset);
@@ -661,22 +764,30 @@ function serializeEntryV4(
  * nanoseconds win whenever they are within a few milliseconds of `ms`, and the seconds are
  * taken from them; otherwise `ms` alone decides.
  */
-function timeParts(ms: number, ns: number | undefined): [seconds: number, nanos: number] {
+function timeParts(ms: number, ns: number | undefined): void {
   const approx = (((ms % 1000) + 1000) % 1000) * 1e6;
   if (ns !== undefined && Number.isInteger(ns) && ns >= 0 && ns < 1e9) {
     const distance = Math.abs(approx - ns);
     if (Math.min(distance, 1e9 - distance) < 2e6) {
-      return [Math.round((ms - ns / 1e6) / 1000), ns];
+      timeSeconds = Math.round((ms - ns / 1e6) / 1000);
+      timeNanos = ns;
+      return;
     }
   }
-  return [Math.floor(ms / 1000), Math.min(999_999_999, Math.max(0, Math.floor(approx)))];
+  timeSeconds = Math.floor(ms / 1000);
+  timeNanos = Math.min(999_999_999, Math.max(0, Math.floor(approx)));
 }
+
+/** What the last {@link timeParts} gave (no array per call). */
+let timeSeconds = 0;
+let timeNanos = 0;
 
 /**
  * Write entry header (62 or 64 bytes).
  */
 function writeEntryHeader(
   view: DataView,
+  at: number,
   entry: StagingEntry,
   pathLength: number,
   hasExtended: boolean,
@@ -684,53 +795,33 @@ function writeEntryHeader(
   // ctime, mtime: seconds and nanoseconds (the exact nanoseconds when known, see timeParts)
   const ctime = entry.ctime ?? entry.mtime;
   const ctimeNs = entry.ctime === undefined ? entry.mtimeNs : entry.ctimeNs;
-  const [ctimeSec, ctimeNanos] = timeParts(ctime, ctimeNs);
-  const [mtimeSec, mtimeNanos] = timeParts(entry.mtime, entry.mtimeNs);
-  view.setUint32(P_CTIME, ctimeSec);
-  view.setUint32(P_CTIME + 4, ctimeNanos);
-  view.setUint32(P_MTIME, mtimeSec);
-  view.setUint32(P_MTIME + 4, mtimeNanos);
+  timeParts(ctime, ctimeNs);
+  view.setUint32(at + P_CTIME, timeSeconds);
+  view.setUint32(at + P_CTIME + 4, timeNanos);
+  timeParts(entry.mtime, entry.mtimeNs);
+  view.setUint32(at + P_MTIME, timeSeconds);
+  view.setUint32(at + P_MTIME + 4, timeNanos);
 
-  // dev, ino
-  view.setUint32(P_DEV, entry.dev ?? 0);
-  view.setUint32(P_INO, entry.ino ?? 0);
+  view.setUint32(at + P_DEV, entry.dev ?? 0);
+  view.setUint32(at + P_INO, entry.ino ?? 0);
+  view.setUint32(at + P_MODE, entry.mode);
+  view.setUint32(at + P_UID, (entry.uid ?? 0) >>> 0);
+  view.setUint32(at + P_GID, (entry.gid ?? 0) >>> 0);
+  view.setUint32(at + P_SIZE, entry.size);
 
-  // mode
-  view.setUint32(P_MODE, entry.mode);
-
-  // uid, gid
-  view.setUint32(P_UID, (entry.uid ?? 0) >>> 0);
-  view.setUint32(P_GID, (entry.gid ?? 0) >>> 0);
-
-  // size
-  view.setUint32(P_SIZE, entry.size);
-
-  // object ID (20 bytes)
-  const oidBytes = objectIdToBytes(entry.objectId);
-  const buffer = new Uint8Array(view.buffer, view.byteOffset);
-  buffer.set(oidBytes, P_OBJECTID);
-
-  // flags
+  // flags (the object id is written by the caller)
   const nameLen = Math.min(pathLength, NAME_MASK);
   let flags = (entry.stage << 12) | nameLen;
-  if (hasExtended) {
-    flags |= EXTENDED;
-  }
-  if (entry.assumeValid) {
-    flags |= ASSUME_VALID;
-  }
-  view.setUint16(P_FLAGS, flags);
+  if (hasExtended) flags |= EXTENDED;
+  if (entry.assumeValid) flags |= ASSUME_VALID;
+  view.setUint16(at + P_FLAGS, flags);
 
   // extended flags
   if (hasExtended) {
     let extFlags = 0;
-    if (entry.intentToAdd) {
-      extFlags |= INTENT_TO_ADD >>> 16;
-    }
-    if (entry.skipWorktree) {
-      extFlags |= SKIP_WORKTREE >>> 16;
-    }
-    view.setUint16(P_FLAGS2, extFlags);
+    if (entry.intentToAdd) extFlags |= INTENT_TO_ADD >>> 16;
+    if (entry.skipWorktree) extFlags |= SKIP_WORKTREE >>> 16;
+    view.setUint16(at + P_FLAGS2, extFlags);
   }
 }
 
@@ -798,6 +889,7 @@ function readNullTerminated(
  * Validate path for index entry.
  */
 function validatePath(path: string): void {
+  if (validAsciiPath(path)) return;
   if (!path) {
     throw new Error("Empty path");
   }
@@ -825,6 +917,36 @@ function validatePath(path: string): void {
       throw new Error(`Invalid path: ${path} (contains .git)`);
     }
   }
+}
+
+/**
+ * The common case of {@link validatePath} in one pass: an ASCII path without an empty
+ * component, a NUL or a `.git` component (any case). False sends the path to the full check
+ * (which then names what is wrong).
+ */
+function validAsciiPath(path: string): boolean {
+  const n = path.length;
+  let start = 0;
+  for (let i = 0; i <= n; i++) {
+    const c = i < n ? path.charCodeAt(i) : 0x2f;
+    if (c === 0x2f) {
+      const len = i - start;
+      if (len === 0) return false;
+      if (
+        len === 4 &&
+        path.charCodeAt(start) === 0x2e &&
+        (path.charCodeAt(start + 1) | 0x20) === 0x67 &&
+        (path.charCodeAt(start + 2) | 0x20) === 0x69 &&
+        (path.charCodeAt(start + 3) | 0x20) === 0x74
+      ) {
+        return false;
+      }
+      start = i + 1;
+    } else if (c === 0 || c > 0x7f) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**

@@ -424,6 +424,29 @@ export function pathspecErrors(originals: readonly string[], seen: readonly numb
   return errors;
 }
 
+/**
+ * git's `exclude_matches_pathspec`: whether an ignored path found by the directory scan is
+ * one the pathspec names (an element's literal part is the path, or goes on below it as a
+ * directory), so `git add` reports it as ignored instead of passing over it in silence.
+ */
+export function excludeMatchesPathspec(items: readonly PathspecItem[], path: string): boolean {
+  const name = pathspecName(path);
+  for (const element of items) {
+    const item = pathspecItemBytes(element);
+    const len = item.nowildcardLen;
+    const n = name.length;
+    if (len < n) continue;
+    if (len > n && item.match[n] !== "/") continue;
+    if (psEqual(item, item.match.slice(0, n), name)) return true;
+  }
+  return false;
+}
+
+/** The path an element names, as a string of the repository (its literal match, decoded). */
+export function pathspecItemPath(item: PathspecItem): string {
+  return item.bytes ? decodeGitPath(latin1Bytes(item.match)) : item.match;
+}
+
 // ============ tree entries (tree-walk.c tree_entry_interesting) ============
 
 /** `tree_entry_interesting`: no later entry of this tree can match */
@@ -562,7 +585,7 @@ export function byteString(s: string): string {
 }
 
 /** A string of one character per byte as its bytes. */
-function latin1Bytes(s: string): Uint8Array {
+export function latin1Bytes(s: string): Uint8Array {
   const out = new Uint8Array(s.length);
   for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
   return out;

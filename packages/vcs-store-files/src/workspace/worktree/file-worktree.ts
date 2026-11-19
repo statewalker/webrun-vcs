@@ -35,6 +35,7 @@ import { collect } from "@statewalker/vcs-utils/streams";
 import type {
   AttributesIndex,
   GitHostEnvironment,
+  GitlinkHeadState,
   IgnoreManager,
   NestedRepositoryState,
   NewHasher,
@@ -568,10 +569,11 @@ export class FileWorktree implements Worktree {
     }
   }
 
-  async isIgnored(path: string): Promise<boolean> {
+  async isIgnored(path: string, asDirectory = false): Promise<boolean> {
     // the .gitignore files of the path's directories and the exclude files, read for this
     // check (once per batch), never through a link
     await this.loadIgnoresFor(path, this.batchIgnores ?? new Set<string>());
+    if (asDirectory) return this.ignoreManager.isIgnored(path, true);
 
     // a directory (an empty one too), never a link to one: as git's lstat decides
     const kind = await this.kindOrError(joinPath(this.rootPath, path));
@@ -799,65 +801,155 @@ export class FileWorktree implements Worktree {
   /**
    * Whether the directory at `path` holds a repository of its own, as git's
    * `is_nonbare_repository_dir` decides: `"repository"`, `"none"`, or `"unknown"` when its
-   * `.git` cannot be checked through this FilesApi (a gitfile or link naming a place
-   * beyond its root, a path reached through a link, an unreadable entry).
+   * `.git` cannot be checked through this FilesApi (a gitfile, link or commondir naming a
+   * place beyond its root, a path reached through a link, an unreadable entry).
+   *
+   * @throws Error with git's "fatal: failed to read <gitdir>/commondir" for an empty
+   * `commondir` (git's `get_common_dir` dies)
    */
   async repositoryState(path: string): Promise<NestedRepositoryState> {
-    const dotGit = joinPath(this.rootPath, path, ".git");
-    const kind = await this.kindOrError(dotGit);
-    if (kind === undefined) return "none";
-    if (kind === "error") return "unknown";
-    if (kind === "file") {
-      // a gitdir: file names a repository when its target is one
-      let target: string | undefined;
-      try {
-        target = await this.readGitfile(dotGit);
-      } catch {
-        return "unknown";
-      }
-      if (!target) return "none";
-      const resolved = this.gitfileTarget(path, target);
-      if (resolved === undefined) return "unknown";
-      // any HEAD (a linked worktree's gitdir has no objects of its own: its commondir has)
-      return this.headState(resolved);
-    }
-    if (kind === "symlink") {
-      // a `.git` link (git follows it): its target, when this FilesApi can name it
-      if (await this.isDanglingLink(dotGit, path)) return "none";
-      const bytes = await this.files.readlink?.(dotGit).catch(() => undefined);
-      const resolved = bytes ? this.gitfileTarget(path, decodeGitPath(bytes)) : undefined;
-      if (resolved === undefined) return "unknown";
-      const state = await this.headState(resolved);
-      return state === "none" ? "unknown" : state;
-    }
-    if (kind !== "directory") return "none";
-    return this.gitDirectoryState(dotGit);
-  }
-
-  /** Whether the directory at `dir` has a HEAD (file or link): a repository's gitdir. */
-  private async headState(dir: string): Promise<NestedRepositoryState> {
-    const head = await this.kindOrError(joinPath(dir, "HEAD"));
-    if (head === "error") return "unknown";
-    return head === undefined ? "none" : "repository";
+    return (await this.nestedGitDir(path)).state;
   }
 
   /**
-   * git's `is_git_directory` for the directory at `dir` (a path in this FilesApi): a HEAD
-   * (a file, or a link as core.preferSymlinkRefs writes it), objects and refs (directories,
-   * or links to them).
+   * git's `is_nonbare_repository_dir` of the directory at `path`, with the git directory it
+   * finds (and its common directory) when it is a repository: a `.git` directory, the
+   * directory a `gitdir:` file names, or what a `.git` link points to (a directory, or a
+   * gitfile, as git's `stat` follows it).
    */
-  private async gitDirectoryState(dir: string): Promise<NestedRepositoryState> {
-    const kindAt = (name: string) => this.kindOrError(joinPath(dir, name));
-    const head = await kindAt("HEAD");
-    if (head === "error") return "unknown";
-    if (head === undefined) return "none";
+  private async nestedGitDir(path: string): Promise<NestedGitDir> {
+    const dotGit = joinPath(this.rootPath, path, ".git");
+    const display = path ? `${path}/.git` : ".git";
+    const kind = await this.kindOrError(dotGit);
+    if (kind === undefined) return { state: "none" };
+    if (kind === "error") return { state: "unknown" };
+    if (kind === "directory") return this.gitDirectoryAt(dotGit, display);
+    if (kind === "file") return this.gitfileRepository(path, dotGit);
+    if (kind !== "symlink") return { state: "none" };
+    // a `.git` link (git follows it): its target, when this FilesApi can name it
+    const bytes = await this.files.readlink?.(dotGit).catch(() => undefined);
+    const resolved = bytes ? this.gitfileTarget(path, decodeGitPath(bytes)) : undefined;
+    if (resolved === undefined) return { state: "unknown" };
+    const target = await this.kindOrError(resolved);
+    // dangling: git's stat fails, and so does is_git_directory
+    if (target === undefined) return { state: "none" };
+    if (target === "directory") return this.gitDirectoryAt(resolved, display);
+    // a link to a gitfile is read as one (its gitdir relative to the link's directory)
+    if (target === "file") return this.gitfileRepository(path, resolved);
+    if (target === "error" || target === "symlink") return { state: "unknown" };
+    return { state: "none" };
+  }
+
+  /** git's `read_gitfile_gently` of the gitfile `file` (the `.git` of `path`). */
+  private async gitfileRepository(path: string, file: string): Promise<NestedGitDir> {
+    let target: string | undefined;
+    try {
+      target = await this.readGitfile(file);
+    } catch {
+      // git's READ_GITFILE_ERR_OPEN_FAILED / READ_FAILED: taken for a repository
+      return { state: "unknown" };
+    }
+    if (!target) return { state: "none" };
+    const resolved = this.gitfileTarget(path, target);
+    if (resolved === undefined) return { state: "unknown" };
+    // the name git gives it: relative to the gitfile's directory, as written
+    const display = this.isAbsoluteGitPath(target) || !path ? target : `${path}/${target}`;
+    return this.gitDirectoryAt(resolved, display);
+  }
+
+  /**
+   * git's `is_git_directory` of the directory at `dir` (a path in this FilesApi, `display`
+   * its name in git's messages): a valid HEAD ({@link headState}: a file, or a link as
+   * core.preferSymlinkRefs writes it), then objects and refs (directories) in its common
+   * directory (a linked worktree's gitdir has none of its own: its `commondir` names them).
+   */
+  private async gitDirectoryAt(dir: string, display: string): Promise<NestedGitDir> {
+    const head = await this.headState(dir);
+    if (head !== "repository") return { state: head };
+    const commonDir = await this.commonDirOf(dir, display);
+    if (commonDir === undefined) return { state: "unknown" };
     let unknown = false;
     for (const name of ["objects", "refs"]) {
-      const k = await kindAt(name);
+      const k = await this.kindOrError(joinPath(commonDir, name));
       if (k === "error" || k === "symlink") unknown = true;
-      else if (k !== "directory") return "none";
+      else if (k !== "directory") return { state: "none" };
     }
-    return unknown ? "unknown" : "repository";
+    return unknown ? { state: "unknown" } : { state: "repository", gitDir: dir, commonDir };
+  }
+
+  /**
+   * git's `get_common_dir_noenv` of the git directory `dir`: the directory its `commondir`
+   * file names (relative to `dir`, or absolute), `dir` itself without one. Undefined when it
+   * cannot be read here (beyond this FilesApi's root, unreadable, through a link chain).
+   *
+   * @throws Error with git's "fatal: failed to read <display>/commondir" for an empty one
+   * (or one that is no file)
+   */
+  private async commonDirOf(dir: string, display: string): Promise<string | undefined> {
+    let file = joinPath(dir, "commondir");
+    let kind = await this.kindOrError(file);
+    if (kind === "symlink") {
+      // git's file_exists and read follow a link
+      const bytes = await this.files.readlink?.(file).catch(() => undefined);
+      const target = bytes ? decodeGitPath(bytes) : undefined;
+      const resolved = !target
+        ? undefined
+        : this.isAbsoluteGitPath(target)
+          ? this.gitfileTarget("", target)
+          : resolveDots(joinPath(dir, target));
+      if (resolved === undefined) return undefined;
+      file = resolved;
+      kind = await this.kindOrError(file);
+      if (kind === "symlink") return undefined;
+    }
+    if (kind === undefined) return dir;
+    if (kind === "error" || kind === "other") return undefined;
+    const fatal = () => new Error(`fatal: failed to read ${display}/commondir`);
+    if (kind !== "file") throw fatal();
+    let bytes: Uint8Array;
+    try {
+      bytes = await readFile(this.files, file);
+    } catch {
+      return undefined;
+    }
+    if (bytes.length === 0) throw fatal();
+    let end = bytes.length;
+    while (end > 0 && (bytes[end - 1] === 0x0a || bytes[end - 1] === 0x0d)) end--;
+    const common = decodeGitPath(bytes.subarray(0, end));
+    if (this.isAbsoluteGitPath(common)) return this.gitfileTarget("", common);
+    return resolveDots(joinPath(dir, common));
+  }
+
+  /** Whether a path git reads from a file is absolute (a drive letter only on Windows). */
+  private isAbsoluteGitPath(target: string): boolean {
+    return target.startsWith("/") || (this.windowsPaths && /^[A-Za-z]:[\\/]/.test(target));
+  }
+
+  /**
+   * Whether the directory at `dir` has a valid HEAD (git's `validate_headref`): a link into
+   * `refs/`, or a file holding a symbolic ref into `refs/` or an object id.
+   */
+  private async headState(dir: string): Promise<NestedRepositoryState> {
+    const path = joinPath(dir, "HEAD");
+    const kind = await this.kindOrError(path);
+    if (kind === "error") return "unknown";
+    if (kind === "symlink") {
+      const target = await this.files.readlink?.(path).catch(() => undefined);
+      if (!target) return "unknown";
+      return decodeGitPath(target).startsWith("refs/") ? "repository" : "none";
+    }
+    // anything but a regular file fails git's open/read (and a FIFO would block)
+    if (kind !== "file") return "none";
+    let text: string;
+    try {
+      text = decodeGitPath((await readFile(this.files, path)).subarray(0, 255));
+    } catch {
+      return "unknown";
+    }
+    if (text.startsWith("ref:") && text.slice(4).replace(/^\s+/, "").startsWith("refs/")) {
+      return "repository";
+    }
+    return /^([0-9a-fA-F]{64}|[0-9a-fA-F]{40})/.test(text) ? "repository" : "none";
   }
 
   /**
@@ -886,32 +978,72 @@ export class FileWorktree implements Worktree {
   }
 
   async readGitlinkHead(path: string): Promise<ObjectId | undefined> {
-    const text = async (full: string) => {
-      try {
-        // a regular file only: never a link, and never a FIFO (reading one would block)
-        if (this.files.lstat) {
-          if ((await this.files.lstat(full))?.kind !== "file") return undefined;
-        } else if ((await this.files.stats(full))?.kind !== "file") return undefined;
-        return decodeGitPath(await readFile(this.files, full)).trim();
-      } catch {
-        return undefined;
+    const state = await this.gitlinkHeadState(path);
+    return state.state === "commit" ? state.head : undefined;
+  }
+
+  /**
+   * git's `resolve_gitlink_ref(path, "HEAD")`: the repository at `path` found as
+   * {@link repositoryState} finds it, then its HEAD resolved (a link into `refs/` as
+   * `ref: <target>`, as core.preferSymlinkRefs writes it), loose refs in its git directory
+   * then its common directory, then `packed-refs`. `"none"` when there is no repository or
+   * no commit there, `"unknown"` when it cannot be read here.
+   */
+  async gitlinkHeadState(path: string): Promise<GitlinkHeadState> {
+    const repo = await this.nestedGitDir(path);
+    if (repo.state !== "repository") return { state: repo.state };
+    const { gitDir, commonDir } = repo;
+    let head = await this.readRefFile(joinPath(gitDir, "HEAD"));
+    for (let depth = 0; typeof head === "string" && head.startsWith("ref:"); depth++) {
+      if (depth >= 5) return { state: "unknown" };
+      const ref = head.slice(4).trim();
+      let loose = await this.readRefFile(joinPath(gitDir, ref));
+      if (loose === undefined && commonDir !== gitDir) {
+        loose = await this.readRefFile(joinPath(commonDir, ref));
       }
-    };
-    const gitDir = await this.gitlinkDir(path);
-    if (gitDir === undefined) return undefined;
-    let head = await text(joinPath(gitDir, "HEAD"));
-    for (let depth = 0; head?.startsWith("ref: ") && depth < 5; depth++) {
-      const ref = head.slice(5).trim();
-      const loose = await text(joinPath(gitDir, ref));
-      if (loose) {
+      if (loose !== undefined) {
         head = loose;
         continue;
       }
-      const packed = await text(joinPath(gitDir, "packed-refs"));
+      const packed = await this.readRefFile(joinPath(commonDir, "packed-refs"));
+      if (packed === UNREADABLE) return { state: "unknown" };
       const line = packed?.split("\n").find((l) => l.endsWith(` ${ref}`));
       head = line?.split(" ")[0];
     }
-    return head && /^[0-9a-f]{40,64}$/.test(head) ? head : undefined;
+    if (head === UNREADABLE) return { state: "unknown" };
+    if (!head || !/^[0-9a-f]{40,64}$/.test(head) || /^0+$/.test(head)) return { state: "none" };
+    return { state: "commit", head };
+  }
+
+  /**
+   * A ref file of a nested repository, trimmed: a link into `refs/` read as `ref: <target>`
+   * (git's files backend), undefined when absent (or a directory), {@link UNREADABLE} when it
+   * cannot be read here (a FIFO would block).
+   */
+  private async readRefFile(full: string): Promise<string | typeof UNREADABLE | undefined> {
+    const kind = await this.kindOrError(full);
+    if (kind === undefined || kind === "directory") return undefined;
+    if (kind === "symlink") {
+      const target = await this.files.readlink?.(full).catch(() => undefined);
+      const name = target ? decodeGitPath(target) : "";
+      return name.startsWith("refs/") ? `ref: ${name}` : UNREADABLE;
+    }
+    if (kind !== "file") return UNREADABLE;
+    try {
+      return decodeGitPath(await readFile(this.files, full)).trim();
+    } catch {
+      return UNREADABLE;
+    }
+  }
+
+  /**
+   * Whether the entry at `path` is a FIFO, socket or device: present, but no content git
+   * can add (`getEntry` gives undefined for it, as for a missing path).
+   */
+  async isSpecialFile(path: string): Promise<boolean> {
+    if (!this.files.lstat) return false;
+    const link = await this.files.lstat(joinPath(this.rootPath, path)).catch(() => undefined);
+    return link?.kind === "other";
   }
 
   /**
@@ -1145,24 +1277,6 @@ export class FileWorktree implements Worktree {
 
   /** What is at `fullPath`: `lstat` where the FilesApi has it, else `stats`. */
   /**
-   * Whether the link at `link` (the `.git` of the directory `dir`) certainly points nowhere:
-   * its target, relative or absolute inside this FilesApi's root, is confirmed absent. A
-   * target that cannot be checked is not dangling.
-   */
-  private async isDanglingLink(link: string, dir: string): Promise<boolean> {
-    try {
-      const bytes = await this.files.readlink?.(link);
-      if (!bytes) return false;
-      // the target as bytes, as `repositoryState` reads it (a name that is no UTF-8)
-      const target = this.gitfileTarget(dir, decodeGitPath(bytes));
-      if (target === undefined) return false;
-      return (await this.kindOrError(target)) === undefined;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
    * The kind of entry at `fullPath`, undefined only when it is confirmed absent, `"error"`
    * when it cannot be checked (beneath a link, unreadable).
    */
@@ -1375,6 +1489,14 @@ export class FileWorktree implements Worktree {
  */
 /** The stat data of an entry the FilesApi reports (what git's index records of it). */
 /** `path` with `.` and `..` resolved; undefined when it climbs above the root. */
+/** A ref file of a nested repository that cannot be read here. */
+const UNREADABLE = Symbol("unreadable");
+
+/** What git's `is_nonbare_repository_dir` finds at a directory, its git directories with it. */
+type NestedGitDir =
+  | { state: "repository"; gitDir: string; commonDir: string }
+  | { state: "none" | "unknown"; gitDir?: undefined; commonDir?: undefined };
+
 function resolveDots(path: string): string | undefined {
   const out: string[] = [];
   for (const part of path.split("/")) {

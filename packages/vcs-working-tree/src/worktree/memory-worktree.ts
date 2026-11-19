@@ -217,8 +217,8 @@ export class MemoryWorktree implements Worktree {
     return this.files.has(path) || this.directories.has(path) || this.hasFilesUnder(path);
   }
 
-  async isIgnored(path: string): Promise<boolean> {
-    const isDirectory = this.directories.has(path) || this.hasFilesUnder(path);
+  async isIgnored(path: string, asDirectory = false): Promise<boolean> {
+    const isDirectory = asDirectory || this.directories.has(path) || this.hasFilesUnder(path);
     return this.isIgnoredPath(path, isDirectory);
   }
 

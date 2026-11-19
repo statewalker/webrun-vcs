@@ -55,6 +55,16 @@ export interface WorktreeWalkOptions {
 /** Whether a directory holds a repository of its own, as far as the worktree can tell. */
 export type NestedRepositoryState = "repository" | "none" | "unknown";
 
+/**
+ * The commit checked out in a nested repository (git's `resolve_gitlink_ref` of its HEAD):
+ * `"none"` when there is no repository or no commit there (git's `check_removed` then takes
+ * a tracked file's directory for its removal), `"unknown"` when it cannot be read here.
+ */
+export type GitlinkHeadState =
+  | { state: "commit"; head: ObjectId }
+  | { state: "none" }
+  | { state: "unknown" };
+
 /** Options for removing a worktree entry. */
 export interface WorktreeRemoveOptions {
   /** Remove a directory with everything in it */
@@ -239,7 +249,12 @@ export interface Worktree {
   /** The file's content as it is on disk (never converted). */
   readContent(path: string): AsyncIterable<Uint8Array>;
   exists(path: string): Promise<boolean>;
-  isIgnored(path: string): Promise<boolean>;
+  /**
+   * Whether the ignore rules exclude `path`, judged as a directory when one is there, or
+   * with `asDirectory` whatever is there (a pathspec element ending in "/", as git's
+   * `is_excluded` judges it).
+   */
+  isIgnored(path: string, asDirectory?: boolean): Promise<boolean>;
 
   // ========== Writing ==========
 
@@ -270,6 +285,12 @@ export interface Worktree {
   readGitlinkHead?(path: string): Promise<ObjectId | undefined>;
 
   /**
+   * The commit checked out in the repository at `path`, or whether there is none
+   * (`"none"`: no repository, or no commit) or it cannot be read here (`"unknown"`).
+   */
+  gitlinkHeadState?(path: string): Promise<GitlinkHeadState>;
+
+  /**
    * The repository checked out in the submodule at `path`, opened as a working copy (its
    * own HEAD, index, config and worktree), so its status can be read as git's
    * `is_submodule_modified` reads it; undefined when it is not populated or its repository
@@ -290,6 +311,13 @@ export interface Worktree {
    * read). `isRepository` takes an unknown as a repository.
    */
   repositoryState?(path: string): Promise<NestedRepositoryState>;
+
+  /**
+   * Whether the entry at `path` is a FIFO, socket or device: there, but nothing git can add
+   * ("can only add regular files, symbolic links or git-directories"). `getEntry` gives
+   * undefined for it, as for a missing path; this tells the two apart.
+   */
+  isSpecialFile?(path: string): Promise<boolean>;
   mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;
 
