@@ -1794,7 +1794,11 @@ class StatEntry implements WorktreeEntry {
     return this.#ignored;
   }
 
-  /** The plain fields, as an object literal entry has them (`{ ...entry }` copies them). */
+  /**
+   * Every field as a plain object, the getters included: `{ ...entry }` copies only the own
+   * fields and drops the prototype getters `name` and `isIgnored`, so serialise or copy an
+   * entry through this.
+   */
   toJSON(): WorktreeEntry {
     return {
       path: this.path,

@@ -89,6 +89,12 @@ export interface UntrackedScanOptions {
    * then read from the index), and no conversion applies; undefined otherwise
    */
   indexIgnoreOid?(path: string): string | undefined;
+  /**
+   * The id git records for a `.gitignore` missing from the worktree: the stage-0 entry's
+   * when it is skip-worktree (read_skip_worktree_file_from_index reads its blob); undefined
+   * otherwise, an assume-unchanged entry included (the null id is recorded then)
+   */
+  skipWorktreeIgnoreOid?(path: string): string | undefined;
   /** The untracked cache to use and update (made for dir flags 0); none: a plain scan */
   cache?: UntrackedCache;
   /** The index file's mtime in whole seconds (racy directory stats are read again) */
@@ -162,8 +168,8 @@ export async function scanUntracked(
           ? await excludeFileOid(read.bytes)
           : (options.indexIgnoreOid?.(path) ?? (await excludeFileOid(read.bytes)));
     } else {
-      // read_skip_worktree_file_from_index: the entry's blob, by its id
-      oid = options.indexIgnoreOid?.(path) ?? NULL_OID;
+      // read_skip_worktree_file_from_index: a skip-worktree entry's blob, by its id
+      oid = options.skipWorktreeIgnoreOid?.(path) ?? NULL_OID;
     }
     if (oid !== node.excludeOid) {
       invalidateGitignore(cache, node);

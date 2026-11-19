@@ -156,7 +156,10 @@ export async function refreshIndexFile(
     // a changed untracked cache is written even with no stat to store (UNTRACKED_CHANGED)
     const entries = applyStatUpdates(base, updates, now) ?? (untrackedChanged ? base : undefined);
     if (!entries) return undefined;
-    if (untrackedChanged) fresh.setUntrackedCache(untrackedCache, entries);
+    // the cache was scanned against the in-memory entries: given those, the write
+    // invalidates the directory of every path they add or remove against the entries
+    // written here, so the cache always describes the index on disk
+    if (untrackedChanged) fresh.setUntrackedCache(untrackedCache, inMemory);
     fresh.version = current.version;
     await fresh.write(entries);
     current.adopt(fresh);

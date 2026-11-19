@@ -519,7 +519,8 @@ export class StatusCommand extends GitCommand<Status> {
           trackedIn: (dir) => index.trackedIn(dir),
           indexDirectory: (dir) =>
             gitlinks.has(dir) ? "gitlink" : index.hasEntriesBelow(dir) ? "directory" : undefined,
-          indexIgnoreOid: (p) => ignoreFiles.get(p),
+          indexIgnoreOid: (p) => ignoreFiles.upToDate.get(p),
+          skipWorktreeIgnoreOid: (p) => ignoreFiles.skipWorktree.get(p),
           ...(cache ? { cache } : {}),
           indexSeconds: Math.floor(indexTime / 1000),
           ...(trust ? { stat: { ctime: trust.ctime, fullStat: trust.fullStat } } : {}),
@@ -574,18 +575,21 @@ export class StatusCommand extends GitCommand<Status> {
 
   /**
    * The ids the untracked cache takes from the index for `.gitignore` files (git's
-   * `add_patterns`): the stage-0 entry's, where the file is up to date with it or the entry
-   * is skip-worktree (read from the index then).
+   * `add_patterns`): `upToDate`, the stage-0 entry's where the file is up to date with it
+   * (assume-unchanged and skip-worktree count as up to date); `skipWorktree`, the stage-0
+   * entry's where it is skip-worktree, for a file missing from the worktree (read from the
+   * index then; an assume-unchanged one missing records the null id).
    */
   private indexIgnoreOids(
     entries: readonly StagingEntry[],
     upToDate: ReadonlySet<string>,
-  ): Map<string, string> {
-    const out = new Map<string, string>();
+  ): { upToDate: Map<string, string>; skipWorktree: Map<string, string> } {
+    const out = { upToDate: new Map<string, string>(), skipWorktree: new Map<string, string>() };
     if (upToDate.size === 0) return out;
     for (const entry of entries) {
       if (entry.stage !== 0 || !upToDate.has(entry.path)) continue;
-      out.set(entry.path, entry.objectId);
+      out.upToDate.set(entry.path, entry.objectId);
+      if (entry.skipWorktree) out.skipWorktree.set(entry.path, entry.objectId);
     }
     return out;
   }
@@ -604,7 +608,9 @@ export class StatusCommand extends GitCommand<Status> {
    * Pairs renames as git status does: on the index side (`diff-index --cached`) a path
    * removed from the index with one added to it; on the worktree side (`diff-files`) a
    * path deleted from the worktree with an intent-to-add file. The source's line goes (or
-   * keeps only its other side); the destination's line becomes the rename.
+   * keeps only its other side); the destination's line becomes the rename. Unmerged paths
+   * take part on the worktree side only, as diff-files queues them: a file there is a
+   * destination, stage #2 of one gone a source; their own lines stay as they are.
    */
   private async pairRenames(
     files: StatusFileEntry[],
@@ -667,14 +673,30 @@ export class StatusCommand extends GitCommand<Status> {
       }
     }
 
-    // worktree side: deletions from the worktree against intent-to-add files
+    // worktree side: deletions from the worktree against intent-to-add files; an unmerged
+    // path takes part as git's diff-files queues it: its file, when there, is a destination
+    // (diff_unmerge with the worktree mode), and its stage #2 a deletion (a source) when the
+    // file is gone
     if (worktree) {
       const sources: RenameCandidate[] = [];
+      const sourceSides = new Map<string, { mode: number; id: ObjectId }>();
       const destinations: Array<[RenameCandidate, StatusFileEntry]> = [];
       for (const f of files) {
-        if (f.stages || drop.has(f)) continue;
+        if (drop.has(f)) continue;
+        if (f.stages) {
+          const ours = f.stages[1];
+          if (f.worktreeMode !== undefined) {
+            destinations.push([{ path: f.path, mode: f.worktreeMode, id: "" }, f]);
+          } else if (ours && !isGitlink(ours.mode)) {
+            // no file (or a directory, which git's check_removed takes as gone)
+            sources.push({ path: f.path, ...side(ours) });
+            sourceSides.set(f.path, side(ours));
+          }
+          continue;
+        }
         if (f.worktree === "D" && f.staged) {
           sources.push({ path: f.path, ...side(f.staged) });
+          sourceSides.set(f.path, side(f.staged));
         } else if (f.worktree === "A" && f.worktreeMode !== undefined) {
           destinations.push([{ path: f.path, mode: f.worktreeMode, id: "" }, f]);
         }
@@ -716,16 +738,22 @@ export class StatusCommand extends GitCommand<Status> {
         for (const pair of pairs) {
           const from = byPath.get(pair.from);
           const to = byPath.get(pair.to);
-          if (!from?.staged || !to) continue;
-          // the source keeps only its index side, if it has one
-          if (from.index === " ") drop.add(from);
+          const source = sourceSides.get(pair.from);
+          if (!from || !source || !to) continue;
+          // the source keeps only its index side, if it has one; an unmerged source keeps
+          // its line (its stage #2 deletion goes)
+          if (from.stages) {
+            // nothing shown changes
+          } else if (from.index === " ") drop.add(from);
           else {
             from.worktree = " ";
-            from.worktreeMode = from.staged.mode;
+            from.worktreeMode = source.mode;
           }
+          // an unmerged destination stays as it is (wt_status shows its stages, no rename)
+          if (to.stages) continue;
           to.worktree = "R";
-          to.head = from.staged;
-          to.staged = from.staged;
+          to.head = source;
+          to.staged = source;
           to.renamedFrom = pair.from;
           to.renameScore = scorePercent(pair.score);
           renamed.set(pair.to, pair.from);

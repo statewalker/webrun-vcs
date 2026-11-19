@@ -66,6 +66,11 @@ const put = (dir: string, path: string, content: string) => {
 
 /** Our working copy over the repository, with the host environment native git has. */
 async function open(dir: string) {
+  return (await openParts(dir)).git;
+}
+
+/** `open`, with the staging store it reads the index through. */
+async function openParts(dir: string) {
   const files = createNodeFilesApi({ rootDir: dir });
   const { history } = await createGitFilesBackend({ files });
   const io = {
@@ -102,7 +107,7 @@ async function open(dir: string) {
     trees: history.trees,
   });
   const wc = new MemoryWorkingCopy({ history, checkout, worktree, config });
-  return Git.fromWorkingCopy(wc);
+  return { git: Git.fromWorkingCopy(wc), staging };
 }
 
 /** The `UNTR` payload of the repository's index (undefined: none). */
@@ -401,4 +406,42 @@ describeGit("untracked cache: native git and ours write the same UNTR", () => {
       }
     }
   }, 120_000);
+
+  it("a status over unwritten index edits writes a cache that matches the index on disk", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    await (await open(dir)).status().call();
+    put(dir, "u/v/x.txt", "x\n");
+    dateBack(dir);
+    const objectId = git(dir, ["hash-object", "-w", "u/v/x.txt"]).trim();
+    const { git: ours, staging } = await openParts(dir);
+    const editor = staging.createEditor();
+    editor.upsert({ path: "u/v/x.txt", mode: 0o100644, objectId });
+    await editor.finish();
+    // the scan sees u/v/x.txt as tracked; the index file (refreshed, not written) does not
+    const inMemory = await ours.status().call();
+    expect(inMemory.untracked.has("u/v/x.txt")).toBe(false);
+    const fresh = await (await open(dir)).status().call();
+    expect(fresh.untracked.has("u/v/x.txt")).toBe(true);
+    expect(formatStatusPorcelain(fresh)).toBe(uncachedStatus(dir));
+    expect(git(dir, ["status", "--porcelain", "-uall"])).toBe(uncachedStatus(dir));
+    expect(git(dir, ["status", "--porcelain", "-uall"])).toContain("?? u/v/x.txt");
+  });
+
+  for (const flag of ["--assume-unchanged", "--skip-worktree"]) {
+    it(`a missing ${flag.slice(2)} .gitignore is recorded as native git records it`, async () => {
+      const dir = join(root, "r");
+      repo(dir);
+      put(dir, "d/x.tmp", "t\n");
+      git(dir, ["status", "--porcelain"]);
+      git(dir, ["update-index", flag, "d/.gitignore"]);
+      rmSync(join(dir, "d/.gitignore"));
+      dateBack(dir);
+      await expectTwins(dir, "native");
+      put(dir, "d/later.txt", "l\n");
+      dateBack(dir);
+      await expectTwins(dir, "ours");
+      expect(git(dir, ["status", "--porcelain"])).toBe(uncachedStatus(dir));
+    });
+  }
 });
