@@ -13,9 +13,8 @@ pnpm test           # everything, as before
 The hash covers the package's files (git blob ids; `ignore` names left out), the external
 packages it resolves to in `pnpm-lock.yaml` with their whole dependency closure, the same for
 every workspace package it reaches, and the global inputs of `config.json` (root files, root
-dependencies, the config itself). Uncommitted changes count locally; CI hashes the commit.
-A change to how the script hashes changes the hashes by itself; a change to how it runs the
-tests retests nothing.
+dependencies, the config itself and the script). Uncommitted changes count locally; CI hashes
+the commit.
 
 Only CI writes these files: the `tested-record` job of `.github/workflows/ci.yml` commits them
 to the pull request's branch after a green run. Do not edit them by hand. On a merge conflict,
