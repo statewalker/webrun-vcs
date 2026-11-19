@@ -30,6 +30,8 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -84,7 +86,13 @@ function sourceTree() {
   try {
     const index = join(scratch, "index");
     const real = git(["rev-parse", "--path-format=absolute", "--git-path", "index"]).trim();
-    if (existsSync(real)) copyFileSync(real, index);
+    // Keep the index's mtime: git rechecks the entries written in its last second ("racily
+    // clean"), which a fresh mtime on the copy would hide.
+    if (existsSync(real)) {
+      copyFileSync(real, index);
+      const { atime, mtime } = statSync(real);
+      utimesSync(index, atime, mtime);
+    }
     git(["add", "-A"], { GIT_INDEX_FILE: index });
     return git(["write-tree"], { GIT_INDEX_FILE: index }).trim();
   } finally {

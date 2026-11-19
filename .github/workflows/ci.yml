@@ -84,6 +84,9 @@ jobs:
           git fetch --depth=1 origin "$HEAD_REF"
           git checkout -B "$HEAD_REF" FETCH_HEAD
           rm -rf .tested && mv "$RUNNER_TEMP/tested" .tested
+          # Rehash: a record rewritten in place within a second of the checkout keeps its size and
+          # inode, so git's stat cache would take it as unchanged.
+          git rm -r -q --cached --ignore-unmatch .tested
           git add .tested
           if git diff --cached --quiet; then echo "records up to date"; exit 0; fi
           git -c user.name="github-actions[bot]" \
