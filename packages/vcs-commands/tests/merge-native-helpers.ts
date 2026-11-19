@@ -88,7 +88,12 @@ export function put(dir: string, path: string, content: string | Uint8Array): vo
  * Our working copy over a repository native git made in `dir`; with `environment`, git's
  * variables as a host gives them (e.g. {@link INTEROP_AUTHOR_ENV}).
  */
-export async function openOurs(dir: string, environment?: GitHostEnvironment): Promise<Git> {
+export async function openOurs(
+  dir: string,
+  environment?: GitHostEnvironment,
+  /** Wraps the worktree's FilesApi (a Proxy simulating a failing operation) */
+  wrapWorktreeFiles?: (files: ReturnType<typeof createNodeFilesApi>) => typeof files,
+): Promise<Git> {
   const files = createNodeFilesApi({ rootDir: dir });
   const { history } = await createGitFilesBackend({ files });
   const io = {
@@ -131,7 +136,7 @@ export async function openOurs(dir: string, environment?: GitHostEnvironment): P
     gitDir: ".git",
   });
   const worktree = createFileWorktree({
-    files,
+    files: wrapWorktreeFiles ? wrapWorktreeFiles(files) : files,
     rootPath: "",
     gitDir: ".git",
     blobs: history.blobs,

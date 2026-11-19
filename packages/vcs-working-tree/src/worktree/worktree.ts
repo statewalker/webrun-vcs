@@ -246,6 +246,18 @@ export interface Worktree {
    */
   setIgnoreCaseReader?(read: (() => boolean) | undefined): void;
 
+  /**
+   * Sets how a `.gitignore` absent from the worktree is read from the index: the function
+   * gets the file's path (`.gitignore`, `dir/.gitignore`) and returns the text of its index
+   * entry when that entry is skip-worktree, else undefined. git reads such a file's patterns
+   * from the index (dir.c `read_skip_worktree_file_from_index`), so a sparse checkout that
+   * removed a directory still ignores, and un-ignores, what its `.gitignore` says. Working
+   * copies set it from their staging area.
+   */
+  setSkipWorktreeIgnoreReader?(
+    read: ((path: string) => Promise<string | undefined>) | undefined,
+  ): void;
+
   // ========== Reading ==========
 
   walk(options?: WorktreeWalkOptions): AsyncIterable<WorktreeEntry>;

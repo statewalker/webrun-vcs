@@ -5,12 +5,17 @@
  * Tests run against all storage backends (Memory, SQL).
  */
 
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { FileMode } from "@statewalker/vcs-core";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
 import { RefNotFoundError } from "../src/errors/index.js";
 import { ResetMode } from "../src/index.js";
+import { gitOk, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import type { MockWorktree } from "./mock-worktree-store.js";
+import { nativeGitAvailable } from "./native-git-http-backend.js";
 import {
   backends,
   createCommit,
@@ -418,3 +423,48 @@ describe.each(backends)("ResetCommand ($name backend)", ({ factory }) => {
     });
   });
 });
+
+describe.skipIf(!nativeGitAvailable() || process.platform === "win32")(
+  "reset --hard against native git",
+  () => {
+    let root: string;
+    afterEach(() => {
+      if (root) rmSync(root, { recursive: true, force: true });
+    });
+
+    /** main with `a`; side adding `c/f` and `c/d/g`, checked out; the same twice. */
+    function twins(): { native: string; ours: string } {
+      root = mkdtempSync(join(tmpdir(), "reset-dirs-"));
+      const dirs = { native: join(root, "native"), ours: join(root, "ours") };
+      for (const dir of [dirs.native, dirs.ours]) {
+        gitOk(root, root, "init", "-q", "-b", "main", dir);
+        put(dir, "a", "a\n");
+        gitOk(root, dir, "add", ".");
+        gitOk(root, dir, "commit", "-q", "-m", "base");
+        gitOk(root, dir, "checkout", "-q", "-b", "side");
+        put(dir, "c/f", "f\n");
+        put(dir, "c/d/g", "g\n");
+        gitOk(root, dir, "add", ".");
+        gitOk(root, dir, "commit", "-q", "-m", "side");
+      }
+      return dirs;
+    }
+
+    it("removes the directories its deletions leave empty (unlink_entry)", async () => {
+      const { native, ours } = twins();
+      gitOk(root, native, "reset", "-q", "--hard", "main");
+      await (await openOurs(ours)).reset().setMode(ResetMode.HARD).setRef("main").call();
+      expect(existsSync(join(ours, "c"))).toBe(false);
+      expect(snapshot(root, ours)).toEqual(snapshot(root, native));
+    });
+
+    it("keeps a directory an untracked file is left in", async () => {
+      const { native, ours } = twins();
+      for (const dir of [native, ours]) put(dir, "c/d/mine", "mine\n");
+      gitOk(root, native, "reset", "-q", "--hard", "main");
+      await (await openOurs(ours)).reset().setMode(ResetMode.HARD).setRef("main").call();
+      expect(existsSync(join(ours, "c/d/mine"))).toBe(true);
+      expect(snapshot(root, ours)).toEqual(snapshot(root, native));
+    });
+  },
+);

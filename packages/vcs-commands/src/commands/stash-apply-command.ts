@@ -26,6 +26,7 @@ import { conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
 import { updateIndexCacheTree } from "./merge-support.js";
 import { type OrtConflict, ortMerge, ortResultEntries } from "./ort-merge.js";
+import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { STASH_REF } from "./stash-list-command.js";
 import {
   planTreeRestore,
@@ -306,6 +307,13 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
         "error: you need to resolve your current index first",
       );
     }
+    // in a sparse checkout: merge-ort's checkout is unpack-trees with the patterns, over the
+    // index as found (o->src_index)
+    const sparse = await SparseUnpack.start({
+      workingCopy: this.workingCopy,
+      worktree,
+      staging: this.staging,
+    });
     const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
     const base = await this.flatTree(stashHeadCommitObj.tree);
     const stashWorking = await this.flatTree(stashCommit.tree);
@@ -358,16 +366,27 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     // index, and its conflicts, are written, removed or staged; an unrelated unstaged edit is
     // left alone
     const conflicts = merge.conflicts;
+    // record_conflicted_index_entries: a conflict's file is written where its entry was
+    // outside the checkout (or absent), unlinked where it leaves the checkout
+    sparse?.conflict([...conflicts.values()].map((c) => c.stagePath));
+    // a path staying outside the sparse checkout: neither checked nor touched in the worktree
+    const quiet = (path: string) => sparse?.leavesAlone(path) === true;
     const changed = [...new Set([...ours.keys(), ...merge.result.keys(), ...conflicts.keys()])]
       .filter((p) => conflicts.has(p) || !sameEntry(ours.get(p), merge.result.get(p)))
       .sort();
     const movedFrom = new Set(
       [...conflicts.values()].flatMap((c) => (c.moveFrom ? [c.moveFrom] : [])),
     );
-    const removes = changed.filter((p) => !merge.result.has(p) && ours.has(p) && !conflicts.has(p));
-    const conflictWrites = [...conflicts.values()].filter((c) => c.content || c.write);
+    const removes = changed.filter(
+      (p) => !merge.result.has(p) && ours.has(p) && !conflicts.has(p) && !quiet(p),
+    );
+    // the files written: in a sparse checkout, those of the paths it writes only
+    const sparseWrites = (path: string) => !sparse || sparse.writes(path);
+    const conflictWrites = [...conflicts.values()].filter(
+      (c) => (c.content || c.write) && (c.moveFrom || sparseWrites(c.stagePath)),
+    );
     const writes = [
-      ...changed.filter((p) => merge.result.has(p) && !conflicts.has(p)),
+      ...changed.filter((p) => merge.result.has(p) && !conflicts.has(p) && sparseWrites(p)),
       ...conflictWrites.map((c) => c.stagePath),
     ];
 
@@ -380,6 +399,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       // our side, a binary conflict) only stages: git keeps an unstaged edit there
       const conflict = conflicts.get(path);
       if (conflict && !conflict.content && !conflict.write && !conflict.moveFrom) continue;
+      if (quiet(path)) continue;
       const i = index.get(path);
       if (i && (await worktreeDiffers(worktree, path, i, trust, this.staging.getUpdateTime())))
         local.push(path);
@@ -416,6 +436,23 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       direction: "checkout",
       index: attributesIndexOf([...merge.result].map(([p, e]) => [p, e.objectId] as const)),
     };
+    // apply_sparse_checkout before check_updates: the files leaving the checkout (a
+    // conflicted path is checked against one of its stages: unlinked unless its file
+    // changed, CE_WT_REMOVE)
+    if (sparse) {
+      const removing = new Set(removes);
+      const unlink = await sparse.leaving(
+        worktree,
+        (p) => {
+          if (removing.has(p)) return undefined;
+          const conflict = conflicts.get(p);
+          if (conflict) return conflict.ours ?? conflict.theirs ?? conflict.base;
+          return merge.result.get(p) ?? index.get(p);
+        },
+        { trust },
+      );
+      await sparse.unlink(worktree, unlink);
+    }
     // a file a file/directory conflict moves aside goes to `<path>~<side>` first
     for (const conflict of conflicts.values()) {
       if (!conflict.moveFrom) continue;
@@ -466,7 +503,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     // conflicted files: the text with git's markers, or the surviving side of a
     // modify/delete; a binary conflict keeps ours as it is
     for (const conflict of conflicts.values()) {
-      if (conflict.moveFrom) continue;
+      if (conflict.moveFrom || !sparseWrites(conflict.stagePath)) continue;
       if (conflict.content) {
         await worktree.writeContent(conflict.stagePath, conflict.content, {
           mode: conflict.mode,
@@ -540,11 +577,13 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       }
       await editor.finish();
       await this.staging.write();
+      const warnings = await this.finishSparse(sparse, worktree, writing);
       await this.writeUntracked(untrackedPlan, worktree, stashId, trust.symlinks);
       return {
         status: StashApplyStatus.CONFLICTS,
         stashCommit: stashId,
         conflicts: [...conflicts.keys()].sort(),
+        ...(warnings.length > 0 ? { warnings } : {}),
       };
     }
     if (restoredIndex) {
@@ -568,12 +607,34 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       await editor.finish();
     }
     await this.staging.write();
+    const warnings = await this.finishSparse(sparse, worktree, writing);
     await this.writeUntracked(untrackedPlan, worktree, stashId, trust.symlinks);
 
     return {
       status: StashApplyStatus.OK,
       stashCommit: stashId,
+      ...(warnings.length > 0 ? { warnings } : {}),
     };
+  }
+
+  /**
+   * The rest of unpack-trees' sparse checkout once the merge's result is written: the
+   * skip-worktree flags of the entries outside the patterns, the entries that came back
+   * written. Returns the warnings it printed.
+   */
+  private async finishSparse(
+    sparse: SparseUnpack | undefined,
+    worktree: Worktree,
+    written: ReadonlySet<string>,
+  ): Promise<string[]> {
+    if (!sparse) return [];
+    const outcome = await sparse.finish(
+      { workingCopy: this.workingCopy, worktree, staging: this.staging, blobs: this.blobs },
+      { written },
+    );
+    const warnings: string[] = [];
+    pushSparseWarnings(warnings, sparse, outcome, true);
+    return warnings;
   }
 
   /** Writes a blob to the worktree (a link as a link where the worktree has them). */

@@ -55,6 +55,7 @@ import {
   RevListCommand,
   RevParseCommand,
   RmCommand,
+  SparseCheckoutCommand,
   StashApplyCommand,
   StashCreateCommand,
   StashDropCommand,
@@ -955,6 +956,23 @@ export class Git implements Disposable {
   rebase(): RebaseCommand {
     this.checkClosed();
     return new RebaseCommand(this._workingCopy);
+  }
+
+  // ============ Sparse Checkout ============
+
+  /**
+   * `git sparse-checkout <subcommand>`: `init`, `set`, `add`, `list`, `reapply`, `disable`
+   * and `check-rules`, over git's own files (`info/sparse-checkout`, `config.worktree`).
+   *
+   * @example
+   * ```typescript
+   * await git.sparseCheckout().setArguments(["set", "src", "docs"]).call();
+   * const { stdout } = await git.sparseCheckout().setSubcommand("list").call();
+   * ```
+   */
+  sparseCheckout(): SparseCheckoutCommand {
+    this.checkClosed();
+    return new SparseCheckoutCommand(this._workingCopy);
   }
 
   // ============ Bisect Operations ============

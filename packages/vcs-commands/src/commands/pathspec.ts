@@ -386,6 +386,12 @@ export function matchPathspecSeen(
   name: string,
   flags: number,
   seen: number[],
+  /**
+   * git 2.43's `do_match_pathspec`: an element that matched a name exactly matches no later
+   * name, a glob-looking one included (`git rm 'b*'` with an entry `b*` removes only it,
+   * the index being sorted); 2.5x skips only elements without wildcards
+   */
+  exactStopsGlobs = false,
 ): number {
   if (items.length === 0) return MATCHED_RECURSIVELY;
   const pass = (exclude: boolean, passFlags: number): number => {
@@ -393,7 +399,12 @@ export function matchPathspecSeen(
     for (let i = items.length - 1; i >= 0; i--) {
       const item = items[i] as PathspecItem;
       if (item.exclude !== exclude) continue;
-      if (seen[i] === MATCHED_EXACTLY && item.nowildcardLen === item.match.length) continue;
+      if (
+        seen[i] === MATCHED_EXACTLY &&
+        (exactStopsGlobs || item.nowildcardLen === item.match.length)
+      ) {
+        continue;
+      }
       if (item.exclude) seen[i] = MATCHED_FNMATCH;
       const how = matchPathspecItem(item, name, passFlags);
       if (how) {

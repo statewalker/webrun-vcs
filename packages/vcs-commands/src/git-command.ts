@@ -36,7 +36,6 @@ import {
   clearSkipWorktreeFromPresentFiles,
   compareWithWorktree,
   IndexChangedError,
-  parseSparseCheckoutPatterns,
   type SparseCheckoutPatterns,
   type Staging,
   type WorkingCopy,
@@ -65,6 +64,7 @@ import {
   type WorktreeLookup,
 } from "./commands/revision-filenames.js";
 import { type ResolveOptions, RevisionResolver } from "./commands/revision-resolver.js";
+import { readSparseCheckoutPatterns } from "./commands/sparse-checkout-support.js";
 import {
   InvalidConfigError,
   NoHeadError,
@@ -709,16 +709,7 @@ export abstract class GitCommand<T> {
    * is in the checkout).
    */
   protected async sparseCheckoutPatterns(): Promise<SparseCheckoutPatterns | undefined> {
-    if (!this._workingCopy.config) return undefined;
-    const config = RemoteConfigStore.from(this._workingCopy);
-    if (parseGitBool(config.value("core.sparseCheckout")) !== true) return undefined;
-    const cone = parseGitBool(config.value("core.sparseCheckoutCone")) === true;
-    const bytes = await this._workingCopy.checkout
-      ?.readStateFile?.("info/sparse-checkout")
-      .catch(() => undefined);
-    const content = bytes === undefined ? undefined : new TextDecoder().decode(bytes);
-    const ignoreCase = parseGitBool(config.value("core.ignoreCase")) === true;
-    return parseSparseCheckoutPatterns(content, cone, ignoreCase);
+    return readSparseCheckoutPatterns(this._workingCopy);
   }
 
   /**

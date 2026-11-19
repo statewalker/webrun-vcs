@@ -921,6 +921,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     renames: boolean | "copies",
     patch = false,
   ): Promise<{ entries: DiffEntry[]; combined: CombinedEntry[] }> {
+    // repo_read_index: in a sparse checkout, a skip-worktree entry whose file is present is
+    // read as in the checkout (in memory: diff writes no index)
+    await this.clearPresentSkipWorktree();
     const worktree = this.worktreeAccess;
     let oldSide: Map<string, Side>;
     let newSide: Map<string, Side>;

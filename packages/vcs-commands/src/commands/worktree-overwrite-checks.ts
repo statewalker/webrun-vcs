@@ -28,7 +28,7 @@ export interface CheckedEntry {
 /**
  * Whether the worktree file at `path` no longer holds the index entry (git's
  * `verify_uptodate`): changed content, type, or executable bit where the worktree shows it.
- * A missing file is no local change. With `indexTime` (the index file's mtime, as the
+ * A missing file is no local change, but one beneath a symbolically linked directory is. With `indexTime` (the index file's mtime, as the
  * caller's index was last read or written: git's `istate->timestamp`), a stat that matches
  * as git's `ie_match_stat` compares it, on an entry older than the index (not racy),
  * settles it without reading the file, as in git; a racy entry is read. A caller that
@@ -42,8 +42,23 @@ export async function worktreeDiffers(
   indexTime?: number,
 ): Promise<boolean> {
   const current = await worktree.getEntry(path);
-  if (!current) return false;
+  if (!current) {
+    // git's lstat follows a symbolic link on a leading directory to whatever the file there
+    // is, never the one the index recorded: a change (the worktree never looks beyond links)
+    return entry.mode !== FileMode.GITLINK && (await beneathSymlink(worktree, path));
+  }
   return differsFrom(worktree, path, entry, current, trust, indexTime);
+}
+
+/** Whether a leading directory of `path` is a symbolic link. */
+async function beneathSymlink(worktree: Worktree, path: string): Promise<boolean> {
+  for (let k = path.indexOf("/"); k > 0; k = path.indexOf("/", k + 1)) {
+    const entry = await worktree.getEntry(path.slice(0, k)).catch(() => undefined);
+    if (!entry) return false;
+    if (entry.mode === FileMode.SYMLINK) return true;
+    if (!entry.isDirectory) return false;
+  }
+  return false;
 }
 
 async function differsFrom(
@@ -124,9 +139,15 @@ export async function untrackedUnder(
   worktree: Worktree,
   dir: string,
   tracked: (path: string) => boolean,
+  /** Ignored files count too (git's `verify_clean_subdirectory` without `o->internal.dir`) */
+  includeIgnored = false,
 ): Promise<boolean> {
   if (!tracked(dir) && (await isNestedRepository(worktree, dir))) return true;
-  for await (const inside of worktree.walk({ pathPrefix: dir, includeDirectories: true })) {
+  for await (const inside of worktree.walk({
+    pathPrefix: dir,
+    includeDirectories: true,
+    ...(includeIgnored ? { includeIgnored: true } : {}),
+  })) {
     if (inside.isDirectory) {
       // a nested repository is never entered by the walk: it is untracked content itself
       if (inside.mode === FileMode.GITLINK && !tracked(inside.path)) return true;
@@ -349,7 +370,8 @@ export function overwriteMessage(
  * (assume-unchanged, skip-worktree), as git's `verify_uptodate_1` checks such an entry
  * before overwriting or removing its file: `ie_match_stat` with `CE_MATCH_IGNORE_VALID`, so
  * a stat that no longer matches is a change (the content is not compared), and a matching
- * one on a racy entry has its content checked. A missing file is no change.
+ * one on a racy entry has its content checked. A missing file is no change, but one
+ * beneath a symbolically linked directory is.
  */
 export async function flaggedEntryDiffers(
   worktree: Worktree,
@@ -357,9 +379,16 @@ export async function flaggedEntryDiffers(
   entry: StagingEntry,
   trust?: WorktreeModeTrust,
   indexTime?: number,
+  /** The file's worktree entry when the caller stat'ed it already (null: none) */
+  stat?: WorktreeEntry | null,
 ): Promise<boolean> {
-  const current = await worktree.getEntry(path);
-  if (!current) return false;
+  const current = stat === undefined ? await worktree.getEntry(path) : stat;
+  if (!current) {
+    // git's lstat follows a symbolic link among the leading directories to whatever is
+    // there, never the file the index recorded: a change, as for an unflagged entry (the
+    // switch then never writes through the link)
+    return entry.mode !== FileMode.GITLINK && (await beneathSymlink(worktree, path));
+  }
   if (current.isDirectory) return entry.mode !== FileMode.GITLINK;
   if (entry.mode === FileMode.GITLINK) return false;
   // an intent-to-add entry never matches its file (ie_match_stat: DATA_CHANGED)
@@ -397,4 +426,88 @@ export async function entryNotUptodate(
     return flaggedEntryDiffers(worktree, path, e, trust, indexTime);
   }
   return worktreeDiffers(worktree, path, entry, trust, indexTime);
+}
+
+/** What {@link statThroughLeadingLinks} found beyond a link. */
+export interface LinkedStat {
+  /** The entry the path reaches through the link(s); undefined when nothing is there */
+  entry?: WorktreeEntry;
+  /** The link points outside the worktree (or loops): what is there cannot be looked at */
+  unknown?: boolean;
+}
+
+/** Links followed in one path at most before it is given up (POSIX `ELOOP`). */
+const MAX_LINKS = 40;
+
+/**
+ * What `lstat(path)` finds when a leading directory of `path` is a symbolic link, which
+ * the system follows (git's `check_local_mod`, `verify_uptodate`): the entry at the place
+ * the link names, resolved within the worktree only (nothing is read beyond it: an
+ * absolute target or one climbing out of the worktree is `unknown`). Undefined when no
+ * leading directory of `path` is a link (the path's own `getEntry` is the answer). Only
+ * reads: nothing is ever written through a link.
+ */
+export async function statThroughLeadingLinks(
+  worktree: Worktree,
+  path: string,
+): Promise<LinkedStat | undefined> {
+  let current = path;
+  let linked = false;
+  for (let followed = 0; ; ) {
+    const parts = current.split("/");
+    let next: string | undefined;
+    for (let k = 1; k < parts.length; k++) {
+      const prefix = parts.slice(0, k).join("/");
+      const entry = await worktree.getEntry(prefix).catch(() => undefined);
+      if (!entry) return linked ? {} : undefined;
+      if (entry.mode === FileMode.SYMLINK) {
+        if (++followed > MAX_LINKS) return { unknown: true };
+        const resolved = resolveLinkTarget(prefix, await readLinkTarget(worktree, prefix));
+        if (resolved === undefined) return { unknown: true };
+        const rest = parts.slice(k).join("/");
+        next = resolved ? `${resolved}/${rest}` : rest;
+        break;
+      }
+      // ENOTDIR: a file among the leading components
+      if (!entry.isDirectory) return linked ? {} : undefined;
+    }
+    if (next === undefined) {
+      if (!linked) return undefined;
+      const entry = await worktree.getEntry(current).catch(() => undefined);
+      return entry ? { entry } : {};
+    }
+    linked = true;
+    current = next;
+  }
+}
+
+async function readLinkTarget(worktree: Worktree, path: string): Promise<string> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of worktree.readContent(path)) chunks.push(chunk);
+  let size = 0;
+  for (const c of chunks) size += c.length;
+  const bytes = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) {
+    bytes.set(c, at);
+    at += c.length;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+/**
+ * The worktree path the link at `linkPath` names with `target` ("" for the root), or
+ * undefined when it lies outside the worktree (absolute, or climbing above the root).
+ */
+function resolveLinkTarget(linkPath: string, target: string): string | undefined {
+  if (target === "" || target.startsWith("/")) return undefined;
+  const out = linkPath.split("/").slice(0, -1);
+  for (const part of target.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (out.length === 0) return undefined;
+      out.pop();
+    } else out.push(part);
+  }
+  return out.join("/");
 }

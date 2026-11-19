@@ -6,6 +6,7 @@ import {
   type ContentAttributesContext,
   cacheTreeOfTree,
   entryStatOf,
+  getWorktreeEntries,
   type IndexEntryOptions,
   invalidateCacheTreePath,
   type Worktree,
@@ -57,10 +58,12 @@ import {
   applyAutostash,
   cleanupMessage,
   createAutostash,
+  removeMergeBranchState,
   resetMerge,
   saveAutostash,
   squashMessage,
 } from "./sequencer-support.js";
+import { readSparseCheckoutPatterns, sparseCheckoutConfig } from "./sparse-checkout-support.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
 import {
   type CheckedEntry,
@@ -76,6 +79,11 @@ export enum MergeOperation {
   ABORT = "abort",
   /** Commit the resolved merge in progress (`git merge --continue`) */
   CONTINUE = "continue",
+  /**
+   * Forget the merge in progress, leaving the index and the worktree as they are
+   * (`git merge --quit`); its autostash is kept on `refs/stash`.
+   */
+  QUIT = "quit",
 }
 
 /** git's refusal of a merge of histories with no common commit. */
@@ -345,13 +353,25 @@ export class MergeCommand extends GitCommand<MergeResult> {
     await this.readCurrentIndex();
     const worktree = this.worktreeAccess;
     const run = () => this.run(worktree);
-    return worktree?.batch ? worktree.batch(run) : run();
+    const result = await (worktree?.batch ? worktree.batch(run) : run());
+    return this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result;
   }
+
+  /** What the sparse checkout printed while the result was written (see MergeResult.warnings). */
+  private readonly sparseWarnings: string[] = [];
 
   private async run(worktree: Worktree | undefined): Promise<MergeResult> {
     const state = new OperationState(this.workingCopy.checkout, this.refsStore);
     if (this.operation === MergeOperation.ABORT) return this.abort(state, worktree);
     if (this.operation === MergeOperation.CONTINUE) return this.continueMerge(state);
+    if (this.operation === MergeOperation.QUIT) {
+      // git's `merge --quit`: remove_merge_branch_state, nothing else touched
+      return {
+        status: MergeStatus.ABORTED,
+        mergedCommits: [],
+        output: await removeMergeBranchState(this.context(worktree), state),
+      };
+    }
 
     // Validate parameters
     if (this.includes.length === 0) {
@@ -419,7 +439,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
           status: MergeStatus.ALREADY_UP_TO_DATE,
           newHead: headId,
           mergedCommits: named.map((n) => n.id),
-          output: [this.squash ? "Already up to date. (nothing to squash)" : "Already up to date."],
+          output: [
+            this.squash ? "Already up to date. (nothing to squash)" : "Already up to date.",
+            ...(await removeMergeBranchState(this.context(worktree), state)),
+          ],
         };
       }
       if (remotes.length > 1) {
@@ -452,11 +475,16 @@ export class MergeCommand extends GitCommand<MergeResult> {
 
     // Check if already up to date (src is ancestor of HEAD)
     if (await this.isAncestor(srcId, headId)) {
+      // finish_up_to_date: remove_merge_branch_state (an AUTO_MERGE left behind goes)
       return {
         status: MergeStatus.ALREADY_UP_TO_DATE,
         newHead: headId,
         mergedCommits: [srcId],
-        output: [this.squash ? "Already up to date. (nothing to squash)" : "Already up to date."],
+        output: [
+          this.squash ? "Already up to date. (nothing to squash)" : "Already up to date.",
+          // and a MERGE_AUTOSTASH left by a stopped merge is kept on refs/stash
+          ...(await removeMergeBranchState(this.context(worktree), state)),
+        ],
       };
     }
 
@@ -699,13 +727,13 @@ export class MergeCommand extends GitCommand<MergeResult> {
     // merge-ort's sanity check: the index must match HEAD (merge-ort-wrappers' unclean())
     const staged = await indexChangesFromTree(index, this.trees, headCommit.tree);
     if (staged.length > 0) {
-      await this.restoreStateQuirk(state, headCommit.tree, worktree);
+      const restored = await this.restoreStateQuirk(state, headCommit.tree, worktree);
       return {
         status: MergeStatus.FAILED,
         newHead: headId,
         mergeBase: baseId,
         mergedCommits: [headId, srcId],
-        message: `error: Your local changes to the following files would be overwritten by merge:\n  ${staged.join(" ")}\nMerge with strategy ort failed.`,
+        message: `error: Your local changes to the following files would be overwritten by merge:\n  ${staged.join(" ")}\n${restored}Merge with strategy ort failed.`,
         failingPaths: new Map(staged.map((p) => [p, MergeFailureReason.DIRTY_INDEX])),
       };
     }
@@ -720,13 +748,13 @@ export class MergeCommand extends GitCommand<MergeResult> {
       targetTree: treeId,
     });
     if (refused) {
-      await this.restoreStateQuirk(state, headCommit.tree, worktree);
+      const restored = await this.restoreStateQuirk(state, headCommit.tree, worktree);
       return {
         status: MergeStatus.FAILED,
         newHead: headId,
         mergeBase: baseId,
         mergedCommits: [headId, srcId],
-        message: `${refused.message}\nMerge with strategy ort failed.`,
+        message: `${refused.message}\n${restored}Merge with strategy ort failed.`,
         failingPaths: failing(refused.paths),
       };
     }
@@ -840,20 +868,20 @@ export class MergeCommand extends GitCommand<MergeResult> {
     // git restores the state it saved (reset --hard, stash apply): AUTO_MERGE as for ort
     const giveUp = async (lines: string[], output: string[] = []): Promise<MergeResult> => {
       const tree = (await this.commits.getTree(headId)) as ObjectId;
-      await this.restoreStateQuirk(state, tree, worktree);
+      const restored = await this.restoreStateQuirk(state, tree, worktree);
       return {
         status: MergeStatus.FAILED,
         newHead: headId,
         mergedCommits,
-        message: [...lines, `Merge with strategy ${strategy} failed.`].join("\n"),
+        message: [...lines, `${restored}Merge with strategy ${strategy} failed.`].join("\n"),
         output,
       };
     };
     // git-merge-resolve and merge-ort handle two heads only
     if (this.strategy === MergeStrategy.RESOLVE) {
       const tree = (await this.commits.getTree(headId)) as ObjectId;
-      await this.restoreStateQuirk(state, tree, worktree);
-      return failed("Merge with strategy resolve failed.");
+      const restored = await this.restoreStateQuirk(state, tree, worktree);
+      return failed(`${restored}Merge with strategy resolve failed.`);
     }
     let outcome: Awaited<ReturnType<typeof octopusMerge>>;
     if (this.strategy === MergeStrategy.OURS) {
@@ -1073,15 +1101,16 @@ export class MergeCommand extends GitCommand<MergeResult> {
    * A failed strategy leaves AUTO_MERGE as git leaves it: git's merge restores the local
    * changes it saved (`restore_state`, a stash of them applied by merge-ort), so AUTO_MERGE
    * ends up the tree of the index and the tracked files' worktree content, and is absent
-   * when there was nothing to save.
+   * when there was nothing to save. Returns the warning lines the reset printed (each ending
+   * with a newline).
    */
   private async restoreStateQuirk(
     state: OperationState,
     headTree: ObjectId,
     worktree: Worktree | undefined,
-  ): Promise<void> {
+  ): Promise<string> {
     await state.removeRef("AUTO_MERGE");
-    if (!worktree) return;
+    if (!worktree) return "";
     const provider = new WorkingCopyStashProvider({
       workingCopy: this.workingCopy,
       trees: this.trees,
@@ -1102,8 +1131,18 @@ export class MergeCommand extends GitCommand<MergeResult> {
     // nothing saved: the reset alone, which leaves the index exactly HEAD (read-tree's
     // prime_cache_tree: a fully valid cache-tree)
     await this.resetAssumeUnchanged(worktree, savedTree ? undefined : headTree);
-    if (!savedTree) return;
-    await state.setRef("AUTO_MERGE", savedTree);
+    if (!savedTree) return "";
+    let warnings = "";
+    // a sparse checkout: the reset leaves what is outside its patterns to unpack-trees, which
+    // unlinks a file leaving it (its skip-worktree bit cleared on reading, the path present)
+    const sparseConfig = sparseCheckoutConfig(this.workingCopy);
+    const patterns = sparseConfig.expectFilesOutside
+      ? undefined
+      : await readSparseCheckoutPatterns(this.workingCopy);
+    // stash apply's merge_ort_nonrecursive: a stash whose worktree tree is HEAD's ("Already
+    // up to date", e.g. a tracked file replaced by a directory, which stash create passes
+    // over) merges nothing and records no AUTO_MERGE
+    if (savedTree !== headTree) await state.setRef("AUTO_MERGE", savedTree);
     // restore_state's `reset --hard` and `stash apply --index`: every changed file is
     // written again from what was saved, through the checkout filters (eol, smudge)
     const saved = await flatTree(this.trees, savedTree);
@@ -1115,21 +1154,59 @@ export class MergeCommand extends GitCommand<MergeResult> {
     };
     const symlinks = worktreeModeTrust(this.workingCopy, worktree).symlinks;
     const restaged = new Map<string, IndexEntryOptions[]>();
+    // the reset --hard (read-tree --reset -u, untracked files overwritten): checkout_entry
+    // finds a directory (never a symlink to one) at each of HEAD's files and removes it with
+    // everything in it, a nested repository too (remove_subtree), before the file is written;
+    // stash create passed such a path over, or saved the index's content for it. HEAD's
+    // files are stat'ed in one batch. Outside the sparse patterns the reset unlinks instead,
+    // which fails on the directory with git's warning, and the path is left alone.
+    const headFiles = [...head]
+      .filter(([, entry]) => entry.mode !== FileMode.GITLINK)
+      .map(([path]) => path);
+    const headStats = await getWorktreeEntries(worktree, headFiles);
+    const replaced = new Set<string>();
+    const blocked = new Set<string>();
+    for (let i = 0; i < headFiles.length; i++) {
+      const path = headFiles[i] as string;
+      const current = headStats[i];
+      if (!current?.isDirectory || current.mode === FileMode.SYMLINK) continue;
+      if (patterns && !patterns.includes(path)) {
+        warnings += `warning: unable to unlink '${path}': Is a directory\n`;
+        blocked.add(path);
+        continue;
+      }
+      await worktree.remove(path, { recursive: true });
+      replaced.add(path);
+    }
     for (const [path, entry] of saved) {
+      if (entry.mode === FileMode.GITLINK || blocked.has(path)) continue;
+      // `stash apply` writes what changed; the reset wrote HEAD's content where it replaced
+      // a directory
       const before = head.get(path);
-      if (before?.objectId === entry.objectId && before.mode === entry.mode) continue;
-      if (entry.mode === FileMode.GITLINK) continue;
+      if (
+        before?.objectId === entry.objectId &&
+        before.mode === entry.mode &&
+        !replaced.has(path)
+      ) {
+        continue;
+      }
       const content = await this.blobs.load(entry.objectId);
       if (!content) continue;
       const mode =
         entry.mode === FileMode.SYMLINK && !symlinks ? FileMode.REGULAR_FILE : entry.mode;
-      await worktree.writeContent(path, content, {
-        mode,
-        ...(mode !== entry.mode ? { raw: true } : {}),
-        createParents: true,
-        replaceInTheWay: true,
-        attributes,
-      });
+      try {
+        await worktree.writeContent(path, content, {
+          mode,
+          ...(mode !== entry.mode ? { raw: true } : {}),
+          createParents: true,
+          replaceInTheWay: true,
+          attributes,
+        });
+      } catch (error) {
+        // checkout_entry's error: the file is not written, the rest goes on
+        warnings += `error: unable to create file ${path}: ${(error as Error).message}\n`;
+        continue;
+      }
       // `stash apply --index` stages again what was staged: the index entry takes the stat
       // of the file just written where the file holds its blob
       const staged = index.get(path);
@@ -1165,6 +1242,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
       if (saved.has(path) || (await worktree.getEntry(path))) continue;
       await pruneEmptyParents(worktree, path);
     }
+    return warnings;
   }
 
   /**
@@ -1228,6 +1306,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
       trees: this.trees,
       commits: this.commits,
       refs: this.refsStore,
+      sparseWarnings: this.sparseWarnings,
     };
   }
 

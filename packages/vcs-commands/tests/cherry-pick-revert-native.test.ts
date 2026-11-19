@@ -5,7 +5,7 @@
  * sequencer/) compared; then each side continues, skips or aborts what the other started.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { CherryPickStatus, RevertStatus, SequencerOperation } from "../src/index.js";
 import {
   git,
+  gitOk,
   INTEROP_AUTHOR_ENV,
   INTEROP_IDENT,
   normalizeState,
@@ -211,4 +212,148 @@ describeGit("cherry-pick and revert write the worktree as native git", () => {
     expect(continued.status).toBe(RevertStatus.OK);
     same(ours, native);
   });
+});
+
+describeGit("state files after a pick or merge that ends early, as native git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "pick-state-"));
+  });
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("a pick that commits drops the CHERRY_PICK_HEAD and MERGE_MSG of a stopped empty one", async () => {
+    const { native, ours } = twins({
+      base: { "a.txt": text() },
+      main: { "a.txt": text({ 1: "main" }) },
+      side: { "n.txt": "n\n" },
+    });
+    // picking HEAD itself is empty: git stops with CHERRY_PICK_HEAD and MERGE_MSG
+    expect(git(root, native, "cherry-pick", "main").status).toBe(1);
+    const head = git(root, ours, "rev-parse", "main").stdout.trim();
+    expect((await oursPick(ours, [head])).status).toBe(CherryPickStatus.CONFLICTING);
+    same(ours, native);
+    // a pick that commits ends it (do_commit), AUTO_MERGE left as git leaves it
+    expect(git(root, native, "cherry-pick", "side").status).toBe(0);
+    expect((await oursPick(ours, ["side"])).status).toBe(CherryPickStatus.OK);
+    same(ours, native);
+  });
+
+  it("an already up to date merge drops the AUTO_MERGE a clean pick left", async () => {
+    const { native, ours } = twins({
+      base: { "a.txt": text() },
+      main: { "a.txt": text({ 1: "main" }) },
+      side: { "n.txt": "n\n" },
+    });
+    git(root, native, "cherry-pick", "side");
+    await oursPick(ours, ["side"]);
+    same(ours, native);
+    expect(git(root, native, "merge", "-q", "main~1").status).toBe(0);
+    await (await openOurs(ours, INTEROP_AUTHOR_ENV)).merge().include("main~1").call();
+    same(ours, native);
+  });
+
+  it("a merge refused over a tracked file replaced by a directory records no AUTO_MERGE", async () => {
+    const { native, ours } = twins({
+      base: { "a.txt": text(), "c/w": "w\n" },
+      main: { "a.txt": text({ 1: "main" }) },
+      side: { "c/w": "W2\n" },
+    });
+    for (const dir of [native, ours]) {
+      rmSync(join(dir, "c/w"));
+      put(dir, "c/w/m", "m\n");
+    }
+    const expected = git(root, native, "merge", "-q", "side");
+    expect(expected.status).not.toBe(0);
+    await (await openOurs(ours, INTEROP_AUTHOR_ENV)).merge().include("side").call();
+    same(ours, native);
+  });
+});
+
+describeGit("a refused merge's restore over a directory at a tracked file, as native git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "restore-dir-"));
+  });
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** A directory (holding m) where f was, after `prepare`; side changes f. */
+  const setups: [string, (dir: string) => void][] = [
+    [
+      "f staged changed, a directory there",
+      (dir) => {
+        put(dir, "f", "S\n");
+        gitOk(root, dir, "add", "f");
+        rmSync(join(dir, "f"));
+        put(dir, "f/m", "m\n");
+      },
+    ],
+    [
+      "f staged changed, a directory there, another file changed",
+      (dir) => {
+        put(dir, "f", "S\n");
+        gitOk(root, dir, "add", "f");
+        rmSync(join(dir, "f"));
+        put(dir, "f/m", "m\n");
+        put(dir, "k", "k2\n");
+      },
+    ],
+    [
+      "rm --cached f, a directory there",
+      (dir) => {
+        gitOk(root, dir, "rm", "-q", "--cached", "f");
+        rmSync(join(dir, "f"));
+        put(dir, "f/m", "m\n");
+      },
+    ],
+    [
+      "a nested repository with a commit at f",
+      (dir) => {
+        rmSync(join(dir, "f"));
+        put(dir, "f/x", "x\n");
+        gitOk(root, join(dir, "f"), "init", "-q");
+        gitOk(root, join(dir, "f"), "add", "x");
+        gitOk(root, join(dir, "f"), "commit", "-q", "-m", "n");
+      },
+    ],
+    [
+      "f staged changed, a nested repository with a commit at f",
+      (dir) => {
+        put(dir, "f", "S\n");
+        gitOk(root, dir, "add", "f");
+        rmSync(join(dir, "f"));
+        put(dir, "f/x", "x\n");
+        gitOk(root, join(dir, "f"), "init", "-q");
+        gitOk(root, join(dir, "f"), "add", "x");
+        gitOk(root, join(dir, "f"), "commit", "-q", "-m", "n");
+      },
+    ],
+    [
+      "f staged changed, a symlink to a directory at f",
+      (dir) => {
+        put(dir, "f", "S\n");
+        gitOk(root, dir, "add", "f");
+        rmSync(join(dir, "f"));
+        mkdirSync(join(dir, "t"));
+        put(dir, "t/m", "m\n");
+        symlinkSync("t", join(dir, "f"));
+      },
+    ],
+  ];
+  for (const [name, prepare] of setups) {
+    it(`${name}: the reset and stash apply of restore_state`, async () => {
+      const { native, ours } = twins({
+        base: { "a.txt": text(), f: "w\n", k: "k\n" },
+        main: { "a.txt": text({ 1: "main" }) },
+        side: { f: "W2\n" },
+      });
+      for (const dir of [native, ours]) prepare(dir);
+      const expected = git(root, native, "merge", "-q", "side");
+      expect(expected.status).toBe(2);
+      await (await openOurs(ours, INTEROP_AUTHOR_ENV)).merge().include("side").call();
+      same(ours, native);
+      expect(gitOk(root, ours, "stash", "list")).toBe(gitOk(root, native, "stash", "list"));
+    });
+  }
 });

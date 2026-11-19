@@ -315,6 +315,31 @@ describe("CloneCommand checkout into the worktree", () => {
     expect(await listAll(files)).toEqual([]);
     expect(await workingCopy.checkout.staging.getEntryCount()).toBe(0);
   });
+
+  it("--sparse: only the top-level files written, the rest skip-worktree (git's cone init)", async () => {
+    const files = createInMemoryFilesApi();
+    const workingCopy = createWorkingCopy(fileWorktree(files));
+    await Git.fromWorkingCopy(workingCopy).clone().setURI(url).setSparse(true).call();
+
+    expect(await listAll(files)).toEqual(["a.txt", "link", "run.sh", "sub/"]);
+    const config = workingCopy.config as Record<string, unknown>;
+    expect(config["core.sparseCheckout"]).toBe("true");
+    expect(config["core.sparseCheckoutCone"]).toBe("true");
+    const patterns = await workingCopy.checkout.readStateFile?.("info/sparse-checkout");
+    expect(new TextDecoder().decode(patterns)).toBe("/*\n!/*/\n");
+    const flags: string[] = [];
+    for await (const entry of workingCopy.checkout.staging.entries()) {
+      flags.push(`${entry.skipWorktree ? "S" : "H"} ${entry.path}`);
+    }
+    expect(flags).toEqual([
+      "H a.txt",
+      "S dir/nested/deep.txt",
+      "S dir/top.txt",
+      "H link",
+      "H run.sh",
+      "H sub",
+    ]);
+  });
 });
 
 /** Commits on the server's main branch the tree `build` makes (raw: names may collide). */

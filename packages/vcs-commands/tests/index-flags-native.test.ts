@@ -1020,9 +1020,15 @@ describeGit("add -N, commit --only, kept stat data and a stale instance, as git"
   }
 
   it("commit --only leaves the cache-tree invalid where git's does while paths are unmerged", async () => {
+    // g/h/i racily clean in both twins whatever the clock does while they are built: its
+    // mtime is the index's second, every other file is older (a second boundary between
+    // the add and the last index write in one twin only made the cache-trees differ)
+    const T = 1_700_000_000;
     await onlyTwins(
       (dir) => {
         put(dir, "g/h/i", "i\n");
+        for (const p of ["a", "d/x", "d/y"]) utimesSync(join(dir, p), T - 100, T - 100);
+        utimesSync(join(dir, "g/h/i"), T, T);
         gitOk(root, dir, "add", ".");
         gitOk(root, dir, "commit", "-q", "-m", "more");
         // a fully valid cache-tree, then a conflict on d/y
@@ -1037,6 +1043,7 @@ describeGit("add -N, commit --only, kept stat data and a stale instance, as git"
           cwd: dir,
           input: [1, 2, 3].map((s) => `100644 ${id} ${s}\td/y\n`).join(""),
         });
+        utimesSync(join(dir, ".git/index"), T, T);
         // a racily clean g/h/i is read again: git invalidates its path all the same
         put(dir, "a", "changed\n");
       },
@@ -1102,7 +1109,7 @@ describeGit("add -N, commit --only, kept stat data and a stale instance, as git"
     const before = await statOf(ours, (p) => p.startsWith("big/"));
     gitOk(root, native, "rm", "-q", "-r", "--cached", "big");
     const g = await openOurs(ours);
-    await g.rm().addFilepattern("big").setCached(true).call();
+    await g.rm().addFilepattern("big").setCached(true).setRecursive(true).call();
     expect(lsFiles(ours)).toBe(lsFiles(native));
     expect(await statOf(ours, (p) => p.startsWith("big/"))).toEqual(before);
     expect(gitOk(root, ours, "diff-files", "--name-status")).toBe(

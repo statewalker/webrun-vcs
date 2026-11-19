@@ -5,6 +5,8 @@ import { GitStaging } from "../../src/staging/index.js";
 import {
   clearSkipWorktreeFromPresentFiles,
   parseSparseCheckoutPatterns,
+  sparsePatternsFromCone,
+  sparsePatternsFromLines,
 } from "../../src/working-copy/index.js";
 import type { WorktreeEntry } from "../../src/worktree/index.js";
 
@@ -41,6 +43,44 @@ describe("parseSparseCheckoutPatterns", () => {
   it("without a sparse-checkout file every path is in", () => {
     expect(parseSparseCheckoutPatterns(undefined, true).includes("any/path")).toBe(true);
   });
+
+  it("warns as git does about patterns cone mode cannot read (add_pattern_to_hashsets)", () => {
+    const warnings = (content: string) => parseSparseCheckoutPatterns(content, true).warnings;
+    expect(warnings("/*\n!/*/\n/k/\n*.md\n")).toEqual([
+      "unrecognized pattern: '*.md'",
+      "disabling cone pattern matching",
+    ]);
+    expect(warnings("/*\n!/*/\n!/k/*/\n")).toEqual([
+      "unrecognized negative pattern: '/k/*'",
+      "disabling cone pattern matching",
+    ]);
+    expect(warnings("/*\n!/*/\n/k/\n!/k/\n")).toEqual([
+      "unrecognized negative pattern: '/k'",
+      "disabling cone pattern matching",
+    ]);
+    expect(warnings("/s/\n!/s/*/\n/s/\n")).toEqual([
+      "your sparse-checkout file may have issues: pattern '/s' is repeated",
+      "disabling cone pattern matching",
+    ]);
+    // non-cone mode reads every pattern silently
+    expect(parseSparseCheckoutPatterns("*.md\n", false).warnings).toEqual([]);
+  });
+
+  it("keeps the cone's hashsets and the lines as read", () => {
+    const sparse = parseSparseCheckoutPatterns("/*\n!/*/\n/p/\n!/p/*/\n/p/q/\n# c\n", true);
+    expect(sparse.coneSets).toEqual({ full: false, recursive: ["/p/q"], parent: ["/p"] });
+    expect(sparse.lines).toEqual(["/*", "!/*/", "/p/", "!/p/*/", "/p/q/"]);
+  });
+
+  it("builds a matcher from hashsets and from patterns given one by one", () => {
+    const cone = sparsePatternsFromCone({ full: false, recursive: ["/k"], parent: [] });
+    expect(cone.includes("k/a")).toBe(true);
+    expect(cone.includes("top")).toBe(true);
+    expect(cone.includes("s/b")).toBe(false);
+    const literal = sparsePatternsFromLines(["/k/", "!/k/x"], false);
+    expect(literal.includes("k/a")).toBe(true);
+    expect(literal.includes("k/x")).toBe(false);
+  });
 });
 
 describe("clearSkipWorktreeFromPresentFiles", () => {
@@ -69,9 +109,10 @@ describe("clearSkipWorktreeFromPresentFiles", () => {
       },
     };
     expect(await clearSkipWorktreeFromPresentFiles(staging, worktree)).toEqual(["s/c"]);
-    // git's path_found: the parents of a missing path are asked up to the first one missing
-    // (s/t), and the paths under it are not asked (s/t/e)
-    expect(asked).toEqual(["s/b", "s", "s/c", "s/t/d", "s/t", "u/v", "u"]);
+    // as git's path_found spares them: the directories first, level by level beneath the
+    // ones found (s/t only under s), then only the paths whose directories all exist; a
+    // missing directory (u, s/t) costs one stat, nothing under it is asked
+    expect(asked).toEqual(["s", "u", "s/t", "s/b", "s/c"]);
     expect(staging.hasUnwrittenChanges()).toBe(false);
     expect((await staging.getEntry("s/c"))?.skipWorktree).toBe(false);
     // written with the next write
@@ -80,6 +121,38 @@ describe("clearSkipWorktreeFromPresentFiles", () => {
     await reread.read();
     expect((await reread.getEntry("s/c"))?.skipWorktree).toBeFalsy();
     expect((await reread.getEntry("s/b"))?.skipWorktree).toBe(true);
+  });
+
+  it("stats in batches through getEntries where the worktree has it", async () => {
+    const files = createInMemoryFilesApi();
+    const staging = new GitStaging(files, "index");
+    for (const path of ["s/b", "s/c", "s/t/d", "u/v", "w"]) {
+      await staging.setEntry({
+        path,
+        mode: 0o100644,
+        objectId: ID,
+        size: 1,
+        mtime: 1,
+        skipWorktree: true,
+      });
+    }
+    await staging.write();
+    await staging.read();
+    const present = new Set(["s", "s/t", "s/t/d", "w"]);
+    const batches: string[][] = [];
+    const worktree = {
+      getEntry: async (): Promise<WorktreeEntry | undefined> => {
+        throw new Error("stat'ed one by one");
+      },
+      getEntries: async (paths: readonly string[]) => {
+        batches.push([...paths]);
+        return paths.map((p) =>
+          present.has(p) ? ({ path: p } as unknown as WorktreeEntry) : undefined,
+        );
+      },
+    };
+    expect(await clearSkipWorktreeFromPresentFiles(staging, worktree)).toEqual(["s/t/d", "w"]);
+    expect(batches).toEqual([["s", "u"], ["s/t"], ["s/b", "s/c", "s/t/d", "w"]]);
   });
 });
 

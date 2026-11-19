@@ -115,6 +115,8 @@ export class FileWorktree implements Worktree {
   private excludesReader?: () => Promise<string | undefined>;
   /** Reads `core.ignoreCase` for the ignore rules (set by the working copy) */
   private ignoreCaseReader?: () => boolean;
+  /** Reads a `.gitignore` the worktree lacks from its skip-worktree index entry */
+  private skipWorktreeIgnoreReader?: (path: string) => Promise<string | undefined>;
   private readonly rootFiles: WorktreeFilesApi;
   /** The FilesApi of the batch in progress (`withLstatCache` view), if any */
   private scoped?: WorktreeFilesApi;
@@ -592,6 +594,12 @@ export class FileWorktree implements Worktree {
 
   setIgnoreCaseReader(read: (() => boolean) | undefined): void {
     this.ignoreCaseReader = read;
+  }
+
+  setSkipWorktreeIgnoreReader(
+    read: ((path: string) => Promise<string | undefined>) | undefined,
+  ): void {
+    this.skipWorktreeIgnoreReader = read;
   }
 
   /** A file of the git directory (`info/attributes`), never through a symbolic link. */
@@ -1535,14 +1543,22 @@ export class FileWorktree implements Worktree {
   ): Promise<void> {
     const gitignorePath = joinPath(dirPath, ".gitignore");
     let text: string | undefined;
+    let opened = false;
     try {
       if ((await files.lstat?.(gitignorePath))?.kind !== "symlink") {
         if (await files.exists(gitignorePath)) {
+          opened = true;
           text = decodeGitPatternFile(await readFile(files, gitignorePath));
         }
       }
     } catch {
       text = undefined;
+    }
+    // a file git cannot open (absent, or a link it never follows) is read from the index
+    // when its entry is skip-worktree (add_patterns' read_skip_worktree_file_from_index)
+    if (!opened && this.skipWorktreeIgnoreReader) {
+      const indexPath = relativePath ? `${relativePath}/.gitignore` : ".gitignore";
+      text = await this.skipWorktreeIgnoreReader(indexPath).catch(() => undefined);
     }
     if (this.ignoreManager.setIgnoreFile) this.ignoreManager.setIgnoreFile(relativePath, text);
     else if (text !== undefined) this.ignoreManager.addIgnoreFile(relativePath, text);

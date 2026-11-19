@@ -308,6 +308,12 @@ export async function createWorktreeTree(
       result.set(entry.path, kept);
       continue;
     }
+    // assume-unchanged: refresh_index marks it up to date, so diff-index takes the index's
+    // blob and never looks at the path (one beyond a symbolic link included)
+    if (entry.assumeValid) {
+      result.set(entry.path, kept);
+      continue;
+    }
     if (compared.kind === "deleted") {
       if (await beyondSymlink(worktree, entry.path)) {
         throw new Error(

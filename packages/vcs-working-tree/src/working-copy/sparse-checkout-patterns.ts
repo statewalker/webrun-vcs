@@ -6,6 +6,20 @@
 import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 import { createIgnoreRule, trimTrailingSpaces } from "../ignore/index.js";
 
+/**
+ * The hashsets of a cone-mode pattern list (git's `recursive_hashmap` and `parent_hashmap`):
+ * slash-led directory names, unescaped (`dup_and_filter_pattern`), in the order they were
+ * added. Both are multisets, as git's hashmaps hold equal entries more than once.
+ */
+export interface SparseConeSets {
+  /** `/*` was given (and not taken back by a later `!/*\/`): every path is in */
+  readonly full: boolean;
+  /** Directories whose whole contents are in (`/k/`) */
+  readonly recursive: readonly string[];
+  /** Directories whose files directly inside are in (`/p/` with `!/p/*\/`) */
+  readonly parent: readonly string[];
+}
+
 /** The sparse checkout's definition, as git reads it for `path_in_sparse_checkout`. */
 export interface SparseCheckoutPatterns {
   /** Whether cone matching is used (`core.sparseCheckoutCone` and cone-shaped patterns). */
@@ -15,18 +29,34 @@ export interface SparseCheckoutPatterns {
    * trailing `/` (`sub/`), for a directory as git asks for an embedded repository.
    */
   includes(path: string): boolean;
+  /**
+   * What git warns about while it loads the patterns in cone mode (`add_pattern_to_hashsets`),
+   * without the `warning: ` prefix: `unrecognized pattern: '<p>'`, `unrecognized negative
+   * pattern: '<p>'`, a repeated pattern, then `disabling cone pattern matching`.
+   */
+  readonly warnings: readonly string[];
+  /** The patterns as read (each line of the file, trailing spaces trimmed) */
+  readonly lines: readonly string[];
+  /** In cone mode: the recursive and parent directories */
+  readonly coneSets?: SparseConeSets;
 }
 
 /** Every path is in the checkout: git without a sparse-checkout file. */
-const EVERYTHING: SparseCheckoutPatterns = { cone: false, includes: () => true };
+const EVERYTHING: SparseCheckoutPatterns = {
+  cone: false,
+  includes: () => true,
+  warnings: [],
+  lines: [],
+};
 
 /**
  * The patterns of a sparse-checkout file (`content`, undefined when there is none: every
  * path is then included, as git accepts a path when the patterns cannot be read), matched
  * in cone mode when `cone` (`core.sparseCheckoutCone`) and the patterns have the cone's
- * shape (git's `add_pattern_to_hashsets`, which otherwise falls back to the gitignore-style
- * matching of non-cone mode). With `ignoreCase` (`core.ignoreCase`) ASCII letters match in
- * either case, in both modes (git's `fspathhash` and `fspathncmp`, `WM_CASEFOLD`).
+ * shape (git's `add_pattern_to_hashsets`, which otherwise warns and falls back to the
+ * gitignore-style matching of non-cone mode). With `ignoreCase` (`core.ignoreCase`) ASCII
+ * letters match in either case, in both modes (git's `fspathhash` and `fspathncmp`,
+ * `WM_CASEFOLD`).
  *
  * The lines are read as git's `add_patterns_from_buffer` reads them: an empty line or one
  * starting with `#` is skipped; any other line loses its CR and unescaped trailing spaces,
@@ -47,37 +77,81 @@ export function parseSparseCheckoutPatterns(
   ignoreCase = false,
 ): SparseCheckoutPatterns {
   if (content === undefined) return EVERYTHING;
+  return sparsePatternsFromLines(splitPatternLines(content), cone, ignoreCase);
+}
+
+/**
+ * The lines of a pattern file as git's `add_patterns_from_buffer` reads them: empty lines
+ * and `#` comments skipped, a CR and unescaped trailing spaces dropped.
+ */
+export function splitPatternLines(content: string): string[] {
   const lines: string[] = [];
   for (const raw of content.split("\n")) {
     // (git's buffer always ends with a newline: text after the last one is a line too)
     if (raw.length === 0 || raw.startsWith("#")) continue;
     lines.push(trimTrailingSpaces(raw.endsWith("\r") ? raw.slice(0, -1) : raw));
   }
+  return lines;
+}
+
+/**
+ * Patterns given one by one, as git's `add_pattern` takes them (nothing trimmed or skipped:
+ * `sparse-checkout set --no-cone <patterns>`, a `--rules-file` read in non-cone mode), in
+ * cone mode when `cone` and they have the cone's shape.
+ */
+export function sparsePatternsFromLines(
+  lines: readonly string[],
+  cone: boolean,
+  ignoreCase = false,
+): SparseCheckoutPatterns {
   const fold = ignoreCase ? foldAsciiCase : (s: string) => s;
-  const hashsets = cone ? coneHashsets(lines, fold) : undefined;
-  if (hashsets) {
-    const { full, recursive, parent } = hashsets;
-    const has = (set: Map<string, number>, key: string) => set.has(fold(key));
-    return {
-      cone: true,
-      includes: (path) => {
-        if (!path || full) return true;
-        // git's path_matches_pattern_list in cone mode: a directory (`sub/`) is asked as a
-        // file directly inside it (`sub/-`)
-        const slashed = `/${path}`;
-        const directory = slashed.endsWith("/");
-        const slash = directory ? slashed.length - 1 : slashed.lastIndexOf("/");
-        if (has(recursive, directory ? `${slashed}-` : slashed)) return true;
-        if (slash <= 0) return true;
-        if (has(parent, slashed.slice(0, slash))) return true;
-        // hashmap_contains_parent
-        for (let k = slashed.lastIndexOf("/"); k > 0; k = slashed.lastIndexOf("/", k - 1)) {
-          if (has(recursive, slashed.slice(0, k))) return true;
-        }
-        return false;
-      },
-    };
-  }
+  const warnings: string[] = [];
+  const sets = cone ? coneHashsets(lines, fold, warnings) : undefined;
+  if (sets) return { ...coneMatcher(sets, fold), warnings, lines: [...lines], coneSets: sets };
+  return { cone: false, includes: nonConeMatcher(lines, ignoreCase), warnings, lines: [...lines] };
+}
+
+/** The patterns of cone-mode hashsets built directly (git's `insert_recursive_pattern`). */
+export function sparsePatternsFromCone(
+  sets: SparseConeSets,
+  ignoreCase = false,
+): SparseCheckoutPatterns {
+  const fold = ignoreCase ? foldAsciiCase : (s: string) => s;
+  return { ...coneMatcher(sets, fold), warnings: [], lines: [], coneSets: sets };
+}
+
+/** git's `path_matches_pattern_list` in cone mode, over the hashsets. */
+function coneMatcher(
+  sets: SparseConeSets,
+  fold: (s: string) => string,
+): { cone: true; includes: (path: string) => boolean } {
+  const recursive = new Set(sets.recursive.map(fold));
+  const parent = new Set(sets.parent.map(fold));
+  const full = sets.full;
+  const has = (set: Set<string>, key: string) => set.has(fold(key));
+  return {
+    cone: true,
+    includes: (path) => {
+      if (!path || full) return true;
+      // git's path_matches_pattern_list in cone mode: a directory (`sub/`) is asked as a
+      // file directly inside it (`sub/-`)
+      const slashed = `/${path}`;
+      const directory = slashed.endsWith("/");
+      const slash = directory ? slashed.length - 1 : slashed.lastIndexOf("/");
+      if (has(recursive, directory ? `${slashed}-` : slashed)) return true;
+      if (slash <= 0) return true;
+      if (has(parent, slashed.slice(0, slash))) return true;
+      // hashmap_contains_parent
+      for (let k = slashed.lastIndexOf("/"); k > 0; k = slashed.lastIndexOf("/", k - 1)) {
+        if (has(recursive, slashed.slice(0, k))) return true;
+      }
+      return false;
+    },
+  };
+}
+
+/** git's `path_in_sparse_checkout_1` over gitignore-style patterns (non-cone mode). */
+function nonConeMatcher(lines: readonly string[], ignoreCase: boolean): (path: string) => boolean {
   const rules = lines.map((line) => {
     // an empty pattern (`""`, `"!"`) takes an empty basename (git's match_basename): a
     // directory asked as `sub/`
@@ -100,50 +174,48 @@ export function parseSparseCheckoutPatterns(
     }
     return undefined;
   };
-  return {
-    cone: false,
-    includes: (path) => {
-      if (!path) return true;
-      // path_in_sparse_checkout_1: the path's own answer, else its parent directories'
-      // (UNDECIDED climbs), else out; `sub/` is asked first as itself (empty basename)
-      let isDirectory = false;
-      for (let end = path.length; end > 0; ) {
-        let slash = end - 1;
-        while (slash > 0 && path[slash] !== "/") slash--;
-        const matched = matchOf(path.slice(0, end), isDirectory);
-        if (matched !== undefined) return matched;
-        isDirectory = true;
-        end = slash;
-      }
-      return false;
-    },
+  return (path) => {
+    if (!path) return true;
+    // path_in_sparse_checkout_1: the path's own answer, else its parent directories'
+    // (UNDECIDED climbs), else out; `sub/` is asked first as itself (empty basename)
+    let isDirectory = false;
+    for (let end = path.length; end > 0; ) {
+      let slash = end - 1;
+      while (slash > 0 && path[slash] !== "/") slash--;
+      const matched = matchOf(path.slice(0, end), isDirectory);
+      if (matched !== undefined) return matched;
+      isDirectory = true;
+      end = slash;
+    }
+    return false;
   };
 }
 
 /** glob characters, as git's `is_glob_special` */
 const isGlobSpecial = (c: string | undefined) => c === "*" || c === "?" || c === "[" || c === "\\";
 
-/** A multiset of keys, as git's hashmap holds equal entries more than once. */
-type Multiset = Map<string, number>;
-const addTo = (set: Multiset, key: string) => set.set(key, (set.get(key) ?? 0) + 1);
-const removeOne = (set: Multiset, key: string) => {
-  const n = set.get(key) ?? 0;
-  if (n <= 1) set.delete(key);
-  else set.set(key, n - 1);
-};
-
 /**
  * git's `add_pattern_to_hashsets` over every pattern: the recursive and parent directory
- * sets (slash-led, unescaped, case folded by `fold`; multisets, as git's hashmaps), or
- * undefined when a pattern is not of the cone's shape.
+ * sets (slash-led, unescaped; multisets, as git's hashmaps, compared after `fold`), or
+ * undefined when a pattern is not of the cone's shape, with git's warnings pushed onto
+ * `warnings` (the pattern as `parse_path_pattern` leaves it: no `!`, no trailing `/`).
  */
 function coneHashsets(
-  lines: string[],
+  lines: readonly string[],
   fold: (s: string) => string,
-): { full: boolean; recursive: Multiset; parent: Multiset } | undefined {
+  warnings: string[],
+): SparseConeSets | undefined {
   let full = false;
-  const recursive: Multiset = new Map();
-  const parent: Multiset = new Map();
+  const recursive: string[] = [];
+  const parent: string[] = [];
+  const indexIn = (list: string[], key: string) => {
+    const folded = fold(key);
+    return list.findIndex((e) => fold(e) === folded);
+  };
+  const disable = (message: string) => {
+    warnings.push(message, "disabling cone pattern matching");
+    return undefined;
+  };
   for (const line of lines) {
     let pattern = line;
     let negative = false;
@@ -165,8 +237,10 @@ function coneHashsets(
       full = true;
       continue;
     }
-    if (pattern.length < 2 || !pattern.startsWith("/") || pattern.includes("**")) return undefined;
-    if (!mustBeDir) return undefined;
+    if (pattern.length < 2 || !pattern.startsWith("/") || pattern.includes("**")) {
+      return disable(`unrecognized pattern: '${pattern}'`);
+    }
+    if (!mustBeDir && pattern !== "/*") return disable(`unrecognized pattern: '${pattern}'`);
     for (let i = 1; i < pattern.length; i++) {
       const prev = pattern[i - 1];
       const cur = pattern[i];
@@ -174,18 +248,22 @@ function coneHashsets(
       if (!isGlobSpecial(cur) || prev === "\\") continue;
       if (cur === "\\" && isGlobSpecial(next)) continue;
       if (prev === "/" && cur === "*" && next === undefined) continue;
-      return undefined;
+      return disable(`unrecognized pattern: '${pattern}'`);
     }
-    const filtered = fold(filterConePattern(pattern));
+    const filtered = filterConePattern(pattern);
     if (pattern.length > 2 && pattern.endsWith("/*")) {
-      if (!negative || !recursive.has(filtered)) return undefined;
-      addTo(parent, filtered);
-      removeOne(recursive, filtered);
+      if (!negative) return disable(`unrecognized pattern: '${pattern}'`);
+      const at = indexIn(recursive, filtered);
+      if (at < 0) return disable(`unrecognized negative pattern: '${pattern}'`);
+      parent.push(filtered);
+      recursive.splice(at, 1);
       continue;
     }
-    if (negative) return undefined;
-    addTo(recursive, filtered);
-    if (parent.has(filtered)) return undefined;
+    if (negative) return disable(`unrecognized negative pattern: '${pattern}'`);
+    recursive.push(filtered);
+    if (indexIn(parent, filtered) >= 0) {
+      return disable(`your sparse-checkout file may have issues: pattern '${pattern}' is repeated`);
+    }
   }
   return { full, recursive, parent };
 }

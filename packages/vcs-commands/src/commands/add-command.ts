@@ -43,6 +43,7 @@ import {
   pathspecErrors,
   pathspecItemPath,
 } from "./pathspec.js";
+import { sparsePathAdvice } from "./sparse-checkout-support.js";
 /**
  * Result of AddCommand execution.
  *
@@ -915,21 +916,7 @@ export class AddCommand extends GitCommand<AddResult> {
    * words it (2.43 ends with "git config advice.updateSparsePath false").
    */
   private sparseAdvice(elements: string[]): string[] {
-    const lines = [
-      "The following paths and/or pathspecs matched paths that exist",
-      "outside of your sparse-checkout definition, so will not be",
-      "updated in the index:",
-      ...elements,
-    ];
-    if (this.advice("updateSparsePath")) {
-      lines.push(
-        "hint: If you intend to update such entries, try one of the following:",
-        "hint: * Use the --sparse option.",
-        "hint: * Disable or modify the sparsity rules.",
-        this.disableHint("updateSparsePath"),
-      );
-    }
-    return lines;
+    return sparsePathAdvice(elements, this.advice("updateSparsePath"), this.compatibility);
   }
 
   /**

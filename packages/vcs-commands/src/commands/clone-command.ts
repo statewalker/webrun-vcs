@@ -21,6 +21,8 @@ import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
+import { SparseCheckoutCommand } from "./sparse-checkout-command.js";
+import { SparseUnpack } from "./sparse-checkout-support.js";
 import { checkoutFreshTree } from "./tree-restore.js";
 
 /** Names the clone's checkout in failure messages. */
@@ -88,6 +90,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   private depth?: number;
   private bare = false;
   private noCheckout = false;
+  private sparse = false;
   private remoteName = "origin";
   private cloneAllBranches = true;
   private mirror = false;
@@ -178,6 +181,17 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   setNoCheckout(noCheckout: boolean): this {
     this.checkCallable();
     this.noCheckout = noCheckout;
+    return this;
+  }
+
+  /**
+   * `git clone --sparse`: the new worktree starts as a cone-mode sparse checkout of the
+   * top-level files only (git runs `git sparse-checkout set` before its checkout), the
+   * other entries skip-worktree and not written.
+   */
+  setSparse(sparse: boolean): this {
+    this.checkCallable();
+    this.sparse = sparse;
     return this;
   }
 
@@ -686,7 +700,20 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     const commit = await this.commits.load(commitId).catch(() => undefined);
     if (!commit) return [];
     const worktree = this.bare ? undefined : this.worktreeAccess;
-    return checkoutFreshTree(
+    // git_sparse_checkout_init: `git sparse-checkout set` in the new repository (no index
+    // yet: the file and the config only), then the checkout applies its patterns
+    const sparse =
+      this.sparse && worktree
+        ? await (async () => {
+            await new SparseCheckoutCommand(this.workingCopy).setArguments(["set"]).call();
+            return SparseUnpack.start({
+              workingCopy: this.workingCopy,
+              worktree,
+              staging: this.staging,
+            });
+          })()
+        : undefined;
+    const collided = await checkoutFreshTree(
       {
         trees: this.trees,
         blobs: this.blobs,
@@ -694,10 +721,19 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         worktree,
         symlinks: worktree ? this.symlinksEnabled(worktree) : false,
         ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+        ...(sparse ? { writes: (path: string) => sparse.writes(path) } : {}),
       },
       commit.tree,
       CLONE,
     );
+    // loop #2 of unpack-trees: the entries outside the patterns are skip-worktree
+    await sparse?.finish({
+      workingCopy: this.workingCopy,
+      worktree,
+      staging: this.staging,
+      blobs: this.blobs,
+    });
+    return collided;
   }
 
   /** Whether symlinks are written as links: the worktree can, and `core.symlinks` allows. */

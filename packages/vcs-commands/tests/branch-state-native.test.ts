@@ -222,4 +222,38 @@ describeGit("branch state against native git", () => {
     );
     await compare(graph, clean, ["reset", "-q", "HEAD"], reset("HEAD", ResetMode.MIXED));
   });
+
+  it("an up-to-date merge, merge --quit and a reset keep a stopped merge's autostash", async () => {
+    // a squash merge with --autostash stops before its commit, its stash in MERGE_AUTOSTASH;
+    // remove_merge_branch_state stores it as stash@{0} ("autostash") and says so
+    const stopped = (dir: string) => {
+      put(dir, "h", "dirty\n");
+      gitOk(root, dir, "merge", "-q", "--squash", "--autostash", "next");
+    };
+    const saved = [
+      "Autostash exists; creating a new stash entry.",
+      "Your changes are safe in the stash.",
+      'You can run "git stash pop" or "git stash drop" at any time.',
+    ];
+    let lines: string[] = [];
+    const upToDate = await compare(graph, stopped, ["merge", "main"], async (g) => {
+      lines = (await g.merge().include("main").call()).output ?? [];
+    });
+    expect(upToDate.stderr.trim().split("\n")).toEqual(saved);
+    expect(lines).toEqual(["Already up to date.", ...saved]);
+
+    const quit = await compare(graph, stopped, ["merge", "--quit"], async (g) => {
+      lines = (await g.merge().setOperation(MergeOperation.QUIT).call()).output ?? [];
+    });
+    expect(quit.stderr.trim().split("\n")).toEqual(saved);
+    expect(lines).toEqual(saved);
+
+    const hard = await compare(graph, stopped, ["reset", "-q", "--hard"], async (g) => {
+      const command = g.reset().setRef("HEAD").setMode(ResetMode.HARD);
+      await command.call();
+      lines = command.getWarnings();
+    });
+    expect(hard.stderr.trim().split("\n")).toEqual(saved);
+    expect(lines).toEqual(saved);
+  });
 });

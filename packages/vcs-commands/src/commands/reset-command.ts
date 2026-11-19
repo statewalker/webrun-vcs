@@ -2,6 +2,8 @@ import type { Blobs, ObjectId, Ref } from "@statewalker/vcs-core";
 import {
   cacheTreeOfTree,
   copyCacheTree,
+  entryStatOf,
+  getWorktreeEntries,
   invalidateCacheTreePath,
   type ResolveUndoRecord,
   type Staging,
@@ -18,8 +20,9 @@ import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { flatTree, OperationState } from "./merge-support.js";
 import { reflogMessages, updateHead } from "./reflog-messages.js";
 import { removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
+import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
-import { flaggedEntryDiffers } from "./worktree-overwrite-checks.js";
+import { flaggedEntryDiffers, pruneEmptyParents } from "./worktree-overwrite-checks.js";
 
 /** Names this operation in restore failure messages. */
 const RESET_HARD = "reset --hard";
@@ -102,6 +105,19 @@ export class ResetCommand extends GitCommand<Ref> {
   }
 
   /**
+   * What the reset printed on stderr while applying the sparse checkout's patterns, line by
+   * line: the patterns' warnings, and git's `error: Path '<p>' not uptodate; will not remove
+   * from working tree.` for a changed file left outside them (`--merge`, `--keep`), and
+   * "Autostash exists; creating a new stash entry." with its lines when a stopped merge's
+   * autostash is kept on `refs/stash`. Read after {@link call}.
+   */
+  getWarnings(): string[] {
+    return [...this.warnings];
+  }
+
+  private readonly warnings: string[] = [];
+
+  /**
    * Add a path to reset.
    *
    * When paths are specified, only those paths are reset in the staging area.
@@ -166,6 +182,7 @@ export class ResetCommand extends GitCommand<Ref> {
         trees: this.trees,
         commits: this.commits,
         refs: this.refsStore,
+        sparseWarnings: this.warnings,
       };
       const refused =
         this.mode === ResetMode.MERGE
@@ -173,6 +190,17 @@ export class ResetCommand extends GitCommand<Ref> {
           : await resetKeep(ctx, headId ?? targetId, targetId, targetRef);
       if (refused) throw new ResetRefusedError(refused.message, refused.paths);
     }
+
+    // a hard reset in a sparse checkout: unpack-trees with its patterns (what stays outside
+    // is neither checked nor touched)
+    const sparse =
+      this.mode === ResetMode.HARD
+        ? await SparseUnpack.start({
+            workingCopy: this.workingCopy,
+            worktree: this.worktreeAccess,
+            staging: this.staging,
+          })
+        : undefined;
 
     // --hard: unpack-trees' one-way merge checks the entries whose flags cheat (assume-unchanged,
     // skip-worktree) before anything changes; a file kept outside the worktree stays so
@@ -188,6 +216,7 @@ export class ResetCommand extends GitCommand<Ref> {
             worktree: this.worktreeAccess,
           },
           commit.tree,
+          sparse,
         );
         if (flagged.refused !== undefined) {
           throw new ResetRefusedError(
@@ -214,11 +243,37 @@ export class ResetCommand extends GitCommand<Ref> {
 
     // Reset working tree (for HARD) - this DESTROYS uncommitted changes
     if (this.mode === ResetMode.HARD) {
-      await this.resetWorkingTree(targetId, trackedBefore ?? new Set(), flagged?.keptOut);
+      const written = await this.resetWorkingTree(
+        targetId,
+        trackedBefore ?? new Set(),
+        flagged?.keptOut,
+        sparse,
+      );
+      // check_updates: the entries written carry the stat of their new files
+      if (this.worktreeAccess && written.size > 0) {
+        await recordWrittenStat(this.staging, this.worktreeAccess, written);
+        await this.staging.write();
+      }
+      if (sparse) {
+        // UNPACK_RESET_OVERWRITE_UNTRACKED: an entry coming back is written over anything
+        const outcome = await sparse.finish(
+          {
+            workingCopy: this.workingCopy,
+            worktree: this.worktreeAccess,
+            staging: this.staging,
+            blobs: this.blobs,
+          },
+          { written, overwrite: true },
+        );
+        pushSparseWarnings(this.warnings, sparse, outcome, false);
+      }
     }
 
     // git's remove_branch_state: a merge, cherry-pick or revert in progress is forgotten
-    await removeBranchState({ commits: this.commits, refs: this.refsStore }, state);
+    // (a merge's autostash kept on refs/stash, git's lines printed)
+    this.warnings.push(
+      ...(await removeBranchState({ commits: this.commits, refs: this.refsStore }, state)),
+    );
 
     // Return the updated HEAD ref
     const headRef = await this.refsStore.resolve("HEAD");
@@ -304,22 +359,24 @@ export class ResetCommand extends GitCommand<Ref> {
     targetId: ObjectId,
     trackedBefore: Set<string>,
     keptOut?: ReadonlySet<string>,
-  ): Promise<void> {
+    sparse?: SparseUnpack,
+  ): Promise<Set<string>> {
     const worktree = this.worktreeAccess;
     if (!worktree) {
       // Bare repository: there is no working tree to reset.
-      return;
+      return new Set();
     }
 
     const commit = await this.commits.load(targetId);
     if (!commit) {
       throw new RefNotFoundError(targetId, "Target commit not found");
     }
-    await restoreWorktreeHard(
+    return restoreWorktreeHard(
       { trees: this.trees, blobs: this.blobs, workingCopy: this.workingCopy, worktree },
       commit.tree,
       trackedBefore,
       keptOut,
+      sparse,
     );
   }
 
@@ -429,14 +486,17 @@ export class ResetCommand extends GitCommand<Ref> {
  * The working tree half of `git reset --hard` (unpack-trees `oneway_merge` with `update`):
  * `treeId` written over the worktree, the paths of `trackedBefore` it lacks deleted first.
  * Untracked files in the way are overwritten, as git's reset does. The restore is planned
- * in full before any file is touched.
+ * in full before any file is touched. In a sparse checkout (`sparse`) only the paths in its
+ * patterns are written, nothing that stays outside is removed, and the files leaving the
+ * checkout are unlinked first. Returns the paths written.
  */
 export async function restoreWorktreeHard(
   deps: { trees: CommandTrees; blobs: Blobs; workingCopy: WorkingCopy; worktree: Worktree },
   treeId: ObjectId,
   trackedBefore: Set<string>,
   keptOut?: ReadonlySet<string>,
-): Promise<void> {
+  sparse?: SparseUnpack,
+): Promise<Set<string>> {
   const { trees, blobs, workingCopy, worktree } = deps;
   // Plan the whole restore first. Anything unrestorable then fails while the
   // working tree is still untouched, instead of half-way through rewriting it.
@@ -446,22 +506,43 @@ export async function restoreWorktreeHard(
     windows: worktree.capabilities?.windowsPaths === true,
     reservedNames: worktree.capabilities?.reservedNames,
   });
-  // a skip-worktree entry the tree keeps is not checked out (oneway_merge skips it)
-  const plan =
-    keptOut && keptOut.size > 0
-      ? {
-          ...fullPlan,
-          entries: fullPlan.entries.filter((e) => !keptOut.has(e.path)),
-          gitlinks: fullPlan.gitlinks.filter((e) => !keptOut.has(e.path)),
-        }
-      : fullPlan;
+  // a skip-worktree entry the tree keeps is not checked out (oneway_merge skips it); in a
+  // sparse checkout, nothing outside its patterns is (apply_sparse_checkout), and an entry
+  // coming back into them is written
+  const skip = sparse
+    ? (path: string) => !sparse.writes(path)
+    : keptOut && keptOut.size > 0
+      ? (path: string) => keptOut.has(path)
+      : undefined;
+  const plan = skip
+    ? {
+        ...fullPlan,
+        entries: fullPlan.entries.filter((e) => !skip(e.path)),
+        gitlinks: fullPlan.gitlinks.filter((e) => !skip(e.path)),
+      }
+    : fullPlan;
+
+  if (sparse) {
+    // apply_sparse_checkout before check_updates: the files leaving the checkout
+    const result = new Map<string, { objectId: ObjectId; mode: number }>();
+    for (const e of fullPlan.entries) result.set(e.path, e);
+    for (const e of fullPlan.gitlinks) result.set(e.path, e);
+    const unlink = await sparse.leaving(worktree, (p) => result.get(p), {
+      reset: true,
+      trust: worktreeModeTrust(workingCopy, worktree),
+    });
+    await sparse.unlink(worktree, unlink);
+  }
 
   // Delete the files that were tracked but are not in the target tree first, as git's
   // unpack-trees does: a tracked file or symlink `d` then makes way for `d/x`, and is
-  // never written beneath or through.
+  // never written beneath or through; the directories left empty go too (unlink_entry's
+  // schedule_dir_for_removal). A skip-worktree entry staying outside a sparse checkout
+  // keeps its file.
   for (const path of trackedBefore) {
-    if (plan.paths.has(path)) continue;
+    if (plan.paths.has(path) || sparse?.leavesAlone(path)) continue;
     await worktree.remove(path);
+    await pruneEmptyParents(worktree, path);
   }
 
   // a forced checkout: a file or link where a directory must go is unlinked, never
@@ -472,6 +553,36 @@ export async function restoreWorktreeHard(
     // git's reset --hard overwrites untracked files (UNPACK_RESET_OVERWRITE_UNTRACKED)
     discardUntracked: true,
   });
+  return new Set([...plan.entries, ...plan.gitlinks].map((e) => e.path));
+}
+
+/**
+ * Records in the index the stat of the files a one-way reset just wrote (`paths`): git's
+ * `checkout_entry` fills each written entry's stat data in `check_updates`, so a following
+ * `diff-files` or sparse update finds them clean. Only stage-0 entries are touched, and the
+ * staging's own racy-git smudging still applies when the index is written. Not written here.
+ */
+export async function recordWrittenStat(
+  staging: Staging,
+  worktree: Worktree,
+  paths: Iterable<string>,
+): Promise<void> {
+  const list = [...paths];
+  if (list.length === 0) return;
+  const found = await getWorktreeEntries(worktree, list);
+  const editor = staging.createEditor();
+  let edits = 0;
+  for (let i = 0; i < list.length; i++) {
+    const stat = found[i];
+    if (!stat || stat.isDirectory) continue;
+    edits++;
+    editor.add({
+      path: list[i] as string,
+      apply: (existing) =>
+        existing && existing.stage === 0 ? { ...existing, ...entryStatOf(stat) } : existing,
+    });
+  }
+  if (edits > 0) await editor.finish();
 }
 
 /** What {@link checkFlaggedEntries} found. */
@@ -498,6 +609,8 @@ export async function checkFlaggedEntries(
     worktree?: Worktree;
   },
   treeId: ObjectId,
+  /** A sparse checkout's run: an entry that stays outside it is not checked (verify_uptodate) */
+  sparse?: SparseUnpack,
 ): Promise<FlaggedEntries> {
   const flagged: StagingEntry[] = [];
   for await (const entry of deps.staging.entries()) {
@@ -510,6 +623,7 @@ export async function checkFlaggedEntries(
   const trust = worktree ? worktreeModeTrust(deps.workingCopy, worktree) : undefined;
   const indexTime = deps.staging.getUpdateTime();
   for (const entry of flagged) {
+    if (sparse?.leavesAlone(entry.path)) continue;
     const t = target.get(entry.path);
     if (t && t.mode === entry.mode && t.objectId === entry.objectId) {
       if (entry.skipWorktree) keptOut.add(entry.path);

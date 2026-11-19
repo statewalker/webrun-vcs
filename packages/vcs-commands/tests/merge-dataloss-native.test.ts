@@ -672,3 +672,43 @@ describeGit("autostash and directory replacement never strand or lose work", () 
     expect((await worktree.getEntry("d"))?.isDirectory).toBe(false);
   });
 });
+
+describeGit("a refused merge over a symbolic link among the leading directories", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "merge-dataloss-link-"));
+  });
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  // d/f assume-unchanged, d then replaced by a link: save_state's `stash create` passes the
+  // entry over (refresh_index marks it up to date), the merge is refused and git's reset
+  // writes d/f into a real directory where the link was, its target left as it is
+  const history = (staged: boolean, target: string): History => ({
+    base: { "d/f": "base\n", k: "k\n" },
+    side: { "d/f": "side\n", k: "side\n" },
+    main: { "d/f": "main\n" },
+    dirty: { k: "local\n", d: { link: target } },
+    ...(staged ? { stage: ["k"] } : {}),
+  });
+  for (const staged of [true, false]) {
+    for (const target of ["e", "../outside-e"]) {
+      it(`returns FAILED and resets (k ${staged ? "staged" : "changed"}, d -> ${target})`, async () => {
+        const fill = (dir: string) => {
+          put(join(dir, target, ".."), `${target.split("/").pop()}/f`, "elsewhere\n");
+          gitOk(root, dir, "update-index", "--assume-unchanged", "d/f");
+        };
+        const { native, ours } = twins(history(staged, target), fill);
+        const n = git(root, native, "merge", "side");
+        expect(n.status).toBe(2);
+        const result = await oursMerge(ours);
+        expect(result.status).toBe("failed");
+        expect(result.message).toBe(n.stderr.trim());
+        same("merge", ours, native);
+        expect(gitOk(root, ours, "ls-files", "-v")).toBe(gitOk(root, native, "ls-files", "-v"));
+        const left = target === "e" ? join(ours, "e/f") : join(root, "outside-e/f");
+        expect(readFileSync(left, "utf8")).toBe("elsewhere\n");
+      });
+    }
+  }
+});

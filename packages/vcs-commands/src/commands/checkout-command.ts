@@ -76,8 +76,9 @@ import {
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { OperationState, updateIndexCacheTree } from "./merge-support.js";
 import { reflogMessages } from "./reflog-messages.js";
-import { checkFlaggedEntries, restoreWorktreeHard } from "./reset-command.js";
+import { checkFlaggedEntries, recordWrittenStat, restoreWorktreeHard } from "./reset-command.js";
 import { removeBranchState } from "./sequencer-support.js";
+import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
 import { StashCreateCommand } from "./stash-create-command.js";
 import { STASH_REF } from "./stash-list-command.js";
@@ -164,6 +165,15 @@ export interface CheckoutResult {
    * untracked files the switch would overwrite, or an index with unmerged entries.
    */
   readonly message?: string;
+
+  /**
+   * What a branch switch printed on stderr while applying the sparse checkout's patterns,
+   * line by line (the patterns' warnings, git's "The following paths are not up to date and
+   * were left despite sparse patterns:" block), and git's "Autostash exists; creating a new
+   * stash entry." lines when a stopped merge's autostash is kept on `refs/stash`; absent when
+   * there was nothing to say.
+   */
+  readonly warnings?: string[];
 }
 
 /** A tree or index entry, as the two-way merge compares them (index entries with stat). */
@@ -654,6 +664,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     const trackedBefore = new Set<string>();
     for await (const entry of this.staging.entries()) trackedBefore.add(entry.path);
     const worktree = this.worktreeAccess;
+    // in a sparse checkout, unpack-trees with its patterns
+    const sparse = await SparseUnpack.start({
+      workingCopy: this.workingCopy,
+      worktree,
+      staging: this.staging,
+    });
     // unpack-trees' one-way merge: unchanged entries keep their flags, a skip-worktree file
     // the tree keeps is left alone
     const { keptOut } = await checkFlaggedEntries(
@@ -664,17 +680,26 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         worktree,
       },
       treeId,
+      sparse,
     );
     await this.staging.readTree(this.trees, treeId, { keepMatching: "flags" });
     // reset_head's prime_cache_tree: the index is HEAD's tree
     this.staging.setCacheTree?.(await cacheTreeOfTree(this.trees, treeId));
     await this.staging.write();
     if (worktree) {
-      await restoreWorktreeHard(
+      const written = await restoreWorktreeHard(
         { trees: this.trees, blobs: this.blobs, workingCopy: this.workingCopy, worktree },
         treeId,
         trackedBefore,
         keptOut,
+        sparse,
+      );
+      // check_updates: the entries written carry the stat of their new files
+      await recordWrittenStat(this.staging, worktree, written);
+      await this.staging.write();
+      await sparse?.finish(
+        { workingCopy: this.workingCopy, worktree, staging: this.staging, blobs: this.blobs },
+        { written },
       );
     }
   }
@@ -805,6 +830,15 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
 
     // Get target tree for conflict detection and checkout
     const targetTreeId = targetId ? await this.commits.getTree(targetId) : undefined;
+    // in a sparse checkout, unpack-trees with its patterns: a path that stays outside is
+    // neither checked nor touched in the worktree (its index entry still switches)
+    const sparse = await SparseUnpack.start({
+      workingCopy: this.workingCopy,
+      worktree: this.worktreeAccess,
+      staging: this.staging,
+    });
+    const quiet = (path: string) => sparse?.leavesAlone(path) === true;
+    const writes = (path: string) => !sparse || sparse.writes(path);
 
     // git's two-way merge (unpack-trees `twoway_merge`, checkout without -f): a path HEAD
     // and the target agree on keeps its index entry and worktree file as they are (local
@@ -855,10 +889,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       if (!this.force && sameSide(h, t)) continue;
       const i = index.get(path);
       if (this.force) {
-        // oneway_merge leaves a skip-worktree entry the target keeps (and its file) alone
+        // oneway_merge leaves a skip-worktree entry the target keeps (and its file) alone, as
+        // the sparse checkout does whatever stays outside it
         if ((i as { skipWorktree?: boolean } | undefined)?.skipWorktree && sameSide(i, t)) {
           continue;
         }
+        if (quiet(path)) continue;
         if (!sameSide(i, t) || t) switched.push(path);
         continue;
       }
@@ -878,6 +914,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       if (
         i !== undefined &&
         worktree &&
+        !quiet(path) &&
         (await entryNotUptodate(worktree, path, i, trust, this.staging.getUpdateTime()))
       ) {
         local.push(path);
@@ -891,7 +928,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // component, untracked files in a directory a file replaces
     if (worktree && !this.force) {
       const found = await findInTheWay(worktree, {
-        writes: switched.filter((p) => target.has(p)),
+        writes: switched.filter((p) => target.has(p) && writes(p)),
         removes: new Set(switched.filter((p) => !target.has(p))),
         index,
         ...(await restoreCaseOptions(worktree, ignoreCase)),
@@ -903,7 +940,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // own messages, one line per path
     if (worktree && this.force && this.protectUntracked) {
       const found = await findInTheWay(worktree, {
-        writes: switched.filter((p) => target.has(p)),
+        writes: switched.filter((p) => target.has(p) && writes(p)),
         removes: new Set(switched.filter((p) => !target.has(p))),
         index,
         ...(await restoreCaseOptions(worktree, ignoreCase)),
@@ -937,7 +974,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       for (const [path, i] of index) {
         const e = i as StagingEntry;
         if (!e.assumeValid && !e.skipWorktree) continue;
-        if (sameSide(i, target.get(path))) continue;
+        if (sameSide(i, target.get(path)) || quiet(path)) continue;
         if (await flaggedEntryDiffers(worktree, path, e, trust, indexTime)) {
           return {
             status: CheckoutStatus.CONFLICTS,
@@ -988,6 +1025,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     const updated: string[] = [];
     const removed: string[] = [];
     const switching = new Set(switched);
+    /** The paths whose files the switch wrote */
+    const written = new Set<string>();
     if (worktree && (targetTreeId || switched.length > 0 || this.force)) {
       const plan = targetTreeId
         ? await planTreeRestore(this.trees, this.blobs, targetTreeId, CHECKOUT, {
@@ -997,8 +1036,17 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
             reservedNames: worktree.capabilities?.reservedNames,
           })
         : undefined;
+      if (sparse && !keepAll) {
+        // apply_sparse_checkout before check_updates: the files leaving the checkout
+        const unlink = await sparse.leaving(
+          worktree,
+          (p) => (this.force || switching.has(p) ? target.get(p) : index.get(p)),
+          { reset: this.force, trust },
+        );
+        await sparse.unlink(worktree, unlink);
+      }
       for (const path of switched) {
-        if (target.has(path)) continue;
+        if (target.has(path) || quiet(path)) continue;
         await worktree.remove(path);
         await pruneEmptyParents(worktree, path);
         removed.push(path);
@@ -1006,16 +1054,17 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       // a forced checkout also drops tracked files no tree holds any more
       if (this.force) {
         for (const path of index.keys()) {
-          if (!target.has(path) && !switching.has(path)) {
+          if (!target.has(path) && !switching.has(path) && !quiet(path)) {
             await worktree.remove(path);
             removed.push(path);
           }
         }
       }
+      // in a sparse checkout, only the paths in its patterns are written
       const only = plan && {
         ...plan,
-        entries: plan.entries.filter((e) => switching.has(e.path)),
-        gitlinks: plan.gitlinks.filter((e) => switching.has(e.path)),
+        entries: plan.entries.filter((e) => switching.has(e.path) && writes(e.path)),
+        gitlinks: plan.gitlinks.filter((e) => switching.has(e.path) && writes(e.path)),
       };
       // the attributes of the index the switch leaves (git's o->result): the target's
       // entries for the switched paths, the index's own for every other
@@ -1038,6 +1087,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           attributes: { direction: "checkout", index: attributesIndexOf(result) },
         });
         updated.push(...only.entries.map((e) => e.path));
+        for (const e of [...only.entries, ...only.gitlinks]) written.add(e.path);
       }
     }
 
@@ -1050,6 +1100,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       // oneway_merge: an unchanged entry keeps its flags and stat, a changed one its
       // skip-worktree bit
       await this.staging.readTree(this.trees as any, targetTreeId, { keepMatching: "flags" });
+      // check_updates: the entries written carry the stat of their new files
+      if (worktree) await recordWrittenStat(this.staging, worktree, written);
       await this.writeSwitchedIndex();
     } else if (this.force && !keepAll) {
       // forced onto the empty tree (switch --orphan --discard-changes): an empty index
@@ -1065,7 +1117,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           editor.remove(path);
           continue;
         }
-        const stats = worktree ? await worktree.getEntry(path) : undefined;
+        // the stat of a file written (an entry left outside the checkout has none)
+        const stats = worktree && written.has(path) ? await worktree.getEntry(path) : undefined;
         // merged_entry: the replaced entry's skip-worktree bit migrates over
         const old = index.get(path) as { skipWorktree?: boolean } | undefined;
         editor.upsert({
@@ -1080,6 +1133,22 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       await this.writeSwitchedIndex();
     } else {
       await this.writeSwitchedIndex();
+    }
+
+    // the flags, and the entries coming back into the patterns (verify_absent_sparse; a
+    // forced checkout overwrites what stands there, UNPACK_RESET_OVERWRITE_UNTRACKED)
+    const sparseWarnings: string[] = [];
+    if (sparse && !keepAll) {
+      const outcome = await sparse.finish(
+        {
+          workingCopy: this.workingCopy,
+          worktree: this.worktreeAccess,
+          staging: this.staging,
+          blobs: this.blobs,
+        },
+        { written, overwrite: this.force && !this.protectUntracked },
+      );
+      pushSparseWarnings(sparseWarnings, sparse, outcome, true);
     }
 
     // HEAD's reflog line (git's update_refs_for_switch): "checkout: moving from <branch
@@ -1117,9 +1186,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       await this.refsStore.setSymbolic("HEAD", `refs/heads/${switchTo.branch}`, log);
     }
     // git's remove_branch_state: a merge, cherry-pick or revert stopped here is forgotten
-    await removeBranchState(
-      { commits: this.commits, refs: this.refsStore },
-      new OperationState(this.workingCopy.checkout, this.refsStore),
+    // (a merge's autostash kept on refs/stash, git's lines printed)
+    sparseWarnings.push(
+      ...(await removeBranchState(
+        { commits: this.commits, refs: this.refsStore },
+        new OperationState(this.workingCopy.checkout, this.refsStore),
+      )),
     );
 
     // conditional includes on the branch (includeIf.onbranch:) follow the new HEAD
@@ -1135,6 +1207,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       removed,
       conflicts: [],
       ref: ref ?? null,
+      ...(sparseWarnings.length > 0 ? { warnings: sparseWarnings } : {}),
     };
   }
 
