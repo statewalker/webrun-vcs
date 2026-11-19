@@ -151,9 +151,9 @@ describe("GitStaging rewrites git's index through index.lock, keeping what still
 
     expect(existsSync(join(dir, ".git/index.lock"))).toBe(false);
     const after = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
-    // the entries changed: the untracked cache goes, the cache-tree stays with the changed
-    // path's directories invalid (as git's add_index_entry leaves it), resolve-undo stays
-    expect(after.extensions).toEqual(["TREE", "REUC"]);
+    // the entries changed: the untracked cache and the cache-tree stay with the changed
+    // path's directories invalid (as git's add_index_entry leaves them), resolve-undo stays
+    expect(after.extensions).toEqual(["TREE", "REUC", "UNTR"]);
     expect(git(dir, ["ls-files", "--resolve-undo"])).toBe(undoBefore);
     expect(git(dir, ["ls-files", "--stage", "h.txt"])).toBe(`100644 ${hId} 0\th.txt`);
     git(dir, ["status", "--porcelain"]);
@@ -182,7 +182,7 @@ describe("GitStaging rewrites git's index through index.lock, keeping what still
     await staging.removeEntry("f.txt");
     await staging.write();
     const after = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
-    expect(after.extensions).toEqual(["TREE", "REUC"]);
+    expect(after.extensions).toEqual(["TREE", "REUC", "UNTR"]);
     expect(git(dir, ["ls-files", "--resolve-undo"])).toBe(undoBefore);
   });
 

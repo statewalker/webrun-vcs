@@ -23,10 +23,12 @@ import {
   fstatSync,
   lstatSync,
   lutimesSync,
+  opendirSync,
   openSync,
   readdirSync,
   readSync,
   renameSync,
+  statSync,
   unlinkSync,
   write as writeCb,
   writeSync,
@@ -38,6 +40,7 @@ import {
   BeyondSymlinkError,
   type DirectoryEntry,
   type LinkStats,
+  type ListKindsOptions,
   type PosixFilesApi,
 } from "@statewalker/vcs-utils/files";
 import { listInPathOrder } from "@statewalker/webrun-files";
@@ -191,6 +194,17 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     // no empty, "." or ".." component, no "\\" on Windows (resolved the long way)
     if (!this.windows) {
       const plain = virtualPath.charCodeAt(0) === 47 ? virtualPath.slice(1) : virtualPath;
+      // no "." or ".." component and no empty one is possible without "/." or "//" inside,
+      // a leading "." or a trailing "/": the regular expression only for the rest
+      if (
+        plain !== "" &&
+        plain.charCodeAt(0) !== 46 &&
+        plain.charCodeAt(plain.length - 1) !== 47 &&
+        !plain.includes("/.") &&
+        !plain.includes("//")
+      ) {
+        return this.rootPrefix + plain;
+      }
       if (plain !== "" && !UNPLAIN_PATH.test(plain)) return this.rootPrefix + plain;
     }
     const real = nodePath.resolve(this.root, ...this.segments(virtualPath));
@@ -728,7 +742,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
    * The directory's entries with their `d_type` (`readdir` with file types: no stat), names
    * read as bytes as `list` reads them; the temporaries of writes in flight left out.
    */
-  async listKinds(path: string): Promise<DirectoryEntry[]> {
+  async listKinds(path: string, options?: ListKindsOptions): Promise<DirectoryEntry[]> {
     const dir = await this.realNoLinks(path);
     let entries: import("node:fs").Dirent<string | Buffer>[];
     try {
@@ -739,9 +753,12 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       // Names as strings (cheaper than a Buffer each); read again as bytes when one is no
       // valid UTF-8 (decoded with U+FFFD), so it keeps its bytes (decodeGitPath's escapes)
       const path = fsPath(dir);
-      entries = readdirSync(path, { withFileTypes: true });
+      // readdirSync (libuv's scandir) sorts the names; an opened directory reads them in
+      // readdir(3) order, the one git's untracked cache records
+      const read = options?.readdirOrder ? readdirInOrder : readdirSorted;
+      entries = read(path, false);
       if (entries.some((dirent) => (dirent.name as string).includes("\uFFFD"))) {
-        entries = readdirSync(path, { withFileTypes: true, encoding: "buffer" });
+        entries = read(path, true);
       }
     } catch (error) {
       // gone meanwhile: nothing; unreadable (EACCES): thrown, its content is unknown
@@ -789,8 +806,37 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   }
 }
 
-const LOW32 = 0xffffffffn;
 const NS_PER_S = 1_000_000_000n;
+
+/** The entries of a directory, sorted by name (libuv's scandir). */
+function readdirSorted(
+  path: string | Buffer,
+  bytes: boolean,
+): import("node:fs").Dirent<string | Buffer>[] {
+  return bytes
+    ? readdirSync(path, { withFileTypes: true, encoding: "buffer" })
+    : readdirSync(path, { withFileTypes: true });
+}
+
+/** The entries of a directory in readdir(3) order (an opened directory, not sorted). */
+function readdirInOrder(
+  path: string | Buffer,
+  bytes: boolean,
+): import("node:fs").Dirent<string | Buffer>[] {
+  // (opendir takes a string path; a name with escaped bytes is listed through readdir)
+  if (typeof path !== "string") return readdirSorted(path, bytes);
+  const handle = opendirSync(path, {
+    bufferSize: 256,
+    ...(bytes ? { encoding: "buffer" as BufferEncoding } : {}),
+  });
+  const out: import("node:fs").Dirent<string | Buffer>[] = [];
+  try {
+    for (let dirent = handle.readSync(); dirent; dirent = handle.readSync()) out.push(dirent);
+  } finally {
+    handle.closeSync();
+  }
+  return out;
+}
 
 /** {@link LinkStats} of an `lstat` with exact times; undefined for nothing there. */
 function linkStatsOf(stat: import("node:fs").BigIntStats | undefined): LinkStats | undefined {
@@ -802,26 +848,57 @@ function linkStatsOf(stat: import("node:fs").BigIntStats | undefined): LinkStats
       : stat.isFile()
         ? "file"
         : "other";
+  // one division and one remainder per time (BigInt arithmetic dominates a stat pass); the
+  // milliseconds as whole seconds * 1000 + nanoseconds / 1e6, as nsToMs computed them
   const mtimeNs = stat.mtimeNs;
   const ctimeNs = stat.ctimeNs;
+  const mSec = Number(mtimeNs / NS_PER_S);
+  const mNs = Number(mtimeNs % NS_PER_S);
+  const cSec = Number(ctimeNs / NS_PER_S);
+  const cNs = Number(ctimeNs % NS_PER_S);
+  const statSize = Number(stat.size);
   return {
     kind,
-    size: kind === "directory" ? 0 : Number(stat.size),
-    lastModified: nsToMs(mtimeNs),
-    ctime: nsToMs(ctimeNs),
-    mode: Number(stat.mode & 0o7777n),
-    mtimeNs: Number(mtimeNs % NS_PER_S),
-    ctimeNs: Number(ctimeNs % NS_PER_S),
-    dev: Number(stat.dev & LOW32),
-    ino: Number(stat.ino & LOW32),
-    uid: Number(stat.uid & LOW32),
-    gid: Number(stat.gid & LOW32),
+    size: kind === "directory" ? 0 : statSize,
+    lastModified: msOf(mSec, mNs),
+    ctime: msOf(cSec, cNs),
+    mode: Number(stat.mode) & 0o7777,
+    mtimeNs: mNs,
+    ctimeNs: cNs,
+    dev: low32(stat.dev),
+    ino: low32(stat.ino),
+    uid: low32(stat.uid),
+    gid: low32(stat.gid),
+    statSize,
   };
 }
 
-/** Milliseconds of a time in nanoseconds, its whole milliseconds exact (no float drift). */
-function nsToMs(ns: bigint): number {
-  return Number(ns / 1_000_000n) + Number(ns % 1_000_000n) / 1e6;
+/**
+ * The stat of a host file by its absolute path, symbolic links followed (git's `fstat` of
+ * an exclude file it opened); undefined when nothing is there. For the host environment
+ * (`core.excludesFile` in the untracked cache), not for worktree paths.
+ */
+export function statHostFile(path: string): LinkStats | undefined {
+  try {
+    return linkStatsOf(statSync(path, { bigint: true, throwIfNoEntry: false }));
+  } catch {
+    return undefined;
+  }
+}
+
+/** The low 32 bits of a stat field (exact below 2^53 without BigInt arithmetic). */
+function low32(value: bigint): number {
+  const n = Number(value);
+  return n <= Number.MAX_SAFE_INTEGER ? n >>> 0 : Number(BigInt.asUintN(32, value));
+}
+
+/**
+ * Milliseconds of a time given as whole seconds and nanoseconds: the whole milliseconds
+ * exact (`Number(ns / 1e6n) + Number(ns % 1e6n) / 1e6` of the full nanoseconds).
+ */
+function msOf(seconds: number, ns: number): number {
+  const wholeMs = seconds * 1000 + Math.trunc(ns / 1e6);
+  return wholeMs + (ns % 1e6) / 1e6;
 }
 
 /**

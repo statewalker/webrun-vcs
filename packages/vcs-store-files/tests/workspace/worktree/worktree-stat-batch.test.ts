@@ -16,9 +16,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const noStores = { blobs: {} as Blobs, trees: {} as Trees };
 
-/** An entry as plain data (an ignored flag worked out when asked included). */
+/**
+ * An entry as plain data (an ignored flag worked out when asked included; a stat pass
+ * entry has its name and ignored flag as getters, which a spread does not copy).
+ */
 const plain = (e: WorktreeEntry | undefined) =>
-  e === undefined ? undefined : JSON.parse(JSON.stringify({ ...e }));
+  e === undefined
+    ? undefined
+    : JSON.parse(JSON.stringify({ ...e, name: e.name, isIgnored: e.isIgnored }));
 
 describe("FileWorktree getEntries and walk skipFile", () => {
   let root: string;

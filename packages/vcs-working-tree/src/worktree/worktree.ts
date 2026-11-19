@@ -16,6 +16,7 @@
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
+import type { UntrackedScanHost } from "../status/untracked-scan.js";
 import type { WorkingCopy } from "../working-copy.js";
 import type { ContentAttributesContext, WorktreeContentFilter } from "./content-filter.js";
 import type { WorktreeEntry } from "./types.js";
@@ -261,6 +262,14 @@ export interface Worktree {
   // ========== Reading ==========
 
   walk(options?: WorktreeWalkOptions): AsyncIterable<WorktreeEntry>;
+  /**
+   * What `scanUntracked` (git's directory walk with the untracked cache) reads of this
+   * worktree, the repository's exclude files loaded: directories in readdir order, stats,
+   * `.gitignore` files with their bytes. Call it within a `batch` (the ignore rules it
+   * loads serve the rest of the batch). Optional: without it untracked files are found
+   * through `walk`, and no untracked cache is used.
+   */
+  untrackedScanHost?(): Promise<UntrackedScanHost>;
   getEntry(path: string): Promise<WorktreeEntry | undefined>;
   /**
    * {@link getEntry} of many paths at once, the answers in the order of `paths`: the stat

@@ -12,7 +12,9 @@
  *
  * | Extension | Kept when |
  * |-----------|-----------|
- * | `TREE` (cache-tree), `UNTR` (untracked cache), `FSMN` (fsmonitor) | the entries did not change; dropped otherwise, git rebuilds them |
+ * | `TREE` (cache-tree) | rewritten by `IndexFile`: each path whose entries changed invalidated |
+ * | `UNTR` (untracked cache) | rewritten by `IndexFile`: the directory of each path added or removed invalidated (`untracked_cache_invalidate_path`) |
+ * | `FSMN` (fsmonitor) | the entries did not change; dropped otherwise |
  * | `REUC` (resolve-undo) | always, every record (dropped only when it cannot be parsed) |
  * | `EOIE`, `IEOT` (offsets into the file) | never; git writes them again when configured to |
  * | any other uppercase signature | never: an optional extension we do not know is dropped |
@@ -46,7 +48,7 @@ export class UnsupportedIndexExtensionError extends Error {
 }
 
 /** Extensions derived from the entries, valid only while the entries stay the same. */
-const ENTRY_DERIVED = new Set(["TREE", "UNTR", "FSMN"]);
+const ENTRY_DERIVED = new Set(["TREE", "FSMN"]);
 
 /** Whether a signature names a required extension (first character not uppercase A-Z). */
 export function isRequiredIndexExtension(signature: string): boolean {
@@ -97,6 +99,9 @@ export function carryIndexExtensions(
   for (const ext of extensions) {
     if (ENTRY_DERIVED.has(ext.signature)) {
       if (!entriesChanged) out.push(ext);
+    } else if (ext.signature === "UNTR") {
+      // kept; the index file invalidates what the entry changes touch
+      out.push(ext);
     } else if (ext.signature === "REUC") {
       if (isValidResolveUndo(ext.data)) out.push(ext);
     }

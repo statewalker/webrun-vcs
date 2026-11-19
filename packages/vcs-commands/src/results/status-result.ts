@@ -236,9 +236,15 @@ export function formatStatusPorcelain(
   const fully = options.quotePath ?? true;
   const quotePath = (path: string) => quoteStatusPath(path, version === 1, fully);
   const entries = status.files;
+  // v2 prints the changed entries, then the unmerged ones (wt_porcelain_v2_print's two
+  // passes); v1 prints them in one list by path
   const tracked = entries
     .filter((e) => e.index !== "?" && e.index !== "!")
-    .sort((a, b) => comparePaths(a.path, b.path));
+    .sort(
+      (a, b) =>
+        (version === 2 ? (a.stages ? 1 : 0) - (b.stages ? 1 : 0) : 0) ||
+        comparePaths(a.path, b.path),
+    );
   const untracked = entries
     .filter((e) => e.index === "?")
     .sort((a, b) => comparePaths(a.path, b.path));

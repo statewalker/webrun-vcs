@@ -6,10 +6,30 @@
  * `@statewalker/vcs-utils-node`).
  */
 
+import type { LinkStats } from "@statewalker/vcs-utils/files";
+
 /** The user's environment, as a host provides it. */
 export interface GitHostEnvironment {
   /** Reads a file of the host by its path (as the paths below name it); undefined when absent */
   readFile(path: string): Promise<Uint8Array | undefined>;
+  /**
+   * The stat of a host file (links followed), for what git records of it: the untracked
+   * cache keeps the stat of `core.excludesFile`. Absent: recorded as zeros.
+   */
+  statFile?(path: string): Promise<LinkStats | undefined>;
+  /**
+   * The operating system's name as `uname` gives it (`Linux`, `Darwin`): git's untracked
+   * cache is valid only for the worktree location and system it names. Absent: no untracked
+   * cache is used.
+   */
+  systemName?: string;
+  /** `$GIT_DISABLE_UNTRACKED_CACHE` is true: the untracked cache is never used */
+  disableUntrackedCache?: boolean;
+  /**
+   * `$GIT_FORCE_UNTRACKED_CACHE`: true writes a changed untracked cache even without
+   * `core.untrackedCache=true`; false never writes one
+   */
+  forceUntrackedCache?: boolean;
   /** The user's home directory (`$HOME`): `~/.gitconfig`, `~/` in paths */
   home?: string;
   /** `$XDG_CONFIG_HOME` (default `<home>/.config`) */

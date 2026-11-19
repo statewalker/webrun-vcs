@@ -25,6 +25,12 @@ import { bytesToHex } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
 import {
+  encodeUntrackedCache,
+  invalidateUntrackedPath,
+  parseUntrackedCache,
+  type UntrackedCache,
+} from "../status/untracked-cache.js";
+import {
   type CacheTree,
   copyCacheTree,
   encodeCacheTree,
@@ -208,6 +214,13 @@ export class IndexFile {
   private dropCacheTree = false;
   /** The entries `pendingCacheTree` describes, when given: the write invalidates what changed since. */
   private pendingEntries: readonly StagingEntry[] | undefined;
+  /**
+   * The untracked cache for the next write (`setUntrackedCache`): a cache, `null` to write
+   * none, undefined to carry the one read (its touched directories invalidated).
+   */
+  private pendingUntracked: UntrackedCache | null | undefined;
+  /** The entries `pendingUntracked` describes: the write invalidates the paths added since. */
+  private pendingUntrackedEntries: readonly StagingEntry[] | undefined;
   /** Why the last read refused the index; writes refuse it too until a read succeeds. */
   private refused: Error | undefined;
   /**
@@ -253,6 +266,8 @@ export class IndexFile {
     this.pendingCacheTree = undefined;
     this.pendingEntries = undefined;
     this.dropCacheTree = false;
+    this.pendingUntracked = undefined;
+    this.pendingUntrackedEntries = undefined;
     const stats = await this.files.stats(this.path);
     if (!stats) {
       this.extensions = [];
@@ -371,6 +386,39 @@ export class IndexFile {
   }
 
   /**
+   * The untracked cache (`UNTR`) the next write of `entries` carries: the one set with
+   * `setUntrackedCache`, else the index's as last read or written, each directory holding a
+   * path added or removed since invalidated (git's `untracked_cache_invalidate_path` from
+   * `add_index_entry` and `remove_file_from_index`). Undefined when there is none or it does
+   * not parse. A fresh copy each time.
+   */
+  untrackedCache(entries: readonly StagingEntry[]): UntrackedCache | undefined {
+    if (this.pendingUntracked === null) return undefined;
+    if (this.pendingUntracked) {
+      const cache = parseUntrackedCache(encodeUntrackedCache(this.pendingUntracked));
+      if (cache && this.pendingUntrackedEntries) {
+        invalidateAddedOrRemoved(cache, this.pendingUntrackedEntries, entries);
+      }
+      return cache;
+    }
+    const ext = this.extensions.find((e) => e.signature === "UNTR");
+    if (!ext) return undefined;
+    const cache = parseUntrackedCache(ext.data);
+    if (cache && this.entriesKept) invalidateAddedOrRemoved(cache, this.entriesKept, entries);
+    return cache;
+  }
+
+  /**
+   * Write `cache` as the `UNTR` extension with the next `write` (git's `UNTRACKED_CHANGED`),
+   * or none with `null` (`remove_untracked_cache`). It describes `entries` when given: paths
+   * added or removed before the write invalidate their directories.
+   */
+  setUntrackedCache(cache: UntrackedCache | null, entries?: readonly StagingEntry[]): void {
+    this.pendingUntracked = cache;
+    this.pendingUntrackedEntries = cache && entries ? entries.slice() : undefined;
+  }
+
+  /**
    * Write `entries` (sorted by path, stage) with the extensions that still apply.
    *
    * @throws IndexChangedError when the index on disk is no longer the one this
@@ -474,7 +522,12 @@ export class IndexFile {
   private prepareWrite(entries: readonly StagingEntry[]): { extensions: IndexExtension[] } {
     // what indexEntriesDigest compares: path, stage, mode, object id, intent-to-add
     const changed = this.entriesKept === undefined || !sameIndexEntries(this.entriesKept, entries);
-    let extensions = carryIndexExtensions(this.extensions, entries, changed);
+    let extensions = withUntrackedCache(
+      carryIndexExtensions(this.extensions, entries, changed),
+      this.untrackedPayload(entries, changed),
+    );
+    this.pendingUntracked = undefined;
+    this.pendingUntrackedEntries = undefined;
     if (this.dropCacheTree) {
       this.dropCacheTree = false;
       this.pendingCacheTree = undefined;
@@ -496,6 +549,31 @@ export class IndexFile {
       ];
     }
     return { extensions };
+  }
+
+  /**
+   * The `UNTR` payload a write of `entries` carries: the one set, else the one read with the
+   * directories of added or removed paths invalidated (unchanged bytes when nothing was
+   * added or removed); null for none.
+   */
+  private untrackedPayload(entries: readonly StagingEntry[], changed: boolean): Uint8Array | null {
+    if (this.pendingUntracked === null) return null;
+    if (this.pendingUntracked) {
+      const cache = this.pendingUntracked;
+      if (this.pendingUntrackedEntries) {
+        invalidateAddedOrRemoved(cache, this.pendingUntrackedEntries, entries);
+      }
+      return encodeUntrackedCache(cache);
+    }
+    const ext = this.extensions.find((e) => e.signature === "UNTR");
+    if (!ext) return null;
+    if (!changed || !this.entriesKept) return ext.data;
+    if (!addsOrRemoves(this.entriesKept, entries)) return ext.data;
+    const cache = parseUntrackedCache(ext.data);
+    // one git could not read either is dropped
+    if (!cache) return null;
+    invalidateAddedOrRemoved(cache, this.entriesKept, entries);
+    return encodeUntrackedCache(cache);
   }
 
   /** After a write: what the index now holds. */
@@ -593,5 +671,82 @@ export function invalidateChangedPaths(
       i++;
       j++;
     }
+  }
+}
+
+/**
+ * `extensions` with `untracked` as their `UNTR` (none for null), where git writes it: after
+ * `TREE` and `REUC`, before the others.
+ */
+function withUntrackedCache(
+  extensions: IndexExtension[],
+  untracked: Uint8Array | null,
+): IndexExtension[] {
+  const others = extensions.filter((e) => e.signature !== "UNTR");
+  if (!untracked) return others;
+  let at = 0;
+  while (
+    at < others.length &&
+    ["TREE", "REUC"].includes((others[at] as IndexExtension).signature)
+  ) {
+    at++;
+  }
+  return [...others.slice(0, at), { signature: "UNTR", data: untracked }, ...others.slice(at)];
+}
+
+/** The (path, stage) keys of `a` and `b` (sorted lists) that only one of them has. */
+function* addedOrRemoved(
+  before: readonly StagingEntry[],
+  after: readonly StagingEntry[],
+): Generator<string> {
+  let i = 0;
+  let j = 0;
+  while (i < before.length || j < after.length) {
+    const x = before[i];
+    const y = after[j];
+    if (x !== undefined && x === y) {
+      i++;
+      j++;
+      continue;
+    }
+    const order =
+      x === undefined
+        ? 1
+        : y === undefined
+          ? -1
+          : compareGitPaths(x.path, y.path) || x.stage - y.stage;
+    if (order < 0) {
+      yield (x as StagingEntry).path;
+      i++;
+    } else if (order > 0) {
+      yield (y as StagingEntry).path;
+      j++;
+    } else {
+      i++;
+      j++;
+    }
+  }
+}
+
+/** Whether `after` adds or removes a (path, stage) of `before`. */
+function addsOrRemoves(before: readonly StagingEntry[], after: readonly StagingEntry[]): boolean {
+  return !addedOrRemoved(before, after).next().done;
+}
+
+/**
+ * Invalidate in `cache` the directory of every path added to or removed from the index
+ * between `before` and `after`, as git's index edits do (`add_index_entry` inserting a new
+ * name or stage, `remove_file_from_index`); an entry replaced in place leaves it alone.
+ */
+function invalidateAddedOrRemoved(
+  cache: UntrackedCache,
+  before: readonly StagingEntry[],
+  after: readonly StagingEntry[],
+): void {
+  let last: string | undefined;
+  for (const path of addedOrRemoved(before, after)) {
+    if (path === last) continue;
+    last = path;
+    invalidateUntrackedPath(cache, path);
   }
 }

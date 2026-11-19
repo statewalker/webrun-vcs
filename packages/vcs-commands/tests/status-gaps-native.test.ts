@@ -1215,3 +1215,90 @@ describeGit(
     });
   },
 );
+
+describeGit("status renames with unmerged paths against native git", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "status-unmerged-renames-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** A conflicted merge: `base`, then `ours` on main and `theirs` on a branch. */
+  const conflicted = (
+    name: string,
+    base: (d: string) => void,
+    ours: (d: string) => void,
+    theirs: (d: string) => void,
+  ) => {
+    const d = join(root, name);
+    mkdirSync(d, { recursive: true });
+    run(d, "init", "-q", "-b", "main");
+    base(d);
+    run(d, "add", "-A");
+    run(d, "commit", "-qm", "base");
+    run(d, "checkout", "-qb", "other");
+    theirs(d);
+    run(d, "add", "-A");
+    run(d, "commit", "-qm", "theirs");
+    run(d, "checkout", "-q", "main");
+    ours(d);
+    run(d, "add", "-A");
+    run(d, "commit", "-qm", "ours");
+    expect(() => exec(d, "merge", "-q", "other")).toThrow();
+    return d;
+  };
+
+  it("an unmerged file is a destination: a worktree deletion paired with it is left out", async () => {
+    // rename/delete: theirs renames and modifies a/b/two.txt, ours deletes it (DU at the new
+    // path); a/b/three.txt, like it, is deleted from the worktree
+    const d = conflicted(
+      "rename-delete",
+      (d) => {
+        put(d, "a/b/two.txt", lines(20, "t"));
+        put(d, "a/b/three.txt", `${lines(20, "t")}three\n`);
+      },
+      (d) => rmSync(join(d, "a/b/two.txt")),
+      (d) => {
+        mkdirSync(join(d, "aX/b"), { recursive: true });
+        renameSync(join(d, "a/b/two.txt"), join(d, "aX/b/two.txt.mv"));
+        put(d, "aX/b/two.txt.mv", `${lines(20, "t")}more\n`);
+      },
+    );
+    rmSync(join(d, "a/b/three.txt"));
+    expect(nativeStatus(d, 1)).toBe("DU aX/b/two.txt.mv\n");
+    const status = await expectStatusAs(d);
+    expect(status.files.map((f) => f.path)).toEqual(["aX/b/two.txt.mv"]);
+  });
+
+  it("modify/delete: the deleted file pairs with the unmerged one theirs left in the tree", async () => {
+    const d = conflicted(
+      "modify-delete",
+      (d) => {
+        put(d, "a/b/two.txt", lines(20, "t"));
+        put(d, "aX/b/two.txt.mv", `${lines(20, "t")}x\n`);
+      },
+      (d) => rmSync(join(d, "aX/b/two.txt.mv")),
+      (d) => put(d, "aX/b/two.txt.mv", `${lines(20, "t")}x\ny\n`),
+    );
+    rmSync(join(d, "a/b/two.txt"));
+    // a file unlike every deleted one stays a plain deletion
+    await expectStatusAs(d);
+    put(d, "aX/b/two.txt.mv", lines(30, "other"));
+    const status = await expectStatusAs(d);
+    expect(status.files.some((f) => f.path === "a/b/two.txt" && f.worktree === "D")).toBe(true);
+  });
+
+  it("stage #2 of an unmerged path gone from the worktree is a source for an intent-to-add file", async () => {
+    const d = conflicted(
+      "uu-ita",
+      (d) => put(d, "f.txt", lines(20, "f")),
+      (d) => put(d, "f.txt", lines(20, "f").replace("f line 5", "F LINE 5")),
+      (d) => put(d, "f.txt", lines(20, "f").replace("f line 5", "five")),
+    );
+    writeFileSync(join(d, "g.txt"), exec(d, "show", ":2:f.txt"));
+    run(d, "add", "-N", "g.txt");
+    rmSync(join(d, "f.txt"));
+    expect(nativeStatus(d, 1)).toBe("UU f.txt\n R f.txt -> g.txt\n");
+    const status = await expectStatusAs(d);
+    expect(status.renamed.get("g.txt")).toBe("f.txt");
+  });
+});
