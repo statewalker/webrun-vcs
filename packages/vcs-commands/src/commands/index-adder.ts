@@ -99,10 +99,10 @@ export async function gitlinkHeadState(
 /**
  * git's `chmod_index_entry` over the entries `matches` accepts (`git add --chmod`,
  * `git update-index --chmod`): a regular file's entry gets the executable bit (`+`) or
- * loses it (`-`), nothing else of it changes (its cache-tree path is invalidated when the
- * index is written); skip-worktree entries are left out. Returns git's error line for each
- * matching entry that is no regular file ("error: cannot chmod +x '<path>'"). With
- * `pretend` (`--dry-run`) nothing changes, the errors are the same.
+ * loses it (`-`), nothing else of it changes; its cache-tree path is invalidated, the mode
+ * changed or not (the index is then written); skip-worktree entries are left out. Returns
+ * git's error line for each matching entry that is no regular file ("error: cannot chmod
+ * +x '<path>'"). With `pretend` (`--dry-run`) nothing changes, the errors are the same.
  */
 export async function chmodIndexEntries(
   staging: Staging,
@@ -112,7 +112,7 @@ export async function chmodIndexEntries(
 ): Promise<string[]> {
   const errors: string[] = [];
   const editor = staging.createEditor();
-  let edited = false;
+  const touched: string[] = [];
   for await (const entry of staging.entries()) {
     if (entry.skipWorktree || !matches(entry)) continue;
     if ((entry.mode & 0o170000) !== 0o100000) {
@@ -121,14 +121,24 @@ export async function chmodIndexEntries(
     }
     if (options.pretend || entry.stage !== 0) continue;
     const mode = flip === "+" ? entry.mode | 0o111 : entry.mode & ~0o111;
+    // (an entry already of that mode counts too: git marks the index changed)
+    touched.push(entry.path);
     if (mode === entry.mode) continue;
-    edited = true;
     editor.add({
       path: entry.path,
       apply: (existing) => (existing ? { ...existing, mode } : existing),
     });
   }
-  if (edited) await editor.finish();
+  if (touched.length === 0) return errors;
+  await editor.finish();
+  // git's chmod_index_entry invalidates the entry's cache-tree path and marks the index
+  // changed (`cache_changed`) whether or not the mode moved (setting the tree, even none,
+  // marks the index as changed)
+  if (staging.setCacheTree) {
+    const tree = staging.getCacheTree?.();
+    if (tree) for (const path of touched) invalidateCacheTreePath(tree, path);
+    staging.setCacheTree(tree);
+  }
   return errors;
 }
 

@@ -27,7 +27,8 @@ export async function clearSkipWorktreeFromPresentFiles(
   const skipped: string[] = [];
   const list = staging.entryList?.();
   const consider = (entry: StagingEntry) => {
-    if (entry.skipWorktree && entry.stage === 0) skipped.push(entry.path);
+    // any stage: git clears every `ce_skip_worktree` entry found (a path once per stage)
+    if (entry.skipWorktree && skipped[skipped.length - 1] !== entry.path) skipped.push(entry.path);
   };
   if (list) for (const entry of list) consider(entry);
   else for await (const entry of staging.entries()) consider(entry);

@@ -701,11 +701,12 @@ export class AddCommand extends GitCommand<AddResult> {
     // add_files: an untracked file outside the sparse checkout is advised on, not added
     const sparseUntracked: string[] = [];
     for (const file of untracked) {
-      if (this.outsideSparse(file.path)) {
-        sparseUntracked.push(file.path);
+      // (a repository is the directory entry `sub/`, asked and advised on as such)
+      const displayPath = file.repository ? `${file.path}/` : file.path;
+      if (this.outsideSparse(displayPath)) {
+        sparseUntracked.push(displayPath);
         continue;
       }
-      const displayPath = file.repository ? `${file.path}/` : file.path;
       if ((await addOne(file.path, file.entry, displayPath)) === "failed") {
         if (!ignoreErrors) {
           throw new AddFailedError(

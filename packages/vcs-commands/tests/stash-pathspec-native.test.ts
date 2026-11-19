@@ -594,6 +594,25 @@ describeGit("stash push -- <pathspec>: git's reset fails after the stash is save
     });
   }
 
+  it("without -u: a path outside the sparse checkout, its flag cleared on read: add -u advises and fails", async () => {
+    const { ours, ourException, nativeError } = await twinStash(
+      "sparse-update",
+      (d) => {
+        run(d, "sparse-checkout", "set", "--cone", "zz");
+        put(d, "d/e.txt", "changed\n");
+      },
+      { paths: ["d/e.txt"] },
+    );
+    expect(nativeError).toContain(
+      `outside of your sparse-checkout definition, so will not be\nupdated in the index:\n${magic()}d/e.txt\n`,
+    );
+    expect(ourException).toBeInstanceOf(StashPathspecResetError);
+    expect((ourException as Error).message).toBe(nativeError);
+    // the stash is saved, git stops after the add: the worktree keeps the edit
+    expect(read(join(ours, "d/e.txt"))).toBe("changed\n");
+    expect(run(ours, "stash", "list")).toContain("stash@{0}");
+  });
+
   it("without -u: a staged edit undone in the worktree, add -u restores HEAD's blob", async () => {
     const { ourException, nativeError } = await twinStash(
       "no-patch-update",

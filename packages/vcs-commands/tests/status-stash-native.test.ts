@@ -724,14 +724,15 @@ const nestedRepo = (dir: string, p: string) => {
 async function twinStash(
   name: string,
   setup: (dir: string) => void,
-  opts: { u?: boolean; a?: boolean; k?: boolean } = {},
+  opts: { u?: boolean; a?: boolean; k?: boolean; verbose?: boolean } = {},
 ) {
   const n = join(root, `${name}-n`);
   const o = join(root, `${name}-o`);
   repo(n);
   setup(n);
   cpSync(n, o, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true });
-  const args = ["stash", "push", "-q"];
+  // (-q unless verbose: ours is quiet alike)
+  const args = opts.verbose ? ["stash", "push"] : ["stash", "push", "-q"];
   if (opts.a) args.push("-a");
   else if (opts.u) args.push("-u");
   if (opts.k) args.push("--keep-index");
@@ -751,6 +752,7 @@ async function twinStash(
       .setIncludeUntracked(!!opts.u || !!opts.a)
       .setIncludeIgnored(!!opts.a)
       .setKeepIndex(!!opts.k)
+      .setQuiet(!opts.verbose)
       .call();
   } catch (e) {
     ourError = (e as Error).message;
@@ -910,8 +912,8 @@ describeGit("stash push twins against native git (review cases)", () => {
       rmSync(join(d, "d"), { recursive: true });
       symlinkSync(outside, join(d, "d"));
     });
-    // native git ran with -q: our message also has git's last line
-    expect(ourError).toBe(`${nativeError}\nCannot save the current worktree state`);
+    // with -q git leaves out its last line ("Cannot save the current worktree state")
+    expect(ourError).toBe(nativeError);
     expect(listing(outside)).toEqual(["e.txt"]);
     expect(read(join(outside, "e.txt"))).toBe("outside e\n");
   });
@@ -1004,7 +1006,18 @@ describeGit("stash push twins against native git (review cases)", () => {
       put(d, "n.txt", "n\n");
       run(d, "add", "-N", "n.txt");
     });
-    expect(ita.ourError).toBe(`${ita.nativeError}\nCannot save the current worktree state`);
+    expect(ita.ourError).toBe(ita.nativeError);
+    // without -q git ends with "Cannot save the current worktree state", ours too
+    const itaVerbose = await twinStash(
+      "ita-verbose",
+      (d) => {
+        put(d, "n.txt", "n\n");
+        run(d, "add", "-N", "n.txt");
+      },
+      { verbose: true },
+    );
+    expect(itaVerbose.nativeError).toMatch(/\nCannot save the current worktree state$/);
+    expect(itaVerbose.ourError).toBe(itaVerbose.nativeError);
     await twinStash("only-untracked-noflag", (d) => put(d, "u.txt", "u\n"));
     await twinStash(
       "unmerged",

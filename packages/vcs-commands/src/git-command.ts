@@ -704,8 +704,9 @@ export abstract class GitCommand<T> {
 
   /**
    * The sparse checkout's patterns (`$GIT_DIR/info/sparse-checkout`, cone matching with
-   * `core.sparseCheckoutCone`) for git's `path_in_sparse_checkout`, or undefined when
-   * `core.sparseCheckout` is off (every path is in the checkout).
+   * `core.sparseCheckoutCone`, case folded with `core.ignoreCase`) for git's
+   * `path_in_sparse_checkout`, or undefined when `core.sparseCheckout` is off (every path
+   * is in the checkout).
    */
   protected async sparseCheckoutPatterns(): Promise<SparseCheckoutPatterns | undefined> {
     if (!this._workingCopy.config) return undefined;
@@ -716,7 +717,8 @@ export abstract class GitCommand<T> {
       ?.readStateFile?.("info/sparse-checkout")
       .catch(() => undefined);
     const content = bytes === undefined ? undefined : new TextDecoder().decode(bytes);
-    return parseSparseCheckoutPatterns(content, cone);
+    const ignoreCase = parseGitBool(config.value("core.ignoreCase")) === true;
+    return parseSparseCheckoutPatterns(content, cone, ignoreCase);
   }
 
   /**

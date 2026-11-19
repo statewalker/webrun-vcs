@@ -189,6 +189,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   private readonly pathspec: string[] = [];
   private staged = false;
   private compatibility: PathspecOriginStyle = "2.56";
+  private quiet = false;
 
   /**
    * Set the message used when committing index changes.
@@ -320,6 +321,17 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   }
 
   /**
+   * `git stash push -q`: git's closing "Cannot save the current worktree state" line is left
+   * out of the error when the worktree cannot be stashed (an intent-to-add entry, a path
+   * beyond a symbolic link), as git prints it only without `-q`.
+   */
+  setQuiet(quiet: boolean): this {
+    this.checkCallable();
+    this.quiet = quiet;
+    return this;
+  }
+
+  /**
    * Set the working tree provider for accessing uncommitted changes.
    *
    * @param provider The working tree provider
@@ -431,7 +443,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     const indexTree = await provider.getIndexTree();
     // --staged: the index is the stash's worktree state; nothing staged, nothing stashed
     if (this.staged && indexTree === headCommit.tree) throw new NoStagedChangesError();
-    const workingTree = this.staged ? indexTree : await provider.getWorkingTree();
+    const workingTree = this.staged ? indexTree : await this.worktreeState(provider);
     const untrackedTree =
       this.includeUntracked && provider.getUntrackedTree
         ? await provider.getUntrackedTree({ includeIgnored: this.includeIgnored })
@@ -529,6 +541,19 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     return stashCommit;
   }
 
+  /** The stash's worktree tree; under `-q` without git's "Cannot save ..." line on failure. */
+  private async worktreeState(provider: StashWorkingTreeProvider): Promise<ObjectId> {
+    try {
+      return await provider.getWorkingTree();
+    } catch (error) {
+      const line = "\nCannot save the current worktree state";
+      if (this.quiet && error instanceof Error && error.message.endsWith(line)) {
+        error.message = error.message.slice(0, -line.length);
+      }
+      throw error;
+    }
+  }
+
   /** The elements as git names them (`item->original` with prefix magic), the implicit "." too. */
   private pathspecOriginals(items: PathspecItem[]): string[] {
     const elements = items.length > this.pathspec.length ? [...this.pathspec, "."] : this.pathspec;
@@ -557,7 +582,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     const worktree = this.workingTreeProvider ? undefined : this.worktreeAccess;
     const inScope = (path: string, flags = 0) => matchPathspec(items, path, flags) > 0;
     const add = () => {
-      const command = new AddCommand(this.workingCopy);
+      const command = new AddCommand(this.workingCopy).setCompatibility(this.compatibility);
       for (const element of originals) command.addFilepattern(element);
       if (!this.includeUntracked) command.setUpdate(true);
       if (this.includeIgnored) command.setForce(true);
@@ -573,17 +598,17 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
       throw new StashPathspecResetError(stashCommit, errors);
     };
     if (worktree) {
-      // `git add -- <pathspec>` (with -u/-a) dies after the stash is saved
-      if (this.includeUntracked) {
-        try {
-          await add().setDryRun(true).call();
-        } catch (error) {
-          if (error instanceof AddFailedError && error.result) await failAfterAdd(error.message);
-          if (error instanceof AddFailedError || error instanceof InvalidArgumentError) {
-            throw new StashPathspecResetError(stashCommit, error.message);
-          }
-          throw error;
+      // `git add [-u] -- <pathspec>` fails after the stash is saved: it dies (an element
+      // matching no file, with -u/-a), or writes the index and exits 1 (ignored paths named,
+      // entries outside the sparse checkout); git stops there
+      try {
+        await add().setDryRun(true).call();
+      } catch (error) {
+        if (error instanceof AddFailedError && error.result) await failAfterAdd(error.message);
+        if (error instanceof AddFailedError || error instanceof InvalidArgumentError) {
+          throw new StashPathspecResetError(stashCommit, error.message);
         }
+        throw error;
       }
       // `git apply --index -R`: a path HEAD has that the index (after the add) does not is
       // created again, refused where the worktree has a file there (git's check_to_create)

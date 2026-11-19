@@ -161,7 +161,7 @@ export async function refreshIndexFile(
 }
 
 /**
- * `entries` with the skip-worktree flag of the stage-0 entries at `paths` cleared (git's
+ * `entries` with the skip-worktree flag of the entries at `paths` cleared, any stage (git's
  * `clear_skip_worktree_from_present_files`); undefined when none had it. `onCleared`
  * receives each entry replaced and its replacement.
  */
@@ -174,7 +174,7 @@ export function clearSkipWorktreeFlags(
   let out: StagingEntry[] | undefined;
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i] as StagingEntry;
-    if (!e.skipWorktree || e.stage !== 0 || !paths.has(e.path)) continue;
+    if (!e.skipWorktree || !paths.has(e.path)) continue;
     out ??= [...entries];
     const next = { ...e, skipWorktree: false };
     out[i] = next;

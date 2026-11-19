@@ -91,9 +91,8 @@ export class RmCommand extends GitCommand<RmResult> {
     }
 
     const removedPaths: string[] = [];
-
-    // Read current staging area
-    await this.staging.read();
+    // (the index as readCurrentIndex left it: reading it again would bring back the
+    // skip-worktree flags cleared for files present in a sparse checkout)
 
     // the kept entries go on as they are: flags (intent-to-add, skip-worktree,
     // assume-unchanged) and stat data included (git's remove_file_from_index)
