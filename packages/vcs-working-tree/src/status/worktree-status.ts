@@ -14,6 +14,7 @@ import type { StagingEntry } from "../staging/types.js";
 import type { WorktreeEntry } from "../worktree/types.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { modeFromWorktree, type WorktreeModeTrust } from "../worktree/worktree-mode.js";
+import type { UntrackedScanHost } from "./untracked-scan.js";
 
 const S_IFMT = 0o170000;
 
@@ -442,6 +443,79 @@ export async function* findUntrackedFiles(
   };
   yield* visit();
 }
+
+/**
+ * An {@link UntrackedScanHost} over a worktree that offers none of its own (one in memory):
+ * built from one walk of everything, ignored paths and directories included, so that
+ * `scanUntracked` can run dir.c's walk on it. The worktree's own ignore answers stand for
+ * the rules (a path inside an ignored directory is ignored); no `.gitignore` is read and no
+ * untracked cache can be used (no worktree location).
+ *
+ * ```typescript
+ * const host = worktree.untrackedScanHost
+ *   ? await worktree.untrackedScanHost()
+ *   : await walkUntrackedScanHost(worktree);
+ * ```
+ */
+export async function walkUntrackedScanHost(worktree: Worktree): Promise<UntrackedScanHost> {
+  const children = new Map<string, Array<{ name: string; kind: LinkKind }>>();
+  const entries = new Map<string, WorktreeEntry>();
+  const unreadable = new Map<string, unknown>();
+  const walked = new Set<string>();
+  const kindOf = (e: WorktreeEntry): LinkKind =>
+    e.isDirectory ? "directory" : e.mode === FileMode.SYMLINK ? "symlink" : "file";
+  const walkFrom = async (prefix: string) => {
+    walked.add(prefix);
+    if (!children.has(prefix)) children.set(prefix, []);
+    for await (const e of worktree.walk({
+      includeIgnored: true,
+      includeDirectories: true,
+      ...(prefix ? { pathPrefix: prefix } : {}),
+      onUnreadable: (path, error) => unreadable.set(path, error),
+    })) {
+      if (entries.has(e.path)) continue;
+      entries.set(e.path, e);
+      const slash = e.path.lastIndexOf("/");
+      const dir = slash < 0 ? "" : e.path.slice(0, slash);
+      let list = children.get(dir);
+      if (!list) {
+        list = [];
+        children.set(dir, list);
+      }
+      list.push({ name: e.name, kind: kindOf(e) });
+      // a nested repository is not entered by the walk: listed on demand
+      if (e.isDirectory && e.mode !== FileMode.GITLINK) {
+        walked.add(e.path);
+        if (!children.has(e.path)) children.set(e.path, []);
+      }
+    }
+  };
+  await walkFrom("");
+  const ignoredSelf = (path: string) => entries.get(path)?.isIgnored === true;
+  return {
+    listDirectory: async (path) => {
+      if (unreadable.has(path)) throw unreadable.get(path);
+      if (!walked.has(path)) await walkFrom(path);
+      return children.get(path) ?? [];
+    },
+    lstat: async (path) => {
+      if (path === "") return { kind: "directory", size: 0, lastModified: 0 };
+      const e = entries.get(path);
+      return e ? { kind: kindOf(e), size: e.size, lastModified: e.mtime } : undefined;
+    },
+    loadIgnoreFile: async () => ({ kind: "missing" }),
+    isExcluded: (path) => {
+      if (ignoredSelf(path)) return true;
+      for (let k = path.indexOf("/"); k > 0; k = path.indexOf("/", k + 1)) {
+        if (ignoredSelf(path.slice(0, k))) return true;
+      }
+      return false;
+    },
+    isNestedRepository: async (path) => entries.get(path)?.mode === FileMode.GITLINK,
+  };
+}
+
+type LinkKind = "file" | "directory" | "symlink" | "other";
 
 /** strerror(3) of the errno codes a directory listing fails with. */
 const STRERROR: Record<string, string> = {

@@ -216,8 +216,8 @@ export interface StatusPorcelainOptions {
 }
 
 /**
- * The status as `git status --porcelain` (v1) or `--porcelain=v2` prints it, with
- * `--untracked-files=all` (and the ignored files when the status has them): the changed
+ * The status as `git status --porcelain` (v1) or `--porcelain=v2` prints it, in the
+ * untracked and ignored modes the status was made with (`?? dir/`, `!! dir/`): the changed
  * tracked paths first, then the untracked, then the ignored ones, each in git's path order.
  * A rename is one line at its new path: `R  old -> new` (v1), `2 R. ... R<score> new<TAB>old`
  * (v2).

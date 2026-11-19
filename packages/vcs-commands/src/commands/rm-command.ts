@@ -632,9 +632,9 @@ async function badToRemoveSubmodule(
   const inner = await worktree.openGitlink?.(path).catch(() => undefined);
   if (!inner) return true;
   try {
+    // `git status --porcelain --ignore-submodules=none` there, in its own untracked mode
     const status = await new StatusCommand(inner)
       .setRenames(false)
-      .setUntracked(true)
       .setIgnoreSubmodules("none")
       .call();
     return status.files.some((f) => f.index !== "!");

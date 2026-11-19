@@ -4,7 +4,10 @@ import {
   type CacheTree,
   compareWithWorktree,
   compareWithWorktreeStat,
-  findUntrackedFiles,
+  DIR_HIDE_EMPTY_DIRECTORIES,
+  DIR_SHOW_IGNORED_TOO,
+  DIR_SHOW_IGNORED_TOO_MODE_MATCHING,
+  DIR_SHOW_OTHER_DIRECTORIES,
   getStageState,
   getWorktreeEntries,
   IndexPathLookup,
@@ -17,13 +20,14 @@ import {
   type StagingEntry,
   scanUntracked,
   statUpdateOf,
-  trackedUnder,
   unreadableDirectoryWarning,
   type WorkingCopy,
   type Worktree,
   type WorktreeModeTrust,
+  walkUntrackedScanHost,
 } from "@statewalker/vcs-working-tree";
 
+import { IncompatibleOptionsError, InvalidConfigError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import {
@@ -86,10 +90,74 @@ function renamesValue(value: string | undefined): boolean | undefined {
   return parseGitBool(value);
 }
 
-/** `status.showUntrackedFiles` says `no` (or a false boolean: `false`, an empty value). */
-function isShowUntrackedOff(value: string | undefined): boolean {
-  if (value === undefined) return false;
-  return value.toLowerCase() === "no" || parseGitBool(value) === false;
+/**
+ * Which untracked files status lists (`--untracked-files`, `status.showUntrackedFiles`):
+ * none, untracked directories as `dir/` (git's default), or every file.
+ */
+export type UntrackedFilesMode = "no" | "normal" | "all";
+
+/**
+ * Which ignored files status lists (`--ignored`): none (the default), every ignored path
+ * with an ignored directory as `dir/` (`traditional`, what `--ignored` alone means), or the
+ * paths an exclude pattern matches (`matching`).
+ */
+export type IgnoredMode = "no" | "traditional" | "matching";
+
+/**
+ * A value of `--untracked-files` or `status.showUntrackedFiles` as git 2.5x reads it
+ * (builtin/commit.c `parse_untracked_setting_name`): a boolean (`true`, `yes`, `on`, `1`, a
+ * variable without `=`; `false`, `off`, `0`, an empty value) is `normal` or `no`, else
+ * exactly `no`, `normal` or `all`. Undefined for anything else. git 2.43 took the three
+ * names alone.
+ *
+ * @example
+ * ```typescript
+ * parseUntrackedFilesMode("false"); // "no"
+ * parseUntrackedFilesMode("All"); // undefined (git: "Invalid untracked files mode 'All'")
+ * ```
+ */
+export function parseUntrackedFilesMode(value: string | undefined): UntrackedFilesMode | undefined {
+  const asBool = value === undefined ? true : parseGitBool(value);
+  if (asBool === false) return "no";
+  if (asBool === true) return "normal";
+  return value === "no" || value === "normal" || value === "all" ? value : undefined;
+}
+
+/**
+ * `status.showUntrackedFiles` as git's `git_status_config` reads it (`git status` and
+ * `git commit` alike): its last value, undefined when it is not set. Every value is checked
+ * in the configuration's order, and the first one git cannot read fails with git's message
+ * (`error: Invalid untracked files mode '<value>'`, then where it was read).
+ *
+ * @example
+ * ```typescript
+ * const mode = readShowUntrackedFiles(workingCopy) ?? "normal";
+ * ```
+ */
+export function readShowUntrackedFiles(workingCopy: WorkingCopy): UntrackedFilesMode | undefined {
+  const key = "status.showuntrackedfiles";
+  let configured: UntrackedFilesMode | undefined;
+  const values = RemoteConfigStore.from(workingCopy).valuesWithOrigin("status.showUntrackedFiles");
+  for (const { text, file, line } of values) {
+    const mode = parseUntrackedFilesMode(text);
+    if (mode === undefined) {
+      const where =
+        file !== undefined && line !== undefined
+          ? `fatal: bad config variable '${key}' in file '${file}' at line ${line}`
+          : `fatal: unable to parse '${key}' from command-line config`;
+      throw new InvalidConfigError(
+        "status.showUntrackedFiles",
+        `error: Invalid untracked files mode '${text}'\n${where}`,
+      );
+    }
+    configured = mode;
+  }
+  return configured;
+}
+
+/** A value of `--ignored` (builtin/commit.c `handle_ignored_arg`), else undefined. */
+export function parseIgnoredMode(value: string): IgnoredMode | undefined {
+  return value === "no" || value === "traditional" || value === "matching" ? value : undefined;
 }
 
 /** A git integer (`1000`, `2k`), or undefined when not one. */
@@ -136,13 +204,10 @@ export async function readSubmoduleDirt(
 ): Promise<SubmoduleDirt> {
   const inner: WorkingCopy | undefined = await worktree.openGitlink?.(path);
   if (!inner) return {};
-  const showUntracked =
-    !ignoreUntracked &&
-    !isShowUntrackedOff(RemoteConfigStore.from(inner).value("status.showUntrackedFiles"));
-  const status = await new StatusCommand(inner)
-    .setRenames(false)
-    .setUntracked(showUntracked)
-    .call();
+  // `git status --porcelain=2` there, with `-uno` when untracked content is ignored
+  const command = new StatusCommand(inner).setRenames(false);
+  if (ignoreUntracked) command.setUntrackedFiles("no");
+  const status = await command.call();
   const dirt: SubmoduleDirt = {};
   for (const f of status.files) {
     if (f.index === "!") continue;
@@ -166,11 +231,17 @@ export async function readSubmoduleDirt(
  * size and modification time still match is not read, unless its entry is racily clean
  * (modified at or after the index was written), which is re-hashed as git does. Links are
  * compared as links (mode 120000), the executable bit only where `core.filemode` trusts it,
- * and the ignore rules are read afresh for each status. Untracked files are listed one by
- * one (`--untracked-files=all`), through the index's untracked cache (`UNTR`) as git uses
- * it for that mode (`status.showUntrackedFiles=all`): directories whose stat and ignore
- * rules are unchanged are not read again, and the cache is written back as git writes it
- * (`core.untrackedCache`: true writes it, false removes it, unset keeps it).
+ * and the ignore rules are read afresh for each status.
+ *
+ * Untracked files are found by git's directory walk (dir.c `read_directory`) in the mode
+ * {@link setUntrackedFiles} or `status.showUntrackedFiles` asks: `normal` (the default) shows
+ * an untracked directory as `dir/` and hides one holding nothing untracked, `all` lists every
+ * file, `no` none. {@link setIgnored} adds the ignored paths (`traditional`: an ignored
+ * directory as `dir/`; `matching`: the paths an exclude pattern matches). A whole-tree scan
+ * without ignored files goes through the index's untracked cache (`UNTR`) as git uses it:
+ * directories whose stat and ignore rules are unchanged are not read again, and the cache is
+ * written back as git writes it (`core.untrackedCache`: true writes it, false removes it,
+ * unset keeps it), made for the mode `status.showUntrackedFiles` names.
  *
  * Renames are detected as git's default `status.renames=true` does: a path deleted from the
  * index paired with one added to it (`R  old -> new`), and a path deleted from the worktree
@@ -200,8 +271,10 @@ export async function readSubmoduleDirt(
  */
 export class StatusCommand extends GitCommand<Status> {
   private paths: string[] = [];
-  private showIgnored = false;
-  private showUntracked = true;
+  private ignoredMode: IgnoredMode = "no";
+  private untrackedMode?: UntrackedFilesMode;
+  /** The mode of the running status (the setter, else `status.showUntrackedFiles`) */
+  private resolvedUntracked: UntrackedFilesMode = "normal";
   private renames?: boolean;
   private renameLimit?: number;
   private ignoreSubmodules?: SubmoduleIgnoreMode;
@@ -221,23 +294,38 @@ export class StatusCommand extends GitCommand<Status> {
   }
 
   /**
-   * Whether to report the ignored files the index does not track (`--ignored`). Off by
-   * default.
+   * Which ignored files the index does not track to report (`--ignored[=<mode>]`): `no`
+   * (the default), `traditional` (`true`: what `--ignored` alone means) or `matching`. They
+   * are looked for with the untracked files, so `--untracked-files=no` shows none, and
+   * `matching` with it fails as git does ("Unsupported combination of ignored and
+   * untracked-files arguments").
    */
-  setIgnored(ignored: boolean): this {
+  setIgnored(ignored: boolean | IgnoredMode): this {
     this.checkCallable();
-    this.showIgnored = ignored;
+    this.ignoredMode = ignored === true ? "traditional" : ignored === false ? "no" : ignored;
     return this;
   }
 
   /**
-   * Whether to report untracked files (`--untracked-files=all`, the default, or `=no`).
-   * Without them, untracked files inside submodules are not looked for either.
+   * Which untracked files to report (`--untracked-files=<mode>`): `normal` shows an
+   * untracked directory as `dir/` (hiding one with nothing untracked in it), `all` every
+   * file in it, `no` none (untracked files inside submodules are not looked for either).
+   * Unset, `status.showUntrackedFiles` decides, else `normal` (git's default).
+   */
+  setUntrackedFiles(mode: UntrackedFilesMode): this {
+    this.checkCallable();
+    this.untrackedMode = mode;
+    return this;
+  }
+
+  /**
+   * Whether to report untracked files: true is `--untracked-files=all` (every file listed),
+   * false `--untracked-files=no`.
+   *
+   * @deprecated Use {@link setUntrackedFiles}.
    */
   setUntracked(untracked: boolean): this {
-    this.checkCallable();
-    this.showUntracked = untracked;
-    return this;
+    return this.setUntrackedFiles(untracked ? "all" : "no");
   }
 
   /**
@@ -276,6 +364,14 @@ export class StatusCommand extends GitCommand<Status> {
   async call(): Promise<Status> {
     this.checkCallable();
     this.setCallable(false);
+    // git reads its configuration, then the options, before anything else
+    this.resolvedUntracked = this.untrackedFilesMode();
+    if (this.ignoredMode === "matching" && this.resolvedUntracked === "no") {
+      throw new IncompatibleOptionsError(
+        ["--ignored=matching", "--untracked-files=no"],
+        "Unsupported combination of ignored and untracked-files arguments",
+      );
+    }
     const worktree = this.worktreeAccess;
     // one operation: fresh ignore rules and one lstat cache for the whole status
     return worktree?.batch ? worktree.batch(() => this.compute(worktree)) : this.compute(worktree);
@@ -283,6 +379,16 @@ export class StatusCommand extends GitCommand<Status> {
 
   private get config(): RemoteConfigStore {
     return RemoteConfigStore.from(this.workingCopy);
+  }
+
+  /**
+   * The untracked mode: the setter, else `status.showUntrackedFiles`, else `normal`. A bad
+   * value of the variable fails whatever the setter says, as git reads its configuration
+   * first.
+   */
+  private untrackedFilesMode(): UntrackedFilesMode {
+    const configured = readShowUntrackedFiles(this.workingCopy);
+    return this.untrackedMode ?? configured ?? "normal";
   }
 
   private async compute(worktree: Worktree | undefined): Promise<Status> {
@@ -507,49 +613,45 @@ export class StatusCommand extends GitCommand<Status> {
       hostEnvironmentOf(this.workingCopy),
       host,
     );
-    if (worktree && this.showUntracked) {
-      const onUnreadable = (path: string, error: unknown) =>
-        warnings.push(unreadableDirectoryWarning(path, error));
-      if (host && !this.showIgnored) {
-        // git's read_directory: through the untracked cache for a whole-tree scan
-        const cache = matchAll ? await untrackedCache.forScan() : undefined;
-        const ignoreFiles = this.indexIgnoreOids(all, upToDate);
-        const result = await scanUntracked(host, {
-          isTracked: (p) => tracked.has(p),
-          trackedIn: (dir) => index.trackedIn(dir),
-          indexDirectory: (dir) =>
-            gitlinks.has(dir) ? "gitlink" : index.hasEntriesBelow(dir) ? "directory" : undefined,
-          indexIgnoreOid: (p) => ignoreFiles.upToDate.get(p),
-          skipWorktreeIgnoreOid: (p) => ignoreFiles.skipWorktree.get(p),
-          ...(cache ? { cache } : {}),
-          indexSeconds: Math.floor(indexTime / 1000),
-          ...(trust ? { stat: { ctime: trust.ctime, fullStat: trust.fullStat } } : {}),
-          // git's "could not open directory" for each directory its scan cannot list
-          onUnreadable: (path, error) => {
-            if (matchAll || this.matchesPath(path)) onUnreadable(path, error);
-          },
-        });
-        for (const path of result.paths) {
-          if (!matchAll && !this.matchesPath(path)) continue;
-          untracked.add(path);
-          files.push({ path, index: "?", worktree: "?" });
-        }
-      } else {
-        for await (const file of findUntrackedFiles(worktree, (p) => tracked.has(p), {
-          hasTrackedUnder: trackedUnder(index.all),
-          isGitlink: (p) => gitlinks.has(p),
-          includeIgnored: this.showIgnored,
-          filter: (p) => this.matchesPath(p),
-          onUnreadable,
-        })) {
-          if (file.ignored) {
-            ignored.add(file.path);
-            files.push({ path: file.path, index: "!", worktree: "!" });
-          } else {
-            untracked.add(file.path);
-            files.push({ path: file.path, index: "?", worktree: "?" });
-          }
-        }
+    if (worktree && this.resolvedUntracked !== "no") {
+      // git's wt_status_collect_untracked: the dir flags of the modes
+      let flags =
+        this.resolvedUntracked === "all"
+          ? 0
+          : DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES;
+      if (this.ignoredMode !== "no") {
+        flags |= DIR_SHOW_IGNORED_TOO;
+        if (this.ignoredMode === "matching") flags |= DIR_SHOW_IGNORED_TOO_MODE_MATCHING;
+      }
+      // read_directory, through the untracked cache for a whole-tree scan without ignored
+      // files (validate_untracked_cache)
+      const cache =
+        host && matchAll && this.ignoredMode === "no"
+          ? await untrackedCache.forScan(flags)
+          : undefined;
+      const ignoreFiles = this.indexIgnoreOids(all, upToDate);
+      const result = await scanUntracked(host ?? (await walkUntrackedScanHost(worktree)), {
+        isTracked: (p) => tracked.has(p),
+        trackedIn: (dir) => index.trackedIn(dir),
+        indexDirectory: (dir) =>
+          gitlinks.has(dir) ? "gitlink" : index.hasEntriesBelow(dir) ? "directory" : undefined,
+        indexIgnoreOid: (p) => ignoreFiles.upToDate.get(p),
+        skipWorktreeIgnoreOid: (p) => ignoreFiles.skipWorktree.get(p),
+        flags,
+        ...(matchAll ? {} : { pathspec: this.paths }),
+        ...(cache ? { cache } : {}),
+        indexSeconds: Math.floor(indexTime / 1000),
+        ...(trust ? { stat: { ctime: trust.ctime, fullStat: trust.fullStat } } : {}),
+        // git's "could not open directory" for each directory its scan cannot list
+        onUnreadable: (path, error) => warnings.push(unreadableDirectoryWarning(path, error)),
+      });
+      for (const path of result.paths) {
+        untracked.add(path);
+        files.push({ path, index: "?", worktree: "?" });
+      }
+      for (const path of result.ignored) {
+        ignored.add(path);
+        files.push({ path, index: "!", worktree: "!" });
       }
     }
 
@@ -821,7 +923,7 @@ export class StatusCommand extends GitCommand<Status> {
     if (own) return submoduleIgnoreFlags(own);
     const configured = this.config.value("diff.ignoreSubmodules")?.trim();
     const flags = submoduleIgnoreFlags(isSubmoduleIgnoreMode(configured) ? configured : "none");
-    if (!this.showUntracked) flags.untracked = true;
+    if (this.resolvedUntracked === "no") flags.untracked = true;
     return flags;
   }
 

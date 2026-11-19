@@ -104,21 +104,39 @@ describeGit("unreadable directories: git's warnings", () => {
   it("status: one warning per directory the untracked scan opens", async () => {
     const d = layout();
     const git = await open(d);
-    // ours reports untracked files as --untracked-files=all
-    const all = await git.status().call();
+    // --untracked-files=all
+    const all = await git.status().setUntrackedFiles("all").call();
     expect(formatStatusPorcelain(all)).toBe("?? u/f\n");
     expect([...all.warnings].sort()).toEqual([warn("t/v"), warn("u/x"), warn("u2")]);
-    const ignored = await (await open(d)).status().setIgnored(true).call();
+    const ignored = await (await open(d)).status().setUntrackedFiles("all").setIgnored(true).call();
     expect([...ignored.warnings].sort()).toEqual([
       warn("ign/w"),
       warn("t/v"),
       warn("u/x"),
       warn("u2"),
     ]);
-    const some = await (await open(d)).status().addPath("t").call();
+    const some = await (await open(d)).status().setUntrackedFiles("all").addPath("t").call();
     expect(some.warnings).toEqual([warn("t/v")]);
     const none = await (await open(d)).status().setUntracked(false).call();
     expect(none.warnings).toEqual([]);
+  });
+
+  it("status in normal mode: the directories its check-only walks open", async () => {
+    const d = layout();
+    // native git as an unprivileged user prints "?? u/" with u2/ and t/v/ (and u/x/ when
+    // readdir lists it before u/f: the check-only walk of u/ stops at its first file)
+    const normal = await (await open(d)).status().call();
+    expect(formatStatusPorcelain(normal)).toBe("?? u/\n");
+    expect(normal.warnings).toEqual(expect.arrayContaining([warn("t/v"), warn("u2")]));
+    expect(normal.warnings).not.toContain(warn("ign/w"));
+    // --ignored=matching: ign/ matches its pattern and is not entered
+    const matching = await (await open(d)).status().setIgnored("matching").call();
+    expect(formatStatusPorcelain(matching)).toBe("?? u/\n!! ign/\n");
+    expect(matching.warnings).not.toContain(warn("ign/w"));
+    // traditional: ign/ is walked to find whether it holds anything
+    const traditional = await (await open(d)).status().setIgnored("traditional").call();
+    expect(formatStatusPorcelain(traditional)).toBe("?? u/\n");
+    expect(traditional.warnings).toContain(warn("ign/w"));
   });
 
   it("add: the scan's warnings, the ignored directories only with -f", async () => {

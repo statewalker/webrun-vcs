@@ -136,15 +136,23 @@ function repo(dir: string): void {
   run(dir, "commit", "-q", "-m", "c1");
 }
 
-/** Our status, as porcelain v1 and v2, equals native git's. */
+/** Our status, as porcelain v1 and v2 with `-uall` and v1 in the default mode, equals native git's. */
 async function expectStatusAsNative(dir: string, ignored = false) {
   const extra = ignored ? ["--ignored"] : [];
   const { ours } = await open(dir);
-  const status = await ours.status().setIgnored(ignored).call();
+  const status = await ours.status().setUntrackedFiles("all").setIgnored(ignored).call();
   expect(formatStatusPorcelain(status, 1)).toBe(nativeStatus(dir, 1, ...extra));
   const { ours: again } = await open(dir);
-  const v2 = formatStatusPorcelain(await again.status().setIgnored(ignored).call(), 2);
+  const v2 = formatStatusPorcelain(
+    await again.status().setUntrackedFiles("all").setIgnored(ignored).call(),
+    2,
+  );
   expect(v2).toBe(nativeStatus(dir, 2, ...extra));
+  // and in git's default untracked mode (normal)
+  const { ours: normal } = await open(dir);
+  expect(formatStatusPorcelain(await normal.status().setIgnored(ignored).call(), 1)).toBe(
+    exec(dir, "status", "--porcelain=v1", ...extra),
+  );
   return status;
 }
 

@@ -293,7 +293,7 @@ async function one(root: string, seed: number) {
   }
   // ours
   const { g, worktree } = await open(repo, !!L.excludesFile);
-  const status = await g.status().setIgnored(true).call();
+  const status = await g.status().setUntrackedFiles("all").setIgnored(true).call();
   const ourStatus = new Map<string, string>();
   for (const f of status.files) ourStatus.set(f.path, `${f.index}${f.worktree}`);
   const ourWalk = new Map<string, boolean>();
