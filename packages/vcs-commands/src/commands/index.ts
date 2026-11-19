@@ -38,6 +38,7 @@ export {
   mergeDriversOf,
 } from "./merge-drivers.js";
 export { CleanupMode, stripspace } from "./message-cleanup.js";
+export * from "./mv-command.js";
 export * from "./notes-command.js";
 export * from "./notes-commands.js";
 export * from "./notes-merge-command.js";
@@ -54,6 +55,7 @@ export * from "./pack-refs-command.js";
 export * from "./pretty-format.js";
 export * from "./pull-command.js";
 export * from "./push-command.js";
+export * from "./read-tree-command.js";
 export * from "./rebase-command.js";
 export * from "./ref-decoration-filter.js";
 export * from "./reflog-command.js";

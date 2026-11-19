@@ -399,3 +399,100 @@ export async function verifyCacheTree(
   await check(tree, "");
   return problems;
 }
+
+/**
+ * git's `cache_tree_update(WRITE_TREE_SILENT | WRITE_TREE_REPAIR)` from nothing (unpack-trees
+ * after `read-tree` freed the cache-tree): each directory of the index valid with the tree
+ * its entries make where that tree is already stored (nothing is written), invalid where it
+ * is not or where it holds an intent-to-add entry. `entries` are the index's, in its order.
+ * Undefined when the index has unmerged entries (`verify_cache` fails: no cache-tree).
+ *
+ * As git's `update_one`, a directory whose tree is not stored stops its parent at once
+ * (the parent finds no object for it and returns -1), and that failure climbs to the root:
+ * every directory on the way stays invalid and the ones after it there are never created,
+ * so the `TREE` written matches git's byte for byte.
+ *
+ * ```typescript
+ * staging.setCacheTree?.(await repairCacheTree(trees, staging.entryList?.() ?? []));
+ * ```
+ */
+export async function repairCacheTree(
+  trees: Pick<Trees, "has">,
+  entries: readonly {
+    path: string;
+    mode: number;
+    objectId: ObjectId;
+    stage: number;
+    intentToAdd?: boolean;
+  }[],
+): Promise<CacheTree | undefined> {
+  if (entries.some((e) => e.stage !== 0)) return undefined;
+  /** The tree id a node computed, kept even while the node is invalid (git's `it->oid`). */
+  const oids = new Map<CacheTree, ObjectId>();
+  const emptyTree = await canonicalTreeId([]);
+  /** `update_one` of the entries from `start` under `base`: how many it covers, or -1. */
+  const update = async (node: CacheTree, start: number, base: string): Promise<number> => {
+    const children = new Map<string, { tree: CacheTree; count: number }>();
+    const inBase = (i: number) => {
+      const e = entries[i];
+      return e !== undefined && e.path.length > base.length && e.path.startsWith(base);
+    };
+    let i = start;
+    while (inBase(i)) {
+      const path = (entries[i] as { path: string }).path;
+      const slash = path.indexOf("/", base.length);
+      if (slash < 0) {
+        i++;
+        continue;
+      }
+      const name = path.slice(base.length, slash);
+      const tree: CacheTree = { entryCount: -1, subtrees: [] };
+      node.subtrees.push({ name, tree });
+      node.subtrees.sort((a, b) => compareSubtreeNames(a.name, b.name));
+      const count = await update(tree, i, path.slice(0, slash + 1));
+      if (count < 0) return -1;
+      children.set(name, { tree, count });
+      i += count;
+    }
+    const items: TreeEntry[] = [];
+    let toInvalidate = false;
+    i = start;
+    while (inBase(i)) {
+      const e = entries[i] as (typeof entries)[number];
+      const slash = e.path.indexOf("/", base.length);
+      if (slash >= 0) {
+        const name = e.path.slice(base.length, slash);
+        const sub = children.get(name) as { tree: CacheTree; count: number };
+        i += sub.count;
+        const oid = oids.get(sub.tree);
+        const containsIta = sub.tree.entryCount < 0;
+        if (containsIta) toInvalidate = true;
+        // a subtree with no object: the expected miss of an invalid one fails this level
+        if (!oid || !(oid === emptyTree || (await trees.has(oid)))) return -1;
+        if (containsIta && oid === emptyTree) continue;
+        items.push({ name, mode: FileMode.TREE, id: oid });
+      } else {
+        i++;
+        if (e.intentToAdd) {
+          toInvalidate = true;
+          continue;
+        }
+        items.push({ name: e.path.slice(base.length), mode: e.mode, id: e.objectId });
+      }
+    }
+    const id = await canonicalTreeId(items);
+    if (id === emptyTree || (await trees.has(id))) oids.set(node, id);
+    else toInvalidate = true;
+    if (toInvalidate) {
+      node.entryCount = -1;
+      node.id = undefined;
+    } else {
+      node.entryCount = i - start;
+      node.id = id;
+    }
+    return i - start;
+  };
+  const root: CacheTree = { entryCount: -1, subtrees: [] };
+  await update(root, 0, "");
+  return root;
+}

@@ -37,10 +37,12 @@ import {
   LogCommand,
   LsRemoteCommand,
   MergeCommand,
+  MvCommand,
   NotesCommands,
   PackRefsCommand,
   PullCommand,
   PushCommand,
+  ReadTreeCommand,
   RebaseCommand,
   ReflogCommand,
   RemoteAddCommand,
@@ -529,6 +531,34 @@ export class Git implements Disposable {
   revert(): RevertCommand {
     this.checkClosed();
     return new RevertCommand(this._workingCopy);
+  }
+
+  // ============ Mv Operations ============
+
+  /**
+   * Create an MvCommand for moving or renaming files, directories and submodules.
+   *
+   * @example
+   * ```typescript
+   * await git.mv().addSource("old.txt").setDestination("new.txt").call();
+   * ```
+   */
+  mv(): MvCommand {
+    this.checkClosed();
+    return new MvCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a ReadTreeCommand for reading trees into the index (`git read-tree`).
+   *
+   * @example
+   * ```typescript
+   * await git.readTree().addTree("HEAD").setMerge(true).setUpdate(true).call();
+   * ```
+   */
+  readTree(): ReadTreeCommand {
+    this.checkClosed();
+    return new ReadTreeCommand(this._workingCopy);
   }
 
   // ============ Rm Operations ============

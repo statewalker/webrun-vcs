@@ -93,9 +93,15 @@ export async function openOurs(
   environment?: GitHostEnvironment,
   /** Wraps the worktree's FilesApi (a Proxy simulating a failing operation) */
   wrapWorktreeFiles?: (files: ReturnType<typeof createNodeFilesApi>) => typeof files,
+  /**
+   * The worktree's directory within `dir` (default `dir` itself): the FilesApi is rooted at
+   * `dir`, so it reaches what lies beside the repository too
+   */
+  worktreePath = "",
 ): Promise<Git> {
   const files = createNodeFilesApi({ rootDir: dir });
-  const { history } = await createGitFilesBackend({ files });
+  const gitDir = worktreePath ? `${worktreePath}/.git` : ".git";
+  const { history } = await createGitFilesBackend({ files, gitDir });
   const io = {
     read: async (path: string) => {
       try {
@@ -106,9 +112,13 @@ export async function openOurs(
     },
     write: async (path: string, content: Uint8Array) => writeFileSync(join(dir, path), content),
   };
-  const config = new GitWorkingCopyConfig(io, ".git/config", environment ? { environment } : {});
+  const config = new GitWorkingCopyConfig(
+    io,
+    `${gitDir}/config`,
+    environment ? { environment } : {},
+  );
   await config.load();
-  const staging = new FileStagingStore(files, ".git/index");
+  const staging = new FileStagingStore(files, `${gitDir}/index`);
   await staging.read();
   const checkoutFiles = {
     read: io.read,
@@ -133,12 +143,12 @@ export async function openOurs(
     staging,
     refs: history.refs,
     files: checkoutFiles,
-    gitDir: ".git",
+    gitDir,
   });
   const worktree = createFileWorktree({
     files: wrapWorktreeFiles ? wrapWorktreeFiles(files) : files,
-    rootPath: "",
-    gitDir: ".git",
+    rootPath: worktreePath,
+    gitDir,
     blobs: history.blobs,
     trees: history.trees,
   });

@@ -74,6 +74,37 @@ export class RmFailedError<R = unknown> extends GitApiError {
 }
 
 /**
+ * Thrown by `mv` when git dies (`fatal:` lines, a check failing before anything moved, or a
+ * rename failing partway) or exits with status 1 after its sparse-checkout advice: the
+ * message is git's stderr, `result` what was done before (when anything was).
+ */
+export class MvFailedError<R = unknown> extends GitApiError {
+  constructor(
+    message: string,
+    /** What was moved and printed before the failure */
+    readonly result?: R,
+  ) {
+    super(message);
+    this.name = "MvFailedError";
+  }
+}
+
+/**
+ * Thrown by `read-tree` when git refuses (`error:`/`fatal:` lines, exit status 128): an
+ * option combination it dies on, or unpack-trees refusing an entry before anything changed.
+ */
+export class ReadTreeFailedError extends GitApiError {
+  constructor(
+    message: string,
+    /** The paths unpack-trees refused */
+    readonly paths: readonly string[] = [],
+  ) {
+    super(message);
+    this.name = "ReadTreeFailedError";
+  }
+}
+
+/**
  * Thrown when a feature is not yet implemented.
  */
 export class NotImplementedError extends GitApiError {

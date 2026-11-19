@@ -204,6 +204,8 @@ export class IndexFile {
   private entriesKept: readonly StagingEntry[] | undefined;
   /** A cache-tree computed for the entries of the next write (see `setCacheTree`). */
   private pendingCacheTree: CacheTree | undefined;
+  /** `setCacheTree(undefined)`: the next write carries no cache-tree at all. */
+  private dropCacheTree = false;
   /** The entries `pendingCacheTree` describes, when given: the write invalidates what changed since. */
   private pendingEntries: readonly StagingEntry[] | undefined;
   /** Why the last read refused the index; writes refuse it too until a read succeeds. */
@@ -250,6 +252,7 @@ export class IndexFile {
     // a cache-tree set for a write of the entries before goes with them
     this.pendingCacheTree = undefined;
     this.pendingEntries = undefined;
+    this.dropCacheTree = false;
     const stats = await this.files.stats(this.path);
     if (!stats) {
       this.extensions = [];
@@ -329,9 +332,12 @@ export class IndexFile {
    * `entries` (the index when it is set); the write invalidates each path whose entries
    * changed since, as git's index edits invalidate it. Without `entries` it must describe
    * the entries that write is given; a valid root whose count disagrees with them is dropped.
+   * Undefined drops the cache-tree: the next write carries none (git's `cache_tree_free`
+   * with no `cache_tree_update` after it, as `read-tree` leaves an index with conflicts).
    */
   setCacheTree(tree: CacheTree | undefined, entries?: readonly StagingEntry[]): void {
     this.pendingCacheTree = tree;
+    this.dropCacheTree = tree === undefined;
     // a copy: the caller's list may be edited in place
     this.pendingEntries = tree && entries ? entries.slice() : undefined;
   }
@@ -343,6 +349,7 @@ export class IndexFile {
    * each time.
    */
   cacheTree(entries: readonly StagingEntry[]): CacheTree | undefined {
+    if (this.dropCacheTree) return undefined;
     if (this.pendingCacheTree) {
       // one set for the next write: what it will write (paths changed since invalid)
       const tree = copyCacheTree(this.pendingCacheTree);
@@ -468,6 +475,12 @@ export class IndexFile {
     // what indexEntriesDigest compares: path, stage, mode, object id, intent-to-add
     const changed = this.entriesKept === undefined || !sameIndexEntries(this.entriesKept, entries);
     let extensions = carryIndexExtensions(this.extensions, entries, changed);
+    if (this.dropCacheTree) {
+      this.dropCacheTree = false;
+      this.pendingCacheTree = undefined;
+      this.pendingEntries = undefined;
+      return { extensions: extensions.filter((e) => e.signature !== "TREE") };
+    }
     // without a cache-tree computed for these entries, the one read or last written goes on
     // with each changed path invalid (git keeps the nodes no edit touched valid)
     let tree = this.pendingCacheTree;

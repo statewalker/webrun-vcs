@@ -14,7 +14,7 @@ import {
   type TreeEntry,
 } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
-import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { compareGitPaths, decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
   type CacheTree,
@@ -726,7 +726,12 @@ export async function switchTrees(
   // whatever they say where its entry was outside the checkout, as
   // record_conflicted_index_entries does; one leaving the checkout is unlinked)
   const conflicts = [...(options.conflicts ?? [])];
-  const sparse = await SparseUnpack.start(ctx);
+  // without update nothing in the worktree is touched (unpack-trees skips the sparse
+  // checkout: `skip_sparse_checkout` when `!o->update`)
+  const sparse =
+    options.update === false || options.skipSparseCheckout
+      ? undefined
+      : await SparseUnpack.start(ctx);
   sparse?.conflict(conflicts.map((c) => c.stagePath));
   const switched = await switchTreesWith(ctx, head, target, { ...options, conflicts }, sparse);
   if (switched.refused) return switched.refused;
@@ -751,6 +756,38 @@ export interface SwitchTreesOptions {
    * cache-tree, as unpack-trees does
    */
   targetTree?: ObjectId;
+  /**
+   * Whether the worktree is updated (default true: `-u`). False (`read-tree -m H M`
+   * without `-u`): the entries are still checked against their files (`verify_uptodate`),
+   * but nothing is written or removed and untracked files are not looked for.
+   */
+  update?: boolean;
+  /** `--no-sparse-checkout`: the sparse-checkout patterns are not applied */
+  skipSparseCheckout?: boolean;
+  /**
+   * unpack-trees without porcelain messages (`read-tree`): the refusal is the first path's
+   * one `error:` line ("Entry 'x' would be overwritten by merge. Cannot merge.", ...)
+   */
+  plainErrors?: boolean;
+}
+
+/** git's default unpack-trees messages (`unpack_plumbing_errors`) for one refused path. */
+export function plainUnpackError(
+  kind: "wouldOverwrite" | "notUptodate" | "lostDir" | "untracked" | "untrackedRemoved",
+  path: string,
+): string {
+  switch (kind) {
+    case "wouldOverwrite":
+      return `error: Entry '${path}' would be overwritten by merge. Cannot merge.`;
+    case "notUptodate":
+      return `error: Entry '${path}' not uptodate. Cannot merge.`;
+    case "lostDir":
+      return `error: Updating '${path}' would lose untracked files in it`;
+    case "untracked":
+      return `error: Untracked working tree file '${path}' would be overwritten by merge.`;
+    case "untrackedRemoved":
+      return `error: Untracked working tree file '${path}' would be removed by merge.`;
+  }
 }
 
 async function switchTreesWith(
@@ -763,8 +800,10 @@ async function switchTreesWith(
   const { index, unmerged } = await readIndex(ctx.staging);
   // a path staying outside the sparse checkout: neither checked nor touched in the worktree
   const quiet = (path: string) => sparse?.leavesAlone(path) === true;
-  const worktree = ctx.worktree;
-  const trust = worktree ? worktreeModeTrust(ctx.workingCopy, worktree) : undefined;
+  const update = options.update !== false;
+  const checked = ctx.worktree;
+  const worktree = update ? checked : undefined;
+  const trust = checked ? worktreeModeTrust(ctx.workingCopy, checked) : undefined;
   const indexTime = ctx.staging.getUpdateTime();
   const ignoreCase = coreBool(ctx.workingCopy, "ignorecase", false);
   const staged: string[] = [];
@@ -785,11 +824,7 @@ async function switchTreesWith(
         staged.push(path);
         continue;
       }
-      if (
-        worktree &&
-        !quiet(path) &&
-        (await entryNotUptodate(worktree, path, i, trust, indexTime))
-      ) {
+      if (checked && !quiet(path) && (await entryNotUptodate(checked, path, i, trust, indexTime))) {
         local.push(path);
         continue;
       }
@@ -818,13 +853,21 @@ async function switchTreesWith(
         ...(await restoreCaseOptions(worktree, ignoreCase)),
       })
     : { untracked: [], lostDirs: [] };
-  const message = overwriteMessage(options.action, {
-    staged,
-    local,
-    lostDirs: found.lostDirs,
-    untracked: found.untracked,
-    untrackedRemoved,
-  });
+  const message = options.plainErrors
+    ? firstPlainError({
+        wouldOverwrite: staged,
+        notUptodate: local,
+        lostDir: found.lostDirs,
+        untracked: found.untracked,
+        untrackedRemoved,
+      })
+    : overwriteMessage(options.action, {
+        staged,
+        local,
+        lostDirs: found.lostDirs,
+        untracked: found.untracked,
+        untrackedRemoved,
+      });
   if (message) {
     return {
       refused: {
@@ -1002,6 +1045,25 @@ async function switchTreesWith(
   // set once the changes are in: it describes the index they leave
   await rewriteIndex(ctx.staging, changes, { cacheTree: switchedCacheTree });
   return { written: worktree ? writing : new Set() };
+}
+
+/**
+ * The refusal unpack-trees prints without porcelain messages: it stops at the first path
+ * refused (in path order), with that path's one `error:` line.
+ */
+export function firstPlainError(
+  found: Partial<Record<Parameters<typeof plainUnpackError>[0], string[]>>,
+): string | undefined {
+  let best: { kind: Parameters<typeof plainUnpackError>[0]; path: string } | undefined;
+  for (const [kind, paths] of Object.entries(found) as [
+    Parameters<typeof plainUnpackError>[0],
+    string[] | undefined,
+  ][]) {
+    for (const path of paths ?? []) {
+      if (!best || compareGitPaths(path, best.path) < 0) best = { kind, path };
+    }
+  }
+  return best ? plainUnpackError(best.kind, best.path) : undefined;
 }
 
 /** git's `# Conflicts:` block appended to MERGE_MSG. */

@@ -327,6 +327,22 @@ export interface Worktree {
   openGitlink?(path: string): Promise<WorkingCopy | undefined>;
 
   /**
+   * The repository directory of the submodule at `path`, in this worktree's FilesApi: its
+   * `.git` directory, or the place its gitfile names (resolved as git resolves it, whether a
+   * repository is there or not). Null when the gitfile names a place this FilesApi cannot
+   * reach (above its root, or an absolute path outside it); undefined without a `.git`.
+   */
+  gitlinkRepository?(path: string): Promise<string | null | undefined>;
+
+  /**
+   * git's `connect_work_tree_and_git_dir` after a submodule moved to `path`: its gitfile
+   * written to name `gitDir` (as {@link gitlinkRepository} gave it before the move)
+   * relative to the new place, and the repository's `core.worktree` set to the new place
+   * relative to it.
+   */
+  connectGitlink?(path: string, gitDir: string): Promise<void>;
+
+  /**
    * Whether the directory at `path` holds a repository of its own: a `.git` directory with
    * `HEAD`, `objects` and `refs` (or a `gitdir:` file), as git's `is_nonbare_repository_dir`.
    * An empty `.git` directory is none.
