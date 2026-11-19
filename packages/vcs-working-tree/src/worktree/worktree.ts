@@ -327,10 +327,12 @@ export interface Worktree {
   openGitlink?(path: string): Promise<WorkingCopy | undefined>;
 
   /**
-   * The repository directory of the populated submodule at `path`, in this worktree's
-   * FilesApi (its `.git` directory, or where its gitfile points); undefined when it has none.
+   * The repository directory of the submodule at `path`, in this worktree's FilesApi: its
+   * `.git` directory, or the place its gitfile names (resolved as git resolves it, whether a
+   * repository is there or not). Null when the gitfile names a place this FilesApi cannot
+   * reach (above its root, or an absolute path outside it); undefined without a `.git`.
    */
-  gitlinkRepository?(path: string): Promise<string | undefined>;
+  gitlinkRepository?(path: string): Promise<string | null | undefined>;
 
   /**
    * git's `connect_work_tree_and_git_dir` after a submodule moved to `path`: its gitfile

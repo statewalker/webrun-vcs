@@ -21,6 +21,7 @@ import {
   firstPlainError,
   flatTree,
   type MergeWriteContext,
+  plainUnpackError,
   planPathsRestore,
   rewriteIndex,
   switchTrees,
@@ -303,22 +304,30 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
   }
 
   /**
-   * unpack-trees without `-m`: the index is the trees' entries (a later tree's entry
-   * replacing an earlier one's), at stage 0, without stat data or flags.
+   * unpack-trees without `-m`: the index is the trees' entries, at stage 0, without stat
+   * data or flags, added in `traverse_trees` order (at each name the trees' files in their
+   * order, then what a directory of that name holds), each with `add_index_entry`'s
+   * `OK_TO_REPLACE`: a later tree's entry replaces an earlier one's, a directory's files
+   * replace a file of its name, whichever tree holds which.
    */
   private async readWithoutMerge(treeIds: ObjectId[]): Promise<void> {
+    const flat = await Promise.all(treeIds.map((id) => flatTree(this.trees, id)));
+    const all = new Set<string>();
+    for (const m of flat) for (const p of m.keys()) all.add(p);
     const entries = new Map<string, CheckedEntry>();
-    for (const id of treeIds) {
-      for (const [path, e] of await flatTree(this.trees, id)) {
-        // add_index_entry with OK_TO_REPLACE: a clashing file or directory goes
+    for (const path of traversalOrder(all)) {
+      for (const m of flat) {
+        const e = m.get(path);
+        if (!e) continue;
+        // add_index_entry with OK_TO_REPLACE: a file in place of a leading directory goes
+        // (nothing beneath the path is added yet: a directory's files come after it)
         for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
           entries.delete(path.slice(0, at));
         }
-        const under = `${path}/`;
-        for (const p of [...entries.keys()]) if (p.startsWith(under)) entries.delete(p);
         entries.set(path, e);
       }
     }
+    assertNoStageZeroClash(new Set(entries.keys()));
     const builder = this.staging.createBuilder();
     for (const path of [...entries.keys()].sort(compareGitPaths)) {
       const e = entries.get(path) as CheckedEntry;
@@ -329,8 +338,15 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
 
   /**
    * `bind_merge` (`--prefix=<dir>/`): the tree's entries under `<dir>/`, every index entry
-   * kept; a path both have is refused ("Entry 'x' overlaps with 'x'.  Cannot bind."). With
-   * `-u` the new files are written (an untracked file in the way refused first).
+   * kept; a path both have is refused ("Entry 'x' overlaps with 'x'.  Cannot bind."). The
+   * entries are added in `traverse_trees` order with `add_index_entry`'s `OK_TO_REPLACE`, so
+   * where a file and a directory clash the directory's entries, added after, win: an index
+   * file in place of a bound leading directory is dropped, and so is a bound file with index
+   * entries beneath it. With `-u` the new files are written: a file in the way is refused
+   * first, tracked or not ("Untracked working tree file 'a' would be overwritten by merge.",
+   * as `check_ok_to_remove` finds it kept in the result); where a bound file finds a
+   * directory, its tracked files must be up to date and go (`verify_clean_subdirectory` marks
+   * them removed), and the bound file is written in its place.
    */
   private async bindMerge(
     ctx: MergeWriteContext,
@@ -346,27 +362,82 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
     for (const e of await this.entryList()) index.set(e.path, e);
     const target = new Map<string, CheckedEntry>();
     for (const [p, e] of tree) target.set(`${prefix}${p}`, e);
-    const paths = [...target.keys()].sort(compareGitPaths);
-    for (const path of paths) {
+    const targetDirs = directoriesOf(target);
+    // an index file at a bound leading directory goes; a bound file with index files
+    // beneath it is replaced by them
+    const dropped = new Set<string>();
+    const beneath = new Map<string, string[]>();
+    for (const p of index.keys()) {
+      if (targetDirs.has(p)) dropped.add(p);
+      for (let at = p.indexOf("/"); at >= 0; at = p.indexOf("/", at + 1)) {
+        const dir = p.slice(0, at);
+        if (target.has(dir)) {
+          const list = beneath.get(dir) ?? [];
+          list.push(p);
+          beneath.set(dir, list);
+          break;
+        }
+      }
+    }
+    const checking = traversalOrder(target.keys());
+    const worktree = this.update ? ctx.worktree : undefined;
+    const sparse = worktree && !this.skipSparseCheckout ? await SparseUnpack.start(ctx) : undefined;
+    const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
+    const indexTime = this.staging.getUpdateTime();
+    const removing: string[] = [];
+    for (const path of checking) {
       if (index.has(path)) {
         throw new ReadTreeFailedError(
           `error: Entry '${path}' overlaps with '${path}'.  Cannot bind.`,
           [path],
         );
       }
-    }
-    const worktree = this.update ? ctx.worktree : undefined;
-    const sparse = worktree && !this.skipSparseCheckout ? await SparseUnpack.start(ctx) : undefined;
-    if (worktree) {
-      for (const path of paths) {
-        if (sparse?.leavesAlone(path)) continue;
-        const error = await verifyAbsent(worktree, path, (p) => index.has(p), "untracked");
-        if (error) throw new ReadTreeFailedError(error, [path]);
+      if (!worktree || sparse?.leavesAlone(path)) continue;
+      const entry = await worktree.getEntry(path).catch(() => undefined);
+      if (entry?.isDirectory && entry.mode !== FileMode.GITLINK) {
+        const under = beneath.get(path) ?? [];
+        for (const old of under) {
+          const e = index.get(old) as StagingEntry;
+          if (await entryNotUptodate(worktree, old, e, trust, indexTime)) {
+            throw new ReadTreeFailedError(plainUnpackError("notUptodate", old), [old]);
+          }
+          removing.push(old);
+          dropped.add(old);
+        }
+        beneath.delete(path);
       }
+      const error = await verifyAbsent(worktree, path, (p) => index.has(p), "untracked");
+      if (error) throw new ReadTreeFailedError(error, [path]);
     }
+    const paths = checking.filter((p) => !beneath.has(p));
+    const stage0 = new Set<string>(paths);
+    for (const p of index.keys()) if (!dropped.has(p)) stage0.add(p);
+    assertNoStageZeroClash(stage0);
+
     const writing = new Set(paths.filter((p) => !sparse || sparse.writes(p)));
-    if (worktree && writing.size > 0) await this.writeFiles(ctx, worktree, target, writing, index);
+    if (worktree) {
+      if (sparse) {
+        // apply_sparse_checkout's unlinks before the files are written (check_updates)
+        const unlink = await sparse.leaving(
+          worktree,
+          (p) =>
+            (beneath.has(p) ? undefined : target.get(p)) ??
+            (dropped.has(p) ? undefined : index.get(p)),
+          { trust },
+        );
+        await sparse.unlink(worktree, unlink);
+      }
+      for (const old of removing) {
+        const entry = await worktree.getEntry(old).catch(() => undefined);
+        if (entry && !entry.isDirectory) {
+          await worktree.remove(old);
+          await pruneEmptyParents(worktree, old);
+        }
+      }
+      if (writing.size > 0) await this.writeFiles(ctx, worktree, target, writing, index);
+    }
     const changes = new Map<string, IndexEntryOptions[]>();
+    for (const p of dropped) changes.set(p, []);
     for (const path of paths) {
       const e = target.get(path) as CheckedEntry;
       const stat = worktree && writing.has(path) ? await worktree.getEntry(path) : undefined;
@@ -414,6 +485,12 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
    * the rest left as stages 1 (the first base), 2 and 3, the worktree untouched there.
    * `--aggressive` resolves deletions on one side with the other unchanged, deletions on
    * both, and identical additions. `--trivial` fails where a file-level merge is needed.
+   *
+   * A path that is a file in some trees and a directory in others is unpack-trees'
+   * file/directory conflict: the trees holding the directory (or a file in place of one of
+   * the path's leading directories) stand as `df_conflict_entry` there, which matches
+   * nothing, is no stage, and keeps `#14`/`#2ALT` (a conflicting head) and `#13`/`#3ALT`
+   * (a conflicting remote) from resolving. Every check runs before anything is written.
    */
   private async threewayMerge(
     ctx: MergeWriteContext,
@@ -421,9 +498,8 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
     result: ReadTreeResult,
   ): Promise<void> {
     const flat = await Promise.all(treeIds.map((id) => flatTree(this.trees, id)));
+    const dirs = flat.map(directoriesOf);
     const bases = flat.slice(0, -2);
-    const head = flat[flat.length - 2] as Map<string, CheckedEntry>;
-    const remote = flat[flat.length - 1] as Map<string, CheckedEntry>;
     const indexEntries = new Map<string, StagingEntry>();
     for (const e of await this.entryList()) if (e.stage === 0) indexEntries.set(e.path, e);
     const checkedWorktree = ctx.worktree;
@@ -434,11 +510,23 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       ? worktreeModeTrust(this.workingCopy, checkedWorktree)
       : undefined;
     const indexTime = this.staging.getUpdateTime();
-    const tracked = (p: string) => indexEntries.has(p);
 
     const paths = new Set<string>(indexEntries.keys());
     for (const m of flat) for (const p of m.keys()) paths.add(p);
-    const sorted = [...paths].sort(compareGitPaths);
+    const sorted = traversalOrder(paths);
+
+    /** The entry tree `k` stands with at `path` (df_conflict_entry, a file, or none). */
+    const stageOf = (k: number, path: string, anyTree: boolean): CheckedEntry | undefined => {
+      const m = flat[k] as Map<string, CheckedEntry>;
+      const e = m.get(path);
+      if (e) return e;
+      if (!anyTree) return undefined;
+      if ((dirs[k] as Set<string>).has(path)) return DF_CONFLICT;
+      for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
+        if (m.has(path.slice(0, at))) return DF_CONFLICT;
+      }
+      return undefined;
+    };
 
     const changes = new Map<string, IndexEntryOptions[]>();
     const writes = new Set<string>();
@@ -454,10 +542,23 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
         fail(`error: Entry '${old.path}' not uptodate. Cannot merge.`, old.path);
       }
     };
+    // check_ok_to_remove: a file in the way is expendable only where this merge already
+    // removes its entry (CE_REMOVE in the result)
+    const removedHere = (p: string) => removes.has(p);
     const absent = async (path: string, kind: "untracked" | "untrackedRemoved") => {
       if (!worktree || quiet(path)) return;
-      const error = await verifyAbsent(worktree, path, tracked, kind);
+      const error = await verifyAbsent(worktree, path, (p) => indexEntries.has(p), kind, {
+        leadingOk: removedHere,
+      });
       if (error) fail(error, path);
+    };
+    const absentIfDirectory = async (path: string) => {
+      if (!worktree || quiet(path)) return;
+      const entry = await worktree.getEntry(path).catch(() => undefined);
+      if (!entry?.isDirectory || entry.mode === FileMode.GITLINK) return;
+      if (await untrackedUnder(worktree, path, (p) => indexEntries.has(p))) {
+        fail(plainUnpackError("lostDir", path), path);
+      }
     };
     const mergedEntry = async (ce: CheckedEntry, old: StagingEntry | undefined, path: string) => {
       if (!old) {
@@ -481,6 +582,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       writes.add(path);
     };
     const deletedEntry = async (old: StagingEntry, path: string) => {
+      await absentIfDirectory(path);
       await verifyUptodate(old);
       changes.set(path, []);
       removes.add(path);
@@ -488,11 +590,16 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
 
     for (const path of sorted) {
       const index = indexEntries.get(path);
-      const h = head.get(path);
-      const r = remote.get(path);
-      const stages = bases.map((b) => b.get(path));
-      const anyAncMissing = stages.some((s) => !s);
-      const noAncExists = stages.every((s) => !s);
+      const anyTree = flat.some((m) => m.has(path)) || dirs.some((d) => d.has(path));
+      const stages = bases.map((_, k) => stageOf(k, path, anyTree));
+      let h = stageOf(flat.length - 2, path, anyTree);
+      let r = stageOf(flat.length - 1, path, anyTree);
+      const anyAncMissing = stages.some((s) => !s || s === DF_CONFLICT);
+      const noAncExists = stages.every((s) => !s || s === DF_CONFLICT);
+      const dfHead = h === DF_CONFLICT;
+      const dfRemote = r === DF_CONFLICT;
+      if (dfHead) h = undefined;
+      if (dfRemote) r = undefined;
       let headMatch = 0;
       let remoteMatch = 0;
       if (!same(r, h)) {
@@ -502,7 +609,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
         });
       }
       // #14, #14ALT, #2ALT
-      if (r && headMatch && !remoteMatch) {
+      if (r && !dfHead && headMatch && !remoteMatch) {
         if (index && !same(index, r) && !same(index, h)) {
           fail(`error: Entry '${path}' would be overwritten by merge. Cannot merge.`, path);
         }
@@ -519,7 +626,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
           continue;
         }
         // #13, #3ALT
-        if (remoteMatch && !headMatch) {
+        if (!dfRemote && remoteMatch && !headMatch) {
           await mergedEntry(h, index, path);
           continue;
         }
@@ -529,6 +636,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       if (this.aggressive) {
         const headDeleted = !h;
         const remoteDeleted = !r;
+        const ce = index ?? h ?? r ?? stages.find((s) => s && s !== DF_CONFLICT);
         if (
           (headDeleted && remoteDeleted) ||
           (headDeleted && r && remoteMatch) ||
@@ -538,7 +646,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
             await deletedEntry(index, path);
             continue;
           }
-          if (!headDeleted) await absent(path, "untrackedRemoved");
+          if (ce && !headDeleted) await absent(path, "untrackedRemoved");
           continue;
         }
         if (noAncExists && h && r && same(h, r)) {
@@ -551,7 +659,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       nontrivial = true;
       const list: IndexEntryOptions[] = [];
       if (!headMatch || !remoteMatch) {
-        const base = stages.find((s) => s !== undefined);
+        const base = stages.find((s) => s !== undefined && s !== DF_CONFLICT);
         if (base) list.push({ path, objectId: base.objectId, mode: base.mode, stage: 1 });
       }
       if (h) list.push({ path, objectId: h.objectId, mode: h.mode, stage: 2 });
@@ -563,6 +671,11 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
     if (this.trivial && nontrivial) {
       throw new ReadTreeFailedError("error: Merge requires file-level merging");
     }
+    // never an index holding a file and a directory of one name at stage 0
+    const stage0 = new Set<string>();
+    for (const p of indexEntries.keys()) if (!changes.has(p)) stage0.add(p);
+    for (const [p, list] of changes) if (list.some((e) => !e.stage)) stage0.add(p);
+    assertNoStageZeroClash(stage0);
 
     // the worktree: removals first, then the files written
     sparse?.conflict(conflicted);
@@ -604,10 +717,73 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
   }
 }
 
+/** unpack-trees' `df_conflict_entry`: mode 0, no id; matches only itself, never a stage. */
+const DF_CONFLICT: CheckedEntry = Object.freeze({ objectId: "" as ObjectId, mode: 0 });
+
+/** The directories a flat tree holds (every leading path of its files). */
+function directoriesOf(tree: Map<string, CheckedEntry>): Set<string> {
+  const out = new Set<string>();
+  for (const p of tree.keys()) {
+    for (let at = p.indexOf("/"); at >= 0; at = p.indexOf("/", at + 1)) out.add(p.slice(0, at));
+  }
+  return out;
+}
+
+/**
+ * `paths` in `traverse_trees` order: the index's (a directory named as `<name>/`), except
+ * that a directory some path also names as a file comes right after that file (unpack-trees
+ * looks ahead for it), before the names that sort between the two.
+ */
+function traversalOrder(paths: Iterable<string>): string[] {
+  const all = new Set(paths);
+  const keys = new Map<string, string[]>();
+  const keyOf = (path: string): string[] => {
+    let key = keys.get(path);
+    if (!key) {
+      const parts = path.split("/");
+      key = parts.map((part, k) =>
+        k < parts.length - 1 && !all.has(parts.slice(0, k + 1).join("/")) ? `${part}/` : part,
+      );
+      keys.set(path, key);
+    }
+    return key;
+  };
+  return [...all].sort((a, b) => {
+    const x = keyOf(a);
+    const y = keyOf(b);
+    for (let k = 0; k < Math.min(x.length, y.length); k++) {
+      const c = compareGitPaths(x[k] as string, y[k] as string);
+      if (c !== 0) return c;
+    }
+    return x.length - y.length;
+  });
+}
+
+/**
+ * The last guard before an index is written: no stage-0 path may also be a leading
+ * directory of another (git's `add_index_entry` never leaves one; a tree written from such an
+ * index would hold two entries of one name).
+ */
+function assertNoStageZeroClash(paths: Set<string>): void {
+  for (const path of paths) {
+    for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
+      const dir = path.slice(0, at);
+      if (paths.has(dir)) {
+        throw new ReadTreeFailedError(
+          `fatal: BUG: the index would hold both '${dir}' and '${path}'`,
+          [dir, path],
+        );
+      }
+    }
+  }
+}
+
 /**
  * unpack-trees' `verify_absent` of a path the merge adds (or, `untrackedRemoved`, removes)
  * with no index entry there: an untracked file or link in the way (ignored files are
  * expendable: `preserve_ignored` is off with `-u`), or a directory holding untracked files.
+ * A file in place of a leading directory is in the way even when tracked, unless the merge
+ * removes its entry (`leadingOk`: `check_ok_to_remove` finds it `CE_REMOVE` in the result).
  * Returns git's plain message, or undefined.
  */
 async function verifyAbsent(
@@ -615,6 +791,7 @@ async function verifyAbsent(
   path: string,
   tracked: (path: string) => boolean,
   kind: "untracked" | "untrackedRemoved",
+  options: { leadingOk?: (path: string) => boolean } = {},
 ): Promise<string | undefined> {
   const parts = path.split("/");
   for (let k = 1; k < parts.length; k++) {
@@ -622,7 +799,7 @@ async function verifyAbsent(
     const entry = await worktree.getEntry(prefix).catch(() => undefined);
     if (!entry) return undefined;
     if (entry.isDirectory) continue;
-    if (tracked(prefix) || (await worktree.isIgnored(prefix))) return undefined;
+    if (options.leadingOk?.(prefix) || (await worktree.isIgnored(prefix))) return undefined;
     return firstPlainError({ [kind]: [prefix] });
   }
   const entry = await worktree.getEntry(path).catch(() => undefined);

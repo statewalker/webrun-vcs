@@ -8,7 +8,15 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeCacheTree } from "@statewalker/vcs-working-tree";
@@ -79,9 +87,9 @@ function basic(dir: string): void {
   put(dir, "empty/u", "u\n");
 }
 
-/** Our `git mv` with git's options. */
-async function ours(dir: string, args: string[]) {
-  const cmd = (await openOurs(dir)).mv().setCompatibility(version);
+/** Our `git mv` with git's options (over a wrapped worktree FilesApi with `wrap`). */
+async function ours(dir: string, args: string[], wrap?: Parameters<typeof openOurs>[2]) {
+  const cmd = (await openOurs(dir, undefined, wrap)).mv().setCompatibility(version);
   const paths: string[] = [];
   for (const arg of args) {
     if (arg === "-f") cmd.setForce(true);
@@ -270,6 +278,19 @@ describeGit("git mv against native git", () => {
       expect(links(t.ours, "d/sub2")).toEqual(links(t.native, "d/sub2"));
     });
 
+    it("keeps the moved gitlink's stat data as git's refresh does", async () => {
+      const t = await compareMv(withSubmodule, ["sub", "d/sub2"]);
+      // ie_match_stat looks at a gitlink's type and HEAD only: refresh_cache_entry keeps the
+      // entry's stat data (the twins' copied index holds the same)
+      const recorded = (dir: string) =>
+        gitOk(root, dir, "ls-files", "--debug", "d/sub2")
+          .split("\n")
+          .filter((l) => /^\s*(mtime|size):/.test(l))
+          .map((l) => l.replace(/\s*flags:.*$/, "").trim());
+      expect(recorded(t.ours)).toEqual(recorded(t.native));
+      expect(recorded(t.ours)[0]).not.toBe("mtime: 0:0");
+    });
+
     it("moves into a directory", async () => {
       const t = await compareMv(withSubmodule, ["sub", "d"]);
       expect(links(t.ours, "d/sub")).toEqual(links(t.native, "d/sub"));
@@ -320,6 +341,246 @@ describeGit("git mv against native git", () => {
 
     it("--sparse moves a skip-worktree directory into a directory", async () => {
       await compareMv(sparse, ["--sparse", "out", "in"]);
+    });
+  });
+
+  describe("review fixes", () => {
+    /** The worktree's FilesApi with `move` refusing every move (EXDEV, EACCES, ...). */
+    const refusingMoves: Parameters<typeof openOurs>[2] = (files) =>
+      new Proxy(files, {
+        get(target, prop, receiver) {
+          if (prop === "move") return async () => false;
+          const value = Reflect.get(target, prop, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+    /**
+     * The worktree's FilesApi as a case-insensitive filesystem shows it: each component
+     * found whatever its case; a move's last component keeps the case asked for.
+     */
+    const caseFolding =
+      (dir: string): Parameters<typeof openOurs>[2] =>
+      (files) => {
+        const resolve = (path: string, keepLast = false): string => {
+          const parts = path.split("/").filter(Boolean);
+          const out: string[] = [];
+          for (let k = 0; k < parts.length; k++) {
+            const part = parts[k] as string;
+            let name = part;
+            if (!(keepLast && k === parts.length - 1)) {
+              try {
+                const names = readdirSync(join(dir, ...out));
+                if (!names.includes(part)) {
+                  name = names.find((n) => n.toLowerCase() === part.toLowerCase()) ?? part;
+                }
+              } catch {
+                // no directory there
+              }
+            }
+            out.push(name);
+          }
+          return `${path.startsWith("/") ? "/" : ""}${out.join("/")}`;
+        };
+        const map = (arg: unknown): unknown =>
+          typeof arg === "string"
+            ? resolve(arg)
+            : Array.isArray(arg)
+              ? arg.map((a) => (typeof a === "string" ? resolve(a) : a))
+              : arg;
+        return new Proxy(files, {
+          get(target, prop, receiver) {
+            const value = Reflect.get(target, prop, receiver);
+            if (typeof value !== "function") return value;
+            if (prop === "move") {
+              return (from: string, to: string) =>
+                (value as (a: string, b: string) => unknown).call(
+                  target,
+                  resolve(from),
+                  resolve(to, true),
+                );
+            }
+            return (...args: unknown[]) =>
+              (value as (...a: unknown[]) => unknown).apply(target, args.map(map));
+          },
+        });
+      };
+
+    /** Ours alone (native git cannot fail this way); the native twin stays as it was. */
+    async function compareOursOnly(
+      build: (dir: string) => void,
+      args: string[],
+      expected: string,
+      wrap: (dir: string) => Parameters<typeof openOurs>[2],
+      setup?: (dir: string) => void,
+    ): Promise<{ native: string; ours: string }> {
+      const t = twins(build);
+      if (setup) for (const dir of [t.native, t.ours]) setup(dir);
+      const o = await ours(t.ours, args, wrap(t.ours));
+      expect(o.stderr).toBe(expected);
+      expect(await state(t.ours)).toEqual(await state(t.native));
+      return t;
+    }
+
+    const sparse = (dir: string) => {
+      for (const p of ["top", "in/x", "in/y", "out/z", "out/w", "out2/q"]) put(dir, p, `${p}\n`);
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-q", "-m", "c");
+      gitOk(root, dir, "sparse-checkout", "set", "--cone", "in");
+    };
+
+    it("--sparse out-to-in refuses an untracked file at the destination", async () => {
+      await compareMv(sparse, ["--sparse", "out/z", "in/h"], (dir) => put(dir, "in/h", "u\n"));
+    });
+
+    it("-f --sparse out-to-in overwrites an untracked file at the destination", async () => {
+      await compareMv(sparse, ["-f", "--sparse", "out/z", "in/h"], (dir) =>
+        put(dir, "in/h", "u\n"),
+      );
+    });
+
+    it("--sparse: an absent skip-worktree directory with no stat is no directory", async () => {
+      // git reads a stat no lstat filled in: almost always no directory, rarely (about one
+      // run in thirty here) a directory, moving it; the twins compared on git's usual answer
+      for (let attempt = 0; ; attempt++) {
+        const t = twins(sparse);
+        const r = run(t.native, ["mv", "--sparse", "out", "out2"]);
+        if (r.status === 0 && attempt < 9) continue;
+        const o = await ours(t.ours, ["--sparse", "out", "out2"]);
+        expect(o.stderr).toBe(r.stderr.replace(/\n$/, ""));
+        expect(o.stderr).toBe("fatal: not under version control, source=out, destination=out2/out");
+        expect(await state(t.ours)).toEqual(await state(t.native));
+        break;
+      }
+    });
+
+    it("dies when the filesystem refuses the move, deleting nothing", async () => {
+      const failed =
+        version === "2.43"
+          ? "fatal: renaming 'd' failed: Operation not permitted"
+          : "fatal: renaming 'd' to 'z' failed: Operation not permitted";
+      await compareOursOnly(
+        basic,
+        ["d", "z"],
+        failed,
+        () => refusingMoves,
+        (dir) => {
+          put(dir, "d/f", "dirty\n");
+          put(dir, "d/u", "untracked\n");
+        },
+      );
+    });
+
+    it("renames by case only where the filesystem folds case", async () => {
+      const t = twins(basic);
+      for (const dir of [t.native, t.ours]) run(dir, ["config", "core.ignoreCase", "true"]);
+      const r = run(t.native, ["mv", "a", "A"]);
+      const o = await ours(t.ours, ["a", "A"], caseFolding(t.ours));
+      expect(o.stderr).toBe(r.stderr.replace(/\n$/, ""));
+      expect(await state(t.ours)).toEqual(await state(t.native));
+    });
+
+    it("a directory renamed by case only where the filesystem folds case fails as git", async () => {
+      // git finds `D` a directory and moves `d` into it: rename(2) refuses (EINVAL)
+      const failed =
+        version === "2.43"
+          ? "fatal: renaming 'd' failed: Invalid argument"
+          : "fatal: renaming 'd' to 'D/d' failed: Invalid argument";
+      await compareOursOnly(basic, ["d", "D"], failed, caseFolding, (dir) =>
+        run(dir, ["config", "core.ignoreCase", "true"]),
+      );
+    });
+
+    const withDirLink = (dir: string) => {
+      basic(dir);
+      put(dir, "realdir/f", "f\n");
+      symlinkSync("realdir", join(dir, "ld"));
+      gitOk(root, dir, "add", "realdir", "ld");
+      gitOk(root, dir, "commit", "-q", "-m", "ld");
+    };
+
+    only256("refuses a destination beyond a symbolic link given with a slash", async () => {
+      await compareMv(withDirLink, ["a", "ld/"]);
+    });
+
+    it("a source beyond a symbolic link is not under version control", async () => {
+      await compareMv(withDirLink, ["ld/f", "z"]);
+    });
+
+    it("names the worktree's absolute path for a path outside it", async () => {
+      const t = twins(basic);
+      const r = run(t.native, ["mv", "a", "../z"]);
+      const o = await ours(t.ours, ["a", "../z"]);
+      expect(o.stderr).toBe(r.stderr.replace(/\n$/, "").replace(t.native, t.ours));
+      expect(o.stderr).toContain(`at '${t.ours}'`);
+      expect(await state(t.ours)).toEqual(await state(t.native));
+    });
+
+    it.skipIf(version !== "2.43")(
+      "2.43 moves a directory, then fails on a path inside it given too",
+      async () => {
+        await compareMv(basic, ["d", "d/f", "empty"]);
+      },
+    );
+  });
+
+  describe("a submodule whose repository lies outside the superproject", () => {
+    /** `<dir>/repo` with the submodule `sub`, its repository at `<dir>/ext/sm`. */
+    const build = (dir: string) => {
+      const repo = join(dir, "repo");
+      gitOk(root, dir, "init", "-q", "-b", "main", repo);
+      const sub = join(root, `sub${counter}`);
+      gitOk(root, root, "init", "-q", "-b", "main", sub);
+      put(sub, "s", "s\n");
+      gitOk(root, sub, "add", ".");
+      gitOk(root, sub, "commit", "-q", "-m", "s");
+      put(repo, "top", "top\n");
+      put(repo, "d/f", "f\n");
+      gitOk(root, repo, "add", ".");
+      gitOk(root, repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "sub");
+      gitOk(root, repo, "commit", "-q", "-m", "c");
+      execFileSync("mkdir", ["-p", join(dir, "ext")]);
+      execFileSync("mv", [join(repo, ".git/modules/sub"), join(dir, "ext/sm")]);
+      writeFileSync(join(repo, "sub/.git"), "gitdir: ../../ext/sm\n");
+      gitOk(root, dir, "config", "-f", "ext/sm/config", "core.worktree", "../../repo/sub");
+    };
+    const outsideTwins = () => {
+      const n = counter++;
+      const fixture = join(root, `f${n}`);
+      execFileSync("mkdir", ["-p", fixture]);
+      build(fixture);
+      settle(join(fixture, "repo"));
+      const out = { native: join(root, `n${n}`), ours: join(root, `o${n}`) };
+      for (const dir of [out.native, out.ours]) execFileSync("cp", ["-a", fixture, dir]);
+      return out;
+    };
+    const links = (dir: string, at: string) => ({
+      gitfile: readFileSync(join(dir, "repo", at, ".git"), "utf8"),
+      worktree: gitOk(root, dir, "config", "-f", "ext/sm/config", "core.worktree"),
+    });
+
+    it("rewrites the gitfile and core.worktree where the FilesApi reaches them", async () => {
+      const t = outsideTwins();
+      const r = run(join(t.native, "repo"), ["mv", "sub", "d/sub2"]);
+      expect(r.stderr).toBe("");
+      const git = await openOurs(t.ours, undefined, undefined, "repo");
+      const o = await runOurs(
+        git.mv().setCompatibility(version).addSource("sub").setDestination("d/sub2"),
+      );
+      expect(o.stderr).toBe("");
+      expect(links(t.ours, "d/sub2")).toEqual(links(t.native, "d/sub2"));
+      expect(links(t.ours, "d/sub2").gitfile).toBe("gitdir: ../../../ext/sm\n");
+      expect(snapshot(root, join(t.ours, "repo"))).toEqual(snapshot(root, join(t.native, "repo")));
+    });
+
+    it("refuses before any change where the FilesApi cannot reach the repository", async () => {
+      const t = outsideTwins();
+      const o = await ours(join(t.ours, "repo"), ["sub", "d/sub2"]);
+      expect(o.stderr).toBe(
+        "fatal: cannot update the repository of submodule 'sub' ('../ext/sm'): it lies outside the files this worktree reaches",
+      );
+      expect(links(t.ours, "sub")).toEqual(links(t.native, "sub"));
+      expect(snapshot(root, join(t.ours, "repo"))).toEqual(snapshot(root, join(t.native, "repo")));
     });
   });
 });

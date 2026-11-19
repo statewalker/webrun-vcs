@@ -1085,8 +1085,15 @@ export class FileWorktree implements Worktree {
     return head === "file" ? resolved : undefined;
   }
 
-  async gitlinkRepository(path: string): Promise<string | undefined> {
-    return this.gitlinkDir(path).catch(() => undefined);
+  async gitlinkRepository(path: string): Promise<string | null | undefined> {
+    const dotGit = joinPath(this.rootPath, path, ".git");
+    const kind = await this.kindOf(dotGit).catch(() => undefined);
+    if (kind === "directory") return dotGit;
+    if (kind !== "file") return undefined;
+    const target = await this.readGitfile(dotGit).catch(() => undefined);
+    if (!target) return undefined;
+    // the place the gitfile names, a repository there or not (git connects it anyway)
+    return this.gitfileTarget(path, target) ?? null;
   }
 
   async connectGitlink(path: string, gitDir: string): Promise<void> {
@@ -1249,7 +1256,10 @@ export class FileWorktree implements Worktree {
     }
     const fullOldPath = joinPath(this.rootPath, oldPath);
     const fullNewPath = joinPath(this.rootPath, newPath);
-    await this.files.move(fullOldPath, fullNewPath);
+    if (await this.files.move(fullOldPath, fullNewPath)) return;
+    // the FilesApi says only that nothing moved: its errno is told where it can be found
+    const code = !(await this.kindOf(fullOldPath).catch(() => undefined)) ? "ENOENT" : "EPERM";
+    throw Object.assign(new Error(`${code}: cannot move '${oldPath}' to '${newPath}'`), { code });
   }
 
   // ========== Checkout Operations ==========

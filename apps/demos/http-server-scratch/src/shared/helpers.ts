@@ -134,7 +134,9 @@ export async function atomicWriteFile(
 
   try {
     await files.write(tempPath, [content]);
-    await files.move(tempPath, path);
+    if (!(await files.move(tempPath, path))) {
+      throw new Error(`could not move ${tempPath} to ${path}`);
+    }
   } catch (error) {
     try {
       await files.remove(tempPath);

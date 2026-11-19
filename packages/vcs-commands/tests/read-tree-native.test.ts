@@ -136,6 +136,30 @@ async function compareReadTree(
   const stderr = await ours(t.ours, args);
   expect(stderr).toBe(r.stderr.replace(/\n$/, ""));
   expect(await state(t.ours)).toEqual(await state(t.native));
+  checkIndexSound(t.ours);
+}
+
+/**
+ * The index ours left holds no stage-0 file/directory clash, and (without conflicts)
+ * native `git write-tree` takes it.
+ */
+function checkIndexSound(dir: string): void {
+  const lines = gitOk(root, dir, "ls-files", "-s").split("\n").filter(Boolean);
+  const stage0 = new Set<string>();
+  let unmerged = false;
+  for (const line of lines) {
+    const [meta, path] = line.split("\t") as [string, string];
+    if (meta.endsWith(" 0")) stage0.add(path);
+    else unmerged = true;
+  }
+  for (const path of stage0) {
+    for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
+      expect(stage0.has(path.slice(0, at)), `${path.slice(0, at)} clashes with ${path}`).toBe(
+        false,
+      );
+    }
+  }
+  if (!unmerged) expect(run(dir, ["write-tree"]).status).toBe(0);
 }
 
 /** A staged change, a local change, an untracked file. */
@@ -298,5 +322,165 @@ describeGit("git read-tree against native git", () => {
     it("a three-way merge with -u", async () => {
       await compareReadTree(sparse, ["-m", "-u", "c1", "c2", "side"]);
     });
+  });
+
+  describe("file/directory conflicts (unpack-trees' df_conflict_entry)", () => {
+    /**
+     * B: x. O (from B): x, e (a file). H (main, from B): x, e/f, e/g. `base` adds paths to
+     * B (and keeps them in H and O unless they replace them). HEAD at `head`.
+     */
+    const dfHistory =
+      (head: "H" | "O", base: Record<string, string> = {}) =>
+      (dir: string) => {
+        put(dir, "x", "x\n");
+        for (const [p, c] of Object.entries(base)) put(dir, p, c);
+        gitOk(root, dir, "add", ".");
+        gitOk(root, dir, "commit", "-q", "-m", "B");
+        gitOk(root, dir, "tag", "B");
+        gitOk(root, dir, "checkout", "-q", "-b", "side");
+        rmSync(join(dir, "e"), { recursive: true, force: true });
+        put(dir, "e", "e\n");
+        gitOk(root, dir, "add", "-A", ".");
+        gitOk(root, dir, "commit", "-q", "-m", "O");
+        gitOk(root, dir, "tag", "O");
+        gitOk(root, dir, "checkout", "-q", "main");
+        rmSync(join(dir, "e"), { recursive: true, force: true });
+        put(dir, "e/f", "f\n");
+        put(dir, "e/g", "g\n");
+        gitOk(root, dir, "add", "-A", ".");
+        gitOk(root, dir, "commit", "-q", "-m", "H");
+        gitOk(root, dir, "tag", "H");
+        if (head === "O") gitOk(root, dir, "checkout", "-q", "O");
+      };
+
+    it("leaves the file at stage 3 and the directory's files at stage 2", async () => {
+      await compareReadTree(dfHistory("H"), ["-m", "B", "H", "O"]);
+    });
+
+    it("with --aggressive", async () => {
+      await compareReadTree(dfHistory("H"), ["-m", "--aggressive", "B", "H", "O"]);
+    });
+
+    it("-u writes nothing for the conflict", async () => {
+      await compareReadTree(dfHistory("H"), ["-m", "-u", "B", "H", "O"]);
+    });
+
+    it("-u with the file at HEAD", async () => {
+      await compareReadTree(dfHistory("O"), ["-m", "-u", "B", "O", "H"]);
+    });
+
+    it("-u refuses the file at HEAD while dirty", async () => {
+      await compareReadTree(dfHistory("O"), ["-m", "-u", "B", "O", "H"], (dir) =>
+        put(dir, "e", "dirty\n"),
+      );
+    });
+
+    it("a base holding the directory, --aggressive -u", async () => {
+      await compareReadTree(dfHistory("H", { "e/f": "f\n" }), [
+        "-m",
+        "--aggressive",
+        "-u",
+        "B",
+        "H",
+        "O",
+      ]);
+    });
+
+    it("a base holding the file, --aggressive -u", async () => {
+      await compareReadTree(dfHistory("O", { e: "e0\n" }), [
+        "-m",
+        "--aggressive",
+        "-u",
+        "B",
+        "O",
+        "H",
+      ]);
+    });
+
+    it("a base holding the directory, the file at HEAD, --aggressive -u", async () => {
+      await compareReadTree(dfHistory("O", { "e/f": "f\n" }), [
+        "-m",
+        "--aggressive",
+        "-u",
+        "B",
+        "O",
+        "H",
+      ]);
+    });
+
+    it("without -m a directory's files replace a file of its name (traversal order)", async () => {
+      await compareReadTree(dfHistory("H"), ["H", "O"]);
+      await compareReadTree(dfHistory("H"), ["O", "H"]);
+    });
+  });
+
+  describe("--prefix over a clashing index entry", () => {
+    it("drops the file the bound directory replaces", async () => {
+      await compareReadTree(history, ["--prefix=a/", "c1"]);
+    });
+
+    it("-u refuses the file in the way", async () => {
+      await compareReadTree(history, ["--prefix=a/", "-u", "c1"]);
+    });
+
+    it("keeps the index's directory over a bound file of its name", async () => {
+      await compareReadTree(history, ["--prefix=sub/", "c1"], (dir) => {
+        put(dir, "sub/d/f/z", "z\n");
+        run(dir, ["add", "sub/d/f/z"]);
+      });
+    });
+
+    it("-u keeps the index's directory over a bound file of its name", async () => {
+      await compareReadTree(history, ["--prefix=sub/", "-u", "c1"], (dir) => {
+        put(dir, "sub/d/f/z", "z\n");
+        run(dir, ["add", "sub/d/f/z"]);
+      });
+    });
+
+    it("-u refuses a dirty file in the directory where a bound file goes", async () => {
+      await compareReadTree(history, ["--prefix=sub/", "-u", "c1"], (dir) => {
+        put(dir, "sub/d/f/z", "z\n");
+        run(dir, ["add", "sub/d/f/z"]);
+        put(dir, "sub/d/f/z", "dirty\n");
+      });
+    });
+  });
+
+  it("--prefix -u in a sparse checkout keeps a dirty file leaving it", async () => {
+    await compareReadTree(
+      (dir) => {
+        history(dir);
+        put(dir, "g/h/i", "i\n");
+        gitOk(root, dir, "add", ".");
+        gitOk(root, dir, "commit", "-q", "-m", "g");
+        gitOk(root, dir, "sparse-checkout", "set", "--cone", "d");
+      },
+      ["--prefix=sub/", "-u", "c1"],
+      (dir) => {
+        run(dir, ["update-index", "--no-skip-worktree", "g/h/i"]);
+        put(dir, "g/h/i", "dirty\n");
+      },
+    );
+  });
+
+  it("several trees leave a cache-tree repaired as git's (invalid ancestors stop)", async () => {
+    await compareReadTree(
+      (dir) => {
+        history(dir);
+        put(dir, "p/a/1", "1\n");
+        put(dir, "p/b/2", "2\n");
+        put(dir, "p/c/3", "3\n");
+        put(dir, "z/1", "1\n");
+        gitOk(root, dir, "add", ".");
+        gitOk(root, dir, "commit", "-q", "-m", "p");
+        gitOk(root, dir, "tag", "p");
+        gitOk(root, dir, "rm", "-q", "-r", "p/a", "p/c");
+        put(dir, "p/a/9", "9\n");
+        gitOk(root, dir, "add", ".");
+        gitOk(root, dir, "commit", "-q", "-m", "q");
+        gitOk(root, dir, "tag", "q");
+      },
+      ["p", "q"],
+    );
   });
 });

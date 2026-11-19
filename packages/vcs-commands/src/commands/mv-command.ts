@@ -22,7 +22,7 @@ import { sparseCheckoutConfig, sparsePathAdvice } from "./sparse-checkout-suppor
 import { strerror } from "./strerror.js";
 import { parseGitmodules } from "./submodule-config.js";
 import { planFlatRestore, writeTreeRestorePlan } from "./tree-restore.js";
-import { statThroughLeadingLinks } from "./worktree-overwrite-checks.js";
+import { statFollowingLinks, statThroughLeadingLinks } from "./worktree-overwrite-checks.js";
 
 /** One move `git mv` made (or, with `-n`, would make). */
 export interface MvRename {
@@ -206,16 +206,31 @@ export class MvCommand extends GitCommand<MvResult> {
     const die = (message: string): never => {
       throw new MvFailedError([...result.warnings, `fatal: ${message}`].join("\n"), result);
     };
+    // git names the worktree's top as the host does (an absolute path)
+    const top =
+      (worktree as { hostPath?: string }).hostPath?.replace(/(.)\/+$/, "$1") ?? worktree.getRoot();
     const normalized = (path: string) =>
-      normalizePath(path) ?? die(`'${path}' is outside repository at '${worktree.getRoot()}'`);
+      normalizePath(path) ?? die(`'${path}' is outside repository at '${top}'`);
     const lstat = (path: string) => worktree.getEntry(path).catch(() => undefined);
-    const isDirectory = async (path: string) => (await lstat(path))?.isDirectory === true;
+    // lstat(2) of a path with a trailing slash, or of one beneath a symbolic link, follows
+    // the links (`ld/` names the directory `ld` points to)
+    const lstatFollowing = async (path: string) => {
+      const bare = path.replace(/\/+$/, "");
+      if (bare !== path) return statFollowingLinks(worktree, bare);
+      const found = await lstat(path);
+      if (found) return found;
+      const through = await statThroughLeadingLinks(worktree, path);
+      return through?.entry;
+    };
+    // is_directory: stat(2), following links
+    const isDirectory = async (path: string) =>
+      (await statFollowingLinks(worktree, path.replace(/\/+$/, "")))?.isDirectory === true;
 
     const cache = await this.indexEntries();
     const namePos = (name: string) => indexNamePos(cache, name);
     const patterns = await this.sparseCheckoutPatterns();
     const inSparse = (path: string) => !path || !patterns || patterns.includes(path);
-    const inCone = (path: string) => !path || !patterns || !patterns.cone || inSparse(path);
+    const inCone = (path: string) => !path || !patterns?.cone || inSparse(path);
     const ignoreCase = configBool(this.workingCopy, "core.ignoreCase", false);
     const fold = (p: string) => (ignoreCase ? p.toLowerCase() : p);
     const emptyDirHasSparseContents = (name: string) => {
@@ -224,7 +239,7 @@ export class MvCommand extends GitCommand<MvResult> {
       if (pos >= 0) return false;
       pos = -pos - 1;
       const ce = cache[pos];
-      return ce !== undefined && ce.path.startsWith(withSlash) && ce.skipWorktree === true;
+      return ce?.path.startsWith(withSlash) === true && ce.skipWorktree === true;
     };
     const indexRangeOfSameDir = (src: string): [number, number] => {
       const withSlash = addSlash(src);
@@ -258,7 +273,7 @@ export class MvCommand extends GitCommand<MvResult> {
     // last successful one left it (a skip-worktree directory as source relies on it)
     let lastStat: { isDirectory: boolean } | undefined;
     const lstatSt = async (path: string) => {
-      const found = await lstat(path);
+      const found = await lstatFollowing(path);
       if (found) lastStat = found;
       return found;
     };
@@ -280,6 +295,8 @@ export class MvCommand extends GitCommand<MvResult> {
     const onlyMatchSkipWorktree: string[] = [];
     const movedDirs = new Set<string>();
     const srcDirs: string[] = [];
+    /** The repository of each submodule with a gitfile, found before anything moves */
+    const gitDirs = new Map<string, string>();
     const trust = worktreeModeTrust(this.workingCopy, worktree);
     const indexTime = this.staging.getUpdateTime();
 
@@ -299,8 +316,9 @@ export class MvCommand extends GitCommand<MvResult> {
             if (!inSparse(addSlash(src)) && emptyDirHasSparseContents(src)) {
               modes[i] = (modes[i] as number) | SKIP_WORKTREE_DIR;
               // S_ISDIR(st.st_mode) of whatever lstat filled in last; where none did, git
-              // reads an uninitialised stat (either way, run to run): the directory it is
-              srcIsDir = lastStat ? lastStat.isDirectory : true;
+              // reads a stat nothing filled in, almost always no directory ("not under
+              // version control" on 2.43 and 2.5x alike; rarely a directory, moving it)
+              srcIsDir = lastStat ? lastStat.isDirectory : false;
               return dirCheck(srcIsDir);
             }
             if (!((modes[i] as number) & SPARSE)) bad = "bad source";
@@ -330,7 +348,7 @@ export class MvCommand extends GitCommand<MvResult> {
           bad = "can not move directory into itself";
           return;
         }
-        if (st.isDirectory && (await lstat(dst))) {
+        if (st.isDirectory && (await lstatFollowing(dst))) {
           bad = "destination already exists";
           return;
         }
@@ -340,11 +358,24 @@ export class MvCommand extends GitCommand<MvResult> {
         if (srcIsDir) {
           const first = namePos(src);
           if (first >= 0) {
-            gitfiles[i] = await this.submoduleGitfilePath(
+            const gitfile = await this.submoduleGitfilePath(
               worktree,
               src,
               cache[first] as IndexEntry,
             );
+            gitfiles[i] = gitfile;
+            if (gitfile && gitfile !== SUBMODULE_WITH_GITDIR && worktree.gitlinkRepository) {
+              // connect_work_tree_and_git_dir rewrites the gitfile and the repository's
+              // core.worktree after the move: refused now when that repository cannot be
+              // reached, rather than leave the submodule broken
+              const gitDir = await worktree.gitlinkRepository(src);
+              if (gitDir === null) {
+                die(
+                  `cannot update the repository of submodule '${src}' ('${gitfile}'): it lies outside the files this worktree reaches`,
+                );
+              }
+              if (gitDir) gitDirs.set(src, gitDir);
+            }
             return;
           }
           const [from, to] = indexRangeOfSameDir(src);
@@ -451,8 +482,9 @@ export class MvCommand extends GitCommand<MvResult> {
       }
     }
 
-    // a path moved together with one of its parent directories (2.5x; 2.43 aborts on it)
-    for (let i = 0; i < argc; i++) {
+    // a path moved together with one of its parent directories (2.5x; 2.43 moves the
+    // directory, then fails renaming the path, or aborts on an assertion)
+    for (let i = 0; i < argc && this.compatibility !== "2.43"; i++) {
       if ((modes[i] as number) & MOVE_VIA_PARENT_DIR) continue;
       const src = sources[i] as string;
       for (let at = src.lastIndexOf("/"); at > 0; at = src.lastIndexOf("/", at - 1)) {
@@ -479,7 +511,6 @@ export class MvCommand extends GitCommand<MvResult> {
     const current = new Map<string, IndexEntry>();
     for (const e of cache) if (e.stage === 0) current.set(e.path, e);
     const dirtyPaths: string[] = [];
-    const checkouts: IndexEntry[] = [];
     let gitmodulesModified = false;
     let changed = false;
     for (let i = 0; i < argc; i++) {
@@ -489,14 +520,10 @@ export class MvCommand extends GitCommand<MvResult> {
       if (this.dryRun || this.verbose) result.output.push(`Renaming ${src} to ${dst}`);
       if (this.dryRun) continue;
       const gitfile = gitfiles[i];
-      // the repository of a submodule with a gitfile, found before its directory moves
-      const gitDir =
-        gitfile && gitfile !== SUBMODULE_WITH_GITDIR
-          ? await worktree.gitlinkRepository?.(src)
-          : undefined;
+      const gitDir = gitfile && gitfile !== SUBMODULE_WITH_GITDIR ? gitDirs.get(src) : undefined;
       if (needsWorktreeRename(mode, dstMode)) {
         try {
-          await renamePath(worktree, src, dst);
+          await renamePath(worktree, src, dst, ignoreCase);
         } catch (error) {
           if (this.skipErrors) continue;
           // die_errno: the index lock is rolled back, the moves made so far stay unrecorded
@@ -525,19 +552,31 @@ export class MvCommand extends GitCommand<MvResult> {
         if (at) sparseAndDirty = await entryModified(worktree, entry, trust, indexTime);
       }
       // rename_index_entry_at: flags kept; refresh_cache_entry takes the new file's stat
-      // only while the content still matches
+      // only while the content still matches (a gitlink's never: ie_match_stat compares its
+      // type and HEAD alone, so its stat data stays as it was)
       let moved: IndexEntry = { ...entry, path: dst };
-      if (!entry.skipWorktree && !entry.assumeValid && !entry.intentToAdd) {
+      if (
+        !entry.skipWorktree &&
+        !entry.assumeValid &&
+        !entry.intentToAdd &&
+        entry.mode !== FileMode.GITLINK
+      ) {
         const file = await lstat(dst);
         if (file && !(await entryModified(worktree, moved, trust, indexTime, true))) {
           moved = { ...moved, ...entryStatOf(file) };
         }
       }
+      let checkout = false;
       if (this.sparse && sparseConfig.enabled && sparseConfig.cone) {
         if (mode & SPARSE && inSparse(dst)) {
-          // from out-of-cone to in-cone: checked out
+          // from out-of-cone to in-cone: checked out (checkout_entry, forced only with -f:
+          // without it a file already there stops the move before the index is written)
           moved = { ...moved, skipWorktree: false };
-          checkouts.push(moved);
+          if (!this.force && (await lstat(dst))) {
+            result.warnings.push(`${dst} already exists, no checkout`);
+            die(`cannot checkout ${dst}`);
+          }
+          checkout = true;
         } else if (dstMode & (SKIP_WORKTREE_DIR | SPARSE) && !(mode & SPARSE) && !inSparse(dst)) {
           // from in-cone to out-of-cone
           if (!sparseAndDirty) {
@@ -549,7 +588,7 @@ export class MvCommand extends GitCommand<MvResult> {
             dirtyPaths.push(dst);
             const slash = dst.lastIndexOf("/");
             if (slash > 0) await worktree.mkdir(dst.slice(0, slash), { recursive: true });
-            await renamePath(worktree, src, dst).catch(() => undefined);
+            await renamePath(worktree, src, dst, ignoreCase).catch(() => undefined);
           }
         }
       }
@@ -562,8 +601,8 @@ export class MvCommand extends GitCommand<MvResult> {
       adder.remove(src);
       adder.put(moved);
       changed = true;
+      if (checkout) await this.checkoutEntries(worktree, [moved], current, trust);
     }
-    if (checkouts.length > 0) await this.checkoutEntries(worktree, checkouts, current, trust);
 
     // remove_empty_src_dirs
     if (!this.dryRun) {
@@ -676,7 +715,14 @@ export class MvCommand extends GitCommand<MvResult> {
     if (!m?.[1]) return SUBMODULE_WITH_GITDIR;
     const target = m[1];
     if (target.startsWith("/")) return target;
-    return normalizePath(`${src}/${target}`) ?? target;
+    // relative to the submodule: as a path from the worktree's top (it may climb out)
+    const out: string[] = [];
+    for (const part of `${src}/${target}`.split("/")) {
+      if (part === "" || part === ".") continue;
+      if (part === ".." && out.length > 0 && out[out.length - 1] !== "..") out.pop();
+      else out.push(part);
+    }
+    return out.join("/") || ".";
   }
 
   /** `is_staging_gitmodules_ok`: `.gitmodules` holds no change the index does not. */
@@ -776,12 +822,24 @@ async function hasSymlinkLeadingPath(worktree: Worktree, path: string): Promise<
 
 /**
  * `rename(2)` through the worktree: a link moves as the link, a directory with everything
- * in it. A worktree without rename copies the file and removes the original.
+ * in it. A worktree without rename copies the file and removes the original. A destination
+ * that is the source itself (a case-only rename where the filesystem folds case, or the
+ * same file under another name) is never removed first: the entry is renamed directly, as
+ * git's `rename` does; a directory moved beneath itself fails (`EINVAL`).
  */
-async function renamePath(worktree: Worktree, src: string, dst: string): Promise<void> {
-  if (!(await worktree.getEntry(src).catch(() => undefined))) {
-    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-  }
+async function renamePath(
+  worktree: Worktree,
+  src: string,
+  dst: string,
+  ignoreCase = false,
+): Promise<void> {
+  const fail = (code: string): never => {
+    throw Object.assign(new Error(code), { code });
+  };
+  const source = await worktree.getEntry(src).catch(() => undefined);
+  if (!source) fail("ENOENT");
+  const fold = (p: string) => (ignoreCase ? p.toLowerCase() : p);
+  if (fold(dst).startsWith(`${fold(src)}/`)) fail("EINVAL");
   // rename(2) creates no leading directory: ENOENT for a missing one, ENOTDIR for a file
   // (a link included) among them
   const slash = dst.lastIndexOf("/");
@@ -789,26 +847,31 @@ async function renamePath(worktree: Worktree, src: string, dst: string): Promise
     const parent = await worktree.getEntry(dst.slice(0, slash)).catch(() => undefined);
     if (!parent) {
       const through = await statThroughLeadingLinks(worktree, `${dst.slice(0, slash)}/x`);
-      const code = through === undefined ? "ENOENT" : "ENOTDIR";
-      throw Object.assign(new Error(code), { code });
-    }
-    if (!parent.isDirectory) throw Object.assign(new Error("ENOTDIR"), { code: "ENOTDIR" });
+      fail(through === undefined ? "ENOENT" : "ENOTDIR");
+    } else if (!parent.isDirectory) fail("ENOTDIR");
   }
   const target = await worktree.getEntry(dst).catch(() => undefined);
-  if (target?.isDirectory) {
-    const source = await worktree.getEntry(src);
-    // rename(2) of a directory over an empty one replaces it; anything else fails
-    if (!source?.isDirectory) throw Object.assign(new Error("EISDIR"), { code: "EISDIR" });
-    if (!(await worktree.remove(dst).catch(() => false))) {
-      throw Object.assign(new Error("ENOTEMPTY"), { code: "ENOTEMPTY" });
+  const sameEntry =
+    target !== undefined &&
+    (fold(src) === fold(dst) ||
+      (source?.ino !== undefined &&
+        source.ino !== 0 &&
+        source.ino === target.ino &&
+        source.dev === target.dev));
+  if (target && !sameEntry) {
+    if (target.isDirectory) {
+      // rename(2) of a directory over an empty one replaces it; anything else fails
+      if (!source?.isDirectory) fail("EISDIR");
+      if (!(await worktree.remove(dst).catch(() => false))) fail("ENOTEMPTY");
+    } else {
+      await worktree.remove(dst);
     }
-  } else if (target) {
-    await worktree.remove(dst);
   }
   if (typeof worktree.rename === "function") {
     await worktree.rename(src, dst);
     return;
   }
+  if (sameEntry) fail("EINVAL");
   const chunks: Uint8Array[] = [];
   for await (const chunk of worktree.readContent(src)) chunks.push(chunk);
   await worktree.writeContent(dst, concat(chunks), { raw: true });

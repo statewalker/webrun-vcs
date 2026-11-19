@@ -694,7 +694,10 @@ export async function writeCommitGraphFile(
       await chmod(files, joinPath(objectsDir, tmp), 0o444);
       if (baseGraphName) {
         const dest = filenamesAfter[numAfter > 1 ? numAfter - 2 : numAfter - 1] as string;
-        if (baseGraphName !== dest) await files.move(baseGraphName, dest);
+        if (baseGraphName !== dest && !(await files.move(baseGraphName, dest))) {
+          // git's "failed to rename base commit-graph file"
+          throw new Error(`failed to rename base commit-graph file ${baseGraphName}`);
+        }
       } else {
         await files.remove(joinPath(objectsDir, COMMIT_GRAPH_FILE));
       }
@@ -750,7 +753,8 @@ export async function writeCommitGraphFile(
       try {
         if (!(await files.copy(path, tmp))) continue;
         await chmod(files, tmp, 0o444);
-        await files.move(tmp, path);
+        // not moved: the copy goes, the mtime only delays the expiry
+        if (!(await files.move(tmp, path))) await files.remove(tmp).catch(() => false);
       } catch {
         // the mtime only delays the expiry
         await files.remove(tmp).catch(() => false);

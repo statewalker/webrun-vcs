@@ -481,6 +481,33 @@ export async function statThroughLeadingLinks(
   }
 }
 
+/**
+ * What `stat(path)` finds: every symbolic link on the way followed, the last component's
+ * included, within the worktree only (a link pointing out of it, or looping, finds nothing).
+ * Undefined when nothing is there.
+ */
+export async function statFollowingLinks(
+  worktree: Worktree,
+  path: string,
+): Promise<WorktreeEntry | undefined> {
+  let current = path;
+  for (let followed = 0; followed <= MAX_LINKS; followed++) {
+    const through = await statThroughLeadingLinks(worktree, current);
+    if (through) {
+      if (through.unknown || !through.entry) return undefined;
+      // a link reached through another one: where it lies is not tracked here
+      return through.entry.mode === FileMode.SYMLINK ? undefined : through.entry;
+    }
+    const entry = await worktree.getEntry(current).catch(() => undefined);
+    if (entry?.mode !== FileMode.SYMLINK) return entry;
+    const resolved = resolveLinkTarget(current, await readLinkTarget(worktree, current));
+    if (resolved === undefined) return undefined;
+    if (resolved === "") return worktree.getEntry("").catch(() => undefined);
+    current = resolved;
+  }
+  return undefined;
+}
+
 async function readLinkTarget(worktree: Worktree, path: string): Promise<string> {
   const chunks: Uint8Array[] = [];
   for await (const chunk of worktree.readContent(path)) chunks.push(chunk);
