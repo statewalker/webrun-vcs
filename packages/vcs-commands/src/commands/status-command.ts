@@ -267,6 +267,8 @@ export class StatusCommand extends GitCommand<Status> {
   }
 
   private async compute(worktree: Worktree | undefined): Promise<Status> {
+    // git's repo_read_index: skip-worktree entries present in the worktree are checked out
+    await this.clearPresentSkipWorktree();
     const head = new Map<string, StatusSide>();
     // directories where HEAD and the index agree (by the cache-tree): their entries are HEAD's
     const sameAsHead = new Set<string>();

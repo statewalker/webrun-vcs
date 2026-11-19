@@ -503,7 +503,15 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
       if (this.keepIndex || items.length > 0) return stashCommit;
     } else if (items.length > 0) {
       // with a pathspec git resets the paths with `add` and `apply --index -R`: no ref moves
-      await this.resetPaths(provider, items, stashCommit, headCommit.tree, indexTree);
+      await this.resetPaths(
+        provider,
+        items,
+        stashCommit,
+        headCommit.tree,
+        indexTree,
+        workingTree,
+        untrackedTree,
+      );
       return stashCommit;
     } else {
       // Reset the index and the working directory, as git stash push does
@@ -542,6 +550,8 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     stashCommit: ObjectId,
     headTree: ObjectId,
     indexTree: ObjectId,
+    workingTree?: ObjectId,
+    untrackedTree?: ObjectId,
   ): Promise<void> {
     const originals = this.pathspecOriginals(items);
     const worktree = this.workingTreeProvider ? undefined : this.worktreeAccess;
@@ -597,6 +607,25 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
         await failAfterAdd(
           exists.map((p) => `error: ${p}: already exists in working directory`).join("\n"),
         );
+      }
+      // `git diff-index --cached HEAD -- <pathspec>` empty after the add: `git apply` of no
+      // patch fails ("No valid patches in input"), the index left as the add wrote it
+      if (workingTree) {
+        const side = new Map<string, string>();
+        const scoped = async (tree: ObjectId, into: Map<string, string>) => {
+          for (const [path, e] of await flattenTree(this.trees, tree)) {
+            if (inScope(path, e.mode === 0o160000 ? DO_MATCH_DIRECTORY : 0))
+              into.set(path, `${e.mode} ${e.id}`);
+          }
+        };
+        await scoped(workingTree, side);
+        if (untrackedTree) await scoped(untrackedTree, side);
+        const headSide = new Map<string, string>();
+        await scoped(headTree, headSide);
+        const same =
+          side.size === headSide.size && [...side].every(([p, v]) => headSide.get(p) === v);
+        if (same)
+          await failAfterAdd('error: No valid patches in input (allow with "--allow-empty")');
       }
     }
     // `git checkout --no-overlay <index tree> -- <pathspec>`: every element must name a path

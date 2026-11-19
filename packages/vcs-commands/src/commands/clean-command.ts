@@ -16,6 +16,7 @@ import {
   pathspecName,
   psEqual,
 } from "./pathspec.js";
+import { strerror } from "./strerror.js";
 import { removeDirectoryIfEmpty } from "./worktree-overwrite-checks.js";
 
 /**
@@ -346,10 +347,15 @@ export class CleanCommand extends GitCommand<CleanResult> {
       // only when empty ("failed to remove" otherwise, the path as remove_dirs holds it)
       if (n.unreadable) {
         if (this.dryRun) return true;
-        const removed = await removeDirectoryIfEmpty(worktree, n.path, options).catch(() => false);
+        // warning_errno: rmdir's reason (a directory that is not empty, or the error's code)
+        let reason = "Directory not empty";
+        const removed = await removeDirectoryIfEmpty(worktree, n.path, options).catch((error) => {
+          reason = strerror(error);
+          return false;
+        });
         if (!removed) {
           const shown = tops.has(n) ? `${n.path}/` : n.path;
-          warnings.push(`warning: failed to remove ${shown}: Directory not empty`);
+          warnings.push(`warning: failed to remove ${shown}: ${reason}`);
         }
         return removed;
       }

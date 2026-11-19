@@ -140,4 +140,26 @@ describe("FileWorktree getEntries without lstatMany: bounded concurrency", () =>
     expect(many.map(plain)).toEqual(one.map(plain));
     expect(many.filter(Boolean)).toHaveLength(400);
   });
+
+  it("stops taking paths once one getEntry fails, and rejects with that error", async () => {
+    const mem = createSymlinkFilesApi(createInMemoryFilesApi());
+    const asked: string[] = [];
+    for (let i = 0; i < 300; i++) {
+      asked.push(`f${i}.txt`);
+      await mem.write(`/f${i}.txt`, [new TextEncoder().encode(`${i}`)]);
+    }
+    const worktree = createFileWorktree({ files: mem, rootPath: "", gitDir: ".git", ...noStores });
+    const seen: string[] = [];
+    const original = worktree.getEntry.bind(worktree);
+    worktree.getEntry = async (path: string) => {
+      seen.push(path);
+      if (path === "f0.txt") throw new Error("EIO: i/o error");
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      return original(path);
+    };
+    await expect(worktree.getEntries?.(asked)).rejects.toThrow("EIO");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // only the first round of workers ran: none took a path after the failure
+    expect(seen.length).toBeLessThanOrEqual(64);
+  });
 });

@@ -233,3 +233,57 @@ describe("GitLinkedWorktrees: review fixes", () => {
     );
   });
 });
+
+describe("GitLinkedWorktrees: directories that cannot be listed or removed", () => {
+  /** `files` whose listing of `unreadable` fails (EACCES) and whose rmdir always fails. */
+  const failing = (files: FilesApi, unreadable: string): FilesApi =>
+    new Proxy(files, {
+      get(target, key, receiver) {
+        if (key === "list" || key === "listKinds") {
+          const original = Reflect.get(target, key, receiver) as (
+            path: string,
+            ...rest: unknown[]
+          ) => AsyncIterable<unknown>;
+          return (path: string, ...rest: unknown[]) => {
+            if (path.replace(/\/+$/, "") !== unreadable)
+              return original.call(target, path, ...rest);
+            return (async function* () {
+              yield* [];
+              throw Object.assign(new Error(`EACCES: permission denied, scandir '${path}'`), {
+                code: "EACCES",
+              });
+            })();
+          };
+        }
+        if (key === "rmdir") {
+          return async () => {
+            throw Object.assign(new Error("EBUSY: resource busy"), { code: "EBUSY" });
+          };
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+
+  it("pathState: a directory that cannot be listed is not empty (git's is_empty_dir)", async () => {
+    const { files, history } = await repository();
+    await files.mkdir("/u");
+    const worktrees = await openGitLinkedWorktrees({
+      files: failing(files, "/u"),
+      gitDir: "/repo/.git",
+      history,
+    });
+    expect(await worktrees.pathState("/u")).toBe("directory");
+  });
+
+  it("deleteAdminRootIfEmpty: a failed removal is ignored (git's delete_worktrees_dir_if_empty)", async () => {
+    const { files, history } = await repository();
+    await files.mkdir("/repo/.git/worktrees");
+    const worktrees = await openGitLinkedWorktrees({
+      files: failing(files, "/repo/.git/worktrees"),
+      gitDir: "/repo/.git",
+      history,
+    });
+    await expect(worktrees.deleteAdminRootIfEmpty()).resolves.toBeUndefined();
+    expect((await files.stats("/repo/.git/worktrees"))?.kind).toBe("directory");
+  });
+});

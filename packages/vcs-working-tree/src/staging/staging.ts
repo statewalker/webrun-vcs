@@ -247,6 +247,15 @@ export interface Staging {
   refreshStats?(updates: IndexStatUpdate[]): Promise<boolean>;
 
   /**
+   * Clears the skip-worktree flag of the stage-0 entries at `paths` as part of reading the
+   * index (git's `clear_skip_worktree_from_present_files` in `repo_read_index`): not an edit
+   * (`hasUnwrittenChanges` stays as it is), the entries kept as read for racy-git smudging,
+   * and the flags written by the next `write()` or `refreshStats()`. Optional: callers
+   * clear the flags through an editor otherwise.
+   */
+  clearSkipWorktree?(paths: ReadonlySet<string>): void;
+
+  /**
    * Sets the check `write()` applies to racily clean entries (git's smudging: an entry whose
    * mtime second is not older than the index file and that changed behind a matching stat is
    * written with size 0). Commands install one that reads the worktree.

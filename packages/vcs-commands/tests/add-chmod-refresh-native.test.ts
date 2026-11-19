@@ -6,7 +6,15 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync } from "node:fs";
+import {
+  chmodSync,
+  lutimesSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseIndexFile } from "@statewalker/vcs-working-tree";
@@ -19,6 +27,15 @@ import { git, gitOk, normalizeState, openOurs, put, snapshot } from "./merge-nat
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
+/** The git version whose messages ours reproduces: the one on PATH. */
+const compatibility = (() => {
+  try {
+    const version = execFileSync("git", ["--version"], { encoding: "utf8" });
+    return /git version 2\.(5\d|[6-9]\d)/.test(version) ? "2.56" : "2.43";
+  } catch {
+    return "2.56";
+  }
+})();
 
 let root: string;
 let counter = 0;
@@ -65,7 +82,7 @@ function dirty(dir: string): string {
 
 /** Our add with git's command-line arguments. */
 async function ourAdd(repo: Git, args: string[]): Promise<AddResult> {
-  const cmd = repo.add();
+  const cmd = repo.add().setCompatibility(compatibility);
   for (const a of args) {
     if (a === "-u") cmd.setUpdate(true);
     else if (a === "-n") cmd.setDryRun(true);
@@ -99,6 +116,10 @@ function base(dir: string) {
   chmodSync(join(dir, "run.sh"), 0o755);
   put(dir, "d/b", "b\n");
   symlinkSync("a", join(dir, "link"));
+  // a minute old: no entry is racily clean in either twin (they are built moments apart)
+  const past = Date.now() / 1000 - 60;
+  for (const p of ["a", "run.sh", "d/b"]) utimesSync(join(dir, p), past, past);
+  lutimesSync(join(dir, "link"), past, past);
   gitOk(root, dir, "add", ".");
   gitOk(root, dir, "commit", "-q", "-m", "c");
 }
@@ -238,9 +259,7 @@ describeGit("git add of paths outside the sparse checkout against native git", (
     gitOk(root, dir, "commit", "-q", "-m", "c");
     gitOk(root, dir, "sparse-checkout", "set", "k");
   };
-  // git 2.43 words the last hint "git config advice...", 2.5x "git config set advice..."
-  const stderrOf = (r: { stderr: string }) =>
-    r.stderr.trim().replace('"git config advice.', '"git config set advice.');
+  const stderrOf = (r: { stderr: string }) => r.stderr.trim();
   const advice = (...elements: string[]) =>
     [
       "The following paths and/or pathspecs matched paths that exist",
@@ -250,7 +269,8 @@ describeGit("git add of paths outside the sparse checkout against native git", (
       "hint: If you intend to update such entries, try one of the following:",
       "hint: * Use the --sparse option.",
       "hint: * Disable or modify the sparsity rules.",
-      'hint: Disable this message with "git config set advice.updateSparsePath false"',
+      // git 2.43 words the last hint "git config advice...", 2.5x "git config set advice..."
+      `hint: Disable this message with "git config${compatibility === "2.43" ? "" : " set"} advice.updateSparsePath false"`,
     ].join("\n");
 
   for (const args of [
@@ -288,5 +308,143 @@ describeGit("git add of paths outside the sparse checkout against native git", (
     expect(r.stderr).not.toContain("hint:");
     const missing = await twinAdd(native, ours, ["s/nope"]);
     expect(missing.error?.message).toBe(stderrOf(missing.r));
+  });
+});
+
+describeGit("skip-worktree entries present in the worktree against native git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "add-sparse-present-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** k/a in the cone; s/b, s/c and s/t/d skip-worktree (their files removed). */
+  const sparse = (dir: string) => {
+    put(dir, "k/a", "a\n");
+    put(dir, "s/b", "b\n");
+    put(dir, "s/c", "c\n");
+    put(dir, "s/t/d", "d\n");
+    gitOk(root, dir, "add", ".");
+    gitOk(root, dir, "commit", "-q", "-m", "c");
+    gitOk(root, dir, "sparse-checkout", "set", "--cone", "k");
+  };
+  /** Each entry's path and skip-worktree flag as the index file holds them (no git read). */
+  const flags = async (dir: string) => {
+    const parsed = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+    return parsed.entries.map((e) => `${e.skipWorktree ? "S" : "H"} ${e.path}`).join("\n");
+  };
+  /** Native `git add <args>` and ours: alike in exit, output and the index file's flags. */
+  const twinAddFlags = async (native: string, ours: string, args: string[]) => {
+    const r = git(root, native, "add", ...args);
+    let result: AddResult | undefined;
+    let error: Error | undefined;
+    try {
+      result = await ourAdd(await openOurs(ours), args);
+    } catch (e) {
+      error = e as Error;
+    }
+    expect(error !== undefined, `ours: ${error?.message} / native: ${r.stderr}`).toBe(
+      r.status !== 0,
+    );
+    // (before git status refreshes and writes either index)
+    const written = await flags(ours);
+    expect(written).toBe(await flags(native));
+    await same(ours, native);
+    return { r, result, error, written };
+  };
+
+  // --refresh asks the skip-worktree flag (cleared: the file is refreshed, exit 0); the others
+  // ask the sparse-checkout patterns as well (the advice, nothing staged, exit 1)
+  for (const [args, status] of [
+    [["--refresh", "s/b"], 0],
+    [["--refresh", "-v", "s/b"], 0],
+    [["s/b"], 1],
+    [["-u", "s/b"], 1],
+    [["s"], 1],
+    [["--chmod=+x", "s/b"], 1],
+  ] as Array<[string[], number]>) {
+    it(`a file recreated outside the cone, same content: add ${args.join(" ")} exits ${status}`, async () => {
+      const { native, ours } = twins(sparse);
+      for (const dir of [native, ours]) put(dir, "s/b", "b\n");
+      const { r, result, error, written } = await twinAddFlags(native, ours, args);
+      expect(r.status).toBe(status);
+      if (status === 0) {
+        expect(result?.output.join("\n") ?? "").toBe(r.stdout.trim());
+        expect(written).toContain("H s/b");
+      } else {
+        expect(error?.message).toBe(r.stderr.trim());
+        // nothing changed: the index is not written, the flag stays on disk
+        expect(written).toContain("S s/b");
+      }
+      expect(written).toContain("S s/c");
+    });
+  }
+
+  it("an untracked file outside the cone: advised on, not added", async () => {
+    const { native, ours } = twins(sparse);
+    for (const dir of [native, ours]) {
+      put(dir, "s/new", "new\n");
+      put(dir, "k/new", "new\n");
+    }
+    const { r, error } = await twinAddFlags(native, ours, ["."]);
+    expect(r.status).toBe(1);
+    expect(error?.message).toBe(r.stderr.trim());
+    expect(gitOk(root, ours, "ls-files", "k/new", "s/new")).toBe("k/new\n");
+  });
+
+  it("recreated with other content: --refresh -v prints M, the index is not written", async () => {
+    const { native, ours } = twins(sparse);
+    for (const dir of [native, ours]) put(dir, "s/b", "changed\n");
+    const { r, result } = await twinAddFlags(native, ours, ["--refresh", "-v", "s/b"]);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("M\ts/b");
+    expect(result?.output.join("\n")).toBe(r.stdout.trim());
+  });
+
+  it("a recreated file in a directory left out: --refresh -v reports it, the rest skipped", async () => {
+    const { native, ours } = twins(sparse);
+    for (const dir of [native, ours]) put(dir, "s/t/d", "new d\n");
+    const { r, result } = await twinAddFlags(native, ours, ["--refresh", "-v", "s"]);
+    expect(r.status).toBe(0);
+    expect(result?.output.join("\n")).toBe(r.stdout.trim());
+  });
+
+  it("non-cone patterns: a file the patterns include is added once recreated", async () => {
+    const { native, ours } = twins((dir) => {
+      put(dir, "k/a", "a\n");
+      put(dir, "s/b", "b\n");
+      put(dir, "s/c", "c\n");
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-q", "-m", "c");
+      gitOk(root, dir, "sparse-checkout", "set", "--no-cone", "/k/");
+      // the patterns now include s/b, its flag (set by the checkout) still on
+      gitOk(root, dir, "config", "core.sparseCheckout", "true");
+      put(dir, ".git/info/sparse-checkout", "/k/\n/s/b\n");
+      put(dir, "s/b", "b changed\n");
+    });
+    const { r, written } = await twinAddFlags(native, ours, ["s/b"]);
+    expect(r.status).toBe(0);
+    expect(written).toContain("H s/b");
+    expect(written).toContain("S s/c");
+  });
+
+  it("sparse.expectFilesOutsideOfPatterns=true keeps the flag: the advice, exit 1", async () => {
+    const { native, ours } = twins((dir) => {
+      sparse(dir);
+      gitOk(root, dir, "config", "sparse.expectFilesOutsideOfPatterns", "true");
+      put(dir, "s/b", "b\n");
+    });
+    const { error, written } = await twinAddFlags(native, ours, ["--refresh", "s/b"]);
+    expect(error).toBeInstanceOf(AddFailedError);
+    expect(written).toContain("S s/b");
+  });
+
+  it("status: the flag cleared and written with the refreshed stat, as git status writes it", async () => {
+    const { native, ours } = twins(sparse);
+    for (const dir of [native, ours]) put(dir, "s/b", "b\n");
+    git(root, native, "status", "--porcelain");
+    const status = await (await openOurs(ours)).status().call();
+    expect(status.isClean()).toBe(true);
+    expect(await flags(ours)).toBe(await flags(native));
+    expect(await flags(ours)).toContain("H s/b");
   });
 });

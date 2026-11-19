@@ -440,7 +440,13 @@ export class FileWorktree implements Worktree {
       const worker = async () => {
         while (next < paths.length) {
           const i = next++;
-          out[i] = await this.getEntry(paths[i] as string);
+          try {
+            out[i] = await this.getEntry(paths[i] as string);
+          } catch (error) {
+            // the first failure rejects the batch: the other workers stop taking paths
+            next = paths.length;
+            throw error;
+          }
         }
       };
       const workers = Math.min(GET_ENTRIES_IN_FLIGHT, paths.length);

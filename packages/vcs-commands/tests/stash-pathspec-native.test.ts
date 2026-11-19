@@ -568,4 +568,44 @@ describeGit("stash push -- <pathspec>: git's reset fails after the stash is save
     expect(nativeError).toBe("fatal: pathspec ':(top,prefix:0)nope' did not match any files");
     expect(ourError).toBe(nativeError);
   });
+
+  const noPatches = 'error: No valid patches in input (allow with "--allow-empty")';
+  for (const variant of [
+    { label: "-u -k", u: true, k: true },
+    { label: "-u", u: true },
+    { label: "-a", a: true },
+    { label: "-a -k", a: true, k: true },
+  ]) {
+    it(`${variant.label}: the add brings the paths back to HEAD, apply -R has no patch`, async () => {
+      const { ours, ourException, nativeError } = await twinStash(
+        `no-patch-${variant.label.replace(/[ -]/g, "")}`,
+        (d) => {
+          run(d, "rm", "-q", "--cached", "c.txt");
+        },
+        { ...variant, paths: ["*.txt"] },
+      );
+      expect(nativeError).toBe(noPatches);
+      expect(ourException).toBeInstanceOf(StashPathspecResetError);
+      expect((ourException as Error).message).toBe(nativeError);
+      // the stash is saved, c.txt re-added and kept (no -k checkout)
+      expect(read(join(ours, "c.txt"))).toBe("1\n2\n3\n4\n5\n6\n7\n8\n9\n");
+      expect(run(ours, "ls-files", "c.txt")).toBe("c.txt");
+      expect(run(ours, "stash", "list")).toContain("stash@{0}");
+    });
+  }
+
+  it("without -u: a staged edit undone in the worktree, add -u restores HEAD's blob", async () => {
+    const { ourException, nativeError } = await twinStash(
+      "no-patch-update",
+      (d) => {
+        put(d, "a.txt", "a staged\n");
+        run(d, "add", "a.txt");
+        put(d, "a.txt", "a\n");
+      },
+      { k: true, paths: ["a.txt"] },
+    );
+    expect(nativeError).toBe(noPatches);
+    expect(ourException).toBeInstanceOf(StashPathspecResetError);
+    expect((ourException as Error).message).toBe(nativeError);
+  });
 });

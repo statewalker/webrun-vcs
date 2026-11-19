@@ -137,13 +137,18 @@ export async function refreshIndexFile(
   fresh: IndexFile,
   inMemory: readonly StagingEntry[],
   updates: readonly IndexStatUpdate[],
+  skipWorktreeCleared?: ReadonlySet<string>,
 ): Promise<StagingEntry[] | undefined> {
   if (updates.length === 0 || current.currentChecksum === undefined) return undefined;
   try {
     const read = await fresh.read();
     if (!read || fresh.currentChecksum !== current.currentChecksum) return undefined;
     const now = Date.now();
-    const entries = applyStatUpdates(read.entries, updates, now);
+    // the flags cleared when the index was read go with the write (as git writes its index)
+    const base =
+      (skipWorktreeCleared && clearSkipWorktreeFlags(read.entries, skipWorktreeCleared)) ||
+      read.entries;
+    const entries = applyStatUpdates(base, updates, now);
     if (!entries) return undefined;
     fresh.version = current.version;
     await fresh.write(entries);
@@ -153,6 +158,29 @@ export async function refreshIndexFile(
     // locked, changed meanwhile, or unreadable: git status gives up on its refresh too
     return undefined;
   }
+}
+
+/**
+ * `entries` with the skip-worktree flag of the stage-0 entries at `paths` cleared (git's
+ * `clear_skip_worktree_from_present_files`); undefined when none had it. `onCleared`
+ * receives each entry replaced and its replacement.
+ */
+export function clearSkipWorktreeFlags(
+  entries: readonly StagingEntry[],
+  paths: ReadonlySet<string>,
+  onCleared?: (before: StagingEntry, after: StagingEntry) => void,
+): StagingEntry[] | undefined {
+  if (paths.size === 0) return undefined;
+  let out: StagingEntry[] | undefined;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i] as StagingEntry;
+    if (!e.skipWorktree || e.stage !== 0 || !paths.has(e.path)) continue;
+    out ??= [...entries];
+    const next = { ...e, skipWorktree: false };
+    out[i] = next;
+    onCleared?.(e, next);
+  }
+  return out;
 }
 
 /**
