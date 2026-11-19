@@ -5,7 +5,7 @@
  * sequencer/) compared; then each side continues, skips or aborts what the other started.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { CherryPickStatus, RevertStatus, SequencerOperation } from "../src/index.js";
 import {
   git,
+  gitOk,
   INTEROP_AUTHOR_ENV,
   INTEROP_IDENT,
   normalizeState,
@@ -267,4 +268,92 @@ describeGit("state files after a pick or merge that ends early, as native git", 
     await (await openOurs(ours, INTEROP_AUTHOR_ENV)).merge().include("side").call();
     same(ours, native);
   });
+});
+
+describeGit("a refused merge's restore over a directory at a tracked file, as native git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "restore-dir-"));
+  });
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** A directory (holding m) where f was, after `prepare`; side changes f. */
+  const setups: [string, (dir: string) => void][] = [
+    [
+      "f staged changed, a directory there",
+      (dir) => {
+        put(dir, "f", "S\n");
+        gitOk(root, dir, "add", "f");
+        rmSync(join(dir, "f"));
+        put(dir, "f/m", "m\n");
+      },
+    ],
+    [
+      "f staged changed, a directory there, another file changed",
+      (dir) => {
+        put(dir, "f", "S\n");
+        gitOk(root, dir, "add", "f");
+        rmSync(join(dir, "f"));
+        put(dir, "f/m", "m\n");
+        put(dir, "k", "k2\n");
+      },
+    ],
+    [
+      "rm --cached f, a directory there",
+      (dir) => {
+        gitOk(root, dir, "rm", "-q", "--cached", "f");
+        rmSync(join(dir, "f"));
+        put(dir, "f/m", "m\n");
+      },
+    ],
+    [
+      "a nested repository with a commit at f",
+      (dir) => {
+        rmSync(join(dir, "f"));
+        put(dir, "f/x", "x\n");
+        gitOk(root, join(dir, "f"), "init", "-q");
+        gitOk(root, join(dir, "f"), "add", "x");
+        gitOk(root, join(dir, "f"), "commit", "-q", "-m", "n");
+      },
+    ],
+    [
+      "f staged changed, a nested repository with a commit at f",
+      (dir) => {
+        put(dir, "f", "S\n");
+        gitOk(root, dir, "add", "f");
+        rmSync(join(dir, "f"));
+        put(dir, "f/x", "x\n");
+        gitOk(root, join(dir, "f"), "init", "-q");
+        gitOk(root, join(dir, "f"), "add", "x");
+        gitOk(root, join(dir, "f"), "commit", "-q", "-m", "n");
+      },
+    ],
+    [
+      "f staged changed, a symlink to a directory at f",
+      (dir) => {
+        put(dir, "f", "S\n");
+        gitOk(root, dir, "add", "f");
+        rmSync(join(dir, "f"));
+        mkdirSync(join(dir, "t"));
+        put(dir, "t/m", "m\n");
+        symlinkSync("t", join(dir, "f"));
+      },
+    ],
+  ];
+  for (const [name, prepare] of setups) {
+    it(`${name}: the reset and stash apply of restore_state`, async () => {
+      const { native, ours } = twins({
+        base: { "a.txt": text(), f: "w\n", k: "k\n" },
+        main: { "a.txt": text({ 1: "main" }) },
+        side: { f: "W2\n" },
+      });
+      for (const dir of [native, ours]) prepare(dir);
+      const expected = git(root, native, "merge", "-q", "side");
+      expect(expected.status).toBe(2);
+      await (await openOurs(ours, INTEROP_AUTHOR_ENV)).merge().include("side").call();
+      same(ours, native);
+      expect(gitOk(root, ours, "stash", "list")).toBe(gitOk(root, native, "stash", "list"));
+    });
+  }
 });

@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { gitOk, openOurs, put } from "./merge-native-helpers.js";
+import { gitOk, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -108,4 +108,83 @@ describeGit("git rm --cached pathspecs against native git", () => {
       .call();
     expect(index(ours)).toBe(index(native));
   });
+});
+
+/**
+ * check_local_mod and the worktree removal: a repository with a, b, c, x, y, d/e/f, z and
+ * w committed, then a and b staged and changed again, c staged, x and y changed, z replaced
+ * by a directory, w deleted, n added with intent to add.
+ */
+function dirtyTwins(): { native: string; ours: string } {
+  const n = counter++;
+  const out = { native: join(root, `n${n}`), ours: join(root, `o${n}`) };
+  for (const dir of [out.native, out.ours]) {
+    gitOk(root, root, "init", "-q", "-b", "main", dir);
+    for (const path of ["a", "b", "c", "x", "y", "d/e/f", "z", "w"]) put(dir, path, `${path}\n`);
+    gitOk(root, dir, "add", ".");
+    gitOk(root, dir, "commit", "-q", "-m", "c");
+    for (const path of ["a", "b", "c"]) put(dir, path, "staged\n");
+    gitOk(root, dir, "add", "a", "b", "c");
+    for (const path of ["a", "b", "x", "y"]) put(dir, path, "changed\n");
+    rmSync(join(dir, "z"));
+    put(dir, "z/inside", "inside\n");
+    rmSync(join(dir, "w"));
+    put(dir, "n", "n\n");
+    gitOk(root, dir, "add", "-N", "n");
+  }
+  return out;
+}
+
+/** The directories of the worktree (empty ones too), outside .git. */
+const dirs = (dir: string) =>
+  execFileSync("find", [".", "-path", "./.git", "-prune", "-o", "-type", "d", "-print"], {
+    cwd: dir,
+    encoding: "utf8",
+  })
+    .split("\n")
+    .sort()
+    .join("\n");
+
+describeGit("git rm refusing to lose content, and its worktree removal, against native git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "rm-local-mod-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  const cases: { args: string[]; cached?: boolean; force?: boolean; hints?: boolean }[] = [
+    { args: ["a"], cached: true },
+    { args: ["a", "b", "c", "x"], cached: true },
+    { args: ["n"], cached: true },
+    { args: ["c", "x", "y"], cached: true },
+    { args: ["a", "b", "c", "x", "y"] },
+    { args: ["c", "x"] },
+    { args: ["c", "x", "a"], hints: false },
+    { args: ["n"] },
+    { args: ["d/e/f"] },
+    { args: ["w", "d/e/f"] },
+    { args: ["z"] },
+    { args: ["z", "d/e/f"] },
+    { args: ["d/e/f", "z"] },
+    { args: ["a", "b", "c", "x", "y", "n"], force: true },
+  ];
+  for (const { args, cached = false, force = false, hints = true } of cases) {
+    const flags = [...(cached ? ["--cached"] : []), ...(force ? ["-f"] : [])];
+    it(`rm ${hints ? "" : "(advice.rmHints off) "}${[...flags, ...args].join(" ")}`, async () => {
+      const { native, ours } = dirtyTwins();
+      if (!hints)
+        for (const dir of [native, ours]) gitOk(root, dir, "config", "advice.rmHints", "false");
+      const r = run(native, ["rm", "-q", ...flags, "--", ...args]);
+      const cmd = (await openOurs(ours)).rm().setCached(cached).setForce(force);
+      for (const p of args) cmd.addFilepattern(p);
+      let error = "";
+      try {
+        await cmd.call();
+      } catch (e) {
+        error = (e as Error).message;
+      }
+      expect(error).toBe(r.stderr.trim());
+      expect(snapshot(root, ours)).toEqual(snapshot(root, native));
+      expect(dirs(ours)).toBe(dirs(native));
+    });
+  }
 });

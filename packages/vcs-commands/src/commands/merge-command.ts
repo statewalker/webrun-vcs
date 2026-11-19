@@ -10,7 +10,6 @@ import {
   type IndexEntryOptions,
   invalidateCacheTreePath,
   type Worktree,
-  type WorktreeEntry,
 } from "@statewalker/vcs-working-tree";
 import { InvalidArgumentError } from "../errors/command-errors.js";
 import {
@@ -59,6 +58,7 @@ import {
   applyAutostash,
   cleanupMessage,
   createAutostash,
+  removeMergeBranchState,
   resetMerge,
   saveAutostash,
   squashMessage,
@@ -79,6 +79,11 @@ export enum MergeOperation {
   ABORT = "abort",
   /** Commit the resolved merge in progress (`git merge --continue`) */
   CONTINUE = "continue",
+  /**
+   * Forget the merge in progress, leaving the index and the worktree as they are
+   * (`git merge --quit`); its autostash is kept on `refs/stash`.
+   */
+  QUIT = "quit",
 }
 
 /** git's refusal of a merge of histories with no common commit. */
@@ -359,6 +364,14 @@ export class MergeCommand extends GitCommand<MergeResult> {
     const state = new OperationState(this.workingCopy.checkout, this.refsStore);
     if (this.operation === MergeOperation.ABORT) return this.abort(state, worktree);
     if (this.operation === MergeOperation.CONTINUE) return this.continueMerge(state);
+    if (this.operation === MergeOperation.QUIT) {
+      // git's `merge --quit`: remove_merge_branch_state, nothing else touched
+      return {
+        status: MergeStatus.ABORTED,
+        mergedCommits: [],
+        output: await removeMergeBranchState(this.context(worktree), state),
+      };
+    }
 
     // Validate parameters
     if (this.includes.length === 0) {
@@ -422,12 +435,14 @@ export class MergeCommand extends GitCommand<MergeResult> {
       const remotes = independent.filter((c) => c.id !== headId);
       if (remotes.length === 0) {
         await state.setRef("ORIG_HEAD", headId);
-        await removeMergeBranchState(state);
         return {
           status: MergeStatus.ALREADY_UP_TO_DATE,
           newHead: headId,
           mergedCommits: named.map((n) => n.id),
-          output: [this.squash ? "Already up to date. (nothing to squash)" : "Already up to date."],
+          output: [
+            this.squash ? "Already up to date. (nothing to squash)" : "Already up to date.",
+            ...(await removeMergeBranchState(this.context(worktree), state)),
+          ],
         };
       }
       if (remotes.length > 1) {
@@ -461,12 +476,15 @@ export class MergeCommand extends GitCommand<MergeResult> {
     // Check if already up to date (src is ancestor of HEAD)
     if (await this.isAncestor(srcId, headId)) {
       // finish_up_to_date: remove_merge_branch_state (an AUTO_MERGE left behind goes)
-      await removeMergeBranchState(state);
       return {
         status: MergeStatus.ALREADY_UP_TO_DATE,
         newHead: headId,
         mergedCommits: [srcId],
-        output: [this.squash ? "Already up to date. (nothing to squash)" : "Already up to date."],
+        output: [
+          this.squash ? "Already up to date. (nothing to squash)" : "Already up to date.",
+          // and a MERGE_AUTOSTASH left by a stopped merge is kept on refs/stash
+          ...(await removeMergeBranchState(this.context(worktree), state)),
+        ],
       };
     }
 
@@ -1136,46 +1154,59 @@ export class MergeCommand extends GitCommand<MergeResult> {
     };
     const symlinks = worktreeModeTrust(this.workingCopy, worktree).symlinks;
     const restaged = new Map<string, IndexEntryOptions[]>();
-    // the unchanged files, stat'ed in one batch: a tracked file replaced by a directory,
-    // which stash create passed over, is written by the reset --hard over the directory and
-    // what is in it, as git's is
-    const unchanged = [...saved]
-      .filter(([path, entry]) => {
-        const before = head.get(path);
-        return (
-          entry.mode !== FileMode.GITLINK &&
-          before?.objectId === entry.objectId &&
-          before.mode === entry.mode
-        );
-      })
+    // the reset --hard (read-tree --reset -u, untracked files overwritten): checkout_entry
+    // finds a directory (never a symlink to one) at each of HEAD's files and removes it with
+    // everything in it, a nested repository too (remove_subtree), before the file is written;
+    // stash create passed such a path over, or saved the index's content for it. HEAD's
+    // files are stat'ed in one batch. Outside the sparse patterns the reset unlinks instead,
+    // which fails on the directory with git's warning, and the path is left alone.
+    const headFiles = [...head]
+      .filter(([, entry]) => entry.mode !== FileMode.GITLINK)
       .map(([path]) => path);
-    const unchangedStats = new Map<string, WorktreeEntry | undefined>();
-    const stated = await getWorktreeEntries(worktree, unchanged);
-    for (let i = 0; i < unchanged.length; i++) {
-      unchangedStats.set(unchanged[i] as string, stated[i]);
+    const headStats = await getWorktreeEntries(worktree, headFiles);
+    const replaced = new Set<string>();
+    const blocked = new Set<string>();
+    for (let i = 0; i < headFiles.length; i++) {
+      const path = headFiles[i] as string;
+      const current = headStats[i];
+      if (!current?.isDirectory || current.mode === FileMode.SYMLINK) continue;
+      if (patterns && !patterns.includes(path)) {
+        warnings += `warning: unable to unlink '${path}': Is a directory\n`;
+        blocked.add(path);
+        continue;
+      }
+      await worktree.remove(path, { recursive: true });
+      replaced.add(path);
     }
     for (const [path, entry] of saved) {
-      if (entry.mode === FileMode.GITLINK) continue;
-      if (unchangedStats.has(path)) {
-        const current = unchangedStats.get(path);
-        if (!current?.isDirectory || current.mode === FileMode.SYMLINK) continue;
-        if (patterns && !patterns.includes(path)) {
-          warnings += `warning: unable to unlink '${path}': Is a directory\n`;
-          continue;
-        }
-        await worktree.remove(path, { recursive: true });
+      if (entry.mode === FileMode.GITLINK || blocked.has(path)) continue;
+      // `stash apply` writes what changed; the reset wrote HEAD's content where it replaced
+      // a directory
+      const before = head.get(path);
+      if (
+        before?.objectId === entry.objectId &&
+        before.mode === entry.mode &&
+        !replaced.has(path)
+      ) {
+        continue;
       }
       const content = await this.blobs.load(entry.objectId);
       if (!content) continue;
       const mode =
         entry.mode === FileMode.SYMLINK && !symlinks ? FileMode.REGULAR_FILE : entry.mode;
-      await worktree.writeContent(path, content, {
-        mode,
-        ...(mode !== entry.mode ? { raw: true } : {}),
-        createParents: true,
-        replaceInTheWay: true,
-        attributes,
-      });
+      try {
+        await worktree.writeContent(path, content, {
+          mode,
+          ...(mode !== entry.mode ? { raw: true } : {}),
+          createParents: true,
+          replaceInTheWay: true,
+          attributes,
+        });
+      } catch (error) {
+        // checkout_entry's error: the file is not written, the rest goes on
+        warnings += `error: unable to create file ${path}: ${(error as Error).message}\n`;
+        continue;
+      }
       // `stash apply --index` stages again what was staged: the index entry takes the stat
       // of the file just written where the file holds its blob
       const staged = index.get(path);
@@ -1427,14 +1458,4 @@ export function favorOf(
     default:
       return undefined;
   }
-}
-
-/**
- * git's `remove_merge_branch_state` (an "Already up to date." merge): MERGE_HEAD, MERGE_RR,
- * MERGE_MSG, MERGE_MODE and AUTO_MERGE go.
- */
-async function removeMergeBranchState(state: OperationState): Promise<void> {
-  if (!state.supported) return;
-  await state.removeRef("MERGE_HEAD", "AUTO_MERGE");
-  await state.remove("MERGE_RR", "MERGE_MSG", "MERGE_MODE");
 }

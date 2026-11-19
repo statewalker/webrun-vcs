@@ -835,6 +835,23 @@ async function switchTreesWith(
     };
   }
 
+  // record_conflicted_index_entries checks out a conflict's stage-0 entry left skip-worktree
+  // (the switch kept it: the trees agree on it, or the index holds the target's already):
+  // its file is written whatever the patterns say, as checkout_entry with force writes it
+  let planTarget = target;
+  if (worktree && sparse) {
+    for (const conflict of options.conflicts ?? []) {
+      const path = conflict.stagePath;
+      const i = index.get(path) as IndexEntryInput | undefined;
+      if (!i?.skipWorktree || writing.has(path) || removes.includes(path)) continue;
+      const t = target.get(path);
+      if (t ? !sameEntry(i, t) : head.has(path)) continue;
+      if (planTarget === target) planTarget = new Map(target);
+      planTarget.set(path, i);
+      writing.add(path);
+    }
+  }
+
   // the worktree: deletions first (a deleted file `d` makes way for `d/x`), then the files
   if (worktree) {
     if (sparse) {
@@ -857,8 +874,8 @@ async function switchTreesWith(
       // only the written paths are planned (each validated, its blob checked)
       const plan = await planPathsRestore(
         ctx,
-        target,
-        options.targetTree,
+        planTarget,
+        planTarget === target ? options.targetTree : undefined,
         writing,
         options.operation,
       );

@@ -1,8 +1,14 @@
-import { FileMode } from "@statewalker/vcs-core";
-import type { IndexEntry } from "@statewalker/vcs-working-tree";
+import { FileMode, type ObjectId, type TreeEntry } from "@statewalker/vcs-core";
+import {
+  compareWithWorktree,
+  type IndexEntry,
+  type Worktree,
+  withWorktreeEntries,
+} from "@statewalker/vcs-working-tree";
 
 import { NoFilepatternError, RmFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { worktreeModeTrust } from "./core-config.js";
 import { configBool } from "./merge-config.js";
 import {
   DO_MATCH_DIRECTORY,
@@ -11,6 +17,7 @@ import {
   parsePathspec,
 } from "./pathspec.js";
 import { sparsePathAdvice } from "./sparse-checkout-support.js";
+import { pruneEmptyParents, removeDirectoryIfEmpty } from "./worktree-overwrite-checks.js";
 
 /**
  * Result of RmCommand execution.
@@ -53,6 +60,7 @@ export class RmCommand extends GitCommand<RmResult> {
   private sparse = false;
   private recursive = false;
   private ignoreUnmatch = false;
+  private force = false;
   private compatibility: "2.43" | "2.56" = "2.56";
 
   /**
@@ -88,6 +96,19 @@ export class RmCommand extends GitCommand<RmResult> {
   }
 
   /**
+   * `-f`: remove entries whatever they hold. Without it git's `check_local_mod` refuses,
+   * before anything changes ({@link RmFailedError}), an entry whose staged content differs
+   * from both its file and HEAD (with `--cached` too, unless it is intent-to-add), and,
+   * without `--cached`, one whose staged content differs from HEAD or whose file differs
+   * from the index.
+   */
+  setForce(force: boolean): this {
+    this.checkCallable();
+    this.force = force;
+    return this;
+  }
+
+  /**
    * The git version whose behaviour is reproduced where versions differ (default 2.56): the
    * advice's last hint, as `AddCommand.setCompatibility`, and 2.43's pathspec matching, where
    * an element that named an entry exactly matches no later entry (`rm 'b*'` with an entry
@@ -114,7 +135,9 @@ export class RmCommand extends GitCommand<RmResult> {
    * Set whether to only remove from index (keep in working tree).
    *
    * When true, files are only removed from the staging area
-   * but remain in the working directory (like `git rm --cached`).
+   * but remain in the working directory (like `git rm --cached`). Otherwise the files of
+   * the removed entries are deleted too and the directories they leave empty pruned (git's
+   * `remove_path`); a populated submodule's directory is left as it is.
    *
    * @param cached true to only remove from index
    */
@@ -149,6 +172,7 @@ export class RmCommand extends GitCommand<RmResult> {
     }
 
     const removedPaths: string[] = [];
+    const removedEntries: IndexEntry[] = [];
     // (the index as readCurrentIndex left it: reading it again would bring back the
     // skip-worktree flags cleared for files present in a sparse checkout)
 
@@ -178,6 +202,7 @@ export class RmCommand extends GitCommand<RmResult> {
       }
       if (matchPathspecSeen(items, entry.path, flags, seen, exactStopsGlobs)) {
         removedPaths.push(entry.path);
+        removedEntries.push(entry);
       } else {
         entriesToKeep.push(entry);
       }
@@ -221,6 +246,31 @@ export class RmCommand extends GitCommand<RmResult> {
     // nothing matched at all (every element passed over by --ignore-unmatch)
     if (!matched) return { removedPaths: [] };
 
+    // check_local_mod: unless forced, nothing is removed that the index alone holds
+    const worktree = this.worktreeAccess;
+    if (!this.force) {
+      const refusal = await this.checkLocalMod(removedEntries, worktree);
+      if (refusal) throw new RmFailedError(refusal, [], { removedPaths: [] });
+    }
+
+    // the files first (git commits the index only once they are gone): the first that cannot
+    // be removed dies before anything changes, a later one is passed over
+    if (!this.cached && worktree) {
+      let removed = false;
+      const done = new Set<string>();
+      for (const entry of removedEntries) {
+        if (done.has(entry.path)) continue;
+        done.add(entry.path);
+        const ok = await removeWorktreePath(worktree, entry);
+        if (ok) removed = true;
+        else if (!removed) {
+          throw new RmFailedError(`fatal: git rm: '${entry.path}': Is a directory`, [], {
+            removedPaths: [],
+          });
+        }
+      }
+    }
+
     // Rebuild staging with entries that weren't removed
     const builder = this.staging.createBuilder();
     for (const entry of entriesToKeep) {
@@ -229,13 +279,138 @@ export class RmCommand extends GitCommand<RmResult> {
     await builder.finish();
     await this.staging.write();
 
-    // Note: Working tree removal is not implemented here since
-    // WorkingCopy may not have worktree access for file deletion.
-    // The cached flag controls whether working tree should be modified,
-    // but actual deletion requires filesystem access which is
-    // implementation-specific.
-
     if (sparsePaths.length > 0) throw advise();
     return { removedPaths };
   }
+
+  /**
+   * git's `check_local_mod`: the entries whose removal would lose content, as git's error
+   * lines (singular or plural, each list with its hint unless `advice.rmHints` is off), or
+   * undefined. An unmerged entry, a file gone from the worktree or a directory standing at
+   * a file is passed over; a submodule is checked against its index entry only.
+   */
+  private async checkLocalMod(
+    entries: readonly IndexEntry[],
+    worktree: Worktree | undefined,
+  ): Promise<string | undefined> {
+    const headTree = await this.headTree();
+    const staged: string[] = [];
+    const cached: string[] = [];
+    const local: string[] = [];
+    // an unmerged path is passed over (its submodule's history is not looked at)
+    const candidates = entries.filter((e) => e.stage === 0);
+    const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
+    const indexTime = this.staging.getUpdateTime();
+    const lookup = treeLookup(this.trees);
+    const stated = worktree
+      ? withWorktreeEntries(worktree, candidates)
+      : candidates.map((item) => ({ item, current: null }));
+    for await (const { item: entry, current } of stated) {
+      // it already vanished from the working tree (or a directory is there instead)
+      if (!worktree || !current) continue;
+      if (current.isDirectory && entry.mode !== FileMode.GITLINK) continue;
+      // ie_match_stat: skip-worktree and assume-unchanged entries match by definition, an
+      // intent-to-add one never does
+      let localChanges = false;
+      if (entry.intentToAdd) localChanges = true;
+      else if (!entry.skipWorktree && !entry.assumeValid) {
+        const compared = await compareWithWorktree(worktree, entry, { trust, indexTime }, current);
+        localChanges = compared.kind !== undefined;
+      }
+      const inHead = headTree ? await lookup(headTree, entry.path) : undefined;
+      const stagedChanges = !inHead || inHead.mode !== entry.mode || inHead.id !== entry.objectId;
+      if (localChanges && stagedChanges) {
+        if (!this.cached || !entry.intentToAdd) staged.push(entry.path);
+      } else if (!this.cached) {
+        if (stagedChanges) cached.push(entry.path);
+        if (localChanges) local.push(entry.path);
+      }
+    }
+    const hints = configBool(this.workingCopy, "advice.rmHints", true);
+    const lines: string[] = [];
+    const report = (files: string[], one: string, many: string, hint: string) => {
+      if (files.length === 0) return;
+      let message = `error: ${files.length === 1 ? one : many}`;
+      for (const file of files) message += `\n    ${file}`;
+      if (hints) message += `\n${hint}`;
+      lines.push(message);
+    };
+    report(
+      staged,
+      "the following file has staged content different from both the\nfile and the HEAD:",
+      "the following files have staged content different from both the\nfile and the HEAD:",
+      "(use -f to force removal)",
+    );
+    const keep = "(use --cached to keep the file, or -f to force removal)";
+    report(
+      cached,
+      "the following file has changes staged in the index:",
+      "the following files have changes staged in the index:",
+      keep,
+    );
+    report(
+      local,
+      "the following file has local modifications:",
+      "the following files have local modifications:",
+      keep,
+    );
+    return lines.length > 0 ? lines.join("\n") : undefined;
+  }
+
+  /** HEAD's tree; undefined before the first commit (everything staged counts as changed). */
+  private async headTree(): Promise<ObjectId | undefined> {
+    const head = await this.refsStore.resolve("HEAD");
+    if (!head?.objectId) return undefined;
+    return this.commits.getTree(head.objectId);
+  }
+}
+
+/**
+ * The entry at `path` in a tree (git's `get_tree_entry`), each directory read once.
+ */
+function treeLookup(trees: {
+  getEntry(treeId: ObjectId, name: string): Promise<TreeEntry | undefined>;
+}): (treeId: ObjectId, path: string) => Promise<TreeEntry | undefined> {
+  const dirs = new Map<string, Promise<TreeEntry | undefined>>();
+  const at = (treeId: ObjectId, dir: string, name: string) => {
+    const key = `${treeId}\0${dir}\0${name}`;
+    let found = dirs.get(key);
+    if (!found) {
+      found = trees.getEntry(treeId, name);
+      dirs.set(key, found);
+    }
+    return found;
+  };
+  return async (treeId, path) => {
+    const parts = path.split("/");
+    let id = treeId;
+    let entry: TreeEntry | undefined;
+    for (let k = 0; k < parts.length; k++) {
+      entry = await at(id, parts.slice(0, k).join("/"), parts[k] ?? "");
+      if (!entry) return undefined;
+      if (k < parts.length - 1) {
+        if (entry.mode !== FileMode.TREE) return undefined;
+        id = entry.id;
+      }
+    }
+    return entry;
+  };
+}
+
+/**
+ * git's `remove_path` for a removed entry: its file unlinked (one already gone is no error),
+ * then each parent directory left empty removed, bottom-up. A directory standing at a file
+ * cannot be unlinked (false: git's EISDIR). A submodule's directory goes only when empty
+ * (git's `remove_dir_recursively` of a populated one is not reproduced: it stays).
+ */
+async function removeWorktreePath(worktree: Worktree, entry: IndexEntry): Promise<boolean> {
+  const current = await worktree.getEntry(entry.path);
+  if (current?.isDirectory) {
+    if (entry.mode !== FileMode.GITLINK) return false;
+    if (!(await removeDirectoryIfEmpty(worktree, entry.path))) return true;
+  } else if (current) {
+    await worktree.remove(entry.path);
+  }
+  await pruneEmptyParents(worktree, entry.path);
+  return true;
 }

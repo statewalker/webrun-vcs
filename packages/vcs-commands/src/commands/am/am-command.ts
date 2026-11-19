@@ -960,7 +960,12 @@ export class AmCommand extends GitCommand<AmResult> {
         this.fatal("failed to clean index");
       }
     }
-    await removeBranchState({ commits: this.commits, refs: this.refsStore }, this.state());
+    for (const line of await removeBranchState(
+      { commits: this.commits, refs: this.refsStore },
+      this.state(),
+    )) {
+      this.err += `${line}\n`;
+    }
   }
 
   private sequencerContext() {

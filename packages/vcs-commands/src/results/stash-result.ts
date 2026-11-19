@@ -57,4 +57,10 @@ export interface StashApplyResult {
 
   /** List of conflicting paths */
   readonly conflicts?: string[];
+
+  /**
+   * What the apply printed on stderr while applying the sparse checkout's patterns, line
+   * by line; absent when there was nothing to say.
+   */
+  readonly warnings?: string[];
 }

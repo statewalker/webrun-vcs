@@ -981,3 +981,140 @@ describeGit(
     }
   },
 );
+
+describeGit(
+  "sparse conflicts that write or unlink outside the patterns, against native git",
+  () => {
+    beforeAll(() => {
+      root = mkdtempSync(join(tmpdir(), "sparse-conflict-more-"));
+    });
+    afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+    /** k/a, s/c and s/d on base; `other` and main change s/c as `change` says. */
+    const history =
+      (other: (dir: string) => void, main: (dir: string) => void) => (dir: string) => {
+        put(dir, "k/a", "a\n");
+        put(dir, "s/c", "c\n1\n");
+        put(dir, "s/d", "d\n");
+        gitOk(root, dir, "add", ".");
+        gitOk(root, dir, "commit", "-q", "-m", "base");
+        gitOk(root, dir, "checkout", "-q", "-b", "other");
+        other(dir);
+        gitOk(root, dir, "commit", "-qam", "o");
+        gitOk(root, dir, "checkout", "-q", "main");
+        main(dir);
+        gitOk(root, dir, "commit", "-qam", "m");
+      };
+
+    it("rebase: a modify/delete conflict writes the skip-worktree side (record_conflicted_index_entries)", async () => {
+      const { native, ours } = twins((dir) => {
+        history(
+          (d) => put(d, "s/c", "OTHER\n1\n"),
+          (d) => gitOk(root, d, "rm", "-q", "s/c"),
+        )(dir);
+        gitOk(root, dir, "checkout", "-q", "other");
+        gitOk(root, dir, "sparse-checkout", "set", "k");
+      });
+      expect(run(native, ["rebase", "main"]).status).toBe(1);
+      const command = (await openOurs(ours, INTEROP_AUTHOR_ENV))
+        .rebase()
+        .setCommitter(INTEROP_IDENT);
+      await command.setUpstreamBranch("main");
+      await command.call();
+      expect(readFileSync(join(native, "s/c"), "utf8")).toBe("OTHER\n1\n");
+      expect(rawState(ours)).toEqual(rawState(native));
+    });
+
+    it("rebase: a skip-worktree entry its pick deletes is written as the conflict's side", async () => {
+      const { native, ours } = twins((dir) => {
+        history(
+          (d) => put(d, "s/c", "OTHER\n1\n"),
+          (d) => gitOk(root, d, "rm", "-q", "s/c"),
+        )(dir);
+        gitOk(root, dir, "sparse-checkout", "set", "k");
+      });
+      expect(run(native, ["rebase", "other"]).status).toBe(1);
+      const command = (await openOurs(ours, INTEROP_AUTHOR_ENV))
+        .rebase()
+        .setCommitter(INTEROP_IDENT);
+      await command.setUpstreamBranch("other");
+      await command.call();
+      expect(readFileSync(join(native, "s/c"), "utf8")).toBe("OTHER\n1\n");
+      expect(rawState(ours)).toEqual(rawState(native));
+    });
+
+    it("merge: a delete on their side of an unchanged checkout unlinks what leaves", async () => {
+      const { native, ours } = twins((dir) => {
+        history(
+          (d) => gitOk(root, d, "rm", "-q", "s/c"),
+          (d) => put(d, "s/c", "MAIN\n1\n"),
+        )(dir);
+        gitOk(root, dir, "sparse-checkout", "set", "k", "s");
+        put(dir, ".git/info/sparse-checkout", "/*\n!/*/\n/k/\n");
+      });
+      expect(run(native, ["merge", "-q", "other"]).status).toBe(1);
+      await (await openOurs(ours, INTEROP_AUTHOR_ENV)).merge().include("other").call();
+      expect(existsSync(join(native, "s/d"))).toBe(false);
+      expect(rawState(ours)).toEqual(rawState(native));
+    });
+
+    for (const changeD of [false, true]) {
+      it(`merge: a delete on their side of a skip-worktree entry${changeD ? ", s/d changed" : ""}`, async () => {
+        const { native, ours } = twins((dir) => {
+          history(
+            (d) => gitOk(root, d, "rm", "-q", "s/c"),
+            (d) => {
+              put(d, "s/c", "MAIN\n1\n");
+              if (changeD) put(d, "s/d", "d2\n");
+            },
+          )(dir);
+          gitOk(root, dir, "sparse-checkout", "set", "k");
+        });
+        expect(run(native, ["merge", "-q", "other"]).status).toBe(1);
+        await (await openOurs(ours, INTEROP_AUTHOR_ENV)).merge().include("other").call();
+        expect(rawState(ours)).toEqual(rawState(native));
+      });
+    }
+
+    it("stash apply: a conflicted and a clean path leaving the patterns are unlinked", async () => {
+      const { native, ours } = twins((dir) => {
+        history(
+          (d) => put(d, "s/c", "OTHER\n1\n"),
+          (d) => put(d, "s/c", "MAIN\n1\n"),
+        )(dir);
+        gitOk(root, dir, "sparse-checkout", "set", "k", "s");
+        put(dir, "s/c", "STASH\n1\n");
+        put(dir, "s/d", "D2\n");
+        gitOk(root, dir, "stash", "-q");
+        gitOk(root, dir, "checkout", "-q", "other");
+        put(dir, ".git/info/sparse-checkout", "/*\n!/*/\n/k/\n");
+      });
+      expect(run(native, ["stash", "apply"]).status).toBe(1);
+      try {
+        await (await openOurs(ours)).stashApply().call();
+      } catch {
+        // the conflict
+      }
+      expect(existsSync(join(native, "s/c"))).toBe(false);
+      expect(rawState(ours)).toEqual(rawState(native));
+    });
+
+    it("merge: a delete on their side unlinks the conflicted and the clean path leaving", async () => {
+      const { native, ours } = twins((dir) => {
+        history(
+          (d) => gitOk(root, d, "rm", "-q", "s/c"),
+          (d) => {
+            put(d, "s/c", "MAIN\n1\n");
+            put(d, "s/d", "d2\n");
+          },
+        )(dir);
+        gitOk(root, dir, "sparse-checkout", "set", "k", "s");
+        put(dir, ".git/info/sparse-checkout", "/*\n!/*/\n/k/\n");
+      });
+      expect(run(native, ["merge", "-q", "other"]).status).toBe(1);
+      await (await openOurs(ours, INTEROP_AUTHOR_ENV)).merge().include("other").call();
+      expect(existsSync(join(native, "s/d"))).toBe(false);
+      expect(rawState(ours)).toEqual(rawState(native));
+    });
+  },
+);

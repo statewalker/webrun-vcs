@@ -107,8 +107,9 @@ export class ResetCommand extends GitCommand<Ref> {
   /**
    * What the reset printed on stderr while applying the sparse checkout's patterns, line by
    * line: the patterns' warnings, and git's `error: Path '<p>' not uptodate; will not remove
-   * from working tree.` for a changed file left outside them (`--merge`, `--keep`). Read after
-   * {@link call}.
+   * from working tree.` for a changed file left outside them (`--merge`, `--keep`), and
+   * "Autostash exists; creating a new stash entry." with its lines when a stopped merge's
+   * autostash is kept on `refs/stash`. Read after {@link call}.
    */
   getWarnings(): string[] {
     return [...this.warnings];
@@ -269,7 +270,10 @@ export class ResetCommand extends GitCommand<Ref> {
     }
 
     // git's remove_branch_state: a merge, cherry-pick or revert in progress is forgotten
-    await removeBranchState({ commits: this.commits, refs: this.refsStore }, state);
+    // (a merge's autostash kept on refs/stash, git's lines printed)
+    this.warnings.push(
+      ...(await removeBranchState({ commits: this.commits, refs: this.refsStore }, state)),
+    );
 
     // Return the updated HEAD ref
     const headRef = await this.refsStore.resolve("HEAD");

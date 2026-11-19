@@ -472,16 +472,39 @@ async function resetKeepWith(
 export async function removeBranchState(
   ctx: Pick<SequencerContext, "commits" | "refs">,
   state: OperationState,
-): Promise<void> {
-  if (!state.supported) return;
-  await state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD", "AUTO_MERGE", "MERGE_HEAD");
-  await state.remove("SQUASH_MSG", "MERGE_RR", "MERGE_MSG", "MERGE_MODE");
-  const autostash = (await state.read("MERGE_AUTOSTASH"))?.trim();
-  if (autostash) {
-    await state.remove("MERGE_AUTOSTASH");
-    await saveAutostash(ctx, autostash);
-  }
+): Promise<string[]> {
+  if (!state.supported) return [];
+  await state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD");
+  await state.remove("SQUASH_MSG");
+  return removeMergeBranchState(ctx, state);
 }
+
+/**
+ * git's `remove_merge_branch_state` (an "Already up to date." merge, `merge --quit`, and
+ * through remove_branch_state a reset or a branch switch): MERGE_HEAD, MERGE_RR, MERGE_MSG,
+ * MERGE_MODE and AUTO_MERGE go, a MERGE_AUTOSTASH is kept on `refs/stash`
+ * (`save_autostash_ref`). Returns the lines git prints on stderr for a kept autostash.
+ */
+export async function removeMergeBranchState(
+  ctx: Pick<SequencerContext, "commits" | "refs">,
+  state: OperationState,
+): Promise<string[]> {
+  if (!state.supported) return [];
+  await state.removeRef("MERGE_HEAD", "AUTO_MERGE");
+  await state.remove("MERGE_RR", "MERGE_MSG", "MERGE_MODE");
+  const autostash = (await state.read("MERGE_AUTOSTASH"))?.trim();
+  if (!autostash) return [];
+  await saveAutostash(ctx, autostash);
+  await state.remove("MERGE_AUTOSTASH");
+  return [...AUTOSTASH_SAVED_LINES];
+}
+
+/** What git's `apply_save_autostash_oid` prints when it stores an autostash it does not apply. */
+export const AUTOSTASH_SAVED_LINES: readonly string[] = [
+  "Autostash exists; creating a new stash entry.",
+  "Your changes are safe in the stash.",
+  'You can run "git stash pop" or "git stash drop" at any time.',
+];
 
 /** Byte order of paths, as git sorts the index. */
 function compareBytes(a: string, b: string): number {

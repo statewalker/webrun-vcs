@@ -169,7 +169,9 @@ export interface CheckoutResult {
   /**
    * What a branch switch printed on stderr while applying the sparse checkout's patterns,
    * line by line (the patterns' warnings, git's "The following paths are not up to date and
-   * were left despite sparse patterns:" block); absent when there was nothing to say.
+   * were left despite sparse patterns:" block), and git's "Autostash exists; creating a new
+   * stash entry." lines when a stopped merge's autostash is kept on `refs/stash`; absent when
+   * there was nothing to say.
    */
   readonly warnings?: string[];
 }
@@ -1184,9 +1186,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       await this.refsStore.setSymbolic("HEAD", `refs/heads/${switchTo.branch}`, log);
     }
     // git's remove_branch_state: a merge, cherry-pick or revert stopped here is forgotten
-    await removeBranchState(
-      { commits: this.commits, refs: this.refsStore },
-      new OperationState(this.workingCopy.checkout, this.refsStore),
+    // (a merge's autostash kept on refs/stash, git's lines printed)
+    sparseWarnings.push(
+      ...(await removeBranchState(
+        { commits: this.commits, refs: this.refsStore },
+        new OperationState(this.workingCopy.checkout, this.refsStore),
+      )),
     );
 
     // conditional includes on the branch (includeIf.onbranch:) follow the new HEAD
