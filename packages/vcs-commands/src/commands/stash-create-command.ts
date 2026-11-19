@@ -342,7 +342,9 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
 
     // Reset the index and the working directory, as git stash push does
     await provider.resetHard({ ...untrackedOptions, keepIndex: this.keepIndex, indexTree });
-    // git stash push runs `git reset --hard`: HEAD's reflog says "reset: moving to HEAD"
+    // git stash push runs `git reset --hard` (reset_refs): ORIG_HEAD records HEAD, and
+    // HEAD's reflog says "reset: moving to HEAD"
+    await this.refsStore.set("ORIG_HEAD", headRef.objectId);
     await updateHead(
       this.refsStore,
       headRef.objectId,

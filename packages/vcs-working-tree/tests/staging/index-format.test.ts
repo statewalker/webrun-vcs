@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   encodeIndexFile,
+  encodeIndexFileBytes,
   INDEX_SIGNATURE,
   INDEX_VERSION_2,
   INDEX_VERSION_3,
@@ -688,5 +689,66 @@ describe("encodeIndexFile: streamed chunks", () => {
       { path: "a//b", mode: 0o100644, objectId: "a".repeat(40), stage: 0, size: 0, mtime: 0 },
     ];
     expect(() => encodeIndexFile(bad)).toThrow("contains //");
+  });
+});
+
+describe("encoding into one buffer (versions 2 and 3)", () => {
+  const entry = (path: string, i: number, extra: Partial<StagingEntry> = {}): StagingEntry => ({
+    path,
+    mode: 0o100644,
+    objectId: i.toString(16).padStart(40, "0"),
+    stage: 0,
+    size: i,
+    mtime: 1_700_000_000_123 + i,
+    mtimeNs: 123_456_789,
+    ctime: 1_700_000_000_000,
+    dev: 1,
+    ino: i,
+    ...extra,
+  });
+  const join = (chunks: Iterable<Uint8Array>) =>
+    Buffer.concat([...chunks].map((c) => Buffer.from(c)));
+
+  it("writes ASCII and non-ASCII paths, extended flags and stages as git reads them", async () => {
+    const entries = [
+      entry("a.txt", 1),
+      entry("caf\u00e9/x", 2, { intentToAdd: true }),
+      entry("d/\udce9", 3, { skipWorktree: true }),
+      entry("z", 4, { stage: 1 }),
+      entry("z", 5, { stage: 2, assumeValid: true }),
+    ];
+    const { bytes } = await encodeIndexFileBytes(entries);
+    const parsed = await parseIndexFile(bytes);
+    expect(parsed.version).toBe(INDEX_VERSION_3);
+    expect(parsed.entries.map((e) => [e.path, e.stage, e.objectId, e.size])).toEqual(
+      entries.map((e) => [e.path, e.stage, e.objectId, e.size]),
+    );
+    expect(parsed.entries[1]?.intentToAdd).toBe(true);
+    expect(parsed.entries[2]?.skipWorktree).toBe(true);
+    expect(parsed.entries[4]?.assumeValid).toBe(true);
+    // the streamed chunks are the same bytes
+    expect(join(encodeIndexFile(entries)).equals(Buffer.from(bytes))).toBe(true);
+  });
+
+  it("encodes an entry written before to the same bytes, wherever they last were", async () => {
+    const entries = Array.from({ length: 3000 }, (_, i) =>
+      entry(`dir${i % 7}/file-${String(i).padStart(5, "0")}`, i),
+    ).sort((a, b) => (a.path < b.path ? -1 : 1));
+    const first = Buffer.from((await encodeIndexFileBytes(entries)).bytes);
+    // the streamed form copies the known entries into a buffer of its own
+    expect(join(encodeIndexFile(entries)).equals(first)).toBe(true);
+    // a new entry among known ones: the known ones copied, the new one written
+    const changed = [...entries];
+    changed[10] = entry(entries[10]?.path as string, 99_999);
+    const second = Buffer.from((await encodeIndexFileBytes(changed)).bytes);
+    const fresh = Buffer.from((await encodeIndexFileBytes(changed.map((e) => ({ ...e })))).bytes);
+    expect(second.equals(fresh)).toBe(true);
+    expect(join(encodeIndexFile(entries)).equals(first)).toBe(true);
+  });
+
+  it("refuses an object id that is not 40 lowercase hex digits, before any byte", () => {
+    for (const objectId of ["A".repeat(40), "a".repeat(39), `${"a".repeat(39)}\u00e9`]) {
+      expect(() => encodeIndexFile([entry("x", 1, { objectId })])).toThrow(/not an object id/);
+    }
   });
 });

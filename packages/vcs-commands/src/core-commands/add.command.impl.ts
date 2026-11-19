@@ -190,6 +190,7 @@ export class AddCommand implements Add {
     const editor = this.staging.createEditor();
     const total = filesToProcess.length;
     let current = 0;
+    let emptyBlobStored = false;
 
     for (const file of filesToProcess) {
       current++;
@@ -203,7 +204,12 @@ export class AddCommand implements Add {
       }
 
       if (intentToAdd) {
-        // Just mark as intent-to-add (placeholder)
+        // Just mark as intent-to-add (placeholder), the empty blob written as git writes it
+        // (set_object_name_for_intent_to_add_entry)
+        if (!emptyBlobStored) {
+          emptyBlobStored = true;
+          await this.blobs.store([new Uint8Array(0)], 0);
+        }
         const worktreeEntry = await this.worktree.getEntry(file.path);
         const mode = worktreeEntry?.mode ?? FileMode.REGULAR_FILE;
         editor.add(

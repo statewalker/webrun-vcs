@@ -20,7 +20,8 @@ import type {
 } from "@statewalker/vcs-working-tree";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { NoFilepatternError } from "../src/errors/index.js";
+import type { AddResult } from "../src/commands/add-command.js";
+import { AddFailedError, NoFilepatternError } from "../src/errors/index.js";
 import { Git } from "../src/git.js";
 import { backends, type WorkingCopyFactory } from "./test-helper.js";
 
@@ -432,15 +433,14 @@ describe.each(backends)("AddCommand ($name backend)", ({ factory }) => {
   describe("basic operations", () => {
     /**
      * JGit: testAddNonExistingSingleFile
-     * Adding a non-existing file should not fail, just skip it.
+     * Adding a non-existing file fails as git's does (exit 128), changing nothing.
      */
     it("testAddNonExistingSingleFile - should handle non-existing file", async () => {
       const { git, staging } = await createInitializedGitWithWorkTree();
 
-      const result = await git.add().addFilepattern("nonexistent.txt").call();
-
-      expect(result.added).toHaveLength(0);
-      expect(result.totalProcessed).toBe(0);
+      await expect(git.add().addFilepattern("nonexistent.txt").call()).rejects.toThrow(
+        "fatal: pathspec 'nonexistent.txt' did not match any files",
+      );
 
       // Verify index is still empty
       let count = 0;
@@ -684,12 +684,25 @@ describe.each(backends)("AddCommand ($name backend)", ({ factory }) => {
       worktree.addFile("ignored.txt", "content");
       worktree.markIgnored("ignored.txt");
 
-      // Without force - skipped
-      let result = await git.add().addFilepattern("ignored.txt").call();
-      expect(result.skipped).toContain("ignored.txt");
+      // Without force - skipped, reported as git reports it (exit status 1)
+      const error = await git
+        .add()
+        .addFilepattern("ignored.txt")
+        .call()
+        .then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+      expect(error).toBeInstanceOf(AddFailedError);
+      const failure = error as AddFailedError<AddResult>;
+      expect(failure.ignoredPaths).toEqual(["ignored.txt"]);
+      expect(failure.result?.skipped).toContain("ignored.txt");
+      expect(failure.message).toContain(
+        "The following paths are ignored by one of your .gitignore files:\nignored.txt",
+      );
 
       // With force - added
-      result = await git.add().addFilepattern("ignored.txt").setForce(true).call();
+      const result = await git.add().addFilepattern("ignored.txt").setForce(true).call();
       expect(result.added).toContain("ignored.txt");
 
       const entry = await staging.getEntry("ignored.txt");

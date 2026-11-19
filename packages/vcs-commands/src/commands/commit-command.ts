@@ -1025,8 +1025,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
     }
 
     // Use AddCommand to stage all modified tracked files
+    // git's add_files_to_cache without a pathspec (`commit -a`): no element to report
     const addCommand = new AddCommand(this._workingCopy);
-    addCommand.addFilepattern(".");
     addCommand.setUpdate(true);
     // into the index lock the commit holds, once the commit's tree is made
     addCommand.setWriteIndex(false);
