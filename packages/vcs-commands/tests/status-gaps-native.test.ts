@@ -1067,6 +1067,13 @@ describeGit("clean removes inside non-repository .git directories as git (review
             return target.list(path);
           };
         }
+        // the listing with kinds a walk prefers fails alike
+        if (key === "listKinds") {
+          return async (path: string) => {
+            if (path.endsWith("/locked")) throw new Error("EACCES: permission denied");
+            return target.listKinds?.(path);
+          };
+        }
         const value = Reflect.get(target, key, receiver);
         return typeof value === "function" ? value.bind(target) : value;
       },

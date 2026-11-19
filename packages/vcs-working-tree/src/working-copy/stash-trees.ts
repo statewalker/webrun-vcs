@@ -22,6 +22,7 @@ import {
   findUntrackedFiles,
   trackedUnder,
   type WorktreeComparison,
+  withWorktreeEntries,
 } from "../status/worktree-status.js";
 import { isUnknownContentId } from "../worktree/hash-worktree-file.js";
 import { storeWorktreeFile } from "../worktree/store-worktree-file.js";
@@ -38,6 +39,11 @@ export interface StashTreesSource {
   worktree: Worktree;
   /** `core.filemode` / `core.symlinks`; defaults to what the worktree can represent */
   trust?: WorktreeModeTrust;
+  /**
+   * `git stash push -- <pathspec>`: the paths the worktree and untracked trees and the
+   * check for changes cover (the index tree is always the whole index); absent: every path
+   */
+  pathFilter?: (path: string) => boolean;
 }
 
 /** A blob, link or gitlink of a flattened tree. */
@@ -130,7 +136,14 @@ export async function scanIndex(source: StashTreesSource): Promise<IndexScan> {
   const entries: ScannedEntry[] = [];
   const unmerged: string[] = [];
   const paths = new Set<string>();
-  for await (const entry of staging.entries()) {
+  // the stat pass a chunk at a time (gitlinks asked one by one, as their directories are)
+  const stated = (entry: StagingEntry) =>
+    entry.stage === 0 && !entry.skipWorktree && entry.mode !== FileMode.GITLINK;
+  for await (const { item: entry, current } of withWorktreeEntries(
+    worktree,
+    staging.entries(),
+    stated,
+  )) {
     paths.add(entry.path);
     if (entry.stage !== 0) {
       unmerged.push(entry.path);
@@ -142,7 +155,7 @@ export async function scanIndex(source: StashTreesSource): Promise<IndexScan> {
     }
     entries.push({
       entry,
-      compared: await compareWithWorktree(worktree, entry, { trust, indexTime }),
+      compared: await compareWithWorktree(worktree, entry, { trust, indexTime }, current),
     });
   }
   return { entries, unmerged: [...new Set(unmerged)], paths };
@@ -282,9 +295,11 @@ export async function createWorktreeTree(
     return (await storeWorktreeFile(blobs, worktree, path, file)).id;
   };
   const result = new Map<string, FlatTreeEntry>();
+  const filter = source.pathFilter;
   for (const { entry, compared } of scanned.entries) {
     const kept = { id: entry.objectId, mode: entry.mode };
-    if (!compared) {
+    // outside the pathspec: as the index has it (git's diff-index there is limited to it)
+    if (!compared || (filter && !filter(entry.path))) {
       result.set(entry.path, kept);
       continue;
     }
@@ -315,7 +330,7 @@ export async function createWorktreeTree(
     result.set(entry.path, kept);
   }
   for (const [path] of head) {
-    if (scanned.paths.has(path)) continue;
+    if (scanned.paths.has(path) || (filter && !filter(path))) continue;
     const current = await worktree.getEntry(path);
     if (!current || current.isDirectory) continue;
     result.set(path, {
@@ -349,6 +364,7 @@ export async function createUntrackedTree(
   for await (const file of findUntrackedFiles(worktree, (p) => tracked.has(p), {
     hasTrackedUnder: trackedUnder(tracked),
     includeIgnored: options.includeIgnored,
+    ...(source.pathFilter ? { filter: source.pathFilter } : {}),
   })) {
     if (file.path.endsWith("/")) continue;
     const stored = await storeWorktreeFile(blobs, worktree, file.path, file.entry);
@@ -370,6 +386,22 @@ export async function hasTrackedChanges(
   scan?: IndexScan,
 ): Promise<boolean> {
   const scanned = scan ?? (await scanIndex(source));
+  const filter = source.pathFilter;
+  if (filter) {
+    // `git stash push -- <pathspec>`: the comparisons limited to the pathspec
+    if (scanned.unmerged.some(filter)) return true;
+    const head = await flattenTree(source.trees, headTree);
+    for (const { entry, compared } of scanned.entries) {
+      if (!filter(entry.path)) continue;
+      const inHead = head.get(entry.path);
+      if (!inHead || inHead.id !== entry.objectId || inHead.mode !== entry.mode) return true;
+      if (entry.intentToAdd) return true;
+      if (entry.mode === FileMode.GITLINK || entry.assumeValid) continue;
+      if (compared?.kind) return true;
+    }
+    for (const path of head.keys()) if (filter(path) && !scanned.paths.has(path)) return true;
+    return false;
+  }
   if (scanned.unmerged.length > 0) return true;
   const head = await flattenTree(source.trees, headTree);
   for (const { entry, compared } of scanned.entries) {

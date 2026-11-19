@@ -15,6 +15,8 @@ import {
   readCleanContent,
   smudgeContent,
   type Worktree,
+  type WorktreeEntry,
+  withWorktreeEntries,
 } from "@statewalker/vcs-working-tree";
 
 import { NoHeadError, RefNotFoundError } from "../errors/index.js";
@@ -943,8 +945,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           const wt = await this.worktreeSide(worktree, true);
           return [old, wt.sides] as const;
         }
-        const index = await this.indexSide();
-        const wt = await this.worktreeSide(worktree, false);
+        // the index side of the entries whose files differ (or are gone), and their files
+        const indexSides = new Map<string, Side>();
+        const wt = await this.worktreeSide(worktree, false, indexSides);
         for (const [path, stages] of wt.unmerged) {
           if (!this.matches(path)) continue;
           const ours = stages.get(2);
@@ -955,7 +958,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           }
           unmerged.set(path, ours ? await this.againstStage(ours, wt.compare) : []);
         }
-        return [index.sides, wt.sides] as const;
+        return [indexSides, wt.sides] as const;
       };
       [oldSide, newSide] = worktree.batch ? await worktree.batch(run) : await run();
     } else {
@@ -1342,6 +1345,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private async worktreeSide(
     worktree: Worktree,
     unmergedAsFiles: boolean,
+    changedOnly?: Map<string, Side>,
   ): Promise<{
     sides: Map<string, Side>;
     unmerged: Map<string, Map<number, StageEntry>>;
@@ -1352,11 +1356,14 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const trust = worktreeModeTrust(this.workingCopy, worktree);
     const indexTime = this.staging.getUpdateTime();
     const ignore = submoduleIgnoreValue(this.config.value("diff.ignoreSubmodules"));
-    const compare: WorktreeCompare = async (entry) => {
+    const compareWith = async (
+      entry: StageEntry,
+      current?: WorktreeEntry | null,
+    ): Promise<Side | undefined> => {
       const indexSide: Side = { mode: entry.mode, id: entry.objectId };
       if (entry.skipWorktree || entry.assumeValid) return indexSide;
       if (entry.mode === GITLINK && ignore === "all") return indexSide;
-      const result = await compareWithWorktree(worktree, entry, { trust, indexTime });
+      const result = await compareWithWorktree(worktree, entry, { trust, indexTime }, current);
       if (result.kind === "deleted") return undefined;
       const mode = result.worktreeMode ?? entry.mode;
       if (mode === GITLINK) {
@@ -1383,7 +1390,19 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       };
       return { mode, id, read };
     };
-    for await (const entry of this.staging.entries()) {
+    const compare: WorktreeCompare = (entry) => compareWith(entry);
+    // the stat pass: the files of the stage-0 entries compared, stat'ed a chunk at a time
+    const stated = (entry: StageEntry) =>
+      entry.stage === 0 &&
+      !entry.skipWorktree &&
+      !entry.assumeValid &&
+      entry.mode !== GITLINK &&
+      this.matches(entry.path);
+    for await (const { item: entry, current } of withWorktreeEntries(
+      worktree,
+      this.staging.entries(),
+      stated,
+    )) {
       if (entry.stage !== 0) {
         let stages = unmerged.get(entry.path);
         if (!stages) {
@@ -1394,7 +1413,15 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         continue;
       }
       if (!this.matches(entry.path)) continue;
-      const side = await compare(entry);
+      const side = await compareWith(entry, current);
+      if (changedOnly && !entry.intentToAdd) {
+        // diff-files: an entry its file still holds is no change on either side, left out
+        // of both (the index side is the entry, as `indexSide` gives it)
+        if (side && side.id === entry.objectId && side.mode === entry.mode && !side.dirty) {
+          continue;
+        }
+        changedOnly.set(entry.path, { mode: entry.mode, id: entry.objectId });
+      }
       if (!side) continue;
       if (entry.intentToAdd && side.id === entry.objectId && !side.read) continue;
       sides.set(entry.path, side);

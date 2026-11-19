@@ -19,7 +19,6 @@ import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
 import {
   assertValidWorktreePath,
   basename,
-  type FileInfo,
   FileMode,
   isBeyondSymlinkError,
   joinPath,
@@ -293,6 +292,7 @@ export class FileWorktree implements Worktree {
       {
         enterNonRepositoryGitDirs: options?.enterNonRepositoryGitDirs === true,
         onUnreadable: options?.onUnreadable,
+        skipFile: options?.skipFile,
       },
     );
   }
@@ -306,7 +306,11 @@ export class FileWorktree implements Worktree {
     includeDirectories: boolean,
     maxDepth?: number,
     currentDepth = 0,
-    extra: { enterNonRepositoryGitDirs: boolean; onUnreadable?: (path: string) => void } = {
+    extra: {
+      enterNonRepositoryGitDirs: boolean;
+      onUnreadable?: (path: string) => void;
+      skipFile?: (path: string) => boolean;
+    } = {
       enterNonRepositoryGitDirs: false,
     },
   ): AsyncIterable<WorktreeEntry> {
@@ -319,10 +323,15 @@ export class FileWorktree implements Worktree {
       await this.tryLoadGitignore(dirPath, relativePath, files);
     }
 
-    const entries: FileInfo[] = [];
+    // the entries with what the listing tells of them: `listKinds` gives each one's kind
+    // without a stat (git's d_type), so a file the caller skips is never stat'ed
+    let entries: Array<{ name: string; kind?: LinkStats["kind"] | "file" | "directory" }>;
+    const listed = !!files.listKinds;
     try {
-      for await (const entry of files.list(dirPath)) {
-        entries.push(entry);
+      if (files.listKinds) entries = await files.listKinds(dirPath);
+      else {
+        entries = [];
+        for await (const entry of files.list(dirPath)) entries.push(entry);
       }
     } catch {
       // unreadable: its content is unknown (reported, so nothing is removed on a guess)
@@ -331,10 +340,16 @@ export class FileWorktree implements Worktree {
     }
 
     entries.sort((a, b) => a.name.localeCompare(b.name));
+    const skipFile = extra.skipFile;
+    const dirPrefix = dirPath === "/" ? "/" : `${dirPath}/`;
 
     for (const entry of entries) {
       const entryPath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
-      const fullPath = joinPath(dirPath, entry.name);
+      // a tracked file of an untracked-file scan: passed over before any stat
+      if (listed && skipFile && entry.kind !== undefined && entry.kind !== "directory") {
+        if (skipFile(entryPath)) continue;
+      }
+      const fullPath = listed ? dirPrefix + entry.name : joinPath(dirPath, entry.name);
 
       if (entry.name === ".git") {
         // the worktree's own repository, or a nested one: never listed; a `.git` in a
@@ -343,11 +358,16 @@ export class FileWorktree implements Worktree {
         if (await this.isRepository(relativePath)) continue;
       }
 
-      // the entry itself: a symbolic link is a file of its own, never descended into
-      const link = await files.lstat?.(fullPath);
+      // the entry itself: a symbolic link is a file of its own, never descended into (a
+      // directory `listKinds` reported is one already: not stat'ed again)
+      const link =
+        listed && entry.kind === "directory" ? DIRECTORY_STATS : await files.lstat?.(fullPath);
       // a FIFO, socket or device is not content git tracks (git skips it too)
       if (link?.kind === "other") continue;
       const isDirectory = link ? link.kind === "directory" : entry.kind === "directory";
+      if (!isDirectory && skipFile && !(listed && entry.kind !== undefined)) {
+        if (skipFile(entryPath)) continue;
+      }
 
       const isIgnored = this.ignoreManager.isIgnored(entryPath, isDirectory);
 
@@ -401,6 +421,63 @@ export class FileWorktree implements Worktree {
         );
       }
     }
+  }
+
+  /**
+   * {@link getEntry} of every path: one `lstatMany` where the FilesApi has it (synchronous
+   * lstats, leading directories checked once), else one `getEntry` per path.
+   */
+  async getEntries(paths: readonly string[]): Promise<Array<WorktreeEntry | undefined>> {
+    const files = this.files;
+    if (!files.lstatMany) return Promise.all(paths.map((path) => this.getEntry(path)));
+    const links = await files.lstatMany(paths.map((path) => this.fullPathOf(path)));
+    const out = new Array<WorktreeEntry | undefined>(paths.length);
+    for (let i = 0; i < paths.length; i++) {
+      const link = links[i];
+      if (!link || link.kind === "other") continue;
+      const path = paths[i] as string;
+      if (link.kind === "directory") {
+        out[i] = await this.getEntry(path); // a gitlink's directory: asked as one
+        continue;
+      }
+      out[i] = this.fileEntry(path, link);
+    }
+    return out;
+  }
+
+  /** The FilesApi path of a worktree path. */
+  private fullPathOf(path: string): string {
+    const root = this.rootPath;
+    return root === "" || root === "/" ? `/${path}` : joinPath(root, path);
+  }
+
+  /**
+   * The entry of a file or symbolic link at `path`, from its `lstat`; whether it is ignored
+   * is worked out when asked (a stat pass over tracked files never asks).
+   */
+  private fileEntry(path: string, link: LinkStats): WorktreeEntry {
+    const slash = path.lastIndexOf("/");
+    const ignoreManager = this.ignoreManager;
+    let ignored: boolean | undefined;
+    return {
+      path,
+      name: slash < 0 ? path : path.slice(slash + 1),
+      mode: this.modeOf(link, false),
+      size: link.size,
+      mtime: link.lastModified,
+      ctime: link.ctime,
+      mtimeNs: link.mtimeNs,
+      ctimeNs: link.ctimeNs,
+      dev: link.dev,
+      ino: link.ino,
+      uid: link.uid,
+      gid: link.gid,
+      isDirectory: false,
+      get isIgnored(): boolean {
+        ignored ??= ignoreManager.isIgnored(path, false);
+        return ignored;
+      },
+    };
   }
 
   async getEntry(path: string): Promise<WorktreeEntry | undefined> {
@@ -1508,6 +1585,9 @@ function resolveDots(path: string): string | undefined {
   }
   return `${path.startsWith("/") ? "/" : ""}${out.join("/")}`;
 }
+
+/** What a walk takes of a directory `listKinds` reported (it stats none). */
+const DIRECTORY_STATS: LinkStats = { kind: "directory", size: 0, lastModified: 0 };
 
 function statData(link: LinkStats): Partial<WorktreeEntry> {
   const out: Partial<WorktreeEntry> = {};

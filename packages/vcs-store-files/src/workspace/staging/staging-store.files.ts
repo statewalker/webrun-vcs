@@ -753,6 +753,11 @@ class FileStagingEditor implements IndexEditor {
    * path's stage-0 entry (the conflict stages kept).
    */
   async finish(): Promise<void> {
+    const merged = this.mergeEdits();
+    if (merged) {
+      this.store._replaceEntries(merged);
+      return;
+    }
     const byPath = new Map<string, StagingEntry[]>();
     for (const entry of this.store._getEntries()) {
       const list = byPath.get(entry.path);
@@ -785,6 +790,75 @@ class FileStagingEditor implements IndexEditor {
     const newEntries = [...byPath.values()].flat();
     newEntries.sort((a, b) => comparePaths(a.path, b.path) || a.stage - b.stage);
     this.store._replaceEntries(newEntries);
+  }
+
+  /** The stages of one path after its edits, in order (a path's part of {@link finish}). */
+  private applyEdits(edits: StagingEdit[], entries: StagingEntry[]): StagingEntry[] {
+    let next = entries;
+    for (const edit of edits) {
+      if (edit instanceof RemoveStagingStages) {
+        next = next.filter((e) => edit.keeps(e));
+      } else if (isResolveConflict(edit)) {
+        const chosen = next.find((e) => e.stage === edit.chooseStage);
+        next = chosen ? [{ ...chosen, stage: MergeStage.MERGED }] : [];
+      } else {
+        const current = next.find((e) => e.stage === MergeStage.MERGED);
+        const result = edit.apply(current);
+        next = next.filter((e) => e.stage !== MergeStage.MERGED);
+        if (result) next.push(result);
+      }
+    }
+    return next.length > 1 ? [...next].sort((a, b) => a.stage - b.stage) : next;
+  }
+
+  /**
+   * {@link finish} without regrouping and sorting the whole index: the edited paths' runs
+   * replaced in place and new paths merged in (a few edits to a large index, `add -u`).
+   * Undefined when a tree deletion is among the edits or the entries are not in order:
+   * {@link finish} then takes the long way.
+   */
+  private mergeEdits(): StagingEntry[] | undefined {
+    const byPath = new Map<string, StagingEdit[]>();
+    for (const edit of this.edits) {
+      if (isDeleteTree(edit)) return undefined;
+      const list = byPath.get(edit.path);
+      if (list) list.push(edit);
+      else byPath.set(edit.path, [edit]);
+    }
+    const entries = this.store._getEntries();
+    const out: StagingEntry[] = [];
+    let previous: string | undefined;
+    for (let k = 0; k < entries.length; ) {
+      const path = entries[k].path;
+      if (previous !== undefined && comparePaths(previous, path) >= 0) return undefined;
+      previous = path;
+      let end = k + 1;
+      while (end < entries.length && entries[end].path === path) end++;
+      const edits = byPath.get(path);
+      if (edits) {
+        byPath.delete(path);
+        for (const entry of this.applyEdits(edits, entries.slice(k, end))) out.push(entry);
+      } else {
+        for (let j = k; j < end; j++) out.push(entries[j]);
+      }
+      k = end;
+    }
+    if (byPath.size === 0) return out;
+    // paths the index did not have: merged into the order
+    const added: StagingEntry[] = [];
+    for (const [, edits] of byPath) added.push(...this.applyEdits(edits, []));
+    if (added.length === 0) return out;
+    added.sort((a, b) => comparePaths(a.path, b.path) || a.stage - b.stage);
+    const result: StagingEntry[] = new Array(out.length + added.length);
+    let i = 0;
+    let j = 0;
+    let n = 0;
+    while (i < out.length || j < added.length) {
+      if (j >= added.length || (i < out.length && comparePaths(out[i].path, added[j].path) <= 0)) {
+        result[n++] = out[i++];
+      } else result[n++] = added[j++];
+    }
+    return result;
   }
 }
 

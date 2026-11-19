@@ -50,6 +50,14 @@ export interface WorktreeWalkOptions {
    * on without its content, so a caller removing what it lists keeps that directory.
    */
   onUnreadable?: (path: string) => void;
+  /**
+   * Files (anything but a directory) for which this answers true are passed over: not
+   * yielded, and neither stat'ed nor matched against the ignore rules where the worktree can
+   * tell a file from a directory without a stat. An untracked-file scan passes the index's
+   * paths, as git's directory walk asks the index first (`treat_path`). Optional to honour:
+   * a worktree may still yield such files, so a caller checks them again.
+   */
+  skipFile?: (path: string) => boolean;
 }
 
 /** Whether a directory holds a repository of its own, as far as the worktree can tell. */
@@ -241,6 +249,13 @@ export interface Worktree {
 
   walk(options?: WorktreeWalkOptions): AsyncIterable<WorktreeEntry>;
   getEntry(path: string): Promise<WorktreeEntry | undefined>;
+  /**
+   * {@link getEntry} of many paths at once, the answers in the order of `paths`: the stat
+   * pass of status, diff, `add -u` and `commit -a` over every index entry (git's
+   * `refresh_index`). Optional: callers fall back to `getEntry` per path
+   * (`getWorktreeEntries`).
+   */
+  getEntries?(paths: readonly string[]): Promise<Array<WorktreeEntry | undefined>>;
   /**
    * The blob id of the file at `path`: of its content as the content filter cleans it (what
    * `git add` would store), a symbolic link's target as it is.

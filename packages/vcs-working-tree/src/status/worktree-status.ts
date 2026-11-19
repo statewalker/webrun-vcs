@@ -172,9 +172,12 @@ export async function compareWithWorktree(
   worktree: Worktree,
   entry: StagingEntry,
   options: WorktreeCompareOptions = {},
+  prefetched?: WorktreeEntry | null,
 ): Promise<WorktreeComparison> {
   const trust = options.trust ?? defaultModeTrust(worktree);
-  const current = await worktree.getEntry(entry.path);
+  // `prefetched`: the entry's file as a stat pass found it (`withWorktreeEntries`), null for none
+  const current =
+    prefetched === undefined ? await worktree.getEntry(entry.path) : (prefetched ?? undefined);
   if (entry.mode === FileMode.GITLINK) {
     // a submodule: its directory (populated or not) is no change; its contents are not ours
     if (!current) return { kind: "deleted" };
@@ -236,12 +239,72 @@ export async function* diffIndexWithWorktree(
   worktree: Worktree,
   options: WorktreeCompareOptions & { filter?: (path: string) => boolean } = {},
 ): AsyncIterable<WorktreeChange> {
-  for await (const entry of entries) {
-    if (entry.stage !== 0 || entry.skipWorktree || entry.assumeValid) continue;
-    if (options.filter && !options.filter(entry.path)) continue;
-    const result = await compareWithWorktree(worktree, entry, options);
+  const filter = options.filter;
+  const wanted = (entry: StagingEntry) =>
+    entry.stage === 0 &&
+    !entry.skipWorktree &&
+    !entry.assumeValid &&
+    (!filter || filter(entry.path));
+  for await (const { item: entry, current } of withWorktreeEntries(worktree, entries, wanted)) {
+    if (current === undefined) continue;
+    const result = await compareWithWorktree(worktree, entry, options, current);
     if (result.kind) yield { ...result, path: entry.path, entry, kind: result.kind };
   }
+}
+
+/**
+ * The worktree entries of `paths` (undefined where nothing is), in their order: one
+ * `getEntries` where the worktree has it, else `getEntry` path by path.
+ */
+export async function getWorktreeEntries(
+  worktree: Worktree,
+  paths: readonly string[],
+): Promise<Array<WorktreeEntry | undefined>> {
+  if (worktree.getEntries) return worktree.getEntries(paths);
+  const out: Array<WorktreeEntry | undefined> = [];
+  for (const path of paths) out.push(await worktree.getEntry(path));
+  return out;
+}
+
+/** How many paths a stat pass asks the worktree for at once. */
+const STAT_CHUNK = 4096;
+
+/**
+ * Items (index entries) with the worktree entries of their paths, stat'ed a chunk at a time
+ * (git's `preload_index` before `refresh_index`): `current` is the file (null for none) of
+ * each item `wanted` accepts, undefined for the others, which are not stat'ed. The items
+ * keep their order; a chunk is stat'ed just before its items are yielded.
+ */
+export async function* withWorktreeEntries<T extends { path: string }>(
+  worktree: Worktree,
+  items: AsyncIterable<T> | Iterable<T>,
+  wanted: (item: T) => boolean = () => true,
+): AsyncIterable<{ item: T; current: WorktreeEntry | null | undefined }> {
+  let chunk: T[] = [];
+  let asked: boolean[] = [];
+  let paths: string[] = [];
+  const flush = async function* () {
+    const found = paths.length > 0 ? await getWorktreeEntries(worktree, paths) : [];
+    let k = 0;
+    const done = chunk;
+    const doneAsked = asked;
+    chunk = [];
+    asked = [];
+    paths = [];
+    for (let i = 0; i < done.length; i++) {
+      const item = done[i] as T;
+      if (!doneAsked[i]) yield { item, current: undefined };
+      else yield { item, current: found[k++] ?? null };
+    }
+  };
+  for await (const item of items) {
+    const want = wanted(item);
+    chunk.push(item);
+    asked.push(want);
+    if (want) paths.push(item.path);
+    if (paths.length >= STAT_CHUNK || chunk.length >= 4 * STAT_CHUNK) yield* flush();
+  }
+  yield* flush();
 }
 
 /** A file on disk the index does not track. */
@@ -287,6 +350,8 @@ export async function* findUntrackedFiles(
     for await (const entry of worktree.walk({
       includeIgnored,
       includeDirectories: true,
+      // tracked files are passed over unstat'ed (git's treat_path asks the index first)
+      skipFile: isTracked,
       ...(pathPrefix ? { pathPrefix } : {}),
     })) {
       if (inSkippedDir(entry.path)) continue;
@@ -319,7 +384,13 @@ export async function* findUntrackedFiles(
 /** The directories that hold the given paths (`a/b/c` gives `a` and `a/b`). */
 export function directoriesOf(paths: Iterable<string>): Set<string> {
   const dirs = new Set<string>();
+  // paths in index order share their directory with the one before: added once
+  let last = "";
   for (const path of paths) {
+    const slash = path.lastIndexOf("/");
+    if (slash <= 0) continue;
+    if (path.length > slash && last.length === slash && path.startsWith(last)) continue;
+    last = path.slice(0, slash);
     for (let k = path.indexOf("/"); k > 0; k = path.indexOf("/", k + 1)) dirs.add(path.slice(0, k));
   }
   return dirs;

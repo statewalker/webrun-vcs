@@ -16,10 +16,13 @@ import {
   createUntrackedTree,
   createWorktreeTree,
   directoriesOf,
+  type EntryStat,
+  entryStatOf,
   findUntrackedFiles,
   flattenTree,
   hasTrackedChanges,
   type IndexScan,
+  modeFromWorktree,
   refreshableEntries,
   refreshIndexStats,
   type Staging,
@@ -48,6 +51,11 @@ export interface WorkingCopyStashContext {
   worktree: Worktree;
   /** HEAD's tree (undefined before the first commit) */
   headTree: () => Promise<ObjectId | undefined>;
+  /**
+   * `git stash push -- <pathspec>`: the paths stashed and reset (the index tree is the whole
+   * index all the same); absent: every path
+   */
+  pathFilter?: (path: string) => boolean;
 }
 
 /**
@@ -61,8 +69,15 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
   constructor(private readonly context: WorkingCopyStashContext) {}
 
   private get source(): StashTreesSource {
-    const { trees, blobs, staging, worktree, workingCopy } = this.context;
-    return { trees, blobs, staging, worktree, trust: worktreeModeTrust(workingCopy, worktree) };
+    const { trees, blobs, staging, worktree, workingCopy, pathFilter } = this.context;
+    return {
+      trees,
+      blobs,
+      staging,
+      worktree,
+      trust: worktreeModeTrust(workingCopy, worktree),
+      ...(pathFilter ? { pathFilter } : {}),
+    };
   }
 
   /** The index compared with the worktree, once. */
@@ -93,6 +108,7 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
     for await (const file of findUntrackedFiles(this.context.worktree, (p) => scan.paths.has(p), {
       hasTrackedUnder: trackedUnder(scan.paths),
       includeIgnored: options.includeIgnored,
+      ...(this.context.pathFilter ? { filter: this.context.pathFilter } : {}),
     })) {
       if (!file.path.endsWith("/")) return true;
     }
@@ -108,11 +124,86 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
    */
   async resetHard(options: StashResetOptions = {}): Promise<void> {
     const scan = await this.scan();
-    if (options.includeUntracked) await this.clean(scan, options.includeIgnored === true);
+    const filter = this.context.pathFilter;
+    if (options.includeUntracked) {
+      if (filter) await this.removeUntracked(scan, options.includeIgnored === true, filter);
+      else await this.clean(scan, options.includeIgnored === true);
+    }
     const headTree = await this.context.headTree();
-    await this.resetToHead(scan, headTree);
+    await this.resetToHead(scan, headTree, filter);
     if (options.keepIndex && options.indexTree) {
-      await this.checkoutTree(headTree, options.indexTree);
+      await this.checkoutTree(headTree, options.indexTree, filter);
+    }
+  }
+
+  /**
+   * `git stash push --staged` after the staged changes left the worktree: the index made to
+   * match HEAD (`git reset -q --refresh -- <pathspec>`, every path without one), each entry
+   * taken from HEAD given its file's stat where the file holds HEAD's content (the refresh).
+   */
+  async resetIndexToHead(): Promise<void> {
+    const { trees, staging, worktree, workingCopy } = this.context;
+    const filter = this.context.pathFilter;
+    const trust = worktreeModeTrust(workingCopy, worktree);
+    const target = await flattenTree(trees, await this.context.headTree());
+    const editor = staging.createEditor();
+    const seen = new Set<string>();
+    const fromHead = async (path: string, t: { id: ObjectId; mode: number }) => {
+      let stat: EntryStat = { size: 0, mtime: 0 };
+      if (t.mode !== FileMode.GITLINK) {
+        const current = await worktree.getEntry(path);
+        if (current && !current.isDirectory) {
+          const mode = modeFromWorktree(current.mode, t.mode, trust);
+          const id = mode === t.mode ? await worktree.computeHash(path).catch(() => "") : "";
+          if (id === t.id) stat = entryStatOf(current);
+        }
+      }
+      editor.upsert({ path, objectId: t.id, mode: t.mode, stage: 0, ...stat });
+    };
+    for await (const entry of staging.entries()) {
+      const path = entry.path;
+      if (seen.has(path) || (filter && !filter(path))) continue;
+      seen.add(path);
+      const t = target.get(path);
+      const same =
+        t &&
+        entry.stage === 0 &&
+        !entry.intentToAdd &&
+        t.id === entry.objectId &&
+        t.mode === entry.mode;
+      if (same) continue;
+      editor.remove(path);
+      if (t) await fromHead(path, t);
+    }
+    for (const [path, t] of target) {
+      if (seen.has(path) || (filter && !filter(path))) continue;
+      await fromHead(path, t);
+    }
+    await editor.finish();
+    await staging.write();
+  }
+
+  /**
+   * The untracked files of a pathspec stash removed (git adds them and applies the stash's
+   * diff in reverse, `git apply --index -R`): each file, then the directories it leaves empty.
+   */
+  private async removeUntracked(
+    scan: IndexScan,
+    ignored: boolean,
+    filter: (path: string) => boolean,
+  ): Promise<void> {
+    const { worktree } = this.context;
+    const untracked: string[] = [];
+    for await (const file of findUntrackedFiles(worktree, (p) => scan.paths.has(p), {
+      hasTrackedUnder: trackedUnder(scan.paths),
+      includeIgnored: ignored,
+      filter,
+    })) {
+      if (!file.path.endsWith("/")) untracked.push(file.path);
+    }
+    for (const path of untracked) {
+      await worktree.remove(path);
+      await pruneEmptyParents(worktree, path);
     }
   }
 
@@ -149,15 +240,23 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
    * with its fresh stat; paths that already match are not touched, and those the scan only
    * proved clean by hashing get their fresh stat.
    */
-  private async resetToHead(scan: IndexScan, headTree: ObjectId | undefined): Promise<void> {
+  private async resetToHead(
+    scan: IndexScan,
+    headTree: ObjectId | undefined,
+    filter?: (path: string) => boolean,
+  ): Promise<void> {
     const target = await flattenTree(this.context.trees, headTree);
-    const stale = new Set<string>(scan.unmerged);
+    const inScope = (path: string) => !filter || filter(path);
+    const stale = new Set<string>(scan.unmerged.filter(inScope));
     for (const { entry, compared } of scan.entries) {
+      if (!inScope(entry.path)) continue;
       const t = target.get(entry.path);
       if (!t || t.id !== entry.objectId || t.mode !== entry.mode) stale.add(entry.path);
       else if (entry.mode !== FileMode.GITLINK && compared?.kind) stale.add(entry.path);
     }
-    for (const path of target.keys()) if (!scan.paths.has(path)) stale.add(path);
+    for (const path of target.keys()) {
+      if (!scan.paths.has(path) && inScope(path)) stale.add(path);
+    }
     const refresh = refreshableEntries(scan).filter((u) => !stale.has(u.path));
     // a reset --hard writes a new index (unpack-trees): the resolve-undo records go
     this.context.staging.clearResolveUndo?.();
@@ -166,16 +265,23 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
   }
 
   /** `git checkout --no-overlay <tree> -- :/` after the reset: index and worktree at `to`. */
-  private async checkoutTree(from: ObjectId | undefined, to: ObjectId): Promise<void> {
+  private async checkoutTree(
+    from: ObjectId | undefined,
+    to: ObjectId,
+    filter?: (path: string) => boolean,
+  ): Promise<void> {
     const { trees } = this.context;
     const before = await flattenTree(trees, from);
     const target = await flattenTree(trees, to);
     const stale = new Set<string>();
     for (const [path, t] of target) {
+      if (filter && !filter(path)) continue;
       const b = before.get(path);
       if (!b || b.id !== t.id || b.mode !== t.mode) stale.add(path);
     }
-    for (const path of before.keys()) if (!target.has(path)) stale.add(path);
+    for (const path of before.keys()) {
+      if (!target.has(path) && (!filter || filter(path))) stale.add(path);
+    }
     // a path checkout (`checkout --no-overlay <tree> -- :/`): the worktree's attributes first
     await this.write(to, target, stale, "checkin");
   }

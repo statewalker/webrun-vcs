@@ -170,6 +170,20 @@ export interface LinkStats {
 }
 
 /**
+ * One entry of a directory as {@link PosixFilesApi.listKinds} reports it: its name and,
+ * where the storage tells it without a stat (POSIX `readdir`'s `d_type`), what it is.
+ */
+export interface DirectoryEntry {
+  /** The base name of the entry */
+  name: string;
+  /**
+   * The entry itself, a symbolic link not followed; absent when the storage cannot tell
+   * without an `lstat` (`DT_UNKNOWN`), the caller then asks {@link PosixFilesApi.lstat}
+   */
+  kind?: LinkStats["kind"];
+}
+
+/**
  * A FilesApi over storage that holds symbolic links (and, optionally, POSIX modes): a local
  * filesystem (`createNodeFilesApi`), or any FilesApi wrapped to simulate links
  * (`createSymlinkFilesApi`). Every member is optional and feature-detected; worktrees,
@@ -242,6 +256,24 @@ export interface PosixFilesApi extends FilesApi {
    * A path beneath a symbolic link is neither: it throws `BeyondSymlinkError`.
    */
   lstat?(path: string): Promise<LinkStats | undefined>;
+  /**
+   * {@link lstat} of many paths in one call, the answers in the order of `paths`: what a
+   * worktree's stat pass (git's `refresh_index`, `run_diff_files`) asks of every tracked
+   * file. A path beneath a symbolic link, or with nothing there, answers undefined (never
+   * `BeyondSymlinkError`); any other failure rejects the whole call. Within one call a
+   * leading directory is checked once. Optional: storage where it is no cheaper than `lstat`
+   * per path leaves it out, and callers fall back to that.
+   */
+  lstatMany?(paths: readonly string[]): Promise<Array<LinkStats | undefined>>;
+  /**
+   * The direct entries of the directory at `path`, in no particular order, each with its
+   * kind where the storage knows it without a stat (POSIX `d_type`), as git's directory walk
+   * reads them: a walk then stats only the entries it reports. Nothing for a missing path,
+   * a file, or a symbolic link (never followed); a directory that cannot be read throws (its
+   * content is unknown), as does a path beneath a link (`BeyondSymlinkError`). The temporaries of writes in flight are left out, as `list` leaves
+   * them out. Optional: callers fall back to `list` and `lstat`.
+   */
+  listKinds?(path: string): Promise<DirectoryEntry[]>;
   /** The target of the symbolic link at `path` (bytes); undefined if it is not a link */
   readlink?(path: string): Promise<Uint8Array | undefined>;
   /**

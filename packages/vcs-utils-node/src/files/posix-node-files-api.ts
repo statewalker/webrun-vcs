@@ -24,6 +24,7 @@ import {
   lstatSync,
   lutimesSync,
   openSync,
+  readdirSync,
   readSync,
   renameSync,
   unlinkSync,
@@ -35,6 +36,7 @@ import * as nodePath from "node:path";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   BeyondSymlinkError,
+  type DirectoryEntry,
   type LinkStats,
   type PosixFilesApi,
 } from "@statewalker/vcs-utils/files";
@@ -58,6 +60,9 @@ const tmpName = () =>
   Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) =>
     b.toString(16).padStart(2, "0"),
   ).join("");
+
+/** A path with an empty, "." or ".." component (or a trailing "/"): resolved the long way. */
+const UNPLAIN_PATH = /(?:^|\/)\.{0,2}(?:\/|$)/;
 
 /** `open` flags that refuse to follow a symbolic link at the path, where the OS has one. */
 const O_NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0;
@@ -112,6 +117,8 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   /** When the oldest entry of `verified` was added (the set is dropped whole) */
   private verifiedSince = 0;
   private readonly options: PosixNodeFilesApiOptions;
+  /** The root with a trailing separator: the prefix of every real path below it */
+  private readonly rootPrefix: string;
 
   constructor(
     options?: PosixNodeFilesApiOptions,
@@ -125,6 +132,7 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     this.pathSeparators = this.windows ? "/\\" : "/";
     this.verified = lstatCache;
     this.verifiedMaxAge = lstatCacheMaxAgeMs;
+    this.rootPrefix = this.root.endsWith(nodePath.sep) ? this.root : this.root + nodePath.sep;
   }
 
   /** The real directory this FilesApi is rooted at. */
@@ -179,6 +187,12 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
 
   /** The real path of a virtual one, checked to stay inside the root. */
   private real(virtualPath: string): string {
+    // the common case (a plain worktree or repository path), joined without path.resolve:
+    // no empty, "." or ".." component, no "\\" on Windows (resolved the long way)
+    if (!this.windows) {
+      const plain = virtualPath.charCodeAt(0) === 47 ? virtualPath.slice(1) : virtualPath;
+      if (plain !== "" && !UNPLAIN_PATH.test(plain)) return this.rootPrefix + plain;
+    }
     const real = nodePath.resolve(this.root, ...this.segments(virtualPath));
     const prefix = this.root.endsWith(nodePath.sep) ? this.root : this.root + nodePath.sep;
     if (real !== this.root && !real.startsWith(prefix)) {
@@ -192,22 +206,33 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
    * link: `BeyondSymlinkError` if one is. A missing component ends the check.
    */
   private async realNoLinks(virtualPath: string): Promise<string> {
-    const real = this.real(virtualPath);
     this.expireVerified();
+    return this.realNoLinksSync(virtualPath, this.verified);
+  }
+
+  /**
+   * {@link realNoLinks}, synchronously (its lstats are), with the cache of verified
+   * directories given: the batch view's, or one local to a `lstatMany` call.
+   */
+  private realNoLinksSync(virtualPath: string, verified: Set<string> | undefined): string {
+    const real = this.real(virtualPath);
     // a verified parent was verified with its ancestors (in order, here and in mkdirs; a listed
     // directory was reached so), and the cache is dropped whole: nothing more to check
-    if (this.verified?.size && this.verified.has(nodePath.dirname(real))) return real;
+    if (verified?.size) {
+      const slash = real.lastIndexOf(nodePath.sep);
+      if (slash > 0 && verified.has(real.slice(0, slash))) return real;
+    }
     const segments = this.segments(virtualPath);
     let current = this.root;
     for (let i = 0; i < segments.length - 1; i++) {
       current = nodePath.join(current, segments[i]);
-      if (this.verified?.has(current)) continue;
-      const stat = await lstatOrUndefined(current);
+      if (verified?.has(current)) continue;
+      const stat = lstatQuiet(current, false);
       if (!stat) return real;
       if (stat.isSymbolicLink()) {
         throw new BeyondSymlinkError(virtualPath, `/${segments.slice(0, i + 1).join("/")}`);
       }
-      if (stat.isDirectory()) this.verified?.add(current);
+      if (stat.isDirectory()) verified?.add(current);
     }
     return real;
   }
@@ -665,29 +690,87 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
 
   /** The entry itself; `BeyondSymlinkError` beneath a link, never "absent". */
   async lstat(path: string): Promise<LinkStats | undefined> {
-    const stat = await bigintLstatOrUndefined(await this.realNoLinks(path));
-    if (!stat) return undefined;
-    const kind = stat.isSymbolicLink()
-      ? "symlink"
-      : stat.isDirectory()
-        ? "directory"
-        : stat.isFile()
-          ? "file"
-          : "other";
-    const low32 = (value: bigint) => Number(value & 0xffffffffn);
-    return {
-      kind,
-      size: kind === "directory" ? 0 : Number(stat.size),
-      lastModified: nsToMs(stat.mtimeNs),
-      ctime: nsToMs(stat.ctimeNs),
-      mode: Number(stat.mode & 0o7777n),
-      mtimeNs: Number(stat.mtimeNs % 1_000_000_000n),
-      ctimeNs: Number(stat.ctimeNs % 1_000_000_000n),
-      dev: low32(stat.dev),
-      ino: low32(stat.ino),
-      uid: low32(stat.uid),
-      gid: low32(stat.gid),
-    };
+    return linkStatsOf(await bigintLstatOrUndefined(await this.realNoLinks(path)));
+  }
+
+  /**
+   * `lstat` of every path, synchronously in one call (an lstat is a short metadata call, see
+   * {@link bigintLstatOrUndefined}); undefined beneath a link or for nothing there. Leading
+   * directories are checked once per call (or per batch, in a batch view).
+   */
+  async lstatMany(paths: readonly string[]): Promise<Array<LinkStats | undefined>> {
+    this.expireVerified();
+    const verified = this.verified ?? new Set<string>();
+    const out = new Array<LinkStats | undefined>(paths.length);
+    for (let i = 0; i < paths.length; i++) {
+      let real: string;
+      try {
+        real = this.realNoLinksSync(paths[i] as string, verified);
+      } catch (error) {
+        if (error instanceof BeyondSymlinkError) {
+          out[i] = undefined;
+          continue;
+        }
+        throw error;
+      }
+      out[i] = linkStatsOf(lstatQuiet(real, true) as import("node:fs").BigIntStats | undefined);
+    }
+    return out;
+  }
+
+  /**
+   * The directory's entries with their `d_type` (`readdir` with file types: no stat), names
+   * read as bytes as `list` reads them; the temporaries of writes in flight left out.
+   */
+  async listKinds(path: string): Promise<DirectoryEntry[]> {
+    const dir = await this.realNoLinks(path);
+    let entries: import("node:fs").Dirent<string | Buffer>[];
+    try {
+      // a link at the path is not followed (opened as a directory only when it is one)
+      if (!lstatQuiet(dir, false)?.isDirectory()) return [];
+      // synchronous, as the lstats are: a walk reads one directory after the other, and a
+      // round trip through libuv's thread pool costs more than reading a directory's names.
+      // Names as strings (cheaper than a Buffer each); read again as bytes when one is no
+      // valid UTF-8 (decoded with U+FFFD), so it keeps its bytes (decodeGitPath's escapes)
+      const path = fsPath(dir);
+      entries = readdirSync(path, { withFileTypes: true });
+      if (entries.some((dirent) => (dirent.name as string).includes("\uFFFD"))) {
+        entries = readdirSync(path, { withFileTypes: true, encoding: "buffer" });
+      }
+    } catch (error) {
+      // gone meanwhile: nothing; unreadable (EACCES): thrown, its content is unknown
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return [];
+      throw error;
+    }
+    const out: DirectoryEntry[] = new Array(entries.length);
+    const prefix = dir.endsWith(nodePath.sep) ? dir : dir + nodePath.sep;
+    let n = 0;
+    for (const dirent of entries) {
+      const name =
+        typeof dirent.name === "string" ? dirent.name : decodeGitPath(dirent.name as Buffer);
+      if (dirent.isDirectory()) {
+        this.verified?.add(prefix + name);
+        out[n++] = { name, kind: "directory" };
+        continue;
+      }
+      // not a directory (any more): never a verified one
+      if (this.verified?.size) this.verified.delete(prefix + name);
+      if (dirent.isFile()) {
+        if (TMP_NAME.test(name)) continue;
+        out[n++] = { name, kind: "file" };
+      } else if (dirent.isSymbolicLink()) out[n++] = { name, kind: "symlink" };
+      else if (
+        dirent.isFIFO() ||
+        dirent.isSocket() ||
+        dirent.isBlockDevice() ||
+        dirent.isCharacterDevice()
+      ) {
+        out[n++] = { name, kind: "other" };
+      } else out[n++] = { name }; // DT_UNKNOWN: the caller stats it
+    }
+    out.length = n;
+    return out;
   }
 
   async readlink(path: string): Promise<Uint8Array | undefined> {
@@ -698,6 +781,36 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       return undefined;
     }
   }
+}
+
+const LOW32 = 0xffffffffn;
+const NS_PER_S = 1_000_000_000n;
+
+/** {@link LinkStats} of an `lstat` with exact times; undefined for nothing there. */
+function linkStatsOf(stat: import("node:fs").BigIntStats | undefined): LinkStats | undefined {
+  if (!stat) return undefined;
+  const kind = stat.isSymbolicLink()
+    ? "symlink"
+    : stat.isDirectory()
+      ? "directory"
+      : stat.isFile()
+        ? "file"
+        : "other";
+  const mtimeNs = stat.mtimeNs;
+  const ctimeNs = stat.ctimeNs;
+  return {
+    kind,
+    size: kind === "directory" ? 0 : Number(stat.size),
+    lastModified: nsToMs(mtimeNs),
+    ctime: nsToMs(ctimeNs),
+    mode: Number(stat.mode & 0o7777n),
+    mtimeNs: Number(mtimeNs % NS_PER_S),
+    ctimeNs: Number(ctimeNs % NS_PER_S),
+    dev: Number(stat.dev & LOW32),
+    ino: Number(stat.ino & LOW32),
+    uid: Number(stat.uid & LOW32),
+    gid: Number(stat.gid & LOW32),
+  };
 }
 
 /** Milliseconds of a time in nanoseconds, its whole milliseconds exact (no float drift). */
