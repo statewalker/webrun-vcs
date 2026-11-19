@@ -252,3 +252,98 @@ describeGit("status text forms: as native git", () => {
     await expectAllFormats(dir, "sparse");
   }, 60_000);
 });
+
+describeGit("status -v / -vv with unmerged paths: as native git", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "status-vv-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** `status -v`, `status -vv` and `commit --dry-run -vv` agree with native git. */
+  async function expectVerbose(dir: string, label: string) {
+    for (const level of [1, 2]) {
+      const flag = level === 1 ? "-v" : "-vv";
+      const ours = await (await openRepo(root, dir)).status().callText({ verbose: level });
+      expect(bytesOf(ours.text), `${label}: status ${flag}`).toBe(git(dir, ["status", flag]));
+      const dry = await (await openRepo(root, dir)).commit().setVerbose(level).callDryRun();
+      const native = gitRun(root, dir, ["commit", "--dry-run", flag]);
+      expect(bytesOf(dry.text), `${label}: commit --dry-run ${flag}`).toBe(native.stdout);
+      expect(dry.exitCode, `${label}: commit --dry-run ${flag} exit`).toBe(native.status);
+    }
+  }
+
+  it("a merge conflict and an am -3 conflict, with and without other worktree changes", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    conflictBranches(dir);
+    gitRun(root, dir, ["merge", "side"]);
+    await expectVerbose(dir, "merge conflict");
+    putFile(dir, "a.txt", "a changed\n");
+    await expectVerbose(dir, "merge conflict, a.txt changed");
+    git(dir, ["checkout", "--", "a.txt"]);
+    git(dir, ["merge", "--abort"]);
+    const patch = git(dir, ["format-patch", "-1", "--stdout", "side"]);
+    putFile(dir, "../p.mbox", patch);
+    gitRun(root, dir, ["am", "-3", "../p.mbox"]);
+    await expectVerbose(dir, "am -3 conflict");
+    putFile(dir, "a.txt", "a changed\n");
+    await expectVerbose(dir, "am -3 conflict, a.txt changed");
+  }, 120_000);
+});
+
+describeGit("status -v / -vv with submodules: the submodule ignore configuration", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "status-v-sub-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** A repository with two submodules: `s1` moved and staged, `s2` moved, unstaged, dirty. */
+  function withSubmodules(dir: string) {
+    const up = join(root, "up");
+    mkdirSync(up, { recursive: true });
+    git(up, ["init", "-q", "-b", "main"]);
+    putFile(up, "f.txt", "f\n");
+    git(up, ["add", "f.txt"]);
+    git(up, ["commit", "-qm", "f"]);
+    base(dir);
+    for (const name of ["s1", "s2"]) {
+      git(dir, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", up, name]);
+    }
+    git(dir, ["commit", "-qm", "submodules"]);
+    for (const name of ["s1", "s2"]) {
+      putFile(join(dir, name), "f.txt", `${name} moved\n`);
+      git(join(dir, name), ["commit", "-qam", "moved"]);
+    }
+    git(dir, ["add", "s1"]);
+    putFile(join(dir, "s2"), "f.txt", "dirty\n");
+    putFile(dir, "c.txt", "c changed\n");
+  }
+
+  async function expectVerbose(dir: string, label: string) {
+    for (const level of [1, 2]) {
+      const flag = level === 1 ? "-v" : "-vv";
+      const ours = await (await openRepo(root, dir)).status().callText({ verbose: level });
+      expect(bytesOf(ours.text), `${label}: status ${flag}`).toBe(git(dir, ["status", flag]));
+    }
+  }
+
+  it("diff.ignoreSubmodules and submodule.<name>.ignore apply to the verbose diffs", async () => {
+    const dir = join(root, "r");
+    withSubmodules(dir);
+    await expectVerbose(dir, "no ignore");
+    for (const value of ["all", "dirty", "untracked", "none"]) {
+      git(dir, ["config", "diff.ignoreSubmodules", value]);
+      await expectVerbose(dir, `diff.ignoreSubmodules=${value}`);
+      git(dir, ["config", "--unset", "diff.ignoreSubmodules"]);
+      for (const name of ["s1", "s2"]) {
+        git(dir, ["config", `submodule.${name}.ignore`, value]);
+        await expectVerbose(dir, `submodule.${name}.ignore=${value}`);
+        git(dir, ["config", "--unset", `submodule.${name}.ignore`]);
+      }
+    }
+    // declared in .gitmodules only
+    git(dir, ["config", "-f", ".gitmodules", "submodule.s1.ignore", "all"]);
+    git(dir, ["config", "-f", ".gitmodules", "submodule.s2.ignore", "all"]);
+    await expectVerbose(dir, ".gitmodules ignore=all");
+  }, 120_000);
+});

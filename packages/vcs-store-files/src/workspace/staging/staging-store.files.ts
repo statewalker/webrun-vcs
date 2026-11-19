@@ -5,9 +5,11 @@ import type {
   CacheTree,
   IndexBuilder,
   IndexEditor,
+  IndexFilePending,
   ResolveUndoRecord,
   Staging,
   StagingIndexLock,
+  StagingState,
   UntrackedCache,
 } from "@statewalker/vcs-working-tree";
 import {
@@ -470,6 +472,34 @@ export class FileStagingStore implements Staging {
     };
   }
 
+  saveState(): StagingState {
+    const saved: SavedFileStagingState = {
+      staging: this,
+      entries: this._entries.slice(),
+      asRead: new Set(this.asRead),
+      unwritten: this.unwritten,
+      skipWorktreeCleared: new Set(this.skipWorktreeCleared),
+      updateTime: this.updateTime,
+      version: this.version,
+      pending: this.indexFile.pendingState(),
+    };
+    return saved;
+  }
+
+  restoreState(state: StagingState): void {
+    const saved = state as SavedFileStagingState;
+    if (saved.staging !== this || !saved.entries) {
+      throw new Error("restoreState: the state was saved by another staging");
+    }
+    this._entries = saved.entries.slice();
+    this.asRead = new Set(saved.asRead);
+    this.unwritten = saved.unwritten;
+    this.skipWorktreeCleared = new Set(saved.skipWorktreeCleared);
+    this.updateTime = saved.updateTime;
+    this.version = saved.version;
+    this.indexFile.restorePending(saved.pending);
+  }
+
   /** Sets the check `write()` smudges racily clean entries with. */
   setRacyCheck(check: RacyCheck | undefined): void {
     this.racyCheck = check;
@@ -579,12 +609,18 @@ export class FileStagingStore implements Staging {
     this._entries = newEntries;
   }
 
+  /** @internal - Whether `entry` (this very object) is one kept as read or written */
+  _isAsRead(entry: unknown): boolean {
+    return this.asRead.has(entry as StagingEntry);
+  }
+
   /**
-   * @internal - Used by the builder: entries it was given back as they are count as set in
-   * this session (as the copies it makes of other options do), not as read.
+   * @internal - Used by the builder: its copies of entries kept as read are still as read
+   * (git copies an entry with its flags: one never refreshed stays checked for racy-git
+   * smudging when the index is written)
    */
-  _forgetAsRead(entries: readonly StagingEntry[]): void {
-    for (const entry of entries) this.asRead.delete(entry);
+  _keepAsRead(entries: readonly StagingEntry[]): void {
+    for (const entry of entries) this.asRead.add(entry);
   }
 
   /** @internal - Used by builder/editor */
@@ -604,14 +640,25 @@ export class FileStagingStore implements Staging {
   }
 }
 
+/** What `FileStagingStore.saveState` keeps. */
+interface SavedFileStagingState extends StagingState {
+  readonly entries: readonly StagingEntry[];
+  readonly asRead: ReadonlySet<StagingEntry>;
+  readonly unwritten: boolean;
+  readonly skipWorktreeCleared: ReadonlySet<string>;
+  readonly updateTime: number;
+  readonly version: IndexVersion;
+  readonly pending: IndexFilePending;
+}
+
 /**
  * Builder for bulk staging area modifications.
  */
 class FileStagingBuilder implements IndexBuilder {
   private _entries: StagingEntry[] = [];
   private keeping: Array<{ start: number; count: number }> = [];
-  /** The store's own entries given back to `add` unchanged (an index rewritten around a few paths) */
-  private reused: StagingEntry[] = [];
+  /** Copies made of store entries kept as read (still as read once finished) */
+  private asReadCopies: StagingEntry[] = [];
   /** Where the next entry given back is looked for in the store's entries */
   private cursor = 0;
 
@@ -625,7 +672,6 @@ class FileStagingBuilder implements IndexBuilder {
       if (existing[k] !== options) continue;
       this.cursor = k + 1;
       this._entries.push(existing[k]);
-      this.reused.push(existing[k]);
       return;
     }
     const entry: StagingEntry = {
@@ -647,6 +693,7 @@ class FileStagingBuilder implements IndexBuilder {
       skipWorktree: options.skipWorktree,
     };
     reuseEntryEncoding(options, entry);
+    if (this.store._isAsRead(options)) this.asReadCopies.push(entry);
     this._entries.push(entry);
   }
 
@@ -726,7 +773,7 @@ class FileStagingBuilder implements IndexBuilder {
 
     // Replace store entries
     this.store._replaceEntries(this._entries);
-    this.store._forgetAsRead(this.reused);
+    this.store._keepAsRead(this.asReadCopies);
   }
 
   private validateStages(): void {

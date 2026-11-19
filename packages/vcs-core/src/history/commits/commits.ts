@@ -197,6 +197,14 @@ export interface Commits extends ObjectStorage<Commit> {
   isAncestor(ancestor: ObjectId, descendant: ObjectId): Promise<boolean>;
 
   /**
+   * The commits only `ours` reaches and those only `theirs` reaches (`rev-list
+   * --left-right --count ours...theirs`), walked no further than the merge bases (see
+   * `countAheadBehind`; the commit-graph's generations order the walk where there is one).
+   * Optional: callers walk with `countAheadBehind` over `load` otherwise.
+   */
+  countAheadBehind?(ours: ObjectId, theirs: ObjectId): Promise<{ ahead: number; behind: number }>;
+
+  /**
    * Check if a commit exists
    *
    * @param id Commit object ID

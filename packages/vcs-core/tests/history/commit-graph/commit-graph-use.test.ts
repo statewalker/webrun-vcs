@@ -10,11 +10,13 @@ import { createCommitGraphProvider } from "../../../src/history/commit-graph/com
 import { readCommitGraph } from "../../../src/history/commit-graph/commit-graph-reader.js";
 import { writeCommitGraphFile } from "../../../src/history/commit-graph/commit-graph-writer.js";
 import {
+  countAheadBehind,
   getMergeBases,
   isAncestorOf,
   type ReachSource,
 } from "../../../src/history/commits/commit-reach.js";
 import { createCommits } from "../../../src/history/commits/commits.impl.js";
+import type { Commits } from "../../../src/history/commits/commits.js";
 import { createGitObjects, type GitObjects } from "../../../src/history/objects/index.js";
 import { createTrees } from "../../../src/history/trees/trees.impl.js";
 import { rawStorageStaging } from "../../../src/storage/adapters/staging-blob-store.js";
@@ -252,4 +254,111 @@ describe("random histories", () => {
       }
     }
   });
+});
+
+describe("ahead and behind counts", () => {
+  /** The store's own count (createCommits implements the optional method). */
+  const counted = (
+    commits: { countAheadBehind?: Commits["countAheadBehind"] },
+    a: string,
+    b: string,
+  ) => {
+    if (!commits.countAheadBehind) throw new Error("countAheadBehind is not implemented");
+    return commits.countAheadBehind(a, b);
+  };
+  /** rev-list --left-right --count: every ancestor of each side, then the difference. */
+  async function bruteForce(s: Awaited<ReturnType<typeof setup>>, a: string, b: string) {
+    const reach = async (from: string) => {
+      const seen = new Set([from]);
+      const stack = [from];
+      while (stack.length > 0) {
+        for (const p of (await s.plain.load(stack.pop() as string))?.parents ?? []) {
+          if (!seen.has(p)) {
+            seen.add(p);
+            stack.push(p);
+          }
+        }
+      }
+      return seen;
+    };
+    const x = await reach(a);
+    const y = await reach(b);
+    return {
+      ahead: [...x].filter((id) => !y.has(id)).length,
+      behind: [...y].filter((id) => !x.has(id)).length,
+    };
+  }
+
+  it("match every commit only one side reaches, with and without a graph", async () => {
+    let seed = 11;
+    const rand = (n: number) => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed % n;
+    };
+    for (let round = 0; round < 6; round++) {
+      const s = await setup();
+      const ids: string[] = [];
+      for (let i = 0; i < 45; i++) {
+        const parents: string[] = [];
+        if (i > 0 && rand(10) > 0)
+          parents.push(ids[ids.length - 1 - rand(Math.min(ids.length, 6))] as string);
+        if (i > 3 && rand(3) === 0) parents.push(ids[rand(ids.length)] as string);
+        if (i > 6 && rand(9) === 0) parents.push(ids[rand(ids.length)] as string);
+        // dates mostly rising, sometimes older than a parent (rounds 1 and 2)
+        const skew = round > 0 && rand(5) === 0 ? 300 : 0;
+        ids.push(await s.commit([...new Set(parents)], 1000 + i * 10 - skew + round));
+        if (i === 30) await s.writeGraph(ids.slice());
+      }
+      const sample = ids.filter((_, i) => i % 3 === 0 || i > 40);
+      for (const x of sample) {
+        for (const y of sample) {
+          const expected = await bruteForce(s, x, y);
+          expect(await counted(s.withGraph, x, y)).toEqual(expected);
+          expect(await counted(s.plain, x, y)).toEqual(expected);
+        }
+      }
+    }
+  });
+
+  it("a commit dated before its parent (outside the graph) is still counted once", async () => {
+    const s = await setup();
+    const base = await linear(s.commit, [], 5, 1000);
+    const tip = base[4] as string;
+    // left: a commit dated far in the past, then a normal one; right: one commit
+    const old = await s.commit([tip], 10);
+    const left = await s.commit([old], 2000);
+    const right = await s.commit([tip], 1500);
+    const merged = await s.commit([right, old], 1600);
+    expect(await counted(s.plain, left, merged)).toEqual(await bruteForce(s, left, merged));
+    expect(await counted(s.plain, merged, left)).toEqual(await bruteForce(s, merged, left));
+  });
+
+  it("stop at the merge bases: a long shared history is not read", async () => {
+    const s = await setup();
+    const shared = await linear(s.commit, [], 3000, 1000);
+    const top = shared[2999] as string;
+    const ours = await linear(s.commit, [top], 3, 10_000);
+    const theirs = await linear(s.commit, [top], 2, 10_000);
+    const a = ours[2] as string;
+    const b = theirs[1] as string;
+    for (const graph of [false, true]) {
+      if (graph) await s.writeGraph([a, b]);
+      const visited: string[] = [];
+      const source: ReachSource = async (id) => {
+        const c = await s.plain.load(id);
+        return c
+          ? { parents: c.parents, date: c.committer.timestamp, generation: Infinity }
+          : undefined;
+      };
+      const started = performance.now();
+      const counts = await countAheadBehind(source, a, b, { onVisit: (id) => visited.push(id) });
+      expect(counts).toEqual({ ahead: 3, behind: 2 });
+      // the tips, their own commits and the merge base's line, not the 3000 below
+      expect(visited.length).toBeLessThan(12);
+      expect(performance.now() - started).toBeLessThan(1000);
+      s.reads.count = 0;
+      expect(await counted(s.withGraph, a, b)).toEqual({ ahead: 3, behind: 2 });
+      expect(s.reads.count).toBeLessThan(graph ? 2 : 12);
+    }
+  }, 60_000);
 });

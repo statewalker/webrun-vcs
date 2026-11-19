@@ -54,6 +54,7 @@ import { worktreeModeTrust } from "./core-config.js";
 import { textconvRunnerOf } from "./diff-textconv.js";
 import { matchPathspec, type PathspecItem, parsePathspecItem } from "./pathspec.js";
 import { readSubmoduleDirt } from "./status-command.js";
+import { isSubmoduleIgnoreMode, parseGitmodules } from "./submodule-config.js";
 
 /** The output formats of {@link DiffCommand.callText} */
 export type DiffOutputFormat =
@@ -171,6 +172,17 @@ const GITLINK = 0o160000;
 const NULL_ID = "0".repeat(40);
 const encoder = new TextEncoder();
 
+/** The chunks as one array. */
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
+}
+
 /** git's path order: bytes, as `strcmp` */
 function compareBytes(a: string, b: string): number {
   return compareGitPaths(a, b);
@@ -264,6 +276,12 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private oldTree?: string;
   private newTree?: string;
   private cached = false;
+  /** revs->combine_merges: a conflicted path as its combined diff (`git diff`'s default) */
+  private combineMerges = true;
+  /** diffopt.flags.dirty_submodules: a submodule at another commit checked for dirt too */
+  private dirtySubmodules = true;
+  /** The `ignore` setting of each submodule's path (see `submoduleIgnores`) */
+  private submoduleIgnoreMap?: Promise<Map<string, "none" | "untracked" | "dirty" | "all">>;
   private pathFilter?: string;
   private pathspecItems?: PathspecItem[];
   private renames?: boolean;
@@ -296,6 +314,35 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   setNewTree(refOrId: string): this {
     this.checkCallable();
     this.newTree = refOrId;
+    return this;
+  }
+
+  /**
+   * Whether a conflicted path is shown as its combined diff (`diff --cc` of stages 2 and 3
+   * against the file, `git diff`'s default) or, as git's `diff-files -p` and the unstaged
+   * diff of `git status -vv` show it, listed as unmerged (`* Unmerged path <path>`) and
+   * diffed as its stage 2 against the file.
+   *
+   * @example
+   * ```typescript
+   * const text = await git.diff().setCombineMerges(false).callText("patch");
+   * ```
+   */
+  setCombineMerges(combine: boolean): this {
+    this.checkCallable();
+    this.combineMerges = combine;
+    return this;
+  }
+
+  /**
+   * Whether a submodule whose worktree is at another commit than its entry is also checked
+   * for changes of its own (`Subproject commit <id>-dirty`), as git's patch output does
+   * (`diff_setup_done` sets `dirty_submodules` for it). `git status -v` diffs without it:
+   * only a submodule at its entry's commit is shown dirty there.
+   */
+  setDirtySubmodules(dirty: boolean): this {
+    this.checkCallable();
+    this.dirtySubmodules = dirty;
     return this;
   }
 
@@ -955,7 +1002,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           if (!this.matches(path)) continue;
           const ours = stages.get(2);
           const theirs = stages.get(3);
-          if (patch && ours && theirs) {
+          if (patch && this.combineMerges && ours && theirs) {
             combined.push({ path, ours, theirs });
             continue;
           }
@@ -969,9 +1016,71 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       oldSide = await this.treeSide(this.oldTree ?? "HEAD", this.oldTree === undefined);
       newSide = await this.treeSide("HEAD", true);
     }
-    const entries = this.pairUp(oldSide, newSide, unmerged);
+    const ignoreOf = await this.submoduleIgnoreOf();
+    // diff_change / diff_addremove: a submodule whose changes are ignored is left out
+    const entries = this.pairUp(oldSide, newSide, unmerged).filter((e) => {
+      if (e.unmerged) return true;
+      const oldLink = e.oldMode === GITLINK;
+      const newLink = e.newMode === GITLINK;
+      const gitlinkOnly =
+        e.changeType === ChangeType.ADD
+          ? newLink
+          : e.changeType === ChangeType.DELETE
+            ? oldLink
+            : oldLink && newLink;
+      return !gitlinkOnly || ignoreOf((e.newPath ?? e.oldPath) as string) !== "all";
+    });
     if (renames) await this.detectRenames(entries, renames === "copies");
     return { entries, combined };
+  }
+
+  /**
+   * What the submodule at a path ignores (git's `set_diffopt_flags_from_submodule_config`
+   * over `diff.ignoreSubmodules`): its `submodule.<name>.ignore` (the configuration, else
+   * `.gitmodules`), else `diff.ignoreSubmodules`; undefined when neither is set.
+   */
+  private async submoduleIgnoreOf(): Promise<
+    (path: string) => "none" | "untracked" | "dirty" | "all" | undefined
+  > {
+    const fallback = submoduleIgnoreValue(this.config.value("diff.ignoreSubmodules"));
+    const own = await this.submoduleIgnores();
+    return (path) => own.get(path) ?? fallback;
+  }
+
+  /** `submodule.<name>.ignore` of each submodule `.gitmodules` names (the worktree's, else the index's). */
+  private submoduleIgnores(): Promise<Map<string, "none" | "untracked" | "dirty" | "all">> {
+    this.submoduleIgnoreMap ??= (async () => {
+      const out = new Map<string, "none" | "untracked" | "dirty" | "all">();
+      let text: string | undefined;
+      try {
+        const worktree = this.worktreeAccess;
+        const entry = worktree ? await worktree.getEntry(".gitmodules") : undefined;
+        if (worktree && entry && !entry.isDirectory && entry.mode !== 0o120000) {
+          const chunks: Uint8Array[] = [];
+          for await (const chunk of worktree.readContent(".gitmodules")) chunks.push(chunk);
+          text = new TextDecoder().decode(concatChunks(chunks));
+        } else {
+          const staged = await this.staging.getEntry(".gitmodules");
+          if (staged && staged.mode !== 0o120000) {
+            const chunks: Uint8Array[] = [];
+            for await (const chunk of (await this.blobs.load(staged.objectId)) ?? []) {
+              chunks.push(chunk);
+            }
+            text = new TextDecoder().decode(concatChunks(chunks));
+          }
+        }
+      } catch {
+        text = undefined;
+      }
+      if (!text) return out;
+      for (const submodule of parseGitmodules(text)) {
+        const configured = this.config.value(`submodule.${submodule.name}.ignore`)?.trim();
+        const value = configured !== undefined ? configured : submodule.ignore?.trim();
+        if (submodule.path && isSubmoduleIgnoreMode(value)) out.set(submodule.path, value);
+      }
+      return out;
+    })();
+    return this.submoduleIgnoreMap;
   }
 
   /** diff-files on a conflicted path's stage 2 (`--ours`): its entry against the worktree */
@@ -1358,13 +1467,14 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const unmerged = new Map<string, Map<number, StageEntry>>();
     const trust = worktreeModeTrust(this.workingCopy, worktree);
     const indexTime = this.staging.getUpdateTime();
-    const ignore = submoduleIgnoreValue(this.config.value("diff.ignoreSubmodules"));
+    const ignoreOf = await this.submoduleIgnoreOf();
     const compareWith = async (
       entry: StageEntry,
       current?: WorktreeEntry | null,
     ): Promise<Side | undefined> => {
       const indexSide: Side = { mode: entry.mode, id: entry.objectId };
       if (entry.skipWorktree || entry.assumeValid) return indexSide;
+      const ignore = entry.mode === GITLINK ? ignoreOf(entry.path) : undefined;
       if (entry.mode === GITLINK && ignore === "all") return indexSide;
       const result = await compareWithWorktree(worktree, entry, { trust, indexTime }, current);
       if (result.kind === "deleted") return undefined;
@@ -1374,7 +1484,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         // a populated submodule with changes of its own: "-dirty" (untracked files count
         // only with diff.ignoreSubmodules=none, as git's default ignores them)
         let dirty = false;
-        if (entry.mode === GITLINK && ignore !== "dirty" && result.worktreeEntry?.isDirectory) {
+        // match_stat_with_submodule: one at another commit only with dirty_submodules
+        if (
+          entry.mode === GITLINK &&
+          ignore !== "dirty" &&
+          (this.dirtySubmodules || id === entry.objectId) &&
+          result.worktreeEntry?.isDirectory
+        ) {
           const dirt = await readSubmoduleDirt(worktree, entry.path, ignore !== "none");
           dirty = !!dirt.modified || (ignore === "none" && !!dirt.untracked);
         }

@@ -14,7 +14,7 @@ import type { UntrackedCache } from "../status/untracked-cache.js";
 import type { CacheTree } from "./cache-tree.js";
 import { verifyTreePaths } from "./conflict-utils.js";
 import type { ResolveUndoRecord } from "./index-extensions.js";
-import { IndexFile, readIndexChecksum } from "./index-file.js";
+import { IndexFile, type IndexFilePending, readIndexChecksum } from "./index-file.js";
 import { INDEX_VERSION_2, type IndexVersion, reuseEntryEncoding } from "./index-format.js";
 import type {
   ConflictResolution,
@@ -27,6 +27,7 @@ import type {
   ReadTreeOptions,
   Staging,
   StagingIndexLock,
+  StagingState,
 } from "./staging.js";
 import {
   clearSkipWorktreeFlags,
@@ -442,6 +443,34 @@ export class GitStaging implements Staging {
     };
   }
 
+  saveState(): StagingState {
+    const saved: SavedGitStagingState = {
+      staging: this,
+      entries: this._entries.slice(),
+      asRead: new Set(this.asRead),
+      unwritten: this.unwritten,
+      skipWorktreeCleared: new Set(this.skipWorktreeCleared),
+      updateTime: this.updateTime,
+      version: this.version,
+      pending: this.indexFile.pendingState(),
+    };
+    return saved;
+  }
+
+  restoreState(state: StagingState): void {
+    const saved = state as SavedGitStagingState;
+    if (saved.staging !== this || !saved.entries) {
+      throw new Error("restoreState: the state was saved by another staging");
+    }
+    this._entries = saved.entries.slice();
+    this.asRead = new Set(saved.asRead);
+    this.unwritten = saved.unwritten;
+    this.skipWorktreeCleared = new Set(saved.skipWorktreeCleared);
+    this.updateTime = saved.updateTime;
+    this.version = saved.version;
+    this.indexFile.restorePending(saved.pending);
+  }
+
   /** Sets the check `write()` smudges racily clean entries with. */
   setRacyCheck(check: RacyCheck | undefined): void {
     this.racyCheck = check;
@@ -596,9 +625,17 @@ export class GitStaging implements Staging {
   }
 
   /** @internal - Used by builder/editor */
-  _replaceEntries(newEntries: IndexEntry[]): void {
+  _replaceEntries(newEntries: IndexEntry[], asReadCopies?: Iterable<IndexEntry>): void {
     this.unwritten = true;
     this._entries = newEntries;
+    // a builder's copy of an entry kept as read is still as read (git copies the entry
+    // with its flags: one never refreshed stays checked for racy-git smudging)
+    if (asReadCopies) for (const entry of asReadCopies) this.asRead.add(entry);
+  }
+
+  /** @internal - Whether `entry` (this very object) is one kept as read or written */
+  _isAsRead(entry: unknown): boolean {
+    return this.asRead.has(entry as StagingEntry);
   }
 
   /** @internal - Used by builder/editor */
@@ -618,11 +655,24 @@ export class GitStaging implements Staging {
   }
 }
 
+/** What `GitStaging.saveState` keeps. */
+interface SavedGitStagingState extends StagingState {
+  readonly entries: readonly IndexEntry[];
+  readonly asRead: ReadonlySet<StagingEntry>;
+  readonly unwritten: boolean;
+  readonly skipWorktreeCleared: ReadonlySet<string>;
+  readonly updateTime: number;
+  readonly version: IndexVersion;
+  readonly pending: IndexFilePending;
+}
+
 /**
  * Builder for bulk staging area modifications.
  */
 class GitStagingBuilder implements IndexBuilder {
   private entries: IndexEntry[] = [];
+  /** Copies of the store's entries kept as read, added as they were */
+  private asReadCopies: IndexEntry[] = [];
   private keeping: Array<{ start: number; count: number }> = [];
 
   constructor(private readonly store: GitStaging) {}
@@ -647,6 +697,7 @@ class GitStagingBuilder implements IndexBuilder {
       skipWorktree: options.skipWorktree,
     };
     reuseEntryEncoding(options, entry);
+    if (this.store._isAsRead(options)) this.asReadCopies.push(entry);
     this.entries.push(entry);
   }
 
@@ -719,7 +770,7 @@ class GitStagingBuilder implements IndexBuilder {
     this.validateStages();
 
     // Replace store entries
-    this.store._replaceEntries(this.entries);
+    this.store._replaceEntries(this.entries, this.asReadCopies);
   }
 
   private validateStages(): void {

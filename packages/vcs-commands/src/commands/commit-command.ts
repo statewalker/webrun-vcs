@@ -6,12 +6,20 @@ import {
   type TreeEntry,
 } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
-import type { Staging, StagingEntry, Worktree, WorktreeEntry } from "@statewalker/vcs-working-tree";
+import {
+  expandUserPath,
+  type Staging,
+  type StagingEntry,
+  type StagingIndexLock,
+  type Worktree,
+  type WorktreeEntry,
+} from "@statewalker/vcs-working-tree";
 
 import {
   EmptyCommitError,
   GitApiError,
   IncompatibleOptionsError,
+  IndexLockFailedError,
   InvalidArgumentError,
   NoHeadError,
   NoMessageError,
@@ -148,6 +156,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private showBranch?: boolean;
   private nullTermination = false;
   private aheadBehind?: boolean;
+  private templateFile?: string;
 
   /**
    * Set the commit message, as git's `commit -m` takes it: its last line is ended and it is
@@ -415,6 +424,23 @@ export class CommitCommand extends GitCommand<CommitResult> {
     return this;
   }
 
+  /**
+   * `-t <file>` / `--template=<file>`: the editor starts from this file's text (default
+   * `commit.template`) when no message is given and nothing is in progress; a message the
+   * editor leaves as the template was is refused (`Aborting commit; you did not edit the
+   * message.`). A relative path is read from the worktree's top, through the host.
+   *
+   * @example
+   * ```typescript
+   * await git.commit().setTemplate("/home/me/.gitmessage").setEditor(edit).call();
+   * ```
+   */
+  setTemplate(path: string): this {
+    this.checkCallable();
+    this.templateFile = path;
+    return this;
+  }
+
   /** `-e` / `--no-edit`: edit a given message too, or never edit (default: edit when none is given). */
   setEdit(edit: boolean): this {
     this.checkCallable();
@@ -521,12 +547,19 @@ export class CommitCommand extends GitCommand<CommitResult> {
       const paths = await this.listPartialPaths(state, mergeHeads, headId);
       const index = await this.holdIndex();
       try {
-        const tree = await this.preparePartialCommit(paths, headId, index);
-        result = await this.withIndexOfTree(tree, run);
+        // the false index shown, its tree never stored (git writes it into a lock only)
+        const falseIndex = await this.preparePartialCommit(paths, headId, index);
+        result = await this.withFalseIndex(await this.falseIndexFiles(falseIndex), run);
       } finally {
         await index.release();
       }
-    } else result = await run();
+    } else {
+      // an as-is commit (prepare_index): the index lock taken (git dies when another
+      // process holds it), then the status of the index as it is
+      const index = await this.holdIndex();
+      await index.release();
+      result = await run();
+    }
     return { ...result, exitCode: result.committable ? 0 : 1 };
   }
 
@@ -550,10 +583,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
     author: PersonIdent;
     committer: PersonIdent;
     authorKept: boolean;
-  }): Promise<{ message: string; cleanup: CleanupMode }> {
+  }): Promise<{ message: string; cleanup: CleanupMode; untouched: boolean }> {
     const { state } = ctx;
     const config = RemoteConfigStore.from(this.workingCopy);
     const mode = editorCleanupMode(this.workingCopy, this.cleanupMode);
+    const templateText = await this.readTemplate(config);
     const rebasing = (await state.read("rebase-merge/head-name")) !== undefined;
     const whence: CommitWhence =
       ctx.mergeHeads.length > 0
@@ -578,7 +612,15 @@ export class CommitCommand extends GitCommand<CommitResult> {
         if (mergeMsg.startsWith(cut) || mergeMsg.includes(`\n${cut}`)) cutLineAdded = true;
       }
     } else if (squashMsg !== undefined) sb = squashMsg;
-    if (mode !== CleanupMode.VERBATIM) sb = stripspace(sb);
+    else if (templateText !== undefined) sb = templateText;
+    // clean_message_contents: not for a template, which goes in as it is
+    const fromTemplate =
+      this.message === undefined &&
+      !(this.amend && ctx.previousCommit) &&
+      mergeMsg === undefined &&
+      squashMsg === undefined &&
+      templateText !== undefined;
+    if (mode !== CleanupMode.VERBATIM && !fromTemplate) sb = stripspace(sb);
     // core.commentChar=auto: a character the message does not start a line with
     const comment = commentPrefixOf(this.workingCopy, sb);
     const includeStatus = this.includeStatus ?? parseBool(config.value("commit.status"), true);
@@ -655,12 +697,12 @@ export class CommitCommand extends GitCommand<CommitResult> {
         : await run();
       committable = status.committable;
     }
-    // an empty commit is refused before the editor runs
+    // COMMIT_EDITMSG written in full, then an empty commit refused before the editor runs
+    await state.write("COMMIT_EDITMSG", template);
     const isMerge = (ctx.previousCommit?.parents.length ?? 0) > 1;
     if (!committable && whence !== "merge" && !this.allowEmpty && !(this.amend && isMerge)) {
       throw new EmptyCommitError();
     }
-    await state.write("COMMIT_EDITMSG", template);
     const edited = await (this.editor as CommitEditor)("COMMIT_EDITMSG", template);
     let text: string;
     if (typeof edited === "string") {
@@ -679,7 +721,37 @@ export class CommitCommand extends GitCommand<CommitResult> {
     if (mode !== CleanupMode.VERBATIM) {
       text = stripspace(text, mode === CleanupMode.STRIP ? comment : undefined);
     }
-    return { message: text, cleanup: mode === CleanupMode.VERBATIM ? mode : CleanupMode.STRIP };
+    return {
+      message: text,
+      cleanup: mode === CleanupMode.VERBATIM ? mode : CleanupMode.STRIP,
+      untouched: templateUntouched(text, templateText, mode, comment),
+    };
+  }
+
+  /**
+   * The commit template (`-t`, else `commit.template`, `~/` expanded) read through the host,
+   * undefined when none is set; one that cannot be read fails as git's `die_errno`.
+   */
+  private async readTemplate(config: RemoteConfigStore): Promise<string | undefined> {
+    const configured = config.value("commit.template");
+    const file =
+      this.templateFile ?? (configured !== undefined && configured !== "" ? configured : undefined);
+    if (file === undefined) return undefined;
+    const environment = hostEnvironmentOf(this.workingCopy);
+    const expanded = expandUserPath(file, environment);
+    let bytes: Uint8Array | undefined;
+    if (expanded !== undefined && environment) {
+      let path = expanded;
+      if (!path.startsWith("/")) {
+        const base = (this.worktreeAccess as { hostPath?: string } | undefined)?.hostPath;
+        if (base) path = `${base.replace(/\/+$/, "")}/${path}`;
+      }
+      bytes = await environment.readFile(path).catch(() => undefined);
+    }
+    if (!bytes) {
+      throw new GitApiError(`fatal: could not read '${file}': No such file or directory`);
+    }
+    return new TextDecoder().decode(bytes);
   }
 
   /** committer_ident_sufficiently_given: a name and an email named, not guessed. */
@@ -751,17 +823,27 @@ export class CommitCommand extends GitCommand<CommitResult> {
     return status.callText(options);
   }
 
-  /**
-   * Runs `fn` while the staging holds the entries of `tree` (a partial commit's false
-   * index: HEAD with the named paths), each with the stat of the staging's same entry,
-   * then puts the staging's entries back.
-   */
+  /** {@link withFalseIndex} with the files of `tree` (a partial commit's stored tree). */
   private async withIndexOfTree<T>(tree: ObjectId, fn: () => Promise<T>): Promise<T> {
+    return this.withFalseIndex(await flatTree(this.trees, tree), fn);
+  }
+
+  /**
+   * Runs `fn` while the staging holds the entries `flat` names (a partial commit's false
+   * index: HEAD with the named paths), each with the stat of the staging's same entry,
+   * then puts the staging back exactly as it was: the same entry objects, so the ones kept
+   * as read are still checked for racy-git smudging when the index is written
+   * (`saveState`; a staging without it gets its entries rebuilt).
+   */
+  private async withFalseIndex<T>(
+    flat: Map<string, { objectId: ObjectId; mode: number }>,
+    fn: () => Promise<T>,
+  ): Promise<T> {
     const staging = this.staging;
+    const saved = staging.saveState?.();
     const before = (staging.entryList?.() ?? (await collectEntries(staging))).slice();
-    const cacheTree = staging.getCacheTree?.();
+    const cacheTree = saved ? undefined : staging.getCacheTree?.();
     const known = new Map(before.filter((e) => e.stage === 0).map((e) => [e.path, e]));
-    const flat = await flatTree(this.trees, tree);
     const builder = staging.createBuilder();
     for (const [path, entry] of flat) {
       const same = known.get(path);
@@ -775,10 +857,13 @@ export class CommitCommand extends GitCommand<CommitResult> {
     try {
       return await fn();
     } finally {
-      const restore = staging.createBuilder();
-      for (const entry of before) restore.add(entry);
-      await restore.finish();
-      staging.setCacheTree?.(cacheTree);
+      if (saved) staging.restoreState?.(saved);
+      else {
+        const restore = staging.createBuilder();
+        for (const entry of before) restore.add(entry);
+        await restore.finish();
+        staging.setCacheTree?.(cacheTree);
+      }
     }
   }
 
@@ -866,7 +951,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
       // the same paths taken; any failure leaves the index as it was
       index = await this.holdIndex();
       try {
-        partialTree = await this.preparePartialCommit(partialPaths, headId, index);
+        partialTree = await this.storeFalseIndex(
+          await this.preparePartialCommit(partialPaths, headId, index),
+        );
       } catch (error) {
         await index.release();
         throw error;
@@ -963,6 +1050,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
         ? this.datedIdent("committer", this.committerName)
         : this.resolveCommitter(author));
 
+    let untouched = false;
     if (editing) {
       const edited = await this.editMessage({
         state,
@@ -976,6 +1064,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       });
       finalMessage = edited.message;
       cleanup = edited.cleanup;
+      untouched = edited.untouched;
     }
 
     // git's message_is_empty: nothing but whitespace and sign-offs (any text, verbatim)
@@ -986,6 +1075,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
         isEmptyMessage(finalMessage))
     ) {
       throw new NoMessageError("Aborting commit due to empty commit message.");
+    }
+    if (untouched && !this.allowEmptyMessage) {
+      throw new NoMessageError("Aborting commit; you did not edit the message.");
     }
 
     // Determine parents
@@ -1198,9 +1290,16 @@ export class CommitCommand extends GitCommand<CommitResult> {
     const unwritten = staging.hasUnwrittenChanges?.() !== false;
     // what the staging held, for a staging that cannot read it back (no index file) or that
     // holds edits not yet written
-    const lock = staging.lockIndex ? await staging.lockIndex() : undefined;
+    let lock: StagingIndexLock | undefined;
+    try {
+      lock = staging.lockIndex ? await staging.lockIndex() : undefined;
+    } catch (error) {
+      throw indexLockError(error, this.workingCopy);
+    }
+    // the staging as it is, put back exactly (the entry objects kept as read included)
+    const saved = !lock || unwritten ? staging.saveState?.() : undefined;
     const snapshot =
-      !lock || unwritten
+      (!lock || unwritten) && !saved
         ? {
             entries: (staging.entryList?.() ?? (await collectEntries(staging))).slice(),
             cacheTree: staging.getCacheTree?.(),
@@ -1220,6 +1319,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
         if (done) return;
         done = true;
         await lock?.rollback();
+        if (saved) {
+          staging.restoreState?.(saved);
+          return;
+        }
         if (!snapshot) {
           await staging.read();
           return;
@@ -1344,13 +1447,14 @@ export class CommitCommand extends GitCommand<CommitResult> {
    * not) hashed and staged, a path gone removed, a directory refused before anything
    * changes ("'<path>' does not have a commit checked out"); the index then gets its
    * cache-tree (none while it holds conflicts) and is written into the lock. The tree
-   * committed is HEAD's with the same paths taken (git's false index).
+   * committed is HEAD's with the same paths taken (git's false index), returned as HEAD's
+   * tree and those edits: stored by {@link storeFalseIndex}, never by a dry run.
    */
   private async preparePartialCommit(
     paths: Map<string, boolean>,
     headId: ObjectId | undefined,
     index: HeldIndex,
-  ): Promise<ObjectId> {
+  ): Promise<FalseIndex> {
     const taken = [...paths].filter(([, skipWorktree]) => !skipWorktree).map(([path]) => path);
     // the lstat of each path, before the index is touched
     const found = new Map<string, WorktreeEntry | undefined>();
@@ -1404,7 +1508,33 @@ export class CommitCommand extends GitCommand<CommitResult> {
     }
     const head = headId ? await this.commits.load(headId) : undefined;
     if (headId && !head) throw new RefNotFoundError(headId, "HEAD commit not found");
-    return (await this.editTree(head?.tree, [...edits])) ?? this.trees.store([]);
+    return { headTree: head?.tree, edits: [...edits] };
+  }
+
+  /** The tree of a partial commit's false index, stored (with the directories it changes). */
+  private async storeFalseIndex(falseIndex: FalseIndex): Promise<ObjectId> {
+    return (await this.editTree(falseIndex.headTree, falseIndex.edits)) ?? this.trees.store([]);
+  }
+
+  /** The files of a partial commit's false index, without storing a tree. */
+  private async falseIndexFiles(
+    falseIndex: FalseIndex,
+  ): Promise<Map<string, { objectId: ObjectId; mode: number }>> {
+    const flat: Map<string, { objectId: ObjectId; mode: number }> = await flatTree(
+      this.trees,
+      falseIndex.headTree,
+    );
+    for (const [path, edit] of falseIndex.edits) {
+      if (edit) {
+        // a file in place of a directory of HEAD (or the reverse) replaces it
+        for (const key of [...flat.keys()]) if (key.startsWith(`${path}/`)) flat.delete(key);
+        for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
+          flat.delete(path.slice(0, at));
+        }
+        flat.set(path, { objectId: edit.id, mode: edit.mode });
+      } else flat.delete(path);
+    }
+    return flat;
   }
 
   /**
@@ -1484,6 +1614,29 @@ export class CommitCommand extends GitCommand<CommitResult> {
   }
 }
 
+/** A partial commit's false index: HEAD's tree with the named paths set or removed. */
+interface FalseIndex {
+  headTree: ObjectId | undefined;
+  edits: Array<[string, { mode: number; id: ObjectId } | null]>;
+}
+
+/**
+ * The index lock another process holds, as git's `unable_to_lock_die` reports it (git 2.5x's
+ * wording: 2.43 adds "e.g. an editor opened by 'git commit'..." instead); other errors as
+ * they are.
+ */
+function indexLockError(error: unknown, workingCopy: unknown): unknown {
+  if (!(error instanceof Error) || error.name !== "IndexLockedError") return error;
+  const gitDir = (workingCopy as { config?: { hostGitDir?: string } }).config?.hostGitDir;
+  const lockPath = gitDir ? `${gitDir.replace(/\/+$/, "")}/index.lock` : ".git/index.lock";
+  return new IndexLockFailedError(
+    lockPath,
+    `fatal: Unable to create '${lockPath}': File exists.\n\n` +
+      "Another git process seems to be running in this repository, or the lock file may be stale",
+    { cause: error },
+  );
+}
+
 /** The index a commit holds while it changes it (see `CommitCommand.holdIndex`). */
 interface HeldIndex {
   /** Writes the staging's entries into the index lock (nothing without an index file). */
@@ -1502,6 +1655,25 @@ async function collectEntries(staging: Staging): Promise<StagingEntry[]> {
 }
 
 const isGitlink = (mode: number) => (mode & 0o170000) === 0o160000;
+
+/**
+ * git's `template_untouched`: the cleaned-up message is the template (cleaned up the same
+ * way, comments kept unless the mode strips them) followed by nothing but whitespace and
+ * sign-offs. A verbatim message that is not empty is never untouched; nor is any without a
+ * template (or with an empty one).
+ */
+function templateUntouched(
+  message: string,
+  template: string | undefined,
+  mode: CleanupMode,
+  comment: string,
+): boolean {
+  if (mode === CleanupMode.VERBATIM && message.length > 0) return false;
+  if (!template) return false;
+  const tmpl = stripspace(template, mode === CleanupMode.STRIP ? comment : undefined);
+  const rest = message.startsWith(tmpl) ? message.slice(tmpl.length) : message;
+  return isEmptyMessage(rest);
+}
 
 /** git's `rest_is_empty`: only whitespace and `Signed-off-by:` lines. */
 function isEmptyMessage(message: string): boolean {

@@ -38,7 +38,7 @@ import type { Blobs } from "../blobs/blobs.js";
 import type { Refs } from "../refs/refs.js";
 import type { Tags } from "../tags/tags.js";
 import type { Trees } from "../trees/trees.js";
-import { getMergeBases, isAncestorOf, type ReachSource } from "./commit-reach.js";
+import { countAheadBehind, getMergeBases, isAncestorOf, type ReachSource } from "./commit-reach.js";
 import type {
   AncestryOptions,
   Commit,
@@ -487,6 +487,23 @@ export function createReplacedCommits(
       const r = await active();
       if (!r) return commits.isAncestor(ancestor, descendant);
       return isAncestorOf(reach(r), ancestor, descendant);
+    },
+    async countAheadBehind(ours, theirs) {
+      const r = await active();
+      if (!r && commits.countAheadBehind) return commits.countAheadBehind(ours, theirs);
+      const source: ReachSource = r
+        ? reach(r)
+        : async (id) => {
+            const c = await commits.load(id);
+            return c
+              ? {
+                  parents: c.parents,
+                  date: c.committer.timestamp,
+                  generation: Number.POSITIVE_INFINITY,
+                }
+              : undefined;
+          };
+      return countAheadBehind(source, ours, theirs);
     },
   };
   return overlayMethods(commits, overrides);

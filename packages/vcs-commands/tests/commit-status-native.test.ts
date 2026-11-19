@@ -10,7 +10,15 @@
  * must get the same ids.
  */
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
@@ -403,5 +411,258 @@ describeGit("commit template: as native git", () => {
     const one = await (await openRepo(root, dir)).status().callText({ format: "long", verbose: 1 });
     expect(bytesOf(one.text)).toBe(git(dir, ["status", "-v"]));
     expect(testEnv(root).GIT_AUTHOR_NAME).toBeDefined();
+  }, 60_000);
+});
+
+describeGit("commit with an editor: the index it leaves", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "commit-racy-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("an editor --only commit keeps racily clean entries checked on the next write", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    // every file dated one second, well after the index file is written: each entry stays
+    // racily clean for every write our instance makes (its index time is the real clock)
+    const racy = Math.floor(Date.now() / 1000) + 1000;
+    const stamp = (p: string) => utimesSync(join(dir, p), racy, racy);
+    const repo = await openRepo(root, dir);
+    putFile(dir, "a.txt", "x1\n");
+    stamp("a.txt");
+    await repo.add().addFilepattern("a.txt").call();
+    putFile(dir, "c.txt", "c3\n");
+    stamp("c.txt");
+    await repo
+      .commit()
+      .setOnly("c.txt")
+      .setEditor(async () => "Only c\n")
+      .call();
+    // a.txt changes behind its stat (same size, same mtime)
+    putFile(dir, "a.txt", "x2\n");
+    stamp("a.txt");
+    putFile(dir, "b.txt", "b2\n");
+    await repo.add().addFilepattern("b.txt").call();
+    // the index now newer than every file: only a smudged entry makes git look at a.txt
+    utimesSync(join(dir, ".git/index"), racy + 100, racy + 100);
+    expect(git(dir, ["status", "--porcelain", "--", "a.txt"])).toBe("MM a.txt\n");
+    expect(git(dir, ["ls-files", "--debug", "--", "a.txt"])).toMatch(/\n {2}size: 0\t/);
+  }, 60_000);
+});
+
+describeGit("commit: template files, an untouched template, the index lock", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "commit-tmpl-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /**
+   * Native git with `editor` (a shell script body over "$1") and ours with `edit` on two
+   * copies of `dir`: exit status and error message, COMMIT_EDITMSG and HEAD agree.
+   */
+  async function expectEditorRun(
+    dir: string,
+    args: string[],
+    editor: string,
+    setup: (c: CommitCommand) => void,
+    edit: (text: string) => Promise<unknown>,
+    label: string,
+  ) {
+    const [theirs, mine] = twins(dir);
+    const script = join(root, "editor.sh");
+    writeFileSync(script, `#!/bin/sh\n${editor}\n`);
+    chmodSync(script, 0o755);
+    const native = gitRun(root, theirs, ["commit", ...args], { GIT_EDITOR: script });
+    const command = (await openRepo(root, mine)).commit();
+    command.setEditor(async (_path, text) => edit(text));
+    setup(command);
+    let error: Error | undefined;
+    try {
+      await command.call();
+    } catch (e) {
+      error = e as Error;
+    }
+    expect(error === undefined, `${label}: ${String(error)} / ${native.stderr}`).toBe(
+      native.status === 0,
+    );
+    if (error && native.stderr.startsWith("Aborting")) {
+      expect(`${error.message}\n`, `${label}: message`).toBe(native.stderr);
+    }
+    const editmsg = (d: string) => {
+      try {
+        return readFileSync(join(d, ".git/COMMIT_EDITMSG")).toString("latin1");
+      } catch {
+        return undefined;
+      }
+    };
+    expect(editmsg(mine), `${label}: COMMIT_EDITMSG`).toBe(editmsg(theirs));
+    expect(git(mine, ["rev-parse", "HEAD"]), `${label}: HEAD`).toBe(
+      git(theirs, ["rev-parse", "HEAD"]),
+    );
+    rmSync(mine, { recursive: true, force: true });
+    rmSync(theirs, { recursive: true, force: true });
+  }
+
+  it("-t and commit.template: the editor starts from the file, untouched aborts", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    putFile(dir, "c.txt", "c2\n");
+    git(dir, ["add", "c.txt"]);
+    const tmpl = join(root, "template.txt");
+    writeFileSync(tmpl, "Subject: \n\n  Why:\n\n# a comment of the template\n");
+    putFile(dir, "rel-template.txt", "Relative template\n");
+    const prepend = '{ printf "Edited subject\\n\\n"; cat "$1"; } > "$1.new" && mv "$1.new" "$1"';
+    const prepended = async (text: string) => `Edited subject\n\n${text}`;
+    await expectEditorRun(dir, ["-t", tmpl], prepend, (c) => c.setTemplate(tmpl), prepended, "-t");
+    await expectEditorRun(
+      dir,
+      ["-t", "rel-template.txt"],
+      prepend,
+      (c) => c.setTemplate("rel-template.txt"),
+      prepended,
+      "-t relative",
+    );
+    // the editor leaves the template as it was
+    await expectEditorRun(
+      dir,
+      ["-t", tmpl],
+      "true",
+      (c) => c.setTemplate(tmpl),
+      async () => undefined,
+      "untouched",
+    );
+    await expectEditorRun(
+      dir,
+      ["-t", tmpl, "--cleanup=whitespace"],
+      "true",
+      (c) => c.setTemplate(tmpl).setCleanupMode(CleanupMode.WHITESPACE),
+      async () => undefined,
+      "untouched, whitespace",
+    );
+    // a sign-off added to an untouched template is no edit
+    await expectEditorRun(
+      dir,
+      ["-t", tmpl],
+      'printf "\\nSigned-off-by: A <a@b>\\n" >> "$1"',
+      (c) => c.setTemplate(tmpl),
+      async (text) => `${text}\nSigned-off-by: A <a@b>\n`,
+      "untouched, signed off",
+    );
+    git(dir, ["config", "commit.template", tmpl]);
+    await expectEditorRun(dir, [], prepend, () => {}, prepended, "commit.template");
+    await expectEditorRun(
+      dir,
+      [],
+      "true",
+      () => {},
+      async () => undefined,
+      "commit.template untouched",
+    );
+    await expectEditorRun(
+      dir,
+      ["--allow-empty-message"],
+      "true",
+      (c) => c.setAllowEmptyMessage(true),
+      async () => undefined,
+      "untouched, empty messages allowed",
+    );
+    // a message given: the template is not read into the editor
+    await expectEditorRun(
+      dir,
+      ["-e", "-m", "Given"],
+      "true",
+      (c) => c.setMessage("Given").setEdit(true),
+      async () => undefined,
+      "-m with a template",
+    );
+  }, 120_000);
+
+  it("COMMIT_EDITMSG is written before an empty commit is refused", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    putFile(dir, "u.txt", "u\n");
+    await expectEditorRun(
+      dir,
+      [],
+      "true",
+      () => {},
+      async () => undefined,
+      "nothing to commit",
+    );
+  }, 60_000);
+
+  it("a dry run refuses an index lock another process holds, and leaves it", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    putFile(dir, "c.txt", "c2\n");
+    writeFileSync(join(dir, ".git/index.lock"), "");
+    const native = gitRun(root, dir, ["commit", "--dry-run"]);
+    expect(native.status).toBe(128);
+    for (const setup of [
+      (c: CommitCommand) => c,
+      (c: CommitCommand) => c.setAll(true),
+      (c: CommitCommand) => c.setOnly("c.txt"),
+    ]) {
+      let error: (Error & { exitCode?: number }) | undefined;
+      try {
+        await setup((await openRepo(root, dir)).commit()).callDryRun();
+      } catch (e) {
+        error = e as Error;
+      }
+      expect(error?.exitCode).toBe(128);
+      const first = (text: string) => text.split("\n")[0];
+      expect(first(error?.message ?? "")).toBe(
+        first(native.stderr).replace(`${dir}/.git/index.lock`, ".git/index.lock"),
+      );
+      expect(readFileSync(join(dir, ".git/index.lock")).length).toBe(0);
+    }
+    rmSync(join(dir, ".git/index.lock"));
+    // without the lock the dry run takes and drops it
+    const ours = await (await openRepo(root, dir)).commit().callDryRun();
+    expect(ours.exitCode).toBe(1);
+    expect(() => readFileSync(join(dir, ".git/index.lock"))).toThrow();
+  }, 60_000);
+
+  it("a dry run of an --only commit stores no tree for the false index", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    dirty(dir);
+    const [theirs, mine] = twins(dir);
+    // the tree the commit would record, made in a third copy
+    const probe = `${dir}-probe`;
+    execFileSync("cp", ["-a", dir, probe]);
+    git(probe, ["commit", "-qm", "probe", "--", "c.txt"]);
+    const tree = git(probe, ["rev-parse", "HEAD^{tree}"]).trim();
+    const has = (d: string) => gitRun(root, d, ["cat-file", "-e", tree]).status === 0;
+    gitRun(root, theirs, ["commit", "--dry-run", "--", "c.txt"]);
+    const ours = await (await openRepo(root, mine)).commit().setOnly("c.txt").callDryRun();
+    expect(ours.exitCode).toBe(0);
+    expect(has(theirs)).toBe(false);
+    expect(has(mine)).toBe(false);
+    // the false index was shown all the same
+    expect(bytesOf(ours.text)).toBe(
+      gitRun(root, theirs, ["commit", "--dry-run", "--", "c.txt"]).stdout,
+    );
+  }, 60_000);
+
+  it("a failed -a commit puts back racily clean entries still checked on the next write", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    const racy = Math.floor(Date.now() / 1000) + 1000;
+    const stamp = (p: string) => utimesSync(join(dir, p), racy, racy);
+    const repo = await openRepo(root, dir);
+    putFile(dir, "a.txt", "x1\n");
+    stamp("a.txt");
+    await repo.add().addFilepattern("a.txt").call();
+    // an edit this instance holds unwritten: the failed commit puts its staging back
+    putFile(dir, "n.txt", "n\n");
+    await repo.add().addFilepattern("n.txt").setWriteIndex(false).call();
+    await expect(repo.commit().setAll(true).call()).rejects.toThrow();
+    putFile(dir, "a.txt", "x2\n");
+    stamp("a.txt");
+    putFile(dir, "b.txt", "b2\n");
+    await repo.add().addFilepattern("b.txt").call();
+    utimesSync(join(dir, ".git/index"), racy + 100, racy + 100);
+    expect(git(dir, ["status", "--porcelain", "--", "a.txt"])).toBe("MM a.txt\n");
   }, 60_000);
 });

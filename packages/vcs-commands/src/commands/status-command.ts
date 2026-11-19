@@ -1,4 +1,4 @@
-import { FileMode, type ObjectId } from "@statewalker/vcs-core";
+import { type Commits, countAheadBehind, FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import {
   type CacheTree,
@@ -506,7 +506,7 @@ export class StatusCommand extends GitCommand<Status> {
         toFile: options.toFile === true,
         cutLineAdded: options.cutLineAdded === true,
         committable: info.committable,
-        workdirDirty: info.workdirDirty,
+        worktreeChanges: info.worktreeChanges,
         referenceId,
         commentPrefix,
       });
@@ -630,7 +630,8 @@ export class StatusCommand extends GitCommand<Status> {
       toFile: boolean;
       cutLineAdded: boolean;
       committable: boolean;
-      workdirDirty: boolean;
+      /** wt_status_check_worktree_changes: unmerged paths left out */
+      worktreeChanges: boolean;
       referenceId: ObjectId | undefined;
       commentPrefix: string | undefined;
     },
@@ -652,13 +653,15 @@ export class StatusCommand extends GitCommand<Status> {
       .setOptions({ ...(cachedPrefixes ?? {}) });
     if (this.renames !== undefined) cached.setRenames(this.renames);
     out += await cached.callText("patch");
-    if (twoLevels && o.workdirDirty) {
+    if (twoLevels && o.worktreeChanges) {
       out += p("--------------------------------------------------");
       out += p("Changes not staged for commit:");
-      const files = new DiffCommand(this.workingCopy).setOptions({
-        srcPrefix: "i/",
-        dstPrefix: "w/",
-      });
+      // run_diff_files without combine_merges (a conflicted path listed as unmerged and
+      // diffed as its stage 2) nor dirty_submodules (git sets it after diff_setup_done)
+      const files = new DiffCommand(this.workingCopy)
+        .setCombineMerges(false)
+        .setDirtySubmodules(false)
+        .setOptions({ srcPrefix: "i/", dstPrefix: "w/" });
       if (this.renames !== undefined) files.setRenames(this.renames);
       out += await files.callText("patch");
     }
@@ -1381,32 +1384,25 @@ export function cutLine(comment: string): string {
   );
 }
 
-/** `rev-list --left-right --count ours...theirs`: the commits only each side reaches. */
+/**
+ * `rev-list --left-right --count ours...theirs` (git's `stat_branch_pair`): the commits only
+ * each side reaches, walked no further than the merge bases (the store's commit-graph
+ * ordering the walk where it has one).
+ */
 async function aheadBehind(
-  commits: { load(id: ObjectId): Promise<{ parents: ObjectId[] } | undefined> },
+  commits: Pick<Commits, "load" | "countAheadBehind">,
   ours: ObjectId,
   theirs: ObjectId,
 ): Promise<{ ahead: number; behind: number }> {
-  const reach = async (from: ObjectId): Promise<Set<ObjectId>> => {
-    const seen = new Set<ObjectId>([from]);
-    const queue = [from];
-    while (queue.length > 0) {
-      const id = queue.pop() as ObjectId;
-      const commit = await commits.load(id).catch(() => undefined);
-      for (const parent of commit?.parents ?? []) {
-        if (!seen.has(parent)) {
-          seen.add(parent);
-          queue.push(parent);
-        }
-      }
-    }
-    return seen;
-  };
-  const a = await reach(ours);
-  const b = await reach(theirs);
-  let ahead = 0;
-  let behind = 0;
-  for (const id of a) if (!b.has(id)) ahead++;
-  for (const id of b) if (!a.has(id)) behind++;
-  return { ahead, behind };
+  if (commits.countAheadBehind) return commits.countAheadBehind(ours, theirs);
+  return countAheadBehind(
+    async (id) => {
+      const c = await commits.load(id).catch(() => undefined);
+      return c
+        ? { parents: c.parents, date: c.committer.timestamp, generation: Number.POSITIVE_INFINITY }
+        : undefined;
+    },
+    ours,
+    theirs,
+  );
 }

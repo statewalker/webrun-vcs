@@ -123,9 +123,11 @@ export interface StatusText {
 export function statusCommitInfo(
   status: Status,
   header: Pick<StatusHeader, "isInitial" | "state">,
-): { committable: boolean; workdirDirty: boolean } {
+): { committable: boolean; workdirDirty: boolean; worktreeChanges: boolean } {
   let committable = false;
   let workdirDirty = false;
+  // wt_status_check_worktree_changes: a worktree change of a path not unmerged
+  let worktreeChanges = false;
   let unmerged = false;
   for (const f of status.files) {
     if (f.index === "?" || f.index === "!") continue;
@@ -137,10 +139,13 @@ export function statusCommitInfo(
       continue;
     }
     if (f.index !== " ") committable = true;
-    if (f.worktree !== " ") workdirDirty = true;
+    if (f.worktree !== " ") {
+      workdirDirty = true;
+      worktreeChanges = true;
+    }
   }
   if (header.state.mergeInProgress && !unmerged) committable = true;
-  return { committable, workdirDirty };
+  return { committable, workdirDirty, worktreeChanges };
 }
 
 /** git's quote_path of a status path (QUOTE_PATH_QUOTE_SP for the short format). */
