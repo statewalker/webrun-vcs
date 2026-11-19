@@ -708,6 +708,8 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
         textconv: false,
         defaultPrefix: true,
         ignoreConfigNoPrefix: true,
+        // a patch git apply reads: no diff.submodule
+        submoduleFormat: "short",
       })
       .callBytes("patch");
     if (patch.length > 0) {

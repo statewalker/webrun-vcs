@@ -87,6 +87,12 @@ export interface DiffEntry {
    * "Subproject commit <id>-dirty", `newId` is its commit as git knows it
    */
   newDirtySubmodule?: boolean;
+
+  /**
+   * What the new side's submodule holds of its own in the worktree, as `--submodule=log`
+   * reports it ("contains modified content", "contains untracked content")
+   */
+  newSubmoduleDirt?: { modified?: boolean; untracked?: boolean };
 }
 
 /**

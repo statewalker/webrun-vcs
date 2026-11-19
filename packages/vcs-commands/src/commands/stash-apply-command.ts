@@ -698,7 +698,14 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       .setOldTree(fromTree)
       .setNewTree(toTree)
       .setRenames(false)
-      .setOptions({ binaryPatch: true, fullIndex: true, srcPrefix: "a/", dstPrefix: "b/" })
+      .setOptions({
+        binaryPatch: true,
+        fullIndex: true,
+        srcPrefix: "a/",
+        dstPrefix: "b/",
+        // diff-tree, plumbing: no diff.submodule
+        submoduleFormat: "short",
+      })
       .callFormats(["patch"]);
     const result = new Map<string, CheckedEntry>();
     if (!diff.bytes || diff.bytes.length === 0)

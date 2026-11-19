@@ -111,6 +111,12 @@ export interface StatusTextOptions {
   aheadBehindQuick?: boolean;
   /** The verbose part (`-v`): printed after the sections, before the closing line */
   verbose?: string;
+  /**
+   * `status.submoduleSummary`: the output of `git submodule summary --cached --for-status`
+   * (`staged`) and `--files --for-status` (`unstaged`), printed after the unstaged changes
+   * under their headers (wt_longstatus_print_submodule_summary)
+   */
+  submoduleSummary?: { staged: string; unstaged: string };
 }
 
 /** The text and whether the status has something to commit (`s->committable`). */
@@ -316,6 +322,21 @@ function porcelainV2(status: Status, header: StatusHeader, options: StatusTextOp
     out += `# stash ${header.stashCount}${eol}`;
   }
   return out + formatStatusPorcelain(status, 2, { quotePath: options.quotePath ?? true, z });
+}
+
+/**
+ * strbuf_add_commented_lines: each line after the prefix, and a space unless the line is
+ * empty or starts with a tab.
+ */
+function commentedLines(text: string, prefix: string): string {
+  if (text === "") return "";
+  let out = "";
+  for (const line of text.split(/(?<=\n)/)) {
+    out += prefix;
+    if (line[0] !== "\n" && line[0] !== "\t") out += " ";
+    out += line;
+  }
+  return out.endsWith("\n") ? out : `${out}\n`;
 }
 
 /**
@@ -569,6 +590,17 @@ function longStatus(
     }
     for (const e of changed) changeLine(p, e, "changed", q);
     trailer();
+  }
+
+  if (options.submoduleSummary) {
+    const section = (output: string, title: string) => {
+      const text = output ? `${title}\n\n${output}` : "";
+      p.raw(
+        options.commentPrefix !== undefined ? commentedLines(text, options.commentPrefix) : text,
+      );
+    };
+    section(options.submoduleSummary.staged, "Submodule changes to be committed:");
+    section(options.submoduleSummary.unstaged, "Submodules changed but not updated:");
   }
 
   const untrackedMode = options.untracked ?? "normal";

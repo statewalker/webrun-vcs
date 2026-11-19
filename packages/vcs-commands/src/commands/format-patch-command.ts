@@ -543,6 +543,8 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
           stat: { width: MAIL_DEFAULT_WRAP },
           binaryPatch: !this.noBinary,
           ignoreConfigNoPrefix: true,
+          // git_format_config ignores diff.submodule
+          submoduleFormat: "short",
           ...(noPrefix ? { noPrefix: true } : {}),
         });
       const bytes = await log.callBytes({
