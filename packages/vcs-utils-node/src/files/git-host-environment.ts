@@ -69,6 +69,7 @@ export interface NodeGitHostEnvironment {
   notesDisplayRef?: string;
   notesRewriteRef?: string;
   notesRewriteMode?: string;
+  pathspecs?: { literal?: string; glob?: string; noglob?: string; icase?: string };
 }
 
 /**
@@ -149,6 +150,13 @@ export function createNodeGitHostEnvironment(
     ...(env.GIT_AUTHOR_EMAIL !== undefined ? { email: env.GIT_AUTHOR_EMAIL } : {}),
     ...(env.GIT_AUTHOR_DATE !== undefined ? { date: env.GIT_AUTHOR_DATE } : {}),
   };
+  const pathspecFlags = {
+    ...(env.GIT_LITERAL_PATHSPECS !== undefined ? { literal: env.GIT_LITERAL_PATHSPECS } : {}),
+    ...(env.GIT_GLOB_PATHSPECS !== undefined ? { glob: env.GIT_GLOB_PATHSPECS } : {}),
+    ...(env.GIT_NOGLOB_PATHSPECS !== undefined ? { noglob: env.GIT_NOGLOB_PATHSPECS } : {}),
+    ...(env.GIT_ICASE_PATHSPECS !== undefined ? { icase: env.GIT_ICASE_PATHSPECS } : {}),
+  };
+  const pathspecs = Object.keys(pathspecFlags).length > 0 ? pathspecFlags : undefined;
   return {
     readFile: async (path: string) => {
       try {
@@ -201,5 +209,7 @@ export function createNodeGitHostEnvironment(
     ...(env.GIT_NOTES_REWRITE_MODE !== undefined
       ? { notesRewriteMode: env.GIT_NOTES_REWRITE_MODE }
       : {}),
+    // the global pathspec magic, as given (git_env_bool reads them when a pathspec is parsed)
+    ...(pathspecs ? { pathspecs } : {}),
   };
 }

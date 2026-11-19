@@ -27,7 +27,11 @@ import {
   walkUntrackedScanHost,
 } from "@statewalker/vcs-working-tree";
 
-import { IncompatibleOptionsError, InvalidConfigError } from "../errors/index.js";
+import {
+  IncompatibleOptionsError,
+  InvalidArgumentError,
+  InvalidConfigError,
+} from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import {
@@ -45,7 +49,25 @@ import {
   submoduleToken,
 } from "../results/status-result.js";
 import { worktreeModeTrust } from "./core-config.js";
+import { DiffCommand } from "./diff-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import { OperationState } from "./merge-support.js";
+import { commentPrefixOf } from "./message-cleanup.js";
+import {
+  DO_MATCH_DIRECTORY,
+  globalPathspecMagic,
+  matchPathspec,
+  type PathspecItem,
+  parsePathspec,
+  untrackedScanPathspec,
+} from "./pathspec.js";
+import {
+  type CommitWhence,
+  formatStatusText,
+  type StatusText,
+  statusCommitInfo,
+} from "./status-format.js";
+import { readStatusHeader } from "./status-header.js";
 import {
   type GitmodulesEntry,
   isSubmoduleIgnoreMode,
@@ -54,7 +76,9 @@ import {
   type SubmoduleIgnoreMode,
   submoduleIgnoreFlags,
 } from "./submodule-config.js";
+import type { TrackingSource } from "./tracking-info.js";
 import { openUntrackedCache } from "./untracked-cache-support.js";
+import { shortenUnambiguousRef } from "./worktree-list-command.js";
 
 export type { SubmoduleIgnoreMode } from "./submodule-config.js";
 
@@ -285,6 +309,8 @@ export async function readSubmoduleDirt(
  */
 export class StatusCommand extends GitCommand<Status> {
   private paths: string[] = [];
+  /** The pathspec of the running status (git's `s->pathspec`), parsed from `paths` */
+  private pathspec: PathspecItem[] = [];
   private ignoredMode: IgnoredMode = "no";
   private untrackedMode?: UntrackedFilesMode;
   /** The mode of the running status (the setter, else `status.showUntrackedFiles`) */
@@ -293,13 +319,22 @@ export class StatusCommand extends GitCommand<Status> {
   private renameLimit?: number;
   private ignoreSubmodules?: SubmoduleIgnoreMode;
   private gitmodules?: Promise<GitmodulesEntry[]>;
+  /** The commit the index is compared with: undefined is HEAD, null none (initial) */
+  private reference?: ObjectId | null;
+  /** Whether the refreshed stats (and the untracked cache) are written back */
+  private writeIndex = true;
 
   /**
-   * Add a path filter.
+   * Add a pathspec element (from the top of the worktree), as `git status -- <pathspec>`
+   * takes it (pathspec.c): a path or directory, a wildcard (`*.txt`, matched by `fnmatch`
+   * without `WM_PATHNAME`, so `*` crosses `/`), or an element with magic: `:(glob)`,
+   * `:(literal)`, `:(icase)`, `:(exclude)` (`:!`, `:^`; an element of excludes alone gets
+   * an implicit `.`), `:/` and `:(prefix:N)`. `GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`,
+   * `GIT_NOGLOB_PATHSPECS` and `GIT_ICASE_PATHSPECS` of the host environment apply.
+   * `:(attr:...)` is refused (attributes are not matched here). Tracked paths are matched as
+   * diff-files and diff-index match them (`ce_path_match`), untracked ones by dir.c's walk.
    *
-   * Only status for paths starting with this prefix will be returned.
-   *
-   * @param path Path prefix to filter by
+   * @param path A pathspec element
    */
   addPath(path: string): this {
     this.checkCallable();
@@ -375,11 +410,267 @@ export class StatusCommand extends GitCommand<Status> {
     return this;
   }
 
+  /**
+   * The commit the index is compared with instead of HEAD (`s->reference`: `git commit
+   * --amend` compares with `HEAD^1`), null for none (every entry new, as before the first
+   * commit).
+   */
+  setReferenceCommit(id: ObjectId | null): this {
+    this.checkCallable();
+    this.reference = id;
+    return this;
+  }
+
+  /**
+   * Whether the stats refreshed while comparing (and a changed untracked cache) are written
+   * back to the index (default true, as `git status`). A caller holding the index with
+   * edits of its own (a commit's prepared index) passes false.
+   */
+  setWriteIndex(write: boolean): this {
+    this.checkCallable();
+    this.writeIndex = write;
+    return this;
+  }
+
+  /** The commit compared with: the one set, else HEAD's (undefined: none). */
+  private async referenceCommit(): Promise<ObjectId | undefined> {
+    if (this.reference !== undefined) return this.reference ?? undefined;
+    const headRef = await this.refsStore.resolve("HEAD").catch(() => undefined);
+    if (!headRef?.objectId) return undefined;
+    // repo_get_oid("HEAD") names a commit only when it loads as one
+    return (await this.commits.load(headRef.objectId).catch(() => undefined))
+      ? headRef.objectId
+      : undefined;
+  }
+
+  /**
+   * The status as `git status` prints it (wt_status_print), in the format asked: the long
+   * format (the default, or `status.short`), `short`, `porcelain` (v1) or `porcelain-v2`,
+   * with `--branch`, `-z`, `--show-stash` and `-v`; the deferred configuration
+   * (`status.short`, `status.branch`, `status.aheadBehind`, `status.showStash`) applies to
+   * the human formats as in git. `committable` is wt_status's: something staged (or a
+   * merge with every conflict resolved).
+   *
+   * @example
+   * ```typescript
+   * const { text } = await git.status().callText({ format: "short", branch: true });
+   * // "## main...origin/main [ahead 1]\n M a.txt\n?? new.txt\n"
+   * ```
+   */
+  async callText(options: StatusCallTextOptions = {}): Promise<StatusTextResult> {
+    const z = options.z === true;
+    let format = options.format;
+    if (z && format === "long") {
+      throw new IncompatibleOptionsError(
+        ["--long", "-z"],
+        "options '--long' and '-z' cannot be used together",
+      );
+    }
+    if (z && format === undefined) format = "porcelain";
+    const deferred = format !== "porcelain" && format !== "porcelain-v2" && !z;
+    const config = this.config;
+    if (deferred && format === undefined) {
+      format = cfgBool(config, "status.short", false) ? "short" : "long";
+    }
+    const resolvedFormat = format ?? "long";
+    const branch = options.branch ?? (deferred ? cfgBool(config, "status.branch", false) : false);
+    const quick =
+      options.aheadBehind !== undefined
+        ? !options.aheadBehind
+        : deferred
+          ? !cfgBool(config, "status.aheadBehind", true)
+          : false;
+    const showStash = options.showStash ?? cfgBool(config, "status.showStash", false);
+    const status = await this.call();
+    const hints = options.hints ?? cfgBool(config, "advice.statusHints", true);
+    const commentPrefix =
+      options.commentPrefix ??
+      (resolvedFormat === "long" && cfgBool(config, "status.displayCommentPrefix", false)
+        ? commentLineString(this.workingCopy)
+        : undefined);
+    const referenceId = await this.referenceCommit();
+    const header = await this.readHeader(status, referenceId, {
+      long: resolvedFormat === "long",
+      short: branch && resolvedFormat !== "long",
+      quick,
+      divergenceAdvice: options.commitTemplate !== true,
+      hints,
+      stash: showStash,
+      amend: options.amend === true,
+      nowarn: options.nowarn === true,
+    });
+    const info = statusCommitInfo(status, header);
+    let verbose: string | undefined;
+    if ((options.verbose ?? 0) > 0 && resolvedFormat === "long") {
+      verbose = await this.verboseText(options.verbose ?? 0, {
+        toFile: options.toFile === true,
+        cutLineAdded: options.cutLineAdded === true,
+        committable: info.committable,
+        workdirDirty: info.workdirDirty,
+        referenceId,
+        commentPrefix,
+      });
+    }
+    const out = formatStatusText(status, header, {
+      format: resolvedFormat,
+      branch,
+      z,
+      showStash,
+      quotePath: cfgBool(config, "core.quotePath", true),
+      hints,
+      ...(commentPrefix !== undefined ? { commentPrefix } : {}),
+      untracked: this.resolvedUntracked,
+      ignored: this.ignoredMode,
+      commitTemplate: options.commitTemplate === true,
+      amend: options.amend === true,
+      nowarn: options.nowarn === true,
+      whence: options.whence ?? (await this.determineWhence()),
+      reference: options.amend ? "HEAD^1" : "HEAD",
+      aheadBehindQuick: quick,
+      ...(verbose !== undefined ? { verbose } : {}),
+    });
+    return {
+      ...out,
+      status,
+      warnings: [...status.warnings, ...header.warnings],
+    };
+  }
+
+  /**
+   * builtin/commit.c's determine_whence: a merge while MERGE_HEAD exists, a cherry-pick
+   * while CHERRY_PICK_HEAD does (sequencer_determine_whence), else a plain commit.
+   */
+  private async determineWhence(): Promise<CommitWhence> {
+    const state = new OperationState(this.workingCopy.checkout, this.refsStore);
+    if ((await state.read("MERGE_HEAD")) !== undefined) return "merge";
+    if (await state.ref("CHERRY_PICK_HEAD")) return "cherry-pick";
+    return "commit";
+  }
+
+  /** The header of the text forms: branch, operations in progress, tracking, stash. */
+  private async readHeader(
+    status: Status,
+    referenceId: ObjectId | undefined,
+    want: {
+      long: boolean;
+      short: boolean;
+      quick: boolean;
+      divergenceAdvice: boolean;
+      hints: boolean;
+      stash: boolean;
+      amend: boolean;
+      nowarn: boolean;
+    },
+  ) {
+    const refs = this.refsStore;
+    const resolver = this.revisionResolver();
+    const commits = this.walkCommits;
+    const peel = async (id: ObjectId) => resolver.commitReference(id).catch(() => undefined);
+    const tracking: TrackingSource = {
+      config: (key) => this.config.value(key),
+      upstreamOf: (branch) => resolver.upstreamOf(branch).catch(() => undefined),
+      pushOf: (branch) => resolver.pushOf(branch).catch(() => undefined),
+      pushRemoteOf: async (branch) => {
+        try {
+          return resolver.pushRemoteOf(branch);
+        } catch {
+          return undefined;
+        }
+      },
+      refCommit: async (ref) => {
+        const id = (await refs.resolve(ref).catch(() => undefined))?.objectId;
+        return id ? peel(id) : undefined;
+      },
+      shortenRef: (ref) => shortenUnambiguousRef(refs, ref),
+      aheadBehind: (ours, theirs) => aheadBehind(commits, ours, theirs),
+    };
+    const entries = this.staging.entryList?.() ?? (await collectEntries(this.staging.entries()));
+    return readStatusHeader(
+      {
+        refs,
+        state: new OperationState(this.workingCopy.checkout, refs),
+        tracking,
+        abbreviate: (id) => this.abbreviateObjectId(id),
+        dwimRef: (name) => resolver.dwimRef(name).catch(() => []),
+        commitOf: peel,
+        objectExists: async (id) =>
+          (await resolver.objectType(id).catch(() => undefined)) !== undefined,
+        config: (key) => this.config.value(key),
+        entries,
+      },
+      {
+        ...(referenceId ? { referenceId } : {}),
+        tracking: {
+          ...(want.long
+            ? {
+                long: {
+                  quick: want.quick,
+                  divergenceAdvice: want.divergenceAdvice,
+                  hints: want.hints,
+                },
+              }
+            : {}),
+          ...(want.short ? { short: { quick: want.quick } } : {}),
+        },
+        amend: want.amend,
+        nowarn: want.nowarn,
+        workdirDirty: statusCommitInfo(status, { isInitial: !referenceId, state: {} }).workdirDirty,
+        stash: want.stash,
+      },
+    );
+  }
+
+  /**
+   * wt_longstatus_print_verbose: the staged changes as a patch (and with `-vv` the unstaged
+   * ones, under their own headers); in a file (the commit template) after the cut line.
+   */
+  private async verboseText(
+    level: number,
+    o: {
+      toFile: boolean;
+      cutLineAdded: boolean;
+      committable: boolean;
+      workdirDirty: boolean;
+      referenceId: ObjectId | undefined;
+      commentPrefix: string | undefined;
+    },
+  ): Promise<string> {
+    const p = (text: string) =>
+      o.commentPrefix !== undefined ? `${o.commentPrefix}${text ? ` ${text}` : ""}\n` : `${text}\n`;
+    let out = "";
+    if (o.toFile && !o.cutLineAdded) out += cutLine(o.commentPrefix ?? "#");
+    const twoLevels = level > 1;
+    let cachedPrefixes: { srcPrefix: string; dstPrefix: string } | undefined;
+    if (twoLevels && o.committable) {
+      if (o.toFile) out += p("");
+      out += p("Changes to be committed:");
+      cachedPrefixes = { srcPrefix: "c/", dstPrefix: "i/" };
+    }
+    const cached = new DiffCommand(this.workingCopy)
+      .setCached(true)
+      .setOldTree(o.referenceId ?? EMPTY_TREE)
+      .setOptions({ ...(cachedPrefixes ?? {}) });
+    if (this.renames !== undefined) cached.setRenames(this.renames);
+    out += await cached.callText("patch");
+    if (twoLevels && o.workdirDirty) {
+      out += p("--------------------------------------------------");
+      out += p("Changes not staged for commit:");
+      const files = new DiffCommand(this.workingCopy).setOptions({
+        srcPrefix: "i/",
+        dstPrefix: "w/",
+      });
+      if (this.renames !== undefined) files.setRenames(this.renames);
+      out += await files.callText("patch");
+    }
+    return out;
+  }
+
   async call(): Promise<Status> {
     this.checkCallable();
     this.setCallable(false);
     // git reads its configuration, then the options, before anything else
     this.resolvedUntracked = this.untrackedFilesMode();
+    this.pathspec = this.parsePaths();
     if (this.ignoredMode === "matching" && this.resolvedUntracked === "no") {
       throw new IncompatibleOptionsError(
         ["--ignored=matching", "--untracked-files=no"],
@@ -389,6 +680,17 @@ export class StatusCommand extends GitCommand<Status> {
     const worktree = this.worktreeAccess;
     // one operation: fresh ignore rules and one lstat cache for the whole status
     return worktree?.batch ? worktree.batch(() => this.compute(worktree)) : this.compute(worktree);
+  }
+
+  /** cmd_status's parse_pathspec (PATHSPEC_PREFER_FULL): none for no elements. */
+  private parsePaths(): PathspecItem[] {
+    if (this.paths.length === 0) return [];
+    try {
+      const global = globalPathspecMagic(hostEnvironmentOf(this.workingCopy)?.pathspecs);
+      return parsePathspec(this.paths, { global, refuseAttrAsUnsupported: true });
+    } catch (error) {
+      throw new InvalidArgumentError("path", this.paths, `fatal: ${(error as Error).message}`);
+    }
   }
 
   private get config(): RemoteConfigStore {
@@ -411,9 +713,9 @@ export class StatusCommand extends GitCommand<Status> {
     const head = new Map<string, StatusSide>();
     // directories where HEAD and the index agree (by the cache-tree): their entries are HEAD's
     const sameAsHead = new Set<string>();
-    const headRef = await this.refsStore.resolve("HEAD");
-    if (headRef?.objectId) {
-      const headCommit = await this.commits.load(headRef.objectId).catch(() => undefined);
+    const referenceId = await this.referenceCommit();
+    if (referenceId) {
+      const headCommit = await this.commits.load(referenceId).catch(() => undefined);
       if (headCommit) {
         const cacheTree = this.staging.getCacheTree?.();
         await this.collectTreeEntries(headCommit.tree, "", head, cacheTree, sameAsHead);
@@ -652,7 +954,7 @@ export class StatusCommand extends GitCommand<Status> {
         indexIgnoreOid: (p) => ignoreFiles.upToDate.get(p),
         skipWorktreeIgnoreOid: (p) => ignoreFiles.skipWorktree.get(p),
         flags,
-        ...(matchAll ? {} : { pathspec: this.paths }),
+        ...(matchAll ? {} : { matcher: untrackedScanPathspec(this.pathspec) }),
         ...(cache ? { cache } : {}),
         indexSeconds: Math.floor(indexTime / 1000),
         ...(trust ? { stat: { ctime: trust.ctime, fullStat: trust.fullStat } } : {}),
@@ -671,11 +973,13 @@ export class StatusCommand extends GitCommand<Status> {
 
     // as git status: the refreshed stats written back when the index is free and unchanged,
     // with the untracked cache when it changed
-    await refreshIndexStats(
-      this.staging,
-      refresh,
-      untrackedCache.changed() ? { untrackedCache: untrackedCache.cache ?? null } : undefined,
-    );
+    if (this.writeIndex) {
+      await refreshIndexStats(
+        this.staging,
+        refresh,
+        untrackedCache.changed() ? { untrackedCache: untrackedCache.cache ?? null } : undefined,
+      );
+    }
 
     return new StatusImpl(added, changed, removed, conflicting, {
       modified,
@@ -958,17 +1262,9 @@ export class StatusCommand extends GitCommand<Status> {
    * element below a file (`a/b`) does not match the file `a`.
    */
   private matchesTracked(path: string, mode: number): boolean {
-    if (this.paths.length === 0) return true;
-    const directory = isGitlink(mode);
-    for (const raw of this.paths) {
-      const filterPath = raw.replace(/\/+$/, "");
-      if (filterPath === "" || filterPath === ".") return true;
-      if (path.startsWith(`${filterPath}/`)) return true;
-      if (path === filterPath && (directory || filterPath === raw)) return true;
-      // a path inside a submodule names its gitlink, as before
-      if (directory && filterPath.startsWith(`${path}/`)) return true;
-    }
-    return false;
+    if (this.pathspec.length === 0) return true;
+    // ce_path_match: a gitlink matches as a directory (`sub/` names it)
+    return matchPathspec(this.pathspec, path, isGitlink(mode) ? DO_MATCH_DIRECTORY : 0) > 0;
   }
 
   /**
@@ -1015,4 +1311,102 @@ async function collectEntries(entries: AsyncIterable<StagingEntry>): Promise<Sta
   const out: StagingEntry[] = [];
   for await (const entry of entries) out.push(entry);
   return out;
+}
+
+/** The options of `StatusCommand.callText`. */
+export interface StatusCallTextOptions {
+  /** `--long`, `--short`, `--porcelain[=v1]`, `--porcelain=v2`; unset: `status.short`, else long */
+  format?: "long" | "short" | "porcelain" | "porcelain-v2";
+  /** `-b` / `--branch` (unset: `status.branch` for the human formats) */
+  branch?: boolean;
+  /** `-z` (porcelain unless another format is given; `--long` refuses it) */
+  z?: boolean;
+  /** `--show-stash` (unset: `status.showStash`) */
+  showStash?: boolean;
+  /** `--[no-]ahead-behind` (unset: `status.aheadBehind` for the human formats, else full) */
+  aheadBehind?: boolean;
+  /** `-v` (1) / `-vv` (2): the staged (and unstaged) changes as a patch, long format only */
+  verbose?: number;
+  /** `advice.statusHints` override (the commit template has none) */
+  hints?: boolean;
+  /** Comment every line with this string (the commit template); unset: `status.displayCommentPrefix` */
+  commentPrefix?: string;
+  /** The commit template: "Initial commit", no divergence advice */
+  commitTemplate?: boolean;
+  /** `git commit --amend` */
+  amend?: boolean;
+  /** `s->nowarn`: no closing line when nothing is committable (the commit template) */
+  nowarn?: boolean;
+  /** Where the commit comes from (the "to unstage" hints only show for a plain commit) */
+  whence?: CommitWhence;
+  /** The text goes to a file (the commit template): `-v` puts the cut line before its patch */
+  toFile?: boolean;
+  /** The cut line was written already (`s->added_cut_line`) */
+  cutLineAdded?: boolean;
+}
+
+/** What `StatusCommand.callText` gives: the text, the status, and git's warnings. */
+export interface StatusTextResult extends StatusText {
+  status: Status;
+  warnings: string[];
+}
+
+/** A git boolean of the configuration, `fallback` when unset or not a boolean. */
+function cfgBool(config: RemoteConfigStore, key: string, fallback: boolean): boolean {
+  const value = config.value(key);
+  return value === undefined ? fallback : (parseGitBool(value) ?? fallback);
+}
+
+/** git's empty tree, the side compared with before the first commit. */
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/** The comment-line string of status's commented lines. */
+function commentLineString(workingCopy: WorkingCopy): string {
+  return commentPrefixOf(workingCopy);
+}
+
+/**
+ * wt_status_append_cut_line: the scissors line and its explanation, commented.
+ *
+ * @example
+ * ```typescript
+ * cutLine("#"); // "# ------------------------ >8 ------------------------\n# Do not modify ..."
+ * ```
+ */
+export function cutLine(comment: string): string {
+  return (
+    `${comment} ------------------------ >8 ------------------------\n` +
+    `${comment} Do not modify or remove the line above.\n` +
+    `${comment} Everything below it will be ignored.\n`
+  );
+}
+
+/** `rev-list --left-right --count ours...theirs`: the commits only each side reaches. */
+async function aheadBehind(
+  commits: { load(id: ObjectId): Promise<{ parents: ObjectId[] } | undefined> },
+  ours: ObjectId,
+  theirs: ObjectId,
+): Promise<{ ahead: number; behind: number }> {
+  const reach = async (from: ObjectId): Promise<Set<ObjectId>> => {
+    const seen = new Set<ObjectId>([from]);
+    const queue = [from];
+    while (queue.length > 0) {
+      const id = queue.pop() as ObjectId;
+      const commit = await commits.load(id).catch(() => undefined);
+      for (const parent of commit?.parents ?? []) {
+        if (!seen.has(parent)) {
+          seen.add(parent);
+          queue.push(parent);
+        }
+      }
+    }
+    return seen;
+  };
+  const a = await reach(ours);
+  const b = await reach(theirs);
+  let ahead = 0;
+  let behind = 0;
+  for (const id of a) if (!b.has(id)) ahead++;
+  for (const id of b) if (!a.has(id)) behind++;
+  return { ahead, behind };
 }

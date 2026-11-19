@@ -97,6 +97,12 @@ export interface GitHostEnvironment {
   notesRewriteRef?: string;
   /** `$GIT_NOTES_REWRITE_MODE`: how such a note combines with one there */
   notesRewriteMode?: string;
+  /**
+   * The global pathspec magic as set, unparsed (pathspec.c reads each with `git_env_bool`
+   * when it parses a pathspec, so a bad value fails only then): `$GIT_LITERAL_PATHSPECS`,
+   * `$GIT_GLOB_PATHSPECS`, `$GIT_NOGLOB_PATHSPECS` and `$GIT_ICASE_PATHSPECS`
+   */
+  pathspecs?: { literal?: string; glob?: string; noglob?: string; icase?: string };
 }
 
 const join = (dir: string, name: string) =>

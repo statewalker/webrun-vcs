@@ -154,6 +154,23 @@ function parseCleanupMode(name: string): CleanupMode {
 }
 
 /**
+ * The cleanup of a message edited in an editor (git's `get_cleanup_mode` with `use_editor`):
+ * the mode given, else `commit.cleanup`, else `default`, which is `strip` (comments
+ * dropped); `scissors` stays (the message cut at the scissors line, comments kept).
+ */
+export function editorCleanupMode(
+  workingCopy: WorkingCopy,
+  mode: CleanupMode | undefined,
+): CleanupMode.STRIP | CleanupMode.WHITESPACE | CleanupMode.VERBATIM | CleanupMode.SCISSORS {
+  const configured = RemoteConfigStore.from(workingCopy).value("commit.cleanup");
+  const chosen = mode ?? (configured !== undefined ? parseCleanupMode(configured) : undefined);
+  if (chosen === CleanupMode.WHITESPACE) return CleanupMode.WHITESPACE;
+  if (chosen === CleanupMode.VERBATIM) return CleanupMode.VERBATIM;
+  if (chosen === CleanupMode.SCISSORS) return CleanupMode.SCISSORS;
+  return CleanupMode.STRIP;
+}
+
+/**
  * The cleanup a commit or merge message gets (git's `get_cleanup_mode` without an editor):
  * the mode given, else `commit.cleanup`, else `default`; `default` and `scissors` are
  * `whitespace`.

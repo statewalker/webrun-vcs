@@ -60,6 +60,79 @@ export interface PathspecParseOptions {
    * it the magic is refused as unsupported.
    */
   attr?: boolean;
+  /**
+   * The global magic of `GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`,
+   * `GIT_NOGLOB_PATHSPECS` and `GIT_ICASE_PATHSPECS` (git's `get_global_magic`), as
+   * {@link globalPathspecMagic} reads them
+   */
+  global?: GlobalPathspecMagic;
+  /**
+   * The command's name for git's `unsupported_magic` refusal of `:(attr:...)` without
+   * {@link attr}: "<elem>: pathspec magic not supported by this command: 'attr'"
+   * (`pathspec.c`); without it the parser's own "Unsupported pathspec magic" is thrown
+   */
+  refuseAttrAsUnsupported?: boolean;
+}
+
+/** The pathspec settings of git's environment (`get_global_magic`), each on or off. */
+export interface GlobalPathspecMagic {
+  /** `GIT_LITERAL_PATHSPECS`: no magic at all, every element literal */
+  literal?: boolean;
+  /** `GIT_GLOB_PATHSPECS`: every element `:(glob)` unless `:(literal)` */
+  glob?: boolean;
+  /** `GIT_NOGLOB_PATHSPECS`: every element `:(literal)` unless `:(glob)` */
+  noglob?: boolean;
+  /** `GIT_ICASE_PATHSPECS`: every element `:(icase)` */
+  icase?: boolean;
+}
+
+/**
+ * git's `git_env_bool` of one variable (`git_config_bool`: a boolean word, else a number,
+ * non-zero being true); a value that is neither fails as git dies.
+ */
+function envBool(name: string, value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const v = value.toLowerCase();
+  if (v === "" || v === "false" || v === "no" || v === "off") return false;
+  if (v === "true" || v === "yes" || v === "on") return true;
+  const m = /^\s*([-+]?\d+)([kmg]?)$/i.exec(value);
+  if (!m) throw new Error(`bad numeric config value '${value}' for '${name}': invalid unit`);
+  return Number(m[1]) !== 0;
+}
+
+/**
+ * The global pathspec magic from the variables as set (a `GitHostEnvironment`'s
+ * `pathspecs`), checked as git's `get_global_magic` checks them: `glob` with `noglob`, and
+ * `literal` with `glob` or `icase`, fail.
+ *
+ * @example
+ * ```typescript
+ * globalPathspecMagic({ icase: "1" }); // { icase: true }
+ * globalPathspecMagic({ glob: "1", noglob: "1" }); // throws
+ * ```
+ */
+export function globalPathspecMagic(
+  vars: { literal?: string; glob?: string; noglob?: string; icase?: string } | undefined,
+): GlobalPathspecMagic {
+  if (!vars) return {};
+  const literal = envBool("GIT_LITERAL_PATHSPECS", vars.literal);
+  const glob = envBool("GIT_GLOB_PATHSPECS", vars.glob);
+  const noglob = envBool("GIT_NOGLOB_PATHSPECS", vars.noglob);
+  const icase = envBool("GIT_ICASE_PATHSPECS", vars.icase);
+  if (glob && noglob) {
+    throw new Error("global 'glob' and 'noglob' pathspec settings are incompatible");
+  }
+  if (literal && (glob || icase)) {
+    throw new Error(
+      "global 'literal' pathspec setting is incompatible with all other global pathspec settings",
+    );
+  }
+  return {
+    ...(literal ? { literal } : {}),
+    ...(glob ? { glob } : {}),
+    ...(noglob ? { noglob } : {}),
+    ...(icase ? { icase } : {}),
+  };
 }
 
 /** git's `strcspn_escaped`: characters from `from` up to one of `stop`, backslash escapes skipped. */
@@ -129,10 +202,11 @@ const SHORT_MAGIC_CHARS = new Set([..."!\"#%&',-;<=>@_`~^/"]);
  * exclude)`), the path normalised as `prefix_path` does (`.`, `..`, repeated slashes; above
  * the top refused), and an implicit `.` when every element excludes.
  */
-export function parsePathspec(paths: string[]): PathspecItem[] {
-  const items = paths.map((p) => parsePathspecItem(p));
+export function parsePathspec(paths: string[], options: PathspecParseOptions = {}): PathspecItem[] {
+  const items = paths.map((p) => parsePathspecItem(p, options));
   if (items.length > 0 && items.every((i) => i.exclude)) {
-    items.push(parsePathspecItem("."));
+    // init_pathspec_item(item + n, 0, ...): the global magic applies to it too
+    items.push(parsePathspecItem(".", { global: options.global }));
   }
   // held as bytes: git matches names byte by byte, so an element may cut a character
   return items.map(pathspecItemBytes);
@@ -166,7 +240,17 @@ export function parsePathspecItem(elem: string, options: PathspecParseOptions = 
   let prefix = -1;
   let attr: AttrMatch[] | undefined;
   let rest = elem;
-  if (elem.startsWith(":(")) {
+  const global = options.global ?? {};
+  const refuseAttr = () =>
+    new Error(
+      options.refuseAttrAsUnsupported
+        ? `${elem}: pathspec magic not supported by this command: 'attr'`
+        : `Unsupported pathspec magic 'attr' in '${elem}'`,
+    );
+  if (global.literal) {
+    // parse_element_magic: no magic is read under GIT_LITERAL_PATHSPECS
+    literal = true;
+  } else if (elem.startsWith(":(")) {
     // git's parse_long_magic: words up to "," or ")", backslash escapes skipped (attr values)
     let pos = 2;
     while (pos < elem.length && elem[pos] !== ")") {
@@ -179,7 +263,7 @@ export function parsePathspecItem(elem: string, options: PathspecParseOptions = 
         continue;
       }
       if (word.startsWith("attr:")) {
-        if (!options.attr) throw new Error(`Unsupported pathspec magic 'attr' in '${elem}'`);
+        if (!options.attr) throw refuseAttr();
         if (attr) throw new Error("Only one 'attr:' specification is allowed.");
         attr = parseAttrSpec(word.slice(5), elem);
         continue;
@@ -192,7 +276,7 @@ export function parsePathspecItem(elem: string, options: PathspecParseOptions = 
       else if (name === "exclude") exclude = true;
       else if (name === "attr") {
         // the magic without a spec: nothing to match
-        if (!options.attr) throw new Error(`Unsupported pathspec magic 'attr' in '${elem}'`);
+        if (!options.attr) throw refuseAttr();
       } else throw new Error(`Invalid pathspec magic '${name}' in '${elem}'`);
     }
     if (elem[pos] !== ")") throw new Error(`Missing ')' at the end of pathspec magic in '${elem}'`);
@@ -210,7 +294,15 @@ export function parsePathspecItem(elem: string, options: PathspecParseOptions = 
     if (elem[pos] === ":") pos++;
     rest = elem.slice(pos);
   }
-  if (literal && glob) throw new Error("'literal' and 'glob' are incompatible");
+  // get_global_magic: glob unless the element is literal, noglob literal unless it is glob
+  if (!global.literal) {
+    const elementLiteral = literal;
+    const elementGlob = glob;
+    if (global.glob && !elementLiteral) glob = true;
+    if (global.icase) icase = true;
+    if (global.noglob && !elementGlob) literal = true;
+  }
+  if (literal && glob) throw new Error(`${elem}: 'literal' and 'glob' are incompatible`);
   // with prefix magic the path is taken as written (git's init_pathspec_item), and its
   // lengths are bytes: the prefix may end inside a character
   const match = prefix >= 0 ? byteString(rest) : normalizePathspecPath(rest, elem);
@@ -451,6 +543,78 @@ export function excludeMatchesPathspec(items: readonly PathspecItem[], path: str
     if (psEqual(item, item.match.slice(0, n), name)) return true;
   }
   return false;
+}
+
+/**
+ * dir.c's `common_prefix_len`: the leading directories (each with its `/`, in bytes) every
+ * positive element shares in its literal part (an `:(icase)` element's only up to its
+ * `:(prefix:N)`), from the first positive element's match; "" when none.
+ */
+export function pathspecCommonPrefix(items: readonly PathspecItem[]): string {
+  let first: PathspecItem | undefined;
+  let max = 0;
+  for (const element of items) {
+    if (element.exclude) continue;
+    const item = pathspecItemBytes(element);
+    const isFirst = first === undefined;
+    if (isFirst) first = item;
+    const head = first as PathspecItem;
+    const itemLen = item.icase ? (item.prefix ?? 0) : item.nowildcardLen;
+    let len = 0;
+    for (let i = 0; i < itemLen && (isFirst || i < max); i++) {
+      const c = item.match[i];
+      if (c !== head.match[i]) break;
+      if (c === "/") len = i + 1;
+    }
+    if (isFirst || len < max) {
+      max = len;
+      if (!max) break;
+    }
+  }
+  return first ? first.match.slice(0, max) : "";
+}
+
+/**
+ * dir.c's `simplify_away`: no element (an exclude one included) can match `path` or
+ * anything below it, judged by the elements' literal parts.
+ */
+export function pathspecSimplifyAway(items: readonly PathspecItem[], path: string): boolean {
+  if (items.length === 0) return false;
+  const name = pathspecName(path);
+  for (const element of items) {
+    const item = pathspecItemBytes(element);
+    const len = Math.min(item.nowildcardLen, name.length);
+    if (psEqual(item, item.match.slice(0, len), name.slice(0, len))) return false;
+  }
+  return true;
+}
+
+/**
+ * The pathspec as `scanUntracked` (vcs-working-tree) asks it, dir.c's view of it: the
+ * walk starts at the elements' common leading directory (`common_prefix_len`, decoded to a
+ * path of the repository), skips what no element can reach (`simplify_away`), and matches
+ * names with `match_pathspec_with_flags` (a directory as `dir/` with
+ * `DO_MATCH_LEADING_PATHSPEC`, which `treat_directory` passes).
+ *
+ * @example
+ * ```typescript
+ * const items = parsePathspec(["src/*.ts", ":!src/gen"]);
+ * await scanUntracked(host, { ..., matcher: untrackedScanPathspec(items) });
+ * ```
+ */
+export function untrackedScanPathspec(items: PathspecItem[]): {
+  match(name: string, leading: boolean): number;
+  simplifyAway(path: string): boolean;
+  commonPrefix(): string;
+} {
+  return {
+    match: (name, leading) => matchPathspec(items, name, leading ? DO_MATCH_LEADING_PATHSPEC : 0),
+    simplifyAway: (path) => pathspecSimplifyAway(items, path),
+    commonPrefix: () => {
+      const prefix = pathspecCommonPrefix(items);
+      return prefix ? decodeGitPath(latin1Bytes(prefix)) : "";
+    },
+  };
 }
 
 /** The path an element names, as a string of the repository (its literal match, decoded). */

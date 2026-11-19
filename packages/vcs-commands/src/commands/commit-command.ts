@@ -20,17 +20,28 @@ import {
   UnmergedPathsError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import { AddCommand } from "./add-command.js";
 import { worktreeModeTrust } from "./core-config.js";
-import { withoutCrud } from "./git-ident.js";
+import { DEFAULT_DATE_MODE, showDate } from "./date-format.js";
+import { hostEnvironmentOf, withoutCrud } from "./git-ident.js";
 import { IndexAdder } from "./index-adder.js";
-import { OperationState, updateIndexCacheTree, writeIndexAsTree } from "./merge-support.js";
+import {
+  flatTree,
+  OperationState,
+  updateIndexCacheTree,
+  writeIndexAsTree,
+} from "./merge-support.js";
 import {
   CleanupMode,
   cleanupWith,
+  commentPrefixOf,
   commitCleanupMode,
   commitMessageFromOption,
+  completeLine,
+  editorCleanupMode,
   preparedMessageCleanup,
+  stripspace,
 } from "./message-cleanup.js";
 import { copyNotesForAmend } from "./notes-support.js";
 import {
@@ -44,7 +55,14 @@ import {
 } from "./pathspec.js";
 import { type CommitReflogKind, reflogMessages, updateHead } from "./reflog-messages.js";
 import { applyAutostash } from "./sequencer-support.js";
-import { readShowUntrackedFiles } from "./status-command.js";
+import {
+  cutLine,
+  readShowUntrackedFiles,
+  StatusCommand,
+  type StatusTextResult,
+  type UntrackedFilesMode,
+} from "./status-command.js";
+import { type CommitWhence, StatusPrinter } from "./status-format.js";
 
 /**
  * Result of a commit operation.
@@ -121,6 +139,15 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private worktreeIterator: Worktree | undefined;
   private cleanupMode?: CleanupMode;
   private allowEmptyMessage = false;
+  private editor?: CommitEditor;
+  private edit?: boolean;
+  private includeStatus?: boolean;
+  private verbose?: number;
+  private untrackedMode?: UntrackedFilesMode;
+  private statusFormat?: "long" | "short" | "porcelain";
+  private showBranch?: boolean;
+  private nullTermination = false;
+  private aheadBehind?: boolean;
 
   /**
    * Set the commit message, as git's `commit -m` takes it: its last line is ended and it is
@@ -367,6 +394,394 @@ export class CommitCommand extends GitCommand<CommitResult> {
    * @param iterator Custom working tree iterator
    * @returns this for chaining
    */
+  /**
+   * The editor of the commit message (git's `core.editor` / `GIT_EDITOR`, which a library
+   * cannot launch): called with the path of `COMMIT_EDITMSG` in the git directory and the
+   * text written there, the template git prepares (the message so far, then, unless
+   * {@link setIncludeStatus} is false, the commented help and status, and with
+   * {@link setVerbose} the diff below the scissors line). It returns the edited text, or
+   * nothing once it changed the file itself; the result is cleaned up as git cleans up an
+   * edited message (`default` strips comments, `scissors` cuts at the scissors line). It is
+   * used when no message is given, or with {@link setEdit}.
+   *
+   * @example
+   * ```typescript
+   * await git.commit().setEditor(async (_path, template) => `Subject\n\n${template}`).call();
+   * ```
+   */
+  setEditor(editor: CommitEditor): this {
+    this.checkCallable();
+    this.editor = editor;
+    return this;
+  }
+
+  /** `-e` / `--no-edit`: edit a given message too, or never edit (default: edit when none is given). */
+  setEdit(edit: boolean): this {
+    this.checkCallable();
+    this.edit = edit;
+    return this;
+  }
+
+  /** `--status` / `--no-status`: the status in the editor's template (default `commit.status`, true). */
+  setIncludeStatus(include: boolean): this {
+    this.checkCallable();
+    this.includeStatus = include;
+    return this;
+  }
+
+  /**
+   * `-v` (1) / `-vv` (2): the staged diff below the template's scissors line (and the
+   * unstaged one), or in {@link callDryRun}'s output (default `commit.verbose`)
+   */
+  setVerbose(level: number): this {
+    this.checkCallable();
+    this.verbose = level;
+    return this;
+  }
+
+  /** `-u<mode>` / `--untracked-files=<mode>` of the template and the dry run */
+  setUntrackedFiles(mode: UntrackedFilesMode): this {
+    this.checkCallable();
+    this.untrackedMode = mode;
+    return this;
+  }
+
+  /** `--short`, `--porcelain`, `--long`: the format of {@link callDryRun} (git's commit has no v2) */
+  setStatusFormat(format: "long" | "short" | "porcelain"): this {
+    this.checkCallable();
+    this.statusFormat = format;
+    return this;
+  }
+
+  /** `--branch`: the branch header of the short and porcelain dry runs (default `status.branch`) */
+  setShowBranch(show: boolean): this {
+    this.checkCallable();
+    this.showBranch = show;
+    return this;
+  }
+
+  /** `-z`: NUL-terminated dry-run output (porcelain unless another format is set) */
+  setNullTermination(z: boolean): this {
+    this.checkCallable();
+    this.nullTermination = z;
+    return this;
+  }
+
+  /** `--[no-]ahead-behind` of the dry run (default `status.aheadBehind` for the human formats) */
+  setAheadBehind(full: boolean): this {
+    this.checkCallable();
+    this.aheadBehind = full;
+    return this;
+  }
+
+  /**
+   * `git commit --dry-run` (and `--short`, `--porcelain`, `--long`, `-z`, which imply it):
+   * the status of what would be committed, in the format set, with git's exit code (0
+   * when there is something to commit, else 1). The index is prepared as the commit would
+   * prepare it (`-a` stages the tracked changes, {@link setOnly} builds the index of HEAD
+   * with the named paths), then left as it was (rollback_index_files).
+   *
+   * @example
+   * ```typescript
+   * const { text, exitCode } = await git.commit().setAll(true).callDryRun();
+   * ```
+   */
+  async callDryRun(): Promise<CommitDryRunResult> {
+    this.checkCallable();
+    this.setCallable(false);
+    readShowUntrackedFiles(this.workingCopy);
+    await this.readCurrentIndex();
+    const state = new OperationState(this.workingCopy.checkout, this.refsStore);
+    const mergeHeads = await this.mergeHeads(state);
+    const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
+    await this.checkAmend(state, mergeHeads, headId);
+    const partial = this.onlyPaths.length > 0;
+    const z = this.nullTermination;
+    const format = this.statusFormat ?? (z ? "porcelain" : "long");
+    const run = async (): Promise<StatusTextResult> =>
+      this.commitStatus({
+        format,
+        z,
+        ...(this.showBranch !== undefined ? { branch: this.showBranch } : {}),
+        ...(this.aheadBehind !== undefined ? { aheadBehind: this.aheadBehind } : {}),
+        verbose: this.verboseLevel(),
+        commitTemplate: true,
+        amend: this.amend,
+      });
+    let result: StatusTextResult;
+    if (this.all) {
+      const index = await this.holdIndex();
+      try {
+        await this.stageTrackedChanges();
+        result = await run();
+      } finally {
+        await index.release();
+      }
+    } else if (partial) {
+      const paths = await this.listPartialPaths(state, mergeHeads, headId);
+      const index = await this.holdIndex();
+      try {
+        const tree = await this.preparePartialCommit(paths, headId, index);
+        result = await this.withIndexOfTree(tree, run);
+      } finally {
+        await index.release();
+      }
+    } else result = await run();
+    return { ...result, exitCode: result.committable ? 0 : 1 };
+  }
+
+  /** git's use_editor: an editor is set, and no message is given or `-e` asks for it. */
+  private usesEditor(): boolean {
+    if (!this.editor || this.edit === false) return false;
+    return this.edit === true || this.message === undefined;
+  }
+
+  /**
+   * prepare_to_commit with an editor: COMMIT_EDITMSG written with the message so far and
+   * (`commit.status`) the commented help, identities and status of the template, the
+   * editor run over it, and what it left cleaned up as the commit message.
+   */
+  private async editMessage(ctx: {
+    state: OperationState;
+    mergeHeads: ObjectId[];
+    pickHead: ObjectId | undefined;
+    partialTree: ObjectId | undefined;
+    previousCommit: Commit | undefined;
+    author: PersonIdent;
+    committer: PersonIdent;
+    authorKept: boolean;
+  }): Promise<{ message: string; cleanup: CleanupMode }> {
+    const { state } = ctx;
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const mode = editorCleanupMode(this.workingCopy, this.cleanupMode);
+    const rebasing = (await state.read("rebase-merge/head-name")) !== undefined;
+    const whence: CommitWhence =
+      ctx.mergeHeads.length > 0
+        ? "merge"
+        : ctx.pickHead
+          ? rebasing && (await state.ref("REBASE_HEAD")) === ctx.pickHead
+            ? "rebase-pick"
+            : "cherry-pick"
+          : "commit";
+    // the message so far
+    let sb = "";
+    let cutLineAdded = false;
+    const mergeMsg = await state.read("MERGE_MSG");
+    const squashMsg = await state.read("SQUASH_MSG");
+    if (this.message !== undefined) sb = completeLine(this.message);
+    else if (this.amend && ctx.previousCommit) {
+      sb = ctx.previousCommit.message.replace(/^(?:[ \t\r]*\n)+/, "");
+    } else if (mergeMsg !== undefined) {
+      sb = `${squashMsg ?? ""}${mergeMsg}`;
+      if (mode === CleanupMode.SCISSORS) {
+        const cut = `${commentPrefixOf(this.workingCopy)} ------------------------ >8 ------------------------\n`;
+        if (mergeMsg.startsWith(cut) || mergeMsg.includes(`\n${cut}`)) cutLineAdded = true;
+      }
+    } else if (squashMsg !== undefined) sb = squashMsg;
+    if (mode !== CleanupMode.VERBATIM) sb = stripspace(sb);
+    // core.commentChar=auto: a character the message does not start a line with
+    const comment = commentPrefixOf(this.workingCopy, sb);
+    const includeStatus = this.includeStatus ?? parseBool(config.value("commit.status"), true);
+    const verbose = this.verboseLevel();
+    let template = sb;
+    let committable: boolean;
+    const p = new StatusPrinter(comment);
+    if (includeStatus) {
+      if (whence !== "commit") {
+        if (mode === CleanupMode.SCISSORS && !cutLineAdded) {
+          p.raw(cutLine(comment));
+          cutLineAdded = true;
+        }
+        const what = whence === "merge" ? "a merge" : "a cherry-pick";
+        const ref = whence === "merge" ? "MERGE_HEAD" : "CHERRY_PICK_HEAD";
+        p.ln(
+          `\nIt looks like you may be committing ${what}.\nIf this is not correct, please run\n\tgit update-ref -d ${ref}\nand try again.\n`,
+        );
+      }
+      p.raw("\n");
+      if (mode === CleanupMode.STRIP) {
+        p.printf(
+          this.allowEmptyMessage
+            ? `Please enter the commit message for your changes. Lines starting\nwith '${comment}' will be ignored.\n`
+            : `Please enter the commit message for your changes. Lines starting\nwith '${comment}' will be ignored, and an empty message aborts the commit.\n`,
+        );
+      } else if (mode === CleanupMode.SCISSORS) {
+        if (whence === "commit" && !cutLineAdded) {
+          p.raw(cutLine(comment));
+          cutLineAdded = true;
+        }
+      } else {
+        p.printf(
+          this.allowEmptyMessage
+            ? `Please enter the commit message for your changes. Lines starting\nwith '${comment}' will be kept; you may remove them yourself if you want to.\n`
+            : `Please enter the commit message for your changes. Lines starting\nwith '${comment}' will be kept; you may remove them yourself if you want to.\nAn empty message aborts the commit.\n`,
+        );
+      }
+      let identShown = 0;
+      const { author, committer } = ctx;
+      if (author.name !== committer.name || author.email !== committer.email) {
+        p.ln(`${identShown++ ? "" : "\n"}Author:    ${author.name} <${author.email}>`);
+      }
+      if (ctx.authorKept) {
+        const date = showDate(author.timestamp, author.tzOffset, DEFAULT_DATE_MODE);
+        p.ln(`${identShown++ ? "" : "\n"}Date:      ${date}`);
+      }
+      if (!this.committerIdentGiven()) {
+        p.ln(`${identShown++ ? "" : "\n"}Committer: ${committer.name} <${committer.email}>`);
+      }
+      p.ln("");
+      const run = () =>
+        this.commitStatus({
+          format: "long",
+          commentPrefix: comment,
+          hints: false,
+          nowarn: true,
+          commitTemplate: true,
+          amend: this.amend,
+          verbose,
+          toFile: true,
+          cutLineAdded,
+          whence,
+        });
+      const status = ctx.partialTree
+        ? await this.withIndexOfTree(ctx.partialTree, run)
+        : await run();
+      committable = status.committable;
+      template += p.out + status.text;
+    } else {
+      const run = () => this.commitStatus({ format: "porcelain" });
+      const status = ctx.partialTree
+        ? await this.withIndexOfTree(ctx.partialTree, run)
+        : await run();
+      committable = status.committable;
+    }
+    // an empty commit is refused before the editor runs
+    const isMerge = (ctx.previousCommit?.parents.length ?? 0) > 1;
+    if (!committable && whence !== "merge" && !this.allowEmpty && !(this.amend && isMerge)) {
+      throw new EmptyCommitError();
+    }
+    await state.write("COMMIT_EDITMSG", template);
+    const edited = await (this.editor as CommitEditor)("COMMIT_EDITMSG", template);
+    let text: string;
+    if (typeof edited === "string") {
+      await state.write("COMMIT_EDITMSG", edited);
+      text = edited;
+    } else text = (await state.read("COMMIT_EDITMSG")) ?? "";
+    // cleanup_message
+    if (verbose > 0 || mode === CleanupMode.SCISSORS) {
+      const cut = `${comment} ------------------------ >8 ------------------------\n`;
+      if (text.startsWith(cut)) text = "";
+      else {
+        const at = text.indexOf(`\n${cut}`);
+        if (at >= 0) text = text.slice(0, at + 1);
+      }
+    }
+    if (mode !== CleanupMode.VERBATIM) {
+      text = stripspace(text, mode === CleanupMode.STRIP ? comment : undefined);
+    }
+    return { message: text, cleanup: mode === CleanupMode.VERBATIM ? mode : CleanupMode.STRIP };
+  }
+
+  /** committer_ident_sufficiently_given: a name and an email named, not guessed. */
+  private committerIdentGiven(): boolean {
+    const env = hostEnvironmentOf(this.workingCopy);
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const name =
+      env?.committer?.name !== undefined ||
+      config.value("committer.name") !== undefined ||
+      config.value("user.name") !== undefined;
+    const email =
+      env?.committer?.email !== undefined ||
+      config.value("committer.email") !== undefined ||
+      config.value("user.email") !== undefined ||
+      !!env?.defaultEmail;
+    return name && email;
+  }
+
+  /** parse_and_validate_options' checks of `--amend`. */
+  private async checkAmend(
+    state: OperationState,
+    mergeHeads: ObjectId[],
+    headId: ObjectId | undefined,
+  ): Promise<void> {
+    if (!this.amend) return;
+    if (!headId) {
+      throw new InvalidArgumentError("amend", true, "fatal: You have nothing to amend.");
+    }
+    if (mergeHeads.length > 0) {
+      throw new InvalidArgumentError(
+        "amend",
+        true,
+        "fatal: You are in the middle of a merge -- cannot amend.",
+      );
+    }
+    if (await state.ref("CHERRY_PICK_HEAD")) {
+      throw new InvalidArgumentError(
+        "amend",
+        true,
+        "fatal: You are in the middle of a cherry-pick -- cannot amend.",
+      );
+    }
+  }
+
+  /** `-v` as given, else `commit.verbose` (a boolean or a level), else 0. */
+  private verboseLevel(): number {
+    if (this.verbose !== undefined) return this.verbose;
+    const value = RemoteConfigStore.from(this.workingCopy).value("commit.verbose");
+    if (value === undefined) return 0;
+    if (/^\s*-?\d+\s*$/.test(value)) return Number.parseInt(value, 10);
+    const v = value.toLowerCase();
+    return v === "" || v === "false" || v === "no" || v === "off" ? 0 : 1;
+  }
+
+  /**
+   * run_status for the commit: the status of the prepared index against HEAD (HEAD^1 for
+   * `--amend`), its stats not written back (the commit holds the index).
+   */
+  private async commitStatus(
+    options: Parameters<StatusCommand["callText"]>[0] & object,
+  ): Promise<StatusTextResult> {
+    const status = new StatusCommand(this.workingCopy).setWriteIndex(false);
+    if (this.untrackedMode) status.setUntrackedFiles(this.untrackedMode);
+    if (this.amend) {
+      const headId = await this.resolveHead();
+      const head = await this.commits.load(headId);
+      status.setReferenceCommit(head?.parents[0] ?? null);
+    }
+    return status.callText(options);
+  }
+
+  /**
+   * Runs `fn` while the staging holds the entries of `tree` (a partial commit's false
+   * index: HEAD with the named paths), each with the stat of the staging's same entry,
+   * then puts the staging's entries back.
+   */
+  private async withIndexOfTree<T>(tree: ObjectId, fn: () => Promise<T>): Promise<T> {
+    const staging = this.staging;
+    const before = (staging.entryList?.() ?? (await collectEntries(staging))).slice();
+    const cacheTree = staging.getCacheTree?.();
+    const known = new Map(before.filter((e) => e.stage === 0).map((e) => [e.path, e]));
+    const flat = await flatTree(this.trees, tree);
+    const builder = staging.createBuilder();
+    for (const [path, entry] of flat) {
+      const same = known.get(path);
+      builder.add(
+        same && same.objectId === entry.objectId && same.mode === entry.mode
+          ? same
+          : { path, mode: entry.mode, objectId: entry.objectId, stage: 0, size: 0, mtime: 0 },
+      );
+    }
+    await builder.finish();
+    try {
+      return await fn();
+    } finally {
+      const restore = staging.createBuilder();
+      for (const entry of before) restore.add(entry);
+      await restore.finish();
+      staging.setCacheTree?.(cacheTree);
+    }
+  }
+
   setWorktree(iterator: Worktree): this {
     this.checkCallable();
     this.worktreeIterator = iterator;
@@ -473,9 +888,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
     pickHead: ObjectId | undefined,
     index: HeldIndex | undefined,
   ): Promise<CommitResult> {
+    // an editor edits the message (git's use_editor): no message given, or -e
+    const editing = this.usesEditor();
     let message = this.message;
     const given = message !== undefined;
-    if (message === undefined && !this.amend) {
+    if (!editing && message === undefined && !this.amend) {
       const prepared = (await state.read("MERGE_MSG")) ?? (await state.read("SQUASH_MSG"));
       // as git commit leaves it once the editor accepts it: comments stripped, or as
       // setCleanupMode / commit.cleanup say, with core.commentChar's character
@@ -487,15 +904,16 @@ export class CommitCommand extends GitCommand<CommitResult> {
     }
 
     // Check message
-    if (message === undefined && !this.amend) {
+    if (!editing && message === undefined && !this.amend) {
       throw new NoMessageError();
     }
 
     // Get message (from amend or new): a message given is git's `-m` (its line ended, then
     // cleaned up); one prepared by a merge or pick was cleaned up above
-    const cleanup = commitCleanupMode(this.workingCopy, this.cleanupMode);
-    let finalMessage =
-      given && message !== undefined
+    let cleanup: CleanupMode = commitCleanupMode(this.workingCopy, this.cleanupMode);
+    let finalMessage = editing
+      ? undefined
+      : given && message !== undefined
         ? commitMessageFromOption(message, this.cleanupMode, this.workingCopy, true)
         : message;
     let previousCommit: Commit | undefined;
@@ -508,20 +926,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
       if (!previousCommit) {
         throw new NoHeadError("Cannot amend: HEAD commit not found");
       }
-      if (finalMessage === undefined) {
+      if (finalMessage === undefined && !editing) {
         // `--amend --no-edit`: the amended commit's message, cleaned up as any other
         finalMessage = cleanupWith(this.workingCopy, previousCommit.message, cleanup, true);
       }
-    }
-
-    // git's message_is_empty: nothing but whitespace and sign-offs (any text, verbatim)
-    if (
-      finalMessage === undefined ||
-      (!this.allowEmptyMessage &&
-        (cleanup !== CleanupMode.VERBATIM || finalMessage.length === 0) &&
-        isEmptyMessage(finalMessage))
-    ) {
-      throw new NoMessageError("Aborting commit due to empty commit message.");
     }
 
     // The author (git's determine_author_info): the one given; else an amended commit's or
@@ -554,6 +962,31 @@ export class CommitCommand extends GitCommand<CommitResult> {
       (this.committerName
         ? this.datedIdent("committer", this.committerName)
         : this.resolveCommitter(author));
+
+    if (editing) {
+      const edited = await this.editMessage({
+        state,
+        mergeHeads,
+        pickHead,
+        partialTree,
+        previousCommit,
+        author,
+        committer,
+        authorKept: !this.author && !this.resetAuthor && (!!previousCommit || !!pickHead),
+      });
+      finalMessage = edited.message;
+      cleanup = edited.cleanup;
+    }
+
+    // git's message_is_empty: nothing but whitespace and sign-offs (any text, verbatim)
+    if (
+      finalMessage === undefined ||
+      (!this.allowEmptyMessage &&
+        (cleanup !== CleanupMode.VERBATIM || finalMessage.length === 0) &&
+        isEmptyMessage(finalMessage))
+    ) {
+      throw new NoMessageError("Aborting commit due to empty commit message.");
+    }
 
     // Determine parents
     let parents: ObjectId[];
@@ -1075,4 +1508,26 @@ function isEmptyMessage(message: string): boolean {
   return message
     .split("\n")
     .every((line) => line.startsWith("Signed-off-by: ") || /^[ \t\r]*$/.test(line));
+}
+
+/** A git boolean (`fallback` when unset or not one). */
+function parseBool(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined) return fallback;
+  const v = value.trim().toLowerCase();
+  if (v === "" || v === "false" || v === "no" || v === "off" || v === "0") return false;
+  if (v === "true" || v === "yes" || v === "on" || v === "1") return true;
+  return fallback;
+}
+
+/**
+ * The editor of a commit message (`CommitCommand.setEditor`): the path of the message file
+ * within the git directory (`COMMIT_EDITMSG`) and its text; it returns the edited text, or
+ * nothing (anything but a string) when it edited the file in place.
+ */
+export type CommitEditor = (path: string, text: string) => Promise<unknown>;
+
+/** What `CommitCommand.callDryRun` gives: the status text and git's exit code. */
+export interface CommitDryRunResult extends StatusTextResult {
+  /** 0 when there is something to commit, 1 when not (dry_run_commit) */
+  exitCode: number;
 }
