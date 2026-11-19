@@ -342,7 +342,7 @@ export class FileWorktree implements Worktree {
         return result;
       },
       isExcluded: (path, isDirectory) => this.ignoreManager.isIgnored(path, isDirectory),
-      isNestedRepository: (path) => this.hasGitDirectory(full(path), files),
+      isNestedRepository: (path) => this.hasGitDirectory(path),
       readInfoExclude: async () => {
         if (!gitDir) return undefined;
         const path = joinPath(gitDir, "info", "exclude");
@@ -484,7 +484,7 @@ export class FileWorktree implements Worktree {
 
       let hasGitDir = false;
       if (isDirectory) {
-        hasGitDir = await this.hasGitDirectory(fullPath, files);
+        hasGitDir = await this.hasGitDirectory(entryPath);
       }
 
       const stats = link
@@ -600,7 +600,7 @@ export class FileWorktree implements Worktree {
       });
       if (!link || link.kind === "other") return undefined;
       const isDirectory = link.kind === "directory";
-      const hasGitDir = isDirectory && (await this.hasGitDirectory(fullPath));
+      const hasGitDir = isDirectory && (await this.hasGitDirectory(path));
       return {
         path,
         name: basename(path),
@@ -633,7 +633,7 @@ export class FileWorktree implements Worktree {
 
       let hasGitDir = false;
       if (isDirectory) {
-        hasGitDir = await this.hasGitDirectory(fullPath);
+        hasGitDir = await this.hasGitDirectory(path);
       }
 
       const mode = this.getFileMode({ kind: isDirectory ? "directory" : "file" }, hasGitDir);
@@ -1567,13 +1567,43 @@ export class FileWorktree implements Worktree {
     return FileMode.REGULAR_FILE;
   }
 
-  private async hasGitDirectory(dirPath: string, files = this.files): Promise<boolean> {
-    const gitPath = joinPath(dirPath, ".git");
+  /**
+   * Whether the directory at `path` (a worktree path) is a nested repository, as git's
+   * `treat_directory` decides: `is_nonbare_repository_dir` ({@link nestedGitDir}: a `.git`
+   * directory with a valid HEAD, objects and refs, or a gitfile or link naming one), unless
+   * its `.git` resolves to the superproject's own git directory (git compares the real
+   * paths: a `.git` link to it). An empty `.git` directory, a gitfile holding garbage or
+   * naming no repository is not one: the directory is walked as any other. What cannot be
+   * checked here (a place beyond the FilesApi's root, an unreadable entry) counts as one,
+   * so nothing is added or removed on a guess.
+   */
+  private async hasGitDirectory(path: string): Promise<boolean> {
+    let repo: NestedGitDir;
     try {
-      return await files.exists(gitPath);
+      repo = await this.nestedGitDir(path);
     } catch {
-      return false;
+      // an empty commondir (git dies there): what may be a repository
+      return true;
     }
+    if (repo.state === "none") return false;
+    if (repo.state === "repository" && this.gitDir !== undefined) {
+      const real = await this.realDotGit(path);
+      const own = resolveDots(joinPath("/", this.gitDir));
+      if (real !== undefined && real === own) return false;
+    }
+    return true;
+  }
+
+  /**
+   * The path the `.git` of `path` resolves to (git's `real_pathdup`), its last component
+   * followed where it is a link; undefined when it lies beyond this FilesApi.
+   */
+  private async realDotGit(path: string): Promise<string | undefined> {
+    const dotGit = joinPath(this.rootPath, path, ".git");
+    if ((await this.kindOrError(dotGit)) !== "symlink") return resolveDots(dotGit);
+    const bytes = await this.files.readlink?.(dotGit).catch(() => undefined);
+    const target = bytes ? this.gitfileTarget(path, decodeGitPath(bytes)) : undefined;
+    return target === undefined ? undefined : resolveDots(joinPath("/", target));
   }
 
   private async getFileStats(

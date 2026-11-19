@@ -6,7 +6,7 @@
  *
  * ```typescript
  * const state = openUntrackedCache(staging, config, environment, host);
- * const cache = await state.forScan(); // undefined: scan without it
+ * const cache = await state.forScan(flags); // undefined: scan without it
  * // ... scanUntracked(host, { cache, ... })
  * if (state.changed()) await refreshIndexStats(staging, refresh, { untrackedCache: state.cache ?? null });
  * ```
@@ -71,11 +71,14 @@ export interface UntrackedCacheState {
   /** The cache the index will hold (undefined: none) */
   readonly cache: UntrackedCache | undefined;
   /**
-   * The cache a `-uall` scan without ignored files and pathspec may use and update
+   * The cache a whole-tree scan without ignored files and pathspec, made with the
+   * `dir_struct` `flags` (0 for `-uall`, `DIR_SHOW_OTHER_DIRECTORIES |
+   * DIR_HIDE_EMPTY_DIRECTORIES` for `-unormal`), may use and update
    * (`validate_untracked_cache`): its exclude files checked, a root made; undefined when
-   * the scan must go without it
+   * the scan must go without it. A cache of other flags is replaced, unless it is the one
+   * `status.showUntrackedFiles` makes (it is then kept for the scans of that mode).
    */
-  forScan(): Promise<UntrackedCache | undefined>;
+  forScan(flags: number): Promise<UntrackedCache | undefined>;
   /** Whether the index must be written for the cache (`UNTRACKED_CHANGED`) */
   changed(): boolean;
 }
@@ -115,16 +118,16 @@ export function openUntrackedCache(
     get cache() {
       return cache;
     },
-    async forScan() {
+    async forScan(flags: number) {
       if (!cache || !ident || !host || environment?.disableUntrackedCache) return undefined;
       if (cache.excludePerDir !== ".gitignore") return undefined;
       // a cache made elsewhere: git warns that it is disabled here and goes without it
       if (!untrackedCacheIdentIs(cache, ident)) return undefined;
-      // this scan is `-uall` (dir flags 0)
-      if (cache.dirFlags !== 0) {
-        // a cache of the configured mode is kept for the scans of that mode
+      // a cache made for other flags: replaced by one for these when it is not the
+      // configured mode's, else kept for the scans of that mode and not used here
+      if (cache.dirFlags !== flags) {
         if (cache.dirFlags === newUntrackedCacheFlags(config)) return undefined;
-        cache = newUntrackedCache(ident, 0);
+        cache = newUntrackedCache(ident, flags);
         changed = true;
       }
       if (!cache.root) {

@@ -1,6 +1,6 @@
 import type { LinkedWorktrees, WorktreeInfo } from "@statewalker/vcs-working-tree";
 
-import { WorktreeError } from "../errors/index.js";
+import { InvalidConfigError, WorktreeError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { StatusCommand } from "./status-command.js";
 import { checkCandidatePath, findLinkedWorktree, requireWorktrees } from "./worktree-support.js";
@@ -83,9 +83,21 @@ export class WorktreeRemoveCommand extends GitCommand<WorktreeInfo> {
     if ((await worktrees.pathState(wt.path)) !== "missing") {
       if (this.force === 0) {
         await refuseSubmodules(worktrees, wt);
+        // `git status --porcelain --ignore-submodules=none` there (check_clean_worktree), in
+        // the worktree's own untracked mode: with status.showUntrackedFiles=no untracked
+        // files do not stop the removal, as in git
         const status = await new StatusCommand(await worktrees.open(wt))
           .setIgnoreSubmodules("none")
-          .call();
+          .call()
+          .catch((error: unknown) => {
+            // the child dies on its configuration (its messages), then git worktree does;
+            // die_errno adds strerror of an errno still 0
+            if (!(error instanceof InvalidConfigError)) throw error;
+            throw new InvalidConfigError(
+              error.key,
+              `${error.message}\nfatal: failed to run 'git status' on '${arg}', code 128: Success`,
+            );
+          });
         if (!status.isClean()) {
           throw new WorktreeError(
             `'${arg}' contains modified or untracked files, use --force to delete it`,

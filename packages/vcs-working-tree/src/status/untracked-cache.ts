@@ -36,6 +36,10 @@ export const EMPTY_BLOB_OID = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 export const DIR_SHOW_IGNORED = 1 << 0;
 export const DIR_SHOW_OTHER_DIRECTORIES = 1 << 1;
 export const DIR_HIDE_EMPTY_DIRECTORIES = 1 << 2;
+/** Report ignored paths too, in their own list (`--ignored`) */
+export const DIR_SHOW_IGNORED_TOO = 1 << 5;
+/** With {@link DIR_SHOW_IGNORED_TOO}: only paths an exclude pattern matches (`--ignored=matching`) */
+export const DIR_SHOW_IGNORED_TOO_MODE_MATCHING = 1 << 8;
 
 /** git's `stat_data`: the stat of a directory or exclude file, each field 32 bits. */
 export interface StatData {

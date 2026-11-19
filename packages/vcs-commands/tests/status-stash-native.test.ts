@@ -136,15 +136,23 @@ function repo(dir: string): void {
   run(dir, "commit", "-q", "-m", "c1");
 }
 
-/** Our status, as porcelain v1 and v2, equals native git's. */
+/** Our status, as porcelain v1 and v2 with `-uall` and v1 in the default mode, equals native git's. */
 async function expectStatusAsNative(dir: string, ignored = false) {
   const extra = ignored ? ["--ignored"] : [];
   const { ours } = await open(dir);
-  const status = await ours.status().setIgnored(ignored).call();
+  const status = await ours.status().setUntrackedFiles("all").setIgnored(ignored).call();
   expect(formatStatusPorcelain(status, 1)).toBe(nativeStatus(dir, 1, ...extra));
   const { ours: again } = await open(dir);
-  const v2 = formatStatusPorcelain(await again.status().setIgnored(ignored).call(), 2);
+  const v2 = formatStatusPorcelain(
+    await again.status().setUntrackedFiles("all").setIgnored(ignored).call(),
+    2,
+  );
   expect(v2).toBe(nativeStatus(dir, 2, ...extra));
+  // and in git's default untracked mode (normal)
+  const { ours: normal } = await open(dir);
+  expect(formatStatusPorcelain(await normal.status().setIgnored(ignored).call(), 1)).toBe(
+    exec(dir, "status", "--porcelain=v1", ...extra),
+  );
   return status;
 }
 
@@ -1097,6 +1105,147 @@ describeGit("stash push twins against native git (review cases)", () => {
     );
     expect(run(dir, "ls-files", "-s")).toBe(run(native, "ls-files", "-s"));
   });
+});
+
+/** Directories whose `.git` names no repository: git walks them as any other (dir.c). */
+function fakeGitDirs(d: string) {
+  mkdirSync(join(d, "x/emptygit/.git"), { recursive: true });
+  put(d, "x/badgitfile/.git", "garbage\n");
+  put(d, "x/badgitfile/g", "g\n");
+  put(d, "x/badgitfile2/.git", "gitdir: ../nonexistent\n");
+  put(d, "x/badgitfile2/b", "b\n");
+  mkdirSync(join(d, "x/linkgit"));
+  symlinkSync("../../.git", join(d, "x/linkgit/.git"));
+  nestedRepo(d, "x/sub");
+}
+
+/** Every path under `dir` but its own `.git`, links as `-> target`. */
+function fullListing(dir: string): string[] {
+  return listing(dir).map((p) => {
+    const st = lstatSync(join(dir, p));
+    if (st.isSymbolicLink()) return `${p} -> ${readlinkSync(join(dir, p))}`;
+    return st.isDirectory() ? `${p}/` : `${p}: ${read(join(dir, p))}`;
+  });
+}
+
+describeGit("a .git naming no repository, against native git", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "fake-gitdirs-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("stash -u stashes and removes the files of such directories, keeps the repository", async () => {
+    const { native, ours } = await twinStash("fake-u", fakeGitDirs, { u: true });
+    expect(fullListing(ours)).toEqual(fullListing(native));
+    expect(existsSync(join(ours, "x/sub/.git"))).toBe(true);
+  });
+
+  it("status in every untracked mode", async () => {
+    const d = join(root, "st");
+    repo(d);
+    fakeGitDirs(d);
+    await expectStatusAsNative(d);
+  });
+
+  // (-f: with the -f of a real run, -ff)
+  for (const flags of [["-d"], ["-d", "-f"], ["-d", "-x"]]) {
+    it(`clean ${flags.join(" ")} (and its dry run)`, async () => {
+      for (const dryRun of [true, false]) {
+        const d = join(root, `clean${flags.join("")}${dryRun}`);
+        repo(d);
+        fakeGitDirs(d);
+        const native = `${d}-native`;
+        cpSync(d, native, { recursive: true, verbatimSymlinks: true });
+        const out = exec(native, "clean", dryRun ? "-n" : "-f", ...flags);
+        const { ours } = await open(d);
+        const result = await ours
+          .clean()
+          .setCleanDirectories(true)
+          .setIgnore(!flags.includes("-x"))
+          .setForceNestedRepositories(
+            flags.filter((f) => f === "-f").length + (dryRun ? 0 : 1) >= 2,
+          )
+          .setDryRun(dryRun)
+          .call();
+        const theirs = out
+          .split("\n")
+          .filter((l) => l.startsWith("Would remove ") || l.startsWith("Removing "))
+          .map((l) => l.replace(/^(Would remove|Removing) /, ""))
+          .sort();
+        expect([flags, dryRun, [...result.cleaned].sort()]).toEqual([flags, dryRun, theirs]);
+        expect(fullListing(d)).toEqual(fullListing(native));
+      }
+    });
+  }
+
+  it("add . and add -n .", async () => {
+    const d = join(root, "add");
+    repo(d);
+    fakeGitDirs(d);
+    // (the nested repository has a commit: git adds it as a gitlink)
+    const native = `${d}-native`;
+    cpSync(d, native, { recursive: true, verbatimSymlinks: true });
+    const dry = exec(native, "add", "-n", ".");
+    const { ours } = await open(d);
+    const result = await ours.add().addFilepattern(".").setDryRun(true).call();
+    expect(result.output.join("\n")).toBe(dry.trim());
+    exec(native, "add", ".");
+    await (await open(d)).ours.add().addFilepattern(".").call();
+    expect(run(d, "ls-files", "-s")).toBe(run(native, "ls-files", "-s"));
+  });
+
+  for (const [name, setup] of [
+    ["an empty .git directory", (d: string) => mkdirSync(join(d, "x/e/.git"), { recursive: true })],
+    ["a gitfile of garbage", (d: string) => put(d, "x/g/.git", "garbage\n")],
+    [
+      "a link to the superproject's .git",
+      (d: string) => {
+        mkdirSync(join(d, "x/l"));
+        symlinkSync("../../.git", join(d, "x/l/.git"));
+      },
+    ],
+    [
+      "a gitfile of garbage beside a file",
+      (d: string) => {
+        put(d, "x/g/.git", "garbage\n");
+        put(d, "x/g/b", "b\n");
+      },
+    ],
+  ] as [string, (d: string) => void][]) {
+    it(`checkout of a file over a directory holding ${name}`, async () => {
+      const dir = join(root, "co");
+      repo(dir);
+      run(dir, "checkout", "-q", "-b", "other");
+      put(dir, "x", "file\n");
+      run(dir, "add", "x");
+      run(dir, "commit", "-qm", "x");
+      run(dir, "checkout", "-q", "main");
+      put(dir, "x/t.txt", "t\n");
+      run(dir, "add", ".");
+      run(dir, "commit", "-qm", "xt");
+      setup(dir);
+      const native = `${dir}-native`;
+      cpSync(dir, native, { recursive: true, verbatimSymlinks: true });
+      let nativeError = "";
+      try {
+        exec(native, "checkout", "-q", "other");
+      } catch (e) {
+        nativeError = ((e as { stderr?: string }).stderr ?? "").trim();
+      }
+      const { ours } = await open(dir);
+      let ourError = "";
+      try {
+        // a refusal is a result with git's message
+        const result = await ours.checkout().setName("other").call();
+        if (result.status !== "OK") ourError = result.message ?? String(result.status);
+      } catch (e) {
+        ourError = (e as Error).message;
+      }
+      expect(ourError).toBe(nativeError);
+      expect(fullListing(dir)).toEqual(fullListing(native));
+      expect(run(dir, "ls-files", "-s")).toBe(run(native, "ls-files", "-s"));
+    });
+  }
 });
 
 describeGit("status against native git (review cases)", () => {

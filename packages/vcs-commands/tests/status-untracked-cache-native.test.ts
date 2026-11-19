@@ -315,7 +315,7 @@ describeGit("untracked cache: native git and ours write the same UNTR", () => {
     const normal = await untr(dir);
     expect(normal).toBeDefined();
     expect(parseUntrackedCache(new Uint8Array(normal as Buffer))?.dirFlags).toBe(6);
-    const status = await (await open(dir)).status().call();
+    const status = await (await open(dir)).status().setUntrackedFiles("all").call();
     expect(formatStatusPorcelain(status)).toBe(git(dir, ["status", "--porcelain", "-uall"]));
     expect((await untr(dir))?.equals(normal as Buffer)).toBe(true);
   });
@@ -444,4 +444,179 @@ describeGit("untracked cache: native git and ours write the same UNTR", () => {
       expect(git(dir, ["status", "--porcelain"])).toBe(uncachedStatus(dir));
     });
   }
+});
+
+/** `repo`, with the cache in git's default mode: `normal` (dir flags 6). */
+function repoNormal(dir: string) {
+  repo(dir);
+  git(dir, ["config", "--unset", "status.showUntrackedFiles"]);
+  mkdirSync(join(dir, "empty/inner"), { recursive: true });
+  put(dir, "only-ignored/x.log", "x\n");
+  put(dir, "only-ignored/deeper/y.log", "y\n");
+  dateBack(dir);
+}
+
+describeGit("untracked cache in normal mode: native git and ours write the same UNTR", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "status-untr-normal-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("through directory changes, ignore-file changes and index edits (dir flags 6)", async () => {
+    const dir = join(root, "r");
+    repoNormal(dir);
+    const steps: Array<[string, () => void]> = [
+      ["first scan (no cache yet)", () => {}],
+      ["nothing changed (every directory from the cache)", () => {}],
+      ["a file made in a cached tracked directory", () => put(dir, "a/b/new2.txt", "n\n")],
+      ["a file deep in an untracked directory", () => put(dir, "u/v/x/y/deep.txt", "d\n")],
+      ["an untracked file removed", () => rmSync(join(dir, "a/new.txt"))],
+      ["the only file of an untracked directory removed", () => rmSync(join(dir, "u/v/w.txt"))],
+      ["the empty directory gets a file", () => put(dir, "empty/inner/now.txt", "n\n")],
+      ["and loses it again", () => rmSync(join(dir, "empty/inner/now.txt"))],
+      ["an ignored file in an untracked directory", () => put(dir, "z/q.log", "q\n")],
+      ["an untracked one next to it", () => put(dir, "z/r.txt", "r\n")],
+      ["the ignored directory gets an untracked file", () => put(dir, "only-ignored/u.txt", "u\n")],
+      ["an untracked directory removed", () => rmSync(join(dir, "u"), { recursive: true })],
+      [
+        "a tracked .gitignore edited in place",
+        () => put(dir, ".gitignore", "*.log\nbuild/\n*.txt.bak\nr.txt\n"),
+      ],
+      ["an untracked .gitignore in a subdirectory", () => put(dir, "e/.gitignore", "*.none\n")],
+      ["info/exclude edited", () => put(dir, ".git/info/exclude", "u.txt\n")],
+      [
+        "a nested repository",
+        () => {
+          mkdirSync(join(dir, "nested"));
+          git(join(dir, "nested"), ["init", "-q"]);
+        },
+      ],
+      ["git add of a file in an untracked directory", () => git(dir, ["add", "-f", "z/r.txt"])],
+      ["git rm --cached of a tracked file", () => git(dir, ["rm", "-q", "--cached", "d/four.txt"])],
+      [
+        "git rm --cached of a whole tracked directory",
+        () => git(dir, ["rm", "-rq", "--cached", "e"]),
+      ],
+      ["a .gitignore removed", () => rmSync(join(dir, "d/.gitignore"))],
+    ];
+    let i = 0;
+    for (const [name, change] of steps) {
+      change();
+      dateBack(dir);
+      const keep = i++ % 2 === 0 ? "native" : "ours";
+      try {
+        await expectTwins(dir, keep);
+        expect(parseUntrackedCache(new Uint8Array((await untr(dir)) as Buffer))?.dirFlags).toBe(6);
+      } catch (error) {
+        throw new Error(`step "${name}": ${(error as Error).message}`);
+      }
+    }
+  }, 60_000);
+
+  it("each side reads the other's normal-mode cache and finds it valid", async () => {
+    const dir = join(root, "r");
+    repoNormal(dir);
+    const ours = formatStatusPorcelain(await (await open(dir)).status().call());
+    const written = await untr(dir);
+    expect(ours).toContain("?? u/\n");
+    expect(git(dir, ["status", "--porcelain"])).toBe(ours);
+    expect((await untr(dir))?.equals(written as Buffer)).toBe(true);
+    put(dir, "u/v/later.txt", "l\n");
+    git(dir, ["status", "--porcelain"]);
+    const nativeUntr = await untr(dir);
+    const again = await (await open(dir)).status().call();
+    expect(formatStatusPorcelain(again)).toBe(uncachedStatus(dir));
+    // nothing changed since native's run: ours leaves its cache as it is
+    expect((await untr(dir))?.equals(nativeUntr as Buffer)).toBe(true);
+  });
+
+  it("the cache follows the configured mode: replaced when it changes, bypassed by the other", async () => {
+    const dir = join(root, "r");
+    repo(dir);
+    // -uall configured: a cache of flags 0
+    await expectTwins(dir, "native");
+    expect(parseUntrackedCache(new Uint8Array((await untr(dir)) as Buffer))?.dirFlags).toBe(0);
+    // normal configured: the -uall cache is replaced by one of flags 6, on both sides
+    git(dir, ["config", "status.showUntrackedFiles", "normal"]);
+    await expectTwins(dir, "ours");
+    expect(parseUntrackedCache(new Uint8Array((await untr(dir)) as Buffer))?.dirFlags).toBe(6);
+    // -uall asked while normal is configured: the cache is not used and stays as it is
+    const kept = await untr(dir);
+    expect(git(dir, ["status", "--porcelain", "-uall"])).toBe(
+      formatStatusPorcelain(await (await open(dir)).status().setUntrackedFiles("all").call()),
+    );
+    expect((await untr(dir))?.equals(kept as Buffer)).toBe(true);
+    // a -uno status does not touch it either
+    await (await open(dir)).status().setUntrackedFiles("no").call();
+    expect((await untr(dir))?.equals(kept as Buffer)).toBe(true);
+    // back to all: replaced by a flags-0 cache again
+    git(dir, ["config", "status.showUntrackedFiles", "all"]);
+    await expectTwins(dir, "native");
+    expect(parseUntrackedCache(new Uint8Array((await untr(dir)) as Buffer))?.dirFlags).toBe(0);
+  });
+
+  it("fuzz: random changes in normal mode, UNTR bytes and status as native git's", async () => {
+    const dir = join(root, "r");
+    repoNormal(dir);
+    let seed = 0x0a0b;
+    const rand = (n: number) => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    const dirs = ["", "a", "a/b", "a/b/c", "d", "e/f", "u", "u/v", "n/m", "n/m/k", "empty/inner"];
+    const names = ["p.txt", "q.log", "r.tmp", "keep.tmp", "s", ".gitignore"];
+    const ignores = ["", "*.txt\n", "*.tmp\n!keep.tmp\n", "s\n", "m/\n", "v/\n!keep.tmp\n"];
+    const untrackedNow = () =>
+      git(dir, ["ls-files", "-o", "--exclude-standard"]).split("\n").filter(Boolean);
+    for (let step = 0; step < 30; step++) {
+      const at = dirs[rand(dirs.length)] as string;
+      const name = names[rand(names.length)] as string;
+      const path = at ? `${at}/${name}` : name;
+      switch (rand(7)) {
+        case 0:
+        case 1:
+          put(
+            dir,
+            path,
+            name === ".gitignore" ? (ignores[rand(ignores.length)] as string) : `${step}\n`,
+          );
+          break;
+        case 2: {
+          const files = untrackedNow();
+          const victim = files[rand(Math.max(1, files.length))];
+          if (victim) rmSync(join(dir, victim), { force: true });
+          break;
+        }
+        case 3:
+          // an empty directory made or removed
+          if (rand(2) === 0) mkdirSync(join(dir, at, `hollow-${step}`), { recursive: true });
+          else rmSync(join(dir, at, "zz"), { recursive: true, force: true });
+          break;
+        case 4:
+          put(dir, ".git/info/exclude", ignores[rand(ignores.length)] as string);
+          break;
+        case 5: {
+          const files = untrackedNow();
+          const victim = files[rand(Math.max(1, files.length))];
+          if (victim) git(dir, ["add", "--", victim]);
+          break;
+        }
+        default:
+          if (existsSync(join(dir, at || "."))) {
+            rmSync(join(dir, at, "zz"), { recursive: true, force: true });
+            put(dir, `${at ? `${at}/` : ""}zz/new-${step}`, "z\n");
+          }
+      }
+      if (rand(2) === 0) dateBack(dir);
+      const keep = rand(2) === 0 ? "native" : "ours";
+      // (not compared with native git without the cache: git's normal-mode cache keeps
+      // showing `dir/` once the files below it go while its parent's stat stays, the
+      // parent's cached name outliving the check-only directory; ours is as stale as git's)
+      try {
+        await expectTwins(dir, keep);
+      } catch (error) {
+        throw new Error(`fuzz step ${step} (${path}): ${(error as Error).message}`);
+      }
+    }
+  }, 120_000);
 });

@@ -44,6 +44,7 @@ import {
 } from "./pathspec.js";
 import { type CommitReflogKind, reflogMessages, updateHead } from "./reflog-messages.js";
 import { applyAutostash } from "./sequencer-support.js";
+import { readShowUntrackedFiles } from "./status-command.js";
 
 /**
  * Result of a commit operation.
@@ -382,6 +383,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
    */
   async call(): Promise<CommitResult> {
     this.checkCallable();
+    // git commit reads the status configuration first (git_status_config): a bad
+    // status.showUntrackedFiles fails it before anything is done
+    readShowUntrackedFiles(this.workingCopy);
     // the index as it is now: one another writer replaced is read again (git reads the
     // index at its start), unless this instance holds unwritten edits (refused)
     await this.readCurrentIndex();

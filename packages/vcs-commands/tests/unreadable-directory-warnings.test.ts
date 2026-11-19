@@ -8,7 +8,7 @@
  * them in readdir order).
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, opendirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -68,9 +68,9 @@ async function open(dir: string) {
         };
       }
       if (key === "listKinds") {
-        return async (path: string) => {
+        return async (path: string, options?: { readdirOrder?: boolean }) => {
           if (locked(path)) throw denied(path);
-          return target.listKinds?.(path);
+          return target.listKinds?.(path, options);
         };
       }
       const value = Reflect.get(target, key, receiver);
@@ -104,21 +104,90 @@ describeGit("unreadable directories: git's warnings", () => {
   it("status: one warning per directory the untracked scan opens", async () => {
     const d = layout();
     const git = await open(d);
-    // ours reports untracked files as --untracked-files=all
-    const all = await git.status().call();
+    // --untracked-files=all
+    const all = await git.status().setUntrackedFiles("all").call();
     expect(formatStatusPorcelain(all)).toBe("?? u/f\n");
     expect([...all.warnings].sort()).toEqual([warn("t/v"), warn("u/x"), warn("u2")]);
-    const ignored = await (await open(d)).status().setIgnored(true).call();
+    const ignored = await (await open(d)).status().setUntrackedFiles("all").setIgnored(true).call();
     expect([...ignored.warnings].sort()).toEqual([
       warn("ign/w"),
       warn("t/v"),
       warn("u/x"),
       warn("u2"),
     ]);
-    const some = await (await open(d)).status().addPath("t").call();
+    const some = await (await open(d)).status().setUntrackedFiles("all").addPath("t").call();
     expect(some.warnings).toEqual([warn("t/v")]);
     const none = await (await open(d)).status().setUntracked(false).call();
     expect(none.warnings).toEqual([]);
+  });
+
+  it("status in normal mode: the directories its check-only walks open", async () => {
+    const d = layout();
+    // native git as an unprivileged user prints "?? u/" with u2/ and t/v/ (and u/x/ when
+    // readdir lists it before u/f: the check-only walk of u/ stops at its first file)
+    const normal = await (await open(d)).status().call();
+    expect(formatStatusPorcelain(normal)).toBe("?? u/\n");
+    expect(normal.warnings).toEqual(expect.arrayContaining([warn("t/v"), warn("u2")]));
+    expect(normal.warnings).not.toContain(warn("ign/w"));
+    // --ignored=matching: ign/ matches its pattern and is not entered
+    const matching = await (await open(d)).status().setIgnored("matching").call();
+    expect(formatStatusPorcelain(matching)).toBe("?? u/\n!! ign/\n");
+    expect(matching.warnings).not.toContain(warn("ign/w"));
+    // traditional: ign/ is walked to find whether it holds anything
+    const traditional = await (await open(d)).status().setIgnored("traditional").call();
+    expect(formatStatusPorcelain(traditional)).toBe("?? u/\n");
+    expect(traditional.warnings).toContain(warn("ign/w"));
+  });
+
+  it("status: the warnings in git's order, each mode (directories read in readdir order)", async () => {
+    const d = layout();
+    // the names of a directory as readdir(3) gives them, the order git walks in
+    const names = (dir: string) => {
+      const handle = opendirSync(join(d, dir));
+      const out: string[] = [];
+      try {
+        for (let e = handle.readSync(); e; e = handle.readSync()) out.push(e.name);
+      } finally {
+        handle.closeSync();
+      }
+      return out;
+    };
+    const uNames = names("u");
+    const xFirst = uNames.indexOf("x") < uNames.indexOf("f");
+    // native git (2.43 and 2.56, as an unprivileged user): t/v/ and u2/, u/x/ where the
+    // walk of u/ opens it (always, but in normal mode only before it met u/f), ign/w/ with
+    // --ignored (traditional)
+    const expected = (uWalk: boolean, ignWalk: boolean) =>
+      names("").flatMap((name) => {
+        if (name === "t") return [warn("t/v")];
+        if (name === "u2") return [warn("u2")];
+        if (name === "u") return uWalk ? [warn("u/x")] : [];
+        if (name === "ign") return ignWalk ? [warn("ign/w")] : [];
+        return [];
+      });
+    const cases: [string, (g: Git) => Promise<{ warnings: Iterable<string> }>, string[]][] = [
+      ["-unormal", (g) => g.status().call(), expected(xFirst, false)],
+      [
+        "-unormal --ignored=matching",
+        (g) => g.status().setIgnored("matching").call(),
+        expected(true, false),
+      ],
+      [
+        "-unormal --ignored",
+        (g) => g.status().setIgnored("traditional").call(),
+        expected(true, true),
+      ],
+      ["-uall", (g) => g.status().setUntrackedFiles("all").call(), expected(true, false)],
+      [
+        "-uall --ignored",
+        (g) => g.status().setUntrackedFiles("all").setIgnored(true).call(),
+        expected(true, true),
+      ],
+    ];
+    for (const [label, call, lines] of cases) {
+      const status = await call(await open(d));
+      expect([label, [...status.warnings]]).toEqual([label, lines]);
+    }
   });
 
   it("add: the scan's warnings, the ignored directories only with -f", async () => {

@@ -225,7 +225,7 @@ describeGit("pattern files and patches with bytes that are no UTF-8, against nat
     expect(expected.toString("latin1")).toContain('?? "caf\\303\\251.txt"\n');
     expect(expected.toString("latin1")).toContain('?? "k\\351ep.log"\n');
     const git = await open(dir);
-    const status = await git.status().setIgnored(true).call();
+    const status = await git.status().setUntrackedFiles("all").setIgnored(true).call();
     expect(Buffer.from(encodeGitPath(formatStatusPorcelain(status))).toString("latin1")).toBe(
       expected.toString("latin1"),
     );
@@ -405,9 +405,13 @@ describeGit("pattern files and patches with bytes that are no UTF-8, against nat
     const nameOnly = await (await open(dir)).diff().callText("name-only");
     expect(nameOnly).toBe(`${ours("caf\xe9.txt")}\n`);
     for (const version of [1, 2] as const) {
-      const status = formatStatusPorcelain(await (await open(dir)).status().call(), version, {
-        quotePath: false,
-      });
+      const status = formatStatusPorcelain(
+        await (await open(dir)).status().setUntrackedFiles("all").call(),
+        version,
+        {
+          quotePath: false,
+        },
+      );
       expect(Buffer.from(encodeGitPath(status)).toString("latin1")).toBe(
         gitText(dir, "status", `--porcelain=v${version}`, "--untracked-files=all"),
       );
@@ -537,7 +541,11 @@ describeGit("literal parts of patterns as bytes, and case folding as git folds i
     expect(expected.toString("latin1")).toContain('!! "x\\303\\251"\n');
     expect(expected.toString("latin1")).toContain('!! "t\\303\\244"\n');
     expect(expected.toString("latin1")).toContain('?? "sub/t\\303\\244"\n');
-    const status = await (await open(dir)).status().setIgnored(true).call();
+    const status = await (await open(dir))
+      .status()
+      .setUntrackedFiles("all")
+      .setIgnored(true)
+      .call();
     expect(Buffer.from(encodeGitPath(formatStatusPorcelain(status))).toString("latin1")).toBe(
       expected.toString("latin1"),
     );
@@ -567,7 +575,11 @@ describeGit("literal parts of patterns as bytes, and case folding as git folds i
     expect(expected.toString("latin1")).toContain("!! a.log\n");
     expect(expected.toString("latin1")).toContain('?? "\\303\\251x"\n');
     expect(expected.toString("latin1")).toContain('!! "\\303\\211y"\n');
-    const status = await (await open(dir)).status().setIgnored(true).call();
+    const status = await (await open(dir))
+      .status()
+      .setUntrackedFiles("all")
+      .setIgnored(true)
+      .call();
     expect(Buffer.from(encodeGitPath(formatStatusPorcelain(status))).toString("latin1")).toBe(
       expected.toString("latin1"),
     );

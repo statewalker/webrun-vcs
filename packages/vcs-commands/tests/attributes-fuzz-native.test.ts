@@ -278,7 +278,10 @@ async function one(root: string, seed: number) {
   const lsO = run(ours, "ls-files", "-s", "--eol");
   if (lsN !== lsO) diffs.push(`ls-files after add:\ngit:\n${lsN}ours:\n${lsO}`);
   const stN = run(native, "status", "--porcelain=v1", "-uall");
-  const stO = formatStatusPorcelain(await (await open(ours)).git.status().call(), 1);
+  const stO = formatStatusPorcelain(
+    await (await open(ours)).git.status().setUntrackedFiles("all").call(),
+    1,
+  );
   if (stN !== stO) diffs.push(`status after add:\ngit:\n${stN}ours:\n${stO}`);
 
   // checkout: commit, remove the files, reset --hard
@@ -304,7 +307,10 @@ async function one(root: string, seed: number) {
         diffs.push(`checkout ${path}: ours=${JSON.stringify(b)} git=${JSON.stringify(a)}`);
     }
     const st2N = run(native, "status", "--porcelain=v1", "-uall");
-    const st2O = formatStatusPorcelain(await (await open(ours)).git.status().call(), 1);
+    const st2O = formatStatusPorcelain(
+      await (await open(ours)).git.status().setUntrackedFiles("all").call(),
+      1,
+    );
     if (st2N !== st2O) diffs.push(`status after checkout:\ngit:\n${st2N}ours:\n${st2O}`);
   }
   rmSync(native, { recursive: true, force: true });
