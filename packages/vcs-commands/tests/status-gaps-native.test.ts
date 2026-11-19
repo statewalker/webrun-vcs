@@ -1154,3 +1154,64 @@ describeGit("clean removes inside non-repository .git directories as git (review
     }
   }, 300_000);
 });
+
+describeGit(
+  "status of an intent-to-add entry over a path of HEAD (git rm --cached; add -N)",
+  () => {
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "status-ita-head-"));
+    });
+    afterEach(() => rmSync(root, { recursive: true, force: true }));
+    const at = (name: string, setup: (d: string) => void) => {
+      const d = join(root, name);
+      repo(d);
+      setup(d);
+      return d;
+    };
+
+    it("DA with the file there, DD once it is gone (v1, v2 and the short format)", async () => {
+      const dir = at("da", (d) => {
+        put(d, "x y", "x\n");
+        run(d, "add", "x y");
+        run(d, "commit", "-qm", "x y");
+        run(d, "rm", "-q", "--cached", "x y", "c.txt", "d/f.txt");
+        run(d, "add", "-N", "x y", "c.txt", "d/f.txt");
+        put(d, "c.txt", "c changed\n");
+        rmSync(join(d, "d/f.txt"));
+      });
+      const status = await expectStatusAs(dir);
+      expect(status.files.find((f) => f.path === "x y")).toMatchObject({
+        index: "D",
+        worktree: "A",
+      });
+      expect(status.files.find((f) => f.path === "d/f.txt")).toMatchObject({
+        index: "D",
+        worktree: "D",
+      });
+      expect(status.removed.has("x y")).toBe(true);
+      expect(formatStatusPorcelain(status, 1)).toBe(exec(dir, "status", "--short"));
+      // diff --cached --name-status (HEAD against the index): the entries are deletions
+      const { ours } = await open(dir);
+      expect(await ours.diff().setCached(true).callText("name-status")).toBe(
+        exec(dir, "diff", "--cached", "--name-status"),
+      );
+    });
+
+    it("a rename from the path: the intent-to-add line keeps only its worktree side", async () => {
+      await expectStatusAs(
+        at("renamed", (d) => {
+          run(d, "rm", "-q", "--cached", "a.txt");
+          run(d, "add", "-N", "a.txt");
+          put(d, "a2.txt", lines(20, "a"));
+          run(d, "add", "a2.txt");
+          // the same with the intent-to-add file gone
+          run(d, "rm", "-q", "--cached", "b.txt");
+          run(d, "add", "-N", "b.txt");
+          put(d, "b2.txt", lines(12, "b"));
+          run(d, "add", "b2.txt");
+          rmSync(join(d, "b.txt"));
+        }),
+      );
+    });
+  },
+);

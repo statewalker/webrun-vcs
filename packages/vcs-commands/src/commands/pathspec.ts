@@ -875,3 +875,54 @@ export function bloomPathOf(item: PathspecItem): string | undefined {
  */
 export const pathspecForbidsBloom = (items: PathspecItem[]) =>
   items.some((i) => i.exclude || i.icase);
+
+/** The git version whose spelling of {@link prefixOriginElement} is reproduced. */
+export type PathspecOriginStyle = "2.43" | "2.56";
+
+/**
+ * git's `item->original` of an element parsed with `PATHSPEC_PREFIX_ORIGIN` from the top of
+ * the worktree (`git stash push -- <pathspec>`): the element's magic with `prefix:0` added,
+ * then its path. git hands these to the commands it runs (`git add`, `git checkout`) and its
+ * own pathspec errors name them. git 2.43 spells an element without magic `:(,prefix:0)x`
+ * and long magic by its names; git 2.5x writes `:(prefix:0)x` and copies long magic as given
+ * (`:(glob,prefix:0)*.c`). Short magic is spelled out in both (`:!x` is
+ * `:(exclude,prefix:0)x`). An element that has prefix magic of its own is kept as given.
+ *
+ * @example
+ * ```typescript
+ * prefixOriginElement("u.txt", parsePathspecItem("u.txt"), "2.56"); // ":(prefix:0)u.txt"
+ * prefixOriginElement("u.txt", parsePathspecItem("u.txt"), "2.43"); // ":(,prefix:0)u.txt"
+ * ```
+ */
+export function prefixOriginElement(
+  elem: string,
+  item: PathspecItem,
+  style: PathspecOriginStyle = "2.56",
+): string {
+  if (item.prefix !== undefined) return elem;
+  // the element's magic as git's pathspec_magic table lists it
+  const names = new Set<string>();
+  let longhand: string | undefined;
+  if (elem.startsWith(":(")) {
+    const close = elem.indexOf(")");
+    longhand = elem.slice(0, close);
+    for (const word of elem.slice(2, close).split(",")) {
+      const name = word.trim();
+      names.add(name.startsWith("attr:") ? "attr" : name);
+    }
+  } else if (elem.startsWith(":")) {
+    for (let pos = 1; pos < elem.length && elem[pos] !== ":"; pos++) {
+      const ch = elem[pos];
+      if (ch === "/") names.add("top");
+      else if (ch === "!" || ch === "^") names.add("exclude");
+      else break;
+    }
+  }
+  const table = ["top", "literal", "glob", "icase", "exclude", "attr"];
+  const magic = table.filter((n) => names.has(n));
+  const path = pathspecItemPath(item);
+  if (style === "2.43") return `:(${magic.join(",")},prefix:0)${path}`;
+  if (magic.length === 0) return `:(prefix:0)${path}`;
+  const head = longhand ?? `:(${magic.filter((n) => n === "top" || n === "exclude").join(",")}`;
+  return `${head},prefix:0)${path}`;
+}

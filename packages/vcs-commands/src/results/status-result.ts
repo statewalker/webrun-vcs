@@ -79,8 +79,10 @@ export interface Status {
   /**
    * git's warnings about this status, as git's diff prints them: when inexact rename
    * detection was skipped for too many candidates ("exhaustive rename detection was skipped
-   * due to too many files.", with the rename limit that would be needed). `git status`
-   * itself prints none of them.
+   * due to too many files.", with the rename limit that would be needed; `git status`
+   * itself prints none of these), then those of the untracked-file scan, which `git status`
+   * prints: "warning: could not open directory 'u/': Permission denied" for each directory it
+   * could not list.
    */
   readonly warnings: string[];
   /** Files with merge conflicts (unmerged index entries). */

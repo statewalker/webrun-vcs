@@ -222,3 +222,71 @@ describeGit("git add --refresh against native git", () => {
     expect(stale).toContain("a");
   });
 });
+
+describeGit("git add of paths outside the sparse checkout against native git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "add-sparse-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** k/a in the sparse checkout; s/b and s/c skip-worktree. */
+  const sparse = (dir: string) => {
+    put(dir, "k/a", "a\n");
+    put(dir, "s/b", "b\n");
+    put(dir, "s/c", "c\n");
+    gitOk(root, dir, "add", ".");
+    gitOk(root, dir, "commit", "-q", "-m", "c");
+    gitOk(root, dir, "sparse-checkout", "set", "k");
+  };
+  // git 2.43 words the last hint "git config advice...", 2.5x "git config set advice..."
+  const stderrOf = (r: { stderr: string }) =>
+    r.stderr.trim().replace('"git config advice.', '"git config set advice.');
+  const advice = (...elements: string[]) =>
+    [
+      "The following paths and/or pathspecs matched paths that exist",
+      "outside of your sparse-checkout definition, so will not be",
+      "updated in the index:",
+      ...elements,
+      "hint: If you intend to update such entries, try one of the following:",
+      "hint: * Use the --sparse option.",
+      "hint: * Disable or modify the sparsity rules.",
+      'hint: Disable this message with "git config set advice.updateSparsePath false"',
+    ].join("\n");
+
+  for (const args of [
+    ["s/b"],
+    ["s"],
+    ["*b"],
+    ["-n", "s/b"],
+    ["-u", "s/b"],
+    ["--chmod=+x", "s/b"],
+    ["--refresh", "s/b"],
+    ["--refresh", "s/b", "k/a"],
+    ["s/b", "k/a"],
+    ["--chmod=+x", "k/a", "s/b"],
+  ]) {
+    it(`add ${args.join(" ")}: the advice, the rest written, exit 1`, async () => {
+      const { native, ours } = twins(sparse);
+      put(native, "k/a", "a changed\n");
+      put(ours, "k/a", "a changed\n");
+      const { r, error } = await twinAdd(native, ours, args);
+      const elements = args.filter((a) => !a.startsWith("-") && a !== "k/a");
+      expect(stderrOf(r)).toBe(advice(...elements));
+      expect(error).toBeInstanceOf(AddFailedError);
+      expect(error?.message).toBe(stderrOf(r));
+      expect((error as AddFailedError).result).toBeDefined();
+    });
+  }
+
+  it("advice.updateSparsePath=false drops the hint; a missing path still dies", async () => {
+    const { native, ours } = twins((dir) => {
+      sparse(dir);
+      gitOk(root, dir, "config", "advice.updateSparsePath", "false");
+    });
+    const { r, error } = await twinAdd(native, ours, ["s/b"]);
+    expect(error?.message).toBe(stderrOf(r));
+    expect(r.stderr).not.toContain("hint:");
+    const missing = await twinAdd(native, ours, ["s/nope"]);
+    expect(missing.error?.message).toBe(stderrOf(missing.r));
+  });
+});

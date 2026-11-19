@@ -7,6 +7,7 @@ import {
   type NestedRepositoryState,
   type StagingEntry,
   statUpdateOf,
+  unreadableDirectoryWarning,
   type Worktree,
   type WorktreeEntry,
   withWorktreeEntries,
@@ -31,6 +32,7 @@ import {
 import { configBool } from "./merge-config.js";
 import {
   DO_MATCH_DIRECTORY,
+  DO_MATCH_LEADING_PATHSPEC,
   excludeMatchesPathspec,
   matchPathspec,
   matchPathspecSeen,
@@ -502,16 +504,25 @@ export class AddCommand extends GitCommand<AddResult> {
       warnings.push(...scan.warnings);
       ignored = scan.ignored;
     }
-    // what the index has matches too (add_pathspec_matches_against_index)
-    // (a skip-worktree path matches here too, where git advises on it instead)
+    // what the index has matches too (add_pathspec_matches_against_index with
+    // PS_IGNORE_SKIP_WORKTREE: a skip-worktree entry is advised on instead)
     for (const group of index) {
+      if (isSkipWorktree(group)) continue;
       matchPathspecSeen(items, group.path, group.gitlink ? DO_MATCH_DIRECTORY : 0, seen);
     }
 
-    // 2. an element that matched nothing must name an existing file
+    // 2. an element that matched nothing must name an existing file, unless it matches
+    //    entries outside the sparse checkout (git's advice, the command failing in the end)
+    const sparse: string[] = [];
+    let skipSeen: number[] | undefined;
     for (let i = 0; i < items.length; i++) {
       const item = items[i] as PathspecItem;
       if (item.exclude || seen[i]) continue;
+      skipSeen ??= skipWorktreeSeen(items, index);
+      if (skipSeen[i]) {
+        sparse.push(originals[i] as string);
+        continue;
+      }
       // "Don't complain at 'git add .' on empty repo"
       if (item.match === "") continue;
       // reported as given, its "/" kept (git's dir_add_ignored of the match)
@@ -651,7 +662,7 @@ export class AddCommand extends GitCommand<AddResult> {
     }
 
     // 4. the untracked files (add_files)
-    const messages: string[] = [];
+    const messages: string[] = sparse.length > 0 ? this.sparseAdvice(sparse) : [];
     if (ignored.length > 0) {
       messages.push("The following paths are ignored by one of your .gitignore files:", ...ignored);
       if (this.advice("addIgnoredFile")) {
@@ -701,7 +712,7 @@ export class AddCommand extends GitCommand<AddResult> {
       warnings,
       output,
     };
-    if (ignored.length > 0 || failed.length > 0 || chmodErrors.length > 0) {
+    if (ignored.length > 0 || failed.length > 0 || chmodErrors.length > 0 || sparse.length > 0) {
       throw new AddFailedError(
         [...messages, ...errors, ...chmodErrors].join("\n"),
         ignored,
@@ -797,8 +808,17 @@ export class AddCommand extends GitCommand<AddResult> {
               : "M";
       show(`${code}\t${entry.path}`, undefined);
     }
+    // an element that matched nothing dies, unless it matches entries outside the sparse
+    // checkout: git advises on those, writes the index and fails
+    const sparse: string[] = [];
+    let skipSeen: number[] | undefined;
     for (let i = 0; i < items.length; i++) {
       if ((items[i] as PathspecItem).exclude || seen[i]) continue;
+      skipSeen ??= skipWorktreeSeen(items, entries.map(groupOf));
+      if (skipSeen[i]) {
+        sparse.push(originals[i] as string);
+        continue;
+      }
       throw new InvalidArgumentError(
         "filepattern",
         originals[i],
@@ -818,7 +838,7 @@ export class AddCommand extends GitCommand<AddResult> {
       await editor.finish();
       if (this.writeIndex) await this.staging.write();
     }
-    return {
+    const result: AddResult = {
       added: [],
       skipped: [],
       ignored: [],
@@ -827,6 +847,33 @@ export class AddCommand extends GitCommand<AddResult> {
       warnings: [],
       output,
     };
+    if (sparse.length > 0) {
+      throw new AddFailedError(this.sparseAdvice(sparse).join("\n"), [], [], result, output);
+    }
+    return result;
+  }
+
+  /**
+   * git's `advise_on_updating_sparse_paths`: the elements that matched only entries outside
+   * the sparse checkout, and (unless `advice.updateSparsePath` is off) the hint, as git 2.5x
+   * words it (2.43 ends with "git config advice.updateSparsePath false").
+   */
+  private sparseAdvice(elements: string[]): string[] {
+    const lines = [
+      "The following paths and/or pathspecs matched paths that exist",
+      "outside of your sparse-checkout definition, so will not be",
+      "updated in the index:",
+      ...elements,
+    ];
+    if (this.advice("updateSparsePath")) {
+      lines.push(
+        "hint: If you intend to update such entries, try one of the following:",
+        "hint: * Use the --sparse option.",
+        "hint: * Disable or modify the sparsity rules.",
+        'hint: Disable this message with "git config set advice.updateSparsePath false"',
+      );
+    }
+    return lines;
   }
 
   /**
@@ -930,6 +977,14 @@ export class AddCommand extends GitCommand<AddResult> {
       // a tracked file is passed over (below too), unstat'ed (git's treat_path)
       skipFile: (path) => indexPaths.has(path),
       ...(prefix ? { pathPrefix: prefix } : {}),
+      // git's "could not open directory" for a directory its scan opens: not one it passes
+      // over as ignored, nor one the pathspec cannot reach into
+      onUnreadable: (path, error) => {
+        if (path === "" || GIT_COMPONENT.test(path)) return;
+        if (!this.force && (ignoredDirs.has(path) || ignoredDirs.has(parentOf(path)))) return;
+        if (!matchPathspec(items, path, DO_MATCH_DIRECTORY | DO_MATCH_LEADING_PATHSPEC)) return;
+        warnings.push(unreadableDirectoryWarning(path, error));
+      },
     })) {
       // ...but git never adds a `.git` (treat_path)
       if (entry.path.includes(".git") && GIT_COMPONENT.test(entry.path)) continue;
@@ -1110,6 +1165,30 @@ interface IndexGroup {
   path: string;
   entries: StagingEntry[];
   gitlink: boolean;
+}
+
+/** Whether the path's entry is a skip-worktree one (outside the sparse checkout). */
+function isSkipWorktree(group: IndexGroup): boolean {
+  const first = group.entries[0] as StagingEntry;
+  return first.stage === 0 && first.skipWorktree === true;
+}
+
+/** One entry as its own group. */
+function groupOf(entry: StagingEntry): IndexGroup {
+  return { path: entry.path, entries: [entry], gitlink: entry.mode === FileMode.GITLINK };
+}
+
+/**
+ * git's `find_pathspecs_matching_skip_worktree`: which elements match a skip-worktree entry
+ * (`matches_skip_worktree`).
+ */
+function skipWorktreeSeen(items: PathspecItem[], index: readonly IndexGroup[]): number[] {
+  const seen = items.map(() => 0);
+  for (const group of index) {
+    if (!isSkipWorktree(group)) continue;
+    matchPathspecSeen(items, group.path, group.gitlink ? DO_MATCH_DIRECTORY : 0, seen);
+  }
+  return seen;
 }
 
 /** A path with a `.git` component: never added (git's treat_path). */

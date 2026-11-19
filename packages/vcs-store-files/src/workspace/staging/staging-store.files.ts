@@ -814,8 +814,8 @@ class FileStagingEditor implements IndexEditor {
   /**
    * {@link finish} without regrouping and sorting the whole index: the edited paths' runs
    * replaced in place and new paths merged in (a few edits to a large index, `add -u`).
-   * Undefined when a tree deletion is among the edits or the entries are not in order:
-   * {@link finish} then takes the long way.
+   * Undefined when a tree deletion is among the edits or the entries are not in order (the
+   * paths, or the stages of one path): {@link finish} then takes the long way.
    */
   private mergeEdits(): StagingEntry[] | undefined {
     const byPath = new Map<string, StagingEdit[]>();
@@ -833,7 +833,11 @@ class FileStagingEditor implements IndexEditor {
       if (previous !== undefined && comparePaths(previous, path) >= 0) return undefined;
       previous = path;
       let end = k + 1;
-      while (end < entries.length && entries[end].path === path) end++;
+      while (end < entries.length && entries[end].path === path) {
+        // a path's stages out of order (a malformed index): the long way sorts them
+        if (entries[end].stage < entries[end - 1].stage) return undefined;
+        end++;
+      }
       const edits = byPath.get(path);
       if (edits) {
         byPath.delete(path);

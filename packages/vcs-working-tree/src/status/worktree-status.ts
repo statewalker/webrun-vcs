@@ -339,6 +339,11 @@ export async function* findUntrackedFiles(
      * populated or not (a deinitialised submodule's leftover files are not untracked)
      */
     isGitlink?: (path: string) => boolean;
+    /**
+     * Called for each directory the scan could not list (and `filter` accepts), with the
+     * error: git's "could not open directory" warning ({@link unreadableDirectoryWarning})
+     */
+    onUnreadable?: (path: string, error?: unknown) => void;
   } = {},
 ): AsyncIterable<UntrackedFile> {
   const includeIgnored = options.includeIgnored ?? false;
@@ -346,6 +351,14 @@ export async function* findUntrackedFiles(
   const inIgnoredDir = (path: string) => ignoredDirs.some((dir) => path.startsWith(`${dir}/`));
   const skippedDirs: string[] = [];
   const inSkippedDir = (path: string) => skippedDirs.some((dir) => path.startsWith(`${dir}/`));
+  const report = options.onUnreadable;
+  const onUnreadable = report
+    ? (path: string, error?: unknown) => {
+        if (path === "" || inSkippedDir(path)) return;
+        if (options.filter && !options.filter(path)) return;
+        report(path, error);
+      }
+    : undefined;
   const visit = async function* (pathPrefix?: string): AsyncIterable<UntrackedFile> {
     for await (const entry of worktree.walk({
       includeIgnored,
@@ -353,6 +366,7 @@ export async function* findUntrackedFiles(
       // tracked files are passed over unstat'ed (git's treat_path asks the index first)
       skipFile: isTracked,
       ...(pathPrefix ? { pathPrefix } : {}),
+      ...(onUnreadable ? { onUnreadable } : {}),
     })) {
       if (inSkippedDir(entry.path)) continue;
       const ignored = entry.isIgnored || inIgnoredDir(entry.path);
@@ -379,6 +393,38 @@ export async function* findUntrackedFiles(
     }
   };
   yield* visit();
+}
+
+/** strerror(3) of the errno codes a directory listing fails with. */
+const STRERROR: Record<string, string> = {
+  EACCES: "Permission denied",
+  EPERM: "Operation not permitted",
+  ENOTDIR: "Not a directory",
+  ENOENT: "No such file or directory",
+  ELOOP: "Too many levels of symbolic links",
+  EMFILE: "Too many open files",
+  ENFILE: "Too many open files in system",
+  EIO: "Input/output error",
+};
+
+/**
+ * git's warning for a directory its scan could not open (`warning_errno("could not open
+ * directory '%s'")`), the reason as strerror gives it for the error's code (an `EACCES`
+ * error, or a message that starts with the code): "Permission denied" when the code is not
+ * known.
+ *
+ * @example
+ * ```typescript
+ * unreadableDirectoryWarning("u/v", { code: "EACCES" });
+ * // "warning: could not open directory 'u/v/': Permission denied"
+ * ```
+ */
+export function unreadableDirectoryWarning(path: string, error?: unknown): string {
+  const code =
+    (error as { code?: unknown } | undefined)?.code ??
+    /^([A-Z][A-Z0-9]+)\b/.exec((error as Error | undefined)?.message ?? "")?.[1];
+  const reason = (typeof code === "string" && STRERROR[code]) || "Permission denied";
+  return `warning: could not open directory '${path}/': ${reason}`;
 }
 
 /** The directories that hold the given paths (`a/b/c` gives `a` and `a/b`). */

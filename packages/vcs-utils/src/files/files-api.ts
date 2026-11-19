@@ -80,7 +80,9 @@ export interface FilesApi {
   stats(path: string): Promise<FileStats | undefined>;
 
   /**
-   * List directory entries.
+   * List directory entries. A missing path lists nothing; a directory that exists but cannot
+   * be read (EACCES) fails the listing (on Node: the error with its `code`), so a caller never
+   * takes an unknown content for an empty directory.
    * @param path - Directory path
    * @param options - List options (recursive)
    */

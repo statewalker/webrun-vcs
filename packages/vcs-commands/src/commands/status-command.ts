@@ -13,6 +13,7 @@ import {
   type StagingEntry,
   statUpdateOf,
   trackedUnder,
+  unreadableDirectoryWarning,
   type WorkingCopy,
   type Worktree,
   withWorktreeEntries,
@@ -338,7 +339,12 @@ export class StatusCommand extends GitCommand<Status> {
       const h = headSideOf(entry);
       const staged = { mode: entry.mode, id: entry.objectId };
       let x: StatusCode = " ";
-      if (!h) {
+      if (h && entry.intentToAdd) {
+        // an intent-to-add entry is in no tree: against HEAD's path it is a deletion (git's
+        // diff-index --cached), the file itself new on the worktree side
+        x = "D";
+        removed.add(entry.path);
+      } else if (!h) {
         // an added submodule a `submodule.<name>.ignore=all` hides (git's diff_addremove)
         const hidden = isGitlink(entry.mode) && (await this.indexIgnoresAll(entry.path));
         if (!entry.intentToAdd && !hidden) {
@@ -385,13 +391,14 @@ export class StatusCommand extends GitCommand<Status> {
       }
       if (x !== " " || y !== " ") {
         // git's v2 line of an intent-to-add entry: no index side while the file is there
-        // (".A"), and the placeholder as the HEAD side once it is gone (".D")
+        // (".A", "DA" over a path of HEAD), and the placeholder as the index side once it is
+        // gone (".D" with the placeholder as the HEAD side too, "DD" with HEAD's)
         const ita = entry.intentToAdd;
         files.push({
           path: entry.path,
           index: x,
           worktree: y,
-          head: ita && y === "D" ? staged : h,
+          head: ita && y === "D" ? (h ?? staged) : h,
           staged: ita && y === "A" ? undefined : staged,
           worktreeMode,
           ...(commitChanged ? { submoduleCommitChanged: true } : {}),
@@ -433,6 +440,8 @@ export class StatusCommand extends GitCommand<Status> {
         isGitlink: (p) => gitlinks.has(p),
         includeIgnored: this.showIgnored,
         filter: (p) => this.matchesPath(p),
+        // git's "could not open directory" for each directory its scan cannot list
+        onUnreadable: (path, error) => warnings.push(unreadableDirectoryWarning(path, error)),
       })) {
         if (file.ignored) {
           ignored.add(file.path);
@@ -523,9 +532,13 @@ export class StatusCommand extends GitCommand<Status> {
         const from = byPath.get(pair.from);
         const to = byPath.get(pair.to);
         if (!from || !to) continue;
-        drop.add(from);
         to.index = "R";
         to.head = from.head;
+        // an intent-to-add source keeps its worktree side, without a HEAD side ("DA" to " A")
+        if (from.intentToAdd && from.worktree !== " ") {
+          from.index = " ";
+          from.head = from.worktree === "D" ? from.staged : undefined;
+        } else drop.add(from);
         to.renamedFrom = pair.from;
         to.renameScore = scorePercent(pair.score);
         renamed.set(pair.to, pair.from);
@@ -539,7 +552,7 @@ export class StatusCommand extends GitCommand<Status> {
       for (const f of files) {
         if (f.stages || drop.has(f)) continue;
         if (f.worktree === "D" && f.staged) {
-          sources.push({ path: f.path, ...side(f.intentToAdd ? (f.head ?? f.staged) : f.staged) });
+          sources.push({ path: f.path, ...side(f.staged) });
         } else if (f.worktree === "A" && f.worktreeMode !== undefined) {
           destinations.push([{ path: f.path, mode: f.worktreeMode, id: "" }, f]);
         }

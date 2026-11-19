@@ -1,6 +1,10 @@
 import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
 import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
-import { directoriesOf, type Worktree } from "@statewalker/vcs-working-tree";
+import {
+  directoriesOf,
+  unreadableDirectoryWarning,
+  type Worktree,
+} from "@statewalker/vcs-working-tree";
 import { GitCommand } from "../git-command.js";
 import {
   DO_MATCH_LEADING_PATHSPEC,
@@ -27,6 +31,13 @@ export interface CleanResult {
   skipped: Set<string>;
   /** Whether this was a dry run (no files actually removed) */
   dryRun: boolean;
+  /**
+   * git's warnings, in order: "warning: could not open directory 'u/': Permission denied"
+   * for each directory the scan could not list, then (not on a dry run) "warning: failed
+   * to remove u: Directory not empty" for each such directory git's `remove_dirs` could not
+   * remove (git then exits with status 1)
+   */
+  warnings: string[];
 }
 
 /**
@@ -159,7 +170,8 @@ export class CleanCommand extends GitCommand<CleanResult> {
    * - a directory (only with `-d` or a path filter) as git's `remove_dirs`: everything in
    *   it, file by file and then each directory once empty, a `.git` that is no repository
    *   included; nested repositories are skipped ("Would skip repository") unless `-ff`
-   *   removes them whole; an unreadable directory is never removed;
+   *   removes them whole; an unreadable directory is removed only when empty (`rmdir`),
+   *   else kept with git's "failed to remove" warning;
    * - `cleaned` lists what `git clean -n` prints after "Would remove": a directory removed
    *   whole as `dir/`, else what went in it; `skipped` the nested repositories.
    *
@@ -222,7 +234,7 @@ export class CleanCommand extends GitCommand<CleanResult> {
         if (removeDirectories) dirs.push(n);
       } else if (isValidWorktreePath(path)) files.push(path);
     }
-    return this.removeEntries(worktree, files, dirs);
+    return this.removeEntries(worktree, files, dirs, scan.warnings);
   }
 
   /**
@@ -250,14 +262,14 @@ export class CleanCommand extends GitCommand<CleanResult> {
       nodes.set(dir, made);
       return made;
     };
-    const unreadable = new Set<string>();
+    const unreadable = new Map<string, unknown>();
     const trackedDirs = directoriesOf(tracked);
     const load = async (pathPrefix?: string) => {
       for await (const entry of worktree.walk({
         includeIgnored: true,
         includeDirectories: true,
         enterNonRepositoryGitDirs: true,
-        onUnreadable: (path) => unreadable.add(path),
+        onUnreadable: (path, error) => unreadable.set(path, error),
         ...(pathPrefix ? { pathPrefix } : {}),
       })) {
         const parent = parentOf(entry.path);
@@ -288,9 +300,12 @@ export class CleanCommand extends GitCommand<CleanResult> {
       }
     };
     await load();
-    for (const path of unreadable) {
+    for (const [path, error] of unreadable) {
       const n = nodes.get(path);
-      if (n) n.unreadable = true;
+      if (n) {
+        n.unreadable = true;
+        n.unreadableError = error;
+      }
     }
     return { root, nodes };
   }
@@ -309,13 +324,16 @@ export class CleanCommand extends GitCommand<CleanResult> {
     worktree: Worktree,
     files: string[],
     dirs: CleanNode[],
+    warnings: string[],
   ): Promise<CleanResult> {
     const cleaned = new Set<string>();
     const skipped = new Set<string>();
     const removeFiles = [...files];
     const removeDirs: string[] = [];
     const repositories: string[] = [];
-    const remove = (n: CleanNode): boolean => {
+    const options = { nonRepositoryGitDirs: true };
+    const tops = new Set(dirs);
+    const remove = async (n: CleanNode): Promise<boolean> => {
       if (n.repository) {
         if (!this.forceNested || n.unverified) {
           skipped.add(n.path);
@@ -324,13 +342,22 @@ export class CleanCommand extends GitCommand<CleanResult> {
         repositories.push(n.path);
         return true;
       }
-      // unreadable: git's dry run takes it as gone (it would try rmdir), a real run keeps it
-      if (n.unreadable) return this.dryRun;
+      // unreadable: git's dry run takes it as gone; a real run tries rmdir, which removes it
+      // only when empty ("failed to remove" otherwise, the path as remove_dirs holds it)
+      if (n.unreadable) {
+        if (this.dryRun) return true;
+        const removed = await removeDirectoryIfEmpty(worktree, n.path, options).catch(() => false);
+        if (!removed) {
+          const shown = tops.has(n) ? `${n.path}/` : n.path;
+          warnings.push(`warning: failed to remove ${shown}: Directory not empty`);
+        }
+        return removed;
+      }
       const dels: string[] = [];
       let all = true;
       for (const child of n.children) {
         if (child.directory) {
-          if (remove(child)) dels.push(child.path);
+          if (await remove(child)) dels.push(child.path);
           else all = false;
         } else if (child.gitDir || isValidWorktreePath(child.path)) {
           removeFiles.push(child.path);
@@ -342,10 +369,9 @@ export class CleanCommand extends GitCommand<CleanResult> {
       return all;
     };
     for (const path of files) cleaned.add(path);
-    for (const dir of dirs) if (remove(dir)) cleaned.add(`${dir.path}/`);
+    for (const dir of dirs) if (await remove(dir)) cleaned.add(`${dir.path}/`);
 
     if (!this.dryRun) {
-      const options = { nonRepositoryGitDirs: true };
       for (const path of removeFiles) await worktree.remove(path, options);
       // `git clean -ff`: a nested repository goes whole, as git removes it
       for (const path of repositories) await worktree.remove(path, { ...options, recursive: true });
@@ -354,7 +380,7 @@ export class CleanCommand extends GitCommand<CleanResult> {
       );
       for (const dir of deepestFirst) await removeDirectoryIfEmpty(worktree, dir, options);
     }
-    return { cleaned, skipped, dryRun: this.dryRun };
+    return { cleaned, skipped, dryRun: this.dryRun, warnings };
   }
 }
 
@@ -372,6 +398,8 @@ interface CleanNode {
   gitDir?: boolean;
   /** A directory whose listing failed */
   unreadable?: boolean;
+  /** What the listing of an unreadable directory failed with */
+  unreadableError?: unknown;
   /** A `.git` that cannot be checked here (beyond the root, unreadable): kept always */
   unverified?: boolean;
   /** A nested repository whose content was loaded (the index tracks paths in it) */
@@ -406,6 +434,9 @@ function compareNames(a: string, b: string): number {
  * `DIR_KEEP_UNTRACKED_CONTENTS` with `-d` or a path filter), over the loaded tree.
  */
 class DirectoryScan {
+  /** git's "could not open directory" warnings, one per directory the scan opened */
+  readonly warnings: string[] = [];
+  private readonly warned = new Set<string>();
   private readonly entries: string[] = [];
   private readonly ignored: string[] = [];
 
@@ -513,8 +544,14 @@ class DirectoryScan {
   }
 
   private readDirectoryRecursive(dir: CleanNode): number {
-    // an unreadable directory: git cannot open it, nothing in it is seen
-    if (dir.unreadable) return PATH_NONE;
+    // an unreadable directory: git cannot open it (and warns), nothing in it is seen
+    if (dir.unreadable) {
+      if (!this.warned.has(dir.path)) {
+        this.warned.add(dir.path);
+        this.warnings.push(unreadableDirectoryWarning(dir.path, dir.unreadableError));
+      }
+      return PATH_NONE;
+    }
     let dirState = PATH_NONE;
     for (const child of dir.children) {
       let state = this.treatPath(child);
