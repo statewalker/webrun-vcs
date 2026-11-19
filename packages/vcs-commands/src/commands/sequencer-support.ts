@@ -30,7 +30,7 @@ import {
   rewriteIndex,
 } from "./merge-support.js";
 import { stripspace } from "./message-cleanup.js";
-import { finishSparseCheckoutRun, startSparseCheckoutRun } from "./sparse-checkout-support.js";
+import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
 import { StashCreateCommand } from "./stash-create-command.js";
 import { STASH_REF } from "./stash-list-command.js";
@@ -71,25 +71,31 @@ export async function resetMerge(
   label: string,
   options: { hard?: boolean } = {},
 ): Promise<MergeRefusal | undefined> {
-  // in a sparse checkout, unpack-trees' apply_sparse_checkout over the result; reset prints
-  // its sparse warnings as plain errors (no porcelain messages)
-  const sparse = await startSparseCheckoutRun(ctx);
-  const refused = await resetMergeUnsparse(ctx, targetId, label, options);
-  if (refused) return refused;
-  const text = await finishSparseCheckoutRun(ctx, sparse, {
-    porcelain: false,
-    reset: options.hard === true,
-  });
-  if (text) ctx.sparseWarnings?.push(...text.replace(/\n$/, "").split("\n"));
+  // in a sparse checkout: unpack-trees with its patterns; reset prints its sparse warnings
+  // as plain errors (no porcelain messages)
+  const sparse = await SparseUnpack.start(ctx);
+  const done = await resetMergeWith(ctx, targetId, label, options, sparse);
+  if (done.refused) return done.refused;
+  if (sparse) {
+    const outcome = await sparse.finish(ctx, {
+      written: done.written,
+      overwrite: options.hard === true,
+    });
+    pushSparseWarnings(ctx.sparseWarnings, sparse, outcome, false);
+  }
   return undefined;
 }
 
-async function resetMergeUnsparse(
+async function resetMergeWith(
   ctx: SequencerContext,
   targetId: ObjectId,
   label: string,
   options: { hard?: boolean },
-): Promise<MergeRefusal | undefined> {
+  sparse: SparseUnpack | undefined,
+): Promise<{ refused?: MergeRefusal; written: Set<string> }> {
+  const refusedWith = (refused: MergeRefusal) => ({ refused, written: new Set<string>() });
+  // a path staying outside the sparse checkout: neither checked nor touched in the worktree
+  const quiet = (path: string) => sparse?.leavesAlone(path) === true;
   const checkUptodate = !options.hard;
   const targetTree = await ctx.commits.getTree(targetId);
   const target = await flatTree(ctx.trees, targetTree);
@@ -138,10 +144,17 @@ async function resetMergeUnsparse(
       // deleted_entry: a directory standing there keeps what is untracked in it
       // (a submodule's directory is not touched)
       const gitlink = i?.mode === FileMode.GITLINK;
-      if (worktree && !gitlink && (await directoryLosesUntracked(worktree, path, inIndex))) {
-        return refuse(`Updating '${path}' would lose untracked files in it`, path);
+      if (
+        worktree &&
+        !gitlink &&
+        !quiet(path) &&
+        (await directoryLosesUntracked(worktree, path, inIndex))
+      ) {
+        return refusedWith(refuse(`Updating '${path}' would lose untracked files in it`, path));
       }
-      if (!conflicted && i && worktree && (await notUptodateEntry(i))) return notUptodate(path);
+      if (!conflicted && i && worktree && !quiet(path) && (await notUptodateEntry(i))) {
+        return refusedWith(notUptodate(path));
+      }
       removing.add(path);
       changes.push(path);
       continue;
@@ -154,13 +167,14 @@ async function resetMergeUnsparse(
         i &&
         worktree &&
         !(i as StagingEntry).skipWorktree &&
+        (!sparse || sparse.writes(path)) &&
         (await worktreeModified(worktree, path, i, trust, indexTime))
       ) {
         changes.push(path);
       }
       continue;
     }
-    if (worktree && !i && !conflicted) {
+    if (worktree && !i && !conflicted && !quiet(path)) {
       // a new path: verify_absent
       const refusal = await verifyAbsent(worktree, path, t, checked, removing, {
         hard: options.hard === true,
@@ -170,23 +184,34 @@ async function resetMergeUnsparse(
         refuse,
         notUptodate,
       });
-      if (refusal) return refusal;
-    } else if (worktree && i && !conflicted && (await notUptodateEntry(i))) {
-      return notUptodate(path);
+      if (refusal) return refusedWith(refusal);
+    } else if (worktree && i && !conflicted && !quiet(path) && (await notUptodateEntry(i))) {
+      return refusedWith(notUptodate(path));
     }
     changes.push(path);
   }
 
+  // the files written: in a sparse checkout, those of the paths in its patterns only
+  const writing = new Set(changes.filter((p) => target.has(p) && (!sparse || sparse.writes(p))));
   if (worktree) {
+    if (sparse) {
+      // apply_sparse_checkout before check_updates: the files leaving the checkout
+      const changed = new Set(changes);
+      const unlink = await sparse.leaving(
+        worktree,
+        (p) => (changed.has(p) ? target.get(p) : (index.get(p) ?? target.get(p))),
+        { reset: options.hard === true, trust },
+      );
+      await sparse.unlink(worktree, unlink);
+    }
     for (const path of changes) {
-      if (target.has(path)) continue;
+      if (target.has(path) || quiet(path)) continue;
       const entry = await worktree.getEntry(path);
       if (entry && !entry.isDirectory) {
         await worktree.remove(path);
         await pruneEmptyParents(worktree, path);
       }
     }
-    const writing = new Set(changes.filter((p) => target.has(p)));
     if (writing.size > 0) {
       const plan = await planPathsRestore(ctx, target, targetTree, writing, "reset");
       await writeTreeRestorePlan(worktree, ctx.blobs, plan, "reset", {
@@ -203,7 +228,7 @@ async function resetMergeUnsparse(
       edits.set(path, []);
       continue;
     }
-    const stats = worktree ? await worktree.getEntry(path) : undefined;
+    const stats = worktree && writing.has(path) ? await worktree.getEntry(path) : undefined;
     // an unchanged entry rewritten keeps its flags (oneway_merge keeps the old entry); a
     // changed one keeps the skip-worktree bit (merged_entry)
     const old = index.get(path) as StagingEntry | undefined;
@@ -223,7 +248,7 @@ async function resetMergeUnsparse(
   // unpack-trees writes a new index: no resolve-undo record survives the reset
   ctx.staging.clearResolveUndo?.();
   await rewriteIndex(ctx.staging, edits, { updateCacheTreeWith: ctx.trees });
-  return undefined;
+  return { written: worktree ? writing : new Set() };
 }
 
 /**
@@ -304,22 +329,28 @@ export async function resetKeep(
   targetId: ObjectId,
   label: string,
 ): Promise<MergeRefusal | undefined> {
-  // in a sparse checkout, unpack-trees' apply_sparse_checkout over the result; reset prints
-  // its sparse warnings as plain errors (no porcelain messages)
-  const sparse = await startSparseCheckoutRun(ctx);
-  const refused = await resetKeepUnsparse(ctx, headId, targetId, label);
-  if (refused) return refused;
-  const text = await finishSparseCheckoutRun(ctx, sparse, { porcelain: false });
-  if (text) ctx.sparseWarnings?.push(...text.replace(/\n$/, "").split("\n"));
+  // in a sparse checkout: unpack-trees with its patterns; reset prints its sparse warnings
+  // as plain errors (no porcelain messages)
+  const sparse = await SparseUnpack.start(ctx);
+  const done = await resetKeepWith(ctx, headId, targetId, label, sparse);
+  if (done.refused) return done.refused;
+  if (sparse) {
+    const outcome = await sparse.finish(ctx, { written: done.written });
+    pushSparseWarnings(ctx.sparseWarnings, sparse, outcome, false);
+  }
   return undefined;
 }
 
-async function resetKeepUnsparse(
+async function resetKeepWith(
   ctx: SequencerContext,
   headId: ObjectId,
   targetId: ObjectId,
   label: string,
-): Promise<MergeRefusal | undefined> {
+  sparse: SparseUnpack | undefined,
+): Promise<{ refused?: MergeRefusal; written: Set<string> }> {
+  const refusedWith = (refused: MergeRefusal) => ({ refused, written: new Set<string>() });
+  // a path staying outside the sparse checkout: neither checked nor touched in the worktree
+  const quiet = (path: string) => sparse?.leavesAlone(path) === true;
   const head = await flatTree(ctx.trees, await ctx.commits.getTree(headId));
   const targetTree = await ctx.commits.getTree(targetId);
   const target = await flatTree(ctx.trees, targetTree);
@@ -349,20 +380,22 @@ async function resetKeepUnsparse(
     if (!sameEntry(i, h)) {
       // the index has the commit's version already, or a change the reset would lose
       if (sameEntry(i, t)) continue;
-      return refuse(`Entry '${path}' would be overwritten by merge. Cannot merge.`, path);
+      return refusedWith(
+        refuse(`Entry '${path}' would be overwritten by merge. Cannot merge.`, path),
+      );
     }
-    if (worktree && i) {
+    if (worktree && i && !quiet(path)) {
       // verify_uptodate_1: an entry whose flags cheat is checked by its stat
       const e = i as StagingEntry;
       const differs =
         e.assumeValid || e.skipWorktree
           ? await flaggedEntryDiffers(worktree, path, e, trust, indexTime)
           : await worktreeDiffers(worktree, path, i, trust, indexTime);
-      if (differs) return notUptodate(path);
+      if (differs) return refusedWith(notUptodate(path));
     }
     if (!t) {
       removing.add(path);
-    } else if (worktree && !i) {
+    } else if (worktree && !i && !quiet(path)) {
       const refusal = await verifyAbsent(worktree, path, t, index, removing, {
         hard: false,
         tracked: (p) => index.has(p),
@@ -371,20 +404,32 @@ async function resetKeepUnsparse(
         refuse,
         notUptodate,
       });
-      if (refusal) return refusal;
+      if (refusal) return refusedWith(refusal);
     }
     changes.push(path);
   }
 
+  // the files written: in a sparse checkout, those of the paths in its patterns only
+  const writing = new Set(changes.filter((p) => target.has(p) && (!sparse || sparse.writes(p))));
   if (worktree) {
+    if (sparse) {
+      // apply_sparse_checkout before check_updates: the files leaving the checkout
+      const changed = new Set(changes);
+      const unlink = await sparse.leaving(
+        worktree,
+        (p) => (changed.has(p) || !index.has(p) ? target.get(p) : index.get(p)),
+        { trust },
+      );
+      await sparse.unlink(worktree, unlink);
+    }
     for (const path of removing) {
+      if (quiet(path)) continue;
       const entry = await worktree.getEntry(path);
       if (entry && !entry.isDirectory) {
         await worktree.remove(path);
         await pruneEmptyParents(worktree, path);
       }
     }
-    const writing = new Set(changes.filter((p) => target.has(p)));
     if (writing.size > 0) {
       const plan = await planPathsRestore(ctx, target, targetTree, writing, "reset");
       await writeTreeRestorePlan(worktree, ctx.blobs, plan, "reset", {
@@ -396,7 +441,7 @@ async function resetKeepUnsparse(
   }
   // the index is the commit's tree: an entry that holds it already keeps its stat, a file
   // just written takes the stat it has now
-  const written = new Set(changes);
+  const written = new Set([...writing]);
   const edits = new Map<string, IndexEntryOptions[]>();
   for (const path of index.keys()) if (!target.has(path)) edits.set(path, []);
   for (const [path, t] of target) {
@@ -416,7 +461,7 @@ async function resetKeepUnsparse(
   }
   ctx.staging.clearResolveUndo?.();
   await rewriteIndex(ctx.staging, edits, { updateCacheTreeWith: ctx.trees });
-  return undefined;
+  return { written: worktree ? writing : new Set() };
 }
 
 /**

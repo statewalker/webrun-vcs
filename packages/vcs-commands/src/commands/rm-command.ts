@@ -3,6 +3,7 @@ import type { IndexEntry } from "@statewalker/vcs-working-tree";
 import { NoFilepatternError, RmFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { configBool } from "./merge-config.js";
+import { matchPathspecSeen, parsePathspec } from "./pathspec.js";
 import { sparsePathAdvice } from "./sparse-checkout-support.js";
 
 /**
@@ -126,26 +127,28 @@ export class RmCommand extends GitCommand<RmResult> {
     // cmd_rm: entries outside the sparse checkout are passed over unless --sparse; a pattern
     // that matched only those is advised on (matches_skip_worktree)
     const patterns = this.sparse ? undefined : await this.sparseCheckoutPatterns();
-    const matched = new Set<string>();
-    const matchedOutside = new Set<string>();
-    const matching = (path: string) =>
-      this.filepatterns.filter((p) => this.matchesPattern(path, [p]));
+    // git's pathspec (parse_pathspec, then ce_path_match): `.` and `./d` name everything
+    // beneath, a directory its files, a glob's `*` crosses slashes; `seen` tells which
+    // elements matched (git's ps_matched)
+    const items = parsePathspec(this.filepatterns);
+    const seen = items.map(() => 0);
+    const seenOutside = items.map(() => 0);
     for await (const entry of this.staging.entries()) {
       const outside =
         patterns !== undefined && (entry.skipWorktree || !patterns.includes(entry.path));
       if (outside) {
-        for (const p of matching(entry.path)) matchedOutside.add(p);
+        matchPathspecSeen(items, entry.path, 0, seenOutside);
         entriesToKeep.push(entry);
         continue;
       }
-      if (this.matchesPattern(entry.path)) {
-        for (const p of matching(entry.path)) matched.add(p);
+      if (matchPathspecSeen(items, entry.path, 0, seen)) {
         removedPaths.push(entry.path);
       } else {
         entriesToKeep.push(entry);
       }
     }
-    const sparsePaths = this.filepatterns.filter((p) => !matched.has(p) && matchedOutside.has(p));
+    const matched = this.filepatterns.filter((_, i) => seen[i]);
+    const sparsePaths = this.filepatterns.filter((_, i) => !seen[i] && seenOutside[i]);
     const advise = () =>
       new RmFailedError(
         sparsePathAdvice(
@@ -157,7 +160,7 @@ export class RmCommand extends GitCommand<RmResult> {
         { removedPaths },
       );
     // nothing else matched: git exits before writing anything
-    if (sparsePaths.length > 0 && matched.size === 0) throw advise();
+    if (sparsePaths.length > 0 && matched.length === 0) throw advise();
 
     // Rebuild staging with entries that weren't removed
     const builder = this.staging.createBuilder();
@@ -175,50 +178,5 @@ export class RmCommand extends GitCommand<RmResult> {
 
     if (sparsePaths.length > 0) throw advise();
     return { removedPaths };
-  }
-
-  /**
-   * Check if a path matches any of the configured patterns.
-   */
-  private matchesPattern(path: string, patterns: string[] = this.filepatterns): boolean {
-    for (const pattern of patterns) {
-      // Exact match
-      if (path === pattern) {
-        return true;
-      }
-
-      // Directory pattern (ends with /)
-      if (pattern.endsWith("/")) {
-        const dirPrefix = pattern;
-        if (path.startsWith(dirPrefix)) {
-          return true;
-        }
-      }
-
-      // Prefix match for directories without trailing slash
-      if (path.startsWith(`${pattern}/`)) {
-        return true;
-      }
-
-      // Simple glob matching for * patterns
-      if (pattern.includes("*")) {
-        const regex = this.patternToRegex(pattern);
-        if (regex.test(path)) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Convert a simple glob pattern to regex.
-   */
-  private patternToRegex(pattern: string): RegExp {
-    // Escape special regex characters except *
-    const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
-    // Convert * to .*
-    const regexStr = escaped.replace(/\*/g, ".*");
-    return new RegExp(`^${regexStr}$`);
   }
 }

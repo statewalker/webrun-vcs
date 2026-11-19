@@ -242,4 +242,26 @@ describe.each(backends)("RmCommand - API options ($name backend)", ({ factory })
     // Attempting to call again should throw
     await expect(command.call()).rejects.toThrow();
   });
+  /**
+   * `git rm --cached -r .`: the pathspec `.` names every path (and `./src` everything in src).
+   */
+  it("should remove everything for the pathspec `.`", async () => {
+    const { git, workingCopy } = await createInitializedGit();
+
+    await addFile(workingCopy, "top.txt", "t");
+    await addFile(workingCopy, "src/a.txt", "a");
+    await addFile(workingCopy, "src/deep/b.txt", "b");
+    await git.commit().setMessage("initial").call();
+
+    const some = await git.rm().addFilepattern("./src").setCached(true).call();
+    expect(some.removedPaths.sort()).toEqual(["src/a.txt", "src/deep/b.txt"]);
+
+    const result = await git.rm().addFilepattern(".").setCached(true).call();
+    expect(result.removedPaths).toEqual(["top.txt"]);
+
+    await workingCopy.checkout.staging.read();
+    const remaining: string[] = [];
+    for await (const entry of workingCopy.checkout.staging.entries()) remaining.push(entry.path);
+    expect(remaining).toEqual([]);
+  });
 });

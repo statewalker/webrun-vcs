@@ -357,8 +357,10 @@ export async function flaggedEntryDiffers(
   entry: StagingEntry,
   trust?: WorktreeModeTrust,
   indexTime?: number,
+  /** The file's worktree entry when the caller stat'ed it already (null: none) */
+  stat?: WorktreeEntry | null,
 ): Promise<boolean> {
-  const current = await worktree.getEntry(path);
+  const current = stat === undefined ? await worktree.getEntry(path) : stat;
   if (!current) return false;
   if (current.isDirectory) return entry.mode !== FileMode.GITLINK;
   if (entry.mode === FileMode.GITLINK) return false;

@@ -5,14 +5,16 @@
  */
 
 import type { Staging, StagingEntry } from "../staging/index.js";
+import { getWorktreeEntries } from "../status/index.js";
 import type { Worktree } from "../worktree/index.js";
 
 /**
  * Clears the skip-worktree flag of the index entries whose files are present in the worktree,
  * as git does on reading the index when `core.sparseCheckout` is on (and
  * `sparse.expectFilesOutsideOfPatterns` is not): the caller checks the configuration. Cheap
- * without skip-worktree entries; missing directories are remembered, as git's `path_found`
- * does, so a sparse directory costs one stat. The flags are cleared as part of the read (not
+ * without skip-worktree entries; the paths are stat'ed in batches (`getEntries`), their
+ * leading directories first, so a missing sparse directory costs one stat, as git's
+ * `path_found` makes it. The flags are cleared as part of the read (not
  * an edit, see `Staging.clearSkipWorktree`). Returns the paths cleared.
  *
  * @example
@@ -22,7 +24,7 @@ import type { Worktree } from "../worktree/index.js";
  */
 export async function clearSkipWorktreeFromPresentFiles(
   staging: Staging,
-  worktree: Pick<Worktree, "getEntry">,
+  worktree: Pick<Worktree, "getEntry" | "getEntries">,
 ): Promise<string[]> {
   const skipped: string[] = [];
   const list = staging.entryList?.();
@@ -34,40 +36,7 @@ export async function clearSkipWorktreeFromPresentFiles(
   else for await (const entry of staging.entries()) consider(entry);
   if (skipped.length === 0) return [];
 
-  const exists = async (path: string) => {
-    try {
-      return (await worktree.getEntry(path)) !== undefined;
-    } catch {
-      return false;
-    }
-  };
-  // git's path_found: `missing` is a path known not to exist, with a trailing slash
-  let missing = "";
-  const found = async (path: string): Promise<boolean> => {
-    if (missing && path.startsWith(missing)) return false;
-    if (await exists(path)) return true;
-    // the top-most missing directory of `path`, from the parent `missing` shares with it
-    let common = 0;
-    for (let i = 0; i < path.length && i < missing.length; i++) {
-      if (path[i] !== missing[i]) break;
-      if (path[i] === "/") common = i + 1;
-    }
-    let dir = missing.slice(0, common);
-    while (true) {
-      const slash = path.indexOf("/", dir.length);
-      if (slash < 0) {
-        missing = `${path}/`;
-        return false;
-      }
-      dir = path.slice(0, slash + 1);
-      if (!(await exists(dir.slice(0, -1)))) {
-        missing = dir;
-        return false;
-      }
-    }
-  };
-  const present = new Set<string>();
-  for (const path of skipped) if (await found(path)) present.add(path);
+  const present = await presentPaths(worktree, skipped);
   if (present.size === 0) return [];
   if (typeof staging.clearSkipWorktree === "function") {
     staging.clearSkipWorktree(present);
@@ -83,4 +52,58 @@ export async function clearSkipWorktreeFromPresentFiles(
     await editor.finish();
   }
   return [...present];
+}
+
+/** `getWorktreeEntries`, a path that cannot be stat'ed counting as missing (as `lstat` failing). */
+async function statAll(
+  worktree: Pick<Worktree, "getEntry" | "getEntries">,
+  paths: string[],
+): Promise<boolean[]> {
+  if (paths.length === 0) return [];
+  try {
+    return (await getWorktreeEntries(worktree, paths)).map((e) => e !== undefined);
+  } catch {
+    const out: boolean[] = [];
+    for (const path of paths)
+      out.push((await worktree.getEntry(path).catch(() => undefined)) !== undefined);
+    return out;
+  }
+}
+
+/**
+ * The paths that exist (`lstat` succeeds), stat'ed in batches: their leading directories
+ * first, one level at a time and only beneath directories found, so a missing directory
+ * answers for everything in it with one stat (git's `path_found`), then the paths whose
+ * directories all exist.
+ */
+async function presentPaths(
+  worktree: Pick<Worktree, "getEntry" | "getEntries">,
+  paths: readonly string[],
+): Promise<Set<string>> {
+  const found = new Map<string, boolean>();
+  const dirsOf = (path: string) => {
+    const dirs: string[] = [];
+    for (let k = path.indexOf("/"); k > 0; k = path.indexOf("/", k + 1))
+      dirs.push(path.slice(0, k));
+    return dirs;
+  };
+  const chains = paths.map(dirsOf);
+  for (let depth = 0; ; depth++) {
+    const asking = new Set<string>();
+    for (const dirs of chains) {
+      if (dirs.length <= depth) continue;
+      if (depth > 0 && found.get(dirs[depth - 1] as string) !== true) continue;
+      const dir = dirs[depth] as string;
+      if (!found.has(dir)) asking.add(dir);
+    }
+    if (asking.size === 0) break;
+    const list = [...asking];
+    const exists = await statAll(worktree, list);
+    for (let i = 0; i < list.length; i++) found.set(list[i] as string, exists[i] === true);
+  }
+  const candidates = paths.filter((_, i) =>
+    (chains[i] as string[]).every((dir) => found.get(dir) === true),
+  );
+  const exists = await statAll(worktree, candidates);
+  return new Set(candidates.filter((_, i) => exists[i]));
 }

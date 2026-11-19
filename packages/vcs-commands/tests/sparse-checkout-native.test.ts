@@ -7,9 +7,18 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { Git } from "../src/index.js";
@@ -481,5 +490,206 @@ describeGit("index-writing commands in a sparse checkout against native git", ()
     nativeOk(native, "rm", "-q", "--sparse", "--cached", "s/c");
     await (await openOurs(ours)).rm().addFilepattern("s/c").setSparse(true).setCached(true).call();
     expect(state(ours)).toEqual(state(native));
+  });
+});
+
+/**
+ * The index flags as stored (`core.sparseCheckout` off, so reading clears none on present
+ * files), taken before `state` (whose `git status` may write the index), then the rest.
+ */
+function rawState(dir: string) {
+  const rawFlags = gitOk(root, dir, "-c", "core.sparseCheckout=false", "ls-files", "-t", "--stage");
+  return { rawFlags, ...state(dir) };
+}
+
+/** What a command printed on stderr, as our warnings give it. */
+const warningText = (warnings: readonly string[] | undefined) =>
+  warnings && warnings.length > 0 ? `${warnings.join("\n")}\n` : "";
+
+/**
+ * u/e racily clean in a cone of k and u, then changed behind a matching stat, then the
+ * sparse-checkout file narrowed to k (git's `ie_match_stat` must read the file to see it).
+ */
+function racyOutside(dir: string) {
+  gitOk(root, dir, "sparse-checkout", "set", "k", "u");
+  // the stat and the index's time in one second, the edit in the same (ctime included)
+  // (well inside a second: the filesystem's coarse clock lags Date.now by a few ms)
+  while (Date.now() % 1000 < 50 || Date.now() % 1000 > 400) {
+    // wait for the start of a second
+  }
+  const t = Math.floor(Date.now() / 1000);
+  utimesSync(join(dir, "u/e"), t, t);
+  gitOk(root, dir, "update-index", "-q", "--refresh");
+  put(dir, "u/e", "E\n");
+  utimesSync(join(dir, "u/e"), t, t);
+  utimesSync(join(dir, ".git/index"), t, t);
+  put(dir, ".git/info/sparse-checkout", "/*\n!/*/\n/k/\n");
+  // the command runs in a later second: the index it writes no longer finds u/e racy
+  while (Math.floor(Date.now() / 1000) <= t) {
+    // wait for the next second
+  }
+}
+
+describeGit("sparse checkout without losing files, against native git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "sparse-keep-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  it("expectFilesOutsideOfPatterns: checkout keeps a changed skip-worktree file", async () => {
+    const { native, ours } = twins((dir) => {
+      sparseHistory(dir);
+      gitOk(root, dir, "config", "sparse.expectFilesOutsideOfPatterns", "true");
+    });
+    for (const dir of [native, ours]) put(dir, "u/e", "dirty\n");
+    const r = run(native, ["checkout", "-q", "other"]);
+    const result = await (await openOurs(ours)).checkout().setName("other").call();
+    expect(warningText(result.warnings)).toBe(r.stderr);
+    expect(rawState(ours)).toEqual(rawState(native));
+    expect(readFileSync(join(ours, "u/e"), "utf8")).toBe("dirty\n");
+  });
+
+  it("expectFilesOutsideOfPatterns: reset --hard HEAD keeps a changed skip-worktree file", async () => {
+    const { native, ours } = twins((dir) => {
+      sparseHistory(dir);
+      gitOk(root, dir, "config", "sparse.expectFilesOutsideOfPatterns", "true");
+    });
+    for (const dir of [native, ours]) put(dir, "u/e", "dirty\n");
+    const r = run(native, ["reset", "-q", "--hard", "HEAD"]);
+    const cmd = (await openOurs(ours)).reset().setMode(ResetMode.HARD).setRef("HEAD");
+    await cmd.call();
+    expect(warningText(cmd.getWarnings())).toBe(r.stderr);
+    expect(rawState(ours)).toEqual(rawState(native));
+    expect(readFileSync(join(ours, "u/e"), "utf8")).toBe("dirty\n");
+  });
+
+  for (const op of ["checkout -f", "reset --hard", "checkout", "merge"] as const) {
+    it(`${op}: an untracked file where a new entry outside the patterns lands is kept`, async () => {
+      const { native, ours } = twins(sparseHistory);
+      for (const dir of [native, ours]) put(dir, "n/x", "mine\n");
+      const repo = await openOurs(ours, INTEROP_AUTHOR_ENV);
+      let r: ReturnType<typeof run>;
+      let warnings: readonly string[] | undefined;
+      if (op === "checkout -f" || op === "checkout") {
+        r = run(native, ["checkout", "-q", ...(op === "checkout -f" ? ["-f"] : []), "other"]);
+        const result = await repo
+          .checkout()
+          .setName("other")
+          .setForced(op === "checkout -f")
+          .call();
+        expect(result.message).toBeUndefined();
+        warnings = result.warnings;
+      } else if (op === "reset --hard") {
+        r = run(native, ["reset", "-q", "--hard", "other"]);
+        const cmd = repo.reset().setMode(ResetMode.HARD).setRef("other");
+        await cmd.call();
+        warnings = cmd.getWarnings();
+      } else {
+        r = run(native, ["merge", "-q", "other"]);
+        const result = await repo.merge().include("other").call();
+        warnings = result.warnings;
+      }
+      expect(r.status).toBe(0);
+      expect(warningText(warnings)).toBe(r.stderr);
+      expect(rawState(ours)).toEqual(rawState(native));
+      expect(readFileSync(join(ours, "n/x"), "utf8")).toBe("mine\n");
+    });
+  }
+
+  for (const op of ["checkout", "reset --hard"] as const) {
+    it(`${op}: an ignored file where a new entry outside the patterns lands is kept`, async () => {
+      const { native, ours } = twins((dir) => {
+        sparseHistory(dir);
+        put(dir, ".git/info/exclude", "x\n");
+      });
+      for (const dir of [native, ours]) put(dir, "n/x", "mine\n");
+      const repo = await openOurs(ours);
+      if (op === "checkout") {
+        run(native, ["checkout", "-q", "other"]);
+        await repo.checkout().setName("other").call();
+      } else {
+        run(native, ["reset", "-q", "--hard", "other"]);
+        await repo.reset().setMode(ResetMode.HARD).setRef("other").call();
+      }
+      expect(rawState(ours)).toEqual(rawState(native));
+      expect(readFileSync(join(ours, "n/x"), "utf8")).toBe("mine\n");
+    });
+  }
+
+  for (const op of ["merge", "cherry-pick", "reset --merge", "reset --keep"] as const) {
+    it(`${op}: a racily clean changed file leaving the patterns is kept`, async () => {
+      const { native, ours } = twins(sparseHistory);
+      for (const dir of [native, ours]) racyOutside(dir);
+      const repo = await openOurs(ours, INTEROP_AUTHOR_ENV);
+      let r: ReturnType<typeof run>;
+      let warnings: readonly string[] | undefined;
+      if (op === "merge") {
+        r = run(native, ["merge", "-q", "other"]);
+        warnings = (await repo.merge().include("other").call()).warnings;
+      } else if (op === "cherry-pick") {
+        r = run(native, ["cherry-pick", "other"]);
+        const other = gitOk(root, ours, "rev-parse", "other").trim();
+        warnings = (await repo.cherryPick().setCommitter(INTEROP_IDENT).include(other).call())
+          .warnings;
+      } else {
+        const mode = op === "reset --merge" ? ResetMode.MERGE : ResetMode.KEEP;
+        r = run(native, ["reset", op.slice(6), "other"]);
+        const cmd = repo.reset().setMode(mode).setRef("other");
+        await cmd.call();
+        warnings = cmd.getWarnings();
+      }
+      expect(r.stderr).toContain("u/e");
+      expect(warningText(warnings)).toBe(r.stderr);
+      expect(rawState(ours)).toEqual(rawState(native));
+      expect(readFileSync(join(ours, "u/e"), "utf8")).toBe("E\n");
+    });
+  }
+
+  it("set in cone mode removes directories left with ignored files only, warns about untracked", async () => {
+    const { native, ours } = twins((dir) => {
+      base(dir);
+      put(dir, ".git/info/exclude", "*.log\n");
+      gitOk(root, dir, "sparse-checkout", "set", "k", "s", "u");
+    });
+    for (const dir of [native, ours]) {
+      put(dir, "s/t/untracked", "mine\n");
+      put(dir, "u/sub/build.log", "log\n");
+      put(dir, "u/trace.log", "log\n");
+    }
+    const { r } = await twinSparse(native, ours, ["set", "k"]);
+    expect(r.stderr).toContain("contains untracked files");
+    expect(rawState(ours)).toEqual(rawState(native));
+    // non-cone patterns clean nothing
+    for (const dir of [native, ours]) put(dir, "s/t/x.log", "log\n");
+    await twinSparse(native, ours, ["set", "--no-cone", "/k/"]);
+    expect(rawState(ours)).toEqual(rawState(native));
+  });
+
+  it("set keeps files reached through a symlinked directory, with git's warning", async () => {
+    const { native, ours } = twins(base);
+    for (const dir of [native, ours]) {
+      const outside = `${dir}-outside`;
+      mkdirSync(join(outside, "t"), { recursive: true });
+      put(outside, "c", "c\n");
+      put(outside, "t/d", "d\n");
+      rmSync(join(dir, "s"), { recursive: true, force: true });
+      symlinkSync(`../${basename(dir)}-outside`, join(dir, "s"));
+    }
+    const r = run(native, ["sparse-checkout", "set", "k"]);
+    const result = await (await openOurs(ours))
+      .sparseCheckout()
+      .setArguments(["set", "k"])
+      .setCompatibility(version)
+      .call();
+    expect(result.stderr).toBe(r.stderr);
+    expect(r.stderr).toContain("not up to date");
+    const twin = (dir: string) =>
+      JSON.parse(JSON.stringify(rawState(dir)).split(basename(dir)).join("<twin>"));
+    expect(twin(ours)).toEqual(twin(native));
+    for (const dir of [native, ours]) {
+      expect(readFileSync(`${dir}-outside/c`, "utf8")).toBe("c\n");
+      expect(readFileSync(`${dir}-outside/t/d`, "utf8")).toBe("d\n");
+      expect(statSync(`${dir}-outside/t`).isDirectory()).toBe(true);
+    }
   });
 });

@@ -34,7 +34,7 @@ import {
 import type { CommandRefs, CommandTrees } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import type { OrtConflict } from "./ort-merge.js";
-import { finishSparseCheckoutRun, startSparseCheckoutRun } from "./sparse-checkout-support.js";
+import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import {
   planFlatRestore,
   planTreeRestore,
@@ -722,12 +722,17 @@ export async function switchTrees(
   target: Map<string, CheckedEntry>,
   options: SwitchTreesOptions,
 ): Promise<MergeRefusal | undefined> {
-  // in a sparse checkout, unpack-trees' apply_sparse_checkout over the result
-  const sparse = await startSparseCheckoutRun(ctx);
-  const refused = await switchTreesUnsparse(ctx, head, target, options);
-  if (refused) return refused;
-  const text = await finishSparseCheckoutRun(ctx, sparse, { porcelain: true });
-  if (text) ctx.sparseWarnings?.push(...text.replace(/\n$/, "").split("\n"));
+  // in a sparse checkout: unpack-trees with its patterns (the conflicts' files are written
+  // whatever they say, as record_conflicted_index_entries does)
+  const conflicts = [...(options.conflicts ?? [])];
+  const sparse = await SparseUnpack.start(ctx);
+  sparse?.conflict(conflicts.map((c) => c.stagePath));
+  const switched = await switchTreesWith(ctx, head, target, { ...options, conflicts }, sparse);
+  if (switched.refused) return switched.refused;
+  if (sparse) {
+    const outcome = await sparse.finish(ctx, { written: switched.written });
+    pushSparseWarnings(ctx.sparseWarnings, sparse, outcome, true);
+  }
   return undefined;
 }
 
@@ -747,13 +752,16 @@ export interface SwitchTreesOptions {
   targetTree?: ObjectId;
 }
 
-async function switchTreesUnsparse(
+async function switchTreesWith(
   ctx: MergeWriteContext,
   head: Map<string, CheckedEntry>,
   target: Map<string, CheckedEntry>,
   options: SwitchTreesOptions,
-): Promise<MergeRefusal | undefined> {
+  sparse: SparseUnpack | undefined,
+): Promise<{ refused?: MergeRefusal; written: Set<string> }> {
   const { index, unmerged } = await readIndex(ctx.staging);
+  // a path staying outside the sparse checkout: neither checked nor touched in the worktree
+  const quiet = (path: string) => sparse?.leavesAlone(path) === true;
   const worktree = ctx.worktree;
   const trust = worktree ? worktreeModeTrust(ctx.workingCopy, worktree) : undefined;
   const indexTime = ctx.staging.getUpdateTime();
@@ -776,7 +784,11 @@ async function switchTreesUnsparse(
         staged.push(path);
         continue;
       }
-      if (worktree && (await entryNotUptodate(worktree, path, i, trust, indexTime))) {
+      if (
+        worktree &&
+        !quiet(path) &&
+        (await entryNotUptodate(worktree, path, i, trust, indexTime))
+      ) {
         local.push(path);
         continue;
       }
@@ -795,9 +807,11 @@ async function switchTreesUnsparse(
   // a dirty file the target deletes is reported as a local change only (git's
   // verify_clean_subdirectory counts tracked files under a replaced directory as such)
   const deleting = [...removes, ...local.filter((p) => !target.has(p))];
+  // the files written: in a sparse checkout, those of the paths in its patterns only
+  const writing = new Set(updates.filter((p) => !sparse || sparse.writes(p)));
   const found = worktree
     ? await findInTheWay(worktree, {
-        writes: updates,
+        writes: [...writing],
         removes: new Set(deleting),
         index,
         ...(await restoreCaseOptions(worktree, ignoreCase)),
@@ -812,19 +826,33 @@ async function switchTreesUnsparse(
   });
   if (message) {
     return {
-      message,
-      paths: [...staged, ...local, ...found.lostDirs, ...found.untracked, ...untrackedRemoved],
+      refused: {
+        message,
+        paths: [...staged, ...local, ...found.lostDirs, ...found.untracked, ...untrackedRemoved],
+      },
+      written: new Set(),
     };
   }
 
   // the worktree: deletions first (a deleted file `d` makes way for `d/x`), then the files
   if (worktree) {
+    if (sparse) {
+      // apply_sparse_checkout before check_updates: the files leaving the checkout
+      const removing = new Set(removes);
+      const updating = new Set(updates);
+      const unlink = await sparse.leaving(
+        worktree,
+        (p) => (removing.has(p) ? undefined : updating.has(p) ? target.get(p) : index.get(p)),
+        { trust },
+      );
+      await sparse.unlink(worktree, unlink);
+    }
     for (const path of removes) {
+      if (quiet(path)) continue;
       await worktree.remove(path);
       await pruneEmptyParents(worktree, path);
     }
-    if (updates.length > 0) {
-      const writing = new Set(updates);
+    if (writing.size > 0) {
       // only the written paths are planned (each validated, its blob checked)
       const plan = await planPathsRestore(
         ctx,
@@ -866,7 +894,8 @@ async function switchTreesUnsparse(
   for (const path of removes) changes.set(path, []);
   for (const path of updates) {
     const t = target.get(path) as CheckedEntry;
-    const stats = worktree ? await worktree.getEntry(path) : undefined;
+    // the stat of a file written (an entry left outside the checkout has none)
+    const stats = worktree && writing.has(path) ? await worktree.getEntry(path) : undefined;
     // the skip-worktree bit of the entry replaced is kept (merged_entry: "Migrate old flags
     // over"); assume-unchanged is not
     const old = index.get(path) as IndexEntryInput | undefined;
@@ -954,7 +983,7 @@ async function switchTreesUnsparse(
   }
   // set once the changes are in: it describes the index they leave
   await rewriteIndex(ctx.staging, changes, { cacheTree: switchedCacheTree });
-  return undefined;
+  return { written: worktree ? writing : new Set() };
 }
 
 /** git's `# Conflicts:` block appended to MERGE_MSG. */

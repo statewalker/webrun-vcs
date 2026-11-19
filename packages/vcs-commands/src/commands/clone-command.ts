@@ -22,7 +22,7 @@ import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
 import { SparseCheckoutCommand } from "./sparse-checkout-command.js";
-import { finishSparseCheckoutRun, startSparseCheckoutRun } from "./sparse-checkout-support.js";
+import { SparseUnpack } from "./sparse-checkout-support.js";
 import { checkoutFreshTree } from "./tree-restore.js";
 
 /** Names the clone's checkout in failure messages. */
@@ -706,7 +706,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       this.sparse && worktree
         ? await (async () => {
             await new SparseCheckoutCommand(this.workingCopy).setArguments(["set"]).call();
-            return startSparseCheckoutRun({
+            return SparseUnpack.start({
               workingCopy: this.workingCopy,
               worktree,
               staging: this.staging,
@@ -721,15 +721,18 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         worktree,
         symlinks: worktree ? this.symlinksEnabled(worktree) : false,
         ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+        ...(sparse ? { writes: (path: string) => sparse.writes(path) } : {}),
       },
       commit.tree,
       CLONE,
     );
-    await finishSparseCheckoutRun(
-      { workingCopy: this.workingCopy, worktree, staging: this.staging, blobs: this.blobs },
-      sparse,
-      { porcelain: true },
-    );
+    // loop #2 of unpack-trees: the entries outside the patterns are skip-worktree
+    await sparse?.finish({
+      workingCopy: this.workingCopy,
+      worktree,
+      staging: this.staging,
+      blobs: this.blobs,
+    });
     return collided;
   }
 

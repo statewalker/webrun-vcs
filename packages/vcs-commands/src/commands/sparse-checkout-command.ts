@@ -34,10 +34,11 @@ import {
 import { GitCommand } from "../git-command.js";
 import { quotePath } from "../results/quote-path.js";
 import {
-  applySparseCheckout,
+  cleanTrackedSparseDirectories,
   readSparseCheckoutFile,
   sparseCheckoutConfig,
   sparseWarningText,
+  updateSparsity,
 } from "./sparse-checkout-support.js";
 
 /** What a `git sparse-checkout` command did. */
@@ -861,7 +862,7 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
       );
       this.warnPatterns(patterns);
     }
-    const outcome = await applySparseCheckout(
+    const outcome = await updateSparsity(
       {
         workingCopy: this.workingCopy,
         worktree: this.worktreeAccess,
@@ -882,6 +883,13 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
     // clean_tracked_sparse_directories reads the patterns again (init_sparse_checkout_patterns)
     // when none were given: their warnings are printed twice
     if (!pl && state.apply) this.warnPatterns(patterns);
+    const cleaned = await cleanTrackedSparseDirectories(
+      { worktree: this.worktreeAccess, staging },
+      patterns,
+    );
+    for (const line of cleaned.split("\n")) {
+      if (line) this.warn(line.slice("warning: ".length));
+    }
     return 0;
   }
 

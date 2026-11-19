@@ -109,9 +109,10 @@ describe("clearSkipWorktreeFromPresentFiles", () => {
       },
     };
     expect(await clearSkipWorktreeFromPresentFiles(staging, worktree)).toEqual(["s/c"]);
-    // git's path_found: the parents of a missing path are asked up to the first one missing
-    // (s/t), and the paths under it are not asked (s/t/e)
-    expect(asked).toEqual(["s/b", "s", "s/c", "s/t/d", "s/t", "u/v", "u"]);
+    // as git's path_found spares them: the directories first, level by level beneath the
+    // ones found (s/t only under s), then only the paths whose directories all exist; a
+    // missing directory (u, s/t) costs one stat, nothing under it is asked
+    expect(asked).toEqual(["s", "u", "s/t", "s/b", "s/c"]);
     expect(staging.hasUnwrittenChanges()).toBe(false);
     expect((await staging.getEntry("s/c"))?.skipWorktree).toBe(false);
     // written with the next write
@@ -120,6 +121,38 @@ describe("clearSkipWorktreeFromPresentFiles", () => {
     await reread.read();
     expect((await reread.getEntry("s/c"))?.skipWorktree).toBeFalsy();
     expect((await reread.getEntry("s/b"))?.skipWorktree).toBe(true);
+  });
+
+  it("stats in batches through getEntries where the worktree has it", async () => {
+    const files = createInMemoryFilesApi();
+    const staging = new GitStaging(files, "index");
+    for (const path of ["s/b", "s/c", "s/t/d", "u/v", "w"]) {
+      await staging.setEntry({
+        path,
+        mode: 0o100644,
+        objectId: ID,
+        size: 1,
+        mtime: 1,
+        skipWorktree: true,
+      });
+    }
+    await staging.write();
+    await staging.read();
+    const present = new Set(["s", "s/t", "s/t/d", "w"]);
+    const batches: string[][] = [];
+    const worktree = {
+      getEntry: async (): Promise<WorktreeEntry | undefined> => {
+        throw new Error("stat'ed one by one");
+      },
+      getEntries: async (paths: readonly string[]) => {
+        batches.push([...paths]);
+        return paths.map((p) =>
+          present.has(p) ? ({ path: p } as unknown as WorktreeEntry) : undefined,
+        );
+      },
+    };
+    expect(await clearSkipWorktreeFromPresentFiles(staging, worktree)).toEqual(["s/t/d", "w"]);
+    expect(batches).toEqual([["s", "u"], ["s/t"], ["s/b", "s/c", "s/t/d", "w"]]);
   });
 });
 

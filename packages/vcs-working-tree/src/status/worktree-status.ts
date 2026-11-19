@@ -257,7 +257,7 @@ export async function* diffIndexWithWorktree(
  * `getEntries` where the worktree has it, else `getEntry` path by path.
  */
 export async function getWorktreeEntries(
-  worktree: Worktree,
+  worktree: Pick<Worktree, "getEntry" | "getEntries">,
   paths: readonly string[],
 ): Promise<Array<WorktreeEntry | undefined>> {
   if (worktree.getEntries) return worktree.getEntries(paths);

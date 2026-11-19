@@ -383,6 +383,11 @@ export interface FreshCheckoutTarget {
   symlinks: boolean;
   /** `core.ignorecase`. */
   ignoreCase: boolean;
+  /**
+   * Which paths are written (a sparse checkout's patterns: an entry outside them is new and
+   * stays out of the worktree, as unpack-trees' loop #2 marks it); default every path.
+   */
+  writes?: (path: string) => boolean;
 }
 
 /**
@@ -404,12 +409,20 @@ export async function checkoutFreshTree(
     await staging.write();
     return [];
   }
-  const plan = await planTreeRestore(trees, blobs, treeId, operation, {
+  const fullPlan = await planTreeRestore(trees, blobs, treeId, operation, {
     symlinks: true,
     ...(await restoreCaseOptions(worktree, target.ignoreCase)),
     windows: worktree.capabilities?.windowsPaths === true,
     reservedNames: worktree.capabilities?.reservedNames,
   });
+  const writes = target.writes;
+  const plan = writes
+    ? {
+        ...fullPlan,
+        entries: fullPlan.entries.filter((e) => writes(e.path)),
+        gitlinks: fullPlan.gitlinks.filter((e) => writes(e.path)),
+      }
+    : fullPlan;
   await writeTreeRestorePlan(worktree, blobs, plan, operation, {
     symlinks: target.symlinks,
     gitlinks: true,
