@@ -4,6 +4,7 @@ import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type {
   CacheTree,
   IndexBuilder,
+  IndexBuilderFinishOptions,
   IndexEditor,
   IndexFilePending,
   ResolveUndoRecord,
@@ -623,6 +624,14 @@ export class FileStagingStore implements Staging {
     for (const entry of entries) this.asRead.add(entry);
   }
 
+  /**
+   * @internal - Used by the builder (`finish({ upToDate })`): these entries count as set in
+   * this session, not checked for racy-git smudging
+   */
+  _forgetAsRead(entries: readonly StagingEntry[]): void {
+    for (const entry of entries) this.asRead.delete(entry);
+  }
+
   /** @internal - Used by builder/editor */
   _getEntries(): StagingEntry[] {
     return this._entries;
@@ -736,7 +745,7 @@ class FileStagingBuilder implements IndexBuilder {
     }
   }
 
-  async finish(): Promise<void> {
+  async finish(options: IndexBuilderFinishOptions = {}): Promise<void> {
     // Merge kept entries from existing index
     const existingEntries = this.store._getEntries();
     for (const { start, count } of this.keeping) {
@@ -773,7 +782,8 @@ class FileStagingBuilder implements IndexBuilder {
 
     // Replace store entries
     this.store._replaceEntries(this._entries);
-    this.store._keepAsRead(this.asReadCopies);
+    if (options.upToDate) this.store._forgetAsRead(this._entries);
+    else this.store._keepAsRead(this.asReadCopies);
   }
 
   private validateStages(): void {

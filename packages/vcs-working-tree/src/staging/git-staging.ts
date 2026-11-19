@@ -20,6 +20,7 @@ import type {
   ConflictResolution,
   EntryIteratorOptions,
   IndexBuilder,
+  IndexBuilderFinishOptions,
   IndexEdit,
   IndexEditor,
   IndexEntry,
@@ -625,12 +626,18 @@ export class GitStaging implements Staging {
   }
 
   /** @internal - Used by builder/editor */
-  _replaceEntries(newEntries: IndexEntry[], asReadCopies?: Iterable<IndexEntry>): void {
+  _replaceEntries(
+    newEntries: IndexEntry[],
+    asReadCopies?: Iterable<IndexEntry>,
+    upToDate = false,
+  ): void {
     this.unwritten = true;
     this._entries = newEntries;
+    // every entry a builder took counts as set in this session (`finish({ upToDate })`)
+    if (upToDate) for (const entry of newEntries) this.asRead.delete(entry);
     // a builder's copy of an entry kept as read is still as read (git copies the entry
     // with its flags: one never refreshed stays checked for racy-git smudging)
-    if (asReadCopies) for (const entry of asReadCopies) this.asRead.add(entry);
+    else if (asReadCopies) for (const entry of asReadCopies) this.asRead.add(entry);
   }
 
   /** @internal - Whether `entry` (this very object) is one kept as read or written */
@@ -739,7 +746,7 @@ class GitStagingBuilder implements IndexBuilder {
     }
   }
 
-  async finish(): Promise<void> {
+  async finish(options: IndexBuilderFinishOptions = {}): Promise<void> {
     // Merge kept entries from existing index
     const existingEntries = this.store._getEntries();
     for (const { start, count } of this.keeping) {
@@ -770,7 +777,7 @@ class GitStagingBuilder implements IndexBuilder {
     this.validateStages();
 
     // Replace store entries
-    this.store._replaceEntries(this.entries, this.asReadCopies);
+    this.store._replaceEntries(this.entries, this.asReadCopies, options.upToDate);
   }
 
   private validateStages(): void {

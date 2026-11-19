@@ -370,7 +370,27 @@ export interface IndexBuilder {
   /**
    * Finalize the builder
    */
-  finish(): Promise<void>;
+  finish(options?: IndexBuilderFinishOptions): Promise<void>;
+}
+
+/** How {@link IndexBuilder.finish} treats the entries it was given. */
+export interface IndexBuilderFinishOptions {
+  /**
+   * Count every entry the builder took (given back as it is, or a copy) as set in this
+   * session, as after git's refresh (`CE_UPTODATE`): the next write does not check it for
+   * racy-git smudging, so it reads no file. For the merge family, which rewrites the index
+   * around the paths it writes without first refreshing the whole index (git's
+   * `try_merge_strategy` refreshes it, reading every racily clean file). Without it, a copy
+   * of an entry kept as read stays as read (git copies an entry with its flags).
+   *
+   * @example
+   * ```typescript
+   * const builder = staging.createBuilder();
+   * for (const entry of entries) builder.add(entry);
+   * await builder.finish({ upToDate: true });
+   * ```
+   */
+  upToDate?: boolean;
 }
 
 /**
