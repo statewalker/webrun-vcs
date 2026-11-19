@@ -48,6 +48,11 @@ export class AddFailedError<R = unknown> extends GitApiError {
     readonly failedPaths: readonly string[] = [],
     /** What was added: present when the index was written all the same */
     readonly result?: R,
+    /**
+     * What git printed on its standard output before it failed (`--dry-run`, `--verbose`:
+     * `add '<path>'`, `remove '<path>'`), also when nothing was written
+     */
+    readonly output: readonly string[] = [],
   ) {
     super(message);
     this.name = "AddFailedError";

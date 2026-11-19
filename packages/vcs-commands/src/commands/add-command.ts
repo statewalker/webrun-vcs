@@ -1,6 +1,11 @@
 import { FileMode } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
-import type { StagingEntry, Worktree, WorktreeEntry } from "@statewalker/vcs-working-tree";
+import type {
+  NestedRepositoryState,
+  StagingEntry,
+  Worktree,
+  WorktreeEntry,
+} from "@statewalker/vcs-working-tree";
 
 import {
   AddFailedError,
@@ -245,8 +250,8 @@ export class AddCommand extends GitCommand<AddResult> {
    * Apply the clean conversion freshly to every tracked file and add it again, whatever its
    * stat says (`git add --renormalize`): after a change of `.gitattributes` or
    * `core.autocrlf`, the index takes the line endings the new settings give. CRLF already in
-   * the index does not hold the conversion back. Implies {@link setUpdate} (tracked files
-   * only).
+   * the index does not hold the conversion back. Only tracked files are touched; as git, it
+   * needs a pathspec unless {@link setUpdate} or {@link setAll} is set.
    *
    * @param renormalize Whether to renormalise
    * @returns this for chaining
@@ -317,10 +322,10 @@ export class AddCommand extends GitCommand<AddResult> {
         "fatal: the option '--ignore-missing' requires '--dry-run'",
       );
     }
-    // git's require_pathspec ("Nothing specified, nothing added."); a renormalisation
-    // without one covers every tracked file here
-    if (this.filepatterns.length === 0 && !(this.update || this.all === true || this.renormalize)) {
-      throw new NoFilepatternError("At least one file pattern is required");
+    // git's require_pathspec ("Nothing specified, nothing added."), a renormalisation
+    // included: only `-u` and `-A` go without one
+    if (this.filepatterns.length === 0 && !(this.update || this.all === true)) {
+      throw new NoFilepatternError("Nothing specified, nothing added.");
     }
 
     let items: PathspecItem[];
@@ -348,6 +353,7 @@ export class AddCommand extends GitCommand<AddResult> {
           "Ensure WorkingCopy has worktree or call setWorktreeStore().",
       );
     }
+    await checkSymlinkLeadingPaths(worktree, items, originals);
 
     // one worktree batch: the ignore rules, the configuration and the attributes files are
     // read once for all the files
@@ -422,16 +428,16 @@ export class AddCommand extends GitCommand<AddResult> {
     const ignoreRemoval = !(this.update || this.all !== false);
 
     const index = await this.indexGroups();
-    const indexPaths = new Set(index.map((g) => g.path));
 
     // 1. the untracked files (git's fill_directory and prune_directory)
     const seen = items.map(() => 0);
     const untracked: Array<{ path: string; entry: WorktreeEntry; repository: boolean }> = [];
     let ignored: string[] = [];
     if (addNewFiles) {
-      const scan = await this.scanUntracked(worktree, items, indexPaths, seen);
+      const scan = await this.scanUntracked(worktree, items, index, seen);
       untracked.push(...scan.untracked);
       skipped.push(...scan.skipped);
+      warnings.push(...scan.warnings);
       ignored = scan.ignored;
     }
     // what the index has matches too (add_pathspec_matches_against_index)
@@ -446,8 +452,10 @@ export class AddCommand extends GitCommand<AddResult> {
       if (item.exclude || seen[i]) continue;
       // "Don't complain at 'git add .' on empty repo"
       if (item.match === "") continue;
-      const path = pathspecItemPath(item).replace(/\/+$/, "");
-      if (item.glob || item.icase || !(await worktree.getEntry(path))) {
+      // reported as given, its "/" kept (git's dir_add_ignored of the match)
+      const literal = pathspecItemPath(item);
+      const path = literal.replace(/\/+$/, "");
+      if (!(await namesFile(worktree, item))) {
         if (!this.ignoreMissing) {
           throw new InvalidArgumentError(
             "filepattern",
@@ -455,7 +463,7 @@ export class AddCommand extends GitCommand<AddResult> {
             `fatal: pathspec '${originals[i]}' did not match any files`,
           );
         }
-        if (await worktree.isIgnored(path)) ignored.push(path);
+        if (await worktree.isIgnored(path, path !== literal)) ignored.push(literal);
       }
     }
 
@@ -463,6 +471,7 @@ export class AddCommand extends GitCommand<AddResult> {
     const adder = await IndexAdder.open(this.staging, this.blobs, trust, { pretend: this.dryRun });
     const failed: string[] = [];
     const errors: string[] = [];
+    const addedSet = new Set<string>();
     const addOne = async (
       path: string,
       entry: WorktreeEntry,
@@ -474,7 +483,11 @@ export class AddCommand extends GitCommand<AddResult> {
           displayPath,
           onWarning: (message) => warnings.push(message),
         });
-        added.push(path);
+        // a file turned repository is met twice (`add .`): tracked, then untracked
+        if (!addedSet.has(path)) {
+          addedSet.add(path);
+          added.push(path);
+        }
         if (outcome === "added") output.push(`add '${displayPath}'`);
         return "ok";
       } catch (error) {
@@ -496,7 +509,27 @@ export class AddCommand extends GitCommand<AddResult> {
       // up to date by promise: skip-worktree, assume-unchanged (CE_VALID)
       if (!unmerged && (first.skipWorktree || first.assumeValid)) continue;
       const current = await worktree.getEntry(path);
-      const gone = await this.isRemoved(worktree, first, current);
+      if (!current && (await worktree.isSpecialFile?.(path))) {
+        // a FIFO, socket or device took its place: add_to_index refuses it
+        errors.push(
+          `error: ${path}: can only add regular files, symbolic links or git-directories`,
+        );
+        failed.push(path);
+        if (ignoreErrors) continue;
+        throw new AddFailedError(
+          [...errors, "fatal: updating files failed"].join("\n"),
+          [],
+          failed,
+          undefined,
+          output,
+        );
+      }
+      const removal = await this.removalState(worktree, first, current);
+      if (removal === "unknown") {
+        warnings.push(unreadableRepositoryWarning(path));
+        continue;
+      }
+      const gone = removal === "removed";
       if (gone && !ignoreRemoval) {
         adder.remove(path);
         removed.push(path);
@@ -517,6 +550,8 @@ export class AddCommand extends GitCommand<AddResult> {
           [...errors, "fatal: updating files failed"].join("\n"),
           [],
           failed,
+          undefined,
+          output,
         );
       }
     }
@@ -551,6 +586,8 @@ export class AddCommand extends GitCommand<AddResult> {
             [...messages, ...errors, "fatal: adding files failed"].join("\n"),
             ignored,
             failed,
+            undefined,
+            output,
           );
         }
         continue;
@@ -585,17 +622,21 @@ export class AddCommand extends GitCommand<AddResult> {
 
   /**
    * git's `check_removed` for the index entry `entry` and what the worktree has at its path
-   * (`current`): missing, or a directory where a file was that is no repository with a
-   * commit checked out (a gitlink keeps its directory, populated or not).
+   * (`current`): `"removed"` when missing, or a directory where a file was that is no
+   * repository with a commit checked out (a gitlink keeps its directory, populated or not);
+   * `"unknown"` for a directory whose repository cannot be read here (its `.git` names a
+   * place beyond the worktree's storage), which git would stage as a gitlink.
    */
-  private async isRemoved(
+  private async removalState(
     worktree: Worktree,
     entry: StagingEntry,
     current: WorktreeEntry | undefined,
-  ): Promise<boolean> {
-    if (!current) return true;
-    if (!current.isDirectory || entry.mode === FileMode.GITLINK) return false;
-    return !(await readGitlinkHead(worktree, entry.path));
+  ): Promise<"removed" | "present" | "unknown"> {
+    if (!current) return "removed";
+    if (!current.isDirectory || entry.mode === FileMode.GITLINK) return "present";
+    if (await readGitlinkHead(worktree, entry.path)) return "present";
+    if ((await worktree.repositoryState?.(entry.path)) === "unknown") return "unknown";
+    return "removed";
   }
 
   /** The index's entries, every stage, grouped by path in the index's order. */
@@ -622,20 +663,33 @@ export class AddCommand extends GitCommand<AddResult> {
    * entry (`sub/`), and the ignored paths the pathspec names (the topmost ignored directory
    * or file: git does not look inside an ignored directory). With `--force` nothing is
    * ignored.
+   *
+   * A directory is a repository of its own unless the index has a gitlink there or paths
+   * under it (git's `directory_exists_in_index`): a tracked file replaced by a repository is
+   * one too. A directory whose `.git` holds no repository is entered, its `.git` passed
+   * over; one whose repository cannot be read here is skipped with a warning.
    */
   private async scanUntracked(
     worktree: Worktree,
     items: PathspecItem[],
-    indexPaths: Set<string>,
+    index: IndexGroup[],
     seen: number[],
   ): Promise<{
     untracked: Array<{ path: string; entry: WorktreeEntry; repository: boolean }>;
     skipped: string[];
     ignored: string[];
+    warnings: string[];
   }> {
     const untracked: Array<{ path: string; entry: WorktreeEntry; repository: boolean }> = [];
     const skipped: string[] = [];
     const ignored: string[] = [];
+    const warnings: string[] = [];
+    const indexPaths = new Set<string>();
+    const gitlinkPaths = new Set<string>();
+    for (const group of index) {
+      indexPaths.add(group.path);
+      if (group.gitlink) gitlinkPaths.add(group.path);
+    }
     const trackedDirs = new Set<string>();
     for (const path of indexPaths) {
       for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
@@ -661,8 +715,12 @@ export class AddCommand extends GitCommand<AddResult> {
     for await (const entry of worktree.walk({
       includeIgnored: true,
       includeDirectories: true,
+      // a directory whose `.git` is no repository is an ordinary one (git's treat_directory)
+      enterNonRepositoryGitDirs: true,
       ...(prefix ? { pathPrefix: prefix } : {}),
     })) {
+      // ...but git never adds a `.git` (treat_path)
+      if (entry.path.includes(".git") && GIT_COMPONENT.test(entry.path)) continue;
       const parent = parentOf(entry.path);
       const underIgnored = parent !== "" && ignoredDirs.has(parent);
       if (!this.force && (entry.isIgnored || underIgnored)) {
@@ -675,13 +733,19 @@ export class AddCommand extends GitCommand<AddResult> {
       if (entry.isDirectory) {
         // a repository of its own, nothing of it tracked: one entry, `sub/`
         if (
-          entry.mode === FileMode.GITLINK &&
-          !indexPaths.has(entry.path) &&
-          !trackedDirs.has(entry.path) &&
-          (worktree.isRepository ? await worktree.isRepository(entry.path) : true) &&
-          matchPathspecSeen(items, entry.path, DO_MATCH_DIRECTORY, seen)
+          entry.mode !== FileMode.GITLINK ||
+          gitlinkPaths.has(entry.path) ||
+          trackedDirs.has(entry.path)
         ) {
-          untracked.push({ path: entry.path, entry, repository: true });
+          continue;
+        }
+        const state = await nestedRepositoryState(worktree, entry.path);
+        if (state === "repository") {
+          if (matchPathspecSeen(items, entry.path, DO_MATCH_DIRECTORY, seen)) {
+            untracked.push({ path: entry.path, entry, repository: true });
+          }
+        } else if (state === "unknown" && matchPathspec(items, entry.path, DO_MATCH_DIRECTORY)) {
+          warnings.push(unreadableRepositoryWarning(entry.path));
         }
         continue;
       }
@@ -695,7 +759,7 @@ export class AddCommand extends GitCommand<AddResult> {
       u.repository ? `${u.path}/` : u.path;
     untracked.sort((a, b) => compareGitPaths(key(a), key(b)));
     ignored.sort(compareGitPaths);
-    return { untracked, skipped, ignored };
+    return { untracked, skipped, ignored, warnings };
   }
 
   /**
@@ -735,7 +799,11 @@ export class AddCommand extends GitCommand<AddResult> {
    * git's `renormalize_tracked_files`: every tracked regular file and link (stage 0, not
    * skip-worktree) the pathspec matches is added again, cleaned with renormalisation (each
    * one's cache-tree path invalidated, as `add_index_entry` does, its content changed or
-   * not). An element that matches nothing tracked must name an existing file.
+   * not), and reported by `--verbose` / `--dry-run` whatever its content. An element that
+   * matches nothing tracked must name an existing file (`--ignore-missing` passes over it).
+   * A tracked file that cannot be stat'ed is fatal (nothing written); one replaced by a
+   * repository is staged as its gitlink, and a path that cannot be added (a directory with no
+   * commit checked out, a FIFO) is reported after the others are written.
    */
   private async renormalizeFiles(
     worktree: Worktree,
@@ -745,6 +813,8 @@ export class AddCommand extends GitCommand<AddResult> {
     const added: string[] = [];
     const warnings: string[] = [];
     const output: string[] = [];
+    const errors: string[] = [];
+    const failed: string[] = [];
     const index = await this.indexGroups();
     const seen = items.map(() => 0);
     for (const group of index) {
@@ -753,8 +823,8 @@ export class AddCommand extends GitCommand<AddResult> {
     for (let i = 0; i < items.length; i++) {
       const item = items[i] as PathspecItem;
       if (item.exclude || seen[i] || item.match === "") continue;
-      const path = pathspecItemPath(item).replace(/\/+$/, "");
-      if (item.glob || item.icase || !(await worktree.getEntry(path))) {
+      // with --ignore-missing git collects an ignored one, but reports none here
+      if (!this.ignoreMissing && !(await namesFile(worktree, item))) {
         throw new InvalidArgumentError(
           "filepattern",
           originals[i],
@@ -771,22 +841,42 @@ export class AddCommand extends GitCommand<AddResult> {
       if (kind !== 0o100000 && kind !== 0o120000) continue;
       if (!matchPathspec(items, path, 0)) continue;
       const worktreeEntry = await worktree.getEntry(path);
-      // git's add_file_to_index dies on a tracked file it cannot stat (the index is left
-      // as it was)
       if (!worktreeEntry) {
-        throw new Error(`unable to stat '${path}': No such file or directory`);
+        if (await worktree.isSpecialFile?.(path)) {
+          errors.push(
+            `error: ${path}: can only add regular files, symbolic links or git-directories`,
+          );
+          failed.push(path);
+          continue;
+        }
+        // git's add_file_to_index dies on a tracked file it cannot stat (the index is left
+        // as it was)
+        throw new AddFailedError(
+          `fatal: unable to stat '${path}': No such file or directory`,
+          [],
+          [path],
+          undefined,
+          output,
+        );
       }
-      if (worktreeEntry.isDirectory) continue;
-      const outcome = await adder.add(worktree, path, worktreeEntry, {
-        renormalize: true,
-        onWarning: (message) => warnings.push(message),
-      });
-      if (outcome === "added") output.push(`add '${path}'`);
+      try {
+        await adder.add(worktree, path, worktreeEntry, {
+          renormalize: true,
+          onWarning: (message) => warnings.push(message),
+        });
+      } catch (error) {
+        if (!(error instanceof AddToIndexError)) throw error;
+        errors.push(...error.lines);
+        failed.push(path);
+        continue;
+      }
+      // no alias is looked up with ADD_CACHE_RENORMALIZE: git's was_same is false
+      output.push(`add '${path}'`);
       added.push(path);
     }
     await adder.finish();
     if (this.writeIndex && !this.dryRun) await this.staging.write();
-    return {
+    const result: AddResult = {
       added,
       skipped: [],
       ignored: [],
@@ -795,6 +885,10 @@ export class AddCommand extends GitCommand<AddResult> {
       warnings,
       output,
     };
+    if (failed.length > 0) {
+      throw new AddFailedError(errors.join("\n"), [], failed, result, output);
+    }
+    return result;
   }
 }
 
@@ -803,6 +897,64 @@ interface IndexGroup {
   path: string;
   entries: StagingEntry[];
   gitlink: boolean;
+}
+
+/** A path with a `.git` component: never added (git's treat_path). */
+const GIT_COMPONENT = /(^|\/)\.git(\/|$)/;
+
+/** What the add says of a directory whose repository it cannot read. */
+function unreadableRepositoryWarning(path: string): string {
+  return `warning: skipping '${path}/': the repository its .git names cannot be read here`;
+}
+
+/** Whether the directory at `path` holds a repository of its own, as far as `worktree` tells. */
+async function nestedRepositoryState(
+  worktree: Worktree,
+  path: string,
+): Promise<NestedRepositoryState> {
+  if (worktree.repositoryState) return worktree.repositoryState(path);
+  if (worktree.isRepository) return (await worktree.isRepository(path)) ? "repository" : "none";
+  return "repository";
+}
+
+/**
+ * git's `file_exists` check of a pathspec element that matched nothing: a literal path
+ * there (`lstat`), a directory when it ends with "/" (`a/` names no file `a`); a glob or
+ * case-folding element never names a file.
+ */
+async function namesFile(worktree: Worktree, item: PathspecItem): Promise<boolean> {
+  if (item.glob || item.icase) return false;
+  const literal = pathspecItemPath(item);
+  const path = literal.replace(/\/+$/, "");
+  const entry = await worktree.getEntry(path);
+  if (!entry) return false;
+  return path === literal || entry.isDirectory;
+}
+
+/**
+ * git's `PATHSPEC_SYMLINK_LEADING_PATH` (`has_symlink_leading_path` of each element's
+ * match): an element reaching through a symbolic link is fatal, before anything changes.
+ */
+async function checkSymlinkLeadingPaths(
+  worktree: Worktree,
+  items: PathspecItem[],
+  originals: string[],
+): Promise<void> {
+  for (let i = 0; i < items.length; i++) {
+    const path = pathspecItemPath(items[i] as PathspecItem);
+    const cut = path.lastIndexOf("/");
+    for (let at = path.indexOf("/"); at > 0 && at <= cut; at = path.indexOf("/", at + 1)) {
+      const entry = await worktree.getEntry(path.slice(0, at));
+      if (entry?.mode === FileMode.SYMLINK) {
+        throw new InvalidArgumentError(
+          "filepattern",
+          originals[i],
+          `fatal: pathspec '${originals[i]}' is beyond a symbolic link`,
+        );
+      }
+      if (!entry?.isDirectory) break;
+    }
+  }
 }
 
 /** A string of one character per byte, decoded as a path. */

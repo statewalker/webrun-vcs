@@ -346,7 +346,7 @@ describeGit("checkout attributes: links, renormalize, configuration", () => {
     } catch (e) {
       error = (e as Error).message;
     }
-    expect(`fatal: ${error}\n`).toBe(n.stderr);
+    expect(`${error}\n`).toBe(n.stderr);
     expect(observe(ours, [])).toBe(observe(native, []));
   });
 

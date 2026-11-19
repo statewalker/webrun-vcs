@@ -376,6 +376,7 @@ export function encodeIndexFile(
  * The index file's bytes as one buffer, the checksum hashed by Web Crypto where the runtime
  * has it (the bytes `encodeIndexFile` yields, joined). For a write of the whole file at once
  * (an index lock created holding it): a large index is copied once and hashed natively.
+ * The buffer is the caller's own: changing it never reaches a later encode.
  *
  * @example
  * ```typescript
@@ -398,7 +399,11 @@ export async function encodeIndexFileBytes(
   const { out, size } = encodeFlat(sortedEntries, written, extensions, 20);
   const checksum = await sha1(out.subarray(0, size));
   out.set(checksum, size);
-  return { bytes: out, checksum };
+  // the entries' records point into `out` (a later encode copies their bytes from there):
+  // the caller gets a copy, so changing it cannot slip into a later index under a valid
+  // checksum
+  const bytes = out.slice();
+  return { bytes, checksum: bytes.subarray(size) };
 }
 
 /**
@@ -572,7 +577,8 @@ function hasExtendedFlags(entry: StagingEntry): boolean {
 function* chunked(out: Uint8Array, size: number): Generator<Uint8Array> {
   const hasher = createSha1();
   for (let at = 0; at < size; at += INDEX_CHUNK_SIZE) {
-    const chunk = out.subarray(at, Math.min(size, at + INDEX_CHUNK_SIZE));
+    // a copy: the entries' records point into `out` (see encodeIndexFileBytes)
+    const chunk = out.slice(at, Math.min(size, at + INDEX_CHUNK_SIZE));
     hasher.update(chunk);
     yield chunk;
   }

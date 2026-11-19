@@ -239,7 +239,12 @@ export interface Worktree {
   /** The file's content as it is on disk (never converted). */
   readContent(path: string): AsyncIterable<Uint8Array>;
   exists(path: string): Promise<boolean>;
-  isIgnored(path: string): Promise<boolean>;
+  /**
+   * Whether the ignore rules exclude `path`, judged as a directory when one is there, or
+   * with `asDirectory` whatever is there (a pathspec element ending in "/", as git's
+   * `is_excluded` judges it).
+   */
+  isIgnored(path: string, asDirectory?: boolean): Promise<boolean>;
 
   // ========== Writing ==========
 
@@ -290,6 +295,13 @@ export interface Worktree {
    * read). `isRepository` takes an unknown as a repository.
    */
   repositoryState?(path: string): Promise<NestedRepositoryState>;
+
+  /**
+   * Whether the entry at `path` is a FIFO, socket or device: there, but nothing git can add
+   * ("can only add regular files, symbolic links or git-directories"). `getEntry` gives
+   * undefined for it, as for a missing path; this tells the two apart.
+   */
+  isSpecialFile?(path: string): Promise<boolean>;
   mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;
 

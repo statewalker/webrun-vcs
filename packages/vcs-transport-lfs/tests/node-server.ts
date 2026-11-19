@@ -60,10 +60,10 @@ export async function serveOnLoopback(
           duplex: "half",
         } as RequestInit),
       );
-      res.writeHead(response.status, {
-        ...Object.fromEntries(response.headers),
-        connection: "close",
-      });
+      // no `connection: close`: undici 6 (Node 22) asserts in Parser.finish when the socket
+      // ends while the body consumer has paused it on the final chunk; `close` below ends
+      // every connection instead
+      res.writeHead(response.status, Object.fromEntries(response.headers));
       if (response.body) {
         const reader = response.body.getReader();
         res.on("close", () => void reader.cancel().catch(() => {}));

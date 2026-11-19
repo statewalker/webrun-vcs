@@ -746,6 +746,19 @@ describe("encoding into one buffer (versions 2 and 3)", () => {
     expect(join(encodeIndexFile(entries)).equals(first)).toBe(true);
   });
 
+  it("hands out bytes of its own: changing them never reaches a later encode", async () => {
+    const entries = Array.from({ length: 50 }, (_, i) =>
+      entry(`f${String(i).padStart(3, "0")}`, i),
+    );
+    const first = await encodeIndexFileBytes(entries);
+    const expected = Buffer.from(first.bytes);
+    first.bytes.fill(0);
+    for (const chunk of encodeIndexFile(entries)) chunk.fill(0);
+    const again = await encodeIndexFileBytes(entries);
+    expect(Buffer.from(again.bytes).equals(expected)).toBe(true);
+    expect(join(encodeIndexFile(entries)).equals(expected)).toBe(true);
+  });
+
   it("refuses an object id that is not 40 lowercase hex digits, before any byte", () => {
     for (const objectId of ["A".repeat(40), "a".repeat(39), `${"a".repeat(39)}\u00e9`]) {
       expect(() => encodeIndexFile([entry("x", 1, { objectId })])).toThrow(/not an object id/);

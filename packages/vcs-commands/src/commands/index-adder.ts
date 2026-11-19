@@ -101,6 +101,8 @@ export class IndexAdder {
   /** The paths given a new entry or removed: git invalidates their cache-tree paths */
   private readonly touched = new Set<string>();
   private emptyBlobStored = false;
+  /** The gitlinks the edits stage, by path: a path added twice is up to date the second time */
+  private readonly stagedGitlinks = new Map<string, ObjectId>();
 
   private constructor(
     private readonly staging: Staging,
@@ -249,9 +251,13 @@ export class IndexAdder {
         `error: unable to index file '${name}'`,
       ]);
     }
-    // ie_match_stat of a gitlink compares the commit checked out (ce_compare_gitlink)
+    // ie_match_stat of a gitlink compares the commit checked out (ce_compare_gitlink), with
+    // the entry as edited so far (`add .` meets a file turned repository twice: as a tracked
+    // path, then as an untracked directory)
+    if (this.stagedGitlinks.get(path) === head && this.added.has(path)) return "unchanged";
     if (
       indexed &&
+      !this.added.has(path) &&
       indexed.mode === FileMode.GITLINK &&
       !indexed.intentToAdd &&
       indexed.objectId === head
@@ -280,7 +286,11 @@ export class IndexAdder {
       this.markAdded(path);
       return "added";
     }
-    if (this.pretend) return "added";
+    this.stagedGitlinks.set(path, head);
+    if (this.pretend) {
+      this.added.add(path);
+      return "added";
+    }
     this.stage(path, head, FileMode.GITLINK, entryStatOf(entry));
     return "added";
   }

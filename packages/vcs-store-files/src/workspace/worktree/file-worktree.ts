@@ -568,10 +568,11 @@ export class FileWorktree implements Worktree {
     }
   }
 
-  async isIgnored(path: string): Promise<boolean> {
+  async isIgnored(path: string, asDirectory = false): Promise<boolean> {
     // the .gitignore files of the path's directories and the exclude files, read for this
     // check (once per batch), never through a link
     await this.loadIgnoresFor(path, this.batchIgnores ?? new Set<string>());
+    if (asDirectory) return this.ignoreManager.isIgnored(path, true);
 
     // a directory (an empty one too), never a link to one: as git's lstat decides
     const kind = await this.kindOrError(joinPath(this.rootPath, path));
@@ -834,23 +835,43 @@ export class FileWorktree implements Worktree {
     return this.gitDirectoryState(dotGit);
   }
 
-  /** Whether the directory at `dir` has a HEAD (file or link): a repository's gitdir. */
+  /**
+   * Whether the directory at `dir` has a valid HEAD (git's `validate_headref`): a link into
+   * `refs/`, or a file holding a symbolic ref into `refs/` or an object id. A gitfile's target
+   * needs no more (a linked worktree's gitdir has no objects of its own: its commondir has).
+   */
   private async headState(dir: string): Promise<NestedRepositoryState> {
-    const head = await this.kindOrError(joinPath(dir, "HEAD"));
-    if (head === "error") return "unknown";
-    return head === undefined ? "none" : "repository";
+    const path = joinPath(dir, "HEAD");
+    const kind = await this.kindOrError(path);
+    if (kind === "error") return "unknown";
+    if (kind === "symlink") {
+      const target = await this.files.readlink?.(path).catch(() => undefined);
+      if (!target) return "unknown";
+      return decodeGitPath(target).startsWith("refs/") ? "repository" : "none";
+    }
+    // anything but a regular file fails git's open/read (and a FIFO would block)
+    if (kind !== "file") return "none";
+    let text: string;
+    try {
+      text = decodeGitPath((await readFile(this.files, path)).subarray(0, 255));
+    } catch {
+      return "unknown";
+    }
+    if (text.startsWith("ref:") && text.slice(4).replace(/^\s+/, "").startsWith("refs/")) {
+      return "repository";
+    }
+    return /^([0-9a-fA-F]{64}|[0-9a-fA-F]{40})/.test(text) ? "repository" : "none";
   }
 
   /**
-   * git's `is_git_directory` for the directory at `dir` (a path in this FilesApi): a HEAD
-   * (a file, or a link as core.preferSymlinkRefs writes it), objects and refs (directories,
-   * or links to them).
+   * git's `is_git_directory` for the directory at `dir` (a path in this FilesApi): a valid
+   * HEAD ({@link headState}: a file, or a link as core.preferSymlinkRefs writes it), objects
+   * and refs (directories, or links to them).
    */
   private async gitDirectoryState(dir: string): Promise<NestedRepositoryState> {
     const kindAt = (name: string) => this.kindOrError(joinPath(dir, name));
-    const head = await kindAt("HEAD");
-    if (head === "error") return "unknown";
-    if (head === undefined) return "none";
+    const head = await this.headState(dir);
+    if (head !== "repository") return head;
     let unknown = false;
     for (const name of ["objects", "refs"]) {
       const k = await kindAt(name);
@@ -899,19 +920,43 @@ export class FileWorktree implements Worktree {
     };
     const gitDir = await this.gitlinkDir(path);
     if (gitDir === undefined) return undefined;
+    // a linked worktree's gitdir (`git worktree add`) keeps HEAD; the branches are in the
+    // repository its `commondir` names (relative to the gitdir, or absolute)
+    const common = await text(joinPath(gitDir, "commondir"));
+    let commonDir = gitDir;
+    if (common) {
+      const absolute = common.startsWith("/") || /^[A-Za-z]:[\\/]/.test(common);
+      const resolved = absolute
+        ? this.gitfileTarget(path, common)
+        : resolveDots(joinPath(gitDir, common));
+      if (resolved === undefined) return undefined;
+      commonDir = resolved;
+    }
     let head = await text(joinPath(gitDir, "HEAD"));
-    for (let depth = 0; head?.startsWith("ref: ") && depth < 5; depth++) {
-      const ref = head.slice(5).trim();
-      const loose = await text(joinPath(gitDir, ref));
+    for (let depth = 0; head?.startsWith("ref:") && depth < 5; depth++) {
+      const ref = head.slice(4).trim();
+      const loose =
+        (await text(joinPath(gitDir, ref))) ??
+        (commonDir !== gitDir ? await text(joinPath(commonDir, ref)) : undefined);
       if (loose) {
         head = loose;
         continue;
       }
-      const packed = await text(joinPath(gitDir, "packed-refs"));
+      const packed = await text(joinPath(commonDir, "packed-refs"));
       const line = packed?.split("\n").find((l) => l.endsWith(` ${ref}`));
       head = line?.split(" ")[0];
     }
     return head && /^[0-9a-f]{40,64}$/.test(head) ? head : undefined;
+  }
+
+  /**
+   * Whether the entry at `path` is a FIFO, socket or device: present, but no content git
+   * can add (`getEntry` gives undefined for it, as for a missing path).
+   */
+  async isSpecialFile(path: string): Promise<boolean> {
+    if (!this.files.lstat) return false;
+    const link = await this.files.lstat(joinPath(this.rootPath, path)).catch(() => undefined);
+    return link?.kind === "other";
   }
 
   /**
