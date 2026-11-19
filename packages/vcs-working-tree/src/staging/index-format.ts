@@ -1,5 +1,5 @@
 import { objectIdToBytes } from "@statewalker/vcs-core";
-import { bytesToHex, createSha1, sha1 } from "@statewalker/vcs-utils";
+import { createSha1, sha1 } from "@statewalker/vcs-utils";
 import {
   compareGitPaths,
   decodeGitPath,
@@ -101,6 +101,33 @@ export interface ParsedIndex {
    * `encodeIndexFile`.
    */
   extensionData: IndexExtension[];
+  /** The entries' bytes, with `keepEncoding` (versions 2 and 3) */
+  encoding?: IndexEncoding;
+}
+
+/**
+ * Entries as encoded in an index's bytes, for the next write of the index to copy instead of
+ * encoding them again: `entries[i]` (an entry object, never changed in place) is written as
+ * `buffer[offsets[i], end)`, where `end` is the next entry's start (`offsets[entries.length]`
+ * ends the last). A negative offset is the complement (`~start`) of bytes that are not to be
+ * copied (not as the encoder would write them). Only a write of the same version copies them.
+ */
+export interface IndexEncoding {
+  entries: readonly StagingEntry[];
+  buffer: Uint8Array;
+  offsets: Int32Array;
+  version: IndexVersion;
+}
+
+/** Options of {@link parseIndexFile}. */
+export interface ParseIndexOptions {
+  /**
+   * Describe where each version 2/3 entry's bytes are (`ParsedIndex.encoding`), so that a
+   * write of the entries copies them instead of encoding them (an index read and written by
+   * a command keeps most of its entries). The caller hands `data` over: it must never change
+   * afterwards.
+   */
+  keepEncoding?: boolean;
 }
 
 /** An index extension as stored: a four-character signature and its payload. */
@@ -118,7 +145,10 @@ export interface IndexExtension {
  * @returns Parsed index with version and entries
  * @throws Error on invalid format or checksum mismatch
  */
-export async function parseIndexFile(data: Uint8Array): Promise<ParsedIndex> {
+export async function parseIndexFile(
+  data: Uint8Array,
+  options: ParseIndexOptions = {},
+): Promise<ParsedIndex> {
   if (data.length < HEADER_SIZE + CHECKSUM_SIZE) {
     throw new Error("Index file too small");
   }
@@ -158,12 +188,24 @@ export async function parseIndexFile(data: Uint8Array): Promise<ParsedIndex> {
   const entries: StagingEntry[] = [];
   let previousPath = "";
 
+  // where each entry's bytes start (a version 2/3 write copies them, see IndexEncoding);
+  // complemented for an entry whose extended-flags word the encoder would not write as read
+  const offsets =
+    options.keepEncoding === true && version !== INDEX_VERSION_4
+      ? new Int32Array(entryCount + 1)
+      : undefined;
   for (let i = 0; i < entryCount; i++) {
-    const { entry, nextOffset } = parseEntry(data, view, offset, version, previousPath);
+    const entry = parseEntry(data, view, offset, version, previousPath);
+    const nextOffset = parsedEnd;
     entries.push(entry);
+    if (offsets) {
+      const extended = (view.getUint16(offset + P_FLAGS) & EXTENDED) !== 0;
+      offsets[i] = extended === hasExtendedFlags(entry) ? offset : ~offset;
+    }
     previousPath = entry.path;
     offset = nextOffset;
   }
+  if (offsets) offsets[entryCount] = offset;
 
   // Extensions: a 4-byte signature and a 4-byte size, then the data, up to the checksum
   const extensions: string[] = [];
@@ -186,11 +228,63 @@ export async function parseIndexFile(data: Uint8Array): Promise<ParsedIndex> {
     for (const entry of entries) validatePath(entry.path);
   }
 
-  return { version, entries, extensions, extensionData };
+  return {
+    version,
+    entries,
+    extensions,
+    extensionData,
+    // (the entries' list as parsed: the caller may edit the one it is given)
+    ...(offsets ? { encoding: { entries: entries.slice(), buffer: data, offsets, version } } : {}),
+  };
 }
 
+/** The char codes of "0" to "f". */
+const HEX_CHARS = Array.from("0123456789abcdef", (c) => c.charCodeAt(0));
+/** The 40 char codes of the id {@link hexIdAt} is converting (it never awaits). */
+const ID_CHARS: number[] = new Array(40).fill(0);
+
+/** The hex object id of the 20 bytes at `data[at]` (no view per id). */
+function hexIdAt(data: Uint8Array, at: number): string {
+  for (let i = 0; i < 20; i++) {
+    const b = data[at + i] as number;
+    ID_CHARS[2 * i] = HEX_CHARS[b >> 4] as number;
+    ID_CHARS[2 * i + 1] = HEX_CHARS[b & 15] as number;
+  }
+  return String.fromCharCode.apply(null, ID_CHARS);
+}
+
+/** Arrays of each length up to {@link SHORT_PATH}, reused to build ASCII paths. */
+const SHORT_PATH = 96;
+const PATH_CHARS: number[][] = Array.from({ length: SHORT_PATH + 1 }, (_, n) =>
+  new Array(n).fill(0),
+);
+
 /**
- * Parse a single index entry.
+ * The path in the `length` bytes at `data[at]` ({@link decodeGitPath}): a short ASCII one
+ * built from its char codes without a view of the bytes, any other decoded as bytes.
+ */
+function pathAt(data: Uint8Array, at: number, length: number): string {
+  if (length <= SHORT_PATH) {
+    const chars = PATH_CHARS[length] as number[];
+    let ascii = true;
+    for (let k = 0; k < length; k++) {
+      const c = data[at + k] as number;
+      if (c >= 0x80) {
+        ascii = false;
+        break;
+      }
+      chars[k] = c;
+    }
+    if (ascii) return String.fromCharCode.apply(null, chars);
+  }
+  return decodeGitPath(data.subarray(at, at + length));
+}
+
+/** Where the entry {@link parseEntry} last parsed ends (no result object per entry). */
+let parsedEnd = 0;
+
+/**
+ * Parse a single index entry (its end in {@link parsedEnd}).
  */
 function parseEntry(
   data: Uint8Array,
@@ -198,7 +292,7 @@ function parseEntry(
   offset: number,
   version: IndexVersion,
   previousPath: string,
-): { entry: StagingEntry; nextOffset: number } {
+): StagingEntry {
   const startOffset = offset;
 
   // Timestamps (ctime, mtime - each 8 bytes: seconds + nanoseconds)
@@ -230,7 +324,7 @@ function parseEntry(
   offset += 4;
 
   // Object ID (20 bytes SHA-1)
-  const objectId = bytesToHex(data.subarray(offset, offset + 20));
+  const objectId = hexIdAt(data, offset);
   offset += 20;
 
   // Flags (2 bytes)
@@ -292,8 +386,7 @@ function parseEntry(
       offset = pathEnd;
     } else {
       // Short path
-      const pathBytes = data.subarray(offset, offset + nameLength);
-      path = decodeGitPath(pathBytes);
+      path = pathAt(data, offset, nameLength);
       offset += nameLength;
 
       // Skip null terminator
@@ -333,7 +426,8 @@ function parseEntry(
     skipWorktree,
   };
 
-  return { entry, nextOffset: offset };
+  parsedEnd = offset;
+  return entry;
 }
 
 /** Entries are gathered into chunks of about this many bytes before they are yielded. */
@@ -389,21 +483,28 @@ export async function encodeIndexFileBytes(
   entries: readonly StagingEntry[],
   version: IndexVersion = INDEX_VERSION_2,
   extensions: readonly IndexExtension[] = [],
-): Promise<{ bytes: Uint8Array; checksum: Uint8Array }> {
+  options: { source?: IndexEncoding } = {},
+): Promise<{ bytes: Uint8Array; checksum: Uint8Array; encoding?: IndexEncoding }> {
   const written = writtenVersion(entries, version);
   const sortedEntries = checkedSorted(entries, extensions, written === INDEX_VERSION_4);
   if (written === INDEX_VERSION_4) {
     const bytes = concatBytes([...encodeSorted(sortedEntries, written, extensions)]);
     return { bytes, checksum: bytes.subarray(bytes.length - 20) };
   }
-  const { out, size } = encodeFlat(sortedEntries, written, extensions, 20);
+  const source = options.source?.version === written ? options.source : undefined;
+  const offsets = new Int32Array(sortedEntries.length + 1);
+  const { out, size } = encodeFlat(sortedEntries, written, extensions, 20, source, offsets);
   const checksum = await sha1(out.subarray(0, size));
   out.set(checksum, size);
   // the entries' records point into `out` (a later encode copies their bytes from there):
   // the caller gets a copy, so changing it cannot slip into a later index under a valid
   // checksum
   const bytes = out.slice();
-  return { bytes, checksum: bytes.subarray(size) };
+  return {
+    bytes,
+    checksum: bytes.subarray(size),
+    encoding: { entries: sortedEntries, buffer: out, offsets, version: written },
+  };
 }
 
 /**
@@ -417,14 +518,50 @@ function encodeFlat(
   version: IndexVersion,
   extensions: readonly IndexExtension[],
   spare: number,
+  source?: IndexEncoding,
+  /** filled with where each entry starts in `out` (and where the entries end) */
+  offsets?: Int32Array,
 ): { out: Uint8Array; size: number } {
   const count = sortedEntries.length;
   // the path's bytes for a path that is not ASCII (undefined: ASCII, written as it is)
   const encodedPaths: Array<Uint8Array | undefined> = new Array(count);
   const known: Array<EncodedEntry | undefined> = new Array(count);
+  // the source's bytes of each entry it has (start; -1 none), found walking both in order
+  const fromSource = source ? new Int32Array(count).fill(-1) : undefined;
+  const fromSourceEnd = source ? new Int32Array(count) : undefined;
+  const sourceEntries = source?.entries ?? [];
+  const sourceOffsets = source?.offsets;
+  const sourceCount = sourceOffsets ? Math.min(sourceEntries.length, sourceOffsets.length - 1) : 0;
+  let j = 0;
   let size = HEADER_SIZE;
   for (let i = 0; i < count; i++) {
     const entry = sortedEntries[i] as StagingEntry;
+    if (fromSource && sourceOffsets) {
+      // the source's entries before this one are gone; one at its path was replaced
+      let found = false;
+      while (j < sourceCount) {
+        const s = sourceEntries[j] as StagingEntry;
+        if (s === entry) {
+          found = true;
+          j++;
+          break;
+        }
+        const order = comparePaths(s.path, entry.path) || s.stage - entry.stage;
+        if (order > 0) break;
+        j++;
+        if (order === 0) break;
+      }
+      const start = found ? (sourceOffsets[j - 1] as number) : -1;
+      if (start >= 0) {
+        // the next entry's start ends it
+        const next = sourceOffsets[j] as number;
+        const end = next >= 0 ? next : ~next;
+        fromSource[i] = start;
+        (fromSourceEnd as Int32Array)[i] = end;
+        size += end - start;
+        continue;
+      }
+    }
     const record = encodedEntries.get(entry);
     // (a buffer handed away since, detached, holds nothing any more)
     if (record && record.version === version && record.buffer.length > 0) {
@@ -451,17 +588,53 @@ function encodeFlat(
   view.setUint32(4, version);
   view.setUint32(8, count);
   let at = HEADER_SIZE;
+  // entries encoded next to each other before are copied in one run
+  let runBuffer: Uint8Array | undefined;
+  let runStart = 0;
+  let runEnd = 0;
+  let runAt = 0;
+  const flushRun = () => {
+    if (runBuffer) out.set(runBuffer.subarray(runStart, runEnd), runAt);
+    if (runBuffer) out.set(runBuffer.subarray(runStart, runEnd), runAt);
+    runBuffer = undefined;
+  };
   for (let i = 0; i < count; i++) {
     const entry = sortedEntries[i] as StagingEntry;
+    if (offsets) offsets[i] = at;
+    const start = fromSource ? (fromSource[i] as number) : -1;
+    if (start >= 0) {
+      const end = (fromSourceEnd as Int32Array)[i] as number;
+      const buffer = (source as IndexEncoding).buffer;
+      if (runBuffer === buffer && runEnd === start) {
+        runEnd = end;
+      } else {
+        flushRun();
+        runBuffer = buffer;
+        runStart = start;
+        runEnd = end;
+        runAt = at;
+      }
+      at += end - start;
+      continue;
+    }
     const record = known[i];
     if (record) {
-      out.set(record.buffer.subarray(record.offset, record.offset + record.length), at);
+      if (runBuffer === record.buffer && runEnd === record.offset) {
+        runEnd += record.length;
+      } else {
+        flushRun();
+        runBuffer = record.buffer;
+        runStart = record.offset;
+        runEnd = runStart + record.length;
+        runAt = at;
+      }
       // the bytes now live here: the record follows them, so an older buffer is let go
       record.buffer = out;
       record.offset = at;
       at += record.length;
       continue;
     }
+    flushRun();
     const hasExtended = hasExtendedFlags(entry);
     const infoLen = hasExtended ? INFO_LEN_EXTENDED : INFO_LEN;
     const bytes = encodedPaths[i];
@@ -478,6 +651,8 @@ function encodeFlat(
     encodedEntries.set(entry, { version, buffer: out, offset: at, length });
     at += length;
   }
+  flushRun();
+  if (offsets) offsets[count] = at;
   for (const ext of extensions) {
     for (let i = 0; i < 4; i++) out[at + i] = ext.signature.charCodeAt(i);
     view.setUint32(at + 4, ext.data.length);

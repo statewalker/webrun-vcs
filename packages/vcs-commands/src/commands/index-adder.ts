@@ -166,7 +166,6 @@ export class IndexAdder {
   private readonly unmerged = new Map<string, StagingEntry[]>();
   /** The index's stage-0 paths before the edits, sorted (git's order) */
   private readonly basePaths: string[] = [];
-  private readonly baseSet = new Set<string>();
   /** Stage-0 paths of the index removed by the edits */
   private readonly removed = new Set<string>();
   /** Stage-0 paths the edits add (in no particular order) */
@@ -202,16 +201,17 @@ export class IndexAdder {
     options: { pretend?: boolean } = {},
   ): Promise<IndexAdder> {
     const adder = new IndexAdder(staging, blobs, trust, options.pretend === true);
-    const list = staging.entryList?.();
-    const entries: Iterable<StagingEntry> | AsyncIterable<StagingEntry> = list ?? staging.entries();
-    for await (const entry of entries) {
+    const take = (entry: StagingEntry) => {
       if (entry.stage === 0) {
         adder.basePaths.push(entry.path);
-        adder.baseSet.add(entry.path);
       } else {
         adder.unmerged.set(entry.path, [...(adder.unmerged.get(entry.path) ?? []), entry]);
       }
-    }
+    };
+    // a list in memory is read without a promise per entry
+    const list = staging.entryList?.();
+    if (list) for (const entry of list) take(entry);
+    else for await (const entry of staging.entries()) take(entry);
     // sorted already in the index's order; sorted again only if a staging gave another
     // (the engine's string order is the bytes' order without surrogates: checked first)
     let previousPlain = !SURROGATE.test(adder.basePaths[0] ?? "");
@@ -230,9 +230,38 @@ export class IndexAdder {
     return adder;
   }
 
+  /**
+   * Whether the index had a stage-0 entry at `path` before the edits: a binary search of the
+   * sorted paths (a set of every path would cost more than the few lookups an add makes).
+   */
+  private inBase(path: string): boolean {
+    const paths = this.basePaths;
+    let lo = 0;
+    let hi = paths.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (compareGitPaths(paths[mid] as string, path) < 0) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo < paths.length && paths[lo] === path;
+  }
+
   /** Whether the index (as edited so far) has a stage-0 entry at `path`. */
   hasStage0(path: string): boolean {
-    return this.added.has(path) || (this.baseSet.has(path) && !this.removed.has(path));
+    return this.added.has(path) || (this.inBase(path) && !this.removed.has(path));
+  }
+
+  /**
+   * Whether `add` of the tracked stage-0 entry `indexed` with its file `entry` would find it
+   * up to date ("unchanged": its stat matches and it is not racily clean) and change
+   * nothing, decided synchronously: a stat pass calls this first and skips `add` for the
+   * entries it accepts. False for anything `add` must look at (a path the edits touched
+   * already, a directory, a changed stat).
+   */
+  unchangedByStat(indexed: StagingEntry, entry: WorktreeEntry): boolean {
+    if (indexed.stage !== 0 || entry.isDirectory) return false;
+    if (this.added.has(indexed.path) || this.removed.has(indexed.path)) return false;
+    return this.statUnchanged(indexed, entry);
   }
 
   /** Whether `path` has conflict stages (as edited so far). */
@@ -531,7 +560,7 @@ export class IndexAdder {
     }
     if (this.addedDirs.has(dir)) {
       for (const p of this.added) {
-        if (p.startsWith(prefix) && !this.baseSet.has(p)) out.push(p);
+        if (p.startsWith(prefix) && !this.inBase(p)) out.push(p);
       }
     }
     return out;
@@ -548,6 +577,6 @@ export class IndexAdder {
 
   private markRemoved(path: string): void {
     this.added.delete(path);
-    if (this.baseSet.has(path)) this.removed.add(path);
+    if (this.inBase(path)) this.removed.add(path);
   }
 }

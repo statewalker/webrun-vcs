@@ -32,6 +32,7 @@ import type {
 } from "./staging.js";
 import {
   clearSkipWorktreeFlags,
+  EntryIdentitySet,
   type IndexStatUpdate,
   type RacyCheck,
   refreshIndexFile,
@@ -52,7 +53,7 @@ export class GitStaging implements Staging {
   private updateTime = 0;
   private racyCheck?: RacyCheck;
   /** The entries as last read or written (others were set in this session: up to date) */
-  private asRead = new Set<StagingEntry>();
+  private asRead = new EntryIdentitySet();
   /** Whether the entries or extensions changed since they were last read or written */
   private unwritten = false;
   /** Skip-worktree flags cleared when the index was read, not yet in the index file */
@@ -390,7 +391,7 @@ export class GitStaging implements Staging {
       return;
     }
     this._entries = read.entries;
-    this.asRead = new Set(this._entries);
+    this.asRead.reset(this._entries);
     this.version = this.indexFile.version;
     this.updateTime = read.lastModified;
   }
@@ -407,7 +408,7 @@ export class GitStaging implements Staging {
     await this.indexFile.write(this._entries);
     this.unwritten = false;
     this.skipWorktreeCleared = new Set();
-    this.asRead = new Set(this._entries);
+    this.asRead.reset(this._entries);
     this.updateTime = await this.indexMtime();
   }
 
@@ -437,7 +438,7 @@ export class GitStaging implements Staging {
         // the index now holds what was written (make no edits between write and commit)
         this.unwritten = false;
         this.skipWorktreeCleared = new Set();
-        this.asRead = new Set(written);
+        this.asRead.reset(written);
         this.updateTime = await this.indexMtime();
       },
       rollback: () => lock.rollback(),
@@ -448,7 +449,7 @@ export class GitStaging implements Staging {
     const saved: SavedGitStagingState = {
       staging: this,
       entries: this._entries.slice(),
-      asRead: new Set(this.asRead),
+      asRead: this.asRead.copy(),
       unwritten: this.unwritten,
       skipWorktreeCleared: new Set(this.skipWorktreeCleared),
       updateTime: this.updateTime,
@@ -464,7 +465,7 @@ export class GitStaging implements Staging {
       throw new Error("restoreState: the state was saved by another staging");
     }
     this._entries = saved.entries.slice();
-    this.asRead = new Set(saved.asRead);
+    this.asRead = saved.asRead.copy();
     this.unwritten = saved.unwritten;
     this.skipWorktreeCleared = new Set(saved.skipWorktreeCleared);
     this.updateTime = saved.updateTime;
@@ -665,7 +666,7 @@ export class GitStaging implements Staging {
 /** What `GitStaging.saveState` keeps. */
 interface SavedGitStagingState extends StagingState {
   readonly entries: readonly IndexEntry[];
-  readonly asRead: ReadonlySet<StagingEntry>;
+  readonly asRead: EntryIdentitySet;
   readonly unwritten: boolean;
   readonly skipWorktreeCleared: ReadonlySet<string>;
   readonly updateTime: number;

@@ -12,6 +12,7 @@ import {
   type Worktree,
   type WorktreeEntry,
   withWorktreeEntries,
+  worktreeEntryChunks,
 } from "@statewalker/vcs-working-tree";
 
 import {
@@ -607,73 +608,84 @@ export class AddCommand extends GitCommand<AddResult> {
       const first = group.entries[0] as StagingEntry;
       return first.stage !== 0 || !(first.skipWorktree || first.assumeValid);
     };
-    for await (const { item: group, current: found } of withWorktreeEntries(
-      worktree,
-      matched,
-      stated,
-    )) {
-      const { path, entries } = group;
-      const first = entries[0] as StagingEntry;
-      const unmerged = first.stage !== 0;
-      // up to date by promise: skip-worktree, assume-unchanged (CE_VALID)
-      if (found === undefined) continue;
-      // update_callback passes over paths outside the sparse checkout's patterns
-      if (this.outsideSparse(path)) continue;
-      const current = found ?? undefined;
-      if (!current && (await worktree.isSpecialFile?.(path))) {
-        // a FIFO, socket or device took its place: add_to_index refuses it
-        errors.push(
-          `error: ${path}: can only add regular files, symbolic links or git-directories`,
-        );
-        failed.push(path);
-        if (ignoreErrors) continue;
-        throw new AddFailedError(
-          [...errors, "fatal: updating files failed"].join("\n"),
-          [],
-          failed,
-          undefined,
-          output,
-          warnings,
-        );
-      }
-      const removal = await this.removalState(worktree, first, current);
-      if (removal === "unknown") {
-        warnings.push(unreadableRepositoryWarning(path));
-        continue;
-      }
-      const gone = removal === "removed";
-      if (gone && !ignoreRemoval) {
-        adder.remove(path);
-        removed.push(path);
-        output.push(`remove '${path}'`);
-        continue;
-      }
-      if (gone && !unmerged) continue;
-      if (!current) {
-        // an unmerged path asked to be added (`--no-all`) that is not there
-        throw new AddFailedError(
-          [...errors, `fatal: unable to stat '${path}': No such file or directory`].join("\n"),
-          [],
-          [...failed, path],
-          undefined,
-          output,
-          warnings,
-        );
-      }
-      // an unpopulated submodule is no change (no commit checked out to compare)
-      if (!unmerged && first.mode === FileMode.GITLINK && current.isDirectory) {
-        if (!(await readGitlinkHead(worktree, path))) continue;
-      }
-      const indexed = unmerged ? undefined : first;
-      if ((await addOne(path, current, path, indexed)) === "failed" && !ignoreErrors) {
-        throw new AddFailedError(
-          [...errors, "fatal: updating files failed"].join("\n"),
-          [],
-          failed,
-          undefined,
-          output,
-          warnings,
-        );
+    // one promise per chunk: the entries clean by their stat (most of them) are settled in
+    // the loop, without a call into the adder
+    const quick = !this.intentToAdd;
+    for await (const chunk of worktreeEntryChunks(worktree, matched, stated)) {
+      for (let at = 0; at < chunk.items.length; at++) {
+        const group = chunk.items[at] as IndexGroup;
+        const found = chunk.current[at];
+        const { path, entries } = group;
+        const first = entries[0] as StagingEntry;
+        const unmerged = first.stage !== 0;
+        // up to date by promise: skip-worktree, assume-unchanged (CE_VALID)
+        if (found === undefined) continue;
+        // update_callback passes over paths outside the sparse checkout's patterns
+        if (this.outsideSparse(path)) continue;
+        // add_to_index of a file whose stat still matches its entry: nothing to do
+        if (quick && found && adder.unchangedByStat(first, found)) {
+          if (!addedSet.has(path)) {
+            addedSet.add(path);
+            added.push(path);
+          }
+          continue;
+        }
+        const current = found ?? undefined;
+        if (!current && (await worktree.isSpecialFile?.(path))) {
+          // a FIFO, socket or device took its place: add_to_index refuses it
+          errors.push(
+            `error: ${path}: can only add regular files, symbolic links or git-directories`,
+          );
+          failed.push(path);
+          if (ignoreErrors) continue;
+          throw new AddFailedError(
+            [...errors, "fatal: updating files failed"].join("\n"),
+            [],
+            failed,
+            undefined,
+            output,
+            warnings,
+          );
+        }
+        const removal = await this.removalState(worktree, first, current);
+        if (removal === "unknown") {
+          warnings.push(unreadableRepositoryWarning(path));
+          continue;
+        }
+        const gone = removal === "removed";
+        if (gone && !ignoreRemoval) {
+          adder.remove(path);
+          removed.push(path);
+          output.push(`remove '${path}'`);
+          continue;
+        }
+        if (gone && !unmerged) continue;
+        if (!current) {
+          // an unmerged path asked to be added (`--no-all`) that is not there
+          throw new AddFailedError(
+            [...errors, `fatal: unable to stat '${path}': No such file or directory`].join("\n"),
+            [],
+            [...failed, path],
+            undefined,
+            output,
+            warnings,
+          );
+        }
+        // an unpopulated submodule is no change (no commit checked out to compare)
+        if (!unmerged && first.mode === FileMode.GITLINK && current.isDirectory) {
+          if (!(await readGitlinkHead(worktree, path))) continue;
+        }
+        const indexed = unmerged ? undefined : first;
+        if ((await addOne(path, current, path, indexed)) === "failed" && !ignoreErrors) {
+          throw new AddFailedError(
+            [...errors, "fatal: updating files failed"].join("\n"),
+            [],
+            failed,
+            undefined,
+            output,
+            warnings,
+          );
+        }
       }
     }
     if (this.update && !ignoreErrors) {
@@ -946,14 +958,17 @@ export class AddCommand extends GitCommand<AddResult> {
     const entries: Iterable<StagingEntry> | AsyncIterable<StagingEntry> =
       list ?? this.staging.entries();
     let last: IndexGroup | undefined;
-    for await (const entry of entries) {
+    const take = (entry: StagingEntry) => {
       if (last && last.path === entry.path) {
         last.entries.push(entry);
-        continue;
+        return;
       }
       last = { path: entry.path, entries: [entry], gitlink: entry.mode === FileMode.GITLINK };
       groups.push(last);
-    }
+    };
+    // a list in memory is read without a promise per entry
+    if (list) for (const entry of list) take(entry);
+    else for await (const entry of entries) take(entry);
     return groups;
   }
 

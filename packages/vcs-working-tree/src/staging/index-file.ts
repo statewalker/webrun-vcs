@@ -47,6 +47,7 @@ import {
 import {
   encodeIndexFileBytes,
   INDEX_VERSION_2,
+  type IndexEncoding,
   type IndexExtension,
   type IndexVersion,
   parseIndexFile,
@@ -141,6 +142,10 @@ export interface IndexWriteOptions {
    * replace whatever is there.
    */
   expectedChecksum?: string | null;
+  /** Entries as encoded before (an index read or written): their bytes are copied */
+  source?: IndexEncoding;
+  /** Called with the entries as encoded in the index written */
+  onEncoding?: (encoding: IndexEncoding) => void;
 }
 
 const RETRY_DELAY_MS = 20;
@@ -167,11 +172,13 @@ export async function writeIndexFile(
   options: IndexWriteOptions = {},
 ): Promise<string> {
   // validates every path and object id now, before the lock exists
-  const { bytes: content, checksum } = await encodeIndexFileBytes(
-    entries,
-    options.version ?? INDEX_VERSION_2,
-    options.extensions,
-  );
+  const {
+    bytes: content,
+    checksum,
+    encoding,
+  } = await encodeIndexFileBytes(entries, options.version ?? INDEX_VERSION_2, options.extensions, {
+    ...(options.source ? { source: options.source } : {}),
+  });
   // the lock is created holding the new index: one exclusive create, then one rename
   const lockPath = `${indexPath}.lock`;
   const atomic = atomicFilesOver(files, "");
@@ -190,6 +197,7 @@ export async function writeIndexFile(
     await atomic.remove(lockPath).catch(() => {});
     throw error;
   }
+  if (encoding) options.onEncoding?.(encoding);
   return bytesToHex(checksum);
 }
 
@@ -202,6 +210,8 @@ export async function writeIndexFile(
  */
 export class IndexFile {
   version: IndexVersion = INDEX_VERSION_2;
+  /** The entries as encoded in the index last read or written: a write copies their bytes */
+  private encoding: IndexEncoding | undefined;
   private extensions: IndexExtension[] = [];
   /**
    * The entries read or written, when an extension depends on them (entries are never
@@ -253,6 +263,7 @@ export class IndexFile {
     this.extensions = other.extensions;
     this.entriesKept = other.entriesKept;
     this.refused = other.refused;
+    this.encoding = other.encoding;
   }
 
   /**
@@ -270,6 +281,7 @@ export class IndexFile {
     this.pendingUntrackedEntries = undefined;
     const stats = await this.files.stats(this.path);
     if (!stats) {
+      this.encoding = undefined;
       this.extensions = [];
       this.entriesKept = undefined;
       this.refused = undefined;
@@ -277,7 +289,9 @@ export class IndexFile {
       return undefined;
     }
     const data = await readFile(this.files, this.path);
-    const parsed = await parseIndexFile(data);
+    // the bytes are ours alone: the entries keep them as their encoding for the next write
+    const parsed = await parseIndexFile(data, { keepEncoding: true });
+    this.encoding = parsed.encoding;
     try {
       assertWritableIndexExtensions(parsed.extensionData);
       this.refused = undefined;
@@ -447,12 +461,18 @@ export class IndexFile {
   async write(entries: readonly StagingEntry[]): Promise<void> {
     if (this.refused) throw this.refused;
     const prepared = this.prepareWrite(entries);
+    let encoding: IndexEncoding | undefined;
     this.checksum = await writeIndexFile(this.files, this.path, entries, {
       version: this.version,
       extensions: prepared.extensions,
       lockTimeoutMs: this.options.lockTimeoutMs,
       expectedChecksum: this.checksum,
+      ...(this.encoding ? { source: this.encoding } : {}),
+      onEncoding: (written) => {
+        encoding = written;
+      },
     });
+    this.encoding = encoding;
     this.wrote(entries, prepared.extensions);
   }
 
@@ -483,7 +503,12 @@ export class IndexFile {
     let state: "held" | "done" = "held";
     // what was written into the lock: applied to this instance once it is committed
     let pending:
-      | { entries: readonly StagingEntry[]; extensions: IndexExtension[]; checksum: string }
+      | {
+          entries: readonly StagingEntry[];
+          extensions: IndexExtension[];
+          checksum: string;
+          encoding: IndexEncoding | undefined;
+        }
       | undefined;
     const release = async () => {
       state = "done";
@@ -503,16 +528,18 @@ export class IndexFile {
       write: async (entries) => {
         if (state !== "held") throw new Error(`'${lockPath}' is no longer held`);
         const prepared = this.prepareWrite(entries);
-        const { bytes, checksum } = await encodeIndexFileBytes(
+        const { bytes, checksum, encoding } = await encodeIndexFileBytes(
           entries,
           this.version,
           prepared.extensions,
+          this.encoding ? { source: this.encoding } : {},
         );
         await atomic.write(lockPath, bytes);
         pending = {
           entries: entries.slice(),
           extensions: prepared.extensions,
           checksum: bytesToHex(checksum),
+          encoding,
         };
       },
       commit: async () => {
@@ -530,6 +557,7 @@ export class IndexFile {
         }
         state = "done";
         this.checksum = pending.checksum;
+        this.encoding = pending.encoding;
         this.wrote(pending.entries, pending.extensions);
       },
       rollback: async () => {

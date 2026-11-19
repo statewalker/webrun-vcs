@@ -15,6 +15,7 @@ import type {
 } from "@statewalker/vcs-working-tree";
 import {
   clearSkipWorktreeFlags,
+  EntryIdentitySet,
   type GitStagingOptions,
   INDEX_VERSION_2,
   IndexFile,
@@ -52,7 +53,7 @@ export class FileStagingStore implements Staging {
   private updateTime = 0;
   private racyCheck?: RacyCheck;
   /** The entries as last read or written (others were set in this session: up to date) */
-  private asRead = new Set<StagingEntry>();
+  private asRead = new EntryIdentitySet();
   /** Whether the entries or extensions changed since they were last read or written */
   private unwritten = false;
   /** Skip-worktree flags cleared when the index was read, not yet in the index file */
@@ -297,7 +298,86 @@ export class FileStagingStore implements Staging {
     verifyTreePaths(stage0);
     // the directories the cache-tree has valid keep their trees, as git's write-tree
     // (`cache_tree_update`): a tree primed by a reset keeps its stored modes (100664)
-    return this.buildTreeRecursive(trees, stage0, "", this.getCacheTree());
+    return this.buildTreeRange(trees, stage0, 0, stage0.length, 0, this.getCacheTree());
+  }
+
+  /**
+   * The tree of `entries[start, end)`, the entries below a directory whose path with its
+   * slash is `prefixLength` characters long (sorted, so each subdirectory's entries are next
+   * to each other). A valid cache-tree node counting a subdirectory's entries is skipped
+   * over in one step, as git's `update_one` uses `entry_count`, so a write is proportional
+   * to the directories changed, not to the index. Entries out of order are grouped by
+   * {@link buildTreeRecursive}.
+   */
+  private async buildTreeRange(
+    trees: Trees,
+    entries: StagingEntry[],
+    start: number,
+    end: number,
+    prefixLength: number,
+    cached: CacheTree | undefined,
+  ): Promise<ObjectId> {
+    // a valid node stands for these entries only when it counts them and its tree is stored
+    // (git's update_one: `it->entry_count >= 0 && has_object(it->oid)`); else computed
+    if (
+      cached &&
+      cached.entryCount >= 0 &&
+      cached.id &&
+      cached.entryCount === end - start &&
+      (await trees.has(cached.id))
+    ) {
+      return cached.id;
+    }
+    const treeEntries: TreeEntry[] = [];
+    const subdirs: Array<{ name: string; from: number; to: number }> = [];
+    let names: Set<string> | undefined;
+    let i = start;
+    while (i < end) {
+      const entry = entries[i] as StagingEntry;
+      const path = entry.path;
+      const slash = path.indexOf("/", prefixLength);
+      if (slash < 0) {
+        treeEntries.push({ name: path.slice(prefixLength), mode: entry.mode, id: entry.objectId });
+        i++;
+        continue;
+      }
+      const name = path.slice(prefixLength, slash);
+      names ??= new Set();
+      if (names.has(name)) {
+        // not in order: grouped by name instead
+        const prefix = path.slice(0, prefixLength > 0 ? prefixLength - 1 : 0);
+        return this.buildTreeRecursive(trees, entries.slice(start, end), prefix, cached);
+      }
+      names.add(name);
+      const dir = path.slice(0, slash + 1);
+      const count = cached?.subtrees.find((s) => s.name === name)?.tree.entryCount ?? -1;
+      let j: number;
+      if (
+        count > 0 &&
+        i + count <= end &&
+        (entries[i + count - 1] as StagingEntry).path.startsWith(dir) &&
+        (i + count === end || !(entries[i + count] as StagingEntry).path.startsWith(dir))
+      ) {
+        j = i + count;
+      } else {
+        j = i + 1;
+        while (j < end && (entries[j] as StagingEntry).path.startsWith(dir)) j++;
+      }
+      subdirs.push({ name, from: i, to: j });
+      i = j;
+    }
+    for (const { name, from, to } of subdirs) {
+      const subtreeId = await this.buildTreeRange(
+        trees,
+        entries,
+        from,
+        to,
+        prefixLength + name.length + 1,
+        cached?.subtrees.find((s) => s.name === name)?.tree,
+      );
+      treeEntries.push({ name, mode: FileMode.TREE, id: subtreeId });
+    }
+    return trees.store(treeEntries);
   }
 
   private async buildTreeRecursive(
@@ -419,7 +499,7 @@ export class FileStagingStore implements Staging {
       return;
     }
     this._entries = read.entries;
-    this.asRead = new Set(this._entries);
+    this.asRead.reset(this._entries);
     this.version = this.indexFile.version;
     this.updateTime = read.lastModified;
   }
@@ -436,7 +516,7 @@ export class FileStagingStore implements Staging {
     await this.indexFile.write(this._entries);
     this.unwritten = false;
     this.skipWorktreeCleared = new Set();
-    this.asRead = new Set(this._entries);
+    this.asRead.reset(this._entries);
     this.updateTime = await this.indexMtime();
   }
 
@@ -466,7 +546,7 @@ export class FileStagingStore implements Staging {
         // the index now holds what was written (make no edits between write and commit)
         this.unwritten = false;
         this.skipWorktreeCleared = new Set();
-        this.asRead = new Set(written);
+        this.asRead.reset(written);
         this.updateTime = await this.indexMtime();
       },
       rollback: () => lock.rollback(),
@@ -477,7 +557,7 @@ export class FileStagingStore implements Staging {
     const saved: SavedFileStagingState = {
       staging: this,
       entries: this._entries.slice(),
-      asRead: new Set(this.asRead),
+      asRead: this.asRead.copy(),
       unwritten: this.unwritten,
       skipWorktreeCleared: new Set(this.skipWorktreeCleared),
       updateTime: this.updateTime,
@@ -493,7 +573,7 @@ export class FileStagingStore implements Staging {
       throw new Error("restoreState: the state was saved by another staging");
     }
     this._entries = saved.entries.slice();
-    this.asRead = new Set(saved.asRead);
+    this.asRead = saved.asRead.copy();
     this.unwritten = saved.unwritten;
     this.skipWorktreeCleared = new Set(saved.skipWorktreeCleared);
     this.updateTime = saved.updateTime;
@@ -652,7 +732,7 @@ export class FileStagingStore implements Staging {
 /** What `FileStagingStore.saveState` keeps. */
 interface SavedFileStagingState extends StagingState {
   readonly entries: readonly StagingEntry[];
-  readonly asRead: ReadonlySet<StagingEntry>;
+  readonly asRead: EntryIdentitySet;
   readonly unwritten: boolean;
   readonly skipWorktreeCleared: ReadonlySet<string>;
   readonly updateTime: number;

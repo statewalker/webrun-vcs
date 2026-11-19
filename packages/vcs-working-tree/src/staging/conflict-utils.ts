@@ -10,6 +10,7 @@
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { Staging } from "./staging.js";
 import { ResolveStagingConflict } from "./staging-edits.js";
 import type { MergeStageValue, StagingEntry } from "./types.js";
@@ -517,6 +518,63 @@ export function countConflictMarkers(content: string): number {
  * @throws Error naming the first file/directory clash
  */
 export function verifyTreePaths(entries: readonly { path: string }[]): void {
+  // in git's order (as an index keeps them) a path given twice is its neighbour, and each
+  // directory is looked up once, by the entry that opens it (the directories it shares with
+  // the entry before it were looked up by an earlier one); an unsorted list checks all
+  const n = entries.length;
+  let previous = "";
+  // the first clash, thrown once no path given twice is found (those are reported first)
+  let clash: string | undefined;
+  for (let i = 0; i < n; i++) {
+    const path = (entries[i] as { path: string }).path;
+    // the length the path shares with the previous one, and that it sorts after it
+    const m = Math.min(previous.length, path.length);
+    let common = 0;
+    while (common < m && previous.charCodeAt(common) === path.charCodeAt(common)) common++;
+    if (i > 0) {
+      if (common === path.length && common === previous.length) {
+        throw new Error(`You have ${path} twice`);
+      }
+      const x = previous.charCodeAt(common);
+      const y = path.charCodeAt(common);
+      const ordered =
+        common === previous.length ||
+        (common < path.length &&
+          ((x & 0xf800) !== 0xd800 && (y & 0xf800) !== 0xd800
+            ? x < y
+            : compareGitPaths(previous, path) < 0));
+      if (!ordered) {
+        verifyUnsortedTreePaths(entries);
+        return;
+      }
+    }
+    for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
+      // a directory of the previous entry too (they share the slash after it)
+      if (at < common) continue;
+      if (clash === undefined) {
+        const dir = path.slice(0, at);
+        if (hasPath(entries, dir, i)) clash = `You have both ${dir} and ${path}`;
+      }
+    }
+    previous = path;
+  }
+  if (clash !== undefined) throw new Error(clash);
+}
+
+/** Whether `entries[0, end)`, sorted in git's order, holds `path`. */
+function hasPath(entries: readonly { path: string }[], path: string, end: number): boolean {
+  let lo = 0;
+  let hi = end;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (compareGitPaths((entries[mid] as { path: string }).path, path) < 0) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < end && (entries[lo] as { path: string }).path === path;
+}
+
+/** {@link verifyTreePaths} of entries in any order. */
+function verifyUnsortedTreePaths(entries: readonly { path: string }[]): void {
   const files = new Set<string>();
   for (const entry of entries) {
     if (files.has(entry.path)) throw new Error(`You have ${entry.path} twice`);
