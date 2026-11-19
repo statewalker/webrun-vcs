@@ -13,7 +13,7 @@
 //
 //   node scripts/tested.mjs status            which packages need testing, and why
 //   node scripts/tested.mjs run [--all]       test those packages (locally: caches the passes)
-//        [--concurrency=4] [--no-bail]
+//        [--no-bail]
 //   node scripts/tested.mjs run --record      CI: also write .tested/<dir> for each pass
 //   node scripts/tested.mjs record            CI, after a green run: write the current hashes
 //   node scripts/tested.mjs hash [dir]        print the hashes
@@ -21,7 +21,7 @@
 // --source=worktree (default outside CI) hashes the working tree, uncommitted changes included;
 // --source=head (default when CI is set) hashes the HEAD commit.
 
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
@@ -37,6 +37,7 @@ import { dirname, join, posix } from "node:path";
 
 const root = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
 const RECORDS = join(root, ".tested");
+const DEFAULT_COMMAND = "pnpm run test";
 const LOCAL = join(root, "node_modules/.cache/tested");
 
 const args = process.argv.slice(2);
@@ -189,7 +190,7 @@ function computeHashes() {
     if (!manifestText) continue;
     const manifest = JSON.parse(manifestText);
     const custom = config.commands[dir] ?? config.commands[manifest.name];
-    const command = custom ?? (manifest.scripts?.test ? "pnpm run test" : null);
+    const command = custom ?? (manifest.scripts?.test ? DEFAULT_COMMAND : null);
     const links = [];
     const runtimeLinks = [];
     const external = [];
@@ -326,42 +327,46 @@ if (command === "hash") {
     console.log("nothing to test");
     process.exit(0);
   }
-  const concurrency = Number(option("concurrency", "4"));
-  console.log(
-    `testing ${todo.length} package(s), ${concurrency} at a time: ${todo.map((p) => p.dir).join(", ")}`,
-  );
-  const failed = [];
-  const queue = [...todo];
-  const testOne = (pkg) =>
-    new Promise((resolve) => {
-      const child = spawn(pkg.command, {
-        cwd: join(root, pkg.dir),
-        shell: true,
-        env: { ...process.env, FORCE_COLOR: "1" },
-      });
-      const output = [];
-      child.stdout.on("data", (c) => output.push(c));
-      child.stderr.on("data", (c) => output.push(c));
-      child.on("close", (code) => {
-        console.log(`::group::${code === 0 ? "pass" : "FAIL"}  ${pkg.dir}`);
-        process.stdout.write(Buffer.concat(output));
-        console.log("::endgroup::");
-        if (code === 0) {
-          writeRecord(LOCAL, pkg.dir, pkg.hash);
-          if (flag("record")) writeRecord(RECORDS, pkg.dir, pkg.hash);
-        } else {
-          failed.push(pkg.dir);
-          if (!flag("no-bail")) queue.length = 0;
-        }
-        resolve();
-      });
-    });
-  const worker = async () => {
-    while (queue.length) await testOne(queue.shift());
+  console.log(`testing ${todo.length} package(s): ${todo.map((p) => p.dir).join(", ")}`);
+  const passed = (pkg) => {
+    writeRecord(LOCAL, pkg.dir, pkg.hash);
+    if (flag("record")) writeRecord(RECORDS, pkg.dir, pkg.hash);
   };
-  await Promise.all(Array.from({ length: concurrency }, worker));
+  const failed = [];
+  // Packages with the default command run through `pnpm -r`, so its ordering and concurrency
+  // apply as for `pnpm test`; its summary file tells which passed.
+  const viaPnpm = todo.filter((pkg) => pkg.command === DEFAULT_COMMAND);
+  if (viaPnpm.length) {
+    const summary = join(root, "pnpm-exec-summary.json");
+    rmSync(summary, { force: true });
+    spawnSync(
+      "pnpm",
+      [
+        "-r",
+        "--report-summary",
+        ...(flag("no-bail") ? ["--no-bail"] : []),
+        ...viaPnpm.flatMap((pkg) => ["--filter", `./${pkg.dir}`]),
+        "run",
+        "test",
+      ],
+      { cwd: root, stdio: "inherit" },
+    );
+    const status = readJson(summary, { executionStatus: {} }).executionStatus;
+    rmSync(summary, { force: true });
+    for (const pkg of viaPnpm) {
+      if (status[join(root, pkg.dir)]?.status === "passed") passed(pkg);
+      else failed.push(pkg.dir);
+    }
+  }
+  for (const pkg of todo.filter((p) => p.command !== DEFAULT_COMMAND)) {
+    if (failed.length && !flag("no-bail")) break;
+    console.log(`\n> ${pkg.dir}: ${pkg.command}`);
+    const run = spawnSync(pkg.command, { cwd: join(root, pkg.dir), stdio: "inherit", shell: true });
+    if (run.status === 0) passed(pkg);
+    else failed.push(pkg.dir);
+  }
   if (failed.length) {
-    console.error(`\nfailed: ${failed.join(", ")}`);
+    console.error(`\nfailed or not run: ${failed.join(", ")}`);
     process.exit(1);
   }
   console.log(`\nall ${todo.length} package(s) passed`);
