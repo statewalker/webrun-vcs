@@ -175,8 +175,12 @@ export class RevertCommand extends GitCommand<RevertResult> {
     await this.readCurrentIndex();
     const worktree = this.worktreeAccess;
     const run = () => this.run();
-    return toResult(await (worktree?.batch ? worktree.batch(run) : run()));
+    const result = toResult(await (worktree?.batch ? worktree.batch(run) : run()));
+    return this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result;
   }
+
+  /** What the sparse checkout printed while the result was written. */
+  private readonly sparseWarnings: string[] = [];
 
   private async run(): Promise<PickOutcome> {
     const sequencer = new PickSequencer(
@@ -188,6 +192,7 @@ export class RevertCommand extends GitCommand<RevertResult> {
         trees: this.trees,
         commits: this.commits,
         refs: this.refsStore,
+        sparseWarnings: this.sparseWarnings,
         state: new OperationState(this.workingCopy.checkout, this.refsStore),
         resolve: (name) => this.resolveRef(name),
       },

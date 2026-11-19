@@ -36,4 +36,10 @@ export interface CherryPickResult {
   readonly message?: string;
   /** What is printed on stdout: merge-ort's `Auto-merging f`, `CONFLICT (...)` lines */
   readonly output?: string[];
+  /**
+   * What the sparse checkout printed on stderr while the result was written, line by line:
+   * the patterns' warnings, git's "The following paths are not up to date and were left
+   * despite sparse patterns:" block. Absent when there was nothing to say.
+   */
+  readonly warnings?: string[];
 }

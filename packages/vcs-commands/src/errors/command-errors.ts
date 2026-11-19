@@ -56,6 +56,24 @@ export class ResetRefusedError extends GitApiError {
 }
 
 /**
+ * Thrown by `rm` when a path matched only entries outside the sparse checkout (git's
+ * `advise_on_updating_sparse_paths`, exit status 1): its message is git's advice; the other
+ * paths were removed all the same (`result`), unless nothing else matched.
+ */
+export class RmFailedError<R = unknown> extends GitApiError {
+  constructor(
+    message: string,
+    /** The patterns that matched only entries outside the sparse checkout */
+    readonly sparsePaths: readonly string[],
+    /** What was removed, when the index was written all the same */
+    readonly result?: R,
+  ) {
+    super(message);
+    this.name = "RmFailedError";
+  }
+}
+
+/**
  * Thrown when a feature is not yet implemented.
  */
 export class NotImplementedError extends GitApiError {

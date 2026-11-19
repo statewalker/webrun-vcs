@@ -34,6 +34,7 @@ import {
 import type { CommandRefs, CommandTrees } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import type { OrtConflict } from "./ort-merge.js";
+import { finishSparseCheckoutRun, startSparseCheckoutRun } from "./sparse-checkout-support.js";
 import {
   planFlatRestore,
   planTreeRestore,
@@ -685,6 +686,11 @@ export interface MergeWriteContext {
   staging: Staging;
   blobs: Blobs;
   trees: CommandTrees;
+  /**
+   * Collects what the sparse checkout prints on stderr while the write applies its patterns
+   * (git's `warning:` lines for files left despite the patterns), one entry per line.
+   */
+  sparseWarnings?: string[];
 }
 
 /** Why a merge's write was refused: git's message, and the paths it lists. */
@@ -714,20 +720,38 @@ export async function switchTrees(
   ctx: MergeWriteContext,
   head: Map<string, CheckedEntry>,
   target: Map<string, CheckedEntry>,
-  options: {
-    /** Names the operation in git's refusal messages */
-    action: "merge" | "checkout";
-    /** Names the operation in restore failures */
-    operation: string;
-    /** The conflicts to stage */
-    conflicts?: Iterable<OrtConflict>;
-    /**
-     * The stored tree the switch leaves in the index (`target` whole, or the tree `target`
-     * changes HEAD to): planned from (saves storing it again), and written as the index's
-     * cache-tree, as unpack-trees does
-     */
-    targetTree?: ObjectId;
-  },
+  options: SwitchTreesOptions,
+): Promise<MergeRefusal | undefined> {
+  // in a sparse checkout, unpack-trees' apply_sparse_checkout over the result
+  const sparse = await startSparseCheckoutRun(ctx);
+  const refused = await switchTreesUnsparse(ctx, head, target, options);
+  if (refused) return refused;
+  const text = await finishSparseCheckoutRun(ctx, sparse, { porcelain: true });
+  if (text) ctx.sparseWarnings?.push(...text.replace(/\n$/, "").split("\n"));
+  return undefined;
+}
+
+/** Options of {@link switchTrees}. */
+export interface SwitchTreesOptions {
+  /** Names the operation in git's refusal messages */
+  action: "merge" | "checkout";
+  /** Names the operation in restore failures */
+  operation: string;
+  /** The conflicts to stage */
+  conflicts?: Iterable<OrtConflict>;
+  /**
+   * The stored tree the switch leaves in the index (`target` whole, or the tree `target`
+   * changes HEAD to): planned from (saves storing it again), and written as the index's
+   * cache-tree, as unpack-trees does
+   */
+  targetTree?: ObjectId;
+}
+
+async function switchTreesUnsparse(
+  ctx: MergeWriteContext,
+  head: Map<string, CheckedEntry>,
+  target: Map<string, CheckedEntry>,
+  options: SwitchTreesOptions,
 ): Promise<MergeRefusal | undefined> {
   const { index, unmerged } = await readIndex(ctx.staging);
   const worktree = ctx.worktree;

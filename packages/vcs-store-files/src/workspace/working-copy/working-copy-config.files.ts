@@ -171,6 +171,11 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   private lines: ConfigLine[] = [];
   /** Keys whose values differ from the parsed file. */
   private readonly dirtyKeys: Set<string> = new Set();
+  /**
+   * Keys as `set`/`add` spelled them: a line written for one names the variable as given
+   * (`sparseCheckout`), as git's `write_pair` does.
+   */
+  private readonly spelling: Map<string, string> = new Map();
   /** Sections removed by {@link unsetSection}. */
   private readonly removedSections: Set<string> = new Set();
   /** Keys mirrored as own properties (for the WorkingCopyConfig index signature). */
@@ -513,6 +518,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   set(key: string, value: unknown): void {
     const canonical = requireCanonicalKey(key);
     requireStorableValue(key, value);
+    this.spelling.set(canonical, key);
     this.values.set(canonical, [value]);
     this.dirtyKeys.add(canonical);
     this.mirror(canonical);
@@ -528,6 +534,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   add(key: string, value: unknown): void {
     const canonical = requireCanonicalKey(key);
     requireStorableValue(key, value);
+    this.spelling.set(canonical, key);
     const values = this.values.get(canonical);
     if (values) values.push(value);
     else this.values.set(canonical, [value]);
@@ -934,7 +941,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const emitValues = (key: string): void => {
       if (emittedKeys.has(key)) return;
       emittedKeys.add(key);
-      for (const value of this.values.get(key) ?? []) out.push(formatEntry(key, value));
+      const name = this.spelling.get(key) ?? key;
+      for (const value of this.values.get(key) ?? []) out.push(formatEntry(name, value));
     };
 
     this.lines.forEach((line, index) => {

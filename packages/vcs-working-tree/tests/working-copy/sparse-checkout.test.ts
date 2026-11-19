@@ -5,6 +5,8 @@ import { GitStaging } from "../../src/staging/index.js";
 import {
   clearSkipWorktreeFromPresentFiles,
   parseSparseCheckoutPatterns,
+  sparsePatternsFromCone,
+  sparsePatternsFromLines,
 } from "../../src/working-copy/index.js";
 import type { WorktreeEntry } from "../../src/worktree/index.js";
 
@@ -40,6 +42,44 @@ describe("parseSparseCheckoutPatterns", () => {
 
   it("without a sparse-checkout file every path is in", () => {
     expect(parseSparseCheckoutPatterns(undefined, true).includes("any/path")).toBe(true);
+  });
+
+  it("warns as git does about patterns cone mode cannot read (add_pattern_to_hashsets)", () => {
+    const warnings = (content: string) => parseSparseCheckoutPatterns(content, true).warnings;
+    expect(warnings("/*\n!/*/\n/k/\n*.md\n")).toEqual([
+      "unrecognized pattern: '*.md'",
+      "disabling cone pattern matching",
+    ]);
+    expect(warnings("/*\n!/*/\n!/k/*/\n")).toEqual([
+      "unrecognized negative pattern: '/k/*'",
+      "disabling cone pattern matching",
+    ]);
+    expect(warnings("/*\n!/*/\n/k/\n!/k/\n")).toEqual([
+      "unrecognized negative pattern: '/k'",
+      "disabling cone pattern matching",
+    ]);
+    expect(warnings("/s/\n!/s/*/\n/s/\n")).toEqual([
+      "your sparse-checkout file may have issues: pattern '/s' is repeated",
+      "disabling cone pattern matching",
+    ]);
+    // non-cone mode reads every pattern silently
+    expect(parseSparseCheckoutPatterns("*.md\n", false).warnings).toEqual([]);
+  });
+
+  it("keeps the cone's hashsets and the lines as read", () => {
+    const sparse = parseSparseCheckoutPatterns("/*\n!/*/\n/p/\n!/p/*/\n/p/q/\n# c\n", true);
+    expect(sparse.coneSets).toEqual({ full: false, recursive: ["/p/q"], parent: ["/p"] });
+    expect(sparse.lines).toEqual(["/*", "!/*/", "/p/", "!/p/*/", "/p/q/"]);
+  });
+
+  it("builds a matcher from hashsets and from patterns given one by one", () => {
+    const cone = sparsePatternsFromCone({ full: false, recursive: ["/k"], parent: [] });
+    expect(cone.includes("k/a")).toBe(true);
+    expect(cone.includes("top")).toBe(true);
+    expect(cone.includes("s/b")).toBe(false);
+    const literal = sparsePatternsFromLines(["/k/", "!/k/x"], false);
+    expect(literal.includes("k/a")).toBe(true);
+    expect(literal.includes("k/x")).toBe(false);
   });
 });
 

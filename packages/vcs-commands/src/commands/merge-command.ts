@@ -345,8 +345,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
     await this.readCurrentIndex();
     const worktree = this.worktreeAccess;
     const run = () => this.run(worktree);
-    return worktree?.batch ? worktree.batch(run) : run();
+    const result = await (worktree?.batch ? worktree.batch(run) : run());
+    return this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result;
   }
+
+  /** What the sparse checkout printed while the result was written (see MergeResult.warnings). */
+  private readonly sparseWarnings: string[] = [];
 
   private async run(worktree: Worktree | undefined): Promise<MergeResult> {
     const state = new OperationState(this.workingCopy.checkout, this.refsStore);
@@ -1228,6 +1232,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
       trees: this.trees,
       commits: this.commits,
       refs: this.refsStore,
+      sparseWarnings: this.sparseWarnings,
     };
   }
 

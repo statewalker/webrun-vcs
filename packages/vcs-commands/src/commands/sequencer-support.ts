@@ -30,6 +30,7 @@ import {
   rewriteIndex,
 } from "./merge-support.js";
 import { stripspace } from "./message-cleanup.js";
+import { finishSparseCheckoutRun, startSparseCheckoutRun } from "./sparse-checkout-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
 import { StashCreateCommand } from "./stash-create-command.js";
 import { STASH_REF } from "./stash-list-command.js";
@@ -69,6 +70,25 @@ export async function resetMerge(
   targetId: ObjectId,
   label: string,
   options: { hard?: boolean } = {},
+): Promise<MergeRefusal | undefined> {
+  // in a sparse checkout, unpack-trees' apply_sparse_checkout over the result; reset prints
+  // its sparse warnings as plain errors (no porcelain messages)
+  const sparse = await startSparseCheckoutRun(ctx);
+  const refused = await resetMergeUnsparse(ctx, targetId, label, options);
+  if (refused) return refused;
+  const text = await finishSparseCheckoutRun(ctx, sparse, {
+    porcelain: false,
+    reset: options.hard === true,
+  });
+  if (text) ctx.sparseWarnings?.push(...text.replace(/\n$/, "").split("\n"));
+  return undefined;
+}
+
+async function resetMergeUnsparse(
+  ctx: SequencerContext,
+  targetId: ObjectId,
+  label: string,
+  options: { hard?: boolean },
 ): Promise<MergeRefusal | undefined> {
   const checkUptodate = !options.hard;
   const targetTree = await ctx.commits.getTree(targetId);
@@ -279,6 +299,22 @@ export async function resetUnmergedToHead(
  * moved. The caller refuses an index with unmerged entries first.
  */
 export async function resetKeep(
+  ctx: SequencerContext,
+  headId: ObjectId,
+  targetId: ObjectId,
+  label: string,
+): Promise<MergeRefusal | undefined> {
+  // in a sparse checkout, unpack-trees' apply_sparse_checkout over the result; reset prints
+  // its sparse warnings as plain errors (no porcelain messages)
+  const sparse = await startSparseCheckoutRun(ctx);
+  const refused = await resetKeepUnsparse(ctx, headId, targetId, label);
+  if (refused) return refused;
+  const text = await finishSparseCheckoutRun(ctx, sparse, { porcelain: false });
+  if (text) ctx.sparseWarnings?.push(...text.replace(/\n$/, "").split("\n"));
+  return undefined;
+}
+
+async function resetKeepUnsparse(
   ctx: SequencerContext,
   headId: ObjectId,
   targetId: ObjectId,

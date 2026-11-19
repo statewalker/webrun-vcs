@@ -18,6 +18,7 @@ import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { flatTree, OperationState } from "./merge-support.js";
 import { reflogMessages, updateHead } from "./reflog-messages.js";
 import { removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
+import { finishSparseCheckoutRun, startSparseCheckoutRun } from "./sparse-checkout-support.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import { flaggedEntryDiffers } from "./worktree-overwrite-checks.js";
 
@@ -102,6 +103,18 @@ export class ResetCommand extends GitCommand<Ref> {
   }
 
   /**
+   * What the reset printed on stderr while applying the sparse checkout's patterns, line by
+   * line: the patterns' warnings, and git's `error: Path '<p>' not uptodate; will not remove
+   * from working tree.` for a changed file left outside them (`--merge`, `--keep`). Read after
+   * {@link call}.
+   */
+  getWarnings(): string[] {
+    return [...this.warnings];
+  }
+
+  private readonly warnings: string[] = [];
+
+  /**
    * Add a path to reset.
    *
    * When paths are specified, only those paths are reset in the staging area.
@@ -166,6 +179,7 @@ export class ResetCommand extends GitCommand<Ref> {
         trees: this.trees,
         commits: this.commits,
         refs: this.refsStore,
+        sparseWarnings: this.warnings,
       };
       const refused =
         this.mode === ResetMode.MERGE
@@ -199,6 +213,16 @@ export class ResetCommand extends GitCommand<Ref> {
       }
     }
 
+    // a hard reset in a sparse checkout: unpack-trees applies the patterns to the result
+    const sparse =
+      this.mode === ResetMode.HARD
+        ? await startSparseCheckoutRun({
+            workingCopy: this.workingCopy,
+            worktree: this.worktreeAccess,
+            staging: this.staging,
+          })
+        : undefined;
+
     // Move HEAD/branch, the old HEAD kept in ORIG_HEAD (git's reset_refs)
     if (headId && state.supported) await state.setRef("ORIG_HEAD", headId);
     // git's set_reflog_message: "reset: moving to <rev>", or "<action>: updating HEAD"
@@ -215,6 +239,17 @@ export class ResetCommand extends GitCommand<Ref> {
     // Reset working tree (for HARD) - this DESTROYS uncommitted changes
     if (this.mode === ResetMode.HARD) {
       await this.resetWorkingTree(targetId, trackedBefore ?? new Set(), flagged?.keptOut);
+      const text = await finishSparseCheckoutRun(
+        {
+          workingCopy: this.workingCopy,
+          worktree: this.worktreeAccess,
+          staging: this.staging,
+          blobs: this.blobs,
+        },
+        sparse,
+        { reset: true, porcelain: false },
+      );
+      if (text) this.warnings.push(...text.replace(/\n$/, "").split("\n"));
     }
 
     // git's remove_branch_state: a merge, cherry-pick or revert in progress is forgotten

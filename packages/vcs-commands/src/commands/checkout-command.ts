@@ -78,6 +78,7 @@ import { OperationState, updateIndexCacheTree } from "./merge-support.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { checkFlaggedEntries, restoreWorktreeHard } from "./reset-command.js";
 import { removeBranchState } from "./sequencer-support.js";
+import { finishSparseCheckoutRun, startSparseCheckoutRun } from "./sparse-checkout-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
 import { StashCreateCommand } from "./stash-create-command.js";
 import { STASH_REF } from "./stash-list-command.js";
@@ -164,6 +165,13 @@ export interface CheckoutResult {
    * untracked files the switch would overwrite, or an index with unmerged entries.
    */
   readonly message?: string;
+
+  /**
+   * What a branch switch printed on stderr while applying the sparse checkout's patterns,
+   * line by line (the patterns' warnings, git's "The following paths are not up to date and
+   * were left despite sparse patterns:" block); absent when there was nothing to say.
+   */
+  readonly warnings?: string[];
 }
 
 /** A tree or index entry, as the two-way merge compares them (index entries with stat). */
@@ -805,6 +813,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
 
     // Get target tree for conflict detection and checkout
     const targetTreeId = targetId ? await this.commits.getTree(targetId) : undefined;
+    // in a sparse checkout, unpack-trees applies the patterns to the switch's result
+    const sparse = await startSparseCheckoutRun({
+      workingCopy: this.workingCopy,
+      worktree: this.worktreeAccess,
+      staging: this.staging,
+    });
 
     // git's two-way merge (unpack-trees `twoway_merge`, checkout without -f): a path HEAD
     // and the target agree on keeps its index entry and worktree file as they are (local
@@ -1082,6 +1096,19 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       await this.writeSwitchedIndex();
     }
 
+    const sparseText = keepAll
+      ? ""
+      : await finishSparseCheckoutRun(
+          {
+            workingCopy: this.workingCopy,
+            worktree: this.worktreeAccess,
+            staging: this.staging,
+            blobs: this.blobs,
+          },
+          sparse,
+          { reset: this.force, porcelain: true },
+        );
+
     // HEAD's reflog line (git's update_refs_for_switch): "checkout: moving from <branch
     // left, or the detached HEAD's full id> to <the name as interpreted: `-` and @{-N}
     // expanded, the new branch's name>", read before anything moves
@@ -1135,6 +1162,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       removed,
       conflicts: [],
       ref: ref ?? null,
+      ...(sparseText ? { warnings: sparseText.replace(/\n$/, "").split("\n") } : {}),
     };
   }
 
