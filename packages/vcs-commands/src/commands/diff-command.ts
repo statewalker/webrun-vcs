@@ -53,8 +53,19 @@ import { quotePath } from "../results/quote-path.js";
 import { worktreeModeTrust } from "./core-config.js";
 import { textconvRunnerOf } from "./diff-textconv.js";
 import { matchPathspec, type PathspecItem, parsePathspecItem } from "./pathspec.js";
-import { readSubmoduleDirt } from "./status-command.js";
-import { isSubmoduleIgnoreMode, parseGitmodules } from "./submodule-config.js";
+import { readSubmoduleDirt, type SubmoduleDirt } from "./status-command.js";
+import {
+  isSubmoduleIgnoreMode,
+  parseGitmodules,
+  type SubmoduleIgnoreMode,
+} from "./submodule-config.js";
+import {
+  openSubmoduleRepository,
+  readDiffSubmoduleConfig,
+  type SubmoduleDiffFormat,
+  showSubmoduleDiffSummary,
+  submoduleHeader,
+} from "./submodule-summary.js";
 
 /** The output formats of {@link DiffCommand.callText} */
 export type DiffOutputFormat =
@@ -116,6 +127,18 @@ export interface DiffTextOptions
    */
   orderFile?: string;
   /**
+   * `--submodule=<format>`: a submodule's change as a `Subproject commit` patch (`short`),
+   * the commits between its two sides (`log`), or the diff of its content (`diff`); default
+   * `diff.submodule`, else `short`
+   */
+  submoduleFormat?: SubmoduleDiffFormat;
+  /**
+   * Whether the diff configuration of the porcelain commands is read (`git_diff_ui_config`:
+   * `diff.submodule`, its warnings and failures); default true. Plumbing (`diff-tree`) and
+   * `format-patch` (whose `git_format_config` skips `diff.submodule`) read none.
+   */
+  uiConfig?: boolean;
+  /**
    * `--textconv` / `--no-textconv`: run `diff.<driver>.textconv` on both sides of a patch
    * (default true, as `git diff`); it takes a runner registered with
    * `installTextconvRunner`, without one no textconv applies
@@ -144,6 +167,15 @@ interface Side {
   read?: () => Promise<Uint8Array>;
   /** A submodule with changes of its own in the worktree ("Subproject commit <id>-dirty") */
   dirty?: boolean;
+  /** Which changes of its own such a submodule holds (for `--submodule=log`) */
+  dirt?: SubmoduleDirt;
+  /**
+   * A worktree submodule at another commit than its index entry: git's diff-index (and
+   * diff-files) gives such a side the null id, filled from the worktree only when a patch is
+   * printed (`get_stat_data`, `diff_fill_oid_info`). The pair is reported whatever the other
+   * side holds (`show_modified`), and no exact rename pairs with it.
+   */
+  unknownId?: boolean;
 }
 
 /** An index entry, of any stage */
@@ -278,8 +310,16 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private cached = false;
   /** revs->combine_merges: a conflicted path as its combined diff (`git diff`'s default) */
   private combineMerges = true;
-  /** diffopt.flags.dirty_submodules: a submodule at another commit checked for dirt too */
-  private dirtySubmodules = true;
+  /**
+   * diffopt.flags.dirty_submodules: a submodule at another commit checked for dirt too
+   * (default: when a patch is printed, as `diff_setup_done` sets it; always for `call()`)
+   */
+  private dirtySubmodules?: boolean;
+  /** `diff.submodule` (its last value git knows), read by the text outputs */
+  private configuredSubmoduleFormat?: SubmoduleDiffFormat;
+  private readonly configWarnings: string[] = [];
+  /** {@link dirtySubmodules} for the comparison being collected */
+  private dirtyThisCall = true;
   /** The `ignore` setting of each submodule's path (see `submoduleIgnores`) */
   private submoduleIgnoreMap?: Promise<Map<string, "none" | "untracked" | "dirty" | "all">>;
   private pathFilter?: string;
@@ -287,6 +327,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private renames?: boolean;
   private renameLimit?: number;
   private textOptions: DiffTextOptions = {};
+  /** `--ignore-submodules=<when>`: overrides the submodule configuration */
+  private ignoreSubmodulesOverride?: SubmoduleIgnoreMode;
 
   /**
    * Set the old (base) tree/commit for comparison.
@@ -335,6 +377,30 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   }
 
   /**
+   * How a submodule's change is shown in the patch (`--submodule=<format>`): `short` (the
+   * default, unless `diff.submodule` says otherwise) as a `Subproject commit` patch, `log`
+   * as the commits between its two sides (`Submodule sub 1234567..89abcde:` and `  > subject`
+   * lines, git's `show_submodule_diff_summary`), `diff` as the diff of the submodule's own
+   * files, their paths under the submodule's (`show_submodule_inline_diff`).
+   */
+  setSubmoduleFormat(format: SubmoduleDiffFormat): this {
+    this.checkCallable();
+    this.textOptions = { ...this.textOptions, submoduleFormat: format };
+    return this;
+  }
+
+  /**
+   * `--ignore-submodules=<when>`: what of submodules to ignore, whatever
+   * `diff.ignoreSubmodules` and `submodule.<name>.ignore` say (`all`: their changes; `dirty`:
+   * their worktrees; `untracked`: untracked files in them; `none`: nothing).
+   */
+  setIgnoreSubmodules(mode: SubmoduleIgnoreMode): this {
+    this.checkCallable();
+    this.ignoreSubmodulesOverride = mode;
+    return this;
+  }
+
+  /**
    * Whether a submodule whose worktree is at another commit than its entry is also checked
    * for changes of its own (`Subproject commit <id>-dirty`), as git's patch output does
    * (`diff_setup_done` sets `dirty_submodules` for it). `git status -v` diffs without it:
@@ -344,6 +410,26 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.checkCallable();
     this.dirtySubmodules = dirty;
     return this;
+  }
+
+  /**
+   * What git prints on stderr reading its diff configuration, once a text output was made:
+   * `warning: Unknown value for 'diff.submodule' config variable: '<value>'` for each value
+   * of `diff.submodule` it does not know.
+   */
+  get warnings(): readonly string[] {
+    return this.configWarnings;
+  }
+
+  /**
+   * git_diff_ui_config, which `git diff` (and log, show) runs before any option is read:
+   * `diff.submodule`, its warnings, and the failure of a variable without a value.
+   */
+  private readUiConfig(): void {
+    if (this.textOptions.uiConfig === false) return;
+    const { format, warnings } = readDiffSubmoduleConfig(this.workingCopy);
+    this.configuredSubmoduleFormat = format;
+    this.configWarnings.splice(0, this.configWarnings.length, ...warnings);
   }
 
   /**
@@ -420,6 +506,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   async call(): Promise<DiffEntry[]> {
     this.checkCallable();
     this.setCallable(false);
+    this.dirtyThisCall = this.dirtySubmodules ?? true;
     return (await this.collect(this.renames ?? false)).entries;
   }
 
@@ -442,6 +529,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.setCallable(false);
     const config = this.config;
     const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
+    this.dirtyThisCall = this.dirtySubmodules ?? format === "patch";
+    this.readUiConfig();
     const collected = await this.collect(renames, format === "patch");
     const sink = new ByteSink();
     await this.writeFormats(sink, [format], collected);
@@ -471,6 +560,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.setCallable(false);
     const config = this.config;
     const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
+    this.dirtyThisCall = this.dirtySubmodules ?? formats.includes("patch");
+    this.readUiConfig();
     let followPath = follow;
     let followChange: ChangeType.RENAME | ChangeType.COPY | undefined;
     let collected: { entries: DiffEntry[]; combined: CombinedEntry[] };
@@ -613,6 +704,12 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       separator = true;
       switch (format) {
         case "patch": {
+          const submoduleFormat =
+            this.textOptions.submoduleFormat ?? this.configuredSubmoduleFormat ?? "short";
+          if (submoduleFormat !== "short") {
+            options.submodulePatch = (out, pair, o) =>
+              this.writeSubmodulePatch(out, pair, o, submoduleFormat);
+          }
           // index lines abbreviate as git does (core.abbrev, the repository's size, uniqueness)
           if (!options.fullIndex) {
             const ids = new Set<string>();
@@ -669,6 +766,57 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           else sink.text(formatShortstat(files));
         }
       }
+    }
+  }
+
+  /**
+   * builtin_diff's submodule branch: `--submodule=log` (show_submodule_diff_summary) or
+   * `--submodule=diff` (show_submodule_inline_diff) for a pair of submodules (or a submodule
+   * and nothing).
+   */
+  private async writeSubmodulePatch(
+    sink: ByteSink,
+    pair: DiffFilePair,
+    options: DiffOutputOptions,
+    format: SubmoduleDiffFormat,
+  ): Promise<void> {
+    const path = pair.old?.path ?? pair.new?.path ?? "";
+    const one = pair.old?.id ?? NULL_ID;
+    const two = pair.new?.id ?? NULL_ID;
+    const dirt = pair.new?.submoduleDirt;
+    // strbuf_add_unique_abbrev(..., DEFAULT_ABBREV): the superproject's abbreviation
+    const abbreviate = (id: ObjectId) => this.idAbbreviator().abbreviate(id);
+    const workingCopy = this.workingCopy;
+    if (format === "log") {
+      sink.text(await showSubmoduleDiffSummary({ workingCopy, path, one, two, dirt, abbreviate }));
+      return;
+    }
+    const sub = await openSubmoduleRepository(workingCopy, path);
+    const header = await submoduleHeader({ path, one, two, dirt, sub, abbreviate });
+    sink.text(header.text);
+    // a valid left and right commit (or none on that side) to diff
+    if (!(header.left || one === NULL_ID) || !(header.right || two === NULL_ID)) return;
+    if (!sub) return;
+    const failed = "(diff failed)\n";
+    // `git diff` runs in the submodule's directory: one that holds no repository of its own
+    // runs it in the superproject, which lacks the submodule's commits
+    if (!sub.populated && (await this.worktreeAccess?.getEntry(path))?.isDirectory) {
+      sink.text(failed);
+      return;
+    }
+    const inner = new DiffCommand(sub.repository)
+      .setOldTree(header.left ? one : EMPTY_TREE_ID)
+      .setSubmoduleFormat("diff")
+      .setOptions({
+        srcPrefix: `${options.srcPrefix ?? "a/"}${path}/`,
+        dstPrefix: `${options.dstPrefix ?? "b/"}${path}/`,
+      });
+    // modified content: the submodule's worktree is diffed, not its commit
+    if (!dirt?.modified) inner.setNewTree(header.right ? two : EMPTY_TREE_ID);
+    try {
+      sink.push(await inner.callBytes("patch"));
+    } catch {
+      sink.text(failed);
     }
   }
 
@@ -1042,6 +1190,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private async submoduleIgnoreOf(): Promise<
     (path: string) => "none" | "untracked" | "dirty" | "all" | undefined
   > {
+    const override = this.ignoreSubmodulesOverride;
+    if (override !== undefined) return () => override;
     const fallback = submoduleIgnoreValue(this.config.value("diff.ignoreSubmodules"));
     const own = await this.submoduleIgnores();
     return (path) => own.get(path) ?? fallback;
@@ -1109,6 +1259,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         newMode: side.mode as FileModeValue,
         ...(side.read ? { readNew: side.read } : {}),
         ...(side.dirty ? { newDirtySubmodule: true } : {}),
+        ...(side.dirt ? { newSubmoduleDirt: side.dirt } : {}),
       },
     ];
   }
@@ -1159,8 +1310,12 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           newMode: b.mode as FileModeValue,
           ...(b.read ? { readNew: b.read } : {}),
           ...(b.dirty ? { newDirtySubmodule: true } : {}),
+          ...(b.dirt ? { newSubmoduleDirt: b.dirt } : {}),
+          ...(b.unknownId ? { newIdUnknown: true } : {}),
         });
-      } else if (a && b && (a.id !== b.id || a.mode !== b.mode || b.dirty)) {
+      } else if (a && b && (a.id !== b.id || a.mode !== b.mode || b.dirty || b.unknownId)) {
+        // show_modified: a side of the null id differs from any (`M sub` even where the
+        // submodule is back at the tree's commit)
         entries.push({
           changeType: ChangeType.MODIFY,
           oldPath: path,
@@ -1171,6 +1326,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           newMode: b.mode as FileModeValue,
           ...(b.read ? { readNew: b.read } : {}),
           ...(b.dirty ? { newDirtySubmodule: true } : {}),
+          ...(b.dirt ? { newSubmoduleDirt: b.dirt } : {}),
+          ...(b.unknownId ? { newIdUnknown: true } : {}),
         });
       }
     }
@@ -1187,7 +1344,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         e.changeType === ChangeType.DELETE ||
         (copies && e.changeType === ChangeType.MODIFY && !e.unmerged),
     );
-    const destinations = entries.filter((e) => e.changeType === ChangeType.ADD);
+    // a submodule of git's null id (diff-index of a moved one) matches no source exactly,
+    // and gitlinks pair only exactly
+    const destinations = entries.filter((e) => e.changeType === ChangeType.ADD && !e.newIdUnknown);
     if (sources.length === 0 || destinations.length === 0) return;
     const byPath = new Map<string, DiffEntry>();
     for (const e of sources) byPath.set(`s:${e.oldPath}`, e);
@@ -1484,19 +1643,32 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         // a populated submodule with changes of its own: "-dirty" (untracked files count
         // only with diff.ignoreSubmodules=none, as git's default ignores them)
         let dirty = false;
+        const dirt: SubmoduleDirt = {};
         // match_stat_with_submodule: one at another commit only with dirty_submodules
         if (
           entry.mode === GITLINK &&
           ignore !== "dirty" &&
-          (this.dirtySubmodules || id === entry.objectId) &&
+          (this.dirtyThisCall || id === entry.objectId) &&
           result.worktreeEntry?.isDirectory
         ) {
-          const dirt = await readSubmoduleDirt(worktree, entry.path, ignore !== "none");
-          dirty = !!dirt.modified || (ignore === "none" && !!dirt.untracked);
+          const found = await readSubmoduleDirt(worktree, entry.path, ignore !== "none");
+          if (found.modified) dirt.modified = true;
+          if (ignore === "none" && found.untracked) dirt.untracked = true;
+          dirty = !!dirt.modified || !!dirt.untracked;
         }
-        if (!dirty) return result.kind ? { mode, id } : indexSide;
+        // ie_match_stat of a gitlink: another commit checked out than the entry's
+        const moved = entry.mode === GITLINK && mode === GITLINK && id !== entry.objectId;
+        if (!dirty) {
+          if (!result.kind) return indexSide;
+          if (!moved) return { mode, id };
+          // its id is no stored object's to git (oid_valid unset): the diffstat compares
+          // the "Subproject commit" lines, which may hold no change
+          const content = encoder.encode(`Subproject commit ${id}\n`);
+          return { mode, id, unknownId: true, read: async () => content };
+        }
+        const unknown = moved ? { unknownId: true } : {};
         const content = encoder.encode(`Subproject commit ${id}-dirty\n`);
-        return { mode, id, dirty, read: async () => content };
+        return { mode, id, dirty, dirt, ...unknown, read: async () => content };
       }
       if (!result.kind && !entry.intentToAdd) return indexSide;
       const path = entry.path;

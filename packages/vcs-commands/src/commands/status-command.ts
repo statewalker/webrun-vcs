@@ -76,6 +76,7 @@ import {
   type SubmoduleIgnoreMode,
   submoduleIgnoreFlags,
 } from "./submodule-config.js";
+import { SubmoduleSummaryCommand } from "./submodule-summary-command.js";
 import type { TrackingSource } from "./tracking-info.js";
 import { openUntrackedCache } from "./untracked-cache-support.js";
 import { shortenUnambiguousRef } from "./worktree-list-command.js";
@@ -323,6 +324,8 @@ export class StatusCommand extends GitCommand<Status> {
   private reference?: ObjectId | null;
   /** Whether the refreshed stats (and the untracked cache) are written back */
   private writeIndex = true;
+  /** `status.submoduleSummary` as set here (a limit; -1 none, 0 off) */
+  private submoduleSummary?: number;
 
   /**
    * Add a pathspec element (from the top of the worktree), as `git status -- <pathspec>`
@@ -432,6 +435,53 @@ export class StatusCommand extends GitCommand<Status> {
     return this;
   }
 
+  /**
+   * The submodule summaries of the long format (`status.submoduleSummary`, which this
+   * overrides): true lists every commit of each changed submodule, a number at most that
+   * many (a negative one: all), false or 0 none. The summaries are `git submodule summary
+   * --cached` and `--files` (see {@link SubmoduleSummaryCommand}), under "Submodule changes
+   * to be committed:" and "Submodules changed but not updated:".
+   */
+  setSubmoduleSummary(summary: boolean | number): this {
+    this.checkCallable();
+    this.submoduleSummary = summary === true ? -1 : summary === false ? 0 : summary;
+    return this;
+  }
+
+  /** git_status_config's `status.submodulesummary` (git_config_bool_or_int; true is -1). */
+  private submoduleSummaryLimit(): number {
+    if (this.submoduleSummary !== undefined) return this.submoduleSummary;
+    const value = this.config.value("status.submoduleSummary");
+    if (value === undefined) return 0;
+    const int = parseConfigInt(value);
+    if (int !== undefined) return int;
+    const bool = parseGitBool(value);
+    if (bool === undefined) {
+      throw new InvalidConfigError(
+        "status.submoduleSummary",
+        `fatal: bad boolean config value '${value}' for 'status.submodulesummary'`,
+      );
+    }
+    return bool ? -1 : 0;
+  }
+
+  /** wt_longstatus_print_submodule_summary's two runs of `git submodule summary`. */
+  private async submoduleSummaries(
+    limit: number,
+    amend: boolean,
+  ): Promise<{ staged: string; unstaged: string }> {
+    const run = (configure: (c: SubmoduleSummaryCommand) => void) => {
+      const command = new SubmoduleSummaryCommand(this.workingCopy)
+        .setForStatus(true)
+        .setSummaryLimit(limit);
+      configure(command);
+      return command.call();
+    };
+    const staged = await run((c) => c.setCached(true).setCommit(amend ? "HEAD^" : "HEAD"));
+    const unstaged = await run((c) => c.setFiles(true));
+    return { staged, unstaged };
+  }
+
   /** The commit compared with: the one set, else HEAD's (undefined: none). */
   private async referenceCommit(): Promise<ObjectId | undefined> {
     if (this.reference !== undefined) return this.reference ?? undefined;
@@ -511,6 +561,11 @@ export class StatusCommand extends GitCommand<Status> {
         commentPrefix,
       });
     }
+    const summaryLimit = resolvedFormat === "long" ? this.submoduleSummaryLimit() : 0;
+    const submoduleSummary =
+      summaryLimit !== 0 && this.ignoreSubmodules !== "all"
+        ? await this.submoduleSummaries(summaryLimit, options.amend === true)
+        : undefined;
     const out = formatStatusText(status, header, {
       format: resolvedFormat,
       branch,
@@ -528,6 +583,7 @@ export class StatusCommand extends GitCommand<Status> {
       reference: options.amend ? "HEAD^1" : "HEAD",
       aheadBehindQuick: quick,
       ...(verbose !== undefined ? { verbose } : {}),
+      ...(submoduleSummary ? { submoduleSummary } : {}),
     });
     return {
       ...out,
@@ -1355,6 +1411,14 @@ export interface StatusTextResult extends StatusText {
 }
 
 /** A git boolean of the configuration, `fallback` when unset or not a boolean. */
+/** git_parse_int: a decimal integer with an optional k, m or g unit; undefined otherwise. */
+function parseConfigInt(value: string): number | undefined {
+  const m = /^\s*([-+]?\d+)([kmg]?)\s*$/i.exec(value);
+  if (!m) return undefined;
+  const scale = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[m[2].toLowerCase()] ?? 1;
+  return Number.parseInt(m[1], 10) * scale;
+}
+
 function cfgBool(config: RemoteConfigStore, key: string, fallback: boolean): boolean {
   const value = config.value(key);
   return value === undefined ? fallback : (parseGitBool(value) ?? fallback);

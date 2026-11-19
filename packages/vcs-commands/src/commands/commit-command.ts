@@ -33,7 +33,7 @@ import { AddCommand } from "./add-command.js";
 import { worktreeModeTrust } from "./core-config.js";
 import { DEFAULT_DATE_MODE, showDate } from "./date-format.js";
 import { hostEnvironmentOf, withoutCrud } from "./git-ident.js";
-import { IndexAdder } from "./index-adder.js";
+import { IndexAdder, readGitlinkHead } from "./index-adder.js";
 import {
   flatTree,
   OperationState,
@@ -337,8 +337,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
    * literally (`add_remove_files`): a file (ignored or not) is staged as `git add` stages it
    * (cleaned by the content filters; an intent-to-add entry gets the content, a conflicted
    * path is resolved to the file, the entries it clashes with as a file or a directory
-   * replaced), a path gone is removed, and a path that is now a directory refuses the commit
-   * before anything changes ("'<path>' does not have a commit checked out"). The index is
+   * replaced), a path gone is removed, a submodule takes the commit checked out in it, and a
+   * path that is now a directory holding no commit refuses the commit before anything
+   * changes ("'<path>' does not have a commit checked out"). The index is
    * written into the lock with the paths updated, and the commit records HEAD's tree with
    * only these paths changed, whatever else is staged. The lock is renamed over the index
    * once the commit is made; on any failure it is removed and the index (and this instance's
@@ -1444,8 +1445,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
   /**
    * git's partial commit (`prepare_index`, `add_remove_files`): each listed path (but the
    * skip-worktree ones) as git's `add_remove_files` takes it, literally: a file (ignored or
-   * not) hashed and staged, a path gone removed, a directory refused before anything
-   * changes ("'<path>' does not have a commit checked out"); the index then gets its
+   * not) hashed and staged, a path gone removed, a submodule staged at the commit checked
+   * out in it, a directory without one refused before anything changes ("'<path>' does not
+   * have a commit checked out"); the index then gets its
    * cache-tree (none while it holds conflicts) and is written into the lock. The tree
    * committed is HEAD's with the same paths taken (git's false index), returned as HEAD's
    * tree and those edits: stored by {@link storeFalseIndex}, never by a dry run.
@@ -1472,10 +1474,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
     if (worktree) {
       for (const path of taken) {
         const entry = await worktree.getEntry(path);
-        if (entry?.isDirectory) {
-          // add_to_index of a directory: a gitlink only for a repository with a commit
-          // (index_path's resolve_gitlink_ref), which a worktree cannot hold here; git 2.5x
-          // adds the "unable to index file" line
+        // add_to_index of a directory: a gitlink to the commit checked out in the repository
+        // there (index_path's resolve_gitlink_ref, a gitfile followed), refused before
+        // anything changes when there is none; git 2.5x adds the "unable to index file" line
+        if (entry?.isDirectory && !(await readGitlinkHead(worktree, path))) {
           throw new GitApiError(
             `error: '${path}' does not have a commit checked out\n` +
               `error: unable to index file '${path}'\nfatal: updating files failed`,

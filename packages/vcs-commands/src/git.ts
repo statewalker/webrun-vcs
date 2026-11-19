@@ -63,6 +63,7 @@ import {
   StashDropCommand,
   StashListCommand,
   StatusCommand,
+  SubmoduleSummaryCommand,
   SwitchCommand,
   TagCommand,
   VerifyPackCommand,
@@ -739,6 +740,20 @@ export class Git implements Disposable {
   status(): StatusCommand {
     this.checkClosed();
     return new StatusCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a SubmoduleSummaryCommand: the commits of changed submodules, as
+   * `git submodule summary`.
+   *
+   * @example
+   * ```typescript
+   * const text = await git.submoduleSummary().setCached(true).call();
+   * ```
+   */
+  submoduleSummary(): SubmoduleSummaryCommand {
+    this.checkClosed();
+    return new SubmoduleSummaryCommand(this._workingCopy);
   }
 
   // ============ Diff Operations ============

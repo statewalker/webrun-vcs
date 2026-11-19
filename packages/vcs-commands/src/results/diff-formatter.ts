@@ -117,22 +117,24 @@ export function diffEntryToPair(entry: DiffEntry, blobs: Blobs): DiffFilePair {
                 (entry.oldMode & 0o170000) !== (entry.newMode & 0o170000)
               ? "T"
               : "M";
+  const newSide =
+    status === "D"
+      ? undefined
+      : side(
+          entry.newPath ?? entry.oldPath,
+          entry.newMode,
+          entry.newId,
+          entry.readNew,
+          entry.newDirtySubmodule === true && entry.newIdUnknown !== true,
+        );
+  if (newSide && entry.newSubmoduleDirt) newSide.submoduleDirt = entry.newSubmoduleDirt;
   return {
     status,
     old:
       status === "A"
         ? undefined
         : side(entry.oldPath ?? entry.newPath, entry.oldMode, entry.oldId, entry.readOld),
-    new:
-      status === "D"
-        ? undefined
-        : side(
-            entry.newPath ?? entry.oldPath,
-            entry.newMode,
-            entry.newId,
-            entry.readNew,
-            entry.newDirtySubmodule === true,
-          ),
+    new: newSide,
     ...(entry.score !== undefined ? { score: entry.score } : {}),
   };
 }

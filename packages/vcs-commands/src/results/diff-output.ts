@@ -72,6 +72,11 @@ export interface DiffSideSpec {
    * is read
    */
   probe?(bigFileThreshold: number): Promise<{ size: number; binary: boolean }>;
+  /**
+   * A submodule's own changes in the worktree (git's `dirty_submodule`): tracked changes
+   * (`modified`) and untracked files (`untracked`) inside it
+   */
+  submoduleDirt?: { modified?: boolean; untracked?: boolean };
 }
 
 /** git's status letters of a file pair */
@@ -129,6 +134,16 @@ export interface DiffOutputOptions
   /** Full object ids in `index` lines (`--full-index`) */
   fullIndex?: boolean;
   /**
+   * `--submodule=log` / `--submodule=diff`: writes a pair whose sides are submodules (or
+   * absent) in place of its patch (builtin_diff's submodule branch); unset, a submodule's
+   * change is a `Subproject commit` patch (`--submodule=short`)
+   */
+  submodulePatch?: (
+    sink: ByteSink,
+    pair: DiffFilePair,
+    options: DiffOutputOptions,
+  ) => Promise<void>;
+  /**
    * `--binary`: binary files as "GIT binary patch" hunks `git apply` can apply (their `index`
    * lines with full ids), instead of "Binary files ... differ"
    */
@@ -148,6 +163,7 @@ export interface DiffOutputOptions
 }
 
 const S_IFMT = 0o170000;
+const GITLINK_MODE = 0o160000;
 const NULL_ID = "0".repeat(40);
 const FIRST_FEW_BYTES = 8000;
 const GIT_DIFF_BIG_FILE_THRESHOLD = 512 * 1024 * 1024;
@@ -358,6 +374,16 @@ async function builtinDiff(
   absentPath?: string,
   report?: PairPatchReport,
 ): Promise<void> {
+  // builtin_diff: a submodule's change in the log or diff format
+  if (
+    options.submodulePatch &&
+    (pair.old || pair.new) &&
+    (!pair.old || (pair.old.mode & S_IFMT) === GITLINK_MODE) &&
+    (!pair.new || (pair.new.mode & S_IFMT) === GITLINK_MODE)
+  ) {
+    await options.submodulePatch(sink, pair, options);
+    return;
+  }
   const quote = options.quotePath ?? true;
   const threshold = options.bigFileThreshold ?? GIT_DIFF_BIG_FILE_THRESHOLD;
   // names as run_diff passes them: the pair's paths even for the absent side

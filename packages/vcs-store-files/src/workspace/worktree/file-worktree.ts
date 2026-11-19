@@ -1269,25 +1269,45 @@ export class FileWorktree implements Worktree {
     return link?.kind === "other";
   }
 
+  /** Whether `dir` holds a repository: HEAD, objects and refs (git's `is_git_directory`). */
+  private async isRepositoryDir(dir: string): Promise<boolean> {
+    const kindAt = (name: string) => this.kindOf(joinPath(dir, name)).catch(() => undefined);
+    // a HEAD that is a file (or a link, core.preferSymlinkRefs): never a FIFO, which
+    // would block the read
+    const headKind = await kindAt("HEAD");
+    return (
+      (headKind === "file" || headKind === "symlink") &&
+      (await kindAt("objects")) === "directory" &&
+      (await kindAt("refs")) === "directory"
+    );
+  }
+
   /**
    * The repository checked out at the gitlink `path` (a populated submodule) as a working
    * copy over the same FilesApi: its objects, refs, index, config and worktree. Undefined
    * when it is not populated (no git directory with HEAD, objects and refs) or its
-   * repository lies beyond this FilesApi's root.
+   * repository lies beyond this FilesApi's root. With `options.name`, a path without a
+   * repository opens `<gitdir>/modules/<name>` instead (git's `submodule_to_gitdir`).
    */
-  async openGitlink(path: string): Promise<WorkingCopy | undefined> {
-    const gitDir = await this.gitlinkDir(path);
-    if (gitDir === undefined) return undefined;
-    const kindAt = (name: string) => this.kindOf(joinPath(gitDir, name)).catch(() => undefined);
-    // a HEAD that is a file (or a link, core.preferSymlinkRefs): never a FIFO, which
-    // would block the read
-    const headKind = await kindAt("HEAD");
-    if (
-      (headKind !== "file" && headKind !== "symlink") ||
-      (await kindAt("objects")) !== "directory" ||
-      (await kindAt("refs")) !== "directory"
-    ) {
-      return undefined;
+  async openGitlink(
+    path: string,
+    options: { name?: string } = {},
+  ): Promise<WorkingCopy | undefined> {
+    let gitDir = await this.gitlinkDir(path);
+    if (gitDir !== undefined && !(await this.isRepositoryDir(gitDir))) gitDir = undefined;
+    if (gitDir === undefined) {
+      // submodule_to_gitdir: no repository at the path, the one kept under modules/<name>
+      const name = options.name;
+      if (
+        name === undefined ||
+        this.gitDir === undefined ||
+        name === "" ||
+        name.split(/[/\\]/).some((part) => part === "..")
+      ) {
+        return undefined;
+      }
+      gitDir = joinPath(this.gitDir, "modules", name);
+      if (!(await this.isRepositoryDir(gitDir))) return undefined;
     }
     const files = this.rootFiles;
     const environment = this.environment ? { environment: this.environment } : {};

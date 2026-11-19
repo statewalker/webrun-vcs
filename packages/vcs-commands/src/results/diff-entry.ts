@@ -87,6 +87,20 @@ export interface DiffEntry {
    * "Subproject commit <id>-dirty", `newId` is its commit as git knows it
    */
   newDirtySubmodule?: boolean;
+
+  /**
+   * What the new side's submodule holds of its own in the worktree, as `--submodule=log`
+   * reports it ("contains modified content", "contains untracked content")
+   */
+  newSubmoduleDirt?: { modified?: boolean; untracked?: boolean };
+
+  /**
+   * The new side is a worktree submodule checked out at another commit than its index entry
+   * (a comparison of a tree with the worktree): git gives it the null id, which it fills from
+   * the submodule's HEAD (`newId`) only to print a patch. Such an entry is reported even
+   * when that commit is the old side's, and no rename pairs with it.
+   */
+  newIdUnknown?: boolean;
 }
 
 /**

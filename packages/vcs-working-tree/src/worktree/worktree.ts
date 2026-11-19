@@ -332,8 +332,13 @@ export interface Worktree {
    * own HEAD, index, config and worktree), so its status can be read as git's
    * `is_submodule_modified` reads it; undefined when it is not populated or its repository
    * cannot be read here (beyond the storage's root).
+   *
+   * With `options.name`, a path that holds no repository (a submodule not checked out, or
+   * one whose directory is gone) falls back to the repository git keeps for the submodule
+   * of that name, `<gitdir>/modules/<name>` (git's `submodule_to_gitdir`); its worktree is
+   * still rooted at `path`.
    */
-  openGitlink?(path: string): Promise<WorkingCopy | undefined>;
+  openGitlink?(path: string, options?: { name?: string }): Promise<WorkingCopy | undefined>;
 
   /**
    * The repository directory of the submodule at `path`, in this worktree's FilesApi: its
