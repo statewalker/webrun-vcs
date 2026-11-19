@@ -690,20 +690,26 @@ export async function writeCommitGraphFile(
     await writeLocked(atomic, objectsDir, COMMIT_GRAPH_CHAIN_FILE, async (lock) => {
       // the layer, through a temporary
       const tmp = `${COMMIT_GRAPHS_DIR}/tmp_graph_${randomSuffix()}`;
-      await atomic.write(tmp, content);
-      await chmod(files, joinPath(objectsDir, tmp), 0o444);
-      if (baseGraphName) {
-        const dest = filenamesAfter[numAfter > 1 ? numAfter - 2 : numAfter - 1] as string;
-        if (baseGraphName !== dest && !(await files.move(baseGraphName, dest))) {
-          // git's "failed to rename base commit-graph file"
-          throw new Error(`failed to rename base commit-graph file ${baseGraphName}`);
+      try {
+        await atomic.write(tmp, content);
+        await chmod(files, joinPath(objectsDir, tmp), 0o444);
+        if (baseGraphName) {
+          const dest = filenamesAfter[numAfter > 1 ? numAfter - 2 : numAfter - 1] as string;
+          if (baseGraphName !== dest && !(await files.move(baseGraphName, dest))) {
+            // git's "failed to rename base commit-graph file"
+            throw new Error(`failed to rename base commit-graph file ${baseGraphName}`);
+          }
+        } else {
+          await files.remove(joinPath(objectsDir, COMMIT_GRAPH_FILE));
         }
-      } else {
-        await files.remove(joinPath(objectsDir, COMMIT_GRAPH_FILE));
+        hashAfter[numAfter - 1] = fileHash;
+        filenamesAfter[numAfter - 1] = joinPath(objectsDir, path);
+        await atomic.replace(tmp, path);
+      } catch (e) {
+        // a failed write leaves no temporary layer behind (git's tempfile, removed at exit)
+        await atomic.remove(tmp).catch(() => false);
+        throw e;
       }
-      hashAfter[numAfter - 1] = fileHash;
-      filenamesAfter[numAfter - 1] = joinPath(objectsDir, path);
-      await atomic.replace(tmp, path);
       for (let i = 0; i < numAfter; i++) hashes.push(hashAfter[i] as string);
       await atomic.write(lock, new TextEncoder().encode(hashes.map((h) => `${h}\n`).join("")));
     });

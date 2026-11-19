@@ -408,6 +408,33 @@ describeGit("git read-tree against native git", () => {
       ]);
     });
 
+    it("a skip-worktree file leaving for a directory with an untracked file, --aggressive -u", async () => {
+      // verify_absent_if_directory passes over a skip-worktree entry: verify_uptodate speaks
+      await compareReadTree(
+        (dir) => {
+          // B and O (HEAD): x, e. H: x, e/f, e/g
+          put(dir, "x", "x\n");
+          put(dir, "e", "e\n");
+          gitOk(root, dir, "add", ".");
+          gitOk(root, dir, "commit", "-q", "-m", "B");
+          gitOk(root, dir, "tag", "B");
+          gitOk(root, dir, "checkout", "-q", "-b", "side");
+          rmSync(join(dir, "e"));
+          put(dir, "e/f", "f\n");
+          put(dir, "e/g", "g\n");
+          gitOk(root, dir, "add", "-A", ".");
+          gitOk(root, dir, "commit", "-q", "-m", "H");
+          gitOk(root, dir, "tag", "H");
+          gitOk(root, dir, "checkout", "-q", "main");
+        },
+        ["-m", "--aggressive", "-u", "B", "main", "H"],
+        (dir) => {
+          gitOk(root, dir, "sparse-checkout", "set", "--no-cone", "/x");
+          put(dir, "e/u", "u\n");
+        },
+      );
+    });
+
     it("without -m a directory's files replace a file of its name (traversal order)", async () => {
       await compareReadTree(dfHistory("H"), ["H", "O"]);
       await compareReadTree(dfHistory("H"), ["O", "H"]);

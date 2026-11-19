@@ -23,7 +23,8 @@ file/directory clash.
 `Worktree` gains optional `gitlinkRepository` (the place a submodule's gitfile names, null
 when the FilesApi cannot reach it) and `connectGitlink` (implemented by the file worktree);
 the file worktree's `rename` throws when the FilesApi refuses the move instead of reporting
-success, and the commit-graph writer no longer ignores a refused move; `setCacheTree(undefined)` now drops the cache-tree from the next index write;
+success, and the commit-graph writer no longer ignores a refused move (nor leaves its
+temporary layer behind when a split write fails); `setCacheTree(undefined)` now drops the cache-tree from the next index write;
 `repairCacheTree` computes git's `cache_tree_update(WRITE_TREE_REPAIR)` (an invalid
 directory stops its ancestors, as `update_one` does); `IndexAdder.put`
 stages a ready entry; `switchTrees` and `resetMerge` take `update`, plain-error and

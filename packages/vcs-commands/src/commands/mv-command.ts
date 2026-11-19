@@ -22,7 +22,11 @@ import { sparseCheckoutConfig, sparsePathAdvice } from "./sparse-checkout-suppor
 import { strerror } from "./strerror.js";
 import { parseGitmodules } from "./submodule-config.js";
 import { planFlatRestore, writeTreeRestorePlan } from "./tree-restore.js";
-import { statFollowingLinks, statThroughLeadingLinks } from "./worktree-overwrite-checks.js";
+import {
+  removeDirectoryIfEmpty,
+  statFollowingLinks,
+  statThroughLeadingLinks,
+} from "./worktree-overwrite-checks.js";
 
 /** One move `git mv` made (or, with `-n`, would make). */
 export interface MvRename {
@@ -523,7 +527,7 @@ export class MvCommand extends GitCommand<MvResult> {
       const gitDir = gitfile && gitfile !== SUBMODULE_WITH_GITDIR ? gitDirs.get(src) : undefined;
       if (needsWorktreeRename(mode, dstMode)) {
         try {
-          await renamePath(worktree, src, dst, ignoreCase);
+          await renamePath(worktree, src, dst);
         } catch (error) {
           if (this.skipErrors) continue;
           // die_errno: the index lock is rolled back, the moves made so far stay unrecorded
@@ -588,7 +592,7 @@ export class MvCommand extends GitCommand<MvResult> {
             dirtyPaths.push(dst);
             const slash = dst.lastIndexOf("/");
             if (slash > 0) await worktree.mkdir(dst.slice(0, slash), { recursive: true });
-            await renamePath(worktree, src, dst, ignoreCase).catch(() => undefined);
+            await renamePath(worktree, src, dst).catch(() => undefined);
           }
         }
       }
@@ -825,21 +829,33 @@ async function hasSymlinkLeadingPath(worktree: Worktree, path: string): Promise<
  * in it. A worktree without rename copies the file and removes the original. A destination
  * that is the source itself (a case-only rename where the filesystem folds case, or the
  * same file under another name) is never removed first: the entry is renamed directly, as
- * git's `rename` does; a directory moved beneath itself fails (`EINVAL`).
+ * git's `rename` does; a directory moved beneath itself fails (`EINVAL`): one of the
+ * destination's leading directories is the source (the same path, the same inode where the
+ * worktree reports one, or a case variant the filesystem folds onto it: `core.ignoreCase`
+ * alone folds nothing, as on a case-sensitive filesystem `D` and `d` are two). A file at the
+ * destination is replaced by the rename itself, atomically as `rename(2)` does, so a move
+ * that fails leaves it in place; only a worktree without rename removes it first. An empty
+ * directory at the destination is removed first (never one holding anything: `ENOTEMPTY`).
  */
-async function renamePath(
-  worktree: Worktree,
-  src: string,
-  dst: string,
-  ignoreCase = false,
-): Promise<void> {
+async function renamePath(worktree: Worktree, src: string, dst: string): Promise<void> {
   const fail = (code: string): never => {
     throw Object.assign(new Error(code), { code });
   };
   const source = await worktree.getEntry(src).catch(() => undefined);
   if (!source) fail("ENOENT");
-  const fold = (p: string) => (ignoreCase ? p.toLowerCase() : p);
-  if (fold(dst).startsWith(`${fold(src)}/`)) fail("EINVAL");
+  const sameInode = (other: { ino?: number; dev?: number } | undefined) =>
+    other !== undefined &&
+    source?.ino !== undefined &&
+    source.ino !== 0 &&
+    source.ino === other.ino &&
+    source.dev === other.dev;
+  if (source?.isDirectory) {
+    for (let at = dst.lastIndexOf("/"); at > 0; at = dst.lastIndexOf("/", at - 1)) {
+      const ancestor = dst.slice(0, at);
+      if (ancestor === src || (await sameEntryByCase(worktree, ancestor, src))) fail("EINVAL");
+      if (sameInode(await worktree.getEntry(ancestor).catch(() => undefined))) fail("EINVAL");
+    }
+  }
   // rename(2) creates no leading directory: ENOENT for a missing one, ENOTDIR for a file
   // (a link included) among them
   const slash = dst.lastIndexOf("/");
@@ -853,21 +869,20 @@ async function renamePath(
   const target = await worktree.getEntry(dst).catch(() => undefined);
   const sameEntry =
     target !== undefined &&
-    (fold(src) === fold(dst) ||
-      (source?.ino !== undefined &&
-        source.ino !== 0 &&
-        source.ino === target.ino &&
-        source.dev === target.dev));
+    (src === dst || sameInode(target) || (await sameEntryByCase(worktree, src, dst)));
+  const canRename = typeof worktree.rename === "function";
   if (target && !sameEntry) {
     if (target.isDirectory) {
       // rename(2) of a directory over an empty one replaces it; anything else fails
       if (!source?.isDirectory) fail("EISDIR");
-      if (!(await worktree.remove(dst).catch(() => false))) fail("ENOTEMPTY");
-    } else {
+      if (!(await removeDirectoryIfEmpty(worktree, dst).catch(() => false))) fail("ENOTEMPTY");
+    } else if (source?.isDirectory) {
+      fail("ENOTDIR");
+    } else if (!canRename) {
       await worktree.remove(dst);
     }
   }
-  if (typeof worktree.rename === "function") {
+  if (canRename) {
     await worktree.rename(src, dst);
     return;
   }
@@ -876,6 +891,41 @@ async function renamePath(
   for await (const chunk of worktree.readContent(src)) chunks.push(chunk);
   await worktree.writeContent(dst, concat(chunks), { raw: true });
   await worktree.remove(src);
+}
+
+/**
+ * Whether `a` and `b`, two spellings of one path that differ in case only, name one entry
+ * (the filesystem folds case): each differing component's directory lists only one of the
+ * two names. A directory never lists one entry twice, so where both are listed (a
+ * case-sensitive filesystem holding `D` and `d`) they are two.
+ */
+async function sameEntryByCase(worktree: Worktree, a: string, b: string): Promise<boolean> {
+  const pa = a.split("/");
+  const pb = b.split("/");
+  if (a === b || pa.length !== pb.length || a.toLowerCase() !== b.toLowerCase()) return false;
+  for (let k = 0; k < pa.length; k++) {
+    const na = pa[k] as string;
+    const nb = pb[k] as string;
+    if (na === nb) continue;
+    const parent = pa.slice(0, k).join("/");
+    const listed = new Set<string>();
+    const inside = worktree.walk({
+      ...(parent ? { pathPrefix: parent } : {}),
+      includeIgnored: true,
+      includeDirectories: true,
+      maxDepth: 0,
+    });
+    try {
+      for await (const entry of inside) {
+        const name = parent ? entry.path.slice(parent.length + 1) : entry.path;
+        if (!name.includes("/")) listed.add(name);
+      }
+    } catch {
+      return false;
+    }
+    if (listed.has(na) && listed.has(nb)) return false;
+  }
+  return true;
 }
 
 /**

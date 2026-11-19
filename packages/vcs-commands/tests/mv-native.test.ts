@@ -491,6 +491,54 @@ describeGit("git mv against native git", () => {
       );
     });
 
+    it("-f keeps an untracked destination when the filesystem refuses the move", async () => {
+      const failed =
+        version === "2.43"
+          ? "fatal: renaming 'a' failed: Operation not permitted"
+          : "fatal: renaming 'a' to 'x' failed: Operation not permitted";
+      const t = await compareOursOnly(
+        basic,
+        ["-f", "a", "x"],
+        failed,
+        () => refusingMoves,
+        (dir) => put(dir, "x", "precious\n"),
+      );
+      expect(readFileSync(join(t.ours, "x"), "utf8")).toBe("precious\n");
+      expect(readFileSync(join(t.ours, "a"), "utf8")).toBe("a\n");
+    });
+
+    it("-f keeps a dirty tracked destination when the filesystem refuses the move", async () => {
+      const failed =
+        version === "2.43"
+          ? "fatal: renaming 'a' failed: Operation not permitted"
+          : "fatal: renaming 'a' to 'b' failed: Operation not permitted";
+      const t = await compareOursOnly(
+        basic,
+        ["-f", "a", "b"],
+        failed,
+        () => refusingMoves,
+        (dir) => put(dir, "b", "dirty\n"),
+      );
+      expect(readFileSync(join(t.ours, "b"), "utf8")).toBe("dirty\n");
+    });
+
+    it("-f overwrites a dirty tracked file", async () => {
+      await compareMv(basic, ["-f", "a", "b"], (dir) => put(dir, "b", "dirty\n"));
+    });
+
+    it("core.ignoreCase on a case-sensitive filesystem moves a directory into its case twin", async () => {
+      // git finds `d` a directory and moves `D` to `d/D`: no directory moved beneath itself
+      const twinDirs = (dir: string) => {
+        put(dir, "D/1", "1\n");
+        put(dir, "d/2", "2\n");
+        gitOk(root, dir, "add", ".");
+        gitOk(root, dir, "commit", "-q", "-m", "c");
+      };
+      await compareMv(twinDirs, ["D", "d"], (dir) =>
+        run(dir, ["config", "core.ignoreCase", "true"]),
+      );
+    });
+
     const withDirLink = (dir: string) => {
       basic(dir);
       put(dir, "realdir/f", "f\n");

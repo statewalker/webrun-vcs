@@ -317,6 +317,76 @@ describe("split chains", () => {
   });
 });
 
+describe("a failed split write", () => {
+  /** `files` with `move` refusing what `refuse` names (its source, then its target). */
+  const refusing = (files: FilesApi, refuse: (from: string, to: string) => boolean): FilesApi =>
+    new Proxy(files, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (prop === "move") {
+          return async (from: string, to: string) =>
+            refuse(from, to) ? false : (value as FilesApi["move"]).call(target, from, to);
+        }
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+  const graphDir = async (files: FilesApi) => {
+    const names: string[] = [];
+    for await (const e of files.list(`${OBJECTS}/info/commit-graphs`)) names.push(e.name);
+    return names.sort();
+  };
+
+  /** A single-file graph of one commit, and a second commit for a split write over it. */
+  async function overSingleFile() {
+    const r = await repo();
+    const first = await r.commit([], 1);
+    await writeCommitGraphFile({
+      files: r.files,
+      objectsDir: OBJECTS,
+      objects: r.objects,
+      commits: [first],
+      existing: await readCommitGraph(r.files, OBJECTS),
+    });
+    const tip = await r.commit([first], 2);
+    return { r, tip, existing: await readCommitGraph(r.files, OBJECTS) };
+  }
+
+  it("leaves no temporary layer when the base graph cannot be renamed", async () => {
+    const { r, tip, existing } = await overSingleFile();
+    const files = refusing(r.files, (from) => from.endsWith("/info/commit-graph"));
+    await expect(
+      writeCommitGraphFile({
+        files,
+        objectsDir: OBJECTS,
+        objects: r.objects,
+        commits: [tip],
+        existing,
+        split: "no-merge",
+      }),
+    ).rejects.toThrow(/failed to rename base commit-graph file/);
+    expect(await graphDir(r.files)).toEqual([]);
+    expect(await r.files.exists(`${OBJECTS}/info/commit-graph`)).toBe(true);
+  });
+
+  it("leaves no temporary layer when the layer cannot be renamed into place", async () => {
+    const { r, tip, existing } = await overSingleFile();
+    const files = refusing(r.files, (from) => from.includes("/tmp_graph_"));
+    await expect(
+      writeCommitGraphFile({
+        files,
+        objectsDir: OBJECTS,
+        objects: r.objects,
+        commits: [tip],
+        existing,
+        split: "no-merge",
+      }),
+    ).rejects.toThrow(/could not move/);
+    expect((await graphDir(r.files)).filter((n) => n.startsWith("tmp_graph_"))).toEqual([]);
+    expect((await graphDir(r.files)).filter((n) => n.endsWith(".lock"))).toEqual([]);
+  });
+});
+
 /** A commit read from the object store, as verify compares it. */
 function readCommit(r: Repo) {
   return async (id: string) => {

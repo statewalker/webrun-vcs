@@ -552,8 +552,10 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       });
       if (error) fail(error, path);
     };
-    const absentIfDirectory = async (path: string) => {
-      if (!worktree || quiet(path)) return;
+    // verify_absent_if_directory passes over an entry leaving the checkout (CE_SKIP_WORKTREE
+    // or CE_NEW_SKIP_WORKTREE): verify_uptodate then speaks for a directory in its place
+    const absentIfDirectory = async (path: string, old: StagingEntry) => {
+      if (!worktree || quiet(path) || old.skipWorktree || sparse?.outside(path)) return;
       const entry = await worktree.getEntry(path).catch(() => undefined);
       if (!entry?.isDirectory || entry.mode === FileMode.GITLINK) return;
       if (await untrackedUnder(worktree, path, (p) => indexEntries.has(p))) {
@@ -582,7 +584,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       writes.add(path);
     };
     const deletedEntry = async (old: StagingEntry, path: string) => {
-      await absentIfDirectory(path);
+      await absentIfDirectory(path, old);
       await verifyUptodate(old);
       changes.set(path, []);
       removes.add(path);
