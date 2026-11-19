@@ -10,6 +10,7 @@ import type {
   StagingIndexLock,
 } from "@statewalker/vcs-working-tree";
 import {
+  clearSkipWorktreeFlags,
   type GitStagingOptions,
   INDEX_VERSION_2,
   IndexFile,
@@ -50,6 +51,8 @@ export class FileStagingStore implements Staging {
   private asRead = new Set<StagingEntry>();
   /** Whether the entries or extensions changed since they were last read or written */
   private unwritten = false;
+  /** Skip-worktree flags cleared when the index was read, not yet in the index file */
+  private skipWorktreeCleared = new Set<string>();
   private version: IndexVersion = INDEX_VERSION_2;
   private readonly indexFile: IndexFile;
 
@@ -395,6 +398,7 @@ export class FileStagingStore implements Staging {
   async read(): Promise<void> {
     const read = await this.indexFile.read();
     this.unwritten = false;
+    this.skipWorktreeCleared = new Set();
     if (!read) {
       // No index file - start empty
       this._entries = [];
@@ -418,6 +422,7 @@ export class FileStagingStore implements Staging {
     );
     await this.indexFile.write(this._entries);
     this.unwritten = false;
+    this.skipWorktreeCleared = new Set();
     this.asRead = new Set(this._entries);
     this.updateTime = await this.indexMtime();
   }
@@ -447,6 +452,7 @@ export class FileStagingStore implements Staging {
         if (!written) return;
         // the index now holds what was written (make no edits between write and commit)
         this.unwritten = false;
+        this.skipWorktreeCleared = new Set();
         this.asRead = new Set(written);
         this.updateTime = await this.indexMtime();
       },
@@ -490,11 +496,22 @@ export class FileStagingStore implements Staging {
       this.indexFile.fresh(),
       this._entries,
       updates,
+      this.skipWorktreeCleared,
     );
     if (!entries) return false;
+    this.skipWorktreeCleared = new Set();
     this._entries = entries;
     this.updateTime = await this.indexMtime();
     return true;
+  }
+
+  clearSkipWorktree(paths: ReadonlySet<string>): void {
+    const cleared = clearSkipWorktreeFlags(this._entries, paths, (before, after) => {
+      // still as read: git flips the flag on the entry it read
+      if (this.asRead.delete(before)) this.asRead.add(after);
+      this.skipWorktreeCleared.add(after.path);
+    });
+    if (cleared) this._entries = cleared;
   }
 
   getUpdateTime(): number {
@@ -753,6 +770,8 @@ class FileStagingEditor implements IndexEditor {
    * path's stage-0 entry (the conflict stages kept).
    */
   async finish(): Promise<void> {
+    // no edit, no change: the index stays as read (unwritten only if it was)
+    if (this.edits.length === 0) return;
     const merged = this.mergeEdits();
     if (merged) {
       this.store._replaceEntries(merged);
@@ -814,8 +833,8 @@ class FileStagingEditor implements IndexEditor {
   /**
    * {@link finish} without regrouping and sorting the whole index: the edited paths' runs
    * replaced in place and new paths merged in (a few edits to a large index, `add -u`).
-   * Undefined when a tree deletion is among the edits or the entries are not in order:
-   * {@link finish} then takes the long way.
+   * Undefined when a tree deletion is among the edits or the entries are not in order (the
+   * paths, or the stages of one path): {@link finish} then takes the long way.
    */
   private mergeEdits(): StagingEntry[] | undefined {
     const byPath = new Map<string, StagingEdit[]>();
@@ -833,7 +852,11 @@ class FileStagingEditor implements IndexEditor {
       if (previous !== undefined && comparePaths(previous, path) >= 0) return undefined;
       previous = path;
       let end = k + 1;
-      while (end < entries.length && entries[end].path === path) end++;
+      while (end < entries.length && entries[end].path === path) {
+        // a path's stages out of order (a malformed index): the long way sorts them
+        if (entries[end].stage < entries[end - 1].stage) return undefined;
+        end++;
+      }
       const edits = byPath.get(path);
       if (edits) {
         byPath.delete(path);

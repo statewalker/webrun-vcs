@@ -30,10 +30,19 @@ import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { Git, NoStagedChangesError } from "../src/index.js";
+import { Git, NoStagedChangesError, StashPathspecResetError } from "../src/index.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
+/** The git version whose messages ours reproduces: the one on PATH. */
+const compatibility = (() => {
+  try {
+    const version = execFileSync("git", ["--version"], { encoding: "utf8" });
+    return /git version 2\.(5\d|[6-9]\d)/.test(version) ? "2.56" : "2.43";
+  } catch {
+    return "2.56";
+  }
+})();
 
 let root: string;
 const exec = (cwd: string, ...args: string[]) =>
@@ -202,7 +211,8 @@ async function twinStash(name: string, setup: (dir: string) => void, opts: Stash
       .setIncludeUntracked(!!opts.u || !!opts.a)
       .setIncludeIgnored(!!opts.a)
       .setKeepIndex(!!opts.k)
-      .setStaged(!!opts.staged);
+      .setStaged(!!opts.staged)
+      .setCompatibility(compatibility);
     for (const path of opts.paths ?? []) command.addPath(path);
     await command.call();
   } catch (e) {
@@ -307,7 +317,7 @@ describeGit("stash push -- <pathspec> against native git", () => {
   });
 
   it("an element that matches nothing tracked is refused before anything changes", async () => {
-    const { ourError } = await twinStash(
+    const { ourError, nativeError } = await twinStash(
       "no-match",
       (d) => {
         put(d, "a.txt", "a changed\n");
@@ -315,8 +325,12 @@ describeGit("stash push -- <pathspec> against native git", () => {
       },
       { paths: ["a.txt", "u.txt"] },
     );
-    expect(ourError).toContain("error: pathspec 'u.txt' did not match any file(s) known to git");
+    const magic = compatibility === "2.43" ? ":(,prefix:0)" : ":(prefix:0)";
+    expect(ourError).toContain(
+      `error: pathspec '${magic}u.txt' did not match any file(s) known to git`,
+    );
     expect(ourError).toContain("Did you forget to 'git add'?");
+    expect(ourError).toBe(nativeError);
   });
 
   it("nothing to stash among the named paths: no stash, nothing changes", async () => {
@@ -431,5 +445,186 @@ describeGit("stash push --staged against native git", () => {
       { staged: true, u: true },
     );
     expect(ourError).toContain("Can't use --staged and --include-untracked");
+  });
+});
+
+describeGit("stash push -- <pathspec>: git's reset fails after the stash is saved", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "stash-pathspec-reset-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const magic = () => (compatibility === "2.43" ? ":(,prefix:0)" : ":(prefix:0)");
+
+  it("a path HEAD has, out of the index and untracked in the worktree: apply -R refuses", async () => {
+    const { ours, ourException, nativeError } = await twinStash(
+      "exists",
+      (d) => {
+        put(d, "a.txt", "a changed\n");
+        run(d, "rm", "-q", "--cached", "b.txt", "c.txt");
+        put(d, "b.txt", "precious\n");
+        put(d, "c.txt", "precious too\n");
+      },
+      { paths: ["*.txt"] },
+    );
+    expect(ourException).toBeInstanceOf(StashPathspecResetError);
+    expect(nativeError).toBe(
+      "error: c.txt: already exists in working directory\n" +
+        "error: b.txt: already exists in working directory",
+    );
+    expect((ourException as Error).message).toBe(nativeError);
+    // the stash is saved, the file kept, the edit of a.txt staged by git's `add -u`
+    expect(read(join(ours, "b.txt"))).toBe("precious\n");
+    expect(run(ours, "stash", "list")).toContain("stash@{0}");
+  });
+
+  it("the same with -u: an ignored file over the path is not added, apply -R refuses", async () => {
+    const { ourException, nativeError } = await twinStash(
+      "exists-ignored",
+      (d) => {
+        put(d, ".gitignore", "b.txt\n");
+        run(d, "rm", "-q", "--cached", "b.txt");
+        put(d, "b.txt", "precious\n");
+        put(d, "u.txt", "untracked\n");
+      },
+      { u: true, paths: ["*.txt"] },
+    );
+    expect(nativeError).toBe("error: b.txt: already exists in working directory");
+    expect((ourException as Error).message).toBe(nativeError);
+  });
+
+  it("-u with an element that matches nothing: git add dies, the stash is kept", async () => {
+    const { ourException, nativeError } = await twinStash(
+      "u-no-match",
+      (d) => {
+        put(d, "a.txt", "a changed\n");
+        put(d, "u.txt", "untracked\n");
+      },
+      { u: true, paths: ["a.txt", "nope"] },
+    );
+    expect(nativeError).toBe(`fatal: pathspec '${magic()}nope' did not match any files`);
+    expect(ourException).toBeInstanceOf(StashPathspecResetError);
+    expect((ourException as Error).message).toBe(nativeError);
+  });
+
+  it("-a with an element that matches nothing: the same", async () => {
+    const { ourError, nativeError } = await twinStash(
+      "a-no-match",
+      (d) => {
+        put(d, ".gitignore", "*.log\n");
+        put(d, "x.log", "ignored\n");
+        put(d, "a.txt", "a changed\n");
+      },
+      { a: true, paths: ["a.txt", ":(glob)n*"] },
+    );
+    expect(nativeError).toBe("fatal: pathspec ':(glob,prefix:0)n*' did not match any files");
+    expect(ourError).toBe(nativeError);
+  });
+
+  it("-u naming an ignored file: git add adds the others and fails", async () => {
+    const { ourError, nativeError } = await twinStash(
+      "u-ignored",
+      (d) => {
+        put(d, ".gitignore", "*.log\n");
+        put(d, "x.log", "ignored\n");
+        put(d, "u.txt", "untracked\n");
+        put(d, "a.txt", "a changed\n");
+      },
+      { u: true, paths: ["a.txt", "u.txt", "x.log"] },
+    );
+    expect(nativeError).toContain(
+      "The following paths are ignored by one of your .gitignore files:\nx.log",
+    );
+    expect(ourError).toContain(
+      "The following paths are ignored by one of your .gitignore files:\nx.log",
+    );
+  });
+
+  it("-u --keep-index with an untracked element: checkout names it, the paths stay reset", async () => {
+    const { ourException, nativeError } = await twinStash(
+      "keep-untracked",
+      (d) => {
+        put(d, "a.txt", "a staged\n");
+        run(d, "add", "a.txt");
+        put(d, "d/g.txt", "untracked\n");
+      },
+      { u: true, k: true, paths: ["a.txt", "d/g.txt"] },
+    );
+    expect(nativeError).toBe(
+      `error: pathspec '${magic()}d/g.txt' did not match any file(s) known to git`,
+    );
+    expect(ourException).toBeInstanceOf(StashPathspecResetError);
+    expect((ourException as Error).message).toBe(nativeError);
+  });
+
+  it("short magic elements are spelled out", async () => {
+    const { ourError, nativeError } = await twinStash(
+      "short-magic",
+      (d) => {
+        put(d, "a.txt", "a changed\n");
+      },
+      { u: true, paths: ["a.txt", ":!b.txt", ":/nope"] },
+    );
+    expect(nativeError).toBe("fatal: pathspec ':(top,prefix:0)nope' did not match any files");
+    expect(ourError).toBe(nativeError);
+  });
+
+  const noPatches = 'error: No valid patches in input (allow with "--allow-empty")';
+  for (const variant of [
+    { label: "-u -k", u: true, k: true },
+    { label: "-u", u: true },
+    { label: "-a", a: true },
+    { label: "-a -k", a: true, k: true },
+  ]) {
+    it(`${variant.label}: the add brings the paths back to HEAD, apply -R has no patch`, async () => {
+      const { ours, ourException, nativeError } = await twinStash(
+        `no-patch-${variant.label.replace(/[ -]/g, "")}`,
+        (d) => {
+          run(d, "rm", "-q", "--cached", "c.txt");
+        },
+        { ...variant, paths: ["*.txt"] },
+      );
+      expect(nativeError).toBe(noPatches);
+      expect(ourException).toBeInstanceOf(StashPathspecResetError);
+      expect((ourException as Error).message).toBe(nativeError);
+      // the stash is saved, c.txt re-added and kept (no -k checkout)
+      expect(read(join(ours, "c.txt"))).toBe("1\n2\n3\n4\n5\n6\n7\n8\n9\n");
+      expect(run(ours, "ls-files", "c.txt")).toBe("c.txt");
+      expect(run(ours, "stash", "list")).toContain("stash@{0}");
+    });
+  }
+
+  it("without -u: a path outside the sparse checkout, its flag cleared on read: add -u advises and fails", async () => {
+    const { ours, ourException, nativeError } = await twinStash(
+      "sparse-update",
+      (d) => {
+        run(d, "sparse-checkout", "set", "--cone", "zz");
+        put(d, "d/e.txt", "changed\n");
+      },
+      { paths: ["d/e.txt"] },
+    );
+    expect(nativeError).toContain(
+      `outside of your sparse-checkout definition, so will not be\nupdated in the index:\n${magic()}d/e.txt\n`,
+    );
+    expect(ourException).toBeInstanceOf(StashPathspecResetError);
+    expect((ourException as Error).message).toBe(nativeError);
+    // the stash is saved, git stops after the add: the worktree keeps the edit
+    expect(read(join(ours, "d/e.txt"))).toBe("changed\n");
+    expect(run(ours, "stash", "list")).toContain("stash@{0}");
+  });
+
+  it("without -u: a staged edit undone in the worktree, add -u restores HEAD's blob", async () => {
+    const { ourException, nativeError } = await twinStash(
+      "no-patch-update",
+      (d) => {
+        put(d, "a.txt", "a staged\n");
+        run(d, "add", "a.txt");
+        put(d, "a.txt", "a\n");
+      },
+      { k: true, paths: ["a.txt"] },
+    );
+    expect(nativeError).toBe(noPatches);
+    expect(ourException).toBeInstanceOf(StashPathspecResetError);
+    expect((ourException as Error).message).toBe(nativeError);
   });
 });

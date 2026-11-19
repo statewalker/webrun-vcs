@@ -412,7 +412,12 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     const kind = await this.kind(at);
     if (kind === undefined) return "missing";
     if (kind === "file") return "file";
-    for await (const _ of this.files.list(at)) return "directory";
+    // git's is_empty_dir: a directory it cannot open is not empty
+    try {
+      for await (const _ of this.files.list(at)) return "directory";
+    } catch {
+      return "directory";
+    }
     return "empty-directory";
   }
 
@@ -630,10 +635,20 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
   }
 
   async deleteAdminRootIfEmpty(): Promise<void> {
+    // git's delete_worktrees_dir_if_empty: rmdir, a failed removal ignored
     const root = `${this.commonDir}/worktrees`;
-    if ((await this.kind(root)) !== "directory") return;
-    for await (const _ of this.files.list(root)) return;
-    await this.files.remove(root);
+    try {
+      if ((await this.kind(root)) !== "directory") return;
+      const posix = this.files as PosixFilesApi;
+      if (posix.rmdir) {
+        await posix.rmdir(root);
+        return;
+      }
+      for await (const _ of this.files.list(root)) return;
+      await this.files.remove(root);
+    } catch {
+      // ignored, as git ignores a failed rmdir
+    }
   }
 
   async deleteWorkTree(entry: WorktreeInfo): Promise<void> {

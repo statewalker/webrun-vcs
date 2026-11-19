@@ -46,10 +46,11 @@ export interface WorktreeWalkOptions {
    */
   enterNonRepositoryGitDirs?: boolean;
   /**
-   * Called with the path of each directory whose listing failed (unreadable): the walk goes
-   * on without its content, so a caller removing what it lists keeps that directory.
+   * Called with the path of each directory whose listing failed (unreadable), and the
+   * error the listing failed with: the walk goes on without its content, so a caller
+   * removing what it lists keeps that directory (git warns "could not open directory").
    */
-  onUnreadable?: (path: string) => void;
+  onUnreadable?: (path: string, error?: unknown) => void;
   /**
    * Files (anything but a directory) for which this answers true are passed over: not
    * yielded, and neither stat'ed nor matched against the ignore rules where the worktree can

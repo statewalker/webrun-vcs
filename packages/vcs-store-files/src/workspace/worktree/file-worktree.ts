@@ -103,6 +103,9 @@ export interface FileWorktreeOptions {
   environment?: GitHostEnvironment;
 }
 
+/** How many `getEntry` calls {@link FileWorktree.getEntries} keeps in flight without `lstatMany`. */
+const GET_ENTRIES_IN_FLIGHT = 48;
+
 /**
  * File-based Worktree implementation
  */
@@ -308,7 +311,7 @@ export class FileWorktree implements Worktree {
     currentDepth = 0,
     extra: {
       enterNonRepositoryGitDirs: boolean;
-      onUnreadable?: (path: string) => void;
+      onUnreadable?: (path: string, error?: unknown) => void;
       skipFile?: (path: string) => boolean;
     } = {
       enterNonRepositoryGitDirs: false,
@@ -333,9 +336,9 @@ export class FileWorktree implements Worktree {
         entries = [];
         for await (const entry of files.list(dirPath)) entries.push(entry);
       }
-    } catch {
+    } catch (error) {
       // unreadable: its content is unknown (reported, so nothing is removed on a guess)
-      extra.onUnreadable?.(relativePath);
+      extra.onUnreadable?.(relativePath, error);
       return;
     }
 
@@ -425,11 +428,31 @@ export class FileWorktree implements Worktree {
 
   /**
    * {@link getEntry} of every path: one `lstatMany` where the FilesApi has it (synchronous
-   * lstats, leading directories checked once), else one `getEntry` per path.
+   * lstats, leading directories checked once), else one `getEntry` per path, at most
+   * {@link GET_ENTRIES_IN_FLIGHT} at a time (a slow asynchronous FilesApi, OPFS or one over
+   * `fetch`, is not handed thousands of requests at once).
    */
   async getEntries(paths: readonly string[]): Promise<Array<WorktreeEntry | undefined>> {
     const files = this.files;
-    if (!files.lstatMany) return Promise.all(paths.map((path) => this.getEntry(path)));
+    if (!files.lstatMany) {
+      const out = new Array<WorktreeEntry | undefined>(paths.length);
+      let next = 0;
+      const worker = async () => {
+        while (next < paths.length) {
+          const i = next++;
+          try {
+            out[i] = await this.getEntry(paths[i] as string);
+          } catch (error) {
+            // the first failure rejects the batch: the other workers stop taking paths
+            next = paths.length;
+            throw error;
+          }
+        }
+      };
+      const workers = Math.min(GET_ENTRIES_IN_FLIGHT, paths.length);
+      await Promise.all(Array.from({ length: workers }, worker));
+      return out;
+    }
     const links = await files.lstatMany(paths.map((path) => this.fullPathOf(path)));
     const out = new Array<WorktreeEntry | undefined>(paths.length);
     for (let i = 0; i < paths.length; i++) {

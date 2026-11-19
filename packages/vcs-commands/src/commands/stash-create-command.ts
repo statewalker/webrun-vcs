@@ -1,13 +1,15 @@
-import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
-import type { Staging } from "@statewalker/vcs-working-tree";
+import { EMPTY_TREE_ID, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
+import { flattenTree, type Staging } from "@statewalker/vcs-working-tree";
 
 import {
+  AddFailedError,
   InvalidArgumentError,
   NoHeadError,
   RefNotFoundError,
   StoreNotAvailableError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { AddCommand } from "./add-command.js";
 import { ApplyCommand } from "./apply/apply-command.js";
 import { abbrevLengths } from "./core-config.js";
 import { DiffCommand } from "./diff-command.js";
@@ -16,8 +18,11 @@ import {
   matchPathspec,
   matchPathspecSeen,
   type PathspecItem,
+  type PathspecOriginStyle,
   parsePathspec,
+  parsePathspecItem,
   pathspecErrors,
+  prefixOriginElement,
 } from "./pathspec.js";
 import { reflogMessages, updateHead } from "./reflog-messages.js";
 import { STASH_REF } from "./stash-list-command.js";
@@ -120,6 +125,33 @@ export class StashWorktreeRemovalError extends Error {
 }
 
 /**
+ * `git stash push -- <pathspec>` saved the stash but could not take the stashed changes out
+ * of the index and the worktree: one of the commands git runs after saving failed (git's exit
+ * status 1 in 2.43, 128 in 2.5x). The stash is kept (`stashCommit`) and `errors` holds what
+ * that command printed:
+ *
+ * - `git add -- <pathspec>` (with `-u`/`-a`) died: an element matched no file ("fatal:
+ *   pathspec ':(prefix:0)x' did not match any files", nothing changed), or one named ignored
+ *   files ("The following paths are ignored by one of your .gitignore files", the other
+ *   files added to the index all the same);
+ * - `git apply --index -R` refused the reverse of the stashed changes, the index updated by
+ *   that `git add` and the worktree untouched: a path HEAD has and the index does not exists
+ *   untracked in the worktree ("error: b.txt: already exists in working directory");
+ * - with `--keep-index`, `git checkout --no-overlay <index tree> -- <pathspec>` found an
+ *   element that names nothing ("error: pathspec ':(prefix:0)u' did not match any file(s)
+ *   known to git"): the paths are reset to HEAD, the index tree not checked out.
+ */
+export class StashPathspecResetError extends Error {
+  constructor(
+    readonly stashCommit: ObjectId,
+    readonly errors: string,
+  ) {
+    super(errors);
+    this.name = "StashPathspecResetError";
+  }
+}
+
+/**
  * Command to create a stash commit.
  *
  * Equivalent to `git stash` or `git stash push`.
@@ -156,6 +188,8 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   private author?: PersonIdent;
   private readonly pathspec: string[] = [];
   private staged = false;
+  private compatibility: PathspecOriginStyle = "2.56";
+  private quiet = false;
 
   /**
    * Set the message used when committing index changes.
@@ -251,7 +285,10 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
    * index, as in git), `-u` the untracked files among them, and only those paths are reset
    * to HEAD afterwards (ORIG_HEAD left alone: git resets them with `add` and `apply -R`).
    * Without `-u` every element must match a path of the index, else the command throws
-   * git's "error: pathspec '<p>' did not match any file(s) known to git".
+   * git's "error: pathspec ':(prefix:0)<p>' did not match any file(s) known to git" (git
+   * names the elements as it hands them on, see {@link setCompatibility}). When git's reset
+   * of the paths fails after the stash is saved, the command throws
+   * {@link StashPathspecResetError} and leaves the index and the worktree as git does.
    */
   addPath(path: string): this {
     this.checkCallable();
@@ -269,6 +306,28 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   setStaged(staged: boolean): this {
     this.checkCallable();
     this.staged = staged;
+    return this;
+  }
+
+  /**
+   * The git version whose messages are reproduced where versions differ (default 2.56): the
+   * pathspec elements git's errors name (`:(prefix:0)x` in 2.5x, `:(,prefix:0)x` in 2.43,
+   * see {@link prefixOriginElement}).
+   */
+  setCompatibility(version: PathspecOriginStyle): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
+
+  /**
+   * `git stash push -q`: git's closing "Cannot save the current worktree state" line is left
+   * out of the error when the worktree cannot be stashed (an intent-to-add entry, a path
+   * beyond a symbolic link), as git prints it only without `-q`.
+   */
+  setQuiet(quiet: boolean): this {
+    this.checkCallable();
+    this.quiet = quiet;
     return this;
   }
 
@@ -349,9 +408,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
         const flags = entry.mode === 0o160000 ? DO_MATCH_DIRECTORY : 0;
         matchPathspecSeen(items, entry.path, flags, seen);
       }
-      const originals =
-        items.length > this.pathspec.length ? [...this.pathspec, "."] : [...this.pathspec];
-      const problems = pathspecErrors(originals, seen);
+      const problems = pathspecErrors(this.pathspecOriginals(items), seen);
       if (problems.length > 0) {
         throw new InvalidArgumentError(
           "path",
@@ -386,7 +443,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     const indexTree = await provider.getIndexTree();
     // --staged: the index is the stash's worktree state; nothing staged, nothing stashed
     if (this.staged && indexTree === headCommit.tree) throw new NoStagedChangesError();
-    const workingTree = this.staged ? indexTree : await provider.getWorkingTree();
+    const workingTree = this.staged ? indexTree : await this.worktreeState(provider);
     const untrackedTree =
       this.includeUntracked && provider.getUntrackedTree
         ? await provider.getUntrackedTree({ includeIgnored: this.includeIgnored })
@@ -456,11 +513,21 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
       await this.removeStagedChanges(provider, stashCommit, headCommit.tree, indexTree);
       // `git reset -q --refresh -- <pathspec>`: refs are reset only without a pathspec
       if (this.keepIndex || items.length > 0) return stashCommit;
+    } else if (items.length > 0) {
+      // with a pathspec git resets the paths with `add` and `apply --index -R`: no ref moves
+      await this.resetPaths(
+        provider,
+        items,
+        stashCommit,
+        headCommit.tree,
+        indexTree,
+        workingTree,
+        untrackedTree,
+      );
+      return stashCommit;
     } else {
       // Reset the index and the working directory, as git stash push does
       await provider.resetHard({ ...untrackedOptions, keepIndex: this.keepIndex, indexTree });
-      // with a pathspec git resets the paths with `add` and `apply --index -R`: no ref moves
-      if (items.length > 0) return stashCommit;
     }
     // git stash push runs `git reset --hard` (reset_refs): ORIG_HEAD records HEAD, and
     // HEAD's reflog says "reset: moving to HEAD"
@@ -472,6 +539,149 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     );
 
     return stashCommit;
+  }
+
+  /** The stash's worktree tree; under `-q` without git's "Cannot save ..." line on failure. */
+  private async worktreeState(provider: StashWorkingTreeProvider): Promise<ObjectId> {
+    try {
+      return await provider.getWorkingTree();
+    } catch (error) {
+      const line = "\nCannot save the current worktree state";
+      if (this.quiet && error instanceof Error && error.message.endsWith(line)) {
+        error.message = error.message.slice(0, -line.length);
+      }
+      throw error;
+    }
+  }
+
+  /** The elements as git names them (`item->original` with prefix magic), the implicit "." too. */
+  private pathspecOriginals(items: PathspecItem[]): string[] {
+    const elements = items.length > this.pathspec.length ? [...this.pathspec, "."] : this.pathspec;
+    return elements.map((elem) =>
+      prefixOriginElement(elem, parsePathspecItem(elem), this.compatibility),
+    );
+  }
+
+  /**
+   * `git stash push -- <pathspec>` after the stash is saved: git's `git add [-u|--force] --
+   * <pathspec>`, `git diff-index -p --cached HEAD -- <pathspec> | git apply --index -R` and,
+   * with `--keep-index`, `git checkout --no-overlay <index tree> -- <pathspec>`. The paths
+   * are reset by the provider; where one of git's commands would fail, the state it leaves
+   * is reproduced and {@link StashPathspecResetError} thrown.
+   */
+  private async resetPaths(
+    provider: StashWorkingTreeProvider,
+    items: PathspecItem[],
+    stashCommit: ObjectId,
+    headTree: ObjectId,
+    indexTree: ObjectId,
+    workingTree?: ObjectId,
+    untrackedTree?: ObjectId,
+  ): Promise<void> {
+    const originals = this.pathspecOriginals(items);
+    const worktree = this.workingTreeProvider ? undefined : this.worktreeAccess;
+    const inScope = (path: string, flags = 0) => matchPathspec(items, path, flags) > 0;
+    const add = () => {
+      const command = new AddCommand(this.workingCopy).setCompatibility(this.compatibility);
+      for (const element of originals) command.addFilepattern(element);
+      if (!this.includeUntracked) command.setUpdate(true);
+      if (this.includeIgnored) command.setForce(true);
+      return command;
+    };
+    const failAfterAdd = async (errors: string): Promise<never> => {
+      try {
+        await add().call();
+      } catch (error) {
+        // the index written all the same (ignored paths named): the reset stops there
+        if (!(error instanceof AddFailedError && error.result)) throw error;
+      }
+      throw new StashPathspecResetError(stashCommit, errors);
+    };
+    if (worktree) {
+      // `git add [-u] -- <pathspec>` fails after the stash is saved: it dies (an element
+      // matching no file, with -u/-a), or writes the index and exits 1 (ignored paths named,
+      // entries outside the sparse checkout); git stops there
+      try {
+        await add().setDryRun(true).call();
+      } catch (error) {
+        if (error instanceof AddFailedError && error.result) await failAfterAdd(error.message);
+        if (error instanceof AddFailedError || error instanceof InvalidArgumentError) {
+          throw new StashPathspecResetError(stashCommit, error.message);
+        }
+        throw error;
+      }
+      // `git apply --index -R`: a path HEAD has that the index (after the add) does not is
+      // created again, refused where the worktree has a file there (git's check_to_create)
+      const indexed = new Set<string>();
+      for await (const entry of this.staging.entries()) indexed.add(entry.path);
+      const head = await flattenTree(this.trees, headTree);
+      const exists: string[] = [];
+      for (const [path, entry] of head) {
+        if (indexed.has(path) || !inScope(path, entry.mode === 0o160000 ? DO_MATCH_DIRECTORY : 0))
+          continue;
+        const current = await worktree.getEntry(path);
+        if (!current || current.isDirectory) continue;
+        // the add stages an untracked file (an ignored one only with -a)
+        if (this.includeUntracked && (this.includeIgnored || !(await worktree.isIgnored(path))))
+          continue;
+        exists.push(path);
+      }
+      if (exists.length > 0) {
+        // apply -R lists the patches in reverse
+        exists.sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+        await failAfterAdd(
+          exists.map((p) => `error: ${p}: already exists in working directory`).join("\n"),
+        );
+      }
+      // `git diff-index --cached HEAD -- <pathspec>` empty after the add: `git apply` of no
+      // patch fails ("No valid patches in input"), the index left as the add wrote it
+      if (workingTree) {
+        const side = new Map<string, string>();
+        const scoped = async (tree: ObjectId, into: Map<string, string>) => {
+          for (const [path, e] of await flattenTree(this.trees, tree)) {
+            if (inScope(path, e.mode === 0o160000 ? DO_MATCH_DIRECTORY : 0))
+              into.set(path, `${e.mode} ${e.id}`);
+          }
+        };
+        await scoped(workingTree, side);
+        if (untrackedTree) await scoped(untrackedTree, side);
+        const headSide = new Map<string, string>();
+        await scoped(headTree, headSide);
+        const same =
+          side.size === headSide.size && [...side].every(([p, v]) => headSide.get(p) === v);
+        if (same)
+          await failAfterAdd('error: No valid patches in input (allow with "--allow-empty")');
+      }
+    }
+    // `git checkout --no-overlay <index tree> -- <pathspec>`: every element must name a path
+    // of the reset index or of the index tree, else nothing is checked out
+    let keepIndex = this.keepIndex;
+    let checkoutErrors: string[] = [];
+    if (keepIndex && indexTree !== EMPTY_TREE_ID) {
+      const seen = items.map(() => 0);
+      const mark = (path: string, mode: number) =>
+        matchPathspecSeen(items, path, mode === 0o160000 ? DO_MATCH_DIRECTORY : 0, seen);
+      for await (const entry of this.staging.entries()) {
+        if (!inScope(entry.path, entry.mode === 0o160000 ? DO_MATCH_DIRECTORY : 0)) {
+          mark(entry.path, entry.mode);
+        }
+      }
+      for (const [path, entry] of await flattenTree(this.trees, headTree)) {
+        if (inScope(path, entry.mode === 0o160000 ? DO_MATCH_DIRECTORY : 0)) mark(path, entry.mode);
+      }
+      for (const [path, entry] of await flattenTree(this.trees, indexTree)) mark(path, entry.mode);
+      checkoutErrors = pathspecErrors(originals, seen);
+      if (checkoutErrors.length > 0) keepIndex = false;
+    }
+    await provider.resetHard({
+      includeUntracked: this.includeUntracked,
+      includeIgnored: this.includeIgnored,
+      keepIndex,
+      indexTree,
+    });
+    if (checkoutErrors.length > 0) {
+      throw new StashPathspecResetError(stashCommit, checkoutErrors.join("\n"));
+    }
   }
 
   /**

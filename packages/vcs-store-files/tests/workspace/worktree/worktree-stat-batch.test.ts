@@ -88,3 +88,78 @@ describe("FileWorktree getEntries and walk skipFile", () => {
     expect(statted).not.toContain("/d/sub/c.sh");
   });
 });
+
+describe("FileWorktree getEntries without lstatMany: bounded concurrency", () => {
+  it("keeps a bounded number of FilesApi calls in flight over a slow FilesApi", async () => {
+    const mem = createSymlinkFilesApi(createInMemoryFilesApi());
+    const asked: string[] = [];
+    for (let i = 0; i < 600; i++) {
+      const path = `d${i % 7}/f${i}.txt`;
+      asked.push(path);
+      if (i % 3 !== 0) await mem.write(`/${path}`, [new TextEncoder().encode(`${i}`)]);
+    }
+    asked.push("nope", "d1/nope");
+    let inFlight = 0;
+    let most = 0;
+    // every asynchronous call takes a timer tick, as over OPFS or fetch
+    const slow = new Proxy(mem, {
+      get(target, key, receiver) {
+        const value = Reflect.get(target, key, receiver);
+        if (typeof value !== "function" || key === "lstatMany") return value;
+        return (...args: unknown[]) => {
+          const result = value.apply(target, args);
+          if (!(result instanceof Promise)) return result;
+          inFlight++;
+          most = Math.max(most, inFlight);
+          return new Promise((resolve) => setTimeout(resolve, 1)).then(async () => {
+            try {
+              return await result;
+            } finally {
+              inFlight--;
+            }
+          });
+        };
+      },
+    });
+    const worktree: Worktree = createFileWorktree({
+      files: slow,
+      rootPath: "",
+      gitDir: ".git",
+      ...noStores,
+    });
+    const many = await (worktree.getEntries?.(asked) ?? []);
+    expect(most).toBeGreaterThan(1);
+    expect(most).toBeLessThanOrEqual(64);
+    const plainWorktree = createFileWorktree({
+      files: mem,
+      rootPath: "",
+      gitDir: ".git",
+      ...noStores,
+    });
+    const one = await Promise.all(asked.map((p) => plainWorktree.getEntry(p)));
+    expect(many.map(plain)).toEqual(one.map(plain));
+    expect(many.filter(Boolean)).toHaveLength(400);
+  });
+
+  it("stops taking paths once one getEntry fails, and rejects with that error", async () => {
+    const mem = createSymlinkFilesApi(createInMemoryFilesApi());
+    const asked: string[] = [];
+    for (let i = 0; i < 300; i++) {
+      asked.push(`f${i}.txt`);
+      await mem.write(`/f${i}.txt`, [new TextEncoder().encode(`${i}`)]);
+    }
+    const worktree = createFileWorktree({ files: mem, rootPath: "", gitDir: ".git", ...noStores });
+    const seen: string[] = [];
+    const original = worktree.getEntry.bind(worktree);
+    worktree.getEntry = async (path: string) => {
+      seen.push(path);
+      if (path === "f0.txt") throw new Error("EIO: i/o error");
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      return original(path);
+    };
+    await expect(worktree.getEntries?.(asked)).rejects.toThrow("EIO");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // only the first round of workers ran: none took a path after the failure
+    expect(seen.length).toBeLessThanOrEqual(64);
+  });
+});

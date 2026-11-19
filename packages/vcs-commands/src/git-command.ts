@@ -33,8 +33,11 @@ import { OrderedMap, parseGitBool } from "@statewalker/vcs-utils";
 import {
   type AttributesSourceResolver,
   basicStatMatches,
+  clearSkipWorktreeFromPresentFiles,
   compareWithWorktree,
   IndexChangedError,
+  parseSparseCheckoutPatterns,
+  type SparseCheckoutPatterns,
   type Staging,
   type WorkingCopy,
   type Worktree,
@@ -674,12 +677,48 @@ export abstract class GitCommand<T> {
    */
   protected async readCurrentIndex(refuseUnwritten = true): Promise<void> {
     const staging = this.staging;
-    if (!(await staging.isOutdated())) return;
-    if (staging.hasUnwrittenChanges?.() !== false) {
-      if (!refuseUnwritten) return;
-      throw new IndexChangedError("index");
+    if (await staging.isOutdated()) {
+      if (staging.hasUnwrittenChanges?.() !== false) {
+        if (!refuseUnwritten) return;
+        throw new IndexChangedError("index");
+      }
+      await staging.read();
     }
-    await staging.read();
+    await this.clearPresentSkipWorktree();
+  }
+
+  /**
+   * git's `clear_skip_worktree_from_present_files`, which `repo_read_index` runs on every
+   * index read: with `core.sparseCheckout` on (and `sparse.expectFilesOutsideOfPatterns`
+   * off), a skip-worktree entry whose path exists in the worktree loses the flag, written
+   * with the index when the command writes it. Nothing is stat'ed outside a sparse checkout.
+   */
+  protected async clearPresentSkipWorktree(): Promise<void> {
+    const worktree = this._workingCopy.worktree;
+    if (!worktree || !this._workingCopy.config) return;
+    const config = RemoteConfigStore.from(this._workingCopy);
+    if (parseGitBool(config.value("core.sparseCheckout")) !== true) return;
+    if (parseGitBool(config.value("sparse.expectFilesOutsideOfPatterns")) === true) return;
+    await clearSkipWorktreeFromPresentFiles(this.staging, worktree);
+  }
+
+  /**
+   * The sparse checkout's patterns (`$GIT_DIR/info/sparse-checkout`, cone matching with
+   * `core.sparseCheckoutCone`, case folded with `core.ignoreCase`) for git's
+   * `path_in_sparse_checkout`, or undefined when `core.sparseCheckout` is off (every path
+   * is in the checkout).
+   */
+  protected async sparseCheckoutPatterns(): Promise<SparseCheckoutPatterns | undefined> {
+    if (!this._workingCopy.config) return undefined;
+    const config = RemoteConfigStore.from(this._workingCopy);
+    if (parseGitBool(config.value("core.sparseCheckout")) !== true) return undefined;
+    const cone = parseGitBool(config.value("core.sparseCheckoutCone")) === true;
+    const bytes = await this._workingCopy.checkout
+      ?.readStateFile?.("info/sparse-checkout")
+      .catch(() => undefined);
+    const content = bytes === undefined ? undefined : new TextDecoder().decode(bytes);
+    const ignoreCase = parseGitBool(config.value("core.ignoreCase")) === true;
+    return parseSparseCheckoutPatterns(content, cone, ignoreCase);
   }
 
   /**

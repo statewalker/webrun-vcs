@@ -461,7 +461,9 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
 
   /**
    * Entries in path order, a symbolic link listed as a file of its own size (its target's
-   * length), a dangling one included; a linked directory is never descended into.
+   * length), a dangling one included; a linked directory is never descended into. A
+   * directory that cannot be read (EACCES) fails the listing, as in `listKinds`; a missing
+   * one lists nothing.
    */
   override async *list(path: string, options?: ListOptions): AsyncIterable<FileInfo> {
     const dir = await this.realNoLinks(path);
@@ -479,8 +481,12 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
     try {
       // names as bytes: one that is no valid UTF-8 keeps them (decodeGitPath's escapes)
       entries = await fs.readdir(fsPath(dir), { withFileTypes: true, encoding: "buffer" });
-    } catch {
-      return [];
+    } catch (error) {
+      // gone meanwhile (or no directory): nothing; unreadable (EACCES): thrown, as
+      // `listKinds` throws, so no caller takes an unknown content for an empty directory
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return [];
+      throw error;
     }
     const prefix = virtualDir === "/" ? "" : virtualDir;
     const infos: FileInfo[] = [];

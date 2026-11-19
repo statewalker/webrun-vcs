@@ -5,8 +5,10 @@ import {
   compareWithWorktree,
   type IndexStatUpdate,
   type NestedRepositoryState,
+  type SparseCheckoutPatterns,
   type StagingEntry,
   statUpdateOf,
+  unreadableDirectoryWarning,
   type Worktree,
   type WorktreeEntry,
   withWorktreeEntries,
@@ -31,10 +33,12 @@ import {
 import { configBool } from "./merge-config.js";
 import {
   DO_MATCH_DIRECTORY,
+  DO_MATCH_LEADING_PATHSPEC,
   excludeMatchesPathspec,
   matchPathspec,
   matchPathspecSeen,
   type PathspecItem,
+  type PathspecOriginStyle,
   parsePathspec,
   pathspecErrors,
   pathspecItemPath,
@@ -98,6 +102,9 @@ export class AddCommand extends GitCommand<AddResult> {
   private writeIndex = true;
   private chmod: string | undefined;
   private refreshOnly = false;
+  private compatibility: PathspecOriginStyle = "2.56";
+  /** The sparse checkout's patterns, read at the start (undefined: not a sparse checkout) */
+  private sparsePatterns?: SparseCheckoutPatterns;
   private verbose = false;
 
   /**
@@ -337,6 +344,23 @@ export class AddCommand extends GitCommand<AddResult> {
   }
 
   /**
+   * The git version whose messages are reproduced where versions differ (default 2.56):
+   * the advice's last hint, `Disable this message with "git config set advice.<name>
+   * false"` in 2.5x, `"git config advice.<name> false"` in 2.43.
+   */
+  setCompatibility(version: PathspecOriginStyle): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
+
+  /** git's closing hint of an advice (`advise_if_enabled`), as the version words it. */
+  private disableHint(name: string): string {
+    const command = this.compatibility === "2.43" ? "git config" : "git config set";
+    return `hint: Disable this message with "${command} advice.${name} false"`;
+  }
+
+  /**
    * Whether the index is written at the end (the default). Without, the staging area is
    * only updated in memory and the caller writes it: git commit's partial commit
    * (`add_remove_files`), whose index is written only once the commit is made.
@@ -363,6 +387,7 @@ export class AddCommand extends GitCommand<AddResult> {
     // replaced is read again (git reads the index at its start), unless this instance holds
     // unwritten edits (refused)
     await this.readCurrentIndex();
+    this.sparsePatterns = await this.sparseCheckoutPatterns();
 
     // Validate options - update and all are mutually exclusive
     if (this.update && this.all !== undefined) {
@@ -502,16 +527,25 @@ export class AddCommand extends GitCommand<AddResult> {
       warnings.push(...scan.warnings);
       ignored = scan.ignored;
     }
-    // what the index has matches too (add_pathspec_matches_against_index)
-    // (a skip-worktree path matches here too, where git advises on it instead)
+    // what the index has matches too (add_pathspec_matches_against_index with
+    // PS_IGNORE_SKIP_WORKTREE: a skip-worktree entry is advised on instead)
     for (const group of index) {
+      if (isSkipWorktree(group) || this.outsideSparse(group.path)) continue;
       matchPathspecSeen(items, group.path, group.gitlink ? DO_MATCH_DIRECTORY : 0, seen);
     }
 
-    // 2. an element that matched nothing must name an existing file
+    // 2. an element that matched nothing must name an existing file, unless it matches
+    //    entries outside the sparse checkout (git's advice, the command failing in the end)
+    const sparse: string[] = [];
+    let skipSeen: number[] | undefined;
     for (let i = 0; i < items.length; i++) {
       const item = items[i] as PathspecItem;
       if (item.exclude || seen[i]) continue;
+      skipSeen ??= skipWorktreeSeen(items, index, (path) => this.outsideSparse(path));
+      if (skipSeen[i]) {
+        sparse.push(originals[i] as string);
+        continue;
+      }
       // "Don't complain at 'git add .' on empty repo"
       if (item.match === "") continue;
       // reported as given, its "/" kept (git's dir_add_ignored of the match)
@@ -582,6 +616,8 @@ export class AddCommand extends GitCommand<AddResult> {
       const unmerged = first.stage !== 0;
       // up to date by promise: skip-worktree, assume-unchanged (CE_VALID)
       if (found === undefined) continue;
+      // update_callback passes over paths outside the sparse checkout's patterns
+      if (this.outsideSparse(path)) continue;
       const current = found ?? undefined;
       if (!current && (await worktree.isSpecialFile?.(path))) {
         // a FIFO, socket or device took its place: add_to_index refuses it
@@ -651,19 +687,26 @@ export class AddCommand extends GitCommand<AddResult> {
     }
 
     // 4. the untracked files (add_files)
-    const messages: string[] = [];
+    const messages: string[] = sparse.length > 0 ? this.sparseAdvice(sparse) : [];
     if (ignored.length > 0) {
       messages.push("The following paths are ignored by one of your .gitignore files:", ...ignored);
       if (this.advice("addIgnoredFile")) {
         messages.push(
           "hint: Use -f if you really want to add them.",
-          'hint: Disable this message with "git config set advice.addIgnoredFile false"',
+          this.disableHint("addIgnoredFile"),
         );
       }
     }
     let advisedEmbedded = false;
+    // add_files: an untracked file outside the sparse checkout is advised on, not added
+    const sparseUntracked: string[] = [];
     for (const file of untracked) {
+      // (a repository is the directory entry `sub/`, asked and advised on as such)
       const displayPath = file.repository ? `${file.path}/` : file.path;
+      if (this.outsideSparse(displayPath)) {
+        sparseUntracked.push(displayPath);
+        continue;
+      }
       if ((await addOne(file.path, file.entry, displayPath)) === "failed") {
         if (!ignoreErrors) {
           throw new AddFailedError(
@@ -681,16 +724,17 @@ export class AddCommand extends GitCommand<AddResult> {
         warnings.push(`warning: adding embedded git repository: ${file.path}`);
         if (!advisedEmbedded && this.advice("addEmbeddedRepo")) {
           advisedEmbedded = true;
-          warnings.push(...embeddedRepoAdvice(file.path));
+          warnings.push(...embeddedRepoAdvice(file.path), this.disableHint("addEmbeddedRepo"));
         }
       }
     }
 
+    if (sparseUntracked.length > 0) messages.push(...this.sparseAdvice(sparseUntracked));
     await adder.finish();
     // --chmod: the entries the pathspec matches, once everything is added (chmod_pathspec)
     const chmodErrors = this.chmod && items.length > 0 ? await this.chmodEntries(items) : [];
     // Persist staging changes (required for FileStagingStore)
-    if (this.writeIndex && !this.dryRun) await this.staging.write();
+    if (this.writeIndex && !this.dryRun) await this.writeIfChanged();
 
     const result: AddResult = {
       added,
@@ -701,7 +745,13 @@ export class AddCommand extends GitCommand<AddResult> {
       warnings,
       output,
     };
-    if (ignored.length > 0 || failed.length > 0 || chmodErrors.length > 0) {
+    if (
+      ignored.length > 0 ||
+      failed.length > 0 ||
+      chmodErrors.length > 0 ||
+      sparse.length > 0 ||
+      sparseUntracked.length > 0
+    ) {
       throw new AddFailedError(
         [...messages, ...errors, ...chmodErrors].join("\n"),
         ignored,
@@ -714,6 +764,20 @@ export class AddCommand extends GitCommand<AddResult> {
     return result;
   }
 
+  /**
+   * Writes the index when this add changed it (git's `write_locked_index` with
+   * `SKIP_IF_UNCHANGED`: skip-worktree flags cleared on reading alone write nothing).
+   */
+  private async writeIfChanged(): Promise<void> {
+    if (this.staging.hasUnwrittenChanges?.() === false) return;
+    await this.staging.write();
+  }
+
+  /** Whether `path` is outside the sparse checkout's patterns (git's `!path_in_sparse_checkout`). */
+  private outsideSparse(path: string): boolean {
+    return this.sparsePatterns !== undefined && !this.sparsePatterns.includes(path);
+  }
+
   /** `--chmod` over the entries the pathspec matches (see {@link chmodIndexEntries}). */
   private async chmodEntries(items: PathspecItem[]): Promise<string[]> {
     const flip = (this.chmod as string)[0] as "+" | "-";
@@ -722,7 +786,7 @@ export class AddCommand extends GitCommand<AddResult> {
     return chmodIndexEntries(
       this.staging,
       flip,
-      (e) => matchPathspec(items, e.path, flags(e)) > 0,
+      (e) => !this.outsideSparse(e.path) && matchPathspec(items, e.path, flags(e)) > 0,
       {
         pretend: this.dryRun,
       },
@@ -797,8 +861,20 @@ export class AddCommand extends GitCommand<AddResult> {
               : "M";
       show(`${code}\t${entry.path}`, undefined);
     }
+    // an element that matched nothing dies, unless it matches entries outside the sparse
+    // checkout: git advises on those, writes the index and fails
+    const sparse: string[] = [];
+    let skipSeen: number[] | undefined;
     for (let i = 0; i < items.length; i++) {
       if ((items[i] as PathspecItem).exclude || seen[i]) continue;
+      skipSeen ??= skipWorktreeSeen(items, entries.map(groupOf), (path) =>
+        this.outsideSparse(path),
+      );
+      // (git asks the element itself as a path too: `path_in_sparse_checkout(original)`)
+      if (skipSeen[i] || this.outsideSparse(originals[i] as string)) {
+        sparse.push(originals[i] as string);
+        continue;
+      }
       throw new InvalidArgumentError(
         "filepattern",
         originals[i],
@@ -818,7 +894,7 @@ export class AddCommand extends GitCommand<AddResult> {
       await editor.finish();
       if (this.writeIndex) await this.staging.write();
     }
-    return {
+    const result: AddResult = {
       added: [],
       skipped: [],
       ignored: [],
@@ -827,6 +903,33 @@ export class AddCommand extends GitCommand<AddResult> {
       warnings: [],
       output,
     };
+    if (sparse.length > 0) {
+      throw new AddFailedError(this.sparseAdvice(sparse).join("\n"), [], [], result, output);
+    }
+    return result;
+  }
+
+  /**
+   * git's `advise_on_updating_sparse_paths`: the elements that matched only entries outside
+   * the sparse checkout, and (unless `advice.updateSparsePath` is off) the hint, as git 2.5x
+   * words it (2.43 ends with "git config advice.updateSparsePath false").
+   */
+  private sparseAdvice(elements: string[]): string[] {
+    const lines = [
+      "The following paths and/or pathspecs matched paths that exist",
+      "outside of your sparse-checkout definition, so will not be",
+      "updated in the index:",
+      ...elements,
+    ];
+    if (this.advice("updateSparsePath")) {
+      lines.push(
+        "hint: If you intend to update such entries, try one of the following:",
+        "hint: * Use the --sparse option.",
+        "hint: * Disable or modify the sparsity rules.",
+        this.disableHint("updateSparsePath"),
+      );
+    }
+    return lines;
   }
 
   /**
@@ -930,6 +1033,14 @@ export class AddCommand extends GitCommand<AddResult> {
       // a tracked file is passed over (below too), unstat'ed (git's treat_path)
       skipFile: (path) => indexPaths.has(path),
       ...(prefix ? { pathPrefix: prefix } : {}),
+      // git's "could not open directory" for a directory its scan opens: not one it passes
+      // over as ignored, nor one the pathspec cannot reach into
+      onUnreadable: (path, error) => {
+        if (path === "" || GIT_COMPONENT.test(path)) return;
+        if (!this.force && (ignoredDirs.has(path) || ignoredDirs.has(parentOf(path)))) return;
+        if (!matchPathspec(items, path, DO_MATCH_DIRECTORY | DO_MATCH_LEADING_PATHSPEC)) return;
+        warnings.push(unreadableDirectoryWarning(path, error));
+      },
     })) {
       // ...but git never adds a `.git` (treat_path)
       if (entry.path.includes(".git") && GIT_COMPONENT.test(entry.path)) continue;
@@ -1048,7 +1159,7 @@ export class AddCommand extends GitCommand<AddResult> {
     const adder = await IndexAdder.open(this.staging, this.blobs, trust, { pretend: this.dryRun });
     for (const { path, entries } of index) {
       const entry = entries[0] as StagingEntry;
-      if (entry.stage !== 0 || entry.skipWorktree) continue;
+      if (entry.stage !== 0 || entry.skipWorktree || this.outsideSparse(path)) continue;
       const kind = entry.mode & 0o170000;
       if (kind !== 0o100000 && kind !== 0o120000) continue;
       if (!matchPathspec(items, path, 0)) continue;
@@ -1088,7 +1199,7 @@ export class AddCommand extends GitCommand<AddResult> {
       added.push(path);
     }
     await adder.finish();
-    if (this.writeIndex && !this.dryRun) await this.staging.write();
+    if (this.writeIndex && !this.dryRun) await this.writeIfChanged();
     const result: AddResult = {
       added,
       skipped: [],
@@ -1110,6 +1221,34 @@ interface IndexGroup {
   path: string;
   entries: StagingEntry[];
   gitlink: boolean;
+}
+
+/** Whether the path's entry is a skip-worktree one (outside the sparse checkout). */
+function isSkipWorktree(group: IndexGroup): boolean {
+  const first = group.entries[0] as StagingEntry;
+  return first.stage === 0 && first.skipWorktree === true;
+}
+
+/** One entry as its own group. */
+function groupOf(entry: StagingEntry): IndexGroup {
+  return { path: entry.path, entries: [entry], gitlink: entry.mode === FileMode.GITLINK };
+}
+
+/**
+ * git's `find_pathspecs_matching_skip_worktree`: which elements match a skip-worktree entry
+ * or one outside the sparse checkout's patterns (`matches_skip_worktree`).
+ */
+function skipWorktreeSeen(
+  items: PathspecItem[],
+  index: readonly IndexGroup[],
+  outsideSparse: (path: string) => boolean,
+): number[] {
+  const seen = items.map(() => 0);
+  for (const group of index) {
+    if (!isSkipWorktree(group) && !outsideSparse(group.path)) continue;
+    matchPathspecSeen(items, group.path, group.gitlink ? DO_MATCH_DIRECTORY : 0, seen);
+  }
+  return seen;
 }
 
 /** A path with a `.git` component: never added (git's treat_path). */
@@ -1191,6 +1330,5 @@ function embeddedRepoAdvice(path: string): string[] {
     `hint: \tgit rm --cached ${path}`,
     "hint:",
     'hint: See "git help submodule" for more information.',
-    'hint: Disable this message with "git config set advice.addEmbeddedRepo false"',
   ];
 }
