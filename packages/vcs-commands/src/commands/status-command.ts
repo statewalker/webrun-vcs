@@ -1,6 +1,7 @@
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import {
+  type CacheTree,
   compareWithWorktree,
   findUntrackedFiles,
   getStageState,
@@ -9,10 +10,12 @@ import {
   readConvertedContent,
   refreshIndexStats,
   type StageStateValue,
+  type StagingEntry,
   statUpdateOf,
   trackedUnder,
   type WorkingCopy,
   type Worktree,
+  withWorktreeEntries,
 } from "@statewalker/vcs-working-tree";
 
 import { GitCommand } from "../git-command.js";
@@ -264,11 +267,34 @@ export class StatusCommand extends GitCommand<Status> {
 
   private async compute(worktree: Worktree | undefined): Promise<Status> {
     const head = new Map<string, StatusSide>();
+    // directories where HEAD and the index agree (by the cache-tree): their entries are HEAD's
+    const sameAsHead = new Set<string>();
     const headRef = await this.refsStore.resolve("HEAD");
     if (headRef?.objectId) {
       const headCommit = await this.commits.load(headRef.objectId).catch(() => undefined);
-      if (headCommit) await this.collectTreeEntries(headCommit.tree, "", head);
+      if (headCommit) {
+        const cacheTree = this.staging.getCacheTree?.();
+        await this.collectTreeEntries(headCommit.tree, "", head, cacheTree, sameAsHead);
+      }
     }
+    // (the entries come in path order: the last directory's answer serves its neighbours)
+    let lastDir: string | undefined;
+    let lastInSame = false;
+    const headSideOf = (entry: StagingEntry): StatusSide | undefined => {
+      const found = head.get(entry.path);
+      if (found || sameAsHead.size === 0 || entry.intentToAdd) return found;
+      const path = entry.path;
+      const dir = path.slice(0, Math.max(0, path.lastIndexOf("/")));
+      if (dir !== lastDir) {
+        lastDir = dir;
+        let inSame = sameAsHead.has("");
+        for (let k = path.indexOf("/"); !inSame && k > 0; k = path.indexOf("/", k + 1)) {
+          inSame = sameAsHead.has(path.slice(0, k));
+        }
+        lastInSame = inSame;
+      }
+      return lastInSame ? { mode: entry.mode, id: entry.objectId } : undefined;
+    };
 
     const added = new Set<string>();
     const changed = new Set<string>();
@@ -288,7 +314,18 @@ export class StatusCommand extends GitCommand<Status> {
     const refresh: IndexStatUpdate[] = [];
     const unmerged = new Map<string, [StatusSide?, StatusSide?, StatusSide?]>();
 
-    for await (const entry of this.staging.entries()) {
+    // the stat pass: the files of the entries compared below, stat'ed a chunk at a time
+    const stated = (entry: StagingEntry) =>
+      !!worktree &&
+      entry.stage === 0 &&
+      !entry.skipWorktree &&
+      !entry.assumeValid &&
+      !isGitlink(entry.mode) &&
+      this.matchesPath(entry.path);
+    const entries = worktree
+      ? withWorktreeEntries(worktree, this.staging.entries(), stated)
+      : mapEntries(this.staging.entries());
+    for await (const { item: entry, current } of entries) {
       tracked.add(entry.path);
       if (entry.mode === FileMode.GITLINK) gitlinks.add(entry.path);
       if (!this.matchesPath(entry.path)) continue;
@@ -298,7 +335,7 @@ export class StatusCommand extends GitCommand<Status> {
         unmerged.set(entry.path, stages);
         continue;
       }
-      const h = head.get(entry.path);
+      const h = headSideOf(entry);
       const staged = { mode: entry.mode, id: entry.objectId };
       let x: StatusCode = " ";
       if (!h) {
@@ -323,7 +360,7 @@ export class StatusCommand extends GitCommand<Status> {
       if (worktree && !entry.skipWorktree && !entry.assumeValid) {
         const flags = isGitlink(entry.mode) ? await this.worktreeFlags(entry.path) : undefined;
         if (!flags?.all) {
-          const result = await compareWithWorktree(worktree, entry, { trust, indexTime });
+          const result = await compareWithWorktree(worktree, entry, { trust, indexTime }, current);
           worktreeMode = result.worktreeMode;
           // proved clean only by hashing: its fresh stat goes into the index (git's refresh);
           // changed behind a matching stat: smudged
@@ -655,15 +692,30 @@ export class StatusCommand extends GitCommand<Status> {
   /**
    * Collect all blob entries from a tree recursively.
    */
+  /**
+   * HEAD's blobs below `prefix`. A directory whose cache-tree node is valid and names the
+   * same tree holds exactly the index's entries: it is not read, only noted in `same` (git's
+   * unpack-trees skips such a directory too, `cache_tree_matches_traversal`).
+   */
   private async collectTreeEntries(
     treeId: ObjectId,
     prefix: string,
     entries: Map<string, StatusSide>,
+    node?: CacheTree,
+    same?: Set<string>,
   ): Promise<void> {
+    if (node && same && node.entryCount >= 0 && node.id === treeId) {
+      same.add(prefix);
+      return;
+    }
+    const subtrees =
+      node && node.subtrees.length > 0
+        ? new Map(node.subtrees.map((s) => [s.name, s.tree] as const))
+        : undefined;
     for await (const entry of this.trees.loadTree(treeId)) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
       if (entry.mode === FileMode.TREE) {
-        await this.collectTreeEntries(entry.id, path, entries);
+        await this.collectTreeEntries(entry.id, path, entries, subtrees?.get(entry.name), same);
       } else {
         entries.set(path, { mode: entry.mode, id: entry.id });
       }
@@ -674,4 +726,11 @@ export class StatusCommand extends GitCommand<Status> {
 /** A side's mode and id, as a rename candidate takes them. */
 function side(s: StatusSide): { mode: number; id: ObjectId } {
   return { mode: s.mode, id: s.id };
+}
+
+/** Index entries as `withWorktreeEntries` yields them, none stat'ed (no worktree). */
+async function* mapEntries<T>(
+  entries: AsyncIterable<T>,
+): AsyncIterable<{ item: T; current: undefined }> {
+  for await (const item of entries) yield { item, current: undefined };
 }

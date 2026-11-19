@@ -45,6 +45,11 @@ export interface AddToIndexOptions {
   /** The path as git names it in its messages (`sub/` for a directory found untracked) */
   displayPath?: string;
   onWarning?: (message: string) => void;
+  /**
+   * The path's stage-0 entry in the index as the adder was opened over it, when the caller
+   * holds it already (spares looking it up)
+   */
+  indexed?: StagingEntry;
 }
 
 /** A path `add_to_index` cannot add: git's error lines (`fatal: adding files failed` follows). */
@@ -89,6 +94,42 @@ export async function gitlinkHeadState(
   if (head) return { state: "commit", head };
   const unknown = (await worktree.repositoryState?.(path)) === "unknown";
   return unknown ? { state: "unknown" } : { state: "none" };
+}
+
+/**
+ * git's `chmod_index_entry` over the entries `matches` accepts (`git add --chmod`,
+ * `git update-index --chmod`): a regular file's entry gets the executable bit (`+`) or
+ * loses it (`-`), nothing else of it changes (its cache-tree path is invalidated when the
+ * index is written); skip-worktree entries are left out. Returns git's error line for each
+ * matching entry that is no regular file ("error: cannot chmod +x '<path>'"). With
+ * `pretend` (`--dry-run`) nothing changes, the errors are the same.
+ */
+export async function chmodIndexEntries(
+  staging: Staging,
+  flip: "+" | "-",
+  matches: (entry: StagingEntry) => boolean,
+  options: { pretend?: boolean } = {},
+): Promise<string[]> {
+  const errors: string[] = [];
+  const editor = staging.createEditor();
+  let edited = false;
+  for await (const entry of staging.entries()) {
+    if (entry.skipWorktree || !matches(entry)) continue;
+    if ((entry.mode & 0o170000) !== 0o100000) {
+      errors.push(`error: cannot chmod ${flip}x '${entry.path}'`);
+      continue;
+    }
+    if (options.pretend || entry.stage !== 0) continue;
+    const mode = flip === "+" ? entry.mode | 0o111 : entry.mode & ~0o111;
+    if (mode === entry.mode) continue;
+    edited = true;
+    editor.add({
+      path: entry.path,
+      apply: (existing) => (existing ? { ...existing, mode } : existing),
+    });
+  }
+  if (edited) await editor.finish();
+  return errors;
 }
 
 /**
@@ -163,10 +204,14 @@ export class IndexAdder {
     }
     // sorted already in the index's order; sorted again only if a staging gave another
     // (the engine's string order is the bytes' order without surrogates: checked first)
+    let previousPlain = !SURROGATE.test(adder.basePaths[0] ?? "");
     for (let i = 1; i < adder.basePaths.length; i++) {
       const a = adder.basePaths[i - 1] as string;
       const b = adder.basePaths[i] as string;
-      if (a < b && !SURROGATE.test(a) && !SURROGATE.test(b)) continue;
+      const plain = !SURROGATE.test(b);
+      const aPlain = previousPlain;
+      previousPlain = plain;
+      if (a < b && aPlain && plain) continue;
       if (compareGitPaths(a, b) > 0) {
         adder.basePaths.sort(compareGitPaths);
         break;
@@ -204,8 +249,24 @@ export class IndexAdder {
     entry: WorktreeEntry,
     options: AddToIndexOptions = {},
   ): Promise<AddOutcome> {
-    const indexed = this.hasStage0(path) ? await this.staging.getEntry(path) : undefined;
+    const hint = options.indexed;
+    const indexed = !this.hasStage0(path)
+      ? undefined
+      : hint && hint.path === path && hint.stage === 0
+        ? hint
+        : await this.staging.getEntry(path);
     if (entry.isDirectory) return this.addGitlink(worktree, path, entry, indexed, options);
+    // a tracked file whose stat still matches its entry (and is not racily clean) is not
+    // read again (nor its line endings checked); a renormalisation always reads it. git's
+    // add_to_index returns so before add_index_entry verifies the path
+    if (
+      indexed &&
+      !options.intentToAdd &&
+      !options.renormalize &&
+      this.statUnchanged(indexed, entry)
+    ) {
+      return "unchanged";
+    }
     // add_index_entry's verify_path (after the file is hashed; never with ADD_CACHE_PRETEND)
     if (!this.pretend) {
       const mode = modeFromWorktree(entry.mode, indexed?.mode, this.trust);
@@ -245,10 +306,6 @@ export class IndexAdder {
       this.markAdded(path);
       return "added";
     }
-
-    // a tracked file whose stat still matches its entry (and is not racily clean) is not
-    // read again (nor its line endings checked); a renormalisation always reads it
-    if (indexed && !options.renormalize && this.statUnchanged(indexed, entry)) return "unchanged";
 
     // the mode git's ce_mode_from_stat would record
     const known = indexed ?? this.unmerged.get(path)?.[0];

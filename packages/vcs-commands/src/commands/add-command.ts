@@ -1,10 +1,15 @@
 import { FileMode } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
-import type {
-  NestedRepositoryState,
-  StagingEntry,
-  Worktree,
-  WorktreeEntry,
+import {
+  applyStatUpdate,
+  compareWithWorktree,
+  type IndexStatUpdate,
+  type NestedRepositoryState,
+  type StagingEntry,
+  statUpdateOf,
+  type Worktree,
+  type WorktreeEntry,
+  withWorktreeEntries,
 } from "@statewalker/vcs-working-tree";
 
 import {
@@ -16,7 +21,13 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { worktreeModeTrust } from "./core-config.js";
-import { AddToIndexError, gitlinkHeadState, IndexAdder, readGitlinkHead } from "./index-adder.js";
+import {
+  AddToIndexError,
+  chmodIndexEntries,
+  gitlinkHeadState,
+  IndexAdder,
+  readGitlinkHead,
+} from "./index-adder.js";
 import { configBool } from "./merge-config.js";
 import {
   DO_MATCH_DIRECTORY,
@@ -85,6 +96,48 @@ export class AddCommand extends GitCommand<AddResult> {
   private warnEmbeddedRepo = true;
   private worktreeIterator: Worktree | undefined;
   private writeIndex = true;
+  private chmod: string | undefined;
+  private refreshOnly = false;
+  private verbose = false;
+
+  /**
+   * `git add --chmod=(+|-)x`: after adding, the index entries of the regular files the
+   * pathspec matches get the executable bit set (`+x`) or cleared (`-x`), the files on disk
+   * left as they are. Only with a pathspec, as in git. An entry that is no regular file (a
+   * symbolic link, a submodule) is not changed: git's "error: cannot chmod +x '<path>'",
+   * the command then rejects with `AddFailedError` after writing the index. Any other value
+   * throws git's "fatal: --chmod param '<value>' must be either -x or +x".
+   */
+  setChmod(chmod: string | undefined): this {
+    this.checkCallable();
+    this.chmod = chmod;
+    return this;
+  }
+
+  /**
+   * `git add --refresh`: nothing is added; the index entries the pathspec matches whose
+   * files still hold their content get the files' fresh stat (git's `refresh_index`). The
+   * result's `output` holds what git prints: "<path>: needs merge" for a conflicted path,
+   * and with {@link setVerbose} the porcelain lines ("Unstaged changes after refreshing
+   * the index:", then `M`, `D`, `T`, `A` or `U`, a tab and the path) of every entry that
+   * differs. An element that matches no entry throws git's "fatal: pathspec '<p>' did not
+   * match any files" before the index is written.
+   */
+  setRefresh(refresh: boolean): this {
+    this.checkCallable();
+    this.refreshOnly = refresh;
+    return this;
+  }
+
+  /**
+   * `git add --verbose`: changes what {@link setRefresh} reports (the porcelain lines);
+   * the paths added and removed are in `output` either way.
+   */
+  setVerbose(verbose: boolean): this {
+    this.checkCallable();
+    this.verbose = verbose;
+    return this;
+  }
 
   /**
    * Only tell what would be added or removed (`git add --dry-run`): the result lists the
@@ -322,6 +375,13 @@ export class AddCommand extends GitCommand<AddResult> {
         "fatal: the option '--ignore-missing' requires '--dry-run'",
       );
     }
+    if (this.chmod !== undefined && !/^[+-]x$/.test(this.chmod)) {
+      throw new InvalidArgumentError(
+        "chmod",
+        this.chmod,
+        `fatal: --chmod param '${this.chmod}' must be either -x or +x`,
+      );
+    }
     // git's require_pathspec ("Nothing specified, nothing added."), a renormalisation
     // included: only `-u` and `-A` go without one
     if (this.filepatterns.length === 0 && !(this.update || this.all === true)) {
@@ -358,9 +418,11 @@ export class AddCommand extends GitCommand<AddResult> {
     // one worktree batch: the ignore rules, the configuration and the attributes files are
     // read once for all the files
     const run = () =>
-      this.renormalize
-        ? this.renormalizeFiles(worktree, items, originals)
-        : this.processFiles(worktree, items, originals);
+      this.refreshOnly
+        ? this.refreshFiles(worktree, items, originals)
+        : this.renormalize
+          ? this.renormalizeFiles(worktree, items, originals)
+          : this.processFiles(worktree, items, originals);
     return worktree.batch ? worktree.batch(run) : run();
   }
 
@@ -476,12 +538,14 @@ export class AddCommand extends GitCommand<AddResult> {
       path: string,
       entry: WorktreeEntry,
       displayPath: string,
+      indexed?: StagingEntry,
     ): Promise<"ok" | "failed"> => {
       try {
         const outcome = await adder.add(worktree, path, entry, {
           intentToAdd: this.intentToAdd,
           displayPath,
           onWarning: (message) => warnings.push(message),
+          ...(indexed ? { indexed } : {}),
         });
         // a file turned repository is met twice (`add .`): tracked, then untracked
         if (!addedSet.has(path)) {
@@ -500,15 +564,25 @@ export class AddCommand extends GitCommand<AddResult> {
 
     // 3. the tracked paths (add_files_to_cache: run_diff_files and update_callback)
     const psMatched = items.map(() => 0);
-    for (const group of index) {
+    const matched = index.filter((group) =>
+      matchPathspecSeen(items, group.path, group.gitlink ? DO_MATCH_DIRECTORY : 0, psMatched),
+    );
+    // the stat pass over the matched paths, a chunk at a time (git's preload_index)
+    const stated = (group: (typeof index)[number]) => {
+      const first = group.entries[0] as StagingEntry;
+      return first.stage !== 0 || !(first.skipWorktree || first.assumeValid);
+    };
+    for await (const { item: group, current: found } of withWorktreeEntries(
+      worktree,
+      matched,
+      stated,
+    )) {
       const { path, entries } = group;
-      const flags = group.gitlink ? DO_MATCH_DIRECTORY : 0;
-      if (!matchPathspecSeen(items, path, flags, psMatched)) continue;
       const first = entries[0] as StagingEntry;
       const unmerged = first.stage !== 0;
       // up to date by promise: skip-worktree, assume-unchanged (CE_VALID)
-      if (!unmerged && (first.skipWorktree || first.assumeValid)) continue;
-      const current = await worktree.getEntry(path);
+      if (found === undefined) continue;
+      const current = found ?? undefined;
       if (!current && (await worktree.isSpecialFile?.(path))) {
         // a FIFO, socket or device took its place: add_to_index refuses it
         errors.push(
@@ -553,7 +627,8 @@ export class AddCommand extends GitCommand<AddResult> {
       if (!unmerged && first.mode === FileMode.GITLINK && current.isDirectory) {
         if (!(await readGitlinkHead(worktree, path))) continue;
       }
-      if ((await addOne(path, current, path)) === "failed" && !ignoreErrors) {
+      const indexed = unmerged ? undefined : first;
+      if ((await addOne(path, current, path, indexed)) === "failed" && !ignoreErrors) {
         throw new AddFailedError(
           [...errors, "fatal: updating files failed"].join("\n"),
           [],
@@ -612,6 +687,8 @@ export class AddCommand extends GitCommand<AddResult> {
     }
 
     await adder.finish();
+    // --chmod: the entries the pathspec matches, once everything is added (chmod_pathspec)
+    const chmodErrors = this.chmod && items.length > 0 ? await this.chmodEntries(items) : [];
     // Persist staging changes (required for FileStagingStore)
     if (this.writeIndex && !this.dryRun) await this.staging.write();
 
@@ -624,9 +701,9 @@ export class AddCommand extends GitCommand<AddResult> {
       warnings,
       output,
     };
-    if (ignored.length > 0 || failed.length > 0) {
+    if (ignored.length > 0 || failed.length > 0 || chmodErrors.length > 0) {
       throw new AddFailedError(
-        [...messages, ...errors].join("\n"),
+        [...messages, ...errors, ...chmodErrors].join("\n"),
         ignored,
         failed,
         result,
@@ -635,6 +712,121 @@ export class AddCommand extends GitCommand<AddResult> {
       );
     }
     return result;
+  }
+
+  /** `--chmod` over the entries the pathspec matches (see {@link chmodIndexEntries}). */
+  private async chmodEntries(items: PathspecItem[]): Promise<string[]> {
+    const flip = (this.chmod as string)[0] as "+" | "-";
+    const flags = (entry: StagingEntry) =>
+      entry.mode === FileMode.GITLINK ? DO_MATCH_DIRECTORY : 0;
+    return chmodIndexEntries(
+      this.staging,
+      flip,
+      (e) => matchPathspec(items, e.path, flags(e)) > 0,
+      {
+        pretend: this.dryRun,
+      },
+    );
+  }
+
+  /**
+   * `git add --refresh` (git's `refresh` over `refresh_index` with `REFRESH_QUIET`, or
+   * `REFRESH_IN_PORCELAIN` when verbose): the matching entries compared with their files,
+   * those still holding their content given the fresh stat; the lines git prints in
+   * `output`. An element that matches no entry dies before the index is written.
+   */
+  private async refreshFiles(
+    worktree: Worktree,
+    items: PathspecItem[],
+    originals: string[],
+  ): Promise<AddResult> {
+    const output: string[] = [];
+    let first = true;
+    const show = (porcelain: string, plain: string | undefined) => {
+      if (this.verbose) {
+        if (first) output.push("Unstaged changes after refreshing the index:");
+        first = false;
+        output.push(porcelain);
+      } else if (plain !== undefined) output.push(plain);
+    };
+    const trust = worktreeModeTrust(this.workingCopy, worktree);
+    const indexTime = this.staging.getUpdateTime();
+    const seen = items.map(() => 0);
+    const updates: IndexStatUpdate[] = [];
+    const matched = new Map<StagingEntry, boolean>();
+    const list = this.staging.entryList?.();
+    const entries: StagingEntry[] = [];
+    for await (const entry of list ?? this.staging.entries()) entries.push(entry);
+    // the stat pass over the stage-0 entries the pathspec matches (refresh_index: skip-worktree
+    // entries are passed over before the pathspec is asked)
+    for (const entry of entries) {
+      if (entry.skipWorktree) continue;
+      const flags = entry.mode === FileMode.GITLINK ? DO_MATCH_DIRECTORY : 0;
+      matched.set(entry, matchPathspecSeen(items, entry.path, flags, seen) > 0);
+    }
+    const stated = (entry: StagingEntry) =>
+      entry.stage === 0 &&
+      matched.get(entry) === true &&
+      !entry.assumeValid &&
+      entry.mode !== FileMode.GITLINK;
+    let lastUnmerged: string | undefined;
+    for await (const { item: entry, current } of withWorktreeEntries(worktree, entries, stated)) {
+      if (!matched.has(entry)) continue;
+      if (entry.stage !== 0) {
+        if (entry.path === lastUnmerged) continue;
+        lastUnmerged = entry.path;
+        if (matched.get(entry)) show(`U\t${entry.path}`, `${entry.path}: needs merge`);
+        continue;
+      }
+      // up to date by promise (CE_VALID without --really-refresh)
+      if (!matched.get(entry) || entry.assumeValid) continue;
+      const compared = await compareWithWorktree(worktree, entry, { trust, indexTime }, current);
+      if (!compared.kind && !entry.intentToAdd) {
+        const update = statUpdateOf(entry, compared);
+        if (update && !update.smudge) updates.push(update);
+        continue;
+      }
+      // quiet unless verbose: git prints nothing for an entry that needs updating
+      const code =
+        compared.kind === "deleted"
+          ? "D"
+          : entry.intentToAdd
+            ? "A"
+            : compared.kind === "typechange"
+              ? "T"
+              : "M";
+      show(`${code}\t${entry.path}`, undefined);
+    }
+    for (let i = 0; i < items.length; i++) {
+      if ((items[i] as PathspecItem).exclude || seen[i]) continue;
+      throw new InvalidArgumentError(
+        "filepattern",
+        originals[i],
+        `fatal: pathspec '${originals[i]}' did not match any files`,
+      );
+    }
+    // (written with `--dry-run` too: git's refresh-only add ignores it)
+    if (updates.length > 0) {
+      const now = Date.now();
+      const editor = this.staging.createEditor();
+      for (const update of updates) {
+        editor.add({
+          path: update.path,
+          apply: (existing) => applyStatUpdate(existing, update, now) ?? existing,
+        });
+      }
+      await editor.finish();
+      if (this.writeIndex) await this.staging.write();
+    }
+    return {
+      added: [],
+      skipped: [],
+      ignored: [],
+      removed: [],
+      totalProcessed: 0,
+      warnings: [],
+      output,
+    };
   }
 
   /**
@@ -735,6 +927,8 @@ export class AddCommand extends GitCommand<AddResult> {
       includeDirectories: true,
       // a directory whose `.git` is no repository is an ordinary one (git's treat_directory)
       enterNonRepositoryGitDirs: true,
+      // a tracked file is passed over (below too), unstat'ed (git's treat_path)
+      skipFile: (path) => indexPaths.has(path),
       ...(prefix ? { pathPrefix: prefix } : {}),
     })) {
       // ...but git never adds a `.git` (treat_path)
