@@ -5,11 +5,13 @@
  * (`core.autocrlf`, `core.attributesFile`, includes with `~/`) apply as in git. Its shape is
  * `GitHostEnvironment` of `@statewalker/vcs-working-tree`.
  */
-import { homedir } from "node:os";
+import { homedir, type as osType } from "node:os";
 
 import { type FilesApi, readFile } from "@statewalker/vcs-utils/files";
 
 import { NodeFilesApi } from "@statewalker/webrun-files-node";
+
+import { statHostFile } from "./posix-node-files-api.js";
 
 /** Where the files are; each defaults to the process environment, as git reads it. */
 export interface NodeGitHostEnvironmentOptions {
@@ -46,6 +48,10 @@ export interface NodeGitHostEnvironmentOptions {
 /** The environment as `GitHostEnvironment` describes it. */
 export interface NodeGitHostEnvironment {
   readFile(path: string): Promise<Uint8Array | undefined>;
+  statFile?(path: string): Promise<import("@statewalker/vcs-utils/files").LinkStats | undefined>;
+  systemName?: string;
+  disableUntrackedCache?: boolean;
+  forceUntrackedCache?: boolean;
   home?: string;
   xdgConfigHome?: string;
   systemConfig?: string;
@@ -154,6 +160,21 @@ export function createNodeGitHostEnvironment(
         return undefined;
       }
     },
+    // the host's own files only (an injected FilesApi has no stat of them)
+    ...(options.files
+      ? {}
+      : {
+          statFile: async (path: string) =>
+            statHostFile(path.startsWith("/") ? path : `${process.cwd()}/${path}`),
+        }),
+    // uname's sysname (the untracked cache's ident: "Linux", "Darwin", "Windows_NT")
+    systemName: osType(),
+    ...(env.GIT_DISABLE_UNTRACKED_CACHE !== undefined && envBool(env.GIT_DISABLE_UNTRACKED_CACHE)
+      ? { disableUntrackedCache: true }
+      : {}),
+    ...(env.GIT_FORCE_UNTRACKED_CACHE !== undefined
+      ? { forceUntrackedCache: envBool(env.GIT_FORCE_UNTRACKED_CACHE) }
+      : {}),
     ...(home ? { home } : {}),
     ...(xdgConfigHome ? { xdgConfigHome } : {}),
     ...(systemConfig ? { systemConfig } : {}),

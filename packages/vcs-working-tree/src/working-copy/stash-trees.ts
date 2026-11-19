@@ -13,7 +13,7 @@
  */
 
 import { type Blobs, FileMode, type ObjectId, type Trees } from "@statewalker/vcs-core";
-import type { Staging } from "../staging/staging.js";
+import type { RefreshStatsOptions, Staging } from "../staging/staging.js";
 import { applyStatUpdate, type IndexStatUpdate } from "../staging/stat-refresh.js";
 import type { StagingEntry } from "../staging/types.js";
 import {
@@ -222,9 +222,16 @@ export function statUpdateOf(
 export async function refreshIndexStats(
   staging: Staging,
   updates: IndexStatUpdate[],
+  options?: RefreshStatsOptions,
 ): Promise<boolean> {
+  const untrackedChanged = options?.untrackedCache !== undefined;
+  if (updates.length === 0 && !untrackedChanged) return false;
+  if (typeof staging.refreshStats === "function") {
+    return untrackedChanged
+      ? staging.refreshStats(updates, options)
+      : staging.refreshStats(updates);
+  }
   if (updates.length === 0) return false;
-  if (typeof staging.refreshStats === "function") return staging.refreshStats(updates);
   try {
     // a store without an index file: the same compare-and-set through its editor
     const now = Date.now();

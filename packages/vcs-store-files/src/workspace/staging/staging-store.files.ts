@@ -8,6 +8,7 @@ import type {
   ResolveUndoRecord,
   Staging,
   StagingIndexLock,
+  UntrackedCache,
 } from "@statewalker/vcs-working-tree";
 import {
   clearSkipWorktreeFlags,
@@ -260,6 +261,15 @@ export class FileStagingStore implements Staging {
     return this.indexFile.cacheTree(this._entries);
   }
 
+  getUntrackedCache(): UntrackedCache | undefined {
+    return this.indexFile.untrackedCache(this._entries);
+  }
+
+  setUntrackedCache(cache: UntrackedCache | null): void {
+    this.unwritten = true;
+    this.indexFile.setUntrackedCache(cache, this._entries);
+  }
+
   createEditor(): IndexEditor {
     return new FileStagingEditor(this);
   }
@@ -490,13 +500,17 @@ export class FileStagingStore implements Staging {
    * refresh: only while the file is the one this instance read or wrote, under
    * `index.lock`, and without writing other in-memory edits.
    */
-  async refreshStats(updates: IndexStatUpdate[]): Promise<boolean> {
+  async refreshStats(
+    updates: IndexStatUpdate[],
+    options?: { untrackedCache?: UntrackedCache | null },
+  ): Promise<boolean> {
     const entries = await refreshIndexFile(
       this.indexFile,
       this.indexFile.fresh(),
       this._entries,
       updates,
       this.skipWorktreeCleared,
+      options?.untrackedCache,
     );
     if (!entries) return false;
     this.skipWorktreeCleared = new Set();

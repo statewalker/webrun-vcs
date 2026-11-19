@@ -169,6 +169,20 @@ export interface LinkStats {
   ino?: number;
   uid?: number;
   gid?: number;
+  /**
+   * `st_size` as the storage reports it, a directory's included (where `size` is 0): what
+   * git records of a directory in the untracked cache (`stat_data.sd_size`)
+   */
+  statSize?: number;
+}
+
+/** Options of {@link PosixFilesApi.listKinds}. */
+export interface ListKindsOptions {
+  /**
+   * The entries in the order the storage reads them (POSIX `readdir` order, which git's
+   * untracked cache records), not sorted; storage without such an order ignores it
+   */
+  readdirOrder?: boolean;
 }
 
 /**
@@ -275,7 +289,7 @@ export interface PosixFilesApi extends FilesApi {
    * content is unknown), as does a path beneath a link (`BeyondSymlinkError`). The temporaries of writes in flight are left out, as `list` leaves
    * them out. Optional: callers fall back to `list` and `lstat`.
    */
-  listKinds?(path: string): Promise<DirectoryEntry[]>;
+  listKinds?(path: string, options?: ListKindsOptions): Promise<DirectoryEntry[]>;
   /** The target of the symbolic link at `path` (bytes); undefined if it is not a link */
   readlink?(path: string): Promise<Uint8Array | undefined>;
   /**

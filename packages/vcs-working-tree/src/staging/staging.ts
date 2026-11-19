@@ -8,10 +8,21 @@
  */
 
 import type { ObjectId, Trees } from "@statewalker/vcs-core";
+import type { UntrackedCache } from "../status/untracked-cache.js";
 import type { CacheTree } from "./cache-tree.js";
 import type { ResolveUndoRecord } from "./index-extensions.js";
 import type { IndexStatUpdate, RacyCheck } from "./stat-refresh.js";
 import type { MergeStageValue, StagingEntry, StagingEntryOptions } from "./types.js";
+
+/** What else a {@link Staging.refreshStats} write carries. */
+export interface RefreshStatsOptions {
+  /**
+   * The untracked cache to write with the refreshed stats (`null`: remove it), as git status
+   * writes the index when its untracked cache changed (`UNTRACKED_CHANGED`) even with no
+   * stat to store; undefined keeps the one the index has
+   */
+  untrackedCache?: UntrackedCache | null;
+}
 
 // Re-export types for consumers
 export {
@@ -195,6 +206,19 @@ export interface Staging {
    */
   getCacheTree?(): CacheTree | undefined;
 
+  /**
+   * The index's untracked cache (`UNTR` extension), as read or last written, the directories
+   * of paths added or removed since invalidated; a fresh copy, undefined when there is none.
+   * Absent: a staging area without an index file (no untracked cache).
+   */
+  getUntrackedCache?(): UntrackedCache | undefined;
+
+  /**
+   * Writes `cache` as the index's untracked cache with the next `write` or `refreshStats`
+   * (`null`: none, git's `remove_untracked_cache`).
+   */
+  setUntrackedCache?(cache: UntrackedCache | null): void;
+
   // ========== Persistence ==========
 
   /**
@@ -244,7 +268,7 @@ export interface Staging {
    * without writing other in-memory edits. Returns whether anything was stored. Absent:
    * callers apply the same compare-and-set through an editor.
    */
-  refreshStats?(updates: IndexStatUpdate[]): Promise<boolean>;
+  refreshStats?(updates: IndexStatUpdate[], options?: RefreshStatsOptions): Promise<boolean>;
 
   /**
    * Clears the skip-worktree flag of the entries at `paths` (any stage) as part of reading the

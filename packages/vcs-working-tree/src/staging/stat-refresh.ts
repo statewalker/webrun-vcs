@@ -5,6 +5,7 @@
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
+import type { UntrackedCache } from "../status/untracked-cache.js";
 import { wholeSeconds } from "../status/worktree-status.js";
 import type { IndexFile } from "./index-file.js";
 import type { StagingEntry } from "./types.js";
@@ -138,8 +139,12 @@ export async function refreshIndexFile(
   inMemory: readonly StagingEntry[],
   updates: readonly IndexStatUpdate[],
   skipWorktreeCleared?: ReadonlySet<string>,
+  untrackedCache?: UntrackedCache | null,
 ): Promise<StagingEntry[] | undefined> {
-  if (updates.length === 0 || current.currentChecksum === undefined) return undefined;
+  const untrackedChanged = untrackedCache !== undefined;
+  if ((updates.length === 0 && !untrackedChanged) || current.currentChecksum === undefined) {
+    return undefined;
+  }
   try {
     const read = await fresh.read();
     if (!read || fresh.currentChecksum !== current.currentChecksum) return undefined;
@@ -148,8 +153,10 @@ export async function refreshIndexFile(
     const base =
       (skipWorktreeCleared && clearSkipWorktreeFlags(read.entries, skipWorktreeCleared)) ||
       read.entries;
-    const entries = applyStatUpdates(base, updates, now);
+    // a changed untracked cache is written even with no stat to store (UNTRACKED_CHANGED)
+    const entries = applyStatUpdates(base, updates, now) ?? (untrackedChanged ? base : undefined);
     if (!entries) return undefined;
+    if (untrackedChanged) fresh.setUntrackedCache(untrackedCache, entries);
     fresh.version = current.version;
     await fresh.write(entries);
     current.adopt(fresh);

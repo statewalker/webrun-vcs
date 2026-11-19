@@ -54,9 +54,9 @@ describe("carryIndexExtensions", () => {
     expect(kept.map((e) => e.signature)).toEqual(["TREE", "REUC", "UNTR"]);
   });
 
-  it("drops TREE and UNTR when the entries changed and keeps every REUC record, as git does", () => {
+  it("drops TREE when the entries changed, keeps UNTR (invalidated by the index file) and every REUC record, as git does", () => {
     const kept = carryIndexExtensions(all, [entry("a.txt")], true);
-    expect(kept.map((e) => e.signature)).toEqual(["REUC"]);
+    expect(kept.map((e) => e.signature)).toEqual(["REUC", "UNTR"]);
     const records = parseResolveUndo((kept[0] as IndexExtension).data);
     // a path resolved by removing it (git rm) keeps its record too
     expect(records.map((r) => r.path)).toEqual(["a.txt", "gone.txt"]);

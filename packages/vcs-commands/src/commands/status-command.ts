@@ -3,20 +3,25 @@ import { parseGitBool } from "@statewalker/vcs-utils";
 import {
   type CacheTree,
   compareWithWorktree,
+  compareWithWorktreeStat,
   findUntrackedFiles,
   getStageState,
+  getWorktreeEntries,
+  IndexPathLookup,
   type IndexStatUpdate,
+  isCleanByStat,
   modeFromWorktree,
   readConvertedContent,
   refreshIndexStats,
   type StageStateValue,
   type StagingEntry,
+  scanUntracked,
   statUpdateOf,
   trackedUnder,
   unreadableDirectoryWarning,
   type WorkingCopy,
   type Worktree,
-  withWorktreeEntries,
+  type WorktreeModeTrust,
 } from "@statewalker/vcs-working-tree";
 
 import { GitCommand } from "../git-command.js";
@@ -36,6 +41,7 @@ import {
   submoduleToken,
 } from "../results/status-result.js";
 import { worktreeModeTrust } from "./core-config.js";
+import { hostEnvironmentOf } from "./git-ident.js";
 import {
   type GitmodulesEntry,
   isSubmoduleIgnoreMode,
@@ -44,6 +50,7 @@ import {
   type SubmoduleIgnoreMode,
   submoduleIgnoreFlags,
 } from "./submodule-config.js";
+import { openUntrackedCache } from "./untracked-cache-support.js";
 
 export type { SubmoduleIgnoreMode } from "./submodule-config.js";
 
@@ -59,6 +66,15 @@ const UNMERGED_CODES: Record<number, [StatusCode, StatusCode]> = {
 };
 
 const S_IFMT = 0o170000;
+
+/** HEAD's side of an entry in a directory the cache-tree shows unchanged: the entry's own. */
+const SAME = Symbol("same-as-head");
+
+/** How many files the stat pass asks the worktree for at once. */
+const STAT_CHUNK = 4096;
+
+/** A `.gitignore` path (the untracked cache records the ids of those files). */
+const isIgnoreFilePath = (path: string) => path === ".gitignore" || path.endsWith("/.gitignore");
 const typeOf = (mode: number) => mode & S_IFMT;
 const isGitlink = (mode: number | undefined) => mode === FileMode.GITLINK;
 
@@ -151,7 +167,10 @@ export async function readSubmoduleDirt(
  * (modified at or after the index was written), which is re-hashed as git does. Links are
  * compared as links (mode 120000), the executable bit only where `core.filemode` trusts it,
  * and the ignore rules are read afresh for each status. Untracked files are listed one by
- * one (`--untracked-files=all`).
+ * one (`--untracked-files=all`), through the index's untracked cache (`UNTR`) as git uses
+ * it for that mode (`status.showUntrackedFiles=all`): directories whose stat and ignore
+ * rules are unchanged are not read again, and the cache is written back as git writes it
+ * (`core.untrackedCache`: true writes it, false removes it, unset keeps it).
  *
  * Renames are detected as git's default `status.renames=true` does: a path deleted from the
  * index paired with one added to it (`R  old -> new`), and a path deleted from the worktree
@@ -283,11 +302,12 @@ export class StatusCommand extends GitCommand<Status> {
     // (the entries come in path order: the last directory's answer serves its neighbours)
     let lastDir: string | undefined;
     let lastInSame = false;
-    const headSideOf = (entry: StagingEntry): StatusSide | undefined => {
-      const found = head.get(entry.path);
-      if (found || sameAsHead.size === 0 || entry.intentToAdd) return found;
+    const headOf = (entry: StagingEntry): StatusSide | typeof SAME | undefined => {
       const path = entry.path;
-      const dir = path.slice(0, Math.max(0, path.lastIndexOf("/")));
+      const found = head.get(path);
+      if (found || sameAsHead.size === 0 || entry.intentToAdd) return found;
+      const slash = path.lastIndexOf("/");
+      const dir = slash < 0 ? "" : path.slice(0, slash);
       if (dir !== lastDir) {
         lastDir = dir;
         let inSame = sameAsHead.has("");
@@ -296,7 +316,7 @@ export class StatusCommand extends GitCommand<Status> {
         }
         lastInSame = inSame;
       }
-      return lastInSame ? { mode: entry.mode, id: entry.objectId } : undefined;
+      return lastInSame ? SAME : undefined;
     };
 
     const added = new Set<string>();
@@ -312,103 +332,146 @@ export class StatusCommand extends GitCommand<Status> {
 
     const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
     const indexTime = this.staging.getUpdateTime();
-    const tracked = new Set<string>();
     const gitlinks = new Set<string>();
     const refresh: IndexStatUpdate[] = [];
     const unmerged = new Map<string, [StatusSide?, StatusSide?, StatusSide?]>();
+    // the `.gitignore` files whose entry is up to date (git's ce_uptodate after its refresh):
+    // the untracked cache takes their ids from the index
+    const upToDate = new Set<string>();
 
     // the stat pass: the files of the entries compared below, stat'ed a chunk at a time
+    // (git's preload_index), each entry then compared synchronously where its stat settles
+    // it, so only the few undecided ones (racy, changed, submodules) cost a promise
+    const matchAll = this.paths.length === 0;
     const stated = (entry: StagingEntry) =>
       !!worktree &&
       entry.stage === 0 &&
       !entry.skipWorktree &&
       !entry.assumeValid &&
       !isGitlink(entry.mode) &&
-      this.matchesPath(entry.path);
-    const entries = worktree
-      ? withWorktreeEntries(worktree, this.staging.entries(), stated)
-      : mapEntries(this.staging.entries());
-    for await (const { item: entry, current } of entries) {
-      tracked.add(entry.path);
-      if (entry.mode === FileMode.GITLINK) gitlinks.add(entry.path);
-      if (!this.matchesPath(entry.path)) continue;
-      if (entry.stage !== 0) {
-        const stages = unmerged.get(entry.path) ?? [undefined, undefined, undefined];
-        stages[entry.stage - 1] = { mode: entry.mode, id: entry.objectId };
-        unmerged.set(entry.path, stages);
-        continue;
+      (matchAll || this.matchesPath(entry.path));
+    const all = this.staging.entryList?.() ?? (await collectEntries(this.staging.entries()));
+    // the index's paths by binary search (git's index_name_pos), no set of every path built
+    const index = new IndexPathLookup(all.map((e) => e.path));
+    const tracked = { has: (path: string) => index.has(path) };
+    const wanted: boolean[] = new Array(all.length);
+    for (let start = 0; start < all.length; ) {
+      let end = start;
+      const paths: string[] = [];
+      while (end < all.length && paths.length < STAT_CHUNK) {
+        const entry = all[end] as StagingEntry;
+        const want = stated(entry);
+        wanted[end] = want;
+        if (want) paths.push(entry.path);
+        end++;
       }
-      const h = headSideOf(entry);
-      const staged = { mode: entry.mode, id: entry.objectId };
-      let x: StatusCode = " ";
-      if (h && entry.intentToAdd) {
-        // an intent-to-add entry is in no tree: against HEAD's path it is a deletion (git's
-        // diff-index --cached), the file itself new on the worktree side
-        x = "D";
-        removed.add(entry.path);
-      } else if (!h) {
-        // an added submodule a `submodule.<name>.ignore=all` hides (git's diff_addremove)
-        const hidden = isGitlink(entry.mode) && (await this.indexIgnoresAll(entry.path));
-        if (!entry.intentToAdd && !hidden) {
-          x = "A";
-          added.add(entry.path);
+      const found = worktree && paths.length > 0 ? await getWorktreeEntries(worktree, paths) : [];
+      let k = 0;
+      for (let i = start; i < end; i++) {
+        const entry = all[i] as StagingEntry;
+        const current = wanted[i] ? (found[k++] ?? null) : undefined;
+        if (entry.mode === FileMode.GITLINK) gitlinks.add(entry.path);
+        if (!matchAll && !this.matchesPath(entry.path)) continue;
+        if (entry.stage !== 0) {
+          const stages = unmerged.get(entry.path) ?? [undefined, undefined, undefined];
+          stages[entry.stage - 1] = { mode: entry.mode, id: entry.objectId };
+          unmerged.set(entry.path, stages);
+          continue;
         }
-      } else if (h.id !== entry.objectId || h.mode !== entry.mode) {
-        const hidden =
-          isGitlink(h.mode) && isGitlink(entry.mode) && (await this.indexIgnoresAll(entry.path));
-        if (!hidden) {
-          x = typeOf(h.mode) === typeOf(entry.mode) ? "M" : "T";
-          changed.add(entry.path);
-        }
-      }
-      let y: StatusCode = " ";
-      let worktreeMode: number | undefined = entry.mode;
-      let commitChanged = false;
-      let dirt: SubmoduleDirt = {};
-      if (worktree && !entry.skipWorktree && !entry.assumeValid) {
-        const flags = isGitlink(entry.mode) ? await this.worktreeFlags(entry.path) : undefined;
-        if (!flags?.all) {
-          const result = await compareWithWorktree(worktree, entry, { trust, indexTime }, current);
-          worktreeMode = result.worktreeMode;
-          // proved clean only by hashing: its fresh stat goes into the index (git's refresh);
-          // changed behind a matching stat: smudged
-          const update = statUpdateOf(entry, result);
-          if (update) refresh.push(update);
-          if (flags && result.kind === "modified") commitChanged = true;
-          // a populated submodule's own index and worktree (git's is_submodule_modified)
-          if (flags && !flags.dirty && result.worktreeEntry?.isDirectory) {
-            dirt = await readSubmoduleDirt(worktree, entry.path, flags.untracked);
-          }
-          if (result.kind === "deleted") {
-            y = "D";
-            missing.add(entry.path);
-          } else if (result.kind || dirt.modified || dirt.untracked) {
-            y = result.kind === "typechange" ? "T" : "M";
-            modified.add(entry.path);
-          } else if (entry.intentToAdd) {
-            y = "A";
+        // HEAD's side: SAME (a directory the cache-tree shows unchanged) is the entry itself
+        const head = headOf(entry);
+        let x: StatusCode = " ";
+        if (head === SAME) {
+          // HEAD and the index agree
+        } else if (head && entry.intentToAdd) {
+          // an intent-to-add entry is in no tree: against HEAD's path it is a deletion (git's
+          // diff-index --cached), the file itself new on the worktree side
+          x = "D";
+          removed.add(entry.path);
+        } else if (!head) {
+          // an added submodule a `submodule.<name>.ignore=all` hides (git's diff_addremove)
+          const hidden = isGitlink(entry.mode) && (await this.indexIgnoresAll(entry.path));
+          if (!entry.intentToAdd && !hidden) {
+            x = "A";
             added.add(entry.path);
           }
+        } else if (head.id !== entry.objectId || head.mode !== entry.mode) {
+          const hidden =
+            isGitlink(head.mode) &&
+            isGitlink(entry.mode) &&
+            (await this.indexIgnoresAll(entry.path));
+          if (!hidden) {
+            x = typeOf(head.mode) === typeOf(entry.mode) ? "M" : "T";
+            changed.add(entry.path);
+          }
+        }
+        let y: StatusCode = " ";
+        let worktreeMode: number | undefined = entry.mode;
+        let commitChanged = false;
+        let dirt: SubmoduleDirt = {};
+        if (worktree && (entry.skipWorktree || entry.assumeValid)) {
+          // git's refresh takes these as up to date (CE_SKIP_WORKTREE, CE_VALID)
+          if (isIgnoreFilePath(entry.path)) upToDate.add(entry.path);
+        } else if (
+          current !== undefined &&
+          isCleanByStat(entry, current, trust as WorktreeModeTrust, indexTime)
+        ) {
+          // clean by its stat: nothing to report, nothing to refresh
+          if (isIgnoreFilePath(entry.path)) upToDate.add(entry.path);
+        } else if (worktree) {
+          const flags = isGitlink(entry.mode) ? await this.worktreeFlags(entry.path) : undefined;
+          if (!flags?.all) {
+            const result =
+              (current !== undefined &&
+                compareWithWorktreeStat(entry, current, trust as WorktreeModeTrust, indexTime)) ||
+              (await compareWithWorktree(worktree, entry, { trust, indexTime }, current));
+            worktreeMode = result.worktreeMode;
+            // proved clean only by hashing: its fresh stat goes into the index (git's refresh);
+            // changed behind a matching stat: smudged
+            if (result.hashedId !== undefined || result.smudge) {
+              const update = statUpdateOf(entry, result);
+              if (update) refresh.push(update);
+            }
+            if (!result.kind && isIgnoreFilePath(entry.path)) upToDate.add(entry.path);
+            if (flags && result.kind === "modified") commitChanged = true;
+            // a populated submodule's own index and worktree (git's is_submodule_modified)
+            if (flags && !flags.dirty && result.worktreeEntry?.isDirectory) {
+              dirt = await readSubmoduleDirt(worktree, entry.path, flags.untracked);
+            }
+            if (result.kind === "deleted") {
+              y = "D";
+              missing.add(entry.path);
+            } else if (result.kind || dirt.modified || dirt.untracked) {
+              y = result.kind === "typechange" ? "T" : "M";
+              modified.add(entry.path);
+            } else if (entry.intentToAdd) {
+              y = "A";
+              added.add(entry.path);
+            }
+          }
+        }
+        if (x !== " " || y !== " ") {
+          const staged = { mode: entry.mode, id: entry.objectId };
+          const h = head === SAME ? staged : head;
+          // git's v2 line of an intent-to-add entry: no index side while the file is there
+          // (".A", "DA" over a path of HEAD), and the placeholder as the index side once it is
+          // gone (".D" with the placeholder as the HEAD side too, "DD" with HEAD's)
+          const ita = entry.intentToAdd;
+          files.push({
+            path: entry.path,
+            index: x,
+            worktree: y,
+            head: ita && y === "D" ? (h ?? staged) : h,
+            staged: ita && y === "A" ? undefined : staged,
+            worktreeMode,
+            ...(commitChanged ? { submoduleCommitChanged: true } : {}),
+            ...(dirt.modified ? { submoduleModified: true } : {}),
+            ...(dirt.untracked ? { submoduleUntracked: true } : {}),
+            ...(ita ? { intentToAdd: true } : {}),
+          });
         }
       }
-      if (x !== " " || y !== " ") {
-        // git's v2 line of an intent-to-add entry: no index side while the file is there
-        // (".A", "DA" over a path of HEAD), and the placeholder as the index side once it is
-        // gone (".D" with the placeholder as the HEAD side too, "DD" with HEAD's)
-        const ita = entry.intentToAdd;
-        files.push({
-          path: entry.path,
-          index: x,
-          worktree: y,
-          head: ita && y === "D" ? (h ?? staged) : h,
-          staged: ita && y === "A" ? undefined : staged,
-          worktreeMode,
-          ...(commitChanged ? { submoduleCommitChanged: true } : {}),
-          ...(dirt.modified ? { submoduleModified: true } : {}),
-          ...(dirt.untracked ? { submoduleUntracked: true } : {}),
-          ...(ita ? { intentToAdd: true } : {}),
-        });
-      }
+      start = end;
     }
 
     for (const [path, stages] of unmerged) {
@@ -436,27 +499,66 @@ export class StatusCommand extends GitCommand<Status> {
     const warnings: string[] = [];
     if (this.detectsRenames()) await this.pairRenames(files, renamed, worktree, warnings);
 
+    // the index's untracked cache, as core.untrackedCache has it (git's tweak_untracked_cache)
+    const host = worktree ? await worktree.untrackedScanHost?.() : undefined;
+    const untrackedCache = openUntrackedCache(
+      this.staging,
+      this.config,
+      hostEnvironmentOf(this.workingCopy),
+      host,
+    );
     if (worktree && this.showUntracked) {
-      for await (const file of findUntrackedFiles(worktree, (p) => tracked.has(p), {
-        hasTrackedUnder: trackedUnder(tracked),
-        isGitlink: (p) => gitlinks.has(p),
-        includeIgnored: this.showIgnored,
-        filter: (p) => this.matchesPath(p),
-        // git's "could not open directory" for each directory its scan cannot list
-        onUnreadable: (path, error) => warnings.push(unreadableDirectoryWarning(path, error)),
-      })) {
-        if (file.ignored) {
-          ignored.add(file.path);
-          files.push({ path: file.path, index: "!", worktree: "!" });
-        } else {
-          untracked.add(file.path);
-          files.push({ path: file.path, index: "?", worktree: "?" });
+      const onUnreadable = (path: string, error: unknown) =>
+        warnings.push(unreadableDirectoryWarning(path, error));
+      if (host && !this.showIgnored) {
+        // git's read_directory: through the untracked cache for a whole-tree scan
+        const cache = matchAll ? await untrackedCache.forScan() : undefined;
+        const ignoreFiles = this.indexIgnoreOids(all, upToDate);
+        const result = await scanUntracked(host, {
+          isTracked: (p) => tracked.has(p),
+          trackedIn: (dir) => index.trackedIn(dir),
+          indexDirectory: (dir) =>
+            gitlinks.has(dir) ? "gitlink" : index.hasEntriesBelow(dir) ? "directory" : undefined,
+          indexIgnoreOid: (p) => ignoreFiles.get(p),
+          ...(cache ? { cache } : {}),
+          indexSeconds: Math.floor(indexTime / 1000),
+          ...(trust ? { stat: { ctime: trust.ctime, fullStat: trust.fullStat } } : {}),
+          // git's "could not open directory" for each directory its scan cannot list
+          onUnreadable: (path, error) => {
+            if (matchAll || this.matchesPath(path)) onUnreadable(path, error);
+          },
+        });
+        for (const path of result.paths) {
+          if (!matchAll && !this.matchesPath(path)) continue;
+          untracked.add(path);
+          files.push({ path, index: "?", worktree: "?" });
+        }
+      } else {
+        for await (const file of findUntrackedFiles(worktree, (p) => tracked.has(p), {
+          hasTrackedUnder: trackedUnder(index.all),
+          isGitlink: (p) => gitlinks.has(p),
+          includeIgnored: this.showIgnored,
+          filter: (p) => this.matchesPath(p),
+          onUnreadable,
+        })) {
+          if (file.ignored) {
+            ignored.add(file.path);
+            files.push({ path: file.path, index: "!", worktree: "!" });
+          } else {
+            untracked.add(file.path);
+            files.push({ path: file.path, index: "?", worktree: "?" });
+          }
         }
       }
     }
 
-    // as git status: the refreshed stats written back when the index is free and unchanged
-    await refreshIndexStats(this.staging, refresh);
+    // as git status: the refreshed stats written back when the index is free and unchanged,
+    // with the untracked cache when it changed
+    await refreshIndexStats(
+      this.staging,
+      refresh,
+      untrackedCache.changed() ? { untrackedCache: untrackedCache.cache ?? null } : undefined,
+    );
 
     return new StatusImpl(added, changed, removed, conflicting, {
       modified,
@@ -468,6 +570,24 @@ export class StatusCommand extends GitCommand<Status> {
       renamed,
       warnings,
     });
+  }
+
+  /**
+   * The ids the untracked cache takes from the index for `.gitignore` files (git's
+   * `add_patterns`): the stage-0 entry's, where the file is up to date with it or the entry
+   * is skip-worktree (read from the index then).
+   */
+  private indexIgnoreOids(
+    entries: readonly StagingEntry[],
+    upToDate: ReadonlySet<string>,
+  ): Map<string, string> {
+    const out = new Map<string, string>();
+    if (upToDate.size === 0) return out;
+    for (const entry of entries) {
+      if (entry.stage !== 0 || !upToDate.has(entry.path)) continue;
+      out.set(entry.path, entry.objectId);
+    }
+    return out;
   }
 
   /** Whether renames are detected: the setter, else `status.renames`, else `diff.renames`. */
@@ -743,9 +863,9 @@ function side(s: StatusSide): { mode: number; id: ObjectId } {
   return { mode: s.mode, id: s.id };
 }
 
-/** Index entries as `withWorktreeEntries` yields them, none stat'ed (no worktree). */
-async function* mapEntries<T>(
-  entries: AsyncIterable<T>,
-): AsyncIterable<{ item: T; current: undefined }> {
-  for await (const item of entries) yield { item, current: undefined };
+/** The index entries of a staging without `entryList`, in order. */
+async function collectEntries(entries: AsyncIterable<StagingEntry>): Promise<StagingEntry[]> {
+  const out: StagingEntry[] = [];
+  for await (const entry of entries) out.push(entry);
+  return out;
 }

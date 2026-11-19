@@ -178,6 +178,8 @@ export async function compareWithWorktree(
   // `prefetched`: the entry's file as a stat pass found it (`withWorktreeEntries`), null for none
   const current =
     prefetched === undefined ? await worktree.getEntry(entry.path) : (prefetched ?? undefined);
+  const quick = compareWithWorktreeStat(entry, current ?? null, trust, options.indexTime ?? 0);
+  if (quick) return quick;
   if (entry.mode === FileMode.GITLINK) {
     // a submodule: its directory (populated or not) is no change; its contents are not ours
     if (!current) return { kind: "deleted" };
@@ -190,6 +192,58 @@ export async function compareWithWorktree(
     }
     return { kind: "typechange", worktreeEntry: current, worktreeMode: current.mode };
   }
+  // undecided by the stat: a file of the entry's kind whose stat changed (or is racy) while
+  // its size did not
+  const file = current as WorktreeEntry;
+  const found = {
+    worktreeEntry: file,
+    worktreeMode: modeFromWorktree(file.mode, entry.mode, trust),
+  };
+  const statMatches = basicStatMatches(entry, file, trust);
+  const racy = isRacy(entry.mtime, entry.mtimeNs, options.indexTime ?? 0);
+  const hashedId = await worktree.computeHash(entry.path);
+  if (hashedId === entry.objectId) return { ...found, hashedId };
+  // a racy entry that changed: smudged when the index is written, as git does for an entry
+  // its own (coarser) stat check would take as clean
+  return { kind: "modified", ...found, hashedId, ...(statMatches && racy ? { smudge: true } : {}) };
+}
+
+/**
+ * Whether the file still holds the entry by its stat alone, without allocating: a file (or
+ * link) of the entry's kind and mode whose stat matches and is not racy. The common answer
+ * of a stat pass; anything else goes to {@link compareWithWorktreeStat}.
+ */
+export function isCleanByStat(
+  entry: StagingEntry,
+  current: WorktreeEntry | null,
+  trust: WorktreeModeTrust,
+  indexTime: number,
+): boolean {
+  if (!current || current.isDirectory || entry.intentToAdd) return false;
+  if (entry.mode === FileMode.GITLINK) return false;
+  const worktreeMode = modeFromWorktree(current.mode, entry.mode, trust);
+  if (worktreeMode !== entry.mode) return false;
+  if (!basicStatMatches(entry, current, trust)) return false;
+  return !isRacy(entry.mtime, entry.mtimeNs, indexTime);
+}
+
+/**
+ * {@link compareWithWorktree} for the entries its stat settles, synchronously: a file
+ * missing, of another kind or mode, clean by a stat that is not racy, or changed in size.
+ * Undefined when the answer needs a read (a submodule, a racy or stat-changed same-size
+ * file): the caller then awaits `compareWithWorktree`. A stat pass over many entries calls
+ * this first so that only the few undecided ones cost a promise.
+ *
+ * @param current The entry's file as the stat pass found it (null: nothing there)
+ * @param indexTime When the index was written (ms); 0 makes every entry racy
+ */
+export function compareWithWorktreeStat(
+  entry: StagingEntry,
+  current: WorktreeEntry | null,
+  trust: WorktreeModeTrust,
+  indexTime: number,
+): WorktreeComparison | undefined {
+  if (entry.mode === FileMode.GITLINK) return undefined;
   if (!current) return { kind: "deleted" };
   // a directory where the file was: deleted, the directory kept for the caller to see
   if (current.isDirectory) return { kind: "deleted", worktreeEntry: current };
@@ -200,11 +254,9 @@ export async function compareWithWorktree(
   if (entry.mode !== FileMode.SYMLINK && worktreeMode !== entry.mode) {
     return { kind: "modified", ...found };
   }
-  const indexTime = options.indexTime ?? 0;
   const statMatches = basicStatMatches(entry, current, trust);
   // racy git: an entry not older than the index file may hide a same-size change
-  const racy = isRacy(entry.mtime, entry.mtimeNs, indexTime);
-  if (statMatches && !racy) return found;
+  if (statMatches && !isRacy(entry.mtime, entry.mtimeNs, indexTime)) return found;
   // a known size that differs is a change, without reading the file (git: DATA_CHANGED)
   if (
     entry.size !== 0 &&
@@ -214,11 +266,7 @@ export async function compareWithWorktree(
   ) {
     return { kind: "modified", ...found };
   }
-  const hashedId = await worktree.computeHash(entry.path);
-  if (hashedId === entry.objectId) return { ...found, hashedId };
-  // a racy entry that changed: smudged when the index is written, as git does for an entry
-  // its own (coarser) stat check would take as clean
-  return { kind: "modified", ...found, hashedId, ...(statMatches && racy ? { smudge: true } : {}) };
+  return undefined;
 }
 
 /** One index entry that no longer matches the worktree. */

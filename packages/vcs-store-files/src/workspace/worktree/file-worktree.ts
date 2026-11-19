@@ -38,6 +38,7 @@ import type {
   IgnoreManager,
   NestedRepositoryState,
   NewHasher,
+  UntrackedScanHost,
   Worktree,
   WorktreeCapabilities,
   WorktreeCheckoutOptions,
@@ -302,6 +303,107 @@ export class FileWorktree implements Worktree {
     );
   }
 
+  async untrackedScanHost(): Promise<UntrackedScanHost> {
+    const files = this.files;
+    // the batch's rules: a .gitignore read here serves later checks of the batch
+    const loaded = this.batchIgnores ?? new Set<string>();
+    if (!loaded.has("<excludes>")) {
+      loaded.add("<excludes>");
+      await this.loadRepositoryExcludes();
+    }
+    const full = (path: string) => (path ? this.fullPathOf(path) : this.rootPath || "/");
+    const lstat = async (path: string): Promise<LinkStats | undefined> => {
+      try {
+        return await files.lstat?.(full(path));
+      } catch (error) {
+        if (isBeyondSymlinkError(error)) return undefined;
+        throw error;
+      }
+    };
+    const gitDir = this.gitDir;
+    return {
+      worktreePath: this.hostPath,
+      listDirectory: async (path, readdirOrder) => {
+        const dirPath = full(path);
+        if (files.listKinds) return files.listKinds(dirPath, { readdirOrder });
+        const out: Array<{ name: string; kind?: LinkStats["kind"] }> = [];
+        for await (const entry of files.list(dirPath)) {
+          out.push({
+            name: entry.name,
+            kind: entry.kind === "directory" ? "directory" : undefined,
+          });
+        }
+        return out;
+      },
+      lstat: files.lstat ? lstat : async (path) => this.statsAsLink(full(path)),
+      loadIgnoreFile: async (dir) => {
+        const result = await this.readIgnoreFile(dir, files);
+        loaded.add(dir);
+        return result;
+      },
+      isExcluded: (path, isDirectory) => this.ignoreManager.isIgnored(path, isDirectory),
+      isNestedRepository: (path) => this.hasGitDirectory(full(path), files),
+      readInfoExclude: async () => {
+        if (!gitDir) return undefined;
+        const path = joinPath(gitDir, "info", "exclude");
+        try {
+          const stat = files.lstat ? await files.lstat(path) : await this.statsAsLink(path);
+          if (stat?.kind !== "file") return undefined;
+          return { bytes: await readFile(files, path), stat };
+        } catch {
+          return undefined;
+        }
+      },
+    };
+  }
+
+  /** `stats` as a `LinkStats` (a FilesApi without `lstat`). */
+  private async statsAsLink(fullPath: string): Promise<LinkStats | undefined> {
+    const stats = await this.files.stats(fullPath).catch(() => undefined);
+    if (!stats) return undefined;
+    return {
+      kind: stats.kind === "directory" ? "directory" : "file",
+      size: stats.size ?? 0,
+      lastModified: stats.lastModified ?? 0,
+    };
+  }
+
+  /**
+   * Reads `<dir>/.gitignore` for the untracked scan and makes its rules `dir`'s (git's
+   * `add_patterns` with PATTERN_NOFOLLOW): a link or anything but a file is not opened, and
+   * one git cannot open is read from its skip-worktree index entry.
+   */
+  private async readIgnoreFile(
+    dir: string,
+    files: WorktreeFilesApi,
+  ): Promise<{ kind: "missing" } | { kind: "file"; bytes: Uint8Array; stat: LinkStats }> {
+    const path = dir ? `${dir}/.gitignore` : ".gitignore";
+    const fullPath = this.fullPathOf(path);
+    let result: { kind: "missing" } | { kind: "file"; bytes: Uint8Array; stat: LinkStats } = {
+      kind: "missing",
+    };
+    try {
+      const stat = files.lstat
+        ? await files.lstat(fullPath)
+        : (await files.exists(fullPath))
+          ? await this.statsAsLink(fullPath)
+          : undefined;
+      if (stat?.kind === "file") {
+        result = { kind: "file", bytes: await readFile(files, fullPath), stat };
+      }
+    } catch {
+      result = { kind: "missing" };
+    }
+    let text: string | undefined;
+    if (result.kind === "file") text = decodeGitPatternFile(result.bytes);
+    else if (this.skipWorktreeIgnoreReader) {
+      text = await this.skipWorktreeIgnoreReader(path).catch(() => undefined);
+    }
+    if (this.ignoreManager.setIgnoreFile) this.ignoreManager.setIgnoreFile(dir, text);
+    else if (text !== undefined) this.ignoreManager.addIgnoreFile(dir, text);
+    return result;
+  }
+
   private async *walkDirectory(
     loaded: Set<string>,
     files: WorktreeFilesApi,
@@ -481,28 +583,9 @@ export class FileWorktree implements Worktree {
    * is worked out when asked (a stat pass over tracked files never asks).
    */
   private fileEntry(path: string, link: LinkStats): WorktreeEntry {
-    const slash = path.lastIndexOf("/");
-    const ignoreManager = this.ignoreManager;
-    let ignored: boolean | undefined;
-    return {
-      path,
-      name: slash < 0 ? path : path.slice(slash + 1),
-      mode: this.modeOf(link, false),
-      size: link.size,
-      mtime: link.lastModified,
-      ctime: link.ctime,
-      mtimeNs: link.mtimeNs,
-      ctimeNs: link.ctimeNs,
-      dev: link.dev,
-      ino: link.ino,
-      uid: link.uid,
-      gid: link.gid,
-      isDirectory: false,
-      get isIgnored(): boolean {
-        ignored ??= ignoreManager.isIgnored(path, false);
-        return ignored;
-      },
-    };
+    // one object of a fixed shape per file, its name and ignore state worked out when asked
+    // (a stat pass over tens of thousands of tracked files asks for neither)
+    return new StatEntry(path, this.modeOf(link, false), link, this.ignoreManager);
   }
 
   async getEntry(path: string): Promise<WorktreeEntry | undefined> {
@@ -1662,6 +1745,75 @@ function resolveDots(path: string): string | undefined {
 
 /** What a walk takes of a directory `listKinds` reported (it stats none). */
 const DIRECTORY_STATS: LinkStats = { kind: "directory", size: 0, lastModified: 0 };
+
+/**
+ * The worktree entry of a file or link a stat pass found: plain fields, with `name` and
+ * `isIgnored` computed on first use (getters on the prototype, not a closure per entry).
+ */
+class StatEntry implements WorktreeEntry {
+  readonly size: number;
+  readonly mtime: number;
+  readonly ctime: number | undefined;
+  readonly mtimeNs: number | undefined;
+  readonly ctimeNs: number | undefined;
+  readonly dev: number | undefined;
+  readonly ino: number | undefined;
+  readonly uid: number | undefined;
+  readonly gid: number | undefined;
+  readonly isDirectory = false;
+  // ES private fields: no own enumerable properties beyond the entry's (a spread or a deep
+  // comparison sees only those)
+  #ignored: boolean | undefined;
+  readonly #ignoreManager: IgnoreManager;
+
+  constructor(
+    readonly path: string,
+    readonly mode: number,
+    link: LinkStats,
+    ignoreManager: IgnoreManager,
+  ) {
+    this.#ignoreManager = ignoreManager;
+    this.size = link.size;
+    this.mtime = link.lastModified;
+    this.ctime = link.ctime;
+    this.mtimeNs = link.mtimeNs;
+    this.ctimeNs = link.ctimeNs;
+    this.dev = link.dev;
+    this.ino = link.ino;
+    this.uid = link.uid;
+    this.gid = link.gid;
+  }
+
+  get name(): string {
+    const slash = this.path.lastIndexOf("/");
+    return slash < 0 ? this.path : this.path.slice(slash + 1);
+  }
+
+  get isIgnored(): boolean {
+    this.#ignored ??= this.#ignoreManager.isIgnored(this.path, false);
+    return this.#ignored;
+  }
+
+  /** The plain fields, as an object literal entry has them (`{ ...entry }` copies them). */
+  toJSON(): WorktreeEntry {
+    return {
+      path: this.path,
+      name: this.name,
+      mode: this.mode,
+      size: this.size,
+      mtime: this.mtime,
+      ctime: this.ctime,
+      mtimeNs: this.mtimeNs,
+      ctimeNs: this.ctimeNs,
+      dev: this.dev,
+      ino: this.ino,
+      uid: this.uid,
+      gid: this.gid,
+      isDirectory: false,
+      isIgnored: this.isIgnored,
+    };
+  }
+}
 
 function statData(link: LinkStats): Partial<WorktreeEntry> {
   const out: Partial<WorktreeEntry> = {};
