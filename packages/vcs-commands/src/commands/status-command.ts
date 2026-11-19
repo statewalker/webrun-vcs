@@ -195,7 +195,9 @@ export interface SubmoduleDirt {
  * `is_submodule_modified` reads it from `git status --porcelain=2` run inside it: an
  * untracked file there (or a nested submodule holding only untracked files, `S..U`) is
  * untracked content; any other change, a nested submodule's included, is modified content.
- * Nothing for a submodule that is not populated (or that the worktree cannot open).
+ * Nothing for a submodule that is not populated (or that the worktree cannot open). A
+ * configuration the inner status cannot read fails with its messages and git's
+ * `'git status --porcelain=2' failed in submodule <path>`.
  */
 export async function readSubmoduleDirt(
   worktree: Worktree,
@@ -207,7 +209,19 @@ export async function readSubmoduleDirt(
   // `git status --porcelain=2` there, with `-uno` when untracked content is ignored
   const command = new StatusCommand(inner).setRenames(false);
   if (ignoreUntracked) command.setUntrackedFiles("no");
-  const status = await command.call();
+  let status: Status;
+  try {
+    status = await command.call();
+  } catch (error) {
+    // the child dies on its configuration (its own messages), then the parent does
+    if (error instanceof InvalidConfigError) {
+      throw new InvalidConfigError(
+        error.key,
+        `${error.message}\nfatal: 'git status --porcelain=2' failed in submodule ${path}`,
+      );
+    }
+    throw error;
+  }
   const dirt: SubmoduleDirt = {};
   for (const f of status.files) {
     if (f.index === "!") continue;
@@ -455,7 +469,7 @@ export class StatusCommand extends GitCommand<Status> {
       !entry.skipWorktree &&
       !entry.assumeValid &&
       !isGitlink(entry.mode) &&
-      (matchAll || this.matchesPath(entry.path));
+      (matchAll || this.matchesTracked(entry.path, entry.mode));
     const all = this.staging.entryList?.() ?? (await collectEntries(this.staging.entries()));
     // the index's paths by binary search (git's index_name_pos), no set of every path built
     const index = new IndexPathLookup(all.map((e) => e.path));
@@ -477,7 +491,7 @@ export class StatusCommand extends GitCommand<Status> {
         const entry = all[i] as StagingEntry;
         const current = wanted[i] ? (found[k++] ?? null) : undefined;
         if (entry.mode === FileMode.GITLINK) gitlinks.add(entry.path);
-        if (!matchAll && !this.matchesPath(entry.path)) continue;
+        if (!matchAll && !this.matchesTracked(entry.path, entry.mode)) continue;
         if (entry.stage !== 0) {
           const stages = unmerged.get(entry.path) ?? [undefined, undefined, undefined];
           stages[entry.stage - 1] = { mode: entry.mode, id: entry.objectId };
@@ -595,7 +609,7 @@ export class StatusCommand extends GitCommand<Status> {
     }
 
     for (const [path, h] of head) {
-      if (tracked.has(path) || !this.matchesPath(path)) continue;
+      if (tracked.has(path) || !this.matchesTracked(path, h.mode)) continue;
       if (isGitlink(h.mode) && (await this.indexIgnoresAll(path))) continue;
       removed.add(path);
       files.push({ path, index: "D", worktree: " ", head: h });
@@ -937,19 +951,22 @@ export class StatusCommand extends GitCommand<Status> {
   }
 
   /**
-   * Check if a path matches the configured path filters.
+   * Whether the tracked path (an index or HEAD entry of `mode`) matches the path filters,
+   * as git's `ce_path_match` / `tree_entry_interesting` match a literal pathspec: the path
+   * itself or a directory above it. An element ending in `/` names a directory only, so
+   * `f.txt/` does not match the file `f.txt` (a gitlink counts as a directory), and an
+   * element below a file (`a/b`) does not match the file `a`.
    */
-  private matchesPath(path: string): boolean {
-    if (this.paths.length === 0) {
-      return true;
-    }
-    const p = path.endsWith("/") ? path.slice(0, -1) : path;
+  private matchesTracked(path: string, mode: number): boolean {
+    if (this.paths.length === 0) return true;
+    const directory = isGitlink(mode);
     for (const raw of this.paths) {
       const filterPath = raw.replace(/\/+$/, "");
       if (filterPath === "" || filterPath === ".") return true;
-      if (p === filterPath || p.startsWith(`${filterPath}/`) || filterPath.startsWith(`${p}/`)) {
-        return true;
-      }
+      if (path.startsWith(`${filterPath}/`)) return true;
+      if (path === filterPath && (directory || filterPath === raw)) return true;
+      // a path inside a submodule names its gitlink, as before
+      if (directory && filterPath.startsWith(`${path}/`)) return true;
     }
     return false;
   }

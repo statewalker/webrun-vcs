@@ -290,6 +290,11 @@ export class CleanCommand extends GitCommand<CleanResult> {
           n.repository = state !== "none";
           // a `.git` that cannot be checked here: never removed, not even with -ff
           n.unverified = state === "unknown";
+        } else if (entry.isDirectory && worktree.repositoryState) {
+          // a `.git` resolving to the superproject's git directory (a link to it): no
+          // nested repository for the scan (treat_directory compares the real paths), but
+          // one for remove_dirs (is_nonbare_repository_dir)
+          n.ownGitDir = (await worktree.repositoryState(entry.path)) === "repository";
         }
         parent.children.push(n);
         nodes.set(entry.path, n);
@@ -335,7 +340,7 @@ export class CleanCommand extends GitCommand<CleanResult> {
     const options = { nonRepositoryGitDirs: true };
     const tops = new Set(dirs);
     const remove = async (n: CleanNode): Promise<boolean> => {
-      if (n.repository) {
+      if (n.repository || n.ownGitDir) {
         if (!this.forceNested || n.unverified) {
           skipped.add(n.path);
           return false;
@@ -410,6 +415,11 @@ interface CleanNode {
   unverified?: boolean;
   /** A nested repository whose content was loaded (the index tracks paths in it) */
   entered?: boolean;
+  /**
+   * A directory whose `.git` resolves to the superproject's own git directory: walked as
+   * any other, but skipped as a repository by the removal (removed whole with `-ff`)
+   */
+  ownGitDir?: boolean;
   children: CleanNode[];
 }
 

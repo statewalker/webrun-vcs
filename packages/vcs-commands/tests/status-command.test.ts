@@ -496,4 +496,38 @@ describe.each(backends)("StatusCommand ($name backend)", ({ factory }) => {
       expect(status.hasUncommittedChanges()).toBe(false);
     });
   });
+
+  /**
+   * The test worktree's walk yields files only: the scan's directories are made up from
+   * their paths (git's normal and all modes alike), an ignored file keeps its answer.
+   */
+  describe("untracked files on a worktree whose walk yields no directories", () => {
+    it("finds untracked files below the root, as dir/ (normal) or each file (all)", async () => {
+      const { git, workingCopy } = await createInitializedGit();
+      await addFile(workingCopy, "a/tracked.txt", "t");
+      await git.commit().setMessage("initial").call();
+      const write = (path: string) =>
+        workingCopy.worktree?.writeContent(path, new TextEncoder().encode(path), {
+          createParents: true,
+        });
+      await write("top.txt");
+      await write("a/new.txt");
+      await write("a/b/deep.txt");
+      await write("u/v/w.txt");
+      await write("a/skip.log");
+      (workingCopy.worktree as unknown as { setIgnored(p: string): void }).setIgnored("a/skip.log");
+
+      const normal = await git.status().call();
+      expect([...normal.untracked].sort()).toEqual(["a/b/", "a/new.txt", "top.txt", "u/"]);
+      const all = await git.status().setUntrackedFiles("all").call();
+      expect([...all.untracked].sort()).toEqual([
+        "a/b/deep.txt",
+        "a/new.txt",
+        "top.txt",
+        "u/v/w.txt",
+      ]);
+      const ignored = await git.status().setIgnored("traditional").call();
+      expect([...ignored.ignored].sort()).toEqual(["a/skip.log"]);
+    });
+  });
 });

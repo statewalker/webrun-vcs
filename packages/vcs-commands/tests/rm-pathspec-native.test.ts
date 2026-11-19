@@ -7,7 +7,7 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -338,12 +338,18 @@ describeGit("git rm data safety against native git", () => {
       gitOk(root, join(dir, "sub"), "commit", "-q", "-am", "y");
     },
     "unstaged .gitmodules": (dir) => put(dir, ".gitmodules", "# edited\n"),
+    // git's inner status passes -uall: the submodule's own mode does not hide the file
+    "untracked under status.showUntrackedFiles=no": (dir) => {
+      put(dir, "sub/new", "new\n");
+      gitOk(root, join(dir, "sub"), "config", "status.showUntrackedFiles", "no");
+    },
   };
   // each kind of change without and with --cached (which refuses none of them)
   for (const kinds of [
     ["clean"],
     ["modified"],
     ["untracked"],
+    ["untracked under status.showUntrackedFiles=no"],
     ["ignored"],
     ["staged", "committed"],
     ["unstaged .gitmodules"],
@@ -362,6 +368,26 @@ describeGit("git rm data safety against native git", () => {
       }
     });
   }
+
+  it("a submodule whose status.showUntrackedFiles git cannot read: rm dies, nothing removed", async () => {
+    for (const cached of [false, true]) {
+      const twin = built((dir) => {
+        submodule(dir);
+        gitOk(root, join(dir, "sub"), "config", "status.showUntrackedFiles", "bogus");
+      });
+      const { native, error } = await rmBoth(twin, ["k", "sub"], { cached });
+      expect(native.status).toBe(128);
+      expect(native.stderr).toContain("fatal: could not run 'git status' in submodule 'sub'");
+      // git names the configuration file by its absolute path, ours relative to the files root
+      expect(error).toBe(native.stderr.split(`${twin.native}/`).join("").trim());
+      // (a status of the superproject dies the same way: the index and files compared)
+      expect(index(twin.native)).toContain("\tk\n");
+      expect(index(twin.ours)).toBe(index(twin.native));
+      for (const path of ["k", "sub/u"]) {
+        expect([path, existsSync(join(twin.ours, path))]).toEqual([path, true]);
+      }
+    }
+  });
 
   /** `d/f` and `t` committed, then `d` replaced by a link to `e`, which `fill` fills. */
   const linked = (target: string, fill: (dir: string) => void) => (dir: string) => {

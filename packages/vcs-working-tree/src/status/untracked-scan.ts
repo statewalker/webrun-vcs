@@ -66,7 +66,8 @@ export type IgnoreFileRead =
 export interface UntrackedScanHost {
   /**
    * The entries of a directory with their kinds where known; in readdir order when asked
-   * (the order the cache records). Throws when the directory cannot be read.
+   * (`scanUntracked` always asks: the order git walks in, and the cache records). Throws
+   * when the directory cannot be read.
    */
   listDirectory(path: string, readdirOrder: boolean): Promise<DirectoryEntry[]>;
   /** The entry itself (a link not followed); undefined when nothing is there */
@@ -494,7 +495,10 @@ export async function scanUntracked(
     let listing: DirectoryEntry[] | undefined;
     if (!(node && cache && (await validCachedDir(dir, node, checkOnly)))) {
       try {
-        listing = await host.listDirectory(dir, !!cache);
+        // in readdir order, as git reads a directory: a check-only walk stops at the first
+        // untracked file it meets, so the order decides which directories it opens (and
+        // warns about), and the cache records the names in that order
+        listing = await host.listDirectory(dir, true);
       } catch (error) {
         if (dir !== "") options.onUnreadable?.(dir, error);
         if (node && cache) {

@@ -538,6 +538,38 @@ describeGit("git worktree, native twins", () => {
     );
   });
 
+  it("remove: the worktree's status.showUntrackedFiles decides (no, or a bad value)", async () => {
+    const { native, ours } = twins();
+    for (const base of [native, ours]) {
+      const repo = join(base, "repo");
+      run(repo, "config", "extensions.worktreeConfig", "true");
+      for (const n of ["hidden", "bad"]) {
+        run(repo, "worktree", "add", "-q", "--detach", join(base, n));
+        put(join(base, n), "new.txt", "new\n");
+      }
+      run(join(base, "hidden"), "config", "--worktree", "status.showUntrackedFiles", "no");
+      run(join(base, "bad"), "config", "--worktree", "status.showUntrackedFiles", "bogus");
+    }
+    const nrepo = join(native, "repo");
+    const { git } = await open(ours);
+    for (const n of ["bad", "hidden"]) {
+      const r = runResult(nrepo, "worktree", "remove", n);
+      let message = "(no error)";
+      try {
+        await git.worktreeRemove().setWorktree(n).call();
+      } catch (error) {
+        message = `${(error as Error).message}\n`;
+      }
+      // git names the configuration file by its absolute path, ours relative to the files root
+      expect([n, message]).toEqual([
+        n,
+        r.status === 0 ? "(no error)" : r.stderr.split(`${native}/`).join(""),
+      ]);
+      expect([n, existsSync(join(ours, n))]).toEqual([n, existsSync(join(native, n))]);
+      expect([n, adminFiles(ours)]).toEqual([n, adminFiles(native)]);
+    }
+  });
+
   it("move: into a directory, to a new path, and git's refusals", async () => {
     const { native, ours } = twins();
     for (const base of [native, ours]) {

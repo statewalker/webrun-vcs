@@ -6,7 +6,7 @@ import {
   withWorktreeEntries,
 } from "@statewalker/vcs-working-tree";
 
-import { NoFilepatternError, RmFailedError } from "../errors/index.js";
+import { InvalidConfigError, NoFilepatternError, RmFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { worktreeModeTrust } from "./core-config.js";
 import { IndexAdder } from "./index-adder.js";
@@ -618,7 +618,9 @@ async function usesGitfile(worktree: Worktree, path: string, depth = 0): Promise
  * staged or untracked file, a nested submodule's changes; ignored files do not count). An
  * empty or absent directory is not. With `--cached` git has not absorbed the submodule's
  * repository first, so one without a gitfile counts; without it git has, and its status is
- * read here as it is. A submodule whose repository cannot be opened counts (git dies).
+ * read here as it is. A submodule whose repository cannot be opened counts (git dies); a
+ * configuration the inner status cannot read (a bad `status.showUntrackedFiles`) fails the
+ * whole removal with its messages and git's "could not run 'git status'", nothing removed.
  */
 async function badToRemoveSubmodule(
   worktree: Worktree,
@@ -632,13 +634,23 @@ async function badToRemoveSubmodule(
   const inner = await worktree.openGitlink?.(path).catch(() => undefined);
   if (!inner) return true;
   try {
-    // `git status --porcelain --ignore-submodules=none` there, in its own untracked mode
+    // `git status --porcelain --ignore-submodules=none -uall` there: every untracked file
+    // counts, whatever the submodule's status.showUntrackedFiles says
     const status = await new StatusCommand(inner)
       .setRenames(false)
+      .setUntrackedFiles("all")
       .setIgnoreSubmodules("none")
       .call();
     return status.files.some((f) => f.index !== "!");
-  } catch {
+  } catch (error) {
+    // the child status dies on its configuration (its own messages), then git rm does
+    if (error instanceof InvalidConfigError) {
+      throw new RmFailedError(
+        `${error.message}\nfatal: could not run 'git status' in submodule '${path}'`,
+        [],
+        { removedPaths: [] },
+      );
+    }
     return true;
   }
 }

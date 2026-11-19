@@ -34,6 +34,7 @@ import {
   InvalidConfigError,
   type UntrackedFilesMode,
 } from "../src/index.js";
+import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -349,6 +350,111 @@ describeGit("status untracked and ignored modes: as native git", () => {
     expect(`${(error as Error).message}\n`).toBe(native.stderr);
     expect(git(dir, ["rev-parse", "HEAD"])).toBe(head);
   });
+
+  it("a submodule whose status.showUntrackedFiles git cannot read fails status and diff as git does", async () => {
+    const up = join(root, "up");
+    mkdirSync(up, { recursive: true });
+    git(up, ["init", "-q", "-b", "main"]);
+    put(up, "u", "u\n");
+    git(up, ["add", "u"]);
+    git(up, ["commit", "-qm", "u"]);
+    const dir = join(root, "r");
+    mkdirSync(dir, { recursive: true });
+    git(dir, ["init", "-q", "-b", "main"]);
+    git(dir, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", up, "sub"]);
+    git(dir, ["commit", "-qm", "sub"]);
+    put(dir, "sub/new", "new\n");
+    // the submodule's own mode is what its inner status (`-uno` aside) uses
+    for (const value of ["no", "all"]) {
+      git(join(dir, "sub"), ["config", "status.showUntrackedFiles", value]);
+      const status = await (await openOurs(dir)).status().call();
+      expect([value, formatStatusPorcelain(status, 2)]).toEqual([
+        value,
+        git(dir, ["status", "--porcelain=v2"]),
+      ]);
+    }
+    git(join(dir, "sub"), ["config", "status.showUntrackedFiles", "bogus"]);
+    const ourGit = await openOurs(dir);
+    for (const [args, call] of [
+      [["status", "--porcelain"], () => ourGit.status().call()],
+      [
+        ["status", "--porcelain", "--ignore-submodules=untracked"],
+        () => ourGit.status().setIgnoreSubmodules("untracked").call(),
+      ],
+      [["diff", "--quiet"], () => ourGit.diff().call()],
+    ] as [string[], () => Promise<unknown>][]) {
+      const native = gitFails(dir, args);
+      expect([args, native.status]).toEqual([args, 128]);
+      const error = await call().catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(InvalidConfigError);
+      // git names the configuration file by its absolute path, ours relative to the files root
+      expect([args, `${(error as Error).message}\n`]).toEqual([
+        args,
+        native.stderr.split(`${dir}/`).join(""),
+      ]);
+    }
+  });
+
+  it("a .git naming no repository is no nested repository (is_nonbare_repository_dir)", async () => {
+    const dir = join(root, "r");
+    mkdirSync(dir, { recursive: true });
+    git(dir, ["init", "-q", "-b", "main"]);
+    put(dir, "t", "t\n");
+    git(dir, ["add", "t"]);
+    git(dir, ["commit", "-qm", "t"]);
+    // an empty .git directory, a gitfile of garbage, one naming a missing place (inside the
+    // worktree: ours can check it), a link to the superproject's own .git, a real repository
+    mkdirSync(join(dir, "emptygit/.git"), { recursive: true });
+    put(dir, "emptygit2/.git/x", "x\n");
+    put(dir, "emptygit2/f", "f\n");
+    put(dir, "badgitfile/.git", "garbage\n");
+    put(dir, "badgitfile/g", "g\n");
+    put(dir, "badgitfile2/.git", `gitdir: ${join(dir, "nonexistent/x")}\n`);
+    put(dir, "badgitfile2/b", "b\n");
+    put(dir, "badgitfile3/.git", "gitdir: ../nonexistent\n");
+    put(dir, "badgitfile3/c", "c\n");
+    put(dir, "linkgit/l", "l\n");
+    symlinkSync("../.git", join(dir, "linkgit/.git"));
+    mkdirSync(join(dir, "linkonly"));
+    symlinkSync("../.git", join(dir, "linkonly/.git"));
+    put(dir, "realrepo/r", "r\n");
+    git(join(dir, "realrepo"), ["init", "-q"]);
+    put(dir, "gitfilerepo/s", "s\n");
+    git(dir, ["init", "-q", "--separate-git-dir", join(dir, "sep.git"), "gitfilerepo"]);
+    put(dir, ".gitignore", "sep.git/\nignored*/\n");
+    mkdirSync(join(dir, "ignoredempty/.git"), { recursive: true });
+    put(dir, "ignoredempty/i", "i\n");
+    for (const untracked of UNTRACKED_MODES) {
+      for (const ignored of IGNORED_MODES) {
+        if (untracked === "no" && ignored === "matching") continue;
+        await expectAsNative(dir, untracked, ignored);
+      }
+    }
+    const all = await ours(dir, "all");
+    expect(all.untracked.has("badgitfile2/b")).toBe(true);
+    expect(all.untracked.has("realrepo/")).toBe(true);
+  }, 60_000);
+
+  it("a pathspec ending in / names a directory only: no tracked file matches it", async () => {
+    const dir = join(root, "r");
+    mkdirSync(dir, { recursive: true });
+    git(dir, ["init", "-q", "-b", "main"]);
+    for (const path of ["f.txt", "g.txt", "a", "d/x", "h.txt"]) put(dir, path, `${path}\n`);
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "c"]);
+    put(dir, "f.txt", "f2\n");
+    git(dir, ["rm", "-q", "--cached", "g.txt"]);
+    put(dir, "a", "a2\n");
+    put(dir, "d/x", "x2\n");
+    put(dir, "n.txt", "n\n");
+    git(dir, ["add", "n.txt"]);
+    rmSync(join(dir, "h.txt"));
+    for (const spec of ["f.txt/", "g.txt/", "n.txt/", "h.txt/", "a/b", "a/", "d/", "d", "f.txt"]) {
+      for (const untracked of UNTRACKED_MODES)
+        await expectAsNative(dir, untracked, undefined, [spec]);
+    }
+    await expectAsNative(dir, undefined, undefined, ["f.txt/", "a"]);
+  }, 60_000);
 
   it.runIf(booleanModes)("a variable without a value is a true boolean: normal", async () => {
     const dir = join(root, "r");

@@ -218,9 +218,12 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
     const trackedDirs = directoriesOf(tracked);
     const untracked: string[] = [];
     const dirs: string[] = [];
+    // a `.git` naming no repository (an empty directory, a gitfile of garbage) is listed
+    // and goes with its directory, as git clean's remove_dirs takes it
     for await (const entry of worktree.walk({
       includeIgnored: ignored,
       includeDirectories: true,
+      enterNonRepositoryGitDirs: true,
     })) {
       if (entry.isDirectory) {
         if (entry.mode !== FileMode.GITLINK && !trackedDirs.has(entry.path)) dirs.push(entry.path);
@@ -228,9 +231,10 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
       }
       if (!tracked.has(entry.path) && (ignored || !entry.isIgnored)) untracked.push(entry.path);
     }
-    for (const path of untracked) await worktree.remove(path);
+    const fake = { nonRepositoryGitDirs: true };
+    for (const path of untracked) await worktree.remove(path, fake);
     dirs.sort((a, b) => b.split("/").length - a.split("/").length || (a < b ? 1 : -1));
-    for (const dir of dirs) await removeDirectoryIfEmpty(worktree, dir);
+    for (const dir of dirs) await removeDirectoryIfEmpty(worktree, dir, fake);
     for (const path of untracked) await pruneEmptyParents(worktree, path);
   }
 
