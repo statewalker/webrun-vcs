@@ -423,6 +423,10 @@ describeGit("commit with an editor: the index it leaves", () => {
   it("an editor --only commit keeps racily clean entries checked on the next write", async () => {
     const dir = join(root, "r");
     base(dir);
+    // ctime cannot be dated: a.txt's two edits get the ctime of the real clock, and when
+    // they land in different seconds (a slow commit under load) its stat no longer matches,
+    // so neither git nor ours smudges it (ce_smudge_racily_clean_entry returns early)
+    git(dir, ["config", "core.trustctime", "false"]);
     // every file dated one second, well after the index file is written: each entry stays
     // racily clean for every write our instance makes (its index time is the real clock)
     const racy = Math.floor(Date.now() / 1000) + 1000;
@@ -648,6 +652,8 @@ describeGit("commit: template files, an untouched template, the index lock", () 
   it("a failed -a commit puts back racily clean entries still checked on the next write", async () => {
     const dir = join(root, "r");
     base(dir);
+    // a.txt's ctime (the real clock) would decide the outcome otherwise, as above
+    git(dir, ["config", "core.trustctime", "false"]);
     const racy = Math.floor(Date.now() / 1000) + 1000;
     const stamp = (p: string) => utimesSync(join(dir, p), racy, racy);
     const repo = await openRepo(root, dir);
