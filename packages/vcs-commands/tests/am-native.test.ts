@@ -370,7 +370,11 @@ describeGit("git am as native git", () => {
         "stgit",
         `Stgit subject\n\nAuthor: Stg User <stg@example.com>\nDate: Tue, 14 Nov 2023 10:00:00 +0000\n\nStgit body\n---\n${diff}`,
       ],
-      ["mail headers", `X-Foo: bar\nSubject: header only\nFrom: H <h@x>\n\nbody\n---\n${diff}`],
+      // a fixed Date: without one the author date is the wall clock, which differs between the twins
+      [
+        "mail headers",
+        `X-Foo: bar\nSubject: header only\nFrom: H <h@x>\nDate: Thu, 1 Jan 2015 00:00:00 +0000\n\nbody\n---\n${diff}`,
+      ],
     ];
     for (const [label, content] of inputs) {
       const path = file(label.replace(/ /g, "-"), content);
