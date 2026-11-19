@@ -83,7 +83,10 @@ jobs:
           mv .tested "$RUNNER_TEMP/tested"
           git fetch --depth=1 origin "$HEAD_REF"
           git checkout -B "$HEAD_REF" FETCH_HEAD
-          rm -rf .tested && mv "$RUNNER_TEMP/tested" .tested
+          # Only the records go onto the branch, which may have moved on since the tested commit:
+          # its config.json and README.md stay as they are.
+          git checkout -- .tested
+          tar -C "$RUNNER_TEMP/tested" --exclude=./config.json --exclude=./README.md -cf - . | tar -C .tested -xf -
           # Rehash: a record rewritten in place within a second of the checkout keeps its size and
           # inode, so git's stat cache would take it as unchanged.
           git rm -r -q --cached --ignore-unmatch .tested
