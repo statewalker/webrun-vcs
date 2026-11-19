@@ -173,7 +173,10 @@ export class SubmoduleSummaryCommand extends GitCommand<string> {
     let entries: DiffEntry[];
     if (head === undefined) entries = await run(() => {});
     else if (this.cached) entries = await run((d) => d.setOldTree(head).setCached(true));
-    else entries = await this.indexAgainstWorktree(head, run);
+    // diff-index: each index entry's worktree side against the tree, a submodule at
+    // another commit than its entry reported even where it is back at the tree's
+    // (show_modified's null id, here the submodule's HEAD)
+    else entries = await run((d) => d.setOldTree(head));
     const out: ModuleChange[] = [];
     for (const e of entries) {
       if (e.unmerged) continue;
@@ -200,61 +203,6 @@ export class SubmoduleSummaryCommand extends GitCommand<string> {
     return out;
   }
 
-  /**
-   * diff-index without `--cached` (diff-lib.c `show_modified`): each index entry against the
-   * tree, its worktree side when the file differs from the entry. An entry whose file
-   * changed is reported even where the file matches the tree again (git's null id, filled
-   * from the worktree), one only in the index is skipped when its file is gone.
-   */
-  private async indexAgainstWorktree(
-    head: ObjectId,
-    run: (configure: (d: DiffCommand) => void) => Promise<DiffEntry[]>,
-  ): Promise<DiffEntry[]> {
-    const cached = await run((d) => d.setOldTree(head).setCached(true));
-    const files = await run(() => {});
-    const byPath = new Map<string, DiffEntry>();
-    const pathOf = (e: DiffEntry) => (e.newPath ?? e.oldPath) as string;
-    for (const e of cached) byPath.set(pathOf(e), e);
-    for (const f of files) {
-      if (f.unmerged) continue;
-      const path = pathOf(f);
-      const c = byPath.get(path);
-      // the tree's side: the cached entry's old side, else the index's (unchanged) entry
-      const inTree = c ? c.changeType !== ChangeType.ADD : true;
-      const treeMode = c ? c.oldMode : f.oldMode;
-      const treeId = c ? c.oldId : f.oldId;
-      if (f.changeType === ChangeType.DELETE) {
-        if (!inTree) byPath.delete(path);
-        else {
-          byPath.set(path, {
-            changeType: ChangeType.DELETE,
-            oldPath: path,
-            oldId: treeId,
-            oldMode: treeMode,
-          });
-        }
-        continue;
-      }
-      byPath.set(
-        path,
-        inTree
-          ? {
-              changeType: ChangeType.MODIFY,
-              oldPath: path,
-              newPath: path,
-              oldId: treeId,
-              oldMode: treeMode,
-              newId: f.newId,
-              newMode: f.newMode,
-            }
-          : { changeType: ChangeType.ADD, newPath: path, newId: f.newId, newMode: f.newMode },
-      );
-    }
-    return [...byPath.keys()]
-      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
-      .map((p) => byPath.get(p) as DiffEntry);
-  }
-
   /** The paths of the submodules whose `submodule.<name>.ignore` is `all` (`--for-status`). */
   private async ignoreAll(): Promise<Set<string>> {
     const out = new Set<string>();
@@ -272,6 +220,13 @@ export class SubmoduleSummaryCommand extends GitCommand<string> {
    * The repository a command run in the submodule's directory reaches (`cp.dir = sm_path`):
    * the submodule's when it is checked out, the superproject's when the directory holds no
    * repository, none when there is no directory.
+   *
+   * Known gap: a submodule replaced by a symbolic link to a directory is a link here (the
+   * worktree follows no link): `* sub <old>(submodule)-><link blob>(blob):`. git opens the
+   * path through the link (generate_submodule_summary's `open` + `index_fd`), fails to hash
+   * the directory ("error: couldn't hash object from 'sub'", the null id `0000000`), and
+   * counts and lists the old commit with `rev-list` / `log` run through the link in whatever
+   * repository it reaches (`(4):` and `  < subject`).
    */
   private async repositoryAt(path: string): Promise<SubmoduleRepository | undefined | "super"> {
     const sub = await openSubmoduleRepository(this.workingCopy, path);

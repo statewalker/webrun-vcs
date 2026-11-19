@@ -125,7 +125,7 @@ export function diffEntryToPair(entry: DiffEntry, blobs: Blobs): DiffFilePair {
           entry.newMode,
           entry.newId,
           entry.readNew,
-          entry.newDirtySubmodule === true,
+          entry.newDirtySubmodule === true && entry.newIdUnknown !== true,
         );
   if (newSide && entry.newSubmoduleDirt) newSide.submoduleDirt = entry.newSubmoduleDirt;
   return {

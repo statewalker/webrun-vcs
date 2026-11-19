@@ -545,6 +545,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
           ignoreConfigNoPrefix: true,
           // git_format_config ignores diff.submodule
           submoduleFormat: "short",
+          uiConfig: false,
           ...(noPrefix ? { noPrefix: true } : {}),
         });
       const bytes = await log.callBytes({
@@ -881,6 +882,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
   private async treeDiffstat(a: ObjectId | undefined, b: ObjectId): Promise<string> {
     const diff = new DiffCommand(this.workingCopy).setNewTree(b).setOptions({
       stat: { width: MAIL_DEFAULT_WRAP },
+      uiConfig: false,
     });
     if (a) diff.setOldTree(a);
     const r = await diff.callFormats(["stat", "summary"]);

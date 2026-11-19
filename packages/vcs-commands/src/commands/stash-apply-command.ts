@@ -705,6 +705,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
         dstPrefix: "b/",
         // diff-tree, plumbing: no diff.submodule
         submoduleFormat: "short",
+        uiConfig: false,
       })
       .callFormats(["patch"]);
     const result = new Map<string, CheckedEntry>();

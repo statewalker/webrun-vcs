@@ -8,7 +8,9 @@
 import type { ObjectId } from "@statewalker/vcs-core";
 import { collectChunks, type WorkingCopy } from "@statewalker/vcs-working-tree";
 
+import { InvalidConfigError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import { createIdAbbreviator, type IdAbbreviator } from "./core-config.js";
 import { commitsBaseSource, MergeBaseGraph } from "./merge-bases.js";
 import { formatCommitPretty } from "./pretty-format.js";
@@ -23,6 +25,47 @@ export function parseSubmoduleDiffFormat(
   value: string | undefined,
 ): SubmoduleDiffFormat | undefined {
   return value === "short" || value === "log" || value === "diff" ? value : undefined;
+}
+
+/** `diff.submodule` as git's `git_diff_ui_config` reads it. */
+export interface DiffSubmoduleConfig {
+  /** The last value git knows, undefined when none */
+  format?: SubmoduleDiffFormat;
+  /** `warning: Unknown value for 'diff.submodule' config variable: '<value>'`, per value */
+  warnings: string[];
+}
+
+/**
+ * `diff.submodule` as git reads it before any diff (`git_diff_ui_config`, whatever
+ * `--submodule` says): every value in the configuration's order, the last one it knows
+ * winning; each other value warns (`parse_submodule_params` fails, the warning of
+ * `git_diff_ui_config`). A variable without `=` fails as git 2.5x fails (`error: missing
+ * value for 'diff.submodule'`, then where it was read; git 2.43 crashes there).
+ *
+ * @throws InvalidConfigError for a variable without a value
+ *
+ * @example
+ * ```typescript
+ * const { format, warnings } = readDiffSubmoduleConfig(workingCopy);
+ * ```
+ */
+export function readDiffSubmoduleConfig(workingCopy: WorkingCopy): DiffSubmoduleConfig {
+  const key = "diff.submodule";
+  const out: DiffSubmoduleConfig = { warnings: [] };
+  if (!workingCopy.config) return out;
+  for (const { text, file, line } of RemoteConfigStore.from(workingCopy).valuesWithOrigin(key)) {
+    if (text === undefined) {
+      const where =
+        file !== undefined && line !== undefined
+          ? `fatal: bad config variable '${key}' in file '${file}' at line ${line}`
+          : `fatal: unable to parse '${key}' from command-line config`;
+      throw new InvalidConfigError(key, `error: missing value for '${key}'\n${where}`);
+    }
+    const format = parseSubmoduleDiffFormat(text);
+    if (format) out.format = format;
+    else out.warnings.push(`warning: Unknown value for '${key}' config variable: '${text}'`);
+  }
+  return out;
 }
 
 /** git's null object id: the side of a submodule that is not there. */
@@ -84,9 +127,21 @@ export class SubmoduleRepository extends GitCommand<never> {
     return (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
   }
 
-  /** git's `repo_get_merge_bases` of two commits, in git's order. */
+  /**
+   * git's `repo_get_merge_bases` of two commits, in git's order.
+   *
+   * @throws SubmoduleWalkError when a commit the walk reaches is missing (git 2.45 and later:
+   * `paint_down_to_common` fails, and the header says "(corrupt repository)")
+   */
   async mergeBases(one: ObjectId, two: ObjectId): Promise<ObjectId[]> {
-    const graph = new MergeBaseGraph(commitsBaseSource(this.walkCommits, async () => new Map()));
+    const source = commitsBaseSource(this.walkCommits, async () => new Map());
+    const load = source.load;
+    source.load = async (id) => {
+      const found = await load(id);
+      if (!found) throw new SubmoduleWalkError(`could not parse commit ${id}`);
+      return found;
+    };
+    const graph = new MergeBaseGraph(source);
     const bases = await graph.mergeBases(graph.commit(one), graph.commit(two));
     return bases.map((n) => n.id).filter((id): id is ObjectId => id !== undefined);
   }
@@ -261,6 +316,13 @@ class GitmodulesReader extends GitCommand<string | undefined> {
  * git's `open_submodule`: the repository of the submodule at `path` (its `.git`, else the
  * one kept under `<gitdir>/modules/<name>` for the name `.gitmodules` gives the path);
  * undefined when there is none.
+ *
+ * Known gaps:
+ * - A gitfile naming a repository beyond the FilesApi's root cannot be followed here, so
+ *   the submodule reads as holding none and the `modules/<name>` fallback is taken, where
+ *   git reads the repository the gitfile names.
+ * - When `.gitmodules` gives one path to several names, the first name is taken; git's
+ *   submodule-config cache keeps the last one read (`cache_put_path` replaces the entry).
  */
 export async function openSubmoduleRepository(
   workingCopy: WorkingCopy,

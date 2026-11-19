@@ -61,7 +61,7 @@ import {
 } from "./submodule-config.js";
 import {
   openSubmoduleRepository,
-  parseSubmoduleDiffFormat,
+  readDiffSubmoduleConfig,
   type SubmoduleDiffFormat,
   showSubmoduleDiffSummary,
   submoduleHeader,
@@ -133,6 +133,12 @@ export interface DiffTextOptions
    */
   submoduleFormat?: SubmoduleDiffFormat;
   /**
+   * Whether the diff configuration of the porcelain commands is read (`git_diff_ui_config`:
+   * `diff.submodule`, its warnings and failures); default true. Plumbing (`diff-tree`) and
+   * `format-patch` (whose `git_format_config` skips `diff.submodule`) read none.
+   */
+  uiConfig?: boolean;
+  /**
    * `--textconv` / `--no-textconv`: run `diff.<driver>.textconv` on both sides of a patch
    * (default true, as `git diff`); it takes a runner registered with
    * `installTextconvRunner`, without one no textconv applies
@@ -163,6 +169,13 @@ interface Side {
   dirty?: boolean;
   /** Which changes of its own such a submodule holds (for `--submodule=log`) */
   dirt?: SubmoduleDirt;
+  /**
+   * A worktree submodule at another commit than its index entry: git's diff-index (and
+   * diff-files) gives such a side the null id, filled from the worktree only when a patch is
+   * printed (`get_stat_data`, `diff_fill_oid_info`). The pair is reported whatever the other
+   * side holds (`show_modified`), and no exact rename pairs with it.
+   */
+  unknownId?: boolean;
 }
 
 /** An index entry, of any stage */
@@ -297,8 +310,16 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private cached = false;
   /** revs->combine_merges: a conflicted path as its combined diff (`git diff`'s default) */
   private combineMerges = true;
-  /** diffopt.flags.dirty_submodules: a submodule at another commit checked for dirt too */
-  private dirtySubmodules = true;
+  /**
+   * diffopt.flags.dirty_submodules: a submodule at another commit checked for dirt too
+   * (default: when a patch is printed, as `diff_setup_done` sets it; always for `call()`)
+   */
+  private dirtySubmodules?: boolean;
+  /** `diff.submodule` (its last value git knows), read by the text outputs */
+  private configuredSubmoduleFormat?: SubmoduleDiffFormat;
+  private readonly configWarnings: string[] = [];
+  /** {@link dirtySubmodules} for the comparison being collected */
+  private dirtyThisCall = true;
   /** The `ignore` setting of each submodule's path (see `submoduleIgnores`) */
   private submoduleIgnoreMap?: Promise<Map<string, "none" | "untracked" | "dirty" | "all">>;
   private pathFilter?: string;
@@ -392,6 +413,26 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   }
 
   /**
+   * What git prints on stderr reading its diff configuration, once a text output was made:
+   * `warning: Unknown value for 'diff.submodule' config variable: '<value>'` for each value
+   * of `diff.submodule` it does not know.
+   */
+  get warnings(): readonly string[] {
+    return this.configWarnings;
+  }
+
+  /**
+   * git_diff_ui_config, which `git diff` (and log, show) runs before any option is read:
+   * `diff.submodule`, its warnings, and the failure of a variable without a value.
+   */
+  private readUiConfig(): void {
+    if (this.textOptions.uiConfig === false) return;
+    const { format, warnings } = readDiffSubmoduleConfig(this.workingCopy);
+    this.configuredSubmoduleFormat = format;
+    this.configWarnings.splice(0, this.configWarnings.length, ...warnings);
+  }
+
+  /**
    * Compare HEAD (or the old tree) to the index instead of the worktree.
    *
    * Equivalent to `git diff --cached` or `git diff --staged`.
@@ -465,6 +506,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   async call(): Promise<DiffEntry[]> {
     this.checkCallable();
     this.setCallable(false);
+    this.dirtyThisCall = this.dirtySubmodules ?? true;
     return (await this.collect(this.renames ?? false)).entries;
   }
 
@@ -487,6 +529,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.setCallable(false);
     const config = this.config;
     const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
+    this.dirtyThisCall = this.dirtySubmodules ?? format === "patch";
+    this.readUiConfig();
     const collected = await this.collect(renames, format === "patch");
     const sink = new ByteSink();
     await this.writeFormats(sink, [format], collected);
@@ -516,6 +560,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.setCallable(false);
     const config = this.config;
     const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
+    this.dirtyThisCall = this.dirtySubmodules ?? formats.includes("patch");
+    this.readUiConfig();
     let followPath = follow;
     let followChange: ChangeType.RENAME | ChangeType.COPY | undefined;
     let collected: { entries: DiffEntry[]; combined: CombinedEntry[] };
@@ -659,9 +705,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       switch (format) {
         case "patch": {
           const submoduleFormat =
-            this.textOptions.submoduleFormat ??
-            parseSubmoduleDiffFormat(config.value("diff.submodule")) ??
-            "short";
+            this.textOptions.submoduleFormat ?? this.configuredSubmoduleFormat ?? "short";
           if (submoduleFormat !== "short") {
             options.submodulePatch = (out, pair, o) =>
               this.writeSubmodulePatch(out, pair, o, submoduleFormat);
@@ -1267,8 +1311,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           ...(b.read ? { readNew: b.read } : {}),
           ...(b.dirty ? { newDirtySubmodule: true } : {}),
           ...(b.dirt ? { newSubmoduleDirt: b.dirt } : {}),
+          ...(b.unknownId ? { newIdUnknown: true } : {}),
         });
-      } else if (a && b && (a.id !== b.id || a.mode !== b.mode || b.dirty)) {
+      } else if (a && b && (a.id !== b.id || a.mode !== b.mode || b.dirty || b.unknownId)) {
+        // show_modified: a side of the null id differs from any (`M sub` even where the
+        // submodule is back at the tree's commit)
         entries.push({
           changeType: ChangeType.MODIFY,
           oldPath: path,
@@ -1280,6 +1327,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           ...(b.read ? { readNew: b.read } : {}),
           ...(b.dirty ? { newDirtySubmodule: true } : {}),
           ...(b.dirt ? { newSubmoduleDirt: b.dirt } : {}),
+          ...(b.unknownId ? { newIdUnknown: true } : {}),
         });
       }
     }
@@ -1296,7 +1344,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         e.changeType === ChangeType.DELETE ||
         (copies && e.changeType === ChangeType.MODIFY && !e.unmerged),
     );
-    const destinations = entries.filter((e) => e.changeType === ChangeType.ADD);
+    // a submodule of git's null id (diff-index of a moved one) matches no source exactly,
+    // and gitlinks pair only exactly
+    const destinations = entries.filter((e) => e.changeType === ChangeType.ADD && !e.newIdUnknown);
     if (sources.length === 0 || destinations.length === 0) return;
     const byPath = new Map<string, DiffEntry>();
     for (const e of sources) byPath.set(`s:${e.oldPath}`, e);
@@ -1598,7 +1648,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         if (
           entry.mode === GITLINK &&
           ignore !== "dirty" &&
-          (this.dirtySubmodules || id === entry.objectId) &&
+          (this.dirtyThisCall || id === entry.objectId) &&
           result.worktreeEntry?.isDirectory
         ) {
           const found = await readSubmoduleDirt(worktree, entry.path, ignore !== "none");
@@ -1606,9 +1656,19 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           if (ignore === "none" && found.untracked) dirt.untracked = true;
           dirty = !!dirt.modified || !!dirt.untracked;
         }
-        if (!dirty) return result.kind ? { mode, id } : indexSide;
+        // ie_match_stat of a gitlink: another commit checked out than the entry's
+        const moved = entry.mode === GITLINK && mode === GITLINK && id !== entry.objectId;
+        if (!dirty) {
+          if (!result.kind) return indexSide;
+          if (!moved) return { mode, id };
+          // its id is no stored object's to git (oid_valid unset): the diffstat compares
+          // the "Subproject commit" lines, which may hold no change
+          const content = encoder.encode(`Subproject commit ${id}\n`);
+          return { mode, id, unknownId: true, read: async () => content };
+        }
+        const unknown = moved ? { unknownId: true } : {};
         const content = encoder.encode(`Subproject commit ${id}-dirty\n`);
-        return { mode, id, dirty, dirt, read: async () => content };
+        return { mode, id, dirty, dirt, ...unknown, read: async () => content };
       }
       if (!result.kind && !entry.intentToAdd) return indexSide;
       const path = entry.path;
