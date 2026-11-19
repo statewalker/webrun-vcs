@@ -31,7 +31,12 @@ import {
   GitWorkingCopyConfig,
 } from "@statewalker/vcs-store-files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-import { MemoryWorkingCopy } from "@statewalker/vcs-working-tree";
+import {
+  MemoryWorkingCopy,
+  parseCacheTree,
+  parseIndexFile,
+  verifyCacheTree,
+} from "@statewalker/vcs-working-tree";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { findInTheWay } from "../src/commands/worktree-overwrite-checks.js";
@@ -218,9 +223,10 @@ describeGit("stash apply against native git", () => {
     const { expected, actual } = await bothApply(dir, true);
     expect(expected.ok).toBe(false);
     expect(expected.message).toContain("Try without --index");
-    // git apply --cached reports the path it could not patch, then the refusal
+    // git apply --cached reports the hunk and the path it could not patch, then the refusal
     expect(actual.message).toBe(
-      "error: a.txt: patch does not apply\nerror: conflicts in index. Try without --index.",
+      "error: patch failed: a.txt:1\nerror: a.txt: patch does not apply\n" +
+        "error: conflicts in index. Try without --index.",
     );
   });
 
@@ -1185,5 +1191,63 @@ describeGit("stash apply never pairs empty files as renames (merge-ort)", () => 
     const { expected } = await expectAsNative(dir, ["e.txt", "moved/e.txt"]);
     expect(expected.ok).toBe(false);
     expect(status(dir)).toContain("DU e.txt");
+  });
+});
+
+describeGit("stash apply --index keeps the cache-tree describing the index it leaves", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "stash-cache-tree-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** The TREE extension of `dir`'s index as hex, and what verifyCacheTree finds wrong. */
+  async function cacheTreeOf(dir: string) {
+    const parsed = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+    const ext = parsed.extensionData.find((e) => e.signature === "TREE");
+    if (!ext) return { hex: "", problems: [] as string[] };
+    const { history } = await createGitFilesBackend({
+      files: createNodeFilesApi({ rootDir: dir }),
+    });
+    const problems = await verifyCacheTree(history.trees, parseCacheTree(ext.data), parsed.entries);
+    return { hex: Buffer.from(ext.data).toString("hex"), problems };
+  }
+
+  it("a staged deletion outside the merged paths stays deleted at the next commit", async () => {
+    const build = (dir: string) => {
+      mkdirSync(dir, { recursive: true });
+      run(dir, "init", "-q", "-b", "main");
+      for (const f of ["a/b/z", "a/b/w", "a/x", "c/v", "f"]) {
+        mkdirSync(join(dir, f, ".."), { recursive: true });
+        writeFileSync(join(dir, f), `${f}\n`);
+      }
+      run(dir, "add", ".");
+      run(dir, "commit", "-q", "-m", "c1");
+      // a/b/z unstaged (the file stays), c/v staged, f edited; the cache-tree made valid
+      run(dir, "rm", "-q", "--cached", "a/b/z");
+      writeFileSync(join(dir, "c/v"), "staged\n");
+      run(dir, "add", "c/v");
+      writeFileSync(join(dir, "f"), "edited\n");
+      run(dir, "write-tree");
+    };
+    const native = join(root, "native");
+    const dir = join(root, "ours");
+    build(native);
+    build(dir);
+    run(native, "stash", "-q");
+    run(native, "stash", "apply", "-q", "--index");
+    const { ours } = await open(dir);
+    expect(await ours.stashCreate().call()).toBeDefined();
+    const { ours: again } = await open(dir);
+    const result = await again.stashApply().setRestoreIndex(true).call();
+    expect(result.status).toBe("ok");
+    expect(run(dir, "ls-files", "-s")).toBe(run(native, "ls-files", "-s"));
+    expect(status(dir)).toBe(status(native));
+    const tree = await cacheTreeOf(dir);
+    expect(tree.problems).toEqual([]);
+    expect(tree.hex).toBe((await cacheTreeOf(native)).hex);
+    expect(run(dir, "write-tree")).toBe(run(native, "write-tree"));
+    for (const repo of [native, dir]) run(repo, "commit", "-q", "-m", "c2");
+    expect(run(dir, "ls-tree", "-r", "--name-only", "HEAD")).toBe("a/b/w\na/x\nc/v\nf");
+    expect(run(dir, "rev-parse", "HEAD^{tree}")).toBe(run(native, "rev-parse", "HEAD^{tree}"));
   });
 });

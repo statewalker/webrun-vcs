@@ -53,6 +53,16 @@ export interface ReadTreeOptions {
   keepResolveUndo?: boolean;
   /** Keep existing entries not in tree */
   keepExisting?: boolean;
+  /**
+   * Read the tree over the index as unpack-trees' one-way merge does (`reset --hard`,
+   * `checkout -f`; git's `oneway_merge` and `merged_entry`): a stage-0 entry the tree holds
+   * unchanged (same mode and object id) stays as it was, its flags (skip-worktree,
+   * assume-unchanged, intent-to-add) and stat data kept; one the tree changes takes the
+   * tree's entry with the old skip-worktree bit ("Migrate old flags over"). `"flags"` keeps
+   * the flags of an unchanged entry but not its stat data (for a caller that writes every
+   * file again). Default: every entry is the tree's, without flags or stat data.
+   */
+  keepMatching?: boolean | "flags";
 }
 
 /**
@@ -198,9 +208,30 @@ export interface Staging {
   write(): Promise<void>;
 
   /**
+   * Takes the index lock now and holds it until the returned lock is committed or rolled
+   * back, as git's `repo_hold_locked_index` for a commit: edits are made in memory, written
+   * into the lock with `write()`, and the lock renamed over the index with `commit()` once
+   * the commit is made (`rollback()` removes it, the index left as it was). Meanwhile every
+   * other writer, native git included, is refused (`index.lock` exists). Absent: a staging
+   * with no index file (memory, a database), which callers `write()` at the end instead.
+   *
+   * @throws IndexLockedError when the lock exists
+   * @throws IndexChangedError when the index on disk is not the one last read or written
+   */
+  lockIndex?(): Promise<StagingIndexLock>;
+
+  /**
    * Check if staging is outdated
    */
   isOutdated(): Promise<boolean>;
+
+  /**
+   * Whether this instance holds edits (entries, resolve-undo, cache-tree, version) made
+   * since the index was last read or written. A command may re-read an outdated index
+   * (as git reads the index at its start) only when there are none. Absent: unknown,
+   * treated as having edits.
+   */
+  hasUnwrittenChanges?(): boolean;
 
   /**
    * Get last update time (ms since epoch)
@@ -226,6 +257,33 @@ export interface Staging {
    * Clear all entries
    */
   clear(): Promise<void>;
+}
+
+/**
+ * The index lock a `Staging` holds for a commit (see `Staging.lockIndex`).
+ *
+ * @example
+ * ```typescript
+ * const lock = await staging.lockIndex();
+ * try {
+ *   await editTheIndex(staging);
+ *   await lock.write(); // the new index, still in index.lock
+ *   await makeTheCommit();
+ *   await lock.commit(); // renamed over the index
+ * } catch (error) {
+ *   await lock.rollback(); // the index as it was
+ *   await staging.read();
+ *   throw error;
+ * }
+ * ```
+ */
+export interface StagingIndexLock {
+  /** Writes the staging's entries as they are now into the lock (again, if called again). */
+  write(): Promise<void>;
+  /** Renames the lock over the index (what `write()` wrote; the index as read if nothing). */
+  commit(): Promise<void>;
+  /** Removes the lock: the index stays as it was. Does nothing once committed. */
+  rollback(): Promise<void>;
 }
 
 /**

@@ -1232,8 +1232,10 @@ describeGit("status and stash refresh the index (review cases)", () => {
     const stasher = await open(dir);
     const hashed = vi.spyOn(stasher.worktree, "computeHash");
     expect(await stasher.ours.stashCreate().call()).toBeDefined();
-    // one comparison per tracked file (no stat after the reset: each is hashed once)
-    expect(hashed).toHaveBeenCalledTimes(5);
+    // one comparison per tracked file whose stat no longer matches (the reset kept the
+    // entries it did not change, stat included, as git's read_from_tree): each backdated
+    // file is hashed once, the dirty one differs in size and is not read
+    expect(hashed).toHaveBeenCalledTimes(4);
     const after = await open(dir);
     const hashedAfter = vi.spyOn(after.worktree, "computeHash");
     expect((await after.ours.status().call()).isClean()).toBe(true);

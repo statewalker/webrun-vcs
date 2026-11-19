@@ -1,8 +1,16 @@
-import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
-import type { Worktree } from "@statewalker/vcs-working-tree";
+import {
+  type Commit,
+  FileMode,
+  type ObjectId,
+  type PersonIdent,
+  type TreeEntry,
+} from "@statewalker/vcs-core";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import type { Staging, StagingEntry, Worktree, WorktreeEntry } from "@statewalker/vcs-working-tree";
 
 import {
   EmptyCommitError,
+  GitApiError,
   IncompatibleOptionsError,
   InvalidArgumentError,
   NoHeadError,
@@ -13,8 +21,10 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { AddCommand } from "./add-command.js";
+import { worktreeModeTrust } from "./core-config.js";
 import { withoutCrud } from "./git-ident.js";
-import { OperationState } from "./merge-support.js";
+import { IndexAdder } from "./index-adder.js";
+import { OperationState, updateIndexCacheTree, writeIndexAsTree } from "./merge-support.js";
 import {
   CleanupMode,
   cleanupWith,
@@ -23,6 +33,15 @@ import {
   preparedMessageCleanup,
 } from "./message-cleanup.js";
 import { copyNotesForAmend } from "./notes-support.js";
+import {
+  DO_MATCH_DIRECTORY,
+  DO_MATCH_LEADING_PATHSPEC,
+  matchPathspec,
+  matchPathspecSeen,
+  type PathspecItem,
+  parsePathspec,
+  pathspecErrors,
+} from "./pathspec.js";
 import { type CommitReflogKind, reflogMessages, updateHead } from "./reflog-messages.js";
 import { applyAutostash } from "./sequencer-support.js";
 
@@ -271,11 +290,24 @@ export class CommitCommand extends GitCommand<CommitResult> {
   }
 
   /**
-   * Set paths to commit (--only mode).
+   * Set paths to commit (`git commit --only <paths>`, git's partial commit).
    *
-   * When set, only the specified paths are taken from the staging area.
-   * All other paths are taken from the parent commit's tree. This allows
-   * partial commits without affecting unstaged changes to other files.
+   * The paths are a pathspec, as git reads it (`d/`, `*.md`, `:(glob)d/**`, `:!d/x`,
+   * `./a`). As git's `prepare_index`: the index entries (any stage) and HEAD's files the
+   * pathspec matches are listed (`list_paths`); an element that matches none of them fails
+   * with git's "error: pathspec '<path>' did not match any file(s) known to git". The index
+   * lock is then held until HEAD has moved. Each listed path is taken from the worktree
+   * literally (`add_remove_files`): a file (ignored or not) is staged as `git add` stages it
+   * (cleaned by the content filters; an intent-to-add entry gets the content, a conflicted
+   * path is resolved to the file, the entries it clashes with as a file or a directory
+   * replaced), a path gone is removed, and a path that is now a directory refuses the commit
+   * before anything changes ("'<path>' does not have a commit checked out"). The index is
+   * written into the lock with the paths updated, and the commit records HEAD's tree with
+   * only these paths changed, whatever else is staged. The lock is renamed over the index
+   * once the commit is made; on any failure it is removed and the index (and this instance's
+   * staging, unwritten edits included) stays as it was. A skip-worktree path keeps its HEAD
+   * version. A partial commit during a merge, a cherry-pick or a rebase is refused; other
+   * unmerged paths do not stop it (they stay unmerged in the index).
    *
    * Cannot be combined with setAll().
    *
@@ -296,7 +328,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
    * Set whether to auto-stage modified tracked files before committing.
    *
    * If true, stages all modified and deleted tracked files before
-   * creating the commit. Requires a working tree iterator.
+   * creating the commit. Requires a working tree iterator. As git's: the index lock is held
+   * from before the files are staged until HEAD has moved, and the index is left as it was
+   * when the commit fails.
    *
    * Cannot be combined with setOnly().
    *
@@ -348,14 +382,34 @@ export class CommitCommand extends GitCommand<CommitResult> {
    */
   async call(): Promise<CommitResult> {
     this.checkCallable();
-
-    // Handle --all flag: auto-stage modified tracked files
-    if (this.all) {
+    // the index as it is now: one another writer replaced is read again (git reads the
+    // index at its start), unless this instance holds unwritten edits (refused)
+    await this.readCurrentIndex();
+    const partial = this.onlyPaths.length > 0;
+    if (!this.all) return this.commitWith(partial, undefined);
+    // `-a` (git's COMMIT_NORMAL): the index lock held from before the tracked changes are
+    // staged until HEAD has moved
+    const index = await this.holdIndex();
+    try {
+      // Handle --all flag: auto-stage modified tracked files
       await this.stageTrackedChanges();
+      return await this.commitWith(partial, index);
+    } catch (error) {
+      await index.release();
+      throw error;
     }
+  }
 
-    // Check for conflicts
-    if (await this.staging.hasConflicts()) {
+  /**
+   * The commit, once `-a` staged the tracked changes (`index`: the index lock it holds).
+   * A partial commit takes the lock itself.
+   */
+  private async commitWith(partial: boolean, held: HeldIndex | undefined): Promise<CommitResult> {
+    let index = held;
+
+    // Check for conflicts (a partial commit records HEAD and the named paths: other
+    // unmerged paths stay in the index, as git's)
+    if (!partial && (await this.staging.hasConflicts())) {
       const conflictPaths = await this.staging.getConflictedPaths();
       throw new UnmergedPathsError(
         conflictPaths,
@@ -380,6 +434,41 @@ export class CommitCommand extends GitCommand<CommitResult> {
         "fatal: You are in the middle of a merge -- cannot amend.",
       );
     }
+    // a partial commit: the paths named, from the index and HEAD (git's list_paths)
+    const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
+    let partialTree: ObjectId | undefined;
+    const partialPaths = partial
+      ? await this.listPartialPaths(state, mergeHeads, headId)
+      : undefined;
+    if (partialPaths) {
+      // git's partial commit (prepare_index): the index lock taken once the paths are
+      // listed, the named paths taken from the worktree into the index and written into
+      // the lock (renamed over the index once HEAD has moved), the commit's tree HEAD's with
+      // the same paths taken; any failure leaves the index as it was
+      index = await this.holdIndex();
+      try {
+        partialTree = await this.preparePartialCommit(partialPaths, headId, index);
+      } catch (error) {
+        await index.release();
+        throw error;
+      }
+    }
+    try {
+      return await this.commitPrepared(partialTree, state, mergeHeads, pickHead, index);
+    } catch (error) {
+      await index?.release();
+      throw error;
+    }
+  }
+
+  /** The commit made from the index (or the partial commit's tree), after the index is ready. */
+  private async commitPrepared(
+    partialTree: ObjectId | undefined,
+    state: OperationState,
+    mergeHeads: ObjectId[],
+    pickHead: ObjectId | undefined,
+    index: HeldIndex | undefined,
+  ): Promise<CommitResult> {
     let message = this.message;
     const given = message !== undefined;
     if (message === undefined && !this.amend) {
@@ -494,15 +583,46 @@ export class CommitCommand extends GitCommand<CommitResult> {
 
     // Generate tree from staging area
     let treeId: ObjectId;
-
-    if (this.onlyPaths.length > 0 && parents.length > 0) {
-      // --only mode: combine parent tree with specified paths from staging
-      treeId = await this.buildOnlyTree(parents[0]);
+    if (partialTree) {
+      treeId = partialTree;
+    } else if (index) {
+      // `-a`: the index with a fully valid cache-tree (cache_tree_update), written into the
+      // lock
+      treeId = await writeIndexAsTree(this.staging, this.trees, { write: false });
+      await index.write();
     } else {
-      // Normal mode: use full staging area
-      treeId = await this.staging.writeTree(this.trees);
+      // Normal mode: use full staging area; as git's prepare_index, the index is written
+      // again with a fully valid cache-tree (cache_tree_update, which keeps the valid nodes:
+      // a stored subtree no edit touched stays the one stored)
+      treeId = await writeIndexAsTree(this.staging, this.trees);
     }
+    return this.finishCommit(treeId, parents, mergeHeads, pickHead, {
+      author,
+      committer,
+      finalMessage,
+      state,
+      amendedId,
+      commitIndex: index ? () => index.commit() : undefined,
+    });
+  }
 
+  /** The commit of `treeId` made, HEAD moved to it, and what was in progress ended. */
+  private async finishCommit(
+    treeId: ObjectId,
+    parents: ObjectId[],
+    mergeHeads: ObjectId[],
+    pickHead: ObjectId | undefined,
+    info: {
+      author: PersonIdent;
+      committer: PersonIdent;
+      finalMessage: string;
+      state: OperationState;
+      amendedId: ObjectId | undefined;
+      /** Renames the index lock over the index, once HEAD has moved (git's commit_index_files) */
+      commitIndex?: () => Promise<void>;
+    },
+  ): Promise<CommitResult> {
+    const { author, committer, finalMessage, state, amendedId } = info;
     // Check for empty commit (a merge may record HEAD's tree)
     if (!this.allowEmpty && parents.length > 0 && mergeHeads.length === 0) {
       const parentCommit = await this.commits.load(parents[0]);
@@ -544,8 +664,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
     this.setCallable(false);
 
     // the commit ends what was in progress (git's sequencer_post_commit_cleanup and the
-    // state files cmd_commit unlinks), then applies a merge's autostash
-    await this.cleanupAfterCommit(state);
+    // state files cmd_commit unlinks), then the new index (commit_index_files), then applies
+    // a merge's autostash
+    await this.cleanupAfterCommit(state, info.commitIndex);
 
     // commit_post_rewrite: the amended commit's notes carried over (notes.rewriteRef)
     if (amendedId && !this.noPostRewrite) {
@@ -592,8 +713,14 @@ export class CommitCommand extends GitCommand<CommitResult> {
    * SQUASH_MSG, AUTO_MERGE), a stopped cherry-pick or revert ended (its sequencer state
    * too once it was the last pick), and MERGE_AUTOSTASH applied back, as `git commit`.
    */
-  private async cleanupAfterCommit(state: OperationState): Promise<void> {
-    if (!state.supported) return;
+  private async cleanupAfterCommit(
+    state: OperationState,
+    commitIndex: (() => Promise<void>) | undefined,
+  ): Promise<void> {
+    if (!state.supported) {
+      await commitIndex?.();
+      return;
+    }
     const picking =
       (await state.ref("CHERRY_PICK_HEAD")) !== undefined ||
       (await state.ref("REVERT_HEAD")) !== undefined;
@@ -605,6 +732,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       const left = todo.split("\n").filter((l) => l.trim() && !l.trim().startsWith("#"));
       if (left.length <= 1) await state.remove("sequencer");
     }
+    await commitIndex?.();
     const autostash = (await state.read("MERGE_AUTOSTASH"))?.trim();
     if (autostash) {
       await state.remove("MERGE_AUTOSTASH");
@@ -624,86 +752,259 @@ export class CommitCommand extends GitCommand<CommitResult> {
   }
 
   /**
-   * Build tree for --only mode.
-   *
-   * Combines parent tree with specified paths from staging area.
-   *
-   * @param parentCommitId Parent commit ID
-   * @returns Tree ObjectId
+   * The index held for a commit that changes it (git's `repo_hold_locked_index`): the
+   * index lock taken now (a staging with an index file), released on failure with the
+   * staging as it was before (read again, or its unwritten edits put back).
    */
-  private async buildOnlyTree(parentCommitId: ObjectId): Promise<ObjectId> {
-    const parentCommit = await this.commits.load(parentCommitId);
-    if (!parentCommit) {
-      throw new RefNotFoundError(parentCommitId, "Parent commit not found");
-    }
-
-    // Collect staging entries for onlyPaths
-    const onlyPathSet = new Set(this.onlyPaths);
-    const stagingEntriesMap = new Map<string, { objectId: ObjectId; mode: number }>();
-
-    for await (const entry of this.staging.entries()) {
-      if (onlyPathSet.has(entry.path) && entry.stage === 0) {
-        stagingEntriesMap.set(entry.path, {
-          objectId: entry.objectId,
-          mode: entry.mode,
-        });
-      }
-    }
-
-    // Create builder and populate with filtered tree
-    const builder = this.staging.createBuilder();
-
-    // Walk parent tree and add entries NOT in onlyPaths
-    await this.addTreeFiltered(builder, parentCommit.tree, "", onlyPathSet);
-
-    // Add staging entries for onlyPaths
-    for (const [path, { objectId, mode }] of stagingEntriesMap) {
-      builder.add({
-        path,
-        mode,
-        objectId,
-        size: 0,
-        mtime: Date.now(),
-      });
-    }
-
-    await builder.finish();
-
-    // Now write tree from staging
-    return await this.staging.writeTree(this.trees);
+  private async holdIndex(): Promise<HeldIndex> {
+    const staging = this.staging;
+    const unwritten = staging.hasUnwrittenChanges?.() !== false;
+    // what the staging held, for a staging that cannot read it back (no index file) or that
+    // holds edits not yet written
+    const lock = staging.lockIndex ? await staging.lockIndex() : undefined;
+    const snapshot =
+      !lock || unwritten
+        ? {
+            entries: (staging.entryList?.() ?? (await collectEntries(staging))).slice(),
+            cacheTree: staging.getCacheTree?.(),
+          }
+        : undefined;
+    let done = false;
+    return {
+      write: async () => {
+        await lock?.write();
+      },
+      commit: async () => {
+        if (lock) await lock.commit();
+        else await staging.write();
+        done = true;
+      },
+      release: async () => {
+        if (done) return;
+        done = true;
+        await lock?.rollback();
+        if (!snapshot) {
+          await staging.read();
+          return;
+        }
+        const builder = staging.createBuilder();
+        for (const entry of snapshot.entries) builder.add(entry);
+        await builder.finish();
+        staging.setCacheTree?.(snapshot.cacheTree);
+      },
+    };
   }
 
   /**
-   * Recursively walk tree and add entries to builder, excluding specified paths.
+   * The paths a partial commit takes (git's `list_paths`): those of the index (any stage)
+   * and of HEAD's tree the pathspec matches (`ce_path_match`, magic and globs as git's), in
+   * git's order, each with whether its index entry is skip-worktree. Refused during a
+   * merge, a cherry-pick or a rebase (git's whence), and when an element of the pathspec
+   * matches nothing (`report_path_error`).
    */
-  private async addTreeFiltered(
-    builder: ReturnType<typeof this.staging.createBuilder>,
+  private async listPartialPaths(
+    state: OperationState,
+    mergeHeads: ObjectId[],
+    headId: ObjectId | undefined,
+  ): Promise<Map<string, boolean>> {
+    if (mergeHeads.length > 0) {
+      throw new InvalidArgumentError(
+        "only",
+        this.onlyPaths,
+        "fatal: cannot do a partial commit during a merge.",
+      );
+    }
+    const pick = await state.ref("CHERRY_PICK_HEAD");
+    if (pick) {
+      // sequencer_determine_whence: a rebase stopped at this pick, else a cherry-pick
+      const rebasing =
+        (await state.read("rebase-merge/head-name")) !== undefined &&
+        (await state.ref("REBASE_HEAD")) === pick;
+      throw new InvalidArgumentError(
+        "only",
+        this.onlyPaths,
+        `fatal: cannot do a partial commit during a ${rebasing ? "rebase" : "cherry-pick"}.`,
+      );
+    }
+
+    let items: PathspecItem[];
+    try {
+      items = parsePathspec(this.onlyPaths);
+    } catch (error) {
+      throw new InvalidArgumentError("only", this.onlyPaths, `fatal: ${(error as Error).message}`);
+    }
+    // the elements as given (and the "." git adds when every element excludes)
+    const originals =
+      items.length > this.onlyPaths.length ? [...this.onlyPaths, "."] : [...this.onlyPaths];
+    // git's overlay_tree_on_index: HEAD's files at stage 1, among the index's entries (its
+    // conflict stages hoisted to 3), a HEAD file the index has at stage 0 left out; matched
+    // in that order (the order decides what an element matched exactly skips, as in git)
+    type Listed = { path: string; key: number; mode: number; skipWorktree: boolean };
+    const listed: Listed[] = [];
+    const stage0 = new Set<string>();
+    for await (const entry of this.staging.entries()) {
+      if (entry.stage === 0) stage0.add(entry.path);
+      listed.push({
+        path: entry.path,
+        key: entry.stage === 0 ? 0 : 3,
+        mode: entry.mode,
+        skipWorktree: entry.skipWorktree === true,
+      });
+    }
+    if (headId) {
+      const head = await this.commits.load(headId);
+      if (!head) throw new RefNotFoundError(headId, "HEAD commit not found");
+      // only the directories a positive element can match something in are read
+      const positive = items.filter((i) => !i.exclude);
+      const mayMatch = (dir: string) =>
+        matchPathspec(positive, dir, DO_MATCH_DIRECTORY | DO_MATCH_LEADING_PATHSPEC) > 0;
+      const files: Array<{ path: string; mode: number }> = [];
+      await this.collectTreeFiles(head.tree, "", mayMatch, files);
+      for (const file of files) {
+        if (!stage0.has(file.path)) listed.push({ ...file, key: 1, skipWorktree: false });
+      }
+      listed.sort((a, b) => compareGitPaths(a.path, b.path) || a.key - b.key);
+    }
+    const seen = items.map(() => 0);
+    const paths = new Map<string, boolean>();
+    for (const entry of listed) {
+      const flags = isGitlink(entry.mode) ? DO_MATCH_DIRECTORY : 0;
+      if (!matchPathspecSeen(items, entry.path, flags, seen)) continue;
+      paths.set(entry.path, (paths.get(entry.path) ?? false) || entry.skipWorktree);
+    }
+    const errors = pathspecErrors(originals, seen);
+    if (errors.length > 0) {
+      throw new InvalidArgumentError(
+        "only",
+        originals.filter((_, i) => !seen[i]),
+        errors.join("\n"),
+      );
+    }
+    // git's string_list: sorted by the paths' bytes
+    return new Map([...paths].sort(([a], [b]) => compareGitPaths(a, b)));
+  }
+
+  /** The files (and gitlinks) of a tree, in the directories `mayMatch` lets in. */
+  private async collectTreeFiles(
     treeId: ObjectId,
     prefix: string,
-    excludePaths: Set<string>,
+    mayMatch: (dir: string) => boolean,
+    files: Array<{ path: string; mode: number }>,
   ): Promise<void> {
     for await (const entry of this.trees.loadTree(treeId)) {
-      const fullPath = prefix ? `${prefix}/${entry.name}` : entry.name;
-
-      // Check if this is a tree (directory)
-      const isTree = (entry.mode & 0o170000) === 0o040000;
-
-      if (isTree) {
-        // Recursively process subtree
-        await this.addTreeFiltered(builder, entry.id, fullPath, excludePaths);
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.mode === FileMode.TREE) {
+        if (mayMatch(path)) await this.collectTreeFiles(entry.id, path, mayMatch, files);
       } else {
-        // Only add if not in excluded paths
-        if (!excludePaths.has(fullPath)) {
-          builder.add({
-            path: fullPath,
-            mode: entry.mode,
-            objectId: entry.id,
-            size: 0,
-            mtime: Date.now(),
-          });
-        }
+        files.push({ path, mode: entry.mode });
       }
     }
+  }
+
+  /**
+   * git's partial commit (`prepare_index`, `add_remove_files`): each listed path (but the
+   * skip-worktree ones) as git's `add_remove_files` takes it, literally: a file (ignored or
+   * not) hashed and staged, a path gone removed, a directory refused before anything
+   * changes ("'<path>' does not have a commit checked out"); the index then gets its
+   * cache-tree (none while it holds conflicts) and is written into the lock. The tree
+   * committed is HEAD's with the same paths taken (git's false index).
+   */
+  private async preparePartialCommit(
+    paths: Map<string, boolean>,
+    headId: ObjectId | undefined,
+    index: HeldIndex,
+  ): Promise<ObjectId> {
+    const taken = [...paths].filter(([, skipWorktree]) => !skipWorktree).map(([path]) => path);
+    // the lstat of each path, before the index is touched
+    const found = new Map<string, WorktreeEntry | undefined>();
+    let worktree: Worktree | undefined;
+    if (taken.length > 0) {
+      worktree = this.getWorktreeIterator();
+      if (!worktree) {
+        throw new StoreNotAvailableError(
+          "Worktree",
+          "Working tree iterator required for a partial commit. " +
+            "Ensure WorkingCopy has worktree or call setWorktreeStore().",
+        );
+      }
+    }
+    if (worktree) {
+      for (const path of taken) {
+        const entry = await worktree.getEntry(path);
+        if (entry?.isDirectory) {
+          // add_to_index of a directory: a gitlink only for a repository with a commit
+          // (index_path's resolve_gitlink_ref), which a worktree cannot hold here; git 2.5x
+          // adds the "unable to index file" line
+          throw new GitApiError(
+            `error: '${path}' does not have a commit checked out\n` +
+              `error: unable to index file '${path}'\nfatal: updating files failed`,
+          );
+        }
+        found.set(path, entry);
+      }
+      const trust = worktreeModeTrust(this.workingCopy, worktree);
+      const adder = await IndexAdder.open(this.staging, this.blobs, trust);
+      for (const path of taken) {
+        const entry = found.get(path);
+        if (entry) await adder.add(worktree, path, entry);
+        else adder.remove(path);
+      }
+      await adder.finish();
+    }
+    // the real index, with a cache-tree made valid as git's cache_tree_update before
+    // write_locked_index (none while it holds conflicts: the edits' invalidations stay)
+    await updateIndexCacheTree(this.staging, this.trees);
+    await index.write();
+
+    // the false index: HEAD's tree with the same paths as the index now has them
+    const edits = new Map<string, { mode: number; id: ObjectId } | null>();
+    for (const path of taken) {
+      const entry = found.get(path) ? await this.staging.getEntry(path) : undefined;
+      edits.set(
+        path,
+        entry && !entry.intentToAdd ? { mode: entry.mode, id: entry.objectId } : null,
+      );
+    }
+    const head = headId ? await this.commits.load(headId) : undefined;
+    if (headId && !head) throw new RefNotFoundError(headId, "HEAD commit not found");
+    return (await this.editTree(head?.tree, [...edits])) ?? this.trees.store([]);
+  }
+
+  /**
+   * A tree with the given files set (or removed, for null), only the directories on their
+   * paths stored again; undefined when nothing is left in it.
+   */
+  private async editTree(
+    treeId: ObjectId | undefined,
+    edits: Array<[string, { mode: number; id: ObjectId } | null]>,
+  ): Promise<ObjectId | undefined> {
+    const entries = new Map<string, TreeEntry>();
+    if (treeId) {
+      for await (const entry of this.trees.loadTree(treeId)) entries.set(entry.name, entry);
+    }
+    const subdirs = new Map<string, Array<[string, { mode: number; id: ObjectId } | null]>>();
+    for (const [path, edit] of edits) {
+      const slash = path.indexOf("/");
+      if (slash >= 0) {
+        const dir = path.slice(0, slash);
+        const list = subdirs.get(dir) ?? [];
+        list.push([path.slice(slash + 1), edit]);
+        subdirs.set(dir, list);
+      } else if (edit) {
+        entries.set(path, { name: path, mode: edit.mode, id: edit.id });
+      } else if (entries.get(path)?.mode !== FileMode.TREE) {
+        entries.delete(path);
+      }
+    }
+    for (const [dir, list] of subdirs) {
+      const existing = entries.get(dir);
+      const base = existing?.mode === FileMode.TREE ? existing.id : undefined;
+      const id = await this.editTree(base, list);
+      if (id) entries.set(dir, { name: dir, mode: FileMode.TREE, id });
+      else if (base) entries.delete(dir);
+    }
+    if (entries.size === 0) return undefined;
+    return this.trees.store([...entries.values()]);
   }
 
   /**
@@ -727,6 +1028,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
     const addCommand = new AddCommand(this._workingCopy);
     addCommand.addFilepattern(".");
     addCommand.setUpdate(true);
+    // into the index lock the commit holds, once the commit's tree is made
+    addCommand.setWriteIndex(false);
     addCommand.setWorktreeStore(worktree);
     await addCommand.call();
   }
@@ -743,6 +1046,25 @@ export class CommitCommand extends GitCommand<CommitResult> {
     return this.worktreeAccess;
   }
 }
+
+/** The index a commit holds while it changes it (see `CommitCommand.holdIndex`). */
+interface HeldIndex {
+  /** Writes the staging's entries into the index lock (nothing without an index file). */
+  write(): Promise<void>;
+  /** The index lock renamed over the index (a staging without one: written). */
+  commit(): Promise<void>;
+  /** On failure: the lock removed, the staging as it was before. Idempotent. */
+  release(): Promise<void>;
+}
+
+/** Every entry of the staging, in its order. */
+async function collectEntries(staging: Staging): Promise<StagingEntry[]> {
+  const out: StagingEntry[] = [];
+  for await (const entry of staging.entries()) out.push(entry);
+  return out;
+}
+
+const isGitlink = (mode: number) => (mode & 0o170000) === 0o160000;
 
 /** git's `rest_is_empty`: only whitespace and `Signed-off-by:` lines. */
 function isEmptyMessage(message: string): boolean {

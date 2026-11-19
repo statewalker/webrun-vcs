@@ -502,3 +502,31 @@ export function countConflictMarkers(content: string): number {
 
   return count;
 }
+
+/**
+ * Refuses entries no tree can hold, as git's `verify_cache` before it builds trees: a path
+ * that is a file and also a directory of another entry ("You have both a and a/b"), or the
+ * same path twice. Without the check the tree written would hold two entries of one name.
+ *
+ * @example
+ * ```typescript
+ * verifyTreePaths([{ path: "a" }, { path: "a/b" }]); // throws "You have both a and a/b"
+ * ```
+ *
+ * @param entries The stage-0 entries a tree is built from, sorted by path
+ * @throws Error naming the first file/directory clash
+ */
+export function verifyTreePaths(entries: readonly { path: string }[]): void {
+  const files = new Set<string>();
+  for (const entry of entries) {
+    if (files.has(entry.path)) throw new Error(`You have ${entry.path} twice`);
+    files.add(entry.path);
+  }
+  for (const entry of entries) {
+    const path = entry.path;
+    for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
+      const dir = path.slice(0, at);
+      if (files.has(dir)) throw new Error(`You have both ${dir} and ${path}`);
+    }
+  }
+}

@@ -1,47 +1,9 @@
-/**
- * AddCommand - Stage files from working tree to index.
- *
- * Implements JGit-compatible fluent API for `git add` command:
- * - Add new files to index
- * - Update modified files in index
- * - Optionally remove deleted files (--all mode)
- * - Support for update-only mode (-u flag)
- *
- * Reference: jgit/org.eclipse.jgit/src/org/eclipse/jgit/api/AddCommand.java
- *
- * @example
- * ```typescript
- * // Add specific files
- * await git.add()
- *   .addFilepattern("src/")
- *   .addFilepattern("lib/")
- *   .call();
- *
- * // Update only tracked files (git add -u)
- * await git.add()
- *   .addFilepattern(".")
- *   .setUpdate(true)
- *   .call();
- *
- * // Add all changes including deletions (git add -A)
- * await git.add()
- *   .addFilepattern(".")
- *   .setAll(true)
- *   .call();
- * ```
- */
-
-import { EMPTY_BLOB_ID, FileMode } from "@statewalker/vcs-core";
 import {
-  basicStatMatches,
-  DeleteStagingEntry,
   entryStatOf,
   modeFromWorktree,
-  type ResolveUndoRecord,
   type StagingEntry,
   UpdateStagingEntry,
   type Worktree,
-  wholeSeconds,
 } from "@statewalker/vcs-working-tree";
 import { storeWorktreeFile } from "../core-commands/index.js";
 
@@ -52,6 +14,7 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { worktreeModeTrust } from "./core-config.js";
+import { IndexAdder } from "./index-adder.js";
 
 /**
  * Result of AddCommand execution.
@@ -160,6 +123,7 @@ export class AddCommand extends GitCommand<AddResult> {
   private intentToAdd = false;
   private renormalize = false;
   private worktreeIterator: Worktree | undefined;
+  private writeIndex = true;
 
   /**
    * Add a path to a file/directory whose content should be added.
@@ -311,6 +275,19 @@ export class AddCommand extends GitCommand<AddResult> {
   }
 
   /**
+   * Whether the index is written at the end (the default). Without, the staging area is
+   * only updated in memory and the caller writes it: git commit's partial commit
+   * (`add_remove_files`), whose index is written only once the commit is made.
+   *
+   * @internal
+   */
+  setWriteIndex(write: boolean): this {
+    this.checkCallable();
+    this.writeIndex = write;
+    return this;
+  }
+
+  /**
    * Execute the add command.
    *
    * @returns Result with lists of added, skipped, and removed paths
@@ -320,6 +297,10 @@ export class AddCommand extends GitCommand<AddResult> {
   async call(): Promise<AddResult> {
     this.checkCallable();
     this.setCallable(false);
+    // the index as it is now, before the worktree or a ref is touched: one another writer
+    // replaced is read again (git reads the index at its start), unless this instance holds
+    // unwritten edits (refused)
+    await this.readCurrentIndex();
 
     // Validate options - update and all are mutually exclusive
     if (this.update && this.all !== undefined) {
@@ -469,59 +450,17 @@ export class AddCommand extends GitCommand<AddResult> {
       filesToProcess.push(...filtered);
     }
 
-    // Process files
-    const editor = this.staging.createEditor();
-    // what the worktree's modes can be trusted for (git's core.filemode / core.symlinks)
+    // Process files: git's add_to_index and remove_file_from_index, each stage-0 entry
+    // replacing the path's conflict stages (kept as resolve-undo) and the entries it
+    // clashes with as a file or a directory (check_file_directory_conflict)
     const trust = worktreeModeTrust(this.workingCopy, worktree);
-    const indexTime = this.staging.getUpdateTime();
-    // git's add_index_entry: a stage-0 entry replaces the path's conflict stages, which
-    // are kept as resolve-undo (record_resolve_undo); a removal takes every stage
-    const resolveUndo: ResolveUndoRecord[] = [];
-    const resolve = (path: string) => {
-      const stages = unmerged.get(path);
-      if (!stages) return;
-      unmerged.delete(path);
-      editor.remove(path);
-      const record: ResolveUndoRecord = {
-        path,
-        modes: [0, 0, 0],
-        objectIds: [undefined, undefined, undefined],
-      };
-      for (const entry of stages) {
-        const k = entry.stage - 1;
-        if (k < 0 || k > 2) continue;
-        record.modes[k] = entry.mode;
-        record.objectIds[k] = entry.objectId;
-      }
-      resolveUndo.push(record);
-    };
+    const adder = await IndexAdder.open(this.staging, this.blobs, trust);
 
     for (const file of filesToProcess) {
       if (!file.exists) {
         // File deleted from worktree - remove from index
-        resolve(file.path);
-        editor.add(new DeleteStagingEntry(file.path));
+        adder.remove(file.path);
         removed.push(file.path);
-        continue;
-      }
-
-      if (this.intentToAdd) {
-        resolve(file.path);
-        // Just mark as intent-to-add (placeholder with empty blob)
-        const worktreeEntry = await worktree.getEntry(file.path);
-        const mode = worktreeEntry?.mode ?? FileMode.REGULAR_FILE;
-        editor.add(
-          // the empty blob's id, flagged intent-to-add, as git records it (never an empty
-          // or all-zero id, which a worktree hash could be compared against)
-          new UpdateStagingEntry(
-            file.path,
-            EMPTY_BLOB_ID,
-            mode,
-            { size: 0, mtime: Date.now() },
-            { intentToAdd: true },
-          ),
-        );
-        added.push(file.path);
         continue;
       }
 
@@ -531,42 +470,18 @@ export class AddCommand extends GitCommand<AddResult> {
         // File disappeared during processing
         continue;
       }
-
-      // git's add_to_index: a tracked file whose stat still matches its entry (and is not
-      // racily clean) is not read again (nor its line endings checked)
-      const indexed = await this.staging.getEntry(file.path);
-      if (
-        indexed &&
-        !indexed.intentToAdd &&
-        indexTime > 0 &&
-        wholeSeconds(indexed.mtime, indexed.mtimeNs) < wholeSeconds(indexTime) &&
-        modeFromWorktree(worktreeEntry.mode, indexed.mode, trust) === indexed.mode &&
-        basicStatMatches(indexed, worktreeEntry, trust)
-      ) {
-        added.push(file.path);
-        continue;
-      }
-
-      // Hash and store content
-      // the stat that matched the stored content (a fresh one after a retry)
-      const stored = await storeWorktreeFile(this.blobs, worktree, file.path, worktreeEntry, {
+      const staged = await adder.add(worktree, file.path, worktreeEntry, {
+        intentToAdd: this.intentToAdd,
         onWarning: (message) => warnings.push(message),
       });
-      resolve(file.path);
-
-      // Add to staging, with the mode git's ce_mode_from_stat would record
-      const indexMode = indexed?.mode;
-      const mode = modeFromWorktree(stored.entry.mode, indexMode, trust);
-      editor.add(new UpdateStagingEntry(file.path, stored.id, mode, entryStatOf(stored.entry)));
-      added.push(file.path);
+      if (staged) added.push(file.path);
     }
 
     // Apply changes
-    await editor.finish();
-    if (resolveUndo.length > 0) this.staging.recordResolveUndo?.(resolveUndo);
+    await adder.finish();
 
     // Persist staging changes (required for FileStagingStore)
-    await this.staging.write();
+    if (this.writeIndex) await this.staging.write();
 
     return {
       added,

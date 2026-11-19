@@ -15,6 +15,7 @@ import {
   createInitializedGitFromFactory,
   testAuthor,
   toArray,
+  writeAddedFiles,
 } from "./test-helper.js";
 
 describe.each(backends)("CommitCommand ($name backend)", ({ factory }) => {
@@ -255,6 +256,9 @@ describe.each(backends)("CommitCommand with --only flag ($name backend)", ({ fac
   async function createInitializedGit() {
     const result = await createInitializedGitFromFactory(factory);
     cleanup = result.cleanup;
+    // --only takes the named paths from the worktree, as git's partial commit: the files
+    // staged are there too
+    writeAddedFiles(result.workingCopy);
     return result;
   }
 

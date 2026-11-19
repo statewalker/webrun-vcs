@@ -1,4 +1,4 @@
-import type { MergeStageValue } from "@statewalker/vcs-working-tree";
+import type { IndexEntry } from "@statewalker/vcs-working-tree";
 
 import { NoFilepatternError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
@@ -81,6 +81,10 @@ export class RmCommand extends GitCommand<RmResult> {
   async call(): Promise<RmResult> {
     this.checkCallable();
     this.setCallable(false);
+    // the index as it is now, before the worktree or a ref is touched: one another writer
+    // replaced is read again (git reads the index at its start), unless this instance holds
+    // unwritten edits (refused)
+    await this.readCurrentIndex();
 
     if (this.filepatterns.length === 0) {
       throw new NoFilepatternError("At least one file pattern is required");
@@ -91,26 +95,15 @@ export class RmCommand extends GitCommand<RmResult> {
     // Read current staging area
     await this.staging.read();
 
-    // Get all entries from staging
-    const entriesToKeep: Array<{
-      path: string;
-      mode: number;
-      objectId: string;
-      stage: MergeStageValue;
-    }> = [];
+    // the kept entries go on as they are: flags (intent-to-add, skip-worktree,
+    // assume-unchanged) and stat data included (git's remove_file_from_index)
+    const entriesToKeep: IndexEntry[] = [];
 
     for await (const entry of this.staging.entries()) {
-      const shouldRemove = this.matchesPattern(entry.path);
-
-      if (shouldRemove) {
+      if (this.matchesPattern(entry.path)) {
         removedPaths.push(entry.path);
       } else {
-        entriesToKeep.push({
-          path: entry.path,
-          mode: entry.mode,
-          objectId: entry.objectId,
-          stage: entry.stage,
-        });
+        entriesToKeep.push(entry);
       }
     }
 

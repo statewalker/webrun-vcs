@@ -2,6 +2,7 @@ import type { Trees } from "@statewalker/vcs-core";
 import { createInMemoryFilesApi, type FilesApi } from "@statewalker/vcs-utils/files";
 import { describe, expect, it } from "vitest";
 import {
+  type CacheTree,
   carryIndexExtensions,
   createGitStaging,
   encodeResolveUndo,
@@ -142,5 +143,43 @@ describe("GitStaging.readTree clears resolve-undo, as git read-tree and reset do
     await staging.readTree(trees, "d".repeat(40), { keepExisting: true, prefix: "sub" });
     await staging.write();
     expect(await extensionsOf(files)).toEqual(["REUC"]);
+  });
+});
+
+describe("GitStaging.setCacheTree: edits after it invalidate their paths at the write", () => {
+  const id = (c: string) => c.repeat(40);
+  const node = (count: number, c: string, subtrees: CacheTree["subtrees"] = []): CacheTree => ({
+    entryCount: count,
+    id: id(c),
+    subtrees,
+  });
+
+  it("an entry removed after the cache-tree was set leaves its directories invalid", async () => {
+    const files = createInMemoryFilesApi();
+    const staging = createGitStaging(files, "index");
+    const builder = staging.createBuilder();
+    for (const path of ["a/b/w", "a/b/z", "a/x", "c/v", "f"]) builder.add(entry(path));
+    await builder.finish();
+    // fully valid for those five entries (a/b, a, c below the root)
+    staging.setCacheTree?.(
+      node(5, "1", [
+        { name: "a", tree: node(3, "2", [{ name: "b", tree: node(2, "3") }]) },
+        { name: "c", tree: node(1, "4") },
+      ]),
+    );
+    const editor = staging.createEditor();
+    editor.remove("a/b/z");
+    await editor.finish();
+    await staging.write();
+
+    const again = createGitStaging(files, "index");
+    await again.read();
+    const tree = again.getCacheTree?.() as CacheTree;
+    expect(tree.entryCount).toBe(-1);
+    const a = tree.subtrees.find((s) => s.name === "a")?.tree as CacheTree;
+    expect(a.entryCount).toBe(-1);
+    expect(a.subtrees[0]?.tree.entryCount).toBe(-1);
+    // the directory no edit touched stays valid
+    expect(tree.subtrees.find((s) => s.name === "c")?.tree).toEqual(node(1, "4"));
   });
 });

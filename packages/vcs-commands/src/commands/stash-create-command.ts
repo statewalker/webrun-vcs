@@ -229,6 +229,10 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   async call(): Promise<ObjectId | undefined> {
     this.checkCallable();
     this.setCallable(false);
+    // the index as it is now, before the worktree or a ref is touched: one another writer
+    // replaced is read again (git reads the index at its start), unless this instance holds
+    // unwritten edits (refused)
+    await this.readCurrentIndex();
     // one operation: one reading of the ignore rules for the trees, the clean and the reset
     const worktree = this.worktreeAccess;
     return worktree?.batch ? worktree.batch(() => this.stash()) : this.stash();

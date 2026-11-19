@@ -168,6 +168,9 @@ export class CleanCommand extends GitCommand<CleanResult> {
   async call(): Promise<CleanResult> {
     this.checkCallable();
     this.setCallable(false);
+    // the index as it is now (git reads it at its start); clean writes none, so unwritten
+    // edits of this instance are kept and used as they are
+    await this.readCurrentIndex(false);
 
     const worktree = this.worktreeAccess;
     if (!worktree) {

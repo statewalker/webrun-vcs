@@ -13,9 +13,13 @@ import type {
 } from "@statewalker/vcs-working-tree";
 import {
   EntriesAsRead,
+  keepMatchingEntries,
+  keepMatchingMode,
   MergeStage,
   type RacyCheck,
+  RemoveStagingStages,
   smudgeRacilyClean,
+  verifyTreePaths,
 } from "@statewalker/vcs-working-tree";
 
 /**
@@ -111,7 +115,7 @@ export class MemoryStagingStore implements Staging {
     } else {
       // Remove specific stage
       const hadEntry = (await this.getEntry(path, stage)) !== undefined;
-      editor.remove(path);
+      editor.remove(path, stage);
       await editor.finish();
       return hadEntry;
     }
@@ -222,9 +226,9 @@ export class MemoryStagingStore implements Staging {
     }
 
     // an intent-to-add entry is no part of the tree (git's update_one skips it)
-    const stage0 = this._entries.filter(
-      (e) => e.stage === MergeStage.MERGED && !(e.intentToAdd && !e.skipWorktree),
-    );
+    const stage0 = this._entries.filter((e) => e.stage === MergeStage.MERGED && !e.intentToAdd);
+    // never a tree with two entries of one name (git's verify_cache)
+    verifyTreePaths(stage0);
     return this.buildTreeRecursive(trees, stage0, "");
   }
 
@@ -269,6 +273,7 @@ export class MemoryStagingStore implements Staging {
   }
 
   async readTree(trees: Trees, treeId: ObjectId, options?: ReadTreeOptions): Promise<void> {
+    const before = options?.keepMatching ? this._entries : undefined;
     if (!options?.keepExisting) {
       this._entries = [];
     }
@@ -278,6 +283,9 @@ export class MemoryStagingStore implements Staging {
 
     await this.addTreeRecursive(trees, treeId, prefix, stage);
     this.sortEntries();
+    if (before) {
+      this._entries = keepMatchingEntries(before, this._entries, keepMatchingMode(options));
+    }
     this.updateTime = Date.now();
   }
 
@@ -424,6 +432,10 @@ class MemoryStagingBuilder implements IndexBuilder {
       ctime: options.ctime,
       dev: options.dev,
       ino: options.ino,
+      mtimeNs: options.mtimeNs,
+      ctimeNs: options.ctimeNs,
+      uid: options.uid,
+      gid: options.gid,
       assumeValid: options.assumeValid,
       intentToAdd: options.intentToAdd,
       skipWorktree: options.skipWorktree,
@@ -533,10 +545,9 @@ class MemoryStagingEditor implements IndexEditor {
     this.edits.push(edit);
   }
 
-  remove(path: string, _stage?: MergeStageValue): void {
-    // For now, remove all stages (ignore stage parameter)
-    // TODO: Implement stage-specific removal if needed
-    this.edits.push({ path, apply: () => undefined });
+  remove(path: string, stage?: MergeStageValue): void {
+    // every stage of the path, or only the one given
+    this.edits.push(new RemoveStagingStages(path, stage));
   }
 
   upsert(entry: StagingEntryOptions): void {
@@ -588,7 +599,18 @@ class MemoryStagingEditor implements IndexEditor {
           if (result) newEntries.push(result);
           editIndex++;
         } else {
-          if (isResolveConflict(edit)) {
+          if (edit instanceof RemoveStagingStages) {
+            // the path's stages but the removed ones
+            while (
+              entryIndex < existingEntries.length &&
+              existingEntries[entryIndex].path === edit.path
+            ) {
+              if (edit.keeps(existingEntries[entryIndex])) {
+                newEntries.push(existingEntries[entryIndex]);
+              }
+              entryIndex++;
+            }
+          } else if (isResolveConflict(edit)) {
             this.applyConflictResolution(existingEntries, entryIndex, edit, newEntries);
             while (
               entryIndex < existingEntries.length &&

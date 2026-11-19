@@ -240,6 +240,37 @@ describeGit("git am as native git", () => {
     );
   }, 120_000);
 
+  it("--skip after a stop with changes staged cleans the index as git's clean_index", async () => {
+    const mbox = series();
+    const bytes = readFileSync(mbox);
+    const drift = (repo: string) => {
+      put(repo, "a.txt", lines(20).replace("line 3\n", "LINE 3\n"));
+      gitOk(repo, ["commit", "-qam", "drift"]);
+    };
+    for (const threeway of [false, true]) {
+      const pair = twins(drift);
+      const args = threeway ? ["-3", mbox] : [mbox];
+      await compare(pair, args, (c) => c.addMbox(bytes).setThreeWay(threeway), "stop");
+      for (const repo of [pair.native, pair.ours]) {
+        // a staged new file, a staged edit, an unstaged edit
+        put(repo, "new.txt", "new\n");
+        put(repo, "b.txt", lines(10, "bee").replace("bee 2\n", "BEE 2\n"));
+        gitOk(repo, ["add", "new.txt", "b.txt"]);
+        put(repo, "data.bin", "worktree only\n");
+      }
+      await compare(pair, ["--skip"], (c) => c.setResume("skip"), `skip ${threeway}`);
+    }
+    // a staged file changed again in the worktree: clean_index refuses to overwrite it
+    const pair = twins(drift);
+    await compare(pair, [mbox], (c) => c.addMbox(bytes), "stop dirty");
+    for (const repo of [pair.native, pair.ours]) {
+      put(repo, "b.txt", "staged\n");
+      gitOk(repo, ["add", "b.txt"]);
+      put(repo, "b.txt", "dirty again\n");
+    }
+    await compare(pair, ["--skip"], (c) => c.setResume("skip"), "skip refused");
+  }, 120_000);
+
   it("stops, skips, continues and aborts as native git does", async () => {
     const mbox = series();
     const bytes = readFileSync(mbox);
@@ -466,7 +497,11 @@ describeGit("git am as native git", () => {
   it("advises --allow-empty on --continue and fails --abort as git", async () => {
     const pair = twins();
     const path = join(root, `m${counter++}`);
-    writeFileSync(path, "From: A <a@x>\nSubject: no patch\n\nbody only\n");
+    // with a Date: header (without one, git am dates the commit by the wall clock)
+    writeFileSync(
+      path,
+      "From: A <a@x>\nSubject: no patch\nDate: Thu, 1 Jan 2015 00:00:00 +0000\n\nbody only\n",
+    );
     const bytes = readFileSync(path);
     await compare(pair, [path], (c) => c.addMbox(bytes, path), "empty patch");
     await compare(pair, ["--continue"], (c) => c.setResume("continue"), "continue empty");

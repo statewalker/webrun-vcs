@@ -447,6 +447,33 @@ export function createStagingStoreTests(name: string, factory: StagingStoreFacto
 
         expect(await ctx.stagingStore.hasEntry("new.txt")).toBe(true);
       });
+
+      it("removes only the stage named (editor.remove and removeEntry)", async () => {
+        const builder = ctx.stagingStore.createBuilder();
+        for (const stage of [MergeStage.BASE, MergeStage.OURS, MergeStage.THEIRS]) {
+          builder.add(createEntry("c.txt", { stage }));
+          builder.add(createEntry("d.txt", { stage }));
+        }
+        await builder.finish();
+
+        const editor = ctx.stagingStore.createEditor();
+        editor.remove("c.txt", MergeStage.OURS);
+        await editor.finish();
+        expect((await ctx.stagingStore.getEntries("c.txt")).map((e) => e.stage)).toEqual([
+          MergeStage.BASE,
+          MergeStage.THEIRS,
+        ]);
+
+        expect(await ctx.stagingStore.removeEntry("d.txt", MergeStage.BASE)).toBe(true);
+        expect(await ctx.stagingStore.removeEntry("d.txt", MergeStage.BASE)).toBe(false);
+        expect((await ctx.stagingStore.getEntries("d.txt")).map((e) => e.stage)).toEqual([
+          MergeStage.OURS,
+          MergeStage.THEIRS,
+        ]);
+
+        expect(await ctx.stagingStore.removeEntry("d.txt")).toBe(true);
+        expect(await ctx.stagingStore.hasEntry("d.txt")).toBe(false);
+      });
     });
 
     describe("Entry Properties", () => {
@@ -494,6 +521,26 @@ export function createStagingStoreTests(name: string, factory: StagingStoreFacto
         expect(entry?.intentToAdd).toBe(true);
         expect(entry?.skipWorktree).toBe(true);
       });
+
+      it("preserves the whole stat data through a builder copy", async () => {
+        const stat = { mtimeNs: 123, ctime: 5000, ctimeNs: 456, uid: 7, gid: 8 };
+        const builder = ctx.stagingStore.createBuilder();
+        builder.add({ ...createEntry("file.txt"), ...stat });
+        await builder.finish();
+        // the entry given again as a copy (as an index rewritten around other paths)
+        const entry = await ctx.stagingStore.getEntry("file.txt");
+        if (!entry) throw new Error("file.txt missing");
+        // a store that keeps no such stat data (KV, SQL rows) has nothing to lose
+        if (entry.mtimeNs === undefined) return;
+        const again = ctx.stagingStore.createBuilder();
+        again.add({ ...entry });
+        await again.finish();
+        const copied = await ctx.stagingStore.getEntry("file.txt");
+        expect(copied?.mtimeNs).toBe(123);
+        expect(copied?.ctimeNs).toBe(456);
+        expect(copied?.uid).toBe(7);
+        expect(copied?.gid).toBe(8);
+      });
     });
 
     describe("Tree Operations", () => {
@@ -525,6 +572,18 @@ export function createStagingStoreTests(name: string, factory: StagingStoreFacto
         await builder.finish();
 
         await expect(ctx.stagingStore.writeTree(ctx.trees)).rejects.toThrow();
+      });
+
+      it("refuses a tree where a path is a file and a directory (git's verify_cache)", async () => {
+        if (!ctx.trees) return;
+        const builder = ctx.stagingStore.createBuilder();
+        builder.add(createEntry("a"));
+        builder.add(createEntry("a/inner"));
+        await builder.finish();
+
+        await expect(ctx.stagingStore.writeTree(ctx.trees)).rejects.toThrow(
+          "You have both a and a/inner",
+        );
       });
 
       it("reads tree into staging area", async () => {

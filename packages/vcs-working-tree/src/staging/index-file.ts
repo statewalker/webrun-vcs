@@ -24,7 +24,13 @@ import { readFile } from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
-import { type CacheTree, encodeCacheTree, parseCacheTree } from "./cache-tree.js";
+import {
+  type CacheTree,
+  copyCacheTree,
+  encodeCacheTree,
+  invalidateCacheTreePath,
+  parseCacheTree,
+} from "./cache-tree.js";
 import {
   assertWritableIndexExtensions,
   carryIndexExtensions,
@@ -198,6 +204,8 @@ export class IndexFile {
   private entriesKept: readonly StagingEntry[] | undefined;
   /** A cache-tree computed for the entries of the next write (see `setCacheTree`). */
   private pendingCacheTree: CacheTree | undefined;
+  /** The entries `pendingCacheTree` describes, when given: the write invalidates what changed since. */
+  private pendingEntries: readonly StagingEntry[] | undefined;
   /** Why the last read refused the index; writes refuse it too until a read succeeds. */
   private refused: Error | undefined;
   /**
@@ -239,6 +247,9 @@ export class IndexFile {
    *   (a split or sparse index), whose entries cannot be read without it
    */
   async read(): Promise<{ entries: StagingEntry[]; lastModified: number } | undefined> {
+    // a cache-tree set for a write of the entries before goes with them
+    this.pendingCacheTree = undefined;
+    this.pendingEntries = undefined;
     const stats = await this.files.stats(this.path);
     if (!stats) {
       this.extensions = [];
@@ -314,28 +325,42 @@ export class IndexFile {
 
   /**
    * Write `tree` as the `TREE` extension with the next `write` (git's cache-tree after
-   * `unpack_trees` or `write_index_as_tree`), replacing what was read. It must describe the
-   * entries that write is given; a valid root whose count disagrees with them is dropped.
+   * `unpack_trees` or `write_index_as_tree`), replacing what was read. It describes
+   * `entries` (the index when it is set); the write invalidates each path whose entries
+   * changed since, as git's index edits invalidate it. Without `entries` it must describe
+   * the entries that write is given; a valid root whose count disagrees with them is dropped.
    */
-  setCacheTree(tree: CacheTree | undefined): void {
+  setCacheTree(tree: CacheTree | undefined, entries?: readonly StagingEntry[]): void {
     this.pendingCacheTree = tree;
+    // a copy: the caller's list may be edited in place
+    this.pendingEntries = tree && entries ? entries.slice() : undefined;
   }
 
   /**
-   * The cache-tree of the index as last read or written (its `TREE` extension), when
-   * `entries` are the ones it was read or written with; undefined otherwise or when it
-   * cannot be parsed. A fresh copy each time.
+   * The cache-tree the next write writes: the one set with `setCacheTree`, else the index's
+   * as last read or written (its `TREE` extension), each path whose entries differ in
+   * `entries` invalid; undefined when there is none or it cannot be parsed. A fresh copy
+   * each time.
    */
   cacheTree(entries: readonly StagingEntry[]): CacheTree | undefined {
-    const ext = this.extensions.find((e) => e.signature === "TREE");
-    if (!ext || this.entriesKept === undefined || !sameIndexEntries(this.entriesKept, entries)) {
-      return undefined;
+    if (this.pendingCacheTree) {
+      // one set for the next write: what it will write (paths changed since invalid)
+      const tree = copyCacheTree(this.pendingCacheTree);
+      if (this.pendingEntries) invalidateChangedPaths(tree, this.pendingEntries, entries);
+      return tree;
     }
+    const ext = this.extensions.find((e) => e.signature === "TREE");
+    if (!ext || this.entriesKept === undefined) return undefined;
+    let tree: CacheTree;
     try {
-      return parseCacheTree(ext.data);
+      tree = parseCacheTree(ext.data);
     } catch {
       return undefined;
     }
+    // the entries changed since: each path changed invalid, as git's index edits invalidate
+    // it (cache_tree_invalidate_path from add_index_entry and remove_index_entry_at)
+    invalidateChangedPaths(tree, this.entriesKept, entries);
+    return tree;
   }
 
   /**
@@ -346,11 +371,110 @@ export class IndexFile {
    */
   async write(entries: readonly StagingEntry[]): Promise<void> {
     if (this.refused) throw this.refused;
+    const prepared = this.prepareWrite(entries);
+    this.checksum = await writeIndexFile(this.files, this.path, entries, {
+      version: this.version,
+      extensions: prepared.extensions,
+      lockTimeoutMs: this.options.lockTimeoutMs,
+      expectedChecksum: this.checksum,
+    });
+    this.wrote(entries, prepared.extensions);
+  }
+
+  /**
+   * Takes `<index>.lock` now, as git's `repo_hold_locked_index`, and holds it until the lock
+   * is committed (renamed over the index) or rolled back (removed). While it is held every
+   * other writer is refused; `write` puts entries into the lock, any number of times.
+   *
+   * @example
+   * ```typescript
+   * const lock = await indexFile.lock();
+   * await lock.write(entries);
+   * await lock.commit(); // or lock.rollback()
+   * ```
+   *
+   * @throws IndexLockedError when the lock exists (after `lockTimeoutMs`)
+   * @throws IndexChangedError when the index on disk is not the one last read or written
+   */
+  async lock(): Promise<IndexFileLock> {
+    if (this.refused) throw this.refused;
+    const lockPath = `${this.path}.lock`;
+    const atomic = atomicFilesOver(this.files, "");
+    const deadline = Date.now() + (this.options.lockTimeoutMs ?? 0);
+    while (!(await atomic.createExclusive(lockPath, new Uint8Array(0)))) {
+      if (Date.now() >= deadline) throw new IndexLockedError(lockPath);
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+    }
+    let state: "held" | "done" = "held";
+    // what was written into the lock: applied to this instance once it is committed
+    let pending:
+      | { entries: readonly StagingEntry[]; extensions: IndexExtension[]; checksum: string }
+      | undefined;
+    const release = async () => {
+      state = "done";
+      await atomic.remove(lockPath).catch(() => {});
+    };
+    try {
+      if (this.checksum !== undefined) {
+        const current = await readIndexChecksum(this.files, this.path);
+        if (current !== this.checksum) throw new IndexChangedError(this.path);
+      }
+    } catch (error) {
+      await release();
+      throw error;
+    }
+    return {
+      path: lockPath,
+      write: async (entries) => {
+        if (state !== "held") throw new Error(`'${lockPath}' is no longer held`);
+        const prepared = this.prepareWrite(entries);
+        const { bytes, checksum } = await encodeIndexFileBytes(
+          entries,
+          this.version,
+          prepared.extensions,
+        );
+        await atomic.write(lockPath, bytes);
+        pending = {
+          entries: entries.slice(),
+          extensions: prepared.extensions,
+          checksum: bytesToHex(checksum),
+        };
+      },
+      commit: async () => {
+        if (state !== "held") throw new Error(`'${lockPath}' is no longer held`);
+        if (!pending) {
+          // nothing written: the index stays as it is
+          await release();
+          return;
+        }
+        try {
+          await atomic.replace(lockPath, this.path);
+        } catch (error) {
+          await release();
+          throw error;
+        }
+        state = "done";
+        this.checksum = pending.checksum;
+        this.wrote(pending.entries, pending.extensions);
+      },
+      rollback: async () => {
+        if (state === "held") await release();
+      },
+    };
+  }
+
+  /** The extensions a write of `entries` carries (the pending cache-tree consumed). */
+  private prepareWrite(entries: readonly StagingEntry[]): { extensions: IndexExtension[] } {
     // what indexEntriesDigest compares: path, stage, mode, object id, intent-to-add
     const changed = this.entriesKept === undefined || !sameIndexEntries(this.entriesKept, entries);
     let extensions = carryIndexExtensions(this.extensions, entries, changed);
-    const tree = this.pendingCacheTree;
+    // without a cache-tree computed for these entries, the one read or last written goes on
+    // with each changed path invalid (git keeps the nodes no edit touched valid)
+    let tree = this.pendingCacheTree;
+    if (tree && this.pendingEntries) invalidateChangedPaths(tree, this.pendingEntries, entries);
+    else if (!tree && changed) tree = this.cacheTree(entries);
     this.pendingCacheTree = undefined;
+    this.pendingEntries = undefined;
     if (tree && describesEntries(tree, entries)) {
       // git writes the cache-tree first
       extensions = [
@@ -358,15 +482,26 @@ export class IndexFile {
         ...extensions.filter((e) => e.signature !== "TREE"),
       ];
     }
-    this.checksum = await writeIndexFile(this.files, this.path, entries, {
-      version: this.version,
-      extensions,
-      lockTimeoutMs: this.options.lockTimeoutMs,
-      expectedChecksum: this.checksum,
-    });
+    return { extensions };
+  }
+
+  /** After a write: what the index now holds. */
+  private wrote(entries: readonly StagingEntry[], extensions: IndexExtension[]): void {
     this.extensions = extensions;
     this.entriesKept = extensions.length > 0 ? entries.slice() : undefined;
   }
+}
+
+/** `<index>.lock` held by `IndexFile.lock()`. */
+export interface IndexFileLock {
+  /** The lock file's path. */
+  readonly path: string;
+  /** Writes `entries` (sorted by path, stage) into the lock, with the extensions that apply. */
+  write(entries: readonly StagingEntry[]): Promise<void>;
+  /** Renames the lock over the index (only removes it when nothing was written). */
+  commit(): Promise<void>;
+  /** Removes the lock, the index left as it was; nothing once committed or rolled back. */
+  rollback(): Promise<void>;
 }
 
 /** Whether a cache-tree can stand for `entries`: a valid root counts their tree entries. */
@@ -375,7 +510,7 @@ function describesEntries(tree: CacheTree, entries: readonly StagingEntry[]): bo
   let count = 0;
   for (const e of entries) {
     if (e.stage !== 0) return false;
-    if (!(e.intentToAdd && !e.skipWorktree)) count++;
+    if (!e.intentToAdd) count++;
   }
   return count === tree.entryCount;
 }
@@ -398,4 +533,52 @@ function sameIndexEntries(a: readonly StagingEntry[], b: readonly StagingEntry[]
     }
   }
   return true;
+}
+
+/**
+ * Invalidate in `tree` (the cache-tree of the entries `before`) every path whose entries
+ * differ in `after` (path, stage, mode, object id, intent-to-add): one added, removed or
+ * changed, as git's index edits invalidate it. Both lists are sorted by path and stage.
+ */
+export function invalidateChangedPaths(
+  tree: CacheTree,
+  before: readonly StagingEntry[],
+  after: readonly StagingEntry[],
+): void {
+  let i = 0;
+  let j = 0;
+  while (i < before.length || j < after.length) {
+    const x = before[i];
+    const y = after[j];
+    if (x === y) {
+      i++;
+      j++;
+      continue;
+    }
+    const order =
+      x === undefined
+        ? 1
+        : y === undefined
+          ? -1
+          : compareGitPaths(x.path, y.path) || x.stage - y.stage;
+    if (order < 0) {
+      invalidateCacheTreePath(tree, x.path);
+      i++;
+    } else if (order > 0) {
+      invalidateCacheTreePath(tree, (y as StagingEntry).path);
+      j++;
+    } else {
+      const a = x as StagingEntry;
+      const b = y as StagingEntry;
+      if (
+        a.mode !== b.mode ||
+        a.objectId !== b.objectId ||
+        (a.intentToAdd ? 1 : 0) !== (b.intentToAdd ? 1 : 0)
+      ) {
+        invalidateCacheTreePath(tree, b.path);
+      }
+      i++;
+      j++;
+    }
+  }
 }

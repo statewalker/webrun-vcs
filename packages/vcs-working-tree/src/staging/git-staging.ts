@@ -11,6 +11,7 @@ import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { createInMemoryFilesApi, FileMode, type FilesApi } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { CacheTree } from "./cache-tree.js";
+import { verifyTreePaths } from "./conflict-utils.js";
 import type { ResolveUndoRecord } from "./index-extensions.js";
 import { IndexFile, readIndexChecksum } from "./index-file.js";
 import { INDEX_VERSION_2, type IndexVersion, reuseEntryEncoding } from "./index-format.js";
@@ -24,6 +25,7 @@ import type {
   IndexEntryOptions,
   ReadTreeOptions,
   Staging,
+  StagingIndexLock,
 } from "./staging.js";
 import {
   type IndexStatUpdate,
@@ -47,6 +49,8 @@ export class GitStaging implements Staging {
   private racyCheck?: RacyCheck;
   /** The entries as last read or written (others were set in this session: up to date) */
   private asRead = new Set<StagingEntry>();
+  /** Whether the entries or extensions changed since they were last read or written */
+  private unwritten = false;
   private version: IndexVersion = INDEX_VERSION_2;
   private readonly indexFile: IndexFile;
 
@@ -89,6 +93,7 @@ export class GitStaging implements Staging {
   }
 
   async setEntry(entryOrOptions: IndexEntry | IndexEntryOptions): Promise<void> {
+    this.unwritten = true;
     const entry = this.normalizeEntry(entryOrOptions);
     const index = this.findEntry(entry.path, entry.stage);
 
@@ -103,6 +108,7 @@ export class GitStaging implements Staging {
   }
 
   async removeEntry(path: string, stage?: MergeStageValue): Promise<boolean> {
+    this.unwritten = true;
     if (stage !== undefined) {
       const index = this.findEntry(path, stage);
       if (index >= 0) {
@@ -211,9 +217,9 @@ export class GitStaging implements Staging {
 
     // Build tree from stage 0 entries only
     // an intent-to-add entry is no part of the tree (git's update_one skips it)
-    const stage0 = this._entries.filter(
-      (e) => e.stage === MergeStage.MERGED && !(e.intentToAdd && !e.skipWorktree),
-    );
+    const stage0 = this._entries.filter((e) => e.stage === MergeStage.MERGED && !e.intentToAdd);
+    // never a tree with two entries of one name (git's verify_cache)
+    verifyTreePaths(stage0);
     // the directories the cache-tree has valid keep their trees, as git's write-tree
     // (`cache_tree_update`): a tree primed by a reset keeps its stored modes (100664)
     return this.buildTreeRecursive(trees, stage0, "", this.getCacheTree());
@@ -281,6 +287,8 @@ export class GitStaging implements Staging {
   }
 
   async readTree(trees: Trees, treeId: ObjectId, options?: ReadTreeOptions): Promise<void> {
+    this.unwritten = true;
+    const before = options?.keepMatching ? this._entries : undefined;
     if (!options?.keepExisting) {
       this._entries = [];
       // a whole tree replaces the index: git's read-tree and unpack-trees drop resolve-undo
@@ -292,6 +300,9 @@ export class GitStaging implements Staging {
 
     await this.addTreeRecursive(trees, treeId, prefix, stage);
     this.sortEntries();
+    if (before) {
+      this._entries = keepMatchingEntries(before, this._entries, keepMatchingMode(options));
+    }
   }
 
   private async addTreeRecursive(
@@ -328,15 +339,19 @@ export class GitStaging implements Staging {
   }
 
   recordResolveUndo(records: readonly ResolveUndoRecord[]): void {
+    this.unwritten = true;
     this.indexFile.recordResolveUndo(records);
   }
 
   clearResolveUndo(): void {
+    this.unwritten = true;
     this.indexFile.clearResolveUndo();
   }
 
   setCacheTree(tree: CacheTree | undefined): void {
-    this.indexFile.setCacheTree(tree);
+    this.unwritten = true;
+    // the entries it describes: later edits before the write invalidate their paths
+    this.indexFile.setCacheTree(tree, this._entries);
   }
 
   getCacheTree(): CacheTree | undefined {
@@ -351,6 +366,7 @@ export class GitStaging implements Staging {
 
   async read(): Promise<void> {
     const read = await this.indexFile.read();
+    this.unwritten = false;
     if (!read) {
       // No index file - start empty
       this._entries = [];
@@ -373,8 +389,41 @@ export class GitStaging implements Staging {
       (entry) => this.asRead.has(entry),
     );
     await this.indexFile.write(this._entries);
+    this.unwritten = false;
     this.asRead = new Set(this._entries);
     this.updateTime = await this.indexMtime();
+  }
+
+  /**
+   * Takes `<index>.lock` until the returned lock is committed or rolled back (git's
+   * `repo_hold_locked_index` for a commit): `write()` puts the entries as they are then into
+   * the lock (racily clean ones smudged), `commit()` renames it over the index.
+   */
+  async lockIndex(): Promise<StagingIndexLock> {
+    const lock = await this.indexFile.lock();
+    let written: StagingEntry[] | undefined;
+    return {
+      write: async () => {
+        this.indexFile.version = this.version;
+        this._entries = await smudgeRacilyClean(
+          this._entries,
+          this.updateTime,
+          this.racyCheck,
+          (entry) => this.asRead.has(entry),
+        );
+        written = this._entries;
+        await lock.write(written);
+      },
+      commit: async () => {
+        await lock.commit();
+        if (!written) return;
+        // the index now holds what was written (make no edits between write and commit)
+        this.unwritten = false;
+        this.asRead = new Set(written);
+        this.updateTime = await this.indexMtime();
+      },
+      rollback: () => lock.rollback(),
+    };
   }
 
   /** Sets the check `write()` smudges racily clean entries with. */
@@ -389,6 +438,10 @@ export class GitStaging implements Staging {
     } catch {
       return 0;
     }
+  }
+
+  hasUnwrittenChanges(): boolean {
+    return this.unwritten;
   }
 
   async isOutdated(): Promise<boolean> {
@@ -421,6 +474,7 @@ export class GitStaging implements Staging {
   }
 
   async clear(): Promise<void> {
+    this.unwritten = true;
     this._entries = [];
   }
 
@@ -438,8 +492,12 @@ export class GitStaging implements Staging {
         size: entry.size ?? 0,
         mtime: entry.mtime ?? Date.now(),
         ctime: entry.ctime,
+        mtimeNs: entry.mtimeNs,
+        ctimeNs: entry.ctimeNs,
         dev: entry.dev,
         ino: entry.ino,
+        uid: entry.uid,
+        gid: entry.gid,
         assumeValid: entry.assumeValid,
         intentToAdd: entry.intentToAdd,
         skipWorktree: entry.skipWorktree,
@@ -455,8 +513,12 @@ export class GitStaging implements Staging {
       size: options.size ?? 0,
       mtime: options.mtime ?? Date.now(),
       ctime: options.ctime,
+      mtimeNs: options.mtimeNs,
+      ctimeNs: options.ctimeNs,
       dev: options.dev,
       ino: options.ino,
+      uid: options.uid,
+      gid: options.gid,
       assumeValid: options.assumeValid,
       intentToAdd: options.intentToAdd,
       skipWorktree: options.skipWorktree,
@@ -504,6 +566,7 @@ export class GitStaging implements Staging {
 
   /** @internal - Used by builder/editor */
   _replaceEntries(newEntries: IndexEntry[]): void {
+    this.unwritten = true;
     this._entries = newEntries;
   }
 
@@ -519,6 +582,7 @@ export class GitStaging implements Staging {
 
   /** @internal - Set index version */
   _setVersion(version: IndexVersion): void {
+    this.unwritten = true;
     this.version = version;
   }
 }
@@ -541,8 +605,12 @@ class GitStagingBuilder implements IndexBuilder {
       size: options.size ?? 0,
       mtime: options.mtime ?? Date.now(),
       ctime: options.ctime,
+      mtimeNs: options.mtimeNs,
+      ctimeNs: options.ctimeNs,
       dev: options.dev,
       ino: options.ino,
+      uid: options.uid,
+      gid: options.gid,
       assumeValid: options.assumeValid,
       intentToAdd: options.intentToAdd,
       skipWorktree: options.skipWorktree,
@@ -711,6 +779,10 @@ class GitStagingEditor implements IndexEditor {
         ctime: upsertOptions.ctime,
         dev: upsertOptions.dev,
         ino: upsertOptions.ino,
+        mtimeNs: upsertOptions.mtimeNs,
+        ctimeNs: upsertOptions.ctimeNs,
+        uid: upsertOptions.uid,
+        gid: upsertOptions.gid,
         assumeValid: upsertOptions.assumeValid,
         intentToAdd: upsertOptions.intentToAdd,
         skipWorktree: upsertOptions.skipWorktree,
@@ -748,6 +820,41 @@ function comparePaths(a: string, b: string): number {
 }
 
 // ========== Helper Functions ==========
+
+/** What `ReadTreeOptions.keepMatching` keeps of an unchanged entry. */
+export function keepMatchingMode(options?: ReadTreeOptions): "entry" | "flags" {
+  return options?.keepMatching === "flags" ? "flags" : "entry";
+}
+
+/**
+ * `entries` (a tree read into the index) as unpack-trees' one-way merge leaves them over the
+ * index `before` (see `ReadTreeOptions.keepMatching`): an unchanged stage-0 entry is the old
+ * entry itself, a changed one keeps the old skip-worktree bit.
+ */
+export function keepMatchingEntries<T extends StagingEntry>(
+  before: readonly T[],
+  entries: readonly T[],
+  keep: "entry" | "flags" = "entry",
+): T[] {
+  const old = new Map<string, T>();
+  for (const e of before) if (e.stage === MergeStage.MERGED) old.set(e.path, e);
+  if (old.size === 0) return entries.slice();
+  return entries.map((e) => {
+    const o = e.stage === MergeStage.MERGED ? old.get(e.path) : undefined;
+    if (!o) return e;
+    if (o.mode === e.mode && o.objectId === e.objectId) {
+      if (keep === "entry") return o;
+      if (!o.skipWorktree && !o.assumeValid && !o.intentToAdd) return e;
+      return {
+        ...e,
+        ...(o.skipWorktree ? { skipWorktree: true } : {}),
+        ...(o.assumeValid ? { assumeValid: true } : {}),
+        ...(o.intentToAdd ? { intentToAdd: true } : {}),
+      };
+    }
+    return o.skipWorktree ? { ...e, skipWorktree: true } : e;
+  });
+}
 
 /**
  * Store tree entries using Trees interface.

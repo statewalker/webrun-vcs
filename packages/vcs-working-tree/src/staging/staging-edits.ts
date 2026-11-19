@@ -85,6 +85,33 @@ export class DeleteStagingEntry implements StagingEdit {
 }
 
 /**
+ * Remove a path's index entries: every stage, or only the one given (what
+ * `IndexEditor.remove(path, stage)` records). Editors recognise it and drop the stages
+ * themselves; `apply` is for one entry.
+ *
+ * @example
+ * ```typescript
+ * editor.add(new RemoveStagingStages("a", MergeStage.MERGED)); // stage 0 only
+ * ```
+ */
+export class RemoveStagingStages implements StagingEdit {
+  constructor(
+    readonly path: string,
+    readonly stage?: MergeStageValue,
+  ) {}
+
+  apply(entry: StagingEntry | undefined): StagingEntry | undefined {
+    if (!entry || this.stage === undefined || entry.stage === this.stage) return undefined;
+    return entry;
+  }
+
+  /** Whether `entry` (one of the path's) is kept. */
+  keeps(entry: StagingEntry): boolean {
+    return this.stage !== undefined && entry.stage !== this.stage;
+  }
+}
+
+/**
  * Delete an entire directory tree.
  *
  * Removes all entries whose path starts with the given prefix.

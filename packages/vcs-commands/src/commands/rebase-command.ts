@@ -588,6 +588,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   async call(): Promise<RebaseResult> {
     this.checkCallable();
     this.setCallable(false);
+    // the index as it is now, before the worktree or a ref is touched: one another writer
+    // replaced is read again (git reads the index at its start), unless this instance holds
+    // unwritten edits (refused)
+    await this.readCurrentIndex();
     const worktree = this.worktreeAccess;
     const run = () => this.run(worktree);
     return worktree?.batch ? worktree.batch(run) : run();
@@ -2671,7 +2675,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       const indexTime = this.staging.getUpdateTime();
       // every tracked file is checked (git's refresh_index); several at a time, as git's
       // preload-index stats in parallel, the results kept in index order
-      const entries = [...index];
+      // diff-files passes over a skip-worktree entry, and an assume-unchanged one matches
+      // whatever its file holds (ie_match_stat honours CE_VALID)
+      const entries = [...index].filter(([, e]) => {
+        const flags = e as { assumeValid?: boolean; skipWorktree?: boolean };
+        return !flags.assumeValid && !flags.skipWorktree;
+      });
       for (let k = 0; k < entries.length; k += WORKTREE_CHECK_BATCH) {
         const batch = entries.slice(k, k + WORKTREE_CHECK_BATCH);
         const modified = await Promise.all(
