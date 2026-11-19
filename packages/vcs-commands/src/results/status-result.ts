@@ -213,6 +213,11 @@ export interface StatusPorcelainOptions {
    * text gives git's output bytes.
    */
   quotePath?: boolean;
+  /**
+   * `-z`: each entry ends with NUL instead of a newline and paths are not quoted; a rename's
+   * old path follows as a NUL-terminated field (v1 `R  new\0old\0`, v2 `...new\0old\0`)
+   */
+  z?: boolean;
 }
 
 /**
@@ -234,7 +239,8 @@ export function formatStatusPorcelain(
   options: StatusPorcelainOptions = {},
 ): string {
   const fully = options.quotePath ?? true;
-  const quotePath = (path: string) => quoteStatusPath(path, version === 1, fully);
+  const z = options.z === true;
+  const quotePath = (path: string) => (z ? path : quoteStatusPath(path, version === 1, fully));
   const entries = status.files;
   // v2 prints the changed entries, then the unmerged ones (wt_porcelain_v2_print's two
   // passes); v1 prints them in one list by path
@@ -256,7 +262,8 @@ export function formatStatusPorcelain(
     const path = quotePath(e.path);
     const from = e.renamedFrom !== undefined ? quotePath(e.renamedFrom) : undefined;
     if (version === 1) {
-      lines.push(`${e.index}${e.worktree} ${from !== undefined ? `${from} -> ` : ""}${path}`);
+      if (z) lines.push(`${e.index}${e.worktree} ${path}${from !== undefined ? `\0${from}` : ""}`);
+      else lines.push(`${e.index}${e.worktree} ${from !== undefined ? `${from} -> ` : ""}${path}`);
       continue;
     }
     const xy = `${e.index === " " ? "." : e.index}${e.worktree === " " ? "." : e.worktree}`;
@@ -273,7 +280,7 @@ export function formatStatusPorcelain(
           e.head?.id ?? ZERO_ID,
           e.staged?.id ?? ZERO_ID,
           `R${e.renameScore ?? 100}`,
-          `${path}\t${from}`,
+          `${path}${z ? "\0" : "\t"}${from}`,
         ].join(" "),
       );
       continue;
@@ -314,5 +321,6 @@ export function formatStatusPorcelain(
   const mark = version === 1 ? ["??", "!!"] : ["?", "!"];
   for (const e of untracked) lines.push(`${mark[0]} ${quotePath(e.path)}`);
   for (const e of ignored) lines.push(`${mark[1]} ${quotePath(e.path)}`);
-  return lines.map((l) => `${l}\n`).join("");
+  const eol = z ? "\0" : "\n";
+  return lines.map((l) => `${l}${eol}`).join("");
 }

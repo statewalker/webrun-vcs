@@ -584,7 +584,10 @@ export async function rewriteIndex(
     builder.add(entry);
   }
   while (a < added.length) builder.add(added[a++]);
-  await builder.finish();
+  // the index is rewritten around the changed paths only: the kept entries count as up to
+  // date (as after the whole-index refresh git runs first), so the write checks no untouched
+  // racily clean file and the command reads only the paths it writes
+  await builder.finish({ upToDate: true });
   // a cache-tree computed for the entries just built
   if (options.cacheTree) staging.setCacheTree?.(options.cacheTree);
   // unpack-trees' cache_tree_update before its index write

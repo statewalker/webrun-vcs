@@ -123,9 +123,14 @@ export interface UntrackedScanOptions {
   flags?: number;
   /**
    * Literal paths (from the worktree's root, `.` for all of it) the scan is limited to, as
-   * a pathspec of git's; none: the whole worktree
+   * a pathspec of git's; none: the whole worktree. {@link matcher} takes over when given.
    */
   pathspec?: readonly string[];
+  /**
+   * A pathspec of any kind (wildcards, magic, excludes) the scan is limited to, as dir.c
+   * asks it (vcs-commands' `untrackedScanPathspec` makes one from parsed elements)
+   */
+  matcher?: UntrackedScanPathspec;
   /**
    * The untracked cache to use and update, made for {@link flags}; only for a whole-tree
    * scan without ignored files (git's `validate_untracked_cache`). None: a plain scan
@@ -137,6 +142,24 @@ export interface UntrackedScanOptions {
   stat?: StatMatchOptions;
   /** Called for each directory (not the root) that could not be listed */
   onUnreadable?(path: string, error: unknown): void;
+}
+
+/**
+ * A pathspec as dir.c's directory walk asks it. Names are worktree paths, a directory's
+ * with its trailing `/`.
+ */
+export interface UntrackedScanPathspec {
+  /**
+   * `match_pathspec_with_flags` (no `seen`): how the best positive element matches `name`
+   * (`MATCHED_RECURSIVELY` 1, `MATCHED_RECURSIVELY_LEADING_PATHSPEC` 2, `MATCHED_FNMATCH`
+   * 3, `MATCHED_EXACTLY` 4), 0 when none does or an exclude element matches; `leading` is
+   * `DO_MATCH_LEADING_PATHSPEC` (a directory that may hold matches)
+   */
+  match(name: string, leading: boolean): number;
+  /** `simplify_away`: no element can match `path` or anything below it */
+  simplifyAway(path: string): boolean;
+  /** `common_prefix_len`: the leading directories (with their `/`) the walk starts at */
+  commonPrefix(): string;
 }
 
 /** What the scan found. */
@@ -170,7 +193,7 @@ const DO_MATCH_LEADING_PATHSPEC = 1 << 2;
  * A pathspec of literal paths, matched as dir.c's `match_pathspec_item` matches an item
  * without wildcards.
  */
-class LiteralPathspec {
+class LiteralPathspec implements UntrackedScanPathspec {
   readonly items: readonly string[];
 
   constructor(raw: readonly string[]) {
@@ -182,7 +205,8 @@ class LiteralPathspec {
   }
 
   /** `do_match_pathspec`: the best match of any item (0: none). */
-  match(name: string, flags: number): number {
+  match(name: string, leading: boolean): number {
+    const flags = leading ? DO_MATCH_LEADING_PATHSPEC : 0;
     let best = 0;
     for (const item of this.items) {
       const how = matchItem(item, name, flags);
@@ -263,10 +287,11 @@ export async function scanUntracked(
   options: UntrackedScanOptions,
 ): Promise<UntrackedScanResult> {
   const flags = options.flags ?? 0;
-  const pathspec =
-    options.pathspec && options.pathspec.length > 0
+  const pathspec: UntrackedScanPathspec | undefined =
+    options.matcher ??
+    (options.pathspec && options.pathspec.length > 0
       ? new LiteralPathspec(options.pathspec)
-      : undefined;
+      : undefined);
   const cache = pathspec || flags & DIR_SHOW_IGNORED_TOO ? undefined : options.cache;
   const indexSeconds = options.indexSeconds ?? 0;
   const showIgnoredToo = (flags & DIR_SHOW_IGNORED_TOO) !== 0;
@@ -397,7 +422,7 @@ export async function scanUntracked(
     if (inIndex === "gitlink") return PATH_NONE;
     let matchesHow = 0;
     if (pathspec && !excluded) {
-      matchesHow = pathspec.match(`${path}/`, DO_MATCH_LEADING_PATHSPEC);
+      matchesHow = pathspec.match(`${path}/`, true);
       if (!matchesHow) return PATH_NONE;
     }
     if (await host.isNestedRepository(path)) {
@@ -474,7 +499,7 @@ export async function scanUntracked(
     }
     // a FIFO, socket or device is nothing git tracks
     if (kind === "other") return { state: PATH_NONE, path, name };
-    if (pathspec && !pathspec.match(path, 0)) return { state: PATH_NONE, path, name };
+    if (pathspec && !pathspec.match(path, false)) return { state: PATH_NONE, path, name };
     return { state: excluded ? PATH_EXCLUDED : PATH_UNTRACKED, path, name };
   };
 
@@ -552,7 +577,7 @@ export async function scanUntracked(
         if (sub) nodes.set(subPath, sub);
         const subState = await readDirectoryRecursive(subPath, sub, checkOnly, stopAtFirstFile);
         if (subState > dirState) dirState = subState;
-        if (pathspec && !pathspec.match(path, 0)) state = PATH_NONE;
+        if (pathspec && !pathspec.match(path, false)) state = PATH_NONE;
       }
       if (checkOnly) {
         if (stopAtFirstFile && dirState >= PATH_EXCLUDED) {

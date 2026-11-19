@@ -6,7 +6,7 @@
  * deterministic; the wall-clock bounds are generous, for slow CI machines.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -129,6 +129,16 @@ async function openCounted(dir: string, reads: Reads): Promise<Git> {
 
 const COMMITTER: PersonIdent = INTEROP_IDENT;
 
+/**
+ * Dates the index back to the second its files were written in, so every entry is racily
+ * clean (as when the files, the commit and the index share one second, often on CI): a
+ * write that checks the kept entries for racy-git smudging then reads every file.
+ */
+function racilyClean(dir: string): void {
+  const written = statSync(join(dir, "d0/f0.txt")).mtime;
+  utimesSync(join(dir, ".git/index"), written, written);
+}
+
 describeGit("the merge family reads only what it changes", () => {
   let root: string;
   let counter = 0;
@@ -219,6 +229,56 @@ describeGit("the merge family reads only what it changes", () => {
     // the racily clean ones; the picks read only the paths they write
     expect(reads.worktree).toBeLessThan(DIRS * FILES_PER_DIR + 100);
     expect(elapsed).toBeLessThan(60_000);
+  }, 180_000);
+
+  it("a merge over a racily clean index reads no untouched file either", async () => {
+    const side: Files = {};
+    const main: Files = {};
+    for (let i = 0; i < 5; i++) Object.assign(side, edited(i, 1, "side"));
+    for (let i = 0; i < 5; i++) Object.assign(main, edited(10 + i, 2, "main"));
+    const { native, ours } = twins({ base: baseFiles(), side, main });
+    git(root, native, "merge", "--no-edit", "side");
+    racilyClean(ours);
+
+    const reads: Reads = { worktree: 0, objects: 0, other: 0 };
+    const result = await (await openCounted(ours, reads))
+      .merge()
+      .include("side")
+      .setAuthor(INTEROP_IDENT)
+      .setCommitter(INTEROP_IDENT)
+      .call();
+
+    expect(result.status).toBe(MergeStatus.MERGED);
+    same(native, ours);
+    // the entries the merge keeps are not checked for racy-git smudging when it writes the
+    // index (it rewrites the index around its own paths): only the paths written are read
+    expect(reads.worktree).toBeLessThanOrEqual(10);
+  }, 120_000);
+
+  it("a rebase over a racily clean index reads each file at most once", async () => {
+    const sideMore: Files[] = [];
+    for (let i = 1; i < 10; i++) sideMore.push(edited(i * 3, 4, `side ${i}`));
+    const { native, ours } = twins({
+      base: baseFiles(),
+      side: edited(0, 4, "side 0"),
+      sideMore,
+      main: { ...edited(1, 7, "main"), ...edited(2, 7, "main") },
+    });
+    git(root, native, "checkout", "-q", "side");
+    git(root, ours, "checkout", "-q", "side");
+    git(root, native, "rebase", "main");
+    racilyClean(ours);
+
+    const reads: Reads = { worktree: 0, objects: 0, other: 0 };
+    const command = (await openCounted(ours, reads)).rebase().setCommitter(COMMITTER);
+    await command.setUpstreamBranch("main");
+    const result = await command.call();
+
+    expect(result.status).toBe(RebaseStatus.OK);
+    same(native, ours);
+    // the clean-worktree check reads the racily clean files once (as git's refresh); the
+    // ten picks' index writes read none of them again
+    expect(reads.worktree).toBeLessThan(DIRS * FILES_PER_DIR + 100);
   }, 180_000);
 
   it("an interactive rebase reads the list's abbreviations back without listing the store", async () => {

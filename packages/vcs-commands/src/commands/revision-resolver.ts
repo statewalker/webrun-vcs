@@ -614,6 +614,20 @@ export class RevisionResolver {
   }
 
   /**
+   * git's `repo_dwim_ref` with `nonfatal_dangling_mark`: every ref the rules find for `name`
+   * (one, unless `core.warnAmbiguousRefs` makes it try them all), its value and full name;
+   * no warnings.
+   *
+   * @example
+   * ```typescript
+   * await resolver.dwimRef("v1.0"); // [{ id: "1a2b...", ref: "refs/tags/v1.0" }]
+   * ```
+   */
+  async dwimRef(name: string): Promise<{ id: ObjectId; ref: string }[]> {
+    return this.dwimRefAll(name, false);
+  }
+
+  /**
    * git's `repo_dwim_ref` (`expand_ref`): every ref the rules find for `name` (its branch
    * syntax read), git's `warn_ambiguous_refs` making it try them all. A name the rules
    * make into no valid ref name (`check_refname_format`: `HEAD:a.txt`, `a..b`) is never

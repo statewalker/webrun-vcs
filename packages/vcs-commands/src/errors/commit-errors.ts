@@ -38,3 +38,22 @@ export class UnmergedPathsError extends GitApiError {
     this.paths = paths;
   }
 }
+
+/**
+ * The index lock (`index.lock`) is held by another process: git dies with exit code 128
+ * (`unable_to_lock_die`). The message is git's (`fatal: Unable to create '<path>': File
+ * exists.` and its advice); the lock is left where it is.
+ */
+export class IndexLockFailedError extends GitApiError {
+  /** git's exit code */
+  readonly exitCode = 128;
+
+  constructor(
+    readonly lockPath: string,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "IndexLockFailedError";
+  }
+}

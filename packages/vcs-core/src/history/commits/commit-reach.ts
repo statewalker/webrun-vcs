@@ -49,6 +49,8 @@ const PARENT2 = 2;
 const STALE = 4;
 const RESULT = 8;
 const ENQUEUED = 16;
+/** rev-list's SLOP: stale commits walked on after the last one only one side reached */
+const SLOP = 5;
 /** git's GENERATION_NUMBER_V1_MAX: topological levels are below it. */
 const GENERATION_NUMBER_V1_MAX = 0x3fffffff;
 
@@ -307,4 +309,148 @@ export async function getMergeBases(
     }
   }
   return sortByDate(list.filter((_, i) => !redundant[i])).map((x) => x.id);
+}
+
+/**
+ * The commits only `ours` reaches and those only `theirs` reaches (`rev-list --left-right
+ * --count ours...theirs`, git's `stat_branch_pair`), counted as git's `ahead_behind` counts
+ * them: one walk down from both tips in a queue ordered by generation, then date, each
+ * commit carrying the sides that reach it; a commit both reach is stale, and the walk ends
+ * once only stale commits are queued, so the history below the merge bases is never read.
+ * A commit that gains a side after it was walked (a clock skew outside the graph) is walked
+ * again, so its parents learn it too, and the stale commits left in the queue mark what
+ * they reach among the walked commits as reached by both (git's rev-list
+ * `mark_parents_uninteresting`).
+ *
+ * @example
+ * ```typescript
+ * const { ahead, behind } = await countAheadBehind(header, branchTip, upstreamTip);
+ * ```
+ */
+export async function countAheadBehind(
+  source: ReachSource,
+  ours: ObjectId,
+  theirs: ObjectId,
+  options: Pick<ReachOptions, "onVisit"> = {},
+): Promise<{ ahead: number; behind: number }> {
+  if (ours === theirs) return { ahead: 0, behind: 0 };
+  const LEFT = PARENT1;
+  const RIGHT = PARENT2;
+  const BOTH = LEFT | RIGHT;
+  const headers = new Map<ObjectId, ReachCommit | null>();
+  const read = async (id: ObjectId): Promise<ReachCommit | undefined> => {
+    const known = headers.get(id);
+    if (known !== undefined) return known ?? undefined;
+    options.onVisit?.(id);
+    const r = source(id);
+    const h = r instanceof Promise ? await r : r;
+    headers.set(id, h ?? null);
+    return h;
+  };
+  // the sides reaching each commit
+  const sides = new Map<ObjectId, number>();
+  type Item = { id: ObjectId; c: ReachCommit; ctr: number };
+  const before = (a: Item, b: Item) => {
+    if (a.c.generation !== b.c.generation) return a.c.generation > b.c.generation;
+    if (a.c.date !== b.c.date) return a.c.date > b.c.date;
+    return a.ctr < b.ctr;
+  };
+  const heap: Item[] = [];
+  const queued = new Set<ObjectId>();
+  let nonStale = 0;
+  let ctr = 0;
+  const push = (item: Item) => {
+    heap.push(item);
+    for (let i = heap.length - 1; i > 0; ) {
+      const p = (i - 1) >> 1;
+      if (!before(heap[i] as Item, heap[p] as Item)) break;
+      [heap[i], heap[p]] = [heap[p] as Item, heap[i] as Item];
+      i = p;
+    }
+  };
+  const pop = (): Item | undefined => {
+    const top = heap[0];
+    if (!top) return undefined;
+    const last = heap.pop() as Item;
+    if (heap.length > 0) {
+      heap[0] = last;
+      for (let i = 0; ; ) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let m = i;
+        if (l < heap.length && before(heap[l] as Item, heap[m] as Item)) m = l;
+        if (r < heap.length && before(heap[r] as Item, heap[m] as Item)) m = r;
+        if (m === i) break;
+        [heap[i], heap[m]] = [heap[m] as Item, heap[i] as Item];
+        i = m;
+      }
+    }
+    return top;
+  };
+  /** Adds `add` to the sides of `id`, queuing it when that changed them. */
+  const paint = (id: ObjectId, c: ReachCommit, add: number) => {
+    const was = sides.get(id) ?? 0;
+    const now = was | add;
+    if (now === was) return;
+    sides.set(id, now);
+    if (queued.has(id)) {
+      if (was !== BOTH && now === BOTH) nonStale--;
+      return;
+    }
+    queued.add(id);
+    if (now !== BOTH) nonStale++;
+    push({ id, c, ctr: ctr++ });
+  };
+  const oursHeader = await read(ours);
+  const theirsHeader = await read(theirs);
+  if (oursHeader) paint(ours, oursHeader, LEFT);
+  if (theirsHeader) paint(theirs, theirsHeader, RIGHT);
+  // queue_has_nonstale: commits both sides reach add nothing below them. In the graph the
+  // queue is in topological order and the walk ends there; outside it (dates only) stale
+  // commits are walked on as rev-list's limit_list does, while one is not older than the
+  // last commit only one side reached, then SLOP more
+  let lastDate = Number.POSITIVE_INFINITY;
+  let slop = SLOP;
+  while (heap.length > 0) {
+    if (nonStale === 0) {
+      const next = heap[0] as Item;
+      if (Number.isFinite(next.c.generation)) break;
+      if (lastDate <= next.c.date) slop = SLOP;
+      else if (--slop === 0) break;
+    }
+    const item = pop() as Item;
+    queued.delete(item.id);
+    const f = sides.get(item.id) ?? 0;
+    if (f !== BOTH) {
+      nonStale--;
+      lastDate = item.c.date;
+    }
+    for (const p of item.c.parents) {
+      if (((sides.get(p) ?? 0) & f) === f) continue;
+      const ph = await read(p);
+      // a missing parent (a shallow or broken history) ends that line
+      if (ph) paint(p, ph, f);
+    }
+  }
+  // mark_parents_uninteresting: what a stale commit left in the queue reaches among the
+  // commits already walked is reached by both sides too (only a clock skew outside the
+  // graph walks an ancestor before its descendant)
+  const stack = heap.map((item) => item.c);
+  while (stack.length > 0) {
+    const c = stack.pop() as ReachCommit;
+    for (const p of c.parents) {
+      const f = sides.get(p);
+      if (f === undefined || f === BOTH) continue;
+      sides.set(p, BOTH);
+      const ph = headers.get(p);
+      if (ph) stack.push(ph);
+    }
+  }
+  let ahead = 0;
+  let behind = 0;
+  for (const f of sides.values()) {
+    if (f === LEFT) ahead++;
+    else if (f === RIGHT) behind++;
+  }
+  return { ahead, behind };
 }

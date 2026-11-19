@@ -16,6 +16,7 @@
 
 import type { ObjectId } from "@statewalker/vcs-core";
 
+import { formatTrackingInfo, type TrackingSource } from "../tracking-info.js";
 import { BisectGraph, type BisectGraphSource, UNINTERESTING } from "./bisect-graph.js";
 
 /** What the checkout reads and does. */
@@ -183,106 +184,34 @@ async function countOnly(host: GitCheckoutHost, from: ObjectId, not: ObjectId): 
 }
 
 /**
- * checkout.c's report_tracking, remote.c's format_tracking_info: the branch against each
- * ref `status.compareBranches` names (`@{upstream}` and `@{push}`, split at spaces, each
- * resolved ref compared once; `@{upstream}` alone when unset), the reports a blank line
- * apart. The push advice goes with the push ref; a push ref that is not the upstream gets
- * `git pull <remote> <branch>` advice when it follows a branch of the push remote.
+ * checkout.c's report_tracking: remote.c's format_tracking_info (AHEAD_BEHIND_FULL, with
+ * the divergence advice) of the branch, on stdout; its warnings about
+ * `status.compareBranches` on stderr.
  */
 async function reportTracking(
   host: GitCheckoutHost,
   path: string | undefined,
 ): Promise<{ stdout: string; stderr: string }> {
-  let sb = "";
-  let stderr = "";
-  if (!path?.startsWith("refs/heads/")) return { stdout: sb, stderr };
-  const branch = path.slice("refs/heads/".length);
-  const setting = host.config("status.compareBranches");
-  const names =
-    setting === undefined ? ["@{upstream}"] : setting.split(" ").filter((n) => n.length > 0);
-  const upstreamRef = await host.upstreamOf(branch);
-  const pushRef = await host.pushOf(branch);
-  const hints = bool(host.config("advice.statusHints"), true);
-  const processed = new Set<string>();
-  let reported = false;
-  for (const name of names) {
-    let fullRef: string | undefined;
-    const lower = name.toLowerCase();
-    if (lower === "@{upstream}") fullRef = upstreamRef;
-    else if (lower === "@{push}") fullRef = pushRef;
-    else {
-      stderr += `warning: ignoring value '${name}' for status.compareBranches, only @{upstream} and @{push} are supported\n`;
-    }
-    if (!fullRef || processed.has(fullRef)) continue;
-    processed.add(fullRef);
-    const short = await host.shortenRef(fullRef);
-    const isUpstream = fullRef === upstreamRef;
-    const isPush = fullRef === pushRef || (isUpstream && (!pushRef || upstreamRef === pushRef));
-    const theirs = await host.refCommit(fullRef);
-    const ours = await host.refCommit(path);
-    if (!theirs || !ours) {
-      if (isUpstream) {
-        sb += `Your branch is based on '${short}', but the upstream is gone.\n`;
-        if (hints) sb += '  (use "git branch --unset-upstream" to fixup)\n';
-        reported = true;
-      }
-      continue;
-    }
-    if (reported) sb += "\n";
-    let pushAdvice = false;
-    let pullAdvice = isUpstream;
-    let pull = "git pull";
-    if (isPush) {
-      pushAdvice = true;
-      if (fullRef !== upstreamRef) {
-        const remote = await host.pushRemoteOf(branch);
-        const prefix = `refs/remotes/${remote}/`;
-        if (remote && fullRef.startsWith(prefix)) {
-          pull = `git pull ${remote} ${fullRef.slice(prefix.length)}`;
-          pullAdvice = true;
-        }
-      } else {
-        pullAdvice = true;
-      }
-    }
-    sb += await formatBranchComparison(host, ours, theirs, short, hints, {
-      push: pushAdvice,
-      pull: pullAdvice ? pull : undefined,
-      // checkout passes show_divergence_advice: the advice goes with the upstream
-      divergence: isUpstream ? "git pull" : undefined,
-    });
-    reported = true;
-  }
-  return { stdout: sb, stderr };
-}
-
-/** remote.c's format_branch_comparison (AHEAD_BEHIND_FULL). */
-async function formatBranchComparison(
-  host: GitCheckoutHost,
-  ours: ObjectId,
-  theirs: ObjectId,
-  short: string,
-  hints: boolean,
-  advice: { push: boolean; pull?: string; divergence?: string },
-): Promise<string> {
-  if (theirs === ours) return `Your branch is up to date with '${short}'.\n`;
-  const nOurs = await countOnly(host, ours, theirs);
-  const nTheirs = await countOnly(host, theirs, ours);
-  if (!nTheirs) {
-    let out = `Your branch is ahead of '${short}' by ${nOurs} ${nOurs === 1 ? "commit" : "commits"}.\n`;
-    if (advice.push && hints) out += '  (use "git push" to publish your local commits)\n';
-    return out;
-  }
-  if (!nOurs) {
-    let out = `Your branch is behind '${short}' by ${nTheirs} ${nTheirs === 1 ? "commit" : "commits"}, and can be fast-forwarded.\n`;
-    if (advice.pull && hints) out += `  (use "${advice.pull}" to update your local branch)\n`;
-    return out;
-  }
-  let out =
-    `Your branch and '${short}' have diverged,\n` +
-    `and have ${nOurs} and ${nTheirs} different ${nOurs + nTheirs === 1 ? "commit" : "commits"} each, respectively.\n`;
-  if (advice.divergence && hints) {
-    out += `  (use "${advice.divergence}" if you want to integrate the remote branch with yours)\n`;
-  }
-  return out;
+  if (!path?.startsWith("refs/heads/")) return { stdout: "", stderr: "" };
+  const source: TrackingSource = {
+    config: (key) => host.config(key),
+    upstreamOf: (branch) => host.upstreamOf(branch),
+    pushOf: (branch) => host.pushOf(branch),
+    pushRemoteOf: (branch) => host.pushRemoteOf(branch),
+    refCommit: (ref) => host.refCommit(ref),
+    shortenRef: (ref) => host.shortenRef(ref),
+    aheadBehind: async (ours, theirs) => ({
+      ahead: await countOnly(host, ours, theirs),
+      behind: await countOnly(host, theirs, ours),
+    }),
+  };
+  const report = await formatTrackingInfo(source, path, {
+    quick: false,
+    divergenceAdvice: true,
+    hints: bool(host.config("advice.statusHints"), true),
+  });
+  return {
+    stdout: report.text,
+    stderr: report.warnings.map((w) => `${w}\n`).join(""),
+  };
 }

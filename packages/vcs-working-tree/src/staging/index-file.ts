@@ -418,6 +418,26 @@ export class IndexFile {
     this.pendingUntrackedEntries = cache && entries ? entries.slice() : undefined;
   }
 
+  /** What the next write would take besides the entries (see `restorePending`). */
+  pendingState(): IndexFilePending {
+    return {
+      cacheTree: this.pendingCacheTree,
+      dropCacheTree: this.dropCacheTree,
+      entries: this.pendingEntries,
+      untracked: this.pendingUntracked,
+      untrackedEntries: this.pendingUntrackedEntries,
+    };
+  }
+
+  /** Puts back what `pendingState` returned (no read or write in between). */
+  restorePending(state: IndexFilePending): void {
+    this.pendingCacheTree = state.cacheTree;
+    this.dropCacheTree = state.dropCacheTree;
+    this.pendingEntries = state.entries;
+    this.pendingUntracked = state.untracked;
+    this.pendingUntrackedEntries = state.untrackedEntries;
+  }
+
   /**
    * Write `entries` (sorted by path, stage) with the extensions that still apply.
    *
@@ -581,6 +601,15 @@ export class IndexFile {
     this.extensions = extensions;
     this.entriesKept = extensions.length > 0 ? entries.slice() : undefined;
   }
+}
+
+/** The pending cache-tree and untracked cache of an `IndexFile` (see `pendingState`). */
+export interface IndexFilePending {
+  readonly cacheTree: CacheTree | undefined;
+  readonly dropCacheTree: boolean;
+  readonly entries: readonly StagingEntry[] | undefined;
+  readonly untracked: UntrackedCache | null | undefined;
+  readonly untrackedEntries: readonly StagingEntry[] | undefined;
 }
 
 /** `<index>.lock` held by `IndexFile.lock()`. */

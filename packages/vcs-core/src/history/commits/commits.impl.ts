@@ -24,7 +24,7 @@ import {
   encodeCommitEntries,
   entriesToCommit,
 } from "./commit-format.js";
-import { getMergeBases, isAncestorOf, type ReachSource } from "./commit-reach.js";
+import { countAheadBehind, getMergeBases, isAncestorOf, type ReachSource } from "./commit-reach.js";
 import type {
   AncestryOptions,
   Commit,
@@ -367,6 +367,14 @@ class GitCommitStore implements Commits {
         correctedDates: (graph?.generationsTrusted && graph.correctedDates) ?? false,
       }),
     );
+  }
+
+  /** `rev-list --left-right --count ours...theirs`, the walk cut at the merge bases. */
+  async countAheadBehind(
+    ours: ObjectId,
+    theirs: ObjectId,
+  ): Promise<{ ahead: number; behind: number }> {
+    return this.withGraph((reach) => countAheadBehind(reach, ours, theirs));
   }
 
   /**

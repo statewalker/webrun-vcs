@@ -245,6 +245,28 @@ export interface Staging {
   lockIndex?(): Promise<StagingIndexLock>;
 
   /**
+   * What the staging holds now, to put back exactly with {@link restoreState}: the entry
+   * objects themselves (so the ones kept as read stay checked for racy-git smudging), the
+   * pending cache-tree and untracked cache, and whether there are unwritten edits. For a
+   * temporary change of the entries that no write follows (a commit's false index shown
+   * in its template, an edit rolled back). Absent: callers rebuild the entries.
+   *
+   * @example
+   * ```typescript
+   * const saved = staging.saveState?.();
+   * // ... change the entries, never writing them ...
+   * if (saved) staging.restoreState?.(saved);
+   * ```
+   */
+  saveState?(): StagingState;
+
+  /**
+   * Puts back what {@link saveState} saved. Only valid while the index was neither read
+   * nor written since (a write in between would be undone in memory only).
+   */
+  restoreState?(state: StagingState): void;
+
+  /**
    * Check if staging is outdated
    */
   isOutdated(): Promise<boolean>;
@@ -290,6 +312,11 @@ export interface Staging {
    * Clear all entries
    */
   clear(): Promise<void>;
+}
+
+/** What `Staging.saveState` saved (opaque: only the same staging restores it). */
+export interface StagingState {
+  readonly staging: unknown;
 }
 
 /**
@@ -343,7 +370,27 @@ export interface IndexBuilder {
   /**
    * Finalize the builder
    */
-  finish(): Promise<void>;
+  finish(options?: IndexBuilderFinishOptions): Promise<void>;
+}
+
+/** How {@link IndexBuilder.finish} treats the entries it was given. */
+export interface IndexBuilderFinishOptions {
+  /**
+   * Count every entry the builder took (given back as it is, or a copy) as set in this
+   * session, as after git's refresh (`CE_UPTODATE`): the next write does not check it for
+   * racy-git smudging, so it reads no file. For the merge family, which rewrites the index
+   * around the paths it writes without first refreshing the whole index (git's
+   * `try_merge_strategy` refreshes it, reading every racily clean file). Without it, a copy
+   * of an entry kept as read stays as read (git copies an entry with its flags).
+   *
+   * @example
+   * ```typescript
+   * const builder = staging.createBuilder();
+   * for (const entry of entries) builder.add(entry);
+   * await builder.finish({ upToDate: true });
+   * ```
+   */
+  upToDate?: boolean;
 }
 
 /**
