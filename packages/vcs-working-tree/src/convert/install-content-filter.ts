@@ -5,7 +5,7 @@ import type { History } from "@statewalker/vcs-core";
 import { decodeGitPatternFile } from "@statewalker/vcs-utils/encoding";
 import type { Checkout } from "../checkout/checkout.js";
 import type { WorkingCopyConfig } from "../working-copy.js";
-import type { WorktreeContentFilter } from "../worktree/content-filter.js";
+import { collectChunks, type WorktreeContentFilter } from "../worktree/content-filter.js";
 import type { Worktree } from "../worktree/worktree.js";
 import type { FilterDriverRegistry } from "./filter-driver.js";
 import {
@@ -64,6 +64,26 @@ export function installExcludesFile(
 }
 
 /**
+ * Lets the worktree read a `.gitignore` it lacks from the index when that entry is
+ * skip-worktree, as git's `add_patterns` does (`read_skip_worktree_file_from_index`): the
+ * stage-0 entry only, its blob as stored.
+ */
+export function installSkipWorktreeIgnoreReader(parts: {
+  history: History;
+  checkout: Checkout;
+  worktree: Worktree;
+}): void {
+  const { worktree, checkout, history } = parts;
+  if (!worktree?.setSkipWorktreeIgnoreReader) return;
+  worktree.setSkipWorktreeIgnoreReader(async (path) => {
+    const entry = await checkout.staging.getEntry(path, 0).catch(() => undefined);
+    if (!entry?.skipWorktree) return undefined;
+    const content = await history.blobs.load(entry.objectId).catch(() => undefined);
+    return content ? decodeGitPatternFile(await collectChunks(content)) : undefined;
+  });
+}
+
+/**
  * Installs a content filter on the worktree of a working copy. A filter the host set on the
  * worktree itself is kept; git's filter from an earlier working copy is replaced by one
  * reading this working copy's configuration and drivers.
@@ -79,6 +99,7 @@ export function installContentFilter(
 ): void {
   const { worktree } = parts;
   installExcludesFile(parts, setup.environment);
+  installSkipWorktreeIgnoreReader(parts);
   // a bare repository (no worktree) or a worktree without filter support
   if (!worktree?.setContentFilter) return;
   if (setup.contentFilter === false) {

@@ -28,7 +28,7 @@ export interface CheckedEntry {
 /**
  * Whether the worktree file at `path` no longer holds the index entry (git's
  * `verify_uptodate`): changed content, type, or executable bit where the worktree shows it.
- * A missing file is no local change. With `indexTime` (the index file's mtime, as the
+ * A missing file is no local change, but one beneath a symbolically linked directory is. With `indexTime` (the index file's mtime, as the
  * caller's index was last read or written: git's `istate->timestamp`), a stat that matches
  * as git's `ie_match_stat` compares it, on an entry older than the index (not racy),
  * settles it without reading the file, as in git; a racy entry is read. A caller that
@@ -42,8 +42,23 @@ export async function worktreeDiffers(
   indexTime?: number,
 ): Promise<boolean> {
   const current = await worktree.getEntry(path);
-  if (!current) return false;
+  if (!current) {
+    // git's lstat follows a symbolic link on a leading directory to whatever the file there
+    // is, never the one the index recorded: a change (the worktree never looks beyond links)
+    return entry.mode !== FileMode.GITLINK && (await beneathSymlink(worktree, path));
+  }
   return differsFrom(worktree, path, entry, current, trust, indexTime);
+}
+
+/** Whether a leading directory of `path` is a symbolic link. */
+async function beneathSymlink(worktree: Worktree, path: string): Promise<boolean> {
+  for (let k = path.indexOf("/"); k > 0; k = path.indexOf("/", k + 1)) {
+    const entry = await worktree.getEntry(path.slice(0, k)).catch(() => undefined);
+    if (!entry) return false;
+    if (entry.mode === FileMode.SYMLINK) return true;
+    if (!entry.isDirectory) return false;
+  }
+  return false;
 }
 
 async function differsFrom(
@@ -124,9 +139,15 @@ export async function untrackedUnder(
   worktree: Worktree,
   dir: string,
   tracked: (path: string) => boolean,
+  /** Ignored files count too (git's `verify_clean_subdirectory` without `o->internal.dir`) */
+  includeIgnored = false,
 ): Promise<boolean> {
   if (!tracked(dir) && (await isNestedRepository(worktree, dir))) return true;
-  for await (const inside of worktree.walk({ pathPrefix: dir, includeDirectories: true })) {
+  for await (const inside of worktree.walk({
+    pathPrefix: dir,
+    includeDirectories: true,
+    ...(includeIgnored ? { includeIgnored: true } : {}),
+  })) {
     if (inside.isDirectory) {
       // a nested repository is never entered by the walk: it is untracked content itself
       if (inside.mode === FileMode.GITLINK && !tracked(inside.path)) return true;

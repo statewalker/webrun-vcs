@@ -871,6 +871,11 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
       },
       patterns,
     );
+    // check_updates (its unlink warnings) before display_warning_msgs
+    for (const line of outcome.unlinkWarnings) {
+      this.err += line;
+      this.warningList.push(line.slice("warning: ".length, -1));
+    }
     const text = sparseWarningText(outcome, true);
     if (text) {
       this.err += text;

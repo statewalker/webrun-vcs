@@ -122,6 +122,12 @@ export interface SparseApplyOutcome {
   written: string[];
   /** Whether the index was changed (and written) */
   changed: boolean;
+  /**
+   * check_updates' `unlink_or_warn` lines for files leaving the checkout that could not be
+   * removed ("warning: unable to unlink 'p': Is a directory"), printed after the sparse
+   * warnings by unpack-trees, before them by `update_sparsity`
+   */
+  unlinkWarnings: string[];
 }
 
 async function entryList(staging: Staging): Promise<readonly StagingEntry[]> {
@@ -181,13 +187,17 @@ async function beneathLink(
  * refuse to replace (`check_leading_path`, then `check_ok_to_remove`: an ignored one is
  * expendable).
  */
-async function blockedLeadingPath(worktree: Worktree, path: string): Promise<boolean> {
+async function blockedLeadingPath(
+  worktree: Worktree,
+  path: string,
+  preserveIgnored = false,
+): Promise<boolean> {
   for (let k = path.indexOf("/"); k > 0; k = path.indexOf("/", k + 1)) {
     const prefix = path.slice(0, k);
     const entry = await worktree.getEntry(prefix).catch(() => undefined);
     if (!entry) return false;
     if (entry.isDirectory && entry.mode !== FileMode.SYMLINK) continue;
-    return !(await worktree.isIgnored(prefix));
+    return preserveIgnored || !(await worktree.isIgnored(prefix));
   }
   return false;
 }
@@ -225,6 +235,7 @@ export class SparseUnpack {
   private readonly smudge = new Set<string>();
   private readonly reports: { kind: SparseReportKind; path: string }[] = [];
   private readonly removed: string[] = [];
+  private readonly unlinkWarnings: string[] = [];
 
   private constructor(
     readonly patterns: SparseCheckoutPatterns,
@@ -265,9 +276,13 @@ export class SparseUnpack {
   }
 
   /**
-   * Paths whose conflicts the command records: their files are written whatever the
-   * patterns say, and their entries are never skip-worktree (merge-ort's
-   * `record_conflicted_index_entries`).
+   * Paths whose conflicts the command records (merge-ort's `record_conflicted_index_entries`,
+   * whose stage entries are never skip-worktree). One whose source entry was skip-worktree,
+   * or that had none, has its file written whatever the patterns say (the stage-0 entry
+   * unpack-trees left skip-worktree is checked out). One whose source entry was in the
+   * checkout but is outside the patterns now leaves it as any other entry does:
+   * `apply_sparse_checkout` set `CE_WT_REMOVE`, which `checkout_entry` honours by unlinking,
+   * so its content is only in the index stages (a changed file is kept, as ever).
    */
   conflict(paths: Iterable<string>): void {
     for (const path of paths) this.conflicts.add(path);
@@ -276,10 +291,15 @@ export class SparseUnpack {
   /**
    * `CE_NEW_SKIP_WORKTREE` of a stage-0 entry the result holds at `path`: outside the
    * patterns, and neither unmerged in the source index (loop #1 of
-   * `mark_new_skip_worktree`) nor conflicted by the command.
+   * `mark_new_skip_worktree`) nor conflicted by the command where its file is written
+   * (see {@link conflict}).
    */
   outside(path: string): boolean {
-    if (this.unmergedSrc.has(path) || this.conflicts.has(path)) return false;
+    if (this.unmergedSrc.has(path)) return false;
+    if (this.conflicts.has(path)) {
+      const old = this.src.get(path);
+      if (!old || old.skipWorktree) return false;
+    }
     let included = this.inPatterns.get(path);
     if (included === undefined) {
       included = this.patterns.includes(path);
@@ -378,7 +398,11 @@ export class SparseUnpack {
         await removeDirectoryIfEmpty(worktree, path);
       } else {
         const current = await worktree.getEntry(path).catch(() => undefined);
-        if (current?.isDirectory) continue;
+        if (current?.isDirectory && current.mode !== FileMode.SYMLINK) {
+          // unlink_or_warn on a directory: EISDIR, the directory and the flag kept as they are
+          this.unlinkWarnings.push(`warning: unable to unlink '${path}': Is a directory\n`);
+          continue;
+        }
         if (current) await worktree.remove(path);
       }
       await pruneEmptyParents(worktree, path);
@@ -393,8 +417,12 @@ export class SparseUnpack {
    * not write (`written`) is written unless something stands at its path
    * (`verify_absent_sparse`: an untracked file, or a directory holding one, is kept and
    * reported; an ignored one is replaced; with `overwrite`, `UNPACK_RESET_OVERWRITE_UNTRACKED`,
-   * anything is). With `warnUnmerged` (`update_sparsity`) unmerged paths are reported. The
-   * index is written when an entry changed.
+   * anything is). A directory holding such a file keeps the entry unwritten without a report
+   * (verify_clean_subdirectory's ERROR_NOT_UPTODATE_DIR, which unpack-trees never prints with
+   * the sparse warnings). With `warnUnmerged` (`update_sparsity`) unmerged paths are reported.
+   * With `preserveIgnored` (`update_sparsity`, which runs without `o->internal.dir`) ignored
+   * files are no more expendable than untracked ones. The index is written when an entry
+   * changed.
    */
   async finish(
     ctx: SparseApplyContext,
@@ -402,6 +430,7 @@ export class SparseUnpack {
       written?: ReadonlySet<string>;
       overwrite?: boolean;
       warnUnmerged?: boolean;
+      preserveIgnored?: boolean;
     } = {},
   ): Promise<SparseApplyOutcome> {
     const { staging, worktree } = ctx;
@@ -441,15 +470,30 @@ export class SparseUnpack {
         const current = found[i];
         let present: boolean;
         if (options.overwrite) present = false;
-        else if (!current) present = await blockedLeadingPath(worktree, entry.path);
-        else if (current.isDirectory && current.mode !== FileMode.SYMLINK) {
+        else if (!current) {
+          present = await blockedLeadingPath(worktree, entry.path, options.preserveIgnored);
+        } else if (current.isDirectory && current.mode !== FileMode.SYMLINK) {
           // verify_clean_subdirectory: what is untracked there would be lost
           tracked ??= new Set(entries.map((e) => e.path));
           const known = tracked;
-          present =
+          // ERROR_NOT_UPTODATE_DIR: the entry stays unwritten, and nothing is printed
+          if (
             entry.mode !== FileMode.GITLINK &&
-            (await untrackedUnder(worktree, entry.path, (p) => known.has(p)));
-        } else present = !(current.isIgnored ?? (await worktree.isIgnored(entry.path)));
+            (await untrackedUnder(
+              worktree,
+              entry.path,
+              (p) => known.has(p),
+              options.preserveIgnored === true,
+            ))
+          ) {
+            continue;
+          }
+          present = false;
+        } else {
+          // the rules read now (never the entry's lazy `isIgnored`, which answers before the
+          // ignore files are read)
+          present = options.preserveIgnored === true || !(await worktree.isIgnored(entry.path));
+        }
         if (present) this.reports.push({ kind: "orphaned", path: entry.path });
         else writing.push(entry);
       }
@@ -529,6 +573,7 @@ export class SparseUnpack {
       removed: [...this.removed],
       written,
       changed,
+      unlinkWarnings: [...this.unlinkWarnings],
     };
   }
 }
@@ -556,7 +601,7 @@ export async function updateSparsity(
     });
     await unpack.unlink(worktree, unlink);
   }
-  return unpack.finish(ctx, { warnUnmerged: true });
+  return unpack.finish(ctx, { warnUnmerged: true, preserveIgnored: true });
 }
 
 /**
@@ -664,7 +709,10 @@ export function pushSparseWarnings(
   porcelain: boolean,
 ): string {
   if (!sparse || !outcome) return "";
-  const text = patternWarningText(sparse.patterns) + sparseWarningText(outcome, porcelain);
+  const text =
+    patternWarningText(sparse.patterns) +
+    sparseWarningText(outcome, porcelain) +
+    outcome.unlinkWarnings.join("");
   if (text) lines?.push(...text.replace(/\n$/, "").split("\n"));
   return text;
 }

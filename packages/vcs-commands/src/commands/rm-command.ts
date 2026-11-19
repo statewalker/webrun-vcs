@@ -1,9 +1,15 @@
+import { FileMode } from "@statewalker/vcs-core";
 import type { IndexEntry } from "@statewalker/vcs-working-tree";
 
 import { NoFilepatternError, RmFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { configBool } from "./merge-config.js";
-import { matchPathspecSeen, parsePathspec } from "./pathspec.js";
+import {
+  DO_MATCH_DIRECTORY,
+  MATCHED_RECURSIVELY,
+  matchPathspecSeen,
+  parsePathspec,
+} from "./pathspec.js";
 import { sparsePathAdvice } from "./sparse-checkout-support.js";
 
 /**
@@ -34,9 +40,10 @@ export interface RmResult {
  *   .setCached(true)
  *   .call();
  *
- * // Remove directory recursively
+ * // Remove directory recursively (`git rm -r`)
  * await git.rm()
  *   .addFilepattern("src/old/")
+ *   .setRecursive(true)
  *   .call();
  * ```
  */
@@ -44,6 +51,8 @@ export class RmCommand extends GitCommand<RmResult> {
   private filepatterns: string[] = [];
   private cached = false;
   private sparse = false;
+  private recursive = false;
+  private ignoreUnmatch = false;
   private compatibility: "2.43" | "2.56" = "2.56";
 
   /**
@@ -58,8 +67,31 @@ export class RmCommand extends GitCommand<RmResult> {
   }
 
   /**
-   * The git version whose messages are reproduced where versions differ (default 2.56): the
-   * advice's last hint, as `AddCommand.setCompatibility`.
+   * `-r`: a pattern may name a directory (or `.`), removing every entry beneath. Without it
+   * such a pattern is refused before anything changes ("not removing 'd' recursively
+   * without -r"), as git does.
+   */
+  setRecursive(recursive: boolean): this {
+    this.checkCallable();
+    this.recursive = recursive;
+    return this;
+  }
+
+  /**
+   * `--ignore-unmatch`: a pattern that matches no entry is passed over. Without it git dies
+   * before anything changes ("pathspec 'x' did not match any files").
+   */
+  setIgnoreUnmatch(ignoreUnmatch: boolean): this {
+    this.checkCallable();
+    this.ignoreUnmatch = ignoreUnmatch;
+    return this;
+  }
+
+  /**
+   * The git version whose behaviour is reproduced where versions differ (default 2.56): the
+   * advice's last hint, as `AddCommand.setCompatibility`, and 2.43's pathspec matching, where
+   * an element that named an entry exactly matches no later entry (`rm 'b*'` with an entry
+   * `b*` removes only that one).
    */
   setCompatibility(version: "2.43" | "2.56"): this {
     this.checkCallable();
@@ -133,22 +165,47 @@ export class RmCommand extends GitCommand<RmResult> {
     const items = parsePathspec(this.filepatterns);
     const seen = items.map(() => 0);
     const seenOutside = items.map(() => 0);
+    const exactStopsGlobs = this.compatibility === "2.43";
     for await (const entry of this.staging.entries()) {
+      // ce_path_match: a submodule matches `sub/` as a directory would
+      const flags = entry.mode === FileMode.GITLINK ? DO_MATCH_DIRECTORY : 0;
       const outside =
         patterns !== undefined && (entry.skipWorktree || !patterns.includes(entry.path));
       if (outside) {
-        matchPathspecSeen(items, entry.path, 0, seenOutside);
+        matchPathspecSeen(items, entry.path, flags, seenOutside, exactStopsGlobs);
         entriesToKeep.push(entry);
         continue;
       }
-      if (matchPathspecSeen(items, entry.path, 0, seen)) {
+      if (matchPathspecSeen(items, entry.path, flags, seen, exactStopsGlobs)) {
         removedPaths.push(entry.path);
       } else {
         entriesToKeep.push(entry);
       }
     }
-    const matched = this.filepatterns.filter((_, i) => seen[i]);
-    const sparsePaths = this.filepatterns.filter((_, i) => !seen[i] && seenOutside[i]);
+    // cmd_rm's check of each element, in order, before anything is written: one that matched
+    // nothing dies (unless --ignore-unmatch, or it matched only entries outside the sparse
+    // checkout), one that named a directory needs -r (an implicit `.` is shown as `.`)
+    const sparsePaths: string[] = [];
+    let seenAny = false;
+    for (let i = 0; i < items.length; i++) {
+      const original = this.filepatterns[i] ?? "";
+      if (seen[i]) seenAny = true;
+      else if (this.ignoreUnmatch) continue;
+      else if (seenOutside[i]) sparsePaths.push(original);
+      else {
+        throw new RmFailedError(`fatal: pathspec '${original}' did not match any files`, [], {
+          removedPaths: [],
+        });
+      }
+      if (!this.recursive && seen[i] === MATCHED_RECURSIVELY) {
+        throw new RmFailedError(
+          `fatal: not removing '${original || "."}' recursively without -r`,
+          [],
+          { removedPaths: [] },
+        );
+      }
+    }
+    const matched = seenAny;
     const advise = () =>
       new RmFailedError(
         sparsePathAdvice(
@@ -160,7 +217,9 @@ export class RmCommand extends GitCommand<RmResult> {
         { removedPaths },
       );
     // nothing else matched: git exits before writing anything
-    if (sparsePaths.length > 0 && matched.length === 0) throw advise();
+    if (sparsePaths.length > 0 && !matched) throw advise();
+    // nothing matched at all (every element passed over by --ignore-unmatch)
+    if (!matched) return { removedPaths: [] };
 
     // Rebuild staging with entries that weren't removed
     const builder = this.staging.createBuilder();

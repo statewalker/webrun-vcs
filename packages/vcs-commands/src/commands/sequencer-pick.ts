@@ -357,6 +357,10 @@ export class PickSequencer {
       // the sequencer's update_head_with_reflog: "cherry-pick: <subject>", "revert: ..."
       reflogMessages.pick(this.options.reflogAction ?? ACTION_NAME[action], commitMessage),
     );
+    // do_commit after try_to_commit: CHERRY_PICK_HEAD and MERGE_MSG go, a stopped empty
+    // pick's left over included (REVERT_HEAD and AUTO_MERGE stay)
+    await deps.state.removeRef("CHERRY_PICK_HEAD");
+    await deps.state.remove("MERGE_MSG");
     return { status: "ok", newHead, picked: [item.id], output };
   }
 

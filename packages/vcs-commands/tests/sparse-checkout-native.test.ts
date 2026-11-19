@@ -693,3 +693,291 @@ describeGit("sparse checkout without losing files, against native git", () => {
     }
   });
 });
+
+describeGit("sparse checkout and ignore rules, against native git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "sparse-ignore-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** A tracked root `.gitignore` of `*.tmp`, and `s/.gitignore` with `extra`. */
+  const ignoring = (extra: string) => (dir: string) => {
+    base(dir);
+    put(dir, ".gitignore", "*.tmp\n");
+    put(dir, "s/.gitignore", extra);
+    gitOk(root, dir, "add", ".");
+    gitOk(root, dir, "commit", "-q", "-m", "ignores");
+    gitOk(root, dir, "sparse-checkout", "set", "k", "s", "u");
+  };
+
+  it("set keeps a file a removed skip-worktree .gitignore un-ignores (read from the index)", async () => {
+    const { native, ours } = twins(ignoring("!keep.tmp\n"));
+    for (const dir of [native, ours]) put(dir, "s/keep.tmp", "PRECIOUS\n");
+    const { r } = await twinSparse(native, ours, ["set", "k"]);
+    expect(r.stderr).toContain("directory 's/' contains untracked files");
+    expect(rawState(ours)).toEqual(rawState(native));
+    expect(readFileSync(join(ours, "s/keep.tmp"), "utf8")).toBe("PRECIOUS\n");
+    // status, add and clean read the same rules from the index
+    const status = (dir: string) =>
+      gitOk(root, dir, "--no-optional-locks", "status", "--porcelain", "--ignored");
+    expect(status(ours)).toContain("?? s/");
+    const repo = await openOurs(ours);
+    const ourStatus = await repo.status().call();
+    expect([...ourStatus.untracked]).toContain("s/keep.tmp");
+  });
+
+  it("set removes a file only a removed skip-worktree .gitignore ignores", async () => {
+    const { native, ours } = twins(ignoring("*.junk\n"));
+    for (const dir of [native, ours]) put(dir, "s/t/x.junk", "junk\n");
+    const { r } = await twinSparse(native, ours, ["set", "k"]);
+    expect(r.stderr).toBe("");
+    expect(existsSync(join(ours, "s"))).toBe(false);
+    expect(rawState(ours)).toEqual(rawState(native));
+  });
+
+  /** k only, expectFilesOutsideOfPatterns, `c` and `*.log` ignored through info/exclude. */
+  const expecting = (dir: string) => {
+    put(dir, "k/a", "a\n");
+    put(dir, "s/c", "c\n");
+    put(dir, "s/d", "d\n");
+    gitOk(root, dir, "add", ".");
+    gitOk(root, dir, "commit", "-q", "-m", "c");
+    put(dir, ".git/info/exclude", "c\n*.log\n");
+    gitOk(root, dir, "sparse-checkout", "set", "k");
+    gitOk(root, dir, "config", "sparse.expectFilesOutsideOfPatterns", "true");
+  };
+
+  for (const [name, path] of [
+    ["an ignored file", "s/c"],
+    ["a directory holding an ignored file", "s/d/x.log"],
+  ] as const) {
+    it(`add keeps ${name} where a skip-worktree entry comes back (update_sparsity)`, async () => {
+      const { native, ours } = twins(expecting);
+      for (const dir of [native, ours]) put(dir, path, "IGNORED MINE\n");
+      await twinSparse(native, ours, ["add", "s"]);
+      expect(rawState(ours)).toEqual(rawState(native));
+      expect(readFileSync(join(ours, path), "utf8")).toBe("IGNORED MINE\n");
+    });
+  }
+
+  for (const op of ["checkout", "merge"] as const) {
+    for (const [name, path] of [
+      ["an ignored file", "s/c"],
+      ["a directory holding an untracked file", "s/c/mine"],
+    ] as const) {
+      it(`${op} with ${name} where an entry returns into the patterns`, async () => {
+        const { native, ours } = twins((dir) => {
+          base(dir);
+          gitOk(root, dir, "checkout", "-q", "-b", "other");
+          put(dir, "k/a", "other\n");
+          gitOk(root, dir, "commit", "-qam", "o");
+          gitOk(root, dir, "checkout", "-q", "main");
+          put(dir, ".git/info/exclude", "c\n");
+          gitOk(root, dir, "sparse-checkout", "set", "k");
+          gitOk(root, dir, "config", "sparse.expectFilesOutsideOfPatterns", "true");
+          put(dir, ".git/info/sparse-checkout", "/*\n!/*/\n/k/\n/s/\n");
+        });
+        for (const dir of [native, ours]) put(dir, path, "MINE\n");
+        const repo = await openOurs(ours, INTEROP_AUTHOR_ENV);
+        let r: ReturnType<typeof run>;
+        let warnings: readonly string[] | undefined;
+        if (op === "checkout") {
+          r = run(native, ["checkout", "-q", "other"]);
+          warnings = (await repo.checkout().setName("other").call()).warnings;
+        } else {
+          r = run(native, ["merge", "-q", "other"]);
+          warnings = (await repo.merge().include("other").call()).warnings;
+        }
+        // an ignored file is overwritten; a directory is ERROR_NOT_UPTODATE_DIR, never printed
+        expect(r.stderr).toBe("");
+        expect(warningText(warnings)).toBe(r.stderr);
+        expect(rawState(ours)).toEqual(rawState(native));
+      });
+    }
+  }
+});
+
+describeGit(
+  "forced one-way resets record the stat of the files they write, against native git",
+  () => {
+    beforeAll(() => {
+      root = mkdtempSync(join(tmpdir(), "sparse-stat-"));
+    });
+    afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+    const diffFiles = (dir: string) =>
+      gitOk(root, dir, "--no-optional-locks", "diff-files", "--name-only");
+
+    for (const sparseOn of [false, true]) {
+      for (const op of ["checkout -f", "reset --hard"] as const) {
+        it(`${op}${sparseOn ? " in a sparse checkout" : ""}: diff-files lists nothing after`, async () => {
+          const { native, ours } = twins((dir) => {
+            sparseHistory(dir);
+            if (!sparseOn) gitOk(root, dir, "sparse-checkout", "disable");
+          });
+          for (const dir of [native, ours]) put(dir, "k/a", "DIRTY\n");
+          const repo = await openOurs(ours);
+          if (op === "checkout -f") {
+            run(native, ["checkout", "-q", "-f", "other"]);
+            await repo.checkout().setName("other").setForced(true).call();
+          } else {
+            run(native, ["reset", "-q", "--hard", "other"]);
+            await repo.reset().setMode(ResetMode.HARD).setRef("other").call();
+          }
+          expect(diffFiles(native)).toBe("");
+          expect(diffFiles(ours)).toBe(diffFiles(native));
+          // a narrower cone then removes the rewritten files (none is "not up to date")
+          await twinSparse(native, ours, ["set", "s"]);
+          expect(rawState(ours)).toEqual(rawState(native));
+        });
+      }
+    }
+  },
+);
+
+describeGit("conflicts leaving the sparse checkout, against native git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "sparse-conflict-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** s/c changed on main and other; k and s checked out, then the patterns narrowed to k. */
+  const conflicting = (wasSkip: boolean) => (dir: string) => {
+    put(dir, "k/a", "a\n");
+    put(dir, "s/c", "c\n1\n");
+    put(dir, "s/d", "d\n");
+    gitOk(root, dir, "add", ".");
+    gitOk(root, dir, "commit", "-q", "-m", "base");
+    gitOk(root, dir, "checkout", "-q", "-b", "other");
+    put(dir, "s/c", "OTHER\n1\n");
+    gitOk(root, dir, "commit", "-qam", "o");
+    gitOk(root, dir, "checkout", "-q", "main");
+    put(dir, "s/c", "MAIN\n1\n");
+    gitOk(root, dir, "commit", "-qam", "m");
+    gitOk(root, dir, "sparse-checkout", "set", "k", "s");
+    if (wasSkip) gitOk(root, dir, "sparse-checkout", "set", "k");
+    else put(dir, ".git/info/sparse-checkout", "/*\n!/*/\n/k/\n");
+  };
+
+  for (const wasSkip of [false, true]) {
+    for (const op of ["merge", "cherry-pick"] as const) {
+      it(`${op}: a conflicted entry ${wasSkip ? "outside the checkout is written" : "leaving the checkout is unlinked"}`, async () => {
+        const { native, ours } = twins(conflicting(wasSkip));
+        const repo = await openOurs(ours, INTEROP_AUTHOR_ENV);
+        if (op === "merge") {
+          expect(run(native, ["merge", "-q", "other"]).status).toBe(1);
+          expect((await repo.merge().include("other").call()).conflicts).toEqual(["s/c"]);
+        } else {
+          expect(run(native, ["cherry-pick", "other"]).status).toBe(1);
+          const other = gitOk(root, ours, "rev-parse", "other").trim();
+          await repo.cherryPick().setCommitter(INTEROP_IDENT).include(other).call();
+        }
+        expect(existsSync(join(native, "s/c"))).toBe(wasSkip);
+        expect(rawState(ours)).toEqual(rawState(native));
+      });
+    }
+  }
+});
+
+describeGit(
+  "leaving the sparse checkout where git cannot unlink or look, against native git",
+  () => {
+    beforeAll(() => {
+      root = mkdtempSync(join(tmpdir(), "sparse-unlink-"));
+    });
+    afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+    /** k only, main and other differing in k/a, s/c's path taken by a directory. */
+    const dirAtLeaving = (dir: string) => {
+      base(dir);
+      gitOk(root, dir, "checkout", "-q", "-b", "other");
+      put(dir, "k/a", "other\n");
+      gitOk(root, dir, "commit", "-qam", "o");
+      gitOk(root, dir, "checkout", "-q", "main");
+      gitOk(root, dir, "sparse-checkout", "set", "k");
+    };
+
+    for (const op of ["checkout -f", "reset --hard"] as const) {
+      it(`${op}: a directory where a file leaves is kept with git's unlink warning`, async () => {
+        const { native, ours } = twins(dirAtLeaving);
+        for (const dir of [native, ours]) put(dir, "s/c/j.o", "IGN\n");
+        const repo = await openOurs(ours);
+        let r: ReturnType<typeof run>;
+        let warnings: readonly string[] | undefined;
+        if (op === "checkout -f") {
+          r = run(native, ["checkout", "-q", "-f", "main"]);
+          warnings = (await repo.checkout().setName("main").setForced(true).call()).warnings;
+        } else {
+          r = run(native, ["reset", "-q", "--hard", "HEAD"]);
+          const cmd = repo.reset().setMode(ResetMode.HARD).setRef("HEAD");
+          await cmd.call();
+          warnings = cmd.getWarnings();
+        }
+        expect(r.stderr).toBe("warning: unable to unlink 's/c': Is a directory\n");
+        expect(warningText(warnings)).toBe(r.stderr);
+        expect(rawState(ours)).toEqual(rawState(native));
+      });
+    }
+
+    it("a refused merge's reset warns about a directory where a file outside the patterns is", async () => {
+      const { native, ours } = twins((dir) => {
+        base(dir);
+        gitOk(root, dir, "checkout", "-q", "-b", "other");
+        put(dir, "s/c", "c-other\n");
+        gitOk(root, dir, "commit", "-qam", "o");
+        gitOk(root, dir, "checkout", "-q", "main");
+        // a real merge (a fast-forward refuses before any strategy runs)
+        put(dir, "k/a", "a-main\n");
+        gitOk(root, dir, "commit", "-qam", "m");
+        put(dir, ".git/info/exclude", "*.o\n");
+        gitOk(root, dir, "sparse-checkout", "set", "k");
+      });
+      for (const dir of [native, ours]) put(dir, "s/c/j.o", "J\n");
+      const r = run(native, ["merge", "-q", "other"]);
+      const repo = await openOurs(ours, INTEROP_AUTHOR_ENV);
+      const result = await repo.merge().include("other").call();
+      expect(r.stderr).toContain("warning: unable to unlink 's/c': Is a directory\n");
+      expect(`${result.message}\n`).toBe(r.stderr);
+      expect(rawState(ours)).toEqual(rawState(native));
+    });
+
+    for (const op of ["checkout", "reset --merge"] as const) {
+      it(`${op}: a changed file reached through a symlinked directory refuses the switch`, async () => {
+        const { native, ours } = twins((dir) => {
+          base(dir);
+          gitOk(root, dir, "checkout", "-q", "-b", "other");
+          put(dir, "s/c", "c-other\n");
+          gitOk(root, dir, "commit", "-qam", "o");
+          gitOk(root, dir, "checkout", "-q", "main");
+          gitOk(root, dir, "sparse-checkout", "set", "k", "s");
+          put(dir, ".git/info/sparse-checkout", "/*\n!/*/\n/k/\n");
+        });
+        for (const dir of [native, ours]) {
+          const ext = `${dir}-ext`;
+          mkdirSync(join(ext, "t"), { recursive: true });
+          put(ext, "c", "c\n");
+          put(ext, "t/d", "d\n");
+          rmSync(join(dir, "s"), { recursive: true, force: true });
+          symlinkSync(ext, join(dir, "s"));
+        }
+        const repo = await openOurs(ours);
+        let r: ReturnType<typeof run>;
+        if (op === "checkout") {
+          r = run(native, ["checkout", "-q", "other"]);
+          const result = await repo.checkout().setName("other").call();
+          expect(result.message).toBe(r.stderr.trim());
+        } else {
+          r = run(native, ["reset", "-q", "--merge", "other"]);
+          await expect(
+            repo.reset().setMode(ResetMode.MERGE).setRef("other").call(),
+          ).rejects.toThrow(r.stderr.split("\n")[0] as string);
+        }
+        expect(r.status).not.toBe(0);
+        const twin = (dir: string) =>
+          JSON.parse(JSON.stringify(rawState(dir)).split(basename(dir)).join("<twin>"));
+        expect(twin(ours)).toEqual(twin(native));
+        for (const dir of [native, ours]) expect(readFileSync(`${dir}-ext/c`, "utf8")).toBe("c\n");
+      });
+    }
+  },
+);

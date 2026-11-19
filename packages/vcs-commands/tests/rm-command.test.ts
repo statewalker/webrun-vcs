@@ -105,7 +105,7 @@ describe.each(backends)("RmCommand ($name backend)", ({ factory }) => {
     await git.commit().setMessage("initial").call();
 
     // Remove src/ directory
-    const result = await git.rm().addFilepattern("src/").call();
+    const result = await git.rm().addFilepattern("src/").setRecursive(true).call();
 
     expect(result.removedPaths).toContain("src/a.txt");
     expect(result.removedPaths).toContain("src/b.txt");
@@ -121,17 +121,21 @@ describe.each(backends)("RmCommand ($name backend)", ({ factory }) => {
   });
 
   /**
-   * Test removing non-existent file doesn't error.
+   * A pattern that matches nothing dies as git's (nothing changed); with --ignore-unmatch
+   * it is passed over.
    */
-  it("should succeed when removing non-existent file", async () => {
+  it("should succeed when removing non-existent file with ignoreUnmatch", async () => {
     const { git, workingCopy } = await createInitializedGit();
 
     // Add a file
     await addFile(workingCopy, "file.txt", "content");
     await git.commit().setMessage("initial").call();
 
+    await expect(git.rm().addFilepattern("nonexistent.txt").call()).rejects.toThrow(
+      "fatal: pathspec 'nonexistent.txt' did not match any files",
+    );
     // Remove a file that doesn't exist
-    const result = await git.rm().addFilepattern("nonexistent.txt").call();
+    const result = await git.rm().addFilepattern("nonexistent.txt").setIgnoreUnmatch(true).call();
 
     expect(result.removedPaths).toEqual([]);
 
@@ -253,10 +257,13 @@ describe.each(backends)("RmCommand - API options ($name backend)", ({ factory })
     await addFile(workingCopy, "src/deep/b.txt", "b");
     await git.commit().setMessage("initial").call();
 
-    const some = await git.rm().addFilepattern("./src").setCached(true).call();
+    await expect(git.rm().addFilepattern("./src").setCached(true).call()).rejects.toThrow(
+      "fatal: not removing './src' recursively without -r",
+    );
+    const some = await git.rm().addFilepattern("./src").setCached(true).setRecursive(true).call();
     expect(some.removedPaths.sort()).toEqual(["src/a.txt", "src/deep/b.txt"]);
 
-    const result = await git.rm().addFilepattern(".").setCached(true).call();
+    const result = await git.rm().addFilepattern(".").setCached(true).setRecursive(true).call();
     expect(result.removedPaths).toEqual(["top.txt"]);
 
     await workingCopy.checkout.staging.read();

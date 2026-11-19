@@ -111,12 +111,15 @@ export async function runRm(args: string[]): Promise<void> {
   const ctx = await requireRepository();
 
   let cached = false;
+  let recursive = false;
   const files: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === "--cached") {
       cached = true;
+    } else if (arg === "-r") {
+      recursive = true;
     } else if (!arg.startsWith("-")) {
       files.push(arg);
     }
@@ -136,6 +139,7 @@ export async function runRm(args: string[]): Promise<void> {
     if (cached) {
       cmd.setCached(true);
     }
+    cmd.setRecursive(recursive);
 
     await cmd.call();
     console.log(success(`Removed: ${files.join(", ")}`));

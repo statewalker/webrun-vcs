@@ -2,6 +2,8 @@ import type { Blobs, ObjectId, Ref } from "@statewalker/vcs-core";
 import {
   cacheTreeOfTree,
   copyCacheTree,
+  entryStatOf,
+  getWorktreeEntries,
   invalidateCacheTreePath,
   type ResolveUndoRecord,
   type Staging,
@@ -246,6 +248,11 @@ export class ResetCommand extends GitCommand<Ref> {
         flagged?.keptOut,
         sparse,
       );
+      // check_updates: the entries written carry the stat of their new files
+      if (this.worktreeAccess && written.size > 0) {
+        await recordWrittenStat(this.staging, this.worktreeAccess, written);
+        await this.staging.write();
+      }
       if (sparse) {
         // UNPACK_RESET_OVERWRITE_UNTRACKED: an entry coming back is written over anything
         const outcome = await sparse.finish(
@@ -543,6 +550,35 @@ export async function restoreWorktreeHard(
     discardUntracked: true,
   });
   return new Set([...plan.entries, ...plan.gitlinks].map((e) => e.path));
+}
+
+/**
+ * Records in the index the stat of the files a one-way reset just wrote (`paths`): git's
+ * `checkout_entry` fills each written entry's stat data in `check_updates`, so a following
+ * `diff-files` or sparse update finds them clean. Only stage-0 entries are touched, and the
+ * staging's own racy-git smudging still applies when the index is written. Not written here.
+ */
+export async function recordWrittenStat(
+  staging: Staging,
+  worktree: Worktree,
+  paths: Iterable<string>,
+): Promise<void> {
+  const list = [...paths];
+  if (list.length === 0) return;
+  const found = await getWorktreeEntries(worktree, list);
+  const editor = staging.createEditor();
+  let edits = 0;
+  for (let i = 0; i < list.length; i++) {
+    const stat = found[i];
+    if (!stat || stat.isDirectory) continue;
+    edits++;
+    editor.add({
+      path: list[i] as string,
+      apply: (existing) =>
+        existing && existing.stage === 0 ? { ...existing, ...entryStatOf(stat) } : existing,
+    });
+  }
+  if (edits > 0) await editor.finish();
 }
 
 /** What {@link checkFlaggedEntries} found. */

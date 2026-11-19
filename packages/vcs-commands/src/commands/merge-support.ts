@@ -722,8 +722,9 @@ export async function switchTrees(
   target: Map<string, CheckedEntry>,
   options: SwitchTreesOptions,
 ): Promise<MergeRefusal | undefined> {
-  // in a sparse checkout: unpack-trees with its patterns (the conflicts' files are written
-  // whatever they say, as record_conflicted_index_entries does)
+  // in a sparse checkout: unpack-trees with its patterns (a conflict's file is written
+  // whatever they say where its entry was outside the checkout, as
+  // record_conflicted_index_entries does; one leaving the checkout is unlinked)
   const conflicts = [...(options.conflicts ?? [])];
   const sparse = await SparseUnpack.start(ctx);
   sparse?.conflict(conflicts.map((c) => c.stagePath));

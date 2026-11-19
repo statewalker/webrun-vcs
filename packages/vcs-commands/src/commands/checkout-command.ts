@@ -76,7 +76,7 @@ import {
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { OperationState, updateIndexCacheTree } from "./merge-support.js";
 import { reflogMessages } from "./reflog-messages.js";
-import { checkFlaggedEntries, restoreWorktreeHard } from "./reset-command.js";
+import { checkFlaggedEntries, recordWrittenStat, restoreWorktreeHard } from "./reset-command.js";
 import { removeBranchState } from "./sequencer-support.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
@@ -692,6 +692,9 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         keptOut,
         sparse,
       );
+      // check_updates: the entries written carry the stat of their new files
+      await recordWrittenStat(this.staging, worktree, written);
+      await this.staging.write();
       await sparse?.finish(
         { workingCopy: this.workingCopy, worktree, staging: this.staging, blobs: this.blobs },
         { written },
@@ -1095,6 +1098,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       // oneway_merge: an unchanged entry keeps its flags and stat, a changed one its
       // skip-worktree bit
       await this.staging.readTree(this.trees as any, targetTreeId, { keepMatching: "flags" });
+      // check_updates: the entries written carry the stat of their new files
+      if (worktree) await recordWrittenStat(this.staging, worktree, written);
       await this.writeSwitchedIndex();
     } else if (this.force && !keepAll) {
       // forced onto the empty tree (switch --orphan --discard-changes): an empty index

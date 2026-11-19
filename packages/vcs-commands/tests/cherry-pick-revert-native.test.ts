@@ -212,3 +212,59 @@ describeGit("cherry-pick and revert write the worktree as native git", () => {
     same(ours, native);
   });
 });
+
+describeGit("state files after a pick or merge that ends early, as native git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "pick-state-"));
+  });
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("a pick that commits drops the CHERRY_PICK_HEAD and MERGE_MSG of a stopped empty one", async () => {
+    const { native, ours } = twins({
+      base: { "a.txt": text() },
+      main: { "a.txt": text({ 1: "main" }) },
+      side: { "n.txt": "n\n" },
+    });
+    // picking HEAD itself is empty: git stops with CHERRY_PICK_HEAD and MERGE_MSG
+    expect(git(root, native, "cherry-pick", "main").status).toBe(1);
+    const head = git(root, ours, "rev-parse", "main").stdout.trim();
+    expect((await oursPick(ours, [head])).status).toBe(CherryPickStatus.CONFLICTING);
+    same(ours, native);
+    // a pick that commits ends it (do_commit), AUTO_MERGE left as git leaves it
+    expect(git(root, native, "cherry-pick", "side").status).toBe(0);
+    expect((await oursPick(ours, ["side"])).status).toBe(CherryPickStatus.OK);
+    same(ours, native);
+  });
+
+  it("an already up to date merge drops the AUTO_MERGE a clean pick left", async () => {
+    const { native, ours } = twins({
+      base: { "a.txt": text() },
+      main: { "a.txt": text({ 1: "main" }) },
+      side: { "n.txt": "n\n" },
+    });
+    git(root, native, "cherry-pick", "side");
+    await oursPick(ours, ["side"]);
+    same(ours, native);
+    expect(git(root, native, "merge", "-q", "main~1").status).toBe(0);
+    await (await openOurs(ours, INTEROP_AUTHOR_ENV)).merge().include("main~1").call();
+    same(ours, native);
+  });
+
+  it("a merge refused over a tracked file replaced by a directory records no AUTO_MERGE", async () => {
+    const { native, ours } = twins({
+      base: { "a.txt": text(), "c/w": "w\n" },
+      main: { "a.txt": text({ 1: "main" }) },
+      side: { "c/w": "W2\n" },
+    });
+    for (const dir of [native, ours]) {
+      rmSync(join(dir, "c/w"));
+      put(dir, "c/w/m", "m\n");
+    }
+    const expected = git(root, native, "merge", "-q", "side");
+    expect(expected.status).not.toBe(0);
+    await (await openOurs(ours, INTEROP_AUTHOR_ENV)).merge().include("side").call();
+    same(ours, native);
+  });
+});
