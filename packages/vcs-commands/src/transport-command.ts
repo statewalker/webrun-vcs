@@ -1,6 +1,22 @@
-import type { Credentials, ProgressInfo } from "@statewalker/vcs-transport";
+import {
+  type Credentials,
+  createDefaultTransports,
+  type GitTransportRegistry,
+  type ProgressInfo,
+} from "@statewalker/vcs-transport";
 
+import {
+  openResolvedRemote,
+  type PreparedRemote,
+  prepareRemote,
+  protocolVersionOf,
+  type RemoteSessionOptions,
+  type ResolvedRemote,
+  remoteContextOf,
+  resolveRemote,
+} from "./commands/remote-transport.js";
 import { GitCommand } from "./git-command.js";
+import { RemoteConfigStore } from "./remote-config/index.js";
 
 /**
  * Progress callback type for transport operations.
@@ -46,6 +62,34 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
   protected progressCallback?: ProgressCallback;
   /** Progress message callback */
   protected progressMessageCallback?: (message: string) => void;
+  /** The transports remote URLs are reached through (undefined: the defaults) */
+  private transportRegistry?: GitTransportRegistry;
+
+  /**
+   * Set the transports non-local remotes are reached through: the registry's connector for a
+   * URL opens the session (default `createDefaultTransports()`: smart HTTP over the global
+   * `fetch`). Paths and `file://` URLs are always git's local transport.
+   *
+   * @example
+   * ```typescript
+   * const transports = createDefaultTransports();
+   * transports.register({ name: "peer", schemes: ["peer"], connect: openPeerSession });
+   * await git.fetch().setRemote("peer://alice/repo").setTransports(transports).call();
+   * ```
+   *
+   * @param transports The registry
+   */
+  setTransports(transports: GitTransportRegistry): this {
+    this.checkCallable();
+    this.transportRegistry = transports;
+    return this;
+  }
+
+  /** The transports non-local remotes are reached through (see {@link setTransports}). */
+  getTransports(): GitTransportRegistry {
+    this.transportRegistry ??= createDefaultTransports();
+    return this.transportRegistry;
+  }
 
   /**
    * Set authentication credentials.
@@ -125,6 +169,39 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
     this.checkCallable();
     this.progressMessageCallback = callback;
     return this;
+  }
+
+  /**
+   * Resolves a remote URL (already rewritten by `insteadOf`) to the transport that reaches it
+   * and opens a local remote's repository (`resolveRemote`): git's errors for a transport
+   * `protocol.allow` refuses, a URL nothing here reaches, a path holding no repository.
+   */
+  protected prepareRemote(url: string): Promise<PreparedRemote> {
+    return prepareRemote(this._workingCopy, url, this.getTransports());
+  }
+
+  /**
+   * {@link prepareRemote} without opening a local repository: the transport is decided (and
+   * refused in git's words) now, the repository opened later by {@link openRemote}.
+   */
+  protected resolveRemote(url: string): ResolvedRemote {
+    return resolveRemote(url, remoteContextOf(this._workingCopy, this.getTransports()));
+  }
+
+  /** Opens the local repository of a remote {@link resolveRemote} resolved. */
+  protected openRemote(resolved: ResolvedRemote): Promise<PreparedRemote> {
+    return openResolvedRemote(this._workingCopy, resolved);
+  }
+
+  /** How this command talks to a remote: its credentials, headers, timeout, `protocol.version`. */
+  protected remoteSessionOptions(): RemoteSessionOptions {
+    return {
+      ...(this.credentials ? { credentials: this.credentials } : {}),
+      ...(this.headers ? { headers: this.headers } : {}),
+      ...(this.timeout !== undefined ? { timeout: this.timeout } : {}),
+      ...(this.gzipRequests !== undefined ? { gzipRequests: this.gzipRequests } : {}),
+      protocolVersion: protocolVersionOf(RemoteConfigStore.from(this._workingCopy)),
+    };
   }
 
   /**

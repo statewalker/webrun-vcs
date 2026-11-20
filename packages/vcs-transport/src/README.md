@@ -367,6 +367,11 @@ packages/vcs-transport/src/
 │   ├── duplex.ts            # Duplex stream interface
 │   ├── repository-facade.ts # Repository operations facade
 │   └── transport-api.ts     # Transport I/O interface
+├── connect/
+│   ├── git-url.ts           # parseGitUrl: remote URLs as git's transport_get reads them
+│   ├── connector.ts         # GitTransportConnector, GitSession (native or smart HTTP)
+│   ├── registry.ts          # GitTransportRegistry, createDefaultTransports
+│   └── open-session.ts      # openUploadPack / openReceivePack over a session
 ├── context/
 │   ├── handler-output.ts    # Handler result accumulator
 │   ├── process-config.ts    # FSM configuration options

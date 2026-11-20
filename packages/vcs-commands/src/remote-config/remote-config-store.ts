@@ -234,14 +234,18 @@ export class RemoteConfigStore {
 
   /**
    * Read a remote, filling in the default fetch refspec when none is
-   * configured, exactly as `git remote` reports one.
+   * configured, exactly as `git remote -v` reports one: its URLs as remote.c's
+   * `alias_all_urls` leaves them (an empty `url`/`pushurl` line clearing the ones before it,
+   * each URL rewritten by `url.<base>.insteadOf`), its push URLs the `pushurl` lines
+   * rewritten by `insteadOf` or, without any, the `pushInsteadOf` rewrites of its URLs (empty
+   * when none applies: the fetch URLs are pushed to).
    */
   read(name: string): RemoteConfig {
     const fetchRefspecs = this.strings(name, "fetch");
     return {
       name,
-      urls: this.strings(name, "url"),
-      pushUrls: this.strings(name, "pushurl"),
+      urls: this.remoteUrls(name),
+      pushUrls: this.aliasedPushUrls(name),
       fetchRefspecs: fetchRefspecs.length > 0 ? fetchRefspecs : [defaultFetchRefspec(name)],
       pushRefspecs: this.strings(name, "push"),
     };
@@ -374,16 +378,110 @@ export class RemoteConfigStore {
   }
 
   /**
-   * The URL to talk to a remote over, or undefined when it has none.
+   * The URL to talk to a remote over, or undefined when it has none: the first of
+   * {@link remoteUrls} (fetch) or {@link remotePushUrls} (push), with `url.<base>.insteadOf`
+   * and `url.<base>.pushInsteadOf` applied as git applies them.
    *
-   * @param push Prefer `pushurl`, falling back to `url`, as git does
+   * @param push The push URL (`pushurl`, else the fetch URLs), as git does
    */
   urlFor(name: string, options: { push?: boolean } = {}): string | undefined {
+    return (options.push ? this.remotePushUrls(name) : this.remoteUrls(name))[0];
+  }
+
+  /**
+   * The URL a remote command talks to for `nameOrUrl`, as git's `remote_get`: a remote whose
+   * configuration gives it URLs uses its first one ({@link urlFor}); anything else is a URL
+   * or path itself, rewritten by `url.<base>.insteadOf` (for a push, by
+   * `url.<base>.pushInsteadOf` first: git's `add_url_alias`).
+   *
+   * @example
+   * ```ts
+   * // [url "https://example.com/"] insteadOf = ex:
+   * store.remoteUrlOf("ex:repo.git");   // "https://example.com/repo.git"
+   * store.remoteUrlOf("origin");        // remote.origin.url, rewritten
+   * ```
+   */
+  remoteUrlOf(nameOrUrl: string, options: { push?: boolean } = {}): string {
+    const configured = this.urlFor(nameOrUrl, options);
+    if (configured !== undefined) return configured;
     if (options.push) {
-      const pushUrl = this.strings(name, "pushurl")[0];
-      if (pushUrl !== undefined) return pushUrl;
+      const pushAlias = this.aliasUrl(nameOrUrl, { push: true });
+      if (pushAlias !== undefined) return pushAlias;
     }
-    return this.strings(name, "url")[0];
+    return this.aliasUrl(nameOrUrl) ?? nameOrUrl;
+  }
+
+  /**
+   * A remote's fetch URLs as git reads them: the `remote.<name>.url` lines (an empty one
+   * clears those before it: git's `add_url`), each rewritten by `url.<base>.insteadOf`.
+   */
+  remoteUrls(name: string): string[] {
+    return this.urlList(name, "url").map((url) => this.aliasUrl(url) ?? url);
+  }
+
+  /**
+   * A remote's push URLs as git's `alias_all_urls` and `push_url_of_remote` give them: the
+   * `remote.<name>.pushurl` lines rewritten by `insteadOf`; without any, the
+   * `pushInsteadOf` rewrite of each `url` line one matches; when that leaves none, the fetch
+   * URLs ({@link remoteUrls}).
+   */
+  remotePushUrls(name: string): string[] {
+    const pushUrls = this.aliasedPushUrls(name);
+    return pushUrls.length > 0 ? pushUrls : this.remoteUrls(name);
+  }
+
+  /**
+   * A remote's `pushurl` list as remote.c's `alias_all_urls` leaves it: the `pushurl` lines
+   * rewritten by `insteadOf`, or without any, the `pushInsteadOf` rewrites of the `url` lines
+   * one matches (`add_pushurl_alias`).
+   */
+  private aliasedPushUrls(name: string): string[] {
+    const pushUrls = this.urlList(name, "pushurl").map((url) => this.aliasUrl(url) ?? url);
+    if (pushUrls.length > 0) return pushUrls;
+    const aliased: string[] = [];
+    for (const url of this.urlList(name, "url")) {
+      const alias = this.aliasUrl(url, { push: true });
+      if (alias !== undefined) aliased.push(alias);
+    }
+    return aliased;
+  }
+
+  /**
+   * git's `alias_url`: `url` with the longest `url.<base>.insteadOf` (or, for `push`,
+   * `url.<base>.pushInsteadOf`) prefix it starts with replaced by that `<base>`; the first
+   * base configured wins a tie. Undefined when none matches.
+   *
+   * @example
+   * ```ts
+   * // [url "git@example.com:"] pushInsteadOf = https://example.com/
+   * store.aliasUrl("https://example.com/r.git", { push: true }); // "git@example.com:r.git"
+   * ```
+   */
+  aliasUrl(url: string, options: { push?: boolean } = {}): string | undefined {
+    // a git config reads the variable without case; a plain bag by its spelling
+    const variables = options.push
+      ? ["pushInsteadOf", "pushinsteadof"]
+      : ["insteadOf", "insteadof"];
+    let best: { base: string; length: number } | undefined;
+    for (const base of this.config.subsections("url")) {
+      const prefixes = new Set(variables.flatMap((v) => this.values(`url.${base}.${v}`)));
+      for (const prefix of prefixes) {
+        if (url.startsWith(prefix) && (best === undefined || best.length < prefix.length)) {
+          best = { base, length: prefix.length };
+        }
+      }
+    }
+    return best === undefined ? undefined : best.base + url.slice(best.length);
+  }
+
+  /** The values of a remote's `url`/`pushurl` lines, an empty value clearing the earlier ones. */
+  private urlList(name: string, variable: string): string[] {
+    const out: string[] = [];
+    for (const value of this.strings(name, variable)) {
+      if (value === "") out.length = 0;
+      else out.push(value);
+    }
+    return out;
   }
 
   /** A config variable (`push.default`, `branch.main.merge`), the last value when repeated. */

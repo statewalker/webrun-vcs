@@ -155,7 +155,7 @@ export async function readGitProtocolRequest(
 export function encodeGitProtocolRequest(request: GitProtocolRequest): Uint8Array {
   const encoder = new TextEncoder();
 
-  // Build content: "service path\0host=host\0[extra params]"
+  // Build content: "service path\0host=host\0[\0extra params]"
   let content = `${request.service} ${request.path}\0`;
 
   if (request.host) {
@@ -165,8 +165,10 @@ export function encodeGitProtocolRequest(request: GitProtocolRequest): Uint8Arra
     content += `host=\0`;
   }
 
-  // Add extra parameters
-  if (request.extraParams) {
+  // Extra parameters follow a second NUL, as git's git_connect_git writes them (older
+  // git-daemons stop reading at it)
+  if (request.extraParams && request.extraParams.size > 0) {
+    content += "\0";
     for (const [key, value] of request.extraParams) {
       content += `${key}=${value}\0`;
     }

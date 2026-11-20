@@ -5,7 +5,6 @@ import {
   fetchFromConnection,
   type RefspecResolver,
   type FetchOptions as TransportFetchOptions,
-  fetch as transportFetch,
 } from "@statewalker/vcs-transport";
 import type { OpenedRepository, Worktree } from "@statewalker/vcs-working-tree";
 
@@ -24,9 +23,9 @@ import { TransportCommand } from "../transport-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
-import { localRemotePath, openLocalRemote, withLocalUploadPack } from "./local-transport.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
+import { withRemoteUploadPack } from "./remote-transport.js";
 import { SparseCheckoutCommand } from "./sparse-checkout-command.js";
 import { SparseUnpack } from "./sparse-checkout-support.js";
 import { checkoutFreshTree } from "./tree-restore.js";
@@ -92,6 +91,8 @@ const CLONE = "clone";
  */
 export class CloneCommand extends TransportCommand<CloneResult> {
   private uri?: string;
+  /** The source as clone.c records it: an existing path made absolute, else the URL */
+  private repoUrl?: string;
   private branch?: string;
   private depth?: number;
   private bare = false;
@@ -422,21 +423,28 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       );
     }
 
-    // a local source is opened before anything is written (git's "does not appear to be a
-    // git repository" leaves no clone behind)
-    const localPath = localRemotePath(this.uri);
-    let localRemote: OpenedRepository | undefined;
-    if (localPath !== undefined) {
-      try {
-        localRemote = await openLocalRemote(this.workingCopy, localPath);
-      } catch (error) {
-        // clone.c: a path (no URL) where no repository is found is "does not exist" (git
-        // tells an existing non-repository apart; here both read so); a file:// URL goes to
-        // upload-pack, which fails as for fetch
-        if (this.uri.startsWith("file://")) throw error;
-        throw new TransportError(`fatal: repository '${this.uri}' does not exist`);
-      }
-    }
+    // clone.c: the source is a path or a URL before anything else (get_repo_path): an
+    // existing repository path becomes absolute (remote.<name>.url, the reflog), a name with
+    // a colon is a URL, anything else is "does not exist", never rewritten. The URL connected
+    // to is remote.<name>.url as remote_get reads it: rewritten by url.<base>.insteadOf (the
+    // absolute path of a local source too). It is resolved, and a local repository opened,
+    // before anything is written (git's "does not appear to be a git repository" leaves no
+    // clone behind)
+    const uri = this.uri;
+    const worktree = this.workingCopy.worktree as Worktree | undefined;
+    const isRepositoryPath = await worktree
+      ?.openRepository?.(uri)
+      .then((opened) => opened !== undefined)
+      .catch(() => false);
+    let repo: string;
+    if (isRepositoryPath) repo = absolutePathOf(worktree, uri);
+    else if (uri.includes(":")) repo = uri;
+    else throw new TransportError(`fatal: repository '${uri}' does not exist`);
+    this.repoUrl = repo;
+    const sourceUrl = RemoteConfigStore.from(this.workingCopy).aliasUrl(repo) ?? repo;
+    const remote = await this.prepareRemote(sourceUrl);
+    const localRemote: OpenedRepository | undefined =
+      remote.kind === "local" ? remote.repository : undefined;
 
     // clone.c: a destination that exists and is not empty is refused before anything is
     // written; here the destination is the working copy, empty once `git init` made it
@@ -524,7 +532,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         : toTagMode(this.tagOption);
 
     const fetchOptions: TransportFetchOptions = {
-      url: this.uri,
+      url: sourceUrl,
       auth: this.credentials,
       headers: this.headers,
       timeout: this.timeout,
@@ -540,15 +548,12 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       // git's write_remote_refs: one initial transaction, no reflog
       skipReflog: true,
     };
-    // transport_get: smart HTTP, or git's local transport (upload-pack of the repository at
-    // the path, in process); anything else fails in git's words
-    const result =
-      localRemote === undefined
-        ? await transportFetch(fetchOptions)
-        : await withLocalUploadPack(localRemote, (connection) =>
-            fetchFromConnection(connection, fetchOptions),
-          );
-    const cloneLog = this.reflogLine(reflogMessages.clone(this.uri));
+    // transport_get: git's local transport (upload-pack of the repository at the path, in
+    // process), or the connector the transport registry names (smart HTTP by default)
+    const result = await withRemoteUploadPack(remote, this.remoteSessionOptions(), (connection) =>
+      fetchFromConnection(connection, fetchOptions),
+    );
+    const cloneLog = this.reflogLine(reflogMessages.clone(repo));
     const trackingUpdates: TrackingRefUpdate[] = result.refUpdates.map(toTrackingRefUpdate);
 
     // Set up HEAD and default branch.
@@ -749,7 +754,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     if (folding?.ignoreCase) store.setValue("core.ignorecase", "true");
     if (folding?.precomposeUnicode) store.setValue("core.precomposeunicode", "true");
     const remote = `remote.${this.remoteName}`;
-    store.setValue(`${remote}.url`, this.uri as string);
+    store.setValue(`${remote}.url`, this.repoUrl ?? (this.uri as string));
     // git >= 2.49: --mirror implies --no-tags (its refspec still maps every tag)
     if (this.tagOption === TagOption.NO_TAGS || this.mirror) {
       store.setValue(`${remote}.tagOpt`, "--no-tags");
@@ -859,6 +864,21 @@ export class CloneCommand extends TransportCommand<CloneResult> {
  * bare name (`main`) is equally legitimate. Both are accepted, and both yield
  * the bare name the ref-building code below prefixes.
  */
+/**
+ * clone.c's `absolute_pathdup` of a local source: an absolute path as given, a relative one
+ * after the directory clone runs in (the worktree top, as the host sees it when the storage
+ * has a root directory), without resolving `..` (git writes `/top/../src`).
+ */
+function absolutePathOf(worktree: Worktree | undefined, path: string): string {
+  if (path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path)) return path;
+  const top = worktree?.getRoot() ?? "";
+  const files = worktree?.getFiles?.() as { rootDirectory?: string } | undefined;
+  const root = files?.rootDirectory?.replace(/\/+$/, "");
+  const inStorage = top.replace(/^\/+|\/+$/g, "");
+  const base = root !== undefined ? (inStorage ? `${root}/${inStorage}` : root) : `/${inStorage}`;
+  return `${base.replace(/\/+$/, "")}/${path}`;
+}
+
 function toBranchName(defaultBranch: string | undefined): string | undefined {
   if (defaultBranch === undefined) return undefined;
   const prefix = "refs/heads/";

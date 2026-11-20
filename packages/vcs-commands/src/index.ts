@@ -8,7 +8,7 @@ export * from "./commands/index.js";
 // with the fluent API. Example: import { AddCommand } from "@statewalker/vcs-commands/core-commands";
 // Errors
 export * from "./errors/index.js";
-export { Git } from "./git.js";
+export { Git, type GitOptions } from "./git.js";
 // Base classes
 export { GitCommand } from "./git-command.js";
 // Results

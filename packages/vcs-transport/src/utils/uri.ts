@@ -12,7 +12,7 @@
  * Based on JGit's URIish.java
  */
 
-import type { GitUrl } from "../protocol/types.js";
+import type { GitUri as GitUrl } from "../protocol/types.js";
 
 /**
  * Regular expression for standard URI format.

@@ -6,7 +6,7 @@ export {
   supportsRequestStreams,
   toReadableStream,
 } from "@statewalker/vcs-utils/streams";
-export type { GitUrl } from "../protocol/types.js";
+export type { GitUri } from "../protocol/types.js";
 export {
   IdleTimeoutError,
   readStreamWithIdleTimeout,
@@ -33,7 +33,7 @@ export {
   getEffectivePort,
   getRepositoryName,
   isRemote,
-  parseGitUrl,
+  parseGitUrl as parseGitUri,
   resolveUrl,
   toHttpUrl,
 } from "./uri.js";

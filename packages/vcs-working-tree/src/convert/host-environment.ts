@@ -74,6 +74,17 @@ export interface GitHostEnvironment {
    */
   noReplaceObjects?: boolean;
   /**
+   * `$GIT_PROTOCOL_FROM_USER` as a boolean (git's `git_env_bool`, default true): whether
+   * transports whose `protocol.<name>.allow` is `user` may be used (false when git runs a
+   * command on the user's behalf, as for submodules)
+   */
+  protocolFromUser?: boolean;
+  /**
+   * `$GIT_ALLOW_PROTOCOL`: a colon-separated list of the only transports allowed, overriding
+   * every `protocol.*.allow` setting (git's `protocol_allow_list`)
+   */
+  allowProtocol?: string;
+  /**
    * `$GIT_REPLACE_REF_BASE`: where replace refs live (default `refs/replace/`); set but empty,
    * every ref is a candidate replace ref, as in git
    */
