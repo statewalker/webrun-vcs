@@ -10,10 +10,17 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { AddCommand } from "./add-command.js";
+import {
+  type PatchOptions,
+  type PatchResult,
+  type PatchSelector,
+  patchModeFor,
+  runPatchSelection,
+} from "./add-patch/index.js";
 import { ApplyCommand } from "./apply/apply-command.js";
 import { abbrevLengths } from "./core-config.js";
 import { DiffCommand } from "./diff-command.js";
-import { flatTree } from "./merge-support.js";
+import { flatTree, storeFlatTree } from "./merge-support.js";
 import {
   DO_MATCH_DIRECTORY,
   matchPathspec,
@@ -27,6 +34,7 @@ import {
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
 import { reflogMessages, updateHead } from "./reflog-messages.js";
+import { ResetCommand } from "./reset-command.js";
 import { STASH_REF } from "./stash-list-command.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
 
@@ -111,6 +119,14 @@ export class NoStagedChangesError extends Error {
   }
 }
 
+/** `git stash push -p` selected no hunk ("No changes selected"): nothing was stashed (exit 1). */
+export class NoChangesSelectedError extends Error {
+  constructor() {
+    super("No changes selected");
+    this.name = "NoChangesSelectedError";
+  }
+}
+
 /**
  * `git stash push --staged` saved the stash but could not take the staged changes out of
  * the worktree (`git apply -R` failed): git's "Cannot remove worktree changes". The stash
@@ -192,6 +208,11 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   private staged = false;
   private compatibility: PathspecOriginStyle = "2.56";
   private quiet = false;
+  private keepIndexSet = false;
+  private patch = false;
+  private patchSelector?: PatchSelector;
+  private patchOptions: PatchOptions = {};
+  private patchResult?: PatchResult;
 
   /**
    * Set the message used when committing index changes.
@@ -278,6 +299,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   setKeepIndex(keepIndex: boolean): this {
     this.checkCallable();
     this.keepIndex = keepIndex;
+    this.keepIndexSet = true;
     return this;
   }
 
@@ -357,6 +379,72 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   }
 
   /**
+   * `git stash push -p`: the differences between HEAD and the worktree are offered hunk by
+   * hunk, as git's add-patch.c does ("Stash this hunk"); the stash's worktree tree is HEAD
+   * with the selected hunks, which are then taken out of the worktree. The index stays as
+   * it is (`--keep-index` is the default in patch mode; `setKeepIndex(false)` resets it to
+   * HEAD afterwards). Throws {@link NoChangesSelectedError} when no hunk was selected. Not
+   * with untracked files; it overrides `setStaged`. The prompts are answered by
+   * {@link setPatchSelector}; {@link getPatchResult} gives git's transcript.
+   *
+   * @example
+   * ```typescript
+   * const answers = ["y", "n"];
+   * const stash = git.stashCreate().setPatch(true).setPatchSelector(() => answers.shift());
+   * await stash.call();
+   * ```
+   */
+  setPatch(patch: boolean): this {
+    this.checkCallable();
+    this.patch = patch;
+    return this;
+  }
+
+  /** Answers the prompts of {@link setPatch}. */
+  setPatchSelector(selector: PatchSelector): this {
+    this.checkCallable();
+    this.patchSelector = selector;
+    return this;
+  }
+
+  /** `-U<n>`, `--inter-hunk-context=<n>` and `--no-auto-advance` of {@link setPatch}. */
+  setPatchOptions(options: PatchOptions): this {
+    this.checkCallable();
+    this.patchOptions = { ...options };
+    return this;
+  }
+
+  /** What {@link setPatch}'s selection printed; read after {@link call}. */
+  getPatchResult(): PatchResult | undefined {
+    return this.patchResult;
+  }
+
+  /**
+   * stash_patch: the selection run on a temporary index of HEAD's tree (`diff-index HEAD`,
+   * `apply --cached`); the tree of that index.
+   */
+  private async patchWorktreeState(headTree: ObjectId, paths: string[]): Promise<ObjectId> {
+    const temporary = new Map<string, { mode: number; objectId: string }>(
+      [...(await flatTree(this.trees, headTree))].map(([p, e]) => [
+        p,
+        { mode: e.mode, objectId: e.objectId },
+      ]),
+    );
+    this.patchResult = await runPatchSelection(this.workingCopy, {
+      ...this.patchOptions,
+      mode: patchModeFor("stash"),
+      selector: this.patchSelector,
+      diffRevision: headTree,
+      paths,
+      compatibility: this.compatibility,
+      temporaryIndex: temporary,
+    });
+    const tree = await storeFlatTree(this.trees, temporary);
+    if (tree === headTree) throw new NoChangesSelectedError();
+    return tree;
+  }
+
+  /**
    * Execute the stash create command.
    *
    * @returns The stash commit ID, or undefined if nothing to stash
@@ -386,6 +474,18 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     }
     const branch = await this.getCurrentBranchName();
 
+    if (this.patch && this.includeUntracked) {
+      throw new InvalidArgumentError(
+        "patch",
+        true,
+        "Can't use --patch and --include-untracked or --all at the same time",
+      );
+    }
+    // --patch overrides --staged, and keeps the index unless told not to
+    if (this.patch) {
+      this.staged = false;
+      if (!this.keepIndexSet) this.keepIndex = true;
+    }
     if (this.staged && this.includeUntracked) {
       throw new InvalidArgumentError(
         "staged",
@@ -450,7 +550,11 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     const indexTree = await provider.getIndexTree();
     // --staged: the index is the stash's worktree state; nothing staged, nothing stashed
     if (this.staged && indexTree === headCommit.tree) throw new NoStagedChangesError();
-    const workingTree = this.staged ? indexTree : await this.worktreeState(provider);
+    const workingTree = this.staged
+      ? indexTree
+      : this.patch
+        ? await this.patchWorktreeState(headCommit.tree, this.pathspec)
+        : await this.worktreeState(provider);
     const untrackedTree =
       this.includeUntracked && provider.getUntrackedTree
         ? await provider.getUntrackedTree({ includeIgnored: this.includeIgnored })
@@ -516,7 +620,18 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     if (!this.ref) return stashCommit;
     await this.updateStashRef(this.ref, stashCommit, workingMsg, this.author);
 
-    if (this.staged) {
+    if (this.patch) {
+      // `git apply -R` of HEAD..w_tree, then (--no-keep-index) `git reset -q --refresh -- <ps>`
+      await this.removeStagedChanges(provider, stashCommit, headCommit.tree, workingTree, true);
+      if (this.keepIndex) return stashCommit;
+      if (items.length > 0) {
+        const reset = new ResetCommand(this.workingCopy).setQuiet(true);
+        for (const p of this.pathspec) reset.addPath(p);
+        await reset.call();
+        return stashCommit;
+      }
+      await provider.resetIndexToHead?.();
+    } else if (this.staged) {
       await this.removeStagedChanges(provider, stashCommit, headCommit.tree, indexTree);
       // `git reset -q --refresh -- <pathspec>`: refs are reset only without a pathspec
       if (this.keepIndex || items.length > 0) return stashCommit;
@@ -741,8 +856,9 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     stashCommit: ObjectId,
     headTree: ObjectId,
     indexTree: ObjectId,
+    patchMode = false,
   ): Promise<void> {
-    if (!provider.resetIndexToHead) {
+    if (!provider.resetIndexToHead && !patchMode) {
       throw new StoreNotAvailableError("worktree", "stash --staged requires a working tree");
     }
     const patch = await new DiffCommand(this.workingCopy)
@@ -751,7 +867,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
       .setRenames(false)
       .setOptions({
         context: 1,
-        binaryPatch: true,
+        binaryPatch: !patchMode,
         textconv: false,
         defaultPrefix: true,
         ignoreConfigNoPrefix: true,
@@ -767,7 +883,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
         .call();
       if (applied.exitCode !== 0) throw new StashWorktreeRemovalError(stashCommit, applied.errors);
     }
-    if (!this.keepIndex) await provider.resetIndexToHead();
+    if (!this.keepIndex && !patchMode) await provider.resetIndexToHead?.();
   }
 
   /** The built-in provider, for a working copy with an index and a worktree. */

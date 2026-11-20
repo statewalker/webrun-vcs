@@ -146,6 +146,33 @@ export interface DiffTextOptions
    * `installTextconvRunner`, without one no textconv applies
    */
   textconv?: boolean;
+  /**
+   * `-R`: the two sides swapped (an addition shows as a deletion, the new side first), their
+   * prefixes with them (`diff --git b/f a/f`). Combined diffs of conflicted paths are not swapped.
+   */
+  reverse?: boolean;
+}
+
+/** An entry with its two sides swapped (`diff -R`). */
+function reverseEntry(entry: DiffEntry): DiffEntry {
+  if (entry.unmerged) return entry;
+  const changeType =
+    entry.changeType === ChangeType.ADD
+      ? ChangeType.DELETE
+      : entry.changeType === ChangeType.DELETE
+        ? ChangeType.ADD
+        : entry.changeType;
+  const out: DiffEntry = { changeType };
+  if (entry.newPath !== undefined) out.oldPath = entry.newPath;
+  if (entry.oldPath !== undefined) out.newPath = entry.oldPath;
+  if (entry.newId !== undefined) out.oldId = entry.newId;
+  if (entry.oldId !== undefined) out.newId = entry.oldId;
+  if (entry.newMode !== undefined) out.oldMode = entry.newMode;
+  if (entry.oldMode !== undefined) out.newMode = entry.oldMode;
+  if (entry.readNew) out.readOld = entry.readNew;
+  if (entry.readOld) out.readNew = entry.readOld;
+  if (entry.score !== undefined) out.score = entry.score;
+  return out;
 }
 
 /** What a diff compares, for `diff.mnemonicPrefix` */
@@ -644,9 +671,17 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   ): Promise<void> {
     const config = this.config;
     const { combined } = collected;
-    const entries = await this.ordered(collected.entries);
+    const ordered = await this.ordered(collected.entries);
+    const entries = this.textOptions.reverse ? ordered.map(reverseEntry) : ordered;
     const options = this.outputOptions();
     Object.assign(options, this.prefixes());
+    if (this.textOptions.reverse) {
+      // diff -R swaps the prefixes with the sides (`diff --git b/f a/f`)
+      [options.srcPrefix, options.dstPrefix] = [
+        options.dstPrefix ?? "b/",
+        options.srcPrefix ?? "a/",
+      ];
+    }
     const pairs: DiffFilePair[] = [];
     const unmerged = new Set<DiffFilePair>();
     for (const entry of entries) {

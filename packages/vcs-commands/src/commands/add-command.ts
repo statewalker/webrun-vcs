@@ -23,6 +23,13 @@ import {
   StoreNotAvailableError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import {
+  type PatchOptions,
+  type PatchResult,
+  type PatchSelector,
+  patchModeFor,
+  runPatchSelection,
+} from "./add-patch/index.js";
 import { worktreeModeTrust } from "./core-config.js";
 import {
   AddToIndexError,
@@ -82,6 +89,9 @@ export interface AddResult {
    * new entry, `remove '<path>'` for each removed, in git's order
    */
   readonly output: string[];
+
+  /** With {@link AddCommand.setPatch}: what the hunk selection printed and applied */
+  readonly patch?: PatchResult;
 }
 
 /**
@@ -112,6 +122,9 @@ export class AddCommand extends GitCommand<AddResult> {
   /** The sparse checkout's patterns, read at the start (undefined: not a sparse checkout) */
   private sparsePatterns?: SparseCheckoutPatterns;
   private verbose = false;
+  private patch = false;
+  private patchSelector?: PatchSelector;
+  private patchOptions: PatchOptions = {};
 
   /**
    * `git add --chmod=(+|-)x`: after adding, the index entries of the regular files the
@@ -395,6 +408,67 @@ export class AddCommand extends GitCommand<AddResult> {
   }
 
   /**
+   * `git add -p` (`--patch`): the changes between the index and the worktree are offered
+   * hunk by hunk, as git's add-patch.c does, and the selected hunks are staged. The
+   * prompts are answered by {@link setPatchSelector}; the result's `patch` carries git's
+   * transcript. Untracked files are not offered (`add -N` them first), binary files are
+   * passed over. The other options but the pathspec do not apply.
+   *
+   * @example
+   * ```typescript
+   * const answers = ["y", "n", "s", "y", "q"];
+   * const { patch } = await git.add().setPatch(true).setPatchSelector(() => answers.shift()).call();
+   * process.stdout.write(patch?.output ?? "");
+   * ```
+   */
+  setPatch(patch: boolean): this {
+    this.checkCallable();
+    this.patch = patch;
+    return this;
+  }
+
+  /** Answers the prompts of {@link setPatch} (git's reads from standard input and its editor). */
+  setPatchSelector(selector: PatchSelector): this {
+    this.checkCallable();
+    this.patchSelector = selector;
+    return this;
+  }
+
+  /** `-U<n>`, `--inter-hunk-context=<n>` and `--no-auto-advance` of {@link setPatch}. */
+  setPatchOptions(options: PatchOptions): this {
+    this.checkCallable();
+    this.patchOptions = { ...options };
+    return this;
+  }
+
+  /** `git add -p`: the selection, staged through `git apply --cached`. */
+  private async callPatch(): Promise<AddResult> {
+    if (this.dryRun) {
+      throw new IncompatibleOptionsError(
+        ["--dry-run", "--interactive/--patch"],
+        "fatal: options '--dry-run' and '--interactive/--patch' cannot be used together",
+      );
+    }
+    const patch = await runPatchSelection(this.workingCopy, {
+      ...this.patchOptions,
+      mode: patchModeFor("add"),
+      selector: this.patchSelector,
+      paths: this.filepatterns,
+      compatibility: this.compatibility,
+    });
+    return {
+      added: patch.applied,
+      skipped: [],
+      ignored: [],
+      removed: [],
+      totalProcessed: patch.applied.length,
+      warnings: [],
+      output: [],
+      patch,
+    };
+  }
+
+  /**
    * Execute the add command.
    *
    * @returns Result with lists of added, skipped, and removed paths
@@ -408,6 +482,7 @@ export class AddCommand extends GitCommand<AddResult> {
     // replaced is read again (git reads the index at its start), unless this instance holds
     // unwritten edits (refused)
     await this.readCurrentIndex();
+    if (this.patch) return this.callPatch();
     this.sparsePatterns = await this.sparseCheckoutPatterns();
 
     // Validate options - update and all are mutually exclusive

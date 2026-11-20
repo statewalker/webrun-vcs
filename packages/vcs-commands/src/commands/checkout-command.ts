@@ -62,6 +62,15 @@ import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { StashApplyStatus } from "../results/index.js";
 import {
+  type PatchCompatibility,
+  type PatchOptions,
+  type PatchResult,
+  type PatchSelector,
+  patchRevisionOf,
+  pathPatchMode,
+  runPatchSelection,
+} from "./add-patch/index.js";
+import {
   guessRemoteBranch,
   installTracking,
   planTracking,
@@ -181,6 +190,9 @@ export interface CheckoutResult {
    * checkout that could not write an entry exits 255
    */
   readonly exitCode?: number;
+
+  /** With `setPatch`: what the hunk selection printed and applied */
+  readonly patch?: PatchResult;
 }
 
 /** A tree or index entry, as the two-way merge compares them (index entries with stat). */
@@ -233,6 +245,10 @@ type SwitchPlan =
 export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private name: string | undefined;
   private createBranch = false;
+  private patch = false;
+  private patchSelector?: PatchSelector;
+  private patchOptions: PatchOptions = {};
+  private patchCompatibility: PatchCompatibility = "2.56";
   private forceCreateBranch = false;
   private orphan = false;
   private force = false;
@@ -607,6 +623,80 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
    * @returns Result with status and affected files
    * @throws RefNotFoundError if target cannot be resolved
    */
+  /**
+   * `git checkout -p [<tree-ish>] [-- <paths>]`: the differences between the index (or the
+   * tree-ish) and the worktree are offered hunk by hunk, as git's add-patch.c does; the
+   * selected hunks are discarded from the worktree (from the index too with a tree-ish:
+   * "Discard this hunk from index and worktree", or "Apply this hunk to index and worktree"
+   * for another commit than HEAD). The prompts are answered by {@link setPatchSelector};
+   * the result's `patch` carries git's transcript. No post-checkout hook runs.
+   *
+   * @example
+   * ```typescript
+   * const answers = ["y", "n"];
+   * const { patch } = await git.checkout().setPatch(true).setStartPoint("HEAD")
+   *   .setPatchSelector(() => answers.shift()).call();
+   * ```
+   */
+  setPatch(patch: boolean): this {
+    this.checkCallable();
+    this.patch = patch;
+    return this;
+  }
+
+  /** Answers the prompts of {@link setPatch}. */
+  setPatchSelector(selector: PatchSelector): this {
+    this.checkCallable();
+    this.patchSelector = selector;
+    return this;
+  }
+
+  /** `-U<n>`, `--inter-hunk-context=<n>` and `--no-auto-advance` of {@link setPatch}. */
+  setPatchOptions(options: PatchOptions): this {
+    this.checkCallable();
+    this.patchOptions = { ...options };
+    return this;
+  }
+
+  /** The git version whose prompts {@link setPatch} reproduces (default 2.56). */
+  setCompatibility(version: PatchCompatibility): this {
+    this.checkCallable();
+    this.patchCompatibility = version;
+    return this;
+  }
+
+  /** `git checkout -p`: run_add_p(ADD_P_CHECKOUT, rev). */
+  private async callPatch(): Promise<CheckoutResult> {
+    if (this.overlay === true) {
+      throw new InvalidArgumentError(
+        "overlay",
+        true,
+        "fatal: options '-p' and '--overlay' cannot be used together",
+      );
+    }
+    const { revision, diffRevision } = await patchRevisionOf(this.startPoint ?? this.name, {
+      headId: async () => (await this.refsStore.resolve("HEAD"))?.objectId,
+      resolve: (name) => this.resolveRevision(name),
+      peelCommit: (id) => this.revisionResolver().peelToType(id, "commit"),
+    });
+    const patch = await runPatchSelection(this.workingCopy, {
+      ...this.patchOptions,
+      mode: pathPatchMode(true, true, revision),
+      selector: this.patchSelector,
+      ...(diffRevision !== undefined ? { diffRevision } : {}),
+      paths: [...this.pathspecFromFile, ...this.paths],
+      compatibility: this.patchCompatibility,
+    });
+    return {
+      status: CheckoutStatus.OK,
+      updated: patch.applied,
+      removed: [],
+      conflicts: [],
+      ref: null,
+      patch,
+    };
+  }
+
   async call(): Promise<CheckoutResult> {
     this.checkCallable();
     this.setCallable(false);
@@ -614,6 +704,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // replaced is read again (git reads the index at its start), unless this instance holds
     // unwritten edits (refused)
     await this.readCurrentIndex();
+    if (this.patch) return this.callPatch();
 
     // path checkout, or branch checkout; one worktree batch, so the checks and the writes
     // share one reading of the ignore rules

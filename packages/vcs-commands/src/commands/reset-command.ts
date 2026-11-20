@@ -1,6 +1,7 @@
 import {
   type Blobs,
   EMPTY_BLOB_ID,
+  EMPTY_TREE_ID,
   FileMode,
   type ObjectId,
   type Ref,
@@ -32,6 +33,14 @@ import {
 import { RefNotFoundError } from "../errors/ref-errors.js";
 import { type CommandTrees, GitCommand } from "../git-command.js";
 import { ResetMode } from "../types.js";
+import {
+  type PatchCompatibility,
+  type PatchOptions,
+  type PatchResult,
+  type PatchSelector,
+  patchModeFor,
+  runPatchSelection,
+} from "./add-patch/index.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { addLeadingDirs, stageZeroClashes } from "./index-adder.js";
@@ -98,6 +107,11 @@ export class ResetCommand extends GitCommand<Ref> {
   private quiet = false;
   private noRefresh = false;
   private readonly output: string[] = [];
+  private patch = false;
+  private patchSelector?: PatchSelector;
+  private patchOptions: PatchOptions = {};
+  private patchResult?: PatchResult;
+  private compatibility: PatchCompatibility = "2.56";
 
   /**
    * `-q` / `--quiet`: a mixed reset does not list the files left with unstaged changes
@@ -108,6 +122,77 @@ export class ResetCommand extends GitCommand<Ref> {
     this.checkCallable();
     this.quiet = quiet;
     return this;
+  }
+
+  /**
+   * `git reset -p [<tree-ish>] [-- <paths>]`: the differences between the tree-ish (HEAD by
+   * default) and the index are offered hunk by hunk, as git's add-patch.c does; the selected
+   * hunks are taken out of the index ("Unstage this hunk"), or with another tree-ish applied
+   * to it ("Apply this hunk to index"). HEAD and the worktree stay. The prompts are answered
+   * by {@link setPatchSelector}; {@link getPatchResult} gives git's transcript. Not with a
+   * mode (`--soft`, `--mixed`, `--hard`...).
+   *
+   * @example
+   * ```typescript
+   * const answers = ["y", "n"];
+   * const reset = git.reset().setPatch(true).setPatchSelector(() => answers.shift());
+   * await reset.call();
+   * console.log(reset.getPatchResult()?.output);
+   * ```
+   */
+  setPatch(patch: boolean): this {
+    this.checkCallable();
+    this.patch = patch;
+    return this;
+  }
+
+  /** Answers the prompts of {@link setPatch}. */
+  setPatchSelector(selector: PatchSelector): this {
+    this.checkCallable();
+    this.patchSelector = selector;
+    return this;
+  }
+
+  /** `-U<n>`, `--inter-hunk-context=<n>` and `--no-auto-advance` of {@link setPatch}. */
+  setPatchOptions(options: PatchOptions): this {
+    this.checkCallable();
+    this.patchOptions = { ...options };
+    return this;
+  }
+
+  /** The git version whose prompts {@link setPatch} reproduces (default 2.56). */
+  setCompatibility(version: PatchCompatibility): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
+
+  /** What {@link setPatch}'s selection printed and applied; read after {@link call}. */
+  getPatchResult(): PatchResult | undefined {
+    return this.patchResult;
+  }
+
+  /** `git reset -p`: run_add_p(ADD_P_RESET, rev). */
+  private async callPatch(): Promise<Ref> {
+    if (this.modeSet) {
+      throw new IncompatibleOptionsError(
+        ["--patch", "--{hard,mixed,soft}"],
+        "fatal: options '--patch' and '--{hard,mixed,soft}' cannot be used together",
+      );
+    }
+    const rev = this.ref === undefined || this.ref === "@" ? "HEAD" : this.ref;
+    const head = await this.refsStore.resolve("HEAD");
+    const diffRevision = rev === "HEAD" && !head?.objectId ? EMPTY_TREE_ID : rev;
+    if (diffRevision !== EMPTY_TREE_ID) await this.resolveRef(rev);
+    this.patchResult = await runPatchSelection(this.workingCopy, {
+      ...this.patchOptions,
+      mode: patchModeFor("reset", rev),
+      selector: this.patchSelector,
+      diffRevision,
+      paths: [...this.pathspecFromFile, ...this.paths],
+      compatibility: this.compatibility,
+    });
+    return (await this.refsStore.resolve("HEAD")) as Ref;
   }
 
   /** `--no-refresh`: a mixed reset leaves the index's stat data as the reset wrote it. */
@@ -256,6 +341,7 @@ export class ResetCommand extends GitCommand<Ref> {
         "fatal: the option '-N' requires '--mixed'",
       );
     }
+    if (this.patch) return this.callPatch();
     // If paths are specified, do path reset
     if (this.paths.length > 0 || this.pathspecFromFile.length > 0) {
       return this.resetPaths();
