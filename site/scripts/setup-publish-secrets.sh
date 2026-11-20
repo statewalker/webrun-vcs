@@ -18,15 +18,15 @@
 # Usage: site/scripts/setup-publish-secrets.sh
 #   HTTPEERS_SSH   default kotelnikov@163.172.46.87
 #   REPO           default statewalker/webrun-vcs
-#   SITE_DOMAIN    default vcs.httpeers.net     (where the workflow publishes)
-#   SITE_DOMAINS   default: vcs.httpeers.net    (prefixes the user may write)
+#   SITE_DOMAIN    default vcs.statewalker.com  (where the workflow publishes)
+#   SITE_DOMAINS   default: vcs.statewalker.com (prefixes the user may write)
 #   SITE_USER      default vcs-site              (the RustFS user's access key)
 set -euo pipefail
 
 HTTPEERS_SSH=${HTTPEERS_SSH:-kotelnikov@163.172.46.87}
 REPO=${REPO:-statewalker/webrun-vcs}
-SITE_DOMAIN=${SITE_DOMAIN:-vcs.httpeers.net}
-SITE_DOMAINS=${SITE_DOMAINS:-vcs.httpeers.net}
+SITE_DOMAIN=${SITE_DOMAIN:-vcs.statewalker.com}
+SITE_DOMAINS=${SITE_DOMAINS:-vcs.statewalker.com}
 SITE_USER=${SITE_USER:-vcs-site}
 ENDPOINT=https://s3.httpeers.net
 RC_IMAGE=rustfs/rc:v0.1.37  # RustFS's own client; MinIO no longer publishes mc images

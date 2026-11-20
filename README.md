@@ -8,7 +8,7 @@ package combines it with rclone-style file synchronisation.
 
 This repository is a pnpm workspace: the library packages under `packages/`, runnable examples,
 demos and benchmarks under `apps/`, a documentation site under `docs/`, and the project website
-under `site/` (published from `main` to <https://vcs.httpeers.net>, with live examples that run the packages
+under `site/` (published from `main` to <https://vcs.statewalker.com>, with live examples that run the packages
 in the browser).
 
 ## The shape

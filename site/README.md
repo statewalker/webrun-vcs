@@ -72,11 +72,11 @@ Setup, once (repository → Settings → Secrets and variables → Actions):
 | Kind | Name | Value |
 | --- | --- | --- |
 | secret | `HTTPEERS_S3_ACCESS_KEY_ID`, `HTTPEERS_S3_SECRET_ACCESS_KEY` | credentials that can write the site's prefix in the `sites` bucket |
-| variable | `SITE_DOMAIN` | optional; `vcs.httpeers.net` when unset |
+| variable | `SITE_DOMAIN` | optional; `vcs.statewalker.com` when unset |
 
 Use credentials of their own, not RustFS's root pair in `/opt/httpeers/.env` on the httpeers
 server, which can rewrite or delete every site in the bucket. A RustFS user whose policy allows
-`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` and `s3:ListBucket` on `sites/vcs.httpeers.net/*`
+`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` and `s3:ListBucket` on `sites/vcs.statewalker.com/*`
 only is what the workflow needs.
 
 `site/scripts/setup-publish-secrets.sh` does all of it: it reads the root pair over ssh
@@ -88,11 +88,33 @@ rotates the key.
 Without the secrets the workflow builds and checks the site and notes that it did not publish.
 Run it by hand with "Run workflow" (`workflow_dispatch`).
 
-`vcs.httpeers.net` needs nothing else: the zone has a wildcard DNS record and Caddy a wildcard
-certificate. To move the site to a domain of its own: add a site block for it to statewalker/httpeers
-`deploy/Caddyfile` (`<domain> { reverse_proxy sites:3000 }`) and deploy it, point the domain's A
-(and AAAA) record at the httpeers server, set `SITE_DOMAIN`, re-run `setup-publish-secrets.sh`
-with `SITE_DOMAINS` including the new name, and run the workflow.
+### Why vcs.statewalker.com needs DNS records and a Caddy block
+
+The site lives at **vcs.statewalker.com**, and vcs.statewalker.org redirects to it with a 301.
+Both names are served by the httpeers server (163.172.46.87), which has no wildcard for them, so
+each needs a DNS record and an exact-name block in statewalker/httpeers `deploy/Caddyfile`:
+
+| Name | DNS | Caddyfile |
+| --- | --- | --- |
+| `vcs.statewalker.com` | Cloudflare: `A vcs 163.172.46.87`, **DNS only** (grey cloud) | `reverse_proxy sites:3000` (the `vcs.statewalker.com` prefix) |
+| `vcs.statewalker.org` | Gandi LiveDNS: `vcs A 163.172.46.87` | `redir https://vcs.statewalker.com{uri} permanent` |
+
+The record must be DNS only. Proxied through Cloudflare, the name would resolve to Cloudflare's
+addresses: Caddy's HTTP-01 challenge would then pass through Cloudflare's edge, and visitors would
+get Cloudflare's certificate in front of the server's. Caddy gets the certificates itself, over
+HTTP-01, once the names resolve to the server. Deploy the Caddyfile only after that; before it,
+Caddy logs `challenge failed` and browsers show a TLS error.
+
+To go live, in order:
+
+1. Add both DNS records, and check them with
+   `dig +short vcs.statewalker.com vcs.statewalker.org` (both `163.172.46.87`).
+2. Deploy statewalker/httpeers `deploy/Caddyfile` as its `deploy/README.md` says.
+3. Run `site/scripts/setup-publish-secrets.sh` (the defaults are `vcs.statewalker.com`), then run
+   the workflow ("Run workflow").
+4. Check the result: `curl -sI https://vcs.statewalker.com/` answers `200`, and
+   `curl -sI https://vcs.statewalker.org/x` answers `301` with
+   `location: https://vcs.statewalker.com/x`.
 
 ## Style
 
