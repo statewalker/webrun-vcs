@@ -41,6 +41,9 @@ import {
   planRefBatch,
   ReflogEntryNotFoundError,
   RefStorage,
+  RefTransactionAbortedError,
+  type RefTransactionHook,
+  type RefTransactionUpdate,
   symrefReflogWrites,
 } from "@statewalker/vcs-core";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
@@ -57,6 +60,11 @@ const ZERO_ID = "0".repeat(40);
 const MAX_SYMREF_READS = 5;
 
 export interface FilesRefBatchOptions {
+  /**
+   * Told about each batch's states (git's reference-transaction hook); read when each batch
+   * starts, so it can be set after the store is made
+   */
+  transactionHook?: () => RefTransactionHook | undefined;
   /** Retry a held ref lock for this long (git: core.filesRefLockTimeout, 100 ms). */
   refLockTimeoutMs?: number;
   /** Retry a held packed-refs.lock for this long (git: core.packedRefsTimeout, 1000 ms). */
@@ -583,7 +591,32 @@ export function createFilesRefOps(
   const mismatch = (old: ObjectId | null | undefined, current: ObjectId | undefined) =>
     old !== undefined && (old === null ? current !== undefined : current !== old);
 
-  async function single(u: Update, o: BatchOptions): Promise<BatchResult> {
+  /** The updates as the transaction hook is told them. */
+  function transactionUpdates(updates: Update[]): RefTransactionUpdate[] {
+    return updates.map((u) => ({
+      requested: u.requested,
+      name: u.name,
+      ...(u.old !== undefined ? { old: u.old } : {}),
+      new: u.newValue,
+    }));
+  }
+
+  /** The `prepared` state: a refusal aborts (the `aborted` state, then a throw). */
+  async function prepared(hook: RefTransactionHook | undefined, updates: Update[]) {
+    if (!hook) return;
+    const told = transactionUpdates(updates);
+    const verdict = await hook("prepared", told);
+    if (verdict === false || typeof verdict === "string") {
+      await hook("aborted", told);
+      throw new RefTransactionAbortedError("prepared", verdict || undefined);
+    }
+  }
+
+  async function single(
+    u: Update,
+    o: BatchOptions,
+    hook?: RefTransactionHook,
+  ): Promise<BatchResult> {
     const content = u.newValue === null ? new Uint8Array(0) : enc.encode(`${u.newValue}\n`);
     // The refs that log this update too (HEAD, symbolic refs on the way) are locked as
     // git locks them (REF_LOG_ONLY updates), so their log lines are appended under a lock.
@@ -614,6 +647,7 @@ export function createFilesRefOps(
       if (mismatch(u.old, curId)) {
         return fail([{ name: u.requested, reason: "mismatch" }]);
       }
+      await prepared(hook, [u]);
       if (u.newValue === null) {
         if ((await deleteUnderPackedLock(u.name)) === "held") {
           return fail([{ name: PACKED, reason: "locked" }]);
@@ -625,6 +659,7 @@ export function createFilesRefOps(
         if (!(await commit(u.name))) return fail([{ name: u.requested, reason: "df-conflict" }]);
         ours = false;
       }
+      await hook?.("committed", transactionUpdates([u]));
       return { ok: true, rejected: [] };
     } finally {
       for (const n of held) if (n !== u.name || ours) await unlock(n);
@@ -652,7 +687,11 @@ export function createFilesRefOps(
     });
   }
 
-  async function multi(updates: Update[], o: BatchOptions): Promise<BatchResult> {
+  async function multi(
+    updates: Update[],
+    o: BatchOptions,
+    hook?: RefTransactionHook,
+  ): Promise<BatchResult> {
     const extra = updates.flatMap((u) => u.reflogAlso);
     const names = [...new Set([...extra, ...updates.map((u) => u.name)])].sort(compareRefNames);
     const held: string[] = [];
@@ -688,6 +727,7 @@ export function createFilesRefOps(
       if (mismatched.length) {
         return fail(mismatched.map((u) => ({ name: u.requested, reason: "mismatch" as const })));
       }
+      await prepared(hook, updates);
       if (loose.size) {
         // Phase 1: move the involved loose refs into packed-refs (values unchanged for
         // readers), committing packed-refs BEFORE removing the loose files.
@@ -721,6 +761,7 @@ export function createFilesRefOps(
         at,
         o,
       );
+      await hook?.("committed", transactionUpdates(updates));
       return { ok: true, rejected: [] };
     } finally {
       if (packedHeld) await files.remove(`${PACKED}.lock`).catch(() => false);
@@ -825,9 +866,17 @@ export function createFilesRefOps(
         return fail(updates.map((u) => ({ name: u.requested, reason: "unsupported" as const })));
       }
     }
+    // the reference-transaction hook: `preparing` before any lock
+    const hook = options.transactionHook?.();
+    const verdict = hook ? await hook("preparing", transactionUpdates(updates)) : undefined;
+    if (verdict === false || typeof verdict === "string") {
+      // ref_transaction_abort tells the hook whatever the state
+      await hook?.("aborted", transactionUpdates(updates));
+      throw new RefTransactionAbortedError("preparing", verdict || undefined);
+    }
     return updates.length === 1
-      ? single(updates[0] as Update, batchOptions)
-      : multi(updates, batchOptions);
+      ? single(updates[0] as Update, batchOptions, hook)
+      : multi(updates, batchOptions, hook);
   };
 
   async function sweepTemporaries(): Promise<number> {

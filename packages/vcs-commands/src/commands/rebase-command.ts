@@ -34,6 +34,7 @@ import type { RebaseResult, RebaseTodoLine } from "../results/rebase-result.js";
 import { RebaseAction, RebaseStatus } from "../results/rebase-result.js";
 import { coreBool, createIdAbbreviator, worktreeModeTrust } from "./core-config.js";
 import { createDescriber, type DescribeOptions } from "./git-describe.js";
+import { runPostCheckoutHook, sequencerPostCommit, sequencerPrepareMessage } from "./git-hooks.js";
 import { hostEnvironmentOf, localTimezoneOffset } from "./git-ident.js";
 import { favorOf, MergeCommand } from "./merge-command.js";
 import { configBool, configValue, conflictStyleOf } from "./merge-config.js";
@@ -283,6 +284,14 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private autosquash?: boolean;
   /** `--root`: every commit of the branch rebased (onto the upstream given, else a new root) */
   private root = false;
+  private noVerify = false;
+
+  /** `--no-verify`: the pre-rebase hook does not run. */
+  setNoVerify(noVerify: boolean): this {
+    this.checkCallable();
+    this.noVerify = noVerify;
+    return this;
+  }
   /** The command after the one running (git's peek_command), for record_in_rewritten */
   private nextCommand?: RebaseAction;
 
@@ -771,6 +780,22 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       output.push(`${upToDate}, rebase forced.`);
     }
 
+    // the pre-rebase hook, told the upstream as given (`--root` with --root), may refuse
+    if (!this.noVerify) {
+      const upstreamArg =
+        this.root && !this.upstreamCommit ? "--root" : (this.upstreamCommitName ?? onto);
+      const pre = await this.hooks.run("pre-rebase", { args: [upstreamArg] });
+      if (pre && pre.exitCode !== 0) {
+        await unstash();
+        return {
+          status: RebaseStatus.FAILED,
+          // 2.43 dies (exit 128), 2.5x returns an error (exit 1)
+          message: `${this.hooks.compatibility === "2.43" ? "fatal" : "error"}: The pre-rebase hook refused to rebase.`,
+          output,
+        };
+      }
+    }
+
     const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
     const ontoTreeId = await this.commits.getTree(onto);
     const ontoTree = await flatTree(this.trees, ontoTreeId);
@@ -788,6 +813,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
       await state.setRef("ORIG_HEAD", headId);
       await this.refsStore.set("HEAD", onto, this.startLog());
+      await runPostCheckoutHook(this.hooks, headId, onto, true);
       await this.finishBranch(headName, onto, onto);
       await unstash();
       return { status, newHead: onto, output };
@@ -1012,6 +1038,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await state.write(`${DIR}/end`, `${commands}\n`);
     await state.write(`${DIR}/msgnum`, "0\n");
     await this.refsStore.set("HEAD", start, this.startLog());
+    // checkout_onto's post-checkout hook: the HEAD left, the commit the picks start from
+    await runPostCheckoutHook(this.hooks, headId, start, true);
     // pick_commits runs the list as expanded (full command names), not as written
     return this.processTodo(state, worktree, output, todo);
   }
@@ -1113,7 +1141,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await this.flushRewrittenPending(state);
     // `git notes copy --for-rewrite=rebase` fed rewritten-list
     const rewritten = await state.read(`${DIR}/rewritten-list`);
-    if (rewritten) await copyNotesForRebase(this.notesContext(), rewritten);
+    if (rewritten) {
+      await copyNotesForRebase(this.notesContext(), rewritten);
+      // the post-rewrite hook told "rebase", rewritten-list on its stdin
+      await this.hooks.run("post-rewrite", { args: ["rebase"], stdin: rewritten });
+    }
     const autostash = (await state.read(`${DIR}/autostash`))?.trim();
     if (autostash) output.push(...(await applyAutostash(this.context(worktree), autostash)));
     await this.doUpdateRefs(state, output);
@@ -2758,19 +2790,21 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     if (await state.exists(`${DIR}/cdate_is_adate`)) {
       committer = { ...committer, timestamp: author.timestamp, tzOffset: author.tzOffset };
     }
+    const hooked = await sequencerPrepareMessage(this.hooks, state, message);
     const id = await this.commits.store({
       tree,
       parents,
       author,
       committer,
-      message,
+      message: hooked,
     });
     const action = reflogMessages.rebaseStep(this.reflogAction("rebase"), step);
     await this.refsStore.set(
       "HEAD",
       id,
-      this.reflogLine(reflogMessages.pick(action, message), this.committer),
+      this.reflogLine(reflogMessages.pick(action, hooked), this.committer),
     );
+    await sequencerPostCommit(this.hooks);
     return id;
   }
 

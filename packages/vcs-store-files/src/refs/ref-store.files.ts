@@ -16,6 +16,7 @@ import type {
   ReflogDeleteOptions,
   ReflogReader,
   Refs,
+  RefTransactionHook,
   RefUpdateResult,
   SymbolicRef,
   SymbolicRefLogOptions,
@@ -60,13 +61,28 @@ export class FileRefStore implements Refs {
   private readonly ops: FilesRefOps;
   private readonly atomic: AtomicFiles;
 
+  private transactionHook?: RefTransactionHook;
+
   constructor(
     private readonly files: FilesApi,
     private readonly gitDir: string,
     options: FileRefStoreOptions = {},
   ) {
     this.atomic = options.atomicFiles ?? atomicFilesOver(files, gitDir);
-    this.ops = createFilesRefOps(this.atomic, options);
+    this.ops = createFilesRefOps(this.atomic, {
+      ...options,
+      transactionHook: () => this.transactionHook,
+    });
+  }
+
+  /**
+   * Tells `hook` about each batch (`set`, `batch`, `compareAndSwap`) as git runs the
+   * reference-transaction hook: `preparing`, `prepared`, `committed`, `aborted`. Symbolic
+   * refs, removals (`remove`) and names outside `refs/` other than HEAD are written without
+   * it. Undefined removes it.
+   */
+  setTransactionHook(hook: RefTransactionHook | undefined): void {
+    this.transactionHook = hook;
   }
 
   /**

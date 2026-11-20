@@ -632,8 +632,12 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
             await transport.writeFlush();
           }
         }
-        // git ends a side-band answer with a flush, report or not
-        if (useSideband) await transport.writeFlush();
+        // git ends a side-band answer with a flush, report or not (after post-receive when
+        // its output is relayed)
+        if (useSideband) {
+          if (receivePackConfig(ctx).relayPostReceive) state.flushAfterPostReceive = true;
+          else await transport.writeFlush();
+        }
         state.reportSent = true;
         return "STATUS_SENT";
       } catch (e) {
@@ -650,7 +654,10 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const state = getState<ServerPushState>(ctx);
       const hook = receivePackHooks(ctx)?.postReceive;
       const applied = (state.appliedCommands ?? []).map(toReceiveCommand);
-      if (!hook || applied.length === 0) return "NO_HOOK";
+      if (!hook || applied.length === 0) {
+        await closeRelayedBand(ctx);
+        return "NO_HOOK";
+      }
       const hookCtx = hookContext(ctx);
       const task = async () => {
         try {
@@ -659,6 +666,12 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           logError(ctx, "post-receive hook failed", e);
         }
       };
+      if (receivePackConfig(ctx).relayPostReceive) {
+        await task();
+        await state.bandQueue;
+        await closeRelayedBand(ctx);
+        return "HOOK_STARTED";
+      }
       const afterReport = receivePackConfig(ctx).afterReport;
       if (afterReport) afterReport(task);
       else setTimeout(() => void task(), 0);
@@ -671,6 +684,8 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
  * Extended state for server push operations.
  */
 interface ServerPushState extends ProtocolState {
+  /** The side-band's closing flush waits for a relayed post-receive */
+  flushAfterPostReceive?: boolean;
   pushCommands?: PushCommand[];
   pushOptions?: string[];
   packStream?: AsyncIterable<Uint8Array>;
@@ -927,7 +942,9 @@ function enqueueBand(ctx: ProcessContext, write: () => Promise<void>): Promise<v
 /** Writes `text` on the progress channel (side-band only; nothing once the report is out). */
 function sendMessage(ctx: ProcessContext, text: string): Promise<void> {
   const state = getState<ServerPushState>(ctx);
-  if (!state.capabilities.has("side-band-64k") || state.reportSent || !text) {
+  // (after the report only while the band stays open for a relayed post-receive)
+  const closed = state.reportSent && !state.flushAfterPostReceive;
+  if (!state.capabilities.has("side-band-64k") || closed || !text) {
     return Promise.resolve();
   }
   const transport = getTransport(ctx);
@@ -1428,4 +1445,12 @@ async function applyOneByOne(
 
   state.appliedCommands = appliedCommands;
   return all.every((c) => c.result === "OK") ? "UPDATES_APPLIED" : "PARTIAL_APPLIED";
+}
+
+/** The side-band's closing flush SEND_STATUS left for after a relayed post-receive. */
+async function closeRelayedBand(ctx: ProcessContext): Promise<void> {
+  const state = getState<ServerPushState>(ctx);
+  if (!state.flushAfterPostReceive) return;
+  state.flushAfterPostReceive = false;
+  await getTransport(ctx).writeFlush();
 }

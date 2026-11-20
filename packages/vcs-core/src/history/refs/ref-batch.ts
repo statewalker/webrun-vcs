@@ -558,3 +558,41 @@ export function symrefReflogLine(
     message: log.message.replace(/\s+/g, " ").trim(),
   };
 }
+
+/** The states of a ref transaction a {@link RefTransactionHook} is told about (githooks(5)). */
+export type RefTransactionState = "preparing" | "prepared" | "committed" | "aborted";
+
+/** One update of a ref transaction, as git's reference-transaction hook is fed it. */
+export interface RefTransactionUpdate {
+  /** The name the command gave (`HEAD`) */
+  requested: string;
+  /** The ref written: the requested one, or the ref it dereferenced to */
+  name: string;
+  /** The command's expected old value: an id, `null` for "must not exist", none unchecked */
+  old?: ObjectId | null;
+  /** The value written; `null` deletes the ref */
+  new: ObjectId | null;
+}
+
+/**
+ * Told about each ref transaction of a store that supports it (`setTransactionHook`): before
+ * the locks (`preparing`), once every lock is held and checked (`prepared`), after the
+ * commit (`committed`), or when it is given up (`aborted`). Returning false (or the message
+ * to fail with) in `preparing` or `prepared` aborts the transaction: the store tells the hook
+ * `aborted`, then throws {@link RefTransactionAbortedError}.
+ */
+export type RefTransactionHook = (
+  state: RefTransactionState,
+  updates: readonly RefTransactionUpdate[],
+) => Promise<boolean | string | undefined>;
+
+/** A ref transaction its hook aborted (git: "in '<state>' phase, update aborted by ..."). */
+export class RefTransactionAbortedError extends Error {
+  constructor(
+    readonly state: "preparing" | "prepared",
+    message = `in '${state}' phase, update aborted by the reference-transaction hook`,
+  ) {
+    super(message);
+    this.name = "RefTransactionAbortedError";
+  }
+}

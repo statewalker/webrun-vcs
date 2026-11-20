@@ -8,6 +8,7 @@ import type {
   Ref,
   RefLogOptions,
   Refs,
+  RefTransactionHook,
   SymbolicRef,
   Tag,
   Tags,
@@ -48,6 +49,7 @@ import {
   type IdAbbreviator,
   worktreeModeTrust,
 } from "./commands/core-config.js";
+import { HookSession, nullIdLike } from "./commands/git-hooks.js";
 import {
   authorIdentOf,
   committerIdentOf,
@@ -293,6 +295,8 @@ export abstract class GitCommand<T> {
   private reflogActionOverride?: string;
   /** The time of this command's reflog lines, read once (git's ident_default_date). */
   private reflogClock?: number;
+  /** The hooks this command runs (made when first asked for) */
+  private hookSession?: HookSession;
 
   constructor(workingCopy: WorkingCopy) {
     this._workingCopy = workingCopy;
@@ -316,6 +320,38 @@ export abstract class GitCommand<T> {
       | undefined;
     if (!filter?.setAttributesSourceResolver || !this._workingCopy.history) return;
     filter.setAttributesSourceResolver(attributesSourceResolver(() => this.revisionResolver()));
+  }
+
+  /**
+   * The hooks this command runs (git's `run_hooks_opt`), through the host environment's
+   * `hookRunner`; with none, no hook runs.
+   */
+  protected get hooks(): HookSession {
+    if (!this.hookSession) this.hookSession = new HookSession(this._workingCopy);
+    return this.hookSession;
+  }
+
+  /**
+   * Runs this command's hooks in another command's session: a command that runs another
+   * (merge committing, rebase picking) gathers the output of both in one place.
+   */
+  shareHooksOf(source: GitCommand<unknown>): this {
+    this.hookSession = source.hooks;
+    return this;
+  }
+
+  /**
+   * What the hooks this command ran wrote, in order, with git's hints about hooks it ignored
+   * (`advice.ignoredHook`): git relays all of it on its stderr (a hook's stdout included,
+   * except for the hooks whose stdout git keeps apart). Empty when no hook ran.
+   */
+  getHookOutput(): string {
+    return this.hookSession?.output ?? "";
+  }
+
+  /** What the hooks whose stdout git keeps on its own stdout (pre-push) wrote there. */
+  getHookStdout(): string {
+    return this.hookSession?.stdout ?? "";
   }
 
   /**
@@ -652,7 +688,53 @@ export abstract class GitCommand<T> {
     if (!this._workingCopy.history) {
       throw new Error("WorkingCopy.history is required for commands");
     }
-    return wrapRefs(this._workingCopy.history.refs as unknown as Refs);
+    const refs = wrapRefs(this._workingCopy.history.refs as unknown as Refs);
+    this.installRefTransactionHook(refs);
+    return refs;
+  }
+
+  /** The reference-transaction hook this command installs on its ref store (made once). */
+  private refTransactionHook?: RefTransactionHook;
+
+  /**
+   * git's reference-transaction hook (refs.c `run_transaction_hook`) on a ref store that
+   * supports it (the files store): told `preparing` (2.5x), `prepared`, `committed` or
+   * `aborted` with an `<old> <new> <ref>` line per update (git 2.43 lists a symbolic ref the
+   * update went through, HEAD, ahead of the ref it names; 2.5x leaves it out); a refusal in
+   * `preparing` or `prepared` aborts the transaction. The command that last touched the store
+   * gathers the hook's output.
+   */
+  private installRefTransactionHook(refs: Refs): void {
+    const store = refs as { setTransactionHook?(hook: RefTransactionHook | undefined): void };
+    if (!store.setTransactionHook) return;
+    if (!this.hooks.enabled) return;
+    if (!this.refTransactionHook) {
+      const hooks = this.hooks;
+      this.refTransactionHook = async (state, updates) => {
+        const legacy = hooks.compatibility === "2.43";
+        if (state === "preparing" && legacy) return true;
+        const lines: string[] = [];
+        for (const u of updates) {
+          const zero = nullIdLike(u.new ?? u.old ?? undefined);
+          const line = (name: string) => `${u.old ?? zero} ${u.new ?? zero} ${name}\n`;
+          if (state === "preparing") lines.push(line(u.requested));
+          else {
+            if (legacy && u.requested !== u.name) lines.push(line(u.requested));
+            lines.push(line(u.name));
+          }
+        }
+        const result = await hooks.run("reference-transaction", {
+          args: [state],
+          stdin: lines.join(""),
+        });
+        if (!result || result.exitCode === 0 || state === "committed" || state === "aborted") {
+          return true;
+        }
+        // 2.43 dies with one message for every state
+        return legacy ? "ref updates aborted by hook" : false;
+      };
+    }
+    store.setTransactionHook(this.refTransactionHook);
   }
 
   /**

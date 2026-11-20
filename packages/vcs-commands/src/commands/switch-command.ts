@@ -265,6 +265,7 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     await this.refuseInProgress();
 
     const checkout = new CheckoutCommand(this._workingCopy)
+      .shareHooksOf(this)
       .setForced(this.force || this.discardChanges)
       .setProtectUntracked(!this.force)
       .setIgnoreOtherWorktrees(this.ignoreOtherWorktrees)

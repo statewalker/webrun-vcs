@@ -244,4 +244,10 @@ export interface ReceivePackConfig {
    * its stream first). Absent: the task starts on its own, detached.
    */
   afterReport?: (task: () => Promise<void>) => void;
+  /**
+   * Run post-receive as git's receive-pack does: after the report, before the side-band's
+   * closing flush, awaited, its messages relayed to the client (`remote: ` lines). Default
+   * false: detached, once the report is out (see {@link afterReport}).
+   */
+  relayPostReceive?: boolean;
 }

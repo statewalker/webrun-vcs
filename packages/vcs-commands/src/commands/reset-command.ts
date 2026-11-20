@@ -7,17 +7,22 @@ import {
 } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
+  applyStatUpdate,
   cacheTreeOfTree,
+  compareWithWorktree,
   copyCacheTree,
   entryStatOf,
   getWorktreeEntries,
   type IndexEntryOptions,
+  type IndexStatUpdate,
   invalidateCacheTreePath,
   type ResolveUndoRecord,
   type Staging,
   type StagingEntry,
+  statUpdateOf,
   type WorkingCopy,
   type Worktree,
+  withWorktreeEntries,
 } from "@statewalker/vcs-working-tree";
 
 import {
@@ -31,6 +36,7 @@ import { ResetMode } from "../types.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { addLeadingDirs, stageZeroClashes } from "./index-adder.js";
+import { configBool } from "./merge-config.js";
 import { flatTree, OperationState, rewriteIndex } from "./merge-support.js";
 import {
   DO_MATCH_DIRECTORY,
@@ -89,6 +95,36 @@ export class ResetCommand extends GitCommand<Ref> {
   private pathspecFromFile: string[] = [];
   private modeSet = false;
   private intentToAdd = false;
+  private quiet = false;
+  private noRefresh = false;
+  private readonly output: string[] = [];
+
+  /**
+   * `-q` / `--quiet`: a mixed reset does not list the files left with unstaged changes
+   * (refresh_index with `REFRESH_QUIET`: only unmerged paths, as `<path>: needs merge`), and
+   * gives no hint about a slow refresh. (`reset.quiet` is read by neither git 2.43 nor 2.5x.)
+   */
+  setQuiet(quiet: boolean): this {
+    this.checkCallable();
+    this.quiet = quiet;
+    return this;
+  }
+
+  /** `--no-refresh`: a mixed reset leaves the index's stat data as the reset wrote it. */
+  setNoRefresh(noRefresh: boolean): this {
+    this.checkCallable();
+    this.noRefresh = noRefresh;
+    return this;
+  }
+
+  /**
+   * What the reset printed on stdout, line by line: after a mixed reset (with paths too),
+   * git's "Unstaged changes after reset:" and a `M\t<path>` (`D`, `T`, `A`, `U`) line per
+   * file whose content differs from its entry. Read after {@link call}.
+   */
+  getOutput(): string[] {
+    return [...this.output];
+  }
 
   /**
    * Set the ref to reset to.
@@ -308,6 +344,10 @@ export class ResetCommand extends GitCommand<Ref> {
     if (this.mode === ResetMode.MIXED || this.mode === ResetMode.HARD) {
       await this.resetStaging(targetId);
     }
+    // a mixed reset refreshes the index and lists what is left unstaged
+    if (this.mode === ResetMode.MIXED && (await this.refreshAfterReset())) {
+      await this.staging.write();
+    }
 
     // Reset working tree (for HARD) - this DESTROYS uncommitted changes
     if (this.mode === ResetMode.HARD) {
@@ -371,9 +411,88 @@ export class ResetCommand extends GitCommand<Ref> {
     }
     const treeId = await this.resetTree(true);
     await this.readFromTree(treeId, items);
+    await this.refreshAfterReset();
     await this.staging.write();
     const headRef = await this.refsStore.resolve("HEAD");
     return headRef as Ref;
+  }
+
+  /**
+   * cmd_reset's refresh after a mixed reset (`refresh_index` with `REFRESH_IN_PORCELAIN`, or
+   * `REFRESH_QUIET` with `--quiet`): every stage-0 entry compared with its file, those still
+   * holding their content given the file's stat; the others listed under "Unstaged changes
+   * after reset:" (unmerged paths whatever the flag). Skip-worktree and assume-unchanged
+   * entries are taken as up to date. With git's hint when it took over two seconds
+   * (`advice.resetNoRefresh`). Whether any entry's stat changed (the index is to be written).
+   */
+  private async refreshAfterReset(): Promise<boolean> {
+    const worktree = this.worktreeAccess;
+    if (this.noRefresh || !worktree) return false;
+    const started = Date.now();
+    let first = true;
+    const show = (line: string) => {
+      if (!this.quiet && first) this.output.push("Unstaged changes after reset:");
+      first = false;
+      this.output.push(line);
+    };
+    const trust = worktreeModeTrust(this.workingCopy, worktree);
+    const indexTime = this.staging.getUpdateTime();
+    const entries: StagingEntry[] = [];
+    for await (const entry of this.staging.entryList?.() ?? this.staging.entries()) {
+      entries.push(entry);
+    }
+    const stated = (entry: StagingEntry) =>
+      entry.stage === 0 && !entry.skipWorktree && !entry.assumeValid;
+    const updates: IndexStatUpdate[] = [];
+    let lastUnmerged: string | undefined;
+    for await (const { item: entry, current } of withWorktreeEntries(worktree, entries, stated)) {
+      if (entry.stage !== 0) {
+        if (entry.path === lastUnmerged) continue;
+        lastUnmerged = entry.path;
+        show(this.quiet ? `${entry.path}: needs merge` : `U\t${entry.path}`);
+        continue;
+      }
+      if (entry.skipWorktree || entry.assumeValid) continue;
+      const compared = await compareWithWorktree(worktree, entry, { trust, indexTime }, current);
+      if (!compared.kind && !entry.intentToAdd) {
+        const update = statUpdateOf(entry, compared);
+        if (update && !update.smudge) updates.push(update);
+        continue;
+      }
+      if (this.quiet) continue;
+      const code =
+        compared.kind === "deleted"
+          ? "D"
+          : entry.intentToAdd
+            ? "A"
+            : compared.kind === "typechange"
+              ? "T"
+              : "M";
+      show(`${code}\t${entry.path}`);
+    }
+    if (updates.length > 0) {
+      const now = Date.now();
+      const editor = this.staging.createEditor();
+      for (const update of updates) {
+        editor.add({
+          path: update.path,
+          apply: (existing) => applyStatUpdate(existing, update, now) ?? existing,
+        });
+      }
+      await editor.finish();
+    }
+    const elapsed = Date.now() - started;
+    if (
+      !this.quiet &&
+      elapsed > 2000 &&
+      configBool(this.workingCopy, "advice.resetNoRefresh", true)
+    ) {
+      this.warnings.push(
+        `hint: It took ${(elapsed / 1000).toFixed(2)} seconds to refresh the index after reset.  You can use\n` +
+          "hint: '--no-refresh' to avoid this.",
+      );
+    }
+    return updates.length > 0;
   }
 
   /**

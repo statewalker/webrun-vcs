@@ -82,6 +82,20 @@ export interface PushClientOptions {
    * lengthened until unique among the local objects (`RepositoryFacade.abbrevLengths`).
    */
   abbrev?: number;
+  /**
+   * git's pre-push hook (transport.c `run_pre_push_hook`): called with every update once
+   * each has its status, before anything is sent (a dry run included); false refuses the
+   * whole push, which then throws {@link PushRefusedByHookError}
+   */
+  prePush?: (updates: readonly PushRefUpdate[]) => Promise<boolean>;
+}
+
+/** A push the pre-push hook refused (git: "failed to push some refs"): nothing was sent. */
+export class PushRefusedByHookError extends TransportError {
+  constructor(readonly updates: readonly PushRefUpdate[]) {
+    super("the pre-push hook refused the push");
+    this.name = "PushRefusedByHookError";
+  }
 }
 
 /** What a push did. */
@@ -213,6 +227,9 @@ async function sendPack(
     force: options.force,
     leases,
   });
+  if (options.prePush && !(await options.prePush(updates))) {
+    throw new PushRefusedByHookError(updates);
+  }
 
   // what the server allows (send_pack)
   if (!caps.has("delete-refs")) {
@@ -368,6 +385,17 @@ async function sendPack(
     }
   }
   for (const u of toSend) if (!reported.has(u)) setStatus(u, "remote-failure");
+  if (caps.has("side-band-64k") && result.unpack.ok) {
+    // git's demultiplexer reads the side-band to its end: what the server's hooks print
+    // after the report (post-receive, post-update) reaches onProgress
+    try {
+      while ((await report.read()) !== undefined) {
+        // channel 1 has nothing more; channel 2 goes to onProgress
+      }
+    } catch {
+      // the report is in: a broken tail changes nothing
+    }
+  }
   result.ok = result.unpack.ok && updates.every((u) => isPushSuccess(u.status));
   return result;
 }

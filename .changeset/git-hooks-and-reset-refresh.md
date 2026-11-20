@@ -1,0 +1,16 @@
+---
+"@statewalker/vcs-commands": minor
+"@statewalker/vcs-core": minor
+"@statewalker/vcs-store-files": minor
+"@statewalker/vcs-transport": minor
+"@statewalker/vcs-utils-node": minor
+"@statewalker/vcs-working-tree": minor
+---
+
+**git hooks run through a portable host interface, and `git reset` refreshes the index as git does.**
+
+- `GitHostEnvironment.hookRunner` (optional) executes hooks; the commands find them as git's `find_hook` does (`core.hooksPath`, relative to the worktree top, else `$GIT_DIR/hooks` of the common git directory) through the repository's FilesApi (`Worktree.getFiles`), and a hook that is not executable gets the `advice.ignoredHook` hint (worded as the runner's `compatibility` says, 2.43 or 2.5x). Without a runner no hook runs, as before. On Node, `createNodeHookRunner` (vcs-utils-node) spawns the script, its stdout joined to its stderr where git joins them; pass it as `createNodeGitHostEnvironment({ hookRunner })`.
+- Hooks wired: commit (`pre-commit`, `prepare-commit-msg`, `commit-msg`, `post-commit`, `post-rewrite` for `--amend`; `setNoVerify`), merge (`pre-merge-commit`, `prepare-commit-msg`, `commit-msg`, `post-merge`; a refusal leaves the merge for `git commit`), checkout, switch, restore, clone and worktree add (`post-checkout`, its exit code in the result), rebase (`pre-rebase`, the post-checkout of onto, the picks' `prepare-commit-msg` and `post-commit`, `post-rewrite` "rebase"), cherry-pick and revert (the sequencer's `prepare-commit-msg` and `post-commit`), am (`applypatch-msg`, `pre-applypatch`, `post-applypatch`), push (`pre-push`, which can stop the push: `HookFailedError`), the receive side of a local push (`pre-receive`, `update`, `post-receive`, `post-update`, `push-to-checkout` for `updateInstead`, their output relayed as "remote: " lines), and the files ref store's batches (`reference-transaction`: `preparing` in 2.5x, `prepared`, `committed`, `aborted`; a refusal throws `RefTransactionAbortedError`). Commands expose what hooks wrote with `getHookOutput()` / `getHookStdout()`.
+- A commit with a hook runner updates HEAD in one transaction expecting its parent, as git's `update_head_with_reflog`.
+- vcs-transport: `PushClientOptions.prePush` (and `PushRefusedByHookError`), `relayPostReceive` for receive-pack (post-receive awaited before the side-band closes, as git), and the push client reads the side-band to its end so messages after the report reach `onProgress`.
+- `git reset` (mixed, and with paths) refreshes the index's stat data and reports "Unstaged changes after reset:" with `M`/`D`/`T`/`A`/`U` lines (`ResetCommand.getOutput()`), as `refresh_index` does; `setQuiet` and `setNoRefresh` as `-q` and `--no-refresh`, with the slow-refresh hint (`advice.resetNoRefresh`).

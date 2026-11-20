@@ -16,6 +16,7 @@
  */
 
 import type { History, ObjectId } from "@statewalker/vcs-core";
+import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { LinkedWorktrees } from "../linked-worktrees/index.js";
 import type { UntrackedScanHost } from "../status/untracked-scan.js";
 import type { WorkingCopy } from "../working-copy.js";
@@ -411,6 +412,12 @@ export interface Worktree {
    * the worktree knows it: walks list it like any other directory unless it is named `.git`.
    */
   getGitDir?(): string | undefined;
+  /**
+   * The FilesApi the worktree and its git directory are paths of ({@link getRoot},
+   * {@link getGitDir}): where the commands look for hooks (`$GIT_DIR/hooks`,
+   * `core.hooksPath`). Absent for a worktree that keeps no files.
+   */
+  getFiles?(): FilesApi;
   refreshIgnore(): Promise<void>;
 }
 

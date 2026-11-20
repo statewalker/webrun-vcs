@@ -194,6 +194,7 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
         sparseWarnings: this.sparseWarnings,
         state: new OperationState(this.workingCopy.checkout, this.refsStore),
         resolve: (name) => this.resolveRef(name),
+        hooks: this.hooks,
       },
       {
         action: "pick",

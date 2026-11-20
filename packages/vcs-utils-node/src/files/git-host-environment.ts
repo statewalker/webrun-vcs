@@ -11,6 +11,7 @@ import { type FilesApi, readFile } from "@statewalker/vcs-utils/files";
 
 import { NodeFilesApi } from "@statewalker/webrun-files-node";
 
+import type { NodeHookRunner } from "./node-hook-runner.js";
 import { statHostFile } from "./posix-node-files-api.js";
 
 /** Where the files are; each defaults to the process environment, as git reads it. */
@@ -43,6 +44,11 @@ export interface NodeGitHostEnvironmentOptions {
    * composite or in-memory FilesApi to read them from elsewhere.
    */
   files?: FilesApi;
+  /**
+   * Runs the repository's hooks (`createNodeHookRunner`); absent: no hook runs, as before
+   * hooks were supported
+   */
+  hookRunner?: NodeHookRunner;
 }
 
 /** The environment as `GitHostEnvironment` describes it. */
@@ -70,6 +76,7 @@ export interface NodeGitHostEnvironment {
   notesRewriteRef?: string;
   notesRewriteMode?: string;
   pathspecs?: { literal?: string; glob?: string; noglob?: string; icase?: string };
+  hookRunner?: NodeHookRunner;
 }
 
 /**
@@ -211,5 +218,6 @@ export function createNodeGitHostEnvironment(
       : {}),
     // the global pathspec magic, as given (git_env_bool reads them when a pathspec is parsed)
     ...(pathspecs ? { pathspecs } : {}),
+    ...(options.hookRunner ? { hookRunner: options.hookRunner } : {}),
   };
 }

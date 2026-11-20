@@ -11,15 +11,19 @@ import {
   type Duplex,
   openDuplexConnection,
   openDuplexReceivePackConnection,
+  type ReceiveCommand,
   type ReceivePackConnection,
+  type ReceivePackHookContext,
+  type ReceivePackHooks,
   type ServerConfigSettings,
   serveOverDuplex,
   serverSettingsFromConfig,
   type UploadPackConnection,
 } from "@statewalker/vcs-transport";
+import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { LinkedWorktrees, OpenedRepository, WorkingCopy } from "@statewalker/vcs-working-tree";
-
 import { TransportError } from "../errors/index.js";
+import { HookSession, hookHostOf } from "./git-hooks.js";
 import { ReadTreeCommand } from "./read-tree-command.js";
 import { StatusCommand } from "./status-command.js";
 import { usesBranch, worktreeUsingBranch } from "./worktree-support.js";
@@ -361,7 +365,10 @@ export async function pushToDeploy(
 export async function withLocalReceivePack<T>(
   remote: OpenedRepository,
   run: (connection: ReceivePackConnection) => Promise<T>,
+  /** The remote repository's hooks ({@link remoteHookSession}): pre-receive, update, ... */
+  hooks?: HookSession,
 ): Promise<T> {
+  const receiveHooks = hooks?.enabled ? scriptReceiveHooks(hooks) : undefined;
   const head = await remote.history.refs.get("HEAD").catch(() => undefined);
   const settings = serverSettingsOf(remote);
   const checkedOut = await checkedOutBranches(remote.worktrees);
@@ -380,9 +387,15 @@ export async function withLocalReceivePack<T>(
     denyDeleteCurrent: settings.denyDeleteCurrent,
     shallowUpdate: settings.shallowUpdate,
     receivePackHideRefs: settings.receivePackHideRefs,
+    ...(receiveHooks ? { hooks: receiveHooks, relayPostReceive: true } : {}),
     ...(checkedOut ? { checkedOutBranches: checkedOut } : {}),
     ...(worktrees
-      ? { updateWorktree: (ref: string, newOid: string) => pushToDeploy(worktrees, ref, newOid) }
+      ? {
+          updateWorktree: async (ref: string, newOid: string) => {
+            const verdict = await pushToCheckout(hooks, worktrees, ref, newOid);
+            return verdict === null ? pushToDeploy(worktrees, ref, newOid) : verdict;
+          },
+        }
       : {}),
   }).finally(() => server.close?.());
   try {
@@ -396,4 +409,113 @@ export async function withLocalReceivePack<T>(
     await client.close?.();
     await serving.catch(() => undefined);
   }
+}
+
+/**
+ * The hooks of a repository a local push reaches (git's receive-pack runs them there): found
+ * in its git directory (or its `core.hooksPath`), run in its git directory, through the host
+ * environment of the working copy pushing. Undefined without a runner or a FilesApi.
+ */
+export function remoteHookSession(
+  workingCopy: WorkingCopy,
+  remote: OpenedRepository,
+): HookSession | undefined {
+  const local = hookHostOf(workingCopy);
+  if (!local.environment()?.hookRunner) return undefined;
+  let files: FilesApi | undefined;
+  try {
+    files = (workingCopy.worktree as { getFiles?(): FilesApi } | undefined)?.getFiles?.();
+  } catch {
+    files = undefined;
+  }
+  if (!files) return undefined;
+  const gitDir = remote.gitDir.replace(/^\/+/, "").replace(/\/+$/, "");
+  const top = !remote.bare && gitDir.endsWith("/.git") ? gitDir.slice(0, -5) : gitDir;
+  const setting = (key: string) => {
+    const values = remote.config?.getAll(key) ?? [];
+    const last = values[values.length - 1];
+    return last === null ? "" : last;
+  };
+  return new HookSession({
+    // receive-pack works in the git directory (enter_repo), with GIT_DIR=.
+    layout: async () => ({ files: files as FilesApi, top, gitDir, cwd: gitDir, bare: remote.bare }),
+    configValue: setting,
+    environment: () => local.environment(),
+  });
+}
+
+/**
+ * receive-pack's `push_to_checkout` (`receive.denyCurrentBranch=updateInstead`): when the
+ * push-to-checkout hook exists it updates the worktree in place of git's own push-to-deploy,
+ * told the pushed commit, with `GIT_DIR` and `GIT_WORK_TREE` the worktree's (absolute):
+ * undefined when it accepts, git's "push-to-checkout hook declined" when it refuses; null
+ * when there is no hook (push-to-deploy decides).
+ */
+async function pushToCheckout(
+  hooks: HookSession | undefined,
+  worktrees: LinkedWorktrees,
+  ref: string,
+  newOid: string,
+): Promise<string | undefined | null> {
+  if (!hooks?.enabled || !(await hooks.exists("push-to-checkout"))) return null;
+  const wt = await worktreeUsingBranch(worktrees, ref);
+  if (!wt || wt.bare) return "denyCurrentBranch = updateInstead needs a worktree";
+  const gitDir = await hooks.hostGitDir();
+  const env: Record<string, string> = { GIT_WORK_TREE: wt.path };
+  // absolute_path(get_worktree_git_dir): receive-pack's own git directory is ".", so the
+  // main worktree's reads `<git dir>/.`
+  if (gitDir) env.GIT_DIR = wt.id ? `${gitDir}/worktrees/${wt.id}` : `${gitDir}/.`;
+  const result = await hooks.run("push-to-checkout", { args: [newOid], env, prefix: false });
+  return result && result.exitCode !== 0 ? "push-to-checkout hook declined" : undefined;
+}
+
+/**
+ * receive-pack's hooks as scripts (builtin/receive-pack.c `run_receive_hook`,
+ * `run_update_hook`, `run_update_post_hook`): pre-receive and post-receive read
+ * `<old> <new> <ref>` lines on stdin (with `GIT_PUSH_OPTION_COUNT` and the options), update
+ * is told one ref, post-update the refs that moved; each runs with `GIT_DIR=.` and its
+ * output goes to the pushing user (side-band, git's "remote: " lines).
+ */
+function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
+  const lines = (commands: readonly ReceiveCommand[]) =>
+    commands.map((c) => `${c.oldOid} ${c.newOid} ${c.refName}\n`).join("");
+  const optionEnv = (ctx: ReceivePackHookContext) => {
+    const env: Record<string, string> = { GIT_PUSH_OPTION_COUNT: String(ctx.pushOptions.length) };
+    ctx.pushOptions.forEach((option, i) => {
+      env[`GIT_PUSH_OPTION_${i}`] = option;
+    });
+    return env;
+  };
+  const run = async (
+    name: string,
+    ctx: ReceivePackHookContext,
+    options: { args?: string[]; stdin?: string; env?: Record<string, string> },
+  ) => {
+    const result = await hooks.run(name, {
+      ...options,
+      env: { GIT_DIR: ".", ...(options.env ?? {}) },
+      prefix: false,
+    });
+    if (result?.stderr) await ctx.message(result.stderr);
+    return result;
+  };
+  return {
+    preReceive: async (commands, ctx) => {
+      const result = await run("pre-receive", ctx, {
+        stdin: lines(commands),
+        env: optionEnv(ctx),
+      });
+      return !result || result.exitCode === 0;
+    },
+    update: async (refName, oldOid, newOid, ctx) => {
+      const result = await run("update", ctx, { args: [refName, oldOid, newOid] });
+      return !result || result.exitCode === 0;
+    },
+    postReceive: async (commands, ctx) => {
+      await run("post-receive", ctx, { stdin: lines(commands), env: optionEnv(ctx) });
+      if (commands.length > 0) {
+        await run("post-update", ctx, { args: commands.map((c) => c.refName) });
+      }
+    },
+  };
 }

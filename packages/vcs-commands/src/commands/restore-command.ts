@@ -22,8 +22,14 @@ import type { ConflictStyle } from "@statewalker/vcs-utils";
 
 import { InvalidArgumentError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
-import { type CheckoutResult, type CheckoutStage, pathCheckoutResult } from "./checkout-command.js";
+import {
+  type CheckoutResult,
+  type CheckoutStage,
+  CheckoutStatus,
+  pathCheckoutResult,
+} from "./checkout-command.js";
 import { runPathCheckout } from "./checkout-paths.js";
+import { runPostCheckoutHook } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { globalPathspecMagic, parsePathspecFile } from "./pathspec.js";
 
@@ -192,6 +198,12 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
         ),
       );
     const worktree = this.worktreeAccess;
-    return worktree?.batch ? worktree.batch(run) : run();
+    const result = await (worktree?.batch ? worktree.batch(run) : run());
+    // checkout_paths' post-checkout hook (`<HEAD> <HEAD> 0`), as for `git checkout -- <paths>`
+    if (!this.hooks.enabled) return result;
+    if (result.status !== CheckoutStatus.OK && result.exitCode === undefined) return result;
+    const head = (await this.refsStore.resolve("HEAD"))?.objectId;
+    const code = await runPostCheckoutHook(this.hooks, head, head, false);
+    return code !== 0 && result.exitCode === undefined ? { ...result, exitCode: code } : result;
   }
 }

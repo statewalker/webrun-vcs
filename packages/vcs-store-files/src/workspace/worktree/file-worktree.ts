@@ -1634,6 +1634,10 @@ export class FileWorktree implements Worktree {
     return this.gitDir;
   }
 
+  getFiles(): WorktreeFilesApi {
+    return this.rootFiles;
+  }
+
   async refreshIgnore(): Promise<void> {
     this.repositoryExcludesLoaded = false;
     await this.loadRepositoryExcludes();

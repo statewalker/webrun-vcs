@@ -72,6 +72,7 @@ import {
 } from "./branch-tracking.js";
 import { type CheckoutPathsOutcome, runPathCheckout } from "./checkout-paths.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { runPostCheckoutHook } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { OperationState, updateIndexCacheTree } from "./merge-support.js";
 import { globalPathspecMagic, parsePathspecFile } from "./pathspec.js";
@@ -616,18 +617,44 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
 
     // path checkout, or branch checkout; one worktree batch, so the checks and the writes
     // share one reading of the ignore rules
-    const run = () =>
-      this.allPaths || this.paths.length > 0 || this.pathspecFromFile.length > 0
-        ? this.checkoutPaths()
-        : this.checkoutBranch();
+    const pathCheckout = this.allPaths || this.paths.length > 0 || this.pathspecFromFile.length > 0;
+    const oldHead = this.hooks.enabled
+      ? (await this.refsStore.resolve("HEAD"))?.objectId
+      : undefined;
+    const run = () => (pathCheckout ? this.checkoutPaths() : this.checkoutBranch());
     const worktree = this.worktreeAccess;
-    const result = await (worktree?.batch ? worktree.batch(run) : run());
+    let result = await (worktree?.batch ? worktree.batch(run) : run());
     const autostash = this.autostashSwitch;
     if (autostash) {
       const done = await this.switchWithAutostash(autostash.label, autostash.base);
-      if (done) return done;
+      if (done) result = done;
     }
-    return result;
+    return this.withPostCheckoutHook(result, oldHead, pathCheckout);
+  }
+
+  /**
+   * The post-checkout hook after a switch (`<old> <new> 1`) or a path checkout (`<HEAD>
+   * <HEAD> 0`) that went through; a non-zero exit becomes the result's `exitCode`, as git's
+   * exit status.
+   */
+  private async withPostCheckoutHook(
+    result: CheckoutResult,
+    oldHead: ObjectId | undefined,
+    pathCheckout: boolean,
+  ): Promise<CheckoutResult> {
+    if (!this.hooks.enabled || this.noPostCheckout) return result;
+    if (result.status !== CheckoutStatus.OK && result.exitCode === undefined) return result;
+    const newHead = (await this.refsStore.resolve("HEAD"))?.objectId;
+    const code = await runPostCheckoutHook(
+      this.hooks,
+      pathCheckout ? newHead : oldHead,
+      newHead,
+      !pathCheckout,
+    );
+    // a switch exits 1 for a failing hook (`ret || writeout_error`), a path checkout with
+    // the hook's code (`errs |= ...`)
+    const exitCode = pathCheckout ? code : 1;
+    return code !== 0 && result.exitCode === undefined ? { ...result, exitCode } : result;
   }
 
   /**
@@ -796,9 +823,18 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     await this.staging.write();
   }
 
+  /** The switch an autostash switch makes again: its caller runs post-checkout once. */
+  private noPostCheckout = false;
+  private withoutPostCheckout(): this {
+    this.noPostCheckout = true;
+    return this;
+  }
+
   /** This checkout's settings on a new command (without `merge`). */
   private copy(): CheckoutCommand {
     const copy = new CheckoutCommand(this._workingCopy)
+      .shareHooksOf(this)
+      .withoutPostCheckout()
       .setCreateBranch(this.createBranch)
       .setForceCreateBranch(this.forceCreateBranch)
       .setOrphan(this.orphan)

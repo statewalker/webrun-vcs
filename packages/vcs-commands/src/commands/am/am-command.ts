@@ -142,6 +142,7 @@ export class AmCommand extends GitCommand<AmResult> {
   private messageId?: boolean;
   private scissors?: boolean;
   private quiet = false;
+  private noVerify = false;
   private utf8 = true;
   private ignoreDate = false;
   private committerDateIsAuthorDate = false;
@@ -226,6 +227,13 @@ export class AmCommand extends GitCommand<AmResult> {
   /** `-c` / `--scissors`, `--no-scissors`. */
   setScissors(value: boolean): this {
     this.scissors = value;
+    return this;
+  }
+
+  /** `--no-verify`: the applypatch-msg and pre-applypatch hooks do not run. */
+  setNoVerify(value: boolean): this {
+    this.checkCallable();
+    this.noVerify = value;
     return this;
   }
 
@@ -619,7 +627,7 @@ export class AmCommand extends GitCommand<AmResult> {
         );
         await this.write("final-commit", msg);
       }
-      const msg = st.msg as string;
+      let msg = st.msg as string;
       let toKeep = false;
       if (await this.patchIsEmpty()) {
         if (this.emptyMode === "drop") {
@@ -635,6 +643,22 @@ export class AmCommand extends GitCommand<AmResult> {
           this.out += "Patch is empty.\n";
           await this.dieUserResolve();
         }
+      }
+      // run_applypatch_msg_hook (not with --no-verify): it may edit final-commit, which is
+      // read back; a refusal stops the am with its state kept
+      if (!this.noVerify) {
+        const hooked = await this.runAmHook("applypatch-msg", [
+          await this.hooks.gitPath(`${DIR}/final-commit`),
+        ]);
+        if (hooked && hooked.exitCode !== 0) throw new AmStop(1);
+      }
+      if (this.hooks.enabled) {
+        const text = await this.read("final-commit");
+        if (text === undefined) {
+          this.fatal(`'.git/${DIR}/final-commit' was deleted by the applypatch-msg hook`);
+        }
+        msg = text;
+        st.msg = text;
       }
       if (!toKeep) {
         this.say(`Applying: ${this.firstLine(msg)}`);
@@ -833,7 +857,23 @@ export class AmCommand extends GitCommand<AmResult> {
     return 0;
   }
 
+  /** Runs an am hook, its output (git's stderr) added to the am's in order. */
+  private async runAmHook(name: string, args: string[] = []) {
+    if (!this.hooks.enabled) return undefined;
+    const before = this.hooks.output.length;
+    const result = await this.hooks.run(name, { args });
+    this.err += this.hooks.output.slice(before);
+    return result;
+  }
+
   private async doCommit(st: AmState): Promise<void> {
+    // do_commit's pre-applypatch (not with --no-verify): a refusal exits 1, the patch applied
+    // and the am stopped (the index git commits is the one in memory: what the hook changed
+    // in the index file is not seen)
+    if (!this.noVerify && this.hooks.enabled) {
+      const pre = await this.runAmHook("pre-applypatch");
+      if (pre && pre.exitCode !== 0) throw new AmStop(1);
+    }
     const tree = await this.staging.writeTree(this.trees);
     const head = await this.headId();
     if (!head) {
@@ -898,6 +938,7 @@ export class AmCommand extends GitCommand<AmResult> {
       // the subject as the mail had it, before commit_tree's UTF-8 fixup
       this.reflogLine(`${action}: ${latin1ToPath(this.firstLine(st.msg as string))}`, committer),
     );
+    await this.runAmHook("post-applypatch");
   }
 
   private async resolve(st: AmState, allowEmpty: boolean): Promise<AmResult> {

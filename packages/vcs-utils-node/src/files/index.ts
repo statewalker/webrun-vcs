@@ -38,4 +38,5 @@ export function createNodeFilesApi(options: {
 }
 
 export * from "./git-host-environment.js";
+export * from "./node-hook-runner.js";
 export { NodeFilesApi, openRepositoryFiles, PosixNodeFilesApi };

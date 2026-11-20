@@ -28,4 +28,10 @@ export interface CloneResult {
    * worktree, as with git's "the following paths have collided" warning.
    */
   collidedPaths?: string[];
+
+  /**
+   * The post-checkout hook's exit code when it failed: git's clone exits with it (the clone
+   * itself stands)
+   */
+  hookExitCode?: number;
 }

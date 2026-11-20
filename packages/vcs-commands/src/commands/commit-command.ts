@@ -19,6 +19,7 @@ import {
 import {
   EmptyCommitError,
   GitApiError,
+  HookFailedError,
   IncompatibleOptionsError,
   IndexLockFailedError,
   InvalidArgumentError,
@@ -141,6 +142,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private resetAuthor = false;
   private amend = false;
   private noPostRewrite = false;
+  private noVerify = false;
   private allowEmpty = false;
   private parents: ObjectId[] = [];
   private onlyPaths: string[] = [];
@@ -290,6 +292,16 @@ export class CommitCommand extends GitCommand<CommitResult> {
   setNoPostRewrite(noPostRewrite: boolean): this {
     this.checkCallable();
     this.noPostRewrite = noPostRewrite;
+    return this;
+  }
+
+  /**
+   * `-n` / `--no-verify`: the `pre-commit` and `commit-msg` hooks do not run
+   * (`prepare-commit-msg` and `post-commit` still do, as in git).
+   */
+  setNoVerify(noVerify: boolean): this {
+    this.checkCallable();
+    this.noVerify = noVerify;
     return this;
   }
 
@@ -629,6 +641,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
       author: PersonIdent;
       committer: PersonIdent;
       authorKept: boolean;
+      /** The variables of the commit hooks */
+      hookEnv: Record<string, string>;
     },
     editor: CommitEditor,
   ): Promise<{ message: string; cleanup: CleanupMode; untouched: boolean }> {
@@ -756,12 +770,25 @@ export class CommitCommand extends GitCommand<CommitResult> {
     if (!committable && whence !== "merge" && !this.allowEmpty && !(this.amend && isMerge)) {
       throw new EmptyCommitError();
     }
-    const edited = await editor("COMMIT_EDITMSG", template);
-    let text: string;
-    if (typeof edited === "string") {
-      await state.write("COMMIT_EDITMSG", edited);
-      text = edited;
-    } else text = (await state.read("COMMIT_EDITMSG")) ?? "";
+    // prepare-commit-msg, the editor over what it left, then commit-msg
+    let text = "";
+    let edited: unknown;
+    const hookArgs = this.prepareMessageHookArgs(
+      mergeMsg,
+      squashMsg,
+      fromTemplate ? templateText : undefined,
+      ctx.mergeHeads,
+      ctx.pickHead,
+    );
+    const ran = await this.runMessageHooks(ctx.hookEnv, hookArgs, async () => {
+      const current = this.hooks.enabled
+        ? ((await state.read("COMMIT_EDITMSG")) ?? template)
+        : template;
+      edited = await editor("COMMIT_EDITMSG", current);
+      if (typeof edited === "string") await state.write("COMMIT_EDITMSG", edited);
+    });
+    if (typeof edited === "string" && !ran) text = edited;
+    else text = (await state.read("COMMIT_EDITMSG")) ?? "";
     // cleanup_message
     if (verbose > 0 || mode === CleanupMode.SCISSORS) {
       const cut = `${comment} ------------------------ >8 ------------------------\n`;
@@ -1090,6 +1117,17 @@ export class CommitCommand extends GitCommand<CommitResult> {
       throw new NoMessageError();
     }
 
+    // prepare_to_commit's pre-commit hook (not with --no-verify), over the index the commit
+    // records (the lock `-a` and a partial commit wrote); a hook that ran may have changed
+    // the index, which is read again (git's discard_index + read_index_from)
+    const hookEnv = await this.commitHookEnv(editorLike, index);
+    if (!this.noVerify && this.hooks.enabled) {
+      if (index) await index.write();
+      if ((await this.runCommitHook("pre-commit", hookEnv)) && !index) {
+        await this.staging.read();
+      }
+    }
+
     // Determine parents
     let parents: ObjectId[];
     if (this.parents.length > 0) {
@@ -1194,6 +1232,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
           author,
           committer,
           authorKept: !this.author && !this.resetAuthor && (!!previousCommit || !!pickHead),
+          hookEnv,
         },
         editor,
       );
@@ -1218,7 +1257,19 @@ export class CommitCommand extends GitCommand<CommitResult> {
       if (cleanup !== CleanupMode.VERBATIM) sb = stripspace(sb);
       await state.write("COMMIT_EDITMSG", sb);
       await this.refuseNothingToCommit(treeId, parents, mergeHeads, previousCommit);
+      // prepare-commit-msg and commit-msg, which may rewrite COMMIT_EDITMSG: the commit
+      // takes the file's text (cmd_commit reads it back)
+      const hookArgs = this.prepareMessageHookArgs(
+        await state.read("MERGE_MSG"),
+        await state.read("SQUASH_MSG"),
+        undefined,
+        mergeHeads,
+        pickHead,
+      );
       let text = sb;
+      if (await this.runMessageHooks(hookEnv, hookArgs, undefined)) {
+        text = (await state.read("COMMIT_EDITMSG")) ?? "";
+      }
       // cleanup_message: cut at the scissors line with -v (commit.verbose)
       if (this.verboseLevel() > 0) {
         const comment = commentPrefixOf(this.workingCopy, sb);
@@ -1252,6 +1303,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       state,
       amendedId,
       commitIndex: index ? () => index.commit() : undefined,
+      editorUsed: editorLike,
     });
   }
 
@@ -1293,6 +1345,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
       amendedId: ObjectId | undefined;
       /** Renames the index lock over the index, once HEAD has moved (git's commit_index_files) */
       commitIndex?: () => Promise<void>;
+      /** An editor edited the message (git's use_editor): hooks get no `GIT_EDITOR=:` */
+      editorUsed?: boolean;
     },
   ): Promise<CommitResult> {
     const { author, committer, finalMessage, state, amendedId } = info;
@@ -1321,11 +1375,21 @@ export class CommitCommand extends GitCommand<CommitResult> {
             ? "cherry-pick"
             : undefined;
     const action = this.hasReflogAction() ? this.reflogAction("commit") : undefined;
-    await updateHead(
-      this.refsStore,
-      commitId,
-      this.reflogLine(reflogMessages.commit(kind, finalMessage, action), committer),
-    );
+    const log = this.reflogLine(reflogMessages.commit(kind, finalMessage, action), committer);
+    if (this.hooks.enabled) {
+      // update_head_with_reflog: one transaction on HEAD expecting the commit's parent (none
+      // for an initial commit), as the reference-transaction hook sees it
+      const current = (await this.refsStore.resolve("HEAD"))?.objectId;
+      const result = await this.refsStore.batch(
+        [{ name: "HEAD", old: current ?? null, new: commitId }],
+        log,
+      );
+      if (!result.ok) {
+        throw new GitApiError(
+          `fatal: cannot lock ref 'HEAD': ${result.rejected.map((r) => r.reason).join(", ")}`,
+        );
+      }
+    } else await updateHead(this.refsStore, commitId, log);
 
     this.setCallable(false);
 
@@ -1334,14 +1398,108 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // a merge's autostash
     await this.cleanupAfterCommit(state, info.commitIndex);
 
-    // commit_post_rewrite: the amended commit's notes carried over (notes.rewriteRef)
+    // the post-commit hook, over the index (whatever the commit recorded)
+    if (this.hooks.enabled) {
+      await this.hooks.run("post-commit", {
+        env: await this.commitHookEnv(info.editorUsed ?? false, undefined),
+      });
+    }
+
+    // commit_post_rewrite: the amended commit's notes carried over (notes.rewriteRef), then
+    // the post-rewrite hook told "amend" with "<old> <new>" on stdin
     if (amendedId && !this.noPostRewrite) {
       // git exports the amend's author (determine_author_info): the notes commit's too
       await copyNotesForAmend(this.notesContext(), amendedId, commitId, commit.author);
+      if (this.hooks.enabled) {
+        await this.hooks.run("post-rewrite", {
+          args: ["amend"],
+          stdin: `${amendedId} ${commitId}\n`,
+        });
+      }
     }
 
     // Return commit with its ID (like JGit's RevCommit)
     return { ...commit, id: commitId };
+  }
+
+  /**
+   * The variables of the commit hooks (git's `run_commit_hook`): `GIT_INDEX_FILE` names the
+   * index the commit records (the lock `-a` and a partial commit write; git's false index of
+   * a partial commit is not kept as a file here), and `GIT_EDITOR=:` tells a hook that no
+   * editor runs.
+   */
+  private async commitHookEnv(
+    editorUsed: boolean,
+    index: HeldIndex | undefined,
+  ): Promise<Record<string, string>> {
+    if (!this.hooks.enabled) return {};
+    return {
+      GIT_INDEX_FILE: index
+        ? await this.hooks.gitPath("index.lock", true)
+        : await this.hooks.gitPath("index"),
+      ...(editorUsed ? {} : { GIT_EDITOR: ":" }),
+    };
+  }
+
+  /** Runs a hook that can refuse the commit; whether it ran. */
+  private async runCommitHook(
+    name: string,
+    env: Record<string, string>,
+    args: string[] = [],
+  ): Promise<boolean> {
+    const result = await this.hooks.run(name, { args, env });
+    if (result && result.exitCode !== 0) {
+      throw new HookFailedError(
+        name,
+        result.exitCode,
+        `the ${name} hook refused the commit (exit code ${result.exitCode})`,
+        this.hooks.output,
+      );
+    }
+    return result !== undefined;
+  }
+
+  /**
+   * The arguments of prepare-commit-msg after the message file (prepare_to_commit's
+   * hook_arg1 and hook_arg2): where the message came from.
+   */
+  private prepareMessageHookArgs(
+    mergeMsg: string | undefined,
+    squashMsg: string | undefined,
+    templateText: string | undefined,
+    mergeHeads: ObjectId[],
+    pickHead: ObjectId | undefined,
+  ): string[] {
+    if (this.message !== undefined) return ["message"];
+    // --amend without a message reuses HEAD's (git's use_message = "HEAD")
+    if (this.amend) return ["commit", "HEAD"];
+    if (mergeMsg !== undefined) return [squashMsg !== undefined ? "squash" : "merge"];
+    if (squashMsg !== undefined) return ["squash"];
+    if (templateText !== undefined) return ["template"];
+    if (mergeHeads.length > 0) return ["merge"];
+    if (pickHead) return ["commit", "CHERRY_PICK_HEAD"];
+    return [];
+  }
+
+  /**
+   * prepare-commit-msg, the editor (when one runs) and commit-msg (not with --no-verify)
+   * over COMMIT_EDITMSG, in prepare_to_commit's order; whether any hook ran (the file is then
+   * to be read back). A non-zero commit-msg refuses the commit, as does prepare-commit-msg.
+   */
+  private async runMessageHooks(
+    env: Record<string, string>,
+    args: string[],
+    edit: (() => Promise<void>) | undefined,
+  ): Promise<boolean> {
+    if (!this.hooks.enabled) {
+      await edit?.();
+      return false;
+    }
+    const file = await this.hooks.gitPath("COMMIT_EDITMSG");
+    let ran = await this.runCommitHook("prepare-commit-msg", env, [file, ...args]);
+    await edit?.();
+    if (!this.noVerify) ran = (await this.runCommitHook("commit-msg", env, [file])) || ran;
+    return ran;
   }
 
   /** The commits MERGE_HEAD names (one per line), none without a merge in progress. */
