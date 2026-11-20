@@ -18,14 +18,9 @@ import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
 import {
-  AttributesResolver,
-  type AttributesSourceTree,
-  attributesSourceSetting,
+  type AttributesResolver,
   type ContentAttributesContext,
   expandUserPath,
-  readTreeAttributesFile,
-  resolveAttributesSource,
-  xdgConfigPath,
 } from "@statewalker/vcs-working-tree";
 
 import { GitApiError, IncompatibleOptionsError } from "../errors/index.js";
@@ -33,7 +28,7 @@ import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type CombinedDiffOptions, writeCombinedDiff } from "../results/combined-diff.js";
 import { quotePath } from "../results/quote-path.js";
-import { attributesSourceResolver } from "./attributes-source.js";
+import { bareAttributesResolver } from "./attributes-source.js";
 import { DiffCommand, type DiffTextOptions } from "./diff-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import {
@@ -1751,56 +1746,14 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 
   private bareResolver?: AttributesResolver;
 
-  /**
-   * The attributes of a bare repository: builtin, system, global and `info/attributes`, and
-   * the in-tree files of an attribute source.
-   */
+  /** The attributes of a bare repository (see {@link bareAttributesResolver}). */
   private bareAttributes(): AttributesResolver {
-    if (this.bareResolver) return this.bareResolver;
-    const environment = hostEnvironmentOf(this._workingCopy);
-    const gitDir = (this._workingCopy.config as { hostGitDir?: string } | undefined)?.hostGitDir;
-    const read = (file: string | undefined) =>
-      file && environment ? environment.readFile(file).catch(() => undefined) : undefined;
-    let source: Promise<AttributesSourceTree | undefined> | undefined;
-    this.bareResolver = new AttributesResolver(
-      {
-        system: async () => read(environment?.systemAttributes),
-        global: async () => {
-          const configured = configValue(this._workingCopy, "core.attributesFile");
-          return read(
-            configured
-              ? expandUserPath(configured, environment)
-              : xdgConfigPath(environment, "attributes"),
-          );
-        },
-        info: async () =>
-          read(gitDir ? `${gitDir.replace(/\/+$/, "")}/info/attributes` : undefined),
-        // only from an attribute source (`$GIT_ATTR_SOURCE`, `attr.tree`)
-        inTree: async (dir) => {
-          source ??= (async () => {
-            const setting = attributesSourceSetting(
-              environment?.attrSource,
-              configValue(this._workingCopy, "attr.tree"),
-            );
-            if (!setting) return undefined;
-            return resolveAttributesSource(
-              setting,
-              attributesSourceResolver(() => this.revisionResolver()),
-            );
-          })();
-          const found = await source;
-          if (!found) return undefined;
-          const file = await readTreeAttributesFile(
-            this.trees,
-            this.blobs,
-            found.tree,
-            dir ? `${dir}/.gitattributes` : ".gitattributes",
-          );
-          return file ? { key: `blob:${file.id}`, content: file.content } : undefined;
-        },
-      },
-      { ignoreCase: configBool(this._workingCopy, "core.ignoreCase", false) },
-    );
+    this.bareResolver ??= bareAttributesResolver({
+      workingCopy: this._workingCopy,
+      trees: this.trees,
+      blobs: this.blobs,
+      revisions: () => this.revisionResolver(),
+    });
     return this.bareResolver;
   }
 

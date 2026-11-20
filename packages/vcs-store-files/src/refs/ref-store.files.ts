@@ -20,7 +20,7 @@ import type {
   SymbolicRef,
   SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
-import { isUpdatableRefName, SYMREF_PREFIX } from "@statewalker/vcs-core";
+import { isRefObjectId, isUpdatableRefName, SYMREF_PREFIX } from "@statewalker/vcs-core";
 import { type AtomicFiles, atomicFilesOver } from "@statewalker/vcs-utils/files";
 
 import {
@@ -178,6 +178,11 @@ export class FileRefStore implements Refs {
    * `refLockTimeoutMs`) with the ref unchanged.
    */
   async set(refName: string, objectId: ObjectId, log?: RefLogOptions): Promise<void> {
+    // a direct value is an object id: a name written here (HEAD holding "main\n") leaves a
+    // repository no git can open; the batch refuses it too, this covers ORIG_HEAD and kin
+    if (!isRefObjectId(objectId)) {
+      throw new RefUpdateRejectedError([{ name: refName, reason: "invalid-object-id" }]);
+    }
     if (!isUpdatableRefName(refName)) return this.ops.writeLoose(refName, `${objectId}\n`);
     const r = await this.ops.batch([{ name: refName, new: objectId, noDeref: true }], log);
     if (!r.ok) throw new RefUpdateRejectedError(r.rejected);

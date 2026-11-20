@@ -31,6 +31,7 @@ import {
   compareRefNames,
   createReflogReaderOf,
   deleteReflogLine,
+  isRefObjectId,
   isUpdatableRefName,
   planRefBatch,
   planReflog,
@@ -254,6 +255,10 @@ export class KVRefStore implements Refs {
    * it as git does (see {@link Refs.set}).
    */
   async set(refName: string, objectId: ObjectId, log?: RefLogOptions): Promise<void> {
+    // a direct value is an object id, never a name (see isRefObjectId)
+    if (!isRefObjectId(objectId)) {
+      throw new Error(`cannot update ${refName}: ${refName}: invalid-object-id`);
+    }
     if (log && isUpdatableRefName(refName)) {
       const r = await this.batch([{ name: refName, new: objectId, noDeref: true }], log);
       if (!r.ok) {

@@ -59,7 +59,7 @@ export class AddFailedError<R = unknown> extends GitApiError {
      */
     readonly warnings: readonly string[] = [],
   ) {
-    super(message, { defaultExitCode: 1 });
+    super(message, { exitCode: 1 });
     this.name = "AddFailedError";
   }
 }

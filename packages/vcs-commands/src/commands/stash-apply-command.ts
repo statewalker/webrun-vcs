@@ -874,35 +874,47 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
    * Resolve the stash reference to a commit ID.
    */
   private async resolveStashRef(): Promise<ObjectId> {
-    const refName = this.stashRef ?? `${STASH_REF}@{0}`;
+    // git's parse_stash_revision: no stash named and none kept is "No stash entries found."
+    // (exit 1 on git 2.43, 128 on 2.5x: cmd_stash maps a failure to die's status); a bare
+    // number n is refs/stash@{n}
+    if (this.stashRef === undefined) {
+      const top = await this.refsStore.resolve(STASH_REF);
+      if (!top?.objectId) {
+        throw new RefNotFoundError(STASH_REF, "No stash entries found.").withExitCode(128);
+      }
+    }
+    const given = this.stashRef ?? `${STASH_REF}@{0}`;
+    const refName = /^\d+$/.test(given) ? `${STASH_REF}@{${given}}` : given;
+    // get_stash_info: a revision naming nothing is "error: <rev> is not a valid reference"
+    const invalid = () =>
+      new RefNotFoundError(refName, `error: ${refName} is not a valid reference`).withExitCode(128);
 
     // Handle stash@{N} syntax
     const match = refName.match(/^(.+)@\{(\d+)\}$/);
     if (match) {
-      let baseRef = match[1];
-      const index = parseInt(match[2], 10);
+      const written = match[1] ?? "";
+      const baseRef = written === "stash" ? STASH_REF : written;
+      const index = parseInt(match[2] ?? "0", 10);
+      const ref = await this.refsStore.resolve(baseRef);
+      if (!ref?.objectId) throw invalid();
 
-      // Normalize stash to refs/stash
-      if (baseRef === "stash") {
-        baseRef = STASH_REF;
-      }
+      // For index 0, just the ref
+      if (index === 0) return ref.objectId;
 
-      // For index 0, just resolve the ref
-      if (index === 0) {
-        const ref = await this.refsStore.resolve(baseRef);
-        if (!ref?.objectId) {
-          throw new RefNotFoundError(refName);
-        }
-        return ref.objectId;
-      }
-
-      // Older entries are in the ref's reflog (stash@{n}), as git reads them
+      // Older entries are in the ref's reflog (stash@{n}), as git reads them; one beyond
+      // the log dies in get_oid (exit 128 on every version)
       const reflog = await this.refsStore.getReflog?.(baseRef);
       if (!reflog) {
         throw new RefNotFoundError(refName, `Stash entry ${index} not found (no reflog)`);
       }
       const entry = await reflog.getReverseEntry(index);
-      if (!entry) throw new RefNotFoundError(refName, `Stash entry ${index} not found`);
+      if (!entry) {
+        const count = (await reflog.getReverseEntries()).length;
+        throw new RefNotFoundError(
+          refName,
+          `fatal: log for '${written}' only has ${count} entries`,
+        );
+      }
       return entry.newId;
     }
 
@@ -917,7 +929,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       return refName;
     }
 
-    throw new RefNotFoundError(refName);
+    throw invalid();
   }
 }
 

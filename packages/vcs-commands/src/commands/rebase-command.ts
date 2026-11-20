@@ -18,6 +18,7 @@ import {
   NoHeadError,
   NoRebaseInProgressError,
   RebaseTodoMissingError,
+  RefNotFoundError,
   UpstreamRequiredError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
@@ -286,11 +287,14 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private nextCommand?: RebaseAction;
 
   /**
-   * Set the upstream commit to rebase onto.
+   * Set the upstream to rebase onto: a commit id or any revision (`main`, `HEAD~2`,
+   * `v1.0`), resolved to a commit when the rebase starts (git's `lookup_commit_reference`
+   * of `<upstream>`; "fatal: invalid upstream '<name>'" when it names none). The name given
+   * is kept for the reflog and the messages (`checkout main`).
    *
-   * @param upstream Upstream commit ID
+   * @param upstream Upstream commit ID or revision
    */
-  setUpstream(upstream: ObjectId): this {
+  setUpstream(upstream: ObjectId | string): this {
     this.checkCallable();
     this.upstreamCommit = upstream;
     this.upstreamCommitName = upstream;
@@ -304,9 +308,25 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
    */
   async setUpstreamBranch(upstream: string): Promise<this> {
     this.checkCallable();
-    this.upstreamCommit = await this.resolveRef(upstream, (n) => `fatal: invalid upstream '${n}'`);
+    this.upstreamCommit = await this.resolveUpstream(upstream);
     this.upstreamCommitName = upstream;
     return this;
+  }
+
+  /**
+   * builtin/rebase.c's `lookup_commit_reference_by_name(options.upstream_name)`: the commit
+   * an upstream names, or git's "fatal: invalid upstream '<name>'" (exit 128).
+   */
+  private async resolveUpstream(name: string): Promise<ObjectId> {
+    const fatal = (n: string) => `fatal: invalid upstream '${n}'`;
+    try {
+      return await this.resolveRef(name, fatal);
+    } catch (error) {
+      if (error instanceof RefNotFoundError) {
+        throw new RefNotFoundError(name, fatal(name)).withExitCode(128);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -653,6 +673,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   ): Promise<RebaseResult> {
     if (!this.upstreamCommit && !this.root) {
       throw new UpstreamRequiredError("Upstream commit is required for rebase BEGIN operation");
+    }
+    // the upstream as given (setUpstream takes a name too) peeled to the commit it names
+    // before anything is written, so HEAD is never set to a name ("main\n" in .git/HEAD)
+    if (this.upstreamCommit) {
+      this.upstreamCommit = await this.resolveUpstream(this.upstreamCommit);
     }
     if (await this.inProgress(state)) {
       return {

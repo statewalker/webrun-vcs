@@ -158,6 +158,36 @@ const ROWS: Row[] = [
     ours: (r) => r.add().addFilepattern("x.log").call(),
   },
   {
+    name: "add: an ignored file named like a prefix ('fatal: x.log', the last line)",
+    cls: AddFailedError,
+    setup: (d) => {
+      putFile(d, "fatal: x.log", "l\n");
+      git(d, ["config", "advice.addIgnoredFile", "false"]);
+    },
+    native: ["add", "fatal: x.log"],
+    ours: (r) => r.add().addFilepattern("fatal: x.log").call(),
+  },
+  {
+    name: "add: an ignored file named like a prefix ('usage: y.log')",
+    cls: AddFailedError,
+    setup: (d) => {
+      putFile(d, "usage: y.log", "l\n");
+      git(d, ["config", "advice.addIgnoredFile", "false"]);
+    },
+    native: ["add", "usage: y.log"],
+    ours: (r) => r.add().addFilepattern("usage: y.log").call(),
+  },
+  {
+    name: "add: ignored files named like prefixes, with the advice",
+    cls: AddFailedError,
+    setup: (d) => {
+      putFile(d, "fatal: x.log", "l\n");
+      putFile(d, "usage: y.log", "l\n");
+    },
+    native: ["add", "fatal: x.log", "usage: y.log"],
+    ours: (r) => r.add().addFilepattern("fatal: x.log").addFilepattern("usage: y.log").call(),
+  },
+  {
     name: "add: no pathspec (a message, exit status 0)",
     cls: NoFilepatternError,
     native: ["add"],
@@ -346,5 +376,15 @@ describeGit("error exit codes: as native git", () => {
     expect(new GitApiError("fatal: x", { exitCode: 3 }).exitCode).toBe(3);
     expect(new EmptyCommitError().exitCode).toBe(1);
     expect(new InvalidArgumentError("a", 1, "error: x").withExitCode(128).exitCode).toBe(128);
+    // only git's prefixes count: usage:/error: on the first line, fatal: on the last (or
+    // first) line, never a path a message lists in between; a class's status beats them
+    expect(new GitApiError("Ignored:\nusage: y.log\nhint: use -f").exitCode).toBe(128);
+    expect(new GitApiError("Ignored:\nfatal: x.log\nhint: use -f").exitCode).toBe(128);
+    expect(new GitApiError("error: a\n  fatal: x.log\nhint: h").exitCode).toBe(1);
+    expect(new GitApiError("fatal: a\nhint: h").exitCode).toBe(128);
+    expect(new GitApiError("x\nfatal: y").exitCode).toBe(128);
+    expect(new AddFailedError("Ignored:\nfatal: x.log").exitCode).toBe(1);
+    expect(new AddFailedError("Ignored:\nusage: y.log").exitCode).toBe(1);
+    expect(new EmptyCommitError("fatal: x").exitCode).toBe(1);
   });
 });

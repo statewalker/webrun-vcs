@@ -51,7 +51,7 @@ export class PushRejectedException extends TransportError {
 
   constructor(refName: string, reason: string, uri?: string) {
     // git push exits 1 when a ref is rejected
-    super(`${refName}: ${reason}`, uri, { defaultExitCode: 1 });
+    super(`${refName}: ${reason}`, uri, { exitCode: 1 });
     this.name = "PushRejectedException";
     this.refName = refName;
     this.reason = reason;

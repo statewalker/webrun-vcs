@@ -533,15 +533,14 @@ describe.each(backends)("StashDropCommand ($name backend)", ({ factory }) => {
   /**
    * Test dropping when no stash exists.
    */
-  it("should return undefined when no stash to drop", async () => {
+  it("refuses to drop when there is no stash, as git (clear returns undefined)", async () => {
     const { git, workingCopy } = await createInitializedGit();
 
     await addFile(workingCopy, "file.txt", "content");
     await git.commit().setMessage("initial").call();
 
-    const result = await git.stashDrop().call();
-
-    expect(result).toBeUndefined();
+    await expect(git.stashDrop().call()).rejects.toThrow("No stash entries found.");
+    expect(await git.stashDrop().setAll(true).call()).toBeUndefined();
   });
 
   /**
@@ -702,7 +701,7 @@ describe.each(backends)("StashDropCommand ($name backend)", ({ factory }) => {
     await addFile(workingCopy, "file.txt", "content");
     await git.commit().setMessage("initial").call();
 
-    const command = git.stashDrop();
+    const command = git.stashDrop().setAll(true);
     await command.call();
 
     // Attempting to call again should throw
@@ -935,7 +934,9 @@ describe.each(backends)(
       // dropping stash@{0} moves refs/stash to the next entry
       expect(await git.stashDrop().call()).toBe(ids[0]);
       expect((await repository.refs.resolve("refs/stash"))?.objectId).toBe(ids[0]);
-      await expect(git.stashDrop().setStashRef(3).call()).rejects.toThrow("stash@{3}");
+      await expect(git.stashDrop().setStashRef(3).call()).rejects.toThrow(
+        "fatal: log for 'stash' only has 1 entries",
+      );
       // the last drop deletes refs/stash and its reflog
       expect(await git.stashDrop().call()).toBeUndefined();
       expect(await repository.refs.get("refs/stash")).toBeUndefined();

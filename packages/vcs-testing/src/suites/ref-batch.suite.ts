@@ -176,6 +176,36 @@ export function createRefBatchTests(
       expect(await snapshot(refs)).toBe("");
     });
 
+    it("refuses a direct value that is no object id, writing nothing", async () => {
+      // a name written as a value (HEAD holding "main\n") leaves a ref git cannot read
+      await seed(["refs/heads/a", oid(1)]);
+      const headBefore = await refs.get("HEAD");
+      const bads = [
+        "main",
+        "refs/heads/a",
+        oid(1).slice(0, 39),
+        oid(1).toUpperCase(),
+        "b".repeat(64),
+        "",
+      ];
+      for (const bad of bads) {
+        const r = await refs.batch([{ name: "refs/heads/a", new: bad }]);
+        expect(r.ok, bad).toBe(false);
+        expect(r.rejected, bad).toContainEqual({
+          name: "refs/heads/a",
+          reason: "invalid-object-id",
+        });
+        const swap = await refs.compareAndSwap("refs/heads/a", oid(1), bad);
+        expect(swap.success, bad).toBe(false);
+        await expect(refs.set("refs/heads/a", bad), bad).rejects.toThrow(/invalid-object-id/);
+        await expect(refs.set("HEAD", bad), bad).rejects.toThrow(/invalid-object-id/);
+        await expect(refs.set("ORIG_HEAD", bad), bad).rejects.toThrow(/invalid-object-id/);
+      }
+      expect((await refs.resolve("refs/heads/a"))?.objectId).toBe(oid(1));
+      expect(await refs.get("HEAD")).toEqual(headBefore);
+      expect(await refs.get("ORIG_HEAD")).toBeUndefined();
+    });
+
     itMulti("refuses directory/file conflicts as git does", async () => {
       await seed(["refs/x", oid(1)], ["refs/p/q", oid(2)]);
       // git refuses a create below an existing ref even when the same batch deletes it.

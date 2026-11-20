@@ -532,8 +532,8 @@ describe("Merge Integration", () => {
 
       // Start merge
       await transformationStore.merge.begin({
-        mergeHead: "abc123",
-        origHead: "def456",
+        mergeHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         squash: false,
         noFastForward: false,
       });

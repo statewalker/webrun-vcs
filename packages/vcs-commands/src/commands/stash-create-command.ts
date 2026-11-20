@@ -394,16 +394,20 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
       );
     }
     let items: PathspecItem[] = [];
+    /** Untracked files dir.c's walk does not reach (`:(attr:...)` on their directories) */
+    let unreachable = new Set<string>();
     if (this.pathspec.length > 0) {
       try {
         items = parsePathspec(this.pathspec, { attr: true });
       } catch (error) {
         throw new InvalidArgumentError("path", this.pathspec, `fatal: ${(error as Error).message}`);
       }
-      await this.loadPathspecAttributes(items, headCommit.tree);
+      unreachable = await this.loadPathspecAttributes(items, headCommit.tree);
     }
     const pathFilter =
-      items.length > 0 ? (path: string) => matchPathspec(items, path, 0) > 0 : undefined;
+      items.length > 0
+        ? (path: string) => !unreachable.has(path) && matchPathspec(items, path, 0) > 0
+        : undefined;
     if (items.length > 0 && !this.includeUntracked) {
       // every element must name something the index tracks (git's report_path_error)
       const seen = items.map(() => 0);
@@ -560,20 +564,41 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   /**
    * `:(attr:...)` elements: the attributes of every path the stash and its reset match (the
    * index's, HEAD's and, with `-u`/`-a`, the worktree's files), read before they are matched.
+   * Returns the untracked files git's untracked walk never reaches: dir.c's
+   * `treat_directory` enters an untracked directory only when it matches the pathspec as a
+   * leading path (`DO_MATCH_LEADING_PATHSPEC`) by its own name and attributes.
    */
-  private async loadPathspecAttributes(items: PathspecItem[], headTree: ObjectId): Promise<void> {
+  private async loadPathspecAttributes(
+    items: PathspecItem[],
+    headTree: ObjectId,
+  ): Promise<Set<string>> {
+    const unreachable = new Set<string>();
     const worktree = this.worktreeAccess;
     const attributes = PathspecAttributes.forWorktree(items, worktree);
-    if (!attributes) return;
+    if (!attributes) return unreachable;
     const paths: string[] = [];
-    for await (const entry of this.staging.entries()) paths.push(entry.path);
+    const indexPaths = new Set<string>();
+    for await (const entry of this.staging.entries()) {
+      paths.push(entry.path);
+      indexPaths.add(entry.path);
+    }
     paths.push(...(await flatTree(this.trees, headTree)).keys());
+    await attributes.load(paths);
     if (this.includeUntracked && worktree) {
+      const trackedDirs = new Set<string>();
+      for (const path of indexPaths) {
+        for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
+          trackedDirs.add(path.slice(0, at));
+        }
+      }
       for await (const entry of worktree.walk({ includeIgnored: this.includeIgnored })) {
-        if (!entry.isDirectory) paths.push(entry.path);
+        if (entry.isDirectory || indexPaths.has(entry.path)) continue;
+        if (!(await attributes.reachable(items, entry.path, trackedDirs))) {
+          unreachable.add(entry.path);
+        }
       }
     }
-    await attributes.load(paths);
+    return unreachable;
   }
 
   /** The elements as git names them (`item->original` with prefix magic), the implicit "." too. */

@@ -698,6 +698,8 @@ export abstract class GitCommand<T> {
    * with the index when the command writes it. Nothing is stat'ed outside a sparse checkout.
    */
   protected async clearPresentSkipWorktree(): Promise<void> {
+    // a bare repository's working copy refuses its worktree: asked without touching it
+    if (!("worktree" in this._workingCopy)) return;
     const worktree = this._workingCopy.worktree;
     if (!worktree || !this._workingCopy.config) return;
     const config = RemoteConfigStore.from(this._workingCopy);

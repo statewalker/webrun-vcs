@@ -8,7 +8,7 @@ export class PathNotInIndexError extends GitApiError {
   readonly path: string;
 
   constructor(path: string, message?: string) {
-    super(message ?? `Path not in index: ${path}`, { defaultExitCode: 1 });
+    super(message ?? `Path not in index: ${path}`, { exitCode: 1 });
     this.name = "PathNotInIndexError";
     this.path = path;
   }
@@ -22,7 +22,7 @@ export class PathNotFoundInTreeError extends GitApiError {
   readonly treeish?: string;
 
   constructor(path: string, treeish?: string, message?: string) {
-    super(message ?? `Path not found in tree: ${path}`, { defaultExitCode: 1 });
+    super(message ?? `Path not found in tree: ${path}`, { exitCode: 1 });
     this.name = "PathNotFoundInTreeError";
     this.path = path;
     this.treeish = treeish;

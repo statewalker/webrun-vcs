@@ -1,5 +1,6 @@
 import {
   type Commit,
+  EMPTY_TREE_ID,
   FileMode,
   type ObjectId,
   type PersonIdent,
@@ -529,8 +530,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
    * `git commit --dry-run` (and `--short`, `--porcelain`, `--long`, `-z`, which imply it):
    * the status of what would be committed, in the format set, with git's exit code (0
    * when there is something to commit, else 1). The index is prepared as the commit would
-   * prepare it (`-a` stages the tracked changes, {@link setOnly} builds the index of HEAD
-   * with the named paths), then left as it was (rollback_index_files).
+   * prepare it (`-a` stages the tracked changes, {@link setInclude} the named tracked paths,
+   * {@link setOnly} builds the index of HEAD with the named paths), then left as it was
+   * (rollback_index_files).
    *
    * @example
    * ```typescript
@@ -544,6 +546,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // ... and git_diff_ui_config: a diff.submodule without a value dies
     readDiffSubmoduleConfig(this.workingCopy);
     await this.readCurrentIndex();
+    // `-i` refuses what it refuses for a commit, before anything is read
+    if (this.include) this.checkIncludeOptions();
     const state = new OperationState(this.workingCopy.checkout, this.refsStore);
     const mergeHeads = await this.mergeHeads(state);
     const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
@@ -562,7 +566,16 @@ export class CommitCommand extends GitCommand<CommitResult> {
         amend: this.amend,
       });
     let result: StatusTextResult;
-    if (this.all) {
+    if (this.include) {
+      // `-i <paths>`: the tracked paths staged on the held index, shown, then rolled back
+      const index = await this.holdIndex();
+      try {
+        await this.stageTrackedChanges(this.includePaths);
+        result = await run();
+      } finally {
+        await index.release();
+      }
+    } else if (this.all) {
       const index = await this.holdIndex();
       try {
         await this.stageTrackedChanges();
@@ -607,6 +620,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
       mergeHeads: ObjectId[];
       pickHead: ObjectId | undefined;
       partialTree: ObjectId | undefined;
+      /** The tree the commit records */
+      treeId: ObjectId;
+      /** HEAD, or HEAD^1 when amending (none: an initial commit, or a root amended) */
+      firstParent: ObjectId | undefined;
       previousCommit: Commit | undefined;
       author: PersonIdent;
       committer: PersonIdent;
@@ -724,11 +741,13 @@ export class CommitCommand extends GitCommand<CommitResult> {
       committable = status.committable;
       template += p.out + status.text;
     } else {
-      const run = () => this.commitStatus({ format: "porcelain" });
-      const status = ctx.partialTree
-        ? await this.withIndexOfTree(ctx.partialTree, run)
-        : await run();
-      committable = status.committable;
+      // no status in the template: prepare_to_commit's index_differs_from against HEAD
+      // (HEAD^1 when amending), intent-to-add entries invisible; without that parent,
+      // `cache_nr - ita_nr > 0`. The recorded tree says both without a status run.
+      const parentTree = ctx.firstParent
+        ? (await this.commits.load(ctx.firstParent))?.tree
+        : EMPTY_TREE_ID;
+      committable = ctx.treeId !== parentTree;
     }
     // COMMIT_EDITMSG written in full, then an empty commit refused before the editor runs
     await state.write("COMMIT_EDITMSG", template);
@@ -946,6 +965,19 @@ export class CommitCommand extends GitCommand<CommitResult> {
    * tracked paths are staged until HEAD has moved.
    */
   private async commitIncluded(): Promise<CommitResult> {
+    this.checkIncludeOptions();
+    const index = await this.holdIndex();
+    try {
+      await this.stageTrackedChanges(this.includePaths);
+      return await this.commitWith(false, index);
+    } catch (error) {
+      await index.release();
+      throw error;
+    }
+  }
+
+  /** `-i <paths>`: parse_and_validate_options' and prepare_index's refusals. */
+  private checkIncludeOptions(): void {
     if (this.onlyPaths.length > 0) {
       throw new IncompatibleOptionsError(
         ["-i/--include", "-o/--only"],
@@ -964,14 +996,6 @@ export class CommitCommand extends GitCommand<CommitResult> {
         [],
         "fatal: No paths with --include/--only does not make sense.",
       );
-    }
-    const index = await this.holdIndex();
-    try {
-      await this.stageTrackedChanges(this.includePaths);
-      return await this.commitWith(false, index);
-    } catch (error) {
-      await index.release();
-      throw error;
     }
   }
 
@@ -1163,6 +1187,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
           mergeHeads,
           pickHead,
           partialTree,
+          treeId,
+          firstParent: parents[0],
           previousCommit,
           author,
           committer,
@@ -1230,7 +1256,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
 
   /**
    * prepare_to_commit's refusal of a commit with nothing to commit: the tree is its first
-   * parent's (HEAD's, HEAD^1's when amending), unless a merge is concluded, empty commits are
+   * parent's (HEAD's, HEAD^1's when amending), or empty without a first parent, unless a merge is concluded, empty commits are
    * allowed, or a merge commit is amended.
    */
   private async refuseNothingToCommit(
@@ -1239,7 +1265,14 @@ export class CommitCommand extends GitCommand<CommitResult> {
     mergeHeads: ObjectId[],
     previousCommit: Commit | undefined,
   ): Promise<void> {
-    if (this.allowEmpty || parents.length === 0 || mergeHeads.length > 0) return;
+    if (this.allowEmpty || mergeHeads.length > 0) return;
+    if (parents.length === 0) {
+      // no first parent (an initial commit, or --amend of a root commit): git counts the
+      // index, `cache_nr - ita_nr > 0`; only intent-to-add entries (or none) leave the tree
+      // empty
+      if (treeId === EMPTY_TREE_ID) throw new EmptyCommitError();
+      return;
+    }
     if (this.amend && (previousCommit?.parents.length ?? 0) > 1) return;
     const parentCommit = await this.commits.load(parents[0] as ObjectId);
     if (parentCommit && parentCommit.tree === treeId) throw new EmptyCommitError();

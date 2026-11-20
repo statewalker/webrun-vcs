@@ -11,6 +11,7 @@ import {
   type FetchDisplayEntry,
   type FetchHeadEntry,
   type FetchRefUpdate,
+  fetchFromConnection,
   fetchRefcolWidth,
   fetchUpdateDisplay,
   formatFetchDisplay,
@@ -20,6 +21,7 @@ import {
   parseRefSpec,
   type RefSpec,
   type TagMode,
+  type FetchOptions as TransportFetchOptions,
   fetch as transportFetch,
   transportSummaryWidth,
   ZERO_OID,
@@ -38,6 +40,7 @@ import {
 } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import { localRemotePath, openLocalRemote, withLocalUploadPack } from "./local-transport.js";
 import { worktreeUsingBranch } from "./worktree-support.js";
 
 /**
@@ -622,12 +625,19 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const errors: string[] = [];
     const trackingUpdates: TrackingRefUpdate[] = [];
 
+    // transport_get: smart HTTP, or git's local transport (upload-pack of the repository at
+    // the path, in process); anything else fails in git's words. The remote is reached
+    // before FETCH_HEAD is touched (transport_get_remote_refs comes first in do_fetch)
+    const localPath = localRemotePath(remoteUrl);
+    const localRemote =
+      localPath === undefined ? undefined : await openLocalRemote(this.workingCopy, localPath);
+
     // git truncates FETCH_HEAD when the fetch starts: a failed fetch leaves it empty
     const checkout = this._workingCopy.checkout;
     const writesFetchHead = !this.dryRun && this.writeFetchHead && !!checkout?.writeFetchHead;
     if (writesFetchHead && !this.appendFetchHead) await checkout.writeFetchHead?.("");
 
-    const result = await transportFetch({
+    const fetchOptions: TransportFetchOptions = {
       url: remoteUrl,
       auth: this.credentials,
       headers: this.headers,
@@ -676,7 +686,13 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       ),
       reflogIdent: this.reflogLine("").ident,
       abbrev: parseCoreAbbrev(store.value("core.abbrev")) ?? -1,
-    });
+    };
+    const result =
+      localRemote === undefined
+        ? await transportFetch(fetchOptions)
+        : await withLocalUploadPack(localRemote, (connection) =>
+            fetchFromConnection(connection, fetchOptions),
+          );
 
     const advertisedRefs = new Map<string, ObjectId>();
     for (const ref of result.remoteRefs) {

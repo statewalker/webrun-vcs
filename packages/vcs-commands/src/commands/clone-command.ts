@@ -2,16 +2,19 @@ import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import {
   createRepositoryFacade,
   createTransportRefStore,
+  fetchFromConnection,
   type RefspecResolver,
+  type FetchOptions as TransportFetchOptions,
   fetch as transportFetch,
 } from "@statewalker/vcs-transport";
-import type { Worktree } from "@statewalker/vcs-working-tree";
+import type { OpenedRepository, Worktree } from "@statewalker/vcs-working-tree";
 
 import {
   CloneCheckoutError,
   InvalidArgumentError,
   InvalidRemoteError,
   RefNotFoundError,
+  TransportError,
 } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import type { CloneResult } from "../results/clone-result.js";
@@ -19,6 +22,7 @@ import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js"
 import { TransportCommand } from "../transport-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
+import { localRemotePath, openLocalRemote, withLocalUploadPack } from "./local-transport.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
 import { SparseCheckoutCommand } from "./sparse-checkout-command.js";
@@ -404,6 +408,22 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       );
     }
 
+    // a local source is opened before anything is written (git's "does not appear to be a
+    // git repository" leaves no clone behind)
+    const localPath = localRemotePath(this.uri);
+    let localRemote: OpenedRepository | undefined;
+    if (localPath !== undefined) {
+      try {
+        localRemote = await openLocalRemote(this.workingCopy, localPath);
+      } catch (error) {
+        // clone.c: a path (no URL) where no repository is found is "does not exist" (git
+        // tells an existing non-repository apart; here both read so); a file:// URL goes to
+        // upload-pack, which fails as for fetch
+        if (this.uri.startsWith("file://")) throw error;
+        throw new TransportError(`fatal: repository '${this.uri}' does not exist`);
+      }
+    }
+
     // Determine clone branch strategy
     const branchesToClone = this.mirror || this.cloneAllBranches ? [] : this.branchesToClone;
     const branchToClone = toBranchName(this.branch ?? branchesToClone[0]);
@@ -485,7 +505,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         ? "all"
         : toTagMode(this.tagOption);
 
-    const result = await transportFetch({
+    const fetchOptions: TransportFetchOptions = {
       url: this.uri,
       auth: this.credentials,
       headers: this.headers,
@@ -501,7 +521,15 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       onProgress: this.progressMessageCallback,
       // git's write_remote_refs: one initial transaction, no reflog
       skipReflog: true,
-    });
+    };
+    // transport_get: smart HTTP, or git's local transport (upload-pack of the repository at
+    // the path, in process); anything else fails in git's words
+    const result =
+      localRemote === undefined
+        ? await transportFetch(fetchOptions)
+        : await withLocalUploadPack(localRemote, (connection) =>
+            fetchFromConnection(connection, fetchOptions),
+          );
     const cloneLog = this.reflogLine(reflogMessages.clone(this.uri));
     const trackingUpdates: TrackingRefUpdate[] = result.refUpdates.map(toTrackingRefUpdate);
 

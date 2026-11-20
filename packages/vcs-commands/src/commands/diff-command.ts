@@ -50,6 +50,7 @@ import {
   writePairPatch,
 } from "../results/diff-output.js";
 import { quotePath } from "../results/quote-path.js";
+import { bareAttributesResolver } from "./attributes-source.js";
 import { worktreeModeTrust } from "./core-config.js";
 import { textconvRunnerOf } from "./diff-textconv.js";
 import { matchPathspec, type PathspecItem, parsePathspecItem } from "./pathspec.js";
@@ -801,7 +802,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const failed = "(diff failed)\n";
     // `git diff` runs in the submodule's directory: one that holds no repository of its own
     // runs it in the superproject, which lacks the submodule's commits
-    if (!sub.populated && (await this.worktreeAccess?.getEntry(path))?.isDirectory) {
+    if (!sub.populated && (await this.worktreeIfAny?.getEntry(path))?.isDirectory) {
       sink.text(failed);
       return;
     }
@@ -828,7 +829,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     options: DiffOutputOptions,
     lengths: ReadonlyMap<string, number> | undefined,
   ): Promise<void> {
-    const worktree = this.worktreeAccess;
+    const worktree = this.worktreeIfAny;
     const driver = await options.driver?.(c.path);
     // combine-diff.c's grab_blob: a gitlink's or a deleted side's content is not converted
     const textconv = driver?.textconv;
@@ -886,7 +887,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    * as they are (the entry's `readNew`, which reads it cleaned)
    */
   private withTextconvInputs(pair: DiffFilePair, entry: DiffEntry): DiffFilePair {
-    const worktree = this.worktreeAccess;
+    const worktree = this.worktreeIfAny;
     if (!worktree) return pair;
     const blob = (side: DiffFilePair["old"]) =>
       side && { ...side, readTextconvInput: () => this.smudged(side.path, side.mode, side.read) };
@@ -910,7 +911,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   ): Promise<Uint8Array> {
     const content = await read();
     return collectChunks(
-      await smudgeContent(this.worktreeAccess?.contentFilter, path, content, mode),
+      await smudgeContent(this.worktreeIfAny?.contentFilter, path, content, mode),
     );
   }
 
@@ -948,7 +949,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private get sides(): DiffSides {
     if (this.newTree) return "trees";
     if (this.cached) return "cached";
-    if (!this.worktreeAccess) return "trees";
+    if (!this.worktreeIfAny) return "trees";
     return this.oldTree ? "commit-worktree" : "index-worktree";
   }
 
@@ -1015,7 +1016,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     environment: GitHostEnvironment | undefined,
   ): Promise<Uint8Array | undefined> {
     if (path.startsWith("/")) return environment?.readFile(path);
-    const worktree = this.worktreeAccess;
+    const worktree = this.worktreeIfAny;
     if (!worktree || path.split("/").includes("..")) {
       const base = worktree
         ? (worktree as { hostPath?: string }).hostPath
@@ -1040,11 +1041,19 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     }
   }
 
+  /**
+   * The worktree, or none in a bare repository, whose working copy refuses it (asked
+   * without touching it): a diff of trees reads the bare attributes there.
+   */
+  private get worktreeIfAny(): Worktree | undefined {
+    return "worktree" in this.workingCopy ? this.worktreeAccess : undefined;
+  }
+
   /** The output options: the setters', else the configuration's */
   private outputOptions(): DiffOutputOptions {
     const config = this.config;
     const get = (key: string) => config.value(key);
-    const worktree = this.worktreeAccess;
+    const worktree = this.worktreeIfAny;
     const filter = worktree?.contentFilter as
       | {
           attributes?: (
@@ -1120,13 +1129,28 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     // repo_read_index: in a sparse checkout, a skip-worktree entry whose file is present is
     // read as in the checkout (in memory: diff writes no index)
     await this.clearPresentSkipWorktree();
-    const worktree = this.worktreeAccess;
+    // a bare repository's working copy refuses its worktree (and index): asked without
+    // touching them
+    const bare = !("worktree" in this.workingCopy);
+    const worktree = this.worktreeIfAny;
     // `:(attr:...)`: the attributes of the index's paths (match_pathspec_attrs), the trees'
     // read once their sides are known
-    const attributes = this.pathspecItems
-      ? PathspecAttributes.forWorktree(this.pathspecItems, worktree)
-      : undefined;
-    if (attributes) {
+    // without a worktree (a bare repository's diff of trees): the bare attributes, as log
+    // reads them
+    const attributes = !this.pathspecItems
+      ? undefined
+      : worktree
+        ? PathspecAttributes.forWorktree(this.pathspecItems, worktree)
+        : PathspecAttributes.forResolver(
+            this.pathspecItems,
+            bareAttributesResolver({
+              workingCopy: this.workingCopy,
+              trees: this.trees,
+              blobs: this.blobs,
+              revisions: () => this.revisionResolver(),
+            }),
+          );
+    if (attributes && !bare) {
       const paths: string[] = [];
       for await (const entry of this.staging.entries()) paths.push(entry.path);
       await attributes.load(paths);
@@ -1215,7 +1239,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       const out = new Map<string, "none" | "untracked" | "dirty" | "all">();
       let text: string | undefined;
       try {
-        const worktree = this.worktreeAccess;
+        const worktree = this.worktreeIfAny;
         const entry = worktree ? await worktree.getEntry(".gitmodules") : undefined;
         if (worktree && entry && !entry.isDirectory && entry.mode !== 0o120000) {
           const chunks: Uint8Array[] = [];

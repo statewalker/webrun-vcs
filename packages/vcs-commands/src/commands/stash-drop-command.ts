@@ -33,6 +33,8 @@ import { STASH_REF } from "./stash-list-command.js";
  */
 export class StashDropCommand extends GitCommand<ObjectId | undefined> {
   private stashRefEntry = 0;
+  /** Whether a stash was named ({@link setStashRef}): git's message for a missing one differs */
+  private stashRefGiven = false;
   private dropAll = false;
 
   /**
@@ -50,6 +52,7 @@ export class StashDropCommand extends GitCommand<ObjectId | undefined> {
       throw new InvalidStashIndexError(stashRef, "Stash index must be >= 0");
     }
     this.stashRefEntry = stashRef;
+    this.stashRefGiven = true;
     return this;
   }
 
@@ -90,7 +93,15 @@ export class StashDropCommand extends GitCommand<ObjectId | undefined> {
     // Check if stash ref exists
     const stashRef = await this.refsStore.get(STASH_REF);
     if (!stashRef || !("objectId" in stashRef) || !stashRef.objectId) {
-      return undefined;
+      // `git stash clear` without a stash is fine, `git stash drop` is not (get_stash_info):
+      //   git stash drop           -> "No stash entries found."
+      //   git stash drop stash@{5} -> "error: stash@{5} is not a valid reference"
+      // both exit 1 on git 2.43, 128 on 2.5x (cmd_stash maps a failure to die's status)
+      if (this.dropAll) return undefined;
+      const message = this.stashRefGiven
+        ? `error: stash@{${this.stashRefEntry}} is not a valid reference`
+        : "No stash entries found.";
+      throw new InvalidStashIndexError(this.stashRefEntry, message).withExitCode(128);
     }
 
     // Drop all stashes: delete the ref and its reflog (`git stash clear`)
@@ -106,9 +117,11 @@ export class StashDropCommand extends GitCommand<ObjectId | undefined> {
     const reflog = await refs.getReflog?.(STASH_REF);
     if (reflog && refs.deleteReflogEntry) {
       if (!(await reflog.getReverseEntry(this.stashRefEntry))) {
+        // get_oid of stash@{n} beyond the log dies (exit 128 on every version)
+        const count = (await reflog.getReverseEntries()).length;
         throw new InvalidStashIndexError(
           this.stashRefEntry,
-          `stash@{${this.stashRefEntry}} does not exist`,
+          `fatal: log for 'stash' only has ${count} entries`,
         );
       }
       const left = await refs.deleteReflogEntry(STASH_REF, this.stashRefEntry, {

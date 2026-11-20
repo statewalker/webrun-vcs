@@ -7,7 +7,7 @@ import { GitApiError } from "./git-api-error.js";
  */
 export class NoMessageError extends GitApiError {
   constructor(message?: string) {
-    super(message ?? "Commit message is required", { defaultExitCode: 1 });
+    super(message ?? "Commit message is required", { exitCode: 1 });
     this.name = "NoMessageError";
   }
 }
@@ -19,7 +19,7 @@ export class NoMessageError extends GitApiError {
  */
 export class EmptyCommitError extends GitApiError {
   constructor(message?: string) {
-    super(message ?? "Nothing to commit", { defaultExitCode: 1 });
+    super(message ?? "Nothing to commit", { exitCode: 1 });
     this.name = "EmptyCommitError";
   }
 }

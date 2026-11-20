@@ -9,9 +9,10 @@
  */
 export class GitApiError extends Error {
   /**
-   * git's exit status for this failure: the one given, else the one the message's lines say
-   * (a `usage:` line 129, a `fatal:` line 128, an `error:` first line 1), else the class's
-   * default (128 unless a subclass says otherwise).
+   * git's exit status for this failure: the one given (by the class where its condition
+   * always ends so, or by the caller), else the one the message's prefixes say (see
+   * {@link exitCodeOfMessage}), else the class's default (128 unless a subclass says
+   * otherwise).
    */
   exitCode: number;
 
@@ -38,19 +39,29 @@ export interface GitApiErrorOptions extends ErrorOptions {
 }
 
 /**
- * The exit status git's message lines imply: a `usage:` line is `usage_with_options` (129),
- * a `fatal:` line `die()` (128), a message starting with `error:` (and dying nowhere) an
- * `error()` return (1); undefined for a message without these prefixes.
+ * The exit status git's message lines imply, read only where git's own prefixes stand (a
+ * path a message lists, `fatal: x.log`, is no prefix): a first line `usage:` (or `usage:`
+ * right after a first `error:` line, parse-options' error and usage) is
+ * `usage_with_options` (129); a `fatal:` line that is the last line, or the first (a die
+ * message with its own continuation or hint lines), is `die()` (128); a first line
+ * `error:` (dying nowhere) an `error()` return (1); undefined for a message without these
+ * prefixes there. A class whose condition always ends with one status says so explicitly,
+ * which this never overrides.
  *
  * @example
  * ```typescript
  * exitCodeOfMessage("error: tag 'x' not found."); // 1
  * exitCodeOfMessage("error: no cherry-pick or revert in progress\nfatal: cherry-pick failed"); // 128
+ * exitCodeOfMessage("The following paths are ignored:\nusage: y.log"); // undefined
  * ```
  */
 export function exitCodeOfMessage(message: string): number | undefined {
-  if (/^usage: /m.test(message)) return 129;
-  if (/^fatal: /m.test(message)) return 128;
-  if (message.startsWith("error: ")) return 1;
+  const lines = message.replace(/\n+$/, "").split("\n");
+  const first = lines[0] ?? "";
+  const last = lines[lines.length - 1] ?? "";
+  if (first.startsWith("usage: ")) return 129;
+  if (first.startsWith("error: ") && (lines[1] ?? "").startsWith("usage: ")) return 129;
+  if (last.startsWith("fatal: ") || first.startsWith("fatal: ")) return 128;
+  if (first.startsWith("error: ")) return 1;
   return undefined;
 }

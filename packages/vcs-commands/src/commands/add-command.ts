@@ -366,7 +366,8 @@ export class AddCommand extends GitCommand<AddResult> {
   /**
    * The git version whose messages are reproduced where versions differ (default 2.56):
    * the advice's last hint, `Disable this message with "git config set advice.<name>
-   * false"` in 2.5x, `"git config advice.<name> false"` in 2.43.
+   * false"` in 2.5x, `"git config advice.<name> false"` in 2.43; and 2.43 refuses
+   * `:(attr:...)` elements ("pathspec magic not supported by this command: 'attr'").
    */
   setCompatibility(version: PathspecOriginStyle): this {
     this.checkCallable();
@@ -436,7 +437,8 @@ export class AddCommand extends GitCommand<AddResult> {
 
     let items: PathspecItem[];
     try {
-      items = parsePathspec(this.filepatterns, { attr: true });
+      // git 2.43's cmd_add masks PATHSPEC_ATTR: `:(attr:...)` is refused there
+      items = parsePathspec(this.filepatterns, { attr: this.compatibility !== "2.43" });
     } catch (error) {
       throw new InvalidArgumentError(
         "filepattern",
@@ -669,7 +671,7 @@ export class AddCommand extends GitCommand<AddResult> {
             undefined,
             output,
             warnings,
-          );
+          ).withExitCode(128);
         }
         const removal = await this.removalState(worktree, first, current);
         if (removal === "unknown") {
@@ -693,7 +695,7 @@ export class AddCommand extends GitCommand<AddResult> {
             undefined,
             output,
             warnings,
-          );
+          ).withExitCode(128);
         }
         // an unpopulated submodule is no change (no commit checked out to compare)
         if (!unmerged && first.mode === FileMode.GITLINK && current.isDirectory) {
@@ -708,7 +710,7 @@ export class AddCommand extends GitCommand<AddResult> {
             undefined,
             output,
             warnings,
-          );
+          ).withExitCode(128);
         }
       }
     }
@@ -754,7 +756,7 @@ export class AddCommand extends GitCommand<AddResult> {
             undefined,
             output,
             warnings,
-          );
+          ).withExitCode(128);
         }
         continue;
       }
@@ -1122,15 +1124,7 @@ export class AddCommand extends GitCommand<AddResult> {
    */
   private async reachableByAttributes(path: string, trackedDirs: Set<string>): Promise<boolean> {
     const attributes = this.attributes as PathspecAttributes;
-    const dirs: string[] = [];
-    for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
-      const dir = path.slice(0, at);
-      if (!trackedDirs.has(dir)) dirs.push(`${dir}/`);
-    }
-    await attributes.load([path, `${path}/`, ...dirs]);
-    return dirs.every(
-      (dir) => matchPathspec(this.pathspecItems, dir, DO_MATCH_LEADING_PATHSPEC) > 0,
-    );
+    return attributes.reachable(this.pathspecItems, path, trackedDirs);
   }
 
   /**
@@ -1229,7 +1223,7 @@ export class AddCommand extends GitCommand<AddResult> {
           undefined,
           output,
           warnings,
-        );
+        ).withExitCode(128);
       }
       try {
         await adder.add(worktree, path, worktreeEntry, {

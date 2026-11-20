@@ -12,6 +12,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -22,8 +23,9 @@ import {
   MergeStatus,
   SequencerOperation,
 } from "../src/index.js";
+import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
-import { gitOut, gitRun, openRepo, putFile } from "./status-native-support.js";
+import { gitOut, gitRun, openRepo, putFile, testEnv } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -227,6 +229,203 @@ describeGit("COMMIT_EDITMSG and the message checks: as native git", () => {
     await expectCommit(dir, ["--no-edit"], (c) => c.setEdit(false), "--no-edit");
   }, 60_000);
 });
+
+describeGit(
+  "commit: nothing to commit without a first parent, -i in a dry run, amend checks",
+  () => {
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "commit-p451-"));
+    });
+    afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+    const headOf = (d: string) => gitRun(root, d, ["rev-parse", "-q", "--verify", "HEAD"]).stdout;
+
+    it("an initial commit, or --amend of a root commit, with an empty index: nothing to commit", async () => {
+      const dir = join(root, "e");
+      mkdirSync(dir, { recursive: true });
+      git(dir, ["init", "-q", "-b", "main"]);
+      putFile(dir, "a.txt", "a\n");
+      const cases: [string, (d: string) => void, string[], (c: CommitCommand) => CommitCommand][] =
+        [
+          ["initial, empty index", () => {}, ["-m", "x"], (c) => c.setMessage("x")],
+          [
+            "initial, an intent-to-add entry only",
+            (d) => git(d, ["add", "-N", "a.txt"]),
+            ["-m", "x"],
+            (c) => c.setMessage("x"),
+          ],
+          [
+            "--amend of a root commit, the index emptied",
+            (d) => {
+              git(d, ["add", "a.txt"]);
+              git(d, ["commit", "-qm", "root"]);
+              git(d, ["rm", "-q", "--cached", "a.txt"]);
+            },
+            ["--amend", "-m", "y"],
+            (c) => c.setAmend(true).setMessage("y"),
+          ],
+        ];
+      for (const [label, setup, args, ours] of cases) {
+        const [theirs, mine] = twins(dir);
+        setup(theirs);
+        setup(mine);
+        const native = gitRun(root, theirs, ["commit", ...args]);
+        expect(native.status, label).toBe(1);
+        const error = await ours((await openRepo(root, mine)).commit())
+          .call()
+          .then(
+            () => undefined,
+            (e: Error) => e,
+          );
+        expect(error, label).toBeInstanceOf(EmptyCommitError);
+        expect((error as EmptyCommitError).exitCode, label).toBe(1);
+        expect(error?.message.toLowerCase(), label).toContain("nothing to commit");
+        expect(headOf(mine), label).toBe(headOf(theirs));
+        // allowed with --allow-empty
+        const allowedNative = gitRun(root, theirs, ["commit", "--allow-empty", ...args]);
+        expect(allowedNative.status, label).toBe(0);
+        await ours((await openRepo(root, mine)).commit())
+          .setAllowEmpty(true)
+          .call();
+        expect(git(mine, ["log", "--format=%s %T"]), label).toBe(
+          git(theirs, ["log", "--format=%s %T"]),
+        );
+      }
+    }, 60_000);
+
+    it("--dry-run with -i: the named tracked paths staged on a held index, the index kept", async () => {
+      const dir = join(root, "r");
+      base(dir);
+      putFile(dir, "a.txt", "a2\n");
+      putFile(dir, "b.txt", "b2\n");
+      const index = (d: string) => readFileSync(join(d, ".git/index")).toString("latin1");
+      const before = index(dir);
+      for (const format of ["short", "porcelain", "long"] as const) {
+        const native = gitRun(root, dir, ["commit", "--dry-run", `--${format}`, "-i", "a.txt"]);
+        const ours = await (await openRepo(root, dir))
+          .commit()
+          .setInclude("a.txt")
+          .setStatusFormat(format)
+          .callDryRun();
+        expect(ours.text, format).toBe(native.stdout);
+        expect(ours.exitCode, format).toBe(native.status);
+        expect(index(dir), format).toBe(before);
+      }
+      // the refusals of a commit
+      for (const [args, setup] of [
+        [["-i", "-a"], (c: CommitCommand) => c.setInclude("a.txt").setAll(true)],
+        [["-i"], (c: CommitCommand) => c.setInclude()],
+      ] as const) {
+        const native = gitRun(root, dir, ["commit", "--dry-run", ...args]);
+        expect(native.status).toBe(128);
+        await expect(setup((await openRepo(root, dir)).commit()).callDryRun()).rejects.toThrow(
+          native.stderr.trimEnd(),
+        );
+      }
+    }, 60_000);
+
+    it("an editor's commit without the status in the template: index_differs_from HEAD (HEAD^1 amending)", async () => {
+      const dir = join(root, "r");
+      base(dir);
+      putFile(dir, "a.txt", "a2\n");
+      git(dir, ["commit", "-qam", "second"]);
+      // --amend with nothing new staged: the index differs from HEAD^1, so it amends
+      await expectCommit(
+        dir,
+        ["--amend", "--no-status"],
+        (c) =>
+          c
+            .setAmend(true)
+            .setIncludeStatus(false)
+            .setEditor(async (_p, t) => t),
+        "--amend --no-status",
+        { GIT_EDITOR: "true" },
+      );
+      // a squash merge's SQUASH_MSG, nothing staged beyond HEAD: nothing to commit
+      git(dir, ["checkout", "-q", "-b", "side", "HEAD~1"]);
+      putFile(dir, "c.txt", "c\n");
+      git(dir, ["add", "c.txt"]);
+      git(dir, ["commit", "-qm", "side"]);
+      git(dir, ["checkout", "-q", "main"]);
+      git(dir, ["merge", "-q", "--squash", "side"]);
+      await expectCommit(
+        dir,
+        ["--no-status"],
+        (c) => c.setIncludeStatus(false).setEditor(async (_p, t) => t),
+        "SQUASH_MSG, staged",
+        { GIT_EDITOR: "true" },
+      );
+      git(dir, ["reset", "-q", "--hard"]);
+      writeFileSync(join(dir, ".git/SQUASH_MSG"), "squashed\n");
+      await expectCommit(
+        dir,
+        ["--no-status"],
+        (c) => c.setIncludeStatus(false).setEditor(async (_p, t) => t),
+        "SQUASH_MSG, nothing staged",
+        { GIT_EDITOR: "true" },
+      );
+      // an initial commit of intent-to-add entries only: `cache_nr - ita_nr` is 0, nothing
+      // to commit (whatever a status run would count)
+      const fresh = join(root, "fresh");
+      mkdirSync(fresh, { recursive: true });
+      git(fresh, ["init", "-q", "-b", "main"]);
+      putFile(fresh, "a.txt", "a\n");
+      git(fresh, ["add", "-N", "a.txt"]);
+      writeFileSync(join(fresh, ".git/SQUASH_MSG"), "squashed\n");
+      const [theirs, mine] = twins(fresh);
+      const native = gitRun(root, theirs, ["commit", "--no-status"], { GIT_EDITOR: "true" });
+      expect(native.status).toBe(1);
+      const error = await (await openRepo(root, mine))
+        .commit()
+        .setIncludeStatus(false)
+        .setEditor(async (_p, t) => t)
+        .call()
+        .then(
+          () => undefined,
+          (e: Error) => e,
+        );
+      expect(error).toBeInstanceOf(EmptyCommitError);
+      expect(editmsg(mine)).toBe(editmsg(theirs));
+
+      // the cheap check: the index against the parent's tree, no status run (no worktree
+      // directory is listed for untracked files)
+      const counted = join(root, "counted");
+      base(counted);
+      putFile(counted, "a.txt", "a3\n");
+      putFile(counted, "untracked/u.txt", "u\n");
+      git(counted, ["add", "a.txt"]);
+      writeFileSync(join(counted, ".git/SQUASH_MSG"), "squashed\n");
+      let listed = 0;
+      // every FilesApi call on the worktree (its lstat-cached views too), outside `.git`
+      const counting = <T extends object>(files: T): T =>
+        new Proxy(files, {
+          get(target, key, receiver) {
+            const value = Reflect.get(target, key, receiver);
+            if (typeof value !== "function") return value;
+            if (key === "withLstatCache") return () => counting(value.call(target));
+            return (path: unknown, ...rest: unknown[]) => {
+              if ((key === "list" || key === "listKinds") && typeof path === "string") {
+                if (!path.includes(".git")) listed++;
+              }
+              return value.call(target, path, ...rest);
+            };
+          },
+        });
+      const repo = await openOurs(
+        counted,
+        createNodeGitHostEnvironment({ env: testEnv(root) }),
+        counting,
+      );
+      await repo
+        .commit()
+        .setIncludeStatus(false)
+        .setEditor(async (_p, t) => t)
+        .call();
+      expect(git(counted, ["log", "-1", "--format=%s"])).toBe("squashed\n");
+      expect(listed).toBe(0);
+    }, 60_000);
+  },
+);
 
 describeGit("COMMIT_EDITMSG of the commands that commit: as native git", () => {
   beforeEach(() => {

@@ -195,8 +195,8 @@ export function checkoutConformanceTests(
 
       it("abortOperation clears operation state", async () => {
         await checkout.setMergeState({
-          mergeHead: "n".repeat(40),
-          originalHead: "o".repeat(40),
+          mergeHead: "e".repeat(40),
+          originalHead: "f".repeat(40),
         });
 
         expect(await checkout.hasOperationInProgress()).toBe(true);

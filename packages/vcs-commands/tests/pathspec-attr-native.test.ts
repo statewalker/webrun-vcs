@@ -246,6 +246,97 @@ describeGit(":(attr:...) pathspecs: as native git", () => {
     }
   }, 300_000);
 
+  it("stash push -u: untracked directories entered by their own attributes (treat_directory)", async () => {
+    const dir = join(root, "u");
+    mkdirSync(dir, { recursive: true });
+    git(dir, ["init", "-q", "-b", "main"]);
+    putFile(dir, ".gitattributes", "ud foo\nud/** foo\n*.c foo\nud2/ foo\n");
+    putFile(dir, "t", "t\n");
+    git(dir, ["add", "-A"]);
+    git(dir, ["commit", "-qm", "base"]);
+    for (const f of ["ud/x.c", "ud/y.h", "ud2/z.h", "ud3/deep/w.c"]) putFile(dir, f, `${f}\n`);
+    const stashed = (d: string) =>
+      `${git(d, ["status", "--porcelain", "-uall"])}|${gitRun(root, d, ["ls-tree", "-r", "--name-only", "stash@{0}^3"]).stdout}`;
+    // git 2.5x's results (2.43's add refuses attr magic after the stash is saved)
+    const expected: Record<string, string> = {
+      ":(attr:foo)": "?? ud2/z.h\n?? ud3/deep/w.c\n|ud/x.c\nud/y.h\n",
+      ":(attr:!foo)": "?? ud/x.c\n?? ud/y.h\n?? ud2/z.h\n?? ud3/deep/w.c\n|",
+      ":(exclude,attr:foo) .": "?? ud/x.c\n?? ud/y.h\n?? ud2/z.h\n?? ud3/deep/w.c\n|",
+    };
+    for (const spec of [[":(attr:foo)"], [":(attr:!foo)"], [":(exclude,attr:foo)", "."]]) {
+      const label = spec.join(" ");
+      const ours = async (r: Awaited<ReturnType<typeof openRepo>>) => {
+        const c = r.stashCreate().setRef("refs/stash").setIncludeUntracked(true);
+        for (const p of spec) c.addPath(p);
+        return c.call();
+      };
+      if (is25x) {
+        await expectTwins(
+          dir,
+          `stash push -u ${label}`,
+          ["stash", "push", "-q", "-u", "--", ...spec],
+          ours,
+          stashed,
+        );
+      }
+      const [, mine] = twins(dir);
+      await ours(await openRepo(root, mine));
+      expect(stashed(mine), label).toBe(expected[label]);
+    }
+  }, 120_000);
+
+  it('setCompatibility("2.43"): add and stash push refuse attr magic as git 2.43', async () => {
+    const dir = join(root, "c");
+    base(dir);
+    const addMessage = "fatal: :(attr:foo): pathspec magic not supported by this command: 'attr'";
+    const stashMessage =
+      "fatal: :(attr,prefix:0): pathspec magic not supported by this command: 'attr'";
+    const [theirs, mine] = twins(dir);
+    if (!is25x) {
+      const native = gitRun(root, theirs, ["add", "--", ":(attr:foo)"]);
+      expect(native.status).toBe(128);
+      expect(native.stderr).toBe(`${addMessage}\n`);
+    }
+    let error = await (await openRepo(root, mine))
+      .add()
+      .setCompatibility("2.43")
+      .addFilepattern(":(attr:foo)")
+      .call()
+      .then(
+        () => undefined,
+        (e: Error) => e,
+      );
+    expect(error?.message).toBe(addMessage);
+    expect((error as { exitCode?: number }).exitCode).toBe(128);
+    expect(stagedOf(mine)).toBe(stagedOf(theirs));
+    // stash push: saved, then its `git add` dies (git stash exits 1)
+    if (!is25x) {
+      const native = gitRun(root, theirs, ["stash", "push", "-q", "-u", "--", ":(attr:foo)"]);
+      expect(native.status).toBe(1);
+      expect(native.stderr).toBe(`${stashMessage}\n`);
+    }
+    error = await (await openRepo(root, mine))
+      .stashCreate()
+      .setRef("refs/stash")
+      .setIncludeUntracked(true)
+      .setCompatibility("2.43")
+      .addPath(":(attr:foo)")
+      .call()
+      .then(
+        () => undefined,
+        (e: Error) => e,
+      );
+    expect(error?.message).toBe(stashMessage);
+    if (!is25x) {
+      const state = (d: string) =>
+        `${git(d, ["status", "--porcelain", "-uall"])}${gitRun(root, d, ["ls-tree", "-r", "--name-only", "stash@{0}"]).stdout}${gitRun(root, d, ["ls-tree", "-r", "--name-only", "stash@{0}^3"]).stdout}`;
+      expect(state(mine)).toBe(state(theirs));
+    }
+    // the default (2.5x) takes it
+    const [, other] = twins(dir);
+    await (await openRepo(root, other)).add().addFilepattern(":(attr:foo)").call();
+  }, 60_000);
+
   it("diff: worktree, --cached and two trees", async () => {
     const dir = join(root, "r");
     base(dir);

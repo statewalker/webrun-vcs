@@ -247,6 +247,43 @@ describeGit("attribute source (GIT_ATTR_SOURCE, attr.tree) against native git", 
     for (const paths of specs) expect(await ourLog(git, paths)).toEqual(nativeLog(bare, paths));
   });
 
+  it("diff -- :(attr) in a bare repository reads the bare attributes, as log does", async () => {
+    const work = join(root, "bare-diff-work");
+    build(work);
+    const bare = join(root, "bare-diff.git");
+    execFileSync("git", ["clone", "-q", "--bare", work, bare], { env: env() });
+    run(bare, ["tag", "-f", "attrs", "main~1"]);
+    const openBare = async (extra: Record<string, string>) => {
+      const files = createNodeFilesApi({ rootDir: bare });
+      const environment = createNodeGitHostEnvironment({ env: env(extra) });
+      const { history } = await createGitFilesBackend({ files, gitDir: "." });
+      const worktrees = await openGitLinkedWorktrees({ files, gitDir: ".", history, environment });
+      return Git.fromWorktreeAdmin(await worktrees.openAdmin());
+    };
+    const nativeDiff = (paths: string[], extra: Record<string, string> = {}) =>
+      run(bare, ["diff", "--name-only", "main~1", "main", "--", ...paths], extra);
+    const ourDiff = async (git: Git, paths: string[]) =>
+      (
+        await git
+          .diff()
+          .setOldTree("main~1")
+          .setNewTree("main")
+          .setPathspec(paths)
+          .callText("name-only")
+      ).toString();
+    for (const extra of [{ GIT_ATTR_SOURCE: "attrs" }, { GIT_ATTR_SOURCE: "main" }]) {
+      const git = await openBare(extra);
+      for (const paths of specs) {
+        expect(await ourDiff(git, paths), `${paths} ${extra.GIT_ATTR_SOURCE}`).toBe(
+          nativeDiff(paths, extra),
+        );
+      }
+    }
+    run(bare, ["config", "attr.tree", "attrs"]);
+    const git = await openBare({});
+    for (const paths of specs) expect(await ourDiff(git, paths)).toBe(nativeDiff(paths));
+  });
+
   it("a bad $GIT_ATTR_SOURCE is fatal; a bad attr.tree is ignored; a blob gives none", async () => {
     const t = twins("bad");
     for (const dir of [t.native, t.ours]) put(dir, "x.bin", "y\n");

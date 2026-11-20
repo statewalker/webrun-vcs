@@ -7,8 +7,11 @@
  * synchronously while the paths are matched.
  */
 
-import type { Worktree } from "@statewalker/vcs-working-tree";
+import type { AttributesResolver, Worktree } from "@statewalker/vcs-working-tree";
+import { GitApiError } from "../errors/index.js";
 import {
+  DO_MATCH_LEADING_PATHSPEC,
+  matchPathspec,
   type PathspecAttributeValue,
   type PathspecItem,
   pathspecItemMayMatch,
@@ -54,7 +57,7 @@ export class PathspecAttributes {
    * direction: the worktree's `.gitattributes` first, then the index's); undefined when no
    * element has `:(attr:...)`.
    *
-   * @throws Error when the worktree reads no attributes
+   * @throws GitApiError without a worktree, or when it reads no attributes
    */
   static forWorktree(
     items: PathspecItem[],
@@ -70,14 +73,36 @@ export class PathspecAttributes {
           ): Promise<Map<string, PathspecAttributeValue>>;
         }
       | undefined;
+    // git reads a command's attributes from its worktree: without one, it dies (a diff of
+    // trees in a bare repository reads the bare attributes instead, see `forResolver`)
+    if (!worktree) throw new GitApiError("fatal: this operation must be run in a work tree");
     const attributes = filter?.attributes?.bind(filter);
-    if (!attributes) throw new Error("pathspec magic 'attr' needs the attributes of a worktree");
+    if (!attributes) {
+      throw new GitApiError("fatal: pathspec magic 'attr' needs the attributes of a worktree");
+    }
     return new PathspecAttributes(items, (path, names) =>
       // git_check_attr of a directory's name ("d/"): the name without its slash, matched by
       // the patterns as a directory, from the stack of the directory above it (attr.c)
       path.endsWith("/")
         ? attributes(path.slice(0, -1), names, { direction: "checkin", isDirectory: true })
         : attributes(path, names, { direction: "checkin" }),
+    );
+  }
+
+  /**
+   * The attributes of `items` read by an attributes resolver (a bare repository's, without
+   * a worktree: builtin, system, global, `info/attributes` and an attribute source);
+   * undefined when no element has `:(attr:...)`.
+   */
+  static forResolver(
+    items: PathspecItem[],
+    resolver: AttributesResolver,
+  ): PathspecAttributes | undefined {
+    if (!items.some((item) => item.attr)) return undefined;
+    return new PathspecAttributes(items, async (path, names) =>
+      path.endsWith("/")
+        ? resolver.get(path.slice(0, -1), names, { isDirectory: true })
+        : resolver.get(path, names),
     );
   }
 
@@ -97,6 +122,22 @@ export class PathspecAttributes {
     return (
       !this.values.has(path) && this.attrItems.some((item) => pathspecItemMayMatch(item, path))
     );
+  }
+
+  /**
+   * Whether dir.c's untracked walk reaches the untracked `path` (its attributes loaded on
+   * the way): each untracked directory above it (one holding no index entry, so not in
+   * `trackedDirs`) must match `items` as a leading path by its own name and attributes
+   * (`treat_directory` with `DO_MATCH_LEADING_PATHSPEC`).
+   */
+  async reachable(items: PathspecItem[], path: string, trackedDirs: Set<string>): Promise<boolean> {
+    const dirs: string[] = [];
+    for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
+      const dir = path.slice(0, at);
+      if (!trackedDirs.has(dir)) dirs.push(`${dir}/`);
+    }
+    await this.load([path, `${path}/`, ...dirs]);
+    return dirs.every((dir) => matchPathspec(items, dir, DO_MATCH_LEADING_PATHSPEC) > 0);
   }
 
   /** Loads the attributes of `path` (whether an element may match it or not). */

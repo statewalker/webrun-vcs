@@ -10,6 +10,8 @@ import {
   type PushCommandResult,
   type PushRefUpdate,
   parseRefSpec,
+  pushToConnection,
+  type PushOptions as TransportPushOptions,
   push as transportPush,
 } from "@statewalker/vcs-transport";
 
@@ -22,6 +24,7 @@ import {
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type PushResult, PushStatus, type RemoteRefUpdate } from "../results/push-result.js";
 import { TransportCommand } from "../transport-command.js";
+import { localRemotePath, openLocalRemote, withLocalReceivePack } from "./local-transport.js";
 
 /** All-zero object id — Git's "no object", used to express a ref delete. */
 const ZERO_OBJECT_ID = "0".repeat(40);
@@ -401,16 +404,19 @@ export class PushCommand extends TransportCommand<PushResult> {
       throw new InvalidRemoteError(this.remote);
     }
 
+    const localPath = localRemotePath(remoteUrl);
     const refspecs = await this.buildRefSpecs();
     if (refspecs.length === 0) {
       return { uri: remoteUrl, remoteUpdates: [], bytesSent: 0, objectCount: 0, messages: [] };
     }
 
+    const localRemote =
+      localPath === undefined ? undefined : await openLocalRemote(this.workingCopy, localPath);
     const history = this._workingCopy.history;
     const tracking = this.trackingRefMapper();
     const messages: string[] = [];
     const leases = this.leases;
-    const result = await transportPush({
+    const pushOptions: TransportPushOptions = {
       url: remoteUrl,
       auth: this.credentials,
       headers: this.headers,
@@ -435,7 +441,15 @@ export class PushCommand extends TransportCommand<PushResult> {
         this.progressMessageCallback?.(message);
       },
       abbrev: parseCoreAbbrev(RemoteConfigStore.from(this._workingCopy).value("core.abbrev")) ?? -1,
-    });
+    };
+    // transport_get: smart HTTP, or git's local transport (receive-pack of the repository at
+    // the path, in process); anything else fails in git's words
+    const result =
+      localRemote === undefined
+        ? await transportPush(pushOptions)
+        : await withLocalReceivePack(localRemote, (connection) =>
+            pushToConnection(connection, pushOptions),
+          );
 
     // git updates the remote-tracking refs of what the server accepted, and of what it had
     // already (transport.c: update_tracking_ref for ok and up-to-date refs)

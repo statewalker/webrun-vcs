@@ -7,7 +7,7 @@ export class MissingArgumentError extends GitApiError {
   readonly argumentName: string;
 
   constructor(argumentName: string, message?: string) {
-    super(message ?? `Missing required argument: ${argumentName}`, { defaultExitCode: 129 });
+    super(message ?? `Missing required argument: ${argumentName}`, { exitCode: 129 });
     this.name = "MissingArgumentError";
     this.argumentName = argumentName;
   }
