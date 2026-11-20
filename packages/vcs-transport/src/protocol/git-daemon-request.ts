@@ -270,8 +270,10 @@ export interface GitServiceCommand {
 
 /**
  * Reads the command git's ssh transport sends (`git-upload-pack '/srv/r.git'`, as
- * connect.c builds it), as git-shell accepts it: the program `git-<service>` or
- * `git <service>`, then one shell-quoted argument.
+ * connect.c builds it), as git-shell accepts it (shell.c's `do_generic_cmd`): the program
+ * `git-<service>` or `git<whitespace><service>`, one space, then exactly one shell-quoted
+ * argument (`sq_dequote`: nothing before or after it, a trailing space included) that does
+ * not start with `-`.
  *
  * @example
  * ```ts
@@ -280,9 +282,11 @@ export interface GitServiceCommand {
  * ```
  */
 export function parseGitServiceCommand(command: string): GitServiceCommand | undefined {
-  const m = /^git[ -](upload-pack|receive-pack|upload-archive) (.*)$/s.exec(command);
+  const m = /^git[ \t\n\v\f\r-](upload-pack|receive-pack|upload-archive) (.*)$/s.exec(command);
   if (!m) return undefined;
-  const words = sqDequoteWords(m[2] as string);
-  if (words?.length !== 1) return undefined;
+  const arg = m[2] as string;
+  if (!arg.startsWith("'") || arg.endsWith(" ")) return undefined;
+  const words = sqDequoteWords(arg);
+  if (words?.length !== 1 || (words[0] as string).startsWith("-")) return undefined;
   return { service: `git-${m[1]}`, path: words[0] as string };
 }

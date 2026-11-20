@@ -107,6 +107,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   private porcelain = false;
   private thin = true;
   private depth?: number;
+  private uploadPack?: string;
   private dryRun = false;
   private writeCommitGraphOption?: boolean;
   private repositoryFiles?: { files: FilesApi; gitDir?: string };
@@ -326,6 +327,19 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       throw new InvalidArgumentError("depth", depth, "Depth must be at least 1");
     }
     this.depth = depth;
+    return this;
+  }
+
+  /**
+   * Set the program the remote runs for upload-pack (git's `--upload-pack`, over
+   * `remote.<name>.uploadpack`): what an ssh connector runs, and what git:// names in its
+   * request line.
+   *
+   * @param uploadPack Path to git-upload-pack on the remote
+   */
+  setUploadPack(uploadPack: string): this {
+    this.checkCallable();
+    this.uploadPack = uploadPack;
     return this;
   }
 
@@ -686,7 +700,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       reflogIdent: this.reflogLine("").ident,
       abbrev: parseCoreAbbrev(store.value("core.abbrev")) ?? -1,
     };
-    const uploadPack = this.remoteProgram(this.remote, "uploadpack");
+    // --upload-pack, else remote.<name>.uploadpack (transport_get)
+    const uploadPack = this.uploadPack ?? this.remoteProgram(this.remote, "uploadpack");
     const sessionOptions = {
       ...this.remoteSessionOptions(),
       ...(uploadPack !== undefined ? { program: uploadPack } : {}),

@@ -1,3 +1,5 @@
+export type { BasePathResolverOptions } from "./base-path-resolver.js";
+export { createBasePathResolver } from "./base-path-resolver.js";
 export type { FetchOptions } from "./fetch.js";
 export { fetch } from "./fetch.js";
 export type { FetchOverDuplexOptions } from "./fetch-over-duplex.js";
@@ -27,8 +29,19 @@ export type {
   ServeGitConnectionResult,
   ServeGitServiceOptions,
 } from "./serve-git-connection.js";
-export { daemonAvoidsAlias, serveGitConnection, serveGitService } from "./serve-git-connection.js";
+export {
+  daemonAvoidsAlias,
+  isUnsafeServicePath,
+  layerServeSettings,
+  serveGitConnection,
+  serveGitService,
+} from "./serve-git-connection.js";
 export type { ServeOverDuplexOptions } from "./serve-over-duplex.js";
 export { serveOverDuplex } from "./serve-over-duplex.js";
 export type { ServerConfigReader, ServerConfigSettings } from "./server-config.js";
-export { httpServerSettings, serverSettingsFromConfig } from "./server-config.js";
+export {
+  explicitServerSettingsFromConfig,
+  GIT_SERVER_SETTINGS_DEFAULTS,
+  httpServerSettings,
+  serverSettingsFromConfig,
+} from "./server-config.js";

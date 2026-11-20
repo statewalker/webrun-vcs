@@ -12,8 +12,15 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDefaultTransports, serveGitConnection } from "@statewalker/vcs-transport";
-import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
+import {
+  createBasePathResolver,
+  createDefaultTransports,
+  serveGitConnection,
+} from "@statewalker/vcs-transport";
+import {
+  createNodeFilesApi,
+  createNodeGitHostEnvironment,
+} from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { openLocalRemote } from "../src/commands/local-transport.js";
@@ -143,6 +150,16 @@ describeGit("git's native transports against native git", () => {
         expect(heads.refs.map((r) => `${r.name} ${r.objectId}`)).toEqual(
           lsRemoteLines(nativeHeads),
         );
+        // HEAD is asked for (`ref-prefix HEAD` over v2) for the default branch, not listed
+        expect(heads.defaultBranch).toBe("main");
+        const tags = await (await ours(o))
+          .lsRemote()
+          .setRemote("git://localhost/src")
+          .setTags(true)
+          .setTransports(viaDaemon())
+          .call();
+        expect(tags.defaultBranch).toBe("main");
+        expect(tags.refs.map((r) => r.name)).toEqual(["refs/tags/v1"]);
       });
     }
 
@@ -263,12 +280,18 @@ describeGit("git's native transports against native git", () => {
         serveGitConnection({
           duplex,
           enableReceivePack,
-          resolveRepository: async (path) => {
-            const opened = await openLocalRemote(g.workingCopy, `../srv${path}`).catch(
-              () => undefined,
-            );
-            return opened && (await servedRepositoryOf(opened));
-          },
+          // git daemon --export-all --base-path=<srv>, as the test daemon runs
+          resolveRepository: createBasePathResolver({
+            files: createNodeFilesApi({ rootDir: root }),
+            basePath: "/srv",
+            exportAll: true,
+            openRepository: async (gitDir) => {
+              const opened = await openLocalRemote(g.workingCopy, `..${gitDir}`).catch(
+                () => undefined,
+              );
+              return opened && (await servedRepositoryOf(opened));
+            },
+          }),
         }),
       );
     });
@@ -492,7 +515,53 @@ describeGit("git's native transports against native git", () => {
         "fatal: strange hostname '-oProxyCommand=x' blocked",
       );
       expect(await fails("host:-x")).toBe("fatal: strange pathname '-x' blocked");
+      expect(await fails("u@-oProxyCommand=x:r.git")).toBe(
+        "fatal: strange hostname 'u@-oProxyCommand=x' blocked",
+      );
       expect(calls.length).toBe(1);
+    });
+
+    it("remote.<name>.uploadpack for fetch and ls-remote, --upload-pack over it; clone -u", async () => {
+      const [, o] = twins();
+      git(join(root, o), "remote", "add", "up", `localhost:${srv}/src`);
+      git(join(root, o), "config", "remote.up.uploadpack", "git upload-pack");
+      const calls: string[] = [];
+      const transports = createDefaultTransports({ exec: localSshExec(root, calls) });
+      await (await ours(o)).lsRemote().setRemote("up").setTransports(transports).call();
+      await (await ours(o))
+        .fetch()
+        .setRemote("up")
+        .setRefSpecs("feat:refs/heads/f")
+        .setTransports(transports)
+        .call();
+      await (await ours(o))
+        .fetch()
+        .setRemote("up")
+        .setUploadPack("git-upload-pack")
+        .setRefSpecs("main:refs/heads/m")
+        .setTransports(transports)
+        .call();
+      expect(git(join(root, o), "rev-parse", "refs/heads/f")).toBe(
+        git(join(srv, "src"), "rev-parse", "feat"),
+      );
+      const v2 = '{"GIT_PROTOCOL":"version=2"}';
+      expect(calls).toEqual([
+        `localhost git upload-pack '${srv}/src' ${v2}`,
+        `localhost git upload-pack '${srv}/src' ${v2}`,
+        `localhost git-upload-pack '${srv}/src' ${v2}`,
+      ]);
+
+      calls.length = 0;
+      const [, c] = twins();
+      await (await ours(c))
+        .clone()
+        .setURI(`localhost:${srv}/src`)
+        .setUploadPack("git upload-pack")
+        .setTransports(transports)
+        .call();
+      expect(calls).toEqual([`localhost git upload-pack '${srv}/src' ${v2}`]);
+      // as git's clone, -u is not written to the new remote's config
+      expect(gitRun(root, join(root, c), ["config", "remote.origin.uploadpack"]).status).toBe(1);
     });
   });
 });

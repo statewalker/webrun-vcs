@@ -9,7 +9,8 @@
  * ```ts
  * const transports = createDefaultTransports({
  *   openSocket: (host, port) => openTcp(host, port),          // git://
- *   exec: (target, command, env) => sshExec(target, command, env), // ssh://, host:path
+ *   // ssh://, host:path; sshArgs puts `--` before the destination
+ *   exec: (target, command, env) => spawnSsh(["ssh", ...sshArgs(target), command], env),
  * });
  * ```
  */
@@ -46,7 +47,12 @@ export function createGitDaemonConnector(
   };
 }
 
-/** Where an ssh command runs. */
+/**
+ * Where an ssh command runs. Every field comes from the remote URL, which may be untrusted
+ * (a submodule's, a link someone sent): the connector refuses a host or user that starts with
+ * `-`, but an `exec` must still keep them out of option positions, by passing `--` before the
+ * destination or the destination as one `user@host` argument ({@link sshArgs} does both).
+ */
 export interface SshTarget {
   /** The host, without user or brackets */
   host: string;
@@ -56,12 +62,53 @@ export interface SshTarget {
   user?: string;
 }
 
+/**
+ * Refuses an ssh destination that could be read as an option: a host or a user starting with
+ * `-`, in git's words (connect.c's "strange hostname '<userandhost>' blocked").
+ *
+ * @throws TransportError for such a target
+ */
+export function checkSshTarget(target: Pick<SshTarget, "host" | "user">): void {
+  const userAndHost = `${target.user !== undefined ? `${target.user}@` : ""}${target.host}`;
+  if (target.host.startsWith("-") || target.user?.startsWith("-") || target.host === "") {
+    throw new TransportError(`fatal: strange hostname '${userAndHost}' blocked`);
+  }
+}
+
+/**
+ * The arguments an OpenSSH client takes for `target`, safe to put between `ssh` and the
+ * command: `-p <port>` when the URL names one (a whole number 0..65535), then `--` and the
+ * destination as one `user@host` argument, so nothing from the URL is read as an option.
+ *
+ * @example
+ * ```ts
+ * sshArgs({ host: "example.com", port: 2222, user: "git" }); // ["-p", "2222", "--", "git@example.com"]
+ * spawn("ssh", [...sshArgs(target), command]);
+ * ```
+ *
+ * @throws TransportError for an option-looking host or user ({@link checkSshTarget}) or a
+ *   port that is not a whole number in range
+ */
+export function sshArgs(target: SshTarget): string[] {
+  checkSshTarget(target);
+  const args: string[] = [];
+  if (target.port !== undefined) {
+    if (!Number.isInteger(target.port) || target.port < 0 || target.port > 65535) {
+      throw new TransportError(`fatal: strange port '${target.port}' blocked`);
+    }
+    args.push("-p", String(target.port));
+  }
+  args.push("--", `${target.user !== undefined ? `${target.user}@` : ""}${target.host}`);
+  return args;
+}
+
 /** Options of {@link createSshConnector}. */
 export interface SshConnectorOptions {
   /**
    * Runs `command` on `target` and returns its stdin/stdout as a stream (ssh's channel).
    * `env` is what git asks ssh to send (`SendEnv=GIT_PROTOCOL`): `GIT_PROTOCOL=version=<n>`
-   * for protocol v1 and v2, nothing for v0.
+   * for protocol v1 and v2, nothing for v0. An exec running an ssh client builds its argument
+   * list with {@link sshArgs} (never `-l <user> <host>` or the host alone in front of options).
    */
   exec(target: SshTarget, command: string, env: Record<string, string>): Promise<Duplex>;
 }
@@ -97,7 +144,8 @@ export function gitSshEnv(request: GitConnectRequest): Record<string, string> {
  * ssh (`ssh://`, `git+ssh://`, `ssh+git://` and the scp-like `[user@]host:path`): the
  * session is `exec(target, "git-upload-pack '<path>'", { GIT_PROTOCOL })`; the remote program
  * speaks first (handshake `"implicit"`). An option-looking host or path is refused, as git
- * refuses to hand one to ssh.
+ * refuses to hand one to ssh; so is an option-looking host after a user (`u@-oProxyCommand=x`),
+ * which git hands ssh safely as one argument but a structured {@link SshTarget} would not.
  */
 export function createSshConnector(options: SshConnectorOptions): GitTransportConnector {
   return {
@@ -106,10 +154,7 @@ export function createSshConnector(options: SshConnectorOptions): GitTransportCo
     async connect(request) {
       const { host, port, user } = request.url;
       if (!host) throw new TransportError(`fatal: no host in '${request.url.raw}'`);
-      const userAndHost = `${user !== undefined ? `${user}@` : ""}${host}`;
-      if (userAndHost.startsWith("-")) {
-        throw new TransportError(`fatal: strange hostname '${userAndHost}' blocked`);
-      }
+      checkSshTarget({ host, ...(user !== undefined ? { user } : {}) });
       const command = gitSshCommand(request);
       const target: SshTarget = {
         host,

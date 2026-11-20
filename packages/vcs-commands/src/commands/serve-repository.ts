@@ -7,7 +7,9 @@
 import {
   createRepositoryFacade,
   createTransportRefStore,
+  type GitServeSettings,
   type ServedRepository,
+  type ServerConfigReader,
 } from "@statewalker/vcs-transport";
 import type { OpenedRepository } from "@statewalker/vcs-working-tree";
 import type { HookSession } from "./git-hooks.js";
@@ -22,21 +24,45 @@ export interface ServedRepositoryOptions {
   hooks?: HookSession;
 }
 
+/** What the served repository's config decides: left to `serveGitService`'s layering. */
+const CONFIG_KEYS = [
+  "allowDeletes",
+  "allowNonFastForward",
+  "denyCurrentBranch",
+  "denyDeleteCurrent",
+  "shallowUpdate",
+  "uploadPackHideRefs",
+  "receivePackHideRefs",
+] as const;
+
+/** A repository without a config reads as one with nothing set: git's defaults. */
+const EMPTY_CONFIG: ServerConfigReader = { getAll: () => [] };
+
 /**
  * An opened repository (`Worktree.openRepository`) as a git server serves it: its objects and
  * refs, its configuration (git-daemon's `daemon.<service>`, `receive.*`, hidden refs), and the
  * settings of git's receive-pack (the current branch and the branches its worktrees have checked
  * out, `receive.denyCurrentBranch=updateInstead`, the hooks given).
  *
+ * The `receive.*` and hidden ref settings are not in `settings` but left to `config`, so
+ * `serveGitService` applies only what the repository's config sets over the operator's
+ * `settings` (git's defaults under both); a repository without a config is served with git's
+ * defaults.
+ *
  * @example
  * ```ts
  * await serveGitConnection({
  *   duplex,
  *   enableReceivePack: true,
- *   resolveRepository: async (path) => {
- *     const opened = await worktree.openRepository?.(`srv${path}`).catch(() => undefined);
- *     return opened && (await servedRepositoryOf(opened));
- *   },
+ *   resolveRepository: createBasePathResolver({
+ *     files,           // the worktree's FilesApi
+ *     basePath: "/srv",
+ *     exportAll: true, // else only repositories with git-daemon-export-ok
+ *     openRepository: async (gitDir) => {
+ *       const opened = await worktree.openRepository?.(gitDir).catch(() => undefined);
+ *       return opened && (await servedRepositoryOf(opened));
+ *     },
+ *   }),
  * });
  * ```
  */
@@ -44,10 +70,14 @@ export async function servedRepositoryOf(
   remote: OpenedRepository,
   options: ServedRepositoryOptions = {},
 ): Promise<ServedRepository> {
+  const settings: Record<string, unknown> = {
+    ...(await receivePackSettingsOf(remote, options.hooks)),
+  };
+  for (const key of CONFIG_KEYS) delete settings[key];
   return {
     repository: createRepositoryFacade({ history: remote.history }),
     refStore: createTransportRefStore(remote.history.refs),
-    ...(remote.config ? { config: remote.config } : {}),
-    settings: await receivePackSettingsOf(remote, options.hooks),
+    config: remote.config ?? EMPTY_CONFIG,
+    settings: settings as GitServeSettings,
   };
 }

@@ -42,7 +42,9 @@ export type MeshGitFetchOptions = Omit<FetchOptions, "fetchImpl"> & MeshRemote;
 /**
  * Fetches from a peer's repository (`git fetch` over smart HTTP through the peer connection):
  * protocol v2 negotiation, refspecs, shallow and tags as the fetch client does them. A refused
- * token throws (`Failed to get refs: 401` / `403`).
+ * token throws an `AuthenticationError` in git's remote-curl words (401: `fatal: Authentication
+ * failed for '<url>/'`; 403: `fatal: unable to access '<url>/': The requested URL returned
+ * error: 403`).
  *
  * @example
  * ```ts

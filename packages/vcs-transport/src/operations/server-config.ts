@@ -101,19 +101,60 @@ function hideRefs(config: ServerConfigReader, section: string): string[] {
   return out;
 }
 
+/** git's defaults: what {@link serverSettingsFromConfig} gives for an empty configuration. */
+export const GIT_SERVER_SETTINGS_DEFAULTS: Readonly<ServerConfigSettings> = Object.freeze({
+  allowDeletes: true,
+  allowNonFastForward: true,
+  denyCurrentBranch: "unconfigured",
+  denyDeleteCurrent: "unconfigured",
+  shallowUpdate: false,
+  uploadPackHideRefs: [],
+  receivePackHideRefs: [],
+});
+
+/**
+ * The settings the configuration sets explicitly: a key appears only when one of the
+ * variables behind it has a value (`receive.denyDeletes` set, a hidden ref pattern listed),
+ * so the result can be layered over another source's settings without resetting what the
+ * configuration leaves alone to git's defaults (see `serveGitService`).
+ *
+ * @example
+ * ```typescript
+ * explicitServerSettingsFromConfig(config); // [receive] denyDeletes = true → { allowDeletes: false }
+ * ```
+ */
+export function explicitServerSettingsFromConfig(
+  config: ServerConfigReader,
+): Partial<ServerConfigSettings> {
+  const out: Partial<ServerConfigSettings> = {};
+  const denyDeletes = last(config, "receive.denyDeletes");
+  if (denyDeletes !== undefined) out.allowDeletes = !configBool(denyDeletes, false);
+  const denyNonFf = last(config, "receive.denyNonFastForwards");
+  if (denyNonFf !== undefined) out.allowNonFastForward = !configBool(denyNonFf, false);
+  const current = config.getAll("receive.denyCurrentBranch");
+  if (current.length > 0) out.denyCurrentBranch = denyAction(current);
+  const deleteCurrent = config.getAll("receive.denyDeleteCurrent");
+  if (deleteCurrent.length > 0) out.denyDeleteCurrent = denyAction(deleteCurrent);
+  const shallow = last(config, "receive.shallowUpdate");
+  if (shallow !== undefined) out.shallowUpdate = configBool(shallow, false);
+  const upload = hideRefs(config, "uploadpack");
+  if (upload.length > 0) out.uploadPackHideRefs = upload;
+  const receive = hideRefs(config, "receive");
+  if (receive.length > 0) out.receivePackHideRefs = receive;
+  return out;
+}
+
 /**
  * The served repository's settings, as git's receive-pack and upload-pack read them from
- * its configuration.
+ * its configuration: every key, git's default ({@link GIT_SERVER_SETTINGS_DEFAULTS}) where the
+ * configuration sets none ({@link explicitServerSettingsFromConfig} gives only the keys set).
  */
 export function serverSettingsFromConfig(config: ServerConfigReader): ServerConfigSettings {
   return {
-    allowDeletes: !configBool(last(config, "receive.denyDeletes"), false),
-    allowNonFastForward: !configBool(last(config, "receive.denyNonFastForwards"), false),
-    denyCurrentBranch: denyAction(config.getAll("receive.denyCurrentBranch")),
-    denyDeleteCurrent: denyAction(config.getAll("receive.denyDeleteCurrent")),
-    shallowUpdate: configBool(last(config, "receive.shallowUpdate"), false),
-    uploadPackHideRefs: hideRefs(config, "uploadpack"),
-    receivePackHideRefs: hideRefs(config, "receive"),
+    ...GIT_SERVER_SETTINGS_DEFAULTS,
+    uploadPackHideRefs: [],
+    receivePackHideRefs: [],
+    ...explicitServerSettingsFromConfig(config),
   };
 }
 

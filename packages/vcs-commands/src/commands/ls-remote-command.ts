@@ -68,6 +68,8 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
   private heads = false;
   private tags = false;
   private uploadPack?: string;
+  /** The remote (name or URL) {@link remoteUrl} resolved */
+  private remoteName?: string;
 
   /**
    * Set the remote to query.
@@ -126,8 +128,9 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
   }
 
   /**
-   * Set the program the remote runs for upload-pack (git's `--upload-pack`): what an ssh
-   * connector runs, and what git:// names in its request line.
+   * Set the program the remote runs for upload-pack (git's `--upload-pack`, over the
+   * `remote.<name>.uploadpack` of the remote listed, given or default): what an ssh connector runs, and
+   * what git:// names in its request line.
    *
    * @param uploadPack Path to git-upload-pack on remote
    */
@@ -156,13 +159,21 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
     // session); either lists with ls-refs over v2, else reads the v0/v1 advertisement, as
     // protocol.version asks; anything else fails in git's words
     const remote = await this.prepareRemote(remoteUrl);
+    // --upload-pack, else remote.<name>.uploadpack (transport_get reads it for a named remote)
+    const uploadPack =
+      this.uploadPack ??
+      (this.remoteName !== undefined
+        ? this.remoteProgram(this.remoteName, "uploadpack")
+        : undefined);
     const options = {
       ...this.remoteSessionOptions(),
-      ...(this.uploadPack !== undefined ? { program: this.uploadPack } : {}),
+      ...(uploadPack !== undefined ? { program: uploadPack } : {}),
     };
     // builtin/ls-remote.c: --tags and --heads become v2 ref-prefixes (v0 lists everything,
-    // filtered here)
+    // filtered here). `ref-prefix HEAD` too, which git does not send: HEAD's symref gives
+    // `defaultBranch` (HEAD itself is never in the refs returned)
     const prefixes = [...(this.tags ? ["refs/tags/"] : []), ...(this.heads ? ["refs/heads/"] : [])];
+    if (prefixes.length > 0) prefixes.push("HEAD");
     const listRefs = async (connection: UploadPackConnection) =>
       connection.version === 2
         ? await lsRefs(connection, prefixes)
@@ -243,13 +254,19 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
   /** The URL of the remote given, or of git's default remote (see {@link callGetUrl}). */
   private async remoteUrl(): Promise<string> {
     const store = RemoteConfigStore.from(this.workingCopy);
-    if (this.remote !== undefined) return store.remoteUrlOf(this.remote);
+    if (this.remote !== undefined) {
+      this.remoteName = this.remote;
+      return store.remoteUrlOf(this.remote);
+    }
     // remotes_remote_for_branch: an explicit branch remote is "given" (add_url_alias)
     const head = await this.refsStore.get("HEAD");
     if (head && isSymbolicRef(head) && head.target.startsWith("refs/heads/")) {
       const branch = head.target.slice("refs/heads/".length);
       const explicit = store.value(`branch.${branch}.remote`);
-      if (explicit !== undefined) return store.remoteUrlOf(explicit);
+      if (explicit !== undefined) {
+        this.remoteName = explicit;
+        return store.remoteUrlOf(explicit);
+      }
     }
     const names = store.configuredNames();
     const name = names.length === 1 ? (names[0] ?? "origin") : "origin";
@@ -257,6 +274,7 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
     if (url === undefined) {
       throw new InvalidRemoteError(name, "fatal: No remote configured to list refs from.");
     }
+    this.remoteName = name;
     return url;
   }
 }

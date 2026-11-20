@@ -4,17 +4,27 @@
  * without native git.
  */
 
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createInMemoryFilesApi, createSymlinkFilesApi } from "@statewalker/vcs-utils/files";
+import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { describe, expect, it } from "vitest";
 import {
+  checkSshTarget,
+  createBasePathResolver,
   createDefaultTransports,
   createGitDaemonConnector,
   createSshConnector,
   type Duplex,
   daemonAvoidsAlias,
+  explicitServerSettingsFromConfig,
   GitDaemonRequestError,
   gitDaemonRequest,
   gitSshCommand,
   gitSshEnv,
+  isUnsafeServicePath,
+  layerServeSettings,
   openDuplexConnection,
   openDuplexReceivePackConnection,
   openHttpConnection,
@@ -26,9 +36,12 @@ import {
   readGitDaemonRequest,
   serveGitConnection,
   serveGitService,
+  serverSettingsFromConfig,
   sqDequoteWords,
   sqQuote,
+  sshArgs,
 } from "../src/index.js";
+import { packOf, pushRequest, serverRepo, ZERO } from "./helpers/receive-pack-harness.js";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -514,5 +527,401 @@ describe("smart-HTTP info/refs failures in git's words", () => {
       (e: Error) => e.message,
     );
     expect(push).toBe("fatal: repository 'https://example.test/r.git/' not found");
+  });
+});
+
+describe("served settings: the operator's, then what a repository's config sets", () => {
+  const reader = (entries: Record<string, unknown[]>) => ({
+    getAll: (key: string) => entries[key.toLowerCase()] ?? [],
+  });
+
+  it("explicitServerSettingsFromConfig gives only the keys set; serverSettingsFromConfig is unchanged", () => {
+    expect(explicitServerSettingsFromConfig(reader({}))).toEqual({});
+    expect(
+      explicitServerSettingsFromConfig(
+        reader({ "receive.denydeletes": ["false"], "uploadpack.hiderefs": ["refs/x/"] }),
+      ),
+    ).toEqual({ allowDeletes: true, uploadPackHideRefs: ["refs/x"] });
+    expect(serverSettingsFromConfig(reader({ "receive.denydeletes": ["true"] }))).toEqual({
+      allowDeletes: false,
+      allowNonFastForward: true,
+      denyCurrentBranch: "unconfigured",
+      denyDeleteCurrent: "unconfigured",
+      shallowUpdate: false,
+      uploadPackHideRefs: [],
+      receivePackHideRefs: [],
+    });
+  });
+
+  it("layers: undefined keeps the value below, hidden ref lists concatenate", () => {
+    expect(
+      layerServeSettings(
+        { allowDeletes: false, uploadPackHideRefs: ["refs/secret"], hideRefs: ["refs/a"] },
+        { allowDeletes: undefined, uploadPackHideRefs: ["!refs/secret/open"] },
+        { allowNonFastForward: true },
+      ),
+    ).toEqual({
+      allowDeletes: false,
+      allowNonFastForward: true,
+      hideRefs: ["refs/a"],
+      uploadPackHideRefs: ["refs/secret", "!refs/secret/open"],
+    });
+  });
+
+  /** A push through `serveGitService` (implicit session), its written answer as text. */
+  async function pushThrough(
+    config: Record<string, unknown[]>,
+    commands: string[],
+    withPack: boolean,
+  ): Promise<string> {
+    const { repo, c1, c2 } = await serverRepo();
+    await repo.refStore.update("refs/heads/other", c2);
+    await repo.refStore.update("refs/secret/x", c1);
+    const lines = commands.map((c) => c.replace("C1", c1).replace("C2", c2));
+    const bytes = pushRequest({
+      commands: lines,
+      caps: "report-status",
+      ...(withPack ? { pack: await packOf(repo, []) } : {}),
+    });
+    const duplex = serverSide(bytes);
+    await serveGitService({
+      duplex,
+      service: "git-receive-pack",
+      path: "/r.git",
+      enableReceivePack: true,
+      settings: {
+        allowNonFastForward: false,
+        allowDeletes: false,
+        receivePackHideRefs: ["refs/secret"],
+        bare: true,
+      },
+      resolveRepository: async () => ({
+        repository: repo.facade,
+        refStore: repo.refStore,
+        config: reader(config),
+      }),
+    });
+    return duplex.written();
+  }
+
+  it("a repository config that sets nothing keeps the operator's policies (git's defaults do not override)", async () => {
+    const deleted = await pushThrough({}, [`C2 ${ZERO} refs/heads/other`], false);
+    expect(deleted).toContain("ng refs/heads/other deletion prohibited");
+    expect(deleted).not.toContain("refs/secret/x");
+    const forced = await pushThrough({}, ["C2 C1 refs/heads/other"], true);
+    expect(forced).toContain("ng refs/heads/other non-fast-forward");
+  });
+
+  it("a key the repository's config sets explicitly overrides the operator's, as git's repository config", async () => {
+    const deleted = await pushThrough(
+      { "receive.denydeletes": ["false"] },
+      [`C2 ${ZERO} refs/heads/other`],
+      false,
+    );
+    expect(deleted).toContain("ok refs/heads/other");
+    // the repository's hidden refs add to the operator's
+    const hidden = await pushThrough(
+      { "receive.hiderefs": ["refs/heads/other"] },
+      [`C2 ${ZERO} refs/heads/main`],
+      false,
+    );
+    expect(hidden).not.toContain("refs/secret/x");
+    expect(hidden.split("0000")[0]).not.toContain("refs/heads/other");
+  });
+});
+
+describe("served paths are client input", () => {
+  it("isUnsafeServicePath: git-daemon's aliases, NUL and backslash; relative paths in an implicit session", () => {
+    for (const path of ["/../../etc", "/a//b", "/a/./b", "/a/..", "/a/.", "/a\0b", "/a\\b", "x"]) {
+      expect(isUnsafeServicePath(path), path).toBe(true);
+    }
+    for (const path of ["/a/b.git", "/a/...b", "~alice/r", "/"]) {
+      expect(isUnsafeServicePath(path), path).toBe(false);
+    }
+    expect(isUnsafeServicePath("~/r")).toBe(true); // git-daemon has no current user
+    for (const path of ["../x", "a/../../x", "a//b", "~/../x", "r\0"]) {
+      expect(isUnsafeServicePath(path, { implicit: true }), path).toBe(true);
+    }
+    for (const path of ["r.git", "~/r.git", "~bob/r.git", "/srv/r.git"]) {
+      expect(isUnsafeServicePath(path, { implicit: true }), path).toBe(false);
+    }
+  });
+
+  it("both modes refuse an alias before resolveRepository; implicit refusals are uniform", async () => {
+    const asked: string[] = [];
+    const resolveRepository = async (path: string) => {
+      asked.push(path);
+      return undefined;
+    };
+    for (const path of ["../x", "a/../../etc", "/a//b", "x\0y"]) {
+      const duplex = serverSide();
+      await serveGitService({ duplex, service: "git-upload-pack", path, resolveRepository });
+      expect(duplex.written()).toBe(line(`ERR '${path}' does not appear to be a git repository`));
+    }
+    expect(asked).toEqual([]);
+    // receive-pack not enabled: the same text unless informative
+    const push = serverSide();
+    await serveGitService({
+      duplex: push,
+      service: "git-receive-pack",
+      path: "r",
+      resolveRepository,
+    });
+    expect(push.written()).toBe(line("ERR 'r' does not appear to be a git repository"));
+    const informative = serverSide();
+    await serveGitService({
+      duplex: informative,
+      service: "git-receive-pack",
+      path: "r",
+      resolveRepository,
+      informativeErrors: true,
+    });
+    expect(informative.written()).toBe(line("ERR service not enabled: r"));
+  });
+
+  it("an implicit session ignores daemon.* unless allowOverride", async () => {
+    const repo = async () => ({
+      repository: {} as never,
+      refStore: {} as never,
+      config: { getAll: (key: string) => (key === "daemon.uploadpack" ? ["false"] : []) },
+    });
+    const off = serverSide();
+    await serveGitService({
+      duplex: off,
+      service: "git-upload-pack",
+      path: "r",
+      resolveRepository: repo,
+      allowOverride: true,
+    });
+    expect(off.written()).toBe(line("ERR 'r' does not appear to be a git repository"));
+    // default: the override is not read, upload-pack is served (and fails on the fake repo)
+    const served = serverSide();
+    const result = await serveGitService({
+      duplex: served,
+      service: "git-upload-pack",
+      path: "r",
+      resolveRepository: repo,
+    });
+    expect(result.refused).toBeUndefined();
+  });
+});
+
+describe("createBasePathResolver: git-daemon's path rules", () => {
+  const enc2 = new TextEncoder();
+  /** A storage with git directories at `dirs` (each with `objects/`, `refs/`, `HEAD`). */
+  async function storage(dirs: string[], exported: string[] = dirs) {
+    const files = createSymlinkFilesApi(createInMemoryFilesApi());
+    for (const dir of dirs) {
+      await files.mkdir(`${dir}/objects`);
+      await files.mkdir(`${dir}/refs`);
+      await files.write(`${dir}/HEAD`, [enc2.encode("ref: refs/heads/main\n")]);
+    }
+    for (const dir of exported) await files.write(`${dir}/git-daemon-export-ok`, []);
+    return files;
+  }
+  const request = (path: string) => ({ service: "git-upload-pack", path, version: 0 as const });
+  const opened = (gitDir: string) => ({ gitDir }) as never;
+  const resolverOf = (
+    files: Awaited<ReturnType<typeof storage>>,
+    options: Partial<Parameters<typeof createBasePathResolver>[0]> = {},
+  ) => {
+    const resolve = createBasePathResolver({
+      files,
+      basePath: "/srv",
+      openRepository: async (gitDir) => opened(gitDir),
+      ...options,
+    });
+    return async (path: string) =>
+      ((await resolve(path, request(path))) as { gitDir?: string } | undefined)?.gitDir;
+  };
+
+  it("joins the base, tries enter_repo's suffixes, needs git-daemon-export-ok", async () => {
+    const files = await storage(
+      ["/srv/a/.git", "/srv/b", "/srv/c.git", "/srv/d.git/.git", "/srv/hidden.git"],
+      ["/srv/a/.git", "/srv/b", "/srv/c.git", "/srv/d.git/.git"],
+    );
+    const resolve = resolverOf(files);
+    expect(await resolve("/a")).toBe("/srv/a/.git");
+    expect(await resolve("/b/")).toBe("/srv/b");
+    expect(await resolve("/c")).toBe("/srv/c.git");
+    expect(await resolve("/d")).toBe("/srv/d.git/.git");
+    expect(await resolve("/hidden")).toBeUndefined();
+    expect(await resolverOf(files, { exportAll: true })("/hidden")).toBe("/srv/hidden.git");
+    expect(await resolve("/nope")).toBeUndefined();
+    // an implicit session's relative path, read below the base too
+    expect(await resolve("b")).toBe("/srv/b");
+  });
+
+  it("refuses aliases, ~user without userPath, and paths leaving the base", async () => {
+    const files = await storage(["/srv/r.git", "/etc/x.git", "/home/root/pub/x.git"]);
+    const resolve = resolverOf(files);
+    for (const path of [
+      "/../../etc",
+      "../x",
+      "/../etc/x",
+      "~root/x",
+      "/a//b",
+      "/r\0",
+      "/r.git\\",
+    ]) {
+      expect(await resolve(path), path).toBeUndefined();
+    }
+    const users = resolverOf(files, {
+      userPath: (user) => (user === "root" ? "/home/root/pub" : undefined),
+    });
+    expect(await users("~root/x")).toBe("/home/root/pub/x.git");
+    expect(await users("~bob/x")).toBeUndefined();
+    expect(await users("~root/../../etc/x")).toBeUndefined();
+  });
+
+  it("strict paths and the whitelist", async () => {
+    const files = await storage(["/srv/r.git", "/srv/team/t.git"]);
+    expect(await resolverOf(files, { strictPaths: true })("/r.git")).toBeUndefined();
+    const strict = resolverOf(files, { strictPaths: true, whitelist: ["/srv/r.git"] });
+    expect(await strict("/r.git")).toBe("/srv/r.git");
+    expect(await strict("/r")).toBeUndefined();
+    const listed = resolverOf(files, { whitelist: ["/srv/team"] });
+    expect(await listed("/team/t")).toBe("/srv/team/t.git");
+    expect(await listed("/r")).toBeUndefined();
+  });
+
+  it("symbolic links: followed inside the base, refused when they lead out", async () => {
+    const files = await storage(["/srv/real.git", "/outside/r.git"]);
+    await files.symlink?.(enc2.encode("real.git"), "/srv/alias.git");
+    await files.symlink?.(enc2.encode("../outside/r.git"), "/srv/evil.git");
+    await files.symlink?.(enc2.encode("/outside/r.git"), "/srv/abs.git");
+    const resolve = resolverOf(files);
+    expect(await resolve("/alias")).toBe("/srv/real.git");
+    expect(await resolve("/evil")).toBeUndefined();
+    expect(await resolve("/abs")).toBeUndefined();
+
+    // on disk, through the Node FilesApi
+    const root = mkdtempSync(join(tmpdir(), "base-path-"));
+    try {
+      for (const dir of ["srv/real.git", "outside/r.git"]) {
+        mkdirSync(join(root, dir, "objects"), { recursive: true });
+        mkdirSync(join(root, dir, "refs"));
+        writeFileSync(join(root, dir, "HEAD"), "ref: refs/heads/main\n");
+        writeFileSync(join(root, dir, "git-daemon-export-ok"), "");
+      }
+      symlinkSync("real.git", join(root, "srv/alias.git"));
+      symlinkSync("../outside/r.git", join(root, "srv/evil.git"));
+      const disk = resolverOf(createNodeFilesApi({ rootDir: root }) as never);
+      expect(await disk("/real")).toBe("/srv/real.git");
+      expect(await disk("/alias")).toBe("/srv/real.git");
+      expect(await disk("/evil")).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("ssh targets that look like options", () => {
+  it("refuses a host or user starting with '-', in git's words", async () => {
+    const execs: unknown[] = [];
+    const transports = createDefaultTransports({
+      exec: async (target) => {
+        execs.push(target);
+        return serverSide();
+      },
+    });
+    for (const [url, userAndHost] of [
+      ["u@-oProxyCommand=x:r.git", "u@-oProxyCommand=x"],
+      ["ssh://u@-oX/r", "u@-oX"],
+      ["ssh://-u@h/r", "-u@h"],
+    ] as const) {
+      const connector = transports.resolve(url);
+      await expect(
+        connector?.connect({
+          url: parseGitUrl(url),
+          service: "git-upload-pack",
+          protocolVersion: 0,
+        }),
+      ).rejects.toThrow(`fatal: strange hostname '${userAndHost}' blocked`);
+    }
+    expect(execs).toEqual([]);
+    expect(() => checkSshTarget({ host: "h", user: "-l" })).toThrow("strange hostname '-l@h'");
+  });
+
+  it("sshArgs: the port checked, `--` before one user@host argument", () => {
+    expect(sshArgs({ host: "example.com", port: 2222, user: "git" })).toEqual([
+      "-p",
+      "2222",
+      "--",
+      "git@example.com",
+    ]);
+    expect(sshArgs({ host: "::1" })).toEqual(["--", "::1"]);
+    expect(() => sshArgs({ host: "h", port: 1.5 })).toThrow("strange port '1.5' blocked");
+    expect(() => sshArgs({ host: "h", port: 70000 })).toThrow("strange port");
+    expect(() => sshArgs({ host: "-oProxyCommand=x" })).toThrow("strange hostname");
+  });
+
+  it("an invalid port stays in the host, as git's get_host_and_port leaves it", () => {
+    expect(parseGitUrl("ssh://h:-1/r")).toMatchObject({ host: "h:-1", path: "/r" });
+    expect(parseGitUrl("ssh://h:-1/r").port).toBeUndefined();
+    expect(sshArgs({ host: "h:-1" })).toEqual(["--", "h:-1"]);
+  });
+
+  it("parseGitServiceCommand: one quoted argument, nothing after it, as git-shell's sq_dequote", () => {
+    expect(parseGitServiceCommand("git-upload-pack '/r' ")).toBeUndefined();
+    expect(parseGitServiceCommand("git-upload-pack  '/r'")).toBeUndefined();
+    expect(parseGitServiceCommand("git-upload-pack /r")).toBeUndefined();
+    expect(parseGitServiceCommand("git-upload-pack '-x'")).toBeUndefined();
+    expect(parseGitServiceCommand("git\tupload-pack '/r'")).toEqual({
+      service: "git-upload-pack",
+      path: "/r",
+    });
+  });
+});
+
+describe("serveGitConnection time limits", () => {
+  /** A duplex whose client sends `parts` and then stalls, never ending. */
+  function stalling(...parts: Uint8Array[]): Duplex & { written(): string; closed: boolean } {
+    const out: Uint8Array[] = [];
+    const duplex = {
+      closed: false,
+      [Symbol.asyncIterator]: () =>
+        (async function* () {
+          for (const part of parts) yield part;
+          await new Promise(() => {});
+        })()[Symbol.asyncIterator](),
+      write(data: Uint8Array) {
+        out.push(data.slice());
+      },
+      async close() {
+        duplex.closed = true;
+      },
+      written: () => out.map((c) => dec.decode(c)).join(""),
+    };
+    return duplex;
+  }
+
+  it("initTimeout: no request line in time, closed without an answer", async () => {
+    const duplex = stalling(enc.encode("00"));
+    const result = await serveGitConnection({
+      duplex,
+      initTimeout: 20,
+      resolveRepository: async () => undefined,
+    });
+    expect(result).toMatchObject({
+      success: false,
+      refused: "timed out waiting for the request line",
+    });
+    expect(duplex.written()).toBe("");
+    expect(duplex.closed).toBe(true);
+  });
+
+  it("timeout: a client that stops sending mid-service is cut off", async () => {
+    const { repo } = await serverRepo();
+    const duplex = stalling(pkt("git-receive-pack /r\0host=h\0"));
+    const result = await serveGitConnection({
+      duplex,
+      enableReceivePack: true,
+      timeout: 30,
+      resolveRepository: async () => ({ repository: repo.facade, refStore: repo.refStore }),
+    });
+    expect(result).toMatchObject({ success: false, error: "timed out waiting for the client" });
+    expect(duplex.closed).toBe(true);
+    expect(duplex.written()).toContain("refs/heads/main");
   });
 });

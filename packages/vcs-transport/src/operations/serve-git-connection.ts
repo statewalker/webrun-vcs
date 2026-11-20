@@ -3,12 +3,27 @@
  * service) and the side of an ssh-like session whose service, path and protocol arrive out of
  * band (the command an ssh channel runs, its `GIT_PROTOCOL`).
  *
+ * The path a request names is client input: it is checked as git-daemon checks it
+ * (`daemon_avoid_alias`, plus no NUL or backslash) before `resolveRepository` sees it, and
+ * {@link createBasePathResolver} maps it onto a directory as git-daemon does (base path,
+ * `~user`, `.git` suffixes, `git-daemon-export-ok`, staying inside the base).
+ *
+ * Neither function bounds how long a client may take: give {@link serveGitConnection} an
+ * `initTimeout` and `timeout` (git-daemon's `--init-timeout` / `--timeout`), or close the
+ * stream from outside, where clients are not trusted.
+ *
  * @example git:// over a socket
  * ```ts
  * await serveGitConnection({
  *   duplex: socketDuplex,
  *   enableReceivePack: true,
- *   resolveRepository: async (path) => repos.get(path), // { repository, refStore, config? }
+ *   initTimeout: 10_000,
+ *   timeout: 60_000,
+ *   resolveRepository: createBasePathResolver({
+ *     files,                 // where the repositories are
+ *     basePath: "/srv/git",  // git-daemon's --base-path
+ *     openRepository: async (gitDir) => repos.open(gitDir), // { repository, refStore, config? }
+ *   }),
  * });
  * ```
  */
@@ -24,7 +39,11 @@ import {
 } from "../protocol/git-daemon-request.js";
 import { encodePacket } from "../protocol/pkt-line-codec.js";
 import { type ServeOverDuplexOptions, serveOverDuplex } from "./serve-over-duplex.js";
-import { type ServerConfigReader, serverSettingsFromConfig } from "./server-config.js";
+import {
+  explicitServerSettingsFromConfig,
+  GIT_SERVER_SETTINGS_DEFAULTS,
+  type ServerConfigReader,
+} from "./server-config.js";
 
 /** The `serveOverDuplex` options a served repository decides (everything but the stream and the protocol). */
 export type GitServeSettings = Omit<
@@ -39,10 +58,15 @@ export interface ServedRepository {
   /**
    * Its configuration: git-daemon's per-repository `daemon.uploadpack` / `daemon.receivepack`
    * overrides, and the settings git's upload-pack and receive-pack read
-   * (`serverSettingsFromConfig`: `receive.*`, hidden refs)
+   * (`explicitServerSettingsFromConfig`: `receive.*`, hidden refs). Only what it sets
+   * explicitly overrides {@link GitServeOptions.settings}; see there for the order.
    */
   config?: ServerConfigReader;
-  /** Server settings of this repository, over those its config gives (hooks, current branch, ...) */
+  /**
+   * Server settings of this repository (hooks, current branch, ...), over the operator's and
+   * those its config sets: the last word, so a resolver that must enforce a policy whatever a
+   * repository's config says sets it here
+   */
   settings?: GitServeSettings;
 }
 
@@ -66,7 +90,13 @@ export interface GitServiceRequest {
 export interface GitServeOptions {
   /**
    * The repository a request names, or undefined when there is none to serve (git-daemon's
-   * "no such repository" and "repository not exported" alike)
+   * "no such repository" and "repository not exported" alike).
+   *
+   * `path` is client input, as sent: it has passed {@link isUnsafeServicePath} (no `..`,
+   * `//`, `/./`, NUL or backslash; git-daemon's `daemon_avoid_alias`), but it is not mapped
+   * anywhere yet, may start with `~`, and in an implicit session may be relative. Map it
+   * with {@link createBasePathResolver}, or check it as strictly yourself, never by joining
+   * it to a directory unchecked.
    */
   resolveRepository(
     path: string,
@@ -74,19 +104,36 @@ export interface GitServeOptions {
   ): Promise<ServedRepository | undefined>;
   /** Serve upload-pack (default true; git-daemon's `--disable=upload-pack` is false) */
   enableUploadPack?: boolean;
-  /** Serve receive-pack (default false, as git-daemon without `--enable=receive-pack`) */
+  /**
+   * Serve receive-pack (default false, as git-daemon without `--enable=receive-pack`; an
+   * implicit session too: an ssh server that accepts pushes says so)
+   */
   enableReceivePack?: boolean;
   /**
    * Let a repository's `daemon.uploadpack` / `daemon.receivepack` turn its service on or off
-   * (default true; git-daemon's `--forbid-override` is false)
+   * (git-daemon's `--forbid-override` is false). Default: true for git:// (`refusal:
+   * "daemon"`, as git-daemon), false for an implicit session (an ssh channel runs the service
+   * the operator allows: git's upload-pack and receive-pack never read `daemon.*`)
    */
   allowOverride?: boolean;
   /**
    * Refusals name their reason (git-daemon's `--informative-errors`: "no such repository",
-   * "service not enabled"); default: "access denied or repository not exported" for all
+   * "service not enabled"); default: one text for every refusal ("access denied or
+   * repository not exported" for git://, `'<path>' does not appear to be a git repository`
+   * for an implicit session), so a client cannot tell a missing repository from a refused one
    */
   informativeErrors?: boolean;
-  /** Settings of every served repository, under each one's own */
+  /**
+   * Settings of every served repository (the operator's: git's system config), under each
+   * repository's. The layers, lowest first: git's defaults (`GIT_SERVER_SETTINGS_DEFAULTS`,
+   * for a repository served with a `config`; `serveOverDuplex`'s defaults otherwise), these, what the repository's `config` sets explicitly (as git's repository config over
+   * its system config: a repository setting `receive.denyDeletes=false` does allow deletes
+   * here), then the resolver's `ServedRepository.settings`. A key the repository's config
+   * leaves unset keeps the operator's value; hidden ref lists (`hideRefs`,
+   * `uploadPackHideRefs`, `receivePackHideRefs`) are not replaced but concatenated, every
+   * layer's patterns in that order, as git reads multi-valued `*.hideRefs` from each config
+   * file (a later `!pattern` can still unhide an earlier one, as in git).
+   */
   settings?: GitServeSettings;
   /** Close the stream once served (default true: the connection is over, as git-daemon's child exits) */
   closeDuplex?: boolean;
@@ -96,6 +143,17 @@ export interface GitServeOptions {
 export interface ServeGitConnectionOptions extends GitServeOptions {
   /** The connection; its first pkt-line is git-daemon's request line */
   duplex: Duplex;
+  /**
+   * Most milliseconds to wait for the request line (git-daemon's `--init-timeout`); the
+   * stream is closed without an answer when it does not arrive in time. Default: no limit
+   */
+  initTimeout?: number;
+  /**
+   * Most milliseconds the service waits for the client's next bytes (git-daemon's
+   * `--timeout`, which it hands to upload-pack); the stream is closed when it is exceeded.
+   * Time the server spends working is not counted. Default: no limit
+   */
+  timeout?: number;
 }
 
 /** Options of {@link serveGitService}: a session whose request arrived out of band. */
@@ -133,6 +191,28 @@ const DAEMON_SERVICES: Record<string, string> = {
   "git-upload-pack": "uploadpack",
   "git-receive-pack": "receivepack",
 };
+
+/**
+ * Whether a served path is refused before any lookup: a NUL or a backslash anywhere (not
+ * git's: a path reaching another API than POSIX's could take either for a separator or an
+ * end), or git-daemon's aliases ({@link daemonAvoidsAlias}). git:// (`implicit` false) asks
+ * for an absolute or `~user` path as git-daemon does; an implicit session (ssh) also sends
+ * relative paths (`host:r.git`) and `~/r.git`, checked as if below a `/`.
+ *
+ * @example
+ * ```ts
+ * isUnsafeServicePath("/a/../b");                     // true
+ * isUnsafeServicePath("r.git", { implicit: true });   // false
+ * isUnsafeServicePath("../r.git", { implicit: true }); // true
+ * ```
+ */
+export function isUnsafeServicePath(path: string, options: { implicit?: boolean } = {}): boolean {
+  if (path.includes("\0") || path.includes("\\")) return true;
+  if (!options.implicit) return daemonAvoidsAlias(path);
+  if (path.startsWith("~/")) return daemonAvoidsAlias(path.slice(1));
+  if (path.startsWith("/") || path.startsWith("~")) return daemonAvoidsAlias(path);
+  return daemonAvoidsAlias(`/${path}`);
+}
 
 /**
  * path.c's `daemon_avoid_alias`: a path git-daemon refuses before looking for it (not absolute
@@ -177,6 +257,92 @@ function configBool(config: ServerConfigReader | undefined, key: string): boolea
   return Number.isFinite(n) ? n !== 0 : undefined;
 }
 
+/** The hidden ref lists of the settings: concatenated across layers, never replaced. */
+const HIDE_REF_KEYS = ["hideRefs", "uploadPackHideRefs", "receivePackHideRefs"] as const;
+
+/**
+ * Layers server settings, the later over the earlier: a key a layer leaves undefined keeps
+ * the value below; the hidden ref lists concatenate (see {@link GitServeOptions.settings}).
+ */
+export function layerServeSettings(
+  ...layers: Array<Partial<GitServeSettings> | undefined>
+): GitServeSettings {
+  const out: Record<string, unknown> = {};
+  const hidden: Record<string, string[]> = {};
+  for (const layer of layers) {
+    if (!layer) continue;
+    for (const [key, value] of Object.entries(layer)) {
+      if (value === undefined) continue;
+      if ((HIDE_REF_KEYS as readonly string[]).includes(key)) {
+        const patterns = hidden[key] ?? [];
+        patterns.push(...(value as string[]));
+        hidden[key] = patterns;
+      } else {
+        out[key] = value;
+      }
+    }
+  }
+  for (const [key, patterns] of Object.entries(hidden)) {
+    if (patterns.length > 0) out[key] = patterns;
+  }
+  return out as GitServeSettings;
+}
+
+/**
+ * The stream with an inactivity limit: a read the client does not answer within `ms` ends
+ * the input (as a hang-up) and closes the stream. `expired()` tells whether it happened.
+ */
+function withReadTimeout(duplex: Duplex, ms: number): Duplex & { expired(): boolean } {
+  let expired = false;
+  return {
+    [Symbol.asyncIterator]: () => {
+      const inner = duplex[Symbol.asyncIterator]();
+      return {
+        async next(): Promise<IteratorResult<Uint8Array>> {
+          if (expired) return { value: undefined, done: true };
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timedOut = new Promise<IteratorResult<Uint8Array>>((resolve) => {
+            timer = setTimeout(() => {
+              expired = true;
+              void closeQuietly(duplex);
+              resolve({ value: undefined, done: true });
+            }, ms);
+          });
+          try {
+            return await Promise.race([inner.next(), timedOut]);
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+        async return(): Promise<IteratorResult<Uint8Array>> {
+          await inner.return?.();
+          return { value: undefined, done: true };
+        },
+      };
+    },
+    write: (data) => duplex.write(data),
+    ...(duplex.end ? { end: () => duplex.end?.() ?? Promise.resolve() } : {}),
+    ...(duplex.close ? { close: () => duplex.close?.() ?? Promise.resolve() } : {}),
+    expired: () => expired,
+  };
+}
+
+/** `promise`, or undefined once `ms` (when given) pass first. */
+async function within<T>(promise: Promise<T>, ms: number | undefined): Promise<T | undefined> {
+  if (ms === undefined) return promise;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function closeQuietly(duplex: Duplex): Promise<void> {
   try {
     await duplex.close?.();
@@ -189,7 +355,8 @@ async function closeQuietly(duplex: Duplex): Promise<void> {
  * Serves one git:// connection as git-daemon does (daemon.c's `execute` and `run_service`):
  * reads the request line (`git-upload-pack /r.git\0host=h\0\0version=2\0`) without losing the
  * bytes after it, then serves the service it names ({@link serveGitService}). A request
- * git-daemon dies on (malformed, an unknown command) gets no answer: the stream is closed.
+ * git-daemon dies on (malformed, an unknown command, none within `initTimeout`) gets no
+ * answer: the stream is closed.
  *
  * @example
  * ```ts
@@ -201,10 +368,19 @@ async function closeQuietly(duplex: Duplex): Promise<void> {
 export async function serveGitConnection(
   options: ServeGitConnectionOptions,
 ): Promise<ServeGitConnectionResult> {
-  const { duplex } = options;
-  let read: Awaited<ReturnType<typeof readGitDaemonRequest>>;
+  const timed =
+    options.timeout !== undefined ? withReadTimeout(options.duplex, options.timeout) : undefined;
+  const duplex: Duplex = timed ?? options.duplex;
+  let read: Awaited<ReturnType<typeof readGitDaemonRequest>> | undefined;
   try {
-    read = await readGitDaemonRequest(duplex);
+    const reading = readGitDaemonRequest(duplex);
+    read = await within(reading, options.initTimeout);
+    if (read === undefined) {
+      reading.catch(() => undefined);
+      await closeQuietly(duplex);
+      const message = "timed out waiting for the request line";
+      return { success: false, error: message, refused: message };
+    }
   } catch (error) {
     if (options.closeDuplex !== false) await closeQuietly(duplex);
     const message = error instanceof Error ? error.message : String(error);
@@ -223,7 +399,7 @@ export async function serveGitConnection(
     ...(duplex.end ? { end: () => duplex.end?.() ?? Promise.resolve() } : {}),
     ...(duplex.close ? { close: () => duplex.close?.() ?? Promise.resolve() } : {}),
   };
-  return serveGitService({
+  const result = await serveGitService({
     ...options,
     duplex: rest,
     service: request.command,
@@ -233,14 +409,19 @@ export async function serveGitConnection(
     ...(request.host !== undefined ? { host: request.host } : {}),
     ...(request.port !== undefined ? { port: request.port } : {}),
   });
+  if (timed?.expired()) {
+    const message = "timed out waiting for the client";
+    return { ...result, success: false, error: message };
+  }
+  return result;
 }
 
 /**
  * Serves a session whose service, path and protocol are known already (an ssh channel that
  * runs `git-upload-pack '<path>'` with `GIT_PROTOCOL=version=2`; git:// after its request
  * line): the service checks of git-daemon's `run_service` (enabled, the path, the
- * repository, its `daemon.<service>` override), then `serveOverDuplex` with the repository's
- * settings at the protocol asked for (v2 for upload-pack; `version 1` announced for v1; a push
+ * repository, its `daemon.<service>` override), then `serveOverDuplex` with the settings
+ * layered as {@link GitServeOptions.settings} tells, at the protocol asked for (v2 for upload-pack; `version 1` announced for v1; a push
  * asking for v2 gets v0, as git's receive-pack).
  */
 export async function serveGitService(
@@ -260,7 +441,7 @@ export async function serveGitService(
   const refuse = async (reason: "no such repository" | "service not enabled") => {
     const text = daemon
       ? `ERR ${options.informativeErrors ? reason : "access denied or repository not exported"}: ${path}`
-      : reason === "service not enabled"
+      : reason === "service not enabled" && options.informativeErrors
         ? `ERR service not enabled: ${path}`
         : `ERR '${path}' does not appear to be a git repository`;
     try {
@@ -280,9 +461,9 @@ export async function serveGitService(
       : service === "git-receive-pack"
         ? options.enableReceivePack === true
         : false;
-  const overridable = options.allowOverride !== false;
+  const overridable = options.allowOverride ?? daemon;
   if (!enabled && !overridable) return refuse("service not enabled");
-  if (daemon && daemonAvoidsAlias(path)) return refuse("no such repository");
+  if (isUnsafeServicePath(path, { implicit: !daemon })) return refuse("no such repository");
   let served: ServedRepository | undefined;
   try {
     served = await options.resolveRepository(path, request);
@@ -296,12 +477,17 @@ export async function serveGitService(
     return refuse("service not enabled");
   }
 
-  const fromConfig = served.config ? serverSettingsFromConfig(served.config) : {};
+  // git's defaults under everything for a repository with a config (git reads one always);
+  // without one, serveOverDuplex's own defaults
+  const settings = layerServeSettings(
+    served.config ? GIT_SERVER_SETTINGS_DEFAULTS : undefined,
+    options.settings,
+    served.config ? explicitServerSettingsFromConfig(served.config) : undefined,
+    served.settings,
+  );
   try {
     const result = await serveOverDuplex({
-      ...options.settings,
-      ...fromConfig,
-      ...served.settings,
+      ...settings,
       duplex,
       repository: served.repository,
       refStore: served.refStore,
