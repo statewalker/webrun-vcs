@@ -595,7 +595,6 @@ function encodeFlat(
   let runAt = 0;
   const flushRun = () => {
     if (runBuffer) out.set(runBuffer.subarray(runStart, runEnd), runAt);
-    if (runBuffer) out.set(runBuffer.subarray(runStart, runEnd), runAt);
     runBuffer = undefined;
   };
   for (let i = 0; i < count; i++) {

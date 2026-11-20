@@ -289,7 +289,8 @@ export class IndexFile {
       return undefined;
     }
     const data = await readFile(this.files, this.path);
-    // the bytes are ours alone: the entries keep them as their encoding for the next write
+    // the entries keep these bytes as their encoding for the next write; nothing changes
+    // file content in place (an in-memory FilesApi may hand back its stored array itself)
     const parsed = await parseIndexFile(data, { keepEncoding: true });
     this.encoding = parsed.encoding;
     try {
