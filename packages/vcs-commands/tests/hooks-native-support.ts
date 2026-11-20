@@ -35,7 +35,7 @@ n=$(basename "$0")
   for a in "$@"; do printf ' [%s]' "$a"; done
   echo
   for v in GIT_INDEX_FILE GIT_EDITOR GIT_PREFIX GIT_DIR GIT_WORK_TREE GIT_REFLOG_ACTION GIT_PUSH_OPTION_COUNT GIT_QUARANTINE_PATH; do
-    if env | grep -q "^$v="; then printf '%s=%s
+    if printenv "$v" >/dev/null; then printf '%s=%s
 ' "$v" "$(printenv "$v")"; fi
   done
   printf 'pwd=%s
