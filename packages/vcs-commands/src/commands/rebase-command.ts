@@ -53,6 +53,7 @@ import {
   indexChanges,
   OperationState,
   readIndex,
+  refsWatched,
   storeFlatTreeOver,
   subjectOf,
   switchTrees,
@@ -1046,15 +1047,18 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await state.write(`${DIR}/end`, `${commands}\n`);
     await state.write(`${DIR}/msgnum`, "0\n");
     // checkout_onto's reset_head: ORIG_HEAD expecting its old value, then HEAD detached
-    // expecting the commit it left (as the reference-transaction hook sees both)
-    await moveHeadAsReset(
-      this.refsStore,
-      state,
-      headId,
-      start,
-      this.startLog(),
-      "rebase: updating ORIG_HEAD",
-      { detach: true },
+    // expecting the commit it left (as the reference-transaction hook sees both); an
+    // ORIG_HEAD it cannot write is reported (as reset reports it) and HEAD moves all the same
+    output.push(
+      ...(await moveHeadAsReset(
+        this.refsStore,
+        state,
+        headId,
+        start,
+        this.startLog(),
+        "rebase: updating ORIG_HEAD",
+        { detach: true },
+      )),
     );
     // checkout_onto's post-checkout hook: the HEAD left, the commit the picks start from
     await runPostCheckoutHook(this.hooks, headId, start, true);
@@ -1481,8 +1485,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       if (!fixup) {
         // do_pick_commit writes CHERRY_PICK_HEAD after a conflicted merge too; the rebase
         // stopping there deletes it again (REBASE_HEAD names the commit instead)
-        await state.setRef("CHERRY_PICK_HEAD", item.id);
-        await state.deleteRef("CHERRY_PICK_HEAD");
+        await state.writeAndDeleteRef("CHERRY_PICK_HEAD", item.id);
       }
       return {
         kind: "conflicts",
@@ -1584,16 +1587,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       const message = signoff ? stripspace(pickedMessage) : pickedMessage;
       // do_pick_commit writes CHERRY_PICK_HEAD for the commit to come; do_commit deletes it
       // once try_to_commit made it
-      await state.setRef("CHERRY_PICK_HEAD", item.id);
-      await this.commitOnto(
-        state,
-        unborn ? [] : [headId],
-        treeId,
-        commit.author,
-        message,
-        item.action,
+      await state.withRefDuring("CHERRY_PICK_HEAD", item.id, () =>
+        this.commitOnto(state, unborn ? [] : [headId], treeId, commit.author, message, item.action),
       );
-      await state.deleteRef("CHERRY_PICK_HEAD");
       // do_commit: the commit made, MERGE_MSG removed
       await state.remove("MERGE_MSG");
       if (item.action === RebaseAction.REWORD) {
@@ -2925,14 +2921,16 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       message: hooked,
     });
     const action = reflogMessages.rebaseStep(this.reflogAction("rebase"), step);
-    // update_head_with_reflog: HEAD expecting the commit it is at (detached while rebasing)
-    const current = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
-    await updateHeadExpecting(
-      this.refsStore,
-      id,
-      current,
-      this.reflogLine(reflogMessages.pick(action, hooked), this.committer),
-    );
+    const log = this.reflogLine(reflogMessages.pick(action, hooked), this.committer);
+    const refs = this.refsStore;
+    if (refsWatched(refs)) {
+      // update_head_with_reflog: HEAD expecting the commit it is at (detached while
+      // rebasing), as the reference-transaction hook hears it
+      const current = (await refs.resolve("HEAD").catch(() => undefined))?.objectId;
+      await updateHeadExpecting(refs, id, current, log);
+    } else {
+      await refs.set("HEAD", id, log);
+    }
     if (!gitCommit) await sequencerPostCommit(this.hooks);
     return id;
   }

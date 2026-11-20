@@ -708,11 +708,56 @@ export class OperationState {
   /**
    * Deletes pseudo refs whether they exist or not, as git's unconditional `refs_delete_ref`
    * calls (AUTO_MERGE after a commit): a ref store with a transaction hook tells it of the
-   * deletion either way. A failure is ignored, as git ignores it there.
+   * deletion either way. Without one nothing can tell, and only the refs there are removed
+   * (a check is far cheaper than a deletion's transaction). A failure is ignored, as git
+   * ignores it there.
    */
   async deleteRef(...names: string[]): Promise<void> {
+    if (!refsWatched(this.refs)) {
+      await this.removeRef(...names).catch(() => undefined);
+      return;
+    }
     for (const name of names) await this.refs.delete(name).catch(() => false);
   }
+
+  /**
+   * A pseudo ref git's sequencer writes and deletes again before anyone else could read it
+   * (CHERRY_PICK_HEAD of a rebase's pick that stops): written and deleted where a
+   * transaction hook hears both, else only deleted (a stale one goes either way).
+   */
+  async writeAndDeleteRef(name: string, id: ObjectId): Promise<void> {
+    if (refsWatched(this.refs)) await this.setRef(name, id);
+    await this.deleteRef(name);
+  }
+
+  /**
+   * Runs `body` with pseudo ref `name` at `id`, deleted once `body` succeeds (git's sequencer:
+   * CHERRY_PICK_HEAD written before the commit, deleted by do_commit after it). Only hooks
+   * can read it meanwhile, and they run only where a transaction hook is installed: without
+   * one it is written only when `body` fails, which leaves it, as git does.
+   */
+  async withRefDuring<T>(name: string, id: ObjectId, body: () => Promise<T>): Promise<T> {
+    const watched = refsWatched(this.refs);
+    if (watched) await this.setRef(name, id);
+    let result: T;
+    try {
+      result = await body();
+    } catch (error) {
+      if (!watched) await this.setRef(name, id).catch(() => undefined);
+      throw error;
+    }
+    await this.deleteRef(name);
+    return result;
+  }
+}
+
+/**
+ * Whether a reference-transaction hook is installed on `refs` (the files store while a
+ * command with a hook runner runs, or a receive-pack): writes it alone would see can be
+ * skipped without one.
+ */
+export function refsWatched(refs: unknown): boolean {
+  return (refs as { getTransactionHook?(): unknown }).getTransactionHook?.() !== undefined;
 }
 
 /** The parts of a command a merge's write needs. */

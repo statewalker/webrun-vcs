@@ -1,5 +1,7 @@
 import type { ObjectId } from "@statewalker/vcs-core";
+import { parseGitInt } from "@statewalker/vcs-utils";
 
+import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { WorktreePruneCommand } from "./worktree-prune-command.js";
@@ -103,11 +105,17 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
    */
   private async needsAutoGc(): Promise<boolean> {
     const config = RemoteConfigStore.from(this.workingCopy);
+    // git_config_int: k, m and g units, hex and octal; git dies on anything else
     const int = (key: string, fallback: number) => {
       const value = config.value(key);
       if (value === undefined) return fallback;
-      const n = Number.parseInt(value, 10);
-      return Number.isFinite(n) ? n : fallback;
+      const n = parseGitInt(value);
+      if (n === undefined) {
+        throw new GitApiError(
+          `fatal: bad numeric config value '${value}' for '${key.toLowerCase()}': invalid unit`,
+        );
+      }
+      return n;
     };
     const gcAuto = int("gc.auto", GC_AUTO_DEFAULT);
     if (gcAuto <= 0) return false;
@@ -126,8 +134,11 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
     if (packLimit > 0) {
       const files = new Set(await names("pack"));
       let packs = 0;
+      // too_many_packs counts the packs git loads (a `.idx` with its `.pack`), not kept
       for (const name of files) {
-        if (name.endsWith(".pack") && !files.has(`${name.slice(0, -5)}.keep`)) packs++;
+        if (!name.endsWith(".pack")) continue;
+        const base = name.slice(0, -5);
+        if (files.has(`${base}.idx`) && !files.has(`${base}.keep`)) packs++;
       }
       if (packs > packLimit) return true;
     }

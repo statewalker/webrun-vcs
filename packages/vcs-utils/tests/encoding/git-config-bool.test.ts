@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parseGitBool } from "../../src/encoding/index.js";
+import { parseGitBool, parseGitInt } from "../../src/encoding/index.js";
 
 describe("parseGitBool (git_config_bool)", () => {
   it("a key with no `=` (the boolean true) is true; an empty value is false", () => {
@@ -66,5 +66,26 @@ describe("parseGitBool (git_config_bool)", () => {
     expect(parseGitBool(2147483647)).toBe(true);
     expect(parseGitBool(-2147483647)).toBe(true);
     expect(parseGitBool("0g")).toBe(false);
+  });
+});
+
+describe("parseGitInt", () => {
+  it("reads integers as git_parse_int: units, hex, octal, a sign", () => {
+    expect(parseGitInt("6700")).toBe(6700);
+    expect(parseGitInt("1k")).toBe(1024);
+    expect(parseGitInt("2M")).toBe(2 * 1024 * 1024);
+    expect(parseGitInt("0x10")).toBe(16);
+    expect(parseGitInt("010")).toBe(8);
+    expect(parseGitInt(" -5")).toBe(-5);
+    expect(parseGitInt(50)).toBe(50);
+  });
+
+  it("refuses what git dies on", () => {
+    expect(parseGitInt("lots")).toBeUndefined();
+    expect(parseGitInt("")).toBeUndefined();
+    expect(parseGitInt(true)).toBeUndefined();
+    expect(parseGitInt("2g")).toBeUndefined();
+    expect(parseGitInt("09")).toBeUndefined();
+    expect(parseGitInt("1.5")).toBeUndefined();
   });
 });

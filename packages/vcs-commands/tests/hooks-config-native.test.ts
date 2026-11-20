@@ -5,7 +5,7 @@
  * leave them out) against native git, for pre-commit and post-checkout. git 2.43 has no
  * configured hooks: it runs the script alone, and so do we following it.
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -18,6 +18,7 @@ import {
   hookTwins,
   installHooks,
   nativeIn,
+  nativeIs25x,
   oursIn,
 } from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
@@ -149,5 +150,77 @@ describeGit("configured hooks (hook.<name>.command): as native git", () => {
     expect(native.status).toBe(0);
     expect(hookLog(mine)).toBe(hookLog(theirs));
     expect(hookLines(command.getHookOutput())).toBe(hookLines(native.stderr));
+  });
+});
+
+describeGit("configured hooks git 2.5x refuses: as native git", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-config-bad-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  // git dies on its first hook lookup (the commit's pre-commit), before any commit; the
+  // configuration goes into each twin after the add (whose hook lookup would die as well)
+  const cases: Array<[string, (dir: string) => void]> = [
+    [
+      "an event without a command",
+      (dir) => git(dir, ["config", "hook.nocmd.event", "post-commit"]),
+    ],
+    [
+      "a friendly name that is a known hook name",
+      (dir) => {
+        git(dir, ["config", "hook.pre-commit.event", "post-commit"]);
+        git(dir, ["config", "hook.pre-commit.command", "true"]);
+      },
+    ],
+    [
+      "an event without `=`",
+      (dir) => appendFileSync(join(dir, ".git/config"), '[hook "bare"]\n\tevent\n'),
+    ],
+    [
+      "enabled without `=`",
+      (dir) => appendFileSync(join(dir, ".git/config"), '[hook "fmt"]\n\tenabled\n'),
+    ],
+  ];
+  for (const [label, configure] of cases) {
+    it.skipIf(!nativeIs25x)(`${label}: the commit dies with git's message`, async () => {
+      const [theirs, mine] = hookTwins(root, base());
+      for (const t of [theirs, mine]) {
+        putFile(t.dir, "a.txt", "changed\n");
+        git(t.dir, ["add", "a.txt"]);
+        // after the add: git dies on any hook lookup (add's post-index-change too)
+        configure(t.dir);
+      }
+      const native = nativeIn(theirs, root, ["commit", "-qm", "two"]);
+      const ours = await attempt((await oursIn(mine)).commit().setMessage("two"));
+      expect(native.status).toBe(128);
+      expect(ours.error).toBeInstanceOf(Error);
+      const message = (ours.error as Error).message;
+      // git names the file as it opened it (relative), ours as the host names it
+      const normalize = (text: string) => text.replace(/ in file '[^']*'/, " in file '<config>'");
+      expect(normalize(message)).toBe(normalize(native.stderr.trimEnd()));
+      expect(hookLog(mine)).toBe(hookLog(theirs));
+      expect(git(mine.dir, ["for-each-ref"])).toBe(git(theirs.dir, ["for-each-ref"]));
+    });
+  }
+
+  it.skipIf(!nativeIs25x)("a friendly name equal to its event: git's warning", async () => {
+    const dir = base();
+    git(dir, ["config", "hook.post-commitx.event", "post-commitx"]);
+    git(dir, ["config", "hook.post-commitx.command", "true"]);
+    const [theirs, mine] = hookTwins(root, dir);
+    for (const t of [theirs, mine]) {
+      putFile(t.dir, "a.txt", "changed\n");
+      git(t.dir, ["add", "a.txt"]);
+    }
+    const native = nativeIn(theirs, root, ["commit", "-qm", "two"]);
+    const ours = await attempt((await oursIn(mine)).commit().setMessage("two"));
+    const warning =
+      "warning: hook friendly-name 'post-commitx' is the same as its event; this may cause ambiguity with hook.post-commitx.enabled";
+    expect(native.status).toBe(0);
+    expect(ours.error).toBeUndefined();
+    expect(native.stderr).toContain(warning);
+    expect(ours.output).toContain(warning);
+    expect(hookLog(mine)).toBe(hookLog(theirs));
   });
 });

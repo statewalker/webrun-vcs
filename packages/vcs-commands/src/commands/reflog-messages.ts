@@ -20,6 +20,7 @@ import {
 } from "@statewalker/vcs-core";
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 
+import { GitApiError } from "../errors/index.js";
 import { findIdent, hostEnvironmentOf, identConfigOf } from "./git-ident.js";
 
 /**
@@ -156,10 +157,21 @@ export async function updateHeadExpecting(
     else await updateHead(refs, id, log);
     return;
   }
-  throw Object.assign(
-    new Error(
-      `cannot lock ref 'HEAD': ${result.rejected.map((r) => `${r.name}: ${r.reason}`).join(", ")}`,
-    ),
-    { rejected: result.rejected },
-  );
+  // UPDATE_REFS_DIE_ON_ERR: git's lock_ref_for_update message
+  const mismatch = result.rejected.find((r) => r.reason === "mismatch");
+  const current =
+    mismatch && old !== undefined
+      ? (await refs.resolve("HEAD").catch(() => undefined))?.objectId
+      : undefined;
+  const detail =
+    mismatch && old !== undefined
+      ? current
+        ? `is at ${current} but expected ${old}`
+        : "unable to resolve reference 'HEAD'"
+      : result.rejected.some((r) => r.reason === "locked")
+        ? "HEAD.lock is held by another writer"
+        : result.rejected.map((r) => `${r.name}: ${r.reason}`).join(", ");
+  throw Object.assign(new GitApiError(`fatal: cannot lock ref 'HEAD': ${detail}`), {
+    rejected: result.rejected,
+  });
 }

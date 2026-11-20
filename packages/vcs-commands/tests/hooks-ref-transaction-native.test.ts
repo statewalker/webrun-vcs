@@ -21,6 +21,7 @@ import {
   type Git,
   HookSession,
   RebaseOperation,
+  RebaseStatus,
   ResetMode,
   refTransactionHookOf,
   SequencerOperation,
@@ -998,5 +999,43 @@ describeGit("reference-transaction hook: ORIG_HEAD and the other root refs (as n
       (g) => attempt(g.am().setLegacyMessages(!nativeIs25x).addMbox(readFileSync(mbox))),
       "am",
     );
+  });
+});
+
+describeGit("rebase: an ORIG_HEAD it cannot write reported, as native git", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx-rebase-orighead-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  // checkout_onto's reset_head writes ORIG_HEAD with UPDATE_REFS_MSG_ON_ERR: the error is
+  // printed and the rebase goes on
+  it("ORIG_HEAD.lock held: the error, then the rebase done all the same", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    git(dir, ["branch", "side"]);
+    putFile(dir, "b.txt", "b\n");
+    git(dir, ["add", "b.txt"]);
+    git(dir, ["commit", "-qm", "b"]);
+    git(dir, ["checkout", "-q", "side"]);
+    putFile(dir, "c.txt", "c\n");
+    git(dir, ["add", "c.txt"]);
+    git(dir, ["commit", "-qm", "c"]);
+    git(dir, ["checkout", "-q", "main"]);
+    const [theirs, mine] = hookTwins(root, dir);
+    for (const t of [theirs, mine]) writeFileSync(join(t.dir, ".git/ORIG_HEAD.lock"), "");
+    const native = nativeIn(theirs, root, ["rebase", "side"]);
+    const result = await (await oursIn(mine)).rebase().setUpstream("side").call();
+    expect(native.status, native.stderr).toBe(0);
+    expect(result.status).toBe(RebaseStatus.OK);
+    const errors = (lines: string[]) =>
+      lines
+        .filter((l) => l.startsWith("error: "))
+        .map((l) => l.replace(/cannot lock ref 'ORIG_HEAD': .*/, "cannot lock ref 'ORIG_HEAD':"));
+    expect(errors((result.output ?? []).join("\n").split("\n"))).toEqual(
+      errors(native.stderr.split("\n")),
+    );
+    expect(errors(native.stderr.split("\n"))).toHaveLength(1);
+    expect(refState(mine.dir)).toBe(refState(theirs.dir));
   });
 });

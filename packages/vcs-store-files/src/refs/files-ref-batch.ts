@@ -108,7 +108,8 @@ export interface FilesRefBatchOptions {
   /**
    * The id an annotated tag `id` peels to (undefined for an object that is not a tag): with
    * it, packed-refs is written as git writes it, every tag with its `^<id>` line under the
-   * `peeled fully-peeled sorted` header. Without it, only the peel lines already known.
+   * `peeled fully-peeled sorted` header. Without it, only the peel lines already known, under
+   * a header claiming no more than those.
    */
   peel?: (id: ObjectId) => Promise<ObjectId | undefined>;
 }
@@ -117,9 +118,9 @@ interface PackedEntry {
   id: string;
   peeled?: string;
   /**
-   * Whether `peeled` is settled: every entry read from packed-refs (git 2.5x copies an
-   * entry as it reads it, peel line or not, whatever the file's traits) or peeled here; a ref
-   * written by this store is not until peeled
+   * Whether `peeled` is settled: an entry read with a peel line, or one the file's traits
+   * settle (`fully-peeled`, or `peeled` for refs/tags/), or one peeled here; a ref written by
+   * this store is not until peeled
    */
   known?: boolean;
 }
@@ -186,16 +187,36 @@ const isPathConflict = (e: unknown) =>
 function parsePacked(text: string | undefined): Map<string, PackedEntry> {
   const out = new Map<string, PackedEntry>();
   if (!text) return out;
+  // the header's traits say which entries without a peel line are known not to peel
+  // (packed-backend.c create_snapshot / next_record): every one under `fully-peeled`, those
+  // under refs/tags/ under `peeled`; a `^` line makes its entry known whatever the traits
+  let fully = false;
+  let tags = false;
   let last: PackedEntry | undefined;
   for (const line of text.split("\n")) {
-    if (line === "" || line.startsWith("#")) continue;
+    if (line === "") continue;
+    if (line.startsWith("#")) {
+      if (out.size === 0 && line.startsWith("# pack-refs with:")) {
+        const traits = line.slice("# pack-refs with:".length).split(" ");
+        fully = traits.includes("fully-peeled");
+        tags = traits.includes("peeled");
+      }
+      continue;
+    }
     if (line.startsWith("^")) {
-      if (last) last.peeled = line.slice(1).trim().toLowerCase();
+      if (last) {
+        last.peeled = line.slice(1).trim().toLowerCase();
+        last.known = true;
+      }
       continue;
     }
     if (line.indexOf(" ") !== 40) throw new Error(`malformed packed-refs line: ${line}`);
-    last = { id: line.slice(0, 40).toLowerCase(), known: true };
-    out.set(line.slice(41), last);
+    const name = line.slice(41);
+    last = {
+      id: line.slice(0, 40).toLowerCase(),
+      known: fully || (tags && name.startsWith("refs/tags/")),
+    };
+    out.set(name, last);
   }
   return out;
 }
@@ -204,11 +225,13 @@ function parsePacked(text: string | undefined): Map<string, PackedEntry> {
 const FULL_PACKED_HEADER = "# pack-refs with: peeled fully-peeled sorted \n";
 
 /**
- * packed-refs as git 2.5x writes it (packed-backend.c write_with_updates): with `peel`, each
- * ref this store wrote is peeled (an annotated tag gets its `^<id>` line), the entries read
- * from the file are copied as they were (with their peel lines, if any: git 2.43 would peel
- * those of a file without the `fully-peeled` trait again), under git's `peeled fully-peeled
- * sorted` header; without it, "sorted" only unless every entry was read from the file.
+ * packed-refs as git writes it (packed-backend.c write_with_updates): with `peel`, every
+ * entry whose peeled value is not known is peeled (an annotated tag gets its `^<id>` line):
+ * the refs this store wrote and the entries of a file whose traits did not settle them (git
+ * 2.43 peels those again; 2.5x copies them as read under its full header, which then claims
+ * a peel it never wrote), under git's `peeled fully-peeled sorted` header. Without it, the
+ * header claims only what holds: `peeled` while every unsettled entry is outside
+ * refs/tags/, else `sorted` alone.
  */
 async function serializePacked(
   entries: Map<string, PackedEntry>,
@@ -216,6 +239,7 @@ async function serializePacked(
 ): Promise<Uint8Array> {
   const names = [...entries.keys()].sort(compareRefNames);
   let full = true;
+  let tags = true;
   let body = "";
   for (const name of names) {
     const e = entries.get(name) as PackedEntry;
@@ -225,11 +249,19 @@ async function serializePacked(
       else delete e.peeled;
       e.known = true;
     }
-    if (!e.known) full = false;
+    if (!e.known) {
+      full = false;
+      if (name.startsWith("refs/tags/")) tags = false;
+    }
     body += `${e.id} ${name}\n`;
     if (e.peeled) body += `^${e.peeled}\n`;
   }
-  return enc.encode((full ? FULL_PACKED_HEADER : "# pack-refs with: sorted \n") + body);
+  const header = full
+    ? FULL_PACKED_HEADER
+    : tags
+      ? "# pack-refs with: peeled sorted \n"
+      : "# pack-refs with: sorted \n";
+  return enc.encode(header + body);
 }
 
 /** Thrown when `packed-refs.lock` stays held by another writer past the timeout. */

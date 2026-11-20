@@ -220,7 +220,8 @@ export async function createGitFilesBackend(
 
 /**
  * What an annotated tag peels to, following a chain of tags (git's `peel_object`): undefined
- * when `id` is not a tag or a tag on the way is missing or malformed.
+ * when `id` is not a tag or a tag on the way is missing or malformed (the object a tag names
+ * as no tag is not read: it may be missing).
  */
 async function peelTag(objects: GitObjects, id: ObjectId): Promise<ObjectId | undefined> {
   let current = id;
@@ -242,10 +243,13 @@ async function peelTag(objects: GitObjects, id: ObjectId): Promise<ObjectId | un
         offset += chunk.length;
       }
     }
-    const head = new TextDecoder().decode(bytes.subarray(0, 48));
-    const m = /^object ([0-9a-f]{40})\n/.exec(head);
+    const head = new TextDecoder().decode(bytes.subarray(0, 64));
+    const m = /^object ([0-9a-f]{40})\ntype ([a-z]+)\n/.exec(head);
     if (!m) return undefined;
     current = m[1] as ObjectId;
+    // git's deref_tag_noverify stops at the first object the tag names as no tag, without
+    // reading it: a tag of a missing commit still peels to that commit's id
+    if (m[2] !== "tag") return current;
   }
   return undefined;
 }

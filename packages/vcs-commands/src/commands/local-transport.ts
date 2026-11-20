@@ -285,10 +285,22 @@ export async function withLocalReceivePack<T>(
 }
 
 /**
+ * The receive-side reference-transaction hooks installed on a ref store, oldest first, and
+ * the hook the store had before the first of them: overlapping receive-packs on one store
+ * (two served pushes at once) each put theirs in and take theirs out, whatever the order
+ * they end in, and the last one out puts back the store's own.
+ */
+const receiveTransactionHooks = new WeakMap<
+  object,
+  { active: RefTransactionHook[]; previous: RefTransactionHook | undefined }
+>();
+
+/**
  * Runs `body` with the reference-transaction hook of `hooks` (a receiving repository's
  * session) installed on `remote`'s ref store, as git's receive-pack runs it: in the git
  * directory with `GIT_DIR=.` and no `GIT_PREFIX`. The hook that was there before is put
- * back after. Without a hook runner, or a ref store that cannot take one, `body` alone.
+ * back after (once every overlapping receive on the store has ended). Without a hook
+ * runner, or a ref store that cannot take one, `body` alone.
  */
 export async function withReceiveTransactionHook<T>(
   remote: OpenedRepository,
@@ -299,18 +311,28 @@ export async function withReceiveTransactionHook<T>(
     setTransactionHook?(hook: RefTransactionHook | undefined): void;
     getTransactionHook?(): RefTransactionHook | undefined;
   };
-  const installHook = hooks?.enabled && store.setTransactionHook !== undefined;
-  const previousHook = installHook ? store.getTransactionHook?.() : undefined;
-  const transactionHook =
-    installHook && hooks
-      ? refTransactionHookOf(hooks, { env: { GIT_DIR: "." }, prefix: false })
-      : undefined;
-  if (transactionHook) store.setTransactionHook?.(transactionHook);
+  if (!hooks?.enabled || store.setTransactionHook === undefined) return body();
+  const transactionHook = refTransactionHookOf(hooks, { env: { GIT_DIR: "." }, prefix: false });
+  let installed = receiveTransactionHooks.get(store);
+  if (!installed) {
+    installed = { active: [], previous: store.getTransactionHook?.() };
+    receiveTransactionHooks.set(store, installed);
+  }
+  installed.active.push(transactionHook);
+  store.setTransactionHook(transactionHook);
   try {
     return await body();
   } finally {
-    if (transactionHook && store.getTransactionHook?.() === transactionHook) {
-      store.setTransactionHook?.(previousHook);
+    const { active, previous } = installed;
+    active.splice(active.indexOf(transactionHook), 1);
+    const current = store.getTransactionHook?.();
+    // a hook installed meanwhile by something else (a command's) stays where it is
+    const ours = current === transactionHook || current === undefined;
+    if (active.length === 0) {
+      receiveTransactionHooks.delete(store);
+      if (ours) store.setTransactionHook(previous);
+    } else if (ours) {
+      store.setTransactionHook(active[active.length - 1]);
     }
   }
 }

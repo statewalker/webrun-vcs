@@ -281,3 +281,37 @@ describe("races with other writers", () => {
     }
   }, 60_000);
 });
+
+describe("packed-refs header without a peel callback", () => {
+  // a store with no object access (a linked worktree's) cannot peel: its rewrite claims only
+  // the traits that still hold, never `fully-peeled` over entries it could not settle
+  const rewrite = async (header: string, names: string[]) => {
+    const repo = newRepo();
+    const [c0] = commits(repo, 1) as [string];
+    const body = names.map((n) => `${c0} ${n}\n`).join("");
+    writeFileSync(join(repo, ".git/packed-refs"), `${header}${body}`);
+    const r = await batchFor(repo)([{ name: "refs/heads/a", old: c0, new: null }]);
+    expect(r.ok).toBe(true);
+    return readFileSync(join(repo, ".git/packed-refs"), "utf8").split("\n")[0];
+  };
+
+  it("a sorted-only file with tags stays sorted-only", async () => {
+    expect(await rewrite("# pack-refs with: sorted \n", ["refs/heads/a", "refs/tags/t"])).toBe(
+      "# pack-refs with: sorted ",
+    );
+  });
+
+  it("a peeled file keeps `peeled` while only refs outside refs/tags/ are unsettled", async () => {
+    const names = ["refs/heads/a", "refs/heads/b", "refs/keep/x", "refs/tags/t"];
+    expect(await rewrite("# pack-refs with: peeled \n", names)).toBe(
+      "# pack-refs with: peeled sorted ",
+    );
+  });
+
+  it("a fully-peeled file stays fully-peeled", async () => {
+    const names = ["refs/heads/a", "refs/keep/x", "refs/tags/t"];
+    expect(await rewrite("# pack-refs with: peeled fully-peeled sorted \n", names)).toBe(
+      "# pack-refs with: peeled fully-peeled sorted ",
+    );
+  });
+});

@@ -634,5 +634,46 @@ describeGit("git's native transports against native git", () => {
       expect(log(dO)).toBe(log(dn));
       expect(refs(join(srv, dO))).toBe(refs(join(srv, dn)));
     });
+
+    // serveGitConnection runs each receive-pack inside the served repository's `around`: two
+    // pushes served at once from one opened repository overlap there, and the one that ends
+    // first must not leave its hook (or the other's) on the store once both have ended
+    it("overlapping served receive-packs leave no reference-transaction hook behind", async () => {
+      const [dn] = bareTwins("src");
+      writeFileSync(join(srv, dn, "hooks/reference-transaction"), HOOK, { mode: 0o755 });
+      const [, host] = twins();
+      const env = testEnv(root);
+      const g = await openOurs(
+        root,
+        createNodeGitHostEnvironment({
+          env,
+          hookRunner: createNodeHookRunner({ env, compatibility: nativeIs25x ? "2.56" : "2.43" }),
+        }),
+        undefined,
+        host,
+      );
+      const opened = await openLocalRemote(g.workingCopy, `../srv/${dn}`);
+      const served = await servedRepositoryOf(opened, {
+        hooks: remoteHookSession(g.workingCopy, opened),
+      });
+      const store = opened.history.refs as { getTransactionHook?(): unknown };
+      const main = git(join(srv, dn), "rev-parse", "main").trim();
+      let endA = () => {};
+      let endB = () => {};
+      const a = served.around?.("git-receive-pack", () => new Promise<void>((r) => (endA = r)));
+      const b = served.around?.("git-receive-pack", () => new Promise<void>((r) => (endB = r)));
+      expect(store.getTransactionHook?.()).toBeDefined();
+      endA();
+      await a;
+      // B still receiving: a hook is still there for it
+      expect(store.getTransactionHook?.()).toBeDefined();
+      endB();
+      await b;
+      expect(store.getTransactionHook?.()).toBeUndefined();
+      // a ref update made after both runs no hook
+      await opened.history.refs.set("refs/heads/after", main as never);
+      expect(git(join(srv, dn), "rev-parse", "after").trim()).toBe(main);
+      expect(() => readFileSync(join(srv, dn, "tx.log"))).toThrow();
+    });
   });
 });

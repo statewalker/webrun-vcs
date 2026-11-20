@@ -1,5 +1,6 @@
 ---
 "@statewalker/vcs-core": patch
+"@statewalker/vcs-utils": patch
 "@statewalker/vcs-store-files": patch
 "@statewalker/vcs-working-tree": patch
 "@statewalker/vcs-utils-node": patch
@@ -15,4 +16,7 @@ CHERRY_PICK_HEAD, REBASE_HEAD and AUTO_MERGE transactions), and pushes served th
 writes (`<updated-workdir> <updated-skipworktree>`); configured hooks (`hook.<name>.event` /
 `.command` / `.enabled`) run before the hooks directory's script; `gc().setAuto(true)` decides
 as `git gc --auto` and asks pre-auto-gc first. packed-refs is written as git writes it: the
-`peeled fully-peeled sorted` header and a peel line for each annotated tag.
+`peeled fully-peeled sorted` header and a peel line for each annotated tag. A rewrite
+of a packed-refs whose traits leave entries unpeeled (an older `sorted`-only file, JGit's
+`peeled`) peels them again, as git 2.43 does, and never claims `fully-peeled` for entries it
+could not peel. vcs-utils adds `parseGitInt` (git's `git_parse_int`).

@@ -58,7 +58,30 @@ export function parseGitBool(value: unknown): boolean | undefined {
   const lower = text.toLowerCase();
   if (lower === "true" || lower === "yes" || lower === "on") return true;
   if (lower === "false" || lower === "no" || lower === "off") return false;
-  const m = INTEGER.exec(text);
+  const n = parseGitInt(text);
+  return n === undefined ? undefined : n !== 0;
+}
+
+/**
+ * A git integer config value (`git_config_int`, through `git_parse_int`): leading
+ * whitespace, a sign, decimal, `0x` hex or `0` octal digits and an optional `k`/`m`/`g` unit,
+ * within git's `int`; undefined when unset or not such an integer (a key without `=`
+ * included), which git refuses ("bad numeric config value").
+ *
+ * @example
+ * ```typescript
+ * parseGitInt("6700"); // 6700
+ * parseGitInt("1k"); // 1024
+ * parseGitInt("0x10"); // 16
+ * parseGitInt("lots"); // undefined
+ * ```
+ */
+export function parseGitInt(value: unknown): number | undefined {
+  if (typeof value === "number") {
+    return Number.isInteger(value) && value >= INT_MIN && value <= INT_MAX ? value : undefined;
+  }
+  if (typeof value !== "string") return undefined;
+  const m = INTEGER.exec(value);
   if (!m) return undefined;
   const digits = m[1] ?? m[2];
   const octal = m[1] === undefined && digits.length > 1 && digits[0] === "0";
@@ -68,7 +91,7 @@ export function parseGitBool(value: unknown): boolean | undefined {
   const magnitude =
     BigInt(m[1] !== undefined ? `0x${digits}` : octal ? `0o${digits.slice(1)}` : digits) *
     UNIT_FACTOR[m[3].toLowerCase()];
-  const negative = text.trimStart().startsWith("-");
+  const negative = value.trimStart().startsWith("-");
   if (magnitude > (negative ? -BigInt(INT_MIN) : BigInt(INT_MAX))) return undefined; // ERANGE
-  return magnitude !== 0n;
+  return Number(negative ? -magnitude : magnitude);
 }
