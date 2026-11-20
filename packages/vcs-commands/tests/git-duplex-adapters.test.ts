@@ -21,6 +21,7 @@ import {
   createMessagePortConnector,
   createWebrunConnector,
   createWebSocketConnector,
+  DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
   GIT_LIBP2P_PROTOCOL,
   type GitTransportConnector,
   GitTransportRegistry,
@@ -193,7 +194,11 @@ const ADAPTERS: Adapter[] = [
   {
     name: "WebSocket (ws server, global WebSocket client)",
     async setup() {
-      const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+      const server = new WebSocketServer({
+        host: "127.0.0.1",
+        port: 0,
+        maxPayload: DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
+      });
       server.on("connection", (socket) => {
         void serveGitOverWebSocket(socket as unknown as WebSocketLike, serveOptions());
       });
@@ -475,7 +480,11 @@ describeGit("git's native protocol over the duplex adapters", () => {
     let bridge: string;
     beforeAll(async () => {
       bridge = writeWebSocketBridge(root);
-      server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+      server = new WebSocketServer({
+        host: "127.0.0.1",
+        port: 0,
+        maxPayload: DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
+      });
       server.on("connection", (socket) => {
         void serveGitOverWebSocket(socket as unknown as WebSocketLike, serveOptions());
       });
@@ -599,7 +608,11 @@ describeGit("git's native protocol over the duplex adapters", () => {
         // the socket buffers (1 MiB each way), the paused reader's queue (4 MiB) and the kernel's
         bound: 16 << 20,
         async setup(meter) {
-          const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+          const server = new WebSocketServer({
+            host: "127.0.0.1",
+            port: 0,
+            maxPayload: DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
+          });
           server.on("connection", (socket) => {
             void serveGitConnection({
               ...serveOptions(),

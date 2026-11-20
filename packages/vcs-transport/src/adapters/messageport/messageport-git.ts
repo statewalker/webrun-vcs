@@ -118,16 +118,24 @@ export interface GitPortMuxOptions {
    * `PortWindow`; default 1 MiB): what may be delivered to a session and not yet read.
    */
   window?: PortWindow;
-  /** The most sessions open at once (webrun-rpc's `maxPorts`) */
+  /**
+   * The most sessions open at once (webrun-rpc's `maxPorts`); a session past it is refused.
+   * {@link serveGitOverPortMux} defaults to {@link DEFAULT_GIT_MAX_PORTS}, so a peer cannot
+   * open sessions (each a repository and a window of buffered bytes) without bound; the
+   * client side defaults to webrun-rpc's own.
+   */
   maxPorts?: number;
 }
 
 /** Default {@link GitPortMuxOptions.window}. */
 export const DEFAULT_GIT_PORT_WINDOW = 1 << 20;
+/** Default {@link GitPortMuxOptions.maxPorts} of {@link serveGitOverPortMux}. */
+export const DEFAULT_GIT_MAX_PORTS = 64;
 
 /**
  * Serves git sessions on every virtual port the peer opens over `port` (webrun-rpc's `serve`
- * over `overPipe`, the responder's side). Returns the teardown.
+ * over `overPipe`, the responder's side), at most `maxPorts` at once (default
+ * {@link DEFAULT_GIT_MAX_PORTS}). Returns the teardown.
  */
 export async function serveGitOverPortMux(
   port: MessageTarget,
@@ -140,7 +148,7 @@ export async function serveGitOverPortMux(
         codec: structuredCodec,
         side: "responder",
         window: window ?? DEFAULT_GIT_PORT_WINDOW,
-        ...(maxPorts !== undefined ? { maxPorts } : {}),
+        maxPorts: maxPorts ?? DEFAULT_GIT_MAX_PORTS,
       }),
     },
     serveGitOverWebrun(serveOptions),

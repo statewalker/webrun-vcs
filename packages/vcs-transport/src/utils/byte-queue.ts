@@ -34,10 +34,16 @@ export interface ByteQueue {
    * Queues a chunk (empty ones are dropped). Returns a promise while the queue is at its high
    * water mark, resolved once the reader has drained it below (or the queue ended); nothing
    * otherwise. The chunk is kept, not copied: do not change it afterwards. A push after
-   * {@link end}, or once the reader stopped, is dropped.
+   * {@link end}, or once the reader stopped, is refused: a rejected promise (with the error
+   * {@link end} was given, if any), never a silent drop. Writers waiting when the queue ends
+   * with an error are rejected with it.
    */
   push(chunk: Uint8Array): Promise<void> | undefined;
-  /** Ends the stream once what is queued has been read; with `error`, the stream throws it there. */
+  /**
+   * Ends the stream once what is queued has been read; with `error`, the stream throws it
+   * there, and waiting and later pushes reject with it (an error given after a clean end, or
+   * after the reader stopped, still becomes the reason later pushes reject with).
+   */
   end(error?: Error): void;
   /** The chunks, in order; ends after {@link end} and the queued chunks */
   readonly stream: AsyncGenerator<Uint8Array>;
@@ -61,14 +67,21 @@ export function createByteQueue(options: ByteQueueOptions = {}): ByteQueue {
   let queued = 0;
   let ended = false;
   let failure: Error | undefined;
+  let endCalled = false;
   let wakeReader: (() => void) | undefined;
-  let writers: Array<() => void> = [];
+  let writers: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
 
-  const releaseWriters = () => {
+  const releaseWriters = (error?: Error) => {
     const waiting = writers;
     writers = [];
-    for (const resolve of waiting) resolve();
+    for (const writer of waiting) {
+      if (error) writer.reject(error);
+      else writer.resolve();
+    }
   };
+  const refusal = (): Error =>
+    failure ??
+    new Error(endCalled ? "write after the end of the stream" : "the stream's reader stopped");
   const notifyReader = () => {
     const wake = wakeReader;
     wakeReader = undefined;
@@ -123,26 +136,33 @@ export function createByteQueue(options: ByteQueueOptions = {}): ByteQueue {
     } finally {
       // the reader stopped (or the stream is over): nothing will be taken any more
       ended = true;
+      const dropped = queued > 0;
       chunks.length = 0;
       head = 0;
       queued = 0;
-      releaseWriters();
+      // writers whose chunks were thrown away hear so; the others were taken already
+      releaseWriters(dropped ? refusal() : undefined);
     }
   }
 
   return {
     push(chunk) {
-      if (ended || chunk.length === 0) return undefined;
+      if (ended) return Promise.reject(refusal());
+      if (chunk.length === 0) return undefined;
       chunks.push(chunk);
       queued += chunk.length;
       notifyReader();
       if (queued < highWaterMark) return undefined;
-      return new Promise<void>((resolve) => writers.push(resolve));
+      return new Promise<void>((resolve, reject) => writers.push({ resolve, reject }));
     },
     end(error) {
+      if (error && !failure) {
+        failure = error;
+        releaseWriters(error);
+      }
+      endCalled = true;
       if (ended) return;
       ended = true;
-      failure = error;
       notifyReader();
       releaseWriters();
     },

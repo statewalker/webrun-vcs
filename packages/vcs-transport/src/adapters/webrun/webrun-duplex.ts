@@ -90,7 +90,8 @@ export function webrunClientDuplex(call: WebrunDuplex, options: WebrunDuplexOpti
 /** Options of {@link webrunServerDuplex}. */
 export interface WebrunServerDuplexOptions<T> extends WebrunDuplexOptions {
   /**
-   * Called once `run` has settled and its output has been taken by the peer (or abandoned):
+   * Called once `run` has settled and its output has been taken by the peer (or abandoned,
+   * before its first pull too):
    * the moment a transport under the call may be released without losing the answer.
    */
   onSettled?(result: T | undefined, error?: unknown): void;
@@ -126,6 +127,10 @@ export function webrunServerDuplex<T>(
     };
     let result: T | undefined;
     let failure: unknown;
+    let outputDone: () => void = () => {};
+    const outputFinished = new Promise<void>((resolve) => {
+      outputDone = resolve;
+    });
     const settled = run(duplex).then(
       (value) => {
         result = value;
@@ -136,17 +141,33 @@ export function webrunServerDuplex<T>(
         outgoing.end(error instanceof Error ? error : new Error(String(error)));
       },
     );
+    if (options.onSettled) {
+      const notify = options.onSettled;
+      // once `run` settled and nothing it wrote waits any more: taken, or abandoned (a call
+      // whose output is dropped before its first pull never runs the generator's `finally`)
+      void settled
+        .then(() => (outgoing.queuedBytes > 0 ? outputFinished : undefined))
+        .then(() => notify(result, failure));
+    }
     async function* output(): AsyncGenerator<Uint8Array> {
       try {
         yield* outgoing.stream;
       } finally {
-        if (options.onSettled) {
-          const notify = options.onSettled;
-          void settled.then(() => notify(result, failure));
-        }
+        outputDone();
+        // nobody takes the answer any more: the input is not wanted either
+        void incoming.return(undefined).catch(() => {});
       }
     }
-    return output();
+    const generator = output();
+    const abandon = generator.return.bind(generator);
+    generator.return = (value) => {
+      outputDone();
+      // before the first pull the generators never ran: tell the writers and the input here
+      outgoing.end(new Error("the peer abandoned the answer"));
+      void incoming.return(undefined).catch(() => {});
+      return abandon(value);
+    };
+    return generator;
   };
 }
 

@@ -370,7 +370,7 @@ transports.register(createMessagePortConnector({
 serveGitOverPort(port, serve);                  // in the worker, per port
 
 // many sessions over one port (webrun-rpc's multiplexer, a window per session)
-await serveGitOverPortMux(port, serve);         // in the worker
+await serveGitOverPortMux(port, serve);         // in the worker; at most 64 sessions at once (maxPorts)
 const peer = await connectGitOverPortMux(port1);
 transports.register(createWebrunConnector({ name: "worker", schemes: ["worker"], call: () => peer.call }));
 ```
@@ -382,28 +382,39 @@ backpressure and ended with a `"__close__"` string.
 ### WebSocket
 
 ```ts
-transports.register(createWebSocketConnector());           // ws:// and wss://, global WebSocket
+transports.register(createWebSocketConnector({ connectTimeout: 10_000 })); // ws:// and wss://
 await git.clone().setURI("wss://git.example.com/repo.git").setTransports(transports).call();
 
-new WebSocketServer({ port: 8080 }).on("connection", (socket) => serveGitOverWebSocket(socket, serve));
+new WebSocketServer({ port: 8080, maxPayload: DEFAULT_WEBSOCKET_MAX_FRAME_SIZE })
+  .on("connection", (socket) => serveGitOverWebSocket(socket, serve));
 ```
 
 One session per socket, binary frames. A WebSocket has no half-close, so **an empty binary
 frame ends its sender's direction** (data frames are never empty). Writes wait while
 `bufferedAmount` is above the high water mark; a socket that can pause (the `ws` package's)
 pauses while its reader lags. A browser WebSocket cannot pause, so its reader must keep up.
+Writes leave in frames of at most 64 KiB (`frameSize`); a received frame over 1 MiB
+(`maxFrameSize`) closes the socket with 1009, and the `ws` server's `maxPayload` bounds what
+it buffers before that. A socket that fails, or closes without the end frame and without a
+normal closure code, fails the read side; a write to a socket that is not open fails.
 
 ### libp2p streams (duck-typed, no dependency)
 
 ```ts
 await node.handle(GIT_LIBP2P_PROTOCOL, ({ stream }) => serveGitOverLibp2pStream(stream, serve));
 transports.register(createLibp2pConnector({
-  dial: (peer, protocol) => node.dialProtocol(peerIdFromString(peer), protocol),
+  dial: (peer, protocol, { signal }) => node.dialProtocol(peerIdFromString(peer), protocol, { signal }),
+  connectTimeout: 30_000,
 }));
 await git.fetch().setRemote(`libp2p://${peerId}/repo.git`).setTransports(transports).call();
 ```
 
-Any `{ source, sink, closeWrite?, close? }` stream fits; `Duplex.end` is `closeWrite`.
+Both stream shapes fit: libp2p 3's message streams (async iterable, `send` / `onDrain`,
+`close` ending the write side, `abort`) and libp2p 1/2's `{ source, sink, closeWrite?, close? }`.
+`Duplex.end` ends the write side without waiting for the peer; `Duplex.close` waits at most
+`closeTimeout` (1 s) for what is written to go out, then aborts the stream, so a peer that
+stopped reading cannot hold a session (or `serveGitConnection`'s `timeout`) open. A sink
+that fails (a closed or reset stream) fails the writes with its error.
 
 ### webrun-streams channels (WebRTC, LiveKit, any `Serve`)
 
