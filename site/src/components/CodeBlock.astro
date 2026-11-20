@@ -1,0 +1,52 @@
+---
+import { Code } from "astro:components";
+import Icon from "./Icon.astro";
+
+interface Props {
+  code: string;
+  lang?: string;
+  title?: string;
+  class?: string;
+}
+
+const { code, lang = "sh", title, class: className } = Astro.props;
+---
+
+<div class:list={["code-window group relative flex flex-col overflow-hidden rounded-xl border bg-code text-code-foreground", className]}>
+  {title && (
+    <div class="flex items-center gap-2 border-b border-white/10 px-4 py-2 font-mono text-xs text-code-foreground/60">
+      <span class="flex gap-1.5">
+        <span class="size-2.5 rounded-full bg-white/15" />
+        <span class="size-2.5 rounded-full bg-white/15" />
+        <span class="size-2.5 rounded-full bg-white/15" />
+      </span>
+      <span class="ml-2">{title}</span>
+    </div>
+  )}
+  <button
+    type="button"
+    data-copy={code}
+    aria-label="Copy code"
+    class="absolute right-2 top-2 z-10 inline-flex size-8 items-center justify-center rounded-md text-code-foreground/60 opacity-0 transition hover:bg-white/10 hover:text-code-foreground group-hover:opacity-100 focus-visible:opacity-100"
+  >
+    <Icon name="copy" class="size-4 copy-icon" />
+    <Icon name="check" class="size-4 check-icon hidden" />
+  </button>
+  <Code code={code} lang={lang as any} theme="github-dark-default" class="!bg-transparent px-4 py-4 text-[13px] leading-6 font-mono min-h-0 flex-1 overflow-auto" />
+</div>
+
+<script>
+  document.querySelectorAll<HTMLButtonElement>("[data-copy]").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(btn.dataset.copy ?? "");
+        btn.querySelector(".copy-icon")?.classList.add("hidden");
+        btn.querySelector(".check-icon")?.classList.remove("hidden");
+        setTimeout(() => {
+          btn.querySelector(".copy-icon")?.classList.remove("hidden");
+          btn.querySelector(".check-icon")?.classList.add("hidden");
+        }, 1500);
+      } catch {}
+    }),
+  );
+</script>

@@ -1,0 +1,65 @@
+---
+import Badge from "@/components/ui/Badge.astro";
+import Docs from "@/layouts/Docs.astro";
+import { type App, demos, tutorials } from "@/lib/apps";
+import { examples } from "@/lib/examples";
+import { repoTree } from "@/lib/site";
+
+const label = (name?: string) => examples.find((e) => e.name === name)?.label;
+const groups: { title: string; intro: string; apps: App[]; run: string }[] = [
+  {
+    title: "Tutorials: apps/examples",
+    intro:
+      "Eleven numbered Node programs, from the object model up to transport and custom storage. The multi-step ones also have step:NN scripts.",
+    apps: tutorials,
+    run: "pnpm --filter @statewalker/vcs-example-01-quick-start start",
+  },
+  {
+    title: "Demos: apps/demos",
+    intro:
+      "Real-world scenarios. Node demos run with start; browser demos with dev (Vite). The Hugging Face demos need network access to huggingface.co.",
+    apps: demos,
+    run: "pnpm --filter @statewalker/vcs-demo-browser-app dev",
+  },
+];
+---
+
+<Docs title="Apps & demos" description="The tutorials and demos in the StateWalker VCS repository: what each one shows, how to run it, and which live example covers the same ground.">
+  <h1>Apps &amp; demos</h1>
+  <p>
+    The repository's <code>apps/</code> folder holds runnable programs beside the packages. Build
+    the workspace first (<code>pnpm install &amp;&amp; pnpm build</code>: the packages'
+    <code>exports</code> point at <code>dist/</code>), then run one with its filter. Where a
+    <a href="/examples">live example</a> covers the same ground, it is linked: run that one here,
+    without cloning anything.
+  </p>
+
+  {groups.map((group) => (
+    <section>
+      <h2>{group.title}</h2>
+      <p>{group.intro} For example: <code>{group.run}</code>.</p>
+      <table>
+        <thead>
+          <tr><th>App</th><th>What it shows</th><th>Live</th></tr>
+        </thead>
+        <tbody>
+          {group.apps.map((app) => (
+            <tr>
+              <td class="whitespace-nowrap">
+                <a href={repoTree(app.path)}><code>{app.name}</code></a>
+                <Badge variant="outline" class="ml-1 font-mono text-[10px]">{app.runtime}</Badge>
+              </td>
+              <td>{app.summary}</td>
+              <td class="whitespace-nowrap">{app.live ? <a href={`/examples/${app.live}`}>{label(app.live)}</a> : "—"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  ))}
+
+  <p>
+    The long descriptions, with every step, are in <a href="/docs/example-applications">Example applications</a>.
+    Benchmarks (delta compression, pack operations, realistic workloads) are under <a href={repoTree("apps/benchmarks")}><code>apps/benchmarks</code></a>.
+  </p>
+</Docs>

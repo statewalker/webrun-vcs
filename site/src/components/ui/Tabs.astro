@@ -1,0 +1,45 @@
+---
+import { cn } from "@/lib/utils";
+
+// shadcn-style tabs without a framework: panels are passed as named slots
+// `tab-0`, `tab-1`, … and switched by a small script.
+interface Props {
+  labels: string[];
+  class?: string;
+}
+
+const { labels, class: className } = Astro.props;
+const panels = await Promise.all(labels.map((_, i) => Astro.slots.render(`tab-${i}`)));
+---
+
+<div class={cn("space-y-3", className)} data-tabs>
+  <div role="tablist" class="inline-flex h-9 max-w-full items-center overflow-x-auto rounded-lg bg-muted p-1 text-muted-foreground">
+    {labels.map((label, i) => (
+      <button
+        type="button"
+        role="tab"
+        data-tab={i}
+        aria-selected={i === 0 ? "true" : "false"}
+        class="inline-flex h-7 items-center whitespace-nowrap rounded-md px-3 text-sm font-medium transition-all hover:text-foreground aria-selected:bg-background aria-selected:text-foreground aria-selected:shadow-xs"
+      >
+        {label}
+      </button>
+    ))}
+  </div>
+  {panels.map((html, i) => (
+    <div role="tabpanel" data-panel={i} hidden={i !== 0} set:html={html} />
+  ))}
+</div>
+
+<script>
+  document.querySelectorAll<HTMLElement>("[data-tabs]").forEach((root) => {
+    const tabs = root.querySelectorAll<HTMLButtonElement>(":scope > [role=tablist] > [data-tab]");
+    const panels = root.querySelectorAll<HTMLElement>(":scope > [data-panel]");
+    tabs.forEach((tab) =>
+      tab.addEventListener("click", () => {
+        tabs.forEach((t) => t.setAttribute("aria-selected", String(t === tab)));
+        panels.forEach((p) => (p.hidden = p.dataset.panel !== tab.dataset.tab));
+      }),
+    );
+  });
+</script>

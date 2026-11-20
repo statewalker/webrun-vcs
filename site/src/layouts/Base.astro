@@ -1,0 +1,45 @@
+---
+import "@/styles/global.css";
+import Footer from "@/components/Footer.astro";
+import Header from "@/components/Header.astro";
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+
+const {
+  title = "StateWalker VCS — Git in TypeScript, everywhere",
+  description = "A Git-compatible version control system written in TypeScript: objects, packs, refs, the fetch/push protocol and Git LFS, with no native git. It runs in browsers, Node.js and workers over pluggable storage.",
+} = Astro.props;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <script is:inline>
+      (() => {
+        let theme;
+        try {
+          theme = localStorage.getItem("theme");
+        } catch {}
+        const dark = theme ? theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.classList.toggle("dark", dark);
+      })();
+    </script>
+  </head>
+  <body class="min-h-dvh flex flex-col">
+    <Header />
+    <main class="flex-1">
+      <slot />
+    </main>
+    <Footer />
+  </body>
+</html>

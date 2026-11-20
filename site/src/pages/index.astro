@@ -1,0 +1,225 @@
+---
+import CodeBlock from "@/components/CodeBlock.astro";
+import Icon from "@/components/Icon.astro";
+import LayerDiagram from "@/components/LayerDiagram.astro";
+import Badge from "@/components/ui/Badge.astro";
+import Button from "@/components/ui/Button.astro";
+import Card from "@/components/ui/Card.astro";
+import Base from "@/layouts/Base.astro";
+import { examples } from "@/lib/examples";
+import { REPO, repoTree } from "@/lib/site";
+
+const hello = `import { Git } from "@statewalker/vcs-commands";
+import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
+
+// Any FilesApi: Node's disk, OPFS, S3, SQLite, memory.
+const { history } = await createGitFilesBackend({ files, gitDir: ".git", create: true });
+const worktrees = await openGitLinkedWorktrees({ files, gitDir: ".git", history });
+const git = Git.fromWorkingCopy(await worktrees.openCurrent());
+
+await files.write("README.md", [new TextEncoder().encode("# Hello\\n")]);
+await git.add().addFilepattern(".").call();
+await git.commit().setMessage("Initial commit").call();
+// $ git log --oneline   ← native git reads the same .git directory`;
+
+const features = [
+  {
+    icon: "check",
+    title: "Git's bytes, not a look-alike",
+    body: "Same object ids, pack files, refs, index and protocol messages as git. Repositories written here open in git, and the other way round.",
+  },
+  {
+    icon: "globe",
+    title: "Runs where JavaScript runs",
+    body: "Pure TypeScript on Web Streams, Web Crypto and fetch: a browser tab, a worker, Node.js. No native git, no child process, no socket.",
+  },
+  {
+    icon: "database",
+    title: "Storage you choose",
+    body: "Memory, a real .git directory over any FilesApi, SQL or a key-value store such as IndexedDB, behind one History interface.",
+  },
+  {
+    icon: "refresh",
+    title: "Fetch and push, v1 and v2",
+    body: "git's wire protocol over smart HTTP or any duplex stream: a MessagePort, a WebRTC data channel, a mesh of peers.",
+  },
+  {
+    icon: "layers",
+    title: "Large files, properly",
+    body: "Git LFS batch transfers and chunked large-object transfer keep big files out of packs, verified by their SHA-256.",
+  },
+  {
+    icon: "gitBranch",
+    title: "The whole porcelain",
+    body: "add, commit, branch, checkout, merge, rebase, cherry-pick, stash, tag, blame, bisect, gc: JGit-style commands with git's behaviour.",
+  },
+] as const;
+
+const useCases = [
+  {
+    icon: "fileText",
+    title: "Editors and IDEs in the browser",
+    body: "Give a web editor real version control over the files it already has: status, diffs, branches, commits, without a backend.",
+    demo: "apps/demos/browser-vcs-app",
+  },
+  {
+    icon: "wifiOff",
+    title: "Offline-first apps",
+    body: "Commit locally while offline and sync with git's protocol when the network returns, as the offline-first PWA demo does.",
+    demo: "apps/demos/offline-first-pwa",
+  },
+  {
+    icon: "book",
+    title: "Versioned documents",
+    body: "History, diffs and merges for documents, not only code: the demo decomposes DOCX and ODF so their parts version meaningfully.",
+    demo: "apps/demos/versioned-documents",
+  },
+  {
+    icon: "users",
+    title: "Peer-to-peer sync",
+    body: "Two browsers exchange history directly, over WebRTC or LiveKit, with the same client and server machines a git host speaks.",
+    demo: "apps/demos/webrtc-p2p-sync",
+  },
+  {
+    icon: "server",
+    title: "Git servers in TypeScript",
+    body: "Serve repositories over smart HTTP from any JavaScript runtime and push to them with native git: no git http-backend.",
+    demo: "apps/demos/http-server-scratch",
+  },
+  {
+    icon: "download",
+    title: "Datasets and model files",
+    body: "Fetch large objects from Git LFS hosts such as Hugging Face, streamed into a content store and verified as they arrive.",
+    demo: "apps/demos/lfs-download-huggingface",
+  },
+] as const;
+---
+
+<Base>
+  <!-- Hero -->
+  <section class="relative overflow-hidden border-b">
+    <div class="bg-grid absolute inset-0 [mask-image:radial-gradient(ellipse_at_top,black,transparent_70%)]"></div>
+    <div class="relative mx-auto grid max-w-6xl items-center gap-10 px-4 py-16 sm:px-6 md:py-24 lg:grid-cols-[1.05fr_1fr]">
+      <div class="space-y-6">
+        <Badge variant="brand" class="font-mono">git, in TypeScript · MIT</Badge>
+        <h1 class="text-4xl font-semibold tracking-tight sm:text-5xl">
+          Version control that runs <span class="text-brand-gradient">wherever your code does</span>
+        </h1>
+        <p class="max-w-xl text-lg text-muted-foreground">
+          StateWalker VCS is a Git-compatible version control system written in TypeScript. It reads
+          and writes git objects, packs and refs, speaks git's fetch/push protocol and Git LFS, with
+          no native <code class="font-mono text-base">git</code>, in browsers, Node.js and workers, over
+          storage you plug in.
+        </p>
+        <div class="flex flex-wrap gap-3">
+          <Button href="/examples" size="lg"><Icon name="play" /> Run it in this tab</Button>
+          <Button href="/docs" variant="outline" size="lg">Get started <Icon name="arrowRight" /></Button>
+          <Button href={REPO} variant="ghost" size="lg"><Icon name="github" /> GitHub</Button>
+        </div>
+      </div>
+      <CodeBlock code={hello} lang="ts" title="a repository git can read, from any runtime" />
+    </div>
+  </section>
+
+  <!-- What it is -->
+  <section class="mx-auto max-w-6xl px-4 py-16 sm:px-6">
+    <p class="font-mono text-xs uppercase tracking-widest text-primary">What it is</p>
+    <h2 class="mt-2 text-3xl font-semibold tracking-tight">Git, rebuilt as a library</h2>
+    <p class="mt-3 max-w-2xl text-muted-foreground">
+      Applications that need history, branches and sync usually shell out to git or reach for a
+      server. Browsers and workers can do neither. These packages give such code git itself:
+      byte-compatible, protocol-compatible, and small enough to take only the layers you need.
+    </p>
+    <div class="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      {features.map((f) => (
+        <Card class="p-5">
+          <span class="inline-flex size-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+            <Icon name={f.icon} />
+          </span>
+          <p class="mt-3 font-semibold">{f.title}</p>
+          <p class="mt-1 text-sm text-muted-foreground">{f.body}</p>
+        </Card>
+      ))}
+    </div>
+  </section>
+
+  <!-- Architecture -->
+  <section class="border-y bg-muted/30">
+    <div class="mx-auto grid max-w-6xl gap-10 px-4 py-16 sm:px-6 lg:grid-cols-[1fr_1.4fr]">
+      <div class="space-y-4">
+        <p class="font-mono text-xs uppercase tracking-widest text-primary">The architecture</p>
+        <h2 class="text-3xl font-semibold tracking-tight">Layers you can take apart</h2>
+        <p class="text-muted-foreground">
+          <code class="font-mono text-sm">vcs-core</code> holds the immutable objects and refs.
+          The index, checkout and files are <code class="font-mono text-sm">vcs-working-tree</code>.
+          Storage backends implement a few small interfaces; the transport speaks git's protocol
+          over any byte stream; the commands compose them into git's workflows.
+        </p>
+        <p class="text-muted-foreground">
+          A server that only stores and serves repositories needs the core, a store and the
+          transport. A web editor adds the working tree and the commands.
+        </p>
+        <Button href="/docs/architecture" variant="outline">Read the architecture <Icon name="arrowRight" /></Button>
+      </div>
+      <LayerDiagram />
+    </div>
+  </section>
+
+  <!-- Use cases -->
+  <section id="use-cases" class="mx-auto max-w-6xl scroll-mt-20 px-4 py-16 sm:px-6">
+    <p class="font-mono text-xs uppercase tracking-widest text-primary">Use cases</p>
+    <h2 class="mt-2 text-3xl font-semibold tracking-tight">What people build with it</h2>
+    <p class="mt-3 max-w-2xl text-muted-foreground">Each one has a working demo in the repository.</p>
+    <div class="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      {useCases.map((u) => (
+        <Card class="flex flex-col p-5">
+          <span class="inline-flex size-9 items-center justify-center rounded-lg bg-accent text-accent-foreground">
+            <Icon name={u.icon} />
+          </span>
+          <p class="mt-3 font-semibold">{u.title}</p>
+          <p class="mt-1 flex-1 text-sm text-muted-foreground">{u.body}</p>
+          <a href={repoTree(u.demo)} class="mt-3 font-mono text-xs text-primary hover:underline">{u.demo}</a>
+        </Card>
+      ))}
+    </div>
+  </section>
+
+  <!-- Live examples -->
+  <section class="border-t">
+    <div class="mx-auto max-w-6xl px-4 py-16 sm:px-6">
+      <p class="font-mono text-xs uppercase tracking-widest text-primary">Live examples</p>
+      <h2 class="mt-2 text-3xl font-semibold tracking-tight">Try it without installing anything</h2>
+      <p class="mt-3 max-w-2xl text-muted-foreground">
+        These run the published packages in your browser. Each page shows the exact code it runs.
+      </p>
+      <div class="mt-8 grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+        {examples.map((e, i) => (
+          <a href={`/examples/${e.name}`} class="group rounded-xl border bg-card p-5 transition-colors hover:border-primary/50">
+            <p class="font-mono text-xs text-primary">{String(i + 1).padStart(2, "0")} · live</p>
+            <p class="mt-1 font-semibold">{e.label}</p>
+            <p class="mt-1 text-sm text-muted-foreground">{e.title}</p>
+          </a>
+        ))}
+        <a href="/examples/playground" class="group rounded-xl border border-primary/40 bg-primary/5 p-5 transition-colors hover:border-primary">
+          <p class="font-mono text-xs text-primary">playground</p>
+          <p class="mt-1 font-semibold">Drive a repository yourself</p>
+          <p class="mt-1 text-sm text-muted-foreground">Edit, commit, branch, switch, merge.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="border-t bg-muted/30">
+    <div class="mx-auto flex max-w-6xl flex-col items-start gap-6 px-4 py-14 sm:px-6 md:flex-row md:items-center md:justify-between">
+      <div>
+        <h2 class="text-2xl font-semibold tracking-tight">Start with one package</h2>
+        <p class="mt-2 font-mono text-sm text-muted-foreground">pnpm add @statewalker/vcs-commands @statewalker/vcs-core @statewalker/vcs-working-tree</p>
+      </div>
+      <div class="flex gap-3">
+        <Button href="/docs" size="lg">Getting started</Button>
+        <Button href="/docs/packages/vcs-core" variant="outline" size="lg">Package reference</Button>
+      </div>
+    </div>
+  </section>
+</Base>

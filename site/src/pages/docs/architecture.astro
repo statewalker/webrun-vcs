@@ -1,0 +1,112 @@
+---
+import CodeBlock from "@/components/CodeBlock.astro";
+import LayerDiagram from "@/components/LayerDiagram.astro";
+import Docs from "@/layouts/Docs.astro";
+import { docHref } from "@/lib/docs";
+import { repoFile } from "@/lib/site";
+
+const workingCopy = `History (vcs-core)          immutable, content-addressed
+  blobs · trees · commits · tags · refs
+Checkout (vcs-working-tree) mutable local state
+  staging (the index) · HEAD · merge/rebase/cherry-pick state · stash
+Worktree (vcs-working-tree) the files
+  read/write · walk · .gitignore · checkoutTree
+
+WorkingCopy = History + Checkout + Worktree  →  Git.fromWorkingCopy(workingCopy)`;
+
+const storage = `// Every backend gives the same History; only where the bytes go differs.
+createMemoryHistory()                                    // vcs-core: tests, ephemeral repos
+createGitFilesBackend({ files, gitDir: ".git" })         // vcs-store-files: git's own layout
+createHistory("sql", { db: await SqlJsAdapter.create() }) // vcs-store-sql: rows and columns
+createHistoryFromComponents({ … })                        // your own raw storage + object store`;
+---
+
+<Docs title="Architecture" description="How StateWalker VCS is built: layered packages, a history/checkout/worktree split, small storage interfaces, one transport for HTTP and peers, and large objects outside the object store.">
+  <h1>Architecture</h1>
+  <p>
+    StateWalker VCS implements git's object model and protocols in TypeScript, with the same object
+    ids, pack format and protocol messages as git. It is a stack of small packages; an application
+    takes only the layers it needs. A server that stores and serves repositories needs
+    <code>vcs-core</code>, a store and <code>vcs-transport</code>, not the working tree or the
+    commands.
+  </p>
+
+  <LayerDiagram />
+
+  <h2>History, checkout and worktree are separate</h2>
+  <p>
+    <code>vcs-core</code> knows only immutable objects and refs. The index, the working files and
+    the state of an operation in progress change on every command and depend on a filesystem, so
+    they live in <code>vcs-working-tree</code>. Multi-step workflows (commit: resolve HEAD, write a
+    tree from the index, store a commit, move the branch) live in <code>vcs-commands</code>.
+  </p>
+  <CodeBlock code={workingCopy} lang="text" title="the three parts" />
+  <p>
+    The split is what lets one history serve several worktrees (as <code>git worktree</code>
+    does), sync independently of any checkout, and run every command over memory in tests and
+    over a real directory in production.
+  </p>
+
+  <h2>Storage is a set of small interfaces</h2>
+  <p>
+    A backend implements object, ref and staging stores; pack formats, deltas and object
+    serialization are shared. So the same repository logic runs over memory, a <code>.git</code>
+    directory, SQL and key-value stores. Content flows as <code>AsyncIterable&lt;Uint8Array&gt;</code>,
+    so a large file is never held whole.
+  </p>
+  <CodeBlock code={storage} lang="ts" title="backends" />
+  <p>
+    Every store uses git's SHA-1 ids. <code>vcs-store-files</code> keeps objects byte for byte; the
+    SQL history rebuilds commits and tags from the columns it models, so a commit with extra
+    headers (a <code>mergetag</code>) is not kept byte-exact there
+    (<a href={docHref("packages/vcs-store-sql/README.md")}>vcs-store-sql</a>).
+  </p>
+
+  <h2>Portable by construction</h2>
+  <p>
+    Library code uses only APIs that exist in browsers and on servers: files through a
+    <code>FilesApi</code> (<code>@statewalker/webrun-files</code>), Web Streams, Web Crypto,
+    <code>fetch</code>. Lint rejects <code>node:*</code> imports outside the Node adapter
+    (<code>vcs-utils-node</code>). That is why the <a href="/examples">live examples</a> run the
+    packages in this page without shims, and why a repository can live in OPFS, IndexedDB, S3 or
+    SQLite behind the same <code>FilesApi</code>.
+  </p>
+
+  <h2>One transport for servers and peers</h2>
+  <p>
+    <code>vcs-transport</code> implements git's wire protocol, v1 and v2, as finite state machines
+    over a <code>Duplex</code>. Smart HTTP (<code>fetch</code>, <code>push</code>,
+    <code>lsRemote</code>) and duplex streams (<code>fetchOverDuplex</code>,
+    <code>pushOverDuplex</code>, <code>serveOverDuplex</code>) run the same client and server
+    machines, so a sync between two browser tabs uses the code path that talks to a git HTTP server.
+    <code>vcs-transport-adapters</code> connects a <code>History</code> to the transport's
+    <code>RepositoryFacade</code> and <code>RefStore</code>;
+    <code>vcs-transport-httpeers</code> serves git and LFS between the peers of an
+    <a href="https://github.com/statewalker/httpeers">httpeers</a> mesh.
+  </p>
+
+  <h2>Large objects go around the object store</h2>
+  <p>
+    <code>vcs-transport-lfs</code> speaks the Git LFS batch protocol with <code>basic</code>
+    whole-object transfer; <code>vcs-transport-xet</code> reads Hugging Face Xet and moves only
+    missing content-defined chunks between content stores (the <code>webrun-chunks</code>
+    transfer). Large objects travel through a chunked content store with its own ids and stay out
+    of packs; the LFS pointer still carries the standard whole-file SHA-256.
+  </p>
+
+  <h2>File sync and versioning stay independent</h2>
+  <p>
+    File synchronization (<code>@statewalker/webrun-files-sync</code>) knows nothing of git, and
+    the git packages know nothing of sync. Only <code>vcs-workspace</code> combines them: it runs
+    <code>publish</code>, <code>update</code>, <code>checkpoint</code> and <code>restore</code> over
+    a working tree and records which commit matches which synced file state. Either side works
+    alone.
+  </p>
+
+  <h2>Further reading</h2>
+  <ul>
+    <li><a href={repoFile("docs/package-dependencies.md")}>Package dependency diagram</a> (every runtime edge, as Mermaid).</li>
+    <li>The <a href={docHref("packages/vcs-core/README.md")}>vcs-core</a>, <a href={docHref("packages/vcs-transport/README.md")}>vcs-transport</a> and <a href={docHref("packages/vcs-store-files/README.md")}>vcs-store-files</a> references.</li>
+    <li><a href={repoFile("README.md")}>The repository README</a>: what will surprise you when building from source.</li>
+  </ul>
+</Docs>

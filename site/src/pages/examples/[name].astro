@@ -1,0 +1,79 @@
+---
+import CodeBlock from "@/components/CodeBlock.astro";
+import Icon from "@/components/Icon.astro";
+import Badge from "@/components/ui/Badge.astro";
+import Docs from "@/layouts/Docs.astro";
+import { examples, type LiveExample } from "@/lib/examples";
+import { npmPackage, repoFile, repoTree } from "@/lib/site";
+
+export function getStaticPaths() {
+  return examples.map((example) => ({ params: { name: example.name }, props: { example } }));
+}
+
+// The examples' sources as text: the page shows the very module its Run button imports.
+const sources = import.meta.glob<string>("../../examples/*.ts", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+
+const { example } = Astro.props as { example: LiveExample };
+const source = sources[`../../examples/${example.name}.ts`];
+if (!source) throw new Error(`src/examples/${example.name}.ts not found`);
+const index = examples.indexOf(example);
+const next = examples[index + 1];
+---
+
+<Docs title={example.label} description={example.summary} wide>
+  <p class="font-mono text-xs uppercase tracking-widest text-primary">Live example {index + 1} of {examples.length}</p>
+  <h1>{example.title}</h1>
+  <p>{example.summary}</p>
+  <div class="not-prose my-4 flex flex-wrap gap-2">
+    {example.packages.map((name) => (
+      <a href={npmPackage(name)} class="no-underline"><Badge variant="brand" class="font-mono">{name}</Badge></a>
+    ))}
+  </div>
+
+  <section data-example={example.name} class="my-6 overflow-hidden rounded-xl border">
+    <div class="flex flex-wrap items-center gap-3 border-b bg-muted/50 px-4 py-3">
+      <button
+        type="button"
+        data-run-button
+        class="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow-xs hover:bg-primary/90 disabled:opacity-50"
+      >
+        <Icon name="play" class="size-4" /> Run in this tab
+      </button>
+      <span data-run-status class="font-mono text-xs text-muted-foreground">not run yet</span>
+      <div data-run-downloads class="ml-auto flex gap-2"></div>
+    </div>
+    <pre data-run-output class="m-0! max-h-[28rem] min-h-24 overflow-auto rounded-none! border-0! bg-code px-4 py-3 font-mono text-[12.5px] leading-6 text-code-foreground">Press Run: the code below runs here, in your browser, on the published packages' sources.</pre>
+  </section>
+
+  <h2>What to look for</h2>
+  <ul>
+    {example.notes.map((note) => <li>{note}</li>)}
+  </ul>
+
+  <h2>The code that runs</h2>
+  <p>
+    This is <a href={repoFile(`site/src/examples/${example.name}.ts`)}><code>site/src/examples/{example.name}.ts</code></a>,
+    the module the button imports. It writes through a small <code>Output</code> (<code>log</code>, <code>download</code>)
+    where a program would use <code>console.log</code>.
+  </p>
+  <CodeBlock code={source} lang="ts" title={`${example.name}.ts`} />
+
+  {example.related && (
+    <p>
+      The repository covers the same ground in <a href={repoTree(example.related.path)}><code>{example.related.label}</code></a>.
+    </p>
+  )}
+  {next ? (
+    <p>Next: <a href={`/examples/${next.name}`}>{next.label}</a>.</p>
+  ) : (
+    <p>Next: try the <a href="/examples/playground">playground</a>, a repository you drive yourself.</p>
+  )}
+</Docs>
+
+<script>
+  import "@/examples/runner";
+</script>

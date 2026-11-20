@@ -1,0 +1,52 @@
+---
+import Icon from "@/components/Icon.astro";
+import Docs from "@/layouts/Docs.astro";
+import { examples } from "@/lib/examples";
+---
+
+<Docs title="Live examples" description="Examples that run the StateWalker VCS packages in your browser: commits, branches and merges, Git's object bytes, a real .git directory, and the Git protocol between two repositories." wide>
+  <h1>Live examples</h1>
+  <p>
+    Each example below is a small TypeScript module that runs in this tab, on the same packages
+    published to npm. Its page shows the module's source and a <strong>Run</strong> button: the code
+    you read is the code that runs. Nothing is sent to a server; there is no server.
+  </p>
+
+  <div class="not-prose my-8 grid gap-4 sm:grid-cols-2">
+    {examples.map((example, i) => (
+      <a href={`/examples/${example.name}`} class="group rounded-xl border bg-card p-5 text-foreground no-underline transition-colors hover:border-primary/50">
+        <p class="font-mono text-xs text-primary">{String(i + 1).padStart(2, "0")}</p>
+        <p class="mt-1 font-semibold">{example.label}</p>
+        <p class="mt-2 text-sm text-muted-foreground">{example.summary}</p>
+        <p class="mt-3 inline-flex items-center gap-1 text-sm font-medium text-primary">
+          Open and run <Icon name="arrowRight" class="size-4 transition-transform group-hover:translate-x-0.5" />
+        </p>
+      </a>
+    ))}
+    <a href="/examples/playground" class="group rounded-xl border border-primary/40 bg-primary/5 p-5 text-foreground no-underline transition-colors hover:border-primary">
+      <p class="font-mono text-xs text-primary">PLAYGROUND</p>
+      <p class="mt-1 font-semibold">Drive a repository yourself</p>
+      <p class="mt-2 text-sm text-muted-foreground">
+        Edit files, stage and commit, create and switch branches, merge them, and watch the log and
+        status as you go, all in memory in this tab.
+      </p>
+      <p class="mt-3 inline-flex items-center gap-1 text-sm font-medium text-primary">
+        Open the playground <Icon name="arrowRight" class="size-4 transition-transform group-hover:translate-x-0.5" />
+      </p>
+    </a>
+  </div>
+
+  <h2>How they run</h2>
+  <p>
+    The site is built with Astro and Vite, which bundle each example with the workspace packages
+    it imports (<code>@statewalker/vcs-core</code>, <code>vcs-working-tree</code>,
+    <code>vcs-commands</code>, <code>vcs-store-files</code>, <code>vcs-transport</code>). The
+    packages use only APIs that browsers and servers share (a <code>FilesApi</code> for files,
+    Web Streams, Web Crypto, <code>fetch</code>), so no shim is involved. A browser check
+    (<code>site/scripts/check-examples.mjs</code>) runs every example on every change to the site.
+  </p>
+  <p>
+    For longer programs, the repository has eleven numbered Node tutorials and a set of demos:
+    see <a href="/docs/examples">Apps &amp; demos</a>.
+  </p>
+</Docs>

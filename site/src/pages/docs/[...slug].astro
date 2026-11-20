@@ -1,0 +1,37 @@
+---
+import { getEntry, render } from "astro:content";
+import Docs from "@/layouts/Docs.astro";
+import { type RepoPage, repoPages } from "@/lib/docs";
+
+export function getStaticPaths() {
+  return repoPages.map((page) => ({ params: { slug: page.slug }, props: { page } }));
+}
+
+/** The page's meta description: its first paragraph of prose, as plain text, cut to ~160 chars. */
+function describe(markdown: string): string | undefined {
+  const block = markdown
+    .split(/\n\s*\n/)
+    .map((b) => b.trim())
+    .find((b) => b && !/^(#|```|\||<|>|-|\*\s|!|\[|\d+\.)/.test(b));
+  if (!block) return undefined;
+  const text = block
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/<(https?:[^>]+)>/g, "$1")
+    .replace(/`|\*\*|__/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length <= 160) return text.replace(/:$/, ".");
+  const cut = text.slice(0, 159);
+  return `${cut.slice(0, cut.lastIndexOf(" ")).replace(/[,;:.]$/, "")}…`;
+}
+
+const { page } = Astro.props as { page: RepoPage };
+const entry = await getEntry("repo", page.file);
+if (!entry) throw new Error(`${page.file} is not in the "repo" collection`);
+const { Content } = await render(entry);
+const description = describe(entry.body ?? "");
+---
+
+<Docs title={page.label} description={description}>
+  <Content />
+</Docs>

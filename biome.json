@@ -43,6 +43,17 @@
   },
   "overrides": [
     {
+      "includes": ["site/**/*.astro"],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noUnusedVariables": "off",
+            "noUnusedImports": "off"
+          }
+        }
+      }
+    },
+    {
       "includes": [
         "packages/*/src/**",
         "!packages/*/src/**/__tests__/**",
@@ -97,5 +108,10 @@
         }
       }
     }
-  ]
+  ],
+  "css": {
+    "parser": {
+      "tailwindDirectives": true
+    }
+  }
 }

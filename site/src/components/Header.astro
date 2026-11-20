@@ -1,0 +1,106 @@
+---
+import { REPO } from "@/lib/site";
+import core from "../../../packages/vcs-core/package.json";
+import Icon from "./Icon.astro";
+import Logo from "./Logo.astro";
+import ThemeToggle from "./ThemeToggle.astro";
+import Badge from "./ui/Badge.astro";
+
+// Built pages are directories ("/docs/"), so compare without the trailing slash.
+const path = Astro.url.pathname.replace(/\/+$/, "") || "/";
+const nav = [
+  { href: "/docs", label: "Docs" },
+  { href: "/docs/architecture", label: "Architecture" },
+  { href: "/examples", label: "Live examples" },
+  { href: "/examples/playground", label: "Playground" },
+  { href: "/docs/examples", label: "Apps & demos" },
+  { href: "/#use-cases", label: "Use cases" },
+];
+
+/** Pages under an item: links to a section (#) never are; Docs takes the /docs pages no other item claims. */
+const under = (href: string) => path === href || path.startsWith(`${href}/`);
+const isActive = (href: string) =>
+  !href.includes("#") &&
+  (href === "/docs" || href === "/examples"
+    ? under(href) && !nav.some((o) => o.href !== href && !o.href.includes("#") && under(o.href))
+    : under(href));
+---
+
+<header class="sticky top-0 z-40 w-full border-b bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+  <div class="mx-auto flex h-14 max-w-6xl items-center gap-6 px-4 sm:px-6">
+    <Logo />
+    <Badge variant="outline" class="hidden font-mono text-[10px] sm:inline-flex">v{core.version} · on npm</Badge>
+    <nav aria-label="Main" class="hidden items-center gap-5 text-sm lg:flex">
+      {nav.map((item) => (
+        <a
+          href={item.href}
+          class:list={[
+            "whitespace-nowrap transition-colors hover:text-foreground",
+            isActive(item.href) ? "text-foreground" : "text-muted-foreground",
+          ]}
+          aria-current={isActive(item.href) ? "page" : undefined}
+        >
+          {item.label}
+        </a>
+      ))}
+    </nav>
+    <div class="ml-auto flex items-center gap-1">
+      <!-- Below lg the bar has no room for the nav: a menu that works without JavaScript. -->
+      <details data-site-menu class="group relative lg:hidden">
+        <summary
+          class="inline-flex h-9 cursor-pointer list-none items-center gap-1.5 rounded-md px-2 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground group-open:text-foreground [&::-webkit-details-marker]:hidden"
+        >
+          <Icon name="menu" />
+          Menu
+        </summary>
+        <nav
+          aria-label="Main"
+          class="absolute right-0 top-full z-50 mt-2 w-56 rounded-lg border bg-background p-2 text-sm shadow-lg"
+        >
+          <ul>
+            {nav.map((item) => (
+              <li>
+                <a
+                  href={item.href}
+                  class:list={[
+                    "block rounded-md px-3 py-2 hover:bg-accent hover:text-accent-foreground",
+                    isActive(item.href) ? "font-medium text-foreground" : "text-muted-foreground",
+                  ]}
+                  aria-current={isActive(item.href) ? "page" : undefined}
+                >
+                  {item.label}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </nav>
+      </details>
+      <a
+        href={REPO}
+        aria-label="GitHub"
+        class="inline-flex size-9 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+      >
+        <Icon name="github" />
+      </a>
+      <ThemeToggle />
+    </div>
+  </div>
+</header>
+
+<script>
+  // The phone menu is a <details>: it closes after a link is chosen (an in-page link would leave
+  // it open over the section), on Escape, and on a click outside it.
+  for (const menu of document.querySelectorAll<HTMLDetailsElement>("details[data-site-menu]")) {
+    menu.addEventListener("click", (e) => {
+      if ((e.target as Element).closest("a")) menu.open = false;
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape" || !menu.open) return;
+      menu.open = false;
+      menu.querySelector("summary")?.focus();
+    });
+    document.addEventListener("click", (e) => {
+      if (menu.open && !menu.contains(e.target as Node)) menu.open = false;
+    });
+  }
+</script>

@@ -1,0 +1,113 @@
+name: site
+
+# The website (site/): built on every pull request that touches it, and published from main to
+# the httpeers static-site host, as statewalker/cellb.dev publishes cellb.dev's site. A site there
+# is a first-level prefix of the `sites` bucket named after its domain (https://s3.httpeers.net,
+# S3 on RustFS); the host serves `<domain>/…` for `Host: <domain>`. For a *.httpeers.net name
+# nothing else is needed: the zone has a wildcard DNS record and Caddy a wildcard certificate.
+# See statewalker/httpeers apps/sites/README.md and tools/publish/README.md.
+#
+# Settings (repository → Settings → Secrets and variables → Actions):
+#   secret   HTTPEERS_S3_ACCESS_KEY_ID, HTTPEERS_S3_SECRET_ACCESS_KEY   credentials that can write
+#            the site's prefix of the `sites` bucket (site/README.md: not RustFS's own pair)
+#   variable SITE_DOMAIN                       where to publish (default: vcs.httpeers.net)
+# Without the secrets the site is built and the publish step says it was skipped.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      # The live examples bundle these packages, and /docs/packages/… renders their READMEs
+      # (site/src/lib/docs.ts).
+      - "packages/*/src/**"
+      - "packages/*/package.json"
+      - "packages/*/README.md"
+      # /docs/example-applications (site/src/lib/docs.ts).
+      - "docs/example-applications.md"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/site.yml"
+      - ".github/scripts/install-chromium.sh"
+      - ".github/scripts/install-rclone.sh"
+  pull_request:
+    paths:
+      - "site/**"
+      - "packages/*/src/**"
+      - "packages/*/package.json"
+      - "packages/*/README.md"
+      - "docs/example-applications.md"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/site.yml"
+      - ".github/scripts/install-chromium.sh"
+      - ".github/scripts/install-rclone.sh"
+  workflow_dispatch:
+
+# One publish at a time, the latest commit last; pull requests cancel their own older runs.
+concurrency:
+  group: site-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  site:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      SITE_DOMAIN: ${{ vars.SITE_DOMAIN || 'vcs.httpeers.net' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # The packages' exports point at dist/: the site's workspace dependencies are built first,
+      # in dependency order.
+      - name: Build the packages the site imports
+        run: pnpm --filter "@statewalker/vcs-site^..." run build
+      - name: Build
+        run: pnpm --filter @statewalker/vcs-site build
+      # Every live example and the playground, run in Chromium as a visitor runs them.
+      - run: bash ${{ github.workspace }}/.github/scripts/install-chromium.sh pnpm --filter @statewalker/vcs-site exec playwright
+      - name: Live examples
+        run: pnpm --filter @statewalker/vcs-site check:examples
+
+      - name: Publish to https://${{ env.SITE_DOMAIN }}
+        if: github.event_name != 'pull_request'
+        env:
+          RCLONE_CONFIG_HTTPEERS_TYPE: s3
+          RCLONE_CONFIG_HTTPEERS_PROVIDER: Other
+          RCLONE_CONFIG_HTTPEERS_ENDPOINT: https://s3.httpeers.net
+          # Path-style addressing: virtual-host style would look up sites.s3.httpeers.net.
+          RCLONE_CONFIG_HTTPEERS_FORCE_PATH_STYLE: "true"
+          RCLONE_CONFIG_HTTPEERS_ACCESS_KEY_ID: ${{ secrets.HTTPEERS_S3_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_HTTPEERS_SECRET_ACCESS_KEY: ${{ secrets.HTTPEERS_S3_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RCLONE_CONFIG_HTTPEERS_ACCESS_KEY_ID" ] || [ -z "$RCLONE_CONFIG_HTTPEERS_SECRET_ACCESS_KEY" ]; then
+            echo "::notice::Not published: the HTTPEERS_S3_* secrets are not set."
+            exit 0
+          fi
+          # The prefix is the site. A name the host would not serve (lowercase labels, at least
+          # one dot) would only hide a mistake, and an empty one would be the bucket's root,
+          # where `rclone sync` would delete every other site.
+          label='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
+          if ! [[ "$SITE_DOMAIN" =~ ^$label(\.$label)+$ ]]; then
+            echo "::error::SITE_DOMAIN '$SITE_DOMAIN' is not a host name the sites host serves."
+            exit 1
+          fi
+          # An incomplete build must not replace the published site.
+          test -f site/dist/index.html || { echo "::error::site/dist/index.html is missing."; exit 1; }
+          test -f site/dist/examples/playground/index.html || { echo "::error::site/dist/examples/playground/index.html is missing."; exit 1; }
+          test -f site/dist/.site/config.json || { echo "::error::site/dist/.site/config.json is missing."; exit 1; }
+
+          bash "${{ github.workspace }}/.github/scripts/install-rclone.sh"
+          # Within the site's own prefix: files the build no longer has are removed, after the
+          # new ones are uploaded (rclone's default), so the site is never half missing.
+          rclone sync site/dist "httpeers:sites/$SITE_DOMAIN" --checksum --stats-one-line -v
+          echo "::notice::Published https://$SITE_DOMAIN (the host may serve old files for up to 60 s)."

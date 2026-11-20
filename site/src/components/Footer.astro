@@ -1,0 +1,38 @@
+---
+import { OBSERVABLE_DOCS, REPO, repoFile } from "@/lib/site";
+import Logo from "./Logo.astro";
+---
+
+<footer class="border-t">
+  <div class="mx-auto grid max-w-6xl gap-8 px-4 py-10 sm:px-6 md:grid-cols-[1fr_auto_auto_auto]">
+    <div class="space-y-3">
+      <Logo />
+      <p class="max-w-xs text-sm text-muted-foreground">
+        A Git-compatible version control system in TypeScript, for browsers, Node.js and workers.
+        Part of the <a href="https://github.com/statewalker" class="text-foreground underline-offset-4 hover:underline">statewalker</a> projects.
+      </p>
+    </div>
+    <div class="space-y-2 text-sm">
+      <p class="font-medium">Learn</p>
+      <ul class="space-y-1.5 text-muted-foreground">
+        <li><a href="/docs" class="hover:text-foreground">Getting started</a></li>
+        <li><a href="/docs/architecture" class="hover:text-foreground">Architecture</a></li>
+        <li><a href="/examples" class="hover:text-foreground">Live examples</a></li>
+        <li><a href="/examples/playground" class="hover:text-foreground">Playground</a></li>
+        <li><a href="/docs/examples" class="hover:text-foreground">Apps &amp; demos</a></li>
+      </ul>
+    </div>
+    <div class="space-y-2 text-sm">
+      <p class="font-medium">Project</p>
+      <ul class="space-y-1.5 text-muted-foreground">
+        <li><a href={REPO} class="hover:text-foreground">GitHub</a></li>
+        <li><a href={repoFile("CHANGELOG.md")} class="hover:text-foreground">Changelog</a></li>
+        <li><a href={OBSERVABLE_DOCS} class="hover:text-foreground">Observable notes</a></li>
+      </ul>
+    </div>
+    <div class="space-y-2 text-sm">
+      <p class="font-medium">Licence</p>
+      <p class="text-muted-foreground">MIT</p>
+    </div>
+  </div>
+</footer>

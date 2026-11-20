@@ -7,7 +7,9 @@ memory, a Git directory over any `FilesApi`, SQL, or a key-value store. A separa
 package combines it with rclone-style file synchronisation.
 
 This repository is a pnpm workspace: the library packages under `packages/`, runnable examples,
-demos and benchmarks under `apps/`, and a documentation site under `docs/`.
+demos and benchmarks under `apps/`, a documentation site under `docs/`, and the project website
+under `site/` (published from `main` to <https://vcs.httpeers.net>, with live examples that run the packages
+in the browser).
 
 ## The shape
 
@@ -61,6 +63,7 @@ TypeScript sources in `src/`. Other `@statewalker/*` dependencies (`webrun-files
 | [`apps/demos/`](apps/demos) | Node.js and browser demos: HTTP server, P2P sync over WebRTC/LiveKit, offline PWA, versioned documents, LFS/xet against HuggingFace. | Node: `start`; browser: `dev` (Vite) |
 | [`apps/benchmarks/`](apps/benchmarks) | Delta compression, pack operations, realistic repository workloads. | `pnpm --filter @statewalker/vcs-benchmark-<name> start` |
 | [`docs/`](docs) | Observable Framework site: overview, example guide, dependency diagram, release notes. | `pnpm docs:dev` |
+| [`site/`](site) | The project website: docs, architecture, live examples and a playground running the packages in the browser ([site/README.md](site/README.md)). | `pnpm --filter @statewalker/vcs-site dev` |
 
 See [docs/example-applications.md](docs/example-applications.md) for each app.
 

@@ -1,0 +1,89 @@
+---
+import Docs from "@/layouts/Docs.astro";
+import { repoFile } from "@/lib/site";
+
+const input =
+  "h-9 w-full rounded-md border bg-background px-3 text-sm outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50";
+const button =
+  "inline-flex h-9 shrink-0 items-center justify-center rounded-md border bg-background px-3 text-sm font-medium hover:bg-accent disabled:pointer-events-none disabled:opacity-50";
+const primary =
+  "inline-flex h-9 shrink-0 items-center justify-center rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground hover:bg-primary/90";
+const panel = "rounded-xl border bg-card p-4";
+const heading = "mb-2 font-mono text-xs uppercase tracking-widest text-muted-foreground";
+---
+
+<Docs title="Playground" description="A Git repository in your browser tab: edit files, commit, branch, switch and merge with the StateWalker VCS porcelain API, and watch status and log." wide>
+  <h1>Playground</h1>
+  <p>
+    A repository in memory, in this tab, driven by the porcelain API of
+    <code>@statewalker/vcs-commands</code>. Edit a file and save it, commit, create a branch,
+    switch back, merge. Each button is one or two commands
+    (<a href={repoFile("site/src/playground/repository.ts")}><code>repository.ts</code></a>);
+    reload the page or press <em>Start over</em> to begin again.
+  </p>
+
+  <div data-playground class="not-prose my-6 space-y-4 data-[busy]:cursor-progress">
+    <div class="flex flex-wrap items-center gap-3 text-sm">
+      <span>On branch <b data-pg-branch class="font-mono text-primary">…</b></span>
+      <span data-pg-state class="font-mono text-xs text-muted-foreground">loading…</span>
+      <button type="button" data-pg-reset class:list={[button, "ml-auto h-8 text-xs"]}>Start over</button>
+    </div>
+
+    <div class="grid gap-4 lg:grid-cols-[180px_1fr]">
+      <div class={panel}>
+        <p class={heading}>Worktree</p>
+        <ul data-pg-files class="my-0 list-none space-y-0.5 pl-0"></ul>
+      </div>
+      <div class:list={[panel, "space-y-3"]}>
+        <div class="flex gap-2">
+          <label class="sr-only" for="pg-path">File path</label>
+          <input id="pg-path" data-pg-path class:list={[input, "font-mono"]} placeholder="path/to/file.txt" />
+          <button type="button" data-pg-save class={primary}>Save file</button>
+          <button type="button" data-pg-remove class={button}>Delete</button>
+        </div>
+        <label class="sr-only" for="pg-editor">File content</label>
+        <textarea id="pg-editor" data-pg-editor rows="8" class="w-full rounded-md border bg-code p-3 font-mono text-[13px] leading-5 text-code-foreground outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" spellcheck="false"></textarea>
+        <div class="flex gap-2">
+          <label class="sr-only" for="pg-message">Commit message</label>
+          <input id="pg-message" data-pg-message class={input} placeholder="Commit message" />
+          <button type="button" data-pg-commit class={primary}>Stage all &amp; commit</button>
+        </div>
+      </div>
+    </div>
+
+    <div class:list={[panel, "flex flex-wrap items-center gap-2"]}>
+      <label class="sr-only" for="pg-new-branch">New branch name</label>
+      <input id="pg-new-branch" data-pg-new-branch class:list={[input, "max-w-48 font-mono"]} placeholder="feature" />
+      <button type="button" data-pg-create class={button}>Create &amp; switch</button>
+      <span class="mx-2 hidden h-6 border-l sm:inline"></span>
+      <label class="sr-only" for="pg-branches">Other branch</label>
+      <select id="pg-branches" data-pg-branches class:list={[input, "max-w-48 font-mono"]}></select>
+      <button type="button" data-pg-switch class={button}>Switch to it</button>
+      <button type="button" data-pg-merge class={button}>Merge into current</button>
+    </div>
+
+    <div class="grid gap-4 md:grid-cols-2">
+      <div class={panel}>
+        <p class={heading}>git status</p>
+        <ul data-pg-status class="my-0 list-none space-y-1 pl-0"></ul>
+        <p class:list={[heading, "mt-4"]}>Messages</p>
+        <pre data-pg-messages class="m-0! rounded-none! border-0! p-0! max-h-40 overflow-auto whitespace-pre-wrap font-mono text-xs leading-5"></pre>
+      </div>
+      <div class={panel}>
+        <p class={heading}>git log</p>
+        <ol data-pg-log class="my-0 list-none space-y-2 pl-0"></ol>
+      </div>
+    </div>
+  </div>
+
+  <h2>Things to try</h2>
+  <ul>
+    <li>Create a branch <code>feature</code>, add a file, commit; switch to <code>main</code>: the file leaves the worktree.</li>
+    <li>Change <code>README.md</code> on <code>main</code> and commit, then merge <code>feature</code>: a merge commit with two parents.</li>
+    <li>Change the same line on two branches and merge: the merge stops with a conflict, the file holds conflict markers, and a commit concludes it.</li>
+  </ul>
+</Docs>
+
+<script>
+  import "@/playground/playground";
+</script>
