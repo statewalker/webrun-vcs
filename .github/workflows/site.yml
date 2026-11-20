@@ -22,6 +22,7 @@ on:
       - "packages/*/src/**"
       - "packages/*/package.json"
       - "packages/*/README.md"
+      - "packages/*/docs/**"
       # /docs/example-applications (site/src/lib/docs.ts).
       - "docs/example-applications.md"
       - "package.json"
@@ -36,6 +37,7 @@ on:
       - "packages/*/src/**"
       - "packages/*/package.json"
       - "packages/*/README.md"
+      - "packages/*/docs/**"
       - "docs/example-applications.md"
       - "package.json"
       - "pnpm-lock.yaml"

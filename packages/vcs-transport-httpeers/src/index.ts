@@ -10,6 +10,7 @@
  */
 
 export * from "./access/index.js";
+export * from "./connect/index.js";
 export * from "./git/index.js";
 export * from "./lfs/index.js";
 export * from "./peer/index.js";

@@ -56,6 +56,60 @@ result.updates[0]; // { remoteRef: `refs/peers/${myPeerId}/main`, status: "ok", 
 `@statewalker/httpeers-access/issuer`), or a function returning a current one. `connection.call`
 is the caller `Duplex` of a webrun-streams connection to the peer.
 
+### Clone, fetch and push with vcs-commands
+
+```typescript
+import { Git } from "@statewalker/vcs-commands";
+import { createDefaultTransports } from "@statewalker/vcs-transport";
+import { createHttpeersConnector } from "@statewalker/vcs-transport-httpeers";
+
+const transports = createDefaultTransports();
+transports.register(createHttpeersConnector({ token, call: (peer) => connectionTo(peer).call }));
+const git = Git.fromWorkingCopy(workingCopy, { transports });
+
+await git.clone().setURI(`httpeers://${peerB}/repo.git`).call();
+await git.push().setRemote("origin").setRefSpecs(`main:refs/peers/${myPeerId}/main`).call();
+```
+
+`httpeers://<peer>/<repo>` is smart HTTP over the mesh (the peer serves `meshGitHandler`), with
+the token sent only to that peer. `call(peer)` returns a webrun caller `Duplex` to the peer; a
+member whose own `fetch` already reaches peers passes `fetchImpl` and `peerUrl` instead.
+
+### git's native protocol on an httpeers stream
+
+```typescript
+import { createDuplexMounts, openDuplex, serveDuplex } from "@statewalker/httpeers-libp2p";
+import {
+  createHttpeersConnector,
+  HTTPEERS_GIT_DUPLEX_PATH,
+  meshGitDuplexHandler,
+} from "@statewalker/vcs-transport-httpeers";
+
+// the serving peer
+const mounts = createDuplexMounts();
+mounts.provide(HTTPEERS_GIT_DUPLEX_PATH, meshGitDuplexHandler({ access, resolveRepository, enableReceivePack: true }));
+await serveDuplex({ node, mounts });
+
+// the calling peer: httpeers+git://<peer>/<repo>
+transports.register(
+  createHttpeersConnector({
+    mode: "native",
+    token,
+    openStream: ({ peer, path, token }) => openDuplex({ node, peerId: peer, path, token }),
+  }),
+);
+await git.fetch().setRemote(`httpeers+git://${peerB}/repo.git`).call();
+```
+
+httpeers-libp2p's duplex streams (`/httpeers-duplex/1.0.0`) carry the token in their open frame
+and give the handler the peer the Noise handshake proved. `meshGitDuplexHandler` verifies the
+token exactly as `meshGitHandler` does, answers a refusal with git's `ERR access denied: …`, then
+serves git-daemon's request line through `serveGitConnection` with the same capability rules
+(`git:read` to fetch; `git:write`, or `git:write-own` inside `refs/peers/<peerId>/*`, to push,
+and only with `enableReceivePack`). A stream is authorized once, when it opens: wrap the handler
+with httpeers-access's `guardStream` to end a revoked member's stream. This package does not
+depend on httpeers-libp2p; the handler and `openStream` only match its shapes.
+
 ### Download one LFS object from several peers
 
 ```typescript
@@ -163,6 +217,9 @@ verified object, or a copy it sent whole that failed to verify.
 | Export | Description |
 |--------|-------------|
 | `meshGitHandler(options)` | git smart-HTTP handler behind the mesh's access checks. `options`: `createFetchHandler`'s (protocol v2, limits, `receivePack`), plus `repository` + `refStore` or `resolveRepository`, `access`, `ownNamespace?` (a `refs/` prefix; a trailing `/` is added), `requestPolicy?` (default `"REACHABLE_COMMIT"`, not git's v2 `"ANY"`) |
+| `createHttpeersConnector(options)` | A transport connector for vcs-commands' remote commands. `mode: "http"` (default, scheme `httpeers`): `call(peer, request)` (with `token`) or `fetchImpl` (+ `peerUrl?(peer)`, `token?`), `headers?`. `mode: "native"` (scheme `httpeers+git`): `openStream({ peer, path, token, request }, { signal })` returning a webrun `Duplex` or `{ call, close? }`, `streamPath?` (default `HTTPEERS_GIT_DUPLEX_PATH`), `connectTimeout?`. Both: `name?`, `schemes?` |
+| `meshGitDuplexHandler(options)` | git's native protocol for httpeers-libp2p's duplex mounts: `(input, { peerId, path?, token? })`. `options`: `serveGitConnection`'s (`resolveRepository`, `settings`, `initTimeout`, `timeout`, `informativeErrors`), `access`, `enableReceivePack?` (default false), `ownNamespace?`, `requestPolicy?` (default `"REACHABLE_COMMIT"`), `onSettled?(result, error, caller)` |
+| `HTTPEERS_GIT_DUPLEX_PATH`, `HTTPEERS_SCHEME`, `HTTPEERS_NATIVE_SCHEME` | `"/git"`, `"httpeers"`, `"httpeers+git"` |
 | `meshLfsHandler(options)` | LFS handler behind the mesh's access checks. `options`: `serveLfs`'s except `transferAuth` (per-action headers would let a transfer skip the capability check), plus `objects`, `access`, `locks?` (`identify` optional), `ranged?` (default true), `authorize?(request, operation, caller, lock?)` |
 | `lfsSwarmDownload(pointers, sources, store, opts?)` | Multi-source download → `{ downloaded, failed, bad, received }`. `opts`: `chunkSize?`, `windowBytes?` (positive), `idleTimeoutMs?`, `reassignAfterMs?`, `signal?` |
 | `meshGitFetch(options)`, `meshGitPush(options)` | The fetch client and push of `@statewalker/vcs-transport` through a peer (`call` or `fetchImpl`, and `token`) |

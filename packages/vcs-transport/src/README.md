@@ -357,7 +357,9 @@ const serve = {
 };
 ```
 
-Each adapter below is a client connector plus a server entry point taking `serve`.
+Each adapter below is a client connector plus a server entry point taking `serve`. The user
+guide, with client and server examples for every transport and the security notes, is
+[docs/transports.md](../docs/transports.md).
 
 ### MessagePort (Workers, iframes, a MessageChannel)
 

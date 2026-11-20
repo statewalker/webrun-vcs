@@ -15,19 +15,24 @@ import {
   DEFAULT_GIT_MAX_PORTS,
   DEFAULT_WEBSOCKET_FRAME_SIZE,
   DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
+  fetchOverDuplex,
   type Libp2pMessageStreamLike,
   type Libp2pStreamLike,
   libp2pStreamDuplex,
   messagePortDuplex,
   parseGitUrl,
+  pushOverDuplex,
   serveGitOverLibp2pStream,
   serveGitOverPortMux,
+  serveOverDuplex,
+  serveOverPort,
   type WebSocketLike,
   webrunClientDuplex,
   webrunServerDuplex,
   webSocketDuplex,
 } from "../src/index.js";
-import { serverRepo } from "./helpers/receive-pack-harness.js";
+import { clientWithNewCommits, serverRepo } from "./helpers/receive-pack-harness.js";
+import { createTransportRepo } from "./interop/helpers.js";
 
 const bytes = (n: number, fill = 1) => new Uint8Array(n).fill(fill);
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -583,5 +588,53 @@ describe("error paths (review of the duplex adapters)", () => {
     await peer.close();
     await stop();
     channel.port1.close();
+  });
+});
+
+describe("serveOverPort (the server side of messagePortDuplex for a fixed service)", () => {
+  it("serves a fetch and a push, one MessageChannel each", async () => {
+    const { repo, c2 } = await serverRepo();
+    const local = await createTransportRepo();
+    const fetchChannel = new MessageChannel();
+    let served: unknown;
+    serveOverPort(fetchChannel.port2, async (duplex) => {
+      served = await serveOverDuplex({
+        duplex,
+        repository: repo.facade,
+        refStore: repo.refStore,
+        service: "git-upload-pack",
+      });
+    });
+    const fetched = await fetchOverDuplex({
+      duplex: messagePortDuplex(fetchChannel.port1),
+      repository: local.facade,
+      refStore: local.refStore,
+      refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+    });
+    expect(fetched.success).toBe(true);
+    expect(await local.refStore.get("refs/remotes/origin/main")).toBe(c2);
+    await tick();
+    expect((served as { success?: boolean } | undefined)?.success).toBe(true);
+
+    const { client, commits } = await clientWithNewCommits(1);
+    await client.refStore.update("refs/heads/main", commits[0] as string);
+    const pushChannel = new MessageChannel();
+    serveOverPort(pushChannel.port2, (duplex) =>
+      serveOverDuplex({
+        duplex,
+        repository: repo.facade,
+        refStore: repo.refStore,
+        service: "git-receive-pack",
+      }),
+    );
+    const pushed = await pushOverDuplex({
+      duplex: messagePortDuplex(pushChannel.port1),
+      repository: client.facade,
+      refStore: client.refStore,
+      refspecs: ["refs/heads/main:refs/heads/main"],
+    });
+    expect(pushed.error).toBeUndefined();
+    expect(pushed.success).toBe(true);
+    expect(await repo.refStore.get("refs/heads/main")).toBe(commits[0]);
   });
 });

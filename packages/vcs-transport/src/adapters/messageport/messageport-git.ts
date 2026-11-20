@@ -56,6 +56,7 @@ import {
   type WebrunDuplex,
   type WebrunDuplexOptions,
   webrunClientDuplex,
+  webrunServerDuplex,
 } from "../webrun/index.js";
 
 export type { MessageTarget };
@@ -107,6 +108,40 @@ export function serveGitOverPort(
   return serveDuplexOverPort(
     port,
     serveGitOverWebrun(serveOptions),
+    streamTimeout !== undefined ? { timeout: streamTimeout } : {},
+  );
+}
+
+/** Options of {@link serveOverPort}. */
+export interface ServeOverPortOptions extends WebrunDuplexOptions {
+  /** Abort the stream after this many milliseconds without a chunk either way (default: none) */
+  streamTimeout?: number;
+}
+
+/**
+ * Runs `run` against the server's end of one session on a port whose client end is a
+ * {@link messagePortDuplex}: the stream `serveOverDuplex` (a fixed service), `serveGitService`
+ * or any other server reads and writes. It replaces the server side of the deprecated
+ * `createMessagePortDuplex`. Returns a teardown that abandons the session.
+ *
+ * @example
+ * ```ts
+ * const { port1, port2 } = new MessageChannel();
+ * serveOverPort(port2, (duplex) =>
+ *   serveOverDuplex({ duplex, repository, refStore, service: "git-upload-pack" }),
+ * );
+ * const result = await fetchOverDuplex({ duplex: messagePortDuplex(port1), repository: local, refStore: localRefs });
+ * ```
+ */
+export function serveOverPort<T>(
+  port: MessageTarget,
+  run: (duplex: Duplex) => Promise<T>,
+  options: ServeOverPortOptions = {},
+): () => void {
+  const { streamTimeout, ...queue } = options;
+  return serveDuplexOverPort(
+    port,
+    webrunServerDuplex(run, queue),
     streamTimeout !== undefined ? { timeout: streamTimeout } : {},
   );
 }
