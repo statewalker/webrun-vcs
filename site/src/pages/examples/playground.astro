@@ -1,5 +1,6 @@
 ---
-import Docs from "@/layouts/Docs.astro";
+import Docs from "@/layouts/docs.astro";
+import { conceptHref } from "@/lib/concepts";
 import { repoFile } from "@/lib/site";
 
 const input =
@@ -81,6 +82,13 @@ const heading = "mb-2 font-mono text-xs uppercase tracking-widest text-muted-for
     <li>Create a branch <code>feature</code>, add a file, commit; switch to <code>main</code>: the file leaves the worktree.</li>
     <li>Change <code>README.md</code> on <code>main</code> and commit, then merge <code>feature</code>: a merge commit with two parents.</li>
     <li>Change the same line on two branches and merge: the merge stops with a conflict, the file holds conflict markers, and a commit concludes it.</li>
+  </ul>
+
+  <h2 id="concepts">What happens underneath</h2>
+  <ul>
+    <li>Each commit stores <a href={conceptHref("object-model", "objects")}>blobs, trees and a commit</a>, named by the <a href={conceptHref("object-model", "ids")}>SHA-1 of their bytes</a>.</li>
+    <li>A branch is a <a href={conceptHref("branches-and-merging", "refs")}>ref</a>; switching <a href={conceptHref("branches-and-merging", "checkout")}>rewrites the worktree</a>.</li>
+    <li>Merging is a <a href={conceptHref("branches-and-merging", "merge")}>fast-forward or a three-way merge</a>, with conflicts staged as git stages them.</li>
   </ul>
 </Docs>
 

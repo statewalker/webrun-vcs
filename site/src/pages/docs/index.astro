@@ -1,8 +1,8 @@
 ---
-import CodeBlock from "@/components/CodeBlock.astro";
-import Docs from "@/layouts/Docs.astro";
+import CodeBlock from "@/components/code-block.astro";
+import Docs from "@/layouts/docs.astro";
 import { docHref } from "@/lib/docs";
-import { repoTree } from "@/lib/site";
+import { OBSERVABLE_DOCS, repoTree } from "@/lib/site";
 
 const install = `pnpm add @statewalker/vcs-commands @statewalker/vcs-core @statewalker/vcs-working-tree`;
 
@@ -126,10 +126,17 @@ pnpm --filter @statewalker/vcs-example-01-quick-start start`;
     <code>apps/benchmarks</code>, and this site under <code>site/</code>.
   </p>
   <CodeBlock code={fromSources} lang="sh" title="terminal" />
+  <p>
+    The package references on this site are the packages' own <code>README.md</code> files, rendered
+    as they are in the repository. The <a href={OBSERVABLE_DOCS}>Observable page</a> on GitHub Pages,
+    built from <code>docs/</code> with Observable Framework, is a one-page summary of the same
+    project: its features and the quick start above.
+  </p>
 
   <h2>Next</h2>
   <ul>
     <li><a href="/docs/architecture">Architecture</a>: the layers and why they are separate.</li>
+    <li><a href="/docs/concepts">Concepts</a>: objects, refs and merging, storage and the wire protocol, explained.</li>
     <li><a href="/examples">Live examples</a> and the <a href="/examples/playground">playground</a>.</li>
     <li><a href="/docs/examples">Apps &amp; demos</a>: the tutorials and demos in the repository.</li>
   </ul>

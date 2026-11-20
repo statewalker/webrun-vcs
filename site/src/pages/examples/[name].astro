@@ -1,8 +1,8 @@
 ---
-import CodeBlock from "@/components/CodeBlock.astro";
-import Icon from "@/components/Icon.astro";
-import Badge from "@/components/ui/Badge.astro";
-import Docs from "@/layouts/Docs.astro";
+import CodeBlock from "@/components/code-block.astro";
+import Icon from "@/components/icon.astro";
+import Badge from "@/components/ui/badge.astro";
+import Docs from "@/layouts/docs.astro";
 import { examples, type LiveExample } from "@/lib/examples";
 import { npmPackage, repoFile, repoTree } from "@/lib/site";
 
@@ -52,6 +52,11 @@ const next = examples[index + 1];
   <h2>What to look for</h2>
   <ul>
     {example.notes.map((note) => <li>{note}</li>)}
+  </ul>
+
+  <h2 id="concepts">What it shows, explained</h2>
+  <ul>
+    {example.concepts.map((concept) => <li><a href={concept.href}>{concept.label}</a></li>)}
   </ul>
 
   <h2>The code that runs</h2>

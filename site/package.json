@@ -19,6 +19,7 @@
     "build": "astro build && node scripts/compress.mjs",
     "preview": "astro preview",
     "typecheck": "astro sync && tsc --noEmit",
+    "check:links": "node scripts/check-links.mjs",
     "check:examples": "node scripts/check-examples.mjs"
   },
   "dependencies": {

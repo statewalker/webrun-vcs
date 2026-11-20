@@ -1,3 +1,5 @@
+import { conceptHref } from "./concepts";
+
 /** The live examples: each is a module of src/examples/ that the page shows and runs. */
 export interface LiveExample {
   /** File name in src/examples/ (without .ts) and the page's slug. */
@@ -10,6 +12,8 @@ export interface LiveExample {
   notes: string[];
   /** Packages the example imports. */
   packages: string[];
+  /** The concept page sections that explain what the example shows. */
+  concepts: { label: string; href: string }[];
   /** The repository's own example or demo covering the same ground. */
   related?: { label: string; path: string };
 }
@@ -29,6 +33,14 @@ export const examples: LiveExample[] = [
       "@statewalker/vcs-commands",
       "@statewalker/vcs-core",
       "@statewalker/vcs-working-tree",
+    ],
+    concepts: [
+      { label: "Objects a commit is made of", href: conceptHref("object-model", "objects") },
+      { label: "Refs and HEAD", href: conceptHref("branches-and-merging", "refs") },
+      {
+        label: "History, checkout and worktree",
+        href: "/docs/architecture#history-checkout-worktree",
+      },
     ],
     related: {
       label: "apps/examples/02-porcelain-commands",
@@ -50,6 +62,17 @@ export const examples: LiveExample[] = [
       "@statewalker/vcs-core",
       "@statewalker/vcs-working-tree",
     ],
+    concepts: [
+      { label: "Refs and HEAD", href: conceptHref("branches-and-merging", "refs") },
+      {
+        label: "Checkout rewrites the worktree",
+        href: conceptHref("branches-and-merging", "checkout"),
+      },
+      {
+        label: "Fast-forward and three-way merge",
+        href: conceptHref("branches-and-merging", "merge"),
+      },
+    ],
     related: {
       label: "apps/examples/04-branching-merging",
       path: "apps/examples/04-branching-merging",
@@ -66,6 +89,11 @@ export const examples: LiveExample[] = [
       "The fixed author time makes the tree and commit ids the same on every run.",
     ],
     packages: ["@statewalker/vcs-core"],
+    concepts: [
+      { label: "Blobs, trees, commits and tags", href: conceptHref("object-model", "objects") },
+      { label: "The loose object format", href: conceptHref("object-model", "loose-format") },
+      { label: "Why an id is the SHA-1 of the bytes", href: conceptHref("object-model", "ids") },
+    ],
     related: { label: "apps/examples/03-object-model", path: "apps/examples/03-object-model" },
   },
   {
@@ -83,6 +111,11 @@ export const examples: LiveExample[] = [
       "@statewalker/vcs-commands",
       "@statewalker/webrun-files-mem",
     ],
+    concepts: [
+      { label: "Files go through a FilesApi", href: conceptHref("storage", "files-api") },
+      { label: "The .git directory layout", href: conceptHref("storage", "git-layout") },
+      { label: "Loose objects", href: conceptHref("object-model", "loose-format") },
+    ],
     related: { label: "packages/vcs-store-files", path: "packages/vcs-store-files" },
   },
   {
@@ -96,6 +129,12 @@ export const examples: LiveExample[] = [
       "The same client and server state machines talk to Git HTTP servers.",
     ],
     packages: ["@statewalker/vcs-transport", "@statewalker/vcs-commands", "@statewalker/vcs-core"],
+    concepts: [
+      { label: "upload-pack and receive-pack", href: conceptHref("transport", "services") },
+      { label: "Fetch negotiation", href: conceptHref("transport", "upload-pack") },
+      { label: "Push commands and status", href: conceptHref("transport", "receive-pack") },
+      { label: "State machines over a duplex", href: conceptHref("transport", "state-machines") },
+    ],
     related: { label: "apps/demos/webrtc-p2p-sync", path: "apps/demos/webrtc-p2p-sync" },
   },
 ];

@@ -1,6 +1,6 @@
 ---
 import { OBSERVABLE_DOCS, REPO, repoFile } from "@/lib/site";
-import Logo from "./Logo.astro";
+import Logo from "./logo.astro";
 ---
 
 <footer class="border-t">
@@ -17,6 +17,7 @@ import Logo from "./Logo.astro";
       <ul class="space-y-1.5 text-muted-foreground">
         <li><a href="/docs" class="hover:text-foreground">Getting started</a></li>
         <li><a href="/docs/architecture" class="hover:text-foreground">Architecture</a></li>
+        <li><a href="/docs/concepts" class="hover:text-foreground">Concepts</a></li>
         <li><a href="/examples" class="hover:text-foreground">Live examples</a></li>
         <li><a href="/examples/playground" class="hover:text-foreground">Playground</a></li>
         <li><a href="/docs/examples" class="hover:text-foreground">Apps &amp; demos</a></li>
@@ -27,7 +28,7 @@ import Logo from "./Logo.astro";
       <ul class="space-y-1.5 text-muted-foreground">
         <li><a href={REPO} class="hover:text-foreground">GitHub</a></li>
         <li><a href={repoFile("CHANGELOG.md")} class="hover:text-foreground">Changelog</a></li>
-        <li><a href={OBSERVABLE_DOCS} class="hover:text-foreground">Observable notes</a></li>
+        <li><a href={OBSERVABLE_DOCS} class="hover:text-foreground">Observable summary</a></li>
       </ul>
     </div>
     <div class="space-y-2 text-sm">
