@@ -7,7 +7,7 @@ import { defineConfig } from "astro/config";
 import { rehypeRepoLinks } from "./src/lib/rehype-repo-links.ts";
 
 export default defineConfig({
-  site: "https://vcs.httpeers.net",
+  site: "https://vcs.statewalker.com",
   vite: {
     plugins: [tailwindcss()],
     // The live examples bundle vcs-commands, about 1.4 MB unminified (under 400 KB as Brotli):
