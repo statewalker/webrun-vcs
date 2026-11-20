@@ -320,7 +320,9 @@ export class InitCommand {
         this.worktreeStore ??
         createFileWorktree({
           files,
-          rootPath: "",
+          // the worktree is the directory asked for (git init <dir>), the FilesApi's root
+          // without one
+          rootPath: (this.directory ?? "").replace(/\/+$/, ""),
           blobs: history.blobs,
           trees: history.trees,
           gitDir,

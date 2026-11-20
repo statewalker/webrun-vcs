@@ -1630,6 +1630,10 @@ export class FileWorktree implements Worktree {
     return this.rootPath;
   }
 
+  getGitDir(): string | undefined {
+    return this.gitDir;
+  }
+
   async refreshIgnore(): Promise<void> {
     this.repositoryExcludesLoaded = false;
     await this.loadRepositoryExcludes();

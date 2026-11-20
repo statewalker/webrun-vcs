@@ -255,6 +255,15 @@ export class FileStagingStore implements Staging {
     this.indexFile.clearResolveUndo();
   }
 
+  getResolveUndo(): ResolveUndoRecord[] {
+    return this.indexFile.getResolveUndo();
+  }
+
+  dropResolveUndo(paths: ReadonlySet<string>): void {
+    this.unwritten = true;
+    this.indexFile.dropResolveUndo(paths);
+  }
+
   setCacheTree(tree: CacheTree | undefined): void {
     this.unwritten = true;
     // the entries it describes: later edits before the write invalidate their paths

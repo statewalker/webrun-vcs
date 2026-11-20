@@ -193,6 +193,20 @@ export interface Staging {
   clearResolveUndo?(): void;
 
   /**
+   * The resolve-undo records the index holds (its `REUC` extension, with the records
+   * recorded since it was read), sorted by path: what `git checkout -m <path>` brings back
+   * as conflict stages (`unmerge_index`). Absent: a staging area that keeps none.
+   */
+  getResolveUndo?(): ResolveUndoRecord[];
+
+  /**
+   * Drops the resolve-undo records of `paths` on the next write (git's `unmerge_index`
+   * forgets a record once it has restored the path's stages). Absent: a staging area that
+   * keeps none.
+   */
+  dropResolveUndo?(paths: ReadonlySet<string>): void;
+
+  /**
    * Writes `tree` as the index's cache-tree (`TREE` extension) with the next `write`, as git
    * does after unpack-trees switches the index to a known tree. It must describe the entries
    * written then; undefined writes none. Absent: a staging area without an index file.

@@ -4,7 +4,12 @@
  * pruned tree diffs of `git log -- <pathspec>`).
  */
 
-import { decodeGitPath, encodeGitPath, foldAsciiCase } from "@statewalker/vcs-utils/encoding";
+import {
+  decodeGitPath,
+  encodeGitPath,
+  foldAsciiCase,
+  unquoteGitPath,
+} from "@statewalker/vcs-utils/encoding";
 import { wildmatch, wildmatchBytes } from "@statewalker/vcs-working-tree";
 
 export const MATCHED_RECURSIVELY = 1;
@@ -1153,4 +1158,42 @@ export function prefixOriginElement(
   if (magic.length === 0) return `:(prefix:0)${path}`;
   const head = longhand ?? `:(${magic.filter((n) => n === "top" || n === "exclude").join(",")}`;
   return `${head},prefix:0)${path}`;
+}
+
+/**
+ * git's `parse_pathspec_file` (`--pathspec-from-file`): one element per line (`\n`, a
+ * trailing `\r` dropped as `strbuf_getline` drops it), a line starting with `"` unquoted
+ * as a C string; with `nul`, elements separated by NUL and taken as they are.
+ *
+ * @example
+ * ```typescript
+ * parsePathspecFile('a.txt\n"caf\\303\\251"\n'); // ["a.txt", "café"]
+ * ```
+ *
+ * @throws Error "line is badly quoted: <line>" as git dies
+ */
+export function parsePathspecFile(content: string | Uint8Array, nul = false): string[] {
+  const bytes = typeof content === "string" ? encodeGitPath(content) : content;
+  const out: string[] = [];
+  const sep = nul ? 0 : 0x0a;
+  let start = 0;
+  while (start < bytes.length) {
+    let end = bytes.indexOf(sep, start);
+    if (end < 0) end = bytes.length;
+    let lineEnd = end;
+    if (!nul && lineEnd > start && bytes[lineEnd - 1] === 0x0d) lineEnd--;
+    const line = bytes.subarray(start, lineEnd);
+    if (!nul && line[0] === 0x22) {
+      const unquoted = unquoteGitPath(line);
+      // unquote_c_style without endp: what follows the closing quote is ignored
+      if (!unquoted) {
+        throw new Error(`line is badly quoted: ${decodeGitPath(line)}`);
+      }
+      out.push(unquoted.path);
+    } else {
+      out.push(decodeGitPath(line));
+    }
+    start = end + 1;
+  }
+  return out;
 }

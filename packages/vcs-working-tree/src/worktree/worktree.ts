@@ -406,6 +406,11 @@ export interface Worktree {
   // ========== Metadata ==========
 
   getRoot(): string;
+  /**
+   * The repository's git directory in the worktree's FilesApi (where its storage is), when
+   * the worktree knows it: walks list it like any other directory unless it is named `.git`.
+   */
+  getGitDir?(): string | undefined;
   refreshIgnore(): Promise<void>;
 }
 

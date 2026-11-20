@@ -6,6 +6,7 @@ export * from "./blame-command.js";
 export * from "./branch-command.js";
 export { TrackMode } from "./branch-tracking.js";
 export * from "./checkout-command.js";
+export * from "./checkout-paths.js";
 export * from "./cherry-pick-command.js";
 export * from "./clean-command.js";
 export * from "./clone-command.js";
@@ -66,6 +67,7 @@ export {
 } from "./reflog-messages.js";
 export * from "./remote-command.js";
 export * from "./reset-command.js";
+export * from "./restore-command.js";
 export * from "./rev-list-command.js";
 export * from "./rev-parse-command.js";
 export * from "./revert-command.js";

@@ -53,6 +53,7 @@ import {
   RemoteSetUrlCommand,
   RenameBranchCommand,
   ResetCommand,
+  RestoreCommand,
   RevertCommand,
   RevListCommand,
   RevParseCommand,
@@ -487,6 +488,20 @@ export class Git implements Disposable {
   reset(): ResetCommand {
     this.checkClosed();
     return new ResetCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a RestoreCommand (`git restore`): restore worktree files or index entries a
+   * pathspec names, from the index or a tree-ish.
+   *
+   * @example
+   * ```typescript
+   * await git.restore().setStaged(true).addPath("src/*.ts").call();
+   * ```
+   */
+  restore(): RestoreCommand {
+    this.checkClosed();
+    return new RestoreCommand(this._workingCopy);
   }
 
   // ============ Merge Operations ============

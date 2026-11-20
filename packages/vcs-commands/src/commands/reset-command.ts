@@ -1,9 +1,16 @@
-import type { Blobs, ObjectId, Ref } from "@statewalker/vcs-core";
+import {
+  type Blobs,
+  EMPTY_BLOB_ID,
+  FileMode,
+  type ObjectId,
+  type Ref,
+} from "@statewalker/vcs-core";
 import {
   cacheTreeOfTree,
   copyCacheTree,
   entryStatOf,
   getWorktreeEntries,
+  type IndexEntryOptions,
   invalidateCacheTreePath,
   type ResolveUndoRecord,
   type Staging,
@@ -12,12 +19,26 @@ import {
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 
-import { ResetRefusedError } from "../errors/command-errors.js";
+import {
+  IncompatibleOptionsError,
+  InvalidArgumentError,
+  ResetRefusedError,
+} from "../errors/command-errors.js";
 import { RefNotFoundError } from "../errors/ref-errors.js";
 import { type CommandTrees, GitCommand } from "../git-command.js";
 import { ResetMode } from "../types.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
-import { flatTree, OperationState } from "./merge-support.js";
+import { hostEnvironmentOf } from "./git-ident.js";
+import { flatTree, OperationState, rewriteIndex } from "./merge-support.js";
+import {
+  DO_MATCH_DIRECTORY,
+  globalPathspecMagic,
+  matchPathspec,
+  type PathspecItem,
+  parsePathspec,
+  parsePathspecFile,
+} from "./pathspec.js";
+import { PathspecAttributes } from "./pathspec-attributes.js";
 import { reflogMessages, updateHead } from "./reflog-messages.js";
 import { removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
@@ -63,6 +84,9 @@ export class ResetCommand extends GitCommand<Ref> {
   private ref?: string;
   private mode = ResetMode.MIXED;
   private paths: string[] = [];
+  private pathspecFromFile: string[] = [];
+  private modeSet = false;
+  private intentToAdd = false;
 
   /**
    * Set the ref to reset to.
@@ -101,6 +125,7 @@ export class ResetCommand extends GitCommand<Ref> {
   setMode(mode: ResetMode): this {
     this.checkCallable();
     this.mode = mode;
+    this.modeSet = true;
     return this;
   }
 
@@ -132,6 +157,34 @@ export class ResetCommand extends GitCommand<Ref> {
   }
 
   /**
+   * `-N` / `--intent-to-add` (mixed resets only): a path the tree lacks stays in the index as
+   * an intent-to-add entry instead of leaving it.
+   */
+  setIntentToAdd(intentToAdd: boolean): this {
+    this.checkCallable();
+    this.intentToAdd = intentToAdd;
+    return this;
+  }
+
+  /**
+   * `--pathspec-from-file` (and `--pathspec-file-nul` with `nul`): the pathspec elements of
+   * `content`, one per line.
+   */
+  setPathspecFromFile(content: string | Uint8Array, nul = false): this {
+    this.checkCallable();
+    try {
+      this.pathspecFromFile = parsePathspecFile(content, nul);
+    } catch (error) {
+      throw new InvalidArgumentError(
+        "pathspecFromFile",
+        content,
+        `fatal: ${(error as Error).message}`,
+      );
+    }
+    return this;
+  }
+
+  /**
    * Execute the reset.
    *
    * @returns The ref that HEAD now points to
@@ -145,8 +198,21 @@ export class ResetCommand extends GitCommand<Ref> {
     // unwritten edits (refused)
     await this.readCurrentIndex();
 
+    if (this.paths.length > 0 && this.pathspecFromFile.length > 0) {
+      throw new InvalidArgumentError(
+        "pathspecFromFile",
+        this.pathspecFromFile,
+        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together",
+      );
+    }
+    if (this.intentToAdd && this.mode !== ResetMode.MIXED) {
+      throw new IncompatibleOptionsError(
+        ["-N", "--mixed"],
+        "fatal: the option '-N' requires '--mixed'",
+      );
+    }
     // If paths are specified, do path reset
-    if (this.paths.length > 0) {
+    if (this.paths.length > 0 || this.pathspecFromFile.length > 0) {
       return this.resetPaths();
     }
 
@@ -281,52 +347,134 @@ export class ResetCommand extends GitCommand<Ref> {
   }
 
   /**
-   * Reset specific paths in staging area.
+   * `git reset [<tree-ish>] [--] <pathspec>...` (builtin/reset.c): the index entries the
+   * pathspec names are set to the tree's (`read_from_tree`); HEAD and the worktree stay.
    */
   private async resetPaths(): Promise<Ref> {
-    // For path reset, we reset the staging entries to match the ref
-    // git's parse_tree_indirect: any tree-ish (`HEAD^{tree}` too)
+    // cmd_reset: only a mixed reset takes paths (an explicit --mixed is deprecated)
+    if (this.modeSet && this.mode !== ResetMode.MIXED) {
+      throw new ResetRefusedError(`fatal: Cannot do ${this.mode} reset with paths.`);
+    }
+    if (this.modeSet) {
+      this.warnings.push(
+        "warning: --mixed with paths is deprecated; use 'git reset -- <paths>' instead.",
+      );
+    }
+    let items: PathspecItem[];
+    try {
+      const global = globalPathspecMagic(hostEnvironmentOf(this.workingCopy)?.pathspecs);
+      items = parsePathspec([...this.pathspecFromFile, ...this.paths], { attr: true, global });
+    } catch (error) {
+      throw new InvalidArgumentError("path", this.paths, `fatal: ${(error as Error).message}`);
+    }
+    const treeId = await this.resetTree(true);
+    await this.readFromTree(treeId, items);
+    await this.staging.write();
+    const headRef = await this.refsStore.resolve("HEAD");
+    return headRef as Ref;
+  }
+
+  /**
+   * The tree a path reset (or a `-N` reset) reads: the empty tree on an unborn HEAD, else the
+   * tree-ish's tree (git's "Failed to resolve '<rev>' as a valid tree.").
+   */
+  private async resetTree(paths: boolean): Promise<ObjectId | undefined> {
     const targetRef = this.ref ?? "HEAD";
-    const treeId = await this.revisionResolver().peelToType(
-      await this.resolveRevision(targetRef),
-      "tree",
-    );
+    let id: ObjectId;
+    try {
+      id = await this.resolveRevision(targetRef);
+    } catch (error) {
+      if (targetRef === "HEAD" && error instanceof RefNotFoundError) return undefined;
+      if (error instanceof RefNotFoundError) {
+        throw new RefNotFoundError(
+          targetRef,
+          paths
+            ? `fatal: Failed to resolve '${targetRef}' as a valid tree.`
+            : `fatal: Failed to resolve '${targetRef}' as a valid revision.`,
+        );
+      }
+      throw error;
+    }
+    const treeId = await this.revisionResolver().peelToType(id, "tree");
     if (treeId === undefined) {
       throw new RefNotFoundError(targetRef, `fatal: Could not parse object '${targetRef}'.`);
     }
+    return treeId;
+  }
 
-    // Reset each path in staging
-    const editor = this.staging.createEditor();
-
-    for (const path of this.paths) {
-      const entry = await this.getTreeEntryForPath(treeId, path);
-      if (entry) {
-        // Path exists in target - update staging to match
-        editor.add({
-          path,
-          apply: () => ({
-            path,
-            mode: entry.mode,
-            objectId: entry.objectId,
-            stage: 0,
-            size: 0,
-            mtime: Date.now(),
-          }),
-        });
-      } else {
-        // Path doesn't exist in target - remove from staging
-        editor.add({
-          path,
-          apply: () => undefined,
-        });
-      }
+  /**
+   * git's `read_from_tree` (`do_diff_cache` of the tree and the index, then
+   * `update_index_from_diff`): each path the pathspec names (every path without one) where
+   * the index differs from the tree (mode or blob; an unmerged path always) takes the
+   * tree's entry, stage 0, or leaves the index when the tree lacks it (with `-N` it stays as
+   * an intent-to-add entry). A new entry keeps a skip-worktree bit, or gets one outside the
+   * sparse checkout; the conflict stages it replaces are recorded for resolve-undo.
+   */
+  private async readFromTree(treeId: ObjectId | undefined, items: PathspecItem[]): Promise<void> {
+    const tree = await flatTree(this.trees, treeId);
+    const index = new Map<string, StagingEntry[]>();
+    for await (const entry of this.staging.entries()) {
+      const list = index.get(entry.path);
+      if (list) list.push(entry);
+      else index.set(entry.path, [entry]);
     }
-
-    await editor.finish();
-    await this.staging.write();
-
-    const headRef = await this.refsStore.resolve("HEAD");
-    return headRef as Ref;
+    const attributes = PathspecAttributes.forWorktree(items, this.worktreeAccess);
+    if (attributes) await attributes.load([...index.keys(), ...tree.keys()]);
+    const named = (path: string, mode: number) =>
+      items.length === 0 ||
+      matchPathspec(items, path, mode === FileMode.GITLINK ? DO_MATCH_DIRECTORY : 0) > 0;
+    const patterns = await this.sparseCheckoutPatterns();
+    const changes = new Map<string, IndexEntryOptions[]>();
+    const undo: ResolveUndoRecord[] = [];
+    for (const path of new Set([...index.keys(), ...tree.keys()])) {
+      const entries = index.get(path) ?? [];
+      const t = tree.get(path);
+      // diff-lib's oneway_diff matches the index entry, else the tree's
+      const first = entries[0];
+      if (!named(path, first ? first.mode : (t?.mode ?? 0))) continue;
+      const unmerged = entries.some((e) => e.stage > 0);
+      const staged = entries.find((e) => e.stage === 0);
+      if (!unmerged) {
+        // the same mode and blob: no change (an intent-to-add entry included)
+        if (staged && t && staged.mode === t.mode && staged.objectId === t.objectId) continue;
+        if (!staged && !t) continue;
+      }
+      if (unmerged) {
+        const record: ResolveUndoRecord = {
+          path,
+          modes: [0, 0, 0],
+          objectIds: [undefined, undefined, undefined],
+        };
+        for (const e of entries) {
+          if (e.stage < 1 || e.stage > 3) continue;
+          record.modes[e.stage - 1] = e.mode;
+          record.objectIds[e.stage - 1] = e.objectId;
+        }
+        undo.push(record);
+      }
+      if (!t && !this.intentToAdd) {
+        changes.set(path, []);
+        continue;
+      }
+      const skipWorktree = staged
+        ? staged.skipWorktree === true
+        : patterns !== undefined && !patterns.includes(path);
+      changes.set(path, [
+        {
+          path,
+          // make_cache_entry of a path the tree lacks: create_ce_mode(0), a regular file
+          mode: t ? t.mode : FileMode.REGULAR_FILE,
+          objectId: t ? t.objectId : EMPTY_BLOB_ID,
+          stage: 0,
+          size: 0,
+          mtime: 0,
+          ...(skipWorktree ? { skipWorktree: true } : {}),
+          ...(t ? {} : { intentToAdd: true }),
+        },
+      ]);
+    }
+    if (undo.length > 0) this.staging.recordResolveUndo?.(undo);
+    if (changes.size > 0) await rewriteIndex(this.staging, changes);
   }
 
   /**
@@ -394,6 +542,12 @@ export class ResetCommand extends GitCommand<Ref> {
         await this.staging.write();
         return;
       }
+      if (this.intentToAdd) {
+        // -N: the paths the commit lacks stay as intent-to-add entries
+        await this.readFromTree(commit.tree, []);
+        await this.staging.write();
+        return;
+      }
       // git's reset --mixed edits the index in place (read_from_tree): the resolve-undo
       // records stay, and the conflict stages it removes are recorded as well
       const unmerged = new Map<string, ResolveUndoRecord>();
@@ -449,36 +603,6 @@ export class ResetCommand extends GitCommand<Ref> {
   private async primeCacheTree(treeId: ObjectId): Promise<void> {
     if (!this.staging.setCacheTree) return;
     this.staging.setCacheTree(await cacheTreeOfTree(this.trees, treeId));
-  }
-
-  /**
-   * Get tree entry for a path.
-   */
-  private async getTreeEntryForPath(
-    treeId: ObjectId,
-    path: string,
-  ): Promise<{ objectId: ObjectId; mode: number } | undefined> {
-    const parts = path.split("/").filter((p) => p.length > 0);
-    let currentTreeId = treeId;
-
-    for (let i = 0; i < parts.length; i++) {
-      const name = parts[i];
-      const isLast = i === parts.length - 1;
-
-      const entry = await this.trees.getEntry(currentTreeId, name);
-
-      if (!entry) {
-        return undefined;
-      }
-
-      if (isLast) {
-        return { objectId: entry.id, mode: entry.mode };
-      }
-
-      currentTreeId = entry.id;
-    }
-
-    return undefined;
   }
 }
 
