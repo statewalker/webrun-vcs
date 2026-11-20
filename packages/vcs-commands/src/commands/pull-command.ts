@@ -257,6 +257,7 @@ export class PullCommand extends TransportCommand<PullResult> {
 
     // Execute fetch
     const fetchCommand = new FetchCommand(this._workingCopy);
+    fetchCommand.setTransports(this.getTransports());
     fetchCommand.setRemote(this.remote);
     fetchCommand.setRefSpecs(refspec);
     // git pull fetches with --update-head-ok

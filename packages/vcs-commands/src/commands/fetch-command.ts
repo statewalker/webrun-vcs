@@ -22,7 +22,6 @@ import {
   type RefSpec,
   type TagMode,
   type FetchOptions as TransportFetchOptions,
-  fetch as transportFetch,
   transportSummaryWidth,
   ZERO_OID,
 } from "@statewalker/vcs-transport";
@@ -41,7 +40,7 @@ import {
 } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
-import { localRemotePath, openLocalRemote, withLocalUploadPack } from "./local-transport.js";
+import { withRemoteUploadPack } from "./remote-transport.js";
 import { worktreeUsingBranch } from "./worktree-support.js";
 
 /**
@@ -626,12 +625,11 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const errors: string[] = [];
     const trackingUpdates: TrackingRefUpdate[] = [];
 
-    // transport_get: smart HTTP, or git's local transport (upload-pack of the repository at
-    // the path, in process); anything else fails in git's words. The remote is reached
-    // before FETCH_HEAD is touched (transport_get_remote_refs comes first in do_fetch)
-    const localPath = localRemotePath(remoteUrl);
-    const localRemote =
-      localPath === undefined ? undefined : await openLocalRemote(this.workingCopy, localPath);
+    // transport_get: git's local transport (upload-pack of the repository at the path, in
+    // process), or the connector the transport registry names (smart HTTP by default);
+    // anything else fails in git's words. The remote is reached before FETCH_HEAD is touched
+    // (transport_get_remote_refs comes first in do_fetch)
+    const remote = await this.prepareRemote(remoteUrl);
 
     // git truncates FETCH_HEAD when the fetch starts: a failed fetch leaves it empty
     const checkout = this._workingCopy.checkout;
@@ -688,11 +686,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       reflogIdent: this.reflogLine("").ident,
       abbrev: parseCoreAbbrev(store.value("core.abbrev")) ?? -1,
     };
-    const result = await (localRemote === undefined
-      ? transportFetch(fetchOptions)
-      : withLocalUploadPack(localRemote, (connection) =>
-          fetchFromConnection(connection, fetchOptions),
-        )
+    const result = await withRemoteUploadPack(remote, this.remoteSessionOptions(), (connection) =>
+      fetchFromConnection(connection, fetchOptions),
     ).catch((error: unknown) => {
       // git dies on a source that names no remote ref (a hidden one included)
       const message = error instanceof Error ? error.message : "";
@@ -1098,19 +1093,12 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
-   * Resolve remote name to URL.
-   *
-   * A named remote resolves through `remote.<name>.url` in the working copy
-   * configuration. An unconfigured name is passed through unchanged, so a URL
-   * given straight to {@link setRemote} still works.
+   * Resolve remote name to URL, as git's `remote_get`: a remote whose configuration gives it
+   * a URL uses that (`remote.<name>.url`); anything else is a URL or path itself. Either is
+   * rewritten by `url.<base>.insteadOf`.
    */
   private async resolveRemoteUrl(remote: string): Promise<string | undefined> {
-    // If it looks like a URL, use it directly
-    if (remote.includes("://") || remote.includes("@")) {
-      return remote;
-    }
-
-    return RemoteConfigStore.from(this.workingCopy).urlFor(remote) ?? remote;
+    return RemoteConfigStore.from(this.workingCopy).remoteUrlOf(remote);
   }
 
   /**

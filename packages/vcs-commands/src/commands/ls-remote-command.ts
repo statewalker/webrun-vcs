@@ -1,10 +1,15 @@
 import type { ObjectId } from "@statewalker/vcs-core";
-import { lsRefs, lsRemote } from "@statewalker/vcs-transport";
+import {
+  lsRefs,
+  lsRemote,
+  openUploadPack,
+  type UploadPackConnection,
+} from "@statewalker/vcs-transport";
 
 import { InvalidRemoteError } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { TransportCommand } from "../transport-command.js";
-import { localRemotePath, openLocalRemote, withLocalUploadPack } from "./local-transport.js";
+import { withRemoteSession, withRemoteUploadPack } from "./remote-transport.js";
 
 /**
  * A remote ref entry.
@@ -157,26 +162,42 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
       throw new InvalidRemoteError(this.remote);
     }
 
-    // transport_get: smart HTTP, or git's local transport (upload-pack of the repository at
-    // the path, in process: its v2 ls-refs); anything else fails in git's words
-    const localPath = localRemotePath(remoteUrl);
+    // transport_get: git's local transport (upload-pack of the repository at the path, in
+    // process: its v2 ls-refs), or the connector the transport registry names: smart HTTP
+    // reads the advertisement, a native session lists with ls-refs; anything else fails in
+    // git's words
+    const remote = await this.prepareRemote(remoteUrl);
+    const options = this.remoteSessionOptions();
+    const listRefs = async (connection: UploadPackConnection) => {
+      const listed = new Map<string, ObjectId>();
+      const refs =
+        connection.version === 2 ? await lsRefs(connection, []) : (connection.advertisedRefs ?? []);
+      for (const ref of refs) {
+        if (ref.oid) listed.set(ref.name, ref.oid);
+      }
+      return listed;
+    };
     const refs =
-      localPath === undefined
-        ? await lsRemote(remoteUrl, {
-            auth: this.credentials,
-            headers: this.headers,
-            timeout: this.timeout,
-          })
-        : await withLocalUploadPack(
-            await openLocalRemote(this.workingCopy, localPath),
-            async (connection) => {
-              const listed = new Map<string, ObjectId>();
-              for (const ref of await lsRefs(connection, [])) {
-                if (ref.oid) listed.set(ref.name, ref.oid);
-              }
-              return listed;
-            },
-          );
+      remote.kind === "local"
+        ? await withRemoteUploadPack(remote, options, listRefs)
+        : await withRemoteSession(remote, "git-upload-pack", options, async (session, request) => {
+            if (session.kind === "http") {
+              return lsRemote(session.baseUrl, {
+                fetchImpl: session.fetchImpl,
+                ...(this.credentials ? { auth: this.credentials } : {}),
+                ...(session.headers || this.headers
+                  ? { headers: { ...session.headers, ...this.headers } }
+                  : {}),
+                ...(this.timeout !== undefined ? { timeout: this.timeout } : {}),
+              });
+            }
+            const connection = await openUploadPack(session, request);
+            try {
+              return await listRefs(connection);
+            } finally {
+              await connection.close();
+            }
+          });
 
     // Filter refs based on heads/tags settings
     const filteredRefs: RemoteRef[] = [];
@@ -236,17 +257,27 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
   }
 
   /**
-   * Resolve remote name to URL.
-   *
-   * A named remote resolves through `remote.<name>.url` in the working copy
-   * configuration; an unconfigured name is passed through unchanged.
+   * Resolve remote name to URL, as git's `remote_get`: a configured remote's URL, else the
+   * URL or path itself, rewritten by `url.<base>.insteadOf`.
    */
   private async resolveRemoteUrl(remote: string): Promise<string | undefined> {
-    // If it looks like a URL, use it directly
-    if (remote.includes("://") || remote.includes("@")) {
-      return remote;
-    }
+    return RemoteConfigStore.from(this.workingCopy).remoteUrlOf(remote);
+  }
 
-    return RemoteConfigStore.from(this.workingCopy).urlFor(remote) ?? remote;
+  /**
+   * The URL a remote resolves to, without contacting it: `git ls-remote --get-url
+   * [<remote>]` (the remote's first URL, or the URL given, with `insteadOf` applied; the
+   * remote defaults to `origin`).
+   *
+   * @example
+   * ```typescript
+   * // [url "https://example.com/"] insteadOf = ex:
+   * await git.lsRemote().setRemote("ex:repo.git").callGetUrl(); // "https://example.com/repo.git"
+   * ```
+   */
+  async callGetUrl(): Promise<string> {
+    this.checkCallable();
+    this.setCallable(false);
+    return RemoteConfigStore.from(this.workingCopy).remoteUrlOf(this.remote ?? "origin");
   }
 }

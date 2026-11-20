@@ -81,9 +81,10 @@ export interface RefSpec {
 }
 
 /**
- * Parsed git URL components.
+ * Parsed git URL components, JGit `URIish` style (see `parseGitUri`). The parser git's
+ * transports follow is `parseGitUrl` (connect/), whose `GitUrl` keeps git's semantics.
  */
-export interface GitUrl {
+export interface GitUri {
   protocol: "https" | "http" | "git" | "ssh" | "file";
   host: string;
   port?: number;

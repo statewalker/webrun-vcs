@@ -68,6 +68,8 @@ export interface NodeGitHostEnvironment {
   defaultEmail?: string;
   attrSource?: string;
   noReplaceObjects?: boolean;
+  protocolFromUser?: boolean;
+  allowProtocol?: string;
   replaceRefBase?: string;
   graftFile?: string;
   printSha1Ellipsis?: boolean;
@@ -201,6 +203,11 @@ export function createNodeGitHostEnvironment(
     ...(env.GIT_ATTR_SOURCE !== undefined ? { attrSource: env.GIT_ATTR_SOURCE } : {}),
     // git: set to anything (even empty) turns replace refs off
     ...(env.GIT_NO_REPLACE_OBJECTS !== undefined ? { noReplaceObjects: true } : {}),
+    // git_env_bool("GIT_PROTOCOL_FROM_USER", 1)
+    ...(env.GIT_PROTOCOL_FROM_USER !== undefined
+      ? { protocolFromUser: envBool(env.GIT_PROTOCOL_FROM_USER) }
+      : {}),
+    ...(env.GIT_ALLOW_PROTOCOL !== undefined ? { allowProtocol: env.GIT_ALLOW_PROTOCOL } : {}),
     // set but empty is a base too (git: every ref is then a candidate replace ref)
     ...(env.GIT_REPLACE_REF_BASE !== undefined ? { replaceRefBase: env.GIT_REPLACE_REF_BASE } : {}),
     ...(env.GIT_GRAFT_FILE !== undefined ? { graftFile: env.GIT_GRAFT_FILE } : {}),

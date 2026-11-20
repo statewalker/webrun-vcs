@@ -5,7 +5,6 @@ import {
   fetchFromConnection,
   type RefspecResolver,
   type FetchOptions as TransportFetchOptions,
-  fetch as transportFetch,
 } from "@statewalker/vcs-transport";
 import type { OpenedRepository, Worktree } from "@statewalker/vcs-working-tree";
 
@@ -24,9 +23,9 @@ import { TransportCommand } from "../transport-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
-import { localRemotePath, openLocalRemote, withLocalUploadPack } from "./local-transport.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
+import { type PreparedRemote, withRemoteUploadPack } from "./remote-transport.js";
 import { SparseCheckoutCommand } from "./sparse-checkout-command.js";
 import { SparseUnpack } from "./sparse-checkout-support.js";
 import { checkoutFreshTree } from "./tree-restore.js";
@@ -422,21 +421,25 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       );
     }
 
-    // a local source is opened before anything is written (git's "does not appear to be a
-    // git repository" leaves no clone behind)
-    const localPath = localRemotePath(this.uri);
-    let localRemote: OpenedRepository | undefined;
-    if (localPath !== undefined) {
-      try {
-        localRemote = await openLocalRemote(this.workingCopy, localPath);
-      } catch (error) {
-        // clone.c: a path (no URL) where no repository is found is "does not exist" (git
-        // tells an existing non-repository apart; here both read so); a file:// URL goes to
-        // upload-pack, which fails as for fetch
-        if (this.uri.startsWith("file://")) throw error;
-        throw new TransportError(`fatal: repository '${this.uri}' does not exist`);
-      }
+    // the source is resolved, and a local one opened, before anything is written (git's
+    // "does not appear to be a git repository" leaves no clone behind). clone.c connects to
+    // remote.origin.url as remote_get reads it: rewritten by url.<base>.insteadOf
+    const uri = this.uri;
+    const sourceUrl = RemoteConfigStore.from(this.workingCopy).remoteUrlOf(uri);
+    let remote: PreparedRemote;
+    try {
+      remote = await this.prepareRemote(sourceUrl);
+    } catch (error) {
+      // clone.c: a name without a colon that names no existing path is "does not exist" (git
+      // tells an existing non-repository apart; here both read so); a URL (file:// too) goes
+      // to upload-pack, which fails as for fetch
+      const notARepository =
+        error instanceof TransportError && error.message.includes("does not appear to be a git");
+      if (!notARepository || uri.includes(":")) throw error;
+      throw new TransportError(`fatal: repository '${uri}' does not exist`);
     }
+    const localRemote: OpenedRepository | undefined =
+      remote.kind === "local" ? remote.repository : undefined;
 
     // clone.c: a destination that exists and is not empty is refused before anything is
     // written; here the destination is the working copy, empty once `git init` made it
@@ -524,7 +527,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         : toTagMode(this.tagOption);
 
     const fetchOptions: TransportFetchOptions = {
-      url: this.uri,
+      url: sourceUrl,
       auth: this.credentials,
       headers: this.headers,
       timeout: this.timeout,
@@ -540,14 +543,11 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       // git's write_remote_refs: one initial transaction, no reflog
       skipReflog: true,
     };
-    // transport_get: smart HTTP, or git's local transport (upload-pack of the repository at
-    // the path, in process); anything else fails in git's words
-    const result =
-      localRemote === undefined
-        ? await transportFetch(fetchOptions)
-        : await withLocalUploadPack(localRemote, (connection) =>
-            fetchFromConnection(connection, fetchOptions),
-          );
+    // transport_get: git's local transport (upload-pack of the repository at the path, in
+    // process), or the connector the transport registry names (smart HTTP by default)
+    const result = await withRemoteUploadPack(remote, this.remoteSessionOptions(), (connection) =>
+      fetchFromConnection(connection, fetchOptions),
+    );
     const cloneLog = this.reflogLine(reflogMessages.clone(this.uri));
     const trackingUpdates: TrackingRefUpdate[] = result.refUpdates.map(toTrackingRefUpdate);
 

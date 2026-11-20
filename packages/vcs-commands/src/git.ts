@@ -1,4 +1,5 @@
 import type { History } from "@statewalker/vcs-core";
+import type { GitTransportRegistry } from "@statewalker/vcs-transport";
 import type { Checkout, WorkingCopy, Worktree, WorktreeAdmin } from "@statewalker/vcs-working-tree";
 
 import {
@@ -46,6 +47,7 @@ import {
   RebaseCommand,
   ReflogCommand,
   RemoteAddCommand,
+  RemoteGetUrlCommand,
   RemoteListCommand,
   RemoteRemoveCommand,
   RemoteRenameCommand,
@@ -80,6 +82,25 @@ import {
 import { worktreeAdminWorkingCopy } from "./commands/worktree-support.js";
 
 /**
+ * Options of {@link Git.fromWorkingCopy}.
+ *
+ * @example
+ * ```typescript
+ * const transports = createDefaultTransports();
+ * transports.register(myWebSocketConnector);
+ * const git = Git.fromWorkingCopy(workingCopy, { transports });
+ * await git.fetch().setRemote("wss://peer.example/repo").call();
+ * ```
+ */
+export interface GitOptions {
+  /**
+   * The transports the remote commands (fetch, pull, push, clone, ls-remote, remote set-head)
+   * reach non-local remotes through; default `createDefaultTransports()` (smart HTTP)
+   */
+  transports?: GitTransportRegistry;
+}
+
+/**
  * Main entry point for high-level Git operations.
  *
  * The Git class is a facade that wraps a WorkingCopy and provides
@@ -109,10 +130,17 @@ import { worktreeAdminWorkingCopy } from "./commands/worktree-support.js";
  */
 export class Git implements Disposable {
   private readonly _workingCopy: WorkingCopy;
+  private readonly transports?: GitTransportRegistry;
   private closed = false;
 
-  private constructor(workingCopy: WorkingCopy) {
+  private constructor(workingCopy: WorkingCopy, options: GitOptions = {}) {
     this._workingCopy = workingCopy;
+    this.transports = options.transports;
+  }
+
+  /** The facade's transports on a remote command, when given (see {@link GitOptions}). */
+  private withTransports<C extends { setTransports(t: GitTransportRegistry): C }>(command: C): C {
+    return this.transports ? command.setTransports(this.transports) : command;
   }
 
   // ============ Static Factory Methods ============
@@ -138,10 +166,11 @@ export class Git implements Disposable {
    * ```
    *
    * @param workingCopy The WorkingCopy to wrap
+   * @param options The transports remote commands use ({@link GitOptions})
    * @returns A Git instance wrapping the working copy
    */
-  static fromWorkingCopy(workingCopy: WorkingCopy): Git {
-    return new Git(workingCopy);
+  static fromWorkingCopy(workingCopy: WorkingCopy, options: GitOptions = {}): Git {
+    return new Git(workingCopy, options);
   }
 
   /**
@@ -844,7 +873,7 @@ export class Git implements Disposable {
    */
   fetch(): FetchCommand {
     this.checkClosed();
-    return new FetchCommand(this._workingCopy);
+    return this.withTransports(new FetchCommand(this._workingCopy));
   }
 
   /**
@@ -859,7 +888,7 @@ export class Git implements Disposable {
    */
   push(): PushCommand {
     this.checkClosed();
-    return new PushCommand(this._workingCopy);
+    return this.withTransports(new PushCommand(this._workingCopy));
   }
 
   /**
@@ -874,7 +903,7 @@ export class Git implements Disposable {
    */
   pull(): PullCommand {
     this.checkClosed();
-    return new PullCommand(this._workingCopy);
+    return this.withTransports(new PullCommand(this._workingCopy));
   }
 
   /**
@@ -889,7 +918,7 @@ export class Git implements Disposable {
    */
   clone(): CloneCommand {
     this.checkClosed();
-    return new CloneCommand(this._workingCopy);
+    return this.withTransports(new CloneCommand(this._workingCopy));
   }
 
   /**
@@ -904,7 +933,7 @@ export class Git implements Disposable {
    */
   lsRemote(): LsRemoteCommand {
     this.checkClosed();
-    return new LsRemoteCommand(this._workingCopy);
+    return this.withTransports(new LsRemoteCommand(this._workingCopy));
   }
 
   // ============ Remote Configuration Operations ============
@@ -954,6 +983,19 @@ export class Git implements Disposable {
   }
 
   /**
+   * Create a RemoteGetUrlCommand for reading a remote's URLs (`git remote get-url`).
+   *
+   * @example
+   * ```typescript
+   * const [pushUrl] = await git.remoteGetUrl().setRemoteName("origin").setPush(true).call();
+   * ```
+   */
+  remoteGetUrl(): RemoteGetUrlCommand {
+    this.checkClosed();
+    return new RemoteGetUrlCommand(this._workingCopy);
+  }
+
+  /**
    * Create a RemoteSetUrlCommand for changing remote URLs.
    *
    * @example
@@ -979,7 +1021,7 @@ export class Git implements Disposable {
    */
   remoteSetHead(): RemoteSetHeadCommand {
     this.checkClosed();
-    return new RemoteSetHeadCommand(this._workingCopy);
+    return this.withTransports(new RemoteSetHeadCommand(this._workingCopy));
   }
 
   /**

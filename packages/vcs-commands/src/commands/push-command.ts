@@ -7,13 +7,13 @@ import {
   formatPushStatus,
   mapRejectReason,
   matchSource,
+  type PushClientResult,
   type PushCommandResult,
   type PushRefUpdate,
   PushRefusedByHookError,
   parseRefSpec,
   pushToConnection,
   type PushOptions as TransportPushOptions,
-  push as transportPush,
 } from "@statewalker/vcs-transport";
 
 import {
@@ -26,12 +26,8 @@ import {
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type PushResult, PushStatus, type RemoteRefUpdate } from "../results/push-result.js";
 import { TransportCommand } from "../transport-command.js";
-import {
-  localRemotePath,
-  openLocalRemote,
-  remoteHookSession,
-  withLocalReceivePack,
-} from "./local-transport.js";
+import { remoteHookSession } from "./local-transport.js";
+import { withRemoteReceivePack } from "./remote-transport.js";
 
 /** All-zero object id — Git's "no object", used to express a ref delete. */
 const ZERO_OBJECT_ID = "0".repeat(40);
@@ -419,14 +415,16 @@ export class PushCommand extends TransportCommand<PushResult> {
       throw new InvalidRemoteError(this.remote);
     }
 
-    const localPath = localRemotePath(remoteUrl);
+    // transport_get: the remote's transport is decided (git's errors for one that cannot be
+    // reached) before the refspecs are worked out
+    const resolved = this.resolveRemote(remoteUrl);
     const refspecs = await this.buildRefSpecs();
     if (refspecs.length === 0) {
       return { uri: remoteUrl, remoteUpdates: [], bytesSent: 0, objectCount: 0, messages: [] };
     }
 
-    const localRemote =
-      localPath === undefined ? undefined : await openLocalRemote(this.workingCopy, localPath);
+    const remote = await this.openRemote(resolved);
+    const localRemote = remote.kind === "local" ? remote.repository : undefined;
     const history = this._workingCopy.history;
     const tracking = this.trackingRefMapper();
     const messages: string[] = [];
@@ -464,23 +462,21 @@ export class PushCommand extends TransportCommand<PushResult> {
         : {}),
     };
     let prePushExit = 0;
-    // transport_get: smart HTTP, or git's local transport (receive-pack of the repository at
-    // the path, in process); anything else fails in git's words
-    let result: Awaited<ReturnType<typeof transportPush>>;
+    // git's local transport (receive-pack of the repository at the path, in process), or the
+    // connector the transport registry names (smart HTTP by default)
+    let result: PushClientResult;
     // the remote's reference-transaction hook writes to the pushing user's stderr directly
     const transactionHooks =
       localRemote === undefined ? undefined : remoteHookSession(this.workingCopy, localRemote);
     try {
-      result =
-        localRemote === undefined
-          ? await transportPush(pushOptions)
-          : await withLocalReceivePack(
-              localRemote,
-              (connection) => pushToConnection(connection, pushOptions),
-              // receive-pack runs the remote repository's hooks
-              remoteHookSession(this.workingCopy, localRemote),
-              transactionHooks,
-            );
+      result = await withRemoteReceivePack(
+        remote,
+        { ...this.remoteSessionOptions(), streamRequestBody: this.streamRequestBody },
+        (connection) => pushToConnection(connection, pushOptions),
+        // receive-pack runs the remote repository's hooks
+        localRemote === undefined ? undefined : remoteHookSession(this.workingCopy, localRemote),
+        transactionHooks,
+      );
     } catch (error) {
       if (error instanceof PushRefusedByHookError) {
         throw new HookFailedError(
@@ -587,19 +583,13 @@ export class PushCommand extends TransportCommand<PushResult> {
   }
 
   /**
-   * Resolve remote name to URL.
-   *
-   * A named remote resolves through the working copy configuration, preferring
-   * `remote.<name>.pushurl` over `remote.<name>.url` as git does; an
-   * unconfigured name is passed through unchanged.
+   * Resolve remote name to its push URL, as git's `pushremote_get` and `push_url_of_remote`:
+   * a configured remote's `pushurl` (else its `url`), rewritten by `url.<base>.insteadOf`, or
+   * by `pushInsteadOf` where it has no `pushurl`; anything else is a URL or path itself,
+   * rewritten by `pushInsteadOf`, else `insteadOf`.
    */
   private async resolveRemoteUrl(remote: string): Promise<string | undefined> {
-    // If it looks like a URL, use it directly
-    if (remote.includes("://") || remote.includes("@")) {
-      return remote;
-    }
-
-    return RemoteConfigStore.from(this.workingCopy).urlFor(remote, { push: true }) ?? remote;
+    return RemoteConfigStore.from(this.workingCopy).remoteUrlOf(remote, { push: true });
   }
 
   /**

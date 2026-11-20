@@ -1,5 +1,6 @@
 export * from "./adapters/index.js";
 export * from "./api/index.js";
+export * from "./connect/index.js";
 export * from "./context/index.js";
 export * from "./factories/index.js";
 export * from "./fetch-client/index.js";

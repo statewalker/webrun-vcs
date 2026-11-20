@@ -3,7 +3,6 @@ import {
   expandFromDestination,
   lsRefs,
   matchDestination,
-  openHttpConnection,
   parseRefSpec,
   type RefSpec,
   type RemoteRef as TransportRemoteRef,
@@ -27,6 +26,7 @@ import {
   RemoteConfigStore,
 } from "../remote-config/index.js";
 import { TransportCommand } from "../transport-command.js";
+import { withRemoteUploadPack } from "./remote-transport.js";
 
 const ZERO_ID = "0".repeat(40);
 
@@ -530,6 +530,63 @@ export class RemoteListCommand extends GitCommand<RemoteConfig[]> {
 }
 
 /**
+ * The URLs of a remote as git uses them: `git remote get-url [--push] [--all] <name>`.
+ *
+ * The URLs are rewritten by `url.<base>.insteadOf` (and, for push URLs of a remote without
+ * `pushurl`, by `url.<base>.pushInsteadOf`), as git reads them.
+ *
+ * @example
+ * ```typescript
+ * const [url] = await git.remoteGetUrl().setRemoteName("origin").call();
+ * const pushUrls = await git.remoteGetUrl().setRemoteName("origin").setPush(true).setAll(true).call();
+ * ```
+ */
+export class RemoteGetUrlCommand extends GitCommand<string[]> {
+  private remoteName?: string;
+  private push = false;
+  private all = false;
+
+  /** Set the remote whose URL is read. */
+  setRemoteName(name: string): this {
+    this.checkCallable();
+    this.remoteName = name;
+    return this;
+  }
+
+  /** Read the push URLs (`--push`). */
+  setPush(push: boolean): this {
+    this.checkCallable();
+    this.push = push;
+    return this;
+  }
+
+  /** Every URL (`--all`), not only the first. */
+  setAll(all: boolean): this {
+    this.checkCallable();
+    this.all = all;
+    return this;
+  }
+
+  /**
+   * @returns the first URL, or with {@link setAll} every one
+   * @throws RemoteNotFoundError (exit 2) when the remote has no configuration (git: "No such
+   *   remote '<name>'")
+   */
+  async call(): Promise<string[]> {
+    this.checkCallable();
+    this.setCallable(false);
+    const name = this.remoteName;
+    if (!name) throw new MissingArgumentError("remoteName", "Remote name must be specified");
+    const store = RemoteConfigStore.from(this.workingCopy);
+    if (!store.isConfigured(name)) {
+      throw new RemoteNotFoundError(name, `error: No such remote '${name}'`);
+    }
+    const urls = this.push ? store.remotePushUrls(name) : store.remoteUrls(name);
+    return this.all ? urls : urls.slice(0, 1);
+  }
+}
+
+/**
  * Set URL for a remote.
  *
  * Equivalent to `git remote set-url`.
@@ -791,19 +848,13 @@ export class RemoteSetHeadCommand extends TransportCommand<string | undefined> {
   private async remoteHeads(remote: string): Promise<string[]> {
     const url = RemoteConfigStore.from(this.workingCopy).urlFor(remote);
     if (!url) throw new InvalidRemoteError(remote);
-    const connection = await openHttpConnection({
-      url,
-      auth: this.credentials,
-      headers: this.headers,
-      timeout: this.timeout,
-    });
-    let refs: readonly TransportRemoteRef[];
-    try {
-      refs =
-        connection.version === 2 ? await lsRefs(connection, []) : (connection.advertisedRefs ?? []);
-    } finally {
-      await connection.close();
-    }
+    // the remote's transport: local in process, else the registry's connector
+    const refs: readonly TransportRemoteRef[] = await withRemoteUploadPack(
+      await this.prepareRemote(url),
+      this.remoteSessionOptions(),
+      async (connection) =>
+        connection.version === 2 ? lsRefs(connection, []) : (connection.advertisedRefs ?? []),
+    );
     const head = refs.find((r) => r.name === "HEAD");
     if (!head) return [];
     const branches = refs.filter((r) => r.oid && r.name.startsWith("refs/heads/"));
