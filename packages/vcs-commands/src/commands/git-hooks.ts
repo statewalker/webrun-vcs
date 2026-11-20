@@ -20,6 +20,7 @@
  * unless the call asks otherwise (`RUN_HOOKS_OPT_INIT`'s `stdout_to_stderr`).
  */
 
+import type { RefTransactionHook } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import {
@@ -220,27 +221,88 @@ async function accessOf(
 ): Promise<"executable" | "not-executable" | "absent"> {
   if (files && filesPath !== undefined) {
     try {
-      const posix = files as {
-        lstat?(path: string): Promise<{ kind: string; mode?: number } | undefined>;
-      };
-      const link = posix.lstat ? await posix.lstat(filesPath) : undefined;
-      const stats = await files.stats(filesPath);
-      if (!stats) return "absent";
-      if (stats.kind !== "file") return "executable";
-      // a link is taken as its target, which the FilesApi stats without a mode
-      if (!link || link.kind === "symlink" || link.mode === undefined) return "executable";
-      return (link.mode & 0o111) !== 0 ? "executable" : "not-executable";
+      return await filesAccessOf(files, filesPath, environment);
     } catch {
       return "absent";
     }
   }
-  if (hostPath && environment?.statFile) {
-    const stats = await environment.statFile(hostPath);
-    if (!stats) return "absent";
-    if (stats.mode === undefined) return "executable";
-    return (stats.mode & 0o111) !== 0 ? "executable" : "not-executable";
+  return hostAccessOf(hostPath, environment);
+}
+
+/** `access(X_OK)` of a host path, by its stat (links followed) through the host. */
+async function hostAccessOf(
+  hostPath: string | undefined,
+  environment: GitHostEnvironment | undefined,
+): Promise<"executable" | "not-executable" | "absent"> {
+  if (!hostPath || !environment?.statFile) return "absent";
+  const stats = await environment.statFile(hostPath);
+  if (!stats) return "absent";
+  if (stats.kind === "directory" || stats.mode === undefined) return "executable";
+  return (stats.mode & 0o111) !== 0 ? "executable" : "not-executable";
+}
+
+/** The most links followed before giving up (the kernel's ELOOP limit). */
+const MAX_LINK_HOPS = 40;
+
+/**
+ * `access(X_OK)` of a FilesApi path: a symbolic link followed to its target (through the
+ * FilesApi while the target lies in it, else by its host path through the host), whose mode
+ * decides, as `access` follows links. A FilesApi without `lstat` gives no modes: present
+ * counts as executable.
+ */
+async function filesAccessOf(
+  files: FilesApi,
+  start: string,
+  environment: GitHostEnvironment | undefined,
+): Promise<"executable" | "not-executable" | "absent"> {
+  const posix = files as {
+    lstat?(path: string): Promise<{ kind: string; mode?: number } | undefined>;
+    readlink?(path: string): Promise<Uint8Array | undefined>;
+  };
+  if (!posix.lstat) {
+    const stats = await files.stats(start);
+    return stats ? "executable" : "absent";
+  }
+  let path = normalizeFilesPath(start);
+  for (let hop = 0; hop <= MAX_LINK_HOPS; hop++) {
+    const link = await posix.lstat(path);
+    if (!link) return "absent";
+    if (link.kind !== "symlink") {
+      if (link.kind !== "file" || link.mode === undefined) return "executable";
+      return (link.mode & 0o111) !== 0 ? "executable" : "not-executable";
+    }
+    const raw = posix.readlink ? await posix.readlink(path) : undefined;
+    if (!raw) return "absent";
+    const target = decoder.decode(raw);
+    const slash = path.lastIndexOf("/");
+    const parent = slash < 0 ? "" : path.slice(0, slash);
+    if (target.startsWith("/")) {
+      const inside = filesPathOfHost(files, target);
+      if (inside === undefined) return hostAccessOf(target, environment);
+      path = inside;
+      continue;
+    }
+    // a relative target that climbs out of the FilesApi is reached through the host
+    if (escapesRoot(parent ? `${parent}/${target}` : target)) {
+      const parentHost = hostPathOf(files, parent);
+      return hostAccessOf(parentHost ? `${parentHost}/${target}` : undefined, environment);
+    }
+    path = normalizeFilesPath(joinFilesPath(parent, target));
   }
   return "absent";
+}
+
+/** Whether a relative path's `..` components climb above its root. */
+function escapesRoot(path: string): boolean {
+  let depth = 0;
+  for (const part of path.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      depth--;
+      if (depth < 0) return true;
+    } else depth++;
+  }
+  return false;
 }
 
 /**
@@ -307,6 +369,12 @@ export class HookSession {
     const relative = relativeFilesPath(layout.cwd, filesPath);
     if (!relative.startsWith("../")) return relative;
     return hostPathOf(layout.files, filesPath) ?? filesPath;
+  }
+
+  /** A file of the git directory as the repository's FilesApi names it (no layout: none). */
+  async gitFile(name: string): Promise<{ files: FilesApi; path: string } | undefined> {
+    const layout = await this.host.layout();
+    return layout ? { files: layout.files, path: joinFilesPath(layout.gitDir, name) } : undefined;
   }
 
   /** The git directory's absolute host path, where the repository's files have one. */
@@ -386,10 +454,13 @@ export class HookSession {
     if (!layout) return undefined;
     const cwd = options.dir !== undefined ? normalizeFilesPath(options.dir) : layout.cwd;
     const hostCwd = hostPathOf(layout.files, cwd);
+    // in another directory (git's opt.dir) the hook is named by its absolute path, else by
+    // its path from that directory
     const path =
-      options.dir !== undefined
-        ? (hook.hostPath ?? normalizeFilesPath(joinFilesPath(layout.cwd, hook.path)))
-        : hook.path;
+      options.dir === undefined || hook.path.startsWith("/")
+        ? hook.path
+        : (hook.hostPath ??
+          relativeFilesPath(cwd, hook.filesPath ?? joinFilesPath(layout.cwd, hook.path)));
     const stdin =
       options.stdin === undefined
         ? undefined
@@ -501,4 +572,131 @@ export async function sequencerPostCommit(hooks: HookSession): Promise<void> {
   await hooks.run("post-commit", {
     env: { GIT_INDEX_FILE: await hooks.gitPath("index"), GIT_EDITOR: ":" },
   });
+}
+
+/**
+ * git's reference-transaction hook (refs.c `run_transaction_hook`) for a ref store's
+ * transactions: told `preparing` (2.5x), `prepared`, `committed` or `aborted` with an
+ * `<old> <new> <ref>` line per update (git 2.43 lists a symbolic ref the update went
+ * through, HEAD, ahead of the ref it names; 2.5x leaves it out); a refusal in `preparing`
+ * or `prepared` aborts the transaction. Calls about a transaction only the other git
+ * version makes (`context.only`) are left out.
+ */
+export function refTransactionHookOf(
+  hooks: HookSession,
+  /** How the hook runs beyond its state and stdin (the receive side: GIT_DIR, no prefix) */
+  runOptions: Pick<HookCallOptions, "env" | "prefix"> = {},
+): RefTransactionHook {
+  return async (state, updates, context) => {
+    const legacy = hooks.compatibility === "2.43";
+    if (context?.only && context.only !== hooks.compatibility) return true;
+    if (state === "preparing" && legacy) return true;
+    const lines: string[] = [];
+    // git 2.43's log-only updates: the symbolic ref asked for keeps its place, the ref it
+    // names and HEAD's line for a ref it names are appended, in order (split_symref_update,
+    // split_head_update)
+    const appended: string[] = [];
+    for (const u of updates) {
+      const zero = nullIdLike(u.new ?? u.old ?? undefined);
+      const line = (name: string) => `${u.old ?? zero} ${u.new ?? zero} ${name}\n`;
+      if (state === "preparing") lines.push(line(u.requested));
+      else if (legacy && u.requested !== u.name) {
+        lines.push(line(u.requested));
+        appended.push(line(u.name));
+      } else {
+        lines.push(line(u.name));
+        if (legacy && u.viaHead) appended.push(line("HEAD"));
+      }
+    }
+    const result = await hooks.run("reference-transaction", {
+      ...runOptions,
+      args: [state],
+      stdin: [...lines, ...appended].join(""),
+    });
+    if (!result || result.exitCode === 0 || state === "committed" || state === "aborted") {
+      return true;
+    }
+    // 2.43 dies with one message for every state
+    return legacy ? "ref updates aborted by hook" : false;
+  };
+}
+
+/** How a sequencer runs `git commit` (sequencer.c `run_git_commit`), for its hooks. */
+export interface GitCommitHookRun {
+  /** VERIFY_MSG: pre-commit and commit-msg run (else `git commit -n`) */
+  verify: boolean;
+  /** EDIT_MSG (`-e`): an editor runs, so the hooks get no `GIT_EDITOR=:` */
+  editor: boolean;
+  /** prepare-commit-msg's arguments after the message file (`message`, `commit HEAD`) */
+  hookArgs: string[];
+  /** Variables of the `git commit` run (`GIT_REFLOG_ACTION`) */
+  env?: Record<string, string>;
+}
+
+/** The variables of the hooks of a `git commit` run (run_commit_hook). */
+async function gitCommitHookEnv(
+  hooks: HookSession,
+  run: GitCommitHookRun,
+  index = true,
+): Promise<Record<string, string>> {
+  return {
+    ...(index ? { GIT_INDEX_FILE: await hooks.gitPath("index") } : {}),
+    ...(run.editor ? {} : { GIT_EDITOR: ":" }),
+    ...(run.env ?? {}),
+  };
+}
+
+/**
+ * The hooks of a `git commit` a sequencer runs, up to the commit (builtin/commit.c
+ * `prepare_to_commit`): pre-commit (with VERIFY_MSG), `template` written to COMMIT_EDITMSG
+ * for prepare-commit-msg, the editor over what it left (`edit`), then commit-msg (with
+ * VERIFY_MSG). The file's text once they ran; a refusing hook throws {@link HookFailedError}.
+ */
+export async function gitCommitMessageHooks(
+  hooks: HookSession,
+  state: SequencerHookState,
+  template: string,
+  run: GitCommitHookRun,
+  edit: (text: string) => string | Promise<string>,
+): Promise<string> {
+  const env = await gitCommitHookEnv(hooks, run);
+  const refuse = async (name: string, args: string[] = []) => {
+    const result = await hooks.run(name, { args, env });
+    if (result && result.exitCode !== 0) {
+      throw new HookFailedError(
+        name,
+        result.exitCode,
+        `the ${name} hook refused the commit (exit code ${result.exitCode})`,
+        hooks.output,
+      );
+    }
+  };
+  if (run.verify) await refuse("pre-commit");
+  await state.write("COMMIT_EDITMSG", template);
+  const file = await hooks.gitPath("COMMIT_EDITMSG");
+  await refuse("prepare-commit-msg", [file, ...run.hookArgs]);
+  const edited = await edit((await state.read("COMMIT_EDITMSG")) ?? template);
+  await state.write("COMMIT_EDITMSG", edited);
+  if (run.verify) await refuse("commit-msg", [file]);
+  return (await state.read("COMMIT_EDITMSG")) ?? edited;
+}
+
+/**
+ * The hooks of a `git commit` a sequencer runs, once HEAD has moved: post-commit, then for an
+ * amend post-rewrite told `amend` with `<old> <new>` (commit_post_rewrite).
+ */
+export async function gitCommitAfterHooks(
+  hooks: HookSession,
+  run: GitCommitHookRun,
+  amended?: { from: string; to: string },
+): Promise<void> {
+  if (!hooks.enabled) return;
+  await hooks.run("post-commit", { env: await gitCommitHookEnv(hooks, run) });
+  if (amended) {
+    await hooks.run("post-rewrite", {
+      args: ["amend"],
+      stdin: `${amended.from} ${amended.to}\n`,
+      env: await gitCommitHookEnv(hooks, run, false),
+    });
+  }
 }

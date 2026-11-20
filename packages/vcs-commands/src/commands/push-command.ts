@@ -467,6 +467,9 @@ export class PushCommand extends TransportCommand<PushResult> {
     // transport_get: smart HTTP, or git's local transport (receive-pack of the repository at
     // the path, in process); anything else fails in git's words
     let result: Awaited<ReturnType<typeof transportPush>>;
+    // the remote's reference-transaction hook writes to the pushing user's stderr directly
+    const transactionHooks =
+      localRemote === undefined ? undefined : remoteHookSession(this.workingCopy, localRemote);
     try {
       result =
         localRemote === undefined
@@ -476,6 +479,7 @@ export class PushCommand extends TransportCommand<PushResult> {
               (connection) => pushToConnection(connection, pushOptions),
               // receive-pack runs the remote repository's hooks
               remoteHookSession(this.workingCopy, localRemote),
+              transactionHooks,
             );
     } catch (error) {
       if (error instanceof PushRefusedByHookError) {
@@ -487,6 +491,8 @@ export class PushCommand extends TransportCommand<PushResult> {
         );
       }
       throw error;
+    } finally {
+      if (transactionHooks) this.hooks.append(transactionHooks.output);
     }
 
     // git updates the remote-tracking refs of what the server accepted, and of what it had

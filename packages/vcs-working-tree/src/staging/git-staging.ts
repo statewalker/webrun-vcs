@@ -451,6 +451,14 @@ export class GitStaging implements Staging {
         this.updateTime = await this.indexMtime();
       },
       rollback: () => lock.rollback(),
+      reread: async () => {
+        const read = await lock.reread();
+        this._entries = read.entries;
+        this.asRead.reset(this._entries);
+        this.version = this.indexFile.version;
+        this.updateTime = read.lastModified;
+        written = this._entries;
+      },
     };
   }
 

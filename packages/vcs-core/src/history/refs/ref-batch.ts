@@ -126,6 +126,12 @@ export interface BatchOptions extends RefLogOptions {
    * the remote's refs without logging them). A deleted ref still loses its log.
    */
   skipReflog?: boolean;
+  /**
+   * A batch with no command still runs as a transaction its reference-transaction hook is
+   * told about (`preparing`, `prepared`, `committed` with no line): git 2.5x's receive-pack
+   * commits the transaction of a phase whose every update was refused
+   */
+  emptyTransaction?: boolean;
 }
 
 /** A consistent view of a store's refs, read while planning one batch. */
@@ -572,6 +578,11 @@ export interface RefTransactionUpdate {
   old?: ObjectId | null;
   /** The value written; `null` deletes the ref */
   new: ObjectId | null;
+  /**
+   * HEAD names the ref written, which was asked for by its own name: git's transaction
+   * also logs the update on HEAD (`split_head_update`, a line of its own in git 2.43)
+   */
+  viaHead?: boolean;
 }
 
 /**
@@ -584,7 +595,30 @@ export interface RefTransactionUpdate {
 export type RefTransactionHook = (
   state: RefTransactionState,
   updates: readonly RefTransactionUpdate[],
+  context?: RefTransactionContext,
 ) => Promise<boolean | string | undefined>;
+
+/**
+ * Which transaction a {@link RefTransactionHook} call is about, beyond the store's own.
+ *
+ * git's files backend deletes a ref from `packed-refs` in a transaction of its own on the
+ * packed store, nested in the one that deletes it (`<zero> <zero> <ref>` lines, no old
+ * value): prepared when the ref is packed, else given up at once (`aborted`), committed
+ * before the outer one. git 2.43's `delete_refs` (branch -d, tag -d) also first runs one
+ * on the packed store alone; such calls are marked with the version that makes them.
+ */
+export interface RefTransactionContext {
+  /** The packed store's nested transaction */
+  packed?: boolean;
+  /** Made by this git version only: a hook following the other leaves the call out */
+  only?: "2.43" | "2.56";
+}
+
+/** How a ref store removes a ref, where git's commands differ (see {@link RefTransactionContext}). */
+export interface RefRemoveOptions {
+  /** As git's `delete_refs` (branch -d, tag -d), rather than `delete_ref` */
+  deleteRefs?: boolean;
+}
 
 /** A ref transaction its hook aborted (git: "in '<state>' phase, update aborted by ..."). */
 export class RefTransactionAbortedError extends Error {

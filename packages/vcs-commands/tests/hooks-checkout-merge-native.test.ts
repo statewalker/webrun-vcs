@@ -11,6 +11,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInMemoryFilesApi } from "@statewalker/vcs-core";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
 import {
   createNodeFilesApi,
@@ -18,8 +19,7 @@ import {
   createNodeHookRunner,
 } from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-
-import { Git, MergeStatus } from "../src/index.js";
+import { Git, HookSession, MergeStatus } from "../src/index.js";
 import {
   type HookTwin,
   hookEdit,
@@ -290,5 +290,28 @@ describeGit("post-checkout and the merge hooks: as native git", () => {
       log.replace(/wt-(native|ours)/g, "wt").replace(/r-(native|ours)/g, "r");
     expect(normalize(hookLog(mine))).toBe(normalize(hookLog(theirs)));
     expect(hookLines(add.getHookOutput())).toBe(hookLines(native.stderr));
+  });
+});
+
+describe("hooks run in another directory (git's opt.dir)", () => {
+  it("a hook of a FilesApi without host paths is named from the directory it runs in", async () => {
+    const files = createInMemoryFilesApi();
+    await files.write(".git/hooks/post-checkout", [new TextEncoder().encode("#!/bin/sh\n")]);
+    const seen: Array<{ path: string; cwd: string }> = [];
+    const session = new HookSession({
+      layout: async () => ({ files, top: "", gitDir: ".git", cwd: "", bare: false }),
+      configValue: () => undefined,
+      environment: () => ({
+        readFile: async () => undefined,
+        hookRunner: {
+          run: async (invocation) => {
+            seen.push({ path: invocation.path, cwd: invocation.cwd });
+            return { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+          },
+        },
+      }),
+    });
+    await session.run("post-checkout", { dir: "wt/new" });
+    expect(seen).toEqual([{ path: "../../.git/hooks/post-checkout", cwd: "wt/new" }]);
   });
 });

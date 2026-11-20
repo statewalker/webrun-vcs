@@ -10,7 +10,7 @@
  * deletion of AUTO_MERGE a commit makes (a transaction that ends `aborted`), which ours
  * writes without one, so those transactions are left out of native's log here.
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RefTransactionAbortedError } from "@statewalker/vcs-core";
@@ -128,5 +128,118 @@ describeGit("reference-transaction hook: as native git", () => {
       "refused",
       (t) => hookExit(t, "reference-transaction", 1),
     );
+  });
+});
+
+/**
+ * A reference-transaction hook that logs its state and stdin; once `committed`, the lock
+ * files of the git directory (git runs it after the locks are released: none) and, outside
+ * a nested run, an update of HEAD to where it is (which a held lock would refuse) with its
+ * exit status.
+ */
+const AFTER_LOCKS_HOOK = `#!/bin/sh
+echo "== $1" >> "$HOOK_LOG"
+input=$(cat)
+echo "$input" >> "$HOOK_LOG"
+# (not for git 2.5x's deletion of AUTO_MERGE, which ours makes without the hook)
+if [ "$1" = committed ] && [ -z "$NESTED" ] && ! echo "$input" | grep -q AUTO_MERGE; then
+  find .git -name '*.lock' | sort >> "$HOOK_LOG"
+  NESTED=1 git update-ref HEAD "$(git rev-parse HEAD)" >> "$HOOK_LOG" 2>&1
+  echo "update-ref: $?" >> "$HOOK_LOG"
+fi
+exit 0
+`;
+
+describeGit("reference-transaction hook: after the locks, and deletions (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx2-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("committed runs once the ref locks are released: no lock file, HEAD can be updated", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    writeFileSync(join(dir, ".git/hooks/reference-transaction"), AFTER_LOCKS_HOOK, {
+      mode: 0o755,
+    });
+    await expectTwins(
+      dir,
+      ["branch", "topic"],
+      (g) => attempt(g.branchCreate().setName("topic")),
+      "branch",
+    );
+    putFile(dir, "a.txt", "a2\n");
+    git(dir, ["add", "a.txt"]);
+    await expectTwins(
+      dir,
+      ["commit", "-qm", "two"],
+      (g) => attempt(g.commit().setMessage("two")),
+      "commit",
+    );
+  });
+
+  it("branch -d, tag -d and remote set-head -d: git's deletion transactions, packed or loose", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    for (const name of ["packed", "loose-later"]) git(dir, ["branch", name]);
+    git(dir, ["tag", "t-packed"]);
+    git(dir, ["pack-refs", "--all"]);
+    git(dir, ["branch", "loose"]);
+    git(dir, ["tag", "t-loose"]);
+    git(dir, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(dir, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+    const cases: Array<[string[], (g: Git) => Promise<{ output: string; error?: Error }>]> = [
+      [["branch", "-d", "loose"], (g) => attempt(g.branchDelete().setBranchNames("loose"))],
+      [["branch", "-d", "packed"], (g) => attempt(g.branchDelete().setBranchNames("packed"))],
+      [
+        ["branch", "-D", "loose-later"],
+        (g) => attempt(g.branchDelete().setBranchNames("loose-later").setForce(true)),
+      ],
+      [["tag", "-d", "t-loose"], (g) => attempt(g.tagDelete().setTags("t-loose"))],
+      [["tag", "-d", "t-packed"], (g) => attempt(g.tagDelete().setTags("t-packed"))],
+      [
+        ["remote", "set-head", "origin", "-d"],
+        (g) => attempt(g.remoteSetHead().setRemoteName("origin").setDelete(true)),
+      ],
+    ];
+    for (const [args, run] of cases) await expectTwins(dir, args, run, args.join(" "));
+  });
+
+  it("a refusal in prepared aborts a deletion", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    git(dir, ["branch", "topic"]);
+    await expectTwins(
+      dir,
+      ["branch", "-d", "topic"],
+      (g) => attempt(g.branchDelete().setBranchNames("topic")),
+      "refused deletion",
+      (t) => hookExit(t, "reference-transaction", 1),
+    );
+  });
+});
+
+describeGit("reference-transaction hook: installed only while the command runs", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx3-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("a ref written after the command ends runs no hook of that command", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    const [, mine] = hookTwins(root, dir);
+    const g = await oursIn(mine);
+    const command = g.branchCreate().setName("topic");
+    await command.call();
+    const logged = hookLog(mine);
+    const outputBefore = command.getHookOutput();
+    expect(logged).toContain("[committed]");
+    const head = git(mine.dir, ["rev-parse", "HEAD"]).trim();
+    await g.workingCopy.history.refs.set("refs/heads/later", head);
+    expect(hookLog(mine)).toBe(logged);
+    expect(command.getHookOutput()).toBe(outputBefore);
+    const store = g.workingCopy.history.refs as { getTransactionHook?(): unknown };
+    expect(store.getTransactionHook?.()).toBeUndefined();
   });
 });

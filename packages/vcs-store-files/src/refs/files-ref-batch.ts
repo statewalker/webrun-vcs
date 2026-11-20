@@ -40,6 +40,7 @@ import {
   isUpdatableRefName,
   planRefBatch,
   ReflogEntryNotFoundError,
+  type RefRemoveOptions,
   RefStorage,
   RefTransactionAbortedError,
   type RefTransactionHook,
@@ -106,7 +107,18 @@ interface PackedEntry {
 type Loose = { id: string } | { target: string };
 
 /** A planned update with the command's expected old value and its noDeref flag. */
-type Update = PlannedRefUpdate & { old: ObjectId | null | undefined; noDeref: boolean };
+type Update = PlannedRefUpdate & {
+  old: ObjectId | null | undefined;
+  noDeref: boolean;
+  /** HEAD names the ref, asked for by its own name (see `RefTransactionUpdate.viaHead`) */
+  viaHead?: boolean;
+};
+
+/** What a batch tells its hook once its locks are released (see `afterLocks`). */
+interface AfterLocks {
+  committed?: boolean;
+  refused?: RefTransactionAbortedError;
+}
 
 /** Refs git logs even without an existing reflog with core.logAllRefUpdates=true. */
 const LOGGED_BY_DEFAULT = ["refs/heads/", "refs/remotes/", "refs/notes/"];
@@ -222,7 +234,7 @@ export interface FilesRefOps {
    * there was nothing to delete. Throws `RefUpdateRejectedError` if `<name>.lock` stays
    * held, `PackedRefsLockedError` if `packed-refs.lock` does, with nothing changed.
    */
-  removeRef(name: string): Promise<boolean>;
+  removeRef(name: string, options?: RefRemoveOptions): Promise<boolean>;
   /**
    * Delete reflog entry `name@{index}` as git's files_reflog_expire does for `git reflog
    * delete`: under `<name>.lock` and `logs/<name>.lock`, the kept lines are written into
@@ -591,6 +603,11 @@ export function createFilesRefOps(
   const mismatch = (old: ObjectId | null | undefined, current: ObjectId | undefined) =>
     old !== undefined && (old === null ? current !== undefined : current !== old);
 
+  /** The updates of the packed store's nested transaction (see `packedPhase`). */
+  function packedUpdates(names: string[]): RefTransactionUpdate[] {
+    return names.map((name) => ({ requested: name, name, new: null }));
+  }
+
   /** The updates as the transaction hook is told them. */
   function transactionUpdates(updates: Update[]): RefTransactionUpdate[] {
     return updates.map((u) => ({
@@ -598,24 +615,91 @@ export function createFilesRefOps(
       name: u.name,
       ...(u.old !== undefined ? { old: u.old } : {}),
       new: u.newValue,
+      ...(u.viaHead ? { viaHead: true } : {}),
     }));
   }
 
-  /** The `prepared` state: a refusal aborts (the `aborted` state, then a throw). */
-  async function prepared(hook: RefTransactionHook | undefined, updates: Update[]) {
-    if (!hook) return;
-    const told = transactionUpdates(updates);
-    const verdict = await hook("prepared", told);
+  /**
+   * The `prepared` state: a refusal is recorded in `after` (told `aborted` and thrown once
+   * the locks are released, as git's ref_transaction_abort after transaction_abort).
+   */
+  async function prepared(
+    hook: RefTransactionHook | undefined,
+    updates: Update[],
+    after: AfterLocks,
+  ): Promise<boolean> {
+    if (!hook) return true;
+    const verdict = await hook("prepared", transactionUpdates(updates));
     if (verdict === false || typeof verdict === "string") {
-      await hook("aborted", told);
-      throw new RefTransactionAbortedError("prepared", verdict || undefined);
+      after.refused = new RefTransactionAbortedError("prepared", verdict || undefined);
+      return false;
     }
+    return true;
+  }
+
+  /**
+   * What the hook is told once a batch's locks are released: `committed` after a commit
+   * (ref_transaction_commit runs it after transaction_finish), `aborted` (then the throw)
+   * after a refusal in `prepared`.
+   */
+  async function afterLocks(
+    hook: RefTransactionHook | undefined,
+    updates: Update[],
+    after: AfterLocks,
+  ): Promise<void> {
+    if (!hook) return;
+    if (after.refused) {
+      await hook("aborted", transactionUpdates(updates));
+      throw after.refused;
+    }
+    if (after.committed) await hook("committed", transactionUpdates(updates));
+  }
+
+  /**
+   * git's nested transaction on the packed store for the deletions of a transaction
+   * (files_transaction_prepare): `<zero> <zero> <ref>` lines; prepared when one of the refs
+   * is packed (`preparing` and `prepared`, a refusal telling it `aborted` and throwing, as
+   * git dies there), else given up at once (`aborted`). Whether it is to be committed.
+   */
+  async function packedPhase(
+    hook: RefTransactionHook | undefined,
+    names: string[],
+    packed: boolean,
+    only?: "2.43" | "2.56",
+  ): Promise<boolean> {
+    if (!hook || names.length === 0) return false;
+    const told = packedUpdates(names);
+    const context = { packed: true, ...(only ? { only } : {}) };
+    if (!packed) {
+      await hook("aborted", told, context);
+      return false;
+    }
+    for (const state of ["preparing", "prepared"] as const) {
+      const verdict = await hook(state, told, context);
+      if (verdict === false || typeof verdict === "string") {
+        await hook("aborted", told, context);
+        throw new RefTransactionAbortedError(state, verdict || undefined);
+      }
+    }
+    return true;
   }
 
   async function single(
     u: Update,
     o: BatchOptions,
     hook?: RefTransactionHook,
+  ): Promise<BatchResult> {
+    const after: AfterLocks = {};
+    const result = await singleLocked(u, o, hook, after);
+    await afterLocks(hook, [u], after);
+    return result;
+  }
+
+  async function singleLocked(
+    u: Update,
+    o: BatchOptions,
+    hook: RefTransactionHook | undefined,
+    after: AfterLocks,
   ): Promise<BatchResult> {
     const content = u.newValue === null ? new Uint8Array(0) : enc.encode(`${u.newValue}\n`);
     // The refs that log this update too (HEAD, symbolic refs on the way) are locked as
@@ -647,11 +731,14 @@ export function createFilesRefOps(
       if (mismatch(u.old, curId)) {
         return fail([{ name: u.requested, reason: "mismatch" }]);
       }
-      await prepared(hook, [u]);
+      const deleting = u.newValue === null ? [u.name] : [];
+      const packedCommit = await packedPhase(hook, deleting, packed.has(u.name));
+      if (!(await prepared(hook, [u], after))) return fail([]);
       if (u.newValue === null) {
         if ((await deleteUnderPackedLock(u.name)) === "held") {
           return fail([{ name: PACKED, reason: "locked" }]);
         }
+        if (packedCommit) await hook?.("committed", packedUpdates(deleting), { packed: true });
         await writeLogs([u], () => curId, o);
       } else {
         // under the ref lock, before the rename (as git); a failed line fails the update
@@ -659,7 +746,7 @@ export function createFilesRefOps(
         if (!(await commit(u.name))) return fail([{ name: u.requested, reason: "df-conflict" }]);
         ours = false;
       }
-      await hook?.("committed", transactionUpdates([u]));
+      after.committed = true;
       return { ok: true, rejected: [] };
     } finally {
       for (const n of held) if (n !== u.name || ours) await unlock(n);
@@ -691,6 +778,18 @@ export function createFilesRefOps(
     updates: Update[],
     o: BatchOptions,
     hook?: RefTransactionHook,
+  ): Promise<BatchResult> {
+    const after: AfterLocks = {};
+    const result = await multiLocked(updates, o, hook, after);
+    await afterLocks(hook, updates, after);
+    return result;
+  }
+
+  async function multiLocked(
+    updates: Update[],
+    o: BatchOptions,
+    hook: RefTransactionHook | undefined,
+    after: AfterLocks,
   ): Promise<BatchResult> {
     const extra = updates.flatMap((u) => u.reflogAlso);
     const names = [...new Set([...extra, ...updates.map((u) => u.name)])].sort(compareRefNames);
@@ -727,7 +826,13 @@ export function createFilesRefOps(
       if (mismatched.length) {
         return fail(mismatched.map((u) => ({ name: u.requested, reason: "mismatch" as const })));
       }
-      await prepared(hook, updates);
+      const deleting = updates.filter((u) => u.newValue === null).map((u) => u.name);
+      const packedCommit = await packedPhase(
+        hook,
+        deleting,
+        deleting.some((n) => packed.has(n)),
+      );
+      if (!(await prepared(hook, updates, after))) return fail([]);
       if (loose.size) {
         // Phase 1: move the involved loose refs into packed-refs (values unchanged for
         // readers), committing packed-refs BEFORE removing the loose files.
@@ -754,6 +859,7 @@ export function createFilesRefOps(
         else packed.set(u.name, { id: u.newValue });
       }
       await commitPacked(serializePacked(packed));
+      if (packedCommit) await hook?.("committed", packedUpdates(deleting), { packed: true });
       await files.remove(`${PACKED}.lock`);
       packedHeld = false;
       await writeLogs(
@@ -761,7 +867,7 @@ export function createFilesRefOps(
         at,
         o,
       );
-      await hook?.("committed", transactionUpdates(updates));
+      after.committed = true;
       return { ok: true, rejected: [] };
     } finally {
       if (packedHeld) await files.remove(`${PACKED}.lock`).catch(() => false);
@@ -837,7 +943,20 @@ export function createFilesRefOps(
     commands: RefCommand[],
     batchOptions: BatchOptions = {},
   ): Promise<BatchResult> => {
-    if (commands.length === 0) return { ok: true, rejected: [] };
+    if (commands.length === 0) {
+      const hook = batchOptions.emptyTransaction ? options.transactionHook?.() : undefined;
+      if (hook) {
+        for (const state of ["preparing", "prepared"] as const) {
+          const verdict = await hook(state, []);
+          if (verdict === false || typeof verdict === "string") {
+            await hook("aborted", []);
+            throw new RefTransactionAbortedError(state, verdict || undefined);
+          }
+        }
+        await hook("committed", []);
+      }
+      return { ok: true, rejected: [] };
+    }
     // Plan without locks: names, policy, D/F conflicts and old values (all re-checked under the locks).
     const packed = await readPacked();
     const read = onceEach();
@@ -857,6 +976,7 @@ export function createFilesRefOps(
         : {}),
       old: commands[i]?.old,
       noDeref: commands[i]?.noDeref === true,
+      viaHead: u.requested === u.name && u.name !== "HEAD" && u.reflogAlso.includes("HEAD"),
     }));
     if (updates.length > 1) {
       // Replacing a symbolic ref (noDeref) cannot join the packed-refs commit: its loose
@@ -933,21 +1053,73 @@ export function createFilesRefOps(
     }
   }
 
-  async function removeRef(name: string): Promise<boolean> {
+  async function removeRef(name: string, o: RefRemoveOptions = {}): Promise<boolean> {
+    // the reference-transaction hook for the refs git deletes in a transaction (refs/...):
+    // `<zero> <zero> <ref>`, no old value (delete_ref and delete_refs give none)
+    const hook = name.startsWith("refs/") ? options.transactionHook?.() : undefined;
+    const told = packedUpdates([name]);
+    if (hook && o.deleteRefs) {
+      // git 2.43's files_delete_refs: the packed store's own transaction first
+      for (const state of ["prepared", "committed"] as const) {
+        const verdict = await hook(state, told, { packed: true, only: "2.43" });
+        if (state === "prepared" && (verdict === false || typeof verdict === "string")) {
+          await hook("aborted", told, { packed: true, only: "2.43" });
+          throw new RefTransactionAbortedError("prepared", verdict || undefined);
+        }
+      }
+    }
+    if (hook) {
+      const verdict = await hook("preparing", told);
+      if (verdict === false || typeof verdict === "string") {
+        await hook("aborted", told);
+        throw new RefTransactionAbortedError("preparing", verdict || undefined);
+      }
+    }
+    const after: AfterLocks = {};
     const r = await lock(name, refLockTimeout);
     if (r === "held") throw new RefUpdateRejectedError([{ name, reason: "locked" }]);
     // "conflict": a file where a parent directory would be, so no loose file at `name`
+    let removed = false;
     try {
-      const d = await deleteUnderPackedLock(name);
-      if (d === "held") throw new PackedRefsLockedError(packedLockTimeout);
-      const removed = d.packed || d.loose;
-      if (removed && (await files.exists(`logs/${name}`))) {
-        await removeAndPrune(`logs/${name}`).catch(() => {}); // as git: the log goes too
+      let packedCommit = false;
+      if (hook) {
+        const inPacked = (await readPacked()).has(name);
+        if (o.deleteRefs) {
+          // 2.43 deleted it from packed-refs already: its nested transaction is not needed
+          await packedPhase(hook, [name], false, "2.43");
+          packedCommit = await packedPhase(hook, [name], inPacked, "2.56");
+        } else packedCommit = await packedPhase(hook, [name], inPacked);
+        const verdict = await hook("prepared", told);
+        if (verdict === false || typeof verdict === "string") {
+          after.refused = new RefTransactionAbortedError("prepared", verdict || undefined);
+        }
       }
-      return removed;
+      if (!after.refused) {
+        const d = await deleteUnderPackedLock(name);
+        if (d === "held") throw new PackedRefsLockedError(packedLockTimeout);
+        if (packedCommit) {
+          await hook?.("committed", told, {
+            packed: true,
+            ...(o.deleteRefs ? { only: "2.56" as const } : {}),
+          });
+        }
+        removed = d.packed || d.loose;
+        if (removed && (await files.exists(`logs/${name}`))) {
+          await removeAndPrune(`logs/${name}`).catch(() => {}); // as git: the log goes too
+        }
+        after.committed = true;
+      }
     } finally {
       if (r === "ok") await unlock(name);
     }
+    if (hook) {
+      if (after.refused) {
+        await hook("aborted", told);
+        throw after.refused;
+      }
+      await hook("committed", told);
+    }
+    return removed;
   }
 
   async function deleteReflogEntry(

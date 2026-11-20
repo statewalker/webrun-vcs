@@ -82,6 +82,12 @@ export interface ServeOverDuplexOptions {
    * (git's receive-pack); default: detached once the report is out
    */
   relayPostReceive?: boolean;
+  /** receive-pack: a push that is not atomic updates refs in two batches (see `ReceivePackOptions`) */
+  batchNonAtomic?: boolean;
+  /** receive-pack: each ref of a push that is not atomic updated after its update hook */
+  interleaveUpdateHook?: boolean;
+  /** receive-pack: objects published before the commands are checked (see `ReceivePackOptions`) */
+  publishBeforeUpdate?: boolean;
   /** upload-pack hooks: authorize (before the negotiation), postUpload (after the pack) */
   uploadPackHooks?: UploadPackHooks;
   /**
@@ -241,6 +247,9 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       drainRefusedPack: true,
       afterReport: (task) => afterReport.push(task),
       ...(options.relayPostReceive ? { relayPostReceive: true } : {}),
+      ...(options.batchNonAtomic ? { batchNonAtomic: true } : {}),
+      ...(options.interleaveUpdateHook ? { interleaveUpdateHook: true } : {}),
+      ...(options.publishBeforeUpdate ? { publishBeforeUpdate: true } : {}),
     },
   };
   // post-receive tasks: started once the report is written (detached from this call)

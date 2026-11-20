@@ -250,4 +250,24 @@ export interface ReceivePackConfig {
    * false: detached, once the report is out (see {@link afterReport}).
    */
   relayPostReceive?: boolean;
+  /**
+   * A push that is not atomic updates its refs in two batches, the deletions then the rest,
+   * each ref refused on its own (git 2.5x's execute_commands_non_atomic, one transaction per
+   * phase with REF_TRANSACTION_ALLOW_FAILURE, as its reference-transaction hook sees them);
+   * default false: one batch per ref (git 2.43)
+   */
+  batchNonAtomic?: boolean;
+  /**
+   * A push that is not atomic updates each ref right after its checks and update hook pass
+   * (git 2.43's execute_commands_non_atomic: `update()` runs the hook, then the ref's own
+   * transaction), rather than once every command is checked. Ignored for shallow pushes.
+   */
+  interleaveUpdateHook?: boolean;
+  /**
+   * The pushed objects are published once pre-receive passed while a command is still open,
+   * before each command is checked (git's execute_commands migrates its quarantine there):
+   * a command refused by the checks or the update hook, even on an atomic push, leaves them
+   * in the repository. Default false: published only when a ref is updated.
+   */
+  publishBeforeUpdate?: boolean;
 }

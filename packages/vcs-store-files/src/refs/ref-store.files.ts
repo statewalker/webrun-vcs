@@ -15,6 +15,7 @@ import type {
   RefLogOptions,
   ReflogDeleteOptions,
   ReflogReader,
+  RefRemoveOptions,
   Refs,
   RefTransactionHook,
   RefUpdateResult,
@@ -76,13 +77,19 @@ export class FileRefStore implements Refs {
   }
 
   /**
-   * Tells `hook` about each batch (`set`, `batch`, `compareAndSwap`) as git runs the
-   * reference-transaction hook: `preparing`, `prepared`, `committed`, `aborted`. Symbolic
-   * refs, removals (`remove`) and names outside `refs/` other than HEAD are written without
-   * it. Undefined removes it.
+   * Tells `hook` about each batch (`set`, `batch`, `compareAndSwap`) and each removal of a
+   * ref under `refs/` (`remove`) as git runs the reference-transaction hook: `preparing`,
+   * `prepared`, `committed`, `aborted` (the last two once the locks are released), with
+   * the packed store's nested transaction of a deletion. Symbolic refs written and names
+   * outside `refs/` other than HEAD are written without it. Undefined removes it.
    */
   setTransactionHook(hook: RefTransactionHook | undefined): void {
     this.transactionHook = hook;
+  }
+
+  /** The hook {@link setTransactionHook} installed, if any. */
+  getTransactionHook(): RefTransactionHook | undefined {
+    return this.transactionHook;
   }
 
   /**
@@ -225,8 +232,8 @@ export class FileRefStore implements Refs {
    * the loose file removed before the lock is released. Throws `RefUpdateRejectedError`
    * or `PackedRefsLockedError` with nothing changed when a lock stays held.
    */
-  async remove(refName: string): Promise<boolean> {
-    return this.ops.removeRef(refName);
+  async remove(refName: string, options?: RefRemoveOptions): Promise<boolean> {
+    return this.ops.removeRef(refName, options);
   }
 
   /**

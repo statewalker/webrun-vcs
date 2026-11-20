@@ -8,11 +8,13 @@
  * repository with logging hooks and ours (with the Node hook runner) in the other, and
  * compares the logs, the hooks' output, HEAD and the abort.
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { OperationState } from "../src/commands/merge-support.js";
 import { type CommitCommand, HookFailedError } from "../src/index.js";
 import {
   type HookTwin,
@@ -25,6 +27,7 @@ import {
   nativeIn,
   oursIn,
 } from "./hooks-native-support.js";
+import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
 
@@ -215,5 +218,155 @@ describeGit("commit hooks: as native git", () => {
     installHooks(absolute, ["pre-commit", "post-commit"]);
     git(dir, ["config", "core.hooksPath", absolute]);
     await expectCommit(dir, ["-m", "two"], (c) => c.setMessage("two"), "absolute hooksPath");
+  });
+});
+
+/**
+ * A pre-commit that stages a file it generates, and hooks after it that list the index they
+ * are given and the index files of the git directory (git's partial-commit index named
+ * `next-index-N.lock`, its process id evened out).
+ */
+const STAGING_PRE_COMMIT = `#!/bin/sh
+echo "== pre-commit GIT_INDEX_FILE=$GIT_INDEX_FILE" >> "$HOOK_LOG"
+ls .git | grep index >> "$HOOK_LOG"
+echo gen > gen.txt
+git add gen.txt
+`;
+const LISTING_HOOK = `#!/bin/sh
+echo "== $(basename "$0") GIT_INDEX_FILE=$GIT_INDEX_FILE" >> "$HOOK_LOG"
+git ls-files -s >> "$HOOK_LOG"
+ls .git | grep index >> "$HOOK_LOG"
+`;
+
+function installStagingHooks(dir: string): void {
+  const hooks = join(dir, ".git/hooks");
+  mkdirSync(hooks, { recursive: true });
+  writeFileSync(join(hooks, "pre-commit"), STAGING_PRE_COMMIT, { mode: 0o755 });
+  for (const name of ["commit-msg", "post-commit"]) {
+    writeFileSync(join(hooks, name), LISTING_HOOK, { mode: 0o755 });
+  }
+}
+
+/**
+ * Native `git commit <args>` and ours over twins with the staging hooks: the same log, the
+ * same commit (tree and id), the same index entries and status afterwards, no false index
+ * left behind.
+ */
+async function expectStagingCommit(
+  dir: string,
+  args: string[],
+  setup: (c: CommitCommand) => void,
+  label: string,
+): Promise<void> {
+  const [theirs, mine] = hookTwins(root, dir);
+  const native = nativeIn(theirs, root, ["commit", ...args]);
+  expect(native.status, `${label}: ${native.stderr}`).toBe(0);
+  const command = (await oursIn(mine)).commit();
+  setup(command);
+  await command.call();
+  const log = (t: HookTwin) => hookLog(t).replace(/next-index-\d+/g, "next-index-N");
+  expect(log(mine), `${label}: log`).toBe(log(theirs));
+  for (const args of [
+    ["rev-parse", "HEAD", "HEAD^{tree}"],
+    ["ls-files", "-s"],
+    ["status", "--porcelain"],
+  ]) {
+    expect(git(mine.dir, args), `${label}: ${args.join(" ")}`).toBe(git(theirs.dir, args));
+  }
+  const leftovers = (t: HookTwin) =>
+    readdirSync(join(t.dir, ".git")).filter((n) => /index/.test(n));
+  expect(leftovers(mine), `${label}: index files`).toEqual(leftovers(theirs));
+}
+
+describeGit("commit hooks: what pre-commit stages (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-commit-stage-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  function stagingBase(dir: string): void {
+    mkdirSync(dir, { recursive: true });
+    git(dir, ["init", "-q", "-b", "main"]);
+    putFile(dir, "a.txt", "a\n");
+    putFile(dir, "b.txt", "b\n");
+    git(dir, ["add", "-A"]);
+    git(dir, ["commit", "-qm", "base"]);
+    installStagingHooks(dir);
+    putFile(dir, "a.txt", "a2\n");
+    putFile(dir, "b.txt", "b2\n");
+  }
+
+  it("commit -a: the file pre-commit adds to the index lock is committed", async () => {
+    const dir = join(root, "r");
+    stagingBase(dir);
+    await expectStagingCommit(dir, ["-a", "-m", "x"], (c) => c.setAll(true).setMessage("x"), "-a");
+  });
+
+  it("commit --only: the hooks see the false index (HEAD and the paths), re-read after pre-commit", async () => {
+    const dir = join(root, "r");
+    stagingBase(dir);
+    await expectStagingCommit(
+      dir,
+      ["-m", "x", "--only", "a.txt"],
+      (c) => c.setMessage("x").setOnly("a.txt"),
+      "--only",
+    );
+  });
+
+  it("a plain commit: what pre-commit adds to the index is committed", async () => {
+    const dir = join(root, "r");
+    stagingBase(dir);
+    git(dir, ["add", "a.txt"]);
+    await expectStagingCommit(dir, ["-m", "x"], (c) => c.setMessage("x"), "plain");
+  });
+});
+
+describeGit("commit hooks: symbolic links (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-commit-link-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("a hook linked to a file that is not executable is ignored with the hint; one linked to an executable file runs", async () => {
+    const dir = join(root, "r");
+    base(dir, ["post-commit"]);
+    // targets inside the repository (relative link), outside it (absolute) and a chain
+    installHooks(join(dir, "targets"), ["plain"], false);
+    installHooks(join(dir, "targets"), ["runs"], true);
+    installHooks(join(root, "outside"), ["plain"], false);
+    const hooks = join(dir, ".git/hooks");
+    symlinkSync("../../targets/plain", join(hooks, "pre-commit"));
+    symlinkSync(join(root, "outside/plain"), join(hooks, "commit-msg"));
+    symlinkSync("pre-commit", join(hooks, "prepare-commit-msg"));
+    await expectCommit(dir, ["-m", "two"], (c) => c.setMessage("two"), "links, not executable");
+    for (const name of ["pre-commit", "commit-msg", "prepare-commit-msg"]) {
+      rmSync(join(hooks, name));
+    }
+    symlinkSync("../../targets/runs", join(hooks, "pre-commit"));
+    symlinkSync("pre-commit", join(hooks, "commit-msg"));
+    await expectCommit(dir, ["-m", "two"], (c) => c.setMessage("two"), "links, executable");
+  });
+});
+
+describeGit("commit hooks: nothing read for them without a runner", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-commit-norunner-"));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("commit -m reads MERGE_MSG and SQUASH_MSG once each (not again for hook arguments)", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    const [, mine] = hookTwins(root, dir);
+    const read = vi.spyOn(OperationState.prototype, "read");
+    const g = await openOurs(mine.dir, createNodeGitHostEnvironment({ env: mine.env }));
+    await g.commit().setMessage("two").call();
+    const names = read.mock.calls.map(([name]) => name);
+    expect(names.filter((n) => n === "MERGE_MSG")).toHaveLength(1);
+    expect(names.filter((n) => n === "SQUASH_MSG")).toHaveLength(1);
+    expect(hookLog(mine)).toBe("");
   });
 });

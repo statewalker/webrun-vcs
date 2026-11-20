@@ -6,14 +6,15 @@
  * rewritten list on stdin. Each case runs native git in one copy of a repository with
  * logging hooks and ours (with the Node hook runner) in the other.
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { type Git, RebaseStatus } from "../src/index.js";
+import { type Git, RebaseOperation, RebaseStatus } from "../src/index.js";
 import {
   type HookTwin,
+  hookEdit,
   hookExit,
   hookLines,
   hookLog,
@@ -159,5 +160,91 @@ describeGit("rebase, cherry-pick and revert hooks: as native git", () => {
       },
       "revert",
     );
+  });
+});
+
+describeGit("rebase -i hooks: reword and edit (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-rebase-i-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** A sequence editor turning the pick of `subject` (`# subject` in 2.5x) into `action`. */
+  function sequenceEditor(action: string, subject: string): string {
+    const path = join(root, `seq-${action}-${subject}.sh`);
+    writeFileSync(
+      path,
+      `#!/bin/sh\nsed -i 's/^pick \\([0-9a-f]*\\) \\(# \\)\\{0,1\\}${subject}$/${action} \\1 ${subject}/' "$1"\n`,
+      { mode: 0o755 },
+    );
+    return path;
+  }
+
+  /** Our interactive rebase onto main with the todo edited as the sequence editor does. */
+  function interactive(g: Git, action: string, subject: string) {
+    const command = g.rebase().setUpstream("main");
+    command.runInteractively({
+      editTodo: (text) =>
+        text.replace(
+          new RegExp(`^pick ([0-9a-f]+) (?:# )?${subject}$`, "m"),
+          `${action} $1 ${subject}`,
+        ),
+      modifyCommitMessage: (text) => text,
+    });
+    return command;
+  }
+
+  /** The editor of both sides: `true` (a hook given `GIT_EDITOR=:` shows no editor ran). */
+  const EDITOR = { GIT_EDITOR: "true" };
+
+  it("reword: the pick's hooks, then git commit --amend -e's (pre-commit, prepare-commit-msg [commit HEAD], commit-msg, post-commit, post-rewrite [amend])", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    const [theirs, mine] = hookTwins(root, dir);
+    for (const t of [theirs, mine]) {
+      hookEdit(t, "commit-msg", "\nSigned-off-by: Hook <hook@example.com>\n");
+    }
+    const native = nativeIn(theirs, root, ["rebase", "-q", "-i", "main"], {
+      GIT_SEQUENCE_EDITOR: sequenceEditor("reword", "d"),
+      ...EDITOR,
+    });
+    expect(native.status, native.stderr).toBe(0);
+    const command = interactive(await oursIn(mine, EDITOR), "reword", "d");
+    const result = await command.call();
+    expect(result.status, result.message).toBe(RebaseStatus.OK);
+    expect(hookLog(mine), "log").toBe(hookLog(theirs));
+    expect(hookLines(command.getHookOutput()), "output").toBe(hookLines(native.stderr));
+    for (const args of [
+      ["rev-parse", "HEAD"],
+      ["log", "-1", "--format=%B"],
+    ]) {
+      expect(git(mine.dir, args), args.join(" ")).toBe(git(theirs.dir, args));
+    }
+  });
+
+  it("edit, then --continue with staged changes: git commit --amend's hooks (no pre-commit or commit-msg: -n)", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    const [theirs, mine] = hookTwins(root, dir);
+    const env = { GIT_SEQUENCE_EDITOR: sequenceEditor("edit", "c"), ...EDITOR };
+    const stopped = nativeIn(theirs, root, ["rebase", "-q", "-i", "main"], env);
+    expect(stopped.status, stopped.stderr).toBe(0);
+    const first = interactive(await oursIn(mine, EDITOR), "edit", "c");
+    expect((await first.call()).status).toBe(RebaseStatus.EDIT);
+    for (const t of [theirs, mine]) {
+      putFile(t.dir, "c", "c edited\n");
+      git(t.dir, ["add", "c"]);
+    }
+    const native = nativeIn(theirs, root, ["rebase", "--continue"], env);
+    expect(native.status, native.stderr).toBe(0);
+    const command = (await oursIn(mine, EDITOR)).rebase().setOperation(RebaseOperation.CONTINUE);
+    command.runInteractively({ modifyCommitMessage: (text) => text });
+    const result = await command.call();
+    expect(result.status, result.message).toBe(RebaseStatus.OK);
+    expect(hookLog(mine), "log").toBe(hookLog(theirs));
+    expect(hookLines(first.getHookOutput() + command.getHookOutput()), "output").toBe(
+      hookLines(stopped.stderr + native.stderr),
+    );
+    expect(git(mine.dir, ["rev-parse", "HEAD"])).toBe(git(theirs.dir, ["rev-parse", "HEAD"]));
   });
 });

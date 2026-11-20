@@ -7,6 +7,7 @@ import type {
   PersonIdent,
   Ref,
   RefLogOptions,
+  RefRemoveOptions,
   Refs,
   RefTransactionHook,
   SymbolicRef,
@@ -49,7 +50,7 @@ import {
   type IdAbbreviator,
   worktreeModeTrust,
 } from "./commands/core-config.js";
-import { HookSession, nullIdLike } from "./commands/git-hooks.js";
+import { HookSession, refTransactionHookOf } from "./commands/git-hooks.js";
 import {
   authorIdentOf,
   committerIdentOf,
@@ -88,9 +89,15 @@ export interface CommandTrees extends Trees {
 /**
  * Extended Refs interface with legacy method names for command compatibility.
  */
+/** A ref store that runs the reference-transaction hook (the files store). */
+interface TransactionHookStore {
+  setTransactionHook?(hook: RefTransactionHook | undefined): void;
+  getTransactionHook?(): RefTransactionHook | undefined;
+}
+
 export interface CommandRefs extends Refs {
   /** Delete a reference - alias for remove() */
-  delete(name: string): Promise<boolean>;
+  delete(name: string, options?: RefRemoveOptions): Promise<boolean>;
 }
 
 /**
@@ -138,7 +145,7 @@ function wrapTrees(trees: Trees): CommandTrees {
 function wrapRefs(refs: Refs): CommandRefs {
   const wrapper = refs as CommandRefs;
   if (!wrapper.delete) {
-    wrapper.delete = (name: string) => refs.remove(name);
+    wrapper.delete = (name: string, options?: RefRemoveOptions) => refs.remove(name, options);
   }
   return wrapper;
 }
@@ -301,6 +308,45 @@ export abstract class GitCommand<T> {
   constructor(workingCopy: WorkingCopy) {
     this._workingCopy = workingCopy;
     this.installAttributesSource();
+    this.releaseHooksAfterCalls();
+  }
+
+  /**
+   * Each entry point of the command (`call`, `callText`, ...) puts back the ref store's
+   * reference-transaction hook when it ends, whatever the outcome.
+   */
+  private releaseHooksAfterCalls(): void {
+    const self = this as unknown as Record<string, unknown>;
+    const names = new Set<string>();
+    for (
+      let proto = Object.getPrototypeOf(this);
+      proto && proto !== Object.prototype;
+      proto = Object.getPrototypeOf(proto)
+    ) {
+      for (const name of Object.getOwnPropertyNames(proto)) {
+        if (!/^call(?:[A-Z]\w*)?$/.test(name)) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+        if (typeof descriptor?.value === "function") names.add(name);
+      }
+    }
+    for (const name of names) {
+      const method = self[name];
+      if (typeof method !== "function") continue;
+      self[name] = (...args: unknown[]) => {
+        let result: unknown;
+        try {
+          result = (method as (...a: unknown[]) => unknown).apply(this, args);
+        } catch (error) {
+          this.releaseRefTransactionHook();
+          throw error;
+        }
+        if (result && typeof (result as Promise<unknown>).finally === "function") {
+          return (result as Promise<unknown>).finally(() => this.releaseRefTransactionHook());
+        }
+        this.releaseRefTransactionHook();
+        return result;
+      };
+    }
   }
 
   /**
@@ -695,46 +741,45 @@ export abstract class GitCommand<T> {
 
   /** The reference-transaction hook this command installs on its ref store (made once). */
   private refTransactionHook?: RefTransactionHook;
+  /** The store it is installed on, and the hook that was there before (put back at the end) */
+  private refTransactionInstalled?: {
+    store: TransactionHookStore;
+    previous: RefTransactionHook | undefined;
+  };
 
   /**
-   * git's reference-transaction hook (refs.c `run_transaction_hook`) on a ref store that
-   * supports it (the files store): told `preparing` (2.5x), `prepared`, `committed` or
-   * `aborted` with an `<old> <new> <ref>` line per update (git 2.43 lists a symbolic ref the
-   * update went through, HEAD, ahead of the ref it names; 2.5x leaves it out); a refusal in
-   * `preparing` or `prepared` aborts the transaction. The command that last touched the store
-   * gathers the hook's output.
+   * git's reference-transaction hook (see {@link refTransactionHookOf}) on a ref store that
+   * supports it (the files store), while this command runs: the hook that was there before
+   * is put back when the command's `call` ends ({@link releaseRefTransactionHook}), so a
+   * later write never routes its output to this command. A command without hooks (no
+   * runner) removes any hook left there.
    */
   private installRefTransactionHook(refs: Refs): void {
-    const store = refs as { setTransactionHook?(hook: RefTransactionHook | undefined): void };
+    const store = refs as TransactionHookStore;
     if (!store.setTransactionHook) return;
-    if (!this.hooks.enabled) return;
-    if (!this.refTransactionHook) {
-      const hooks = this.hooks;
-      this.refTransactionHook = async (state, updates) => {
-        const legacy = hooks.compatibility === "2.43";
-        if (state === "preparing" && legacy) return true;
-        const lines: string[] = [];
-        for (const u of updates) {
-          const zero = nullIdLike(u.new ?? u.old ?? undefined);
-          const line = (name: string) => `${u.old ?? zero} ${u.new ?? zero} ${name}\n`;
-          if (state === "preparing") lines.push(line(u.requested));
-          else {
-            if (legacy && u.requested !== u.name) lines.push(line(u.requested));
-            lines.push(line(u.name));
-          }
-        }
-        const result = await hooks.run("reference-transaction", {
-          args: [state],
-          stdin: lines.join(""),
-        });
-        if (!result || result.exitCode === 0 || state === "committed" || state === "aborted") {
-          return true;
-        }
-        // 2.43 dies with one message for every state
-        return legacy ? "ref updates aborted by hook" : false;
-      };
+    if (!this.hooks.enabled) {
+      if (!this.refTransactionInstalled) store.setTransactionHook(undefined);
+      return;
+    }
+    if (!this.refTransactionHook) this.refTransactionHook = refTransactionHookOf(this.hooks);
+    if (!this.refTransactionInstalled) {
+      this.refTransactionInstalled = { store, previous: store.getTransactionHook?.() };
     }
     store.setTransactionHook(this.refTransactionHook);
+  }
+
+  /**
+   * Puts back the reference-transaction hook the store had before this command installed
+   * its own (when its own is still the one installed).
+   */
+  protected releaseRefTransactionHook(): void {
+    const installed = this.refTransactionInstalled;
+    if (!installed) return;
+    this.refTransactionInstalled = undefined;
+    const current = installed.store.getTransactionHook?.();
+    if (current === undefined || current === this.refTransactionHook) {
+      installed.store.setTransactionHook?.(installed.previous);
+    }
   }
 
   /**

@@ -161,6 +161,27 @@ export async function pushToConnection(
   return result;
 }
 
+/**
+ * The updates in the order of git's ref list after `match_push_refs`: the remote's refs as
+ * advertised (sorted), then the refs the push creates in the order they were matched. git
+ * feeds the pre-push hook and sends the commands in that order (so pre-receive's stdin and
+ * the update hook calls follow it).
+ */
+function inRemoteRefOrder<T extends { remoteRef: string }>(
+  updates: T[],
+  remoteRefs: ReadonlyArray<{ name: string }>,
+): T[] {
+  const position = new Map<string, number>();
+  remoteRefs.forEach((r, i) => {
+    if (!position.has(r.name)) position.set(r.name, i);
+  });
+  const rank = (u: T) => position.get(u.remoteRef) ?? Number.MAX_SAFE_INTEGER;
+  return updates
+    .map((u, i) => ({ u, i }))
+    .sort((a, b) => rank(a.u) - rank(b.u) || a.i - b.i)
+    .map(({ u }) => u);
+}
+
 async function sendPack(
   connection: ReceivePackConnection,
   options: PushClientOptions,
@@ -223,10 +244,13 @@ async function sendPack(
       leases.set(m.remoteRef, expect ?? ZERO_OID);
     }
   }
-  const updates = await setPushStatus(matched, objectSource(repository), {
-    force: options.force,
-    leases,
-  });
+  const updates = inRemoteRefOrder(
+    await setPushStatus(matched, objectSource(repository), {
+      force: options.force,
+      leases,
+    }),
+    remoteRefs,
+  );
   if (options.prePush && !(await options.prePush(updates))) {
     throw new PushRefusedByHookError(updates);
   }

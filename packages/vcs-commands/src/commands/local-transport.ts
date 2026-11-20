@@ -5,6 +5,7 @@
  * duplex, where git spawns `git-upload-pack '<path>'`.
  */
 
+import type { RefTransactionHook } from "@statewalker/vcs-core";
 import {
   createRepositoryFacade,
   createTransportRefStore,
@@ -23,7 +24,7 @@ import {
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { LinkedWorktrees, OpenedRepository, WorkingCopy } from "@statewalker/vcs-working-tree";
 import { TransportError } from "../errors/index.js";
-import { HookSession, hookHostOf } from "./git-hooks.js";
+import { HookSession, hookHostOf, refTransactionHookOf } from "./git-hooks.js";
 import { ReadTreeCommand } from "./read-tree-command.js";
 import { StatusCommand } from "./status-command.js";
 import { usesBranch, worktreeUsingBranch } from "./worktree-support.js";
@@ -367,8 +368,41 @@ export async function withLocalReceivePack<T>(
   run: (connection: ReceivePackConnection) => Promise<T>,
   /** The remote repository's hooks ({@link remoteHookSession}): pre-receive, update, ... */
   hooks?: HookSession,
+  /**
+   * The session its reference-transaction hook runs in (default `hooks`): that hook's
+   * output reaches the pushing user's stderr directly, not as "remote: " lines
+   */
+  transactionHooks: HookSession | undefined = hooks,
 ): Promise<T> {
   const receiveHooks = hooks?.enabled ? scriptReceiveHooks(hooks) : undefined;
+  // the remote's reference-transaction hook on its ref store while receive-pack runs (its
+  // output goes to the pushing user's stderr directly, not through the side-band)
+  const store = remote.history.refs as {
+    setTransactionHook?(hook: RefTransactionHook | undefined): void;
+    getTransactionHook?(): RefTransactionHook | undefined;
+  };
+  const installHook = transactionHooks?.enabled && store.setTransactionHook !== undefined;
+  const previousHook = installHook ? store.getTransactionHook?.() : undefined;
+  const transactionHook =
+    installHook && transactionHooks
+      ? refTransactionHookOf(transactionHooks, { env: { GIT_DIR: "." }, prefix: false })
+      : undefined;
+  if (transactionHook) store.setTransactionHook?.(transactionHook);
+  try {
+    return await receiveOver(remote, run, hooks, receiveHooks);
+  } finally {
+    if (transactionHook && store.getTransactionHook?.() === transactionHook) {
+      store.setTransactionHook?.(previousHook);
+    }
+  }
+}
+
+async function receiveOver<T>(
+  remote: OpenedRepository,
+  run: (connection: ReceivePackConnection) => Promise<T>,
+  hooks: HookSession | undefined,
+  receiveHooks: ReceivePackHooks | undefined,
+): Promise<T> {
   const head = await remote.history.refs.get("HEAD").catch(() => undefined);
   const settings = serverSettingsOf(remote);
   const checkedOut = await checkedOutBranches(remote.worktrees);
@@ -388,6 +422,12 @@ export async function withLocalReceivePack<T>(
     shallowUpdate: settings.shallowUpdate,
     receivePackHideRefs: settings.receivePackHideRefs,
     ...(receiveHooks ? { hooks: receiveHooks, relayPostReceive: true } : {}),
+    // git's receive-pack migrates its quarantine before update() checks the commands
+    publishBeforeUpdate: true,
+    // git 2.5x updates the refs of a push that is not atomic in two batches
+    ...(hooks?.enabled && hooks.compatibility !== "2.43" ? { batchNonAtomic: true } : {}),
+    // ... git 2.43 updates each ref after its update hook
+    ...(hooks?.enabled && hooks.compatibility === "2.43" ? { interleaveUpdateHook: true } : {}),
     ...(checkedOut ? { checkedOutBranches: checkedOut } : {}),
     ...(worktrees
       ? {
@@ -398,13 +438,33 @@ export async function withLocalReceivePack<T>(
         }
       : {}),
   }).finally(() => server.close?.());
+  // receive-pack died (its reference-transaction hook aborted the update): its message on
+  // the shared stderr, then send-pack's, as git's local transport shows them
+  const died = async (cause?: unknown) => {
+    await client.close?.();
+    const served = await serving.catch(() => undefined);
+    if (!served?.error?.startsWith("fatal: ")) return undefined;
+    return new TransportError(
+      `${served.error}\nsend-pack: unexpected disconnect while reading sideband packet\n` +
+        "fatal: the remote end hung up unexpectedly",
+      undefined,
+      cause === undefined ? undefined : { cause },
+    );
+  };
   try {
     const connection = await openDuplexReceivePackConnection(client, { closeDuplex: true });
+    let value: T;
     try {
-      return await run(connection);
+      value = await run(connection);
     } finally {
       await connection.close();
     }
+    const death = await died();
+    if (death) throw death;
+    return value;
+  } catch (error) {
+    if (error instanceof TransportError) throw error;
+    throw (await died(error)) ?? error;
   } finally {
     await client.close?.();
     await serving.catch(() => undefined);

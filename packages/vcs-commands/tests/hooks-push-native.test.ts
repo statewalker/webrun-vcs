@@ -226,3 +226,185 @@ describeGit("push hooks: as native git", () => {
     }
   });
 });
+
+describeGit("push hooks: reference-transaction on the receive side (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-push-reftx-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** `<dir>/src` (main, other, gone) cloned bare to `<dir>/bare.git` (refs packed), then moved on. */
+  function reftxBase(dir: string): void {
+    const src = join(dir, "src");
+    mkdirSync(src, { recursive: true });
+    git(src, ["init", "-q", "-b", "main"]);
+    putFile(src, "a.txt", "a\n");
+    git(src, ["add", "-A"]);
+    git(src, ["commit", "-qm", "a"]);
+    git(src, ["branch", "other"]);
+    git(src, ["branch", "gone"]);
+    git(dir, ["clone", "-q", "--bare", "src", "bare.git"]);
+    putFile(src, "a.txt", "a2\n");
+    git(src, ["commit", "-qam", "a2"]);
+    git(src, ["checkout", "-q", "other"]);
+    putFile(src, "c.txt", "c\n");
+    git(src, ["add", "c.txt"]);
+    git(src, ["commit", "-qm", "c"]);
+    git(src, ["checkout", "-q", "main"]);
+    installHooks(join(dir, "bare.git/hooks"), ["reference-transaction"]);
+  }
+
+  /**
+   * Native `git push <args>` in one twin, ours in the other: the same hook log and refs of
+   * the bare repository, both failing or neither.
+   */
+  async function expectReftxPush(
+    dir: string,
+    args: string[],
+    setup: (p: PushCommand) => void,
+    label: string,
+    prepare?: (twin: HookTwin) => void,
+  ): Promise<{ native: { status: number | null; stderr: string }; error?: Error; output: string }> {
+    const [theirs, mine] = hookTwins(root, dir);
+    prepare?.(theirs);
+    prepare?.(mine);
+    const native = gitRun(root, join(theirs.dir, "src"), ["push", ...args], theirs.env);
+    const env = mine.env;
+    const ours = await openOurs(
+      mine.dir,
+      createNodeGitHostEnvironment({
+        env,
+        hookRunner: createNodeHookRunner({ env, compatibility: nativeIs25x ? "2.56" : "2.43" }),
+      }),
+      undefined,
+      "src",
+    );
+    const command = ours.push();
+    setup(command);
+    let error: Error | undefined;
+    let rejected = false;
+    try {
+      const result = await command.call();
+      rejected = result.remoteUpdates.some(
+        (u) => u.status !== PushStatus.OK && u.status !== PushStatus.UP_TO_DATE,
+      );
+    } catch (e) {
+      error = e as Error;
+    }
+    expect(logOf(mine), `${label}: log`).toBe(logOf(theirs));
+    expect(error !== undefined || rejected, `${label}: failed (${String(error)})`).toBe(
+      native.status !== 0,
+    );
+    expect(git(join(mine.dir, "bare.git"), ["for-each-ref"]), `${label}: refs`).toBe(
+      git(join(theirs.dir, "bare.git"), ["for-each-ref"]),
+    );
+    const output = error instanceof HookFailedError ? error.output : command.getHookOutput();
+    expect(hookLines(output), `${label}: hook output`).toBe(hookLines(native.stderr));
+    return { native, error, output };
+  }
+
+  it("an update, a forced update and a deletion: the remote's ref transactions", async () => {
+    const dir = join(root, "r");
+    reftxBase(dir);
+    await expectReftxPush(
+      dir,
+      ["--atomic", "-f", "../bare.git", "main", "+other", ":gone"],
+      (p) =>
+        p
+          .setRemote("../bare.git")
+          .setAtomic(true)
+          .setForce(true)
+          .add("main")
+          .add("+other")
+          .add(":gone"),
+      "atomic push",
+    );
+    await expectReftxPush(
+      dir,
+      ["-f", "../bare.git", "main", "+other", ":gone"],
+      (p) => p.setRemote("../bare.git").setForce(true).add("main").add("+other").add(":gone"),
+      "push",
+    );
+  });
+
+  it("commands go in git's order (the remote's refs as advertised, then new ones): pre-push, pre-receive and update see it", async () => {
+    const dir = join(root, "r");
+    reftxBase(dir);
+    installHooks(join(dir, "src/.git/hooks"), ["pre-push"]);
+    installHooks(join(dir, "bare.git/hooks"), RECEIVE_HOOKS);
+    await expectPush(
+      dir,
+      ["-f", "../bare.git", "main:refs/heads/znew", "other", "main:refs/heads/anew", "main"],
+      (p) =>
+        p
+          .setRemote("../bare.git")
+          .setForce(true)
+          .add("main:refs/heads/znew")
+          .add("other")
+          .add("main:refs/heads/anew")
+          .add("main"),
+      "order",
+    );
+  });
+
+  it("an update hook refusing an atomic push: no ref moves, the objects stay (migrated after pre-receive)", async () => {
+    const dir = join(root, "r");
+    reftxBase(dir);
+    installHooks(join(dir, "bare.git/hooks"), RECEIVE_HOOKS);
+    const objects = (t: HookTwin) =>
+      git(join(t.dir, "bare.git"), [
+        "cat-file",
+        "--batch-all-objects",
+        "--batch-check=%(objectname) %(objecttype)",
+      ]);
+    for (const atomic of [true, false]) {
+      const [theirs, mine] = hookTwins(root, dir);
+      for (const t of [theirs, mine]) hookExit(t, "update", 1);
+      const args = [...(atomic ? ["--atomic"] : []), "-f", "../bare.git", "main", "+other"];
+      const native = gitRun(root, join(theirs.dir, "src"), ["push", ...args], theirs.env);
+      expect(native.status).not.toBe(0);
+      const env = mine.env;
+      const ours = await openOurs(
+        mine.dir,
+        createNodeGitHostEnvironment({
+          env,
+          hookRunner: createNodeHookRunner({ env, compatibility: nativeIs25x ? "2.56" : "2.43" }),
+        }),
+        undefined,
+        "src",
+      );
+      const command = ours.push().setRemote("../bare.git").setForce(true).add("main").add("+other");
+      if (atomic) command.setAtomic(true);
+      const result = await command.call();
+      expect(result.remoteUpdates.every((u) => u.status !== PushStatus.OK)).toBe(true);
+      expect(logOf(mine), `atomic ${atomic}: log`).toBe(logOf(theirs));
+      expect(objects(mine), `atomic ${atomic}: objects`).toBe(objects(theirs));
+      expect(git(join(mine.dir, "bare.git"), ["for-each-ref"])).toBe(
+        git(join(theirs.dir, "bare.git"), ["for-each-ref"]),
+      );
+    }
+  });
+
+  it("a refusal in prepared: receive-pack dies, no ref moves", async () => {
+    const dir = join(root, "r");
+    reftxBase(dir);
+    const { native, error } = await expectReftxPush(
+      dir,
+      ["--atomic", "-f", "../bare.git", "main", "+other", ":gone"],
+      (p) =>
+        p
+          .setRemote("../bare.git")
+          .setAtomic(true)
+          .setForce(true)
+          .add("main")
+          .add("+other")
+          .add(":gone"),
+      "refused atomic push",
+      (t) => hookExit(t, "reference-transaction", 1),
+    );
+    expect(native.status).toBe(128);
+    const fatal = /^fatal: .*abort.*$/m.exec(native.stderr)?.[0] ?? "";
+    expect(fatal).not.toBe("");
+    expect(String(error?.message)).toContain(fatal);
+  });
+});

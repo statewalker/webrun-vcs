@@ -100,7 +100,9 @@ function runHook(
       child.stdin.end(Buffer.from(invocation.stdin));
     }
     child.on("close", (code, signal) => {
-      if (failed && code === null) {
+      // a spawn that failed (ENOENT, EACCES) closes with a negative errno as its code, or
+      // none: git's notify_start_failure either way
+      if (failed) {
         resolve({
           exitCode: 1,
           stdout: new Uint8Array(),

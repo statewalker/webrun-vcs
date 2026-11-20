@@ -105,9 +105,14 @@ export function hookLog(twin: HookTwin): string {
   return readFileSync(twin.log, "latin1").replaceAll(twin.dir, "<twin>");
 }
 
-/** Native git in a twin: exit status, stdout and stderr. */
-export function nativeIn(twin: HookTwin, root: string, args: string[]) {
-  return gitRun(root, twin.dir, args, twin.env);
+/** Native git in a twin (with `extra` variables): exit status, stdout and stderr. */
+export function nativeIn(
+  twin: HookTwin,
+  root: string,
+  args: string[],
+  extra: Record<string, string> = {},
+) {
+  return gitRun(root, twin.dir, args, { ...twin.env, ...extra });
 }
 
 /** The lines of a stderr that hooks wrote or that are hints about them. */

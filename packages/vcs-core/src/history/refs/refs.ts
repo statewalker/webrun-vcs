@@ -17,6 +17,7 @@ import type {
   BatchResult,
   RefCommand,
   RefLogOptions,
+  RefRemoveOptions,
   SymbolicRefLogOptions,
 } from "./ref-batch.js";
 import type { Ref, SymbolicRef } from "./ref-types.js";
@@ -129,9 +130,10 @@ export interface Refs {
    * Named 'remove' instead of 'delete' to match other store interfaces.
    *
    * @param name Reference name
+   * @param options How git's command removes it, where a store tells hooks about it
    * @returns True if removed, false if didn't exist
    */
-  remove(name: string): Promise<boolean>;
+  remove(name: string, options?: RefRemoveOptions): Promise<boolean>;
 
   /**
    * Apply all `commands` atomically, or none of them.
