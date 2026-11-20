@@ -540,7 +540,16 @@ export type IndexEntryInput = IndexEntryOptions;
 export async function rewriteIndex(
   staging: Staging,
   changes: Map<string, IndexEntryInput[]>,
-  options: { updateCacheTreeWith?: CommandTrees; cacheTree?: CacheTree } = {},
+  options: {
+    updateCacheTreeWith?: CommandTrees;
+    cacheTree?: CacheTree;
+    /**
+     * Whether the kept entries count as up to date (default true: the merge family refreshes
+     * the whole index first). False for a write without a refresh (`git apply --cached`):
+     * the write then smudges the racily clean entries it keeps, as `write_locked_index`
+     */
+    upToDate?: boolean;
+  } = {},
 ): Promise<void> {
   // the kept entries are in the index's order already: only the changes are sorted, then
   // both merged (git's order: the paths' bytes, then the stage)
@@ -588,7 +597,7 @@ export async function rewriteIndex(
   // the index is rewritten around the changed paths only: the kept entries count as up to
   // date (as after the whole-index refresh git runs first), so the write checks no untouched
   // racily clean file and the command reads only the paths it writes
-  await builder.finish({ upToDate: true });
+  await builder.finish({ upToDate: options.upToDate ?? true });
   // a cache-tree computed for the entries just built
   if (options.cacheTree) staging.setCacheTree?.(options.cacheTree);
   // unpack-trees' cache_tree_update before its index write

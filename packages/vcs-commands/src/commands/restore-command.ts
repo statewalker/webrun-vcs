@@ -20,8 +20,20 @@
 import type { ObjectId } from "@statewalker/vcs-core";
 import type { ConflictStyle } from "@statewalker/vcs-utils";
 
-import { InvalidArgumentError } from "../errors/index.js";
+import {
+  IncompatibleOptionsError,
+  InvalidArgumentError,
+  RefNotFoundError,
+} from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import {
+  type PatchCompatibility,
+  type PatchOptions,
+  type PatchSelector,
+  patchRevisionOf,
+  pathPatchMode,
+  runPatchSelection,
+} from "./add-patch/index.js";
 import {
   type CheckoutResult,
   type CheckoutStage,
@@ -45,6 +57,8 @@ import { globalPathspecMagic, parsePathspecFile } from "./pathspec.js";
 export class RestoreCommand extends GitCommand<CheckoutResult> {
   private readonly paths: string[] = [];
   private pathspecFromFile: string[] = [];
+  /** Whether `--pathspec-from-file` was given (an empty file included) */
+  private pathspecFileGiven = false;
   private source?: string;
   private staged?: boolean;
   private worktree?: boolean;
@@ -55,6 +69,131 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
   private conflictStyle?: ConflictStyle;
   private ignoreUnmerged = false;
   private quiet = false;
+  private patch = false;
+  private patchSelector?: PatchSelector;
+  private patchOptions: PatchOptions = {};
+  private patchCompatibility: PatchCompatibility = "2.56";
+
+  /**
+   * `git restore -p`: the differences between the source and the worktree (with
+   * `--staged`: the index; with both: index and worktree) are offered hunk by hunk, as
+   * git's add-patch.c does, and the selected hunks restored. Without a source the worktree
+   * is compared with the index ("Discard this hunk from worktree"); `--staged` alone takes
+   * HEAD ("Unstage this hunk"). The prompts are answered by {@link setPatchSelector}; the
+   * result's `patch` carries git's transcript. No post-checkout hook runs.
+   *
+   * @example
+   * ```typescript
+   * const answers = ["y", "n"];
+   * const { patch } = await git.restore().setStaged(true).setPatch(true)
+   *   .setPatchSelector(() => answers.shift()).call();
+   * ```
+   */
+  setPatch(patch: boolean): this {
+    this.checkCallable();
+    this.patch = patch;
+    return this;
+  }
+
+  /** Answers the prompts of {@link setPatch}. */
+  setPatchSelector(selector: PatchSelector): this {
+    this.checkCallable();
+    this.patchSelector = selector;
+    return this;
+  }
+
+  /** `-U<n>`, `--inter-hunk-context=<n>` and `--no-auto-advance` of {@link setPatch}. */
+  setPatchOptions(options: PatchOptions): this {
+    this.checkCallable();
+    this.patchOptions = { ...options };
+    return this;
+  }
+
+  /** The git version whose prompts {@link setPatch} reproduces (default 2.56). */
+  setCompatibility(version: PatchCompatibility): this {
+    this.checkCallable();
+    this.patchCompatibility = version;
+    return this;
+  }
+
+  /** `git restore -p`: run_add_p with the mode of what is restored. */
+  private async callPatch(): Promise<CheckoutResult> {
+    if (this.overlay) {
+      throw new InvalidArgumentError(
+        "overlay",
+        true,
+        "fatal: options '-p' and '--overlay' cannot be used together",
+      );
+    }
+    // checkout_main: --staged and --worktree default to "worktree only"; --staged implies
+    // --source=HEAD
+    const index = this.staged === true;
+    const worktree = this.worktree ?? !index;
+    if (!index && !worktree) {
+      throw new InvalidArgumentError(
+        "worktree",
+        false,
+        "fatal: you must specify path(s) to restore",
+      );
+    }
+    const source = this.source ?? (index ? "HEAD" : undefined);
+    // checkout_main resolves the source first (an unborn HEAD included: unlike reset -p,
+    // restore has no empty-tree fallback)
+    if (source !== undefined) await this.resolvePatchSource(source);
+    if (this.pathspecFileGiven) {
+      if (this.paths.length > 0) {
+        throw new InvalidArgumentError(
+          "pathspecFromFile",
+          this.pathspecFromFile,
+          "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together",
+        );
+      }
+      throw new IncompatibleOptionsError(
+        ["--pathspec-from-file", "--patch"],
+        "fatal: options '--pathspec-from-file' and '--patch' cannot be used together",
+      );
+    }
+    const { revision, diffRevision } = await patchRevisionOf(source, {
+      headId: async () => (await this.refsStore.resolve("HEAD"))?.objectId,
+      resolve: (name) => this.resolveRevision(name),
+      peelCommit: (id) => this.revisionResolver().peelToType(id, "commit"),
+    });
+    const patch = await runPatchSelection(this.workingCopy, {
+      hookSource: this,
+      ...this.patchOptions,
+      mode: pathPatchMode(index, worktree, revision),
+      selector: this.patchSelector,
+      ...(diffRevision !== undefined ? { diffRevision } : {}),
+      paths: [...this.pathspecFromFile, ...this.paths],
+      compatibility: this.patchCompatibility,
+    });
+    return {
+      status: CheckoutStatus.OK,
+      updated: patch.applied,
+      removed: [],
+      conflicts: [],
+      ref: null,
+      patch,
+    };
+  }
+
+  /** `repo_get_oid_mb(from_treeish)`: dies "could not resolve" for a name naming nothing. */
+  private async resolvePatchSource(source: string): Promise<void> {
+    const rev = source === "@" ? "HEAD" : source;
+    let found: boolean;
+    try {
+      found =
+        rev === "HEAD"
+          ? (await this.refsStore.resolve("HEAD"))?.objectId !== undefined
+          : (await this.resolveRevision(rev)) !== undefined;
+    } catch (error) {
+      if (!(error instanceof RefNotFoundError)) throw error;
+      found = false;
+    }
+    // (2.43 printed the name without quotes)
+    const name = this.patchCompatibility === "2.43" ? source : `'${source}'`;
+    if (!found) throw new RefNotFoundError(source, `fatal: could not resolve ${name}`);
+  }
 
   /** Adds a pathspec element (wildcards and magic as git reads them). */
   addPath(path: string): this {
@@ -66,6 +205,7 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
   /** `--pathspec-from-file` (and `--pathspec-file-nul` with `nul`): the elements of `content`. */
   setPathspecFromFile(content: string | Uint8Array, nul = false): this {
     this.checkCallable();
+    this.pathspecFileGiven = true;
     try {
       this.pathspecFromFile = parsePathspecFile(content, nul);
     } catch (error) {
@@ -152,6 +292,7 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
     this.checkCallable();
     this.setCallable(false);
     await this.readCurrentIndex();
+    if (this.patch) return this.callPatch();
     if (this.paths.length > 0 && this.pathspecFromFile.length > 0) {
       throw new InvalidArgumentError(
         "pathspecFromFile",

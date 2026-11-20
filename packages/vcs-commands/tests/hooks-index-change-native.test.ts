@@ -6,13 +6,21 @@
  * sparse-checkout). `commit -a` runs it while `index.lock` is held. Each case runs native
  * git in one copy of a repository with a logging hook and ours in the other.
  */
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { type Git, ResetMode } from "../src/index.js";
-import { hookLog, hookTwins, installHooks, nativeIn, oursIn } from "./hooks-native-support.js";
+import {
+  hookLog,
+  hookTwins,
+  installHooks,
+  nativeIn,
+  nativeIs25x,
+  oursIn,
+} from "./hooks-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
 
@@ -125,5 +133,48 @@ describeGit("post-index-change hook: as native git", () => {
     await expectTwins(dir, ["sparse-checkout", "disable"], (g) =>
       g.sparseCheckout().setArguments(["disable"]).call(),
     );
+  });
+
+  it("add -p: the refresh and each apply run it, their output on stderr", async () => {
+    // add-patch.c refreshes the index before the selection and after each file's
+    // `git apply --cached` (itself a write); the hook's stdout goes to stderr too
+    const dir = base();
+    writeFileSync(
+      join(dir, ".git/hooks/post-index-change"),
+      `#!/bin/sh\nprintf '== %s %s\\n' "$1" "$2" >> "$HOOK_LOG"\necho "hook $1 $2 out"\necho "hook $1 $2 err" >&2\n`,
+      { mode: 0o755 },
+    );
+    const twenty = Array.from({ length: 20 }, (_, i) => `${i + 1}\n`).join("");
+    putFile(dir, "a.txt", twenty);
+    git(dir, ["add", "a.txt"]);
+    git(dir, ["commit", "-qm", "twenty"]);
+    const [theirs, mine] = hookTwins(root, dir);
+    for (const d of [theirs.dir, mine.dir]) {
+      putFile(d, "a.txt", twenty.replace("2\n", "two\n").replace("18\n", "eighteen\n"));
+      putFile(d, "d/f.txt", "f\ng\n");
+    }
+    const answers = ["y", "n", "y"];
+    const native = spawnSync(
+      "git",
+      ["-c", "color.ui=false", "-c", "interactive.singleKey=false", "add", "-p"],
+      {
+        cwd: theirs.dir,
+        env: theirs.env,
+        input: answers.map((a) => `${a}\n`).join(""),
+        encoding: "utf8",
+      },
+    );
+    expect(native.status, native.stderr).toBe(0);
+    const queue = [...answers];
+    const add = (await oursIn(mine))
+      .add()
+      .setPatch(true)
+      .setPatchSelector(() => queue.shift())
+      .setCompatibility(nativeIs25x ? "2.56" : "2.43");
+    const result = await add.call();
+    expect(result.patch?.output).toBe(native.stdout);
+    expect(`${result.patch?.errors ?? ""}${add.getHookOutput()}`).toBe(native.stderr);
+    expect(hookLog(mine)).toBe(hookLog(theirs));
+    expect(git(mine.dir, ["ls-files", "-s"])).toBe(git(theirs.dir, ["ls-files", "-s"]));
   });
 });
