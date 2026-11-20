@@ -16,6 +16,7 @@ export default defineConfig({
     /^@statewalker\/vcs-core/,
     /^@statewalker\/vcs-utils/,
     /^@statewalker\/webrun-http-streams/,
+    /^@statewalker\/webrun-rpc/,
     /^@statewalker\/webrun-streams/,
   ],
   treeshake: true,

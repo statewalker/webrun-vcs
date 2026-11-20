@@ -23,6 +23,9 @@ export type MessagePortFetchOptions = Omit<FetchClientOptions, "repository" | "r
  * The MessagePort should be connected to a server running
  * messagePortServe() on the other end.
  *
+ * @deprecated Runs over the sentinel-based `createMessagePortDuplex` (no backpressure).
+ *   Use `messagePortDuplex` / `serveGitOverPort` (or `createMessagePortConnector` with the
+ *   porcelain commands) instead.
  * @param port - MessagePort connected to the server
  * @param repository - Repository facade for pack import/export
  * @param refStore - Ref store for reading/writing refs

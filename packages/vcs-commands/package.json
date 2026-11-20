@@ -66,9 +66,12 @@
     "@statewalker/vcs-transport-adapters": "workspace:^",
     "@statewalker/vcs-transport-lfs": "workspace:^",
     "@statewalker/vcs-utils-node": "workspace:^",
+    "@statewalker/webrun-rpc": "catalog:",
     "@types/node": "catalog:",
+    "@types/ws": "catalog:",
     "rolldown": "catalog:",
     "typescript": "catalog:",
-    "vitest": "catalog:"
+    "vitest": "catalog:",
+    "ws": "catalog:"
   }
 }
