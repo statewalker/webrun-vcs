@@ -16,7 +16,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { PatchRequest, PatchResult } from "../src/commands/add-patch/index.js";
 import type { Git } from "../src/index.js";
-import { gitOk, openOurs, put, snapshot } from "./merge-native-helpers.js";
+import { gitOk, git as gitRun, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
 
@@ -338,11 +338,10 @@ describeGit("reset -p, checkout -p, restore -p, stash -p as native git", () => {
     const build = (dir: string) => {
       threeHunks(dir);
       gitOk(root, dir, "add", ".");
-      // a size of its own: no racily clean entry for the index writes to keep
       put(
         dir,
         "f",
-        twenty.replace("2\n", "TWOO\n").replace("4\n", "four\n").replace("18\n", "eighteen\n"),
+        twenty.replace("2\n", "TWO\n").replace("4\n", "four\n").replace("18\n", "eighteen\n"),
       );
     };
     const answers = ["y", "n", "n", "y"];
@@ -518,5 +517,172 @@ describeGit("patch mode details as native git", () => {
             .call()
         ).patch,
     );
+  });
+});
+
+describeGit("patch mode refreshes, conflicts and errors as native git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "add-patch-native-"));
+    modern = gitAtLeast(gitOk(root, root, "--version"), 2, 50);
+    compat = modern ? "2.56" : "2.43";
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** A merge stopped on a conflict in `f`, and an unstaged change of `g`. */
+  const conflicted = (dir: string) => {
+    put(dir, "f", "a\nb\nc\n");
+    put(dir, "g", "1\n2\n3\n4\n5\n6\n7\n8\n9\n");
+    gitOk(root, dir, "add", ".");
+    gitOk(root, dir, "commit", "-qm", "base");
+    gitOk(root, dir, "checkout", "-qb", "side");
+    put(dir, "f", "a\nSIDE\nc\n");
+    gitOk(root, dir, "commit", "-qam", "side");
+    gitOk(root, dir, "checkout", "-q", "main");
+    put(dir, "f", "a\nMAIN\nc\n");
+    gitOk(root, dir, "commit", "-qam", "main");
+    expect(gitRun(root, dir, "merge", "side").status).toBe(1);
+    put(dir, "g", "1\n2\nthree\n4\n5\n6\n7\n8\nnine\n");
+  };
+
+  it("refreshes the index (needs merge) and passes over unmerged paths", async () => {
+    // diff-files shows the conflicted path as a combined diff: no hunk to offer
+    const answers = ["y", "s", "y", "y", "y"];
+    await compare(twins(conflicted), ["add", "-p"], answers, add(answers));
+    await compare(
+      twins(conflicted),
+      ["checkout", "-p"],
+      answers,
+      async (git, select) =>
+        (
+          await git
+            .checkout()
+            .setPatch(true)
+            .setPatchSelector(select)
+            .setCompatibility(compat)
+            .call()
+        ).patch,
+    );
+    // diff-index against HEAD offers the conflicted file as it is in the worktree
+    await compare(
+      twins(conflicted),
+      ["checkout", "-p", "HEAD"],
+      ["n", "y"],
+      async (git, select) =>
+        (
+          await git
+            .checkout()
+            .setStartPoint("HEAD")
+            .setPatch(true)
+            .setPatchSelector(select)
+            .setCompatibility(compat)
+            .call()
+        ).patch,
+    );
+    // reset -p is index-only: no refresh before the diff
+    const staged = (dir: string) => {
+      conflicted(dir);
+      gitOk(root, dir, "add", "g");
+    };
+    await compare(twins(staged), ["reset", "-p"], ["y"], async (git, select) => {
+      const reset = git.reset().setPatch(true).setPatchSelector(select).setCompatibility(compat);
+      await reset.call();
+      return reset.getPatchResult();
+    });
+  });
+
+  it("stash push -p diffs HEAD's paths only (a path removed from the index alone)", async () => {
+    const build = (dir: string) => {
+      put(dir, "f", "a\nb\nc\n");
+      put(dir, "g", "x\n");
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-qm", "base");
+      // f stays in the worktree, unchanged
+      gitOk(root, dir, "rm", "-q", "--cached", "f");
+      put(dir, "g", "x\ny\n");
+    };
+    await compare(twins(build), ["stash", "push", "-p"], ["y", "y", "y"], async (git, select) => {
+      const cmd = git
+        .stashCreate()
+        .setPatch(true)
+        .setPatchSelector(select)
+        .setCompatibility(compat);
+      await cmd.call();
+      return cmd.getPatchResult();
+    });
+  });
+
+  it("splits a decided hunk (2.43 keeps the decision, 2.5x asks again)", async () => {
+    await compare(twins(threeHunks), ["add", "-p"], ["y", "K", "s", "q"], add([]));
+    await compare(twins(threeHunks), ["add", "-p"], ["y", "K", "s", "n", "y", "q"], add([]));
+  });
+
+  it("reports hunks that fail to merge and still runs git apply --check", async () => {
+    const build = (dir: string) => {
+      put(dir, "f", "1\n2\n3\n4\n5\n6\n7\n8\n9\n");
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-qm", "base");
+      put(dir, "f", "1\nTWO\n3\n4\n5\n6\n7\n8\nNINE\n");
+      gitOk(root, dir, "add", "f");
+    };
+    const resetRun = async (git: Git, select: ReturnType<typeof selector>) => {
+      const reset = git.reset().setPatch(true).setPatchSelector(select).setCompatibility(compat);
+      await reset.call();
+      return reset.getPatchResult();
+    };
+    const addLine: Edit = {
+      sed: "s/^ 3$/+extra\\n 3/",
+      js: (t) => t.replace(/^ 3$/m, "+extra\n 3"),
+    };
+    await compare(twins(build), ["reset", "-p"], ["s", "e", "n"], resetRun, [addLine]);
+    // the edited first part no longer ends with the second's leading context
+    const delCtx: Edit = { sed: "/^ 4$/d", js: (t) => t.replace(/^ 4\n/m, "") };
+    const { n } = await compare(twins(build), ["reset", "-p"], ["s", "e", "y", "y"], resetRun, [
+      delCtx,
+      addLine,
+    ]);
+    expect(n.stderr).toContain("error: hunks do not overlap");
+    expect(n.stderr).toContain("error: patch failed: f:1");
+  });
+
+  it("refuses --pathspec-from-file with -p, and restore -p --staged on an unborn branch", async () => {
+    const dir = join(root, `refuse${counter++}`);
+    gitOk(root, root, "init", "-q", "-b", "main", dir);
+    put(dir, "f", "a\n");
+    put(dir, "list", "f\n");
+    gitOk(root, dir, "add", "f");
+    const fatal = (...args: string[]) => {
+      const r = gitRun(root, dir, ...args);
+      expect(r.status).toBe(128);
+      return r.stderr.trim();
+    };
+    const git = await openOurs(dir);
+    const never = () => undefined;
+    await expect(
+      git
+        .restore()
+        .setStaged(true)
+        .setPatch(true)
+        .setPatchSelector(never)
+        .setCompatibility(compat)
+        .call(),
+    ).rejects.toThrow(fatal("restore", "-p", "--staged"));
+    await expect(
+      git.reset().setPathspecFromFile("f\n").setPatch(true).setPatchSelector(never).call(),
+    ).rejects.toThrow(fatal("reset", "-p", "--pathspec-from-file=list"));
+    await expect(
+      git.checkout().setPathspecFromFile("f\n").setPatch(true).setPatchSelector(never).call(),
+    ).rejects.toThrow(fatal("checkout", "-p", "--pathspec-from-file=list"));
+    await expect(
+      git
+        .checkout()
+        .setPathspecFromFile("f\n")
+        .addPath("f")
+        .setPatch(true)
+        .setPatchSelector(never)
+        .call(),
+    ).rejects.toThrow(fatal("checkout", "-p", "--pathspec-from-file=list", "f"));
+    await expect(
+      git.restore().setPathspecFromFile("f\n").setPatch(true).setPatchSelector(never).call(),
+    ).rejects.toThrow(fatal("restore", "-p", "--pathspec-from-file=list"));
   });
 });

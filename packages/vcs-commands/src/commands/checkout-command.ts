@@ -49,6 +49,7 @@ import {
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import {
+  IncompatibleOptionsError,
   InvalidArgumentError,
   InvalidRefNameError,
   MissingArgumentError,
@@ -271,6 +272,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private quiet = false;
   private countCheckoutPaths = false;
   private pathspecFromFile: string[] = [];
+  /** Whether `--pathspec-from-file` was given (an empty file included) */
+  private pathspecFileGiven = false;
   /** Set by a `merge` checkout the two-way merge refused: what the autostash needs */
   private autostashSwitch?: { label: string; base: string };
 
@@ -605,6 +608,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
    */
   setPathspecFromFile(content: string | Uint8Array, nul = false): this {
     this.checkCallable();
+    this.pathspecFileGiven = true;
     try {
       this.pathspecFromFile = parsePathspecFile(content, nul);
     } catch (error) {
@@ -665,6 +669,22 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     return this;
   }
 
+  /** checkout_main's checks of `--pathspec-from-file` with `-p`. */
+  private refusePathspecFileWithPatch(): void {
+    if (!this.pathspecFileGiven) return;
+    if (this.paths.length > 0) {
+      throw new InvalidArgumentError(
+        "pathspecFromFile",
+        this.pathspecFromFile,
+        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together",
+      );
+    }
+    throw new IncompatibleOptionsError(
+      ["--pathspec-from-file", "--patch"],
+      "fatal: options '--pathspec-from-file' and '--patch' cannot be used together",
+    );
+  }
+
   /** `git checkout -p`: run_add_p(ADD_P_CHECKOUT, rev). */
   private async callPatch(): Promise<CheckoutResult> {
     if (this.overlay === true) {
@@ -674,6 +694,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         "fatal: options '-p' and '--overlay' cannot be used together",
       );
     }
+    this.refusePathspecFileWithPatch();
     const { revision, diffRevision } = await patchRevisionOf(this.startPoint ?? this.name, {
       headId: async () => (await this.refsStore.resolve("HEAD"))?.objectId,
       resolve: (name) => this.resolveRevision(name),

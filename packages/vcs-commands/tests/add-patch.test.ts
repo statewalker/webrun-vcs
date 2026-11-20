@@ -116,4 +116,56 @@ index 0ff3bbb..5ecd119 100644
     });
     expect(legacy.errors).toBe("No changes.\n");
   });
+
+  it("shows the patch as a last resort when only the worktree refuses it (2.43: stderr)", async () => {
+    for (const compatibility of ["2.56", "2.43"] as const) {
+      const b = {
+        diff: async () => DIFF,
+        apply: async (_patch: string, args: { cached: boolean; check?: boolean }) => ({
+          ok: args.cached,
+          errors: "",
+        }),
+      };
+      const result = await runAddPatch({
+        mode: patchModeFor("checkout", "HEAD"),
+        backend: b,
+        compatibility,
+        selector: () => "y",
+      });
+      const count = (text: string) => text.split("diff --git a/f b/f\n").length - 1;
+      // the file's header as prompted, then the patch shown
+      expect([count(result.output), count(result.errors)]).toEqual(
+        compatibility === "2.43" ? [1, 1] : [2, 0],
+      );
+    }
+  });
+
+  it("refreshes the index before the diff (not in index-only modes) and after each apply", async () => {
+    const calls: string[] = [];
+    const make = () => ({
+      ...backend(DIFF),
+      diff: async () => {
+        calls.push("diff");
+        return DIFF;
+      },
+      refresh: async () => {
+        calls.push("refresh");
+        return "u: needs merge\n";
+      },
+    });
+    const staged = await runAddPatch({
+      mode: PATCH_MODES.stage,
+      backend: make(),
+      selector: () => "a",
+    });
+    expect(calls).toEqual(["refresh", "diff", "refresh"]);
+    expect(staged.output.startsWith("u: needs merge\ndiff --git")).toBe(true);
+    calls.length = 0;
+    await runAddPatch({
+      mode: patchModeFor("reset", "HEAD"),
+      backend: make(),
+      selector: () => "a",
+    });
+    expect(calls).toEqual(["diff", "refresh"]);
+  });
 });

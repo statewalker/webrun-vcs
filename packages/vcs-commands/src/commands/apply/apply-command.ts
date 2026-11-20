@@ -521,7 +521,9 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
           })),
         );
       }
-      await rewriteIndex(staging, changes);
+      // apply.c writes the index it read without refreshing it: the racily clean entries it
+      // keeps are smudged by the write
+      await rewriteIndex(staging, changes, { upToDate: false });
     }
     return {
       status,

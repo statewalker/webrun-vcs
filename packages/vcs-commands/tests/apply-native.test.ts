@@ -923,6 +923,41 @@ describeGit("git apply as native git", () => {
       "missing",
     );
   });
+
+  it("smudges the racily clean entries an --cached write keeps (no refresh first)", async () => {
+    // f is rewritten in place after `git add`, same size, same mtime second as the index:
+    // apply.c writes the index without refreshing, so the write smudges f's entry (size 0)
+    // and status then sees f modified in the worktree
+    const build = (dir: string) => {
+      gitOk(dir, "config", "core.trustctime", "false");
+      put(dir, "f", "one\ntwo\n");
+      put(dir, "g", "x\n");
+      gitOk(dir, "add", ".");
+      gitOk(dir, "commit", "-qm", "base");
+      const t = Math.floor(Date.now() / 1000) - 100;
+      put(dir, "f", "one\nTWO\n");
+      utimesSync(join(dir, "f"), t, t);
+      gitOk(dir, "add", "f");
+      writeFileSync(join(dir, "f"), "one\nthr\n");
+      utimesSync(join(dir, "f"), t, t);
+      utimesSync(join(dir, ".git/index"), t, t);
+    };
+    const patch = "diff --git a/g b/g\n--- a/g\n+++ b/g\n@@ -1 +1,2 @@\n x\n+y\n";
+    const dirs = twins(build);
+    expect(git(dirs.native, ["apply", "--cached"], patch).status).toBe(0);
+    const ours = await (await open(dirs.ours))
+      .apply()
+      .addPatch(new TextEncoder().encode(patch))
+      .setCached(true)
+      .call();
+    expect(ours.exitCode).toBe(0);
+    const state = (dir: string) => ({
+      size: /size: (\d+)/.exec(gitOk(dir, "ls-files", "--debug", "f"))?.[1],
+      status: gitOk(dir, "status", "--porcelain"),
+    });
+    expect(state(dirs.native).status).toBe("MM f\nMM g\n");
+    expect(state(dirs.ours)).toEqual(state(dirs.native));
+  });
 });
 
 /** Our command configured as native `git apply <args>`. */

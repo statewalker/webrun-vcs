@@ -20,7 +20,11 @@
 import type { ObjectId } from "@statewalker/vcs-core";
 import type { ConflictStyle } from "@statewalker/vcs-utils";
 
-import { InvalidArgumentError } from "../errors/index.js";
+import {
+  IncompatibleOptionsError,
+  InvalidArgumentError,
+  RefNotFoundError,
+} from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import {
   type PatchCompatibility,
@@ -53,6 +57,8 @@ import { globalPathspecMagic, parsePathspecFile } from "./pathspec.js";
 export class RestoreCommand extends GitCommand<CheckoutResult> {
   private readonly paths: string[] = [];
   private pathspecFromFile: string[] = [];
+  /** Whether `--pathspec-from-file` was given (an empty file included) */
+  private pathspecFileGiven = false;
   private source?: string;
   private staged?: boolean;
   private worktree?: boolean;
@@ -131,6 +137,22 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
       );
     }
     const source = this.source ?? (index ? "HEAD" : undefined);
+    // checkout_main resolves the source first (an unborn HEAD included: unlike reset -p,
+    // restore has no empty-tree fallback)
+    if (source !== undefined) await this.resolvePatchSource(source);
+    if (this.pathspecFileGiven) {
+      if (this.paths.length > 0) {
+        throw new InvalidArgumentError(
+          "pathspecFromFile",
+          this.pathspecFromFile,
+          "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together",
+        );
+      }
+      throw new IncompatibleOptionsError(
+        ["--pathspec-from-file", "--patch"],
+        "fatal: options '--pathspec-from-file' and '--patch' cannot be used together",
+      );
+    }
     const { revision, diffRevision } = await patchRevisionOf(source, {
       headId: async () => (await this.refsStore.resolve("HEAD"))?.objectId,
       resolve: (name) => this.resolveRevision(name),
@@ -154,6 +176,24 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
     };
   }
 
+  /** `repo_get_oid_mb(from_treeish)`: dies "could not resolve" for a name naming nothing. */
+  private async resolvePatchSource(source: string): Promise<void> {
+    const rev = source === "@" ? "HEAD" : source;
+    let found: boolean;
+    try {
+      found =
+        rev === "HEAD"
+          ? (await this.refsStore.resolve("HEAD"))?.objectId !== undefined
+          : (await this.resolveRevision(rev)) !== undefined;
+    } catch (error) {
+      if (!(error instanceof RefNotFoundError)) throw error;
+      found = false;
+    }
+    // (2.43 printed the name without quotes)
+    const name = this.patchCompatibility === "2.43" ? source : `'${source}'`;
+    if (!found) throw new RefNotFoundError(source, `fatal: could not resolve ${name}`);
+  }
+
   /** Adds a pathspec element (wildcards and magic as git reads them). */
   addPath(path: string): this {
     this.checkCallable();
@@ -164,6 +204,7 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
   /** `--pathspec-from-file` (and `--pathspec-file-nul` with `nul`): the elements of `content`. */
   setPathspecFromFile(content: string | Uint8Array, nul = false): this {
     this.checkCallable();
+    this.pathspecFileGiven = true;
     try {
       this.pathspecFromFile = parsePathspecFile(content, nul);
     } catch (error) {

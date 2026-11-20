@@ -102,6 +102,8 @@ export class ResetCommand extends GitCommand<Ref> {
   private mode = ResetMode.MIXED;
   private paths: string[] = [];
   private pathspecFromFile: string[] = [];
+  /** Whether `--pathspec-from-file` was given (an empty file included) */
+  private pathspecFileGiven = false;
   private modeSet = false;
   private intentToAdd = false;
   private quiet = false;
@@ -297,6 +299,7 @@ export class ResetCommand extends GitCommand<Ref> {
    */
   setPathspecFromFile(content: string | Uint8Array, nul = false): this {
     this.checkCallable();
+    this.pathspecFileGiven = true;
     try {
       this.pathspecFromFile = parsePathspecFile(content, nul);
     } catch (error) {
@@ -328,6 +331,11 @@ export class ResetCommand extends GitCommand<Ref> {
     // unwritten edits (refused)
     await this.readCurrentIndex();
 
+    if (this.pathspecFileGiven && this.patch)
+      throw new IncompatibleOptionsError(
+        ["--pathspec-from-file", "--patch"],
+        "fatal: options '--pathspec-from-file' and '--patch' cannot be used together",
+      );
     if (this.paths.length > 0 && this.pathspecFromFile.length > 0) {
       throw new InvalidArgumentError(
         "pathspecFromFile",

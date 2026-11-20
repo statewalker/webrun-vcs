@@ -13,6 +13,7 @@ import {
   expandUserPath,
   type GitHostEnvironment,
   readCleanContent,
+  type Staging,
   smudgeContent,
   type Worktree,
   type WorktreeEntry,
@@ -358,6 +359,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private textOptions: DiffTextOptions = {};
   /** `--ignore-submodules=<when>`: overrides the submodule configuration */
   private ignoreSubmodulesOverride?: SubmoduleIgnoreMode;
+  /** The index read instead of the working copy's (see {@link setTemporaryIndex}) */
+  private temporaryIndex?: Staging;
 
   /**
    * Set the old (base) tree/commit for comparison.
@@ -472,6 +475,20 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.checkCallable();
     this.cached = cached;
     return this;
+  }
+
+  /**
+   * Reads `index` instead of the working copy's index, as git run with `GIT_INDEX_FILE`
+   * pointing at a temporary index (`stash -p`'s index of HEAD's tree). The diff only reads it.
+   */
+  setTemporaryIndex(index: Staging): this {
+    this.checkCallable();
+    this.temporaryIndex = index;
+    return this;
+  }
+
+  protected override get staging(): Staging {
+    return this.temporaryIndex ?? super.staging;
   }
 
   /**

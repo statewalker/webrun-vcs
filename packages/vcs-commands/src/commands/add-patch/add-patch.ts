@@ -11,7 +11,7 @@
 
 import { compilePosixRegex, PosixRegexError } from "@statewalker/vcs-utils";
 
-import { latin1ToBytes, latin1ToPath, pathToLatin1 } from "../apply/latin1.js";
+import { latin1ToBytes, latin1ToPath, pathToLatin1 } from "../apply/index.js";
 import type { PatchApplyArgs, PatchMode, PatchPromptKind } from "./patch-modes.js";
 import { promptIndex } from "./patch-modes.js";
 
@@ -97,6 +97,12 @@ export interface PatchBackend {
     patch: string,
     args: PatchApplyArgs & { check?: boolean },
   ): Promise<{ ok: boolean; errors: string }>;
+  /**
+   * `repo_refresh_and_write_index` of the index the selection works on: refreshed and
+   * written, what it prints on standard output (`<path>: needs merge`) handed back. None for
+   * an index whose refresh shows nothing (`stash -p`'s temporary one).
+   */
+  refresh?(): Promise<string>;
 }
 
 /** Options of {@link runAddPatch}. */
@@ -244,8 +250,22 @@ class AddPatchState {
     return latin1ToPath(latin1);
   }
 
+  /** repo_refresh_and_write_index through the backend, its lines printed */
+  private async refresh(): Promise<void> {
+    const refresh = this.options.backend.refresh;
+    if (refresh) this.out += pathToLatin1(await refresh.call(this.options.backend));
+  }
+
+  /** The marker of the line at `at`: 2.5x's `normalize_marker`, 2.43's byte as it is */
+  private marker(at: number): string {
+    return this.modern ? markerAt(this.plain, at) : (this.plain[at] ?? "");
+  }
+
   async run(): Promise<PatchResult> {
-    this.plain = await this.options.backend.diff();
+    const backend = this.options.backend;
+    // run_add_p: every mode but the index-only ones refreshes the index first
+    if (!this.mode.indexOnly && backend.refresh) await this.refresh();
+    this.plain = await backend.diff();
     if (this.plain.length > 0 && !this.plain.endsWith("\n")) this.plain += "\n";
     this.parseDiff();
     const nr = this.files.length;
@@ -331,7 +351,7 @@ class AddPatchState {
     while (p !== pend) {
       let eol = plain.indexOf("\n", p);
       if (eol < 0) eol = pend;
-      const ch = markerAt(plain, p);
+      const ch = this.marker(p);
       let modeChange = false;
       const atHead = file !== undefined && hunk === file.head;
       if (plain.startsWith("diff ", p) || plain.startsWith("* Unmerged path ", p)) {
@@ -417,7 +437,11 @@ class AddPatchState {
     return eol < 0 ? this.plain.length : eol + 1;
   }
 
-  /** merge_hunks: coalesces hunks that were split again; the merged hunk or undefined */
+  /**
+   * merge_hunks: coalesces hunks that were split again; the merged hunk, or undefined when
+   * none merged. On an error (git's `return error(...)`, which its caller takes as merged)
+   * the hunk merged so far comes back and `index` stays: the next hunk is rendered on its own.
+   */
   private mergeHunks(file: FileDiff, index: { i: number }, useAll: boolean): Hunk | undefined {
     let i = index.i;
     let hunk = file.hunks[i];
@@ -448,11 +472,11 @@ class AddPatchState {
           if (overlapNext > hunk.end) {
             throw new PatchError(`failed to find ${overlappingLineCount} context lines`);
           }
-          if (markerAt(this.plain, overlapEnd) !== " ") {
+          if (this.marker(overlapEnd) !== " ") {
             this.error(
               `expected context line #${j + 1} in\n${this.plain.slice(hunk.start, hunk.end)}`,
             );
-            throw new PatchError("expected context line");
+            return merged;
           }
           overlapStart = overlapEnd;
           overlapEnd = overlapNext;
@@ -466,7 +490,7 @@ class AddPatchState {
           this.error(
             `hunks do not overlap:\n${this.plain.slice(merged.start, merged.end)}\n\tdoes not end with:\n${this.plain.slice(overlapStart, overlapEnd)}`,
           );
-          throw new PatchError("hunks do not overlap");
+          return merged;
         }
         if (merged.end !== this.plain.length) {
           const start = this.plain.length;
@@ -522,7 +546,8 @@ class AddPatchState {
     let n = 0;
     let hunk = parts[0];
     hunk.splittableInto = 1;
-    hunk.use = UNDECIDED;
+    // 2.43 kept the decision: the first part keeps it, each later one copies its neighbour's
+    if (this.modern) hunk.use = UNDECIDED;
     let header = hunk.header;
     header.oldCount = 0;
     header.newCount = 0;
@@ -531,7 +556,7 @@ class AddPatchState {
     let contextLineCount = 0;
     let first = true;
     while (splittableInto > 1) {
-      let ch = markerAt(this.plain, current);
+      let ch = this.marker(current);
       if (!ch) throw new PatchError("buffer overrun while splitting hunks");
       if ((marker === "-" || marker === "+") && ch === " ") {
         first = false;
@@ -568,7 +593,7 @@ class AddPatchState {
       n++;
       hunk = parts[n];
       hunk.splittableInto = 1;
-      hunk.use = UNDECIDED;
+      hunk.use = this.modern ? UNDECIDED : parts[n - 1].use;
       header = hunk.header;
       header.oldCount = contextLineCount;
       header.newCount = contextLineCount;
@@ -643,6 +668,21 @@ class AddPatchState {
 
   private recountEditedHunk(hunk: Hunk, origOld: number, origNew: number): number {
     const header = hunk.header;
+    if (!this.modern) {
+      // 2.43: the counts only (splittable_into kept), a bare line end counting as context
+      header.oldCount = 0;
+      header.newCount = 0;
+      for (let i = hunk.start; i < hunk.end; i = this.findNextLine(i)) {
+        const ch = this.plain[i];
+        if (ch === "-") header.oldCount++;
+        else if (ch === "+") header.newCount++;
+        else if (ch === " " || ch === "\r" || ch === "\n") {
+          header.oldCount++;
+          header.newCount++;
+        }
+      }
+      return origOld - origNew - header.oldCount + header.newCount;
+    }
     hunk.splittableInto = 0;
     header.oldCount = 0;
     header.newCount = 0;
@@ -667,14 +707,7 @@ class AddPatchState {
   }
 
   private async runApplyCheck(file: FileDiff): Promise<boolean> {
-    let patch: string;
-    try {
-      patch = this.reassemblePatch(file, true);
-    } catch (error) {
-      if (!(error instanceof PatchError)) throw error;
-      this.error("'git apply --cached' failed");
-      return false;
-    }
+    const patch = this.reassemblePatch(file, true);
     const r = await this.options.backend.apply(patch, {
       ...this.mode.applyCheckArgs,
       check: true,
@@ -741,8 +774,11 @@ class AddPatchState {
         return;
       }
       this.err("Nothing was applied.\n");
-    } else {
+    } else if (this.modern) {
+      // as a last resort, the diff is shown (2.43 wrote it to stderr)
       this.out += patch;
+    } else {
+      this.errOut += patch;
     }
   }
 
@@ -763,6 +799,8 @@ class AddPatchState {
       this.errOut += r.errors;
       if (!r.ok) this.error("'git apply' failed");
     }
+    // the index read back and refreshed after the apply
+    await this.refresh();
     this.applied.push(this.filePath(file));
   }
 
