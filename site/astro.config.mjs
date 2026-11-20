@@ -8,6 +8,10 @@ import { rehypeRepoLinks } from "./src/lib/rehype-repo-links.ts";
 
 export default defineConfig({
   site: "https://vcs.statewalker.com",
+  // Astro's HTML compression drops the space before an element that starts a new source line
+  // ("listed in the<a …>vcs-commands reference</a>"), gluing words to links. scripts/compress.mjs
+  // writes .br/.gz copies of every page anyway, so the minification saved almost nothing.
+  compressHTML: false,
   vite: {
     plugins: [tailwindcss()],
     // The live examples bundle vcs-commands, about 1.4 MB unminified (under 400 KB as Brotli):
