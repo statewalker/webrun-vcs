@@ -25,7 +25,10 @@ import type { GitUrl } from "./git-url.js";
 
 /** What {@link DuplexConnectorOptions.open} is given besides the request. */
 export interface DuplexOpenOptions {
-  /** Aborts when `connectTimeout` passes first: stop connecting */
+  /**
+   * Aborts when `connectTimeout` passes first, or when the request's own `signal` aborts: stop
+   * connecting
+   */
   signal?: AbortSignal;
 }
 
@@ -42,7 +45,8 @@ export interface DuplexConnectorOptions {
   /**
    * Most milliseconds `open` may take (default: no limit): past it the session fails with
    * `fatal: unable to connect`, `open`'s signal aborts, and a stream it still returns is
-   * closed
+   * closed. The request's `signal` (`GitConnectRequest.signal`) does the same when it aborts
+   * first, failing with its reason.
    */
   connectTimeout?: number;
   /**
@@ -73,30 +77,49 @@ async function openWithin(
   request: GitConnectRequest,
 ): Promise<Duplex> {
   const ms = options.connectTimeout;
-  if (ms === undefined) return options.open(request, {});
+  const cancel = request.signal;
+  if (ms === undefined && !cancel) return options.open(request, {});
+  if (cancel?.aborted)
+    throw abortErrorOf(cancel, `fatal: connecting to ${request.url.raw} was aborted`);
+  // aborts on the timeout or the request's own signal, whichever comes first
   const controller = new AbortController();
   const opening = Promise.resolve().then(() =>
     options.open(request, { signal: controller.signal }),
   );
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let timedOut = false;
+  let onAbort: (() => void) | undefined;
+  let abandoned = false;
   try {
     return await Promise.race([
       opening,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          timedOut = true;
-          const error = new TransportError(
-            `fatal: unable to connect to ${request.url.raw}: timed out after ${ms} ms`,
-          );
+        const giveUp = (error: Error) => {
+          abandoned = true;
           controller.abort(error);
           reject(error);
-        }, ms);
+        };
+        if (ms !== undefined) {
+          timer = setTimeout(
+            () =>
+              giveUp(
+                new TransportError(
+                  `fatal: unable to connect to ${request.url.raw}: timed out after ${ms} ms`,
+                ),
+              ),
+            ms,
+          );
+        }
+        if (cancel) {
+          onAbort = () =>
+            giveUp(abortErrorOf(cancel, `fatal: connecting to ${request.url.raw} was aborted`));
+          cancel.addEventListener("abort", onAbort, { once: true });
+        }
       }),
     ]);
   } finally {
     clearTimeout(timer);
-    if (timedOut) {
+    if (onAbort) cancel?.removeEventListener("abort", onAbort);
+    if (abandoned) {
       // a stream that opens after all is not wanted any more
       void opening.then(
         (late) => late.close?.().catch(() => undefined),
@@ -104,4 +127,9 @@ async function openWithin(
       );
     }
   }
+}
+
+/** The signal's reason when it is an error, else a transport error saying so. */
+function abortErrorOf(signal: AbortSignal, message: string): Error {
+  return signal.reason instanceof Error ? signal.reason : new TransportError(message);
 }

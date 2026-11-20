@@ -52,6 +52,7 @@
     "@statewalker/webrun-streams": "catalog:"
   },
   "devDependencies": {
+    "@statewalker/vcs-commands": "workspace:^",
     "@statewalker/webrun-files-mem": "catalog:",
     "@types/node": "catalog:",
     "rolldown": "catalog:",

@@ -8,7 +8,7 @@ Git transport protocol (wire protocol v1 and v2) built on finite state machines.
 
 Browser and worker code cannot spawn `git` or open raw TCP sockets, yet repositories built with `@statewalker/vcs-core` still need to exchange objects with real Git servers and with each other. This package speaks the Git wire protocol directly over whatever channel is available: an HTTP `fetch`, a `MessagePort` between tabs or workers, or an in-process webrun-streams channel. The same client and server state machines serve every channel, so a peer-to-peer sync between two browser tabs uses exactly the code path that talks to a Git HTTP server.
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for the design and [src/README.md](./src/README.md) for the FSM internals.
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the design and [src/README.md](./src/README.md) for the FSM internals. [docs/transports.md](./docs/transports.md) is the guide to reaching remotes over HTTP, git://, ssh, a MessagePort, a WebSocket, libp2p or an httpeers mesh, with client and server examples for each.
 
 ## How to use: pick a layer
 
@@ -305,6 +305,22 @@ const result = await p2pSync({
 });
 if (result.success) console.log(`Synced ${result.refsSynced} refs`);
 ```
+
+### One session over a MessagePort
+
+```typescript
+import { fetchOverDuplex, messagePortDuplex, serveOverDuplex, serveOverPort } from "@statewalker/vcs-transport";
+
+const { port1, port2 } = new MessageChannel();
+serveOverPort(port2, (duplex) =>
+  serveOverDuplex({ duplex, repository, refStore, service: "git-upload-pack" }),
+);
+const result = await fetchOverDuplex({ duplex: messagePortDuplex(port1), repository: local, refStore: localRefs });
+```
+
+`serveOverPort` runs a server on one end of a port and `messagePortDuplex` is the client's end, with
+backpressure both ways and a half-close; they replace the deprecated `createMessagePortDuplex`.
+For remote commands, register a connector instead ([docs/transports.md](./docs/transports.md)).
 
 ## Internals
 

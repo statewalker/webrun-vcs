@@ -156,7 +156,7 @@ await syncWorkspace(otherWs, httpRemote({ url }));
 The same sync runs over a duplex stream (a MessagePort, a WebSocket, a WebRTC channel) and over an httpeers mesh:
 
 ```typescript
-import { createMessagePortDuplex } from "@statewalker/vcs-transport";
+import { messagePortDuplex, serveOverPort } from "@statewalker/vcs-transport";
 import { meshGitHandler, meshRemoteFetch, servePeerConnection } from "@statewalker/vcs-transport-httpeers";
 import { duplexRemote, httpRemote } from "@statewalker/vcs-workspace/net";
 
@@ -164,8 +164,9 @@ import { duplexRemote, httpRemote } from "@statewalker/vcs-workspace/net";
 const overChannel = duplexRemote({
   connect: (service) => {
     const channel = new MessageChannel();
-    void server.serve(createMessagePortDuplex(channel.port2), service);
-    return createMessagePortDuplex(channel.port1);
+    // serveOverPort closes both ports once the session is over
+    serveOverPort(channel.port2, (duplex) => server.serve(duplex, service));
+    return messagePortDuplex(channel.port1);
   },
 });
 

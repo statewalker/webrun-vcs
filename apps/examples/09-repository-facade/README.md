@@ -11,7 +11,7 @@ What you will learn:
 - Exporting a pack from one repository and importing it into another
 - Adapting core `Refs` to the transport `RefStore` interface
 - Serving with `serveOverDuplex` and fetching with `fetchOverDuplex`
-- Wrapping a `MessagePort` as a transport `Duplex` with `createMessagePortDuplex`
+- Serving and fetching over a `MessagePort` with `serveOverPort` and `messagePortDuplex`
 
 It builds on [08-transport-basics](../08-transport-basics/).
 
@@ -150,31 +150,33 @@ function createRefStoreAdapter(refs: Refs): RefStore {
 
 ### Step 4: serve and fetch over a MessageChannel
 
-`createMessagePortDuplex` turns each end of a `MessageChannel` into a `Duplex`. The server and client run concurrently under `Promise.all`; the client gets its own empty memory repository, facade and ref store.
+`serveOverPort` runs the server on one end of a `MessageChannel`, and `messagePortDuplex` turns the other end into the client's `Duplex`; one channel carries one session, and the session closes both ports when it is over. The client gets its own empty memory repository, facade and ref store.
 
 ```typescript
 // MessageChannel is the standard global (browsers, workers, Node); no node: import.
-const { serveOverDuplex, fetchOverDuplex, createMessagePortDuplex } = await import(
+const { serveOverDuplex, fetchOverDuplex, messagePortDuplex, serveOverPort } = await import(
   "@statewalker/vcs-transport"
 );
 
 const channel = new MessageChannel();
-const serverDuplex = createMessagePortDuplex(channel.port1 as any);
-const clientDuplex = createMessagePortDuplex(channel.port2 as any);
 
-const [serveResult, fetchResult] = await Promise.all([
-  serveOverDuplex({
-    duplex: serverDuplex,
-    repository: serverFacade,
-    refStore: serverRefStore,
-    service: "git-upload-pack",
-  }),
-  fetchOverDuplex({
-    duplex: clientDuplex,
-    repository: clientFacade,
-    refStore: clientRefStore,
-  }),
-]);
+const serving = new Promise((resolve, reject) => {
+  serveOverPort(channel.port1, (duplex) =>
+    serveOverDuplex({
+      duplex,
+      repository: serverFacade,
+      refStore: serverRefStore,
+      service: "git-upload-pack",
+    }).then(resolve, reject),
+  );
+});
+
+const fetchResult = await fetchOverDuplex({
+  duplex: messagePortDuplex(channel.port2),
+  repository: clientFacade,
+  refStore: clientRefStore,
+});
+const serveResult = await serving;
 ```
 
 Afterwards the example resolves `refs/heads/main` in the client repository, loads the commit and prints its message, then closes both ports.
@@ -220,7 +222,7 @@ Commit ids differ on every run (see below). A real run:
 === Step 4: Serve Over Duplex (MessagePort) ===
 
   Server result: success=true
-  Client result: refs updated=2
+  Client result: refs updated=1
   Client received commit: "Initial commit from server"
 
 === Summary ===
@@ -248,10 +250,9 @@ The transport layer depends on a minimal `RefStore` (`get`, `update`, `listAll`,
 - **`history.refs.list()` shows `HEAD` as symbolic, `RefStore.listAll()` as an id.** The core lists the ref as stored; the transport adapter resolves it.
 - **The pack header counts objects, the import result counts more finely.** `importPack` reports commits and trees separately; blobs are in `objectsImported` only.
 - **The client reports two updated refs.** The fetch updates `HEAD` and `refs/heads/main` in the client `RefStore`.
-- **`as any` on the ports.** Under Node's type definitions the global `MessageChannel` is the `worker_threads` one, whose `MessagePort` is not the DOM `MessagePort` type that `createMessagePortDuplex` declares; the cast is needed to typecheck.
-- **The process does not exit if ports stay open.** Setting `onmessage` keeps a Node `MessagePort` alive; the example calls `channel.port1.close()` and `channel.port2.close()` before finishing.
+- **The process does not exit if ports stay open.** Setting `onmessage` keeps a Node `MessagePort` alive; the session closes both ports when it is over, and the example closes them again before finishing.
 - **Fetch assumes `refs/heads/main` locally.** `fetchOverDuplex` resolves `options.localHead ?? "refs/heads/main"` in the client `RefStore` to choose haves. Here the client is empty, so it sends none.
-- **Missing objects answer, not throw.** `facade.has()` returns `false` and `getObjectSize()` returns `null` for an id the repository lacks. Port errors are logged as `MessagePort error:`.
+- **Missing objects answer, not throw.** `facade.has()` returns `false` and `getObjectSize()` returns `null` for an id the repository lacks.
 
 ## Reference
 
@@ -270,7 +271,7 @@ The transport layer depends on a minimal `RefStore` (`get`, `update`, `listAll`,
 | `RefStore` | [context/process-context.ts](../../../packages/vcs-transport/src/context/process-context.ts) | Transport ref storage contract |
 | `serveOverDuplex` | [operations/serve-over-duplex.ts](../../../packages/vcs-transport/src/operations/serve-over-duplex.ts) | Serve Git requests over a duplex |
 | `fetchOverDuplex` | [operations/fetch-over-duplex.ts](../../../packages/vcs-transport/src/operations/fetch-over-duplex.ts) | Fetch from a served repository |
-| `createMessagePortDuplex` | [adapters/messageport/messageport-duplex.ts](../../../packages/vcs-transport/src/adapters/messageport/messageport-duplex.ts) | `MessagePort` as a `Duplex` |
+| `messagePortDuplex`, `serveOverPort` | [adapters/messageport/messageport-git.ts](../../../packages/vcs-transport/src/adapters/messageport/messageport-git.ts) | One git session over a `MessagePort` |
 | `createVcsRepositoryFacade` | [vcs-repository-facade.ts](../../../packages/vcs-transport-adapters/src/vcs-repository-facade.ts) | `RepositoryFacade` from a `History` |
 | `Refs` | [history/refs/](../../../packages/vcs-core/src/history/refs/) | Core ref storage |
 | `History` | [history/](../../../packages/vcs-core/src/history/) | Repository interface |

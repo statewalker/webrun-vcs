@@ -10,24 +10,33 @@ import { describe, expect, it } from "vitest";
 import {
   connectGitOverPortMux,
   createByteQueue,
+  createDuplexConnector,
   createLibp2pConnector,
   createWebSocketConnector,
   DEFAULT_GIT_MAX_PORTS,
   DEFAULT_WEBSOCKET_FRAME_SIZE,
   DEFAULT_WEBSOCKET_MAX_FRAME_SIZE,
+  type Duplex,
+  fetchOverDuplex,
+  gitDaemonRequest,
   type Libp2pMessageStreamLike,
   type Libp2pStreamLike,
   libp2pStreamDuplex,
   messagePortDuplex,
   parseGitUrl,
+  pushOverDuplex,
   serveGitOverLibp2pStream,
+  serveGitOverPort,
   serveGitOverPortMux,
+  serveOverDuplex,
+  serveOverPort,
   type WebSocketLike,
   webrunClientDuplex,
   webrunServerDuplex,
   webSocketDuplex,
 } from "../src/index.js";
-import { serverRepo } from "./helpers/receive-pack-harness.js";
+import { clientWithNewCommits, serverRepo } from "./helpers/receive-pack-harness.js";
+import { createTransportRepo } from "./interop/helpers.js";
 
 const bytes = (n: number, fill = 1) => new Uint8Array(n).fill(fill);
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -583,5 +592,303 @@ describe("error paths (review of the duplex adapters)", () => {
     await peer.close();
     await stop();
     channel.port1.close();
+  });
+});
+
+describe("serveOverPort (the server side of messagePortDuplex for a fixed service)", () => {
+  it("serves a fetch and a push, one MessageChannel each", async () => {
+    const { repo, c2 } = await serverRepo();
+    const local = await createTransportRepo();
+    const fetchChannel = new MessageChannel();
+    let served: unknown;
+    serveOverPort(fetchChannel.port2, async (duplex) => {
+      served = await serveOverDuplex({
+        duplex,
+        repository: repo.facade,
+        refStore: repo.refStore,
+        service: "git-upload-pack",
+      });
+    });
+    const fetched = await fetchOverDuplex({
+      duplex: messagePortDuplex(fetchChannel.port1),
+      repository: local.facade,
+      refStore: local.refStore,
+      refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+    });
+    expect(fetched.success).toBe(true);
+    expect(await local.refStore.get("refs/remotes/origin/main")).toBe(c2);
+    await tick();
+    expect((served as { success?: boolean } | undefined)?.success).toBe(true);
+
+    const { client, commits } = await clientWithNewCommits(1);
+    await client.refStore.update("refs/heads/main", commits[0] as string);
+    const pushChannel = new MessageChannel();
+    serveOverPort(pushChannel.port2, (duplex) =>
+      serveOverDuplex({
+        duplex,
+        repository: repo.facade,
+        refStore: repo.refStore,
+        service: "git-receive-pack",
+      }),
+    );
+    const pushed = await pushOverDuplex({
+      duplex: messagePortDuplex(pushChannel.port1),
+      repository: client.facade,
+      refStore: client.refStore,
+      refspecs: ["refs/heads/main:refs/heads/main"],
+    });
+    expect(pushed.error).toBeUndefined();
+    expect(pushed.success).toBe(true);
+    expect(await repo.refStore.get("refs/heads/main")).toBe(commits[0]);
+  });
+});
+
+/**
+ * A `MessageChannel` whose ports deliver as a browser's do: `addEventListener("message")` alone
+ * does not start a port (Node's does), only `start()` or setting `onmessage`; until then every
+ * message stays queued.
+ */
+function browserLikeChannel(): { port1: MessagePort; port2: MessagePort } {
+  const { port1, port2 } = new MessageChannel();
+  const wrap = (port: MessagePort): MessagePort => {
+    const target = new EventTarget();
+    const queued: MessageEvent[] = [];
+    let started = false;
+    let handler: ((event: MessageEvent) => void) | null = null;
+    port.onmessage = (event) => {
+      const copy = new MessageEvent("message", { data: event.data });
+      if (started) target.dispatchEvent(copy);
+      else queued.push(copy);
+    };
+    const start = () => {
+      if (started) return;
+      started = true;
+      for (const event of queued.splice(0)) target.dispatchEvent(event);
+    };
+    const wrapped = {
+      postMessage: (message: unknown, transfer?: Transferable[]) =>
+        port.postMessage(message, transfer ?? []),
+      addEventListener: (type: string, listener: EventListener) =>
+        target.addEventListener(type, listener),
+      removeEventListener: (type: string, listener: EventListener) =>
+        target.removeEventListener(type, listener),
+      start,
+      close: () => port.close(),
+      get onmessage() {
+        return handler;
+      },
+      set onmessage(value: ((event: MessageEvent) => void) | null) {
+        if (handler) target.removeEventListener("message", handler as EventListener);
+        handler = value;
+        if (value) target.addEventListener("message", value as EventListener);
+        start();
+      },
+    };
+    return wrapped as unknown as MessagePort;
+  };
+  return { port1: wrap(port1), port2: wrap(port2) };
+}
+
+describe("MessagePort adapters on browser-like ports", () => {
+  it("messagePortDuplex and serveOverPort start their ports (a browser's addEventListener does not)", async () => {
+    const { repo, c2 } = await serverRepo();
+    const local = await createTransportRepo();
+    const channel = browserLikeChannel();
+    serveOverPort(channel.port2, (duplex) =>
+      serveOverDuplex({
+        duplex,
+        repository: repo.facade,
+        refStore: repo.refStore,
+        service: "git-upload-pack",
+      }),
+    );
+    const fetched = await fetchOverDuplex({
+      duplex: messagePortDuplex(channel.port1),
+      repository: local.facade,
+      refStore: local.refStore,
+      refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+    });
+    expect(fetched.success).toBe(true);
+    expect(await local.refStore.get("refs/remotes/origin/main")).toBe(c2);
+  }, 10_000);
+});
+
+/** A port that forwards to `port` and counts the calls to its `close`. */
+function countingPort(port: MessagePort): { port: MessagePort; closes: () => number } {
+  let closes = 0;
+  const wrapped = {
+    postMessage: (message: unknown, transfer?: Transferable[]) =>
+      port.postMessage(message, transfer ?? []),
+    addEventListener: (type: string, listener: EventListener) =>
+      port.addEventListener(type, listener),
+    removeEventListener: (type: string, listener: EventListener) =>
+      port.removeEventListener(type, listener),
+    start: () => port.start(),
+    close: () => {
+      closes++;
+      port.close();
+    },
+  };
+  return { port: wrapped as unknown as MessagePort, closes: () => closes };
+}
+
+const closeEvent = (port: MessagePort) =>
+  new Promise<void>((resolve) => port.addEventListener("close", () => resolve(), { once: true }));
+
+async function until(check: () => boolean, ms = 2000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error("timed out");
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+describe("MessagePort sessions close their ports", () => {
+  it("serveOverPort closes its port after a fetch whose client never closes, which closes the client's too", async () => {
+    const { repo, c2 } = await serverRepo();
+    const local = await createTransportRepo();
+    const channel = new MessageChannel();
+    const clientClosed = closeEvent(channel.port1);
+    const server = countingPort(channel.port2);
+    serveOverPort(
+      server.port,
+      (duplex) =>
+        serveOverDuplex({
+          duplex,
+          repository: repo.facade,
+          refStore: repo.refStore,
+          service: "git-upload-pack",
+        }),
+      { lingerTimeout: 20 },
+    );
+    // as site/src/examples/fetch-push.ts: the duplex is never closed by its caller
+    const fetched = await fetchOverDuplex({
+      duplex: messagePortDuplex(channel.port1),
+      repository: local.facade,
+      refStore: local.refStore,
+      refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+    });
+    expect(fetched.success).toBe(true);
+    expect(await local.refStore.get("refs/remotes/origin/main")).toBe(c2);
+    await clientClosed; // the entangled port went with it: nothing keeps the process alive
+    expect(server.closes()).toBe(1);
+  });
+
+  it("closes at once when the client takes the whole answer; messagePortDuplex.close closes its port, once however often called", async () => {
+    const channel = new MessageChannel();
+    const server = countingPort(channel.port2);
+    const client = countingPort(channel.port1);
+    serveOverPort(
+      server.port,
+      async (duplex) => {
+        let n = 0;
+        for await (const chunk of duplex) n += chunk.length;
+        await duplex.write(new TextEncoder().encode(`got ${n}`));
+      },
+      { lingerTimeout: 60_000 },
+    );
+    const duplex = messagePortDuplex(client.port);
+    await duplex.write(bytes(10));
+    await duplex.end?.();
+    expect(new TextDecoder().decode(new Uint8Array(await collect(duplex)))).toBe("got 10");
+    await until(() => server.closes() === 1); // not after the 60 s linger
+    await duplex.close?.();
+    await until(() => client.closes() >= 1);
+    await tick();
+    const closes = client.closes(); // the stream tier's own close may come first: both are harmless
+    await duplex.close?.();
+    await tick();
+    expect(client.closes()).toBe(closes);
+    expect(server.closes()).toBe(1);
+  });
+
+  it("the teardown closes the port once; serveGitOverPort closes its port after a refused session", async () => {
+    const channel = new MessageChannel();
+    const server = countingPort(channel.port2);
+    const stop = serveOverPort(server.port, () => new Promise<void>(() => {}));
+    stop();
+    stop();
+    expect(server.closes()).toBe(1);
+    channel.port1.close();
+
+    const git = new MessageChannel();
+    const gitServer = countingPort(git.port2);
+    serveGitOverPort(gitServer.port, {
+      resolveRepository: async () => undefined,
+      lingerTimeout: 20,
+    });
+    const duplex = messagePortDuplex(git.port1);
+    await duplex.write(
+      gitDaemonRequest({
+        url: parseGitUrl("git://host/missing.git"),
+        service: "git-upload-pack",
+        protocolVersion: 0,
+      }),
+    );
+    const answer = new TextDecoder().decode(new Uint8Array(await collect(duplex)));
+    expect(answer).toContain("ERR");
+    await until(() => gitServer.closes() === 1);
+  });
+});
+
+describe("createDuplexConnector and the request's signal", () => {
+  it("a user abort cancels a pending open, with or without connectTimeout; a late stream is closed", async () => {
+    for (const connectTimeout of [undefined, 60_000]) {
+      let openSignal: AbortSignal | undefined;
+      let finish: (duplex: Duplex) => void = () => {};
+      const connector = createDuplexConnector({
+        name: "slow",
+        schemes: ["slow"],
+        ...(connectTimeout !== undefined ? { connectTimeout } : {}),
+        open: (_request, { signal }) => {
+          openSignal = signal;
+          return new Promise<Duplex>((resolve) => {
+            finish = resolve;
+          });
+        },
+      });
+      const user = new AbortController();
+      const connecting = connector.connect({
+        url: parseGitUrl("slow://host/r.git"),
+        service: "git-upload-pack",
+        protocolVersion: 2,
+        signal: user.signal,
+      });
+      await tick();
+      user.abort(new Error("stopped by the user"));
+      await expect(connecting).rejects.toThrow("stopped by the user");
+      expect(openSignal?.aborted).toBe(true);
+      let closed = 0;
+      finish({
+        async *[Symbol.asyncIterator]() {},
+        write: () => undefined,
+        close: async () => {
+          closed++;
+        },
+      });
+      await tick();
+      expect(closed).toBe(1);
+    }
+
+    const already = new AbortController();
+    already.abort();
+    let opened = 0;
+    const connector = createDuplexConnector({
+      name: "never",
+      schemes: ["never"],
+      open: async () => {
+        opened++;
+        throw new Error("not reached");
+      },
+    });
+    await expect(
+      connector.connect({
+        url: parseGitUrl("never://host/r.git"),
+        service: "git-upload-pack",
+        protocolVersion: 2,
+        signal: already.signal,
+      }),
+    ).rejects.toThrow();
+    expect(opened).toBe(0);
   });
 });

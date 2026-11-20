@@ -4,13 +4,13 @@ import {
   type HistoryWithOperations,
 } from "@statewalker/vcs-core";
 import {
-  createMessagePortDuplex,
   createRepositoryFacade,
   createTransportRefStore,
-  messagePortFetch,
-  messagePortServe,
+  fetchOverDuplex,
+  messagePortDuplex,
   pushOverDuplex,
   serveOverDuplex,
+  serveOverPort,
 } from "@statewalker/vcs-transport";
 import {
   createMemoryCheckout,
@@ -42,19 +42,20 @@ export default async function fetchPush(out: Output) {
   // A MessageChannel is the wire: one end could as well be a worker, another tab or a
   // WebRTC data channel. Alice serves git-upload-pack on it; Bob fetches through the other end.
   const fetchChannel = new MessageChannel();
-  const serving = messagePortServe(
-    fetchChannel.port2,
-    createRepositoryFacade({ history: alice.history }),
-    createTransportRefStore(alice.history.refs),
+  serveOverPort(fetchChannel.port2, (duplex) =>
+    serveOverDuplex({
+      duplex,
+      repository: createRepositoryFacade({ history: alice.history }),
+      refStore: createTransportRefStore(alice.history.refs),
+      service: "git-upload-pack",
+    }),
   );
-  const fetched = await messagePortFetch(
-    fetchChannel.port1,
-    createRepositoryFacade({ history: bob.history }),
-    createTransportRefStore(bob.history.refs),
-    { refspecs: ["+refs/heads/*:refs/remotes/alice/*"] },
-  );
-  await serving;
-  fetchChannel.port1.close();
+  const fetched = await fetchOverDuplex({
+    duplex: messagePortDuplex(fetchChannel.port1),
+    repository: createRepositoryFacade({ history: bob.history }),
+    refStore: createTransportRefStore(bob.history.refs),
+    refspecs: ["+refs/heads/*:refs/remotes/alice/*"],
+  });
   if (!fetched.success) throw new Error(`fetch failed: ${fetched.error}`);
   out.log("");
   out.log("$ git fetch alice   (git protocol over a MessagePort)");
@@ -84,20 +85,23 @@ export default async function fetchPush(out: Output) {
     .call();
 
   const pushChannel = new MessageChannel();
-  const receiving = serveOverDuplex({
-    duplex: createMessagePortDuplex(pushChannel.port2),
-    repository: createRepositoryFacade({ history: alice.history }),
-    refStore: createTransportRefStore(alice.history.refs),
-    service: "git-receive-pack",
+  const receiving = new Promise<void>((resolve) => {
+    serveOverPort(pushChannel.port2, (duplex) =>
+      serveOverDuplex({
+        duplex,
+        repository: createRepositoryFacade({ history: alice.history }),
+        refStore: createTransportRefStore(alice.history.refs),
+        service: "git-receive-pack",
+      }).finally(resolve),
+    );
   });
   const pushed = await pushOverDuplex({
-    duplex: createMessagePortDuplex(pushChannel.port1),
+    duplex: messagePortDuplex(pushChannel.port1),
     repository: createRepositoryFacade({ history: bob.history }),
     refStore: createTransportRefStore(bob.history.refs),
     refspecs: ["refs/heads/main:refs/heads/from-bob"],
   });
   await receiving;
-  pushChannel.port1.close();
   if (!pushed.success) throw new Error(`push failed: ${pushed.error}`);
   out.log("");
   out.log("$ git push alice main:from-bob");

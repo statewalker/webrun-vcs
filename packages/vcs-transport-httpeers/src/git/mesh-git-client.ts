@@ -26,11 +26,20 @@ export interface MeshRemote {
    * helpers set it from their `url`.
    */
   origin?: string;
+  /**
+   * The base URL the token is pinned to, on that origin (`withMeshToken`'s `scope`): only
+   * requests to it or below it carry the token, and a redirect leaving it is refused. Default:
+   * the whole origin.
+   */
+  scope?: string;
 }
 
 /** The `fetchImpl` for a {@link MeshRemote}. */
 export function meshRemoteFetch(remote: MeshRemote): (request: Request) => Promise<Response> {
-  const options = { origin: remote.origin };
+  const options = {
+    ...(remote.origin !== undefined ? { origin: remote.origin } : {}),
+    ...(remote.scope !== undefined ? { scope: remote.scope } : {}),
+  };
   if (remote.call) return peerFetch(remote.call, remote.token, options);
   if (remote.fetchImpl) return withMeshToken(remote.fetchImpl, remote.token, options);
   throw new Error("a mesh remote needs a call (Duplex) or a fetchImpl");

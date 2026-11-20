@@ -56,6 +56,96 @@ result.updates[0]; // { remoteRef: `refs/peers/${myPeerId}/main`, status: "ok", 
 `@statewalker/httpeers-access/issuer`), or a function returning a current one. `connection.call`
 is the caller `Duplex` of a webrun-streams connection to the peer.
 
+### Clone, fetch and push with vcs-commands
+
+```typescript
+import { Git } from "@statewalker/vcs-commands";
+import { createDefaultTransports } from "@statewalker/vcs-transport";
+import { createHttpeersConnector } from "@statewalker/vcs-transport-httpeers";
+
+const transports = createDefaultTransports();
+transports.register(createHttpeersConnector({ token, call: (peer) => connectionTo(peer).call }));
+const git = Git.fromWorkingCopy(workingCopy, { transports });
+
+await git.clone().setURI(`httpeers://${peerB}/repo.git`).call();
+await git.push().setRemote("origin").setRefSpecs(`main:refs/peers/${myPeerId}/main`).call();
+```
+
+`httpeers://<peer>/<repo>` is smart HTTP over the mesh (the peer serves `meshGitHandler`), with
+the token sent only to that peer. `call(peer)` returns a webrun caller `Duplex` to the peer; a
+member whose own `fetch` already reaches peers passes `fetchImpl` and `peerUrl` instead:
+
+```typescript
+createHttpeersConnector({ token, fetchImpl: member.fetch, peerUrl: (peer) => `http://local/${edgeKey}/${peer}` });
+```
+
+`peerUrl` is required with `fetchImpl`, and puts the peer in the path: a peer id is base58 and
+case-sensitive, and a URL host is lower-cased. Every peer behind one edge shares its origin, so
+the token is pinned to the repository's base URL (`http://local/<key>/<peer>/repo.git` and below);
+a redirect out of it is refused (`MeshRedirectError`). The peer in an httpeers URL is letters,
+digits, `-` and `_` only; a `user@` or a `:port` is refused.
+
+### git's native protocol on an httpeers stream
+
+```typescript
+import { createDuplexMounts, openDuplex, serveDuplex } from "@statewalker/httpeers-libp2p";
+import {
+  createHttpeersConnector,
+  HTTPEERS_GIT_DUPLEX_PATH,
+  meshGitDuplexHandler,
+} from "@statewalker/vcs-transport-httpeers";
+
+// the serving peer
+const mounts = createDuplexMounts();
+mounts.provide(HTTPEERS_GIT_DUPLEX_PATH, meshGitDuplexHandler({ access, resolveRepository, enableReceivePack: true }));
+await serveDuplex({ node, mounts });
+
+// the calling peer: httpeers+git://<peer>/<repo>
+transports.register(
+  createHttpeersConnector({
+    mode: "native",
+    token,
+    openStream: ({ peer, path, token }) => openDuplex({ node, peerId: peer, path, token }),
+  }),
+);
+await git.fetch().setRemote(`httpeers+git://${peerB}/repo.git`).call();
+```
+
+httpeers-libp2p's duplex streams (`/httpeers-duplex/1.0.0`) carry the token in their open frame
+and give the handler the peer the Noise handshake proved. `meshGitDuplexHandler` verifies the
+token exactly as `meshGitHandler` does, answers a refusal with git's `ERR access denied: …`, then
+serves git-daemon's request line through `serveGitConnection` with the same capability rules
+(`git:read` to fetch; `git:write`, or `git:write-own` inside `refs/peers/<peerId>/*`, to push,
+and only with `enableReceivePack`). The stream's proven peer is the only identity: an
+`access.provenPeer` is ignored. This package does not depend on httpeers-libp2p; the handler and
+`openStream` only match its shapes.
+
+A stream is authorized once, when it opens. To end the stream of a member revoked while it runs,
+give `guard` httpeers-access's `guardStream`; it is called with each authorized caller, whose
+`issuedAt` lets a member re-admitted with a newer token through:
+
+```typescript
+import { createRevocations, guardStream } from "@statewalker/httpeers-access";
+
+const revocations = createRevocations(); // the hub's revocations, kept in sync
+meshGitDuplexHandler({
+  access,
+  resolveRepository,
+  guard: (serve, caller, context) =>
+    guardStream(serve, {
+      peerId: context.peerId,
+      revocations,
+      ...(caller.issuedAt !== undefined
+        ? { claims: { sub: context.peerId, issuedAt: caller.issuedAt } }
+        : {}),
+    }),
+});
+```
+
+Wrapping the whole handler from outside, `(input, ctx) => guardStream((i) => handler(i, ctx), {
+peerId: ctx.peerId, revocations })(input)`, also ends revoked streams, but it cannot see the
+token: without `issuedAt` a peer revoked once stays refused, even with a token minted after.
+
 ### Download one LFS object from several peers
 
 ```typescript
@@ -125,10 +215,12 @@ without an edge, the handlers never trust a client's header. A request with a re
 two ways.
 
 On the calling side the token goes only to the remote's origin (`origin`, which
-`meshGitFetch`/`meshGitPush` take from their `url`; otherwise the first request's).
+`meshGitFetch`/`meshGitPush` take from their `url`; otherwise the first request's), or only to
+one base URL on it (`scope`, as `createHttpeersConnector` pins it to a repository's URL behind a
+shared edge).
 `peerFetch`/`withMeshToken` never send a peer header, handle redirects themselves (a
-same-origin redirect of a request without a body is followed; one to another origin throws
-`MeshRedirectError`), and send nothing mesh-related to another origin, such as an LFS action
+same-origin redirect of a request without a body is followed; one to another origin, or out of
+`scope`, throws `MeshRedirectError`), and send nothing mesh-related to another origin, such as an LFS action
 href on a CDN.
 
 ## LFS
@@ -163,12 +255,15 @@ verified object, or a copy it sent whole that failed to verify.
 | Export | Description |
 |--------|-------------|
 | `meshGitHandler(options)` | git smart-HTTP handler behind the mesh's access checks. `options`: `createFetchHandler`'s (protocol v2, limits, `receivePack`), plus `repository` + `refStore` or `resolveRepository`, `access`, `ownNamespace?` (a `refs/` prefix; a trailing `/` is added), `requestPolicy?` (default `"REACHABLE_COMMIT"`, not git's v2 `"ANY"`) |
+| `createHttpeersConnector(options)` | A transport connector for vcs-commands' remote commands. `mode: "http"` (default, scheme `httpeers`): `call(peer, request)` (with `token`; `peerUrl?(peer)`, default `HTTPEERS_CALL_ORIGIN`) or `fetchImpl` (+ `peerUrl(peer)`, required, `token?`: pinned to the repository's base URL), `headers?`. Peers are letters, digits, `-`, `_`; no `user@` or `:port`. `mode: "native"` (scheme `httpeers+git`): `openStream({ peer, path, token, request }, { signal })` (the signal aborts on `connectTimeout` or the request's own signal) returning a webrun `Duplex` or `{ call, close? }`, `streamPath?` (default `HTTPEERS_GIT_DUPLEX_PATH`), `connectTimeout?`. Both: `name?`, `schemes?` |
+| `meshGitDuplexHandler(options)` | git's native protocol for httpeers-libp2p's duplex mounts: `(input, { peerId, path?, token? })`. `options`: `serveGitConnection`'s (`resolveRepository`, `settings`, `initTimeout`, `timeout`, `informativeErrors`), `access`, `enableReceivePack?` (default false), `ownNamespace?`, `requestPolicy?` (default `"REACHABLE_COMMIT"`), `guard?(serve, caller, context)` (wraps each authorized stream, e.g. `guardStream`; `caller.issuedAt` is the token's `iat`), `onSettled?(result, error, caller)`. `access.provenPeer` is ignored: the stream's peer is the identity |
+| `HTTPEERS_GIT_DUPLEX_PATH`, `HTTPEERS_SCHEME`, `HTTPEERS_NATIVE_SCHEME`, `HTTPEERS_CALL_ORIGIN` | `"/git"`, `"httpeers"`, `"httpeers+git"`, `"http://httpeers.mesh"` (what a `call` connector's requests are addressed to: the connection already leads to the peer) |
 | `meshLfsHandler(options)` | LFS handler behind the mesh's access checks. `options`: `serveLfs`'s except `transferAuth` (per-action headers would let a transfer skip the capability check), plus `objects`, `access`, `locks?` (`identify` optional), `ranged?` (default true), `authorize?(request, operation, caller, lock?)` |
 | `lfsSwarmDownload(pointers, sources, store, opts?)` | Multi-source download → `{ downloaded, failed, bad, received }`. `opts`: `chunkSize?`, `windowBytes?` (positive), `idleTimeoutMs?`, `reassignAfterMs?`, `signal?` |
 | `meshGitFetch(options)`, `meshGitPush(options)` | The fetch client and push of `@statewalker/vcs-transport` through a peer (`call` or `fetchImpl`, and `token`) |
 | `servePeerConnection(handler, { remotePeer })` | The serving end of a peer connection: a webrun `Duplex` |
 | `bindProvenPeer(request, peer)` | For other edges: binds a request to the peer its transport proved |
-| `peerFetch(call, token, opts?)`, `withMeshToken(fetchImpl, token, opts?)`, `meshRemoteFetch({ call?, fetchImpl?, token, origin? })` | The calling end: a `fetchImpl` with the token, pinned to the remote's origin. `opts`: `origin?`, `maxRedirects?` (5) |
+| `peerFetch(call, token, opts?)`, `withMeshToken(fetchImpl, token, opts?)`, `meshRemoteFetch({ call?, fetchImpl?, token, origin?, scope? })` | The calling end: a `fetchImpl` with the token, pinned to the remote's origin (or to `scope`, a base URL on it). `opts`: `origin?`, `scope?`, `maxRedirects?` (5) |
 | `MeshRedirectError` | Thrown for a redirect to another origin, or too many |
 | `gitServiceOf(request)`, `isReceivePackRequest(request)` | The service of a git request, read as the transport's server reads it |
 | `withMeshAccess(access, next)` | The access middleware for other handlers: `next(request, { peer, capabilities })` |

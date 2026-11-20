@@ -167,17 +167,11 @@ console.log("\n=== Step 4: Serve Over Duplex (MessagePort) ===\n");
 // In a real application, you would use MessagePort, WebSocket, or WebRTC.
 // This demonstrates the pattern using the standard (global) MessageChannel,
 // available in browsers, workers and Node.
-const { serveOverDuplex, fetchOverDuplex, createMessagePortDuplex } = await import(
+const { serveOverDuplex, fetchOverDuplex, messagePortDuplex, serveOverPort } = await import(
   "@statewalker/vcs-transport"
 );
 
 const channel = new MessageChannel();
-
-// Wrap MessagePorts into transport-compatible Duplex objects
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const serverDuplex = createMessagePortDuplex(channel.port1 as any);
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const clientDuplex = createMessagePortDuplex(channel.port2 as any);
 
 // Create a client-side history to receive the data
 const clientHistory = createMemoryHistoryWithOperations();
@@ -190,22 +184,25 @@ const clientFacade = createVcsRepositoryFacade({
 });
 const clientRefStore = createRefStoreAdapter(clientHistory.refs);
 
-// Run server and client concurrently
-const [serveResult, fetchResult] = await Promise.all([
-  // Server side: serve the repository
-  serveOverDuplex({
-    duplex: serverDuplex,
-    repository: serverFacade,
-    refStore: serverRefStore,
-    service: "git-upload-pack",
-  }),
-  // Client side: fetch from the served repository
-  fetchOverDuplex({
-    duplex: clientDuplex,
-    repository: clientFacade,
-    refStore: clientRefStore,
-  }),
-]);
+// Server side: serve the repository on one end of the channel (one session per port)
+const serving = new Promise<Awaited<ReturnType<typeof serveOverDuplex>>>((resolve, reject) => {
+  serveOverPort(channel.port1, (duplex) =>
+    serveOverDuplex({
+      duplex,
+      repository: serverFacade,
+      refStore: serverRefStore,
+      service: "git-upload-pack",
+    }).then(resolve, reject),
+  );
+});
+
+// Client side: fetch from the served repository through the other end
+const fetchResult = await fetchOverDuplex({
+  duplex: messagePortDuplex(channel.port2),
+  repository: clientFacade,
+  refStore: clientRefStore,
+});
+const serveResult = await serving;
 
 console.log(`  Server result: success=${serveResult.success}`);
 console.log(`  Client result: refs updated=${fetchResult.updatedRefs?.size ?? 0}`);
@@ -219,7 +216,8 @@ if (clientMainRef?.objectId) {
   }
 }
 
-// Clean up MessagePorts
+// serveOverPort closes its port once the session is over, and the entangled port goes with
+// it, so nothing keeps the process alive; closing them again now is harmless
 channel.port1.close();
 channel.port2.close();
 

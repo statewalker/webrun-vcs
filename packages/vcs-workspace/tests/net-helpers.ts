@@ -15,9 +15,10 @@ import { Readable } from "node:stream";
 
 import { createMemoryHistoryWithOperations } from "@statewalker/vcs-core";
 import {
-  createMessagePortDuplex,
   createRepositoryFacade,
   createTransportRefStore,
+  messagePortDuplex,
+  serveOverPort,
 } from "@statewalker/vcs-transport";
 import { MemFilesApi } from "@statewalker/webrun-files-mem";
 import {
@@ -99,10 +100,9 @@ export function messageChannelRemote(server: SyncServer, name = "origin"): SyncR
     name,
     connect: (service) => {
       const channel = new MessageChannel();
-      void server.serve(createMessagePortDuplex(channel.port2), service).finally(() => {
-        setTimeout(() => channel.port2.close(), 0);
-      });
-      return createMessagePortDuplex(channel.port1);
+      // serveOverPort closes both ports once the session is over
+      serveOverPort(channel.port2, (duplex) => server.serve(duplex, service));
+      return messagePortDuplex(channel.port1);
     },
   });
 }

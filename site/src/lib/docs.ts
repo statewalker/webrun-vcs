@@ -37,12 +37,18 @@ export const packagePages: RepoPage[] = [
 ];
 
 /** Guides kept in docs/ (Markdown beside the Observable site; package-dependencies.md is a
- * Mermaid diagram, which this site does not render, so the architecture page links to it). */
+ * Mermaid diagram, which this site does not render, so the architecture page links to it) and in
+ * a package's own docs/ folder. */
 export const guidePages: RepoPage[] = [
   {
     file: "docs/example-applications.md",
     slug: "example-applications",
     label: "Example applications",
+  },
+  {
+    file: "packages/vcs-transport/docs/transports.md",
+    slug: "transports",
+    label: "Transports",
   },
 ];
 

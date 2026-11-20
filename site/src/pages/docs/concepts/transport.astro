@@ -114,8 +114,19 @@ const refStore = createTransportRefStore(history.refs);`;
     allow CORS.
   </p>
 
+  <h2 id="transports">The same protocol over any transport</h2>
+  <p>
+    A remote command finds its transport by the URL's scheme: smart HTTP for <code>https://</code>,
+    git's native protocol for <code>git://</code>, ssh, <code>ws://</code>, <code>libp2p://</code>
+    and <code>httpeers://</code>, or any scheme a connector registered with
+    <code>Git.fromWorkingCopy(workingCopy, &#123; transports &#125;)</code> serves. The
+    <a href={docHref("packages/vcs-transport/docs/transports.md")}>transports guide</a> has a client
+    and a server example for each, and the security notes for serving.
+  </p>
+
   <h2 id="next">Where to go next</h2>
   <ul>
+    <li>The <a href={docHref("packages/vcs-transport/docs/transports.md")}>transports guide</a>: HTTP, git://, ssh, MessagePort, WebSocket, libp2p and HTTPeers, client and server.</li>
     <li>The <a href={docHref("packages/vcs-transport/README.md")}>vcs-transport reference</a>: entry points, constraints and failure messages.</li>
     <li><a href={docHref("packages/vcs-transport-httpeers/README.md")}>vcs-transport-httpeers</a>: git and LFS between the peers of an httpeers mesh.</li>
     <li><a href="/docs/architecture">Architecture</a>: why one transport serves servers and peers.</li>
