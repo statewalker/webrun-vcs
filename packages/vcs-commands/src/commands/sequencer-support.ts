@@ -504,7 +504,9 @@ async function resetKeepWith(
  * git's reset `update_refs`: ORIG_HEAD set to the HEAD left (`headId`), given the ORIG_HEAD
  * it read as the old value (none when absent), then HEAD moved to `target` expecting the
  * HEAD left, as the reference-transaction hook sees both. Without a HEAD (unborn), HEAD's
- * branch is set as it is.
+ * branch is set as it is. An ORIG_HEAD that cannot be written (its lock held, another
+ * value meanwhile) is reported and HEAD still moves, as git's `update_ref` with
+ * UPDATE_REFS_MSG_ON_ERR: the `error:` lines are returned.
  */
 export async function moveHeadAsReset(
   refs: CommandRefs,
@@ -512,17 +514,45 @@ export async function moveHeadAsReset(
   headId: ObjectId | undefined,
   target: ObjectId,
   log: RefLogOptions,
-): Promise<void> {
+  /** ORIG_HEAD's reflog message (a log only a symbolic ORIG_HEAD's target keeps) */
+  origHeadMessage = "reset: updating ORIG_HEAD",
+): Promise<string[]> {
   if (!headId) {
     await updateHead(refs, target, log);
-    return;
+    return [];
   }
+  const errors: string[] = [];
   if (state.supported) {
-    await state.setRef("ORIG_HEAD", headId, { old: (await state.ref("ORIG_HEAD")) ?? null });
+    const old = (await state.ref("ORIG_HEAD")) ?? null;
+    try {
+      await state.setRef("ORIG_HEAD", headId, { old, log: { ...log, message: origHeadMessage } });
+    } catch (error) {
+      errors.push(origHeadError(error, old, await state.ref("ORIG_HEAD").catch(() => undefined)));
+    }
   }
   const result = await refs.batch([{ name: "HEAD", old: headId, new: target }], log);
   // a store that cannot batch HEAD: the plain update
   if (!result.ok) await updateHead(refs, target, log);
+  return errors;
+}
+
+/** git's `update_ref failed for ref 'ORIG_HEAD'` error for a write the store rejected. */
+function origHeadError(error: unknown, old: ObjectId | null, now: ObjectId | undefined): string {
+  const rejected = (error as { rejected?: { reason: string }[] }).rejected ?? [];
+  const reason = rejected[0]?.reason;
+  const why =
+    reason === "locked"
+      ? "Unable to create 'ORIG_HEAD.lock': File exists."
+      : reason === "mismatch"
+        ? old === null
+          ? "reference already exists"
+          : now === undefined
+            ? "unable to resolve reference 'ORIG_HEAD'"
+            : `is at ${now} but expected ${old}`
+        : error instanceof Error
+          ? error.message
+          : String(error);
+  return `error: update_ref failed for ref 'ORIG_HEAD': cannot lock ref 'ORIG_HEAD': ${why}`;
 }
 
 /**

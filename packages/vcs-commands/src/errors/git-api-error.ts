@@ -16,6 +16,19 @@ export class GitApiError extends Error {
    */
   exitCode: number;
 
+  /**
+   * Every refusal of a command that reports one and goes on with the next item (git's
+   * `error()` and `continue`, as `branch -d` and `tag -d`), this error first: it is thrown
+   * once the command is done, carrying the others here.
+   */
+  refusals?: GitApiError[];
+
+  /**
+   * git's stderr for {@link refusals}, one entry per refusal in order (its `error:` line with
+   * the lines git prints after it, joined by newlines), so all of them can be shown.
+   */
+  messages?: string[];
+
   constructor(message: string, options?: GitApiErrorOptions) {
     super(message, options);
     this.name = "GitApiError";
@@ -27,6 +40,17 @@ export class GitApiError extends Error {
   withExitCode(exitCode: number): this {
     this.exitCode = exitCode;
     return this;
+  }
+
+  /**
+   * The error a command that went on past refusals throws: the first refusal, carrying all
+   * of them ({@link refusals}) and their stderr texts ({@link messages}).
+   */
+  static ofRefusals(refusals: { error: GitApiError; text: string }[]): GitApiError {
+    const [first] = refusals;
+    first.error.refusals = refusals.map((r) => r.error);
+    first.error.messages = refusals.map((r) => r.text);
+    return first.error;
   }
 }
 

@@ -614,3 +614,136 @@ describeGit(
     });
   },
 );
+
+describeGit("branch -d and tag -d with several refusals: each reported (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx-refusals-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** main (checked out), merged and gone (in it), side (not merged), origin/x remote-tracking. */
+  function repo(): string {
+    const dir = join(root, "r");
+    base(dir);
+    git(dir, ["branch", "merged"]);
+    git(dir, ["branch", "gone"]);
+    git(dir, ["checkout", "-q", "-b", "side"]);
+    putFile(dir, "b.txt", "b\n");
+    git(dir, ["add", "b.txt"]);
+    git(dir, ["commit", "-qm", "side"]);
+    git(dir, ["checkout", "-q", "main"]);
+    git(dir, ["update-ref", "refs/remotes/origin/x", "main"]);
+    git(dir, ["tag", "t1"]);
+    return dir;
+  }
+
+  /** git's stderr without the hook's lines. */
+  const refusalLines = (stderr: string) =>
+    stderr
+      .split("\n")
+      .filter((l) => l !== "" && !/^hook \S+ (out|err)$/.test(l))
+      .join("\n");
+
+  async function compare(
+    args: string[],
+    run: (g: Git) => Promise<unknown>,
+    setup?: (dir: string) => void,
+  ): Promise<void> {
+    const dir = repo();
+    setup?.(dir);
+    const [theirs, mine] = hookTwins(root, dir);
+    const native = nativeIn(theirs, root, args);
+    let error: unknown;
+    try {
+      await run(await oursIn(mine));
+    } catch (e) {
+      error = e;
+    }
+    const label = args.join(" ");
+    expect(native.status, `${label}: native fails`).toBe(1);
+    expect(error, label).toBeInstanceOf(Error);
+    const thrown = error as { messages?: string[]; refusals?: Error[]; exitCode?: number };
+    expect(thrown.exitCode, `${label}: exit code`).toBe(1);
+    expect(
+      (thrown.messages ?? []).join("\n").replaceAll(mine.dir, "<twin>"),
+      `${label}: stderr`,
+    ).toBe(refusalLines(native.stderr).replaceAll(theirs.dir, "<twin>"));
+    expect(thrown.refusals?.[0], `${label}: first refusal`).toBe(error);
+    expect(hookLog(mine), `${label}: log`).toBe(hookLog(theirs));
+    expect(refState(mine.dir), `${label}: refs`).toBe(refState(theirs.dir));
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  // (the checked-out branch is left out: without linked worktrees our working copy cannot
+  // tell git's "used by worktree at '<path>'")
+  it("branch -d: not merged, not found and a remote-tracking name, the rest deleted", async () => {
+    await compare(["branch", "-d", "side", "nope", "merged", "origin/x", "gone"], (g) =>
+      g.branchDelete().setBranchNames("side", "nope", "merged", "origin/x", "gone").call(),
+    );
+  });
+
+  it("branch -d with advice.forceDeleteBranch off, and branch -D", async () => {
+    await compare(
+      ["branch", "-d", "side", "merged", "nope"],
+      (g) => g.branchDelete().setBranchNames("side", "merged", "nope").call(),
+      (dir) => git(dir, ["config", "advice.forceDeleteBranch", "false"]),
+    );
+    await compare(["branch", "-D", "nope", "side", "nope2"], (g) =>
+      g.branchDelete().setBranchNames("nope", "side", "nope2").setForce(true).call(),
+    );
+  });
+
+  it("tag -d: each missing tag reported, the others deleted", async () => {
+    await compare(["tag", "-d", "nope", "t1", "nope2"], (g) =>
+      g.tagDelete().setTags("nope", "t1", "nope2").call(),
+    );
+  });
+});
+
+describeGit("reset: an ORIG_HEAD that cannot be written (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx-orighead-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  function repo(): string {
+    const dir = join(root, "r");
+    base(dir);
+    putFile(dir, "b.txt", "b\n");
+    git(dir, ["add", "b.txt"]);
+    git(dir, ["commit", "-qm", "second"]);
+    return dir;
+  }
+
+  async function compare(label: string, prepare: (twin: HookTwin) => void): Promise<string[]> {
+    const [theirs, mine] = hookTwins(root, repo());
+    prepare(theirs);
+    prepare(mine);
+    const native = nativeIn(theirs, root, ["reset", "--soft", "HEAD~1"]);
+    const command = (await oursIn(mine)).reset().setRef("HEAD~1").setMode(ResetMode.SOFT);
+    await command.call();
+    expect(native.status, `${label}: native succeeds (${native.stderr})`).toBe(0);
+    expect(hookLog(mine), `${label}: log`).toBe(hookLog(theirs));
+    expect(refState(mine.dir), `${label}: refs`).toBe(refState(theirs.dir));
+    const errors = (text: string) =>
+      text
+        .split("\n")
+        .filter((l) => l.startsWith("error: "))
+        .map((l) => l.replace(/cannot lock ref 'ORIG_HEAD': .*/, "cannot lock ref 'ORIG_HEAD':"));
+    expect(errors(command.getWarnings().join("\n")), `${label}: errors`).toEqual(
+      errors(native.stderr),
+    );
+    return command.getWarnings();
+  }
+
+  it("ORIG_HEAD.lock held: an error for ORIG_HEAD, HEAD moved all the same", async () => {
+    const warnings = await compare("held", (t) =>
+      writeFileSync(join(t.dir, ".git/ORIG_HEAD.lock"), ""),
+    );
+    expect(warnings.join("\n")).toContain("update_ref failed for ref 'ORIG_HEAD'");
+  });
+
+  it("ORIG_HEAD a symbolic ref: written through it, HEAD moved", async () => {
+    await compare("symbolic", (t) => git(t.dir, ["symbolic-ref", "ORIG_HEAD", "refs/heads/foo"]));
+  });
+});

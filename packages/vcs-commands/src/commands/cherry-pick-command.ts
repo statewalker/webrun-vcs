@@ -9,7 +9,13 @@ import { type ContentMergeStrategy, MergeStrategy } from "../results/merge-resul
 import { CommitCommand, type CommitEditor } from "./commit-command.js";
 import { favorOf } from "./merge-command.js";
 import { OperationState } from "./merge-support.js";
-import { type PickOutcome, PickSequencer, SequencerOperation } from "./sequencer-pick.js";
+import { CleanupMode } from "./message-cleanup.js";
+import {
+  type PickCommitMode,
+  type PickOutcome,
+  PickSequencer,
+  SequencerOperation,
+} from "./sequencer-pick.js";
 
 /**
  * Cherry-pick commits onto current branch.
@@ -45,7 +51,7 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
   private reflogPrefix = "cherry-pick:";
   private operation = SequencerOperation.START;
   private committer?: PersonIdent;
-  private edit = false;
+  private edit?: boolean;
   private editor?: CommitEditor;
 
   /**
@@ -176,7 +182,10 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
    * by `git commit -n -e`: the message goes through the editor ({@link setEditor}) in git
    * commit's template (with its help and status, as `commit.status` says), with git
    * commit's prepare-commit-msg (told `merge`) and post-commit hooks, and without pre-commit
-   * or commit-msg. `false` (`--no-edit`, the default here) commits the message as it is.
+   * or commit-msg. `false` (`--no-edit`) commits the message as it is, as does leaving it unset
+   * (the default). Given either way, it is saved in `sequencer/opts` (`options.edit`) for a
+   * run of several commits: `--continue` then commits a resolved conflict under `--edit` by
+   * plain `git commit` (its editor, every hook), and edits the picks after it.
    */
   setEdit(edit: boolean): this {
     this.checkCallable();
@@ -194,13 +203,23 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
     return this;
   }
 
-  /** git's run_git_commit for an edited cherry-pick: `git commit -n -e`, GIT_REFLOG_ACTION set. */
-  private async gitCommit(reflogAction: string) {
-    const commit = new CommitCommand(this.workingCopy)
-      .shareHooksOf(this, { GIT_REFLOG_ACTION: reflogAction })
-      .setNoVerify(true)
-      .setEdit(true)
-      .setReflogAction(reflogAction);
+  /**
+   * The sequencer's `git commit`: run_git_commit's `git commit -n -e` for an edited cherry-pick
+   * (GIT_REFLOG_ACTION set), or continue_single_pick's `git commit` for a resolved conflict
+   * (`--no-edit --cleanup=strip` unless edited; every hook, its own reflog message).
+   */
+  private async gitCommit(mode: PickCommitMode) {
+    const commit = new CommitCommand(this.workingCopy);
+    if (mode.kind === "pick") {
+      commit
+        .shareHooksOf(this, { GIT_REFLOG_ACTION: mode.reflogAction })
+        .setNoVerify(true)
+        .setEdit(true)
+        .setReflogAction(mode.reflogAction);
+    } else {
+      commit.shareHooksOf(this).setEdit(mode.edit);
+      if (!mode.edit) commit.setCleanupMode(CleanupMode.STRIP);
+    }
     if (this.editor) commit.setEditor(this.editor);
     if (this.committer) commit.setCommitterIdent(this.committer);
     const status = RemoteConfigStore.from(this.workingCopy).value("commit.status");
@@ -239,7 +258,7 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
         state: new OperationState(this.workingCopy.checkout, this.refsStore),
         resolve: (name) => this.resolveRef(name),
         hooks: this.hooks,
-        gitCommit: (action) => this.gitCommit(action),
+        gitCommit: (mode) => this.gitCommit(mode),
       },
       {
         action: "pick",

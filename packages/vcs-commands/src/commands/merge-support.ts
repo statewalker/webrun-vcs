@@ -11,6 +11,7 @@ import {
   collectTreeBytes,
   FileMode,
   type ObjectId,
+  type RefLogOptions,
   type TreeEntry,
 } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
@@ -676,15 +677,22 @@ export class OperationState {
    * given the value it read: a ref store with a transaction hook shows it, and checks it under
    * the lock (a store that cannot batch the ref writes it plainly).
    */
-  async setRef(name: string, id: ObjectId, options?: { old: ObjectId | null }): Promise<void> {
+  async setRef(
+    name: string,
+    id: ObjectId,
+    options?: { old: ObjectId | null; log?: RefLogOptions },
+  ): Promise<void> {
     if (options) {
-      const result = await this.refs.batch([{ name, old: options.old, new: id }]);
+      const result = await this.refs.batch([{ name, old: options.old, new: id }], options.log);
       if (result.ok) return;
       if (
         !result.rejected.every((r) => r.reason === "invalid-name" || r.reason === "unsupported")
       ) {
-        throw new Error(
-          `cannot update ${name}: ${result.rejected.map((r) => `${r.name}: ${r.reason}`).join(", ")}`,
+        throw Object.assign(
+          new Error(
+            `cannot update ${name}: ${result.rejected.map((r) => `${r.name}: ${r.reason}`).join(", ")}`,
+          ),
+          { rejected: result.rejected },
         );
       }
     }

@@ -13,6 +13,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -20,7 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import type { Git } from "../src/index.js";
+import { type Git, SequencerOperation } from "../src/index.js";
 import {
   type HookTwin,
   hookLines,
@@ -200,6 +201,156 @@ describeGit("cherry-pick -e and revert -e: git commit -n -e (as native git)", ()
       },
       "emptied",
       "EMPTY",
+    );
+  });
+});
+
+/**
+ * main: x (1), y, x (3), checked out; side (off the first commit): c, x (2), d. Picking
+ * side~2..side conflicts on side~1, reverting main~2 (x two) on x.
+ */
+function conflictBase(dir: string): void {
+  mkdirSync(dir, { recursive: true });
+  git(dir, ["init", "-q", "-b", "main"]);
+  const commit = (name: string, text: string, subject: string) => {
+    putFile(dir, name, text);
+    git(dir, ["add", name]);
+    git(dir, ["commit", "-qm", subject]);
+  };
+  commit("x", "1\n", "x one");
+  git(dir, ["branch", "side"]);
+  commit("x", "2\n", "x two");
+  commit("y", "y\n", "add y");
+  commit("x", "3\n", "x three");
+  git(dir, ["checkout", "-q", "side"]);
+  commit("c", "c\n", "add c");
+  commit("x", "side\n", "x side");
+  commit("d", "d\n", "add d");
+  git(dir, ["checkout", "-q", "main"]);
+  installHooks(join(dir, ".git/hooks"), HOOKS);
+}
+
+type Starter = (g: Git, edit: ReturnType<typeof editorOf>) => Promise<{ output: string }>;
+
+/**
+ * A run that stops at a conflict (`args` in native git, `start` in ours), `x` resolved and
+ * added in both, then `--continue` (`command` names cherry-pick or revert): the opts saved,
+ * the hook logs (the editor's texts in them), hook output, the commits and their reflog.
+ */
+async function expectContinueTwins(
+  dir: string,
+  command: "cherry-pick" | "revert",
+  args: string[],
+  start: Starter,
+  label: string,
+): Promise<void> {
+  const [theirs, mine] = hookTwins(root, dir);
+  const line = "edited line";
+  const extra = { GIT_EDITOR: editorScript(), EDIT_LINE: line };
+  const native = nativeIn(theirs, root, args, extra);
+  const g = await oursIn(mine, extra);
+  const ours = await start(g, editorOf(mine, line));
+  expect(native.status, `${label}: native stops (${native.stderr})`).not.toBe(0);
+  const opts = (d: string) => {
+    const path = join(d, ".git/sequencer/opts");
+    return existsSync(path) ? readFileSync(path, "latin1") : "<none>";
+  };
+  expect(opts(mine.dir), `${label}: sequencer/opts`).toBe(opts(theirs.dir));
+  for (const twin of [theirs, mine]) {
+    putFile(twin.dir, "x", "resolved\n");
+    git(twin.dir, ["add", "x"]);
+  }
+  const nativeContinue = nativeIn(theirs, root, [command, "--continue"], extra);
+  const g2 = await oursIn(mine, extra);
+  const next = command === "cherry-pick" ? g2.cherryPick() : g2.revert();
+  next.setOperation(SequencerOperation.CONTINUE).setEditor(editorOf(mine, line));
+  const result = await next.call();
+  expect(hookLog(mine), `${label}: log`).toBe(hookLog(theirs));
+  expect(hookLines(ours.output + next.getHookOutput()), `${label}: output`).toBe(
+    hookLines(native.stderr + nativeContinue.stderr),
+  );
+  expect(result.status === "ok", `${label}: ok (${nativeContinue.stderr})`).toBe(
+    nativeContinue.status === 0,
+  );
+  const show = (d: string) =>
+    git(d, ["log", "-4", "--format=%H%n%an <%ae> %ad%n%B", "HEAD"]) +
+    git(d, ["reflog", "-4", "--format=%gs"]);
+  expect(show(mine.dir), `${label}: HEAD`).toBe(show(theirs.dir));
+  for (const file of ["CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_MSG", "AUTO_MERGE", "sequencer"]) {
+    expect(existsSync(join(mine.dir, ".git", file)), `${label}: ${file}`).toBe(
+      existsSync(join(theirs.dir, ".git", file)),
+    );
+  }
+}
+
+describeGit("cherry-pick -e and revert -e through a conflict (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-pick-edit-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("cherry-pick -e: options.edit saved, --continue commits the conflict with git commit's editor", async () => {
+    const dir = join(root, "r");
+    conflictBase(dir);
+    await expectContinueTwins(
+      dir,
+      "cherry-pick",
+      ["cherry-pick", "-e", "side~2", "side~1", "side"],
+      async (g, edit) => {
+        const command = g
+          .cherryPick()
+          .include("side~2")
+          .include("side~1")
+          .include("side")
+          .setEdit(true)
+          .setEditor(edit);
+        await command.call();
+        return { output: command.getHookOutput() };
+      },
+      "cherry-pick -e continue",
+    );
+  });
+
+  it("cherry-pick --no-edit: options.edit = false, --continue without the editor", async () => {
+    const dir = join(root, "r");
+    conflictBase(dir);
+    await expectContinueTwins(
+      dir,
+      "cherry-pick",
+      ["cherry-pick", "--no-edit", "side~2", "side~1", "side"],
+      async (g, edit) => {
+        const command = g
+          .cherryPick()
+          .include("side~2")
+          .include("side~1")
+          .include("side")
+          .setEdit(false)
+          .setEditor(edit);
+        await command.call();
+        return { output: command.getHookOutput() };
+      },
+      "cherry-pick --no-edit continue",
+    );
+  });
+
+  it("revert -e: --continue commits the conflict with git commit's editor, then edits the rest", async () => {
+    const dir = join(root, "r");
+    conflictBase(dir);
+    await expectContinueTwins(
+      dir,
+      "revert",
+      ["revert", "-e", "HEAD~2", "HEAD~1"],
+      async (g, edit) => {
+        const command = g
+          .revert()
+          .include("HEAD~2")
+          .include("HEAD~1")
+          .setEdit(true)
+          .setEditor(edit);
+        await command.call();
+        return { output: command.getHookOutput() };
+      },
+      "revert -e continue",
     );
   });
 });

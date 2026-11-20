@@ -3,6 +3,7 @@ import { compareRefNames, isValidTagName, ObjectType } from "@statewalker/vcs-co
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import {
+  GitApiError,
   InvalidTagNameError,
   RefAlreadyExistsError,
   RefNotFoundError,
@@ -309,15 +310,18 @@ export class DeleteTagCommand extends GitCommand<string[]> {
     this.checkCallable();
     this.setCallable(false);
 
-    // git's delete_tags: each name checked (a missing one reported, the others still
+    // git's delete_tags: each name checked (each missing one reported, the others still
     // deleted), then all of them deleted with one delete_refs
     const toDelete: string[] = [];
-    let refusal: Error | undefined;
+    const refusals: { error: GitApiError; text: string }[] = [];
     for (const name of this.tags) {
       const refName = name.startsWith("refs/") ? name : `refs/tags/${name}`;
       if (!(await this.refsStore.has(refName))) {
         // git's delete_tags: error("tag '%s' not found."), exit status 1
-        refusal ??= new RefNotFoundError(refName, `Tag '${name}' not found`).withExitCode(1);
+        refusals.push({
+          error: new RefNotFoundError(refName, `Tag '${name}' not found`).withExitCode(1),
+          text: `error: tag '${name}' not found.`,
+        });
         continue;
       }
       if (!toDelete.includes(refName)) toDelete.push(refName);
@@ -325,7 +329,7 @@ export class DeleteTagCommand extends GitCommand<string[]> {
 
     const { removed: deleted, error } =
       toDelete.length > 0 ? await this.removeRefsAsGit(toDelete) : { removed: [] };
-    if (refusal) throw refusal;
+    if (refusals.length > 0) throw GitApiError.ofRefusals(refusals);
     if (error !== undefined) throw error;
     return deleted;
   }

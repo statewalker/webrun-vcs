@@ -3,7 +3,7 @@
  *
  * - A single-ref batch locks `<ref>.lock` (O_CREAT|O_EXCL), re-checks under the
  *   lock, writes the new value into the lock and renames it over the ref.
- * - A multi-ref batch locks every ref (in git's name order) and then
+ * - A multi-ref batch locks every ref (in name order) and then
  *   `packed-refs.lock`, and commits as JGit's PackedBatchRefUpdate does: first
  *   the involved loose refs move into packed-refs (values unchanged for
  *   readers), then the whole batch lands in packed-refs with one rename.
@@ -773,6 +773,7 @@ export function createFilesRefOps(
     let packedHeld = false;
     try {
       // the ref itself first, then the refs that only log the update, as git orders them
+      // (a multi-ref batch takes the refs it updates in name order, then these: see there)
       for (const n of [u.name, ...extra]) {
         const r = await lock(n, refLockTimeout, n === u.name ? content : new Uint8Array(0));
         if (r !== "ok") {
@@ -864,19 +865,27 @@ export function createFilesRefOps(
     hook: RefTransactionHook | undefined,
     after: AfterLocks,
   ): Promise<BatchResult> {
-    // locked in the transaction's order, then the refs that only log an update (HEAD), as
-    // git's files_transaction_prepare appends their log-only updates
+    // git's files_transaction_prepare takes the locks in the transaction's order, then the
+    // refs that only log an update (HEAD). Ours takes the refs it updates in name order, so
+    // two batches naming the same refs in opposite orders can never each hold a lock the
+    // other waits for (with core.filesRefLockTimeout < 0 they would wait forever), then the
+    // log-only ones, as a single update (ours or git's) takes them after its ref. What git
+    // shows (the hook's lines, the ref a held lock fails on) keeps the transaction's order
     const extra = updates.flatMap((u) => u.reflogAlso);
-    const names = [...new Set([...updates.map((u) => u.name), ...extra])];
+    const own = [...new Set(updates.map((u) => u.name))];
+    const names = [...new Set([...own, ...extra])];
+    const lockOrder = [...[...own].sort(compareRefNames), ...names.filter((n) => !own.includes(n))];
     const deleting = updates.filter((u) => u.newValue === null).map((u) => u.name);
     const held: string[] = [];
     let packedHeld = false;
     try {
-      for (const n of names) {
+      for (const n of lockOrder) {
         const r = await lock(n, refLockTimeout);
         if (r !== "ok") {
-          // the packed store's transaction, holding the deletions locked so far, given up
-          const before = deleting.filter((d) => held.includes(d));
+          // the packed store's transaction, holding the deletions git would have locked
+          // before this ref (those ahead of it in the transaction), given up
+          const at = names.indexOf(n);
+          const before = deleting.filter((d) => names.indexOf(d) < at);
           if (before.length > 0) {
             await hook?.("aborted", packedUpdates(before), { packed: true });
           }
@@ -1050,9 +1059,14 @@ export function createFilesRefOps(
     return out;
   }
 
-  const batch = async (
+  const batch = (commands: RefCommand[], batchOptions: BatchOptions = {}) =>
+    batchAs(commands, batchOptions);
+
+  /** `batch`; `requestedAs`: the symbolic root ref the one command was asked of (see there). */
+  const batchAs = async (
     commands: RefCommand[],
-    batchOptions: BatchOptions = {},
+    batchOptions: BatchOptions,
+    requestedAs?: string,
   ): Promise<BatchResult> => {
     if (commands.length === 0) {
       const hook = batchOptions.emptyTransaction ? options.transactionHook?.() : undefined;
@@ -1068,8 +1082,17 @@ export function createFilesRefOps(
       }
       return { ok: true, rejected: [] };
     }
-    // a root ref (ORIG_HEAD, ...) written on its own, as git's refs_update_ref writes it
+    // a root ref (ORIG_HEAD, ...) written on its own, as git's refs_update_ref writes it; a
+    // symbolic one naming a ref under refs/ (unless replaced) is written through to that ref,
+    // the hook told the root ref asked for, as git splits a symbolic ref's update
     const only = commands.length === 1 ? commands[0] : undefined;
+    const rootTarget =
+      only && !only.noDeref && isRootRefName(only.name)
+        ? await symbolicTarget(only.name)
+        : undefined;
+    if (only && rootTarget?.startsWith("refs/")) {
+      return batchAs([{ ...only, name: rootTarget }], batchOptions, only.name);
+    }
     if (only && only.new !== null && isRootRefName(only.name) && isRefObjectId(only.new)) {
       try {
         await writeRootRef(only.name, only.new, only.old);
@@ -1093,6 +1116,7 @@ export function createFilesRefOps(
     if (!plan.ok) return fail(plan.rejected);
     const updates: Update[] = plan.updates.map((u, i) => ({
       ...u,
+      ...(requestedAs !== undefined ? { requested: requestedAs } : {}),
       ...(options.logHeadUpdates === false && u.name !== "HEAD"
         ? { reflogAlso: u.reflogAlso.filter((n) => n !== "HEAD") }
         : {}),
@@ -1175,6 +1199,12 @@ export function createFilesRefOps(
     }
   }
 
+  /** The ref the loose file of `name` names when it is a symbolic ref (`ref: ...`). */
+  async function symbolicTarget(name: string): Promise<string | undefined> {
+    const loose = await readLoose(name).catch(() => undefined);
+    return loose && "target" in loose ? loose.target : undefined;
+  }
+
   async function writeRootRef(name: string, id: ObjectId, old?: ObjectId | null): Promise<void> {
     const hook = rootRefHook(options.transactionHook?.(), name);
     const told: RefTransactionUpdate[] = [
@@ -1231,6 +1261,24 @@ export function createFilesRefOps(
       name.startsWith("refs/") || isRootRefName(name)
         ? rootRefHook(options.transactionHook?.(), name)
         : undefined;
+    if (!hook && isRootRefName(name)) {
+      // a root ref (AUTO_MERGE, CHERRY_PICK_HEAD, ...) is never packed: without a hook to
+      // tell of git's nested packed-refs transaction, unlinked under its own lock, with
+      // neither packed-refs.lock taken nor packed-refs read (as every commit, reset and
+      // checkout deletes some)
+      const r = await lock(name, refLockTimeout);
+      if (r === "held") throw new RefUpdateRejectedError([{ name, reason: "locked" }]);
+      try {
+        const loose = await files.exists(name);
+        if (loose) await removeAndPrune(name);
+        if (await files.exists(`logs/${name}`)) {
+          await removeAndPrune(`logs/${name}`).catch(() => {});
+        }
+        return loose;
+      } finally {
+        if (r === "ok") await unlock(name);
+      }
+    }
     const told = packedUpdates([name]);
     // packed-refs.lock found held: git 2.43's delete_refs gives up before any hook runs
     let packedBusy = false;

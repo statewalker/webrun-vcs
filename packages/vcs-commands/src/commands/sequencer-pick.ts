@@ -7,7 +7,7 @@
  */
 
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
-import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import { compareGitPaths, parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 import { GitApiError } from "../errors/git-api-error.js";
 import {
@@ -86,13 +86,22 @@ export interface SequencerDeps extends MergeWriteContext {
   /** The hooks of the command (prepare-commit-msg and post-commit around each commit) */
   hooks?: HookSession;
   /**
-   * `git commit -n -e` as git's run_git_commit runs it for a pick with `--edit` (EDIT_MSG
-   * without VERIFY_MSG): MERGE_MSG as the template of the editor, `reflogAction` as its
-   * GIT_REFLOG_ACTION; the commit made, or the error that stopped it (its editor, an empty
-   * message). Needed for {@link PickOptions.edit}.
+   * A `git commit` run by the sequencer; the commit made, or the error that stopped it (its
+   * editor, an empty message, a hook). `pick`: `git commit -n -e` as git's run_git_commit
+   * runs it for a pick with `--edit` (EDIT_MSG without VERIFY_MSG): MERGE_MSG as the
+   * template of the editor, `reflogAction` as its GIT_REFLOG_ACTION. `continue`:
+   * continue_single_pick's `git commit` for a resolved conflict, `--no-edit --cleanup=strip`
+   * unless `edit` (its editor): every hook (pre-commit and commit-msg too), its own reflog
+   * message, no GIT_REFLOG_ACTION. Needed for {@link PickOptions.edit}; without it a
+   * resolved conflict is committed in process.
    */
-  gitCommit?: (reflogAction: string) => Promise<ObjectId>;
+  gitCommit?: (mode: PickCommitMode) => Promise<ObjectId>;
 }
+
+/** The `git commit` the sequencer runs (see {@link SequencerDeps.gitCommit}). */
+export type PickCommitMode =
+  | { kind: "pick"; reflogAction: string }
+  | { kind: "continue"; edit: boolean };
 
 /** Options of one sequencer run. */
 export interface PickOptions {
@@ -111,7 +120,10 @@ export interface PickOptions {
   reflogAction?: string;
   /**
    * `--edit`: each pick that merges cleanly is committed by `git commit -n -e` (see
-   * {@link SequencerDeps.gitCommit}), its message edited, with git commit's hooks
+   * {@link SequencerDeps.gitCommit}), its message edited, with git commit's hooks; a
+   * conflict resolved and continued is committed by `git commit` with its editor. `false`
+   * is `--no-edit` given; both are saved in `sequencer/opts` for `--continue` and `--skip`
+   * (git's `options.edit`), left out when neither was given.
    */
   edit?: boolean;
 }
@@ -133,6 +145,8 @@ export class PickSequencer {
   private clock?: number;
   /** git's find_unique_abbrev (`core.abbrev`) for labels, messages and the todo */
   private readonly abbreviator: IdAbbreviator;
+  /** `--edit` / `--no-edit` (git's opts->edit, unset: undefined), read back from the opts */
+  private edit: boolean | undefined;
 
   constructor(
     private readonly deps: SequencerDeps,
@@ -140,6 +154,7 @@ export class PickSequencer {
   ) {
     this.flats = new FlatTreeCache(deps.trees);
     this.abbreviator = createIdAbbreviator(deps.workingCopy);
+    this.edit = options.edit;
   }
 
   private get name(): string {
@@ -177,8 +192,11 @@ export class PickSequencer {
       await state.write("sequencer/head", `${headId}\n`);
       await this.writeTodo(todo);
       await state.write("sequencer/abort-safety", `${headId}\n`);
-      if (this.options.noCommit)
-        await state.write("sequencer/opts", "[options]\n\tno-commit = true\n");
+      // save_opts: options.no-commit, then options.edit when given (git config's format)
+      const opts: string[] = [];
+      if (this.options.noCommit) opts.push("\tno-commit = true\n");
+      if (this.edit !== undefined) opts.push(`\tedit = ${this.edit}\n`);
+      if (opts.length > 0) await state.write("sequencer/opts", `[options]\n${opts.join("")}`);
     }
     return this.run(todo, todo.length > 1);
   }
@@ -367,7 +385,7 @@ export class PickSequencer {
         ].join("\n"),
       };
     }
-    if (this.options.edit && deps.gitCommit) {
+    if (this.edit && deps.gitCommit) {
       // do_pick_commit with EDIT_MSG: the message in MERGE_MSG, CHERRY_PICK_HEAD for a pick
       // (git commit then takes its author and says it concludes a cherry-pick), then
       // run_git_commit; git commit cleans up after itself (CHERRY_PICK_HEAD, MERGE_MSG)
@@ -375,7 +393,10 @@ export class PickSequencer {
       await deps.state.write("MERGE_MSG", message);
       let newHead: ObjectId;
       try {
-        newHead = await deps.gitCommit(this.options.reflogAction ?? ACTION_NAME[action]);
+        newHead = await deps.gitCommit({
+          kind: "pick",
+          reflogAction: this.options.reflogAction ?? ACTION_NAME[action],
+        });
       } catch (error) {
         if (!(error instanceof GitApiError)) throw error;
         // the commit failed (an empty message, its editor): the pick stays in progress
@@ -383,6 +404,8 @@ export class PickSequencer {
       }
       return { status: "ok", newHead, picked: [item.id], output };
     }
+    // do_pick_commit records CHERRY_PICK_HEAD for a clean pick too, before do_commit
+    if (action === "pick") await deps.state.setRef(HEAD_REF[action], item.id);
     const committer = this.committer();
     const commitMessage = action === "pick" ? commit.message : message;
     const newHead = await this.commit(
@@ -413,6 +436,7 @@ export class PickSequencer {
     }
     const { unmerged } = await readIndex(this.deps.staging);
     if (unmerged.length > 0) return this.fail(UNMERGED_FILES_MESSAGE("Committing"));
+    await this.readSavedOptions();
     let todo = sequenced ? await this.readTodo() : [];
     let newHead = await this.headId();
     if (stopped) {
@@ -420,19 +444,36 @@ export class PickSequencer {
       const commit = await this.deps.commits.load(stopped);
       if (!commit) throw new RefNotFoundError(stopped, "Commit being picked not found");
       const treeId = await this.deps.staging.writeTree(this.deps.trees);
-      const committer = this.committer();
+      const headCommit = await this.deps.commits.load(newHead);
       const fallback = this.messageFor(action, stopped, commit, commit.parents[0]);
       const prepared = (await state.read("MERGE_MSG")) ?? fallback;
-      // continue_single_pick runs `git commit --no-edit --cleanup=strip`: its prepare_to_commit
-      // writes MERGE_MSG with its whitespace cleaned up (comments kept) to COMMIT_EDITMSG,
-      // before a commit with nothing to commit is refused
-      await state.write("COMMIT_EDITMSG", stripspace(prepared));
-      const headCommit = await this.deps.commits.load(newHead);
+      // continue_single_pick runs `git commit --no-edit --cleanup=strip` (plain `git commit`
+      // under --edit): without the editor its prepare_to_commit writes MERGE_MSG with its
+      // whitespace cleaned up (comments kept) to COMMIT_EDITMSG, before a commit with nothing
+      // to commit is refused
+      if (!this.edit) await state.write("COMMIT_EDITMSG", stripspace(prepared));
       if (headCommit?.tree === treeId) {
         return this.fail(
           `The previous ${ACTION_NAME[action]} is now empty, possibly due to conflict resolution.`,
         );
       }
+      if (this.deps.gitCommit) {
+        // git commit itself: its hooks (pre-commit and commit-msg too), its reflog message,
+        // and it ends the stopped pick (CHERRY_PICK_HEAD, REVERT_HEAD, MERGE_MSG, AUTO_MERGE)
+        try {
+          newHead = await this.deps.gitCommit({ kind: "continue", edit: this.edit === true });
+        } catch (error) {
+          if (!(error instanceof GitApiError)) throw error;
+          return this.fail(error.message);
+        }
+        if (todo[0]?.id === stopped) todo = todo.slice(1);
+        if (!sequenced) return { status: "ok", newHead, picked: [stopped], output: [] };
+        await this.writeTodo(todo);
+        await state.write("sequencer/abort-safety", `${newHead}\n`);
+        const outcome = await this.run(todo, true);
+        return { ...outcome, picked: [stopped, ...outcome.picked] };
+      }
+      const committer = this.committer();
       const message = cleanupMessage(prepared);
       newHead = await this.commit(
         treeId,
@@ -463,16 +504,18 @@ export class PickSequencer {
     if (!stopped) {
       return this.fail(`error: no cherry-pick or revert in progress\nfatal: ${this.name} failed`);
     }
+    await this.readSavedOptions();
     const headId = await this.headId();
     const refused = await resetMerge(this.deps, headId, "HEAD");
     if (refused) return this.fail(refused.message);
     // git reset --merge <HEAD's id> records ORIG_HEAD, and HEAD's reflog line
-    await this.resetRefs(headId, headId);
+    const errors = await this.resetRefs(headId, headId);
     await state.remove("MERGE_MSG");
     if (!(await this.sequenced())) {
-      return { status: "ok", newHead: headId, picked: [], output: [] };
+      return { status: "ok", newHead: headId, picked: [], output: errors };
     }
-    return this.run((await this.readTodo()).slice(1), true);
+    const outcome = await this.run((await this.readTodo()).slice(1), true);
+    return { ...outcome, output: [...errors, ...outcome.output] };
   }
 
   /** `--abort`: `reset --merge` to where the operation started, its state removed. */
@@ -488,9 +531,9 @@ export class PickSequencer {
       const refused = await resetMerge(this.deps, headId, "HEAD");
       if (refused) return this.fail(refused.message);
       // git's rollback_single_pick: `reset --merge <HEAD's id>`
-      await this.resetRefs(headId, headId);
+      const errors = await this.resetRefs(headId, headId);
       await this.removeState();
-      return { status: "ok", newHead: headId, picked: [], output: [] };
+      return { status: "ok", newHead: headId, picked: [], output: errors };
     }
     const origHead = (await state.read("sequencer/head"))?.trim();
     const safety = (await state.read("sequencer/abort-safety"))?.trim();
@@ -507,9 +550,9 @@ export class PickSequencer {
     const refused = await resetMerge(this.deps, origHead, origHead);
     if (refused) return this.fail(refused.message);
     // git's reset_merge(<sequencer/head>): `reset --merge <id>`
-    await this.resetRefs(headId, origHead);
+    const errors = await this.resetRefs(headId, origHead);
     await this.removeState();
-    return { status: "ok", newHead: origHead, picked: [], output: [] };
+    return { status: "ok", newHead: origHead, picked: [], output: errors };
   }
 
   /** `--quit`: the operation forgotten, index, worktree and HEAD kept. */
@@ -522,9 +565,10 @@ export class PickSequencer {
   /**
    * The refs of the `git reset --merge <target>` git runs (its index and worktree reset
    * already): ORIG_HEAD and HEAD (update_refs), then remove_branch_state (CHERRY_PICK_HEAD,
-   * REVERT_HEAD, AUTO_MERGE and the merge state).
+   * REVERT_HEAD, AUTO_MERGE and the merge state). Returns its `error:` lines for an ORIG_HEAD
+   * it could not write (HEAD moved all the same).
    */
-  private async resetRefs(headId: ObjectId, target: ObjectId): Promise<void> {
+  private async resetRefs(headId: ObjectId, target: ObjectId): Promise<string[]> {
     this.clock ??= Math.floor(Date.now() / 1000);
     const log = reflogLine(
       this.deps.workingCopy,
@@ -532,8 +576,31 @@ export class PickSequencer {
       this.options.committer,
       this.clock,
     );
-    await moveHeadAsReset(this.deps.refs, this.deps.state, headId, target, log);
+    const errors = await moveHeadAsReset(this.deps.refs, this.deps.state, headId, target, log);
     await removeBranchState(this.deps, this.deps.state);
+    return errors;
+  }
+
+  /**
+   * read_populate_opts: `options.edit` of `sequencer/opts` (git config's syntax, the last
+   * value wins), the `--edit` / `--no-edit` the run started with.
+   */
+  private async readSavedOptions(): Promise<void> {
+    const text = await this.deps.state.read("sequencer/opts");
+    if (text === undefined) return;
+    let section = "";
+    for (const raw of text.split("\n")) {
+      const line = raw.trim();
+      const header = /^\[\s*([^\]\s]+)\s*\]/.exec(line);
+      if (header) {
+        section = header[1].toLowerCase();
+        continue;
+      }
+      const entry = /^([A-Za-z][A-Za-z0-9-]*)\s*=\s*(.*)$/.exec(line);
+      if (section !== "options" || !entry || entry[1].toLowerCase() !== "edit") continue;
+      const value = parseGitBool(entry[2].replace(/^"(.*)"$/, "$1"));
+      if (value !== undefined) this.edit = value;
+    }
   }
 
   private async removeState(): Promise<void> {
@@ -607,10 +674,12 @@ export class PickSequencer {
       log,
     );
     if (result.ok) return;
-    // a store that cannot batch (or HEAD moved meanwhile): git's plain update
+    // HEAD moved meanwhile: git's transaction fails on the old value it expects
     if (result.rejected.some((r) => r.reason === "mismatch")) {
       throw new GitApiError(`fatal: cannot lock ref 'HEAD': is at another value`);
     }
+    // a store whose batches cannot take HEAD (no transactions there): HEAD set as that store
+    // sets it, without the old value checked (git has no such path)
     await updateHead(this.deps.refs, id, log);
   }
 

@@ -119,3 +119,82 @@ describe("packed-refs.lock only for batches that need it", () => {
     expect(await refs.has("refs/heads/y")).toBe(false);
   });
 });
+
+describe("lock order of multi-ref batches", () => {
+  /** `run`, or "stuck" when it has not settled after `ms`. */
+  const within = <T>(ms: number, run: Promise<T>) =>
+    Promise.race([run, new Promise<"stuck">((r) => setTimeout(() => r("stuck"), ms))]);
+
+  it("two batches naming the same refs in opposite orders never deadlock (timeout -1)", async () => {
+    const { refs } = await open({ filesRefLockTimeout: "-1", packedRefsTimeout: "-1" });
+    await refs.set("refs/heads/x", oid(1));
+    await refs.set("refs/heads/y", oid(1));
+    const outcome = await within(
+      5000,
+      Promise.all([
+        refs.batch([
+          { name: "refs/heads/y", new: oid(2) },
+          { name: "refs/heads/x", new: oid(2) },
+        ]),
+        refs.batch([
+          { name: "refs/heads/x", new: oid(3) },
+          { name: "refs/heads/y", new: oid(3) },
+        ]),
+      ]),
+    );
+    expect(outcome).not.toBe("stuck");
+    if (outcome === "stuck") return;
+    expect(outcome.map((r) => r.ok)).toEqual([true, true]);
+    const x = (await refs.resolve("refs/heads/x"))?.objectId;
+    expect(x === oid(2) || x === oid(3)).toBe(true);
+    // one batch ran after the other: both refs hold its values
+    expect((await refs.resolve("refs/heads/y"))?.objectId).toBe(x);
+  });
+
+  it("two deletions of the same refs in opposite orders never deadlock (timeout -1)", async () => {
+    const { refs } = await open({ filesRefLockTimeout: "-1", packedRefsTimeout: "-1" });
+    for (const n of ["a", "b", "c"]) await refs.set(`refs/heads/${n}`, oid(1));
+    const outcome = await within(
+      5000,
+      Promise.all([
+        refs.batch([
+          { name: "refs/heads/c", new: null },
+          { name: "refs/heads/a", new: null },
+        ]),
+        refs.batch([
+          { name: "refs/heads/a", new: null },
+          { name: "refs/heads/b", new: null },
+          { name: "refs/heads/c", new: null },
+        ]),
+      ]),
+    );
+    expect(outcome).not.toBe("stuck");
+    for (const n of ["a", "b", "c"]) expect(await refs.has(`refs/heads/${n}`)).toBe(false);
+  });
+});
+
+describe("root ref deletions without a transaction hook", () => {
+  it("never take packed-refs.lock: a held one does not fail them", async () => {
+    const { files, refs } = await open({ packedRefsTimeout: "0" });
+    await refs.set("AUTO_MERGE", oid(1));
+    await refs.set("CHERRY_PICK_HEAD", oid(2));
+    await hold(files, PACKED_LOCK);
+    expect(await refs.remove("AUTO_MERGE")).toBe(true);
+    expect(await refs.remove("CHERRY_PICK_HEAD")).toBe(true);
+    // absent: nothing to delete
+    expect(await refs.remove("REVERT_HEAD")).toBe(false);
+    expect(await refs.has("AUTO_MERGE")).toBe(false);
+    expect(await files.exists(".git/CHERRY_PICK_HEAD")).toBe(false);
+    expect(await files.exists(".git/AUTO_MERGE.lock")).toBe(false);
+    // the other writer's lock is left alone
+    expect(await files.exists(PACKED_LOCK)).toBe(true);
+  });
+
+  it("a held lock of the root ref itself still fails the deletion", async () => {
+    const { files, refs } = await open({ filesRefLockTimeout: "0" });
+    await refs.set("AUTO_MERGE", oid(1));
+    await hold(files, ".git/AUTO_MERGE.lock");
+    await expect(refs.remove("AUTO_MERGE")).rejects.toThrow();
+    expect((await refs.resolve("AUTO_MERGE"))?.objectId).toBe(oid(1));
+  });
+});
