@@ -385,6 +385,91 @@ describeGit("push hooks: reference-transaction on the receive side (as native gi
     }
   });
 
+  // git 2.5x's execute_commands_non_atomic: update() and the transaction of the deletions,
+  // then update() and the transaction of the rest
+  (nativeIs25x ? it : it.skip)(
+    "2.5x: the update hook runs per phase, the deletions' transaction before the rest's update hooks",
+    async () => {
+      const dir = join(root, "r");
+      const src = join(dir, "src");
+      mkdirSync(src, { recursive: true });
+      git(src, ["init", "-q", "-b", "main"]);
+      putFile(src, "a.txt", "a\n");
+      git(src, ["add", "-A"]);
+      git(src, ["commit", "-qm", "a"]);
+      for (const b of ["b", "d", "x"]) git(src, ["branch", b]);
+      git(dir, ["clone", "-q", "--bare", "src", "bare.git"]);
+      putFile(src, "a.txt", "a2\n");
+      git(src, ["commit", "-qam", "a2"]);
+      for (const b of ["e", "c"]) git(src, ["branch", b]);
+      git(src, ["branch", "-f", "d"]);
+      installHooks(join(dir, "bare.git/hooks"), ["pre-receive", "update", "reference-transaction"]);
+      const refspecs = [
+        "refs/heads/e",
+        "refs/heads/d",
+        ":refs/heads/b",
+        "refs/heads/c",
+        "refs/heads/main:refs/heads/x",
+      ];
+      const setup = (p: PushCommand) => {
+        p.setRemote("../bare.git");
+        for (const r of refspecs) p.add(r);
+      };
+      await expectReftxPush(dir, ["../bare.git", ...refspecs], setup, "phases");
+      const { native } = await expectReftxPush(
+        dir,
+        ["../bare.git", ...refspecs],
+        setup,
+        "refused in the deletion phase",
+        (t) => hookExit(t, "reference-transaction", 1),
+      );
+      expect(native.status).toBe(128);
+    },
+  );
+
+  it("updateInstead: the remote's reference-transaction hook sees the update of its checked-out branch", async () => {
+    const dir = join(root, "r");
+    reftxBase(dir);
+    const dst = join(dir, "dst");
+    mkdirSync(dst);
+    git(dst, ["init", "-q", "-b", "main"]);
+    putFile(dst, "d.txt", "d\n");
+    git(dst, ["add", "-A"]);
+    git(dst, ["commit", "-qm", "d"]);
+    git(dst, ["config", "receive.denyCurrentBranch", "updateInstead"]);
+    installHooks(join(dst, ".git/hooks"), ["reference-transaction"]);
+    const [theirs, mine] = hookTwins(root, dir);
+    const native = gitRun(
+      root,
+      join(theirs.dir, "src"),
+      ["push", "-f", "../dst", "main"],
+      theirs.env,
+    );
+    expect(native.status).toBe(0);
+    const env = mine.env;
+    const ours = await openOurs(
+      mine.dir,
+      createNodeGitHostEnvironment({
+        env,
+        hookRunner: createNodeHookRunner({ env, compatibility: nativeIs25x ? "2.56" : "2.43" }),
+      }),
+      undefined,
+      "src",
+    );
+    const command = ours.push().setRemote("../dst").add("+main");
+    const result = await command.call();
+    expect(result.remoteUpdates[0]?.status).toBe(PushStatus.OK);
+    expect(logOf(theirs)).toContain("== reference-transaction [committed]");
+    expect(logOf(mine)).toBe(logOf(theirs));
+    expect(hookLines(command.getHookOutput())).toBe(hookLines(native.stderr));
+    expect(git(join(mine.dir, "dst"), ["for-each-ref"])).toBe(
+      git(join(theirs.dir, "dst"), ["for-each-ref"]),
+    );
+    expect(git(join(mine.dir, "dst"), ["status", "--porcelain"])).toBe(
+      git(join(theirs.dir, "dst"), ["status", "--porcelain"]),
+    );
+  });
+
   it("a refusal in prepared: receive-pack dies, no ref moves", async () => {
     const dir = join(root, "r");
     reftxBase(dir);

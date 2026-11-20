@@ -10,13 +10,15 @@
  * deletion of AUTO_MERGE a commit makes (a transaction that ends `aborted`), which ours
  * writes without one, so those transactions are left out of native's log here.
  */
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RefTransactionAbortedError } from "@statewalker/vcs-core";
+import { RefTransactionAbortedError, type RefTransactionHook } from "@statewalker/vcs-core";
+import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import type { Git } from "../src/index.js";
+import { type Git, HookSession, refTransactionHookOf } from "../src/index.js";
 import {
   type HookTwin,
   hookExit,
@@ -25,10 +27,12 @@ import {
   hookTwins,
   installHooks,
   nativeIn,
+  nativeIs25x,
   oursIn,
 } from "./hooks-native-support.js";
+import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
-import { gitOut, putFile } from "./status-native-support.js";
+import { gitOut, putFile, testEnv } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -219,6 +223,91 @@ describeGit("reference-transaction hook: after the locks, and deletions (as nati
   });
 });
 
+describeGit("reference-transaction hook: a deletion failing on a held lock (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx-held-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  // git frees the failed transaction without ref_transaction_abort: the hook hears no
+  // `aborted` for it, only for the packed store's transaction files_transaction_cleanup
+  // gives up when packed-refs.lock is held
+  it("a held ref lock or packed-refs.lock: update-ref -d, branch -D and a batch of deletions", async () => {
+    type Store = {
+      setTransactionHook(hook: RefTransactionHook | undefined): void;
+      remove(name: string): Promise<boolean>;
+      batch(commands: Array<{ name: string; new: null }>): Promise<{ ok: boolean }>;
+    };
+    const ops: Array<[string, string[], string | undefined, (g: Git) => Promise<unknown>]> = [
+      [
+        "update-ref -d",
+        ["update-ref", "-d", "refs/heads/topic"],
+        undefined,
+        (g) => (g.workingCopy.history.refs as unknown as Store).remove("refs/heads/topic"),
+      ],
+      [
+        "branch -D",
+        ["branch", "-D", "topic"],
+        undefined,
+        (g) => g.branchDelete().setBranchNames("topic").setForce(true).call(),
+      ],
+      [
+        "update-ref --stdin",
+        ["update-ref", "--stdin"],
+        "delete refs/heads/topic\ndelete refs/heads/other\n",
+        (g) =>
+          (g.workingCopy.history.refs as unknown as Store).batch([
+            { name: "refs/heads/topic", new: null },
+            { name: "refs/heads/other", new: null },
+          ]),
+      ],
+    ];
+    for (const held of ["refs/heads/topic.lock", "packed-refs.lock"]) {
+      for (const packed of [false, true]) {
+        const dir = join(root, `r-${held.length}-${packed}`);
+        base(dir);
+        git(dir, ["branch", "topic"]);
+        git(dir, ["branch", "other"]);
+        if (packed) git(dir, ["pack-refs", "--all"]);
+        // (native gives up on packed-refs.lock at once; ours waits its default second)
+        git(dir, ["config", "core.packedRefsTimeout", "0"]);
+        for (const [label, args, input, run] of ops) {
+          const name = `${held} packed=${packed} ${label}`;
+          const [theirs, mine] = hookTwins(root, dir);
+          for (const t of [theirs, mine]) writeFileSync(join(t.dir, ".git", held), "");
+          const native = spawnSync("git", args, {
+            cwd: theirs.dir,
+            env: theirs.env,
+            input: input ?? "",
+          });
+          expect(native.status, name).not.toBe(0);
+          const g = await oursIn(mine);
+          const store = g.workingCopy.history.refs as unknown as Store;
+          const session = new HookSession(g.workingCopy);
+          store.setTransactionHook(refTransactionHookOf(session));
+          let failed = false;
+          try {
+            const result = await run(g);
+            failed = (result as { ok?: boolean } | undefined)?.ok === false;
+          } catch {
+            failed = true;
+          }
+          store.setTransactionHook(undefined);
+          expect(failed, name).toBe(true);
+          expect(hookLog(mine), name).toBe(hookLog(theirs));
+          rmSync(join(theirs.dir, ".git", held));
+          rmSync(join(mine.dir, ".git", held));
+          // (git 2.43's delete_refs drops a packed ref before it finds its loose ref locked;
+          // ours deletes nothing then)
+          if (nativeIs25x || held === "packed-refs.lock" || label !== "branch -D") {
+            expect(git(mine.dir, ["for-each-ref"]), name).toBe(git(theirs.dir, ["for-each-ref"]));
+          }
+        }
+      }
+    }
+  }, 60_000);
+});
+
 describeGit("reference-transaction hook: installed only while the command runs", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hooks-reftx3-"));
@@ -241,5 +330,24 @@ describeGit("reference-transaction hook: installed only while the command runs",
     expect(command.getHookOutput()).toBe(outputBefore);
     const store = g.workingCopy.history.refs as { getTransactionHook?(): unknown };
     expect(store.getTransactionHook?.()).toBeUndefined();
+  });
+
+  it("a command without hooks leaves a hook someone else set on the store", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    const g = await openOurs(dir, createNodeGitHostEnvironment({ env: testEnv(root) }));
+    const store = g.workingCopy.history.refs as unknown as {
+      setTransactionHook(hook: RefTransactionHook | undefined): void;
+      getTransactionHook(): RefTransactionHook | undefined;
+    };
+    const states: string[] = [];
+    const foreign: RefTransactionHook = async (state) => {
+      states.push(state);
+      return true;
+    };
+    store.setTransactionHook(foreign);
+    await g.branchCreate().setName("topic").call();
+    expect(store.getTransactionHook()).toBe(foreign);
+    expect(states).toContain("committed");
   });
 });

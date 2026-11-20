@@ -707,6 +707,7 @@ export function createFilesRefOps(
     const extra = [...new Set(u.reflogAlso)].filter((n) => n !== u.name);
     const held: string[] = [];
     let ours = true;
+    let packedHeld = false;
     try {
       // the ref itself first, then the refs that only log the update, as git orders them
       for (const n of [u.name, ...extra]) {
@@ -732,12 +733,22 @@ export function createFilesRefOps(
         return fail([{ name: u.requested, reason: "mismatch" }]);
       }
       const deleting = u.newValue === null ? [u.name] : [];
+      // a deletion locks packed-refs before the hook hears `prepared`, as
+      // files_transaction_prepare: held, the packed store's transaction is given up
+      // (`aborted`), the main one only freed
+      if (deleting.length > 0) {
+        if ((await lock(PACKED, packedLockTimeout)) !== "ok") {
+          await hook?.("aborted", packedUpdates(deleting), { packed: true });
+          return fail([{ name: PACKED, reason: "locked" }]);
+        }
+        packedHeld = true;
+      }
       const packedCommit = await packedPhase(hook, deleting, packed.has(u.name));
       if (!(await prepared(hook, [u], after))) return fail([]);
       if (u.newValue === null) {
-        if ((await deleteUnderPackedLock(u.name)) === "held") {
-          return fail([{ name: PACKED, reason: "locked" }]);
-        }
+        await deleteHoldingPackedLock(u.name);
+        await files.remove(`${PACKED}.lock`).catch(() => false);
+        packedHeld = false;
         if (packedCommit) await hook?.("committed", packedUpdates(deleting), { packed: true });
         await writeLogs([u], () => curId, o);
       } else {
@@ -749,6 +760,7 @@ export function createFilesRefOps(
       after.committed = true;
       return { ok: true, rejected: [] };
     } finally {
+      if (packedHeld) await files.remove(`${PACKED}.lock`).catch(() => false);
       for (const n of held) if (n !== u.name || ours) await unlock(n);
     }
   }
@@ -758,20 +770,18 @@ export function createFilesRefOps(
    * it: a pack-refs that holds the lock may be packing this loose ref right now. In one
    * pass under the lock: drop the ref from packed-refs if the fresh copy names it, then
    * remove the loose file, before the lock is released, so no pack-refs can copy the
-   * loose value back in between. The caller holds `<name>.lock` (or knows no loose file
-   * can exist there).
+   * loose value back in between. The caller holds `packed-refs.lock` (released by the
+   * caller) and `<name>.lock` (or knows no loose file can exist there).
    */
-  async function deleteUnderPackedLock(
+  async function deleteHoldingPackedLock(
     name: string,
-  ): Promise<{ packed: boolean; loose: boolean } | "held"> {
-    return withPackedLock(async (commit) => {
-      const fresh = await readPacked();
-      const packed = fresh.delete(name);
-      if (packed) await commit(serializePacked(fresh));
-      const loose = await files.exists(name);
-      if (loose) await removeAndPrune(name);
-      return { packed, loose };
-    });
+  ): Promise<{ packed: boolean; loose: boolean }> {
+    const fresh = await readPacked();
+    const packed = fresh.delete(name);
+    if (packed) await commitPacked(serializePacked(fresh));
+    const loose = await files.exists(name);
+    if (loose) await removeAndPrune(name);
+    return { packed, loose };
   }
 
   async function multi(
@@ -805,6 +815,11 @@ export function createFilesRefOps(
         held.push(n);
       }
       if ((await lock(PACKED, packedLockTimeout)) !== "ok") {
+        // the packed store's transaction of the deletions given up (files_transaction_cleanup)
+        const deleting = updates.filter((u) => u.newValue === null).map((u) => u.name);
+        if (deleting.length > 0) {
+          await hook?.("aborted", packedUpdates(deleting), { packed: true });
+        }
         return fail([{ name: PACKED, reason: "locked" }]);
       }
       packedHeld = true;
@@ -1058,13 +1073,23 @@ export function createFilesRefOps(
     // `<zero> <zero> <ref>`, no old value (delete_ref and delete_refs give none)
     const hook = name.startsWith("refs/") ? options.transactionHook?.() : undefined;
     const told = packedUpdates([name]);
+    // packed-refs.lock found held: git 2.43's delete_refs gives up before any hook runs
+    let packedBusy = false;
     if (hook && o.deleteRefs) {
-      // git 2.43's files_delete_refs: the packed store's own transaction first
-      for (const state of ["prepared", "committed"] as const) {
-        const verdict = await hook(state, told, { packed: true, only: "2.43" });
-        if (state === "prepared" && (verdict === false || typeof verdict === "string")) {
-          await hook("aborted", told, { packed: true, only: "2.43" });
-          throw new RefTransactionAbortedError("prepared", verdict || undefined);
+      // git 2.43's files_delete_refs: the packed store's own transaction first, under
+      // packed-refs.lock (released before the loose refs go)
+      if ((await lock(PACKED, packedLockTimeout)) !== "ok") packedBusy = true;
+      else {
+        try {
+          for (const state of ["prepared", "committed"] as const) {
+            const verdict = await hook(state, told, { packed: true, only: "2.43" });
+            if (state === "prepared" && (verdict === false || typeof verdict === "string")) {
+              await hook("aborted", told, { packed: true, only: "2.43" });
+              throw new RefTransactionAbortedError("prepared", verdict || undefined);
+            }
+          }
+        } finally {
+          await files.remove(`${PACKED}.lock`).catch(() => false);
         }
       }
     }
@@ -1075,12 +1100,24 @@ export function createFilesRefOps(
         throw new RefTransactionAbortedError("preparing", verdict || undefined);
       }
     }
+    // a held lock fails the deletion with the hook told no more of the transaction (git
+    // frees it without ref_transaction_abort), only the packed store's given up
     const after: AfterLocks = {};
     const r = await lock(name, refLockTimeout);
     if (r === "held") throw new RefUpdateRejectedError([{ name, reason: "locked" }]);
     // "conflict": a file where a parent directory would be, so no loose file at `name`
     let removed = false;
+    let packedHeld = false;
     try {
+      // packed-refs.lock taken before the hook hears `prepared` (files_transaction_prepare)
+      if (packedBusy || (await lock(PACKED, packedLockTimeout)) !== "ok") {
+        await hook?.("aborted", told, {
+          packed: true,
+          ...(o.deleteRefs ? { only: "2.56" as const } : {}),
+        });
+        throw new PackedRefsLockedError(packedLockTimeout);
+      }
+      packedHeld = true;
       let packedCommit = false;
       if (hook) {
         const inPacked = (await readPacked()).has(name);
@@ -1095,8 +1132,9 @@ export function createFilesRefOps(
         }
       }
       if (!after.refused) {
-        const d = await deleteUnderPackedLock(name);
-        if (d === "held") throw new PackedRefsLockedError(packedLockTimeout);
+        const d = await deleteHoldingPackedLock(name);
+        await files.remove(`${PACKED}.lock`).catch(() => false);
+        packedHeld = false;
         if (packedCommit) {
           await hook?.("committed", told, {
             packed: true,
@@ -1110,6 +1148,7 @@ export function createFilesRefOps(
         after.committed = true;
       }
     } finally {
+      if (packedHeld) await files.remove(`${PACKED}.lock`).catch(() => false);
       if (r === "ok") await unlock(name);
     }
     if (hook) {

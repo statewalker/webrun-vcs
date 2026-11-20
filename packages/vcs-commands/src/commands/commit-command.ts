@@ -8,6 +8,7 @@ import {
 } from "@statewalker/vcs-core";
 import { FileStagingStore } from "@statewalker/vcs-store-files";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import type { FilesApi } from "@statewalker/vcs-utils/files";
 import {
   expandUserPath,
   type Staging,
@@ -1112,16 +1113,24 @@ export class CommitCommand extends GitCommand<CommitResult> {
    * others none. Undefined where the repository's files cannot hold it.
    */
   private async writeFalseIndexFile(falseIndex: FalseIndex): Promise<FalseIndexFile | undefined> {
-    // git names it by its process id; any number unused will do here
-    const name = `next-index-${10000 + Math.floor(Math.random() * 90000)}.lock`;
-    const target = await this.hooks.gitFile(name);
-    if (!target) return undefined;
+    // git names it by its process id; any number no file has will do here
+    let name = "";
+    let target: { files: FilesApi; path: string } | undefined;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      name = `next-index-${10000 + Math.floor(Math.random() * 90000)}.lock`;
+      target = await this.hooks.gitFile(name);
+      if (!target) return undefined;
+      if ((await target.files.stats(target.path)) === undefined) break;
+      target = undefined;
+    }
+    if (!target) throw new Error("could not choose a name for the false index file");
+    const lock = target;
     const files = await this.falseIndexFiles(falseIndex);
     const current = new Map<string, StagingEntry>();
     for await (const entry of this.staging.entries()) {
       if (entry.stage === 0) current.set(entry.path, entry);
     }
-    const temp = new FileStagingStore(target.files, target.path);
+    const temp = new FileStagingStore(lock.files, lock.path);
     const builder = temp.createBuilder();
     for (const path of [...files.keys()].sort(compareGitPaths)) {
       const file = files.get(path) as { objectId: ObjectId; mode: number };
@@ -1133,18 +1142,24 @@ export class CommitCommand extends GitCommand<CommitResult> {
       }
     }
     await builder.finish();
-    await temp.write();
     const remove = async () => {
-      await target.files.remove(target.path).catch(() => false);
+      await lock.files.remove(lock.path).catch(() => false);
     };
-    return {
-      hostPath: await this.hooks.gitPath(name, true),
-      reread: async () => {
-        await temp.read();
-        return writeIndexAsTree(temp, this.trees, { write: false });
-      },
-      remove,
-    };
+    // the file is ours from its first byte: a failure before it is handed over removes it
+    try {
+      await temp.write();
+      return {
+        hostPath: await this.hooks.gitPath(name, true),
+        reread: async () => {
+          await temp.read();
+          return writeIndexAsTree(temp, this.trees, { write: false });
+        },
+        remove,
+      };
+    } catch (error) {
+      await remove();
+      throw error;
+    }
   }
 
   /** The commit made from the index (or the partial commit's tree), after the index is ready. */

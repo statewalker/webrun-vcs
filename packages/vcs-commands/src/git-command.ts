@@ -95,6 +95,13 @@ interface TransactionHookStore {
   getTransactionHook?(): RefTransactionHook | undefined;
 }
 
+/**
+ * The reference-transaction hooks commands installed: a command without hooks removes one
+ * of these left on its store (a command that wrote refs outside its `call`), never a hook
+ * someone else set (the receive side of a local push, a library user).
+ */
+const commandTransactionHooks = new WeakSet<RefTransactionHook>();
+
 export interface CommandRefs extends Refs {
   /** Delete a reference - alias for remove() */
   delete(name: string, options?: RefRemoveOptions): Promise<boolean>;
@@ -752,16 +759,20 @@ export abstract class GitCommand<T> {
    * supports it (the files store), while this command runs: the hook that was there before
    * is put back when the command's `call` ends ({@link releaseRefTransactionHook}), so a
    * later write never routes its output to this command. A command without hooks (no
-   * runner) removes any hook left there.
+   * runner) removes a command's hook left there, and leaves any other hook in place.
    */
   private installRefTransactionHook(refs: Refs): void {
     const store = refs as TransactionHookStore;
     if (!store.setTransactionHook) return;
     if (!this.hooks.enabled) {
-      if (!this.refTransactionInstalled) store.setTransactionHook(undefined);
+      const current = store.getTransactionHook?.();
+      if (current && commandTransactionHooks.has(current)) store.setTransactionHook(undefined);
       return;
     }
-    if (!this.refTransactionHook) this.refTransactionHook = refTransactionHookOf(this.hooks);
+    if (!this.refTransactionHook) {
+      this.refTransactionHook = refTransactionHookOf(this.hooks);
+      commandTransactionHooks.add(this.refTransactionHook);
+    }
     if (!this.refTransactionInstalled) {
       this.refTransactionInstalled = { store, previous: store.getTransactionHook?.() };
     }

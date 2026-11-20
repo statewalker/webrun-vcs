@@ -573,7 +573,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         if (invalidCount === commands.length) {
           // git 2.5x still commits the (empty) transaction of each phase update() took up
           const rp = receivePackConfig(ctx);
-          if (rp.batchNonAtomic && !state.capabilities.has("atomic")) {
+          if (rp.batchNonAtomic && !state.capabilities.has("atomic") && !state.phasesApplied) {
             try {
               await applyUpdates(state, getRefStore(ctx), false, false, true);
             } catch (e) {
@@ -736,8 +736,10 @@ interface ServerPushState extends ProtocolState {
   pushOptions?: string[];
   packStream?: AsyncIterable<Uint8Array>;
   appliedCommands?: PushCommand[];
-  /** The commands `interleaveUpdateHook` applied as their checks passed, in order */
+  /** The commands `interleaveUpdateHook` or `batchNonAtomic` applied while checking them */
   eagerlyApplied?: PushCommand[];
+  /** `batchNonAtomic` applied each phase's commands as it checked them (no batch is left) */
+  phasesApplied?: boolean;
   /** The client's `shallow` lines */
   pushShallow?: string[];
   /** The connectivity analysis of an accepted shallow push (which shallow commits to record) */
@@ -1331,6 +1333,34 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
   const batch = refStore.batch?.bind(refStore);
   const eager =
     !atomic && rp.interleaveUpdateHook === true && !!batch && !state.shallowConnectivity;
+  // git 2.5x's execute_commands_non_atomic: update() for the deletions, their transaction
+  // committed, then update() for the rest and theirs
+  if (!atomic && !eager && rp.batchNonAtomic === true && batch && !state.shallowConnectivity) {
+    for (const deletions of [true, false]) {
+      const phase = commands.filter(
+        (c) => c.result === "NOT_ATTEMPTED" && (c.newOid === ZERO_OID) === deletions,
+      );
+      if (phase.length === 0) continue;
+      for (const cmd of phase) await check(cmd);
+      const open = phase.filter((c) => c.result === "NOT_ATTEMPTED");
+      for (const c of open) if (isNoop(c)) c.result = "OK";
+      const pending = open.filter((c) => !isNoop(c));
+      if (pending.length > 0) await publishQuarantine(ctx);
+      const applied = await applyPhase(batch, pending, true);
+      for (const c of pending) {
+        if (applied.has(c)) c.result = "OK";
+        else {
+          c.result = "LOCK_FAILURE";
+          c.message = FAILED_TO_UPDATE;
+        }
+      }
+    }
+    // post-receive's commands in the order the commands came
+    state.eagerlyApplied = commands.filter((c) => c.result === "OK" && !isNoop(c));
+    state.appliedCommands = [...state.eagerlyApplied];
+    state.phasesApplied = true;
+    return;
+  }
   for (const cmd of commands) {
     if (cmd.result !== "NOT_ATTEMPTED") continue;
     await check(cmd);
@@ -1466,9 +1496,7 @@ async function applyUpdates(
     return failTransaction();
   }
 
-  // git 2.5x: one batch for the deletions, one for the rest; a batch that fails (a ref
-  // refused under its locks) is applied ref by ref, as REF_TRANSACTION_ALLOW_FAILURE refuses
-  // only the refs that fail
+  // git 2.5x: one batch for the deletions, one for the rest (see applyPhase)
   const applied = new Set<PushCommand>();
   const phases = batchNonAtomic
     ? [pending.filter((c) => c.type === "DELETE"), pending.filter((c) => c.type !== "DELETE")]
@@ -1480,27 +1508,11 @@ async function applyUpdates(
     if (batchNonAtomic && phase.length === 0) {
       const deletions = phase === phases[0];
       if (considered.some((c) => (c.type === "DELETE") === deletions)) {
-        await batch([], { ...options, emptyTransaction: true });
+        await applyPhase(batch, [], true);
       }
       continue;
     }
-    if (batchNonAtomic && phase.length > 1) {
-      try {
-        if ((await batch(phase.map(toRefCommand), options)).ok) {
-          for (const c of phase) applied.add(c);
-        }
-      } catch (e) {
-        if (isTransactionAborted(e)) throw e;
-      }
-    }
-    for (const c of phase) {
-      if (applied.has(c)) continue;
-      try {
-        if ((await batch([toRefCommand(c)], options)).ok) applied.add(c);
-      } catch (e) {
-        if (isTransactionAborted(e)) throw e;
-      }
-    }
+    for (const c of await applyPhase(batch, phase, batchNonAtomic)) applied.add(c);
   }
   // the results (and post-receive's commands) in the order the commands came
   for (const c of pending) {
@@ -1513,6 +1525,45 @@ async function applyUpdates(
     }
   }
   return okCount() === all.length ? "UPDATES_APPLIED" : "PARTIAL_APPLIED";
+}
+
+/**
+ * Applies the commands of one phase of a push that is not atomic: with `together` (git
+ * 2.5x), one transaction for them all (an empty one is committed too, as git commits the
+ * transaction update() began), and a batch that fails (a ref refused under its locks) is
+ * applied ref by ref, as REF_TRANSACTION_ALLOW_FAILURE refuses only the refs that fail;
+ * else one batch per ref. A refusing reference-transaction hook throws. The commands
+ * applied.
+ */
+async function applyPhase(
+  batch: NonNullable<RefStore["batch"]>,
+  phase: PushCommand[],
+  together: boolean,
+): Promise<Set<PushCommand>> {
+  const options = { message: "push" };
+  const applied = new Set<PushCommand>();
+  if (together && phase.length === 0) {
+    await batch([], { ...options, emptyTransaction: true });
+    return applied;
+  }
+  if (together && phase.length > 1) {
+    try {
+      if ((await batch(phase.map(toRefCommand), options)).ok) {
+        for (const c of phase) applied.add(c);
+      }
+    } catch (e) {
+      if (isTransactionAborted(e)) throw e;
+    }
+  }
+  for (const c of phase) {
+    if (applied.has(c)) continue;
+    try {
+      if ((await batch([toRefCommand(c)], options)).ok) applied.add(c);
+    } catch (e) {
+      if (isTransactionAborted(e)) throw e;
+    }
+  }
+  return applied;
 }
 
 /**
