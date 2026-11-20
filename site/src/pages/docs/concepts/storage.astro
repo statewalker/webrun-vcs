@@ -65,7 +65,7 @@ const layout = `.git/
       own <code>.git</code> layout, byte for byte, through a <code>FilesApi</code> (below).</li>
     <li><a href={docHref("packages/vcs-store-sql/README.md")}><code>vcs-store-sql</code></a>: rows and
       columns. It rebuilds commits and tags from the columns it models, so a commit with extra headers
-      (a <code>mergetag</code>) is not kept byte-exact there and is refused when received.</li>
+      (a <code>mergetag</code>, a <code>gpgsig-sha256</code>) loses them when parsed and gets a different id than in Git.</li>
     <li><a href={docHref("packages/vcs-store-kv/README.md")}><code>vcs-store-kv</code></a>: any key-value
       store, with git-compatible SHA-1 ids; long values are chunked.</li>
   </ul>
