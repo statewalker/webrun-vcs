@@ -1199,10 +1199,14 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       oldSide = await this.treeSide(this.oldTree ?? "HEAD", this.oldTree === undefined);
       newSide = await this.treeSide("HEAD", true);
     }
-    const ignoreOf = await this.submoduleIgnoreOf();
-    // diff_change / diff_addremove: a submodule whose changes are ignored is left out
+    // diff_change / diff_addremove: a submodule whose changes are ignored is left out (the
+    // settings read only when a submodule changed: `git log -p` diffs once per commit)
     await attributes?.load([...oldSide.keys(), ...newSide.keys(), ...unmerged.keys()]);
-    const entries = this.pairUp(oldSide, newSide, unmerged).filter((e) => {
+    const paired = this.pairUp(oldSide, newSide, unmerged);
+    const ignoreOf = paired.some((e) => e.oldMode === GITLINK || e.newMode === GITLINK)
+      ? await this.submoduleIgnoreOf()
+      : () => undefined;
+    const entries = paired.filter((e) => {
       if (e.unmerged) return true;
       const oldLink = e.oldMode === GITLINK;
       const newLink = e.newMode === GITLINK;

@@ -184,9 +184,12 @@ export async function parseIndexFile(
     throw new Error("Index file checksum mismatch");
   }
 
-  // Parse entries
-  const entries: StagingEntry[] = [];
+  // Parse entries, in one pass over the bytes (no result object per entry besides the entry)
+  const entries: StagingEntry[] = new Array(entryCount);
   let previousPath = "";
+  // the entries whose paths still need `validatePath` (a short ASCII path is checked as its
+  // bytes are read, see pathAt)
+  let unchecked: number[] | undefined;
 
   // where each entry's bytes start (a version 2/3 write copies them, see IndexEncoding);
   // complemented for an entry whose extended-flags word the encoder would not write as read
@@ -196,14 +199,14 @@ export async function parseIndexFile(
       : undefined;
   for (let i = 0; i < entryCount; i++) {
     const entry = parseEntry(data, view, offset, version, previousPath);
-    const nextOffset = parsedEnd;
-    entries.push(entry);
-    if (offsets) {
-      const extended = (view.getUint16(offset + P_FLAGS) & EXTENDED) !== 0;
-      offsets[i] = extended === hasExtendedFlags(entry) ? offset : ~offset;
+    entries[i] = entry;
+    if (!parsedPathChecked) {
+      unchecked ??= [];
+      unchecked.push(i);
     }
+    if (offsets) offsets[i] = parsedExtendedAsRead ? offset : ~offset;
     previousPath = entry.path;
-    offset = nextOffset;
+    offset = parsedEnd;
   }
   if (offsets) offsets[entryCount] = offset;
 
@@ -224,8 +227,8 @@ export async function parseIndexFile(
   // A required extension we do not understand (a split index's `link`) changes what
   // the entries mean: entries there may legitimately have empty paths. Leave them
   // as they are; callers refuse such an index (see `assertWritableIndexExtensions`).
-  if (!extensions.some((sig) => !/^[A-Z]/.test(sig))) {
-    for (const entry of entries) validatePath(entry.path);
+  if (unchecked && !extensions.some((sig) => !/^[A-Z]/.test(sig))) {
+    for (const i of unchecked) validatePath((entries[i] as StagingEntry).path);
   }
 
   return {
@@ -261,12 +264,16 @@ const PATH_CHARS: number[][] = Array.from({ length: SHORT_PATH + 1 }, (_, n) =>
 
 /**
  * The path in the `length` bytes at `data[at]` ({@link decodeGitPath}): a short ASCII one
- * built from its char codes without a view of the bytes, any other decoded as bytes.
+ * built from its char codes without a view of the bytes, any other decoded as bytes. Sets
+ * {@link parsedPathChecked} when the bytes read pass {@link validAsciiPath} (no empty
+ * component, no `.git` one in any case, no NUL), so that the path needs no `validatePath`.
  */
 function pathAt(data: Uint8Array, at: number, length: number): string {
-  if (length <= SHORT_PATH) {
+  if (length <= SHORT_PATH && length > 0) {
     const chars = PATH_CHARS[length] as number[];
     let ascii = true;
+    let valid = true;
+    let start = 0;
     for (let k = 0; k < length; k++) {
       const c = data[at + k] as number;
       if (c >= 0x80) {
@@ -274,14 +281,41 @@ function pathAt(data: Uint8Array, at: number, length: number): string {
         break;
       }
       chars[k] = c;
+      if (c === 0x2f) {
+        if (k === start || isDotGit(data, at + start, k - start)) valid = false;
+        start = k + 1;
+      } else if (c === 0) valid = false;
     }
-    if (ascii) return String.fromCharCode.apply(null, chars);
+    if (ascii) {
+      if (start === length || isDotGit(data, at + start, length - start)) valid = false;
+      parsedPathChecked = valid;
+      return String.fromCharCode.apply(null, chars);
+    }
   }
+  parsedPathChecked = false;
   return decodeGitPath(data.subarray(at, at + length));
+}
+
+/** Whether the `len` bytes at `data[at]` are `.git` in any case */
+function isDotGit(data: Uint8Array, at: number, len: number): boolean {
+  return (
+    len === 4 &&
+    data[at] === 0x2e &&
+    ((data[at + 1] as number) | 0x20) === 0x67 &&
+    ((data[at + 2] as number) | 0x20) === 0x69 &&
+    ((data[at + 3] as number) | 0x20) === 0x74
+  );
 }
 
 /** Where the entry {@link parseEntry} last parsed ends (no result object per entry). */
 let parsedEnd = 0;
+/** Whether the path of the entry {@link parseEntry} last parsed is known valid already */
+let parsedPathChecked = false;
+/**
+ * Whether the entry {@link parseEntry} last parsed has the extended-flags word exactly when
+ * the encoder would write one (see `IndexEncoding`)
+ */
+let parsedExtendedAsRead = true;
 
 /**
  * Parse a single index entry (its end in {@link parsedEnd}).
@@ -377,12 +411,14 @@ function parseEntry(
     whole.set(previous.subarray(0, prefixLen));
     whole.set(suffix, prefixLen);
     path = decodeGitPath(whole);
+    parsedPathChecked = false;
   } else {
     // Version 2/3: uncompressed path
     if (nameLength === NAME_MASK) {
       // Long path (>= 0xfff bytes)
       const { value: pathStr, nextOffset: pathEnd } = readNullTerminated(data, offset);
       path = pathStr;
+      parsedPathChecked = false;
       offset = pathEnd;
     } else {
       // Short path
@@ -427,6 +463,7 @@ function parseEntry(
   };
 
   parsedEnd = offset;
+  parsedExtendedAsRead = hasExtended === (intentToAdd || skipWorktree);
   return entry;
 }
 

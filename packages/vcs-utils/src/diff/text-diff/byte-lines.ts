@@ -5,6 +5,7 @@
  * @module
  */
 
+import { allocInt32 } from "../../streams/index.js";
 import { Sequence, type SequenceComparator } from "./sequence.js";
 
 /**
@@ -38,7 +39,10 @@ export class ByteLines extends Sequence implements LineSource {
       this.hashes = hashes;
       return;
     }
-    this.starts = lineStarts(content);
+    // the lines and their hashes in one pass: a diff hashes every line it splits
+    const scanned = scanLines(content);
+    this.starts = scanned.starts;
+    this.hashes = scanned.hashes;
   }
 
   /** The start offsets of the lines, plus the content length as the last entry (shared) */
@@ -112,7 +116,7 @@ export class ByteLines extends Sequence implements LineSource {
   private hashAll(): Int32Array {
     const starts = this.starts;
     const n = starts.length - 1;
-    const hashes = new Int32Array(n);
+    const hashes = allocInt32(n);
     const c = this.content;
     const words = lineWords(c);
     for (let k = 0; k < n; k++) hashes[k] = hashLine(c, starts[k], starts[k + 1], words);
@@ -229,24 +233,42 @@ export const BYTE_LINES_COMPARATOR: SequenceComparator<ByteLines> = {
   },
 };
 
+/** Where {@link scanLines} gathers the line starts and hashes (reused across calls) */
+let scanStarts = new Int32Array(4096);
+let scanHashes = new Int32Array(4096);
+
 /**
- * The start of each line of `content` (split after each LF), then its length; `indexOf` finds
- * the LFs (a native scan, several times faster than a loop over the bytes).
+ * Splits `content` after each LF and hashes each line ({@link hashLine}) in one pass, front
+ * to back: the start of each line, then the content's length (`starts`), and the hash of
+ * each line (`hashes`), in arrays of their own.
  */
-function lineStarts(content: Uint8Array): Int32Array {
+function scanLines(content: Uint8Array): { starts: Int32Array; hashes: Int32Array } {
   const len = content.length;
-  if (len === 0) return new Int32Array(1);
-  let out = new Int32Array((len >> 5) + 2);
+  let starts = scanStarts;
+  let hashes = scanHashes;
+  const hasher = new LineHasher(content);
   let n = 0;
-  out[n++] = 0;
-  for (let i = content.indexOf(0x0a); i >= 0 && i < len - 1; i = content.indexOf(0x0a, i + 1)) {
-    if (n + 1 >= out.length) {
-      const grown = new Int32Array(out.length * 2);
-      grown.set(out);
-      out = grown;
+  for (let p = 0; p < len; p = hasher.end) {
+    if (n + 1 >= starts.length) {
+      const grownStarts = new Int32Array(starts.length * 2);
+      grownStarts.set(starts);
+      starts = grownStarts;
+      const grownHashes = new Int32Array(hashes.length * 2);
+      grownHashes.set(hashes);
+      hashes = grownHashes;
     }
-    out[n++] = i + 1;
+    hashes[n] = hasher.next(p);
+    starts[n++] = p;
   }
-  out[n++] = len;
-  return out.length === n ? out : out.subarray(0, n);
+  starts[n] = len;
+  // kept for the next call unless far longer than a usual file needs
+  if (starts.length <= 1 << 16) {
+    scanStarts = starts;
+    scanHashes = hashes;
+  }
+  const outStarts = allocInt32(n + 1);
+  outStarts.set(starts.subarray(0, n + 1));
+  const outHashes = allocInt32(n);
+  outHashes.set(hashes.subarray(0, n));
+  return { starts: outStarts, hashes: outHashes };
 }

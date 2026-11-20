@@ -302,6 +302,33 @@ async function* single(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
   yield bytes;
 }
 
+/** The entry points (`call`, `callText`, ...) of each command class, found once per class */
+const ENTRY_POINTS = new WeakMap<object, readonly string[]>();
+
+/**
+ * The names of the entry points a command's prototype chain defines (`call` and `callX`
+ * methods), looked up once per class: `git log -p` makes a command per commit.
+ */
+function entryPointNames(prototype: object): readonly string[] {
+  const known = ENTRY_POINTS.get(prototype);
+  if (known) return known;
+  const names = new Set<string>();
+  for (
+    let proto = prototype;
+    proto && proto !== Object.prototype;
+    proto = Object.getPrototypeOf(proto)
+  ) {
+    for (const name of Object.getOwnPropertyNames(proto)) {
+      if (!/^call(?:[A-Z]\w*)?$/.test(name)) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+      if (typeof descriptor?.value === "function") names.add(name);
+    }
+  }
+  const found = [...names];
+  ENTRY_POINTS.set(prototype, found);
+  return found;
+}
+
 export abstract class GitCommand<T> {
   protected readonly _workingCopy: WorkingCopy;
   private callable = true;
@@ -327,19 +354,7 @@ export abstract class GitCommand<T> {
    */
   private releaseHooksAfterCalls(): void {
     const self = this as unknown as Record<string, unknown>;
-    const names = new Set<string>();
-    for (
-      let proto = Object.getPrototypeOf(this);
-      proto && proto !== Object.prototype;
-      proto = Object.getPrototypeOf(proto)
-    ) {
-      for (const name of Object.getOwnPropertyNames(proto)) {
-        if (!/^call(?:[A-Z]\w*)?$/.test(name)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(proto, name);
-        if (typeof descriptor?.value === "function") names.add(name);
-      }
-    }
-    for (const name of names) {
+    for (const name of entryPointNames(Object.getPrototypeOf(this))) {
       const method = self[name];
       if (typeof method !== "function") continue;
       self[name] = (...args: unknown[]) => {

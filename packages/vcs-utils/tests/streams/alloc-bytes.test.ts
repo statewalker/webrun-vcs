@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { allocBytes } from "../../src/streams/index.js";
+import { allocBytes, allocInt32 } from "../../src/streams/index.js";
 
 describe("allocBytes", () => {
   it("carves small zeroed buffers from shared slabs, and gives large ones their own", () => {
@@ -20,5 +20,24 @@ describe("allocBytes", () => {
     const seen = new Set<ArrayBufferLike>();
     for (let i = 0; i < 100; i++) seen.add(allocBytes(2048).buffer);
     expect(seen.size).toBeGreaterThan(1);
+  });
+});
+
+describe("allocInt32", () => {
+  it("carves small zeroed arrays from the slabs, aligned, and gives large ones their own", () => {
+    const bytes = allocBytes(3); // leaves the slab at an odd offset
+    const a = allocInt32(100);
+    const b = allocInt32(100);
+    expect(a.length).toBe(100);
+    expect(a.buffer).toBe(b.buffer);
+    expect(a.byteOffset % 4).toBe(0);
+    a.fill(-1);
+    bytes.fill(0xff);
+    expect(b.every((x) => x === 0)).toBe(true);
+    expect(allocBytes(8).every((x) => x === 0)).toBe(true);
+    const big = allocInt32(10_000);
+    expect(big.length).toBe(10_000);
+    expect(big.byteOffset).toBe(0);
+    expect(allocInt32(0).length).toBe(0);
   });
 });
