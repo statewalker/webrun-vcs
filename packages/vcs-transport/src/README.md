@@ -342,6 +342,97 @@ const myHandlers = new Map([
 ]);
 ```
 
+## Transports and Adapters
+
+A remote URL becomes a session through a connector in a `GitTransportRegistry`. Smart HTTP
+is built in (`createDefaultTransports`); every other transport carries git's own native
+protocol over a byte stream (a `Duplex`), with git-daemon's request line first
+(`git-upload-pack /repo.git\0host=<host>\0`) so one server serves any repository its
+resolver finds. On the serving side, every adapter ends in `serveGitConnection`:
+
+```ts
+const serve = {
+  enableReceivePack: true,
+  resolveRepository: createBasePathResolver({ files, basePath: "/srv/git", openRepository }),
+};
+```
+
+Each adapter below is a client connector plus a server entry point taking `serve`.
+
+### MessagePort (Workers, iframes, a MessageChannel)
+
+```ts
+// one session per MessageChannel; webrun-rpc's stream tier bounds both directions
+transports.register(createMessagePortConnector({
+  name: "worker", schemes: ["worker"],
+  openPort: () => openPortToWorker(),          // a fresh port per session
+}));
+serveGitOverPort(port, serve);                  // in the worker, per port
+
+// many sessions over one port (webrun-rpc's multiplexer, a window per session)
+await serveGitOverPortMux(port, serve);         // in the worker; at most 64 sessions at once (maxPorts)
+const peer = await connectGitOverPortMux(port1);
+transports.register(createWebrunConnector({ name: "worker", schemes: ["worker"], call: () => peer.call }));
+```
+
+`Duplex.end` ends the client's input, which the server sees as the end of its input while
+its answer goes on. The deprecated `createMessagePortDuplex` posted writes without
+backpressure and ended with a `"__close__"` string.
+
+### WebSocket
+
+```ts
+transports.register(createWebSocketConnector({ connectTimeout: 10_000 })); // ws:// and wss://
+await git.clone().setURI("wss://git.example.com/repo.git").setTransports(transports).call();
+
+new WebSocketServer({ port: 8080, maxPayload: DEFAULT_WEBSOCKET_MAX_FRAME_SIZE })
+  .on("connection", (socket) => serveGitOverWebSocket(socket, serve));
+```
+
+One session per socket, binary frames. A WebSocket has no half-close, so **an empty binary
+frame ends its sender's direction** (data frames are never empty). Writes wait while
+`bufferedAmount` is above the high water mark; a socket that can pause (the `ws` package's)
+pauses while its reader lags. A browser WebSocket cannot pause, so its reader must keep up.
+Writes leave in frames of at most 64 KiB (`frameSize`); a received frame over 1 MiB
+(`maxFrameSize`) closes the socket with 1009, and the `ws` server's `maxPayload` bounds what
+it buffers before that. A socket that fails, or closes without the end frame and without a
+normal closure code, fails the read side; a write to a socket that is not open fails.
+
+### libp2p streams (duck-typed, no dependency)
+
+```ts
+await node.handle(GIT_LIBP2P_PROTOCOL, ({ stream }) => serveGitOverLibp2pStream(stream, serve));
+transports.register(createLibp2pConnector({
+  dial: (peer, protocol, { signal }) => node.dialProtocol(peerIdFromString(peer), protocol, { signal }),
+  connectTimeout: 30_000,
+}));
+await git.fetch().setRemote(`libp2p://${peerId}/repo.git`).setTransports(transports).call();
+```
+
+Both stream shapes fit: libp2p 3's message streams (async iterable, `send` / `onDrain`,
+`close` ending the write side, `abort`) and libp2p 1/2's `{ source, sink, closeWrite?, close? }`.
+`Duplex.end` ends the write side without waiting for the peer; `Duplex.close` waits at most
+`closeTimeout` (1 s) for what is written to go out, then aborts the stream, so a peer that
+stopped reading cannot hold a session (or `serveGitConnection`'s `timeout`) open. A sink
+that fails (a closed or reset stream) fails the writes with its error.
+
+### webrun-streams channels (WebRTC, LiveKit, any `Serve`)
+
+```ts
+const handler = serveGitOverWebrun(serve);      // register with the channel's serve
+transports.register(createWebrunConnector({ name: "peer", schemes: ["peer"], call: () => call }));
+```
+
+`webrunClientDuplex` / `webrunServerDuplex` bridge a webrun `Duplex` and a transport
+`Duplex` both ways through bounded queues (`createByteQueue`, 1 MiB by default).
+
+### Any other stream
+
+```ts
+transports.register(createDuplexConnector({ name: "tcp", schemes: ["tcp"], open: (req) => openStream(req.url) }));
+await serveGitConnection({ ...serve, duplex });
+```
+
 ## Testing
 
 Each FSM module has unit tests:
@@ -363,6 +454,13 @@ files. The package-level tests live in `packages/vcs-transport/tests/`.
 
 ```
 packages/vcs-transport/src/
+├── adapters/
+│   ├── http/                # smart HTTP client and server
+│   ├── libp2p-stream/       # git over a libp2p stream (duck-typed)
+│   ├── messageport/         # git over a MessagePort (webrun-rpc)
+│   ├── webrun/              # webrun-streams Duplex bridge, serveGitOverWebrun
+│   ├── webrun-http/         # smart HTTP over a webrun Duplex
+│   └── websocket/           # git over a WebSocket (binary frames)
 ├── api/
 │   ├── duplex.ts            # Duplex stream interface
 │   ├── repository-facade.ts # Repository operations facade
@@ -370,6 +468,7 @@ packages/vcs-transport/src/
 ├── connect/
 │   ├── git-url.ts           # parseGitUrl: remote URLs as git's transport_get reads them
 │   ├── connector.ts         # GitTransportConnector, GitSession (native or smart HTTP)
+│   ├── duplex-connector.ts  # createDuplexConnector: a connector over any byte stream
 │   ├── registry.ts          # GitTransportRegistry, createDefaultTransports
 │   └── open-session.ts      # openUploadPack / openReceivePack over a session
 ├── context/

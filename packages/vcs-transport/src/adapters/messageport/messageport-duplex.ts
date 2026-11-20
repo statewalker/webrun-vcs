@@ -14,6 +14,10 @@ import type { Duplex } from "../../api/duplex.js";
  * The MessagePort is expected to transfer Uint8Array messages.
  * Incoming messages are queued and yielded via the async iterator.
  *
+ * @deprecated Posts every write at once (no backpressure) and ends the stream with a
+ *   `"__close__"` string message, which a byte stream cannot carry. Use
+ *   `messagePortDuplex` with `serveGitOverPort` (webrun-rpc's stream tier:
+ *   bounded, with a half-close), or `connectGitOverPortMux` for many sessions per port.
  * @param port - MessagePort to wrap
  * @returns Duplex stream interface
  *

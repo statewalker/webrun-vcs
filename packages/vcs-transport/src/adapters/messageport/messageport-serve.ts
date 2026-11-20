@@ -44,6 +44,9 @@ export interface MessagePortServeOptions {
  * Waits for a client connection and processes the fetch request.
  * Typically run in a Web Worker or on one side of a MessageChannel.
  *
+ * @deprecated Runs over the sentinel-based `createMessagePortDuplex` (no backpressure).
+ *   Use `messagePortDuplex` / `serveGitOverPort` (or `createMessagePortConnector` with the
+ *   porcelain commands) instead.
  * @param port - MessagePort to listen on
  * @param repository - Repository facade for pack import/export
  * @param refStore - Ref store for reading refs
