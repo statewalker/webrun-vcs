@@ -485,6 +485,7 @@ export async function handleInfoRefs(
   refStore: RefStore,
   options: HttpServerOptions = {},
   repository?: RepositoryFacade,
+  version1 = false,
 ): Promise<HttpResponse> {
   // Get all refs but the hidden ones
   const refs = visibleRefs(await refStore.listAll(), uploadPackHiddenRefs(options));
@@ -495,6 +496,8 @@ export async function handleInfoRefs(
   // Service announcement line
   chunks.push(encodePacketLine("# service=git-upload-pack\n"));
   chunks.push(encodeFlush());
+  // a client asking for v1: upload-pack's `version 1` line before the advertisement
+  if (version1) chunks.push(encodePacketLine("version 1\n"));
 
   // Default capabilities (copied: the symref below must not change the caller's array)
   const capabilities = [...(options.capabilities ?? DEFAULT_UPLOAD_PACK_CAPABILITIES)];
@@ -558,6 +561,26 @@ export async function handleInfoRefs(
 export function requestsProtocolV2(gitProtocol: string | undefined): boolean {
   if (!gitProtocol) return false;
   return gitProtocol.split(":").some((param) => param === "version=2");
+}
+
+/**
+ * The protocol version a `Git-Protocol` header asks for, as git's
+ * `determine_protocol_version_server`: the highest `version=<n>` among its `:`-separated
+ * parameters (0 without any).
+ *
+ * @example
+ * ```ts
+ * requestedProtocolVersion("version=1");           // 1
+ * requestedProtocolVersion("version=1:version=2"); // 2
+ * ```
+ */
+export function requestedProtocolVersion(gitProtocol: string | undefined): 0 | 1 | 2 {
+  let version: 0 | 1 | 2 = 0;
+  for (const param of (gitProtocol ?? "").split(":")) {
+    if (param === "version=2") version = 2;
+    else if (param === "version=1" && version < 1) version = 1;
+  }
+  return version;
 }
 
 /** Whether `request` carries `Git-Protocol: version=2` (and v2 is not switched off). */
@@ -842,6 +865,7 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
 export async function handleReceivePackInfoRefs(
   refStore: RefStore,
   options: HttpServerOptions = {},
+  version1 = false,
 ): Promise<HttpResponse> {
   // Get all refs but the hidden ones
   const refs = visibleRefs(await refStore.listAll(), receivePackHiddenRefs(options));
@@ -852,6 +876,8 @@ export async function handleReceivePackInfoRefs(
   // Service announcement line
   chunks.push(encodePacketLine("# service=git-receive-pack\n"));
   chunks.push(encodeFlush());
+  // a client asking for v1 (or v2, which push lacks: v0): receive-pack's `version 1` line
+  if (version1) chunks.push(encodePacketLine("version 1\n"));
 
   // Default capabilities for receive-pack
   const capabilities = options.capabilities ?? RECEIVE_PACK_CAPABILITIES;
@@ -1281,11 +1307,14 @@ export function createHttpHandler(
         }
 
         if (v2) return handleInfoRefsV2(serverOptions, repository);
+        // determine_protocol_version_server: v1 when that is the highest asked for (v2 asked
+        // of receive-pack, or of an upload-pack with v2 off, falls back to v0)
+        const version1 = requestedProtocolVersion(header(request, "git-protocol")) === 1;
         if (parsed.service === "git-upload-pack") {
-          return await handleInfoRefs(refStore, uploadPackOptions, repository);
+          return await handleInfoRefs(refStore, uploadPackOptions, repository, version1);
         } else {
           // git-receive-pack info/refs
-          return await handleReceivePackInfoRefs(refStore, serverOptions);
+          return await handleReceivePackInfoRefs(refStore, serverOptions, version1);
         }
       } else {
         // Handle POST /git-upload-pack or /git-receive-pack

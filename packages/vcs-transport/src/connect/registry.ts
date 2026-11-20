@@ -95,8 +95,9 @@ export interface HttpConnectorOptions {
 }
 
 /**
- * Smart HTTP for `http://` and `https://` URLs: a session whose requests go through
- * `fetchImpl` (git's remote-curl).
+ * Smart HTTP for `http://` and `https://` URLs (and `http::<url>` / `https::<url>`, the
+ * helper named: its address is the URL): a session whose requests go through `fetchImpl`
+ * (git's remote-curl).
  */
 export function createHttpConnector(options: HttpConnectorOptions = {}): GitTransportConnector {
   const fetchImpl = options.fetchImpl ?? ((request: Request) => globalThis.fetch(request));
@@ -106,7 +107,8 @@ export function createHttpConnector(options: HttpConnectorOptions = {}): GitTran
     async connect(request) {
       return {
         kind: "http",
-        baseUrl: request.url.raw,
+        // `https::https://h/r` (git's remote-https helper named): the helper's address
+        baseUrl: request.url.address ?? request.url.raw,
         fetchImpl,
         ...(options.headers ? { headers: { ...options.headers } } : {}),
       };

@@ -107,7 +107,8 @@ export async function openLocalRemote(
 /**
  * Runs `run` over a connection to upload-pack serving a local repository (opened by
  * {@link openLocalRemote}) with protocol v2, git's default `protocol.version` (v0 when the
- * option says 0 or 1), as git's local transport runs `git-upload-pack '<path>'`, in process.
+ * option says 0, v1 when it says 1), as git's local transport runs `git-upload-pack '<path>'`,
+ * in process.
  */
 export async function withLocalUploadPack<T>(
   remote: OpenedRepository,
@@ -123,6 +124,8 @@ export async function withLocalUploadPack<T>(
     refStore: createTransportRefStore(remote.history.refs),
     service: "git-upload-pack",
     ...((options.protocolVersion ?? 2) === 2 ? { protocolVersion: "2" as const } : {}),
+    // GIT_PROTOCOL=version=1: upload-pack's `version 1` line before its advertisement
+    ...(options.protocolVersion === 1 ? { announceVersion1: true } : {}),
     // uploadpack.hideRefs and transfer.hideRefs, in the order git reads them
     uploadPackHideRefs: settings.uploadPackHideRefs,
     ...(head && "target" in head ? { currentBranch: head.target } : {}),
@@ -262,6 +265,8 @@ export async function withLocalReceivePack<T>(
    * output reaches the pushing user's stderr directly, not as "remote: " lines
    */
   transactionHooks: HookSession | undefined = hooks,
+  /** `protocol.version`: 1 has receive-pack answer `version 1` first (2 is v0 for a push) */
+  options: { protocolVersion?: 0 | 1 | 2 } = {},
 ): Promise<T> {
   const receiveHooks = hooks?.enabled ? scriptReceiveHooks(hooks) : undefined;
   // the remote's reference-transaction hook on its ref store while receive-pack runs (its
@@ -278,7 +283,7 @@ export async function withLocalReceivePack<T>(
       : undefined;
   if (transactionHook) store.setTransactionHook?.(transactionHook);
   try {
-    return await receiveOver(remote, run, hooks, receiveHooks);
+    return await receiveOver(remote, run, hooks, receiveHooks, options.protocolVersion === 1);
   } finally {
     if (transactionHook && store.getTransactionHook?.() === transactionHook) {
       store.setTransactionHook?.(previousHook);
@@ -291,6 +296,7 @@ async function receiveOver<T>(
   run: (connection: ReceivePackConnection) => Promise<T>,
   hooks: HookSession | undefined,
   receiveHooks: ReceivePackHooks | undefined,
+  version1: boolean,
 ): Promise<T> {
   const head = await remote.history.refs.get("HEAD").catch(() => undefined);
   const settings = serverSettingsOf(remote);
@@ -302,6 +308,7 @@ async function receiveOver<T>(
     repository: createRepositoryFacade({ history: remote.history }),
     refStore: createTransportRefStore(remote.history.refs),
     service: "git-receive-pack",
+    ...(version1 ? { announceVersion1: true } : {}),
     bare: remote.bare,
     ...(head && "target" in head ? { currentBranch: head.target } : {}),
     allowDeletes: settings.allowDeletes,

@@ -8,6 +8,7 @@
 
 import {
   type Credentials,
+  type Duplex,
   type GitConnectRequest,
   type GitService,
   type GitSession,
@@ -18,6 +19,7 @@ import {
   openReceivePack,
   openUploadPack,
   parseGitUrl,
+  protocolVersionFor,
   type ReceivePackConnection,
   type UploadPackConnection,
 } from "@statewalker/vcs-transport";
@@ -166,10 +168,21 @@ export function resolveRemote(url: string, context: RemoteResolutionContext): Re
     const scheme = url.slice(0, url.indexOf(":"));
     return viaConnector(scheme) ?? throwError(helperMissing(scheme));
   }
-  if (!parsed.path) throw new TransportError(NO_PATH);
+  // parse_connect_url: `host:` names the empty path, a URL without one names none
+  if (!parsed.path && !parsed.scpLike) throw new TransportError(NO_PATH);
+  // git_connect runs a command for ssh and file (not for git://): an option-looking path, then
+  // (after protocol.ssh.allow) host, never reaches it
+  if (parsed.scheme === "ssh" || parsed.local) checkNotAnOption("pathname", parsed.path);
   if (parsed.scheme === "file") {
     checkTransportAllowed("file", config, environment);
     return { kind: "local", url, path: parsed.path };
+  }
+  if (parsed.scheme === "ssh") {
+    checkTransportAllowed("ssh", config, environment);
+    checkNotAnOption(
+      "hostname",
+      `${parsed.user !== undefined ? `${parsed.user}@` : ""}${parsed.host ?? ""}`,
+    );
   }
   return (
     viaConnector(parsed.scheme) ??
@@ -179,6 +192,17 @@ export function resolveRemote(url: string, context: RemoteResolutionContext): Re
       ),
     )
   );
+}
+
+/**
+ * connect.c's `looks_like_command_line_option` checks: git's "strange hostname '<host>'
+ * blocked" (and pathname), so a remote URL cannot smuggle an option into the command git
+ * runs (`ssh -oProxyCommand=...`).
+ *
+ * @throws TransportError git's line (exit 128)
+ */
+function checkNotAnOption(what: "hostname" | "pathname", value: string): void {
+  if (value.startsWith("-")) throw new TransportError(`fatal: strange ${what} '${value}' blocked`);
 }
 
 function throwError(error: Error): never {
@@ -244,7 +268,8 @@ function connectRequest(
   return {
     url: remote.parsed,
     service,
-    protocolVersion: options.protocolVersion,
+    // git_connect: receive-pack has no v2, so a push asks for v0; connectors never see 2
+    protocolVersion: protocolVersionFor(service, options.protocolVersion),
     ...(options.credentials ? { credentials: options.credentials } : {}),
     ...(options.headers ? { headers: options.headers } : {}),
     ...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
@@ -253,8 +278,29 @@ function connectRequest(
 }
 
 /**
- * Runs `run` over a session the remote's connector opens for `service`; a native session's
- * stream is closed afterwards.
+ * A native session whose stream closes once: the connection opened over it closes the stream
+ * (`closeDuplex`), and {@link withRemoteSession} closes it again for a `run` that opened none
+ * or failed before; the second close does nothing.
+ */
+function closingOnce(session: GitSession): GitSession {
+  if (session.kind !== "native") return session;
+  const inner = session.duplex;
+  let closing: Promise<void> | undefined;
+  const duplex: Duplex = {
+    [Symbol.asyncIterator]: () => inner[Symbol.asyncIterator](),
+    write: (data) => inner.write(data),
+    close: () => {
+      closing ??= inner.close?.() ?? Promise.resolve();
+      return closing;
+    },
+  };
+  return { ...session, duplex };
+}
+
+/**
+ * Runs `run` over a session the remote's connector opens for `service` (the request's
+ * protocol version as git_connect asks for it: v0 for receive-pack when v2 is configured); a
+ * native session's stream is closed afterwards, once, whether or not `run` closed it.
  */
 export async function withRemoteSession<T>(
   remote: Extract<ResolvedRemote, { kind: "connector" }>,
@@ -263,7 +309,7 @@ export async function withRemoteSession<T>(
   run: (session: GitSession, request: GitConnectRequest) => Promise<T>,
 ): Promise<T> {
   const request = connectRequest(remote, service, options);
-  const session = await remote.connector.connect(request);
+  const session = closingOnce(await remote.connector.connect(request));
   try {
     return await run(session, request);
   } finally {
@@ -311,7 +357,9 @@ export async function withRemoteReceivePack<T>(
   transactionHooks?: HookSession,
 ): Promise<T> {
   if (remote.kind === "local") {
-    return withLocalReceivePack(remote.repository, run, hooks, transactionHooks);
+    return withLocalReceivePack(remote.repository, run, hooks, transactionHooks, {
+      protocolVersion: options.protocolVersion,
+    });
   }
   return withRemoteSession(remote, "git-receive-pack", options, async (session, request) => {
     const connection = await openReceivePack(session, request, {

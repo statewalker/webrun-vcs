@@ -10,12 +10,13 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createDefaultTransports } from "@statewalker/vcs-transport";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { Git, GitApiError } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
-import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
@@ -337,5 +338,276 @@ describeGit("protocol.allow, as native git", () => {
     );
     expect(push?.message).toBe(nativePush.stderr.trim());
     expect(push?.exitCode).toBe(nativePush.status);
+  });
+});
+
+describeGit("review fixes: option-looking URLs, default remotes, clone sources, -v, v1", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "url-review-"));
+    const src = join(root, "src");
+    mkdirSync(src);
+    git(src, "init", "-q", "-b", "main");
+    putFile(src, "a.txt", "a\n");
+    git(src, "add", "a.txt");
+    git(src, "commit", "-qm", "one");
+    git(src, "checkout", "-q", "-b", "feat");
+    putFile(src, "b.txt", "b\n");
+    git(src, "add", "b.txt");
+    git(src, "commit", "-qm", "two");
+    git(src, "checkout", "-q", "main");
+    git(root, "init", "-q", "--bare", "other.git");
+    git(src, "push", "-q", "../other.git", "feat:refs/heads/only");
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  // ssh would run a command: git refuses an option-looking path (ssh and local), then host
+  // (ssh, after protocol.ssh.allow), before it connects
+  const strange: { url: string; config?: string[][] }[] = [
+    { url: "ssh://-oProxyCommand=x/r" },
+    { url: "-oProxyCommand=x:r" },
+    { url: "h:-r" },
+    { url: "-h:-r" },
+    { url: "ssh://-h:22/r" },
+    { url: "ssh://[-h:22]/r" },
+    { url: "ssh://u@-h/r" },
+    { url: "-r" },
+    { url: "ssh://-h/r", config: [["protocol.ssh.allow", "never"]] },
+    { url: "h:-r", config: [["protocol.ssh.allow", "never"]] },
+  ];
+  for (const c of strange) {
+    it(`refuses ${c.url}${c.config ? " (ssh never)" : ""} as native git`, async () => {
+      const [n, o] = twins();
+      for (const d of [n, o]) {
+        // a repository named `-r` beside: still refused
+        git(join(root, d), "init", "-q", "--bare", "./-r");
+        for (const [key, value] of c.config ?? []) git(join(root, d), "config", key, value);
+      }
+      const env = { GIT_SSH_COMMAND: "false" };
+      for (const command of ["ls-remote", "fetch"] as const) {
+        const native = gitRun(root, join(root, n), [command, "--", c.url], env);
+        const g = await ours(o, env);
+        const error = await failure(() =>
+          command === "ls-remote"
+            ? g.lsRemote().setRemote(c.url).call()
+            : g.fetch().setRemote(c.url).call(),
+        );
+        // ssh://u@-h/r: git's host check sees `u@-h`, not an option: it connects (and fails)
+        if (c.url === "ssh://u@-h/r") {
+          expect(native.stderr).not.toContain("strange");
+          expect(error?.message).not.toContain("strange");
+          continue;
+        }
+        expect(error?.message, `${command} ${c.url}`).toBe(native.stderr.trim());
+        expect(error?.exitCode).toBe(native.status);
+      }
+    });
+  }
+
+  it("ls-remote without a remote: remote_get(NULL)", async () => {
+    const [n, o] = twins();
+    const getUrl = async () => {
+      const native = gitRun(root, join(root, n), ["ls-remote", "--get-url"]);
+      let mine: string | undefined;
+      const error = await failure(async () => {
+        mine = await (await ours(o)).lsRemote().callGetUrl();
+      });
+      if (native.status === 0) {
+        expect(error).toBeUndefined();
+        expect(mine).toBe(native.stdout.trim());
+      } else {
+        expect(error?.message).toBe(native.stderr.trim());
+        expect(error?.exitCode).toBe(native.status);
+      }
+      return native.status;
+    };
+    const both = (...args: string[]) => {
+      for (const d of [n, o]) git(join(root, d), "config", ...args);
+    };
+    // no remote at all: listing fails as getting the URL does
+    expect(await getUrl()).toBe(128);
+    const nativeLs = gitRun(root, join(root, n), ["ls-remote"]);
+    const ls = await failure(async () => (await ours(o)).lsRemote().call());
+    expect(ls?.message).toBe(nativeLs.stderr.trim());
+    expect(ls?.exitCode).toBe(nativeLs.status);
+    // the only remote
+    both("remote.up.url", "../src");
+    expect(await getUrl()).toBe(0);
+    // two remotes, none origin: origin, which has no URL
+    both("remote.b.url", "../other.git");
+    expect(await getUrl()).toBe(128);
+    // the current branch's remote; one that names no remote is a URL (insteadOf applies)
+    both("branch.main.remote", "b");
+    expect(await getUrl()).toBe(0);
+    both(`url.${root}/.insteadOf`, "sh:");
+    both("branch.main.remote", "sh:other.git");
+    expect(await getUrl()).toBe(0);
+    both("--unset", "branch.main.remote");
+    // origin with no URL
+    both("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+    expect(await getUrl()).toBe(128);
+    both("remote.origin.url", "../src");
+    expect(await getUrl()).toBe(0);
+    // and ls-remote lists the default remote's refs
+    const listed = (await (await ours(o)).lsRemote().call()).refs.map(
+      (r) => `${r.objectId}\t${r.name}`,
+    );
+    const native = git(join(root, n), "ls-remote")
+      .split("\n")
+      .filter((l) => l && !l.endsWith("\tHEAD"));
+    expect(listed).toEqual(native);
+  });
+
+  it("clone: a name without a colon that is no path is not rewritten", async () => {
+    const [n, o] = twins();
+    rmSync(join(root, n), { recursive: true, force: true });
+    const native = gitRun(root, root, [
+      "-c",
+      `url.${root}/src.insteadOf=nocolon`,
+      "clone",
+      "nocolon",
+      n,
+    ]);
+    git(join(root, o), "config", `url.${root}/src.insteadOf`, "nocolon");
+    const error = await failure(async () => (await ours(o)).clone().setURI("nocolon").call());
+    expect(native.stderr.trim()).toBe("fatal: repository 'nocolon' does not exist");
+    expect(error?.message).toBe(native.stderr.trim());
+    expect(error?.exitCode).toBe(native.status);
+    expect(git(join(root, o), "for-each-ref")).toBe("");
+  });
+
+  it("clone: a path becomes absolute, and insteadOf rewrites that absolute path", async () => {
+    // native clones into its (empty) directory, so both resolve `../src` from their top
+    const [n, o] = twins();
+    rmSync(join(root, n), { recursive: true, force: true });
+    mkdirSync(join(root, n));
+    expect(gitRun(root, join(root, n), ["clone", "-q", "../src", "."]).status).toBe(0);
+    await (await ours(o)).clone().setURI("../src").call();
+    expect(refs(o)).toBe(refs(n));
+    const originUrl = (d: string) => git(join(root, d), "config", "remote.origin.url").trim();
+    expect(originUrl(n)).toBe(`${root}/${n}/../src`);
+    expect(originUrl(o)).toBe(`${root}/${o}/../src`);
+    const reflog = (d: string) => git(join(root, d), "reflog", "-1", "--format=%gs", "main");
+    expect(reflog(o).replace(`/${o}/`, "/X/")).toBe(reflog(n).replace(`/${n}/`, "/X/"));
+
+    const [n2, o2] = twins();
+    rmSync(join(root, n2), { recursive: true, force: true });
+    mkdirSync(join(root, n2));
+    const rewrite = (d: string) => `url.${root}/other.git.insteadOf=${root}/${d}/../src`;
+    expect(
+      gitRun(root, join(root, n2), ["-c", rewrite(n2), "clone", "-q", "../src", "."]).status,
+    ).toBe(0);
+    git(join(root, o2), "config", `url.${root}/other.git.insteadOf`, `${root}/${o2}/../src`);
+    await (await ours(o2)).clone().setURI("../src").call();
+    expect(refs(o2)).toBe(refs(n2));
+    expect(refs(o2)).toContain("refs/remotes/origin/only");
+    expect(originUrl(o2)).toBe(`${root}/${o2}/../src`);
+  });
+
+  it("remote -v: URLs as alias_all_urls leaves them", async () => {
+    const [n, o] = twins();
+    for (const d of [n, o]) {
+      const set = (...args: string[]) => git(join(root, d), "config", ...args);
+      set(`url.${root}/.insteadOf`, "short:");
+      set("url.ssh://push.example/.pushInsteadOf", "short:");
+      set("remote.a.url", "short:src");
+      set("remote.b.url", "short:src");
+      set("remote.b.pushurl", "short:dst");
+      set("remote.d.url", "short:x1");
+      set("--add", "remote.d.url", "plain:y1");
+      set("remote.f.url", "https://example.com/r.git");
+      set("remote.e.url", "short:gone");
+      set("--add", "remote.e.url", "");
+      set("--add", "remote.e.url", "short:kept");
+    }
+    const keepsEmpty = git(join(root, n), "remote", "get-url", "--all", "e")
+      .split("\n")
+      .includes("");
+    const native = git(join(root, n), "remote", "-v")
+      .split("\n")
+      .filter((l) => l && !(keepsEmpty && l.startsWith("e\t")));
+    const remotes = await (await ours(o)).remoteList().call();
+    const mine: string[] = [];
+    for (const r of [...remotes].sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0))) {
+      if (keepsEmpty && r.name === "e") continue;
+      if (r.urls[0] !== undefined) mine.push(`${r.name}\t${r.urls[0]} (fetch)`);
+      for (const url of r.pushUrls.length > 0 ? r.pushUrls : r.urls) {
+        mine.push(`${r.name}\t${url} (push)`);
+      }
+    }
+    expect(mine).toEqual(native);
+  });
+
+  it("protocol.version=1: local fetch and push", async () => {
+    const [n, o] = twins();
+    git(root, "init", "-q", "--bare", `${n}-dst.git`);
+    git(root, "init", "-q", "--bare", `${o}-dst.git`);
+    for (const d of [n, o]) git(join(root, d), "config", "protocol.version", "1");
+    expect(gitRun(root, join(root, n), ["fetch", "../src", "feat:refs/heads/f"]).status).toBe(0);
+    await (await ours(o)).fetch().setRemote("../src").setRefSpecs("feat:refs/heads/f").call();
+    expect(refs(o)).toBe(refs(n));
+    expect(gitRun(root, join(root, n), ["push", `../${n}-dst.git`, "f:refs/heads/p"]).status).toBe(
+      0,
+    );
+    await (await ours(o)).push().setRemote(`../${o}-dst.git`).setRefSpecs("f:refs/heads/p").call();
+    const dst = (d: string) => git(join(root, `${d}-dst.git`), "for-each-ref");
+    expect(dst(o)).toBe(dst(n));
+  });
+
+  it("protocol.version=1 over smart HTTP: native http-backend answers `version 1`", async () => {
+    const [n, o] = twins();
+    git(root, "init", "-q", "--bare", `${o}-http.git`);
+    git(join(root, `${o}-http.git`), "config", "http.receivepack", "true");
+    git(join(root, o), "config", "protocol.version", "1");
+    const backend = nativeGitHttpBackend(root, root);
+    const seen: string[] = [];
+    const transports = createDefaultTransports({
+      fetchImpl: async (request: Request) => {
+        const response = await backend.fetch(request);
+        let first = "";
+        if (request.method === "GET") {
+          const text = new TextDecoder().decode(await response.clone().arrayBuffer());
+          first = text.split("0000")[1]?.slice(0, 14) ?? "";
+        }
+        seen.push(
+          `${request.method} ${new URL(request.url).pathname} ${request.headers.get("git-protocol")} ${first}`,
+        );
+        return response;
+      },
+    });
+    try {
+      expect(
+        gitRun(root, join(root, n), [
+          "-c",
+          "protocol.version=1",
+          "fetch",
+          "../src",
+          "feat:refs/heads/f",
+        ]).status,
+      ).toBe(0);
+      await (await ours(o))
+        .fetch()
+        .setRemote("http://h/src")
+        .setRefSpecs("feat:refs/heads/f")
+        .setTransports(transports)
+        .call();
+      expect(refs(o)).toBe(refs(n));
+      await (await ours(o))
+        .push()
+        .setRemote(`http://h/${o}-http.git`)
+        .setRefSpecs("f:refs/heads/p")
+        .setTransports(transports)
+        .call();
+      expect(git(join(root, `${o}-http.git`), "rev-parse", "refs/heads/p")).toBe(
+        git(join(root, "src"), "rev-parse", "feat"),
+      );
+    } finally {
+      backend.close();
+    }
+    expect(seen).toEqual([
+      "GET /src/info/refs version=1 000eversion 1\n",
+      "POST /src/git-upload-pack version=1 ",
+      `GET /${o}-http.git/info/refs version=1 000eversion 1\n`,
+      `POST /${o}-http.git/git-receive-pack version=1 `,
+    ]);
   });
 });

@@ -220,7 +220,8 @@ describeGit("remote commands over registered connectors", () => {
       expect(git(join(root, `${o}-dst.git`), "rev-parse", "refs/heads/pushed")).toBe(
         git(dir, "rev-parse", "HEAD"),
       );
-      expect(calls).toEqual([`${kind} git-receive-pack /${o}-dst.git v2`]);
+      // git_connect: a push configured for v2 asks for v0; the connector never sees 2
+      expect(calls).toEqual([`${kind} git-receive-pack /${o}-dst.git v0`]);
     });
   }
 
@@ -287,5 +288,68 @@ describeGit("remote commands over registered connectors", () => {
     expect(await fails("peer:src")).toBe(
       "fatal: cannot connect to 'peer:src': only http(s) and local repositories are reachable here",
     );
+  });
+
+  it("a native session's stream is closed once, after the connection closed it", async () => {
+    const [n, o] = twins();
+    const g = await ours(o);
+    const transports = transportsFor(g);
+    let closes = 0;
+    transports.register({
+      name: "counting",
+      schemes: ["counting"],
+      connect: async (request) => {
+        const inner = transports.resolve("test://x/y");
+        const session = await (inner as NonNullable<typeof inner>).connect(request);
+        if (session.kind !== "native") return session;
+        const duplex = session.duplex;
+        return {
+          ...session,
+          duplex: {
+            [Symbol.asyncIterator]: () => duplex[Symbol.asyncIterator](),
+            write: (data: Uint8Array) => duplex.write(data),
+            close: async () => {
+              closes++;
+              await duplex.close?.();
+            },
+          },
+        };
+      },
+    });
+    git(join(root, n), "fetch", "-q", "../src", "feat:refs/heads/f");
+    await g
+      .fetch()
+      .setRemote("counting://peer/src")
+      .setRefSpecs("feat:refs/heads/f")
+      .setTransports(transports)
+      .call();
+    expect(refs(o)).toBe(refs(n));
+    expect(closes).toBe(1);
+  });
+
+  it("protocol.version=1 reaches the connector for fetch and push", async () => {
+    const [, o] = twins();
+    git(root, "init", "-q", "--bare", `${o}-dst.git`);
+    const dir = join(root, o);
+    git(dir, "fetch", "-q", "../src", "main");
+    git(dir, "reset", "-q", "--hard", "FETCH_HEAD");
+    git(dir, "config", "protocol.version", "1");
+    const g = await ours(o);
+    await g
+      .fetch()
+      .setRemote("test://peer/src")
+      .setRefSpecs("feat:refs/heads/f")
+      .setTransports(transportsFor(g))
+      .call();
+    await (await ours(o))
+      .push()
+      .setRemote(`test://peer/${o}-dst.git`)
+      .setRefSpecs("main:refs/heads/pushed")
+      .setTransports(transportsFor(g))
+      .call();
+    expect(calls).toEqual([
+      "native git-upload-pack /src v1",
+      `native git-receive-pack /${o}-dst.git v1`,
+    ]);
   });
 });

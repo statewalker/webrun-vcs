@@ -11,6 +11,7 @@ import type { Credentials } from "../api/credentials.js";
 import type { Duplex } from "../api/duplex.js";
 import { authorizationHeader } from "../operations/http-auth.js";
 import { ServerError, TransportError } from "../protocol/index.js";
+import { abortErrorOf, IdleTimer } from "./idle-timer.js";
 import { type Pkt, PktStream } from "./pkt-stream.js";
 
 /** A ref as the server lists it (ls-refs, or the v0 advertisement). */
@@ -56,8 +57,12 @@ export interface HttpConnectionOptions {
   timeout?: number;
   /** Defaults to `globalThis.fetch` */
   fetchImpl?: (request: Request) => Promise<Response>;
-  /** 2 (default): ask for protocol v2 and fall back to v0 when the server answers v0. 0: v0 only. */
-  protocolVersion?: 0 | 2;
+  /**
+   * 2 (default): ask for protocol v2 and fall back to v0 when the server answers v0. 1: ask
+   * for v1 (`Git-Protocol: version=1` on every request; the advertisement after the server's
+   * `version 1` line, spoken as v0). 0: v0 only.
+   */
+  protocolVersion?: 0 | 1 | 2;
   /** Aborts every request of the connection */
   signal?: AbortSignal;
   /**
@@ -79,7 +84,9 @@ export async function openHttpConnection(
 ): Promise<UploadPackConnection> {
   const baseUrl = options.url.replace(/\/+$/, "");
   const doFetch = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
-  const wantV2 = (options.protocolVersion ?? 2) === 2;
+  const asked = options.protocolVersion ?? 2;
+  const protocolHeader: Record<string, string> =
+    asked > 0 ? { "Git-Protocol": `version=${asked}` } : {};
   const headers: Record<string, string> = { ...options.headers };
   if (options.auth) headers.Authorization = authorizationHeader(options.auth);
 
@@ -96,7 +103,7 @@ export async function openHttpConnection(
         headers: {
           ...headers,
           Accept: "application/x-git-upload-pack-advertisement",
-          ...(wantV2 ? { "Git-Protocol": "version=2" } : {}),
+          ...protocolHeader,
         },
         signal: controller.signal,
       }),
@@ -137,7 +144,13 @@ export async function openHttpConnection(
               ...headers,
               "Content-Type": "application/x-git-upload-pack-request",
               Accept: "application/x-git-upload-pack-result",
-              ...(greeting.version === 2 ? { "Git-Protocol": "version=2" } : {}),
+              // the version spoken: v2 as answered, v1 as asked (git's remote-curl sends its
+              // protocol header with every request)
+              ...(greeting.version === 2
+                ? { "Git-Protocol": "version=2" }
+                : asked === 1
+                  ? protocolHeader
+                  : {}),
               ...(payload.gzip ? { "Content-Encoding": "gzip" } : {}),
             },
             body: payload.bytes,
@@ -164,19 +177,50 @@ export async function openHttpConnection(
 export interface DuplexConnectionOptions {
   /** Whether {@link UploadPackConnection.close} also closes the duplex (default false: the caller owns it) */
   closeDuplex?: boolean;
+  /**
+   * Bounds each wait for the server, in milliseconds (its greeting, a write it does not take,
+   * the next chunk of an answer), not the time spent here between requests; on expiry the
+   * pending wait fails with "Request timeout" and the duplex is closed
+   */
+  timeout?: number;
+  /** Aborts the fetch: the pending wait fails (the duplex is closed with `closeDuplex`) */
+  signal?: AbortSignal;
 }
 
 /**
  * Opens a stateful connection over a duplex whose other end runs upload-pack (our
  * `serveOverDuplex`, a spawned `git upload-pack`): the server speaks first, with its v2
- * capabilities (`version 2`) or its v0 ref advertisement, and the connection follows.
+ * capabilities (`version 2`) or its v0 ref advertisement (after `version 1` for protocol
+ * v1), and the connection follows.
  */
 export async function openDuplexConnection(
   duplex: Duplex,
   options: DuplexConnectionOptions = {},
 ): Promise<UploadPackConnection> {
-  const pkts = new PktStream(duplex);
-  const greeting = await readServerGreeting(pkts, await pkts.read());
+  const { signal } = options;
+  if (signal?.aborted) throw abortErrorOf(signal, "Fetch aborted");
+  const idle = new IdleTimer(
+    options.timeout,
+    () => {
+      void duplex.close?.();
+    },
+    signal,
+    "Fetch aborted",
+  );
+  const wait = <T>(next: () => Promise<T>): Promise<T> => idle.wait(next);
+  const onAbort = () => {
+    if (options.closeDuplex) void duplex.close?.();
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const release = () => signal?.removeEventListener("abort", onAbort);
+  const pkts = new PktStream(duplex, wait);
+  let greeting: ServerGreeting;
+  try {
+    greeting = await readServerGreeting(pkts, await pkts.read());
+  } catch (error) {
+    release();
+    throw error;
+  }
   let closed = false;
   let requested = false;
   return {
@@ -186,7 +230,7 @@ export async function openDuplexConnection(
     advertisedRefs: greeting.refs,
     async request(body) {
       requested = true;
-      for (const chunk of body) await duplex.write(chunk);
+      for (const chunk of body) await wait(async () => duplex.write(chunk));
       return pkts;
     },
     async close() {
@@ -202,6 +246,7 @@ export async function openDuplexConnection(
           // the other end is gone already
         }
       }
+      release();
       if (options.closeDuplex) await duplex.close?.();
     },
   };

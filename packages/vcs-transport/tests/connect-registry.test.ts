@@ -9,15 +9,18 @@ import { describe, expect, it } from "vitest";
 import {
   createDefaultTransports,
   createFetchHandler,
+  createHttpConnector,
   type Duplex,
   type GitConnectRequest,
   type GitTransportConnector,
   GitTransportRegistry,
   gitDaemonRequest,
   lsRefs,
+  openDuplexConnection,
   openReceivePack,
   openUploadPack,
   parseGitUrl,
+  protocolVersionFor,
   serveOverDuplex,
 } from "../src/index.js";
 import { serverRepo } from "./helpers/receive-pack-harness.js";
@@ -236,4 +239,145 @@ describe("openUploadPack / openReceivePack", () => {
       }
     });
   }
+});
+
+describe("review fixes: NUL, helper URLs, versions, timeouts", () => {
+  it("refuses a NUL in the host, path or extra parameters of git's request line", () => {
+    // `%00` stays as written (git's url_decode keeps it): no parameter is smuggled in
+    expect(
+      new TextDecoder().decode(
+        gitDaemonRequest({
+          url: parseGitUrl("git://h/r%00%00x=y"),
+          service: "git-upload-pack",
+          protocolVersion: 0,
+        }),
+      ),
+    ).toBe("0027git-upload-pack /r%00%00x=y\0host=h\0");
+    const url = { ...parseGitUrl("git://h/r"), path: "/r\0\0x=y" };
+    expect(() => gitDaemonRequest({ url, service: "git-upload-pack", protocolVersion: 0 })).toThrow(
+      "NUL is forbidden in git:// hosts and repo paths",
+    );
+    expect(() =>
+      gitDaemonRequest({
+        url: parseGitUrl("git://h/r"),
+        service: "git-upload-pack",
+        protocolVersion: 0,
+        extraParams: { "a\0b": "c" },
+      }),
+    ).toThrow("NUL is forbidden");
+  });
+
+  it("protocolVersionFor: receive-pack never asks for v2", () => {
+    expect(protocolVersionFor("git-receive-pack", 2)).toBe(0);
+    expect(protocolVersionFor("git-receive-pack", 1)).toBe(1);
+    expect(protocolVersionFor("git-upload-pack", 2)).toBe(2);
+  });
+
+  it("createHttpConnector: a `https::<url>` URL's session targets its address", async () => {
+    const connector = createHttpConnector({ fetchImpl: async () => new Response("") });
+    const registry = new GitTransportRegistry();
+    registry.register(connector);
+    const url = parseGitUrl("https::https://h.example/r.git");
+    expect(registry.resolve(url)?.name).toBe("http");
+    const session = await connector.connect({
+      url,
+      service: "git-upload-pack",
+      protocolVersion: 2,
+    });
+    expect(session.kind === "http" && session.baseUrl).toBe("https://h.example/r.git");
+  });
+
+  it("openDuplexConnection: an idle server times out, an abort fails the wait", async () => {
+    const silent = duplexPair();
+    const started = Date.now();
+    await expect(
+      openDuplexConnection(silent.left, { closeDuplex: true, timeout: 50 }),
+    ).rejects.toThrow("Request timeout");
+    expect(Date.now() - started).toBeLessThan(5000);
+
+    const aborted = duplexPair();
+    const controller = new AbortController();
+    const opening = openDuplexConnection(aborted.left, {
+      closeDuplex: true,
+      signal: controller.signal,
+    });
+    controller.abort(new Error("stop"));
+    await expect(opening).rejects.toThrow("stop");
+    const before = new AbortController();
+    before.abort();
+    await expect(
+      openDuplexConnection(duplexPair().left, { signal: before.signal }),
+    ).rejects.toThrow();
+  });
+
+  it("openUploadPack passes the request's timeout to a native session", async () => {
+    const { left } = duplexPair();
+    await expect(
+      openUploadPack(
+        { kind: "native", duplex: left, handshake: "implicit" },
+        {
+          url: parseGitUrl("x://p/r"),
+          service: "git-upload-pack",
+          protocolVersion: 2,
+          timeout: 50,
+        },
+      ),
+    ).rejects.toThrow("Request timeout");
+  });
+
+  it("protocol v1: the client asks for it, the servers answer `version 1`", async () => {
+    const { repo, c2 } = await serverRepo();
+    const handler = createFetchHandler({
+      resolveRepository: async () => ({ repository: repo.facade, refStore: repo.refStore }),
+    });
+    const protocols: (string | null)[] = [];
+    const firstLines: string[] = [];
+    const session = {
+      kind: "http" as const,
+      baseUrl: "http://in-process/repo.git",
+      fetchImpl: async (req: Request) => {
+        protocols.push(req.headers.get("git-protocol"));
+        const res = await handler(req);
+        if (req.method === "GET") {
+          const body = new Uint8Array(await res.clone().arrayBuffer());
+          firstLines.push(new TextDecoder().decode(body).split("0000")[1]?.slice(0, 14) ?? "");
+        }
+        return res;
+      },
+    };
+    const request: GitConnectRequest = {
+      url: parseGitUrl(session.baseUrl),
+      service: "git-upload-pack",
+      protocolVersion: 1,
+    };
+    const fetchConnection = await openUploadPack(session, request);
+    expect(fetchConnection.version).toBe(0);
+    expect(fetchConnection.advertisedRefs?.find((r) => r.name === "refs/heads/main")?.oid).toBe(c2);
+    await fetchConnection.close();
+    const push = await openReceivePack(session, { ...request, service: "git-receive-pack" });
+    expect(push.advertisedRefs.find((r) => r.name === "refs/heads/main")?.oid).toBe(c2);
+    await push.close();
+    expect(protocols).toEqual(["version=1", "version=1"]);
+    expect(firstLines).toEqual(["000eversion 1\n", "000eversion 1\n"]);
+
+    // over a duplex: serveOverDuplex's `version 1` line, read by the client
+    const { left, right, written } = duplexPair();
+    void written;
+    const serving = serveOverDuplex({
+      duplex: right,
+      repository: repo.facade,
+      refStore: repo.refStore,
+      service: "git-upload-pack",
+      announceVersion1: true,
+    });
+    const native = await openUploadPack(
+      { kind: "native", duplex: left, handshake: "implicit" },
+      request,
+    );
+    expect(native.version).toBe(0);
+    expect(native.advertisedRefs?.find((r) => r.name === "refs/heads/main")?.oid).toBe(c2);
+    await native.close();
+    await serving;
+    await right.close?.();
+  });
 });

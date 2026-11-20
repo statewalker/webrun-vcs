@@ -234,14 +234,18 @@ export class RemoteConfigStore {
 
   /**
    * Read a remote, filling in the default fetch refspec when none is
-   * configured, exactly as `git remote` reports one.
+   * configured, exactly as `git remote -v` reports one: its URLs as remote.c's
+   * `alias_all_urls` leaves them (an empty `url`/`pushurl` line clearing the ones before it,
+   * each URL rewritten by `url.<base>.insteadOf`), its push URLs the `pushurl` lines
+   * rewritten by `insteadOf` or, without any, the `pushInsteadOf` rewrites of its URLs (empty
+   * when none applies: the fetch URLs are pushed to).
    */
   read(name: string): RemoteConfig {
     const fetchRefspecs = this.strings(name, "fetch");
     return {
       name,
-      urls: this.strings(name, "url"),
-      pushUrls: this.strings(name, "pushurl"),
+      urls: this.remoteUrls(name),
+      pushUrls: this.aliasedPushUrls(name),
       fetchRefspecs: fetchRefspecs.length > 0 ? fetchRefspecs : [defaultFetchRefspec(name)],
       pushRefspecs: this.strings(name, "push"),
     };
@@ -422,6 +426,16 @@ export class RemoteConfigStore {
    * URLs ({@link remoteUrls}).
    */
   remotePushUrls(name: string): string[] {
+    const pushUrls = this.aliasedPushUrls(name);
+    return pushUrls.length > 0 ? pushUrls : this.remoteUrls(name);
+  }
+
+  /**
+   * A remote's `pushurl` list as remote.c's `alias_all_urls` leaves it: the `pushurl` lines
+   * rewritten by `insteadOf`, or without any, the `pushInsteadOf` rewrites of the `url` lines
+   * one matches (`add_pushurl_alias`).
+   */
+  private aliasedPushUrls(name: string): string[] {
     const pushUrls = this.urlList(name, "pushurl").map((url) => this.aliasUrl(url) ?? url);
     if (pushUrls.length > 0) return pushUrls;
     const aliased: string[] = [];
@@ -429,7 +443,7 @@ export class RemoteConfigStore {
       const alias = this.aliasUrl(url, { push: true });
       if (alias !== undefined) aliased.push(alias);
     }
-    return aliased.length > 0 ? aliased : this.remoteUrls(name);
+    return aliased;
   }
 
   /**

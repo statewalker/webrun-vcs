@@ -53,12 +53,18 @@ const children = new Set<ChildProcess>();
 function gitAsync(
   cwd: string,
   args: string[],
+  env: Record<string, string> = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = execFile(
       "git",
       args,
-      { cwd, env: { ...process.env, ...GIT_ENV }, timeout: GIT_TIMEOUT, killSignal: "SIGKILL" },
+      {
+        cwd,
+        env: { ...process.env, ...GIT_ENV, ...env },
+        timeout: GIT_TIMEOUT,
+        killSignal: "SIGKILL",
+      },
       (error, stdout, stderr) => {
         children.delete(child);
         const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
@@ -136,6 +142,7 @@ function serveRelay(repo: TransportRepo): Server {
       };
       const rest = buffered.subarray(newline + 1);
       const v2 = header.protocol.split(":").includes("version=2");
+      const v1 = !v2 && header.protocol.split(":").includes("version=1");
       await serveOverDuplex({
         duplex: {
           async *[Symbol.asyncIterator]() {
@@ -155,6 +162,7 @@ function serveRelay(repo: TransportRepo): Server {
         refStore: repo.refStore,
         service: "git-upload-pack",
         protocolVersion: v2 ? "2" : "1",
+        ...(v1 ? { announceVersion1: true } : {}),
         requestPolicy: relayPolicy,
       });
       socket.end();
@@ -229,6 +237,18 @@ describeGit("Interop · real git client ← our upload-pack", { timeout: TEST_TI
     expect(await gitOk(dst, ["rev-list", "--count", "main"])).toBe("4");
     expect(existsSync(join(dst, "shallow"))).toBe(false);
     await gitOk(dst, ["fsck", "--no-dangling"]);
+  });
+
+  it("protocol v1: git asks for it and reads our `version 1` line", async () => {
+    const dst = join(root, "v1.git");
+    const cloned = await gitAsync(
+      root,
+      ["-c", "protocol.version=1", "clone", "--bare", `--upload-pack=${uploadPack}`, url, dst],
+      { GIT_TRACE_PACKET: "1" },
+    );
+    expect(cloned.code, cloned.stderr).toBe(0);
+    expect(cloned.stderr).toMatch(/clone< version 1\n/);
+    expect(await gitOk(dst, ["rev-list", "--count", "main"])).toBe("4");
   });
 
   it("protocol v0: --depth 2 clone has two commits", async () => {

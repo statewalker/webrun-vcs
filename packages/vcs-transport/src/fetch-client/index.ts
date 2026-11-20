@@ -9,6 +9,7 @@ export * from "./fetch-display.js";
 export * from "./fetch-head.js";
 export * from "./fetch-pack.js";
 export * from "./fetch-remote.js";
+export * from "./idle-timer.js";
 export * from "./negotiator.js";
 export * from "./pkt-stream.js";
 export * from "./ref-updates.js";

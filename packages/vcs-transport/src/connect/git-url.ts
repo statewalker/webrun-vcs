@@ -7,7 +7,7 @@
 
 /** A remote URL taken apart the way git's transports read it. */
 export interface GitUrl {
-  /** The URL as given */
+  /** The URL as given (cut at a NUL, as git's C strings are) */
   raw: string;
   /**
    * The transport it names: `file` (a path or a `file://` URL), `ssh` (`ssh://`,
@@ -93,8 +93,8 @@ function helperLength(url: string): number {
 }
 
 /**
- * git's `url_decode`: `%XX` escapes decoded (an invalid one kept as is) after the scheme's
- * colon, the bytes read as UTF-8.
+ * git's `url_decode`: `%XX` escapes decoded (an invalid one, and `%00`, kept as is) after the
+ * scheme's colon, the bytes read as UTF-8.
  */
 function urlDecode(url: string): string {
   const colon = url.indexOf(":");
@@ -104,10 +104,14 @@ function urlDecode(url: string): string {
   const encoder = new TextEncoder();
   for (let i = 0; i < rest.length; i++) {
     const ch = rest[i];
+    // hex2chr's `0 < val`: `%00` is no escape (git's C strings could not hold the NUL)
     if (ch === "%" && /^[0-9A-Fa-f]{2}$/.test(rest.slice(i + 1, i + 3))) {
-      bytes.push(Number.parseInt(rest.slice(i + 1, i + 3), 16));
-      i += 2;
-      continue;
+      const value = Number.parseInt(rest.slice(i + 1, i + 3), 16);
+      if (value > 0) {
+        bytes.push(value);
+        i += 2;
+        continue;
+      }
     }
     for (const b of encoder.encode(ch)) bytes.push(b);
   }
@@ -136,14 +140,10 @@ function portOf(text: string): number | undefined {
 }
 
 /**
- * Splits `[user@]host[:port]` as git's ssh and tcp code do (`get_host_and_port`, and for ssh
- * then `get_port`): brackets removed, a valid port after the host split off, a lone trailing
- * colon dropped.
+ * Splits the `[user[:password]@]host[:port]` of a URL git hands to a remote helper (http(s)
+ * and other schemes): brackets removed, a valid port split off, a lone trailing colon dropped.
  */
-function splitAuthority(
-  authority: string,
-  ssh: boolean,
-): { user?: string; host?: string; port?: number } {
+function splitAuthority(authority: string): { user?: string; host?: string; port?: number } {
   let rest = authority;
   let user: string | undefined;
   const bracketAt = rest.indexOf("@[");
@@ -175,20 +175,69 @@ function splitAuthority(
       }
     }
   }
-  // ssh's get_port: a host still holding `name:port` (from `[name:port]`)
-  if (ssh && port === undefined) {
-    const colon = host.indexOf(":");
-    const p = colon >= 0 ? portOf(host.slice(colon + 1)) : undefined;
-    if (p !== undefined) {
-      port = p;
-      host = host.slice(0, colon);
-    }
-  }
   return {
     ...(user !== undefined ? { user } : {}),
     ...(host !== "" ? { host } : {}),
     ...(port !== undefined ? { port } : {}),
   };
+}
+
+/**
+ * A port as git's `strtol` check reads it (`get_host_and_port`, `get_port`): optional leading
+ * white space and sign, at least one digit, nothing after, 0..65535.
+ */
+function strtolPort(text: string): number | undefined {
+  const m = /^[ \t\n\v\f\r]*([+-]?)([0-9]+)$/.exec(text);
+  if (!m) return undefined;
+  const n = Number.parseInt(m[2] ?? "", 10);
+  if (m[1] === "-" && n !== 0) return undefined;
+  return n < 65536 ? n : undefined;
+}
+
+/**
+ * connect.c's `get_host_and_port` (brackets removed, a valid port after the first colon past
+ * the host split off, a lone trailing colon dropped), then for ssh `get_port` (a host still
+ * holding `name:port`, from `[name:port]`). The user stays in the host, as git hands
+ * `user@host` to ssh; ssh splits it at the last `@`.
+ */
+function gitHostAndPort(authority: string, ssh: boolean): { host: string; port?: number } {
+  // host_end(&host, 1): the bracketed part unwrapped, the rest searched for the port
+  let head = "";
+  let rest = authority;
+  const at = authority.indexOf("@[");
+  const start = at >= 0 ? at + 1 : 0;
+  if (authority[start] === "[") {
+    const close = authority.indexOf("]", start + 1);
+    if (close >= 0) {
+      head = authority.slice(0, start) + authority.slice(start + 1, close);
+      rest = authority.slice(close + 1);
+    }
+  }
+  let host = head + rest;
+  let port: number | undefined;
+  const colon = rest.indexOf(":");
+  if (colon >= 0) {
+    const p = strtolPort(rest.slice(colon + 1));
+    if (p !== undefined) port = p;
+    if (p !== undefined || colon === rest.length - 1) host = head + rest.slice(0, colon);
+  }
+  if (ssh && port === undefined) {
+    const c = host.indexOf(":");
+    const p = c >= 0 ? strtolPort(host.slice(c + 1)) : undefined;
+    if (p !== undefined) {
+      port = p;
+      host = host.slice(0, c);
+    }
+  }
+  return { host, ...(port !== undefined ? { port } : {}) };
+}
+
+/** `user@host` split at its last `@`, as ssh reads it. */
+function splitUser(userAndHost: string): { user?: string; host?: string } {
+  const at = userAndHost.lastIndexOf("@");
+  const user = at >= 0 ? userAndHost.slice(0, at) : undefined;
+  const host = at >= 0 ? userAndHost.slice(at + 1) : userAndHost;
+  return { ...(user !== undefined ? { user } : {}), ...(host !== "" ? { host } : {}) };
 }
 
 /** url.c's `url_get_scheme` for the builtin smart transports. */
@@ -219,7 +268,10 @@ function builtinScheme(scheme: string): "file" | "ssh" | "git" | undefined {
  * `[user@]host:path` of ssh. A missing path is left empty (git dies with "no path
  * specified" when it connects).
  */
-export function parseGitUrl(raw: string): GitUrl {
+export function parseGitUrl(given: string): GitUrl {
+  // git reads the URL as a C string: nothing after a NUL reaches it
+  const nul = given.indexOf("\0");
+  const raw = nul >= 0 ? given.slice(0, nul) : given;
   const helper = helperLength(raw);
   if (helper > 0) {
     const address = raw.slice(helper + 2);
@@ -244,16 +296,19 @@ export function parseGitUrl(raw: string): GitUrl {
       let path = slash < 0 ? "" : rest.slice(slash);
       const authority = slash < 0 ? rest : rest.slice(0, slash);
       if (builtin !== "file" && path.startsWith("/~")) path = path.slice(1);
-      const parts =
-        builtin === "file"
-          ? { host: authority || undefined }
-          : splitAuthority(authority, builtin === "ssh");
+      let parts: { user?: string; host?: string; port?: number };
+      if (builtin === "file") {
+        parts = authority ? { host: authority } : {};
+      } else {
+        const { host, port } = gitHostAndPort(authority, builtin === "ssh");
+        parts = { ...splitUser(host), ...(port !== undefined ? { port } : {}) };
+      }
       return {
         raw,
         scheme: builtin,
         ...(parts.host !== undefined ? { host: parts.host } : {}),
-        ...("port" in parts && parts.port !== undefined ? { port: parts.port } : {}),
-        ...("user" in parts && parts.user !== undefined ? { user: parts.user } : {}),
+        ...(parts.port !== undefined ? { port: parts.port } : {}),
+        ...(parts.user !== undefined ? { user: parts.user } : {}),
         path,
         scpLike: false,
         local: false,
@@ -264,7 +319,7 @@ export function parseGitUrl(raw: string): GitUrl {
     const rest = raw.slice(raw.indexOf("://") + 3);
     const stop = rest.search(/[/?#]/);
     const authority = stop < 0 ? rest : rest.slice(0, stop);
-    const parts = splitAuthority(authority, false);
+    const parts = splitAuthority(authority);
     const user = parts.user?.split(":")[0];
     return {
       raw,
@@ -290,8 +345,11 @@ export function parseGitUrl(raw: string): GitUrl {
   const end = hostEnd(raw);
   const colon = raw.indexOf(":", end);
   const authority = raw.slice(0, colon);
-  const path = raw.slice(colon + 1);
-  const parts = splitAuthority(authority, true);
+  let path = raw.slice(colon + 1);
+  // parse_connect_url: `host:/~user/x` asks for `~user/x`
+  if (path.startsWith("/~")) path = path.slice(1);
+  const { host, port } = gitHostAndPort(authority, true);
+  const parts = { ...splitUser(host), ...(port !== undefined ? { port } : {}) };
   return {
     raw,
     scheme: "ssh",

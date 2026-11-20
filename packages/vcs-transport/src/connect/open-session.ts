@@ -24,8 +24,17 @@ export interface OpenSessionOptions {
   streamRequestBody?: boolean;
 }
 
-/** The protocol version a service is asked for: receive-pack has no v2 (git falls back to v0). */
-function versionFor(service: GitService, version: 0 | 1 | 2): 0 | 1 | 2 {
+/**
+ * The protocol version a service is asked for (git_connect): receive-pack has no v2, so a
+ * push configured for v2 asks for v0; v0 and v1 stay.
+ *
+ * @example
+ * ```ts
+ * protocolVersionFor("git-receive-pack", 2); // 0
+ * protocolVersionFor("git-upload-pack", 2);  // 2
+ * ```
+ */
+export function protocolVersionFor(service: GitService, version: 0 | 1 | 2): 0 | 1 | 2 {
   return version === 2 && service !== "git-upload-pack" ? 0 : version;
 }
 
@@ -46,10 +55,17 @@ export function gitDaemonRequest(request: GitConnectRequest): Uint8Array {
   if (host.includes("\n") || path.includes("\n")) {
     throw new TransportError("newline is forbidden in git:// hosts and repo paths");
   }
+  // a NUL would end the field early and smuggle in parameters (git's C strings hold none)
+  if (host.includes("\0") || path.includes("\0")) {
+    throw new TransportError("NUL is forbidden in git:// hosts and repo paths");
+  }
   const extraParams = new Map<string, string>();
-  const version = versionFor(request.service, request.protocolVersion);
+  const version = protocolVersionFor(request.service, request.protocolVersion);
   if (version > 0) extraParams.set("version", String(version));
   for (const [key, value] of Object.entries(request.extraParams ?? {})) {
+    if (key.includes("\0") || value.includes("\0")) {
+      throw new TransportError("NUL is forbidden in git:// extra parameters");
+    }
     extraParams.set(key, value);
   }
   return encodeGitProtocolRequest({
@@ -104,12 +120,16 @@ export async function openUploadPack(
       ...(request.timeout !== undefined ? { timeout: request.timeout } : {}),
       ...(request.signal ? { signal: request.signal } : {}),
       ...(options.gzipRequests !== undefined ? { gzipRequests: options.gzipRequests } : {}),
-      protocolVersion: request.protocolVersion === 2 ? 2 : 0,
+      protocolVersion: request.protocolVersion,
     });
   }
   await handshake(session, request);
   try {
-    return await openDuplexConnection(session.duplex, { closeDuplex: true });
+    return await openDuplexConnection(session.duplex, {
+      closeDuplex: true,
+      ...(request.timeout !== undefined ? { timeout: request.timeout } : {}),
+      ...(request.signal ? { signal: request.signal } : {}),
+    });
   } catch (error) {
     await session.duplex.close?.();
     throw error;
@@ -138,6 +158,9 @@ export async function openReceivePack(
       ...(request.signal ? { signal: request.signal } : {}),
       ...(options.streamRequestBody !== undefined
         ? { streamRequestBody: options.streamRequestBody }
+        : {}),
+      ...(protocolVersionFor(request.service, request.protocolVersion) === 1
+        ? { protocolVersion: 1 as const }
         : {}),
     });
   }

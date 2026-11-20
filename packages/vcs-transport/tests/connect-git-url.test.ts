@@ -119,6 +119,37 @@ describe("parseGitUrl", () => {
     expect(parseGitUrl("HTTPS://example.com/r").scheme).toBe("https");
   });
 
+  it("reads hosts and ports in get_host_and_port's order", () => {
+    // scp-like `/~user`: the path git asks for is `~user/x`
+    expect(parseGitUrl("host:/~user/x")).toMatchObject({ host: "host", path: "~user/x" });
+    // a bracketed `[user@host:port]` names the user and the port
+    expect(parseGitUrl("[user@host:22]:repo")).toMatchObject({
+      user: "user",
+      host: "host",
+      port: 22,
+      path: "repo",
+    });
+    // the first colon past the host starts the port: `pw@host:22` is none, so no port
+    const pw = parseGitUrl("ssh://user:pw@host:22/x");
+    expect(pw).toMatchObject({ user: "user:pw", host: "host:22", path: "/x" });
+    expect(pw.port).toBeUndefined();
+    // strtol: a sign and leading blanks are read
+    expect(parseGitUrl("ssh://host:+22/x")).toMatchObject({ host: "host", port: 22 });
+    expect(parseGitUrl("ssh://host:22x/r")).toMatchObject({ host: "host:22x" });
+    expect(parseGitUrl("ssh://host:22x/r").port).toBeUndefined();
+    // `host:` names the empty path
+    expect(parseGitUrl("host:")).toMatchObject({ host: "host", path: "", scpLike: true });
+  });
+
+  it("keeps %00 and cuts at a NUL, as git's C strings do", () => {
+    expect(parseGitUrl("git://h/r%00%00x=y")).toMatchObject({ host: "h", path: "/r%00%00x=y" });
+    expect(parseGitUrl("ssh://h/r%00x").path).toBe("/r%00x");
+    const cut = parseGitUrl("git://h/r\0\0x=y");
+    expect(cut).toMatchObject({ raw: "git://h/r", path: "/r" });
+    // other escapes are still decoded
+    expect(parseGitUrl("git://h/a%20b").path).toBe("/a b");
+  });
+
   it("is_url and url_is_local_not_ssh", () => {
     expect(isGitUrl("a+b.c-d://x")).toBe(true);
     expect(isGitUrl("+a://x")).toBe(false);
@@ -173,6 +204,20 @@ describeGit("parseGitUrl: as native git's fetch-pack --diag-url", () => {
     "./x:y",
     "/abs",
     "rel/dir",
+    "host:/~user/x",
+    "[user@host:22]:repo",
+    "ssh://user:pw@host:22/x",
+    "ssh://host:+22/x",
+    "ssh://host: 22/x",
+    "ssh://host:22x/r",
+    "ssh://host:-1/r",
+    "ssh://[u@h:22]/r",
+    "ssh://u@[::1]:22/r",
+    "host:",
+    "git://h/r%00%00x=y",
+    "git://h%00x/r",
+    "ssh://h/r%00x",
+    "ssh://-oProxyCommand=x/r",
   ];
   for (const url of urls) {
     it(url, () => {
@@ -183,7 +228,9 @@ describeGit("parseGitUrl: as native git's fetch-pack --diag-url", () => {
       if (ours.scheme === "ssh") {
         const userAndHost = `${ours.user !== undefined ? `${ours.user}@` : ""}${ours.host ?? ""}`;
         expect(userAndHost).toBe(native.get("userandhost"));
-        expect(ours.port === undefined ? "NONE" : String(ours.port)).toBe(native.get("port"));
+        // git keeps the port as written (`+22`, ` 22`): compare the number strtol reads
+        const port = native.get("port");
+        expect(ours.port).toBe(port === "NONE" || port === undefined ? undefined : Number(port));
       } else {
         expect(ours.host ?? "").toBe(native.get("hostandport"));
       }

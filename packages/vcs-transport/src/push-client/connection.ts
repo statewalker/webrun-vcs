@@ -10,7 +10,13 @@
 import { fetchWithRequestBody, shouldStreamRequestBody } from "@statewalker/vcs-utils/streams";
 import type { Credentials } from "../api/credentials.js";
 import type { Duplex } from "../api/duplex.js";
-import { PktStream, type RemoteRef, readServerGreeting } from "../fetch-client/index.js";
+import {
+  abortErrorOf,
+  IdleTimer,
+  PktStream,
+  type RemoteRef,
+  readServerGreeting,
+} from "../fetch-client/index.js";
 import { authorizationHeader } from "../operations/http-auth.js";
 import { AuthenticationError, TransportError } from "../protocol/index.js";
 
@@ -47,6 +53,11 @@ export interface HttpReceivePackOptions {
   auth?: Credentials;
   headers?: Record<string, string>;
   /**
+   * 1: ask for protocol v1 (`Git-Protocol: version=1` on every request, as git's remote-curl
+   * sends for `protocol.version=1`; the server's `version 1` line is accepted). Default 0.
+   */
+  protocolVersion?: 0 | 1;
+  /**
    * Bounds each wait for the server, in milliseconds: the advertisement, the time the server
    * takes to read each chunk of the request, the report's next chunk (receive-pack's side-band
    * keep-alives count as chunks). Not the whole push.
@@ -78,13 +89,14 @@ export async function openHttpReceivePackConnection(
   const doFetch = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const headers: Record<string, string> = { ...options.headers };
   if (options.auth) headers.Authorization = authorizationHeader(options.auth);
+  if (options.protocolVersion === 1) headers["Git-Protocol"] = "version=1";
 
   const { signal } = options;
   if (signal?.aborted) throw abortError(signal);
   const controller = new AbortController();
   const onAbort = () => controller.abort(signal?.reason);
   signal?.addEventListener("abort", onAbort, { once: true });
-  const idle = new IdleTimer(options.timeout, () => controller.abort(), signal);
+  const idle = new IdleTimer(options.timeout, () => controller.abort(), signal, "Push aborted");
   const wait = <T>(next: () => Promise<T>): Promise<T> => idle.wait(next);
   try {
     return await openHttp(options, baseUrl, doFetch, headers, controller, idle, wait, () =>
@@ -212,6 +224,7 @@ export async function openDuplexReceivePackConnection(
       void duplex.close?.();
     },
     signal,
+    "Push aborted",
   );
   const wait = <T>(next: () => Promise<T>): Promise<T> => idle.wait(next);
   const onAbort = () => {
@@ -263,7 +276,7 @@ export async function openDuplexReceivePackConnection(
 }
 
 function abortError(signal: AbortSignal): Error {
-  return signal.reason instanceof Error ? signal.reason : new TransportError("Push aborted");
+  return abortErrorOf(signal, "Push aborted");
 }
 
 /** The advertised refs without `.have` lines, and the `.have` object ids. */
@@ -291,81 +304,4 @@ async function checkResponse(response: Response, what: string): Promise<void> {
     throw new AuthenticationError(`${what}: ${status}`);
   }
   throw new TransportError(`${what}: ${status}`);
-}
-
-/**
- * An idle timeout on the server: each wait, and each {@link touch}, re-arms it; {@link pause}
- * stops it while the client itself is busy. When it fires the pending wait fails with "Request
- * timeout" and `onExpire` runs (aborting the requests, closing the duplex). An aborted `signal`
- * fails the pending wait too.
- */
-class IdleTimer {
-  private timer: ReturnType<typeof setTimeout> | undefined;
-  private reject: ((error: Error) => void) | undefined;
-  private expired = false;
-
-  constructor(
-    private readonly timeout: number | undefined,
-    private readonly onExpire: () => void,
-    private readonly signal?: AbortSignal,
-  ) {}
-
-  touch(): void {
-    if (!this.timeout || !this.reject) return;
-    clearTimeout(this.timer);
-    this.timer = setTimeout(() => {
-      this.expired = true;
-      this.reject?.(new TransportError("Request timeout"));
-      this.onExpire();
-    }, this.timeout);
-  }
-
-  pause(): void {
-    clearTimeout(this.timer);
-  }
-
-  /**
-   * `chunks` with the timer paused while each is produced here, and re-armed while each waits
-   * for the server to take it (and after the last).
-   */
-  async *serverPaced(chunks: AsyncIterable<Uint8Array>): AsyncGenerator<Uint8Array> {
-    const iterator = chunks[Symbol.asyncIterator]();
-    try {
-      while (true) {
-        this.pause();
-        const next = await iterator.next();
-        this.touch();
-        if (next.done) return;
-        yield next.value;
-      }
-    } finally {
-      this.touch();
-      await iterator.return?.();
-    }
-  }
-
-  async wait<T>(next: () => Promise<T>): Promise<T> {
-    const { signal } = this;
-    if (!this.timeout && !signal) return next();
-    if (signal?.aborted) throw abortError(signal);
-    let onAbort: (() => void) | undefined;
-    const stopped = new Promise<never>((_, reject) => {
-      this.reject = reject;
-      if (signal) {
-        onAbort = () => reject(abortError(signal));
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
-    });
-    this.touch();
-    try {
-      return await Promise.race([next(), stopped]);
-    } catch (error) {
-      if (this.expired) throw new TransportError("Request timeout");
-      throw error;
-    } finally {
-      clearTimeout(this.timer);
-      this.reject = undefined;
-      if (onAbort) signal?.removeEventListener("abort", onAbort);
-    }
-  }
 }

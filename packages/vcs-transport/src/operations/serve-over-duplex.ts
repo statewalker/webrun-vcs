@@ -30,6 +30,7 @@ import {
   serverPushHandlers,
   serverPushTransitions,
 } from "../fsm/push/server-push-fsm.js";
+import { encodePacketLine } from "../protocol/pkt-line-codec.js";
 import type { ServiceType } from "../protocol/types.js";
 import { withIdleTimeout, withWriteTimeout } from "../utils/idle-timeout.js";
 
@@ -146,6 +147,12 @@ export interface ServeOverDuplexOptions {
    * Defaults to `"1"`, which keeps the v1 path byte-for-byte unchanged.
    */
   protocolVersion?: "1" | "2";
+  /**
+   * Answer a client that asked for protocol v1 (`GIT_PROTOCOL=version=1`): the `version 1`
+   * line before the v0 advertisement, as git's upload-pack and receive-pack write it. Ignored
+   * when v2 is served.
+   */
+  announceVersion1?: boolean;
 }
 
 /**
@@ -274,6 +281,9 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       : new Fsm(serverFetchTransitions, serverFetchHandlers);
 
   try {
+    if (options.announceVersion1 && !useV2) {
+      await (write ?? ((data: Uint8Array) => duplex.write(data)))(encodePacketLine("version 1\n"));
+    }
     const success = await fsm.run(ctx);
     for (const task of afterReport) setTimeout(() => void task(), 0);
 
