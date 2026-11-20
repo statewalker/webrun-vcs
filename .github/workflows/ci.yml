@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, and on demand: every package, whatever the records say (`run --all`).
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
 
 jobs:
   ci:
@@ -19,6 +23,14 @@ jobs:
       # Fails a breaking API change (against npm's latest) that no changeset or version bump
       # declares: minor on 0.x, major from 1.0.
       api-diff: true
+      # Incremental tests (scripts/tested.mjs): only the packages whose inputs (files, locked
+      # dependencies, workspace dependencies, .tested/config.json) changed since they last passed
+      # here, as recorded in .tested/. `pnpm test` still runs everything.
+      # A pull request from a fork may not change the records (only CI writes them).
+      test-command: >-
+        node scripts/tested.mjs run --no-bail
+        ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '--all' || '' }}
+        ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && format('--records-unchanged-from={0}', github.event.pull_request.base.sha) || '' }}
 
   # The lockfile-only pull request that .github/workflows/statewalker-update.yml opens: merged
   # once every other check on it passes, after checking it changes pnpm-lock.yaml alone
@@ -35,6 +47,84 @@ jobs:
       actions: read
     uses: statewalker/statewalker-ci/.github/workflows/merge-lockfile.yml@main
     secrets: inherit
+
+  # After a run on a pull request from this repository: record in .tested/ the hashes (of the merge
+  # commit CI tested) of the packages that passed, and push them to the pull request's branch.
+  # Merging brings them to main, whose run then skips those packages. Only this job writes
+  # .tested/ records. Not on the lockfile pull request, which must change pnpm-lock.yaml alone,
+  # the version pull request, which changesets rewrites, nor Dependabot's, which it rebases.
+  # Only with the statewalker-release App: GitHub runs CI on what it pushes (it skips everything,
+  # the records being no test input), so the new head has the required check; a GITHUB_TOKEN
+  # push would start no run and leave the pull request blocked.
+  tested-record:
+    needs: ci
+    if: >-
+      !cancelled()
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.head_ref != 'deps/statewalker-lockfile'
+      && !startsWith(github.head_ref, 'changeset-release/')
+      && !startsWith(github.head_ref, 'dependabot/')
+      && vars.RELEASE_APP_CLIENT_ID != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # The merge commit the ci job tested. No credentials stay in it: the pull request's own
+      # script runs below; the push token comes only after.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # The shared workflow runs the tests and uploads no records: after a green run, every package
+      # passed, so record the hashes of the tested commit.
+      - name: Record the tested hashes
+        if: ${{ needs.ci.result == 'success' }}
+        run: node scripts/tested.mjs record
+      - name: Push token
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_KEY }}
+          permission-contents: write
+      - name: Push the records to the pull request branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          PUSH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          # The records this run changed. Rehash: a record rewritten in place within a second of
+          # the checkout keeps its size and inode, so git's stat cache would take it as unchanged.
+          git rm -r -q --cached .tested && git add .tested
+          git diff --cached --name-only -- .tested ':!.tested/config.json' ':!.tested/README.md' \
+            > "$RUNNER_TEMP/changed"
+          [ -s "$RUNNER_TEMP/changed" ] || { echo "records up to date"; exit 0; }
+          while read -r f; do
+            [ -f "$f" ] || continue
+            mkdir -p "$RUNNER_TEMP/records/$(dirname "$f")" && cp "$f" "$RUNNER_TEMP/records/$f"
+          done < "$RUNNER_TEMP/changed"
+          git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git reset -q --hard
+          git fetch -q --depth=1 origin "$HEAD_REF"
+          git checkout -q -B "$HEAD_REF" FETCH_HEAD
+          # Onto the branch, which may have moved on since the tested commit: each changed record
+          # merged with the branch's (newest first, four kept), a pruned one removed. Nothing else.
+          while read -r f; do
+            if [ -f "$RUNNER_TEMP/records/$f" ]; then
+              mkdir -p "$(dirname "$f")"
+              { cat "$RUNNER_TEMP/records/$f"; cat "$f" 2>/dev/null || true; } \
+                | awk 'NF && !seen[$0]++ && n++ < 4' > "$RUNNER_TEMP/merged"
+              mv "$RUNNER_TEMP/merged" "$f"
+            else
+              rm -f "$f"
+            fi
+          done < "$RUNNER_TEMP/changed"
+          git rm -r -q --cached .tested && git add .tested
+          if git diff --cached --quiet; then echo "records up to date"; exit 0; fi
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "chore: record tested packages"
+          # A commit pushed to the branch meanwhile wins: its own run records.
+          git push origin "HEAD:$HEAD_REF" || echo "::warning::branch moved; records left to the next run"
 
   # Releases to npm in three jobs: `version` opens the version pull request, `pack` packs what
   # npm lacks once it is merged, `publish` uploads the tarballs. Nobody approves the upload:

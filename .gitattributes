@@ -1,0 +1,4 @@
+# Test records (scripts/tested.mjs): two branches recording one package keep both hashes.
+.tested/** merge=union
+.tested/config.json merge=text
+.tested/README.md merge=text

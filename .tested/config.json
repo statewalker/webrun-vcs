@@ -1,0 +1,6 @@
+{
+  "globalFiles": ["tsconfig.base.json", "tsconfig.json", "vitest.config.ts"],
+  "globalDeps": ["vitest", "typescript", "@types/node"],
+  "ignore": ["CHANGELOG.md", "README.md"],
+  "runtime": ["node", "git"]
+}
