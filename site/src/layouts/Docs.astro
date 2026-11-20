@@ -1,0 +1,105 @@
+---
+import { guidePages, packagePages, pageHref, type RepoPage } from "@/lib/docs";
+import { examples } from "@/lib/examples";
+import Base from "./Base.astro";
+
+interface Props {
+  title: string;
+  description?: string;
+  /** Wider article column, for pages with live examples. */
+  wide?: boolean;
+}
+
+const { title, description, wide = false } = Astro.props;
+const path = Astro.url.pathname.replace(/\/$/, "");
+
+const navItem = (page: RepoPage) => ({ href: pageHref(page), label: page.label });
+
+const sections = [
+  {
+    heading: "Start",
+    items: [
+      { href: "/docs", label: "Getting started" },
+      { href: "/docs/architecture", label: "Architecture" },
+      { href: "/docs/examples", label: "Apps & demos" },
+      ...guidePages.map(navItem),
+    ],
+  },
+  {
+    heading: "Live examples",
+    items: [
+      { href: "/examples", label: "Overview" },
+      ...examples.map((e) => ({ href: `/examples/${e.name}`, label: e.label })),
+      { href: "/examples/playground", label: "Playground" },
+    ],
+  },
+  { heading: "Packages", items: packagePages.map(navItem) },
+];
+---
+
+<Base title={`${title} · StateWalker VCS`} description={description}>
+  <div class="mx-auto grid max-w-6xl gap-6 px-4 py-6 sm:px-6 md:grid-cols-[200px_1fr] md:gap-10 md:py-10">
+    {/* Below md the sidebar is hidden: the same sections, folded, above the article. */}
+    <details class="group rounded-lg border text-sm md:hidden">
+      <summary class="flex cursor-pointer list-none items-center justify-between px-4 py-3 font-medium [&::-webkit-details-marker]:hidden">
+        Docs menu
+        <span aria-hidden="true" class="text-muted-foreground transition-transform group-open:rotate-180">▾</span>
+      </summary>
+      <nav aria-label="Docs" class="grid gap-5 border-t px-4 py-4 sm:grid-cols-2">
+        {sections.map((s) => (
+          <div>
+            <p class="mb-2 font-medium">{s.heading}</p>
+            <ul class="space-y-1 border-l">
+              {s.items.map((item) => (
+                <li>
+                  <a
+                    href={item.href}
+                    aria-current={path === item.href ? "page" : undefined}
+                    class:list={[
+                      "-ml-px block border-l py-1 pl-3",
+                      path === item.href
+                        ? "border-primary text-foreground font-medium"
+                        : "border-transparent text-muted-foreground hover:text-foreground",
+                    ]}
+                  >
+                    {item.label}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </nav>
+    </details>
+    <aside class="hidden md:block">
+      <nav aria-label="Docs" class="sticky top-24 max-h-[calc(100dvh-7rem)] space-y-6 overflow-y-auto pb-6 text-sm">
+        {sections.map((s) => (
+          <div>
+            <p class="mb-2 font-medium">{s.heading}</p>
+            <ul class="space-y-1 border-l">
+              {s.items.map((item) => (
+                <li>
+                  <a
+                    href={item.href}
+                    aria-current={path === item.href ? "page" : undefined}
+                    class:list={[
+                      "-ml-px block border-l py-1 pl-3 transition-colors",
+                      path === item.href
+                        ? "border-primary text-foreground font-medium"
+                        : "border-transparent text-muted-foreground hover:text-foreground hover:border-foreground/30",
+                    ]}
+                  >
+                    {item.label}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </nav>
+    </aside>
+    <article class:list={["prose-vcs min-w-0", wide ? "max-w-4xl" : "max-w-3xl"]}>
+      <slot />
+    </article>
+  </div>
+</Base>

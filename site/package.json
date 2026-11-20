@@ -1,0 +1,47 @@
+{
+  "name": "@statewalker/vcs-site",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The StateWalker VCS website (Astro, Tailwind CSS, shadcn/ui tokens), with live examples that run the VCS packages in the browser.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/statewalker/webrun-vcs.git",
+    "directory": "site"
+  },
+  "bugs": {
+    "url": "https://github.com/statewalker/webrun-vcs/issues"
+  },
+  "homepage": "https://github.com/statewalker/webrun-vcs/tree/main/site#readme",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build && node scripts/compress.mjs",
+    "preview": "astro preview",
+    "typecheck": "astro sync && tsc --noEmit",
+    "check:examples": "node scripts/check-examples.mjs"
+  },
+  "dependencies": {
+    "@astrojs/markdown-remark": "catalog:",
+    "@fontsource-variable/inter": "catalog:",
+    "@fontsource-variable/jetbrains-mono": "catalog:",
+    "@statewalker/vcs-commands": "workspace:^",
+    "@statewalker/vcs-core": "workspace:^",
+    "@statewalker/vcs-store-files": "workspace:^",
+    "@statewalker/vcs-transport": "workspace:^",
+    "@statewalker/vcs-utils": "workspace:^",
+    "@statewalker/vcs-working-tree": "workspace:^",
+    "@statewalker/webrun-files": "catalog:",
+    "@statewalker/webrun-files-mem": "catalog:",
+    "@tailwindcss/vite": "catalog:",
+    "astro": "catalog:",
+    "clsx": "catalog:",
+    "jszip": "catalog:",
+    "tailwind-merge": "catalog:",
+    "tailwindcss": "catalog:"
+  },
+  "devDependencies": {
+    "playwright": "catalog:",
+    "typescript": "catalog:"
+  }
+}

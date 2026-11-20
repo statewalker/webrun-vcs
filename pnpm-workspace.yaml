@@ -4,9 +4,19 @@ packages:
   - "apps/demos/*"
   - "apps/benchmarks/*"
   - "docs"
+  - "site"
 
 catalog:
   "@changesets/cli": "^3.0.3"
+  # The website (site/), as statewalker/cellb.dev's site uses them.
+  "@astrojs/markdown-remark": "^7.3.8"
+  "@fontsource-variable/inter": "^5.3.0"
+  "@fontsource-variable/jetbrains-mono": "^5.3.0"
+  "@tailwindcss/vite": "^4.3.5"
+  astro: "^7.4.11"
+  clsx: "^2.1.1"
+  tailwind-merge: "^3.7.0"
+  tailwindcss: "^4.3.5"
   "@hono/node-server": "^2.1.8"
   "@playwright/test": "^1.63.0"
   "@statewalker/utils": "^0.4.2"

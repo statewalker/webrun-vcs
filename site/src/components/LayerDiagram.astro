@@ -1,0 +1,94 @@
+---
+// The packages as layers, bottom first: each one depends only on the layers below it
+// (README.md, "The shape"; docs/package-dependencies.md has every edge).
+import { docHref } from "@/lib/docs";
+
+const layers = [
+  {
+    name: "Orchestration",
+    items: [
+      {
+        pkg: "vcs-workspace",
+        note: "file sync + versioning: publish, update, checkpoint, restore",
+      },
+    ],
+  },
+  {
+    name: "Commands",
+    items: [
+      {
+        pkg: "vcs-commands",
+        note: "the Git API: add, commit, merge, rebase, stash, fetch, push, clone…",
+      },
+    ],
+  },
+  {
+    name: "Transport",
+    items: [
+      { pkg: "vcs-transport", note: "wire protocol v1/v2 over HTTP or any duplex" },
+      { pkg: "vcs-transport-adapters", note: "history ↔ transport" },
+      { pkg: "vcs-transport-lfs", note: "Git LFS" },
+      { pkg: "vcs-transport-xet", note: "large objects in chunks" },
+      { pkg: "vcs-transport-httpeers", note: "git over an httpeers mesh" },
+    ],
+  },
+  {
+    name: "Storage",
+    items: [
+      { pkg: "vcs-store-files", note: ".git over a FilesApi" },
+      { pkg: "vcs-store-mem", note: "memory" },
+      { pkg: "vcs-store-sql", note: "SQL (sql.js)" },
+      { pkg: "vcs-store-kv", note: "key-value (IndexedDB…)" },
+    ],
+  },
+  {
+    name: "Working tree",
+    items: [
+      {
+        pkg: "vcs-working-tree",
+        note: "index, checkout, worktree, status, ignore, merge/rebase state",
+      },
+    ],
+  },
+  {
+    name: "Core",
+    items: [{ pkg: "vcs-core", note: "objects, refs, packs, History" }],
+  },
+  {
+    name: "Utilities",
+    items: [
+      { pkg: "vcs-utils", note: "SHA-1, CRC32, zlib, diff, delta, streams" },
+      { pkg: "vcs-utils-node", note: "native zlib, Node files" },
+    ],
+  },
+];
+---
+
+<figure class="not-prose my-6 space-y-1.5" aria-label="StateWalker VCS packages as layers">
+  {layers.map((layer, i) => (
+    <div class="grid items-stretch gap-2 sm:grid-cols-[120px_1fr]">
+      <div class="flex items-center font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
+        {layer.name}
+      </div>
+      <div class="flex flex-wrap gap-1.5">
+        {layer.items.map((item) => (
+          <a
+            href={docHref(`packages/${item.pkg}/README.md`)}
+            class:list={[
+              "min-w-40 flex-1 rounded-lg border px-3 py-2 text-foreground no-underline transition-colors hover:border-primary/60",
+              i === 1 ? "border-primary/40 bg-primary/10" : "bg-card",
+            ]}
+          >
+            <span class="block font-mono text-[13px] font-medium">{item.pkg}</span>
+            <span class="block text-xs text-muted-foreground">{item.note}</span>
+          </a>
+        ))}
+      </div>
+    </div>
+  ))}
+  <figcaption class="pt-2 text-xs text-muted-foreground">
+    Each layer depends only on the layers below it. Files come in through{" "}
+    <code class="font-mono">@statewalker/webrun-files</code> (a <code class="font-mono">FilesApi</code>),
+    so no package touches <code class="font-mono">node:fs</code> except the Node adapter.
+  </figcaption>
+</figure>

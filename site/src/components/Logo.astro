@@ -1,0 +1,22 @@
+---
+interface Props {
+  class?: string;
+}
+const { class: className } = Astro.props;
+---
+
+<a href="/" class:list={["inline-flex items-center gap-2 font-semibold tracking-tight", className]}>
+  <svg viewBox="0 0 24 24" class="size-6" aria-hidden="true">
+    <rect width="24" height="24" rx="6" class="fill-primary" />
+    <g class="stroke-primary-foreground" fill="none" stroke-width="2" stroke-linecap="round">
+      <path d="M8 6v12" />
+      <path d="M8 13.5c0-3 8-2.25 8-6" />
+    </g>
+    <g class="fill-primary-foreground">
+      <circle cx="8" cy="6" r="2.1" />
+      <circle cx="8" cy="18" r="2.1" />
+      <circle cx="16" cy="6.75" r="2.1" />
+    </g>
+  </svg>
+  <span>StateWalker <span class="text-primary">VCS</span></span>
+</a>

@@ -1,0 +1,191 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * StateWalker VCS design tokens (shadcn/ui variable contract), the same structure as
+ * statewalker/cellb.dev's site so components move between them; only the values differ.
+ * The signature hue is a Git orange (≈ 45-55°) with a red secondary. To re-skin, change
+ * the --primary and --accent-2 values.
+ */
+:root {
+  --radius: 0.625rem;
+
+  --background: oklch(0.99 0.004 50);
+  --foreground: oklch(0.18 0.03 50);
+  --card: oklch(1 0 0);
+  --card-foreground: var(--foreground);
+  --popover: oklch(1 0 0);
+  --popover-foreground: var(--foreground);
+  --primary: oklch(0.58 0.19 45);
+  --primary-foreground: oklch(0.99 0.01 50);
+  --secondary: oklch(0.955 0.015 50);
+  --secondary-foreground: oklch(0.25 0.05 50);
+  --muted: oklch(0.96 0.01 50);
+  --muted-foreground: oklch(0.5 0.03 50);
+  --accent: oklch(0.95 0.03 50);
+  --accent-foreground: oklch(0.3 0.12 50);
+  --accent-2: oklch(0.6 0.21 25);
+  --destructive: oklch(0.58 0.22 27);
+  --border: oklch(0.91 0.015 50);
+  --input: oklch(0.91 0.015 50);
+  --ring: oklch(0.64 0.17 45);
+
+  --code: oklch(0.17 0.03 50);
+  --code-foreground: oklch(0.93 0.01 50);
+  --grid-line: oklch(0.58 0.19 45 / 0.07);
+}
+
+.dark {
+  --background: oklch(0.15 0.025 50);
+  --foreground: oklch(0.96 0.01 50);
+  --card: oklch(0.19 0.03 50);
+  --card-foreground: var(--foreground);
+  --popover: oklch(0.19 0.03 50);
+  --popover-foreground: var(--foreground);
+  --primary: oklch(0.76 0.15 55);
+  --primary-foreground: oklch(0.16 0.04 50);
+  --secondary: oklch(0.24 0.035 50);
+  --secondary-foreground: oklch(0.95 0.01 50);
+  --muted: oklch(0.23 0.03 50);
+  --muted-foreground: oklch(0.72 0.03 50);
+  --accent: oklch(0.27 0.06 50);
+  --accent-foreground: oklch(0.9 0.06 50);
+  --accent-2: oklch(0.72 0.17 25);
+  --destructive: oklch(0.65 0.2 25);
+  --border: oklch(1 0 0 / 0.1);
+  --input: oklch(1 0 0 / 0.14);
+  --ring: oklch(0.72 0.17 50);
+
+  --code: oklch(0.12 0.025 50);
+  --code-foreground: oklch(0.93 0.01 50);
+  --grid-line: oklch(0.76 0.15 55 / 0.07);
+}
+
+@theme inline {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent-2: var(--accent-2);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-code: var(--code);
+  --color-code-foreground: var(--code-foreground);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply scroll-smooth;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+  ::selection {
+    background: color-mix(in oklch, var(--primary) 30%, transparent);
+  }
+}
+
+@utility bg-grid {
+  background-image:
+    linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+@utility text-brand-gradient {
+  background-image: linear-gradient(100deg, var(--primary), var(--accent-2));
+  background-clip: text;
+  color: transparent;
+}
+
+/* Long-form docs content */
+@layer components {
+  .prose-vcs {
+    @apply text-[15px] leading-7 text-foreground/90;
+  }
+  .prose-vcs h1 {
+    @apply text-3xl font-semibold tracking-tight text-foreground mb-4;
+  }
+  .prose-vcs h2 {
+    @apply text-xl font-semibold tracking-tight text-foreground mt-10 mb-3 pb-2 border-b;
+  }
+  .prose-vcs h3 {
+    @apply text-base font-semibold text-foreground mt-8 mb-2;
+  }
+  .prose-vcs p {
+    @apply my-4;
+  }
+  .prose-vcs a {
+    @apply text-primary underline underline-offset-4 decoration-primary/40 hover:decoration-primary;
+  }
+  .prose-vcs ul {
+    @apply my-4 list-disc pl-6 space-y-1;
+  }
+  .prose-vcs h4 {
+    @apply text-sm font-semibold text-foreground mt-6 mb-2;
+  }
+  .prose-vcs ol {
+    @apply my-4 list-decimal pl-6 space-y-1;
+  }
+  .prose-vcs blockquote {
+    @apply my-4 border-l-2 pl-4 text-muted-foreground;
+  }
+  .prose-vcs pre {
+    @apply my-6 overflow-x-auto rounded-xl border px-4 py-4 font-mono text-[13px] leading-6;
+  }
+  /* A CodeBlock is the frame already: its own <pre> gets no second border, margin or radius. */
+  .prose-vcs .code-window {
+    @apply my-6;
+  }
+  .prose-vcs .code-window pre {
+    @apply m-0 rounded-none border-0;
+  }
+  .prose-vcs :not(pre) > code {
+    @apply font-mono text-[0.85em] rounded-md bg-muted px-1.5 py-0.5 text-foreground;
+    /* A long call or path breaks where it must instead of widening the page; break-word (not
+       anywhere) leaves a table's columns their natural width. */
+    overflow-wrap: break-word;
+  }
+  .prose-vcs table {
+    @apply w-full text-sm my-6;
+  }
+  /* On a phone, a wide table scrolls inside its own box, not the whole page. (Only there: as a
+     block, a table no longer stretches its rows to the full width.) */
+  @media (max-width: 767px) {
+    .prose-vcs table {
+      @apply block max-w-full overflow-x-auto;
+    }
+  }
+  .prose-vcs th {
+    @apply text-left font-medium text-muted-foreground border-b py-2 pr-4;
+  }
+  .prose-vcs td {
+    @apply border-b py-2 pr-4 align-top;
+  }
+}

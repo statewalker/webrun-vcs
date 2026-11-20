@@ -1,0 +1,136 @@
+---
+import CodeBlock from "@/components/CodeBlock.astro";
+import Docs from "@/layouts/Docs.astro";
+import { docHref } from "@/lib/docs";
+import { repoTree } from "@/lib/site";
+
+const install = `pnpm add @statewalker/vcs-commands @statewalker/vcs-core @statewalker/vcs-working-tree`;
+
+const minimal = `import { Git } from "@statewalker/vcs-commands";
+import { createMemoryHistory } from "@statewalker/vcs-core";
+import {
+  createMemoryCheckout,
+  createMemoryGitStaging,
+  createMemoryWorkingCopy,
+  createMemoryWorktree,
+} from "@statewalker/vcs-working-tree";
+
+const history = createMemoryHistory();
+await history.initialize();
+await history.refs.setSymbolic("HEAD", "refs/heads/main");
+
+const staging = createMemoryGitStaging();
+const checkout = createMemoryCheckout({ staging });
+const worktree = createMemoryWorktree({ blobs: history.blobs, trees: history.trees });
+const git = Git.fromWorkingCopy(createMemoryWorkingCopy({ history, checkout, worktree }));
+
+await worktree.writeContent("README.md", new TextEncoder().encode("# Hello\\n"));
+await git.add().addFilepattern(".").call();
+const commit = await git.commit().setMessage("Initial commit").call();
+console.log(commit.id);`;
+
+const onDisk = `import { Git } from "@statewalker/vcs-commands";
+import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
+import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+
+// An existing repository (or create: true for git init): native git and this code share it.
+const files = createNodeFilesApi({ rootDir: "/path/to/repo" });
+const { history } = await createGitFilesBackend({ files, gitDir: ".git" });
+const worktrees = await openGitLinkedWorktrees({ files, gitDir: ".git", history });
+const git = Git.fromWorkingCopy(await worktrees.openCurrent());
+
+for await (const c of await git.log().setMaxCount(5).call()) {
+  console.log(c.id.slice(0, 7), c.message.split("\\n")[0]);
+}`;
+
+const clone = `import { createMemoryHistoryWithOperations } from "@statewalker/vcs-core";
+import { createRepositoryFacade, createTransportRefStore, fetch, lsRemote } from "@statewalker/vcs-transport";
+
+const history = createMemoryHistoryWithOperations();
+await history.initialize();
+
+const refs = await lsRemote("https://example.com/some/repo.git"); // Map<ref name, id>
+
+// Smart HTTP, protocol v2 when the server speaks it (in a browser the server must allow CORS).
+const result = await fetch({
+  url: "https://example.com/some/repo.git",
+  repository: createRepositoryFacade({ history }),
+  refStore: createTransportRefStore(history.refs),
+  refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+});
+for (const u of result.refUpdates) console.log(u.summary, u.localRef); // [new branch] refs/remotes/origin/main`;
+
+const fromSources = `corepack enable          # Node.js 24, pnpm 10.16.1 (pinned in packageManager)
+pnpm install
+pnpm build               # packages' exports point at dist/: build before running apps
+pnpm test
+pnpm --filter @statewalker/vcs-example-01-quick-start start`;
+---
+
+<Docs title="Getting started" description="Install StateWalker VCS, write a first commit with the porcelain API, open a repository on disk, and fetch over HTTP.">
+  <h1>Getting started</h1>
+  <p>
+    StateWalker VCS is a set of npm packages. You compose a repository from three parts, a
+    <strong>history</strong> (objects and refs), a <strong>checkout</strong> (index, HEAD,
+    operation state) and a <strong>worktree</strong> (the files), and drive it with the
+    <code>Git</code> facade, whose commands mirror git's and JGit's. Every package is ESM with
+    type declarations and runs in browsers, Node.js and workers.
+  </p>
+
+  <h2>Install</h2>
+  <CodeBlock code={install} lang="sh" title="terminal" />
+  <p>
+    Add a storage backend when the repository must outlive the process:
+    <code>@statewalker/vcs-store-files</code> (a real <code>.git</code> directory over a
+    <code>FilesApi</code>), <code>vcs-store-sql</code>, <code>vcs-store-kv</code> (IndexedDB and
+    similar), and <code>@statewalker/vcs-transport</code> to fetch and push.
+  </p>
+
+  <h2>A first commit</h2>
+  <p>The minimal program, in memory. It is also the <a href="/examples/quick-start">first live example</a>: run it in this tab.</p>
+  <CodeBlock code={minimal} lang="ts" title="first-commit.ts" />
+  <p>
+    Commands are objects: configure them with chainable setters, then <code>call()</code> once.
+    <code>git.add()</code>, <code>commit()</code>, <code>status()</code>, <code>log()</code>,
+    <code>branchCreate()</code>, <code>checkout()</code>, <code>merge()</code>,
+    <code>rebase()</code>, <code>stash*()</code>, <code>fetch()</code>, <code>push()</code>,
+    <code>clone()</code> and more are listed in the
+    <a href={docHref("packages/vcs-commands/README.md")}>vcs-commands reference</a>.
+  </p>
+
+  <h2>A repository git can open</h2>
+  <p>
+    <code>@statewalker/vcs-store-files</code> reads and writes git's own layout: loose objects,
+    packs and their indexes, loose and packed refs, reflogs, the binary index. A repository written
+    here is one <code>git log</code>, <code>git status</code> and <code>git fsck</code> accept, and
+    the reverse. In a browser, pass any other <code>FilesApi</code> (memory, OPFS); the
+    <a href="/examples/git-directory">.git directory example</a> builds one in a tab and lets you
+    download it.
+  </p>
+  <CodeBlock code={onDisk} lang="ts" title="open-on-disk.ts" />
+
+  <h2>Fetch and push</h2>
+  <p>
+    <code>@statewalker/vcs-transport</code> speaks git's wire protocol (v1 and v2) over smart HTTP
+    or any duplex byte stream: a <code>MessagePort</code>, a WebRTC data channel, a webrun-streams
+    channel. The <a href="/examples/fetch-push">fetch &amp; push example</a> runs both directions
+    between two repositories in a tab.
+  </p>
+  <CodeBlock code={clone} lang="ts" title="fetch.ts" />
+
+  <h2>From the sources</h2>
+  <p>
+    The repository is a pnpm workspace: packages under <code>packages/</code>, eleven numbered
+    Node tutorials under <a href={repoTree("apps/examples")}><code>apps/examples</code></a>,
+    demos under <a href={repoTree("apps/demos")}><code>apps/demos</code></a>, benchmarks under
+    <code>apps/benchmarks</code>, and this site under <code>site/</code>.
+  </p>
+  <CodeBlock code={fromSources} lang="sh" title="terminal" />
+
+  <h2>Next</h2>
+  <ul>
+    <li><a href="/docs/architecture">Architecture</a>: the layers and why they are separate.</li>
+    <li><a href="/examples">Live examples</a> and the <a href="/examples/playground">playground</a>.</li>
+    <li><a href="/docs/examples">Apps &amp; demos</a>: the tutorials and demos in the repository.</li>
+  </ul>
+</Docs>

@@ -1,0 +1,16 @@
+---
+import Button from "@/components/ui/Button.astro";
+import Base from "@/layouts/Base.astro";
+---
+
+<Base title="Not found · StateWalker VCS">
+  <section class="mx-auto max-w-3xl px-4 py-24 text-center sm:px-6">
+    <p class="font-mono text-sm text-primary">fatal: not a valid object name</p>
+    <h1 class="mt-3 text-3xl font-semibold tracking-tight">This page does not exist</h1>
+    <p class="mt-3 text-muted-foreground">It may have moved. The docs and the live examples are a click away.</p>
+    <div class="mt-8 flex justify-center gap-3">
+      <Button href="/">Home</Button>
+      <Button href="/docs" variant="outline">Docs</Button>
+    </div>
+  </section>
+</Base>
