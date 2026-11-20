@@ -568,6 +568,10 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           }
           throw e;
         }
+        if (state.peerGone !== undefined) {
+          await discardQuarantine(ctx);
+          return internalError(ctx, state.peerGone);
+        }
         const commands = state.pushCommands ?? [];
         const invalidCount = commands.filter((c) => c.result !== "NOT_ATTEMPTED").length;
         if (invalidCount === commands.length) {
@@ -1342,6 +1346,11 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
       );
       if (phase.length === 0) continue;
       for (const cmd of phase) await check(cmd);
+      // a client that went away mid-check gets no ref update (git dies on the failed write)
+      if (state.peerGone !== undefined) {
+        state.phasesApplied = true;
+        return;
+      }
       const open = phase.filter((c) => c.result === "NOT_ATTEMPTED");
       for (const c of open) if (isNoop(c)) c.result = "OK";
       const pending = open.filter((c) => !isNoop(c));

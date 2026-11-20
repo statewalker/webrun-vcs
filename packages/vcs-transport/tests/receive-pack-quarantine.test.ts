@@ -570,3 +570,32 @@ describe("receive-pack quarantine: failures, races and stalled peers", () => {
     await result.quarantine?.discard();
   });
 });
+
+describe("receive-pack: a client gone during update() checks (git 2.5x phases)", () => {
+  for (const batchNonAtomic of [false, true]) {
+    it(`moves no ref (batchNonAtomic: ${batchNonAtomic})`, async () => {
+      const { repo, c2 } = await setup();
+      await repo.refStore.update("refs/heads/old", c2);
+      const request = pushRequest({
+        commands: [`${c2} ${ZERO} refs/heads/a..b`, `${c2} ${ZERO} refs/heads/old`],
+      });
+      const decoder = new TextDecoder();
+      const result = await serveOverDuplex({
+        repository: repo.facade,
+        refStore: repo.refStore,
+        service: "git-receive-pack",
+        batchNonAtomic,
+        duplex: {
+          async *[Symbol.asyncIterator]() {
+            yield request;
+          },
+          write(chunk: Uint8Array) {
+            if (decoder.decode(chunk).includes("funny")) throw new Error("the client is gone");
+          },
+        },
+      });
+      expect(result.success).toBe(false);
+      expect(await repo.refStore.get("refs/heads/old")).toBe(c2);
+    });
+  }
+});
