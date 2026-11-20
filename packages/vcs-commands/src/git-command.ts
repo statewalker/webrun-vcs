@@ -60,6 +60,7 @@ import {
   withoutCrud,
 } from "./commands/git-ident.js";
 import type { NotesContext } from "./commands/notes-support.js";
+import { postIndexChangeHookOf } from "./commands/post-index-change.js";
 import { reflogLine } from "./commands/reflog-messages.js";
 import {
   type ArgumentFiles,
@@ -101,6 +102,8 @@ interface TransactionHookStore {
  * someone else set (the receive side of a local push, a library user).
  */
 const commandTransactionHooks = new WeakSet<RefTransactionHook>();
+/** The post-index-change hooks commands installed (see `installIndexWriteHook`). */
+const commandIndexWriteHooks = new WeakSet<() => Promise<void>>();
 
 export interface CommandRefs extends Refs {
   /** Delete a reference - alias for remove() */
@@ -809,13 +812,44 @@ export abstract class GitCommand<T> {
     }
     if (!this.refTransactionHook) {
       const env = this.refTransactionHookEnv();
-      this.refTransactionHook = refTransactionHookOf(this.hooks, env ? { env } : {});
+      const plain = refTransactionHookOf(this.hooks, env ? { env } : {});
+      // a git child process with variables of its own (withRefTransactionEnv) runs it with them
+      this.refTransactionHook = (state, updates, context) => {
+        const extra = this.refTransactionExtraEnv;
+        if (!extra) return plain(state, updates, context);
+        return refTransactionHookOf(this.hooks, { env: { ...(env ?? {}), ...extra } })(
+          state,
+          updates,
+          context,
+        );
+      };
       commandTransactionHooks.add(this.refTransactionHook);
     }
     if (!this.refTransactionInstalled) {
       this.refTransactionInstalled = { store, previous: store.getTransactionHook?.() };
     }
     store.setTransactionHook(this.refTransactionHook);
+  }
+
+  /** Variables the reference-transaction hook gets for now (see {@link withRefTransactionEnv}) */
+  private refTransactionExtraEnv?: Record<string, string>;
+
+  /**
+   * Runs `body` with `env` added to the reference-transaction hook's variables: the ref
+   * updates of a git command git runs as a child process with variables set (a sequencer's
+   * `git commit` with GIT_REFLOG_ACTION).
+   */
+  protected async withRefTransactionEnv<T>(
+    env: Record<string, string>,
+    body: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.refTransactionExtraEnv;
+    this.refTransactionExtraEnv = { ...(previous ?? {}), ...env };
+    try {
+      return await body();
+    } finally {
+      this.refTransactionExtraEnv = previous;
+    }
   }
 
   /**
@@ -826,11 +860,90 @@ export abstract class GitCommand<T> {
     return undefined;
   }
 
+  /** The post-index-change hook this command installs on its staging (made once). */
+  private indexWriteHook?: () => Promise<void>;
+  /** The staging it is installed on, and the hook that was there before (put back at the end) */
+  private indexWriteInstalled?: {
+    staging: Staging;
+    previous: (() => Promise<void>) | undefined;
+  };
+
+  /**
+   * git's post-index-change hook (see {@link postIndexChangeHookOf}) after each index write
+   * of this command's staging (one that supports it), while the command runs: the hook
+   * that was there before is put back when its `call` ends. Without a hook runner, a
+   * command's hook left there is removed.
+   */
+  private installIndexWriteHook(staging: Staging): void {
+    if (!staging.setWriteHook) return;
+    if (!this.hooks.enabled) {
+      const current = staging.getWriteHook?.();
+      if (current && commandIndexWriteHooks.has(current)) staging.setWriteHook(undefined);
+      return;
+    }
+    if (this.indexWriteInstalled?.staging === staging) {
+      if (staging.getWriteHook?.() !== this.indexWriteHook) {
+        staging.setWriteHook(this.indexWriteHook);
+      }
+      return;
+    }
+    if (!this.indexWriteHook) {
+      const run = postIndexChangeHookOf(this.hooks, staging);
+      this.indexWriteRun = run;
+      this.indexWriteHook = async () => {
+        const scope = this.indexWriteScope;
+        if (!scope) return run();
+        // one hook run for the writes of a scope (see withOneIndexWrite)
+        if (scope.written) return;
+        scope.written = true;
+        if (scope.at === "first") await run();
+      };
+      commandIndexWriteHooks.add(this.indexWriteHook);
+    }
+    this.indexWriteInstalled = { staging, previous: staging.getWriteHook?.() };
+    staging.setWriteHook(this.indexWriteHook);
+  }
+
+  /** What the installed hook runs (post-index-change with the flags marked) */
+  private indexWriteRun?: () => Promise<void>;
+  /** Index writes git makes once (see {@link withOneIndexWrite}) */
+  private indexWriteScope?: { at: "first" | "last"; written: boolean };
+
+  /**
+   * Runs `body` with its index writes counted as git's one write of the index: the
+   * post-index-change hook runs once, at the first write (`first`: `commit -a`, while the
+   * lock is held) or after `body` when it wrote (`last`: a reset that writes the index
+   * again after updating the worktree), with every flag marked meanwhile.
+   */
+  protected async withOneIndexWrite<T>(at: "first" | "last", body: () => Promise<T>): Promise<T> {
+    if (this.indexWriteScope) return body();
+    const scope = { at, written: false };
+    this.indexWriteScope = scope;
+    try {
+      return await body();
+    } finally {
+      this.indexWriteScope = undefined;
+      if (at === "last" && scope.written) await this.indexWriteRun?.();
+    }
+  }
+
+  /** Puts back the post-index-change hook the staging had before this command's. */
+  private releaseIndexWriteHook(): void {
+    const installed = this.indexWriteInstalled;
+    if (!installed) return;
+    this.indexWriteInstalled = undefined;
+    const current = installed.staging.getWriteHook?.();
+    if (current === undefined || current === this.indexWriteHook) {
+      installed.staging.setWriteHook?.(installed.previous);
+    }
+  }
+
   /**
    * Puts back the reference-transaction hook the store had before this command installed
-   * its own (when its own is still the one installed).
+   * its own (when its own is still the one installed), and the post-index-change hook.
    */
   protected releaseRefTransactionHook(): void {
+    this.releaseIndexWriteHook();
     const installed = this.refTransactionInstalled;
     if (!installed) return;
     this.refTransactionInstalled = undefined;
@@ -850,6 +963,7 @@ export abstract class GitCommand<T> {
       this.racyCheckInstalled = true;
       this.installRacyCheck(staging);
     }
+    this.installIndexWriteHook(staging);
     return staging;
   }
 

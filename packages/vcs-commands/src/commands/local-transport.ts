@@ -279,19 +279,35 @@ export async function withLocalReceivePack<T>(
   const receiveHooks = hooks?.enabled ? scriptReceiveHooks(hooks) : undefined;
   // the remote's reference-transaction hook on its ref store while receive-pack runs (its
   // output goes to the pushing user's stderr directly, not through the side-band)
+  return withReceiveTransactionHook(remote, transactionHooks, () =>
+    receiveOver(remote, run, hooks, receiveHooks, options.protocolVersion === 1),
+  );
+}
+
+/**
+ * Runs `body` with the reference-transaction hook of `hooks` (a receiving repository's
+ * session) installed on `remote`'s ref store, as git's receive-pack runs it: in the git
+ * directory with `GIT_DIR=.` and no `GIT_PREFIX`. The hook that was there before is put
+ * back after. Without a hook runner, or a ref store that cannot take one, `body` alone.
+ */
+export async function withReceiveTransactionHook<T>(
+  remote: OpenedRepository,
+  hooks: HookSession | undefined,
+  body: () => Promise<T>,
+): Promise<T> {
   const store = remote.history.refs as {
     setTransactionHook?(hook: RefTransactionHook | undefined): void;
     getTransactionHook?(): RefTransactionHook | undefined;
   };
-  const installHook = transactionHooks?.enabled && store.setTransactionHook !== undefined;
+  const installHook = hooks?.enabled && store.setTransactionHook !== undefined;
   const previousHook = installHook ? store.getTransactionHook?.() : undefined;
   const transactionHook =
-    installHook && transactionHooks
-      ? refTransactionHookOf(transactionHooks, { env: { GIT_DIR: "." }, prefix: false })
+    installHook && hooks
+      ? refTransactionHookOf(hooks, { env: { GIT_DIR: "." }, prefix: false })
       : undefined;
   if (transactionHook) store.setTransactionHook?.(transactionHook);
   try {
-    return await receiveOver(remote, run, hooks, receiveHooks, options.protocolVersion === 1);
+    return await body();
   } finally {
     if (transactionHook && store.getTransactionHook?.() === transactionHook) {
       store.setTransactionHook?.(previousHook);

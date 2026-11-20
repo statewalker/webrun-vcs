@@ -105,11 +105,23 @@ export interface FilesRefBatchOptions {
    * updates them: that worktree's own HEAD records the update, the repository's does not.
    */
   logHeadUpdates?: boolean;
+  /**
+   * The id an annotated tag `id` peels to (undefined for an object that is not a tag): with
+   * it, packed-refs is written as git writes it, every tag with its `^<id>` line under the
+   * `peeled fully-peeled sorted` header. Without it, only the peel lines already known.
+   */
+  peel?: (id: ObjectId) => Promise<ObjectId | undefined>;
 }
 
 interface PackedEntry {
   id: string;
   peeled?: string;
+  /**
+   * Whether `peeled` is settled: every entry read from packed-refs (git 2.5x copies an
+   * entry as it reads it, peel line or not, whatever the file's traits) or peeled here; a ref
+   * written by this store is not until peeled
+   */
+  known?: boolean;
 }
 
 type Loose = { id: string } | { target: string };
@@ -182,21 +194,42 @@ function parsePacked(text: string | undefined): Map<string, PackedEntry> {
       continue;
     }
     if (line.indexOf(" ") !== 40) throw new Error(`malformed packed-refs line: ${line}`);
-    last = { id: line.slice(0, 40).toLowerCase() };
+    last = { id: line.slice(0, 40).toLowerCase(), known: true };
     out.set(line.slice(41), last);
   }
   return out;
 }
 
-/** "sorted" only: peel lines are kept for untouched refs; git peels the others on demand. */
-function serializePacked(entries: Map<string, PackedEntry>): Uint8Array {
-  let s = "# pack-refs with: sorted \n";
-  for (const name of [...entries.keys()].sort(compareRefNames)) {
+/** git's packed-refs header (packed-backend.c `PACKED_REFS_HEADER`). */
+const FULL_PACKED_HEADER = "# pack-refs with: peeled fully-peeled sorted \n";
+
+/**
+ * packed-refs as git 2.5x writes it (packed-backend.c write_with_updates): with `peel`, each
+ * ref this store wrote is peeled (an annotated tag gets its `^<id>` line), the entries read
+ * from the file are copied as they were (with their peel lines, if any: git 2.43 would peel
+ * those of a file without the `fully-peeled` trait again), under git's `peeled fully-peeled
+ * sorted` header; without it, "sorted" only unless every entry was read from the file.
+ */
+async function serializePacked(
+  entries: Map<string, PackedEntry>,
+  peel?: (id: ObjectId) => Promise<ObjectId | undefined>,
+): Promise<Uint8Array> {
+  const names = [...entries.keys()].sort(compareRefNames);
+  let full = true;
+  let body = "";
+  for (const name of names) {
     const e = entries.get(name) as PackedEntry;
-    s += `${e.id} ${name}\n`;
-    if (e.peeled) s += `^${e.peeled}\n`;
+    if (!e.known && peel) {
+      const peeled = await peel(e.id as ObjectId).catch(() => undefined);
+      if (peeled !== undefined && peeled !== e.id) e.peeled = peeled;
+      else delete e.peeled;
+      e.known = true;
+    }
+    if (!e.known) full = false;
+    body += `${e.id} ${name}\n`;
+    if (e.peeled) body += `^${e.peeled}\n`;
   }
-  return enc.encode(s);
+  return enc.encode((full ? FULL_PACKED_HEADER : "# pack-refs with: sorted \n") + body);
 }
 
 /** Thrown when `packed-refs.lock` stays held by another writer past the timeout. */
@@ -269,7 +302,8 @@ export interface FilesRefOps {
   /**
    * Point `name` at `target` (`ref: <target>` through `writeLoose`). With a `log` message,
    * `name`'s reflog gets git's create_symref line: the id `name` resolved to before (zeros
-   * if none) to the id `target` resolves to, nothing when `target` does not resolve.
+   * if none) to the id `target` resolves to, nothing when `target` does not resolve. Tells
+   * the transaction hook of the update (git 2.5x's `refs_update_symref`, `ref:<target>`).
    */
   writeSymbolic(name: string, target: string, log?: SymbolicRefLogOptions): Promise<void>;
   /**
@@ -869,7 +903,7 @@ export function createFilesRefOps(
   ): Promise<{ packed: boolean; loose: boolean }> {
     const fresh = await readPacked();
     const packed = fresh.delete(name);
-    if (packed) await commitPacked(serializePacked(fresh));
+    if (packed) await commitPacked(await serializePacked(fresh, options.peel));
     const loose = await files.exists(name);
     if (loose) await removeAndPrune(name);
     return { packed, loose };
@@ -978,7 +1012,7 @@ export function createFilesRefOps(
         const fresh = await readPacked();
         let dropped = false;
         for (const n of deleting) dropped = fresh.delete(n) || dropped;
-        if (dropped) await commitPacked(serializePacked(fresh));
+        if (dropped) await commitPacked(await serializePacked(fresh, options.peel));
         for (const n of deleting) if (await files.exists(n)) await removeAndPrune(n);
       } else {
         if (loose.size) {
@@ -989,7 +1023,7 @@ export function createFilesRefOps(
             packed.set(n, prev?.id === v ? prev : { id: v });
           }
           // packed-refs.lock stays held: no other writer runs between the phases.
-          await commitPacked(serializePacked(packed));
+          await commitPacked(await serializePacked(packed, options.peel));
           for (const n of loose.keys()) await removeAndPrune(n);
         }
         // The log lines of the refs still to be committed, before the commit: a line that
@@ -1005,7 +1039,7 @@ export function createFilesRefOps(
           if (u.newValue === null) packed.delete(u.name);
           else packed.set(u.name, { id: u.newValue });
         }
-        await commitPacked(serializePacked(packed));
+        await commitPacked(await serializePacked(packed, options.peel));
       }
       if (packedCommit) await hook?.("committed", packedUpdates(deleting), { packed: true });
       await files.remove(`${PACKED}.lock`);
@@ -1064,7 +1098,7 @@ export function createFilesRefOps(
         packed.set(n, prev?.id === l.id ? prev : { id: l.id });
         packedNow.set(n, l.id);
       }
-      if (packedNow.size) await commit(serializePacked(packed));
+      if (packedNow.size) await commit(await serializePacked(packed, options.peel));
     });
     if (r === "held") throw new PackedRefsLockedError(packedLockTimeout);
     if (!o.prune) return;
@@ -1200,7 +1234,12 @@ export function createFilesRefOps(
     }
   }
 
-  async function writeLoose(name: string, content: string): Promise<void> {
+  async function writeLoose(
+    name: string,
+    content: string,
+    /** Run once the lock is held and checked, before the rename; throwing gives the write up */
+    beforeCommit?: () => Promise<void>,
+  ): Promise<void> {
     const r = await lock(name, refLockTimeout, enc.encode(content));
     if (r !== "ok") {
       throw new RefUpdateRejectedError([{ name, reason: r === "held" ? "locked" : "df-conflict" }]);
@@ -1212,6 +1251,7 @@ export function createFilesRefOps(
         const df = await conflicts([u], await readPacked(), new Set([name]));
         if (df.length) throw new RefUpdateRejectedError(df);
       }
+      await beforeCommit?.();
       if (!(await commit(name)))
         throw new RefUpdateRejectedError([{ name, reason: "df-conflict" }]);
       ours = false;
@@ -1220,28 +1260,64 @@ export function createFilesRefOps(
     }
   }
 
+  /**
+   * A symbolic ref written as git 2.5x's `refs_update_symref`: one update in a transaction
+   * of its own (`<zero> ref:<target> <ref>`, no old value) told to the hook as `preparing`
+   * before the lock, `prepared` under it, `committed` once it is released and the reflog
+   * line written; a refusal gives the write up (`aborted`, then the throw). git 2.43 writes
+   * symbolic refs outside any transaction, so the calls are marked `only: "2.56"`.
+   */
   async function writeSymbolic(
     name: string,
     target: string,
     log?: SymbolicRefLogOptions,
   ): Promise<void> {
-    // git's create_symref: the old value is what `name` resolved to before the write
-    const old =
-      log?.message !== undefined && !log.reflog
-        ? await resolveId(name).catch(() => undefined)
+    const hook = options.transactionHook?.();
+    const told: RefTransactionUpdate[] = [{ requested: name, name, new: null, newTarget: target }];
+    const context = { only: "2.56" as const };
+    const refusal = (state: "preparing" | "prepared", verdict: unknown) =>
+      verdict === false || typeof verdict === "string"
+        ? new RefTransactionAbortedError(state, verdict || undefined)
         : undefined;
-    await writeLoose(name, `ref: ${target}\n`);
-    if (!log || (log.message === undefined && !log.reflog)) return;
-    // an unborn target: git logs nothing
-    const next = log.reflog ? undefined : await resolveId(target).catch(() => undefined);
-    const ident = log.ident ?? defaultIdent();
-    for (const w of symrefReflogWrites(name, old, next, { ...log, ident })) {
-      if (w.op !== "append") continue;
-      const { oldId, newId, message } = w.line;
-      const line = `${oldId} ${newId} ${w.line.ident}${message ? `\t${message}` : ""}\n`;
-      // after the commit, as git's files_create_symref: the ref stands without its line
-      await appendLog(name, encodeGitPath(line), w.create && Boolean(log.reflog)).catch(() => {});
+    if (hook) {
+      const refused = refusal("preparing", await hook("preparing", told, context));
+      if (refused) {
+        await hook("aborted", told, context);
+        throw refused;
+      }
     }
+    const logged = log !== undefined && (log.message !== undefined || Boolean(log.reflog));
+    // git's create_symref: the old value is what `name` resolved to before the write
+    const old = logged && !log?.reflog ? await resolveId(name).catch(() => undefined) : undefined;
+    let refused: RefTransactionAbortedError | undefined;
+    try {
+      await writeLoose(
+        name,
+        `ref: ${target}\n`,
+        hook
+          ? async () => {
+              refused = refusal("prepared", await hook("prepared", told, context));
+              if (refused) throw refused;
+            }
+          : undefined,
+      );
+    } catch (error) {
+      if (hook && refused) await hook("aborted", told, context);
+      throw error;
+    }
+    if (logged && log) {
+      // an unborn target: git logs nothing
+      const next = log.reflog ? undefined : await resolveId(target).catch(() => undefined);
+      const ident = log.ident ?? defaultIdent();
+      for (const w of symrefReflogWrites(name, old, next, { ...log, ident })) {
+        if (w.op !== "append") continue;
+        const { oldId, newId, message } = w.line;
+        const line = `${oldId} ${newId} ${w.line.ident}${message ? `\t${message}` : ""}\n`;
+        // after the commit, as git's files_create_symref: the ref stands without its line
+        await appendLog(name, encodeGitPath(line), w.create && Boolean(log.reflog)).catch(() => {});
+      }
+    }
+    if (hook) await hook("committed", told, context);
   }
 
   /** The ref the loose file of `name` names when it is a symbolic ref (`ref: ...`). */
@@ -1462,7 +1538,7 @@ export function createFilesRefOps(
       }
       const fresh = await readPacked();
       for (const name of unique) fresh.delete(name);
-      await commitPacked(serializePacked(fresh));
+      await commitPacked(await serializePacked(fresh, options.peel));
       await hook?.("committed", told, { packed: true });
     } finally {
       await files.remove(`${PACKED}.lock`).catch(() => false);

@@ -48,7 +48,6 @@ import {
   type StagingEntry,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
-
 import {
   InvalidArgumentError,
   InvalidRefNameError,
@@ -76,6 +75,7 @@ import { runPostCheckoutHook } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { OperationState, updateIndexCacheTree } from "./merge-support.js";
 import { globalPathspecMagic, parsePathspecFile } from "./pathspec.js";
+import { markIndexUpdate } from "./post-index-change.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { checkFlaggedEntries, recordWrittenStat, restoreWorktreeHard } from "./reset-command.js";
 import { removeBranchState } from "./sequencer-support.js";
@@ -794,6 +794,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     await this.staging.readTree(this.trees, treeId, { keepMatching: "flags" });
     // reset_head's prime_cache_tree: the index is HEAD's tree
     this.staging.setCacheTree?.(await cacheTreeOfTree(this.trees, treeId));
+    markIndexUpdate(this.staging, { workdir: true });
     await this.staging.write();
     if (worktree) {
       const written = await restoreWorktreeHard(
@@ -820,6 +821,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
    */
   private async writeSwitchedIndex(): Promise<void> {
     await updateIndexCacheTree(this.staging, this.trees);
+    markIndexUpdate(this.staging, { workdir: true });
     await this.staging.write();
   }
 

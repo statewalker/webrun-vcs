@@ -31,10 +31,10 @@ import {
   type WorkingCopy,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
-
 import type { CommandRefs, CommandTrees } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import type { OrtConflict } from "./ort-merge.js";
+import { markIndexUpdate } from "./post-index-change.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import {
   planFlatRestore,
@@ -758,6 +758,9 @@ export async function switchTrees(
   target: Map<string, CheckedEntry>,
   options: SwitchTreesOptions,
 ): Promise<MergeRefusal | undefined> {
+  // unpack-trees with a destination index: the index written next follows a worktree update
+  // (post-index-change's first flag)
+  markIndexUpdate(ctx.staging, { workdir: true });
   // in a sparse checkout: unpack-trees with its patterns (a conflict's file is written
   // whatever they say where its entry was outside the checkout, as
   // record_conflicted_index_entries does; one leaving the checkout is unlinked)

@@ -45,7 +45,7 @@ import {
 import { stripspace } from "../message-cleanup.js";
 import { ortResultEntries } from "../ort-merge.js";
 import { mergeStoredTrees, storedBase } from "../ort-recursive.js";
-import { updateHead } from "../reflog-messages.js";
+import { updateHead, updateHeadExpecting } from "../reflog-messages.js";
 import { removeBranchState, resetMerge, resetUnmergedToHead } from "../sequencer-support.js";
 import { appendSignoff } from "../trailers.js";
 import { mailinfo, mailsplit } from "./mailinfo.js";
@@ -394,7 +394,7 @@ export class AmCommand extends GitCommand<AmResult> {
       this.err += "Patch format detection failed.\n";
       throw new AmStop(128);
     }
-    await state.removeRef("REBASE_HEAD");
+    await state.deleteRef("REBASE_HEAD");
     const mails: string[] = [];
     const failSplit = (error: string): never => {
       this.err += `error: ${error}\n`;
@@ -520,7 +520,8 @@ export class AmCommand extends GitCommand<AmResult> {
     st.author = undefined;
     st.msg = undefined;
     await state.remove(`${DIR}/author-script`, `${DIR}/final-commit`, `${DIR}/original-commit`);
-    await state.removeRef("REBASE_HEAD");
+    // am_next: REBASE_HEAD deleted whether it exists or not (the hook hears it either way)
+    await state.deleteRef("REBASE_HEAD");
     await this.writeText("abort-safety", (await this.headId()) ?? "");
     st.cur++;
     await this.writeText("next", String(st.cur));
@@ -932,9 +933,11 @@ export class AmCommand extends GitCommand<AmResult> {
       id = await this.commits.store({ tree, parents, author, committer, message });
     }
     const action = this.reflogAction("am");
-    await updateHead(
+    // do_commit's update_ref("HEAD", commit, old_oid): HEAD expecting the commit it left
+    await updateHeadExpecting(
       this.refsStore,
       id,
+      head,
       // the subject as the mail had it, before commit_tree's UTF-8 fixup
       this.reflogLine(`${action}: ${latin1ToPath(this.firstLine(st.msg as string))}`, committer),
     );

@@ -68,6 +68,12 @@ export interface ServedRepository {
    * repository's config says sets it here
    */
   settings?: GitServeSettings;
+  /**
+   * Runs around the serving of one request (`serve`), for what the repository's owner
+   * installs for its duration: the repository's reference-transaction hook while
+   * receive-pack updates its refs (`servedRepositoryOf`)
+   */
+  around?<T>(service: "git-upload-pack" | "git-receive-pack", serve: () => Promise<T>): Promise<T>;
 }
 
 /** What a client asked for. */
@@ -536,15 +542,20 @@ export async function serveGitService(
     served.settings,
   );
   try {
-    const result = await serveOverDuplex({
-      ...settings,
-      duplex,
-      repository: served.repository,
-      refStore: served.refStore,
-      service: service as "git-upload-pack" | "git-receive-pack",
-      ...(service === "git-upload-pack" && version === 2 ? { protocolVersion: "2" as const } : {}),
-      ...(version === 1 ? { announceVersion1: true } : {}),
-    });
+    const servedService = service as "git-upload-pack" | "git-receive-pack";
+    const serve = () =>
+      serveOverDuplex({
+        ...settings,
+        duplex,
+        repository: served.repository,
+        refStore: served.refStore,
+        service: servedService,
+        ...(service === "git-upload-pack" && version === 2
+          ? { protocolVersion: "2" as const }
+          : {}),
+        ...(version === 1 ? { announceVersion1: true } : {}),
+      });
+    const result = served.around ? await served.around(servedService, serve) : await serve();
     return { ...result, request };
   } finally {
     if (options.closeDuplex !== false) await closeQuietly(duplex);

@@ -17,6 +17,8 @@ export interface NodeHookInvocation {
   cwd: string;
   hostCwd?: string;
   stdoutToStderr: boolean;
+  /** A configured hook's shell command (`hook.<name>.command`), in place of a script */
+  command?: string;
 }
 
 /** What a hook did (`HookOutcome`). */
@@ -71,6 +73,30 @@ function runHook(
   for (const [key, value] of Object.entries(base)) if (value !== undefined) env[key] = value;
   Object.assign(env, invocation.env);
   const cwd = invocation.hostCwd ?? options.defaultCwd ?? process.cwd();
+  // a configured hook: git's prepare_shell_cmd (with shell metacharacters `sh -c '<command>
+  // "$@"' '<command>' args`, "$@" only when there are args; else the command run itself),
+  // its stdout joined to stderr first where git sends it there
+  if (invocation.command !== undefined) {
+    const command = invocation.command;
+    const toStderr = invocation.stdoutToStderr ? "exec 1>&2; " : "";
+    if (/[|&;<>()$`\\"' \t\n*?[#~=%]/.test(command)) {
+      const line = invocation.args.length > 0 ? `${command} "$@"` : command;
+      return spawnHook(
+        "/bin/sh",
+        ["-c", `${toStderr}${line}`, command, ...invocation.args],
+        cwd,
+        env,
+        invocation,
+      );
+    }
+    return spawnHook(
+      "/bin/sh",
+      ["-c", `${toStderr}exec "$0" "$@"`, command, ...invocation.args],
+      cwd,
+      env,
+      invocation,
+    );
+  }
   // the script as git names it (relative to the cwd), its argv[0]; else its host path
   const script =
     invocation.path.startsWith("/") || invocation.hostCwd ? invocation.path : invocation.hostPath;
@@ -80,8 +106,19 @@ function runHook(
   const [command, args] = invocation.stdoutToStderr
     ? ["/bin/sh", ["-c", 'exec "$0" "$@" 1>&2', script, ...invocation.args]]
     : [script, invocation.args];
+  return spawnHook(command as string, args as string[], cwd, env, invocation);
+}
+
+/** Spawns a hook's process and collects its exit code and output. */
+function spawnHook(
+  command: string,
+  args: string[],
+  cwd: string,
+  env: Record<string, string>,
+  invocation: NodeHookInvocation,
+): Promise<NodeHookOutcome | undefined> {
   return new Promise((resolve) => {
-    const child = spawn(command as string, args as string[], {
+    const child = spawn(command, args, {
       cwd,
       env,
       stdio: [invocation.stdin ? "pipe" : "ignore", "pipe", "pipe"],

@@ -1,5 +1,5 @@
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
-import { DEFAULT_BIG_FILE_THRESHOLD, FileMode, isSymbolicRef } from "@statewalker/vcs-core";
+import { DEFAULT_BIG_FILE_THRESHOLD, FileMode } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
@@ -57,7 +57,7 @@ import {
 import { octopusMerge } from "./octopus-merge.js";
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeBaseTree, mergeStoredTrees } from "./ort-recursive.js";
-import { reflogMessages, updateHead } from "./reflog-messages.js";
+import { reflogMessages, updateHead, updateHeadExpecting } from "./reflog-messages.js";
 import {
   applyAutostash,
   cleanupMessage,
@@ -1532,8 +1532,14 @@ export class MergeCommand extends GitCommand<MergeResult> {
       message ?? reflogMessages.merge(action, outcome ?? ""),
       this.committer,
     );
-    if (head && isSymbolicRef(head)) await this.refsStore.set(head.target, id, log);
-    else await this.refsStore.set("HEAD", id, log);
+    // finish()'s update_ref("HEAD", new_head, head): one transaction on HEAD expecting the
+    // commit it left, as the reference-transaction hook sees it
+    const old = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
+    if (head === undefined && old === undefined) {
+      await this.refsStore.set("HEAD", id, log);
+      return;
+    }
+    await updateHeadExpecting(this.refsStore, id, old, log);
   }
 
   /** How git's merge message names what is merged: `branch 'x'`, `tag 'v1'`, ... */

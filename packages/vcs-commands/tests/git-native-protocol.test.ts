@@ -9,7 +9,7 @@
  *   running the same through `GIT_SSH_COMMAND`.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -20,11 +20,13 @@ import {
 import {
   createNodeFilesApi,
   createNodeGitHostEnvironment,
+  createNodeHookRunner,
 } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { openLocalRemote } from "../src/commands/local-transport.js";
+import { openLocalRemote, remoteHookSession } from "../src/commands/local-transport.js";
 import { type Git, type GitApiError, servedRepositoryOf } from "../src/index.js";
+import { nativeIs25x } from "./hooks-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import {
   daemonOpener,
@@ -562,6 +564,75 @@ describeGit("git's native transports against native git", () => {
       expect(calls).toEqual([`localhost git upload-pack '${srv}/src' ${v2}`]);
       // as git's clone, -u is not written to the new remote's config
       expect(gitRun(root, join(root, c), ["config", "remote.origin.uploadpack"]).status).toBe(1);
+    });
+  });
+
+  describe("our server behind git:// with the repository's hooks", () => {
+    // receive-pack runs the reference-transaction hook in the git directory: each bare twin
+    // logs its own calls (state, GIT_DIR, stdin) into `<repo>/tx.log`
+    const HOOK = `#!/bin/sh\nprintf '== %s GIT_DIR=%s\\n' "$1" "$GIT_DIR" >> tx.log\ncat >> tx.log\n`;
+    let server: { port: number; close(): Promise<void> };
+    beforeAll(async () => {
+      const [, host] = twins();
+      const env = testEnv(root);
+      const g = await openOurs(
+        root,
+        createNodeGitHostEnvironment({
+          env,
+          hookRunner: createNodeHookRunner({ env, compatibility: nativeIs25x ? "2.56" : "2.43" }),
+        }),
+        undefined,
+        host,
+      );
+      server = await startTcpServer((duplex) =>
+        serveGitConnection({
+          duplex,
+          enableReceivePack: true,
+          resolveRepository: createBasePathResolver({
+            files: createNodeFilesApi({ rootDir: root }),
+            basePath: "/srv",
+            exportAll: true,
+            openRepository: async (gitDir) => {
+              const opened = await openLocalRemote(g.workingCopy, `..${gitDir}`).catch(
+                () => undefined,
+              );
+              if (!opened) return undefined;
+              return servedRepositoryOf(opened, {
+                hooks: remoteHookSession(g.workingCopy, opened),
+              });
+            },
+          }),
+        }),
+      );
+    });
+    afterAll(async () => server?.close());
+
+    it("a push runs the served repository's reference-transaction hook as git daemon's", async () => {
+      const [dn, dO] = bareTwins("src");
+      for (const d of [dn, dO]) {
+        writeFileSync(join(srv, d, "hooks/reference-transaction"), HOOK, { mode: 0o755 });
+      }
+      const name = `sh${counter++}`;
+      git(root, "clone", "-q", join(srv, "src"), name);
+      const dir = join(root, name);
+      putFile(dir, "h.txt", "h\n");
+      git(dir, "add", "h.txt");
+      git(dir, "commit", "-qm", "h");
+      const specs = ["main:refs/heads/main", "main:refs/heads/new", ":refs/heads/feat"];
+      const url = `git://127.0.0.1:${server.port}/${dO}`;
+      const viaOurs = await gitAsync(root, dir, ["push", "--porcelain", url, ...specs]);
+      const viaDaemon = await gitAsync(
+        root,
+        dir,
+        ["push", "--porcelain", `git://localhost/${dn}`, ...specs],
+        { GIT_PROXY_COMMAND: scripts.proxy },
+      );
+      expect(viaOurs.status, viaOurs.stderr).toBe(0);
+      expect(viaDaemon.status, viaDaemon.stderr).toBe(0);
+      const log = (d: string) => readFileSync(join(srv, d, "tx.log"), "latin1");
+      expect(log(dO)).toContain("refs/heads/new");
+      expect(log(dO)).toBe(log(dn));
+      expect(refs(join(srv, dO))).toBe(refs(join(srv, dn)));
     });
   });
 });

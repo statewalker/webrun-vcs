@@ -24,7 +24,6 @@ import {
   type Worktree,
   withWorktreeEntries,
 } from "@statewalker/vcs-working-tree";
-
 import {
   IncompatibleOptionsError,
   InvalidArgumentError,
@@ -47,6 +46,7 @@ import {
   parsePathspecFile,
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
+import { markIndexUpdate } from "./post-index-change.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { moveHeadAsReset, removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
@@ -231,6 +231,11 @@ export class ResetCommand extends GitCommand<Ref> {
    * @throws RefNotFoundError if ref cannot be resolved
    */
   async call(): Promise<Ref> {
+    // git writes the index once: one post-index-change run, after the worktree is updated
+    return this.withOneIndexWrite("last", () => this.resetOnce());
+  }
+
+  private async resetOnce(): Promise<Ref> {
     this.checkCallable();
     this.setCallable(false);
     // the index as it is now, before the worktree or a ref is touched: one another writer
@@ -353,6 +358,12 @@ export class ResetCommand extends GitCommand<Ref> {
 
     // Reset staging area (for MIXED and HARD)
     if (this.mode === ResetMode.MIXED || this.mode === ResetMode.HARD) {
+      // post-index-change: unpack-trees updated the worktree (hard), or read_from_tree may
+      // have changed skip-worktree bits (mixed)
+      markIndexUpdate(
+        this.staging,
+        this.mode === ResetMode.HARD ? { workdir: true } : { skipWorktree: true },
+      );
       await this.resetStaging(targetId);
     }
     // a mixed reset refreshes the index and lists what is left unstaged
@@ -423,6 +434,7 @@ export class ResetCommand extends GitCommand<Ref> {
     const treeId = await this.resetTree(true);
     await this.readFromTree(treeId, items);
     await this.refreshAfterReset();
+    markIndexUpdate(this.staging, { skipWorktree: true });
     await this.staging.write();
     const headRef = await this.refsStore.resolve("HEAD");
     return headRef as Ref;

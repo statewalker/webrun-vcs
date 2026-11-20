@@ -23,7 +23,7 @@ import type {
   SymbolicRef,
   SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
-import { isRefObjectId, isUpdatableRefName, SYMREF_PREFIX } from "@statewalker/vcs-core";
+import { isRefObjectId, isUpdatableRefName } from "@statewalker/vcs-core";
 import { type AtomicFiles, atomicFilesOver } from "@statewalker/vcs-utils/files";
 
 import {
@@ -84,7 +84,8 @@ export class FileRefStore implements Refs {
    * `prepared`, `committed`, `aborted` (the last two once the locks are released), with
    * the packed store's nested transaction of a deletion; also each write (`set`) and removal
    * of a root ref git updates in a transaction (`isRootRefName`: ORIG_HEAD, CHERRY_PICK_HEAD,
-   * AUTO_MERGE marked for git 2.5x only). Symbolic refs written and the other names outside
+   * AUTO_MERGE marked for git 2.5x only), and each symbolic ref written (`setSymbolic`: git
+   * 2.5x's `<zero> ref:<target> <ref>`, marked for 2.5x only). The other names outside
    * `refs/` (MERGE_HEAD, FETCH_HEAD) are written without it. Undefined removes it.
    */
   setTransactionHook(hook: RefTransactionHook | undefined): void {
@@ -222,13 +223,10 @@ export class FileRefStore implements Refs {
    * Set a symbolic ref: `ref: <target>` written into `<ref>.lock` and renamed over the
    * ref. Throws `RefUpdateRejectedError` with the ref unchanged when the lock stays held
    * or on a D/F conflict. With a `log` message, the ref's reflog records the change as git's
-   * create_symref does (see `Refs.setSymbolic`).
+   * create_symref does (see `Refs.setSymbolic`). The transaction hook is told of it as git
+   * 2.5x's `refs_update_symref` (a refusal throws `RefTransactionAbortedError`).
    */
   async setSymbolic(refName: string, target: string, log?: SymbolicRefLogOptions): Promise<void> {
-    if (log?.message === undefined && !log?.reflog) {
-      await this.ops.writeLoose(refName, `${SYMREF_PREFIX}${target}\n`);
-      return;
-    }
     await this.ops.writeSymbolic(refName, target, log);
   }
 

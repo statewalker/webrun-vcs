@@ -85,13 +85,15 @@ import {
   takesCommit,
   todoHelp,
 } from "./rebase-todo.js";
-import { reflogMessages } from "./reflog-messages.js";
+import { reflogMessages, updateHeadExpecting } from "./reflog-messages.js";
 import { revisionMergeBases } from "./rev-parse-command.js";
 import { expandCommitId } from "./sequencer-pick.js";
 import {
   applyAutostash,
   cleanupMessage,
   createAutostash,
+  moveHeadAsReset,
+  removeBranchState,
   resetMerge,
 } from "./sequencer-support.js";
 import { appendSignoff, trailerConfigOf } from "./trailers.js";
@@ -1040,11 +1042,20 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         output,
       };
     }
-    await state.setRef("ORIG_HEAD", headId);
     const commands = countTodoCommands(parsed.items);
     await state.write(`${DIR}/end`, `${commands}\n`);
     await state.write(`${DIR}/msgnum`, "0\n");
-    await this.refsStore.set("HEAD", start, this.startLog());
+    // checkout_onto's reset_head: ORIG_HEAD expecting its old value, then HEAD detached
+    // expecting the commit it left (as the reference-transaction hook sees both)
+    await moveHeadAsReset(
+      this.refsStore,
+      state,
+      headId,
+      start,
+      this.startLog(),
+      "rebase: updating ORIG_HEAD",
+      { detach: true },
+    );
     // checkout_onto's post-checkout hook: the HEAD left, the commit the picks start from
     await runPostCheckoutHook(this.hooks, headId, start, true);
     // pick_commits runs the list as expanded (full command names), not as written
@@ -1095,7 +1106,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       // what the previous command left (pick_commits unlinks it before each one)
       await state.remove(`${DIR}/message`, `${DIR}/stopped-sha`);
       await state.remove(`${DIR}/author-script`, "MERGE_HEAD");
-      await state.removeRef("AUTO_MERGE", "REBASE_HEAD");
+      // deleted whether they exist or not (git 2.5x's reference-transaction hook hears both)
+      await state.deleteRef("AUTO_MERGE", "REBASE_HEAD");
       if (item.action === RebaseAction.BREAK) {
         // stopped_at_head
         return { status: RebaseStatus.STOPPED, message: await this.stoppedAtHead(), output };
@@ -1144,7 +1156,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const headName = (await state.read(`${DIR}/head-name`))?.trim() ?? "detached HEAD";
     const newHead = await this.resolveHead();
     const onto = (await state.read(`${DIR}/onto`))?.trim() ?? newHead;
-    await this.finishBranch(headName, newHead, onto);
+    const origHead = (await state.read(`${DIR}/orig-head`))?.trim();
+    await this.finishBranch(headName, newHead, onto, false, origHead || undefined);
     await this.flushRewrittenPending(state);
     // `git notes copy --for-rewrite=rebase` fed rewritten-list
     const rewritten = await state.read(`${DIR}/rewritten-list`);
@@ -1465,6 +1478,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     if (conflicts.length > 0 || !merge.clean) {
       const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort(compareGitPaths);
       await state.write("MERGE_MSG", `${merged}${conflictsComment(paths, true)}`);
+      if (!fixup) {
+        // do_pick_commit writes CHERRY_PICK_HEAD after a conflicted merge too; the rebase
+        // stopping there deletes it again (REBASE_HEAD names the commit instead)
+        await state.setRef("CHERRY_PICK_HEAD", item.id);
+        await state.deleteRef("CHERRY_PICK_HEAD");
+      }
       return {
         kind: "conflicts",
         conflicts: [...new Set(merge.conflicts.keys())].sort(),
@@ -1563,6 +1582,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
       // try_to_commit: a signed-off message is cleaned up as whitespace (else verbatim)
       const message = signoff ? stripspace(pickedMessage) : pickedMessage;
+      // do_pick_commit writes CHERRY_PICK_HEAD for the commit to come; do_commit deletes it
+      // once try_to_commit made it
+      await state.setRef("CHERRY_PICK_HEAD", item.id);
       await this.commitOnto(
         state,
         unborn ? [] : [headId],
@@ -1571,6 +1593,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         message,
         item.action,
       );
+      await state.deleteRef("CHERRY_PICK_HEAD");
       // do_commit: the commit made, MERGE_MSG removed
       await state.remove("MERGE_MSG");
       if (item.action === RebaseAction.REWORD) {
@@ -2697,15 +2720,21 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           const author =
             parseAuthorScript((await state.read(`${DIR}/author-script`)) ?? "") ??
             this.resolveAuthor();
-          await this.commitOnto(
-            state,
-            [headId, ...mergeHeads],
-            treeId,
-            author,
-            message,
-            "continue",
-            run,
-          );
+          // git commit, a child with GIT_REFLOG_ACTION: its HEAD update and its cleanup
+          // (sequencer_post_commit_cleanup: CHERRY_PICK_HEAD when there, AUTO_MERGE)
+          await this.withRefTransactionEnv(run.env ?? {}, async () => {
+            await this.commitOnto(
+              state,
+              [headId, ...mergeHeads],
+              treeId,
+              author,
+              message,
+              "continue",
+              run,
+            );
+            await state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD");
+            await state.deleteRef("AUTO_MERGE");
+          });
           await gitCommitAfterHooks(this.hooks, run);
         }
       }
@@ -2734,7 +2763,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     }
     // git commit's cleanup (SQUASH_MSG of a final squash too), then commit_staged_changes'
     await state.remove(`${DIR}/amend`, "MERGE_HEAD", "MERGE_MODE", "MERGE_MSG", "SQUASH_MSG");
-    await state.removeRef("AUTO_MERGE", "CHERRY_PICK_HEAD");
+    await state.removeRef("CHERRY_PICK_HEAD");
+    // commit_staged_changes deletes AUTO_MERGE once git commit is done, whether it exists
+    await state.deleteRef("AUTO_MERGE");
     if (finalFixup) await state.remove(`${DIR}/message-fixup`, `${DIR}/message-squash`);
     if (fixupCount > 0) await state.remove(`${DIR}/current-fixups`);
     return undefined;
@@ -2752,9 +2783,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       };
     }
     // remove_branch_state (REBASE_HEAD stays: the next command removes it, so a skip of the
-    // last one leaves it, as git does)
-    await state.removeRef("AUTO_MERGE", "CHERRY_PICK_HEAD");
-    await state.remove("MERGE_HEAD", "MERGE_MODE", "MERGE_MSG", "SQUASH_MSG");
+    // last one leaves it, as git does); AUTO_MERGE deleted twice, as git's hook hears it
+    await removeBranchState(this.context(worktree), state);
     return this.resume(state, worktree);
   }
 
@@ -2777,7 +2807,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     }
     await this.finishBranch(headName, origHead, undefined, true);
     const autostash = (await state.read(`${DIR}/autostash`))?.trim();
-    await state.removeRef("REBASE_HEAD", "AUTO_MERGE", "CHERRY_PICK_HEAD");
+    // remove_branch_state, then finish_rebase's unconditional deletions of REBASE_HEAD and
+    // AUTO_MERGE (git 2.5x's reference-transaction hook hears each)
+    await removeBranchState(this.context(worktree), state);
+    await state.deleteRef("REBASE_HEAD", "AUTO_MERGE");
     await this.deleteRewrittenRefs(state);
     await state.remove("MERGE_HEAD", "MERGE_MODE", "MERGE_MSG", "SQUASH_MSG", DIR);
     const output = autostash ? await applyAutostash(this.context(worktree), autostash) : [];
@@ -2892,13 +2925,42 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       message: hooked,
     });
     const action = reflogMessages.rebaseStep(this.reflogAction("rebase"), step);
-    await this.refsStore.set(
-      "HEAD",
+    // update_head_with_reflog: HEAD expecting the commit it is at (detached while rebasing)
+    const current = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
+    await updateHeadExpecting(
+      this.refsStore,
       id,
+      current,
       this.reflogLine(reflogMessages.pick(action, hooked), this.committer),
     );
     if (!gitCommit) await sequencerPostCommit(this.hooks);
     return id;
+  }
+
+  /**
+   * `name` set to `id` as git's `refs_update_ref(..., name, id, old, REF_NO_DEREF)`: one
+   * transaction expecting `old` (unchecked when undefined), as the reference-transaction hook
+   * sees it; a store that cannot batch the ref sets it plainly.
+   */
+  private async setRefExpecting(
+    name: string,
+    id: ObjectId,
+    old: ObjectId | undefined,
+    log: RefLogOptions | undefined,
+  ): Promise<void> {
+    if (old === undefined) {
+      await this.refsStore.set(name, id, log);
+      return;
+    }
+    const result = await this.refsStore.batch([{ name, old, new: id, noDeref: true }], log);
+    if (result.ok) return;
+    if (result.rejected.every((r) => r.reason === "unsupported" || r.reason === "invalid-name")) {
+      await this.refsStore.set(name, id, log);
+      return;
+    }
+    throw new Error(
+      `cannot lock ref '${name}': ${result.rejected.map((r) => `${r.name}: ${r.reason}`).join(", ")}`,
+    );
   }
 
   /** HEAD detached at upstream: `rebase (start): checkout <upstream as given>`. */
@@ -2921,6 +2983,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     id: ObjectId,
     onto: ObjectId | undefined,
     abort = false,
+    /** The value the branch is expected at (pick_commits' `orig-head`), shown to the hook */
+    old?: ObjectId,
   ): Promise<void> {
     const action = this.reflogAction("rebase");
     if (headName.startsWith("refs/")) {
@@ -2936,7 +3000,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
             reflogMessages.rebaseFinishBranch(action, headName, onto ?? id),
             this.committer,
           );
-      await this.refsStore.set(headName, id, branchLog);
+      await this.setRefExpecting(headName, id, old, branchLog);
       await this.refsStore.setSymbolic("HEAD", headName, headLog);
     } else {
       // git's abort of a detached rebase: HEAD back at orig-head ("rebase (abort): returning
