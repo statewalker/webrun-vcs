@@ -17,6 +17,7 @@ import type {
   BatchResult,
   RefCommand,
   RefLogOptions,
+  RefRemoveAllOptions,
   RefRemoveOptions,
   SymbolicRefLogOptions,
 } from "./ref-batch.js";
@@ -134,6 +135,15 @@ export interface Refs {
    * @returns True if removed, false if didn't exist
    */
   remove(name: string, options?: RefRemoveOptions): Promise<boolean>;
+
+  /**
+   * Remove several references whatever their values, as git's `delete_refs` (branch -d,
+   * tag -d, remote prune): one transaction for all of them (git 2.5x), or with `legacy` as
+   * git 2.43's files backend. Optional: without it, callers remove them one by one.
+   *
+   * @throws when a reference could not be removed
+   */
+  removeAll?(names: string[], options?: RefRemoveAllOptions): Promise<void>;
 
   /**
    * Apply all `commands` atomically, or none of them.

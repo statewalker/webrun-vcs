@@ -6,7 +6,7 @@ import {
   isValidBranchName,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
-import type { WorktreeInfo } from "@statewalker/vcs-working-tree";
+import type { LinkedWorktrees, WorktreeInfo } from "@statewalker/vcs-working-tree";
 
 import {
   BranchUsedByWorktreeError,
@@ -222,48 +222,24 @@ export class DeleteBranchCommand extends GitCommand<string[]> {
     this.setCallable(false);
 
     const currentBranch = await this.getCurrentBranch();
-    const deleted: string[] = [];
     const worktrees = this.workingCopy.worktrees;
+    // git's delete_branches: each name checked (a refused one reported, the others still
+    // deleted), then all of them deleted with one delete_refs
+    const toDelete: string[] = [];
+    let refusal: Error | undefined;
 
     for (const name of this.branchNames) {
       const refName = name.startsWith("refs/") ? name : `refs/heads/${name}`;
-
-      // git's branch_checked_out: no worktree's branch is deleted (this one's included)
-      const user = worktrees ? await worktreeUsingBranch(worktrees, refName) : undefined;
-      if (user) {
-        const message = `cannot delete branch '${shortBranchName(refName)}' used by worktree at '${user.path}'`;
-        if (user.current) throw new CannotDeleteCurrentBranchError(name, message);
-        // git's delete_branches: error() and the next branch, exit status 1
-        throw new BranchUsedByWorktreeError(
-          shortBranchName(refName),
-          user.path,
-          message,
-        ).withExitCode(1);
+      try {
+        await this.checkDeletable(name, refName, currentBranch, worktrees);
+        if (!toDelete.includes(refName)) toDelete.push(refName);
+      } catch (error) {
+        refusal ??= error as Error;
       }
-
-      // Cannot delete current branch
-      if (currentBranch === refName) {
-        throw new CannotDeleteCurrentBranchError(name);
-      }
-
-      // Check if exists
-      if (!(await this.refsStore.has(refName))) {
-        // git's delete_branches: error("branch '%s' not found"), exit status 1
-        throw new RefNotFoundError(refName, `Branch '${name}' not found`).withExitCode(1);
-      }
-
-      // Check if fully merged (unless force)
-      if (!this.force) {
-        const isMerged = await this.isBranchMerged(refName);
-        if (!isMerged) {
-          throw new NotMergedError(name);
-        }
-      }
-
-      // git deletes them with delete_refs (its reference-transaction hook calls differ)
-      await this.refsStore.delete(refName, { deleteRefs: true });
-      deleted.push(refName);
     }
+
+    const { removed: deleted, error } =
+      toDelete.length > 0 ? await this.removeRefsAsGit(toDelete) : { removed: [] };
 
     // git's delete_branch_config: a deleted branch's `[branch "<name>"]` section goes too
     const config = RemoteConfigStore.from(this.workingCopy);
@@ -275,7 +251,46 @@ export class DeleteBranchCommand extends GitCommand<string[]> {
     for (const name of sections) config.removeSection(`branch.${name}`);
     if (sections.length > 0) await config.save();
 
+    if (refusal) throw refusal;
+    if (error !== undefined) throw error;
     return deleted;
+  }
+
+  /** Why git's delete_branches refuses to delete a branch, thrown; nothing for a deletable one. */
+  private async checkDeletable(
+    name: string,
+    refName: string,
+    currentBranch: string | undefined,
+    worktrees: LinkedWorktrees | undefined,
+  ): Promise<void> {
+    // git's branch_checked_out: no worktree's branch is deleted (this one's included)
+    const user = worktrees ? await worktreeUsingBranch(worktrees, refName) : undefined;
+    if (user) {
+      const message = `cannot delete branch '${shortBranchName(refName)}' used by worktree at '${user.path}'`;
+      if (user.current) throw new CannotDeleteCurrentBranchError(name, message);
+      // git's delete_branches: error() and the next branch, exit status 1
+      throw new BranchUsedByWorktreeError(
+        shortBranchName(refName),
+        user.path,
+        message,
+      ).withExitCode(1);
+    }
+
+    // Cannot delete current branch
+    if (currentBranch === refName) {
+      throw new CannotDeleteCurrentBranchError(name);
+    }
+
+    // Check if exists
+    if (!(await this.refsStore.has(refName))) {
+      // git's delete_branches: error("branch '%s' not found"), exit status 1
+      throw new RefNotFoundError(refName, `Branch '${name}' not found`).withExitCode(1);
+    }
+
+    // Check if fully merged (unless force)
+    if (!this.force && !(await this.isBranchMerged(refName))) {
+      throw new NotMergedError(name);
+    }
   }
 
   /**

@@ -1631,7 +1631,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
     const picking =
       (await state.ref("CHERRY_PICK_HEAD")) !== undefined ||
       (await state.ref("REVERT_HEAD")) !== undefined;
-    await state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD", "AUTO_MERGE", "MERGE_HEAD");
+    // sequencer_post_commit_cleanup: CHERRY_PICK_HEAD and REVERT_HEAD when there, AUTO_MERGE
+    // in any case (git 2.5x's reference-transaction hook hears of it)
+    await state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD");
+    await state.deleteRef("AUTO_MERGE");
+    await state.removeRef("MERGE_HEAD");
     await state.remove("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG");
     if (picking) {
       // have_finished_the_last_pick: the todo holds no more than the pick just committed

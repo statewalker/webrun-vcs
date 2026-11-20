@@ -6,19 +6,24 @@
  * message). Each case runs native git in one copy of a repository with a logging hook and
  * ours (with the Node hook runner) in the other.
  *
- * Only the files store's batches run the hook: native git 2.5x also runs it for the
- * deletion of AUTO_MERGE a commit makes (a transaction that ends `aborted`), which ours
- * writes without one, so those transactions are left out of native's log here.
+ * The root refs git updates in transactions run it too: a commit deletes AUTO_MERGE (git
+ * 2.5x only: 2.43 removes the file), whether it exists or not.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RefTransactionAbortedError, type RefTransactionHook } from "@statewalker/vcs-core";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { type Git, HookSession, refTransactionHookOf } from "../src/index.js";
+import {
+  type Git,
+  HookSession,
+  ResetMode,
+  refTransactionHookOf,
+  SequencerOperation,
+} from "../src/index.js";
 import {
   type HookTwin,
   hookExit,
@@ -27,7 +32,6 @@ import {
   hookTwins,
   installHooks,
   nativeIn,
-  nativeIs25x,
   oursIn,
 } from "./hooks-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
@@ -48,13 +52,6 @@ function base(dir: string): void {
   installHooks(join(dir, ".git/hooks"), ["reference-transaction"]);
 }
 
-/** A log's entries (one per hook run), those about AUTO_MERGE left out. */
-const entries = (log: string) =>
-  log
-    .split(/(?=^== )/m)
-    .filter((e) => e && !/ AUTO_MERGE$/m.test(e))
-    .join("");
-
 async function expectTwins(
   dir: string,
   args: string[],
@@ -67,12 +64,12 @@ async function expectTwins(
   prepare?.(mine);
   const native = nativeIn(theirs, root, args);
   const ours = await run(await oursIn(mine));
-  expect(entries(hookLog(mine)), `${label}: log`).toBe(entries(hookLog(theirs)));
+  expect(hookLog(mine), `${label}: log`).toBe(hookLog(theirs));
   expect(ours.error !== undefined, `${label}: failed (${native.stderr})`).toBe(native.status !== 0);
   if (ours.error) {
     expect(ours.error).toBeInstanceOf(RefTransactionAbortedError);
     expect(native.stderr).toContain(`fatal: ${ours.error.message}`);
-  } else if (!/AUTO_MERGE/.test(hookLog(theirs))) {
+  } else {
     expect(hookLines(ours.output), `${label}: output`).toBe(hookLines(native.stderr));
   }
   expect(git(mine.dir, ["for-each-ref"]), `${label}: refs`).toBe(git(theirs.dir, ["for-each-ref"]));
@@ -145,8 +142,7 @@ const AFTER_LOCKS_HOOK = `#!/bin/sh
 echo "== $1" >> "$HOOK_LOG"
 input=$(cat)
 echo "$input" >> "$HOOK_LOG"
-# (not for git 2.5x's deletion of AUTO_MERGE, which ours makes without the hook)
-if [ "$1" = committed ] && [ -z "$NESTED" ] && ! echo "$input" | grep -q AUTO_MERGE; then
+if [ "$1" = committed ] && [ -z "$NESTED" ]; then
   find .git -name '*.lock' | sort >> "$HOOK_LOG"
   NESTED=1 git update-ref HEAD "$(git rev-parse HEAD)" >> "$HOOK_LOG" 2>&1
   echo "update-ref: $?" >> "$HOOK_LOG"
@@ -297,11 +293,8 @@ describeGit("reference-transaction hook: a deletion failing on a held lock (as n
           expect(hookLog(mine), name).toBe(hookLog(theirs));
           rmSync(join(theirs.dir, ".git", held));
           rmSync(join(mine.dir, ".git", held));
-          // (git 2.43's delete_refs drops a packed ref before it finds its loose ref locked;
-          // ours deletes nothing then)
-          if (nativeIs25x || held === "packed-refs.lock" || label !== "branch -D") {
-            expect(git(mine.dir, ["for-each-ref"]), name).toBe(git(theirs.dir, ["for-each-ref"]));
-          }
+          // (git 2.43's delete_refs drops a packed ref before it finds its loose ref locked)
+          expect(git(mine.dir, ["for-each-ref"]), name).toBe(git(theirs.dir, ["for-each-ref"]));
         }
       }
     }
@@ -351,3 +344,273 @@ describeGit("reference-transaction hook: installed only while the command runs",
     expect(states).toContain("committed");
   });
 });
+
+/**
+ * What a ref deletion leaves in a git directory: the refs, packed-refs (absent, or its ref
+ * lines: git writes a fuller header and peel lines), the reflogs and the lock files.
+ */
+function refState(dir: string): string {
+  const packedPath = join(dir, ".git/packed-refs");
+  const packed = existsSync(packedPath)
+    ? readFileSync(packedPath, "latin1")
+        .split("\n")
+        .filter((l) => l && !l.startsWith("#") && !l.startsWith("^"))
+        .join("\n")
+    : "(no packed-refs)";
+  const files = (args: string[]) =>
+    spawnSync("find", [".git", ...args], { cwd: dir })
+      .stdout.toString()
+      .split("\n")
+      .sort();
+  const logs = files(["-path", ".git/logs/*", "-type", "f"])
+    .filter(Boolean)
+    .map((f) => `${f}:\n${readFileSync(join(dir, f), "latin1")}`);
+  return [
+    git(dir, ["for-each-ref"]),
+    `packed-refs:\n${packed}`,
+    `logs:\n${logs.join("")}`,
+    `locks:${files(["-name", "*.lock"]).join(" ")}`,
+  ].join("\n");
+}
+
+describeGit("reference-transaction hook: several refs deleted at once (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx-multi-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  type Run = (g: Git) => Promise<unknown>;
+
+  /** Runs native git and ours in twins of `dir`; compares the logs, outcomes and refs. */
+  async function compare(
+    dir: string,
+    label: string,
+    args: string[],
+    run: Run,
+    prepare?: (twin: HookTwin) => void,
+  ): Promise<void> {
+    const [theirs, mine] = hookTwins(root, dir);
+    prepare?.(theirs);
+    prepare?.(mine);
+    const native = nativeIn(theirs, root, args);
+    let failed = false;
+    try {
+      await run(await oursIn(mine));
+    } catch {
+      failed = true;
+    }
+    expect(hookLog(mine), `${label}: log`).toBe(hookLog(theirs));
+    expect(failed, `${label}: failed (${native.stderr})`).toBe(native.status !== 0);
+    expect(refState(mine.dir), `${label}: refs`).toBe(refState(theirs.dir));
+  }
+
+  function repo(name: string, packedRefs: boolean): string {
+    const dir = join(root, name);
+    base(dir);
+    git(dir, ["branch", "a"]);
+    git(dir, ["branch", "b"]);
+    git(dir, ["tag", "t1"]);
+    git(dir, ["tag", "-a", "-m", "annotated", "t2"]);
+    if (packedRefs) {
+      git(dir, ["pack-refs", "--all"]);
+      // a loose one beside the packed ones
+      git(dir, ["branch", "c"]);
+      git(dir, ["tag", "t3"]);
+    } else {
+      git(dir, ["branch", "c"]);
+      git(dir, ["tag", "t3"]);
+    }
+    return dir;
+  }
+
+  it("branch -d, branch -D and tag -d of several refs: one transaction (2.5x), packed-refs first then each ref (2.43)", async () => {
+    for (const packedRefs of [false, true]) {
+      const dir = repo(`r-${packedRefs}`, packedRefs);
+      const cases: Array<[string[], Run]> = [
+        [["branch", "-d", "a", "c"], (g) => g.branchDelete().setBranchNames("a", "c").call()],
+        [
+          ["branch", "-D", "c", "b", "a"],
+          (g) => g.branchDelete().setBranchNames("c", "b", "a").setForce(true).call(),
+        ],
+        [["tag", "-d", "t1", "t3", "t2"], (g) => g.tagDelete().setTags("t1", "t3", "t2").call()],
+        // a name that cannot be deleted is reported, the others still go
+        [
+          ["branch", "-d", "a", "nope", "b"],
+          (g) => g.branchDelete().setBranchNames("a", "nope", "b").call(),
+        ],
+      ];
+      for (const [args, run] of cases) {
+        await compare(dir, `packed=${packedRefs} ${args.join(" ")}`, args, run);
+      }
+    }
+  }, 60_000);
+
+  it("a refusal of the hook: nothing deleted", async () => {
+    for (const packedRefs of [false, true]) {
+      const dir = repo(`r-${packedRefs}`, packedRefs);
+      for (const state of ["prepared", "committed"]) {
+        await compare(
+          dir,
+          `packed=${packedRefs} refused`,
+          ["branch", "-D", "a", "c"],
+          (g) => g.branchDelete().setBranchNames("a", "c").setForce(true).call(),
+          (t) => {
+            // refuses in `prepared` (and so aborts); `committed` changes nothing
+            const hook = join(t.dir, ".git/hooks/reference-transaction");
+            writeFileSync(
+              hook,
+              readFileSync(hook, "latin1").replace(
+                "exit 0\n",
+                `[ "$1" = ${state} ] && exit 1\nexit 0\n`,
+              ),
+            );
+          },
+        );
+      }
+    }
+  }, 60_000);
+
+  it("a held ref lock or packed-refs.lock: as each git version fails", async () => {
+    for (const packedRefs of [false, true]) {
+      for (const [i, held] of [
+        "refs/heads/c.lock",
+        "refs/heads/a.lock",
+        "packed-refs.lock",
+      ].entries()) {
+        const dir = repo(`r-${packedRefs}-${i}`, packedRefs);
+        git(dir, ["config", "core.packedRefsTimeout", "0"]);
+        git(dir, ["config", "core.filesRefLockTimeout", "0"]);
+        await compare(
+          dir,
+          `packed=${packedRefs} held ${held}`,
+          ["branch", "-D", "a", "c", "b"],
+          (g) => g.branchDelete().setBranchNames("a", "c", "b").setForce(true).call(),
+          (t) => writeFileSync(join(t.dir, ".git", held), ""),
+        );
+      }
+    }
+  }, 60_000);
+
+  it("remote remove: the remote-tracking refs in one deletion", async () => {
+    for (const packedRefs of [false, true]) {
+      const dir = join(root, `r-${packedRefs}`);
+      base(dir);
+      git(dir, ["remote", "add", "origin", "https://example.invalid/r.git"]);
+      for (const n of ["main", "x", "y/z"]) {
+        git(dir, ["update-ref", `refs/remotes/origin/${n}`, "HEAD"]);
+      }
+      if (packedRefs) {
+        git(dir, ["pack-refs", "--all"]);
+        git(dir, ["update-ref", "refs/remotes/origin/w", "HEAD"]);
+      }
+      await compare(
+        dir,
+        `packed=${packedRefs} remote remove`,
+        ["remote", "remove", "origin"],
+        (g) => g.remoteRemove().setRemoteName("origin").call(),
+      );
+    }
+  }, 60_000);
+
+  it("a batch without deletions while packed-refs.lock is held: committed loose, as native", async () => {
+    const dir = repo("r", true);
+    const [theirs, mine] = hookTwins(root, dir);
+    for (const t of [theirs, mine]) writeFileSync(join(t.dir, ".git/packed-refs.lock"), "");
+    const head = git(dir, ["rev-parse", "HEAD"]).trim();
+    const native = spawnSync("git", ["update-ref", "--stdin"], {
+      cwd: theirs.dir,
+      env: theirs.env,
+      input: `update refs/heads/a ${head}\ncreate refs/heads/new ${head}\n`,
+    });
+    expect(native.status).toBe(0);
+    const g = await oursIn(mine);
+    const store = g.workingCopy.history.refs as unknown as {
+      setTransactionHook(hook: RefTransactionHook | undefined): void;
+      batch(
+        commands: Array<{ name: string; new: string }>,
+        options: { ident: string },
+      ): Promise<{ ok: boolean }>;
+    };
+    store.setTransactionHook(refTransactionHookOf(new HookSession(g.workingCopy)));
+    const {
+      GIT_COMMITTER_NAME: name,
+      GIT_COMMITTER_EMAIL: email,
+      GIT_COMMITTER_DATE: date,
+    } = mine.env;
+    const result = await store.batch(
+      [
+        { name: "refs/heads/a", new: head },
+        { name: "refs/heads/new", new: head },
+      ],
+      { ident: `${name} <${email}> ${date}` },
+    );
+    store.setTransactionHook(undefined);
+    expect(result.ok).toBe(true);
+    expect(hookLog(mine)).toBe(hookLog(theirs));
+    expect(refState(mine.dir)).toBe(refState(theirs.dir));
+  });
+});
+
+describeGit(
+  "reference-transaction hook: the root refs git updates in transactions (as native git)",
+  () => {
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "hooks-reftx-root-"));
+    });
+    afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+    /** main: base, m (a.txt "m"); side (off base): s (a.txt "s"): their picks conflict. */
+    function conflicting(dir: string): void {
+      base(dir);
+      git(dir, ["checkout", "-q", "-b", "side"]);
+      putFile(dir, "a.txt", "s\n");
+      git(dir, ["commit", "-qam", "s"]);
+      git(dir, ["checkout", "-q", "main"]);
+      putFile(dir, "a.txt", "m\n");
+      git(dir, ["commit", "-qam", "m"]);
+    }
+
+    /** Runs a command in twins of `dir` (both left as they end, for the next step). */
+    async function step(
+      twins: [HookTwin, HookTwin],
+      label: string,
+      args: string[],
+      run: (g: Git) => Promise<unknown>,
+    ): Promise<void> {
+      const [theirs, mine] = twins;
+      rmSync(theirs.log, { force: true });
+      rmSync(mine.log, { force: true });
+      nativeIn(theirs, root, args);
+      await run(await oursIn(mine)).catch(() => undefined);
+      expect(hookLog(mine), `${label}: log`).toBe(hookLog(theirs));
+      expect(refState(mine.dir), `${label}: refs`).toBe(refState(theirs.dir));
+      for (const file of ["ORIG_HEAD", "CHERRY_PICK_HEAD", "AUTO_MERGE"]) {
+        expect(existsSync(join(mine.dir, ".git", file)), `${label}: ${file}`).toBe(
+          existsSync(join(theirs.dir, ".git", file)),
+        );
+      }
+    }
+
+    it("cherry-pick stopped at a conflict, then --abort: CHERRY_PICK_HEAD, AUTO_MERGE, ORIG_HEAD", async () => {
+      const dir = join(root, "r");
+      conflicting(dir);
+      const twins = hookTwins(root, dir);
+      await step(twins, "cherry-pick", ["cherry-pick", "side"], (g) =>
+        g.cherryPick().include("side").call(),
+      );
+      await step(twins, "cherry-pick --abort", ["cherry-pick", "--abort"], (g) =>
+        g.cherryPick().setOperation(SequencerOperation.ABORT).call(),
+      );
+    });
+
+    it("merge stopped at a conflict, then reset --hard: ORIG_HEAD and AUTO_MERGE", async () => {
+      const dir = join(root, "r");
+      conflicting(dir);
+      const twins = hookTwins(root, dir);
+      await step(twins, "merge", ["merge", "side"], (g) => g.merge().include("side").call());
+      await step(twins, "reset --hard", ["reset", "-q", "--hard", "HEAD"], (g) =>
+        g.reset().setRef("HEAD").setMode(ResetMode.HARD).call(),
+      );
+    });
+  },
+);

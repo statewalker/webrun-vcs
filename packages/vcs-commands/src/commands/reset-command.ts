@@ -47,8 +47,8 @@ import {
   parsePathspecFile,
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
-import { reflogMessages, updateHead } from "./reflog-messages.js";
-import { removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
+import { reflogMessages } from "./reflog-messages.js";
+import { moveHeadAsReset, removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import { flaggedEntryDiffers, pruneEmptyParents } from "./worktree-overwrite-checks.js";
@@ -332,13 +332,12 @@ export class ResetCommand extends GitCommand<Ref> {
       }
     }
 
-    // Move HEAD/branch, the old HEAD kept in ORIG_HEAD (git's reset_refs)
-    if (headId && state.supported) await state.setRef("ORIG_HEAD", headId);
     // git's set_reflog_message: "reset: moving to <rev>", or "<action>: updating HEAD"
     const message = this.hasReflogAction()
       ? `${this.reflogAction("reset")}: updating HEAD`
       : reflogMessages.reset(targetRef);
-    await updateHead(this.refsStore, targetId, this.reflogLine(message));
+    // Move HEAD/branch, the old HEAD kept in ORIG_HEAD (git's update_refs)
+    await moveHeadAsReset(this.refsStore, state, headId, targetId, this.reflogLine(message));
 
     // Reset staging area (for MIXED and HARD)
     if (this.mode === ResetMode.MIXED || this.mode === ResetMode.HARD) {

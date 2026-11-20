@@ -309,21 +309,24 @@ export class DeleteTagCommand extends GitCommand<string[]> {
     this.checkCallable();
     this.setCallable(false);
 
-    const deleted: string[] = [];
-
+    // git's delete_tags: each name checked (a missing one reported, the others still
+    // deleted), then all of them deleted with one delete_refs
+    const toDelete: string[] = [];
+    let refusal: Error | undefined;
     for (const name of this.tags) {
       const refName = name.startsWith("refs/") ? name : `refs/tags/${name}`;
-
       if (!(await this.refsStore.has(refName))) {
         // git's delete_tags: error("tag '%s' not found."), exit status 1
-        throw new RefNotFoundError(refName, `Tag '${name}' not found`).withExitCode(1);
+        refusal ??= new RefNotFoundError(refName, `Tag '${name}' not found`).withExitCode(1);
+        continue;
       }
-
-      // git deletes them with delete_refs (its reference-transaction hook calls differ)
-      await this.refsStore.delete(refName, { deleteRefs: true });
-      deleted.push(refName);
+      if (!toDelete.includes(refName)) toDelete.push(refName);
     }
 
+    const { removed: deleted, error } =
+      toDelete.length > 0 ? await this.removeRefsAsGit(toDelete) : { removed: [] };
+    if (refusal) throw refusal;
+    if (error !== undefined) throw error;
     return deleted;
   }
 }

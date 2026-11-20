@@ -18,12 +18,19 @@ export interface RefMove {
 /**
  * Deletes `names` with their reflogs: the refs holding an object id in one atomic batch
  * (logged `message` where the store logs deletes), symbolic refs themselves (not their
- * targets) one by one, as git deletes with REF_NO_DEREF. A store that cannot batch several
- * refs (`unsupported`) deletes them one by one.
+ * targets) one by one, as git deletes with REF_NO_DEREF. A store with `removeAll` deletes
+ * the refs holding an id as git's `delete_refs` (`legacy`: as git 2.43's files backend, see
+ * `RefRemoveAllOptions`); a store that cannot batch several refs (`unsupported`) deletes
+ * them one by one.
  *
  * @throws Error naming the refs when the batch is refused (nothing deleted then)
  */
-export async function deleteRefs(refs: Refs, names: string[], message: string): Promise<void> {
+export async function deleteRefs(
+  refs: Refs,
+  names: string[],
+  message: string,
+  options: { legacy?: boolean } = {},
+): Promise<void> {
   const direct: string[] = [];
   const symbolic: string[] = [];
   for (const name of names) {
@@ -31,7 +38,9 @@ export async function deleteRefs(refs: Refs, names: string[], message: string): 
     if (!ref) continue;
     (isSymbolicRef(ref) ? symbolic : direct).push(name);
   }
-  if (direct.length > 0) {
+  if (direct.length > 0 && refs.removeAll) {
+    await refs.removeAll(direct, { message, legacy: options.legacy === true });
+  } else if (direct.length > 0) {
     const result = await refs.batch(
       direct.map((name) => ({ name, new: null })),
       { message },

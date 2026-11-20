@@ -9,6 +9,7 @@ import {
   formatPersonIdent,
   type ObjectId,
   type PersonIdent,
+  type RefLogOptions,
 } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
@@ -30,6 +31,7 @@ import {
   rewriteIndex,
 } from "./merge-support.js";
 import { stripspace } from "./message-cleanup.js";
+import { updateHead } from "./reflog-messages.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
 import { StashCreateCommand } from "./stash-create-command.js";
@@ -499,6 +501,31 @@ async function resetKeepWith(
 }
 
 /**
+ * git's reset `update_refs`: ORIG_HEAD set to the HEAD left (`headId`), given the ORIG_HEAD
+ * it read as the old value (none when absent), then HEAD moved to `target` expecting the
+ * HEAD left, as the reference-transaction hook sees both. Without a HEAD (unborn), HEAD's
+ * branch is set as it is.
+ */
+export async function moveHeadAsReset(
+  refs: CommandRefs,
+  state: OperationState,
+  headId: ObjectId | undefined,
+  target: ObjectId,
+  log: RefLogOptions,
+): Promise<void> {
+  if (!headId) {
+    await updateHead(refs, target, log);
+    return;
+  }
+  if (state.supported) {
+    await state.setRef("ORIG_HEAD", headId, { old: (await state.ref("ORIG_HEAD")) ?? null });
+  }
+  const result = await refs.batch([{ name: "HEAD", old: headId, new: target }], log);
+  // a store that cannot batch HEAD: the plain update
+  if (!result.ok) await updateHead(refs, target, log);
+}
+
+/**
  * git's remove_branch_state (a branch switch, a reset): the merge, cherry-pick or revert
  * stopped before its commit is forgotten (MERGE_HEAD, MERGE_MSG, MERGE_MODE, SQUASH_MSG,
  * CHERRY_PICK_HEAD, REVERT_HEAD, AUTO_MERGE), its MERGE_AUTOSTASH kept on `refs/stash`.
@@ -508,7 +535,11 @@ export async function removeBranchState(
   state: OperationState,
 ): Promise<string[]> {
   if (!state.supported) return [];
+  // sequencer_post_commit_cleanup: CHERRY_PICK_HEAD and REVERT_HEAD when there, AUTO_MERGE
+  // in any case (as remove_merge_branch_state again below: git 2.5x's reference-transaction
+  // hook hears of both deletions)
   await state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD");
+  await state.deleteRef("AUTO_MERGE");
   await state.remove("SQUASH_MSG");
   return removeMergeBranchState(ctx, state);
 }
@@ -524,8 +555,9 @@ export async function removeMergeBranchState(
   state: OperationState,
 ): Promise<string[]> {
   if (!state.supported) return [];
-  await state.removeRef("MERGE_HEAD", "AUTO_MERGE");
+  await state.removeRef("MERGE_HEAD");
   await state.remove("MERGE_RR", "MERGE_MSG", "MERGE_MODE");
+  await state.deleteRef("AUTO_MERGE");
   const autostash = (await state.read("MERGE_AUTOSTASH"))?.trim();
   if (!autostash) return [];
   await saveAutostash(ctx, autostash);

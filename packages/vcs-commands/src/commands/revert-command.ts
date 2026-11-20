@@ -1,8 +1,12 @@
 import type { PersonIdent } from "@statewalker/vcs-core";
 
+import { parseGitBool } from "@statewalker/vcs-utils";
+
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import { type ContentMergeStrategy, MergeStrategy } from "../results/merge-result.js";
 import { type RevertResult, RevertStatus } from "../results/revert-result.js";
+import { CommitCommand, type CommitEditor } from "./commit-command.js";
 import { favorOf } from "./merge-command.js";
 import { OperationState } from "./merge-support.js";
 import { type PickOutcome, PickSequencer, SequencerOperation } from "./sequencer-pick.js";
@@ -40,6 +44,8 @@ export class RevertCommand extends GitCommand<RevertResult> {
   private reflogPrefix = "revert:";
   private operation = SequencerOperation.START;
   private committer?: PersonIdent;
+  private edit = false;
+  private editor?: CommitEditor;
 
   /**
    * Add a commit to revert.
@@ -166,6 +172,44 @@ export class RevertCommand extends GitCommand<RevertResult> {
     return this;
   }
 
+  /**
+   * `--edit` (`-e`): each revert that applies cleanly is committed as git commits it then,
+   * by `git commit -n -e`: the message goes through the editor ({@link setEditor}) in git
+   * commit's template (with its help and status, as `commit.status` says), with git
+   * commit's prepare-commit-msg (told `merge`) and post-commit hooks, and without pre-commit
+   * or commit-msg. `false` (`--no-edit`, the default here) commits the message as it is.
+   */
+  setEdit(edit: boolean): this {
+    this.checkCallable();
+    this.edit = edit;
+    return this;
+  }
+
+  /**
+   * The editor of {@link setEdit} (git's `core.editor` / `GIT_EDITOR`): see
+   * `CommitCommand.setEditor`. Without one the template is kept as it is (comments stripped).
+   */
+  setEditor(editor: CommitEditor): this {
+    this.checkCallable();
+    this.editor = editor;
+    return this;
+  }
+
+  /** git's run_git_commit for an edited revert: `git commit -n -e`, GIT_REFLOG_ACTION set. */
+  private async gitCommit(reflogAction: string) {
+    const commit = new CommitCommand(this.workingCopy)
+      .shareHooksOf(this, { GIT_REFLOG_ACTION: reflogAction })
+      .setNoVerify(true)
+      .setEdit(true)
+      .setReflogAction(reflogAction);
+    if (this.editor) commit.setEditor(this.editor);
+    if (this.committer) commit.setCommitterIdent(this.committer);
+    const status = RemoteConfigStore.from(this.workingCopy).value("commit.status");
+    commit.setIncludeStatus(status === undefined ? true : (parseGitBool(status) ?? true));
+    const made = await commit.call();
+    return made.id;
+  }
+
   async call(): Promise<RevertResult> {
     this.checkCallable();
     this.setCallable(false);
@@ -196,6 +240,7 @@ export class RevertCommand extends GitCommand<RevertResult> {
         state: new OperationState(this.workingCopy.checkout, this.refsStore),
         resolve: (name) => this.resolveRef(name),
         hooks: this.hooks,
+        gitCommit: (action) => this.gitCommit(action),
       },
       {
         action: "revert",
@@ -204,6 +249,7 @@ export class RevertCommand extends GitCommand<RevertResult> {
         favor: favorOf(this.contentStrategy),
         oursLabel: this.ourCommitName,
         committer: this.committer,
+        edit: this.edit,
         reflogAction: this.reflogAction(this.reflogPrefix.replace(/:$/, "")),
       },
     );

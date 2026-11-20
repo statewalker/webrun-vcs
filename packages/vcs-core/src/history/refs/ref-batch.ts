@@ -620,6 +620,19 @@ export interface RefRemoveOptions {
   deleteRefs?: boolean;
 }
 
+/** How a ref store removes several refs (`Refs.removeAll`, git's `delete_refs`). */
+export interface RefRemoveAllOptions {
+  /**
+   * As git 2.43's files backend (files_delete_refs): the refs dropped from packed-refs in a
+   * transaction of the packed store first (packed-refs rewritten, created when absent), then
+   * each ref deleted in a transaction of its own, going on past one that fails. Without it,
+   * as git 2.5x: one transaction deleting them all (none deleted when one cannot be).
+   */
+  legacy?: boolean;
+  /** The reflog message (logged on HEAD when a removed ref is the branch it names) */
+  message?: string;
+}
+
 /** A ref transaction its hook aborted (git: "in '<state>' phase, update aborted by ..."). */
 export class RefTransactionAbortedError extends Error {
   constructor(
