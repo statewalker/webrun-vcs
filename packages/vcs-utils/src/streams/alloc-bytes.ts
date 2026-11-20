@@ -39,3 +39,26 @@ export function allocBytes(size: number): Uint8Array {
   used += (size + 7) & ~7;
   return out;
 }
+
+/**
+ * A zeroed `Int32Array` of `length` elements: a view into the shared slab when it takes at
+ * most `SLAB_MAX` bytes, else its own (see {@link allocBytes}). The diff of two files of a few
+ * hundred lines makes about ten such arrays; each with its own backing store costs more than
+ * the diff's loops over them.
+ *
+ * @example
+ * ```typescript
+ * const classes = allocInt32(lineCount);
+ * ```
+ */
+export function allocInt32(length: number): Int32Array {
+  const size = length * 4;
+  if (size > SLAB_MAX || size === 0) return new Int32Array(length);
+  if (used + size > SLAB_SIZE) {
+    slab = new ArrayBuffer(SLAB_SIZE);
+    used = 0;
+  }
+  const out = new Int32Array(slab, used, length);
+  used += (size + 7) & ~7;
+  return out;
+}

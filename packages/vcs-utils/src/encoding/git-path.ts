@@ -22,9 +22,13 @@
  * @module
  */
 
+import { allocBytes } from "../streams/index.js";
+
 const fatalDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const encoder = new TextEncoder();
 const SURROGATE = /[\uD800-\uDFFF]/;
+/** Paths up to this many characters are encoded by hand when ASCII (see encodeGitPath) */
+const ASCII_FAST_MAX = 256;
 
 /** Whether `path` holds an escaped byte (or any lone surrogate): not plain UTF-8 text. */
 export function hasEscapedBytes(path: string): boolean {
@@ -96,6 +100,22 @@ export function decodeGitPath(bytes: Uint8Array): string {
  * encodes it.
  */
 export function encodeGitPath(path: string): Uint8Array {
+  // a short ASCII path (most are): its char codes into a slab view, no buffer of its own
+  if (path.length <= ASCII_FAST_MAX) {
+    const n = path.length;
+    let ascii = true;
+    for (let i = 0; i < n; i++) {
+      if (path.charCodeAt(i) >= 0x80) {
+        ascii = false;
+        break;
+      }
+    }
+    if (ascii) {
+      const out = allocBytes(n);
+      for (let i = 0; i < n; i++) out[i] = path.charCodeAt(i);
+      return out;
+    }
+  }
   if (!SURROGATE.test(path)) return encoder.encode(path);
   const out: number[] = [];
   for (let i = 0; i < path.length; i++) {

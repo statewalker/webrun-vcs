@@ -765,3 +765,66 @@ describe("encoding into one buffer (versions 2 and 3)", () => {
     }
   });
 });
+
+describe("parseIndexFile: paths checked as their bytes are read", () => {
+  /**
+   * A version 2 index of `placeholders` (valid paths), whose path bytes are then replaced by
+   * `paths` (each as long as its placeholder) and the checksum computed again: the encoder
+   * refuses invalid paths, a file on disk may hold them.
+   */
+  async function indexWithPaths(paths: string[]): Promise<Uint8Array> {
+    const placeholders = paths.map((p, i) => `${String.fromCharCode(97 + i)}`.repeat(p.length));
+    const entries: StagingEntry[] = placeholders.map((path) => ({
+      path,
+      mode: 0o100644,
+      objectId: "a".repeat(40),
+      stage: 0,
+      size: 1,
+      mtime: 0,
+    }));
+    const { bytes } = await encodeIndexFileBytes(entries, INDEX_VERSION_2);
+    const data = bytes.slice();
+    const text = new TextDecoder("latin1").decode(data);
+    for (let i = 0; i < paths.length; i++) {
+      const at = text.indexOf(placeholders[i] as string, 12);
+      const replacement = new TextEncoder().encode(paths[i]);
+      expect(replacement.length).toBe((placeholders[i] as string).length);
+      data.set(replacement, at);
+    }
+    data.set(await sha1(data.subarray(0, data.length - 20)), data.length - 20);
+    return data;
+  }
+
+  it("refuses the paths validatePath refuses, short or long", async () => {
+    const long = `${"d/".repeat(60)}x`;
+    const bad = [
+      "a//bcd",
+      "/abcde",
+      "abcde/",
+      "a/.git",
+      "a/.GiT/b",
+      ".git/x",
+      ".GIT",
+      "a\0bcd",
+      `${long.slice(0, -1)}/`,
+      `${long}/.git/y`,
+    ];
+    for (const path of bad) {
+      await expect(parseIndexFile(await indexWithPaths([path]))).rejects.toThrow(/path/i);
+    }
+  });
+
+  it("reads valid paths that look close to invalid ones", async () => {
+    const good = [
+      ".gitx/y",
+      "x.git/y",
+      "a/.gi",
+      "a/.gitt",
+      ".git2",
+      "b/.g/i/t",
+      `${"d/".repeat(60)}x`,
+    ];
+    const parsed = await parseIndexFile(await indexWithPaths(good));
+    expect(parsed.entries.map((e) => e.path).sort()).toEqual([...good].sort());
+  });
+});

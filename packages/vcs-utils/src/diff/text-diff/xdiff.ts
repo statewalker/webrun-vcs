@@ -22,6 +22,7 @@
  * @module
  */
 
+import { allocBytes, allocInt32 } from "../../streams/index.js";
 import type { ByteLines } from "./byte-lines.js";
 import type { LineInterner } from "./line-interner.js";
 import { histogramDiff } from "./xdiff-histogram.js";
@@ -252,6 +253,51 @@ const DISCARD = 0;
 const KEEP = 1;
 const INVESTIGATE = 2;
 
+/** The slots of the {@link scratchInt32} buffers */
+const S_TABLE = 0;
+const S_CLS_HASH = 1;
+const S_REP_IDX = 2;
+const S_LEN1 = 3;
+const S_LEN2 = 4;
+const S_H1 = 5;
+const S_H2 = 6;
+const S_KV = 7;
+const S_REP_FILE = 0;
+const S_ACTION1 = 1;
+const S_ACTION2 = 2;
+/** Scratch buffers longer than this are not kept for the next call */
+const SCRATCH_KEPT = 1 << 16;
+const int32Scratch: Int32Array[] = [];
+const byteScratch: Uint8Array[] = [];
+
+/**
+ * A buffer of at least `length` elements for slot `slot`, used by one synchronous step of a
+ * diff and reused by the next diff: not zeroed, and longer than asked. A typed array of its
+ * own costs a backing store outside the heap (a microsecond or two), several times the work
+ * of a small diff's loops over it.
+ */
+function scratchInt32(slot: number, length: number): Int32Array {
+  const kept = int32Scratch[slot];
+  if (kept && kept.length >= length) return kept;
+  if (length > SCRATCH_KEPT) return new Int32Array(length);
+  const made = new Int32Array(Math.max(1024, length, kept ? 2 * kept.length : 0));
+  int32Scratch[slot] = made;
+  return made;
+}
+
+/** {@link scratchInt32} of bytes */
+function scratchBytes(slot: number, length: number): Uint8Array {
+  const kept = byteScratch[slot];
+  if (kept && kept.length >= length) return kept;
+  if (length > SCRATCH_KEPT) return new Uint8Array(length);
+  const made = new Uint8Array(Math.max(1024, length, kept ? 2 * kept.length : 0));
+  byteScratch[slot] = made;
+  return made;
+}
+
+/** An empty `rindex` (replaced before it is read) */
+const NO_RECORDS = new Int32Array(0);
+
 /** xdiff's `xdl_bogosqrt`: a power of two near the square root */
 export function xdlBogosqrt(n: number): number {
   let i = 1;
@@ -273,20 +319,21 @@ function classify(
   if (interner && interner.whitespace === ws) {
     return classifyInterned(interner, l1, from1, n1, l2, from2, n2);
   }
-  const ha1 = new Int32Array(n1);
-  const ha2 = new Int32Array(n2);
+  const ha1 = allocInt32(n1);
+  const ha2 = allocInt32(n2);
   // classes are numbered by first appearance, as xdiff numbers its records; a class is found
   // through an open-addressing table on the line hash (equal lines hash alike)
   const max = n1 + n2;
   let bits = 4;
   while (1 << bits < max * 2) bits++;
   const mask = (1 << bits) - 1;
-  const table = new Int32Array(1 << bits).fill(-1);
-  const clsHash = new Int32Array(max);
-  const repFile = new Uint8Array(max);
-  const repIdx = new Int32Array(max);
-  const len1 = new Int32Array(max);
-  const len2 = new Int32Array(max);
+  const table = scratchInt32(S_TABLE, 1 << bits).fill(-1, 0, 1 << bits);
+  const clsHash = scratchInt32(S_CLS_HASH, max);
+  const repFile = scratchBytes(S_REP_FILE, max);
+  const repIdx = scratchInt32(S_REP_IDX, max);
+  // the counts per class: read by cleanupRecords right after, before the next classify
+  const len1 = scratchInt32(S_LEN1, max).fill(0, 0, max);
+  const len2 = scratchInt32(S_LEN2, max).fill(0, 0, max);
   // the lines the files share byte for byte at their start and end: a line of the second
   // file there has the class of its twin in the first, which is classified already (and no
   // class is new there, so the numbering is the one of a full scan)
@@ -384,7 +431,7 @@ function commonPrefix(
   let p = 0;
   if (max >= 16) {
     // four bytes at a time
-    while (p + 4 <= max && da.getInt32(i + p) === db.getInt32(j + p)) p += 4;
+    while (p + 4 <= max && da.getInt32(i + p, true) === db.getInt32(j + p, true)) p += 4;
   }
   while (p < max && a[i + p] === b[j + p]) p++;
   return p;
@@ -402,7 +449,8 @@ function commonSuffix(
 ): number {
   let q = 0;
   if (max >= 16) {
-    while (q + 4 <= max && da.getInt32(end1 - q - 4) === db.getInt32(end2 - q - 4)) q += 4;
+    while (q + 4 <= max && da.getInt32(end1 - q - 4, true) === db.getInt32(end2 - q - 4, true))
+      q += 4;
   }
   while (q < max && a[end1 - 1 - q] === b[end2 - 1 - q]) q++;
   return q;
@@ -468,10 +516,10 @@ function classifyInterned(
 ): { ha1: Int32Array; ha2: Int32Array; len1: Int32Array; len2: Int32Array } {
   const ids1 = interner.ids(l1);
   const ids2 = interner.ids(l2);
-  const ha1 = new Int32Array(n1);
-  const ha2 = new Int32Array(n2);
-  const len1 = new Int32Array(n1 + n2);
-  const len2 = new Int32Array(n1 + n2);
+  const ha1 = allocInt32(n1);
+  const ha2 = allocInt32(n2);
+  const len1 = scratchInt32(S_LEN1, n1 + n2).fill(0, 0, n1 + n2);
+  const len2 = scratchInt32(S_LEN2, n1 + n2).fill(0, 0, n1 + n2);
   const { stamps, local, generation } = interner.scratch();
   let classes = 0;
   for (let i = 0; i < n1; i++) {
@@ -507,8 +555,8 @@ function newFile(lines: ByteLines, from: number, nrec: number, ha: Int32Array): 
     from,
     nrec,
     ha,
-    changed: new Uint8Array(nrec + 2),
-    rindex: new Int32Array(0),
+    changed: allocBytes(nrec + 2),
+    rindex: NO_RECORDS,
     nreff: 0,
     dstart: 0,
     dend: nrec - 1,
@@ -555,8 +603,8 @@ function cleanupRecords(
   const off = xdf1.dstart;
   const len1 = Math.max(0, xdf1.dend - off + 1);
   const len2 = Math.max(0, xdf2.dend - off + 1);
-  const action1 = new Uint8Array(len1);
-  const action2 = new Uint8Array(len2);
+  const action1 = scratchBytes(S_ACTION1, len1);
+  const action2 = scratchBytes(S_ACTION2, len2);
   let mlim1 = Number.MAX_SAFE_INTEGER;
   let mlim2 = Number.MAX_SAFE_INTEGER;
   if (!needMin) {
@@ -572,7 +620,7 @@ function cleanupRecords(
     action2[i] = nm === 0 ? DISCARD : nm < mlim2 ? KEEP : INVESTIGATE;
   }
   const keep = (xdf: XdFile, action: Uint8Array, len: number) => {
-    const rindex = new Int32Array(len);
+    const rindex = allocInt32(len);
     let nreff = 0;
     for (let i = 0; i < len; i++) {
       let a = action[i];
@@ -816,12 +864,13 @@ function myersDiff(env: XdEnv, needMinimal: boolean): void {
   const { xdf1, xdf2 } = env;
   const n1 = xdf1.nreff;
   const n2 = xdf2.nreff;
-  const h1 = new Int32Array(n1);
-  const h2 = new Int32Array(n2);
+  const h1 = scratchInt32(S_H1, n1);
+  const h2 = scratchInt32(S_H2, n2);
   for (let i = 0; i < n1; i++) h1[i] = xdf1.ha[xdf1.rindex[i]];
   for (let i = 0; i < n2; i++) h2[i] = xdf2.ha[xdf2.rindex[i]];
   const ndiags = n1 + n2 + 3;
-  const kv = new Int32Array(2 * ndiags + 2);
+  // xdiff mallocs it without zeroing: split writes each diagonal before it reads it
+  const kv = scratchInt32(S_KV, 2 * ndiags + 2);
   const fb = n2 + 1;
   const bb = ndiags + n2 + 1;
   const mxcost = Math.max(xdlBogosqrt(ndiags), XDL_MAX_COST_MIN);

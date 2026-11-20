@@ -20,6 +20,7 @@
  */
 
 import { encodeGitPath } from "../../encoding/index.js";
+import { allocBytes } from "../../streams/index.js";
 import { ByteLines, type LineSource } from "./byte-lines.js";
 import {
   diffScript,
@@ -563,12 +564,11 @@ export class ByteSink {
  */
 export function formatHunkHeader(hunk: EmittedHunk): Uint8Array {
   const range = (start: number, count: number) => (count !== 1 ? `${start},${count}` : `${start}`);
-  const head = encoder.encode(
-    `@@ -${range(hunk.oldStart, hunk.oldCount)} +${range(hunk.newStart, hunk.newCount)} @@`,
-  );
-  const buf = new Uint8Array(128);
-  buf.set(head);
-  let nb = head.length;
+  // ASCII: its char codes are its bytes
+  const head = `@@ -${range(hunk.oldStart, hunk.oldCount)} +${range(hunk.newStart, hunk.newCount)} @@`;
+  const buf = HEADER_SCRATCH;
+  let nb = 0;
+  for (; nb < head.length; nb++) buf[nb] = head.charCodeAt(nb);
   if (hunk.func.length > 0) {
     buf[nb++] = 0x20;
     let funclen = hunk.func.length;
@@ -578,12 +578,19 @@ export function formatHunkHeader(hunk: EmittedHunk): Uint8Array {
   }
   buf[nb++] = 0x0a;
   const valid = saneUtf8Length(buf, 0, nb);
-  if (valid === nb) return buf.slice(0, nb);
-  const out = new Uint8Array(valid + 1);
+  if (valid === nb) {
+    const out = allocBytes(nb);
+    out.set(buf.subarray(0, nb));
+    return out;
+  }
+  const out = allocBytes(valid + 1);
   out.set(buf.subarray(0, valid));
   out[valid] = 0x0a;
   return out;
 }
+
+/** Where {@link formatHunkHeader} builds a header (git's 128-byte buffer), then copies it out */
+const HEADER_SCRATCH = new Uint8Array(128);
 
 /** Writes hunks as git prints them: headers, lines, and the "\ No newline" marker */
 export function writeHunks(sink: ByteSink, result: UnifiedDiffResult): void {
@@ -605,7 +612,7 @@ export function writeHunks(sink: ByteSink, result: UnifiedDiffResult): void {
       size += 1 + len;
       if (len > 0 && bytes[end - 1] !== 0x0a) size += NO_NEWLINE.length;
     }
-    const out = new Uint8Array(size);
+    const out = allocBytes(size);
     let at = 0;
     for (const line of hunk.lines) {
       const minus = line.kind === "-";

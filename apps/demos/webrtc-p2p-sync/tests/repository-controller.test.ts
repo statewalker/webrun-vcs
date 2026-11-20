@@ -240,9 +240,12 @@ async function createTestAppContext(): Promise<AppContext> {
 }
 
 /**
- * Wait for a condition to become true (for async state changes).
+ * Wait for a condition to become true (for async state changes). The first operation of a file
+ * also pays for loading and compiling the git modules it reaches (about 0.3 s alone, several
+ * times that on a loaded CI runner), so the wait allows 5 s: a passing run returns as soon as
+ * the condition holds.
  */
-async function waitFor(condition: () => boolean, timeout = 1000, interval = 10): Promise<void> {
+async function waitFor(condition: () => boolean, timeout = 5000, interval = 10): Promise<void> {
   const start = Date.now();
   while (!condition()) {
     if (Date.now() - start > timeout) {
