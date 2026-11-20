@@ -3,6 +3,7 @@ export * from "./capabilities.js";
 export * from "./chunk-queue.js";
 export * from "./constants.js";
 export * from "./errors.js";
+export * from "./git-daemon-request.js";
 export * from "./git-request-parser.js";
 export * from "./hidden-refs.js";
 export * from "./pkt-line-codec.js";

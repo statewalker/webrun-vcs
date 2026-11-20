@@ -95,6 +95,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   private repoUrl?: string;
   private branch?: string;
   private depth?: number;
+  private uploadPack?: string;
   private bare = false;
   private noCheckout = false;
   private sparse = false;
@@ -170,6 +171,20 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       throw new InvalidArgumentError("depth", depth, "Depth must be at least 1");
     }
     this.depth = depth;
+    return this;
+  }
+
+  /**
+   * Set the program the remote runs for upload-pack (git's `clone --upload-pack` / `-u`):
+   * what an ssh connector runs, and what git:// names in its request line. As git's clone,
+   * the default is `git-upload-pack` whatever `remote.<name>.uploadpack` says, and the value
+   * is not written to the new repository's config.
+   *
+   * @param uploadPack Path to git-upload-pack on the remote
+   */
+  setUploadPack(uploadPack: string): this {
+    this.checkCallable();
+    this.uploadPack = uploadPack;
     return this;
   }
 
@@ -550,7 +565,11 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     };
     // transport_get: git's local transport (upload-pack of the repository at the path, in
     // process), or the connector the transport registry names (smart HTTP by default)
-    const result = await withRemoteUploadPack(remote, this.remoteSessionOptions(), (connection) =>
+    const sessionOptions = {
+      ...this.remoteSessionOptions(),
+      ...(this.uploadPack !== undefined ? { program: this.uploadPack } : {}),
+    };
+    const result = await withRemoteUploadPack(remote, sessionOptions, (connection) =>
       fetchFromConnection(connection, fetchOptions),
     );
     const cloneLog = this.reflogLine(reflogMessages.clone(repo));

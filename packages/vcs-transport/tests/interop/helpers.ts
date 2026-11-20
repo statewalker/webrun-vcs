@@ -242,6 +242,9 @@ export function gitProcessDuplex(child: ChildProcessWithoutNullStreams): GitProc
         child.stdin.write(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
       }
     },
+    async end(): Promise<void> {
+      if (!child.stdin.destroyed) child.stdin.end();
+    },
     async close(): Promise<void> {
       if (!child.stdin.destroyed) child.stdin.end();
     },

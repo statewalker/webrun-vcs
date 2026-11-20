@@ -69,7 +69,8 @@ export function gitDaemonRequest(request: GitConnectRequest): Uint8Array {
     extraParams.set(key, value);
   }
   return encodeGitProtocolRequest({
-    service: request.service,
+    // git_connect_git writes the program asked for (`--upload-pack`) where the service goes
+    service: (request.program ?? request.service) as GitService,
     path,
     host,
     ...(extraParams.size > 0 ? { extraParams } : {}),

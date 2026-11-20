@@ -4,6 +4,12 @@
 
 import type { GitTransportConnector } from "./connector.js";
 import { type GitUrl, parseGitUrl } from "./git-url.js";
+import {
+  createGitDaemonConnector,
+  createSshConnector,
+  type GitDaemonConnectorOptions,
+  type SshConnectorOptions,
+} from "./native-connectors.js";
 
 /** Options of {@link GitTransportRegistry.register}. */
 export interface RegisterTransportOptions {
@@ -116,20 +122,34 @@ export function createHttpConnector(options: HttpConnectorOptions = {}): GitTran
   };
 }
 
+/** Options of {@link createDefaultTransports}. */
+export interface DefaultTransportsOptions extends HttpConnectorOptions {
+  /** With it, `git://` URLs connect through it ({@link createGitDaemonConnector}) */
+  openSocket?: GitDaemonConnectorOptions["openSocket"];
+  /** With it, ssh URLs (`ssh://`, `host:path`) run git's command through it ({@link createSshConnector}) */
+  exec?: SshConnectorOptions["exec"];
+}
+
 /**
  * The transports every remote command starts with: smart HTTP over the global `fetch` for
- * `http(s)://` URLs. Local paths and `file://` URLs never reach the registry (they are served
- * in process by git's local transport).
+ * `http(s)://` URLs, and `git://` and ssh when the host supplies a socket opener or a command
+ * runner. Local paths and `file://` URLs never reach the registry (they are served in process
+ * by git's local transport).
  *
  * @example
  * ```ts
- * const transports = createDefaultTransports();
+ * const transports = createDefaultTransports({ openSocket, exec });
  * transports.register(connector, { priority: 10 });
  * const git = Git.fromWorkingCopy(workingCopy, { transports });
  * ```
  */
-export function createDefaultTransports(options: HttpConnectorOptions = {}): GitTransportRegistry {
+export function createDefaultTransports(
+  options: DefaultTransportsOptions = {},
+): GitTransportRegistry {
   const registry = new GitTransportRegistry();
   registry.register(createHttpConnector(options));
+  if (options.openSocket)
+    registry.register(createGitDaemonConnector({ openSocket: options.openSocket }));
+  if (options.exec) registry.register(createSshConnector({ exec: options.exec }));
   return registry;
 }

@@ -8,9 +8,10 @@
  */
 
 import type { Credentials } from "../api/credentials.js";
-import type { Duplex } from "../api/duplex.js";
+import { type Duplex, endDuplex } from "../api/duplex.js";
 import { authorizationHeader } from "../operations/http-auth.js";
-import { ServerError, TransportError } from "../protocol/index.js";
+import { AuthenticationError, ServerError, TransportError } from "../protocol/index.js";
+import { anonymizeUrl } from "./fetch-head.js";
 import { abortErrorOf, IdleTimer } from "./idle-timer.js";
 import { type Pkt, PktStream } from "./pkt-stream.js";
 
@@ -109,10 +110,7 @@ export async function openHttpConnection(
       }),
     ),
   );
-  if (!response.ok) {
-    await response.body?.cancel().catch(() => {});
-    throw new TransportError(`Failed to get refs: ${response.status} ${response.statusText}`);
-  }
+  if (!response.ok) throw await httpRefsError(response, baseUrl);
   if (!response.body) throw new TransportError("Empty response from info/refs");
   const advert = new PktStream(response.body, wait);
   let first = await advert.read();
@@ -171,6 +169,40 @@ export async function openHttpConnection(
       options.signal?.removeEventListener("abort", onAbort);
     },
   };
+}
+
+/**
+ * The error git's remote-curl dies with when `info/refs` fails (`discover_refs`): a 404 is
+ * "repository '<url>/' not found", a 401 "Authentication failed for '<url>/'" (an
+ * {@link AuthenticationError}, as is a 403), any other "unable to access '<url>/': The
+ * requested URL returned error: <code>"; a `text/plain` body comes first as `remote: ` lines
+ * (`show_http_message`). The URL ends with a slash and carries no credentials, as git prints it.
+ */
+export async function httpRefsError(response: Response, baseUrl: string): Promise<TransportError> {
+  let body = "";
+  const type = (response.headers.get("content-type") ?? "").split(";")[0]?.trim().toLowerCase();
+  if (type === "text/plain") {
+    body = await response.text().catch(() => "");
+  } else {
+    await response.body?.cancel().catch(() => {});
+  }
+  const text = body.trim();
+  const lines = text
+    ? text
+        .split("\n")
+        .map((line) => `remote: ${line}\n`)
+        .join("")
+    : "";
+  const url = `${anonymizeUrl(baseUrl.replace(/\/+$/, ""))}/`;
+  if (response.status === 404) {
+    return new TransportError(`${lines}fatal: repository '${url}' not found`);
+  }
+  const unable = `fatal: unable to access '${url}': The requested URL returned error: ${response.status}`;
+  if (response.status === 401) {
+    return new AuthenticationError(`${lines}fatal: Authentication failed for '${url}'`);
+  }
+  if (response.status === 403) return new AuthenticationError(`${lines}${unable}`);
+  return new TransportError(`${lines}${unable}`);
 }
 
 /** Options of {@link openDuplexConnection}. */
@@ -246,6 +278,9 @@ export async function openDuplexConnection(
           // the other end is gone already
         }
       }
+      // then the write side ends, as git's disconnect_git closes its end of the stream: a
+      // server reading until the end of its input (a spawned upload-pack) exits
+      await endDuplex(duplex);
       release();
       if (options.closeDuplex) await duplex.close?.();
     },

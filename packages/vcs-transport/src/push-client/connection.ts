@@ -9,10 +9,11 @@
 
 import { fetchWithRequestBody, shouldStreamRequestBody } from "@statewalker/vcs-utils/streams";
 import type { Credentials } from "../api/credentials.js";
-import type { Duplex } from "../api/duplex.js";
+import { type Duplex, endDuplex } from "../api/duplex.js";
+// the idle timer is internal to the clients: not exported from the package
+import { abortErrorOf, IdleTimer } from "../fetch-client/idle-timer.js";
 import {
-  abortErrorOf,
-  IdleTimer,
+  httpRefsError,
   PktStream,
   type RemoteRef,
   readServerGreeting,
@@ -127,7 +128,7 @@ async function openHttp(
       }),
     ),
   );
-  await checkResponse(response, "Failed to get refs");
+  if (!response.ok) throw await httpRefsError(response, baseUrl);
   if (!response.body) throw new TransportError("Empty response from info/refs");
   const advert = new PktStream(response.body, wait);
   let first = await advert.read();
@@ -257,6 +258,9 @@ export async function openDuplexReceivePackConnection(
       for await (const chunk of idle.serverPaced(body())) {
         await wait(async () => duplex.write(chunk));
       }
+      // the request is complete: git's send-pack closes its end once the pack is written
+      // (pack-objects owns the descriptor), so receive-pack sees the end of its input
+      await endDuplex(duplex);
       return pkts;
     },
     async close() {
@@ -268,6 +272,7 @@ export async function openDuplexReceivePackConnection(
         } catch {
           // the other end is gone already
         }
+        await endDuplex(duplex);
       }
       release();
       if (options.closeDuplex) await duplex.close?.();

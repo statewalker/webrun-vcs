@@ -205,6 +205,17 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
   }
 
   /**
+   * The program a configured remote runs for a service (`remote.<name>.uploadpack` or
+   * `remote.<name>.receivepack`, as git's `remote_get` reads them); undefined for a URL or when
+   * unset.
+   */
+  protected remoteProgram(remote: string, key: "uploadpack" | "receivepack"): string | undefined {
+    const store = RemoteConfigStore.from(this._workingCopy);
+    if (store.urlFor(remote) === undefined) return undefined;
+    return store.value(`remote.${remote}.${key}`);
+  }
+
+  /**
    * Get transport options for passing to transport operations.
    */
   protected getTransportOptions(): TransportOptions {

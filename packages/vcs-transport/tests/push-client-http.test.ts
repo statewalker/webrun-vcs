@@ -232,7 +232,9 @@ describe("push client over smart HTTP", () => {
   it("401 and 403 are authentication errors; a dumb server is refused", async () => {
     const unauthorized = await run({ advert: "", infoStatus: 401 });
     expect(unauthorized.error).toBeInstanceOf(AuthenticationError);
-    expect(unauthorized.error?.message).toMatch(/\b401\b/);
+    expect(unauthorized.error?.message).toBe(
+      "fatal: Authentication failed for 'http://example.test/repo.git/'",
+    );
     const forbidden = await run({ advert: advert("report-status"), postStatus: 403 });
     expect(forbidden.error).toBeInstanceOf(AuthenticationError);
     expect(forbidden.error?.message).toMatch(/\b403\b/);

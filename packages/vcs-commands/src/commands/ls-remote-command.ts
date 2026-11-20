@@ -67,8 +67,9 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
   private remote?: string;
   private heads = false;
   private tags = false;
-  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: API placeholder for transport layer
   private uploadPack?: string;
+  /** The remote (name or URL) {@link remoteUrl} resolved */
+  private remoteName?: string;
 
   /**
    * Set the remote to query.
@@ -127,7 +128,9 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
   }
 
   /**
-   * Set custom upload-pack path for the remote.
+   * Set the program the remote runs for upload-pack (git's `--upload-pack`, over the
+   * `remote.<name>.uploadpack` of the remote listed, given or default): what an ssh connector runs, and
+   * what git:// names in its request line.
    *
    * @param uploadPack Path to git-upload-pack on remote
    */
@@ -156,52 +159,54 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
     // session); either lists with ls-refs over v2, else reads the v0/v1 advertisement, as
     // protocol.version asks; anything else fails in git's words
     const remote = await this.prepareRemote(remoteUrl);
-    const options = this.remoteSessionOptions();
-    const listRefs = async (connection: UploadPackConnection) => {
-      const listed = new Map<string, ObjectId>();
-      const refs =
-        connection.version === 2 ? await lsRefs(connection, []) : (connection.advertisedRefs ?? []);
-      for (const ref of refs) {
-        if (ref.oid) listed.set(ref.name, ref.oid);
-      }
-      return listed;
+    // --upload-pack, else remote.<name>.uploadpack (transport_get reads it for a named remote)
+    const uploadPack =
+      this.uploadPack ??
+      (this.remoteName !== undefined
+        ? this.remoteProgram(this.remoteName, "uploadpack")
+        : undefined);
+    const options = {
+      ...this.remoteSessionOptions(),
+      ...(uploadPack !== undefined ? { program: uploadPack } : {}),
     };
-    const refs = await withRemoteUploadPack(remote, options, listRefs);
+    // builtin/ls-remote.c: --tags and --heads become v2 ref-prefixes (v0 lists everything,
+    // filtered here). `ref-prefix HEAD` too, which git does not send: HEAD's symref gives
+    // `defaultBranch` (HEAD itself is never in the refs returned)
+    const prefixes = [...(this.tags ? ["refs/tags/"] : []), ...(this.heads ? ["refs/heads/"] : [])];
+    if (prefixes.length > 0) prefixes.push("HEAD");
+    const listRefs = async (connection: UploadPackConnection) =>
+      connection.version === 2
+        ? await lsRefs(connection, prefixes)
+        : [...(connection.advertisedRefs ?? [])];
+    const listed = await withRemoteUploadPack(remote, options, listRefs);
 
-    // Filter refs based on heads/tags settings
     const filteredRefs: RemoteRef[] = [];
-    let defaultBranch: string | undefined;
-
-    for (const [refName, objectIdHex] of refs) {
-      // Handle HEAD specially
-      if (refName === "HEAD") {
-        continue; // We'll use it for defaultBranch detection but not include in results
-      }
-
-      // Apply filters
-      if (this.heads && !refName.startsWith("refs/heads/")) {
-        continue;
-      }
-      if (this.tags && !refName.startsWith("refs/tags/")) {
-        continue;
-      }
-
+    for (const ref of listed) {
+      // HEAD only names the default branch; an unborn ref has no object
+      if (ref.name === "HEAD" || !ref.oid) continue;
+      // --heads and --tags: refs of either kind (git's REF_BRANCHES | REF_TAGS)
+      const wanted =
+        (!this.heads && !this.tags) ||
+        (this.heads && ref.name.startsWith("refs/heads/")) ||
+        (this.tags && ref.name.startsWith("refs/tags/"));
+      if (!wanted) continue;
       filteredRefs.push({
-        name: refName,
-        objectId: objectIdHex,
+        name: ref.name,
+        objectId: ref.oid,
+        ...(ref.peeled ? { peeledObjectId: ref.peeled } : {}),
+        ...(ref.symref ? { symbolic: true, target: ref.symref } : {}),
       });
     }
 
-    // Try to determine default branch
-    const headRef = refs.get("HEAD");
-    if (headRef) {
-      // Check if HEAD points to a known branch
-      for (const [refName, objectIdHex] of refs) {
-        if (refName.startsWith("refs/heads/") && objectIdHex === headRef) {
-          defaultBranch = refName.slice("refs/heads/".length);
-          break;
-        }
-      }
+    // The default branch: HEAD's symref (v2 `symref-target`, v0's `symref=HEAD:` capability),
+    // else the first branch at HEAD's commit (a server that names no symref)
+    let defaultBranch: string | undefined;
+    const head = listed.find((r) => r.name === "HEAD");
+    if (head?.symref?.startsWith("refs/heads/")) {
+      defaultBranch = head.symref.slice("refs/heads/".length);
+    } else if (head?.oid) {
+      const match = listed.find((r) => r.name.startsWith("refs/heads/") && r.oid === head.oid);
+      if (match) defaultBranch = match.name.slice("refs/heads/".length);
     }
 
     return {
@@ -249,13 +254,19 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
   /** The URL of the remote given, or of git's default remote (see {@link callGetUrl}). */
   private async remoteUrl(): Promise<string> {
     const store = RemoteConfigStore.from(this.workingCopy);
-    if (this.remote !== undefined) return store.remoteUrlOf(this.remote);
+    if (this.remote !== undefined) {
+      this.remoteName = this.remote;
+      return store.remoteUrlOf(this.remote);
+    }
     // remotes_remote_for_branch: an explicit branch remote is "given" (add_url_alias)
     const head = await this.refsStore.get("HEAD");
     if (head && isSymbolicRef(head) && head.target.startsWith("refs/heads/")) {
       const branch = head.target.slice("refs/heads/".length);
       const explicit = store.value(`branch.${branch}.remote`);
-      if (explicit !== undefined) return store.remoteUrlOf(explicit);
+      if (explicit !== undefined) {
+        this.remoteName = explicit;
+        return store.remoteUrlOf(explicit);
+      }
     }
     const names = store.configuredNames();
     const name = names.length === 1 ? (names[0] ?? "origin") : "origin";
@@ -263,6 +274,7 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
     if (url === undefined) {
       throw new InvalidRemoteError(name, "fatal: No remote configured to list refs from.");
     }
+    this.remoteName = name;
     return url;
   }
 }

@@ -135,7 +135,7 @@ describe("HTTP Fetch E2E", () => {
         refStore: clientRefs,
         fetchImpl: async () => new Response("Not Found", { status: 404 }),
       }),
-    ).rejects.toThrow("404");
+    ).rejects.toThrow("fatal: repository 'http://test-server/repo.git/' not found");
   });
 
   it("handles network errors gracefully", async () => {

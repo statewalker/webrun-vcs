@@ -128,7 +128,7 @@ describe("HTTP Push E2E", () => {
     });
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain("refs");
+    expect(result.error).toContain("fatal: repository 'http://test-server/repo.git/' not found");
   });
 
   it("handles network errors gracefully", async () => {

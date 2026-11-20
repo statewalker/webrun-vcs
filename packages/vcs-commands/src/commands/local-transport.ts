@@ -10,6 +10,7 @@ import {
   createRepositoryFacade,
   createTransportRefStore,
   type Duplex,
+  type GitServeSettings,
   openDuplexConnection,
   openDuplexReceivePackConnection,
   type ReceiveCommand,
@@ -34,7 +35,10 @@ const NOT_A_REPOSITORY = (path: string) =>
   "fatal: Could not read from remote repository.\n\n" +
   "Please make sure you have the correct access rights\nand the repository exists.";
 
-/** A connected pair of in-memory duplex streams: what one side writes, the other reads. */
+/**
+ * A connected pair of in-memory duplex streams: what one side writes, the other reads. `end`
+ * half-closes a side (the other one reads to its end and can still answer); `close` ends it.
+ */
 export function createDuplexPair(): [Duplex, Duplex] {
   const make = () => {
     const queue: Uint8Array[] = [];
@@ -65,27 +69,31 @@ export function createDuplexPair(): [Duplex, Duplex] {
   const b = make();
   let aClosed = false;
   let bClosed = false;
+  const endLeft = async () => {
+    if (aClosed) return;
+    aClosed = true;
+    b.push(null);
+  };
+  const endRight = async () => {
+    if (bClosed) return;
+    bClosed = true;
+    a.push(null);
+  };
   const left: Duplex = {
     [Symbol.asyncIterator]: () => a.read()[Symbol.asyncIterator](),
     write: (data) => {
       if (!aClosed) b.push(data.slice());
     },
-    close: async () => {
-      if (aClosed) return;
-      aClosed = true;
-      b.push(null);
-    },
+    end: endLeft,
+    close: endLeft,
   };
   const right: Duplex = {
     [Symbol.asyncIterator]: () => b.read()[Symbol.asyncIterator](),
     write: (data) => {
       if (!bClosed) a.push(data.slice());
     },
-    close: async () => {
-      if (bClosed) return;
-      bClosed = true;
-      a.push(null);
-    },
+    end: endRight,
+    close: endRight,
   };
   return [left, right];
 }
@@ -291,24 +299,24 @@ export async function withLocalReceivePack<T>(
   }
 }
 
-async function receiveOver<T>(
+/**
+ * The settings git's receive-pack takes from the repository it serves: the policies and hidden
+ * refs of its config (`serverSettingsFromConfig`), its current branch and the branches its
+ * worktrees have checked out, `updateInstead` (push-to-checkout, push-to-deploy), and, with
+ * hooks, pre-receive / update / post-receive run as git's receive-pack runs them.
+ */
+export async function receivePackSettingsOf(
   remote: OpenedRepository,
-  run: (connection: ReceivePackConnection) => Promise<T>,
-  hooks: HookSession | undefined,
-  receiveHooks: ReceivePackHooks | undefined,
-  version1: boolean,
-): Promise<T> {
+  hooks?: HookSession,
+  receiveHooks: ReceivePackHooks | undefined = hooks?.enabled
+    ? scriptReceiveHooks(hooks)
+    : undefined,
+): Promise<GitServeSettings> {
   const head = await remote.history.refs.get("HEAD").catch(() => undefined);
   const settings = serverSettingsOf(remote);
   const checkedOut = await checkedOutBranches(remote.worktrees);
   const worktrees = remote.worktrees;
-  const [client, server] = createDuplexPair();
-  const serving = serveOverDuplex({
-    duplex: server,
-    repository: createRepositoryFacade({ history: remote.history }),
-    refStore: createTransportRefStore(remote.history.refs),
-    service: "git-receive-pack",
-    ...(version1 ? { announceVersion1: true } : {}),
+  return {
     bare: remote.bare,
     ...(head && "target" in head ? { currentBranch: head.target } : {}),
     allowDeletes: settings.allowDeletes,
@@ -316,6 +324,7 @@ async function receiveOver<T>(
     denyCurrentBranch: settings.denyCurrentBranch,
     denyDeleteCurrent: settings.denyDeleteCurrent,
     shallowUpdate: settings.shallowUpdate,
+    uploadPackHideRefs: settings.uploadPackHideRefs,
     receivePackHideRefs: settings.receivePackHideRefs,
     ...(receiveHooks ? { hooks: receiveHooks, relayPostReceive: true } : {}),
     // git's receive-pack migrates its quarantine before update() checks the commands
@@ -333,6 +342,24 @@ async function receiveOver<T>(
           },
         }
       : {}),
+  };
+}
+
+async function receiveOver<T>(
+  remote: OpenedRepository,
+  run: (connection: ReceivePackConnection) => Promise<T>,
+  hooks: HookSession | undefined,
+  receiveHooks: ReceivePackHooks | undefined,
+  version1: boolean,
+): Promise<T> {
+  const [client, server] = createDuplexPair();
+  const serving = serveOverDuplex({
+    ...(await receivePackSettingsOf(remote, hooks, receiveHooks)),
+    duplex: server,
+    repository: createRepositoryFacade({ history: remote.history }),
+    refStore: createTransportRefStore(remote.history.refs),
+    service: "git-receive-pack",
+    ...(version1 ? { announceVersion1: true } : {}),
   }).finally(() => server.close?.());
   // receive-pack died (its reference-transaction hook aborted the update): its message on
   // the shared stderr, then send-pack's, as git's local transport shows them

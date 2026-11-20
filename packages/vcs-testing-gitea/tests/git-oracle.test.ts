@@ -53,7 +53,9 @@ describeGitea("Gitea oracle · G1 git over smart HTTP", () => {
     try {
       const local = { repository: ours.facade, refStore: ours.refStore };
       // a private repository: no credentials, no refs
-      await expect(transportFetch({ url: repo.cloneUrl, ...local })).rejects.toThrow(/\b401\b/);
+      await expect(transportFetch({ url: repo.cloneUrl, ...local })).rejects.toThrow(
+        /Authentication failed for/,
+      );
       expect(await ours.refStore.get("refs/heads/main")).toBeUndefined();
 
       // every branch and tag under its own name (the transport's default refspecs)
@@ -137,7 +139,7 @@ describeGitea("Gitea oracle · G1 git over smart HTTP", () => {
 
       await expect(
         push({ url: repo.cloneUrl, ...local, refspecs: ["refs/heads/main:refs/heads/other"] }),
-      ).rejects.toThrow(/\b401\b/);
+      ).rejects.toThrow(/Authentication failed for/);
       expect(nativeGit(env, clone, ["ls-remote", "origin"])).not.toContain("refs/heads/other");
     } finally {
       await ours.close();
