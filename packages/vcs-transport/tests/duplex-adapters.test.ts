@@ -638,3 +638,73 @@ describe("serveOverPort (the server side of messagePortDuplex for a fixed servic
     expect(await repo.refStore.get("refs/heads/main")).toBe(commits[0]);
   });
 });
+
+/**
+ * A `MessageChannel` whose ports deliver as a browser's do: `addEventListener("message")` alone
+ * does not start a port (Node's does), only `start()` or setting `onmessage`; until then every
+ * message stays queued.
+ */
+function browserLikeChannel(): { port1: MessagePort; port2: MessagePort } {
+  const { port1, port2 } = new MessageChannel();
+  const wrap = (port: MessagePort): MessagePort => {
+    const target = new EventTarget();
+    const queued: MessageEvent[] = [];
+    let started = false;
+    let handler: ((event: MessageEvent) => void) | null = null;
+    port.onmessage = (event) => {
+      const copy = new MessageEvent("message", { data: event.data });
+      if (started) target.dispatchEvent(copy);
+      else queued.push(copy);
+    };
+    const start = () => {
+      if (started) return;
+      started = true;
+      for (const event of queued.splice(0)) target.dispatchEvent(event);
+    };
+    const wrapped = {
+      postMessage: (message: unknown, transfer?: Transferable[]) =>
+        port.postMessage(message, transfer ?? []),
+      addEventListener: (type: string, listener: EventListener) =>
+        target.addEventListener(type, listener),
+      removeEventListener: (type: string, listener: EventListener) =>
+        target.removeEventListener(type, listener),
+      start,
+      close: () => port.close(),
+      get onmessage() {
+        return handler;
+      },
+      set onmessage(value: ((event: MessageEvent) => void) | null) {
+        if (handler) target.removeEventListener("message", handler as EventListener);
+        handler = value;
+        if (value) target.addEventListener("message", value as EventListener);
+        start();
+      },
+    };
+    return wrapped as unknown as MessagePort;
+  };
+  return { port1: wrap(port1), port2: wrap(port2) };
+}
+
+describe("MessagePort adapters on browser-like ports", () => {
+  it("messagePortDuplex and serveOverPort start their ports (a browser's addEventListener does not)", async () => {
+    const { repo, c2 } = await serverRepo();
+    const local = await createTransportRepo();
+    const channel = browserLikeChannel();
+    serveOverPort(channel.port2, (duplex) =>
+      serveOverDuplex({
+        duplex,
+        repository: repo.facade,
+        refStore: repo.refStore,
+        service: "git-upload-pack",
+      }),
+    );
+    const fetched = await fetchOverDuplex({
+      duplex: messagePortDuplex(channel.port1),
+      repository: local.facade,
+      refStore: local.refStore,
+      refspecs: ["+refs/heads/*:refs/remotes/origin/*"],
+    });
+    expect(fetched.success).toBe(true);
+    expect(await local.refStore.get("refs/remotes/origin/main")).toBe(c2);
+  }, 10_000);
+});

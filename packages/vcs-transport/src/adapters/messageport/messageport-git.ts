@@ -81,7 +81,24 @@ export function messagePortDuplex(
   options: MessagePortDuplexOptions = {},
 ): Duplex {
   const { timeout, ...queue } = options;
-  return webrunClientDuplex(duplexOverPort(port, timeout !== undefined ? { timeout } : {}), queue);
+  const call = duplexOverPort(port, timeout !== undefined ? { timeout } : {});
+  return webrunClientDuplex((input) => {
+    // `duplexOverPort` installs its listeners synchronously: start the port right after.
+    const output = call(input);
+    startPort(port);
+    return output;
+  }, queue);
+}
+
+/**
+ * Starts a `MessagePort`'s message queue. webrun-rpc's stream tier listens with
+ * `addEventListener("message")`, which starts a Node `MessagePort` but not a browser's: there
+ * only setting `onmessage` (or `start()`) does, and until then every message stays queued, so a
+ * session hangs at its first chunk. Called once the stream's listeners are installed, as Node
+ * starts the port at its first listener; a no-op for targets without `start`.
+ */
+function startPort(port: MessageTarget): void {
+  (port as { start?: () => void }).start?.();
 }
 
 /** Options of {@link serveGitOverPort}. */
@@ -105,11 +122,13 @@ export function serveGitOverPort(
   options: ServeGitOverPortOptions,
 ): () => void {
   const { streamTimeout, ...serveOptions } = options;
-  return serveDuplexOverPort(
+  const teardown = serveDuplexOverPort(
     port,
     serveGitOverWebrun(serveOptions),
     streamTimeout !== undefined ? { timeout: streamTimeout } : {},
   );
+  startPort(port);
+  return teardown;
 }
 
 /** Options of {@link serveOverPort}. */
@@ -139,11 +158,13 @@ export function serveOverPort<T>(
   options: ServeOverPortOptions = {},
 ): () => void {
   const { streamTimeout, ...queue } = options;
-  return serveDuplexOverPort(
+  const teardown = serveDuplexOverPort(
     port,
     webrunServerDuplex(run, queue),
     streamTimeout !== undefined ? { timeout: streamTimeout } : {},
   );
+  startPort(port);
+  return teardown;
 }
 
 /** Options of {@link serveGitOverPortMux} and {@link connectGitOverPortMux}. */
