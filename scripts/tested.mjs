@@ -4,12 +4,17 @@
 // The inputs of a package are hashed together:
 //   - its own files (git blob ids, so content only; names in `ignore` are left out),
 //   - the external packages it resolves to in pnpm-lock.yaml, with their whole dependency closure,
-//   - the same two for every workspace package it reaches through `link:` dependencies,
-//   - the global inputs of .tested/config.json (root files, root dependencies, the config itself),
+//   - the same two for every workspace package it reaches: its own dependencies (dev included),
+//     packages its vitest/vite config aliases to, `links` of the config; then runtime ones only,
+//   - the files of `link:`/`file:` targets that are no workspace package,
+//   - the global inputs: pnpm settings of pnpm-workspace.yaml (not its catalogs), the root
+//     package.json's packageManager/engines/pnpm, and from .tested/config.json the root files,
+//     root dependencies, runtime versions and environment variables it lists, and itself,
 //   - its test command.
 //
-// A package whose hash equals the one recorded in .tested/<package dir> (committed, written by CI
-// only) or in the local cache (node_modules/.cache/tested, written by local runs) is skipped.
+// A package is skipped when its hash is one of those recorded in .tested/<package dir> (committed,
+// written by CI only; a few recent hashes, newest first, so a revert finds its earlier pass) or in
+// the local cache (node_modules/.cache/tested, written by local runs).
 //
 //   node scripts/tested.mjs status            which packages need testing, and why
 //   node scripts/tested.mjs run [--all]       test those packages (locally: caches the passes)
@@ -17,6 +22,8 @@
 //   node scripts/tested.mjs run --record      CI: also write .tested/<dir> for each pass
 //   node scripts/tested.mjs record            CI, after a green run: write the current hashes
 //   node scripts/tested.mjs hash [dir]        print the hashes
+//
+//   --records-unchanged-from=<commit>         fail if .tested/ records differ from that commit's
 //
 // --source=worktree (default outside CI) hashes the working tree, uncommitted changes included;
 // --source=head (default when CI is set) hashes the HEAD commit.
@@ -58,6 +65,8 @@ const config = {
   commands: {},
   links: {},
   skip: [],
+  runtime: [],
+  globalEnv: [],
   ...readJson(join(RECORDS, "config.json"), {}),
 };
 
@@ -113,15 +122,18 @@ function listFiles(tree) {
 }
 
 // --- pnpm-lock.yaml (v9), read line by line: importers and snapshots are all we need.
+// Dependencies stay `{ name, version }` pairs until `resolveKey` turns them into snapshot keys.
 
 function parseLockfile(text) {
   const importers = new Map(); // dir -> [{ name, version, dev }]
-  const snapshots = new Map(); // key -> [key of each dependency]
+  const snapshots = new Map(); // key -> [{ name, version }]
   let section = "";
   let current = null;
   let depName = null;
   let kind = "";
   const unquote = (s) => s.replace(/^'(.*)'$/, "$1");
+  // `name:` or `name: {}` (an entry without dependencies).
+  const entryKey = (body) => unquote(body.replace(/:( \{\})?$/, ""));
   for (const line of text.split("\n")) {
     if (/^\S/.test(line)) {
       section = line.replace(/:.*/, "");
@@ -131,53 +143,80 @@ function parseLockfile(text) {
     const indent = line.search(/\S/);
     if (indent < 0) continue;
     const body = line.trim();
-    if (section === "importers") {
-      if (indent === 2) {
-        current = [];
-        importers.set(unquote(body.slice(0, -1)), current);
-      } else if (indent === 4) {
-        kind = body.replace(/:$/, "");
-      } else if (indent === 6 && current) {
-        depName = unquote(body.replace(/:$/, ""));
-      } else if (
-        indent === 8 &&
-        body.startsWith("version:") &&
-        current &&
-        kind.endsWith("ependencies")
-      ) {
+    if (indent === 2) {
+      current = [];
+      if (section === "importers") importers.set(entryKey(body), current);
+      else if (section === "snapshots") snapshots.set(entryKey(body), current);
+      else current = null;
+    } else if (indent === 4) {
+      kind = body.replace(/:.*$/, "");
+    } else if (!current || !/^(dev|optional)?[dD]ependencies$/.test(kind)) {
+      // transitivePeerDependencies, dependenciesMeta, ...
+    } else if (section === "importers") {
+      if (indent === 6) depName = unquote(body.replace(/:$/, ""));
+      else if (indent === 8 && body.startsWith("version:")) {
         const version = unquote(body.slice(8).trim());
         current.push({ name: depName, version, dev: kind === "devDependencies" });
       }
-    } else if (section === "snapshots") {
-      if (indent === 2) {
-        current = [];
-        snapshots.set(unquote(body.replace(/:( \{\})?$/, "")), current);
-      } else if (indent === 6 && current) {
-        const colon = body.indexOf(": ");
-        current.push(snapshotKey(unquote(body.slice(0, colon)), unquote(body.slice(colon + 2))));
-      }
+    } else if (section === "snapshots" && indent === 6) {
+      const colon = body.indexOf(": ");
+      current.push({
+        name: unquote(body.slice(0, colon)),
+        version: unquote(body.slice(colon + 2)),
+      });
     }
   }
   return { importers, snapshots };
 }
 
-// A dependency `name: version` points at the snapshot `name@version`; an alias or a tarball
-// (`name: other@1.0.0`, `name: https://...`) at the snapshot named by its value.
-function snapshotKey(name, version) {
+// A dependency `name: version` points at the snapshot `name@version` (`file:`, `git+`, tarball
+// and peer-suffixed versions included); an alias (`name: other@1.0.0`) at its value.
+function resolveKey({ name, version }, snapshots) {
   if (version.startsWith("link:")) return version;
-  return /^\d/.test(version) ? `${name}@${version}` : version;
+  const direct = `${name}@${version}`;
+  if (snapshots.has(direct) || /^\d/.test(version)) return direct;
+  return snapshots.has(version) ? version : direct;
 }
 
-function closure(keys, snapshots) {
+function closure(deps, snapshots) {
   const seen = new Set();
-  const stack = [...keys];
+  const stack = deps.map((d) => resolveKey(d, snapshots));
   while (stack.length) {
     const key = stack.pop();
     if (seen.has(key) || key.startsWith("link:")) continue;
     seen.add(key);
-    for (const dep of snapshots.get(key) ?? []) stack.push(dep);
+    for (const dep of snapshots.get(key) ?? []) stack.push(resolveKey(dep, snapshots));
   }
   return [...seen].sort();
+}
+
+// The workspace-relative paths a vitest/vite config names (`"../vcs-store-mem/src"`): its
+// aliases to other packages' sources.
+const TEST_CONFIG = /^(vitest|vite)\.(config|workspace)\.[cm]?[jt]s$/;
+function configPaths(dir, text) {
+  const paths = [];
+  for (const [, path] of text.matchAll(/["'`](\.\.?\/[^"'`\n]*)["'`]/g))
+    paths.push(posix.normalize(posix.join(dir, path)));
+  return paths;
+}
+
+// pnpm-workspace.yaml without what is no setting: its packages and catalogs (the lockfile
+// carries what the catalogs resolve to, package by package).
+function pnpmSettings(text) {
+  const kept = [];
+  let skipping = false;
+  for (const line of text.split("\n")) {
+    if (/^\S/.test(line)) skipping = /^(packages|catalog|catalogs):/.test(line);
+    if (!skipping && line.trim() && !line.trim().startsWith("#")) kept.push(line);
+  }
+  return sha(kept.join("\n"));
+}
+
+// `node`: its major version; `git`: major.minor.
+function runtimeVersion(name) {
+  if (name === "node") return process.versions.node.split(".")[0];
+  if (name === "git") return (/(\d+\.\d+)/.exec(git(["--version"])) ?? [])[1];
+  throw new Error(`unknown runtime in .tested/config.json: ${name}`);
 }
 
 // --- packages and their hashes
@@ -203,17 +242,28 @@ function computeHashes() {
     const runtimeLinks = [];
     const external = [];
     const runtimeExternal = [];
-    for (const { name, version, dev } of deps) {
-      if (version.startsWith("link:")) {
-        const target = posix.normalize(posix.join(dir, version.slice(5)));
-        links.push(target);
-        if (!dev) runtimeLinks.push(target);
+    const localPaths = []; // link:/file: targets, kept if they turn out to be no workspace package
+    for (const dep of deps) {
+      const local = /^(link|file):/.exec(dep.version);
+      // link: is relative to the package, file: to the workspace root.
+      if (local) {
+        const target = dep.version.slice(5);
+        localPaths.push(posix.normalize(local[1] === "link" ? posix.join(dir, target) : target));
+      }
+      if (dep.version.startsWith("link:")) {
+        links.push(localPaths.at(-1));
+        if (!dep.dev) runtimeLinks.push(localPaths.at(-1));
       } else {
-        external.push(snapshotKey(name, version));
-        if (!dev) runtimeExternal.push(snapshotKey(name, version));
+        external.push(dep);
+        if (!dep.dev) runtimeExternal.push(dep);
       }
     }
-    // Workspace packages its tests reach without declaring them (an alias to their sources).
+    // Workspace packages its tests reach without declaring them: aliases of its test config,
+    // and the config's `links`.
+    const testConfigs = [...files.keys()].filter(
+      (f) => f.startsWith(`${dir}/`) && TEST_CONFIG.test(f.slice(dir.length + 1)),
+    );
+    const aliased = testConfigs.flatMap((f) => configPaths(dir, readBlob(f)));
     links.push(...(config.links[dir] ?? config.links[manifest.name] ?? []));
     const pkg = {
       dir,
@@ -223,18 +273,34 @@ function computeHashes() {
       runtimeLinks,
       external,
       runtimeExternal,
+      localPaths,
+      aliased,
     };
     packages.set(dir, pkg);
   }
+  // An aliased path counts when it lies in another workspace package.
+  const dirsByLength = [...packages.keys()].sort((x, y) => y.length - x.length);
+  const packageOf = (path) => dirsByLength.find((d) => path === d || path.startsWith(`${d}/`));
+  for (const pkg of packages.values()) {
+    for (const path of pkg.aliased) {
+      const target = packageOf(path);
+      if (target && target !== pkg.dir) pkg.links.push(target);
+    }
+  }
 
-  const rootDeps = (lock.importers.get(".") ?? [])
-    .filter((d) => config.globalDeps.includes(d.name))
-    .map((d) => snapshotKey(d.name, d.version));
+  const rootDeps = (lock.importers.get(".") ?? []).filter((d) =>
+    config.globalDeps.includes(d.name),
+  );
+  const rootManifest = JSON.parse(readBlob("package.json") || "{}");
   const globalHash = sha(
     [
       `config ${files.get(".tested/config.json") ?? ""}`,
+      `pnpm ${pnpmSettings(readBlob("pnpm-workspace.yaml"))}`,
+      `root ${JSON.stringify([rootManifest.packageManager, rootManifest.engines, rootManifest.pnpm])}`,
       ...config.globalFiles.map((f) => `file ${f} ${files.get(f) ?? "missing"}`),
       ...closure(rootDeps, lock.snapshots).map((k) => `dep ${k}`),
+      ...config.runtime.map((r) => `runtime ${r} ${runtimeVersion(r)}`),
+      ...config.globalEnv.map((v) => `env ${v} ${process.env[v] ?? ""}`),
     ].join("\n"),
   );
 
@@ -249,10 +315,20 @@ function computeHashes() {
     ownFiles.get(owner).push(`${path.slice(owner.length + 1)} ${entry}`);
   }
 
+  // link:/file: targets outside the workspace packages: their files count as the package's.
+  const localFiles = (pkg) =>
+    pkg.localPaths
+      .filter((p) => !packages.has(p))
+      .flatMap((p) =>
+        [...files]
+          .filter(([f]) => f === p || f.startsWith(`${p}/`))
+          .map(([f, e]) => `local ${f} ${e}`),
+      );
   const shallow = (pkg, external) =>
     sha(
       [
         ...ownFiles.get(pkg.dir).sort(),
+        ...localFiles(pkg).sort(),
         ...closure(external, lock.snapshots).map((k) => `dep ${k}`),
       ].join("\n"),
     );
@@ -281,27 +357,63 @@ function computeHashes() {
   return result;
 }
 
+// A record holds the hashes of the last passes, newest first. Two branches recording the same
+// package merge line by line (.gitattributes: merge=union); the next write trims the list.
+const KEPT = 4;
 const recordPath = (base, dir) => join(base, dir);
 const readRecord = (base, dir) => {
   const path = recordPath(base, dir);
-  return existsSync(path) ? readFileSync(path, "utf8").trim() : null;
+  if (!existsSync(path)) return null;
+  return readFileSync(path, "utf8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
 };
+const hasPass = (base, pkg) => readRecord(base, pkg.dir)?.includes(pkg.hash) ?? false;
 function writeRecord(base, dir, hash) {
   const path = recordPath(base, dir);
+  const kept = [hash, ...(readRecord(base, dir) ?? []).filter((h) => h !== hash)].slice(0, KEPT);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${hash}\n`);
+  writeFileSync(path, `${kept.join("\n")}\n`);
 }
+const isSkipped = (pkg) => config.skip.includes(pkg.dir) || config.skip.includes(pkg.name);
 
 function classify(pkg) {
   if (!pkg.command) return "no-tests";
-  if (config.skip.includes(pkg.dir) || config.skip.includes(pkg.name)) return "skipped";
+  if (isSkipped(pkg)) return "skipped";
   if (flag("all")) return "forced";
-  if (readRecord(RECORDS, pkg.dir) === pkg.hash) return "tested";
-  if (readRecord(LOCAL, pkg.dir) === pkg.hash) return "tested-locally";
+  if (hasPass(RECORDS, pkg)) return "tested";
+  if (hasPass(LOCAL, pkg)) return "tested-locally";
   return readRecord(RECORDS, pkg.dir) ? "changed" : "new";
 }
 
 // --- commands
+
+// CI on a pull request from a fork: its records must be the base's, as only CI writes records
+// (a fork could otherwise commit matching hashes and skip its tests).
+const recordsBase = option("records-unchanged-from", "");
+if (recordsBase) {
+  if (!/^[0-9a-f]{7,64}$/.test(recordsBase)) throw new Error(`not a commit id: ${recordsBase}`);
+  try {
+    git(["cat-file", "-e", `${recordsBase}^{commit}`]);
+  } catch {
+    git(["fetch", "-q", "--depth=1", "origin", recordsBase]);
+  }
+  const changed = git([
+    "diff",
+    "--name-only",
+    recordsBase,
+    "HEAD",
+    "--",
+    ".tested",
+    ":!.tested/config.json",
+    ":!.tested/README.md",
+  ]).trim();
+  if (changed) {
+    console.error(`a pull request from a fork may not change test records:\n${changed}`);
+    process.exit(1);
+  }
+}
 
 const hashes = computeHashes();
 
@@ -317,11 +429,20 @@ if (command === "hash") {
 } else if (command === "record") {
   let written = 0;
   for (const pkg of hashes.values()) {
-    if (!pkg.command || readRecord(RECORDS, pkg.dir) === pkg.hash) continue;
+    if (!pkg.command || isSkipped(pkg) || hasPass(RECORDS, pkg)) continue;
     writeRecord(RECORDS, pkg.dir, pkg.hash);
     written++;
   }
-  console.log(`recorded ${written} package(s)`);
+  // Records of packages that are gone (renamed, removed, no tests any more).
+  let pruned = 0;
+  const testable = new Set([...hashes.values()].filter((p) => p.command).map((p) => p.dir));
+  for (const file of git(["ls-files", "--", ".tested"]).split("\n").filter(Boolean)) {
+    const dir = file.slice(".tested/".length);
+    if (dir === "config.json" || dir === "README.md" || testable.has(dir)) continue;
+    rmSync(join(root, file), { force: true });
+    pruned++;
+  }
+  console.log(`recorded ${written} package(s), pruned ${pruned}`);
 } else if (command === "run") {
   const todo = [...hashes.values()].filter((pkg) =>
     ["changed", "new", "forced"].includes(classify(pkg)),
