@@ -1,5 +1,6 @@
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { DEFAULT_BIG_FILE_THRESHOLD, FileMode, isSymbolicRef } from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
@@ -12,6 +13,7 @@ import {
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import { InvalidArgumentError } from "../errors/command-errors.js";
+import { GitApiError } from "../errors/git-api-error.js";
 import {
   InvalidMergeHeadsError,
   MergeFailureReason,
@@ -20,6 +22,7 @@ import {
 } from "../errors/merge-errors.js";
 import { NoHeadError, NotACommitError, RefNotFoundError } from "../errors/ref-errors.js";
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import {
   ContentMergeStrategy,
   FastForwardMode,
@@ -27,6 +30,7 @@ import {
   MergeStatus,
   MergeStrategy,
 } from "../results/merge-result.js";
+import { CommitCommand, type CommitResult } from "./commit-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { configBool, conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
@@ -65,6 +69,7 @@ import {
 } from "./sequencer-support.js";
 import { readSparseCheckoutPatterns, sparseCheckoutConfig } from "./sparse-checkout-support.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
+import { readDiffSubmoduleConfig } from "./submodule-summary.js";
 import {
   type CheckedEntry,
   pruneEmptyParents,
@@ -134,6 +139,18 @@ export class MergeCommand extends GitCommand<MergeResult> {
   private commit = true;
   private message?: string;
   private cleanupMode?: CleanupMode;
+  private inProcess = false;
+
+  /**
+   * A merge another command makes in process (a rebase's `merge`), which reads no `git
+   * merge` configuration of its own (`git_merge_config`).
+   *
+   * @internal
+   */
+  setInProcess(inProcess: boolean): this {
+    this.inProcess = inProcess;
+    return this;
+  }
   private bigFileThreshold = DEFAULT_BIG_FILE_THRESHOLD;
   private operation = MergeOperation.MERGE;
   private author?: PersonIdent;
@@ -347,6 +364,9 @@ export class MergeCommand extends GitCommand<MergeResult> {
   async call(): Promise<MergeResult> {
     this.checkCallable();
     this.setCallable(false);
+    // git_merge_config ends in git_diff_ui_config: a diff.submodule without a value dies
+    // (not for the merges a rebase makes in process)
+    if (!this.inProcess) readDiffSubmoduleConfig(this.workingCopy);
     // the index as it is now, before the worktree or a ref is touched: one another writer
     // replaced is read again (git reads the index at its start), unless this instance holds
     // unwritten edits (refused)
@@ -1040,6 +1060,36 @@ export class MergeCommand extends GitCommand<MergeResult> {
     const { unmerged } = await readIndex(this.staging);
     if (unmerged.length > 0) {
       return failed(UNMERGED_FILES_MESSAGE("Committing"), unmerged);
+    }
+    if (this.message === undefined) {
+      // `git merge --continue` runs `git commit`: its editor gets the whole template
+      // (MERGE_MSG, the help and the status, written to COMMIT_EDITMSG), taken as the editor
+      // leaves it
+      const commit = new CommitCommand(this.workingCopy);
+      if (this.author) commit.setAuthorIdent(this.author);
+      if (this.committer) commit.setCommitterIdent(this.committer);
+      if (this.cleanupMode) commit.setCleanupMode(this.cleanupMode);
+      // the status in the template as `commit.status` says (git's editor gets it)
+      const status = RemoteConfigStore.from(this.workingCopy).value("commit.status");
+      commit.setIncludeStatus(status === undefined ? true : (parseGitBool(status) ?? true));
+      // the autostash applied here, with its output (the commit would apply it silently)
+      const autostash = await state.read("MERGE_AUTOSTASH");
+      if (autostash !== undefined) await state.remove("MERGE_AUTOSTASH");
+      let made: CommitResult;
+      try {
+        made = await commit.call();
+      } catch (error) {
+        if (autostash !== undefined) await state.write("MERGE_AUTOSTASH", autostash);
+        if (error instanceof GitApiError) return failed(error.message);
+        throw error;
+      }
+      if (autostash !== undefined) await state.write("MERGE_AUTOSTASH", autostash);
+      return {
+        status: MergeStatus.MERGED,
+        newHead: made.id,
+        mergedCommits: made.parents,
+        output: await this.popAutostash(state, this.worktreeAccess),
+      };
     }
     const headId = await this.resolveHead();
     const head = await this.refsStore.get("HEAD");

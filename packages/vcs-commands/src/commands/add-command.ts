@@ -44,6 +44,7 @@ import {
   pathspecErrors,
   pathspecItemPath,
 } from "./pathspec.js";
+import { PathspecAttributes } from "./pathspec-attributes.js";
 import { sparsePathAdvice } from "./sparse-checkout-support.js";
 /**
  * Result of AddCommand execution.
@@ -105,6 +106,9 @@ export class AddCommand extends GitCommand<AddResult> {
   private chmod: string | undefined;
   private refreshOnly = false;
   private compatibility: PathspecOriginStyle = "2.56";
+  private attributes?: PathspecAttributes;
+  private filesToCache = false;
+  private pathspecItems: PathspecItem[] = [];
   /** The sparse checkout's patterns, read at the start (undefined: not a sparse checkout) */
   private sparsePatterns?: SparseCheckoutPatterns;
   private verbose = false;
@@ -346,6 +350,20 @@ export class AddCommand extends GitCommand<AddResult> {
   }
 
   /**
+   * Stage as git's `add_files_to_cache` alone (`commit -i <paths>`, with {@link setUpdate}):
+   * an element naming no file is not refused as `git add` refuses it ("did not match any
+   * files"); one matching no index entry fails with "error: pathspec '<element>' did not
+   * match any file(s) known to git".
+   *
+   * @internal
+   */
+  setFilesToCache(filesToCache: boolean): this {
+    this.checkCallable();
+    this.filesToCache = filesToCache;
+    return this;
+  }
+
+  /**
    * The git version whose messages are reproduced where versions differ (default 2.56):
    * the advice's last hint, `Disable this message with "git config set advice.<name>
    * false"` in 2.5x, `"git config advice.<name> false"` in 2.43.
@@ -412,12 +430,13 @@ export class AddCommand extends GitCommand<AddResult> {
     // git's require_pathspec ("Nothing specified, nothing added."), a renormalisation
     // included: only `-u` and `-A` go without one
     if (this.filepatterns.length === 0 && !(this.update || this.all === true)) {
-      throw new NoFilepatternError("Nothing specified, nothing added.");
+      // (git prints it with a hint and exits 0)
+      throw new NoFilepatternError("Nothing specified, nothing added.").withExitCode(0);
     }
 
     let items: PathspecItem[];
     try {
-      items = parsePathspec(this.filepatterns);
+      items = parsePathspec(this.filepatterns, { attr: true });
     } catch (error) {
       throw new InvalidArgumentError(
         "filepattern",
@@ -441,6 +460,10 @@ export class AddCommand extends GitCommand<AddResult> {
       );
     }
     await checkSymlinkLeadingPaths(worktree, items, originals);
+    // `:(attr:...)`: the attributes of the index's paths (the worktree's read as it is walked)
+    this.pathspecItems = items;
+    this.attributes = PathspecAttributes.forWorktree(items, worktree);
+    if (this.attributes) await this.attributes.load((await this.indexGroups()).map((g) => g.path));
 
     // one worktree batch: the ignore rules, the configuration and the attributes files are
     // read once for all the files
@@ -540,7 +563,8 @@ export class AddCommand extends GitCommand<AddResult> {
     //    entries outside the sparse checkout (git's advice, the command failing in the end)
     const sparse: string[] = [];
     let skipSeen: number[] | undefined;
-    for (let i = 0; i < items.length; i++) {
+    // (not for `commit -i`, which calls add_files_to_cache alone)
+    for (let i = 0; i < items.length && !this.filesToCache; i++) {
       const item = items[i] as PathspecItem;
       if (item.exclude || seen[i]) continue;
       skipSeen ??= skipWorktreeSeen(items, index, (path) => this.outsideSparse(path));
@@ -691,11 +715,12 @@ export class AddCommand extends GitCommand<AddResult> {
     if (this.update && !ignoreErrors) {
       const problems = pathspecErrors(originals, psMatched);
       if (problems.length > 0) {
+        // report_path_error, then exit(128) (add_files_to_cache's callers)
         throw new InvalidArgumentError(
           "filepattern",
           originals.filter((_, i) => !psMatched[i]),
           problems.join("\n"),
-        );
+        ).withExitCode(128);
       }
     }
 
@@ -1046,6 +1071,9 @@ export class AddCommand extends GitCommand<AddResult> {
     })) {
       // ...but git never adds a `.git` (treat_path)
       if (entry.path.includes(".git") && GIT_COMPONENT.test(entry.path)) continue;
+      if (this.attributes && !(await this.reachableByAttributes(entry.path, trackedDirs))) {
+        continue;
+      }
       const parent = parentOf(entry.path);
       const underIgnored = parent !== "" && ignoredDirs.has(parent);
       if (!this.force && (entry.isIgnored || underIgnored)) {
@@ -1085,6 +1113,24 @@ export class AddCommand extends GitCommand<AddResult> {
     untracked.sort((a, b) => compareGitPaths(key(a), key(b)));
     ignored.sort(compareGitPaths);
     return { untracked, skipped, ignored, warnings };
+  }
+
+  /**
+   * With `:(attr:...)` elements: the attributes of a walked path loaded, and whether dir.c's
+   * walk reaches it: each untracked directory above it (one holding no index entry) must
+   * match the pathspec as a leading path by its own name and attributes (`treat_directory`).
+   */
+  private async reachableByAttributes(path: string, trackedDirs: Set<string>): Promise<boolean> {
+    const attributes = this.attributes as PathspecAttributes;
+    const dirs: string[] = [];
+    for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
+      const dir = path.slice(0, at);
+      if (!trackedDirs.has(dir)) dirs.push(`${dir}/`);
+    }
+    await attributes.load([path, `${path}/`, ...dirs]);
+    return dirs.every(
+      (dir) => matchPathspec(this.pathspecItems, dir, DO_MATCH_LEADING_PATHSPEC) > 0,
+    );
   }
 
   /**

@@ -1145,14 +1145,16 @@ describeGit("clean: review repros A-E (native twins)", () => {
     }
   }
 
-  it("E: paths above the top and attr magic are refused, as git refuses them", async () => {
+  it("E: paths above the top and bad magic are refused, as git refuses them", async () => {
     const r = join(root, "r");
     mkdirSync(r, { recursive: true });
     git(r, "init", "-q", "-b", "main");
     commitAll(r);
     put(join(r, "a.txt"), "a\n");
     expect(() => git(r, "clean", "-f", "-n", "--", "../x")).toThrow();
-    for (const paths of [["../x"], [":(attr:foo)a.txt"], [":(bogus)a.txt"]]) {
+    // (attr magic is no refusal: git clean takes it, PATHSPEC_ATTR is not in its mask)
+    git(r, "clean", "-f", "-n", "--", ":(attr:foo)a.txt");
+    for (const paths of [["../x"], [":(bogus)a.txt"]]) {
       const L = parseFlags("-f").L;
       L.paths = paths;
       await expect(ours(r, L, true)).rejects.toThrow();

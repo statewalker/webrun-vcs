@@ -45,22 +45,20 @@ import {
   cleanupWith,
   commentPrefixOf,
   commitCleanupMode,
-  commitMessageFromOption,
   completeLine,
   editorCleanupMode,
-  preparedMessageCleanup,
   stripspace,
 } from "./message-cleanup.js";
 import { copyNotesForAmend } from "./notes-support.js";
 import {
   DO_MATCH_DIRECTORY,
-  DO_MATCH_LEADING_PATHSPEC,
-  matchPathspec,
   matchPathspecSeen,
   type PathspecItem,
   parsePathspec,
   pathspecErrors,
+  pathspecItemMayMatch,
 } from "./pathspec.js";
+import { PathspecAttributes } from "./pathspec-attributes.js";
 import { type CommitReflogKind, reflogMessages, updateHead } from "./reflog-messages.js";
 import { applyAutostash } from "./sequencer-support.js";
 import {
@@ -71,6 +69,7 @@ import {
   type UntrackedFilesMode,
 } from "./status-command.js";
 import { type CommitWhence, StatusPrinter } from "./status-format.js";
+import { readDiffSubmoduleConfig } from "./submodule-summary.js";
 
 /**
  * Result of a commit operation.
@@ -144,6 +143,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private parents: ObjectId[] = [];
   private onlyPaths: string[] = [];
   private all = false;
+  private include = false;
+  private includePaths: string[] = [];
   private worktreeIterator: Worktree | undefined;
   private cleanupMode?: CleanupMode;
   private allowEmptyMessage = false;
@@ -354,10 +355,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
    */
   setOnly(...paths: string[]): this {
     this.checkCallable();
-    // JGit: --all and --only are mutually exclusive
-    if (this.all && paths.length > 0) {
-      throw new IncompatibleOptionsError(["--only", "--all"]);
-    }
+    // git's parse_and_validate_options: paths and -a do not go together
+    if (this.all && paths.length > 0) throw pathsWithAllError(paths);
     this.onlyPaths = paths;
     return this;
   }
@@ -380,11 +379,36 @@ export class CommitCommand extends GitCommand<CommitResult> {
    */
   setAll(all: boolean): this {
     this.checkCallable();
-    // JGit: --all and --only are mutually exclusive
-    if (all && this.onlyPaths.length > 0) {
-      throw new IncompatibleOptionsError(["--all", "--only"]);
-    }
+    // git's parse_and_validate_options: paths and -a do not go together
+    if (all && this.onlyPaths.length > 0) throw pathsWithAllError(this.onlyPaths);
     this.all = all;
+    return this;
+  }
+
+  /**
+   * Commit the index with the tracked files `paths` names staged first (`git commit -i
+   * <paths>` / `--include`, git's `prepare_index` "non partial, non as-is commit"): the index
+   * lock is taken, the tracked paths the pathspec matches are staged from the worktree as
+   * `git add -u <paths>` stages them (`add_files_to_cache`; untracked files are not added),
+   * an element that matches no index entry fails with git's "error: pathspec '<path>' did
+   * not match any file(s) known to git" (git 2.5x; 2.43 commits what is staged), and the
+   * whole index, written into the lock, is committed; the lock is renamed over the index
+   * once HEAD has moved, or removed on failure (the index stays as it was).
+   *
+   * As git: refused with {@link setOnly} paths ("options '-i/--include' and '-o/--only'
+   * cannot be used together"), with {@link setAll} ("options '-i/--include' and
+   * '-a/--all' cannot be used together"), and without paths ("No paths with
+   * --include/--only does not make sense."), when the commit runs.
+   *
+   * @example
+   * ```typescript
+   * await git.commit().setInclude("src/a.ts").setMessage("Fix a").call();
+   * ```
+   */
+  setInclude(...paths: string[]): this {
+    this.checkCallable();
+    this.include = true;
+    this.includePaths = paths;
     return this;
   }
 
@@ -517,6 +541,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
     this.checkCallable();
     this.setCallable(false);
     readShowUntrackedFiles(this.workingCopy);
+    // ... and git_diff_ui_config: a diff.submodule without a value dies
+    readDiffSubmoduleConfig(this.workingCopy);
     await this.readCurrentIndex();
     const state = new OperationState(this.workingCopy.checkout, this.refsStore);
     const mergeHeads = await this.mergeHeads(state);
@@ -575,16 +601,19 @@ export class CommitCommand extends GitCommand<CommitResult> {
    * (`commit.status`) the commented help, identities and status of the template, the
    * editor run over it, and what it left cleaned up as the commit message.
    */
-  private async editMessage(ctx: {
-    state: OperationState;
-    mergeHeads: ObjectId[];
-    pickHead: ObjectId | undefined;
-    partialTree: ObjectId | undefined;
-    previousCommit: Commit | undefined;
-    author: PersonIdent;
-    committer: PersonIdent;
-    authorKept: boolean;
-  }): Promise<{ message: string; cleanup: CleanupMode; untouched: boolean }> {
+  private async editMessage(
+    ctx: {
+      state: OperationState;
+      mergeHeads: ObjectId[];
+      pickHead: ObjectId | undefined;
+      partialTree: ObjectId | undefined;
+      previousCommit: Commit | undefined;
+      author: PersonIdent;
+      committer: PersonIdent;
+      authorKept: boolean;
+    },
+    editor: CommitEditor,
+  ): Promise<{ message: string; cleanup: CleanupMode; untouched: boolean }> {
     const { state } = ctx;
     const config = RemoteConfigStore.from(this.workingCopy);
     const mode = editorCleanupMode(this.workingCopy, this.cleanupMode);
@@ -624,7 +653,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
     if (mode !== CleanupMode.VERBATIM && !fromTemplate) sb = stripspace(sb);
     // core.commentChar=auto: a character the message does not start a line with
     const comment = commentPrefixOf(this.workingCopy, sb);
-    const includeStatus = this.includeStatus ?? parseBool(config.value("commit.status"), true);
+    // (a prepared message taken without an editor: as `--no-status`, unless asked for)
+    const includeStatus =
+      this.includeStatus ??
+      (this.usesEditor() ? parseBool(config.value("commit.status"), true) : false);
     const verbose = this.verboseLevel();
     let template = sb;
     let committable: boolean;
@@ -704,7 +736,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     if (!committable && whence !== "merge" && !this.allowEmpty && !(this.amend && isMerge)) {
       throw new EmptyCommitError();
     }
-    const edited = await (this.editor as CommitEditor)("COMMIT_EDITMSG", template);
+    const edited = await editor("COMMIT_EDITMSG", template);
     let text: string;
     if (typeof edited === "string") {
       await state.write("COMMIT_EDITMSG", edited);
@@ -887,9 +919,12 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // git commit reads the status configuration first (git_status_config): a bad
     // status.showUntrackedFiles fails it before anything is done
     readShowUntrackedFiles(this.workingCopy);
+    // ... and git_diff_ui_config: a diff.submodule without a value dies
+    readDiffSubmoduleConfig(this.workingCopy);
     // the index as it is now: one another writer replaced is read again (git reads the
     // index at its start), unless this instance holds unwritten edits (refused)
     await this.readCurrentIndex();
+    if (this.include) return this.commitIncluded();
     const partial = this.onlyPaths.length > 0;
     if (!this.all) return this.commitWith(partial, undefined);
     // `-a` (git's COMMIT_NORMAL): the index lock held from before the tracked changes are
@@ -899,6 +934,41 @@ export class CommitCommand extends GitCommand<CommitResult> {
       // Handle --all flag: auto-stage modified tracked files
       await this.stageTrackedChanges();
       return await this.commitWith(partial, index);
+    } catch (error) {
+      await index.release();
+      throw error;
+    }
+  }
+
+  /**
+   * `-i <paths>` (git's prepare_index for `also`): the option checks of
+   * parse_and_validate_options and prepare_index, then the index lock held from before the
+   * tracked paths are staged until HEAD has moved.
+   */
+  private async commitIncluded(): Promise<CommitResult> {
+    if (this.onlyPaths.length > 0) {
+      throw new IncompatibleOptionsError(
+        ["-i/--include", "-o/--only"],
+        "fatal: options '-i/--include' and '-o/--only' cannot be used together",
+      );
+    }
+    if (this.all) {
+      throw new IncompatibleOptionsError(
+        ["-i/--include", "-a/--all"],
+        "fatal: options '-i/--include' and '-a/--all' cannot be used together",
+      );
+    }
+    if (this.includePaths.length === 0) {
+      throw new InvalidArgumentError(
+        "include",
+        [],
+        "fatal: No paths with --include/--only does not make sense.",
+      );
+    }
+    const index = await this.holdIndex();
+    try {
+      await this.stageTrackedChanges(this.includePaths);
+      return await this.commitWith(false, index);
     } catch (error) {
       await index.release();
       throw error;
@@ -976,109 +1046,23 @@ export class CommitCommand extends GitCommand<CommitResult> {
     pickHead: ObjectId | undefined,
     index: HeldIndex | undefined,
   ): Promise<CommitResult> {
-    // an editor edits the message (git's use_editor): no message given, or -e
-    const editing = this.usesEditor();
-    let message = this.message;
-    const given = message !== undefined;
-    if (!editing && message === undefined && !this.amend) {
-      const prepared = (await state.read("MERGE_MSG")) ?? (await state.read("SQUASH_MSG"));
-      // as git commit leaves it once the editor accepts it: comments stripped, or as
-      // setCleanupMode / commit.cleanup say, with core.commentChar's character
-      const cleaned =
-        prepared !== undefined
-          ? preparedMessageCleanup(this.workingCopy, prepared, this.cleanupMode)
-          : "";
-      if (cleaned) message = cleaned;
-    }
-
-    // Check message
-    if (!editing && message === undefined && !this.amend) {
+    // an editor edits the message (git's use_editor): no message given, or -e; without an
+    // editor set, a merge's or a pick's prepared message (MERGE_MSG, SQUASH_MSG) is taken as
+    // `git commit --no-status` takes it once the editor leaves it as it is (the template
+    // written to COMMIT_EDITMSG; the status too with setIncludeStatus(true)), unless
+    // setEdit(false) (`--no-edit`)
+    const mergeMsgPresent =
+      (await state.read("MERGE_MSG")) !== undefined ||
+      (await state.read("SQUASH_MSG")) !== undefined;
+    const editorLike =
+      this.usesEditor() ||
+      (this.message === undefined && !this.amend && this.edit !== false && mergeMsgPresent);
+    const editor: CommitEditor = this.usesEditor()
+      ? (this.editor as CommitEditor)
+      : async () => undefined;
+    const message = this.message;
+    if (!editorLike && message === undefined && !this.amend && !mergeMsgPresent) {
       throw new NoMessageError();
-    }
-
-    // Get message (from amend or new): a message given is git's `-m` (its line ended, then
-    // cleaned up); one prepared by a merge or pick was cleaned up above
-    let cleanup: CleanupMode = commitCleanupMode(this.workingCopy, this.cleanupMode);
-    let finalMessage = editing
-      ? undefined
-      : given && message !== undefined
-        ? commitMessageFromOption(message, this.cleanupMode, this.workingCopy, true)
-        : message;
-    let previousCommit: Commit | undefined;
-    let amendedId: ObjectId | undefined;
-
-    if (this.amend) {
-      const headId = await this.resolveHead();
-      amendedId = headId;
-      previousCommit = await this.commits.load(headId);
-      if (!previousCommit) {
-        throw new NoHeadError("Cannot amend: HEAD commit not found");
-      }
-      if (finalMessage === undefined && !editing) {
-        // `--amend --no-edit`: the amended commit's message, cleaned up as any other
-        finalMessage = cleanupWith(this.workingCopy, previousCommit.message, cleanup, true);
-      }
-    }
-
-    // The author (git's determine_author_info): the one given; else an amended commit's or
-    // a concluded cherry-pick's author (its date too; `--author` replaces only the name and
-    // email), unless --reset-author; else resolved as git does (GIT_AUTHOR_*, author.*,
-    // user.*, GIT_AUTHOR_DATE or now)
-    let author = this.author;
-    if (!author) {
-      const kept = this.resetAuthor
-        ? undefined
-        : this.amend && previousCommit
-          ? previousCommit.author
-          : pickHead
-            ? (await this.commits.load(pickHead))?.author
-            : undefined;
-      if (kept) {
-        author = this.authorName
-          ? {
-              ...kept,
-              name: withoutCrud(this.authorName.name),
-              email: withoutCrud(this.authorName.email),
-            }
-          : kept;
-      } else if (this.authorName) author = this.datedIdent("author", this.authorName);
-      else author = this.resolveAuthor(this.committer ?? this.committerName);
-    }
-    // the committer: always resolved (GIT_COMMITTER_*, committer.*, user.*), unless given
-    const committer =
-      this.committer ??
-      (this.committerName
-        ? this.datedIdent("committer", this.committerName)
-        : this.resolveCommitter(author));
-
-    let untouched = false;
-    if (editing) {
-      const edited = await this.editMessage({
-        state,
-        mergeHeads,
-        pickHead,
-        partialTree,
-        previousCommit,
-        author,
-        committer,
-        authorKept: !this.author && !this.resetAuthor && (!!previousCommit || !!pickHead),
-      });
-      finalMessage = edited.message;
-      cleanup = edited.cleanup;
-      untouched = edited.untouched;
-    }
-
-    // git's message_is_empty: nothing but whitespace and sign-offs (any text, verbatim)
-    if (
-      finalMessage === undefined ||
-      (!this.allowEmptyMessage &&
-        (cleanup !== CleanupMode.VERBATIM || finalMessage.length === 0) &&
-        isEmptyMessage(finalMessage))
-    ) {
-      throw new NoMessageError("Aborting commit due to empty commit message.");
-    }
-    if (untouched && !this.allowEmptyMessage) {
-      throw new NoMessageError("Aborting commit; you did not edit the message.");
     }
 
     // Determine parents
@@ -1126,6 +1110,114 @@ export class CommitCommand extends GitCommand<CommitResult> {
       // a stored subtree no edit touched stays the one stored)
       treeId = await writeIndexAsTree(this.staging, this.trees);
     }
+    let previousCommit: Commit | undefined;
+    let amendedId: ObjectId | undefined;
+
+    if (this.amend) {
+      const headId = await this.resolveHead();
+      amendedId = headId;
+      previousCommit = await this.commits.load(headId);
+      if (!previousCommit) {
+        throw new NoHeadError("Cannot amend: HEAD commit not found");
+      }
+    }
+
+    // The author (git's determine_author_info): the one given; else an amended commit's or
+    // a concluded cherry-pick's author (its date too; `--author` replaces only the name and
+    // email), unless --reset-author; else resolved as git does (GIT_AUTHOR_*, author.*,
+    // user.*, GIT_AUTHOR_DATE or now)
+    let author = this.author;
+    if (!author) {
+      const kept = this.resetAuthor
+        ? undefined
+        : this.amend && previousCommit
+          ? previousCommit.author
+          : pickHead
+            ? (await this.commits.load(pickHead))?.author
+            : undefined;
+      if (kept) {
+        author = this.authorName
+          ? {
+              ...kept,
+              name: withoutCrud(this.authorName.name),
+              email: withoutCrud(this.authorName.email),
+            }
+          : kept;
+      } else if (this.authorName) author = this.datedIdent("author", this.authorName);
+      else author = this.resolveAuthor(this.committer ?? this.committerName);
+    }
+    // the committer: always resolved (GIT_COMMITTER_*, committer.*, user.*), unless given
+    const committer =
+      this.committer ??
+      (this.committerName
+        ? this.datedIdent("committer", this.committerName)
+        : this.resolveCommitter(author));
+
+    let finalMessage: string;
+    let cleanup: CleanupMode;
+    let untouched = false;
+    if (editorLike) {
+      const edited = await this.editMessage(
+        {
+          state,
+          mergeHeads,
+          pickHead,
+          partialTree,
+          previousCommit,
+          author,
+          committer,
+          authorKept: !this.author && !this.resetAuthor && (!!previousCommit || !!pickHead),
+        },
+        editor,
+      );
+      finalMessage = edited.message;
+      cleanup = edited.cleanup;
+      untouched = edited.untouched;
+    } else {
+      // prepare_to_commit without an editor: the message so far (`-m`, the amended commit's,
+      // else MERGE_MSG after SQUASH_MSG, or SQUASH_MSG) with its whitespace cleaned up
+      // unless verbatim (`get_cleanup_mode` without an editor: default and scissors are
+      // whitespace) is written to COMMIT_EDITMSG; then a commit with nothing to commit is
+      // refused; then the file's text is cleaned up (cleanup_message) and checked
+      cleanup = commitCleanupMode(this.workingCopy, this.cleanupMode);
+      let sb: string;
+      if (message !== undefined) sb = completeLine(message);
+      else if (previousCommit) sb = previousCommit.message.replace(/^(?:[ \t\r]*\n)+/, "");
+      else {
+        const mergeMsg = await state.read("MERGE_MSG");
+        const squashMsg = await state.read("SQUASH_MSG");
+        sb = mergeMsg !== undefined ? `${squashMsg ?? ""}${mergeMsg}` : (squashMsg ?? "");
+      }
+      if (cleanup !== CleanupMode.VERBATIM) sb = stripspace(sb);
+      await state.write("COMMIT_EDITMSG", sb);
+      await this.refuseNothingToCommit(treeId, parents, mergeHeads, previousCommit);
+      let text = sb;
+      // cleanup_message: cut at the scissors line with -v (commit.verbose)
+      if (this.verboseLevel() > 0) {
+        const comment = commentPrefixOf(this.workingCopy, sb);
+        const cut = `${comment} ------------------------ >8 ------------------------\n`;
+        if (text.startsWith(cut)) text = "";
+        else {
+          const at = text.indexOf(`\n${cut}`);
+          if (at >= 0) text = text.slice(0, at + 1);
+        }
+      }
+      finalMessage = cleanupWith(this.workingCopy, text, cleanup, true);
+    }
+
+    // git's message_is_empty: nothing but whitespace and sign-offs (any text, verbatim);
+    // then template_untouched (only an editor's message: -m, -F and -C drop the template)
+    if (
+      !this.allowEmptyMessage &&
+      (cleanup !== CleanupMode.VERBATIM || finalMessage.length === 0) &&
+      isEmptyMessage(finalMessage)
+    ) {
+      throw new NoMessageError("Aborting commit due to empty commit message.");
+    }
+    if (untouched && !this.allowEmptyMessage) {
+      throw new NoMessageError("Aborting commit; you did not edit the message.");
+    }
+
     return this.finishCommit(treeId, parents, mergeHeads, pickHead, {
       author,
       committer,
@@ -1134,6 +1226,23 @@ export class CommitCommand extends GitCommand<CommitResult> {
       amendedId,
       commitIndex: index ? () => index.commit() : undefined,
     });
+  }
+
+  /**
+   * prepare_to_commit's refusal of a commit with nothing to commit: the tree is its first
+   * parent's (HEAD's, HEAD^1's when amending), unless a merge is concluded, empty commits are
+   * allowed, or a merge commit is amended.
+   */
+  private async refuseNothingToCommit(
+    treeId: ObjectId,
+    parents: ObjectId[],
+    mergeHeads: ObjectId[],
+    previousCommit: Commit | undefined,
+  ): Promise<void> {
+    if (this.allowEmpty || parents.length === 0 || mergeHeads.length > 0) return;
+    if (this.amend && (previousCommit?.parents.length ?? 0) > 1) return;
+    const parentCommit = await this.commits.load(parents[0] as ObjectId);
+    if (parentCommit && parentCommit.tree === treeId) throw new EmptyCommitError();
   }
 
   /** The commit of `treeId` made, HEAD moved to it, and what was in progress ended. */
@@ -1153,13 +1262,6 @@ export class CommitCommand extends GitCommand<CommitResult> {
     },
   ): Promise<CommitResult> {
     const { author, committer, finalMessage, state, amendedId } = info;
-    // Check for empty commit (a merge may record HEAD's tree)
-    if (!this.allowEmpty && parents.length > 0 && mergeHeads.length === 0) {
-      const parentCommit = await this.commits.load(parents[0]);
-      if (parentCommit && parentCommit.tree === treeId) {
-        throw new EmptyCommitError();
-      }
-    }
 
     // Create commit
     const commit: Commit = {
@@ -1370,7 +1472,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
 
     let items: PathspecItem[];
     try {
-      items = parsePathspec(this.onlyPaths);
+      items = parsePathspec(this.onlyPaths, { attr: true });
     } catch (error) {
       throw new InvalidArgumentError("only", this.onlyPaths, `fatal: ${(error as Error).message}`);
     }
@@ -1397,8 +1499,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       if (!head) throw new RefNotFoundError(headId, "HEAD commit not found");
       // only the directories a positive element can match something in are read
       const positive = items.filter((i) => !i.exclude);
-      const mayMatch = (dir: string) =>
-        matchPathspec(positive, dir, DO_MATCH_DIRECTORY | DO_MATCH_LEADING_PATHSPEC) > 0;
+      const mayMatch = (dir: string) => positive.some((item) => pathspecItemMayMatch(item, dir));
       const files: Array<{ path: string; mode: number }> = [];
       await this.collectTreeFiles(head.tree, "", mayMatch, files);
       for (const file of files) {
@@ -1406,6 +1507,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
       }
       listed.sort((a, b) => compareGitPaths(a.path, b.path) || a.key - b.key);
     }
+    // `:(attr:...)`: the attributes of the listed paths (match_pathspec_attrs)
+    const attributes = PathspecAttributes.forWorktree(items, this.getWorktreeIterator());
+    await attributes?.load(listed.map((entry) => entry.path));
     const seen = items.map(() => 0);
     const paths = new Map<string, boolean>();
     for (const entry of listed) {
@@ -1415,6 +1519,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     }
     const errors = pathspecErrors(originals, seen);
     if (errors.length > 0) {
+      // report_path_error: list_paths fails, prepare_index exits 1
       throw new InvalidArgumentError(
         "only",
         originals.filter((_, i) => !seen[i]),
@@ -1582,7 +1687,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
    * Uses AddCommand with setUpdate(true) to stage changes,
    * equivalent to `git add -u .` which JGit does for --all.
    */
-  private async stageTrackedChanges(): Promise<void> {
+  private async stageTrackedChanges(paths: string[] = []): Promise<void> {
     // Get working tree iterator
     const worktree = this.getWorktreeIterator();
     if (!worktree) {
@@ -1597,6 +1702,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // git's add_files_to_cache without a pathspec (`commit -a`): no element to report
     const addCommand = new AddCommand(this._workingCopy);
     addCommand.setUpdate(true);
+    // `-i <paths>`: the tracked paths they match (report_path_error: an element matching no
+    // index entry fails, exit status 128)
+    for (const path of paths) addCommand.addFilepattern(path);
+    if (paths.length > 0) addCommand.setFilesToCache(true);
     // into the index lock the commit holds, once the commit's tree is made
     addCommand.setWriteIndex(false);
     addCommand.setWorktreeStore(worktree);
@@ -1614,6 +1723,14 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // Get worktree from WorkingCopy
     return this.worktreeAccess;
   }
+}
+
+/** git's "paths '<first> ...' with -a does not make sense". */
+function pathsWithAllError(paths: readonly string[]): IncompatibleOptionsError {
+  return new IncompatibleOptionsError(
+    ["--all", "--only"],
+    `fatal: paths '${paths[0]} ...' with -a does not make sense`,
+  );
 }
 
 /** A partial commit's false index: HEAD's tree with the named paths set or removed. */

@@ -34,6 +34,7 @@ import {
   treeDelta,
   writeIndexAsTree,
 } from "./merge-support.js";
+import { stripspace } from "./message-cleanup.js";
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeStoredTrees, storedBase } from "./ort-recursive.js";
 import { reflogLine, reflogMessages, updateHead } from "./reflog-messages.js";
@@ -383,15 +384,20 @@ export class PickSequencer {
       const commit = await this.deps.commits.load(stopped);
       if (!commit) throw new RefNotFoundError(stopped, "Commit being picked not found");
       const treeId = await this.deps.staging.writeTree(this.deps.trees);
+      const committer = this.committer();
+      const fallback = this.messageFor(action, stopped, commit, commit.parents[0]);
+      const prepared = (await state.read("MERGE_MSG")) ?? fallback;
+      // continue_single_pick runs `git commit --no-edit --cleanup=strip`: its prepare_to_commit
+      // writes MERGE_MSG with its whitespace cleaned up (comments kept) to COMMIT_EDITMSG,
+      // before a commit with nothing to commit is refused
+      await state.write("COMMIT_EDITMSG", stripspace(prepared));
       const headCommit = await this.deps.commits.load(newHead);
       if (headCommit?.tree === treeId) {
         return this.fail(
           `The previous ${ACTION_NAME[action]} is now empty, possibly due to conflict resolution.`,
         );
       }
-      const committer = this.committer();
-      const fallback = this.messageFor(action, stopped, commit, commit.parents[0]);
-      const message = cleanupMessage((await state.read("MERGE_MSG")) ?? fallback);
+      const message = cleanupMessage(prepared);
       newHead = await this.commit(
         treeId,
         [newHead],

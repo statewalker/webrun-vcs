@@ -43,6 +43,12 @@ export interface PathspecItem {
   prefix?: number;
   /** `:(attr:...)`: the attributes a matching path must have (only where a caller allows it) */
   attr?: AttrMatch[];
+  /**
+   * The attributes of a path for {@link attr} (git's `git_check_attr` through the command's
+   * index): undefined when they were not loaded ({@link PathspecAttributes} loads them
+   * before the paths are matched)
+   */
+  attrLookup?: (path: string) => ReadonlyMap<string, PathspecAttributeValue> | undefined;
 }
 
 /** One requirement of `:(attr:<spec>)` (git's `struct attr_match`). */
@@ -67,9 +73,11 @@ export interface PathspecParseOptions {
    */
   global?: GlobalPathspecMagic;
   /**
-   * The command's name for git's `unsupported_magic` refusal of `:(attr:...)` without
-   * {@link attr}: "<elem>: pathspec magic not supported by this command: 'attr'"
-   * (`pathspec.c`); without it the parser's own "Unsupported pathspec magic" is thrown
+   * Kept for compatibility: `:(attr:...)` without {@link attr} is always refused with git's
+   * `unsupported_magic` message, "<elem>: pathspec magic not supported by this command:
+   * 'attr'" (`pathspec.c`)
+   *
+   * @deprecated
    */
   refuseAttrAsUnsupported?: boolean;
 }
@@ -241,12 +249,9 @@ export function parsePathspecItem(elem: string, options: PathspecParseOptions = 
   let attr: AttrMatch[] | undefined;
   let rest = elem;
   const global = options.global ?? {};
+  // git's unsupported_magic
   const refuseAttr = () =>
-    new Error(
-      options.refuseAttrAsUnsupported
-        ? `${elem}: pathspec magic not supported by this command: 'attr'`
-        : `Unsupported pathspec magic 'attr' in '${elem}'`,
-    );
+    new Error(`${elem}: pathspec magic not supported by this command: 'attr'`);
   if (global.literal) {
     // parse_element_magic: no magic is read under GIT_LITERAL_PATHSPECS
     literal = true;
@@ -408,6 +413,44 @@ export const pathspecName = (name: string) => byteString(name);
  * bytes, so an element that cuts a character matches as in git (`:(icase)` folds ASCII only).
  */
 function matchPathspecItem(element: PathspecItem, path: string, flags: number): number {
+  const how = matchPathspecItemPath(element, path, flags);
+  if (!how || !element.attr) return how;
+  // match_pathspec_attrs: the path's attributes as the element wants them, or no match
+  const values = element.attrLookup?.(path);
+  if (!values) throw new Error(`BUG: the attributes of '${path}' were not loaded for a pathspec`);
+  return attrsMatch(element.attr, values) ? how : 0;
+}
+
+/** git's `match_pathspec_attrs` over the values read: each requirement as the element says. */
+export function attrsMatch(
+  wanted: readonly AttrMatch[],
+  values: ReadonlyMap<string, PathspecAttributeValue>,
+): boolean {
+  for (const a of wanted) {
+    const v = values.get(a.name);
+    const ok =
+      v === true
+        ? a.mode === "set"
+        : v === false
+          ? a.mode === "unset"
+          : v === undefined
+            ? a.mode === "unspecified"
+            : a.mode === "value" && a.value === v;
+    if (!ok) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether the element can match `path` by its path alone (its attributes not asked): the
+ * paths {@link PathspecAttributes} loads the attributes of.
+ */
+export function pathspecItemMayMatch(item: PathspecItem, path: string): boolean {
+  return matchPathspecItemPath(item, path, DO_MATCH_DIRECTORY | DO_MATCH_LEADING_PATHSPEC) > 0;
+}
+
+/** {@link matchPathspecItem} without the attributes. */
+function matchPathspecItemPath(element: PathspecItem, path: string, flags: number): number {
   const item = pathspecItemBytes(element);
   const { match } = item;
   const name = pathspecName(path);
@@ -602,13 +645,23 @@ export function pathspecSimplifyAway(items: readonly PathspecItem[], path: strin
  * await scanUntracked(host, { ..., matcher: untrackedScanPathspec(items) });
  * ```
  */
-export function untrackedScanPathspec(items: PathspecItem[]): {
-  match(name: string, leading: boolean): number;
+export function untrackedScanPathspec(
+  items: PathspecItem[],
+  /** The attributes of `:(attr:...)` elements, read for a name before it is matched */
+  attributes?: { needs(path: string): boolean; loadOne(path: string): Promise<void> },
+): {
+  match(name: string, leading: boolean): number | Promise<number>;
   simplifyAway(path: string): boolean;
   commonPrefix(): string;
 } {
   return {
-    match: (name, leading) => matchPathspec(items, name, leading ? DO_MATCH_LEADING_PATHSPEC : 0),
+    match: (name, leading) => {
+      const flags = leading ? DO_MATCH_LEADING_PATHSPEC : 0;
+      if (attributes?.needs(name)) {
+        return attributes.loadOne(name).then(() => matchPathspec(items, name, flags));
+      }
+      return matchPathspec(items, name, flags);
+    },
     simplifyAway: (path) => pathspecSimplifyAway(items, path),
     commonPrefix: () => {
       const prefix = pathspecCommonPrefix(items);

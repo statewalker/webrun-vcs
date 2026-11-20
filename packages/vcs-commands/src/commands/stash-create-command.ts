@@ -13,6 +13,7 @@ import { AddCommand } from "./add-command.js";
 import { ApplyCommand } from "./apply/apply-command.js";
 import { abbrevLengths } from "./core-config.js";
 import { DiffCommand } from "./diff-command.js";
+import { flatTree } from "./merge-support.js";
 import {
   DO_MATCH_DIRECTORY,
   matchPathspec,
@@ -24,6 +25,7 @@ import {
   pathspecErrors,
   prefixOriginElement,
 } from "./pathspec.js";
+import { PathspecAttributes } from "./pathspec-attributes.js";
 import { reflogMessages, updateHead } from "./reflog-messages.js";
 import { STASH_REF } from "./stash-list-command.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
@@ -394,10 +396,11 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     let items: PathspecItem[] = [];
     if (this.pathspec.length > 0) {
       try {
-        items = parsePathspec(this.pathspec);
+        items = parsePathspec(this.pathspec, { attr: true });
       } catch (error) {
         throw new InvalidArgumentError("path", this.pathspec, `fatal: ${(error as Error).message}`);
       }
+      await this.loadPathspecAttributes(items, headCommit.tree);
     }
     const pathFilter =
       items.length > 0 ? (path: string) => matchPathspec(items, path, 0) > 0 : undefined;
@@ -554,11 +557,30 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     }
   }
 
+  /**
+   * `:(attr:...)` elements: the attributes of every path the stash and its reset match (the
+   * index's, HEAD's and, with `-u`/`-a`, the worktree's files), read before they are matched.
+   */
+  private async loadPathspecAttributes(items: PathspecItem[], headTree: ObjectId): Promise<void> {
+    const worktree = this.worktreeAccess;
+    const attributes = PathspecAttributes.forWorktree(items, worktree);
+    if (!attributes) return;
+    const paths: string[] = [];
+    for await (const entry of this.staging.entries()) paths.push(entry.path);
+    paths.push(...(await flatTree(this.trees, headTree)).keys());
+    if (this.includeUntracked && worktree) {
+      for await (const entry of worktree.walk({ includeIgnored: this.includeIgnored })) {
+        if (!entry.isDirectory) paths.push(entry.path);
+      }
+    }
+    await attributes.load(paths);
+  }
+
   /** The elements as git names them (`item->original` with prefix magic), the implicit "." too. */
   private pathspecOriginals(items: PathspecItem[]): string[] {
     const elements = items.length > this.pathspec.length ? [...this.pathspec, "."] : this.pathspec;
     return elements.map((elem) =>
-      prefixOriginElement(elem, parsePathspecItem(elem), this.compatibility),
+      prefixOriginElement(elem, parsePathspecItem(elem, { attr: true }), this.compatibility),
     );
   }
 

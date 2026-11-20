@@ -232,7 +232,12 @@ export class DeleteBranchCommand extends GitCommand<string[]> {
       if (user) {
         const message = `cannot delete branch '${shortBranchName(refName)}' used by worktree at '${user.path}'`;
         if (user.current) throw new CannotDeleteCurrentBranchError(name, message);
-        throw new BranchUsedByWorktreeError(shortBranchName(refName), user.path, message);
+        // git's delete_branches: error() and the next branch, exit status 1
+        throw new BranchUsedByWorktreeError(
+          shortBranchName(refName),
+          user.path,
+          message,
+        ).withExitCode(1);
       }
 
       // Cannot delete current branch
@@ -242,7 +247,8 @@ export class DeleteBranchCommand extends GitCommand<string[]> {
 
       // Check if exists
       if (!(await this.refsStore.has(refName))) {
-        throw new RefNotFoundError(refName, `Branch '${name}' not found`);
+        // git's delete_branches: error("branch '%s' not found"), exit status 1
+        throw new RefNotFoundError(refName, `Branch '${name}' not found`).withExitCode(1);
       }
 
       // Check if fully merged (unless force)

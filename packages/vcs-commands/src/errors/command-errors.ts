@@ -7,7 +7,7 @@ export class MissingArgumentError extends GitApiError {
   readonly argumentName: string;
 
   constructor(argumentName: string, message?: string) {
-    super(message ?? `Missing required argument: ${argumentName}`);
+    super(message ?? `Missing required argument: ${argumentName}`, { defaultExitCode: 129 });
     this.name = "MissingArgumentError";
     this.argumentName = argumentName;
   }
@@ -68,7 +68,7 @@ export class RmFailedError<R = unknown> extends GitApiError {
     /** What was removed, when the index was written all the same */
     readonly result?: R,
   ) {
-    super(message);
+    super(message, { defaultExitCode: 1 });
     this.name = "RmFailedError";
   }
 }
@@ -84,7 +84,7 @@ export class MvFailedError<R = unknown> extends GitApiError {
     /** What was moved and printed before the failure */
     readonly result?: R,
   ) {
-    super(message);
+    super(message, { defaultExitCode: 1 });
     this.name = "MvFailedError";
   }
 }

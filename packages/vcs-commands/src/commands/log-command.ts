@@ -68,7 +68,9 @@ import {
   treeEntryInteresting,
   treePathspec,
 } from "./pathspec.js";
+import { PathspecAttributes } from "./pathspec-attributes.js";
 import { loadRefDecorations } from "./pretty-format.js";
+import { readDiffSubmoduleConfig } from "./submodule-summary.js";
 
 const NULL_OBJECT_ID = "0".repeat(40);
 
@@ -457,6 +459,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   async call(): Promise<AsyncIterable<LogResult>> {
     this.checkCallable();
     this.setCallable(false);
+    // git_log_config ends in git_diff_ui_config: a diff.submodule without a value dies
+    readDiffSubmoduleConfig(this.workingCopy);
 
     // the commits given, in order, the refs of `all()` where it was called; HEAD without
     // either
@@ -1257,10 +1261,16 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       options.follow !== undefined
         ? [`:(literal)${options.follow}`]
         : [...this.paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
-    const items = spec.map((p) => parsePathspecItem(p));
+    const items = spec.map((p) => parsePathspecItem(p, { attr: true }));
     if (items.length > 0 && items.every((i) => i.exclude)) items.push(parsePathspecItem("."));
     const all = new Set<string>(result.keys());
     for (const m of parents) for (const k of m.keys()) all.add(k);
+    // `:(attr:...)`: the attributes of the paths, as the walk reads them
+    if (items.some((i) => i.attr)) {
+      await new PathspecAttributes(items, (path, names) => this.readAttributes(path, names)).load(
+        all,
+      );
+    }
     const differs = (a?: { mode: number; id: ObjectId }, b?: { mode: number; id: ObjectId }) =>
       !a || !b ? a !== b : a.id !== b.id || a.mode !== b.mode;
     const paths = [...all]
@@ -1714,12 +1724,17 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const path = attributes?.pending;
     if (!attributes || path === undefined) return;
     attributes.pending = undefined;
+    attributes.values.set(path, await this.readAttributes(path, attributes.names));
+  }
+
+  /** The attributes `names` of `path` as {@link loadAttributes} reads them. */
+  private async readAttributes(
+    path: string,
+    names: readonly string[],
+  ): Promise<Map<string, PathspecAttributeValue>> {
     // a bare repository's working copy refuses its worktree: asked without touching it
     const worktree = "worktree" in this._workingCopy ? this.worktreeAccess : undefined;
-    if (!worktree) {
-      attributes.values.set(path, await this.bareAttributes().get(path, attributes.names));
-      return;
-    }
+    if (!worktree) return this.bareAttributes().get(path, names);
     const filter = worktree.contentFilter as
       | {
           attributes?(
@@ -1731,10 +1746,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       | undefined;
     if (!filter?.attributes)
       throw new GitApiError("pathspec magic 'attr' needs the attributes of a worktree");
-    attributes.values.set(
-      path,
-      await filter.attributes(path, attributes.names, { direction: "checkin", index: NO_INDEX }),
-    );
+    return filter.attributes(path, names, { direction: "checkin", index: NO_INDEX });
   }
 
   private bareResolver?: AttributesResolver;

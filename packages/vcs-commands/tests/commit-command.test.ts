@@ -650,10 +650,14 @@ describe.each(backends)("CommitCommand with --all flag ($name backend)", ({ fact
     await git.commit().setMessage("initial").call();
 
     // Cannot set --all after --only
-    expect(() => git.commit().setOnly("file.txt").setAll(true)).toThrow(/Cannot combine/);
+    expect(() => git.commit().setOnly("file.txt").setAll(true)).toThrow(
+      "paths 'file.txt ...' with -a does not make sense",
+    );
 
     // Cannot set --only after --all
-    expect(() => git.commit().setAll(true).setOnly("file.txt")).toThrow(/Cannot combine/);
+    expect(() => git.commit().setAll(true).setOnly("file.txt")).toThrow(
+      "paths 'file.txt ...' with -a does not make sense",
+    );
   });
 
   it("should not add new untracked files", async () => {

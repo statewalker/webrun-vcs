@@ -2070,6 +2070,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       committer = { ...committer, timestamp: author.timestamp, tzOffset: author.tzOffset };
     }
     const command = new MergeCommand(this._workingCopy)
+      .setInProcess(true)
       .setFastForwardMode(FastForwardMode.NO_FF)
       .setMessage(message)
       .setAuthor(author)

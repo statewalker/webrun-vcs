@@ -308,7 +308,8 @@ export class DeleteTagCommand extends GitCommand<string[]> {
       const refName = name.startsWith("refs/") ? name : `refs/tags/${name}`;
 
       if (!(await this.refsStore.has(refName))) {
-        throw new RefNotFoundError(refName, `Tag '${name}' not found`);
+        // git's delete_tags: error("tag '%s' not found."), exit status 1
+        throw new RefNotFoundError(refName, `Tag '${name}' not found`).withExitCode(1);
       }
 
       await this.refsStore.delete(refName);

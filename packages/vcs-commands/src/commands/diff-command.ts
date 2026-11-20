@@ -53,6 +53,7 @@ import { quotePath } from "../results/quote-path.js";
 import { worktreeModeTrust } from "./core-config.js";
 import { textconvRunnerOf } from "./diff-textconv.js";
 import { matchPathspec, type PathspecItem, parsePathspecItem } from "./pathspec.js";
+import { PathspecAttributes } from "./pathspec-attributes.js";
 import { readSubmoduleDirt, type SubmoduleDirt } from "./status-command.js";
 import {
   isSubmoduleIgnoreMode,
@@ -462,7 +463,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    */
   setPathspec(paths: string[]): this {
     this.checkCallable();
-    this.pathspecItems = paths.map((p) => parsePathspecItem(p));
+    this.pathspecItems = paths.map((p) => parsePathspecItem(p, { attr: true }));
     if (this.pathspecItems.length > 0 && this.pathspecItems.every((i) => i.exclude)) {
       this.pathspecItems.push(parsePathspecItem("."));
     }
@@ -1120,6 +1121,16 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     // read as in the checkout (in memory: diff writes no index)
     await this.clearPresentSkipWorktree();
     const worktree = this.worktreeAccess;
+    // `:(attr:...)`: the attributes of the index's paths (match_pathspec_attrs), the trees'
+    // read once their sides are known
+    const attributes = this.pathspecItems
+      ? PathspecAttributes.forWorktree(this.pathspecItems, worktree)
+      : undefined;
+    if (attributes) {
+      const paths: string[] = [];
+      for await (const entry of this.staging.entries()) paths.push(entry.path);
+      await attributes.load(paths);
+    }
     let oldSide: Map<string, Side>;
     let newSide: Map<string, Side>;
     const unmerged = new Map<string, DiffEntry[]>();
@@ -1166,6 +1177,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     }
     const ignoreOf = await this.submoduleIgnoreOf();
     // diff_change / diff_addremove: a submodule whose changes are ignored is left out
+    await attributes?.load([...oldSide.keys(), ...newSide.keys(), ...unmerged.keys()]);
     const entries = this.pairUp(oldSide, newSide, unmerged).filter((e) => {
       if (e.unmerged) return true;
       const oldLink = e.oldMode === GITLINK;
