@@ -170,7 +170,9 @@ async function readGitfile(files: FilesApi, file: string): Promise<string | unde
  *
  * - aliases refused (`isUnsafeServicePath`: `..`, `//`, `/./`, NUL, backslash), as the
  *   servers check before calling it;
- * - `~user[/path]` read below `userPath(user)`, refused without that option;
+ * - `~user[/path]` read below `userPath(user)`, refused without that option or with an empty
+ *   user (`~`, `~/x`: `userPath` is never asked for "");
+ * - an empty path refused (it would name the base itself);
  * - any other path read below `basePath` (an implicit session's relative path too, as if
  *   absolute);
  * - unless `strictPaths`, trailing slashes dropped and the first git directory of
@@ -198,6 +200,8 @@ export function createBasePathResolver(
       if (!options.userPath) return undefined;
       const slash = path.indexOf("/");
       const user = slash < 0 ? path.slice(1) : path.slice(1, slash);
+      // `~` and `~/x` name no user: never the server's own home (enter_repo's interpolate_path)
+      if (user === "") return undefined;
       const home = options.userPath(user, request);
       if (home === undefined) return undefined;
       root = normalize(home);

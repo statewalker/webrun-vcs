@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInMemoryFilesApi, createSymlinkFilesApi } from "@statewalker/vcs-utils/files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   checkSshTarget,
   createBasePathResolver,
@@ -923,5 +923,223 @@ describe("serveGitConnection time limits", () => {
     expect(result).toMatchObject({ success: false, error: "timed out waiting for the client" });
     expect(duplex.closed).toBe(true);
     expect(duplex.written()).toContain("refs/heads/main");
+  });
+});
+
+describe("the resolver's hidden refs are the last word", () => {
+  const reader = (entries: Record<string, unknown[]>) => ({
+    getAll: (key: string) => entries[key.toLowerCase()] ?? [],
+  });
+  /** The effective list of a service, as serveOverDuplex builds it. */
+  const effective = (
+    settings: ReturnType<typeof layerServeSettings>,
+    service: "upload" | "receive",
+  ) => [
+    ...(settings.hideRefs ?? []),
+    ...((service === "upload" ? settings.uploadPackHideRefs : settings.receivePackHideRefs) ?? []),
+  ];
+  /** git's isRefHidden: the last matching pattern decides. */
+  const hidden = (patterns: string[], ref: string) => {
+    let out = false;
+    for (const p of patterns) {
+      const neg = p.startsWith("!");
+      const pattern = neg ? p.slice(1) : p;
+      if (ref === pattern || ref.startsWith(`${pattern}/`)) out = !neg;
+    }
+    return out;
+  };
+
+  it("layerServeSettings: an earlier layer's service !pattern does not unhide a later hideRefs", () => {
+    const settings = layerServeSettings(
+      { allowDeletes: false },
+      {},
+      { uploadPackHideRefs: ["!refs/secret"], receivePackHideRefs: ["!refs/secret"] },
+      { hideRefs: ["refs/secret"] },
+    );
+    expect(hidden(effective(settings, "upload"), "refs/secret")).toBe(true);
+    expect(hidden(effective(settings, "receive"), "refs/secret")).toBe(true);
+    const one = layerServeSettings(
+      { allowDeletes: false },
+      {},
+      { uploadPackHideRefs: ["!refs/secret"] },
+      { hideRefs: ["refs/secret"] },
+    );
+    expect(hidden(effective(one, "upload"), "refs/secret")).toBe(true);
+    expect(hidden(effective(one, "receive"), "refs/secret")).toBe(true);
+    // a later layer's !pattern still unhides an earlier one
+    const later = layerServeSettings(
+      { hideRefs: ["refs/secret"] },
+      { uploadPackHideRefs: ["!refs/secret"] },
+    );
+    expect(hidden(effective(later, "upload"), "refs/secret")).toBe(false);
+    expect(hidden(effective(later, "receive"), "refs/secret")).toBe(true);
+  });
+
+  it("serveGitService: a repository config's !refs/secret leaves the resolver's refs/secret hidden", async () => {
+    const { repo, c1 } = await serverRepo();
+    await repo.refStore.update("refs/secret/x", c1);
+    const config = reader({
+      "uploadpack.hiderefs": ["!refs/secret"],
+      "receive.hiderefs": ["!refs/secret"],
+      "transfer.hiderefs": ["!refs/secret"],
+    });
+    for (const service of ["git-upload-pack", "git-receive-pack"]) {
+      const duplex = serverSide();
+      await serveGitService({
+        duplex,
+        service,
+        path: "/r.git",
+        enableReceivePack: true,
+        resolveRepository: async () => ({
+          repository: repo.facade,
+          refStore: repo.refStore,
+          config,
+          settings: { hideRefs: ["refs/secret"] },
+        }),
+      });
+      expect(duplex.written(), service).toContain("refs/heads/main");
+      expect(duplex.written(), service).not.toContain("refs/secret");
+    }
+  });
+});
+
+describe("serveGitConnection timeout covers writes", () => {
+  /** A duplex sending `parts`, then stalling; its writes never complete (the client stopped reading). */
+  function deaf(withClose: boolean, ...parts: Uint8Array[]) {
+    const state = { closed: false, ended: false, writes: 0 };
+    const duplex: Duplex = {
+      [Symbol.asyncIterator]: () =>
+        (async function* () {
+          for (const part of parts) yield part;
+          await new Promise(() => {});
+        })()[Symbol.asyncIterator](),
+      write() {
+        state.writes++;
+        return new Promise<void>(() => {});
+      },
+      async end() {
+        state.ended = true;
+      },
+      ...(withClose
+        ? {
+            async close() {
+              state.closed = true;
+            },
+          }
+        : {}),
+    };
+    return { duplex, state };
+  }
+
+  it("a client that stops reading is cut off, and no timer is left behind", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const { repo } = await serverRepo();
+      const { duplex, state } = deaf(true, pkt("git-upload-pack /r\0host=h\0"));
+      const serving = serveGitConnection({
+        duplex,
+        timeout: 30,
+        resolveRepository: async () => ({ repository: repo.facade, refStore: repo.refStore }),
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      const result = await serving;
+      expect(result).toMatchObject({ success: false, error: "timed out waiting for the client" });
+      expect(state.writes).toBe(1);
+      expect(state.closed).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a stream without close is ended", async () => {
+    const { repo } = await serverRepo();
+    const { duplex, state } = deaf(false, pkt("git-receive-pack /r\0host=h\0"));
+    const result = await serveGitConnection({
+      duplex,
+      enableReceivePack: true,
+      timeout: 20,
+      resolveRepository: async () => ({ repository: repo.facade, refStore: repo.refStore }),
+    });
+    expect(result).toMatchObject({ success: false, error: "timed out waiting for the client" });
+    expect(state.ended).toBe(true);
+  });
+});
+
+describe("createBasePathResolver: empty users and paths", () => {
+  async function storage() {
+    const files = createSymlinkFilesApi(createInMemoryFilesApi());
+    for (const dir of ["/srv", "/srv/r.git", "/home/x", "/home/x/r.git"]) {
+      await files.mkdir(`${dir}/objects`);
+      await files.mkdir(`${dir}/refs`);
+      await files.write(`${dir}/HEAD`, [enc.encode("ref: refs/heads/main\n")]);
+      await files.write(`${dir}/git-daemon-export-ok`, []);
+    }
+    return files;
+  }
+
+  it("~ and ~/x never ask userPath for the empty user, in either mode", async () => {
+    const files = await storage();
+    const asked: string[] = [];
+    const resolve = createBasePathResolver({
+      files,
+      basePath: "/srv",
+      openRepository: async (gitDir) => ({ gitDir }) as never,
+      userPath: (user) => {
+        asked.push(user);
+        return "/home/x";
+      },
+    });
+    for (const path of ["~", "~/", "~/r.git"]) {
+      expect(await resolve(path, { service: "git-upload-pack", path, version: 0 }), path).toBe(
+        undefined,
+      );
+    }
+    expect(asked).toEqual([]);
+    expect(
+      await resolve("~x/r.git", { service: "git-upload-pack", path: "~x/r.git", version: 0 }),
+    ).toBeDefined();
+    // the standard refusal through both servers
+    for (const [refusal, path, text] of [
+      ["daemon", "~", "ERR access denied or repository not exported: ~"],
+      ["implicit", "~/r.git", "ERR '~/r.git' does not appear to be a git repository"],
+    ] as const) {
+      const duplex = serverSide();
+      await serveGitService({
+        duplex,
+        service: "git-upload-pack",
+        path,
+        refusal,
+        resolveRepository: resolve,
+      });
+      expect(duplex.written()).toBe(line(text));
+    }
+    expect(asked).toEqual(["x"]);
+  });
+
+  it("an empty path is refused, not the base directory", async () => {
+    const files = await storage();
+    const resolve = createBasePathResolver({
+      files,
+      basePath: "/srv",
+      exportAll: true,
+      openRepository: async (gitDir) => ({ gitDir }) as never,
+    });
+    expect(isUnsafeServicePath("", { implicit: true })).toBe(true);
+    expect(isUnsafeServicePath("")).toBe(true);
+    expect(await resolve("", { service: "git-upload-pack", path: "", version: 0 })).toBeUndefined();
+    const duplex = serverSide();
+    let asked = false;
+    await serveGitService({
+      duplex,
+      service: "git-upload-pack",
+      path: "",
+      resolveRepository: async (path, request) => {
+        asked = true;
+        return resolve(path, request);
+      },
+    });
+    expect(asked).toBe(false);
+    expect(duplex.written()).toBe(line("ERR '' does not appear to be a git repository"));
   });
 });

@@ -131,8 +131,9 @@ export interface GitServeOptions {
    * here), then the resolver's `ServedRepository.settings`. A key the repository's config
    * leaves unset keeps the operator's value; hidden ref lists (`hideRefs`,
    * `uploadPackHideRefs`, `receivePackHideRefs`) are not replaced but concatenated, every
-   * layer's patterns in that order, as git reads multi-valued `*.hideRefs` from each config
-   * file (a later `!pattern` can still unhide an earlier one, as in git).
+   * layer's patterns in that order across all three lists, as git reads multi-valued
+   * `*.hideRefs` from each config file (a later `!pattern` can still unhide an earlier one, as
+   * in git; an earlier one never unhides a later layer's, so the resolver's stay hidden).
    */
   settings?: GitServeSettings;
   /** Close the stream once served (default true: the connection is over, as git-daemon's child exits) */
@@ -149,9 +150,10 @@ export interface ServeGitConnectionOptions extends GitServeOptions {
    */
   initTimeout?: number;
   /**
-   * Most milliseconds the service waits for the client's next bytes (git-daemon's
-   * `--timeout`, which it hands to upload-pack); the stream is closed when it is exceeded.
-   * Time the server spends working is not counted. Default: no limit
+   * Most milliseconds the service waits for the client's next bytes, or for the client to
+   * take a write (git-daemon's `--timeout`, which it hands to upload-pack); the stream is
+   * closed (ended, without `close`) when it is exceeded. Time the server spends working is
+   * not counted. Default: no limit
    */
   timeout?: number;
 }
@@ -193,7 +195,7 @@ const DAEMON_SERVICES: Record<string, string> = {
 };
 
 /**
- * Whether a served path is refused before any lookup: a NUL or a backslash anywhere (not
+ * Whether a served path is refused before any lookup: an empty path, a NUL or a backslash anywhere (not
  * git's: a path reaching another API than POSIX's could take either for a separator or an
  * end), or git-daemon's aliases ({@link daemonAvoidsAlias}). git:// (`implicit` false) asks
  * for an absolute or `~user` path as git-daemon does; an implicit session (ssh) also sends
@@ -202,11 +204,15 @@ const DAEMON_SERVICES: Record<string, string> = {
  * @example
  * ```ts
  * isUnsafeServicePath("/a/../b");                     // true
+ * isUnsafeServicePath("", { implicit: true });       // true
  * isUnsafeServicePath("r.git", { implicit: true });   // false
  * isUnsafeServicePath("../r.git", { implicit: true }); // true
  * ```
  */
 export function isUnsafeServicePath(path: string, options: { implicit?: boolean } = {}): boolean {
+  // an empty path (ssh's `git-upload-pack ''`) names no repository: setup.c's enter_repo
+  // stats "" (which fails) and otherwise only looks at `/.git` or the working directory
+  if (path === "") return true;
   if (path.includes("\0") || path.includes("\\")) return true;
   if (!options.implicit) return daemonAvoidsAlias(path);
   if (path.startsWith("~/")) return daemonAvoidsAlias(path.slice(1));
@@ -257,43 +263,78 @@ function configBool(config: ServerConfigReader | undefined, key: string): boolea
   return Number.isFinite(n) ? n !== 0 : undefined;
 }
 
-/** The hidden ref lists of the settings: concatenated across layers, never replaced. */
-const HIDE_REF_KEYS = ["hideRefs", "uploadPackHideRefs", "receivePackHideRefs"] as const;
-
 /**
  * Layers server settings, the later over the earlier: a key a layer leaves undefined keeps
  * the value below; the hidden ref lists concatenate (see {@link GitServeOptions.settings}).
+ * Each service's effective list (`hideRefs`, then the service's own, as `serveOverDuplex`
+ * reads them) keeps the layers' order: a layer's `hideRefs` come after every pattern of the
+ * layers below, the services' own lists included, so a later layer's `hideRefs` cannot be
+ * unhidden by an earlier layer's `!pattern` in `uploadPackHideRefs` or `receivePackHideRefs`
+ * (once a lower layer has set a service's own list, a later `hideRefs` is appended to both
+ * service lists instead).
  */
 export function layerServeSettings(
   ...layers: Array<Partial<GitServeSettings> | undefined>
 ): GitServeSettings {
   const out: Record<string, unknown> = {};
-  const hidden: Record<string, string[]> = {};
+  const transfer: string[] = [];
+  const upload: string[] = [];
+  const receive: string[] = [];
   for (const layer of layers) {
     if (!layer) continue;
-    for (const [key, value] of Object.entries(layer)) {
-      if (value === undefined) continue;
-      if ((HIDE_REF_KEYS as readonly string[]).includes(key)) {
-        const patterns = hidden[key] ?? [];
-        patterns.push(...(value as string[]));
-        hidden[key] = patterns;
-      } else {
-        out[key] = value;
+    const { hideRefs, uploadPackHideRefs, receivePackHideRefs, ...rest } = layer;
+    for (const [key, value] of Object.entries(rest)) {
+      if (value !== undefined) out[key] = value;
+    }
+    if (hideRefs) {
+      if (upload.length === 0 && receive.length === 0) transfer.push(...hideRefs);
+      else {
+        upload.push(...hideRefs);
+        receive.push(...hideRefs);
       }
     }
+    if (uploadPackHideRefs) upload.push(...uploadPackHideRefs);
+    if (receivePackHideRefs) receive.push(...receivePackHideRefs);
   }
-  for (const [key, patterns] of Object.entries(hidden)) {
-    if (patterns.length > 0) out[key] = patterns;
-  }
+  if (transfer.length > 0) out.hideRefs = transfer;
+  if (upload.length > 0) out.uploadPackHideRefs = upload;
+  if (receive.length > 0) out.receivePackHideRefs = receive;
   return out as GitServeSettings;
 }
 
 /**
  * The stream with an inactivity limit: a read the client does not answer within `ms` ends
- * the input (as a hang-up) and closes the stream. `expired()` tells whether it happened.
+ * the input (as a hang-up), and a write the client does not take within `ms` (it stopped
+ * reading: the stream's backpressure never lets go) fails, as git's upload-pack resets its
+ * alarm around every write of `create_pack_file`; either closes the stream (ends it, for a
+ * stream without `close`). `expired()` tells whether it happened.
  */
-function withReadTimeout(duplex: Duplex, ms: number): Duplex & { expired(): boolean } {
+function withTimeout(duplex: Duplex, ms: number): Duplex & { expired(): boolean } {
   let expired = false;
+  const expire = () => {
+    expired = true;
+    void cutOff(duplex);
+  };
+  const write = async (data: Uint8Array): Promise<void> => {
+    if (expired) throw new Error("timed out waiting for the client");
+    const pending = duplex.write(data);
+    if (!pending) return;
+    pending.catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        pending,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            expire();
+            reject(new Error("timed out waiting for the client"));
+          }, ms);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   return {
     [Symbol.asyncIterator]: () => {
       const inner = duplex[Symbol.asyncIterator]();
@@ -303,8 +344,7 @@ function withReadTimeout(duplex: Duplex, ms: number): Duplex & { expired(): bool
           let timer: ReturnType<typeof setTimeout> | undefined;
           const timedOut = new Promise<IteratorResult<Uint8Array>>((resolve) => {
             timer = setTimeout(() => {
-              expired = true;
-              void closeQuietly(duplex);
+              expire();
               resolve({ value: undefined, done: true });
             }, ms);
           });
@@ -320,7 +360,7 @@ function withReadTimeout(duplex: Duplex, ms: number): Duplex & { expired(): bool
         },
       };
     },
-    write: (data) => duplex.write(data),
+    write,
     ...(duplex.end ? { end: () => duplex.end?.() ?? Promise.resolve() } : {}),
     ...(duplex.close ? { close: () => duplex.close?.() ?? Promise.resolve() } : {}),
     expired: () => expired,
@@ -340,6 +380,16 @@ async function within<T>(promise: Promise<T>, ms: number | undefined): Promise<T
     ]);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/** Closes the stream, or ends it when it has no `close`; errors of a gone stream ignored. */
+async function cutOff(duplex: Duplex): Promise<void> {
+  try {
+    if (duplex.close) await duplex.close();
+    else await duplex.end?.();
+  } catch {
+    // gone already
   }
 }
 
@@ -369,7 +419,7 @@ export async function serveGitConnection(
   options: ServeGitConnectionOptions,
 ): Promise<ServeGitConnectionResult> {
   const timed =
-    options.timeout !== undefined ? withReadTimeout(options.duplex, options.timeout) : undefined;
+    options.timeout !== undefined ? withTimeout(options.duplex, options.timeout) : undefined;
   const duplex: Duplex = timed ?? options.duplex;
   let read: Awaited<ReturnType<typeof readGitDaemonRequest>> | undefined;
   try {
