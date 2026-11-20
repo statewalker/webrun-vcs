@@ -99,6 +99,7 @@ export function repositoryQuarantine(
   if (options.isBare) repository.isBare = options.isBare;
   return {
     repository,
+    ...(quarantine.path !== undefined ? { path: quarantine.path } : {}),
     commit: () => quarantine.commit(),
     discard: () => quarantine.discard(),
   };

@@ -640,6 +640,17 @@ export class HookSession {
     };
   }
 
+  /**
+   * A path of the repository's FilesApi as hooks are told it: its absolute host path where the
+   * files have one (as git names `GIT_QUARANTINE_PATH`), else relative to the directory the
+   * hooks run in; as given without a layout.
+   */
+  async hookPathOf(filesPath: string): Promise<string> {
+    const layout = await this.host.layout();
+    if (!layout) return filesPath;
+    return hostPathOf(layout.files, filesPath) ?? relativeFilesPath(layout.cwd, filesPath);
+  }
+
   /** The git directory's absolute host path, where the repository's files have one. */
   async hostGitDir(): Promise<string | undefined> {
     const layout = await this.host.layout();

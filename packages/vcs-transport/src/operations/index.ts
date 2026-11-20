@@ -33,6 +33,7 @@ export {
   daemonAvoidsAlias,
   isUnsafeServicePath,
   layerServeSettings,
+  resolveServeSettings,
   serveGitConnection,
   serveGitService,
 } from "./serve-git-connection.js";
@@ -40,6 +41,7 @@ export type { ServeOverDuplexOptions } from "./serve-over-duplex.js";
 export { serveOverDuplex } from "./serve-over-duplex.js";
 export type { ServerConfigReader, ServerConfigSettings } from "./server-config.js";
 export {
+  configBoolOf,
   explicitServerSettingsFromConfig,
   GIT_SERVER_SETTINGS_DEFAULTS,
   httpServerSettings,

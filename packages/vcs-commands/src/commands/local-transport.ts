@@ -28,7 +28,7 @@ import { TransportError } from "../errors/index.js";
 import { HookSession, hookHostOf, refTransactionHookOf } from "./git-hooks.js";
 import { ReadTreeCommand } from "./read-tree-command.js";
 import { StatusCommand } from "./status-command.js";
-import { usesBranch, worktreeUsingBranch } from "./worktree-support.js";
+import { repositoryPlaceOf, usesBranch, worktreeUsingBranch } from "./worktree-support.js";
 
 const NOT_A_REPOSITORY = (path: string) =>
   `fatal: '${path}' does not appear to be a git repository\n` +
@@ -106,8 +106,10 @@ export async function openLocalRemote(
   workingCopy: WorkingCopy,
   path: string,
 ): Promise<OpenedRepository> {
-  const worktree = workingCopy.worktree as WorkingCopy["worktree"] | undefined;
-  const opened = await worktree?.openRepository?.(path).catch(() => undefined);
+  // a bare repository opens it from its git directory, as git runs there
+  const opened = await repositoryPlaceOf(workingCopy)
+    ?.openRepository?.(path)
+    .catch(() => undefined);
   if (!opened) throw new TransportError(NOT_A_REPOSITORY(path));
   return opened;
 }
@@ -367,6 +369,8 @@ export async function receivePackSettingsOf(
     ...(receiveHooks ? { hooks: receiveHooks, relayPostReceive: true } : {}),
     // git's receive-pack migrates its quarantine before update() checks the commands
     publishBeforeUpdate: true,
+    // ... and runs pre-receive with every command, refused ones included (skip_broken 0)
+    preReceiveSeesRefused: true,
     // git 2.5x updates the refs of a push that is not atomic in two batches
     ...(hooks?.enabled && hooks.compatibility !== "2.43" ? { batchNonAtomic: true } : {}),
     // ... git 2.43 updates each ref after its update hook
@@ -445,7 +449,7 @@ export function remoteHookSession(
   if (!local.environment()?.hookRunner) return undefined;
   let files: FilesApi | undefined;
   try {
-    files = (workingCopy.worktree as { getFiles?(): FilesApi } | undefined)?.getFiles?.();
+    files = repositoryPlaceOf(workingCopy)?.getFiles?.();
   } catch {
     files = undefined;
   }
@@ -491,6 +495,42 @@ async function pushToCheckout(
 }
 
 /**
+ * tmp-objdir.c's `tmp_objdir_env` for a hook run while the push's objects are quarantined
+ * (`ctx.quarantinePath`: pre-receive, as git's receive-pack hands `odb_transaction_env` to
+ * it): `GIT_QUARANTINE_PATH` and `GIT_OBJECT_DIRECTORY` name the quarantine,
+ * `GIT_ALTERNATE_OBJECT_DIRECTORIES` the repository's objects (git appends them to the
+ * alternates receive-pack was given; ours names them alone), absolute where the repository's files have a host path, so native git run
+ * by the hook reads the pushed objects. Nothing once the objects are published.
+ */
+export async function quarantineEnv(
+  hooks: HookSession,
+  ctx: Pick<ReceivePackHookContext, "quarantinePath">,
+): Promise<Record<string, string>> {
+  const quarantine = ctx.quarantinePath;
+  if (quarantine === undefined) return {};
+  const objects = await hooks.commonGitFile("objects");
+  const trim = (p: string) => p.replace(/^\/+|\/+$/g, "");
+  const host = await hooks.hostGitDir();
+  const below = objects && trim(quarantine).startsWith(`${trim(objects.path)}/`);
+  // git's absolute_path of `./objects/...`: receive-pack runs with GIT_DIR=. in its git dir
+  const path =
+    host && objects && below
+      ? `${host}/./objects/${trim(quarantine).slice(trim(objects.path).length + 1)}`
+      : await hooks.hookPathOf(quarantine);
+  const env: Record<string, string> = { GIT_QUARANTINE_PATH: path, GIT_OBJECT_DIRECTORY: path };
+  if (objects) {
+    const dir = host && below ? `${host}/./objects` : await hooks.hookPathOf(objects.path);
+    // env_append: quoted (C style) when it holds the separator or starts with a quote
+    const value =
+      dir.includes(":") || dir.startsWith('"')
+        ? `"${dir.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+        : dir;
+    env.GIT_ALTERNATE_OBJECT_DIRECTORIES = value;
+  }
+  return env;
+}
+
+/**
  * receive-pack's hooks as scripts (builtin/receive-pack.c `run_receive_hook`,
  * `run_update_hook`, `run_update_post_hook`): pre-receive and post-receive read
  * `<old> <new> <ref>` lines on stdin (with `GIT_PUSH_OPTION_COUNT` and the options), update
@@ -514,7 +554,7 @@ function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
   ) => {
     const result = await hooks.run(name, {
       ...options,
-      env: { GIT_DIR: ".", ...(options.env ?? {}) },
+      env: { GIT_DIR: ".", ...(await quarantineEnv(hooks, ctx)), ...(options.env ?? {}) },
       prefix: false,
     });
     if (result?.stderr) await ctx.message(result.stderr);

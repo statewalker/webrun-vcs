@@ -45,6 +45,14 @@ export interface ReceivePackHookContext {
    */
   readonly repository: RepositoryFacade;
   /**
+   * The quarantine directory of the push in the repository's storage (`RepositoryQuarantine.path`)
+   * while its objects are quarantined (pre-receive; update too unless the objects are published
+   * before it, as git's receive-pack does), undefined otherwise or where the repository keeps
+   * no quarantine in files. git hands it to the pre-receive hook as `GIT_QUARANTINE_PATH`, its
+   * `GIT_OBJECT_DIRECTORY`, with the repository's objects as an alternate.
+   */
+  readonly quarantinePath?: string;
+  /**
    * Shows `text` to the pushing user (side-band channel 2, as git relays a hook's output;
    * nothing without side-band).
    */
@@ -270,4 +278,11 @@ export interface ReceivePackConfig {
    * in the repository. Default false: published only when a ref is updated.
    */
   publishBeforeUpdate?: boolean;
+  /**
+   * pre-receive is given every command of the push, those already refused (a hidden ref, missing
+   * objects) included, and runs even when all are refused, as git's receive-pack runs it
+   * (`run_receive_hook` with `skip_broken` 0). Default false: only the open commands, and no
+   * pre-receive when none is open.
+   */
+  preReceiveSeesRefused?: boolean;
 }

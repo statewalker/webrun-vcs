@@ -26,7 +26,9 @@
  */
 
 import type { History, ObjectId, Refs } from "@statewalker/vcs-core";
+import type { Checkout } from "../checkout/index.js";
 import type { WorkingCopy, WorkingCopyConfig } from "../working-copy.js";
+import type { Worktree } from "../worktree/index.js";
 
 /**
  * What `git worktree` works with: the repository's history (its refs, the current
@@ -44,6 +46,19 @@ export interface WorktreeAdmin {
   readonly history: History;
   readonly config: WorkingCopyConfig;
   readonly worktrees: LinkedWorktrees;
+  /**
+   * A bare repository's place in its storage, for what git does there without a working
+   * tree: open other repositories by path (`openRepository`, relative paths read from the git
+   * directory, where git runs in a bare repository: local remotes of fetch, push, ls-remote)
+   * and reach its files (`getFiles`, `getGitDir`, `getRoot` = the git directory), and write
+   * `FETCH_HEAD` there (as `Checkout.readFetchHead` / `writeFetchHead` in a working tree).
+   * Never used as a working tree.
+   */
+  readonly bareRepository?: Pick<
+    Worktree,
+    "openRepository" | "getFiles" | "getGitDir" | "getRoot"
+  > &
+    Pick<Checkout, "readFetchHead" | "writeFetchHead">;
 }
 
 /** A worktree as git's `get_worktrees` describes it. */

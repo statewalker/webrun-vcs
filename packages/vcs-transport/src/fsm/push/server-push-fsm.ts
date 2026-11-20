@@ -502,22 +502,28 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       // git's reject_updates_to_hidden: after the connectivity check, before pre-receive
       rejectHiddenUpdates(ctx, commands);
       const open = commands.filter((cmd) => cmd.result === "NOT_ATTEMPTED");
-      if (open.length === 0) return "NOTHING_TO_DO";
+      // git's run_receive_hook with skip_broken=0: every command, refused ones included
+      const fed = receivePackConfig(ctx).preReceiveSeesRefused ? commands : open;
+      if (fed.length === 0) return "NOTHING_TO_DO";
 
       const hook = receivePackHooks(ctx)?.preReceive;
-      if (!hook) return "NO_HOOK";
+      if (!hook) return open.length === 0 ? "NOTHING_TO_DO" : "NO_HOOK";
 
       let verdict: ReturnType<typeof normalizeVerdict>;
       try {
         verdict = normalizeVerdict(
           await timedHook(ctx, "pre-receive", () =>
-            hook(open.map(toReceiveCommand), hookContext(ctx)),
+            hook(fed.map(toReceiveCommand), hookContext(ctx)),
           ),
         );
       } catch (e) {
         logError(ctx, "pre-receive hook failed", e);
         await sendError(ctx, "pre-receive hook error");
         verdict = { ok: false };
+      }
+      if (open.length === 0) {
+        if (!verdict.ok && verdict.message) await sendMessage(ctx, verdict.message);
+        return "NOTHING_TO_DO";
       }
       if (verdict.ok) return "HOOK_OK";
 
@@ -971,6 +977,9 @@ function hookContext(ctx: ProcessContext): ReceivePackHookContext {
       },
       get repository() {
         return pushView(ctx);
+      },
+      get quarantinePath() {
+        return state.quarantine?.path;
       },
       request: rp.request,
       repoPath: rp.repoPath,

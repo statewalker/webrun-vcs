@@ -59,6 +59,12 @@ export interface RepositoryQuarantine {
    * receive-pack's connectivity check, its `update()` checks and its hooks read through it.
    */
   readonly repository: RepositoryFacade;
+  /**
+   * The quarantine's directory in the repository's storage, where it has one
+   * (`ObjectQuarantine.path`: `objects/tmp_objdir-incoming-<id>` of the files backend);
+   * receive-pack hands it to hooks as `ReceivePackHookContext.quarantinePath`
+   */
+  readonly path?: string;
   /** Publish the quarantined objects into the repository (before any ref names them). */
   commit(): Promise<void>;
   /** Remove every quarantined object. Safe to call more than once. */

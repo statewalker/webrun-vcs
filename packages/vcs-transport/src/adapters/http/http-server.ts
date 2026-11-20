@@ -258,6 +258,30 @@ export interface ReceivePackServerOptions {
    * `ReceivePackConfig.strictAtomic`)
    */
   strictAtomic?: boolean;
+  /**
+   * Run post-receive before the side-band closes, awaited, its messages relayed to the client
+   * (git's receive-pack); default: detached once the report is out
+   */
+  relayPostReceive?: boolean;
+  /** A push that is not atomic updates refs in two batches (git 2.5x; see `ReceivePackConfig`) */
+  batchNonAtomic?: boolean;
+  /** Each ref of a push that is not atomic updated after its update hook (git 2.43) */
+  interleaveUpdateHook?: boolean;
+  /** Objects published before the commands are checked (git's receive-pack; see `ReceivePackConfig`) */
+  publishBeforeUpdate?: boolean;
+  /** pre-receive sees the commands refused before it too (git's receive-pack; see `ReceivePackConfig`) */
+  preReceiveSeesRefused?: boolean;
+}
+
+/**
+ * What a handler is told besides the request: the repository path (for the hooks) and, with
+ * `done`, a callback given the promise of the whole run (settled once the streamed response
+ * is written and the run's quarantine released), for what must last as long as the run
+ * (`ServedRepository.around`).
+ */
+export interface HttpHandlerContext {
+  repoPath?: string;
+  done?: (finished: Promise<void>) => void;
 }
 
 /** Default idle timeout of a POST /git-receive-pack body. */
@@ -644,7 +668,7 @@ export async function handleUploadPack(
   repository: RepositoryFacade,
   refStore: RefStore,
   options: HttpServerOptions = {},
-  context: { repoPath?: string } = {},
+  context: HttpHandlerContext = {},
 ): Promise<HttpResponse> {
   const requestBytes = await readUploadPackRequest(request, options);
   if (!(requestBytes instanceof Uint8Array)) return requestBytes;
@@ -677,7 +701,7 @@ export async function handleUploadPack(
   // (ref advertisement was already sent in GET /info/refs)
   const fsm = new Fsm(serverFetchTransitions, serverFetchHandlers);
   fsm.setState("READ_WANTS");
-  return streamUploadPack(requestBytes, fsm, { repository, refStore, state, config });
+  return streamUploadPack(requestBytes, fsm, { repository, refStore, state, config }, context);
 }
 
 /**
@@ -702,7 +726,7 @@ export async function handleUploadPackV2(
   repository: RepositoryFacade,
   refStore: RefStore,
   options: HttpServerOptions = {},
-  context: { repoPath?: string } = {},
+  context: HttpHandlerContext = {},
 ): Promise<HttpResponse> {
   const requestBytes = await readUploadPackRequest(request, options);
   if (!(requestBytes instanceof Uint8Array)) return requestBytes;
@@ -725,7 +749,7 @@ export async function handleUploadPackV2(
 
   const fsm = new Fsm(serverV2Transitions, serverV2Handlers);
   fsm.setState("READ_COMMAND");
-  return streamUploadPack(requestBytes, fsm, { repository, refStore, state, config });
+  return streamUploadPack(requestBytes, fsm, { repository, refStore, state, config }, context);
 }
 
 /**
@@ -766,6 +790,7 @@ async function streamUploadPack(
   requestBytes: Uint8Array,
   fsm: Fsm<ProcessContext>,
   parts: Pick<ProcessContext, "repository" | "refStore" | "state" | "config">,
+  context: HttpHandlerContext = {},
 ): Promise<HttpResponse> {
   // An identity TransformStream with no readable buffer
   const pipe = new TransformStream<Uint8Array, Uint8Array>(
@@ -818,7 +843,7 @@ async function streamUploadPack(
       return plain(500, failure.error.message);
     }
   }
-  void run.then(async (failure) => {
+  const finished = run.then(async (failure) => {
     if (failure?.how === "abort") {
       await out.abort(failure.error).catch(() => {});
       return;
@@ -832,6 +857,7 @@ async function streamUploadPack(
     }
     await out.close().catch(() => {});
   });
+  context.done?.(finished);
 
   return {
     status: 200,
@@ -945,7 +971,7 @@ export async function handleReceivePack(
   repository: RepositoryFacade,
   refStore: RefStore,
   options: HttpServerOptions = {},
-  context: { repoPath?: string } = {},
+  context: HttpHandlerContext = {},
 ): Promise<HttpResponse> {
   if (!request.body) return plain(400, "Missing request body");
 
@@ -1012,6 +1038,11 @@ export async function handleReceivePack(
       updateWorktree: rp.updateWorktree,
       shallowUpdate: rp.shallowUpdate,
       strictAtomic: rp.strictAtomic,
+      ...(rp.relayPostReceive ? { relayPostReceive: true } : {}),
+      ...(rp.batchNonAtomic ? { batchNonAtomic: true } : {}),
+      ...(rp.interleaveUpdateHook ? { interleaveUpdateHook: true } : {}),
+      ...(rp.publishBeforeUpdate ? { publishBeforeUpdate: true } : {}),
+      ...(rp.preReceiveSeesRefused ? { preReceiveSeesRefused: true } : {}),
       logger: options.logger,
       request: {
         method: request.method,
@@ -1075,7 +1106,7 @@ export async function handleReceivePack(
     };
   }
 
-  void run.then(async ({ thrown }) => {
+  const finished = run.then(async ({ thrown }) => {
     const output = getOutput(ctx);
     const reported = (state as ProtocolState & { reportSent?: boolean }).reportSent === true;
     if (thrown !== undefined || (output.error && !reported)) {
@@ -1089,6 +1120,7 @@ export async function handleReceivePack(
     // git's post-receive: once the report is written, apart from the response
     for (const task of afterReport) setTimeout(() => void task(), 0);
   });
+  context.done?.(finished);
 
   return {
     status: 200,

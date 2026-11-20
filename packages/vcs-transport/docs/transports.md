@@ -105,6 +105,61 @@ handler speaks protocol v2 to clients that ask for it. It has no on/off switch f
 `resolveRepository` that returns `null`, or a `receivePack.hooks.authorize` that refuses, is how a
 server says no.
 
+### Serving repositories on disk as `git http-backend` does
+
+A server for repositories on disk usually wants what native git's `http-backend` gives: the
+repository's own hooks, the settings of its config, and the services switched on and off by
+`http.*`. `createServedFetchHandler` takes the same resolver as `serveGitConnection` (a path to a
+`ServedRepository`), so one resolver serves git://, ssh and HTTP alike:
+
+```typescript
+import { createBasePathResolver, createServedFetchHandler } from "@statewalker/vcs-transport";
+import { remoteHookSession, servedRepositoryOf } from "@statewalker/vcs-commands";
+
+const handleGit = createServedFetchHandler({
+  resolveRepository: createBasePathResolver({
+    files,                 // the storage the repositories are in
+    basePath: "/srv/git",  // http-backend's GIT_PROJECT_ROOT
+    exportAll: true,       // GIT_HTTP_EXPORT_ALL (else git-daemon-export-ok is required)
+    openRepository: async (gitDir) => {
+      const opened = await host.worktree.openRepository?.(`..${gitDir}`);
+      if (!opened) return undefined;
+      const hooks = remoteHookSession(host, opened); // host: a WorkingCopy with a hook runner
+      return servedRepositoryOf(opened, hooks ? { hooks } : {});
+    },
+  }),
+  // http-backend's REMOTE_USER: who the web server authenticated
+  remoteUser: (request) => userFromAuthorization(request.headers.authorization),
+});
+Deno.serve(handleGit);
+```
+
+A push runs the repository's pre-receive, update, post-receive and post-update hooks (their
+output relayed as `remote:` lines), push-to-checkout for `receive.denyCurrentBranch=updateInstead`,
+and the reference-transaction hook through `ServedRepository.around`, which lasts until the push
+has ended, not only until the response head is out. pre-receive gets `GIT_QUARANTINE_PATH`,
+`GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` as git sets them, so a hook running
+native git (`git cat-file -t $new`) reads the pushed objects before they are published.
+
+Settings are layered as `serveGitService` layers them: git's defaults, the operator's `settings`,
+what the repository's config sets (`receive.*`, `uploadpack.hideRefs`, `receive.hideRefs`,
+`transfer.hideRefs`), then the resolver's `ServedRepository.settings`.
+
+The services follow http-backend's rules, the repository's config over the handler's options:
+
+| Service | Default | Config | Option |
+|---|---|---|---|
+| upload-pack (fetch, clone) | served | `http.uploadpack` | `enableUploadPack` |
+| receive-pack (push) | served only to a request with a `remoteUser` | `http.receivepack` | `enableReceivePack` |
+| dumb `HEAD`, `info/refs` | served from the refs | `http.getanyfile` | `getAnyFile` |
+
+A service that is not enabled, or an unknown one, is answered `403` with an empty body, as
+http-backend answers it ("Service not enabled: 'receive-pack'" goes to `logger.info`, where
+http-backend writes it to its stderr); a native client prints `The requested URL returned error:
+403`. An unknown path or repository is a `404`, the wrong method a `405` with `Allow`.
+`allowOverride: false` keeps the repositories' `http.*` from overriding the options. Dumb-protocol
+object files (`objects/...`) are never served: a dumb client cannot fetch from this handler.
+
 ## git://
 
 ```typescript

@@ -89,6 +89,8 @@ export interface ServeOverDuplexOptions {
   interleaveUpdateHook?: boolean;
   /** receive-pack: objects published before the commands are checked (see `ReceivePackOptions`) */
   publishBeforeUpdate?: boolean;
+  /** receive-pack: pre-receive sees the commands refused before it too (see `ReceivePackConfig`) */
+  preReceiveSeesRefused?: boolean;
   /** upload-pack hooks: authorize (before the negotiation), postUpload (after the pack) */
   uploadPackHooks?: UploadPackHooks;
   /**
@@ -257,6 +259,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       ...(options.batchNonAtomic ? { batchNonAtomic: true } : {}),
       ...(options.interleaveUpdateHook ? { interleaveUpdateHook: true } : {}),
       ...(options.publishBeforeUpdate ? { publishBeforeUpdate: true } : {}),
+      ...(options.preReceiveSeesRefused ? { preReceiveSeesRefused: true } : {}),
     },
   };
   // post-receive tasks: started once the report is written (detached from this call)

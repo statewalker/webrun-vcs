@@ -60,12 +60,9 @@ const remoteLines = (text: string) =>
     .map((l) => l.slice("remote: ".length).trimEnd())
     .filter((l) => /^hook /.test(l));
 
-/** The hook log with the quarantine path git gives pre-receive and update left out. */
+/** The hook log, the quarantine directory git names to pre-receive written alike. */
 const logOf = (twin: HookTwin) =>
-  hookLog(twin)
-    .split("\n")
-    .filter((l) => !l.startsWith("GIT_QUARANTINE_PATH="))
-    .join("\n");
+  hookLog(twin).replace(/tmp_objdir-incoming-[^/\s]+/g, "tmp_objdir-incoming-<id>");
 
 async function expectPush(
   dir: string,

@@ -26,6 +26,7 @@ import {
   ZERO_OID,
 } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
+import type { WorktreeAdmin } from "@statewalker/vcs-working-tree";
 import {
   FetchIntoCheckedOutBranchError,
   InvalidArgumentError,
@@ -646,7 +647,11 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const remote = await this.prepareRemote(remoteUrl);
 
     // git truncates FETCH_HEAD when the fetch starts: a failed fetch leaves it empty
-    const checkout = this._workingCopy.checkout;
+    // a bare repository writes FETCH_HEAD in its git directory (no checkout to ask)
+    const checkout =
+      "checkout" in this._workingCopy
+        ? this._workingCopy.checkout
+        : (this._workingCopy as Partial<Pick<WorktreeAdmin, "bareRepository">>).bareRepository;
     const writesFetchHead = !this.dryRun && this.writeFetchHead && !!checkout?.writeFetchHead;
     if (writesFetchHead && !this.appendFetchHead) await checkout.writeFetchHead?.("");
 

@@ -54,8 +54,16 @@ export interface NativeGitHttpBackend {
   close(): void;
 }
 
-/** Serves the repositories under `projectRoot` through `git http-backend`. */
-export function nativeGitHttpBackend(projectRoot: string, home: string): NativeGitHttpBackend {
+/**
+ * Serves the repositories under `projectRoot` through `git http-backend`; `extraEnv` is added
+ * to every backend's variables (`REMOTE_USER`, the variables of the repositories' hooks), or
+ * computed per request.
+ */
+export function nativeGitHttpBackend(
+  projectRoot: string,
+  home: string,
+  extraEnv: Record<string, string> | ((request: Request) => Record<string, string>) = {},
+): NativeGitHttpBackend {
   const children = new Set<ChildProcess>();
   const handler = async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
@@ -70,9 +78,12 @@ export function nativeGitHttpBackend(projectRoot: string, home: string): NativeG
       QUERY_STRING: url.search.replace(/^\?/, ""),
       CONTENT_TYPE: request.headers.get("content-type") ?? "",
       REMOTE_ADDR: "127.0.0.1",
+      ...(typeof extraEnv === "function" ? extraEnv(request) : extraEnv),
     };
     if (body) env.CONTENT_LENGTH = String(body.length);
     if (gitProtocol) env.GIT_PROTOCOL = gitProtocol;
+    const encoding = request.headers.get("content-encoding");
+    if (encoding) env.HTTP_CONTENT_ENCODING = encoding;
     const child = spawn("git", ["http-backend"], { env });
     children.add(child);
     child.on("close", () => children.delete(child));
