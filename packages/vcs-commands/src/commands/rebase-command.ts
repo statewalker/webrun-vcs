@@ -34,6 +34,14 @@ import type { RebaseResult, RebaseTodoLine } from "../results/rebase-result.js";
 import { RebaseAction, RebaseStatus } from "../results/rebase-result.js";
 import { coreBool, createIdAbbreviator, worktreeModeTrust } from "./core-config.js";
 import { createDescriber, type DescribeOptions } from "./git-describe.js";
+import {
+  type GitCommitHookRun,
+  gitCommitAfterHooks,
+  gitCommitMessageHooks,
+  runPostCheckoutHook,
+  sequencerPostCommit,
+  sequencerPrepareMessage,
+} from "./git-hooks.js";
 import { hostEnvironmentOf, localTimezoneOffset } from "./git-ident.js";
 import { favorOf, MergeCommand } from "./merge-command.js";
 import { configBool, configValue, conflictStyleOf } from "./merge-config.js";
@@ -283,6 +291,14 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private autosquash?: boolean;
   /** `--root`: every commit of the branch rebased (onto the upstream given, else a new root) */
   private root = false;
+  private noVerify = false;
+
+  /** `--no-verify`: the pre-rebase hook does not run. */
+  setNoVerify(noVerify: boolean): this {
+    this.checkCallable();
+    this.noVerify = noVerify;
+    return this;
+  }
   /** The command after the one running (git's peek_command), for record_in_rewritten */
   private nextCommand?: RebaseAction;
 
@@ -771,6 +787,22 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       output.push(`${upToDate}, rebase forced.`);
     }
 
+    // the pre-rebase hook, told the upstream as given (`--root` with --root), may refuse
+    if (!this.noVerify) {
+      const upstreamArg =
+        this.root && !this.upstreamCommit ? "--root" : (this.upstreamCommitName ?? onto);
+      const pre = await this.hooks.run("pre-rebase", { args: [upstreamArg] });
+      if (pre && pre.exitCode !== 0) {
+        await unstash();
+        return {
+          status: RebaseStatus.FAILED,
+          // 2.43 dies (exit 128), 2.5x returns an error (exit 1)
+          message: `${this.hooks.compatibility === "2.43" ? "fatal" : "error"}: The pre-rebase hook refused to rebase.`,
+          output,
+        };
+      }
+    }
+
     const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
     const ontoTreeId = await this.commits.getTree(onto);
     const ontoTree = await flatTree(this.trees, ontoTreeId);
@@ -788,6 +820,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
       await state.setRef("ORIG_HEAD", headId);
       await this.refsStore.set("HEAD", onto, this.startLog());
+      await runPostCheckoutHook(this.hooks, headId, onto, true);
       await this.finishBranch(headName, onto, onto);
       await unstash();
       return { status, newHead: onto, output };
@@ -1012,6 +1045,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await state.write(`${DIR}/end`, `${commands}\n`);
     await state.write(`${DIR}/msgnum`, "0\n");
     await this.refsStore.set("HEAD", start, this.startLog());
+    // checkout_onto's post-checkout hook: the HEAD left, the commit the picks start from
+    await runPostCheckoutHook(this.hooks, headId, start, true);
     // pick_commits runs the list as expanded (full command names), not as written
     return this.processTodo(state, worktree, output, todo);
   }
@@ -1113,7 +1148,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await this.flushRewrittenPending(state);
     // `git notes copy --for-rewrite=rebase` fed rewritten-list
     const rewritten = await state.read(`${DIR}/rewritten-list`);
-    if (rewritten) await copyNotesForRebase(this.notesContext(), rewritten);
+    if (rewritten) {
+      await copyNotesForRebase(this.notesContext(), rewritten);
+      // the post-rewrite hook told "rebase", rewritten-list on its stdin
+      await this.hooks.run("post-rewrite", { args: ["rebase"], stdin: rewritten });
+    }
     const autostash = (await state.read(`${DIR}/autostash`))?.trim();
     if (autostash) output.push(...(await applyAutostash(this.context(worktree), autostash)));
     await this.doUpdateRefs(state, output);
@@ -1568,11 +1607,35 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private async rewordHead(state: OperationState): Promise<void> {
     const head = await this.commits.load(await this.resolveHead());
     if (!head) return;
+    if (this.hooks.enabled) {
+      // run_git_commit(EDIT_MSG | VERIFY_MSG | AMEND_MSG): git commit --amend -e, its hooks
+      await state.removeRef("AUTO_MERGE");
+      await this.amendHead(state, head.tree, head.message, RebaseAction.REWORD, true, {
+        verify: true,
+        editor: true,
+        hookArgs: ["commit", "HEAD"],
+        env: { GIT_REFLOG_ACTION: this.stepAction(RebaseAction.REWORD) },
+      });
+      await state.remove("SQUASH_MSG");
+      return;
+    }
     const message = this.editMessage(head.message);
     // git commit --amend: the merge state it removes
     await state.removeRef("AUTO_MERGE");
     await this.amendHead(state, head.tree, message, RebaseAction.REWORD, true);
     await state.remove("SQUASH_MSG");
+  }
+
+  /** The reflog action of a rebase step (`rebase (reword)`), git's GIT_REFLOG_ACTION for it. */
+  private stepAction(step: string): string {
+    return reflogMessages.rebaseStep(this.reflogAction("rebase"), step);
+  }
+
+  /** The editor of a `git commit -e` run (the interactive handler; comments kept). */
+  private modifyMessage(text: string): string {
+    return this.interactiveHandler?.modifyCommitMessage
+      ? this.interactiveHandler.modifyCommitMessage(text)
+      : text;
   }
 
   /**
@@ -1586,13 +1649,25 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     message: string,
     step: string,
     byGitCommit = false,
+    /** `git commit` run with hooks: `message` is its template, edited and checked by them */
+    gitCommit?: GitCommitHookRun,
   ): Promise<ObjectId> {
     const headId = await this.resolveHead();
     const head = await this.commits.load(headId);
     if (!head) throw new NoHeadError("HEAD cannot be resolved");
-    const id = await this.commitOnto(state, head.parents, tree, head.author, message, step);
+    const id = await this.commitOnto(
+      state,
+      head.parents,
+      tree,
+      head.author,
+      message,
+      step,
+      gitCommit,
+    );
     // commit_post_rewrite of the amend (git commit --amend, try_to_commit's AMEND_MSG)
     await copyNotesForAmend(this.notesContext(), headId, id, byGitCommit ? head.author : undefined);
+    // ... and git commit's post-rewrite hook, told "amend"
+    if (gitCommit) await gitCommitAfterHooks(this.hooks, gitCommit, { from: headId, to: id });
     return id;
   }
 
@@ -2589,14 +2664,50 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // (git commit -e: comments stripped) or cleaned up (--cleanup=strip)
     const comment = commentPrefixOf(this.workingCopy);
     let message: string;
+    // with hooks: git commit -n (-F rebase-merge/message) -e, the template edited between
+    // its hooks (commit_staged_changes: EDIT_MSG without VERIFY_MSG)
+    let gitCommit: GitCommitHookRun | undefined;
     try {
-      if (finalFixup) {
+      if (this.hooks.enabled) {
+        gitCommit = {
+          verify: false,
+          editor: !finalFixup || edit,
+          hookArgs: finalFixup ? (amend ? ["commit", "HEAD"] : []) : ["message"],
+          env: { GIT_REFLOG_ACTION: this.stepAction("continue") },
+        };
+        message = finalFixup
+          ? (headCommit?.message ?? "")
+          : ((await state.read(`${DIR}/message`)) ?? (await state.read("MERGE_MSG")) ?? "");
+      } else if (finalFixup) {
         const own = headCommit?.message ?? "";
         message = edit ? this.editMessage(own) : cleanupMessage(own, comment);
       } else {
         message = this.editMessage(
           (await state.read(`${DIR}/message`)) ?? (await state.read("MERGE_MSG")) ?? "",
         );
+      }
+      if (gitCommit) {
+        const run = gitCommit;
+        if (amend) await this.amendHead(state, treeId, message, "continue", true, run);
+        else {
+          const mergeHeads = ((await state.read("MERGE_HEAD")) ?? "")
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => /^[0-9a-f]{40,64}$/.test(line));
+          const author =
+            parseAuthorScript((await state.read(`${DIR}/author-script`)) ?? "") ??
+            this.resolveAuthor();
+          await this.commitOnto(
+            state,
+            [headId, ...mergeHeads],
+            treeId,
+            author,
+            message,
+            "continue",
+            run,
+          );
+          await gitCommitAfterHooks(this.hooks, run);
+        }
       }
     } catch (error) {
       // git commit failed on its editor: nothing committed, the stop stays as it is
@@ -2607,7 +2718,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         ),
       };
     }
-    if (amend) await this.amendHead(state, treeId, message, "continue", true);
+    if (gitCommit) {
+      // committed above, with git commit's hooks
+    } else if (amend) await this.amendHead(state, treeId, message, "continue", true);
     else {
       // a stopped merge: its other parents (git commit reads MERGE_HEAD, one per line: an
       // octopus has several)
@@ -2742,6 +2855,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     picked: PersonIdent,
     message: string,
     step: string,
+    /**
+     * A `git commit` run (sequencer.c `run_git_commit`) with its hooks, `message` its
+     * template: post-commit is left to the caller (post-rewrite follows it for an amend)
+     */
+    gitCommit?: GitCommitHookRun,
   ): Promise<ObjectId> {
     // git's try_to_commit: reset_ident_date() first, so each pick is committed (and its
     // reflog line written) at its own time
@@ -2758,19 +2876,28 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     if (await state.exists(`${DIR}/cdate_is_adate`)) {
       committer = { ...committer, timestamp: author.timestamp, tzOffset: author.tzOffset };
     }
+    const hooked = gitCommit
+      ? cleanupMessage(
+          await gitCommitMessageHooks(this.hooks, state, message, gitCommit, (text) =>
+            gitCommit.editor ? this.modifyMessage(text) : text,
+          ),
+          commentPrefixOf(this.workingCopy),
+        )
+      : await sequencerPrepareMessage(this.hooks, state, message);
     const id = await this.commits.store({
       tree,
       parents,
       author,
       committer,
-      message,
+      message: hooked,
     });
     const action = reflogMessages.rebaseStep(this.reflogAction("rebase"), step);
     await this.refsStore.set(
       "HEAD",
       id,
-      this.reflogLine(reflogMessages.pick(action, message), this.committer),
+      this.reflogLine(reflogMessages.pick(action, hooked), this.committer),
     );
+    if (!gitCommit) await sequencerPostCommit(this.hooks);
     return id;
   }
 

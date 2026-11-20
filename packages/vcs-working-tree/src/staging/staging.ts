@@ -358,6 +358,12 @@ export interface StagingIndexLock {
   commit(): Promise<void>;
   /** Removes the lock: the index stays as it was. Does nothing once committed. */
   rollback(): Promise<void>;
+  /**
+   * Reads the lock back into the staging as another writer left it (a hook given the lock
+   * as `GIT_INDEX_FILE`): git's `discard_index` + `read_index_from(<lock>)`. A later
+   * `commit()` renames it over the index (with `write()` first, what the staging holds then).
+   */
+  reread?(): Promise<void>;
 }
 
 /**

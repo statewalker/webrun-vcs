@@ -23,6 +23,7 @@ import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js"
 import { TransportCommand } from "../transport-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
+import { runPostCheckoutHook } from "./git-hooks.js";
 import { localRemotePath, openLocalRemote, withLocalUploadPack } from "./local-transport.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
@@ -658,6 +659,20 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       } catch (error) {
         throw new CloneCheckoutError(cloneResult, error);
       }
+      // checkout()'s post-checkout hook: from no commit to the one checked out, a branch
+      // switch; its exit code becomes the clone's exit status
+      // (clone exports GIT_DIR, the new repository's absolute path, and no GIT_PREFIX)
+      const gitDir = this.hooks.enabled ? await this.hooks.hostGitDir() : undefined;
+      const code = await runPostCheckoutHook(
+        this.hooks,
+        undefined,
+        checkoutId,
+        true,
+        gitDir ? { GIT_DIR: gitDir } : undefined,
+        undefined,
+        false,
+      );
+      if (code !== 0) cloneResult.hookExitCode = code;
     }
     return cloneResult;
   }

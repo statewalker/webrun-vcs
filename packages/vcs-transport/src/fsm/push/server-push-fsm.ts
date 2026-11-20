@@ -112,12 +112,14 @@ export const serverPushTransitions: FsmTransition[] = [
   ["VALIDATE_COMMANDS", "SOME_INVALID", "APPLY_UPDATES"], // Partial execution
   ["VALIDATE_COMMANDS", "ALL_INVALID", "SEND_STATUS"],
   ["VALIDATE_COMMANDS", "INTERNAL_ERROR", "SEND_STATUS"], // reported in band: "internal error"
+  ["VALIDATE_COMMANDS", "DIED", ""], // the ref store's reference-transaction hook aborted
 
   // Apply ref updates
   ["APPLY_UPDATES", "UPDATES_APPLIED", "SEND_STATUS"],
   ["APPLY_UPDATES", "PARTIAL_APPLIED", "SEND_STATUS"], // Some failed
   ["APPLY_UPDATES", "ATOMIC_FAILED", "SEND_STATUS"], // Atomic push failed
   ["APPLY_UPDATES", "INTERNAL_ERROR", "SEND_STATUS"], // reported in band: "internal error"
+  ["APPLY_UPDATES", "DIED", ""], // the ref store's reference-transaction hook aborted: git dies
 
   // Send status report
   ["SEND_STATUS", "STATUS_SENT", "RUN_POST_RECEIVE_HOOK"],
@@ -549,10 +551,45 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
             (c) => c.result !== "NOT_ATTEMPTED" && !state.preReceiveRefused?.has(c),
           ),
         );
-        await validateCommands(ctx);
+        // git migrates the quarantined objects once pre-receive passed and a command is still
+        // open, before update() checks each (execute_commands): a refusal there keeps them
+        if (
+          receivePackConfig(ctx).publishBeforeUpdate &&
+          (state.pushCommands ?? []).some((c) => c.result === "NOT_ATTEMPTED")
+        ) {
+          await publishQuarantine(ctx);
+        }
+        try {
+          await validateCommands(ctx);
+        } catch (e) {
+          if (isTransactionAborted(e)) {
+            getOutput(ctx).error = `fatal: ${(e as Error).message}`;
+            return "DIED";
+          }
+          throw e;
+        }
+        if (state.peerGone !== undefined) {
+          await discardQuarantine(ctx);
+          return internalError(ctx, state.peerGone);
+        }
         const commands = state.pushCommands ?? [];
         const invalidCount = commands.filter((c) => c.result !== "NOT_ATTEMPTED").length;
-        if (invalidCount === commands.length) return "ALL_INVALID";
+        if (invalidCount === commands.length) {
+          // git 2.5x still commits the (empty) transaction of each phase update() took up
+          const rp = receivePackConfig(ctx);
+          if (rp.batchNonAtomic && !state.capabilities.has("atomic") && !state.phasesApplied) {
+            try {
+              await applyUpdates(state, getRefStore(ctx), false, false, true);
+            } catch (e) {
+              if (isTransactionAborted(e)) {
+                getOutput(ctx).error = `fatal: ${(e as Error).message}`;
+                return "DIED";
+              }
+              throw e;
+            }
+          }
+          return "ALL_INVALID";
+        }
         if (invalidCount > 0) return "SOME_INVALID";
         return "ALL_VALID";
       } catch (e) {
@@ -592,8 +629,21 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           const reached = blocked ? [] : state.shallowConnectivity.shallowReachedFrom(tips);
           if (reached.length > 0) await repository.updateShallow(reached);
         }
-        return await applyUpdates(state, refStore, atomic, blocked);
+        return await applyUpdates(
+          state,
+          refStore,
+          atomic,
+          blocked,
+          receivePackConfig(ctx).batchNonAtomic === true,
+        );
       } catch (e) {
+        if (isTransactionAborted(e)) {
+          // refs.c dies when the reference-transaction hook aborts: receive-pack ends
+          // without a status report, its message on its stderr
+          const output = getOutput(ctx);
+          output.error = `fatal: ${(e as Error).message}`;
+          return "DIED";
+        }
         return internalError(ctx, e);
       }
     },
@@ -632,8 +682,12 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
             await transport.writeFlush();
           }
         }
-        // git ends a side-band answer with a flush, report or not
-        if (useSideband) await transport.writeFlush();
+        // git ends a side-band answer with a flush, report or not (after post-receive when
+        // its output is relayed)
+        if (useSideband) {
+          if (receivePackConfig(ctx).relayPostReceive) state.flushAfterPostReceive = true;
+          else await transport.writeFlush();
+        }
         state.reportSent = true;
         return "STATUS_SENT";
       } catch (e) {
@@ -650,7 +704,10 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const state = getState<ServerPushState>(ctx);
       const hook = receivePackHooks(ctx)?.postReceive;
       const applied = (state.appliedCommands ?? []).map(toReceiveCommand);
-      if (!hook || applied.length === 0) return "NO_HOOK";
+      if (!hook || applied.length === 0) {
+        await closeRelayedBand(ctx);
+        return "NO_HOOK";
+      }
       const hookCtx = hookContext(ctx);
       const task = async () => {
         try {
@@ -659,6 +716,12 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           logError(ctx, "post-receive hook failed", e);
         }
       };
+      if (receivePackConfig(ctx).relayPostReceive) {
+        await task();
+        await state.bandQueue;
+        await closeRelayedBand(ctx);
+        return "HOOK_STARTED";
+      }
       const afterReport = receivePackConfig(ctx).afterReport;
       if (afterReport) afterReport(task);
       else setTimeout(() => void task(), 0);
@@ -671,10 +734,16 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
  * Extended state for server push operations.
  */
 interface ServerPushState extends ProtocolState {
+  /** The side-band's closing flush waits for a relayed post-receive */
+  flushAfterPostReceive?: boolean;
   pushCommands?: PushCommand[];
   pushOptions?: string[];
   packStream?: AsyncIterable<Uint8Array>;
   appliedCommands?: PushCommand[];
+  /** The commands `interleaveUpdateHook` or `batchNonAtomic` applied while checking them */
+  eagerlyApplied?: PushCommand[];
+  /** `batchNonAtomic` applied each phase's commands as it checked them (no batch is left) */
+  phasesApplied?: boolean;
   /** The client's `shallow` lines */
   pushShallow?: string[];
   /** The connectivity analysis of an accepted shallow push (which shallow commits to record) */
@@ -835,6 +904,11 @@ function protocolError(ctx: ProcessContext, message: string): string {
  * "internal error" in the report (the client hears about it), and `output.error` tells the
  * driver.
  */
+/** A ref store's reference-transaction hook aborted the update (vcs-core's error). */
+function isTransactionAborted(error: unknown): boolean {
+  return error instanceof Error && error.name === "RefTransactionAbortedError";
+}
+
 function internalError(ctx: ProcessContext, error: unknown): string {
   const output = getOutput(ctx);
   output.error = error instanceof Error ? error.message : String(error);
@@ -927,7 +1001,9 @@ function enqueueBand(ctx: ProcessContext, write: () => Promise<void>): Promise<v
 /** Writes `text` on the progress channel (side-band only; nothing once the report is out). */
 function sendMessage(ctx: ProcessContext, text: string): Promise<void> {
   const state = getState<ServerPushState>(ctx);
-  if (!state.capabilities.has("side-band-64k") || state.reportSent || !text) {
+  // (after the report only while the band stays open for a relayed post-receive)
+  const closed = state.reportSent && !state.flushAfterPostReceive;
+  if (!state.capabilities.has("side-band-64k") || closed || !text) {
     return Promise.resolve();
   }
   const transport = getTransport(ctx);
@@ -1256,6 +1332,44 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
     }
   };
 
+  // git 2.43's execute_commands_non_atomic: each command's ref transaction right after its
+  // checks and update hook (the objects migrated before the first)
+  const batch = refStore.batch?.bind(refStore);
+  const eager =
+    !atomic && rp.interleaveUpdateHook === true && !!batch && !state.shallowConnectivity;
+  // git 2.5x's execute_commands_non_atomic: update() for the deletions, their transaction
+  // committed, then update() for the rest and theirs
+  if (!atomic && !eager && rp.batchNonAtomic === true && batch && !state.shallowConnectivity) {
+    for (const deletions of [true, false]) {
+      const phase = commands.filter(
+        (c) => c.result === "NOT_ATTEMPTED" && (c.newOid === ZERO_OID) === deletions,
+      );
+      if (phase.length === 0) continue;
+      for (const cmd of phase) await check(cmd);
+      // a client that went away mid-check gets no ref update (git dies on the failed write)
+      if (state.peerGone !== undefined) {
+        state.phasesApplied = true;
+        return;
+      }
+      const open = phase.filter((c) => c.result === "NOT_ATTEMPTED");
+      for (const c of open) if (isNoop(c)) c.result = "OK";
+      const pending = open.filter((c) => !isNoop(c));
+      if (pending.length > 0) await publishQuarantine(ctx);
+      const applied = await applyPhase(batch, pending, true);
+      for (const c of pending) {
+        if (applied.has(c)) c.result = "OK";
+        else {
+          c.result = "LOCK_FAILURE";
+          c.message = FAILED_TO_UPDATE;
+        }
+      }
+    }
+    // post-receive's commands in the order the commands came
+    state.eagerlyApplied = commands.filter((c) => c.result === "OK" && !isNoop(c));
+    state.appliedCommands = [...state.eagerlyApplied];
+    state.phasesApplied = true;
+    return;
+  }
   for (const cmd of commands) {
     if (cmd.result !== "NOT_ATTEMPTED") continue;
     await check(cmd);
@@ -1263,6 +1377,23 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
     if (atomic && cmd.result !== "NOT_ATTEMPTED") {
       failOpen(ATOMIC_PUSH_FAILURE);
       return;
+    }
+    if (eager && batch && cmd.result === "NOT_ATTEMPTED" && !isNoop(cmd)) {
+      await publishQuarantine(ctx);
+      let ok = false;
+      try {
+        ok = (await batch([toRefCommand(cmd)], { message: "push" })).ok;
+      } catch (e) {
+        if (isTransactionAborted(e)) throw e;
+      }
+      if (ok) {
+        cmd.result = "OK";
+        state.eagerlyApplied = [...(state.eagerlyApplied ?? []), cmd];
+        state.appliedCommands = [...state.eagerlyApplied];
+      } else {
+        cmd.result = "LOCK_FAILURE";
+        cmd.message = FAILED_TO_UPDATE;
+      }
     }
   }
   if (transactionFails) failOpen(ATOMIC_TRANSACTION_FAILED);
@@ -1324,10 +1455,12 @@ async function applyUpdates(
   refStore: RefStore,
   atomic: boolean,
   blocked = (state.pushCommands ?? []).some((c) => c.result !== "NOT_ATTEMPTED"),
+  /** Not atomic: the deletions in one batch, then the rest (see `batchNonAtomic`) */
+  batchNonAtomic = false,
 ): Promise<ApplyResult> {
   const all = state.pushCommands ?? [];
   const open = all.filter((c) => c.result === "NOT_ATTEMPTED");
-  state.appliedCommands = [];
+  state.appliedCommands = [...(state.eagerlyApplied ?? [])];
   if (atomic && blocked) {
     for (const c of open) {
       c.result = "ATOMIC_REJECTED";
@@ -1357,7 +1490,8 @@ async function applyUpdates(
     let result: Awaited<ReturnType<typeof batch>>;
     try {
       result = await batch(pending.map(toRefCommand), options);
-    } catch {
+    } catch (e) {
+      if (isTransactionAborted(e)) throw e;
       result = { ok: false, rejected: pending.map((c) => ({ name: c.refName, reason: "locked" })) };
     }
     if (result.ok) {
@@ -1371,14 +1505,27 @@ async function applyUpdates(
     return failTransaction();
   }
 
-  for (const c of pending) {
-    let ok = false;
-    try {
-      ok = (await batch([toRefCommand(c)], options)).ok;
-    } catch {
-      ok = false;
+  // git 2.5x: one batch for the deletions, one for the rest (see applyPhase)
+  const applied = new Set<PushCommand>();
+  const phases = batchNonAtomic
+    ? [pending.filter((c) => c.type === "DELETE"), pending.filter((c) => c.type !== "DELETE")]
+    : [pending];
+  // the commands git's update() took up (no refusal before it): a phase that had some
+  // commits its transaction even when update() refused them all
+  const considered = all.filter((c) => !state.refusedBeforeTransaction?.has(c));
+  for (const phase of phases) {
+    if (batchNonAtomic && phase.length === 0) {
+      const deletions = phase === phases[0];
+      if (considered.some((c) => (c.type === "DELETE") === deletions)) {
+        await applyPhase(batch, [], true);
+      }
+      continue;
     }
-    if (ok) {
+    for (const c of await applyPhase(batch, phase, batchNonAtomic)) applied.add(c);
+  }
+  // the results (and post-receive's commands) in the order the commands came
+  for (const c of pending) {
+    if (applied.has(c)) {
       c.result = "OK";
       state.appliedCommands.push(c);
     } else {
@@ -1387,6 +1534,45 @@ async function applyUpdates(
     }
   }
   return okCount() === all.length ? "UPDATES_APPLIED" : "PARTIAL_APPLIED";
+}
+
+/**
+ * Applies the commands of one phase of a push that is not atomic: with `together` (git
+ * 2.5x), one transaction for them all (an empty one is committed too, as git commits the
+ * transaction update() began), and a batch that fails (a ref refused under its locks) is
+ * applied ref by ref, as REF_TRANSACTION_ALLOW_FAILURE refuses only the refs that fail;
+ * else one batch per ref. A refusing reference-transaction hook throws. The commands
+ * applied.
+ */
+async function applyPhase(
+  batch: NonNullable<RefStore["batch"]>,
+  phase: PushCommand[],
+  together: boolean,
+): Promise<Set<PushCommand>> {
+  const options = { message: "push" };
+  const applied = new Set<PushCommand>();
+  if (together && phase.length === 0) {
+    await batch([], { ...options, emptyTransaction: true });
+    return applied;
+  }
+  if (together && phase.length > 1) {
+    try {
+      if ((await batch(phase.map(toRefCommand), options)).ok) {
+        for (const c of phase) applied.add(c);
+      }
+    } catch (e) {
+      if (isTransactionAborted(e)) throw e;
+    }
+  }
+  for (const c of phase) {
+    if (applied.has(c)) continue;
+    try {
+      if ((await batch([toRefCommand(c)], options)).ok) applied.add(c);
+    } catch (e) {
+      if (isTransactionAborted(e)) throw e;
+    }
+  }
+  return applied;
 }
 
 /**
@@ -1428,4 +1614,12 @@ async function applyOneByOne(
 
   state.appliedCommands = appliedCommands;
   return all.every((c) => c.result === "OK") ? "UPDATES_APPLIED" : "PARTIAL_APPLIED";
+}
+
+/** The side-band's closing flush SEND_STATUS left for after a relayed post-receive. */
+async function closeRelayedBand(ctx: ProcessContext): Promise<void> {
+  const state = getState<ServerPushState>(ctx);
+  if (!state.flushAfterPostReceive) return;
+  state.flushAfterPostReceive = false;
+  await getTransport(ctx).writeFlush();
 }

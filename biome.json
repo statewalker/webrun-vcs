@@ -72,7 +72,10 @@
       }
     },
     {
-      "includes": ["packages/vcs-utils-node/src/files/git-host-environment.ts"],
+      "includes": [
+        "packages/vcs-utils-node/src/files/git-host-environment.ts",
+        "packages/vcs-utils-node/src/files/node-hook-runner.ts"
+      ],
       "linter": {
         "rules": {
           "correctness": {

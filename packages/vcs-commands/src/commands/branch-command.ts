@@ -260,7 +260,8 @@ export class DeleteBranchCommand extends GitCommand<string[]> {
         }
       }
 
-      await this.refsStore.delete(refName);
+      // git deletes them with delete_refs (its reference-transaction hook calls differ)
+      await this.refsStore.delete(refName, { deleteRefs: true });
       deleted.push(refName);
     }
 

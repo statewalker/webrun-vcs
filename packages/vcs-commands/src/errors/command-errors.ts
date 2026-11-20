@@ -144,3 +144,25 @@ export class InvalidConfigError extends GitApiError {
     this.key = key;
   }
 }
+
+/**
+ * A hook refused the operation (githooks(5)): `pre-commit`, `commit-msg`, `pre-merge-commit`,
+ * `pre-rebase`, `pre-push`, `applypatch-msg`, `pre-applypatch` and the receive side's hooks
+ * exit non-zero to stop it. `message` is what git prints of its own (often nothing: the hook
+ * explains itself, in `output`); `output` is everything the hooks wrote, with git's hints.
+ */
+export class HookFailedError extends GitApiError {
+  constructor(
+    /** The hook that refused */
+    readonly hook: string,
+    /** Its exit code */
+    readonly hookExitCode: number,
+    message: string,
+    /** What the hooks of the command wrote up to the refusal (git relays it on stderr) */
+    readonly output: string,
+    exitCode = 1,
+  ) {
+    super(message, { exitCode });
+    this.name = "HookFailedError";
+  }
+}

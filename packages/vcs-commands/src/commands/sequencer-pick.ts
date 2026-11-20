@@ -9,7 +9,6 @@
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { Worktree } from "@statewalker/vcs-working-tree";
-
 import {
   InvalidMainlineParentError,
   MultipleParentsNotAllowedError,
@@ -17,6 +16,7 @@ import {
 import { NotACommitError, RefNotFoundError } from "../errors/ref-errors.js";
 import type { CommandCommits, CommandRefs, CommandTrees } from "../git-command.js";
 import { coreBool, createIdAbbreviator, type IdAbbreviator } from "./core-config.js";
+import { type HookSession, sequencerPostCommit, sequencerPrepareMessage } from "./git-hooks.js";
 import { authorIdentOf, committerIdentOf } from "./git-ident.js";
 import { UNMERGED_FILES_MESSAGE } from "./merge-command.js";
 import { conflictStyleOf } from "./merge-config.js";
@@ -77,6 +77,8 @@ export interface SequencerDeps extends MergeWriteContext {
   worktree?: Worktree;
   state: OperationState;
   resolve: (name: string) => Promise<ObjectId>;
+  /** The hooks of the command (prepare-commit-msg and post-commit around each commit) */
+  hooks?: HookSession;
 }
 
 /** Options of one sequencer run. */
@@ -537,8 +539,12 @@ export class PickSequencer {
     message: string,
     reflogMessage: string,
   ): Promise<ObjectId> {
-    const id = await this.deps.commits.store({ tree, parents, author, committer, message });
+    // try_to_commit: prepare-commit-msg may rewrite the message; post-commit after
+    const hooks = this.deps.hooks;
+    const text = hooks ? await sequencerPrepareMessage(hooks, this.deps.state, message) : message;
+    const id = await this.deps.commits.store({ tree, parents, author, committer, message: text });
     await this.moveHead(id, reflogMessage);
+    if (hooks) await sequencerPostCommit(hooks);
     return id;
   }
 

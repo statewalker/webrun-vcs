@@ -7,7 +7,9 @@ import type {
   PersonIdent,
   Ref,
   RefLogOptions,
+  RefRemoveOptions,
   Refs,
+  RefTransactionHook,
   SymbolicRef,
   Tag,
   Tags,
@@ -48,6 +50,7 @@ import {
   type IdAbbreviator,
   worktreeModeTrust,
 } from "./commands/core-config.js";
+import { HookSession, refTransactionHookOf } from "./commands/git-hooks.js";
 import {
   authorIdentOf,
   committerIdentOf,
@@ -86,9 +89,22 @@ export interface CommandTrees extends Trees {
 /**
  * Extended Refs interface with legacy method names for command compatibility.
  */
+/** A ref store that runs the reference-transaction hook (the files store). */
+interface TransactionHookStore {
+  setTransactionHook?(hook: RefTransactionHook | undefined): void;
+  getTransactionHook?(): RefTransactionHook | undefined;
+}
+
+/**
+ * The reference-transaction hooks commands installed: a command without hooks removes one
+ * of these left on its store (a command that wrote refs outside its `call`), never a hook
+ * someone else set (the receive side of a local push, a library user).
+ */
+const commandTransactionHooks = new WeakSet<RefTransactionHook>();
+
 export interface CommandRefs extends Refs {
   /** Delete a reference - alias for remove() */
-  delete(name: string): Promise<boolean>;
+  delete(name: string, options?: RefRemoveOptions): Promise<boolean>;
 }
 
 /**
@@ -136,7 +152,7 @@ function wrapTrees(trees: Trees): CommandTrees {
 function wrapRefs(refs: Refs): CommandRefs {
   const wrapper = refs as CommandRefs;
   if (!wrapper.delete) {
-    wrapper.delete = (name: string) => refs.remove(name);
+    wrapper.delete = (name: string, options?: RefRemoveOptions) => refs.remove(name, options);
   }
   return wrapper;
 }
@@ -293,10 +309,51 @@ export abstract class GitCommand<T> {
   private reflogActionOverride?: string;
   /** The time of this command's reflog lines, read once (git's ident_default_date). */
   private reflogClock?: number;
+  /** The hooks this command runs (made when first asked for) */
+  private hookSession?: HookSession;
 
   constructor(workingCopy: WorkingCopy) {
     this._workingCopy = workingCopy;
     this.installAttributesSource();
+    this.releaseHooksAfterCalls();
+  }
+
+  /**
+   * Each entry point of the command (`call`, `callText`, ...) puts back the ref store's
+   * reference-transaction hook when it ends, whatever the outcome.
+   */
+  private releaseHooksAfterCalls(): void {
+    const self = this as unknown as Record<string, unknown>;
+    const names = new Set<string>();
+    for (
+      let proto = Object.getPrototypeOf(this);
+      proto && proto !== Object.prototype;
+      proto = Object.getPrototypeOf(proto)
+    ) {
+      for (const name of Object.getOwnPropertyNames(proto)) {
+        if (!/^call(?:[A-Z]\w*)?$/.test(name)) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+        if (typeof descriptor?.value === "function") names.add(name);
+      }
+    }
+    for (const name of names) {
+      const method = self[name];
+      if (typeof method !== "function") continue;
+      self[name] = (...args: unknown[]) => {
+        let result: unknown;
+        try {
+          result = (method as (...a: unknown[]) => unknown).apply(this, args);
+        } catch (error) {
+          this.releaseRefTransactionHook();
+          throw error;
+        }
+        if (result && typeof (result as Promise<unknown>).finally === "function") {
+          return (result as Promise<unknown>).finally(() => this.releaseRefTransactionHook());
+        }
+        this.releaseRefTransactionHook();
+        return result;
+      };
+    }
   }
 
   /**
@@ -316,6 +373,38 @@ export abstract class GitCommand<T> {
       | undefined;
     if (!filter?.setAttributesSourceResolver || !this._workingCopy.history) return;
     filter.setAttributesSourceResolver(attributesSourceResolver(() => this.revisionResolver()));
+  }
+
+  /**
+   * The hooks this command runs (git's `run_hooks_opt`), through the host environment's
+   * `hookRunner`; with none, no hook runs.
+   */
+  protected get hooks(): HookSession {
+    if (!this.hookSession) this.hookSession = new HookSession(this._workingCopy);
+    return this.hookSession;
+  }
+
+  /**
+   * Runs this command's hooks in another command's session: a command that runs another
+   * (merge committing, rebase picking) gathers the output of both in one place.
+   */
+  shareHooksOf(source: GitCommand<unknown>): this {
+    this.hookSession = source.hooks;
+    return this;
+  }
+
+  /**
+   * What the hooks this command ran wrote, in order, with git's hints about hooks it ignored
+   * (`advice.ignoredHook`): git relays all of it on its stderr (a hook's stdout included,
+   * except for the hooks whose stdout git keeps apart). Empty when no hook ran.
+   */
+  getHookOutput(): string {
+    return this.hookSession?.output ?? "";
+  }
+
+  /** What the hooks whose stdout git keeps on its own stdout (pre-push) wrote there. */
+  getHookStdout(): string {
+    return this.hookSession?.stdout ?? "";
   }
 
   /**
@@ -652,7 +741,56 @@ export abstract class GitCommand<T> {
     if (!this._workingCopy.history) {
       throw new Error("WorkingCopy.history is required for commands");
     }
-    return wrapRefs(this._workingCopy.history.refs as unknown as Refs);
+    const refs = wrapRefs(this._workingCopy.history.refs as unknown as Refs);
+    this.installRefTransactionHook(refs);
+    return refs;
+  }
+
+  /** The reference-transaction hook this command installs on its ref store (made once). */
+  private refTransactionHook?: RefTransactionHook;
+  /** The store it is installed on, and the hook that was there before (put back at the end) */
+  private refTransactionInstalled?: {
+    store: TransactionHookStore;
+    previous: RefTransactionHook | undefined;
+  };
+
+  /**
+   * git's reference-transaction hook (see {@link refTransactionHookOf}) on a ref store that
+   * supports it (the files store), while this command runs: the hook that was there before
+   * is put back when the command's `call` ends ({@link releaseRefTransactionHook}), so a
+   * later write never routes its output to this command. A command without hooks (no
+   * runner) removes a command's hook left there, and leaves any other hook in place.
+   */
+  private installRefTransactionHook(refs: Refs): void {
+    const store = refs as TransactionHookStore;
+    if (!store.setTransactionHook) return;
+    if (!this.hooks.enabled) {
+      const current = store.getTransactionHook?.();
+      if (current && commandTransactionHooks.has(current)) store.setTransactionHook(undefined);
+      return;
+    }
+    if (!this.refTransactionHook) {
+      this.refTransactionHook = refTransactionHookOf(this.hooks);
+      commandTransactionHooks.add(this.refTransactionHook);
+    }
+    if (!this.refTransactionInstalled) {
+      this.refTransactionInstalled = { store, previous: store.getTransactionHook?.() };
+    }
+    store.setTransactionHook(this.refTransactionHook);
+  }
+
+  /**
+   * Puts back the reference-transaction hook the store had before this command installed
+   * its own (when its own is still the one installed).
+   */
+  protected releaseRefTransactionHook(): void {
+    const installed = this.refTransactionInstalled;
+    if (!installed) return;
+    this.refTransactionInstalled = undefined;
+    const current = installed.store.getTransactionHook?.();
+    if (current === undefined || current === this.refTransactionHook) {
+      installed.store.setTransactionHook?.(installed.previous);
+    }
   }
 
   /**

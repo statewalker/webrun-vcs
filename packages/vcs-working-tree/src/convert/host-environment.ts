@@ -103,6 +103,74 @@ export interface GitHostEnvironment {
    * `$GIT_GLOB_PATHSPECS`, `$GIT_NOGLOB_PATHSPECS` and `$GIT_ICASE_PATHSPECS`
    */
   pathspecs?: { literal?: string; glob?: string; noglob?: string; icase?: string };
+  /**
+   * Runs the repository's hooks (githooks(5)): the commands find a hook through the
+   * repository's files (`core.hooksPath`, else `$GIT_DIR/hooks`) and hand it to this runner
+   * to execute. Absent: no hook runs, as in a browser (`createNodeHookRunner` of
+   * `@statewalker/vcs-utils-node` spawns them on Node).
+   */
+  hookRunner?: HookRunner;
+}
+
+/**
+ * One hook to run, as git's `run_hooks_opt` starts it: the script, its arguments, what it
+ * reads on stdin, the variables git sets for it, and the directory it runs in (the worktree
+ * top; the git directory of a bare repository).
+ *
+ * @example
+ * ```typescript
+ * // pre-commit of `git commit`
+ * { name: "pre-commit", path: ".git/hooks/pre-commit", args: [],
+ *   env: { GIT_INDEX_FILE: ".git/index", GIT_EDITOR: ":", GIT_PREFIX: "" },
+ *   cwd: "", stdoutToStderr: true }
+ * ```
+ */
+export interface HookInvocation {
+  /** The hook's name (`pre-commit`) */
+  name: string;
+  /**
+   * The script as git names it, its `argv[0]`: relative to {@link cwd} (`.git/hooks/pre-commit`,
+   * `hooks/pre-commit` of a relative `core.hooksPath`) or absolute
+   */
+  path: string;
+  /** The script's absolute path on the host, where the repository's files have one */
+  hostPath?: string;
+  /** The arguments after the script */
+  args: string[];
+  /** What the hook reads on stdin; absent: nothing (git's `no_stdin`, /dev/null) */
+  stdin?: Uint8Array;
+  /** The variables git sets for this hook (added to the host's own) */
+  env: Record<string, string>;
+  /** The directory the hook runs in, as a path of the repository's files ("" for the root) */
+  cwd: string;
+  /** That directory on the host, where the repository's files have one */
+  hostCwd?: string;
+  /** The hook's stdout is sent to its stderr (git's default for hooks, `stdout_to_stderr`) */
+  stdoutToStderr: boolean;
+}
+
+/** What a hook did: its exit code and what it wrote. */
+export interface HookOutcome {
+  /** The exit code (128 + the signal for a hook a signal killed) */
+  exitCode: number;
+  /** What it wrote on stdout (empty when sent to stderr) */
+  stdout: Uint8Array;
+  /** What it wrote on stderr (its stdout too, with `stdoutToStderr`), in order */
+  stderr: Uint8Array;
+}
+
+/**
+ * Executes hooks for the repository's commands. The commands find the hook (an executable
+ * file) themselves and call {@link run}; a runner that cannot start the script answers
+ * `undefined` ("no hook"), and the command goes on as without it.
+ */
+export interface HookRunner {
+  run(invocation: HookInvocation): Promise<HookOutcome | undefined>;
+  /**
+   * The git version whose wording and order the hooks follow where versions differ (the
+   * `advice.ignoredHook` hint, reference-transaction's states); default `2.56`
+   */
+  compatibility?: "2.43" | "2.56";
 }
 
 const join = (dir: string, name: string) =>

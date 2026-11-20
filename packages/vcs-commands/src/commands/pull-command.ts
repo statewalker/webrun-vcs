@@ -320,6 +320,7 @@ export class PullCommand extends TransportCommand<PullResult> {
       (await this.canFastForward(headId, trackingRefResolved.objectId));
     if (rebase && !canFastForward) {
       const rebaseResult = await new RebaseCommand(this._workingCopy)
+        .shareHooksOf(this)
         .setUpstream(trackingRefResolved.objectId)
         .setReflogAction(action)
         .setAutoStash(autoStash === true)
@@ -334,7 +335,7 @@ export class PullCommand extends TransportCommand<PullResult> {
     }
 
     // Execute merge (git's message for a pull: `Merge branch 'x' of <url>`)
-    const mergeCommand = new MergeCommand(this._workingCopy);
+    const mergeCommand = new MergeCommand(this._workingCopy).shareHooksOf(this);
     mergeCommand.include(trackingRefResolved.objectId);
     // git's fmt-merge-msg shortens the URL: no trailing slash, no `.git`
     const url = (configValue(this._workingCopy, `remote.${this.remote}.url`) ?? this.remote)

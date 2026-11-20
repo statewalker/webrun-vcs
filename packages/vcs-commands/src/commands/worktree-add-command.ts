@@ -14,6 +14,7 @@ import type {
 import { WorktreeError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { abbrevLengths, coreBool, worktreeModeTrust } from "./core-config.js";
+import { runPostCheckoutHook } from "./git-hooks.js";
 import { checkoutFreshTree } from "./tree-restore.js";
 import {
   checkCandidatePath,
@@ -34,6 +35,8 @@ export interface WorktreeAddResult {
   head?: ObjectId;
   /** What git prints on stderr (`Preparing worktree (...)`), without `--quiet`. */
   messages: string[];
+  /** The post-checkout hook's exit code when it failed (git exits with it; the worktree stays) */
+  hookExitCode?: number;
   /** What git prints on stdout: the checkout's `HEAD is now at <abbrev> <subject>`, without `--quiet`. */
   output: string[];
   /** A working copy of the new worktree. */
@@ -69,7 +72,8 @@ export interface WorktreeAddResult {
  * HEAD and its reflog line; then, unless `--no-checkout`, the files and the index are
  * checked out (git runs `reset --hard`: ORIG_HEAD and, on a branch, the reflog line
  * `reset: moving to HEAD`). A failure removes what was created. The `post-checkout`
- * hook is not run, and `--track` / `--guess-remote` are not supported.
+ * hook runs in the new worktree once it is checked out (`<null> <HEAD> 1`);
+ * `--track` / `--guess-remote` are not supported.
  */
 export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
   private path?: string;
@@ -370,7 +374,23 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
       throw error;
     }
     await worktrees.finishCreate(created.id, keepLocked !== undefined);
+    // add_worktree's post-checkout hook, in the new worktree (not for --no-checkout, nor an
+    // orphan): from no commit to its HEAD; its exit code becomes git's exit status
+    let hookExitCode: number | undefined;
+    if (this.checkout && !orphan && commitId !== undefined && this.hooks.enabled) {
+      const root = (workingCopy.worktree as { getRoot?(): string }).getRoot?.();
+      const code = await runPostCheckoutHook(
+        this.hooks,
+        undefined,
+        commitId,
+        true,
+        undefined,
+        root,
+      );
+      if (code !== 0) hookExitCode = code;
+    }
     return {
+      ...(hookExitCode !== undefined ? { hookExitCode } : {}),
       path: entry.path,
       id: created.id,
       ...("ref" in head ? { branch: head.ref } : {}),

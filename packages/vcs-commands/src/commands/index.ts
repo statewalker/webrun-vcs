@@ -20,6 +20,7 @@ export * from "./format-patch-command.js";
 export * from "./fsck/index.js";
 export * from "./gc-command.js";
 export * from "./git-describe.js";
+export * from "./git-hooks.js";
 export * from "./git-ident.js";
 export * from "./init-command.js";
 export * from "./log-command.js";

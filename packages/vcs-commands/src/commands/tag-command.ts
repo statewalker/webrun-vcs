@@ -319,7 +319,8 @@ export class DeleteTagCommand extends GitCommand<string[]> {
         throw new RefNotFoundError(refName, `Tag '${name}' not found`).withExitCode(1);
       }
 
-      await this.refsStore.delete(refName);
+      // git deletes them with delete_refs (its reference-transaction hook calls differ)
+      await this.refsStore.delete(refName, { deleteRefs: true });
       deleted.push(refName);
     }
 

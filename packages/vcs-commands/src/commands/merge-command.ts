@@ -140,6 +140,17 @@ export class MergeCommand extends GitCommand<MergeResult> {
   private message?: string;
   private cleanupMode?: CleanupMode;
   private inProcess = false;
+  private noVerify = false;
+
+  /**
+   * `--no-verify`: the `pre-merge-commit` and `commit-msg` hooks do not run
+   * (`prepare-commit-msg` and `post-merge` still do).
+   */
+  setNoVerify(noVerify: boolean): this {
+    this.checkCallable();
+    this.noVerify = noVerify;
+    return this;
+  }
 
   /**
    * A merge another command makes in process (a rebase's `merge`), which reads no `git
@@ -374,6 +385,24 @@ export class MergeCommand extends GitCommand<MergeResult> {
     const worktree = this.worktreeAccess;
     const run = () => this.run(worktree);
     const result = await (worktree?.batch ? worktree.batch(run) : run());
+    // finish's post-merge hook, told whether the merge was squashed: after a fast-forward, a
+    // merge commit or a squash (not when already up to date, nor when stopped)
+    if (
+      this.operation === MergeOperation.MERGE &&
+      !this.inProcess &&
+      this.hooks.enabled &&
+      [
+        MergeStatus.FAST_FORWARD,
+        MergeStatus.FAST_FORWARD_SQUASHED,
+        MergeStatus.MERGED,
+        MergeStatus.MERGED_SQUASHED,
+      ].includes(result.status)
+    ) {
+      await this.hooks.run("post-merge", {
+        args: [this.squash ? "1" : "0"],
+        env: { GIT_REFLOG_ACTION: this.reflogActionValue() },
+      });
+    }
     return this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result;
   }
 
@@ -836,7 +865,20 @@ export class MergeCommand extends GitCommand<MergeResult> {
       };
     }
 
-    const cleaned = this.cleanup(message);
+    const hooked = await this.mergeCommitHooks(state, message, (text) =>
+      this.writeMergeState(state, srcId, text),
+    );
+    if (hooked.refused !== undefined) {
+      return {
+        status: MergeStatus.FAILED,
+        newHead: headId,
+        mergeBase: baseId,
+        mergedCommits: [headId, srcId],
+        message: hooked.refused,
+        output,
+      };
+    }
+    const cleaned = hooked.message;
     if (cleaned.length === 0) {
       // git's prepare_to_commit: abort_commit, the merge left for `git commit`
       await this.writeMergeState(state, srcId, this.stateMessage(message));
@@ -990,7 +1032,17 @@ export class MergeCommand extends GitCommand<MergeResult> {
     // finish_automerge: HEAD a parent unless the heads contain it, or with --no-ff
     const keepHead = !headSubsumed || this.ffMode() === FastForwardMode.NO_FF;
     const parents = [...(keepHead ? [headId] : []), ...remoteIds];
-    const cleaned = this.cleanup(message);
+    const hooked = await this.mergeCommitHooks(state, message, writeState);
+    if (hooked.refused !== undefined) {
+      return {
+        status: MergeStatus.FAILED,
+        newHead: headId,
+        mergedCommits,
+        message: hooked.refused,
+        output,
+      };
+    }
+    const cleaned = hooked.message;
     if (cleaned.length === 0) {
       // git's prepare_to_commit: abort_commit, the merge left for `git commit`
       await writeState(this.stateMessage(message));
@@ -1065,7 +1117,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
       // `git merge --continue` runs `git commit`: its editor gets the whole template
       // (MERGE_MSG, the help and the status, written to COMMIT_EDITMSG), taken as the editor
       // leaves it
-      const commit = new CommitCommand(this.workingCopy);
+      const commit = new CommitCommand(this.workingCopy).shareHooksOf(this);
       if (this.author) commit.setAuthorIdent(this.author);
       if (this.committer) commit.setCommitterIdent(this.committer);
       if (this.cleanupMode) commit.setCleanupMode(this.cleanupMode);
@@ -1367,6 +1419,59 @@ export class MergeCommand extends GitCommand<MergeResult> {
    */
   private stateMessage(message: string): string {
     return this.message !== undefined ? `${this.message}\n` : message;
+  }
+
+  /** `GIT_REFLOG_ACTION` as git's merge exports it (`merge <names>`, `pull` for a pull). */
+  private reflogActionValue(): string {
+    return this.reflogAction(reflogMessages.mergeAction(this.includes));
+  }
+
+  /**
+   * prepare_to_commit of git's merge, around the hooks: `pre-merge-commit` (not with
+   * --no-verify; the index read again after it), then MERGE_HEAD and MERGE_MSG written,
+   * `prepare-commit-msg` (`merge`) and `commit-msg` (not with --no-verify) over MERGE_MSG,
+   * whose text, cleaned up, is the commit's. A refusing hook stops the merge before its
+   * commit, its state written (abort_commit); `refused` is git's message then. Without
+   * hooks: the message cleaned up.
+   */
+  private async mergeCommitHooks(
+    state: OperationState,
+    message: string,
+    writeState: (text: string) => Promise<void>,
+  ): Promise<{ message: string; refused?: string }> {
+    // (a merge a rebase makes in process runs no hooks of its own)
+    if (!this.hooks.enabled || this.inProcess) return { message: this.cleanup(message) };
+    const env = {
+      GIT_INDEX_FILE: await this.hooks.gitPath("index"),
+      GIT_EDITOR: ":",
+      GIT_REFLOG_ACTION: this.reflogActionValue(),
+    };
+    const abort = async () => {
+      await writeState(this.stateMessage(message));
+      return {
+        message: "",
+        refused: "Not committing merge; use 'git commit' to complete the merge.",
+      };
+    };
+    if (!this.noVerify) {
+      const pre = await this.hooks.run("pre-merge-commit", { env });
+      if (pre && pre.exitCode !== 0) return abort();
+      if (pre) await this.staging.read();
+    }
+    // prepare_to_commit writes merge_msg as it is (`-m`'s text without a newline added)
+    await writeState(this.message ?? message);
+    const file = await this.hooks.gitPath("MERGE_MSG");
+    const prepare = await this.hooks.run("prepare-commit-msg", { args: [file, "merge"], env });
+    if (prepare && prepare.exitCode !== 0) return abort();
+    if (!this.noVerify) {
+      const check = await this.hooks.run("commit-msg", { args: [file], env });
+      if (check && check.exitCode !== 0) return abort();
+    }
+    const text = (await state.read("MERGE_MSG")) ?? "";
+    // the commit ends the merge (remove_merge_branch_state)
+    await state.removeRef("MERGE_HEAD");
+    await state.remove("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE");
+    return { message: this.cleanup(text) };
   }
 
   /** MERGE_HEAD, MERGE_MSG and MERGE_MODE of a merge stopped before its commit. */

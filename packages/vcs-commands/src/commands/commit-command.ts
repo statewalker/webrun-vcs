@@ -6,7 +6,9 @@ import {
   type PersonIdent,
   type TreeEntry,
 } from "@statewalker/vcs-core";
+import { FileStagingStore } from "@statewalker/vcs-store-files";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import type { FilesApi } from "@statewalker/vcs-utils/files";
 import {
   expandUserPath,
   type Staging,
@@ -19,6 +21,7 @@ import {
 import {
   EmptyCommitError,
   GitApiError,
+  HookFailedError,
   IncompatibleOptionsError,
   IndexLockFailedError,
   InvalidArgumentError,
@@ -141,6 +144,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private resetAuthor = false;
   private amend = false;
   private noPostRewrite = false;
+  private noVerify = false;
   private allowEmpty = false;
   private parents: ObjectId[] = [];
   private onlyPaths: string[] = [];
@@ -290,6 +294,16 @@ export class CommitCommand extends GitCommand<CommitResult> {
   setNoPostRewrite(noPostRewrite: boolean): this {
     this.checkCallable();
     this.noPostRewrite = noPostRewrite;
+    return this;
+  }
+
+  /**
+   * `-n` / `--no-verify`: the `pre-commit` and `commit-msg` hooks do not run
+   * (`prepare-commit-msg` and `post-commit` still do, as in git).
+   */
+  setNoVerify(noVerify: boolean): this {
+    this.checkCallable();
+    this.noVerify = noVerify;
     return this;
   }
 
@@ -629,6 +643,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
       author: PersonIdent;
       committer: PersonIdent;
       authorKept: boolean;
+      /** The variables of the commit hooks */
+      hookEnv: Record<string, string>;
     },
     editor: CommitEditor,
   ): Promise<{ message: string; cleanup: CleanupMode; untouched: boolean }> {
@@ -756,12 +772,25 @@ export class CommitCommand extends GitCommand<CommitResult> {
     if (!committable && whence !== "merge" && !this.allowEmpty && !(this.amend && isMerge)) {
       throw new EmptyCommitError();
     }
-    const edited = await editor("COMMIT_EDITMSG", template);
-    let text: string;
-    if (typeof edited === "string") {
-      await state.write("COMMIT_EDITMSG", edited);
-      text = edited;
-    } else text = (await state.read("COMMIT_EDITMSG")) ?? "";
+    // prepare-commit-msg, the editor over what it left, then commit-msg
+    let text = "";
+    let edited: unknown;
+    const hookArgs = this.prepareMessageHookArgs(
+      mergeMsg,
+      squashMsg,
+      fromTemplate ? templateText : undefined,
+      ctx.mergeHeads,
+      ctx.pickHead,
+    );
+    const ran = await this.runMessageHooks(ctx.hookEnv, hookArgs, async () => {
+      const current = this.hooks.enabled
+        ? ((await state.read("COMMIT_EDITMSG")) ?? template)
+        : template;
+      edited = await editor("COMMIT_EDITMSG", current);
+      if (typeof edited === "string") await state.write("COMMIT_EDITMSG", edited);
+    });
+    if (typeof edited === "string" && !ran) text = edited;
+    else text = (await state.read("COMMIT_EDITMSG")) ?? "";
     // cleanup_message
     if (verbose > 0 || mode === CleanupMode.SCISSORS) {
       const cut = `${comment} ------------------------ >8 ------------------------\n`;
@@ -1037,6 +1066,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // a partial commit: the paths named, from the index and HEAD (git's list_paths)
     const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
     let partialTree: ObjectId | undefined;
+    let falseIndexFile: FalseIndexFile | undefined;
     const partialPaths = partial
       ? await this.listPartialPaths(state, mergeHeads, headId)
       : undefined;
@@ -1047,30 +1077,101 @@ export class CommitCommand extends GitCommand<CommitResult> {
       // the same paths taken; any failure leaves the index as it was
       index = await this.holdIndex();
       try {
-        partialTree = await this.storeFalseIndex(
-          await this.preparePartialCommit(partialPaths, headId, index),
-        );
+        const falseIndex = await this.preparePartialCommit(partialPaths, headId, index);
+        partialTree = await this.storeFalseIndex(falseIndex);
+        // the hooks are given the false index as a file (git's next-index-<pid>.lock),
+        // removed once the commit is made or given up
+        if (this.hooks.enabled) {
+          falseIndexFile = await this.writeFalseIndexFile(falseIndex);
+          if (falseIndexFile) index = withCleanup(index, falseIndexFile.remove);
+        }
       } catch (error) {
+        await falseIndexFile?.remove();
         await index.release();
         throw error;
       }
     }
     try {
-      return await this.commitPrepared(partialTree, state, mergeHeads, pickHead, index);
+      return await this.commitPrepared(
+        partialTree,
+        state,
+        mergeHeads,
+        pickHead,
+        index,
+        falseIndexFile,
+      );
     } catch (error) {
       await index?.release();
       throw error;
     }
   }
 
+  /**
+   * A partial commit's false index written as git's `prepare_index` writes it for the hooks
+   * (`$GIT_DIR/next-index-<pid>.lock`): HEAD's tree with the named paths taken, each entry
+   * the index has unchanged keeping its stat data (create_base_index's one-way merge), the
+   * others none. Undefined where the repository's files cannot hold it.
+   */
+  private async writeFalseIndexFile(falseIndex: FalseIndex): Promise<FalseIndexFile | undefined> {
+    // git names it by its process id; any number no file has will do here
+    let name = "";
+    let target: { files: FilesApi; path: string } | undefined;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      name = `next-index-${10000 + Math.floor(Math.random() * 90000)}.lock`;
+      target = await this.hooks.gitFile(name);
+      if (!target) return undefined;
+      if ((await target.files.stats(target.path)) === undefined) break;
+      target = undefined;
+    }
+    if (!target) throw new Error("could not choose a name for the false index file");
+    const lock = target;
+    const files = await this.falseIndexFiles(falseIndex);
+    const current = new Map<string, StagingEntry>();
+    for await (const entry of this.staging.entries()) {
+      if (entry.stage === 0) current.set(entry.path, entry);
+    }
+    const temp = new FileStagingStore(lock.files, lock.path);
+    const builder = temp.createBuilder();
+    for (const path of [...files.keys()].sort(compareGitPaths)) {
+      const file = files.get(path) as { objectId: ObjectId; mode: number };
+      const kept = current.get(path);
+      if (kept && kept.objectId === file.objectId && kept.mode === file.mode && !kept.intentToAdd) {
+        builder.add(kept);
+      } else {
+        builder.add({ path, mode: file.mode, objectId: file.objectId, size: 0, mtime: 0 });
+      }
+    }
+    await builder.finish();
+    const remove = async () => {
+      await lock.files.remove(lock.path).catch(() => false);
+    };
+    // the file is ours from its first byte: a failure before it is handed over removes it
+    try {
+      await temp.write();
+      return {
+        hostPath: await this.hooks.gitPath(name, true),
+        reread: async () => {
+          await temp.read();
+          return writeIndexAsTree(temp, this.trees, { write: false });
+        },
+        remove,
+      };
+    } catch (error) {
+      await remove();
+      throw error;
+    }
+  }
+
   /** The commit made from the index (or the partial commit's tree), after the index is ready. */
   private async commitPrepared(
-    partialTree: ObjectId | undefined,
+    partialTreeIn: ObjectId | undefined,
     state: OperationState,
     mergeHeads: ObjectId[],
     pickHead: ObjectId | undefined,
     index: HeldIndex | undefined,
+    falseIndexFile?: FalseIndexFile,
   ): Promise<CommitResult> {
+    let partialTree = partialTreeIn;
     // an editor edits the message (git's use_editor): no message given, or -e; without an
     // editor set, a merge's or a pick's prepared message (MERGE_MSG, SQUASH_MSG) is taken as
     // `git commit --no-status` takes it once the editor leaves it as it is (the template
@@ -1088,6 +1189,21 @@ export class CommitCommand extends GitCommand<CommitResult> {
     const message = this.message;
     if (!editorLike && message === undefined && !this.amend && !mergeMsgPresent) {
       throw new NoMessageError();
+    }
+
+    // prepare_to_commit's pre-commit hook (not with --no-verify), over the index the commit
+    // records (the lock `-a` and a partial commit wrote); a hook that ran may have changed
+    // the index, which is read again (git's discard_index + read_index_from)
+    // (a partial commit's hooks see its false index; `-a` the index lock, read back from
+    // the lock; a plain commit the index)
+    const hookEnv = await this.commitHookEnv(editorLike, index, falseIndexFile?.hostPath);
+    if (!this.noVerify && this.hooks.enabled) {
+      if (index) await index.write();
+      if (await this.runCommitHook("pre-commit", hookEnv)) {
+        if (falseIndexFile) partialTree = await falseIndexFile.reread();
+        else if (index) await index.reread();
+        else await this.staging.read();
+      }
     }
 
     // Determine parents
@@ -1194,6 +1310,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
           author,
           committer,
           authorKept: !this.author && !this.resetAuthor && (!!previousCommit || !!pickHead),
+          hookEnv,
         },
         editor,
       );
@@ -1218,7 +1335,22 @@ export class CommitCommand extends GitCommand<CommitResult> {
       if (cleanup !== CleanupMode.VERBATIM) sb = stripspace(sb);
       await state.write("COMMIT_EDITMSG", sb);
       await this.refuseNothingToCommit(treeId, parents, mergeHeads, previousCommit);
+      // prepare-commit-msg and commit-msg, which may rewrite COMMIT_EDITMSG: the commit
+      // takes the file's text (cmd_commit reads it back)
+      // (git's hook arguments: read only when hooks can run)
+      const hookArgs = this.hooks.enabled
+        ? this.prepareMessageHookArgs(
+            await state.read("MERGE_MSG"),
+            await state.read("SQUASH_MSG"),
+            undefined,
+            mergeHeads,
+            pickHead,
+          )
+        : [];
       let text = sb;
+      if (await this.runMessageHooks(hookEnv, hookArgs, undefined)) {
+        text = (await state.read("COMMIT_EDITMSG")) ?? "";
+      }
       // cleanup_message: cut at the scissors line with -v (commit.verbose)
       if (this.verboseLevel() > 0) {
         const comment = commentPrefixOf(this.workingCopy, sb);
@@ -1252,6 +1384,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       state,
       amendedId,
       commitIndex: index ? () => index.commit() : undefined,
+      editorUsed: editorLike,
     });
   }
 
@@ -1293,6 +1426,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
       amendedId: ObjectId | undefined;
       /** Renames the index lock over the index, once HEAD has moved (git's commit_index_files) */
       commitIndex?: () => Promise<void>;
+      /** An editor edited the message (git's use_editor): hooks get no `GIT_EDITOR=:` */
+      editorUsed?: boolean;
     },
   ): Promise<CommitResult> {
     const { author, committer, finalMessage, state, amendedId } = info;
@@ -1321,11 +1456,21 @@ export class CommitCommand extends GitCommand<CommitResult> {
             ? "cherry-pick"
             : undefined;
     const action = this.hasReflogAction() ? this.reflogAction("commit") : undefined;
-    await updateHead(
-      this.refsStore,
-      commitId,
-      this.reflogLine(reflogMessages.commit(kind, finalMessage, action), committer),
-    );
+    const log = this.reflogLine(reflogMessages.commit(kind, finalMessage, action), committer);
+    if (this.hooks.enabled) {
+      // update_head_with_reflog: one transaction on HEAD expecting the commit's parent (none
+      // for an initial commit), as the reference-transaction hook sees it
+      const current = (await this.refsStore.resolve("HEAD"))?.objectId;
+      const result = await this.refsStore.batch(
+        [{ name: "HEAD", old: current ?? null, new: commitId }],
+        log,
+      );
+      if (!result.ok) {
+        throw new GitApiError(
+          `fatal: cannot lock ref 'HEAD': ${result.rejected.map((r) => r.reason).join(", ")}`,
+        );
+      }
+    } else await updateHead(this.refsStore, commitId, log);
 
     this.setCallable(false);
 
@@ -1334,14 +1479,110 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // a merge's autostash
     await this.cleanupAfterCommit(state, info.commitIndex);
 
-    // commit_post_rewrite: the amended commit's notes carried over (notes.rewriteRef)
+    // the post-commit hook, over the index (whatever the commit recorded)
+    if (this.hooks.enabled) {
+      await this.hooks.run("post-commit", {
+        env: await this.commitHookEnv(info.editorUsed ?? false, undefined),
+      });
+    }
+
+    // commit_post_rewrite: the amended commit's notes carried over (notes.rewriteRef), then
+    // the post-rewrite hook told "amend" with "<old> <new>" on stdin
     if (amendedId && !this.noPostRewrite) {
       // git exports the amend's author (determine_author_info): the notes commit's too
       await copyNotesForAmend(this.notesContext(), amendedId, commitId, commit.author);
+      if (this.hooks.enabled) {
+        await this.hooks.run("post-rewrite", {
+          args: ["amend"],
+          stdin: `${amendedId} ${commitId}\n`,
+        });
+      }
     }
 
     // Return commit with its ID (like JGit's RevCommit)
     return { ...commit, id: commitId };
+  }
+
+  /**
+   * The variables of the commit hooks (git's `run_commit_hook`): `GIT_INDEX_FILE` names the
+   * index the commit records (the lock `-a` and a partial commit write; git's false index of
+   * a partial commit is not kept as a file here), and `GIT_EDITOR=:` tells a hook that no
+   * editor runs.
+   */
+  private async commitHookEnv(
+    editorUsed: boolean,
+    index: HeldIndex | undefined,
+    /** A partial commit's false index (its host path), which the hooks see in its place */
+    falseIndexPath?: string,
+  ): Promise<Record<string, string>> {
+    if (!this.hooks.enabled) return {};
+    return {
+      GIT_INDEX_FILE:
+        falseIndexPath ??
+        (index ? await this.hooks.gitPath("index.lock", true) : await this.hooks.gitPath("index")),
+      ...(editorUsed ? {} : { GIT_EDITOR: ":" }),
+    };
+  }
+
+  /** Runs a hook that can refuse the commit; whether it ran. */
+  private async runCommitHook(
+    name: string,
+    env: Record<string, string>,
+    args: string[] = [],
+  ): Promise<boolean> {
+    const result = await this.hooks.run(name, { args, env });
+    if (result && result.exitCode !== 0) {
+      throw new HookFailedError(
+        name,
+        result.exitCode,
+        `the ${name} hook refused the commit (exit code ${result.exitCode})`,
+        this.hooks.output,
+      );
+    }
+    return result !== undefined;
+  }
+
+  /**
+   * The arguments of prepare-commit-msg after the message file (prepare_to_commit's
+   * hook_arg1 and hook_arg2): where the message came from.
+   */
+  private prepareMessageHookArgs(
+    mergeMsg: string | undefined,
+    squashMsg: string | undefined,
+    templateText: string | undefined,
+    mergeHeads: ObjectId[],
+    pickHead: ObjectId | undefined,
+  ): string[] {
+    if (this.message !== undefined) return ["message"];
+    // --amend without a message reuses HEAD's (git's use_message = "HEAD")
+    if (this.amend) return ["commit", "HEAD"];
+    if (mergeMsg !== undefined) return [squashMsg !== undefined ? "squash" : "merge"];
+    if (squashMsg !== undefined) return ["squash"];
+    if (templateText !== undefined) return ["template"];
+    if (mergeHeads.length > 0) return ["merge"];
+    if (pickHead) return ["commit", "CHERRY_PICK_HEAD"];
+    return [];
+  }
+
+  /**
+   * prepare-commit-msg, the editor (when one runs) and commit-msg (not with --no-verify)
+   * over COMMIT_EDITMSG, in prepare_to_commit's order; whether any hook ran (the file is then
+   * to be read back). A non-zero commit-msg refuses the commit, as does prepare-commit-msg.
+   */
+  private async runMessageHooks(
+    env: Record<string, string>,
+    args: string[],
+    edit: (() => Promise<void>) | undefined,
+  ): Promise<boolean> {
+    if (!this.hooks.enabled) {
+      await edit?.();
+      return false;
+    }
+    const file = await this.hooks.gitPath("COMMIT_EDITMSG");
+    let ran = await this.runCommitHook("prepare-commit-msg", env, [file, ...args]);
+    await edit?.();
+    if (!this.noVerify) ran = (await this.runCommitHook("commit-msg", env, [file])) || ran;
+    return ran;
   }
 
   /** The commits MERGE_HEAD names (one per line), none without a merge in progress. */
@@ -1446,6 +1687,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
     return {
       write: async () => {
         await lock?.write();
+      },
+      reread: async () => {
+        if (lock?.reread) await lock.reread();
+        else if (lock) await staging.read();
       },
       commit: async () => {
         if (lock) await lock.commit();
@@ -1767,6 +2012,38 @@ function pathsWithAllError(paths: readonly string[]): IncompatibleOptionsError {
   );
 }
 
+/** A partial commit's false index written for the hooks (see `writeFalseIndexFile`). */
+interface FalseIndexFile {
+  /** Its absolute host path (else its path from the worktree top): `GIT_INDEX_FILE` */
+  hostPath: string;
+  /** Reads it back as a hook left it: the tree to commit */
+  reread(): Promise<ObjectId>;
+  /** Removes it (git's rollback of `false_lock`) */
+  remove(): Promise<void>;
+}
+
+/** A held index whose commit or release also runs `cleanup` (after the index's own). */
+function withCleanup(index: HeldIndex, cleanup: () => Promise<void>): HeldIndex {
+  return {
+    write: () => index.write(),
+    reread: () => index.reread(),
+    commit: async () => {
+      try {
+        await index.commit();
+      } finally {
+        await cleanup();
+      }
+    },
+    release: async () => {
+      try {
+        await index.release();
+      } finally {
+        await cleanup();
+      }
+    },
+  };
+}
+
 /** A partial commit's false index: HEAD's tree with the named paths set or removed. */
 interface FalseIndex {
   headTree: ObjectId | undefined;
@@ -1794,6 +2071,8 @@ function indexLockError(error: unknown, workingCopy: unknown): unknown {
 interface HeldIndex {
   /** Writes the staging's entries into the index lock (nothing without an index file). */
   write(): Promise<void>;
+  /** Reads the index lock back into the staging, as a hook left it (git's read_index_from). */
+  reread(): Promise<void>;
   /** The index lock renamed over the index (a staging without one: written). */
   commit(): Promise<void>;
   /** On failure: the lock removed, the staging as it was before. Idempotent. */

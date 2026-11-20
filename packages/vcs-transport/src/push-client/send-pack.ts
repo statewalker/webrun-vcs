@@ -82,6 +82,20 @@ export interface PushClientOptions {
    * lengthened until unique among the local objects (`RepositoryFacade.abbrevLengths`).
    */
   abbrev?: number;
+  /**
+   * git's pre-push hook (transport.c `run_pre_push_hook`): called with every update once
+   * each has its status, before anything is sent (a dry run included); false refuses the
+   * whole push, which then throws {@link PushRefusedByHookError}
+   */
+  prePush?: (updates: readonly PushRefUpdate[]) => Promise<boolean>;
+}
+
+/** A push the pre-push hook refused (git: "failed to push some refs"): nothing was sent. */
+export class PushRefusedByHookError extends TransportError {
+  constructor(readonly updates: readonly PushRefUpdate[]) {
+    super("the pre-push hook refused the push");
+    this.name = "PushRefusedByHookError";
+  }
 }
 
 /** What a push did. */
@@ -147,6 +161,27 @@ export async function pushToConnection(
   return result;
 }
 
+/**
+ * The updates in the order of git's ref list after `match_push_refs`: the remote's refs as
+ * advertised (sorted), then the refs the push creates in the order they were matched. git
+ * feeds the pre-push hook and sends the commands in that order (so pre-receive's stdin and
+ * the update hook calls follow it).
+ */
+function inRemoteRefOrder<T extends { remoteRef: string }>(
+  updates: T[],
+  remoteRefs: ReadonlyArray<{ name: string }>,
+): T[] {
+  const position = new Map<string, number>();
+  remoteRefs.forEach((r, i) => {
+    if (!position.has(r.name)) position.set(r.name, i);
+  });
+  const rank = (u: T) => position.get(u.remoteRef) ?? Number.MAX_SAFE_INTEGER;
+  return updates
+    .map((u, i) => ({ u, i }))
+    .sort((a, b) => rank(a.u) - rank(b.u) || a.i - b.i)
+    .map(({ u }) => u);
+}
+
 async function sendPack(
   connection: ReceivePackConnection,
   options: PushClientOptions,
@@ -209,10 +244,16 @@ async function sendPack(
       leases.set(m.remoteRef, expect ?? ZERO_OID);
     }
   }
-  const updates = await setPushStatus(matched, objectSource(repository), {
-    force: options.force,
-    leases,
-  });
+  const updates = inRemoteRefOrder(
+    await setPushStatus(matched, objectSource(repository), {
+      force: options.force,
+      leases,
+    }),
+    remoteRefs,
+  );
+  if (options.prePush && !(await options.prePush(updates))) {
+    throw new PushRefusedByHookError(updates);
+  }
 
   // what the server allows (send_pack)
   if (!caps.has("delete-refs")) {
@@ -368,6 +409,17 @@ async function sendPack(
     }
   }
   for (const u of toSend) if (!reported.has(u)) setStatus(u, "remote-failure");
+  if (caps.has("side-band-64k") && result.unpack.ok) {
+    // git's demultiplexer reads the side-band to its end: what the server's hooks print
+    // after the report (post-receive, post-update) reaches onProgress
+    try {
+      while ((await report.read()) !== undefined) {
+        // channel 1 has nothing more; channel 2 goes to onProgress
+      }
+    } catch {
+      // the report is in: a broken tail changes nothing
+    }
+  }
   result.ok = result.unpack.ok && updates.every((u) => isPushSuccess(u.status));
   return result;
 }

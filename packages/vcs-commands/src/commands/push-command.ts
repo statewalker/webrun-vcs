@@ -9,6 +9,7 @@ import {
   matchSource,
   type PushCommandResult,
   type PushRefUpdate,
+  PushRefusedByHookError,
   parseRefSpec,
   pushToConnection,
   type PushOptions as TransportPushOptions,
@@ -16,6 +17,7 @@ import {
 } from "@statewalker/vcs-transport";
 
 import {
+  HookFailedError,
   InvalidArgumentError,
   InvalidRemoteError,
   NonFastForwardError,
@@ -24,7 +26,12 @@ import {
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type PushResult, PushStatus, type RemoteRefUpdate } from "../results/push-result.js";
 import { TransportCommand } from "../transport-command.js";
-import { localRemotePath, openLocalRemote, withLocalReceivePack } from "./local-transport.js";
+import {
+  localRemotePath,
+  openLocalRemote,
+  remoteHookSession,
+  withLocalReceivePack,
+} from "./local-transport.js";
 
 /** All-zero object id — Git's "no object", used to express a ref delete. */
 const ZERO_OBJECT_ID = "0".repeat(40);
@@ -118,6 +125,14 @@ export class PushCommand extends TransportCommand<PushResult> {
   private refSpecs: string[] = [];
   private force = false;
   private atomic = false;
+  private noVerify = false;
+
+  /** `--no-verify`: the pre-push hook does not run. */
+  setNoVerify(noVerify: boolean): this {
+    this.checkCallable();
+    this.noVerify = noVerify;
+    return this;
+  }
   private thin = true;
   private dryRun = false;
   private pushAll = false;
@@ -441,15 +456,44 @@ export class PushCommand extends TransportCommand<PushResult> {
         this.progressMessageCallback?.(message);
       },
       abbrev: parseCoreAbbrev(RemoteConfigStore.from(this._workingCopy).value("core.abbrev")) ?? -1,
+      ...(!this.noVerify && this.hooks.enabled
+        ? {
+            prePush: (updates) =>
+              this.runPrePush(updates, remoteUrl, (code) => (prePushExit = code)),
+          }
+        : {}),
     };
+    let prePushExit = 0;
     // transport_get: smart HTTP, or git's local transport (receive-pack of the repository at
     // the path, in process); anything else fails in git's words
-    const result =
-      localRemote === undefined
-        ? await transportPush(pushOptions)
-        : await withLocalReceivePack(localRemote, (connection) =>
-            pushToConnection(connection, pushOptions),
-          );
+    let result: Awaited<ReturnType<typeof transportPush>>;
+    // the remote's reference-transaction hook writes to the pushing user's stderr directly
+    const transactionHooks =
+      localRemote === undefined ? undefined : remoteHookSession(this.workingCopy, localRemote);
+    try {
+      result =
+        localRemote === undefined
+          ? await transportPush(pushOptions)
+          : await withLocalReceivePack(
+              localRemote,
+              (connection) => pushToConnection(connection, pushOptions),
+              // receive-pack runs the remote repository's hooks
+              remoteHookSession(this.workingCopy, localRemote),
+              transactionHooks,
+            );
+    } catch (error) {
+      if (error instanceof PushRefusedByHookError) {
+        throw new HookFailedError(
+          "pre-push",
+          prePushExit,
+          `error: failed to push some refs to '${remoteUrl}'`,
+          this.hooks.output,
+        );
+      }
+      throw error;
+    } finally {
+      if (transactionHooks) this.hooks.append(transactionHooks.output);
+    }
 
     // git updates the remote-tracking refs of what the server accepted, and of what it had
     // already (transport.c: update_tracking_ref for ok and up-to-date refs)
@@ -484,6 +528,36 @@ export class PushCommand extends TransportCommand<PushResult> {
       messages,
       display: formatPushStatus(result, { dest: remoteUrl }),
     };
+  }
+
+  /**
+   * transport.c's pre-push hook: told the remote's name (its URL when pushed to by URL) and
+   * URL, with a `<local ref> <local id> <remote ref> <remote id>` line on stdin for each ref
+   * to be pushed (not those up to date, non-fast-forward or with a stale lease). Its stdout
+   * stays git's stdout (`getHookStdout`). Whether the push may go on.
+   */
+  private async runPrePush(
+    updates: readonly PushRefUpdate[],
+    remoteUrl: string,
+    exit: (code: number) => void,
+  ): Promise<boolean> {
+    const skipped = new Set(["rejected-nonfastforward", "rejected-stale", "up-to-date"]);
+    const zero = "0".repeat(40);
+    const stdin = updates
+      .filter((u) => !skipped.has(u.status))
+      .map((u) => {
+        const local = u.localRef ?? u.source ?? (/^0+$/.test(u.newOid) ? "(delete)" : u.newOid);
+        return `${local} ${u.newOid || zero} ${u.remoteRef} ${u.oldOid || zero}\n`;
+      })
+      .join("");
+    const result = await this.hooks.run("pre-push", {
+      args: [this.remote, remoteUrl],
+      stdin,
+      keepStdout: true,
+    });
+    if (!result || result.exitCode === 0) return true;
+    exit(result.exitCode);
+    return false;
   }
 
   /**

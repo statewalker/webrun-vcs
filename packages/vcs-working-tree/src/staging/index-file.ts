@@ -590,6 +590,31 @@ export class IndexFile {
       rollback: async () => {
         if (state === "held") await release();
       },
+      reread: async () => {
+        if (state !== "held") throw new Error(`'${lockPath}' is no longer held`);
+        const data = await readFile(this.files, lockPath);
+        const parsed = await parseIndexFile(data, { keepEncoding: true });
+        assertWritableIndexExtensions(parsed.extensionData);
+        const stats = await this.files.stats(lockPath);
+        // what was read stands for what the lock holds: the next write carries its
+        // extensions, and a commit renames it over the index as it is
+        this.pendingCacheTree = undefined;
+        this.pendingEntries = undefined;
+        this.dropCacheTree = false;
+        this.pendingUntracked = undefined;
+        this.pendingUntrackedEntries = undefined;
+        this.version = parsed.version;
+        this.encoding = parsed.encoding;
+        this.extensions = parsed.extensionData;
+        this.entriesKept = this.extensions.length > 0 ? parsed.entries.slice() : undefined;
+        pending = {
+          entries: parsed.entries.slice(),
+          extensions: parsed.extensionData,
+          checksum: bytesToHex(data.subarray(Math.max(0, data.length - INDEX_CHECKSUM_SIZE))),
+          encoding: parsed.encoding,
+        };
+        return { entries: parsed.entries, lastModified: stats?.lastModified ?? 0 };
+      },
     };
   }
 
@@ -677,6 +702,12 @@ export interface IndexFileLock {
   commit(): Promise<void>;
   /** Removes the lock, the index left as it was; nothing once committed or rolled back. */
   rollback(): Promise<void>;
+  /**
+   * Reads the lock as another writer (a hook given it as `GIT_INDEX_FILE`) left it: its
+   * entries and modification time, which a commit then renames over the index (git's
+   * `discard_index` + `read_index_from(<lock>)`).
+   */
+  reread(): Promise<{ entries: StagingEntry[]; lastModified: number }>;
 }
 
 /** Whether a cache-tree can stand for `entries`: a valid root counts their tree entries. */
