@@ -3,14 +3,15 @@ name: site
 # The website (site/): built on every pull request that touches it, and published from main to
 # the httpeers static-site host, as statewalker/cellb.dev publishes cellb.dev's site. A site there
 # is a first-level prefix of the `sites` bucket named after its domain (https://s3.httpeers.net,
-# S3 on RustFS); the host serves `<domain>/…` for `Host: <domain>`. For a *.httpeers.net name
-# nothing else is needed: the zone has a wildcard DNS record and Caddy a wildcard certificate.
-# See statewalker/httpeers apps/sites/README.md and tools/publish/README.md.
+# S3 on RustFS); the host serves `<domain>/…` for `Host: <domain>`. The site's domain,
+# vcs.statewalker.com, needs its DNS record and its Caddy block (statewalker/httpeers
+# deploy/Caddyfile) once: site/README.md, "Going live". See statewalker/httpeers
+# apps/sites/README.md and tools/publish/README.md.
 #
 # Settings (repository → Settings → Secrets and variables → Actions):
 #   secret   HTTPEERS_S3_ACCESS_KEY_ID, HTTPEERS_S3_SECRET_ACCESS_KEY   credentials that can write
 #            the site's prefix of the `sites` bucket (site/README.md: not RustFS's own pair)
-#   variable SITE_DOMAIN                       where to publish (default: vcs.httpeers.net)
+#   variable SITE_DOMAIN                       where to publish (default: vcs.statewalker.com)
 # Without the secrets the site is built and the publish step says it was skipped.
 on:
   push:
@@ -57,7 +58,7 @@ jobs:
     permissions:
       contents: read
     env:
-      SITE_DOMAIN: ${{ vars.SITE_DOMAIN || 'vcs.httpeers.net' }}
+      SITE_DOMAIN: ${{ vars.SITE_DOMAIN || 'vcs.statewalker.com' }}
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
@@ -73,6 +74,9 @@ jobs:
       - name: Build
         run: pnpm --filter @statewalker/vcs-site build
       # Every live example and the playground, run in Chromium as a visitor runs them.
+      # Every internal link and #anchor of the built pages resolves.
+      - name: Internal links
+        run: pnpm --filter @statewalker/vcs-site check:links
       - run: bash ${{ github.workspace }}/.github/scripts/install-chromium.sh pnpm --filter @statewalker/vcs-site exec playwright
       - name: Live examples
         run: pnpm --filter @statewalker/vcs-site check:examples

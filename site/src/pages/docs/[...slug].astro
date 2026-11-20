@@ -1,7 +1,8 @@
 ---
 import { getEntry, render } from "astro:content";
-import Docs from "@/layouts/Docs.astro";
-import { type RepoPage, repoPages } from "@/lib/docs";
+import Docs from "@/layouts/docs.astro";
+import { packageConcepts, type RepoPage, repoPages } from "@/lib/docs";
+import { examples } from "@/lib/examples";
 
 export function getStaticPaths() {
   return repoPages.map((page) => ({ params: { slug: page.slug }, props: { page } }));
@@ -30,8 +31,23 @@ const entry = await getEntry("repo", page.file);
 if (!entry) throw new Error(`${page.file} is not in the "repo" collection`);
 const { Content } = await render(entry);
 const description = describe(entry.body ?? "");
+const concepts = page.npm ? (packageConcepts[page.npm] ?? []) : [];
+const usedBy = page.npm ? examples.filter((e) => e.packages.includes(page.npm as string)) : [];
 ---
 
 <Docs title={page.label} description={description}>
   <Content />
+  {(concepts.length > 0 || usedBy.length > 0) && (
+    <section id="on-this-site">
+      <h2>On this site</h2>
+      <ul>
+        {concepts.map((c) => (
+          <li>Concept: <a href={c.href}>{c.label}</a></li>
+        ))}
+        {usedBy.map((e) => (
+          <li>Live example: <a href={`/examples/${e.name}`}>{e.label}</a></li>
+        ))}
+      </ul>
+    </section>
+  )}
 </Docs>

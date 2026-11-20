@@ -1,7 +1,7 @@
 ---
 import { guidePages, packagePages, pageHref, type RepoPage } from "@/lib/docs";
 import { examples } from "@/lib/examples";
-import Base from "./Base.astro";
+import Base from "./base.astro";
 
 interface Props {
   title: string;
@@ -21,6 +21,7 @@ const sections = [
     items: [
       { href: "/docs", label: "Getting started" },
       { href: "/docs/architecture", label: "Architecture" },
+      { href: "/docs/concepts", label: "How Git works here" },
       { href: "/docs/examples", label: "Apps & demos" },
       ...guidePages.map(navItem),
     ],

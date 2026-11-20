@@ -1,8 +1,8 @@
 ---
-import CodeBlock from "@/components/CodeBlock.astro";
-import Icon from "@/components/Icon.astro";
-import Badge from "@/components/ui/Badge.astro";
-import Docs from "@/layouts/Docs.astro";
+import CodeBlock from "@/components/code-block.astro";
+import Icon from "@/components/icon.astro";
+import Badge from "@/components/ui/badge.astro";
+import Docs from "@/layouts/docs.astro";
 import { examples, type LiveExample } from "@/lib/examples";
 import { npmPackage, repoFile, repoTree } from "@/lib/site";
 
@@ -46,12 +46,19 @@ const next = examples[index + 1];
       <span data-run-status class="font-mono text-xs text-muted-foreground">not run yet</span>
       <div data-run-downloads class="ml-auto flex gap-2"></div>
     </div>
-    <pre data-run-output class="m-0! max-h-[28rem] min-h-24 overflow-auto rounded-none! border-0! bg-code px-4 py-3 font-mono text-[12.5px] leading-6 text-code-foreground">Press Run: the code below runs here, in your browser, on the published packages' sources.</pre>
+    <pre data-run-output class="m-0! max-h-[28rem] min-h-24 overflow-auto rounded-none! border-0! bg-code px-4 py-3 font-mono text-[12.5px] leading-6 text-code-foreground">Press Run: the code below runs here, in your browser, on this repository's packages.</pre>
   </section>
 
   <h2>What to look for</h2>
   <ul>
     {example.notes.map((note) => <li>{note}</li>)}
+  </ul>
+
+  <h2 id="concepts">Read more: the concepts behind it</h2>
+  <ul>
+    {example.concepts.map((c) => (
+      <li><a href={c.href}>{c.label}</a>: {c.why}.</li>
+    ))}
   </ul>
 
   <h2>The code that runs</h2>

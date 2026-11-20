@@ -54,3 +54,60 @@ const hrefByFile = new Map(repoPages.map((page) => [page.file, pageHref(page)]))
 
 /** The site page of a repository file if the site renders it, else the file on GitHub. */
 export const docHref = (file: string) => hrefByFile.get(file) ?? repoFile(file);
+
+/** The explanation sections of /docs/concepts and /docs/architecture each package implements:
+ * listed under the package's page with the live examples that import it. */
+export const packageConcepts: Record<string, { label: string; href: string }[]> = {
+  "@statewalker/vcs-core": [
+    { label: "The object model", href: "/docs/concepts#objects" },
+    { label: "Loose objects and ids", href: "/docs/concepts#loose-objects" },
+    { label: "Pack files", href: "/docs/concepts#packs" },
+    { label: "Refs, HEAD and branches", href: "/docs/concepts#refs" },
+  ],
+  "@statewalker/vcs-working-tree": [
+    { label: "History, checkout and worktree", href: "/docs/concepts#working-copy" },
+  ],
+  "@statewalker/vcs-commands": [
+    { label: "History, checkout and worktree", href: "/docs/concepts#working-copy" },
+    { label: "Merging", href: "/docs/concepts#merge" },
+  ],
+  "@statewalker/vcs-store-files": [
+    { label: "The .git directory", href: "/docs/concepts#git-directory" },
+    { label: "Storage is a set of small interfaces", href: "/docs/architecture#storage" },
+  ],
+  "@statewalker/vcs-store-mem": [
+    { label: "Storage is a set of small interfaces", href: "/docs/architecture#storage" },
+  ],
+  "@statewalker/vcs-store-sql": [
+    { label: "Storage is a set of small interfaces", href: "/docs/architecture#storage" },
+  ],
+  "@statewalker/vcs-store-kv": [
+    { label: "Storage is a set of small interfaces", href: "/docs/architecture#storage" },
+  ],
+  "@statewalker/vcs-transport": [
+    { label: "The wire protocol", href: "/docs/concepts#transport" },
+    { label: "Fetch negotiation", href: "/docs/concepts#negotiation" },
+    { label: "One transport for servers and peers", href: "/docs/architecture#transport" },
+  ],
+  "@statewalker/vcs-transport-adapters": [
+    { label: "One transport for servers and peers", href: "/docs/architecture#transport" },
+  ],
+  "@statewalker/vcs-transport-httpeers": [
+    { label: "One transport for servers and peers", href: "/docs/architecture#transport" },
+  ],
+  "@statewalker/vcs-transport-lfs": [
+    { label: "Large objects go around the object store", href: "/docs/architecture#large-objects" },
+  ],
+  "@statewalker/vcs-transport-xet": [
+    { label: "Large objects go around the object store", href: "/docs/architecture#large-objects" },
+  ],
+  "@statewalker/vcs-workspace": [
+    { label: "File sync and versioning stay independent", href: "/docs/architecture#workspace" },
+  ],
+  "@statewalker/vcs-utils": [
+    { label: "Portable by construction", href: "/docs/architecture#portability" },
+  ],
+  "@statewalker/vcs-utils-node": [
+    { label: "Portable by construction", href: "/docs/architecture#portability" },
+  ],
+};

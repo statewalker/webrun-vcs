@@ -1,11 +1,11 @@
 ---
-import CodeBlock from "@/components/CodeBlock.astro";
-import Icon from "@/components/Icon.astro";
-import LayerDiagram from "@/components/LayerDiagram.astro";
-import Badge from "@/components/ui/Badge.astro";
-import Button from "@/components/ui/Button.astro";
-import Card from "@/components/ui/Card.astro";
-import Base from "@/layouts/Base.astro";
+import CodeBlock from "@/components/code-block.astro";
+import Icon from "@/components/icon.astro";
+import LayerDiagram from "@/components/layer-diagram.astro";
+import Badge from "@/components/ui/badge.astro";
+import Button from "@/components/ui/button.astro";
+import Card from "@/components/ui/card.astro";
+import Base from "@/layouts/base.astro";
 import { examples } from "@/lib/examples";
 import { REPO, repoTree } from "@/lib/site";
 
@@ -159,7 +159,10 @@ const useCases = [
           A server that only stores and serves repositories needs the core, a store and the
           transport. A web editor adds the working tree and the commands.
         </p>
-        <Button href="/docs/architecture" variant="outline">Read the architecture <Icon name="arrowRight" /></Button>
+        <div class="flex flex-wrap gap-3">
+          <Button href="/docs/architecture" variant="outline">Read the architecture <Icon name="arrowRight" /></Button>
+          <Button href="/docs/concepts" variant="ghost">How Git works here <Icon name="arrowRight" /></Button>
+        </div>
       </div>
       <LayerDiagram />
     </div>
@@ -190,7 +193,7 @@ const useCases = [
       <p class="font-mono text-xs uppercase tracking-widest text-primary">Live examples</p>
       <h2 class="mt-2 text-3xl font-semibold tracking-tight">Try it without installing anything</h2>
       <p class="mt-3 max-w-2xl text-muted-foreground">
-        These run the published packages in your browser. Each page shows the exact code it runs.
+        These run the packages in your browser, built from this repository. Each page shows the exact code it runs and links to the concepts behind it.
       </p>
       <div class="mt-8 grid gap-3 md:grid-cols-2 lg:grid-cols-3">
         {examples.map((e, i) => (

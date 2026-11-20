@@ -1,5 +1,6 @@
 ---
-import Docs from "@/layouts/Docs.astro";
+import Docs from "@/layouts/docs.astro";
+import { playgroundConcepts } from "@/lib/examples";
 import { repoFile } from "@/lib/site";
 
 const input =
@@ -82,6 +83,17 @@ const heading = "mb-2 font-mono text-xs uppercase tracking-widest text-muted-for
     <li>Change <code>README.md</code> on <code>main</code> and commit, then merge <code>feature</code>: a merge commit with two parents.</li>
     <li>Change the same line on two branches and merge: the merge stops with a conflict, the file holds conflict markers, and a commit concludes it.</li>
   </ul>
+
+  <h2 id="concepts">Read more: the concepts behind it</h2>
+  <ul>
+    {playgroundConcepts.map((c) => (
+      <li><a href={c.href}>{c.label}</a>: {c.why}.</li>
+    ))}
+  </ul>
+  <p>
+    The <a href="/examples/branching-merging">branching &amp; merging example</a> runs the same
+    commands as a script, with its source beside it.
+  </p>
 </Docs>
 
 <script>

@@ -7,7 +7,11 @@ import { defineConfig } from "astro/config";
 import { rehypeRepoLinks } from "./src/lib/rehype-repo-links.ts";
 
 export default defineConfig({
-  site: "https://vcs.httpeers.net",
+  site: "https://vcs.statewalker.com",
+  // Astro's HTML compression drops the line break between a word and a link that starts the
+  // next source line ("read the\n<a>architecture</a>" rendered as "read thearchitecture"). The
+  // published files are Brotli/gzip-compressed anyway (scripts/compress.mjs).
+  compressHTML: false,
   vite: {
     plugins: [tailwindcss()],
     // The live examples bundle vcs-commands, about 1.4 MB unminified (under 400 KB as Brotli):

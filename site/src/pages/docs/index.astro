@@ -1,8 +1,8 @@
 ---
-import CodeBlock from "@/components/CodeBlock.astro";
-import Docs from "@/layouts/Docs.astro";
+import CodeBlock from "@/components/code-block.astro";
+import Docs from "@/layouts/docs.astro";
 import { docHref } from "@/lib/docs";
-import { repoTree } from "@/lib/site";
+import { OBSERVABLE_DOCS, repoTree } from "@/lib/site";
 
 const install = `pnpm add @statewalker/vcs-commands @statewalker/vcs-core @statewalker/vcs-working-tree`;
 
@@ -77,7 +77,7 @@ pnpm --filter @statewalker/vcs-example-01-quick-start start`;
     type declarations and runs in browsers, Node.js and workers.
   </p>
 
-  <h2>Install</h2>
+  <h2 id="install">Install</h2>
   <CodeBlock code={install} lang="sh" title="terminal" />
   <p>
     Add a storage backend when the repository must outlive the process:
@@ -86,7 +86,7 @@ pnpm --filter @statewalker/vcs-example-01-quick-start start`;
     similar), and <code>@statewalker/vcs-transport</code> to fetch and push.
   </p>
 
-  <h2>A first commit</h2>
+  <h2 id="first-commit">A first commit</h2>
   <p>The minimal program, in memory. It is also the <a href="/examples/quick-start">first live example</a>: run it in this tab.</p>
   <CodeBlock code={minimal} lang="ts" title="first-commit.ts" />
   <p>
@@ -95,10 +95,12 @@ pnpm --filter @statewalker/vcs-example-01-quick-start start`;
     <code>branchCreate()</code>, <code>checkout()</code>, <code>merge()</code>,
     <code>rebase()</code>, <code>stash*()</code>, <code>fetch()</code>, <code>push()</code>,
     <code>clone()</code> and more are listed in the
-    <a href={docHref("packages/vcs-commands/README.md")}>vcs-commands reference</a>.
+    <a href={docHref("packages/vcs-commands/README.md")}>vcs-commands reference</a>. What
+    <code>add</code> and <code>commit</code> move between the worktree, the index and the history
+    is explained in <a href="/docs/concepts#working-copy">How Git works here</a>.
   </p>
 
-  <h2>A repository git can open</h2>
+  <h2 id="on-disk">A repository git can open</h2>
   <p>
     <code>@statewalker/vcs-store-files</code> reads and writes git's own layout: loose objects,
     packs and their indexes, loose and packed refs, reflogs, the binary index. A repository written
@@ -109,7 +111,7 @@ pnpm --filter @statewalker/vcs-example-01-quick-start start`;
   </p>
   <CodeBlock code={onDisk} lang="ts" title="open-on-disk.ts" />
 
-  <h2>Fetch and push</h2>
+  <h2 id="fetch-push">Fetch and push</h2>
   <p>
     <code>@statewalker/vcs-transport</code> speaks git's wire protocol (v1 and v2) over smart HTTP
     or any duplex byte stream: a <code>MessagePort</code>, a WebRTC data channel, a webrun-streams
@@ -118,7 +120,7 @@ pnpm --filter @statewalker/vcs-example-01-quick-start start`;
   </p>
   <CodeBlock code={clone} lang="ts" title="fetch.ts" />
 
-  <h2>From the sources</h2>
+  <h2 id="from-sources">From the sources</h2>
   <p>
     The repository is a pnpm workspace: packages under <code>packages/</code>, eleven numbered
     Node tutorials under <a href={repoTree("apps/examples")}><code>apps/examples</code></a>,
@@ -127,10 +129,15 @@ pnpm --filter @statewalker/vcs-example-01-quick-start start`;
   </p>
   <CodeBlock code={fromSources} lang="sh" title="terminal" />
 
-  <h2>Next</h2>
+  <h2 id="next">Next</h2>
   <ul>
+    <li><a href="/docs/concepts">How Git works here</a>: objects, refs, the index, merging and the protocol, with the examples that show them.</li>
     <li><a href="/docs/architecture">Architecture</a>: the layers and why they are separate.</li>
     <li><a href="/examples">Live examples</a> and the <a href="/examples/playground">playground</a>.</li>
     <li><a href="/docs/examples">Apps &amp; demos</a>: the tutorials and demos in the repository.</li>
   </ul>
+  <p>
+    This site replaces the earlier one-page summary published from <code>docs/</code> on
+    <a href={OBSERVABLE_DOCS}>GitHub Pages</a>; everything that page says is covered here.
+  </p>
 </Docs>

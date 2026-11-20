@@ -1,14 +1,14 @@
 ---
-import Icon from "@/components/Icon.astro";
-import Docs from "@/layouts/Docs.astro";
+import Icon from "@/components/icon.astro";
+import Docs from "@/layouts/docs.astro";
 import { examples } from "@/lib/examples";
 ---
 
 <Docs title="Live examples" description="Examples that run the StateWalker VCS packages in your browser: commits, branches and merges, Git's object bytes, a real .git directory, and the Git protocol between two repositories." wide>
   <h1>Live examples</h1>
   <p>
-    Each example below is a small TypeScript module that runs in this tab, on the same packages
-    published to npm. Its page shows the module's source and a <strong>Run</strong> button: the code
+    Each example below is a small TypeScript module that runs in this tab, on this repository's
+    packages (the code published to npm, built from the main branch). Its page shows the module's source and a <strong>Run</strong> button: the code
     you read is the code that runs. Nothing is sent to a server; there is no server.
   </p>
 
@@ -46,7 +46,8 @@ import { examples } from "@/lib/examples";
     (<code>site/scripts/check-examples.mjs</code>) runs every example on every change to the site.
   </p>
   <p>
-    For longer programs, the repository has eleven numbered Node tutorials and a set of demos:
-    see <a href="/docs/examples">Apps &amp; demos</a>.
+    Each example page ends with links to the concepts it shows; they are collected in
+    <a href="/docs/concepts">How Git works here</a>. For longer programs, the repository has
+    eleven numbered Node tutorials and eleven demos: see <a href="/docs/examples">Apps &amp; demos</a>.
   </p>
 </Docs>

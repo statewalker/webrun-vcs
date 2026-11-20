@@ -1,7 +1,7 @@
 ---
-import CodeBlock from "@/components/CodeBlock.astro";
-import LayerDiagram from "@/components/LayerDiagram.astro";
-import Docs from "@/layouts/Docs.astro";
+import CodeBlock from "@/components/code-block.astro";
+import LayerDiagram from "@/components/layer-diagram.astro";
+import Docs from "@/layouts/docs.astro";
 import { docHref } from "@/lib/docs";
 import { repoFile } from "@/lib/site";
 
@@ -28,12 +28,13 @@ createHistoryFromComponents({ … })                        // your own raw stor
     ids, pack format and protocol messages as git. It is a stack of small packages; an application
     takes only the layers it needs. A server that stores and serves repositories needs
     <code>vcs-core</code>, a store and <code>vcs-transport</code>, not the working tree or the
-    commands.
+    commands. The git ideas themselves (objects, refs, the index, merging, the protocol) are
+    explained in <a href="/docs/concepts">How Git works here</a>.
   </p>
 
   <LayerDiagram />
 
-  <h2>History, checkout and worktree are separate</h2>
+  <h2 id="working-copy">History, checkout and worktree are separate</h2>
   <p>
     <code>vcs-core</code> knows only immutable objects and refs. The index, the working files and
     the state of an operation in progress change on every command and depend on a filesystem, so
@@ -44,10 +45,12 @@ createHistoryFromComponents({ … })                        // your own raw stor
   <p>
     The split is what lets one history serve several worktrees (as <code>git worktree</code>
     does), sync independently of any checkout, and run every command over memory in tests and
-    over a real directory in production.
+    over a real directory in production. The <a href="/examples/quick-start">quick start</a>
+    composes the three parts in memory; <a href="/docs/concepts#working-copy">How Git works here</a>
+    says what each one holds.
   </p>
 
-  <h2>Storage is a set of small interfaces</h2>
+  <h2 id="storage">Storage is a set of small interfaces</h2>
   <p>
     A backend implements object, ref and staging stores; pack formats, deltas and object
     serialization are shared. So the same repository logic runs over memory, a <code>.git</code>
@@ -59,10 +62,13 @@ createHistoryFromComponents({ … })                        // your own raw stor
     Every store uses git's SHA-1 ids. <code>vcs-store-files</code> keeps objects byte for byte; the
     SQL history rebuilds commits and tags from the columns it models, so a commit with extra
     headers (a <code>mergetag</code>) is not kept byte-exact there
-    (<a href={docHref("packages/vcs-store-sql/README.md")}>vcs-store-sql</a>).
+    (<a href={docHref("packages/vcs-store-sql/README.md")}>vcs-store-sql</a>). The
+    <a href="/examples/git-directory">.git directory example</a> runs the file backend over an
+    in-memory <code>FilesApi</code>; its layout is described in
+    <a href="/docs/concepts#git-directory">How Git works here</a>.
   </p>
 
-  <h2>Portable by construction</h2>
+  <h2 id="portability">Portable by construction</h2>
   <p>
     Library code uses only APIs that exist in browsers and on servers: files through a
     <code>FilesApi</code> (<code>@statewalker/webrun-files</code>), Web Streams, Web Crypto,
@@ -72,7 +78,7 @@ createHistoryFromComponents({ … })                        // your own raw stor
     SQLite behind the same <code>FilesApi</code>.
   </p>
 
-  <h2>One transport for servers and peers</h2>
+  <h2 id="transport">One transport for servers and peers</h2>
   <p>
     <code>vcs-transport</code> implements git's wire protocol, v1 and v2, as finite state machines
     over a <code>Duplex</code>. Smart HTTP (<code>fetch</code>, <code>push</code>,
@@ -82,10 +88,13 @@ createHistoryFromComponents({ … })                        // your own raw stor
     <code>vcs-transport-adapters</code> connects a <code>History</code> to the transport's
     <code>RepositoryFacade</code> and <code>RefStore</code>;
     <code>vcs-transport-httpeers</code> serves git and LFS between the peers of an
-    <a href="https://github.com/statewalker/httpeers">httpeers</a> mesh.
+    <a href="https://github.com/statewalker/httpeers">httpeers</a> mesh. The
+    <a href="/examples/fetch-push">fetch &amp; push example</a> runs a fetch and a push over
+    <code>MessagePort</code>s; the protocol itself is described in
+    <a href="/docs/concepts#transport">How Git works here</a>.
   </p>
 
-  <h2>Large objects go around the object store</h2>
+  <h2 id="large-objects">Large objects go around the object store</h2>
   <p>
     <code>vcs-transport-lfs</code> speaks the Git LFS batch protocol with <code>basic</code>
     whole-object transfer; <code>vcs-transport-xet</code> reads Hugging Face Xet and moves only
@@ -94,7 +103,7 @@ createHistoryFromComponents({ … })                        // your own raw stor
     of packs; the LFS pointer still carries the standard whole-file SHA-256.
   </p>
 
-  <h2>File sync and versioning stay independent</h2>
+  <h2 id="workspace">File sync and versioning stay independent</h2>
   <p>
     File synchronization (<code>@statewalker/webrun-files-sync</code>) knows nothing of git, and
     the git packages know nothing of sync. Only <code>vcs-workspace</code> combines them: it runs
@@ -103,8 +112,10 @@ createHistoryFromComponents({ … })                        // your own raw stor
     alone.
   </p>
 
-  <h2>Further reading</h2>
+  <h2 id="further-reading">Further reading</h2>
   <ul>
+    <li><a href="/docs/concepts">How Git works here</a>: the concepts the live examples show.</li>
+    <li><a href={repoFile("ARCHITECTURE.md")}>ARCHITECTURE.md</a> in the repository: the same layers in more depth, for contributors.</li>
     <li><a href={repoFile("docs/package-dependencies.md")}>Package dependency diagram</a> (every runtime edge, as Mermaid).</li>
     <li>The <a href={docHref("packages/vcs-core/README.md")}>vcs-core</a>, <a href={docHref("packages/vcs-transport/README.md")}>vcs-transport</a> and <a href={docHref("packages/vcs-store-files/README.md")}>vcs-store-files</a> references.</li>
     <li><a href={repoFile("README.md")}>The repository README</a>: what will surprise you when building from source.</li>

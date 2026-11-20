@@ -19,7 +19,8 @@
     "build": "astro build && node scripts/compress.mjs",
     "preview": "astro preview",
     "typecheck": "astro sync && tsc --noEmit",
-    "check:examples": "node scripts/check-examples.mjs"
+    "check:examples": "node scripts/check-examples.mjs",
+    "check:links": "node scripts/check-links.mjs"
   },
   "dependencies": {
     "@astrojs/markdown-remark": "catalog:",

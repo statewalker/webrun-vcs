@@ -1,0 +1,255 @@
+---
+import CodeBlock from "@/components/code-block.astro";
+import Docs from "@/layouts/docs.astro";
+import { docHref } from "@/lib/docs";
+
+const loose = `object = "<type> <size>\\0" + content        type: blob | tree | commit | tag
+id     = SHA-1(object)                        40 hex digits
+stored = zlib(object) at .git/objects/<id[0..2]>/<id[2..]>
+
+"hello\\n" as a blob:  "blob 6\\0hello\\n"  →  ce013625030ba8dba906f756967f9e9ca394464a
+                     (the id \`printf 'hello\\n' | git hash-object --stdin\` prints)`;
+
+const gitDir = `.git/
+  HEAD                  ref: refs/heads/main      (a symbolic ref: the current branch)
+  config                repository settings
+  index                 the staging area, in git's binary index format
+  objects/ce/0136…      loose objects, zlib-compressed
+  objects/pack/*.pack   pack files, each with its .idx
+  refs/heads/main       a branch: one object id
+  refs/tags/v1.0        a tag
+  packed-refs           many refs in one file (git pack-refs)
+  logs/HEAD, logs/refs/ reflogs: where each ref pointed, and when
+  MERGE_HEAD, rebase-merge/, sequencer/ …   the state of an operation in progress`;
+
+const fetchDialogue = `client                                   server (git-upload-pack)
+                                  ←      ref advertisement: <id> refs/heads/main …  (v0/v1)
+                                         or capabilities, then ls-refs on request     (v2)
+want <id>                          →
+have <id> … (commits it already has)  →
+                                  ←      ACK <id> / NAK  (common commits found)
+done                               →
+                                  ←      a pack of the objects the client lacks`;
+---
+
+<Docs title="How Git works here" description="The concepts behind StateWalker VCS and its live examples: Git's object model, loose objects and packs, refs and branches, the working copy, merging, the .git directory, and the wire protocol.">
+  <h1>How Git works here</h1>
+  <p>
+    StateWalker VCS does not imitate git: it stores and exchanges the same bytes. This page
+    explains the ideas the <a href="/examples">live examples</a> show, section by section, and
+    points to the packages that implement each one. For how the packages are layered, read the
+    <a href="/docs/architecture">architecture</a>.
+  </p>
+
+  <h2 id="objects">The object model</h2>
+  <p>
+    A repository's history is a set of immutable <strong>objects</strong>, each named by the hash
+    of its content. There are four kinds:
+  </p>
+  <ul>
+    <li>a <strong>blob</strong> is a file's bytes, with no name or mode;</li>
+    <li>a <strong>tree</strong> is a directory: entries of mode, name and the id of a blob or another tree;</li>
+    <li>a <strong>commit</strong> names a tree (the whole snapshot), its parent commits, an author, a committer and a message;</li>
+    <li>an annotated <strong>tag</strong> names an object and adds a tagger and a message.</li>
+  </ul>
+  <p>
+    Because an id is a hash of the content, the same file always has the same id, a snapshot
+    shares every unchanged blob and tree with its parent, and any change to an object gives it a
+    different id. <code>vcs-core</code> holds these objects behind typed stores
+    (<code>history.blobs</code>, <code>trees</code>, <code>commits</code>, <code>tags</code>); see
+    the <a href={docHref("packages/vcs-core/README.md")}>vcs-core reference</a>.
+  </p>
+  <p>Shown by: <a href="/examples/object-model">Object model</a> (a blob, a tree and a commit, built and checked).</p>
+
+  <h2 id="loose-objects">Loose objects and ids</h2>
+  <p>
+    git stores an object on its own as a <strong>loose object</strong>: a short header, the type
+    and the size, then the content; the id is the SHA-1 of those bytes, and the file holds them
+    zlib-compressed. <code>vcs-core</code>'s object kernel writes exactly that form, whatever the
+    storage behind it, and never re-encodes what git produced, so every id stays git's.
+  </p>
+  <CodeBlock code={loose} lang="text" title="a loose object" />
+  <p>
+    Only SHA-1 is implemented: SHA-256 repositories are not supported. Reading checks the header,
+    the size and the zlib stream, and a received object is refused unless its bytes hash to its id.
+  </p>
+  <p>
+    Shown by: <a href="/examples/object-model">Object model</a> (the browser's own zlib and SHA-1
+    confirm each id) and <a href="/examples/git-directory">A real .git directory</a> (the files
+    under <code>objects/</code>).
+  </p>
+
+  <h2 id="packs">Pack files</h2>
+  <p>
+    A <strong>pack</strong> holds many objects in one file, with an <code>.idx</code> index to find
+    each by id. Inside, an object may be stored as a <strong>delta</strong> against another one
+    (by offset in the same pack, or by id), which is how git keeps history small. Packs are also
+    what the protocol sends: a fetch or a push transfers one pack of the objects the other side
+    lacks. <code>vcs-core</code> lists the objects to send (<code>listObjects</code>), writes
+    version 2 packs (<code>writePack</code>, with a delta search), reads and indexes received ones;
+    <code>vcs-store-files</code> adds <code>repack</code> and <code>gc</code> over a
+    <code>.git</code> directory.
+  </p>
+  <p>
+    Shown by: <a href="/examples/fetch-push">Fetch &amp; push</a> (each direction transfers a pack).
+    More in the <a href={docHref("packages/vcs-core/README.md")}>vcs-core</a> and
+    <a href={docHref("packages/vcs-store-files/README.md")}>vcs-store-files</a> references.
+  </p>
+
+  <h2 id="refs">Refs, HEAD and branches</h2>
+  <p>
+    Objects are immutable; what moves is <strong>refs</strong>, names that point at an object id.
+    A <strong>branch</strong> is a ref under <code>refs/heads/</code>, a tag a ref under
+    <code>refs/tags/</code>, and a <strong>remote-tracking</strong> ref under
+    <code>refs/remotes/&lt;remote&gt;/</code> records where another repository's branch was at the
+    last fetch. <strong>HEAD</strong> is usually a <em>symbolic</em> ref, naming the current branch
+    rather than a commit: committing moves the branch HEAD names, and checking out a branch points
+    HEAD at it. A <strong>refspec</strong> such as <code>+refs/heads/*:refs/remotes/alice/*</code>
+    says which remote refs a fetch writes to which local ones.
+  </p>
+  <p>
+    Every ref store checks names as git does and refuses a value that is not a full object id;
+    several refs can be updated in one atomic batch. <code>vcs-store-files</code> keeps refs as
+    git does: one file per loose ref, <code>packed-refs</code>, and reflogs.
+  </p>
+  <p>
+    Shown by: <a href="/examples/quick-start">Quick start</a> (HEAD set to an unborn
+    <code>main</code>), <a href="/examples/branching-merging">Branching &amp; merging</a> (create,
+    switch) and <a href="/examples/fetch-push">Fetch &amp; push</a> (remote-tracking refs written
+    by a refspec).
+  </p>
+
+  <h2 id="working-copy">History, checkout and worktree</h2>
+  <p>
+    The objects and refs are the <strong>history</strong>. What you edit is the
+    <strong>worktree</strong>, the files. Between them sits the <strong>index</strong> (the staging
+    area): the snapshot the next commit will record. <code>git add</code> stores a file's content
+    as a blob and puts it in the index; <code>git commit</code> writes trees from the index, stores
+    a commit of them and moves the current branch; <code>git status</code> compares HEAD, the index
+    and the worktree.
+  </p>
+  <p>
+    Here these are separate parts. <code>vcs-core</code> holds the history;
+    <code>vcs-working-tree</code> holds the <strong>checkout</strong> (the index, HEAD and the
+    state of a merge or rebase in progress) and the worktree; the three together are a
+    <code>WorkingCopy</code>, and <code>Git.fromWorkingCopy</code> from <code>vcs-commands</code>
+    runs commands on it. Each part has an in-memory and a file implementation
+    (<a href="/docs/architecture#working-copy">architecture</a>).
+  </p>
+  <p>
+    Shown by: <a href="/examples/quick-start">Quick start</a> and the
+    <a href="/examples/playground">playground</a>, whose panels show the worktree, the status and
+    the log.
+  </p>
+
+  <h2 id="merge">Merging</h2>
+  <p>
+    <code>git merge</code> joins another branch's history into the current one. It first finds the
+    <strong>merge base</strong>, the best common ancestor of the two commits.
+  </p>
+  <ul>
+    <li>
+      If the current commit is that ancestor, nothing needs combining: the merge
+      <strong>fast-forwards</strong> and the branch simply moves to the other commit (the default;
+      <code>FastForwardMode.NO_FF</code> always makes a merge commit, <code>FF_ONLY</code> refuses
+      anything else).
+    </li>
+    <li>
+      Otherwise it is a <strong>three-way merge</strong>: each path is compared in the base, ours
+      and theirs. A change on one side only is taken; the same change on both sides is taken once;
+      different changes to the same lines are a <strong>conflict</strong>. Without conflicts, a
+      merge commit with two parents records the result.
+    </li>
+    <li>
+      With conflicts, the merge stops (status <code>CONFLICTING</code>): the files hold conflict
+      markers and the index keeps the three versions until you resolve them and commit.
+    </li>
+  </ul>
+  <p>
+    The strategy is <code>MergeStrategy.RECURSIVE</code> by default, which handles several merge
+    bases (criss-cross histories); <code>RESOLVE</code> uses a single base, and <code>OURS</code> /
+    <code>THEIRS</code> keep one side's tree. <code>ContentMergeStrategy</code> (ours, theirs,
+    union) settles conflicting hunks automatically. See the
+    <a href={docHref("packages/vcs-commands/README.md")}>vcs-commands reference</a>.
+  </p>
+  <p>
+    Shown by: <a href="/examples/branching-merging">Branching &amp; merging</a> (a three-way merge
+    commit) and the <a href="/examples/playground">playground</a> (try a conflict).
+  </p>
+
+  <h2 id="git-directory">The .git directory</h2>
+  <p>
+    <code>@statewalker/vcs-store-files</code> stores a repository in git's own layout, so
+    <code>git log</code>, <code>git status</code> and <code>git fsck</code> work on it, and it reads
+    what native git writes. All of its I/O goes through a <code>FilesApi</code>: the Node
+    filesystem, memory, OPFS or any other implementation.
+  </p>
+  <CodeBlock code={gitDir} lang="text" title="what vcs-store-files reads and writes" />
+  <p>
+    The other backends (memory, SQL, key-value) keep the same objects and refs elsewhere, behind the
+    same <code>History</code> interface (<a href="/docs/architecture#storage">architecture: storage</a>).
+  </p>
+  <p>
+    Shown by: <a href="/examples/git-directory">A real .git directory</a> (every file written,
+    then the folder as a zip for native git).
+  </p>
+
+  <h2 id="transport">The wire protocol</h2>
+  <p>
+    Two repositories exchange history with git's protocol. A fetch talks to the other side's
+    <strong>upload-pack</strong> service, a push to its <strong>receive-pack</strong> service.
+    Messages are <strong>pkt-lines</strong> (a 4-digit hex length, then the payload); with the
+    side-band capability, the pack and the progress messages travel on separate bands of one
+    stream.
+  </p>
+  <ul>
+    <li>
+      <strong>Protocol v0/v1</strong>: the server opens with a ref advertisement (every ref and its
+      id, plus capabilities such as <code>multi_ack_detailed</code>, <code>side-band-64k</code>,
+      <code>ofs-delta</code>, <code>thin-pack</code>, <code>shallow</code>,
+      <code>include-tag</code>).
+    </li>
+    <li>
+      <strong>Protocol v2</strong>: the server advertises capabilities, and the client sends
+      commands: <code>ls-refs</code> (list refs, optionally by prefix), <code>fetch</code> and
+      <code>object-info</code>.
+    </li>
+    <li>
+      <strong>Push</strong>: the client sends one command per ref (old id, new id, name) and a pack;
+      the server checks and applies them and answers with a report-status, per ref.
+    </li>
+  </ul>
+  <p>
+    <code>@statewalker/vcs-transport</code> implements both sides as state machines over a
+    <code>Duplex</code>, so the same code runs over smart HTTP (<code>fetch</code>,
+    <code>push</code>, <code>lsRemote</code>) and over any byte stream
+    (<code>fetchOverDuplex</code>, <code>pushOverDuplex</code>, <code>serveOverDuplex</code>; a
+    <code>MessagePort</code> in the example). See the
+    <a href={docHref("packages/vcs-transport/README.md")}>vcs-transport reference</a> and
+    <a href="/docs/architecture#transport">architecture: transport</a>.
+  </p>
+
+  <h3 id="negotiation">Fetch negotiation</h3>
+  <p>
+    The client says which commits it <em>wants</em> and which it already <em>has</em>; the server
+    acknowledges the common ones, and then sends a pack with only the objects reachable from the
+    wants and not from the common commits. A repository that already holds most of the history
+    receives only what is new.
+  </p>
+  <CodeBlock code={fetchDialogue} lang="text" title="a fetch, simplified" />
+  <p>
+    Shown by: <a href="/examples/fetch-push">Fetch &amp; push</a> (a fetch over upload-pack, then a
+    push over receive-pack, between two repositories in this tab).
+  </p>
+
+  <h2 id="further-reading">Further reading</h2>
+  <ul>
+    <li><a href="/docs/architecture">Architecture</a>: the packages, layer by layer, and why they are separate.</li>
+    <li><a href="/docs">Getting started</a>: install, a first commit, a repository on disk, a fetch.</li>
+    <li>
+      Large files (Git LFS and Hugging Face Xet) are explained in
+      <a href="/docs/architecture#large-objects">architecture: large objects</a> and the
+      <a href={docHref("packages/vcs-transport-lfs/README.md")}>vcs-transport-lfs</a> reference.
+    </li>
+  </ul>
+</Docs>

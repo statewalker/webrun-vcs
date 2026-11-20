@@ -12,7 +12,33 @@ export interface LiveExample {
   packages: string[];
   /** The repository's own example or demo covering the same ground. */
   related?: { label: string; path: string };
+  /** The pages (and sections) that explain what the example shows. */
+  concepts: { label: string; href: string; why: string }[];
 }
+
+/** The explanation pages a playground session touches (src/pages/examples/playground.astro). */
+export const playgroundConcepts: LiveExample["concepts"] = [
+  {
+    label: "History, checkout and worktree",
+    href: "/docs/concepts#working-copy",
+    why: "what Save file, Stage all and commit change: the worktree, the index, then the history",
+  },
+  {
+    label: "Refs, HEAD and branches",
+    href: "/docs/concepts#refs",
+    why: "what Create & switch and Switch to it move",
+  },
+  {
+    label: "Merging",
+    href: "/docs/concepts#merge",
+    why: "fast-forward or a three-way merge commit, and when a merge conflicts",
+  },
+  {
+    label: "vcs-commands reference",
+    href: "/docs/packages/vcs-commands",
+    why: "every command the buttons call, and the many more they do not",
+  },
+];
 
 export const examples: LiveExample[] = [
   {
@@ -34,6 +60,28 @@ export const examples: LiveExample[] = [
       label: "apps/examples/02-porcelain-commands",
       path: "apps/examples/02-porcelain-commands",
     },
+    concepts: [
+      {
+        label: "Getting started: a first commit",
+        href: "/docs#first-commit",
+        why: "the same program, with how to install the packages",
+      },
+      {
+        label: "History, checkout and worktree",
+        href: "/docs/concepts#working-copy",
+        why: "the three parts the example composes into a working copy, and what add and commit move between them",
+      },
+      {
+        label: "The commands layer",
+        href: "/docs/architecture#working-copy",
+        why: "why the porcelain lives in its own package",
+      },
+      {
+        label: "vcs-commands reference",
+        href: "/docs/packages/vcs-commands",
+        why: "every command of the Git facade",
+      },
+    ],
   },
   {
     name: "branching-merging",
@@ -54,6 +102,23 @@ export const examples: LiveExample[] = [
       label: "apps/examples/04-branching-merging",
       path: "apps/examples/04-branching-merging",
     },
+    concepts: [
+      {
+        label: "Refs, HEAD and branches",
+        href: "/docs/concepts#refs",
+        why: "a branch is a ref under refs/heads, and HEAD names the current one",
+      },
+      {
+        label: "Merging",
+        href: "/docs/concepts#merge",
+        why: "the merge base, fast-forward versus a three-way merge, strategies and conflicts",
+      },
+      {
+        label: "vcs-commands reference",
+        href: "/docs/packages/vcs-commands",
+        why: "checkout, merge and their options",
+      },
+    ],
   },
   {
     name: "object-model",
@@ -67,6 +132,28 @@ export const examples: LiveExample[] = [
     ],
     packages: ["@statewalker/vcs-core"],
     related: { label: "apps/examples/03-object-model", path: "apps/examples/03-object-model" },
+    concepts: [
+      {
+        label: "The object model",
+        href: "/docs/concepts#objects",
+        why: "blobs, trees, commits and tags, and why an id names the content",
+      },
+      {
+        label: "Loose objects and ids",
+        href: "/docs/concepts#loose-objects",
+        why: "the header, the zlib stream and the SHA-1 this example checks",
+      },
+      {
+        label: "Pack files",
+        href: "/docs/concepts#packs",
+        why: "how the same objects are stored many at a time, as deltas",
+      },
+      {
+        label: "vcs-core reference",
+        href: "/docs/packages/vcs-core",
+        why: "the object kernel, the typed stores and the pack functions",
+      },
+    ],
   },
   {
     name: "git-directory",
@@ -84,6 +171,28 @@ export const examples: LiveExample[] = [
       "@statewalker/webrun-files-mem",
     ],
     related: { label: "packages/vcs-store-files", path: "packages/vcs-store-files" },
+    concepts: [
+      {
+        label: "The .git directory",
+        href: "/docs/concepts#git-directory",
+        why: "what each file the example lists is for",
+      },
+      {
+        label: "Storage is a set of small interfaces",
+        href: "/docs/architecture#storage",
+        why: "the other backends behind the same History",
+      },
+      {
+        label: "Portable by construction",
+        href: "/docs/architecture#portability",
+        why: "why the same code writes to memory here and to a disk in Node",
+      },
+      {
+        label: "vcs-store-files reference",
+        href: "/docs/packages/vcs-store-files",
+        why: "createGitFilesBackend, the ref store, gc and repack",
+      },
+    ],
   },
   {
     name: "fetch-push",
@@ -97,5 +206,32 @@ export const examples: LiveExample[] = [
     ],
     packages: ["@statewalker/vcs-transport", "@statewalker/vcs-commands", "@statewalker/vcs-core"],
     related: { label: "apps/demos/webrtc-p2p-sync", path: "apps/demos/webrtc-p2p-sync" },
+    concepts: [
+      {
+        label: "The wire protocol",
+        href: "/docs/concepts#transport",
+        why: "upload-pack and receive-pack, pkt-lines, protocol v1 and v2",
+      },
+      {
+        label: "Fetch negotiation",
+        href: "/docs/concepts#negotiation",
+        why: "how the two sides agree on which objects to send",
+      },
+      {
+        label: "Refs, HEAD and branches",
+        href: "/docs/concepts#refs",
+        why: "the refspec that maps Alice's branches to refs/remotes/alice/*",
+      },
+      {
+        label: "One transport for servers and peers",
+        href: "/docs/architecture#transport",
+        why: "why the same machines talk to a git host and to another tab",
+      },
+      {
+        label: "vcs-transport reference",
+        href: "/docs/packages/vcs-transport",
+        why: "the HTTP and duplex operations and their results",
+      },
+    ],
   },
 ];
