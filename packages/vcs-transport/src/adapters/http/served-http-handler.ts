@@ -7,7 +7,8 @@
  * repository's own config, its hooks run for a push (pre-receive, update, post-receive,
  * post-update, push-to-checkout, reference-transaction through `around`), and the services
  * are enabled as http-backend enables them (`http.uploadpack`, `http.receivepack`,
- * `http.getanyfile`).
+ * `http.getanyfile`), except that what the operator turns off stays off whatever a
+ * repository's config says, and the dumb protocol is off unless asked for.
  *
  * @example
  * ```ts
@@ -37,9 +38,11 @@ import {
   isUnsafeServicePath,
   resolveServeSettings,
   type ServedRepository,
+  type ServedRequestContext,
 } from "../../operations/serve-git-connection.js";
 import { configBoolOf } from "../../operations/server-config.js";
 import { parseGitProtocolEnv } from "../../protocol/git-daemon-request.js";
+import { visibleRefs } from "../../protocol/hidden-refs.js";
 import {
   fetchRequestToHttpRequest,
   type HttpHandlerContext,
@@ -69,6 +72,8 @@ export interface HttpServiceRequest extends GitServiceRequest {
   http: HttpRequest;
   /** The authenticated user ({@link ServedHttpHandlerOptions.remoteUser}), if any */
   remoteUser?: string;
+  /** The client's address ({@link ServedHttpHandlerOptions.remoteAddr}), if known */
+  remoteAddr?: string;
 }
 
 /** Options of {@link createServedHttpHandler}. */
@@ -76,9 +81,11 @@ export interface ServedHttpHandlerOptions {
   /**
    * The repository a request names, or undefined (answered 404, as http-backend's "Not a git
    * repository" and "Repository not exported"). `path` is the URL path before the service
-   * suffix (`/r.git` of `/r.git/info/refs`), percent-decoded as the URL parser leaves it; it
-   * has passed {@link isUnsafeServicePath} (absolute, no `..`, `//`, `/./`, NUL or
-   * backslash). Map it with `createBasePathResolver`, never by joining it to a directory
+   * suffix (`/r.git` of `/r.git/info/refs`), each segment percent-decoded (`/my repo.git` of
+   * `/my%20repo.git`, as a web server hands http-backend its `PATH_INFO`); a path whose
+   * segments encode `/`, `\` or NUL, or do not decode, is answered 404 without asking. It
+   * has passed {@link isUnsafeServicePath} once decoded (absolute, no `..`, `//`, `/./`, NUL
+   * or backslash). Map it with `createBasePathResolver`, never by joining it to a directory
    * unchecked.
    */
   resolveRepository(
@@ -92,26 +99,41 @@ export interface ServedHttpHandlerOptions {
    */
   remoteUser?(request: HttpRequest): string | undefined | Promise<string | undefined>;
   /**
-   * Serve upload-pack (default true, as http-backend); a repository's `http.uploadpack`
-   * overrides it (unless `allowOverride` is false)
+   * The client's address of a request (http-backend's `REMOTE_ADDR`, which the web server
+   * sets); default: none. Receive-pack's hooks get it as `REMOTE_ADDR`, and in
+   * `GIT_COMMITTER_EMAIL` (`<user>@http.<addr>`) where the host sets no committer.
+   */
+  remoteAddr?(request: HttpRequest): string | undefined | Promise<string | undefined>;
+  /**
+   * Serve upload-pack (default true, as http-backend). Unset or true, a repository's
+   * `http.uploadpack` decides (unless `allowOverride` is false); false refuses it whatever
+   * the repository's config says (http-backend lets the config turn it back on)
    */
   enableUploadPack?: boolean;
   /**
    * Serve receive-pack: true to every client, false to none; default (undefined) as
-   * http-backend: to authenticated users only (`remoteUser`). A repository's
-   * `http.receivepack` overrides it (unless `allowOverride` is false)
+   * http-backend: to authenticated users only (`remoteUser`). Unset or true, a repository's
+   * `http.receivepack` decides (unless `allowOverride` is false); false refuses it whatever
+   * the repository's config says, so one tenant cannot open its repository to pushes the
+   * operator turned off
    */
   enableReceivePack?: boolean;
   /**
-   * Answer the dumb protocol's requests (http-backend's `http.getanyfile`, default true):
-   * `HEAD` and `info/refs` without a service are served from the refs; `objects/...` files
-   * are not served here (404) whatever this says. False refuses them all (403). A
-   * repository's `http.getanyfile` overrides it (unless `allowOverride` is false)
+   * Answer the dumb protocol's requests (http-backend's `http.getanyfile`), default false
+   * here where http-backend's is true: this server serves no object files (`objects/...` is
+   * a 404 whatever this says), so a dumb client cannot clone from it anyway. On, `HEAD` and
+   * `info/refs` without a service are served from the refs, only where upload-pack is
+   * served (403 otherwise) and without the refs upload-pack hides (`transfer.hideRefs`,
+   * `uploadpack.hideRefs`), where http-backend lists every ref. Off, they are refused (403).
+   * Unset, a repository's `http.getanyfile=true` turns it on, as true turns it on and its
+   * `http.getanyfile=false` off (unless `allowOverride` is false); false refuses it whatever
+   * the repository's config says
    */
   getAnyFile?: boolean;
   /**
    * Let a repository's config (`http.uploadpack`, `http.receivepack`, `http.getanyfile`)
-   * decide (default true: http-backend reads them from the repository's config)
+   * decide what the operator left unset or turned on (default true: http-backend reads them
+   * from the repository's config). An operator's false is never overridden.
    */
   allowOverride?: boolean;
   /**
@@ -170,6 +192,38 @@ const ROUTES: Array<{ method: "GET" | "POST"; pattern: RegExp; route: Route }> =
 ];
 
 const textEncoder = new TextEncoder();
+
+/** The body of every 500: what failed goes to the logger, never to the client. */
+const INTERNAL_ERROR = "Internal server error";
+
+function internalError(): HttpResponse {
+  return {
+    status: 500,
+    headers: { ...NO_CACHE_HEADERS, "Content-Type": "text/plain" },
+    body: textEncoder.encode(INTERNAL_ERROR),
+  };
+}
+
+/**
+ * The repository path of a request path, each segment percent-decoded (as a web server
+ * decodes `PATH_INFO` for http-backend); undefined when a segment does not decode or
+ * encodes a `/`, `\` or NUL (Apache's `AllowEncodedSlashes Off` answers those 404 too).
+ */
+function decodeRepoPath(path: string): string | undefined {
+  const segments = path.split("/");
+  const out: string[] = [];
+  for (const segment of segments) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      return undefined;
+    }
+    if (/[/\\\0]/.test(decoded)) return undefined;
+    out.push(decoded);
+  }
+  return out.join("/");
+}
 
 /** An answer with no body, as http-backend's `not_found` / `forbidden` (the reason on its stderr). */
 function refusal(status: 403 | 404, headers: Record<string, string> = {}): HttpResponse {
@@ -234,25 +288,40 @@ function withinAround(
   service: "git-upload-pack" | "git-receive-pack",
   produce: (context: Pick<HttpHandlerContext, "done">) => Promise<HttpResponse>,
   logger: ServedHttpHandlerOptions["logger"],
+  requestContext: ServedRequestContext,
 ): Promise<HttpResponse> {
   const around = served.around?.bind(served);
   if (!around) return produce({});
   return new Promise<HttpResponse>((resolve, reject) => {
     let delivered = false;
-    around(service, async () => {
-      let finished: Promise<void> = Promise.resolve();
-      const response = await produce({
-        done: (run) => {
-          finished = run;
-        },
-      });
-      delivered = true;
-      resolve(response);
-      await finished;
-    }).catch((error: unknown) => {
-      if (!delivered) reject(error);
-      else logger?.error(`${service} failed`, error);
-    });
+    around(
+      service,
+      async () => {
+        let finished: Promise<void> = Promise.resolve();
+        const response = await produce({
+          done: (run) => {
+            finished = run;
+          },
+        });
+        delivered = true;
+        resolve(response);
+        await finished;
+      },
+      requestContext,
+    ).then(
+      () => {
+        // an `around` that never served the request: answered, not left hanging
+        if (!delivered) {
+          logger?.error(`${service}: the repository's around ended without serving the request`);
+          delivered = true;
+          resolve(internalError());
+        }
+      },
+      (error: unknown) => {
+        if (!delivered) reject(error);
+        else logger?.error(`${service} failed`, error);
+      },
+    );
   });
 }
 
@@ -271,15 +340,19 @@ function selectService(
   if (short === undefined || key === undefined) {
     return { refused: `Unsupported service: '${name}'` };
   }
-  const override =
-    options.allowOverride === false ? undefined : configBoolOf(served.config, `http.${key}`);
   const operator =
     short === "upload-pack"
       ? (options.enableUploadPack ?? true)
       : short === "receive-pack"
         ? options.enableReceivePack
         : undefined;
-  const enabled = override ?? operator ?? (remoteUser !== undefined && remoteUser !== "");
+  // the operator's false is final (a repository's config cannot open what it closed)
+  const override =
+    options.allowOverride === false || operator === false
+      ? undefined
+      : configBoolOf(served.config, `http.${key}`);
+  const enabled =
+    operator !== false && (override ?? operator ?? (remoteUser !== undefined && remoteUser !== ""));
   // upload-archive is not served here: refused as when it is not enabled
   if (!enabled || short === "upload-archive") {
     return { refused: `Service not enabled: '${short}'` };
@@ -289,11 +362,12 @@ function selectService(
 
 /**
  * The dumb protocol's `info/refs` (http-backend's `show_text_ref`): `<oid>\t<ref>` per ref
- * under `refs/`, an annotated tag followed by its peeled `^{}` line.
+ * under `refs/`, an annotated tag followed by its peeled `^{}` line; unlike http-backend,
+ * without the refs upload-pack hides (`hidden`).
  */
-async function textRefs(served: ServedRepository): Promise<Uint8Array> {
+async function textRefs(served: ServedRepository, hidden: readonly string[]): Promise<Uint8Array> {
   let text = "";
-  for (const [name, oid] of await served.refStore.listAll()) {
+  for (const [name, oid] of visibleRefs(await served.refStore.listAll(), hidden)) {
     if (!name.startsWith("refs/")) continue;
     text += `${oid}\t${name}\n`;
     const peeled = await peelFully(served.repository, oid);
@@ -341,7 +415,12 @@ export function createServedHttpHandler(
         };
       }
       match = entry;
-      repoPath = request.path.slice(0, found.index);
+      const decoded = decodeRepoPath(request.path.slice(0, found.index));
+      if (decoded === undefined) {
+        logger?.info(`Request not supported: '${request.path}'`);
+        return refusal(404);
+      }
+      repoPath = decoded;
       break;
     }
     if (!match) {
@@ -349,7 +428,15 @@ export function createServedHttpHandler(
       return refusal(404);
     }
 
-    const remoteUser = (await options.remoteUser?.(request)) || undefined;
+    let remoteUser: string | undefined;
+    let remoteAddr: string | undefined;
+    try {
+      remoteUser = (await options.remoteUser?.(request)) || undefined;
+      remoteAddr = (await options.remoteAddr?.(request)) || undefined;
+    } catch (error) {
+      logger?.error("Error identifying the client", error);
+      return internalError();
+    }
     const rpcName =
       match.route === "rpc"
         ? request.path.slice(request.path.lastIndexOf("/") + 1)
@@ -364,6 +451,7 @@ export function createServedHttpHandler(
       ...(gitProtocol !== undefined ? { gitProtocol } : {}),
       http: request,
       ...(remoteUser !== undefined ? { remoteUser } : {}),
+      ...(remoteAddr !== undefined ? { remoteAddr } : {}),
     };
 
     let served: ServedRepository | undefined;
@@ -381,30 +469,44 @@ export function createServedHttpHandler(
     }
 
     if (rpcName === undefined) {
-      // the dumb protocol
+      // the dumb protocol: off unless turned on (no object files are served here), never
+      // where upload-pack is not served, and without the refs upload-pack hides
       const getAnyFile =
-        (options.allowOverride === false
+        options.getAnyFile !== false &&
+        ((options.allowOverride === false
           ? undefined
           : configBoolOf(served.config, "http.getanyfile")) ??
-        options.getAnyFile ??
-        true;
+          options.getAnyFile ??
+          false);
       if (!getAnyFile) {
         logger?.info("Unsupported service: getanyfile");
         return refusal(403);
       }
-      if (match.route === "info-refs") {
-        return {
-          status: 200,
-          headers: { ...NO_CACHE_HEADERS, "Content-Type": "text/plain" },
-          body: await textRefs(served),
-        };
+      const uploadPack = selectService("git-upload-pack", served, options, remoteUser);
+      if ("refused" in uploadPack) {
+        logger?.info(uploadPack.refused);
+        return refusal(403);
       }
-      if (match.route === "head") {
-        return {
-          status: 200,
-          headers: { "Content-Type": "text/plain" },
-          body: await textHead(served),
-        };
+      try {
+        if (match.route === "info-refs") {
+          const settings = resolveServeSettings(options.settings, served);
+          const hidden = [...(settings.hideRefs ?? []), ...(settings.uploadPackHideRefs ?? [])];
+          return {
+            status: 200,
+            headers: { ...NO_CACHE_HEADERS, "Content-Type": "text/plain" },
+            body: await textRefs(served, hidden),
+          };
+        }
+        if (match.route === "head") {
+          return {
+            status: 200,
+            headers: { "Content-Type": "text/plain" },
+            body: await textHead(served),
+          };
+        }
+      } catch (error) {
+        logger?.error(`Error answering ${request.path}`, error);
+        return internalError();
       }
       logger?.info(`Cannot open '${request.path}': files are not served`);
       return refusal(404);
@@ -441,7 +543,12 @@ export function createServedHttpHandler(
               ? handleInfoRefs(refStore, uploadPackOptions, repository, version1)
               : handleReceivePackInfoRefs(refStore, serverOptions, version1);
           }
-          const runContext: HttpHandlerContext = { repoPath, ...context };
+          const runContext: HttpHandlerContext = {
+            repoPath,
+            ...context,
+            ...(remoteUser !== undefined ? { remoteUser } : {}),
+            ...(remoteAddr !== undefined ? { remoteAddr } : {}),
+          };
           if (v2)
             return handleUploadPackV2(request, repository, refStore, serverOptions, runContext);
           return service === "git-upload-pack"
@@ -449,14 +556,15 @@ export function createServedHttpHandler(
             : handleReceivePack(request, repository, refStore, serverOptions, runContext);
         },
         logger,
+        {
+          http: true,
+          ...(remoteUser !== undefined ? { remoteUser } : {}),
+          ...(remoteAddr !== undefined ? { remoteAddr } : {}),
+        },
       );
     } catch (error) {
       logger?.error(`Error handling ${service} request`, error);
-      return {
-        status: 500,
-        headers: { ...NO_CACHE_HEADERS, "Content-Type": "text/plain" },
-        body: textEncoder.encode(error instanceof Error ? error.message : "Internal server error"),
-      };
+      return internalError();
     }
   };
 }

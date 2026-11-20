@@ -73,7 +73,7 @@ function base(dir: string, config: Record<string, string> = { "http.receivepack"
 /** Native `git http-backend` over the twin's repositories, on a loopback port. */
 async function nativeServer(
   twin: HookTwin,
-  extra: Record<string, string> = {},
+  extra: Record<string, string | undefined> = {},
 ): Promise<{ server: LoopbackServer; close(): Promise<void> }> {
   const backend = nativeGitHttpBackend(twin.dir, root, {
     HOOK_LOG: twin.log,
@@ -94,8 +94,9 @@ async function nativeServer(
 async function ourServer(
   twin: HookTwin,
   options: Partial<ServedHttpHandlerOptions> = {},
+  /** The host's variables (default the twin's) */
+  env: Record<string, string> = twin.env,
 ): Promise<{ server: LoopbackServer; close(): Promise<void> }> {
-  const env = twin.env;
   const host = await openOurs(
     twin.dir,
     createNodeGitHostEnvironment({
@@ -161,8 +162,10 @@ async function expectTwins(
   label: string,
   setup: {
     prepare?: (twin: HookTwin) => void;
-    native?: Record<string, string>;
+    native?: Record<string, string | undefined>;
     ours?: Partial<ServedHttpHandlerOptions>;
+    /** The variables of our server's host (default the twin's) */
+    oursEnv?: (twin: HookTwin) => Record<string, string>;
   } = {},
 ): Promise<{ theirs: HookTwin; mine: HookTwin; native: TwinRun; ours: TwinRun }> {
   const [theirs, mine] = hookTwins(root, dir);
@@ -190,7 +193,7 @@ async function expectTwins(
     }
   };
   const native = await run(theirs, await nativeServer(theirs, setup.native));
-  const ours = await run(mine, await ourServer(mine, setup.ours));
+  const ours = await run(mine, await ourServer(mine, setup.ours, setup.oursEnv?.(mine)));
   expect(ours.status, `${label}: status`).toBe(native.status);
   expect(ours.lines, `${label}: client`).toEqual(native.lines);
   expect(logOf(mine), `${label}: hook log`).toBe(logOf(theirs));
@@ -300,7 +303,8 @@ describeGit("served smart HTTP: http-backend's service rules", () => {
     git(join(dir, "src"), ["push", "-q", "../bare.git", "main", "other", "v1"]);
     const [theirs, mine] = hookTwins(root, dir);
     const backend = nativeGitHttpBackend(theirs.dir, root);
-    const ours = await ourServer(mine);
+    // ours serves the dumb protocol only when asked (http-backend's http.getanyfile is on)
+    const ours = await ourServer(mine, { getAnyFile: true });
     try {
       const answer = async (
         fetcher: (r: Request) => Promise<Response>,
@@ -374,5 +378,92 @@ describeGit("local push: the quarantine path given to pre-receive (as native git
     await ours.push().setRemote("../bare.git").add("main").call();
     expect(logOf(mine)).toBe(logOf(theirs));
     expect(logOf(mine)).toContain("cat-file refs/heads/main commit");
+  });
+});
+
+describeGit("served smart HTTP: the client's variables, decoded paths, missing deletions", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "http-served-client-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("REMOTE_USER reaches every receive hook; the committer is the user where none is set", async () => {
+    const dir = join(root, "r");
+    base(dir, {});
+    // run_service: GIT_COMMITTER_NAME=<user>, GIT_COMMITTER_EMAIL=<user>@http.<REMOTE_ADDR>
+    const extra = "GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL REMOTE_ADDR";
+    const { theirs } = await expectTwins(dir, ["push", "<url>/bare.git", "main"], "REMOTE_USER", {
+      native: {
+        REMOTE_USER: "alice",
+        GIT_COMMITTER_NAME: undefined,
+        GIT_COMMITTER_EMAIL: undefined,
+        HOOK_EXTRA_VARS: extra,
+      },
+      ours: { remoteUser: () => "alice", remoteAddr: () => "127.0.0.1" },
+      oursEnv: (twin) => {
+        const { GIT_COMMITTER_NAME: _n, GIT_COMMITTER_EMAIL: _e, ...env } = twin.env;
+        return { ...env, HOOK_EXTRA_VARS: extra };
+      },
+    });
+    const log = logOf(theirs);
+    expect(log).toContain("REMOTE_USER=alice");
+    expect(log).toContain("GIT_COMMITTER_NAME=alice");
+    expect(log).toContain("GIT_COMMITTER_EMAIL=alice@http.127.0.0.1");
+    // the host's committer stays where it is set
+    const kept = await expectTwins(dir, ["push", "<url>/bare.git", "other"], "committer set", {
+      native: { REMOTE_USER: "alice", HOOK_EXTRA_VARS: "GIT_COMMITTER_NAME" },
+      ours: { remoteUser: () => "alice", remoteAddr: () => "127.0.0.1" },
+      oursEnv: (twin) => ({ ...twin.env, HOOK_EXTRA_VARS: "GIT_COMMITTER_NAME" }),
+      prepare: (t) => git(join(t.dir, "src"), ["push", "-q", "../bare.git", "main"]),
+    });
+    expect(logOf(kept.theirs)).toContain("GIT_COMMITTER_NAME=Interop Tester");
+  });
+
+  it("a repository named with a space or non-ASCII letters: clone, ls-remote and push", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    const names = ["my repo.git", "d\u00e9p\u00f4t.git"];
+    const prepare = (t: HookTwin) => {
+      for (const name of names) {
+        git(t.dir, ["clone", "-q", "--bare", "src", name]);
+        git(join(t.dir, name), ["config", "http.receivepack", "true"]);
+      }
+    };
+    for (const name of names) {
+      const url = `<url>/${encodeURIComponent(name.slice(0, -4))}.git`;
+      const listed = await expectTwins(dir, ["ls-remote", url], `ls-remote ${name}`, { prepare });
+      expect(listed.native.status).toBe(0);
+      expect(listed.ours.stdout).toBe(listed.native.stdout);
+      const cloned = await expectTwins(dir, ["clone", "-q", url, "../cl"], `clone ${name}`, {
+        prepare,
+      });
+      expect(cloned.native.status).toBe(0);
+      expect(git(join(cloned.mine.dir, "cl"), ["rev-parse", "HEAD"])).toBe(
+        git(join(cloned.theirs.dir, "cl"), ["rev-parse", "HEAD"]),
+      );
+      const pushed = await expectTwins(dir, ["push", url, "main:refs/heads/x"], `push ${name}`, {
+        prepare,
+      });
+      expect(pushed.native.status).toBe(0);
+      expect(git(join(pushed.mine.dir, name), ["for-each-ref"])).toBe(
+        git(join(pushed.theirs.dir, name), ["for-each-ref"]),
+      );
+    }
+  });
+
+  it("deleting a ref that does not exist: the reference-transaction hook hears it, as git's", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    const { theirs } = await expectTwins(
+      dir,
+      ["push", "<url>/bare.git", ":refs/heads/nope", "main"],
+      "missing delete",
+    );
+    expect(logOf(theirs)).toContain(`${"0".repeat(40)} ${"0".repeat(40)} refs/heads/nope`);
+    await expectTwins(
+      dir,
+      ["push", "--atomic", "<url>/bare.git", ":refs/heads/nope", "main"],
+      "atomic missing delete",
+    );
   });
 });

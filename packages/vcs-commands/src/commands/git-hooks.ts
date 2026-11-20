@@ -577,6 +577,15 @@ export class HookSession {
     return this.host.environment()?.hookRunner;
   }
 
+  /**
+   * The committer variables the host sets (`GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`), as
+   * the host environment's `committer` gives them: what git's http-backend checks before
+   * naming the pushing user the committer of its children.
+   */
+  get hostCommitter(): { name?: string; email?: string } {
+    return this.host.environment()?.committer ?? {};
+  }
+
   /** Whether hooks can run at all: the host environment has a runner. */
   get enabled(): boolean {
     return this.runner !== undefined;

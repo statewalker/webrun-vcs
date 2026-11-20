@@ -17,6 +17,7 @@ import {
   type ReceivePackConnection,
   type ReceivePackHookContext,
   type ReceivePackHooks,
+  type ServedRequestContext,
   type ServerConfigSettings,
   serveOverDuplex,
   serverSettingsFromConfig,
@@ -378,8 +379,8 @@ export async function receivePackSettingsOf(
     ...(checkedOut ? { checkedOutBranches: checkedOut } : {}),
     ...(worktrees
       ? {
-          updateWorktree: async (ref: string, newOid: string) => {
-            const verdict = await pushToCheckout(hooks, worktrees, ref, newOid);
+          updateWorktree: async (ref: string, newOid: string, ctx?: ReceivePackHookContext) => {
+            const verdict = await pushToCheckout(hooks, worktrees, ref, newOid, ctx);
             return verdict === null ? pushToDeploy(worktrees, ref, newOid) : verdict;
           },
         }
@@ -481,12 +482,13 @@ async function pushToCheckout(
   worktrees: LinkedWorktrees,
   ref: string,
   newOid: string,
+  ctx?: ReceivePackHookContext,
 ): Promise<string | undefined | null> {
   if (!hooks?.enabled || !(await hooks.exists("push-to-checkout"))) return null;
   const wt = await worktreeUsingBranch(worktrees, ref);
   if (!wt || wt.bare) return "denyCurrentBranch = updateInstead needs a worktree";
   const gitDir = await hooks.hostGitDir();
-  const env: Record<string, string> = { GIT_WORK_TREE: wt.path };
+  const env: Record<string, string> = { ...hookClientEnv(hooks, ctx), GIT_WORK_TREE: wt.path };
   // absolute_path(get_worktree_git_dir): receive-pack's own git directory is ".", so the
   // main worktree's reads `<git dir>/.`
   if (gitDir) env.GIT_DIR = wt.id ? `${gitDir}/worktrees/${wt.id}` : `${gitDir}/.`;
@@ -531,6 +533,43 @@ export async function quarantineEnv(
 }
 
 /**
+ * The variables git's http-backend hands receive-pack, and so every hook it runs
+ * (http-backend.c `run_service`), for a push served over smart HTTP: the web server's
+ * `REMOTE_USER` and `REMOTE_ADDR` (inherited), and, where the host sets none,
+ * `GIT_COMMITTER_NAME=<user>` and `GIT_COMMITTER_EMAIL=<user>@http.<addr>` (`anonymous` and
+ * `(none)` when unknown). Nothing for a push not over HTTP.
+ */
+export function httpBackendEnv(
+  hooks: HookSession,
+  client: ServedRequestContext | undefined,
+): Record<string, string> {
+  if (!client?.http) return {};
+  const env: Record<string, string> = {};
+  if (client.remoteUser) env.REMOTE_USER = client.remoteUser;
+  if (client.remoteAddr) env.REMOTE_ADDR = client.remoteAddr;
+  const user = client.remoteUser || "anonymous";
+  const addr = client.remoteAddr || "(none)";
+  const committer = hooks.hostCommitter;
+  if (committer.name === undefined) env.GIT_COMMITTER_NAME = user;
+  if (committer.email === undefined) env.GIT_COMMITTER_EMAIL = `${user}@http.${addr}`;
+  return env;
+}
+
+/** {@link httpBackendEnv} of a push its hook context describes (HTTP: it has a request). */
+function hookClientEnv(hooks: HookSession, ctx: ReceivePackHookContext | undefined) {
+  return httpBackendEnv(
+    hooks,
+    ctx?.request
+      ? {
+          http: true,
+          ...(ctx.remoteUser !== undefined ? { remoteUser: ctx.remoteUser } : {}),
+          ...(ctx.remoteAddr !== undefined ? { remoteAddr: ctx.remoteAddr } : {}),
+        }
+      : undefined,
+  );
+}
+
+/**
  * receive-pack's hooks as scripts (builtin/receive-pack.c `run_receive_hook`,
  * `run_update_hook`, `run_update_post_hook`): pre-receive and post-receive read
  * `<old> <new> <ref>` lines on stdin (with `GIT_PUSH_OPTION_COUNT` and the options), update
@@ -554,7 +593,12 @@ function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
   ) => {
     const result = await hooks.run(name, {
       ...options,
-      env: { GIT_DIR: ".", ...(await quarantineEnv(hooks, ctx)), ...(options.env ?? {}) },
+      env: {
+        ...hookClientEnv(hooks, ctx),
+        GIT_DIR: ".",
+        ...(await quarantineEnv(hooks, ctx)),
+        ...(options.env ?? {}),
+      },
       prefix: false,
     });
     if (result?.stderr) await ctx.message(result.stderr);

@@ -38,6 +38,13 @@ export interface ReceivePackHookContext {
   /** The repository path of the HTTP request */
   readonly repoPath?: string;
   /**
+   * The authenticated user of an HTTP push (git's http-backend `REMOTE_USER`, which its
+   * hooks inherit), if the server knows one
+   */
+  readonly remoteUser?: string;
+  /** The client's address of an HTTP push (http-backend's `REMOTE_ADDR`), if known */
+  readonly remoteAddr?: string;
+  /**
    * The repository as the push sees it, as git gives hooks `GIT_QUARANTINE_PATH` and the
    * quarantine as an alternate object directory: from the import of the pack until its objects
    * are published (pre-receive, update), it reads the quarantined objects, then the
@@ -199,9 +206,14 @@ export interface ReceivePackConfig {
    * `newOid` (git's `update_worktree`: refused while it has unstaged or staged changes, else
    * `read-tree -u -m`), run after the update hook and before the ref is updated. Resolves to
    * the refusal reason ("Working directory has unstaged changes"), undefined when done.
-   * Absent: such an update is refused.
+   * Absent: such an update is refused. `context` is the push's hook context (the variables
+   * git's push-to-checkout hook inherits: `REMOTE_USER`, ...).
    */
-  updateWorktree?: (ref: string, newOid: string) => Promise<string | undefined>;
+  updateWorktree?: (
+    ref: string,
+    newOid: string,
+    context?: ReceivePackHookContext,
+  ) => Promise<string | undefined>;
   /**
    * Accept pushes from a shallow client whose history ends at its shallow commits (git's
    * `receive.shallowUpdate`, default false: "shallow update not allowed"). Needs the facade's
@@ -225,6 +237,10 @@ export interface ReceivePackConfig {
   request?: ReceivePackRequestInfo;
   /** The repository path (for the hooks) */
   repoPath?: string;
+  /** The authenticated user of an HTTP push (for the hooks: `REMOTE_USER`) */
+  remoteUser?: string;
+  /** The client's address of an HTTP push (for the hooks: `REMOTE_ADDR`) */
+  remoteAddr?: string;
   /** Logs hook failures that cannot reach the client */
   logger?: ReceivePackLogger;
 

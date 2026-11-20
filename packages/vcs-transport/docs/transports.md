@@ -130,9 +130,16 @@ const handleGit = createServedFetchHandler({
   }),
   // http-backend's REMOTE_USER: who the web server authenticated
   remoteUser: (request) => userFromAuthorization(request.headers.authorization),
+  // http-backend's REMOTE_ADDR, if the server knows the client's address
+  remoteAddr: (request) => request.headers["x-forwarded-for"],
 });
 Deno.serve(handleGit);
 ```
+
+The repository path handed to `resolveRepository` is decoded segment by segment, as a web server
+decodes `PATH_INFO` for http-backend: `/my%20repo.git/info/refs` asks for `/my repo.git`. A
+segment that encodes `/`, `\` or NUL, or does not decode, is a `404` that never reaches the
+resolver, and the decoded path must still pass `isUnsafeServicePath`.
 
 A push runs the repository's pre-receive, update, post-receive and post-update hooks (their
 output relayed as `remote:` lines), push-to-checkout for `receive.denyCurrentBranch=updateInstead`,
@@ -140,25 +147,41 @@ and the reference-transaction hook through `ServedRepository.around`, which last
 has ended, not only until the response head is out. pre-receive gets `GIT_QUARANTINE_PATH`,
 `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` as git sets them, so a hook running
 native git (`git cat-file -t $new`) reads the pushed objects before they are published.
+Every hook of the push (reference-transaction and push-to-checkout included) inherits
+`REMOTE_USER` and `REMOTE_ADDR` from `remoteUser` and `remoteAddr`, and, where the host sets no
+committer, `GIT_COMMITTER_NAME=<user>` and `GIT_COMMITTER_EMAIL=<user>@http.<addr>`
+(`anonymous`, `(none)` when unknown), as http-backend's `run_service` hands them to receive-pack.
 
 Settings are layered as `serveGitService` layers them: git's defaults, the operator's `settings`,
 what the repository's config sets (`receive.*`, `uploadpack.hideRefs`, `receive.hideRefs`,
 `transfer.hideRefs`), then the resolver's `ServedRepository.settings`.
 
-The services follow http-backend's rules, the repository's config over the handler's options:
+The services follow http-backend's rules, the repository's config over the handler's options,
+with two differences that matter to a server of many tenants' repositories:
 
 | Service | Default | Config | Option |
 |---|---|---|---|
 | upload-pack (fetch, clone) | served | `http.uploadpack` | `enableUploadPack` |
 | receive-pack (push) | served only to a request with a `remoteUser` | `http.receivepack` | `enableReceivePack` |
-| dumb `HEAD`, `info/refs` | served from the refs | `http.getanyfile` | `getAnyFile` |
+| dumb `HEAD`, `info/refs` | refused (http-backend: served) | `http.getanyfile` | `getAnyFile` |
+
+- An option the operator sets to `false` is final: a repository's `http.receivepack=true` (or
+  `http.uploadpack`, `http.getanyfile`) cannot turn back on what the operator turned off, where
+  http-backend lets the repository's config decide. An option left unset (or `true`) is still
+  overridden by the repository's config, as in git.
+- The dumb protocol is off unless `getAnyFile` or the repository's `http.getanyfile=true` turns it
+  on, since this handler serves no object files anyway. Turned on, `HEAD` and `info/refs` are
+  answered only where upload-pack is served (`403` otherwise), and `info/refs` leaves out the refs
+  upload-pack hides (`transfer.hideRefs`, `uploadpack.hideRefs`), where http-backend lists them all.
 
 A service that is not enabled, or an unknown one, is answered `403` with an empty body, as
 http-backend answers it ("Service not enabled: 'receive-pack'" goes to `logger.info`, where
 http-backend writes it to its stderr); a native client prints `The requested URL returned error:
 403`. An unknown path or repository is a `404`, the wrong method a `405` with `Allow`.
 `allowOverride: false` keeps the repositories' `http.*` from overriding the options. Dumb-protocol
-object files (`objects/...`) are never served: a dumb client cannot fetch from this handler.
+object files (`objects/...`) are never served: a dumb client cannot fetch from this handler. A
+failure (a throwing `remoteUser`, `remoteAddr` or `around`, an `around` that returns without serving)
+is a `500` with the fixed body `Internal server error`; the detail goes to `logger.error`.
 
 ## git://
 

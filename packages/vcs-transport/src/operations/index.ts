@@ -25,6 +25,7 @@ export type {
   GitServeSettings,
   GitServiceRequest,
   ServedRepository,
+  ServedRequestContext,
   ServeGitConnectionOptions,
   ServeGitConnectionResult,
   ServeGitServiceOptions,

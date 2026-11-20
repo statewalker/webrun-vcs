@@ -72,9 +72,25 @@ export interface ServedRepository {
   /**
    * Runs around the serving of one request (`serve`), for what the repository's owner
    * installs for its duration: the repository's reference-transaction hook while
-   * receive-pack updates its refs (`servedRepositoryOf`)
+   * receive-pack updates its refs (`servedRepositoryOf`). `context` tells what the server
+   * knows of the client: an HTTP request's user and address (the variables git's
+   * http-backend hands its children, the hooks included)
    */
-  around?<T>(service: "git-upload-pack" | "git-receive-pack", serve: () => Promise<T>): Promise<T>;
+  around?<T>(
+    service: "git-upload-pack" | "git-receive-pack",
+    serve: () => Promise<T>,
+    context?: ServedRequestContext,
+  ): Promise<T>;
+}
+
+/** What a server knows of the client of one served request (see `ServedRepository.around`). */
+export interface ServedRequestContext {
+  /** Served over smart HTTP (git's http-backend sets the committer of its children) */
+  http?: boolean;
+  /** The authenticated user (http-backend's `REMOTE_USER`) */
+  remoteUser?: string;
+  /** The client's address (http-backend's `REMOTE_ADDR`) */
+  remoteAddr?: string;
 }
 
 /** What a client asked for. */

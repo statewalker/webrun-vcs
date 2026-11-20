@@ -282,6 +282,10 @@ export interface ReceivePackServerOptions {
 export interface HttpHandlerContext {
   repoPath?: string;
   done?: (finished: Promise<void>) => void;
+  /** The authenticated user (http-backend's `REMOTE_USER`), for receive-pack's hooks */
+  remoteUser?: string;
+  /** The client's address (http-backend's `REMOTE_ADDR`), for receive-pack's hooks */
+  remoteAddr?: string;
 }
 
 /** Default idle timeout of a POST /git-receive-pack body. */
@@ -1051,6 +1055,8 @@ export async function handleReceivePack(
         headers: request.headers,
       },
       repoPath: context.repoPath,
+      ...(context.remoteUser !== undefined ? { remoteUser: context.remoteUser } : {}),
+      ...(context.remoteAddr !== undefined ? { remoteAddr: context.remoteAddr } : {}),
       // a push refused as a whole is a 403, its body unread
       authorizeFailure: "fatal",
       // a pack refused once the head is out is read and dropped (at most the body limit):
@@ -1371,11 +1377,12 @@ export function createHttpHandler(
         }
       }
     } catch (err) {
+      // the detail goes to the logger, never to the client
       logger?.error(`Error handling ${parsed.service} request`, err);
       return {
         status: 500,
         headers: { "Content-Type": "text/plain" },
-        body: textEncoder.encode(err instanceof Error ? err.message : "Internal server error"),
+        body: textEncoder.encode("Internal server error"),
       };
     }
   };

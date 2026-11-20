@@ -324,6 +324,24 @@ describeGit("push hooks: reference-transaction on the receive side (as native gi
     );
   });
 
+  it("deleting a ref that does not exist: queued in the remote's transaction, not told to post-receive", async () => {
+    const dir = join(root, "r");
+    reftxBase(dir);
+    installHooks(join(dir, "bare.git/hooks"), RECEIVE_HOOKS);
+    for (const atomic of [false, true]) {
+      const { native } = await expectReftxPush(
+        dir,
+        [...(atomic ? ["--atomic"] : []), "../bare.git", ":refs/heads/nope", "main"],
+        (p) => {
+          p.setRemote("../bare.git").add(":refs/heads/nope").add("main");
+          if (atomic) p.setAtomic(true);
+        },
+        `missing delete (atomic ${atomic})`,
+      );
+      expect(native.stderr).toContain("deleting a non-existent ref");
+    }
+  });
+
   it("commands go in git's order (the remote's refs as advertised, then new ones): pre-push, pre-receive and update see it", async () => {
     const dir = join(root, "r");
     reftxBase(dir);
