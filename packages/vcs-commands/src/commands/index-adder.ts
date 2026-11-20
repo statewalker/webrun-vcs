@@ -580,3 +580,40 @@ export class IndexAdder {
     if (this.inBase(path)) this.removed.add(path);
   }
 }
+
+/** Adds the leading directories of `path` to `dirs` (`a/b/c`: `a`, `a/b`). */
+export function addLeadingDirs(dirs: Set<string>, path: string): void {
+  for (let at = path.indexOf("/"); at > 0; at = path.indexOf("/", at + 1)) {
+    dirs.add(path.slice(0, at));
+  }
+}
+
+/**
+ * `add_index_entry`'s `check_file_directory_conflict` for a new stage-0 entry at `path`
+ * (`has_dir_name`, `has_file_name`): the paths whose stage-0 entry it clashes with as a file
+ * or a directory. Only entries of the same stage clash, so the conflict stages of those
+ * paths stay in the index.
+ *
+ * @param hasStageZero Whether a path has a stage-0 entry now
+ * @param paths Every path the index may hold (a superset will do)
+ * @param dirs The leading directories of those paths (a superset will do)
+ */
+export function stageZeroClashes(
+  path: string,
+  hasStageZero: (path: string) => boolean,
+  paths: Iterable<string>,
+  dirs: ReadonlySet<string>,
+): string[] {
+  const out: string[] = [];
+  for (let at = path.indexOf("/"); at > 0; at = path.indexOf("/", at + 1)) {
+    const dir = path.slice(0, at);
+    if (hasStageZero(dir)) out.push(dir);
+  }
+  if (dirs.has(path)) {
+    const prefix = `${path}/`;
+    for (const other of paths) {
+      if (other.startsWith(prefix) && hasStageZero(other)) out.push(other);
+    }
+  }
+  return out;
+}

@@ -688,10 +688,15 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     }
     const worktree = this.bare ? undefined : this.worktreeAccess;
     if (worktree) {
-      for await (const _entry of worktree.walk({
+      // the repository's own git directory, when it lies in the worktree under another name
+      // than `.git` (`git init --separate-git-dir`-like layouts): git checks the destination
+      // before it makes one
+      const own = ownGitDirIn(worktree);
+      for await (const entry of worktree.walk({
         includeIgnored: true,
         includeDirectories: true,
       })) {
+        if (own && (entry.path === own || entry.path.startsWith(`${own}/`))) continue;
         throw refuse();
       }
       if (source) {
@@ -843,4 +848,15 @@ function toBranchName(defaultBranch: string | undefined): string | undefined {
   if (defaultBranch === undefined) return undefined;
   const prefix = "refs/heads/";
   return defaultBranch.startsWith(prefix) ? defaultBranch.slice(prefix.length) : defaultBranch;
+}
+
+/** The worktree's git directory as a path of the worktree, when it lies inside it. */
+function ownGitDirIn(worktree: Worktree): string | undefined {
+  const trim = (p: string) => p.replace(/^\/+|\/+$/g, "");
+  const gitDir = worktree.getGitDir?.();
+  if (gitDir === undefined) return undefined;
+  const dir = trim(gitDir);
+  const root = trim(worktree.getRoot?.() ?? "");
+  if (!root) return dir || undefined;
+  return dir.startsWith(`${root}/`) ? dir.slice(root.length + 1) : undefined;
 }

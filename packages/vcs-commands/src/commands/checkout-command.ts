@@ -40,24 +40,21 @@ import {
   type ObjectId,
   type Ref,
 } from "@statewalker/vcs-core";
-import { parseGitBool } from "@statewalker/vcs-utils";
+import { type ConflictStyle, parseGitBool } from "@statewalker/vcs-utils";
 import {
   attributesIndexOf,
   cacheTreeOfTree,
   entryStatOf,
   type StagingEntry,
-  UpdateStagingEntry,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 
 import {
+  InvalidArgumentError,
   InvalidRefNameError,
   MissingArgumentError,
   NoHeadError,
   NotACommitError,
-  NotADirectoryError,
-  PathNotFoundInTreeError,
-  PathNotInIndexError,
   RefAlreadyExistsError,
   RefNotFoundError,
   SwitchRefusedError,
@@ -73,8 +70,11 @@ import {
   TrackMode,
   trackableStart,
 } from "./branch-tracking.js";
+import { type CheckoutPathsOutcome, runPathCheckout } from "./checkout-paths.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { hostEnvironmentOf } from "./git-ident.js";
 import { OperationState, updateIndexCacheTree } from "./merge-support.js";
+import { globalPathspecMagic, parsePathspecFile } from "./pathspec.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { checkFlaggedEntries, recordWrittenStat, restoreWorktreeHard } from "./reset-command.js";
 import { removeBranchState } from "./sequencer-support.js";
@@ -174,6 +174,12 @@ export interface CheckoutResult {
    * there was nothing to say.
    */
   readonly warnings?: string[];
+
+  /**
+   * git's exit status where `status` alone does not give it (OK: 0, CONFLICTS: 1): a path
+   * checkout that could not write an entry exits 255
+   */
+  readonly exitCode?: number;
 }
 
 /** A tree or index entry, as the two-way merge compares them (index entries with stat). */
@@ -242,6 +248,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private guess?: boolean;
   private protectUntracked = false;
   private merge = false;
+  private overlay?: boolean;
+  private ignoreSkipWorktreeBits = false;
+  private conflictStyle?: ConflictStyle;
+  private quiet = false;
+  private countCheckoutPaths = false;
+  private pathspecFromFile: string[] = [];
   /** Set by a `merge` checkout the two-way merge refused: what the autostash needs */
   private autostashSwitch?: { label: string; base: string };
 
@@ -521,6 +533,74 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   }
 
   /**
+   * `--overlay` / `--no-overlay` for a path checkout: in overlay mode (the default) entries
+   * the tree-ish lacks are kept; without it, the paths the pathspec names that the
+   * tree-ish lacks are removed from the index and the worktree.
+   */
+  setOverlay(overlay: boolean): this {
+    this.checkCallable();
+    this.overlay = overlay;
+    return this;
+  }
+
+  /**
+   * `--ignore-skip-worktree-bits`: a path checkout also checks out skip-worktree entries
+   * (by default it passes over them, so an element naming only such entries matches
+   * nothing).
+   */
+  setIgnoreSkipWorktreeBits(ignore: boolean): this {
+    this.checkCallable();
+    this.ignoreSkipWorktreeBits = ignore;
+    return this;
+  }
+
+  /**
+   * `--conflict=<style>` (`merge`, `diff3`, `zdiff3`): for a path checkout, implies
+   * {@link setMerge}, the unmerged paths re-created with this conflict style.
+   */
+  setConflictStyle(style: ConflictStyle): this {
+    this.checkCallable();
+    this.conflictStyle = style;
+    return this;
+  }
+
+  /** `-q`: a path checkout reports no counts and no "path is unmerged" warnings. */
+  setQuiet(quiet: boolean): this {
+    this.checkCallable();
+    this.quiet = quiet;
+    return this;
+  }
+
+  /**
+   * Whether a path checkout reports what it did ("Updated 2 paths from the index",
+   * "Recreated 1 merge conflict") in `warnings`, as `git checkout` does when its paths
+   * follow no `--` (`count_checkout_paths`).
+   */
+  setCountCheckoutPaths(count: boolean): this {
+    this.checkCallable();
+    this.countCheckoutPaths = count;
+    return this;
+  }
+
+  /**
+   * `--pathspec-from-file`: the pathspec elements of `content`, one per line (C-quoted
+   * lines unquoted), or NUL-separated with `nul` (`--pathspec-file-nul`).
+   */
+  setPathspecFromFile(content: string | Uint8Array, nul = false): this {
+    this.checkCallable();
+    try {
+      this.pathspecFromFile = parsePathspecFile(content, nul);
+    } catch (error) {
+      throw new InvalidArgumentError(
+        "pathspecFromFile",
+        content,
+        `fatal: ${(error as Error).message}`,
+      );
+    }
+    return this;
+  }
+
+  /**
    * Execute the checkout command.
    *
    * @returns Result with status and affected files
@@ -537,7 +617,9 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // path checkout, or branch checkout; one worktree batch, so the checks and the writes
     // share one reading of the ignore rules
     const run = () =>
-      this.allPaths || this.paths.length > 0 ? this.checkoutPaths() : this.checkoutBranch();
+      this.allPaths || this.paths.length > 0 || this.pathspecFromFile.length > 0
+        ? this.checkoutPaths()
+        : this.checkoutBranch();
     const worktree = this.worktreeAccess;
     const result = await (worktree?.batch ? worktree.batch(run) : run());
     const autostash = this.autostashSwitch;
@@ -734,47 +816,71 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   }
 
   /**
-   * Checkout paths from index or commit.
+   * git's `checkout [<tree-ish>] [--] <pathspec>...` (`checkout_paths`): see
+   * {@link runPathCheckout}. An error git reports (an element that matched nothing, an
+   * unmerged path) leaves the index and the worktree as they were: status `CONFLICTS`, the
+   * elements or paths in `conflicts`, git's lines in `message`.
    */
   private async checkoutPaths(): Promise<CheckoutResult> {
-    const updated: string[] = [];
-    const conflicts: string[] = [];
-
-    // Determine source tree
-    let sourceTreeId: ObjectId | undefined;
-    if (this.startPoint) {
-      sourceTreeId = await this.resolveTreeId(this.startPoint);
-      if (!sourceTreeId) {
-        throw new RefNotFoundError(this.startPoint);
-      }
+    if (this.createBranch || this.forceCreateBranch || this.orphan) {
+      throw new SwitchRefusedError(
+        `fatal: Cannot update paths and switch to branch '${this.name ?? ""}' at the same time.`,
+      );
     }
-
-    // Get paths to checkout
-    const pathsToCheckout = this.allPaths ? await this.getAllPaths(sourceTreeId) : this.paths;
-
-    // Checkout each path
-    for (const path of pathsToCheckout) {
-      try {
-        const entry = sourceTreeId
-          ? // Checkout from commit tree
-            await this.checkoutPathFromTree(path, sourceTreeId)
-          : // Checkout from index
-            await this.checkoutPathFromIndex(path);
-        await this.writePathToWorktree(path, entry);
-        updated.push(path);
-      } catch {
-        conflicts.push(path);
-      }
+    if (this.detach) {
+      throw new SwitchRefusedError(
+        `fatal: git checkout: --detach does not take a path argument '${this.paths[0] ?? ""}'`,
+      );
     }
-    if (updated.length > 0) await this.staging.write();
+    if (this.track !== TrackMode.DEFAULT) {
+      throw new SwitchRefusedError("fatal: '--track' cannot be used with updating paths");
+    }
+    if (this.paths.length > 0 && this.pathspecFromFile.length > 0) {
+      throw new InvalidArgumentError(
+        "pathspecFromFile",
+        this.pathspecFromFile,
+        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together",
+      );
+    }
+    const source = this.startPoint ?? this.name;
+    const outcome = await runPathCheckout(this.pathCheckoutContext(), {
+      command: "checkout",
+      paths: [...this.pathspecFromFile, ...this.paths],
+      allPaths: this.allPaths,
+      ...(source !== undefined ? { source } : {}),
+      ...(this.overlay !== undefined ? { overlay: this.overlay } : {}),
+      ignoreSkipWorktree: this.ignoreSkipWorktreeBits,
+      ...(this.stage !== undefined ? { stage: this.stage } : {}),
+      merge: this.merge,
+      ...(this.conflictStyle ? { conflictStyle: this.conflictStyle } : {}),
+      force: this.force,
+      quiet: this.quiet,
+      countCheckoutPaths: this.countCheckoutPaths,
+      globalMagic: this.globalPathspecMagic(),
+    });
+    return pathCheckoutResult(outcome);
+  }
 
+  /** What a path checkout reads and writes. */
+  private pathCheckoutContext() {
     return {
-      status: conflicts.length > 0 ? CheckoutStatus.CONFLICTS : CheckoutStatus.OK,
-      updated,
-      removed: [],
-      conflicts,
-      ref: null,
+      workingCopy: this.workingCopy,
+      staging: this.staging,
+      trees: this.trees,
+      blobs: this.blobs,
+      worktree: this.worktreeAccess,
+      abbreviate: (id: ObjectId) => this.abbreviateObjectId(id),
+      resolveTree: (rev: string) => this.resolveSourceTree(rev),
     };
+  }
+
+  /** git's `get_global_magic` from the host environment (`GIT_LITERAL_PATHSPECS`, ...). */
+  private globalPathspecMagic() {
+    try {
+      return globalPathspecMagic(hostEnvironmentOf(this.workingCopy)?.pathspecs);
+    } catch (error) {
+      throw new InvalidArgumentError("path", this.paths, `fatal: ${(error as Error).message}`);
+    }
   }
 
   /**
@@ -1212,150 +1318,6 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   }
 
   /**
-   * Checkout a path from the staging index.
-   */
-  private async checkoutPathFromIndex(path: string): Promise<{ objectId: ObjectId; mode: number }> {
-    // Find the entry in staging
-    let found: { objectId: ObjectId; mode: number } | undefined;
-    for await (const entry of this.staging.entries()) {
-      if (entry.path !== path) continue;
-
-      // Handle conflict stages
-      if (entry.stage !== 0) {
-        if (this.stage && entry.stage === this.stage) {
-          // Replace with specified stage
-          const editor = this.staging.createEditor();
-          editor.add(
-            new UpdateStagingEntry(path, entry.objectId, entry.mode, {
-              size: entry.size,
-              mtime: Date.now(),
-            }),
-          );
-          await editor.finish();
-          found = entry;
-          break;
-        }
-        continue;
-      }
-
-      found = entry;
-      break;
-    }
-
-    if (!found) {
-      throw new PathNotInIndexError(path);
-    }
-    return found;
-  }
-
-  /**
-   * Writes a checked-out path to the worktree (git's `checkout_entry` outside unpack-trees:
-   * attributes read from the worktree first) and records the file's stat in its entry.
-   */
-  private async writePathToWorktree(
-    path: string,
-    entry: { objectId: ObjectId; mode: number },
-  ): Promise<void> {
-    const worktree = this.worktreeAccess;
-    if (!worktree || entry.mode === FileMode.GITLINK || entry.mode === FileMode.TREE) return;
-    const content = await this.blobs.load(entry.objectId);
-    if (!content) throw new Error(`${CHECKOUT} cannot restore ${path}: blob missing`);
-    const symlinks = worktreeModeTrust(this.workingCopy, worktree).symlinks;
-    const mode = entry.mode === FileMode.SYMLINK && !symlinks ? FileMode.REGULAR_FILE : entry.mode;
-    await worktree.writeContent(path, content, {
-      mode,
-      // a link written as a file holds its target as it is (never smudged)
-      ...(mode !== entry.mode ? { raw: true } : {}),
-      createParents: true,
-    });
-    const stats = await worktree.getEntry(path);
-    const editor = this.staging.createEditor();
-    editor.upsert({
-      path,
-      objectId: entry.objectId,
-      mode: entry.mode,
-      ...entryStatOf(stats ?? {}),
-    });
-    await editor.finish();
-  }
-
-  /**
-   * Checkout a path from a tree.
-   */
-  private async checkoutPathFromTree(
-    path: string,
-    treeId: ObjectId,
-  ): Promise<{ objectId: ObjectId; mode: number }> {
-    // Navigate tree to find the entry
-    const parts = path.split("/");
-    let currentTreeId = treeId;
-
-    for (let i = 0; i < parts.length; i++) {
-      const name = parts[i];
-      const entry = await this.trees.getEntry(currentTreeId, name);
-
-      if (!entry) {
-        throw new PathNotFoundInTreeError(path);
-      }
-
-      if (i < parts.length - 1) {
-        if (entry.mode !== FileMode.TREE) {
-          throw new NotADirectoryError(parts.slice(0, i + 1).join("/"));
-        }
-        currentTreeId = entry.id;
-      } else {
-        // Found the file - update staging
-        const editor = this.staging.createEditor();
-        editor.add(
-          new UpdateStagingEntry(path, entry.id, entry.mode, {
-            size: 0,
-            mtime: Date.now(),
-          }),
-        );
-        await editor.finish();
-        return { objectId: entry.id, mode: entry.mode };
-      }
-    }
-    throw new PathNotFoundInTreeError(path);
-  }
-
-  /**
-   * Get all paths from staging or tree.
-   */
-  private async getAllPaths(sourceTreeId?: ObjectId): Promise<string[]> {
-    const paths: string[] = [];
-
-    if (sourceTreeId) {
-      // Get all paths from tree
-      await this.collectTreePaths(sourceTreeId, "", paths);
-    } else {
-      // Get all paths from staging
-      for await (const entry of this.staging.entries()) {
-        if (entry.stage === 0 && !paths.includes(entry.path)) {
-          paths.push(entry.path);
-        }
-      }
-    }
-
-    return paths;
-  }
-
-  /**
-   * Collect all paths from a tree recursively.
-   */
-  private async collectTreePaths(treeId: ObjectId, prefix: string, paths: string[]): Promise<void> {
-    for await (const entry of this.trees.loadTree(treeId)) {
-      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-
-      if (entry.mode === FileMode.TREE) {
-        await this.collectTreePaths(entry.id, path, paths);
-      } else {
-        paths.push(path);
-      }
-    }
-  }
-
-  /**
    * Collect tree entries into a map.
    */
   private async collectTreeEntries(
@@ -1375,18 +1337,17 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   }
 
   /**
-   * Resolve a revision (`HEAD~1`, a branch, a tag, `@{-1}`) to its commit's tree.
+   * The object a revision names (`HEAD~1`, a branch, a tag, `@{-1}`, `-`) and its tree, as
+   * git's `parse_tree_indirect` peels it: the tree undefined for an object that is no
+   * tree-ish.
+   *
+   * @throws RefNotFoundError when it names nothing
    */
-  private async resolveTreeId(refName: string): Promise<ObjectId | undefined> {
-    let id: ObjectId;
-    try {
-      id = await this.resolveRevision(refName);
-    } catch (error) {
-      if (error instanceof RefNotFoundError) return undefined;
-      throw error;
-    }
-    // git's parse_tree_indirect: a commit, a tree, or a tag of either
-    return this.revisionResolver().peelToType(id, "tree");
+  private async resolveSourceTree(
+    refName: string,
+  ): Promise<{ id: ObjectId; tree: ObjectId | undefined }> {
+    const id = await this.resolveRevision(refName === "-" ? "@{-1}" : refName);
+    return { id, tree: await this.revisionResolver().peelToType(id, "tree") };
   }
 
   /**
@@ -1534,6 +1495,20 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       }
     }
   }
+}
+
+/** A path checkout's outcome as a {@link CheckoutResult}. */
+export function pathCheckoutResult(outcome: CheckoutPathsOutcome): CheckoutResult {
+  return {
+    status: outcome.ok ? CheckoutStatus.OK : CheckoutStatus.CONFLICTS,
+    updated: outcome.updated,
+    removed: outcome.removed,
+    conflicts: outcome.conflicts,
+    ref: null,
+    ...(outcome.errors.length > 0 ? { message: outcome.errors.join("\n") } : {}),
+    ...(outcome.warnings.length > 0 ? { warnings: outcome.warnings } : {}),
+    ...(outcome.exitCode !== undefined ? { exitCode: outcome.exitCode } : {}),
+  };
 }
 
 /** The refusals of {@link nonCommitSwitchError}. */

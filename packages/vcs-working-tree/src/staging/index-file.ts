@@ -317,6 +317,32 @@ export class IndexFile {
     this.extensions = this.extensions.filter((e) => e.signature !== "REUC");
   }
 
+  /** The resolve-undo records held (`REUC`), sorted by path; none when unreadable. */
+  getResolveUndo(): ResolveUndoRecord[] {
+    const existing = this.extensions.find((e) => e.signature === "REUC");
+    if (!existing) return [];
+    try {
+      return parseResolveUndo(existing.data);
+    } catch {
+      return [];
+    }
+  }
+
+  /** Drops the resolve-undo records of `paths` (the extension too when none is left). */
+  dropResolveUndo(paths: ReadonlySet<string>): void {
+    const list = this.getResolveUndo();
+    const kept = list.filter((r) => !paths.has(r.path));
+    if (kept.length === list.length) return;
+    const others = this.extensions.filter((e) => e.signature !== "REUC");
+    if (kept.length === 0) {
+      this.extensions = others;
+      return;
+    }
+    const at = others.findIndex((e) => e.signature === "TREE") + 1;
+    const reuc = { signature: "REUC", data: encodeResolveUndo(kept) };
+    this.extensions = [...others.slice(0, at), reuc, ...others.slice(at)];
+  }
+
   /**
    * Record what a resolution removed (git's `record_resolve_undo`): each record's stages
    * are set in the path's resolve-undo record (the others it had kept), written with the

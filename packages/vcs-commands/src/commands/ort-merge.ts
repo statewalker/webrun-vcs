@@ -18,7 +18,7 @@
  */
 
 import { type Blobs, FileMode, type ObjectId } from "@statewalker/vcs-core";
-import { type ConflictStyle, mergeLines } from "@statewalker/vcs-utils";
+import type { ConflictStyle } from "@statewalker/vcs-utils";
 import { encodeGitPath, foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 
 import {
@@ -28,12 +28,10 @@ import {
   RELEVANT_FOR_SELF,
   RELEVANT_LOCATION,
   type RenameCandidate,
-  SimilarityIndex,
 } from "../rename/index.js";
 import {
-  lookupMergeDriver,
+  lowLevelMerge,
   type MergeAttributeValue,
-  type MergeDriver,
   type MergeDriverRegistry,
 } from "./merge-drivers.js";
 import type { CheckedEntry } from "./worktree-overwrite-checks.js";
@@ -1187,24 +1185,6 @@ class OrtMerge {
     return e && isReg(e) ? readBlob(this.blobs, e.objectId) : new Uint8Array(0);
   }
 
-  /** The driver for a path's `merge` attribute (find_ll_merge_driver). */
-  private driverFor(attr: MergeAttributeValue): {
-    name: string;
-    custom?: MergeDriver;
-  } {
-    let name: string;
-    if (attr === true) return { name: "text" };
-    if (attr === false) return { name: "binary" };
-    if (attr === undefined) {
-      if (!this.options.defaultDriver) return { name: "text" };
-      name = this.options.defaultDriver;
-    } else name = attr;
-    const custom = lookupMergeDriver(this.options.drivers, name);
-    if (custom) return { name, custom };
-    if (name === "binary" || name === "text" || name === "union") return { name };
-    return { name: "text" };
-  }
-
   /**
    * merge-ort's merge_3way (ll_merge): the merge driver of the path's `merge` attribute
    * (text, binary, union or a registered one) with its markers.
@@ -1226,58 +1206,22 @@ class OrtMerge {
       const norm = this.options.renormalizeContent;
       [orig, src1, src2] = [await norm(path, orig), await norm(path, src1), await norm(path, src2)];
     }
-    const attrs = (await this.options.attributes?.(path)) ?? {};
-    let markerSize = 7;
-    const size = attrs.conflictMarkerSize;
-    if (typeof size === "string") {
-      const parsed = /^[+-]?\d+$/.test(size.trim()) ? Number.parseInt(size, 10) : Number.NaN;
-      markerSize = Number.isNaN(parsed) || parsed <= 0 ? 7 : parsed;
-    }
-    let driver = this.driverFor(attrs.merge);
-    if (this.depth > 0) {
-      const recursive = driver.custom?.recursive ?? this.options.recursiveDriver?.(driver.name);
-      if (recursive) driver = this.driverFor(recursive);
-    }
-    markerSize += extraMarkerSize;
-    const favor = this.depth > 0 ? undefined : this.options.favor;
-    const binaryMerge = () => {
-      // ll_binary_merge: the base for an inner merge, else ours (or the favored side)
-      if (this.depth > 0) return { status: "ok" as const, content: orig };
-      if (favor === "ours") return { status: "ok" as const, content: src1 };
-      if (favor === "theirs") return { status: "ok" as const, content: src2 };
-      return { status: "binary" as const, content: src1 };
-    };
-    if (driver.custom) {
-      const out = await driver.custom.merge({
-        path,
-        base: orig,
-        ours: src1,
-        theirs: src2,
-        baseLabel,
-        oursLabel,
-        theirsLabel,
-        markerSize,
-      });
-      return { status: out.conflict ? "conflict" : "ok", content: out.content };
-    }
-    if (driver.name === "binary") return binaryMerge();
-    const threshold = this.options.bigFileThreshold ?? 512 * 1024 * 1024;
-    if (
-      [orig, src1, src2].some(
-        (bytes) => bytes.length > threshold || SimilarityIndex.isBinary(bytes),
-      )
-    ) {
-      return binaryMerge();
-    }
-    const lines = mergeLines(orig, src1, src2, {
-      oursLabel,
-      theirsLabel,
-      baseLabel,
-      style: this.options.style,
-      favor: driver.name === "union" ? "union" : favor,
-      markerSize,
-    });
-    return { status: lines.conflicts > 0 ? "conflict" : "ok", content: lines.content };
+    return lowLevelMerge(
+      { path, base: orig, ours: src1, theirs: src2, baseLabel, oursLabel, theirsLabel },
+      {
+        attributes: (await this.options.attributes?.(path)) ?? {},
+        ...(this.options.drivers ? { drivers: this.options.drivers } : {}),
+        ...(this.options.defaultDriver ? { defaultDriver: this.options.defaultDriver } : {}),
+        ...(this.options.recursiveDriver ? { recursiveDriver: this.options.recursiveDriver } : {}),
+        virtualAncestor: this.depth > 0,
+        ...(this.options.favor ? { favor: this.options.favor } : {}),
+        ...(this.options.style ? { style: this.options.style } : {}),
+        extraMarkerSize,
+        ...(this.options.bigFileThreshold !== undefined
+          ? { bigFileThreshold: this.options.bigFileThreshold }
+          : {}),
+      },
+    );
   }
 
   /** merge-ort's handle_content_merge: two versions of a type merged, with their mode. */

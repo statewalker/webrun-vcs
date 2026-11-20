@@ -14,9 +14,15 @@
  * ```
  */
 
-import { parseGitBool } from "@statewalker/vcs-utils";
+import {
+  type ConflictStyle,
+  type LineMergeOptions,
+  mergeLines,
+  parseGitBool,
+} from "@statewalker/vcs-utils";
 import type { WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
 
+import { SimilarityIndex } from "../rename/index.js";
 import { configBool, configValue } from "./merge-config.js";
 import type { MergeAttributes, OrtMergeOptions } from "./ort-merge.js";
 
@@ -91,6 +97,130 @@ export function mergeDriversOf(workingCopy: WorkingCopy): MergeDriverRegistry | 
   return installed.get(workingCopy);
 }
 
+/**
+ * The driver for a path's `merge` attribute (git's `find_ll_merge_driver`): `text` when set
+ * (or unspecified without `merge.default`), `binary` when unset, else the named driver: a
+ * registered one, a builtin (`text`, `binary`, `union`), or `text` for an unknown name.
+ */
+export function findMergeDriver(
+  attr: MergeAttributeValue,
+  drivers: MergeDriverRegistry | undefined,
+  defaultDriver?: string,
+): { name: string; custom?: MergeDriver } {
+  let name: string;
+  if (attr === true) return { name: "text" };
+  if (attr === false) return { name: "binary" };
+  if (attr === undefined) {
+    if (!defaultDriver) return { name: "text" };
+    name = defaultDriver;
+  } else name = attr;
+  const custom = lookupMergeDriver(drivers, name);
+  if (custom) return { name, custom };
+  if (name === "binary" || name === "text" || name === "union") return { name };
+  return { name: "text" };
+}
+
+/** The three versions of a path {@link lowLevelMerge} merges, with their marker labels. */
+export interface LowLevelMergeInput {
+  path: string;
+  base: Uint8Array;
+  ours: Uint8Array;
+  theirs: Uint8Array;
+  baseLabel: string;
+  oursLabel: string;
+  theirsLabel: string;
+}
+
+/** How {@link lowLevelMerge} merges (git's `ll_merge_options` and the path's attributes). */
+export interface LowLevelMergeOptions {
+  /** The path's `merge` and `conflict-marker-size` attributes */
+  attributes?: MergeAttributes;
+  /** Registered drivers, `merge.default`, `merge.<driver>.recursive` */
+  drivers?: MergeDriverRegistry;
+  defaultDriver?: string;
+  recursiveDriver?: (name: string) => string | undefined;
+  /** A merge of merge bases (`virtual_ancestor`): the recursive driver, the base on binary */
+  virtualAncestor?: boolean;
+  /** `-X ours` / `-X theirs` / `-X union` (ignored for a merge of merge bases) */
+  favor?: "ours" | "theirs" | "union";
+  style?: ConflictStyle;
+  /** Added to the marker size (merge-ort's nested conflicts) */
+  extraMarkerSize?: number;
+  /** Files above this size are binary (core.bigFileThreshold; default 512 MiB) */
+  bigFileThreshold?: number;
+  /** The diff algorithm: merge-ort's histogram, `checkout -m`'s myers */
+  algorithm?: LineMergeOptions["algorithm"];
+}
+
+/** What {@link lowLevelMerge} gives: `binary` is git's `LL_MERGE_BINARY_CONFLICT`. */
+export interface LowLevelMergeResult {
+  status: "ok" | "conflict" | "binary";
+  content: Uint8Array;
+}
+
+/**
+ * git's `ll_merge`: the driver of the path's `merge` attribute (text, binary, union or a
+ * registered one) with the `conflict-marker-size` markers; binary content (or a `binary`
+ * driver) keeps ours as a binary conflict, the base in a merge of merge bases.
+ */
+export async function lowLevelMerge(
+  input: LowLevelMergeInput,
+  options: LowLevelMergeOptions = {},
+): Promise<LowLevelMergeResult> {
+  const { path, base: orig, ours: src1, theirs: src2 } = input;
+  const attrs = options.attributes ?? {};
+  let markerSize = 7;
+  const size = attrs.conflictMarkerSize;
+  if (typeof size === "string") {
+    const parsed = /^[+-]?\d+$/.test(size.trim()) ? Number.parseInt(size, 10) : Number.NaN;
+    markerSize = Number.isNaN(parsed) || parsed <= 0 ? 7 : parsed;
+  }
+  let driver = findMergeDriver(attrs.merge, options.drivers, options.defaultDriver);
+  if (options.virtualAncestor) {
+    const recursive = driver.custom?.recursive ?? options.recursiveDriver?.(driver.name);
+    if (recursive) driver = findMergeDriver(recursive, options.drivers, options.defaultDriver);
+  }
+  markerSize += options.extraMarkerSize ?? 0;
+  const favor = options.virtualAncestor ? undefined : options.favor;
+  const binaryMerge = (): LowLevelMergeResult => {
+    // ll_binary_merge: the base for an inner merge, else ours (or the favored side)
+    if (options.virtualAncestor) return { status: "ok", content: orig };
+    if (favor === "ours") return { status: "ok", content: src1 };
+    if (favor === "theirs") return { status: "ok", content: src2 };
+    return { status: "binary", content: src1 };
+  };
+  if (driver.custom) {
+    const out = await driver.custom.merge({
+      path,
+      base: orig,
+      ours: src1,
+      theirs: src2,
+      baseLabel: input.baseLabel,
+      oursLabel: input.oursLabel,
+      theirsLabel: input.theirsLabel,
+      markerSize,
+    });
+    return { status: out.conflict ? "conflict" : "ok", content: out.content };
+  }
+  if (driver.name === "binary") return binaryMerge();
+  const threshold = options.bigFileThreshold ?? 512 * 1024 * 1024;
+  if (
+    [orig, src1, src2].some((bytes) => bytes.length > threshold || SimilarityIndex.isBinary(bytes))
+  ) {
+    return binaryMerge();
+  }
+  const lines = mergeLines(orig, src1, src2, {
+    oursLabel: input.oursLabel,
+    theirsLabel: input.theirsLabel,
+    baseLabel: input.baseLabel,
+    style: options.style,
+    favor: driver.name === "union" ? "union" : favor,
+    markerSize,
+    ...(options.algorithm ? { algorithm: options.algorithm } : {}),
+  });
+  return { status: lines.conflicts > 0 ? "conflict" : "ok", content: lines.content };
+}
+
 /** The attributes interface a content filter may offer (GitContentFilter's). */
 interface AttributeReader {
   attributes?(
@@ -115,7 +245,15 @@ interface AttributeReader {
 export function ortConfigOptions(
   workingCopy: WorkingCopy,
   worktree: Worktree | undefined,
-  overrides: { renormalize?: boolean } = {},
+  overrides: {
+    renormalize?: boolean;
+    /**
+     * Read the attributes as `ll_merge` reads them for a path of the index (`checkout -m`):
+     * the worktree's `.gitattributes`, then the index's (merge-ort's attribute index is
+     * none)
+     */
+    indexAttributes?: boolean;
+  } = {},
 ): Partial<OrtMergeOptions> {
   const out: Partial<OrtMergeOptions> = {};
   // merge.renames over diff.renames (`copies` counts as on)
@@ -149,7 +287,9 @@ export function ortConfigOptions(
     const read = filter.attributes.bind(filter);
     // merge-ort's attribute index is empty (no merge.renormalize) or holds the merged
     // .gitattributes; the worktree's files are read first either way
-    const context = { direction: "checkin" as const, index: { attributesBlob: () => undefined } };
+    const context = overrides.indexAttributes
+      ? { direction: "checkin" as const }
+      : { direction: "checkin" as const, index: { attributesBlob: () => undefined } };
     out.attributes = async (path): Promise<MergeAttributes> => {
       const values = await read(path, ["merge", "conflict-marker-size"], context);
       return { merge: values.get("merge"), conflictMarkerSize: values.get("conflict-marker-size") };

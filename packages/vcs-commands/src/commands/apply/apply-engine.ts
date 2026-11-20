@@ -1327,6 +1327,8 @@ export class ApplyEngine extends ApplyParser {
 
   private async addIndexFile(name: string, mode: number, buf: string): Promise<number> {
     if (this.itaOnly) {
+      // set_object_name_for_intent_to_add_entry: the empty blob it names is written
+      await this.io.writeBlob("");
       return this.addIndexEntries(name, [
         { mode, oid: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", intentToAdd: true },
       ]);
