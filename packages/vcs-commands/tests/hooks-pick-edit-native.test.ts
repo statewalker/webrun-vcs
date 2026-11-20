@@ -354,3 +354,64 @@ describeGit("cherry-pick -e and revert -e through a conflict (as native git)", (
     );
   });
 });
+
+describeGit("a clean pick whose commit fails: HEAD's lock held (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-pick-locked-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  async function compare(
+    args: string[],
+    run: (g: Git) => Promise<unknown>,
+    setup?: (dir: string) => void,
+  ): Promise<void> {
+    const dir = join(root, "r");
+    base(dir);
+    setup?.(dir);
+    const [theirs, mine] = hookTwins(root, dir);
+    for (const t of [theirs, mine]) writeFileSync(join(t.dir, ".git/refs/heads/main.lock"), "");
+    const native = nativeIn(theirs, root, args);
+    let error: unknown;
+    try {
+      await run(await oursIn(mine));
+    } catch (e) {
+      error = e;
+    }
+    const label = args.join(" ");
+    expect(native.status, `${label}: native fails`).not.toBe(0);
+    expect(error, label).toBeInstanceOf(Error);
+    const thrown = error as Error & { exitCode?: number };
+    expect(thrown.name, `${label}: error`).toBe("GitApiError");
+    expect(thrown.exitCode, `${label}: exit code`).toBe(native.status);
+    const stderr = native.stderr
+      .split("\n")
+      .filter((l) => !/^hook \S+ (out|err)$/.test(l))
+      .join("\n")
+      .replace(/\n+$/, "")
+      .replaceAll(theirs.dir, "<twin>");
+    expect(thrown.message.replaceAll(mine.dir, "<twin>"), `${label}: stderr`).toBe(stderr);
+    expect(hookLog(mine), `${label}: log`).toBe(hookLog(theirs));
+    for (const file of ["CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_MSG", "ORIG_HEAD"]) {
+      const read = (d: string) => {
+        const path = join(d, ".git", file);
+        return existsSync(path) ? readFileSync(path, "latin1") : "(none)";
+      };
+      expect(read(mine.dir), `${label}: ${file}`).toBe(read(theirs.dir));
+    }
+    const state = (d: string) =>
+      git(d, ["status", "--porcelain"]) + git(d, ["for-each-ref"]) + git(d, ["rev-parse", "HEAD"]);
+    expect(state(mine.dir), `${label}: state`).toBe(state(theirs.dir));
+    expect(existsSync(join(mine.dir, ".git/refs/heads/main.lock")), `${label}: lock kept`).toBe(
+      true,
+    );
+  }
+
+  it("cherry-pick: CHERRY_PICK_HEAD and MERGE_MSG left, git's lock error", async () => {
+    await compare(["cherry-pick", "side"], (g) => g.cherryPick().include("side").call());
+  });
+
+  it("revert: MERGE_MSG left, git's lock error", async () => {
+    await compare(["revert", "HEAD"], (g) => g.revert().include("HEAD").call());
+  });
+});

@@ -620,7 +620,9 @@ export function refTransactionHookOf(
       if (state === "preparing") lines.push(line(u.requested));
       else if (legacy && u.requested !== u.name) {
         lines.push(line(u.requested));
+        for (const n of u.through ?? []) appended.push(line(n));
         appended.push(line(u.name));
+        if (u.viaHead) appended.push(line("HEAD"));
       } else {
         lines.push(line(u.name));
         if (legacy && u.viaHead) appended.push(line("HEAD"));

@@ -506,7 +506,8 @@ async function resetKeepWith(
  * HEAD left, as the reference-transaction hook sees both. Without a HEAD (unborn), HEAD's
  * branch is set as it is. An ORIG_HEAD that cannot be written (its lock held, another
  * value meanwhile) is reported and HEAD still moves, as git's `update_ref` with
- * UPDATE_REFS_MSG_ON_ERR: the `error:` lines are returned.
+ * UPDATE_REFS_MSG_ON_ERR: the `error:` lines are returned (after git's `warning:` for a
+ * symbolic ORIG_HEAD naming nothing).
  */
 export async function moveHeadAsReset(
   refs: CommandRefs,
@@ -523,11 +524,19 @@ export async function moveHeadAsReset(
   }
   const errors: string[] = [];
   if (state.supported) {
-    const old = (await state.ref("ORIG_HEAD")) ?? null;
+    // git's get_oid("ORIG_HEAD"): through a symbolic ORIG_HEAD to the id its target holds
+    // (the old value the write through it expects), warning of one naming nothing
+    const resolved = async () =>
+      (await refs.resolve("ORIG_HEAD").catch(() => undefined))?.objectId ?? undefined;
+    const ref = await refs.get("ORIG_HEAD").catch(() => undefined);
+    const old = (await resolved()) ?? null;
+    if (ref && "target" in ref && old === null) {
+      errors.push("warning: ignoring dangling symref ORIG_HEAD");
+    }
     try {
       await state.setRef("ORIG_HEAD", headId, { old, log: { ...log, message: origHeadMessage } });
     } catch (error) {
-      errors.push(origHeadError(error, old, await state.ref("ORIG_HEAD").catch(() => undefined)));
+      errors.push(origHeadError(error, old, await resolved()));
     }
   }
   const result = await refs.batch([{ name: "HEAD", old: headId, new: target }], log);

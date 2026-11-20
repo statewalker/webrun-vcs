@@ -747,3 +747,60 @@ describeGit("reset: an ORIG_HEAD that cannot be written (as native git)", () => 
     await compare("symbolic", (t) => git(t.dir, ["symbolic-ref", "ORIG_HEAD", "refs/heads/foo"]));
   });
 });
+
+describeGit("reset: a symbolic ORIG_HEAD written through to its target (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx-orighead-sym-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** main at "second", tag t at "base". */
+  function repo(): string {
+    const dir = join(root, "r");
+    base(dir);
+    git(dir, ["tag", "t"]);
+    putFile(dir, "b.txt", "b\n");
+    git(dir, ["add", "b.txt"]);
+    git(dir, ["commit", "-qm", "second"]);
+    return dir;
+  }
+
+  /** `reset --hard HEAD~1` in both twins, ORIG_HEAD naming `target`. */
+  async function compare(target: string): Promise<void> {
+    const [theirs, mine] = hookTwins(root, repo());
+    for (const t of [theirs, mine])
+      writeFileSync(join(t.dir, ".git/ORIG_HEAD"), `ref: ${target}\n`);
+    const native = nativeIn(theirs, root, ["reset", "-q", "--hard", "HEAD~1"]);
+    const command = (await oursIn(mine)).reset().setRef("HEAD~1").setMode(ResetMode.HARD);
+    await command.call();
+    expect(native.status, `${target}: native succeeds (${native.stderr})`).toBe(0);
+    expect(hookLog(mine), `${target}: hook log`).toBe(hookLog(theirs));
+    expect(refState(mine.dir), `${target}: refs`).toBe(refState(theirs.dir));
+    expect(git(mine.dir, ["rev-parse", "HEAD"]), `${target}: HEAD`).toBe(
+      git(theirs.dir, ["rev-parse", "HEAD"]),
+    );
+    expect(readFileSync(join(mine.dir, ".git/ORIG_HEAD"), "latin1"), `${target}: ORIG_HEAD`).toBe(
+      readFileSync(join(theirs.dir, ".git/ORIG_HEAD"), "latin1"),
+    );
+    const stderr = native.stderr
+      .split("\n")
+      .filter((l) => l !== "" && !/^hook \S+ (out|err)$/.test(l));
+    expect(command.getWarnings(), `${target}: stderr`).toEqual(stderr);
+  }
+
+  it("naming an existing branch (HEAD's): written through, no error", async () => {
+    await compare("refs/heads/main");
+  });
+
+  it("naming an existing tag: the tag moved to the HEAD left", async () => {
+    await compare("refs/tags/t");
+  });
+
+  it("naming a missing branch: created, git's dangling symref warning", async () => {
+    await compare("refs/heads/foo");
+  });
+
+  it("naming HEAD: written through to HEAD's branch", async () => {
+    await compare("HEAD");
+  });
+});

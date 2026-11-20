@@ -198,3 +198,46 @@ describe("root ref deletions without a transaction hook", () => {
     expect((await refs.resolve("AUTO_MERGE"))?.objectId).toBe(oid(1));
   });
 });
+
+describe("root ref deletions without a transaction hook: packed root refs", () => {
+  const packed = (lines: string[]) =>
+    new TextEncoder().encode(`# pack-refs with: peeled fully-peeled sorted \n${lines.join("")}`);
+
+  it("a root ref packed-refs lists is deleted from it (git reads and deletes those)", async () => {
+    const { files, refs } = await open();
+    await refs.set("refs/heads/main", oid(1));
+    // nothing packed yet: the deletion of an absent root ref reads (and keeps) packed-refs' state
+    expect(await refs.remove("REVERT_HEAD")).toBe(false);
+    await files.write(".git/packed-refs", [
+      packed([`${oid(2)} CHERRY_PICK_HEAD\n`, `${oid(3)} refs/heads/other\n`]),
+    ]);
+    expect((await refs.resolve("CHERRY_PICK_HEAD"))?.objectId).toBe(oid(2));
+    expect(await refs.remove("CHERRY_PICK_HEAD")).toBe(true);
+    expect(await refs.has("CHERRY_PICK_HEAD")).toBe(false);
+    const text = await readText(files, ".git/packed-refs");
+    expect(text).not.toContain("CHERRY_PICK_HEAD");
+    expect(text).toContain("refs/heads/other");
+    expect(await files.exists(PACKED_LOCK)).toBe(false);
+  });
+
+  it("a root ref both loose and packed: both go, the packed value does not show through", async () => {
+    const { files, refs } = await open();
+    await files.write(".git/packed-refs", [packed([`${oid(2)} CHERRY_PICK_HEAD\n`])]);
+    await refs.set("CHERRY_PICK_HEAD", oid(4));
+    expect((await refs.resolve("CHERRY_PICK_HEAD"))?.objectId).toBe(oid(4));
+    expect(await refs.remove("CHERRY_PICK_HEAD")).toBe(true);
+    expect(await refs.has("CHERRY_PICK_HEAD")).toBe(false);
+    expect(await readText(files, ".git/packed-refs")).not.toContain("CHERRY_PICK_HEAD");
+  });
+
+  it("packed-refs read again once it changes (a rewrite after an earlier deletion)", async () => {
+    const { files, refs } = await open();
+    await files.write(".git/packed-refs", [packed([`${oid(3)} refs/heads/other\n`])]);
+    expect(await refs.remove("AUTO_MERGE")).toBe(false);
+    await files.write(".git/packed-refs", [
+      packed([`${oid(2)} AUTO_MERGE\n`, `${oid(3)} refs/heads/other\n`]),
+    ]);
+    expect(await refs.remove("AUTO_MERGE")).toBe(true);
+    expect(await refs.has("AUTO_MERGE")).toBe(false);
+  });
+});

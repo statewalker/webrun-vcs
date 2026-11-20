@@ -579,10 +579,16 @@ export interface RefTransactionUpdate {
   /** The value written; `null` deletes the ref */
   new: ObjectId | null;
   /**
-   * HEAD names the ref written, which was asked for by its own name: git's transaction
-   * also logs the update on HEAD (`split_head_update`, a line of its own in git 2.43)
+   * HEAD names the ref written, which was asked for by its own name or through another
+   * symbolic ref (a symbolic ORIG_HEAD): git's transaction also logs the update on HEAD
+   * (`split_head_update`, a line of its own in git 2.43, after the ref's)
    */
   viaHead?: boolean;
+  /**
+   * The symbolic refs between `requested` and `name` (an ORIG_HEAD naming HEAD: `HEAD`), in
+   * order: each a log-only update of its own in git 2.43 (`split_symref_update`)
+   */
+  through?: string[];
 }
 
 /**

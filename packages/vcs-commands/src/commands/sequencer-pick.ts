@@ -404,8 +404,10 @@ export class PickSequencer {
       }
       return { status: "ok", newHead, picked: [item.id], output };
     }
-    // do_pick_commit records CHERRY_PICK_HEAD for a clean pick too, before do_commit
+    // do_pick_commit records CHERRY_PICK_HEAD for a clean pick too, and writes MERGE_MSG,
+    // before do_commit: a commit that fails (HEAD's lock held) leaves both
     if (action === "pick") await deps.state.setRef(HEAD_REF[action], item.id);
+    await deps.state.write("MERGE_MSG", message);
     const committer = this.committer();
     const commitMessage = action === "pick" ? commit.message : message;
     const newHead = await this.commit(
@@ -678,9 +680,49 @@ export class PickSequencer {
     if (result.rejected.some((r) => r.reason === "mismatch")) {
       throw new GitApiError(`fatal: cannot lock ref 'HEAD': is at another value`);
     }
+    if (result.rejected.some((r) => r.reason === "locked")) throw await this.headLockedError();
     // a store whose batches cannot take HEAD (no transactions there): HEAD set as that store
     // sets it, without the old value checked (git has no such path)
     await updateHead(this.deps.refs, id, log);
+  }
+
+  /**
+   * git's failure of a commit whose ref lock another process holds: try_to_commit's
+   * `error: cannot lock ref 'HEAD'` with lockfile.c's hint (2.43's longer wording), then in
+   * git 2.43 `fatal: <action> failed` (exit 128); 2.5x returns after the error (exit 1).
+   */
+  private async headLockedError(): Promise<GitApiError> {
+    let name = "HEAD";
+    for (let i = 0; i < 5; i++) {
+      const ref = await this.deps.refs.get(name).catch(() => undefined);
+      if (!ref || !("target" in ref)) break;
+      name = ref.target;
+    }
+    // lockfile.c names the lock by its resolved (absolute) path
+    const gitDir =
+      (await this.deps.hooks?.hostGitDir().catch(() => undefined)) ??
+      (this.deps.workingCopy as { config?: { hostGitDir?: string } }).config?.hostGitDir;
+    const lockPath = `${gitDir ? gitDir.replace(/\/+$/, "") : ".git"}/${name}.lock`;
+    const legacy = this.deps.hooks?.compatibility === "2.43";
+    const hint = legacy
+      ? [
+          "Another git process seems to be running in this repository, e.g.",
+          "an editor opened by 'git commit'. Please make sure all processes",
+          "are terminated then try again. If it still fails, a git process",
+          "may have crashed in this repository earlier:",
+          "remove the file manually to continue.",
+        ]
+      : [
+          "Another git process seems to be running in this repository, or the lock file may be stale",
+        ];
+    return new GitApiError(
+      [
+        `error: cannot lock ref 'HEAD': Unable to create '${lockPath}': File exists.`,
+        "",
+        ...hint,
+        ...(legacy ? [`fatal: ${this.name} failed`] : []),
+      ].join("\n"),
+    );
   }
 
   private async headId(): Promise<ObjectId> {
