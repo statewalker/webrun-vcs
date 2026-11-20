@@ -257,6 +257,11 @@ export interface RemoteSessionOptions {
   streamRequestBody?: boolean;
   /** `protocol.version` ({@link protocolVersionOf}) */
   protocolVersion: 0 | 1 | 2;
+  /**
+   * The program the remote runs for the service (git's `--upload-pack` / `--receive-pack`,
+   * `remote.<name>.uploadpack` / `receivepack`); connectors that run one (ssh, git://) use it
+   */
+  program?: string;
   signal?: AbortSignal;
 }
 
@@ -270,6 +275,7 @@ function connectRequest(
     service,
     // git_connect: receive-pack has no v2, so a push asks for v0; connectors never see 2
     protocolVersion: protocolVersionFor(service, options.protocolVersion),
+    ...(options.program !== undefined ? { program: options.program } : {}),
     ...(options.credentials ? { credentials: options.credentials } : {}),
     ...(options.headers ? { headers: options.headers } : {}),
     ...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
@@ -289,6 +295,7 @@ function closingOnce(session: GitSession): GitSession {
   const duplex: Duplex = {
     [Symbol.asyncIterator]: () => inner[Symbol.asyncIterator](),
     write: (data) => inner.write(data),
+    ...(inner.end ? { end: () => inner.end?.() ?? Promise.resolve() } : {}),
     close: () => {
       closing ??= inner.close?.() ?? Promise.resolve();
       return closing;

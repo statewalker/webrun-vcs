@@ -44,8 +44,29 @@ export interface Duplex {
   write(data: Uint8Array): void | Promise<void>;
 
   /**
+   * Ends the write side only (a half-close: a socket's FIN, a child's stdin closed), keeping
+   * the read side open for the peer's answer. git half-closes where its peer waits for the end
+   * of input: after a push's pack, after the final flush of a fetch. Optional: a transport
+   * without it is simply not ended until {@link close}. A peer must keep answering after it
+   * (a Node socket needs `allowHalfOpen: true` on both ends, or the FIN ends the answer too).
+   */
+  end?(): Promise<void>;
+
+  /**
    * Closes the transport connection.
    * Optional - not all transports support explicit close.
    */
   close?(): Promise<void>;
+}
+
+/**
+ * Half-closes a duplex where it can ({@link Duplex.end}); a transport without `end`, or one
+ * whose other end is gone already, is left as it is.
+ */
+export async function endDuplex(duplex: Duplex): Promise<void> {
+  try {
+    await duplex.end?.();
+  } catch {
+    // the other end is gone already
+  }
 }

@@ -26,6 +26,12 @@ export interface GitConnectRequest {
    * push asks for v0 instead, as git does.
    */
   protocolVersion: 0 | 1 | 2;
+  /**
+   * The program the remote runs for the service (git's `--upload-pack` / `--receive-pack`,
+   * `remote.<name>.uploadpack` / `receivepack`): what an ssh connector runs and git:// names
+   * in its request line. Default: the service's name.
+   */
+  program?: string;
   /** Extra parameters for the server (git-daemon's `key=value` after the host) */
   extraParams?: Readonly<Record<string, string>>;
   /** Credentials, for transports that use them */

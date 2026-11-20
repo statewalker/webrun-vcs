@@ -18,6 +18,16 @@ export type {
   RefPushStatus,
 } from "./push-over-duplex.js";
 export { pushOverDuplex } from "./push-over-duplex.js";
+export type {
+  GitServeOptions,
+  GitServeSettings,
+  GitServiceRequest,
+  ServedRepository,
+  ServeGitConnectionOptions,
+  ServeGitConnectionResult,
+  ServeGitServiceOptions,
+} from "./serve-git-connection.js";
+export { daemonAvoidsAlias, serveGitConnection, serveGitService } from "./serve-git-connection.js";
 export type { ServeOverDuplexOptions } from "./serve-over-duplex.js";
 export { serveOverDuplex } from "./serve-over-duplex.js";
 export type { ServerConfigReader, ServerConfigSettings } from "./server-config.js";

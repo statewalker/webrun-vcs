@@ -5,6 +5,7 @@
  */
 
 import type { Credentials } from "../api/credentials.js";
+import { httpRefsError } from "../fetch-client/index.js";
 import { parseBufferedAdvertisement } from "../protocol/advertisement-parser.js";
 import { authorizationHeader } from "./http-auth.js";
 
@@ -87,7 +88,8 @@ export async function lsRemote(
     if (timeoutId) clearTimeout(timeoutId);
 
     if (!response.ok) {
-      throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
+      // git's remote-curl wording ("repository '<url>/' not found", ...)
+      throw await httpRefsError(response, baseUrl);
     }
 
     if (!response.body) {

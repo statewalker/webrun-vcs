@@ -67,7 +67,6 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
   private remote?: string;
   private heads = false;
   private tags = false;
-  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: API placeholder for transport layer
   private uploadPack?: string;
 
   /**
@@ -127,7 +126,8 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
   }
 
   /**
-   * Set custom upload-pack path for the remote.
+   * Set the program the remote runs for upload-pack (git's `--upload-pack`): what an ssh
+   * connector runs, and what git:// names in its request line.
    *
    * @param uploadPack Path to git-upload-pack on remote
    */
@@ -156,52 +156,46 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
     // session); either lists with ls-refs over v2, else reads the v0/v1 advertisement, as
     // protocol.version asks; anything else fails in git's words
     const remote = await this.prepareRemote(remoteUrl);
-    const options = this.remoteSessionOptions();
-    const listRefs = async (connection: UploadPackConnection) => {
-      const listed = new Map<string, ObjectId>();
-      const refs =
-        connection.version === 2 ? await lsRefs(connection, []) : (connection.advertisedRefs ?? []);
-      for (const ref of refs) {
-        if (ref.oid) listed.set(ref.name, ref.oid);
-      }
-      return listed;
+    const options = {
+      ...this.remoteSessionOptions(),
+      ...(this.uploadPack !== undefined ? { program: this.uploadPack } : {}),
     };
-    const refs = await withRemoteUploadPack(remote, options, listRefs);
+    // builtin/ls-remote.c: --tags and --heads become v2 ref-prefixes (v0 lists everything,
+    // filtered here)
+    const prefixes = [...(this.tags ? ["refs/tags/"] : []), ...(this.heads ? ["refs/heads/"] : [])];
+    const listRefs = async (connection: UploadPackConnection) =>
+      connection.version === 2
+        ? await lsRefs(connection, prefixes)
+        : [...(connection.advertisedRefs ?? [])];
+    const listed = await withRemoteUploadPack(remote, options, listRefs);
 
-    // Filter refs based on heads/tags settings
     const filteredRefs: RemoteRef[] = [];
-    let defaultBranch: string | undefined;
-
-    for (const [refName, objectIdHex] of refs) {
-      // Handle HEAD specially
-      if (refName === "HEAD") {
-        continue; // We'll use it for defaultBranch detection but not include in results
-      }
-
-      // Apply filters
-      if (this.heads && !refName.startsWith("refs/heads/")) {
-        continue;
-      }
-      if (this.tags && !refName.startsWith("refs/tags/")) {
-        continue;
-      }
-
+    for (const ref of listed) {
+      // HEAD only names the default branch; an unborn ref has no object
+      if (ref.name === "HEAD" || !ref.oid) continue;
+      // --heads and --tags: refs of either kind (git's REF_BRANCHES | REF_TAGS)
+      const wanted =
+        (!this.heads && !this.tags) ||
+        (this.heads && ref.name.startsWith("refs/heads/")) ||
+        (this.tags && ref.name.startsWith("refs/tags/"));
+      if (!wanted) continue;
       filteredRefs.push({
-        name: refName,
-        objectId: objectIdHex,
+        name: ref.name,
+        objectId: ref.oid,
+        ...(ref.peeled ? { peeledObjectId: ref.peeled } : {}),
+        ...(ref.symref ? { symbolic: true, target: ref.symref } : {}),
       });
     }
 
-    // Try to determine default branch
-    const headRef = refs.get("HEAD");
-    if (headRef) {
-      // Check if HEAD points to a known branch
-      for (const [refName, objectIdHex] of refs) {
-        if (refName.startsWith("refs/heads/") && objectIdHex === headRef) {
-          defaultBranch = refName.slice("refs/heads/".length);
-          break;
-        }
-      }
+    // The default branch: HEAD's symref (v2 `symref-target`, v0's `symref=HEAD:` capability),
+    // else the first branch at HEAD's commit (a server that names no symref)
+    let defaultBranch: string | undefined;
+    const head = listed.find((r) => r.name === "HEAD");
+    if (head?.symref?.startsWith("refs/heads/")) {
+      defaultBranch = head.symref.slice("refs/heads/".length);
+    } else if (head?.oid) {
+      const match = listed.find((r) => r.name.startsWith("refs/heads/") && r.oid === head.oid);
+      if (match) defaultBranch = match.name.slice("refs/heads/".length);
     }
 
     return {

@@ -77,6 +77,7 @@ export * from "./revision-range.js";
 export * from "./revision-resolver.js";
 export * from "./rm-command.js";
 export { SequencerOperation } from "./sequencer-pick.js";
+export * from "./serve-repository.js";
 export * from "./sparse-checkout-command.js";
 export * from "./stash-apply-command.js";
 export * from "./stash-create-command.js";

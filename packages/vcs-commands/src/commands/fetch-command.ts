@@ -686,7 +686,12 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       reflogIdent: this.reflogLine("").ident,
       abbrev: parseCoreAbbrev(store.value("core.abbrev")) ?? -1,
     };
-    const result = await withRemoteUploadPack(remote, this.remoteSessionOptions(), (connection) =>
+    const uploadPack = this.remoteProgram(this.remote, "uploadpack");
+    const sessionOptions = {
+      ...this.remoteSessionOptions(),
+      ...(uploadPack !== undefined ? { program: uploadPack } : {}),
+    };
+    const result = await withRemoteUploadPack(remote, sessionOptions, (connection) =>
       fetchFromConnection(connection, fetchOptions),
     ).catch((error: unknown) => {
       // git dies on a source that names no remote ref (a hidden one included)
