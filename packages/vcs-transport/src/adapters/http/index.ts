@@ -8,3 +8,4 @@
 
 export * from "./http-duplex.js";
 export * from "./http-server.js";
+export * from "./served-http-handler.js";

@@ -577,6 +577,15 @@ export class HookSession {
     return this.host.environment()?.hookRunner;
   }
 
+  /**
+   * The committer variables the host sets (`GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`), as
+   * the host environment's `committer` gives them: what git's http-backend checks before
+   * naming the pushing user the committer of its children.
+   */
+  get hostCommitter(): { name?: string; email?: string } {
+    return this.host.environment()?.committer ?? {};
+  }
+
   /** Whether hooks can run at all: the host environment has a runner. */
   get enabled(): boolean {
     return this.runner !== undefined;
@@ -638,6 +647,17 @@ export class HookSession {
       files: layout.files,
       path: joinFilesPath(await commonDirOf(layout.files, layout.gitDir), name),
     };
+  }
+
+  /**
+   * A path of the repository's FilesApi as hooks are told it: its absolute host path where the
+   * files have one (as git names `GIT_QUARANTINE_PATH`), else relative to the directory the
+   * hooks run in; as given without a layout.
+   */
+  async hookPathOf(filesPath: string): Promise<string> {
+    const layout = await this.host.layout();
+    if (!layout) return filesPath;
+    return hostPathOf(layout.files, filesPath) ?? relativeFilesPath(layout.cwd, filesPath);
   }
 
   /** The git directory's absolute host path, where the repository's files have one. */

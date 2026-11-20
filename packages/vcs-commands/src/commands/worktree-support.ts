@@ -22,15 +22,23 @@ import {
 /**
  * A working copy for the `git worktree` commands from a {@link WorktreeAdmin}: the admin's
  * working copy when it has one, else (a bare repository) its history, configuration and
- * worktrees, with every part of a working tree (index, files, stash, HEAD helpers) refused
- * as git refuses them there: `this operation must be run in a work tree`.
+ * worktrees (and `bareRepository`, the repository's directory: see {@link repositoryPlaceOf}),
+ * with every part of a working tree (index, files, stash, HEAD helpers) refused as git refuses
+ * them there: `this operation must be run in a work tree`.
  */
 export function worktreeAdminWorkingCopy(admin: WorktreeAdmin): WorkingCopy {
   if ("checkout" in admin) return admin as WorkingCopy;
   const refuse = (): never => {
     throw new WorktreeError("this operation must be run in a work tree");
   };
-  const base = { history: admin.history, config: admin.config, worktrees: admin.worktrees };
+  // a bare repository's directory (`repositoryPlaceOf`): not a `worktree`, which commands
+  // test for to tell a bare repository
+  const base = {
+    history: admin.history,
+    config: admin.config,
+    worktrees: admin.worktrees,
+    ...(admin.bareRepository ? { bareRepository: admin.bareRepository } : {}),
+  };
   return new Proxy(base, {
     get(target, key, receiver) {
       if (key in target) return Reflect.get(target, key, receiver);
@@ -39,6 +47,21 @@ export function worktreeAdminWorkingCopy(admin: WorktreeAdmin): WorkingCopy {
     },
     has: (target, key) => key in target,
   }) as unknown as WorkingCopy;
+}
+
+/**
+ * Where a working copy opens other repositories by path (local remotes): its worktree, or,
+ * for a bare repository's working copy ({@link worktreeAdminWorkingCopy}), the repository's
+ * directory (`WorktreeAdmin.bareRepository`), relative paths read from the git directory as
+ * git reads them there. Undefined when it has neither.
+ */
+export function repositoryPlaceOf(
+  workingCopy: WorkingCopy,
+): NonNullable<WorktreeAdmin["bareRepository"]> | undefined {
+  if ("worktree" in workingCopy) {
+    return (workingCopy.worktree as WorkingCopy["worktree"] | undefined) ?? undefined;
+  }
+  return (workingCopy as { bareRepository?: WorktreeAdmin["bareRepository"] }).bareRepository;
 }
 
 /** The working copy's worktrees, or WorktreesUnsupportedError for a backend without them. */

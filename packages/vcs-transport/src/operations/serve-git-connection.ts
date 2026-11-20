@@ -40,6 +40,7 @@ import {
 import { encodePacket } from "../protocol/pkt-line-codec.js";
 import { type ServeOverDuplexOptions, serveOverDuplex } from "./serve-over-duplex.js";
 import {
+  configBoolOf,
   explicitServerSettingsFromConfig,
   GIT_SERVER_SETTINGS_DEFAULTS,
   type ServerConfigReader,
@@ -71,9 +72,25 @@ export interface ServedRepository {
   /**
    * Runs around the serving of one request (`serve`), for what the repository's owner
    * installs for its duration: the repository's reference-transaction hook while
-   * receive-pack updates its refs (`servedRepositoryOf`)
+   * receive-pack updates its refs (`servedRepositoryOf`). `context` tells what the server
+   * knows of the client: an HTTP request's user and address (the variables git's
+   * http-backend hands its children, the hooks included)
    */
-  around?<T>(service: "git-upload-pack" | "git-receive-pack", serve: () => Promise<T>): Promise<T>;
+  around?<T>(
+    service: "git-upload-pack" | "git-receive-pack",
+    serve: () => Promise<T>,
+    context?: ServedRequestContext,
+  ): Promise<T>;
+}
+
+/** What a server knows of the client of one served request (see `ServedRepository.around`). */
+export interface ServedRequestContext {
+  /** Served over smart HTTP (git's http-backend sets the committer of its children) */
+  http?: boolean;
+  /** The authenticated user (http-backend's `REMOTE_USER`) */
+  remoteUser?: string;
+  /** The client's address (http-backend's `REMOTE_ADDR`) */
+  remoteAddr?: string;
 }
 
 /** What a client asked for. */
@@ -255,20 +272,6 @@ export function daemonAvoidsAlias(path: string): boolean {
   return false;
 }
 
-/** git's `git_config_bool` for the last value of `key`, or undefined when unset. */
-function configBool(config: ServerConfigReader | undefined, key: string): boolean | undefined {
-  const values = config?.getAll(key) ?? [];
-  if (values.length === 0) return undefined;
-  const value = values[values.length - 1];
-  if (value === null || value === true || value === undefined) return true;
-  if (value === false) return false;
-  const text = String(value).trim().toLowerCase();
-  if (["true", "yes", "on"].includes(text)) return true;
-  if (["false", "no", "off", ""].includes(text)) return false;
-  const n = Number(text);
-  return Number.isFinite(n) ? n !== 0 : undefined;
-}
-
 /**
  * Layers server settings, the later over the earlier: a key a layer leaves undefined keeps
  * the value below; the hidden ref lists concatenate (see {@link GitServeOptions.settings}).
@@ -306,6 +309,30 @@ export function layerServeSettings(
   if (upload.length > 0) out.uploadPackHideRefs = upload;
   if (receive.length > 0) out.receivePackHideRefs = receive;
   return out as GitServeSettings;
+}
+
+/**
+ * The settings a served repository is served with (see {@link GitServeOptions.settings}):
+ * git's defaults (for a repository with a config, which git always reads; without one, the
+ * server's own defaults), the operator's `settings`, what the repository's config sets
+ * explicitly, then the resolver's {@link ServedRepository.settings}. `serveGitService` and
+ * the served smart-HTTP handler (`createServedHttpHandler`) layer them alike.
+ *
+ * @example
+ * ```ts
+ * const settings = resolveServeSettings({ allowDeletes: false }, served);
+ * ```
+ */
+export function resolveServeSettings(
+  operator: GitServeSettings | undefined,
+  served: Pick<ServedRepository, "config" | "settings">,
+): GitServeSettings {
+  return layerServeSettings(
+    served.config ? GIT_SERVER_SETTINGS_DEFAULTS : undefined,
+    operator,
+    served.config ? explicitServerSettingsFromConfig(served.config) : undefined,
+    served.settings,
+  );
 }
 
 /**
@@ -527,20 +554,13 @@ export async function serveGitService(
     served = undefined;
   }
   if (!served) return refuse("no such repository");
-  const override = overridable ? configBool(served.config, `daemon.${configKey}`) : undefined;
+  const override = overridable ? configBoolOf(served.config, `daemon.${configKey}`) : undefined;
   // upload-archive is not served here: refused as when it is not enabled
   if (!(override ?? enabled) || service === "git-upload-archive") {
     return refuse("service not enabled");
   }
 
-  // git's defaults under everything for a repository with a config (git reads one always);
-  // without one, serveOverDuplex's own defaults
-  const settings = layerServeSettings(
-    served.config ? GIT_SERVER_SETTINGS_DEFAULTS : undefined,
-    options.settings,
-    served.config ? explicitServerSettingsFromConfig(served.config) : undefined,
-    served.settings,
-  );
+  const settings = resolveServeSettings(options.settings, served);
   try {
     const servedService = service as "git-upload-pack" | "git-receive-pack";
     const serve = () =>

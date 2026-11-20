@@ -27,6 +27,8 @@ export const nativeIs25x = (() => {
 /**
  * The logging hook. `$HOOK_LOG` is the log; in `$HOOK_CTL`, a file `exit-<name>` gives the
  * exit code, `edit-<name>` text appended to the file named by the first argument.
+ * `$HOOK_EXTRA_VARS` names more variables to log (`GIT_COMMITTER_NAME ...`), for twins that
+ * set them alike on both sides.
  */
 export const HOOK_SCRIPT = String.raw`#!/bin/sh
 n=$(basename "$0")
@@ -34,7 +36,7 @@ n=$(basename "$0")
   printf '== %s' "$n"
   for a in "$@"; do printf ' [%s]' "$a"; done
   echo
-  for v in GIT_INDEX_FILE GIT_EDITOR GIT_PREFIX GIT_DIR GIT_WORK_TREE GIT_REFLOG_ACTION GIT_PUSH_OPTION_COUNT GIT_QUARANTINE_PATH; do
+  for v in GIT_INDEX_FILE GIT_EDITOR GIT_PREFIX GIT_DIR GIT_WORK_TREE GIT_REFLOG_ACTION GIT_PUSH_OPTION_COUNT GIT_QUARANTINE_PATH REMOTE_USER $HOOK_EXTRA_VARS; do
     if printenv "$v" >/dev/null; then printf '%s=%s
 ' "$v" "$(printenv "$v")"; fi
   done

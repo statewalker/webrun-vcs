@@ -167,6 +167,14 @@ export interface ObjectQuarantine {
    */
   readonly objects: GitObjects;
   /**
+   * The quarantine's directory, for backends that keep one in their storage (the files
+   * backend: `objects/tmp_objdir-incoming-<id>`, a path of its FilesApi): git gives it to the
+   * pre-receive hook as `GIT_QUARANTINE_PATH` (and as `GIT_OBJECT_DIRECTORY`), so a hook
+   * running native git reads the quarantined objects there. Absent where the objects are
+   * not files.
+   */
+  readonly path?: string;
+  /**
    * Where a received pack is kept inside the quarantine, for backends that keep packs (the
    * files backend: `objects/tmp_objdir-incoming-<id>/pack`). Its objects are read through
    * `objects`. Without it a quarantined pack is unpacked into `objects`.

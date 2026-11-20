@@ -17,6 +17,7 @@ import {
   type ReceivePackConnection,
   type ReceivePackHookContext,
   type ReceivePackHooks,
+  type ServedRequestContext,
   type ServerConfigSettings,
   serveOverDuplex,
   serverSettingsFromConfig,
@@ -28,7 +29,7 @@ import { TransportError } from "../errors/index.js";
 import { HookSession, hookHostOf, refTransactionHookOf } from "./git-hooks.js";
 import { ReadTreeCommand } from "./read-tree-command.js";
 import { StatusCommand } from "./status-command.js";
-import { usesBranch, worktreeUsingBranch } from "./worktree-support.js";
+import { repositoryPlaceOf, usesBranch, worktreeUsingBranch } from "./worktree-support.js";
 
 const NOT_A_REPOSITORY = (path: string) =>
   `fatal: '${path}' does not appear to be a git repository\n` +
@@ -106,8 +107,10 @@ export async function openLocalRemote(
   workingCopy: WorkingCopy,
   path: string,
 ): Promise<OpenedRepository> {
-  const worktree = workingCopy.worktree as WorkingCopy["worktree"] | undefined;
-  const opened = await worktree?.openRepository?.(path).catch(() => undefined);
+  // a bare repository opens it from its git directory, as git runs there
+  const opened = await repositoryPlaceOf(workingCopy)
+    ?.openRepository?.(path)
+    .catch(() => undefined);
   if (!opened) throw new TransportError(NOT_A_REPOSITORY(path));
   return opened;
 }
@@ -367,6 +370,8 @@ export async function receivePackSettingsOf(
     ...(receiveHooks ? { hooks: receiveHooks, relayPostReceive: true } : {}),
     // git's receive-pack migrates its quarantine before update() checks the commands
     publishBeforeUpdate: true,
+    // ... and runs pre-receive with every command, refused ones included (skip_broken 0)
+    preReceiveSeesRefused: true,
     // git 2.5x updates the refs of a push that is not atomic in two batches
     ...(hooks?.enabled && hooks.compatibility !== "2.43" ? { batchNonAtomic: true } : {}),
     // ... git 2.43 updates each ref after its update hook
@@ -374,8 +379,8 @@ export async function receivePackSettingsOf(
     ...(checkedOut ? { checkedOutBranches: checkedOut } : {}),
     ...(worktrees
       ? {
-          updateWorktree: async (ref: string, newOid: string) => {
-            const verdict = await pushToCheckout(hooks, worktrees, ref, newOid);
+          updateWorktree: async (ref: string, newOid: string, ctx?: ReceivePackHookContext) => {
+            const verdict = await pushToCheckout(hooks, worktrees, ref, newOid, ctx);
             return verdict === null ? pushToDeploy(worktrees, ref, newOid) : verdict;
           },
         }
@@ -445,7 +450,7 @@ export function remoteHookSession(
   if (!local.environment()?.hookRunner) return undefined;
   let files: FilesApi | undefined;
   try {
-    files = (workingCopy.worktree as { getFiles?(): FilesApi } | undefined)?.getFiles?.();
+    files = repositoryPlaceOf(workingCopy)?.getFiles?.();
   } catch {
     files = undefined;
   }
@@ -477,17 +482,91 @@ async function pushToCheckout(
   worktrees: LinkedWorktrees,
   ref: string,
   newOid: string,
+  ctx?: ReceivePackHookContext,
 ): Promise<string | undefined | null> {
   if (!hooks?.enabled || !(await hooks.exists("push-to-checkout"))) return null;
   const wt = await worktreeUsingBranch(worktrees, ref);
   if (!wt || wt.bare) return "denyCurrentBranch = updateInstead needs a worktree";
   const gitDir = await hooks.hostGitDir();
-  const env: Record<string, string> = { GIT_WORK_TREE: wt.path };
+  const env: Record<string, string> = { ...hookClientEnv(hooks, ctx), GIT_WORK_TREE: wt.path };
   // absolute_path(get_worktree_git_dir): receive-pack's own git directory is ".", so the
   // main worktree's reads `<git dir>/.`
   if (gitDir) env.GIT_DIR = wt.id ? `${gitDir}/worktrees/${wt.id}` : `${gitDir}/.`;
   const result = await hooks.run("push-to-checkout", { args: [newOid], env, prefix: false });
   return result && result.exitCode !== 0 ? "push-to-checkout hook declined" : undefined;
+}
+
+/**
+ * tmp-objdir.c's `tmp_objdir_env` for a hook run while the push's objects are quarantined
+ * (`ctx.quarantinePath`: pre-receive, as git's receive-pack hands `odb_transaction_env` to
+ * it): `GIT_QUARANTINE_PATH` and `GIT_OBJECT_DIRECTORY` name the quarantine,
+ * `GIT_ALTERNATE_OBJECT_DIRECTORIES` the repository's objects (git appends them to the
+ * alternates receive-pack was given; ours names them alone), absolute where the repository's files have a host path, so native git run
+ * by the hook reads the pushed objects. Nothing once the objects are published.
+ */
+export async function quarantineEnv(
+  hooks: HookSession,
+  ctx: Pick<ReceivePackHookContext, "quarantinePath">,
+): Promise<Record<string, string>> {
+  const quarantine = ctx.quarantinePath;
+  if (quarantine === undefined) return {};
+  const objects = await hooks.commonGitFile("objects");
+  const trim = (p: string) => p.replace(/^\/+|\/+$/g, "");
+  const host = await hooks.hostGitDir();
+  const below = objects && trim(quarantine).startsWith(`${trim(objects.path)}/`);
+  // git's absolute_path of `./objects/...`: receive-pack runs with GIT_DIR=. in its git dir
+  const path =
+    host && objects && below
+      ? `${host}/./objects/${trim(quarantine).slice(trim(objects.path).length + 1)}`
+      : await hooks.hookPathOf(quarantine);
+  const env: Record<string, string> = { GIT_QUARANTINE_PATH: path, GIT_OBJECT_DIRECTORY: path };
+  if (objects) {
+    const dir = host && below ? `${host}/./objects` : await hooks.hookPathOf(objects.path);
+    // env_append: quoted (C style) when it holds the separator or starts with a quote
+    const value =
+      dir.includes(":") || dir.startsWith('"')
+        ? `"${dir.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+        : dir;
+    env.GIT_ALTERNATE_OBJECT_DIRECTORIES = value;
+  }
+  return env;
+}
+
+/**
+ * The variables git's http-backend hands receive-pack, and so every hook it runs
+ * (http-backend.c `run_service`), for a push served over smart HTTP: the web server's
+ * `REMOTE_USER` and `REMOTE_ADDR` (inherited), and, where the host sets none,
+ * `GIT_COMMITTER_NAME=<user>` and `GIT_COMMITTER_EMAIL=<user>@http.<addr>` (`anonymous` and
+ * `(none)` when unknown). Nothing for a push not over HTTP.
+ */
+export function httpBackendEnv(
+  hooks: HookSession,
+  client: ServedRequestContext | undefined,
+): Record<string, string> {
+  if (!client?.http) return {};
+  const env: Record<string, string> = {};
+  if (client.remoteUser) env.REMOTE_USER = client.remoteUser;
+  if (client.remoteAddr) env.REMOTE_ADDR = client.remoteAddr;
+  const user = client.remoteUser || "anonymous";
+  const addr = client.remoteAddr || "(none)";
+  const committer = hooks.hostCommitter;
+  if (committer.name === undefined) env.GIT_COMMITTER_NAME = user;
+  if (committer.email === undefined) env.GIT_COMMITTER_EMAIL = `${user}@http.${addr}`;
+  return env;
+}
+
+/** {@link httpBackendEnv} of a push its hook context describes (HTTP: it has a request). */
+function hookClientEnv(hooks: HookSession, ctx: ReceivePackHookContext | undefined) {
+  return httpBackendEnv(
+    hooks,
+    ctx?.request
+      ? {
+          http: true,
+          ...(ctx.remoteUser !== undefined ? { remoteUser: ctx.remoteUser } : {}),
+          ...(ctx.remoteAddr !== undefined ? { remoteAddr: ctx.remoteAddr } : {}),
+        }
+      : undefined,
+  );
 }
 
 /**
@@ -514,7 +593,12 @@ function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
   ) => {
     const result = await hooks.run(name, {
       ...options,
-      env: { GIT_DIR: ".", ...(options.env ?? {}) },
+      env: {
+        ...hookClientEnv(hooks, ctx),
+        GIT_DIR: ".",
+        ...(await quarantineEnv(hooks, ctx)),
+        ...(options.env ?? {}),
+      },
       prefix: false,
     });
     if (result?.stderr) await ctx.message(result.stderr);

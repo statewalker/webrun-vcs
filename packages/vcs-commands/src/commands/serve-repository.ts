@@ -9,11 +9,16 @@ import {
   createTransportRefStore,
   type GitServeSettings,
   type ServedRepository,
+  type ServedRequestContext,
   type ServerConfigReader,
 } from "@statewalker/vcs-transport";
 import type { OpenedRepository } from "@statewalker/vcs-working-tree";
 import type { HookSession } from "./git-hooks.js";
-import { receivePackSettingsOf, withReceiveTransactionHook } from "./local-transport.js";
+import {
+  httpBackendEnv,
+  receivePackSettingsOf,
+  withReceiveTransactionHook,
+} from "./local-transport.js";
 
 /** Options of {@link servedRepositoryOf}. */
 export interface ServedRepositoryOptions {
@@ -84,10 +89,14 @@ export async function servedRepositoryOf(
     settings: settings as GitServeSettings,
     ...(hooks?.enabled
       ? {
-          around: <T>(service: string, serve: () => Promise<T>) =>
-            service === "git-receive-pack"
-              ? withReceiveTransactionHook(remote, hooks, serve)
-              : serve(),
+          // the client's variables (http-backend's REMOTE_USER, ...) reach the
+          // reference-transaction hook too, as every child of receive-pack inherits them
+          around: <T>(service: string, serve: () => Promise<T>, client?: ServedRequestContext) => {
+            if (service !== "git-receive-pack") return serve();
+            const env = httpBackendEnv(hooks, client);
+            const session = Object.keys(env).length > 0 ? hooks.withEnv(env) : hooks;
+            return withReceiveTransactionHook(remote, session, serve);
+          },
         }
       : {}),
   };

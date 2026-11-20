@@ -502,22 +502,28 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       // git's reject_updates_to_hidden: after the connectivity check, before pre-receive
       rejectHiddenUpdates(ctx, commands);
       const open = commands.filter((cmd) => cmd.result === "NOT_ATTEMPTED");
-      if (open.length === 0) return "NOTHING_TO_DO";
+      // git's run_receive_hook with skip_broken=0: every command, refused ones included
+      const fed = receivePackConfig(ctx).preReceiveSeesRefused ? commands : open;
+      if (fed.length === 0) return "NOTHING_TO_DO";
 
       const hook = receivePackHooks(ctx)?.preReceive;
-      if (!hook) return "NO_HOOK";
+      if (!hook) return open.length === 0 ? "NOTHING_TO_DO" : "NO_HOOK";
 
       let verdict: ReturnType<typeof normalizeVerdict>;
       try {
         verdict = normalizeVerdict(
           await timedHook(ctx, "pre-receive", () =>
-            hook(open.map(toReceiveCommand), hookContext(ctx)),
+            hook(fed.map(toReceiveCommand), hookContext(ctx)),
           ),
         );
       } catch (e) {
         logError(ctx, "pre-receive hook failed", e);
         await sendError(ctx, "pre-receive hook error");
         verdict = { ok: false };
+      }
+      if (open.length === 0) {
+        if (!verdict.ok && verdict.message) await sendMessage(ctx, verdict.message);
+        return "NOTHING_TO_DO";
       }
       if (verdict.ok) return "HOOK_OK";
 
@@ -972,8 +978,13 @@ function hookContext(ctx: ProcessContext): ReceivePackHookContext {
       get repository() {
         return pushView(ctx);
       },
+      get quarantinePath() {
+        return state.quarantine?.path;
+      },
       request: rp.request,
       repoPath: rp.repoPath,
+      ...(rp.remoteUser !== undefined ? { remoteUser: rp.remoteUser } : {}),
+      ...(rp.remoteAddr !== undefined ? { remoteAddr: rp.remoteAddr } : {}),
       message: (text: string) => sendMessage(ctx, text),
     };
   }
@@ -1309,7 +1320,7 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
         // git migrates the quarantined objects before update(): the worktree reads them
         if (rp.updateWorktree) await publishQuarantine(ctx);
         refusal = rp.updateWorktree
-          ? await rp.updateWorktree(name, cmd.newOid)
+          ? await rp.updateWorktree(name, cmd.newOid, hookContext(ctx))
           : "denyCurrentBranch = updateInstead needs a worktree";
       } catch (e) {
         logError(ctx, `updating the worktree of ${name} failed`, e);
@@ -1351,13 +1362,12 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
         state.phasesApplied = true;
         return;
       }
-      const open = phase.filter((c) => c.result === "NOT_ATTEMPTED");
-      for (const c of open) if (isNoop(c)) c.result = "OK";
-      const pending = open.filter((c) => !isNoop(c));
-      if (pending.length > 0) await publishQuarantine(ctx);
+      // a delete of a ref that does not exist joins the transaction (its hook hears it)
+      const pending = phase.filter((c) => c.result === "NOT_ATTEMPTED");
+      if (pending.some((c) => !isNoop(c))) await publishQuarantine(ctx);
       const applied = await applyPhase(batch, pending, true);
       for (const c of pending) {
-        if (applied.has(c)) c.result = "OK";
+        if (applied.has(c) || isNoop(c)) c.result = "OK";
         else {
           c.result = "LOCK_FAILURE";
           c.message = FAILED_TO_UPDATE;
@@ -1378,15 +1388,19 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
       failOpen(ATOMIC_PUSH_FAILURE);
       return;
     }
-    if (eager && batch && cmd.result === "NOT_ATTEMPTED" && !isNoop(cmd)) {
-      await publishQuarantine(ctx);
+    if (eager && batch && cmd.result === "NOT_ATTEMPTED") {
+      const noop = isNoop(cmd);
+      if (!noop) await publishQuarantine(ctx);
       let ok = false;
       try {
         ok = (await batch([toRefCommand(cmd)], { message: "push" })).ok;
       } catch (e) {
         if (isTransactionAborted(e)) throw e;
       }
-      if (ok) {
+      if (noop) {
+        // git's transaction of a delete of a ref that does not exist: nothing to apply
+        cmd.result = "OK";
+      } else if (ok) {
         cmd.result = "OK";
         state.eagerlyApplied = [...(state.eagerlyApplied ?? []), cmd];
         state.appliedCommands = [...state.eagerlyApplied];
@@ -1404,13 +1418,19 @@ function isAncestor(ctx: ProcessContext, ancestor: string, oid: string): Promise
   return isAncestorOf(pushView(ctx), ancestor, oid);
 }
 
-/** A delete of a ref that does not exist: nothing to do, reported ok (git warns). */
+/**
+ * A delete of a ref that does not exist: nothing to do, reported ok (git warns, and queues
+ * it in its ref transaction all the same, so the reference-transaction hook hears it; it is
+ * not among the commands post-receive and post-update are told of: `did_not_exist`).
+ */
 function isNoop(cmd: PushCommand): boolean {
   return cmd.oldOid === ZERO_OID && cmd.newOid === ZERO_OID && cmd.expectedOid === undefined;
 }
 
 /** The batch command for a push command; git's zero id means "absent" on both sides. */
 function toRefCommand(cmd: PushCommand): RefCommand {
+  // git's ref_transaction_delete with no old value: nothing to check, nothing to remove
+  if (isNoop(cmd)) return { name: cmd.refName, new: null, noDeref: true };
   return {
     name: cmd.refName,
     old: cmd.expectedOid ?? (cmd.oldOid === ZERO_OID ? null : cmd.oldOid),
@@ -1448,7 +1468,8 @@ function atomicBlocked(ctx: ProcessContext, state: ServerPushState): boolean {
  *   gets the one-by-one path.
  * - Without `batch`, refs are written one by one with `update`.
  * - Deleting a ref that does not exist is a no-op reported ok, as git does; it is not
- *   among the applied commands (post-receive does not see it).
+ *   among the applied commands (post-receive does not see it). With `batch` it joins the
+ *   transaction (git queues it: the reference-transaction hook hears `<zero> <zero> <ref>`).
  */
 async function applyUpdates(
   state: ServerPushState,
@@ -1468,8 +1489,10 @@ async function applyUpdates(
     }
     return "ATOMIC_FAILED";
   }
-  for (const c of open) if (isNoop(c)) c.result = "OK";
-  const pending = open.filter((c) => !isNoop(c));
+  const batch = refStore.batch?.bind(refStore);
+  // without a batch a delete of a ref that does not exist is nothing to write
+  if (!batch) for (const c of open) if (isNoop(c)) c.result = "OK";
+  const pending = open.filter((c) => c.result === "NOT_ATTEMPTED");
   // a failed transaction fails the commands it held; those refused before keep their errors
   const failTransaction = (): "ATOMIC_FAILED" => {
     for (const c of open) {
@@ -1481,7 +1504,6 @@ async function applyUpdates(
   };
   const okCount = () => all.filter((c) => c.result === "OK").length;
 
-  const batch = refStore.batch?.bind(refStore);
   if (!batch) return applyOneByOne(state, refStore, atomic, pending, failTransaction);
   const options = { message: "push" };
 
@@ -1496,11 +1518,18 @@ async function applyUpdates(
     }
     if (result.ok) {
       for (const c of pending) c.result = "OK";
-      state.appliedCommands = [...pending];
+      state.appliedCommands = pending.filter((c) => !isNoop(c));
       return "UPDATES_APPLIED";
     }
     if (result.rejected.every((r) => r.reason === "unsupported")) {
-      return applyOneByOne(state, refStore, atomic, pending, failTransaction);
+      for (const c of pending) if (isNoop(c)) c.result = "OK";
+      return applyOneByOne(
+        state,
+        refStore,
+        atomic,
+        pending.filter((c) => !isNoop(c)),
+        failTransaction,
+      );
     }
     return failTransaction();
   }
@@ -1525,7 +1554,9 @@ async function applyUpdates(
   }
   // the results (and post-receive's commands) in the order the commands came
   for (const c of pending) {
-    if (applied.has(c)) {
+    if (isNoop(c)) {
+      c.result = "OK";
+    } else if (applied.has(c)) {
       c.result = "OK";
       state.appliedCommands.push(c);
     } else {

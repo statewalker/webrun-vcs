@@ -54,26 +54,41 @@ export interface NativeGitHttpBackend {
   close(): void;
 }
 
-/** Serves the repositories under `projectRoot` through `git http-backend`. */
-export function nativeGitHttpBackend(projectRoot: string, home: string): NativeGitHttpBackend {
+/**
+ * Serves the repositories under `projectRoot` through `git http-backend`; `extraEnv` is added
+ * to every backend's variables (`REMOTE_USER`, the variables of the repositories' hooks), or
+ * computed per request; a variable given as undefined is removed (`GIT_COMMITTER_NAME`, for
+ * http-backend to set its own). `PATH_INFO` is the decoded path, as a web server sets it.
+ */
+export function nativeGitHttpBackend(
+  projectRoot: string,
+  home: string,
+  extraEnv:
+    | Record<string, string | undefined>
+    | ((request: Request) => Record<string, string | undefined>) = {},
+): NativeGitHttpBackend {
   const children = new Set<ChildProcess>();
   const handler = async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
     const body = request.method === "POST" ? Buffer.from(await request.arrayBuffer()) : undefined;
     const gitProtocol = request.headers.get("git-protocol");
-    const env: Record<string, string> = {
+    const env: Record<string, string | undefined> = {
       ...nativeGitEnv(home),
       GIT_PROJECT_ROOT: projectRoot,
       GIT_HTTP_EXPORT_ALL: "1",
       REQUEST_METHOD: request.method,
-      PATH_INFO: url.pathname,
+      PATH_INFO: decodeURIComponent(url.pathname),
       QUERY_STRING: url.search.replace(/^\?/, ""),
       CONTENT_TYPE: request.headers.get("content-type") ?? "",
       REMOTE_ADDR: "127.0.0.1",
+      ...(typeof extraEnv === "function" ? extraEnv(request) : extraEnv),
     };
     if (body) env.CONTENT_LENGTH = String(body.length);
     if (gitProtocol) env.GIT_PROTOCOL = gitProtocol;
-    const child = spawn("git", ["http-backend"], { env });
+    const encoding = request.headers.get("content-encoding");
+    if (encoding) env.HTTP_CONTENT_ENCODING = encoding;
+    for (const [key, value] of Object.entries(env)) if (value === undefined) delete env[key];
+    const child = spawn("git", ["http-backend"], { env: env as Record<string, string> });
     children.add(child);
     child.on("close", () => children.delete(child));
     child.stderr.resume();

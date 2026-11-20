@@ -202,6 +202,7 @@ export async function beginFilesQuarantine(
 
   return {
     objects: view,
+    path: dir,
     packs: {
       install: async (source, o) => {
         checkOpen();

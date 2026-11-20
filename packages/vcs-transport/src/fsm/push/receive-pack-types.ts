@@ -38,12 +38,27 @@ export interface ReceivePackHookContext {
   /** The repository path of the HTTP request */
   readonly repoPath?: string;
   /**
+   * The authenticated user of an HTTP push (git's http-backend `REMOTE_USER`, which its
+   * hooks inherit), if the server knows one
+   */
+  readonly remoteUser?: string;
+  /** The client's address of an HTTP push (http-backend's `REMOTE_ADDR`), if known */
+  readonly remoteAddr?: string;
+  /**
    * The repository as the push sees it, as git gives hooks `GIT_QUARANTINE_PATH` and the
    * quarantine as an alternate object directory: from the import of the pack until its objects
    * are published (pre-receive, update), it reads the quarantined objects, then the
    * repository's; otherwise (authorize, post-receive) it is the repository itself.
    */
   readonly repository: RepositoryFacade;
+  /**
+   * The quarantine directory of the push in the repository's storage (`RepositoryQuarantine.path`)
+   * while its objects are quarantined (pre-receive; update too unless the objects are published
+   * before it, as git's receive-pack does), undefined otherwise or where the repository keeps
+   * no quarantine in files. git hands it to the pre-receive hook as `GIT_QUARANTINE_PATH`, its
+   * `GIT_OBJECT_DIRECTORY`, with the repository's objects as an alternate.
+   */
+  readonly quarantinePath?: string;
   /**
    * Shows `text` to the pushing user (side-band channel 2, as git relays a hook's output;
    * nothing without side-band).
@@ -191,9 +206,14 @@ export interface ReceivePackConfig {
    * `newOid` (git's `update_worktree`: refused while it has unstaged or staged changes, else
    * `read-tree -u -m`), run after the update hook and before the ref is updated. Resolves to
    * the refusal reason ("Working directory has unstaged changes"), undefined when done.
-   * Absent: such an update is refused.
+   * Absent: such an update is refused. `context` is the push's hook context (the variables
+   * git's push-to-checkout hook inherits: `REMOTE_USER`, ...).
    */
-  updateWorktree?: (ref: string, newOid: string) => Promise<string | undefined>;
+  updateWorktree?: (
+    ref: string,
+    newOid: string,
+    context?: ReceivePackHookContext,
+  ) => Promise<string | undefined>;
   /**
    * Accept pushes from a shallow client whose history ends at its shallow commits (git's
    * `receive.shallowUpdate`, default false: "shallow update not allowed"). Needs the facade's
@@ -217,6 +237,10 @@ export interface ReceivePackConfig {
   request?: ReceivePackRequestInfo;
   /** The repository path (for the hooks) */
   repoPath?: string;
+  /** The authenticated user of an HTTP push (for the hooks: `REMOTE_USER`) */
+  remoteUser?: string;
+  /** The client's address of an HTTP push (for the hooks: `REMOTE_ADDR`) */
+  remoteAddr?: string;
   /** Logs hook failures that cannot reach the client */
   logger?: ReceivePackLogger;
 
@@ -270,4 +294,11 @@ export interface ReceivePackConfig {
    * in the repository. Default false: published only when a ref is updated.
    */
   publishBeforeUpdate?: boolean;
+  /**
+   * pre-receive is given every command of the push, those already refused (a hidden ref, missing
+   * objects) included, and runs even when all are refused, as git's receive-pack runs it
+   * (`run_receive_hook` with `skip_broken` 0). Default false: only the open commands, and no
+   * pre-receive when none is open.
+   */
+  preReceiveSeesRefused?: boolean;
 }

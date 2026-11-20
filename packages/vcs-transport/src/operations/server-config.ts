@@ -61,6 +61,32 @@ function configBool(value: unknown, fallback: boolean): boolean {
   return Number.isFinite(n) ? n !== 0 : fallback;
 }
 
+/**
+ * git's `git_config_bool` for the last value of `key` (a key without a value is true, an
+ * empty value false), or undefined when the configuration does not set it (or sets no
+ * boolean): `daemon.<service>`, `http.receivepack`, `http.getanyfile`.
+ *
+ * @example
+ * ```typescript
+ * configBoolOf(config, "http.receivepack"); // [http] receivepack → true; unset → undefined
+ * ```
+ */
+export function configBoolOf(
+  config: ServerConfigReader | undefined,
+  key: string,
+): boolean | undefined {
+  const values = config?.getAll(key) ?? [];
+  if (values.length === 0) return undefined;
+  const value = values[values.length - 1];
+  if (value === null || value === true || value === undefined) return true;
+  if (value === false) return false;
+  const text = String(value).trim().toLowerCase();
+  if (["true", "yes", "on"].includes(text)) return true;
+  if (["false", "no", "off", ""].includes(text)) return false;
+  const n = Number(text);
+  return Number.isFinite(n) ? n !== 0 : undefined;
+}
+
 /** receive-pack.c's `parse_deny_action`. */
 function denyAction(values: unknown[]): ReceiveDenyAction {
   if (values.length === 0) return "unconfigured";

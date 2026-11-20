@@ -817,7 +817,32 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       ...(this.options.environment ? { environment: this.options.environment } : {}),
       gitDirPath: this.paths.hostPath(this.commonDir),
     });
-    return { history: this.history, config, worktrees: this };
+    // the bare repository's own directory, for local remotes and hooks (never a work tree)
+    const place = createFileWorktree({
+      files: this.files,
+      rootPath: this.commonDir,
+      gitDir: this.commonDir,
+      blobs: this.history.blobs,
+      trees: this.history.trees,
+      ...(this.options.environment ? { environment: this.options.environment } : {}),
+    });
+    const readFetchHead = async () => {
+      const content = await readIfFile(this.files, `${this.commonDir}/FETCH_HEAD`);
+      return content === undefined ? undefined : new TextDecoder().decode(content);
+    };
+    const bareRepository: NonNullable<WorktreeAdmin["bareRepository"]> = {
+      getRoot: () => place.getRoot(),
+      getGitDir: () => place.getGitDir?.(),
+      getFiles: () => place.getFiles?.() as FilesApi,
+      openRepository: (location) => place.openRepository?.(location) ?? Promise.resolve(undefined),
+      readFetchHead: () => readFetchHead(),
+      writeFetchHead: async (content, options) => {
+        const path = `${this.commonDir}/FETCH_HEAD`;
+        const before = options?.append ? ((await readFetchHead()) ?? "") : "";
+        await this.files.write(path, [new TextEncoder().encode(`${before}${content}`)]);
+      },
+    };
+    return { history: this.history, config, worktrees: this, bareRepository };
   }
 
   async updateHead(

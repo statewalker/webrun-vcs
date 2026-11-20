@@ -29,6 +29,7 @@ import { withRemoteUploadPack } from "./remote-transport.js";
 import { SparseCheckoutCommand } from "./sparse-checkout-command.js";
 import { SparseUnpack } from "./sparse-checkout-support.js";
 import { checkoutFreshTree } from "./tree-restore.js";
+import { repositoryPlaceOf } from "./worktree-support.js";
 
 /** Names the clone's checkout in failure messages. */
 const CLONE = "clone";
@@ -446,7 +447,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     // before anything is written (git's "does not appear to be a git repository" leaves no
     // clone behind)
     const uri = this.uri;
-    const worktree = this.workingCopy.worktree as Worktree | undefined;
+    // a bare repository's working copy opens it from its git directory
+    const worktree = repositoryPlaceOf(this.workingCopy);
     const isRepositoryPath = await worktree
       ?.openRepository?.(uri)
       .then((opened) => opened !== undefined)
@@ -710,7 +712,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
    */
   private async refuseNonEmptyDestination(source: OpenedRepository | undefined): Promise<void> {
     const refuse = () => {
-      const root = this.worktreeAccess?.getRoot?.() ?? "";
+      const root = repositoryPlaceOf(this._workingCopy)?.getRoot?.() ?? "";
       const name = this.directory ?? (root.replace(/\/+$/, "").split("/").pop() || ".");
       return new CloneDestinationError(
         `fatal: destination path '${name}' already exists and is not an empty directory.`,
@@ -721,7 +723,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       if (!isSymbolicRef(ref)) throw refuse();
     }
     if (await this.refsStore.resolve("HEAD").catch(() => undefined)) throw refuse();
-    const staging = this._workingCopy.checkout?.staging;
+    // a bare repository's working copy has no index (nor checkout to ask)
+    const staging =
+      "checkout" in this._workingCopy ? this._workingCopy.checkout?.staging : undefined;
     if (staging) {
       for await (const _entry of staging.entries()) throw refuse();
     }
@@ -888,7 +892,10 @@ export class CloneCommand extends TransportCommand<CloneResult> {
  * after the directory clone runs in (the worktree top, as the host sees it when the storage
  * has a root directory), without resolving `..` (git writes `/top/../src`).
  */
-function absolutePathOf(worktree: Worktree | undefined, path: string): string {
+function absolutePathOf(
+  worktree: Pick<Worktree, "getRoot" | "getFiles"> | undefined,
+  path: string,
+): string {
   if (path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path)) return path;
   const top = worktree?.getRoot() ?? "";
   const files = worktree?.getFiles?.() as { rootDirectory?: string } | undefined;
