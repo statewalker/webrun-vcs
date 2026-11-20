@@ -1,0 +1,121 @@
+---
+import CodeBlock from "@/components/code-block.astro";
+import Docs from "@/layouts/docs.astro";
+import { conceptHref } from "@/lib/concepts";
+import { docHref } from "@/lib/docs";
+
+const refs = `await history.refs.setSymbolic("HEAD", "refs/heads/main"); // HEAD names a branch
+const head = await history.refs.resolve("HEAD");                // follows it: { name, objectId }
+
+// several refs at once: every command or none, each checked against the value it expects
+const r = await history.refs.batch([
+  { name: "refs/heads/main", old: oldMain, new: newMain },
+  { name: "refs/tags/v1", old: null, new: tagId },   // must not exist yet
+]);
+if (!r.ok) console.log(r.rejected); // [{ name, reason: "mismatch" | "invalid-name" | ... }]`;
+
+const merge = `import { FastForwardMode, MergeStatus } from "@statewalker/vcs-commands/results";
+
+await git.checkout().setName("feature").setCreateBranch(true).call(); // git checkout -b feature
+// ... commit on feature, switch back to main, commit there ...
+const result = await git.merge().include("feature").call();
+if (result.status === MergeStatus.CONFLICTING) console.log(result.conflicts);
+
+await git.merge().include("feature").setFastForwardMode(FastForwardMode.NO_FF).call(); // always a merge commit`;
+
+const graph = `      A ── B ── D        main      D: "Add a second idea"
+            \\    \\
+             C ── M     merge     M: parents D and C, tree = merge(base B, ours D, theirs C)
+           feature`;
+---
+
+<Docs title="Branches, refs and merging" description="Refs and symbolic refs, HEAD, atomic ref updates and reflogs, checkout, and fast-forward and three-way merges in StateWalker VCS.">
+  <p class="text-sm text-muted-foreground"><a href="/docs/concepts">Concepts</a> · run it: <a href="/examples/branching-merging">Branching &amp; merging example</a></p>
+  <h1>Branches, refs and merging</h1>
+  <p>
+    <a href={conceptHref("object-model")}>Objects</a> never change, so a branch cannot be an object.
+    It is a <strong>ref</strong>: a name that points at a commit id and moves when you commit. The
+    <a href="/examples/branching-merging">branching &amp; merging example</a> creates a branch,
+    lets two lines of history diverge and merges them in your tab.
+  </p>
+
+  <h2 id="refs">A ref is a name for an id; HEAD is a ref to a ref</h2>
+  <p>
+    Branches live under <code>refs/heads/</code>, tags under <code>refs/tags/</code>, what was
+    fetched from a remote under <code>refs/remotes/&lt;remote&gt;/</code>. A <strong>symbolic
+    ref</strong> points at another ref instead of an id: <code>HEAD</code> normally names the
+    current branch (<code>refs/heads/main</code>), so committing moves that branch. A detached HEAD
+    holds an id directly.
+  </p>
+  <CodeBlock code={refs} lang="ts" title="refs in vcs-core" />
+  <p>
+    Names are checked as git checks them: <code>isValidRefName</code> gives the verdict of
+    <code>git check-ref-format</code>, and every store refuses a direct value that is not a full
+    lowercase hex id. A symbolic ref is written with <code>setSymbolic</code>, never as a value.
+  </p>
+
+  <h2 id="ref-updates">Ref updates are atomic, and logged</h2>
+  <p>
+    <code>refs.batch</code> applies every command or none, checked as
+    <code>git update-ref --stdin</code> checks it: each <code>old</code> must match, a ref may appear
+    once, and <code>refs/a</code> and <code>refs/a/b</code> cannot both exist.
+    <code>compareAndSwap</code> is a one-command batch, which is what makes concurrent writers safe:
+    a commit moves the branch only if nobody moved it since. Batches keep reflogs as git does with
+    <code>core.logAllRefUpdates=true</code>. The memory, SQL, KV and git-files stores all apply
+    batches atomically, each its own way (one transaction, one compare-and-swap, git's lock files);
+    see <a href={conceptHref("storage", "backends")}>storage backends</a>.
+  </p>
+
+  <h2 id="checkout">Checkout moves HEAD and rewrites the worktree</h2>
+  <p>
+    Refs are history; the files you edit are not. <code>git.checkout()</code> and
+    <code>git.switch()</code> (in <code>vcs-commands</code>) point HEAD at another branch and update
+    the index and the files of <code>vcs-working-tree</code> to that branch's tree, refusing, with
+    git's messages, where that would lose local changes. That is why the example's
+    <code>feature.md</code> disappears when it switches back to <code>main</code>: the file is in
+    the feature branch's tree, not in main's. The
+    <a href="/docs/architecture">architecture</a> page explains why history, checkout and worktree
+    are separate parts.
+  </p>
+
+  <h2 id="merge">A merge joins two lines of history</h2>
+  <p>
+    <code>git.merge()</code> first finds the <strong>merge base</strong>, the best common ancestor
+    of the two commits (<code>commits.findMergeBase</code>, as <code>git merge-base --all</code>).
+    Then:
+  </p>
+  <ul>
+    <li><strong>Already up to date</strong>: the other commit is an ancestor of ours; nothing to do.</li>
+    <li><strong>Fast-forward</strong>: ours is an ancestor of theirs; the branch simply moves to their
+      commit, and no commit is created. <code>FastForwardMode.NO_FF</code> refuses this and always
+      makes a merge commit; <code>FF_ONLY</code> refuses anything else.</li>
+    <li><strong>Three-way merge</strong>: the lines diverged. Each path is compared in three trees,
+      base, ours and theirs: a path changed on one side only takes that side's version; a path
+      changed on both sides gets a line-level content merge, and conflicts where the changes overlap.</li>
+  </ul>
+  <CodeBlock code={graph} lang="text" title="the example's history" />
+  <p>
+    The three-way merge is a port of git's <strong>merge-ort</strong>, with its rename detection;
+    when there are several merge bases, they are merged first into a virtual base, as git does. A
+    clean result is a merge commit with two parents. A conflicting one leaves git's conflict markers
+    in the files, the three versions staged at index stages 1 to 3, and git's state files
+    (<code>MERGE_HEAD</code>, <code>MERGE_MSG</code>, <code>ORIG_HEAD</code>), so native git can
+    continue or abort a merge this code started, and the other way round. The same machinery runs
+    cherry-pick, revert, rebase and stash apply.
+  </p>
+  <CodeBlock code={merge} lang="ts" title="merge in vcs-commands" />
+  <p>
+    <code>result.status</code> is a <code>MergeStatus</code>: <code>FAST_FORWARD</code>,
+    <code>ALREADY_UP_TO_DATE</code>, <code>MERGED</code>, <code>CONFLICTING</code>,
+    <code>FAILED</code> (refused before anything was written, git's error in
+    <code>message</code>) and the squash and no-commit variants. Strategies <code>ours</code>,
+    <code>resolve</code> and octopus are there too; <code>theirs</code> is refused, as git refuses it.
+  </p>
+
+  <h2 id="next">Where to go next</h2>
+  <ul>
+    <li><a href={conceptHref("transport")}>The transport</a>: how refs and objects move between repositories.</li>
+    <li>The <a href={docHref("packages/vcs-commands/README.md")}>vcs-commands reference</a>: branches, checkout, merge, rebase, cherry-pick.</li>
+    <li>The <a href={docHref("packages/vcs-core/README.md")}>vcs-core reference</a>: refs, batches and reflogs in detail.</li>
+  </ul>
+</Docs>

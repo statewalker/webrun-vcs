@@ -1,11 +1,11 @@
 ---
-import CodeBlock from "@/components/CodeBlock.astro";
-import Icon from "@/components/Icon.astro";
-import LayerDiagram from "@/components/LayerDiagram.astro";
-import Badge from "@/components/ui/Badge.astro";
-import Button from "@/components/ui/Button.astro";
-import Card from "@/components/ui/Card.astro";
-import Base from "@/layouts/Base.astro";
+import CodeBlock from "@/components/code-block.astro";
+import Icon from "@/components/icon.astro";
+import LayerDiagram from "@/components/layer-diagram.astro";
+import Badge from "@/components/ui/badge.astro";
+import Button from "@/components/ui/button.astro";
+import Card from "@/components/ui/card.astro";
+import Base from "@/layouts/base.astro";
 import { examples } from "@/lib/examples";
 import { REPO, repoTree } from "@/lib/site";
 
@@ -159,7 +159,10 @@ const useCases = [
           A server that only stores and serves repositories needs the core, a store and the
           transport. A web editor adds the working tree and the commands.
         </p>
-        <Button href="/docs/architecture" variant="outline">Read the architecture <Icon name="arrowRight" /></Button>
+        <div class="flex flex-wrap gap-3">
+          <Button href="/docs/architecture" variant="outline">Read the architecture <Icon name="arrowRight" /></Button>
+          <Button href="/docs/concepts" variant="outline">Learn the concepts <Icon name="arrowRight" /></Button>
+        </div>
       </div>
       <LayerDiagram />
     </div>

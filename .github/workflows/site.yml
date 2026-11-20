@@ -72,6 +72,9 @@ jobs:
         run: pnpm --filter "@statewalker/vcs-site^..." run build
       - name: Build
         run: pnpm --filter @statewalker/vcs-site build
+      # Every internal href/src of the built pages resolves, #fragments included.
+      - name: Internal links
+        run: pnpm --filter @statewalker/vcs-site check:links
       # Every live example and the playground, run in Chromium as a visitor runs them.
       - run: bash ${{ github.workspace }}/.github/scripts/install-chromium.sh pnpm --filter @statewalker/vcs-site exec playwright
       - name: Live examples

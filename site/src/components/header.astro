@@ -1,16 +1,17 @@
 ---
 import { REPO } from "@/lib/site";
 import core from "../../../packages/vcs-core/package.json";
-import Icon from "./Icon.astro";
-import Logo from "./Logo.astro";
-import ThemeToggle from "./ThemeToggle.astro";
-import Badge from "./ui/Badge.astro";
+import Icon from "./icon.astro";
+import Logo from "./logo.astro";
+import ThemeToggle from "./theme-toggle.astro";
+import Badge from "./ui/badge.astro";
 
 // Built pages are directories ("/docs/"), so compare without the trailing slash.
 const path = Astro.url.pathname.replace(/\/+$/, "") || "/";
 const nav = [
   { href: "/docs", label: "Docs" },
   { href: "/docs/architecture", label: "Architecture" },
+  { href: "/docs/concepts", label: "Concepts" },
   { href: "/examples", label: "Live examples" },
   { href: "/examples/playground", label: "Playground" },
   { href: "/docs/examples", label: "Apps & demos" },

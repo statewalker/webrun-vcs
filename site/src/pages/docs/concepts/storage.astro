@@ -1,0 +1,110 @@
+---
+import CodeBlock from "@/components/code-block.astro";
+import Docs from "@/layouts/docs.astro";
+import { conceptHref } from "@/lib/concepts";
+import { docHref } from "@/lib/docs";
+
+const stack = `History / HistoryWithOperations     typed objects + refs
+  ├─ blobs, trees, commits, tags   parsed objects
+  └─ refs                          get / resolve / set / setSymbolic / batch
+        │
+GitObjects                          "<type> <size>\\0<content>", SHA-1, zlib
+        │
+StagingBlobStore                    bytes by an id known only after the last byte
+        │
+RawStorage                          bytes by key: memory, compressed, chunked, KV, SQL…`;
+
+const backends = `import { createMemoryHistory } from "@statewalker/vcs-core";
+import { createGitFilesBackend } from "@statewalker/vcs-store-files";
+
+const memory = createMemoryHistory();                                           // tests, ephemeral repos
+const { history } = await createGitFilesBackend({ files, gitDir: ".git", create: true }); // git's own layout`;
+
+const layout = `.git/
+  HEAD                         ref: refs/heads/main
+  config
+  objects/ce/013625…           loose objects (zlib of "type size\\0content")
+  objects/pack/pack-<id>.pack  packs, with their .idx
+  refs/heads/main              loose refs (one id per file)
+  refs/tags/v1.0
+  packed-refs                  many refs in one file
+  logs/HEAD, logs/refs/…       reflogs
+  index                        the staging area (binary index file)
+  MERGE_HEAD, rebase-merge/…   state of an operation in progress`;
+---
+
+<Docs title="Storage and the .git layout" description="How StateWalker VCS stores objects and refs: a stack of small interfaces, several backends, and a .git directory written through a FilesApi that native git can open.">
+  <p class="text-sm text-muted-foreground"><a href="/docs/concepts">Concepts</a> · run it: <a href="/examples/git-directory">.git directory example</a></p>
+  <h1>Storage and the .git layout</h1>
+  <p>
+    The repository logic does not know where bytes go. It talks to a <code>History</code>, and a
+    backend decides whether objects end up in memory, in a <code>.git</code> directory, in SQL rows
+    or in a key-value store. The <a href="/examples/git-directory">.git directory example</a> writes a
+    real <code>.git</code> into an in-memory filesystem in your tab and hands it to you as a zip
+    that native git opens.
+  </p>
+
+  <h2 id="stack">Storage is a stack of small interfaces</h2>
+  <CodeBlock code={stack} lang="text" title="from typed objects down to bytes" />
+  <p>
+    Each typed store delegates to the <code>GitObjects</code> kernel, which owns the
+    <a href={conceptHref("object-model", "loose-format")}>object format and the ids</a>. Below it a
+    <code>StagingBlobStore</code> stores bytes under an id known only after the last byte (git writes
+    <code>objects/tmp_obj_*</code> and renames it), and <code>rawStorageStaging()</code> adapts any
+    <code>RawStorage</code>, which stores bytes by key and knows nothing about git. A new backend can
+    stop there: <code>createHistoryFromComponents</code> builds a full <code>History</code> from a raw
+    store and a ref store. Packs, deltas and serialization are shared, so every backend gets them.
+  </p>
+
+  <h2 id="backends">One History, several backends</h2>
+  <CodeBlock code={backends} lang="ts" title="choosing where the bytes go" />
+  <ul>
+    <li><a href={docHref("packages/vcs-store-mem/README.md")}><code>vcs-store-mem</code></a> and
+      <code>createMemoryHistory()</code> in vcs-core: memory, for tests and short-lived repositories.</li>
+    <li><a href={docHref("packages/vcs-store-files/README.md")}><code>vcs-store-files</code></a>: git's
+      own <code>.git</code> layout, byte for byte, through a <code>FilesApi</code> (below).</li>
+    <li><a href={docHref("packages/vcs-store-sql/README.md")}><code>vcs-store-sql</code></a>: rows and
+      columns. It rebuilds commits and tags from the columns it models, so a commit with extra headers
+      (a <code>mergetag</code>, a <code>gpgsig-sha256</code>) loses them when parsed and gets a different id than in Git.</li>
+    <li><a href={docHref("packages/vcs-store-kv/README.md")}><code>vcs-store-kv</code></a>: any key-value
+      store, with git-compatible SHA-1 ids; long values are chunked.</li>
+  </ul>
+  <p>
+    Every backend applies <a href={conceptHref("branches-and-merging", "ref-updates")}>ref batches</a>
+    atomically, and every one uses git's SHA-1 ids, so objects move between them, and over
+    <a href={conceptHref("transport")}>the transport</a>, without changing ids.
+  </p>
+
+  <h2 id="files-api">Files go through a FilesApi</h2>
+  <p>
+    <code>vcs-store-files</code> never imports <code>node:fs</code>. It reads and writes through a
+    <code>FilesApi</code> (<code>@statewalker/webrun-files</code>): the Node filesystem
+    (<code>createNodeFilesApi</code> from <code>@statewalker/vcs-utils-node/files</code>), memory
+    (<code>MemFilesApi</code>, the one the example uses), OPFS, S3 or SQLite. The same code that
+    opens a repository on disk opens one in a browser tab.
+  </p>
+
+  <h2 id="git-layout">The .git directory is the one git writes</h2>
+  <CodeBlock code={layout} lang="text" title="what vcs-store-files reads and writes" />
+  <p>
+    A repository written by <code>vcs-store-files</code> is one <code>git log</code>,
+    <code>git status</code> and <code>git fsck</code> work on, and it reads what <code>git init</code>,
+    <code>git commit</code>, <code>git pack-refs</code> and <code>git repack</code> produce. Reads try
+    the <a href={conceptHref("object-model", "packs")}>packs</a> first, then loose objects, as git
+    does; new objects are always written loose, and <code>repack()</code> turns them into a pack, as
+    <code>git gc</code> does. Ref updates take git's <code>.lock</code> files and rename, so this code
+    and native git can share one repository.
+  </p>
+  <p>
+    Known limits: <code>.git/config</code> includes (<code>[include]</code>, <code>[includeIf]</code>)
+    are not followed; ref locks are exclusive across processes only when the FilesApi has
+    <code>createExclusive</code>; deltas exist only in packs, so
+    <code>history.delta.blobs.deltifyBlob()</code> throws on a git-files history.
+  </p>
+
+  <h2 id="next">Where to go next</h2>
+  <ul>
+    <li>The <a href={docHref("packages/vcs-store-files/README.md")}>vcs-store-files reference</a>: the storage stack, repack, gc, compatibility limits and errors.</li>
+    <li><a href="/docs/architecture">Architecture</a>: where storage sits among the packages.</li>
+  </ul>
+</Docs>

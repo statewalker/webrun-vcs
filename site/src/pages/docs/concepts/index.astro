@@ -1,0 +1,30 @@
+---
+import Docs from "@/layouts/docs.astro";
+import { conceptHref, conceptPages } from "@/lib/concepts";
+import { examples } from "@/lib/examples";
+
+const examplesOf = (slug: string) =>
+  examples.filter((e) => e.concepts.some((c) => c.href.startsWith(conceptHref(slug))));
+---
+
+<Docs title="Concepts" description="The ideas behind the live examples: git's object model, refs and merging, storage and the .git layout, and the wire protocol, as StateWalker VCS implements them.">
+  <h1>Concepts</h1>
+  <p>
+    Each <a href="/examples">live example</a> runs one idea of git in your tab. These pages explain
+    those ideas as this code implements them, and link back to the example that shows each one. For
+    the package structure, read <a href="/docs/architecture">Architecture</a>; for every API and
+    error message, the package references in the sidebar.
+  </p>
+  <ul>
+    {conceptPages.map((page) => (
+      <li>
+        <a href={conceptHref(page.slug)}>{page.label}</a>: {page.summary}
+        {examplesOf(page.slug).length > 0 && (
+          <> Shown by {examplesOf(page.slug).map((e, i) => (
+            <>{i > 0 && ", "}<a href={`/examples/${e.name}`}>{e.label}</a></>
+          ))}.</>
+        )}
+      </li>
+    ))}
+  </ul>
+</Docs>

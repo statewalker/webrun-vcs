@@ -1,0 +1,123 @@
+---
+import CodeBlock from "@/components/code-block.astro";
+import Docs from "@/layouts/docs.astro";
+import { conceptHref } from "@/lib/concepts";
+import { docHref } from "@/lib/docs";
+
+const fetchFlow = `client (fetch)                               server (git-upload-pack)
+                                  ◄──────  ref advertisement: <id> <ref>, capabilities
+  want <id> (what I lack)         ──────►
+  have <id> (what I already have) ──────►
+                                  ◄──────  ACK <id> (common) / NAK
+  done                            ──────►
+                                  ◄──────  pack (side-band: data, progress, errors)`;
+
+const pushFlow = `client (push)                                server (git-receive-pack)
+                                  ◄──────  ref advertisement
+  <old-id> <new-id> <ref>         ──────►  one command per ref
+  pack (objects the server lacks) ──────►
+                                  ◄──────  report-status: ok <ref> / ng <ref> <reason>`;
+
+const layers = `HTTP operations: fetch · push · lsRemote          Duplex operations: fetchOverDuplex ·
+                                                   pushOverDuplex · serveOverDuplex · p2pSync
+                         \\                        /
+              Fsm (transition tables + handlers): upload-pack, receive-pack, protocol v2
+                                       │
+              TransportApi: pkt-lines, side-band, pack streams
+                                       │
+              Duplex: async-iterable bytes + write (HTTP body, MessagePort, WebRTC…)`;
+
+const facade = `import { createRepositoryFacade, createTransportRefStore } from "@statewalker/vcs-transport";
+
+// the transport sees a repository only through these two
+const repository = createRepositoryFacade({ history }); // pack import/export, has, ancestry
+const refStore = createTransportRefStore(history.refs);`;
+---
+
+<Docs title="The transport" description="How StateWalker VCS moves objects and refs: git's wire protocol v1 and v2, upload-pack and receive-pack as state machines, and one implementation over HTTP and any duplex stream.">
+  <p class="text-sm text-muted-foreground"><a href="/docs/concepts">Concepts</a> · run it: <a href="/examples/fetch-push">Fetch &amp; push example</a></p>
+  <h1>The transport</h1>
+  <p>
+    <code>vcs-transport</code> speaks git's own wire protocol, so it can fetch from and push to a git
+    server, and serve one. It does not need a <code>git</code> binary or a socket: the same code runs
+    over an HTTP <code>fetch</code>, a <code>MessagePort</code> between tabs or workers, or a WebRTC
+    data channel. The <a href="/examples/fetch-push">fetch &amp; push example</a> runs both directions
+    between two repositories in your tab, over a <code>MessageChannel</code>.
+  </p>
+
+  <h2 id="services">Two services: upload-pack and receive-pack</h2>
+  <p>
+    Git has two server roles. <strong>git-upload-pack</strong> sends objects: a fetch or clone talks
+    to it. <strong>git-receive-pack</strong> takes objects and ref updates: a push talks to it. Both
+    start the same way, with the server <strong>advertising</strong> its refs (<code>&lt;id&gt;
+    &lt;ref name&gt;</code> lines) and its capabilities (<code>side-band-64k</code>,
+    <code>ofs-delta</code>, <code>multi_ack_detailed</code>, <code>report-status</code>, …). Every
+    message is a <strong>pkt-line</strong>: four hex digits of length, then the payload, at most
+    65520 bytes; <code>0000</code> is a flush.
+  </p>
+
+  <h2 id="upload-pack">A fetch negotiates, then receives one pack</h2>
+  <CodeBlock code={fetchFlow} lang="text" title="fetch, protocol v0/v1" />
+  <p>
+    The client sends <code>want</code> lines for the advertised ids it lacks and <code>have</code>
+    lines for commits it already has, newest first. The server answers <code>ACK</code> for haves it
+    has too: those are common, so neither they nor their ancestors need to be sent. When the client has
+    found enough common ground, or gives up, it sends <code>done</code> and the server streams one
+    <a href={conceptHref("object-model", "packs")}>pack</a> with exactly what is missing, usually a
+    thin pack whose deltas lean on objects the client already has.
+  </p>
+  <p id="negotiation">
+    The fetch client gives up as git does: in v0/v1 it counts haves "in vain" since the last newly
+    common commit; in v2 any <code>ACK</code> resets the count, and after the first <code>ACK</code>
+    the first request that adds 256 haves says <code>done</code>. A clone is a fetch into an empty
+    repository: there is nothing to have.
+  </p>
+
+  <h2 id="protocol-v2">Protocol v2 splits the conversation into commands</h2>
+  <p>
+    In protocol v2 the server advertises commands instead of refs, and the client asks for what it
+    needs: <code>ls-refs</code> lists refs (only the prefixes it asks for), <code>fetch</code> runs
+    the negotiation and sends the pack, and <code>object-info</code> answers object sizes. HTTP
+    <code>fetch</code> uses v2 when the server speaks it. Protocol v2 is fetch-only: a push always
+    runs the v1 receive-pack exchange.
+  </p>
+
+  <h2 id="receive-pack">A push sends commands and a pack, and gets a status per ref</h2>
+  <CodeBlock code={pushFlow} lang="text" title="push" />
+  <p>
+    Each command carries the old id the client saw, so a ref that moved since the advertisement is
+    refused (<code>ng &lt;ref&gt; failed to update ref</code>) instead of overwritten. Names must be
+    valid refs under <code>refs/</code>. The client refuses a non-fast-forward update unless the
+    refspec forces it (<code>+</code>), and the server refuses one when configured to, as git's
+    <code>receive.denyNonFastForwards</code>. An <code>atomic</code> push is one
+    <a href={conceptHref("branches-and-merging", "ref-updates")}>ref batch</a>: every ref changes or
+    none.
+  </p>
+
+  <h2 id="state-machines">Every server role is a state machine over a duplex</h2>
+  <CodeBlock code={layers} lang="text" title="the layers of vcs-transport" />
+  <p>
+    Each server role is a table of <code>[state, event, next state]</code> transitions and a map of
+    handlers that do one protocol step each. Stopping the machine at a state is how the stateless
+    smart-HTTP request/response pair maps onto one continuous conversation, and why the same machines
+    serve a <code>MessagePort</code>. The clients (git's fetch-pack and send-pack) are plain async
+    code over a connection. Storage stays outside: the transport sees a repository only through a
+    <code>RepositoryFacade</code> and a <code>RefStore</code>, which
+    <code>vcs-transport-adapters</code> builds from any <a href={conceptHref("storage", "backends")}>backend</a>.
+  </p>
+  <CodeBlock code={facade} lang="ts" title="connecting a History" />
+  <p>
+    Failures differ by layer: HTTP operations throw (<code>Failed to get refs: 404 Not Found</code>,
+    an <code>AuthenticationError</code> for 401/403); duplex operations return
+    <code>&#123; success: false, error &#125;</code>, which is why the example checks
+    <code>fetched.success</code> and <code>pushed.success</code>. From a browser, an HTTP server must
+    allow CORS.
+  </p>
+
+  <h2 id="next">Where to go next</h2>
+  <ul>
+    <li>The <a href={docHref("packages/vcs-transport/README.md")}>vcs-transport reference</a>: entry points, constraints and failure messages.</li>
+    <li><a href={docHref("packages/vcs-transport-httpeers/README.md")}>vcs-transport-httpeers</a>: git and LFS between the peers of an httpeers mesh.</li>
+    <li><a href="/docs/architecture">Architecture</a>: why one transport serves servers and peers.</li>
+  </ul>
+</Docs>

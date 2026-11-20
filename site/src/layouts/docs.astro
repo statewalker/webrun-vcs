@@ -1,7 +1,8 @@
 ---
+import { conceptHref, conceptPages } from "@/lib/concepts";
 import { guidePages, packagePages, pageHref, type RepoPage } from "@/lib/docs";
 import { examples } from "@/lib/examples";
-import Base from "./Base.astro";
+import Base from "./base.astro";
 
 interface Props {
   title: string;
@@ -23,6 +24,13 @@ const sections = [
       { href: "/docs/architecture", label: "Architecture" },
       { href: "/docs/examples", label: "Apps & demos" },
       ...guidePages.map(navItem),
+    ],
+  },
+  {
+    heading: "Concepts",
+    items: [
+      { href: "/docs/concepts", label: "Overview" },
+      ...conceptPages.map((c) => ({ href: conceptHref(c.slug), label: c.label })),
     ],
   },
   {

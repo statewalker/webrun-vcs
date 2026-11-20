@@ -10,6 +10,7 @@ pnpm install                                            # at the repository root
 pnpm --filter "@statewalker/vcs-site^..." run build     # the packages it imports (exports → dist/)
 pnpm --filter @statewalker/vcs-site dev                 # http://localhost:4321
 pnpm --filter @statewalker/vcs-site build               # static output in site/dist/
+pnpm --filter @statewalker/vcs-site check:links         # every internal link and #anchor of dist/ resolves
 pnpm --filter @statewalker/vcs-site check:examples      # runs every live example in Chromium
 ```
 
@@ -21,15 +22,17 @@ changing one (the README's "What will surprise you" applies here too).
 | path | purpose |
 | --- | --- |
 | `src/styles/global.css` | Design tokens (shadcn/ui variable contract), light + dark: cellb.dev's structure, a Git orange |
-| `src/components/ui/` | shadcn-style primitives as Astro components: Button, Badge, Card, Tabs |
-| `src/components/` | Header, Footer, Logo, ThemeToggle, Icon, CodeBlock (Shiki + copy), LayerDiagram (the packages as layers) |
-| `src/layouts/` | `Base` (theme bootstrap, header/footer) and `Docs` (sidebar) |
-| `src/pages/` | Home, `/docs` (getting started), `/docs/architecture`, `/docs/examples` (the repository's apps and demos), `/docs/[...slug]` (the repository's Markdown), `/examples` and `/examples/<name>` (live examples), `/examples/playground` |
+| `src/components/ui/` | shadcn-style primitives as Astro components: `button`, `badge`, `card`, `tabs` |
+| `src/components/` | `header`, `footer`, `logo`, `theme-toggle`, `icon`, `code-block` (Shiki + copy), `layer-diagram` (the packages as layers) |
+| `src/layouts/` | `base` (theme bootstrap, header/footer) and `docs` (sidebar) |
+| `src/pages/` | Home, `/docs` (getting started), `/docs/architecture`, `/docs/concepts/…` (what the examples show, explained), `/docs/examples` (the repository's apps and demos), `/docs/[...slug]` (the repository's Markdown), `/examples` and `/examples/<name>` (live examples), `/examples/playground` |
 | `src/examples/` | The live examples: one module per example (`export default async function (out: Output)`), and `runner.ts`, the pages' client that imports and runs them |
 | `src/playground/` | The playground: `repository.ts` (an in-memory working copy behind a few verbs) and `playground.ts` (the page) |
 | `src/lib/docs.ts` | Which repository Markdown files become which `/docs/…` pages (the packages' READMEs, `docs/example-applications.md`) |
-| `src/lib/examples.ts`, `src/lib/apps.ts` | The live examples' titles and notes; the repository's tutorials and demos |
+| `src/lib/examples.ts`, `src/lib/apps.ts` | The live examples' titles, notes and the concept sections each links to; the repository's tutorials and demos |
+| `src/lib/concepts.ts` | The concept pages, for the sidebar and the concepts index |
 | `scripts/check-examples.mjs` | Serves `dist/`, opens each example page in Chromium, presses Run and fails on a failed run or a page error; then drives the playground through a branch, two commits and a merge (run in `site.yml`) |
+| `scripts/check-links.mjs` | Walks `dist/` and fails on an internal `href`/`src` that resolves to no file (directories as `index.html`) or a `#fragment` with no matching `id` in its page (run in `site.yml`, before the examples) |
 | `scripts/compress.mjs` | After `astro build`: `dist/.site/config.json` (the host's options) and Brotli/gzip copies of text assets |
 | `scripts/setup-publish-secrets.sh` | Creates the publishing key and sets the repository's secrets (below) |
 
@@ -37,7 +40,7 @@ changing one (the README's "What will surprise you" applies here too).
 
 Each example is a module in `src/examples/`. Its page imports the module's text with `?raw` and
 shows it, and the Run button imports the same module, so the code a visitor reads is the code
-that runs. To add one: write the module, add it to `src/lib/examples.ts`, to the `modules` map in
+that runs. To add one: write the module, add it to `src/lib/examples.ts` (with the concept sections that explain it), to the `modules` map in
 `src/examples/runner.ts` and to `NAMES` in `scripts/check-examples.mjs`.
 
 | Example | Shows |

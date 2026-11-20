@@ -1,0 +1,125 @@
+---
+import CodeBlock from "@/components/code-block.astro";
+import Docs from "@/layouts/docs.astro";
+import { conceptHref } from "@/lib/concepts";
+import { docHref } from "@/lib/docs";
+
+const store = `import { createMemoryHistory, FileMode } from "@statewalker/vcs-core";
+
+const history = createMemoryHistory();
+await history.initialize();
+
+const blob = await history.blobs.store([new TextEncoder().encode("hello\\n")]);
+const tree = await history.trees.store([{ mode: FileMode.REGULAR_FILE, name: "hello.txt", id: blob }]);
+const who = { name: "Ada", email: "ada@example.com", timestamp: 1700000000, tzOffset: "+0000" };
+const commit = await history.commits.store({ tree, parents: [], author: who, committer: who, message: "Say hello\\n" });`;
+
+const loose = `"blob 6\\0hello\\n"                      the bytes that are hashed and stored
+SHA-1 of those bytes = ce013625030ba8dba906f756967f9e9ca394464a   (the id)
+zlib(those bytes)    → .git/objects/ce/013625030ba8dba906f756967f9e9ca394464a`;
+
+const layers = `History            blobs · trees · commits · tags · refs   (typed, parsed)
+  └─ GitObjects    "<type> <size>\\0<content>", SHA-1 over the whole, zlib
+       └─ store    bytes by id (loose files, packs, rows, keys…)`;
+---
+
+<Docs title="The object model" description="Git's four object types, the loose object format, why an object's id is the SHA-1 of its bytes, and how packs hold many objects with deltas, as StateWalker VCS implements them.">
+  <p class="text-sm text-muted-foreground"><a href="/docs/concepts">Concepts</a> · run it: <a href="/examples/object-model">Object model example</a></p>
+  <h1>The object model</h1>
+  <p>
+    A repository's history is a set of immutable objects, each named by a hash of its bytes.
+    <code>vcs-core</code> stores and reads them exactly as git does, so the ids it computes are the
+    ids git computes and the bytes it writes are bytes git can read. The
+    <a href="/examples/object-model">object model example</a> stores a blob, a tree and a commit in
+    your tab and checks each id against the bytes.
+  </p>
+
+  <h2 id="objects">Four kinds of object, linked by id</h2>
+  <ul>
+    <li><strong>blob</strong>: the content of one file, nothing else (no name, no mode).</li>
+    <li><strong>tree</strong>: a directory: entries of a mode, a name and an id. The modes are
+      <code>FileMode.TREE</code> (a subdirectory), <code>REGULAR_FILE</code>,
+      <code>EXECUTABLE_FILE</code>, <code>SYMLINK</code> and <code>GITLINK</code> (a submodule's commit).</li>
+    <li><strong>commit</strong>: a tree id, the parent commit ids (none for the first commit, two or
+      more for a merge), author, committer and a message.</li>
+    <li><strong>tag</strong>: an annotated tag: the id and type of the object it names, a tag name,
+      a tagger and a message.</li>
+  </ul>
+  <CodeBlock code={store} lang="ts" title="a blob, a tree, a commit" />
+  <p>
+    Because a commit names its tree and its parents by id, the id of the newest commit fixes the
+    whole history below it: change one byte of an old file and every id above it changes.
+    <code>history.blobs</code>, <code>trees</code>, <code>commits</code> and <code>tags</code> are
+    the typed stores; <code>load</code> returns <code>undefined</code> for a missing id, and for an
+    id that names an object of another type
+    (<a href={docHref("packages/vcs-core/README.md")}>vcs-core reference</a>).
+  </p>
+
+  <h2 id="loose-format">An object is "type size\0content", compressed with zlib</h2>
+  <p>
+    Every object is stored as one byte string: the type, a space, the content's length in decimal,
+    a NUL byte, then the content. That string, compressed with zlib, is a git loose object, the
+    file under <code>.git/objects/&lt;2 hex&gt;/&lt;38 hex&gt;</code>.
+  </p>
+  <CodeBlock code={loose} lang="text" title="a loose object" />
+  <p>
+    All the typed stores go through one kernel, <code>GitObjects</code>, which adds the header,
+    computes the id and compresses; it never parses commits or trees, so bytes git produced keep
+    their id even when they carry headers the commit parser does not model.
+  </p>
+  <CodeBlock code={layers} lang="text" title="where the format lives" />
+  <p>
+    The size comes first in the hashed bytes, so a write needs it before the content. When a caller
+    does not know it (a download of unknown length), the kernel keeps up to 1 MiB in memory and
+    spools anything longer to the store's temporary storage, then reads it again. Content always
+    flows as <code>AsyncIterable&lt;Uint8Array&gt;</code>, so a large file is never held whole.
+  </p>
+
+  <h2 id="ids">An id is the SHA-1 of those bytes</h2>
+  <p>
+    The id is the SHA-1 of the uncompressed header-and-content string, as 40 lowercase hex digits.
+    That is why <code>printf 'hello\n' | git hash-object --stdin</code> prints
+    <code>ce013625…</code> and why the example can check its work with nothing but the browser's
+    <code>DecompressionStream</code> and Web Crypto: inflate the stored bytes, hash them, compare
+    with the id. An object received with its id (<code>putRaw</code>) is refused unless its bytes
+    hash to that id.
+  </p>
+  <p>
+    Only SHA-1 is implemented. Asking for SHA-256 (<code>createVcsCore(deps, &#123; hash: "sha256" &#125;)</code>)
+    throws <code>sha256 not yet supported</code> instead of silently writing SHA-1 ids.
+  </p>
+
+  <h2 id="packs">Packs hold many objects, some as deltas</h2>
+  <p>
+    Loose objects are one file each. For transfer and for compact storage, git puts many objects in
+    one <strong>pack</strong>: a 12-byte header with the object count, the entries, and a SHA-1
+    trailer, with an <code>.idx</code> beside it to find an entry by id. An entry is a whole object
+    or a <strong>delta</strong> against another object: an OFS delta names its base by its offset in
+    the same pack, a REF delta by id.
+  </p>
+  <ul>
+    <li><code>listObjects</code> + <code>writePack</code> are git's <code>rev-list --objects</code> piped
+      into <code>pack-objects</code>: what the receiver lacks, streamed as a pack, reusing stored
+      entries and, optionally, searching for deltas in git's window.</li>
+    <li><code>importPack</code> keeps a received pack of 100 objects or more as a pack (git's
+      <code>transfer.unpackLimit</code>) and unpacks smaller ones into loose objects; stores without
+      packs (memory, KV, SQL) unpack everything.</li>
+    <li><code>installPack</code> is <code>git index-pack --stdin --fix-thin</code>: it completes a thin
+      pack from the repository's objects and writes an <code>.idx</code> byte-identical to git's.</li>
+    <li><code>openPackSet</code> reads a pack directory, validating every <code>.idx</code> and
+      skipping a corrupt pack instead of failing the repository.</li>
+  </ul>
+  <p>
+    Packs are how objects travel over <a href={conceptHref("transport", "upload-pack")}>the transport</a>,
+    and the <code>.git</code> backend reads them before loose objects
+    (<a href={conceptHref("storage", "git-layout")}>storage</a>). Not supported:
+    <code>multi-pack-index</code>, <code>.rev</code> and bitmap files.
+  </p>
+
+  <h2 id="next">Where to go next</h2>
+  <ul>
+    <li><a href={conceptHref("branches-and-merging")}>Branches, refs and merging</a>: names for commits, and how two lines of history join.</li>
+    <li><a href={conceptHref("storage")}>Storage and the .git layout</a>: where these bytes go.</li>
+    <li>The <a href={docHref("packages/vcs-core/README.md")}>vcs-core reference</a>: the kernel, packs, GC and the error messages.</li>
+  </ul>
+</Docs>
