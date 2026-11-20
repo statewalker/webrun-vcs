@@ -220,7 +220,7 @@ const GRAFT_FILE_ADVICE = [
 /** Trees the commands sharing reads keep (see `GitCommand.shareReadsOf`). */
 const SHARED_TREES = 1024;
 /** Bytes of blob content the commands sharing reads keep, and the largest blob kept */
-export const SHARED_BLOB_BYTES = 32 * 2 ** 20;
+export const SHARED_BLOB_BYTES = 64 * 2 ** 20;
 export const SHARED_BLOB_MAX = 2 ** 20;
 
 /** Blob contents kept for the commands sharing reads, most recently used last */
@@ -230,16 +230,20 @@ export interface SharedBlobs {
 }
 
 /**
- * `blobs` keeping the small blobs it reads in `shared` a while: `git log -p` reads a file's
- * version as the new side of one commit's diff and again as the old side of the next. The
- * bytes handed out are shared between the readers, never to be changed.
+ * `blobs` keeping the small blobs it reads in `shared` until they are read again: `git log -p`
+ * reads a file's version as the old side of one commit's diff and again as the new side of
+ * the next one down, then no more. The bytes handed out are shared between the readers,
+ * never to be changed.
  */
 export function sharingBlobs(blobs: Blobs, shared: SharedBlobs): Blobs {
   const open = async (id: ObjectId): Promise<BlobRead | undefined> => {
     const known = shared.recent.get(id);
     if (known) {
+      // the second read is mostly the last (newest first, a version is read as the old side
+      // of the change after it, then as the new side of its own): it leaves the cache, which
+      // so holds the versions still to come instead of the ones done with
       shared.recent.delete(id);
-      shared.recent.set(id, known);
+      shared.bytes -= known.length;
       return { size: known.length, bytes: known, content: single(known) };
     }
     const blob = await blobs.open?.(id);

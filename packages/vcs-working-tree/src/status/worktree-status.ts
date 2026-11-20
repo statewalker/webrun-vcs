@@ -356,6 +356,38 @@ export async function* withWorktreeEntries<T extends { path: string }>(
   yield* flush();
 }
 
+/**
+ * {@link withWorktreeEntries} a chunk at a time: the items of each chunk with the worktree
+ * entries of their paths (`current[i]` for `items[i]`: the file, null for none, undefined
+ * when `wanted` refused the item). One promise per chunk instead of one per item, so a
+ * caller settles the common case (an entry clean by its stat) in a plain loop.
+ */
+export async function* worktreeEntryChunks<T extends { path: string }>(
+  worktree: Worktree,
+  items: readonly T[],
+  wanted: (item: T) => boolean = () => true,
+): AsyncIterable<{ items: T[]; current: Array<WorktreeEntry | null | undefined> }> {
+  let start = 0;
+  while (start < items.length) {
+    const paths: string[] = [];
+    const asked: number[] = [];
+    let end = start;
+    while (end < items.length && paths.length < STAT_CHUNK && end - start < 4 * STAT_CHUNK) {
+      const item = items[end] as T;
+      if (wanted(item)) {
+        asked.push(end - start);
+        paths.push(item.path);
+      }
+      end++;
+    }
+    const found = paths.length > 0 ? await getWorktreeEntries(worktree, paths) : [];
+    const current = new Array<WorktreeEntry | null | undefined>(end - start);
+    for (let k = 0; k < asked.length; k++) current[asked[k] as number] = found[k] ?? null;
+    yield { items: items.slice(start, end), current };
+    start = end;
+  }
+}
+
 /** A file on disk the index does not track. */
 export interface UntrackedFile {
   /** The path; a nested repository's directory ends with `/`, as git shows it */

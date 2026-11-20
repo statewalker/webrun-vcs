@@ -40,9 +40,32 @@ describe("sharingBlobs", () => {
     // every reader gets the kept buffer, so the line tables diffs keep by buffer are shared
     const kept = shared.recent.get(id);
     for (const blob of opened) expect(blob?.bytes).toBe(kept);
-    // a later open is a hit
+    // a later open is a hit, which takes the blob out (its last read, in a log)
     expect((await cached.open?.(id))?.bytes).toBe(kept);
-    expect(shared.bytes).toBe(100);
+    expect(shared.recent.size).toBe(0);
+    expect(shared.bytes).toBe(0);
+  });
+
+  it("keeps a blob until its second read, then lets it go", async () => {
+    const shared: SharedBlobs = { recent: new OrderedMap(), bytes: 0 };
+    const sizes = new Map([
+      ["c".repeat(40), 10],
+      ["d".repeat(40), 20],
+    ]);
+    const { blobs, reads } = slowBlobs(sizes);
+    const cached = sharingBlobs(blobs, shared);
+    const c = "c".repeat(40) as ObjectId;
+    const d = "d".repeat(40) as ObjectId;
+    await cached.open?.(c);
+    await cached.open?.(d);
+    expect(shared.bytes).toBe(30);
+    await cached.open?.(c);
+    expect(reads()).toBe(2);
+    expect([...shared.recent.keys()]).toEqual([d]);
+    expect(shared.bytes).toBe(20);
+    // a third read of the same version reads it again
+    await cached.open?.(c);
+    expect(reads()).toBe(3);
   });
 
   it("stops evicting at an empty cache when the byte count drifted", async () => {

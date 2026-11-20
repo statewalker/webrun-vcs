@@ -221,3 +221,51 @@ export class EntriesAsRead {
 }
 
 const signature = (e: StagingEntry) => `${e.objectId}:${e.mode}:${e.size}:${ms(e.mtime)}`;
+
+/**
+ * A set of entry objects (by identity), filled from a whole index at once: `reset` keeps the
+ * list and the set is built only when first asked, so reading or writing a large index does
+ * not hash every entry when nothing asks (a write asks only for racily clean entries).
+ *
+ * @example
+ * ```typescript
+ * const asRead = new EntryIdentitySet();
+ * asRead.reset(entries); // after a read or a write: nothing built yet
+ * asRead.has(entries[0]); // true (the set is built now)
+ * ```
+ */
+export class EntryIdentitySet {
+  private base: readonly StagingEntry[] = [];
+  private set: Set<StagingEntry> | undefined = new Set();
+
+  /** Replaces the members with `entries` (a snapshot of the list). */
+  reset(entries: readonly StagingEntry[]): void {
+    this.base = entries.slice();
+    this.set = undefined;
+  }
+
+  private built(): Set<StagingEntry> {
+    if (!this.set) this.set = new Set(this.base);
+    return this.set;
+  }
+
+  has(entry: StagingEntry): boolean {
+    return this.built().has(entry);
+  }
+
+  add(entry: StagingEntry): void {
+    this.built().add(entry);
+  }
+
+  delete(entry: StagingEntry): boolean {
+    return this.built().delete(entry);
+  }
+
+  /** An independent set of the same members. */
+  copy(): EntryIdentitySet {
+    const out = new EntryIdentitySet();
+    out.base = this.base;
+    out.set = this.set ? new Set(this.set) : undefined;
+    return out;
+  }
+}

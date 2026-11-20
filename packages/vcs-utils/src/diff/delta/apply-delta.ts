@@ -71,6 +71,19 @@ export function applyGitDelta(
   return out;
 }
 
+/**
+ * Copies up to this many bytes go byte by byte: below it a loop is cheaper than the view
+ * `subarray` allocates for `set`.
+ */
+const SMALL_COPY = 64;
+
+/** The number of bits set in a 7-bit value. */
+function bitCount(v: number): number {
+  v = v - ((v >> 1) & 0x55);
+  v = (v & 0x33) + ((v >> 2) & 0x33);
+  return (v + (v >> 4)) & 0x0f;
+}
+
 /** Results above this size are checked by a first pass before they are allocated. */
 const CHECK_FIRST = 64 * 1024;
 
@@ -89,27 +102,29 @@ function runDelta(
   while (p < end) {
     const cmd = delta[p++] as number;
     if (cmd & 0x80) {
+      // offset bytes for bits 0-3, size bytes for bits 4-6 (little-endian); integer shifts,
+      // the offset's top byte multiplied so that it stays a positive 32-bit number
+      if ((cmd & 0x7f) !== 0 && p + bitCount(cmd & 0x7f) > end) {
+        throw new DeltaError(
+          p + bitCount(cmd & 0x0f) > end ? "copy offset truncated" : "copy size truncated",
+        );
+      }
       let off = 0;
       let size = 0;
-      for (let i = 0; i < 4; i++) {
-        if (cmd & (1 << i)) {
-          if (p >= end) throw new DeltaError("copy offset truncated");
-          off += (delta[p++] as number) * 2 ** (8 * i);
-        }
-      }
-      for (let i = 0; i < 3; i++) {
-        if (cmd & (0x10 << i)) {
-          if (p >= end) throw new DeltaError("copy size truncated");
-          size += (delta[p++] as number) << (8 * i);
-        }
-      }
+      if (cmd & 0x01) off = delta[p++] as number;
+      if (cmd & 0x02) off |= (delta[p++] as number) << 8;
+      if (cmd & 0x04) off |= (delta[p++] as number) << 16;
+      if (cmd & 0x08) off = (off >>> 0) + (delta[p++] as number) * 0x1000000;
+      if (cmd & 0x10) size = delta[p++] as number;
+      if (cmd & 0x20) size |= (delta[p++] as number) << 8;
+      if (cmd & 0x40) size |= (delta[p++] as number) << 16;
       if (size === 0) size = 0x10000;
       if (off + size > base.length) {
         throw new DeltaError(`copy [${off}, ${off + size}) beyond base of ${base.length}`);
       }
       if (o + size > resultSize) throw new DeltaError("delta result longer than declared");
       if (out) {
-        if (size <= 16) for (let k = 0; k < size; k++) out[o + k] = base[off + k] as number;
+        if (size <= SMALL_COPY) for (let k = 0; k < size; k++) out[o + k] = base[off + k] as number;
         else out.set(base.subarray(off, off + size), o);
       }
       o += size;
@@ -117,7 +132,7 @@ function runDelta(
       if (p + cmd > end) throw new DeltaError("insert truncated");
       if (o + cmd > resultSize) throw new DeltaError("delta result longer than declared");
       if (out) {
-        if (cmd <= 16) for (let k = 0; k < cmd; k++) out[o + k] = delta[p + k] as number;
+        if (cmd <= SMALL_COPY) for (let k = 0; k < cmd; k++) out[o + k] = delta[p + k] as number;
         else out.set(delta.subarray(p, p + cmd), o);
       }
       p += cmd;
