@@ -90,6 +90,7 @@ jobs:
       - name: Push the records to the pull request branch
         env:
           HEAD_REF: ${{ github.head_ref }}
+          TESTED_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           # The records this run changed. Rehash: a record rewritten in place within a second of
@@ -105,9 +106,18 @@ jobs:
           git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git reset -q --hard
           git fetch -q --depth=1 origin "$HEAD_REF"
+          # Only onto the head this run tested. A run superseded by a newer push (still running
+          # when the branch moved) would put the hashes of the older files on the newer head:
+          # nothing there matches them, and the push starts another run whose own record then
+          # rewrites the same files, while the author has to merge the bot commits into the
+          # next push. The newer head's run records for itself.
+          if [ "$(git rev-parse FETCH_HEAD)" != "$TESTED_HEAD" ]; then
+            echo "::notice::branch moved on from the tested $TESTED_HEAD; its newer run records"
+            exit 0
+          fi
           git checkout -q -B "$HEAD_REF" FETCH_HEAD
-          # Onto the branch, which may have moved on since the tested commit: each changed record
-          # merged with the branch's (newest first, four kept), a pruned one removed. Nothing else.
+          # Each changed record merged with the branch's (newest first, four kept), a pruned one
+          # removed. Nothing else.
           while read -r f; do
             if [ -f "$RUNNER_TEMP/records/$f" ]; then
               mkdir -p "$(dirname "$f")"
