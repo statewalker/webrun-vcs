@@ -8,7 +8,7 @@ export class PathNotInIndexError extends GitApiError {
   readonly path: string;
 
   constructor(path: string, message?: string) {
-    super(message ?? `Path not in index: ${path}`);
+    super(message ?? `Path not in index: ${path}`, { exitCode: 1 });
     this.name = "PathNotInIndexError";
     this.path = path;
   }
@@ -22,7 +22,7 @@ export class PathNotFoundInTreeError extends GitApiError {
   readonly treeish?: string;
 
   constructor(path: string, treeish?: string, message?: string) {
-    super(message ?? `Path not found in tree: ${path}`);
+    super(message ?? `Path not found in tree: ${path}`, { exitCode: 1 });
     this.name = "PathNotFoundInTreeError";
     this.path = path;
     this.treeish = treeish;
@@ -62,6 +62,17 @@ export class CloneCheckoutError extends GitApiError {
 }
 
 /**
+ * Thrown when a clone's destination is not empty (git: "destination path '<dir>' already
+ * exists and is not an empty directory.", exit 128): nothing is written.
+ */
+export class CloneDestinationError extends GitApiError {
+  constructor(message: string) {
+    super(message);
+    this.name = "CloneDestinationError";
+  }
+}
+
+/**
  * Thrown when `git switch` refuses before anything changes, with git's message: a name
  * that is not a branch (`fatal: a branch is expected, got commit '...'` and its hint), an
  * operation in progress, a branch `-c` would create that exists, options that do not go
@@ -69,7 +80,7 @@ export class CloneCheckoutError extends GitApiError {
  */
 export class SwitchRefusedError extends GitApiError {
   constructor(message: string) {
-    super(message);
+    super(message, { defaultExitCode: 1 });
     this.name = "SwitchRefusedError";
   }
 }

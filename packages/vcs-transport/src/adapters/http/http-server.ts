@@ -41,6 +41,8 @@ import { serverV2Handlers, serverV2Transitions } from "../../fsm/protocol-v2/ser
 import { serverV2Capabilities } from "../../fsm/protocol-v2/types.js";
 import {
   DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS,
+  type ReceiveDenyAction,
+  type ReceivePackConfig,
   type ReceivePackHooks,
   type ReceivePackLogger,
 } from "../../fsm/push/receive-pack-types.js";
@@ -224,12 +226,24 @@ export interface ReceivePackServerOptions {
   allowNonFastForward?: boolean;
   /** Whether the repository has no working tree (default: `repository.isBare()`, else true) */
   bare?: boolean;
-  /** Refuse updating the checked-out branch of a non-bare repository (default true) */
-  denyCurrentBranch?: boolean;
+  /**
+   * Refuse updating the checked-out branch of a non-bare repository (default true; see
+   * `ReceiveDenyAction` for git's other `receive.denyCurrentBranch` values)
+   */
+  denyCurrentBranch?: boolean | ReceiveDenyAction;
   /** Refuse deleting the branch HEAD names (default true) */
-  denyDeleteCurrent?: boolean;
+  denyDeleteCurrent?: boolean | ReceiveDenyAction;
   /** The branch HEAD names (default: `refStore.getSymrefTarget("HEAD")`) */
   currentBranch?: string;
+  /**
+   * The branches the HEAD of each non-bare worktree uses, linked worktrees included (git's
+   * `find_shared_symref`; see `ReceivePackConfig.checkedOutBranches`). A repository on disk
+   * with linked worktrees must list them, or a push can move a branch another worktree has
+   * checked out. Default: `currentBranch` unless bare.
+   */
+  checkedOutBranches?: readonly string[];
+  /** `denyCurrentBranch: "updateInstead"`: see `ReceivePackConfig.updateWorktree` */
+  updateWorktree?: ReceivePackConfig["updateWorktree"];
   /** Accept shallow pushes (git's `receive.shallowUpdate`; default false) */
   shallowUpdate?: boolean;
   /**
@@ -968,6 +982,8 @@ export async function handleReceivePack(
       hookTimeoutMs: rp.hookTimeoutMs,
       bare: rp.bare,
       denyDeleteCurrent: rp.denyDeleteCurrent,
+      checkedOutBranches: rp.checkedOutBranches,
+      updateWorktree: rp.updateWorktree,
       shallowUpdate: rp.shallowUpdate,
       strictAtomic: rp.strictAtomic,
       logger: options.logger,

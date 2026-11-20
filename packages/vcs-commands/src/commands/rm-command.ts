@@ -17,6 +17,7 @@ import {
   matchPathspecSeen,
   parsePathspec,
 } from "./pathspec.js";
+import { PathspecAttributes } from "./pathspec-attributes.js";
 import { sparsePathAdvice } from "./sparse-checkout-support.js";
 import { StatusCommand } from "./status-command.js";
 import { parseGitmodules } from "./submodule-config.js";
@@ -201,7 +202,14 @@ export class RmCommand extends GitCommand<RmResult> {
     // git's pathspec (parse_pathspec, then ce_path_match): `.` and `./d` name everything
     // beneath, a directory its files, a glob's `*` crosses slashes; `seen` tells which
     // elements matched (git's ps_matched)
-    const items = parsePathspec(this.filepatterns);
+    const items = parsePathspec(this.filepatterns, { attr: true });
+    // `:(attr:...)`: the attributes of the index's paths (match_pathspec_attrs)
+    const attributes = PathspecAttributes.forWorktree(items, this.worktreeAccess);
+    if (attributes) {
+      const paths: string[] = [];
+      for await (const entry of this.staging.entries()) paths.push(entry.path);
+      await attributes.load(paths);
+    }
     const seen = items.map(() => 0);
     const seenOutside = items.map(() => 0);
     const exactStopsGlobs = this.compatibility === "2.43";

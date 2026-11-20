@@ -106,7 +106,9 @@ export class CannotDeleteCurrentBranchError extends GitApiError {
   readonly branchName: string;
 
   constructor(branchName: string, message?: string) {
-    super(message ?? `Cannot delete the branch you are currently on: ${branchName}`);
+    super(message ?? `Cannot delete the branch you are currently on: ${branchName}`, {
+      exitCode: 1,
+    });
     this.name = "CannotDeleteCurrentBranchError";
     this.branchName = branchName;
   }
@@ -145,7 +147,7 @@ export class NotMergedError extends GitApiError {
   readonly branchName: string;
 
   constructor(branchName: string, message?: string) {
-    super(message ?? `Branch '${branchName}' is not fully merged`);
+    super(message ?? `Branch '${branchName}' is not fully merged`, { exitCode: 1 });
     this.name = "NotMergedError";
     this.branchName = branchName;
   }

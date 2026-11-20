@@ -51,7 +51,7 @@ describe.each(backends)("PushCommand ($name backend)", ({ factory }) => {
       );
 
       // Set up HEAD on client
-      await workingCopy.history.refs.set("HEAD", "refs/heads/main");
+      await workingCopy.history.refs.setSymbolic("HEAD", "refs/heads/main");
       await workingCopy.history.refs.set("refs/heads/main", commitId);
 
       const originalFetch = globalThis.fetch;

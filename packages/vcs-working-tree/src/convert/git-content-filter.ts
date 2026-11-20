@@ -615,7 +615,7 @@ export class GitContentFilter implements WorktreeContentFilter {
     context: ContentAttributesContext,
   ): Promise<Map<string, AttributeValue>> {
     const { sources, memo } = this.sourcesFor(scope, context);
-    return this.resolver.get(path, names, { sources, memo });
+    return this.resolver.get(path, names, { sources, memo, isDirectory: context.isDirectory });
   }
 
   /**

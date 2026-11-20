@@ -53,6 +53,7 @@ import { DiffCommand } from "./diff-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { OperationState } from "./merge-support.js";
 import { commentPrefixOf } from "./message-cleanup.js";
+import { canonicalObjectId } from "./object-id-input.js";
 import {
   DO_MATCH_DIRECTORY,
   globalPathspecMagic,
@@ -61,6 +62,7 @@ import {
   parsePathspec,
   untrackedScanPathspec,
 } from "./pathspec.js";
+import { PathspecAttributes } from "./pathspec-attributes.js";
 import {
   type CommitWhence,
   formatStatusText,
@@ -76,6 +78,7 @@ import {
   type SubmoduleIgnoreMode,
   submoduleIgnoreFlags,
 } from "./submodule-config.js";
+import { readDiffSubmoduleConfig } from "./submodule-summary.js";
 import { SubmoduleSummaryCommand } from "./submodule-summary-command.js";
 import type { TrackingSource } from "./tracking-info.js";
 import { openUntrackedCache } from "./untracked-cache-support.js";
@@ -334,8 +337,10 @@ export class StatusCommand extends GitCommand<Status> {
    * `:(literal)`, `:(icase)`, `:(exclude)` (`:!`, `:^`; an element of excludes alone gets
    * an implicit `.`), `:/` and `:(prefix:N)`. `GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`,
    * `GIT_NOGLOB_PATHSPECS` and `GIT_ICASE_PATHSPECS` of the host environment apply.
-   * `:(attr:...)` is refused (attributes are not matched here). Tracked paths are matched as
-   * diff-files and diff-index match them (`ce_path_match`), untracked ones by dir.c's walk.
+   * `:(attr:<spec>)` matches paths by their attributes (`name`, `-name`, `!name`,
+   * `name=value`, several per element), read through the worktree's attribute stack, an
+   * untracked directory by its own name (`d/`). Tracked paths are matched as diff-files and
+   * diff-index match them (`ce_path_match`), untracked ones by dir.c's walk.
    *
    * @param path A pathspec element
    */
@@ -419,6 +424,7 @@ export class StatusCommand extends GitCommand<Status> {
    * commit).
    */
   setReferenceCommit(id: ObjectId | null): this {
+    id = id === null ? null : canonicalObjectId(id);
     this.checkCallable();
     this.reference = id;
     return this;
@@ -729,6 +735,8 @@ export class StatusCommand extends GitCommand<Status> {
     this.setCallable(false);
     // git reads its configuration, then the options, before anything else
     this.resolvedUntracked = this.untrackedFilesMode();
+    // git_status_config ends in git_diff_ui_config: a diff.submodule without a value dies
+    readDiffSubmoduleConfig(this.workingCopy);
     this.pathspec = this.parsePaths();
     if (this.ignoredMode === "matching" && this.resolvedUntracked === "no") {
       throw new IncompatibleOptionsError(
@@ -746,7 +754,7 @@ export class StatusCommand extends GitCommand<Status> {
     if (this.paths.length === 0) return [];
     try {
       const global = globalPathspecMagic(hostEnvironmentOf(this.workingCopy)?.pathspecs);
-      return parsePathspec(this.paths, { global, refuseAttrAsUnsupported: true });
+      return parsePathspec(this.paths, { global, attr: true });
     } catch (error) {
       throw new InvalidArgumentError("path", this.paths, `fatal: ${(error as Error).message}`);
     }
@@ -832,6 +840,9 @@ export class StatusCommand extends GitCommand<Status> {
       !isGitlink(entry.mode) &&
       (matchAll || this.matchesTracked(entry.path, entry.mode));
     const all = this.staging.entryList?.() ?? (await collectEntries(this.staging.entries()));
+    // `:(attr:...)`: the attributes of the tracked paths the pathspec may match
+    const attributes = PathspecAttributes.forWorktree(this.pathspec, worktree);
+    await attributes?.load([...all.map((e) => e.path), ...head.keys()]);
     // the index's paths by binary search (git's index_name_pos), no set of every path built
     const index = new IndexPathLookup(all.map((e) => e.path));
     const tracked = { has: (path: string) => index.has(path) };
@@ -1013,7 +1024,7 @@ export class StatusCommand extends GitCommand<Status> {
         indexIgnoreOid: (p) => ignoreFiles.upToDate.get(p),
         skipWorktreeIgnoreOid: (p) => ignoreFiles.skipWorktree.get(p),
         flags,
-        ...(matchAll ? {} : { matcher: untrackedScanPathspec(this.pathspec) }),
+        ...(matchAll ? {} : { matcher: untrackedScanPathspec(this.pathspec, attributes) }),
         ...(cache ? { cache } : {}),
         indexSeconds: Math.floor(indexTime / 1000),
         ...(trust ? { stat: { ctime: trust.ctime, fullStat: trust.fullStat } } : {}),

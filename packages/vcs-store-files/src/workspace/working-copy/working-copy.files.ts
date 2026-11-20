@@ -129,13 +129,14 @@ export class GitWorkingCopy implements WorkingCopy {
    * Set HEAD to a branch or commit.
    */
   async setHead(target: ObjectId | string): Promise<void> {
-    const isBranch = target.startsWith("refs/") || !target.match(/^[0-9a-f]{40,64}$/);
+    // a full id in either case (git's get_oid_hex) is a commit, kept lowercase
+    const isBranch = target.startsWith("refs/") || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(target);
 
     if (isBranch) {
       const ref = target.startsWith("refs/") ? target : `refs/heads/${target}`;
       await this.checkout.setHead({ type: "symbolic", target: ref });
     } else {
-      await this.checkout.setHead({ type: "detached", commitId: target });
+      await this.checkout.setHead({ type: "detached", commitId: target.toLowerCase() });
     }
   }
 

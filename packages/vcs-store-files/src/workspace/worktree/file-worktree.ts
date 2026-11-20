@@ -19,6 +19,7 @@ import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
 import {
   assertValidWorktreePath,
   basename,
+  createHistoryFromStores,
   FileMode,
   isBeyondSymlinkError,
   joinPath,
@@ -38,6 +39,7 @@ import type {
   IgnoreManager,
   NestedRepositoryState,
   NewHasher,
+  OpenedRepository,
   UntrackedScanHost,
   Worktree,
   WorktreeCapabilities,
@@ -60,6 +62,7 @@ import {
 } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "../../create-git-files-backend.js";
 import { parseGitfile } from "../git-dir/index.js";
+import { openGitLinkedWorktrees } from "../linked-worktrees/index.js";
 import { FileStagingStore } from "../staging/index.js";
 import { createWorkingCopyConfig } from "../working-copy/index.js";
 import { type CaseFolding, probeCaseFolding } from "./probe-case-folding.js";
@@ -1234,8 +1237,11 @@ export class FileWorktree implements Worktree {
       head = line?.split(" ")[0];
     }
     if (head === UNREADABLE) return { state: "unknown" };
-    if (!head || !/^[0-9a-f]{40,64}$/.test(head) || /^0+$/.test(head)) return { state: "none" };
-    return { state: "commit", head };
+    // an id in either case (git's get_oid_hex), kept lowercase
+    if (!head || !/^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test(head) || /^0+$/.test(head)) {
+      return { state: "none" };
+    }
+    return { state: "commit", head: head.toLowerCase() };
   }
 
   /**
@@ -1338,6 +1344,133 @@ export class FileWorktree implements Worktree {
       worktree,
       config,
     });
+  }
+
+  async openRepository(location: string): Promise<OpenedRepository | undefined> {
+    const base = this.locate(location);
+    if (base === undefined) return undefined;
+    // enter_repo (strict = 0): each suffix in turn, a gitfile followed
+    for (const suffix of ["/.git", "", ".git/.git", ".git"]) {
+      const candidate = resolveDots(`${base}${suffix}`);
+      if (candidate === undefined) continue;
+      let gitDir: string | undefined = candidate;
+      const kind = await this.kindOf(gitDir).catch(() => undefined);
+      if (kind === "file") {
+        const target = await this.readGitfile(gitDir).catch(() => undefined);
+        if (!target) continue;
+        const parent = gitDir.slice(0, Math.max(gitDir.lastIndexOf("/"), 0));
+        gitDir = target.startsWith("/") ? this.locate(target) : resolveDots(`${parent}/${target}`);
+        if (gitDir === undefined) continue;
+      } else if (kind !== "directory") continue;
+      // is_git_directory: HEAD here, objects and refs here or in the `commondir` named
+      const found = await this.gitDirectoryAt(gitDir, gitDir).catch(() => undefined);
+      if (found?.state !== "repository") continue;
+      return this.openRepositoryAt(found.gitDir, found.commonDir);
+    }
+    return undefined;
+  }
+
+  /**
+   * The repository whose git directory is `gitDir` and repository directory `commonDir`
+   * (the same, unless `gitDir` is a linked worktree's): its history (HEAD the git
+   * directory's own), configuration and worktrees.
+   */
+  private async openRepositoryAt(gitDir: string, commonDir: string): Promise<OpenedRepository> {
+    const files = this.rootFiles;
+    const environment = this.environment ? { environment: this.environment } : {};
+    const backend = await createGitFilesBackend({ files, gitDir: commonDir, ...environment });
+    const worktrees = await openGitLinkedWorktrees({
+      files,
+      gitDir,
+      history: backend.history,
+      ...environment,
+    });
+    let history = backend.history;
+    if (gitDir !== commonDir) {
+      // a linked worktree's git directory: its own HEAD over the repository's refs
+      const current = (await worktrees.list().catch(() => [])).find((wt) => wt.current);
+      if (current) {
+        const base = backend.history;
+        history = createHistoryFromStores({
+          blobs: base.blobs,
+          trees: base.trees,
+          commits: base.commits,
+          tags: base.tags,
+          refs: await worktrees.refsOf(current),
+          objects: base.objects,
+          packs: base.packs,
+        });
+      }
+    }
+    const config = await createWorkingCopyConfig(
+      {
+        read: async (p) => ((await files.exists(p)) ? readFile(files, p) : undefined),
+        write: (p, content) => files.write(p, [content]),
+      },
+      commonDir,
+      undefined,
+      environment,
+    );
+    const textOf = (o: { text: string | undefined }) => o.text ?? null;
+    return {
+      history,
+      gitDir,
+      commonDir,
+      // a linked worktree's git directory has a working tree (git runs there as non-bare)
+      bare: gitDir === commonDir && (await this.isBareRepository(gitDir)),
+      config: {
+        getAll: (key) => config.getAllWithOrigin(key).map(textOf),
+        list: () => config.listWithOrigin().map((e) => ({ key: e.key, value: textOf(e) })),
+      },
+      worktrees,
+    };
+  }
+
+  /**
+   * A local remote's location in this FilesApi: relative to the worktree top, absolute in
+   * the real directory the FilesApi is rooted at (`rootDirectory`; from its root when that
+   * is unknown). Undefined beyond the root.
+   */
+  private locate(location: string): string | undefined {
+    const windows = this.windowsPaths;
+    const path = windows ? location.replace(/\\/g, "/") : location;
+    const absolute = path.startsWith("/") || (windows && /^[A-Za-z]:\//.test(path));
+    if (!absolute) return resolveDots(joinPath(this.rootPath || "/", path));
+    const root = this.rootFiles.rootDirectory;
+    if (!root) return resolveDots(path);
+    const realTarget = resolveDots(path);
+    const realRoot = resolveDots(windows ? root.replace(/\\/g, "/") : root);
+    if (realTarget === undefined || realRoot === undefined) return undefined;
+    const same = (a: string, b: string) =>
+      windows ? a.toLowerCase() === b.toLowerCase() : a === b;
+    const top = realRoot.endsWith("/") ? realRoot.slice(0, -1) : realRoot;
+    if (same(realTarget, top)) return "/";
+    if (!same(realTarget.slice(0, top.length + 1), `${top}/`)) return undefined;
+    return realTarget.slice(top.length);
+  }
+
+  /** git's `is_bare_repository` of another repository: `core.bare`, else no `.git` name. */
+  private async isBareRepository(gitDir: string): Promise<boolean> {
+    const configPath = joinPath(gitDir, "config");
+    if ((await this.kindOf(configPath).catch(() => undefined)) === "file") {
+      const text = new TextDecoder().decode(await readFile(this.rootFiles, configPath));
+      let core = false;
+      for (const raw of text.split("\n")) {
+        const line = raw.replace(/[#;].*$/, "").trim();
+        const section = /^\[\s*([^\]\s"]+)/.exec(line);
+        if (section) {
+          core = section[1]?.toLowerCase() === "core";
+          continue;
+        }
+        const bare = core ? /^bare\s*(?:=\s*(.*))?$/i.exec(line) : null;
+        if (bare) {
+          const value = (bare[1] ?? "true").trim().toLowerCase();
+          if (["true", "yes", "on", "1"].includes(value)) return true;
+          if (["false", "no", "off", "0", ""].includes(value)) return false;
+        }
+      }
+    }
+    return !/(^|\/)\.git$/.test(gitDir);
   }
 
   async mkdir(path: string, _options?: { recursive?: boolean }): Promise<void> {

@@ -127,14 +127,15 @@ export class MemoryWorkingCopy implements WorkingCopy {
    * Set HEAD to a branch or commit.
    */
   async setHead(target: ObjectId | string): Promise<void> {
-    const isBranch = target.startsWith("refs/") || !target.match(/^[0-9a-f]{40,64}$/);
+    // a full id in either case (git's get_oid_hex) is a commit, kept lowercase
+    const isBranch = target.startsWith("refs/") || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(target);
 
     if (isBranch) {
       const ref = target.startsWith("refs/") ? target : `refs/heads/${target}`;
       this.headRef = ref;
       this.headCommit = undefined;
     } else {
-      this.headCommit = target;
+      this.headCommit = target.toLowerCase();
     }
   }
 

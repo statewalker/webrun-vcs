@@ -137,6 +137,16 @@ export const DEFAULT_RECEIVE_KEEP_ALIVE_MS = 5000;
 export const DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
+ * What receive-pack does with a push to a branch checked out in a non-bare worktree, or a
+ * delete of the current branch (git's `receive.denyCurrentBranch`, `receive.denyDeleteCurrent`):
+ * `"refuse"` (true), `"ignore"` (false), `"warn"` (accept with a warning), `"updateInstead"`
+ * (denyCurrentBranch only: the worktree is updated to the pushed commit when it is clean,
+ * through `ReceivePackConfig.updateWorktree`; a delete is refused), and `"unconfigured"`:
+ * refuse with git's advice on the setting, as git does when it is not set.
+ */
+export type ReceiveDenyAction = "unconfigured" | "ignore" | "warn" | "refuse" | "updateInstead";
+
+/**
  * receive-pack settings (`ProcessConfiguration.receivePack`). The ref policies
  * `allowDeletes`, `allowNonFastForward`, `denyCurrentBranch` and `currentBranch` are
  * `ProcessConfiguration` fields.
@@ -167,7 +177,23 @@ export interface ReceivePackConfig {
    * Refuse deleting the branch HEAD names, "deletion of the current branch prohibited"
    * (git's `receive.denyDeleteCurrent`, default true).
    */
-  denyDeleteCurrent?: boolean;
+  denyDeleteCurrent?: boolean | ReceiveDenyAction;
+  /**
+   * The branches (`refs/heads/x`) the HEAD of a non-bare worktree uses, the repository's
+   * own and its linked worktrees' (git's `find_shared_symref` over `get_worktrees`, a
+   * worktree being rebased or bisected on a branch included). An update or delete of one is
+   * what `denyCurrentBranch` rules on, and a delete of one what `denyDeleteCurrent` rules
+   * on. Absent: the branch HEAD names when the repository is not bare.
+   */
+  checkedOutBranches?: readonly string[];
+  /**
+   * `denyCurrentBranch: "updateInstead"`: brings the worktree that has `ref` checked out to
+   * `newOid` (git's `update_worktree`: refused while it has unstaged or staged changes, else
+   * `read-tree -u -m`), run after the update hook and before the ref is updated. Resolves to
+   * the refusal reason ("Working directory has unstaged changes"), undefined when done.
+   * Absent: such an update is refused.
+   */
+  updateWorktree?: (ref: string, newOid: string) => Promise<string | undefined>;
   /**
    * Accept pushes from a shallow client whose history ends at its shallow commits (git's
    * `receive.shallowUpdate`, default false: "shallow update not allowed"). Needs the facade's

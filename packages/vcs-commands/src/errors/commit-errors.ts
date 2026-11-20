@@ -7,7 +7,7 @@ import { GitApiError } from "./git-api-error.js";
  */
 export class NoMessageError extends GitApiError {
   constructor(message?: string) {
-    super(message ?? "Commit message is required");
+    super(message ?? "Commit message is required", { exitCode: 1 });
     this.name = "NoMessageError";
   }
 }
@@ -19,7 +19,7 @@ export class NoMessageError extends GitApiError {
  */
 export class EmptyCommitError extends GitApiError {
   constructor(message?: string) {
-    super(message ?? "Nothing to commit");
+    super(message ?? "Nothing to commit", { exitCode: 1 });
     this.name = "EmptyCommitError";
   }
 }
@@ -45,9 +45,6 @@ export class UnmergedPathsError extends GitApiError {
  * exists.` and its advice); the lock is left where it is.
  */
 export class IndexLockFailedError extends GitApiError {
-  /** git's exit code */
-  readonly exitCode = 128;
-
   constructor(
     readonly lockPath: string,
     message: string,

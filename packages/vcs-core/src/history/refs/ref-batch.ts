@@ -66,6 +66,8 @@ export type RefRejectReason =
   | "duplicate"
   /** A malformed command, such as a delete whose `old` says "must not exist". */
   | "invalid-command"
+  /** A value to write (`new`) that is no full hex object id (git's "not a valid SHA1"). */
+  | "invalid-object-id"
   /**
    * A name outside `refs/` (a detached HEAD) in a multi-ref batch. This is a
    * project policy, not git's rule: on git files such a ref cannot be committed
@@ -192,6 +194,21 @@ function sanitizeOwnLine(line: OwnReflogLine): OwnReflogLine {
   };
 }
 
+/**
+ * Whether `value` may be written as a ref's direct value: a full lowercase hex object id
+ * (SHA-1, the one object format the stores read). A name (`main`) written there leaves a ref no git can read, `HEAD`
+ * holding `main\n` is no repository to git at all, so every ref store refuses it.
+ *
+ * @example
+ * ```typescript
+ * isRefObjectId("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"); // true
+ * isRefObjectId("main"); // false
+ * ```
+ */
+export function isRefObjectId(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+}
+
 /** Names a batch may update: `HEAD`, or a valid name under `refs/`. */
 export function isUpdatableRefName(name: string): boolean {
   return name === "HEAD" || (name.startsWith("refs/") && isValidRefName(name));
@@ -229,6 +246,8 @@ export async function planRefBatch(
     else if (seen.has(c.name)) early.push({ name: c.name, reason: "duplicate" });
     else if (c.new === null && c.old === null) {
       early.push({ name: c.name, reason: "invalid-command" });
+    } else if (c.new !== null && !isRefObjectId(c.new)) {
+      early.push({ name: c.name, reason: "invalid-object-id" });
     } else if (c.reflog && (c.new === null || !c.reflog.every(validOwnLine))) {
       // own reflog lines: on a written ref only, with object ids and an identity
       early.push({ name: c.name, reason: "invalid-command" });

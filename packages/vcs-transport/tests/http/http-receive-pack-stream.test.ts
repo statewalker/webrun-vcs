@@ -7,7 +7,12 @@
 
 import { describe, expect, it } from "vitest";
 
-import { type HttpRequest, handleReceivePack } from "../../src/index.js";
+import {
+  type HttpRequest,
+  handleReceivePack,
+  httpServerSettings,
+  serverSettingsFromConfig,
+} from "../../src/index.js";
 import {
   clientWithNewCommits,
   decodeAnswer,
@@ -87,6 +92,43 @@ describe("smart-HTTP receive-pack: streamed answer", () => {
     expect(imported).toBe(true);
     expect(answer.report).toEqual(["unpack ok", "ok refs/heads/main"]);
     expect(answer.keepAlives).toBeGreaterThan(0);
+  });
+
+  it("a branch checked out in a linked worktree (checkedOutBranches) is refused over HTTP too", async () => {
+    const { repo, c2 } = await serverRepo();
+    await repo.refStore.update("refs/heads/topic", c2);
+    const { client, commits } = await clientWithNewCommits(1);
+    const n0 = commits[0] as string;
+    const settings = httpServerSettings(
+      serverSettingsFromConfig({
+        getAll: (key) => (key === "receive.denyNonFastForwards" ? ["false"] : []),
+      }),
+    );
+    const response = await handleReceivePack(
+      post(
+        pushRequest({
+          commands: [`${c2} ${n0} refs/heads/topic`, `${c2} ${n0} refs/heads/main`],
+          pack: await fullPackOf(client, [n0], [c2]),
+        }),
+      ),
+      repo.facade,
+      repo.refStore,
+      {
+        receivePack: {
+          ...settings.receivePack,
+          bare: true,
+          checkedOutBranches: ["refs/heads/topic"],
+        },
+      },
+    );
+    const answer = decodeAnswer(await read(response.body), true);
+    expect(answer.report).toEqual([
+      "unpack ok",
+      "ng refs/heads/topic branch is currently checked out",
+      "ok refs/heads/main",
+    ]);
+    expect(answer.messages).toContain("'receive.denyCurrentBranch' configuration variable");
+    expect(await repo.refStore.get("refs/heads/topic")).toBe(c2);
   });
 
   it("a pack over the body limit is answered in band (the head is out)", async () => {

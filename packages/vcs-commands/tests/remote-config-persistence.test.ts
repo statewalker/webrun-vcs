@@ -439,7 +439,7 @@ describe.each(backends)("Remote config persistence ($name backend)", ({ factory 
         "client content",
         "Client commit",
       );
-      await workingCopy.history.refs.set("HEAD", "refs/heads/main");
+      await workingCopy.history.refs.setSymbolic("HEAD", "refs/heads/main");
       await workingCopy.history.refs.set("refs/heads/main", commitId);
 
       await git.remoteAdd().setName("origin").setUri(remoteUrl).call();
@@ -474,7 +474,7 @@ describe.each(backends)("Remote config persistence ($name backend)", ({ factory 
         "client content",
         "Client commit",
       );
-      await workingCopy.history.refs.set("HEAD", "refs/heads/main");
+      await workingCopy.history.refs.setSymbolic("HEAD", "refs/heads/main");
       await workingCopy.history.refs.set("refs/heads/main", commitId);
 
       // The fetch URL points nowhere: only preferring `pushurl` can work.

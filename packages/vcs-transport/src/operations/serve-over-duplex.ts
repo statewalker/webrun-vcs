@@ -20,6 +20,8 @@ import { Fsm } from "../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../fsm/protocol-v2/server-v2-fsm.js";
 import {
   DEFAULT_RECEIVE_PACK_WRITE_TIMEOUT_MS,
+  type ReceiveDenyAction,
+  type ReceivePackConfig,
   type ReceivePackHooks,
   type ReceivePackLogger,
 } from "../fsm/push/receive-pack-types.js";
@@ -51,13 +53,20 @@ export interface ServeOverDuplexOptions {
    * Refuse updating the checked-out branch of a non-bare repository ("branch is currently
    * checked out", git's `receive.denyCurrentBranch`; default true)
    */
-  denyCurrentBranch?: boolean;
+  denyCurrentBranch?: boolean | ReceiveDenyAction;
   /** The branch HEAD names (default: `refStore.getSymrefTarget("HEAD")`) */
   currentBranch?: string;
+  /**
+   * The branches the HEAD of each non-bare worktree uses (git's `find_shared_symref`; see
+   * `ReceivePackConfig.checkedOutBranches`). Default: `currentBranch` unless bare.
+   */
+  checkedOutBranches?: readonly string[];
+  /** `denyCurrentBranch: "updateInstead"`: see `ReceivePackConfig.updateWorktree` */
+  updateWorktree?: ReceivePackConfig["updateWorktree"];
   /** Whether the repository has no working tree (default: `repository.isBare()`, else true) */
   bare?: boolean;
   /** Refuse deleting the current branch (git's `receive.denyDeleteCurrent`; default true) */
-  denyDeleteCurrent?: boolean;
+  denyDeleteCurrent?: boolean | ReceiveDenyAction;
   /** Accept shallow pushes (git's `receive.shallowUpdate`; default false) */
   shallowUpdate?: boolean;
   /**
@@ -218,6 +227,8 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       hookTimeoutMs: options.hookTimeoutMs,
       bare: options.bare,
       denyDeleteCurrent: options.denyDeleteCurrent,
+      checkedOutBranches: options.checkedOutBranches,
+      updateWorktree: options.updateWorktree,
       shallowUpdate: options.shallowUpdate,
       strictAtomic: options.strictAtomic,
       logger: options.logger,

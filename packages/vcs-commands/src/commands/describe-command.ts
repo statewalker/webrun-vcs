@@ -2,6 +2,7 @@ import type { ObjectId } from "@statewalker/vcs-core";
 
 import { RefNotFoundError } from "../errors/ref-errors.js";
 import { GitCommand } from "../git-command.js";
+import { canonicalObjectId } from "./object-id-input.js";
 
 /**
  * Result of describe operation.
@@ -72,6 +73,7 @@ export class DescribeCommand extends GitCommand<DescribeResult> {
    * @param target ObjectId of commit to describe
    */
   setTarget(target: ObjectId): this {
+    target = canonicalObjectId(target);
     this.checkCallable();
     this.target = target;
     return this;

@@ -52,6 +52,7 @@ import {
   DEFAULT_RECEIVE_KEEP_ALIVE_MS,
   type HookVerdict,
   type ReceiveCommand,
+  type ReceiveDenyAction,
   type ReceivePackConfig,
   type ReceivePackHookContext,
   type ReceivePackHooks,
@@ -940,6 +941,45 @@ function sendProgress(ctx: ProcessContext, text: string): Promise<void> {
   return sendMessage(ctx, text);
 }
 
+/** git's `rp_warning`: a `warning:` line on the progress channel, quiet or not. */
+function sendWarning(ctx: ProcessContext, text: string): Promise<void> {
+  return sendMessage(ctx, `warning: ${text}`);
+}
+
+/** A deny setting (`receive.denyCurrentBranch`, `receive.denyDeleteCurrent`) as an action. */
+function denyActionOf(value: boolean | ReceiveDenyAction | undefined): ReceiveDenyAction {
+  if (value === undefined || value === true) return "refuse";
+  if (value === false) return "ignore";
+  return value;
+}
+
+/** receive-pack.c's `refuse_unconfigured_deny_msg`. */
+const REFUSE_UNCONFIGURED_DENY =
+  "By default, updating the current branch in a non-bare repository\n" +
+  "is denied, because it will make the index and work tree inconsistent\n" +
+  "with what you pushed, and will require 'git reset --hard' to match\n" +
+  "the work tree to HEAD.\n" +
+  "\n" +
+  "You can set the 'receive.denyCurrentBranch' configuration variable\n" +
+  "to 'ignore' or 'warn' in the remote repository to allow pushing into\n" +
+  "its current branch; however, this is not recommended unless you\n" +
+  "arranged to update its work tree to match what you pushed in some\n" +
+  "other way.\n" +
+  "\n" +
+  "To squelch this message and still keep the default behaviour, set\n" +
+  "'receive.denyCurrentBranch' configuration variable to 'refuse'.";
+
+/** receive-pack.c's `refuse_unconfigured_deny_delete_current_msg`. */
+const REFUSE_UNCONFIGURED_DENY_DELETE_CURRENT =
+  "By default, deleting the current branch is denied, because the next\n" +
+  "'git clone' won't result in any file checked out, causing confusion.\n" +
+  "\n" +
+  "You can set 'receive.denyDeleteCurrent' configuration variable to\n" +
+  "'warn' or 'ignore' in the remote repository to allow deleting the\n" +
+  "current branch, with or without a warning message.\n" +
+  "\n" +
+  "To squelch this message, you can set it to 'refuse'.";
+
 /** git's `rp_error`: an `error:` line on the progress channel, quiet or not. */
 function sendError(ctx: ProcessContext, text: string): Promise<void> {
   return sendMessage(ctx, `error: ${text}`);
@@ -1026,8 +1066,13 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
         ? await repository.isBare()
         : true);
   const head = config.currentBranch ?? (await refStore.getSymrefTarget?.("HEAD"));
-  const denyCurrentBranch = config.denyCurrentBranch ?? true;
-  const denyDeleteCurrent = rp.denyDeleteCurrent ?? true;
+  const denyCurrentBranch = denyActionOf(config.denyCurrentBranch);
+  const denyDeleteCurrent = denyActionOf(rp.denyDeleteCurrent);
+  // find_shared_symref over the worktrees: the branches a non-bare worktree's HEAD uses
+  // (given), else the one HEAD names in a non-bare repository
+  const checkedOut = new Set<string>(
+    rp.checkedOutBranches ?? (!bare && head !== undefined ? [head] : []),
+  );
   /** An atomic push whose ref transaction will refuse to commit */
   let transactionFails = false;
 
@@ -1063,11 +1108,17 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
       return;
     }
 
-    if (!bare && denyCurrentBranch && head === name) {
-      await sendError(ctx, `refusing to update checked out branch: ${name}`);
-      cmd.result = "REJECTED_CURRENT_BRANCH";
-      cmd.message = "branch is currently checked out";
-      return;
+    let updateWorktree = false;
+    if (checkedOut.has(name)) {
+      if (denyCurrentBranch === "warn") await sendWarning(ctx, "updating the current branch");
+      else if (denyCurrentBranch === "updateInstead") updateWorktree = true;
+      else if (denyCurrentBranch !== "ignore") {
+        await sendError(ctx, `refusing to update checked out branch: ${name}`);
+        if (denyCurrentBranch === "unconfigured") await sendError(ctx, REFUSE_UNCONFIGURED_DENY);
+        cmd.result = "REJECTED_CURRENT_BRANCH";
+        cmd.message = "branch is currently checked out";
+        return;
+      }
     }
 
     // git deletes an existing ref even when the client sent the zero id as its old value
@@ -1083,11 +1134,17 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
         cmd.message = "deletion prohibited";
         return;
       }
-      if (denyDeleteCurrent && head === name) {
-        await sendError(ctx, `refusing to delete the current branch: ${name}`);
-        cmd.result = "REJECTED_NODELETE";
-        cmd.message = "deletion of the current branch prohibited";
-        return;
+      if (checkedOut.has(name) || head === name) {
+        if (denyDeleteCurrent === "warn") await sendWarning(ctx, "deleting the current branch");
+        else if (denyDeleteCurrent !== "ignore") {
+          if (denyDeleteCurrent === "unconfigured") {
+            await sendError(ctx, REFUSE_UNCONFIGURED_DENY_DELETE_CURRENT);
+          }
+          await sendError(ctx, `refusing to delete the current branch: ${name}`);
+          cmd.result = "REJECTED_NODELETE";
+          cmd.message = "deletion of the current branch prohibited";
+          return;
+        }
       }
     }
 
@@ -1164,6 +1221,26 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
         if (verdict.message) await sendMessage(ctx, verdict.message);
         await sendError(ctx, `hook declined to update ${name}`);
         reject(cmd, "hook declined");
+        return;
+      }
+    }
+
+    // receive.denyCurrentBranch=updateInstead: the worktree takes the new commit first
+    // (git's update_worktree, after the update hook), or the update is refused
+    if (updateWorktree) {
+      let refusal: string | undefined;
+      try {
+        // git migrates the quarantined objects before update(): the worktree reads them
+        if (rp.updateWorktree) await publishQuarantine(ctx);
+        refusal = rp.updateWorktree
+          ? await rp.updateWorktree(name, cmd.newOid)
+          : "denyCurrentBranch = updateInstead needs a worktree";
+      } catch (e) {
+        logError(ctx, `updating the worktree of ${name} failed`, e);
+        refusal = "Could not update working tree to new HEAD";
+      }
+      if (refusal) {
+        reject(cmd, refusal);
         return;
       }
     }

@@ -34,7 +34,7 @@ export class StashApplyFailedError extends GitApiError {
   readonly conflicts?: string[];
 
   constructor(stashRef: string, conflicts?: string[], message?: string) {
-    super(message ?? `Failed to apply stash: ${stashRef}`);
+    super(message ?? `Failed to apply stash: ${stashRef}`, { exitCode: 1 });
     this.name = "StashApplyFailedError";
     this.stashRef = stashRef;
     this.conflicts = conflicts;

@@ -60,6 +60,11 @@ export interface ContentAttributesContext {
   direction: "checkin" | "checkout";
   /** The index read (default: the working copy's current index) */
   index?: AttributesIndex;
+  /**
+   * The path names a directory (only for {@link WorktreeContentFilter.attributes}): patterns
+   * ending in `/` may match it, as git's `git_check_attr` of a name ending in `/`
+   */
+  isDirectory?: boolean;
 }
 
 /**

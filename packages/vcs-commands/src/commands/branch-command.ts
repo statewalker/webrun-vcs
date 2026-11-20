@@ -19,6 +19,7 @@ import {
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { ListBranchMode } from "../types.js";
+import { canonicalObjectId } from "./object-id-input.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { shortBranchName, worktreeUsingBranch } from "./worktree-support.js";
 
@@ -232,7 +233,12 @@ export class DeleteBranchCommand extends GitCommand<string[]> {
       if (user) {
         const message = `cannot delete branch '${shortBranchName(refName)}' used by worktree at '${user.path}'`;
         if (user.current) throw new CannotDeleteCurrentBranchError(name, message);
-        throw new BranchUsedByWorktreeError(shortBranchName(refName), user.path, message);
+        // git's delete_branches: error() and the next branch, exit status 1
+        throw new BranchUsedByWorktreeError(
+          shortBranchName(refName),
+          user.path,
+          message,
+        ).withExitCode(1);
       }
 
       // Cannot delete current branch
@@ -242,7 +248,8 @@ export class DeleteBranchCommand extends GitCommand<string[]> {
 
       // Check if exists
       if (!(await this.refsStore.has(refName))) {
-        throw new RefNotFoundError(refName, `Branch '${name}' not found`);
+        // git's delete_branches: error("branch '%s' not found"), exit status 1
+        throw new RefNotFoundError(refName, `Branch '${name}' not found`).withExitCode(1);
       }
 
       // Check if fully merged (unless force)
@@ -334,6 +341,7 @@ export class ListBranchCommand extends GitCommand<Ref[]> {
    * @param commit Commit that must be in branch history
    */
   setContains(commit: ObjectId): this {
+    commit = canonicalObjectId(commit);
     this.checkCallable();
     this.containsCommit = commit;
     return this;

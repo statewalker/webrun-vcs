@@ -1,17 +1,21 @@
-import { FileMode, type ObjectId } from "@statewalker/vcs-core";
+import { FileMode, isSymbolicRef, type ObjectId } from "@statewalker/vcs-core";
 import {
   createRepositoryFacade,
   createTransportRefStore,
+  fetchFromConnection,
   type RefspecResolver,
+  type FetchOptions as TransportFetchOptions,
   fetch as transportFetch,
 } from "@statewalker/vcs-transport";
-import type { Worktree } from "@statewalker/vcs-working-tree";
+import type { OpenedRepository, Worktree } from "@statewalker/vcs-working-tree";
 
 import {
   CloneCheckoutError,
+  CloneDestinationError,
   InvalidArgumentError,
   InvalidRemoteError,
   RefNotFoundError,
+  TransportError,
 } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import type { CloneResult } from "../results/clone-result.js";
@@ -19,6 +23,7 @@ import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js"
 import { TransportCommand } from "../transport-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
+import { localRemotePath, openLocalRemote, withLocalUploadPack } from "./local-transport.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
 import { SparseCheckoutCommand } from "./sparse-checkout-command.js";
@@ -99,6 +104,18 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   private tagOption: TagOption = TagOption.AUTO_FOLLOW;
   private shallowSince?: Date;
   private shallowExcludes: string[] = [];
+  private directory?: string;
+
+  /**
+   * The destination directory as `git clone <url> <directory>` names it, for messages only
+   * (the clone goes into the working copy the command was made for). Default: the last
+   * component of the worktree's top.
+   */
+  setDirectory(directory: string): this {
+    this.checkCallable();
+    this.directory = directory;
+    return this;
+  }
 
   /**
    * Set the URI to clone from.
@@ -404,6 +421,26 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       );
     }
 
+    // a local source is opened before anything is written (git's "does not appear to be a
+    // git repository" leaves no clone behind)
+    const localPath = localRemotePath(this.uri);
+    let localRemote: OpenedRepository | undefined;
+    if (localPath !== undefined) {
+      try {
+        localRemote = await openLocalRemote(this.workingCopy, localPath);
+      } catch (error) {
+        // clone.c: a path (no URL) where no repository is found is "does not exist" (git
+        // tells an existing non-repository apart; here both read so); a file:// URL goes to
+        // upload-pack, which fails as for fetch
+        if (this.uri.startsWith("file://")) throw error;
+        throw new TransportError(`fatal: repository '${this.uri}' does not exist`);
+      }
+    }
+
+    // clone.c: a destination that exists and is not empty is refused before anything is
+    // written; here the destination is the working copy, empty once `git init` made it
+    await this.refuseNonEmptyDestination(localRemote);
+
     // Determine clone branch strategy
     const branchesToClone = this.mirror || this.cloneAllBranches ? [] : this.branchesToClone;
     const branchToClone = toBranchName(this.branch ?? branchesToClone[0]);
@@ -442,7 +479,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
           }
           throw new RefNotFoundError(
             `refs/heads/${b}`,
-            `Remote branch ${b} not found in upstream ${this.remoteName}`,
+            `fatal: Remote branch ${b} not found in upstream ${this.remoteName}`,
           );
         },
       };
@@ -461,7 +498,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
           }
           throw new RefNotFoundError(
             `refs/heads/${b}`,
-            `Remote branch ${b} not found in upstream ${this.remoteName}`,
+            `fatal: Remote branch ${b} not found in upstream ${this.remoteName}`,
           );
         },
       };
@@ -485,7 +522,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         ? "all"
         : toTagMode(this.tagOption);
 
-    const result = await transportFetch({
+    const fetchOptions: TransportFetchOptions = {
       url: this.uri,
       auth: this.credentials,
       headers: this.headers,
@@ -501,7 +538,15 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       onProgress: this.progressMessageCallback,
       // git's write_remote_refs: one initial transaction, no reflog
       skipReflog: true,
-    });
+    };
+    // transport_get: smart HTTP, or git's local transport (upload-pack of the repository at
+    // the path, in process); anything else fails in git's words
+    const result =
+      localRemote === undefined
+        ? await transportFetch(fetchOptions)
+        : await withLocalUploadPack(localRemote, (connection) =>
+            fetchFromConnection(connection, fetchOptions),
+          );
     const cloneLog = this.reflogLine(reflogMessages.clone(this.uri));
     const trackingUpdates: TrackingRefUpdate[] = result.refUpdates.map(toTrackingRefUpdate);
 
@@ -579,6 +624,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       detachedTag,
       remoteHead,
       checkedOutBranch,
+      isEmpty: result.isEmpty,
     });
 
     // Build fetch result
@@ -617,6 +663,47 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   }
 
   /**
+   * git's "destination path '<dir>' already exists and is not an empty directory" (exit
+   * 128) for a working copy that is no freshly initialised repository: one with a ref
+   * (commits, a tag), index entries or files in its worktree, or that the local source
+   * resolves to (`git clone . .`). The directory is named as the worktree's top is
+   * ({@link setDirectory}, else its last component, `.` for the root).
+   */
+  private async refuseNonEmptyDestination(source: OpenedRepository | undefined): Promise<void> {
+    const refuse = () => {
+      const root = this.worktreeAccess?.getRoot?.() ?? "";
+      const name = this.directory ?? (root.replace(/\/+$/, "").split("/").pop() || ".");
+      return new CloneDestinationError(
+        `fatal: destination path '${name}' already exists and is not an empty directory.`,
+      );
+    };
+    const history = this._workingCopy.history;
+    for await (const ref of history.refs.list()) {
+      if (!isSymbolicRef(ref)) throw refuse();
+    }
+    if (await this.refsStore.resolve("HEAD").catch(() => undefined)) throw refuse();
+    const staging = this._workingCopy.checkout?.staging;
+    if (staging) {
+      for await (const _entry of staging.entries()) throw refuse();
+    }
+    const worktree = this.bare ? undefined : this.worktreeAccess;
+    if (worktree) {
+      for await (const _entry of worktree.walk({
+        includeIgnored: true,
+        includeDirectories: true,
+      })) {
+        throw refuse();
+      }
+      if (source) {
+        const self = await worktree.openRepository?.(".").catch(() => undefined);
+        if (self && (self.commonDir ?? self.gitDir) === (source.commonDir ?? source.gitDir)) {
+          throw refuse();
+        }
+      }
+    }
+  }
+
+  /**
    * Writes the configuration `git clone` writes (clone.c): `remote.<name>.url`,
    * `remote.<name>.tagOpt` for `--no-tags` and `--mirror` (git 2.49+), the `remote.<name>.fetch` refspec of what was
    * cloned (none for a bare clone; `+refs/*:refs/*` and `remote.<name>.mirror` for a
@@ -630,6 +717,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     detachedTag?: string;
     remoteHead?: string;
     checkedOutBranch?: string;
+    isEmpty?: boolean;
   }): Promise<void> {
     const store = RemoteConfigStore.from(this.workingCopy);
     // git init probes the filesystem: what the worktree cannot represent is turned off
@@ -654,8 +742,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       if (!clone.singleBranch) fetchRefspec = `+refs/heads/*:${top}*`;
       else if (clone.detachedTag) fetchRefspec = `+${clone.detachedTag}:${clone.detachedTag}`;
       else if (clone.branch) fetchRefspec = `+refs/heads/${clone.branch}:${top}${clone.branch}`;
-      // without a remote HEAD branch, a later fetch takes the remote HEAD alone, as in git
-      else if (clone.remoteHead)
+      // without a remote HEAD branch, a later fetch takes the remote HEAD alone, as in git;
+      // an empty remote's unborn HEAD points at nothing (remote_head_points_at): no refspec
+      else if (clone.remoteHead && !clone.isEmpty)
         fetchRefspec = `+refs/heads/${clone.remoteHead}:${top}${clone.remoteHead}`;
     }
     if (fetchRefspec) {

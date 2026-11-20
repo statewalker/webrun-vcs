@@ -15,7 +15,8 @@
  * @see Checkout for mutable local state (Part 3)
  */
 
-import type { ObjectId } from "@statewalker/vcs-core";
+import type { History, ObjectId } from "@statewalker/vcs-core";
+import type { LinkedWorktrees } from "../linked-worktrees/index.js";
 import type { UntrackedScanHost } from "../status/untracked-scan.js";
 import type { WorkingCopy } from "../working-copy.js";
 import type { ContentAttributesContext, WorktreeContentFilter } from "./content-filter.js";
@@ -341,6 +342,17 @@ export interface Worktree {
   openGitlink?(path: string, options?: { name?: string }): Promise<WorkingCopy | undefined>;
 
   /**
+   * The repository a local remote names (`../other`, `/srv/repo.git`, the path of a
+   * `file://` URL), opened over this worktree's storage, as git's upload-pack and
+   * receive-pack find it (`enter_repo`): `<path>/.git`, `<path>`, `<path>.git/.git`, then
+   * `<path>.git`, a gitfile followed. A relative location is read from the worktree top
+   * (where git runs a fetch), an absolute one in the real directory the storage is rooted
+   * at (from its root when that is unknown). Undefined when no repository is there or it
+   * lies beyond the storage's root.
+   */
+  openRepository?(location: string): Promise<OpenedRepository | undefined>;
+
+  /**
    * The repository directory of the submodule at `path`, in this worktree's FilesApi: its
    * `.git` directory, or the place its gitfile names (resolved as git resolves it, whether a
    * repository is there or not). Null when the gitfile names a place this FilesApi cannot
@@ -410,4 +422,34 @@ export interface WorktreeExtended extends Worktree {
   watch?(
     callback: (events: Array<{ path: string; type: "add" | "change" | "remove" }>) => void,
   ): () => void;
+}
+
+/** A repository {@link Worktree.openRepository} opened. */
+export interface OpenedRepository {
+  /** Its objects and refs (HEAD the one of the git directory opened) */
+  history: History;
+  /** Its git directory, in the storage's paths */
+  gitDir: string;
+  /**
+   * Its repository directory: the one a linked worktree's git directory names in
+   * `commondir`, else `gitDir`
+   */
+  commonDir?: string;
+  /**
+   * Whether it has no working tree (`core.bare`, else no `.git` directory name; a linked
+   * worktree's git directory never is)
+   */
+  bare: boolean;
+  /** Its configuration, as git reads it there (system, global, then the repository's) */
+  config?: OpenedRepositoryConfig;
+  /** Its worktrees: the main one and the linked ones (git's `get_worktrees`) */
+  worktrees?: LinkedWorktrees;
+}
+
+/** The configuration of an {@link OpenedRepository}, values as written. */
+export interface OpenedRepositoryConfig {
+  /** Every value of `key` in the order git reads them; null for a key without `=` */
+  getAll(key: string): Array<string | null>;
+  /** Every entry in the order git reads them */
+  list(): Array<{ key: string; value: string | null }>;
 }

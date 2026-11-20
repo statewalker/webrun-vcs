@@ -9,7 +9,7 @@ export class MergeConflictError extends GitApiError {
   readonly conflicts: string[];
 
   constructor(conflicts: string[] = [], message?: string) {
-    super(message ?? `Merge conflicts in ${conflicts.length} file(s)`);
+    super(message ?? `Merge conflicts in ${conflicts.length} file(s)`, { exitCode: 1 });
     this.name = "MergeConflictError";
     this.conflicts = conflicts;
   }
@@ -22,7 +22,7 @@ export class MergeConflictError extends GitApiError {
  */
 export class InvalidMergeHeadsError extends GitApiError {
   constructor(message?: string) {
-    super(message ?? "No merge heads specified");
+    super(message ?? "No merge heads specified", { exitCode: 1 });
     this.name = "InvalidMergeHeadsError";
   }
 }

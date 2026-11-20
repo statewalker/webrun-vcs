@@ -1,5 +1,5 @@
 import type { UploadPackConfig } from "../fsm/fetch/upload-pack-hooks.js";
-import type { ReceivePackConfig } from "../fsm/push/receive-pack-types.js";
+import type { ReceiveDenyAction, ReceivePackConfig } from "../fsm/push/receive-pack-types.js";
 
 /**
  * Which objects upload-pack serves when a client asks for them by id (`want <oid>`); anything
@@ -128,7 +128,7 @@ export class ProcessConfiguration {
    * ("branch is currently checked out", git's `receive.denyCurrentBranch`).
    * @default true
    */
-  denyCurrentBranch?: boolean;
+  denyCurrentBranch?: boolean | ReceiveDenyAction;
 
   /**
    * The currently checked-out branch on the server.

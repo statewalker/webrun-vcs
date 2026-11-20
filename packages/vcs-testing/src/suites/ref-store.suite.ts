@@ -26,7 +26,9 @@ export type RefStoreFactory = () => Promise<RefStoreTestContext>;
  * Helper function to generate a fake object ID (for testing)
  */
 function fakeObjectId(seed: string): string {
-  return seed.padEnd(40, "0").slice(0, 40);
+  // hex digits: ref stores refuse a value that is no object id
+  const hex = Array.from(seed, (c) => c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+  return hex.padEnd(40, "0").slice(0, 40);
 }
 
 /**

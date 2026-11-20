@@ -1,9 +1,10 @@
 import type { ObjectId } from "@statewalker/vcs-core";
-import { lsRemote } from "@statewalker/vcs-transport";
+import { lsRefs, lsRemote } from "@statewalker/vcs-transport";
 
 import { InvalidRemoteError } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { TransportCommand } from "../transport-command.js";
+import { localRemotePath, openLocalRemote, withLocalUploadPack } from "./local-transport.js";
 
 /**
  * A remote ref entry.
@@ -156,12 +157,26 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
       throw new InvalidRemoteError(this.remote);
     }
 
-    // Execute ls-remote
-    const refs = await lsRemote(remoteUrl, {
-      auth: this.credentials,
-      headers: this.headers,
-      timeout: this.timeout,
-    });
+    // transport_get: smart HTTP, or git's local transport (upload-pack of the repository at
+    // the path, in process: its v2 ls-refs); anything else fails in git's words
+    const localPath = localRemotePath(remoteUrl);
+    const refs =
+      localPath === undefined
+        ? await lsRemote(remoteUrl, {
+            auth: this.credentials,
+            headers: this.headers,
+            timeout: this.timeout,
+          })
+        : await withLocalUploadPack(
+            await openLocalRemote(this.workingCopy, localPath),
+            async (connection) => {
+              const listed = new Map<string, ObjectId>();
+              for (const ref of await lsRefs(connection, [])) {
+                if (ref.oid) listed.set(ref.name, ref.oid);
+              }
+              return listed;
+            },
+          );
 
     // Filter refs based on heads/tags settings
     const filteredRefs: RemoteRef[] = [];

@@ -16,6 +16,7 @@ import {
   pathspecName,
   psEqual,
 } from "./pathspec.js";
+import { PathspecAttributes } from "./pathspec-attributes.js";
 import { strerror } from "./strerror.js";
 import { removeDirectoryIfEmpty } from "./worktree-overwrite-checks.js";
 
@@ -206,12 +207,18 @@ export class CleanCommand extends GitCommand<CleanResult> {
     }
     const { root, nodes } = await this.loadTree(worktree, tracked);
     const removeDirectories = this.directories || this.paths.size > 0;
+    const pathspec = parsePathspec([...this.paths], { attr: true });
+    // `:(attr:...)`: the attributes of the files and directories read (a directory's by its
+    // name with its "/", as dir.c matches it)
+    const attributes = PathspecAttributes.forWorktree(pathspec, worktree);
+    await attributes?.load([...nodes].map(([path, n]) => (n.directory ? `${path}/` : path)));
+    await attributes?.load(nodes.keys());
     const scan = new DirectoryScan({
       nodes,
       tracked,
       trackedDirs: directoriesOf(tracked),
       gitlinks,
-      pathspec: parsePathspec([...this.paths]),
+      pathspec,
       // -x: no ignore rules at all (git does not set up the standard excludes)
       excludes: this.ignoredOnly || this.ignore,
       showIgnored: this.ignoredOnly,

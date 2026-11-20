@@ -153,9 +153,10 @@ export interface UntrackedScanPathspec {
    * `match_pathspec_with_flags` (no `seen`): how the best positive element matches `name`
    * (`MATCHED_RECURSIVELY` 1, `MATCHED_RECURSIVELY_LEADING_PATHSPEC` 2, `MATCHED_FNMATCH`
    * 3, `MATCHED_EXACTLY` 4), 0 when none does or an exclude element matches; `leading` is
-   * `DO_MATCH_LEADING_PATHSPEC` (a directory that may hold matches)
+   * `DO_MATCH_LEADING_PATHSPEC` (a directory that may hold matches); a promise where the
+   * answer needs a read first (the attributes of `:(attr:...)` elements)
    */
-  match(name: string, leading: boolean): number;
+  match(name: string, leading: boolean): number | Promise<number>;
   /** `simplify_away`: no element can match `path` or anything below it */
   simplifyAway(path: string): boolean;
   /** `common_prefix_len`: the leading directories (with their `/`) the walk starts at */
@@ -422,7 +423,8 @@ export async function scanUntracked(
     if (inIndex === "gitlink") return PATH_NONE;
     let matchesHow = 0;
     if (pathspec && !excluded) {
-      matchesHow = pathspec.match(`${path}/`, true);
+      const how = pathspec.match(`${path}/`, true);
+      matchesHow = typeof how === "number" ? how : await how;
       if (!matchesHow) return PATH_NONE;
     }
     if (await host.isNestedRepository(path)) {
@@ -499,7 +501,10 @@ export async function scanUntracked(
     }
     // a FIFO, socket or device is nothing git tracks
     if (kind === "other") return { state: PATH_NONE, path, name };
-    if (pathspec && !pathspec.match(path, false)) return { state: PATH_NONE, path, name };
+    if (pathspec) {
+      const how = pathspec.match(path, false);
+      if (!(typeof how === "number" ? how : await how)) return { state: PATH_NONE, path, name };
+    }
     return { state: excluded ? PATH_EXCLUDED : PATH_UNTRACKED, path, name };
   };
 
@@ -577,7 +582,10 @@ export async function scanUntracked(
         if (sub) nodes.set(subPath, sub);
         const subState = await readDirectoryRecursive(subPath, sub, checkOnly, stopAtFirstFile);
         if (subState > dirState) dirState = subState;
-        if (pathspec && !pathspec.match(path, false)) state = PATH_NONE;
+        if (pathspec) {
+          const how = pathspec.match(path, false);
+          if (!(typeof how === "number" ? how : await how)) state = PATH_NONE;
+        }
       }
       if (checkOnly) {
         if (stopAtFirstFile && dirState >= PATH_EXCLUDED) {

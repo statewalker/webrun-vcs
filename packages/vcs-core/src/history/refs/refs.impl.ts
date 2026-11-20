@@ -7,6 +7,7 @@ import {
   type BatchOptions,
   type BatchResult,
   batchBySingleRef,
+  isRefObjectId,
   isUpdatableRefName,
   planRefBatch,
   planReflog,
@@ -142,6 +143,10 @@ export class MemoryRefs implements Refs {
    * Set a direct reference
    */
   set(name: string, objectId: ObjectId, log?: RefLogOptions): Promise<void> {
+    // a direct value is an object id, never a name (see isRefObjectId)
+    if (!isRefObjectId(objectId)) {
+      return Promise.reject(new Error(`cannot update ${name}: ${name}: invalid-object-id`));
+    }
     return this.exclusive(async () => {
       if (!log || !isUpdatableRefName(name)) {
         this.refs.set(name, { type: "direct", objectId });

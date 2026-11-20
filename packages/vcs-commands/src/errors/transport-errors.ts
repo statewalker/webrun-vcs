@@ -1,4 +1,4 @@
-import { GitApiError } from "./git-api-error.js";
+import { GitApiError, type GitApiErrorOptions } from "./git-api-error.js";
 
 /**
  * Error thrown when a remote cannot be resolved.
@@ -23,8 +23,8 @@ export class InvalidRemoteError extends GitApiError {
 export class TransportError extends GitApiError {
   readonly uri?: string;
 
-  constructor(message: string, uri?: string) {
-    super(uri ? `${uri}: ${message}` : message);
+  constructor(message: string, uri?: string, options?: GitApiErrorOptions) {
+    super(uri ? `${uri}: ${message}` : message, options);
     this.name = "TransportError";
     this.uri = uri;
   }
@@ -50,7 +50,8 @@ export class PushRejectedException extends TransportError {
   readonly reason: string;
 
   constructor(refName: string, reason: string, uri?: string) {
-    super(`${refName}: ${reason}`, uri);
+    // git push exits 1 when a ref is rejected
+    super(`${refName}: ${reason}`, uri, { exitCode: 1 });
     this.name = "PushRejectedException";
     this.refName = refName;
     this.reason = reason;

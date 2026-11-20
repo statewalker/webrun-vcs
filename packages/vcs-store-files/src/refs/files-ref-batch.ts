@@ -114,11 +114,11 @@ function parsePacked(text: string | undefined): Map<string, PackedEntry> {
   for (const line of text.split("\n")) {
     if (line === "" || line.startsWith("#")) continue;
     if (line.startsWith("^")) {
-      if (last) last.peeled = line.slice(1).trim();
+      if (last) last.peeled = line.slice(1).trim().toLowerCase();
       continue;
     }
     if (line.indexOf(" ") !== 40) throw new Error(`malformed packed-refs line: ${line}`);
-    last = { id: line.slice(0, 40) };
+    last = { id: line.slice(0, 40).toLowerCase() };
     out.set(line.slice(41), last);
   }
   return out;
@@ -309,9 +309,10 @@ export function createFilesRefOps(
     if (text === undefined) return undefined;
     const sym = /^ref:\s*(\S+)/.exec(text);
     if (sym) return { target: sym[1] as string };
-    const m = /^([0-9a-f]{40})(?:\s|$)/.exec(text);
+    // git's parse_oid_hex reads either case; the id is kept lowercase, as git writes it
+    const m = /^([0-9a-fA-F]{40})(?:\s|$)/.exec(text);
     if (!m) throw new Error(`${name} is broken: ${JSON.stringify(text.slice(0, 50))}`);
-    return { id: m[1] as string };
+    return { id: (m[1] as string).toLowerCase() };
   }
   const readPacked = async () => parsePacked(await readText(PACKED));
   type ReadLoose = (name: string) => Promise<Loose | undefined>;

@@ -18,14 +18,9 @@ import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
 import {
-  AttributesResolver,
-  type AttributesSourceTree,
-  attributesSourceSetting,
+  type AttributesResolver,
   type ContentAttributesContext,
   expandUserPath,
-  readTreeAttributesFile,
-  resolveAttributesSource,
-  xdgConfigPath,
 } from "@statewalker/vcs-working-tree";
 
 import { GitApiError, IncompatibleOptionsError } from "../errors/index.js";
@@ -33,7 +28,7 @@ import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type CombinedDiffOptions, writeCombinedDiff } from "../results/combined-diff.js";
 import { quotePath } from "../results/quote-path.js";
-import { attributesSourceResolver } from "./attributes-source.js";
+import { bareAttributesResolver } from "./attributes-source.js";
 import { DiffCommand, type DiffTextOptions } from "./diff-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import {
@@ -54,6 +49,7 @@ import {
   notesEnvironmentOf,
 } from "./notes-support.js";
 import { combineNotesIgnore } from "./notes-tree.js";
+import { canonicalObjectId } from "./object-id-input.js";
 import {
   ALL_ENTRIES_NOT_INTERESTING,
   bloomPathOf,
@@ -68,7 +64,9 @@ import {
   treeEntryInteresting,
   treePathspec,
 } from "./pathspec.js";
+import { PathspecAttributes } from "./pathspec-attributes.js";
 import { loadRefDecorations } from "./pretty-format.js";
+import { readDiffSubmoduleConfig } from "./submodule-summary.js";
 
 const NULL_OBJECT_ID = "0".repeat(40);
 
@@ -443,6 +441,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * @param until Commits reachable from here are included (start point)
    */
   addRange(since: ObjectId, until: ObjectId): this {
+    since = canonicalObjectId(since);
+    until = canonicalObjectId(until);
     this.checkCallable();
     this.startCommits.push(until);
     this.pending.push({ id: since, exclude: true }, { id: until, exclude: false });
@@ -457,6 +457,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   async call(): Promise<AsyncIterable<LogResult>> {
     this.checkCallable();
     this.setCallable(false);
+    // git_log_config ends in git_diff_ui_config: a diff.submodule without a value dies
+    readDiffSubmoduleConfig(this.workingCopy);
 
     // the commits given, in order, the refs of `all()` where it was called; HEAD without
     // either
@@ -1257,10 +1259,16 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       options.follow !== undefined
         ? [`:(literal)${options.follow}`]
         : [...this.paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
-    const items = spec.map((p) => parsePathspecItem(p));
+    const items = spec.map((p) => parsePathspecItem(p, { attr: true }));
     if (items.length > 0 && items.every((i) => i.exclude)) items.push(parsePathspecItem("."));
     const all = new Set<string>(result.keys());
     for (const m of parents) for (const k of m.keys()) all.add(k);
+    // `:(attr:...)`: the attributes of the paths, as the walk reads them
+    if (items.some((i) => i.attr)) {
+      await new PathspecAttributes(items, (path, names) => this.readAttributes(path, names)).load(
+        all,
+      );
+    }
     const differs = (a?: { mode: number; id: ObjectId }, b?: { mode: number; id: ObjectId }) =>
       !a || !b ? a !== b : a.id !== b.id || a.mode !== b.mode;
     const paths = [...all]
@@ -1714,12 +1722,17 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const path = attributes?.pending;
     if (!attributes || path === undefined) return;
     attributes.pending = undefined;
+    attributes.values.set(path, await this.readAttributes(path, attributes.names));
+  }
+
+  /** The attributes `names` of `path` as {@link loadAttributes} reads them. */
+  private async readAttributes(
+    path: string,
+    names: readonly string[],
+  ): Promise<Map<string, PathspecAttributeValue>> {
     // a bare repository's working copy refuses its worktree: asked without touching it
     const worktree = "worktree" in this._workingCopy ? this.worktreeAccess : undefined;
-    if (!worktree) {
-      attributes.values.set(path, await this.bareAttributes().get(path, attributes.names));
-      return;
-    }
+    if (!worktree) return this.bareAttributes().get(path, names);
     const filter = worktree.contentFilter as
       | {
           attributes?(
@@ -1731,64 +1744,19 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       | undefined;
     if (!filter?.attributes)
       throw new GitApiError("pathspec magic 'attr' needs the attributes of a worktree");
-    attributes.values.set(
-      path,
-      await filter.attributes(path, attributes.names, { direction: "checkin", index: NO_INDEX }),
-    );
+    return filter.attributes(path, names, { direction: "checkin", index: NO_INDEX });
   }
 
   private bareResolver?: AttributesResolver;
 
-  /**
-   * The attributes of a bare repository: builtin, system, global and `info/attributes`, and
-   * the in-tree files of an attribute source.
-   */
+  /** The attributes of a bare repository (see {@link bareAttributesResolver}). */
   private bareAttributes(): AttributesResolver {
-    if (this.bareResolver) return this.bareResolver;
-    const environment = hostEnvironmentOf(this._workingCopy);
-    const gitDir = (this._workingCopy.config as { hostGitDir?: string } | undefined)?.hostGitDir;
-    const read = (file: string | undefined) =>
-      file && environment ? environment.readFile(file).catch(() => undefined) : undefined;
-    let source: Promise<AttributesSourceTree | undefined> | undefined;
-    this.bareResolver = new AttributesResolver(
-      {
-        system: async () => read(environment?.systemAttributes),
-        global: async () => {
-          const configured = configValue(this._workingCopy, "core.attributesFile");
-          return read(
-            configured
-              ? expandUserPath(configured, environment)
-              : xdgConfigPath(environment, "attributes"),
-          );
-        },
-        info: async () =>
-          read(gitDir ? `${gitDir.replace(/\/+$/, "")}/info/attributes` : undefined),
-        // only from an attribute source (`$GIT_ATTR_SOURCE`, `attr.tree`)
-        inTree: async (dir) => {
-          source ??= (async () => {
-            const setting = attributesSourceSetting(
-              environment?.attrSource,
-              configValue(this._workingCopy, "attr.tree"),
-            );
-            if (!setting) return undefined;
-            return resolveAttributesSource(
-              setting,
-              attributesSourceResolver(() => this.revisionResolver()),
-            );
-          })();
-          const found = await source;
-          if (!found) return undefined;
-          const file = await readTreeAttributesFile(
-            this.trees,
-            this.blobs,
-            found.tree,
-            dir ? `${dir}/.gitattributes` : ".gitattributes",
-          );
-          return file ? { key: `blob:${file.id}`, content: file.content } : undefined;
-        },
-      },
-      { ignoreCase: configBool(this._workingCopy, "core.ignoreCase", false) },
-    );
+    this.bareResolver ??= bareAttributesResolver({
+      workingCopy: this._workingCopy,
+      trees: this.trees,
+      blobs: this.blobs,
+      revisions: () => this.revisionResolver(),
+    });
     return this.bareResolver;
   }
 

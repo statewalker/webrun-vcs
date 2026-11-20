@@ -8,7 +8,12 @@
 
 import { describe, expect, it } from "vitest";
 
-import { checkConnectivity, findNewCommits, mapRejectReason } from "../src/index.js";
+import {
+  checkConnectivity,
+  findNewCommits,
+  mapRejectReason,
+  serverSettingsFromConfig,
+} from "../src/index.js";
 import {
   clientWithNewCommits,
   fullPackOf,
@@ -541,6 +546,103 @@ describe("receive-pack: review fixes", () => {
     expect(run.report).toEqual(["unpack ok", "ok refs/heads/main"]);
   });
 
+  it("checkedOutBranches: every worktree's branch is current (find_shared_symref)", async () => {
+    const { repo, c1, c2 } = await serverRepo();
+    await repo.refStore.update("refs/heads/topic", c2);
+    const empty = await packOf(repo, []);
+    // a bare repository whose linked worktree has topic checked out: main is free
+    const options = {
+      allowNonFastForward: true,
+      bare: true,
+      currentBranch: "refs/heads/main",
+      checkedOutBranches: ["refs/heads/topic"],
+    };
+    let run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${c1} refs/heads/topic`, `${c2} ${c1} refs/heads/main`], pack: empty },
+      options,
+    );
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ng refs/heads/topic branch is currently checked out",
+      "ok refs/heads/main",
+    ]);
+    expect(run.messages).toContain(
+      "error: refusing to update checked out branch: refs/heads/topic",
+    );
+    // its deletion too, under denyCurrentBranch first
+    run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${ZERO} refs/heads/topic`], pack: empty },
+      options,
+    );
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ng refs/heads/topic branch is currently checked out",
+    ]);
+  });
+
+  it("denyCurrentBranch and denyDeleteCurrent actions: warn, ignore, unconfigured", async () => {
+    const { repo, c1, c2 } = await serverRepo();
+    const empty = await packOf(repo, []);
+    const base = { allowNonFastForward: true, currentBranch: "refs/heads/main", bare: false };
+    let run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${c1} refs/heads/main`], pack: empty },
+      { ...base, denyCurrentBranch: "unconfigured" },
+    );
+    expect(run.report).toEqual(["unpack ok", "ng refs/heads/main branch is currently checked out"]);
+    expect(run.messages).toContain(
+      "error: By default, updating the current branch in a non-bare repository",
+    );
+    run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${c1} refs/heads/main`], pack: empty },
+      { ...base, denyCurrentBranch: "warn" },
+    );
+    expect(run.report).toEqual(["unpack ok", "ok refs/heads/main"]);
+    expect(run.messages).toContain("warning: updating the current branch");
+    run = await runReceivePack(
+      repo,
+      { commands: [`${c1} ${ZERO} refs/heads/main`], pack: empty },
+      { ...base, bare: true, denyDeleteCurrent: "ignore" },
+    );
+    expect(run.report).toEqual(["unpack ok", "ok refs/heads/main"]);
+  });
+
+  it("denyCurrentBranch updateInstead: updateWorktree decides, after the other checks", async () => {
+    const { repo, c1, c2 } = await serverRepo();
+    const empty = await packOf(repo, []);
+    const seen: string[] = [];
+    const options = {
+      allowNonFastForward: true,
+      currentBranch: "refs/heads/main",
+      bare: false,
+      denyCurrentBranch: "updateInstead" as const,
+      updateWorktree: async (ref: string, id: string) => {
+        seen.push(`${ref} ${id}`);
+        return seen.length === 1 ? "Working directory has unstaged changes" : undefined;
+      },
+    };
+    let run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${c1} refs/heads/main`], pack: empty },
+      options,
+    );
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ng refs/heads/main Working directory has unstaged changes",
+    ]);
+    expect(await repo.refStore.get("refs/heads/main")).toBe(c2);
+    run = await runReceivePack(
+      repo,
+      { commands: [`${c2} ${c1} refs/heads/main`], pack: empty },
+      options,
+    );
+    expect(run.report).toEqual(["unpack ok", "ok refs/heads/main"]);
+    expect(seen).toEqual([`refs/heads/main ${c1}`, `refs/heads/main ${c1}`]);
+  });
+
   it("createRepositoryFacade tells its bareness", async () => {
     const { createRepositoryFacade } = await import("../src/index.js");
     const { repo } = await serverRepo();
@@ -725,5 +827,50 @@ describe("receive-pack: atomic pushes as git's execute_commands_atomic", () => {
       "ng refs/heads/main atomic transaction failed",
     ]);
     expect(await repo.refStore.get("refs/heads/a")).toBeUndefined();
+  });
+});
+
+describe("receive-pack: the settings git reads from the repository's config", () => {
+  const reader = (entries: Array<[string, string | null]>) => ({
+    getAll: (key: string) =>
+      entries.filter(([k]) => k.toLowerCase() === key.toLowerCase()).map(([, v]) => v),
+    list: () => entries.map(([key, value]) => ({ key, value })),
+  });
+
+  it("maps git's defaults: forced updates and deletes accepted, the current branch unconfigured", () => {
+    expect(serverSettingsFromConfig(reader([]))).toEqual({
+      allowDeletes: true,
+      allowNonFastForward: true,
+      denyCurrentBranch: "unconfigured",
+      denyDeleteCurrent: "unconfigured",
+      shallowUpdate: false,
+      uploadPackHideRefs: [],
+      receivePackHideRefs: [],
+    });
+  });
+
+  it("maps receive.* values as git's config parser and parse_deny_action read them", () => {
+    const settings = serverSettingsFromConfig(
+      reader([
+        ["receive.denyDeletes", null],
+        ["receive.denyNonFastForwards", "yes"],
+        ["receive.denyCurrentBranch", "UpdateInstead"],
+        ["receive.denyDeleteCurrent", "0"],
+        ["receive.shallowUpdate", "1"],
+        ["transfer.hideRefs", "refs/a/"],
+        ["receive.hideRefs", "refs/b"],
+        ["uploadpack.hideRefs", "refs/c"],
+        ["transfer.hideRefs", "!refs/a/x"],
+      ]),
+    );
+    expect(settings).toEqual({
+      allowDeletes: false,
+      allowNonFastForward: false,
+      denyCurrentBranch: "updateInstead",
+      denyDeleteCurrent: "ignore",
+      shallowUpdate: true,
+      uploadPackHideRefs: ["refs/a", "refs/c", "!refs/a/x"],
+      receivePackHideRefs: ["refs/a", "refs/b", "!refs/a/x"],
+    });
   });
 });

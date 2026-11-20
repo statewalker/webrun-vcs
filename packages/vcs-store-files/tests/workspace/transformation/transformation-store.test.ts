@@ -36,8 +36,8 @@ describe("TransformationStore", () => {
 
     it("prioritizes rebase over merge", async () => {
       await store.merge.begin({
-        mergeHead: "abc123",
-        origHead: "def456",
+        mergeHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         squash: false,
         noFastForward: false,
       });
@@ -45,8 +45,8 @@ describe("TransformationStore", () => {
       await store.rebase.begin({
         rebaseType: "rebase-merge",
         headName: "refs/heads/feature",
-        onto: "abc123",
-        origHead: "def456",
+        onto: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         currentStep: 1,
         totalSteps: 3,
         interactive: false,
@@ -58,14 +58,14 @@ describe("TransformationStore", () => {
 
     it("prioritizes merge over cherry-pick", async () => {
       await store.cherryPick.begin({
-        cherryPickHead: "abc123",
-        origHead: "def456",
+        cherryPickHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
       await store.merge.begin({
-        mergeHead: "xyz789",
-        origHead: "def456",
+        mergeHead: "0789000000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         squash: false,
         noFastForward: false,
       });
@@ -76,14 +76,14 @@ describe("TransformationStore", () => {
 
     it("prioritizes cherry-pick over revert", async () => {
       await store.revert.begin({
-        revertHead: "abc123",
-        origHead: "def456",
+        revertHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
       await store.cherryPick.begin({
-        cherryPickHead: "xyz789",
-        origHead: "def456",
+        cherryPickHead: "0789000000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
@@ -112,8 +112,8 @@ describe("TransformationStore", () => {
       expect(await store.merge.isInProgress()).toBe(false);
 
       await store.merge.begin({
-        mergeHead: "abc123",
-        origHead: "def456",
+        mergeHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         squash: false,
         noFastForward: false,
       });
@@ -123,8 +123,8 @@ describe("TransformationStore", () => {
 
     it("completes merge and cleans up state", async () => {
       await store.merge.begin({
-        mergeHead: "abc123",
-        origHead: "def456",
+        mergeHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         squash: false,
         noFastForward: false,
       });
@@ -139,8 +139,8 @@ describe("TransformationStore", () => {
 
     it("aborts merge and cleans up state", async () => {
       await store.merge.begin({
-        mergeHead: "abc123",
-        origHead: "def456",
+        mergeHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         squash: false,
         noFastForward: false,
       });
@@ -152,8 +152,8 @@ describe("TransformationStore", () => {
 
     it("updates merge message", async () => {
       await store.merge.begin({
-        mergeHead: "abc123",
-        origHead: "def456",
+        mergeHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         message: "Original message",
         squash: false,
         noFastForward: false,
@@ -167,8 +167,8 @@ describe("TransformationStore", () => {
 
     it("handles squash merge mode", async () => {
       await store.merge.begin({
-        mergeHead: "abc123",
-        origHead: "def456",
+        mergeHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         squash: true,
         noFastForward: false,
       });
@@ -183,8 +183,8 @@ describe("TransformationStore", () => {
       await store.rebase.begin({
         rebaseType: "rebase-merge",
         headName: "refs/heads/feature",
-        onto: "abc123",
-        origHead: "def456",
+        onto: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         currentStep: 1,
         totalSteps: 5,
         interactive: false,
@@ -200,8 +200,8 @@ describe("TransformationStore", () => {
       await store.rebase.begin({
         rebaseType: "rebase-apply",
         headName: "refs/heads/feature",
-        onto: "abc123",
-        origHead: "def456",
+        onto: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         currentStep: 2,
         totalSteps: 4,
         interactive: false,
@@ -217,8 +217,8 @@ describe("TransformationStore", () => {
       await store.rebase.begin({
         rebaseType: "rebase-merge",
         headName: "refs/heads/feature",
-        onto: "abc123",
-        origHead: "def456",
+        onto: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         currentStep: 1,
         totalSteps: 2,
         interactive: true,
@@ -240,8 +240,8 @@ describe("TransformationStore", () => {
       await store.rebase.begin({
         rebaseType: "rebase-merge",
         headName: "feature",
-        onto: "abc123",
-        origHead: "def456",
+        onto: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         currentStep: 1,
         totalSteps: 3,
         interactive: false,
@@ -257,8 +257,8 @@ describe("TransformationStore", () => {
       await store.rebase.begin({
         rebaseType: "rebase-merge",
         headName: "feature",
-        onto: "abc123",
-        origHead: "def456",
+        onto: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         currentStep: 1,
         totalSteps: 3,
         interactive: true,
@@ -284,8 +284,8 @@ describe("TransformationStore", () => {
       await store.rebase.begin({
         rebaseType: "rebase-merge",
         headName: "feature",
-        onto: "abc123",
-        origHead: "def456",
+        onto: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         currentStep: 1,
         totalSteps: 1,
         interactive: false,
@@ -304,8 +304,8 @@ describe("TransformationStore", () => {
       await store.rebase.begin({
         rebaseType: "rebase-merge",
         headName: "feature",
-        onto: "abc123",
-        origHead: "def456",
+        onto: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         currentStep: 1,
         totalSteps: 1,
         interactive: false,
@@ -333,8 +333,8 @@ describe("TransformationStore", () => {
       expect(await store.cherryPick.isInProgress()).toBe(false);
 
       await store.cherryPick.begin({
-        cherryPickHead: "abc123",
-        origHead: "def456",
+        cherryPickHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
@@ -343,8 +343,8 @@ describe("TransformationStore", () => {
 
     it("completes cherry-pick and cleans up", async () => {
       await store.cherryPick.begin({
-        cherryPickHead: "abc123",
-        origHead: "def456",
+        cherryPickHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
@@ -355,8 +355,8 @@ describe("TransformationStore", () => {
 
     it("updates message", async () => {
       await store.cherryPick.begin({
-        cherryPickHead: "abc123",
-        origHead: "def456",
+        cherryPickHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         message: "Original",
         noCommit: false,
       });
@@ -386,8 +386,8 @@ describe("TransformationStore", () => {
       expect(await store.revert.isInProgress()).toBe(false);
 
       await store.revert.begin({
-        revertHead: "abc123",
-        origHead: "def456",
+        revertHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
@@ -396,8 +396,8 @@ describe("TransformationStore", () => {
 
     it("completes revert and cleans up", async () => {
       await store.revert.begin({
-        revertHead: "abc123",
-        origHead: "def456",
+        revertHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
@@ -505,8 +505,8 @@ describe("TransformationStore", () => {
 
     it("returns true during merge", async () => {
       await store.merge.begin({
-        mergeHead: "abc123",
-        origHead: "def456",
+        mergeHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         squash: false,
         noFastForward: false,
       });
@@ -518,8 +518,8 @@ describe("TransformationStore", () => {
       await store.rebase.begin({
         rebaseType: "rebase-merge",
         headName: "feature",
-        onto: "abc123",
-        origHead: "def456",
+        onto: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         currentStep: 1,
         totalSteps: 1,
         interactive: false,
@@ -530,8 +530,8 @@ describe("TransformationStore", () => {
 
     it("returns true during cherry-pick", async () => {
       await store.cherryPick.begin({
-        cherryPickHead: "abc123",
-        origHead: "def456",
+        cherryPickHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
@@ -540,8 +540,8 @@ describe("TransformationStore", () => {
 
     it("returns true during revert", async () => {
       await store.revert.begin({
-        revertHead: "abc123",
-        origHead: "def456",
+        revertHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
@@ -562,8 +562,8 @@ describe("TransformationStore", () => {
 
     it("returns merge capabilities", async () => {
       await store.merge.begin({
-        mergeHead: "abc123",
-        origHead: "def456",
+        mergeHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         squash: false,
         noFastForward: false,
       });
@@ -581,8 +581,8 @@ describe("TransformationStore", () => {
       await store.rebase.begin({
         rebaseType: "rebase-merge",
         headName: "feature",
-        onto: "abc123",
-        origHead: "def456",
+        onto: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         currentStep: 1,
         totalSteps: 3,
         interactive: false,
@@ -600,8 +600,8 @@ describe("TransformationStore", () => {
       await store.rebase.begin({
         rebaseType: "rebase-merge",
         headName: "feature",
-        onto: "abc123",
-        origHead: "def456",
+        onto: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         currentStep: 1,
         totalSteps: 3,
         interactive: true,
@@ -613,8 +613,8 @@ describe("TransformationStore", () => {
 
     it("returns cherry-pick capabilities without sequencer", async () => {
       await store.cherryPick.begin({
-        cherryPickHead: "abc123",
-        origHead: "def456",
+        cherryPickHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
@@ -628,17 +628,17 @@ describe("TransformationStore", () => {
 
     it("returns cherry-pick capabilities with sequencer", async () => {
       await store.cherryPick.begin({
-        cherryPickHead: "abc123",
-        origHead: "def456",
+        cherryPickHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
       await store.sequencer.begin({
         operation: "cherry-pick",
-        head: "def456",
+        head: "def4560000000000000000000000000000000000",
         todo: [
-          { action: "pick", commit: "abc123", message: "First" },
-          { action: "pick", commit: "xyz789", message: "Second" },
+          { action: "pick", commit: "abc1230000000000000000000000000000000000", message: "First" },
+          { action: "pick", commit: "0789000000000000000000000000000000000000", message: "Second" },
         ],
         options: {},
       });
@@ -658,8 +658,8 @@ describe("TransformationStore", () => {
 
     it("aborts merge", async () => {
       await store.merge.begin({
-        mergeHead: "abc123",
-        origHead: "def456",
+        mergeHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         squash: false,
         noFastForward: false,
       });
@@ -673,8 +673,8 @@ describe("TransformationStore", () => {
       await store.rebase.begin({
         rebaseType: "rebase-merge",
         headName: "feature",
-        onto: "abc123",
-        origHead: "def456",
+        onto: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         currentStep: 1,
         totalSteps: 1,
         interactive: false,
@@ -687,15 +687,17 @@ describe("TransformationStore", () => {
 
     it("aborts cherry-pick and sequencer", async () => {
       await store.cherryPick.begin({
-        cherryPickHead: "abc123",
-        origHead: "def456",
+        cherryPickHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
       await store.sequencer.begin({
         operation: "cherry-pick",
-        head: "def456",
-        todo: [{ action: "pick", commit: "abc123", message: "First" }],
+        head: "def4560000000000000000000000000000000000",
+        todo: [
+          { action: "pick", commit: "abc1230000000000000000000000000000000000", message: "First" },
+        ],
         options: {},
       });
 
@@ -707,15 +709,21 @@ describe("TransformationStore", () => {
 
     it("aborts revert and sequencer", async () => {
       await store.revert.begin({
-        revertHead: "abc123",
-        origHead: "def456",
+        revertHead: "abc1230000000000000000000000000000000000",
+        origHead: "def4560000000000000000000000000000000000",
         noCommit: false,
       });
 
       await store.sequencer.begin({
         operation: "revert",
-        head: "def456",
-        todo: [{ action: "revert", commit: "abc123", message: "First" }],
+        head: "def4560000000000000000000000000000000000",
+        todo: [
+          {
+            action: "revert",
+            commit: "abc1230000000000000000000000000000000000",
+            message: "First",
+          },
+        ],
         options: {},
       });
 
