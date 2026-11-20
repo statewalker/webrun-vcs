@@ -980,9 +980,12 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // staged until HEAD has moved
     const index = await this.holdIndex();
     try {
-      // Handle --all flag: auto-stage modified tracked files
-      await this.stageTrackedChanges();
-      return await this.commitWith(partial, index);
+      // git writes the lock once (prepare_index): one post-index-change run, the lock held
+      return await this.withOneIndexWrite("first", async () => {
+        // Handle --all flag: auto-stage modified tracked files
+        await this.stageTrackedChanges();
+        return await this.commitWith(partial, index);
+      });
     } catch (error) {
       await index.release();
       throw error;

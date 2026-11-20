@@ -323,6 +323,17 @@ export interface Staging {
   setRacyCheck?(check: RacyCheck | undefined): void;
 
   /**
+   * Sets what runs after each write of the index file: `write()`, a lock's `write()` (before
+   * the lock is committed) and a `refreshStats` that stored something, as git runs its
+   * post-index-change hook at the end of `do_write_locked_index`. Undefined removes it.
+   * Absent: a staging with no index file.
+   */
+  setWriteHook?(hook: (() => Promise<void>) | undefined): void;
+
+  /** The hook {@link setWriteHook} installed, if any. */
+  getWriteHook?(): (() => Promise<void>) | undefined;
+
+  /**
    * Clear all entries
    */
   clear(): Promise<void>;

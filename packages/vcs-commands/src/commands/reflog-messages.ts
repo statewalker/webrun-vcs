@@ -20,6 +20,7 @@ import {
 } from "@statewalker/vcs-core";
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 
+import { GitApiError } from "../errors/index.js";
 import { findIdent, hostEnvironmentOf, identConfigOf } from "./git-ident.js";
 
 /**
@@ -119,8 +120,58 @@ export const reflogMessages = {
  * Move HEAD to `id` as git's `update_ref("HEAD", ...)` does: through a symbolic HEAD its
  * branch moves (logged in the branch's reflog and HEAD's), a detached HEAD moves itself.
  */
-export async function updateHead(refs: Refs, id: ObjectId, log: RefLogOptions): Promise<void> {
+export async function updateHead(refs: Refs, id: ObjectId, log?: RefLogOptions): Promise<void> {
   const head = await refs.get("HEAD");
   if (head && isSymbolicRef(head)) await refs.set(head.target, id, log);
   else await refs.set("HEAD", id, log);
+}
+
+/**
+ * Move HEAD to `id` as git's `refs_update_ref("HEAD", id, old)` does: one transaction on
+ * HEAD expecting `old` (unchecked when undefined), through a symbolic HEAD to its branch
+ * unless `noDeref` (a detached HEAD written as itself), as the reference-transaction hook
+ * sees it (`<old> <new> HEAD`). A store whose batches cannot take HEAD sets it plainly; a
+ * refusal (HEAD moved meanwhile, its lock held) throws.
+ */
+export async function updateHeadExpecting(
+  refs: Refs,
+  id: ObjectId,
+  old: ObjectId | undefined,
+  log: RefLogOptions | undefined,
+  options: { noDeref?: boolean } = {},
+): Promise<void> {
+  const result = await refs.batch(
+    [
+      {
+        name: "HEAD",
+        ...(old !== undefined ? { old } : {}),
+        new: id,
+        ...(options.noDeref ? { noDeref: true } : {}),
+      },
+    ],
+    log,
+  );
+  if (result.ok) return;
+  if (result.rejected.every((r) => r.reason === "unsupported" || r.reason === "invalid-name")) {
+    if (options.noDeref) await refs.set("HEAD", id, log);
+    else await updateHead(refs, id, log);
+    return;
+  }
+  // UPDATE_REFS_DIE_ON_ERR: git's lock_ref_for_update message
+  const mismatch = result.rejected.find((r) => r.reason === "mismatch");
+  const current =
+    mismatch && old !== undefined
+      ? (await refs.resolve("HEAD").catch(() => undefined))?.objectId
+      : undefined;
+  const detail =
+    mismatch && old !== undefined
+      ? current
+        ? `is at ${current} but expected ${old}`
+        : "unable to resolve reference 'HEAD'"
+      : result.rejected.some((r) => r.reason === "locked")
+        ? "HEAD.lock is held by another writer"
+        : result.rejected.map((r) => `${r.name}: ${r.reason}`).join(", ");
+  throw Object.assign(new GitApiError(`fatal: cannot lock ref 'HEAD': ${detail}`), {
+    rejected: result.rejected,
+  });
 }

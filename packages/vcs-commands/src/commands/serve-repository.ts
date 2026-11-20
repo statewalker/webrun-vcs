@@ -13,13 +13,15 @@ import {
 } from "@statewalker/vcs-transport";
 import type { OpenedRepository } from "@statewalker/vcs-working-tree";
 import type { HookSession } from "./git-hooks.js";
-import { receivePackSettingsOf } from "./local-transport.js";
+import { receivePackSettingsOf, withReceiveTransactionHook } from "./local-transport.js";
 
 /** Options of {@link servedRepositoryOf}. */
 export interface ServedRepositoryOptions {
   /**
    * The served repository's hooks (`remoteHookSession`): pre-receive, update, post-receive and
-   * post-update run for a push, their output relayed to the client
+   * post-update run for a push, their output relayed to the client; its reference-transaction
+   * hook runs for the refs a push updates, as git's receive-pack runs it (in the git
+   * directory, `GIT_DIR=.`), its output not sent to the client
    */
   hooks?: HookSession;
 }
@@ -74,10 +76,19 @@ export async function servedRepositoryOf(
     ...(await receivePackSettingsOf(remote, options.hooks)),
   };
   for (const key of CONFIG_KEYS) delete settings[key];
+  const hooks = options.hooks;
   return {
     repository: createRepositoryFacade({ history: remote.history }),
     refStore: createTransportRefStore(remote.history.refs),
     config: remote.config ?? EMPTY_CONFIG,
     settings: settings as GitServeSettings,
+    ...(hooks?.enabled
+      ? {
+          around: <T>(service: string, serve: () => Promise<T>) =>
+            service === "git-receive-pack"
+              ? withReceiveTransactionHook(remote, hooks, serve)
+              : serve(),
+        }
+      : {}),
   };
 }

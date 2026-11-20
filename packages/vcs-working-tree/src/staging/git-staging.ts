@@ -419,6 +419,7 @@ export class GitStaging implements Staging {
     this.skipWorktreeCleared = new Set();
     this.asRead.reset(this._entries);
     this.updateTime = await this.indexMtime();
+    await this.writeHook?.();
   }
 
   /**
@@ -440,6 +441,8 @@ export class GitStaging implements Staging {
         );
         written = this._entries;
         await lock.write(written);
+        // git runs post-index-change once the lock is written, before it is committed
+        await this.writeHook?.();
       },
       commit: async () => {
         await lock.commit();
@@ -495,6 +498,17 @@ export class GitStaging implements Staging {
     this.racyCheck = check;
   }
 
+  /** Told after each write of the index file (see `Staging.setWriteHook`). */
+  private writeHook?: () => Promise<void>;
+
+  setWriteHook(hook: (() => Promise<void>) | undefined): void {
+    this.writeHook = hook;
+  }
+
+  getWriteHook(): (() => Promise<void>) | undefined {
+    return this.writeHook;
+  }
+
   /** The index file's own mtime (0 when unknown: every entry is then racy). */
   private async indexMtime(): Promise<number> {
     try {
@@ -536,6 +550,7 @@ export class GitStaging implements Staging {
     this.skipWorktreeCleared = new Set();
     this._entries = entries;
     this.updateTime = await this.indexMtime();
+    await this.writeHook?.();
     return true;
   }
 

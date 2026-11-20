@@ -158,6 +158,12 @@ export interface HookInvocation {
   hostCwd?: string;
   /** The hook's stdout is sent to its stderr (git's default for hooks, `stdout_to_stderr`) */
   stdoutToStderr: boolean;
+  /**
+   * A hook the configuration defines (git 2.5x's `hook.<name>.command`): a shell command run
+   * as git's `use_shell` runs it (`sh -c '<command> "$@"' '<command>' <args>...`) rather than
+   * a script file; {@link path} then holds the command too
+   */
+  command?: string;
 }
 
 /** What a hook did: its exit code and what it wrote. */

@@ -576,8 +576,13 @@ export interface RefTransactionUpdate {
   name: string;
   /** The command's expected old value: an id, `null` for "must not exist", none unchecked */
   old?: ObjectId | null;
-  /** The value written; `null` deletes the ref */
+  /** The value written; `null` deletes the ref (or, with `newTarget`, writes a symbolic ref) */
   new: ObjectId | null;
+  /**
+   * The ref a symbolic ref is (re)pointed at: git 2.5x's symref update, told to the hook as
+   * `ref:<target>` (git 2.43 writes symbolic refs outside any transaction)
+   */
+  newTarget?: string;
   /**
    * HEAD names the ref written, which was asked for by its own name or through another
    * symbolic ref (a symbolic ORIG_HEAD): git's transaction also logs the update on HEAD

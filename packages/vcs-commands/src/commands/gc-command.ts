@@ -1,5 +1,7 @@
 import type { ObjectId } from "@statewalker/vcs-core";
+import { parseGitInt } from "@statewalker/vcs-utils";
 
+import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { WorktreePruneCommand } from "./worktree-prune-command.js";
@@ -21,7 +23,19 @@ export interface GCCommandResult {
    * --expire <gc.worktreePruneExpire>`, default `3.months.ago`), where the backend keeps them.
    */
   worktreesPruned: string[];
+  /**
+   * `setAuto(true)` only: why nothing was done (git's `gc --auto` returning at once): no
+   * housekeeping needed (`not-needed`, gc.auto 0 included), or the pre-auto-gc hook refused
+   * it (`hook`)
+   */
+  autoSkipped?: "not-needed" | "hook";
+  /** `setAuto(true)` and run: git's "Auto packing the repository ..." lines (its stderr) */
+  messages?: string[];
 }
+
+/** git's defaults: `gc.auto` loose objects, `gc.autoPackLimit` packs. */
+const GC_AUTO_DEFAULT = 6700;
+const GC_AUTO_PACK_LIMIT_DEFAULT = 50;
 
 /**
  * Run garbage collection on the repository.
@@ -63,6 +77,76 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
   }
   private _aggressive = false;
   private _expire?: Date;
+  private _auto = false;
+
+  /**
+   * `git gc --auto`: housekeeping only when needed (git's `need_to_gc`: more loose objects
+   * than `gc.auto`, estimated from `objects/17` as git does, default 6700, or more packs
+   * without a `.keep` than `gc.autoPackLimit`, default 50; 0 or less turns either check
+   * off, `gc.auto=0` all of auto gc), and only when the pre-auto-gc hook, run first, agrees.
+   * No command runs it by itself: callers decide when (git's `maintenance.auto` after a
+   * commit, merge or fetch is not reproduced).
+   *
+   * @example
+   * ```typescript
+   * const result = await git.gc().setAuto(true).call();
+   * if (result.autoSkipped) console.log(`nothing done: ${result.autoSkipped}`);
+   * ```
+   */
+  setAuto(auto: boolean): this {
+    this.checkCallable();
+    this._auto = auto;
+    return this;
+  }
+
+  /**
+   * Whether `gc --auto` has work to do (git's `need_to_gc` / `odb_optimize_required` for the
+   * incremental strategy), read from the common directory's `objects/`.
+   */
+  private async needsAutoGc(): Promise<boolean> {
+    const config = RemoteConfigStore.from(this.workingCopy);
+    // git_config_int: k, m and g units, hex and octal; git dies on anything else
+    const int = (key: string, fallback: number) => {
+      const value = config.value(key);
+      if (value === undefined) return fallback;
+      const n = parseGitInt(value);
+      if (n === undefined) {
+        throw new GitApiError(
+          `fatal: bad numeric config value '${value}' for '${key.toLowerCase()}': invalid unit`,
+        );
+      }
+      return n;
+    };
+    const gcAuto = int("gc.auto", GC_AUTO_DEFAULT);
+    if (gcAuto <= 0) return false;
+    const packLimit = int("gc.autoPackLimit", GC_AUTO_PACK_LIMIT_DEFAULT);
+    const objects = await this.hooks.commonGitFile("objects");
+    if (!objects) return false;
+    const names = async (dir: string): Promise<string[]> => {
+      const out: string[] = [];
+      try {
+        for await (const info of objects.files.list(`${objects.path}/${dir}`)) out.push(info.name);
+      } catch {
+        // a directory that cannot be listed counts as empty
+      }
+      return out;
+    };
+    if (packLimit > 0) {
+      const files = new Set(await names("pack"));
+      let packs = 0;
+      // too_many_packs counts the packs git loads (a `.idx` with its `.pack`), not kept
+      for (const name of files) {
+        if (!name.endsWith(".pack")) continue;
+        const base = name.slice(0, -5);
+        if (files.has(`${base}.idx`) && !files.has(`${base}.keep`)) packs++;
+      }
+      if (packs > packLimit) return true;
+    }
+    // the loose objects estimated from one fan-out directory, against the limit rounded up
+    // to a multiple of 256
+    const inSeventeen = (await names("17")).filter((n) => /^[0-9a-f]{38}$/.test(n)).length;
+    return inSeventeen * 256 > Math.ceil(gcAuto / 256) * 256;
+  }
 
   /**
    * Set aggressive mode.
@@ -118,6 +202,25 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
     const objectsRemoved = 0;
     const bytesFreed = 0;
     let refsPacked = false;
+    const messages: string[] = [];
+    if (this._auto) {
+      const skipped = (autoSkipped: "not-needed" | "hook"): GCCommandResult => ({
+        objectsRemoved,
+        bytesFreed,
+        refsPacked,
+        durationMs: Date.now() - startTime,
+        worktreesPruned: [],
+        autoSkipped,
+      });
+      if (!(await this.needsAutoGc())) return skipped("not-needed");
+      // git's `gc --auto`: the pre-auto-gc hook may refuse the housekeeping
+      const hook = await this.hooks.run("pre-auto-gc");
+      if (hook && hook.exitCode !== 0) return skipped("hook");
+      messages.push(
+        "Auto packing the repository for optimum performance.",
+        'See "git help gc" for manual housekeeping.',
+      );
+    }
 
     // Collect all ref roots
     const roots: ObjectId[] = [];
@@ -172,6 +275,7 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
       refsPacked,
       durationMs: Date.now() - startTime,
       worktreesPruned,
+      ...(this._auto ? { messages } : {}),
     };
   }
 }

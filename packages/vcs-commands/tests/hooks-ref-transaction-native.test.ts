@@ -20,6 +20,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   type Git,
   HookSession,
+  RebaseOperation,
+  RebaseStatus,
   ResetMode,
   refTransactionHookOf,
   SequencerOperation,
@@ -32,11 +34,12 @@ import {
   hookTwins,
   installHooks,
   nativeIn,
+  nativeIs25x,
   oursIn,
 } from "./hooks-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
-import { gitOut, putFile, testEnv } from "./status-native-support.js";
+import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -802,5 +805,237 @@ describeGit("reset: a symbolic ORIG_HEAD written through to its target (as nativ
 
   it("naming HEAD: written through to HEAD's branch", async () => {
     await compare("HEAD");
+  });
+});
+
+describeGit("reference-transaction hook: symbolic refs written (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx-symref-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  // git 2.5x writes a symbolic ref in a transaction of its own (refs_update_symref:
+  // `<zero> ref:<target> <ref>`); git 2.43 writes it outside any, telling the hook nothing
+  it("switch -c and checkout of a branch: HEAD repointed", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    await expectTwins(
+      dir,
+      ["switch", "-q", "-c", "topic"],
+      (g) => attempt(g.switch().setCreateBranch("topic")),
+      "switch -c",
+    );
+    git(dir, ["branch", "other"]);
+    await expectTwins(
+      dir,
+      ["checkout", "-q", "other"],
+      (g) => attempt(g.checkout().setName("other")),
+      "checkout",
+    );
+  });
+
+  it("remote set-head: refs/remotes/<remote>/HEAD written", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    git(dir, ["remote", "add", "origin", "https://example.invalid/r.git"]);
+    git(dir, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    await expectTwins(
+      dir,
+      ["remote", "set-head", "origin", "main"],
+      (g) => attempt(g.remoteSetHead().setRemoteName("origin").setBranch("main")),
+      "remote set-head",
+    );
+  });
+
+  it("a refusal aborts the symbolic ref's update (2.5x)", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    git(dir, ["branch", "other"]);
+    const [theirs, mine] = hookTwins(root, dir);
+    for (const t of [theirs, mine]) hookExit(t, "reference-transaction", 1);
+    const native = nativeIn(theirs, root, ["symbolic-ref", "HEAD", "refs/heads/other"]);
+    const g = await oursIn(mine);
+    const store = g.workingCopy.history.refs as unknown as {
+      setTransactionHook(hook: RefTransactionHook | undefined): void;
+      setSymbolic(name: string, target: string): Promise<void>;
+    };
+    store.setTransactionHook(refTransactionHookOf(new HookSession(g.workingCopy)));
+    const error = await store.setSymbolic("HEAD", "refs/heads/other").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    store.setTransactionHook(undefined);
+    expect(hookLog(mine)).toBe(hookLog(theirs));
+    expect(error !== undefined).toBe(native.status !== 0);
+    if (error) {
+      expect(error).toBeInstanceOf(RefTransactionAbortedError);
+      expect(native.stderr).toContain(`fatal: ${(error as Error).message}`);
+    }
+    expect(git(mine.dir, ["symbolic-ref", "HEAD"])).toBe(git(theirs.dir, ["symbolic-ref", "HEAD"]));
+  });
+
+  it("rebase --abort: HEAD back on its branch", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    git(dir, ["checkout", "-q", "-b", "topic"]);
+    putFile(dir, "a.txt", "topic\n");
+    git(dir, ["commit", "-qam", "topic"]);
+    git(dir, ["checkout", "-q", "main"]);
+    putFile(dir, "a.txt", "main\n");
+    git(dir, ["commit", "-qam", "main"]);
+    git(dir, ["checkout", "-q", "topic"]);
+    gitRun(root, dir, ["rebase", "-q", "main"], testEnv(root));
+    await expectTwins(
+      dir,
+      ["rebase", "--abort"],
+      (g) => attempt(g.rebase().setOperation(RebaseOperation.ABORT)),
+      "rebase --abort",
+    );
+  });
+});
+
+describeGit("reference-transaction hook: ORIG_HEAD and the other root refs (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx-rootrefs-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** main and topic changing a.txt apart (conflicting unless `clean`), topic checked out. */
+  function forked(clean = false): string {
+    const dir = join(root, "r");
+    base(dir);
+    git(dir, ["checkout", "-q", "-b", "topic"]);
+    putFile(dir, clean ? "t.txt" : "a.txt", "topic\n");
+    git(dir, ["add", "-A"]);
+    git(dir, ["commit", "-qm", "topic"]);
+    git(dir, ["checkout", "-q", "main"]);
+    putFile(dir, "a.txt", "main\n");
+    git(dir, ["commit", "-qam", "main"]);
+    git(dir, ["checkout", "-q", "topic"]);
+    return dir;
+  }
+
+  const rebaseMain = (g: Git) => attempt(g.rebase().setUpstream("main"));
+
+  it("rebase: a clean one, ORIG_HEAD written with its old value", async () => {
+    const dir = forked(true);
+    git(dir, ["update-ref", "ORIG_HEAD", "main"]);
+    await expectTwins(dir, ["rebase", "-q", "main"], rebaseMain, "clean rebase");
+  });
+
+  it("rebase: stopped on a conflict (REBASE_HEAD, AUTO_MERGE), then --continue", async () => {
+    const dir = forked();
+    const [theirs, mine] = hookTwins(root, dir);
+    const native = nativeIn(theirs, root, ["rebase", "-q", "main"]);
+    const ours = await rebaseMain(await oursIn(mine));
+    expect(native.status).not.toBe(0);
+    expect(hookLog(mine), "stopped: log").toBe(hookLog(theirs));
+    expect(ours.error).toBeUndefined();
+    for (const t of [theirs, mine]) {
+      putFile(t.dir, "a.txt", "resolved\n");
+      gitRun(root, t.dir, ["add", "a.txt"], t.env);
+      rmSync(t.log, { force: true });
+    }
+    const continued = nativeIn(theirs, root, ["rebase", "--continue"], { GIT_EDITOR: "true" });
+    expect(continued.status, continued.stderr).toBe(0);
+    await (await oursIn(mine, { GIT_EDITOR: "true" }))
+      .rebase()
+      .setOperation(RebaseOperation.CONTINUE)
+      .call();
+    expect(hookLog(mine), "continued: log").toBe(hookLog(theirs));
+    expect(git(mine.dir, ["for-each-ref"])).toBe(git(theirs.dir, ["for-each-ref"]));
+  });
+
+  it("merge: a fast-forward and a merge commit, ORIG_HEAD with its old value", async () => {
+    const dir = forked(true);
+    git(dir, ["update-ref", "ORIG_HEAD", "main"]);
+    await expectTwins(
+      dir,
+      ["merge", "-q", "--no-edit", "main"],
+      (g) => attempt(g.merge().include("main")),
+      "merge commit",
+    );
+    git(dir, ["checkout", "-q", "main"]);
+    await expectTwins(
+      dir,
+      ["merge", "-q", "topic"],
+      (g) => attempt(g.merge().include("topic")),
+      "fast-forward",
+    );
+  });
+
+  it("reset: --hard, --soft and --mixed with an ORIG_HEAD there", async () => {
+    const dir = forked(true);
+    git(dir, ["update-ref", "ORIG_HEAD", "main"]);
+    for (const [mode, flag] of [
+      [ResetMode.HARD, "--hard"],
+      [ResetMode.SOFT, "--soft"],
+      [ResetMode.MIXED, "--mixed"],
+    ] as const) {
+      await expectTwins(
+        dir,
+        ["reset", "-q", flag, "main"],
+        (g) => attempt(g.reset().setRef("main").setMode(mode)),
+        `reset ${flag}`,
+      );
+    }
+  });
+
+  it("am: two patches applied, ORIG_HEAD written", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    for (const n of ["b", "c"]) {
+      putFile(dir, `${n}.txt`, `${n}\n`);
+      git(dir, ["add", "-A"]);
+      git(dir, ["commit", "-qm", n]);
+    }
+    const mbox = join(root, "p.mbox");
+    writeFileSync(mbox, git(dir, ["format-patch", "--stdout", "HEAD~2"]), "latin1");
+    git(dir, ["reset", "-q", "--hard", "HEAD~2"]);
+    git(dir, ["update-ref", "ORIG_HEAD", "HEAD"]);
+    await expectTwins(
+      dir,
+      ["am", "-q", mbox],
+      (g) => attempt(g.am().setLegacyMessages(!nativeIs25x).addMbox(readFileSync(mbox))),
+      "am",
+    );
+  });
+});
+
+describeGit("rebase: an ORIG_HEAD it cannot write reported, as native git", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx-rebase-orighead-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  // checkout_onto's reset_head writes ORIG_HEAD with UPDATE_REFS_MSG_ON_ERR: the error is
+  // printed and the rebase goes on
+  it("ORIG_HEAD.lock held: the error, then the rebase done all the same", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    git(dir, ["branch", "side"]);
+    putFile(dir, "b.txt", "b\n");
+    git(dir, ["add", "b.txt"]);
+    git(dir, ["commit", "-qm", "b"]);
+    git(dir, ["checkout", "-q", "side"]);
+    putFile(dir, "c.txt", "c\n");
+    git(dir, ["add", "c.txt"]);
+    git(dir, ["commit", "-qm", "c"]);
+    git(dir, ["checkout", "-q", "main"]);
+    const [theirs, mine] = hookTwins(root, dir);
+    for (const t of [theirs, mine]) writeFileSync(join(t.dir, ".git/ORIG_HEAD.lock"), "");
+    const native = nativeIn(theirs, root, ["rebase", "side"]);
+    const result = await (await oursIn(mine)).rebase().setUpstream("side").call();
+    expect(native.status, native.stderr).toBe(0);
+    expect(result.status).toBe(RebaseStatus.OK);
+    const errors = (lines: string[]) =>
+      lines
+        .filter((l) => l.startsWith("error: "))
+        .map((l) => l.replace(/cannot lock ref 'ORIG_HEAD': .*/, "cannot lock ref 'ORIG_HEAD':"));
+    expect(errors((result.output ?? []).join("\n").split("\n"))).toEqual(
+      errors(native.stderr.split("\n")),
+    );
+    expect(errors(native.stderr.split("\n"))).toHaveLength(1);
+    expect(refState(mine.dir)).toBe(refState(theirs.dir));
   });
 });

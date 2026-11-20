@@ -18,7 +18,6 @@ import {
   type StagingEntry,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
-
 import type { CommandCommits, CommandRefs } from "../git-command.js";
 import { StashApplyStatus } from "../results/stash-result.js";
 import { worktreeModeTrust } from "./core-config.js";
@@ -31,6 +30,7 @@ import {
   rewriteIndex,
 } from "./merge-support.js";
 import { stripspace } from "./message-cleanup.js";
+import { markIndexUpdate } from "./post-index-change.js";
 import { updateHead } from "./reflog-messages.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
@@ -73,6 +73,8 @@ export async function resetMerge(
   label: string,
   options: OnewayMergeOptions = {},
 ): Promise<MergeRefusal | undefined> {
+  // unpack-trees: post-index-change's worktree flag for the index written next
+  markIndexUpdate(ctx.staging, { workdir: true });
   // in a sparse checkout: unpack-trees with its patterns; reset prints its sparse warnings
   // as plain errors (no porcelain messages). Without update the patterns are not applied
   // (`skip_sparse_checkout` when `!o->update`)
@@ -365,6 +367,8 @@ export async function resetKeep(
   targetId: ObjectId,
   label: string,
 ): Promise<MergeRefusal | undefined> {
+  // unpack-trees: post-index-change's worktree flag for the index written next
+  markIndexUpdate(ctx.staging, { workdir: true });
   // in a sparse checkout: unpack-trees with its patterns; reset prints its sparse warnings
   // as plain errors (no porcelain messages)
   const sparse = await SparseUnpack.start(ctx);
@@ -517,9 +521,13 @@ export async function moveHeadAsReset(
   log: RefLogOptions,
   /** ORIG_HEAD's reflog message (a log only a symbolic ORIG_HEAD's target keeps) */
   origHeadMessage = "reset: updating ORIG_HEAD",
+  /** HEAD detached at `target` (git's RESET_HEAD_DETACH: REF_NO_DEREF) rather than written through */
+  options: { detach?: boolean } = {},
 ): Promise<string[]> {
+  const detach = options.detach === true;
   if (!headId) {
-    await updateHead(refs, target, log);
+    if (detach) await refs.set("HEAD", target, log);
+    else await updateHead(refs, target, log);
     return [];
   }
   const errors: string[] = [];
@@ -539,9 +547,15 @@ export async function moveHeadAsReset(
       errors.push(origHeadError(error, old, await resolved()));
     }
   }
-  const result = await refs.batch([{ name: "HEAD", old: headId, new: target }], log);
+  const result = await refs.batch(
+    [{ name: "HEAD", old: headId, new: target, ...(detach ? { noDeref: true } : {}) }],
+    log,
+  );
   // a store that cannot batch HEAD: the plain update
-  if (!result.ok) await updateHead(refs, target, log);
+  if (!result.ok) {
+    if (detach) await refs.set("HEAD", target, log);
+    else await updateHead(refs, target, log);
+  }
   return errors;
 }
 
