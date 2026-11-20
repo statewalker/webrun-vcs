@@ -318,9 +318,23 @@ export class HookSession {
   private readonly stdoutChunks: string[] = [];
 
   private readonly host: HookHost;
+  /** Variables every hook of this session gets, below each call's own (see {@link withEnv}) */
+  private processEnv: Record<string, string> = {};
 
   constructor(source: WorkingCopy | HookHost) {
     this.host = "layout" in source ? source : hookHostOf(source);
+  }
+
+  /**
+   * A session sharing this one's output and hints whose hooks all get `env` too (below each
+   * call's own variables): the hooks of a git command git runs as a child process with
+   * variables set, as a sequencer's `git commit` with GIT_REFLOG_ACTION.
+   */
+  withEnv(env: Record<string, string>): HookSession {
+    const derived = Object.create(HookSession.prototype) as HookSession;
+    Object.assign(derived, this);
+    derived.processEnv = { ...this.processEnv, ...env };
+    return derived;
   }
 
   private get runner(): HookRunner | undefined {
@@ -475,7 +489,11 @@ export class HookSession {
         ...(hook.hostPath ? { hostPath: hook.hostPath } : {}),
         args: options.args ?? [],
         ...(stdin ? { stdin } : {}),
-        env: { ...(options.prefix === false ? {} : { GIT_PREFIX: "" }), ...(options.env ?? {}) },
+        env: {
+          ...(options.prefix === false ? {} : { GIT_PREFIX: "" }),
+          ...this.processEnv,
+          ...(options.env ?? {}),
+        },
         cwd,
         ...(hostCwd ? { hostCwd } : {}),
         stdoutToStderr: !options.keepStdout,
@@ -602,7 +620,9 @@ export function refTransactionHookOf(
       if (state === "preparing") lines.push(line(u.requested));
       else if (legacy && u.requested !== u.name) {
         lines.push(line(u.requested));
+        for (const n of u.through ?? []) appended.push(line(n));
         appended.push(line(u.name));
+        if (u.viaHead) appended.push(line("HEAD"));
       } else {
         lines.push(line(u.name));
         if (legacy && u.viaHead) appended.push(line("HEAD"));

@@ -1421,6 +1421,11 @@ export class MergeCommand extends GitCommand<MergeResult> {
     return this.message !== undefined ? `${this.message}\n` : message;
   }
 
+  /** git's merge exports GIT_REFLOG_ACTION before it writes a ref (see reflogActionValue). */
+  protected override refTransactionHookEnv(): Record<string, string> | undefined {
+    return { GIT_REFLOG_ACTION: this.reflogActionValue() };
+  }
+
   /** `GIT_REFLOG_ACTION` as git's merge exports it (`merge <names>`, `pull` for a pull). */
   private reflogActionValue(): string {
     return this.reflogAction(reflogMessages.mergeAction(this.includes));

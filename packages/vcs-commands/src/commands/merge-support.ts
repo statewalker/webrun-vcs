@@ -11,6 +11,7 @@ import {
   collectTreeBytes,
   FileMode,
   type ObjectId,
+  type RefLogOptions,
   type TreeEntry,
 } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
@@ -671,7 +672,30 @@ export class OperationState {
     return ref && "objectId" in ref && ref.objectId ? ref.objectId : undefined;
   }
 
-  async setRef(name: string, id: ObjectId): Promise<void> {
+  /**
+   * Writes a pseudo ref. With `old` (an id, or `null` for none), as git's refs_update_ref
+   * given the value it read: a ref store with a transaction hook shows it, and checks it under
+   * the lock (a store that cannot batch the ref writes it plainly).
+   */
+  async setRef(
+    name: string,
+    id: ObjectId,
+    options?: { old: ObjectId | null; log?: RefLogOptions },
+  ): Promise<void> {
+    if (options) {
+      const result = await this.refs.batch([{ name, old: options.old, new: id }], options.log);
+      if (result.ok) return;
+      if (
+        !result.rejected.every((r) => r.reason === "invalid-name" || r.reason === "unsupported")
+      ) {
+        throw Object.assign(
+          new Error(
+            `cannot update ${name}: ${result.rejected.map((r) => `${r.name}: ${r.reason}`).join(", ")}`,
+          ),
+          { rejected: result.rejected },
+        );
+      }
+    }
     await this.refs.set(name, id);
   }
 
@@ -679,6 +703,15 @@ export class OperationState {
     for (const name of names) {
       if (await this.refs.has(name).catch(() => false)) await this.refs.delete(name);
     }
+  }
+
+  /**
+   * Deletes pseudo refs whether they exist or not, as git's unconditional `refs_delete_ref`
+   * calls (AUTO_MERGE after a commit): a ref store with a transaction hook tells it of the
+   * deletion either way. A failure is ignored, as git ignores it there.
+   */
+  async deleteRef(...names: string[]): Promise<void> {
+    for (const name of names) await this.refs.delete(name).catch(() => false);
   }
 }
 

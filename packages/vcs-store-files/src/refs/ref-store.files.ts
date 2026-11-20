@@ -15,6 +15,7 @@ import type {
   RefLogOptions,
   ReflogDeleteOptions,
   ReflogReader,
+  RefRemoveAllOptions,
   RefRemoveOptions,
   Refs,
   RefTransactionHook,
@@ -29,6 +30,7 @@ import {
   createFilesRefOps,
   type FilesRefBatchOptions,
   type FilesRefOps,
+  isRootRefName,
   RefUpdateRejectedError,
 } from "./files-ref-batch.js";
 import { readAllRefs, readRef, resolveRef } from "./ref-reader.js";
@@ -80,8 +82,10 @@ export class FileRefStore implements Refs {
    * Tells `hook` about each batch (`set`, `batch`, `compareAndSwap`) and each removal of a
    * ref under `refs/` (`remove`) as git runs the reference-transaction hook: `preparing`,
    * `prepared`, `committed`, `aborted` (the last two once the locks are released), with
-   * the packed store's nested transaction of a deletion. Symbolic refs written and names
-   * outside `refs/` other than HEAD are written without it. Undefined removes it.
+   * the packed store's nested transaction of a deletion; also each write (`set`) and removal
+   * of a root ref git updates in a transaction (`isRootRefName`: ORIG_HEAD, CHERRY_PICK_HEAD,
+   * AUTO_MERGE marked for git 2.5x only). Symbolic refs written and the other names outside
+   * `refs/` (MERGE_HEAD, FETCH_HEAD) are written without it. Undefined removes it.
    */
   setTransactionHook(hook: RefTransactionHook | undefined): void {
     this.transactionHook = hook;
@@ -197,7 +201,8 @@ export class FileRefStore implements Refs {
    * Set a ref to point to an object ID, replacing a symbolic ref of that name (git
    * `update-ref --no-deref`). A one-command batch without an old-value check: under
    * `<ref>.lock`, with D/F checks and reflog lines. Names outside `refs/` other than HEAD
-   * (`ORIG_HEAD`) are written under their lock without a reflog. Throws
+   * (`ORIG_HEAD`) are written under their lock without a reflog, the root refs git writes in
+   * a transaction (`isRootRefName`) telling the transaction hook. Throws
    * `RefUpdateRejectedError` (`code` "ELOCKED" when the lock stays held past
    * `refLockTimeoutMs`) with the ref unchanged.
    */
@@ -207,6 +212,7 @@ export class FileRefStore implements Refs {
     if (!isRefObjectId(objectId)) {
       throw new RefUpdateRejectedError([{ name: refName, reason: "invalid-object-id" }]);
     }
+    if (isRootRefName(refName)) return this.ops.writeRootRef(refName, objectId);
     if (!isUpdatableRefName(refName)) return this.ops.writeLoose(refName, `${objectId}\n`);
     const r = await this.ops.batch([{ name: refName, new: objectId, noDeref: true }], log);
     if (!r.ok) throw new RefUpdateRejectedError(r.rejected);
@@ -234,6 +240,16 @@ export class FileRefStore implements Refs {
    */
   async remove(refName: string, options?: RefRemoveOptions): Promise<boolean> {
     return this.ops.removeRef(refName, options);
+  }
+
+  /**
+   * Delete `refNames` whatever their values, as git's `delete_refs` (branch -d, tag -d,
+   * remote prune): one transaction for all of them as git 2.5x, or with `legacy` as git
+   * 2.43's files backend (packed-refs rewritten first, then each ref on its own). Throws
+   * when a ref could not be deleted (see `FilesRefOps.removeRefs`).
+   */
+  removeAll(refNames: string[], options?: RefRemoveAllOptions): Promise<void> {
+    return this.ops.removeRefs(refNames, options);
   }
 
   /**

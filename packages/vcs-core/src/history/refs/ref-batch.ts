@@ -579,10 +579,16 @@ export interface RefTransactionUpdate {
   /** The value written; `null` deletes the ref */
   new: ObjectId | null;
   /**
-   * HEAD names the ref written, which was asked for by its own name: git's transaction
-   * also logs the update on HEAD (`split_head_update`, a line of its own in git 2.43)
+   * HEAD names the ref written, which was asked for by its own name or through another
+   * symbolic ref (a symbolic ORIG_HEAD): git's transaction also logs the update on HEAD
+   * (`split_head_update`, a line of its own in git 2.43, after the ref's)
    */
   viaHead?: boolean;
+  /**
+   * The symbolic refs between `requested` and `name` (an ORIG_HEAD naming HEAD: `HEAD`), in
+   * order: each a log-only update of its own in git 2.43 (`split_symref_update`)
+   */
+  through?: string[];
 }
 
 /**
@@ -618,6 +624,19 @@ export interface RefTransactionContext {
 export interface RefRemoveOptions {
   /** As git's `delete_refs` (branch -d, tag -d), rather than `delete_ref` */
   deleteRefs?: boolean;
+}
+
+/** How a ref store removes several refs (`Refs.removeAll`, git's `delete_refs`). */
+export interface RefRemoveAllOptions {
+  /**
+   * As git 2.43's files backend (files_delete_refs): the refs dropped from packed-refs in a
+   * transaction of the packed store first (packed-refs rewritten, created when absent), then
+   * each ref deleted in a transaction of its own, going on past one that fails. Without it,
+   * as git 2.5x: one transaction deleting them all (none deleted when one cannot be).
+   */
+  legacy?: boolean;
+  /** The reflog message (logged on HEAD when a removed ref is the branch it names) */
+  message?: string;
 }
 
 /** A ref transaction its hook aborted (git: "in '<state>' phase, update aborted by ..."). */

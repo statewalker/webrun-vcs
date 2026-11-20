@@ -55,9 +55,15 @@ export interface GitFilesBackendOptions {
    * (another process, such as native git, is not excluded then).
    */
   atomicFiles?: AtomicFiles;
-  /** Retry a held ref lock for this long (git: core.filesRefLockTimeout, 100 ms). */
+  /**
+   * Retry a held ref lock for this long (git: core.filesRefLockTimeout, 100 ms; negative:
+   * forever, 0: one attempt). Read from the repository's config when omitted.
+   */
   refLockTimeoutMs?: number;
-  /** Retry a held packed-refs.lock for this long (git: core.packedRefsTimeout, 1000 ms). */
+  /**
+   * Retry a held packed-refs.lock for this long (git: core.packedRefsTimeout, 1000 ms;
+   * negative: forever, 0: one attempt). Read from the repository's config when omitted.
+   */
   packedLockTimeoutMs?: number;
   /**
    * git's freshen window (default one hour): writing an object whose pack was last modified
@@ -173,11 +179,11 @@ export async function createGitFilesBackend(
   // receive-pack keeps a pushed pack in objects/tmp_objdir-incoming-* until the push is accepted
   objects.beginQuarantine = () =>
     beginFilesQuarantine({ files, objectsDir, objects, packs, freshenMaxAgeMs });
-  const reflog = await readReflogConfig(files, gitDir);
+  const reflog = await readRefStoreConfig(files, gitDir);
   const refStore = createFileRefStore(files, gitDir, {
     atomicFiles: options.atomicFiles,
-    refLockTimeoutMs: options.refLockTimeoutMs,
-    packedLockTimeoutMs: options.packedLockTimeoutMs,
+    refLockTimeoutMs: options.refLockTimeoutMs ?? reflog.refLockTimeoutMs,
+    packedLockTimeoutMs: options.packedLockTimeoutMs ?? reflog.packedLockTimeoutMs,
     logAllRefUpdates: options.logAllRefUpdates ?? reflog.logAllRefUpdates,
     reflogIdentity: options.reflogIdentity ?? reflog.identity,
   });
@@ -225,11 +231,12 @@ function invalidateOnCompatibilityChange(refs: FileRefStore, commitGraph: Commit
       if (touches) commitGraph.invalidate();
     }
   };
-  const { setShallow, set, setSymbolic, remove, compareAndSwap, batch } = refs;
+  const { setShallow, set, setSymbolic, remove, removeAll, compareAndSwap, batch } = refs;
   refs.setShallow = (...args) => after(setShallow.apply(refs, args), true);
   refs.set = (...args) => after(set.apply(refs, args), replace(args[0]));
   refs.setSymbolic = (...args) => after(setSymbolic.apply(refs, args), replace(args[0]));
   refs.remove = (...args) => after(remove.apply(refs, args), replace(args[0]));
+  refs.removeAll = (...args) => after(removeAll.apply(refs, args), args[0].some(replace));
   refs.compareAndSwap = (...args) => after(compareAndSwap.apply(refs, args), replace(args[0]));
   refs.batch = (...args) =>
     after(
@@ -239,16 +246,20 @@ function invalidateOnCompatibilityChange(refs: FileRefStore, commitGraph: Commit
 }
 
 /**
- * The reflog settings of the repository's config, as git reads them: core.logAllRefUpdates
+ * The ref store settings of the repository's config, as git reads them: core.logAllRefUpdates
  * (a boolean or "always"), defaulting to true unless core.bare is true; user.name and
- * user.email for the reflog identity (each defaulting to webrun-vcs <vcs@localhost>).
+ * user.email for the reflog identity (each defaulting to webrun-vcs <vcs@localhost>); the
+ * lock timeouts core.filesRefLockTimeout and core.packedRefsTimeout (undefined when unset
+ * or not an integer: the store's defaults, 100 and 1000 ms).
  */
-async function readReflogConfig(
+async function readRefStoreConfig(
   files: FilesApi,
   gitDir: string,
 ): Promise<{
   logAllRefUpdates: boolean | "always";
   identity?: { name: string; email: string };
+  refLockTimeoutMs?: number;
+  packedLockTimeoutMs?: number;
 }> {
   const config = await createWorkingCopyConfig(
     {
@@ -268,7 +279,30 @@ async function readReflogConfig(
     name !== undefined || email !== undefined
       ? { name: String(name ?? "webrun-vcs"), email: String(email ?? "vcs@localhost") }
       : undefined;
-  return { logAllRefUpdates, identity };
+  return {
+    logAllRefUpdates,
+    identity,
+    refLockTimeoutMs: parseConfigInt(config.get("core.filesRefLockTimeout")),
+    packedLockTimeoutMs: parseConfigInt(config.get("core.packedRefsTimeout")),
+  };
+}
+
+/** An integer as git_config_int reads it (sign, decimal, 0x hex or 0 octal, then k, m or g). */
+function parseConfigInt(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isSafeInteger(value) ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const match = /^\s*([-+]?)(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)([kKmMgG]?)\s*$/.exec(value);
+  if (!match) return undefined;
+  const digits = match[2] as string;
+  const magnitude =
+    digits.length > 2 && (digits[1] === "x" || digits[1] === "X")
+      ? Number.parseInt(digits.slice(2), 16)
+      : digits.length > 1 && digits.startsWith("0")
+        ? Number.parseInt(digits.slice(1), 8)
+        : Number.parseInt(digits, 10);
+  const unit = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[(match[3] as string).toLowerCase()];
+  const n = magnitude * (unit ?? 1) * (match[1] === "-" ? -1 : 1);
+  return Number.isSafeInteger(n) ? n : undefined;
 }
 
 /**

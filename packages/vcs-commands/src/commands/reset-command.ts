@@ -47,8 +47,8 @@ import {
   parsePathspecFile,
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
-import { reflogMessages, updateHead } from "./reflog-messages.js";
-import { removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
+import { reflogMessages } from "./reflog-messages.js";
+import { moveHeadAsReset, removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import { flaggedEntryDiffers, pruneEmptyParents } from "./worktree-overwrite-checks.js";
@@ -172,7 +172,9 @@ export class ResetCommand extends GitCommand<Ref> {
    * line: the patterns' warnings, and git's `error: Path '<p>' not uptodate; will not remove
    * from working tree.` for a changed file left outside them (`--merge`, `--keep`), and
    * "Autostash exists; creating a new stash entry." with its lines when a stopped merge's
-   * autostash is kept on `refs/stash`. Read after {@link call}.
+   * autostash is kept on `refs/stash`, and git's `error: update_ref failed for ref
+   * 'ORIG_HEAD': ...` when ORIG_HEAD cannot be written (HEAD moves all the same). Read after
+   * {@link call}.
    */
   getWarnings(): string[] {
     return [...this.warnings];
@@ -332,13 +334,22 @@ export class ResetCommand extends GitCommand<Ref> {
       }
     }
 
-    // Move HEAD/branch, the old HEAD kept in ORIG_HEAD (git's reset_refs)
-    if (headId && state.supported) await state.setRef("ORIG_HEAD", headId);
     // git's set_reflog_message: "reset: moving to <rev>", or "<action>: updating HEAD"
     const message = this.hasReflogAction()
       ? `${this.reflogAction("reset")}: updating HEAD`
       : reflogMessages.reset(targetRef);
-    await updateHead(this.refsStore, targetId, this.reflogLine(message));
+    // Move HEAD/branch, the old HEAD kept in ORIG_HEAD (git's update_refs)
+    // (an ORIG_HEAD it cannot write reported on stderr, HEAD moved all the same)
+    this.warnings.push(
+      ...(await moveHeadAsReset(
+        this.refsStore,
+        state,
+        headId,
+        targetId,
+        this.reflogLine(message),
+        `${this.hasReflogAction() ? this.reflogAction("reset") : "reset"}: updating ORIG_HEAD`,
+      )),
+    );
 
     // Reset staging area (for MIXED and HARD)
     if (this.mode === ResetMode.MIXED || this.mode === ResetMode.HARD) {

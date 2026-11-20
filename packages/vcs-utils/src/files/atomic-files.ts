@@ -38,6 +38,12 @@ export interface AtomicFiles {
   append(path: string, content: Uint8Array): Promise<void>;
   /** Remove `dir` if it is an empty directory; `false` otherwise. */
   removeEmptyDir(dir: string): Promise<boolean>;
+  /**
+   * The size and modification time of the file at `path` (nothing when no file is there),
+   * for caches validated by stat data as git's `stat_validity`. Optional: without it a
+   * caller reads the file each time.
+   */
+  stats?(path: string): Promise<{ size?: number; lastModified?: number } | undefined>;
 }
 
 /**
@@ -203,6 +209,11 @@ export function atomicFilesOver(fs: FilesApi, root: string): AtomicFiles {
         for await (const _ of fs.list(abs(dir))) return false;
         return fs.remove(abs(dir));
       }),
+    async stats(path) {
+      const stats = await fs.stats(abs(path));
+      if (stats?.kind !== "file") return undefined;
+      return { size: stats.size, lastModified: stats.lastModified };
+    },
   };
 }
 

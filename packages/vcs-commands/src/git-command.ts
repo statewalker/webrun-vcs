@@ -386,10 +386,12 @@ export abstract class GitCommand<T> {
 
   /**
    * Runs this command's hooks in another command's session: a command that runs another
-   * (merge committing, rebase picking) gathers the output of both in one place.
+   * (merge committing, rebase picking) gathers the output of both in one place. With `env`,
+   * this command's hooks also get those variables, as the hooks of a git command git runs as
+   * a child process with them set (a sequencer's `git commit` with GIT_REFLOG_ACTION).
    */
-  shareHooksOf(source: GitCommand<unknown>): this {
-    this.hookSession = source.hooks;
+  shareHooksOf(source: GitCommand<unknown>, env?: Record<string, string>): this {
+    this.hookSession = env ? source.hooks.withEnv(env) : source.hooks;
     return this;
   }
 
@@ -746,6 +748,42 @@ export abstract class GitCommand<T> {
     return refs;
   }
 
+  /**
+   * Deletes `names` whatever their values, as git's `delete_refs` (branch -d, tag -d, remote
+   * prune): on a store with `removeAll`, one transaction for them all (git 2.5x), or as git
+   * 2.43's files backend when the hooks follow 2.43 (their reference-transaction calls and
+   * a failure's outcome differ); else one by one. Returns the names that no longer exist
+   * and the failure, if any (git reports it after the others are deleted).
+   */
+  protected async removeRefsAsGit(
+    names: string[],
+    message?: string,
+  ): Promise<{ removed: string[]; error?: unknown }> {
+    const refs = this.refsStore;
+    let error: unknown;
+    try {
+      if (refs.removeAll) {
+        await refs.removeAll(names, {
+          legacy: this.hooks.compatibility === "2.43",
+          ...(message !== undefined ? { message } : {}),
+        });
+      } else {
+        for (const name of names) {
+          try {
+            await refs.delete(name, { deleteRefs: true });
+          } catch (e) {
+            error ??= e;
+          }
+        }
+      }
+    } catch (e) {
+      error = e;
+    }
+    const removed: string[] = [];
+    for (const name of names) if (!(await refs.has(name).catch(() => true))) removed.push(name);
+    return error === undefined ? { removed } : { removed, error };
+  }
+
   /** The reference-transaction hook this command installs on its ref store (made once). */
   private refTransactionHook?: RefTransactionHook;
   /** The store it is installed on, and the hook that was there before (put back at the end) */
@@ -770,13 +808,22 @@ export abstract class GitCommand<T> {
       return;
     }
     if (!this.refTransactionHook) {
-      this.refTransactionHook = refTransactionHookOf(this.hooks);
+      const env = this.refTransactionHookEnv();
+      this.refTransactionHook = refTransactionHookOf(this.hooks, env ? { env } : {});
       commandTransactionHooks.add(this.refTransactionHook);
     }
     if (!this.refTransactionInstalled) {
       this.refTransactionInstalled = { store, previous: store.getTransactionHook?.() };
     }
     store.setTransactionHook(this.refTransactionHook);
+  }
+
+  /**
+   * Variables git's command exports for every hook it runs, the reference-transaction hook
+   * included (merge's GIT_REFLOG_ACTION); none by default.
+   */
+  protected refTransactionHookEnv(): Record<string, string> | undefined {
+    return undefined;
   }
 
   /**

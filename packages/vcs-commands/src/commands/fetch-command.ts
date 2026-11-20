@@ -1159,6 +1159,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
           this.refsStore,
           stale.map((r) => r.name),
           "fetch: prune",
+          { legacy: this.hooks.compatibility === "2.43" },
         );
       } catch (error) {
         errors.push(error instanceof Error ? error.message : String(error));

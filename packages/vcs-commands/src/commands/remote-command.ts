@@ -266,7 +266,11 @@ export class RemoteRemoveCommand extends GitCommand<RemoteConfig> {
       }
     }
 
-    await deleteRefs(this.refsStore, refsToDelete, "remote: remove");
+    // in for_each_ref order (a store may list its loose refs before its packed ones)
+    refsToDelete.sort();
+    await deleteRefs(this.refsStore, refsToDelete, "remote: remove", {
+      legacy: this.hooks.compatibility === "2.43",
+    });
     if (skipped.length > 0) {
       this.messages.push(
         skipped.length === 1
