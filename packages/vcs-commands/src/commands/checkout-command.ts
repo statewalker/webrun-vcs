@@ -174,6 +174,12 @@ export interface CheckoutResult {
    * there was nothing to say.
    */
   readonly warnings?: string[];
+
+  /**
+   * git's exit status where `status` alone does not give it (OK: 0, CONFLICTS: 1): a path
+   * checkout that could not write an entry exits 255
+   */
+  readonly exitCode?: number;
 }
 
 /** A tree or index entry, as the two-way merge compares them (index entries with stat). */
@@ -1501,6 +1507,7 @@ export function pathCheckoutResult(outcome: CheckoutPathsOutcome): CheckoutResul
     ref: null,
     ...(outcome.errors.length > 0 ? { message: outcome.errors.join("\n") } : {}),
     ...(outcome.warnings.length > 0 ? { warnings: outcome.warnings } : {}),
+    ...(outcome.exitCode !== undefined ? { exitCode: outcome.exitCode } : {}),
   };
 }
 

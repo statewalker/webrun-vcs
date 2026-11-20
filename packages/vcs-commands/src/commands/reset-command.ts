@@ -5,6 +5,7 @@ import {
   type ObjectId,
   type Ref,
 } from "@statewalker/vcs-core";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   cacheTreeOfTree,
   copyCacheTree,
@@ -29,6 +30,7 @@ import { type CommandTrees, GitCommand } from "../git-command.js";
 import { ResetMode } from "../types.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import { addLeadingDirs, stageZeroClashes } from "./index-adder.js";
 import { flatTree, OperationState, rewriteIndex } from "./merge-support.js";
 import {
   DO_MATCH_DIRECTORY,
@@ -426,7 +428,16 @@ export class ResetCommand extends GitCommand<Ref> {
     const patterns = await this.sparseCheckoutPatterns();
     const changes = new Map<string, IndexEntryOptions[]>();
     const undo: ResolveUndoRecord[] = [];
-    for (const path of new Set([...index.keys(), ...tree.keys()])) {
+    // the index as edited so far, for add_index_entry's file/directory clashes
+    const current = (path: string): readonly IndexEntryOptions[] =>
+      changes.get(path) ?? index.get(path) ?? [];
+    const hasStageZero = (path: string) => current(path).some((e) => (e.stage ?? 0) === 0);
+    const dirs = new Set<string>();
+    for (const path of index.keys()) addLeadingDirs(dirs, path);
+    // update_index_from_diff works through the diff queue in the index's order
+    const paths = [...new Set([...index.keys(), ...tree.keys()])].sort(compareGitPaths);
+    let intentToAddCreated = false;
+    for (const path of paths) {
       const entries = index.get(path) ?? [];
       const t = tree.get(path);
       // diff-lib's oneway_diff matches the index entry, else the tree's
@@ -459,6 +470,16 @@ export class ResetCommand extends GitCommand<Ref> {
       const skipWorktree = staged
         ? staged.skipWorktree === true
         : patterns !== undefined && !patterns.includes(path);
+      // add_index_entry: the new stage-0 entry replaces the stage-0 entries it clashes with
+      // as a file or a directory (has_dir_name / has_file_name; conflict stages stay)
+      for (const other of stageZeroClashes(path, hasStageZero, paths, dirs)) {
+        changes.set(
+          other,
+          current(other).filter((e) => (e.stage ?? 0) > 0),
+        );
+      }
+      addLeadingDirs(dirs, path);
+      if (!t) intentToAddCreated = true;
       changes.set(path, [
         {
           path,
@@ -473,6 +494,9 @@ export class ResetCommand extends GitCommand<Ref> {
         },
       ]);
     }
+    // set_object_name_for_intent_to_add_entry: the empty blob an intent-to-add entry names
+    // is written, so the index never names a missing object
+    if (intentToAddCreated) await this.blobs.store([new Uint8Array(0)], 0);
     if (undo.length > 0) this.staging.recordResolveUndo?.(undo);
     if (changes.size > 0) await rewriteIndex(this.staging, changes);
   }

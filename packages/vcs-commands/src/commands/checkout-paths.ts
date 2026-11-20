@@ -7,7 +7,7 @@
  */
 
 import { type Blobs, FileMode, type ObjectId } from "@statewalker/vcs-core";
-import { type ConflictStyle, compareGitPaths, mergeLines } from "@statewalker/vcs-utils";
+import { type ConflictStyle, compareGitPaths } from "@statewalker/vcs-utils";
 import { collect } from "@statewalker/vcs-utils/streams";
 import {
   entryStatOf,
@@ -26,7 +26,9 @@ import {
 } from "../errors/index.js";
 import type { CommandTrees } from "../git-command.js";
 import { worktreeModeTrust } from "./core-config.js";
+import { addLeadingDirs, stageZeroClashes } from "./index-adder.js";
 import { conflictStyleOf } from "./merge-config.js";
+import { lowLevelMerge, ortConfigOptions } from "./merge-drivers.js";
 import { flatTree, rewriteIndex } from "./merge-support.js";
 import {
   DO_MATCH_DIRECTORY,
@@ -91,6 +93,11 @@ export interface CheckoutPathsOptions {
 export interface CheckoutPathsOutcome {
   /** false where git returns 1 (an error was reported) */
   ok: boolean;
+  /**
+   * git's exit status where it is neither 0 nor 1: 255 once `checkout_worktree` reported an
+   * error (an entry it could not write: its `error()` returns -1)
+   */
+  exitCode?: number;
   /** git's `error: ...` lines */
   errors: string[];
   /** The other stderr lines: warnings and the counts */
@@ -343,6 +350,10 @@ export async function checkoutPaths(
 
   // read_tree_some: each tree entry the pathspec names goes into the index (update_some)
   if (tree) {
+    const hasStageZero = (path: string) =>
+      byPath.get(path)?.some((r) => stageOf(r.entry) === 0) === true;
+    const dirs = new Set<string>();
+    for (const path of byPath.keys()) addLeadingDirs(dirs, path);
     for (const [path, t] of tree) {
       if (matchPathspec(o.items, path, flagsOf(t.mode)) <= 0) continue;
       const list = byPath.get(path);
@@ -357,13 +368,16 @@ export async function checkoutPaths(
         continue;
       }
       // add_index_entry(ADD_CACHE_OK_TO_REPLACE): a stage-0 entry replaces every stage of
-      // its path (recorded for resolve-undo) and the entries it clashes with as a file or
-      // a directory
+      // its path (recorded for resolve-undo) and the stage-0 entries it clashes with as a
+      // file or a directory (their conflict stages stay)
       if (list) recordUndo(path, list);
-      for (const other of clashingPaths(byPath, path)) {
-        byPath.delete(other);
+      for (const other of stageZeroClashes(path, hasStageZero, byPath.keys(), dirs)) {
+        const kept = (byPath.get(other) ?? []).filter((r) => stageOf(r.entry) > 0);
+        if (kept.length > 0) byPath.set(other, kept);
+        else byPath.delete(other);
         changed.add(other);
       }
+      addLeadingDirs(dirs, path);
       byPath.set(path, [
         {
           entry: { path, mode: t.mode, objectId: t.objectId, stage: 0, size: 0, mtime: 0 },
@@ -484,7 +498,10 @@ export async function checkoutPaths(
   // now committed to check them out
   if (o.checkoutWorktree) {
     const ok = await checkoutWorktree(ctx, o, ordered, out, changed);
-    if (!ok) out.ok = false;
+    if (!ok) {
+      out.ok = false;
+      out.exitCode = 255;
+    }
   }
   // remove_marked_cache_entries
   for (const rec of ordered) {
@@ -518,18 +535,6 @@ export async function checkoutPaths(
   return out;
 }
 
-/** The entries `path` clashes with as a file or a directory (`check_file_directory_conflict`). */
-function clashingPaths(byPath: Map<string, Rec[]>, path: string): string[] {
-  const out: string[] = [];
-  for (let at = path.indexOf("/"); at > 0; at = path.indexOf("/", at + 1)) {
-    const dir = path.slice(0, at);
-    if (byPath.has(dir)) out.push(dir);
-  }
-  const prefix = `${path}/`;
-  for (const other of byPath.keys()) if (other.startsWith(prefix)) out.push(other);
-  return out;
-}
-
 /** Calls `fn` once per matched path (its first matched entry, all its entries). */
 function forEachMatchedPath(ordered: Rec[], fn: (rec: Rec, stages: Rec[]) => void): void {
   for (let i = 0; i < ordered.length; i++) {
@@ -545,6 +550,21 @@ function forEachMatchedPath(ordered: Rec[], fn: (rec: Rec, stages: Rec[]) => voi
     fn(rec, stages);
     i = j - 1;
   }
+}
+
+/** What `checkout_entry` did with an entry. */
+type CheckedOut = "written" | "unchanged" | "failed";
+
+/**
+ * git's `check_leading_path` returning -1: every leading component of `path` is there as a
+ * directory (none missing, none a symbolic link or a file).
+ */
+async function leadingDirectoriesExist(worktree: Worktree, path: string): Promise<boolean> {
+  for (let k = path.indexOf("/"); k > 0; k = path.indexOf("/", k + 1)) {
+    const entry = await worktree.getEntry(path.slice(0, k)).catch(() => undefined);
+    if (!entry?.isDirectory || entry.mode === FileMode.SYMLINK) return false;
+  }
+  return true;
 }
 
 const stageMissing = (path: string, stage: number) =>
@@ -568,25 +588,56 @@ async function checkoutWorktree(
     const trust = worktreeModeTrust(ctx.workingCopy, worktree);
     const indexTime = ctx.staging.getUpdateTime();
     const symlinks = trust.symlinks;
+    // git's unlink_entry: nothing beneath a missing leading directory or a symbolic link
+    // (check_leading_path); a file already gone counts as removed (unlink_or_warn takes
+    // ENOENT as success), so its emptied directories are pruned all the same
+    // (schedule_dir_for_removal); a removal that fails is a warning
     const unlink = async (rec: Rec) => {
       const path = rec.entry.path;
+      if (!(await leadingDirectoriesExist(worktree, path))) return;
       const current = await worktree.getEntry(path).catch(() => undefined);
-      if (!current) return;
       if (isGitlink(rec.entry.mode)) {
-        if (current.isDirectory) await removeDirectoryIfEmpty(worktree, path);
-      } else if (!current.isDirectory) {
+        // rmdir_or_warn
+        if (current) {
+          if (!current.isDirectory) {
+            out.warnings.push(`warning: unable to rmdir '${path}': Not a directory`);
+            return;
+          }
+          if (!(await removeDirectoryIfEmpty(worktree, path))) {
+            out.warnings.push(`warning: unable to rmdir '${path}': Directory not empty`);
+            return;
+          }
+          out.removed.push(path);
+        }
+      } else if (current) {
+        // unlink_or_warn
+        if (current.isDirectory) {
+          out.warnings.push(`warning: unable to unlink '${path}': Is a directory`);
+          return;
+        }
         await worktree.remove(path);
-      } else return;
-      out.removed.push(path);
+        out.removed.push(path);
+      }
       await pruneEmptyParents(worktree, path);
     };
-    const write = async (path: string, objectId: ObjectId, mode: number) => {
+    // write_entry; false where the blob cannot be read ("unable to read sha1 file of"), after
+    // checkout_entry has unlinked what stood there and made the leading directories
+    const write = async (path: string, objectId: ObjectId, mode: number): Promise<boolean> => {
       if (isGitlink(mode)) {
         await worktree.mkdir(path, { recursive: true });
-        return;
+        return true;
       }
-      const content = await ctx.blobs.load(objectId);
-      if (!content) throw new Error(`checkout cannot restore ${path}: blob missing`);
+      const content = (await ctx.blobs.has(objectId))
+        ? await ctx.blobs.load(objectId).catch(() => undefined)
+        : undefined;
+      if (!content) {
+        const current = await worktree.getEntry(path).catch(() => undefined);
+        if (current) await worktree.remove(path, { recursive: current.isDirectory });
+        const at = path.lastIndexOf("/");
+        if (at > 0) await worktree.mkdir(path.slice(0, at), { recursive: true }).catch(() => {});
+        out.errors.push(`error: unable to read sha1 file of ${path} (${objectId})`);
+        return false;
+      }
       const written = mode === FileMode.SYMLINK && !symlinks ? FileMode.REGULAR_FILE : mode;
       await worktree.writeContent(path, content, {
         mode: written,
@@ -595,24 +646,28 @@ async function checkoutWorktree(
         replaceInTheWay: true,
         discardUntracked: true,
       });
+      return true;
     };
     // checkout_entry with state.force: an up-to-date file is left alone (not counted), a
-    // gitlink whose directory is there too
-    const checkoutEntry = async (rec: Rec, stat: boolean): Promise<boolean> => {
+    // gitlink whose directory is there too; "written" counts, "failed" is an error
+    const checkoutEntry = async (rec: Rec, stat: boolean): Promise<CheckedOut> => {
       const e = rec.entry;
       if (rec.wtRemove) {
         await unlink(rec);
-        return false;
+        return "unchanged";
       }
       const current = await worktree.getEntry(e.path).catch(() => undefined);
       if (current) {
-        if (isGitlink(e.mode)) return false;
+        if (isGitlink(e.mode)) return "unchanged";
         const differs =
           rec.fresh ||
           (await worktreeDiffers(worktree, e.path, e as StagingEntry, trust, indexTime));
-        if (!differs) return false;
+        if (!differs) return "unchanged";
       }
-      await write(e.path, e.objectId, e.mode);
+      if (!(await write(e.path, e.objectId, e.mode))) {
+        out.conflicts.push(e.path);
+        return "failed";
+      }
       out.updated.push(e.path);
       if (stat && !isGitlink(e.mode)) {
         const stats = await worktree.getEntry(e.path);
@@ -621,13 +676,18 @@ async function checkoutWorktree(
           changed.add(e.path);
         }
       }
-      return true;
+      return "written";
+    };
+    // checkout_worktree goes on past an entry it cannot write (errs |= ...)
+    const count = (outcome: CheckedOut) => {
+      if (outcome === "written") nrCheckouts++;
+      else if (outcome === "failed") ok = false;
     };
     for (let i = 0; i < ordered.length; i++) {
       const rec = ordered[i];
       if (!rec.matched) continue;
       if (stageOf(rec.entry) === 0) {
-        if (await checkoutEntry(rec, true)) nrCheckouts++;
+        count(await checkoutEntry(rec, true));
         continue;
       }
       let j = i + 1;
@@ -637,7 +697,7 @@ async function checkoutWorktree(
       if (o.writeoutStage) {
         const chosen = stages.find((r) => stageOf(r.entry) === o.writeoutStage);
         if (chosen) {
-          if (await checkoutEntry({ ...chosen, fresh: true }, false)) nrCheckouts++;
+          count(await checkoutEntry({ ...chosen, fresh: true }, false));
         } else if (!o.overlay) {
           await unlink(rec);
         } else {
@@ -647,11 +707,10 @@ async function checkoutWorktree(
       } else if (o.merge) {
         const merged = await checkoutMerged(ctx, o, stages, out);
         if (merged === undefined) ok = false;
-        else {
-          await write(rec.entry.path, merged.objectId, merged.mode);
+        else if (await write(rec.entry.path, merged.objectId, merged.mode)) {
           out.updated.push(rec.entry.path);
           nrUnmerged++;
-        }
+        } else ok = false;
       }
     }
   }
@@ -698,21 +757,26 @@ async function checkoutMerged(
     return content ? collect(content) : new Uint8Array(0);
   };
   const [base, ours, theirs] = await Promise.all(ids.map(load));
-  let content: Uint8Array;
-  if ([base, ours, theirs].some((x) => x.subarray(0, 8000).includes(0))) {
-    // the binary driver: ours, with a conflict
-    out.warnings.push(`warning: Cannot merge binary files: ${path} (ours vs. theirs)`);
-    content = ours;
-  } else {
-    content = mergeLines(base, ours, theirs, {
-      oursLabel: "ours",
-      theirsLabel: "theirs",
-      baseLabel: "base",
+  // ll_merge with the path's `merge` and `conflict-marker-size` attributes and the merge
+  // drivers, as the merges read them (myers: checkout_merged's ll_merge_options)
+  const config = ortConfigOptions(ctx.workingCopy, ctx.worktree, { indexAttributes: true });
+  const merged = await lowLevelMerge(
+    { path, base, ours, theirs, baseLabel: "base", oursLabel: "ours", theirsLabel: "theirs" },
+    {
+      attributes: (await config.attributes?.(path)) ?? {},
+      ...(config.drivers ? { drivers: config.drivers } : {}),
+      ...(config.defaultDriver ? { defaultDriver: config.defaultDriver } : {}),
       style: o.conflictStyle ?? conflictStyleOf(ctx.workingCopy),
+      ...(config.bigFileThreshold !== undefined
+        ? { bigFileThreshold: config.bigFileThreshold }
+        : {}),
       algorithm: "myers",
-      level: "zealous",
-    }).content;
+    },
+  );
+  if (merged.status === "binary") {
+    out.warnings.push(`warning: Cannot merge binary files: ${path} (ours vs. theirs)`);
   }
+  const content = merged.content;
   const objectId = await ctx.blobs.store([content]);
   return { objectId, mode };
 }

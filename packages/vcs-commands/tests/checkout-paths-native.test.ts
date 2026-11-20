@@ -104,7 +104,8 @@ async function runOurs(
       if (result.warnings) lines.push(...result.warnings.filter((l) => l.startsWith("warning:")));
       if (result.message) lines.push(...result.message.split("\n"));
       if (result.warnings) lines.push(...result.warnings.filter((l) => !l.startsWith("warning:")));
-      return { status: result.status === "OK" ? 0 : 1, stderr: lines.join("\n") };
+      const status = result.exitCode ?? (result.status === "OK" ? 0 : 1);
+      return { status, stderr: lines.join("\n") };
     }
     return { status: 0, stderr: "" };
   } catch (error) {
@@ -829,4 +830,406 @@ describeGit("checkout, restore and reset in a sparse checkout, as native git", (
       );
     }
   }, 300_000);
+});
+
+/** Native `write-tree` and `status` on a result (both fail on an index naming a missing object). */
+const soundness = (dir: string) => {
+  const tree = gitRun(root, dir, ["write-tree"]);
+  const status = gitRun(root, dir, ["status", "--porcelain"]);
+  return `write-tree ${tree.status} ${tree.stdout}${tree.stderr}\nstatus ${status.status} ${status.stderr}`;
+};
+
+/** The twins {@link expectTwins} left behind: native git reads ours as it reads its own. */
+function expectSoundTwins(label: string, mustSucceed = true): void {
+  const theirs = soundness(join(root, "native"));
+  expect(soundness(join(root, "ours")), `${label}: write-tree and status`).toBe(theirs);
+  if (mustSucceed) expect(theirs, label).toMatch(/^write-tree 0 [0-9a-f]{40}\n\nstatus 0 $/);
+}
+
+/** Replaces the index entries of `path` with conflict stages (`[stage, content]`). */
+function unmerge(dir: string, path: string, stages: Array<[number, string]>): void {
+  const lines = [`0 ${"0".repeat(40)}\t${path}`];
+  for (const [stage, content] of stages) {
+    const id = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+      cwd: dir,
+      input: content,
+    })
+      .toString()
+      .trim();
+    lines.push(`100644 ${id} ${stage}\t${path}`);
+  }
+  execFileSync("git", ["update-index", "--index-info"], {
+    cwd: dir,
+    input: `${lines.join("\n")}\n`,
+  });
+}
+
+describeGit("path checkouts and resets: the index git writes, removals, merges, errors", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "checkout-paths-fixes-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  const fixture = (name: string, build: (dir: string) => void) => {
+    const dir = join(root, name);
+    mkdirSync(dir, { recursive: true });
+    git(dir, ["init", "-q", "-b", "main"]);
+    build(dir);
+    gitRun(root, dir, ["update-index", "-q", "--refresh"]);
+    return dir;
+  };
+
+  it("reset -N writes the empty blob its intent-to-add entries name", async () => {
+    const template = fixture("ita", (dir) => {
+      putFile(dir, "a/x", "1\n");
+      putFile(dir, "c/z", "3\n");
+      git(dir, ["add", "-A"]);
+      git(dir, ["commit", "-qm", "c1"]);
+      putFile(dir, "c/n", "4\n");
+      git(dir, ["add", "-A"]);
+      git(dir, ["commit", "-qm", "c2"]);
+    });
+    const emptyBlob = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+    expect(gitRun(root, template, ["cat-file", "-e", emptyBlob]).status).not.toBe(0);
+    await expectTwins(
+      template,
+      "reset -N HEAD~1 -- .",
+      ["reset", "-q", "-N", "HEAD~1", "--", "."],
+      (g) => g.reset().setRef("HEAD~1").setIntentToAdd(true).addPath(".").call(),
+    );
+    expectSoundTwins("reset -N HEAD~1 -- .");
+    await expectTwins(template, "reset -N HEAD~1", ["reset", "-q", "-N", "HEAD~1"], (g) =>
+      g.reset().setRef("HEAD~1").setIntentToAdd(true).call(),
+    );
+    expectSoundTwins("reset -N HEAD~1");
+    // apply -N (add_index_file's set_object_name_for_intent_to_add_entry); native git's
+    // apply -N never reads the index (only --index does), so the index starts empty here
+    const empty = fixture("ita-apply", () => {});
+    const patch =
+      "diff --git a/c/m b/c/m\nnew file mode 100644\n--- /dev/null\n+++ b/c/m\n@@ -0,0 +1 @@\n+5\n";
+    writeFileSync(join(root, "new.patch"), patch);
+    await expectTwins(empty, "apply -N", ["apply", "-N", join(root, "new.patch")], (g) =>
+      g.apply().setIntentToAdd(true).addPatch(patch).call(),
+    );
+    expectSoundTwins("apply -N");
+  }, 120_000);
+
+  it("reset: a stage-0 entry replaces the stage-0 entries it clashes with", async () => {
+    // reset: p/q comes back from HEAD~1, the file p of HEAD leaves the index
+    const fileOverDir = fixture("file-over-dir", (dir) => {
+      putFile(dir, "p/q", "q\n");
+      putFile(dir, "o", "o\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "c1"]);
+      git(dir, ["rm", "-q", "-r", "p"]);
+      putFile(dir, "p", "pf\n");
+      git(dir, ["add", "p"]);
+      git(dir, ["commit", "-qm", "c2"]);
+    });
+    await expectTwins(
+      fileOverDir,
+      "reset HEAD~1 -- p/q",
+      ["reset", "-q", "HEAD~1", "--", "p/q"],
+      (g) => g.reset().setRef("HEAD~1").addPath("p/q").call(),
+    );
+    expectSoundTwins("reset HEAD~1 -- p/q");
+    await expectTwins(
+      fileOverDir,
+      "reset -N HEAD~1 -- p/q p",
+      ["reset", "-q", "-N", "HEAD~1", "--", "p/q", "p"],
+      (g) => g.reset().setRef("HEAD~1").setIntentToAdd(true).addPath("p/q").addPath("p").call(),
+    );
+    expectSoundTwins("reset -N HEAD~1 -- p/q p");
+  }, 120_000);
+
+  it("checkout: a file from the tree leaves the conflict stages below it", async () => {
+    // checkout: the file p from HEAD~1 leaves the unmerged p/q as it is ("UD p/q")
+    const unmergedBelow = fixture("unmerged-below", (dir) => {
+      putFile(dir, "d/g", "g\n");
+      putFile(dir, "p", "pf\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "c1"]);
+      rmSync(join(dir, "p"));
+      putFile(dir, "p/q", "q\n");
+      git(dir, ["add", "-A"]);
+      git(dir, ["commit", "-qm", "c2"]);
+      unmerge(dir, "p/q", [
+        [1, "base\n"],
+        [2, "q\n"],
+      ]);
+    });
+    await expectTwins(
+      unmergedBelow,
+      "checkout HEAD~1 -- :^d/g",
+      ["checkout", "HEAD~1", "--", ":^d/g"],
+      (g) => g.checkout().setStartPoint("HEAD~1").addPath(":^d/g").call(),
+    );
+    expectSoundTwins("checkout HEAD~1 -- :^d/g", false);
+  }, 120_000);
+
+  it("restore: a file below an unmerged path leaves its stages, refused as unmerged", async () => {
+    // restore: p/q from HEAD~1 leaves the unmerged file p, which is then refused
+    const unmergedAbove = fixture("unmerged-above", (dir) => {
+      putFile(dir, "p/q", "q\n");
+      putFile(dir, "o", "o\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "c1"]);
+      rmSync(join(dir, "p"), { recursive: true });
+      putFile(dir, "p", "pf\n");
+      git(dir, ["add", "-A"]);
+      git(dir, ["commit", "-qm", "c2"]);
+      unmerge(dir, "p", [
+        [1, "base\n"],
+        [2, "pf\n"],
+      ]);
+    });
+    await expectTwins(
+      unmergedAbove,
+      "restore -s HEAD~1 -- *",
+      ["restore", "-s", "HEAD~1", "--", "*"],
+      (g) => g.restore().setSource("HEAD~1").addPath("*").call(),
+    );
+    await expectTwins(
+      unmergedAbove,
+      "restore -SW -s HEAD~1 -- *",
+      ["restore", "-SW", "-s", "HEAD~1", "--", "*"],
+      (g) => g.restore().setStaged(true).setWorktree(true).setSource("HEAD~1").addPath("*").call(),
+    );
+  }, 120_000);
+
+  it("no-overlay removals prune emptied directories, a file already gone too", async () => {
+    const template = fixture("prune", (dir) => {
+      putFile(dir, "keep.txt", "k\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "c1"]);
+      putFile(dir, "n/deep/z", "z\n");
+      putFile(dir, "n/deep/z2", "z2\n");
+      putFile(dir, "au/sub/v", "v\n");
+      putFile(dir, "here/w", "w\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "c2"]);
+      // gone from the worktree, their directories left (one a directory of its own)
+      rmSync(join(dir, "n/deep/z"));
+      rmSync(join(dir, "n/deep/z2"));
+      rmSync(join(dir, "au/sub/v"));
+      git(dir, ["update-index", "--assume-unchanged", "au/sub/v"]);
+    });
+    const cases: Array<[string, string[], (g: Git) => Promise<unknown>]> = [
+      [
+        "restore -s HEAD~1 -- n",
+        ["restore", "-s", "HEAD~1", "--", "n"],
+        (g) => g.restore().setSource("HEAD~1").addPath("n").call(),
+      ],
+      [
+        "restore -SW -s HEAD~1 -- n here",
+        ["restore", "-SW", "-s", "HEAD~1", "--", "n", "here"],
+        (g) =>
+          g
+            .restore()
+            .setStaged(true)
+            .setWorktree(true)
+            .setSource("HEAD~1")
+            .addPath("n")
+            .addPath("here")
+            .call(),
+      ],
+      [
+        "checkout --no-overlay HEAD~1 -- .",
+        ["checkout", "--no-overlay", "HEAD~1", "--", "."],
+        (g) => g.checkout().setOverlay(false).setStartPoint("HEAD~1").addPath(".").call(),
+      ],
+      [
+        "restore -s HEAD~1 -- au (assume-unchanged)",
+        ["restore", "-s", "HEAD~1", "--", "au"],
+        (g) => g.restore().setSource("HEAD~1").addPath("au").call(),
+      ],
+      [
+        "restore -SW -s HEAD~1 -- au (assume-unchanged)",
+        ["restore", "-SW", "-s", "HEAD~1", "--", "au"],
+        (g) =>
+          g.restore().setStaged(true).setWorktree(true).setSource("HEAD~1").addPath("au").call(),
+      ],
+    ];
+    for (const [label, native, ours] of cases) {
+      await expectTwins(template, label, native, ours);
+    }
+  }, 120_000);
+
+  it("no-overlay removals: nothing beneath a symbolic link", async () => {
+    // a symbolic link on a leading directory: nothing beneath it is unlinked
+    const linked = fixture("linked", (dir) => {
+      putFile(dir, "keep.txt", "k\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "c1"]);
+      putFile(dir, "sl/f", "f\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "c2"]);
+      rmSync(join(dir, "sl"), { recursive: true });
+      putFile(dir, "target/f", "f\n");
+      execFileSync("ln", ["-s", "target", join(dir, "sl")]);
+    });
+    const theirs = copyOf(linked, "native");
+    const mine = copyOf(linked, "ours");
+    const result = gitRun(root, theirs, ["restore", "-s", "HEAD~1", "--", "sl"]);
+    const got = await runOurs(await openRepo(root, mine), (g) =>
+      g.restore().setSource("HEAD~1").addPath("sl").call(),
+    );
+    expect(`${got.status}\n${got.stderr}`).toBe(`${result.status}\n${nativeLines(result.stderr)}`);
+    for (const dir of [theirs, mine]) expect(existsSync(join(dir, "target/f")), dir).toBe(true);
+    expect(indexOf(mine)).toBe(indexOf(theirs));
+    expect(git(mine, ["status", "--porcelain", "-uall"])).toBe(
+      git(theirs, ["status", "--porcelain", "-uall"]),
+    );
+  }, 120_000);
+
+  it("no-overlay removals that fail warn: a populated gitlink, a directory for a file", async () => {
+    const template = fixture("warnings", (dir) => {
+      putFile(dir, "keep.txt", "k\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "c1"]);
+      for (const sm of ["sm", "g/sm2"]) {
+        const inner = join(dir, sm);
+        mkdirSync(inner, { recursive: true });
+        git(inner, ["init", "-q", "-b", "main"]);
+        putFile(inner, "i", "i\n");
+        git(inner, ["add", "."]);
+        git(inner, ["commit", "-qm", "inner"]);
+        git(dir, ["add", sm]);
+      }
+      putFile(dir, "q", "q\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "c2"]);
+      // a gitlink whose directory is gone, a directory where the file q was
+      rmSync(join(dir, "g/sm2"), { recursive: true });
+      rmSync(join(dir, "q"));
+      putFile(dir, "q/inside", "x\n");
+    });
+    await expectTwins(
+      template,
+      "checkout --no-overlay HEAD~1 -- sm",
+      ["checkout", "--no-overlay", "HEAD~1", "--", "sm"],
+      (g) => g.checkout().setOverlay(false).setStartPoint("HEAD~1").addPath("sm").call(),
+    );
+    await expectTwins(
+      template,
+      "restore -s HEAD~1 -- q",
+      ["restore", "-s", "HEAD~1", "--", "q"],
+      (g) => g.restore().setSource("HEAD~1").addPath("q").call(),
+    );
+    await expectTwins(
+      template,
+      "restore -s HEAD~1 -- sm g q",
+      ["restore", "-s", "HEAD~1", "--", "sm", "g", "q"],
+      (g) => g.restore().setSource("HEAD~1").addPath("sm").addPath("g").addPath("q").call(),
+    );
+  }, 120_000);
+
+  it("restore --ours without our version warns of a directory in the way", async () => {
+    // restore --ours (no overlay) of a path without our version, a directory there now
+    const theirsOnly = fixture("theirs-only", (dir) => {
+      putFile(dir, "o", "o\n");
+      putFile(dir, "p", "p\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "c1"]);
+      unmerge(dir, "p", [
+        [1, "base\n"],
+        [3, "theirs\n"],
+      ]);
+      rmSync(join(dir, "p"));
+      putFile(dir, "p/z", "z\n");
+    });
+    await expectTwins(theirsOnly, "restore --ours -- p", ["restore", "--ours", "--", "p"], (g) =>
+      g.restore().setStage(CheckoutStage.OURS).addPath("p").call(),
+    );
+  }, 120_000);
+
+  it("checkout -m merges with the merge and conflict-marker-size attributes", async () => {
+    const template = fixture("attrs", (dir) => {
+      const files = ["u.txt", "b.txt", "n.txt", "m.txt", "plain.txt"];
+      for (const f of files) putFile(dir, f, "1\n2\n3\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "base"]);
+      git(dir, ["checkout", "-qb", "side"]);
+      for (const f of files) putFile(dir, f, "1\nside\n3\n");
+      git(dir, ["commit", "-qam", "side"]);
+      git(dir, ["checkout", "-q", "main"]);
+      for (const f of files) putFile(dir, f, "1\nmain\n3\n");
+      git(dir, ["commit", "-qam", "main"]);
+      gitRun(root, dir, ["merge", "-q", "side"]);
+      putFile(
+        dir,
+        ".gitattributes",
+        "u.txt merge=union\nb.txt merge=binary\nn.txt -merge\nm.txt conflict-marker-size=12\n",
+      );
+    });
+    const paths = ["u.txt", "b.txt", "n.txt", "m.txt", "plain.txt"];
+    await expectTwins(template, "checkout -m -- m.txt", ["checkout", "-m", "--", "m.txt"], (g) =>
+      g.checkout().setMerge(true).addPath("m.txt").call(),
+    );
+    await expectTwins(template, "checkout -m -- u.txt", ["checkout", "-m", "--", "u.txt"], (g) =>
+      g.checkout().setMerge(true).addPath("u.txt").call(),
+    );
+    await expectTwins(template, "checkout -m -- <all>", ["checkout", "-m", "--", ...paths], (g) =>
+      withPaths(g.checkout().setMerge(true), paths).call(),
+    );
+    await expectTwins(template, "checkout -m <all> (counts)", ["checkout", "-m", ...paths], (g) =>
+      withPaths(g.checkout().setCountCheckoutPaths(true).setMerge(true), paths).call(),
+    );
+    await expectTwins(
+      template,
+      "checkout --conflict=diff3 -- m.txt u.txt",
+      ["checkout", "--conflict=diff3", "--", "m.txt", "u.txt"],
+      (g) => g.checkout().setConflictStyle("diff3").addPath("m.txt").addPath("u.txt").call(),
+    );
+    await expectTwins(template, "restore -m -- .", ["restore", "-m", "--", "."], (g) =>
+      g.restore().setMerge(true).addPath(".").call(),
+    );
+  }, 120_000);
+
+  it("a blob missing partway: an error for its path, the rest checked out, exit 255", async () => {
+    const template = fixture("missing-blob", (dir) => {
+      for (const f of ["a", "b", "c", "d/e"]) putFile(dir, f, `${f}1\n`);
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "c1"]);
+      for (const f of ["a", "b", "c", "d/e"]) putFile(dir, f, `${f}2\n`);
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "c2"]);
+      for (const f of ["b", "d/e"]) {
+        const id = git(dir, ["rev-parse", `HEAD~1:${f}`]).trim();
+        rmSync(join(dir, ".git/objects", id.slice(0, 2), id.slice(2)));
+      }
+      rmSync(join(dir, "d"), { recursive: true });
+    });
+    const cases: Array<[string, string[], (g: Git) => Promise<unknown>]> = [
+      [
+        "checkout HEAD~1 -- a b c d",
+        ["checkout", "HEAD~1", "--", "a", "b", "c", "d"],
+        (g) => withPaths(g.checkout().setStartPoint("HEAD~1"), ["a", "b", "c", "d"]).call(),
+      ],
+      [
+        "checkout HEAD~1 a b c (counts)",
+        ["checkout", "HEAD~1", "a", "b", "c"],
+        (g) =>
+          withPaths(g.checkout().setCountCheckoutPaths(true).setStartPoint("HEAD~1"), [
+            "a",
+            "b",
+            "c",
+          ]).call(),
+      ],
+      [
+        "restore -s HEAD~1 -- .",
+        ["restore", "-s", "HEAD~1", "--", "."],
+        (g) => g.restore().setSource("HEAD~1").addPath(".").call(),
+      ],
+      [
+        "restore -SW -s HEAD~1 -- .",
+        ["restore", "-SW", "-s", "HEAD~1", "--", "."],
+        (g) =>
+          g.restore().setStaged(true).setWorktree(true).setSource("HEAD~1").addPath(".").call(),
+      ],
+    ];
+    for (const [label, native, ours] of cases) {
+      await expectTwins(template, label, native, ours);
+    }
+  }, 120_000);
 });
