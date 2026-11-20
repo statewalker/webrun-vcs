@@ -264,7 +264,11 @@ export interface Refs {
    * Optional - non-Git implementations can omit.
    *
    * @param refNames Specific refs to pack (empty array with all=true packs all)
-   * @param options Pack options
+   * @param options Pack options: `all` every loose ref, `prefixes` the loose refs under
+   *   them (`["refs/tags/"]`: `git pack-refs` without `--all`), `deleteLoose` prune them
    */
-  packRefs?(refNames: string[], options?: { all?: boolean; deleteLoose?: boolean }): Promise<void>;
+  packRefs?(
+    refNames: string[],
+    options?: { all?: boolean; deleteLoose?: boolean; prefixes?: string[] },
+  ): Promise<void>;
 }

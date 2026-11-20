@@ -237,16 +237,21 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const reader = new ChainReader(this, env, this.options, followIncludes);
     const base: ConfigEntry[] = [];
     if (env) {
-      const hostSource = (path: string): ConfigSource => ({ read: env.readFile, path, host: true });
-      if (env.systemConfig) await reader.readFile(hostSource(env.systemConfig), base, 0);
+      const hostSource = (path: string, scope: ConfigScope): ConfigSource => ({
+        read: env.readFile,
+        path,
+        host: true,
+        scope,
+      });
+      if (env.systemConfig) await reader.readFile(hostSource(env.systemConfig, "system"), base, 0);
       if (env.globalConfig) {
         // $GIT_CONFIG_GLOBAL replaces both global files
-        await reader.readFile(hostSource(env.globalConfig), base, 0);
+        await reader.readFile(hostSource(env.globalConfig, "global"), base, 0);
       } else {
         const xdg = xdgConfigPath(env, "config");
-        if (xdg) await reader.readFile(hostSource(xdg), base, 0);
+        if (xdg) await reader.readFile(hostSource(xdg, "global"), base, 0);
         const userConfig = expandUserPath("~/.gitconfig", env);
-        if (userConfig) await reader.readFile(hostSource(userConfig), base, 0);
+        if (userConfig) await reader.readFile(hostSource(userConfig, "global"), base, 0);
       }
     }
     this.baseEntries = base;
@@ -256,7 +261,11 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     if (isTrue(this.get("extensions.worktreeconfig"))) {
       const overlay: ConfigEntry[] = [];
       const path = this.options.worktreeConfigPath ?? `${dirOf(this.configPath)}config.worktree`;
-      await reader.readFile({ read: (p) => this.files.read(p), path }, overlay, 0);
+      await reader.readFile(
+        { read: (p) => this.files.read(p), path, scope: "worktree" },
+        overlay,
+        0,
+      );
       this.overlayEntries = overlay;
     }
     this.resolvedCache = undefined;
@@ -292,7 +301,11 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     this.resolvedCache = undefined;
     if (this.options.includes === false) return;
     const r = reader ?? new ChainReader(this, this.options.environment, this.options, true);
-    const source: ConfigSource = { read: (p) => this.files.read(p), path: this.configPath };
+    const source: ConfigSource = {
+      read: (p) => this.files.read(p),
+      path: this.configPath,
+      scope: "local",
+    };
     for (const line of this.lines) {
       const key = keyOfLine(line);
       if (key === undefined || !isIncludeKey(key)) continue;
@@ -325,6 +338,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
           key,
           value,
           origin: { file: originName(this.configPath), line: lineEnd, text: written },
+          scope: "local",
         });
         continue;
       }
@@ -333,7 +347,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
         if (this.dirtyKeys.has(key) || !this.values.has(key)) {
           if (!emitted.has(key)) {
             emitted.add(key);
-            for (const value of this.values.get(key) ?? []) out.push({ key, value });
+            for (const value of this.values.get(key) ?? [])
+              out.push({ key, value, scope: "local" });
           }
         } else {
           out.push({
@@ -345,6 +360,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
               line: lineEnd,
               text: writtenValueOfLine(line),
             },
+            scope: "local",
           });
         }
       }
@@ -444,8 +460,18 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     if (!canonical) return [];
     return this.entriesOf(canonical).map((e) =>
       e.origin
-        ? { value: e.value, text: e.origin.text, file: e.origin.file, line: e.origin.line }
-        : { value: e.value, text: e.value === true ? undefined : String(e.value) },
+        ? {
+            value: e.value,
+            text: e.origin.text,
+            file: e.origin.file,
+            line: e.origin.line,
+            ...(e.scope ? { scope: e.scope } : {}),
+          }
+        : {
+            value: e.value,
+            text: e.value === true ? undefined : String(e.value),
+            ...(e.scope ? { scope: e.scope } : {}),
+          },
     );
   }
 
@@ -470,8 +496,14 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
             text: e.origin.text,
             file: e.origin.file,
             line: e.origin.line,
+            ...(e.scope ? { scope: e.scope } : {}),
           }
-        : { key: e.key, value: e.value, text: e.value === true ? undefined : String(e.value) },
+        : {
+            key: e.key,
+            value: e.value,
+            text: e.value === true ? undefined : String(e.value),
+            ...(e.scope ? { scope: e.scope } : {}),
+          },
     );
   }
 
@@ -1019,6 +1051,8 @@ interface ConfigEntry {
   value: unknown;
   /** Where it was read (absent for a value set in memory and not saved yet) */
   origin?: { file: string; line: number; text: string | undefined };
+  /** The scope of the file it belongs to (see {@link ConfigScope}) */
+  scope?: ConfigScope;
 }
 
 /**
@@ -1037,7 +1071,15 @@ export interface ConfigValueOrigin {
   file?: string;
   /** Its line in that file, from 1 */
   line?: number;
+  /** The scope of that file, as `git config --show-scope` names it */
+  scope?: ConfigScope;
 }
+
+/**
+ * The scope of a config value (git's `config_scope_name`): the system file, the global files,
+ * the repository's `config` (`local`, its includes too), `config.worktree`, the command line.
+ */
+export type ConfigScope = "system" | "global" | "local" | "worktree" | "command";
 
 /** A config file and how to read it. */
 interface ConfigSource {
@@ -1045,7 +1087,13 @@ interface ConfigSource {
   path: string;
   /** Read through the host's environment (a host path), not the repository's files API */
   host?: boolean;
+  /** The scope of its values (an included file's: the including file's) */
+  scope?: ConfigScope;
 }
+
+/** An included file's values have the scope of the file that includes it. */
+const scopeOf = (from: ConfigSource): { scope?: ConfigScope } =>
+  from.scope ? { scope: from.scope } : {};
 
 /**
  * A file's name as git prints it in a config error: a host path as it is; a path of the
@@ -1097,7 +1145,12 @@ class ChainReader {
       lineEnd += physicalLines(line);
       if (line.kind === "text" && line.topLevel) {
         const { key, value, written } = line.topLevel;
-        out.push({ key, value, origin: { file, line: lineEnd, text: written } });
+        out.push({
+          key,
+          value,
+          origin: { file, line: lineEnd, text: written },
+          ...(source.scope ? { scope: source.scope } : {}),
+        });
         continue;
       }
       const key = keyOfLine(line);
@@ -1112,6 +1165,7 @@ class ChainReader {
           line: lineEnd,
           text: writtenValueOfLine(line),
         },
+        ...(source.scope ? { scope: source.scope } : {}),
       });
       if (this.followIncludes && isIncludeKey(key)) {
         await this.include(key, value, source, out, depth + 1);
@@ -1146,12 +1200,19 @@ class ChainReader {
     const env = this.env;
     if (value.startsWith("~")) {
       const expanded = expandUserPath(value, env);
-      return expanded && env ? { read: env.readFile, path: expanded, host: true } : undefined;
+      return expanded && env
+        ? { read: env.readFile, path: expanded, host: true, ...scopeOf(from) }
+        : undefined;
     }
     if (value.startsWith("/")) {
-      return env ? { read: env.readFile, path: value, host: true } : undefined;
+      return env ? { read: env.readFile, path: value, host: true, ...scopeOf(from) } : undefined;
     }
-    return { read: from.read, path: `${dirOf(from.path)}${value}`, host: from.host };
+    return {
+      read: from.read,
+      path: `${dirOf(from.path)}${value}`,
+      host: from.host,
+      ...scopeOf(from),
+    };
   }
 
   private gitDirPath(): string {

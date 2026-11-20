@@ -18,6 +18,11 @@ export interface PackRefsResult {
  * This command packs loose reference files (.git/refs/*) into the
  * single .git/packed-refs file for efficiency.
  *
+ * Without {@link setAll} or refs named, the loose tags are packed (git's default
+ * `refs/tags/*`). The reference-transaction hook runs as in git: once for the packed-refs
+ * transaction (every loose ref packed, as `<zero> <id> <ref>`), then once per loose ref
+ * pruned; a refusal throws `RefTransactionAbortedError` (git dies there).
+ *
  * Based on JGit's PackRefsCommand.
  *
  * @example
@@ -84,13 +89,18 @@ export class PackRefsCommand extends GitCommand<PackRefsResult> {
       }
       refsPacked = allRefs.length;
 
-      if (allRefs.length > 0) {
-        await this.refsStore.packRefs(allRefs, { all: true, deleteLoose: true });
-      }
+      // run with nothing to pack too: git's reference-transaction hook hears an empty one
+      await this.refsStore.packRefs(allRefs, { all: true, deleteLoose: true });
     } else if (this.refs.length > 0) {
       // Pack specific refs
       refsPacked = this.refs.length;
       await this.refsStore.packRefs(this.refs, { deleteLoose: true });
+    } else {
+      // git's default: the loose tags
+      for await (const ref of this.refsStore.list("refs/tags/")) {
+        if (ref.name.startsWith("refs/tags/")) refsPacked++;
+      }
+      await this.refsStore.packRefs([], { deleteLoose: true, prefixes: ["refs/tags/"] });
     }
 
     return {

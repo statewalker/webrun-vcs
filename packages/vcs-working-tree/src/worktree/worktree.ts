@@ -464,4 +464,15 @@ export interface OpenedRepositoryConfig {
   getAll(key: string): Array<string | null>;
   /** Every entry in the order git reads them */
   list(): Array<{ key: string; value: string | null }>;
+  /**
+   * Every entry in the order git reads them with where it was read: the file and line (for
+   * git's `bad config variable` messages) and the file's scope (`local`, `global`, ...)
+   */
+  listWithOrigin?(): Array<{
+    key: string;
+    value: string | null;
+    file?: string;
+    line?: number;
+    scope?: string;
+  }>;
 }

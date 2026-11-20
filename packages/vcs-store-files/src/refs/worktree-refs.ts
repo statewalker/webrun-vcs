@@ -258,7 +258,7 @@ class WorktreeRefs implements Refs {
 
   async packRefs(
     refNames: string[],
-    options?: { all?: boolean; deleteLoose?: boolean },
+    options?: { all?: boolean; deleteLoose?: boolean; prefixes?: string[] },
   ): Promise<void> {
     await this.common.packRefs?.(refNames, options);
   }

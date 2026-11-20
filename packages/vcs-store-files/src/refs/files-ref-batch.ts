@@ -316,7 +316,15 @@ export interface FilesRefOps {
    * packed-refs (`all`: every loose ref under `refs/`). With `prune`, then remove
    * each loose ref under its own `.lock`, only if it still holds the packed value.
    */
-  packRefs(names: string[], options?: { all?: boolean; prune?: boolean }): Promise<void>;
+  packRefs(
+    names: string[],
+    options?: {
+      all?: boolean;
+      prune?: boolean;
+      /** Every loose ref under one of these prefixes (`refs/tags/`: git's default) */
+      prefixes?: string[];
+    },
+  ): Promise<void>;
   /**
    * Remove `packed-refs.new` left by a crashed rewrite, if `packed-refs.lock` is free right
    * now (the temporary is only written under the lock, so it is stale then). Returns how
@@ -1109,20 +1117,36 @@ export function createFilesRefOps(
   }
 
   /**
-   * As git's files_pack_refs and JGit's RefDirectory.pack: the loose refs are read
-   * and packed-refs is written under packed-refs.lock; only then is each packed
-   * loose ref removed, under its own lock and only if it still holds the packed
-   * value, so a ref updated meanwhile stays loose with its new value.
+   * As git's files_pack_refs (`files_optimize`) and JGit's RefDirectory.pack: the loose refs
+   * are read and packed-refs is written under packed-refs.lock; only then is each packed
+   * loose ref removed, under its own lock and only if it still holds the packed value, so a
+   * ref updated meanwhile stays loose with its new value.
+   *
+   * The reference-transaction hook hears what git's runs: the packed store's transaction
+   * (`<zero> <id> <ref>` for every loose ref packed, in name order, run even when there is
+   * none), then one transaction per pruned ref (`<id> <zero> <ref>`, in reverse name order,
+   * git's `refs_to_prune` stack). A refusal tells the hook `aborted` and throws
+   * {@link RefTransactionAbortedError}, as git dies there: nothing packed after it, no ref
+   * pruned.
    */
   async function packRefs(
     names: string[],
-    o: { all?: boolean; prune?: boolean } = {},
+    o: { all?: boolean; prune?: boolean; prefixes?: string[] } = {},
   ): Promise<void> {
     const packedNow = new Map<string, string>();
+    const hook = options.transactionHook?.();
+    let told: RefTransactionUpdate[] = [];
     const r = await withPackedLock(async (commit) => {
       const packed = await readPacked();
-      const wanted = o.all ? await looseRefNames() : names;
-      for (const n of wanted) {
+      const wanted =
+        o.all || o.prefixes
+          ? (await looseRefNames()).filter(
+              (n) => o.all || (o.prefixes ?? []).some((prefix) => n.startsWith(prefix)),
+            )
+          : names;
+      for (const n of [...new Set(wanted)].sort(compareRefNames)) {
+        // git keeps per-worktree refs loose (refs/bisect/, refs/worktree/, refs/rewritten/)
+        if (/^refs\/(bisect|worktree|rewritten)\//.test(n)) continue;
         // absent, broken (git's iteration skips those) or symbolic (git keeps symrefs loose)
         const l = await readLoose(n).catch(() => undefined);
         if (!l || "target" in l) continue;
@@ -1130,19 +1154,44 @@ export function createFilesRefOps(
         packed.set(n, prev?.id === l.id ? prev : { id: l.id });
         packedNow.set(n, l.id);
       }
+      told = [...packedNow].map(([name, id]) => ({ requested: name, name, new: id }));
+      if (hook) {
+        for (const state of ["preparing", "prepared"] as const) {
+          const verdict = await hook(state, told, { packed: true });
+          if (verdict === false || typeof verdict === "string") {
+            await hook("aborted", told, { packed: true });
+            throw new RefTransactionAbortedError(state, verdict || undefined);
+          }
+        }
+      }
       if (packedNow.size) await commit(await serializePacked(packed, options.peel));
     });
     if (r === "held") throw new PackedRefsLockedError(packedLockTimeout);
+    await hook?.("committed", told, { packed: true });
     if (!o.prune) return;
-    for (const [n, id] of packedNow) {
-      // A ref someone is updating right now keeps its loose file (git skips it too).
+    for (const [n, id] of [...packedNow].reverse()) {
+      const update: RefTransactionUpdate[] = [{ requested: n, name: n, old: id, new: null }];
+      const refuse = async (state: "preparing" | "prepared", verdict: false | string) => {
+        await hook?.("aborted", update);
+        throw new RefTransactionAbortedError(state, verdict || undefined);
+      };
+      const preparing = hook ? await hook("preparing", update) : undefined;
+      if (preparing === false || typeof preparing === "string")
+        await refuse("preparing", preparing);
+      // A ref someone is updating right now keeps its loose file (git fails to prune it).
       if ((await lock(n, refLockTimeout)) !== "ok") continue;
+      let verdict: boolean | string | undefined;
       try {
-        const l = await readLoose(n).catch(() => undefined);
-        if (l && "id" in l && l.id === id) await files.remove(n);
+        verdict = hook ? await hook("prepared", update) : undefined;
+        if (verdict !== false && typeof verdict !== "string") {
+          const l = await readLoose(n).catch(() => undefined);
+          if (l && "id" in l && l.id === id) await files.remove(n);
+        }
       } finally {
         await unlock(n); // also prunes the directories the removal emptied
       }
+      if (verdict === false || typeof verdict === "string") await refuse("prepared", verdict);
+      await hook?.("committed", update);
     }
   }
 

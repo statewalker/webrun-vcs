@@ -1039,3 +1039,114 @@ describeGit("rebase: an ORIG_HEAD it cannot write reported, as native git", () =
     expect(refState(mine.dir)).toBe(refState(theirs.dir));
   });
 });
+
+/**
+ * pack-refs and gc (files-backend.c `files_optimize`): the packed store's transaction lists
+ * every loose ref packed (`<zero> <id> <ref>`, in name order, run with none too), then each
+ * pruned loose ref is deleted in a transaction of its own (`<id> <zero> <ref>`, the reverse
+ * order); `preparing` in 2.5x only. A refusal dies: nothing packed, or the refs left to prune
+ * stay loose.
+ */
+describeGit("reference-transaction hook: pack-refs and gc (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx-pack-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** A repository with loose branches and tags, some already packed, and a symbolic ref. */
+  function packBase(dir: string): void {
+    base(dir);
+    git(dir, ["branch", "b1"]);
+    git(dir, ["tag", "t1"]);
+    git(dir, ["tag", "-a", "-m", "annotated", "t2"]);
+    git(dir, ["pack-refs", "--all"]);
+    git(dir, ["branch", "b2"]);
+    git(dir, ["branch", "b1", "-f", "HEAD"]);
+    git(dir, ["tag", "t3"]);
+    git(dir, ["update-ref", "refs/bisect/bad", "HEAD"]);
+    git(dir, ["symbolic-ref", "refs/heads/sym", "refs/heads/main"]);
+  }
+
+  /** The loose ref files and the packed entries. */
+  const packedState = (dir: string) =>
+    [
+      spawnSync("find", [".git/refs", "-type", "f"], { cwd: dir })
+        .stdout.toString()
+        .split("\n")
+        .sort()
+        .join("\n"),
+      readFileSync(join(dir, ".git/packed-refs"), "latin1"),
+      git(dir, ["for-each-ref"]),
+    ].join("\n");
+
+  it("pack-refs --all: the packed transaction, then one per pruned ref", async () => {
+    const dir = join(root, "r");
+    packBase(dir);
+    await expectTwins(
+      dir,
+      ["pack-refs", "--all"],
+      (g) => attempt(g.packRefs().setAll(true)),
+      "pack-refs --all",
+    );
+    expect(packedState(`${dir}-ours`)).toBe(packedState(`${dir}-native`));
+  });
+
+  it("pack-refs (the loose tags) and with nothing to pack: an empty transaction", async () => {
+    const dir = join(root, "r");
+    packBase(dir);
+    git(dir, ["pack-refs"]);
+    await expectTwins(dir, ["pack-refs"], (g) => attempt(g.packRefs()), "nothing to pack");
+    const fresh = join(root, "s");
+    packBase(fresh);
+    await expectTwins(fresh, ["pack-refs"], (g) => attempt(g.packRefs()), "pack-refs");
+    expect(packedState(`${fresh}-ours`)).toBe(packedState(`${fresh}-native`));
+  });
+
+  it("a refusal of the packed transaction: nothing packed, nothing pruned", async () => {
+    const dir = join(root, "r");
+    packBase(dir);
+    await expectTwins(
+      dir,
+      ["pack-refs", "--all"],
+      (g) => attempt(g.packRefs().setAll(true)),
+      "refused",
+      (t) => hookExit(t, "reference-transaction", 1),
+    );
+    expect(packedState(`${dir}-ours`)).toBe(packedState(`${dir}-native`));
+  });
+
+  it("a refusal while pruning: the refs pruned before it are gone, the rest stay loose", async () => {
+    const dir = join(root, "r");
+    packBase(dir);
+    // refuses the deletion of refs/heads/b2 (pruned after the tags, before b1)
+    const hook = String.raw`#!/bin/sh
+input=$(cat)
+{
+  printf '== reference-transaction [%s]\n' "$1"
+  if [ -n "$input" ]; then printf 'stdin:\n%s\n' "$input"; fi
+} >> "$HOOK_LOG"
+case "$1:$input" in
+  prepared:*" 0000000000000000000000000000000000000000 refs/heads/b2"*) exit 1 ;;
+esac
+exit 0
+`;
+    await expectTwins(
+      dir,
+      ["pack-refs", "--all"],
+      (g) => attempt(g.packRefs().setAll(true)),
+      "prune refused",
+      (t) => {
+        const path = join(t.dir, ".git/hooks/reference-transaction");
+        writeFileSync(path, hook, { mode: 0o755 });
+      },
+    );
+    expect(packedState(`${dir}-ours`)).toBe(packedState(`${dir}-native`));
+  });
+
+  it("gc packs the refs as pack-refs --all --prune", async () => {
+    const dir = join(root, "r");
+    packBase(dir);
+    await expectTwins(dir, ["gc", "-q"], (g) => attempt(g.gc()), "gc");
+    expect(packedState(`${dir}-ours`)).toBe(packedState(`${dir}-native`));
+  });
+});

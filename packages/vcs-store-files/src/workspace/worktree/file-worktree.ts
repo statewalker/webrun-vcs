@@ -1421,6 +1421,14 @@ export class FileWorktree implements Worktree {
       config: {
         getAll: (key) => config.getAllWithOrigin(key).map(textOf),
         list: () => config.listWithOrigin().map((e) => ({ key: e.key, value: textOf(e) })),
+        listWithOrigin: () =>
+          config.listWithOrigin().map((e) => ({
+            key: e.key,
+            value: textOf(e),
+            ...(e.file !== undefined ? { file: e.file } : {}),
+            ...(e.line !== undefined ? { line: e.line } : {}),
+            ...(e.scope !== undefined ? { scope: e.scope } : {}),
+          })),
       },
       worktrees,
     };

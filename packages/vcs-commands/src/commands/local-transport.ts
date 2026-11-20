@@ -26,7 +26,12 @@ import {
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { LinkedWorktrees, OpenedRepository, WorkingCopy } from "@statewalker/vcs-working-tree";
 import { TransportError } from "../errors/index.js";
-import { HookSession, hookHostOf, refTransactionHookOf } from "./git-hooks.js";
+import {
+  HookSession,
+  hookHostOf,
+  hookSettingsFromEntries,
+  refTransactionHookOf,
+} from "./git-hooks.js";
 import { ReadTreeCommand } from "./read-tree-command.js";
 import { StatusCommand } from "./status-command.js";
 import { repositoryPlaceOf, usesBranch, worktreeUsingBranch } from "./worktree-support.js";
@@ -467,6 +472,14 @@ export function remoteHookSession(
     layout: async () => ({ files: files as FilesApi, top, gitDir, cwd: gitDir, bare: remote.bare }),
     configValue: setting,
     environment: () => local.environment(),
+    // git 2.5x's configured hooks (hook.<name>.*) of the receiving repository: receive-pack
+    // runs pre-receive, update, post-receive, post-update, push-to-checkout and
+    // reference-transaction through the hook API (only proc-receive through find_hook)
+    hookSettings: () => {
+      const config = remote.config;
+      if (!config) return [];
+      return hookSettingsFromEntries(config.listWithOrigin?.() ?? config.list());
+    },
   });
 }
 

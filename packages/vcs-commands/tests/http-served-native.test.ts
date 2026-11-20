@@ -467,3 +467,34 @@ describeGit("served smart HTTP: the client's variables, decoded paths, missing d
     );
   });
 });
+
+/**
+ * git 2.5x's configured hooks of the served repository (`hook.<name>.*`): receive-pack runs
+ * every receive hook through the hook API, so the configured ones run before the scripts, as
+ * for a local push (git 2.43 ignores them).
+ */
+describeGit("served smart HTTP: configured receive hooks (as git http-backend runs them)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "http-served-config-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const logCommand = (name: string, code = 0) =>
+    `f() { { printf '== cfg-${name}'; printf ' [%s]' "$@"; printf ' GIT_DIR=%s pwd=%s\\n' "$GIT_DIR" "$(pwd)"; input=$(cat); if [ -n "$input" ]; then printf 'stdin:\\n%s\\n' "$input"; fi; } >> "$HOOK_LOG"; echo hook cfg-${name} out; return ${code}; }; f`;
+
+  it("each configured receive hook runs before the script; a refusing one declines", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    const bare = join(dir, "bare.git");
+    for (const event of [...RECEIVE_HOOKS, "reference-transaction"]) {
+      git(bare, ["config", `hook.c-${event}.event`, event]);
+      git(bare, ["config", `hook.c-${event}.command`, logCommand(event)]);
+    }
+    const { theirs } = await expectTwins(dir, ["push", "<url>/bare.git", "main", "other"], "push");
+    if (nativeIs25x) expect(logOf(theirs)).toContain("== cfg-reference-transaction [prepared]");
+    await expectTwins(dir, ["push", "<url>/bare.git", "main"], "configured update refuses", {
+      prepare: (t) =>
+        git(join(t.dir, "bare.git"), ["config", "hook.c-update.command", logCommand("update", 1)]),
+    });
+  });
+});
