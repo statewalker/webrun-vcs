@@ -20,3 +20,5 @@ export type {
 export { pushOverDuplex } from "./push-over-duplex.js";
 export type { ServeOverDuplexOptions } from "./serve-over-duplex.js";
 export { serveOverDuplex } from "./serve-over-duplex.js";
+export type { ServerConfigReader, ServerConfigSettings } from "./server-config.js";
+export { httpServerSettings, serverSettingsFromConfig } from "./server-config.js";

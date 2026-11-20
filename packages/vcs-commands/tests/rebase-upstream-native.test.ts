@@ -67,24 +67,30 @@ describeGit("rebase: an upstream given by name", () => {
     });
   }
 
-  it("an upstream naming nothing fails with git's message, nothing written", async () => {
-    const { native, ours } = twins();
-    const expected = git(root, native, "rebase", "nope");
-    expect(expected.status).toBe(128);
-    const before = snapshot(root, ours, normalizeState);
-    let error: unknown;
-    try {
-      await (await openOurs(ours)).rebase().setCommitter(INTEROP_IDENT).setUpstream("nope").call();
-    } catch (e) {
-      error = e;
-    }
-    expect(error).toBeInstanceOf(GitApiError);
-    expect((error as GitApiError).message).toBe(expected.stderr.trim());
-    expect((error as GitApiError).exitCode).toBe(expected.status);
-    expect(readFileSync(join(ours, ".git/HEAD"), "utf8")).toBe("ref: refs/heads/side\n");
-    expect(snapshot(root, ours, normalizeState)).toEqual(before);
-    expect(snapshot(root, ours, normalizeState)).toEqual(snapshot(root, native, normalizeState));
-  });
+  for (const upstream of ["nope", ""]) {
+    it(`an upstream naming nothing ("${upstream}") fails with git's message, nothing written`, async () => {
+      const { native, ours } = twins();
+      const expected = git(root, native, "rebase", upstream);
+      expect(expected.status).toBe(128);
+      const before = snapshot(root, ours, normalizeState);
+      let error: unknown;
+      try {
+        await (await openOurs(ours))
+          .rebase()
+          .setCommitter(INTEROP_IDENT)
+          .setUpstream(upstream)
+          .call();
+      } catch (e) {
+        error = e;
+      }
+      expect(error).toBeInstanceOf(GitApiError);
+      expect((error as GitApiError).message).toBe(expected.stderr.trim());
+      expect((error as GitApiError).exitCode).toBe(expected.status);
+      expect(readFileSync(join(ours, ".git/HEAD"), "utf8")).toBe("ref: refs/heads/side\n");
+      expect(snapshot(root, ours, normalizeState)).toEqual(before);
+      expect(snapshot(root, ours, normalizeState)).toEqual(snapshot(root, native, normalizeState));
+    });
+  }
 
   it("an upstream naming a tree fails with git's lines", async () => {
     const { native, ours } = twins();

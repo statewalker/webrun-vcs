@@ -31,6 +31,7 @@ import {
   FetchIntoCheckedOutBranchError,
   InvalidArgumentError,
   InvalidRemoteError,
+  TransportError,
 } from "../errors/index.js";
 import { deleteRefs, RemoteConfigStore } from "../remote-config/index.js";
 import {
@@ -687,12 +688,19 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       reflogIdent: this.reflogLine("").ident,
       abbrev: parseCoreAbbrev(store.value("core.abbrev")) ?? -1,
     };
-    const result =
-      localRemote === undefined
-        ? await transportFetch(fetchOptions)
-        : await withLocalUploadPack(localRemote, (connection) =>
-            fetchFromConnection(connection, fetchOptions),
-          );
+    const result = await (localRemote === undefined
+      ? transportFetch(fetchOptions)
+      : withLocalUploadPack(localRemote, (connection) =>
+          fetchFromConnection(connection, fetchOptions),
+        )
+    ).catch((error: unknown) => {
+      // git dies on a source that names no remote ref (a hidden one included)
+      const message = error instanceof Error ? error.message : "";
+      if (message.startsWith("couldn't find remote ref ")) {
+        throw new TransportError(`fatal: ${message}`, undefined, { cause: error });
+      }
+      throw error;
+    });
 
     const advertisedRefs = new Map<string, ObjectId>();
     for (const ref of result.remoteRefs) {

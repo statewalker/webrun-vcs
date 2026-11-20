@@ -62,6 +62,17 @@ export class CloneCheckoutError extends GitApiError {
 }
 
 /**
+ * Thrown when a clone's destination is not empty (git: "destination path '<dir>' already
+ * exists and is not an empty directory.", exit 128): nothing is written.
+ */
+export class CloneDestinationError extends GitApiError {
+  constructor(message: string) {
+    super(message);
+    this.name = "CloneDestinationError";
+  }
+}
+
+/**
  * Thrown when `git switch` refuses before anything changes, with git's message: a name
  * that is not a branch (`fatal: a branch is expected, got commit '...'` and its hint), an
  * operation in progress, a branch `-c` would create that exists, options that do not go

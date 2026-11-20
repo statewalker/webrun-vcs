@@ -290,6 +290,14 @@ function createRepositoryFacadeFromHistory(
     },
   };
 
+  // receive.shallowUpdate: the accepted shallow commits join the repository's shallow list
+  const setShallow = refs.setShallow?.bind(refs);
+  if (setShallow) {
+    facade.updateShallow = async (oids) => {
+      const current = (await refs.getShallow?.()) ?? [];
+      await setShallow(new Set([...current, ...oids]), current);
+    };
+  }
   return facade;
 }
 

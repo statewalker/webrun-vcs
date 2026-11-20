@@ -11,6 +11,7 @@ import {
 import { type CommandCommits, GitCommand } from "../git-command.js";
 import { abbrevLengths } from "./core-config.js";
 import { type CleanupMode, tagMessageFromOption } from "./message-cleanup.js";
+import { canonicalObjectId, isFullHexObjectId } from "./object-id-input.js";
 
 /**
  * Create a tag (lightweight or annotated).
@@ -117,7 +118,7 @@ export class TagCommand extends GitCommand<Ref> {
    */
   setObjectId(objectId: ObjectId): this {
     this.checkCallable();
-    this.objectId = objectId;
+    this.objectId = canonicalObjectId(objectId);
     return this;
   }
 
@@ -210,7 +211,13 @@ export class TagCommand extends GitCommand<Ref> {
     }
 
     // Resolve target object
-    const targetId = this.objectId ?? (await this.resolveHead());
+    // a full id in either case, else any revision (git's `get_oid`)
+    const targetId =
+      this.objectId === undefined
+        ? await this.resolveHead()
+        : isFullHexObjectId(this.objectId)
+          ? this.objectId
+          : await this.resolveRevision(this.objectId);
 
     // Determine if we should create annotated tag
     // (an empty message too: git's `tag -m ""` makes an annotated tag)

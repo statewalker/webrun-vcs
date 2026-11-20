@@ -53,6 +53,7 @@ import { DiffCommand } from "./diff-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { OperationState } from "./merge-support.js";
 import { commentPrefixOf } from "./message-cleanup.js";
+import { canonicalObjectId } from "./object-id-input.js";
 import {
   DO_MATCH_DIRECTORY,
   globalPathspecMagic,
@@ -423,6 +424,7 @@ export class StatusCommand extends GitCommand<Status> {
    * commit).
    */
   setReferenceCommit(id: ObjectId | null): this {
+    id = id === null ? null : canonicalObjectId(id);
     this.checkCallable();
     this.reference = id;
     return this;

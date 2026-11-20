@@ -336,7 +336,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
    */
   setUpstreamName(name: string): this {
     this.checkCallable();
-    if (!this.upstreamCommit) {
+    if (this.upstreamCommit === undefined) {
       throw new InvalidArgumentError(
         "upstreamName",
         name,
@@ -671,12 +671,13 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     state: OperationState,
     worktree: Worktree | undefined,
   ): Promise<RebaseResult> {
-    if (!this.upstreamCommit && !this.root) {
+    if (this.upstreamCommit === undefined && !this.root) {
       throw new UpstreamRequiredError("Upstream commit is required for rebase BEGIN operation");
     }
     // the upstream as given (setUpstream takes a name too) peeled to the commit it names
     // before anything is written, so HEAD is never set to a name ("main\n" in .git/HEAD)
-    if (this.upstreamCommit) {
+    // an empty name too: "fatal: invalid upstream ''"
+    if (this.upstreamCommit !== undefined) {
       this.upstreamCommit = await this.resolveUpstream(this.upstreamCommit);
     }
     if (await this.inProgress(state)) {

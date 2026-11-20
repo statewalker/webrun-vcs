@@ -16,6 +16,7 @@
  */
 
 import type { History, ObjectId } from "@statewalker/vcs-core";
+import type { LinkedWorktrees } from "../linked-worktrees/index.js";
 import type { UntrackedScanHost } from "../status/untracked-scan.js";
 import type { WorkingCopy } from "../working-copy.js";
 import type { ContentAttributesContext, WorktreeContentFilter } from "./content-filter.js";
@@ -425,10 +426,30 @@ export interface WorktreeExtended extends Worktree {
 
 /** A repository {@link Worktree.openRepository} opened. */
 export interface OpenedRepository {
-  /** Its objects and refs */
+  /** Its objects and refs (HEAD the one of the git directory opened) */
   history: History;
   /** Its git directory, in the storage's paths */
   gitDir: string;
-  /** Whether it has no working tree (`core.bare`, else no `.git` directory name) */
+  /**
+   * Its repository directory: the one a linked worktree's git directory names in
+   * `commondir`, else `gitDir`
+   */
+  commonDir?: string;
+  /**
+   * Whether it has no working tree (`core.bare`, else no `.git` directory name; a linked
+   * worktree's git directory never is)
+   */
   bare: boolean;
+  /** Its configuration, as git reads it there (system, global, then the repository's) */
+  config?: OpenedRepositoryConfig;
+  /** Its worktrees: the main one and the linked ones (git's `get_worktrees`) */
+  worktrees?: LinkedWorktrees;
+}
+
+/** The configuration of an {@link OpenedRepository}, values as written. */
+export interface OpenedRepositoryConfig {
+  /** Every value of `key` in the order git reads them; null for a key without `=` */
+  getAll(key: string): Array<string | null>;
+  /** Every entry in the order git reads them */
+  list(): Array<{ key: string; value: string | null }>;
 }

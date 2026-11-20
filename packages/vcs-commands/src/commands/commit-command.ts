@@ -51,6 +51,7 @@ import {
   stripspace,
 } from "./message-cleanup.js";
 import { copyNotesForAmend } from "./notes-support.js";
+import { canonicalObjectId } from "./object-id-input.js";
 import {
   DO_MATCH_DIRECTORY,
   matchPathspecSeen,
@@ -324,7 +325,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
    */
   setParentIds(...parents: ObjectId[]): this {
     this.checkCallable();
-    this.parents = parents;
+    this.parents = parents.map(canonicalObjectId);
     return this;
   }
 

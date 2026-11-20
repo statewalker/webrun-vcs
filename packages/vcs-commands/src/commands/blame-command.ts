@@ -21,6 +21,7 @@ import {
   GIT_MAX_SCORE,
 } from "../rename/index.js";
 import { abbrevLengths } from "./core-config.js";
+import { canonicalObjectId } from "./object-id-input.js";
 
 /** Line bytes the interner holds before blame starts a new one (see `setInternerByteLimit`) */
 const DEFAULT_INTERNER_BYTE_LIMIT = 64 * 1024 * 1024;
@@ -337,6 +338,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
    * @param commit ObjectId of the starting commit
    */
   setStartCommit(commit: ObjectId): this {
+    commit = canonicalObjectId(commit);
     this.checkCallable();
     this.startCommit = commit;
     return this;

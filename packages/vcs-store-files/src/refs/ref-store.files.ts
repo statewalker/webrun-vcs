@@ -81,6 +81,7 @@ export class FileRefStore implements Refs {
     text += decoder.decode();
     return text
       .split("\n")
+      .map((line) => line.toLowerCase())
       .filter((line) => /^[0-9a-f]{40}$/.test(line))
       .sort();
   }

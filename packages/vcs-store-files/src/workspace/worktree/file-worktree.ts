@@ -19,6 +19,7 @@ import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
 import {
   assertValidWorktreePath,
   basename,
+  createHistoryFromStores,
   FileMode,
   isBeyondSymlinkError,
   joinPath,
@@ -61,6 +62,7 @@ import {
 } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "../../create-git-files-backend.js";
 import { parseGitfile } from "../git-dir/index.js";
+import { openGitLinkedWorktrees } from "../linked-worktrees/index.js";
 import { FileStagingStore } from "../staging/index.js";
 import { createWorkingCopyConfig } from "../working-copy/index.js";
 import { type CaseFolding, probeCaseFolding } from "./probe-case-folding.js";
@@ -1235,8 +1237,11 @@ export class FileWorktree implements Worktree {
       head = line?.split(" ")[0];
     }
     if (head === UNREADABLE) return { state: "unknown" };
-    if (!head || !/^[0-9a-f]{40,64}$/.test(head) || /^0+$/.test(head)) return { state: "none" };
-    return { state: "commit", head };
+    // an id in either case (git's get_oid_hex), kept lowercase
+    if (!head || !/^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test(head) || /^0+$/.test(head)) {
+      return { state: "none" };
+    }
+    return { state: "commit", head: head.toLowerCase() };
   }
 
   /**
@@ -1357,13 +1362,68 @@ export class FileWorktree implements Worktree {
         gitDir = target.startsWith("/") ? this.locate(target) : resolveDots(`${parent}/${target}`);
         if (gitDir === undefined) continue;
       } else if (kind !== "directory") continue;
-      if (!(await this.isRepositoryDir(gitDir))) continue;
-      const files = this.rootFiles;
-      const environment = this.environment ? { environment: this.environment } : {};
-      const { history } = await createGitFilesBackend({ files, gitDir, ...environment });
-      return { history, gitDir, bare: await this.isBareRepository(gitDir) };
+      // is_git_directory: HEAD here, objects and refs here or in the `commondir` named
+      const found = await this.gitDirectoryAt(gitDir, gitDir).catch(() => undefined);
+      if (found?.state !== "repository") continue;
+      return this.openRepositoryAt(found.gitDir, found.commonDir);
     }
     return undefined;
+  }
+
+  /**
+   * The repository whose git directory is `gitDir` and repository directory `commonDir`
+   * (the same, unless `gitDir` is a linked worktree's): its history (HEAD the git
+   * directory's own), configuration and worktrees.
+   */
+  private async openRepositoryAt(gitDir: string, commonDir: string): Promise<OpenedRepository> {
+    const files = this.rootFiles;
+    const environment = this.environment ? { environment: this.environment } : {};
+    const backend = await createGitFilesBackend({ files, gitDir: commonDir, ...environment });
+    const worktrees = await openGitLinkedWorktrees({
+      files,
+      gitDir,
+      history: backend.history,
+      ...environment,
+    });
+    let history = backend.history;
+    if (gitDir !== commonDir) {
+      // a linked worktree's git directory: its own HEAD over the repository's refs
+      const current = (await worktrees.list().catch(() => [])).find((wt) => wt.current);
+      if (current) {
+        const base = backend.history;
+        history = createHistoryFromStores({
+          blobs: base.blobs,
+          trees: base.trees,
+          commits: base.commits,
+          tags: base.tags,
+          refs: await worktrees.refsOf(current),
+          objects: base.objects,
+          packs: base.packs,
+        });
+      }
+    }
+    const config = await createWorkingCopyConfig(
+      {
+        read: async (p) => ((await files.exists(p)) ? readFile(files, p) : undefined),
+        write: (p, content) => files.write(p, [content]),
+      },
+      commonDir,
+      undefined,
+      environment,
+    );
+    const textOf = (o: { text: string | undefined }) => o.text ?? null;
+    return {
+      history,
+      gitDir,
+      commonDir,
+      // a linked worktree's git directory has a working tree (git runs there as non-bare)
+      bare: gitDir === commonDir && (await this.isBareRepository(gitDir)),
+      config: {
+        getAll: (key) => config.getAllWithOrigin(key).map(textOf),
+        list: () => config.listWithOrigin().map((e) => ({ key: e.key, value: textOf(e) })),
+      },
+      worktrees,
+    };
   }
 
   /**

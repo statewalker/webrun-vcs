@@ -12,12 +12,17 @@ import {
   openDuplexConnection,
   openDuplexReceivePackConnection,
   type ReceivePackConnection,
+  type ServerConfigSettings,
   serveOverDuplex,
+  serverSettingsFromConfig,
   type UploadPackConnection,
 } from "@statewalker/vcs-transport";
-import type { OpenedRepository, WorkingCopy } from "@statewalker/vcs-working-tree";
+import type { LinkedWorktrees, OpenedRepository, WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { TransportError } from "../errors/index.js";
+import { ReadTreeCommand } from "./read-tree-command.js";
+import { StatusCommand } from "./status-command.js";
+import { usesBranch, worktreeUsingBranch } from "./worktree-support.js";
 
 /** How a remote is reached: smart HTTP, git's local transport, or not at all. */
 export type RemoteTransport =
@@ -216,6 +221,7 @@ export async function withLocalUploadPack<T>(
   run: (connection: UploadPackConnection) => Promise<T>,
 ): Promise<T> {
   const head = await remote.history.refs.get("HEAD").catch(() => undefined);
+  const settings = serverSettingsOf(remote);
   const [client, server] = createDuplexPair();
   const serving = serveOverDuplex({
     duplex: server,
@@ -223,12 +229,16 @@ export async function withLocalUploadPack<T>(
     refStore: createTransportRefStore(remote.history.refs),
     service: "git-upload-pack",
     protocolVersion: "2",
+    // uploadpack.hideRefs and transfer.hideRefs, in the order git reads them
+    uploadPackHideRefs: settings.uploadPackHideRefs,
     ...(head && "target" in head ? { currentBranch: head.target } : {}),
   }).finally(() => server.close?.());
   try {
     const connection = await openDuplexConnection(client, { closeDuplex: true });
     try {
       return await run(connection);
+    } catch (error) {
+      throw packFailure(error) ?? error;
     } finally {
       await connection.close();
     }
@@ -239,16 +249,123 @@ export async function withLocalUploadPack<T>(
 }
 
 /**
+ * The lines git prints when upload-pack's pack-objects fails on an object it cannot read
+ * (upload-pack.c's create_pack_file): its own error and death (upload-pack's stderr, which
+ * the local transport shares), the abort message it sends on band 3, then the client's
+ * deaths. The pack failure reaches the client as a band-3 `ERR <reason>` (`sendPackStream`).
+ */
+function packFailure(error: unknown): TransportError | undefined {
+  const message = error instanceof Error ? error.message : "";
+  if (!(error instanceof Error) || error.name !== "ServerError" || !message.startsWith("ERR ")) {
+    return undefined;
+  }
+  const abort = "aborting due to possible repository corruption on the remote side.";
+  return new TransportError(
+    [
+      "error: git upload-pack: git-pack-objects died with error.",
+      `fatal: git upload-pack: ${abort}`,
+      `remote: ${abort}`,
+      "fatal: early EOF",
+      "fatal: fetch-pack: invalid index-pack output",
+    ].join("\n"),
+    undefined,
+    { cause: error },
+  );
+}
+
+/** git's defaults, for a repository whose configuration cannot be read. */
+const DEFAULT_SETTINGS: ServerConfigSettings = {
+  allowDeletes: true,
+  allowNonFastForward: true,
+  denyCurrentBranch: "unconfigured",
+  denyDeleteCurrent: "unconfigured",
+  shallowUpdate: false,
+  uploadPackHideRefs: [],
+  receivePackHideRefs: [],
+};
+
+/** What git's upload-pack and receive-pack read from the served repository's config. */
+function serverSettingsOf(remote: OpenedRepository): ServerConfigSettings {
+  return remote.config ? serverSettingsFromConfig(remote.config) : DEFAULT_SETTINGS;
+}
+
+/**
+ * The branches the HEAD of a non-bare worktree of the repository uses, the main one and
+ * every linked one (git's `find_shared_symref(get_worktrees(), "HEAD", ref)`, a worktree
+ * being rebased or bisected on a branch included); undefined without the worktree list.
+ */
+async function checkedOutBranches(
+  worktrees: LinkedWorktrees | undefined,
+): Promise<string[] | undefined> {
+  if (!worktrees) return undefined;
+  const list = await worktrees.list().catch(() => undefined);
+  if (!list) return undefined;
+  const out = new Set<string>();
+  for (const wt of list) {
+    for (const ref of [wt.headRef, wt.rebasing, wt.bisecting]) {
+      if (ref !== undefined && usesBranch(wt, ref)) out.add(ref);
+    }
+  }
+  return [...out];
+}
+
+/**
+ * receive.denyCurrentBranch=updateInstead (receive-pack.c's `update_worktree`, without the
+ * push-to-checkout hook: `push_to_deploy`): the worktree that has `ref` checked out is
+ * refused while it has unstaged or staged changes, else brought to `newOid` by
+ * `read-tree -u -m`; the ref itself is updated afterwards by receive-pack.
+ *
+ * @returns the refusal reason, as git reports it; undefined when the worktree was updated
+ */
+export async function pushToDeploy(
+  worktrees: LinkedWorktrees,
+  ref: string,
+  newOid: string,
+): Promise<string | undefined> {
+  const wt = await worktreeUsingBranch(worktrees, ref);
+  if (!wt) return "denyCurrentBranch = updateInstead needs a worktree";
+  let workingCopy: WorkingCopy;
+  try {
+    workingCopy = await worktrees.open(wt);
+  } catch {
+    return "Up-to-date check failed";
+  }
+  // diff-files --quiet --ignore-submodules, then diff-index --quiet --cached HEAD
+  const status = await new StatusCommand(workingCopy)
+    .setUntrackedFiles("no")
+    .setIgnoreSubmodules("all")
+    .call();
+  if (status.modified.size > 0 || status.missing.size > 0 || status.conflicting.size > 0) {
+    return "Working directory has unstaged changes";
+  }
+  if (status.added.size > 0 || status.changed.size > 0 || status.removed.size > 0) {
+    return "Working directory has staged changes";
+  }
+  try {
+    await new ReadTreeCommand(workingCopy).addTree(newOid).setMerge(true).setUpdate(true).call();
+  } catch {
+    return "Could not update working tree to new HEAD";
+  }
+  return undefined;
+}
+
+/**
  * Runs `run` over a connection to receive-pack serving a local repository (opened by
  * {@link openLocalRemote}), as git's local transport runs `git-receive-pack '<path>'`, in
- * process: the pushed objects go into that repository and its refs are updated there, with
- * receive-pack's default checks (a non-bare repository's checked-out branch is refused).
+ * process: the pushed objects go into that repository and its refs are updated there, under
+ * the settings git's receive-pack reads from that repository's config (see
+ * `serverSettingsFromConfig`: deletes, forced updates, the current branch, hidden refs,
+ * shallow updates). A branch checked out in any non-bare worktree of it, linked ones
+ * included, is the current branch `receive.denyCurrentBranch` rules on.
  */
 export async function withLocalReceivePack<T>(
   remote: OpenedRepository,
   run: (connection: ReceivePackConnection) => Promise<T>,
 ): Promise<T> {
   const head = await remote.history.refs.get("HEAD").catch(() => undefined);
+  const settings = serverSettingsOf(remote);
+  const checkedOut = await checkedOutBranches(remote.worktrees);
+  const worktrees = remote.worktrees;
   const [client, server] = createDuplexPair();
   const serving = serveOverDuplex({
     duplex: server,
@@ -257,6 +374,16 @@ export async function withLocalReceivePack<T>(
     service: "git-receive-pack",
     bare: remote.bare,
     ...(head && "target" in head ? { currentBranch: head.target } : {}),
+    allowDeletes: settings.allowDeletes,
+    allowNonFastForward: settings.allowNonFastForward,
+    denyCurrentBranch: settings.denyCurrentBranch,
+    denyDeleteCurrent: settings.denyDeleteCurrent,
+    shallowUpdate: settings.shallowUpdate,
+    receivePackHideRefs: settings.receivePackHideRefs,
+    ...(checkedOut ? { checkedOutBranches: checkedOut } : {}),
+    ...(worktrees
+      ? { updateWorktree: (ref: string, newOid: string) => pushToDeploy(worktrees, ref, newOid) }
+      : {}),
   }).finally(() => server.close?.());
   try {
     const connection = await openDuplexReceivePackConnection(client, { closeDuplex: true });

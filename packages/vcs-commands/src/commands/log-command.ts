@@ -49,6 +49,7 @@ import {
   notesEnvironmentOf,
 } from "./notes-support.js";
 import { combineNotesIgnore } from "./notes-tree.js";
+import { canonicalObjectId } from "./object-id-input.js";
 import {
   ALL_ENTRIES_NOT_INTERESTING,
   bloomPathOf,
@@ -440,6 +441,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * @param until Commits reachable from here are included (start point)
    */
   addRange(since: ObjectId, until: ObjectId): this {
+    since = canonicalObjectId(since);
+    until = canonicalObjectId(until);
     this.checkCallable();
     this.startCommits.push(until);
     this.pending.push({ id: since, exclude: true }, { id: until, exclude: false });

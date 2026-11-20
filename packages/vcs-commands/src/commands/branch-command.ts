@@ -19,6 +19,7 @@ import {
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { ListBranchMode } from "../types.js";
+import { canonicalObjectId } from "./object-id-input.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { shortBranchName, worktreeUsingBranch } from "./worktree-support.js";
 
@@ -340,6 +341,7 @@ export class ListBranchCommand extends GitCommand<Ref[]> {
    * @param commit Commit that must be in branch history
    */
   setContains(commit: ObjectId): this {
+    commit = canonicalObjectId(commit);
     this.checkCallable();
     this.containsCommit = commit;
     return this;
