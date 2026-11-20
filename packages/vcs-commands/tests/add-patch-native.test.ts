@@ -644,6 +644,105 @@ describeGit("patch mode refreshes, conflicts and errors as native git", () => {
     expect(n.stderr).toContain("error: patch failed: f:1");
   });
 
+  it("stash push -p hides skip-worktree and assume-unchanged paths (2.5x), 2.43 offers them", async () => {
+    // 2.5x builds the temporary index by a one-way merge from the index (keep_entry copies
+    // a same-id entry with its flags, merged_entry carries skip-worktree), 2.43 by read-tree
+    const base = (dir: string) => {
+      put(dir, "f", "x\n");
+      put(dir, "g", "1\n2\n3\n");
+      put(dir, "h", "h\n");
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-qm", "base");
+      // a normal change elsewhere, so that the stash goes ahead
+      put(dir, "f", "x\ny\n");
+    };
+    const scenarios: Record<string, (dir: string) => void> = {
+      "skip-worktree, file deleted": (dir) => {
+        base(dir);
+        gitOk(root, dir, "update-index", "--skip-worktree", "h");
+        unlinkSync(join(dir, "h"));
+      },
+      "assume-unchanged, file edited": (dir) => {
+        base(dir);
+        gitOk(root, dir, "update-index", "--assume-unchanged", "g");
+        put(dir, "g", "1\n2\n3\nG\n");
+      },
+      "a staged change marked skip-worktree, file deleted": (dir) => {
+        base(dir);
+        put(dir, "g", "1\nS\n3\n");
+        gitOk(root, dir, "add", "g");
+        gitOk(root, dir, "update-index", "--skip-worktree", "g");
+        unlinkSync(join(dir, "g"));
+      },
+    };
+    for (const [name, build] of Object.entries(scenarios)) {
+      const { n } = await compare(
+        twins(build),
+        ["stash", "push", "-p"],
+        ["y", "y", "y"],
+        async (git, select) => {
+          const cmd = git
+            .stashCreate()
+            .setPatch(true)
+            .setPatchSelector(select)
+            .setCompatibility(compat);
+          await cmd.call();
+          return cmd.getPatchResult();
+        },
+      );
+      expect(n.status, name).toBe(0);
+      expect(n.stdout.includes("diff --git a/f b/f"), name).toBe(true);
+      expect(/diff --git a\/[gh] /.test(n.stdout), name).toBe(!modern);
+    }
+  });
+
+  it("stash push -p refuses a replaced flagged entry whose file changed (2.5x)", async () => {
+    const base = (dir: string) => {
+      put(dir, "f", "x\n");
+      put(dir, "g", "1\n2\n3\n");
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-qm", "base");
+      put(dir, "f", "x\ny\n");
+      put(dir, "g", "1\nS\n3\n");
+      gitOk(root, dir, "add", "g");
+    };
+    const scenarios: Record<string, (dir: string) => void> = {
+      "assume-unchanged": (dir) => {
+        base(dir);
+        gitOk(root, dir, "update-index", "--assume-unchanged", "g");
+        put(dir, "g", "1\nS\n3\nW\n");
+      },
+      "skip-worktree": (dir) => {
+        base(dir);
+        gitOk(root, dir, "update-index", "--skip-worktree", "g");
+        put(dir, "g", "zz\n");
+      },
+    };
+    for (const [name, build] of Object.entries(scenarios)) {
+      const run = async (git: Git, select: ReturnType<typeof selector>) => {
+        const cmd = git
+          .stashCreate()
+          .setPatch(true)
+          .setPatchSelector(select)
+          .setCompatibility(compat);
+        await cmd.call();
+        return cmd.getPatchResult();
+      };
+      if (!modern) {
+        // read-tree HEAD: no flags, the file's change is offered
+        await compare(twins(build), ["stash", "push", "-p"], ["y", "y"], run);
+        continue;
+      }
+      const dirs = twins(build);
+      const n = native(dirs.native, ["stash", "push", "-p"], ["y", "y"]);
+      expect(n.status, name).toBe(128);
+      expect(n.stdout, name).toBe("");
+      const git = await openOurs(dirs.ours);
+      await expect(run(git, selector(["y", "y"])), name).rejects.toThrow(n.stderr.trimEnd());
+      expect(view(dirs.ours), name).toEqual(view(dirs.native));
+    }
+  });
+
   it("refuses --pathspec-from-file with -p, and restore -p --staged on an unborn branch", async () => {
     const dir = join(root, `refuse${counter++}`);
     gitOk(root, root, "init", "-q", "-b", "main", dir);

@@ -159,6 +159,7 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
       peelCommit: (id) => this.revisionResolver().peelToType(id, "commit"),
     });
     const patch = await runPatchSelection(this.workingCopy, {
+      hookSource: this,
       ...this.patchOptions,
       mode: pathPatchMode(index, worktree, revision),
       selector: this.patchSelector,

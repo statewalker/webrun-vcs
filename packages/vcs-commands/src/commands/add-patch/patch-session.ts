@@ -8,6 +8,7 @@ import { EMPTY_TREE_ID } from "@statewalker/vcs-core";
 import type { XdiffAlgorithm } from "@statewalker/vcs-utils";
 
 import { InvalidArgumentError } from "../../errors/index.js";
+import type { GitCommand } from "../../git-command.js";
 import type { WorkingCopy } from "../../types.js";
 import { configValue } from "../merge-config.js";
 import {
@@ -38,6 +39,8 @@ export interface PatchSelectionRequest extends PatchOptions {
   paths: string[];
   compatibility?: PatchCompatibility;
   temporaryIndex?: TemporaryIndex;
+  /** The command running the selection, whose hook session gathers the hooks' output */
+  hookSource?: GitCommand<unknown>;
 }
 
 const ALGORITHMS = new Set(["myers", "minimal", "patience", "histogram"]);
@@ -108,6 +111,7 @@ export async function runPatchSelection(
     ...(interHunkContext !== undefined ? { interHunkContext } : {}),
     ...(algorithm ? { algorithm } : {}),
     ...(request.temporaryIndex ? { temporaryIndex: request.temporaryIndex } : {}),
+    ...(request.hookSource ? { hookSource: request.hookSource } : {}),
   });
   return runAddPatch({
     mode: request.mode,

@@ -25,8 +25,19 @@ import { DiffCommand } from "../diff-command.js";
 import type { PatchBackend } from "./add-patch.js";
 import type { PatchMode } from "./patch-modes.js";
 
+/** An entry of a {@link TemporaryIndex}. */
+export interface TemporaryIndexEntry {
+  mode: number;
+  objectId: string;
+  /**
+   * What the entry took over from the repository's index besides its id: its stat data and
+   * flags (skip-worktree, assume-unchanged), kept while the entry holds the same id and mode
+   */
+  carried?: Omit<StagingEntry, "path" | "mode" | "objectId" | "stage">;
+}
+
 /** An index held in memory (`GIT_INDEX_FILE` pointing at a temporary index). */
-export type TemporaryIndex = Map<string, { mode: number; objectId: string }>;
+export type TemporaryIndex = Map<string, TemporaryIndexEntry>;
 
 /** Options of {@link createPatchBackend}. */
 export interface PatchBackendOptions {
@@ -47,6 +58,11 @@ export interface PatchBackendOptions {
    * selected hunks are applied to it (`apply --cached` with `GIT_INDEX_FILE`)
    */
   temporaryIndex?: TemporaryIndex;
+  /**
+   * The command running the selection: the index refresh and `git apply` run their hooks
+   * (post-index-change) in its hook session, so its `getHookOutput()` gathers their output
+   */
+  hookSource?: GitCommand<unknown>;
 }
 
 /**
@@ -55,7 +71,9 @@ export interface PatchBackendOptions {
  * textconv), and `git apply` with the mode's arguments.
  */
 export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
-  const { workingCopy, mode } = options;
+  const { workingCopy, mode, hookSource } = options;
+  const sharing = <T extends GitCommand<unknown>>(command: T): T =>
+    hookSource ? command.shareHooksOf(hookSource) : command;
   const paths = options.paths ?? [];
   const diffCommand = (pathspec: string[]) => {
     // diff-files shows a conflicted path as its combined diff (`diff --cc`, no hunk
@@ -76,12 +94,20 @@ export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
     async diff() {
       const diff = diffCommand(paths);
       if (temporary) {
-        // `GIT_INDEX_FILE` at the temporary index (create_index_from_tree: entries without
-        // stat data, so each file is compared by content): only its paths are in the diff
+        // `GIT_INDEX_FILE` at the temporary index: only its paths are in the diff. An entry
+        // without carried stat data is compared by content; one carrying the repository
+        // index's flags (2.5x) is taken as its flags say (skip-worktree, assume-unchanged)
         const index = new MemoryStagingStore();
         const builder = index.createBuilder();
         for (const [path, entry] of [...temporary].sort((a, b) => compareGitPaths(a[0], b[0])))
-          builder.add({ path, mode: entry.mode, objectId: entry.objectId, size: 0, mtime: 0 });
+          builder.add({
+            size: 0,
+            mtime: 0,
+            ...entry.carried,
+            path,
+            mode: entry.mode,
+            objectId: entry.objectId,
+          });
         await builder.finish();
         diff.setTemporaryIndex(index);
       }
@@ -104,7 +130,7 @@ export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
       return bytesToLatin1(bytes);
     },
     async apply(patch, args) {
-      const apply = new ApplyCommand(workingCopy).addPatch(latin1ToBytes(patch));
+      const apply = sharing(new ApplyCommand(workingCopy)).addPatch(latin1ToBytes(patch));
       if (args.cached) apply.setCached(true);
       if (args.reverse) apply.setReverse(true);
       if (args.check) apply.setCheck(true);
@@ -112,13 +138,19 @@ export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
       if (temporary && args.cached) apply.setTemporaryIndex(new Map(temporary));
       const result = await apply.call();
       if (temporary && args.cached && !args.check && result.exitCode === 0 && result.index) {
+        // the paths apply rewrote get new entries (no stat data, no flags); the others stay
+        const before = new Map(temporary);
         temporary.clear();
-        for (const [path, entry] of result.index) temporary.set(path, entry);
+        for (const [path, entry] of result.index) {
+          const old = before.get(path);
+          const same = old && old.mode === entry.mode && old.objectId === entry.objectId;
+          temporary.set(path, same ? old : { mode: entry.mode, objectId: entry.objectId });
+        }
       }
       return { ok: result.exitCode === 0, errors: result.errors };
     },
     // the temporary index's refresh changes nothing the selection shows
-    ...(temporary ? {} : { refresh: () => new IndexRefresh(workingCopy).call() }),
+    ...(temporary ? {} : { refresh: () => sharing(new IndexRefresh(workingCopy)).call() }),
   };
 }
 

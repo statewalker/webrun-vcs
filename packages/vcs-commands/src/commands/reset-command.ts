@@ -187,6 +187,7 @@ export class ResetCommand extends GitCommand<Ref> {
     const diffRevision = rev === "HEAD" && !head?.objectId ? EMPTY_TREE_ID : rev;
     if (diffRevision !== EMPTY_TREE_ID) await this.resolveRef(rev);
     this.patchResult = await runPatchSelection(this.workingCopy, {
+      hookSource: this,
       ...this.patchOptions,
       mode: patchModeFor("reset", rev),
       selector: this.patchSelector,

@@ -701,6 +701,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       peelCommit: (id) => this.revisionResolver().peelToType(id, "commit"),
     });
     const patch = await runPatchSelection(this.workingCopy, {
+      hookSource: this,
       ...this.patchOptions,
       mode: pathPatchMode(true, true, revision),
       selector: this.patchSelector,

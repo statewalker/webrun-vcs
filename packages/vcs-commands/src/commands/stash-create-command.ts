@@ -16,9 +16,10 @@ import {
   type PatchSelector,
   patchModeFor,
   runPatchSelection,
+  type TemporaryIndex,
 } from "./add-patch/index.js";
 import { ApplyCommand } from "./apply/apply-command.js";
-import { abbrevLengths } from "./core-config.js";
+import { abbrevLengths, worktreeModeTrust } from "./core-config.js";
 import { DiffCommand } from "./diff-command.js";
 import { flatTree, storeFlatTree } from "./merge-support.js";
 import {
@@ -37,6 +38,7 @@ import { reflogMessages, updateHead } from "./reflog-messages.js";
 import { ResetCommand } from "./reset-command.js";
 import { STASH_REF } from "./stash-list-command.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
+import { flaggedEntryDiffers } from "./worktree-overwrite-checks.js";
 
 /**
  * Default message format for index commit.
@@ -424,13 +426,17 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
    * `apply --cached`); the tree of that index.
    */
   private async patchWorktreeState(headTree: ObjectId, paths: string[]): Promise<ObjectId> {
-    const temporary = new Map<string, { mode: number; objectId: string }>(
+    const temporary: TemporaryIndex = new Map(
       [...(await flatTree(this.trees, headTree))].map(([p, e]) => [
         p,
         { mode: e.mode, objectId: e.objectId },
       ]),
     );
+    // 2.43 builds it with `read-tree HEAD` (entries of the tree alone), 2.5x with
+    // create_index_from_tree (a one-way merge from the repository's index)
+    if (this.compatibility !== "2.43") await this.carryIndexEntries(temporary);
     this.patchResult = await runPatchSelection(this.workingCopy, {
+      hookSource: this,
       ...this.patchOptions,
       mode: patchModeFor("stash"),
       selector: this.patchSelector,
@@ -442,6 +448,41 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     const tree = await storeFlatTree(this.trees, temporary);
     if (tree === headTree) throw new NoChangesSelectedError();
     return tree;
+  }
+
+  /**
+   * 2.5x's create_index_from_tree: HEAD's tree unpacked by `oneway_merge` with the
+   * repository's index as its source. An index entry of the tree's id and mode is kept as it
+   * is (`keep_entry`: stat data, skip-worktree, assume-unchanged); a tree entry the index
+   * holds at another id takes over its skip-worktree bit alone (`merged_entry`). Before that,
+   * `verify_uptodate` checks each index entry the merge replaces or drops whose flags cheat:
+   * its file must still match the entry's stat, else the stash fails ("Entry '<path>' not
+   * uptodate. Cannot merge.").
+   */
+  private async carryIndexEntries(temporary: TemporaryIndex): Promise<void> {
+    const worktree = this.worktreeAccess;
+    const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
+    const indexTime = this.staging.getUpdateTime();
+    for await (const entry of this.staging.entries()) {
+      if (entry.stage !== 0) continue;
+      const head = temporary.get(entry.path);
+      if (head && head.mode === entry.mode && head.objectId === entry.objectId) {
+        const { path: _path, mode: _mode, objectId: _id, stage: _stage, ...carried } = entry;
+        head.carried = carried;
+        continue;
+      }
+      if (
+        worktree &&
+        (entry.assumeValid || entry.skipWorktree) &&
+        (await flaggedEntryDiffers(worktree, entry.path, entry, trust, indexTime))
+      ) {
+        throw new Error(
+          `error: Entry '${entry.path}' not uptodate. Cannot merge.
+` + "Cannot save the current worktree state",
+        );
+      }
+      if (head && entry.skipWorktree) head.carried = { size: 0, mtime: 0, skipWorktree: true };
+    }
   }
 
   /**
@@ -553,8 +594,8 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     const workingTree = this.staged
       ? indexTree
       : this.patch
-        ? await this.patchWorktreeState(headCommit.tree, this.pathspec)
-        : await this.worktreeState(provider);
+        ? await this.worktreeState(() => this.patchWorktreeState(headCommit.tree, this.pathspec))
+        : await this.worktreeState(() => provider.getWorkingTree());
     const untrackedTree =
       this.includeUntracked && provider.getUntrackedTree
         ? await provider.getUntrackedTree({ includeIgnored: this.includeIgnored })
@@ -664,9 +705,9 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   }
 
   /** The stash's worktree tree; under `-q` without git's "Cannot save ..." line on failure. */
-  private async worktreeState(provider: StashWorkingTreeProvider): Promise<ObjectId> {
+  private async worktreeState(compute: () => Promise<ObjectId>): Promise<ObjectId> {
     try {
-      return await provider.getWorkingTree();
+      return await compute();
     } catch (error) {
       const line = "\nCannot save the current worktree state";
       if (this.quiet && error instanceof Error && error.message.endsWith(line)) {

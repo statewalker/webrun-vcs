@@ -450,6 +450,7 @@ export class AddCommand extends GitCommand<AddResult> {
       );
     }
     const patch = await runPatchSelection(this.workingCopy, {
+      hookSource: this,
       ...this.patchOptions,
       mode: patchModeFor("add"),
       selector: this.patchSelector,
