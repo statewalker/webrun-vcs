@@ -99,6 +99,7 @@ export interface DuplexRemoteOptions {
  * const remote = duplexRemote({
  *   connect: (service) => {
  *     const channel = new MessageChannel();
+ *     // serveOverPort closes both ports once the session is over
  *     serveOverPort(channel.port2, (duplex) => server.serve(duplex, service));
  *     return messagePortDuplex(channel.port1); // both of @statewalker/vcs-transport
  *   },

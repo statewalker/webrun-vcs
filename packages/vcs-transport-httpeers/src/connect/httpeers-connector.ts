@@ -29,6 +29,13 @@ export const HTTPEERS_SCHEME = "httpeers";
 /** The scheme of git's native protocol over an httpeers stream: `httpeers+git://<peer>/<repo>`. */
 export const HTTPEERS_NATIVE_SCHEME = "httpeers+git";
 
+/**
+ * The origin of the requests a `call` connector sends over its peer connection, unless
+ * `peerUrl` says otherwise: the connection already leads to the peer, so the URL routes
+ * nothing (the peer's handler sees the repository's path).
+ */
+export const HTTPEERS_CALL_ORIGIN = "http://httpeers.mesh";
+
 /** Where a native session's stream goes: what {@link HttpeersConnectorOptions.openStream} is given. */
 export interface HttpeersStreamTarget {
   /** The peer the URL names (its authority, case kept) */
@@ -66,8 +73,11 @@ export interface HttpeersConnectorOptions {
   /** HTTP: or a fetch that reaches peers by URL (an httpeers member's `fetch`) */
   fetchImpl?: (request: Request) => Promise<Response>;
   /**
-   * HTTP: the URL of a peer's root, the repository's path appended (default `http://<peer>`;
-   * through a member's edge, e.g. `http://local/<key>/<peer>`)
+   * HTTP: the URL of a peer's root, the repository's path appended. Required with `fetchImpl`
+   * (through a member's edge, e.g. `http://local/<key>/<peer>`): a peer id is case-sensitive,
+   * so it belongs in the path, never in a URL host (which URL parsing lower-cases). With
+   * `call` the connection already leads to the peer, and the default, {@link HTTPEERS_CALL_ORIGIN},
+   * only names the requests. The membership token goes only to this URL and below it.
    */
   peerUrl?(peer: string): string;
   /** HTTP: headers added to every request */
@@ -83,10 +93,24 @@ export interface HttpeersConnectorOptions {
   connectTimeout?: number;
 }
 
+/**
+ * What a peer may be spelled with: letters and digits (libp2p peer ids are base58btc, or base32
+ * / base36 multibase), and `-` / `_` for names a test or a local mesh gives its peers. Nothing
+ * that could change a URL's meaning (`@`, `:`, `%`, `/`, `.`).
+ */
+const PEER_NAME = /^[A-Za-z0-9_-]+$/;
+
 /** The peer and repository path of an httpeers URL, or git's error. */
 function targetOf(request: GitConnectRequest): { peer: string; path: string } {
-  const { host, path, raw } = request.url;
+  const { host, path, raw, user, port } = request.url;
   if (!host) throw new TransportError(`fatal: no peer in '${raw}'`);
+  // an httpeers URL names a peer, not a host: no `user@`, no `:port`
+  if (user !== undefined || port !== undefined)
+    throw new TransportError(
+      `fatal: '${raw}' names a user or a port; httpeers URLs name a peer only`,
+    );
+  if (!PEER_NAME.test(host))
+    throw new TransportError(`fatal: '${host}' in '${raw}' is not a peer id`);
   if (!path || path === "/") throw new TransportError(`fatal: no path specified in '${raw}'`);
   return { peer: host, path: path.startsWith("/") ? path : `/${path}` };
 }
@@ -146,7 +170,11 @@ export function createHttpeersConnector(options: HttpeersConnectorOptions): GitT
     throw new Error("createHttpeersConnector: give call or fetchImpl (or mode: native)");
   if (call && token === undefined)
     throw new Error("createHttpeersConnector: a call needs the membership token");
-  const peerUrl = options.peerUrl ?? ((peer: string) => `http://${peer}`);
+  if (!call && !options.peerUrl)
+    throw new Error(
+      "createHttpeersConnector: a fetchImpl needs peerUrl (the peer id in the path, e.g. http://local/<key>/<peer>)",
+    );
+  const peerUrl = options.peerUrl ?? (() => HTTPEERS_CALL_ORIGIN);
   return {
     name: options.name ?? "httpeers",
     schemes: options.schemes ?? [HTTPEERS_SCHEME],
@@ -164,9 +192,11 @@ export function createHttpeersConnector(options: HttpeersConnectorOptions): GitT
           call: await call(peer, request),
           token: token as MeshToken,
           origin: baseUrl,
+          scope: baseUrl,
         });
       } else if (token !== undefined) {
-        send = meshRemoteFetch({ fetchImpl, token, origin: baseUrl });
+        // every peer behind one edge shares its origin: the token stays on this peer's path
+        send = meshRemoteFetch({ fetchImpl, token, origin: baseUrl, scope: baseUrl });
       } else {
         send = fetchImpl as (request: Request) => Promise<Response>;
       }

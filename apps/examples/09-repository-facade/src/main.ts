@@ -216,7 +216,8 @@ if (clientMainRef?.objectId) {
   }
 }
 
-// The session closed both ports when it was over; closing again is harmless
+// serveOverPort closes its port once the session is over, and the entangled port goes with
+// it, so nothing keeps the process alive; closing them again now is harmless
 channel.port1.close();
 channel.port2.close();
 

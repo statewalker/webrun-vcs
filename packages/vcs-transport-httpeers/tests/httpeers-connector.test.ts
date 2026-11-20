@@ -297,3 +297,147 @@ describe("createHttpeersConnector (native protocol over an httpeers stream)", ()
     ).rejects.toThrow(/access denied/);
   });
 });
+
+/** Native transports whose handler takes `extra` options, its streams proven as `peerId`. */
+function nativeWith(
+  repo: TestRepo,
+  hub: Hub,
+  token: string,
+  extra: Partial<Parameters<typeof meshGitDuplexHandler>[0]>,
+  peerId = "peer-a",
+) {
+  const handler = meshGitDuplexHandler({
+    access: access(hub),
+    resolveRepository: async (path) =>
+      path === "/repo.git" ? { repository: repo.facade, refStore: repo.refStore } : undefined,
+    ...extra,
+  });
+  const transports = createDefaultTransports();
+  transports.register(
+    createHttpeersConnector({
+      mode: "native",
+      token,
+      openStream: ({ path, token: frameToken }) =>
+        async function* (input) {
+          yield* handler(input as AsyncIterable<Uint8Array>, {
+            peerId,
+            path,
+            ...(frameToken !== undefined ? { token: frameToken } : {}),
+          });
+        },
+    }),
+  );
+  return transports;
+}
+
+describe("review of the httpeers connectors (PR #181)", () => {
+  it("meshGitDuplexHandler: an access.provenPeer cannot replace the stream's proven peer", async () => {
+    const hub = await createHub();
+    const { repo } = await served();
+    // peer-a's stream presents peer-z's admin token; a provenPeer slipped into access claims peer-z
+    const stolen = await hub.token("peer-z", ["admin"]);
+    const transports = nativeWith(repo, hub, stolen, {
+      access: { ...access(hub), provenPeer: () => "peer-z" } as ReturnType<typeof access>,
+    });
+    const { git } = await client(transports);
+    await expect(git.lsRemote().setRemote("httpeers+git://peer-b/repo.git").call()).rejects.toThrow(
+      /access denied/,
+    );
+  });
+
+  it("refuses peers that are not peer ids, user@ and :port; a fetchImpl needs peerUrl", async () => {
+    expect(() => createHttpeersConnector({ fetchImpl: async () => new Response() })).toThrow(
+      /peerUrl/,
+    );
+    const hub = await createHub();
+    const { repo } = await served();
+    const { transports } = httpTransports(repo, hub, "t");
+    const { git } = await client(transports);
+    for (const [url, error] of [
+      ["httpeers://user@peer-b/repo.git", /user or a port/],
+      ["httpeers://peer-b:8080/repo.git", /user or a port/],
+      ["httpeers://a%40b/repo.git", /not a peer id/],
+      ["httpeers://peer.b/repo.git", /not a peer id/],
+    ] as const) {
+      await expect(git.lsRemote().setRemote(url).call()).rejects.toThrow(error);
+    }
+  });
+
+  it("keeps a peer id's case and pins the token to the peer's base URL behind a shared edge", async () => {
+    const hub = await createHub();
+    const { repo, c2 } = await served();
+    const token = await hub.token("peer-a", ["member"]);
+    const handler = meshGitHandler({
+      repository: repo.facade,
+      refStore: repo.refStore,
+      access: access(hub),
+    });
+    const edge = servePeerConnection(handler, { remotePeer: "peer-a" });
+    const { fetchOverDuplex } = await import("@statewalker/webrun-http-streams");
+    const seen: Array<[string, string | null]> = [];
+    const transports = createDefaultTransports();
+    transports.register(
+      createHttpeersConnector({
+        token,
+        peerUrl: (peer) => `http://local/key/${peer}`,
+        fetchImpl: async (request) => {
+          const url = new URL(request.url);
+          seen.push([url.pathname, request.headers.get("x-httpeers-token")]);
+          // the edge sends every request of 12D3KooWRedirect to another peer behind it
+          if (url.pathname.startsWith("/key/12D3KooWRedirect/"))
+            return new Response(null, {
+              status: 302,
+              headers: { location: url.pathname.replace("12D3KooWRedirect", "12D3KooWOther") },
+            });
+          return fetchOverDuplex(edge, new Request(request, { duplex: "half" } as RequestInit));
+        },
+      }),
+    );
+    const { git } = await client(transports);
+    const listed = await git.lsRemote().setRemote("httpeers://12D3KooWMixedCase/repo.git").call();
+    expect(listed.refs.find((r) => r.name === "refs/heads/main")?.objectId).toBe(c2);
+    expect(seen[0]).toEqual(["/key/12D3KooWMixedCase/repo.git/info/refs", token]);
+
+    seen.length = 0;
+    await expect(
+      git.lsRemote().setRemote("httpeers://12D3KooWRedirect/repo.git").call(),
+    ).rejects.toThrow();
+    expect(seen.map(([path]) => path)).toEqual(["/key/12D3KooWRedirect/repo.git/info/refs"]);
+  });
+
+  it("guard wraps each authorized stream: guardStream ends a revoked member's, a newer token re-admits it", async () => {
+    const { createRevocations, guardStream } = await import("@statewalker/httpeers-access");
+    const hub = await createHub();
+    const { repo, c2 } = await served();
+    const revocations = createRevocations(hub.now);
+    const callers: Array<number | undefined> = [];
+    const extra = {
+      guard: (
+        serve: (input: AsyncIterable<Uint8Array>) => AsyncIterable<Uint8Array>,
+        caller: { issuedAt?: number },
+        context: { peerId: string },
+      ) => {
+        callers.push(caller.issuedAt);
+        return guardStream(serve, {
+          peerId: context.peerId,
+          revocations,
+          ...(caller.issuedAt !== undefined
+            ? { claims: { sub: context.peerId, issuedAt: caller.issuedAt } }
+            : {}),
+        });
+      },
+    };
+    const old = await hub.token("peer-a", ["member"]);
+    revocations.revoke("peer-a");
+    const refused = await client(nativeWith(repo, hub, old, extra));
+    await expect(
+      refused.git.lsRemote().setRemote("httpeers+git://peer-b/repo.git").call(),
+    ).rejects.toThrow();
+
+    const fresh = await hub.token("peer-a", ["member"]);
+    const admitted = await client(nativeWith(repo, hub, fresh, extra));
+    const listed = await admitted.git.lsRemote().setRemote("httpeers+git://peer-b/repo.git").call();
+    expect(listed.refs.find((r) => r.name === "refs/heads/main")?.objectId).toBe(c2);
+    expect(callers.every((at) => typeof at === "number")).toBe(true);
+  });
+});

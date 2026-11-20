@@ -88,6 +88,12 @@ export interface MeshCaller {
   peer: string | undefined;
   /** The capabilities its token's roles derive */
   capabilities: ReadonlySet<string>;
+  /**
+   * When its token was issued (the claims' `iat`, in hub time), so a revocation check can tell a
+   * member re-admitted with a newer token from a revoked one (httpeers-access's `guardStream`
+   * `claims.issuedAt`)
+   */
+  issuedAt?: number;
 }
 
 /**
@@ -111,9 +117,11 @@ export function withMeshAccess(
   })(async (request) => {
     const ctx = access(request);
     const peer = ctx?.peer;
+    const issuedAt = ctx?.claims?.iat;
     return next(request, {
       peer: typeof peer === "string" && peer !== "" ? peer : undefined,
       capabilities: ctx?.capabilities() ?? new Set<string>(),
+      ...(typeof issuedAt === "number" ? { issuedAt } : {}),
     });
   });
   return async (request) => {

@@ -222,7 +222,7 @@ Commit ids differ on every run (see below). A real run:
 === Step 4: Serve Over Duplex (MessagePort) ===
 
   Server result: success=true
-  Client result: refs updated=2
+  Client result: refs updated=1
   Client received commit: "Initial commit from server"
 
 === Summary ===

@@ -37,11 +37,13 @@
 import {
   connect,
   duplexOverPort,
+  getPortCloseSignal,
   type MessageTarget,
   overPipe,
   type PortWindow,
   serve,
   serveDuplexOverPort,
+  setPortCloseSignal,
   structuredCodec,
 } from "@statewalker/webrun-rpc";
 import type { Duplex } from "../../api/duplex.js";
@@ -68,11 +70,12 @@ export interface MessagePortDuplexOptions extends WebrunDuplexOptions {
 }
 
 /**
- * A transport `Duplex` running one git session on a port served by {@link serveGitOverPort}.
- * Writes wait (a promise) once `highWaterMark` bytes queue up; `end` is a half-close (the
- * server's input ends, its answer goes on). The stream tier closes the port when the session
- * is over (a raw `MessagePort` has no `end` of its own, so the caller's side closes it; an
- * entangled `MessageChannel` port closes its peer too).
+ * A transport `Duplex` running one git session on a port served by {@link serveGitOverPort}
+ * or {@link serveOverPort}. Writes wait (a promise) once `highWaterMark` bytes queue up; `end`
+ * is a half-close (the server's input ends, its answer goes on). `close` abandons what is
+ * still running and closes the port (idempotent). The server closes its end once the session
+ * is over, which closes an entangled `MessageChannel` port too, so a session nobody closes
+ * still frees both ports.
  *
  * @param port - A `MessagePort` (or any webrun-rpc `MessageTarget`), one session per port
  */
@@ -81,13 +84,22 @@ export function messagePortDuplex(
   options: MessagePortDuplexOptions = {},
 ): Duplex {
   const { timeout, ...queue } = options;
+  watchPortClose(port);
   const call = duplexOverPort(port, timeout !== undefined ? { timeout } : {});
-  return webrunClientDuplex((input) => {
+  const duplex = webrunClientDuplex((input) => {
     // `duplexOverPort` installs its listeners synchronously: start the port right after.
     const output = call(input);
     startPort(port);
     return output;
   }, queue);
+  const closePort = portCloser(port);
+  return {
+    ...duplex,
+    close: async () => {
+      await duplex.close?.();
+      closePort();
+    },
+  };
 }
 
 /**
@@ -101,16 +113,117 @@ function startPort(port: MessageTarget): void {
   (port as { start?: () => void }).start?.();
 }
 
+/** Closes `port` once, however often it is called; a failing or missing `close` is ignored. */
+function portCloser(port: MessageTarget): () => void {
+  let closed = false;
+  return () => {
+    if (closed) return;
+    closed = true;
+    try {
+      void Promise.resolve(port.close?.()).catch(() => {});
+    } catch {
+      // the port may already be gone
+    }
+  };
+}
+
+/**
+ * Gives a real `MessagePort` a close signal (its `close` event: Node, current browsers), so
+ * the stream tier fails a session whose other end closed instead of waiting for a chunk that
+ * will never come. Other targets keep what they have: a `"close"` listener on a target that
+ * only knows `"message"` might be called for every message.
+ */
+function watchPortClose(port: MessageTarget): void {
+  if (typeof MessagePort === "undefined" || !(port instanceof MessagePort)) return;
+  if (getPortCloseSignal(port)) return;
+  const controller = new AbortController();
+  port.addEventListener("close", () => controller.abort(new Error("the MessagePort was closed")), {
+    once: true,
+  });
+  setPortCloseSignal(port, controller.signal);
+}
+
+/** Default {@link ServeOverPortOptions.lingerTimeout}. */
+export const DEFAULT_PORT_LINGER_TIMEOUT = 1000;
+
+/**
+ * Serves one session on `port` and closes the port once it is over: right after the answer's
+ * end went out (the peer took every chunk), or `lingerTimeout` ms after the session settled
+ * and the last of its answer was handed to the port while the peer leaves that last chunk
+ * unread (a fetch client stops reading at the end of the protocol, before the stream's own
+ * end, and never closes a duplex it was not asked to). The teardown abandons the session and closes the
+ * port at once.
+ */
+function servePortSession(
+  port: MessageTarget,
+  handler: (hooks: { onSettled(): void; onDrained(): void }) => WebrunDuplex,
+  options: { streamTimeout?: number; lingerTimeout?: number },
+): () => void {
+  const closePort = portCloser(port);
+  let lingering: ReturnType<typeof setTimeout> | undefined;
+  let answered = false;
+  const close = () => {
+    if (lingering !== undefined) clearTimeout(lingering);
+    closePort();
+  };
+  const onAnswered = () => {
+    answered = true;
+    // the end of the answer is posted in the promise turns after this: close after them
+    setTimeout(close, 0);
+  };
+  // the session settled and all of its answer is out, but the peer may not take the last of it
+  const linger = () => {
+    if (answered || lingering !== undefined) return;
+    lingering = setTimeout(close, options.lingerTimeout ?? DEFAULT_PORT_LINGER_TIMEOUT);
+  };
+  watchPortClose(port);
+  const teardown = serveDuplexOverPort(
+    port,
+    observeAnswerEnd(handler({ onSettled: linger, onDrained: linger }), onAnswered),
+    options.streamTimeout !== undefined ? { timeout: options.streamTimeout } : {},
+  );
+  startPort(port);
+  return () => {
+    teardown();
+    close();
+  };
+}
+
+/** `handler`, calling `onEnd` once the stream tier pulled the end of its output. */
+function observeAnswerEnd(handler: WebrunDuplex, onEnd: () => void): WebrunDuplex {
+  return (input) => {
+    const output = handler(input);
+    const next = output.next.bind(output);
+    let ended = false;
+    output.next = async (...args) => {
+      const result = await next(...args);
+      if (result.done && !ended) {
+        ended = true;
+        onEnd();
+      }
+      return result;
+    };
+    return output;
+  };
+}
+
 /** Options of {@link serveGitOverPort}. */
 export type ServeGitOverPortOptions = ServeGitOverWebrunOptions & {
   /** Abort the stream after this many milliseconds without a chunk either way (default: none) */
   streamTimeout?: number;
+  /**
+   * How long the port stays open after the session settled while the client leaves the last
+   * chunk of the answer unread (default {@link DEFAULT_PORT_LINGER_TIMEOUT} ms)
+   */
+  lingerTimeout?: number;
 };
 
 /**
  * Serves one git session on a port: git-daemon's request line, then upload-pack or
- * receive-pack (`serveGitConnection`). Returns a teardown that abandons the session;
- * `onSettled` hears its outcome once the answer was taken.
+ * receive-pack (`serveGitConnection`). The port is closed once the session is over (see
+ * {@link ServeGitOverPortOptions.lingerTimeout}), so neither end of a `MessageChannel` keeps
+ * a worker or a Node process alive. Returns a teardown that abandons the session and closes
+ * the port; `onSettled` hears its outcome once the answer was taken.
  *
  * @example
  * ```ts
@@ -121,27 +234,43 @@ export function serveGitOverPort(
   port: MessageTarget,
   options: ServeGitOverPortOptions,
 ): () => void {
-  const { streamTimeout, ...serveOptions } = options;
-  const teardown = serveDuplexOverPort(
+  const { streamTimeout, lingerTimeout, onSettled, onDrained, ...serveOptions } = options;
+  return servePortSession(
     port,
-    serveGitOverWebrun(serveOptions),
-    streamTimeout !== undefined ? { timeout: streamTimeout } : {},
+    (hooks) =>
+      serveGitOverWebrun({
+        ...serveOptions,
+        onSettled: (result, error) => {
+          hooks.onSettled();
+          onSettled?.(result, error);
+        },
+        onDrained: () => {
+          hooks.onDrained();
+          onDrained?.();
+        },
+      }),
+    { streamTimeout, lingerTimeout },
   );
-  startPort(port);
-  return teardown;
 }
 
 /** Options of {@link serveOverPort}. */
 export interface ServeOverPortOptions extends WebrunDuplexOptions {
   /** Abort the stream after this many milliseconds without a chunk either way (default: none) */
   streamTimeout?: number;
+  /**
+   * How long the port stays open after `run` settled while the client leaves the last chunk
+   * of the answer unread (default {@link DEFAULT_PORT_LINGER_TIMEOUT} ms)
+   */
+  lingerTimeout?: number;
 }
 
 /**
  * Runs `run` against the server's end of one session on a port whose client end is a
  * {@link messagePortDuplex}: the stream `serveOverDuplex` (a fixed service), `serveGitService`
  * or any other server reads and writes. It replaces the server side of the deprecated
- * `createMessagePortDuplex`. Returns a teardown that abandons the session.
+ * `createMessagePortDuplex`. The port is closed once the session is over (see
+ * {@link ServeOverPortOptions.lingerTimeout}); the returned teardown abandons the session and
+ * closes the port at once.
  *
  * @example
  * ```ts
@@ -150,6 +279,7 @@ export interface ServeOverPortOptions extends WebrunDuplexOptions {
  *   serveOverDuplex({ duplex, repository, refStore, service: "git-upload-pack" }),
  * );
  * const result = await fetchOverDuplex({ duplex: messagePortDuplex(port1), repository: local, refStore: localRefs });
+ * // both ports are closed once the session is over
  * ```
  */
 export function serveOverPort<T>(
@@ -157,14 +287,11 @@ export function serveOverPort<T>(
   run: (duplex: Duplex) => Promise<T>,
   options: ServeOverPortOptions = {},
 ): () => void {
-  const { streamTimeout, ...queue } = options;
-  const teardown = serveDuplexOverPort(
-    port,
-    webrunServerDuplex(run, queue),
-    streamTimeout !== undefined ? { timeout: streamTimeout } : {},
-  );
-  startPort(port);
-  return teardown;
+  const { streamTimeout, lingerTimeout, ...queue } = options;
+  return servePortSession(port, (hooks) => webrunServerDuplex(run, { ...queue, ...hooks }), {
+    streamTimeout,
+    lingerTimeout,
+  });
 }
 
 /** Options of {@link serveGitOverPortMux} and {@link connectGitOverPortMux}. */

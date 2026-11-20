@@ -208,7 +208,11 @@ Both shapes run on webrun-rpc's stream tier: each direction moves one chunk at a
 pack never piles up in the port, and `Duplex.end` reaches the server as the end of its input. The
 multiplexer serves at most 64 sessions at once (`maxPorts`). Code that runs one fixed service
 without a registry (a `fetchOverDuplex` against a `serveOverDuplex`) pairs `messagePortDuplex` on
-the client with `serveOverPort` on the server. `createMessagePortDuplex`, `messagePortFetch` and
+the client with `serveOverPort` on the server. `serveGitOverPort` and `serveOverPort` close their
+port once the session is over (and with it the other end of a `MessageChannel`), so a session
+nobody closes keeps neither a worker nor a Node process alive: right away when the client took the
+whole answer, else `lingerTimeout` (1 s) after the server settled, for a client such as
+`fetchOverDuplex`, which stops reading at the end of the protocol. `createMessagePortDuplex`, `messagePortFetch` and
 `messagePortServe` are deprecated: they posted writes without backpressure.
 
 ## WebSocket
@@ -294,8 +298,12 @@ serve(params, servePeerConnection(handler, { remotePeer: provenPeerId }));
 ```
 
 A member that already reaches peers through its own `fetch` (an httpeers member's edge) passes
-`fetchImpl` and `peerUrl: (peer) => edgeBaseUrl + peer` instead of `call`; the token is
-then optional, since the edge adds it.
+`fetchImpl` and `` peerUrl: (peer) => `http://local/${edgeKey}/${peer}` `` instead of `call`; the
+token is then optional, since the edge adds it. `peerUrl` is required there and carries the peer
+in the path: peer ids are case-sensitive and a URL host is lower-cased. A token the connector
+sends is pinned to the repository's URL under it (every peer behind an edge shares one origin), and
+a redirect out of it is refused. The peer of an httpeers URL is letters, digits, `-` and `_`; a
+`user@` or a `:port` is refused.
 
 ```typescript
 // git's native protocol over httpeers-libp2p's duplex streams: httpeers+git://<peer>/<repo>
@@ -332,8 +340,33 @@ any ref; with `gitRules({ contributors: true })` a member may push only into
 `refs/peers/<its peer id>/*`, and a command outside it comes back as
 `ng <ref> not allowed: this peer writes refs/peers/<id>/* only`. A token that is missing, expired,
 forged or minted for another peer is refused: with 401 or 403 over HTTP, with git's
-`ERR access denied: …` over the native stream. A native stream is authorized once, when it opens;
-wrap the handler with httpeers-access's `guardStream` to end a revoked member's stream.
+`ERR access denied: …` over the native stream; the stream's proven peer is the only identity
+(an `access.provenPeer` is ignored). A native stream is authorized once, when it opens; to end the
+stream of a member revoked while it runs, give the handler httpeers-access's `guardStream` as its
+`guard`:
+
+```typescript
+import { createRevocations, guardStream } from "@statewalker/httpeers-access";
+
+const revocations = createRevocations(); // kept in sync with the hub's
+meshGitDuplexHandler({
+  access,
+  resolveRepository,
+  guard: (serve, caller, context) =>
+    guardStream(serve, {
+      peerId: context.peerId,
+      revocations,
+      // the token's iat: a member re-admitted with a newer token gets through
+      ...(caller.issuedAt !== undefined
+        ? { claims: { sub: context.peerId, issuedAt: caller.issuedAt } }
+        : {}),
+    }),
+});
+```
+
+Wrapping the handler from outside (`(input, ctx) => guardStream((i) => handler(i, ctx), { peerId:
+ctx.peerId, revocations })(input)`) works too, but without the token's `issuedAt`: a peer revoked
+once then stays refused, even with a token minted after.
 
 ## Any other stream
 
@@ -349,6 +382,10 @@ transports.register(
 // the other end:
 await serveGitConnection({ duplex, resolveRepository });
 ```
+
+`open`'s `signal` aborts when `connectTimeout` passes or when the command's own signal aborts
+(`GitConnectRequest.signal`), whichever comes first; the session then fails, and a stream that
+still opens is closed.
 
 For a webrun-streams channel (WebRTC, LiveKit), register `serveGitOverWebrun(serve)` with the
 channel's `serve` and reach it with `createWebrunConnector({ call: () => call })`.

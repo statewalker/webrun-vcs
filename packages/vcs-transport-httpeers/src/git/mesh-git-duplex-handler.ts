@@ -40,6 +40,9 @@ export interface MeshDuplexContext {
   readonly token?: string;
 }
 
+/** One authorized stream's server: httpeers-access's `StreamHandler` shape. */
+export type MeshStreamHandler = (input: AsyncIterable<Uint8Array>) => AsyncIterable<Uint8Array>;
+
 /** A stream handler in httpeers-libp2p's `DuplexHandler` shape. */
 export type MeshDuplexHandler = (
   input: AsyncIterable<Uint8Array>,
@@ -64,6 +67,30 @@ export interface MeshGitDuplexHandlerOptions
   initTimeout?: number;
   /** Most milliseconds the service waits for the client (default: no limit) */
   timeout?: number;
+  /**
+   * Wraps the server of each stream once its caller is authorized, with what the token proved
+   * (peer, capabilities, `issuedAt`): the place for httpeers-access's `guardStream`, which ends
+   * the stream of a member revoked while it runs. A native stream is authorized only when it
+   * opens, so without such a guard a revoked member keeps a stream it already has.
+   *
+   * @example
+   * ```ts
+   * guard: (serve, caller, context) =>
+   *   guardStream(serve, {
+   *     peerId: context.peerId,
+   *     revocations,
+   *     // without issuedAt a member re-admitted after a revocation is refused too
+   *     ...(caller.issuedAt !== undefined
+   *       ? { claims: { sub: context.peerId, issuedAt: caller.issuedAt } }
+   *       : {}),
+   *   }),
+   * ```
+   */
+  guard?(
+    serve: MeshStreamHandler,
+    caller: MeshCaller,
+    context: MeshDuplexContext,
+  ): MeshStreamHandler;
   /** Hears each served stream's outcome, with the caller it was served to */
   onSettled?(
     result: ServeGitConnectionResult | undefined,
@@ -78,7 +105,10 @@ async function authorize(
   context: MeshDuplexContext,
 ): Promise<MeshCaller | string> {
   let caller: MeshCaller | undefined;
-  const check = withMeshAccess(access, async (_request, found) => {
+  // the stream's proven peer is the only identity: a `provenPeer` that slipped into `access`
+  // (the type leaves it out, a cast does not) must not override it
+  const { provenPeer: _ignored, ...meshAccess } = access as MeshAccessOptions;
+  const check = withMeshAccess(meshAccess, async (_request, found) => {
     caller = found;
     return new Response(null, { status: 204 });
   });
@@ -114,8 +144,11 @@ async function authorize(
  *   outside the caller's own namespace are refused (`ng <ref> not allowed: …`);
  * - a repository's `daemon.*` config never turns a service on (`allowOverride: false`).
  *
- * A stream is authorized once, when it opens; wrap the handler with httpeers-access's
- * `guardStream` to cut a revoked member's stream short.
+ * A stream is authorized once, when it opens; give `guard` (httpeers-access's `guardStream`)
+ * to cut a revoked member's stream short. Wrapping the whole handler from outside works too
+ * (`(input, ctx) => guardStream((i) => handler(i, ctx), { peerId: ctx.peerId, revocations })(input)`),
+ * but there the token's `issuedAt` is unknown, so a peer revoked once stays refused even with
+ * a newer token.
  *
  * @example
  * ```ts
@@ -141,6 +174,7 @@ export function meshGitDuplexHandler(options: MeshGitDuplexHandlerOptions): Mesh
     resolveRepository,
     settings,
     onSettled,
+    guard,
     ...serve
   } = options;
   return async function* gitOverMesh(input, context) {
@@ -172,6 +206,7 @@ export function meshGitDuplexHandler(options: MeshGitDuplexHandlerOptions): Mesh
       },
       ...(onSettled ? { onSettled: (result, error) => onSettled(result, error, caller) } : {}),
     });
-    yield* handler(input);
+    const serveStream: MeshStreamHandler = (stream) => handler(stream);
+    yield* (guard ? guard(serveStream, caller, context) : serveStream)(input);
   };
 }

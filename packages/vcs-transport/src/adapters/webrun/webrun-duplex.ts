@@ -95,6 +95,12 @@ export interface WebrunServerDuplexOptions<T> extends WebrunDuplexOptions {
    * the moment a transport under the call may be released without losing the answer.
    */
   onSettled?(result: T | undefined, error?: unknown): void;
+  /**
+   * Called once `run` has settled and every byte it wrote was handed to the transport: the
+   * last chunk may still wait for the peer to take it. Earlier than `onSettled`, which waits
+   * for that, and called even when the peer never takes it.
+   */
+  onDrained?(): void;
 }
 
 /**
@@ -127,6 +133,13 @@ export function webrunServerDuplex<T>(
     };
     let result: T | undefined;
     let failure: unknown;
+    let runSettled = false;
+    let drained = false;
+    const checkDrained = () => {
+      if (drained || !runSettled || outgoing.queuedBytes > 0) return;
+      drained = true;
+      options.onDrained?.();
+    };
     let outputDone: () => void = () => {};
     const outputFinished = new Promise<void>((resolve) => {
       outputDone = resolve;
@@ -141,6 +154,10 @@ export function webrunServerDuplex<T>(
         outgoing.end(error instanceof Error ? error : new Error(String(error)));
       },
     );
+    void settled.then(() => {
+      runSettled = true;
+      checkDrained();
+    });
     if (options.onSettled) {
       const notify = options.onSettled;
       // once `run` settled and nothing it wrote waits any more: taken, or abandoned (a call
@@ -151,7 +168,10 @@ export function webrunServerDuplex<T>(
     }
     async function* output(): AsyncGenerator<Uint8Array> {
       try {
-        yield* outgoing.stream;
+        for await (const chunk of outgoing.stream) {
+          checkDrained();
+          yield chunk;
+        }
       } finally {
         outputDone();
         // nobody takes the answer any more: the input is not wanted either
@@ -188,11 +208,12 @@ export type ServeGitOverWebrunOptions = Omit<ServeGitConnectionOptions, "duplex"
  * ```
  */
 export function serveGitOverWebrun(options: ServeGitOverWebrunOptions): WebrunDuplex {
-  const { highWaterMark, coalesce, onSettled, ...serve } = options;
+  const { highWaterMark, coalesce, onSettled, onDrained, ...serve } = options;
   return webrunServerDuplex((duplex) => serveGitConnection({ ...serve, duplex }), {
     ...(highWaterMark !== undefined ? { highWaterMark } : {}),
     ...(coalesce !== undefined ? { coalesce } : {}),
     ...(onSettled ? { onSettled } : {}),
+    ...(onDrained ? { onDrained } : {}),
   });
 }
 

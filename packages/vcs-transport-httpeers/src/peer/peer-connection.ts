@@ -59,6 +59,14 @@ export interface MeshTokenOptions {
    * Default: the origin of the first request.
    */
   origin?: string;
+  /**
+   * Narrows where the token goes to one base URL on that origin (a repository's
+   * `http://local/<key>/<peer>/repo.git`, which shares its origin with every other peer behind
+   * the same edge): only requests to that path or below it carry the token, and a redirect
+   * leaving it throws {@link MeshRedirectError}. Its origin is the pinned one when `origin` is
+   * not given. Default: the whole origin.
+   */
+  scope?: string;
   /** Same-origin redirects followed at most (default 5); a redirect to another origin throws */
   maxRedirects?: number;
 }
@@ -78,15 +86,23 @@ export class MeshRedirectError extends Error {
  * (`options.origin`, default the first request's), and removes any peer header from all of them:
  * an identity is proven by the transport, never claimed. Redirects are not left to `fetchImpl`
  * (`redirect: "manual"`): a same-origin redirect of a request without a body is followed, with
- * the token; a redirect to another origin throws {@link MeshRedirectError}, so the token never
- * follows one.
+ * the token; a redirect to another origin (or out of `scope`) throws {@link MeshRedirectError},
+ * so the token never follows one.
  */
 export function withMeshToken(
   fetchImpl: (request: Request) => Promise<Response>,
   token: MeshToken,
   options: MeshTokenOptions = {},
 ): (request: Request) => Promise<Response> {
-  let pinned = options.origin === undefined ? undefined : new URL(options.origin).origin;
+  const scope = options.scope === undefined ? undefined : new URL(options.scope);
+  let pinned = options.origin !== undefined ? new URL(options.origin).origin : scope?.origin;
+  // the scope's path without a trailing slash: the path itself, or anything below it
+  const scopePath = scope?.pathname.replace(/\/+$/, "");
+  const inScope = (url: URL) =>
+    url.origin === pinned &&
+    (scope === undefined ||
+      (url.origin === scope.origin &&
+        (url.pathname === scopePath || url.pathname.startsWith(`${scopePath}/`))));
   const maxRedirects = options.maxRedirects ?? 5;
   return async (request) => {
     pinned ??= new URL(request.url).origin;
@@ -95,7 +111,7 @@ export function withMeshToken(
       const headers = new Headers(current.headers);
       headers.delete(PEER_ID_HEADER);
       headers.delete(MESH_TOKEN_HEADER);
-      if (new URL(current.url).origin === pinned)
+      if (inScope(new URL(current.url)))
         headers.set(MESH_TOKEN_HEADER, typeof token === "function" ? await token() : token);
       const res = await fetchImpl(
         new Request(current, { headers, redirect: "manual", duplex: "half" } as RequestInit),
@@ -109,6 +125,10 @@ export function withMeshToken(
       if (target.origin !== from)
         throw new MeshRedirectError(
           `refused a redirect from ${from} to another origin (${target.origin})`,
+        );
+      if (scope !== undefined && inScope(new URL(current.url)) && !inScope(target))
+        throw new MeshRedirectError(
+          `refused a redirect from ${current.url} out of ${scope.href} (${target.href})`,
         );
       if (hops >= maxRedirects) throw new MeshRedirectError(`more than ${maxRedirects} redirects`);
       const bodiless = current.method === "GET" || current.method === "HEAD";
