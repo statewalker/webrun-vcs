@@ -1256,3 +1256,33 @@ describeGit("interactive rebase, native twins", () => {
     expectSame(native, mine, "done");
   });
 });
+
+describeGit("interactive rebase, native twins: a branch made at a stop", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "rebase-i-branch-"));
+    writeFileSync(
+      join(root, "seq-editor.sh"),
+      '#!/bin/sh\ncp "$1" "$SEEN_TODO"\nif [ -n "$NEW_TODO" ]; then cp "$NEW_TODO" "$1"; fi\nexit 0\n',
+    );
+    writeFileSync(
+      join(root, "msg-editor.sh"),
+      '#!/bin/sh\nif [ -n "$NEW_MSG" ]; then cp "$NEW_MSG" "$1"; fi\nexit 0\n',
+    );
+    chmodSync(join(root, "seq-editor.sh"), 0o755);
+    chmodSync(join(root, "msg-editor.sh"), 0o755);
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  it("checkout -b at an edit stop: --continue moves the new branch, as git's update_head_with_reflog", async () => {
+    const { native, ours: mine } = twins(linear);
+    const todo = `edit ${short(native, "topic~2")} one\npick ${short(native, "topic~1")} two\npick ${short(native, "topic")} three\n`;
+    expect(nativeGit(native, ["rebase", "-i", "main"], { todo }).status).toBe(0);
+    expect((await ours(mine, RebaseOperation.BEGIN, { todo })).result.status).toBe(
+      RebaseStatus.EDIT,
+    );
+    for (const dir of [native, mine]) gitOk(root, dir, "checkout", "-q", "-b", "other");
+    expect(nativeGit(native, ["rebase", "--continue"]).status).toBe(0);
+    expect((await ours(mine, RebaseOperation.CONTINUE)).result.status).toBe(RebaseStatus.OK);
+    expectSame(native, mine, "continued");
+  });
+});

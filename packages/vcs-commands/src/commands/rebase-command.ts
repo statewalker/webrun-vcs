@@ -2929,7 +2929,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       const current = (await refs.resolve("HEAD").catch(() => undefined))?.objectId;
       await updateHeadExpecting(refs, id, current, log);
     } else {
-      await refs.set("HEAD", id, log);
+      // no hook to hear an old value: one batch through HEAD to its branch, unchecked
+      await updateHeadExpecting(refs, id, undefined, log);
     }
     if (!gitCommit) await sequencerPostCommit(this.hooks);
     return id;

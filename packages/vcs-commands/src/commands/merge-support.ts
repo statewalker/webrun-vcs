@@ -705,6 +705,11 @@ export class OperationState {
     }
   }
 
+  /** Each name on its own, a failure ignored (git's unconditional `refs_delete_ref` calls). */
+  private async removeRefsIgnoringFailures(names: string[]): Promise<void> {
+    for (const name of names) await this.removeRef(name).catch(() => undefined);
+  }
+
   /**
    * Deletes pseudo refs whether they exist or not, as git's unconditional `refs_delete_ref`
    * calls (AUTO_MERGE after a commit): a ref store with a transaction hook tells it of the
@@ -714,7 +719,7 @@ export class OperationState {
    */
   async deleteRef(...names: string[]): Promise<void> {
     if (!refsWatched(this.refs)) {
-      await this.removeRef(...names).catch(() => undefined);
+      await this.removeRefsIgnoringFailures(names);
       return;
     }
     for (const name of names) await this.refs.delete(name).catch(() => false);
