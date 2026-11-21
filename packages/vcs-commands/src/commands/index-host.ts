@@ -51,7 +51,8 @@ const readdedPaths = new WeakMap<object, Set<string>>();
 /**
  * Marks paths whose entries the next write of `staging` removes and adds again, as git's
  * apply edits the index (`remove_file_from_index`, then `add_index_entry`): a split index
- * writes them whole instead of as replacements. Cleared by that write.
+ * writes them whole instead of as replacements. Cleared once that write is done (the host's
+ * `written`), never by asking the settings.
  */
 export function markReaddedEntries(staging: object, paths: Iterable<string>): void {
   const set = readdedPaths.get(staging) ?? new Set<string>();
@@ -66,10 +67,7 @@ export async function indexSettingsOf(
 ): Promise<IndexSettings> {
   const settings: IndexSettings = { unpackTrees: peekIndexUpdate(staging).workdir };
   const readded = readdedPaths.get(staging);
-  if (readded) {
-    readdedPaths.delete(staging);
-    settings.readded = readded;
-  }
+  if (readded) settings.readded = new Set(readded);
   if (!workingCopy.config) return settings;
   const config = RemoteConfigStore.from(workingCopy);
   const split = configValueOf(config, "core.splitIndex");
@@ -111,6 +109,9 @@ export function indexHostOf(
 ): IndexHost {
   return {
     settings: () => indexSettingsOf(workingCopy, staging),
+    written: () => {
+      readdedPaths.delete(staging);
+    },
     get trees() {
       return trees();
     },

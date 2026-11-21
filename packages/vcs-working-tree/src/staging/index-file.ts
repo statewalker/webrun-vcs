@@ -63,6 +63,7 @@ import {
   isSparseDirectoryEntry,
   recollapseSparseIndex,
   SPARSE_DIRECTORIES_EXTENSION,
+  sparseIndexMatches,
 } from "./sparse-index.js";
 import {
   adoptSharedIndex,
@@ -135,8 +136,14 @@ export interface IndexSettings {
  * ```
  */
 export interface IndexHost {
-  /** The configuration of the next write, asked once per write */
+  /**
+   * The configuration of the next write, asked once per write (and when a read or
+   * `wantsRewrite` needs it): it must not change what it answers, so state meant for one write
+   * (`readded`) is cleared from `written`, not here.
+   */
   settings?(): IndexSettings | Promise<IndexSettings>;
+  /** Called once a write used the settings (the index file or its lock written). */
+  written?(): void;
   /** The trees a sparse index expands from (`load`) and collapses into (`store`) */
   trees?: Pick<Trees, "load" | "store">;
 }
@@ -174,6 +181,9 @@ interface IndexWritePlan {
   /** Run once the index file is in place */
   after?: () => Promise<void>;
 }
+
+/** git's `init_split_index` death for a sparse index asked to be split (`core.splitIndex`). */
+export const SPLIT_WITH_SPARSE = "cannot use split index with a sparse index";
 
 /** Two weeks, in seconds: git's default `splitIndex.sharedIndexExpire`. */
 const TWO_WEEKS = 14 * 24 * 60 * 60;
@@ -412,6 +422,9 @@ export class IndexFile {
   async wantsRewrite(): Promise<boolean> {
     if (this.refused || this.checksum === undefined || this.checksum === null) return false;
     const settings = (await this.host?.settings?.()) ?? {};
+    if (settings.splitIndex === true && this.split === undefined && this.sparseDirs !== undefined) {
+      throw new Error(SPLIT_WITH_SPARSE);
+    }
     if (settings.splitIndex === true) return this.split === undefined;
     if (settings.splitIndex === false) return this.split !== undefined;
     return false;
@@ -495,6 +508,11 @@ export class IndexFile {
       return { entries, version: parsed.version, extensions, encoding, split, sparseDirs };
     }
     if (sparse) {
+      // post_read_index_from's tweak_split_index: core.splitIndex=true on an index still
+      // sparse dies in init_split_index
+      if (!split && (await this.host?.settings?.())?.splitIndex === true) {
+        throw new Error(SPLIT_WITH_SPARSE);
+      }
       const trees = this.host?.trees ?? this.options.defaultTrees;
       if (!trees) throw new UnsupportedIndexExtensionError(SPARSE_DIRECTORIES_EXTENSION);
       const treeExt = others.find((e) => e.signature === "TREE");
@@ -530,7 +548,11 @@ export class IndexFile {
     const settings: IndexSettings = (await this.host?.settings?.()) ?? {};
     let split = this.split;
     if (settings.splitIndex === false) split = undefined;
-    else if (settings.splitIndex === true && !split) split = { ordered: true };
+    else if (settings.splitIndex === true && !split) {
+      // an index read sparse cannot be split (init_split_index dies)
+      if (this.sparseDirs !== undefined) throw new Error(SPLIT_WITH_SPARSE);
+      split = { ordered: true };
+    }
     if (split) return this.planSplit(entries, extensions, split, settings);
     const sparse = await this.planSparse(entries, extensions, settings);
     if (sparse) return sparse;
@@ -669,29 +691,47 @@ export class IndexFile {
       tree = undefined;
     }
     const rest = extensions.filter((e) => e.signature !== "TREE" && e.signature !== "FSMN");
+    const inCheckout = (path: string) => patterns.includes(path);
+    // git's cache_tree_update(WRITE_TREE_MISSING_OK): every directory's tree stored, the
+    // ones holding an intent-to-add entry invalid; undefined when it cannot be had
+    const computed = async (list: readonly StagingEntry[]) => {
+      try {
+        return await storeCacheTree((items) => trees.store(items), list);
+      } catch {
+        return undefined;
+      }
+    };
     if (this.sparseDirs && this.sparseDirs.length > 0) {
       // read sparse: kept collapsed where it still can be, as git's sparse-aware commands
       const kept = await recollapseSparseIndex(
         entries,
         tree,
         this.sparseDirs,
-        (path) => patterns.includes(path),
+        inCheckout,
         async (below) => {
-          const t = await storeCacheTree((list) => trees.store(list), below);
-          return t?.id ?? (await trees.store([]));
+          const t = await computed(below);
+          return t && t.entryCount >= 0 ? t.id : undefined;
         },
       );
-      if (kept) return this.sparsePlan(kept.entries, kept.cacheTree, tree, rest);
-    }
-    if (!tree || !cacheTreeFullyValid(tree)) {
-      try {
-        tree = await storeCacheTree((list) => trees.store(list), entries);
-      } catch {
-        return undefined;
+      if (kept && (await sparseIndexMatches(kept.entries, entries, trees))) {
+        return this.sparsePlan(kept.entries, kept.cacheTree, tree, rest);
       }
+    }
+    let fromIndex = true;
+    if (!tree || !cacheTreeFullyValid(tree)) {
+      tree = await computed(entries);
+      fromIndex = false;
       if (!tree) return undefined;
     }
-    const collapsed = collapseSparseIndex(entries, tree, (path) => patterns.includes(path));
+    let collapsed = collapseSparseIndex(entries, tree, inCheckout);
+    if (!(await sparseIndexMatches(collapsed.entries, entries, trees))) {
+      // a cache-tree that no longer describes the entries: computed again, never written
+      if (!fromIndex) return undefined;
+      tree = await computed(entries);
+      if (!tree) return undefined;
+      collapsed = collapseSparseIndex(entries, tree, inCheckout);
+      if (!(await sparseIndexMatches(collapsed.entries, entries, trees))) return undefined;
+    }
     return this.sparsePlan(collapsed.entries, collapsed.cacheTree, tree, rest);
   }
 
@@ -983,6 +1023,7 @@ export class IndexFile {
       throw error;
     }
     await plan.after?.();
+    this.host?.written?.();
     this.checksum = bytesToHex(plan.checksum);
     this.encoding = plan.encoding;
     this.split = plan.split;
@@ -1050,6 +1091,7 @@ export class IndexFile {
         // git writes the shared index while it writes the index into its lock
         await plan.before?.();
         await atomic.write(lockPath, plan.bytes);
+        this.host?.written?.();
         pending = {
           entries: entries.slice(),
           extensions: plan.extensions,

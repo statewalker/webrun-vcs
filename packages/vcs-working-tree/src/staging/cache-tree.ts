@@ -583,6 +583,25 @@ export async function storeCacheTree(
   return root;
 }
 
+/**
+ * The id of the tree `entries` make (paths relative to it, in index order), hashed and not
+ * stored; undefined when an entry is unmerged or intent-to-add (no tree holds it: git's
+ * `update_one` leaves such a directory invalid).
+ */
+export async function treeIdOfEntries(
+  entries: readonly {
+    path: string;
+    mode: number;
+    objectId: ObjectId;
+    stage: number;
+    intentToAdd?: boolean;
+  }[],
+): Promise<ObjectId | undefined> {
+  if (entries.some((e) => e.stage !== 0 || e.intentToAdd)) return undefined;
+  const tree = await storeCacheTree(canonicalTreeId, entries);
+  return tree && tree.entryCount >= 0 ? tree.id : undefined;
+}
+
 /** The node of `tree` at `dir` (a directory path without a trailing slash; "" the root). */
 export function cacheTreeNodeAt(tree: CacheTree, dir: string): CacheTree | undefined {
   if (dir === "") return tree;

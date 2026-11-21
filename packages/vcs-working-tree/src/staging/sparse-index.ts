@@ -16,7 +16,7 @@
  */
 
 import { FileMode, type ObjectId, type TreeEntry, type Trees } from "@statewalker/vcs-core";
-import { type CacheTree, cacheTreeOfTree, copyCacheTree } from "./cache-tree.js";
+import { type CacheTree, cacheTreeOfTree, copyCacheTree, treeIdOfEntries } from "./cache-tree.js";
 import type { StagingEntry } from "./types.js";
 
 /** The `sdir` extension's signature. */
@@ -114,7 +114,8 @@ export async function expandSparseIndex(
  * for these entries): a directory outside the checkout (`inCheckout`, git's
  * `path_in_sparse_checkout` of the directory's path with its trailing slash) becomes one
  * sparse directory entry when every entry below it is skip-worktree, merged and no gitlink,
- * and its cache-tree node is valid. Also returns the sparse index's cache-tree (git's
+ * and its cache-tree node is valid (an intent-to-add entry leaves every node above it
+ * invalid, as `update_one` does, so its directory is never collapsed). Also returns the sparse index's cache-tree (git's
  * `cache_tree_update` after the conversion): a sparse directory counts as one entry.
  */
 export function collapseSparseIndex(
@@ -128,9 +129,11 @@ export function collapseSparseIndex(
     let canConvert = ctPath !== "" && !inCheckout(ctPath);
     for (let i = start; canConvert && i < end; i++) {
       const e = entries[i] as StagingEntry;
-      if (e.stage !== 0 || e.mode === FileMode.GITLINK || !e.skipWorktree) canConvert = false;
+      if (e.stage !== 0 || e.mode === FileMode.GITLINK || !e.skipWorktree || e.intentToAdd) {
+        canConvert = false;
+      }
     }
-    if (canConvert && ct.id) {
+    if (canConvert && ct.entryCount >= 0 && ct.id) {
       out.push(sparseDirectoryEntry(ctPath, ct.id));
       collapsed.add(ctPath);
       return;
@@ -202,15 +205,17 @@ export function sparseCacheTreeOf(
  * directory read as a sparse directory (`dirs`) is written as one again when every entry
  * below it is still skip-worktree, merged and no gitlink, and it is still outside the
  * checkout. Its tree is its cache-tree node's when valid, else `treeOf` its entries (paths
- * below the directory). Undefined when a directory read sparse no longer qualifies: git would
- * have expanded the index, and the write converts the full index instead.
+ * below the directory). Undefined when a directory read sparse no longer qualifies (an entry
+ * below it intent-to-add included: git's cache-tree leaves that directory invalid), or its
+ * tree cannot be had: git would have expanded the index, and the write converts the full
+ * index instead. A directory is never written as a tree its entries do not make.
  */
 export async function recollapseSparseIndex(
   entries: readonly StagingEntry[],
   cacheTree: CacheTree | undefined,
   dirs: Iterable<string>,
   inCheckout: (path: string) => boolean,
-  treeOf: (entries: StagingEntry[]) => Promise<ObjectId>,
+  treeOf: (entries: StagingEntry[]) => Promise<ObjectId | undefined>,
 ): Promise<{ entries: StagingEntry[]; cacheTree: CacheTree | undefined } | undefined> {
   const wanted = [...dirs].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const collapsed = new Map<string, ObjectId>();
@@ -235,13 +240,16 @@ export async function recollapseSparseIndex(
     const below: StagingEntry[] = [];
     while (j < entries.length && (entries[j] as StagingEntry).path.startsWith(dir)) {
       const x = entries[j] as StagingEntry;
-      if (x.stage !== 0 || x.mode === FileMode.GITLINK || !x.skipWorktree) return undefined;
+      if (x.stage !== 0 || x.mode === FileMode.GITLINK || !x.skipWorktree || x.intentToAdd) {
+        return undefined;
+      }
       below.push({ ...x, path: x.path.slice(dir.length) });
       j++;
     }
     if (inCheckout(dir)) return undefined;
     const node = cacheTree ? nodeAt(cacheTree, dir) : undefined;
     const id = node && node.entryCount >= 0 && node.id ? node.id : await treeOf(below);
+    if (!id) return undefined;
     out.push(sparseDirectoryEntry(dir, id));
     collapsed.set(dir, id);
     i = j;
@@ -261,4 +269,59 @@ function nodeAt(tree: CacheTree, dir: string): CacheTree | undefined {
     if (!node) return undefined;
   }
   return node;
+}
+
+/**
+ * Whether the sparse index `sparse` stands for the full index `full` exactly: its other
+ * entries are `full`'s, and each sparse directory's tree holds exactly the entries of `full`
+ * it replaces (so expanding it gives `full` back). A tree id is checked by hashing those
+ * entries; one that differs (a stored tree of non-canonical modes) is loaded from `trees` and
+ * compared entry by entry. A stale cache-tree thus never reaches the disk.
+ */
+export async function sparseIndexMatches(
+  sparse: readonly StagingEntry[],
+  full: readonly StagingEntry[],
+  trees: Pick<Trees, "load">,
+): Promise<boolean> {
+  let j = 0;
+  for (const e of sparse) {
+    if (!isSparseDirectoryEntry(e)) {
+      const f = full[j];
+      if (!f || f.path !== e.path || f.stage !== e.stage) return false;
+      j++;
+      continue;
+    }
+    let k = j;
+    while (k < full.length && (full[k] as StagingEntry).path.startsWith(e.path)) k++;
+    if (k === j) return false;
+    const below = full.slice(j, k).map((x) => ({ ...x, path: x.path.slice(e.path.length) }));
+    j = k;
+    const id = await treeIdOfEntries(below);
+    if (id === undefined) return false;
+    if (id === e.objectId) continue;
+    if (!(await treeHoldsEntries(trees, e.objectId, below))) return false;
+  }
+  return j === full.length;
+}
+
+/** Whether the stored tree `treeId` holds exactly `entries` (paths relative to it). */
+async function treeHoldsEntries(
+  trees: Pick<Trees, "load">,
+  treeId: ObjectId,
+  entries: readonly StagingEntry[],
+): Promise<boolean> {
+  const stored: string[] = [];
+  const walk = async (id: ObjectId, prefix: string): Promise<boolean> => {
+    const loaded = await trees.load(id);
+    if (!loaded) return false;
+    for await (const e of loaded) {
+      if (e.mode === FileMode.TREE) {
+        if (!(await walk(e.id, `${prefix}${e.name}/`))) return false;
+      } else stored.push(`${e.mode.toString(8)} ${e.id} ${prefix}${e.name}`);
+    }
+    return true;
+  };
+  if (!(await walk(treeId, ""))) return false;
+  if (stored.length !== entries.length) return false;
+  return entries.every((e, i) => stored[i] === `${e.mode.toString(8)} ${e.objectId} ${e.path}`);
 }

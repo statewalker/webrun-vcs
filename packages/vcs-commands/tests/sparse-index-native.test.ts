@@ -347,3 +347,69 @@ describeGit("sparse-checkout's sparse index settings, against native git", () =>
     expect(view(mine)).toEqual(view(native));
   });
 });
+
+describeGit("sparse index with intent-to-add entries, against native git", () => {
+  /** out/ (outside the cone in/) holds files and a subdirectory; HEAD adds out/new.txt. */
+  function itaRepo(): string {
+    const dir = mkdtempSync(join(root, "ita-"));
+    git(dir, ["init", "-q", "-b", "main"]);
+    git(dir, ["config", "core.trustctime", "false"]);
+    for (const f of ["in/x", "out/a.txt", "out/b.txt", "out/deep/a.txt", "out/deep/b.txt"]) {
+      put(dir, f, `${f}\n`);
+    }
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-q", "-m", "base"]);
+    put(dir, "out/new.txt", "new\n");
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-q", "-m", "new"]);
+    git(dir, ["sparse-checkout", "set", "--sparse-index", "in"]);
+    git(dir, ["config", "advice.sparseIndexExpanded", "false"]);
+    settle(dir);
+    return dir;
+  }
+
+  // 2.43's own `reset -N` writes a sparse index whose out/ is the empty tree
+  it.runIf(version === "2.56")(
+    "reset -N of a path in a sparse directory writes that directory expanded, as 2.5x",
+    async () => {
+      const dir = itaRepo();
+      expect(git(dir, ["ls-files", "--sparse"])).toBe("in/x\nout/");
+      const { native, ours: mine } = copies(dir);
+      git(native, ["reset", "-q", "-N", "HEAD~1", "--", "out/new.txt"]);
+      await (await ours(mine))
+        .reset()
+        .setRef("HEAD~1")
+        .addPath("out/new.txt")
+        .setIntentToAdd(true)
+        .call();
+      const s = await structure(mine);
+      expect(s).toEqual(await structure(native));
+      // never a sparse directory of the empty tree
+      expect(s.entries.some((e) => e.includes("4b825dc642cb6eb9a060e54bf8d69288fbee4904"))).toBe(
+        false,
+      );
+      expect(s.entries).toContain(
+        "100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0SI\tout/new.txt",
+      );
+      expect(view(mine)).toEqual(view(native));
+      expect(git(mine, ["status", "--porcelain"])).not.toMatch(/^ ?D +out\/a\.txt/m);
+    },
+  );
+
+  it("an intent-to-add entry under a directory read sparse never collapses it (git reads it)", async () => {
+    const dir = itaRepo();
+    await (await ours(dir))
+      .reset()
+      .setRef("HEAD~1")
+      .addPath("out/new.txt")
+      .setIntentToAdd(true)
+      .call();
+    const sparse = git(dir, ["ls-files", "--sparse", "-s"]);
+    expect(sparse).not.toContain("040000");
+    expect(git(dir, ["ls-files"])).toBe(
+      "in/x\nout/a.txt\nout/b.txt\nout/deep/a.txt\nout/deep/b.txt\nout/new.txt",
+    );
+    // the cache-tree native git checks: out/ and the root invalid, out/deep/ valid
+    expect(run(dir, ["fsck", "--no-progress", "--no-dangling"]).exit).toBe(0);
+  });
+});

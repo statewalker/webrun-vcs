@@ -1,6 +1,7 @@
 import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { FileMode, type FilesApi } from "@statewalker/vcs-core";
-import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { tryReadFile } from "@statewalker/vcs-utils/files";
 import type {
   CacheTree,
   IndexBuilder,
@@ -38,6 +39,7 @@ import {
   verifyTreePaths,
 } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "../../create-git-files-backend.js";
+import { HostPaths, isAbsoluteGitPath, parseCommonDir } from "../git-dir/index.js";
 
 /**
  * File-based staging store implementation.
@@ -1143,18 +1145,32 @@ function dirOf(path: string): string {
 
 /**
  * The trees of the repository at `gitDir`, opened on first use: what a sparse index read
- * before a command gave the staging its host expands from.
+ * before a command gave the staging its host expands from. A linked worktree's git
+ * directory names its repository in `commondir` (`get_common_dir_noenv`: relative to the
+ * git directory unless absolute), whose objects hold the trees.
  */
 function lazyRepositoryTrees(files: FilesApi, gitDir: string): Pick<Trees, "load" | "store"> {
   let opened: Promise<Trees> | undefined;
   const trees = () => {
-    opened ??= createGitFilesBackend({ files, gitDir }).then(
-      ({ history }) => history.trees as unknown as Trees,
-    );
+    opened ??= commonDirOf(files, gitDir)
+      .then((commonDir) => createGitFilesBackend({ files, gitDir: commonDir }))
+      .then(({ history }) => history.trees as unknown as Trees);
     return opened;
   };
   return {
     load: async (id) => (await trees()).load(id),
     store: async (entries) => (await trees()).store(entries),
   };
+}
+
+/** git's `get_common_dir_noenv` of `gitDir`, as a FilesApi path. */
+async function commonDirOf(files: FilesApi, gitDir: string): Promise<string> {
+  const under = (name: string) => (gitDir ? `${gitDir}/${name}` : name);
+  const path = under("commondir");
+  if ((await files.stats(path).catch(() => undefined))?.kind !== "file") return gitDir;
+  const bytes = await tryReadFile(files, path).catch(() => undefined);
+  const text = bytes ? parseCommonDir(decodeGitPath(bytes)) : undefined;
+  if (!text) return gitDir;
+  const paths = new HostPaths();
+  return paths.normalize(isAbsoluteGitPath(text) ? text : under(text));
 }

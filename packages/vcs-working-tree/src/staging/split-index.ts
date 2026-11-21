@@ -211,11 +211,24 @@ export function mergeSplitIndex(
   merged.forEach((e, i) => {
     byKey.set(`${e.stage}\0${e.path}`, i);
   });
-  const out = merged.slice();
-  const extra: StagingEntry[] = [];
+  const out: (StagingEntry | undefined)[] = merged.slice();
+  const extra: (StagingEntry | undefined)[] = [];
   for (const entry of added) {
     const at = byKey.get(`${entry.stage}\0${entry.path}`);
     if (at === undefined) {
+      // add_index_entry_with_check: a merged entry replaces every unmerged one of its path
+      if (entry.stage === 0) {
+        for (const stage of [1, 2, 3]) {
+          const key = `${stage}\0${entry.path}`;
+          const i = byKey.get(key);
+          if (i !== undefined) out[i] = undefined;
+          byKey.delete(key);
+        }
+        for (let k = 0; k < extra.length; k++) {
+          const x = extra[k];
+          if (x && x.path === entry.path && x.stage !== 0) extra[k] = undefined;
+        }
+      }
       extra.push(entry);
       continue;
     }
@@ -225,8 +238,9 @@ export function mergeSplitIndex(
     if (link?.sharedId === shared.id) sharedLinks.set(entry, { ...link, update: true });
     out[at] = entry;
   }
-  out.push(...extra);
-  return out.sort((a, b) => compareGitPaths(a.path, b.path) || a.stage - b.stage);
+  return [...out, ...extra]
+    .filter((e): e is StagingEntry => e !== undefined)
+    .sort((a, b) => compareGitPaths(a.path, b.path) || a.stage - b.stage);
 }
 
 /** How the entries of the index stand against a shared index before a split write. */

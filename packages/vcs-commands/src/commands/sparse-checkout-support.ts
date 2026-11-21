@@ -607,7 +607,7 @@ export async function updateSparsity(
 /**
  * git's `clean_tracked_sparse_directories` after `update_sparsity` (cone mode only, an index
  * without unmerged entries): each top-most directory outside the cone whose entries are all
- * skip-worktree and none a submodule (what `convert_to_sparse` collapses) is removed with
+ * skip-worktree, none a submodule or intent-to-add (what `convert_to_sparse` collapses) is removed with
  * what is left in it when that is only ignored files, else warned about. A directory reached
  * through a symbolic link is never entered. Returns git's warning lines.
  */
@@ -624,7 +624,8 @@ export async function cleanTrackedSparseDirectories(
   const dirs: string[] = [];
   const seen = new Set<string>();
   for (const entry of entries) {
-    const stays = !entry.skipWorktree || entry.mode === FileMode.GITLINK;
+    // an intent-to-add entry leaves every cache-tree node above it invalid (update_one)
+    const stays = !entry.skipWorktree || entry.mode === FileMode.GITLINK || entry.intentToAdd;
     for (let k = entry.path.indexOf("/"); k > 0; k = entry.path.indexOf("/", k + 1)) {
       const dir = entry.path.slice(0, k + 1);
       if (!seen.has(dir)) {

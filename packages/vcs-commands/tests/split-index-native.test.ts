@@ -558,3 +558,55 @@ describeGit("split index through unpack-trees commands, against native git", () 
     expect(git(mine, ["status", "--porcelain"])).toBe(git(native, ["status", "--porcelain"]));
   });
 });
+
+describeGit("split index and sparse index together, against native git", () => {
+  const sparseRepo = () => {
+    const dir = repo(3);
+    git(dir, ["sparse-checkout", "set", "--sparse-index"]);
+    expect(git(dir, ["ls-files", "--sparse"])).toBe("d/\nf1.txt\nf2.txt\nf3.txt");
+    return dir;
+  };
+
+  it("core.splitIndex=true on a sparse index dies on read, as git (both versions)", async () => {
+    const dir = sparseRepo();
+    git(dir, ["config", "core.splitIndex", "true"]);
+    const before = readFileSync(join(dir, ".git/index"));
+    let theirs = "";
+    try {
+      git(dir, ["status", "--porcelain"]);
+    } catch (error) {
+      theirs = String((error as { stderr?: string }).stderr);
+    }
+    expect(theirs).toBe("fatal: cannot use split index with a sparse index\n");
+    await expect((await ours(dir)).status().call()).rejects.toThrow(
+      "cannot use split index with a sparse index",
+    );
+    put(dir, "f1.txt", "changed\n");
+    await expect((await ours(dir)).add().addFilepattern("f1.txt").call()).rejects.toThrow(
+      "cannot use split index with a sparse index",
+    );
+    expect(readFileSync(join(dir, ".git/index")).equals(before)).toBe(true);
+    expect(readdirSync(join(dir, ".git")).some((n) => n.startsWith("sharedindex."))).toBe(false);
+  });
+
+  it("a split index under index.sparse stays split and whole (convert_to_sparse returns early)", async () => {
+    const dir = repo(3);
+    git(dir, ["config", "core.splitIndex", "true"]);
+    git(dir, ["status", "--porcelain"]);
+    git(dir, ["config", "--unset", "core.splitIndex"]);
+    git(dir, ["sparse-checkout", "set", "--sparse-index"]);
+    expect(git(dir, ["ls-files", "--sparse"])).toBe("d/a.txt\nd/b.txt\nf1.txt\nf2.txt\nf3.txt");
+    put(dir, "f1.txt", "changed\n");
+    git(dir, ["update-index", "-q", "--refresh"]);
+    const result = await twins(
+      dir,
+      () => git(dir, ["add", "f1.txt"]),
+      (g) => g.add().addFilepattern("f1.txt").call(),
+    );
+    expectSame(result);
+    const parsed = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+    expect(parsed.extensions).toContain("link");
+    expect(parsed.extensions).not.toContain("sdir");
+    expect(git(dir, ["status", "--porcelain"])).toBe("M  f1.txt");
+  });
+});

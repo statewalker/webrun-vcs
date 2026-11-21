@@ -44,6 +44,7 @@ import type {
   WorktreePruneCheck,
   WorktreeRepairReport,
 } from "@statewalker/vcs-working-tree";
+import { readIndexFileEntries } from "@statewalker/vcs-working-tree";
 
 import { createFileRefStore, createWorktreeRefs, peelTag } from "../../refs/index.js";
 import { GitCheckout, type GitCheckoutFilesApi } from "../checkout/index.js";
@@ -544,15 +545,14 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     const gitDir = entry.id === undefined ? this.commonDir : this.adminDir(entry.id);
     if ((await this.kind(`${gitDir}/modules`)) === "directory") return true;
     if ((await this.kind(`${gitDir}/index`)) !== "file") return false;
-    const staging = new FileStagingStore(this.files, `${gitDir}/index`);
-    try {
-      await staging.read();
-    } catch {
-      return false;
-    }
+    // read_index_from: a split index merged (its shared index in the worktree's git
+    // directory), a sparse index read as it is (sparse directories are no gitlinks); an index
+    // git cannot read makes it die, so the error is thrown, never taken as no submodules
+    const read = await readIndexFileEntries(this.files, `${gitDir}/index`, { gitDir });
+    if (!read) return false;
     const root = this.fromHost(entry.path);
     if (root === undefined) return false;
-    for await (const e of staging.entries()) {
+    for (const e of read.entries) {
       if (e.mode !== GITLINK_MODE) continue;
       // is_submodule_populated_gently: the submodule's .git leads to a repository
       const dotGit = `${root}/${e.path}/.git`;
@@ -915,7 +915,9 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
             objects: base.objects,
             packs: base.packs,
           });
-    const staging = new FileStagingStore(this.files, `${gitDir}/index`);
+    const staging = new FileStagingStore(this.files, `${gitDir}/index`, {
+      defaultTrees: this.history.trees,
+    });
     await staging.read();
     const checkout = new GitCheckout({
       staging,

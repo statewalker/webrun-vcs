@@ -13,6 +13,8 @@ import {
   createGitStaging,
   encodeLinkExtension,
   expandSparseIndex,
+  IndexFile,
+  isSparseDirectoryEntry,
   mergeSplitIndex,
   parseIndexFile,
   parseLinkExtension,
@@ -228,5 +230,140 @@ describe("sparse index", () => {
     const tree = (await storeCacheTree((l) => trees.store(l), full)) as CacheTree;
     const sparse = collapseSparseIndex(full, tree, (p) => p === "u/");
     expect(sparse.entries.map((e) => e.path)).toEqual(["s/c", "s/d", "u/e"]);
+  });
+});
+
+describe("sparse index writes stand for the full index", () => {
+  const sw = { skipWorktree: true };
+  const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+  const base = () => [
+    entry("in/x", 1),
+    entry("out/a.txt", 2, sw),
+    entry("out/b.txt", 3, sw),
+    entry("out/deep/a.txt", 4, sw),
+    entry("out/deep/b.txt", 5, sw),
+    entry("top", 6),
+  ];
+  const inCone = { includes: (p: string) => p === "in/" };
+  const key = (e: StagingEntry) =>
+    `${e.mode.toString(8)} ${e.objectId} ${e.stage}${e.skipWorktree ? "S" : ""}${e.intentToAdd ? "I" : ""} ${e.path}`;
+
+  /** The index file expanded again: exactly `expected`, and no sparse directory of the empty tree. */
+  async function expectStandsFor(
+    files: ReturnType<typeof createInMemoryFilesApi>,
+    trees: ReturnType<typeof memoryTrees>,
+    expected: readonly StagingEntry[],
+  ) {
+    const parsed = await parseIndexFile(await readAll(files, ".git/index"));
+    for (const e of parsed.entries) {
+      if (isSparseDirectoryEntry(e)) expect(e.objectId, e.path).not.toBe(EMPTY_TREE);
+    }
+    const expanded = await expandSparseIndex(parsed.entries, undefined, trees);
+    expect(expanded.entries.map(key)).toEqual(expected.map(key));
+    return parsed;
+  }
+
+  it("an intent-to-add entry under a directory read sparse writes it expanded", async () => {
+    const files = createInMemoryFilesApi();
+    const trees = memoryTrees();
+    const host = { settings: () => ({ sparse: inCone }), trees };
+    const staging = createGitStaging(files, ".git/index");
+    staging.setIndexHost?.(host);
+    for (const e of base()) await staging.setEntry(e);
+    await staging.write();
+    const first = await expectStandsFor(files, trees, base());
+    expect(first.entries.map((e) => e.path)).toEqual(["in/x", "out/", "top"]);
+
+    const read = createGitStaging(files, ".git/index");
+    read.setIndexHost?.(host);
+    await read.read();
+    expect(read.indexLayout?.()).toEqual({ split: false, sparse: true });
+    const ita = entry("out/new.txt", 7, { ...sw, intentToAdd: true, objectId: EMPTY_TREE });
+    await read.setEntry(ita);
+    await read.write();
+    const expected = [...base()];
+    expected.splice(5, 0, ita);
+    const written = await expectStandsFor(files, trees, expected);
+    // convert_to_sparse_rec: out/ and the root invalid, so nothing below out/ collapses
+    expect(written.entries.filter(isSparseDirectoryEntry)).toEqual([]);
+
+    // removing it again collapses out/ back to its tree
+    await read.removeEntry("out/new.txt");
+    await read.write();
+    const again = await expectStandsFor(files, trees, base());
+    expect(again.entries.map((e) => e.path)).toEqual(["in/x", "out/", "top"]);
+    expect(again.entries[1]?.objectId).toBe(first.entries[1]?.objectId);
+  });
+
+  it("an edited entry under a sparse directory, or one under a new directory, as the entries say", async () => {
+    const files = createInMemoryFilesApi();
+    const trees = memoryTrees();
+    const host = { settings: () => ({ sparse: inCone }), trees };
+    const staging = createGitStaging(files, ".git/index");
+    staging.setIndexHost?.(host);
+    for (const e of base()) await staging.setEntry(e);
+    await staging.write();
+    const read = createGitStaging(files, ".git/index");
+    read.setIndexHost?.(host);
+    await read.read();
+    await read.setEntry(entry("out/deep/a.txt", 40, sw));
+    await read.setEntry(entry("zz/q", 41, sw));
+    await read.write();
+    const expected = base();
+    expected[3] = entry("out/deep/a.txt", 40, sw);
+    expected.push(entry("zz/q", 41, sw));
+    const written = await expectStandsFor(files, trees, expected);
+    // an index kept sparse is not converted again (convert_to_sparse returns early): zz/ stays
+    expect(written.entries.map((e) => e.path)).toEqual(["in/x", "out/", "top", "zz/q"]);
+  });
+
+  it("a cache-tree that no longer describes the entries is never written as a sparse directory", async () => {
+    const files = createInMemoryFilesApi();
+    const trees = memoryTrees();
+    const file = new IndexFile(files, ".git/index", {
+      host: { settings: () => ({ sparse: inCone }), trees },
+    });
+    const entries = base();
+    // a fully valid cache-tree of other content (out/b.txt at another object), set without
+    // the entries it describes
+    const other = base();
+    other[2] = entry("out/b.txt", 99, sw);
+    const stale = (await storeCacheTree((l) => trees.store(l), other)) as CacheTree;
+    file.setCacheTree(stale);
+    await file.write(entries);
+    const written = await expectStandsFor(files, trees, entries);
+    const out = written.entries.find((e) => e.path === "out/");
+    expect(out?.objectId).not.toBe(stale.subtrees.find((s) => s.name === "out")?.tree.id as string);
+  });
+});
+
+describe("merge_base_index: unmerged entries under a merged one", () => {
+  it("a stage-0 entry of the split file drops the shared index's stages 1-3 at its path", () => {
+    const shared: SharedIndex = {
+      id: oid(98),
+      version: 2,
+      entries: [
+        entry("a", 1),
+        entry("c", 2, { stage: 1 }),
+        entry("c", 3, { stage: 2 }),
+        entry("c", 4, { stage: 3 }),
+        entry("d", 5),
+      ],
+    };
+    const merged = mergeSplitIndex([entry("c", 9)], { baseId: oid(98) }, shared);
+    expect(merged.map((e) => `${e.path}:${e.stage}:${e.size}`)).toEqual([
+      "a:0:1",
+      "c:0:9",
+      "d:0:5",
+    ]);
+    // an unmerged entry added keeps the others
+    const unmerged = mergeSplitIndex([entry("c", 8, { stage: 2 })], { baseId: oid(98) }, shared);
+    expect(unmerged.map((e) => `${e.path}:${e.stage}:${e.size}`)).toEqual([
+      "a:0:1",
+      "c:1:2",
+      "c:2:8",
+      "c:3:4",
+      "d:0:5",
+    ]);
   });
 });

@@ -1317,3 +1317,102 @@ describeGit("git worktree add of a replaced HEAD, native twins", () => {
     expect((await opened.git.status().call()).isClean()).toBe(true);
   });
 });
+
+describeGit("git worktree: a linked worktree with a sparse index", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "wt-sparse-native-"));
+    home = join(root, "home");
+    mkdirSync(home);
+  });
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  /** A linked worktree `name` of `repo` whose index git made sparse (dir/ collapsed). */
+  function sparseWorktree(base: string, repo: string, name: string): string {
+    const wt = join(base, name);
+    run(repo, "worktree", "add", "-q", wt, "feat");
+    run(wt, "sparse-checkout", "set", "--sparse-index");
+    run(wt, "config", "advice.sparseIndexExpanded", "false");
+    expect(run(wt, "ls-files", "--sparse")).toBe("a.txt\ndir/\n");
+    return wt;
+  }
+
+  it("its index opens, status reads it, a write keeps it sparse; move and remove work", async () => {
+    const base = join(root, "sparse-wt");
+    const repo = build(base);
+    const wt = sparseWorktree(base, repo, "wt");
+    // the staging store over the worktree's index finds the repository's trees (commondir)
+    const files = createNodeFilesApi({ rootDir: base });
+    const staging = new FileStagingStore(files, "repo/.git/worktrees/wt/index");
+    await staging.read();
+    expect(staging.entryList?.().map((e) => `${e.path}${e.skipWorktree ? " S" : ""}`)).toEqual([
+      "a.txt",
+      "dir/b.txt S",
+    ]);
+    // opened from the worktree, and from the main worktree's list
+    const linked = await open(base, "repo/.git/worktrees/wt");
+    expect((await linked.git.status().call()).isClean()).toBe(true);
+    expect(run(wt, "status", "--porcelain")).toBe("");
+    put(wt, "a.txt", "changed\n");
+    await linked.git.add().addFilepattern("a.txt").call();
+    expect(run(wt, "status", "--porcelain")).toBe("M  a.txt\n");
+    expect(run(wt, "ls-files", "--sparse")).toBe("a.txt\ndir/\n");
+    const { git, worktrees } = await open(base);
+    const listed = (await worktrees.list()).find((w) => w.path === join(base, "wt"));
+    expect(listed).toBeDefined();
+    // move and remove from the main worktree (validate_no_submodules reads the sparse index)
+    await git.worktreeMove().setWorktree("wt").setDestination(join(base, "wt2")).call();
+    expect(run(join(base, "wt2"), "status", "--porcelain")).toBe("M  a.txt\n");
+    // a staged change: refused without --force, as git refuses it
+    expect(runResult(repo, "worktree", "remove", join(base, "wt2")).status).toBe(128);
+    expect(await fatal(() => git.worktreeRemove().setWorktree("wt2").call())).toBe(
+      "fatal: 'wt2' contains modified or untracked files, use --force to delete it\n",
+    );
+    await git.worktreeRemove().setWorktree("wt2").setForce(true).call();
+    expect(existsSync(join(base, "wt2"))).toBe(false);
+    expect(run(repo, "worktree", "list", "--porcelain").split("worktree ").length).toBe(2);
+  });
+
+  it("a populated submodule in it refuses move and remove, as git", async () => {
+    const base = join(root, "sparse-wt-sub");
+    const repo = build(base);
+    const wt = sparseWorktree(base, repo, "wt");
+    run(wt, "init", "-q", "sub");
+    put(join(wt, "sub"), "s.txt", "s\n");
+    run(join(wt, "sub"), "add", ".");
+    run(join(wt, "sub"), "commit", "-qm", "s");
+    run(wt, "-c", "advice.addEmbeddedRepo=false", "add", "--sparse", "sub");
+    expect(run(wt, "ls-files", "--sparse")).toBe("a.txt\ndir/\nsub\n");
+    const theirs = runResult(repo, "worktree", "move", wt, join(base, "wt2"));
+    expect(theirs.status).toBe(128);
+    const { git } = await open(base);
+    expect(
+      await fatal(() =>
+        git.worktreeMove().setWorktree("wt").setDestination(join(base, "wt2")).call(),
+      ),
+    ).toBe(theirs.stderr);
+    // remove checks for submodules only without --force (check_clean_worktree)
+    const removed = runResult(repo, "worktree", "remove", wt);
+    expect(removed.status).toBe(128);
+    expect(await fatal(() => git.worktreeRemove().setWorktree("wt").call())).toBe(removed.stderr);
+    expect(existsSync(join(wt, "sub", "s.txt"))).toBe(true);
+  });
+
+  it("an index git cannot read is an error, never taken as no submodules", async () => {
+    const base = join(root, "sparse-wt-corrupt");
+    const repo = build(base);
+    const wt = sparseWorktree(base, repo, "wt");
+    const index = join(repo, ".git/worktrees/wt/index");
+    const bytes = readFileSync(index);
+    bytes[3] = 0x58; // "DIRX": git dies on the signature
+    writeFileSync(index, bytes);
+    const theirs = runResult(repo, "worktree", "move", wt, join(base, "wt2"));
+    expect(theirs.status).toBe(128);
+    const { git } = await open(base);
+    await expect(
+      git.worktreeMove().setWorktree("wt").setDestination(join(base, "wt2")).call(),
+    ).rejects.toThrow();
+    expect(existsSync(wt)).toBe(true);
+  });
+});
