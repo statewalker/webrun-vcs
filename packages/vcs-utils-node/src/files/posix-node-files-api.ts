@@ -19,6 +19,7 @@
 
 import {
   closeSync,
+  fchmodSync,
   constants as fsConstants,
   fstatSync,
   lstatSync,
@@ -376,31 +377,39 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       });
     }
     const tmp = nodePath.join(nodePath.dirname(real), tmpName());
-    let handle: fs.FileHandle;
+    // Opened, filled, closed and renamed with synchronous calls where the content is small
+    // (`fillNewFile`): a checkout writes thousands of small files, and each round trip
+    // through libuv's thread pool costs more than the write itself.
+    let fd: number;
     try {
-      handle = await fs.open(fsPath(tmp), "wx", 0o666);
+      fd = openSync(fsPath(tmp), "wx", 0o666);
     } catch (error) {
       // a directory the batch cache vouched for is gone: check the path afresh, once
       if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !this.verified) throw error;
       this.verified.clear();
       await this.realNoLinks(path);
       await this.mkdirs(nodePath.dirname(real), path);
-      handle = await fs.open(fsPath(tmp), "wx", 0o666);
+      fd = openSync(fsPath(tmp), "wx", 0o666);
     }
-    let done = false;
     try {
       // a regular file keeps its permission bits (as NodeFilesApi); a link is replaced
       // by a new file of the default mode
-      if (existing?.isFile()) await handle.chmod(existing.mode & 0o777);
-      await writeBatched(handle, content);
-      await handle.close();
-      await replaceFile(tmp, real, { platform: this.windows ? "win32" : "linux" });
-      done = true;
-    } finally {
-      if (!done) {
-        await handle.close().catch(() => {});
-        await fs.rm(fsPath(tmp), { force: true }).catch(() => {});
-      }
+      if (existing?.isFile()) fchmodSync(fd, existing.mode & 0o777);
+    } catch (error) {
+      closeSync(fd);
+      rmQuiet(tmp);
+      throw error;
+    }
+    // closes the file, and removes it on a failure
+    await fillNewFile(fd, tmp, content);
+    try {
+      await replaceFile(tmp, real, {
+        platform: this.windows ? "win32" : "linux",
+        rename: async (from, to) => renameSync(fsPath(from), fsPath(to)),
+      });
+    } catch (error) {
+      rmQuiet(tmp);
+      throw error;
     }
   }
 
@@ -998,6 +1007,15 @@ async function fillNewFile(fd: number, real: string, content: Content): Promise<
         // already gone
       }
     }
+  }
+}
+
+/** Removes the file at a real path, if anything is there; never fails. */
+function rmQuiet(real: string): void {
+  try {
+    unlinkSync(fsPath(real));
+  } catch {
+    // already gone
   }
 }
 

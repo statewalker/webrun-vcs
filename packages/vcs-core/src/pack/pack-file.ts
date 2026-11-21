@@ -43,7 +43,7 @@ import {
   TruncatedStreamError,
 } from "@statewalker/vcs-utils/compression";
 import { applyGitDelta, DeltaError } from "@statewalker/vcs-utils/diff";
-import { CRC32 } from "@statewalker/vcs-utils/hash/crc32";
+import { CRC32, crc32 as crc32Of } from "@statewalker/vcs-utils/hash/crc32";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
@@ -73,6 +73,13 @@ export interface PackedEntry {
    * This reads the entry twice, which doubles the I/O for large reused entries.
    */
   raw(): AsyncIterable<Uint8Array>;
+  /**
+   * The bytes `raw()` yields, in one piece, for an entry short enough to be read through the
+   * pack's windows (the CRC of the whole entry checked first, as `raw()` does): without a
+   * promise when its windows are loaded. Absent for longer entries, which `raw()` streams.
+   * The bytes may be a view into a cached window: read them before the next pack read.
+   */
+  data?(): Uint8Array | Promise<Uint8Array>;
 }
 
 /** One installed pack (`pack-<packId>.pack` and its `.idx`). */
@@ -1757,15 +1764,39 @@ export async function openPack(
         baseId = hex(t.idAt(bi));
       }
       const crc32 = t.crcOf(i) ?? (await checkEntry(e));
+      const span = e.end - offset;
+      /** The entry's bytes from the windows, CRC-checked; its data after the header. */
+      const checked = (bytes: Uint8Array): Uint8Array => {
+        if (bytes.length !== span) throw new PackError(`${packPath}: entry at ${offset} truncated`);
+        if (crc32Of(bytes) !== crc32)
+          throw new PackError(
+            `${packPath}: entry ${id} at ${offset} does not match its idx CRC (corrupt)`,
+          );
+        return bytes.subarray(e.dataStart - offset);
+      };
       return {
         kind: e.kind as PackedEntryKind,
         size: e.size,
         ...(baseId ? { baseId } : {}),
         crc32,
+        ...(span <= WINDOWED_MAX
+          ? {
+              data(): Uint8Array | Promise<Uint8Array> {
+                const now = peekRange(offset, span);
+                return now ? checked(now) : readRangeAll(offset, span).then(checked);
+              },
+            }
+          : {}),
         async *raw() {
           // Two passes, as JGit's copyAsIs validates before copying: the CRC of the whole entry
           // is checked before a byte is yielded, then again while streaming (the file could
-          // change in between). Entries are compressed and usually small.
+          // change in between). Entries are compressed and usually small: those read through
+          // the windows are checked once there (`data()`).
+          if (span <= WINDOWED_MAX) {
+            const bytes = peekRange(offset, span) ?? (await readRangeAll(offset, span));
+            yield checked(bytes).slice();
+            return;
+          }
           const check = (crc: CRC32, at: number) => {
             if (at !== e.end) throw new PackError(`${packPath}: entry at ${offset} truncated`);
             if (crc.getValue() !== crc32)

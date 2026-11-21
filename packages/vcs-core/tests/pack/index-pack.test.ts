@@ -349,6 +349,8 @@ describe("installPack: delta resolution memory", () => {
       const r = await installPack(files, PACK_DIR, chunks(tree), {
         baseCacheBytes,
         windowBytes: 1,
+        // every delta read again in phase 2 (none kept from phase 1)
+        deltaStashBytes: 0,
       });
       return { reads: counter.reads, idx: await readIdx(files, r.packId) };
     };
@@ -371,7 +373,11 @@ describe("installPack: delta resolution memory", () => {
     const bytes = pack(entries);
     const files = createInMemoryFilesApi();
     const counter = countingReads(files);
-    await installPack(files, PACK_DIR, chunks(bytes), { windowBytes: 1024 });
+    await installPack(files, PACK_DIR, chunks(bytes), {
+      windowBytes: 1024,
+      windowCount: 1,
+      deltaStashBytes: 0,
+    });
     // the phase-1 pass, then window refills: far fewer than the 101 entry loads
     expect(counter.reads).toBeGreaterThan(2);
     expect(counter.reads).toBeLessThan(20);
@@ -641,5 +647,45 @@ describe("installPack: storage failures and the final renames", () => {
       installPack(files, PACK_DIR, chunks(pack([{ kind: 3, data: A }]))),
     ).rejects.toThrow(/could not move/);
     expect(await listed(base)).toEqual([]);
+  });
+});
+
+describe("installPack: deltas kept from phase 1 (deltaStashBytes)", () => {
+  const chain = () => {
+    const entries: Entry[] = [{ kind: 3, data: A }];
+    let prev = A;
+    for (let i = 0; i < 100; i++) {
+      const next = extend(prev, `+${i}`);
+      entries.push({ kind: 6, baseIdx: i, data: next.d });
+      prev = next.data;
+    }
+    return pack(entries);
+  };
+
+  it("resolves deltas without reading them again (same idx)", async () => {
+    const bytes = chain();
+    const run = async (deltaStashBytes?: number) => {
+      const files = createInMemoryFilesApi();
+      const counter = countingReads(files);
+      const r = await installPack(files, PACK_DIR, chunks(bytes), {
+        windowBytes: 1,
+        ...(deltaStashBytes === undefined ? {} : { deltaStashBytes }),
+      });
+      return { reads: counter.reads, idx: await readIdx(files, r.packId) };
+    };
+    const kept = await run();
+    const reread = await run(0);
+    expect(kept.idx).toEqual(reread.idx);
+    // the phase-1 pass and the base: no delta is read again
+    expect(kept.reads).toBe(2);
+    expect(reread.reads).toBe(2 + 100);
+  });
+
+  it("re-reads the deltas past the budget", async () => {
+    const files = createInMemoryFilesApi();
+    const counter = countingReads(files);
+    await installPack(files, PACK_DIR, chunks(chain()), { windowBytes: 1, deltaStashBytes: 200 });
+    expect(counter.reads).toBeGreaterThan(2);
+    expect(counter.reads).toBeLessThan(2 + 100);
   });
 });

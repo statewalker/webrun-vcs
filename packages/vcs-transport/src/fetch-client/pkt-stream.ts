@@ -73,9 +73,19 @@ export class PktStream {
     if (!(await this.fill(length))) throw new PacketLineError("Incomplete packet at end of stream");
     this.queue.take(4);
     const data = this.queue.take(length - 4);
-    let text = decoder.decode(data);
-    if (text.endsWith("\n")) text = text.slice(0, -1);
-    return { type: "data", data, text };
+    // decoded when asked: the sideband packets of a pack are never read as text
+    let text: string | undefined;
+    return {
+      type: "data",
+      data,
+      get text() {
+        if (text === undefined) {
+          text = decoder.decode(data);
+          if (text.endsWith("\n")) text = text.slice(0, -1);
+        }
+        return text;
+      },
+    };
   }
 
   /**

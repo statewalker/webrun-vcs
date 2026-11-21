@@ -6,7 +6,8 @@
  *   1. one sequential pass: entry headers, delta bases, every zlib stream inflated once (stopping
  *      past the declared size), CRC-32 per entry, ids of non-delta objects, the trailer;
  *   2. deltas resolved depth first from each base, through a byte-bounded base cache; entries are
- *      re-read through a bounded window over the stored pack (one storage read serves many);
+ *      re-read through a few small windows over the stored pack (one storage read serves many),
+ *      the deltas kept from phase 1 within `deltaStashBytes` not re-read at all;
  *   3. thin packs (`externalBase` given, git's `--fix-thin`): every REF_DELTA still unresolved,
  *      in pack order, has its base looked up once, verified (its content must hash to the id),
  *      appended as a whole object and its subtree resolved; the pack is then rewritten with the
@@ -27,6 +28,7 @@ import { applyGitDelta, DeltaError } from "@statewalker/vcs-utils/diff";
 import { CRC32 } from "@statewalker/vcs-utils/hash/crc32";
 import { createSha1, type Hasher } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
+import { allocBytes } from "@statewalker/vcs-utils/streams";
 import type { FilesApi } from "../common/files/index.js";
 import type { ObjectId } from "../common/id/index.js";
 import { CorruptObjectError } from "../history/objects/git-objects.js";
@@ -55,8 +57,16 @@ export interface InstallPackOptions {
   maxPackSize?: number;
   /** Bytes of resolved bases kept while resolving deltas; evicted bases are re-derived. Default 32 MiB. */
   baseCacheBytes?: number;
-  /** Size of the window phase 2 reads the stored pack through. Default 1 MiB. */
+  /** Size of each window phase 2 reads the stored pack through. Default 64 KiB. */
   windowBytes?: number;
+  /** Windows phase 2 keeps (the least recently used is replaced). Default 16. */
+  windowCount?: number;
+  /**
+   * Bytes of inflated delta data kept from the first pass for phase 2, which then neither
+   * re-reads nor inflates those deltas again (the others are, through the window). Default
+   * 32 MiB; 0 keeps none.
+   */
+  deltaStashBytes?: number;
   /**
    * Called for every received object once the whole pack is resolved (before it is
    * installed): the entries sent whole first, then the deltas, each group in pack order (the
@@ -105,14 +115,22 @@ const REF_DELTA = 7;
 const SLICE = 1024; // inflater input per push: one push yields at most ~1 MiB
 /** smallest possible entry: a 1-byte header and an 8-byte zlib stream (empty, fixed block) */
 const MIN_ENTRY = 9;
-const enc = new TextEncoder();
 const hex = bytesToHex;
 
+/** `<type> <size>\0`, the header an object id hashes first. */
+function objectHeaderBytes(type: ObjectTypeString, size: number): Uint8Array {
+  const digits = String(size);
+  const out = new Uint8Array(type.length + digits.length + 2);
+  let o = 0;
+  for (let k = 0; k < type.length; k++) out[o++] = type.charCodeAt(k);
+  out[o++] = 0x20;
+  for (let k = 0; k < digits.length; k++) out[o++] = digits.charCodeAt(k);
+  out[o] = 0;
+  return out;
+}
+
 const objectId = (type: ObjectTypeString, data: Uint8Array) =>
-  createSha1()
-    .update(enc.encode(`${type} ${data.length}\0`))
-    .update(data)
-    .digest();
+  createSha1().update(objectHeaderBytes(type, data.length)).update(data).digest();
 
 /**
  * Struct-of-arrays entry table. Entries are in pack order (offsets ascending), appended bases
@@ -261,19 +279,73 @@ class SequentialReader {
   }
 }
 
+/**
+ * Inflated delta data kept from phase 1 (`deltaStashBytes`), in slabs: one offset per entry,
+ * the length being the entry's size. Deltas past the budget, or larger than a slab, are not
+ * kept (phase 2 reads them again).
+ */
+class DeltaStash {
+  private static readonly SLAB = 2 ** 20;
+  private readonly slabs: Uint8Array[] = [];
+  private used = DeltaStash.SLAB; // in the last slab
+  private at: Int32Array = new Int32Array(0); // slab * SLAB + offset + 1, 0 none
+  private left: number;
+  constructor(budget: number) {
+    this.left = budget;
+  }
+  /** Room for the data of entry `i` (`size` bytes), or undefined when it is not kept. */
+  reserve(i: number, size: number): Uint8Array | undefined {
+    if (size === 0 || size > DeltaStash.SLAB || size > this.left) return undefined;
+    if (i >= this.at.length) {
+      const grown = new Int32Array(Math.max(4096, this.at.length * 2, i + 1));
+      grown.set(this.at);
+      this.at = grown;
+    }
+    if (this.used + size > DeltaStash.SLAB) {
+      if ((this.slabs.length + 1) * DeltaStash.SLAB > 2 ** 31 - 1) return undefined;
+      this.slabs.push(new Uint8Array(DeltaStash.SLAB));
+      this.used = 0;
+    }
+    const k = this.slabs.length - 1;
+    this.at[i] = k * DeltaStash.SLAB + this.used + 1;
+    const out = (this.slabs[k] as Uint8Array).subarray(this.used, this.used + size);
+    this.used += size;
+    this.left -= size;
+    return out;
+  }
+  /** Forgets entry `i` (its data turned out not to be whole). */
+  drop(i: number) {
+    if (i < this.at.length) this.at[i] = 0;
+  }
+  /** The kept data of entry `i` (`size` bytes), if any. */
+  get(i: number, size: number): Uint8Array | undefined {
+    const a = i < this.at.length ? (this.at[i] as number) : 0;
+    if (a === 0) return undefined;
+    const o = a - 1;
+    const k = Math.floor(o / DeltaStash.SLAB);
+    const from = o - k * DeltaStash.SLAB;
+    return (this.slabs[k] as Uint8Array).subarray(from, from + size);
+  }
+  release() {
+    this.slabs.length = 0;
+    this.at = new Int32Array(0);
+  }
+}
+
 /** Phase 1: one pass over the stored pack. */
 async function parse(
   files: FilesApi,
   path: string,
   packLen: number,
   maxObjectSize: number,
+  stash: DeltaStash,
   onContent?: ObjectContentCallback,
 ) {
   if (packLen < 32) throw new PackError("pack too short");
   const pool = createInflaterPool();
   const r = new SequentialReader(files.read(path), packLen - 20);
   try {
-    return await parseWith(r, pool, packLen, maxObjectSize, onContent);
+    return await parseWith(r, pool, packLen, maxObjectSize, stash, onContent);
   } finally {
     await r.close();
   }
@@ -284,6 +356,7 @@ async function parseWith(
   pool: InflaterPool,
   packLen: number,
   maxObjectSize: number,
+  stash: DeltaStash,
   onContent?: ObjectContentCallback,
 ) {
   const head = await r.bytes(12);
@@ -356,9 +429,14 @@ async function parseWith(
     const inflater = pool.acquire();
     let got = 0;
     const typeName = TYPE_NAMES[kind];
-    const objHash = typeName ? createSha1().update(enc.encode(`${typeName} ${size}\0`)) : undefined;
+    const objHash = typeName ? createSha1().update(objectHeaderBytes(typeName, size)) : undefined;
     // a commit, tree or tag sent whole is kept while it inflates, for `onContent`
-    const content = onContent && typeName && typeName !== "blob" ? new Uint8Array(size) : undefined;
+    const content =
+      onContent && typeName && typeName !== "blob"
+        ? allocBytes(size)
+        : typeName
+          ? undefined
+          : stash.reserve(i, size); // a delta's data, kept for phase 2
     try {
       await r.inflate(inflater, (out) => {
         got += out.length;
@@ -370,6 +448,7 @@ async function parseWith(
       });
     } catch (err) {
       inflater.abort();
+      stash.drop(i);
       // zlib errors are the pack's; storage errors (EIO…) pass through unchanged
       if (err instanceof CompressionError) {
         throw new PackError(`entry at ${offset}: ${(err as Error).message}`);
@@ -382,7 +461,7 @@ async function parseWith(
     if (objHash) {
       t.oid.set(objHash.digest(), i * 20);
       t.type[i] = kind;
-      if (content && onContent) {
+      if (content && onContent && typeName) {
         onContent(hex(t.oid.subarray(i * 20, i * 20 + 20)), typeName as ObjectTypeString, content);
       }
     }
@@ -404,17 +483,23 @@ async function parseWith(
 }
 
 /**
- * Ranged reads through one bounded window: an entry that fits is served from the window, which is
- * refilled (one storage read of `windowBytes` from the entry on) when it misses; larger entries
- * are read directly.
+ * Ranged reads through a few small windows: an entry that fits is served from a window holding
+ * it, else a window is read from the entry on (one storage read of `windowBytes`), replacing the
+ * least recently used of `windowCount`; larger entries are read directly. Phase 2 jumps between
+ * a base and its deltas all over the pack, so several short windows hit more often than one
+ * long one, and short reads are cheap (the Node FilesApi serves reads of up to 64 KiB
+ * synchronously; a longer window mostly reads bytes nobody asks for).
  */
 class WindowReader {
-  private path = "";
-  private start = 0;
-  private buf: Uint8Array | null = null;
+  private readonly paths: string[] = [];
+  private readonly starts: number[] = [];
+  private readonly bufs: (Uint8Array | null)[] = [];
+  private readonly used: number[] = [];
+  private clock = 0;
   constructor(
     private readonly files: FilesApi,
     private readonly windowBytes: number,
+    private readonly windowCount: number,
   ) {}
   async *range(
     path: string,
@@ -426,11 +511,21 @@ class WindowReader {
       yield* this.files.read(path, { start, length });
       return;
     }
-    const b = this.buf;
-    if (
-      !(b && path === this.path && start >= this.start && start + length <= this.start + b.length)
-    ) {
-      this.buf = null; // never hold two windows
+    let k = -1;
+    for (let w = 0; w < this.bufs.length; w++) {
+      const b = this.bufs[w];
+      const from = this.starts[w] as number;
+      if (b && path === this.paths[w] && start >= from && start + length <= from + b.length) {
+        k = w;
+        break;
+      }
+    }
+    if (k < 0) {
+      // the least recently used window (or a new one) is replaced: released before the read
+      k = this.bufs.length < this.windowCount ? this.bufs.length : 0;
+      for (let w = 1; w < this.bufs.length && this.bufs.length >= this.windowCount; w++)
+        if ((this.used[w] as number) < (this.used[k] as number)) k = w;
+      this.bufs[k] = null;
       const want = Math.min(this.windowBytes, fileEnd - start);
       const nb = new Uint8Array(want);
       let o = 0;
@@ -440,15 +535,20 @@ class WindowReader {
         o += c.length;
       }
       if (o < length) throw new PackError(`${path} truncated at ${start + o}`);
-      this.buf = nb.subarray(0, o);
-      this.path = path;
-      this.start = start;
+      this.bufs[k] = nb.subarray(0, o);
+      this.paths[k] = path;
+      this.starts[k] = start;
     }
-    const w = this.buf as Uint8Array;
-    yield w.subarray(start - this.start, start - this.start + length);
+    this.used[k] = ++this.clock;
+    const w = this.bufs[k] as Uint8Array;
+    const from = this.starts[k] as number;
+    yield w.subarray(start - from, start - from + length);
   }
   release() {
-    this.buf = null;
+    this.bufs.length = 0;
+    this.paths.length = 0;
+    this.starts.length = 0;
+    this.used.length = 0;
   }
 }
 
@@ -466,7 +566,7 @@ async function loadEntry(
   const size = t.size[i] as number; // ≤ maxObjectSize, checked when the entry was parsed
   const offset = t.offset[i] as number;
   const dataStart = offset + (t.hdr[i] as number);
-  const out = new Uint8Array(size);
+  const out = allocBytes(size);
   let o = 0;
   let done = false;
   try {
@@ -526,7 +626,7 @@ class Resolver {
   private held = 0;
   constructor(
     private readonly t: Entries,
-    private readonly load: (i: number) => Promise<Uint8Array>,
+    private readonly load: (i: number) => Uint8Array | Promise<Uint8Array>,
     private readonly opts: {
       maxObjectSize: number;
       baseCacheBytes: number;
@@ -597,7 +697,7 @@ class Resolver {
   }
   private patch(base: Uint8Array, d: Uint8Array, at: number) {
     try {
-      return applyGitDelta(base, d, this.opts.maxObjectSize);
+      return applyGitDelta(base, d, this.opts.maxObjectSize, allocBytes);
     } catch (err) {
       // only format errors become PackError; anything else (e.g. allocation failure) is not ours
       if (err instanceof DeltaError) throw new PackError(`delta at ${at}: ${err.message}`);
@@ -1034,13 +1134,15 @@ export async function installPack(
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;
   const baseCacheBytes = options.baseCacheBytes ?? 32 * 2 ** 20;
   const maxPackSize = options.maxPackSize ?? Number.POSITIVE_INFINITY;
-  const windowBytes = options.windowBytes ?? 2 ** 20;
+  const windowBytes = options.windowBytes ?? 2 ** 16;
+  const windowCount = Math.max(1, options.windowCount ?? 16);
+  const stash = new DeltaStash(options.deltaStashBytes ?? 32 * 2 ** 20);
   const dir = packDir.replace(/\/+$/, "");
   const id = rand();
   const tmpPack = `${dir}/tmp_pack_${id}`;
   const tmpIdx = `${dir}/tmp_idx_${id}`;
   const tmpFixed = `${dir}/tmp_pack_${id}_fixed`;
-  const win = new WindowReader(files, windowBytes);
+  const win = new WindowReader(files, windowBytes, windowCount);
   let appended: AppendedStore | undefined;
   try {
     await files.write(tmpPack, guardedPack(source, maxPackSize));
@@ -1048,7 +1150,7 @@ export async function installPack(
     if (stats?.kind !== "file" || stats.size === undefined)
       throw new PackError("pack was not stored");
     const packLen = stats.size;
-    const parsed = await parse(files, tmpPack, packLen, maxObjectSize, options.onContent);
+    const parsed = await parse(files, tmpPack, packLen, maxObjectSize, stash, options.onContent);
     const t = parsed.t;
     const received = t.n;
     const dataEnd = packLen - 20;
@@ -1062,7 +1164,9 @@ export async function installPack(
     };
     const resolver = new Resolver(
       t,
-      (i) => loadEntry(read, t, i, endOf(i), parsed.pool.acquire()),
+      (i) =>
+        (i < received ? stash.get(i, t.size[i] as number) : undefined) ??
+        loadEntry(read, t, i, endOf(i), parsed.pool.acquire()),
       {
         maxObjectSize,
         baseCacheBytes,
@@ -1076,6 +1180,7 @@ export async function installPack(
       await completeThin(t, resolver, options.externalBase, store, maxObjectSize);
     store.release();
     win.release();
+    stash.release();
     let missing = 0;
     let firstRef = -1;
     for (let i = 0; i < received; i++) {
@@ -1143,6 +1248,7 @@ export async function installPack(
     return result;
   } catch (e) {
     win.release();
+    stash.release();
     appended?.release();
     for (const p of [tmpPack, tmpIdx, tmpFixed, ...(appended?.allPaths ?? [])]) {
       await safeRemove(files, p);

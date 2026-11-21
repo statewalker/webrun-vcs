@@ -101,8 +101,11 @@ export interface PackSet {
     id: ObjectId,
     options?: { verify?: boolean },
   ): GitObject | undefined | Promise<GitObject | undefined>;
-  /** The object's entry as stored in the first pack holding a sound copy (for reuse). */
-  entry(id: ObjectId): Promise<PackedEntry | undefined>;
+  /**
+   * The object's entry as stored in the first pack holding a sound copy (for reuse), with the
+   * id of that pack.
+   */
+  entry(id: ObjectId): Promise<(PackedEntry & { packId: string }) | undefined>;
   /**
    * Every packed id, once (an id is yielded by the first pack holding it). Without `packs`, the
    * directory is rescanned first (within the rate limit) and the current packs are listed; with
@@ -511,7 +514,10 @@ export async function openPackSet(
     return undefined;
   }
 
-  async function findEntry(id: ObjectId, rescan: boolean): Promise<PackedEntry | undefined> {
+  async function findEntry(
+    id: ObjectId,
+    rescan: boolean,
+  ): Promise<(PackedEntry & { packId: string }) | undefined> {
     if (!isId(id)) return undefined;
     let vanished = false;
     for (const p of [...packs]) {
@@ -531,8 +537,26 @@ export async function openPackSet(
       }
       if (!stored) continue;
       const entry = stored;
+      const data = entry.data?.bind(entry);
+      const bad = (e: unknown) => {
+        if (e instanceof PackError) markBad(p, id);
+        throw e;
+      };
       return {
         ...entry,
+        packId: p.packId,
+        ...(data
+          ? {
+              data() {
+                try {
+                  const d = data();
+                  return d instanceof Uint8Array ? d : d.catch(bad);
+                } catch (e) {
+                  return bad(e);
+                }
+              },
+            }
+          : {}),
         async *raw() {
           try {
             yield* entry.raw();

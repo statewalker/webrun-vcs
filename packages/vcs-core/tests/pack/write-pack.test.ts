@@ -109,12 +109,22 @@ function spied(set: PackSet) {
     async entry(id) {
       const e = await set.entry(id);
       if (!e) return e;
+      const data = e.data?.bind(e);
       return {
         ...e,
         raw() {
           raws.push(id);
           return e.raw();
         },
+        // the stored bytes in one piece (an entry the pack's windows hold): a copy as well
+        ...(data
+          ? {
+              data() {
+                raws.push(id);
+                return data();
+              },
+            }
+          : {}),
       };
     },
   };
@@ -467,5 +477,70 @@ describe("writePack: reuse cycles", () => {
     expect(entries.find((e) => e.id === delta.baseId)?.kind).toBe(3);
     const r = await checkUnpacks(bytes, objects);
     expect(r.deltas).toBe(1);
+  });
+});
+
+describe("writePack: deltas the pack's writer already tried (git's try_delta)", () => {
+  // two versions of one file, each worth a delta on the other
+  const lines = Array.from({ length: 200 }, (_, i) => `line ${i}: lorem ipsum dolor sit amet`);
+  const X = enc.encode(`${lines.join("\n")}\n`);
+  lines[17] = "edited";
+  const Y = enc.encode(`${lines.join("\n")}\n`);
+  const Xid = oidOf("blob", X);
+  const Yid = oidOf("blob", Y);
+  const refs: PackObjectRef[] = [
+    { id: Xid, type: "blob", path: "notes.txt" },
+    { id: Yid, type: "blob", path: "notes.txt" },
+  ];
+
+  async function packed(...packs: Uint8Array[][]): Promise<PackSet> {
+    const set = await openPackSet(createInMemoryFilesApi(), "/objects/pack");
+    for (const objects of packs) {
+      await set.install(chunks(pack(objects.map((data) => ({ kind: 3 as const, data })))));
+    }
+    return set;
+  }
+
+  it("keeps two objects stored whole in one pack whole, without reading them", async () => {
+    const { set, gets } = spied(await packed([X, Y]));
+    const { bytes, entries } = await write(set, refs, { packs: set, deltaSearch: true });
+    expect(entries.map((e) => [e.kind, e.reused])).toEqual([
+      [3, true],
+      [3, true],
+    ]);
+    expect(gets).toEqual([]);
+    await checkUnpacks(bytes, set);
+  });
+
+  it("tries the delta between objects of different packs", async () => {
+    const set = await packed([X], [Y]);
+    const { bytes, entries } = await write(set, refs, { packs: set, deltaSearch: true });
+    expect(entries.filter((e) => e.kind === 6).length).toBe(1);
+    await checkUnpacks(bytes, set);
+  });
+
+  it("tries it when stored deltas are not reused (repack -f)", async () => {
+    const set = await packed([X, Y]);
+    const { entries } = await write(set, refs, {
+      packs: set,
+      reuseDeltas: false,
+      deltaSearch: true,
+    });
+    expect(entries.filter((e) => e.kind === 6).length).toBe(1);
+  });
+});
+
+describe("writePack: stored entries copied in one piece (PackedEntry.data)", () => {
+  it("reads each through the pack's windows, CRC-checked, as raw() streams it", async () => {
+    const set = await packedABC();
+    for (const id of [Aid, Bid, Cid]) {
+      const e = await set.entry(id);
+      const data = e?.data?.();
+      expect(data).toBeDefined();
+      const whole = data instanceof Promise ? await data : (data as Uint8Array);
+      expect(bytesToHex(whole)).toBe(
+        bytesToHex(await collect((e as { raw(): AsyncIterable<Uint8Array> }).raw())),
+      );
+    }
   });
 });
