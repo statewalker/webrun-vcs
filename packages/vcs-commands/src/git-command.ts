@@ -62,6 +62,7 @@ import {
 import { indexHostOf } from "./commands/index-host.js";
 import type { NotesContext } from "./commands/notes-support.js";
 import { postIndexChangeHookOf } from "./commands/post-index-change.js";
+import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
 import { reflogLine } from "./commands/reflog-messages.js";
 import {
   type ArgumentFiles,
@@ -346,6 +347,10 @@ export abstract class GitCommand<T> {
   constructor(workingCopy: WorkingCopy) {
     this._workingCopy = workingCopy;
     this.installAttributesSource();
+    // a partial clone's absent objects come from its promisor remotes (unless the library
+    // user installed a fetcher of their own)
+    const promisor = promisorOf(workingCopy);
+    if (promisor && !promisor.fetcher) promisor.setFetcher(createPromisorFetcher(workingCopy));
     this.releaseHooksAfterCalls();
   }
 
@@ -370,6 +375,34 @@ export abstract class GitCommand<T> {
           return (result as Promise<unknown>).finally(() => this.releaseRefTransactionHook());
         }
         this.releaseRefTransactionHook();
+        return result;
+      };
+    }
+  }
+
+  /**
+   * Runs `enter` as each entry point of the command (`call`, `callText`, ...) starts; the
+   * function it returns runs when that call ends, whatever the outcome (subclasses scope
+   * state to their calls with it: a transport command's promisor fetcher).
+   */
+  protected aroundEntryPoints(enter: () => (() => void) | undefined): void {
+    const self = this as unknown as Record<string, unknown>;
+    for (const name of entryPointNames(Object.getPrototypeOf(this))) {
+      const method = self[name];
+      if (typeof method !== "function") continue;
+      self[name] = (...args: unknown[]) => {
+        const leave = enter();
+        let result: unknown;
+        try {
+          result = (method as (...a: unknown[]) => unknown).apply(this, args);
+        } catch (error) {
+          leave?.();
+          throw error;
+        }
+        if (leave && result && typeof (result as Promise<unknown>).finally === "function") {
+          return (result as Promise<unknown>).finally(leave);
+        }
+        leave?.();
         return result;
       };
     }

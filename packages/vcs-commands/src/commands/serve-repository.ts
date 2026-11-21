@@ -4,6 +4,7 @@
  * receive-pack read from it.
  */
 
+import { historyWithoutLazyFetch } from "@statewalker/vcs-core";
 import {
   createRepositoryFacade,
   createTransportRefStore,
@@ -91,7 +92,7 @@ export async function servedRepositoryOf(
   const hooks = options.hooks;
   return {
     repository: createRepositoryFacade({
-      history: remote.history,
+      history: historyWithoutLazyFetch(remote.history),
       // git's pack.useBitmaps (pack-objects reads it from the served repository)
       useBitmaps: servedUseBitmaps(remote),
       // a sparse:oid filter's patterns
@@ -106,17 +107,17 @@ export async function servedRepositoryOf(
     ...(remote.files
       ? { files: servedGitFilesOf(remote.files, remote.commonDir ?? remote.gitDir) }
       : {}),
-    ...(hooks?.enabled
-      ? {
-          // the client's variables (http-backend's REMOTE_USER, ...) reach the
-          // reference-transaction hook too, as every child of receive-pack inherits them
-          around: <T>(service: string, serve: () => Promise<T>, client?: ServedRequestContext) => {
-            if (service !== "git-receive-pack") return serve();
-            const env = httpBackendEnv(hooks, client);
-            const session = Object.keys(env).length > 0 ? hooks.withEnv(env) : hooks;
-            return withReceiveTransactionHook(remote, session, serve);
-          },
-        }
-      : {}),
+    around: <T>(service: string, serve: () => Promise<T>, client?: ServedRequestContext) => {
+      // a served partial clone never fetches lazily (upload-pack's GIT_NO_LAZY_FETCH,
+      // receive-pack's rev-list --exclude-promisor-objects): the facade reads through the
+      // history's view without lazy fetch
+      if (service !== "git-receive-pack") return serve();
+      if (!hooks?.enabled) return serve();
+      // the client's variables (http-backend's REMOTE_USER, ...) reach the
+      // reference-transaction hook too, as every child of receive-pack inherits them
+      const env = httpBackendEnv(hooks, client);
+      const session = Object.keys(env).length > 0 ? hooks.withEnv(env) : hooks;
+      return withReceiveTransactionHook(remote, session, serve);
+    },
   };
 }

@@ -31,6 +31,7 @@ import type {
   ListedObject,
   ObjectId,
   Refs,
+  ResolvedObjectFilter,
 } from "@statewalker/vcs-core";
 import { isSymbolicRef, joinPath, listObjects, readGraftParents } from "@statewalker/vcs-core";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
@@ -83,6 +84,18 @@ export interface ReachabilityRoots {
    * grafts name are walked too. Omit to read `info/grafts` (`refs.readGrafts`).
    */
   readGraftFile?: () => Promise<string | undefined>;
+  /**
+   * A partial clone's promisor objects (`promisorExclusions`): neither listed nor walked, as
+   * git's gc and repack walk with `--exclude-promisor-objects`
+   */
+  excludeObjects?: ReadonlySet<ObjectId>;
+  /**
+   * More roots, walked when stored (a partial clone's local objects that promisor objects
+   * link to: `PromisorExclusions.roots`)
+   */
+  extraRoots?: Iterable<ObjectId>;
+  /** A filter the listing applies (`git repack --filter=<spec>`'s pack-objects `--filter`) */
+  filter?: ResolvedObjectFilter;
 }
 
 /**
@@ -169,6 +182,7 @@ async function collectRoots(
   for (const id of await reflogIds(files, joinPath(gitDir, "logs"))) tips.add(id);
   requireIndex(await indexIds(files, joinPath(gitDir, "index")));
   for (const id of await pseudoRefIds(files, gitDir)) tips.add(id);
+  for (const id of roots.extraRoots ?? []) tips.add(id);
 
   // Linked worktrees: their HEAD, index and reflogs live under worktrees/<name>/
   const worktrees = joinPath(gitDir, "worktrees");
@@ -254,6 +268,8 @@ export async function listReachableObjects(roots: ReachabilityRoots): Promise<Li
     grafts,
     commitHeader,
     tipPaths,
+    ...(roots.excludeObjects ? { excludeObjects: roots.excludeObjects } : {}),
+    ...(roots.filter ? { filter: roots.filter } : {}),
   })) {
     listed.push(o);
   }

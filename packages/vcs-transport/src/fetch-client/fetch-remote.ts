@@ -3,6 +3,7 @@
  * negotiate and import the pack, keep the shallow file, follow tags, update the refs.
  */
 
+import { outgoingLinks } from "@statewalker/vcs-core";
 import type { PackImportResult, RepositoryFacade } from "../api/repository-facade.js";
 import type { RefStore } from "../context/process-context.js";
 import { INFINITE_DEPTH } from "../fsm/index.js";
@@ -132,6 +133,12 @@ export interface FetchClientOptions {
    * lazily: reading an absent blob fails.
    */
   filter?: string;
+  /**
+   * `git fetch --refetch`: every selected tip is wanted again and nothing local is offered
+   * (fetch-pack's `refetch`: no `have`, no tip counted complete), so the whole history comes
+   * again (under `filter`, what it keeps), as when the repository was cloned
+   */
+  refetch?: boolean;
   /** Warnings fetch-pack prints (`warning: ...`) */
   onWarning?: (line: string) => void;
   /** Allow every update to be a non-fast-forward (`--force`) */
@@ -434,7 +441,7 @@ export async function fetchFromConnection(
   let packFetched = false;
   const runFetchPack = async (wants: string[], request: Partial<FetchPackRequest>) => {
     const knownCommon: string[] = [];
-    for (const ref of remoteRefs) {
+    for (const ref of options.refetch ? [] : remoteRefs) {
       if (ref.oid && !knownCommon.includes(ref.oid) && (await complete.isComplete(ref.oid))) {
         knownCommon.push(ref.oid);
       }
@@ -459,9 +466,11 @@ export async function fetchFromConnection(
       new Set([...applyShallow(shallow, update), ...(serverShallow?.list ?? [])]);
     // the objects' links, read while the import holds them (index-pack's fsck_walk)
     const receivedLinks = received && links ? new ReceivedLinks(grafts) : undefined;
+    // a promisor pack's outgoing links (index-pack --promisor's repack_local_links)
+    const outgoing = filter && !options.dryRun ? new Set<string>() : undefined;
     const fetched = await fetchPack(connection, source, {
       wants,
-      localTips,
+      localTips: options.refetch ? [] : localTips,
       knownCommon,
       shallow,
       filter: options.filter,
@@ -478,8 +487,13 @@ export async function fetchFromConnection(
               ...(received
                 ? { quarantine: true, onObject: (id, type, entry) => received.add(id, type, entry) }
                 : {}),
-              ...(receivedLinks
-                ? { onContent: (id, type, content) => receivedLinks.add(id, type, content) }
+              ...(receivedLinks || outgoing
+                ? {
+                    onContent: (id, type, content) => {
+                      receivedLinks?.add(id, type, content);
+                      if (outgoing) for (const l of outgoingLinks(type, content)) outgoing.add(l);
+                    },
+                  }
                 : {}),
             }),
       onShallowUpdate: async (u) => {
@@ -531,16 +545,21 @@ export async function fetchFromConnection(
         !(connection.stateless && connection.version !== 2);
       const content = kept ? promisorSought.map((r) => `${r.oid} ${r.name}\n`).join("") : "";
       await repository.markPromisorPack?.(imported.packId, content);
+      // git 2.48+: the local objects the pack links to go into a promisor pack of their own
+      if (outgoing && outgoing.size > 0) await repository.repackLocalLinks?.(outgoing);
     }
     if (!options.dryRun) packFetched = true;
     const after = applyShallow(shallow, update);
     // fetch-pack: a deepening fetch (not a clone) checks what it brought against the new
     // shallow commits, without `--not --all`, before the shallow file changes
     if (!options.dryRun && !options.cloning && deepening) {
+      // a promisor pack's absent objects are promised (check_connected's partial clone case)
+      const promised = filter ? filterPromises(filter) : undefined;
       const lines = await connectivityErrors(repository, wants, {
         known: [],
         shallow: new Set(after),
         deepening: true,
+        ...(promised ? { promised } : {}),
       });
       if (lines) {
         throw new FetchCheckError(
@@ -587,7 +606,7 @@ export async function fetchFromConnection(
   const wanted = new Set<string>();
   for (const p of planned) {
     if (wanted.has(p.oid)) continue;
-    if (deepen || !(await complete.isComplete(p.oid))) {
+    if (deepen || options.refetch || !(await complete.isComplete(p.oid))) {
       wants.push(p.oid);
       wanted.add(p.oid);
     }
@@ -884,6 +903,131 @@ function applyShallow(before: string[], update: ServerShallowUpdate): string[] {
   const after = [...set].sort();
   const same = after.length === before.length && [...before].sort().every((o, i) => o === after[i]);
   return same ? before : after;
+}
+
+/** What {@link fetchPromisedObjects} fetches, and where it goes. */
+export interface FetchPromisedOptions {
+  /** Where the pack goes (kept, marked as a promisor pack) */
+  repository: RepositoryFacade;
+  /** The objects to fetch, by id (git's `--stdin` refspecs of the lazy fetch) */
+  ids: readonly string[];
+  /** The filter of the fetch (git's lazy fetch passes `blob:none`) */
+  filter?: string;
+  /** The client's shallow commits, sent as `shallow` lines */
+  shallow?: readonly string[];
+  /** Progress messages from the server */
+  onProgress?: (message: string) => void;
+  /** Warnings fetch-pack prints */
+  onWarning?: (line: string) => void;
+  /**
+   * `fetch.fsckObjects` / `transfer.fsckObjects` (`fetchFsckOf`): fetch-pack passes the
+   * promisor fetch's index-pack `--fsck-objects`, which checks the objects, never their links
+   */
+  fsckObjects?: ReceivedObjectsFsck;
+  /** The remote's URL, as git's check names it (`error: <url> did not send all ...`) */
+  url?: string;
+  /** git 2.43 prints an empty line after that error */
+  compatibility?: "2.43" | "2.56";
+}
+
+/** What {@link fetchPromisedObjects} did. */
+export interface FetchPromisedResult {
+  /** The pack import's report */
+  imported: PackImportResult;
+  /** Objects in the pack as sent */
+  packObjects: number;
+  /** Bytes of the pack */
+  packBytes: number;
+}
+
+/**
+ * A partial clone's lazy fetch over `connection`, as the `git -c
+ * fetch.negotiationAlgorithm=noop fetch <remote> --no-tags --no-write-fetch-head
+ * --recurse-submodules=no --filter=blob:none --stdin` that promisor-remote.c runs: the ids
+ * are wanted by id (no ref listing: every refspec is an exact id, and no tag is followed), no
+ * `have` is sent (the noop negotiator), the pack is kept as a promisor pack (index-pack
+ * `--promisor`; its `.promisor` file names the ids, `<id> <id>`, when fetch-pack keeps the
+ * pack itself: 100 objects or more, not over smart HTTP v0), and no ref, FETCH_HEAD or
+ * shallow file is written.
+ *
+ * @example
+ * ```typescript
+ * await fetchPromisedObjects(connection, { repository, ids: [blobId], filter: "blob:none" });
+ * ```
+ */
+export async function fetchPromisedObjects(
+  connection: UploadPackConnection,
+  options: FetchPromisedOptions,
+): Promise<FetchPromisedResult> {
+  const { repository } = options;
+  const wants = [...new Set(options.ids)];
+  if (wants.length === 0) throw new Error("fetchPromisedObjects: nothing to fetch");
+  const received = new ReceivedObjects();
+  const outgoing = new Set<string>();
+  const fetched = await fetchPack(connection, negotiatorSource(repository), {
+    wants,
+    localTips: [],
+    shallow: [...(options.shallow ?? [])],
+    ...(options.filter ? { filter: options.filter } : {}),
+    ...(options.onWarning ? { onWarning: options.onWarning } : {}),
+    includeTag: false,
+    ...(options.onProgress ? { onProgress: options.onProgress } : {}),
+    importPack: (pack) =>
+      repository.importPack(pack, {
+        keepPack: true,
+        // checked before anything sees them: a pack without the wanted objects leaves none
+        quarantine: true,
+        onObject: (id, type, entry) => received.add(id, type, entry),
+        onContent: (_id, type, content) => {
+          for (const l of outgoingLinks(type, content)) outgoing.add(l);
+        },
+      }),
+  });
+  const { quarantine, ...imported } = fetched.imported;
+  // fetch-pack keeps (locks) the pack itself at transfer.unpackLimit's 100 objects, not for the
+  // `git fetch-pack` remote-curl runs for smart HTTP v0 (given no lock file)
+  const kept =
+    fetched.packObjects >= DEFAULT_UNPACK_LIMIT &&
+    !(connection.stateless && connection.version !== 2);
+  let committed = false;
+  try {
+    if (options.fsckObjects) {
+      // index-pack --fsck-objects: the objects only (a promisor pack's links are promised)
+      await checkReceivedPack(quarantine?.repository ?? repository, received, {
+        fsck: options.fsckObjects,
+        links: false,
+        shallow: new Set<string>(),
+        kept,
+      });
+    }
+    // the lazy fetch's check_connected: every wanted object came (a server that answered
+    // with others fails the fetch, and the caller dies "could not fetch")
+    const absent = wants.find((id) => !received.has(id));
+    if (absent !== undefined) {
+      throw new FetchCheckError(
+        "refs",
+        [
+          // check_connected's rev-list dies on the first wanted object not there
+          `fatal: bad revision '${absent}'`,
+          `error: ${options.url ?? "remote"} did not send all necessary objects`,
+          ...(options.compatibility === "2.43" ? [""] : []),
+        ],
+        1,
+      );
+    }
+    await quarantine?.commit();
+    committed = true;
+  } finally {
+    if (!committed) await quarantine?.discard().catch(() => {});
+  }
+  if (imported.packId !== undefined) {
+    // from_promisor: index-pack --promisor, then the sought refs for a pack fetch-pack locks
+    const content = kept ? wants.map((id) => `${id} ${id}\n`).join("") : "";
+    await repository.markPromisorPack?.(imported.packId, content);
+    // git 2.48+: the local objects the pack links to go into a promisor pack of their own
+    if (outgoing.size > 0) await repository.repackLocalLinks?.(outgoing);
+  }
+  return { imported, packObjects: fetched.packObjects, packBytes: fetched.packBytes };
 }
 
 /** The local history as the negotiator reads it. */

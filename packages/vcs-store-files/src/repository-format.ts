@@ -36,7 +36,8 @@ export interface RepositoryFormat {
   /**
    * The promisor remote of a partial clone, whose objects may be absent: `extensions.partialClone`,
    * else the first remote with `remote.<name>.promisor = true` (what `git clone --filter`
-   * writes since git 2.29; git's `repo_has_promisor_remote` checks both)
+   * writes since git 2.29) or a `remote.<name>.partialclonefilter` (git's
+   * `promisor_remote_config`; `repo_has_promisor_remote` checks them all)
    */
   partialClone?: string;
   /** `extensions.worktreeConfig`: linked worktrees read their own `config.worktree` */
@@ -171,10 +172,18 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
     );
   }
   if (format.partialClone === undefined) {
+    // promisor_remote_config: a remote with `promisor = true`, or with a
+    // `partialclonefilter` whatever its value, is a promisor remote (the first in config order)
     for (const key of config.listKeys("remote.")) {
-      if (!key.endsWith(".promisor") || key.length <= "remote..promisor".length) continue;
-      if (gitTrue(config.get(key))) {
-        format.partialClone = key.slice("remote.".length, -".promisor".length);
+      const lower = key.toLowerCase();
+      const suffix = lower.endsWith(".promisor")
+        ? ".promisor"
+        : lower.endsWith(".partialclonefilter")
+          ? ".partialclonefilter"
+          : undefined;
+      if (!suffix || key.length <= `remote.${suffix}`.length) continue;
+      if (suffix === ".partialclonefilter" || gitTrue(config.get(key))) {
+        format.partialClone = key.slice("remote.".length, -suffix.length);
         break;
       }
     }
@@ -217,7 +226,8 @@ export async function readRepositoryFormat(
 /**
  * Refuses to delete objects where the repository format forbids it: `preciousObjects` (git's
  * "cannot prune in a precious-objects repo") and partial clones, whose absent objects a
- * promisor remote provides and whose promisor packs we do not handle. `operation` names what
+ * promisor remote provides, unless `partialClone: "allow"` (gc and repack, which keep the
+ * promisor packs apart as git does; a bare prune does not). `operation` names what
  * was asked ("prune", "repack", "gc").
  *
  * @example
@@ -225,13 +235,17 @@ export async function readRepositoryFormat(
  * assertObjectsDeletable(await readRepositoryFormat(files, gitDir), "prune");
  * ```
  */
-export function assertObjectsDeletable(format: RepositoryFormat, operation: string): void {
+export function assertObjectsDeletable(
+  format: RepositoryFormat,
+  operation: string,
+  options: { partialClone?: "refuse" | "allow" } = {},
+): void {
   if (format.preciousObjects) {
     throw new UnsupportedRepositoryFormatError(
       `cannot ${operation} in a precious-objects repo (extensions.preciousObjects)`,
     );
   }
-  if (format.partialClone !== undefined) {
+  if (format.partialClone !== undefined && options.partialClone !== "allow") {
     throw new UnsupportedRepositoryFormatError(
       `cannot ${operation} in a partial clone (promisor remote ${format.partialClone}): ` +
         "promisor objects are not supported",

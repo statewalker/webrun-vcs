@@ -21,6 +21,8 @@ export * from "./gc-strategy.js";
 // Pack file management (file-dependent)
 export * from "./pack/index.js";
 // Quarantine for received packs (receive-pack)
+export * from "./promisor-objects.js";
+
 export * from "./quarantine/index.js";
 // Reachability roots (refs, reflogs, index) for repack and gc
 export * from "./reachable-objects.js";

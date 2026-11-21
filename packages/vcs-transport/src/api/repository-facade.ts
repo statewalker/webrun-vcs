@@ -186,6 +186,15 @@ export interface RepositoryFacade {
   markPromisorPack?(packId: string, content: string): Promise<boolean>;
 
   /**
+   * index-pack `--promisor`'s `repack_local_links` (git 2.48+), after a promisor pack came in:
+   * the objects `links` reach that are stored outside the promisor packs (a local commit the
+   * server built on) are packed into one more promisor pack (empty `.promisor`), so gc keeps
+   * them. Resolves with that pack's id, undefined when no link is local or the store keeps no
+   * promisor packs.
+   */
+  repackLocalLinks?(links: Iterable<string>): Promise<string | undefined>;
+
+  /**
    * Exports objects as a pack stream.
    * Collects reachable objects and serializes to pack format.
    *

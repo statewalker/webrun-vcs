@@ -5,7 +5,7 @@
  * is decided in `remote-transport.ts` (`resolveRemote`).
  */
 
-import type { RefTransactionHook } from "@statewalker/vcs-core";
+import { historyWithoutLazyFetch, type RefTransactionHook } from "@statewalker/vcs-core";
 import {
   createRepositoryFacade,
   createTransportRefStore,
@@ -143,25 +143,28 @@ export async function withLocalUploadPack<T>(
   const head = await remote.history.refs.get("HEAD").catch(() => undefined);
   const settings = serverSettingsOf(remote);
   const [client, server] = createDuplexPair();
-  const serving = serveOverDuplex({
-    duplex: server,
-    repository: createRepositoryFacade({
-      history: remote.history,
-      useBitmaps: servedUseBitmaps(remote),
-      sparseFilterPatterns: sparseFilterMatcher,
-      maxTreeDepth: servedMaxTreeDepth(remote),
-    }),
-    refStore: createTransportRefStore(remote.history.refs),
-    service: "git-upload-pack",
-    ...((options.protocolVersion ?? 2) === 2 ? { protocolVersion: "2" as const } : {}),
-    // GIT_PROTOCOL=version=1: upload-pack's `version 1` line before its advertisement
-    ...(options.protocolVersion === 1 ? { announceVersion1: true } : {}),
-    // uploadpack.hideRefs and transfer.hideRefs, in the order git reads them
-    uploadPackHideRefs: settings.uploadPackHideRefs,
-    // uploadpack.allowFilter and uploadpackfilter.*
-    ...(settings.uploadPackFilter ? { uploadPackFilter: settings.uploadPackFilter } : {}),
-    ...(head && "target" in head ? { currentBranch: head.target } : {}),
-  }).finally(() => server.close?.());
+  // upload-pack never fetches lazily (GIT_NO_LAZY_FETCH): it reads through the history's
+  // view without lazy fetch, as receive-pack does (rev-list --exclude-promisor-objects)
+  const serving = (async () =>
+    serveOverDuplex({
+      duplex: server,
+      repository: createRepositoryFacade({
+        history: historyWithoutLazyFetch(remote.history),
+        useBitmaps: servedUseBitmaps(remote),
+        sparseFilterPatterns: sparseFilterMatcher,
+        maxTreeDepth: servedMaxTreeDepth(remote),
+      }),
+      refStore: createTransportRefStore(remote.history.refs),
+      service: "git-upload-pack",
+      ...((options.protocolVersion ?? 2) === 2 ? { protocolVersion: "2" as const } : {}),
+      // GIT_PROTOCOL=version=1: upload-pack's `version 1` line before its advertisement
+      ...(options.protocolVersion === 1 ? { announceVersion1: true } : {}),
+      // uploadpack.hideRefs and transfer.hideRefs, in the order git reads them
+      uploadPackHideRefs: settings.uploadPackHideRefs,
+      // uploadpack.allowFilter and uploadpackfilter.*
+      ...(settings.uploadPackFilter ? { uploadPackFilter: settings.uploadPackFilter } : {}),
+      ...(head && "target" in head ? { currentBranch: head.target } : {}),
+    }))().finally(() => server.close?.());
   try {
     const connection = await openDuplexConnection(client, { closeDuplex: true });
     try {
@@ -441,7 +444,7 @@ async function receiveOver<T>(
     ...(await receivePackSettingsOf(remote, hooks, receiveHooks)),
     duplex: server,
     repository: createRepositoryFacade({
-      history: remote.history,
+      history: historyWithoutLazyFetch(remote.history),
       useBitmaps: servedUseBitmaps(remote),
       sparseFilterPatterns: sparseFilterMatcher,
       maxTreeDepth: servedMaxTreeDepth(remote),

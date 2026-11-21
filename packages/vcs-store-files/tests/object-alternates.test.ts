@@ -269,11 +269,11 @@ describe("alternates' upkeep", () => {
     const files = createInMemoryFilesApi();
     const alt = await repoWithBlob(files, "/alt", "a\n");
     const local = await createGitFilesBackend({ files, gitDir: "/repo/.git", create: true });
-    const getBefore = local.objects.get;
     expect(await local.objects.alternates?.refs()).toEqual([]);
-    // linking one wraps the reads in place
+    expect(await local.objects.get(alt.id)).toBeUndefined();
+    // linking one wraps the reads in place (the store's reads see it at once)
     await local.objects.alternates?.add("/alt/.git/objects");
-    expect(local.objects.get).not.toBe(getBefore);
+    expect(await local.objects.get(alt.id)).toBeDefined();
     expect(await local.objects.has(alt.id)).toBe(true);
     expect(await local.history.blobs.has(alt.id)).toBe(true);
   });

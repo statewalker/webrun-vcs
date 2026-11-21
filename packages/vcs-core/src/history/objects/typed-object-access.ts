@@ -4,6 +4,7 @@
  */
 import type { ObjectId } from "../../common/id/index.js";
 import { CorruptObjectError, type GitObjects, InvalidObjectIdError } from "./git-objects.js";
+import { PromisorFetchError } from "./object-promisor.js";
 import type { ObjectTypeString } from "./object-types.js";
 
 /**
@@ -50,7 +51,13 @@ export async function hasObjectOfType(
   try {
     header = await objectHeader(objects, id);
   } catch (e) {
-    if (e instanceof CorruptObjectError || e instanceof InvalidObjectIdError) throw e;
+    if (
+      e instanceof CorruptObjectError ||
+      e instanceof InvalidObjectIdError ||
+      e instanceof PromisorFetchError
+    ) {
+      throw e;
+    }
     const reason = e instanceof Error ? `: ${e.message}` : "";
     throw new CorruptObjectError(`object ${id} is stored but cannot be read${reason}`, {
       cause: e,

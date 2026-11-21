@@ -77,6 +77,11 @@ export type UnpackedEntry =
       corrupt: boolean;
       /** The zlib error git prints first (`inflate: data stream error (...)`), if any. */
       zlib?: string;
+      /**
+       * A delta whose base could not be read: git's `failed to read delta base object <id>
+       * at offset <n> from <pack>`, printed before {@link error}
+       */
+      base?: string;
     };
 
 /** What `checkPack` reports, as it goes. */
@@ -277,6 +282,8 @@ export async function checkPack(
       return { type, data };
     };
 
+    /** Entries that could not be unpacked, by id: their offsets */
+    const unreadable = new Map<string, number>();
     /** Entry `k`, its bytes read (or undefined when they were not kept): to `hooks.entry`. */
     const visit = (k: number, bytes: Uint8Array | undefined): void | Promise<void> => {
       const offset = offsetOf(k);
@@ -303,9 +310,21 @@ export async function checkPack(
         const content = fast.type === "blob" && !keepBlob(id) ? EMPTY : fast.data;
         return hooks.entry(entry, { type: fast.type, content }, pack);
       }
+      // unpack_entry: a delta whose base failed to read says so first
+      const noted = (u: UnpackedEntry): UnpackedEntry => {
+        if (!("error" in u)) return u;
+        unreadable.set(id, offset);
+        const baseId = entry.head?.baseId;
+        const baseAt = baseId === undefined ? undefined : unreadable.get(baseId);
+        if (baseId === undefined || baseAt === undefined) return u;
+        return {
+          ...u,
+          base: `failed to read delta base object ${baseId} at offset ${baseAt} from ${packPath}`,
+        };
+      };
       const slow = unpackEntry(pack, packPath, entry, keepBlob);
-      if (slow instanceof Promise) return slow.then((u) => hooks.entry(entry, u, pack));
-      return hooks.entry(entry, slow, pack);
+      if (slow instanceof Promise) return slow.then((u) => hooks.entry(entry, noted(u), pack));
+      return hooks.entry(entry, noted(slow), pack);
     };
 
     // One pass: the pack's SHA-1, each entry's CRC-32 and bytes

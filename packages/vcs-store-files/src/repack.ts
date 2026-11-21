@@ -19,12 +19,16 @@ import type {
   ObjectId,
   Pack,
   PackSet,
+  ResolvedObjectFilter,
 } from "@statewalker/vcs-core";
 import {
   BitmapClosureError,
   createGitObjects,
   joinPath,
+  objectsWithoutLazyFetch,
   type PackFile,
+  parseObjectFilter,
+  resolveObjectFilter,
   writePack,
   writePackBitmap,
 } from "@statewalker/vcs-core";
@@ -32,6 +36,7 @@ import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { assertAlternatesReadable } from "./alternates/index.js";
+import { type PromisorExclusions, promisorExclusions } from "./promisor-objects.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
@@ -73,6 +78,13 @@ export interface RepackOptions extends RepackTarget {
    * those loose copies (`git repack -d`); existing packs are left alone.
    */
   all?: boolean;
+  /**
+   * `git repack --filter=<spec>` (with `all`): the new pack leaves out what the filter omits,
+   * and those objects of the replaced packs go into a pack of their own beside it (git's
+   * `write_filtered_pack`: pack-objects `--stdin-packs` of the replaced packs, the new ones
+   * excluded). A `sparse:oid` filter must come resolved (`resolveObjectFilter`).
+   */
+  filter?: string | ResolvedObjectFilter;
   /** Search deltas (git's window search); an object sets window and depth. Default true. */
   deltaSearch?: boolean | DeltaSearchOptions;
   /** Copy stored deltas (git: no `-f`). Default true. */
@@ -252,6 +264,13 @@ export interface RepackResult {
   /** git's warnings (`warning: disabling bitmap writing, ...`) */
   warnings?: string[];
   /**
+   * A partial clone's `-a`: the promisor pack written besides (every object of the old
+   * promisor packs, with an empty `.promisor` file), when it is not the only pack written
+   */
+  promisorPack?: { packName: string; objectCount: number };
+  /** `filter`: the pack of the objects the filter left out (`pack-<id>`), when any was */
+  filteredPack?: string;
+  /**
    * git's error lines from reading the alternates, which git repack prints to stderr and goes
    * on (`repack()` only; gc reports them in its own result); absent when there are none
    */
@@ -306,8 +325,11 @@ export async function snapshotPacks(packs: PackSet): Promise<PackSnapshot> {
  * (`git repack -l`); a loose copy of an object some pack holds, an alternate's included, is
  * removed (`git prune-packed`). Alternates themselves are never written or deleted.
  *
- * A repository with `extensions.preciousObjects` or a partial clone is refused
- * (`UnsupportedRepositoryFormatError`), unless `dryRun`.
+ * A repository with `extensions.preciousObjects` is refused (`UnsupportedRepositoryFormatError`),
+ * unless `dryRun`. In a partial clone the promisor objects stay out of the walk
+ * (`--exclude-promisor-objects`) and `all` writes every object of the promisor packs into a
+ * promisor pack of its own, with an empty `.promisor` file (git's `repack_promisor_objects`),
+ * besides the pack of the rest.
  *
  * @returns the result, or null if there is nothing to pack (then nothing is changed)
  *
@@ -321,27 +343,49 @@ export async function snapshotPacks(packs: PackSet): Promise<PackSnapshot> {
  */
 export async function repack(options: RepackOptions): Promise<RepackResult | null> {
   // repack deletes what the new pack replaces: not in a precious-objects repo (git: "cannot
-  // delete packs in a precious-objects repo"), nor in a partial clone (promisor packs)
+  // delete packs in a precious-objects repo")
   // git's errors reading the alternates are printed and repack goes on (see gc)
   let alternatesErrors: readonly string[] = options.objects.alternates?.errors ?? [];
   if (!options.dryRun) {
-    assertObjectsDeletable(await readRepositoryFormat(options.files, options.gitDir), "repack");
+    assertObjectsDeletable(await readRepositoryFormat(options.files, options.gitDir), "repack", {
+      partialClone: "allow",
+    });
     alternatesErrors = await assertAlternatesReadable(options, "repack");
   }
-  // The snapshot first: a pack installed during the walk is never removed
-  const snapshot = await snapshotPacks(options.packs);
-  const listed = await listReachableObjects({
-    files: options.files,
-    gitDir: options.gitDir,
-    refs: options.history.refs,
-    objects: options.objects,
-    commitGraph: options.history.commitGraph,
-    ...(options.readGraftFile ? { readGraftFile: options.readGraftFile } : {}),
-  });
-  const result = await repackListed(options, listed, snapshot);
+  // pack-objects runs with fetch_if_missing = 0: every read goes through the store's view
+  // without lazy fetch
+  const run = async (options: RepackOptions) => {
+    // a partial clone: its promisor objects stay out of the walk (--exclude-promisor-objects)
+    const exclusions = await promisorExclusions(options.objects, options.files, options.gitDir);
+    // The snapshot first: a pack installed during the walk is never removed
+    const snapshot = await snapshotPacks(options.packs);
+    const filter = await repackFilterOf(options);
+    const listed = await listReachableObjects({
+      files: options.files,
+      gitDir: options.gitDir,
+      refs: options.history.refs,
+      objects: options.objects,
+      commitGraph: options.history.commitGraph,
+      ...(options.readGraftFile ? { readGraftFile: options.readGraftFile } : {}),
+      ...(exclusions ? { excludeObjects: exclusions.excluded, extraRoots: exclusions.roots } : {}),
+      ...(filter ? { filter } : {}),
+    });
+    return repackListed(options, listed, snapshot, undefined, exclusions);
+  };
+  const result = await run({ ...options, objects: objectsWithoutLazyFetch(options.objects) });
   return result && alternatesErrors.length > 0
     ? { ...result, errors: [...alternatesErrors] }
     : result;
+}
+
+/** The filter of a repack, parsed and resolved (a `sparse:oid` one must come resolved). */
+async function repackFilterOf(options: RepackOptions): Promise<ResolvedObjectFilter | undefined> {
+  if (options.filter === undefined) return undefined;
+  if (!(options.all ?? true)) throw new Error("repack --filter needs -a");
+  if (typeof options.filter !== "string") return options.filter;
+  return resolveObjectFilter(parseObjectFilter(options.filter), async (name) => {
+    throw new Error(`unable to access sparse blob in '${name}'`);
+  });
 }
 
 /**
@@ -356,6 +400,8 @@ export async function repackListed(
   reachable: readonly ListedObject[],
   snapshot: PackSnapshot,
   loosened?: Set<ObjectId>,
+  /** A partial clone's promisor objects (left out of `reachable` already) */
+  exclusions?: PromisorExclusions,
 ): Promise<RepackResult | null> {
   const { files, packs, looseStorage, objects, all = true, dryRun = false } = options;
   const gitDir = options.gitDir ?? ".git";
@@ -396,7 +442,24 @@ export async function repackListed(
     if (alternates.length > 0 && (await borrowed(o.id))) continue;
     ids.push(o);
   }
-  if (ids.length === 0) return null;
+  // repack_promisor_objects (-a): every object of the promisor packs goes into a new promisor
+  // pack, which the main pack then leaves out (`--keep-pack`)
+  const promised: ListedObject[] = [];
+  if (all && exclusions) {
+    for (const id of exclusions.inPacks) {
+      if (skip.some((p) => p.has(id))) continue;
+      const o = await objects.get(id);
+      if (!o) continue;
+      if (!o.bytes) await o.content[Symbol.asyncIterator]().return?.();
+      promised.push({ id, type: o.type });
+    }
+  }
+  if (ids.length === 0 && promised.length === 0) return null;
+  if ((exclusions || options.filter) && bitmaps.mode !== "off") {
+    // the promisor objects are not packed with the rest: no closure for a bitmap
+    if (bitmaps.mode === "loud") warnings.push(NO_CLOSURE_BITMAP_WARNING);
+    bitmaps.mode = "off";
+  }
   // a bitmap describes a pack holding everything its commits reach (pack-objects'
   // no_closure_warning)
   if (bitmaps.mode !== "off" && ids.length < new Set(reachable.map((o) => o.id)).size) {
@@ -416,14 +479,27 @@ export async function repackListed(
     };
   }
 
-  // One stream: objects are read one at a time, the pack goes straight into its temporary file
-  const stream = writePack(objects, ids, {
+  const packOptions = {
     packs,
     reuseObjects: options.reuseObjects ?? true,
     reuseDeltas: options.reuseDeltas ?? true,
     deltaSearch: options.deltaSearch ?? true,
     bigFileThreshold: options.bigFileThreshold,
-  });
+  };
+  // the promisor pack first, with its (empty) `.promisor` file, as repack-promisor.c writes it
+  let promisorPack: string | undefined;
+  if (promised.length > 0) {
+    const written = await packs.install(writePack(objects, promised, packOptions));
+    promisorPack = written.packId;
+    if (packs.writePromisor) await packs.writePromisor(promisorPack, "");
+    else await files.write(joinPath(packDir, `pack-${promisorPack}.promisor`), []);
+  }
+  if (ids.length === 0) {
+    await packs.refresh();
+    return finishRepack(promisorPack as string, promised.length, false);
+  }
+  // One stream: objects are read one at a time, the pack goes straight into its temporary file
+  const stream = writePack(objects, ids, packOptions);
   const installed = await packs.install(stream);
   // Install before remove: every reader finds each object in the new pack from now on
   await packs.refresh();
@@ -438,49 +514,91 @@ export async function repackListed(
     throw e;
   }
 
-  // Only packs of the snapshot, and none modified since the walk started (defence in depth)
-  const removable: { pack: Pack; modified?: number }[] = [];
-  if (all) {
-    for (const p of replaced) {
-      if (p.packId === installed.packId) continue;
-      const modified = (await files.stats(joinPath(packDir, `pack-${p.packId}.pack`)))
-        ?.lastModified;
-      if (modified !== undefined && modified > snapshot.walkStartedAt) continue;
-      removable.push({ pack: p, modified });
+  return finishRepack(installed.packId, installed.count, bitmapWritten);
+
+  /** Removes what the new packs replace (`-d`), then the loose objects now packed. */
+  async function finishRepack(
+    packId: string,
+    count: number,
+    bitmapWritten: boolean,
+  ): Promise<RepackResult> {
+    const newPacks = new Set([packId, ...(promisorPack ? [promisorPack] : [])]);
+    // --filter: what the replaced packs hold and the new packs do not, in a pack of its own
+    let filteredPack: string | undefined;
+    if (options.filter && all) {
+      const fresh = (await packs.packs()).filter((p) => newPacks.has(p.packId));
+      const sources = packKeptObjects ? replaced.concat(kept) : replaced;
+      const left: ListedObject[] = [];
+      const seen = new Set<ObjectId>();
+      for (const p of sources) {
+        for (const id of p.ids()) {
+          if (seen.has(id) || fresh.some((f) => f.has(id))) continue;
+          seen.add(id);
+          const o = await objects.get(id);
+          if (!o) continue;
+          if (!o.bytes) await o.content[Symbol.asyncIterator]().return?.();
+          left.push({ id, type: o.type });
+        }
+      }
+      if (left.length > 0) {
+        filteredPack = (await packs.install(writePack(objects, left, packOptions))).packId;
+        newPacks.add(filteredPack);
+        await packs.refresh();
+      }
     }
+    // Only packs of the snapshot, and none modified since the walk started (defence in depth)
+    const removable: { pack: Pack; modified?: number }[] = [];
+    if (all) {
+      for (const p of replaced) {
+        if (newPacks.has(p.packId)) continue;
+        const modified = (await files.stats(joinPath(packDir, `pack-${p.packId}.pack`)))
+          ?.lastModified;
+        if (modified !== undefined && modified > snapshot.walkStartedAt) continue;
+        removable.push({ pack: p, modified });
+      }
+    }
+
+    let unpackedObjects = 0;
+    if (options.unpackUnreachable && removable.length) {
+      unpackedObjects = await unpackUnreachable({
+        files,
+        gitDir,
+        objects,
+        removable,
+        // the new pack holds only reachable objects; .keep packs and the promisor pack stay
+        keep: [
+          ...kept,
+          ...(await packs.packs()).filter(
+            (p) => p.packId === promisorPack || p.packId === filteredPack,
+          ),
+        ],
+        reachable: new Set(reachable.map((o) => o.id)),
+        cutoff:
+          snapshot.walkStartedAt - (options.unpackUnreachableExpireMs ?? DEFAULT_PRUNE_EXPIRE_MS),
+        loosened: loosened ?? new Set(),
+      });
+    }
+
+    const packsRemoved = removable.map((r) => `pack-${r.pack.packId}`);
+    if (packsRemoved.length) await packs.remove(removable.map((r) => r.pack.packId));
+
+    const looseObjectsRemoved = await prunePacked(looseStorage, packs, alternates);
+
+    return {
+      packName: `pack-${packId}`,
+      objectCount: count,
+      looseObjectsRemoved,
+      packsRemoved,
+      keptPacks,
+      unpackedObjects,
+      bitmapWritten,
+      ...(promisorPack && promisorPack !== packId
+        ? { promisorPack: { packName: `pack-${promisorPack}`, objectCount: promised.length } }
+        : {}),
+      ...(filteredPack ? { filteredPack: `pack-${filteredPack}` } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
+    };
   }
-
-  let unpackedObjects = 0;
-  if (options.unpackUnreachable && removable.length) {
-    unpackedObjects = await unpackUnreachable({
-      files,
-      gitDir,
-      objects,
-      removable,
-      // the new pack holds only reachable objects; .keep packs stay
-      keep: kept,
-      reachable: new Set(reachable.map((o) => o.id)),
-      cutoff:
-        snapshot.walkStartedAt - (options.unpackUnreachableExpireMs ?? DEFAULT_PRUNE_EXPIRE_MS),
-      loosened: loosened ?? new Set(),
-    });
-  }
-
-  const packsRemoved = removable.map((r) => `pack-${r.pack.packId}`);
-  if (packsRemoved.length) await packs.remove(removable.map((r) => r.pack.packId));
-
-  const looseObjectsRemoved = await prunePacked(looseStorage, packs, alternates);
-
-  return {
-    packName: `pack-${installed.packId}`,
-    objectCount: installed.count,
-    looseObjectsRemoved,
-    packsRemoved,
-    keptPacks,
-    unpackedObjects,
-    bitmapWritten,
-    ...(warnings.length > 0 ? { warnings } : {}),
-  };
 }
 
 interface BitmapPlan {

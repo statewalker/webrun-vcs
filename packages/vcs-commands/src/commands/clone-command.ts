@@ -1,5 +1,6 @@
 import {
   type FilesApi,
+  historyWithoutLazyFetch,
   isSymbolicRef,
   type ObjectId,
   parseObjectFilter,
@@ -34,6 +35,7 @@ import { fetchFsckOf } from "./fsck/index.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { copyLocalObjects } from "./local-clone.js";
+import { promisorOf } from "./promisor-remote.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
@@ -203,8 +205,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
    * no filters sends everything, with git's warning; a local clone ignores the filter
    * (`--filter is ignored in local clones; use file:// instead.`), its config still written.
    *
-   * Objects left out are never fetched lazily here: a checkout, or any read of an absent
-   * blob, fails. Pair it with `setNoCheckout(true)` or `setBare(true)`.
+   * Objects left out are fetched lazily from the remote when read (the checkout fetches the
+   * blobs it writes in one batch, as git's).
    *
    * @param spec The filter spec; `blob:limit=1k` is recorded and sent as `blob:limit=1024`
    * @throws ObjectFilterError with git's message for a spec git refuses
@@ -735,7 +737,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       headers: this.headers,
       timeout: this.timeout,
       gzipRequests: this.gzipRequests,
-      repository: createRepositoryFacade({ history }),
+      repository: createRepositoryFacade({ history: historyWithoutLazyFetch(history) }),
       refStore: createTransportRefStore(history.refs),
       refspecs,
       tags,
@@ -774,6 +776,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       ...this.remoteSessionOptions(),
       ...(this.uploadPack !== undefined ? { program: this.uploadPack } : {}),
     };
+    // fetch_if_missing = 0 while the fetch runs: its walks read through the history's view
+    // without lazy fetch (the facade above)
     const result = await withRemoteUploadPack(remote, sessionOptions, (connection) =>
       fetchFromConnection(connection, fetchOptions),
     ).catch((error: unknown) => {
@@ -1110,6 +1114,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       );
     }
     await store.save();
+    // the promisor remote just recorded (partial_clone_register's reinit)
+    if (this.filterSpec !== undefined) promisorOf(this._workingCopy)?.fetcher?.invalidate?.();
   }
 
   /** The branch the local HEAD names (`init.defaultBranch` of the new repository), if any. */

@@ -72,6 +72,29 @@ import {
 } from "./submodule-summary.js";
 
 /** The output formats of {@link DiffCommand.callText} */
+/**
+ * The outputs whose diff git prefetches (diffcore_std's `output_formats_to_prefetch`: the
+ * diffstat kinds, the patch, `--dirstat`)
+ */
+const PREFETCH_FORMATS = new Set<string>(["patch", "stat", "numstat", "shortstat"]);
+
+/**
+ * The repository blobs of a diff's pairs (git's `diff_add_if_missing`: each side whose id is
+ * known, no submodule), in queue order, old side first.
+ */
+function prefetchIds(entries: readonly DiffEntry[]): ObjectId[] {
+  const out: ObjectId[] = [];
+  const add = (id: ObjectId | undefined, mode: number | undefined) => {
+    if (id && id !== NULL_ID && mode !== GITLINK && mode !== undefined && mode !== 0) out.push(id);
+  };
+  for (const e of entries) {
+    if (e.unmerged) continue;
+    if (!e.readOld) add(e.oldId, e.oldMode);
+    if (!e.readNew && !e.newIdUnknown) add(e.newId, e.newMode);
+  }
+  return out;
+}
+
 export type DiffOutputFormat =
   | "patch"
   | "stat"
@@ -592,7 +615,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
     this.dirtyThisCall = this.dirtySubmodules ?? format === "patch";
     this.readUiConfig();
-    const collected = await this.collect(renames, format === "patch");
+    const collected = await this.collect(renames, format === "patch", PREFETCH_FORMATS.has(format));
     const sink = new ByteSink();
     await this.writeFormats(sink, [format], collected);
     return sink.bytes();
@@ -670,7 +693,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           followChange = found.changeType as ChangeType.RENAME | ChangeType.COPY;
         }
       }
-    } else collected = await this.collect(renames, formats.includes("patch"));
+    } else {
+      collected = await this.collect(
+        renames,
+        formats.includes("patch"),
+        formats.some((f) => PREFETCH_FORMATS.has(f)),
+      );
+    }
     const followed = {
       ...(followPath !== undefined ? { followPath } : {}),
       ...(followChange !== undefined ? { followChange } : {}),
@@ -1222,6 +1251,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private async collect(
     renames: boolean | "copies",
     patch = false,
+    prefetch = false,
   ): Promise<{ entries: DiffEntry[]; combined: CombinedEntry[] }> {
     // repo_read_index: in a sparse checkout, a skip-worktree entry whose file is present is
     // read as in the checkout (in memory: diff writes no index)
@@ -1315,6 +1345,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
             : oldLink && newLink;
       return !gitlinkOnly || ignoreOf((e.newPath ?? e.oldPath) as string) !== "all";
     });
+    // diffcore_std: an output that reads the blobs fetches a partial clone's absent ones in
+    // one batch first (diff_queued_diff_prefetch), before rename detection
+    if (prefetch) await this.blobs.prefetch?.(prefetchIds(entries));
     if (renames) await this.detectRenames(entries, renames === "copies");
     return { entries, combined };
   }
@@ -1517,6 +1550,16 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         renameLimit: limit,
         countLastSpan: this.textOptions.renameCountLastSpan,
         copies,
+        // a partial clone's absent blobs, fetched in one batch (a worktree file is no blob)
+        prefetch: async (wanted) => {
+          const ids: ObjectId[] = [];
+          for (const { candidate: c, side } of wanted) {
+            const e = byPath.get(`${side === "source" ? "s" : "d"}:${c.path}`);
+            if (side === "destination" && e?.readNew) continue;
+            if (c.mode !== GITLINK && c.id) ids.push(c.id);
+          }
+          await this.blobs.prefetch?.(ids);
+        },
         size: async (c, role) => {
           const e = byPath.get(`${role === "source" ? "s" : "d"}:${c.path}`);
           if (role === "destination" && e?.readNew) return (await e.readNew()).length;

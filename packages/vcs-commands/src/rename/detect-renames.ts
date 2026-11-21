@@ -47,6 +47,14 @@ export interface DetectRenamesOptions {
   /** The content of a candidate, for inexact renames */
   load(candidate: RenameCandidate, side: "source" | "destination"): Promise<Uint8Array>;
   /**
+   * Called before the candidates are compared by content, with those about to be read, in
+   * git's order: a partial clone fetches the absent ones in one batch (diffcore-rename.c's
+   * `basename_prefetch` before the basename matches, `inexact_prefetch` before the matrix)
+   */
+  prefetch?(
+    candidates: Array<{ candidate: RenameCandidate; side: "source" | "destination" }>,
+  ): Promise<void>;
+  /**
    * The size of a candidate without reading it (`Blobs.size`), when known: a candidate is
    * then read only when it is compared, and its content is not kept afterwards
    */
@@ -411,6 +419,10 @@ export async function detectRenames(
       options.onRenameLimit?.(Math.max(sourcesLeft.length, destinationsLeft.length));
       return resolved();
     }
+    await options.prefetch?.([
+      ...destinationsLeft.map((d) => ({ candidate: dst[d], side: "destination" as const })),
+      ...sourcesLeft.map((i) => ({ candidate: src[i], side: "source" as const })),
+    ]);
     const matrix = await scoreMatrix(
       sourcesLeft,
       destinationsLeft,
@@ -474,6 +486,27 @@ export async function detectRenames(
   const dstNames = unique(
     dst.map((d, i) => [i, d.path] as [number, string]).filter(([i]) => !dstDone.has(i)),
   );
+  if (options.prefetch) {
+    // basename_prefetch: the pairs the loop below compares, destination first
+    const wanted: Array<{ candidate: RenameCandidate; side: "source" | "destination" }> = [];
+    for (const i of liveSources()) {
+      if (relevant && !relevant.has(src[i].path)) continue;
+      const base = basename(src[i].path);
+      if (!dstNames.has(base)) continue;
+      let s = srcNames.get(base) ?? -1;
+      let d = dstNames.get(base) ?? -1;
+      if (s < 0 || d < 0) {
+        s = i;
+        d = info ? info.possibleRename(src[i].path) : -1;
+      }
+      if (d < 0 || dstDone.has(d)) continue;
+      wanted.push(
+        { candidate: dst[d], side: "destination" },
+        { candidate: src[s], side: "source" },
+      );
+    }
+    if (wanted.length > 0) await options.prefetch(wanted);
+  }
   for (const i of liveSources()) {
     if (relevant && !relevant.has(src[i].path)) continue;
     const base = basename(src[i].path);
@@ -539,6 +572,11 @@ export async function detectRenames(
     options.onRenameLimit?.(Math.max(remainingSources.length, remainingDestinations.length));
     return finish();
   }
+  // inexact_prefetch: the destinations not paired yet, then the sources
+  await options.prefetch?.([
+    ...remainingDestinations.map((d) => ({ candidate: dst[d], side: "destination" as const })),
+    ...remainingSources.map((i) => ({ candidate: src[i], side: "source" as const })),
+  ]);
   const matrix = await scoreMatrix(
     remainingSources,
     remainingDestinations,

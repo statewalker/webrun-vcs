@@ -360,3 +360,33 @@ export function createGitFilesHistory(config: GitFilesStorageBackendConfig): His
 export interface GitFilesHistoryConfig extends GitFilesBackendConfig {
   // Inherits path, create, readOnly from GitFilesBackendConfig
 }
+
+const withoutLazyFetchViews = new WeakMap<History, History>();
+
+/**
+ * `history` as walks that must not fetch from a promisor remote read it (git's
+ * `fetch_if_missing = 0`: fetch, clone, fsck, gc, a served or received pack): its object
+ * store's `withoutLazyFetch` view under typed stores of its own, the same refs, packs and
+ * commit-graph. `history` itself when its store has no lazy fetch. The view is the context
+ * passed down to those walks; reads through `history` meanwhile still fetch.
+ *
+ * @example
+ * ```typescript
+ * const repository = createRepositoryFacade({ history: historyWithoutLazyFetch(history) });
+ * ```
+ */
+export function historyWithoutLazyFetch(history: History): History {
+  const objects = history.objects?.withoutLazyFetch;
+  if (!objects || objects === history.objects) return history;
+  let view = withoutLazyFetchViews.get(history);
+  if (!view) {
+    view = createHistoryFromComponents({
+      objects,
+      refs: history.refs,
+      ...(history.packs ? { packs: history.packs } : {}),
+      ...(history.commitGraph ? { commitGraph: history.commitGraph } : {}),
+    });
+    withoutLazyFetchViews.set(history, view);
+  }
+  return view;
+}

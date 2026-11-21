@@ -234,7 +234,12 @@ async function planInto(
       );
     }
 
-    if ((!options.writing || options.writing.has(path)) && !(await blobs.has(entry.id))) {
+    // a partial clone's absent blob is fetched when the plan is written
+    if (
+      (!options.writing || options.writing.has(path)) &&
+      !(await blobs.has(entry.id)) &&
+      !blobs.mayFetch?.()
+    ) {
       throw new Error(`${operation} cannot restore ${path}: blob ${entry.id} is missing`);
     }
 
@@ -279,6 +284,11 @@ async function writePlan(
           direction: "checkout",
           index: attributesIndexOf(plan.entries.map((e) => [e.path, e.objectId] as const)),
         });
+  // check_updates: a partial clone fetches the blobs to be written in one batch first
+  // (prefetch_cache_entries over the entries to check out)
+  if (blobs.prefetch && plan.entries.length > 0) {
+    await blobs.prefetch(plan.entries.map((e) => e.objectId));
+  }
   for (const { path, objectId, mode } of plan.entries) {
     const content = await blobs.load(objectId);
     if (!content) {
@@ -364,7 +374,7 @@ export async function planFlatRestore(
         `${operation} cannot restore ${path}: the worktree cannot create symbolic links`,
       );
     }
-    if (!(await blobs.has(entry.objectId))) {
+    if (!(await blobs.has(entry.objectId)) && !blobs.mayFetch?.()) {
       throw new Error(`${operation} cannot restore ${path}: blob ${entry.objectId} is missing`);
     }
     plan.entries.push(restore);

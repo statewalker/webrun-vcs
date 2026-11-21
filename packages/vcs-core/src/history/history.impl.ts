@@ -13,6 +13,7 @@ import type { CommitGraphProvider } from "./commit-graph/commit-graph-provider.j
 import type { Commits } from "./commits/commits.js";
 import type { CollectReachableOptions, History, HistoryWithOperations } from "./history.js";
 import { CorruptObjectError, type GitObjects } from "./objects/git-objects.js";
+import { PromisorFetchError } from "./objects/object-promisor.js";
 import type { Refs } from "./refs/refs.js";
 import type { Tags } from "./tags/tags.js";
 import { decodeTreeEntries, EMPTY_TREE_ID } from "./trees/index.js";
@@ -106,7 +107,9 @@ async function readChildIds(
   try {
     obj = await objects.get(oid);
   } catch (e) {
-    throw e instanceof CorruptObjectError ? e : corrupt(oid, "is stored but cannot be read", e);
+    throw e instanceof CorruptObjectError || e instanceof PromisorFetchError
+      ? e
+      : corrupt(oid, "is stored but cannot be read", e);
   }
   if (!obj) return oid === EMPTY_TREE_ID ? [] : undefined;
   const it = obj.content[Symbol.asyncIterator]();

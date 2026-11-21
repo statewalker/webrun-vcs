@@ -8,9 +8,11 @@ import {
   graftFileBaseDir,
   graftFileReader,
   isSymbolicRef,
+  objectsWithoutLazyFetch,
   openPack,
   type PackFile,
   type PackIndex,
+  PromisorObjectReadError,
   parseGraftFile,
   parseGraphCommit,
   type Refs,
@@ -36,8 +38,10 @@ import {
 } from "@statewalker/vcs-working-tree";
 
 import { GitCommand } from "../../git-command.js";
+import { RemoteConfigStore } from "../../remote-config/index.js";
 import { hostEnvironmentOf } from "../git-ident.js";
 import { configBool, configValue } from "../merge-config.js";
+import { hasPromisorRemote } from "../promisor-remote.js";
 import { DEFAULT_BIG_FILE_THRESHOLD, readLooseObject } from "./fsck-loose.js";
 import { FSCK_MSG_IDS, FsckMessageTypes, type FsckMsgId } from "./fsck-msg-ids.js";
 import {
@@ -259,8 +263,13 @@ function treeLineSound(data: Uint8Array): boolean {
  * verify` (unless `core.commitGraph` is false): its messages follow the rest on stderr and a
  * failure sets exit bit 16 (`FSCK_ERROR_COMMIT_GRAPH`).
  *
+ * In a partial clone (a promisor remote) the promisor objects are taken as git's fsck takes
+ * them (`is_promisor_object`: the objects of promisor packs and the objects they name): marked
+ * reachable without being walked further, never reported missing, valid as ref and reflog
+ * values; nothing is fetched lazily while fsck runs.
+ *
  * Not done: the ref database checks of `git refs verify` (git 2.45+),
- * multi-pack-index and reverse-index verification, promisor objects, the commit-graphs
+ * multi-pack-index and reverse-index verification, the commit-graphs
  * of alternates, `fsck.skipList`, and explicit `<object>` heads. The objects of alternates
  * (`history.objects.alternates`) are read and checked as git's default `--full` reads them
  * (their dangling objects listed too): 2.56 source by source, 2.43 every source's loose
@@ -424,14 +433,25 @@ export class FsckCommand extends GitCommand<FsckResult> {
     const bigFileThreshold =
       sizeValue("core.bigFileThreshold", configValue(this.workingCopy, "core.bigFileThreshold")) ??
       DEFAULT_BIG_FILE_THRESHOLD;
-    const objects = this.workingCopy.history.objects;
-    if (!objects) throw new Error("fsck needs the object store (history.objects)");
+    const stored = this.workingCopy.history.objects;
+    if (!stored) throw new Error("fsck needs the object store (history.objects)");
+    // fsck knows how to handle missing promisor objects (fetch_if_missing = 0): in a partial
+    // clone it reads through the store's view without lazy fetch
+    const partial =
+      stored.promisor !== undefined && hasPromisorRemote(RemoteConfigStore.from(this.workingCopy));
+    const objects = partial ? objectsWithoutLazyFetch(stored) : stored;
     const stores: RunStores = {
       refs: this.refsStore,
       staging: () => this.staging,
       trees: () => this.storedTrees,
     };
+    const promisor = objects.promisor;
+    const loadPromised =
+      promisor && partial
+        ? (skipUnreadable?: boolean) => promisor.promisedObjects({ skipUnreadable })
+        : undefined;
     const run = new FsckRun(stores, objects, types, {
+      ...(loadPromised ? { loadPromised } : {}),
       connectivityOnly: this._connectivityOnly,
       dangling: this._dangling,
       unreachable: this._unreachable,
@@ -497,6 +517,18 @@ interface RunStores {
 }
 
 interface RunOptions {
+  /**
+   * A partial clone's promisor objects (git's `is_promisor_object`): reachable without being
+   * walked, never missing, valid ref and reflog values; absent outside a partial clone
+   */
+  promised?: ReadonlySet<string>;
+  /**
+   * Reads {@link promised} when the walk first asks (git's `is_promisor_object` builds the
+   * set on its first call): an object of a promisor pack that cannot be read is git's death
+   * there (2.5x asks for every reachable object; 2.43 only for a missing one, so ours reads
+   * no set then)
+   */
+  loadPromised?: (skipUnreadable?: boolean) => Promise<ReadonlySet<string>>;
   connectivityOnly: boolean;
   dangling: boolean;
   unreachable: boolean;
@@ -580,6 +612,10 @@ class FsckRun {
   private readonly gitattributesFound = new Set<string>();
   private readonly gitattributesDone = new Set<string>();
   private shallow = new Set<string>();
+  /** A partial clone's promisor objects, once read (see `RunOptions.loadPromised`) */
+  private promised?: ReadonlySet<string>;
+  /** git 2.43's death when the walk first asks about a promisor object (see `run`) */
+  private promisorDeathAt?: { at: number; error: PromisorObjectReadError };
   /**
    * The commit grafts of `info/grafts` (git's parse_commit_buffer gives a grafted commit those
    * parents, its own not looked up), and what reading them reported, printed when the first
@@ -720,6 +756,30 @@ class FsckRun {
       if (await this.fsckFinish()) this.errorsFound |= FSCK_ERROR_OBJECT;
     }
 
+    // is_promisor_object's set, built when the walk from the refs first asks
+    this.promised = this.o.promised;
+    if (this.o.loadPromised) {
+      try {
+        const loaded = await this.o.loadPromised();
+        this.promised = loaded.size > 0 ? loaded : undefined;
+      } catch (error) {
+        if (!(error instanceof PromisorObjectReadError)) throw error;
+        if (this.o.compatibility === "2.56") {
+          for (const pack of this.opened.values()) pack?.close();
+          return this.promisorDeath(error);
+        }
+        // 2.43 asks only for an object that is missing: it dies there, at the first question
+        const loaded = await this.o.loadPromised(true);
+        const findings = this.findings;
+        const run = this;
+        this.promised = {
+          has(id: string) {
+            run.promisorDeathAt ??= { at: findings.length, error };
+            return loaded.has(id);
+          },
+        } as ReadonlySet<string>;
+      }
+    }
     if (snapshot) await this.processSnapshot(snapshot);
     else await this.processRefs();
     await this.processIndexes();
@@ -739,10 +799,40 @@ class FsckRun {
       for (const pack of this.opened.values()) pack?.close();
     }
 
+    if (this.promisorDeathAt) {
+      this.findings.length = this.promisorDeathAt.at;
+      return this.promisorDeath(this.promisorDeathAt.error);
+    }
     const out = this.findings.filter((f) => f.stream === "stdout").map((f) => `${f.text}\n`);
     const err = this.findings.filter((f) => f.stream === "stderr").map((f) => `${f.text}\n`);
     return {
       exitCode: this.errorsFound,
+      findings: this.findings,
+      output: out.join(""),
+      errorOutput: err.join(""),
+      statistics: {
+        objectsRead: this.objectsRead,
+        commitsFromGraph: this.graphParsed,
+        objectsScanned: this.objectsScanned,
+        linksKept: this.kidsLength + this.scanKidsLength,
+        graphCommitsKept: this.graphCommitsKept,
+      },
+    };
+  }
+
+  /** add_promisor_object's death on a promisor pack's unreadable object: exit 128. */
+  private promisorDeath(error: PromisorObjectReadError): FsckResult {
+    const pack = this.packs.find((p) => p.idx.has(error.objectId));
+    const where = pack ? pack.packPath : `pack-${error.packId}.pack`;
+    this.emit({
+      kind: "error",
+      stream: "stderr",
+      text: `fatal: packed object ${error.objectId} (stored in ${where}) is corrupt`,
+    });
+    const out = this.findings.filter((f) => f.stream === "stdout").map((f) => `${f.text}\n`);
+    const err = this.findings.filter((f) => f.stream === "stderr").map((f) => `${f.text}\n`);
+    return {
+      exitCode: 128,
       findings: this.findings,
       output: out.join(""),
       errorOutput: err.join(""),
@@ -1951,6 +2041,7 @@ class FsckRun {
             }
             if ("error" in unpacked) {
               if (unpacked.zlib) this.error(unpacked.zlib);
+              if (unpacked.base) this.error(unpacked.base);
               this.error(unpacked.error, entry.id);
               this.badCopy.add(entry.id);
               // the verification reads this copy (git does not check its hash there)
@@ -2038,6 +2129,11 @@ class FsckRun {
     if (n === undefined || t.type(n) !== type) return false;
     const flags = t.flags(n);
     if (flags & REACHABLE) return true;
+    if (this.promised?.has(t.id(n))) {
+      // a promisor object: reachable, not walked further (mark_object)
+      t.addFlags(n, REACHABLE);
+      return true;
+    }
     if (!(flags & HAS_OBJ)) return false;
     t.addFlags(n, REACHABLE);
     this.pending.push(n);
@@ -2054,6 +2150,10 @@ class FsckRun {
     if (n !== undefined && (type === "any" || parent === undefined || t.type(n) === type)) {
       const flags = t.flags(n);
       if (flags & REACHABLE) return 0;
+      if (this.promised?.has(t.id(n))) {
+        t.addFlags(n, REACHABLE);
+        return 0;
+      }
       if (flags & HAS_OBJ) {
         t.addFlags(n, REACHABLE);
         this.pending.push(n);
@@ -2091,6 +2191,14 @@ class FsckRun {
     }
     if (t.flags(n) & REACHABLE) return 0;
     t.addFlags(n, REACHABLE);
+    // a promisor object needs no further recursion (it is not missing: it will be fetched);
+    // 2.43 asks only for an object it does not have
+    if (
+      (this.o.compatibility === "2.56" || !(t.flags(n) & HAS_OBJ)) &&
+      this.promised?.has(t.id(n))
+    ) {
+      return 0;
+    }
     if (!(t.flags(n) & HAS_OBJ)) {
       const id = t.id(n);
       if (parent !== undefined && !(await this.hasObject(id))) {
@@ -2119,6 +2227,11 @@ class FsckRun {
   private async handleRef(name: string, id: string): Promise<void> {
     const n = await this.parseObject(id);
     if (n === undefined) {
+      // a promisor object: a valid ref
+      if (this.promised?.has(id)) {
+        this.defaultRefs++;
+        return;
+      }
       this.error(`${name}: invalid sha1 pointer ${id}`, id);
       this.errorsFound |= FSCK_ERROR_REACHABLE;
       return;
@@ -2141,7 +2254,7 @@ class FsckRun {
       if (timestamp) this.putName(id, `${refname}@{${timestamp}}`);
       this.t.addFlags(n, USED);
       await this.markObject(n, "any", undefined);
-    } else {
+    } else if (!this.promised?.has(id)) {
       this.error(`${refname}: invalid reflog entry ${id}`, id);
       this.errorsFound |= FSCK_ERROR_REACHABLE;
     }
@@ -2188,6 +2301,10 @@ class FsckRun {
     const snapshotRef = async (name: string, id: string) => {
       const n = await this.parseObject(id);
       if (n === undefined) {
+        if (this.promised?.has(id)) {
+          this.defaultRefs++;
+          return;
+        }
         this.error(`${name}: invalid sha1 pointer ${id}`, id);
         this.errorsFound |= FSCK_ERROR_REACHABLE;
         return;
@@ -3009,7 +3126,7 @@ class FsckRun {
       const id = t.id(n);
       const flags = t.flags(n);
       if (flags & REACHABLE) {
-        if (flags & HAS_OBJ || this.inPack(id)) continue;
+        if (this.promised?.has(id) || flags & HAS_OBJ || this.inPack(id)) continue;
         const type = await this.printableType(n);
         this.emit({
           kind: "missing",

@@ -6,7 +6,7 @@
  * paths and skip-worktree entries passed over unless `--ignore-skip-worktree-bits`.
  */
 
-import { type Blobs, FileMode, type ObjectId } from "@statewalker/vcs-core";
+import { type Blobs, FileMode, type ObjectId, PromisorFetchError } from "@statewalker/vcs-core";
 import { type ConflictStyle, compareGitPaths } from "@statewalker/vcs-utils";
 import { collect } from "@statewalker/vcs-utils/streams";
 import {
@@ -627,9 +627,11 @@ async function checkoutWorktree(
         await worktree.mkdir(path, { recursive: true });
         return true;
       }
-      const content = (await ctx.blobs.has(objectId))
-        ? await ctx.blobs.load(objectId).catch(() => undefined)
-        : undefined;
+      // a partial clone's absent blob is fetched by the read (git's lazy fetch)
+      const content = await ctx.blobs.load(objectId).catch((error: unknown) => {
+        if (error instanceof PromisorFetchError) throw error;
+        return undefined;
+      });
       if (!content) {
         const current = await worktree.getEntry(path).catch(() => undefined);
         if (current) await worktree.remove(path, { recursive: current.isDirectory });

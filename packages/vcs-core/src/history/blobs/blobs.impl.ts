@@ -12,6 +12,7 @@ import {
   type GitObjects,
   InvalidObjectIdError,
 } from "../objects/git-objects.js";
+import { PromisorFetchError } from "../objects/object-promisor.js";
 import {
   hasObjectOfType,
   objectHeader,
@@ -67,7 +68,7 @@ class GitBlobStore implements Blobs {
       obj = await (this.objects.getNow ? this.objects.getNow(id) : this.objects.get(id));
     } catch (e) {
       if (e instanceof InvalidObjectIdError) return undefined;
-      if (e instanceof CorruptObjectError) throw e;
+      if (e instanceof CorruptObjectError || e instanceof PromisorFetchError) throw e;
       const reason = e instanceof Error ? `: ${e.message}` : "";
       throw new CorruptObjectError(`object ${id} is stored but cannot be read${reason}`, {
         cause: e,
@@ -81,6 +82,19 @@ class GitBlobStore implements Blobs {
     return obj.bytes
       ? { size: obj.size, bytes: obj.bytes, content: obj.content }
       : { size: obj.size, content: obj.content };
+  }
+
+  /**
+   * Fetches the blobs a partial clone lacks in one batch (git's prefetch before a checkout or
+   * a diff); nothing in a complete repository.
+   */
+  async prefetch(ids: Iterable<ObjectId>): Promise<void> {
+    await this.objects.promisor?.prefetch(ids);
+  }
+
+  /** Whether absent blobs come from a promisor remote (see `Blobs.mayFetch`). */
+  mayFetch(): boolean {
+    return this.objects.promisor?.hasPromisorRemote() ?? false;
   }
 
   /**
