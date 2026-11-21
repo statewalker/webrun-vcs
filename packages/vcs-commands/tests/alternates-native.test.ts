@@ -15,13 +15,14 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { findAbbrevLengths } from "@statewalker/vcs-core";
-import { createGitFilesBackend, gc, repack } from "@statewalker/vcs-store-files";
+import { createGitFilesBackend, FileGcStrategy, gc, repack } from "@statewalker/vcs-store-files";
 import { createBasePathResolver, createServedFetchHandler } from "@statewalker/vcs-transport";
 import {
   createNodeFilesApi,
@@ -483,6 +484,96 @@ describeGit("alternate object directories, as native git", () => {
       expect(received).not.toContain(id.slice(0, 40));
     }
     expect(gitRun(root, join(dir, "b.git"), ["fsck", "--no-progress"]).status).toBe(0);
+  });
+
+  it("gc --prune=now, repack and prune refuse when an alternate is gone, deleting nothing", async () => {
+    const dir = fresh("gone");
+    const src = repoWith(join(dir, "src"), ["s1", "s2"]);
+    const blob = git(src, "rev-parse", "HEAD:s1.txt").trim();
+    const twin = (name: string) => {
+      const repo = join(dir, name);
+      git(dir, "clone", "-q", "--shared", src, repo);
+      // a branch at a borrowed commit, and a loose copy of a borrowed blob of its own
+      git(repo, "branch", "kept", "HEAD~1");
+      const at = join(repo, ".git/objects", blob.slice(0, 2));
+      mkdirSync(at, { recursive: true });
+      writeFileSync(
+        join(at, blob.slice(2)),
+        readFileSync(join(src, ".git/objects", blob.slice(0, 2), blob.slice(2))),
+      );
+      return repo;
+    };
+    const n = twin("n");
+    const o = twin("o");
+    renameSync(src, join(dir, "moved"));
+    const before = {
+      n: localObjects(join(n, ".git/objects")),
+      o: localObjects(join(o, ".git/objects")),
+    };
+    expect(before.n).toContain(blob);
+    const theirs = gitRun(root, n, ["gc", "-q", "--prune=now"]);
+    expect(theirs.status).not.toBe(0);
+    expect(theirs.stderr).toContain("bad object");
+    expect(gitRun(root, n, ["prune", "--expire=now"]).status).not.toBe(0);
+    expect(localObjects(join(n, ".git/objects"))).toEqual(before.n);
+    const backend = await backendOf(o);
+    expect(backend.objects.alternates?.errors.length).toBeGreaterThan(0);
+    const target = { ...backend, history: backend.history };
+    await expect(gc({ ...target, pruneExpireMs: 0, writeCommitGraph: false })).rejects.toThrow(
+      /alternate object directory cannot be read/,
+    );
+    await expect(repack(target)).rejects.toThrow(/alternate object directory cannot be read/);
+    await expect(new FileGcStrategy(target).collectRoots()).rejects.toThrow();
+    // and with alternates not read at all (alternates: false), the same refusal
+    const blind = await createGitFilesBackend({
+      files: backend.files,
+      gitDir: backend.gitDir,
+      alternates: false,
+    });
+    await expect(gc({ ...blind, pruneExpireMs: 0, writeCommitGraph: false })).rejects.toThrow(
+      /alternates are not read/,
+    );
+    expect(localObjects(join(o, ".git/objects"))).toEqual(before.o);
+    expect(before.o).toEqual(before.n);
+  });
+
+  it("reads relative $GIT_ALTERNATE_OBJECT_DIRECTORIES entries from the worktree top (--separate-git-dir)", async () => {
+    const dir = fresh("separate");
+    const work = join(dir, "work");
+    mkdirSync(join(work, "meta"), { recursive: true });
+    git(dir, "init", "-q", "-b", "main", "--separate-git-dir", join(work, "meta/repo.git"), work);
+    mkdirSync(join(work, "sub"));
+    const inner = repoWith(join(work, "vendor/inner"), ["i1"]);
+    const beside = repoWith(join(dir, "beside"), ["b1"]);
+    const ids = [git(inner, "rev-parse", "HEAD").trim(), git(beside, "rev-parse", "HEAD").trim()];
+    const env = {
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: "vendor/inner/.git/objects:../beside/.git/objects",
+    };
+    // git runs from the worktree top, wherever it was started
+    for (const id of ids) {
+      expect(gitRun(root, join(work, "sub"), ["cat-file", "-e", id], env).status).toBe(0);
+    }
+    const environment = createNodeGitHostEnvironment({ env: testEnv(root, env) });
+    // a FilesApi rooted at the worktree: its root is the worktree top (`../beside` lies
+    // beyond the storage)
+    const atTop = await createGitFilesBackend({
+      files: createNodeFilesApi({ rootDir: work }),
+      gitDir: "meta/repo.git",
+      environment,
+    });
+    expect(atTop.objects.alternates?.errors).toEqual([
+      `error: unable to normalize alternate object path: ${work}/../beside/.git/objects`,
+    ]);
+    expect(await atTop.objects.has(ids[0] as string)).toBe(true);
+    // one rooted above it, told where the worktree is
+    const above = await createGitFilesBackend({
+      files: createNodeFilesApi({ rootDir: dir }),
+      gitDir: "work/meta/repo.git",
+      workTree: "work",
+      environment,
+    });
+    expect(above.objects.alternates?.errors).toEqual([]);
+    for (const id of ids) expect(await above.objects.has(id)).toBe(true);
   });
 });
 

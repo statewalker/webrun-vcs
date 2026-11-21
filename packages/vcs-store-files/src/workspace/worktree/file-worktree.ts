@@ -1318,7 +1318,14 @@ export class FileWorktree implements Worktree {
     }
     const files = this.rootFiles;
     const environment = this.environment ? { environment: this.environment } : {};
-    const { history } = await createGitFilesBackend({ files, gitDir, ...environment });
+    // only the superproject's object database honours $GIT_ALTERNATE_OBJECT_DIRECTORIES (git
+    // opens a submodule's without ODB_NEW_HONOR_ENV)
+    const { history } = await createGitFilesBackend({
+      files,
+      gitDir,
+      ...environment,
+      alternatesFromEnvironment: false,
+    });
     const staging = new FileStagingStore(files, joinPath(gitDir, "index"));
     await staging.read();
     const config = await createWorkingCopyConfig(

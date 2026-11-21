@@ -22,6 +22,7 @@ import type {
 } from "@statewalker/vcs-core";
 import { joinPath } from "@statewalker/vcs-core";
 
+import { assertAlternatesReadable } from "./alternates/index.js";
 import { collectReachabilityRoots } from "./reachable-objects.js";
 
 import { type RepackTarget, repack } from "./repack.js";
@@ -71,6 +72,7 @@ export class FileGcStrategy implements GcStrategy {
   async collectRoots(): Promise<GcRoots> {
     const { files, gitDir, history, objects } = this.target;
     assertObjectsDeletable(await readRepositoryFormat(files, gitDir), "prune");
+    await assertAlternatesReadable({ files, gitDir, objects }, "prune");
     return {
       roots: await collectReachabilityRoots({ files, gitDir, refs: history.refs, objects }),
     };

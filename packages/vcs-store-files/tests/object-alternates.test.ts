@@ -5,7 +5,17 @@
  */
 import { createInMemoryFilesApi } from "@statewalker/vcs-core";
 import { describe, expect, it } from "vitest";
-import { createGitFilesBackend, parseAlternates } from "../src/index.js";
+import {
+  AlternatesUnreadableError,
+  collectReachabilityRoots,
+  createGitFilesBackend,
+  FileGcStrategy,
+  FileWorktree,
+  gc,
+  MissingRootError,
+  parseAlternates,
+  repack,
+} from "../src/index.js";
 
 const enc = new TextEncoder();
 
@@ -115,5 +125,156 @@ describe("a files store with alternates", () => {
     expect(await repo.objects.alternates?.list()).toEqual([]);
     // copied into a pack of its own
     expect(await repo.packs.has(alt.id)).toBe(true);
+  });
+});
+
+describe("gc, repack and prune over alternates that cannot be read", () => {
+  /** A repository at /repo borrowing a commit from /alt, a branch at it, the blob also here. */
+  async function borrowed() {
+    const files = createInMemoryFilesApi();
+    const alt = await createGitFilesBackend({ files, gitDir: "/alt/.git", create: true });
+    const bytes = enc.encode("shared\n");
+    const blob = await alt.objects.put("blob", bytes.length, [bytes]);
+    const tree = await alt.history.trees.store([{ mode: 0o100644, name: "a.txt", id: blob }]);
+    const who = { name: "a", email: "a@b", timestamp: 1, tzOffset: "+0000" };
+    const commit = await alt.history.commits.store({
+      tree,
+      parents: [],
+      author: who,
+      committer: who,
+      message: "c\n",
+    });
+    await alt.history.refs.set("refs/heads/main", commit);
+    await files.write("/repo/.git/objects/info/alternates", [enc.encode("/alt/.git/objects\n")]);
+    const repo = await createGitFilesBackend({ files, gitDir: "/repo/.git", create: true });
+    await repo.history.refs.set("refs/heads/main", commit);
+    // a loose copy of the blob of its own (git writes one, e.g. by hash-object -w)
+    const loose = `/repo/.git/objects/${blob.slice(0, 2)}/${blob.slice(2)}`;
+    const raw: Uint8Array[] = [];
+    for await (const c of files.read(`/alt/.git/objects/${blob.slice(0, 2)}/${blob.slice(2)}`))
+      raw.push(c);
+    await files.write(loose, raw);
+    return { files, commit, loose };
+  }
+
+  it("refuses when an alternate is gone, deleting nothing (git: bad object)", async () => {
+    const { files, loose } = await borrowed();
+    await files.remove("/alt");
+    const repo = await createGitFilesBackend({ files, gitDir: "/repo/.git" });
+    expect(repo.objects.alternates?.errors.length).toBeGreaterThan(0);
+    const target = { ...repo, history: repo.history, gitDir: "/repo/.git" };
+    await expect(gc({ ...target, pruneExpireMs: 0, writeCommitGraph: false })).rejects.toThrow(
+      AlternatesUnreadableError,
+    );
+    await expect(repack(target)).rejects.toThrow(AlternatesUnreadableError);
+    await expect(new FileGcStrategy(target).collectRoots()).rejects.toThrow(
+      AlternatesUnreadableError,
+    );
+    expect(await files.exists(loose)).toBe(true);
+  });
+
+  it("refuses with an alternates file the store does not read (alternates: false)", async () => {
+    const { files, loose } = await borrowed();
+    const repo = await createGitFilesBackend({ files, gitDir: "/repo/.git", alternates: false });
+    expect(repo.objects.alternates).toBeUndefined();
+    const target = { ...repo, gitDir: "/repo/.git" };
+    await expect(gc({ ...target, pruneExpireMs: 0, writeCommitGraph: false })).rejects.toThrow(
+      /alternates are not read/,
+    );
+    await expect(repack(target)).rejects.toThrow(AlternatesUnreadableError);
+    expect(await files.exists(loose)).toBe(true);
+  });
+
+  it("a ref whose object is missing is fatal (git's bad object), a reflog entry is not", async () => {
+    const files = createInMemoryFilesApi();
+    const { backend, id } = await repoWithBlob(files, "/r", "x\n");
+    await backend.history.refs.set("refs/tags/x", id);
+    const gone = "1".repeat(40);
+    await files.write("/r/.git/logs/refs/tags/x", [
+      enc.encode(`${"0".repeat(40)} ${gone} a <a@b> 1 +0000\tx\n`),
+    ]);
+    const roots = {
+      files,
+      gitDir: "/r/.git",
+      refs: backend.history.refs,
+      objects: backend.objects,
+    };
+    expect(await collectReachabilityRoots(roots)).toEqual([id]);
+    await files.write("/r/.git/refs/heads/broken", [enc.encode(`${gone}\n`)]);
+    await expect(collectReachabilityRoots(roots)).rejects.toThrow(MissingRootError);
+    await expect(collectReachabilityRoots(roots)).rejects.toThrow("bad object refs/heads/broken");
+  });
+});
+
+describe("alternates' upkeep", () => {
+  it("refs() leaves out an alternate's refs to objects it lacks (for-each-ref there)", async () => {
+    const files = createInMemoryFilesApi();
+    const alt = await repoWithBlob(files, "/alt", "a\n");
+    await alt.backend.history.refs.set("refs/tags/good", alt.id);
+    await files.write("/alt/.git/refs/tags/dangling", [enc.encode(`${"2".repeat(40)}\n`)]);
+    await files.write("/repo/.git/objects/info/alternates", [enc.encode("/alt/.git/objects\n")]);
+    const repo = await createGitFilesBackend({ files, gitDir: "/repo/.git", create: true });
+    expect(await repo.objects.alternates?.refs()).toEqual([alt.id]);
+  });
+
+  it("add() writes the file through alternates.lock and refuses while the lock is held", async () => {
+    const files = createInMemoryFilesApi();
+    await repoWithBlob(files, "/alt", "a\n");
+    const repo = await createGitFilesBackend({ files, gitDir: "/repo/.git", create: true });
+    await files.write("/repo/.git/objects/info/alternates.lock", [new Uint8Array()]);
+    await expect(repo.objects.alternates?.add("/alt/.git/objects")).rejects.toThrow(
+      /alternates\.lock': File exists/,
+    );
+    expect(await files.exists("/repo/.git/objects/info/alternates")).toBe(false);
+    await files.remove("/repo/.git/objects/info/alternates.lock");
+    await repo.objects.alternates?.add("/alt/.git/objects");
+    expect(await files.exists("/repo/.git/objects/info/alternates.lock")).toBe(false);
+    const text: string[] = [];
+    for await (const c of files.read("/repo/.git/objects/info/alternates"))
+      text.push(new TextDecoder().decode(c));
+    expect(text.join("")).toBe("/alt/.git/objects\n");
+  });
+
+  it("a repository without alternates reads through its own store, no layer added", async () => {
+    const files = createInMemoryFilesApi();
+    const alt = await repoWithBlob(files, "/alt", "a\n");
+    const local = await createGitFilesBackend({ files, gitDir: "/repo/.git", create: true });
+    const getBefore = local.objects.get;
+    expect(await local.objects.alternates?.refs()).toEqual([]);
+    // linking one wraps the reads in place
+    await local.objects.alternates?.add("/alt/.git/objects");
+    expect(local.objects.get).not.toBe(getBefore);
+    expect(await local.objects.has(alt.id)).toBe(true);
+    expect(await local.history.blobs.has(alt.id)).toBe(true);
+  });
+});
+
+describe("$GIT_ALTERNATE_OBJECT_DIRECTORIES and submodules", () => {
+  it("a submodule opened through openGitlink does not read the variable (git: superproject only)", async () => {
+    const files = createInMemoryFilesApi();
+    const alt = await repoWithBlob(files, "/alt", "borrowed\n");
+    const environment = {
+      readFile: async () => undefined,
+      alternateObjectDirectories: "/alt/.git/objects",
+    };
+    const superproject = await createGitFilesBackend({
+      files,
+      gitDir: "/super/.git",
+      create: true,
+      environment,
+    });
+    expect(await superproject.objects.has(alt.id)).toBe(true);
+    await createGitFilesBackend({ files, gitDir: "/super/sub/.git", create: true });
+    const worktree = new FileWorktree({
+      files,
+      rootPath: "/super",
+      gitDir: "/super/.git",
+      blobs: superproject.history.blobs,
+      trees: superproject.history.trees,
+      environment,
+    });
+    const sub = await worktree.openGitlink("sub");
+    expect(sub).toBeDefined();
+    expect(await sub?.history?.objects?.has(alt.id)).toBe(false);
   });
 });

@@ -14,7 +14,7 @@ import {
 } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
-
+import { assertAlternatesReadable } from "./alternates/index.js";
 import { readCommitGraphSettings, writeCommitGraph } from "./commit-graph.js";
 import { sweepQuarantines } from "./quarantine/files-quarantine.js";
 import { listReachableObjects } from "./reachable-objects.js";
@@ -166,7 +166,9 @@ export interface GcResult {
  * refused with `UnsupportedRepositoryFormatError` before anything changes. In a repository
  * with alternates (`objects/info/alternates`) what they reach is walked through them, and the
  * repack leaves out what they hold (`git gc` runs `repack -d -l`); only the repository's own
- * objects are ever deleted.
+ * objects are ever deleted. While an alternate cannot be read (or `objects/info/alternates`
+ * exists but the store reads no alternates) gc refuses (`AlternatesUnreadableError`), and a
+ * ref, HEAD or index entry whose object is missing aborts it (`MissingRootError`), as git dies.
  *
  * The lock excludes gcs in other processes when the FilesApi has `createExclusive`, and
  * otherwise only gcs over the same FilesApi instance (see `atomicFilesOver`).
@@ -224,6 +226,8 @@ async function collect(options: GcOptions): Promise<GcResult> {
   // refused. preciousObjects: as git gc, refs are packed, but nothing is repacked or pruned.
   const format = await readRepositoryFormat(files, gitDir);
   if (format.partialClone !== undefined) assertObjectsDeletable(format, "gc");
+  // an alternate that cannot be read hides what reaches local objects: git dies, as we do
+  if (!dryRun) await assertAlternatesReadable({ files, gitDir, objects }, "gc");
   if (format.preciousObjects) {
     let refsPacked = false;
     if ((options.packRefs ?? true) && !dryRun && history.refs.packRefs) {

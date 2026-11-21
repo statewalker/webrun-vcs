@@ -22,6 +22,7 @@ import type {
 } from "@statewalker/vcs-core";
 import { createGitObjects, joinPath, writePack } from "@statewalker/vcs-core";
 
+import { assertAlternatesReadable } from "./alternates/index.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
@@ -180,6 +181,7 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
   // delete packs in a precious-objects repo"), nor in a partial clone (promisor packs)
   if (!options.dryRun) {
     assertObjectsDeletable(await readRepositoryFormat(options.files, options.gitDir), "repack");
+    await assertAlternatesReadable(options, "repack");
   }
   // The snapshot first: a pack installed during the walk is never removed
   const snapshot = await snapshotPacks(options.packs);

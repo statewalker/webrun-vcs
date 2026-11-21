@@ -113,6 +113,13 @@ export interface GitFilesBackendOptions {
    * cleared (a local remote, a served repository).
    */
   alternatesFromEnvironment?: boolean;
+  /**
+   * The worktree top in `files` (git's current directory after its setup): relative
+   * `$GIT_ALTERNATE_OBJECT_DIRECTORIES` entries name directories from there. Default: the
+   * git directory when bare, `core.worktree` when set, the directory holding `.git`, else (a
+   * separate git directory) the FilesApi's root.
+   */
+  workTree?: string;
   /** Each of git's error lines (`error: ...`) while the alternates are read */
   onAlternatesError?: (line: string) => void;
 }
@@ -215,6 +222,7 @@ export async function createGitFilesBackend(
           freshenMaxAgeMs,
           ...(options.environment ? { environment: options.environment } : {}),
           ...(options.alternatesFromEnvironment === false ? { honorEnvironment: false } : {}),
+          ...(options.workTree !== undefined ? { workTree: options.workTree } : {}),
           ...(options.onAlternatesError ? { onError: options.onAlternatesError } : {}),
           readConfig: () =>
             createWorkingCopyConfig(configFilesApiOf(files), gitDir, undefined, includes),

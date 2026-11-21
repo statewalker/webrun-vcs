@@ -37,6 +37,8 @@ import {
   openPackSet,
   type PackSet,
 } from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils/encoding";
+import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { skipPacked, withPacks } from "../pack/index.js";
 import { createFileRefStore } from "../refs/index.js";
@@ -73,6 +75,15 @@ export interface ObjectAlternatesOptions {
    * repository): the variable is not theirs
    */
   honorEnvironment?: boolean;
+  /**
+   * Where git runs, in `files`: relative `$GIT_ALTERNATE_OBJECT_DIRECTORIES` entries name
+   * directories from there (git resolves them against its current directory, which its setup
+   * changed to the worktree top, or to the git directory of a bare repository). Default: the
+   * git directory when bare (`core.bare`, or a git directory not named `.git` without it),
+   * else `core.worktree` when set, else the directory holding `.git`, else (a separate git
+   * directory) the FilesApi's root, taken as the worktree top.
+   */
+  workTree?: string;
   /** Passed to each alternate's packs and loose store (git's freshen window) */
   freshenMaxAgeMs?: number;
   /** The repository's configuration (`core.alternateRefsCommand`, `core.alternateRefsPrefixes`) */
@@ -99,6 +110,8 @@ export interface FilesObjectAlternates extends ObjectAlternates {
   packed(id: string): Promise<boolean>;
   /** The first alternate's copy of `id` */
   get(id: string, options?: { verify?: boolean }): Promise<GitObject | undefined>;
+  /** Calls `listener` once, when the first alternate is linked (by `add()` or `refresh()`) */
+  whenLinked(listener: () => void): void;
 }
 
 /**
@@ -199,30 +212,83 @@ export async function openObjectAlternates(
     for (const entry of nested) await link(into, seen, entry, depth + 1);
   };
 
-  /** The objects directory's real path and every linked alternate: what `link` skips. */
+  /** The objects directory's real path: what `link` skips. */
   const ownDir = async () => (await alternateRealPath(files, objectsDir, host)) ?? objectsDir;
-  let seenDirs = new Set<string>();
+  /** The directories `link` skips: the own one and each linked alternate (read on demand). */
+  let seenDirs: Set<string> | undefined;
+  const seen = async () => {
+    seenDirs ??= new Set([await ownDir()]);
+    return seenDirs;
+  };
+  let listeners: (() => void)[] = [];
+  const linked = () => {
+    if (sources.length === 0 || listeners.length === 0) return;
+    const pending = listeners;
+    listeners = [];
+    for (const listener of pending) listener();
+  };
+
+  /** Where git runs (relative environment entries are read from there), as a real path. */
+  const workTreeDir = async (): Promise<string> => {
+    let dir = options.workTree;
+    if (dir === undefined) {
+      const config = await options.readConfig?.().catch(() => undefined);
+      const bareValue = config?.get("core.bare");
+      const bare =
+        typeof bareValue === "boolean"
+          ? bareValue
+          : typeof bareValue === "string"
+            ? parseGitBool(bareValue)
+            : undefined;
+      const worktree = config?.get("core.worktree");
+      const name = gitDir.replace(/\/+$/, "").split("/").pop();
+      if (gitDir === "." || bare === true || (bare === undefined && name !== ".git")) {
+        dir = gitDir;
+      } else if (typeof worktree === "string" && worktree !== "") {
+        dir = isAbsolute(worktree)
+          ? host.known && host.inside(worktree)
+            ? host.filesPath(worktree)
+            : worktree
+          : `${gitDir}/${worktree}`;
+      } else if (name === ".git") {
+        dir = graftFileBaseDir(gitDir, false);
+      } else {
+        dir = "/";
+      }
+    }
+    const cwd = normalize(dir || "/") ?? "/";
+    return (await alternateRealPath(files, cwd, host)) ?? cwd;
+  };
 
   const load = async () => {
     errors = [];
+    const env =
+      options.honorEnvironment === false
+        ? undefined
+        : options.environment?.alternateObjectDirectories;
+    // nothing to read: no realpath, no config (the repositories that borrow nothing)
+    const file = `${objectsDir}/info/alternates`;
+    if (!env && (await files.stats(file).catch(() => undefined))?.kind !== "file") {
+      sources = [];
+      seenDirs = undefined;
+      return;
+    }
     const own = await ownDir();
-    const seen = new Set<string>([own]);
+    const skip = new Set<string>([own]);
     const top: string[] = [];
-    const env = options.environment?.alternateObjectDirectories;
-    if (env && options.honorEnvironment !== false) {
-      // relative entries from where git runs: the worktree top (the git directory when bare)
-      const cwd = normalize(graftFileBaseDir(gitDir) || "/") ?? "/";
-      const realCwd = (await alternateRealPath(files, cwd, host)) ?? cwd;
+    if (env) {
+      const realCwd = await workTreeDir();
       for (const entry of parseAlternates(env, ":")) {
         const real = await resolve(entry, realCwd);
         if (real !== undefined) top.push(real);
       }
     }
     top.push(...(await readFileEntries(own)));
-    const linked: Source[] = [];
-    for (const dir of top) await link(linked, seen, dir, 0);
-    sources = linked;
-    seenDirs = seen;
+    const into: Source[] = [];
+    for (const dir of top) await link(into, skip, dir, 0);
+    sources = into;
+    seenDirs = skip;
+    linked();
   };
   await load();
 
@@ -242,24 +308,45 @@ export async function openObjectAlternates(
     list: async () => sources,
     refresh: load,
     async add(path) {
-      // odb_source_files_write_alternate: the line appended under the file's lock, unless there
-      const file = `${objectsDir}/info/alternates`;
-      const existing =
-        (await files.stats(file))?.kind === "file"
-          ? await readAllBytes(files, file)
-          : new Uint8Array();
-      const text = new TextDecoder().decode(existing);
-      const lines = text.split("\n");
-      if (lines[lines.length - 1] === "") lines.pop();
-      if (!lines.includes(path)) {
-        await files.mkdir(`${objectsDir}/info`);
-        const body = `${lines.map((l) => `${l}\n`).join("")}${path}\n`;
-        await files.write(file, [new TextEncoder().encode(body)]);
+      // odb_source_files_write_alternate: under `alternates.lock` (taken before the file is
+      // read, as hold_lock_file_for_update), the line appended unless there, then renamed
+      // over the file; the lock is dropped when nothing changes
+      const info = atomicFilesOver(files, `${objectsDir}/info`);
+      if (!(await info.createExclusive("alternates.lock", new Uint8Array()))) {
+        throw new Error(
+          `Unable to create '${display(`${objectsDir}/info/alternates.lock`)}': File exists.`,
+        );
+      }
+      try {
+        const file = `${objectsDir}/info/alternates`;
+        const existing =
+          (await files.stats(file))?.kind === "file"
+            ? await readAllBytes(files, file)
+            : new Uint8Array();
+        const text = new TextDecoder().decode(existing);
+        const lines = text.split("\n");
+        if (lines[lines.length - 1] === "") lines.pop();
+        if (lines.includes(path)) {
+          await info.remove("alternates.lock");
+        } else {
+          const body = `${lines.map((l) => `${l}\n`).join("")}${path}\n`;
+          await info.write("alternates.lock", new TextEncoder().encode(body));
+          await info.replace("alternates.lock", "alternates");
+        }
+      } catch (error) {
+        await info.remove("alternates.lock").catch(() => false);
+        throw error;
       }
       const real = await resolve(path, await ownDir());
-      if (real !== undefined) await link(sources, seenDirs, real, 0);
+      if (real !== undefined) await link(sources, await seen(), real, 0);
+      linked();
+    },
+    whenLinked(listener) {
+      if (sources.length > 0) listener();
+      else listeners.push(listener);
     },
     async refs() {
+      if (sources.length === 0) return [];
       const config = await options.readConfig?.().catch(() => undefined);
       // a command of the user's (run through the shell) is not run here: no alternate refs
       if (config?.get("core.alternateRefsCommand") !== undefined) return [];
@@ -286,7 +373,8 @@ export async function openObjectAlternates(
         for (const name of names) {
           if (patterns.length > 0 && !patterns.some((p) => refMatches(name, p))) continue;
           const id = (await store.resolve(name).catch(() => undefined))?.objectId;
-          if (id && OID.test(id)) ids.push(id);
+          // for-each-ref there leaves out a ref whose object the alternate lacks
+          if (id && OID.test(id) && (await s.objects.has(id))) ids.push(id);
         }
       }
       return ids;
@@ -315,6 +403,33 @@ export async function openObjectAlternates(
  * git's `odb_freshen_object` skips it.
  */
 export function withAlternates(local: GitObjects, alternates: FilesObjectAlternates): GitObjects {
+  if (alternates.current().length > 0) return wrapWithAlternates(local, alternates);
+  // none yet: `local` itself, no layer on any read; wrapped in place once one is linked
+  const base: GitObjects = { ...local };
+  (local as { alternates?: ObjectAlternates }).alternates = alternates;
+  alternates.whenLinked(() => {
+    // only the reads: what was set on `local` since (beginQuarantine, ...) stays
+    const wrapped = wrapWithAlternates(base, alternates);
+    for (const key of WRAPPED_READS) {
+      (local as unknown as Record<string, unknown>)[key] = wrapped[key];
+    }
+  });
+  return local;
+}
+
+/** The methods {@link wrapWithAlternates} replaces. */
+const WRAPPED_READS = [
+  "get",
+  "getNow",
+  "getRaw",
+  "has",
+  "list",
+  "listPrefix",
+  "approximateCount",
+] as const;
+
+/** `local` with every read and listing falling through to the alternates. */
+function wrapWithAlternates(local: GitObjects, alternates: FilesObjectAlternates): GitObjects {
   const fromAlternates = (id: string, options?: { verify?: boolean }) =>
     alternates.current().length === 0 ? undefined : alternates.get(id, options);
   const get = async (id: string, options?: { verify?: boolean }) =>
