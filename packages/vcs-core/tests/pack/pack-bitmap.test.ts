@@ -20,6 +20,7 @@ import {
   writePack,
   writePackBitmap,
 } from "../../src/pack/index.js";
+import { parseObjectFilter } from "../../src/pack/object-filter/index.js";
 import { blob, commit, memObjects, tag, tree } from "./history-builder.js";
 
 /** A small seeded PRNG (mulberry32). */
@@ -389,3 +390,58 @@ describe("crafted bitmaps (served repositories)", () => {
     );
   });
 });
+
+describe("partial clone filters through bitmaps", () => {
+  it("list what the filtered walk lists, with and without haves, wants of every type", async () => {
+    const specs = [
+      "blob:none",
+      "blob:limit=4",
+      "blob:limit=8",
+      "tree:0",
+      "object:type=commit",
+      "object:type=tree",
+      "object:type=blob",
+      "object:type=tag",
+      "combine:blob:none+object:type=tree",
+      "combine:blob:limit=6+tree:0",
+    ];
+    for (const seed of [11, 12, 13]) {
+      const h = await randomHistory(seed, 25);
+      const tip = h.commits[h.commits.length - 1] as string;
+      const { index } = await bitmapped(h, [h.commits[18] as string]);
+      // tags and a subtree among the wants: kept whatever the filter says (not a commit's
+      // root tree: git's walk marks those not user given before it walks the wants, its
+      // bitmap keeps them, and so do ours)
+      const someTree = (
+        await setOfTyped(listObjects(h.objects, { wants: [h.commits[3] as string] }))
+      ).find((o) => o.type === "tree" && o.path)?.id as string;
+      const wantSets = [[tip], [tip, ...h.tags, someTree]];
+      for (const wants of wantSets) {
+        for (const haves of [[], [h.commits[10] as string]]) {
+          for (const spec of specs) {
+            const filter = parseObjectFilter(spec) as never;
+            const walked = await setOf(listObjects(h.objects, { wants, haves, filter }));
+            const viaBitmap = await setOf(
+              listObjects(h.objects, { wants, haves, filter, bitmap: index }),
+            );
+            if (haves.length === 0)
+              expect(
+                [...viaBitmap]
+                  .filter((x) => !walked.has(x))
+                  .map(String)
+                  .concat([...walked].filter((x) => !viaBitmap.has(x)).map((x) => `-${x}`)),
+                `${seed} ${spec} ${wants.length}`,
+              ).toEqual([]);
+            else for (const id of viaBitmap) expect(walked.has(id), `${seed} ${spec}`).toBe(true);
+          }
+        }
+      }
+    }
+  });
+});
+
+async function setOfTyped(it: AsyncIterable<{ id: string; type: string; path?: string }>) {
+  const out: { id: string; type: string; path?: string }[] = [];
+  for await (const o of it) out.push(o);
+  return out;
+}

@@ -4,7 +4,7 @@
  */
 
 import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
-import { createIgnoreRule, trimTrailingSpaces } from "../ignore/index.js";
+import { createIgnoreRule, trimTrailingSpaces, wildmatch } from "../ignore/index.js";
 
 /**
  * The hashsets of a cone-mode pattern list (git's `recursive_hashmap` and `parent_hashmap`):
@@ -276,4 +276,48 @@ function filterConePattern(pattern: string): string {
     if (i < pattern.length) out += pattern[i];
   }
   return out.length > 2 && out.endsWith("/*") ? out.slice(0, -2) : out;
+}
+
+/**
+ * The matcher of a `sparse:oid=<blob>` partial clone filter: the blob's patterns
+ * (`add_patterns_from_blob_to_list`: a UTF-8 BOM skipped, read as a sparse-checkout file)
+ * matched gitignore-style, never in cone mode, as git's `path_matches_pattern_list` answers
+ * list-objects-filter.c's `filter_sparse`: true when the last matching pattern includes the
+ * path, false when it is negated, undefined when none matches (the directory's answer then
+ * applies).
+ *
+ * @example
+ * ```typescript
+ * const match = sparseFilterMatcher("/docs/\n!/docs/big/\n");
+ * match("docs", "docs", true); // true
+ * match("docs/big", "big", true); // false
+ * match("src/a.c", "a.c", false); // undefined
+ * ```
+ */
+export function sparseFilterMatcher(
+  text: string,
+): (pathname: string, basename: string, isDirectory: boolean) => boolean | undefined {
+  const lines = splitPatternLines(text.startsWith("\uFEFF") ? text.slice(1) : text);
+  const rules = lines.map((line) => {
+    const negated = line.startsWith("!");
+    const rule = createIgnoreRule(line);
+    // the root tree ("") is asked by its empty basename: only a pattern without a slash
+    // (git's NODIR) can match it
+    let body = negated ? line.slice(1) : line;
+    const mustBeDir = body.endsWith("/");
+    if (mustBeDir) body = body.slice(0, -1);
+    const root = !body.includes("/") && wildmatch(body, "");
+    return {
+      negated,
+      matches: (path: string, isDirectory: boolean) =>
+        path === "" ? root && isDirectory : rule.matchesPath?.(path, isDirectory) === true,
+    };
+  });
+  return (pathname, _basename, isDirectory) => {
+    for (let i = rules.length - 1; i >= 0; i--) {
+      const rule = rules[i] as (typeof rules)[number];
+      if (rule.matches(pathname, isDirectory)) return !rule.negated;
+    }
+    return undefined;
+  };
 }

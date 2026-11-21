@@ -14,6 +14,7 @@
 import type { ObjectId } from "../common/id/index.js";
 import type { ObjectQuarantine } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
+import type { ResolvedObjectFilter } from "../pack/object-filter/index.js";
 import type { PackEntryInfo } from "../pack/unpack-objects.js";
 
 /**
@@ -108,6 +109,12 @@ export interface ExportOptions extends PackOptions {
    * haves (its delta bases come from the revision walk's boundary).
    */
   useBitmaps?: boolean;
+  /**
+   * A partial clone filter (upload-pack's `filter`, `pack-objects --filter`), its
+   * `sparse:oid` patterns read (`resolveObjectFilter`): the objects it omits are not packed
+   * (see `ListObjectsOptions.filter`)
+   */
+  filter?: ResolvedObjectFilter;
 }
 
 /**

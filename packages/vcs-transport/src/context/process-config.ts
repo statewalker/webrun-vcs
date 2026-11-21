@@ -1,3 +1,4 @@
+import type { UploadPackFilterPolicy } from "../fsm/fetch/upload-pack-filter.js";
 import type { UploadPackConfig } from "../fsm/fetch/upload-pack-hooks.js";
 import type { ReceiveDenyAction, ReceivePackConfig } from "../fsm/push/receive-pack-types.js";
 
@@ -246,6 +247,11 @@ export class ProcessConfiguration {
    * to `serverCapabilities` as `object-info=size type` unless they name it already.
    */
   advertiseObjectInfo?: boolean;
+  /**
+   * upload-pack's partial clone filters (see `UploadPackFilterPolicy`): `filter` offered by
+   * the default capabilities with `allowFilter`, requests checked against the allow-list
+   */
+  uploadPackFilter?: UploadPackFilterPolicy;
 
   /**
    * Whether to include automatically annotated tags pointing to fetched objects.

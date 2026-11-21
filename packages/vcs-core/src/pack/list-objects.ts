@@ -27,6 +27,16 @@ import type { ObjectId } from "../common/id/index.js";
 import type { GitObject, GitObjects } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 import { listObjectsWithBitmap } from "./bitmap-walk.js";
+import {
+  canFilterBitmap,
+  type FilterSituation,
+  LOFR_DO_SHOW,
+  LOFR_MARK_SEEN,
+  LOFR_SKIP_TREE,
+  type ObjectFilterRun,
+  type ResolvedObjectFilter,
+  startObjectFilter,
+} from "./object-filter/index.js";
 import { ObjectIdFlags } from "./object-id-flags.js";
 import type { PackBitmapIndex } from "./pack-bitmap.js";
 
@@ -87,6 +97,15 @@ export interface ListObjectsOptions {
    * want is listed with none (name hash 0), as git names a ref's tree or blob "".
    */
   tipPaths?: ReadonlyMap<ObjectId, string>;
+  /**
+   * A partial clone filter (git's `rev-list --filter`, upload-pack's `filter`), its
+   * `sparse:oid` patterns read (`resolveObjectFilter`): the objects it omits are not listed.
+   * The wants, and what their tags peel to, are always listed (git's user-given objects).
+   * Through the bitmap only for the filters git's bitmaps apply (`canFilterBitmap`), else
+   * walked in git's order (trees entry by entry, depth first), which the order-dependent
+   * filters (`tree:<depth>`, `sparse:oid`, `combine:`) answer as git's do.
+   */
+  filter?: ResolvedObjectFilter;
 }
 
 /** One listed object, as `git rev-list --objects` prints it. */
@@ -109,6 +128,10 @@ const UNINTERESTING = 2;
 const ADDED = 4;
 /** a tree or blob below the boundary, already marked with everything below it */
 const BOUNDARY = 8;
+/** seen by the partial clone filter's walk (git's SEEN of trees, blobs and tags) */
+const FILTER_SEEN = 16;
+/** met through a tree or as a parent, not named by a want (git's NOT_USER_GIVEN) */
+const NOT_USER_GIVEN = 32;
 /** Commits walked after only uninteresting ones remain queued (git's SLOP). */
 const SLOP = 5;
 
@@ -143,6 +166,7 @@ export async function* listObjects(
     !options.shallow &&
     !options.grafts &&
     !options.onBoundary &&
+    (!options.filter || canFilterBitmap(options.filter)) &&
     (await haveInBitmappedPack(options.bitmap, objects, [
       ...(options.haves ?? []),
       ...(options.excludes ?? []),
@@ -257,6 +281,8 @@ export async function* listObjects(
   };
 
   const tags: ObjectId[] = [];
+  /** commits the wants name (directly or through tags): git's user-given commits */
+  const givenCommits = new Set<ObjectId>();
   /** wanted tags, trees and blobs in the order met (git's revs->pending after handle_commit) */
   const pending: { id: ObjectId; type: "tag" | "tree" | "blob" }[] = [];
   const boundaryTrees: ObjectId[] = [];
@@ -269,6 +295,7 @@ export async function* listObjects(
       const known = commits.get(id) ?? (uninteresting ? await fromHeader(id) : undefined);
       if (known) {
         if (uninteresting) set(id, UNINTERESTING);
+        else givenCommits.add(id);
         commits.set(id, known);
         await enqueue(id, uninteresting);
         return;
@@ -288,6 +315,7 @@ export async function* listObjects(
         }
         case "commit":
           commits.set(id, commits.get(id) ?? parseCommitHeader(id, o.data));
+          if (!uninteresting) givenCommits.add(id);
           await enqueue(id, uninteresting);
           return;
         case "tree":
@@ -366,57 +394,153 @@ export async function* listObjects(
   }
 
   // ---- output ----
-  for (const id of kept) {
-    set(id, ADDED);
-    yield { id, type: "commit" };
+  if (options.filter) {
+    yield* filteredOutput(options.filter);
+  } else {
+    yield* plainOutput();
   }
 
-  async function* walkTree(root: ObjectId, rootPath: string): AsyncGenerator<ListedObject> {
-    const stack: { id: ObjectId; path: string }[] = [{ id: root, path: rootPath }];
-    while (stack.length) {
-      const { id, path } = stack.pop() as { id: ObjectId; path: string };
-      if (has(id, UNINTERESTING | ADDED)) continue;
-      set(id, ADDED);
+  /** git's traverse_commit_list_filtered: commits, then the pending objects, trees in order */
+  async function* filteredOutput(filter: ResolvedObjectFilter): AsyncGenerator<ListedObject> {
+    const run: ObjectFilterRun = startObjectFilter(filter, {
+      objectSize: async (id) => {
+        const o = await objects.get(id);
+        if (!o) return undefined;
+        await o.content[Symbol.asyncIterator]().return?.();
+        return o.size;
+      },
+    });
+    const ask = async (
+      situation: FilterSituation,
+      id: ObjectId,
+      pathname: string,
+      filename: string,
+    ): Promise<number> => {
+      const r = run.filter(situation, id, has(id, NOT_USER_GIVEN), pathname, filename);
+      return r instanceof Promise ? await r : r;
+    };
+    for (const id of kept) {
+      // parents met by the walk are not user given; the wants' commits are
+      if (!givenCommits.has(id)) set(id, NOT_USER_GIVEN);
+      const r = await ask("commit", id, "", "");
+      if (r & LOFR_DO_SHOW) {
+        set(id, ADDED);
+        yield { id, type: "commit" };
+      }
+    }
+    // do_traverse marks every listed commit's root tree before any pending object is walked
+    for (const id of kept) set((commits.get(id) as CommitInfo).tree, NOT_USER_GIVEN);
+
+    async function* processBlob(id: ObjectId, base: string, name: string) {
+      if (has(id, UNINTERESTING | FILTER_SEEN)) return;
+      const path = base + name;
+      const r = await ask("blob", id, path, name);
+      if (r & LOFR_MARK_SEEN) set(id, FILTER_SEEN);
+      if (r & LOFR_DO_SHOW && !has(id, ADDED)) {
+        set(id, ADDED);
+        yield { id, type: "blob" as const, path };
+      }
+    }
+    async function* processTree(
+      id: ObjectId,
+      base: string,
+      name: string,
+    ): AsyncGenerator<ListedObject> {
+      if (has(id, UNINTERESTING | FILTER_SEEN)) return;
       const o = await read(id);
       if (o.type !== "tree") throw new Error(`object ${id} is a ${o.type}, not a tree`);
-      yield { id, type: "tree", path };
-      const subtrees: { id: ObjectId; path: string }[] = [];
-      const data = o.data;
-      // entries already listed or excluded are skipped before their names are decoded
-      for (let at = 0; at < data.length; ) {
-        const e = scanTreeEntry(data, at);
-        at = e.next;
-        if (e.kind === GITLINK) continue;
-        if (flags.getAt(data, e.nul + 1) & (UNINTERESTING | ADDED)) continue;
-        const eid = bytesToHex(data.subarray(e.nul + 1, e.nul + 21));
-        const name = decodeGitPath(data.subarray(e.nameStart, e.nul));
-        const p = path ? `${path}/${name}` : name;
-        if (e.kind === TREE) subtrees.push({ id: eid, path: p });
-        else {
-          flags.addAt(data, e.nul + 1, ADDED);
-          yield { id: eid, type: "blob", path: p };
+      const path = base + name;
+      let r = await ask("begin-tree", id, path, name);
+      if (r & LOFR_MARK_SEEN) set(id, FILTER_SEEN);
+      if (r & LOFR_DO_SHOW && !has(id, ADDED)) {
+        set(id, ADDED);
+        yield { id, type: "tree", path };
+      }
+      const childBase = path ? `${path}/` : "";
+      if (!(r & LOFR_SKIP_TREE)) {
+        const data = o.data;
+        for (let at = 0; at < data.length; ) {
+          const e = scanTreeEntry(data, at);
+          at = e.next;
+          if (e.kind === GITLINK) continue;
+          const eid = bytesToHex(data.subarray(e.nul + 1, e.nul + 21));
+          const entryName = decodeGitPath(data.subarray(e.nameStart, e.nul));
+          set(eid, NOT_USER_GIVEN);
+          if (e.kind === TREE) yield* processTree(eid, childBase, entryName);
+          else yield* processBlob(eid, childBase, entryName);
         }
       }
-      // depth first, in tree order
-      for (let i = subtrees.length - 1; i >= 0; i--)
-        stack.push(subtrees[i] as (typeof subtrees)[0]);
+      r = await ask("end-tree", id, childBase, name);
+      if (r & LOFR_MARK_SEEN) set(id, FILTER_SEEN);
     }
+
+    const tipPaths = options.tipPaths;
+    for (const { id, type } of pending) {
+      if (has(id, UNINTERESTING | FILTER_SEEN)) continue;
+      if (type === "tag") {
+        // (a wanted tag is ADDED already: `start` met it)
+        const r = await ask("tag", id, "", "");
+        if (r & LOFR_MARK_SEEN) set(id, FILTER_SEEN);
+        if (r & LOFR_DO_SHOW) yield { id, type: "tag" };
+      } else if (type === "tree") yield* processTree(id, "", tipPaths?.get(id) ?? "");
+      else yield* processBlob(id, "", tipPaths?.get(id) ?? "");
+    }
+    for (const id of kept) yield* processTree((commits.get(id) as CommitInfo).tree, "", "");
   }
 
-  // the pending objects first (tags, tree and blob wants), then the commits' trees
-  const tipPaths = options.tipPaths;
-  for (const { id, type } of pending) {
-    if (type === "tag") {
-      if (!has(id, UNINTERESTING)) yield { id, type: "tag" };
-    } else if (type === "tree") yield* walkTree(id, tipPaths?.get(id) ?? "");
-    else {
-      if (has(id, UNINTERESTING | ADDED)) continue;
+  async function* plainOutput(): AsyncGenerator<ListedObject> {
+    for (const id of kept) {
       set(id, ADDED);
-      const path = tipPaths?.get(id);
-      yield path === undefined ? { id, type: "blob" } : { id, type: "blob", path };
+      yield { id, type: "commit" };
     }
+
+    async function* walkTree(root: ObjectId, rootPath: string): AsyncGenerator<ListedObject> {
+      const stack: { id: ObjectId; path: string }[] = [{ id: root, path: rootPath }];
+      while (stack.length) {
+        const { id, path } = stack.pop() as { id: ObjectId; path: string };
+        if (has(id, UNINTERESTING | ADDED)) continue;
+        set(id, ADDED);
+        const o = await read(id);
+        if (o.type !== "tree") throw new Error(`object ${id} is a ${o.type}, not a tree`);
+        yield { id, type: "tree", path };
+        const subtrees: { id: ObjectId; path: string }[] = [];
+        const data = o.data;
+        // entries already listed or excluded are skipped before their names are decoded
+        for (let at = 0; at < data.length; ) {
+          const e = scanTreeEntry(data, at);
+          at = e.next;
+          if (e.kind === GITLINK) continue;
+          if (flags.getAt(data, e.nul + 1) & (UNINTERESTING | ADDED)) continue;
+          const eid = bytesToHex(data.subarray(e.nul + 1, e.nul + 21));
+          const name = decodeGitPath(data.subarray(e.nameStart, e.nul));
+          const p = path ? `${path}/${name}` : name;
+          if (e.kind === TREE) subtrees.push({ id: eid, path: p });
+          else {
+            flags.addAt(data, e.nul + 1, ADDED);
+            yield { id: eid, type: "blob", path: p };
+          }
+        }
+        // depth first, in tree order
+        for (let i = subtrees.length - 1; i >= 0; i--)
+          stack.push(subtrees[i] as (typeof subtrees)[0]);
+      }
+    }
+
+    // the pending objects first (tags, tree and blob wants), then the commits' trees
+    const tipPaths = options.tipPaths;
+    for (const { id, type } of pending) {
+      if (type === "tag") {
+        if (!has(id, UNINTERESTING)) yield { id, type: "tag" };
+      } else if (type === "tree") yield* walkTree(id, tipPaths?.get(id) ?? "");
+      else {
+        if (has(id, UNINTERESTING | ADDED)) continue;
+        set(id, ADDED);
+        const path = tipPaths?.get(id);
+        yield path === undefined ? { id, type: "blob" } : { id, type: "blob", path };
+      }
+    }
+    for (const id of kept) yield* walkTree((commits.get(id) as CommitInfo).tree, "");
   }
-  for (const id of kept) yield* walkTree((commits.get(id) as CommitInfo).tree, "");
 
   // git's add_ref_tag / add_tag_chain: a tag peeling to a listed object comes with its chain.
   // Only tag objects are read: a listed object (ADDED) ends the chain without a read, an

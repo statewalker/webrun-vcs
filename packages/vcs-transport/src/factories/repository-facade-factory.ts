@@ -17,7 +17,10 @@ import {
   type History,
   type HistoryWithOperations,
   type ObjectQuarantine,
+  parseObjectFilter,
   type Ref,
+  resolveObjectFilter,
+  type SparseFilterMatcher,
   type SymbolicRef,
 } from "@statewalker/vcs-core";
 import type {
@@ -31,6 +34,7 @@ import type {
   TagTargetInfo,
   TreeEntryInfo,
 } from "../api/repository-facade.js";
+import { PackObjectsError } from "../fsm/fetch/pack-objects-error.js";
 import { computeShallowUpdate } from "../fsm/fetch/upload-pack-graph.js";
 import { lenientCommitHeader, lenientTagTarget, storedObjectType } from "../utils/index.js";
 
@@ -54,6 +58,13 @@ export interface HistoryFacadeConfig {
    * one (git's `pack.useBitmaps`, default true).
    */
   useBitmaps?: boolean;
+  /**
+   * Parses the patterns of a `sparse:oid=<blob-ish>` partial clone filter (the blob's text,
+   * gitignore-style, non-cone: git's `add_patterns_from_blob_to_list` and
+   * `path_matches_pattern_list`); vcs-working-tree's `sparseFilterMatcher`. Without it a
+   * `sparse:oid` filter fails the pack.
+   */
+  sparseFilterPatterns?: (text: string) => SparseFilterMatcher;
 }
 
 /**
@@ -76,7 +87,11 @@ export interface HistoryFacadeConfig {
  * ```
  */
 export function createRepositoryFacade(config: HistoryFacadeConfig): RepositoryFacade {
-  const facade = createRepositoryFacadeFromHistory(config.history, config.useBitmaps);
+  const facade = createRepositoryFacadeFromHistory(
+    config.history,
+    config.useBitmaps,
+    config.sparseFilterPatterns,
+  );
   const bare = config.bare ?? true;
   facade.isBare = () => bare;
   return facade;
@@ -117,6 +132,7 @@ export function repositoryQuarantine(
 function createRepositoryFacadeFromHistory(
   history: History | HistoryWithOperations,
   useBitmaps?: boolean,
+  sparseFilterPatterns?: (text: string) => SparseFilterMatcher,
 ): RepositoryFacade {
   const { commits, tags, refs } = history;
   const serialization =
@@ -141,6 +157,16 @@ function createRepositoryFacadeFromHistory(
     } catch {
       return undefined;
     }
+  };
+  /** git's filter_sparse_oid__init: the blob-ish resolved and its patterns parsed. */
+  const loadSparse = async (name: string): Promise<SparseFilterMatcher> => {
+    const id = await resolveBlobName(history, name);
+    if (id === undefined) throw new PackObjectsError(`unable to access sparse blob in '${name}'`);
+    const object = await facade.loadObject?.(id).catch(() => undefined);
+    if (object?.type !== "blob" || !sparseFilterPatterns) {
+      throw new PackObjectsError(`unable to parse sparse filter data in ${id}`);
+    }
+    return sparseFilterPatterns(new TextDecoder().decode(object.content));
   };
   const facade: RepositoryFacade = {
     // the alternates' refs, for receive-pack's `.have` lines
@@ -167,8 +193,13 @@ function createRepositoryFacadeFromHistory(
       exclude: Set<string>,
       options?: ExportPackOptions,
     ): AsyncIterable<Uint8Array> {
+      // the partial clone filter, its sparse:oid blob read (pack-objects dies on a bad one)
+      const filter = options?.filterSpec
+        ? await resolveObjectFilter(parseObjectFilter(options.filterSpec), loadSparse)
+        : undefined;
       // listObjects + writePack: streamed, stored entries reused, deltas searched
       yield* serialization.exportPack(wants, exclude, {
+        ...(filter ? { filter } : {}),
         thinPack: options?.thin,
         shallow: options?.shallow,
         ...(useBitmaps === false ? { useBitmaps } : {}),
@@ -380,4 +411,62 @@ const OBJECT_TYPE_NAMES: Record<number, GitObjectTypeName> = {
  */
 function isSymbolicRef(ref: Ref | SymbolicRef): ref is SymbolicRef {
   return "target" in ref;
+}
+
+/** The refs a short name may mean, in git's `ref_rev_parse_rules` order. */
+const REV_PARSE_RULES = [
+  "%s",
+  "refs/%s",
+  "refs/tags/%s",
+  "refs/heads/%s",
+  "refs/remotes/%s",
+  "refs/remotes/%s/HEAD",
+];
+
+/** A revision's object: a full id, or a ref by git's short-name rules. */
+async function resolveRevision(history: History, rev: string): Promise<string | undefined> {
+  if (/^[0-9a-f]{40}$/.test(rev)) return rev;
+  for (const rule of REV_PARSE_RULES) {
+    const ref = await history.refs.resolve(rule.replace("%s", rev)).catch(() => undefined);
+    if (ref && "objectId" in ref && ref.objectId) return ref.objectId;
+  }
+  return undefined;
+}
+
+/**
+ * The blob a `sparse:oid=` filter names, as git's `get_oid_with_context` reads the common
+ * forms: a full id, a ref (git's short-name rules), or `<rev>:<path>` (the revision peeled to
+ * its tree, the path looked up in it). Undefined when it names nothing.
+ */
+async function resolveBlobName(history: History, name: string): Promise<string | undefined> {
+  const colon = name.indexOf(":");
+  if (colon < 0) return resolveRevision(history, name);
+  const rev = name.slice(0, colon);
+  const path = name.slice(colon + 1);
+  // `:<path>` names an index entry, which a served repository does not read
+  if (rev === "") return undefined;
+  let id = await resolveRevision(history, rev);
+  // peel tags and commits down to the tree
+  for (let depth = 0; id !== undefined && depth < 64; depth++) {
+    const tag = await history.tags.load(id).catch(() => undefined);
+    if (tag) {
+      id = tag.object;
+      continue;
+    }
+    const commit = await history.commits.load(id).catch(() => undefined);
+    if (commit) id = commit.tree;
+    break;
+  }
+  if (id === undefined) return undefined;
+  for (const part of path.split("/").filter((p) => p.length > 0)) {
+    const tree = await history.trees.load(id).catch(() => undefined);
+    if (!tree) return undefined;
+    let next: string | undefined;
+    for await (const entry of tree) {
+      if (entry.name === part) next = entry.id;
+    }
+    if (next === undefined) return undefined;
+    id = next;
+  }
+  return id;
 }

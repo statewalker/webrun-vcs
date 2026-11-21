@@ -24,6 +24,7 @@ import { ZERO_OID } from "../../protocol/constants.js";
 import { visibleRefs } from "../../protocol/hidden-refs.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { sendPackStream } from "./send-pack-stream.js";
+import { checkUploadPackFilter, withFilterCapability } from "./upload-pack-filter.js";
 import {
   computeShallowUpdate,
   findUnreachableWant,
@@ -83,10 +84,8 @@ export const serverFetchTransitions: FsmTransition[] = [
   ["SEND_SHALLOW_UPDATE", "SHALLOW_SENT", "READ_HAVES"],
   ["SEND_SHALLOW_UPDATE", "ERROR", ""],
 
-  // Read filter specification (partial clone)
-  ["READ_WANTS", "WANTS_WITH_FILTER", "READ_FILTER"],
-  ["READ_FILTER", "FILTER_RECEIVED", "VALIDATE_WANTS"],
-  ["READ_FILTER", "ERROR", ""],
+  // A filter line came with the wants (partial clone): checked with them
+  ["READ_WANTS", "WANTS_WITH_FILTER", "VALIDATE_WANTS"],
 
   // Read a batch of haves (each answered as it is read, as git's get_common_commits)
   ["READ_HAVES", "DONE_RECEIVED", "SEND_FINAL_ACK"], // client sent done
@@ -178,8 +177,8 @@ function uploadRequest(ctx: ProcessContext): UploadPackRequestParts {
 /**
  * What upload-pack (protocol v0/v1) advertises by default: only what it implements. The
  * `allow-*-sha1-in-want` capabilities follow the request policy; `deepen-since`, `deepen-not`
- * and `deepen-relative` need the commit graph (`getCommitInfo`); no `filter` (no partial
- * clone).
+ * and `deepen-relative` need the commit graph (`getCommitInfo`); `filter` is added by the
+ * advertisement with `uploadpack.allowFilter` (`withFilterCapability`).
  */
 export function defaultUploadPackCapabilities(
   policy: string | undefined,
@@ -239,9 +238,12 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         const repositoryShallow = await prepareServedShallow(ctx);
         const repository = getRepository(ctx);
         const refs = await refStore.listAll();
-        const capabilities =
+        // `filter` with uploadpack.allowFilter, after the others (git puts it near the end)
+        const capabilities = withFilterCapability(
           config.serverCapabilities ??
-          defaultUploadPackCapabilities(config.requestPolicy, repository);
+            defaultUploadPackCapabilities(config.requestPolicy, repository),
+          config.uploadPackFilter,
+        );
 
         let first = true;
         // hidden refs are neither advertised nor "ours" under the ADVERTISED policy
@@ -358,8 +360,10 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           } else if (line === "deepen-relative") {
             state.deepenRelative = true;
           } else if (line.startsWith("filter ")) {
+            // git dies at a second one (list_objects_filter_die_if_populated)
+            if (hasFilter) state.filterRepeated = true;
             hasFilter = true;
-            state.filterSpec = line.slice(7);
+            state.filterSpec = state.filterSpec ?? line.slice(7);
           }
         }
       } catch (e) {
@@ -380,6 +384,19 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const refStore = getRefStore(ctx);
 
       try {
+        // receive_needs: a filter needs the negotiated capability, one spec, a parsable and
+        // allowed one; git dies on each (an allow-list refusal sent as ERR first)
+        if (state.filterSpec !== undefined) {
+          const refused = !state.capabilities.has("filter")
+            ? { message: "git upload-pack: filtering capability not negotiated", reported: false }
+            : state.filterRepeated
+              ? { message: "multiple filter-specs cannot be combined", reported: false }
+              : checkUploadPackFilter(state.filterSpec, config.uploadPackFilter);
+          if (refused) {
+            output.error = refused.message;
+            return refused.reported ? "INVALID_WANT" : "ERROR";
+          }
+        }
         const policy = config.requestPolicy ?? "ADVERTISED";
         // reachability counts hidden tips too, as git's allowReachableSHA1InWant
         const reachableFrom = config.hiddenRefs?.length
@@ -461,39 +478,6 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         await transport.writeLine(`ERR ${output.error}`);
         output.errorReported = true;
         return "ERROR_SENT";
-      } catch (e) {
-        output.error = String(e);
-        return "ERROR";
-      }
-    },
-  ],
-
-  // Read filter specification
-  [
-    "READ_FILTER",
-    async (ctx) => {
-      const transport = getTransport(ctx);
-      const state = getState(ctx);
-      const output = getOutput(ctx);
-
-      try {
-        while (true) {
-          const pkt = await transport.readPktLine();
-          if (pkt.type === "flush") return "FILTER_RECEIVED";
-          if (pkt.type === "eof") {
-            output.error = "Unexpected end of input";
-            return "ERROR";
-          }
-          if (pkt.type === "delim") {
-            continue; // Unexpected delimiter in filter section
-          }
-
-          // Type narrowing: pkt.type === "data" guaranteed here
-          const line = pkt.text;
-          if (line.startsWith("filter ")) {
-            state.filterSpec = line.slice(7);
-          }
-        }
       } catch (e) {
         output.error = String(e);
         return "ERROR";

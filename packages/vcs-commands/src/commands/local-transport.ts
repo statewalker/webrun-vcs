@@ -26,7 +26,12 @@ import {
 } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
-import type { LinkedWorktrees, OpenedRepository, WorkingCopy } from "@statewalker/vcs-working-tree";
+import {
+  type LinkedWorktrees,
+  type OpenedRepository,
+  sparseFilterMatcher,
+  type WorkingCopy,
+} from "@statewalker/vcs-working-tree";
 import { GitApiError, TransportError } from "../errors/index.js";
 import { quoteCStyleBody } from "../results/index.js";
 import {
@@ -143,6 +148,7 @@ export async function withLocalUploadPack<T>(
     repository: createRepositoryFacade({
       history: remote.history,
       useBitmaps: servedUseBitmaps(remote),
+      sparseFilterPatterns: sparseFilterMatcher,
     }),
     refStore: createTransportRefStore(remote.history.refs),
     service: "git-upload-pack",
@@ -151,6 +157,8 @@ export async function withLocalUploadPack<T>(
     ...(options.protocolVersion === 1 ? { announceVersion1: true } : {}),
     // uploadpack.hideRefs and transfer.hideRefs, in the order git reads them
     uploadPackHideRefs: settings.uploadPackHideRefs,
+    // uploadpack.allowFilter and uploadpackfilter.*
+    ...(settings.uploadPackFilter ? { uploadPackFilter: settings.uploadPackFilter } : {}),
     ...(head && "target" in head ? { currentBranch: head.target } : {}),
   }).finally(() => server.close?.());
   try {
@@ -424,6 +432,7 @@ async function receiveOver<T>(
     repository: createRepositoryFacade({
       history: remote.history,
       useBitmaps: servedUseBitmaps(remote),
+      sparseFilterPatterns: sparseFilterMatcher,
     }),
     refStore: createTransportRefStore(remote.history.refs),
     service: "git-receive-pack",

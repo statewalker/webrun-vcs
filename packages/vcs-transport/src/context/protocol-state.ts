@@ -171,6 +171,9 @@ export class ProtocolState {
    */
   filterSpec?: string;
 
+  /** A second `filter` line came (git dies: "multiple filter-specs cannot be combined") */
+  filterRepeated?: boolean;
+
   /**
    * Count of empty negotiation rounds.
    * Used to detect and prevent infinite cycles.
@@ -318,6 +321,7 @@ export class ProtocolState {
     this.packShallow = undefined;
     this.extraWants = undefined;
     this.filterSpec = undefined;
+    this.filterRepeated = undefined;
     this.emptyBatchCount = undefined;
     this.ackedCommon = undefined;
     this.checkpoint = undefined;

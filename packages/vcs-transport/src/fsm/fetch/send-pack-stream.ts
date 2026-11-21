@@ -17,6 +17,7 @@
  */
 
 import type { TransportApi } from "../../api/transport-api.js";
+import { PACK_OBJECTS_ABORT, PackObjectsError } from "./pack-objects-error.js";
 
 /** The default keep-alive interval (git's `uploadpack.keepAlive` is 5 seconds). */
 export const DEFAULT_KEEP_ALIVE_MS = 5000;
@@ -155,6 +156,14 @@ export async function sendPackStream(
     // Not awaited: a read still pending (keep-alive path) settles first, then it closes.
     void Promise.resolve(it.return?.())?.catch(() => {});
     try {
+      if (error instanceof PackObjectsError) {
+        // create_pack_file: pack-objects' death on the progress band, then the abort
+        await transport.writeSideband(2, textEncoder.encode(`fatal: ${error.message}\n`));
+        // sent with its NUL, as git's sizeof(abort_msg)
+        await transport.writeSideband(3, textEncoder.encode(`${PACK_OBJECTS_ABORT}\0`));
+        await transport.writeFlush();
+        return { ok: false, error: `fatal: ${error.message}`, inBand: true };
+      }
       await transport.writeSideband(3, textEncoder.encode(`ERR ${error}`));
       await transport.writeFlush();
       return { ok: false, error: String(error), inBand: true };

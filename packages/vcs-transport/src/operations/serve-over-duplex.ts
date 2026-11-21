@@ -15,6 +15,7 @@ import type { ProcessContext, RefStore } from "../context/process-context.js";
 import { ProtocolState } from "../context/protocol-state.js";
 import { createTransportApi } from "../factories/transport-api-factory.js";
 import { serverFetchHandlers, serverFetchTransitions } from "../fsm/fetch/server-fetch-fsm.js";
+import type { UploadPackFilterPolicy } from "../fsm/fetch/upload-pack-filter.js";
 import type { UploadPackHooks } from "../fsm/fetch/upload-pack-hooks.js";
 import { Fsm } from "../fsm/fsm.js";
 import { serverV2Handlers, serverV2Transitions } from "../fsm/protocol-v2/server-v2-fsm.js";
@@ -140,6 +141,13 @@ export interface ServeOverDuplexOptions {
    */
   advertiseObjectInfo?: boolean;
   /**
+   * upload-pack's partial clone filters (git's `uploadpack.allowFilter` and
+   * `uploadpackfilter.*`; see `UploadPackFilterPolicy`): with `allowFilter` the default
+   * capabilities offer `filter` (v0) and `fetch=... filter` (v2), and each request is checked
+   * against the allow-list. Default: none advertised, as git.
+   */
+  uploadPackFilter?: UploadPackFilterPolicy;
+  /**
    * Git wire protocol version to serve. Version negotiation is out-of-band in
    * git (the `GIT_PROTOCOL` env / `Git-Protocol: version=2` header), never in
    * the pkt-line stream — so the version is handed to the server as an option.
@@ -229,6 +237,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
     serverCapabilities: options.capabilities,
     requestPolicy: options.requestPolicy,
     advertiseObjectInfo: options.advertiseObjectInfo,
+    ...(options.uploadPackFilter ? { uploadPackFilter: options.uploadPackFilter } : {}),
     hiddenRefs: [
       ...(options.hideRefs ?? []),
       ...((service === "git-receive-pack"

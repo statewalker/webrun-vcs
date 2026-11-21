@@ -167,6 +167,7 @@ export class DefaultSerializationApi implements SerializationApi {
       haves: haveList,
       ...(shallow && shallow.length > 0 ? { shallow } : {}),
       includeTags: options.includeTags,
+      ...(options.filter ? { filter: options.filter } : {}),
       onBoundary: options.thinPack && !bitmap ? (b) => boundary.push(b) : undefined,
     })) {
       listed.push(o);

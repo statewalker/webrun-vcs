@@ -1,0 +1,13 @@
+---
+"@statewalker/vcs-core": minor
+"@statewalker/vcs-transport": minor
+"@statewalker/vcs-working-tree": minor
+"@statewalker/vcs-commands": minor
+---
+
+**upload-pack serves partial clone filters as git does.**
+
+- **vcs-core:** `parseObjectFilter` parses `--filter` specs as git's list-objects-filter-options.c (`blob:none`, `blob:limit=<n>[kmg]`, `tree:<depth>`, `sparse:oid=<blob-ish>`, `object:type=<type>`, percent-encoded `combine:`), refusing with git's messages (`ObjectFilterError`; 2.43's where they differ). `listObjects({ filter })` and `ExportOptions.filter` omit what the filter omits: through the bitmap for the filters git's bitmaps apply (`canFilterBitmap`: blob:none, blob:limit, tree:0, object:type, combine of those; `bitmapWalk({ objectFilter })`), else in a walk in git's order whose filters (`startObjectFilter`) answer as list-objects-filter.c's, the order-dependent `tree:<depth>`, `sparse:oid` and `combine:` included; the wants and what their tags peel to are always sent.
+- **vcs-transport:** `uploadpack.allowFilter` advertises `filter` (v0) and `fetch=... filter` (v2); `uploadpackfilter.allow`, `uploadpackfilter.<choice>.allow` and `uploadpackfilter.tree.maxDepth` refuse with git's `ERR` lines (`UploadPackFilterPolicy`, read by `explicitServerSettingsFromConfig`, `serveOverDuplex({ uploadPackFilter })`, the smart-HTTP servers). The facade resolves `sparse:oid` names (an id, a ref, `<rev>:<path>`) and fails the pack as pack-objects dies (`PackObjectsError`). The fetch client asks for the `filter` capability in v0 and, from a server that takes none, drops the filter with git's warning (`onWarning`) and checks the fetch as a full one. The v0 server no longer reads past the wants' flush for a filter.
+- **vcs-working-tree:** `sparseFilterMatcher` matches a `sparse:oid` blob's patterns as git's `path_matches_pattern_list` (non-cone).
+- **vcs-commands:** served repositories (`servedRepositoryOf`, the local transport) apply their filter configuration and parse `sparse:oid` patterns.

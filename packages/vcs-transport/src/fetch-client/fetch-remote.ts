@@ -31,6 +31,7 @@ import {
   fetchPack,
   type NegotiationStats,
   type ServerShallowUpdate,
+  serverSupportsFilter,
 } from "./fetch-pack.js";
 import type { NegotiatorSource } from "./negotiator.js";
 import {
@@ -116,8 +117,15 @@ export interface FetchClientOptions {
   deepenNot?: string[];
   /** `--unshallow`: fetch the whole history of a shallow repository */
   unshallow?: boolean;
-  /** Partial clone filter (`blob:none`) */
+  /**
+   * Partial clone filter (`blob:none`). A server that does not take filters gets none
+   * (`onWarning` hears git's "filtering not recognized by server, ignoring") and the fetch is
+   * checked as a full one. The objects it omits are not recorded as promised (no promisor
+   * pack or remote config yet): only the fetched tips are checked to be present.
+   */
   filter?: string;
+  /** Warnings fetch-pack prints (`warning: ...`) */
+  onWarning?: (line: string) => void;
   /** Allow every update to be a non-fast-forward (`--force`) */
   force?: boolean;
   /** Write all ref updates in one transaction, or none (`--atomic`) */
@@ -401,7 +409,10 @@ export async function fetchFromConnection(
   let serverShallow: ServerShallowInfo | undefined;
   // index-pack's links check: with fsck (`--strict`), or for a clone without --depth
   // (`--check-self-contained-and-connected`); never for a partial clone's packs
-  const strictLinks = !options.filter && (!!options.fsckObjects || options.cloning === true);
+  // the filter the server takes (fetch-pack drops one it does not, with a warning): its
+  // objects are promised, so the checks below cannot walk them
+  const filter = options.filter && serverSupportsFilter(connection) ? options.filter : undefined;
+  const strictLinks = !filter && (!!options.fsckObjects || options.cloning === true);
   /** Packs that named nothing outside themselves (a clone's check skips the tips they hold) */
   const selfContained: ReceivedObjects[] = [];
   /** The tips fetch-pack's own check of a deepening fetch covered */
@@ -441,6 +452,7 @@ export async function fetchFromConnection(
       knownCommon,
       shallow,
       filter: options.filter,
+      ...(options.onWarning ? { onWarning: options.onWarning } : {}),
       includeTag: autoTags,
       onProgress: options.onProgress,
       importPack: options.dryRun
@@ -746,7 +758,7 @@ export async function fetchFromConnection(
       tips.push(p.oid);
     }
     let lines: string[] | undefined;
-    if (options.filter) {
+    if (filter) {
       // a partial clone's objects are promised: git checks the tips came (check_connected_promisor)
       for (const tip of tips) {
         if (!(await repository.has(tip))) {
