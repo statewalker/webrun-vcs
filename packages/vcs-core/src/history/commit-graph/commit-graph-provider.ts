@@ -3,7 +3,8 @@
  * `prepare_commit_graph`: not at all when `core.commitGraph` is false, nor when the graph
  * cannot describe the history git would walk (`commit_graph_compatible`): replace refs (with
  * `core.useReplaceRefs`), grafts in `info/grafts` (or the file `GIT_GRAFT_FILE` names), or a
- * shallow repository (a `shallow` file).
+ * shallow repository (a `shallow` file). The graph is the first one found among the object
+ * directories in git's order: the repository's own, then its alternates' (`odb->sources`).
  */
 
 import type { FilesApi } from "@statewalker/vcs-utils/files";
@@ -160,6 +161,12 @@ export async function commitGraphCompatible(repo: CommitGraphRepository): Promis
 export interface LoadRepositoryCommitGraphOptions extends CommitGraphRepository {
   /** The object directory (default `<gitDir>/objects`) */
   objectsDir?: string;
+  /**
+   * The alternates' object directories in `files`, in git's order: where the repository's own
+   * objects directory has no graph, the first of them that has one is used (git's
+   * prepare_commit_graph walks every odb source and keeps the first graph it reads)
+   */
+  alternateObjectDirs?: () => Promise<readonly string[]>;
   /** The settings (default: git's) */
   settings?: Partial<CommitGraphSettings>;
   /** Receives the messages git prints while loading */
@@ -186,7 +193,18 @@ export async function loadRepositoryCommitGraph(
     return undefined;
   }
   const objectsDir = options.objectsDir ?? joinPath(options.gitDir, "objects");
-  const read = await readCommitGraph(options.files, objectsDir, settings);
+  const alternates = options.alternateObjectDirs ? await options.alternateObjectDirs() : [];
+  // every source's layers are looked up in all of them, the repository's own first
+  const objectDirs = [objectsDir, ...alternates];
+  const read = await readCommitGraph(options.files, objectsDir, settings, objectDirs);
   for (const d of read.diagnostics) options.onDiagnostic?.(d);
-  return read.graph;
+  if (read.graph) return read.graph;
+  // the alternates' graphs, in order: the first that loads is the one used (it describes the
+  // borrowed history; the repository's own commits are parsed from their objects)
+  for (const dir of alternates) {
+    const alt = await readCommitGraph(options.files, dir, settings, objectDirs);
+    for (const d of alt.diagnostics) options.onDiagnostic?.(d);
+    if (alt.graph) return alt.graph;
+  }
+  return undefined;
 }

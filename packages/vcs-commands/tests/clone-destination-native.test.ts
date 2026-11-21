@@ -38,9 +38,15 @@ function state(dir: string) {
 }
 
 /** Our clone's failure, or undefined. */
-async function ourClone(dir: string, url: string): Promise<GitApiError | undefined> {
+async function ourClone(
+  dir: string,
+  url: string,
+  local?: boolean,
+): Promise<GitApiError | undefined> {
   try {
-    await (await ours(dir)).clone().setURI(url).call();
+    const clone = (await ours(dir)).clone().setURI(url);
+    if (local !== undefined) clone.setLocal(local);
+    await clone.call();
   } catch (e) {
     return e as GitApiError;
   }
@@ -254,7 +260,7 @@ describeGit("clone into a destination that is not empty, as native git", () => {
     expect(native.status).toBe(128);
     mkdirSync(join(root, o));
     git(join(root, o), "init", "-q", "-b", "main");
-    const error = await ourClone(o, "../bad");
+    const error = await ourClone(o, "../bad", false);
     // git's lines but pack-objects' own (its reading errors, forwarded as "remote: ...")
     const lines = native.stderr
       .split("\n")

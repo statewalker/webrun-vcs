@@ -127,6 +127,37 @@ describe("a files store with alternates", () => {
     // copied into a pack of its own
     expect(await repo.packs.has(alt.id)).toBe(true);
   });
+
+  it("every later add() and refresh() invalidates the commit-graph, not only the first link", async () => {
+    const files = createInMemoryFilesApi();
+    await repoWithBlob(files, "/a1", "one\n");
+    await repoWithBlob(files, "/a2", "two\n");
+    const repo = await createGitFilesBackend({ files, gitDir: "/repo/.git", create: true });
+    const provider = repo.history.commitGraph;
+    if (!provider) throw new Error("no commit-graph provider");
+    let invalidated = 0;
+    const invalidate = provider.invalidate.bind(provider);
+    provider.invalidate = () => {
+      invalidated++;
+      invalidate();
+    };
+    const alternates = repo.objects.alternates;
+    if (!alternates?.onChange) throw new Error("no persistent change listener");
+    let seen = 0;
+    const stop = alternates.onChange(() => seen++);
+    await alternates.add("/a1/.git/objects");
+    expect(invalidated).toBe(1);
+    // a second alternate (a later --reference, a refresh after another process wrote one)
+    await alternates.add("/a2/.git/objects");
+    expect(invalidated).toBe(2);
+    await alternates.refresh();
+    expect(invalidated).toBe(3);
+    expect(seen).toBe(3);
+    stop();
+    await alternates.refresh();
+    expect(seen).toBe(3);
+    expect(invalidated).toBe(4);
+  });
 });
 
 describe("gc, repack and prune over alternates that cannot be read", () => {

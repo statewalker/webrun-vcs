@@ -235,6 +235,8 @@ export async function createGitFilesBackend(
       await repack({ history, objects, packs, looseStorage, files, gitDir, all: true });
       await files.remove(file);
       await alternates.refresh();
+      // a graph read from an alternate is gone with it
+      commitGraph.invalidate();
     };
   }
   const loose = createGitObjects(skipPacked(staging, packs, alternates));
@@ -271,8 +273,15 @@ export async function createGitFilesBackend(
     refs: refStore,
     environment: options.environment,
     ...(options.configIncludes === undefined ? {} : { configIncludes: options.configIncludes }),
+    // git's prepare_commit_graph: the alternates' graphs after the repository's own
+    ...(alternates
+      ? { alternateObjectDirs: async () => (await alternates.list()).map((a) => a.objectsDir) }
+      : {}),
   });
   invalidateOnCompatibilityChange(refStore, commitGraph);
+  // an alternate linked later (clone --shared, --reference, each one added or re-read) may
+  // bring a graph or the layers a chain builds on
+  alternates?.onChange(() => commitGraph.invalidate());
   const history = createHistoryFromComponents({
     objects,
     refs: refStore,

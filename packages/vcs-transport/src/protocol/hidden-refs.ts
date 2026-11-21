@@ -57,3 +57,20 @@ export function visibleRefs<T extends readonly [string, ...unknown[]]>(
   for (const ref of refs) if (!isRefHidden(ref[0], patterns)) out.push(ref);
   return out;
 }
+
+/**
+ * The refs receive-pack advertises (git's `write_head_info`): those under `refs/` that
+ * `patterns` do not hide, in their order. receive-pack walks `refs_for_each_ref`, so HEAD and
+ * the other root refs (ORIG_HEAD, FETCH_HEAD, ...) are never advertised to a pusher, unlike
+ * upload-pack's HEAD.
+ */
+export function receivePackRefs<T extends readonly [string, ...unknown[]]>(
+  refs: Iterable<T>,
+  patterns: readonly string[] | undefined,
+): T[] {
+  const out: T[] = [];
+  for (const ref of refs) {
+    if (ref[0].startsWith("refs/") && !isRefHidden(ref[0], patterns)) out.push(ref);
+  }
+  return out;
+}

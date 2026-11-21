@@ -463,7 +463,19 @@ export class FsckCommand extends GitCommand<FsckResult> {
           (configBool(this.workingCopy, "commitGraph.readChangedPaths", true) ? -1 : 0),
       },
     });
-    return run.run();
+    const result = await run.run();
+    // git prints the alternates' error lines when it first reads an object: first on stderr
+    // (once here; git repeats them in its child processes)
+    const alternates = this.alternatesErrors();
+    if (alternates.length === 0) return result;
+    return {
+      ...result,
+      findings: [
+        ...alternates.map((text): FsckFinding => ({ kind: "error", stream: "stderr", text })),
+        ...result.findings,
+      ],
+      errorOutput: `${alternates.map((l) => `${l}\n`).join("")}${result.errorOutput}`,
+    };
   }
 }
 
@@ -722,15 +734,16 @@ class FsckRun {
   }
 
   /**
-   * git's fsck runs `git commit-graph verify --object-dir <objects>` when `core.commitGraph`
-   * is on: its stderr follows, and a failure sets ERROR_COMMIT_GRAPH.
+   * git's fsck runs `git commit-graph verify --object-dir <objects>` for every object
+   * directory (the repository's, then each alternate's) when `core.commitGraph` is on: their
+   * stderr follows, and a failure sets ERROR_COMMIT_GRAPH.
    */
   private async verifyCommitGraph(): Promise<void> {
     const settings = this.o.commitGraph;
     if (!this.files || !settings.enabled) return;
-    const objectsDir = `${this.gitDir}/objects`;
     // fsck itself loads the graph when it parses the commit of a ref (parse_object looks it
-    // up there first; fsck disables replace refs): what loading prints comes once from fsck
+    // up there first; fsck disables replace refs): what loading prints comes once from fsck,
+    // for each directory read until one has a graph (prepare_commit_graph)
     if (
       (await this.hasRefs()) &&
       (await commitGraphCompatible({
@@ -740,11 +753,21 @@ class FsckRun {
         readGraftFile: () => this.graftFileText(),
       }))
     ) {
-      const read = await readCommitGraph(this.files, objectsDir, settings);
-      for (const d of read.diagnostics) {
-        this.emit({ kind: "commit-graph", stream: "stderr", text: `${d.level}: ${d.message}` });
+      for (const dir of this.sourceDirs()) {
+        const read = await readCommitGraph(this.files, dir, settings, this.sourceDirs());
+        for (const d of read.diagnostics) {
+          this.emit({ kind: "commit-graph", stream: "stderr", text: `${d.level}: ${d.message}` });
+        }
+        if (read.graph) break;
       }
     }
+    for (const dir of this.sourceDirs()) await this.verifySourceCommitGraph(dir);
+  }
+
+  /** One `git commit-graph verify --object-dir <objectsDir>` child of fsck. */
+  private async verifySourceCommitGraph(objectsDir: string): Promise<void> {
+    const settings = this.o.commitGraph;
+    if (!this.files) return;
     // git's `git commit-graph verify` reads each commit (in the graph's order) from the first
     // pack of its most-recently-used list that has it: a commit in several packs is read from
     // the one the commit before it came from, when that one has it too
@@ -791,6 +814,8 @@ class FsckRun {
       },
       {
         settings,
+        // the child's layers come from every object directory of the repository
+        objectDirs: this.sourceDirs(),
         ...(this.grafts
           ? {
               ungraphedParents: (id: string) => graftsRead && this.graftedParents(id) !== undefined,
@@ -921,7 +946,12 @@ class FsckRun {
       ) {
         return undefined;
       }
-      return (await readCommitGraph(this.files, `${this.gitDir}/objects`, settings)).graph;
+      // the first graph among the object directories (prepare_commit_graph)
+      for (const dir of this.sourceDirs()) {
+        const graph = (await readCommitGraph(this.files, dir, settings, this.sourceDirs())).graph;
+        if (graph) return graph;
+      }
+      return undefined;
     } catch {
       return undefined;
     }

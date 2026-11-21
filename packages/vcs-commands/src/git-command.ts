@@ -737,6 +737,27 @@ export abstract class GitCommand<T> {
     return [...loaded.replaceMessages, ...advice, ...loaded.graftMessages];
   }
 
+  /**
+   * The error lines git prints on stderr when it prepares the object database and reads the
+   * repository's alternates (odb.c: `error: object directory <path> does not exist; check
+   * .git/objects/info/alternates`, `error: unable to normalize alternate object path: <path>`,
+   * `error: <path>: ignoring alternate object stores, nesting too deep`), in git's order; empty
+   * when the alternates read cleanly. git prints them once per process, when it first looks up
+   * an object (status, log, diff, fsck, gc, fetch, push, commit all do), so a caller printing a
+   * command's stderr prints these once, first. Where git runs child git processes it repeats
+   * them per child (gc's repack and prune, 2.5x fsck's `refs verify` and index-pack checks,
+   * commit), and 2.43's `rev-parse HEAD` reads no object and prints none: ours are read with
+   * the repository, once.
+   *
+   * This is the channel for these lines: commands whose results have no stderr of their own
+   * (status, log, diff, commit, fetch, push, clone, ...) leave them here for the caller to print
+   * first. Where a result carries git's stderr they are folded in as well, first and once:
+   * `FsckResult.errorOutput`/`findings` and `GcResult.errors`.
+   */
+  alternatesErrors(): string[] {
+    return [...(this._workingCopy.history?.objects?.alternates?.errors ?? [])];
+  }
+
   /** Marks that this command read objects through the replacements (see replacementMessages). */
   protected markReplacementsRead(): void {
     this.replacementsRead = true;

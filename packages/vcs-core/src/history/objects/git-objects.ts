@@ -194,6 +194,12 @@ export interface ObjectAlternates {
   /** Reads the alternates again (after `objects/info/alternates` was changed elsewhere) */
   refresh(): Promise<void>;
   /**
+   * Calls `listener` after every later change of the list (each `add()`, `refresh()` and
+   * `dissociate()`), so caches of what the alternates hold (the commit-graph) can forget it;
+   * returns a function removing the listener. Present on the files backend.
+   */
+  onChange?(listener: () => void): () => void;
+  /**
    * The object ids of the alternates' refs (git's `odb_for_each_alternate_ref`: `for-each-ref
    * --format=%(objectname)` in each alternate that is a repository's `objects` directory with
    * a `refs` directory; `core.alternateRefsPrefixes` limits them), in that order, repeats kept:

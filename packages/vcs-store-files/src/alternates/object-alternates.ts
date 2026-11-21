@@ -119,6 +119,12 @@ export interface FilesObjectAlternates extends ObjectAlternates {
   get(id: string, options?: { verify?: boolean }): Promise<GitObject | undefined>;
   /** Calls `listener` once, when the first alternate is linked (by `add()` or `refresh()`) */
   whenLinked(listener: () => void): void;
+  /**
+   * Calls `listener` after every later change of the list: each `refresh()` and each `add()`
+   * (a cache of what the alternates hold, such as the commit-graph, forgets it then). Returns
+   * a function that removes the listener.
+   */
+  onChange(listener: () => void): () => void;
 }
 
 /**
@@ -228,6 +234,10 @@ export async function openObjectAlternates(
     return seenDirs;
   };
   let listeners: (() => void)[] = [];
+  const changeListeners = new Set<() => void>();
+  const changed = () => {
+    for (const listener of [...changeListeners]) listener();
+  };
   const linked = () => {
     if (sources.length === 0 || listeners.length === 0) return;
     const pending = listeners;
@@ -313,7 +323,10 @@ export async function openObjectAlternates(
     },
     current: () => sources,
     list: async () => sources,
-    refresh: load,
+    async refresh() {
+      await load();
+      changed();
+    },
     async add(path) {
       // odb_source_files_write_alternate: under `alternates.lock` (taken before the file is
       // read, as hold_lock_file_for_update), the line appended unless there, then renamed
@@ -347,10 +360,15 @@ export async function openObjectAlternates(
       const real = await resolve(path, await ownDir());
       if (real !== undefined) await link(sources, await seen(), real, 0);
       linked();
+      changed();
     },
     whenLinked(listener) {
       if (sources.length > 0) listener();
       else listeners.push(listener);
+    },
+    onChange(listener) {
+      changeListeners.add(listener);
+      return () => changeListeners.delete(listener);
     },
     async refs() {
       if (sources.length === 0) return [];

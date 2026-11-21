@@ -105,7 +105,7 @@ export async function readCommitGraphSettings(
 /**
  * The commit-graph provider of a files repository: loads the graph on first use, as git's
  * prepare_commit_graph (settings from the config, `commitGraphCompatible`, then
- * `objects/info/commit-graph` or the split chain).
+ * `objects/info/commit-graph` or the split chain, else the first alternate's).
  *
  * @example
  * ```typescript
@@ -121,6 +121,11 @@ export function createFilesCommitGraphProvider(options: {
   environment?: GitHostEnvironment;
   /** Which include directives of the repository's config are followed (git's: all) */
   configIncludes?: boolean | "files";
+  /**
+   * The alternates' object directories in `files` (git's order): the first graph among the
+   * repository's own objects directory and these is used
+   */
+  alternateObjectDirs?: () => Promise<readonly string[]>;
 }): CommitGraphProvider {
   const { files, refs, environment } = options;
   const gitDir = options.gitDir ?? ".git";
@@ -136,6 +141,7 @@ export function createFilesCommitGraphProvider(options: {
       refs,
       settings,
       ...(readGraftFile ? { readGraftFile } : {}),
+      ...(options.alternateObjectDirs ? { alternateObjectDirs: options.alternateObjectDirs } : {}),
     });
   });
 }

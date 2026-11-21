@@ -43,7 +43,7 @@ import {
 } from "../../context/context-adapters.js";
 import type { RefStore } from "../../context/process-context.js";
 import type { ProtocolState } from "../../context/protocol-state.js";
-import { isRefHidden, visibleRefs } from "../../protocol/hidden-refs.js";
+import { isRefHidden, receivePackRefs } from "../../protocol/hidden-refs.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { isAncestorOf, PushConnectivity } from "./connectivity.js";
@@ -174,8 +174,8 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         const capabilities = getConfig(ctx).serverCapabilities ?? RECEIVE_PACK_CAPABILITIES;
 
         let first = true;
-        // hidden refs are not advertised (git's receive.hideRefs)
-        const refsArray = visibleRefs(refs, getConfig(ctx).hiddenRefs);
+        // the refs under refs/ but the hidden ones (git's receive.hideRefs): never HEAD
+        const refsArray = receivePackRefs(refs, getConfig(ctx).hiddenRefs);
         // write_head_info: then the alternates' refs as `.have`, each object id once and none
         // an advertised ref names (the first line carries the capabilities, whichever it is)
         const seen = new Set(refsArray.map(([, oid]) => oid));
@@ -469,6 +469,12 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       startKeepAlive(ctx);
       try {
         const known = new Set(state.refs.values());
+        // git's check_connected walks `--not --exclude-hidden=receive --all`: HEAD too, which
+        // receive-pack does not advertise (a detached HEAD's history counts as present)
+        if (!isRefHidden("HEAD", getConfig(ctx).hiddenRefs)) {
+          const head = await getRefStore(ctx).get("HEAD");
+          if (head) known.add(head);
+        }
         const pending = () =>
           (state.pushCommands ?? []).filter(
             (c) => c.result === "NOT_ATTEMPTED" && c.type !== "DELETE",
