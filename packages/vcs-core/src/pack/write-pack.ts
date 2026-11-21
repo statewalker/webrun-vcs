@@ -24,6 +24,7 @@ import {
   encodeGitDelta,
   type GitDeltaIndex,
 } from "@statewalker/vcs-utils/diff";
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { CRC32 } from "@statewalker/vcs-utils/hash/crc32";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { hexToBytes } from "@statewalker/vcs-utils/hash/utils";
@@ -42,7 +43,15 @@ import type { PackedEntry, PackedEntryKind } from "./pack-file.js";
 export type PackObjectSource = Pick<GitObjects, "get">;
 
 /** An object to write: its id, or its id with what is known of it (as `listObjects` yields). */
-export type PackObjectRef = ObjectId | { id: ObjectId; type?: ObjectTypeString; path?: string };
+export type PackObjectRef =
+  | ObjectId
+  | {
+      id: ObjectId;
+      type?: ObjectTypeString;
+      path?: string;
+      /** The path's name hash, when known without the path (a bitmap's name-hash cache) */
+      nameHash?: number;
+    };
 
 /** A stored entry `writePack` may copy (a `PackSet` is one source of them). */
 export type ReusableEntry = Pick<PackedEntry, "kind" | "size" | "baseId" | "raw" | "data"> & {
@@ -188,7 +197,7 @@ export async function* writePack(
     const p: Planned = {
       id: r.id,
       type: r.type,
-      nameHash: nameHash(r.path),
+      nameHash: r.nameHash ?? packNameHash(r.path),
       depth: 0,
       have: false,
     };
@@ -200,7 +209,13 @@ export async function* writePack(
     for (const ref of options.haves ?? []) {
       const r = typeof ref === "string" ? { id: ref } : ref;
       if (byId.has(r.id) || haves.has(r.id)) continue;
-      haves.set(r.id, { id: r.id, type: r.type, nameHash: nameHash(r.path), depth: 0, have: true });
+      haves.set(r.id, {
+        id: r.id,
+        type: r.type,
+        nameHash: r.nameHash ?? packNameHash(r.path),
+        depth: 0,
+        have: true,
+      });
     }
   }
 
@@ -461,13 +476,31 @@ function limitReusedChains(order: Planned[], maxDepth: number) {
   }
 }
 
-/** git's pack_name_hash: the last characters of the path weigh most; spaces are skipped. */
-function nameHash(path: string | undefined): number {
+/**
+ * git's pack_name_hash (pack-objects.h): over the path's bytes, the last ones weigh most;
+ * git's isspace bytes (tab, LF, CR, space: not VT or FF) are skipped. A path that is not ASCII
+ * is hashed as its bytes (`encodeGitPath`: UTF-8, escaped bytes of a non-UTF-8 name back as
+ * they are stored), so the hash is the one git computes from the tree entry's name.
+ */
+export function packNameHash(path: string | undefined): number {
   if (!path) return 0;
   let h = 0;
   for (let i = 0; i < path.length; i++) {
-    const c = path.charCodeAt(i) & 0xff;
-    if (c === 0x20 || (c >= 0x09 && c <= 0x0d)) continue;
+    const c = path.charCodeAt(i);
+    if (c >= 0x80) return packNameHashBytes(encodeGitPath(path));
+    if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) continue;
+    h = ((h >>> 2) + (c << 24)) >>> 0;
+  }
+  return h;
+}
+
+/** git's pack_name_hash over raw name bytes (up to a NUL, as git's C string ends there). */
+export function packNameHashBytes(bytes: Uint8Array): number {
+  let h = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    const c = bytes[i] as number;
+    if (c === 0) break;
+    if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) continue;
     h = ((h >>> 2) + (c << 24)) >>> 0;
   }
   return h;

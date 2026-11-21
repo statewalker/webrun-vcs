@@ -6,11 +6,15 @@
  *    uninteresting, and so are its ancestors. The walk stops once every queued commit is
  *    uninteresting, plus a few more commits (git's SLOP) to absorb clock skew; a commit found
  *    uninteresting after it was listed is dropped before anything is yielded;
- *  - the trees of the uninteresting commits met on the way (the boundary) and of the haves are
- *    marked uninteresting with everything below them, so a tree or blob the receiver has through
- *    its own commits is not listed again;
- *  - commits are yielded first, then wanted tags, then the trees and blobs of each listed commit
- *    (with their path, for the delta search's name hash);
+ *  - the trees of the uninteresting parents of listed commits (the edges, git's
+ *    mark_edges_uninteresting) and the tree haves are marked uninteresting with everything below
+ *    them, so a tree or blob the receiver has through those commits is not listed again; the
+ *    trees of other uninteresting commits are not (a have no listed commit stands on marks
+ *    nothing, as in git's walk);
+ *  - commits are yielded first, then the wanted tags, trees and blobs in the order of the wants
+ *    (git's pending objects: a tree or blob want named "" unless `tipPaths` names it), then
+ *    the trees and blobs of each listed commit (with their path, for the delta search's name
+ *    hash), as list-objects.c's traverse_non_commits lists them;
  *  - with `includeTags` (git's `pack-objects --include-tag`), last come the annotated tags among
  *    them that peel to a listed object, each with the tags of its chain.
  *
@@ -22,7 +26,9 @@ import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
 import type { GitObject, GitObjects } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
+import { listObjectsWithBitmap } from "./bitmap-walk.js";
 import { ObjectIdFlags } from "./object-id-flags.js";
+import type { PackBitmapIndex } from "./pack-bitmap.js";
 
 /** What `listObjects` reads: objects by id. */
 export type ListObjectsSource = Pick<GitObjects, "get"> & Partial<Pick<GitObjects, "getNow">>;
@@ -48,8 +54,8 @@ export interface ListObjectsOptions {
    */
   grafts?: ReadonlyMap<ObjectId, readonly ObjectId[]>;
   /**
-   * Called for each tree and blob below the boundary (the trees of the uninteresting commits
-   * met, and tree haves), with its path: the receiver's objects, bases for a thin pack.
+   * Called for each tree and blob below the boundary (the trees of the uninteresting parents
+   * of listed commits, and tree haves), with its path: the receiver's objects, bases for a thin pack.
    */
   onBoundary?: (object: ListedObject) => void;
   /**
@@ -68,6 +74,19 @@ export interface ListObjectsOptions {
   commitHeader?: (
     id: ObjectId,
   ) => Promise<{ tree: ObjectId; parents: ObjectId[]; commitTime: number } | undefined>;
+  /**
+   * A pack bitmap (`PackSet.bitmap()`, git's `--use-bitmap-index`): when nothing needs the
+   * revision walk (no `shallow`, `grafts` or `onBoundary`), the objects are listed through it
+   * (`bitmapWalk`): exactly what the wants reach and the haves do not, by type in pack order,
+   * with the name hash of each path (`nameHash`) instead of the path.
+   */
+  bitmap?: PackBitmapIndex;
+  /**
+   * The path a tree or blob want is listed with (git's pending path: an index entry's name,
+   * a cache-tree node's directory, as `--indexed-objects` adds them); any other tree or blob
+   * want is listed with none (name hash 0), as git names a ref's tree or blob "".
+   */
+  tipPaths?: ReadonlyMap<ObjectId, string>;
 }
 
 /** One listed object, as `git rev-list --objects` prints it. */
@@ -76,6 +95,8 @@ export interface ListedObject {
   type: ObjectTypeString;
   /** The path of a tree or blob below its commit's root tree ("" for a root tree). */
   path?: string;
+  /** The path's name hash, when listed through a bitmap (its name-hash cache) */
+  nameHash?: number;
 }
 
 /** A want the store does not have. */
@@ -91,7 +112,8 @@ const BOUNDARY = 8;
 /** Commits walked after only uninteresting ones remain queued (git's SLOP). */
 const SLOP = 5;
 
-interface CommitInfo {
+/** @internal */
+export interface CommitInfo {
   tree: ObjectId;
   parents: ObjectId[];
   time: number;
@@ -113,6 +135,22 @@ export async function* listObjects(
   objects: ListObjectsSource,
   options: ListObjectsOptions,
 ): AsyncGenerator<ListedObject> {
+  if (options.bitmap) options = { ...options, wants: [...options.wants] };
+  if (
+    options.bitmap &&
+    // no wants: nothing to list (git's prepare_bitmap_walk gives up too)
+    (options.wants as ObjectId[]).length > 0 &&
+    !options.shallow &&
+    !options.grafts &&
+    !options.onBoundary &&
+    (await haveInBitmappedPack(options.bitmap, objects, [
+      ...(options.haves ?? []),
+      ...(options.excludes ?? []),
+    ]))
+  ) {
+    yield* listObjectsWithBitmap(options.bitmap, objects, options);
+    return;
+  }
   const flags = new ObjectIdFlags();
   const has = (id: ObjectId, f: number) => (flags.get(id) & f) !== 0;
   const set = (id: ObjectId, f: number) => flags.add(id, f);
@@ -219,8 +257,8 @@ export async function* listObjects(
   };
 
   const tags: ObjectId[] = [];
-  const pendingTrees: ObjectId[] = [];
-  const pendingBlobs: ObjectId[] = [];
+  /** wanted tags, trees and blobs in the order met (git's revs->pending after handle_commit) */
+  const pending: { id: ObjectId; type: "tag" | "tree" | "blob" }[] = [];
   const boundaryTrees: ObjectId[] = [];
 
   /** Follows tags down to their target and queues it. */
@@ -243,6 +281,7 @@ export async function* listObjects(
           if (!uninteresting && !has(id, ADDED)) {
             set(id, ADDED);
             tags.push(id);
+            pending.push({ id, type: "tag" });
           }
           id = parseTagTarget(id, o.data);
           continue;
@@ -252,10 +291,11 @@ export async function* listObjects(
           await enqueue(id, uninteresting);
           return;
         case "tree":
-          (uninteresting ? boundaryTrees : pendingTrees).push(id);
+          if (uninteresting) boundaryTrees.push(id);
+          else pending.push({ id, type: "tree" });
           return;
         case "blob":
-          if (!uninteresting) pendingBlobs.push(id);
+          if (!uninteresting) pending.push({ id, type: "blob" });
           return;
       }
     }
@@ -275,8 +315,8 @@ export async function* listObjects(
     const { id } = pop() as { id: ObjectId };
     const c = commits.get(id) as CommitInfo;
     const uninteresting = has(id, UNINTERESTING);
-    if (uninteresting) boundaryTrees.push(c.tree);
-    else listed.push(id);
+    // an uninteresting commit's tree is not marked (only edges below, as git's walk)
+    if (!uninteresting) listed.push(id);
     for (const p of parentsOf(id, c)) await enqueue(p, uninteresting);
   }
 
@@ -330,7 +370,6 @@ export async function* listObjects(
     set(id, ADDED);
     yield { id, type: "commit" };
   }
-  for (const id of tags) if (!has(id, UNINTERESTING)) yield { id, type: "tag" };
 
   async function* walkTree(root: ObjectId, rootPath: string): AsyncGenerator<ListedObject> {
     const stack: { id: ObjectId; path: string }[] = [{ id: root, path: rootPath }];
@@ -364,13 +403,20 @@ export async function* listObjects(
     }
   }
 
-  for (const id of kept) yield* walkTree((commits.get(id) as CommitInfo).tree, "");
-  for (const id of pendingTrees) yield* walkTree(id, "");
-  for (const id of pendingBlobs) {
-    if (has(id, UNINTERESTING | ADDED)) continue;
-    set(id, ADDED);
-    yield { id, type: "blob" };
+  // the pending objects first (tags, tree and blob wants), then the commits' trees
+  const tipPaths = options.tipPaths;
+  for (const { id, type } of pending) {
+    if (type === "tag") {
+      if (!has(id, UNINTERESTING)) yield { id, type: "tag" };
+    } else if (type === "tree") yield* walkTree(id, tipPaths?.get(id) ?? "");
+    else {
+      if (has(id, UNINTERESTING | ADDED)) continue;
+      set(id, ADDED);
+      const path = tipPaths?.get(id);
+      yield path === undefined ? { id, type: "blob" } : { id, type: "blob", path };
+    }
   }
+  for (const id of kept) yield* walkTree((commits.get(id) as CommitInfo).tree, "");
 
   // git's add_ref_tag / add_tag_chain: a tag peeling to a listed object comes with its chain.
   // Only tag objects are read: a listed object (ADDED) ends the chain without a read, an
@@ -408,6 +454,39 @@ export async function* listObjects(
   }
 }
 
+/**
+ * git's prepare_bitmap_walk check (classic traversal, `pack.useBitmapBoundaryTraversal`
+ * unset): with haves, at least one of them (or a tag's target on the way) must be in the
+ * bitmapped pack, else the bitmap gives nothing to optimize and the plain walk runs.
+ */
+async function haveInBitmappedPack(
+  index: PackBitmapIndex,
+  objects: ListObjectsSource,
+  haves: ObjectId[],
+): Promise<boolean> {
+  if (haves.length === 0) return true;
+  const inPack = (id: ObjectId) => {
+    const p = index.position(id);
+    return p >= 0 && p < index.count;
+  };
+  if (haves.some(inPack)) return true;
+  // tags peeled as git's loop does: each tag and what it points at join the haves
+  for (const have of haves) {
+    let id = have;
+    for (let depth = 0; depth < 64; depth++) {
+      const o = await objects.get(id);
+      if (!o) break;
+      if (o.type !== "tag") {
+        await o.content[Symbol.asyncIterator]().return?.();
+        break;
+      }
+      id = parseTagTarget(id, await collect(o));
+      if (inPack(id)) return true;
+    }
+  }
+  return false;
+}
+
 async function collect(o: GitObject): Promise<Uint8Array> {
   const data = new Uint8Array(o.size);
   let at = 0;
@@ -420,8 +499,11 @@ async function collect(o: GitObject): Promise<Uint8Array> {
   return data;
 }
 
-/** The tree and parents of a commit, and its committer time. */
-function parseCommitHeader(id: ObjectId, data: Uint8Array): CommitInfo {
+/**
+ * The tree and parents of a commit, and its committer time.
+ * @internal
+ */
+export function parseCommitHeader(id: ObjectId, data: Uint8Array): CommitInfo {
   const end = indexOfBlankLine(data);
   const text = dec.decode(data.subarray(0, end));
   let tree: ObjectId | undefined;
@@ -446,7 +528,8 @@ function parseCommitHeader(id: ObjectId, data: Uint8Array): CommitInfo {
   return { tree, parents, time };
 }
 
-function parseTagTarget(id: ObjectId, data: Uint8Array): ObjectId {
+/** @internal the object a tag names */
+export function parseTagTarget(id: ObjectId, data: Uint8Array): ObjectId {
   const text = dec.decode(data.subarray(0, Math.min(data.length, 64)));
   if (!text.startsWith("object ")) throw new Error(`tag ${id} has no object`);
   return text.slice(7, 47);
@@ -457,15 +540,21 @@ function indexOfBlankLine(data: Uint8Array): number {
   return data.length;
 }
 
-const TREE = 0;
-const BLOB = 1;
-const GITLINK = 2;
+/** @internal tree entry kinds of `scanTreeEntry` */
+export const TREE_ENTRY_TREE = 0;
+/** @internal */
+export const TREE_ENTRY_BLOB = 1;
+/** @internal */
+export const TREE_ENTRY_GITLINK = 2;
+const TREE = TREE_ENTRY_TREE;
+const GITLINK = TREE_ENTRY_GITLINK;
 
 /**
+ * @internal
  * The tree entry at `at`: its kind (by its mode, `40000` a tree, `160000` a gitlink, else a
  * blob), where its name starts and its NUL (the id follows), and where the next entry starts.
  */
-function scanTreeEntry(
+export function scanTreeEntry(
   data: Uint8Array,
   at: number,
 ): { kind: number; nameStart: number; nul: number; next: number } {
@@ -489,6 +578,6 @@ function scanTreeEntry(
           data[at + 4] === 0x30 &&
           data[at + 5] === 0x30
         ? GITLINK
-        : BLOB;
+        : TREE_ENTRY_BLOB;
   return { kind, nameStart: sp + 1, nul, next: nul + 21 };
 }

@@ -49,6 +49,11 @@ export interface HistoryFacadeConfig {
    * update the checked-out branch of a non-bare one ("branch is currently checked out").
    */
   bare?: boolean;
+  /**
+   * List the objects of served packs through the packs' reachability bitmap when there is
+   * one (git's `pack.useBitmaps`, default true).
+   */
+  useBitmaps?: boolean;
 }
 
 /**
@@ -71,7 +76,7 @@ export interface HistoryFacadeConfig {
  * ```
  */
 export function createRepositoryFacade(config: HistoryFacadeConfig): RepositoryFacade {
-  const facade = createRepositoryFacadeFromHistory(config.history);
+  const facade = createRepositoryFacadeFromHistory(config.history, config.useBitmaps);
   const bare = config.bare ?? true;
   facade.isBare = () => bare;
   return facade;
@@ -111,6 +116,7 @@ export function repositoryQuarantine(
  */
 function createRepositoryFacadeFromHistory(
   history: History | HistoryWithOperations,
+  useBitmaps?: boolean,
 ): RepositoryFacade {
   const { commits, tags, refs } = history;
   const serialization =
@@ -165,6 +171,7 @@ function createRepositoryFacadeFromHistory(
       yield* serialization.exportPack(wants, exclude, {
         thinPack: options?.thin,
         shallow: options?.shallow,
+        ...(useBitmaps === false ? { useBitmaps } : {}),
         ofsDelta: options?.ofsDelta,
         includeTags: options?.includeTag
           ? (options.includeTags ?? (await tagRefIds(refs)))

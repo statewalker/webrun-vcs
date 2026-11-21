@@ -15,6 +15,7 @@ import {
   pushToConnection,
   type PushOptions as TransportPushOptions,
 } from "@statewalker/vcs-transport";
+import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 
 import {
   HookFailedError,
@@ -133,7 +134,7 @@ export class PushCommand extends TransportCommand<PushResult> {
   private dryRun = false;
   private pushAll = false;
   private pushTags = false;
-  private useBitmaps = true;
+  private useBitmaps?: boolean;
   private pushOptions: string[] = [];
   private receivePack?: string;
   private prune = false;
@@ -333,7 +334,9 @@ export class PushCommand extends TransportCommand<PushResult> {
   /**
    * Set whether to use bitmaps for push.
    *
-   * Default is true.
+   * Default: `push.useBitmaps` (default true), which git's send-pack turns into
+   * `--no-use-bitmap-index` when false. Either way pack-objects uses them only while the
+   * repository's `pack.useBitmaps` (default true) allows.
    *
    * @param useBitmaps Whether to use bitmaps
    */
@@ -344,10 +347,20 @@ export class PushCommand extends TransportCommand<PushResult> {
   }
 
   /**
-   * Whether bitmaps are used for push.
+   * Whether bitmaps are used for push: `setUseBitmaps`, else `push.useBitmaps` (default true).
    */
   isUseBitmaps(): boolean {
-    return this.useBitmaps;
+    return this.useBitmaps ?? this.configBool("push.useBitmaps") ?? true;
+  }
+
+  /** Whether pack-objects lists the pushed objects through a bitmap (see `setUseBitmaps`). */
+  private bitmapsInUse(): boolean {
+    return this.isUseBitmaps() && (this.configBool("pack.useBitmaps") ?? true);
+  }
+
+  private configBool(key: string): boolean | undefined {
+    const value = RemoteConfigStore.from(this._workingCopy).value(key);
+    return value === undefined ? undefined : (parseGitBool(value) ?? undefined);
   }
 
   /**
@@ -434,7 +447,7 @@ export class PushCommand extends TransportCommand<PushResult> {
       auth: this.credentials,
       headers: this.headers,
       timeout: this.timeout,
-      repository: createRepositoryFacade({ history }),
+      repository: createRepositoryFacade({ history, useBitmaps: this.bitmapsInUse() }),
       refStore: createTransportRefStore(history.refs),
       refspecs,
       force: this.force,

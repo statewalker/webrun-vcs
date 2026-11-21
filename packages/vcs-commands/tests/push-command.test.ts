@@ -1116,3 +1116,18 @@ describe.each(backends)("PushCommand review fixes ($name backend)", ({ factory }
     expect(git.push().setStreamRequestBody(false).isStreamRequestBody()).toBe(false);
   });
 });
+
+describe.each(backends)("push.useBitmaps ($name backend)", ({ factory }) => {
+  it("reads push.useBitmaps when setUseBitmaps is not called", async () => {
+    const ctx = await factory();
+    try {
+      const git = Git.fromWorkingCopy(ctx.workingCopy);
+      expect(git.push().isUseBitmaps()).toBe(true);
+      RemoteConfigStore.from(ctx.workingCopy).setValue("push.useBitmaps", "false");
+      expect(git.push().isUseBitmaps()).toBe(false);
+      expect(git.push().setUseBitmaps(true).isUseBitmaps()).toBe(true);
+    } finally {
+      await ctx.cleanup?.();
+    }
+  });
+});

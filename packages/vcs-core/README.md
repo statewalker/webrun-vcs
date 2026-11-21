@@ -291,7 +291,20 @@ A miss in `has`, `get` or `entry` rescans the directory, and `list()` and `packs
 
 `entry(id)` returns an object's entry as stored, for reuse when writing another pack: its kind (1 to 4, or 6 and 7 for deltas), the size in its header, the base id of a delta (an OFS_DELTA's base looked up through the idx), the CRC-32 from the idx, and `raw()`, the compressed bytes. `raw()` reads the entry twice: it checks the CRC of the whole entry before it yields a byte (a mismatch throws `PackError` from the first `next()`, so a pack writer knows before it sends anything), then checks it again while streaming, in case the file changed in between. This doubles the I/O for large reused entries. An idx v1 has no CRCs: the entry is then read once to compute its CRC and check its zlib stream.
 
-`openPack(files, packPath, idxPath, options)` opens a single pack with the same checks. Not supported: `multi-pack-index`, `.rev` and bitmap files (packs are read without them), SHA-256 repositories.
+`openPack(files, packPath, idxPath, options)` opens a single pack with the same checks. Not supported: `multi-pack-index` and `.rev` files (the pack order is computed from the idx), SHA-256 repositories.
+
+### Reachability bitmaps
+
+```typescript
+const index = await packs.bitmap(); // the first pack's usable `.bitmap`, or undefined
+if (index) {
+  const result = await bitmapWalk(index, objects, { wants: [tip], haves: [theirTip] });
+  console.log(result.count); // git rev-list --use-bitmap-index --count --objects tip ^theirTip
+}
+const bytes = await writePackBitmap({ pack, objects, listed }); // git's .bitmap, byte for byte
+```
+
+A pack's `.bitmap` (format v1) holds, for selected commits, the set of objects each reaches, as EWAH bitmaps over the pack's objects in pack order. `parsePackBitmap` reads one (type bitmaps, XOR-compressed entries, lookup table, name-hash cache), checking its trailing SHA-1 and the pack checksum in its header; a file it cannot use throws `PackBitmapError` with git's message, and `PackSet.bitmap()` then falls back to none (`bitmapErrors` keeps git's error lines). `bitmapWalk` lists what the wants reach minus what the haves reach: stored bitmaps are taken whole, other tips are walked down to a bitmapped commit, and objects the pack lacks get positions after its own (git's extended index). `listObjects({ bitmap })` and `exportPack` (unless `useBitmaps: false`, a shallow receiver, or a thin pack with haves) list through it, unless no have is in the bitmapped pack (git's classic traversal then walks too). A bitmap whose size or runs claim more objects than its pack has is refused, and bits at or above the pack's count are ignored, so a crafted file in a served repository cannot allocate without bound or mark objects outside the pack. `writePackBitmap` selects commits as `bitmap_writer_select_commits` does and compresses entries as `compute_xor_offsets` does; the entry order is 2.5x's (oldest first) or, with `compatibility: "2.43"`, 2.43's. Pseudo-merge bitmaps (2.5x's `bitmapPseudoMerge.*`) and multi-pack bitmaps are not written; a pseudo-merge section is skipped when read.
 
 ### The `VcsCore` facade over `@statewalker/webrun-storage`
 

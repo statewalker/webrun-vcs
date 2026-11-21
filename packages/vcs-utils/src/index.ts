@@ -3,6 +3,7 @@ export * from "./collections/index.js";
 export * from "./compression/index.js";
 export * from "./diff/index.js";
 export * from "./encoding/index.js";
+export * from "./ewah/index.js";
 export * from "./hash/index.js";
 export * from "./ids/index.js";
 export * from "./regex/index.js";

@@ -24,6 +24,7 @@ import {
   serverSettingsFromConfig,
   type UploadPackConnection,
 } from "@statewalker/vcs-transport";
+import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { LinkedWorktrees, OpenedRepository, WorkingCopy } from "@statewalker/vcs-working-tree";
 import { GitApiError, TransportError } from "../errors/index.js";
@@ -139,7 +140,10 @@ export async function withLocalUploadPack<T>(
   const [client, server] = createDuplexPair();
   const serving = serveOverDuplex({
     duplex: server,
-    repository: createRepositoryFacade({ history: remote.history }),
+    repository: createRepositoryFacade({
+      history: remote.history,
+      useBitmaps: servedUseBitmaps(remote),
+    }),
     refStore: createTransportRefStore(remote.history.refs),
     service: "git-upload-pack",
     ...((options.protocolVersion ?? 2) === 2 ? { protocolVersion: "2" as const } : {}),
@@ -199,6 +203,16 @@ const DEFAULT_SETTINGS: ServerConfigSettings = {
   uploadPackHideRefs: [],
   receivePackHideRefs: [],
 };
+
+/**
+ * The served repository's `pack.useBitmaps` (default true): its pack-objects (upload-pack's)
+ * lists through a bitmap only while it allows.
+ */
+export function servedUseBitmaps(remote: OpenedRepository): boolean {
+  const value = remote.config?.getAll("pack.useBitmaps").at(-1);
+  if (value === undefined || value === null) return true;
+  return parseGitBool(String(value)) ?? true;
+}
 
 /** What git's upload-pack and receive-pack read from the served repository's config. */
 function serverSettingsOf(remote: OpenedRepository): ServerConfigSettings {
@@ -407,7 +421,10 @@ async function receiveOver<T>(
   const serving = serveOverDuplex({
     ...(await receivePackSettingsOf(remote, hooks, receiveHooks)),
     duplex: server,
-    repository: createRepositoryFacade({ history: remote.history }),
+    repository: createRepositoryFacade({
+      history: remote.history,
+      useBitmaps: servedUseBitmaps(remote),
+    }),
     refStore: createTransportRefStore(remote.history.refs),
     service: "git-receive-pack",
     ...(version1 ? { announceVersion1: true } : {}),

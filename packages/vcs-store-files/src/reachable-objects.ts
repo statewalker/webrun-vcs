@@ -33,6 +33,7 @@ import type {
   Refs,
 } from "@statewalker/vcs-core";
 import { isSymbolicRef, joinPath, listObjects, readGraftParents } from "@statewalker/vcs-core";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { parseResolveUndo, readIndexFileEntries } from "@statewalker/vcs-working-tree";
 
@@ -109,6 +110,16 @@ export interface ReachabilityRoots {
  * ```
  */
 export async function collectReachabilityRoots(roots: ReachabilityRoots): Promise<ObjectId[]> {
+  return (await collectRoots(roots)).ids;
+}
+
+/**
+ * The roots, with the path git's `--indexed-objects` gives each tree or blob it adds first
+ * (an index entry's name, a cache-tree node's directory, a resolve-undo record's path).
+ */
+async function collectRoots(
+  roots: ReachabilityRoots,
+): Promise<{ ids: ObjectId[]; paths: Map<ObjectId, string> }> {
   const { files, refs, objects } = roots;
   const gitDir = roots.gitDir ?? ".git";
   const tips = new Set<ObjectId>();
@@ -117,9 +128,21 @@ export async function collectReachabilityRoots(roots: ReachabilityRoots): Promis
   const require = (id: ObjectId, message: string) => {
     if (!required.has(id)) required.set(id, message);
   };
-  const requireIndex = (ids: { entries: ObjectId[]; extra: ObjectId[] }) => {
-    for (const id of ids.entries) require(id, `unable to read ${id}`);
-    for (const id of ids.extra) tips.add(id);
+  // the name of a tree or blob the index adds before anything else names it (git's pending
+  // path: an object a ref names first is listed as "")
+  const paths = new Map<ObjectId, string>();
+  const name = (id: ObjectId, path: string) => {
+    if (!required.has(id) && !tips.has(id) && !paths.has(id)) paths.set(id, path);
+  };
+  const requireIndex = (ids: IndexRoots) => {
+    for (const { id, path } of ids.entries) {
+      name(id, path);
+      require(id, `unable to read ${id}`);
+    }
+    for (const { id, path } of ids.extra) {
+      name(id, path);
+      tips.add(id);
+    }
   };
 
   // The refs on storage, strictly: a ref that cannot be read throws instead of being skipped
@@ -182,7 +205,7 @@ export async function collectReachabilityRoots(roots: ReachabilityRoots): Promis
     tips.delete(id);
   }
   for (const id of tips) if (await objects.has(id)) present.push(id);
-  return present;
+  return { ids: present, paths };
 }
 
 /** A worktree's HEAD: a detached object id, or `ref: <name>` resolved through `resolve`. */
@@ -205,7 +228,7 @@ async function worktreeHead(
  * and paths are kept: the objects themselves are read one at a time.
  */
 export async function listReachableObjects(roots: ReachabilityRoots): Promise<ListedObject[]> {
-  const wants = await collectReachabilityRoots(roots);
+  const { ids: wants, paths: tipPaths } = await collectRoots(roots);
   const listed: ListedObject[] = [];
   if (wants.length === 0) return listed;
   // the parents of shallow commits are not there (git's grafts): not walked
@@ -225,7 +248,13 @@ export async function listReachableObjects(roots: ReachabilityRoots): Promise<Li
         };
       }
     : undefined;
-  for await (const o of listObjects(roots.objects, { wants, shallow, grafts, commitHeader })) {
+  for await (const o of listObjects(roots.objects, {
+    wants,
+    shallow,
+    grafts,
+    commitHeader,
+    tipPaths,
+  })) {
     listed.push(o);
   }
   return listed;
@@ -296,29 +325,37 @@ async function reflogIds(files: FilesApi, logsDir: string): Promise<ObjectId[]> 
   return ids;
 }
 
+/** An index's roots, each with the path git's `--indexed-objects` lists it with. */
+interface IndexRoots {
+  /** its entries (gitlinks excepted), which must be stored */
+  entries: { id: ObjectId; path: string }[];
+  /** the cache-tree's trees and the resolve-undo's blobs */
+  extra: { id: ObjectId; path: string }[];
+}
+
 /**
  * The object ids the index records: its entries' (gitlinks excepted), and the cache-tree's
- * and resolve-undo's (`extra`).
+ * and resolve-undo's (`extra`), in git's order (do_add_index_objects_to_pending).
  */
-async function indexIds(
-  files: FilesApi,
-  indexPath: string,
-): Promise<{ entries: ObjectId[]; extra: ObjectId[] }> {
+async function indexIds(files: FilesApi, indexPath: string): Promise<IndexRoots> {
   if ((await files.stats(indexPath))?.kind !== "file") return { entries: [], extra: [] };
   // a split index merged with its shared index; a sparse index's directories stay trees
   const gitDir = indexPath.slice(0, Math.max(0, indexPath.lastIndexOf("/")));
   const read = await readIndexFileEntries(files, indexPath, { gitDir });
   if (!read) return { entries: [], extra: [] };
   const parsed = { entries: read.entries, extensionData: read.extensions };
-  const entries = parsed.entries.filter((e) => e.mode !== GITLINK).map((e) => e.objectId);
-  const ids: ObjectId[] = [];
+  const entries = parsed.entries
+    .filter((e) => e.mode !== GITLINK)
+    // a sparse index's directory as its path without the slash (git expands it first)
+    .map((e) => ({ id: e.objectId, path: e.path.endsWith("/") ? e.path.slice(0, -1) : e.path }));
+  const ids: { id: ObjectId; path: string }[] = [];
   for (const ext of parsed.extensionData) {
     if (ext.signature === "TREE") ids.push(...cacheTreeIds(ext.data, indexPath));
     else if (ext.signature === "REUC") {
       // git's add_resolve_undo_to_pending: `git checkout -m` recreates a conflict from them
       for (const record of parseResolveUndo(ext.data)) {
         record.objectIds.forEach((id, i) => {
-          if (id && record.modes[i] !== GITLINK) ids.push(id);
+          if (id && record.modes[i] !== GITLINK) ids.push({ id, path: record.path });
         });
       }
     }
@@ -327,22 +364,34 @@ async function indexIds(
 }
 
 /**
- * The trees of a cache-tree (TREE) extension: per node, a NUL-terminated path, the ASCII entry
- * count, a space, the ASCII subtree count and a newline, then the tree id unless the entry
- * count is -1 (an invalidated node). git's `add_cache_tree` keeps them.
+ * The trees of a cache-tree (TREE) extension, with their directories: per node, a
+ * NUL-terminated name, the ASCII entry count, a space, the ASCII subtree count and a newline,
+ * then the tree id unless the entry count is -1 (an invalidated node); its subtrees follow it.
+ * git's `add_cache_tree` keeps them.
  */
-function cacheTreeIds(data: Uint8Array, indexPath: string): ObjectId[] {
-  const ids: ObjectId[] = [];
+function cacheTreeIds(data: Uint8Array, indexPath: string): { id: ObjectId; path: string }[] {
+  const ids: { id: ObjectId; path: string }[] = [];
+  // the open directories: their path and how many subtrees are still to come
+  const open: { path: string; left: number }[] = [];
   let p = 0;
   while (p < data.length) {
     const nul = data.indexOf(0, p);
     const lf = nul < 0 ? -1 : data.indexOf(10, nul);
     if (lf < 0) throw new Error(`${indexPath}: malformed cache-tree extension`);
-    const [count] = new TextDecoder().decode(data.subarray(nul + 1, lf)).split(" ");
+    const component = decodeGitPath(data.subarray(p, nul));
+    const [count, subtrees] = new TextDecoder().decode(data.subarray(nul + 1, lf)).split(" ");
     p = lf + 1;
+    while (open.length > 0 && (open[open.length - 1] as { left: number }).left === 0) open.pop();
+    const parent = open[open.length - 1];
+    let path = component;
+    if (parent) {
+      parent.left--;
+      path = parent.path ? `${parent.path}/${component}` : component;
+    }
+    open.push({ path, left: Math.max(0, Number(subtrees) || 0) });
     if (Number(count) < 0) continue;
     if (p + 20 > data.length) throw new Error(`${indexPath}: malformed cache-tree extension`);
-    ids.push(bytesToHex(data.subarray(p, p + 20)));
+    ids.push({ id: bytesToHex(data.subarray(p, p + 20)), path });
     p += 20;
   }
   return ids;

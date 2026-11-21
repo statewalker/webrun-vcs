@@ -24,6 +24,7 @@ import {
   installPack,
   PackError,
 } from "./index-pack.js";
+import { PackBitmapError, type PackBitmapIndex, parsePackBitmap } from "./pack-bitmap.js";
 import {
   DEFAULT_DELTA_BASE_CACHE_LIMIT,
   DeltaBaseCache,
@@ -131,6 +132,17 @@ export interface PackSet {
   refresh(): Promise<boolean>;
   /** Packs that could not be opened, skipped as git does. */
   readonly skipped: readonly { pack: string; error: string }[];
+  /**
+   * The reachability bitmap git would use: the `.bitmap` of the first pack (lookup order)
+   * that has one it can read (`parsePackBitmap`), loaded once per pack; undefined when there
+   * is none. Optional for wrappers of a set.
+   */
+  bitmap?(): Promise<PackBitmapIndex | undefined>;
+  /**
+   * git's error lines for the bitmap files `bitmap()` could not use (`error: corrupted bitmap
+   * index file (wrong header)`, ...), from its last call.
+   */
+  readonly bitmapErrors?: readonly string[];
 }
 
 const OID = /^[0-9a-f]{40}$/;
@@ -573,9 +585,65 @@ export async function openPackSet(
 
   await startScan();
 
+  /** the loaded bitmap, by the pack it belongs to and its file's size and mtime */
+  const loadedBitmaps = new WeakMap<
+    PackFile,
+    { signature: string; index?: PackBitmapIndex; error?: string }
+  >();
+  let bitmapErrors: string[] = [];
+  const bitmap = async (): Promise<PackBitmapIndex | undefined> => {
+    await rescanOnMiss();
+    const errors: string[] = [];
+    try {
+      for (const p of [...packs]) {
+        const path = `${dir}/${nameOf(p)}.bitmap`;
+        const st = await files.stats(path);
+        if (st?.kind !== "file") continue;
+        const sig = `${st.size}:${st.lastModified}`;
+        const cached = loadedBitmaps.get(p);
+        if (cached?.signature === sig) {
+          if (cached.index) return cached.index;
+          if (cached.error) errors.push(cached.error);
+          continue;
+        }
+        try {
+          const chunks: Uint8Array[] = [];
+          let n = 0;
+          for await (const c of files.read(path)) {
+            chunks.push(c);
+            n += c.length;
+          }
+          const bytes = chunks.length === 1 ? (chunks[0] as Uint8Array) : new Uint8Array(n);
+          if (chunks.length !== 1) {
+            let at = 0;
+            for (const c of chunks) {
+              bytes.set(c, at);
+              at += c.length;
+            }
+          }
+          const index = parsePackBitmap(bytes, p, path);
+          loadedBitmaps.set(p, { signature: sig, index });
+          return index;
+        } catch (e) {
+          if (!(e instanceof PackBitmapError)) throw e;
+          const error = `error: ${e.message}`;
+          errors.push(error);
+          loadedBitmaps.set(p, { signature: sig, error });
+        }
+      }
+      return undefined;
+    } finally {
+      bitmapErrors = errors;
+    }
+  };
+
   return {
     skipped,
     refresh,
+    bitmap,
+    get bitmapErrors() {
+      return bitmapErrors;
+    },
     async has(id) {
       if (!isId(id)) return false;
       if (packs.some((p) => holds(p, id))) return true;

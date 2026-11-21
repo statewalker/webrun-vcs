@@ -100,6 +100,13 @@ export interface GcOptions {
    * repository's `info/grafts`.
    */
   readGraftFile?: () => Promise<string | undefined>;
+  /**
+   * Write a reachability bitmap of the new pack (`repack.writeBitmaps`). Default: the
+   * config's, else git's default: written in a bare repository (silently skipped when the
+   * pack cannot hold everything, as with `.keep` packs), with git's warning when alternates
+   * keep objects out of it.
+   */
+  writeBitmaps?: boolean;
 }
 
 /**
@@ -313,6 +320,9 @@ async function collect(options: GcOptions): Promise<GcResult> {
         unpackUnreachableExpireMs: pruneExpireMs,
         // git gc: repack -d -l, what alternates hold stays theirs
         local: true,
+        // a bare repository's gc writes a bitmap (git's repack default for -a in a bare one)
+        ...(options.environment ? { environment: options.environment } : {}),
+        ...(options.writeBitmaps !== undefined ? { writeBitmaps: options.writeBitmaps } : {}),
       },
       listed,
       snapshot,

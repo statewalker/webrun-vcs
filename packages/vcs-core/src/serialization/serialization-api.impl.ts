@@ -153,18 +153,27 @@ export class DefaultSerializationApi implements SerializationApi {
   ): AsyncIterable<Uint8Array> {
     const listed: ListedObject[] = [];
     const boundary: ListedObject[] = [];
+    const haveList = [...haves];
+    const shallow = options.shallow ? [...options.shallow] : undefined;
+    const bitmap =
+      options.useBitmaps !== false &&
+      (shallow === undefined || shallow.length === 0) &&
+      !(options.thinPack && haveList.length > 0)
+        ? await this.packs?.bitmap?.()
+        : undefined;
     for await (const o of listObjects(this.objects, {
+      ...(bitmap ? { bitmap } : {}),
       wants,
-      haves,
-      shallow: options.shallow,
+      haves: haveList,
+      ...(shallow && shallow.length > 0 ? { shallow } : {}),
       includeTags: options.includeTags,
-      onBoundary: options.thinPack ? (b) => boundary.push(b) : undefined,
+      onBoundary: options.thinPack && !bitmap ? (b) => boundary.push(b) : undefined,
     })) {
       listed.push(o);
     }
     yield* writePack(this.objects, listed, {
       ...this.writeOptions(options),
-      ...(options.thinPack ? { thin: true, haves: boundary } : {}),
+      ...(options.thinPack && !bitmap ? { thin: true, haves: boundary } : {}),
     });
   }
 
