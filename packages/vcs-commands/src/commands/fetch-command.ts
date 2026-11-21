@@ -4,9 +4,11 @@ import type { ObjectId } from "@statewalker/vcs-core";
 import { type FilesApi, isSymbolicRef, parseCoreAbbrev } from "@statewalker/vcs-core";
 import { writeCommitGraph } from "@statewalker/vcs-store-files";
 import {
+  anonymizeUrl,
   createRepositoryFacade,
   createTransportRefStore,
   expandFromDestination,
+  FetchCheckError,
   type FetchClientResult,
   type FetchDisplayEntry,
   type FetchHeadEntry,
@@ -40,6 +42,7 @@ import {
   type TrackingRefUpdate,
 } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
+import { fetchFsckOf } from "./fsck/index.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
 import { worktreeUsingBranch } from "./worktree-support.js";
@@ -114,7 +117,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   private repositoryFiles?: { files: FilesApi; gitDir?: string };
   private forceUpdate = false;
   private atomic = false;
-  private checkFetchedObjects = false;
+  private checkFetchedObjects?: boolean;
+  private compatibility?: "2.43" | "2.56";
   private initialBranch?: string;
   private shallowSince?: Date;
   private shallowExcludes: string[] = [];
@@ -433,9 +437,18 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
-   * Set whether to check received objects for validity.
+   * Set whether to check received objects for validity, over `fetch.fsckObjects` (else
+   * `transfer.fsckObjects`), which decide when this is not set.
    *
-   * If true, objects received will be verified.
+   * Checked, each received object passes fsck as git's `index-pack --strict` runs it
+   * (`fetch.fsck.<msg-id>` severities, `fetch.fsck.skipList`), and every object it names came
+   * with the pack or is here; otherwise the fetch fails with `FetchCheckError` (git's
+   * `error: object <id>: <msg-id>: <message>`, `fatal: fsck error in packed object`, `fatal:
+   * index-pack failed`), leaving no ref and no received object behind.
+   *
+   * Whatever this says, the new ref tips must be connected (git's check_connected): a
+   * remote that does not send every object they need fails the fetch (`error: <url> did not
+   * send all necessary objects`, exit 1) before any ref is written.
    *
    * @param check Whether to check objects
    */
@@ -446,10 +459,22 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
-   * Whether to check received objects for validity.
+   * Whether to check received objects for validity, as set with {@link setCheckFetchedObjects}
+   * (false when unset: the configuration is read when the fetch runs).
    */
   isCheckFetchedObjects(): boolean {
-    return this.checkFetchedObjects;
+    return this.checkFetchedObjects ?? false;
+  }
+
+  /**
+   * Whose output to give where git 2.43 and 2.5x differ (2.43 prints an empty line after
+   * `error: <url> did not send all necessary objects`; fsck of a tag's `gpgsig` header).
+   * Default: the hook runner's compatibility, else 2.56.
+   */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
   }
 
   /**
@@ -668,6 +693,21 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const writesFetchHead = !this.dryRun && this.writeFetchHead && !!checkout?.writeFetchHead;
     if (writesFetchHead && !this.appendFetchHead) await checkout.writeFetchHead?.("");
 
+    // fetch.fsckObjects / transfer.fsckObjects: index-pack --strict over each received pack
+    const compatibility = this.compatibility ?? this.hooks.compatibility;
+    const environment = hostEnvironmentOf(this.workingCopy);
+    const fsck = await fetchFsckOf(
+      {
+        value: (key) => store.value(key),
+        compatibility,
+        ...(environment
+          ? { readFile: (path: string) => environment.readFile(path), home: environment.home }
+          : {}),
+        baseDir: await this.hostWorkingDir(),
+      },
+      this.checkFetchedObjects,
+    );
+
     const fetchOptions: TransportFetchOptions = {
       url: remoteUrl,
       auth: this.credentials,
@@ -718,6 +758,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       ),
       reflogIdent: this.reflogLine("").ident,
       abbrev: parseCoreAbbrev(store.value("core.abbrev")) ?? -1,
+      ...(fsck ? { fsckObjects: fsck } : {}),
     };
     // --upload-pack, else remote.<name>.uploadpack (transport_get)
     const uploadPack = this.uploadPack ?? this.remoteProgram(this.remote, "uploadpack");
@@ -733,8 +774,19 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       if (message.startsWith("couldn't find remote ref ")) {
         throw new TransportError(`fatal: ${message}`, undefined, { cause: error });
       }
+      if (error instanceof FetchCheckError) {
+        const lines = [...error.lines];
+        // store_updated_refs: the ref tips' check failed; nothing is written
+        if (error.check === "refs") {
+          lines.push(`error: ${anonymizeUrl(remoteUrl)} did not send all necessary objects`);
+          if (compatibility === "2.43") lines.push("");
+        }
+        throw new FetchCheckError(error.check, lines, error.exitCode);
+      }
       throw error;
     });
+    // index-pack's fsck warnings
+    messages.push(...(result.packCheckMessages ?? []));
 
     const advertisedRefs = new Map<string, ObjectId>();
     for (const ref of result.remoteRefs) {

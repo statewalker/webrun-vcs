@@ -32,6 +32,7 @@ import type {
   TreeEntryInfo,
 } from "../api/repository-facade.js";
 import { computeShallowUpdate } from "../fsm/fetch/upload-pack-graph.js";
+import { lenientCommitHeader, lenientTagTarget } from "../utils/index.js";
 
 /**
  * Configuration for creating RepositoryFacade using History facade.
@@ -200,9 +201,13 @@ function createRepositoryFacadeFromHistory(
     // ─────────────────────────────────────────────────────────────────
 
     async getCommitInfo(oid: string): Promise<CommitGraphInfo | undefined> {
-      const commit = await commits.load(oid);
-      if (!commit) return undefined;
-      return { parents: commit.parents, time: commit.committer.timestamp, tree: commit.tree };
+      const commit = await commits.load(oid).catch(() => undefined);
+      if (commit) {
+        return { parents: commit.parents, time: commit.committer.timestamp, tree: commit.tree };
+      }
+      // a commit the typed store cannot parse (an author line fsck refuses): git walks it
+      const object = await facade.loadObject?.(oid);
+      return object?.type === "commit" ? lenientCommitHeader(object.content) : undefined;
     },
 
     async getObjectType(oid: string): Promise<GitObjectTypeName | undefined> {
@@ -217,6 +222,30 @@ function createRepositoryFacadeFromHistory(
       if (await tags.load(oid).catch(() => undefined)) return "tag";
       if ((await facade.getTreeEntries?.(oid)) !== undefined) return "tree";
       return (await history.blobs.has(oid)) ? "blob" : undefined;
+    },
+
+    async loadObject(
+      oid: string,
+    ): Promise<{ type: GitObjectTypeName; content: Uint8Array } | undefined> {
+      const objects = history.objects;
+      if (!objects) return undefined;
+      const object = await objects.get(oid);
+      if (!object) return undefined;
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for await (const chunk of object.content) {
+        chunks.push(chunk);
+        size += chunk.length;
+      }
+      const content = chunks.length === 1 ? (chunks[0] as Uint8Array) : new Uint8Array(size);
+      if (chunks.length !== 1) {
+        let at = 0;
+        for (const chunk of chunks) {
+          content.set(chunk, at);
+          at += chunk.length;
+        }
+      }
+      return { type: object.type, content };
     },
 
     async getTreeEntries(oid: string): Promise<TreeEntryInfo[] | undefined> {
@@ -257,11 +286,12 @@ function createRepositoryFacadeFromHistory(
     async getTagInfo(oid: string): Promise<TagTargetInfo | undefined> {
       try {
         const tag = await tags.load(oid);
-        if (!tag) return undefined;
-        return { object: tag.object, type: OBJECT_TYPE_NAMES[tag.objectType] ?? "commit" };
+        if (tag) return { object: tag.object, type: OBJECT_TYPE_NAMES[tag.objectType] ?? "commit" };
       } catch {
-        return undefined;
+        // a tag the typed store cannot parse: read as git's parse_tag_buffer reads it
       }
+      const object = await facade.loadObject?.(oid);
+      return object?.type === "tag" ? lenientTagTarget(object.content) : undefined;
     },
 
     async computeShallowBoundaries(wants: Set<string>, depth: number): Promise<Set<string>> {

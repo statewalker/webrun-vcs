@@ -18,6 +18,13 @@ import { parseRefSpec } from "../utils/index.js";
 import { Completeness } from "./completeness.js";
 import type { RemoteRef, UploadPackConnection } from "./connection.js";
 import {
+  checkReceivedPack,
+  connectivityErrors,
+  FetchCheckError,
+  ReceivedObjects,
+  type ReceivedObjectsFsck,
+} from "./fetch-checks.js";
+import {
   CLIENT_AGENT,
   type FetchPackRequest,
   fetchPack,
@@ -152,6 +159,15 @@ export interface FetchClientOptions {
    * lengthened until unique among the local objects (`RepositoryFacade.abbrevLengths`).
    */
   abbrev?: number;
+  /**
+   * `fetch.fsckObjects` (else `transfer.fsckObjects`): each received object is checked as git's
+   * `index-pack --strict` checks it (the fsck itself is the caller's; vcs-commands builds it
+   * from `fetch.fsck.<msg-id>` and `fetch.fsck.skipList`), and every object it names must have
+   * come with the pack or be here. A refused pack leaves no object behind (it is imported into
+   * a quarantine where the repository can keep one) and the fetch throws
+   * {@link FetchCheckError} (`pack`).
+   */
+  fsckObjects?: ReceivedObjectsFsck;
 }
 
 /** Refspecs chosen from the remote refs (a clone of the remote HEAD's branch, a tag). */
@@ -221,6 +237,8 @@ export interface FetchClientResult {
    * 'refs/remotes/origin/a/b'`); nothing was written. Absent otherwise.
    */
   refTransactionError?: string;
+  /** The fsck warnings index-pack printed (`fsckObjects`), in its order */
+  packCheckMessages?: string[];
 }
 
 /** A remote ref a fetch took (see {@link FetchClientResult.fetched}). */
@@ -380,6 +398,15 @@ export async function fetchFromConnection(
   const complete = new Completeness(repository, localTips);
   let shallow = shallowBefore;
   let serverShallow: ServerShallowInfo | undefined;
+  // index-pack's links check: with fsck (`--strict`), or for a clone without --depth
+  // (`--check-self-contained-and-connected`); never for a partial clone's packs
+  const strictLinks = !options.filter && (!!options.fsckObjects || options.cloning === true);
+  /** Packs that named nothing outside themselves (a clone's check skips the tips they hold) */
+  const selfContained: ReceivedObjects[] = [];
+  /** The tips fetch-pack's own check of a deepening fetch covered */
+  const deepenChecked = new Set<string>();
+  const packMessages: string[] = [];
+  let packFetched = false;
   const runFetchPack = async (wants: string[], request: Partial<FetchPackRequest>) => {
     const knownCommon: string[] = [];
     for (const ref of remoteRefs) {
@@ -398,6 +425,9 @@ export async function fetchFromConnection(
     if (connection.version === 0 && !deepening && connection.advertisedShallow?.length) {
       serverShallow = await shallowInfoOf(repository, connection.advertisedShallow, shallow);
     }
+    const links = strictLinks && (!!options.fsckObjects || !deepening);
+    const received =
+      !options.dryRun && (links || options.fsckObjects) ? new ReceivedObjects() : undefined;
     const fetched = await fetchPack(connection, source, {
       wants,
       localTips,
@@ -408,7 +438,14 @@ export async function fetchFromConnection(
       onProgress: options.onProgress,
       importPack: options.dryRun
         ? drainPack
-        : (pack) => repository.importPack(pack, options.keepPack ? { keepPack: true } : undefined),
+        : (pack) =>
+            repository.importPack(pack, {
+              ...(options.keepPack ? { keepPack: true } : {}),
+              // checked before anything sees them: a refused pack leaves no object behind
+              ...(received
+                ? { quarantine: true, onObject: (id, type, entry) => received.add(id, type, entry) }
+                : {}),
+            }),
       onShallowUpdate: async (u) => {
         if (
           connection.version === 2 &&
@@ -427,14 +464,52 @@ export async function fetchFromConnection(
       },
       ...request,
     });
+    const { quarantine, ...imported } = fetched.imported;
+    if (received) {
+      // index-pack's --strict / --check-self-contained-and-connected, with the shallow
+      // commits it is given (the shallow file as this fetch leaves it, and a shallow server's)
+      const grafts = new Set([...applyShallow(shallow, update), ...(serverShallow?.list ?? [])]);
+      try {
+        const checked = await checkReceivedPack(quarantine?.repository ?? repository, received, {
+          fsck: options.fsckObjects,
+          links,
+          shallow: grafts,
+          kept: imported.packId !== undefined,
+        });
+        packMessages.push(...checked.messages);
+        if (links && checked.selfContained) selfContained.push(received);
+      } catch (error) {
+        await quarantine?.discard();
+        throw error;
+      }
+    }
+    await quarantine?.commit();
+    if (!options.dryRun) packFetched = true;
+    const after = applyShallow(shallow, update);
+    // fetch-pack: a deepening fetch (not a clone) checks what it brought against the new
+    // shallow commits, without `--not --all`, before the shallow file changes
+    if (!options.dryRun && !options.cloning && deepening) {
+      const lines = await connectivityErrors(repository, wants, {
+        known: [],
+        shallow: new Set(after),
+        deepening: true,
+      });
+      if (lines) {
+        throw new FetchCheckError(
+          "deepen",
+          [...lines, "error: remote did not send all necessary objects"],
+          1,
+        );
+      }
+      for (const want of wants) deepenChecked.add(want);
+    }
     // the pack is in (its trailer checked): the wants are complete now
     if (!options.dryRun) for (const want of wants) complete.addTip(want);
-    result.imports.push(fetched.imported);
+    result.imports.push(imported);
     result.packObjects += fetched.packObjects;
     result.packBytes += fetched.packBytes;
     result.stats.rounds += fetched.stats.rounds;
     result.stats.haves += fetched.stats.haves;
-    const after = applyShallow(shallow, update);
     if (after !== shallow) {
       // checked against what this fetch read: a concurrent fetch's change is not lost
       if (!options.dryRun) await refStore.setShallow?.(after, shallow);
@@ -644,6 +719,37 @@ export async function fetchFromConnection(
       if (tagsOfTips.has(p.remoteRef) !== first) continue;
       result.fetched.push({ remoteRef: p.remoteRef, localRef: p.localRef, oid: p.oid });
     }
+  }
+  if (packMessages.length > 0) result.packCheckMessages = packMessages;
+  // git's check_connected before any ref is written: fetch's store_updated_refs over its ref
+  // map (the refs a deepening fetch-pack checked aside), clone's update_remote_refs over the
+  // refs it writes (those in a self-contained pack aside)
+  if (!options.dryRun && packFetched) {
+    const candidates = options.cloning
+      ? planned.filter((p) => p.localRef !== undefined)
+      : [...planned, ...opportunistic, ...followed];
+    const tips: string[] = [];
+    for (const p of candidates) {
+      if (deepenChecked.has(p.oid)) continue;
+      if (options.cloning && selfContained.some((pack) => pack.has(p.oid))) continue;
+      tips.push(p.oid);
+    }
+    let lines: string[] | undefined;
+    if (options.filter) {
+      // a partial clone's objects are promised: git checks the tips came (check_connected_promisor)
+      for (const tip of tips) {
+        if (!(await repository.has(tip))) {
+          lines = [`fatal: bad object ${tip}`];
+          break;
+        }
+      }
+    } else {
+      lines = await connectivityErrors(repository, tips, {
+        known: localTips,
+        shallow: new Set(shallow),
+      });
+    }
+    if (lines) throw new FetchCheckError("refs", lines, options.cloning ? 128 : 1);
   }
   if (!options.dryRun) {
     const failure = await applyRefUpdates(result.refUpdates, refStore, {

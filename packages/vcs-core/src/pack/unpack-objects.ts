@@ -48,8 +48,19 @@ export interface UnpackObjectsOptions {
    * the store keeps an existing object, so one can never be replaced. Default 16 MiB.
    */
   bigObjectThreshold?: number;
-  /** Called for every object of the pack once it is stored (or found already stored). */
-  onObject?: (id: ObjectId, type: ObjectTypeString) => void;
+  /**
+   * Called for every object of the pack once it is stored (or found already stored), with its
+   * entry in the pack (its index, and whether it was sent as a delta)
+   */
+  onObject?: (id: ObjectId, type: ObjectTypeString, entry: PackEntryInfo) => void;
+}
+
+/** Where a received object was in its pack (see `UnpackObjectsOptions.onObject`). */
+export interface PackEntryInfo {
+  /** The entry's index in the pack (0 for the first) */
+  index: number;
+  /** Whether the entry was a delta (OFS_DELTA or REF_DELTA) */
+  delta: boolean;
 }
 
 export interface UnpackResult {
@@ -276,6 +287,8 @@ export async function unpackObjects(
   const t = new Entries();
   /** waiting deltas, keyed by base id or by "#<index>" of a base entry that itself waits */
   const waiting = new Map<string, Waiting[]>();
+  /** Entries sent as deltas (`onObject` says so) */
+  const deltaEntries = new Set<number>();
   let waitingCount = 0;
 
   const patch = (base: Uint8Array, delta: Uint8Array, i: number) => {
@@ -352,7 +365,7 @@ export async function unpackObjects(
     t.type[i] = TYPE_CODE[type];
     t.oid.set(hexToBytes(id), i * 20);
     result.types[type]++;
-    options.onObject?.(id, type);
+    options.onObject?.(id, type, { index: i, delta: deltaEntries.has(i) });
   };
 
   const wait = (key: string, w: Waiting) => {
@@ -466,6 +479,7 @@ export async function unpackObjects(
         continue;
       }
       result.deltas++;
+      deltaEntries.add(i);
       const delta = await r.inflateAll(size, offset);
       if (baseIndex >= 0 && !t.type[baseIndex]) {
         wait(`#${baseIndex}`, { index: i, delta }); // its base is a delta still waiting

@@ -14,15 +14,17 @@ import {
   serializeTag,
   serializeTree,
 } from "@statewalker/vcs-core";
-import type {
-  CommitGraphInfo,
-  ExportPackOptions,
-  GitObjectTypeName,
-  PackImportOptions,
-  PackImportResult,
-  RepositoryFacade,
-  TagTargetInfo,
-  TreeEntryInfo,
+import {
+  type CommitGraphInfo,
+  type ExportPackOptions,
+  type GitObjectTypeName,
+  lenientCommitHeader,
+  lenientTagTarget,
+  type PackImportOptions,
+  type PackImportResult,
+  type RepositoryFacade,
+  type TagTargetInfo,
+  type TreeEntryInfo,
 } from "@statewalker/vcs-transport";
 import { toArray } from "@statewalker/vcs-utils/streams";
 
@@ -229,9 +231,13 @@ export class VcsRepositoryFacade implements RepositoryFacade {
       const h = await commits.getHeader(oid, { checkExists: options.checkExists });
       return h ? { parents: h.parents, time: h.commitTime, tree: h.tree } : undefined;
     }
-    const commit = await commits.load(oid);
-    if (!commit) return undefined;
-    return { parents: commit.parents, time: commit.committer.timestamp, tree: commit.tree };
+    const commit = await commits.load(oid).catch(() => undefined);
+    if (commit) {
+      return { parents: commit.parents, time: commit.committer.timestamp, tree: commit.tree };
+    }
+    // a commit the typed store cannot parse (an author line fsck refuses): git walks it
+    const object = await this.loadObject(oid);
+    return object?.type === "commit" ? lenientCommitHeader(object.content) : undefined;
   }
 
   /**
@@ -253,11 +259,39 @@ export class VcsRepositoryFacade implements RepositoryFacade {
   async getTagInfo(oid: string): Promise<TagTargetInfo | undefined> {
     try {
       const tag = await this.history.tags.load(oid);
-      if (!tag) return undefined;
-      return { object: tag.object, type: OBJECT_TYPE_NAMES[tag.objectType] ?? "commit" };
+      if (tag) return { object: tag.object, type: OBJECT_TYPE_NAMES[tag.objectType] ?? "commit" };
     } catch {
-      return undefined;
+      // a tag the typed store cannot parse: read as git's parse_tag_buffer reads it
     }
+    const object = await this.loadObject(oid);
+    return object?.type === "tag" ? lenientTagTarget(object.content) : undefined;
+  }
+
+  /**
+   * An object's type and content, undefined when absent (a fetch's `fetch.fsckObjects`).
+   */
+  async loadObject(
+    oid: string,
+  ): Promise<{ type: GitObjectTypeName; content: Uint8Array } | undefined> {
+    const objects = this.history.objects;
+    if (!objects) return undefined;
+    const object = await objects.get(oid);
+    if (!object) return undefined;
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for await (const chunk of object.content) {
+      chunks.push(chunk);
+      size += chunk.length;
+    }
+    const content = chunks.length === 1 ? (chunks[0] as Uint8Array) : new Uint8Array(size);
+    if (chunks.length !== 1) {
+      let at = 0;
+      for (const chunk of chunks) {
+        content.set(chunk, at);
+        at += chunk.length;
+      }
+    }
+    return { type: object.type, content };
   }
 
   /**

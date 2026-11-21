@@ -170,6 +170,7 @@ async function importStream(
       externalBase,
       maxObjectSize,
       baseCacheBytes: options.baseCacheBytes,
+      ...(options.onObject ? { onObject: options.onObject } : {}),
     });
     return { count: kept.count, types: kept.types, kept };
   }

@@ -31,6 +31,7 @@ import type { FilesApi } from "../common/files/index.js";
 import type { ObjectId } from "../common/id/index.js";
 import { CorruptObjectError } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
+import type { PackEntryInfo } from "./unpack-objects.js";
 
 /** A pack refused by `installPack`: corrupt, hostile, over a limit, or with unresolvable deltas. */
 export class PackError extends CorruptObjectError {
@@ -56,6 +57,13 @@ export interface InstallPackOptions {
   baseCacheBytes?: number;
   /** Size of the window phase 2 reads the stored pack through. Default 1 MiB. */
   windowBytes?: number;
+  /**
+   * Called for every received object once the whole pack is resolved (before it is
+   * installed): the entries sent whole first, then the deltas, each group in pack order (the
+   * order git's index-pack checks them in). Bases appended to complete a thin pack are local
+   * objects, not reported.
+   */
+  onObject?: (id: ObjectId, type: ObjectTypeString, entry: PackEntryInfo) => void;
 }
 
 export interface InstalledPack {
@@ -1039,6 +1047,19 @@ export async function installPack(
           ? `${missing} unresolved deltas (thin pack? first missing base ${hex(t.refOid.subarray(firstRef * 20, firstRef * 20 + 20))})`
           : `${missing} deltas could not be resolved`,
       );
+    }
+    if (options.onObject) {
+      for (const delta of [false, true]) {
+        for (let i = 0; i < received; i++) {
+          const isDelta = t.kind[i] === OFS_DELTA || t.kind[i] === REF_DELTA;
+          if (isDelta !== delta) continue;
+          options.onObject(
+            hex(t.oid.subarray(i * 20, i * 20 + 20)),
+            TYPE_NAMES[t.type[i] as number] as ObjectTypeString,
+            { index: i, delta },
+          );
+        }
+      }
     }
     let packChecksum = hexToBytes(parsed.packId);
     let packFile = tmpPack;

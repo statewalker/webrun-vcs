@@ -680,6 +680,23 @@ export abstract class GitCommand<T> {
     return { dir: graftFileBaseDir(gitDir, bare) };
   }
 
+  /**
+   * The directory git runs in, as the host names it: the worktree top (the git directory when
+   * `core.bare`), where git reads a relative path from the configuration
+   * (`fetch.fsck.skipList`); from the working copy's `hostGitDir`, else from the repository's
+   * FilesApi root. Undefined when the host path is unknown.
+   */
+  protected async hostWorkingDir(): Promise<string | undefined> {
+    const known = this.graftFileBase()?.dir;
+    if (known !== undefined) return known;
+    const gitDir = await this.hooks.hostGitDir({ real: false }).catch(() => undefined);
+    if (gitDir === undefined) return undefined;
+    const bare = this._workingCopy.config
+      ? parseGitBool(RemoteConfigStore.from(this._workingCopy).value("core.bare"))
+      : undefined;
+    return graftFileBaseDir(gitDir, bare);
+  }
+
   /** The commits as git's history walks read them: {@link commits}. */
   protected get walkCommits(): CommandCommits {
     return this.commits;
