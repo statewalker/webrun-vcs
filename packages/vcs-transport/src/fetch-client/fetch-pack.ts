@@ -54,8 +54,14 @@ export interface FetchPackRequest {
   deepenSince?: number;
   /** `deepen-not`: commits not reachable from these remote refs */
   deepenNot?: string[];
-  /** Partial clone filter (`blob:none`) */
+  /**
+   * Partial clone filter (`blob:none`): sent when the server takes filters
+   * ({@link serverSupportsFilter}), else dropped with {@link FILTER_NOT_RECOGNIZED} passed
+   * to `onWarning`
+   */
   filter?: string;
+  /** Warnings fetch-pack prints (`warning: ...`) */
+  onWarning?: (line: string) => void;
   /** Ask the server for the annotated tags of the objects it sends (`include-tag`) */
   includeTag?: boolean;
   /** Progress messages (side-band channel 2); without it the client asks for `no-progress` */
@@ -111,6 +117,10 @@ export async function fetchPack(
   request: FetchPackRequest,
 ): Promise<FetchPackResult> {
   if (request.wants.length === 0) throw new Error("fetchPack: nothing to fetch");
+  if (request.filter && !serverSupportsFilter(connection)) {
+    request.onWarning?.(FILTER_NOT_RECOGNIZED);
+    request = { ...request, filter: undefined };
+  }
   const shallow = [...(request.shallow ?? [])];
   const negotiator = new Negotiator(source, { shallow });
   for (const oid of request.knownCommon ?? []) await negotiator.knownCommon(oid);
@@ -141,9 +151,6 @@ function checkShallowSupport(
     if ((clientShallow || deepen) && !features.has("shallow")) {
       throw new TransportError("The server does not support shallow clients or fetches");
     }
-    if (request.filter && !features.has("filter")) {
-      throw new TransportError("The server does not support filters");
-    }
     return;
   }
   if ((clientShallow || deepen) && !caps.has("shallow")) {
@@ -158,10 +165,20 @@ function checkShallowSupport(
   if (request.deepenRelative && !caps.has("deepen-relative")) {
     throw new TransportError("The server does not support deepen-relative");
   }
-  if (request.filter && !caps.has("filter")) {
-    throw new TransportError("The server does not support filters");
-  }
 }
+
+/**
+ * Whether the server takes a `filter` (v0's `filter` capability, v2's `fetch=... filter`):
+ * without it fetch-pack sends none, warning "filtering not recognized by server, ignoring".
+ */
+export function serverSupportsFilter(connection: UploadPackConnection): boolean {
+  return connection.version === 2
+    ? fetchFeatures(connection).has("filter")
+    : connection.capabilities.has("filter");
+}
+
+/** The warning fetch-pack prints for a filter the server does not take (send_filter). */
+export const FILTER_NOT_RECOGNIZED = "warning: filtering not recognized by server, ignoring";
 
 /** The shallow and deepen lines both protocols share. */
 function shallowLines(request: FetchPackRequest, shallow: string[]): string[] {
@@ -203,6 +220,8 @@ async function fetchPackV0(
   if (request.includeTag && caps.has("include-tag")) wanted.push("include-tag");
   if (shallow.length > 0 || deepen) wanted.push("shallow");
   if (request.deepenRelative) wanted.push("deepen-relative");
+  // the filter capability asked for with the request's filter (find_common)
+  if (request.filter) wanted.push("filter");
   if (caps.has("agent")) wanted.push(`agent=${CLIENT_AGENT}`);
 
   // the request's "state": wants (capabilities on the first), shallow and deepen lines, filter

@@ -15,7 +15,7 @@ import {
   pushToConnection,
   type PushOptions as TransportPushOptions,
 } from "@statewalker/vcs-transport";
-import { parseGitBool } from "@statewalker/vcs-utils/encoding";
+import { parseGitBool, parseGitInt } from "@statewalker/vcs-utils/encoding";
 
 import {
   HookFailedError,
@@ -358,6 +358,12 @@ export class PushCommand extends TransportCommand<PushResult> {
     return this.isUseBitmaps() && (this.configBool("pack.useBitmaps") ?? true);
   }
 
+  /** `core.maxTreeDepth` (git's default 2048 when unset or unreadable). */
+  private maxTreeDepth(): number | undefined {
+    const value = RemoteConfigStore.from(this._workingCopy).value("core.maxTreeDepth");
+    return value === undefined ? undefined : parseGitInt(value);
+  }
+
   private configBool(key: string): boolean | undefined {
     const value = RemoteConfigStore.from(this._workingCopy).value(key);
     return value === undefined ? undefined : (parseGitBool(value) ?? undefined);
@@ -447,7 +453,12 @@ export class PushCommand extends TransportCommand<PushResult> {
       auth: this.credentials,
       headers: this.headers,
       timeout: this.timeout,
-      repository: createRepositoryFacade({ history, useBitmaps: this.bitmapsInUse() }),
+      repository: createRepositoryFacade({
+        history,
+        useBitmaps: this.bitmapsInUse(),
+        // send-pack's pack-objects reads core.maxTreeDepth
+        maxTreeDepth: this.maxTreeDepth(),
+      }),
       refStore: createTransportRefStore(history.refs),
       refspecs,
       force: this.force,

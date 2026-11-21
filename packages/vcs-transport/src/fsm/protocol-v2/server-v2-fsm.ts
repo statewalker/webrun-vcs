@@ -27,6 +27,7 @@ import {
   UploadPackRequestError,
   type UploadPackRequestParts,
 } from "../fetch/index.js";
+import { checkUploadPackFilter } from "../fetch/upload-pack-filter.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import {
   createEmptyFetchRequest,
@@ -126,6 +127,12 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
   [
     "SEND_CAPABILITIES",
     async (ctx) => {
+      // 2.5x's advertisement reads upload-pack's config and dies on a filter setting it
+      // cannot read (2.43 advertised and died at the fetch command)
+      if (ctx.config.uploadPackFilter?.configError !== undefined) {
+        ctx.output.error = ctx.config.uploadPackFilter.configError;
+        return "ERROR";
+      }
       try {
         await ctx.transport.writeLine("version 2");
 
@@ -373,7 +380,9 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           } else if (line === "deepen-relative") {
             req.deepenRelative = true;
           } else if (line.startsWith("filter ")) {
-            req.filter = line.slice(7);
+            // git dies at a second one (list_objects_filter_die_if_populated)
+            if (req.filter !== null) req.filterRepeated = true;
+            else req.filter = line.slice(7);
           } else if (line === "thin-pack") {
             req.thinPack = true;
           } else if (line === "no-progress") {
@@ -422,11 +431,21 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           ctx.state.wantedRefs.set(refName, oid);
         }
 
-        // A filter is refused unless advertised (the built-in facades do not filter); an
-        // advertised one goes to exportPack as `filterSpec`
-        if (req.filter !== null && !advertisesFetchFeature(ctx, "filter")) {
-          ctx.output.error = `unexpected line: 'filter ${req.filter}'`;
-          return "INVALID_WANT";
+        // A filter is refused unless advertised (uploadpack.allowFilter); an advertised one
+        // must parse and pass the allow-list (process_args: git dies, an allow-list refusal
+        // sent as ERR first), then goes to exportPack as `filterSpec`
+        if (req.filter !== null) {
+          if (!advertisesFetchFeature(ctx, "filter")) {
+            ctx.output.error = `unexpected line: 'filter ${req.filter}'`;
+            return "INVALID_WANT";
+          }
+          const refused = req.filterRepeated
+            ? { message: "multiple filter-specs cannot be combined", reported: false }
+            : checkUploadPackFilter(req.filter, ctx.config.uploadPackFilter);
+          if (refused) {
+            ctx.output.error = refused.message;
+            return refused.reported ? "INVALID_WANT" : "ERROR";
+          }
         }
 
         // Direct wants: by default any object the repository has, as git's v2 upload-pack
@@ -905,6 +924,7 @@ function advertisedCapabilities(ctx: ProcessContext): string[] {
     ctx.config.serverCapabilities,
     ctx.config.advertiseObjectInfo,
     ctx.repository,
+    ctx.config.uploadPackFilter,
   );
 }
 

@@ -241,3 +241,20 @@ describe("clearSkipWorktreeFromPresentFiles of conflict stages", () => {
     expect(flags).toEqual([false, false, false]);
   });
 });
+
+describe("sparseFilterMatcher (sparse:oid filters)", () => {
+  it("answers git's path_matches_pattern_list: last match decides, none is undecided", async () => {
+    const { sparseFilterMatcher } = await import("../../src/working-copy/index.js");
+    const match = sparseFilterMatcher("﻿/a.txt\n/dir/\n!/dir/sub/\n# comment\n*.md\n");
+    expect(match("a.txt", "a.txt", false)).toBe(true);
+    expect(match("dir", "dir", true)).toBe(true);
+    // a directory-only pattern does not match a file of that name
+    expect(match("dir", "dir", false)).toBeUndefined();
+    expect(match("dir/sub", "sub", true)).toBe(false);
+    expect(match("dir/sub/x.c", "x.c", false)).toBeUndefined();
+    expect(match("x/y/readme.md", "readme.md", false)).toBe(true);
+    // the root tree: only a pattern without a slash can match its empty name
+    expect(match("", "", true)).toBeUndefined();
+    expect(sparseFilterMatcher("*\n")("", "", true)).toBe(true);
+  });
+});

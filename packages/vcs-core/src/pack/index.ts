@@ -10,6 +10,7 @@ export * from "./delta-reverse-index.js";
 export * from "./import-pack.js";
 export * from "./index-pack.js";
 export * from "./list-objects.js";
+export * from "./object-filter/index.js";
 export * from "./pack-bitmap.js";
 export * from "./pack-bitmap-writer.js";
 export * from "./pack-file.js";

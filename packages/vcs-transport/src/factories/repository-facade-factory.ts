@@ -17,8 +17,12 @@ import {
   type History,
   type HistoryWithOperations,
   type ObjectQuarantine,
+  parseObjectFilter,
   type Ref,
+  resolveObjectFilter,
+  type SparseFilterMatcher,
   type SymbolicRef,
+  TreeDepthError,
 } from "@statewalker/vcs-core";
 import type {
   CommitGraphInfo,
@@ -31,7 +35,9 @@ import type {
   TagTargetInfo,
   TreeEntryInfo,
 } from "../api/repository-facade.js";
+import { PackObjectsError } from "../fsm/fetch/pack-objects-error.js";
 import { computeShallowUpdate } from "../fsm/fetch/upload-pack-graph.js";
+import { resolveRevision } from "../push-client/revision.js";
 import { lenientCommitHeader, lenientTagTarget, storedObjectType } from "../utils/index.js";
 
 /**
@@ -54,6 +60,18 @@ export interface HistoryFacadeConfig {
    * one (git's `pack.useBitmaps`, default true).
    */
   useBitmaps?: boolean;
+  /**
+   * Parses the patterns of a `sparse:oid=<blob-ish>` partial clone filter (the blob's text,
+   * gitignore-style, non-cone: git's `add_patterns_from_blob_to_list` and
+   * `path_matches_pattern_list`); vcs-working-tree's `sparseFilterMatcher`. Without it a
+   * `sparse:oid` filter fails the pack.
+   */
+  sparseFilterPatterns?: (text: string) => SparseFilterMatcher;
+  /**
+   * git's `core.maxTreeDepth` for the served packs' walk (default 2048): a deeper tree fails
+   * the pack as pack-objects dies (`fatal: exceeded maximum allowed tree depth`)
+   */
+  maxTreeDepth?: number;
 }
 
 /**
@@ -76,7 +94,12 @@ export interface HistoryFacadeConfig {
  * ```
  */
 export function createRepositoryFacade(config: HistoryFacadeConfig): RepositoryFacade {
-  const facade = createRepositoryFacadeFromHistory(config.history, config.useBitmaps);
+  const facade = createRepositoryFacadeFromHistory(
+    config.history,
+    config.useBitmaps,
+    config.sparseFilterPatterns,
+    config.maxTreeDepth,
+  );
   const bare = config.bare ?? true;
   facade.isBare = () => bare;
   return facade;
@@ -117,6 +140,8 @@ export function repositoryQuarantine(
 function createRepositoryFacadeFromHistory(
   history: History | HistoryWithOperations,
   useBitmaps?: boolean,
+  sparseFilterPatterns?: (text: string) => SparseFilterMatcher,
+  maxTreeDepth?: number,
 ): RepositoryFacade {
   const { commits, tags, refs } = history;
   const serialization =
@@ -142,6 +167,25 @@ function createRepositoryFacadeFromHistory(
       return undefined;
     }
   };
+  /**
+   * git's filter_sparse_oid__init: the blob-ish resolved (get_oid with GET_OID_BLOB) and its
+   * patterns parsed, a blob over dir.c's PATTERN_MAX_FILE_SIZE refused before it is read
+   */
+  const loadSparse = async (name: string): Promise<SparseFilterMatcher> => {
+    const id = await resolveBlobName(history, facade, name);
+    if (id === undefined) throw new PackObjectsError(`unable to access sparse blob in '${name}'`);
+    const size = await facade.getObjectSize?.(id).catch(() => null);
+    if (size != null && size > PATTERN_MAX_FILE_SIZE) {
+      throw new PackObjectsError(`unable to parse sparse filter data in ${id}`, {
+        lines: [`warning: ignoring excessively large pattern blob: ${id}`],
+      });
+    }
+    const object = await facade.loadObject?.(id).catch(() => undefined);
+    if (object?.type !== "blob" || !sparseFilterPatterns) {
+      throw new PackObjectsError(`unable to parse sparse filter data in ${id}`);
+    }
+    return sparseFilterPatterns(new TextDecoder().decode(object.content));
+  };
   const facade: RepositoryFacade = {
     // the alternates' refs, for receive-pack's `.have` lines
     ...(alternates ? { alternateRefs: () => alternates.refs() } : {}),
@@ -162,13 +206,23 @@ function createRepositoryFacadeFromHistory(
         : result;
     },
 
+    async markPromisorPack(packId: string, content: string): Promise<boolean> {
+      return (await serialization.markPromisorPack?.(packId, content)) ?? false;
+    },
+
     async *exportPack(
       wants: Set<string>,
       exclude: Set<string>,
       options?: ExportPackOptions,
     ): AsyncIterable<Uint8Array> {
+      // the partial clone filter, its sparse:oid blob read (pack-objects dies on a bad one)
+      const filter = options?.filterSpec
+        ? await resolveObjectFilter(parseObjectFilter(options.filterSpec), loadSparse)
+        : undefined;
       // listObjects + writePack: streamed, stored entries reused, deltas searched
-      yield* serialization.exportPack(wants, exclude, {
+      const pack = serialization.exportPack(wants, exclude, {
+        ...(filter ? { filter } : {}),
+        ...(maxTreeDepth !== undefined ? { maxTreeDepth } : {}),
         thinPack: options?.thin,
         shallow: options?.shallow,
         ...(useBitmaps === false ? { useBitmaps } : {}),
@@ -177,6 +231,13 @@ function createRepositoryFacadeFromHistory(
           ? (options.includeTags ?? (await tagRefIds(refs)))
           : undefined,
       });
+      try {
+        yield* pack;
+      } catch (error) {
+        // the walk dies before any pack byte (it lists everything first): pack-objects' death
+        if (error instanceof TreeDepthError) throw new PackObjectsError(error.message);
+        throw error;
+      }
     },
 
     // ─────────────────────────────────────────────────────────────────
@@ -380,4 +441,68 @@ const OBJECT_TYPE_NAMES: Record<number, GitObjectTypeName> = {
  */
 function isSymbolicRef(ref: Ref | SymbolicRef): ref is SymbolicRef {
   return "target" in ref;
+}
+
+/** dir.c's PATTERN_MAX_FILE_SIZE: a pattern blob larger than this is ignored (100 MiB). */
+const PATTERN_MAX_FILE_SIZE = 100 * 1024 * 1024;
+
+/**
+ * A revision as git's get_oid reads it (`resolveRevision`: a full id first, refs by git's
+ * short-name rules, an abbreviated id, `~`/`^`/`^{type}` suffixes), hex in any case.
+ */
+async function resolveRevisionOf(
+  history: History,
+  facade: RepositoryFacade,
+  rev: string,
+): Promise<string | undefined> {
+  // get_oid_hex takes either case; a full id wins over a ref of that name
+  const lower = /^[0-9a-fA-F]+$/.test(rev) ? rev.toLowerCase() : undefined;
+  if (lower?.length === 40) return (await facade.has(lower)) ? lower : undefined;
+  const refs = new Map<string, string>();
+  let head: string | undefined;
+  for await (const ref of history.refs.list()) {
+    const resolved = isSymbolicRef(ref)
+      ? await history.refs.resolve(ref.name).catch(() => undefined)
+      : ref;
+    if (!resolved || !("objectId" in resolved) || !resolved.objectId) continue;
+    refs.set(ref.name, resolved.objectId);
+  }
+  const headRef = await history.refs.resolve("HEAD").catch(() => undefined);
+  if (headRef && "objectId" in headRef && headRef.objectId) head = headRef.objectId;
+  const source = { refs, ...(head ? { head: { oid: head } } : {}), repository: facade };
+  const found = await resolveRevision(rev, source);
+  if (found !== undefined || lower === undefined || lower === rev) return found;
+  // an abbreviated id in upper case: no ref matched it as written
+  return resolveRevision(lower, source);
+}
+
+/**
+ * The blob a `sparse:oid=` filter names, as git's `get_oid_with_context` reads the common
+ * forms: a revision (see {@link resolveRevisionOf}), or `<rev>:<path>` (the revision peeled
+ * to its tree, the path looked up in it). Undefined when it names nothing.
+ */
+async function resolveBlobName(
+  history: History,
+  facade: RepositoryFacade,
+  name: string,
+): Promise<string | undefined> {
+  const colon = name.indexOf(":");
+  if (colon < 0) return resolveRevisionOf(history, facade, name);
+  const rev = name.slice(0, colon);
+  const path = name.slice(colon + 1);
+  // `:<path>` names an index entry, which a served repository does not read
+  if (rev === "") return undefined;
+  let id = await resolveRevisionOf(history, facade, `${rev}^{tree}`);
+  if (id === undefined) return undefined;
+  for (const part of path.split("/").filter((p) => p.length > 0)) {
+    const tree = await history.trees.load(id).catch(() => undefined);
+    if (!tree) return undefined;
+    let next: string | undefined;
+    for await (const entry of tree) {
+      if (entry.name === part) next = entry.id;
+    }
+    if (next === undefined) return undefined;
+    id = next;
+  }
+  return id;
 }

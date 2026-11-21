@@ -296,6 +296,7 @@ function httpOptionsOf(
     receivePackHideRefs,
     requestPolicy,
     advertiseObjectInfo,
+    uploadPackFilter,
     logger,
     capabilities: _capabilities,
     ...receive
@@ -312,6 +313,7 @@ function httpOptionsOf(
   const policy = requestPolicy ?? options.requestPolicy;
   if (policy !== undefined) out.requestPolicy = policy;
   if (advertiseObjectInfo !== undefined) out.advertiseObjectInfo = advertiseObjectInfo;
+  if (uploadPackFilter !== undefined) out.uploadPackFilter = uploadPackFilter;
   if (options.maxRequestBodyBytes !== undefined) {
     out.maxRequestBodyBytes = options.maxRequestBodyBytes;
   }

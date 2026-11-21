@@ -24,6 +24,7 @@ import { ZERO_OID } from "../../protocol/constants.js";
 import { visibleRefs } from "../../protocol/hidden-refs.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { sendPackStream } from "./send-pack-stream.js";
+import { checkUploadPackFilter, withFilterCapability } from "./upload-pack-filter.js";
 import {
   computeShallowUpdate,
   findUnreachableWant,
@@ -57,7 +58,7 @@ export const serverFetchTransitions: FsmTransition[] = [
   ["READ_WANTS", "WANTS_RECEIVED", "VALIDATE_WANTS"],
   ["READ_WANTS", "WANTS_WITH_SHALLOW", "VALIDATE_WANTS"], // Wants + shallow info
   ["READ_WANTS", "NO_WANTS", ""], // client has everything
-  ["READ_WANTS", "INVALID_REQUEST", "SEND_ERROR"], // a deepen line git refuses
+  ["READ_WANTS", "INVALID_REQUEST", "SEND_ERROR"], // a deepen or filter line git refuses
   ["READ_WANTS", "ERROR", ""],
 
   // Validate wants against policy (ADVERTISED, REACHABLE_COMMIT, TIP, ANY)
@@ -83,10 +84,8 @@ export const serverFetchTransitions: FsmTransition[] = [
   ["SEND_SHALLOW_UPDATE", "SHALLOW_SENT", "READ_HAVES"],
   ["SEND_SHALLOW_UPDATE", "ERROR", ""],
 
-  // Read filter specification (partial clone)
-  ["READ_WANTS", "WANTS_WITH_FILTER", "READ_FILTER"],
-  ["READ_FILTER", "FILTER_RECEIVED", "VALIDATE_WANTS"],
-  ["READ_FILTER", "ERROR", ""],
+  // A filter line came with the wants (partial clone): checked with them
+  ["READ_WANTS", "WANTS_WITH_FILTER", "VALIDATE_WANTS"],
 
   // Read a batch of haves (each answered as it is read, as git's get_common_commits)
   ["READ_HAVES", "DONE_RECEIVED", "SEND_FINAL_ACK"], // client sent done
@@ -178,8 +177,8 @@ function uploadRequest(ctx: ProcessContext): UploadPackRequestParts {
 /**
  * What upload-pack (protocol v0/v1) advertises by default: only what it implements. The
  * `allow-*-sha1-in-want` capabilities follow the request policy; `deepen-since`, `deepen-not`
- * and `deepen-relative` need the commit graph (`getCommitInfo`); no `filter` (no partial
- * clone).
+ * and `deepen-relative` need the commit graph (`getCommitInfo`); `filter` is added by the
+ * advertisement with `uploadpack.allowFilter` (`withFilterCapability`).
  */
 export function defaultUploadPackCapabilities(
   policy: string | undefined,
@@ -235,13 +234,21 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const config = getConfig(ctx);
       const state = getState(ctx);
       const output = getOutput(ctx);
+      // upload_pack_config dies on a filter setting it cannot read, before the advertisement
+      if (config.uploadPackFilter?.configError !== undefined) {
+        output.error = config.uploadPackFilter.configError;
+        return "ERROR";
+      }
       try {
         const repositoryShallow = await prepareServedShallow(ctx);
         const repository = getRepository(ctx);
         const refs = await refStore.listAll();
-        const capabilities =
+        // `filter` with uploadpack.allowFilter, after the others (git puts it near the end)
+        const capabilities = withFilterCapability(
           config.serverCapabilities ??
-          defaultUploadPackCapabilities(config.requestPolicy, repository);
+            defaultUploadPackCapabilities(config.requestPolicy, repository),
+          config.uploadPackFilter,
+        );
 
         let first = true;
         // hidden refs are neither advertised nor "ours" under the ADVERTISED policy
@@ -285,6 +292,11 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const state = getState(ctx);
       const output = getOutput(ctx);
 
+      const configError = getConfig(ctx).uploadPackFilter?.configError;
+      if (configError !== undefined) {
+        output.error = configError;
+        return "ERROR";
+      }
       try {
         // a stateless request starts here (its advertisement was another request)
         await prepareServedShallow(ctx);
@@ -358,8 +370,21 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           } else if (line === "deepen-relative") {
             state.deepenRelative = true;
           } else if (line.startsWith("filter ")) {
+            // receive_needs checks it as it reads the line, in the loop of the wants: the
+            // negotiated capability, one spec (list_objects_filter_die_if_populated), a
+            // parsable and allowed one; git dies on each (an allow-list refusal sent as ERR)
+            const spec = line.slice(7);
+            const refused = !state.capabilities.has("filter")
+              ? { message: "git upload-pack: filtering capability not negotiated", reported: false }
+              : hasFilter
+                ? { message: "multiple filter-specs cannot be combined", reported: false }
+                : checkUploadPackFilter(spec, getConfig(ctx).uploadPackFilter);
+            if (refused) {
+              output.error = refused.message;
+              return refused.reported ? "INVALID_REQUEST" : "ERROR";
+            }
             hasFilter = true;
-            state.filterSpec = line.slice(7);
+            state.filterSpec = spec;
           }
         }
       } catch (e) {
@@ -461,39 +486,6 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         await transport.writeLine(`ERR ${output.error}`);
         output.errorReported = true;
         return "ERROR_SENT";
-      } catch (e) {
-        output.error = String(e);
-        return "ERROR";
-      }
-    },
-  ],
-
-  // Read filter specification
-  [
-    "READ_FILTER",
-    async (ctx) => {
-      const transport = getTransport(ctx);
-      const state = getState(ctx);
-      const output = getOutput(ctx);
-
-      try {
-        while (true) {
-          const pkt = await transport.readPktLine();
-          if (pkt.type === "flush") return "FILTER_RECEIVED";
-          if (pkt.type === "eof") {
-            output.error = "Unexpected end of input";
-            return "ERROR";
-          }
-          if (pkt.type === "delim") {
-            continue; // Unexpected delimiter in filter section
-          }
-
-          // Type narrowing: pkt.type === "data" guaranteed here
-          const line = pkt.text;
-          if (line.startsWith("filter ")) {
-            state.filterSpec = line.slice(7);
-          }
-        }
       } catch (e) {
         output.error = String(e);
         return "ERROR";

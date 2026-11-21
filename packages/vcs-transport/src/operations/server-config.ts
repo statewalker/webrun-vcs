@@ -14,6 +14,10 @@
  * ```
  */
 
+import {
+  type UploadPackFilterPolicy,
+  uploadPackFilterPolicyOf,
+} from "../fsm/fetch/upload-pack-filter.js";
 import type { ReceiveDenyAction } from "../fsm/push/receive-pack-types.js";
 
 /** Reads a repository's configuration. */
@@ -47,6 +51,32 @@ export interface ServerConfigSettings {
   uploadPackHideRefs: string[];
   /** receive-pack's hidden ref patterns: `transfer.hideRefs` and `receive.hideRefs` */
   receivePackHideRefs: string[];
+  /**
+   * upload-pack's partial clone filters: `uploadpack.allowFilter`, `uploadpackfilter.allow`,
+   * `uploadpackfilter.<choice>.allow`, `uploadpackfilter.tree.maxDepth` (absent: none set, no
+   * filter advertised, as git's default)
+   */
+  uploadPackFilter?: UploadPackFilterPolicy;
+}
+
+/** The keys of {@link ServerConfigSettings.uploadPackFilter} without a subsection list. */
+const FILTER_KEYS = [
+  "uploadpack.allowFilter",
+  "uploadpackfilter.allow",
+  ...["blob:none", "blob:limit", "tree", "sparse:oid", "object:type", "combine"].map(
+    (choice) => `uploadpackfilter.${choice}.allow`,
+  ),
+  "uploadpackfilter.tree.maxDepth",
+];
+
+/** The filter policy the configuration sets, read in config order where it can be. */
+function filterPolicy(config: ServerConfigReader): UploadPackFilterPolicy | undefined {
+  if (config.list) return uploadPackFilterPolicyOf(config.list());
+  const entries: { key: string; value: unknown }[] = [];
+  for (const key of FILTER_KEYS) {
+    for (const value of config.getAll(key)) entries.push({ key, value });
+  }
+  return uploadPackFilterPolicyOf(entries);
 }
 
 /** git's `git_config_bool`: a key without a value is true, an empty value false. */
@@ -167,6 +197,8 @@ export function explicitServerSettingsFromConfig(
   if (upload.length > 0) out.uploadPackHideRefs = upload;
   const receive = hideRefs(config, "receive");
   if (receive.length > 0) out.receivePackHideRefs = receive;
+  const filter = filterPolicy(config);
+  if (filter) out.uploadPackFilter = filter;
   return out;
 }
 

@@ -3,6 +3,7 @@
  */
 
 import type { RepositoryFacade } from "../../api/repository-facade.js";
+import { type UploadPackFilterPolicy, withFilterFeature } from "../fetch/upload-pack-filter.js";
 
 /**
  * V2 fetch request structure.
@@ -41,6 +42,8 @@ export interface FetchV2Request {
 
   /** Partial clone filter spec */
   filter: string | null;
+  /** A second `filter` line came (git dies: "multiple filter-specs cannot be combined") */
+  filterRepeated?: boolean;
 
   /** Packfile-uri protocols (if packfile-uris capability) */
   packfileUriProtocols?: string[];
@@ -60,7 +63,7 @@ export type FetchV2ResponseSection =
  * Default V2 server capabilities: what the server implements. `ls-refs=unborn`: ls-refs reports
  * an unborn HEAD (`unborn HEAD symref-target:<ref>`), so cloning an empty repository picks its
  * branch; `fetch=shallow` covers `deepen`, `deepen-relative`, `deepen-since` and `deepen-not`;
- * no `filter` (no partial clone). No `object-info`, as git (since 2.45) without
+ * no `filter` (added with `uploadpack.allowFilter`: see `UploadPackFilterPolicy`). No `object-info`, as git (since 2.45) without
  * `transfer.advertiseObjectInfo`: the servers' `advertiseObjectInfo` option adds
  * {@link OBJECT_INFO_CAPABILITY}.
  */
@@ -92,8 +95,10 @@ export function serverV2Capabilities(
   capabilities: readonly string[] = SERVER_V2_CAPABILITIES,
   advertiseObjectInfo = false,
   repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType">,
+  uploadPackFilter?: UploadPackFilterPolicy,
 ): string[] {
-  const list = [...capabilities];
+  // `fetch=... filter` with uploadpack.allowFilter
+  const list = withFilterFeature(capabilities, uploadPackFilter);
   const named = list.some((c) => c === "object-info" || c.startsWith("object-info="));
   if (!advertiseObjectInfo || named) return list;
   const attributes = objectInfoAttributes(repository);

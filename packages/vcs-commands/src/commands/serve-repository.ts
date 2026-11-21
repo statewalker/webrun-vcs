@@ -13,11 +13,12 @@ import {
   type ServerConfigReader,
   servedGitFilesOf,
 } from "@statewalker/vcs-transport";
-import type { OpenedRepository } from "@statewalker/vcs-working-tree";
+import { type OpenedRepository, sparseFilterMatcher } from "@statewalker/vcs-working-tree";
 import type { HookSession } from "./git-hooks.js";
 import {
   httpBackendEnv,
   receivePackSettingsOf,
+  servedMaxTreeDepth,
   servedUseBitmaps,
   withReceiveTransactionHook,
 } from "./local-transport.js";
@@ -93,6 +94,10 @@ export async function servedRepositoryOf(
       history: remote.history,
       // git's pack.useBitmaps (pack-objects reads it from the served repository)
       useBitmaps: servedUseBitmaps(remote),
+      // a sparse:oid filter's patterns
+      sparseFilterPatterns: sparseFilterMatcher,
+      // core.maxTreeDepth (pack-objects' walk)
+      maxTreeDepth: servedMaxTreeDepth(remote),
     }),
     refStore: createTransportRefStore(remote.history.refs),
     config: remote.config ?? EMPTY_CONFIG,

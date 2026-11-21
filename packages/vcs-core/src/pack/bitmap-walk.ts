@@ -35,6 +35,7 @@ import {
   TREE_ENTRY_GITLINK,
   TREE_ENTRY_TREE,
 } from "./list-objects.js";
+import type { ObjectFilter } from "./object-filter/index.js";
 import type { PackBitmapIndex } from "./pack-bitmap.js";
 import { packNameHash } from "./write-pack.js";
 
@@ -62,6 +63,12 @@ export interface BitmapWalkOptions {
   haves?: Iterable<ObjectId>;
   /** A filter of the listed objects (wants are always kept). */
   filter?: BitmapFilter;
+  /**
+   * A partial clone filter git's bitmaps apply (`canFilterBitmap`: `blob:none`,
+   * `blob:limit`, `tree:0`, `object:type`, `combine:` of those), as pack-bitmap.c's
+   * `filter_bitmap`: the wants and what their tags peel to are kept whatever their type.
+   */
+  objectFilter?: ObjectFilter;
   /** A commit's tree and parents without reading it (the commit-graph). */
   commitHeader?: ListObjectsOptions["commitHeader"];
 }
@@ -163,6 +170,7 @@ export async function bitmapWalk(
     roots: Iterable<ObjectId>,
     seen: RawBitmap | undefined,
     required: boolean,
+    tips?: ObjectId[],
   ): Promise<RawBitmap> => {
     const out = new RawBitmap(Math.ceil(count / 64) + 1);
     const known = (p: number) => p >= 0 && (out.get(p) || (seen?.get(p) ?? false));
@@ -200,6 +208,8 @@ export async function bitmapWalk(
     for (const root of roots) {
       let id = root;
       for (let depth = 0; depth < 64; depth++) {
+        // git's prepare_bitmap_walk lists each tag of a want and what it peels to
+        tips?.push(id);
         const p = posOf(id);
         if (known(p)) break;
         const inPack = p >= 0 && p < count;
@@ -247,8 +257,69 @@ export async function bitmapWalk(
 
   const haves = await find(options.haves ?? [], undefined, false);
   const wantList = [...options.wants];
-  const result = await find(wantList, haves, true);
+  const tipIds: ObjectId[] = [];
+  const result = await find(wantList, haves, true, tipIds);
   result.andNot(haves);
+
+  const typeOf = (p: number): ObjectTypeString | undefined =>
+    p < count ? index.typeAt(p) : (extTypes[p - count] as ObjectTypeString);
+  if (options.objectFilter) {
+    // the tips' bits as they are now: a filter never clears them (find_tip_objects)
+    const tips = new Map<number, boolean>();
+    for (const id of tipIds) {
+      const p = posOf(id);
+      if (p >= 0) tips.set(p, result.get(p));
+    }
+    const typed = {
+      commit: index.commits,
+      tree: index.trees,
+      blob: index.blobs,
+      tag: index.tags,
+    };
+    const exclude = (type: ObjectTypeString) => {
+      result.andNotEwah(typed[type], count);
+      for (let k = 0; k < extIds.length; k++) {
+        if (extTypes[k] === type) result.unset(count + k);
+      }
+      for (const [p, was] of tips) if (was && typeOf(p) === type) result.set(p);
+    };
+    const sizeOf = async (p: number): Promise<number> => {
+      const id = p < count ? index.idAt(p) : (extIds[p - count] as ObjectId);
+      const o = await objects.get(id);
+      if (!o) throw new MissingObjectError(`unable to get size of ${id}`);
+      await o.content[Symbol.asyncIterator]().return?.();
+      return o.size;
+    };
+    const apply = async (f: ObjectFilter): Promise<void> => {
+      switch (f.choice) {
+        case "blob:none":
+          exclude("blob");
+          return;
+        case "tree":
+          if (f.depth !== 0) throw new Error(`bitmaps cannot apply tree:${f.depth}`);
+          exclude("tree");
+          exclude("blob");
+          return;
+        case "object:type":
+          for (const t of ["tag", "commit", "tree", "blob"] as const) if (t !== f.type) exclude(t);
+          return;
+        case "blob:limit": {
+          const blobs: number[] = [];
+          result.forEach((p) => {
+            if (typeOf(p) === "blob" && !tips.has(p)) blobs.push(p);
+          });
+          for (const p of blobs) if ((await sizeOf(p)) >= f.limit) result.unset(p);
+          return;
+        }
+        case "combine":
+          for (const sub of f.filters) await apply(sub);
+          return;
+        default:
+          throw new Error(`bitmaps cannot apply ${f.choice}`);
+      }
+    };
+    await apply(options.objectFilter);
+  }
 
   // filters: their types cleared, the wants kept (git's filter_bitmap_exclude_type tips)
   const filter = options.filter;
@@ -326,6 +397,7 @@ export async function* listObjectsWithBitmap(
   const result = await bitmapWalk(index, objects, {
     wants: options.wants,
     haves: [...(options.haves ?? []), ...(options.excludes ?? [])],
+    ...(options.filter ? { objectFilter: options.filter as ObjectFilter } : {}),
     ...(options.commitHeader ? { commitHeader: options.commitHeader } : {}),
   });
   yield* result.objects();

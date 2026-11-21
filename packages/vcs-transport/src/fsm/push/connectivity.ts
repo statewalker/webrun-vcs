@@ -55,6 +55,18 @@ export interface ConnectivityOptions {
   shallow?: ReadonlySet<string>;
   /** Commits step 1 may read before the exact walk takes over (default 10000) */
   firstStepBudget?: number;
+  /**
+   * Objects a partial clone's server promised (its filter left them out): a tree or blob of
+   * these kinds found absent under a tree or commit is not missing (git's
+   * `--exclude-promisor-objects`, narrowed to what the filter omits)
+   */
+  promised?: PromisedKinds;
+}
+
+/** The kinds of objects a partial clone filter may leave out. */
+export interface PromisedKinds {
+  tree: boolean;
+  blob: boolean;
 }
 
 /**
@@ -196,7 +208,7 @@ export class PushConnectivity {
     this.known = new Set(known);
     this.shallow = options.shallow ?? new Set();
     this.budget = options.firstStepBudget ?? DEFAULT_FIRST_STEP_BUDGET;
-    this.checker = new ObjectChecker(repository);
+    this.checker = new ObjectChecker(repository, options.promised);
   }
 
   /** Analyzes the push of `tips` (any object ids). */
@@ -509,7 +521,10 @@ class ObjectChecker {
   /** What each object found missing was expected to be */
   private readonly kinds = new Map<string, "object" | "tree" | "blob">();
 
-  constructor(private readonly repository: RepositoryFacade) {}
+  constructor(
+    private readonly repository: RepositoryFacade,
+    private readonly promised?: PromisedKinds,
+  ) {}
 
   /** Records `id` as a missing tip. */
   markMissing(id: string): void {
@@ -562,6 +577,11 @@ class ObjectChecker {
     if (known !== undefined) return known;
     const entries = await this.repository.getTreeEntries?.(tree);
     if (!entries) {
+      // a tree the filter left out (absent, not of another type): promised
+      if (this.promised?.tree && !(await this.repository.has(tree))) {
+        this.checked.add(tree);
+        return undefined;
+      }
       this.brokenTrees.set(tree, tree);
       if (!this.kinds.has(tree)) this.kinds.set(tree, "tree");
       return tree;
@@ -583,6 +603,11 @@ class ObjectChecker {
         missing = await this.checkTree(entry.id, baseTree);
       } else if (!this.checked.has(entry.id)) {
         if (this.missing.has(entry.id) || !(await this.repository.has(entry.id))) {
+          if (this.promised?.blob) {
+            // a blob the filter left out: promised
+            this.checked.add(entry.id);
+            continue;
+          }
           this.missing.add(entry.id);
           if (!this.kinds.has(entry.id)) this.kinds.set(entry.id, "blob");
           missing = entry.id;

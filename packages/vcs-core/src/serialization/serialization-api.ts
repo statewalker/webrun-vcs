@@ -14,6 +14,7 @@
 import type { ObjectId } from "../common/id/index.js";
 import type { ObjectQuarantine } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
+import type { ResolvedObjectFilter } from "../pack/object-filter/index.js";
 import type { PackEntryInfo } from "../pack/unpack-objects.js";
 
 /**
@@ -108,6 +109,17 @@ export interface ExportOptions extends PackOptions {
    * haves (its delta bases come from the revision walk's boundary).
    */
   useBitmaps?: boolean;
+  /**
+   * A partial clone filter (upload-pack's `filter`, `pack-objects --filter`), its
+   * `sparse:oid` patterns read (`resolveObjectFilter`): the objects it omits are not packed
+   * (see `ListObjectsOptions.filter`)
+   */
+  filter?: ResolvedObjectFilter;
+  /**
+   * git's `core.maxTreeDepth` for the walk (default 2048): a deeper tree fails the export with
+   * `TreeDepthError` (see `ListObjectsOptions.maxTreeDepth`)
+   */
+  maxTreeDepth?: number;
 }
 
 /**
@@ -188,6 +200,13 @@ export interface SerializationApi {
     pack: AsyncIterable<Uint8Array>,
     options?: PackImportOptions,
   ): Promise<PackImportResult>;
+
+  /**
+   * Marks a pack kept by `importPack` as a promisor pack (`pack-<id>.promisor` with `content`,
+   * as git's fetch-pack writes for a partial clone's packs). False where the backend keeps no
+   * packs.
+   */
+  markPromisorPack?(packId: string, content: string): Promise<boolean>;
 
   /**
    * Export single object in Git format

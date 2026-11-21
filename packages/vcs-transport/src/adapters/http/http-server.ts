@@ -34,6 +34,10 @@ import {
   serverFetchHandlers,
   serverFetchTransitions,
 } from "../../fsm/fetch/server-fetch-fsm.js";
+import {
+  type UploadPackFilterPolicy,
+  withFilterCapability,
+} from "../../fsm/fetch/upload-pack-filter.js";
 import { peelFully } from "../../fsm/fetch/upload-pack-graph.js";
 import type { UploadPackConfig, UploadPackHooks } from "../../fsm/fetch/upload-pack-hooks.js";
 import { Fsm } from "../../fsm/fsm.js";
@@ -129,6 +133,11 @@ export interface HttpServerOptions {
    * it is refused ("invalid command 'object-info'").
    */
   advertiseObjectInfo?: boolean;
+  /**
+   * upload-pack's partial clone filters (git's `uploadpack.allowFilter` and
+   * `uploadpackfilter.*`; see `UploadPackFilterPolicy`). Default: none advertised.
+   */
+  uploadPackFilter?: UploadPackFilterPolicy;
   /** receive-pack (push) hooks, limits and ref policies */
   receivePack?: ReceivePackServerOptions;
   /** upload-pack (fetch) hooks and hidden refs */
@@ -476,6 +485,15 @@ function header(request: HttpRequest, name: string): string | undefined {
   return undefined;
 }
 
+/**
+ * upload-pack dying as it reads its config (a filter setting it cannot read): nothing of the
+ * service is sent, the response a server error
+ */
+function uploadPackConfigError(options: HttpServerOptions): HttpResponse | undefined {
+  const error = options.uploadPackFilter?.configError;
+  return error === undefined ? undefined : plain(500, `fatal: ${error}`);
+}
+
 function plain(status: number, message: string): HttpResponse {
   return {
     status,
@@ -515,6 +533,8 @@ export async function handleInfoRefs(
   repository?: RepositoryFacade,
   version1 = false,
 ): Promise<HttpResponse> {
+  const unreadable = uploadPackConfigError(options);
+  if (unreadable) return unreadable;
   // Get all refs but the hidden ones
   const refs = visibleRefs(await refStore.listAll(), uploadPackHiddenRefs(options));
 
@@ -528,7 +548,10 @@ export async function handleInfoRefs(
   if (version1) chunks.push(encodePacketLine("version 1\n"));
 
   // Default capabilities (copied: the symref below must not change the caller's array)
-  const capabilities = [...(options.capabilities ?? DEFAULT_UPLOAD_PACK_CAPABILITIES)];
+  const capabilities = withFilterCapability(
+    options.capabilities ?? DEFAULT_UPLOAD_PACK_CAPABILITIES,
+    options.uploadPackFilter,
+  );
 
   // Add symref capability if HEAD is a symbolic ref
   if (refStore.getSymrefTarget) {
@@ -640,11 +663,14 @@ export function handleInfoRefsV2(
   options: HttpServerOptions = {},
   repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType">,
 ): HttpResponse {
+  const unreadable = uploadPackConfigError(options);
+  if (unreadable) return unreadable;
   const chunks: Uint8Array[] = [encodePacketLine("version 2\n")];
   for (const capability of serverV2Capabilities(
     options.v2Capabilities,
     options.advertiseObjectInfo,
     repository,
+    options.uploadPackFilter,
   )) {
     chunks.push(encodePacketLine(`${capability}\n`));
   }
@@ -678,6 +704,8 @@ export async function handleUploadPack(
   options: HttpServerOptions = {},
   context: HttpHandlerContext = {},
 ): Promise<HttpResponse> {
+  const unreadable = uploadPackConfigError(options);
+  if (unreadable) return unreadable;
   const requestBytes = await readUploadPackRequest(request, options);
   if (!(requestBytes instanceof Uint8Array)) return requestBytes;
 
@@ -691,12 +719,16 @@ export async function handleUploadPack(
 
   // What GET /info/refs advertised; the client's first want line picks from it (the FSM sets
   // `state.capabilities` to that request, possibly empty)
-  for (const cap of options.capabilities ?? DEFAULT_UPLOAD_PACK_CAPABILITIES) {
+  for (const cap of withFilterCapability(
+    options.capabilities ?? DEFAULT_UPLOAD_PACK_CAPABILITIES,
+    options.uploadPackFilter,
+  )) {
     state.advertisedCapabilities.add(cap);
   }
 
   const config: ProcessConfiguration = {
     requestPolicy: options.requestPolicy ?? "ADVERTISED",
+    ...(options.uploadPackFilter ? { uploadPackFilter: options.uploadPackFilter } : {}),
     maxEmptyBatches: 10,
     keepAliveMs: options.keepAliveMs,
     hiddenRefs,
@@ -736,6 +768,8 @@ export async function handleUploadPackV2(
   options: HttpServerOptions = {},
   context: HttpHandlerContext = {},
 ): Promise<HttpResponse> {
+  const unreadable = uploadPackConfigError(options);
+  if (unreadable) return unreadable;
   const requestBytes = await readUploadPackRequest(request, options);
   if (!(requestBytes instanceof Uint8Array)) return requestBytes;
 
@@ -746,6 +780,7 @@ export async function handleUploadPackV2(
   const config: ProcessConfiguration = {
     serverCapabilities: options.v2Capabilities,
     advertiseObjectInfo: options.advertiseObjectInfo,
+    ...(options.uploadPackFilter ? { uploadPackFilter: options.uploadPackFilter } : {}),
     // git's v2 upload-pack serves any object it has
     requestPolicy: options.requestPolicy ?? "ANY",
     keepAliveMs: options.keepAliveMs,

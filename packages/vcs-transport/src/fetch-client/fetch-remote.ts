@@ -21,6 +21,7 @@ import {
   checkReceivedPack,
   connectivityErrors,
   FetchCheckError,
+  filterPromises,
   ReceivedLinks,
   ReceivedObjects,
   type ReceivedObjectsFsck,
@@ -31,8 +32,13 @@ import {
   fetchPack,
   type NegotiationStats,
   type ServerShallowUpdate,
+  serverSupportsFilter,
 } from "./fetch-pack.js";
 import type { NegotiatorSource } from "./negotiator.js";
+
+/** git's default `transfer.unpackLimit`: a fetched pack of this many objects is kept as is. */
+const DEFAULT_UNPACK_LIMIT = 100;
+
 import {
   applyRefUpdates,
   type FetchRefUpdate,
@@ -116,8 +122,18 @@ export interface FetchClientOptions {
   deepenNot?: string[];
   /** `--unshallow`: fetch the whole history of a shallow repository */
   unshallow?: boolean;
-  /** Partial clone filter (`blob:none`) */
+  /**
+   * Partial clone filter (`blob:none`). A server that does not take filters gets none
+   * (`onWarning` hears git's "filtering not recognized by server, ignoring") and the fetch is
+   * checked as a full one. A pack received under a filter is kept with a `.promisor` file
+   * (the sought refs for a kept pack, as fetch-pack writes it); the new tips are checked as
+   * `rev-list --exclude-promisor-objects` would, an absent object passing only when the
+   * filter leaves out objects of its kind (`filterPromises`). Objects are never fetched
+   * lazily: reading an absent blob fails.
+   */
   filter?: string;
+  /** Warnings fetch-pack prints (`warning: ...`) */
+  onWarning?: (line: string) => void;
   /** Allow every update to be a non-fast-forward (`--force`) */
   force?: boolean;
   /** Write all ref updates in one transaction, or none (`--atomic`) */
@@ -401,7 +417,15 @@ export async function fetchFromConnection(
   let serverShallow: ServerShallowInfo | undefined;
   // index-pack's links check: with fsck (`--strict`), or for a clone without --depth
   // (`--check-self-contained-and-connected`); never for a partial clone's packs
-  const strictLinks = !options.filter && (!!options.fsckObjects || options.cloning === true);
+  // the filter the server takes (fetch-pack drops one it does not, with a warning): its
+  // objects are promised, so the checks below cannot walk them
+  const filter = options.filter && serverSupportsFilter(connection) ? options.filter : undefined;
+  const strictLinks = !filter && (!!options.fsckObjects || options.cloning === true);
+  /**
+   * The refs a filtered round asked for (fetch-pack's `sought`), the lines of its pack's
+   * `.promisor` file: `<id> <name>`, in the order the server listed them
+   */
+  let promisorSought: RemoteRef[] = [];
   /** Packs that named nothing outside themselves (a clone's check skips the tips they hold) */
   const selfContained: ReceivedObjects[] = [];
   /** The tips fetch-pack's own check of a deepening fetch covered */
@@ -441,13 +465,15 @@ export async function fetchFromConnection(
       knownCommon,
       shallow,
       filter: options.filter,
+      ...(options.onWarning ? { onWarning: options.onWarning } : {}),
       includeTag: autoTags,
       onProgress: options.onProgress,
       importPack: options.dryRun
         ? drainPack
         : (pack) =>
             repository.importPack(pack, {
-              ...(options.keepPack ? { keepPack: true } : {}),
+              // a filtered pack goes through index-pack (`--promisor`): kept, never unpacked
+              ...(options.keepPack || filter ? { keepPack: true } : {}),
               // checked before anything sees them: a refused pack leaves no object behind
               ...(received
                 ? { quarantine: true, onObject: (id, type, entry) => received.add(id, type, entry) }
@@ -494,6 +520,17 @@ export async function fetchFromConnection(
     } finally {
       // a refused pack (or any failure before the commit) leaves no object behind
       if (!committed) await quarantine?.discard().catch(() => {});
+    }
+    if (filter && imported.packId !== undefined && !options.dryRun) {
+      // a promisor pack: index-pack `--promisor` writes an empty `.promisor`, which fetch-pack
+      // replaces with the sought refs for a kept pack (`--keep`, or transfer.unpackLimit's 100
+      // objects reached) when it locks the pack itself: not the `git fetch-pack` remote-curl
+      // runs for smart HTTP v0, which is given no lock file
+      const kept =
+        (options.keepPack || fetched.packObjects >= DEFAULT_UNPACK_LIMIT) &&
+        !(connection.stateless && connection.version !== 2);
+      const content = kept ? promisorSought.map((r) => `${r.oid} ${r.name}\n`).join("") : "";
+      await repository.markPromisorPack?.(imported.packId, content);
     }
     if (!options.dryRun) packFetched = true;
     const after = applyShallow(shallow, update);
@@ -579,6 +616,10 @@ export async function fetchFromConnection(
   }
   const shallowRejected = new Set<PlannedRef>();
   if (wants.length > 0) {
+    // clone's mapped refs start with the remote HEAD (wanted_peer_refs)
+    const soughtNames = new Set([...sought, ...opportunistic].map((p) => p.remoteRef));
+    if (options.cloning) soughtNames.add("HEAD");
+    promisorSought = remoteRefs.filter((r) => r.oid && soughtNames.has(r.name));
     await runFetchPack(wants, {
       depth,
       deepenRelative: options.deepenRelative,
@@ -658,6 +699,7 @@ export async function fetchFromConnection(
       result.tagsNotFollowed = backfill.map((r) => r.name);
     } else {
       const backfillWants = [...new Set(backfill.map((r) => r.oid as string))];
+      promisorSought = backfill;
       await runFetchPack(backfillWants, {});
       for (const ref of backfill) {
         if (await complete.isComplete(ref.oid as string)) {
@@ -746,14 +788,27 @@ export async function fetchFromConnection(
       tips.push(p.oid);
     }
     let lines: string[] | undefined;
-    if (options.filter) {
-      // a partial clone's objects are promised: git checks the tips came (check_connected_promisor)
+    const promised = filter ? filterPromises(filter) : undefined;
+    if (filter && !promised) {
+      // a filter that may leave out commits or tags: their history cannot be walked; the
+      // tips must have come
       for (const tip of tips) {
         if (!(await repository.has(tip))) {
           lines = [`fatal: bad object ${tip}`];
           break;
         }
       }
+    } else if (promised) {
+      // git's check_connected in a partial clone takes the tips found in a promisor pack and
+      // fetches anything else lazily later; with no lazy fetch here, everything the new tips
+      // reach is walked as rev-list --exclude-promisor-objects would, an absent object passing
+      // only when it is of a kind the filter leaves out (a server that sends no trees for
+      // blob:none is refused with rev-list's "bad tree object")
+      lines = await connectivityErrors(repository, tips, {
+        known: localTips,
+        shallow: new Set(shallow),
+        promised,
+      });
     } else {
       lines = await connectivityErrors(repository, tips, {
         known: localTips,

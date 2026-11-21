@@ -24,9 +24,14 @@ import {
   serverSettingsFromConfig,
   type UploadPackConnection,
 } from "@statewalker/vcs-transport";
-import { parseGitBool } from "@statewalker/vcs-utils/encoding";
+import { parseGitBool, parseGitInt } from "@statewalker/vcs-utils/encoding";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
-import type { LinkedWorktrees, OpenedRepository, WorkingCopy } from "@statewalker/vcs-working-tree";
+import {
+  type LinkedWorktrees,
+  type OpenedRepository,
+  sparseFilterMatcher,
+  type WorkingCopy,
+} from "@statewalker/vcs-working-tree";
 import { GitApiError, TransportError } from "../errors/index.js";
 import { quoteCStyleBody } from "../results/index.js";
 import {
@@ -143,6 +148,8 @@ export async function withLocalUploadPack<T>(
     repository: createRepositoryFacade({
       history: remote.history,
       useBitmaps: servedUseBitmaps(remote),
+      sparseFilterPatterns: sparseFilterMatcher,
+      maxTreeDepth: servedMaxTreeDepth(remote),
     }),
     refStore: createTransportRefStore(remote.history.refs),
     service: "git-upload-pack",
@@ -151,6 +158,8 @@ export async function withLocalUploadPack<T>(
     ...(options.protocolVersion === 1 ? { announceVersion1: true } : {}),
     // uploadpack.hideRefs and transfer.hideRefs, in the order git reads them
     uploadPackHideRefs: settings.uploadPackHideRefs,
+    // uploadpack.allowFilter and uploadpackfilter.*
+    ...(settings.uploadPackFilter ? { uploadPackFilter: settings.uploadPackFilter } : {}),
     ...(head && "target" in head ? { currentBranch: head.target } : {}),
   }).finally(() => server.close?.());
   try {
@@ -212,6 +221,16 @@ export function servedUseBitmaps(remote: OpenedRepository): boolean {
   const value = remote.config?.getAll("pack.useBitmaps").at(-1);
   if (value === undefined || value === null) return true;
   return parseGitBool(String(value)) ?? true;
+}
+
+/**
+ * The served repository's `core.maxTreeDepth` (git's repo settings, default 2048): its
+ * pack-objects dies on a deeper tree. Undefined when unset or unreadable (the default then).
+ */
+export function servedMaxTreeDepth(remote: OpenedRepository): number | undefined {
+  const value = remote.config?.getAll("core.maxTreeDepth").at(-1);
+  if (value === undefined || value === null) return undefined;
+  return parseGitInt(value);
 }
 
 /** What git's upload-pack and receive-pack read from the served repository's config. */
@@ -424,6 +443,8 @@ async function receiveOver<T>(
     repository: createRepositoryFacade({
       history: remote.history,
       useBitmaps: servedUseBitmaps(remote),
+      sparseFilterPatterns: sparseFilterMatcher,
+      maxTreeDepth: servedMaxTreeDepth(remote),
     }),
     refStore: createTransportRefStore(remote.history.refs),
     service: "git-receive-pack",

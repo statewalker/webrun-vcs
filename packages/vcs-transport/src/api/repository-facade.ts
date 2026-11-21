@@ -179,6 +179,13 @@ export interface RepositoryFacade {
   ): Promise<PackImportResult>;
 
   /**
+   * Marks a kept pack (`PackImportResult.packId`) as a promisor pack: `pack-<id>.promisor`
+   * with `content`, as git's fetch-pack writes for the packs of a partial clone. False (or
+   * absent) where the store keeps no packs.
+   */
+  markPromisorPack?(packId: string, content: string): Promise<boolean>;
+
+  /**
    * Exports objects as a pack stream.
    * Collects reachable objects and serializes to pack format.
    *
