@@ -45,6 +45,7 @@ import {
   attributesIndexOf,
   cacheTreeOfTree,
   entryStatOf,
+  isIndexUnborn,
   type StagingEntry,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
@@ -262,6 +263,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private ignoreOtherWorktrees = false;
   private detach = false;
   private orphanFromEmptyTree = false;
+  private onlyMergeOnSwitchingBranches = false;
   private track = TrackMode.DEFAULT;
   private guess?: boolean;
   private protectUntracked = false;
@@ -419,6 +421,30 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     this.checkCallable();
     this.guess = guess;
     return this;
+  }
+
+  /**
+   * git's `only_merge_on_switching_branches` (`git switch`, and `git checkout -b <new>`
+   * given exactly so): a switch that names no target (a new branch without a start point,
+   * `--detach` without a commit) only moves HEAD, leaving the index and the worktree as
+   * they are (no index write, no check of unmerged entries, an unborn index left unborn).
+   * By default, as `git checkout` with any other arguments, such a switch still runs the
+   * two-way merge from HEAD to HEAD (an unborn index is then checked out).
+   *
+   * @param only Whether only a switch to a named target merges
+   * @returns this for chaining
+   */
+  setOnlyMergeOnSwitchingBranches(only: boolean): this {
+    this.checkCallable();
+    this.onlyMergeOnSwitchingBranches = only;
+    return this;
+  }
+
+  /** Whether this switch skips merge_working_tree (see {@link setOnlyMergeOnSwitchingBranches}). */
+  private skipsMergeWorkingTree(): boolean {
+    if (!this.onlyMergeOnSwitchingBranches || this.orphan) return false;
+    if (this.createBranch || this.forceCreateBranch) return this.startPoint === undefined;
+    return this.detach && this.name === undefined;
   }
 
   /**
@@ -957,6 +983,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       .setDetach(this.detach)
       .setTrack(this.track)
       .setOrphanFromEmptyTree(this.orphanFromEmptyTree)
+      .setOnlyMergeOnSwitchingBranches(this.onlyMergeOnSwitchingBranches)
       .setProtectUntracked(this.protectUntracked);
     if (this.createBranch) copy.setCreateBranch(true);
     if (this.name !== undefined) copy.setName(this.name);
@@ -1085,8 +1112,27 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       }
     }
 
+    // git's switch_branches without a target name (`switch -c <new>` or `switch --detach`
+    // without a start point, the bare `checkout -b <new>`: only_merge_on_switching_branches)
+    // does not run merge_working_tree: index and worktree stay as they are, an unborn index
+    // is not checked out
+    if (this.skipsMergeWorkingTree()) return this.updateRefsForSwitch(switchTo, [], [], []);
+
     // Get target tree for conflict detection and checkout
-    const targetTreeId = targetId ? await this.commits.getTree(targetId) : undefined;
+    const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
+    const headTreeId = headId ? await this.commits.getTree(headId) : undefined;
+    // git's initial checkout (`topts.initial_checkout = is_index_unborn(...)`): with no index
+    // file and no entries, twoway_merge takes every path of the target as new
+    // (merged_entry: written, untracked files in the way refused) instead of reading HEAD's
+    // files as staged deletions. `checkout --orphan` merges HEAD into HEAD (the new branch
+    // keeps its tree), which then checks HEAD's files out too.
+    const unborn = !this.force && (await isIndexUnborn(this.staging));
+    const orphanCheckout = unborn && this.orphan && !this.orphanFromEmptyTree;
+    const targetTreeId = orphanCheckout
+      ? headTreeId
+      : targetId
+        ? await this.commits.getTree(targetId)
+        : undefined;
     // in a sparse checkout, unpack-trees with its patterns: a path that stays outside is
     // neither checked nor touched in the worktree (its index entry still switches)
     const sparse = await SparseUnpack.start({
@@ -1104,8 +1150,6 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // untracked files in the way and an index with unmerged entries. With `setForce`, as
     // `git checkout -f`, the target's tree replaces index and worktree whatever they hold.
     const worktree = this.worktreeAccess;
-    const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
-    const headTreeId = headId ? await this.commits.getTree(headId) : undefined;
     const head = new Map<string, Side>();
     const target = new Map<string, Side>();
     if (headTreeId) await this.collectTreeEntries(headTreeId, "", head);
@@ -1119,7 +1163,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
 
     // (an orphan branch keeps index and worktree as they are, as git's checkout --orphan;
     // switch --orphan switches to the empty tree)
-    const keepAll = this.orphan && !this.orphanFromEmptyTree;
+    const keepAll = this.orphan && !this.orphanFromEmptyTree && !orphanCheckout;
     if (!this.force && !keepAll && unmerged.size > 0) {
       return {
         status: CheckoutStatus.CONFLICTS,
@@ -1139,10 +1183,15 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     const lostDirs: string[] = [];
     const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
     const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
+    const initial = unborn && !keepAll;
     const paths = [...new Set([...head.keys(), ...target.keys()])].sort();
     for (const path of keepAll ? [] : paths) {
       const h = head.get(path);
       const t = target.get(path);
+      if (initial && t) {
+        switched.push(path);
+        continue;
+      }
       if (!this.force && sameSide(h, t)) continue;
       const i = index.get(path);
       if (this.force) {
@@ -1408,6 +1457,19 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       pushSparseWarnings(sparseWarnings, sparse, outcome, true);
     }
 
+    return this.updateRefsForSwitch(switchTo, updated, removed, sparseWarnings);
+  }
+
+  /**
+   * git's update_refs_for_switch after the index and worktree are switched (or left alone):
+   * the new branch, HEAD and its reflog, remove_branch_state.
+   */
+  private async updateRefsForSwitch(
+    switchTo: SwitchPlan,
+    updated: string[],
+    removed: string[],
+    sparseWarnings: string[],
+  ): Promise<CheckoutResult> {
     // HEAD's reflog line (git's update_refs_for_switch): "checkout: moving from <branch
     // left, or the detached HEAD's full id> to <the name as interpreted: `-` and @{-N}
     // expanded, the new branch's name>", read before anything moves

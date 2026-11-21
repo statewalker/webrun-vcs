@@ -270,7 +270,8 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
       .setProtectUntracked(!this.force)
       .setIgnoreOtherWorktrees(this.ignoreOtherWorktrees)
       .setTrack(this.track)
-      .setMerge(this.merge);
+      .setMerge(this.merge)
+      .setOnlyMergeOnSwitchingBranches(true);
     if (this.guess !== undefined) checkout.setGuess(this.guess);
     if (this.hasReflogAction()) checkout.setReflogAction(this.reflogAction("checkout"));
     if (this.orphan !== undefined) {

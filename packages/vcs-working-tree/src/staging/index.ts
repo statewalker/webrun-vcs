@@ -18,3 +18,5 @@ export * from "./staging-edits.js";
 // Index refresh: fresh stats, compare-and-set
 export * from "./stat-refresh.js";
 export * from "./types.js";
+// git's is_index_unborn
+export * from "./unborn-index.js";

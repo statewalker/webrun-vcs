@@ -9,6 +9,7 @@ import {
   cacheTreeOfTree,
   entryStatOf,
   type IndexEntryOptions,
+  isIndexUnborn,
   repairCacheTree,
   type StagingEntry,
   type Worktree,
@@ -261,6 +262,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
           update: this.update,
           skipSparseCheckout: this.skipSparseCheckout,
           plainErrors: true,
+          initialCheckout: await isIndexUnborn(this.staging),
         },
       );
       refused(refusal?.message, refusal?.paths);
