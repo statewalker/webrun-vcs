@@ -39,6 +39,11 @@ export interface PackImportOptions {
    * when the repository can quarantine (its object store has `beginQuarantine`).
    */
   quarantine?: boolean;
+  /**
+   * Keep the pack whatever its size (git's `fetch-pack --keep`, which `git clone` asks for),
+   * never unpacking a small one into loose objects
+   */
+  keepPack?: boolean;
 }
 
 /**

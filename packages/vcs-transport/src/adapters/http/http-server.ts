@@ -53,7 +53,7 @@ import {
   serverPushTransitions,
 } from "../../fsm/push/server-push-fsm.js";
 import { ZERO_OID } from "../../protocol/constants.js";
-import { visibleRefs } from "../../protocol/hidden-refs.js";
+import { receivePackRefs, visibleRefs } from "../../protocol/hidden-refs.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import { readStreamWithIdleTimeout, withWriteTimeout } from "../../utils/idle-timeout.js";
 import { createSimpleDuplex } from "./http-duplex.js";
@@ -898,8 +898,8 @@ export async function handleReceivePackInfoRefs(
   version1 = false,
   repository?: Pick<RepositoryFacade, "alternateRefs">,
 ): Promise<HttpResponse> {
-  // Get all refs but the hidden ones
-  const refs = visibleRefs(await refStore.listAll(), receivePackHiddenRefs(options));
+  // The refs under refs/ but the hidden ones (write_head_info: never HEAD)
+  const refs = receivePackRefs(await refStore.listAll(), receivePackHiddenRefs(options));
   // write_head_info: then the alternates' refs as `.have`, each object id once and none an
   // advertised ref names
   const seen = new Set(refs.map(([, oid]) => oid));
@@ -994,9 +994,9 @@ export async function handleReceivePack(
   const rp = options.receivePack ?? {};
 
   const state = new ProtocolState();
-  // what GET /info/refs advertised: the refs but the hidden ones
+  // what GET /info/refs advertised: the refs under refs/ but the hidden ones
   const hiddenRefs = receivePackHiddenRefs(options);
-  for (const [refName, oid] of visibleRefs(await refStore.listAll(), hiddenRefs)) {
+  for (const [refName, oid] of receivePackRefs(await refStore.listAll(), hiddenRefs)) {
     state.refs.set(refName, oid);
   }
   // state.capabilities stays empty: READ_COMMANDS takes the client's request from the first

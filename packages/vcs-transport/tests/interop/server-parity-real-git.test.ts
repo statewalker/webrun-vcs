@@ -422,10 +422,49 @@ describeGit("Interop · server parity with native git", { timeout: TIMEOUT }, ()
         config: GIT_HIDE_CONFIG,
       }).stdout;
       const our = await bodyBytes(await handler(OUR_HIDE)(get("git-receive-pack")));
-      const lines = refLines(our).filter((l) => !l.endsWith(" HEAD"));
+      const lines = refLines(our);
       expect(lines).toEqual(refLines(native));
       // receive.hideRefs=refs/tags: no tags for pushes, all of them for fetches
       expect(lines.join("\n")).not.toContain("refs/tags/");
+      // write_head_info walks refs/ only: no HEAD for a pusher
+      expect(lines.join("\n")).not.toMatch(/ HEAD$/m);
+    });
+
+    it("receive-pack advertisement of an empty repository, and with every ref hidden: capabilities^{} as git", async () => {
+      const empty = makeTmpDir("rp-empty-");
+      try {
+        git(empty, ["init", "-q", "--bare", "e.git"]);
+        const native = run(empty, [
+          "receive-pack",
+          "--stateless-rpc",
+          "--advertise-refs",
+          "e.git",
+        ]).stdout;
+        const repo = await createTransportRepo();
+        try {
+          await repo.history.refs.setSymbolic("HEAD", "refs/heads/main");
+          const h = createHttpHandler({
+            resolveRepository: async () => ({ repository: repo.facade, refStore: repo.refStore }),
+          });
+          const our = await bodyBytes(await h(get("git-receive-pack")));
+          expect(refLines(our)).toEqual(refLines(native));
+          expect(refLines(our)).toEqual([`${ZERO} capabilities^{}`]);
+        } finally {
+          await repo.close();
+        }
+      } finally {
+        cleanupDir(empty);
+      }
+      // every ref hidden but HEAD there: still capabilities^{} (HEAD is never advertised)
+      const all = [["receive.hideRefs", "refs"]];
+      const native = run(root, ["receive-pack", "--stateless-rpc", "--advertise-refs", bare], {
+        config: all,
+      }).stdout;
+      const our = await bodyBytes(
+        await handler({ receivePack: { hideRefs: ["refs"] } })(get("git-receive-pack")),
+      );
+      expect(refLines(our)).toEqual(refLines(native));
+      expect(refLines(native).join("\n")).toContain("capabilities^{}");
     });
 
     it("v0: a want of a hidden tip is refused as git refuses it", async () => {

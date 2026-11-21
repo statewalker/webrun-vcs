@@ -82,14 +82,22 @@ export interface FetchClientOptions {
    * branch a worktree has checked out). With `atomic`, it may return the stale refs instead
    * of deleting them (`deletes`): they are deleted in the fetch's one ref transaction, as
    * git's prune_refs queues them into the `--atomic` transaction, so a refused update or a
-   * failed transaction leaves them too.
+   * failed transaction leaves them too. It may also return `completeTips`: object ids whose
+   * whole history is here now (git clone's `clone_local` copies the source's objects after
+   * listing its refs), counted as local tips, so the refs they name are written without
+   * fetching anything.
    */
   beforeFetch?: (
     remoteRefs: readonly RemoteRef[],
     refMap: readonly { remoteRef: string; localRef?: string }[],
-  ) => Promise<{ deletes?: string[] } | undefined>;
+  ) => Promise<{ deletes?: string[]; completeTips?: Iterable<string> } | undefined>;
   /** Tag following; default `auto` */
   tags?: TagMode;
+  /**
+   * Keep the received pack whatever its size (git's `TRANS_OPT_KEEP`: `git clone` keeps every
+   * pack, where a fetch below `transfer.unpackLimit` objects unpacks it)
+   */
+  keepPack?: boolean;
   /** Shallow fetch: at most this many commits from each fetched tip (`--depth`) */
   depth?: number;
   /** `--deepen-relative`: `depth` counts from the current shallow boundary */
@@ -344,6 +352,7 @@ export async function fetchFromConnection(
   // the alternates' refs too: tips the negotiation offers and complete history (fetch-pack's
   // insert_alternate_refs and mark_alternate_complete)
   for (const oid of (await repository.alternateRefs?.()) ?? []) localTips.add(oid);
+  for (const oid of before?.completeTips ?? []) localTips.add(oid);
   const complete = new Completeness(repository, localTips);
   let shallow = shallowBefore;
   const runFetchPack = async (wants: string[], request: Partial<FetchPackRequest>) => {
@@ -362,7 +371,9 @@ export async function fetchFromConnection(
       filter: options.filter,
       includeTag: autoTags,
       onProgress: options.onProgress,
-      importPack: options.dryRun ? drainPack : (pack) => repository.importPack(pack),
+      importPack: options.dryRun
+        ? drainPack
+        : (pack) => repository.importPack(pack, options.keepPack ? { keepPack: true } : undefined),
       onShallowUpdate: (u) => {
         update = u;
         const changed = applyShallow(shallow, u) !== shallow;

@@ -455,8 +455,7 @@ describeGit("alternate object directories, as native git", () => {
       };
       const theirs = await (await backend.fetch(new Request(`http://localhost${path}`))).text();
       const mine = await (await ours(new Request(`http://localhost${path}`))).text();
-      // (ours advertises HEAD to a pusher too, which receive-pack does not: left out here)
-      expect(strip(mine).filter((l) => !l.endsWith(" HEAD"))).toEqual(strip(theirs));
+      expect(strip(mine)).toEqual(strip(theirs));
       expect(theirs).toContain(".have");
     } finally {
       backend.close();
@@ -614,6 +613,127 @@ describeGit("alternate object directories, as native git", () => {
     });
     expect(above.objects.alternates?.errors).toEqual([]);
     for (const id of ids) expect(await above.objects.has(id)).toBe(true);
+  });
+
+  it("commands surface git's alternates error lines once (status, log, fsck, gc)", async () => {
+    const dir = fresh("cmderr");
+    const alt = repoWith(join(dir, "alt"), ["a1"]);
+    const repo = join(dir, "repo");
+    git(dir, "clone", "-q", "--shared", alt, repo);
+    repoWith(repo, ["r1"], false);
+    mkdirSync(join(dir, "gone")); // its objects directory is missing (not its parent)
+    writeFileSync(
+      join(repo, ".git/objects/info/alternates"),
+      `${join(alt, ".git/objects")}\n${join(dir, "gone", "objects")}\n`,
+    );
+    const rel = repo.slice(root.length + 1);
+    const runs: Array<[string[], (g: Awaited<ReturnType<typeof openOurs>>) => Promise<string[]>]> =
+      [
+        [
+          ["status", "--porcelain"],
+          async (g) => {
+            const cmd = g.status();
+            await cmd.call();
+            return cmd.alternatesErrors();
+          },
+        ],
+        [
+          ["log", "--oneline"],
+          async (g) => {
+            const cmd = g.log();
+            for await (const _ of await cmd.call());
+            return cmd.alternatesErrors();
+          },
+        ],
+        [
+          ["fsck", ...noReferences],
+          async (g) => {
+            const files = createNodeFilesApi({ rootDir: root });
+            const cmd = g
+              .fsck()
+              .setRepositoryFiles({ files, gitDir: `${rel}/.git` })
+              .setCompatibility(compatibility);
+            await cmd.call();
+            return cmd.alternatesErrors();
+          },
+        ],
+        [
+          ["gc", "-q"],
+          async (g) => {
+            const cmd = g.gc();
+            await cmd.call();
+            return cmd.alternatesErrors();
+          },
+        ],
+      ];
+    for (const [args, ours] of runs) {
+      const theirs = gitRun(root, repo, args);
+      const lines = errorLines(theirs.stderr);
+      expect(lines.length, args[0]).toBeGreaterThan(0);
+      const g = await openOurs(root, undefined, undefined, rel);
+      // git prints them once per process (gc and fsck run child processes: once each)
+      expect(await ours(g), args[0]).toEqual([...new Set(lines)]);
+      expect(lines[0]).toBe(
+        `error: object directory ${join(dir, "gone", "objects")} does not exist; check .git/objects/info/alternates`,
+      );
+    }
+    // a clean repository: none
+    const g = await openOurs(root, undefined, undefined, alt.slice(root.length + 1));
+    const st = g.status();
+    await st.call();
+    expect(st.alternatesErrors()).toEqual([]);
+  });
+
+  it("reads the first alternate's commit-graph where the repository has none; fsck verifies each", async () => {
+    const dir = fresh("graph");
+    const alt = repoWith(join(dir, "alt"), ["a1", "a2", "a3"]);
+    git(alt, "checkout", "-q", "-b", "side", "HEAD~1");
+    repoWith(alt, ["b1", "b2"], false);
+    git(alt, "checkout", "-q", "main");
+    git(alt, "commit-graph", "write", "--reachable");
+    const repo = join(dir, "repo");
+    git(dir, "clone", "-q", "--shared", alt, repo);
+    git(repo, "checkout", "-q", "-b", "topic", "origin/side");
+    repoWith(repo, ["r1", "r2"], false);
+    expect(existsSync(join(repo, ".git/objects/info/commit-graph"))).toBe(false);
+    const { history } = await backendOf(repo);
+    const graph = await history.commitGraph?.get();
+    // the alternate's: its five commits
+    expect(graph?.size).toBe(5);
+    // the graph is a cache: the walks answer as git's
+    const rel = repo.slice(root.length + 1);
+    const g = await openOurs(root, undefined, undefined, rel);
+    const walk = async (...revs: string[]) => {
+      const cmd = g.revList();
+      for (const r of revs) cmd.addRevision(r);
+      const ids: string[] = [];
+      for await (const c of await cmd.call()) ids.push(c.id);
+      return ids.join("\n");
+    };
+    expect(await walk("HEAD")).toBe(git(repo, "rev-list", "HEAD").trim());
+    expect(await walk("HEAD...origin/main")).toBe(
+      git(repo, "rev-list", "HEAD...origin/main").trim(),
+    );
+    expect(await walk("origin/main", "^HEAD")).toBe(
+      git(repo, "rev-list", "origin/main", "^HEAD").trim(),
+    );
+    // fsck verifies the alternate's graph too (commit-graph verify --object-dir <each>)
+    const graphFile = join(alt, ".git/objects/info/commit-graph");
+    const bytes = readFileSync(graphFile);
+    bytes[bytes.length - 1] = (bytes[bytes.length - 1] as number) ^ 0xff; // its checksum
+    writeFileSync(graphFile, bytes);
+    const theirs = gitRun(root, repo, ["fsck", "--no-progress", ...noReferences]);
+    const files = createNodeFilesApi({ rootDir: root });
+    const ours = await g
+      .fsck()
+      .setRepositoryFiles({ files, gitDir: `${rel}/.git` })
+      .setCompatibility(compatibility)
+      .call();
+    expect(theirs.status).not.toBe(0);
+    expect(ours.exitCode).toBe(theirs.status);
+    expect(ours.errorOutput.split("\n").filter(Boolean).sort()).toEqual(
+      theirs.stderr.split("\n").filter(Boolean).sort(),
+    );
   });
 });
 

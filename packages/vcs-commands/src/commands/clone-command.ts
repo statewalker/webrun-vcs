@@ -24,6 +24,7 @@ import { TransportCommand } from "../transport-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
+import { copyLocalObjects } from "./local-clone.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
@@ -111,6 +112,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   private shallowExcludes: string[] = [];
   private directory?: string;
   private shared = false;
+  /** `--local` (true), `--no-local` (false), neither (undefined: local for a path) */
+  private local?: boolean;
   private dissociate = false;
   /** `--reference` (required) and `--reference-if-able` paths, in the order given */
   private references: { path: string; required: boolean }[] = [];
@@ -429,6 +432,34 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   }
 
   /**
+   * `git clone --local` (`-l`, true) / `--no-local` (false). A source given as a path to a
+   * local repository (not a URL, `file://` included) is cloned as git's `clone_local` does,
+   * unless `--no-local`: its refs are listed through the transport, but its objects directory
+   * is copied (or, with {@link setShared}, borrowed) instead of fetched, its
+   * `objects/info/alternates` entries carried over as absolute paths, and the refs written
+   * without a connectivity check; `--depth`, `--shallow-since` and `--shallow-exclude` are
+   * ignored with git's warnings (`CloneResult.messages`). A shallow source is fetched instead
+   * (`--local` then warns "source repository is shallow, ignoring --local"), and `--local`
+   * with a URL warns "--local is ignored". A store without files (memory, KV, SQL) on either
+   * side is fetched from too.
+   */
+  setLocal(local: boolean): this {
+    this.checkCallable();
+    this.local = local;
+    return this;
+  }
+
+  /**
+   * `git clone --no-hardlinks`: git copies the files of a local clone instead of hardlinking
+   * them. Ours always copies (the FilesApi has no hard-link primitive), so this changes
+   * nothing but is accepted.
+   */
+  setNoHardlinks(_noHardlinks: boolean): this {
+    this.checkCallable();
+    return this;
+  }
+
+  /**
    * `git clone --reference <repository>`: borrow from that local repository
    * (`objects/info/alternates` names its objects) and fetch only what it lacks. A path that is
    * no usable repository fails the clone before anything is fetched ("reference repository
@@ -517,13 +548,54 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     // written; here the destination is the working copy, empty once `git init` made it
     await this.refuseNonEmptyDestination(localRemote);
 
+    // clone.c's is_local: a local repository path (remote.<name>.url as rewritten; never a
+    // URL, file:// included), unless --no-local or the source is shallow
+    const localWarnings: string[] = [];
+    let isLocal =
+      this.local !== false &&
+      localRemote !== undefined &&
+      !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(sourceUrl);
+    let depth = this.depth;
+    let shallowSince = this.shallowSince;
+    let shallowExcludes = this.shallowExcludes;
+    if (isLocal && localRemote) {
+      if (depth !== undefined) {
+        localWarnings.push("warning: --depth is ignored in local clones; use file:// instead.\n");
+      }
+      if (shallowSince !== undefined) {
+        localWarnings.push(
+          "warning: --shallow-since is ignored in local clones; use file:// instead.\n",
+        );
+      }
+      if (shallowExcludes.length > 0) {
+        localWarnings.push(
+          "warning: --shallow-exclude is ignored in local clones; use file:// instead.\n",
+        );
+      }
+      if (await sourceIsShallow(localRemote, worktree?.getFiles?.())) {
+        if (this.local === true) {
+          localWarnings.push("warning: source repository is shallow, ignoring --local\n");
+        }
+        isLocal = false;
+      }
+    }
+    if (this.local === true && !isLocal) localWarnings.push("warning: --local is ignored\n");
+    if (isLocal) {
+      depth = undefined;
+      shallowSince = undefined;
+      shallowExcludes = [];
+    }
+
     // setup_reference, then clone_local's --shared: the alternates before the fetch, which
     // then takes only what they lack (their refs are complete history to it)
-    const messages = await this.setupAlternates(
-      worktree,
-      isRepositoryPath ? localRemote : undefined,
-      repo,
-    );
+    const messages = await this.setupAlternates(worktree, isLocal ? localRemote : undefined, repo);
+    messages.push(...localWarnings);
+    // clone_local without --shared: the source's objects copied once its refs are listed,
+    // the advertised refs then complete history (nothing fetched)
+    const copyObjects =
+      isLocal && !this.shared && localRemote
+        ? this.localObjectsCopy(worktree, localRemote, repo)
+        : undefined;
 
     // Determine clone branch strategy
     const branchesToClone = this.mirror || this.cloneAllBranches ? [] : this.branchesToClone;
@@ -616,12 +688,25 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       refStore: createTransportRefStore(history.refs),
       refspecs,
       tags,
-      depth: this.depth,
-      deepenSince: this.shallowSince,
-      deepenNot: this.shallowExcludes.length > 0 ? this.shallowExcludes : undefined,
+      depth,
+      deepenSince: shallowSince,
+      deepenNot: shallowExcludes.length > 0 ? shallowExcludes : undefined,
       onProgress: this.progressMessageCallback,
       // git's write_remote_refs: one initial transaction, no reflog
       skipReflog: true,
+      // clone.c sets TRANS_OPT_KEEP: the pack is kept whatever its size
+      keepPack: true,
+      ...(copyObjects
+        ? {
+            beforeFetch: async (remoteRefs) => {
+              const { warnings } = await copyObjects();
+              for (const w of warnings) messages.push(`${w}\n`);
+              const tips: string[] = [];
+              for (const ref of remoteRefs) if (ref.oid) tips.push(ref.oid);
+              return { completeTips: tips };
+            },
+          }
+        : {}),
     };
     // transport_get: git's local transport (upload-pack of the repository at the path, in
     // process), or the connector the transport registry names (smart HTTP by default)
@@ -805,6 +890,38 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         await alternates.add(`${sourceCommonDirPath(files, localSource, repo)}/objects`);
     }
     return messages;
+  }
+
+  /**
+   * clone_local's copy of the source's objects (see `local-clone.ts`), or undefined where
+   * either side keeps no files (the clone then fetches).
+   */
+  private localObjectsCopy(
+    worktree: Pick<Worktree, "getRoot" | "getFiles" | "getGitDir"> | undefined,
+    source: OpenedRepository,
+    repo: string,
+  ): (() => Promise<{ warnings: string[] }>) | undefined {
+    const files = worktree?.getFiles?.();
+    const gitDir = worktree?.getGitDir?.();
+    const alternates = this._workingCopy.history.objects?.alternates;
+    const sourceFiles = source.files ?? files;
+    if (!files || gitDir === undefined || !sourceFiles || !alternates) return undefined;
+    const commonDir = (source.commonDir ?? source.gitDir).replace(/\/+$/, "");
+    return async () => {
+      const result = await copyLocalObjects({
+        source: {
+          files: sourceFiles,
+          objectsDir: `${commonDir}/objects`,
+          repo: sourceGitDirPath(files, source, repo),
+        },
+        target: { files, objectsDir: `${gitDir.replace(/\/+$/, "")}/objects` },
+        addAlternate: (path) => alternates.add(path),
+      });
+      // the copied packs (and commit-graph) are read from now on
+      await this._workingCopy.history.packs?.refresh();
+      this._workingCopy.history.commitGraph?.invalidate();
+      return result;
+    };
   }
 
   /**
@@ -1026,6 +1143,29 @@ function sourceCommonDirPath(files: FilesApi, source: OpenedRepository, repo: st
     if (host.same(`${base}${suffix}`, gitDir)) return `${base}${suffix}`;
   }
   return gitDir;
+}
+
+/**
+ * clone.c's `src_repo` (get_repo_path's answer): the source's git directory as clone.c names
+ * it; copy_alternates makes the source's relative alternates absolute from there.
+ */
+function sourceGitDirPath(files: FilesApi, source: OpenedRepository, repo: string): string {
+  if ((source.commonDir ?? source.gitDir) === source.gitDir) {
+    return sourceCommonDirPath(files, source, repo);
+  }
+  const host = new HostPaths(hostRootOf(files));
+  return host.known ? host.hostPath(source.gitDir) : source.gitDir;
+}
+
+/** Whether the source has a `shallow` file (clone.c: a shallow source is not cloned locally). */
+async function sourceIsShallow(
+  source: OpenedRepository,
+  files: FilesApi | undefined,
+): Promise<boolean> {
+  const storage = source.files ?? files;
+  if (!storage) return false;
+  const commonDir = (source.commonDir ?? source.gitDir).replace(/\/+$/, "");
+  return (await storage.stats(`${commonDir}/shallow`).catch(() => undefined)) !== undefined;
 }
 
 function toBranchName(defaultBranch: string | undefined): string | undefined {

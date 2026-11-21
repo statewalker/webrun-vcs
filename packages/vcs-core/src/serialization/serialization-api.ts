@@ -54,6 +54,11 @@ export interface PackImportOptions {
    * (see `GitObjects.beginQuarantine`): `result.quarantine` is set when the backend can.
    */
   quarantine?: boolean;
+  /**
+   * Keep the pack whatever its size, never unpacking it into loose objects (git's
+   * `TRANS_OPT_KEEP`, which `git clone` sets: `fetch-pack --keep`)
+   */
+  keepPack?: boolean;
 }
 
 /**
