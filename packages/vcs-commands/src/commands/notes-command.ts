@@ -861,7 +861,6 @@ export class NotesPruneCommand extends NotesSubcommand<NotesPruneResult> {
 
   protected async execute(): Promise<NotesPruneResult> {
     const t = await this.initCheck("prune", true);
-    await this.refuseAlternates();
     const missing = await t.tree.unreachableObjects((id) => this.objectExists(id));
     let output = "";
     for (const id of missing) {
@@ -870,34 +869,6 @@ export class NotesPruneCommand extends NotesSubcommand<NotesPruneResult> {
     }
     if (!this.dryRun) await commitNotes(this.ctx, t, "Notes removed by 'git notes prune'");
     return { exitCode: 0, output, errors: "", pruned: missing };
-  }
-
-  /**
-   * Refuses, as gc, repack and prune refuse (vcs-store-files' assertNoAlternates), a
-   * repository that borrows objects through `objects/info/alternates`: the objects only an
-   * alternate holds are not read, so their notes would look like notes of missing objects
-   * and be pruned. The file is looked for in the common directory (a linked worktree's
-   * `commondir` followed).
-   */
-  private async refuseAlternates(): Promise<void> {
-    const checkout = this.workingCopy.checkout;
-    if (!checkout.readStateFile) return;
-    const link = await checkout.readStateFile("commondir").catch(() => undefined);
-    const commondir = link ? decodeGitPath(link).trim() : "";
-    const base = commondir === "" || commondir.startsWith("/") ? "" : `${commondir}/`;
-    const bytes = await checkout
-      .readStateFile(`${base}objects/info/alternates`)
-      .catch(() => undefined);
-    if (!bytes) return;
-    const used = decodeGitPath(bytes)
-      .split("\n")
-      .some((line) => line.trim() !== "" && !line.startsWith("#"));
-    if (used) {
-      throw new NotesError(
-        "cannot prune notes in a repository with alternates (objects/info/alternates): " +
-          "the objects it borrows are not read",
-      );
-    }
   }
 
   /** odb_has_object: one typeless lookup where the store has its object kernel. */

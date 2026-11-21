@@ -270,9 +270,8 @@ describeGit("served dumb HTTP: as git http-backend serves it", () => {
     base(dir);
     git(dir, ["clone", "-q", "--bare", "--shared", "bare.git", "borrower.git"]);
     noMaintenance(join(dir, "borrower.git"));
-    // no annotated tag only the alternate holds: our object store reads no alternates, so
-    // info/refs could not peel it
-    git(join(dir, "borrower.git"), ["tag", "-d", "v1"]);
+    // the annotated tag v1 is held by the alternate alone: info/refs peels it through it
+    expect(git(join(dir, "borrower.git"), ["cat-file", "-t", "v1"]).trim()).toBe("tag");
     // relative, as http-walker follows it (`../../bare.git/objects` from the objects)
     writeFileSync(join(dir, "borrower.git/objects/info/alternates"), "../../bare.git/objects\n");
     git(join(dir, "src"), ["commit", "-q", "--allow-empty", "-m", "own"]);

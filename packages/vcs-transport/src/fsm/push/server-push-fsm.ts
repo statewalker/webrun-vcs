@@ -176,9 +176,18 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         let first = true;
         // hidden refs are not advertised (git's receive.hideRefs)
         const refsArray = visibleRefs(refs, getConfig(ctx).hiddenRefs);
+        // write_head_info: then the alternates' refs as `.have`, each object id once and none
+        // an advertised ref names (the first line carries the capabilities, whichever it is)
+        const seen = new Set(refsArray.map(([, oid]) => oid));
+        const haves: string[] = [];
+        for (const oid of (await getRepository(ctx).alternateRefs?.()) ?? []) {
+          if (seen.has(oid)) continue;
+          seen.add(oid);
+          haves.push(oid);
+        }
 
         // Empty repository
-        if (refsArray.length === 0) {
+        if (refsArray.length === 0 && haves.length === 0) {
           await transport.writeLine(`${ZERO_OID} capabilities^{}\0${capabilities.join(" ")}`);
           await transport.writeFlush();
           // READ_COMMANDS populates state.capabilities with the client's request.
@@ -189,6 +198,12 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           const line = first ? `${oid} ${name}\0${capabilities.join(" ")}` : `${oid} ${name}`;
           await transport.writeLine(line);
           state.refs.set(name, oid);
+          first = false;
+        }
+        for (const oid of haves) {
+          await transport.writeLine(
+            first ? `${oid} .have\0${capabilities.join(" ")}` : `${oid} .have`,
+          );
           first = false;
         }
         await transport.writeFlush();

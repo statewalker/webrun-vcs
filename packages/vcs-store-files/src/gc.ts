@@ -26,11 +26,7 @@ import {
   repackListed,
   snapshotPacks,
 } from "./repack.js";
-import {
-  assertNoAlternates,
-  assertObjectsDeletable,
-  readRepositoryFormat,
-} from "./repository-format.js";
+import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
@@ -166,9 +162,11 @@ export interface GcResult {
  *    `git gc` does: `objects/info/commit-graph`, replacing a split chain.
  *
  * In a repository with `extensions.preciousObjects`, only steps 3 and 7 run, as `git gc` skips its
- * repack and prune there. A partial clone (`extensions.partialClone`, a promisor remote) and
- * a repository with `objects/info/alternates` are refused with
- * `UnsupportedRepositoryFormatError` before anything changes.
+ * repack and prune there. A partial clone (`extensions.partialClone`, a promisor remote) is
+ * refused with `UnsupportedRepositoryFormatError` before anything changes. In a repository
+ * with alternates (`objects/info/alternates`) what they reach is walked through them, and the
+ * repack leaves out what they hold (`git gc` runs `repack -d -l`); only the repository's own
+ * objects are ever deleted.
  *
  * The lock excludes gcs in other processes when the FilesApi has `createExclusive`, and
  * otherwise only gcs over the same FilesApi instance (see `atomicFilesOver`).
@@ -226,7 +224,6 @@ async function collect(options: GcOptions): Promise<GcResult> {
   // refused. preciousObjects: as git gc, refs are packed, but nothing is repacked or pruned.
   const format = await readRepositoryFormat(files, gitDir);
   if (format.partialClone !== undefined) assertObjectsDeletable(format, "gc");
-  await assertNoAlternates(files, gitDir, "gc");
   if (format.preciousObjects) {
     let refsPacked = false;
     if ((options.packRefs ?? true) && !dryRun && history.refs.packRefs) {
@@ -296,6 +293,8 @@ async function collect(options: GcOptions): Promise<GcResult> {
         gitDir,
         unpackUnreachable: true,
         unpackUnreachableExpireMs: pruneExpireMs,
+        // git gc: repack -d -l, what alternates hold stays theirs
+        local: true,
       },
       listed,
       snapshot,

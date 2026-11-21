@@ -341,6 +341,9 @@ export async function fetchFromConnection(
   // present (an interrupted fetch leaves commits without their trees and blobs)
   const localTips = new Set<string>();
   for (const [, oid] of await refStore.listAll()) localTips.add(oid);
+  // the alternates' refs too: tips the negotiation offers and complete history (fetch-pack's
+  // insert_alternate_refs and mark_alternate_complete)
+  for (const oid of (await repository.alternateRefs?.()) ?? []) localTips.add(oid);
   const complete = new Completeness(repository, localTips);
   let shallow = shallowBefore;
   const runFetchPack = async (wants: string[], request: Partial<FetchPackRequest>) => {

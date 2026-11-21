@@ -116,7 +116,10 @@ function createRepositoryFacadeFromHistory(
     (history as Partial<HistoryWithOperations>).serialization ??
     new DefaultSerializationApi({ history });
 
+  const alternates = history.objects?.alternates;
   const facade: RepositoryFacade = {
+    // the alternates' refs, for receive-pack's `.have` lines
+    ...(alternates ? { alternateRefs: () => alternates.refs() } : {}),
     // ─────────────────────────────────────────────────────────────────
     // Pack I/O - delegated to SerializationApi
     // ─────────────────────────────────────────────────────────────────

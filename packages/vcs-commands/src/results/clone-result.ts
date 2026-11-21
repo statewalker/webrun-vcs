@@ -34,4 +34,10 @@ export interface CloneResult {
    * itself stands)
    */
   hookExitCode?: number;
+
+  /**
+   * What git prints on stderr besides progress: `--reference-if-able`'s "info: Could not add
+   * alternate for '<path>': <reason>" lines, each with its newline
+   */
+  messages?: string[];
 }

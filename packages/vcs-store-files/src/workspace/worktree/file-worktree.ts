@@ -1393,6 +1393,9 @@ export class FileWorktree implements Worktree {
       gitDir: commonDir,
       ...environment,
       ...(options.configIncludes === undefined ? {} : { configIncludes: options.configIncludes }),
+      // another repository: git runs its upload-pack/receive-pack without local_repo_env
+      alternatesFromEnvironment: false,
+      ...(options.alternates === false ? { alternates: false } : {}),
     });
     const worktrees = await openGitLinkedWorktrees({
       files,
