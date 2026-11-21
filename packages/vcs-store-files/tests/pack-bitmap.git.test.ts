@@ -33,9 +33,11 @@ import {
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import {
+  BitmapWriteError,
   createGitFilesBackend,
   gc,
   IncrementalBitmapError,
+  isPreferredBitmapTip,
   listReachableObjects,
   NO_CLOSURE_BITMAP_WARNING,
   repack,
@@ -414,5 +416,230 @@ describe("corrupt bitmaps", () => {
       size += c.length;
     expect(size).toBeGreaterThan(32);
     expect(Number(native.stdout.trim())).toBe(objectsOf(dir).length);
+  });
+});
+
+/** Our bitmap of the only pack, from our listing, against the one native git wrote with it. */
+async function oursOfNativePack(
+  dir: string,
+  options: { preferredTips?: string[] } = {},
+): Promise<{ ours: string; native: string }> {
+  const [bitmapName] = filesIn(dir, ".bitmap");
+  const native = readFileSync(join(packDir(dir), bitmapName as string)).toString("hex");
+  const { pack, backend, files, gitDir } = await onlyPack(dir);
+  const listed = await listReachableObjects({
+    files,
+    gitDir,
+    refs: backend.history.refs,
+    objects: backend.objects,
+  });
+  const ours = await writePackBitmap({
+    pack,
+    objects: backend.objects,
+    listed,
+    compatibility,
+    ...(options.preferredTips ? { preferredTips: options.preferredTips } : {}),
+  });
+  return { ours: Buffer.from(ours).toString("hex"), native };
+}
+
+describe("name hashes and tip objects as git lists them", () => {
+  it("hashes a path's bytes, skipping only git's isspace bytes (non-ASCII, VT, non-UTF-8)", async () => {
+    const dir = makeRepo("linear", 3);
+    mkdirSync(join(dir, "日本"), { recursive: true });
+    mkdirSync(join(dir, "a b"), { recursive: true });
+    writeFileSync(join(dir, "é.txt"), "e acute\n");
+    writeFileSync(join(dir, "日本", "ü.txt"), "u umlaut\n");
+    // U+0120: its low byte is a space, which the hash must not skip
+    writeFileSync(join(dir, "Ġx.txt"), "g dot\n");
+    writeFileSync(join(dir, "a b", "c\v.txt"), "vertical tab\n");
+    // a name that is not UTF-8
+    writeFileSync(Buffer.concat([Buffer.from(`${dir}/`), Buffer.from([0xff, 0x2e, 0x74])]), "ff\n");
+    commitAll(dir, "names");
+    git(dir, ["repack", "-a", "-d", "-b", "-q"]);
+    const { ours, native } = await oursOfNativePack(dir);
+    expect(ours).toBe(native);
+  });
+
+  it('names a blob or tree behind a ref "", as git\'s pending objects, before commit trees', async () => {
+    const dir = makeRepo("linear", 4);
+    const blob = git(dir, ["rev-parse", "HEAD:top.txt"]).trim();
+    const other = git(dir, ["rev-parse", "HEAD~1:top.txt"]).trim();
+    const tree = git(dir, ["rev-parse", "HEAD~2:d0"]).trim();
+    git(dir, ["update-ref", "refs/tags/light-blob", blob]);
+    git(dir, ["update-ref", "refs/tags/light-tree", tree]);
+    git(dir, ["tag", "-a", "-m", "blob tag", "blob-tag", other], {
+      GIT_COMMITTER_DATE: `${clock} +0000`,
+    });
+    git(dir, ["repack", "-a", "-d", "-b", "-q"]);
+    const { ours, native } = await oursOfNativePack(dir);
+    expect(ours).toBe(native);
+  });
+
+  it("matches pack.preferBitmapTips as each version does", async () => {
+    const dir = makeLongRepo(260);
+    const log = git(dir, ["log", "--all", "--format=%H %s"]).split("\n").filter(Boolean);
+    const commitOf = (subject: string) =>
+      (log.find((l) => l.endsWith(` ${subject}`)) as string).slice(0, 40);
+    // in two selection windows, neither commit chosen without the preference
+    git(dir, ["update-ref", "refs/tags/pick/one", commitOf("c119")]);
+    git(dir, ["update-ref", "refs/tags/picky", commitOf("c79")]);
+    git(dir, ["-c", "pack.preferBitmapTips=refs/tags/pick", "repack", "-a", "-d", "-b", "-q"]);
+    const refs = git(dir, ["for-each-ref", "--format=%(refname) %(objectname)"])
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => l.split(" ") as [string, string]);
+    const tipsAs = (c: "2.43" | "2.56") =>
+      refs
+        .filter(([name]) => isPreferredBitmapTip(name, ["refs/tags/pick"], c))
+        .map(([, id]) => id);
+    expect(tipsAs("2.56")).toEqual([commitOf("c119")]);
+    expect(tipsAs("2.43").sort()).toEqual([commitOf("c119"), commitOf("c79")].sort());
+    const { ours, native } = await oursOfNativePack(dir, { preferredTips: tipsAs(compatibility) });
+    expect(ours).toBe(native);
+    // the other version's matching selects other commits
+    const other = await oursOfNativePack(dir, {
+      preferredTips: tipsAs(compatibility === "2.43" ? "2.56" : "2.43"),
+    });
+    expect(other.ours).not.toBe(native);
+  });
+});
+
+describe("repack.packKeptObjects", () => {
+  /** A repository whose history is in a .keep pack, with newer loose objects. */
+  function withKeptPack(): string {
+    const dir = makeRepo("linear", 4);
+    git(dir, ["repack", "-a", "-d", "-q"]);
+    const [pack] = filesIn(dir, ".pack");
+    writeFileSync(join(packDir(dir), (pack as string).replace(/\.pack$/, ".keep")), "");
+    writeFileSync(join(dir, "later.txt"), "later\n");
+    commitAll(dir, "later");
+    return dir;
+  }
+  const newPackCount = (dir: string, kept: string[]) => {
+    const pack = filesIn(dir, ".idx").find((f) => !kept.includes(f)) as string;
+    return execFileSync("git", ["show-index"], { input: readFileSync(join(packDir(dir), pack)) })
+      .toString()
+      .split("\n")
+      .filter(Boolean).length;
+  };
+
+  it("false keeps .keep objects out of a -b repack, and the bitmap is not written", async () => {
+    const dir = withKeptPack();
+    const nativeDir = tmp("bitmap-keep-native-");
+    cpSync(dir, nativeDir, { recursive: true });
+    const native = gitResult(nativeDir, [
+      "-c",
+      "repack.packKeptObjects=false",
+      "repack",
+      "-a",
+      "-d",
+      "-b",
+      "-q",
+    ]);
+    expect(native.stderr.trim()).toBe(NO_CLOSURE_BITMAP_WARNING);
+    expect(filesIn(nativeDir, ".bitmap")).toEqual([]);
+    git(dir, ["config", "repack.packKeptObjects", "false"]);
+    const { backend } = await open(dir);
+    const kept = filesIn(dir, ".idx");
+    const ours = await repack({ ...backend, writeBitmaps: true });
+    expect(ours?.warnings).toEqual([NO_CLOSURE_BITMAP_WARNING]);
+    expect(ours?.bitmapWritten).toBe(false);
+    expect(newPackCount(dir, kept)).toBe(newPackCount(nativeDir, kept));
+  });
+
+  it("true packs .keep objects without -b too", async () => {
+    const dir = withKeptPack();
+    const nativeDir = tmp("bitmap-keep-native-");
+    cpSync(dir, nativeDir, { recursive: true });
+    const kept = filesIn(dir, ".idx");
+    git(nativeDir, ["-c", "repack.packKeptObjects=true", "repack", "-a", "-d", "-q"]);
+    git(dir, ["config", "repack.packKeptObjects", "true"]);
+    const { backend } = await open(dir);
+    await repack({ ...backend, writeBitmaps: false });
+    const count = newPackCount(dir, kept);
+    expect(count).toBe(newPackCount(nativeDir, kept));
+    expect(count).toBe(objectsOf(dir).length);
+  });
+});
+
+describe("a bitmap that cannot be built", () => {
+  it("fails the repack with git's lines, replacing nothing", async () => {
+    const dir = makeRepo("linear", 5);
+    git(dir, ["repack", "-a", "-d", "-q"]);
+    writeFileSync(join(dir, "loose.txt"), "loose\n");
+    commitAll(dir, "loose");
+    const before = readdirSync(packDir(dir)).sort();
+    const { backend } = await open(dir);
+    const hidden = git(dir, ["rev-parse", "HEAD:loose.txt"]).trim();
+    // the new pack, as the writer sees it, lacks one blob: the closure check fails
+    const packs = new Proxy(backend.packs, {
+      get(target, prop, receiver) {
+        if (prop !== "packs") return Reflect.get(target, prop, receiver);
+        return async () =>
+          (await target.packs()).map(
+            (p) =>
+              new Proxy(p, {
+                get(t, k, r) {
+                  if (k !== "indexOf") return Reflect.get(t, k, r);
+                  return (id: string) => (id === hidden ? -1 : (t as PackFile).indexOf(id));
+                },
+              }),
+          );
+      },
+    });
+    const error = await repack({ ...backend, packs, writeBitmaps: true }).catch((e) => e);
+    expect(error).toBeInstanceOf(BitmapWriteError);
+    expect((error as BitmapWriteError).warnings).toEqual([
+      `warning: Failed to write bitmap index. Packfile doesn't have full closure (object ${hidden} is missing)`,
+    ]);
+    expect((error as Error).message).toBe("failed to write bitmap index");
+    // the old pack and the loose objects stay; the new pack is gone
+    expect(readdirSync(packDir(dir)).sort()).toEqual(before);
+    git(dir, ["fsck", "--no-progress"]);
+  });
+});
+
+describe("the bitmap walk falls back as git's", () => {
+  it("walks when no have is in the bitmapped pack (a tag of a tree, a loose commit had)", async () => {
+    const dir = makeRepo("merge", 12);
+    git(dir, ["repack", "-a", "-d", "-b", "-q"]);
+    const tree = git(dir, ["rev-parse", "HEAD~3^{tree}"]).trim();
+    git(dir, ["tag", "-a", "-m", "a tree", "tree-tag", tree], {
+      GIT_COMMITTER_DATE: `${clock} +0000`,
+    });
+    writeFileSync(join(dir, "loose.txt"), "loose\n");
+    commitAll(dir, "loose");
+    const tag = git(dir, ["rev-parse", "tree-tag"]).trim();
+    const have = git(dir, ["rev-parse", "HEAD"]).trim();
+    const countOf = (pack: Buffer | Uint8Array) => Buffer.from(pack).readUInt32BE(8);
+    const nativeCount = (args: string[], input: string) =>
+      countOf(
+        execFileSync("git", ["pack-objects", "--revs", "--stdout", "-q", ...args], {
+          cwd: dir,
+          env: GIT_ENV,
+          input,
+          maxBuffer: 1 << 26,
+        }),
+      );
+    const { backend } = await onlyPack(dir);
+    const serialization = new DefaultSerializationApi({
+      history: backend.history,
+      packs: backend.packs,
+    });
+    const ours = async (wants: string[], haves: string[]) => {
+      const chunks: Uint8Array[] = [];
+      for await (const c of serialization.exportPack(wants, haves, { useBitmaps: true }))
+        chunks.push(c);
+      return countOf(Buffer.concat(chunks));
+    };
+    const native = nativeCount(["--use-bitmap-index"], `${tag}\n^${have}\n`);
+    expect(native).toBeGreaterThan(1);
+    expect(await ours([tag], [have])).toBe(native);
+    // a have in the pack: the bitmap is used, by both
+    const packed = git(dir, ["rev-parse", "HEAD~1"]).trim();
+    expect(await ours([tag], [packed])).toBe(
+      nativeCount(["--use-bitmap-index"], `${tag}\n^${packed}\n`),
+    );
   });
 });

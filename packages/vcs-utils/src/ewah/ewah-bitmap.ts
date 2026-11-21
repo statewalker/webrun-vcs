@@ -246,19 +246,37 @@ export class EwahBitmap {
    * Calls `fn` with each uncompressed word index and halves, skipping runs of zeros (much faster
    * than `words()` for sparse maps).
    */
-  forEachWord(fn: (index: number, lo: number, hi: number) => void): void {
+  forEachWord(fn: (index: number, lo: number, hi: number) => void, maxWords = Infinity): void {
     let p = 0;
     let at = 0;
-    while (p < this.n) {
+    while (p < this.n && at < maxWords) {
       const rl = this.runningLen(p);
       const lw = this.literalWords(p);
-      if (this.runBit(p)) for (let k = 0; k < rl; k++) fn(at + k, 0xffffffff, 0xffffffff);
+      if (this.runBit(p)) {
+        const end = Math.min(rl, maxWords - at);
+        for (let k = 0; k < end; k++) fn(at + k, 0xffffffff, 0xffffffff);
+      }
       at += rl;
-      for (let k = 1; k <= lw; k++) {
+      for (let k = 1; k <= lw && at < maxWords; k++) {
         fn(at++, this.w[2 * (p + k)] as number, this.w[2 * (p + k) + 1] as number);
       }
       p += lw + 1;
     }
+  }
+
+  /**
+   * The uncompressed length in 64-bit words (every run and literal counted), without expanding
+   * anything: what a reader checks before trusting a bitmap read from a file.
+   */
+  expandedWords(): number {
+    let p = 0;
+    let words = 0;
+    while (p < this.n) {
+      const lw = this.literalWords(p);
+      words += this.runningLen(p) + lw;
+      p += lw + 1;
+    }
+    return words;
   }
 
   /** The positions of the set bits, ascending (git's `ewah_each_bit`). */

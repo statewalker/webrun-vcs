@@ -20,7 +20,10 @@
  * index file (wrong header)`, ...); callers fall back to walking, as git does. Unlike git, the
  * trailing checksum (git checks it only in fsck) and the pack checksum in the header (git
  * checks it only for multi-pack bitmaps) are checked on open, as a stale or damaged bitmap
- * would silently drop objects from served packs.
+ * would silently drop objects from served packs. A bitmap claiming more bits than the pack has
+ * objects (its size or its runs) is refused too (`bitmap larger than its pack`), and readers
+ * ignore bits at or above the pack's count, so a crafted file cannot allocate without bound or
+ * mark objects outside the pack.
  */
 import { EwahBitmap } from "@statewalker/vcs-utils";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
@@ -163,10 +166,15 @@ export function parsePackBitmap(bytes: Uint8Array, pack: BitmapPack, path = ""):
   }
 
   let pos = HEADER_SIZE;
+  // no bitmap describes more objects than the pack has (git's never do; git does not check,
+  // ours refuses a crafted one rather than expand its runs or size into memory)
+  const maxWords = Math.ceil(count / 64);
   const readEwah = (): EwahBitmap => {
     const r = EwahBitmap.read(bytes, pos, indexEnd);
     if (!r?.bitmap.isWellFormed())
       throw new PackBitmapError("failed to load bitmap index (corrupted?)");
+    if (r.bitmap.bitSize > maxWords * 64 || r.bitmap.expandedWords() > maxWords)
+      throw new PackBitmapError("corrupted bitmap index file (bitmap larger than its pack)");
     pos = r.next;
     return r.bitmap;
   };

@@ -45,7 +45,7 @@ import {
   BITMAP_OPT_LOOKUP_TABLE,
   type BitmapPack,
 } from "./pack-bitmap.js";
-import { packNameHash } from "./write-pack.js";
+import { packNameHash, packNameHashBytes } from "./write-pack.js";
 
 /** A pack the bitmap cannot describe: an object it reaches is not in it (git's warning). */
 export class BitmapClosureError extends Error {
@@ -164,7 +164,7 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
   // a tag listed without a name is named by its `tag` header, as the revision walk names it
   for (const p of tagsToName) {
     const { data } = await read(pack.idAt(order[p] as number));
-    hashes[p] = packNameHash(tagName(data));
+    hashes[p] = packNameHashBytes(tagName(data));
   }
 
   const typeBitmaps = [new EwahBitmap(), new EwahBitmap(), new EwahBitmap(), new EwahBitmap()];
@@ -401,12 +401,22 @@ function hexOf(data: Uint8Array, at: number): ObjectId {
   return s;
 }
 
-/** The `tag` header of a tag object ("" without one). */
-function tagName(data: Uint8Array): string {
-  const text = new TextDecoder().decode(data.subarray(0, Math.min(data.length, 4096)));
-  const end = text.indexOf("\n\n");
-  for (const line of (end < 0 ? text : text.slice(0, end)).split("\n")) {
-    if (line.startsWith("tag ")) return line.slice(4);
+/** The `tag` header's bytes of a tag object (empty without one). */
+function tagName(data: Uint8Array): Uint8Array {
+  let at = 0;
+  while (at < data.length) {
+    let nl = data.indexOf(0x0a, at);
+    if (nl < 0) nl = data.length;
+    if (nl === at) break; // the blank line ends the header
+    if (
+      nl - at >= 4 &&
+      data[at] === 0x74 &&
+      data[at + 1] === 0x61 &&
+      data[at + 2] === 0x67 &&
+      data[at + 3] === 0x20
+    )
+      return data.subarray(at + 4, nl);
+    at = nl + 1;
   }
-  return "";
+  return new Uint8Array(0);
 }

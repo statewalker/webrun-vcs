@@ -114,10 +114,17 @@ export interface RepackOptions extends RepackTarget {
    * Default: the config's `repack.writeBitmaps` (or `pack.writeBitmaps`), else git's default:
    * written, silently skipped when it cannot be, when `all` packs everything of a bare
    * repository. With true, `all` is required (git dies: incremental repacks have no bitmap)
-   * and the objects of `.keep` packs are packed too (git's `--pack-kept-objects`), so the new
-   * pack is complete.
+   * and the objects of `.keep` packs are packed too (git's `--pack-kept-objects` default), so
+   * the new pack is complete.
    */
   writeBitmaps?: boolean;
+  /**
+   * With `all`, pack the objects of `.keep` packs too (`git repack --pack-kept-objects`).
+   * Default: `repack.packKeptObjects`, else true exactly when a bitmap is asked for
+   * (`writeBitmaps` true or `repack.writeBitmaps`), as git's repack decides; false keeps them
+   * out, and then a bitmap cannot be written ("disabling bitmap writing, ...").
+   */
+  packKeptObjects?: boolean;
   /** `pack.writeBitmapHashCache`, `pack.writeBitmapLookupTable` and the rest, read from the config when not given. */
   bitmapSettings?: Partial<BitmapSettings>;
   /** Where the system and global config are read for the bitmap settings. */
@@ -138,6 +145,8 @@ export interface BitmapSettings {
   lookupTable: boolean;
   /** `pack.preferBitmapTips`: ref prefixes whose tips get a bitmap when in a window */
   preferredTips: string[];
+  /** `repack.packKeptObjects`, undefined when unset */
+  packKeptObjects?: boolean;
 }
 
 /** git's warning when a bitmap cannot cover every object. */
@@ -146,6 +155,23 @@ export const NO_CLOSURE_BITMAP_WARNING =
 /** git's error for `repack -b` without `-a`. */
 export const INCREMENTAL_BITMAP_ERROR =
   "Incremental repacks are incompatible with bitmap indexes.  Use\n--no-write-bitmap-index or disable the pack.writeBitmaps configuration.";
+
+/** git's error when the bitmap of the new pack cannot be built (pack-objects dies). */
+export const BITMAP_WRITE_FAILED = "failed to write bitmap index";
+
+/**
+ * The new pack's bitmap could not be built: an object a commit reaches is not in it (git's
+ * pack-objects warns `Failed to write bitmap index. Packfile doesn't have full closure ...`
+ * and dies with `fatal: failed to write bitmap index`). The repack fails before anything is
+ * replaced: the new pack is removed again (git leaves it as a `.tmp-*` file nothing reads),
+ * no old pack or loose object is deleted. `warnings` holds git's warning lines.
+ */
+export class BitmapWriteError extends Error {
+  override name = "BitmapWriteError";
+  constructor(readonly warnings: string[]) {
+    super(BITMAP_WRITE_FAILED);
+  }
+}
 
 /** `git repack -b` without `-a` (git dies with this message). */
 export class IncrementalBitmapError extends Error {
@@ -185,8 +211,10 @@ export async function readBitmapSettings(
     .sort((a, b) => originOrder(a) - originOrder(b))) {
     writeBitmaps = parseGitBool(entry.value) ?? writeBitmaps;
   }
+  const packKeptObjects = bool("repack.packKeptObjects");
   return {
     ...(writeBitmaps !== undefined ? { writeBitmaps } : {}),
+    ...(packKeptObjects !== undefined ? { packKeptObjects } : {}),
     bare: bool("core.bare") ?? false,
     hashCache: bool("pack.writeBitmapHashCache") ?? true,
     lookupTable: bool("pack.writeBitmapLookupTable") ?? false,
@@ -346,11 +374,15 @@ export async function repackListed(
   // the bitmap: "loud" (-b, repack.writeBitmaps) warns when it cannot be written, "quiet"
   // (git's default for -a in a bare repository) does not
   const bitmaps = await bitmapPlan(options, all, alternates.length > 0, warnings);
+  // git's pack_kept_objects: the option, repack.packKeptObjects, else whether a bitmap is
+  // asked for (write_bitmaps > 0, git's default for -b)
+  const packKeptObjects =
+    options.packKeptObjects ?? bitmaps.settings?.packKeptObjects ?? bitmaps.explicit === true;
 
-  // -a: everything reachable but what .keep packs hold (all of it with -b: git's
-  // --pack-kept-objects); -d alone: what no pack holds (an alternate's included:
-  // pack-objects --unpacked); -l: nothing an alternate holds
-  const skip = all ? (bitmaps.mode === "loud" ? [] : kept) : before;
+  // -a: everything reachable but what .keep packs hold (all of it with --pack-kept-objects);
+  // -d alone: what no pack holds (an alternate's included: pack-objects --unpacked); -l:
+  // nothing an alternate holds
+  const skip = all ? (packKeptObjects ? [] : kept) : before;
   const borrowed = async (id: ObjectId) => {
     for (const alt of alternates) {
       if (options.local ? await alt.objects.has(id) : !all && (await alt.packs.has(id)))
@@ -395,14 +427,16 @@ export async function repackListed(
   const installed = await packs.install(stream);
   // Install before remove: every reader finds each object in the new pack from now on
   await packs.refresh();
-  const bitmapWritten = await installBitmap(
-    options,
-    packDir,
-    installed.packId,
-    ids,
-    bitmaps,
-    warnings,
-  );
+  let bitmapWritten: boolean;
+  try {
+    bitmapWritten = await installBitmap(options, packDir, installed.packId, ids, bitmaps);
+  } catch (e) {
+    // pack-objects died before naming the pack: repack replaces nothing, and the new pack is
+    // not left installed (unless it is one of the packs already there, which stays)
+    if (e instanceof BitmapWriteError && !before.some((p) => p.packId === installed.packId))
+      await packs.remove([installed.packId]);
+    throw e;
+  }
 
   // Only packs of the snapshot, and none modified since the walk started (defence in depth)
   const removable: { pack: Pack; modified?: number }[] = [];
@@ -452,6 +486,10 @@ export async function repackListed(
 interface BitmapPlan {
   mode: "loud" | "quiet" | "off";
   settings?: BitmapSettings;
+  /** `writeBitmaps` or the config's, undefined when neither says (git's write_bitmaps < 0) */
+  explicit?: boolean;
+  /** the version whose `pack.preferBitmapTips` matching is followed */
+  compatibility?: "2.43" | "2.56";
 }
 
 /** Whether and how the repack writes a bitmap: git's repack.c / pack-objects decisions. */
@@ -461,12 +499,20 @@ async function bitmapPlan(
   hasAlternates: boolean,
   warnings: string[],
 ): Promise<BitmapPlan> {
-  if (options.writeBitmaps === false || options.dryRun) return { mode: "off" };
+  // the settings are read for -a even without a bitmap (repack.packKeptObjects)
+  if ((options.writeBitmaps === false || options.dryRun) && !all)
+    return { mode: "off", explicit: false };
   const read = await readBitmapSettings(options.files, options.gitDir ?? ".git", {
     ...(options.environment ? { environment: options.environment } : {}),
   });
   const settings: BitmapSettings = { ...read, ...options.bitmapSettings };
   const explicit = options.writeBitmaps ?? settings.writeBitmaps;
+  const base = {
+    settings,
+    ...(explicit !== undefined ? { explicit } : {}),
+    ...(options.compatibility ? { compatibility: options.compatibility } : {}),
+  };
+  if (options.writeBitmaps === false || options.dryRun) return { ...base, mode: "off" };
   let mode: BitmapPlan["mode"] =
     explicit === true
       ? "loud"
@@ -475,22 +521,41 @@ async function bitmapPlan(
         : all && settings.bare
           ? "quiet"
           : "off";
-  if (mode === "off") return { mode, settings };
+  if (mode === "off") return { ...base, mode };
   if (!all) throw new IncrementalBitmapError();
   if (options.local && hasAlternates) {
     // git warns even for its default (write_bitmaps = -1 is true there)
     warnings.push(NO_CLOSURE_BITMAP_WARNING);
-    return { mode: "off", settings };
+    return { ...base, mode: "off" };
   }
   // a shallow repository's commits lack parents: no bitmap (not git's: its walk grafts them)
   const shallow = (await options.history.refs.getShallow?.().catch(() => [])) ?? [];
   if (shallow.length > 0) mode = "off";
-  return { mode, settings };
+  return { ...base, mode };
+}
+
+/**
+ * Whether `pack.preferBitmapTips` names a ref: 2.5x (pack-bitmap.c
+ * for_each_preferred_bitmap_tip) appends `/` to a value lacking one, so `refs/heads/ma` names
+ * nothing and `refs/heads/main` names the refs below `refs/heads/main/`; 2.43 matches the
+ * value as a plain prefix (`refs_for_each_ref_in`). 2.43 dies with `BUG: attempt to trim too
+ * many characters` when a value is a ref's full name (the iterator trims the whole name); ours
+ * matches that ref instead.
+ */
+export function isPreferredBitmapTip(
+  refName: string,
+  prefixes: readonly string[],
+  compatibility: "2.43" | "2.56" = "2.56",
+): boolean {
+  return prefixes.some((prefix) =>
+    refName.startsWith(compatibility === "2.43" || prefix.endsWith("/") ? prefix : `${prefix}/`),
+  );
 }
 
 /**
  * Writes the new pack's bitmap through a temporary file and a rename, or, when none is
  * written, removes a stale `.bitmap` of that pack name (git's generated_pack_install).
+ * Throws `BitmapWriteError` when the pack lacks an object its commits reach.
  */
 async function installBitmap(
   options: RepackOptions,
@@ -498,7 +563,6 @@ async function installBitmap(
   packId: string,
   listed: readonly ListedObject[],
   plan: BitmapPlan,
-  warnings: string[],
 ): Promise<boolean> {
   const { files, packs } = options;
   const target = joinPath(packDir, `pack-${packId}.bitmap`);
@@ -510,7 +574,8 @@ async function installBitmap(
   const preferred: ObjectId[] = [];
   if (plan.settings.preferredTips.length > 0) {
     for await (const ref of options.history.refs.list()) {
-      if (!plan.settings.preferredTips.some((prefix) => ref.name.startsWith(prefix))) continue;
+      if (!isPreferredBitmapTip(ref.name, plan.settings.preferredTips, plan.compatibility))
+        continue;
       const resolved = await options.history.refs.resolve(ref.name).catch(() => undefined);
       if (resolved?.objectId) preferred.push(resolved.peeledObjectId ?? resolved.objectId);
     }
@@ -527,10 +592,9 @@ async function installBitmap(
       ...(options.compatibility ? { compatibility: options.compatibility } : {}),
     });
   } catch (e) {
+    // git warns (even for its quiet default) and pack-objects dies
     if (!(e instanceof BitmapClosureError)) throw e;
-    warnings.push(`warning: ${e.message}`);
-    if (await files.exists(target)) await files.remove(target);
-    return false;
+    throw new BitmapWriteError([`warning: ${e.message}`]);
   }
   const tmp = joinPath(packDir, `tmp_bitmap_${Math.random().toString(36).slice(2, 8)}`);
   await files.write(tmp, [bytes]);

@@ -24,6 +24,7 @@ import {
   encodeGitDelta,
   type GitDeltaIndex,
 } from "@statewalker/vcs-utils/diff";
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { CRC32 } from "@statewalker/vcs-utils/hash/crc32";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { hexToBytes } from "@statewalker/vcs-utils/hash/utils";
@@ -475,13 +476,31 @@ function limitReusedChains(order: Planned[], maxDepth: number) {
   }
 }
 
-/** git's pack_name_hash: the last characters of the path weigh most; spaces are skipped. */
+/**
+ * git's pack_name_hash (pack-objects.h): over the path's bytes, the last ones weigh most;
+ * git's isspace bytes (tab, LF, CR, space: not VT or FF) are skipped. A path that is not ASCII
+ * is hashed as its bytes (`encodeGitPath`: UTF-8, escaped bytes of a non-UTF-8 name back as
+ * they are stored), so the hash is the one git computes from the tree entry's name.
+ */
 export function packNameHash(path: string | undefined): number {
   if (!path) return 0;
   let h = 0;
   for (let i = 0; i < path.length; i++) {
-    const c = path.charCodeAt(i) & 0xff;
-    if (c === 0x20 || (c >= 0x09 && c <= 0x0d)) continue;
+    const c = path.charCodeAt(i);
+    if (c >= 0x80) return packNameHashBytes(encodeGitPath(path));
+    if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) continue;
+    h = ((h >>> 2) + (c << 24)) >>> 0;
+  }
+  return h;
+}
+
+/** git's pack_name_hash over raw name bytes (up to a NUL, as git's C string ends there). */
+export function packNameHashBytes(bytes: Uint8Array): number {
+  let h = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    const c = bytes[i] as number;
+    if (c === 0) break;
+    if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) continue;
     h = ((h >>> 2) + (c << 24)) >>> 0;
   }
   return h;

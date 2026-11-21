@@ -7,6 +7,17 @@
  */
 import { EwahBitmap, popcount32 } from "./ewah-bitmap.js";
 
+/** A word's halves with the bits at or above `limit` cleared (word `k` holds bits 64k..64k+63). */
+function maskWord(k: number, lo: number, hi: number, limit: number): [number, number] {
+  const start = k * 64;
+  if (start + 64 <= limit) return [lo, hi];
+  const keep = limit - start;
+  if (keep <= 0) return [0, 0];
+  if (keep <= 32) return [keep === 32 ? lo : (lo & ((1 << keep) - 1)) >>> 0, 0];
+  const h = keep - 32;
+  return [lo, h === 32 ? hi : (hi & ((1 << h) - 1)) >>> 0];
+}
+
 export class RawBitmap {
   /** 32-bit halves: word `k` is `w[2k]` (bits 0-31) and `w[2k + 1]` (bits 32-63) */
   private w: Uint32Array;
@@ -58,14 +69,21 @@ export class RawBitmap {
     for (let i = 0; i < n; i++) this.w[i] = ((this.w[i] as number) | (other.w[i] as number)) >>> 0;
   }
 
-  /** git's `bitmap_or_ewah`. */
-  orEwah(other: EwahBitmap): void {
-    this.grow(Math.ceil(other.bitSize / 64));
-    other.forEachWord((k, lo, hi) => {
+  /**
+   * git's `bitmap_or_ewah`. With `limit`, only bits below it are taken (a bitmap read from a
+   * file may claim more bits than its pack has objects): this one grows to `limit` bits at
+   * most, whatever the other's size or runs say.
+   */
+  orEwah(other: EwahBitmap, limit = Infinity): void {
+    const limitWords = Math.ceil(limit / 64);
+    this.grow(Math.min(Math.ceil(other.bitSize / 64), limitWords));
+    other.forEachWord((k, rawLo, rawHi) => {
+      if (rawLo === 0 && rawHi === 0) return;
+      const [lo, hi] = maskWord(k, rawLo, rawHi, limit);
       this.grow(k + 1);
       this.w[2 * k] = ((this.w[2 * k] as number) | lo) >>> 0;
       this.w[2 * k + 1] = ((this.w[2 * k + 1] as number) | hi) >>> 0;
-    });
+    }, limitWords);
   }
 
   /** git's `bitmap_and_not`. */
@@ -82,18 +100,19 @@ export class RawBitmap {
         keep[2 * k] = ((this.w[2 * k] as number) & lo) >>> 0;
         keep[2 * k + 1] = ((this.w[2 * k + 1] as number) & hi) >>> 0;
       }
-    });
+    }, this.alloc);
     this.w.set(keep);
   }
 
-  /** Clears the bits `other` has. */
-  andNotEwah(other: EwahBitmap): void {
-    other.forEachWord((k, lo, hi) => {
+  /** Clears the bits `other` has (below `limit` only, when given). */
+  andNotEwah(other: EwahBitmap, limit = Infinity): void {
+    other.forEachWord((k, rawLo, rawHi) => {
+      const [lo, hi] = maskWord(k, rawLo, rawHi, limit);
       if (k < this.alloc) {
         this.w[2 * k] = ((this.w[2 * k] as number) & ~lo) >>> 0;
         this.w[2 * k + 1] = ((this.w[2 * k + 1] as number) & ~hi) >>> 0;
       }
-    });
+    }, this.alloc);
   }
 
   /** Whether every bit of this one is set in `other` (git's `bitmap_is_subset` negated). */

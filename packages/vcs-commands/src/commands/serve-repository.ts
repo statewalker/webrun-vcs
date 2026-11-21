@@ -13,12 +13,12 @@ import {
   type ServerConfigReader,
   servedGitFilesOf,
 } from "@statewalker/vcs-transport";
-import { parseGitBool } from "@statewalker/vcs-utils";
 import type { OpenedRepository } from "@statewalker/vcs-working-tree";
 import type { HookSession } from "./git-hooks.js";
 import {
   httpBackendEnv,
   receivePackSettingsOf,
+  servedUseBitmaps,
   withReceiveTransactionHook,
 } from "./local-transport.js";
 
@@ -92,7 +92,7 @@ export async function servedRepositoryOf(
     repository: createRepositoryFacade({
       history: remote.history,
       // git's pack.useBitmaps (pack-objects reads it from the served repository)
-      useBitmaps: parseGitBool(remote.config?.getAll("pack.useBitmaps").at(-1)) ?? true,
+      useBitmaps: servedUseBitmaps(remote),
     }),
     refStore: createTransportRefStore(remote.history.refs),
     config: remote.config ?? EMPTY_CONFIG,

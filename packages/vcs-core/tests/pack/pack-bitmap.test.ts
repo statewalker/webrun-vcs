@@ -5,6 +5,7 @@
  * pack).
  */
 import { EwahBitmap, RawBitmap } from "@statewalker/vcs-utils";
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { describe, expect, it } from "vitest";
 import { createInMemoryFilesApi } from "../../src/common/files/index.js";
 import type { GitObjects } from "../../src/history/objects/git-objects.js";
@@ -243,5 +244,148 @@ describe("pack bitmaps", () => {
     expect(refuse(flipped)).toBe("bitmap file 'x.bitmap' has invalid checksum");
     expect(refuse(bytes.subarray(0, 40))).toBe("corrupted bitmap index (too small)");
     expect(refuse(bytes)).toBe("accepted");
+  });
+});
+
+/**
+ * A bitmap file with each entry's stored EWAH replaced by `fn`'s, the checksum recomputed (so
+ * only the content is crafted).
+ */
+function rewriteEntries(
+  bytes: Uint8Array,
+  fn: (stored: EwahBitmap, i: number, xorOffset: number) => Uint8Array,
+): Uint8Array {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const entryCount = view.getUint32(8);
+  const end = bytes.length - 20;
+  let pos = 32;
+  for (let k = 0; k < 4; k++) pos = (EwahBitmap.read(bytes, pos, end) as { next: number }).next;
+  const parts: Uint8Array[] = [bytes.subarray(0, pos)];
+  for (let i = 0; i < entryCount; i++) {
+    const r = EwahBitmap.read(bytes, pos + 6, end) as { bitmap: EwahBitmap; next: number };
+    parts.push(bytes.subarray(pos, pos + 6), fn(r.bitmap, i, bytes[pos + 4] as number));
+    pos = r.next;
+  }
+  parts.push(bytes.subarray(pos, end));
+  const body = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) {
+    body.set(p, at);
+    at += p.length;
+  }
+  const out = new Uint8Array(body.length + 20);
+  out.set(body);
+  out.set(createSha1().update(body).digest(), body.length);
+  return out;
+}
+
+/** An EWAH buffer as git serializes it: bit size, word count, words (as given), RLW position. */
+function rawEwah(bitSize: number, words: [hi: number, lo: number][]): Uint8Array {
+  const out = new Uint8Array(12 + words.length * 8);
+  const v = new DataView(out.buffer);
+  v.setUint32(0, bitSize >>> 0);
+  v.setUint32(4, words.length);
+  words.forEach(([hi, lo], i) => {
+    v.setUint32(8 + i * 8, hi >>> 0);
+    v.setUint32(12 + i * 8, lo >>> 0);
+  });
+  v.setUint32(8 + words.length * 8, 0);
+  return out;
+}
+
+const serialized = (b: EwahBitmap) => {
+  const out = new Uint8Array(b.serializedSize);
+  b.writeTo(out, 0);
+  return out;
+};
+
+describe("crafted bitmaps (served repositories)", () => {
+  async function smallBitmap() {
+    const h = await randomHistory(3, 12);
+    return { h, ...(await bitmapped(h, [h.commits[11] as string])) };
+  }
+  const refusal = (b: Uint8Array, pack: PackFile) => {
+    try {
+      parsePackBitmap(b, pack, "x.bitmap");
+    } catch (e) {
+      expect(e).toBeInstanceOf(PackBitmapError);
+      return (e as Error).message;
+    }
+    return "accepted";
+  };
+
+  it("refuses a run longer than the pack, before expanding it", async () => {
+    const { bytes, pack } = await smallBitmap();
+    // one RLW: running bit 1, running length 2^32 - 1 (git's RLW_RUNNING_BITS), no literals
+    const huge = rewriteEntries(bytes, (stored, i) =>
+      i === 0 ? rawEwah(64, [[0x1, 0xffffffff]]) : serialized(stored),
+    );
+    const started = Date.now();
+    expect(refusal(huge, pack)).toBe("corrupted bitmap index file (bitmap larger than its pack)");
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it("refuses a bit size larger than the pack", async () => {
+    const { bytes, pack } = await smallBitmap();
+    const big = rewriteEntries(bytes, (stored, i) =>
+      i === 0 ? rawEwah(0xffffffff, [[0, 2]]) : serialized(stored),
+    );
+    expect(refusal(big, pack)).toBe("corrupted bitmap index file (bitmap larger than its pack)");
+  });
+
+  it("falls back to the walk with an error line when the pack set opens one", async () => {
+    const { bytes, packs, files, pack, h } = await smallBitmap();
+    const huge = rewriteEntries(bytes, (stored, i) =>
+      i === 0 ? rawEwah(64, [[0x1, 0xffffffff]]) : serialized(stored),
+    );
+    await files.write(`/pack/pack-${pack.packId}.bitmap`, [huge]);
+    await packs.refresh();
+    const reopened = await openPackSet(files, "/pack");
+    expect(await reopened.bitmap?.()).toBeUndefined();
+    expect(reopened.bitmapErrors).toEqual([
+      "error: corrupted bitmap index file (bitmap larger than its pack)",
+    ]);
+    const tip = h.commits[11] as string;
+    expect(
+      await setOf(listObjects(h.objects, { wants: [tip], bitmap: await reopened.bitmap?.() })),
+    ).toEqual(await setOf(listObjects(h.objects, { wants: [tip] })));
+  });
+
+  it("ignores stray bits at or above the pack's count, extended objects included", async () => {
+    // a history whose packed prefix does not fill its last bitmap word
+    let seed = 40;
+    let found: { h: History; cut: number; built: Awaited<ReturnType<typeof bitmapped>> };
+    for (;;) {
+      const h = await randomHistory(seed++, 30);
+      const cut = 20;
+      const built = await bitmapped(h, [h.commits[cut - 1] as string]);
+      if (built.pack.count % 64 !== 0 && built.pack.count % 64 < 60) {
+        found = { h, cut, built };
+        break;
+      }
+    }
+    const { h, built } = found;
+    const count = built.pack.count;
+    const stray = rewriteEntries(built.bytes, (stored, _i, xorOffset) => {
+      if (xorOffset !== 0) return serialized(stored);
+      const raw = RawBitmap.fromEwah(stored);
+      for (let b = count; b < Math.ceil(count / 64) * 64; b++) raw.set(b);
+      return serialized(raw.toEwah());
+    });
+    const index = parsePackBitmap(stray, built.pack, "x.bitmap");
+    // commits after the packed prefix get extended positions from `count` on
+    const wants = [h.commits[h.commits.length - 1] as string];
+    const got = await bitmapWalk(index, h.objects, { wants });
+    const ids = new Set([...got.objects()].map((o) => o.id));
+    const reach = await setOf(listObjects(h.objects, { wants }));
+    expect(ids).toEqual(reach);
+    expect(got.count).toBe(reach.size);
+    // and as haves: nothing outside the pack is taken for theirs
+    const haves = [h.commits[19] as string];
+    const part = await bitmapWalk(index, h.objects, { wants, haves });
+    const theirs = await setOf(listObjects(h.objects, { wants: haves }));
+    expect(new Set([...part.objects()].map((o) => o.id))).toEqual(
+      new Set([...reach].filter((id) => !theirs.has(id))),
+    );
   });
 });

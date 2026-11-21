@@ -230,7 +230,8 @@ export async function bitmapWalk(
       if (known(p)) continue;
       const stored = p >= 0 && p < count ? index.bitmapFor(c) : undefined;
       if (stored) {
-        out.orEwah(stored);
+        // bits at or above the pack's count stand for no object of it (nor an extended one)
+        out.orEwah(stored, count);
         continue;
       }
       const info = await commitInfo(c, required);
@@ -270,7 +271,7 @@ export async function bitmapWalk(
       blob: index.blobs,
       tag: index.tags,
     };
-    for (const t of drop) result.andNotEwah(bitmaps[t]);
+    for (const t of drop) result.andNotEwah(bitmaps[t], count);
     for (let k = 0; k < extIds.length; k++) {
       if (drop.has(extTypes[k] as ObjectTypeString)) result.unset(count + k);
     }
