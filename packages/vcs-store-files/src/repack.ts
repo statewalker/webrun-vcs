@@ -22,12 +22,9 @@ import type {
 } from "@statewalker/vcs-core";
 import { createGitObjects, joinPath, writePack } from "@statewalker/vcs-core";
 
+import { assertAlternatesReadable } from "./alternates/index.js";
 import { listReachableObjects } from "./reachable-objects.js";
-import {
-  assertNoAlternates,
-  assertObjectsDeletable,
-  readRepositoryFormat,
-} from "./repository-format.js";
+import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
@@ -74,6 +71,13 @@ export interface RepackOptions extends RepackTarget {
   /** Report what would be done without writing or deleting anything. */
   dryRun?: boolean;
   /**
+   * `git repack -l` (`pack-objects --local`): leave out the objects an alternate holds, loose
+   * or packed (`objects.alternates`). Without it the reachable objects borrowed from
+   * alternates are copied into the new pack, as `git repack -a -d` copies them. `gc()` sets
+   * it, as `git gc` runs `repack -d -l`.
+   */
+  local?: boolean;
+  /**
    * `git repack -A` (with `all`): before a replaced pack is removed, its unreachable objects are
    * written loose, unless the pack was last modified more than `unpackUnreachableExpireMs` ago
    * (git's `--unpack-unreachable=<expire>`). A pack whose mtime is unknown is loosened. The loose
@@ -109,6 +113,11 @@ export interface RepackResult {
   keptPacks: string[];
   /** Unreachable objects of the removed packs written loose or renewed (`unpackUnreachable`) */
   unpackedObjects: number;
+  /**
+   * git's error lines from reading the alternates, which git repack prints to stderr and goes
+   * on (`repack()` only; gc reports them in its own result); absent when there are none
+   */
+  errors?: string[];
 }
 
 /**
@@ -155,8 +164,12 @@ export async function snapshotPacks(packs: PackSet): Promise<PackSnapshot> {
  * Without `all`, as `git repack -d`: the reachable objects that are only loose go into a new
  * pack and their loose copies are removed; existing packs are untouched.
  *
- * A repository with `extensions.preciousObjects`, a partial clone, or one with
- * `objects/info/alternates` is refused (`UnsupportedRepositoryFormatError`), unless `dryRun`.
+ * Objects borrowed from alternates (`objects/info/alternates`) are packed too unless `local`
+ * (`git repack -l`); a loose copy of an object some pack holds, an alternate's included, is
+ * removed (`git prune-packed`). Alternates themselves are never written or deleted.
+ *
+ * A repository with `extensions.preciousObjects` or a partial clone is refused
+ * (`UnsupportedRepositoryFormatError`), unless `dryRun`.
  *
  * @returns the result, or null if there is nothing to pack (then nothing is changed)
  *
@@ -171,9 +184,11 @@ export async function snapshotPacks(packs: PackSet): Promise<PackSnapshot> {
 export async function repack(options: RepackOptions): Promise<RepackResult | null> {
   // repack deletes what the new pack replaces: not in a precious-objects repo (git: "cannot
   // delete packs in a precious-objects repo"), nor in a partial clone (promisor packs)
+  // git's errors reading the alternates are printed and repack goes on (see gc)
+  let alternatesErrors: readonly string[] = options.objects.alternates?.errors ?? [];
   if (!options.dryRun) {
     assertObjectsDeletable(await readRepositoryFormat(options.files, options.gitDir), "repack");
-    await assertNoAlternates(options.files, options.gitDir, "repack");
+    alternatesErrors = await assertAlternatesReadable(options, "repack");
   }
   // The snapshot first: a pack installed during the walk is never removed
   const snapshot = await snapshotPacks(options.packs);
@@ -185,7 +200,10 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
     commitGraph: options.history.commitGraph,
     ...(options.readGraftFile ? { readGraftFile: options.readGraftFile } : {}),
   });
-  return repackListed(options, listed, snapshot);
+  const result = await repackListed(options, listed, snapshot);
+  return result && alternatesErrors.length > 0
+    ? { ...result, errors: [...alternatesErrors] }
+    : result;
 }
 
 /**
@@ -213,9 +231,23 @@ export async function repackListed(
     else replaced.push(p);
   }
 
-  // -a: everything reachable but what .keep packs hold; -d alone: what no pack holds
+  // -a: everything reachable but what .keep packs hold; -d alone: what no pack holds (an
+  // alternate's included: pack-objects --unpacked); -l: nothing an alternate holds
   const skip = all ? kept : before;
-  const ids = reachable.filter((o) => !skip.some((p) => p.has(o.id)));
+  const alternates = (await objects.alternates?.list()) ?? [];
+  const borrowed = async (id: ObjectId) => {
+    for (const alt of alternates) {
+      if (options.local ? await alt.objects.has(id) : !all && (await alt.packs.has(id)))
+        return true;
+    }
+    return false;
+  };
+  const ids: ListedObject[] = [];
+  for (const o of reachable) {
+    if (skip.some((p) => p.has(o.id))) continue;
+    if (alternates.length > 0 && (await borrowed(o.id))) continue;
+    ids.push(o);
+  }
   if (ids.length === 0) return null;
 
   const keptPacks = kept.map((p) => `pack-${p.packId}`);
@@ -273,7 +305,7 @@ export async function repackListed(
   const packsRemoved = removable.map((r) => `pack-${r.pack.packId}`);
   if (packsRemoved.length) await packs.remove(removable.map((r) => r.pack.packId));
 
-  const looseObjectsRemoved = await prunePacked(looseStorage, packs);
+  const looseObjectsRemoved = await prunePacked(looseStorage, packs, alternates);
 
   return {
     packName: `pack-${installed.packId}`,
@@ -327,8 +359,20 @@ async function unpackUnreachable(o: {
   return written;
 }
 
-/** Removes the loose objects a pack holds (`git prune-packed`). Returns how many. */
-export async function prunePacked(looseStorage: FileRawStorage, packs: PackSet): Promise<number> {
+/**
+ * Removes the loose objects a pack holds (`git prune-packed`): one of `packs`, or one of an
+ * alternate's (git's `has_object_pack` looks in every source's packs). Returns how many.
+ */
+export async function prunePacked(
+  looseStorage: FileRawStorage,
+  packs: PackSet,
+  alternates: readonly { packs: PackSet }[] = [],
+): Promise<number> {
+  const packed = async (id: ObjectId) => {
+    if (await packs.has(id)) return true;
+    for (const alt of alternates) if (await alt.packs.has(id)) return true;
+    return false;
+  };
   const loose: ObjectId[] = [];
   for await (const id of looseStorage.keys()) {
     // Only object files: native git writes objects/ab/tmp_obj_* while it works.
@@ -336,7 +380,7 @@ export async function prunePacked(looseStorage: FileRawStorage, packs: PackSet):
   }
   let removed = 0;
   for (const id of loose) {
-    if ((await packs.has(id)) && (await looseStorage.remove(id))) removed++;
+    if ((await packed(id)) && (await looseStorage.remove(id))) removed++;
   }
   return removed;
 }

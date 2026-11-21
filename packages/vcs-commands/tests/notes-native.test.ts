@@ -19,7 +19,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
 import {
   createNodeFilesApi,
@@ -1283,7 +1283,7 @@ describeGit("git notes, native twins", () => {
     }
   });
 
-  it("prune refuses a repository with alternates, as gc does", async () => {
+  it("prune keeps the notes of objects an alternate holds, as git", async () => {
     const t = twins();
     for (const repo of [t.native, t.ours]) {
       const alt = join(repo, "../alt");
@@ -1302,16 +1302,14 @@ describeGit("git notes, native twins", () => {
     }
     const n = git(t.native, ["notes", "prune", "-v"]);
     expect(n).toEqual({ status: 0, stdout: "", stderr: "" });
-    const mine = await ours(async () =>
-      (await open(t.ours)).notes().prune().setVerbose(true).call(),
-    );
-    expect(mine).toEqual({
-      status: 128,
-      stdout: "",
-      stderr:
-        "fatal: cannot prune notes in a repository with alternates (objects/info/alternates): " +
-        "the objects it borrows are not read\n",
-    });
+    // the alternate is read through the storage: rooted above both repositories
+    const files = createNodeFilesApi({ rootDir: join(t.ours, "..") });
+    const gitDir = `${basename(t.ours)}/.git`;
+    const { history } = await createGitFilesBackend({ files, gitDir });
+    const worktrees = await openGitLinkedWorktrees({ files, gitDir, history });
+    const g = Git.fromWorkingCopy(await worktrees.openCurrent());
+    const mine = await ours(() => g.notes().prune().setVerbose(true).call());
+    expect(mine).toEqual(n);
     expect(state(t.ours)).toBe(state(t.native));
   });
 

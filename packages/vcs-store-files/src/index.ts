@@ -8,6 +8,8 @@
  * - Maintenance: repack(), gc(), FileGcStrategy
  */
 
+// Alternate object directories (objects/info/alternates)
+export * from "./alternates/index.js";
 // The commit-graph: settings, provider, writeCommitGraph
 export * from "./commit-graph.js";
 // Factory functions

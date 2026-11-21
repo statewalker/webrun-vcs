@@ -224,9 +224,9 @@ through `ServedRepository.files`, with `Content-Length` and `Last-Modified` as
 (upper-case hex, a short name) are a `404` before any lookup.
 
 The files of a repository with `objects/info/alternates` are served as they are (a dumb client
-then fetches from the alternate, given `http.followRedirects=true`), but the repository's
-object store reads no alternates: an annotated tag whose object only an alternate holds is
-listed in `info/refs` without its peeled `^{}` line, where http-backend peels it.
+then fetches from the alternate, given `http.followRedirects=true`). The repository's object
+store reads its alternates as git does, so an annotated tag whose object only an alternate
+holds is listed in `info/refs` with its peeled `^{}` line, as http-backend lists it.
 
 `servedRepositoryOf` sets `files` for a repository opened from a FilesApi
 (`OpenedRepository.files`, set by `Worktree.openRepository`), reading below its repository
@@ -600,6 +600,20 @@ channel's `serve` and reach it with `createWebrunConnector({ call: () => call })
   tell links apart, so `"files"` follows no include there. The system and global config files
   are the operator's and keep git's rules either way. The same option reaches the settings the
   object and ref stores read (`createGitFilesBackend({ configIncludes })`).
+- **Alternates borrow from other repositories.** A repository's `objects/info/alternates`
+  names object directories its object store reads after its own (git's alternates, written by
+  `git clone --shared`/`--reference`), and git always honours it: upload-pack sends what an
+  alternate holds, receive-pack advertises the alternates' refs as `.have` lines. Ours reads
+  alternates only through the storage's FilesApi (an absolute path only inside its
+  `rootDirectory`, symbolic links followed only there), so no repository borrows from outside the
+  storage. Inside it, a repository owner who can write `objects/info/alternates` can read any
+  other repository's objects through upload-pack (as with git on a shared filesystem). Where the
+  storage holds repositories of owners who must not read each other's objects, open them with
+  `openRepository(location, { alternates: false })` (`createGitFilesBackend({ alternates: false
+  })`): borrowed objects then read as missing. `$GIT_ALTERNATE_OBJECT_DIRECTORIES` is never
+  applied to a repository `openRepository` opens (git clears it, `local_repo_env`, for the
+  upload-pack or receive-pack of another repository); `configIncludes: "files"` does not touch
+  alternates, which are no configuration.
 - **Hooks already run the owner's code.** With a hook runner installed, a served repository's
   `pre-receive`, `update` and `post-receive` scripts run on the server with its rights, so its
   owner can read whatever the server can, includes or not. Include confinement matters for

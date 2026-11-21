@@ -14,7 +14,7 @@ import {
 } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
-
+import { assertAlternatesReadable } from "./alternates/index.js";
 import { readCommitGraphSettings, writeCommitGraph } from "./commit-graph.js";
 import { sweepQuarantines } from "./quarantine/files-quarantine.js";
 import { listReachableObjects } from "./reachable-objects.js";
@@ -26,11 +26,7 @@ import {
   repackListed,
   snapshotPacks,
 } from "./repack.js";
-import {
-  assertNoAlternates,
-  assertObjectsDeletable,
-  readRepositoryFormat,
-} from "./repository-format.js";
+import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
@@ -145,6 +141,12 @@ export interface GcResult {
    * did stands.
    */
   commitGraphError?: string;
+  /**
+   * git's error lines from reading the alternates (`error: unable to normalize alternate object
+   * path: ...`, `error: ...: ignoring alternate object stores, nesting too deep`), which git gc
+   * prints to stderr and goes on; absent when there are none
+   */
+  errors?: string[];
 }
 
 /**
@@ -166,9 +168,15 @@ export interface GcResult {
  *    `git gc` does: `objects/info/commit-graph`, replacing a split chain.
  *
  * In a repository with `extensions.preciousObjects`, only steps 3 and 7 run, as `git gc` skips its
- * repack and prune there. A partial clone (`extensions.partialClone`, a promisor remote) and
- * a repository with `objects/info/alternates` are refused with
- * `UnsupportedRepositoryFormatError` before anything changes.
+ * repack and prune there. A partial clone (`extensions.partialClone`, a promisor remote) is
+ * refused with `UnsupportedRepositoryFormatError` before anything changes. In a repository
+ * with alternates (`objects/info/alternates`) what they reach is walked through them, and the
+ * repack leaves out what they hold (`git gc` runs `repack -d -l`); only the repository's own
+ * objects are ever deleted. An alternate git cannot read either (gone, a path that cannot be
+ * normalized, nesting too deep) is reported in `errors` and gc goes on, as git does; a ref, HEAD
+ * or index entry whose object is missing aborts it (`MissingRootError`), and so does a missing
+ * object under a local commit, as git dies. Alternates git reads and this store does not
+ * (`alternates: false`, outside the FilesApi's root) are refused (`AlternatesUnreadableError`).
  *
  * The lock excludes gcs in other processes when the FilesApi has `createExclusive`, and
  * otherwise only gcs over the same FilesApi instance (see `atomicFilesOver`).
@@ -226,7 +234,13 @@ async function collect(options: GcOptions): Promise<GcResult> {
   // refused. preciousObjects: as git gc, refs are packed, but nothing is repacked or pruned.
   const format = await readRepositoryFormat(files, gitDir);
   if (format.partialClone !== undefined) assertObjectsDeletable(format, "gc");
-  await assertNoAlternates(files, gitDir, "gc");
+  // git's errors reading the alternates (a directory gone, ...) are printed and gc goes on: the
+  // walk below fails on a root or a local commit's object that only they held. Alternates git
+  // reads and we cannot (alternates: false, outside the storage) are refused.
+  const alternatesErrors = dryRun
+    ? (objects.alternates?.errors ?? [])
+    : await assertAlternatesReadable({ files, gitDir, objects }, "gc");
+  const errors = alternatesErrors.length > 0 ? { errors: [...alternatesErrors] } : {};
   if (format.preciousObjects) {
     let refsPacked = false;
     if ((options.packRefs ?? true) && !dryRun && history.refs.packRefs) {
@@ -245,6 +259,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
       repack: null,
       skipped: false,
       ...(await gcCommitGraph(options, objects)),
+      ...errors,
     };
   }
 
@@ -296,6 +311,8 @@ async function collect(options: GcOptions): Promise<GcResult> {
         gitDir,
         unpackUnreachable: true,
         unpackUnreachableExpireMs: pruneExpireMs,
+        // git gc: repack -d -l, what alternates hold stays theirs
+        local: true,
       },
       listed,
       snapshot,
@@ -358,6 +375,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
     repack: repackResult,
     skipped: false,
     ...commitGraph,
+    ...errors,
   };
 }
 

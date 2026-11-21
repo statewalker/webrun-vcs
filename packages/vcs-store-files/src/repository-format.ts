@@ -17,8 +17,7 @@
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
-import { decodeGitPath, parseGitBool } from "@statewalker/vcs-utils/encoding";
-import { readFile } from "@statewalker/vcs-utils/files";
+import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 
 import {
   configFilesApiOf,
@@ -236,34 +235,6 @@ export function assertObjectsDeletable(format: RepositoryFormat, operation: stri
     throw new UnsupportedRepositoryFormatError(
       `cannot ${operation} in a partial clone (promisor remote ${format.partialClone}): ` +
         "promisor objects are not supported",
-    );
-  }
-}
-
-/**
- * Refuses gc and repack in a repository that borrows objects through
- * `objects/info/alternates`: those objects are not read here, so what only they hold would
- * look absent (a reachable one aborts the walk; a ref to one would silently stop being a
- * root). git handles alternates; we refuse instead of guessing.
- *
- * @example
- * ```typescript
- * await assertNoAlternates(files, ".git", "gc");
- * ```
- */
-export async function assertNoAlternates(
-  files: FilesApi,
-  gitDir = ".git",
-  operation = "gc",
-): Promise<void> {
-  const path = `${gitDir.replace(/\/+$/, "")}/objects/info/alternates`;
-  if ((await files.stats(path))?.kind !== "file") return;
-  const text = decodeGitPath(await readFile(files, path));
-  const used = text.split("\n").some((line) => line.trim() !== "" && !line.startsWith("#"));
-  if (used) {
-    throw new UnsupportedRepositoryFormatError(
-      `cannot ${operation} in a repository with alternates (objects/info/alternates): ` +
-        "the objects it borrows are not read",
     );
   }
 }

@@ -685,7 +685,7 @@ export function createServedHttpHandler(
             const version1 = requestedProtocolVersion(gitProtocol) === 1;
             return service === "git-upload-pack"
               ? handleInfoRefs(refStore, uploadPackOptions, repository, version1)
-              : handleReceivePackInfoRefs(refStore, serverOptions, version1);
+              : handleReceivePackInfoRefs(refStore, serverOptions, version1, repository);
           }
           const runContext: HttpHandlerContext = {
             repoPath,

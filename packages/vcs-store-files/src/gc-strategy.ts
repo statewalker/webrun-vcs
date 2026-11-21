@@ -22,14 +22,11 @@ import type {
 } from "@statewalker/vcs-core";
 import { joinPath } from "@statewalker/vcs-core";
 
+import { assertAlternatesReadable } from "./alternates/index.js";
 import { collectReachabilityRoots } from "./reachable-objects.js";
 
 import { type RepackTarget, repack } from "./repack.js";
-import {
-  assertNoAlternates,
-  assertObjectsDeletable,
-  readRepositoryFormat,
-} from "./repository-format.js";
+import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
 /** A loose object file name, fan-out directory included. */
@@ -68,13 +65,15 @@ export class FileGcStrategy implements GcStrategy {
    * HEAD, the index, every reflog file, linked worktrees and pseudo-refs; strict, as `gc()`.
    * Called first by the orchestrator, so it also refuses, before anything is pruned, a
    * repository with `extensions.preciousObjects` (git: "cannot prune in a precious-objects
-   * repo"), a partial clone (`extensions.partialClone`, a promisor remote) or a repository
-   * with `objects/info/alternates`: `UnsupportedRepositoryFormatError`.
+   * repo") or a partial clone (`extensions.partialClone`, a promisor remote):
+   * `UnsupportedRepositoryFormatError`. Alternates are read: only the repository's own loose
+   * objects are pruned. git's non-fatal alternates errors (a directory gone, ...) do not stop
+   * it, alternates git reads and this store cannot do (`AlternatesUnreadableError`, see gc).
    */
   async collectRoots(): Promise<GcRoots> {
     const { files, gitDir, history, objects } = this.target;
     assertObjectsDeletable(await readRepositoryFormat(files, gitDir), "prune");
-    await assertNoAlternates(files, gitDir, "prune");
+    await assertAlternatesReadable({ files, gitDir, objects }, "prune");
     return {
       roots: await collectReachabilityRoots({ files, gitDir, refs: history.refs, objects }),
     };
@@ -109,7 +108,7 @@ export class FileGcStrategy implements GcStrategy {
 
   async compact(): Promise<CompactResult> {
     // git repack -d: the reachable loose objects into one pack, existing packs untouched
-    const result = await repack({ ...this.target, all: false });
+    const result = await repack({ ...this.target, all: false, local: true });
 
     if (!result) {
       return { packsCreated: 0, objectsPacked: 0, packsMerged: 0 };

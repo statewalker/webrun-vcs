@@ -40,6 +40,26 @@ import { readAllRefs } from "./refs/index.js";
 
 const OID = /^[0-9a-f]{40}$/;
 const ZERO = "0".repeat(40);
+/** The empty blob and tree: git reads them whether stored or not (`find_cached_object`). */
+const VIRTUAL = new Set([
+  "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+  "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+]);
+
+/**
+ * A root gc, repack and prune cannot do without is not stored: a ref, HEAD or an index entry
+ * names an object the repository (and its alternates) lack. Nothing has changed.
+ */
+export class MissingRootError extends Error {
+  constructor(
+    message: string,
+    /** The missing object */
+    readonly objectId: ObjectId,
+  ) {
+    super(message);
+    this.name = "MissingRootError";
+  }
+}
 /** A gitlink (submodule commit): the object lives in another repository. */
 const GITLINK = 0o160000;
 
@@ -77,6 +97,12 @@ export interface ReachabilityRoots {
  * as does an unreadable reflog, index or worktree HEAD. A root skipped silently would let gc
  * and repack delete what it holds, so they abort instead, as `git gc` does.
  *
+ * A ref, HEAD (a linked worktree's too) or index entry whose object is not stored throws
+ * ({@link MissingRootError}: `bad object <name>`, `unable to read <id>`), as git's
+ * `get_reference` and pack-objects die (an alternate that cannot be read hides what it holds:
+ * pruning then would delete what the missing commits reach). Reflog entries, pseudo-refs and
+ * the cache-tree's and resolve-undo's ids are left out when missing, as git tolerates them.
+ *
  * @example
  * ```typescript
  * const tips = await collectReachabilityRoots({ files, refs: history.refs, objects });
@@ -86,6 +112,15 @@ export async function collectReachabilityRoots(roots: ReachabilityRoots): Promis
   const { files, refs, objects } = roots;
   const gitDir = roots.gitDir ?? ".git";
   const tips = new Set<ObjectId>();
+  // roots that must be stored, with git's message when one is not (the first naming wins)
+  const required = new Map<ObjectId, string>();
+  const require = (id: ObjectId, message: string) => {
+    if (!required.has(id)) required.set(id, message);
+  };
+  const requireIndex = (ids: { entries: ObjectId[]; extra: ObjectId[] }) => {
+    for (const id of ids.entries) require(id, `unable to read ${id}`);
+    for (const id of ids.extra) tips.add(id);
+  };
 
   // The refs on storage, strictly: a ref that cannot be read throws instead of being skipped
   const stored = await readAllRefs(files, gitDir, "", { strict: true });
@@ -98,18 +133,18 @@ export async function collectReachabilityRoots(roots: ReachabilityRoots): Promis
   };
   for (const ref of stored) {
     const id = resolveStored(ref.name);
-    if (id) tips.add(id);
+    if (id) require(id, `bad object ${ref.name}`);
   }
   // and through the Refs API too (a store that keeps refs elsewhere)
   for await (const ref of refs.list()) {
     const resolved = await refs.resolve(ref.name);
-    if (resolved?.objectId) tips.add(resolved.objectId);
+    if (resolved?.objectId) require(resolved.objectId, `bad object ${ref.name}`);
   }
   const head = await refs.resolve("HEAD");
-  if (head?.objectId) tips.add(head.objectId);
+  if (head?.objectId) require(head.objectId, "bad object HEAD");
 
   for (const id of await reflogIds(files, joinPath(gitDir, "logs"))) tips.add(id);
-  for (const id of await indexIds(files, joinPath(gitDir, "index"))) tips.add(id);
+  requireIndex(await indexIds(files, joinPath(gitDir, "index")));
   for (const id of await pseudoRefIds(files, gitDir)) tips.add(id);
 
   // Linked worktrees: their HEAD, index and reflogs live under worktrees/<name>/
@@ -117,10 +152,11 @@ export async function collectReachabilityRoots(roots: ReachabilityRoots): Promis
   if ((await files.stats(worktrees))?.kind === "directory") {
     for await (const wt of files.list(worktrees)) {
       if (wt.kind !== "directory") continue;
+      const label = `worktrees/${wt.path.slice(wt.path.lastIndexOf("/") + 1)}`;
       const id = await worktreeHead(files, joinPath(wt.path, "HEAD"), async (target) => {
         return resolveStored(target) ?? (await refs.resolve(target))?.objectId;
       });
-      if (id) tips.add(id);
+      if (id) require(id, `bad object ${label}/HEAD`);
       // its per-worktree refs (refs/bisect/*, refs/worktree/*, refs/rewritten/*), always loose
       const own = await readAllRefs(files, wt.path, "refs/", { strict: true });
       const ownByName = new Map(own.map((r) => [r.name, r]));
@@ -130,15 +166,21 @@ export async function collectReachabilityRoots(roots: ReachabilityRoots): Promis
           const name: string = target.target;
           target = ownByName.get(name) ?? byName.get(name);
         }
-        if (target && !isSymbolicRef(target) && target.objectId) tips.add(target.objectId);
+        if (target && !isSymbolicRef(target) && target.objectId)
+          require(target.objectId, `bad object ${label}/${ref.name}`);
       }
       for (const id of await reflogIds(files, joinPath(wt.path, "logs"))) tips.add(id);
-      for (const id of await indexIds(files, joinPath(wt.path, "index"))) tips.add(id);
+      requireIndex(await indexIds(files, joinPath(wt.path, "index")));
       for (const id of await pseudoRefIds(files, wt.path)) tips.add(id);
     }
   }
 
   const present: ObjectId[] = [];
+  for (const [id, message] of required) {
+    if (!VIRTUAL.has(id) && !(await objects.has(id))) throw new MissingRootError(message, id);
+    present.push(id);
+    tips.delete(id);
+  }
   for (const id of tips) if (await objects.has(id)) present.push(id);
   return present;
 }
@@ -254,9 +296,15 @@ async function reflogIds(files: FilesApi, logsDir: string): Promise<ObjectId[]> 
   return ids;
 }
 
-/** The object ids the index records (gitlinks excepted). */
-async function indexIds(files: FilesApi, indexPath: string): Promise<ObjectId[]> {
-  if ((await files.stats(indexPath))?.kind !== "file") return [];
+/**
+ * The object ids the index records: its entries' (gitlinks excepted), and the cache-tree's
+ * and resolve-undo's (`extra`).
+ */
+async function indexIds(
+  files: FilesApi,
+  indexPath: string,
+): Promise<{ entries: ObjectId[]; extra: ObjectId[] }> {
+  if ((await files.stats(indexPath))?.kind !== "file") return { entries: [], extra: [] };
   const parts: Uint8Array[] = [];
   let length = 0;
   for await (const c of files.read(indexPath)) {
@@ -276,7 +324,8 @@ async function indexIds(files: FilesApi, indexPath: string): Promise<ObjectId[]>
         "run `git update-index --no-split-index` first",
     );
   }
-  const ids = parsed.entries.filter((e) => e.mode !== GITLINK).map((e) => e.objectId);
+  const entries = parsed.entries.filter((e) => e.mode !== GITLINK).map((e) => e.objectId);
+  const ids: ObjectId[] = [];
   for (const ext of parsed.extensionData) {
     if (ext.signature === "TREE") ids.push(...cacheTreeIds(ext.data, indexPath));
     else if (ext.signature === "REUC") {
@@ -288,7 +337,7 @@ async function indexIds(files: FilesApi, indexPath: string): Promise<ObjectId[]>
       }
     }
   }
-  return ids;
+  return { entries, extra: ids };
 }
 
 /**

@@ -26,10 +26,12 @@ import {
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
+import { openObjectAlternates, withAlternates } from "./alternates/index.js";
 import { createFilesCommitGraphProvider } from "./commit-graph.js";
 import { readDeltaBaseCacheLimit, skipPacked, withPacks } from "./pack/index.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
 import { createFileRefStore, type FileRefStore, peelTag } from "./refs/index.js";
+import { repack } from "./repack.js";
 import { readRepositoryFormat } from "./repository-format.js";
 import { resolveLinkedGitDir } from "./resolve-linked-git-dir.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
@@ -97,6 +99,29 @@ export interface GitFilesBackendOptions {
    * the repository's directory (a server's repositories), `false` none.
    */
   configIncludes?: boolean | "files";
+  /**
+   * Read the alternate object directories (`objects/info/alternates`, and
+   * `$GIT_ALTERNATE_OBJECT_DIRECTORIES` unless `alternatesFromEnvironment` is false), as git
+   * always does. Default true. A server whose storage holds repositories of owners who must
+   * not read each other's objects passes false: the objects an alternate holds are then
+   * missing (git honours alternates whatever the owner; see docs/transports.md).
+   */
+  alternates?: boolean;
+  /**
+   * Read `$GIT_ALTERNATE_OBJECT_DIRECTORIES` from `environment` (default true). False for a
+   * repository opened as git opens another one in a child process with `local_repo_env`
+   * cleared (a local remote, a served repository).
+   */
+  alternatesFromEnvironment?: boolean;
+  /**
+   * The worktree top in `files` (git's current directory after its setup): relative
+   * `$GIT_ALTERNATE_OBJECT_DIRECTORIES` entries name directories from there. Default: the
+   * git directory when bare, `core.worktree` when set, the directory holding `.git`, else (a
+   * separate git directory) the FilesApi's root.
+   */
+  workTree?: string;
+  /** Each of git's error lines (`error: ...`) while the alternates are read */
+  onAlternatesError?: (line: string) => void;
 }
 
 /**
@@ -185,8 +210,36 @@ export async function createGitFilesBackend(
     // git's core.deltaBaseCacheLimit (96 MiB when unset)
     baseCacheBytes: await readDeltaBaseCacheLimit(files, gitDir, includes),
   });
-  const loose = createGitObjects(skipPacked(staging, packs));
-  const objects = withPacks(loose, packs);
+  // the alternates (git's other odb sources): read after the repository's own objects, never
+  // written; an object one holds is not written here (odb_freshen_object)
+  const alternates =
+    options.alternates === false
+      ? undefined
+      : await openObjectAlternates({
+          files,
+          gitDir,
+          objectsDir,
+          freshenMaxAgeMs,
+          ...(options.environment ? { environment: options.environment } : {}),
+          ...(options.alternatesFromEnvironment === false ? { honorEnvironment: false } : {}),
+          ...(options.workTree !== undefined ? { workTree: options.workTree } : {}),
+          ...(options.onAlternatesError ? { onError: options.onAlternatesError } : {}),
+          readConfig: () =>
+            createWorkingCopyConfig(configFilesApiOf(files), gitDir, undefined, includes),
+        });
+  if (alternates) {
+    // clone --dissociate: copy what is borrowed (repack -a -d), then stop borrowing
+    alternates.dissociate = async () => {
+      const file = joinPath(objectsDir, "info", "alternates");
+      if ((await files.stats(file))?.kind !== "file") return;
+      await repack({ history, objects, packs, looseStorage, files, gitDir, all: true });
+      await files.remove(file);
+      await alternates.refresh();
+    };
+  }
+  const loose = createGitObjects(skipPacked(staging, packs, alternates));
+  const local = withPacks(loose, packs);
+  const objects = alternates ? withAlternates(local, alternates) : local;
   // receive-pack keeps a pushed pack in objects/tmp_objdir-incoming-* until the push is accepted
   objects.beginQuarantine = () =>
     beginFilesQuarantine({ files, objectsDir, objects, packs, freshenMaxAgeMs });

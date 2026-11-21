@@ -6,6 +6,7 @@
  */
 import type { ObjectId } from "../../common/id/index.js";
 import type { InstalledPack, InstallPackOptions } from "../../pack/index-pack.js";
+import type { PackSet } from "../../pack/pack-set.js";
 import type { ObjectTypeString } from "./object-types.js";
 
 /** `put` rejects with this when the content is not as long as the size given for it. */
@@ -146,6 +147,67 @@ export interface GitObjects {
    * `quarantine: true` then writes straight into it and returns no quarantine.
    */
   beginQuarantine?(): Promise<ObjectQuarantine>;
+  /**
+   * The object directories this store borrows from (git's alternates: `objects/info/alternates`
+   * and `$GIT_ALTERNATE_OBJECT_DIRECTORIES`), when the store reads any: present on the files
+   * backend. Reads (`get`, `has`, `list`, `listPrefix`, `approximateCount`) see their objects
+   * after the store's own; writes and removals never reach them.
+   */
+  readonly alternates?: ObjectAlternates;
+}
+
+/**
+ * One borrowed object directory (git's `odb_source` other than the primary one).
+ */
+export interface AlternateObjectDirectory {
+  /** The directory as git names it in messages: its real host path where known */
+  readonly path: string;
+  /** The directory as a path of the store's FilesApi */
+  readonly objectsDir: string;
+  /** Its objects, packs first, then loose ones (read-only to the borrowing store) */
+  readonly objects: GitObjects;
+  /** Its packs */
+  readonly packs: PackSet;
+}
+
+/**
+ * The alternates of an object store (git's `odb->sources->next...`), in git's order: the
+ * `$GIT_ALTERNATE_OBJECT_DIRECTORIES` entries, then `objects/info/alternates`, each followed by
+ * its own alternates (depth first, at most five levels below the first).
+ *
+ * @example
+ * ```typescript
+ * const { objects } = await createGitFilesBackend({ files });
+ * for (const alt of await objects.alternates!.list()) console.log(alt.path);
+ * await objects.alternates!.add("/srv/shared/objects"); // git clone --shared/--reference
+ * ```
+ */
+export interface ObjectAlternates {
+  /** The alternates in use, in git's order */
+  list(): Promise<readonly AlternateObjectDirectory[]>;
+  /**
+   * git's `odb_add_to_alternates_file`: appends `path` (a host path, or relative to the objects
+   * directory) to `objects/info/alternates` unless a line holds it already, then links it (and
+   * its own alternates) in
+   */
+  add(path: string): Promise<void>;
+  /** Reads the alternates again (after `objects/info/alternates` was changed elsewhere) */
+  refresh(): Promise<void>;
+  /**
+   * The object ids of the alternates' refs (git's `odb_for_each_alternate_ref`: `for-each-ref
+   * --format=%(objectname)` in each alternate that is a repository's `objects` directory with
+   * a `refs` directory; `core.alternateRefsPrefixes` limits them), in that order, repeats kept:
+   * receive-pack advertises them as `.have`
+   */
+  refs(): Promise<string[]>;
+  /** git's errors while the alternates were read (`error: ...` lines), since the last read */
+  readonly errors: readonly string[];
+  /**
+   * `git clone --dissociate`: when `objects/info/alternates` exists, every reachable object is
+   * packed into the store's own objects (`git repack -a -d`), then the file is removed and the
+   * alternates are dropped. Present where the store can repack (the files backend).
+   */
+  dissociate?(): Promise<void>;
 }
 
 /**

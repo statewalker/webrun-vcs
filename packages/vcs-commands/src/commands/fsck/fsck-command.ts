@@ -256,8 +256,11 @@ function treeLineSound(data: Uint8Array): boolean {
  * failure sets exit bit 16 (`FSCK_ERROR_COMMIT_GRAPH`).
  *
  * Not done: the ref database checks of `git refs verify` (git 2.45+),
- * multi-pack-index, bitmap and reverse-index verification, promisor objects, alternates,
- * `fsck.skipList`, and explicit `<object>` heads.
+ * multi-pack-index, bitmap and reverse-index verification, promisor objects, the commit-graphs
+ * of alternates, `fsck.skipList`, and explicit `<object>` heads. The objects of alternates
+ * (`history.objects.alternates`) are read and checked as git's default `--full` reads them
+ * (their dangling objects listed too): 2.56 source by source, 2.43 every source's loose
+ * objects, then every pack.
  *
  * @example
  * ```typescript
@@ -431,6 +434,10 @@ export class FsckCommand extends GitCommand<FsckResult> {
       lostFound: this._lostFound,
       compatibility: this._compatibility,
       repository: this._repository,
+      // git's fsck reads every source (`--full`, the default): the alternates' objects too
+      alternateDirs: this._repository
+        ? ((await objects.alternates?.list()) ?? []).map((a) => a.objectsDir)
+        : [],
       bigFileThreshold,
       linksKept: Math.max(0, this._limits.links ?? DEFAULT_LINKS_KEPT),
       graphCommitsKept: Math.max(0, this._limits.graphCommits ?? DEFAULT_GRAPH_COMMITS_KEPT),
@@ -493,6 +500,8 @@ interface RunOptions {
   graphCommitsKept: number;
   /** `core.commitGraph` and the graph read settings, for `git commit-graph verify` */
   commitGraph: { enabled: boolean; generationVersion: number; changedPathsVersion: number };
+  /** The alternates' objects directories in `repository.files`, in git's order */
+  alternateDirs?: readonly string[];
 }
 
 /** A git integer setting (decimal), undefined when unset or not a number. */
@@ -508,6 +517,8 @@ interface RepoPack {
   idx: PackIndex;
   /** The idx file, read once for the listing, the checks and the open */
   idxBytes: Uint8Array;
+  /** The object directory it is in: 0 the repository's, then its alternates' */
+  source: number;
 }
 
 /** An object read whole. */
@@ -671,8 +682,10 @@ class FsckRun {
       });
     } else {
       if (this.files) {
-        await this.fsckLooseObjects();
-        await this.fsckPacks();
+        for (const step of this.sourceSteps()) {
+          if ("loose" in step) await this.fsckLooseObjects(step.loose);
+          else await this.fsckPacks(step.packs.map((k) => this.packs[k] as RepoPack));
+        }
       } else {
         await this.fsckStoredObjects();
       }
@@ -1228,9 +1241,38 @@ class FsckRun {
     return pathOf(this.gitDir, "objects");
   }
 
+  /** The object directories: the repository's, then its alternates' (git's odb sources). */
+  private sourceDirs(): string[] {
+    return [this.looseDir(), ...(this.o.alternateDirs ?? [])];
+  }
+
+  /**
+   * Every pack of every source, in the order git lists them: 2.56 source by source (each
+   * source's packs newest first), 2.43 the repository's packs, then all of its alternates'
+   * (get_all_packs' sort_pack: local first, then the most recently modified).
+   */
   private async listPacks(): Promise<RepoPack[]> {
+    const dirs = this.sourceDirs();
+    const all: (RepoPack & { mtime: number })[] = [];
+    for (let i = 0; i < dirs.length; i++)
+      all.push(...(await this.listSourcePacks(dirs[i] as string, i)));
+    if (this.o.compatibility === "2.43") {
+      all.sort(
+        (a, b) =>
+          Number(a.source !== 0) - Number(b.source !== 0) ||
+          b.mtime - a.mtime ||
+          (a.packPath < b.packPath ? -1 : 1),
+      );
+    }
+    return all;
+  }
+
+  private async listSourcePacks(
+    objectsDir: string,
+    source: number,
+  ): Promise<(RepoPack & { mtime: number })[]> {
     const files = this.files as FilesApi;
-    const dir = pathOf(this.looseDir(), "pack");
+    const dir = pathOf(objectsDir, "pack");
     if ((await files.stats(dir))?.kind !== "directory") return [];
     const found: (RepoPack & { mtime: number })[] = [];
     for await (const e of files.list(dir)) {
@@ -1242,7 +1284,7 @@ class FsckRun {
       try {
         const idxBytes = await readAll(files, idxPath);
         const idx = readPackIndex(idxBytes);
-        found.push({ packPath, idxPath, idx, idxBytes, mtime: stats.lastModified ?? 0 });
+        found.push({ packPath, idxPath, idx, idxBytes, source, mtime: stats.lastModified ?? 0 });
       } catch {
         // git does not list a pack whose idx cannot be opened
       }
@@ -1252,12 +1294,17 @@ class FsckRun {
     return found;
   }
 
-  /** The loose object files of each fan-out directory, in directory order, and its other entries. */
-  private async *looseEntries(): AsyncIterable<{ id?: string; path: string; name: string }> {
+  /**
+   * The loose object files of each fan-out directory of `objectsDir` (default the
+   * repository's), in directory order, and its other entries.
+   */
+  private async *looseEntries(
+    objectsDir = this.looseDir(),
+  ): AsyncIterable<{ id?: string; path: string; name: string }> {
     const files = this.files as FilesApi;
     for (let i = 0; i < 256; i++) {
       const sub = i.toString(16).padStart(2, "0");
-      const dir = pathOf(this.looseDir(), sub);
+      const dir = pathOf(objectsDir, sub);
       if ((await files.stats(dir))?.kind !== "directory") continue;
       const entries: { name: string; path: string }[] = [];
       for await (const e of files.list(dir)) entries.push({ name: e.name, path: e.path });
@@ -1269,6 +1316,24 @@ class FsckRun {
           : { path, name: e.name };
       }
     }
+  }
+
+  /**
+   * The order git reads the sources in: 2.56 one source at a time (its loose objects, then its
+   * packs: odb_fsck / odb_for_each_object), 2.43 the loose objects of every source, then every
+   * pack. Each step names a source's loose objects (`loose`) or the packs to read (`packs`,
+   * indexes into `this.packs`).
+   */
+  private sourceSteps(): ({ loose: string } | { packs: number[] })[] {
+    const dirs = this.sourceDirs();
+    const all = this.packs.map((_, k) => k);
+    if (this.o.compatibility === "2.43") {
+      return [...dirs.map((loose) => ({ loose })), { packs: all }];
+    }
+    return dirs.flatMap((loose, i) => [
+      { loose },
+      { packs: all.filter((k) => (this.packs[k] as RepoPack).source === i) },
+    ]);
   }
 
   /**
@@ -1296,19 +1361,24 @@ class FsckRun {
       }
       return;
     }
-    for await (const e of this.looseEntries()) {
-      if (!e.id) continue;
-      const r = visit(parsed(e.id), 0, -1, -1);
-      if (r) await r;
-    }
-    for (let k = 0; k < this.packs.length; k++) {
-      const p = this.packs[k] as RepoPack;
-      const v2 = p.idx.version > 1;
-      const idsAt = v2 ? 8 + 1024 : 1024 + 4;
-      const stride = v2 ? 20 : 24;
-      for (let i = 0, n = p.idx.objectCount; i < n; i++) {
-        const r = visit(p.idxBytes, idsAt + i * stride, k, i);
-        if (r) await r;
+    for (const step of this.sourceSteps()) {
+      if ("loose" in step) {
+        for await (const e of this.looseEntries(step.loose)) {
+          if (!e.id) continue;
+          const r = visit(parsed(e.id), 0, -1, -1);
+          if (r) await r;
+        }
+        continue;
+      }
+      for (const k of step.packs) {
+        const p = this.packs[k] as RepoPack;
+        const v2 = p.idx.version > 1;
+        const idsAt = v2 ? 8 + 1024 : 1024 + 4;
+        const stride = v2 ? 20 : 24;
+        for (let i = 0, n = p.idx.objectCount; i < n; i++) {
+          const r = visit(p.idxBytes, idsAt + i * stride, k, i);
+          if (r) await r;
+        }
       }
     }
   }
@@ -1729,10 +1799,10 @@ class FsckRun {
   private keepBlob = (id: string): boolean =>
     this.gitmodulesFound.has(id) || this.gitattributesFound.has(id);
 
-  /** git's `fsck_object_dir`: every loose object file. */
-  private async fsckLooseObjects(): Promise<void> {
+  /** git's `fsck_object_dir`: every loose object file of `objectsDir`. */
+  private async fsckLooseObjects(objectsDir: string): Promise<void> {
     const files = this.files as FilesApi;
-    for await (const e of this.looseEntries()) {
+    for await (const e of this.looseEntries(objectsDir)) {
       if (!e.id) {
         if (!e.name.startsWith("tmp_obj_")) {
           this.emit({ kind: "notice", stream: "stderr", text: `bad sha1 file: ${e.path}` });
@@ -1765,10 +1835,10 @@ class FsckRun {
     }
   }
 
-  /** git's `verify_pack` for every pack, with `fsck_obj_buffer` for each object. */
-  private async fsckPacks(): Promise<void> {
+  /** git's `verify_pack` for each of `packs`, with `fsck_obj_buffer` for each object. */
+  private async fsckPacks(packs: readonly RepoPack[]): Promise<void> {
     const files = this.files as FilesApi;
-    for (const p of this.packs) {
+    for (const p of packs) {
       let err = 0;
       // git prints the pack checksum errors before any entry's output
       let checksumAt = 0;

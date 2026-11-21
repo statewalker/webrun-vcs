@@ -44,14 +44,27 @@ class AlreadyPacked extends Error {}
 /**
  * A staging store that does not keep objects already in `packs`: the bytes are
  * staged as usual, and once their id is known a packed object is dropped (the
- * temporary is removed) and reported as `stored: false`.
+ * temporary is removed) and reported as `stored: false`. With `elsewhere` (the
+ * repository's alternates: git's `check_and_freshen_nonlocal`), an object it holds and
+ * renews is skipped the same way.
  */
-export function skipPacked(store: StagingBlobStore, packs: PackSet): StagingBlobStore {
+export function skipPacked(
+  store: StagingBlobStore,
+  packs: PackSet,
+  elsewhere?: { freshen(id: string): Promise<boolean> },
+): StagingBlobStore {
   const looseFresh = store.isFresh?.bind(store);
+  const held = async (id: string) =>
+    (await packs.freshen(id)) || (elsewhere !== undefined && (await elsewhere.freshen(id)));
   return {
     ...store,
     ...(looseFresh
-      ? { isFresh: async (id: string) => (await packs.freshen(id)) || (await looseFresh(id)) }
+      ? {
+          isFresh: async (id: string) =>
+            (await packs.freshen(id)) ||
+            (await looseFresh(id)) ||
+            (elsewhere !== undefined && (await elsewhere.freshen(id))),
+        }
       : {}),
     async putStaged(bytes, idOf, options) {
       // `isFresh` (packs, then loose) said no just before: nothing to look up again
@@ -60,7 +73,7 @@ export function skipPacked(store: StagingBlobStore, packs: PackSet): StagingBlob
       try {
         return await store.putStaged(bytes, async () => {
           const id = await idOf();
-          if (await packs.freshen(id)) {
+          if (await held(id)) {
             packedId = id;
             throw new AlreadyPacked(id);
           }

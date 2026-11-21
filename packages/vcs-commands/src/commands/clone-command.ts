@@ -1,4 +1,5 @@
-import { FileMode, isSymbolicRef, type ObjectId } from "@statewalker/vcs-core";
+import { type FilesApi, isSymbolicRef, type ObjectId } from "@statewalker/vcs-core";
+import { computeAlternatePath, HostPaths, hostRootOf } from "@statewalker/vcs-store-files";
 import {
   createRepositoryFacade,
   createTransportRefStore,
@@ -109,6 +110,10 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   private shallowSince?: Date;
   private shallowExcludes: string[] = [];
   private directory?: string;
+  private shared = false;
+  private dissociate = false;
+  /** `--reference` (required) and `--reference-if-able` paths, in the order given */
+  private references: { path: string; required: boolean }[] = [];
 
   /**
    * The destination directory as `git clone <url> <directory>` names it, for messages only
@@ -412,6 +417,51 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   }
 
   /**
+   * `git clone --shared` (`-s`): a clone of a local repository path borrows the source's
+   * objects through `objects/info/alternates` (the source's common directory's `objects`)
+   * instead of fetching them. Ignored for URLs (`file://` too) and for a shallow source, as
+   * git ignores it outside `clone_local`.
+   */
+  setShared(shared: boolean): this {
+    this.checkCallable();
+    this.shared = shared;
+    return this;
+  }
+
+  /**
+   * `git clone --reference <repository>`: borrow from that local repository
+   * (`objects/info/alternates` names its objects) and fetch only what it lacks. A path that is
+   * no usable repository fails the clone before anything is fetched ("reference repository
+   * '<path>' is not a local repository.", "... is shallow", "... is grafted").
+   */
+  addReference(path: string): this {
+    this.checkCallable();
+    this.references.push({ path, required: true });
+    return this;
+  }
+
+  /**
+   * `git clone --reference-if-able <repository>`: as {@link addReference}, but a path that is
+   * no usable repository is skipped with git's "info: Could not add alternate for '<path>':
+   * <reason>" (in `CloneResult.messages`).
+   */
+  addReferenceIfAble(path: string): this {
+    this.checkCallable();
+    this.references.push({ path, required: false });
+    return this;
+  }
+
+  /**
+   * `git clone --dissociate`: once the refs are written, the borrowed objects are copied in
+   * (`git repack -a -d`) and `objects/info/alternates` is removed, before the checkout.
+   */
+  setDissociate(dissociate: boolean): this {
+    this.checkCallable();
+    this.dissociate = dissociate;
+    return this;
+  }
+
+  /**
    * Get the shallow excludes.
    */
   getShallowExcludes(): string[] {
@@ -466,6 +516,14 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     // clone.c: a destination that exists and is not empty is refused before anything is
     // written; here the destination is the working copy, empty once `git init` made it
     await this.refuseNonEmptyDestination(localRemote);
+
+    // setup_reference, then clone_local's --shared: the alternates before the fetch, which
+    // then takes only what they lack (their refs are complete history to it)
+    const messages = await this.setupAlternates(
+      worktree,
+      isRepositoryPath ? localRemote : undefined,
+      repo,
+    );
 
     // Determine clone branch strategy
     const branchesToClone = this.mirror || this.cloneAllBranches ? [] : this.branchesToClone;
@@ -676,7 +734,12 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       remoteName: this.remoteName,
       bare: this.bare,
       headCommit,
+      ...(messages.length > 0 ? { messages } : {}),
     };
+
+    // dissociate_from_references: before the checkout, the borrowed objects copied in
+    // (a store without alternates has nothing to dissociate from)
+    if (this.dissociate) await history.objects?.alternates?.dissociate?.();
 
     if (checkoutId) {
       try {
@@ -701,6 +764,47 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       if (code !== 0) cloneResult.hookExitCode = code;
     }
     return cloneResult;
+  }
+
+  /**
+   * The alternates `git clone` writes before it fetches: each `--reference` (a required one
+   * that is no usable repository fails the clone; an optional one is reported in the returned
+   * messages), then, for `--shared` with a local source path that is not shallow, the source's
+   * objects (`<common dir>/objects`, named as git names the source: its path as given made
+   * absolute, the `.git` found below it appended).
+   */
+  private async setupAlternates(
+    worktree: Pick<Worktree, "getRoot" | "getFiles"> | undefined,
+    localSource: OpenedRepository | undefined,
+    repo: string,
+  ): Promise<string[]> {
+    const messages: string[] = [];
+    const sharing = this.shared && localSource !== undefined;
+    if (this.references.length === 0 && !sharing) return messages;
+    const alternates = this._workingCopy.history.objects?.alternates;
+    const files = worktree?.getFiles?.();
+    if (!alternates || !files) {
+      throw new TransportError("fatal: this repository cannot borrow objects (no alternates)");
+    }
+    for (const { path, required } of this.references) {
+      const found = await computeAlternatePath(files, absolutePathOf(worktree, path), path);
+      if ("error" in found) {
+        if (required) throw new TransportError(`fatal: ${found.error}`);
+        messages.push(`info: Could not add alternate for '${path}': ${found.error}\n`);
+        continue;
+      }
+      await alternates.add(`${found.gitDir}/objects`);
+    }
+    if (sharing && localSource) {
+      const commonDir = localSource.commonDir ?? localSource.gitDir;
+      const shallow = await (localSource.files ?? files)
+        .stats(`${commonDir.replace(/\/+$/, "")}/shallow`)
+        .catch(() => undefined);
+      // a shallow source is cloned through the transport (clone.c: is_local = 0)
+      if (!shallow)
+        await alternates.add(`${sourceCommonDirPath(files, localSource, repo)}/objects`);
+    }
+    return messages;
   }
 
   /**
@@ -903,6 +1007,25 @@ function absolutePathOf(
   const inStorage = top.replace(/^\/+|\/+$/g, "");
   const base = root !== undefined ? (inStorage ? `${root}/${inStorage}` : root) : `/${inStorage}`;
   return `${base.replace(/\/+$/, "")}/${path}`;
+}
+
+/**
+ * clone_local's `get_common_dir(src_repo)`: the source's git directory as clone.c names it
+ * (`repo`, its path as given made absolute, with the suffix get_repo_path found: `/.git`,
+ * none, `.git/.git` or `.git`), or, for a gitfile or a linked worktree's `commondir`, the
+ * host path of the directory reached.
+ */
+function sourceCommonDirPath(files: FilesApi, source: OpenedRepository, repo: string): string {
+  const host = new HostPaths(hostRootOf(files));
+  const hostOf = (p: string) => (host.known ? host.hostPath(p) : p);
+  const commonDir = source.commonDir ?? source.gitDir;
+  if (commonDir !== source.gitDir) return hostOf(commonDir);
+  const base = repo.replace(/\/+$/, "");
+  const gitDir = hostOf(source.gitDir);
+  for (const suffix of ["/.git", "", ".git/.git", ".git"]) {
+    if (host.same(`${base}${suffix}`, gitDir)) return `${base}${suffix}`;
+  }
+  return gitDir;
 }
 
 function toBranchName(defaultBranch: string | undefined): string | undefined {

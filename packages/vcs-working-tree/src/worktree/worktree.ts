@@ -461,6 +461,14 @@ export interface OpenRepositoryOptions {
    * cannot tell links apart. `false`: none. The system and global files keep git's rules.
    */
   configIncludes?: boolean | "files";
+  /**
+   * Whether the repository's alternate object directories (`objects/info/alternates`) are
+   * read, as git always reads them (default true). `$GIT_ALTERNATE_OBJECT_DIRECTORIES` is
+   * never applied to a repository opened here: git starts the upload-pack or receive-pack
+   * of another repository with it cleared (`local_repo_env`). A server whose storage holds
+   * repositories of owners who must not borrow each other's objects passes false.
+   */
+  alternates?: boolean;
 }
 
 /** A repository {@link Worktree.openRepository} opened. */

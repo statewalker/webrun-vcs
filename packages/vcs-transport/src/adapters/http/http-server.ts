@@ -896,9 +896,18 @@ export async function handleReceivePackInfoRefs(
   refStore: RefStore,
   options: HttpServerOptions = {},
   version1 = false,
+  repository?: Pick<RepositoryFacade, "alternateRefs">,
 ): Promise<HttpResponse> {
   // Get all refs but the hidden ones
   const refs = visibleRefs(await refStore.listAll(), receivePackHiddenRefs(options));
+  // write_head_info: then the alternates' refs as `.have`, each object id once and none an
+  // advertised ref names
+  const seen = new Set(refs.map(([, oid]) => oid));
+  for (const oid of (await repository?.alternateRefs?.()) ?? []) {
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    refs.push([".have", oid]);
+  }
 
   // Build ref advertisement
   const chunks: Uint8Array[] = [];
@@ -1360,7 +1369,7 @@ export function createHttpHandler(
           return await handleInfoRefs(refStore, uploadPackOptions, repository, version1);
         } else {
           // git-receive-pack info/refs
-          return await handleReceivePackInfoRefs(refStore, serverOptions, version1);
+          return await handleReceivePackInfoRefs(refStore, serverOptions, version1, repository);
         }
       } else {
         // Handle POST /git-upload-pack or /git-receive-pack

@@ -1318,7 +1318,14 @@ export class FileWorktree implements Worktree {
     }
     const files = this.rootFiles;
     const environment = this.environment ? { environment: this.environment } : {};
-    const { history } = await createGitFilesBackend({ files, gitDir, ...environment });
+    // only the superproject's object database honours $GIT_ALTERNATE_OBJECT_DIRECTORIES (git
+    // opens a submodule's without ODB_NEW_HONOR_ENV)
+    const { history } = await createGitFilesBackend({
+      files,
+      gitDir,
+      ...environment,
+      alternatesFromEnvironment: false,
+    });
     const staging = new FileStagingStore(files, joinPath(gitDir, "index"));
     await staging.read();
     const config = await createWorkingCopyConfig(
@@ -1393,6 +1400,9 @@ export class FileWorktree implements Worktree {
       gitDir: commonDir,
       ...environment,
       ...(options.configIncludes === undefined ? {} : { configIncludes: options.configIncludes }),
+      // another repository: git runs its upload-pack/receive-pack without local_repo_env
+      alternatesFromEnvironment: false,
+      ...(options.alternates === false ? { alternates: false } : {}),
     });
     const worktrees = await openGitLinkedWorktrees({
       files,

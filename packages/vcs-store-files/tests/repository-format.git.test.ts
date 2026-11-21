@@ -1,18 +1,17 @@
 /**
  * The repository format check against repositories native git made: a reftable or sha256
  * repository, or one with an unknown version-1 extension, is refused when opened (git refuses
- * the last one too); preciousObjects, partial clones and repositories with alternates open,
- * but gc and repack delete nothing there. Reftable needs git 2.45 or newer: that test is skipped on older gits.
+ * the last one too); preciousObjects and partial clones open, but gc and repack delete nothing
+ * there; in a repository with alternates they delete only its own objects. Reftable needs git 2.45 or newer: that test is skipped on older gits.
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { cpSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createInMemoryFilesApi, GcOrchestrator } from "@statewalker/vcs-core";
+import { GcOrchestrator } from "@statewalker/vcs-core";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import {
-  assertNoAlternates,
   checkRepositoryFormat,
   createGitFilesBackend,
   FileGcStrategy,
@@ -100,8 +99,8 @@ const stored = (dir: string) =>
   );
 
 /** An unreachable loose blob, last modified a month ago (past every prune expiry). */
-function oldOrphan(dir: string): string {
-  const id = git(dir, ["hash-object", "-w", "--stdin"], "an old unreachable blob\n").trim();
+function oldOrphan(dir: string, content = "an old unreachable blob\n"): string {
+  const id = git(dir, ["hash-object", "-w", "--stdin"], content).trim();
   const month = Date.now() / 1000 - 30 * 24 * 3600;
   utimesSync(join(dir, ".git/objects", id.slice(0, 2), id.slice(2)), month, month);
   return id;
@@ -179,32 +178,39 @@ describe("preciousObjects", () => {
 });
 
 describe("a repository with alternates (git clone --shared)", () => {
-  it("opens, but gc(), repack() and GcOrchestrator refuse and delete nothing", async () => {
-    const src = nativeRepo();
-    const dir = join(tempDir("repo-format-shared-"), "clone");
-    git(src, ["clone", "-q", "--shared", src, dir]);
+  it("opens; gc(), repack() and GcOrchestrator delete only its own objects", async () => {
+    const root = tempDir("repo-format-shared-");
+    const src = join(root, "src");
+    git(root, ["init", "-q", "--initial-branch=main", "src"]);
+    git(src, ["commit", "-q", "--allow-empty", "-m", "first"]);
+    const srcOrphan = oldOrphan(src);
+    const dir = join(root, "clone");
+    git(root, ["clone", "-q", "--shared", src, dir]);
     git(dir, ["commit", "-q", "--allow-empty", "-m", "local"]);
-    const orphan = oldOrphan(dir);
-    const before = stored(dir);
+    const orphan = oldOrphan(dir, "the clone's own unreachable blob\n");
+    const srcBefore = stored(src);
 
-    const backend = await open(dir);
-    await expect(
-      gc({ history: backend.history, files: backend.files, pruneExpireMs: 0 }),
-    ).rejects.toThrow(/cannot gc in a repository with alternates/);
-    await expect(repack(backend)).rejects.toBeInstanceOf(UnsupportedRepositoryFormatError);
+    const backend = await createGitFilesBackend({
+      files: createNodeFilesApi({ rootDir: root }),
+      gitDir: "clone/.git",
+    });
+    const result = await gc({
+      history: backend.history,
+      files: backend.files,
+      gitDir: "clone/.git",
+      pruneExpireMs: 0,
+    });
+    expect(result.removedObjects).toBe(1);
+    // git gc's repack -l: the local commit and its tree (the empty tree is the source's)
+    expect(result.repack?.objectCount).toBe(1);
+    expect(stored(dir).has(orphan)).toBe(false);
+    expect(stored(src)).toEqual(srcBefore);
+    expect(srcBefore.has(srcOrphan)).toBe(true);
+    await repack({ ...backend, gitDir: "clone/.git" });
     const orchestrator = new GcOrchestrator(backend.history, new FileGcStrategy(backend));
-    await expect(orchestrator.run({ pruneExpireMs: 0 })).rejects.toThrow(/alternates/);
-    expect(stored(dir)).toEqual(before);
-    expect(before.has(orphan)).toBe(true);
-  });
-
-  it("reads objects/info/alternates as bytes: a latin-1 path counts, comments do not", async () => {
-    const files = createInMemoryFilesApi();
-    const alternates = ".git/objects/info/alternates";
-    await files.write(alternates, [new TextEncoder().encode("# none here\n\n")]);
-    await expect(assertNoAlternates(files)).resolves.toBeUndefined();
-    await files.write(alternates, [new Uint8Array([0x2f, 0x63, 0x61, 0x66, 0xe9, 0x0a])]);
-    await expect(assertNoAlternates(files)).rejects.toThrow(/alternates/);
+    await orchestrator.run({ pruneExpireMs: 0 });
+    expect(stored(src)).toEqual(srcBefore);
+    fsck(dir);
   });
 });
 

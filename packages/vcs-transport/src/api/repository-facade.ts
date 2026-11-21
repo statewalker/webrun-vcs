@@ -301,6 +301,13 @@ export interface RepositoryFacade {
   isBare?(): boolean | Promise<boolean>;
 
   /**
+   * The object ids of the refs of the repository's alternates (git's
+   * `odb_for_each_alternate_ref`): receive-pack advertises each one no advertised ref already
+   * names as a `.have` line, so a pushing client leaves those objects out. Absent: none.
+   */
+  alternateRefs?(): Promise<string[]>;
+
+  /**
    * Record commits as shallow (git's `.git/shallow`). receive-pack calls it for a shallow
    * push it accepted with `shallowUpdate` (git's `receive.shallowUpdate`); without it such a
    * push is refused ("shallow update not allowed").
