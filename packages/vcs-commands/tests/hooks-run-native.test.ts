@@ -264,3 +264,55 @@ describeGit("git hook list: as native git", () => {
     expect(native.stderr).toContain((error as GitApiError).message);
   });
 });
+
+describeGit("git hook run --to-stdin: a path above the repository", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-run-up-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("reads the host file a `..` path names, never the worktree's file of that name", async () => {
+    const dir = base();
+    writeFileSync(join(dir, "outside.txt"), "worktree copy\n");
+    writeFileSync(join(root, "outside.txt"), "from above\n");
+    const run = await expectRun(
+      dir,
+      ["--to-stdin=../outside.txt", "pre-commit"],
+      (c) => c.setHookName("pre-commit").setToStdin("../outside.txt"),
+      "above",
+    );
+    expect(run.log).toContain("from above");
+    expect(run.log).not.toContain("worktree copy");
+    writeFileSync(join(dir, "gone.txt"), "worktree copy\n");
+    await expectRun(
+      dir,
+      ["--to-stdin=../../gone.txt", "pre-commit"],
+      (c) => c.setHookName("pre-commit").setToStdin("../../gone.txt"),
+      "above missing",
+    );
+  });
+});
+
+describeGit("git hook run: hook settings from included config files", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-run-inc-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("include.path=../inc (the worktree top) and ../../inc (above it) are read", async () => {
+    const dir = base();
+    // beside the worktree's files: a configured hook (2.5x)
+    writeFileSync(
+      join(dir, "inc"),
+      `[hook "inc"]\n\tevent = pre-commit\n\tcommand = "${logCommand("inc").replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"\n`,
+    );
+    git(dir, ["config", "--add", "include.path", "../inc"]);
+    const inc = await expectRun(dir, ["pre-commit"], (c) => c.setHookName("pre-commit"), "inc");
+    if (nativeIs25x) expect(inc.log).toContain("cfg-inc");
+    // above the worktree: a hooks directory without the hook (both versions)
+    writeFileSync(join(root, "inc-up"), `[core]\n\thooksPath = ${join(root, "no-hooks")}\n`);
+    git(dir, ["config", "--add", "include.path", "../../inc-up"]);
+    const up = await expectRun(dir, ["pre-commit"], (c) => c.setHookName("pre-commit"), "inc-up");
+    expect(up.log).not.toContain("== pre-commit");
+  });
+});

@@ -59,6 +59,15 @@ export type RefEntry = Ref | SymbolicRef;
  * This interface does NOT extend ObjectStorage<V> because refs have
  * fundamentally different semantics.
  */
+/** Options of {@link Refs.packRefs}. */
+export interface PackRefsOptions {
+  all?: boolean;
+  deleteLoose?: boolean;
+  prefixes?: string[];
+  auto?: boolean;
+  onError?: (line: string) => void;
+}
+
 export interface Refs {
   /**
    * Get a reference value
@@ -265,10 +274,11 @@ export interface Refs {
    *
    * @param refNames Specific refs to pack (empty array with all=true packs all)
    * @param options Pack options: `all` every loose ref, `prefixes` the loose refs under
-   *   them (`["refs/tags/"]`: `git pack-refs` without `--all`), `deleteLoose` prune them
+   *   them (`["refs/tags/"]`: `git pack-refs` without `--all`), `deleteLoose` prune them,
+   *   `auto` only when enough loose refs wait (git 2.5x `pack-refs --auto`), `onError` told
+   *   each error line git prints meanwhile (a ref whose object is missing, a ref changed
+   *   before its prune)
+   * @returns How many refs were packed
    */
-  packRefs?(
-    refNames: string[],
-    options?: { all?: boolean; deleteLoose?: boolean; prefixes?: string[] },
-  ): Promise<void>;
+  packRefs?(refNames: string[], options?: PackRefsOptions): Promise<number>;
 }

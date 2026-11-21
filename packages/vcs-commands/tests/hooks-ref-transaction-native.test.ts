@@ -1150,3 +1150,144 @@ exit 0
     expect(packedState(`${dir}-ours`)).toBe(packedState(`${dir}-native`));
   });
 });
+
+/**
+ * pack-refs as files_optimize leaves refs loose: a loose ref whose object is missing
+ * (`ref_resolves_to_object`: `error: <ref> does not point to a valid object!`), a loose name
+ * failing check_refname_format (silently), and a ref changed between its packing and its
+ * prune (check_old_oid under its lock: `error: cannot lock ref ...`, the transaction ending
+ * in the backend's prepare). `--auto` (2.5x) packs only past should_pack_refs' limit.
+ */
+describeGit("pack-refs: refs left loose, --auto (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx-pack2-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  const it25x = nativeIs25x ? it : it.skip;
+
+  /** Loose branches and tags, a symbolic ref; nothing packed yet. */
+  function looseBase(dir: string, branches = 3): void {
+    base(dir);
+    for (let i = 1; i <= branches; i++) git(dir, ["branch", `b${i}`]);
+    git(dir, ["tag", "t1"]);
+    git(dir, ["symbolic-ref", "refs/heads/sym", "refs/heads/main"]);
+  }
+
+  const looseFiles = (dir: string) =>
+    spawnSync("find", [".git/refs", "-type", "f"], { cwd: dir })
+      .stdout.toString()
+      .split("\n")
+      .sort()
+      .join("\n");
+  const packedText = (dir: string) =>
+    existsSync(join(dir, ".git/packed-refs"))
+      ? readFileSync(join(dir, ".git/packed-refs"), "latin1")
+      : "<none>";
+  /** git's stderr as ours reports it: the hooks' lines and git's error lines, in order. */
+  const errorAndHookLines = (text: string) =>
+    text
+      .split("\n")
+      .filter((l) => /^hook \S+ (out|err)$/.test(l) || l.startsWith("error: "))
+      .join("\n");
+
+  async function packTwins(
+    dir: string,
+    args: string[],
+    run: (git: Git) => Promise<{ errors: string[]; output: string; refsPacked?: number }>,
+    label: string,
+    prepare?: (twin: HookTwin) => void,
+  ) {
+    const [theirs, mine] = hookTwins(root, dir);
+    prepare?.(theirs);
+    prepare?.(mine);
+    const native = nativeIn(theirs, root, args);
+    const ours = await run(await oursIn(mine));
+    expect(native.status, `${label}: ${native.stderr}`).toBe(0);
+    expect(hookLog(mine), `${label}: log`).toBe(hookLog(theirs));
+    expect(errorAndHookLines(ours.output), `${label}: output`).toBe(
+      errorAndHookLines(native.stderr),
+    );
+    expect(ours.errors.join("\n"), `${label}: errors`).toBe(
+      native.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("error: "))
+        .join("\n"),
+    );
+    expect(looseFiles(mine.dir), `${label}: loose`).toBe(looseFiles(theirs.dir));
+    expect(packedText(mine.dir), `${label}: packed`).toBe(packedText(theirs.dir));
+    return { ours, native };
+  }
+
+  const packAll = (g: Git, auto = false) => {
+    const command = g.packRefs().setAll(true).setAuto(auto);
+    return command.call().then((r) => ({ ...r, output: command.getHookOutput() }));
+  };
+
+  it("a ref whose object is missing and a badly named loose ref stay loose", async () => {
+    const dir = join(root, "r");
+    looseBase(dir);
+    writeFileSync(join(dir, ".git/refs/heads/ghost"), `${"17".repeat(20)}\n`);
+    const head = git(dir, ["rev-parse", "HEAD"]).trim();
+    writeFileSync(join(dir, ".git/refs/heads/bad..name"), `${head}\n`);
+    const { ours, native } = await packTwins(
+      dir,
+      ["pack-refs", "--all"],
+      (g) => packAll(g),
+      "missing object",
+    );
+    expect(native.stderr).toContain("error: refs/heads/ghost does not point to a valid object!");
+    // b1..b3, main, t1
+    expect(ours.refsPacked).toBe(5);
+  });
+
+  it("a ref changed before its prune keeps its new value, git's error", async () => {
+    const dir = join(root, "r");
+    looseBase(dir);
+    const tree = git(dir, ["rev-parse", "HEAD^{tree}"]).trim();
+    // once the packed transaction is committed, b2 moves (before its prune locks it)
+    const hook = String.raw`#!/bin/sh
+input=$(cat)
+{
+  printf '== reference-transaction [%s]\n' "$1"
+  if [ -n "$input" ]; then printf 'stdin:\n%s\n' "$input"; fi
+} >> "$HOOK_LOG"
+case "$1:$input" in
+  committed:0000000000000000000000000000000000000000*) echo ${tree} > .git/refs/heads/b2 ;;
+esac
+exit 0
+`;
+    const { native } = await packTwins(
+      dir,
+      ["pack-refs", "--all"],
+      (g) => packAll(g),
+      "changed before prune",
+      (t) => writeFileSync(join(t.dir, ".git/hooks/reference-transaction"), hook, { mode: 0o755 }),
+    );
+    expect(native.stderr).toContain(`error: cannot lock ref 'refs/heads/b2': is at ${tree}`);
+  });
+
+  it25x(
+    "--auto: below should_pack_refs' limit nothing happens, past it all is packed",
+    async () => {
+      const dir = join(root, "r");
+      looseBase(dir);
+      const few = await packTwins(
+        dir,
+        ["pack-refs", "--all", "--auto"],
+        (g) => packAll(g, true),
+        "auto, few",
+      );
+      expect(few.ours.refsPacked).toBe(0);
+      expect(packedText(`${dir}-ours`)).toBe("<none>");
+      const many = join(root, "s");
+      looseBase(many, 15);
+      const past = await packTwins(
+        many,
+        ["pack-refs", "--all", "--auto"],
+        (g) => packAll(g, true),
+        "auto, many",
+      );
+      expect(past.ours.refsPacked).toBe(17);
+    },
+  );
+});

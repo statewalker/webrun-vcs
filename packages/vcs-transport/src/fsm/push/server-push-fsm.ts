@@ -106,6 +106,7 @@ export const serverPushTransitions: FsmTransition[] = [
   ["RUN_PRE_RECEIVE_HOOK", "NO_HOOK", "VALIDATE_COMMANDS"],
   ["RUN_PRE_RECEIVE_HOOK", "HOOK_REJECTED", "SEND_STATUS"],
   ["RUN_PRE_RECEIVE_HOOK", "NOTHING_TO_DO", "SEND_STATUS"],
+  ["RUN_PRE_RECEIVE_HOOK", "DIED", ""], // receive-pack died looking the hook up (ReceivePackDiedError)
 
   // Check each command (git's update()) and run the update hook
   ["VALIDATE_COMMANDS", "ALL_VALID", "APPLY_UPDATES"],
@@ -517,6 +518,13 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           ),
         );
       } catch (e) {
+        if (isReceivePackDeath(e)) {
+          // git dies (a broken hook.* configuration): no status report, the quarantined
+          // objects dropped, its message on its stderr
+          await discardQuarantine(ctx);
+          getOutput(ctx).error = `fatal: ${(e as Error).message}`;
+          return "DIED";
+        }
         logError(ctx, "pre-receive hook failed", e);
         await sendError(ctx, "pre-receive hook error");
         verdict = { ok: false };
@@ -568,7 +576,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         try {
           await validateCommands(ctx);
         } catch (e) {
-          if (isTransactionAborted(e)) {
+          if (isTransactionAborted(e) || isReceivePackDeath(e)) {
             getOutput(ctx).error = `fatal: ${(e as Error).message}`;
             return "DIED";
           }
@@ -853,6 +861,23 @@ async function discardQuarantine(ctx: ProcessContext): Promise<void> {
  */
 export async function releaseReceivePack(ctx: ProcessContext): Promise<void> {
   await discardQuarantine(ctx);
+}
+
+/**
+ * Thrown by a receive-pack hook when receive-pack itself dies there (git's `die()` while it
+ * looks the hook up: a broken `hook.<name>.*` configuration): the push ends without a status
+ * report, `fatal: <message>` on receive-pack's stderr (`output.error`), and the client hears
+ * the remote end hang up.
+ */
+export class ReceivePackDiedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReceivePackDiedError";
+  }
+}
+
+function isReceivePackDeath(error: unknown): boolean {
+  return error instanceof Error && error.name === "ReceivePackDiedError";
 }
 
 /** A hook that did not answer within `hookTimeoutMs`. */
@@ -1300,6 +1325,7 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
           ),
         );
       } catch (e) {
+        if (isReceivePackDeath(e)) throw e;
         logError(ctx, `update hook failed for ${name}`, e);
         await sendError(ctx, "update hook error");
         verdict = { ok: false };

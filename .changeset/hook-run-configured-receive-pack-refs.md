@@ -2,6 +2,7 @@
 "@statewalker/vcs-commands": minor
 "@statewalker/vcs-core": minor
 "@statewalker/vcs-store-files": minor
+"@statewalker/vcs-transport": minor
 "@statewalker/vcs-working-tree": minor
 ---
 
@@ -12,3 +13,7 @@
 - The receive side of local and served pushes runs git 2.5x's configured hooks (`hook.<name>.*` of the receiving repository) for pre-receive, update, post-receive, post-update, push-to-checkout and reference-transaction, as receive-pack runs them through the hook API (`OpenedRepositoryConfig.listWithOrigin`).
 - `pack-refs` and `gc` run the reference-transaction hook as git's `files_optimize`: the packed store's transaction (`<zero> <id> <ref>` for each loose ref packed, also when there is none), then one transaction per pruned ref in reverse name order; a refusal throws `RefTransactionAbortedError` with nothing packed or the rest left loose. `pack-refs` without `--all` or refs packs the loose tags as git does (`Refs.packRefs` takes `prefixes`), and per-worktree refs (`refs/bisect/` ...) stay loose.
 - Config values carry their scope (`ConfigValueOrigin.scope`: system, global, local, worktree; an included file's is the including file's).
+- `Refs.packRefs` returns how many refs it packed (`PackRefsResult.refsPacked` counts those) and takes `auto` (git 2.5x's `pack-refs --auto`, `should_pack_refs`: nothing locked and no hook unless `max(16, log2(packed-refs size / 100) * 5)` loose refs wait; `PackRefsCommand.setAuto`, and 2.5x's `gc --auto`) and `onError`. A loose ref whose object is missing stays loose (`error: <ref> does not point to a valid object!`, `FilesRefBatchOptions.hasObject`), as does a loose name failing check_refname_format; a ref changed between its packing and its prune keeps its loose file (`error: cannot lock ref '<ref>': is at X but expected Y`, its transaction ending after `preparing`). The error lines go to the hook output and `errors` of `PackRefsResult` / `GCCommandResult`.
+- `git hook run --to-stdin=<path>`: a relative path climbing above the repository's files is read from the host (never the worktree's file of the clamped name); one that cannot be read is git's fatal "could not open".
+- A broken `hook.<name>.*` configuration of the receiving repository makes receive-pack die (`ReceivePackDiedError` from a receive hook): a local push fails with git's fatal line and "the remote end hung up unexpectedly", a served HTTP push's answer ends without a report; no ref moves.
+- Config include paths resolve `.` and `..` (`include.path=../inc` of a repository's config, read by `FileWorktree.openRepositoryAt` and the working copy alike); one above the repository's files is read from the host where the files have a root directory.

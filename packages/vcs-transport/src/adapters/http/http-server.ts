@@ -1115,6 +1115,14 @@ export async function handleReceivePack(
   const finished = run.then(async ({ thrown }) => {
     const output = getOutput(ctx);
     const reported = (state as ProtocolState & { reportSent?: boolean }).reportSent === true;
+    if (thrown === undefined && !reported && output.error?.startsWith("fatal: ")) {
+      // receive-pack died (git's die(): a broken hook configuration, an aborted ref
+      // transaction): http-backend's answer just ends, without a report; its message goes
+      // to the server's log
+      options.logger?.error("receive-pack died", new Error(output.error));
+      await out.close().catch(() => {});
+      return;
+    }
     if (thrown !== undefined || (output.error && !reported)) {
       // the status is out and no report could be written: break the response
       const error = thrown ?? new Error(output.error);

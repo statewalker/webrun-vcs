@@ -498,3 +498,23 @@ describeGit("served smart HTTP: configured receive hooks (as git http-backend ru
     });
   });
 });
+
+/**
+ * A broken `hook.<name>.*` configuration of the served repository (git 2.5x): receive-pack
+ * dies on its pre-receive lookup, http-backend's answer ends without a status report, and
+ * the client fails as native git's does; no ref moves (git 2.43 ignores the configuration).
+ */
+describeGit("served smart HTTP: a broken hook configuration (as git http-backend)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "http-served-broken-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("hook.x.event without a command: the push fails, no ref moves", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    git(join(dir, "bare.git"), ["config", "hook.x.event", "post-receive"]);
+    const { native } = await expectTwins(dir, ["push", "<url>/bare.git", "main"], "broken");
+    if (nativeIs25x) expect(native.status).not.toBe(0);
+  });
+});

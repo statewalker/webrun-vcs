@@ -15,6 +15,7 @@ import {
   openDuplexReceivePackConnection,
   type ReceiveCommand,
   type ReceivePackConnection,
+  ReceivePackDiedError,
   type ReceivePackHookContext,
   type ReceivePackHooks,
   type ServedRequestContext,
@@ -25,7 +26,7 @@ import {
 } from "@statewalker/vcs-transport";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { LinkedWorktrees, OpenedRepository, WorkingCopy } from "@statewalker/vcs-working-tree";
-import { TransportError } from "../errors/index.js";
+import { GitApiError, TransportError } from "../errors/index.js";
 import {
   HookSession,
   hookHostOf,
@@ -604,16 +605,24 @@ function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
     ctx: ReceivePackHookContext,
     options: { args?: string[]; stdin?: string; env?: Record<string, string> },
   ) => {
-    const result = await hooks.run(name, {
-      ...options,
-      env: {
-        ...hookClientEnv(hooks, ctx),
-        GIT_DIR: ".",
-        ...(await quarantineEnv(hooks, ctx)),
-        ...(options.env ?? {}),
-      },
-      prefix: false,
-    });
+    const result = await hooks
+      .run(name, {
+        ...options,
+        env: {
+          ...hookClientEnv(hooks, ctx),
+          GIT_DIR: ".",
+          ...(await quarantineEnv(hooks, ctx)),
+          ...(options.env ?? {}),
+        },
+        prefix: false,
+      })
+      .catch((error: unknown) => {
+        // receive-pack dies looking the hook up (a broken hook.* configuration)
+        if (error instanceof GitApiError && error.message.startsWith("fatal: ")) {
+          throw new ReceivePackDiedError(error.message.slice("fatal: ".length));
+        }
+        throw error;
+      });
     if (result?.stderr) await ctx.message(result.stderr);
     return result;
   };

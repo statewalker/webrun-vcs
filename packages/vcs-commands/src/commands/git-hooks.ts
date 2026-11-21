@@ -100,6 +100,19 @@ function normalizeFilesPath(path: string): string {
   return out.join("/");
 }
 
+/** Whether resolving `..` components of a FilesApi path climbs above the root. */
+function leavesFilesRoot(path: string): boolean {
+  let depth = 0;
+  for (const part of path.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (depth === 0) return true;
+      depth--;
+    } else depth++;
+  }
+  return false;
+}
+
 /** `path` relative to `from` (both FilesApi paths). */
 function relativeFilesPath(from: string, path: string): string {
   const a = normalizeFilesPath(from).split("/").filter(Boolean);
@@ -748,11 +761,23 @@ export class HookSession {
   async readFileAt(path: string): Promise<Uint8Array | undefined> {
     const layout = await this.host.layout();
     const environment = this.host.environment();
-    const filesPath = !layout
-      ? undefined
-      : path.startsWith("/")
-        ? filesPathOfHost(layout.files, path)
-        : normalizeFilesPath(joinFilesPath(layout.cwd, path));
+    // A relative path that climbs above the FilesApi's root names a host file outside it:
+    // resolve it against the host path of the directory git runs in, never clamp it.
+    let hostPath = path.startsWith("/") ? path : undefined;
+    let filesPath: string | undefined;
+    if (layout && !path.startsWith("/")) {
+      const joined = joinFilesPath(layout.cwd, path);
+      if (leavesFilesRoot(joined)) {
+        const hostCwd = hostPathOf(layout.files, layout.cwd);
+        if (!hostCwd) return undefined;
+        hostPath = `/${normalizeFilesPath(`${hostCwd}/${path}`)}`;
+        filesPath = filesPathOfHost(layout.files, hostPath);
+      } else {
+        filesPath = normalizeFilesPath(joined);
+      }
+    } else if (layout && hostPath) {
+      filesPath = filesPathOfHost(layout.files, hostPath);
+    }
     try {
       if (layout && filesPath !== undefined) {
         if ((await layout.files.stats(filesPath))?.kind !== "file") return undefined;
@@ -760,7 +785,7 @@ export class HookSession {
         for await (const chunk of layout.files.read(filesPath)) chunks.push(chunk);
         return chunks.length === 1 ? chunks[0] : concat(chunks);
       }
-      if (path.startsWith("/") && environment) return await environment.readFile(path);
+      if (hostPath && environment) return await environment.readFile(hostPath);
     } catch {
       return undefined;
     }

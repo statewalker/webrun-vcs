@@ -1110,6 +1110,23 @@ const dirOf = (path: string) => {
   return slash >= 0 ? path.slice(0, slash + 1) : "";
 };
 
+/**
+ * `path` with its `.` and `..` components resolved (a leading `/` kept); `escapes` when a
+ * `..` climbs above its start (the root, or the start of a relative path).
+ */
+function resolveDots(path: string): { path: string; escapes: boolean } {
+  const out: string[] = [];
+  let escapes = false;
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (out.length === 0) escapes = true;
+      else out.pop();
+    } else out.push(part);
+  }
+  return { path: `${path.startsWith("/") ? "/" : ""}${out.join("/")}`, escapes };
+}
+
 const isTrue = (value: unknown) => parseGitBool(value) === true;
 
 /** `include.path` or `includeif.<condition>.path`. */
@@ -1207,12 +1224,18 @@ class ChainReader {
     if (value.startsWith("/")) {
       return env ? { read: env.readFile, path: value, host: true, ...scopeOf(from) } : undefined;
     }
-    return {
-      read: from.read,
-      path: `${dirOf(from.path)}${value}`,
-      host: from.host,
-      ...scopeOf(from),
-    };
+    // beside `from`, its `.` and `..` resolved (a FilesApi does not resolve them itself)
+    const joined = resolveDots(`${dirOf(from.path)}${value}`);
+    if (joined.escapes && !from.host) {
+      // above the repository's files API: the host file, where its root has a host path
+      // (none otherwise: a missing include is skipped); a host path stops at `/` as POSIX
+      const root = (this.config as unknown as { files: { rootDirectory?: string } }).files
+        .rootDirectory;
+      if (!root || !env) return undefined;
+      const host = resolveDots(`${root.replace(/\/+$/, "")}/${dirOf(from.path)}${value}`);
+      return { read: env.readFile, path: host.path, host: true, ...scopeOf(from) };
+    }
+    return { read: from.read, path: joined.path, host: from.host, ...scopeOf(from) };
   }
 
   private gitDirPath(): string {
