@@ -67,7 +67,8 @@ export class FileGcStrategy implements GcStrategy {
    * repository with `extensions.preciousObjects` (git: "cannot prune in a precious-objects
    * repo") or a partial clone (`extensions.partialClone`, a promisor remote):
    * `UnsupportedRepositoryFormatError`. Alternates are read: only the repository's own loose
-   * objects are pruned.
+   * objects are pruned. git's non-fatal alternates errors (a directory gone, ...) do not stop
+   * it, alternates git reads and this store cannot do (`AlternatesUnreadableError`, see gc).
    */
   async collectRoots(): Promise<GcRoots> {
     const { files, gitDir, history, objects } = this.target;

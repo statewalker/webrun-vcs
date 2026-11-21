@@ -486,7 +486,7 @@ describeGit("alternate object directories, as native git", () => {
     expect(gitRun(root, join(dir, "b.git"), ["fsck", "--no-progress"]).status).toBe(0);
   });
 
-  it("gc --prune=now, repack and prune refuse when an alternate is gone, deleting nothing", async () => {
+  it("gc --prune=now, repack and prune refuse a branch at a commit of a gone alternate, deleting nothing", async () => {
     const dir = fresh("gone");
     const src = repoWith(join(dir, "src"), ["s1", "s2"]);
     const blob = git(src, "rev-parse", "HEAD:s1.txt").trim();
@@ -520,11 +520,12 @@ describeGit("alternate object directories, as native git", () => {
     expect(backend.objects.alternates?.errors.length).toBeGreaterThan(0);
     const target = { ...backend, history: backend.history };
     await expect(gc({ ...target, pruneExpireMs: 0, writeCommitGraph: false })).rejects.toThrow(
-      /alternate object directory cannot be read/,
+      /^bad object /,
     );
-    await expect(repack(target)).rejects.toThrow(/alternate object directory cannot be read/);
+    await expect(repack(target)).rejects.toThrow(/^bad object /);
     await expect(new FileGcStrategy(target).collectRoots()).rejects.toThrow();
-    // and with alternates not read at all (alternates: false), the same refusal
+    // with alternates not read at all (alternates: false), a refusal up front: the walk would
+    // skip a borrowed reflog entry, and git, reading the alternate, keeps what it reaches
     const blind = await createGitFilesBackend({
       files: backend.files,
       gitDir: backend.gitDir,
@@ -535,6 +536,45 @@ describeGit("alternate object directories, as native git", () => {
     );
     expect(localObjects(join(o, ".git/objects"))).toEqual(before.o);
     expect(before.o).toEqual(before.n);
+  });
+
+  it("clone --reference, repack -a -d, the reference removed: gc --prune=now goes on as git", async () => {
+    const dir = fresh("unref");
+    const ref = repoWith(join(dir, "ref"), ["r1", "r2"]);
+    const twin = (name: string) => {
+      const repo = join(dir, name);
+      git(dir, "clone", "-q", "--reference", ref, ref, repo);
+      repoWith(repo, ["l1"], false);
+      return repo;
+    };
+    const n = twin("n");
+    const o = twin("o");
+    git(n, "repack", "-q", "-a", "-d");
+    const copied = await repack({ ...(await backendOf(o)), all: true });
+    expect(copied?.objectCount).toBeGreaterThan(0);
+    expect(localObjects(join(o, ".git/objects"))).toEqual(localObjects(join(n, ".git/objects")));
+    rmSync(ref, { recursive: true, force: true });
+    const theirs = gitRun(root, n, ["gc", "-q", "--prune=now"]);
+    expect(theirs.status, theirs.stderr).toBe(0);
+    const backend = await backendOf(o);
+    const result = await gc({
+      history: backend.history,
+      files: backend.files,
+      gitDir: backend.gitDir,
+      pruneExpireMs: 0,
+      writeCommitGraph: false,
+    });
+    // git prints its error lines once per reading of the alternates; ours, once
+    expect(result.errors).toEqual([...new Set(errorLines(theirs.stderr))]);
+    expect(result.errors?.length).toBeGreaterThan(0);
+    expect(localObjects(join(o, ".git/objects"))).toEqual(localObjects(join(n, ".git/objects")));
+    for (const repo of [n, o]) {
+      const fsck = gitRun(root, repo, ["fsck", "--no-progress", ...noReferences]);
+      expect(fsck.status, fsck.stderr).toBe(0);
+      expect(git(repo, "rev-list", "--objects", "--all").trim().split("\n").length).toBe(
+        git(n, "rev-list", "--objects", "--all").trim().split("\n").length,
+      );
+    }
   });
 
   it("reads relative $GIT_ALTERNATE_OBJECT_DIRECTORIES entries from the worktree top (--separate-git-dir)", async () => {

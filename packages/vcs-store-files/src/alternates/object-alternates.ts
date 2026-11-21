@@ -92,6 +92,13 @@ export interface ObjectAlternatesOptions {
   onError?: (line: string) => void;
 }
 
+/**
+ * The start of the error line for an absolute alternate outside the FilesApi's root: git reads
+ * it, this store cannot (gc, repack and prune refuse while one is listed).
+ */
+export const OUTSIDE_STORAGE_ERROR =
+  "error: unable to read alternate object directory outside the storage: ";
+
 /** One alternate as the files backend reads it. */
 interface Source extends AlternateObjectDirectory {
   /** git's freshen of a copy here (check_and_freshen_nonlocal): false when absent or old and fixed */
@@ -141,7 +148,7 @@ export async function openObjectAlternates(
     let path: string;
     if (isAbsolute(entry)) {
       if (host.known && !host.inside(entry)) {
-        report(`error: unable to read alternate object directory outside the storage: ${entry}`);
+        report(`${OUTSIDE_STORAGE_ERROR}${entry}`);
         return undefined;
       }
       path = host.known ? host.filesPath(entry) : entry;

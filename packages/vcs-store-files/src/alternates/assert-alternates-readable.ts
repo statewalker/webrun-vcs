@@ -1,9 +1,15 @@
 /**
  * gc, repack and prune delete what nothing reachable names; in a repository that borrows
- * objects, what reaches a local object may live only in an alternate. When an alternate
- * cannot be read, its objects look absent, and a walk that went on would delete local
- * objects only they reach. git dies in that case (`bad object refs/heads/main` from
- * pack-objects); we refuse up front, before anything changes.
+ * objects, what reaches a local object may live only in an alternate. Where git cannot read an
+ * alternate either (a directory gone, a path that cannot be normalized, nesting too deep) we go
+ * on as git does, printing its error lines: a ref, HEAD or index entry at a borrowed object
+ * fails the walk (`MissingRootError`, git's `bad object`), and so does a borrowed parent, tree
+ * or blob under a local commit (`MissingObjectError`), before anything is deleted.
+ *
+ * Where git reads the alternates but this store does not (`alternates: false`, an absolute
+ * alternate outside the FilesApi's root) we refuse up front: the walk skips a reflog entry or
+ * pseudo-ref whose commit it cannot read, as git does for a commit that is gone, so the local
+ * objects only such a borrowed commit reaches would be deleted where git keeps them.
  *
  * @example
  * ```typescript
@@ -13,8 +19,9 @@
 
 import type { FilesApi, GitObjects } from "@statewalker/vcs-core";
 import { joinPath } from "@statewalker/vcs-core";
+import { OUTSIDE_STORAGE_ERROR } from "./object-alternates.js";
 
-/** An alternate of the repository could not be read: gc, repack and prune refuse to run. */
+/** git reads an alternate this store cannot: gc, repack and prune refuse to run. */
 export class AlternatesUnreadableError extends Error {
   constructor(
     message: string,
@@ -27,27 +34,29 @@ export class AlternatesUnreadableError extends Error {
 }
 
 /**
- * Throws {@link AlternatesUnreadableError} when reading the alternates reported errors
- * (`objects.alternates.errors`: a directory gone, a path that cannot be normalized, nesting
- * too deep), or when `objects/info/alternates` exists while the store reads no alternates
- * (`createGitFilesBackend({ alternates: false })`).
+ * Throws {@link AlternatesUnreadableError} when `objects/info/alternates` exists while the store
+ * reads no alternates (`createGitFilesBackend({ alternates: false })`), or when an alternate
+ * lies outside the FilesApi's root. Other errors from reading the alternates are git's
+ * non-fatal ones: returned (`objects.alternates.errors`, empty when there are none) for the
+ * caller to report, as git prints them and goes on.
  */
 export async function assertAlternatesReadable(
   target: { files: FilesApi; gitDir?: string; objects: Pick<GitObjects, "alternates"> },
   operation: string,
-): Promise<void> {
+): Promise<readonly string[]> {
   const alternates = target.objects.alternates;
   if (alternates) {
     const errors = alternates.errors;
-    if (errors.length === 0) return;
+    const outside = errors.filter((line) => line.startsWith(OUTSIDE_STORAGE_ERROR));
+    if (outside.length === 0) return errors;
     throw new AlternatesUnreadableError(
-      `cannot ${operation}: an alternate object directory cannot be read, so the objects ` +
-        `it holds look missing\n${errors.join("\n")}`,
+      `cannot ${operation}: an alternate object directory lies outside the storage, so the ` +
+        `objects it holds look missing\n${outside.join("\n")}`,
       errors,
     );
   }
   const file = joinPath(target.gitDir ?? ".git", "objects", "info", "alternates");
-  if ((await target.files.stats(file).catch(() => undefined))?.kind !== "file") return;
+  if ((await target.files.stats(file).catch(() => undefined))?.kind !== "file") return [];
   throw new AlternatesUnreadableError(
     `cannot ${operation}: the repository borrows objects (objects/info/alternates) but ` +
       "alternates are not read here (alternates: false)",

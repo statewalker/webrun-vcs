@@ -3,7 +3,7 @@
  * `$GIT_ALTERNATE_OBJECT_DIRECTORIES`, the order and skips of `odb_add_alternate_recursively`,
  * and the store's reads and writes over them.
  */
-import { createInMemoryFilesApi } from "@statewalker/vcs-core";
+import { createInMemoryFilesApi, GcOrchestrator, ObjectType } from "@statewalker/vcs-core";
 import { describe, expect, it } from "vitest";
 import {
   AlternatesUnreadableError,
@@ -12,6 +12,7 @@ import {
   FileGcStrategy,
   FileWorktree,
   gc,
+  listReachableObjects,
   MissingRootError,
   parseAlternates,
   repack,
@@ -157,19 +158,17 @@ describe("gc, repack and prune over alternates that cannot be read", () => {
     return { files, commit, loose };
   }
 
-  it("refuses when an alternate is gone, deleting nothing (git: bad object)", async () => {
+  it("an alternate gone is no refusal, but a branch at its commit is bad object; nothing deleted", async () => {
     const { files, loose } = await borrowed();
     await files.remove("/alt");
     const repo = await createGitFilesBackend({ files, gitDir: "/repo/.git" });
     expect(repo.objects.alternates?.errors.length).toBeGreaterThan(0);
     const target = { ...repo, history: repo.history, gitDir: "/repo/.git" };
     await expect(gc({ ...target, pruneExpireMs: 0, writeCommitGraph: false })).rejects.toThrow(
-      AlternatesUnreadableError,
+      MissingRootError,
     );
-    await expect(repack(target)).rejects.toThrow(AlternatesUnreadableError);
-    await expect(new FileGcStrategy(target).collectRoots()).rejects.toThrow(
-      AlternatesUnreadableError,
-    );
+    await expect(repack(target)).rejects.toThrow(MissingRootError);
+    await expect(new FileGcStrategy(target).collectRoots()).rejects.toThrow(MissingRootError);
     expect(await files.exists(loose)).toBe(true);
   });
 
@@ -276,5 +275,190 @@ describe("$GIT_ALTERNATE_OBJECT_DIRECTORIES and submodules", () => {
     const sub = await worktree.openGitlink("sub");
     expect(sub).toBeDefined();
     expect(await sub?.history?.objects?.has(alt.id)).toBe(false);
+  });
+});
+
+describe("gc, repack and prune with an alternate gone: the walk refuses, deleting nothing", () => {
+  const who = { name: "a", email: "a@b", timestamp: 1, tzOffset: "+0000" };
+
+  /**
+   * /alt holds a commit (tree, blob) and an annotated tag of it; /repo borrows from it, holds
+   * a loose copy of the borrowed blob and an unborrowed blob of its own; /alt is then removed
+   * (git's error, no refusal up front: the walk alone must stop gc, repack and prune).
+   */
+  async function blindBorrower() {
+    const files = createInMemoryFilesApi();
+    const alt = await createGitFilesBackend({ files, gitDir: "/alt/.git", create: true });
+    const shared = enc.encode("shared\n");
+    const blob = await alt.objects.put("blob", shared.length, [shared]);
+    const tree = await alt.history.trees.store([{ mode: 0o100644, name: "a.txt", id: blob }]);
+    const commit = await alt.history.commits.store({
+      tree,
+      parents: [],
+      author: who,
+      committer: who,
+      message: "c\n",
+    });
+    const tag = await alt.history.tags.store({
+      object: commit,
+      objectType: ObjectType.COMMIT,
+      tag: "t",
+      tagger: who,
+      message: "t\n",
+    });
+    await alt.history.refs.set("refs/heads/main", commit);
+    await files.write("/repo/.git/objects/info/alternates", [enc.encode("/alt/.git/objects\n")]);
+    const seen = await createGitFilesBackend({ files, gitDir: "/repo/.git", create: true });
+    const own = enc.encode("own\n");
+    const mine = await seen.objects.put("blob", own.length, [own]);
+    const loose = `/repo/.git/objects/${blob.slice(0, 2)}/${blob.slice(2)}`;
+    const raw: Uint8Array[] = [];
+    for await (const c of files.read(`/alt/.git/objects/${blob.slice(0, 2)}/${blob.slice(2)}`))
+      raw.push(c);
+    await files.write(loose, raw);
+    await files.remove("/alt");
+    const repo = await createGitFilesBackend({ files, gitDir: "/repo/.git" });
+    expect(repo.objects.alternates?.errors.length).toBeGreaterThan(0);
+    return { files, repo, blob, tree, commit, tag, mine, loose };
+  }
+
+  /** Every loose object file of /repo. */
+  async function looseOf(files: ReturnType<typeof createInMemoryFilesApi>): Promise<string[]> {
+    const out: string[] = [];
+    for await (const d of files.list("/repo/.git/objects")) {
+      if (d.kind !== "directory" || !/\/[0-9a-f]{2}$/.test(d.path)) continue;
+      for await (const f of files.list(d.path)) out.push(f.path);
+    }
+    return out.sort();
+  }
+
+  /** gc, repack -a -d and the prune orchestrator each refuse, deleting nothing. */
+  async function expectAllRefuse(fixture: Awaited<ReturnType<typeof blindBorrower>>) {
+    const { files, repo } = fixture;
+    const before = await looseOf(files);
+    const target = { ...repo, gitDir: "/repo/.git" };
+    await expect(gc({ ...target, pruneExpireMs: 0, writeCommitGraph: false })).rejects.toThrow();
+    await expect(repack(target)).rejects.toThrow();
+    await expect(
+      new GcOrchestrator(repo.history, new FileGcStrategy(target)).run({ pruneExpireMs: 0 }),
+    ).rejects.toThrow();
+    expect(await looseOf(files)).toEqual(before);
+    expect(await files.exists(fixture.loose)).toBe(true);
+  }
+
+  it("nothing borrowed reached: gc and repack go on, reporting git's error lines", async () => {
+    const f = await blindBorrower();
+    const own = await f.repo.history.trees.store([{ mode: 0o100644, name: "o", id: f.mine }]);
+    const local = await f.repo.history.commits.store({
+      tree: own,
+      parents: [],
+      author: who,
+      committer: who,
+      message: "local\n",
+    });
+    await f.repo.history.refs.set("refs/heads/main", local);
+    const errors = f.repo.objects.alternates?.errors ?? [];
+    expect(errors).toEqual([
+      "error: object directory /alt/.git/objects does not exist; check .git/objects/info/alternates",
+    ]);
+    const target = { ...f.repo, gitDir: "/repo/.git" };
+    const result = await gc({ ...target, pruneExpireMs: 0, writeCommitGraph: false });
+    expect(result.errors).toEqual(errors);
+    expect(result.repack?.objectCount).toBe(3);
+    // the loose copy of the borrowed blob was unreachable here: pruned, as git prunes it
+    expect(await f.files.exists(f.loose)).toBe(false);
+    expect(await f.repo.objects.has(f.mine)).toBe(true);
+    expect((await repack({ ...target, all: true }))?.errors).toEqual(errors);
+  });
+
+  it("a branch at a borrowed commit: bad object (MissingRootError)", async () => {
+    const f = await blindBorrower();
+    await f.repo.history.refs.set("refs/heads/main", f.commit);
+    await expect(
+      gc({ ...f.repo, gitDir: "/repo/.git", pruneExpireMs: 0, writeCommitGraph: false }),
+    ).rejects.toThrow(MissingRootError);
+    await expectAllRefuse(f);
+  });
+
+  it("a tag ref at a borrowed tag object: bad object (MissingRootError)", async () => {
+    const f = await blindBorrower();
+    await f.repo.history.refs.set("refs/tags/t", f.tag);
+    await expectAllRefuse(f);
+  });
+
+  it("a local commit of a borrowed tree, or with a borrowed parent: the walk fails", async () => {
+    for (const shape of ["tree", "parent"] as const) {
+      const f = await blindBorrower();
+      const own = await f.repo.history.trees.store([{ mode: 0o100644, name: "o", id: f.mine }]);
+      const local = await f.repo.history.commits.store({
+        tree: shape === "tree" ? f.tree : own,
+        parents: shape === "parent" ? [f.commit] : [],
+        author: who,
+        committer: who,
+        message: "local\n",
+      });
+      await f.repo.history.refs.set("refs/heads/main", local);
+      await expectAllRefuse(f);
+    }
+  });
+
+  it("a local tree naming a borrowed blob: the walk fails", async () => {
+    const f = await blindBorrower();
+    // the borrowed blob, which this store cannot see (its loose copy removed)
+    await f.files.remove(f.loose);
+    const borrowedOnly = await f.repo.history.trees.store([
+      { mode: 0o100644, name: "a.txt", id: f.blob },
+      { mode: 0o100644, name: "o", id: f.mine },
+    ]);
+    const local = await f.repo.history.commits.store({
+      tree: borrowedOnly,
+      parents: [],
+      author: who,
+      committer: who,
+      message: "local\n",
+    });
+    await f.repo.history.refs.set("refs/heads/main", local);
+    const before = await looseOf(f.files);
+    const target = { ...f.repo, gitDir: "/repo/.git" };
+    await expect(gc({ ...target, pruneExpireMs: 0, writeCommitGraph: false })).rejects.toThrow();
+    await expect(repack(target)).rejects.toThrow();
+    await expect(
+      new GcOrchestrator(f.repo.history, new FileGcStrategy(target)).run({ pruneExpireMs: 0 }),
+    ).rejects.toThrow();
+    expect(await looseOf(f.files)).toEqual(before);
+  });
+});
+
+describe("why alternates: false still refuses", () => {
+  it("a local object reached only through a borrowed reflog entry is not listed blind", async () => {
+    const files = createInMemoryFilesApi();
+    const who = { name: "a", email: "a@b", timestamp: 1, tzOffset: "+0000" };
+    const alt = await createGitFilesBackend({ files, gitDir: "/alt/.git", create: true });
+    await files.write("/repo/.git/objects/info/alternates", [enc.encode("/alt/.git/objects\n")]);
+    const seen = await createGitFilesBackend({ files, gitDir: "/repo/.git", create: true });
+    // a blob only here, under a borrowed commit that only the reflog names
+    const bytes = enc.encode("only here\n");
+    const blob = await seen.objects.put("blob", bytes.length, [bytes]);
+    const tree = await alt.history.trees.store([{ mode: 0o100644, name: "a", id: blob }]);
+    const commit = await alt.history.commits.store({
+      tree,
+      parents: [],
+      author: who,
+      committer: who,
+      message: "c\n",
+    });
+    await files.write("/repo/.git/logs/refs/heads/x", [
+      enc.encode(`${"0".repeat(40)} ${commit} a <a@b> 1 +0000\tx\n`),
+    ]);
+    const roots = { files, gitDir: "/repo/.git", refs: seen.history.refs, objects: seen.objects };
+    expect((await listReachableObjects(roots)).map((o) => o.id)).toContain(blob);
+    const repo = await createGitFilesBackend({ files, gitDir: "/repo/.git", alternates: false });
+    const blind = { ...roots, objects: repo.objects };
+    // the walk skips the reflog entry it cannot read, as git skips a commit that is gone
+    expect((await listReachableObjects(blind)).map((o) => o.id)).not.toContain(blob);
+    await expect(
+      gc({ ...repo, gitDir: "/repo/.git", pruneExpireMs: 0, writeCommitGraph: false }),
+    ).rejects.toThrow(/alternates are not read/);
+    expect(await seen.objects.has(blob)).toBe(true);
   });
 });

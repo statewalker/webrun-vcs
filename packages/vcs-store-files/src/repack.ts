@@ -113,6 +113,11 @@ export interface RepackResult {
   keptPacks: string[];
   /** Unreachable objects of the removed packs written loose or renewed (`unpackUnreachable`) */
   unpackedObjects: number;
+  /**
+   * git's error lines from reading the alternates, which git repack prints to stderr and goes
+   * on (`repack()` only; gc reports them in its own result); absent when there are none
+   */
+  errors?: string[];
 }
 
 /**
@@ -179,9 +184,11 @@ export async function snapshotPacks(packs: PackSet): Promise<PackSnapshot> {
 export async function repack(options: RepackOptions): Promise<RepackResult | null> {
   // repack deletes what the new pack replaces: not in a precious-objects repo (git: "cannot
   // delete packs in a precious-objects repo"), nor in a partial clone (promisor packs)
+  // git's errors reading the alternates are printed and repack goes on (see gc)
+  let alternatesErrors: readonly string[] = options.objects.alternates?.errors ?? [];
   if (!options.dryRun) {
     assertObjectsDeletable(await readRepositoryFormat(options.files, options.gitDir), "repack");
-    await assertAlternatesReadable(options, "repack");
+    alternatesErrors = await assertAlternatesReadable(options, "repack");
   }
   // The snapshot first: a pack installed during the walk is never removed
   const snapshot = await snapshotPacks(options.packs);
@@ -193,7 +200,10 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
     commitGraph: options.history.commitGraph,
     ...(options.readGraftFile ? { readGraftFile: options.readGraftFile } : {}),
   });
-  return repackListed(options, listed, snapshot);
+  const result = await repackListed(options, listed, snapshot);
+  return result && alternatesErrors.length > 0
+    ? { ...result, errors: [...alternatesErrors] }
+    : result;
 }
 
 /**
