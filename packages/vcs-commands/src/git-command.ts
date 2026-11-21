@@ -748,6 +748,11 @@ export abstract class GitCommand<T> {
    * them per child (gc's repack and prune, 2.5x fsck's `refs verify` and index-pack checks,
    * commit), and 2.43's `rev-parse HEAD` reads no object and prints none: ours are read with
    * the repository, once.
+   *
+   * This is the channel for these lines: commands whose results have no stderr of their own
+   * (status, log, diff, commit, fetch, push, clone, ...) leave them here for the caller to print
+   * first. Where a result carries git's stderr they are folded in as well, first and once:
+   * `FsckResult.errorOutput`/`findings` and `GcResult.errors`.
    */
   alternatesErrors(): string[] {
     return [...(this._workingCopy.history?.objects?.alternates?.errors ?? [])];

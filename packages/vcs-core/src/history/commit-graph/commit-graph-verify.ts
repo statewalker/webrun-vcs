@@ -233,7 +233,14 @@ export async function verifyCommitGraph(
   files: FilesApi,
   objectsDir: string,
   readCommit: VerifyCommitSource,
-  options: VerifyGraphOptions & { settings?: CommitGraphReadSettings } = {},
+  options: VerifyGraphOptions & {
+    settings?: CommitGraphReadSettings;
+    /**
+     * Every object directory of the repository, its own first, then the alternates': the
+     * layers of a split chain are looked up in each (default: `objectsDir` alone)
+     */
+    objectDirs?: readonly string[];
+  } = {},
 ): Promise<CommitGraphVerifyResult> {
   const settings = options.settings ?? {};
   const prefix = (d: { level: string; message: string }) => `${d.level}: ${d.message}`;
@@ -250,7 +257,7 @@ export async function verifyCommitGraph(
     if (!layer) return { exitCode: 1, messages };
     graph = new CommitGraph([layer]);
   } else {
-    const read = await readCommitGraph(files, objectsDir, settings);
+    const read = await readCommitGraph(files, objectsDir, settings, options.objectDirs);
     messages.push(...read.diagnostics.map(prefix));
     if (read.opened === "none") return { exitCode: 0, messages };
     if (!read.graph) return { exitCode: 1, messages };

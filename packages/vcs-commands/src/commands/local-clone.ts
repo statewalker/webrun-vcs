@@ -39,6 +39,11 @@ export interface LocalObjectsCopy {
     objectsDir: string;
     /** The source's git directory as clone.c names it (`src_repo`), a host path */
     repo: string;
+    /**
+     * The objects directory as clone.c names it in its messages (`get_common_dir(src_repo)`
+     * plus `/objects`, a host path); default `objectsDir`
+     */
+    objectsPath?: string;
   };
   target: {
     files: FilesApi;
@@ -120,11 +125,12 @@ export async function copyLocalObjects(copy: LocalObjectsCopy): Promise<LocalObj
   const srcRoot = source.objectsDir.replace(/\/+$/, "");
   const destRoot = target.objectsDir.replace(/\/+$/, "");
   if ((await (source.files as PosixFilesApi).lstat?.(srcRoot))?.kind === "symlink") {
-    throw new TransportError(`fatal: '${srcRoot}' is a symlink, refusing to clone with --local`);
+    const shown = source.objectsPath ?? srcRoot;
+    throw new TransportError(`fatal: '${shown}' is a symlink, refusing to clone with --local`);
   }
   if ((await source.files.stats(srcRoot))?.kind !== "directory") {
     throw new TransportError(
-      `fatal: failed to start iterator over '${srcRoot}': No such file or directory`,
+      `fatal: failed to start iterator over '${source.objectsPath ?? srcRoot}': No such file or directory`,
     );
   }
   await target.files.mkdir(destRoot);

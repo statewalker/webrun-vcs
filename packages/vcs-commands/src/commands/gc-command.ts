@@ -32,8 +32,10 @@ export interface GCCommandResult {
   /** `setAuto(true)` and run: git's "Auto packing the repository ..." lines (its stderr) */
   messages?: string[];
   /**
-   * git's error lines while packing refs (its stderr, also in the hook output): a loose ref
-   * whose object is missing stays loose, a ref changed before its prune keeps its loose file
+   * git's error lines (its stderr): first the alternates' (`alternatesErrors()`, once: git's
+   * repack and prune children repeat them), then those while packing refs (also in the hook
+   * output): a loose ref whose object is missing stays loose, a ref changed before its prune
+   * keeps its loose file
    */
   errors?: string[];
 }
@@ -291,7 +293,9 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
       durationMs: Date.now() - startTime,
       worktreesPruned,
       ...(this._auto ? { messages } : {}),
-      ...(errors.length > 0 ? { errors } : {}),
+      ...(errors.length > 0 || this.alternatesErrors().length > 0
+        ? { errors: [...this.alternatesErrors(), ...errors] }
+        : {}),
     };
   }
 }

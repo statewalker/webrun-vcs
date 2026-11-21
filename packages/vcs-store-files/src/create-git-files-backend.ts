@@ -279,8 +279,9 @@ export async function createGitFilesBackend(
       : {}),
   });
   invalidateOnCompatibilityChange(refStore, commitGraph);
-  // an alternate linked later (clone --shared, --reference) may bring a graph
-  alternates?.whenLinked(() => commitGraph.invalidate());
+  // an alternate linked later (clone --shared, --reference, each one added or re-read) may
+  // bring a graph or the layers a chain builds on
+  alternates?.onChange(() => commitGraph.invalidate());
   const history = createHistoryFromComponents({
     objects,
     refs: refStore,

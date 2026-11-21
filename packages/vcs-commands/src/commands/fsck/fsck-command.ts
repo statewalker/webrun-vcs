@@ -463,7 +463,19 @@ export class FsckCommand extends GitCommand<FsckResult> {
           (configBool(this.workingCopy, "commitGraph.readChangedPaths", true) ? -1 : 0),
       },
     });
-    return run.run();
+    const result = await run.run();
+    // git prints the alternates' error lines when it first reads an object: first on stderr
+    // (once here; git repeats them in its child processes)
+    const alternates = this.alternatesErrors();
+    if (alternates.length === 0) return result;
+    return {
+      ...result,
+      findings: [
+        ...alternates.map((text): FsckFinding => ({ kind: "error", stream: "stderr", text })),
+        ...result.findings,
+      ],
+      errorOutput: `${alternates.map((l) => `${l}\n`).join("")}${result.errorOutput}`,
+    };
   }
 }
 
@@ -742,7 +754,7 @@ class FsckRun {
       }))
     ) {
       for (const dir of this.sourceDirs()) {
-        const read = await readCommitGraph(this.files, dir, settings);
+        const read = await readCommitGraph(this.files, dir, settings, this.sourceDirs());
         for (const d of read.diagnostics) {
           this.emit({ kind: "commit-graph", stream: "stderr", text: `${d.level}: ${d.message}` });
         }
@@ -802,6 +814,8 @@ class FsckRun {
       },
       {
         settings,
+        // the child's layers come from every object directory of the repository
+        objectDirs: this.sourceDirs(),
         ...(this.grafts
           ? {
               ungraphedParents: (id: string) => graftsRead && this.graftedParents(id) !== undefined,
@@ -934,7 +948,7 @@ class FsckRun {
       }
       // the first graph among the object directories (prepare_commit_graph)
       for (const dir of this.sourceDirs()) {
-        const graph = (await readCommitGraph(this.files, dir, settings)).graph;
+        const graph = (await readCommitGraph(this.files, dir, settings, this.sourceDirs())).graph;
         if (graph) return graph;
       }
       return undefined;

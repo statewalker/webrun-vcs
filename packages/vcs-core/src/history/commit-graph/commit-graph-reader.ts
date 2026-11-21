@@ -2,7 +2,9 @@
  * Loading a repository's commit-graph from its object directory, as git's
  * `read_commit_graph_one`: `info/commit-graph` if it parses, else the split chain listed in
  * `info/commit-graphs/commit-graph-chain` (each `graph-<hash>.graph`, base first). A chain
- * that breaks off is kept up to the last layer that fits (git's incomplete chain).
+ * that breaks off is kept up to the last layer that fits (git's incomplete chain). Each layer
+ * of a chain is looked up in every object directory, the repository's own first, then its
+ * alternates (git's load_commit_graph_chain_fd_st walks every odb source per layer).
  */
 
 import type { FilesApi } from "@statewalker/vcs-utils/files";
@@ -63,6 +65,9 @@ const HEX40 = /^[0-9a-f]{40}/;
 
 /**
  * Reads the commit-graph of the object directory `objectsDir` (a path within `files`).
+ * `objectDirs` lists every object directory of the repository in git's order (its own
+ * first, then the alternates'): the layers a split chain names are looked up in each of them,
+ * so a chain may build on layers an alternate holds (default: `objectsDir` alone).
  *
  * @example
  * ```typescript
@@ -74,6 +79,7 @@ export async function readCommitGraph(
   files: FilesApi,
   objectsDir: string,
   settings: CommitGraphReadSettings = {},
+  objectDirs?: readonly string[],
 ): Promise<CommitGraphReadResult> {
   const diagnostics: CommitGraphDiagnostic[] = [];
   const single = joinPath(objectsDir, COMMIT_GRAPH_FILE);
@@ -90,7 +96,13 @@ export async function readCommitGraph(
       };
     }
   }
-  const chain = await readChain(files, objectsDir, settings, diagnostics);
+  const chain = await readChain(
+    files,
+    objectsDir,
+    objectDirs && objectDirs.length > 0 ? objectDirs : [objectsDir],
+    settings,
+    diagnostics,
+  );
   return { ...chain, diagnostics };
 }
 
@@ -98,6 +110,7 @@ export async function readCommitGraph(
 async function readChain(
   files: FilesApi,
   objectsDir: string,
+  objectDirs: readonly string[],
   settings: CommitGraphReadSettings,
   diagnostics: CommitGraphDiagnostic[],
 ): Promise<Omit<CommitGraphReadResult, "diagnostics">> {
@@ -130,9 +143,15 @@ async function readChain(
       break;
     }
     hashes.push(line.slice(0, 2 * HASH_SIZE));
-    const path = joinPath(objectsDir, splitGraphFileName(line));
-    const bytes = await readGraphFile(files, path);
-    const layer = bytes ? parseCommitGraphLayer(bytes, path, settings, diagnostics) : undefined;
+    // the first object directory whose layer of that name loads holds it
+    let layer: CommitGraphLayer | undefined;
+    let path = "";
+    for (const dir of objectDirs) {
+      path = joinPath(dir, splitGraphFileName(line));
+      const bytes = await readGraphFile(files, path);
+      layer = bytes ? parseCommitGraphLayer(bytes, path, settings, diagnostics) : undefined;
+      if (layer) break;
+    }
     valid = layer !== undefined && addToChain(layer, layers, hashes, diagnostics);
     if (!valid) {
       diagnostics.push({ level: "warning", message: "unable to find all commit-graph files" });

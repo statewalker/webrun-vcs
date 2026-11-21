@@ -881,12 +881,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       await alternates.add(`${found.gitDir}/objects`);
     }
     if (sharing && localSource) {
-      const commonDir = localSource.commonDir ?? localSource.gitDir;
-      const shallow = await (localSource.files ?? files)
-        .stats(`${commonDir.replace(/\/+$/, "")}/shallow`)
-        .catch(() => undefined);
       // a shallow source is cloned through the transport (clone.c: is_local = 0)
-      if (!shallow)
+      if (!(await sourceIsShallow(localSource, files)))
         await alternates.add(`${sourceCommonDirPath(files, localSource, repo)}/objects`);
     }
     return messages;
@@ -913,6 +909,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
           files: sourceFiles,
           objectsDir: `${commonDir}/objects`,
           repo: sourceGitDirPath(files, source, repo),
+          objectsPath: `${sourceCommonDirPath(files, source, repo)}/objects`,
         },
         target: { files, objectsDir: `${gitDir.replace(/\/+$/, "")}/objects` },
         addAlternate: (path) => alternates.add(path),
@@ -1157,15 +1154,20 @@ function sourceGitDirPath(files: FilesApi, source: OpenedRepository, repo: strin
   return host.known ? host.hostPath(source.gitDir) : source.gitDir;
 }
 
-/** Whether the source has a `shallow` file (clone.c: a shallow source is not cloned locally). */
+/**
+ * Whether the source has a `shallow` file (clone.c: a shallow source is not cloned locally).
+ * clone.c looks in the git directory get_repo_path found, a linked worktree's own (the
+ * gitfile's target) and not the common directory, so a linked worktree of a shallow
+ * repository is cloned locally as git does.
+ */
 async function sourceIsShallow(
   source: OpenedRepository,
   files: FilesApi | undefined,
 ): Promise<boolean> {
   const storage = source.files ?? files;
   if (!storage) return false;
-  const commonDir = (source.commonDir ?? source.gitDir).replace(/\/+$/, "");
-  return (await storage.stats(`${commonDir}/shallow`).catch(() => undefined)) !== undefined;
+  const gitDir = source.gitDir.replace(/\/+$/, "");
+  return (await storage.stats(`${gitDir}/shallow`).catch(() => undefined)) !== undefined;
 }
 
 function toBranchName(defaultBranch: string | undefined): string | undefined {

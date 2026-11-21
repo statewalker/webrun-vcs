@@ -8,12 +8,25 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
+import {
+  createNodeFilesApi,
+  createNodeGitHostEnvironment,
+} from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { copyLocalObjects } from "../src/commands/local-clone.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
@@ -208,5 +221,54 @@ describeGit("local clone (clone_local), as native git", () => {
     expect(ours.messages ?? []).toEqual(warnings(url.stderr));
     expect(warnings(url.stderr)).toEqual(["warning: --local is ignored\n"]);
     expect(objectIds(o2)).toEqual(objectIds(n2));
+  });
+
+  it("a linked worktree of a shallow repository is cloned locally (clone.c checks its own git directory)", async () => {
+    const dir = fresh("shallowwt");
+    const up = repoWith(join(dir, "up"), ["u1", "u2", "u3"]);
+    const src = join(dir, "src");
+    git(dir, "clone", "-q", "--depth=1", `file://${up}`, src);
+    const wt = join(dir, "wt");
+    git(src, "worktree", "add", "-q", wt, "-b", "wtb");
+    // get_repo_path answers the gitfile's target (.git/worktrees/wt): no `shallow` there, so
+    // git copies the objects locally without a warning (the shallow source itself is fetched)
+    const n = join(dir, "n");
+    const o = join(dir, "o");
+    const theirs = gitRun(root, dir, ["clone", "-q", "--local", wt, n]);
+    expect(theirs.status).toBe(0);
+    expect(warnings(theirs.stderr)).toEqual([]);
+    const result = await ourClone(o, (c) => c.setURI(wt).setLocal(true));
+    expect(result.messages ?? []).toEqual([]);
+    expect(filesOf(join(o, ".git/objects"))).toEqual(filesOf(join(n, ".git/objects")));
+    expect(filesOf(join(n, ".git/objects"))).toEqual(filesOf(join(src, ".git/objects")));
+    expect(stateOf(o).shallow).toBe(stateOf(n).shallow);
+  });
+
+  it("refuses a source whose objects directory is a symlink, naming its absolute path", async () => {
+    const dir = fresh("objlink");
+    const src = repoWith(join(dir, "src"), ["s1"]);
+    renameSync(join(src, ".git/objects"), join(dir, "objects"));
+    symlinkSync("../../objects", join(src, ".git/objects"));
+    const theirs = gitRun(root, dir, ["clone", "-q", src, join(dir, "n")]);
+    expect(theirs.status).toBe(128);
+    expect(theirs.stderr).toBe(
+      `fatal: '${join(src, ".git/objects")}' is a symlink, refusing to clone with --local\n`,
+    );
+    // (our worktree opens no repository whose objects directory is a link, so the copy is
+    // driven directly, as clone's localObjectsCopy calls it)
+    const files = createNodeFilesApi({ rootDir: root });
+    const rel = (p: string) => p.slice(root.length + 1);
+    await expect(
+      copyLocalObjects({
+        source: {
+          files,
+          objectsDir: rel(join(src, ".git/objects")),
+          repo: join(src, ".git"),
+          objectsPath: join(src, ".git/objects"),
+        },
+        target: { files, objectsDir: rel(join(dir, "o/.git/objects")) },
+        addAlternate: async () => {},
+      }),
+    ).rejects.toThrow(theirs.stderr.trimEnd());
   });
 });

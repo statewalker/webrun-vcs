@@ -193,13 +193,16 @@ export async function loadRepositoryCommitGraph(
     return undefined;
   }
   const objectsDir = options.objectsDir ?? joinPath(options.gitDir, "objects");
-  const read = await readCommitGraph(options.files, objectsDir, settings);
+  const alternates = options.alternateObjectDirs ? await options.alternateObjectDirs() : [];
+  // every source's layers are looked up in all of them, the repository's own first
+  const objectDirs = [objectsDir, ...alternates];
+  const read = await readCommitGraph(options.files, objectsDir, settings, objectDirs);
   for (const d of read.diagnostics) options.onDiagnostic?.(d);
-  if (read.graph || !options.alternateObjectDirs) return read.graph;
+  if (read.graph) return read.graph;
   // the alternates' graphs, in order: the first that loads is the one used (it describes the
   // borrowed history; the repository's own commits are parsed from their objects)
-  for (const dir of await options.alternateObjectDirs()) {
-    const alt = await readCommitGraph(options.files, dir, settings);
+  for (const dir of alternates) {
+    const alt = await readCommitGraph(options.files, dir, settings, objectDirs);
     for (const d of alt.diagnostics) options.onDiagnostic?.(d);
     if (alt.graph) return alt.graph;
   }

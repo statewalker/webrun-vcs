@@ -10,6 +10,7 @@
 
 import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -653,7 +654,9 @@ describeGit("alternate object directories, as native git", () => {
               .fsck()
               .setRepositoryFiles({ files, gitDir: `${rel}/.git` })
               .setCompatibility(compatibility);
-            await cmd.call();
+            const result = await cmd.call();
+            // folded into fsck's stderr too, first
+            expect(errorLines(result.errorOutput)).toEqual(cmd.alternatesErrors());
             return cmd.alternatesErrors();
           },
         ],
@@ -661,7 +664,9 @@ describeGit("alternate object directories, as native git", () => {
           ["gc", "-q"],
           async (g) => {
             const cmd = g.gc();
-            await cmd.call();
+            const result = await cmd.call();
+            // folded into gc's error lines too
+            expect(result.errors).toEqual(cmd.alternatesErrors());
             return cmd.alternatesErrors();
           },
         ],
@@ -721,6 +726,8 @@ describeGit("alternate object directories, as native git", () => {
     const graphFile = join(alt, ".git/objects/info/commit-graph");
     const bytes = readFileSync(graphFile);
     bytes[bytes.length - 1] = (bytes[bytes.length - 1] as number) ^ 0xff; // its checksum
+    // git writes commit-graph files read-only (0444): only root may write them as they are
+    chmodSync(graphFile, 0o644);
     writeFileSync(graphFile, bytes);
     const theirs = gitRun(root, repo, ["fsck", "--no-progress", ...noReferences]);
     const files = createNodeFilesApi({ rootDir: root });
@@ -734,6 +741,65 @@ describeGit("alternate object directories, as native git", () => {
     expect(ours.errorOutput.split("\n").filter(Boolean).sort()).toEqual(
       theirs.stderr.split("\n").filter(Boolean).sort(),
     );
+  });
+
+  it("loads a split chain whose base layers are in the alternate (each layer from every source)", async () => {
+    const dir = fresh("chain");
+    const alt = repoWith(join(dir, "alt"), ["a1", "a2", "a3"]);
+    git(alt, "commit-graph", "write", "--reachable", "--split");
+    const repo = join(dir, "repo");
+    git(dir, "clone", "-q", "--shared", alt, repo);
+    git(repo, "checkout", "-q", "-b", "topic", "origin/main~1");
+    repoWith(repo, ["r1", "r2"], false);
+    git(repo, "commit-graph", "write", "--reachable", "--split=no-merge");
+    // the repository's chain names the alternate's layer first, then its own
+    const chain = readFileSync(
+      join(repo, ".git/objects/info/commit-graphs/commit-graph-chain"),
+      "utf8",
+    )
+      .split("\n")
+      .filter(Boolean);
+    expect(chain.length).toBe(2);
+    expect(existsSync(join(alt, `.git/objects/info/commit-graphs/graph-${chain[0]}.graph`))).toBe(
+      true,
+    );
+    expect(existsSync(join(repo, `.git/objects/info/commit-graphs/graph-${chain[0]}.graph`))).toBe(
+      false,
+    );
+    const { history } = await backendOf(repo);
+    const graph = await history.commitGraph?.get();
+    // both layers: the alternate's three commits and the repository's two
+    expect(graph?.size).toBe(5);
+    const rel = repo.slice(root.length + 1);
+    const g = await openOurs(root, undefined, undefined, rel);
+    const walk = async (...revs: string[]) => {
+      const cmd = g.revList();
+      for (const r of revs) cmd.addRevision(r);
+      const ids: string[] = [];
+      for await (const c of await cmd.call()) ids.push(c.id);
+      return ids.join("\n");
+    };
+    expect(await walk("HEAD")).toBe(git(repo, "rev-list", "HEAD").trim());
+    expect(await walk("HEAD...origin/main")).toBe(
+      git(repo, "rev-list", "HEAD...origin/main").trim(),
+    );
+    const head = git(repo, "rev-parse", "HEAD").trim();
+    const main = git(repo, "rev-parse", "origin/main").trim();
+    expect(await history.commits.findMergeBase(head, main)).toEqual([
+      git(repo, "merge-base", head, main).trim(),
+    ]);
+    // fsck verifies the chain (and the alternate's) without a word, as git
+    const theirs = gitRun(root, repo, ["fsck", "--no-progress", ...noReferences]);
+    expect(theirs.status).toBe(0);
+    expect(theirs.stderr).toBe("");
+    const files = createNodeFilesApi({ rootDir: root });
+    const ours = await g
+      .fsck()
+      .setRepositoryFiles({ files, gitDir: `${rel}/.git` })
+      .setCompatibility(compatibility)
+      .call();
+    expect(ours.exitCode).toBe(0);
+    expect(ours.errorOutput).toBe("");
   });
 });
 
