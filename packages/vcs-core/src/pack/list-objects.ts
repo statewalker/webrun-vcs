@@ -22,9 +22,10 @@ import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
 import type { GitObject, GitObjects } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
+import { ObjectIdFlags } from "./object-id-flags.js";
 
 /** What `listObjects` reads: objects by id. */
-export type ListObjectsSource = Pick<GitObjects, "get">;
+export type ListObjectsSource = Pick<GitObjects, "get"> & Partial<Pick<GitObjects, "getNow">>;
 
 export interface ListObjectsOptions {
   /** The tips to list from (commits, tags, trees or blobs). A missing want throws. */
@@ -85,6 +86,8 @@ export class MissingObjectError extends Error {
 const SEEN = 1;
 const UNINTERESTING = 2;
 const ADDED = 4;
+/** a tree or blob below the boundary, already marked with everything below it */
+const BOUNDARY = 8;
 /** Commits walked after only uninteresting ones remain queued (git's SLOP). */
 const SLOP = 5;
 
@@ -110,9 +113,9 @@ export async function* listObjects(
   objects: ListObjectsSource,
   options: ListObjectsOptions,
 ): AsyncGenerator<ListedObject> {
-  const flags = new Map<ObjectId, number>();
-  const has = (id: ObjectId, f: number) => ((flags.get(id) ?? 0) & f) !== 0;
-  const set = (id: ObjectId, f: number) => flags.set(id, (flags.get(id) ?? 0) | f);
+  const flags = new ObjectIdFlags();
+  const has = (id: ObjectId, f: number) => (flags.get(id) & f) !== 0;
+  const set = (id: ObjectId, f: number) => flags.add(id, f);
   const commits = new Map<ObjectId, CommitInfo>();
   const shallow = new Set(options.shallow ?? []);
   const grafts = options.grafts;
@@ -125,9 +128,17 @@ export async function* listObjects(
     return extra.length > 0 ? [...c.parents, ...extra] : c.parents;
   };
 
+  const getNow = objects.getNow?.bind(objects);
   const read = async (id: ObjectId): Promise<{ type: ObjectTypeString; data: Uint8Array }> => {
-    const o = await objects.get(id);
+    // without a promise when the store has the object at hand (a loaded pack window)
+    let o = getNow ? getNow(id) : await objects.get(id);
+    if (o instanceof Promise) o = await o;
     if (!o) throw new MissingObjectError(`object ${id} is missing`);
+    if (o.bytes) {
+      await o.content[Symbol.asyncIterator]().return?.();
+      if (o.bytes.length !== o.size) throw new Error("object size mismatch");
+      return { type: o.type, data: o.bytes };
+    }
     return { type: o.type, data: await collect(o) };
   };
   const tryRead = (id: ObjectId) =>
@@ -278,8 +289,6 @@ export async function* listObjects(
       if (pc) boundaryTrees.push(pc.tree);
     }
   }
-  /** trees already walked to their leaves as uninteresting */
-  const boundary = new Set<ObjectId>();
   for (const t of boundaryTrees) await markTreeUninteresting(t);
 
   /** Marks a tree and everything below it uninteresting; each tree is read once. */
@@ -288,19 +297,29 @@ export async function* listObjects(
     const stack = [{ id: root, path: "" }];
     while (stack.length) {
       const { id: t, path } = stack.pop() as { id: ObjectId; path: string };
-      if (boundary.has(t)) continue;
-      boundary.add(t);
-      set(t, UNINTERESTING);
+      if (has(t, BOUNDARY)) continue;
+      set(t, BOUNDARY | UNINTERESTING);
       const o = await tryRead(t);
       if (o?.type !== "tree") continue;
       onBoundary?.({ id: t, type: "tree", path });
-      for (const e of treeEntries(o.data)) {
-        const p = path ? `${path}/${e.name}` : e.name;
-        if (e.kind === "tree") stack.push({ id: e.id, path: p });
-        else if (e.kind === "blob" && !boundary.has(e.id)) {
-          boundary.add(e.id);
-          set(e.id, UNINTERESTING);
-          onBoundary?.({ id: e.id, type: "blob", path: p });
+      const data = o.data;
+      for (let at = 0; at < data.length; ) {
+        const e = scanTreeEntry(data, at);
+        at = e.next;
+        if (e.kind === GITLINK) continue;
+        if (flags.getAt(data, e.nul + 1) & BOUNDARY) continue;
+        // the paths only matter to `onBoundary`
+        const name = onBoundary ? decodeGitPath(data.subarray(e.nameStart, e.nul)) : "";
+        const p = path ? `${path}/${name}` : name;
+        if (e.kind === TREE) {
+          stack.push({ id: bytesToHex(data.subarray(e.nul + 1, e.nul + 21)), path: p });
+        } else {
+          flags.addAt(data, e.nul + 1, BOUNDARY | UNINTERESTING);
+          onBoundary?.({
+            id: bytesToHex(data.subarray(e.nul + 1, e.nul + 21)),
+            type: "blob",
+            path: p,
+          });
         }
       }
     }
@@ -323,12 +342,20 @@ export async function* listObjects(
       if (o.type !== "tree") throw new Error(`object ${id} is a ${o.type}, not a tree`);
       yield { id, type: "tree", path };
       const subtrees: { id: ObjectId; path: string }[] = [];
-      for (const e of treeEntries(o.data)) {
-        const p = path ? `${path}/${e.name}` : e.name;
-        if (e.kind === "tree") subtrees.push({ id: e.id, path: p });
-        else if (e.kind === "blob" && !has(e.id, UNINTERESTING | ADDED)) {
-          set(e.id, ADDED);
-          yield { id: e.id, type: "blob", path: p };
+      const data = o.data;
+      // entries already listed or excluded are skipped before their names are decoded
+      for (let at = 0; at < data.length; ) {
+        const e = scanTreeEntry(data, at);
+        at = e.next;
+        if (e.kind === GITLINK) continue;
+        if (flags.getAt(data, e.nul + 1) & (UNINTERESTING | ADDED)) continue;
+        const eid = bytesToHex(data.subarray(e.nul + 1, e.nul + 21));
+        const name = decodeGitPath(data.subarray(e.nameStart, e.nul));
+        const p = path ? `${path}/${name}` : name;
+        if (e.kind === TREE) subtrees.push({ id: eid, path: p });
+        else {
+          flags.addAt(data, e.nul + 1, ADDED);
+          yield { id: eid, type: "blob", path: p };
         }
       }
       // depth first, in tree order
@@ -360,7 +387,7 @@ export async function* listObjects(
         listed = !has(id, UNINTERESTING);
         break;
       }
-      if (!tagIds.has(id) && (flags.get(id) ?? 0) !== 0) break; // met, not listed
+      if (!tagIds.has(id) && flags.get(id) !== 0) break; // met, not listed
       const o = await objects.get(id);
       if (!o) break;
       if (o.type !== "tag") {
@@ -430,20 +457,38 @@ function indexOfBlankLine(data: Uint8Array): number {
   return data.length;
 }
 
-/** A tree's entries: subtrees, blobs (files and symlinks) and gitlinks (submodule commits). */
-function* treeEntries(
+const TREE = 0;
+const BLOB = 1;
+const GITLINK = 2;
+
+/**
+ * The tree entry at `at`: its kind (by its mode, `40000` a tree, `160000` a gitlink, else a
+ * blob), where its name starts and its NUL (the id follows), and where the next entry starts.
+ */
+function scanTreeEntry(
   data: Uint8Array,
-): Generator<{ kind: "tree" | "blob" | "gitlink"; name: string; id: ObjectId }> {
-  let p = 0;
-  while (p < data.length) {
-    const sp = data.indexOf(0x20, p);
-    const nul = data.indexOf(0, sp);
-    if (sp < 0 || nul < 0 || nul + 21 > data.length) throw new Error("malformed tree");
-    const mode = dec.decode(data.subarray(p, sp));
-    const name = decodeGitPath(data.subarray(sp + 1, nul));
-    const id = bytesToHex(data.subarray(nul + 1, nul + 21));
-    p = nul + 21;
-    const kind = mode === "40000" ? "tree" : mode === "160000" ? "gitlink" : "blob";
-    yield { kind, name, id };
-  }
+  at: number,
+): { kind: number; nameStart: number; nul: number; next: number } {
+  const sp = data.indexOf(0x20, at);
+  const nul = sp < 0 ? -1 : data.indexOf(0, sp);
+  if (sp < 0 || nul < 0 || nul + 21 > data.length) throw new Error("malformed tree");
+  const len = sp - at;
+  const kind =
+    len === 5 &&
+    data[at] === 0x34 &&
+    data[at + 1] === 0x30 &&
+    data[at + 2] === 0x30 &&
+    data[at + 3] === 0x30 &&
+    data[at + 4] === 0x30
+      ? TREE
+      : len === 6 &&
+          data[at] === 0x31 &&
+          data[at + 1] === 0x36 &&
+          data[at + 2] === 0x30 &&
+          data[at + 3] === 0x30 &&
+          data[at + 4] === 0x30 &&
+          data[at + 5] === 0x30
+        ? GITLINK
+        : BLOB;
+  return { kind, nameStart: sp + 1, nul, next: nul + 21 };
 }

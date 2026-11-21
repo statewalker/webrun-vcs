@@ -3,8 +3,8 @@
  * and JGit's PackWriter:
  *
  *  - the header (with the object count, known up front), then each entry, then the SHA-1 of
- *    everything before it, computed while streaming. Nothing is buffered beyond one entry's
- *    chunk: whole objects stream from the store through zlib;
+ *    everything before it, computed while streaming. Output is gathered in 64 KiB chunks and
+ *    nothing else is buffered: whole objects stream from the store through zlib;
  *  - reuse (JGit's reuseObjects / reuseDeltas): an object a pack holds is copied as stored,
  *    its compressed bytes untouched (`PackedEntry.raw()`). A reused delta whose base is written
  *    too becomes an OFS delta with the base's new offset (or stays a REF delta); a delta whose
@@ -45,7 +45,14 @@ export type PackObjectSource = Pick<GitObjects, "get">;
 export type PackObjectRef = ObjectId | { id: ObjectId; type?: ObjectTypeString; path?: string };
 
 /** A stored entry `writePack` may copy (a `PackSet` is one source of them). */
-export type ReusableEntry = Pick<PackedEntry, "kind" | "size" | "baseId" | "raw">;
+export type ReusableEntry = Pick<PackedEntry, "kind" | "size" | "baseId" | "raw" | "data"> & {
+  /**
+   * The pack holding the entry (`PackSet` gives its id): the delta search does not try again a
+   * delta between two objects of one pack where the target is stored whole (git's try_delta,
+   * with reused deltas: that pack's writer tried it and kept the object whole).
+   */
+  packId?: string;
+};
 
 /** Where stored entries are looked up for reuse: a `PackSet`, or anything shaped like one. */
 export interface PackReuseSource {
@@ -119,6 +126,8 @@ const REF_DELTA = 7;
 const DEFAULT_DEPTH = 50;
 /** git's try_delta: smaller targets are never deltified. */
 const MIN_DELTA_TARGET = 50;
+/** Bytes of output gathered before they are hashed and yielded. */
+const OUT_CHUNK = 64 * 1024;
 
 interface Planned {
   id: ObjectId;
@@ -127,6 +136,10 @@ interface Planned {
   nameHash: number;
   /** a stored entry to copy */
   reuse?: ReusableEntry;
+  /** the written object a reused delta is on (undefined: a have of a thin pack) */
+  reuseBase?: Planned;
+  /** the pack the object is stored whole in, when reused deltas are on (git's IN_PACK) */
+  wholeIn?: string;
   /** a base chosen by the search */
   deltaBase?: Planned;
   delta?: Uint8Array;
@@ -137,6 +150,10 @@ interface Planned {
   /** a have: a base only, never written */
   have: boolean;
   offset?: number;
+  /** walk marks of breakReuseCycles (1 on the path, 2 done) and limitReusedChains (3 depth known) */
+  mark?: number;
+  /** the root of the reused chain this delta is on (null: a have of a thin pack) */
+  chainRoot?: Planned | null;
 }
 
 /**
@@ -191,44 +208,81 @@ export async function* writePack(
     for (const p of order) {
       const e = await options.packs.entry(p.id);
       if (!e) continue;
+      if (e.kind <= 4 && reuseDeltas && e.packId !== undefined) p.wholeIn = e.packId;
       if (e.kind <= 4 && reuseObjects) {
         p.reuse = e;
         p.type = TYPE_NAME[e.kind];
         p.size = e.size;
       } else if ((e.kind === OFS_DELTA || e.kind === REF_DELTA) && reuseDeltas && e.baseId) {
         // kept only if its base is written or is a have of a thin pack
-        if (byId.has(e.baseId) || haves.has(e.baseId)) p.reuse = e;
+        const base = byId.get(e.baseId);
+        if (base || haves.has(e.baseId)) {
+          p.reuse = e;
+          p.reuseBase = base;
+        }
       }
     }
-    breakReuseCycles(order, byId);
+    breakReuseCycles(order);
     // git's break_delta_chains: reused chains are kept within the depth limit, here or after
     // the search (which never makes a base of reused deltas so deep that they pass it)
-    limitReusedChains(order, byId, search?.depth ?? DEFAULT_DEPTH);
+    limitReusedChains(order, search?.depth ?? DEFAULT_DEPTH);
   }
 
   if (search) await searchDeltas(objects, order, haves, search, bigFileThreshold);
 
   // ---- write ----
+  // Bases first (an OFS delta points back to its base), each object once: the order the
+  // entries are written in, known before the first byte.
+  const writeOrder: Planned[] = [];
+  const queued = new Set<Planned>();
+  const chain: Planned[] = [];
+  for (const top of order) {
+    let p: Planned | undefined = top;
+    while (p && !p.have && !queued.has(p)) {
+      queued.add(p);
+      chain.push(p);
+      p = p.reuse?.baseId ? p.reuseBase : p.deltaBase;
+    }
+    while (chain.length) writeOrder.push(chain.pop() as Planned);
+  }
+
+  // Output goes through one buffer, hashed and yielded when full (or at a streamed object):
+  // entries are mostly small, and a chunk (and a hash update) per header costs more than they do.
   const hasher = createSha1();
   let offset = 0;
   let crc: CRC32 | undefined;
+  let buf = new Uint8Array(OUT_CHUNK);
+  let used = 0;
   const emit = (chunk: Uint8Array) => {
-    hasher.update(chunk);
     crc?.update(chunk);
     offset += chunk.length;
-    return chunk;
+    if (chunk.length > buf.length - used) {
+      if (used > 0) full.push(take());
+      if (chunk.length >= buf.length) {
+        hasher.update(chunk);
+        full.push(chunk);
+        return;
+      }
+    }
+    buf.set(chunk, used);
+    used += chunk.length;
+  };
+  const full: Uint8Array[] = [];
+  /** The buffered bytes, hashed; a new buffer takes their place. */
+  const take = (): Uint8Array => {
+    const out = buf.subarray(0, used);
+    hasher.update(out);
+    buf = new Uint8Array(OUT_CHUNK);
+    used = 0;
+    return out;
   };
 
   const head = new Uint8Array(12);
   head.set([0x50, 0x41, 0x43, 0x4b, 0, 0, 0, 2]);
   new DataView(head.buffer).setUint32(8, order.length);
-  yield emit(head);
+  emit(head);
 
-  async function* writeOne(p: Planned): AsyncGenerator<Uint8Array> {
-    if (p.offset !== undefined) return;
-    // the base first: an OFS delta points back to it
-    const base = p.reuse?.baseId ? byId.get(p.reuse.baseId) : p.deltaBase;
-    if (base && !base.have && base.offset === undefined) yield* writeOne(base);
+  for (const p of writeOrder) {
     const start = offset;
     crc = onEntry ? new CRC32() : undefined;
     let kind: PackedEntryKind;
@@ -238,28 +292,39 @@ export async function* writePack(
       reused = true;
       if (p.reuse.kind <= 4) {
         kind = p.reuse.kind;
-        yield emit(entryHeader(kind, p.reuse.size));
+        emit(entryHeader(kind, p.reuse.size));
       } else {
         baseId = p.reuse.baseId as ObjectId;
-        kind = deltaKind(byId.get(baseId), ofsDelta);
-        yield emit(deltaHeader(kind, p.reuse.size, start, byId.get(baseId), baseId));
+        kind = deltaKind(p.reuseBase, ofsDelta);
+        emit(deltaHeader(kind, p.reuse.size, start, p.reuseBase, baseId));
       }
-      for await (const c of p.reuse.raw()) yield emit(c);
+      const data = p.reuse.data?.();
+      if (data) {
+        // a view into the pack's cached windows: copied before it leaves as a chunk of its own
+        const bytes = data instanceof Uint8Array ? data : await data;
+        emit(bytes.length >= OUT_CHUNK ? bytes.slice() : bytes);
+      } else {
+        for await (const c of p.reuse.raw()) {
+          emit(c);
+          while (full.length) yield full.shift() as Uint8Array;
+        }
+      }
     } else if (p.deltaBase) {
       const d = p.delta ?? (await recomputeDelta(objects, p));
       p.delta = undefined;
       baseId = p.deltaBase.id;
       kind = deltaKind(p.deltaBase.have ? undefined : p.deltaBase, ofsDelta);
-      yield emit(
-        deltaHeader(kind, d.length, start, p.deltaBase.have ? undefined : p.deltaBase, baseId),
-      );
-      for await (const c of deflate(once(d))) yield emit(c);
+      emit(deltaHeader(kind, d.length, start, p.deltaBase.have ? undefined : p.deltaBase, baseId));
+      for await (const c of deflate(once(d))) emit(c);
     } else {
       const o = await objects.get(p.id);
       if (!o) throw new MissingObjectError(`object ${p.id} is missing`);
       kind = TYPE_CODE[o.type];
-      yield emit(entryHeader(kind, o.size));
-      for await (const c of deflate(sized(o, p.id))) yield emit(c);
+      emit(entryHeader(kind, o.size));
+      for await (const c of deflate(sized(o, p.id))) {
+        emit(c);
+        while (full.length) yield full.shift() as Uint8Array;
+      }
     }
     p.offset = start;
     onEntry?.({
@@ -271,9 +336,9 @@ export async function* writePack(
       reused,
     });
     crc = undefined;
+    while (full.length) yield full.shift() as Uint8Array;
   }
-
-  for (const p of order) yield* writeOne(p);
+  if (used > 0) yield take();
   yield hasher.digest();
 }
 
@@ -282,6 +347,10 @@ function deltaKind(base: Planned | undefined, ofsDelta: boolean): PackedEntryKin
   return base && ofsDelta ? OFS_DELTA : REF_DELTA;
 }
 
+/** Where entry headers are built: `emit` copies them out before the next one is. */
+const HEADER = new Uint8Array(64);
+const OFS_SCRATCH = new Uint8Array(16);
+
 function deltaHeader(
   kind: PackedEntryKind,
   size: number,
@@ -289,60 +358,64 @@ function deltaHeader(
   base: Planned | undefined,
   baseId: ObjectId,
 ): Uint8Array {
-  const h = entryHeader(kind, size);
-  const tail = kind === OFS_DELTA ? ofsVarint(at - (base?.offset as number)) : hexToBytes(baseId);
-  const out = new Uint8Array(h.length + tail.length);
-  out.set(h);
-  out.set(tail, h.length);
-  return out;
+  const n = putEntryHeader(kind, size);
+  if (kind !== OFS_DELTA) {
+    HEADER.set(hexToBytes(baseId), n);
+    return HEADER.subarray(0, n + 20);
+  }
+  // the back-offset: big-endian 7-bit groups, each continuation adding one
+  let back = at - (base?.offset as number);
+  let k = OFS_SCRATCH.length - 1;
+  OFS_SCRATCH[k] = back & 127;
+  back = Math.floor(back / 128);
+  while (back > 0) {
+    back--;
+    OFS_SCRATCH[--k] = 0x80 | (back & 127);
+    back = Math.floor(back / 128);
+  }
+  HEADER.set(OFS_SCRATCH.subarray(k), n);
+  return HEADER.subarray(0, n + OFS_SCRATCH.length - k);
 }
 
 /** An entry header: kind and size (4 bits, then 7 per byte). */
 function entryHeader(kind: number, size: number): Uint8Array {
-  const out: number[] = [];
+  return HEADER.subarray(0, putEntryHeader(kind, size));
+}
+
+/** Writes an entry header into `HEADER`; its length. */
+function putEntryHeader(kind: number, size: number): number {
+  let n = 0;
   let b = (kind << 4) | (size & 15);
   let rest = Math.floor(size / 16);
   while (rest > 0) {
-    out.push(b | 0x80);
+    HEADER[n++] = b | 0x80;
     b = rest & 127;
     rest = Math.floor(rest / 128);
   }
-  out.push(b);
-  return Uint8Array.from(out);
-}
-
-/** An OFS_DELTA back-offset (big-endian 7-bit groups, each continuation adding one). */
-function ofsVarint(n: number): Uint8Array {
-  const out = [n & 127];
-  let rest = Math.floor(n / 128);
-  while (rest > 0) {
-    rest--;
-    out.unshift(0x80 | (rest & 127));
-    rest = Math.floor(rest / 128);
-  }
-  return Uint8Array.from(out);
+  HEADER[n++] = b;
+  return n;
 }
 
 /**
  * Reused deltas whose bases form a cycle (copies from different packs, each a delta on the
  * other) cannot all be written as deltas: the first of each cycle is written whole.
  */
-function breakReuseCycles(order: Planned[], byId: Map<ObjectId, Planned>) {
-  const state = new Map<Planned, 1 | 2>(); // 1 on the path, 2 done
+function breakReuseCycles(order: Planned[]) {
+  const path: Planned[] = [];
   for (const start of order) {
-    const path: Planned[] = [];
     let p: Planned | undefined = start;
-    while (p && !state.has(p)) {
-      state.set(p, 1);
+    while (p && p.mark === undefined) {
+      p.mark = 1; // on the path
       path.push(p);
       const b: ObjectId | undefined = p.reuse?.baseId;
-      p = b ? byId.get(b) : undefined;
-      if (p && state.get(p) === 1) {
+      p = b ? p.reuseBase : undefined;
+      if (p && p.mark === 1) {
         p.reuse = undefined; // break the cycle here
         break;
       }
     }
-    for (const x of path) state.set(x, 2);
+    for (const x of path) x.mark = 2; // done
+    path.length = 0;
   }
 }
 
@@ -352,13 +425,12 @@ function breakReuseCycles(order: Planned[], byId: Map<ObjectId, Planned>) {
  * Then each object at the root of reused chains records the longest chain on it (`reusedAbove`),
  * so the search does not make it a delta those chains would pass the limit on.
  */
-function limitReusedChains(order: Planned[], byId: Map<ObjectId, Planned>, maxDepth: number) {
-  const done = new Set<Planned>();
+function limitReusedChains(order: Planned[], maxDepth: number) {
   const depthOf = (p: Planned): number => {
-    if (done.has(p)) return p.depth;
-    done.add(p);
+    if (p.mark === 3) return p.depth;
+    p.mark = 3;
     const baseId = p.reuse && p.reuse.kind > 4 ? p.reuse.baseId : undefined;
-    const base = baseId ? byId.get(baseId) : undefined;
+    const base = baseId ? p.reuseBase : undefined;
     let d = baseId ? (base ? depthOf(base) + 1 : 1) : 0; // 1: on a have of a thin pack
     if (d > maxDepth) {
       p.reuse = undefined; // written whole: the chain is broken here
@@ -368,12 +440,21 @@ function limitReusedChains(order: Planned[], byId: Map<ObjectId, Planned>, maxDe
     return d;
   };
   for (const p of order) depthOf(p);
+  // each chain's root found once, for every delta on it
+  const path: Planned[] = [];
   for (const p of order) {
     if (!(p.reuse && p.reuse.kind > 4)) continue;
-    let root: Planned | undefined = p;
+    let root: Planned | undefined | null = p;
     while (root?.reuse && root.reuse.kind > 4 && root.reuse.baseId) {
-      root = byId.get(root.reuse.baseId);
+      if (root.chainRoot !== undefined) {
+        root = root.chainRoot;
+        break;
+      }
+      path.push(root);
+      root = root.reuseBase;
     }
+    for (const x of path) x.chainRoot = root ?? null;
+    path.length = 0;
     if (root) root.reusedAbove = Math.max(root.reusedAbove ?? 0, p.depth);
   }
 }
@@ -426,7 +507,8 @@ async function recomputeDelta(objects: PackObjectSource, p: Planned): Promise<Ui
 
 interface WindowEntry {
   p: Planned;
-  data: Uint8Array;
+  /** read on first use */
+  data?: Uint8Array;
   index?: GitDeltaIndex;
   bytes: number;
 }
@@ -435,7 +517,9 @@ interface WindowEntry {
  * git's find_deltas: candidates sorted by type, name hash, haves first and size (largest first), each tried
  * against the previous `window` ones of its type; the smallest delta within git's size limit
  * wins. Objects reused as deltas are neither targets nor bases; an object with reused deltas on
- * it becomes a delta only where their chains stay within the depth limit.
+ * it becomes a delta only where their chains stay within the depth limit. Contents are read
+ * when a delta is first tried with them, and a target stored whole in the pack its base is in
+ * is not tried again (git's try_delta under reused deltas).
  */
 async function searchDeltas(
   objects: PackObjectSource,
@@ -475,16 +559,30 @@ async function searchDeltas(
 
   const window: WindowEntry[] = [];
   let held = 0;
+  /** An entry's content, read the first time a delta is tried with it (git's try_delta). */
+  const dataOf = async (w: WindowEntry): Promise<Uint8Array> => {
+    if (!w.data) {
+      w.data = await load(objects, w.p.id);
+      w.bytes += w.data.length;
+      held += w.data.length;
+    }
+    return w.data;
+  };
   for (const p of candidates) {
-    const data = await load(objects, p.id);
+    const me: WindowEntry = { p, bytes: 0 };
     if (!p.have) {
       let best: { base: WindowEntry; delta: Uint8Array } | undefined;
       for (let i = window.length - 1; i >= 0; i--) {
         const w = window[i] as WindowEntry;
+        if (w.p.type !== p.type) continue;
+        // a delta between two objects of one pack, the target stored whole, was tried (and
+        // discarded) when that pack was written; a have is always tried
+        if (p.wholeIn !== undefined && p.wholeIn === w.p.wholeIn && !w.p.have) continue;
         // the reused deltas on p get as much deeper as p does
-        if (w.p.type !== p.type || w.p.depth + 1 + (p.reusedAbove ?? 0) > maxDepth) continue;
+        if (w.p.depth + 1 + (p.reusedAbove ?? 0) > maxDepth) continue;
         // git's try_delta size limit, tighter for bases deep in a chain
-        const trgSize = data.length;
+        const trgSize = p.size as number;
+        const srcSize = w.p.size as number;
         let maxSize: number;
         let refDepth: number;
         if (!best) {
@@ -496,11 +594,13 @@ async function searchDeltas(
         }
         maxSize = Math.floor((maxSize * (maxDepth - w.p.depth)) / (maxDepth - refDepth + 1));
         if (maxSize <= 0) continue;
-        const sizeDiff = w.data.length < trgSize ? trgSize - w.data.length : 0;
+        const sizeDiff = srcSize < trgSize ? trgSize - srcSize : 0;
         if (sizeDiff >= maxSize) continue;
-        if (trgSize < w.data.length / 32) continue;
+        if (trgSize < srcSize / 32) continue;
+        const data = await dataOf(me);
+        const base = await dataOf(w);
         if (!w.index) {
-          w.index = createGitDeltaIndex(w.data);
+          w.index = createGitDeltaIndex(base);
           const extra = w.index.start.byteLength + w.index.pos.byteLength * 2;
           w.bytes += extra;
           held += extra;
@@ -522,8 +622,7 @@ async function searchDeltas(
         }
       }
     }
-    window.push({ p, data, bytes: data.length });
-    held += data.length;
+    window.push(me);
     while (window.length > windowSize || (held > windowMemory && window.length > 1)) {
       held -= (window.shift() as WindowEntry).bytes;
     }
