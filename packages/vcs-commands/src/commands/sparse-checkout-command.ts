@@ -16,6 +16,7 @@
  */
 
 import { GitWorkingCopyConfig } from "@statewalker/vcs-store-files";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import {
   decodeGitPath,
   encodeGitPath,
@@ -25,6 +26,7 @@ import {
 import {
   type SparseCheckoutPatterns,
   type SparseConeSets,
+  type Staging,
   sparsePatternsFromCone,
   sparsePatternsFromLines,
   splitPatternLines,
@@ -32,6 +34,7 @@ import {
 } from "@statewalker/vcs-working-tree";
 
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import { quotePath } from "../results/quote-path.js";
 import {
   cleanTrackedSparseDirectories,
@@ -166,8 +169,10 @@ interface RunState {
  * `git sparse-checkout <subcommand> <options>` as git 2.5x runs it. Arguments are given as
  * on git's command line ({@link setArguments}) or with the typed setters; `--stdin` reads
  * {@link setStdin}, `--rules-file` the file named (relative to the worktree's root) or the
- * text given to {@link setRulesFile}. The sparse index is not supported: `--sparse-index`
- * is refused (`--no-sparse-index` records `index.sparse=false`, as git).
+ * text given to {@link setRulesFile}. `--sparse-index` records `index.sparse=true` and the
+ * index is written as a sparse index where cone mode allows it; `--no-sparse-index` records
+ * `index.sparse=false` and writes it whole (both in `config.worktree` once the worktree
+ * config is on, else in the repository's config, as git).
  */
 export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
   private args?: string[];
@@ -184,6 +189,11 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
 
   private out = "";
   private err = "";
+  /**
+   * Whether expanding the index still gives git 2.5x's `advice.sparseIndexExpanded` hint
+   * (`give_advice_on_expansion`): the index read sparse and not expanded yet
+   */
+  private adviseOnExpansion = false;
   private warningList: string[] = [];
 
   /** The arguments after `git sparse-checkout` (the typed setters are then ignored). */
@@ -214,7 +224,7 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
     return this;
   }
 
-  /** `--sparse-index` (refused: no sparse index) or `--no-sparse-index`. */
+  /** `--sparse-index` or `--no-sparse-index`. */
   setSparseIndex(sparseIndex: boolean): this {
     this.checkCallable();
     this.sparseIndex = sparseIndex;
@@ -315,6 +325,11 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
     }
     const opts = this.parseOptions(sub, rest);
     const state = this.runState();
+    // disable expands the index on purpose: no hint
+    this.adviseOnExpansion =
+      sub !== "disable" &&
+      this.compatibility !== "2.43" &&
+      this.staging.indexLayout?.().sparse === true;
     switch (sub) {
       case "list":
         return this.list(state);
@@ -603,12 +618,33 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
     const recordMode = opts.cone !== -1 || !state.apply;
     const mode = this.updateConeMode(state, opts.cone);
     if (recordMode) await this.setConfig(mode);
-    if (opts.sparseIndex === 1) {
-      throw new SparseDie("the sparse index is not supported");
+    // set_sparse_index_config: the setting recorded, the index written again (sparse when
+    // the cone allows it, whole for --no-sparse-index) by update_working_directory's write
+    if (opts.sparseIndex >= 0) {
+      await this.setWorktreeConfigGently([
+        ["index.sparse", opts.sparseIndex === 1 ? "true" : "false"],
+      ]);
+      // ensure_full_index
+      if (opts.sparseIndex === 0) this.expandIndex();
     }
-    if (opts.sparseIndex === 0) {
-      await this.writeWorktreeConfig([["index.sparse", "false"]]);
-    }
+  }
+
+  /** git's `expand_index` to a full index: 2.5x's hint the first time a sparse index expands. */
+  private expandIndex(): void {
+    if (!this.adviseOnExpansion) return;
+    this.adviseOnExpansion = false;
+    const config = this.workingCopy.config as { get?(key: string): unknown } | undefined;
+    const value = String(config?.get?.("advice.sparseIndexExpanded") ?? "true").toLowerCase();
+    if (["false", "no", "off", "0"].includes(value)) return;
+    this.err +=
+      "hint: The sparse index is expanding to a full index, a slow operation.\n" +
+      "hint: Your working directory likely has contents that are outside of\n" +
+      "hint: your sparse-checkout patterns. Use 'git sparse-checkout list' to\n" +
+      "hint: see your sparse-checkout definition and compare it to your working\n" +
+      "hint: directory contents. Cleaning up any merge conflicts or staged\n" +
+      "hint: changes before running 'git sparse-checkout clean' or 'git\n" +
+      "hint: sparse-checkout reapply' may assist in this cleanup.\n" +
+      'hint: Disable this message with "git config set advice.sparseIndexExpanded false"\n';
   }
 
   /** set_config: the worktree's config (init_worktree_config first) */
@@ -667,6 +703,27 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
     await worktreeConfig.save();
     // the repository's config reads config.worktree again
     await config.load?.();
+  }
+
+  /**
+   * `repo_config_set_worktree_gently`: the values written to this worktree's
+   * `config.worktree` when `extensions.worktreeConfig` is on, else to the repository's config.
+   */
+  private async setWorktreeConfigGently(values: [string, string][]): Promise<void> {
+    const config = this.workingCopy.config as
+      | (WorkingCopyConfig & {
+          get?(key: string): unknown;
+          set?(key: string, value: unknown): void;
+          save?(): Promise<void>;
+        })
+      | undefined;
+    const enabled = String(config?.get?.("extensions.worktreeConfig") ?? "").toLowerCase();
+    if (["true", "yes", "on", "1"].includes(enabled) || !config?.save || !config.set) {
+      await this.writeWorktreeConfig(values);
+      return;
+    }
+    for (const [key, value] of values) config.set(key, value);
+    await config.save();
   }
 
   /** modify_pattern_list */
@@ -862,6 +919,46 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
       );
       this.warnPatterns(patterns);
     }
+    // update_sparsity's expand_index: patterns not of the cone's shape expand it fully
+    if (!patterns.cone || patterns.coneSets === undefined) this.expandIndex();
+    // write_locked_index converts to a sparse index with the patterns being applied (git sets
+    // them on the index for update_sparsity), when index.sparse and cone mode allow it
+    const previousHost = staging.getIndexHost?.();
+    if (staging.setIndexHost) {
+      const allowed = state.apply && state.cone && patterns.cone && patterns.coneSets !== undefined;
+      staging.setIndexHost({
+        ...(previousHost ?? {}),
+        ...(previousHost?.trees ? { trees: previousHost.trees } : {}),
+        settings: async () => {
+          const settings = { ...((await previousHost?.settings?.()) ?? {}) };
+          const config = RemoteConfigStore.from(this.workingCopy);
+          const indexSparse = (() => {
+            try {
+              return parseGitBool(config.value("index.sparse")) === true;
+            } catch {
+              return false;
+            }
+          })();
+          if (allowed && indexSparse) settings.sparse = patterns;
+          else delete settings.sparse;
+          return settings;
+        },
+      });
+    }
+    try {
+      return await this.applySparsity(state, pl, patterns, staging);
+    } finally {
+      staging.setIndexHost?.(previousHost);
+    }
+  }
+
+  /** update_working_directory once its patterns are known: update_sparsity, then the write. */
+  private async applySparsity(
+    state: RunState,
+    pl: PatternList | undefined,
+    patterns: SparseCheckoutPatterns,
+    staging: Staging,
+  ): Promise<number> {
     const outcome = await updateSparsity(
       {
         workingCopy: this.workingCopy,

@@ -520,17 +520,18 @@ export async function encodeIndexFileBytes(
   entries: readonly StagingEntry[],
   version: IndexVersion = INDEX_VERSION_2,
   extensions: readonly IndexExtension[] = [],
-  options: { source?: IndexEncoding } = {},
+  options: { source?: IndexEncoding; sparseDirectories?: boolean } = {},
 ): Promise<{ bytes: Uint8Array; checksum: Uint8Array; encoding?: IndexEncoding }> {
   const written = writtenVersion(entries, version);
-  const sortedEntries = checkedSorted(entries, extensions, written === INDEX_VERSION_4);
+  const sparse = options.sparseDirectories === true;
+  const sortedEntries = checkedSorted(entries, extensions, written === INDEX_VERSION_4, sparse);
   if (written === INDEX_VERSION_4) {
     const bytes = concatBytes([...encodeSorted(sortedEntries, written, extensions)]);
     return { bytes, checksum: bytes.subarray(bytes.length - 20) };
   }
   const source = options.source?.version === written ? options.source : undefined;
   const offsets = new Int32Array(sortedEntries.length + 1);
-  const { out, size } = encodeFlat(sortedEntries, written, extensions, 20, source, offsets);
+  const { out, size } = encodeFlat(sortedEntries, written, extensions, 20, source, offsets, sparse);
   const checksum = await sha1(out.subarray(0, size));
   out.set(checksum, size);
   // the entries' records point into `out` (a later encode copies their bytes from there):
@@ -558,6 +559,8 @@ function encodeFlat(
   source?: IndexEncoding,
   /** filled with where each entry starts in `out` (and where the entries end) */
   offsets?: Int32Array,
+  /** sparse directory entries (mode 040000, a trailing slash) allowed */
+  sparseDirectories = false,
 ): { out: Uint8Array; size: number } {
   const count = sortedEntries.length;
   // the path's bytes for a path that is not ASCII (undefined: ASCII, written as it is)
@@ -607,7 +610,7 @@ function encodeFlat(
       continue;
     }
     const path = entry.path;
-    validatePath(path);
+    validateEntryPath(entry, sparseDirectories);
     let pathLength = path.length;
     if (!isAscii(path)) {
       const bytes = encodeGitPath(path);
@@ -738,12 +741,13 @@ function checkedSorted(
   entries: readonly StagingEntry[],
   extensions: readonly IndexExtension[],
   checkEntries: boolean,
+  sparseDirectories = false,
 ): StagingEntry[] {
   // versions 2 and 3 check each entry as they write it (encodeFlat), before any byte is out
   for (const entry of checkEntries ? entries : []) {
     // an entry encoded before was checked then (entries are never changed in place)
     if (encodedEntries.has(entry)) continue;
-    validatePath(entry.path);
+    validateEntryPath(entry, sparseDirectories);
     objectIdToBytes(entry.objectId);
   }
   for (const ext of extensions) {
@@ -1097,6 +1101,27 @@ function readNullTerminated(
 }
 
 /**
+ * Check the path of an entry: a sparse directory entry (`sparseDirectories`, mode 040000) has
+ * one trailing slash after an otherwise valid path.
+ */
+function validateEntryPath(entry: StagingEntry, sparseDirectories: boolean): void {
+  if (sparseDirectories && entry.mode === 0o040000 && entry.path.endsWith("/")) {
+    validatePath(entry.path.slice(0, -1));
+  } else validatePath(entry.path);
+}
+
+/**
+ * Check the paths of entries read from an index whose entries could not be checked as they
+ * were parsed (a split or sparse index, see `ParsedIndex.extensions`), once they are merged
+ * or expanded: as {@link parseIndexFile} checks an ordinary index's.
+ *
+ * @throws Error naming the first invalid path
+ */
+export function validateIndexEntryPaths(entries: readonly StagingEntry[]): void {
+  for (const entry of entries) validatePath(entry.path);
+}
+
+/**
  * Validate path for index entry.
  */
 function validatePath(path: string): void {
@@ -1183,4 +1208,101 @@ function concatBytes(arrays: Uint8Array[]): Uint8Array {
     offset += arr.length;
   }
   return result;
+}
+
+/** One entry of {@link encodeIndexInOrder}: the entry, written under `path` (empty: stripped). */
+export interface OrderedIndexItem {
+  entry: StagingEntry;
+  /** The name written; `""` for a split index's replacement entry (git's `CE_STRIP_NAME`). */
+  path: string;
+}
+
+/**
+ * An index file's bytes with its entries in the order given and under the names given, no
+ * entry checked or sorted (git's `do_write_index` over a split index's `cache[]`:
+ * replacements with stripped names first, in shared-index order, then the new entries).
+ * Versions 2 and 3 are chosen by the entries written, as {@link encodeIndexFile} does.
+ *
+ * @example
+ * ```typescript
+ * const { bytes } = await encodeIndexInOrder([{ entry, path: "" }], 2, [link]);
+ * ```
+ */
+export async function encodeIndexInOrder(
+  items: readonly OrderedIndexItem[],
+  version: IndexVersion,
+  extensions: readonly IndexExtension[],
+): Promise<{ bytes: Uint8Array; checksum: Uint8Array }> {
+  const written = writtenVersion(
+    items.map((i) => i.entry),
+    version,
+  );
+  const parts: Uint8Array[] = [];
+  const header = new Uint8Array(HEADER_SIZE);
+  const headerView = new DataView(header.buffer);
+  headerView.setUint32(0, INDEX_SIGNATURE);
+  headerView.setUint32(4, written);
+  headerView.setUint32(8, items.length);
+  parts.push(header);
+  let previous: Uint8Array = new Uint8Array(0);
+  for (const { entry, path } of items) {
+    objectIdToBytes(entry.objectId);
+    const name = encodeGitPath(path);
+    const hasExtended = hasExtendedFlags(entry);
+    const infoLen = hasExtended ? INFO_LEN_EXTENDED : INFO_LEN;
+    if (written === INDEX_VERSION_4) {
+      let common = 0;
+      while (common < name.length && common < previous.length && name[common] === previous[common])
+        common++;
+      const varint = encodeVarint(previous.length - common);
+      const out = new Uint8Array(infoLen + varint.length + name.length - common + 1);
+      writeEntryHeader(new DataView(out.buffer), 0, entry, name.length, hasExtended);
+      out.set(objectIdToBytes(entry.objectId), P_OBJECTID);
+      out.set(varint, infoLen);
+      out.set(name.subarray(common), infoLen + varint.length);
+      parts.push(out);
+      previous = name;
+    } else {
+      const out = new Uint8Array((infoLen + name.length + 8) & ~7);
+      writeEntryHeader(new DataView(out.buffer), 0, entry, name.length, hasExtended);
+      out.set(objectIdToBytes(entry.objectId), P_OBJECTID);
+      out.set(name, infoLen);
+      parts.push(out);
+    }
+  }
+  for (const ext of extensions) {
+    const head = new Uint8Array(8);
+    for (let i = 0; i < 4; i++) head[i] = ext.signature.charCodeAt(i);
+    new DataView(head.buffer).setUint32(4, ext.data.length);
+    parts.push(head, ext.data);
+  }
+  const body = concatBytes(parts);
+  const checksum = await sha1(body);
+  const bytes = new Uint8Array(body.length + CHECKSUM_SIZE);
+  bytes.set(body);
+  bytes.set(checksum, body.length);
+  return { bytes, checksum: bytes.subarray(body.length) };
+}
+
+/** Scratch buffers of {@link sameOnDiskEntryData}. */
+const COMPARE_A = new DataView(new ArrayBuffer(INFO_LEN_EXTENDED));
+const COMPARE_B = new DataView(new ArrayBuffer(INFO_LEN_EXTENDED));
+
+/**
+ * Whether two entries are written with the same data apart from their names: stat data,
+ * mode, object id and the on-disk flags (git's `compare_ce_content`, which a split index
+ * write uses to tell a copy of a shared entry from a changed one).
+ */
+export function sameOnDiskEntryData(a: StagingEntry, b: StagingEntry): boolean {
+  if (a.objectId !== b.objectId) return false;
+  const extA = hasExtendedFlags(a);
+  if (extA !== hasExtendedFlags(b)) return false;
+  writeEntryHeader(COMPARE_A, 0, a, 0, extA);
+  writeEntryHeader(COMPARE_B, 0, b, 0, extA);
+  const len = extA ? INFO_LEN_EXTENDED : INFO_LEN;
+  for (let i = 0; i < len; i++) {
+    if (i >= P_OBJECTID && i < P_FLAGS) continue;
+    if (COMPARE_A.getUint8(i) !== COMPARE_B.getUint8(i)) return false;
+  }
+  return true;
 }

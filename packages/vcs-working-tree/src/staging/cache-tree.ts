@@ -496,3 +496,100 @@ export async function repairCacheTree(
   await update(root, 0, "");
   return root;
 }
+
+/**
+ * git's `cache_tree_update(WRITE_TREE_MISSING_OK)` from nothing, as `convert_to_sparse`
+ * runs it before collapsing directories: the tree of every directory of the index is stored
+ * (`store`) and its node valid, except the directories holding an intent-to-add entry (up
+ * to the root), which stay invalid while their trees (without such entries) are still
+ * stored. Undefined when the index has unmerged entries.
+ *
+ * ```typescript
+ * const tree = await storeCacheTree((entries) => trees.store(entries), staging.entryList());
+ * ```
+ */
+export async function storeCacheTree(
+  store: (entries: TreeEntry[]) => Promise<ObjectId>,
+  entries: readonly {
+    path: string;
+    mode: number;
+    objectId: ObjectId;
+    stage: number;
+    intentToAdd?: boolean;
+  }[],
+): Promise<CacheTree | undefined> {
+  if (entries.some((e) => e.stage !== 0)) return undefined;
+  const oids = new Map<CacheTree, ObjectId>();
+  const emptyTree = await canonicalTreeId([]);
+  const update = async (node: CacheTree, start: number, base: string): Promise<number> => {
+    const inBase = (i: number) => {
+      const e = entries[i];
+      return e !== undefined && e.path.length > base.length && e.path.startsWith(base);
+    };
+    const children = new Map<string, { tree: CacheTree; count: number }>();
+    let i = start;
+    while (inBase(i)) {
+      const path = (entries[i] as { path: string }).path;
+      const slash = path.indexOf("/", base.length);
+      if (slash < 0) {
+        i++;
+        continue;
+      }
+      const name = path.slice(base.length, slash);
+      const tree: CacheTree = { entryCount: -1, subtrees: [] };
+      node.subtrees.push({ name, tree });
+      const count = await update(tree, i, path.slice(0, slash + 1));
+      children.set(name, { tree, count });
+      i += count;
+    }
+    node.subtrees.sort((a, b) => compareSubtreeNames(a.name, b.name));
+    const items: TreeEntry[] = [];
+    let toInvalidate = false;
+    i = start;
+    while (inBase(i)) {
+      const e = entries[i] as (typeof entries)[number];
+      const slash = e.path.indexOf("/", base.length);
+      if (slash >= 0) {
+        const name = e.path.slice(base.length, slash);
+        const sub = children.get(name) as { tree: CacheTree; count: number };
+        i += sub.count;
+        const oid = oids.get(sub.tree) as ObjectId;
+        const containsIta = sub.tree.entryCount < 0;
+        if (containsIta) toInvalidate = true;
+        if (containsIta && oid === emptyTree) continue;
+        items.push({ name, mode: FileMode.TREE, id: oid });
+      } else {
+        i++;
+        if (e.intentToAdd) {
+          toInvalidate = true;
+          continue;
+        }
+        items.push({ name: e.path.slice(base.length), mode: e.mode, id: e.objectId });
+      }
+    }
+    const id = await store(items);
+    oids.set(node, id);
+    if (toInvalidate) {
+      node.entryCount = -1;
+      node.id = undefined;
+    } else {
+      node.entryCount = i - start;
+      node.id = id;
+    }
+    return i - start;
+  };
+  const root: CacheTree = { entryCount: -1, subtrees: [] };
+  await update(root, 0, "");
+  return root;
+}
+
+/** The node of `tree` at `dir` (a directory path without a trailing slash; "" the root). */
+export function cacheTreeNodeAt(tree: CacheTree, dir: string): CacheTree | undefined {
+  if (dir === "") return tree;
+  let node: CacheTree | undefined = tree;
+  for (const name of dir.split("/")) {
+    node = node?.subtrees.find((s) => s.name === name)?.tree;
+    if (!node) return undefined;
+  }
+  return node;
+}

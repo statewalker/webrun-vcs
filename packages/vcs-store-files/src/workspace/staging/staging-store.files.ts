@@ -19,6 +19,7 @@ import {
   type GitStagingOptions,
   INDEX_VERSION_2,
   IndexFile,
+  type IndexHost,
   type IndexStatUpdate,
   type IndexVersion,
   keepMatchingEntries,
@@ -36,6 +37,7 @@ import {
   smudgeRacilyClean,
   verifyTreePaths,
 } from "@statewalker/vcs-working-tree";
+import { createGitFilesBackend } from "../../create-git-files-backend.js";
 
 /**
  * File-based staging store implementation.
@@ -66,7 +68,11 @@ export class FileStagingStore implements Staging {
     private readonly indexPath: string,
     options: GitStagingOptions = {},
   ) {
-    this.indexFile = new IndexFile(files, indexPath, options);
+    this.indexFile = new IndexFile(files, indexPath, {
+      ...options,
+      defaultTrees:
+        options.defaultTrees ?? lazyRepositoryTrees(files, options.gitDir ?? dirOf(indexPath)),
+    });
   }
 
   // ============ Reading Operations ============
@@ -513,7 +519,25 @@ export class FileStagingStore implements Staging {
     this.updateTime = read.lastModified;
   }
 
+  /** Writes held back by `holdWrites`: one write once they are let go. */
+  private held: { pending: boolean } | undefined;
+
+  holdWrites(): () => Promise<void> {
+    if (this.held) return async () => {};
+    const held = { pending: false };
+    this.held = held;
+    return async () => {
+      if (this.held !== held) return;
+      this.held = undefined;
+      if (held.pending) await this.write();
+    };
+  }
+
   async write(): Promise<void> {
+    if (this.held) {
+      this.held.pending = true;
+      return;
+    }
     this.indexFile.version = this.version;
     // git's smudging of racily clean entries, against the index as it was read or written
     this._entries = await smudgeRacilyClean(
@@ -615,6 +639,18 @@ export class FileStagingStore implements Staging {
 
   getWriteHook(): (() => Promise<void>) | undefined {
     return this.writeHook;
+  }
+
+  setIndexHost(host: IndexHost | undefined): void {
+    this.indexFile.setHost(host);
+  }
+
+  getIndexHost(): IndexHost | undefined {
+    return this.indexFile.getHost();
+  }
+
+  indexLayout(): { split: boolean; sparse: boolean } {
+    return { split: this.indexFile.isSplit, sparse: this.indexFile.isSparse };
   }
 
   /** The index file's own mtime (0 when unknown: every entry is then racy). */
@@ -1097,4 +1133,28 @@ function isResolveConflict(
   edit: StagingEdit,
 ): edit is StagingEdit & { chooseStage: MergeStageValue } {
   return "chooseStage" in edit;
+}
+
+/** The directory of a path ("" for a bare name). */
+function dirOf(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash < 0 ? "" : path.slice(0, slash);
+}
+
+/**
+ * The trees of the repository at `gitDir`, opened on first use: what a sparse index read
+ * before a command gave the staging its host expands from.
+ */
+function lazyRepositoryTrees(files: FilesApi, gitDir: string): Pick<Trees, "load" | "store"> {
+  let opened: Promise<Trees> | undefined;
+  const trees = () => {
+    opened ??= createGitFilesBackend({ files, gitDir }).then(
+      ({ history }) => history.trees as unknown as Trees,
+    );
+    return opened;
+  };
+  return {
+    load: async (id) => (await trees()).load(id),
+    store: async (entries) => (await trees()).store(entries),
+  };
 }

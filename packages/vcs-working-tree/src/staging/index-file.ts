@@ -20,7 +20,7 @@
  * still the one it read (by its trailing checksum), so a change made by native
  * git between our read and our write is refused instead of overwritten.
  */
-import { readFile } from "@statewalker/vcs-core";
+import { readFile, type Trees } from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
@@ -32,10 +32,12 @@ import {
 } from "../status/untracked-cache.js";
 import {
   type CacheTree,
+  cacheTreeFullyValid,
   copyCacheTree,
   encodeCacheTree,
   invalidateCacheTreePath,
   parseCacheTree,
+  storeCacheTree,
 } from "./cache-tree.js";
 import {
   assertWritableIndexExtensions,
@@ -43,16 +45,138 @@ import {
   encodeResolveUndo,
   parseResolveUndo,
   type ResolveUndoRecord,
+  UnsupportedIndexExtensionError,
 } from "./index-extensions.js";
 import {
   encodeIndexFileBytes,
+  encodeIndexInOrder,
   INDEX_VERSION_2,
   type IndexEncoding,
   type IndexExtension,
   type IndexVersion,
   parseIndexFile,
+  validateIndexEntryPaths,
 } from "./index-format.js";
+import {
+  collapseSparseIndex,
+  expandSparseIndex,
+  isSparseDirectoryEntry,
+  recollapseSparseIndex,
+  SPARSE_DIRECTORIES_EXTENSION,
+} from "./sparse-index.js";
+import {
+  adoptSharedIndex,
+  classifySplitEntries,
+  freshenFile,
+  isNullIndexId,
+  mergeSplitIndex,
+  parseLinkExtension,
+  prepareSplitWrite,
+  readSharedIndex,
+  rememberSplitWrite,
+  type SharedIndex,
+  type SplitClassification,
+  sharedIndexPath,
+  tooManyNotSharedEntries,
+} from "./split-index.js";
 import type { StagingEntry } from "./types.js";
+
+/**
+ * What a write of the index follows from the repository's configuration, as git reads it
+ * when it writes (`write_locked_index`, `convert_to_sparse`). Every field may be left out.
+ */
+export interface IndexSettings {
+  /**
+   * `core.splitIndex`: true splits the index (a shared index is written), false writes it
+   * whole again; undefined (unset) keeps it as it was read.
+   */
+  splitIndex?: boolean;
+  /**
+   * `splitIndex.maxPercentChange` (default 20): a new shared index is written when more than
+   * this percentage of the entries are not in the shared one; 0 always, 100 never.
+   */
+  maxPercentChange?: number;
+  /**
+   * `splitIndex.sharedIndexExpire` as a time (seconds since the epoch): when a new shared
+   * index is written, the other shared indexes not used since are removed; 0 never removes
+   * any. Default: two weeks before now.
+   */
+  sharedIndexExpireBefore?: number;
+  /**
+   * `core.sharedRepository` as git's `git_config_perm` returns it (0 for `umask`, `0660`
+   * for `group`, `0664` for `all`, the negated mode for an octal one): the shared index's
+   * permission bits are adjusted as `adjust_shared_perm` does.
+   */
+  sharedRepository?: number;
+  /**
+   * Set when a sparse index may be written (git's `is_sparse_index_allowed`: `index.sparse`,
+   * `core.sparseCheckout`, `core.sparseCheckoutCone` and cone-shaped patterns): the patterns'
+   * `path_in_sparse_checkout`.
+   */
+  sparse?: { includes(path: string): boolean };
+  /**
+   * Whether the write follows an unpack-trees-like rebuild of the index (checkout, reset,
+   * merge): a split index then deletes the shared entry of a path whose object changed and
+   * writes the new entry whole, where an edit in place (add, refresh) writes a replacement.
+   */
+  unpackTrees?: boolean;
+  /**
+   * Paths whose entries the write removes and adds again (`git apply` edits the index so): in
+   * a split index such a path's shared entry is deleted and the new entry written whole.
+   */
+  readded?: ReadonlySet<string>;
+}
+
+/**
+ * What an index file reads from the repository around it (see `Staging.setIndexHost`).
+ *
+ * ```typescript
+ * staging.setIndexHost?.({ settings: () => ({ splitIndex: true }), trees: history.trees });
+ * ```
+ */
+export interface IndexHost {
+  /** The configuration of the next write, asked once per write */
+  settings?(): IndexSettings | Promise<IndexSettings>;
+  /** The trees a sparse index expands from (`load`) and collapses into (`store`) */
+  trees?: Pick<Trees, "load" | "store">;
+}
+
+/** A split index's state: its shared index (undefined: none yet, or a link naming none). */
+interface SplitState {
+  shared?: SharedIndex;
+  /** Split by `core.splitIndex=true` since it was read (git's `SPLIT_INDEX_ORDERED`) */
+  ordered?: boolean;
+}
+
+/** An index file's bytes as decoded: the entries in memory, full and merged. */
+interface DecodedIndex {
+  entries: StagingEntry[];
+  version: IndexVersion;
+  extensions: IndexExtension[];
+  encoding: IndexEncoding | undefined;
+  split: SplitState | undefined;
+  /** The sparse directories of a sparse index (paths with their trailing slash) */
+  sparseDirs: string[] | undefined;
+}
+
+/** What a write puts on disk, and what it does around the index file's rename. */
+interface IndexWritePlan {
+  bytes: Uint8Array;
+  checksum: Uint8Array;
+  encoding: IndexEncoding | undefined;
+  /** The extensions the instance holds once written (the full index's) */
+  extensions: IndexExtension[];
+  split: SplitState | undefined;
+  /** The sparse directories written (a sparse index) */
+  sparseDirs?: string[];
+  /** Run before the index file is in place (a new shared index written) */
+  before?: () => Promise<void>;
+  /** Run once the index file is in place */
+  after?: () => Promise<void>;
+}
+
+/** Two weeks, in seconds: git's default `splitIndex.sharedIndexExpire`. */
+const TWO_WEEKS = 14 * 24 * 60 * 60;
 
 /** `<index>.lock` exists: another process holds the index, or one crashed while holding it. */
 export class IndexLockedError extends Error {
@@ -240,20 +364,72 @@ export class IndexFile {
    */
   private checksum: string | null | undefined;
 
+  /** The split index's state; undefined for an index written whole */
+  private split: SplitState | undefined;
+  /** The entries of a split index as last read or written (what a write replaces) */
+  private lastEntries: readonly StagingEntry[] = [];
+  /** The sparse directories of the sparse index last read or written */
+  private sparseDirs: string[] | undefined;
+  /** What this file reads from the repository (`setHost`) */
+  private host: IndexHost | undefined;
+
   constructor(
     private readonly files: FilesApi,
     readonly path: string,
-    private readonly options: { lockTimeoutMs?: number } = {},
-  ) {}
+    private readonly options: {
+      lockTimeoutMs?: number;
+      gitDir?: string;
+      host?: IndexHost;
+      /** The trees used when the host gives none (a sparse index read before any host is set) */
+      defaultTrees?: Pick<Trees, "load" | "store">;
+      /** A sparse index's sparse directory entries kept as they are (read only: never written) */
+      keepSparseDirectories?: boolean;
+    } = {},
+  ) {
+    this.host = options.host;
+  }
 
   /** The checksum of the index this instance last read or wrote (`null`: none; `undefined`: never read). */
   get currentChecksum(): string | null | undefined {
     return this.checksum;
   }
 
-  /** A fresh instance over the same file (same options), for a read-modify-write of its own. */
+  /** Sets what the file reads from the repository: configuration and trees (see `IndexHost`). */
+  setHost(host: IndexHost | undefined): void {
+    this.host = host;
+  }
+
+  /** The host `setHost` set. */
+  getHost(): IndexHost | undefined {
+    return this.host;
+  }
+
+  /**
+   * Whether the configuration asks for the index file to be written again although no entry
+   * changed: `core.splitIndex` splits an index read whole, or unsplits one read split (git
+   * marks the index changed then: `SPLIT_INDEX_ORDERED`, `remove_split_index`).
+   */
+  async wantsRewrite(): Promise<boolean> {
+    if (this.refused || this.checksum === undefined || this.checksum === null) return false;
+    const settings = (await this.host?.settings?.()) ?? {};
+    if (settings.splitIndex === true) return this.split === undefined;
+    if (settings.splitIndex === false) return this.split !== undefined;
+    return false;
+  }
+
+  /** Whether the index was read (or last written) as a sparse index. */
+  get isSparse(): boolean {
+    return this.sparseDirs !== undefined;
+  }
+
+  /** Whether the index was read (or last written) as a split index. */
+  get isSplit(): boolean {
+    return this.split !== undefined;
+  }
+
+  /** A fresh instance over the same file (same options and host), for a read-modify-write of its own. */
   fresh(): IndexFile {
-    return new IndexFile(this.files, this.path, this.options);
+    return new IndexFile(this.files, this.path, { ...this.options, host: this.host });
   }
 
   /** Takes over what `other` (over the same file) last read or wrote. */
@@ -264,6 +440,292 @@ export class IndexFile {
     this.entriesKept = other.entriesKept;
     this.refused = other.refused;
     this.encoding = other.encoding;
+    this.split = other.split;
+    this.lastEntries = other.lastEntries;
+    this.sparseDirs = other.sparseDirs;
+  }
+
+  /** The repository's git directory: where shared indexes live (the index's directory by default). */
+  private get gitDir(): string {
+    if (this.options.gitDir !== undefined) return this.options.gitDir;
+    const slash = this.path.lastIndexOf("/");
+    return slash < 0 ? "" : this.path.slice(0, slash);
+  }
+
+  /**
+   * The entries and extensions of an index file's bytes, as git's `read_index_from` leaves
+   * them: a split index merged with its shared index (`merge_base_index`), a sparse index
+   * expanded (`ensure_full_index`, which needs the host's trees).
+   *
+   * @throws UnsupportedIndexExtensionError for another required extension, or a sparse index
+   *   without trees to expand it from
+   */
+  private async decode(data: Uint8Array): Promise<DecodedIndex> {
+    const parsed = await parseIndexFile(data, { keepEncoding: true });
+    let linkData: Uint8Array | undefined;
+    let sparse = false;
+    const others: IndexExtension[] = [];
+    for (const ext of parsed.extensionData) {
+      if (ext.signature === "link") linkData = ext.data;
+      else if (ext.signature === SPARSE_DIRECTORIES_EXTENSION) sparse = true;
+      else others.push(ext);
+    }
+    assertWritableIndexExtensions(others);
+    let entries = parsed.entries;
+    let encoding = parsed.encoding;
+    let split: SplitState | undefined;
+    if (linkData) {
+      const link = parseLinkExtension(linkData);
+      if (isNullIndexId(link.baseId)) {
+        split = {};
+      } else {
+        const indexDir =
+          this.path.lastIndexOf("/") < 0 ? "" : this.path.slice(0, this.path.lastIndexOf("/"));
+        const shared = await readSharedIndex(this.files, this.gitDir, link.baseId, indexDir);
+        entries = mergeSplitIndex(parsed.entries, link, shared);
+        encoding = shared.encoding;
+        split = { shared };
+      }
+    }
+    let extensions = others;
+    let sparseDirs: string[] | undefined;
+    if (sparse && this.options.keepSparseDirectories) {
+      sparseDirs = entries.filter(isSparseDirectoryEntry).map((e) => e.path);
+      for (const e of entries) if (!isSparseDirectoryEntry(e)) validateIndexEntryPaths([e]);
+      return { entries, version: parsed.version, extensions, encoding, split, sparseDirs };
+    }
+    if (sparse) {
+      const trees = this.host?.trees ?? this.options.defaultTrees;
+      if (!trees) throw new UnsupportedIndexExtensionError(SPARSE_DIRECTORIES_EXTENSION);
+      const treeExt = others.find((e) => e.signature === "TREE");
+      let cacheTree: CacheTree | undefined;
+      try {
+        cacheTree = treeExt ? parseCacheTree(treeExt.data) : undefined;
+      } catch {
+        cacheTree = undefined;
+      }
+      sparseDirs = entries.filter(isSparseDirectoryEntry).map((e) => e.path);
+      const full = await expandSparseIndex(entries, cacheTree, trees);
+      entries = full.entries;
+      extensions = others
+        .filter((e) => e.signature !== "TREE")
+        .filter((e) => e.signature !== "FSMN");
+      if (full.cacheTree) {
+        extensions = [{ signature: "TREE", data: encodeCacheTree(full.cacheTree) }, ...extensions];
+      }
+    }
+    if (linkData || sparse) validateIndexEntryPaths(entries);
+    return { entries, version: parsed.version, extensions, encoding, split, sparseDirs };
+  }
+
+  /**
+   * How `entries` go on disk with `extensions` (the full index's, `TREE` first): split
+   * against a shared index (`write_locked_index`), collapsed into a sparse index
+   * (`convert_to_sparse`), or whole.
+   */
+  private async plan(
+    entries: readonly StagingEntry[],
+    extensions: IndexExtension[],
+  ): Promise<IndexWritePlan> {
+    const settings: IndexSettings = (await this.host?.settings?.()) ?? {};
+    let split = this.split;
+    if (settings.splitIndex === false) split = undefined;
+    else if (settings.splitIndex === true && !split) split = { ordered: true };
+    if (split) return this.planSplit(entries, extensions, split, settings);
+    const sparse = await this.planSparse(entries, extensions, settings);
+    if (sparse) return sparse;
+    const { bytes, checksum, encoding } = await encodeIndexFileBytes(
+      entries,
+      this.version,
+      extensions,
+      this.encoding ? { source: this.encoding } : {},
+    );
+    return { bytes, checksum, encoding, extensions, split: undefined };
+  }
+
+  /** `write_locked_index` of a split index: a new shared index when due, then the split file. */
+  private async planSplit(
+    entries: readonly StagingEntry[],
+    extensions: IndexExtension[],
+    split: SplitState,
+    settings: IndexSettings,
+  ): Promise<IndexWritePlan> {
+    let shared = split.shared;
+    let classification: SplitClassification = shared
+      ? classifySplitEntries(
+          entries,
+          shared,
+          settings.unpackTrees === true,
+          this.lastEntries,
+          settings.readded,
+        )
+      : { matched: [], update: [], added: entries.slice() };
+    const maxPercent = settings.maxPercentChange ?? 20;
+    const newShared =
+      split.ordered === true ||
+      tooManyNotSharedEntries(entries.length, classification.added.length, maxPercent);
+    let before: (() => Promise<void>) | undefined;
+    if (newShared) {
+      const written = await encodeIndexFileBytes(
+        entries,
+        this.version,
+        [],
+        this.encoding ? { source: this.encoding } : {},
+      );
+      const id = bytesToHex(written.checksum);
+      const sortedEntries = written.encoding?.entries ?? entries.slice();
+      const fresh: SharedIndex = {
+        id,
+        entries: sortedEntries,
+        version: written.encoding?.version ?? this.version,
+        ...(written.encoding ? { encoding: written.encoding } : {}),
+      };
+      shared = fresh;
+      classification = {
+        matched: sortedEntries.slice(),
+        update: new Array(sortedEntries.length).fill(false),
+        added: [],
+      };
+      before = () => this.writeSharedIndex(written.bytes, id, settings);
+    }
+    const sharedId = shared ? shared.id : "0".repeat(40);
+    const { items, link } = prepareSplitWrite(classification, sharedId);
+    const main = await encodeIndexInOrder(items, this.version, [
+      { signature: "link", data: link },
+      ...extensions,
+    ]);
+    const finalShared = shared;
+    const finalClassification = classification;
+    return {
+      bytes: main.bytes,
+      checksum: main.checksum,
+      encoding: finalShared?.encoding,
+      extensions,
+      split: finalShared ? { shared: finalShared } : {},
+      ...(before ? { before } : {}),
+      after: async () => {
+        if (finalShared) {
+          if (newShared) adoptSharedIndex(finalShared);
+          else await freshenFile(this.files, sharedIndexPath(this.gitDir, finalShared.id));
+          rememberSplitWrite(finalClassification, finalShared.id);
+        }
+      },
+    };
+  }
+
+  /**
+   * `write_shared_index`: the shared index written as `sharedindex_XXXXXX`, its mode adjusted
+   * (`core.sharedRepository`), renamed to `sharedindex.<id>`, then the shared indexes
+   * unused since `splitIndex.sharedIndexExpire` removed (`clean_shared_index_files`).
+   */
+  private async writeSharedIndex(
+    bytes: Uint8Array,
+    id: string,
+    settings: IndexSettings,
+  ): Promise<void> {
+    const dir = this.gitDir;
+    const atomic = atomicFilesOver(this.files, "");
+    let temp = "";
+    for (let attempt = 0; ; attempt++) {
+      temp = joinPath(dir, `sharedindex_${randomSuffix()}`);
+      if (await atomic.createExclusive(temp, bytes)) break;
+      if (attempt > 100) throw new Error(`unable to create temporary file '${temp}'`);
+    }
+    try {
+      await adjustSharedPerm(this.files, temp, settings.sharedRepository ?? 0);
+      await atomic.replace(temp, sharedIndexPath(dir, id));
+    } catch (error) {
+      await atomic.remove(temp).catch(() => {});
+      throw error;
+    }
+    const expire = settings.sharedIndexExpireBefore ?? Math.floor(Date.now() / 1000) - TWO_WEEKS;
+    if (expire === 0) return;
+    for await (const info of this.files.list(dir)) {
+      const name = info.name ?? info.path.slice(info.path.lastIndexOf("/") + 1);
+      if (!name.startsWith("sharedindex.") || name === `sharedindex.${id}`) continue;
+      const path = joinPath(dir, name);
+      const stats = await this.files.stats(path).catch(() => undefined);
+      if (!stats) continue;
+      if (Math.floor((stats.lastModified ?? 0) / 1000) > expire) continue;
+      await this.files.remove(path).catch(() => {});
+    }
+  }
+
+  /** `convert_to_sparse` before a write: the sparse index's bytes, or undefined to write it whole. */
+  private async planSparse(
+    entries: readonly StagingEntry[],
+    extensions: IndexExtension[],
+    settings: IndexSettings,
+  ): Promise<IndexWritePlan | undefined> {
+    const patterns = settings.sparse;
+    const trees = this.host?.trees ?? this.options.defaultTrees;
+    if (!patterns || !trees || entries.length === 0) return undefined;
+    if (entries.some((e) => e.stage !== 0)) return undefined;
+    const treeExt = extensions.find((e) => e.signature === "TREE");
+    let tree: CacheTree | undefined;
+    try {
+      tree = treeExt ? parseCacheTree(treeExt.data) : undefined;
+    } catch {
+      tree = undefined;
+    }
+    const rest = extensions.filter((e) => e.signature !== "TREE" && e.signature !== "FSMN");
+    if (this.sparseDirs && this.sparseDirs.length > 0) {
+      // read sparse: kept collapsed where it still can be, as git's sparse-aware commands
+      const kept = await recollapseSparseIndex(
+        entries,
+        tree,
+        this.sparseDirs,
+        (path) => patterns.includes(path),
+        async (below) => {
+          const t = await storeCacheTree((list) => trees.store(list), below);
+          return t?.id ?? (await trees.store([]));
+        },
+      );
+      if (kept) return this.sparsePlan(kept.entries, kept.cacheTree, tree, rest);
+    }
+    if (!tree || !cacheTreeFullyValid(tree)) {
+      try {
+        tree = await storeCacheTree((list) => trees.store(list), entries);
+      } catch {
+        return undefined;
+      }
+      if (!tree) return undefined;
+    }
+    const collapsed = collapseSparseIndex(entries, tree, (path) => patterns.includes(path));
+    return this.sparsePlan(collapsed.entries, collapsed.cacheTree, tree, rest);
+  }
+
+  /** The bytes of a sparse index: its entries, its cache-tree, the other extensions, `sdir`. */
+  private async sparsePlan(
+    sparseEntries: StagingEntry[],
+    sparseTree: CacheTree | undefined,
+    fullTree: CacheTree | undefined,
+    rest: IndexExtension[],
+  ): Promise<IndexWritePlan> {
+    const onDisk: IndexExtension[] = [
+      ...(sparseTree ? [{ signature: "TREE", data: encodeCacheTree(sparseTree) }] : []),
+      ...rest,
+      { signature: SPARSE_DIRECTORIES_EXTENSION, data: new Uint8Array(0) },
+    ];
+    const { bytes, checksum, encoding } = await encodeIndexFileBytes(
+      sparseEntries,
+      this.version,
+      onDisk,
+      { ...(this.encoding ? { source: this.encoding } : {}), sparseDirectories: true },
+    );
+    // in memory the index stays full, with the full index's cache-tree
+    const kept: IndexExtension[] = [
+      ...(fullTree ? [{ signature: "TREE", data: encodeCacheTree(fullTree) }] : []),
+      ...rest,
+    ];
+    return {
+      bytes,
+      checksum,
+      encoding,
+      extensions: kept,
+      split: undefined,
+      sparseDirs: sparseEntries.filter(isSparseDirectoryEntry).map((e) => e.path),
+    };
   }
 
   /**
@@ -285,28 +747,40 @@ export class IndexFile {
       this.extensions = [];
       this.entriesKept = undefined;
       this.refused = undefined;
+      this.split = undefined;
+      this.lastEntries = [];
+      this.sparseDirs = undefined;
       this.checksum = null;
       return undefined;
     }
     const data = await readFile(this.files, this.path);
     // the entries keep these bytes as their encoding for the next write; nothing changes
     // file content in place (an in-memory FilesApi may hand back its stored array itself)
-    const parsed = await parseIndexFile(data, { keepEncoding: true });
-    this.encoding = parsed.encoding;
+    let decoded: DecodedIndex;
     try {
-      assertWritableIndexExtensions(parsed.extensionData);
+      decoded = await this.decode(data);
       this.refused = undefined;
     } catch (error) {
       // do not let a later write replace an index we could not read
+      this.encoding = undefined;
       this.refused = error as Error;
       throw error;
     }
+    this.encoding = decoded.encoding;
+    this.split = decoded.split;
+    this.lastEntries = decoded.split ? decoded.entries.slice() : [];
+    this.sparseDirs = decoded.sparseDirs;
     this.checksum = bytesToHex(data.subarray(Math.max(0, data.length - INDEX_CHECKSUM_SIZE)));
-    this.version = parsed.version;
-    this.extensions = parsed.extensionData;
-    this.entriesKept = this.extensions.length > 0 ? parsed.entries.slice() : undefined;
+    this.version = decoded.version;
+    this.extensions = decoded.extensions;
+    this.entriesKept = this.extensions.length > 0 ? decoded.entries.slice() : undefined;
     // the index file's own mtime; unknown is 0 (every entry racy), never "now"
-    return { entries: parsed.entries, lastModified: stats.lastModified ?? 0 };
+    return { entries: decoded.entries, lastModified: stats.lastModified ?? 0 };
+  }
+
+  /** The extensions read with the index or last written with it (`link` and `sdir` aside). */
+  currentExtensions(): readonly IndexExtension[] {
+    return this.extensions;
   }
 
   /**
@@ -488,19 +962,33 @@ export class IndexFile {
   async write(entries: readonly StagingEntry[]): Promise<void> {
     if (this.refused) throw this.refused;
     const prepared = this.prepareWrite(entries);
-    let encoding: IndexEncoding | undefined;
-    this.checksum = await writeIndexFile(this.files, this.path, entries, {
-      version: this.version,
-      extensions: prepared.extensions,
-      lockTimeoutMs: this.options.lockTimeoutMs,
-      expectedChecksum: this.checksum,
-      ...(this.encoding ? { source: this.encoding } : {}),
-      onEncoding: (written) => {
-        encoding = written;
-      },
-    });
-    this.encoding = encoding;
-    this.wrote(entries, prepared.extensions);
+    const plan = await this.plan(entries, prepared.extensions);
+    // the lock is created holding the new index: one exclusive create, then one rename
+    const lockPath = `${this.path}.lock`;
+    const atomic = atomicFilesOver(this.files, "");
+    const deadline = Date.now() + (this.options.lockTimeoutMs ?? 0);
+    while (!(await atomic.createExclusive(lockPath, plan.bytes))) {
+      if (Date.now() >= deadline) throw new IndexLockedError(lockPath);
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+    }
+    try {
+      if (this.checksum !== undefined) {
+        const current = await readIndexChecksum(this.files, this.path);
+        if (current !== this.checksum) throw new IndexChangedError(this.path);
+      }
+      await plan.before?.();
+      await atomic.replace(lockPath, this.path);
+    } catch (error) {
+      await atomic.remove(lockPath).catch(() => {});
+      throw error;
+    }
+    await plan.after?.();
+    this.checksum = bytesToHex(plan.checksum);
+    this.encoding = plan.encoding;
+    this.split = plan.split;
+    this.lastEntries = plan.split ? entries.slice() : [];
+    this.sparseDirs = plan.sparseDirs;
+    this.wrote(entries, plan.extensions);
   }
 
   /**
@@ -535,6 +1023,9 @@ export class IndexFile {
           extensions: IndexExtension[];
           checksum: string;
           encoding: IndexEncoding | undefined;
+          split: SplitState | undefined;
+          sparseDirs?: string[];
+          after?: () => Promise<void>;
         }
       | undefined;
     const release = async () => {
@@ -555,18 +1046,18 @@ export class IndexFile {
       write: async (entries) => {
         if (state !== "held") throw new Error(`'${lockPath}' is no longer held`);
         const prepared = this.prepareWrite(entries);
-        const { bytes, checksum, encoding } = await encodeIndexFileBytes(
-          entries,
-          this.version,
-          prepared.extensions,
-          this.encoding ? { source: this.encoding } : {},
-        );
-        await atomic.write(lockPath, bytes);
+        const plan = await this.plan(entries, prepared.extensions);
+        // git writes the shared index while it writes the index into its lock
+        await plan.before?.();
+        await atomic.write(lockPath, plan.bytes);
         pending = {
           entries: entries.slice(),
-          extensions: prepared.extensions,
-          checksum: bytesToHex(checksum),
-          encoding,
+          extensions: plan.extensions,
+          checksum: bytesToHex(plan.checksum),
+          encoding: plan.encoding,
+          split: plan.split,
+          sparseDirs: plan.sparseDirs,
+          after: plan.after,
         };
       },
       commit: async () => {
@@ -583,8 +1074,12 @@ export class IndexFile {
           throw error;
         }
         state = "done";
+        await pending.after?.();
         this.checksum = pending.checksum;
         this.encoding = pending.encoding;
+        this.split = pending.split;
+        this.lastEntries = pending.split ? pending.entries.slice() : [];
+        this.sparseDirs = pending.sparseDirs;
         this.wrote(pending.entries, pending.extensions);
       },
       rollback: async () => {
@@ -593,8 +1088,7 @@ export class IndexFile {
       reread: async () => {
         if (state !== "held") throw new Error(`'${lockPath}' is no longer held`);
         const data = await readFile(this.files, lockPath);
-        const parsed = await parseIndexFile(data, { keepEncoding: true });
-        assertWritableIndexExtensions(parsed.extensionData);
+        const parsed = await this.decode(data);
         const stats = await this.files.stats(lockPath);
         // what was read stands for what the lock holds: the next write carries its
         // extensions, and a commit renames it over the index as it is
@@ -605,13 +1099,18 @@ export class IndexFile {
         this.pendingUntrackedEntries = undefined;
         this.version = parsed.version;
         this.encoding = parsed.encoding;
-        this.extensions = parsed.extensionData;
+        this.extensions = parsed.extensions;
+        this.split = parsed.split;
+        this.lastEntries = parsed.split ? parsed.entries.slice() : [];
+        this.sparseDirs = parsed.sparseDirs;
         this.entriesKept = this.extensions.length > 0 ? parsed.entries.slice() : undefined;
         pending = {
           entries: parsed.entries.slice(),
-          extensions: parsed.extensionData,
+          extensions: parsed.extensions,
           checksum: bytesToHex(data.subarray(Math.max(0, data.length - INDEX_CHECKSUM_SIZE))),
           encoding: parsed.encoding,
+          split: parsed.split,
+          sparseDirs: parsed.sparseDirs,
         };
         return { entries: parsed.entries, lastModified: stats?.lastModified ?? 0 };
       },
@@ -864,4 +1363,101 @@ function invalidateAddedOrRemoved(
     last = path;
     invalidateUntrackedPath(cache, path);
   }
+}
+
+/** Six random characters for a temporary file's name (git's `mkstemp` template). */
+function randomSuffix(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = new Uint8Array(6);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (const b of bytes) out += chars[b % chars.length];
+  return out;
+}
+
+/**
+ * git's `adjust_shared_perm` of a file under `core.sharedRepository` (`shared`, as
+ * `git_config_perm` returns it; 0 leaves the mode alone): the file's permission bits widened
+ * (or, for an octal value, replaced) as `calc_shared_perm` computes them. Nothing where the
+ * FilesApi keeps no modes.
+ */
+export async function adjustSharedPerm(
+  files: FilesApi,
+  path: string,
+  shared: number,
+): Promise<void> {
+  if (!shared) return;
+  const posix = files as FilesApi & {
+    lstat?(path: string): Promise<{ mode?: number } | undefined>;
+    chmod?(path: string, mode: number): Promise<void>;
+  };
+  if (!posix.lstat || !posix.chmod) return;
+  const mode = (await posix.lstat(path))?.mode;
+  if (mode === undefined) return;
+  const next = calcSharedPerm(mode & 0o7777, shared);
+  if (((mode ^ next) & 0o7777) !== 0) await posix.chmod(path, next & 0o7777);
+}
+
+/** git's `calc_shared_perm` of a file's mode. */
+export function calcSharedPerm(mode: number, shared: number): number {
+  let tweak = shared < 0 ? -shared : shared;
+  if (!(mode & 0o200)) tweak &= ~0o222;
+  if (mode & 0o100) tweak |= (tweak & 0o444) >> 2;
+  return shared < 0 ? (mode & ~0o777) | tweak : mode | tweak;
+}
+
+/**
+ * git's `git_config_perm` of a `core.sharedRepository` value: 0 for `umask` (or false),
+ * `0660` for `group` (or true), `0664` for `all`/`world`/`everybody`, the negated masked mode
+ * for an octal one (`0640` gives `-0640`).
+ *
+ * @throws Error for an octal mode that leaves the owner without read and write
+ */
+export function parseSharedRepository(value: string | undefined): number {
+  if (value === undefined) return 0;
+  if (value === "umask") return 0;
+  if (value === "group") return 0o660;
+  if (value === "all" || value === "world" || value === "everybody") return 0o664;
+  if (/^[0-7]+$/.test(value)) {
+    const i = Number.parseInt(value, 8);
+    if (i === 0) return 0;
+    if (i === 1) return 0o660;
+    if (i === 2) return 0o664;
+    if ((i & 0o600) !== 0o600) {
+      throw new Error(
+        `problem with core.sharedRepository filemode value (0${(i & 0o777).toString(8).padStart(3, "0")}).\n` +
+          "The owner of files must always have read and write permissions.",
+      );
+    }
+    return -(i & 0o666);
+  }
+  const lower = value.toLowerCase();
+  if (["true", "yes", "on"].includes(lower)) return 0o660;
+  return 0;
+}
+
+/**
+ * The entries and extensions of the index file at `indexPath` as git reads them: a split
+ * index merged with its shared index (looked up in `gitDir`, default the index's directory),
+ * a sparse index expanded from `trees`, or, without trees, with its sparse directory entries
+ * as they are (mode 040000, a tree's id). Undefined when there is no index file.
+ *
+ * ```typescript
+ * const index = await readIndexFileEntries(files, ".git/index", { gitDir: ".git" });
+ * ```
+ *
+ * @throws UnsupportedIndexExtensionError for another required extension
+ */
+export async function readIndexFileEntries(
+  files: FilesApi,
+  indexPath: string,
+  options: { gitDir?: string; trees?: Pick<Trees, "load" | "store"> } = {},
+): Promise<{ entries: StagingEntry[]; extensions: readonly IndexExtension[] } | undefined> {
+  const file = new IndexFile(files, indexPath, {
+    ...(options.gitDir !== undefined ? { gitDir: options.gitDir } : {}),
+    ...(options.trees ? { defaultTrees: options.trees } : { keepSparseDirectories: true }),
+  });
+  const read = await file.read();
+  if (!read) return undefined;
+  return { entries: read.entries, extensions: file.currentExtensions() };
 }

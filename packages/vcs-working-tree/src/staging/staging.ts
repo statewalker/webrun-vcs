@@ -11,6 +11,7 @@ import type { ObjectId, Trees } from "@statewalker/vcs-core";
 import type { UntrackedCache } from "../status/untracked-cache.js";
 import type { CacheTree } from "./cache-tree.js";
 import type { ResolveUndoRecord } from "./index-extensions.js";
+import type { IndexHost } from "./index-file.js";
 import type { IndexStatUpdate, RacyCheck } from "./stat-refresh.js";
 import type { MergeStageValue, StagingEntry, StagingEntryOptions } from "./types.js";
 
@@ -340,6 +341,33 @@ export interface Staging {
 
   /** The hook {@link setWriteHook} installed, if any. */
   getWriteHook?(): (() => Promise<void>) | undefined;
+
+  /**
+   * Gives an index file what git reads from the repository around it: the configuration a
+   * write follows (`core.splitIndex`, `splitIndex.*`, `index.sparse` with the cone patterns,
+   * `core.sharedRepository`) and the trees a sparse index expands from and collapses into.
+   * Without one a split index stays split and nothing else changes, and a sparse index
+   * cannot be read. Absent: a staging with no index file.
+   */
+  setIndexHost?(host: IndexHost | undefined): void;
+
+  /** The host {@link setIndexHost} installed, if any. */
+  getIndexHost?(): IndexHost | undefined;
+
+  /**
+   * How the index file was last read or written: split (`link`), sparse (`sdir`). The entries
+   * are always held merged and expanded. Absent: a staging with no index file.
+   */
+  indexLayout?(): { split: boolean; sparse: boolean };
+
+  /**
+   * Holds back `write()` until the returned function is called, which then writes once if
+   * any write was asked meanwhile: a command that writes the index several times where git
+   * writes it once (a reset writes the entries, then their new stat data) leaves the index
+   * file, and a split index's shared index, as git's one write does. Absent: a staging with
+   * no index file.
+   */
+  holdWrites?(): () => Promise<void>;
 
   /**
    * Clear all entries

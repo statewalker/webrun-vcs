@@ -17,6 +17,7 @@ import {
 
 import { GitCommand } from "../../git-command.js";
 import { coreBool, worktreeModeTrust } from "../core-config.js";
+import { markReaddedEntries } from "../index-host.js";
 import { configValue, conflictStyleOf } from "../merge-config.js";
 import { type IndexEntryInput, rewriteIndex } from "../merge-support.js";
 import { strerror } from "../strerror.js";
@@ -522,7 +523,8 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
         );
       }
       // apply.c writes the index it read without refreshing it: the racily clean entries it
-      // keeps are smudged by the write
+      // keeps are smudged by the write; each path it touches is removed and added again
+      markReaddedEntries(staging, changes.keys());
       await rewriteIndex(staging, changes, { upToDate: false });
     }
     return {

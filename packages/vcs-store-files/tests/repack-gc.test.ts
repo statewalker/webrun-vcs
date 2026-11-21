@@ -3,7 +3,6 @@
  * reachable, `.keep` packs honoured, loose-only mode, the prune grace period, install before
  * remove, and bounded memory for a large blob.
  */
-import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +15,7 @@ import {
   writePack,
 } from "@statewalker/vcs-core";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
-import { serializeIndexFile } from "@statewalker/vcs-working-tree";
+import { Ewah, encodeLinkExtension, serializeIndexFile } from "@statewalker/vcs-working-tree";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   createGitFilesBackend,
@@ -818,39 +817,38 @@ describe("P2.6 second review: the gc lock holds a token", () => {
   });
 });
 
-describe("P2.6 second review: a split index is refused", () => {
-  /** An index with a `link` extension (split index): its entries live in a shared index too. */
-  async function splitIndex(objectId: ObjectId) {
-    const base = await serializeIndexFile([
+describe("P2.6 second review: a split index is read with its shared index", () => {
+  /**
+   * A split index (a `link` extension, no entries of its own) and its shared index holding
+   * the one entry: the staged object is known only through the shared index.
+   */
+  async function splitIndex(
+    files: { write(p: string, c: Uint8Array[]): Promise<void> },
+    objectId: ObjectId,
+  ) {
+    const shared = await serializeIndexFile([
       { path: "s.txt", mode: 0o100644, objectId, stage: 0, size: 6, mtime: 0 },
     ]);
-    const body = base.subarray(0, base.length - 20);
-    const ext = new Uint8Array(8 + 20);
-    ext.set(enc.encode("link"), 0);
-    new DataView(ext.buffer).setUint32(4, 20);
-    const content = Buffer.concat([body, ext]);
-    return Buffer.concat([content, createHash("sha1").update(content).digest()]);
+    const sharedId = Buffer.from(shared.subarray(shared.length - 20)).toString("hex");
+    await files.write(`.git/sharedindex.${sharedId}`, [shared]);
+    const empty = new Ewah();
+    return serializeIndexFile([], 2, [
+      { signature: "link", data: encodeLinkExtension(sharedId, empty, new Ewah()) },
+    ]);
   }
 
-  it("gc and repack throw before changing anything", async () => {
+  it("gc and repack keep the objects the shared index names", async () => {
     const b = await open();
     await commit(b, "main", "a.txt", "main\n");
     await repack({ ...b, all: false });
     await commit(b, "main", "b.txt", "loose\n");
     const staged = await b.history.blobs.store([enc.encode("staged\n")]);
-    await b.files.write(".git/index", [await splitIndex(staged)]);
-    const before = {
-      packs: await packNames(b.files, ".pack"),
-      loose: await b.looseStorage.has(staged),
-    };
+    await b.files.write(".git/index", [await splitIndex(b.files, staged)]);
 
-    await expect(gc({ history: b.history, files: b.files, pruneExpireMs: 0 })).rejects.toThrow(
-      /split index/,
-    );
-    await expect(repack(b)).rejects.toThrow(/split index/);
-
-    expect(await packNames(b.files, ".pack")).toEqual(before.packs);
-    expect(await b.looseStorage.has(staged)).toBe(before.loose);
+    await gc({ history: b.history, files: b.files, pruneExpireMs: 0 });
+    expect(await b.history.blobs.has(staged)).toBe(true);
+    await repack(b);
+    expect(await b.history.blobs.has(staged)).toBe(true);
     expect(await b.files.exists(".git/gc.pid")).toBe(false);
   });
 });

@@ -59,6 +59,7 @@ import {
   resolveIdentDate,
   withoutCrud,
 } from "./commands/git-ident.js";
+import { indexHostOf } from "./commands/index-host.js";
 import type { NotesContext } from "./commands/notes-support.js";
 import { postIndexChangeHookOf } from "./commands/post-index-change.js";
 import { reflogLine } from "./commands/reflog-messages.js";
@@ -968,12 +969,24 @@ export abstract class GitCommand<T> {
    * lock is held) or after `body` when it wrote (`last`: a reset that writes the index
    * again after updating the worktree), with every flag marked meanwhile.
    */
-  protected async withOneIndexWrite<T>(at: "first" | "last", body: () => Promise<T>): Promise<T> {
+  protected async withOneIndexWrite<T>(
+    at: "first" | "last",
+    body: () => Promise<T>,
+    options: { holdWrites?: boolean } = {},
+  ): Promise<T> {
     if (this.indexWriteScope) return body();
     const scope = { at, written: false };
     this.indexWriteScope = scope;
+    // `holdWrites`: the writes before the last one are held back, the index written once at
+    // the end (a body that reads the index back between its writes must not hold them)
+    const release = options.holdWrites ? this.staging.holdWrites?.() : undefined;
     try {
-      return await body();
+      const result = await body();
+      await release?.();
+      return result;
+    } catch (error) {
+      await release?.();
+      throw error;
     } finally {
       this.indexWriteScope = undefined;
       if (at === "last" && scope.written) await this.indexWriteRun?.();
@@ -1017,7 +1030,20 @@ export abstract class GitCommand<T> {
       this.installRacyCheck(staging);
     }
     this.installIndexWriteHook(staging);
+    this.installIndexHost(staging);
     return staging;
+  }
+
+  /**
+   * Gives the staging what its index file reads from the repository (`indexHostOf`: the
+   * split and sparse index settings, the trees), once: a host already there stays (the
+   * sparse-checkout command installs its own while it writes new patterns).
+   */
+  private installIndexHost(staging: Staging): void {
+    if (!staging.setIndexHost || staging.getIndexHost?.() !== undefined) return;
+    staging.setIndexHost(
+      indexHostOf(this._workingCopy, staging, () => this.historyOf().trees as unknown as Trees),
+    );
   }
 
   /**
