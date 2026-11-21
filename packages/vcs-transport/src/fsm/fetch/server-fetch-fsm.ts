@@ -413,9 +413,13 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
               }
               break;
             case "REACHABLE_COMMIT_TIP":
-              // Reachable from any ref tip
+              // Reachable from any ref tip (a shallow repository's grafted view withholds
+              // isReachableFromAnyTip: its graph is walked from the ref store's tips)
               if (repository.isReachableFromAnyTip) {
                 valid = await repository.isReachableFromAnyTip(oid);
+              } else if (repository.getCommitInfo) {
+                const tips = [...(await refStore.listAll())].map(([, id]) => id);
+                valid = !(await findUnreachableWant(repository, [oid], tips));
               } else {
                 valid = [...state.refs.values()].includes(oid);
               }

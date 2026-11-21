@@ -35,8 +35,14 @@ const SERVED_SHALLOW = Symbol("servedShallow");
 /**
  * The repository as upload-pack walks it when it is shallow itself (git reads its
  * `.git/shallow` as grafts without parents, `register_shallow`): `shallow`'s commits have no
- * parents in `getCommitInfo` and `walkAncestors`, and every pack stops at them. The same
- * repository when `shallow` is empty (or it is wrapped already).
+ * parents in `getCommitInfo`, `walkAncestors` and `isReachableFrom` (so a want below the
+ * boundary is refused, as git's reachability checks walk the grafted history), every pack
+ * stops at them, and `isReachableFromAnyTip` is withheld (callers walk the grafted graph from
+ * the ref store's tips instead). The same repository when `shallow` is empty (or it is
+ * wrapped already).
+ *
+ * @throws UploadPackRequestError when the repository is shallow and has no commit graph
+ * (`getCommitInfo`): its history could not be cut at the shallow commits
  *
  * @example
  * ```ts
@@ -51,42 +57,42 @@ export function withServedShallow(
     return repository;
   }
   const getCommitInfo = repository.getCommitInfo?.bind(repository);
+  if (!getCommitInfo) {
+    throw new UploadPackRequestError("serving a shallow repository is not supported");
+  }
+  const grafted: NonNullable<RepositoryFacade["getCommitInfo"]> = async (oid, options) => {
+    const info = await getCommitInfo(oid, options);
+    return info && shallow.has(oid) ? { ...info, parents: [] } : info;
+  };
   const overrides: Partial<RepositoryFacade> & { [SERVED_SHALLOW]: true } = {
     [SERVED_SHALLOW]: true,
-    ...(getCommitInfo
-      ? {
-          getCommitInfo: async (oid, options) => {
-            const info = await getCommitInfo(oid, options);
-            return info && shallow.has(oid) ? { ...info, parents: [] } : info;
-          },
-        }
-      : {}),
+    getCommitInfo: grafted,
     walkAncestors: async function* (start: string) {
-      if (!getCommitInfo) {
-        // without the graph, the facade's own walk cut at the shallow commits' parents
-        const cut = new Set<string>();
-        for await (const oid of repository.walkAncestors(start)) {
-          if (cut.has(oid)) continue;
-          yield oid;
-          if (shallow.has(oid)) {
-            const info = await repository.getCommitInfo?.(oid);
-            for (const parent of info?.parents ?? []) cut.add(parent);
-          }
-        }
-        return;
-      }
       const seen = new Set<string>();
       const stack = [start];
       while (stack.length > 0) {
         const oid = stack.pop() as string;
         if (seen.has(oid)) continue;
         seen.add(oid);
-        const info = await getCommitInfo(oid);
+        const info = await grafted(oid);
         if (!info) continue;
         yield oid;
-        if (!shallow.has(oid)) stack.push(...info.parents);
+        stack.push(...info.parents);
       }
     },
+    isReachableFrom: async (oid: string, from: string | string[]) => {
+      const seen = new Set<string>();
+      const stack = Array.isArray(from) ? [...from] : [from];
+      while (stack.length > 0) {
+        const c = stack.pop() as string;
+        if (c === oid) return true;
+        if (seen.has(c)) continue;
+        seen.add(c);
+        stack.push(...((await grafted(c))?.parents ?? []));
+      }
+      return false;
+    },
+    isReachableFromAnyTip: undefined,
     exportPack: (wants, exclude, options) =>
       repository.exportPack(wants, exclude, {
         ...options,

@@ -615,10 +615,13 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         }
         // ...where a request that deepens nothing walks the whole history from the wants
         // (deepen(INFINITE_DEPTH)): the shallow commits it reaches are the client's too
-        const depth =
-          req.deepen === 0 && !byRevList && repositoryShallow.size > 0
-            ? INFINITE_DEPTH
-            : req.deepen;
+        const infiniteForShallow = req.deepen === 0 && !byRevList && repositoryShallow.size > 0;
+        const depth = infiniteForShallow ? INFINITE_DEPTH : req.deepen;
+        // ...after send_shallow_list registered the client's shallow commits as grafts too:
+        // the walk stops there and unshallows nothing
+        const grafts = infiniteForShallow
+          ? new Set([...repositoryShallow, ...req.shallow])
+          : repositoryShallow;
 
         let update: ShallowUpdate;
         try {
@@ -640,7 +643,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
             deepenSince: req.deepenSince,
             deepenNot,
             tips: [...(await ctx.refStore.listAll())].map(([, oid]) => oid),
-            serverShallow: repositoryShallow,
+            serverShallow: grafts,
           });
         } catch (e) {
           if (!(e instanceof UploadPackRequestError)) throw e;

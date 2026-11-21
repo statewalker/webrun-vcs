@@ -768,11 +768,13 @@ async function shallowInfoOf(
 /**
  * fetch-pack's update_shallow for a shallow server's commits once the pack is in: a clone
  * records those the pack brought; otherwise, of those not here before, the ones the pack
- * brought count (remove_nonexistent_theirs_shallow), and with `updateShallow` they and the
- * ones here before are recorded, else each sought ref whose new history needs one is rejected
- * (assign_shallow_commits_to_refs: walking down from the ref, stopping at the local refs' tips
- * and at those commits, it reaches one not here before, or one here before that no local ref
- * reaches). Returns the shallow file to write and the rejected refs.
+ * brought count (remove_nonexistent_theirs_shallow), and the sought refs are painted down
+ * (assign_shallow_commits_to_refs: walking down from each ref, stopping at the local refs'
+ * tips and at those commits). A commit counts when a ref paints it and it was not here
+ * before, or it was here before and no local ref reaches it (post_assign_shallow). With
+ * `updateShallow` only the commits that count are recorded (none: the file stays), else
+ * each sought ref that paints one is rejected. Returns the shallow file to write and the
+ * rejected refs.
  */
 async function updateServerShallow(
   info: ServerShallowInfo,
@@ -805,12 +807,35 @@ async function updateServerShallow(
   const theirs: string[] = [];
   for (const oid of info.theirs) if (await repository.has(oid)) theirs.push(oid);
   if (info.ours.length === 0 && theirs.length === 0) return unchanged;
-  if (context.updateShallow) return record([...info.ours, ...theirs]);
 
-  const getCommitInfo = repository.getCommitInfo?.bind(repository);
+  const assigned = await assignShallowToRefs(repository, refStore, context.shallow, {
+    ours: info.ours,
+    theirs,
+    sought: context.sought,
+  });
   // without the commit graph nothing can be checked: every sought ref is refused
-  if (!getCommitInfo) return { shallow: context.shallow, rejected: [...context.sought] };
-  const own = new Set(context.shallow);
+  if (!assigned) return { shallow: context.shallow, rejected: [...context.sought] };
+  if (!context.updateShallow) return { shallow: context.shallow, rejected: assigned.rejected };
+  const kept = [...assigned.ours, ...assigned.theirs];
+  return kept.length > 0 ? record(kept) : unchanged;
+}
+
+/**
+ * shallow.c's assign_shallow_commits_to_refs with post_assign_shallow: paints the shallow
+ * server's commits from the sought refs' new tips (stopping at the local refs' tips and at
+ * those commits), keeps the painted `theirs` and the painted `ours` no local ref reaches
+ * (in_merge_bases_many), and names the refs painting a kept one. Undefined without the
+ * commit graph.
+ */
+async function assignShallowToRefs(
+  repository: RepositoryFacade,
+  refStore: RefStore,
+  ownShallow: readonly string[],
+  input: { ours: readonly string[]; theirs: readonly string[]; sought: readonly PlannedRef[] },
+): Promise<{ ours: string[]; theirs: string[]; rejected: PlannedRef[] } | undefined> {
+  const getCommitInfo = repository.getCommitInfo?.bind(repository);
+  if (!getCommitInfo) return undefined;
+  const own = new Set(ownShallow);
   const parentsOf = async (oid: string) =>
     own.has(oid) ? [] : ((await getCommitInfo(oid))?.parents ?? []);
   const peel = async (oid: string) => {
@@ -827,8 +852,8 @@ async function updateServerShallow(
     const commit = await peel(oid);
     if (commit) localTips.add(commit);
   }
-  const oursSet = new Set(info.ours);
-  const theirsSet = new Set(theirs);
+  const oursSet = new Set(input.ours);
+  const theirsSet = new Set(input.theirs);
   // the commits the local refs reach (in_merge_bases_many), walked once when first needed
   let reachable: Set<string> | undefined;
   const reachedLocally = async (oid: string) => {
@@ -844,22 +869,34 @@ async function updateServerShallow(
     }
     return reachable.has(oid);
   };
+  const keptOurs = new Set<string>();
+  const keptTheirs = new Set<string>();
   const rejected: PlannedRef[] = [];
-  for (const ref of context.sought) {
+  for (const ref of input.sought) {
     const tip = await peel(ref.oid);
     if (!tip) continue;
     let needs = false;
     const seen = new Set<string>();
     const stack = [tip];
-    while (stack.length > 0 && !needs) {
+    while (stack.length > 0) {
       const c = stack.pop() as string;
       if (seen.has(c) || localTips.has(c)) continue;
       seen.add(c);
-      if (theirsSet.has(c)) needs = true;
-      else if (oursSet.has(c)) needs = !(await reachedLocally(c));
-      else stack.push(...(await parentsOf(c)));
+      if (theirsSet.has(c)) {
+        keptTheirs.add(c);
+        needs = true;
+      } else if (oursSet.has(c)) {
+        if (!(await reachedLocally(c))) {
+          keptOurs.add(c);
+          needs = true;
+        }
+      } else stack.push(...(await parentsOf(c)));
     }
     if (needs) rejected.push(ref);
   }
-  return { shallow: context.shallow, rejected };
+  return {
+    ours: input.ours.filter((oid) => keptOurs.has(oid)),
+    theirs: input.theirs.filter((oid) => keptTheirs.has(oid)),
+    rejected,
+  };
 }

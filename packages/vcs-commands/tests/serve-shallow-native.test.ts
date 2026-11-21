@@ -327,4 +327,132 @@ describeGit("serving a shallow repository, as native git", () => {
       });
     }
   }
+
+  /** A shallow server `srv/<name>`: a `--depth 2` clone of full, `extra` commits added. */
+  let shalSerial = 0;
+  function shallowServer(extra: number): string {
+    const name = `shal-x${shalSerial++}`;
+    const dir = join(srv, name);
+    git(root, "clone", "-q", "--no-local", "--depth", "2", join(root, "full"), dir);
+    git(dir, "config", "uploadpack.allowfilter", "false");
+    for (let k = 0; k < extra; k++) addCommit(dir, `x${k}`);
+    return name;
+  }
+  function addCommit(dir: string, text: string) {
+    putFile(dir, "g.txt", `${text}\n`);
+    git(dir, "add", "g.txt");
+    gitOut(root, dir, ["commit", "-qm", text], {
+      GIT_AUTHOR_DATE: "1700000100 +0000",
+      GIT_COMMITTER_DATE: "1700000100 +0000",
+    });
+  }
+  /** A native clone `name-<n>` of `source` for our side to open. */
+  async function oursCloneOf(name: string, source: string, version: "0" | "2") {
+    const dir = join(root, `${name}-${counter++}`);
+    git(root, "clone", "-q", "--no-local", source, dir);
+    git(dir, "config", "protocol.version", version);
+    const ours = await openOurs(
+      root,
+      createNodeGitHostEnvironment({ env: testEnv(root) }),
+      undefined,
+      dir.slice(root.length + 1),
+    );
+    return { dir, ours };
+  }
+
+  for (const version of ["0", "2"] as const) {
+    it(`fetch --update-shallow (v${version}) into a complete clone records no shallow commit it has the history of`, async () => {
+      const shal = join(srv, shallowServer(1));
+      const native = join(root, `us-native-${counter++}`);
+      git(root, "clone", "-q", "--no-local", join(root, "full"), native);
+      const r = gitRun(root, native, [
+        "-c",
+        `protocol.version=${version}`,
+        "fetch",
+        "-q",
+        "--update-shallow",
+        shal,
+        "main:refs/x",
+      ]);
+      expect(r.status, r.stderr).toBe(0);
+      expect(existsSync(join(native, ".git/shallow"))).toBe(false);
+      const { dir, ours } = await oursCloneOf("us-ours", join(root, "full"), version);
+      await ours.fetch().setRemote(shal).setRefSpecs("main:refs/x").setUpdateShallow(true).call();
+      expect(existsSync(join(dir, ".git/shallow"))).toBe(false);
+      expect(stateOf(dir)).toEqual(stateOf(native));
+      // the whole history stays reachable: c1..c5 and the server's new commit
+      expect(git(dir, "rev-list", "--count", "refs/x").trim()).toBe("6");
+      expect(gitRun(root, dir, ["fsck", "--no-dangling", "--no-progress"]).status).toBe(0);
+    });
+
+    it(`fetch --update-shallow (v${version}) into an unrelated repository records the shallow commits it needs`, async () => {
+      const shal = join(srv, shallowServer(1));
+      const unrelated = join(root, `unrelated-${counter++}`);
+      git(root, "init", "-q", "-b", "main", unrelated);
+      addCommit(unrelated, "own");
+      const native = join(root, `uu-native-${counter++}`);
+      git(root, "clone", "-q", "--no-local", unrelated, native);
+      const r = gitRun(root, native, [
+        "-c",
+        `protocol.version=${version}`,
+        "fetch",
+        "-q",
+        "--update-shallow",
+        shal,
+        "main:refs/x",
+      ]);
+      expect(r.status, r.stderr).toBe(0);
+      const { dir, ours } = await oursCloneOf("uu-ours", unrelated, version);
+      await ours.fetch().setRemote(shal).setRefSpecs("main:refs/x").setUpdateShallow(true).call();
+      expect(stateOf(native).shallow.length).toBe(1);
+      expect(stateOf(dir).shallow).toEqual([...new Set(stateOf(native).shallow)]);
+      expect(stateOf(dir).refs).toBe(stateOf(native).refs);
+      expect(stateOf(dir).objects).toEqual(stateOf(native).objects);
+    });
+
+    it(`a native shallow clone (v${version}) fetching without deepening from our shallow server keeps its shallow file, as http-backend`, async () => {
+      const name = shallowServer(0);
+      const n = counter++;
+      const clone = async (server: LoopbackServer, label: string) => {
+        const dest = join(root, `${label}-${n}`);
+        const r = await gitAsync(root, root, [
+          "-c",
+          `protocol.version=${version}`,
+          "clone",
+          "-q",
+          "--depth",
+          "1",
+          `${server.baseUrl}/${name}`,
+          dest,
+        ]);
+        expect(r.status, r.stderr).toBe(0);
+        return dest;
+      };
+      const theirs = await clone(nativeHttp.server, "nd-native");
+      const mine = await clone(ourHttp, "nd-ours");
+      const before = readFileSync(join(theirs, ".git/shallow"), "utf8");
+      expect(readFileSync(join(mine, ".git/shallow"), "utf8")).toBe(before);
+      addCommit(join(srv, name), "next");
+      const fetch = async (server: LoopbackServer, dest: string) => {
+        const r = await gitAsync(root, dest, [
+          "-c",
+          `protocol.version=${version}`,
+          "fetch",
+          "-q",
+          `${server.baseUrl}/${name}`,
+          "main:refs/x",
+        ]);
+        expect(r.status, r.stderr).toBe(0);
+        return {
+          shallow: readFileSync(join(dest, ".git/shallow"), "utf8"),
+          count: git(dest, "rev-list", "--count", "refs/x").trim(),
+          refs: git(dest, "for-each-ref", "--format=%(refname) %(objectname)"),
+        };
+      };
+      const a = await fetch(nativeHttp.server, theirs);
+      const b = await fetch(ourHttp, mine);
+      expect(a.shallow).toBe(before);
+      expect(b).toEqual(a);
+    });
+  }
 });
