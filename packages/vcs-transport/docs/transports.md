@@ -242,10 +242,13 @@ Four differences from http-backend keep a server of many tenants' repositories s
   hidden refs reach included, so while any hidden-ref pattern applies to upload-pack (the
   operator's `settings.hideRefs` / `uploadPackHideRefs`, the repository's `transfer.hideRefs` /
   `uploadpack.hideRefs`, a resolver's `ServedRepository.settings`), every `objects/...` path
-  is refused (`403`, as a disabled `getanyfile`) unless the operator passes `getAnyFile: true`
-  or the repository sets `http.getanyfile=true` explicitly (and `allowOverride` is not
-  false). `HEAD` and `info/refs` are still served: they leave the hidden refs out. With
-  nothing hidden, http-backend's default stands and the files are served.
+  is refused (`403`, as a disabled `getanyfile`) unless the operator passes `getAnyFile: true`.
+  A repository's own `http.getanyfile=true` opts in only while its own config alone hides refs
+  (and `allowOverride` is not false): where the operator's `settings` or the resolver's
+  settings contribute hidden-ref patterns, a tenant's config cannot re-open the files that
+  would hand out what the operator hid. `HEAD` and `info/refs` are still served: they leave
+  the hidden refs out. With nothing hidden, http-backend's default stands and the files are
+  served.
 
   ```ts
   // hidden refs, and the dumb protocol's files served anyway (their objects included)

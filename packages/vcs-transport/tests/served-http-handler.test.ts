@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import {
   createServedFetchHandler,
   createServedHttpHandler,
+  type GitServeSettings,
   type ServedHttpHandlerOptions,
   type ServedRepository,
   type ServerConfigReader,
@@ -565,7 +566,8 @@ describe("createServedFetchHandler: dumb files fail closed under hidden refs; HE
     }
     const resolver = handlerFor({ ...repository, settings: { uploadPackHideRefs: ["refs/x"] } });
     expect((await get(resolver.handler, `/repo.git/objects/pack/${PACK}.pack`)).status).toBe(403);
-    // explicit opt-in: the operator's getAnyFile: true or the repository's http.getanyfile=true
+    // explicit opt-in: the operator's getAnyFile: true, or the repository's
+    // http.getanyfile=true where only its own config hides refs
     const optIn = handlerFor(repository, {
       settings: { hideRefs: ["refs/secret"] },
       getAnyFile: true,
@@ -578,7 +580,8 @@ describe("createServedFetchHandler: dumb files fail closed under hidden refs; HE
       { ...repository, config: configOf({ "http.getanyfile": "true" }) },
       { settings: { hideRefs: ["refs/secret"] } },
     );
-    expect((await get(configured.handler, `/repo.git/objects/pack/${PACK}.pack`)).status).toBe(200);
+    // the operator's patterns hide refs: the repository's true does not re-open the files
+    expect((await get(configured.handler, `/repo.git/objects/pack/${PACK}.pack`)).status).toBe(403);
     // allowOverride false: the repository's true does not count
     const noOverride = handlerFor(
       { ...repository, config: configOf({ "http.getanyfile": "true" }) },
@@ -671,5 +674,48 @@ describe("createServedFetchHandler: dumb files fail closed under hidden refs; HE
     await files.remove("/srv/repo.git/objects");
     await files.symlink?.(enc2.encode("/elsewhere/objects"), "/srv/repo.git/objects");
     expect(await servedGitFilesOf(rooted, "/srv/repo.git").read(LOOSE)).toBeUndefined();
+  });
+});
+
+describe("createServedFetchHandler: a repository's http.getanyfile=true under hidden refs", () => {
+  const enc = new TextEncoder();
+  const PACK = `pack-${"2".repeat(40)}`;
+  const packPath = `/repo.git/objects/pack/${PACK}.pack`;
+
+  async function repositoryWith(config: Record<string, string>, settings?: GitServeSettings) {
+    const files = createSymlinkFilesApi(createInMemoryFilesApi());
+    await files.write(`/srv/repo.git/objects/pack/${PACK}.pack`, [enc.encode("PACK")]);
+    const { repository } = await setup({ files: servedGitFilesOf(files, "/srv/repo.git") });
+    return { ...repository, config: configOf(config), ...(settings ? { settings } : {}) };
+  }
+
+  it("opts in where only the repository's own config hides refs", async () => {
+    for (const hide of ["transfer.hideRefs", "uploadpack.hideRefs"]) {
+      const repository = await repositoryWith({ [hide]: "refs/x", "http.getanyfile": "true" });
+      const response = await get(handlerFor(repository).handler, packPath);
+      expect(response.status, hide).toBe(200);
+      expect(await response.text()).toBe("PACK");
+    }
+  });
+
+  it("never re-opens what the operator's settings or the resolver's settings hide", async () => {
+    const opted = { "http.getanyfile": "true" };
+    for (const settings of <GitServeSettings[]>[
+      { hideRefs: ["refs/secret"] },
+      { uploadPackHideRefs: ["refs/secret"] },
+    ]) {
+      // the operator's settings, with or without the repository hiding refs too
+      for (const config of [opted, { ...opted, "transfer.hideRefs": "refs/x" }]) {
+        const repository = await repositoryWith(config);
+        const { handler } = handlerFor(repository, { settings });
+        expect((await get(handler, packPath)).status).toBe(403);
+        // the operator's own getAnyFile: true still opens them
+        const optIn = handlerFor(repository, { settings, getAnyFile: true });
+        expect((await get(optIn.handler, packPath)).status).toBe(200);
+      }
+      // the resolver's settings (operator-level, per repository)
+      const resolved = await repositoryWith(opted, settings);
+      expect((await get(handlerFor(resolved).handler, packPath)).status).toBe(403);
+    }
   });
 });

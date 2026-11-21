@@ -23,7 +23,11 @@ import { servedRepositoryOf } from "../src/index.js";
 import { type LoopbackServer, serveOnLoopback } from "./http-loopback-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync } from "./native-connect-support.js";
-import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
+import {
+  nativeGitAvailable,
+  nativeGitHttpBackend,
+  noMaintenance,
+} from "./native-git-http-backend.js";
 import { gitOut, putFile, testEnv } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
@@ -193,19 +197,6 @@ async function nativeLoopback(dir: string): Promise<LoopbackServer> {
       backend.close();
     },
   };
-}
-
-/**
- * No background maintenance in a repository a local push reaches: connect.c starts its
- * receive-pack with `local_repo_env` cleared (`GIT_CONFIG_COUNT` included), so the test
- * environment's command-line `maintenance.auto=false` / `gc.auto=0` do not reach it, and
- * git 2.5x's receive-pack would detach `git maintenance run --auto` there (changing
- * `objects/` while the test copies it). Its own config turns that off.
- */
-function noMaintenance(repo: string): void {
-  git(repo, ["config", "maintenance.auto", "false"]);
-  git(repo, ["config", "gc.auto", "0"]);
-  git(repo, ["config", "receive.autogc", "false"]);
 }
 
 /** `<dir>/src` (main, other, an annotated tag) and `<dir>/bare.git` holding them, loose. */

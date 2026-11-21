@@ -40,7 +40,7 @@ export {
 } from "./serve-git-connection.js";
 export type { ServeOverDuplexOptions } from "./serve-over-duplex.js";
 export { serveOverDuplex } from "./serve-over-duplex.js";
-export type { ServedGitFile, ServedGitFiles } from "./served-git-files.js";
+export type { ServedGitFile, ServedGitFileStats, ServedGitFiles } from "./served-git-files.js";
 export { servedGitFilesOf } from "./served-git-files.js";
 export type { ServerConfigReader, ServerConfigSettings } from "./server-config.js";
 export {

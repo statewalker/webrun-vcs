@@ -36,6 +36,7 @@ import {
   type GitServeSettings,
   type GitServiceRequest,
   isUnsafeServicePath,
+  layerServeSettings,
   resolveServeSettings,
   type ServedRepository,
   type ServedRequestContext,
@@ -129,8 +130,10 @@ export interface ServedHttpHandlerOptions {
    * (`transfer.hideRefs`, `uploadpack.hideRefs`), where http-backend lists every ref. The
    * object files hold what hidden refs reach, so they fail closed: while any hidden-ref
    * pattern applies (the operator's `settings`, the repository's config or the resolver's
-   * settings), `objects/...` is refused (403) unless this is explicitly true or the
-   * repository sets `http.getanyfile=true`; `HEAD` and `info/refs` are still served. Off,
+   * settings), `objects/...` is refused (403) unless this is explicitly true, or the
+   * repository sets `http.getanyfile=true` while only its own config hides refs (a
+   * repository's opt-in never re-opens what the operator's `settings` or the resolver's
+   * settings hide); `HEAD` and `info/refs` are still served. Off,
    * every dumb request is refused (403). Unset or true, a repository's `http.getanyfile`
    * decides (unless `allowOverride` is false); false refuses it whatever the repository's
    * config says. A `HEAD` request is answered with the headers only, no file opened
@@ -617,9 +620,16 @@ export function createServedHttpHandler(
           });
         }
         // fail closed: the object files hold what hidden refs reach, so with refs hidden they
-        // are served only where the operator (getAnyFile: true) or the repository
-        // (http.getanyfile=true) asked for them explicitly
-        if (hidden.length > 0 && options.getAnyFile !== true && explicit !== true) {
+        // are served only where the operator (getAnyFile: true) asked for them explicitly, or
+        // the repository (http.getanyfile=true) while only its own config hides refs: a
+        // repository cannot re-open what the operator's patterns (its `settings`, the
+        // resolver's) hide
+        const operatorHides = layerServeSettings(options.settings, served.settings);
+        const operatorHidden =
+          (operatorHides.hideRefs?.length ?? 0) + (operatorHides.uploadPackHideRefs?.length ?? 0) >
+          0;
+        const optedIn = options.getAnyFile === true || (explicit === true && !operatorHidden);
+        if (hidden.length > 0 && !optedIn) {
           logger?.info("Unsupported service: getanyfile");
           return refusal(403);
         }

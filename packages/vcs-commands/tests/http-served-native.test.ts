@@ -36,7 +36,11 @@ import {
 import { type LoopbackServer, serveOnLoopback } from "./http-loopback-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync } from "./native-connect-support.js";
-import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
+import {
+  nativeGitAvailable,
+  nativeGitHttpBackend,
+  noMaintenance,
+} from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
@@ -64,6 +68,8 @@ function base(dir: string, config: Record<string, string> = { "http.receivepack"
   git(src, ["commit", "-qm", "a"]);
   git(src, ["branch", "other"]);
   git(dir, ["init", "-q", "--bare", "-b", "main", "bare.git"]);
+  // native local pushes reach it: no background maintenance there
+  noMaintenance(join(dir, "bare.git"));
   for (const [key, value] of Object.entries(config)) {
     git(join(dir, "bare.git"), ["config", key, value]);
   }
@@ -420,6 +426,7 @@ describeGit("served smart HTTP: the client's variables, decoded paths, missing d
     const prepare = (t: HookTwin) => {
       for (const name of names) {
         git(t.dir, ["clone", "-q", "--bare", "src", name]);
+        noMaintenance(join(t.dir, name));
         git(join(t.dir, name), ["config", "http.receivepack", "true"]);
       }
     };

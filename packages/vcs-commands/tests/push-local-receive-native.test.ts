@@ -15,7 +15,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { Git, GitApiError, PushResult } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
-import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { nativeGitAvailable, noMaintenance } from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
@@ -53,6 +53,9 @@ function setup(makeTarget: (target: string) => void): { n: string; o: string } {
     git(dir, "add", "m.txt");
     git(dir, "commit", "-qm", "main pushed");
     makeTarget(`${d}-dst`);
+    // a native local push reaches a bare target: no background maintenance there
+    const target = join(root, `${d}-dst`);
+    if (git(target, "rev-parse", "--is-bare-repository").trim() === "true") noMaintenance(target);
   }
   return { n, o };
 }
@@ -339,6 +342,7 @@ describeGit("push to a local repository: the target's worktrees and receive.* co
         git(dir, "add", "s.txt");
         git(dir, "commit", "-qm", "on a shallow clone");
         git(root, "init", "-q", "--bare", `${d}-dst`);
+        noMaintenance(join(root, `${d}-dst`));
         if (value) git(join(root, `${d}-dst`), "config", "receive.shallowUpdate", value);
       }
       await pushBoth(n, o, ["main:main"]);

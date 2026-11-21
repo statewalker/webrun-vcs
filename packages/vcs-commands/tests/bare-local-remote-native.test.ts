@@ -17,7 +17,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { Git } from "../src/index.js";
-import { nativeGitAvailable } from "./native-git-http-backend.js";
+import { nativeGitAvailable, noMaintenance } from "./native-git-http-backend.js";
 import { gitOut, putFile, testEnv } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
@@ -37,6 +37,9 @@ function base(dir: string): void {
   git(src, ["tag", "-a", "-m", "t", "v1"]);
   git(dir, ["clone", "-q", "--bare", "src", "remote.git"]);
   git(dir, ["init", "-q", "--bare", "-b", "main", "local.git"]);
+  // a native local push reaches them: no background maintenance there
+  noMaintenance(join(dir, "remote.git"));
+  noMaintenance(join(dir, "local.git"));
 }
 
 /** Two copies of `dir`: native's and ours. */
