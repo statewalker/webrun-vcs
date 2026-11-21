@@ -505,11 +505,20 @@ channel's `serve` and reach it with `createWebrunConnector({ call: () => call })
   configured by people who must not read the server's files, an include would bring any file
   the server process can read into the repository's settings (and a device or a huge file
   into its memory). Open served repositories with `configIncludes: "files"`: only files inside
-  the storage are included (nothing above its root, no `~/` path, an absolute path only inside
-  its `rootDirectory`, no symbolic link leading out), or `false` to follow none. The system and
-  global config files are the operator's and keep git's rules either way. A storage without
-  `lstat`/`readlink` is checked lexically, so it must not follow links out of its root itself
-  (the Node FilesApi follows none).
+  the repository's own git directory are included (its common directory, and a linked
+  worktree's git directory: not another tenant's `../other.git/config`), where their symbolic
+  links lead, no `~/` path, an absolute path only inside the storage's `rootDirectory`, and none
+  larger than 1 MiB (`MAX_CONFINED_INCLUDE_SIZE`, our hardening: git has no limit, and a pack file
+  is no configuration); or `false` to follow none. A storage without `lstat`/`readlink` cannot
+  tell links apart, so `"files"` follows no include there. The system and global config files
+  are the operator's and keep git's rules either way. The same option reaches the settings the
+  object and ref stores read (`createGitFilesBackend({ configIncludes })`).
+- **Hooks already run the owner's code.** With a hook runner installed, a served repository's
+  `pre-receive`, `update` and `post-receive` scripts run on the server with its rights, so its
+  owner can read whatever the server can, includes or not. Include confinement matters for
+  serving without hooks (no `hookRunner`, or hooks for repositories whose owners are trusted
+  only); confine the hooks themselves with the runner (a sandbox, a container) where owners
+  are not trusted.
 - **Identity is the transport's.** Over ssh and httpeers the transport proves who is calling;
   never take an identity from the payload. Over plain git:// and WebSocket there is none: put
   them behind something that authenticates, or serve read-only data.

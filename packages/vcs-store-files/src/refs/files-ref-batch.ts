@@ -1288,7 +1288,9 @@ export function createFilesRefOps(
     through: string[] = [],
   ): Promise<BatchResult> => {
     if (commands.length === 0) {
-      const hook = batchOptions.emptyTransaction ? options.transactionHook?.() : undefined;
+      const hook = batchOptions.emptyTransaction
+        ? (batchOptions.transactionHook ?? options.transactionHook?.())
+        : undefined;
       if (hook) {
         for (const state of ["preparing", "prepared"] as const) {
           const verdict = await hook(state, []);
@@ -1365,7 +1367,7 @@ export function createFilesRefOps(
       }
     }
     // the reference-transaction hook: `preparing` before any lock
-    const hook = options.transactionHook?.();
+    const hook = batchOptions.transactionHook ?? options.transactionHook?.();
     const verdict = hook ? await hook("preparing", transactionUpdates(updates)) : undefined;
     if (verdict === false || typeof verdict === "string") {
       // ref_transaction_abort tells the hook whatever the state (the updates as asked: the

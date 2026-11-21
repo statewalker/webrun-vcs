@@ -26,11 +26,13 @@ import {
   writeCommitGraphFile,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
-import { readFile } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { readAllRefs } from "./refs/index.js";
-import { createWorkingCopyConfig } from "./workspace/working-copy/working-copy-config.files.js";
+import {
+  configFilesApiOf,
+  createWorkingCopyConfig,
+} from "./workspace/working-copy/working-copy-config.files.js";
 
 /** The commit-graph settings of a repository's config, with git's maintenance switches. */
 export interface RepositoryCommitGraphSettings extends CommitGraphSettings {
@@ -74,17 +76,16 @@ function configInt(value: unknown): number | undefined {
 export async function readCommitGraphSettings(
   files: FilesApi,
   gitDir = ".git",
-  options: { environment?: GitHostEnvironment } = {},
+  options: {
+    environment?: GitHostEnvironment;
+    /** Which include directives of the repository's config are followed (git's: all) */
+    includes?: boolean | "files";
+  } = {},
 ): Promise<RepositoryCommitGraphSettings> {
-  const config = await createWorkingCopyConfig(
-    {
-      read: async (path) => ((await files.exists(path)) ? readFile(files, path) : undefined),
-      write: (path, content) => files.write(path, [content]),
-    },
-    gitDir,
-    undefined,
-    options.environment ? { environment: options.environment } : {},
-  );
+  const config = await createWorkingCopyConfig(configFilesApiOf(files), gitDir, undefined, {
+    ...(options.environment ? { environment: options.environment } : {}),
+    ...(options.includes === undefined ? {} : { includes: options.includes }),
+  });
   const bool = (key: string, fallback: boolean) => parseGitBool(config.get(key)) ?? fallback;
   const readChangedPaths = bool("commitGraph.readChangedPaths", true);
   return {
@@ -118,11 +119,16 @@ export function createFilesCommitGraphProvider(options: {
   refs?: Pick<Refs, "list">;
   /** The user's environment: the global and system config files are read too */
   environment?: GitHostEnvironment;
+  /** Which include directives of the repository's config are followed (git's: all) */
+  configIncludes?: boolean | "files";
 }): CommitGraphProvider {
   const { files, refs, environment } = options;
   const gitDir = options.gitDir ?? ".git";
   return createCommitGraphProvider(async () => {
-    const settings = await readCommitGraphSettings(files, gitDir, { environment });
+    const settings = await readCommitGraphSettings(files, gitDir, {
+      environment,
+      ...(options.configIncludes === undefined ? {} : { includes: options.configIncludes }),
+    });
     const readGraftFile = graftFileReader(environment, { files, dir: graftFileBaseDir(gitDir) });
     return loadRepositoryCommitGraph({
       files,

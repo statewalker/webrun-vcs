@@ -886,6 +886,19 @@ export function statHostFile(path: string): LinkStats | undefined {
   }
 }
 
+/**
+ * The real path of a host path (`realpath(3)`: every symbolic link followed, `.` and `..`
+ * resolved), as git's `strbuf_realpath` names the git directory it exports to hooks;
+ * undefined when it cannot be resolved (a missing component).
+ */
+export async function realHostPath(path: string): Promise<string | undefined> {
+  try {
+    return decodeGitPath(await fs.realpath(path, { encoding: "buffer" }));
+  } catch {
+    return undefined;
+  }
+}
+
 /** The low 32 bits of a stat field (exact below 2^53 without BigInt arithmetic). */
 function low32(value: bigint): number {
   const n = Number(value);

@@ -24,7 +24,7 @@ import {
   openPackSet,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
-import { type AtomicFiles, readFile } from "@statewalker/vcs-utils/files";
+import type { AtomicFiles } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { createFilesCommitGraphProvider } from "./commit-graph.js";
 import { readDeltaBaseCacheLimit, skipPacked, withPacks } from "./pack/index.js";
@@ -34,7 +34,10 @@ import { readRepositoryFormat } from "./repository-format.js";
 import { resolveLinkedGitDir } from "./resolve-linked-git-dir.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
-import { createWorkingCopyConfig } from "./workspace/working-copy/working-copy-config.files.js";
+import {
+  configFilesApiOf,
+  createWorkingCopyConfig,
+} from "./workspace/working-copy/working-copy-config.files.js";
 
 /**
  * Options for creating a file-backed Git storage backend.
@@ -88,6 +91,12 @@ export interface GitFilesBackendOptions {
    * grafts file (`GIT_GRAFT_FILE`) is read in place of `info/grafts` (`refs.readGrafts`).
    */
   environment?: GitHostEnvironment;
+  /**
+   * Which include directives of the repository's config are followed while its settings are
+   * read here (see `GitConfigOptions.includes`): git's rule by default, `"files"` confined to
+   * the repository's directory (a server's repositories), `false` none.
+   */
+  configIncludes?: boolean | "files";
 }
 
 /**
@@ -151,7 +160,8 @@ export async function createGitFilesBackend(
 
   // git's check_repository_format: a version or extension we cannot honour (reftable refs,
   // sha256 objects, an unknown v1 extension) is refused before anything is read or written
-  await readRepositoryFormat(files, gitDir);
+  const includes = options.configIncludes === undefined ? {} : { includes: options.configIncludes };
+  await readRepositoryFormat(files, gitDir, includes);
 
   if (create) {
     await createGitDirectoryStructure(files, gitDir, objectsDir);
@@ -172,14 +182,14 @@ export async function createGitFilesBackend(
     externalBase: (id) => looseOnly.get(id),
     freshenMaxAgeMs,
     // git's core.deltaBaseCacheLimit (96 MiB when unset)
-    baseCacheBytes: await readDeltaBaseCacheLimit(files, gitDir),
+    baseCacheBytes: await readDeltaBaseCacheLimit(files, gitDir, includes),
   });
   const loose = createGitObjects(skipPacked(staging, packs));
   const objects = withPacks(loose, packs);
   // receive-pack keeps a pushed pack in objects/tmp_objdir-incoming-* until the push is accepted
   objects.beginQuarantine = () =>
     beginFilesQuarantine({ files, objectsDir, objects, packs, freshenMaxAgeMs });
-  const reflog = await readRefStoreConfig(files, gitDir);
+  const reflog = await readRefStoreConfig(files, gitDir, includes);
   const refStore = createFileRefStore(files, gitDir, {
     atomicFiles: options.atomicFiles,
     refLockTimeoutMs: options.refLockTimeoutMs ?? reflog.refLockTimeoutMs,
@@ -206,6 +216,7 @@ export async function createGitFilesBackend(
     gitDir,
     refs: refStore,
     environment: options.environment,
+    ...(options.configIncludes === undefined ? {} : { configIncludes: options.configIncludes }),
   });
   invalidateOnCompatibilityChange(refStore, commitGraph);
   const history = createHistoryFromComponents({
@@ -257,6 +268,7 @@ function invalidateOnCompatibilityChange(refs: FileRefStore, commitGraph: Commit
 async function readRefStoreConfig(
   files: FilesApi,
   gitDir: string,
+  options: { includes?: boolean | "files" },
 ): Promise<{
   logAllRefUpdates: boolean | "always";
   identity?: { name: string; email: string };
@@ -264,11 +276,10 @@ async function readRefStoreConfig(
   packedLockTimeoutMs?: number;
 }> {
   const config = await createWorkingCopyConfig(
-    {
-      read: async (path) => ((await files.exists(path)) ? readFile(files, path) : undefined),
-      write: (path, content) => files.write(path, [content]),
-    },
+    configFilesApiOf(files),
     gitDir,
+    undefined,
+    options.includes === undefined ? {} : { includes: options.includes },
   );
   const setting = config.get("core.logAllRefUpdates");
   const logAllRefUpdates =

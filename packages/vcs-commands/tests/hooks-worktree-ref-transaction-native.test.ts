@@ -13,7 +13,15 @@
  * runs native git in one copy's worktree and ours in the other's.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RefTransactionAbortedError, type RefTransactionHook } from "@statewalker/vcs-core";
@@ -31,6 +39,7 @@ import {
   hookExit,
   hookLines,
   hookLog,
+  hookTwins,
   installHooks,
   nativeIs25x,
 } from "./hooks-native-support.js";
@@ -363,5 +372,118 @@ describeGit("pack-refs and gc in a linked worktree (as native git)", () => {
     const packed = readFileSync(join(mine.dir, "repo/.git/packed-refs"), "latin1");
     expect(packed.split("\n")[0]).toBe("# pack-refs with: peeled fully-peeled sorted ");
     expect(packed).toBe(readFileSync(join(theirs.dir, "repo/.git/packed-refs"), "latin1"));
+  });
+});
+
+describeGit("GIT_DIR in hooks of linked worktrees and bare repositories (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-wt-gitdir-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** Only the logging post-checkout hook in the repository's hooks directory. */
+  const postCheckoutOnly = (twin: HookTwin) => {
+    rmSync(join(twin.dir, "repo/.git/hooks/reference-transaction"), { force: true });
+    installHooks(join(twin.dir, "repo/.git/hooks"), ["post-checkout"]);
+  };
+
+  it("worktree add from a linked worktree: post-checkout without GIT_DIR and GIT_WORK_TREE", async () => {
+    const dir = join(root, "c");
+    base(dir);
+    const [theirs, mine] = await expectTwins(
+      dir,
+      ["worktree", "add", "-q", "--detach", "../wt2"],
+      (g) => attempt(g.worktreeAdd().setPath("../wt2").setDetach(true)),
+      "worktree add",
+      postCheckoutOnly,
+    );
+    expect(hookLog(mine)).toContain("== post-checkout");
+    expect(hookLog(mine)).not.toContain("GIT_DIR=");
+    expect(existsSync(join(theirs.dir, "wt2/.git"))).toBe(true);
+    // a checkout in the linked worktree exports the git directory its gitfile names
+    await expectTwins(
+      dir,
+      ["checkout", "-q", "other"],
+      (g) => attempt(g.checkout().setName("other")),
+      "checkout",
+      postCheckoutOnly,
+    );
+  });
+
+  it("a gitfile reached through a symbolic link: GIT_DIR is the real path", async () => {
+    const real = join(root, "real");
+    const link = join(root, "lnk");
+    mkdirSync(real, { recursive: true });
+    symlinkSync(real, link);
+    const dir = join(real, "c");
+    base(dir);
+    const make = (suffix: string): HookTwin & { real: string } => {
+      const copy = `${dir}-${suffix}`;
+      execFileSync("cp", ["-a", dir, copy]);
+      // the worktree and its gitfile named through the link
+      const named = join(link, `c-${suffix}`);
+      writeFileSync(join(copy, "repo/.git/worktrees/wt/gitdir"), `${join(named, "wt")}/.git\n`);
+      writeFileSync(join(copy, "wt/.git"), `gitdir: ${join(named, "repo/.git/worktrees/wt")}\n`);
+      const log = `${copy}.hooklog`;
+      const ctl = `${copy}.hookctl`;
+      mkdirSync(ctl, { recursive: true });
+      const env = testEnv(root, { HOOK_LOG: log, HOOK_CTL: ctl });
+      gitRun(root, join(named, "wt"), ["update-index", "-q", "--refresh"], env);
+      const twin = { dir: named, log, ctl, env, real: copy };
+      postCheckoutOnly({ ...twin, dir: copy });
+      return twin;
+    };
+    const theirs = make("native");
+    const mine = make("ours");
+    const logOf = (t: HookTwin & { real: string }) =>
+      existsSync(t.log)
+        ? readFileSync(t.log, "latin1").replaceAll(t.real, "<real>").replaceAll(t.dir, "<lnk>")
+        : "";
+    const native = nativeIn(theirs, ["checkout", "-q", "other"]);
+    expect(native.status, native.stderr).toBe(0);
+    const ours = await attempt((await oursIn(mine)).checkout().setName("other"));
+    expect(ours.error).toBeUndefined();
+    expect(logOf(theirs)).toContain("GIT_DIR=<real>/repo/.git/worktrees/wt\n");
+    expect(logOf(mine)).toBe(logOf(theirs));
+  });
+
+  it("a bare repository: GIT_DIR=. in the repository's directory", async () => {
+    const dir = join(root, "b");
+    const src = join(dir, "src");
+    mkdirSync(src, { recursive: true });
+    git(src, ["init", "-q", "-b", "main"]);
+    putFile(src, "a.txt", "a\n");
+    git(src, ["add", "-A"]);
+    git(src, ["commit", "-qm", "a"]);
+    git(dir, ["clone", "-q", "--bare", "src", "bare.git"]);
+    installHooks(join(dir, "bare.git/hooks"), ["pre-commit", "reference-transaction"]);
+    const cases: Array<[string[], (g: Git) => Promise<{ output: string; error?: Error }>]> = [
+      [["hook", "run", "pre-commit"], (g) => attempt(g.hookRun().setHookName("pre-commit"))],
+      [["branch", "topic"], (g) => attempt(g.branchCreate().setName("topic"))],
+    ];
+    for (const [args, run] of cases) {
+      const [theirs, mine] = hookTwins(root, dir);
+      const native = gitRun(root, join(theirs.dir, "bare.git"), args, theirs.env);
+      expect(native.status, `${args.join(" ")}: ${native.stderr}`).toBe(0);
+      const files = createNodeFilesApi({ rootDir: mine.dir });
+      const { history } = await createGitFilesBackend({ files, gitDir: "bare.git" });
+      const environment = createNodeGitHostEnvironment({
+        env: mine.env,
+        hookRunner: createNodeHookRunner({
+          env: mine.env,
+          compatibility: nativeIs25x ? "2.56" : "2.43",
+        }),
+      });
+      const worktrees = await openGitLinkedWorktrees({
+        files,
+        gitDir: "bare.git",
+        history,
+        environment,
+      });
+      const ours = await run(Git.fromWorktreeAdmin(await worktrees.openAdmin()));
+      expect(ours.error, args.join(" ")).toBeUndefined();
+      expect(hookLog(theirs), args.join(" ")).toContain("GIT_DIR=.\n");
+      expect(hookLog(mine), args.join(" ")).toBe(hookLog(theirs));
+    }
   });
 });

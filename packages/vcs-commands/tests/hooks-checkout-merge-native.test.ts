@@ -8,7 +8,7 @@
  * git in one copy of a repository with logging hooks and ours (with the Node hook runner) in
  * the other, and compares the hook logs and output.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInMemoryFilesApi } from "@statewalker/vcs-core";
@@ -313,5 +313,61 @@ describe("hooks run in another directory (git's opt.dir)", () => {
     });
     await session.run("post-checkout", { dir: "wt/new" });
     expect(seen).toEqual([{ path: "../../.git/hooks/post-checkout", cwd: "wt/new" }]);
+  });
+});
+
+describeGit("clone through a symbolic link: post-checkout's GIT_DIR (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-clone-link-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("GIT_DIR is the real path of the new repository's git directory", async () => {
+    const real = join(root, "real");
+    const link = join(root, "lnk");
+    mkdirSync(real, { recursive: true });
+    symlinkSync(real, link);
+    // the source inside the storage, named through the link
+    const src = join(link, "src");
+    base(join(real, "src"));
+    const template = join(root, "template");
+    installHooks(join(template, "hooks"), ["post-checkout"]);
+    const twin = (name: string): HookTwin => {
+      const ctl = join(root, `${name}.hookctl`);
+      mkdirSync(ctl, { recursive: true });
+      const log = join(root, `${name}.hooklog`);
+      return {
+        dir: join(link, name),
+        log,
+        ctl,
+        env: testEnv(root, { HOOK_LOG: log, HOOK_CTL: ctl }),
+      };
+    };
+    const theirs = twin("c-native");
+    const mine = twin("c-ours");
+    const native = nativeIn({ ...theirs, dir: root }, root, [
+      "clone",
+      "-q",
+      `--template=${template}`,
+      src,
+      theirs.dir,
+    ]);
+    expect(native.status, native.stderr).toBe(0);
+    installHooks(join(mine.dir, ".git/hooks"), ["post-checkout"]);
+    const env = mine.env;
+    const ours = await openOurs(
+      link,
+      createNodeGitHostEnvironment({
+        env,
+        hookRunner: createNodeHookRunner({ env, compatibility: nativeIs25x ? "2.56" : "2.43" }),
+      }),
+      undefined,
+      "c-ours",
+    );
+    await ours.clone().setURI(src).call();
+    const logOf = (t: HookTwin, name: string) =>
+      readFileSync(t.log, "latin1").replaceAll(join(real, name), "<real>");
+    expect(logOf(theirs, "c-native")).toContain("GIT_DIR=<real>/.git\n");
+    expect(logOf(mine, "c-ours")).toBe(logOf(theirs, "c-native"));
   });
 });

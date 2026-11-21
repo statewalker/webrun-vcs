@@ -14,6 +14,8 @@ export interface NodeHookInvocation {
   args: string[];
   stdin?: Uint8Array;
   env: Record<string, string>;
+  /** Variables removed from the base environment (`GIT_DIR` for `worktree add`'s hook) */
+  unsetEnv?: string[];
   cwd: string;
   hostCwd?: string;
   stdoutToStderr: boolean;
@@ -71,6 +73,7 @@ function runHook(
   const base = options.env ?? process.env;
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(base)) if (value !== undefined) env[key] = value;
+  for (const key of invocation.unsetEnv ?? []) delete env[key];
   Object.assign(env, invocation.env);
   const cwd = invocation.hostCwd ?? options.defaultCwd ?? process.cwd();
   // a configured hook: git's prepare_shell_cmd (with shell metacharacters `sh -c '<command>

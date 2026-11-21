@@ -132,6 +132,11 @@ export interface BatchOptions extends RefLogOptions {
    * commits the transaction of a phase whose every update was refused
    */
   emptyTransaction?: boolean;
+  /**
+   * The reference-transaction hook of this batch alone, told in place of the one the store
+   * has installed (a wrapping store tells each batch's updates as that batch asked for them)
+   */
+  transactionHook?: RefTransactionHook;
 }
 
 /** A consistent view of a store's refs, read while planning one batch. */

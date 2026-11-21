@@ -60,6 +60,8 @@ import { FileStagingStore } from "../staging/index.js";
 import { createGitStashStore } from "../working-copy/stash-store.files.js";
 import { GitWorkingCopy, type WorkingCopyFilesApi } from "../working-copy/working-copy.files.js";
 import {
+  type ConfigFilesApi,
+  configFilesApiOf,
   createWorkingCopyConfig,
   type GitConfigOptions,
   type GitWorkingCopyConfig,
@@ -228,10 +230,11 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     return this.options.includes === undefined ? {} : { includes: this.options.includes };
   }
 
-  private configFiles() {
+  /** The config files, with the storage's root and links (what confined includes check) */
+  private configFiles(): ConfigFilesApi {
     return {
+      ...configFilesApiOf(this.files),
       read: (path: string) => readIfFile(this.files, path),
-      write: (path: string, content: Uint8Array) => this.files.write(path, [content]),
     };
   }
 

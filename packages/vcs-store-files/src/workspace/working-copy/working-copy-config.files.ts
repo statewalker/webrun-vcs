@@ -13,6 +13,7 @@ import {
   encodeGitPath,
   parseGitBool,
 } from "@statewalker/vcs-utils/encoding";
+import { type FilesApi, type PosixFilesApi, readFile } from "@statewalker/vcs-utils/files";
 import {
   expandUserPath,
   type GitHostEnvironment,
@@ -20,6 +21,38 @@ import {
   wildmatch,
   xdgConfigPath,
 } from "@statewalker/vcs-working-tree";
+
+/**
+ * The config files of a repository in `files`: read and written through it, with its root
+ * directory and, where it has them, `lstat` / `readlink` (what `includes: "files"` needs to
+ * confine includes; it follows none without them).
+ *
+ * @example
+ * ```ts
+ * const config = await createWorkingCopyConfig(configFilesApiOf(files), ".git", undefined, {
+ *   includes: "files",
+ * });
+ * ```
+ */
+export function configFilesApiOf(
+  files: FilesApi,
+  options: { readOnly?: string } = {},
+): ConfigFilesApi {
+  const posix = files as PosixFilesApi;
+  const readOnly = options.readOnly;
+  return {
+    read: async (path) => ((await files.exists(path)) ? readFile(files, path) : undefined),
+    write: readOnly
+      ? async () => {
+          throw new Error(readOnly);
+        }
+      : (path, content) => files.write(path, [content]),
+    ...(posix.rootDirectory ? { rootDirectory: posix.rootDirectory } : {}),
+    ...(posix.lstat && posix.readlink
+      ? { lstat: posix.lstat.bind(posix), readlink: posix.readlink.bind(posix) }
+      : {}),
+  };
+}
 
 /**
  * Thrown where git refuses a config file (`fatal: bad config line <n> in file <file>`): an
@@ -60,8 +93,11 @@ export interface ConfigFilesApi {
    * read through these paths
    */
   rootDirectory?: string;
-  /** What `path` is without following a last symbolic link (checked by `includes: "files"`) */
-  lstat?(path: string): Promise<{ kind: string } | undefined>;
+  /**
+   * What `path` is without following a last symbolic link, and its size (checked by
+   * `includes: "files"`, which follows no include without it)
+   */
+  lstat?(path: string): Promise<{ kind: string; size?: number } | undefined>;
   /** The target of the symbolic link at `path` (followed by `includes: "files"`) */
   readlink?(path: string): Promise<Uint8Array | undefined>;
 }
@@ -1043,12 +1079,19 @@ export interface GitConfigOptions {
    * Follow `include.path` / `includeIf.*.path` (default true, as git: a relative path beside
    * the including file, `~/` and absolute paths and those climbing above the files API read
    * from the host through `environment`). `"files"` confines the includes of the repository's
-   * own files (`config`, `config.worktree` and what they include) to the files API: a path
-   * that climbs above its root, a `~/` path, an absolute path outside its `rootDirectory` and
-   * a symbolic link leading out of it are skipped (absolute paths inside it are read through
-   * it); the system and global files keep git's rules. `false` follows none.
+   * own files (`config`, `config.worktree` and what they include) to the repository's
+   * directories ({@link includeRoots}): a `~/` path, a path that resolves (its symbolic links
+   * followed through the files API's `lstat` / `readlink`) outside them and a file above
+   * {@link MAX_CONFINED_INCLUDE_SIZE} are skipped, and so is every include where the files API
+   * cannot tell links apart; the system and global files keep git's rules. `false` follows none.
    */
   includes?: boolean | "files";
+  /**
+   * With `includes: "files"`, the directories (paths of the files API) an include may be read
+   * from. Default: the directory of this file (the common git directory) and that of
+   * {@link worktreeConfigPath} (a linked worktree's git directory) when given.
+   */
+  includeRoots?: string[];
   /**
    * The git directory as the host names it (an absolute path on Node), matched by
    * `includeIf.gitdir:` and used for `./` in its patterns. Default: the directory of this file.
@@ -1152,19 +1195,26 @@ function isIncludeKey(key: string): boolean {
   return key === "include.path" || (key.startsWith("includeif.") && key.endsWith(".path"));
 }
 
+/**
+ * The largest file an include confined to the repository (`includes: "files"`) reads: our
+ * hardening for servers (git has no limit), so a repository's config cannot make the server
+ * read a pack file as configuration. A larger one is skipped as if missing.
+ */
+export const MAX_CONFINED_INCLUDE_SIZE = 1024 * 1024;
+
 /** Most symbolic links followed while confining an include (the kernel's ELOOP limit). */
 const MAX_INCLUDE_LINKS = 40;
 
 /**
  * `path` (in `files`) with the symbolic links on it followed through `files.lstat` /
  * `readlink`, without its leading `/`: undefined when a link climbs above the root or
- * names a host path outside `files.rootDirectory`, or there are too many. Lexical when
- * `files` cannot tell links apart.
+ * names a host path outside `files.rootDirectory`, there are too many, or `files` cannot
+ * tell links apart.
  */
 async function confinedRealPath(files: ConfigFilesApi, path: string): Promise<string | undefined> {
   const absolute = path.startsWith("/");
   const pending = path.split("/").filter((p) => p !== "" && p !== ".");
-  if (!files.lstat || !files.readlink) return pending.join("/");
+  if (!files.lstat || !files.readlink) return undefined;
   const root = files.rootDirectory?.replace(/\/+$/, "");
   const out: string[] = [];
   let links = 0;
@@ -1308,14 +1358,16 @@ class ChainReader {
   }
 
   /**
-   * An include of the repository's own files confined to the files API (`includes: "files"`):
-   * the path beside `from` (or an absolute one inside the root directory); undefined when it
-   * climbs out or a symbolic link on it leads out of the files API.
+   * An include of the repository's own files confined to its directories (`includes:
+   * "files"`): the path beside `from` (or an absolute one inside the root directory), read
+   * where its symbolic links lead; undefined when that is outside {@link includeRoots}, the
+   * file is larger than {@link MAX_CONFINED_INCLUDE_SIZE}, or the files API cannot tell links
+   * apart.
    */
   private async confinedPath(value: string, from: ConfigSource): Promise<ConfigSource | undefined> {
     const files = (this.config as unknown as { files: ConfigFilesApi }).files;
     let path: string;
-    if (value.startsWith("~")) return undefined;
+    if (value.startsWith("~") || !files.lstat) return undefined;
     if (value.startsWith("/")) {
       const root = files.rootDirectory?.replace(/\/+$/, "");
       if (root === undefined) return undefined;
@@ -1327,13 +1379,33 @@ class ChainReader {
       if (joined.escapes) return undefined;
       path = joined.path;
     }
-    // refused when a symbolic link on the way leads out; read as the files API reads it
-    // (the Node one follows no link at all), so this rule never reads more than git's
-    if ((await confinedRealPath(files, path)) === undefined) return undefined;
-    const bare = path.replace(/^\/+/, "");
+    // where its symbolic links lead, which must be inside the repository's directories; the
+    // file read is that one (no link left on the way to swap after the check)
+    const real = await confinedRealPath(files, path);
+    if (real === undefined) return undefined;
+    if (!this.includeRoots().some((r) => r === "" || real === r || real.startsWith(`${r}/`))) {
+      return undefined;
+    }
     // the including file's spelling of the path (leading `/` or not), for its origin
-    const spelled = from.path.startsWith("/") ? `/${bare}` : bare;
-    return { read: from.read, path: spelled, ...scopeOf(from) };
+    const spelled = from.path.startsWith("/") ? `/${real}` : real;
+    const stat = await files.lstat(spelled).catch(() => undefined);
+    if (stat?.kind !== "file" || (stat.size ?? 0) > MAX_CONFINED_INCLUDE_SIZE) return undefined;
+    const read = async (p: string) => {
+      const content = await files.read(p);
+      return content && content.length > MAX_CONFINED_INCLUDE_SIZE ? undefined : content;
+    };
+    return { read, path: spelled, ...scopeOf(from) };
+  }
+
+  /** The directories confined includes may be read from, without leading or trailing `/`. */
+  private includeRoots(): string[] {
+    const strip = (p: string) => resolveDots(p).path.replace(/^\/+/, "");
+    if (this.options.includeRoots) return this.options.includeRoots.map(strip);
+    const roots = [strip(dirOf(this.configPath()))];
+    if (this.options.worktreeConfigPath !== undefined) {
+      roots.push(strip(dirOf(this.options.worktreeConfigPath)));
+    }
+    return roots;
   }
 
   private gitDirPath(): string {

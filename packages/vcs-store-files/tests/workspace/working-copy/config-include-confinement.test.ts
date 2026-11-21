@@ -5,6 +5,7 @@
  * leading out of it) and `includes: false` (none), on `GitWorkingCopyConfig` and through
  * `FileWorktree.openRepository(location, { configIncludes })`, the opener a server uses.
  */
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,6 +51,9 @@ function layout(): void {
   symlinkSync("../../etc/x", join(git, "up.cfg"));
   symlinkSync(join(tmp, "outside.cfg"), join(git, "abs-link.cfg"));
   symlinkSync(join(root, "shared", "linked.cfg"), join(git, "in-link.cfg"));
+  mkdirSync(join(git, "sub"), { recursive: true });
+  writeFileSync(join(git, "sub", "inner.cfg"), cfg("linkInGit"));
+  symlinkSync("sub/inner.cfg", join(git, "in-git-link.cfg"));
   writeFileSync(
     join(git, "config"),
     [
@@ -65,6 +69,7 @@ function layout(): void {
       "\tpath = up.cfg",
       "\tpath = abs-link.cfg",
       "\tpath = in-link.cfg",
+      "\tpath = in-git-link.cfg",
       '[includeIf "gitdir:**"]',
       "\tpath = ../../../if.cfg",
       "",
@@ -74,7 +79,8 @@ function layout(): void {
 
 /** git's rule over the Node files API (which reads no symbolic link: a link reads as nothing) */
 const ALL = ["beside", "climbing", "absoluteOutside", "absoluteInside", "home", "includeIfOutside"];
-const INSIDE = ["beside", "absoluteInside"];
+/** Confined to the git directory: the file beside the config and a link staying inside it */
+const INSIDE = ["beside", "linkInGit"];
 
 /** Which probes the config read, in order, with their file. */
 function probes(get: (key: string) => unknown[]): string[] {
@@ -85,6 +91,7 @@ function probes(get: (key: string) => unknown[]): string[] {
     "absoluteInside",
     "home",
     "linkInside",
+    "linkInGit",
     "includeIfOutside",
   ];
   return names.filter((n) => get(`probe.${n}`).length > 0);
@@ -191,17 +198,13 @@ describe("config includes: git's rule, confined to the files API, or none", () =
     const confined = await createWorkingCopyConfig(storage(true), ".git", undefined, {
       includes: "files",
     });
-    expect(probes((k) => confined.getAll(k))).toEqual(["beside", "linkInside"]);
-    // without lstat the check is lexical: such a storage must not follow links out itself
-    const lexical = await createWorkingCopyConfig(storage(false), ".git", undefined, {
+    // the link to ../shared/linked.cfg stays in the storage but leaves the git directory
+    expect(probes((k) => confined.getAll(k))).toEqual(["beside"]);
+    // a storage that cannot tell links apart follows no include at all
+    const blind = await createWorkingCopyConfig(storage(false), ".git", undefined, {
       includes: "files",
     });
-    expect(probes((k) => lexical.getAll(k))).toEqual([
-      "beside",
-      "climbing",
-      "absoluteOutside",
-      "linkInside",
-    ]);
+    expect(probes((k) => blind.getAll(k))).toEqual([]);
   });
 });
 
@@ -250,5 +253,181 @@ describe("FileWorktree.openRepository: configIncludes", () => {
     const opened = await worktree.openRepository?.(root, { configIncludes: "files" });
     expect(opened?.config?.getAll("core.bare")).toEqual(["false"]);
     expect(opened?.gitDir).toBe("/.git");
+  });
+});
+
+describe('config includes "files": confined to the repository, size-capped', () => {
+  let base: string;
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "config-tenants-"));
+  });
+  afterEach(() => rmSync(base, { recursive: true, force: true }));
+
+  /** A bare repository `<base>/<name>.git` whose config has `lines` after its core section. */
+  function bare(name: string, lines: string[]): string {
+    const git = join(base, `${name}.git`);
+    mkdirSync(join(git, "objects"), { recursive: true });
+    mkdirSync(join(git, "refs", "heads"), { recursive: true });
+    writeFileSync(join(git, "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(
+      join(git, "config"),
+      ["[core]", "\trepositoryformatversion = 0", "\tbare = true", ...lines, ""].join("\n"),
+    );
+    return git;
+  }
+
+  async function served(name: string, configIncludes: boolean | "files") {
+    const files = createNodeFilesApi({ rootDir: base });
+    const { history } = await createGitFilesBackend({ files, gitDir: `${name}.git` });
+    const worktree = createFileWorktree({
+      files,
+      rootPath: "",
+      gitDir: `${name}.git`,
+      blobs: history.blobs,
+      trees: history.trees,
+    });
+    const opened = await worktree.openRepository?.(`${base}/${name}.git`, { configIncludes });
+    if (!opened?.config) throw new Error("not opened");
+    return opened.config;
+  }
+
+  it("another repository of the storage is not included, its own files are", async () => {
+    bare("tenantB", ["[secret]", "\ttoken = b-secret"]);
+    const a = bare("tenantA", [
+      "[include]",
+      "\tpath = ../tenantB.git/config",
+      `\tpath = ${join(base, "tenantB.git", "config")}`,
+      "\tpath = own.cfg",
+    ]);
+    writeFileSync(join(a, "own.cfg"), cfg("own"));
+    const confined = await served("tenantA", "files");
+    expect(confined.getAll("secret.token")).toEqual([]);
+    expect(confined.getAll("probe.own")).toEqual(["yes"]);
+    // git's rule reads the other repository's config by its relative path (the absolute one
+    // is a host path, read through an environment this worktree has not)
+    const open = await served("tenantA", true);
+    expect(open.getAll("secret.token")).toEqual(["b-secret"]);
+  });
+
+  it("createGitFilesBackend reads its settings under the same rule", async () => {
+    // tenantB's config would make tenantA's format one this store refuses
+    const b = bare("tenantB", []);
+    writeFileSync(join(b, "config"), "[core]\n\trepositoryformatversion = 2\n");
+    bare("tenantA", ["[include]", "\tpath = ../tenantB.git/config"]);
+    const files = createNodeFilesApi({ rootDir: base });
+    await expect(createGitFilesBackend({ files, gitDir: "tenantA.git" })).rejects.toThrow();
+    await expect(
+      createGitFilesBackend({ files, gitDir: "tenantA.git", configIncludes: "files" }),
+    ).resolves.toBeDefined();
+    await expect(
+      createGitFilesBackend({ files, gitDir: "tenantA.git", configIncludes: false }),
+    ).resolves.toBeDefined();
+  });
+
+  it("a file above MAX_CONFINED_INCLUDE_SIZE is skipped, a smaller one read", async () => {
+    const a = bare("big", ["[include]", "\tpath = big.cfg", "\tpath = small.cfg"]);
+    const filler = `# ${"x".repeat(1022)}\n`.repeat(1025);
+    writeFileSync(join(a, "big.cfg"), `${cfg("big")}${filler}`);
+    writeFileSync(join(a, "small.cfg"), cfg("small"));
+    const confined = await served("big", "files");
+    expect(confined.getAll("probe.big")).toEqual([]);
+    expect(confined.getAll("probe.small")).toEqual(["yes"]);
+    expect((await served("big", true)).getAll("probe.big")).toEqual(["yes"]);
+  });
+
+  it("includeRoots widens the confinement to directories the caller names", async () => {
+    tmp = mkdtempSync(join(tmpdir(), "config-includes-"));
+    layout();
+    const files = createNodeFilesApi({ rootDir: root });
+    const config = await createWorkingCopyConfig(
+      {
+        read: async (p: string) => {
+          if ((await files.stats(p))?.kind !== "file") return undefined;
+          const chunks: Uint8Array[] = [];
+          for await (const c of files.read(p)) chunks.push(c);
+          return new Uint8Array(Buffer.concat(chunks));
+        },
+        write: (p, content) => files.write(p, [content]),
+        rootDirectory: root,
+        lstat: (p: string) => files.lstat?.(p) ?? Promise.resolve(undefined),
+        readlink: (p: string) => files.readlink?.(p) ?? Promise.resolve(undefined),
+      },
+      ".git",
+      undefined,
+      { environment: environment(), includes: "files", includeRoots: [".git", "shared"] },
+    );
+    expect(probes((k) => config.getAll(k))).toEqual([
+      "beside",
+      "absoluteInside",
+      "linkInside",
+      "linkInGit",
+    ]);
+    rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
+describe("FileWorktree.openRepository of a linked worktree's git directory", () => {
+  let base: string;
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "config-linked-"));
+  });
+  afterEach(() => rmSync(base, { recursive: true, force: true }));
+
+  it("reads its config.worktree, its HEAD for onbranch: and its directory for gitdir:", async () => {
+    const env = {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_AUTHOR_NAME: "A",
+      GIT_AUTHOR_EMAIL: "a@example.com",
+      GIT_COMMITTER_NAME: "A",
+      GIT_COMMITTER_EMAIL: "a@example.com",
+    };
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync("git", args, { cwd, env, stdio: "pipe" }).toString();
+    const main = join(base, "main");
+    mkdirSync(main);
+    git(main, "init", "-q", "-b", "main");
+    git(main, "commit", "-q", "--allow-empty", "-m", "c");
+    git(main, "worktree", "add", "-q", "-b", "wt", join(base, "wt"));
+    git(main, "config", "extensions.worktreeConfig", "true");
+    git(join(base, "wt"), "config", "--worktree", "probe.worktree", "yes");
+    const wtGitDir = join(main, ".git", "worktrees", "wt");
+    writeFileSync(join(main, ".git", "onbranch.cfg"), cfg("onbranch"));
+    writeFileSync(join(main, ".git", "gitdir.cfg"), cfg("gitdir"));
+    git(main, "config", "includeIf.onbranch:wt.path", "onbranch.cfg");
+    git(main, "config", `includeIf.gitdir:${wtGitDir}.path`, "gitdir.cfg");
+    // native git's view from the linked worktree
+    const native = (key: string) => {
+      try {
+        return git(join(base, "wt"), "config", "--get", key).trim();
+      } catch {
+        return undefined;
+      }
+    };
+    expect([native("probe.worktree"), native("probe.onbranch"), native("probe.gitdir")]).toEqual([
+      "yes",
+      "yes",
+      "yes",
+    ]);
+    const files = createNodeFilesApi({ rootDir: base });
+    const { history } = await createGitFilesBackend({ files, gitDir: "main/.git" });
+    const worktree = createFileWorktree({
+      files,
+      rootPath: "main",
+      gitDir: "main/.git",
+      blobs: history.blobs,
+      trees: history.trees,
+    });
+    for (const configIncludes of [true, "files"] as const) {
+      const opened = await worktree.openRepository?.(wtGitDir, { configIncludes });
+      const config = opened?.config;
+      if (!config) throw new Error("not opened");
+      expect([
+        config.getAll("probe.worktree"),
+        config.getAll("probe.onbranch"),
+        config.getAll("probe.gitdir"),
+      ]).toEqual([["yes"], ["yes"], ["yes"]]);
+    }
   });
 });

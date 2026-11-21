@@ -65,7 +65,7 @@ import { createGitFilesBackend } from "../../create-git-files-backend.js";
 import { parseGitfile } from "../git-dir/index.js";
 import { openGitLinkedWorktrees } from "../linked-worktrees/index.js";
 import { FileStagingStore } from "../staging/index.js";
-import { createWorkingCopyConfig } from "../working-copy/index.js";
+import { configFilesApiOf, createWorkingCopyConfig } from "../working-copy/index.js";
 import { type CaseFolding, probeCaseFolding } from "./probe-case-folding.js";
 
 /**
@@ -1388,7 +1388,12 @@ export class FileWorktree implements Worktree {
     const environment = this.environment ? { environment: this.environment } : {};
     const includes =
       options.configIncludes === undefined ? {} : { includes: options.configIncludes };
-    const backend = await createGitFilesBackend({ files, gitDir: commonDir, ...environment });
+    const backend = await createGitFilesBackend({
+      files,
+      gitDir: commonDir,
+      ...environment,
+      ...(options.configIncludes === undefined ? {} : { configIncludes: options.configIncludes }),
+    });
     const worktrees = await openGitLinkedWorktrees({
       files,
       gitDir,
@@ -1413,21 +1418,27 @@ export class FileWorktree implements Worktree {
         });
       }
     }
-    // the storage's root directory and links, for includes (git's host rule, or confined)
-    const posix = files as PosixFilesApi;
-    const config = await createWorkingCopyConfig(
-      {
-        read: async (p) => ((await files.exists(p)) ? readFile(files, p) : undefined),
-        write: (p, content) => files.write(p, [content]),
-        ...(files.rootDirectory ? { rootDirectory: files.rootDirectory } : {}),
-        ...(posix.lstat && posix.readlink
-          ? { lstat: posix.lstat.bind(posix), readlink: posix.readlink.bind(posix) }
-          : {}),
-      },
-      commonDir,
-      undefined,
-      { ...environment, ...includes },
-    );
+    // the storage's root directory and links, for includes (git's host rule, or confined);
+    // the git directory opened as the host names it (includeIf.gitdir), its own HEAD
+    // (includeIf.onbranch) and, for a linked worktree's, its config.worktree
+    const root = files.rootDirectory?.replace(/\/+$/, "");
+    const gitDirHost = root !== undefined ? `${root}/${gitDir.replace(/^\/+/, "")}` : undefined;
+    const config = await createWorkingCopyConfig(configFilesApiOf(files), commonDir, undefined, {
+      ...environment,
+      ...includes,
+      ...(gitDirHost !== undefined ? { gitDirPath: gitDirHost.replace(/\/+$/, "") } : {}),
+      ...(gitDir !== commonDir
+        ? {
+            worktreeConfigPath: `${gitDir}/config.worktree`,
+            readHead: async () => {
+              const head = (await files.exists(`${gitDir}/HEAD`))
+                ? decodeGitPath(await readFile(files, `${gitDir}/HEAD`)).trim()
+                : undefined;
+              return head?.startsWith("ref: ") ? head.slice(5).trim() : undefined;
+            },
+          }
+        : {}),
+    });
     const textOf = (o: { text: string | undefined }) => o.text ?? null;
     return {
       history,

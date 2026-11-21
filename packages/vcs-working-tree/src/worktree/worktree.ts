@@ -454,9 +454,11 @@ export interface OpenRepositoryOptions {
    * Which `include.path` / `includeIf.*.path` directives of the repository's own config are
    * followed. `true` (the default, as git): every one, a `~/`, absolute or climbing path read
    * from the host through the worktree's environment. `"files"`: only those naming a file
-   * inside the storage (no `~/` path, nothing above its root, no absolute path or symbolic
-   * link leading out of it), for a server whose repositories' owners must not read the
-   * host's files. `false`: none. The system and global files keep git's rules.
+   * inside the repository's own git directory (its common directory and, for a linked
+   * worktree's, that git directory: no other repository of the storage), where its symbolic
+   * links lead, no `~/` path, and no file above 1 MiB (our hardening; git has no limit), for a
+   * server whose repositories' owners must not read the host's files; none where the storage
+   * cannot tell links apart. `false`: none. The system and global files keep git's rules.
    */
   configIncludes?: boolean | "files";
 }

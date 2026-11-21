@@ -49,7 +49,7 @@ import type {
   SymbolicRef,
   SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
-import { isSymbolicRef } from "@statewalker/vcs-core";
+import { isSymbolicRef, RefTransactionAbortedError } from "@statewalker/vcs-core";
 import { appendByRewrite, joinPath } from "@statewalker/vcs-utils/files";
 
 import type { FilesRefBatchOptions } from "./files-ref-batch.js";
@@ -101,8 +101,6 @@ class WorktreeRefs implements Refs {
   private readonly common: Refs;
   private readonly own: Refs;
   private transactionHook?: RefTransactionHook;
-  /** The refs of the repository's batch in flight, as this worktree's batch asked for them */
-  private askedAs?: Map<string, AskedAs>;
 
   constructor(private readonly options: WorktreeRefsOptions) {
     this.common = options.common;
@@ -123,9 +121,8 @@ class WorktreeRefs implements Refs {
   setTransactionHook(hook: RefTransactionHook | undefined): void {
     this.transactionHook = hook;
     (this.own as HookableRefs).setTransactionHook?.(hook);
-    (this.common as HookableRefs).setTransactionHook?.(
-      hook ? (state, updates, context) => hook(state, this.asAsked(updates), context) : undefined,
-    );
+    // each batch passes its own hook, telling the updates as it asked for them (asAsked)
+    (this.common as HookableRefs).setTransactionHook?.(hook);
   }
 
   /** The hook {@link setTransactionHook} installed, if any. */
@@ -134,9 +131,11 @@ class WorktreeRefs implements Refs {
   }
 
   /** The repository's updates as this worktree's batch asked for them (`HEAD` for its branch). */
-  private asAsked(updates: readonly RefTransactionUpdate[]): readonly RefTransactionUpdate[] {
-    const asked = this.askedAs;
-    if (!asked) return updates;
+  private static asAsked(
+    asked: ReadonlyMap<string, AskedAs>,
+    updates: readonly RefTransactionUpdate[],
+  ): readonly RefTransactionUpdate[] {
+    if (asked.size === 0) return updates;
     return updates.map((u) => {
       const as = asked.get(u.name);
       if (!as || u.requested !== u.name) return u;
@@ -211,6 +210,9 @@ class WorktreeRefs implements Refs {
   async removeAll(refNames: string[], options?: RefRemoveAllOptions): Promise<void> {
     const own = refNames.filter(isPerWorktreeRef);
     const common = refNames.filter((n) => !isPerWorktreeRef(n));
+    // the repository's first: a transaction refused there (by the hook) deletes none of
+    // this worktree's own either, as git's delete_refs gives up the whole transaction; a
+    // ref that fails on its own (2.43's one-by-one deletion) leaves the others going
     let error: unknown;
     for (const [store, names] of [
       [this.common, common],
@@ -221,6 +223,7 @@ class WorktreeRefs implements Refs {
         if (store.removeAll) await store.removeAll(names, options);
         else for (const name of names) await store.remove(name, { deleteRefs: true });
       } catch (e) {
+        if (e instanceof RefTransactionAbortedError) throw e;
         error ??= e;
       }
     }
@@ -271,13 +274,18 @@ class WorktreeRefs implements Refs {
     const before = new Map<string, ObjectId | undefined>();
     for (const { name } of logged) before.set(name, (await this.common.resolve(name))?.objectId);
     if (commonCommands.length > 0) {
-      this.askedAs = askedAs;
-      let result: BatchResult;
-      try {
-        result = await this.common.batch(commonCommands, options);
-      } finally {
-        this.askedAs = undefined;
-      }
+      // this batch's own hook (concurrent batches each tell their updates as they asked)
+      const hook = this.transactionHook;
+      const result = await this.common.batch(
+        commonCommands,
+        hook
+          ? {
+              ...options,
+              transactionHook: (state, updates, context) =>
+                hook(state, WorktreeRefs.asAsked(askedAs, updates), context),
+            }
+          : options,
+      );
       if (!result.ok) return result;
     }
     // the worktree's HEAD records an update made through it (split_head_update), even one
