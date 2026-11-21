@@ -467,3 +467,54 @@ describeGit("served smart HTTP: the client's variables, decoded paths, missing d
     );
   });
 });
+
+/**
+ * git 2.5x's configured hooks of the served repository (`hook.<name>.*`): receive-pack runs
+ * every receive hook through the hook API, so the configured ones run before the scripts, as
+ * for a local push (git 2.43 ignores them).
+ */
+describeGit("served smart HTTP: configured receive hooks (as git http-backend runs them)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "http-served-config-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const logCommand = (name: string, code = 0) =>
+    `f() { { printf '== cfg-${name}'; printf ' [%s]' "$@"; printf ' GIT_DIR=%s pwd=%s\\n' "$GIT_DIR" "$(pwd)"; input=$(cat); if [ -n "$input" ]; then printf 'stdin:\\n%s\\n' "$input"; fi; } >> "$HOOK_LOG"; echo hook cfg-${name} out; return ${code}; }; f`;
+
+  it("each configured receive hook runs before the script; a refusing one declines", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    const bare = join(dir, "bare.git");
+    for (const event of [...RECEIVE_HOOKS, "reference-transaction"]) {
+      git(bare, ["config", `hook.c-${event}.event`, event]);
+      git(bare, ["config", `hook.c-${event}.command`, logCommand(event)]);
+    }
+    const { theirs } = await expectTwins(dir, ["push", "<url>/bare.git", "main", "other"], "push");
+    if (nativeIs25x) expect(logOf(theirs)).toContain("== cfg-reference-transaction [prepared]");
+    await expectTwins(dir, ["push", "<url>/bare.git", "main"], "configured update refuses", {
+      prepare: (t) =>
+        git(join(t.dir, "bare.git"), ["config", "hook.c-update.command", logCommand("update", 1)]),
+    });
+  });
+});
+
+/**
+ * A broken `hook.<name>.*` configuration of the served repository (git 2.5x): receive-pack
+ * dies on its pre-receive lookup, http-backend's answer ends without a status report, and
+ * the client fails as native git's does; no ref moves (git 2.43 ignores the configuration).
+ */
+describeGit("served smart HTTP: a broken hook configuration (as git http-backend)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "http-served-broken-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("hook.x.event without a command: the push fails, no ref moves", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    git(join(dir, "bare.git"), ["config", "hook.x.event", "post-receive"]);
+    const { native } = await expectTwins(dir, ["push", "<url>/bare.git", "main"], "broken");
+    if (nativeIs25x) expect(native.status).not.toBe(0);
+  });
+});

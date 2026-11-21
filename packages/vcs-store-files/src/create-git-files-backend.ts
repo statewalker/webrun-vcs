@@ -188,6 +188,7 @@ export async function createGitFilesBackend(
     logAllRefUpdates: options.logAllRefUpdates ?? reflog.logAllRefUpdates,
     reflogIdentity: options.reflogIdentity ?? reflog.identity,
     peel: (id) => peelTag(objects, id),
+    hasObject: (id) => objects.has(id),
   });
   // GIT_GRAFT_FILE: the environment's grafts file is the one read (gc, repack and the
   // walks keep and follow its grafts), in place of info/grafts; a relative one from the

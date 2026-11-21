@@ -15,6 +15,7 @@ import {
   openDuplexReceivePackConnection,
   type ReceiveCommand,
   type ReceivePackConnection,
+  ReceivePackDiedError,
   type ReceivePackHookContext,
   type ReceivePackHooks,
   type ServedRequestContext,
@@ -25,8 +26,13 @@ import {
 } from "@statewalker/vcs-transport";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { LinkedWorktrees, OpenedRepository, WorkingCopy } from "@statewalker/vcs-working-tree";
-import { TransportError } from "../errors/index.js";
-import { HookSession, hookHostOf, refTransactionHookOf } from "./git-hooks.js";
+import { GitApiError, TransportError } from "../errors/index.js";
+import {
+  HookSession,
+  hookHostOf,
+  hookSettingsFromEntries,
+  refTransactionHookOf,
+} from "./git-hooks.js";
 import { ReadTreeCommand } from "./read-tree-command.js";
 import { StatusCommand } from "./status-command.js";
 import { repositoryPlaceOf, usesBranch, worktreeUsingBranch } from "./worktree-support.js";
@@ -467,6 +473,14 @@ export function remoteHookSession(
     layout: async () => ({ files: files as FilesApi, top, gitDir, cwd: gitDir, bare: remote.bare }),
     configValue: setting,
     environment: () => local.environment(),
+    // git 2.5x's configured hooks (hook.<name>.*) of the receiving repository: receive-pack
+    // runs pre-receive, update, post-receive, post-update, push-to-checkout and
+    // reference-transaction through the hook API (only proc-receive through find_hook)
+    hookSettings: () => {
+      const config = remote.config;
+      if (!config) return [];
+      return hookSettingsFromEntries(config.listWithOrigin?.() ?? config.list());
+    },
   });
 }
 
@@ -591,16 +605,24 @@ function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
     ctx: ReceivePackHookContext,
     options: { args?: string[]; stdin?: string; env?: Record<string, string> },
   ) => {
-    const result = await hooks.run(name, {
-      ...options,
-      env: {
-        ...hookClientEnv(hooks, ctx),
-        GIT_DIR: ".",
-        ...(await quarantineEnv(hooks, ctx)),
-        ...(options.env ?? {}),
-      },
-      prefix: false,
-    });
+    const result = await hooks
+      .run(name, {
+        ...options,
+        env: {
+          ...hookClientEnv(hooks, ctx),
+          GIT_DIR: ".",
+          ...(await quarantineEnv(hooks, ctx)),
+          ...(options.env ?? {}),
+        },
+        prefix: false,
+      })
+      .catch((error: unknown) => {
+        // receive-pack dies looking the hook up (a broken hook.* configuration)
+        if (error instanceof GitApiError && error.message.startsWith("fatal: ")) {
+          throw new ReceivePackDiedError(error.message.slice("fatal: ".length));
+        }
+        throw error;
+      });
     if (result?.stderr) await ctx.message(result.stderr);
     return result;
   };

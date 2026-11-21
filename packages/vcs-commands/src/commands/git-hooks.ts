@@ -100,6 +100,19 @@ function normalizeFilesPath(path: string): string {
   return out.join("/");
 }
 
+/** Whether resolving `..` components of a FilesApi path climbs above the root. */
+function leavesFilesRoot(path: string): boolean {
+  let depth = 0;
+  for (const part of path.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (depth === 0) return true;
+      depth--;
+    } else depth++;
+  }
+  return false;
+}
+
 /** `path` relative to `from` (both FilesApi paths). */
 function relativeFilesPath(from: string, path: string): string {
   const a = normalizeFilesPath(from).split("/").filter(Boolean);
@@ -172,6 +185,8 @@ export interface HookSetting {
   file?: string;
   /** Its line in that file, from 1 */
   line?: number;
+  /** The scope of that file (git's `config_scope_name`: `local`, `global`, ...) */
+  scope?: string;
 }
 
 /** The hook host of a working copy. */
@@ -198,7 +213,7 @@ function hookSettingsOf(workingCopy: WorkingCopy): HookSetting[] {
   } catch {
     return [];
   }
-  const found: Array<HookSetting & { file?: string; line?: number; seq: number }> = [];
+  const found: Array<HookSetting & { seq: number }> = [];
   for (const name of names) {
     for (const variable of HOOK_VARIABLES) {
       const key = `hook.${name}.${variable}`;
@@ -211,6 +226,7 @@ function hookSettingsOf(workingCopy: WorkingCopy): HookSetting[] {
           value: where.text,
           ...(where.file !== undefined ? { file: where.file } : {}),
           ...(where.line !== undefined ? { line: where.line } : {}),
+          ...(where.scope !== undefined ? { scope: where.scope } : {}),
           seq: found.length,
         });
       }
@@ -229,13 +245,41 @@ function hookSettingsOf(workingCopy: WorkingCopy): HookSetting[] {
       const [fb, lb] = rank(b);
       return (fa as number) - (fb as number) || (la as number) - (lb as number) || a.seq - b.seq;
     })
-    .map(({ name, variable, value, file, line }) => ({
-      name,
+    .map(({ seq: _seq, ...setting }) => setting);
+}
+
+/**
+ * The `hook.<name>.<variable>` settings (event, command, enabled) among a configuration's
+ * entries in the order git reads them (an opened repository's `listWithOrigin`, else `list`
+ * without origins): the hook settings of a repository a push reaches.
+ */
+export function hookSettingsFromEntries(
+  entries: ReadonlyArray<{
+    key: string;
+    value: string | null;
+    file?: string;
+    line?: number;
+    scope?: string;
+  }>,
+): HookSetting[] {
+  const out: HookSetting[] = [];
+  for (const e of entries) {
+    const first = e.key.indexOf(".");
+    const last = e.key.lastIndexOf(".");
+    if (first < 0 || last <= first) continue;
+    if (e.key.slice(0, first).toLowerCase() !== "hook") continue;
+    const variable = e.key.slice(last + 1).toLowerCase();
+    if (variable !== "event" && variable !== "command" && variable !== "enabled") continue;
+    out.push({
+      name: e.key.slice(first + 1, last),
       variable,
-      value,
-      ...(file !== undefined ? { file } : {}),
-      ...(line !== undefined ? { line } : {}),
-    }));
+      value: e.value === null ? undefined : e.value,
+      ...(e.file !== undefined ? { file: e.file } : {}),
+      ...(e.line !== undefined ? { line: e.line } : {}),
+      ...(e.scope !== undefined ? { scope: e.scope } : {}),
+    });
+  }
+  return out;
 }
 
 /** git's hook names (hook-list.h, from githooks(5)): no friendly name may be one of them. */
@@ -269,6 +313,11 @@ const KNOWN_HOOKS = new Set([
   "sendemail-validate",
   "update",
 ]);
+
+/** Whether `name` is one of git's hooks (hook.c `is_known_hook`, hook-list.h). */
+export function isKnownHook(name: string): boolean {
+  return KNOWN_HOOKS.has(name);
+}
 
 /**
  * What git 2.5x dies with (or warns of) on reading the configured hooks, which it does on
@@ -343,37 +392,51 @@ export function hookSettingsCheck(settings: readonly HookSetting[]): {
   return { warnings };
 }
 
+/** One configured hook of an event, as git 2.5x's `list_hooks` keeps it (`git hook list`). */
+export interface ConfiguredHookEntry {
+  /** Its friendly name (`hook.<name>`) */
+  name: string;
+  /** Its `hook.<name>.command` (absent: only a disabled hook may have none) */
+  command?: string;
+  /** `hook.<name>.enabled=false` */
+  disabled: boolean;
+  /** The whole event is disabled (`hook.<event>.enabled=false`, `<event>` no friendly name) */
+  eventDisabled: boolean;
+  /** The scope of its last event line (`local`, `global`, ...), where the config tells */
+  scope?: string;
+}
+
 /**
- * git 2.5x's configured hooks of `event` (hook.c `build_hook_config_map`): the friendly
- * names whose `hook.<name>.event` names it, in the order of their last such line (an empty
- * value drops the name from every event), each with its last `hook.<name>.command`; those
- * `hook.<name>.enabled=false` disables are left out, and all of them when the event itself
- * is disabled (`hook.<event>.enabled=false`, `<event>` not a friendly name). A name with no
- * command is left out (git refuses to run any hook then).
+ * git 2.5x's configured hooks of `event` (hook.c `build_hook_config_map`,
+ * `list_hooks_add_configured`): the friendly names whose `hook.<name>.event` names it, in the
+ * order of their last such line (an empty value drops the name from every event), each with
+ * its last `hook.<name>.command`, whether `hook.<name>.enabled=false` disables it and whether
+ * the event itself is disabled (`hook.<event>.enabled=false`, `<event>` not a friendly name).
+ * Disabled ones are kept, as `git hook list` shows them; none of them runs.
  */
-export function configuredHooks(
+export function configuredHookEntries(
   settings: readonly HookSetting[],
   event: string,
-): Array<{ name: string; command: string }> {
-  const events = new Map<string, string[]>();
+): ConfiguredHookEntry[] {
+  const events = new Map<string, Array<{ name: string; scope?: string }>>();
   const commands = new Map<string, string>();
   const disabled = new Set<string>();
+  const drop = (list: Array<{ name: string }>, name: string) => {
+    const at = list.findIndex((e) => e.name === name);
+    if (at >= 0) list.splice(at, 1);
+  };
   for (const s of settings) {
     if (s.variable === "event") {
       if (s.value === undefined) continue;
       if (s.value === "") {
         // an empty value drops the name from every event
-        for (const list of events.values()) {
-          const at = list.indexOf(s.name);
-          if (at >= 0) list.splice(at, 1);
-        }
+        for (const list of events.values()) drop(list, s.name);
         continue;
       }
       // moved to the end of its event's list (last-seen order)
       const list = events.get(s.value) ?? [];
-      const at = list.indexOf(s.name);
-      if (at >= 0) list.splice(at, 1);
-      list.push(s.name);
+      drop(list, s.name);
+      list.push({ name: s.name, ...(s.scope !== undefined ? { scope: s.scope } : {}) });
       events.set(s.value, list);
     } else if (s.variable === "command") {
       if (s.value !== undefined) commands.set(s.name, s.value);
@@ -384,16 +447,45 @@ export function configuredHooks(
     }
   }
   const friendly = (name: string) =>
-    commands.has(name) || [...events.values()].some((list) => list.includes(name));
-  if (disabled.has(event) && !friendly(event)) return [];
-  const out: Array<{ name: string; command: string }> = [];
-  for (const name of events.get(event) ?? []) {
+    commands.has(name) || [...events.values()].some((list) => list.some((e) => e.name === name));
+  const eventDisabled = disabled.has(event) && !friendly(event);
+  return (events.get(event) ?? []).map(({ name, scope }) => {
     const command = commands.get(name);
-    if (command === undefined || disabled.has(name)) continue;
-    out.push({ name, command });
+    return {
+      name,
+      ...(command !== undefined ? { command } : {}),
+      disabled: disabled.has(name),
+      eventDisabled,
+      ...(scope !== undefined ? { scope } : {}),
+    };
+  });
+}
+
+/**
+ * git 2.5x's configured hooks of `event` that run (see {@link configuredHookEntries}): those
+ * neither disabled nor of a disabled event. A name with no command is left out (git refuses
+ * to run any hook then, see {@link hookSettingsCheck}).
+ */
+export function configuredHooks(
+  settings: readonly HookSetting[],
+  event: string,
+): Array<{ name: string; command: string }> {
+  const out: Array<{ name: string; command: string }> = [];
+  for (const e of configuredHookEntries(settings, event)) {
+    if (e.command === undefined || e.disabled || e.eventDisabled) continue;
+    out.push({ name: e.name, command: e.command });
   }
   return out;
 }
+
+/** One hook `git hook list` lists: a configured one or the hooks directory's script. */
+export type HookListEntry =
+  | ({ kind: "configured" } & ConfiguredHookEntry)
+  | {
+      kind: "traditional";
+      /** The script's path as git names it (`.git/hooks/pre-commit`) */
+      path: string;
+    };
 
 /** A hook to run: a script of the hooks directory or one the configuration defines. */
 type HookToRun =
@@ -660,6 +752,46 @@ export class HookSession {
     return hostPathOf(layout.files, filesPath) ?? relativeFilesPath(layout.cwd, filesPath);
   }
 
+  /**
+   * The bytes of a file a git option names (`git hook run --to-stdin=<path>`): a relative
+   * path from the directory git runs in (the worktree top, the git directory when bare),
+   * through the repository's FilesApi; an absolute one through it when it lies there, else
+   * through the host. Undefined when it cannot be read.
+   */
+  async readFileAt(path: string): Promise<Uint8Array | undefined> {
+    const layout = await this.host.layout();
+    const environment = this.host.environment();
+    // A relative path that climbs above the FilesApi's root names a host file outside it:
+    // resolve it against the host path of the directory git runs in, never clamp it.
+    let hostPath = path.startsWith("/") ? path : undefined;
+    let filesPath: string | undefined;
+    if (layout && !path.startsWith("/")) {
+      const joined = joinFilesPath(layout.cwd, path);
+      if (leavesFilesRoot(joined)) {
+        const hostCwd = hostPathOf(layout.files, layout.cwd);
+        if (!hostCwd) return undefined;
+        hostPath = `/${normalizeFilesPath(`${hostCwd}/${path}`)}`;
+        filesPath = filesPathOfHost(layout.files, hostPath);
+      } else {
+        filesPath = normalizeFilesPath(joined);
+      }
+    } else if (layout && hostPath) {
+      filesPath = filesPathOfHost(layout.files, hostPath);
+    }
+    try {
+      if (layout && filesPath !== undefined) {
+        if ((await layout.files.stats(filesPath))?.kind !== "file") return undefined;
+        const chunks: Uint8Array[] = [];
+        for await (const chunk of layout.files.read(filesPath)) chunks.push(chunk);
+        return chunks.length === 1 ? chunks[0] : concat(chunks);
+      }
+      if (hostPath && environment) return await environment.readFile(hostPath);
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+
   /** The git directory's absolute host path, where the repository's files have one. */
   async hostGitDir(): Promise<string | undefined> {
     const layout = await this.host.layout();
@@ -685,6 +817,26 @@ export class HookSession {
     }
     const found = await this.find(name, advise);
     if (found) out.push({ kind: "traditional", found });
+    return out;
+  }
+
+  /**
+   * Every hook of `name` git 2.5x's `list_hooks` keeps, in order (`git hook list`): the
+   * configured ones, disabled ones included (see {@link configuredHookEntries}; none under
+   * 2.43), then the hooks directory's script ({@link find}, its hint given). Throws git's
+   * fatal error for a broken `hook.*` configuration.
+   */
+  async listAll(name: string): Promise<HookListEntry[]> {
+    const out: HookListEntry[] = [];
+    if (this.compatibility !== "2.43") {
+      const settings = this.host.hookSettings?.() ?? [];
+      if (settings.length > 0) this.checkSettings(settings);
+      for (const entry of configuredHookEntries(settings, name)) {
+        out.push({ kind: "configured", ...entry });
+      }
+    }
+    const found = await this.find(name);
+    if (found) out.push({ kind: "traditional", path: found.path });
     return out;
   }
 

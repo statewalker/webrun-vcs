@@ -28,6 +28,7 @@ import type {
   BatchResult,
   FilesApi,
   ObjectId,
+  PackRefsOptions,
   Ref,
   RefCommand,
   RefLogOptions,
@@ -256,10 +257,7 @@ class WorktreeRefs implements Refs {
     return store.deleteReflogEntry(name, index, options);
   }
 
-  async packRefs(
-    refNames: string[],
-    options?: { all?: boolean; deleteLoose?: boolean },
-  ): Promise<void> {
-    await this.common.packRefs?.(refNames, options);
+  async packRefs(refNames: string[], options?: PackRefsOptions): Promise<number> {
+    return (await this.common.packRefs?.(refNames, options)) ?? 0;
   }
 }

@@ -32,6 +32,8 @@ import {
   FormatPatchCommand,
   FsckCommand,
   GarbageCollectCommand,
+  HookListCommand,
+  HookRunCommand,
   InitCommand,
   ListBranchCommand,
   ListTagCommand,
@@ -734,6 +736,35 @@ export class Git implements Disposable {
   verifyPack(): VerifyPackCommand {
     this.checkClosed();
     return new VerifyPackCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a HookRunCommand that runs a hook (`git hook run <hook-name>`): the configured
+   * hooks (git 2.5x) and the hooks directory's script, through the host's hook runner.
+   *
+   * @example
+   * ```typescript
+   * const { exitCode, output } = await git.hookRun("pre-commit").setIgnoreMissing(true).call();
+   * ```
+   */
+  hookRun(name?: string): HookRunCommand {
+    this.checkClosed();
+    const command = new HookRunCommand(this._workingCopy);
+    return name === undefined ? command : command.setHookName(name);
+  }
+
+  /**
+   * Create a HookListCommand that lists the hooks of an event (git 2.5x `git hook list`).
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.hookList("pre-commit").call(); // "lint\nhook from hookdir\n"
+   * ```
+   */
+  hookList(name?: string): HookListCommand {
+    this.checkClosed();
+    const command = new HookListCommand(this._workingCopy);
+    return name === undefined ? command : command.setHookName(name);
   }
 
   /**

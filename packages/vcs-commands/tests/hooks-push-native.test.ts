@@ -8,7 +8,7 @@
  * Each case runs native git in one copy of a pusher and its bare remote and ours (with the
  * Node hook runner) in the other.
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -17,7 +17,7 @@ import {
 } from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { HookFailedError, type PushCommand, PushStatus } from "../src/index.js";
+import { HookFailedError, type PushCommand, PushStatus, TransportError } from "../src/index.js";
 import {
   type HookTwin,
   hookExit,
@@ -508,3 +508,210 @@ describeGit("push hooks: reference-transaction on the receive side (as native gi
     expect(String(error?.message)).toContain(fatal);
   });
 });
+
+/**
+ * git 2.5x's configured hooks (`hook.<name>.*` of the receiving repository) on the receive
+ * side: receive-pack runs pre-receive, update, post-receive, post-update, push-to-checkout
+ * and reference-transaction through the hook API (only proc-receive through `find_hook`), so
+ * each configured one runs before the hooks directory's script, with the same arguments,
+ * stdin and variables, its output relayed alike. git 2.43 ignores them.
+ */
+describeGit("push hooks: configured hooks of the receiving repository (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-push-config-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /**
+   * A configured hook's command: logs its name, arguments, `GIT_DIR`, directory and stdin to
+   * `$HOOK_LOG`, says `hook cfg-<name> out` / `err`, then exits with `code`.
+   */
+  const logCommand = (name: string, code = 0) =>
+    `f() { { printf '== cfg-${name}'; printf ' [%s]' "$@"; printf ' GIT_DIR=%s pwd=%s\\n' "$GIT_DIR" "$(pwd)"; input=$(cat); if [ -n "$input" ]; then printf 'stdin:\\n%s\\n' "$input"; fi; } >> "$HOOK_LOG"; echo hook cfg-${name} out; echo hook cfg-${name} err >&2; return ${code}; }; f`;
+
+  function configure(dir: string, refuse?: string): void {
+    const bare = join(dir, "bare.git");
+    const events = [...RECEIVE_HOOKS, "reference-transaction"];
+    for (const event of events) {
+      const name = `c-${event}`;
+      git(bare, ["config", `hook.${name}.event`, event]);
+      git(bare, ["config", `hook.${name}.command`, logCommand(event, event === refuse ? 1 : 0)]);
+    }
+    // a disabled one runs nowhere
+    git(bare, ["config", "hook.off.event", "pre-receive"]);
+    git(bare, ["config", "hook.off.command", logCommand("off")]);
+    git(bare, ["config", "hook.off.enabled", "false"]);
+  }
+
+  it("each configured receive hook runs before the script", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    configure(dir);
+    await expectPush(
+      dir,
+      ["../bare.git", "main", "other"],
+      (p) => p.setRemote("../bare.git").add("main").add("other"),
+      "push",
+    );
+  });
+
+  it("a refusing configured pre-receive or update declines the refs", async () => {
+    for (const refuse of ["pre-receive", "update"]) {
+      const dir = join(root, `r-${refuse}`);
+      base(dir);
+      configure(dir, refuse);
+      await expectPush(
+        dir,
+        ["../bare.git", "main"],
+        (p) => p.setRemote("../bare.git").add("main"),
+        `${refuse} refused`,
+      );
+    }
+  });
+
+  it("a configured push-to-checkout runs in place of push-to-deploy", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    const dst = join(dir, "dst");
+    mkdirSync(dst);
+    git(dst, ["init", "-q", "-b", "main"]);
+    putFile(dst, "d.txt", "d\n");
+    git(dst, ["add", "-A"]);
+    git(dst, ["commit", "-qm", "d"]);
+    git(dst, ["config", "receive.denyCurrentBranch", "updateInstead"]);
+    git(dst, ["config", "hook.deploy.event", "push-to-checkout"]);
+    for (const refuse of [false, true]) {
+      git(dst, ["config", "hook.deploy.command", logCommand("push-to-checkout", refuse ? 1 : 0)]);
+      const [theirs, mine] = hookTwins(root, dir);
+      const native = gitRun(
+        root,
+        join(theirs.dir, "src"),
+        ["push", "-f", "../dst", "main"],
+        theirs.env,
+      );
+      const env = mine.env;
+      const ours = await openOurs(
+        mine.dir,
+        createNodeGitHostEnvironment({
+          env,
+          hookRunner: createNodeHookRunner({ env, compatibility: nativeIs25x ? "2.56" : "2.43" }),
+        }),
+        undefined,
+        "src",
+      );
+      const result = await ours.push().setRemote("../dst").add("+main").call();
+      expect(logOf(mine), `refuse ${refuse}: log`).toBe(logOf(theirs));
+      if (nativeIs25x) expect(logOf(mine)).toContain("cfg-push-to-checkout");
+      expect(result.remoteUpdates[0]?.status === PushStatus.OK, `refuse ${refuse}`).toBe(
+        native.status === 0,
+      );
+      expect(git(join(mine.dir, "dst"), ["for-each-ref"])).toBe(
+        git(join(theirs.dir, "dst"), ["for-each-ref"]),
+      );
+      expect(git(join(mine.dir, "dst"), ["status", "--porcelain"])).toBe(
+        git(join(theirs.dir, "dst"), ["status", "--porcelain"]),
+      );
+    }
+  });
+});
+
+/**
+ * A broken `hook.<name>.*` configuration of the receiving repository (git 2.5x): receive-pack
+ * dies on its first hook lookup (pre-receive), whatever event the broken hook names, so the
+ * push fails with its fatal line and send-pack's "the remote end hung up unexpectedly", no
+ * ref moved; git 2.43 ignores the configuration.
+ */
+describeGit("push hooks: a broken hook configuration of the receiving repository", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-push-broken-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  async function pushTwins(dir: string, label: string) {
+    const [theirs, mine] = hookTwins(root, dir);
+    const native = gitRun(
+      root,
+      join(theirs.dir, "src"),
+      ["push", "../bare.git", "main"],
+      theirs.env,
+    );
+    const env = mine.env;
+    const ours = await openOurs(
+      mine.dir,
+      createNodeGitHostEnvironment({
+        env,
+        hookRunner: createNodeHookRunner({ env, compatibility: nativeIs25x ? "2.56" : "2.43" }),
+      }),
+      undefined,
+      "src",
+    );
+    let error: Error | undefined;
+    try {
+      await ours.push().setRemote("../bare.git").add("main").call();
+    } catch (e) {
+      error = e as Error;
+    }
+    expect(logOf(mine), `${label}: log`).toBe(logOf(theirs));
+    expect(error !== undefined, `${label}: failed (${String(error)} / ${native.stderr})`).toBe(
+      native.status !== 0,
+    );
+    expect(git(join(mine.dir, "bare.git"), ["for-each-ref"]), `${label}: refs`).toBe(
+      git(join(theirs.dir, "bare.git"), ["for-each-ref"]),
+    );
+    return { native, error };
+  }
+
+  for (const event of ["pre-receive", "post-receive"]) {
+    it(`hook.x.event=${event} without a command: receive-pack dies`, async () => {
+      const dir = join(root, "r");
+      base(dir);
+      git(join(dir, "bare.git"), ["config", "hook.x.event", event]);
+      const { native, error } = await pushTwins(dir, event);
+      if (!nativeIs25x) return;
+      expect(native.status).toBe(128);
+      const fatal =
+        "fatal: 'hook.x.command' must be configured or 'hook.x.event' must be removed; aborting.";
+      expect(native.stderr).toContain(fatal);
+      expect(native.stderr).toContain("fatal: the remote end hung up unexpectedly");
+      expect(error).toBeInstanceOf(TransportError);
+      expect(String(error?.message)).toContain(fatal);
+      expect(String(error?.message)).toContain("fatal: the remote end hung up unexpectedly");
+    });
+  }
+});
+
+/**
+ * The receiving repository's config reaches its hooks through its include directives: a
+ * configured pre-receive (git 2.5x) defined in `include.path=../inc`, beside the bare
+ * repository.
+ */
+describeGit(
+  "push hooks: configured hooks from an included file of the receiving repository",
+  () => {
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "hooks-push-include-"));
+    });
+    afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+    it("include.path=../inc: its configured pre-receive runs", async () => {
+      const dir = join(root, "r");
+      base(dir);
+      writeFileSync(
+        join(dir, "inc"),
+        '[hook "inc"]\n\tevent = pre-receive\n\tcommand = "echo == inc-pre-receive >> \\"$HOOK_LOG\\"; echo hook inc out"\n',
+      );
+      git(join(dir, "bare.git"), ["config", "include.path", "../inc"]);
+      await expectPush(
+        dir,
+        ["../bare.git", "main"],
+        (p) => p.setRemote("../bare.git").add("main"),
+        "include",
+      );
+      if (nativeIs25x) {
+        const [theirs] = hookTwins(root, dir);
+        gitRun(root, join(theirs.dir, "src"), ["push", "../bare.git", "main"], theirs.env);
+        expect(logOf(theirs)).toContain("== inc-pre-receive");
+      }
+    });
+  },
+);

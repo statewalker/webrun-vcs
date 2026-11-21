@@ -10,6 +10,7 @@ import type {
   BatchResult,
   FilesApi,
   ObjectId,
+  PackRefsOptions,
   Ref,
   RefCommand,
   RefLogOptions,
@@ -312,15 +313,17 @@ export class FileRefStore implements Refs {
    * Pack loose refs into packed-refs, as `git pack-refs`: packed-refs is written under
    * packed-refs.lock (waiting up to `packedLockTimeoutMs`, then throwing
    * `PackedRefsLockedError`), and only then is each packed loose ref removed, under its
-   * own lock and only if it still holds the packed value.
+   * own lock and only if it still holds the packed value. The reference-transaction hook
+   * ({@link setTransactionHook}) hears git's transactions: the packed store's, then one per
+   * pruned ref.
    */
-  async packRefs(
-    refNames: string[],
-    options?: { all?: boolean; deleteLoose?: boolean },
-  ): Promise<void> {
-    await this.ops.packRefs(refNames, {
+  async packRefs(refNames: string[], options?: PackRefsOptions): Promise<number> {
+    return this.ops.packRefs(refNames, {
       all: options?.all === true,
       prune: options?.deleteLoose ?? true,
+      ...(options?.prefixes ? { prefixes: options.prefixes } : {}),
+      ...(options?.auto ? { auto: true } : {}),
+      ...(options?.onError ? { onError: options.onError } : {}),
     });
   }
 }

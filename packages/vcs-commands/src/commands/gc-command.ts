@@ -31,6 +31,11 @@ export interface GCCommandResult {
   autoSkipped?: "not-needed" | "hook";
   /** `setAuto(true)` and run: git's "Auto packing the repository ..." lines (its stderr) */
   messages?: string[];
+  /**
+   * git's error lines while packing refs (its stderr, also in the hook output): a loose ref
+   * whose object is missing stays loose, a ref changed before its prune keeps its loose file
+   */
+  errors?: string[];
 }
 
 /** git's defaults: `gc.auto` loose objects, `gc.autoPackLimit` packs. */
@@ -241,8 +246,18 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
     // For now, we'll check if the ref store supports the gc operations
 
     // Check if refs support packRefs
+    // (`pack-refs --all --prune`; git 2.5x's `gc --auto` adds `--auto`, should_pack_refs)
+    const errors: string[] = [];
     if (this._packRefs && this.refsStore.packRefs) {
-      await this.refsStore.packRefs([], { all: true, deleteLoose: true });
+      await this.refsStore.packRefs([], {
+        all: true,
+        deleteLoose: true,
+        ...(this._auto && this.hooks.compatibility !== "2.43" ? { auto: true } : {}),
+        onError: (line) => {
+          errors.push(line);
+          this.hooks.append(`${line}\n`);
+        },
+      });
       refsPacked = true;
     }
 
@@ -276,6 +291,7 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
       durationMs: Date.now() - startTime,
       worktreesPruned,
       ...(this._auto ? { messages } : {}),
+      ...(errors.length > 0 ? { errors } : {}),
     };
   }
 }

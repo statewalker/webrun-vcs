@@ -6,7 +6,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -120,4 +120,42 @@ describeGit("pre-auto-gc hook: gc --auto as native git", () => {
     expect(hookLog(mine)).toBe(hookLog(theirs));
     expect(hookLog(mine)).toBe("");
   });
+});
+
+/**
+ * `gc --auto` packs refs with `pack-refs --all --prune`, which 2.5x runs with `--auto`
+ * (should_pack_refs: at least 16 loose refs while packed-refs is small); 2.43 always packs.
+ */
+describeGit("gc --auto: pack-refs --auto in 2.5x (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-auto-gc-refs-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  const refState = (dir: string) =>
+    [
+      spawnSync("find", [".git/refs", "-type", "f"], { cwd: dir })
+        .stdout.toString()
+        .split("\n")
+        .sort()
+        .join("\n"),
+      existsSync(join(dir, ".git/packed-refs"))
+        ? readFileSync(join(dir, ".git/packed-refs"), "latin1")
+        : "<none>",
+    ].join("\n");
+
+  for (const branches of [3, 20]) {
+    it(`${branches} loose branches: the refs packed as native git packs them`, async () => {
+      const dir = base(2);
+      for (let i = 1; i <= branches; i++) git(dir, ["branch", `b${i}`]);
+      installHooks(join(dir, ".git/hooks"), ["reference-transaction"]);
+      const [theirs, mine] = hookTwins(root, dir);
+      const native = gcAuto(theirs);
+      const result = await (await oursIn(mine)).gc().setAuto(true).call();
+      expect(native.status).toBe(0);
+      expect(result.autoSkipped).toBeUndefined();
+      expect(hookLog(mine)).toBe(hookLog(theirs));
+      expect(refState(mine.dir)).toBe(refState(theirs.dir));
+    });
+  }
 });

@@ -111,6 +111,8 @@ export async function openOurs(
       }
     },
     write: async (path: string, content: Uint8Array) => writeFileSync(join(dir, path), content),
+    // the host directory these paths are relative to (an include climbing above it)
+    rootDirectory: dir,
   };
   const config = new GitWorkingCopyConfig(
     io,

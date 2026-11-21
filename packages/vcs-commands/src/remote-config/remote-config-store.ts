@@ -85,6 +85,8 @@ export interface ConfigValueWhere {
   file?: string;
   /** The line in that file, from 1 */
   line?: number;
+  /** The scope of that file (`local`, `global`, `system`, `worktree`), where the config tells */
+  scope?: string;
 }
 
 const GIT_CONFIG_METHODS = [
