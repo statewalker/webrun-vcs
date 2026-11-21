@@ -168,6 +168,7 @@ export class DefaultSerializationApi implements SerializationApi {
       ...(shallow && shallow.length > 0 ? { shallow } : {}),
       includeTags: options.includeTags,
       ...(options.filter ? { filter: options.filter } : {}),
+      ...(options.maxTreeDepth !== undefined ? { maxTreeDepth: options.maxTreeDepth } : {}),
       onBoundary: options.thinPack && !bitmap ? (b) => boundary.push(b) : undefined,
     })) {
       listed.push(o);
@@ -216,6 +217,13 @@ export class DefaultSerializationApi implements SerializationApi {
       ...(r.quarantine ? { quarantine: r.quarantine } : {}),
       ...(r.quarantined !== undefined ? { quarantined: r.quarantined } : {}),
     };
+  }
+
+  /** Writes `pack-<id>.promisor` next to a kept pack (see `SerializationApi.markPromisorPack`). */
+  async markPromisorPack(packId: string, content: string): Promise<boolean> {
+    if (!this.packs?.writePromisor) return false;
+    await this.packs.writePromisor(packId, content);
+    return true;
   }
 
   /**

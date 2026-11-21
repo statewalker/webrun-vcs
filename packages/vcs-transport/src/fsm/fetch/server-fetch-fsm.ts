@@ -58,7 +58,7 @@ export const serverFetchTransitions: FsmTransition[] = [
   ["READ_WANTS", "WANTS_RECEIVED", "VALIDATE_WANTS"],
   ["READ_WANTS", "WANTS_WITH_SHALLOW", "VALIDATE_WANTS"], // Wants + shallow info
   ["READ_WANTS", "NO_WANTS", ""], // client has everything
-  ["READ_WANTS", "INVALID_REQUEST", "SEND_ERROR"], // a deepen line git refuses
+  ["READ_WANTS", "INVALID_REQUEST", "SEND_ERROR"], // a deepen or filter line git refuses
   ["READ_WANTS", "ERROR", ""],
 
   // Validate wants against policy (ADVERTISED, REACHABLE_COMMIT, TIP, ANY)
@@ -234,6 +234,11 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const config = getConfig(ctx);
       const state = getState(ctx);
       const output = getOutput(ctx);
+      // upload_pack_config dies on a filter setting it cannot read, before the advertisement
+      if (config.uploadPackFilter?.configError !== undefined) {
+        output.error = config.uploadPackFilter.configError;
+        return "ERROR";
+      }
       try {
         const repositoryShallow = await prepareServedShallow(ctx);
         const repository = getRepository(ctx);
@@ -287,6 +292,11 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const state = getState(ctx);
       const output = getOutput(ctx);
 
+      const configError = getConfig(ctx).uploadPackFilter?.configError;
+      if (configError !== undefined) {
+        output.error = configError;
+        return "ERROR";
+      }
       try {
         // a stateless request starts here (its advertisement was another request)
         await prepareServedShallow(ctx);
@@ -360,10 +370,21 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           } else if (line === "deepen-relative") {
             state.deepenRelative = true;
           } else if (line.startsWith("filter ")) {
-            // git dies at a second one (list_objects_filter_die_if_populated)
-            if (hasFilter) state.filterRepeated = true;
+            // receive_needs checks it as it reads the line, in the loop of the wants: the
+            // negotiated capability, one spec (list_objects_filter_die_if_populated), a
+            // parsable and allowed one; git dies on each (an allow-list refusal sent as ERR)
+            const spec = line.slice(7);
+            const refused = !state.capabilities.has("filter")
+              ? { message: "git upload-pack: filtering capability not negotiated", reported: false }
+              : hasFilter
+                ? { message: "multiple filter-specs cannot be combined", reported: false }
+                : checkUploadPackFilter(spec, getConfig(ctx).uploadPackFilter);
+            if (refused) {
+              output.error = refused.message;
+              return refused.reported ? "INVALID_REQUEST" : "ERROR";
+            }
             hasFilter = true;
-            state.filterSpec = state.filterSpec ?? line.slice(7);
+            state.filterSpec = spec;
           }
         }
       } catch (e) {
@@ -384,19 +405,6 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const refStore = getRefStore(ctx);
 
       try {
-        // receive_needs: a filter needs the negotiated capability, one spec, a parsable and
-        // allowed one; git dies on each (an allow-list refusal sent as ERR first)
-        if (state.filterSpec !== undefined) {
-          const refused = !state.capabilities.has("filter")
-            ? { message: "git upload-pack: filtering capability not negotiated", reported: false }
-            : state.filterRepeated
-              ? { message: "multiple filter-specs cannot be combined", reported: false }
-              : checkUploadPackFilter(state.filterSpec, config.uploadPackFilter);
-          if (refused) {
-            output.error = refused.message;
-            return refused.reported ? "INVALID_WANT" : "ERROR";
-          }
-        }
         const policy = config.requestPolicy ?? "ADVERTISED";
         // reachability counts hidden tips too, as git's allowReachableSHA1InWant
         const reachableFrom = config.hiddenRefs?.length

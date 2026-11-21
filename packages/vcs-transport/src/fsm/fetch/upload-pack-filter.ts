@@ -14,7 +14,13 @@
  * // { message: "expected 'tree:<depth>'", reported: false } (git dies without a packet)
  * ```
  */
-import { type ObjectFilter, ObjectFilterError, parseObjectFilter } from "@statewalker/vcs-core";
+import {
+  type ObjectFilter,
+  ObjectFilterError,
+  parseGitUlong,
+  parseObjectFilter,
+} from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 
 /** What upload-pack reads from `uploadpack.allowFilter` and `uploadpackfilter.*`. */
 export interface UploadPackFilterPolicy {
@@ -30,6 +36,13 @@ export interface UploadPackFilterPolicy {
   choices?: Readonly<Record<string, boolean>>;
   /** `uploadpackfilter.tree.maxDepth`: the deepest `tree:<depth>` served (default: any) */
   treeMaxDepth?: number;
+  /**
+   * A value of these keys git cannot read (`bad boolean config value '<v>' for '<key>'`,
+   * `bad numeric config value '<v>' for 'uploadpackfilter.tree.maxdepth' in file config:
+   * invalid unit`, `missing value for '<key>'`): upload-pack dies reading its config, before
+   * it advertises anything (git 2.43's v2 advertisement still went out, its fetch died)
+   */
+  configError?: string;
 }
 
 /** Why a filter request is refused (see {@link checkUploadPackFilter}). */
@@ -108,26 +121,39 @@ export function withFilterFeature(
   });
 }
 
-/** git's `git_config_bool` of a config value; undefined for none it can read. */
-function configBool(value: unknown): boolean | undefined {
-  if (value === null || value === true) return true;
-  if (value === false) return false;
-  if (value === undefined) return undefined;
-  const text = String(value).trim().toLowerCase();
-  if (["true", "yes", "on"].includes(text)) return true;
-  if (["false", "no", "off", ""].includes(text)) return false;
-  const n = Number(text);
-  return Number.isFinite(n) ? n !== 0 : undefined;
+/** The key as git names it in its messages: section and variable lowercased. */
+function canonicalKey(key: string): string {
+  const first = key.indexOf(".");
+  const last = key.lastIndexOf(".");
+  if (first < 0) return key.toLowerCase();
+  return `${key.slice(0, first).toLowerCase()}${key.slice(first, last + 1)}${key.slice(last + 1).toLowerCase()}`;
 }
 
-/** git's `git_config_ulong` (a `k`/`m`/`g` unit allowed); undefined for anything else. */
-function configUlong(value: unknown): number | undefined {
-  if (typeof value !== "string") return undefined;
-  const m = /^\s*\+?(\d+)([kmg]?)$/i.exec(value);
-  if (!m) return undefined;
-  const unit = (m[2] ?? "").toLowerCase();
-  const factor = unit === "k" ? 1024 : unit === "m" ? 1024 ** 2 : unit === "g" ? 1024 ** 3 : 1;
-  return Number(m[1]) * factor;
+/** A config value as the text git read (a key without `=` is null or true here). */
+function configText(value: unknown): string | undefined {
+  if (value === null || value === undefined || value === true) return undefined;
+  return String(value);
+}
+
+/** git's `git_config_bool`: the value, or the message git dies with. */
+function configBool(key: string, value: unknown): boolean | string {
+  const b = parseGitBool(value === null ? true : value);
+  return b ?? `bad boolean config value '${configText(value) ?? ""}' for '${canonicalKey(key)}'`;
+}
+
+/**
+ * git's `git_config_ulong` (strtoumax with base 0: hex and octal, a `k`/`m`/`g` unit), from
+ * a value read in the repository's `config` (upload-pack runs in the git directory): the
+ * number, or the message git dies with.
+ */
+function configUlong(key: string, value: unknown): number | string {
+  const text = configText(value);
+  if (text === undefined) return `missing value for '${canonicalKey(key)}'`;
+  const n = parseGitUlong(text);
+  if (n !== undefined) return n;
+  // git_parse_ulong sets ERANGE only past ULONG_MAX, EINVAL (invalid unit) otherwise
+  const range = /^\s*\+?\d+[kmg]?$/i.test(text) && !text.includes("-");
+  return `bad numeric config value '${text}' for '${canonicalKey(key)}' in file config: ${range ? "out of range" : "invalid unit"}`;
 }
 
 /**
@@ -145,6 +171,7 @@ export function uploadPackFilterPolicyOf(
   let allowFilter = false;
   let allowByDefault: boolean | undefined;
   let treeMaxDepth: number | undefined;
+  let configError: string | undefined;
   const choices: Record<string, boolean> = {};
   for (const { key, value } of entries) {
     const first = key.indexOf(".");
@@ -153,26 +180,36 @@ export function uploadPackFilterPolicyOf(
     const section = key.slice(0, first).toLowerCase();
     const name = key.slice(last + 1).toLowerCase();
     const sub = first === last ? undefined : key.slice(first + 1, last);
+    // git dies at the first value it cannot read
+    const bool = (): boolean | undefined => {
+      const b = configBool(key, value);
+      if (typeof b === "string") configError ??= b;
+      return typeof b === "boolean" ? b : undefined;
+    };
     if (section === "uploadpack" && sub === undefined && name === "allowfilter") {
       any = true;
-      allowFilter = configBool(value) ?? false;
+      allowFilter = bool() ?? false;
     } else if (section === "uploadpackfilter") {
       if (sub === undefined) {
         if (name === "allow") {
           any = true;
-          allowByDefault = configBool(value) ?? true;
+          allowByDefault = bool() ?? true;
         }
       } else if (name === "allow") {
         any = true;
-        choices[sub] = configBool(value) ?? false;
+        choices[sub] = bool() ?? false;
       } else if (sub === "tree" && name === "maxdepth") {
-        const depth = configUlong(value);
-        if (depth === undefined) continue;
         any = true;
+        const depth = configUlong(key, value);
+        if (typeof depth === "string") {
+          configError ??= depth;
+          continue;
+        }
         choices.tree = true;
         treeMaxDepth = depth;
       }
     }
+    if (configError !== undefined) break;
   }
   if (!any) return undefined;
   return {
@@ -180,5 +217,6 @@ export function uploadPackFilterPolicyOf(
     ...(allowByDefault !== undefined ? { allowByDefault } : {}),
     ...(Object.keys(choices).length > 0 ? { choices } : {}),
     ...(treeMaxDepth !== undefined ? { treeMaxDepth } : {}),
+    ...(configError !== undefined ? { configError } : {}),
   };
 }

@@ -485,6 +485,15 @@ function header(request: HttpRequest, name: string): string | undefined {
   return undefined;
 }
 
+/**
+ * upload-pack dying as it reads its config (a filter setting it cannot read): nothing of the
+ * service is sent, the response a server error
+ */
+function uploadPackConfigError(options: HttpServerOptions): HttpResponse | undefined {
+  const error = options.uploadPackFilter?.configError;
+  return error === undefined ? undefined : plain(500, `fatal: ${error}`);
+}
+
 function plain(status: number, message: string): HttpResponse {
   return {
     status,
@@ -524,6 +533,8 @@ export async function handleInfoRefs(
   repository?: RepositoryFacade,
   version1 = false,
 ): Promise<HttpResponse> {
+  const unreadable = uploadPackConfigError(options);
+  if (unreadable) return unreadable;
   // Get all refs but the hidden ones
   const refs = visibleRefs(await refStore.listAll(), uploadPackHiddenRefs(options));
 
@@ -652,6 +663,8 @@ export function handleInfoRefsV2(
   options: HttpServerOptions = {},
   repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType">,
 ): HttpResponse {
+  const unreadable = uploadPackConfigError(options);
+  if (unreadable) return unreadable;
   const chunks: Uint8Array[] = [encodePacketLine("version 2\n")];
   for (const capability of serverV2Capabilities(
     options.v2Capabilities,
@@ -691,6 +704,8 @@ export async function handleUploadPack(
   options: HttpServerOptions = {},
   context: HttpHandlerContext = {},
 ): Promise<HttpResponse> {
+  const unreadable = uploadPackConfigError(options);
+  if (unreadable) return unreadable;
   const requestBytes = await readUploadPackRequest(request, options);
   if (!(requestBytes instanceof Uint8Array)) return requestBytes;
 
@@ -753,6 +768,8 @@ export async function handleUploadPackV2(
   options: HttpServerOptions = {},
   context: HttpHandlerContext = {},
 ): Promise<HttpResponse> {
+  const unreadable = uploadPackConfigError(options);
+  if (unreadable) return unreadable;
   const requestBytes = await readUploadPackRequest(request, options);
   if (!(requestBytes instanceof Uint8Array)) return requestBytes;
 

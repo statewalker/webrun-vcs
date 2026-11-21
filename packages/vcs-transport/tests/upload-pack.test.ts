@@ -226,7 +226,7 @@ describe("Upload-Pack: Filter Support", () => {
     const wantOid = randomOid();
 
     transport._setPackets(
-      packets().data(`want ${wantOid}`).data("filter blob:none").flush().build(),
+      packets().data(`want ${wantOid} filter`).data("filter blob:none").flush().build(),
     );
 
     const ctx = createServerContext({ transport });
@@ -242,7 +242,7 @@ describe("Upload-Pack: Filter Support", () => {
     const wantOid = randomOid();
 
     transport._setPackets(
-      packets().data(`want ${wantOid}`).data("filter blob:limit=1048576").flush().build(),
+      packets().data(`want ${wantOid} filter`).data("filter blob:limit=1048576").flush().build(),
     );
 
     const ctx = createServerContext({ transport });
@@ -257,7 +257,9 @@ describe("Upload-Pack: Filter Support", () => {
     const transport = createMockTransport();
     const wantOid = randomOid();
 
-    transport._setPackets(packets().data(`want ${wantOid}`).data("filter tree:0").flush().build());
+    transport._setPackets(
+      packets().data(`want ${wantOid} filter`).data("filter tree:0").flush().build(),
+    );
 
     const ctx = createServerContext({ transport });
     getState(ctx).refs.set("refs/heads/main", wantOid);
@@ -290,7 +292,7 @@ describe("Upload-Pack: Filter Support", () => {
 
     transport._setPackets(
       packets()
-        .data(`want ${wantOid}`)
+        .data(`want ${wantOid} filter`)
         .data(`shallow ${shallowOid}`)
         .data("filter blob:none")
         .flush()

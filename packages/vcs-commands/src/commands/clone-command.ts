@@ -1,4 +1,9 @@
-import { type FilesApi, isSymbolicRef, type ObjectId } from "@statewalker/vcs-core";
+import {
+  type FilesApi,
+  isSymbolicRef,
+  type ObjectId,
+  parseObjectFilter,
+} from "@statewalker/vcs-core";
 import { computeAlternatePath, HostPaths, hostRootOf } from "@statewalker/vcs-store-files";
 import {
   createRepositoryFacade,
@@ -8,6 +13,7 @@ import {
   type RefspecResolver,
   type FetchOptions as TransportFetchOptions,
 } from "@statewalker/vcs-transport";
+import { parseGitInt } from "@statewalker/vcs-utils/encoding";
 import type { OpenedRepository, Worktree } from "@statewalker/vcs-working-tree";
 
 import {
@@ -101,6 +107,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   private repoUrl?: string;
   private branch?: string;
   private depth?: number;
+  /** `--filter=<spec>`, expanded as git sends and records it */
+  private filterSpec?: string;
   private uploadPack?: string;
   private bare = false;
   private noCheckout = false;
@@ -183,6 +191,29 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       throw new InvalidArgumentError("depth", depth, "Depth must be at least 1");
     }
     this.depth = depth;
+    return this;
+  }
+
+  /**
+   * A partial clone (git's `clone --filter=<spec>`): the server is asked to leave out what
+   * the filter omits (`blob:none`, `blob:limit=<n>`, `tree:<depth>`, `sparse:oid=<blob-ish>`,
+   * `object:type=<type>`, `combine:...`), the received pack is kept as a promisor pack, and the
+   * remote is recorded as git's partial_clone_register does (`core.repositoryformatversion =
+   * 1`, `remote.<name>.promisor`, `remote.<name>.partialclonefilter`). A server that takes
+   * no filters sends everything, with git's warning; a local clone ignores the filter
+   * (`--filter is ignored in local clones; use file:// instead.`), its config still written.
+   *
+   * Objects left out are never fetched lazily here: a checkout, or any read of an absent
+   * blob, fails. Pair it with `setNoCheckout(true)` or `setBare(true)`.
+   *
+   * @param spec The filter spec; `blob:limit=1k` is recorded and sent as `blob:limit=1024`
+   * @throws ObjectFilterError with git's message for a spec git refuses
+   */
+  setFilter(spec: string): this {
+    this.checkCallable();
+    const filter = parseObjectFilter(spec);
+    // expand_list_objects_filter_spec: a blob limit in bytes
+    this.filterSpec = filter.choice === "blob:limit" ? `blob:limit=${filter.limit}` : spec;
     return this;
   }
 
@@ -575,6 +606,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
           "warning: --shallow-exclude is ignored in local clones; use file:// instead.\n",
         );
       }
+      if (this.filterSpec !== undefined) {
+        localWarnings.push("warning: --filter is ignored in local clones; use file:// instead.\n");
+      }
       if (await sourceIsShallow(localRemote, worktree?.getFiles?.())) {
         if (this.local === true) {
           localWarnings.push("warning: source repository is shallow, ignoring --local\n");
@@ -717,6 +751,10 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       cloning: true,
       // clone.c sets TRANS_OPT_KEEP: the pack is kept whatever its size
       keepPack: true,
+      // --filter (TRANS_OPT_LIST_OBJECTS_FILTER, TRANS_OPT_FROM_PROMISOR); not in a local clone
+      ...(this.filterSpec !== undefined && !isLocal
+        ? { filter: this.filterSpec, onWarning: (line: string) => messages.push(`${line}\n`) }
+        : {}),
       ...(fsck ? { fsckObjects: fsck } : {}),
       ...(copyObjects
         ? {
@@ -1055,6 +1093,14 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     if (fetchRefspec) {
       store.setValue(`${remote}.fetch`, fetchRefspec);
       if (this.mirror) store.setValue(`${remote}.mirror`, "true");
+    }
+    if (this.filterSpec !== undefined) {
+      // partial_clone_register: the repository format upgraded to 1 (no extension: git 2.29+
+      // records the promisor remote only), the remote marked as promisor with its filter
+      const version = parseGitInt(store.value("core.repositoryformatversion") ?? "0") ?? 0;
+      if (version < 1) store.setValue("core.repositoryformatversion", "1");
+      store.setValue(`${remote}.promisor`, "true");
+      store.setValue(`${remote}.partialclonefilter`, this.filterSpec);
     }
     if (!this.bare && clone.checkedOutBranch) {
       store.setValue(`branch.${clone.checkedOutBranch}.remote`, this.remoteName);

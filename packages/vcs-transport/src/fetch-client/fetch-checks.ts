@@ -11,9 +11,9 @@
  *   alternates' refs) reach.
  */
 
-import type { PackEntryInfo } from "@statewalker/vcs-core";
+import { type ObjectFilter, type PackEntryInfo, parseObjectFilter } from "@statewalker/vcs-core";
 import type { GitObjectTypeName, RepositoryFacade } from "../api/repository-facade.js";
-import { PushConnectivity } from "../fsm/push/index.js";
+import { type PromisedKinds, PushConnectivity } from "../fsm/push/index.js";
 import { TransportError } from "../protocol/index.js";
 
 /**
@@ -527,6 +527,47 @@ export interface ConnectivityCheckOptions {
    * commits is new), so the walk does not stop at the existing refs
    */
   deepening?: boolean;
+  /** The trees and blobs a partial clone's filter left out ({@link filterPromises}) */
+  promised?: PromisedKinds;
+}
+
+/**
+ * What a partial clone filter may leave out of a pack, as kinds of objects found absent under
+ * a commit or tree: blobs (`blob:none`, `blob:limit`, `sparse:oid`), trees and blobs
+ * (`tree:<depth>`, `object:type=commit`), the union for `combine:`. Undefined when it may
+ * leave out commits or tags (`object:type=blob|tree|tag`), whose history cannot be walked,
+ * or when the spec does not parse.
+ */
+export function filterPromises(spec: string): PromisedKinds | undefined {
+  let filter: ObjectFilter;
+  try {
+    filter = parseObjectFilter(spec);
+  } catch {
+    return undefined;
+  }
+  const kinds = (f: ObjectFilter): PromisedKinds | undefined => {
+    switch (f.choice) {
+      case "blob:none":
+      case "blob:limit":
+      case "sparse:oid":
+        return { tree: false, blob: true };
+      case "tree":
+        return { tree: true, blob: true };
+      case "object:type":
+        return f.type === "commit" ? { tree: true, blob: true } : undefined;
+      case "combine": {
+        const all: PromisedKinds = { tree: false, blob: false };
+        for (const sub of f.filters) {
+          const k = kinds(sub);
+          if (!k) return undefined;
+          all.tree ||= k.tree;
+          all.blob ||= k.blob;
+        }
+        return all;
+      }
+    }
+  };
+  return kinds(filter);
 }
 
 /**
@@ -548,7 +589,10 @@ export async function connectivityErrors(
   const list = [...new Set(tips)];
   if (list.length === 0) return undefined;
   const known = options.deepening ? [] : [...new Set(options.known)];
-  const conn = new PushConnectivity(repository, known, { shallow: options.shallow });
+  const conn = new PushConnectivity(repository, known, {
+    shallow: options.shallow,
+    ...(options.promised ? { promised: options.promised } : {}),
+  });
   await conn.analyze(list);
   if (list.every((tip) => conn.verdict(tip).ok)) return undefined;
   const failure = conn.failure() ?? { kind: "object" as const, id: list[0] as string };

@@ -127,6 +127,12 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
   [
     "SEND_CAPABILITIES",
     async (ctx) => {
+      // 2.5x's advertisement reads upload-pack's config and dies on a filter setting it
+      // cannot read (2.43 advertised and died at the fetch command)
+      if (ctx.config.uploadPackFilter?.configError !== undefined) {
+        ctx.output.error = ctx.config.uploadPackFilter.configError;
+        return "ERROR";
+      }
       try {
         await ctx.transport.writeLine("version 2");
 

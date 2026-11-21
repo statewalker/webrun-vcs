@@ -11,6 +11,7 @@ import {
   parseGitUlong,
   parseObjectFilter,
   resolveObjectFilter,
+  TreeDepthError,
 } from "../../src/pack/index.js";
 import { blob, commit, memObjects, tree } from "./history-builder.js";
 
@@ -104,5 +105,66 @@ describe("listObjects with a filter", () => {
     expect(await list("tree:3")).toEqual([c, root, deep, lib, leaf].sort());
     // blob:none marks lib seen under a/ (depth 2, where tree:2 omits it): never shown after
     expect(await list("combine:blob:none+tree:2")).toEqual([c, root, deep].sort());
+  });
+});
+
+describe("listObjects and core.maxTreeDepth", () => {
+  /** A commit of a chain of `depth` trees below its root (`d/d/.../f`), as `git mktree` builds it. */
+  const chain = async (depth: number) => {
+    const objects = memObjects();
+    let t = await tree(objects, [["100644", "f", await blob(objects, "f\n")]]);
+    for (let i = 0; i < depth; i++) t = await tree(objects, [["40000", "d", t]]);
+    return { objects, tip: await commit(objects, t, [], 1000, "deep") };
+  };
+  const list = async (
+    c: Awaited<ReturnType<typeof chain>>,
+    options: { filter?: string; maxTreeDepth?: number } = {},
+  ) => {
+    const filter = options.filter
+      ? await resolveObjectFilter(parseObjectFilter(options.filter), async () => () => true)
+      : undefined;
+    let n = 0;
+    for await (const _ of listObjects(c.objects, {
+      wants: [c.tip],
+      ...(filter ? { filter } : {}),
+      ...(options.maxTreeDepth !== undefined ? { maxTreeDepth: options.maxTreeDepth } : {}),
+    }))
+      n++;
+    return n;
+  };
+
+  it("lists a chain at git's default limit (2048) and dies one tree deeper, with git's message", async () => {
+    const at = await chain(2048);
+    // the commit, 2049 trees, the blob
+    expect(await list(at)).toBe(2051);
+    expect(await list(at, { filter: "blob:none" })).toBe(2050);
+    const over = await chain(2049);
+    for (const filter of [undefined, "blob:none", "tree:5000"]) {
+      const error = await list(over, filter ? { filter } : {}).catch((e) => e);
+      expect(error).toBeInstanceOf(TreeDepthError);
+      expect((error as Error).message).toBe("exceeded maximum allowed tree depth");
+    }
+    // core.maxTreeDepth set lower
+    const small = await chain(4);
+    expect(await list(small, { maxTreeDepth: 4 })).toBe(7);
+    await expect(list(small, { maxTreeDepth: 3 })).rejects.toThrow(TreeDepthError);
+    await expect(list(small, { maxTreeDepth: 3, filter: "blob:none" })).rejects.toThrow(
+      TreeDepthError,
+    );
+  });
+
+  it("walks a filtered chain without recursion, in time linear in its depth", async () => {
+    const time = async (depth: number) => {
+      const c = await chain(depth);
+      const started = performance.now();
+      // nested generators overflowed the stack near depth 5000
+      expect(await list(c, { filter: "blob:none", maxTreeDepth: 1e6 })).toBe(depth + 2);
+      return performance.now() - started;
+    };
+    await time(500); // warm up
+    const short = await time(2000);
+    const long = await time(8000);
+    // quadratic (a yield* per level) is 16 times slower at four times the depth
+    expect(long).toBeLessThan(8 * short + 250);
   });
 });

@@ -298,3 +298,139 @@ describe("fetch client and filters", () => {
     expect(sent).not.toContain("filter");
   });
 });
+
+describe("upload-pack filter config git cannot read", () => {
+  it("records the first value git dies on, with git's message", () => {
+    const error = (key: string, value: unknown) =>
+      uploadPackFilterPolicyOf([{ key, value }])?.configError;
+    expect(error("uploadpackfilter.allow", "garbage")).toBe(
+      "bad boolean config value 'garbage' for 'uploadpackfilter.allow'",
+    );
+    expect(error("uploadpack.allowFilter", "maybe")).toBe(
+      "bad boolean config value 'maybe' for 'uploadpack.allowfilter'",
+    );
+    expect(error("uploadpackfilter.blob:none.allow", "x")).toBe(
+      "bad boolean config value 'x' for 'uploadpackfilter.blob:none.allow'",
+    );
+    for (const value of ["10x", "-1", "", "1.5"]) {
+      expect(error("uploadpackfilter.tree.maxDepth", value)).toBe(
+        `bad numeric config value '${value}' for 'uploadpackfilter.tree.maxdepth' in file config: invalid unit`,
+      );
+    }
+    expect(error("uploadpackfilter.tree.maxDepth", "99999999999999999999")).toBe(
+      "bad numeric config value '99999999999999999999' for 'uploadpackfilter.tree.maxdepth' in file config: out of range",
+    );
+    expect(error("uploadpackfilter.tree.maxDepth", null)).toBe(
+      "missing value for 'uploadpackfilter.tree.maxdepth'",
+    );
+    // git_parse_ulong: hex, octal, units
+    const depth = (value: string) =>
+      uploadPackFilterPolicyOf([{ key: "uploadpackfilter.tree.maxDepth", value }])?.treeMaxDepth;
+    expect(depth("0x10")).toBe(16);
+    expect(depth("010")).toBe(8);
+    expect(depth("2k")).toBe(2048);
+    // booleans as git_config_bool reads them
+    expect(uploadPackFilterPolicyOf([{ key: "uploadpackfilter.allow", value: "0" }])).toEqual({
+      allowFilter: false,
+      allowByDefault: false,
+    });
+  });
+
+  it("refuses to serve: nothing is advertised (v0 and v2)", async () => {
+    const { repo } = await smallRepo();
+    const policy = uploadPackFilterPolicyOf([
+      { key: "uploadpack.allowFilter", value: "true" },
+      { key: "uploadpackfilter.allow", value: "garbage" },
+    ]);
+    for (const version of ["1", "2"] as const) {
+      const served = await serve(repo, encodeFlush(), {
+        version,
+        ...(policy ? { uploadPackFilter: policy } : {}),
+      });
+      expect(served.text).toBe("");
+      expect(served.error).toBe("bad boolean config value 'garbage' for 'uploadpackfilter.allow'");
+    }
+  });
+});
+
+describe("upload-pack filter parity", () => {
+  it("v0: checks a filter line as it is read, in the loop of the wants", async () => {
+    const { repo, tip } = await smallRepo();
+    const caps = "multi_ack_detailed side-band-64k ofs-delta";
+    // git dies at the filter line (not negotiated) before it reads the bad deepen
+    const served = await serve(repo, v0Request(tip, caps, ["filter blob:none", "deepen 0"]), {
+      version: "1",
+      uploadPackFilter: ALLOW,
+    });
+    expect(served.error).toBe("git upload-pack: filtering capability not negotiated");
+    expect(served.text).not.toContain("ERR");
+    // a refused filter is sent as ERR before a later bad deepen
+    const refused = await serve(
+      repo,
+      v0Request(tip, `${caps} filter`, ["filter tree:3", "deepen 0"]),
+      { version: "1", uploadPackFilter: { allowFilter: true, treeMaxDepth: 2 } },
+    );
+    expect(refused.text).toContain("ERR tree filter allows max depth 2, but got 3");
+    expect(refused.text).not.toContain("Invalid deepen");
+  });
+
+  it("resolves a sparse:oid name as get_oid: abbreviated, upper-case hex, revision suffixes", async () => {
+    const { repo, tip } = await smallRepo();
+    const tree = (await repo.history.commits.load(tip))?.tree as string;
+    let blobId = "";
+    for await (const e of (await repo.history.trees.load(tree)) ?? []) {
+      if (e.name === "a.txt") blobId = e.id;
+    }
+    const fetchWith = (name: string) =>
+      serve(repo, v2Fetch([`want ${tip}`, `filter sparse:oid=${name}`, "done"]), {
+        version: "2",
+        uploadPackFilter: ALLOW,
+      });
+    // resolved: the facade has no pattern parser, so pack-objects dies parsing it
+    for (const name of [
+      blobId,
+      blobId.toUpperCase(),
+      blobId.slice(0, 7),
+      blobId.slice(0, 9).toUpperCase(),
+      "main:a.txt",
+      "main^{tree}:a.txt",
+      `${tip.slice(0, 8)}:a.txt`,
+      "refs/heads/main~0:a.txt",
+    ]) {
+      const served = await fetchWith(name);
+      expect(served.text, name).toContain(`fatal: unable to parse sparse filter data in ${blobId}`);
+    }
+    const missing = await fetchWith("main~1:a.txt");
+    expect(missing.text).toContain("fatal: unable to access sparse blob in 'main~1:a.txt'");
+  });
+
+  it("ignores a sparse:oid blob over dir.c's 100 MiB, as git's pack-objects warns and dies", async () => {
+    const { repo, tip } = await smallRepo();
+    const big = await repo.history.blobs.store([new Uint8Array(100 * 1024 * 1024 + 1)]);
+    const served = await serve(repo, v2Fetch([`want ${tip}`, `filter sparse:oid=${big}`, "done"]), {
+      version: "2",
+      uploadPackFilter: ALLOW,
+    });
+    const warning = served.text.indexOf(`warning: ignoring excessively large pattern blob: ${big}`);
+    expect(warning).toBeGreaterThan(0);
+    expect(
+      served.text.indexOf(`fatal: unable to parse sparse filter data in ${big}`),
+    ).toBeGreaterThan(warning);
+  });
+});
+
+describe("what a partial clone's filter promises", () => {
+  it("names the kinds of objects a filter may leave out", async () => {
+    const { filterPromises } = await import("../src/index.js");
+    expect(filterPromises("blob:none")).toEqual({ tree: false, blob: true });
+    expect(filterPromises("blob:limit=1k")).toEqual({ tree: false, blob: true });
+    expect(filterPromises("sparse:oid=main:spec")).toEqual({ tree: false, blob: true });
+    expect(filterPromises("tree:0")).toEqual({ tree: true, blob: true });
+    expect(filterPromises("object:type=commit")).toEqual({ tree: true, blob: true });
+    expect(filterPromises("combine:blob:none+tree:2")).toEqual({ tree: true, blob: true });
+    // commits or tags may be left out: no walk
+    expect(filterPromises("object:type=blob")).toBeUndefined();
+    expect(filterPromises("combine:blob:none+object:type=tag")).toBeUndefined();
+    expect(filterPromises("bogus")).toBeUndefined();
+  });
+});

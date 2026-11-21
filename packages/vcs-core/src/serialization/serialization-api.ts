@@ -115,6 +115,11 @@ export interface ExportOptions extends PackOptions {
    * (see `ListObjectsOptions.filter`)
    */
   filter?: ResolvedObjectFilter;
+  /**
+   * git's `core.maxTreeDepth` for the walk (default 2048): a deeper tree fails the export with
+   * `TreeDepthError` (see `ListObjectsOptions.maxTreeDepth`)
+   */
+  maxTreeDepth?: number;
 }
 
 /**
@@ -195,6 +200,13 @@ export interface SerializationApi {
     pack: AsyncIterable<Uint8Array>,
     options?: PackImportOptions,
   ): Promise<PackImportResult>;
+
+  /**
+   * Marks a pack kept by `importPack` as a promisor pack (`pack-<id>.promisor` with `content`,
+   * as git's fetch-pack writes for a partial clone's packs). False where the backend keeps no
+   * packs.
+   */
+  markPromisorPack?(packId: string, content: string): Promise<boolean>;
 
   /**
    * Export single object in Git format

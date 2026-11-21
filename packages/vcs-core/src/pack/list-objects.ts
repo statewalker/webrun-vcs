@@ -106,7 +106,38 @@ export interface ListObjectsOptions {
    * filters (`tree:<depth>`, `sparse:oid`, `combine:`) answer as git's do.
    */
   filter?: ResolvedObjectFilter;
+  /**
+   * git's `core.maxTreeDepth` (default {@link DEFAULT_MAX_TREE_DEPTH}): a tree deeper than this
+   * below the tree a walk starts from (that one at depth 0) stops the listing with
+   * {@link TreeDepthError}, as list-objects.c's process_tree dies. Not checked by the bitmap
+   * walk, which reads no trees.
+   */
+  maxTreeDepth?: number;
 }
+
+/** git's default `core.maxTreeDepth` (`DEFAULT_MAX_ALLOWED_TREE_DEPTH`, outside MSVC builds). */
+export const DEFAULT_MAX_TREE_DEPTH = 2048;
+
+/** A tree deeper than `core.maxTreeDepth`: git's `fatal: exceeded maximum allowed tree depth`. */
+export class TreeDepthError extends Error {
+  override name = "TreeDepthError";
+  constructor() {
+    super("exceeded maximum allowed tree depth");
+  }
+}
+
+/** A tree being walked by the filtered listing: its entries from `at` on. */
+interface FilterFrame {
+  id: ObjectId;
+  data: Uint8Array;
+  at: number;
+  /** the path its entries are under (`<path>/`, "" for a root) */
+  childBase: string;
+  name: string;
+  depth: number;
+}
+
+const EMPTY_TREE = new Uint8Array(0);
 
 /** One listed object, as `git rev-list --objects` prints it. */
 export interface ListedObject {
@@ -175,6 +206,7 @@ export async function* listObjects(
     yield* listObjectsWithBitmap(options.bitmap, objects, options);
     return;
   }
+  const maxTreeDepth = options.maxTreeDepth ?? DEFAULT_MAX_TREE_DEPTH;
   const flags = new ObjectIdFlags();
   const has = (id: ObjectId, f: number) => (flags.get(id) & f) !== 0;
   const set = (id: ObjectId, f: number) => flags.add(id, f);
@@ -431,47 +463,83 @@ export async function* listObjects(
     // do_traverse marks every listed commit's root tree before any pending object is walked
     for (const id of kept) set((commits.get(id) as CommitInfo).tree, NOT_USER_GIVEN);
 
-    async function* processBlob(id: ObjectId, base: string, name: string) {
-      if (has(id, UNINTERESTING | FILTER_SEEN)) return;
+    async function processBlob(
+      id: ObjectId,
+      base: string,
+      name: string,
+    ): Promise<ListedObject | undefined> {
+      if (has(id, UNINTERESTING | FILTER_SEEN)) return undefined;
       const path = base + name;
       const r = await ask("blob", id, path, name);
       if (r & LOFR_MARK_SEEN) set(id, FILTER_SEEN);
       if (r & LOFR_DO_SHOW && !has(id, ADDED)) {
         set(id, ADDED);
-        yield { id, type: "blob" as const, path };
+        return { id, type: "blob", path };
       }
+      return undefined;
     }
-    async function* processTree(
+    /**
+     * git's process_tree up to its contents: the depth check, the tree read and its
+     * begin-tree question; the frame whose entries are walked next (none when skipped).
+     */
+    async function beginTree(
       id: ObjectId,
       base: string,
       name: string,
-    ): AsyncGenerator<ListedObject> {
-      if (has(id, UNINTERESTING | FILTER_SEEN)) return;
+      depth: number,
+    ): Promise<{ shown?: ListedObject; frame?: FilterFrame }> {
+      if (has(id, UNINTERESTING | FILTER_SEEN)) return {};
+      if (depth > maxTreeDepth) throw new TreeDepthError();
       const o = await read(id);
       if (o.type !== "tree") throw new Error(`object ${id} is a ${o.type}, not a tree`);
       const path = base + name;
-      let r = await ask("begin-tree", id, path, name);
+      const r = await ask("begin-tree", id, path, name);
       if (r & LOFR_MARK_SEEN) set(id, FILTER_SEEN);
+      let shown: ListedObject | undefined;
       if (r & LOFR_DO_SHOW && !has(id, ADDED)) {
         set(id, ADDED);
-        yield { id, type: "tree", path };
+        shown = { id, type: "tree", path };
       }
       const childBase = path ? `${path}/` : "";
-      if (!(r & LOFR_SKIP_TREE)) {
-        const data = o.data;
-        for (let at = 0; at < data.length; ) {
-          const e = scanTreeEntry(data, at);
-          at = e.next;
+      const data = r & LOFR_SKIP_TREE ? EMPTY_TREE : o.data;
+      return { ...(shown ? { shown } : {}), frame: { id, data, at: 0, childBase, name, depth } };
+    }
+    /**
+     * git's process_tree over a whole tree, depth first in entry order, with an explicit
+     * stack of frames (no recursion: each listed object costs the same at any depth)
+     */
+    async function* processTree(
+      root: ObjectId,
+      base: string,
+      name: string,
+    ): AsyncGenerator<ListedObject> {
+      const first = await beginTree(root, base, name, 0);
+      if (first.shown) yield first.shown;
+      if (!first.frame) return;
+      const stack: FilterFrame[] = [first.frame];
+      while (stack.length > 0) {
+        const f = stack[stack.length - 1] as FilterFrame;
+        if (f.at < f.data.length) {
+          const e = scanTreeEntry(f.data, f.at);
+          f.at = e.next;
           if (e.kind === GITLINK) continue;
-          const eid = bytesToHex(data.subarray(e.nul + 1, e.nul + 21));
-          const entryName = decodeGitPath(data.subarray(e.nameStart, e.nul));
+          const eid = bytesToHex(f.data.subarray(e.nul + 1, e.nul + 21));
+          const entryName = decodeGitPath(f.data.subarray(e.nameStart, e.nul));
           set(eid, NOT_USER_GIVEN);
-          if (e.kind === TREE) yield* processTree(eid, childBase, entryName);
-          else yield* processBlob(eid, childBase, entryName);
+          if (e.kind === TREE) {
+            const next = await beginTree(eid, f.childBase, entryName, f.depth + 1);
+            if (next.shown) yield next.shown;
+            if (next.frame) stack.push(next.frame);
+          } else {
+            const shown = await processBlob(eid, f.childBase, entryName);
+            if (shown) yield shown;
+          }
+          continue;
         }
+        stack.pop();
+        const r = await ask("end-tree", f.id, f.childBase, f.name);
+        if (r & LOFR_MARK_SEEN) set(f.id, FILTER_SEEN);
       }
-      r = await ask("end-tree", id, childBase, name);
-      if (r & LOFR_MARK_SEEN) set(id, FILTER_SEEN);
     }
 
     const tipPaths = options.tipPaths;
@@ -483,7 +551,10 @@ export async function* listObjects(
         if (r & LOFR_MARK_SEEN) set(id, FILTER_SEEN);
         if (r & LOFR_DO_SHOW) yield { id, type: "tag" };
       } else if (type === "tree") yield* processTree(id, "", tipPaths?.get(id) ?? "");
-      else yield* processBlob(id, "", tipPaths?.get(id) ?? "");
+      else {
+        const shown = await processBlob(id, "", tipPaths?.get(id) ?? "");
+        if (shown) yield shown;
+      }
     }
     for (const id of kept) yield* processTree((commits.get(id) as CommitInfo).tree, "", "");
   }
@@ -495,15 +566,19 @@ export async function* listObjects(
     }
 
     async function* walkTree(root: ObjectId, rootPath: string): AsyncGenerator<ListedObject> {
-      const stack: { id: ObjectId; path: string }[] = [{ id: root, path: rootPath }];
+      const stack: { id: ObjectId; path: string; depth: number }[] = [
+        { id: root, path: rootPath, depth: 0 },
+      ];
       while (stack.length) {
-        const { id, path } = stack.pop() as { id: ObjectId; path: string };
+        const { id, path, depth } = stack.pop() as { id: ObjectId; path: string; depth: number };
         if (has(id, UNINTERESTING | ADDED)) continue;
+        // process_tree's core.maxTreeDepth (the root at depth 0)
+        if (depth > maxTreeDepth) throw new TreeDepthError();
         set(id, ADDED);
         const o = await read(id);
         if (o.type !== "tree") throw new Error(`object ${id} is a ${o.type}, not a tree`);
         yield { id, type: "tree", path };
-        const subtrees: { id: ObjectId; path: string }[] = [];
+        const subtrees: { id: ObjectId; path: string; depth: number }[] = [];
         const data = o.data;
         // entries already listed or excluded are skipped before their names are decoded
         for (let at = 0; at < data.length; ) {
@@ -514,7 +589,7 @@ export async function* listObjects(
           const eid = bytesToHex(data.subarray(e.nul + 1, e.nul + 21));
           const name = decodeGitPath(data.subarray(e.nameStart, e.nul));
           const p = path ? `${path}/${name}` : name;
-          if (e.kind === TREE) subtrees.push({ id: eid, path: p });
+          if (e.kind === TREE) subtrees.push({ id: eid, path: p, depth: depth + 1 });
           else {
             flags.addAt(data, e.nul + 1, ADDED);
             yield { id: eid, type: "blob", path: p };

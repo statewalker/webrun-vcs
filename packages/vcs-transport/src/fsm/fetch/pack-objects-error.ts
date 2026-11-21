@@ -11,6 +11,13 @@
  */
 export class PackObjectsError extends Error {
   override name = "PackObjectsError";
+  /** What pack-objects printed before it died (`warning: ...` lines), relayed first */
+  readonly lines: readonly string[];
+
+  constructor(message: string, options: { lines?: readonly string[] } = {}) {
+    super(message);
+    this.lines = options.lines ?? [];
+  }
 }
 
 /** What upload-pack sends on band 3 when pack-objects fails (create_pack_file's abort_msg). */

@@ -22,6 +22,7 @@ import {
   resolveObjectFilter,
   type SparseFilterMatcher,
   type SymbolicRef,
+  TreeDepthError,
 } from "@statewalker/vcs-core";
 import type {
   CommitGraphInfo,
@@ -36,6 +37,7 @@ import type {
 } from "../api/repository-facade.js";
 import { PackObjectsError } from "../fsm/fetch/pack-objects-error.js";
 import { computeShallowUpdate } from "../fsm/fetch/upload-pack-graph.js";
+import { resolveRevision } from "../push-client/revision.js";
 import { lenientCommitHeader, lenientTagTarget, storedObjectType } from "../utils/index.js";
 
 /**
@@ -65,6 +67,11 @@ export interface HistoryFacadeConfig {
    * `sparse:oid` filter fails the pack.
    */
   sparseFilterPatterns?: (text: string) => SparseFilterMatcher;
+  /**
+   * git's `core.maxTreeDepth` for the served packs' walk (default 2048): a deeper tree fails
+   * the pack as pack-objects dies (`fatal: exceeded maximum allowed tree depth`)
+   */
+  maxTreeDepth?: number;
 }
 
 /**
@@ -91,6 +98,7 @@ export function createRepositoryFacade(config: HistoryFacadeConfig): RepositoryF
     config.history,
     config.useBitmaps,
     config.sparseFilterPatterns,
+    config.maxTreeDepth,
   );
   const bare = config.bare ?? true;
   facade.isBare = () => bare;
@@ -133,6 +141,7 @@ function createRepositoryFacadeFromHistory(
   history: History | HistoryWithOperations,
   useBitmaps?: boolean,
   sparseFilterPatterns?: (text: string) => SparseFilterMatcher,
+  maxTreeDepth?: number,
 ): RepositoryFacade {
   const { commits, tags, refs } = history;
   const serialization =
@@ -158,10 +167,19 @@ function createRepositoryFacadeFromHistory(
       return undefined;
     }
   };
-  /** git's filter_sparse_oid__init: the blob-ish resolved and its patterns parsed. */
+  /**
+   * git's filter_sparse_oid__init: the blob-ish resolved (get_oid with GET_OID_BLOB) and its
+   * patterns parsed, a blob over dir.c's PATTERN_MAX_FILE_SIZE refused before it is read
+   */
   const loadSparse = async (name: string): Promise<SparseFilterMatcher> => {
-    const id = await resolveBlobName(history, name);
+    const id = await resolveBlobName(history, facade, name);
     if (id === undefined) throw new PackObjectsError(`unable to access sparse blob in '${name}'`);
+    const size = await facade.getObjectSize?.(id).catch(() => null);
+    if (size != null && size > PATTERN_MAX_FILE_SIZE) {
+      throw new PackObjectsError(`unable to parse sparse filter data in ${id}`, {
+        lines: [`warning: ignoring excessively large pattern blob: ${id}`],
+      });
+    }
     const object = await facade.loadObject?.(id).catch(() => undefined);
     if (object?.type !== "blob" || !sparseFilterPatterns) {
       throw new PackObjectsError(`unable to parse sparse filter data in ${id}`);
@@ -188,6 +206,10 @@ function createRepositoryFacadeFromHistory(
         : result;
     },
 
+    async markPromisorPack(packId: string, content: string): Promise<boolean> {
+      return (await serialization.markPromisorPack?.(packId, content)) ?? false;
+    },
+
     async *exportPack(
       wants: Set<string>,
       exclude: Set<string>,
@@ -198,8 +220,9 @@ function createRepositoryFacadeFromHistory(
         ? await resolveObjectFilter(parseObjectFilter(options.filterSpec), loadSparse)
         : undefined;
       // listObjects + writePack: streamed, stored entries reused, deltas searched
-      yield* serialization.exportPack(wants, exclude, {
+      const pack = serialization.exportPack(wants, exclude, {
         ...(filter ? { filter } : {}),
+        ...(maxTreeDepth !== undefined ? { maxTreeDepth } : {}),
         thinPack: options?.thin,
         shallow: options?.shallow,
         ...(useBitmaps === false ? { useBitmaps } : {}),
@@ -208,6 +231,13 @@ function createRepositoryFacadeFromHistory(
           ? (options.includeTags ?? (await tagRefIds(refs)))
           : undefined,
       });
+      try {
+        yield* pack;
+      } catch (error) {
+        // the walk dies before any pack byte (it lists everything first): pack-objects' death
+        if (error instanceof TreeDepthError) throw new PackObjectsError(error.message);
+        throw error;
+      }
     },
 
     // ─────────────────────────────────────────────────────────────────
@@ -413,50 +443,56 @@ function isSymbolicRef(ref: Ref | SymbolicRef): ref is SymbolicRef {
   return "target" in ref;
 }
 
-/** The refs a short name may mean, in git's `ref_rev_parse_rules` order. */
-const REV_PARSE_RULES = [
-  "%s",
-  "refs/%s",
-  "refs/tags/%s",
-  "refs/heads/%s",
-  "refs/remotes/%s",
-  "refs/remotes/%s/HEAD",
-];
+/** dir.c's PATTERN_MAX_FILE_SIZE: a pattern blob larger than this is ignored (100 MiB). */
+const PATTERN_MAX_FILE_SIZE = 100 * 1024 * 1024;
 
-/** A revision's object: a full id, or a ref by git's short-name rules. */
-async function resolveRevision(history: History, rev: string): Promise<string | undefined> {
-  if (/^[0-9a-f]{40}$/.test(rev)) return rev;
-  for (const rule of REV_PARSE_RULES) {
-    const ref = await history.refs.resolve(rule.replace("%s", rev)).catch(() => undefined);
-    if (ref && "objectId" in ref && ref.objectId) return ref.objectId;
+/**
+ * A revision as git's get_oid reads it (`resolveRevision`: a full id first, refs by git's
+ * short-name rules, an abbreviated id, `~`/`^`/`^{type}` suffixes), hex in any case.
+ */
+async function resolveRevisionOf(
+  history: History,
+  facade: RepositoryFacade,
+  rev: string,
+): Promise<string | undefined> {
+  // get_oid_hex takes either case; a full id wins over a ref of that name
+  const lower = /^[0-9a-fA-F]+$/.test(rev) ? rev.toLowerCase() : undefined;
+  if (lower?.length === 40) return (await facade.has(lower)) ? lower : undefined;
+  const refs = new Map<string, string>();
+  let head: string | undefined;
+  for await (const ref of history.refs.list()) {
+    const resolved = isSymbolicRef(ref)
+      ? await history.refs.resolve(ref.name).catch(() => undefined)
+      : ref;
+    if (!resolved || !("objectId" in resolved) || !resolved.objectId) continue;
+    refs.set(ref.name, resolved.objectId);
   }
-  return undefined;
+  const headRef = await history.refs.resolve("HEAD").catch(() => undefined);
+  if (headRef && "objectId" in headRef && headRef.objectId) head = headRef.objectId;
+  const source = { refs, ...(head ? { head: { oid: head } } : {}), repository: facade };
+  const found = await resolveRevision(rev, source);
+  if (found !== undefined || lower === undefined || lower === rev) return found;
+  // an abbreviated id in upper case: no ref matched it as written
+  return resolveRevision(lower, source);
 }
 
 /**
  * The blob a `sparse:oid=` filter names, as git's `get_oid_with_context` reads the common
- * forms: a full id, a ref (git's short-name rules), or `<rev>:<path>` (the revision peeled to
- * its tree, the path looked up in it). Undefined when it names nothing.
+ * forms: a revision (see {@link resolveRevisionOf}), or `<rev>:<path>` (the revision peeled
+ * to its tree, the path looked up in it). Undefined when it names nothing.
  */
-async function resolveBlobName(history: History, name: string): Promise<string | undefined> {
+async function resolveBlobName(
+  history: History,
+  facade: RepositoryFacade,
+  name: string,
+): Promise<string | undefined> {
   const colon = name.indexOf(":");
-  if (colon < 0) return resolveRevision(history, name);
+  if (colon < 0) return resolveRevisionOf(history, facade, name);
   const rev = name.slice(0, colon);
   const path = name.slice(colon + 1);
   // `:<path>` names an index entry, which a served repository does not read
   if (rev === "") return undefined;
-  let id = await resolveRevision(history, rev);
-  // peel tags and commits down to the tree
-  for (let depth = 0; id !== undefined && depth < 64; depth++) {
-    const tag = await history.tags.load(id).catch(() => undefined);
-    if (tag) {
-      id = tag.object;
-      continue;
-    }
-    const commit = await history.commits.load(id).catch(() => undefined);
-    if (commit) id = commit.tree;
-    break;
-  }
+  let id = await resolveRevisionOf(history, facade, `${rev}^{tree}`);
   if (id === undefined) return undefined;
   for (const part of path.split("/").filter((p) => p.length > 0)) {
     const tree = await history.trees.load(id).catch(() => undefined);

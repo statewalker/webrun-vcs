@@ -11,7 +11,17 @@
  * Our listObjects with a filter is also compared with native `rev-list --filter` on the same
  * repository (the order-dependent `tree:<depth>`, `sparse:oid` and `combine:`).
  */
-import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  chmodSync,
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -42,7 +52,7 @@ import { type LoopbackServer, serveOnLoopback } from "./http-loopback-support.js
 import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync, startTcpServer } from "./native-connect-support.js";
 import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
-import { gitOut, putFile } from "./status-native-support.js";
+import { gitOut, gitRun, putFile } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
@@ -403,6 +413,172 @@ describeGit("serving partial clone filters, as native git", () => {
       const mine: string[] = [];
       for await (const o of listObjects(objects, { wants: refs, filter })) mine.push(o.id);
       expect(mine.sort(), spec).toEqual(theirs);
+    }
+  });
+  /** Our clone (`setFilter`) into a fresh repository, or the error it fails with. */
+  const ourClone = async (url: string, spec: string, name: string, version = "2") => {
+    const dest = join(root, `${name}-${counter++}`);
+    git(root, "init", "-q", dest);
+    git(dest, "config", "protocol.version", version);
+    const ours = await openOurs(dest, createNodeGitHostEnvironment({ env: { HOME: root } }));
+    const error = await ours
+      .clone()
+      .setURI(url)
+      .setNoCheckout(true)
+      .setFilter(spec)
+      .call()
+      .then(
+        () => undefined,
+        (e: unknown) => e as Error & { lines?: string[] },
+      );
+    return { dest, error };
+  };
+  const promisorFiles = (repo: string) => {
+    const dir = join(repo, ".git/objects/pack");
+    return readdirSync(dir)
+      .filter((f) => f.endsWith(".promisor"))
+      .map((f) => readFileSync(join(dir, f), "latin1"));
+  };
+
+  for (const version of ["0", "2"] as const) {
+    for (const spec of ["blob:none", "blob:limit=1k", "tree:0", "combine:blob:none+tree:2"]) {
+      it(`our clone (v${version}) --filter=${spec}: a promisor pack and config as native git's`, async () => {
+        const url = `${nativeHttp.server.baseUrl}/repo`;
+        const native = join(root, `pn-${counter++}`);
+        const r = await gitAsync(root, root, [
+          "-c",
+          `protocol.version=${version}`,
+          "clone",
+          "-q",
+          "--no-checkout",
+          `--filter=${spec}`,
+          url,
+          native,
+        ]);
+        expect(r.status, r.stderr).toBe(0);
+        const { dest, error } = await ourClone(url, spec, "po", version);
+        expect(error).toBeUndefined();
+        try {
+          expect(objectsOf(dest)).toEqual(objectsOf(native));
+          // what native git's partial clone machinery sees: promisor objects excluded
+          const promisorWalk = (repo: string) =>
+            git(repo, "rev-list", "--objects", "--all", "--exclude-promisor-objects");
+          expect(promisorWalk(dest)).toBe(promisorWalk(native));
+          for (const repo of [native, dest]) {
+            expect(gitRun(root, repo, ["fsck", "--no-progress"]).status).toBe(0);
+          }
+          expect(promisorFiles(dest)).toEqual(promisorFiles(native));
+          expect(promisorFiles(dest).length).toBe(1);
+          const remoteConfig = (repo: string) =>
+            git(repo, "config", "--local", "--list")
+              .split("\n")
+              .filter((l) => /^(core\.repositoryformatversion|remote\.|extensions\.)/.test(l));
+          expect(remoteConfig(dest)).toEqual(remoteConfig(native));
+          // the [remote] section byte for byte
+          const section = (repo: string) => {
+            const text = readFileSync(join(repo, ".git/config"), "latin1");
+            const at = text.indexOf('[remote "origin"]');
+            return text.slice(at, text.indexOf("\n[", at + 1) + 1 || undefined);
+          };
+          expect(section(dest)).toBe(section(native));
+        } finally {
+          rmSync(dest, { recursive: true, force: true });
+          rmSync(native, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+
+  it("our clone --filter=blob:none from a server that sends no trees is refused with rev-list's error", async () => {
+    // native http-backend whose pack-objects keeps only commits whatever filter was asked
+    const hook = join(root, "commits-only.sh");
+    writeFileSync(
+      hook,
+      [
+        "#!/bin/bash",
+        'args=(); for a in "$@"; do case "$a" in --filter=*|--thin) ;; *) args+=("$a");; esac; done',
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: a shell script
+        'exec "${args[@]}" --filter=object:type=commit',
+        "",
+      ].join("\n"),
+    );
+    chmodSync(hook, 0o755);
+    const backend = nativeGitHttpBackend(srv, root, {
+      GIT_CONFIG_COUNT: "3",
+      GIT_CONFIG_KEY_2: "uploadpack.packObjectsHook",
+      GIT_CONFIG_VALUE_2: hook,
+    });
+    const server = await serveOnLoopback((request) => backend.fetch(request));
+    try {
+      const { dest, error } = await ourClone(`${server.baseUrl}/repo`, "blob:none", "mal");
+      rmSync(dest, { recursive: true, force: true });
+      expect(error).toBeDefined();
+      // native git takes it (the tips came in a promisor pack) and would fetch the trees
+      // lazily; ours, which cannot, stops where rev-list meets the first absent tree
+      const native = join(root, `maln-${counter++}`);
+      const r = await gitAsync(root, root, [
+        "clone",
+        "-q",
+        "--no-checkout",
+        "--filter=blob:none",
+        `${server.baseUrl}/repo`,
+        native,
+      ]);
+      expect(r.status, r.stderr).toBe(0);
+      const absent = git(native, "rev-list", "--objects", "--all", "--missing=print")
+        .split("\n")
+        .filter((l) => l.startsWith("?"))
+        .map((l) => l.slice(1));
+      rmSync(native, { recursive: true, force: true });
+      const line = error?.lines?.[0] ?? "";
+      expect(line).toMatch(/^fatal: bad tree object [0-9a-f]{40}$/);
+      const tree = line.slice(-40);
+      expect(absent).toContain(tree);
+      expect(git(join(srv, "repo"), "cat-file", "-t", tree).trim()).toBe("tree");
+      expect(error?.lines).toEqual([line, "fatal: remote did not send all necessary objects"]);
+    } finally {
+      await server.close();
+      backend.close();
+    }
+  });
+
+  it("refuses a tree deeper than core.maxTreeDepth as http-backend's pack-objects does", async () => {
+    const deep = join(srv, "deep");
+    git(root, "init", "-q", "--bare", deep);
+    const env = { ...process.env, HOME: root, GIT_CONFIG_GLOBAL: "/dev/null" };
+    const mktree = (input: string) =>
+      execFileSync("git", ["mktree"], { cwd: deep, input, env }).toString().trim();
+    // a chain of trees five deep below the root: d/d/d/d/d
+    let tree = mktree("");
+    for (let i = 0; i < 5; i++) tree = mktree(`040000 tree ${tree}\td\n`);
+    const commit = gitOut(root, deep, ["commit-tree", "-m", "deep", tree], {
+      GIT_AUTHOR_DATE: "1700000001 +0000",
+      GIT_COMMITTER_DATE: "1700000001 +0000",
+    }).trim();
+    git(deep, "update-ref", "refs/heads/main", commit);
+    git(deep, "symbolic-ref", "HEAD", "refs/heads/main");
+    git(deep, "config", "core.maxTreeDepth", "4");
+    git(deep, "config", "uploadpack.allowFilter", "true");
+    try {
+      for (const spec of [undefined, "blob:none"]) {
+        const theirs = await clone(`${nativeHttp.server.baseUrl}/deep`, "2", spec, "n");
+        const mine = await clone(`${ourHttp.baseUrl}/deep`, "2", spec, "o");
+        expect(theirs.status).not.toBe(0);
+        expect(mine.status).not.toBe(0);
+        const remote = (text: string) => messages(text).filter((l) => l.startsWith("remote:"));
+        expect(remote(mine.stderr)).toEqual(remote(theirs.stderr));
+        expect(remote(theirs.stderr)).toContain(
+          "remote: fatal: exceeded maximum allowed tree depth",
+        );
+      }
+      // within the limit both serve it
+      git(deep, "config", "core.maxTreeDepth", "5");
+      const theirs = await clone(`${nativeHttp.server.baseUrl}/deep`, "2", undefined, "n");
+      const mine = await clone(`${ourHttp.baseUrl}/deep`, "2", undefined, "o");
+      expect(mine.status, mine.stderr).toBe(0);
+      expect(mine.state).toEqual(theirs.state);
+    } finally {
+      rmSync(deep, { recursive: true, force: true });
     }
   });
 });

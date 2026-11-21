@@ -126,6 +126,12 @@ export interface PackSet {
   /** Removes packs: `.idx` first, then `.pack`, and `.keep`, `.rev`, `.bitmap`… if present. */
   remove(packIds: readonly string[]): Promise<void>;
   /**
+   * Marks an installed pack as a promisor pack (a partial clone's): writes `pack-<id>.promisor`
+   * with `content` (git's fetch-pack writes the fetched refs, `<id> <name>` per line, for a
+   * kept pack; index-pack `--promisor` an empty file)
+   */
+  writePromisor?(packId: string, content: string): Promise<void>;
+  /**
    * Rescans the directory now, whatever the rate limit: a scan that started before the call is
    * followed by a new one. True if packs were added or dropped.
    */
@@ -765,6 +771,9 @@ export async function openPackSet(
         }
       }
       return r;
+    },
+    async writePromisor(packId, content) {
+      await files.write(`${dir}/pack-${packId}.promisor`, [new TextEncoder().encode(content)]);
     },
     async remove(packIds) {
       for (const packId of packIds) {

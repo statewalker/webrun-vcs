@@ -18,6 +18,7 @@ import type { HookSession } from "./git-hooks.js";
 import {
   httpBackendEnv,
   receivePackSettingsOf,
+  servedMaxTreeDepth,
   servedUseBitmaps,
   withReceiveTransactionHook,
 } from "./local-transport.js";
@@ -95,6 +96,8 @@ export async function servedRepositoryOf(
       useBitmaps: servedUseBitmaps(remote),
       // a sparse:oid filter's patterns
       sparseFilterPatterns: sparseFilterMatcher,
+      // core.maxTreeDepth (pack-objects' walk)
+      maxTreeDepth: servedMaxTreeDepth(remote),
     }),
     refStore: createTransportRefStore(remote.history.refs),
     config: remote.config ?? EMPTY_CONFIG,
