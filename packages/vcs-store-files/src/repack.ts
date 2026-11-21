@@ -20,13 +20,26 @@ import type {
   Pack,
   PackSet,
 } from "@statewalker/vcs-core";
-import { createGitObjects, joinPath, writePack } from "@statewalker/vcs-core";
+import {
+  BitmapClosureError,
+  createGitObjects,
+  joinPath,
+  type PackFile,
+  writePack,
+  writePackBitmap,
+} from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils/encoding";
+import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { assertAlternatesReadable } from "./alternates/index.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
+import {
+  configFilesApiOf,
+  createWorkingCopyConfig,
+} from "./workspace/working-copy/working-copy-config.files.js";
 
 /** git's gc.pruneExpire (2.weeks.ago): the grace period of unreachable objects. */
 export const DEFAULT_PRUNE_EXPIRE_MS = 14 * 24 * 60 * 60 * 1000;
@@ -95,6 +108,99 @@ export interface RepackOptions extends RepackTarget {
    * `graftFileReader(environment)` makes one): what its grafts reach is packed.
    */
   readGraftFile?: () => Promise<string | undefined>;
+  /**
+   * Write a reachability bitmap of the new pack (`git repack -b`, `repack.writeBitmaps`): true
+   * writes one (warning when it cannot: "disabling bitmap writing, ..."), false never does.
+   * Default: the config's `repack.writeBitmaps` (or `pack.writeBitmaps`), else git's default:
+   * written, silently skipped when it cannot be, when `all` packs everything of a bare
+   * repository. With true, `all` is required (git dies: incremental repacks have no bitmap)
+   * and the objects of `.keep` packs are packed too (git's `--pack-kept-objects`), so the new
+   * pack is complete.
+   */
+  writeBitmaps?: boolean;
+  /** `pack.writeBitmapHashCache`, `pack.writeBitmapLookupTable` and the rest, read from the config when not given. */
+  bitmapSettings?: Partial<BitmapSettings>;
+  /** Where the system and global config are read for the bitmap settings. */
+  environment?: GitHostEnvironment;
+  /** Bitmap entry order: 2.5x's (default) or 2.43's. */
+  compatibility?: "2.43" | "2.56";
+}
+
+/** The bitmap settings of a repository's config. */
+export interface BitmapSettings {
+  /** `repack.writeBitmaps` / `pack.writeBitmaps`, undefined when unset */
+  writeBitmaps?: boolean;
+  /** `core.bare` */
+  bare: boolean;
+  /** `pack.writeBitmapHashCache` (default true) */
+  hashCache: boolean;
+  /** `pack.writeBitmapLookupTable` (default false) */
+  lookupTable: boolean;
+  /** `pack.preferBitmapTips`: ref prefixes whose tips get a bitmap when in a window */
+  preferredTips: string[];
+}
+
+/** git's warning when a bitmap cannot cover every object. */
+export const NO_CLOSURE_BITMAP_WARNING =
+  "warning: disabling bitmap writing, as some objects are not being packed";
+/** git's error for `repack -b` without `-a`. */
+export const INCREMENTAL_BITMAP_ERROR =
+  "Incremental repacks are incompatible with bitmap indexes.  Use\n--no-write-bitmap-index or disable the pack.writeBitmaps configuration.";
+
+/** `git repack -b` without `-a` (git dies with this message). */
+export class IncrementalBitmapError extends Error {
+  override name = "IncrementalBitmapError";
+  constructor() {
+    super(INCREMENTAL_BITMAP_ERROR);
+  }
+}
+
+/**
+ * Reads the bitmap settings of a repository (`repack.writeBitmaps`, `pack.writeBitmaps`,
+ * `core.bare`, `pack.writeBitmapHashCache`, `pack.writeBitmapLookupTable`,
+ * `pack.preferBitmapTips`).
+ *
+ * @example
+ * ```typescript
+ * const { writeBitmaps, bare } = await readBitmapSettings(files, "repo.git");
+ * ```
+ */
+export async function readBitmapSettings(
+  files: FilesApi,
+  gitDir = ".git",
+  options: { environment?: GitHostEnvironment } = {},
+): Promise<BitmapSettings> {
+  const config = await createWorkingCopyConfig(configFilesApiOf(files), gitDir, undefined, {
+    ...(options.environment ? { environment: options.environment } : {}),
+  });
+  const bool = (key: string): boolean | undefined => {
+    const v = config.get(key);
+    return v === undefined ? undefined : (parseGitBool(v) ?? undefined);
+  };
+  // git reads both in order; the last one set wins
+  let writeBitmaps: boolean | undefined;
+  for (const entry of config
+    .getAllWithOrigin("repack.writeBitmaps")
+    .concat(config.getAllWithOrigin("pack.writeBitmaps"))
+    .sort((a, b) => originOrder(a) - originOrder(b))) {
+    writeBitmaps = parseGitBool(entry.value) ?? writeBitmaps;
+  }
+  return {
+    ...(writeBitmaps !== undefined ? { writeBitmaps } : {}),
+    bare: bool("core.bare") ?? false,
+    hashCache: bool("pack.writeBitmapHashCache") ?? true,
+    lookupTable: bool("pack.writeBitmapLookupTable") ?? false,
+    preferredTips: config
+      .getAll("pack.preferBitmapTips")
+      .filter((v): v is string => typeof v === "string"),
+  };
+}
+
+/** A config value's place in git's reading order. */
+function originOrder(o: { scope?: string; line?: number }): number {
+  const scopes = ["system", "global", "local", "worktree", "command"];
+  const s = Math.max(0, scopes.indexOf(o.scope ?? "local"));
+  return s * 1e9 + (o.line ?? 0);
 }
 
 /**
@@ -113,6 +219,10 @@ export interface RepackResult {
   keptPacks: string[];
   /** Unreachable objects of the removed packs written loose or renewed (`unpackUnreachable`) */
   unpackedObjects: number;
+  /** Whether a reachability bitmap of the new pack was written (`pack-<id>.bitmap`) */
+  bitmapWritten?: boolean;
+  /** git's warnings (`warning: disabling bitmap writing, ...`) */
+  warnings?: string[];
   /**
    * git's error lines from reading the alternates, which git repack prints to stderr and goes
    * on (`repack()` only; gc reports them in its own result); absent when there are none
@@ -231,10 +341,16 @@ export async function repackListed(
     else replaced.push(p);
   }
 
-  // -a: everything reachable but what .keep packs hold; -d alone: what no pack holds (an
-  // alternate's included: pack-objects --unpacked); -l: nothing an alternate holds
-  const skip = all ? kept : before;
   const alternates = (await objects.alternates?.list()) ?? [];
+  const warnings: string[] = [];
+  // the bitmap: "loud" (-b, repack.writeBitmaps) warns when it cannot be written, "quiet"
+  // (git's default for -a in a bare repository) does not
+  const bitmaps = await bitmapPlan(options, all, alternates.length > 0, warnings);
+
+  // -a: everything reachable but what .keep packs hold (all of it with -b: git's
+  // --pack-kept-objects); -d alone: what no pack holds (an alternate's included:
+  // pack-objects --unpacked); -l: nothing an alternate holds
+  const skip = all ? (bitmaps.mode === "loud" ? [] : kept) : before;
   const borrowed = async (id: ObjectId) => {
     for (const alt of alternates) {
       if (options.local ? await alt.objects.has(id) : !all && (await alt.packs.has(id)))
@@ -249,6 +365,12 @@ export async function repackListed(
     ids.push(o);
   }
   if (ids.length === 0) return null;
+  // a bitmap describes a pack holding everything its commits reach (pack-objects'
+  // no_closure_warning)
+  if (bitmaps.mode !== "off" && ids.length < new Set(reachable.map((o) => o.id)).size) {
+    if (bitmaps.mode === "loud") warnings.push(NO_CLOSURE_BITMAP_WARNING);
+    bitmaps.mode = "off";
+  }
 
   const keptPacks = kept.map((p) => `pack-${p.packId}`);
   if (dryRun) {
@@ -273,6 +395,14 @@ export async function repackListed(
   const installed = await packs.install(stream);
   // Install before remove: every reader finds each object in the new pack from now on
   await packs.refresh();
+  const bitmapWritten = await installBitmap(
+    options,
+    packDir,
+    installed.packId,
+    ids,
+    bitmaps,
+    warnings,
+  );
 
   // Only packs of the snapshot, and none modified since the walk started (defence in depth)
   const removable: { pack: Pack; modified?: number }[] = [];
@@ -314,7 +444,101 @@ export async function repackListed(
     packsRemoved,
     keptPacks,
     unpackedObjects,
+    bitmapWritten,
+    ...(warnings.length > 0 ? { warnings } : {}),
   };
+}
+
+interface BitmapPlan {
+  mode: "loud" | "quiet" | "off";
+  settings?: BitmapSettings;
+}
+
+/** Whether and how the repack writes a bitmap: git's repack.c / pack-objects decisions. */
+async function bitmapPlan(
+  options: RepackOptions,
+  all: boolean,
+  hasAlternates: boolean,
+  warnings: string[],
+): Promise<BitmapPlan> {
+  if (options.writeBitmaps === false || options.dryRun) return { mode: "off" };
+  const read = await readBitmapSettings(options.files, options.gitDir ?? ".git", {
+    ...(options.environment ? { environment: options.environment } : {}),
+  });
+  const settings: BitmapSettings = { ...read, ...options.bitmapSettings };
+  const explicit = options.writeBitmaps ?? settings.writeBitmaps;
+  let mode: BitmapPlan["mode"] =
+    explicit === true
+      ? "loud"
+      : explicit === false
+        ? "off"
+        : all && settings.bare
+          ? "quiet"
+          : "off";
+  if (mode === "off") return { mode, settings };
+  if (!all) throw new IncrementalBitmapError();
+  if (options.local && hasAlternates) {
+    // git warns even for its default (write_bitmaps = -1 is true there)
+    warnings.push(NO_CLOSURE_BITMAP_WARNING);
+    return { mode: "off", settings };
+  }
+  // a shallow repository's commits lack parents: no bitmap (not git's: its walk grafts them)
+  const shallow = (await options.history.refs.getShallow?.().catch(() => [])) ?? [];
+  if (shallow.length > 0) mode = "off";
+  return { mode, settings };
+}
+
+/**
+ * Writes the new pack's bitmap through a temporary file and a rename, or, when none is
+ * written, removes a stale `.bitmap` of that pack name (git's generated_pack_install).
+ */
+async function installBitmap(
+  options: RepackOptions,
+  packDir: string,
+  packId: string,
+  listed: readonly ListedObject[],
+  plan: BitmapPlan,
+  warnings: string[],
+): Promise<boolean> {
+  const { files, packs } = options;
+  const target = joinPath(packDir, `pack-${packId}.bitmap`);
+  const pack = (await packs.packs()).find((p) => p.packId === packId) as PackFile | undefined;
+  if (plan.mode === "off" || !plan.settings || !pack || typeof pack.packOrder !== "function") {
+    if (await files.exists(target)) await files.remove(target);
+    return false;
+  }
+  const preferred: ObjectId[] = [];
+  if (plan.settings.preferredTips.length > 0) {
+    for await (const ref of options.history.refs.list()) {
+      if (!plan.settings.preferredTips.some((prefix) => ref.name.startsWith(prefix))) continue;
+      const resolved = await options.history.refs.resolve(ref.name).catch(() => undefined);
+      if (resolved?.objectId) preferred.push(resolved.peeledObjectId ?? resolved.objectId);
+    }
+  }
+  let bytes: Uint8Array;
+  try {
+    bytes = await writePackBitmap({
+      pack,
+      objects: options.objects,
+      listed,
+      hashCache: plan.settings.hashCache,
+      lookupTable: plan.settings.lookupTable,
+      preferredTips: preferred,
+      ...(options.compatibility ? { compatibility: options.compatibility } : {}),
+    });
+  } catch (e) {
+    if (!(e instanceof BitmapClosureError)) throw e;
+    warnings.push(`warning: ${e.message}`);
+    if (await files.exists(target)) await files.remove(target);
+    return false;
+  }
+  const tmp = joinPath(packDir, `tmp_bitmap_${Math.random().toString(36).slice(2, 8)}`);
+  await files.write(tmp, [bytes]);
+  if (!(await files.move(tmp, target))) {
+    await files.remove(tmp).catch(() => false);
+    throw new Error(`unable to rename temporary bitmap file to '${target}'`);
+  }
+  return true;
 }
 
 /**

@@ -102,6 +102,12 @@ export interface ExportOptions extends PackOptions {
    * chain. Pass the ids of the `refs/tags/*` the receiver may see.
    */
   includeTags?: Iterable<ObjectId>;
+  /**
+   * List the objects through the packs' reachability bitmap when there is one (git's
+   * `pack.useBitmaps`, default true): not for a shallow receiver, nor for a thin pack with
+   * haves (its delta bases come from the revision walk's boundary).
+   */
+  useBitmaps?: boolean;
 }
 
 /**

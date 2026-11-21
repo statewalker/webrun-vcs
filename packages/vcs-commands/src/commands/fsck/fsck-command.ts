@@ -24,6 +24,7 @@ import {
 } from "@statewalker/vcs-core";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { readFile } from "@statewalker/vcs-utils/files";
+import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import {
   type CacheTree,
@@ -77,6 +78,8 @@ export const FSCK_ERROR_PACK = 0o4;
 export const FSCK_ERROR_REFS = 0o10;
 /** `git commit-graph verify` failed (git's ERROR_COMMIT_GRAPH). */
 export const FSCK_ERROR_COMMIT_GRAPH = 0o20;
+/** A bitmap file's checksum is wrong, in git 2.43 (its ERROR_BITMAP; 2.5x sets the object bit). */
+export const FSCK_ERROR_BITMAP_243 = 0o200;
 
 /** What one line of fsck's output reports. */
 export type FsckFindingKind =
@@ -257,7 +260,7 @@ function treeLineSound(data: Uint8Array): boolean {
  * failure sets exit bit 16 (`FSCK_ERROR_COMMIT_GRAPH`).
  *
  * Not done: the ref database checks of `git refs verify` (git 2.45+),
- * multi-pack-index, bitmap and reverse-index verification, promisor objects, the commit-graphs
+ * multi-pack-index and reverse-index verification, promisor objects, the commit-graphs
  * of alternates, `fsck.skipList`, and explicit `<object>` heads. The objects of alternates
  * (`history.objects.alternates`) are read and checked as git's default `--full` reads them
  * (their dangling objects listed too): 2.56 source by source, 2.43 every source's loose
@@ -703,7 +706,13 @@ class FsckRun {
       if (this.files) {
         for (const step of this.sourceSteps()) {
           if ("loose" in step) await this.fsckLooseObjects(step.loose);
-          else await this.fsckPacks(step.packs.map((k) => this.packs[k] as RepoPack));
+          else {
+            const packs = step.packs.map((k) => this.packs[k] as RepoPack);
+            await this.fsckPacks(packs);
+            // 2.5x's verify_bitmap_files, after the source's packs (2.43: at the end)
+            if (this.o.compatibility === "2.56" && (await this.verifyBitmapFiles(packs)))
+              this.errorsFound |= FSCK_ERROR_OBJECT;
+          }
         }
       } else {
         await this.fsckStoredObjects();
@@ -719,6 +728,13 @@ class FsckRun {
     try {
       await this.checkConnectivity();
       await this.verifyCommitGraph();
+      // 2.43 checks every pack's bitmap last, --connectivity-only too (ERROR_BITMAP, 0200)
+      if (
+        this.files &&
+        this.o.compatibility === "2.43" &&
+        (await this.verifyBitmapFiles(this.packs))
+      )
+        this.errorsFound |= FSCK_ERROR_BITMAP_243;
     } finally {
       for (const pack of this.opened.values()) pack?.close();
     }
@@ -1870,6 +1886,35 @@ class FsckRun {
       );
       if (r > 0) this.errorsFound |= FSCK_ERROR_OBJECT;
     }
+  }
+
+  /**
+   * git's `verify_bitmap_files`: the trailing SHA-1 of each pack's `.bitmap` (a missing file
+   * is fine). True if one is wrong.
+   */
+  private async verifyBitmapFiles(packs: readonly RepoPack[]): Promise<boolean> {
+    const files = this.files as FilesApi;
+    let bad = false;
+    for (const p of packs) {
+      const path = `${p.packPath.replace(/\.pack$/, "")}.bitmap`;
+      const st = await files.stats(path).catch(() => undefined);
+      if (st?.kind !== "file") continue;
+      const size = st.size ?? 0;
+      let valid = size >= 20;
+      if (valid) {
+        const hasher = createSha1();
+        for await (const c of files.read(path, { start: 0, length: size - 20 })) hasher.update(c);
+        const sum = hasher.digest();
+        const tail: number[] = [];
+        for await (const c of files.read(path, { start: size - 20, length: 20 })) tail.push(...c);
+        valid = tail.length === 20 && sum.every((b, i) => b === tail[i]);
+      }
+      if (!valid) {
+        this.error(`bitmap file '${path}' has invalid checksum`);
+        bad = true;
+      }
+    }
+    return bad;
   }
 
   /** git's `verify_pack` for each of `packs`, with `fsck_obj_buffer` for each object. */

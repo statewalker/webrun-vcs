@@ -434,7 +434,7 @@ export class PushCommand extends TransportCommand<PushResult> {
       auth: this.credentials,
       headers: this.headers,
       timeout: this.timeout,
-      repository: createRepositoryFacade({ history }),
+      repository: createRepositoryFacade({ history, useBitmaps: this.useBitmaps }),
       refStore: createTransportRefStore(history.refs),
       refspecs,
       force: this.force,

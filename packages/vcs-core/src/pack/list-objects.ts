@@ -22,7 +22,9 @@ import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
 import type { GitObject, GitObjects } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
+import { listObjectsWithBitmap } from "./bitmap-walk.js";
 import { ObjectIdFlags } from "./object-id-flags.js";
+import type { PackBitmapIndex } from "./pack-bitmap.js";
 
 /** What `listObjects` reads: objects by id. */
 export type ListObjectsSource = Pick<GitObjects, "get"> & Partial<Pick<GitObjects, "getNow">>;
@@ -68,6 +70,13 @@ export interface ListObjectsOptions {
   commitHeader?: (
     id: ObjectId,
   ) => Promise<{ tree: ObjectId; parents: ObjectId[]; commitTime: number } | undefined>;
+  /**
+   * A pack bitmap (`PackSet.bitmap()`, git's `--use-bitmap-index`): when nothing needs the
+   * revision walk (no `shallow`, `grafts` or `onBoundary`), the objects are listed through it
+   * (`bitmapWalk`): exactly what the wants reach and the haves do not, by type in pack order,
+   * with the name hash of each path (`nameHash`) instead of the path.
+   */
+  bitmap?: PackBitmapIndex;
 }
 
 /** One listed object, as `git rev-list --objects` prints it. */
@@ -76,6 +85,8 @@ export interface ListedObject {
   type: ObjectTypeString;
   /** The path of a tree or blob below its commit's root tree ("" for a root tree). */
   path?: string;
+  /** The path's name hash, when listed through a bitmap (its name-hash cache) */
+  nameHash?: number;
 }
 
 /** A want the store does not have. */
@@ -91,7 +102,8 @@ const BOUNDARY = 8;
 /** Commits walked after only uninteresting ones remain queued (git's SLOP). */
 const SLOP = 5;
 
-interface CommitInfo {
+/** @internal */
+export interface CommitInfo {
   tree: ObjectId;
   parents: ObjectId[];
   time: number;
@@ -113,6 +125,10 @@ export async function* listObjects(
   objects: ListObjectsSource,
   options: ListObjectsOptions,
 ): AsyncGenerator<ListedObject> {
+  if (options.bitmap && !options.shallow && !options.grafts && !options.onBoundary) {
+    yield* listObjectsWithBitmap(options.bitmap, objects, options);
+    return;
+  }
   const flags = new ObjectIdFlags();
   const has = (id: ObjectId, f: number) => (flags.get(id) & f) !== 0;
   const set = (id: ObjectId, f: number) => flags.add(id, f);
@@ -420,8 +436,11 @@ async function collect(o: GitObject): Promise<Uint8Array> {
   return data;
 }
 
-/** The tree and parents of a commit, and its committer time. */
-function parseCommitHeader(id: ObjectId, data: Uint8Array): CommitInfo {
+/**
+ * The tree and parents of a commit, and its committer time.
+ * @internal
+ */
+export function parseCommitHeader(id: ObjectId, data: Uint8Array): CommitInfo {
   const end = indexOfBlankLine(data);
   const text = dec.decode(data.subarray(0, end));
   let tree: ObjectId | undefined;
@@ -446,7 +465,8 @@ function parseCommitHeader(id: ObjectId, data: Uint8Array): CommitInfo {
   return { tree, parents, time };
 }
 
-function parseTagTarget(id: ObjectId, data: Uint8Array): ObjectId {
+/** @internal the object a tag names */
+export function parseTagTarget(id: ObjectId, data: Uint8Array): ObjectId {
   const text = dec.decode(data.subarray(0, Math.min(data.length, 64)));
   if (!text.startsWith("object ")) throw new Error(`tag ${id} has no object`);
   return text.slice(7, 47);
@@ -457,15 +477,21 @@ function indexOfBlankLine(data: Uint8Array): number {
   return data.length;
 }
 
-const TREE = 0;
-const BLOB = 1;
-const GITLINK = 2;
+/** @internal tree entry kinds of `scanTreeEntry` */
+export const TREE_ENTRY_TREE = 0;
+/** @internal */
+export const TREE_ENTRY_BLOB = 1;
+/** @internal */
+export const TREE_ENTRY_GITLINK = 2;
+const TREE = TREE_ENTRY_TREE;
+const GITLINK = TREE_ENTRY_GITLINK;
 
 /**
+ * @internal
  * The tree entry at `at`: its kind (by its mode, `40000` a tree, `160000` a gitlink, else a
  * blob), where its name starts and its NUL (the id follows), and where the next entry starts.
  */
-function scanTreeEntry(
+export function scanTreeEntry(
   data: Uint8Array,
   at: number,
 ): { kind: number; nameStart: number; nul: number; next: number } {
@@ -489,6 +515,6 @@ function scanTreeEntry(
           data[at + 4] === 0x30 &&
           data[at + 5] === 0x30
         ? GITLINK
-        : BLOB;
+        : TREE_ENTRY_BLOB;
   return { kind, nameStart: sp + 1, nul, next: nul + 21 };
 }

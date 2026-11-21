@@ -188,6 +188,15 @@ export interface PackFile extends Pack {
    * verify-pack run it): rejects with `PackError` if it is corrupt.
    */
   verifyIndex(): Promise<void>;
+  /**
+   * For each entry in pack order (by offset), its position in the idx: git's reverse index
+   * (`.rev`), computed from the idx's offsets. A pack bitmap's bit positions are pack order.
+   */
+  packOrder(): Uint32Array;
+  /** The id at position `i` of the idx (sorted order). */
+  idAt(i: number): ObjectId;
+  /** The idx position of `id`, -1 when the pack does not hold it. */
+  indexOf(id: ObjectId): number;
 }
 
 const TYPES: (ObjectTypeString | undefined)[] = [undefined, "commit", "tree", "blob", "tag"];
@@ -1732,6 +1741,16 @@ export async function openPack(
       },
     },
     verifyIndex: () => t.verify(),
+    packOrder: () => permutation(),
+    idAt: (i) => hex(t.idAt(i)),
+    indexOf(id) {
+      try {
+        return t.find(id);
+      } catch (e) {
+        if (e instanceof PackError) return -1;
+        throw e;
+      }
+    },
     close: () => {
       cached.drop();
       closed = true;

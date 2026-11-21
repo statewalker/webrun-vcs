@@ -1565,4 +1565,35 @@ describeGit("fsck against native git", () => {
     expect(none.output).not.toContain("dangling");
     expect(none.errorOutput).not.toContain("hint:");
   });
+
+  it("a bitmap whose checksum is wrong (verify_bitmap_files); a sound one passes", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n", "d/b": "b\n" }, "one");
+    commitFiles(dir, { a: "a2\n" }, "two");
+    g(dir, "repack", "-adbq");
+    expect(await compare(dir, [])).toEqual({ stdout: "", stderr: "", exit: 0 });
+    const packDir = join(dir, ".git", "objects", "pack");
+    const bitmap = readdirSync(packDir).find((f) => f.endsWith(".bitmap")) as string;
+    flipByte(join(packDir, bitmap), 40);
+    // git 2.43 dies with status 128 (its ERROR_BITMAP bit), 2.5x sets the object bit
+    const theirs = native(dir, ["fsck", ...noReferences]);
+    const files = createNodeFilesApi({ rootDir: dir });
+    const run = async (connectivityOnly: boolean) =>
+      (await openOurs(dir))
+        .fsck()
+        .setRepositoryFiles({ files })
+        .setCompatibility(compatibility)
+        .setConnectivityOnly(connectivityOnly)
+        .call();
+    const ours = await run(false);
+    const line = `error: bitmap file '.git/objects/pack/${bitmap}' has invalid checksum\n`;
+    expect(theirs.stderr).toBe(line);
+    expect(ours.errorOutput).toBe(line);
+    expect(ours.exitCode).toBe(theirs.status);
+    // --connectivity-only: 2.43 still checks bitmaps, 2.5x does not
+    const theirsOnly = native(dir, ["fsck", ...noReferences, "--connectivity-only"]);
+    const oursOnly = await run(true);
+    expect(oursOnly.errorOutput).toBe(theirsOnly.stderr);
+    expect(oursOnly.exitCode).toBe(theirsOnly.status);
+  });
 });

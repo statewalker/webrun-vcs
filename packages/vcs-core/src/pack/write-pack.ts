@@ -42,7 +42,15 @@ import type { PackedEntry, PackedEntryKind } from "./pack-file.js";
 export type PackObjectSource = Pick<GitObjects, "get">;
 
 /** An object to write: its id, or its id with what is known of it (as `listObjects` yields). */
-export type PackObjectRef = ObjectId | { id: ObjectId; type?: ObjectTypeString; path?: string };
+export type PackObjectRef =
+  | ObjectId
+  | {
+      id: ObjectId;
+      type?: ObjectTypeString;
+      path?: string;
+      /** The path's name hash, when known without the path (a bitmap's name-hash cache) */
+      nameHash?: number;
+    };
 
 /** A stored entry `writePack` may copy (a `PackSet` is one source of them). */
 export type ReusableEntry = Pick<PackedEntry, "kind" | "size" | "baseId" | "raw" | "data"> & {
@@ -188,7 +196,7 @@ export async function* writePack(
     const p: Planned = {
       id: r.id,
       type: r.type,
-      nameHash: nameHash(r.path),
+      nameHash: r.nameHash ?? packNameHash(r.path),
       depth: 0,
       have: false,
     };
@@ -200,7 +208,13 @@ export async function* writePack(
     for (const ref of options.haves ?? []) {
       const r = typeof ref === "string" ? { id: ref } : ref;
       if (byId.has(r.id) || haves.has(r.id)) continue;
-      haves.set(r.id, { id: r.id, type: r.type, nameHash: nameHash(r.path), depth: 0, have: true });
+      haves.set(r.id, {
+        id: r.id,
+        type: r.type,
+        nameHash: r.nameHash ?? packNameHash(r.path),
+        depth: 0,
+        have: true,
+      });
     }
   }
 
@@ -462,7 +476,7 @@ function limitReusedChains(order: Planned[], maxDepth: number) {
 }
 
 /** git's pack_name_hash: the last characters of the path weigh most; spaces are skipped. */
-function nameHash(path: string | undefined): number {
+export function packNameHash(path: string | undefined): number {
   if (!path) return 0;
   let h = 0;
   for (let i = 0; i < path.length; i++) {

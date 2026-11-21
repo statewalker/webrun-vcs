@@ -13,6 +13,7 @@ import {
   type ServerConfigReader,
   servedGitFilesOf,
 } from "@statewalker/vcs-transport";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import type { OpenedRepository } from "@statewalker/vcs-working-tree";
 import type { HookSession } from "./git-hooks.js";
 import {
@@ -88,7 +89,11 @@ export async function servedRepositoryOf(
   for (const key of CONFIG_KEYS) delete settings[key];
   const hooks = options.hooks;
   return {
-    repository: createRepositoryFacade({ history: remote.history }),
+    repository: createRepositoryFacade({
+      history: remote.history,
+      // git's pack.useBitmaps (pack-objects reads it from the served repository)
+      useBitmaps: parseGitBool(remote.config?.getAll("pack.useBitmaps").at(-1)) ?? true,
+    }),
     refStore: createTransportRefStore(remote.history.refs),
     config: remote.config ?? EMPTY_CONFIG,
     settings: settings as GitServeSettings,
