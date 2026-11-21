@@ -472,6 +472,18 @@ describeGit("connectivity and fsck checks after fetch and clone, as native git",
       refspec: "name",
       ok: false,
     },
+    {
+      name: "an unknown fetch.fsck.<msg-id> skipped with a warning",
+      config: ["fetch.fsckObjects=true", "fetch.fsck.noSuchId=warn", "fetch.fsck.badName=warn"],
+      refspec: "name",
+      ok: true,
+    },
+    {
+      name: "an unknown fetch.fsck.<msg-id> warned of before index-pack dies",
+      config: ["fetch.fsckObjects=true", "fetch.fsck.noSuchId=bogus"],
+      refspec: "main",
+      ok: false,
+    },
   ];
   for (const c of fsckCases) {
     it(`${c.name}: as native git`, async () => {
@@ -514,6 +526,18 @@ describeGit("connectivity and fsck checks after fetch and clone, as native git",
       [["fetch.fsck.badName=bogus"], false],
       [["fetch.fsck.badName=WARN"], false],
       [["fetch.fsckObjects=true", "fetch.fsck.nulInHeader=warn"], true],
+      // index-pack dies at the first fatal message demoted, in the configuration's order
+      [
+        [
+          "fetch.fsckObjects=true",
+          "fetch.fsck.unterminatedHeader=warn",
+          "fetch.fsck.nulInHeader=ignore",
+        ],
+        true,
+      ],
+      // fetch-pack reads fetch.fsckObjects (and transfer.fsckObjects) as booleans
+      [["fetch.fsckObjects=maybe"], false],
+      [["fetch.fsckObjects=false", "transfer.fsckObjects=perhaps"], false],
     ] as const) {
       const { native, dir } = await fetchTwins(badUrl());
       for (const d of [native, dir]) {

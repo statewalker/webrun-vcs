@@ -650,3 +650,47 @@ describe("VcsRepositoryFacade.exportPack: include-tag", () => {
     expect(calls[1]?.includeTags).toBeUndefined();
   });
 });
+
+describe("VcsRepositoryFacade: a commit the typed store cannot parse", () => {
+  it("is walked leniently (fetch's connectivity check passes), and typed as a commit", async () => {
+    const { createMemoryHistoryWithOperations, DefaultSerializationApi } = await import(
+      "@statewalker/vcs-core"
+    );
+    const { connectivityErrors } = await import("@statewalker/vcs-transport");
+    const history = createMemoryHistoryWithOperations();
+    await history.initialize();
+    const objects = history.objects;
+    if (!objects) throw new Error("no object store");
+    const enc = new TextEncoder();
+    const blob = await history.blobs.store([enc.encode("content\n")]);
+    const tree = await history.trees.store([{ mode: 0o100644, name: "a.txt", id: blob }]);
+    const good = await history.commits.store({
+      tree,
+      parents: [],
+      author: SAMPLE_IDENT,
+      committer: SAMPLE_IDENT,
+      message: "good",
+    });
+    // a committer without `<`: fsck's badName, refused by the typed parser, walked by git
+    const raw = enc.encode(
+      `tree ${tree}\nparent ${good}\nauthor A U Thor <a@example.com> 1700000000 +0000\n` +
+        "committer no email 1700000001 +0000\n\nmalformed\n",
+    );
+    const bad = await objects.put("commit", raw.length, [raw]);
+    const facade = new VcsRepositoryFacade({
+      history,
+      serialization: new DefaultSerializationApi({ history }),
+    });
+
+    // no `>` on the committer line: git's parse_commit_date reads time 0
+    expect(await facade.getCommitInfo(bad)).toEqual({ tree, parents: [good], time: 0 });
+    expect(await facade.getObjectType(bad)).toBe("commit");
+    expect(await connectivityErrors(facade, [bad], { known: [], shallow: new Set() })).toBe(
+      undefined,
+    );
+    // objects that are no commit (or no tag) are not taken for one
+    expect(await facade.getCommitInfo(blob)).toBeUndefined();
+    expect(await facade.getTagInfo(bad)).toBeUndefined();
+    expect(await facade.getCommitInfo("0".repeat(40))).toBeUndefined();
+  });
+});

@@ -90,6 +90,18 @@ export class ReceivedObjects {
     else this.insert(this.n - 1);
   }
 
+  /** Whether the id at `raw[at..at+20)` came with the pack. */
+  hasRaw(raw: Uint8Array, at: number): boolean {
+    return this.find(raw, at) >= 0;
+  }
+
+  /** How many of the received objects are commits, trees or tags. */
+  get nonBlobs(): number {
+    let n = 0;
+    for (let i = 0; i < this.n; i++) if (this.types[i] !== 3) n++;
+    return n;
+  }
+
   /** Whether `id` came with the pack. */
   has(id: string): boolean {
     if (id.length !== 40) return false;
@@ -149,15 +161,15 @@ export class ReceivedObjects {
     );
   }
 
-  private find(raw: Uint8Array): number {
+  private find(raw: Uint8Array, rawAt = 0): number {
     const mask = this.slots.length - 1;
-    for (let s = this.hash(raw) & mask; ; s = (s + 1) & mask) {
+    for (let s = this.hash(raw, rawAt) & mask; ; s = (s + 1) & mask) {
       const v = this.slots[s] as number;
       if (v === 0) return -1;
       const at = (v - 1) * 20;
       let same = true;
       for (let k = 0; k < 20; k++) {
-        if (this.ids[at + k] !== raw[k]) {
+        if (this.ids[at + k] !== raw[rawAt + k]) {
           same = false;
           break;
         }
@@ -179,6 +191,166 @@ export class ReceivedObjects {
   }
 }
 
+/** A set of raw 20-byte object ids, open addressing over one byte array. */
+class RawIdSet {
+  private ids = new Uint8Array(20 * 256);
+  private slots = new Int32Array(512);
+  private n = 0;
+
+  get size(): number {
+    return this.n;
+  }
+
+  /** Adds the id at `raw[at..at+20)`; false when it was there already. */
+  add(raw: Uint8Array, at: number): boolean {
+    const mask = this.slots.length - 1;
+    let s = idHash(raw, at) & mask;
+    for (; ; s = (s + 1) & mask) {
+      const v = this.slots[s] as number;
+      if (v === 0) break;
+      if (sameId(this.ids, (v - 1) * 20, raw, at)) return false;
+    }
+    if (this.n * 20 === this.ids.length) {
+      const ids = new Uint8Array(this.ids.length * 2);
+      ids.set(this.ids);
+      this.ids = ids;
+    }
+    this.ids.set(raw.subarray(at, at + 20), this.n * 20);
+    this.n++;
+    if (this.n * 2 > this.slots.length) {
+      this.slots = new Int32Array(this.slots.length * 2);
+      const m = this.slots.length - 1;
+      for (let i = 0; i < this.n; i++) {
+        let t = idHash(this.ids, i * 20) & m;
+        while (this.slots[t] !== 0) t = (t + 1) & m;
+        this.slots[t] = i + 1;
+      }
+    } else {
+      this.slots[s] = this.n;
+    }
+    return true;
+  }
+
+  /** Calls `fn` with each id (the shared array and its offset), in insertion order. */
+  forEach(fn: (raw: Uint8Array, at: number) => void): void {
+    for (let i = 0; i < this.n; i++) fn(this.ids, i * 20);
+  }
+}
+
+function idHash(raw: Uint8Array, at: number): number {
+  return (
+    (((raw[at] as number) << 24) |
+      ((raw[at + 1] as number) << 16) |
+      ((raw[at + 2] as number) << 8) |
+      (raw[at + 3] as number)) >>>
+    0
+  );
+}
+
+function sameId(a: Uint8Array, ai: number, b: Uint8Array, bi: number): boolean {
+  for (let k = 0; k < 20; k++) if (a[ai + k] !== b[bi + k]) return false;
+  return true;
+}
+
+function rawToHex(raw: Uint8Array, at: number): string {
+  let id = "";
+  for (let k = 0; k < 20; k++) id += (raw[at + k] as number).toString(16).padStart(2, "0");
+  return id;
+}
+
+/** Parses 40 hex digits of `content` at `at` into `out`; false when they are not hex. */
+function parseHexId(content: Uint8Array, at: number, out: Uint8Array): boolean {
+  if (at + 40 > content.length) return false;
+  for (let i = 0; i < 20; i++) {
+    const hi = hexDigit(content[at + 2 * i] as number);
+    const lo = hexDigit(content[at + 2 * i + 1] as number);
+    if (hi < 0 || lo < 0) return false;
+    out[i] = (hi << 4) | lo;
+  }
+  return true;
+}
+
+/** Whether `content` has the ASCII `word` at `at`. */
+function startsWith(content: Uint8Array, at: number, word: string): boolean {
+  if (at + word.length > content.length) return false;
+  for (let i = 0; i < word.length; i++) if (content[at + i] !== word.charCodeAt(i)) return false;
+  return true;
+}
+
+/**
+ * The objects the received commits, trees and tags name, read from their content while the
+ * import holds it (the import's `onContent`), as index-pack's `fsck_walk` marks them
+ * (`FLAG_LINK`) when it hashes each object: a commit's tree and parents (not those of a
+ * shallow commit), a tree's entries (not gitlinks), a tag's object. Checking them afterwards
+ * reads nothing back from the store.
+ */
+export class ReceivedLinks {
+  private readonly links = new RawIdSet();
+  private readonly reported = new RawIdSet();
+  private readonly scratch = new Uint8Array(20);
+  private shallow: ReadonlySet<string> | undefined;
+
+  /** `shallow` gives the shallow commits index-pack is given, asked once the first commit comes. */
+  constructor(private readonly shallowOf: () => ReadonlySet<string>) {}
+
+  /** How many distinct objects were reported */
+  get reportedCount(): number {
+    return this.reported.size;
+  }
+
+  /** Records the links of a received object (the import's `onContent`). */
+  add(id: string, type: GitObjectTypeName, content: Uint8Array): void {
+    if (type === "blob" || !parseHexIdString(id, this.scratch)) return;
+    if (!this.reported.add(this.scratch, 0)) return; // a duplicate entry
+    if (type === "commit") {
+      let at = 0;
+      if (startsWith(content, at, "tree ") && parseHexId(content, at + 5, this.scratch)) {
+        this.links.add(this.scratch, 0);
+        at += 46;
+      }
+      this.shallow ??= this.shallowOf();
+      if (this.shallow.has(id)) return;
+      while (startsWith(content, at, "parent ") && parseHexId(content, at + 7, this.scratch)) {
+        this.links.add(this.scratch, 0);
+        at += 48;
+      }
+    } else if (type === "tag") {
+      if (startsWith(content, 0, "object ") && parseHexId(content, 7, this.scratch))
+        this.links.add(this.scratch, 0);
+    } else {
+      let at = 0;
+      while (at < content.length) {
+        let mode = 0;
+        while (at < content.length && content[at] !== 32) {
+          mode = mode * 8 + ((content[at] as number) - 48);
+          at++;
+        }
+        while (at < content.length && content[at] !== 0) at++;
+        at++;
+        if (at + 20 > content.length) break;
+        if ((mode & 0o170000) !== 0o160000) this.links.add(content, at); // gitlinks: not followed
+        at += 20;
+      }
+    }
+  }
+
+  /** Calls `fn` with each linked id */
+  forEach(fn: (raw: Uint8Array, at: number) => void): void {
+    this.links.forEach(fn);
+  }
+}
+
+function parseHexIdString(id: string, out: Uint8Array): boolean {
+  if (id.length !== 40) return false;
+  for (let i = 0; i < 20; i++) {
+    const hi = hexDigit(id.charCodeAt(2 * i));
+    const lo = hexDigit(id.charCodeAt(2 * i + 1));
+    if (hi < 0 || lo < 0) return false;
+    out[i] = (hi << 4) | lo;
+  }
+  return true;
+}
+
 /**
  * fsck of received objects, as index-pack's `--strict` runs it (the checks themselves are the
  * caller's: vcs-commands' `fsck` checks with `fetch.fsck.<msg-id>` and `fetch.fsck.skipList`).
@@ -191,6 +363,12 @@ export interface ReceivedObjectsFsck {
    * <msg-id>: <message>`, warnings too) added to `lines`; true when one is an error
    */
   checkObject(id: string, type: GitObjectTypeName, content: Uint8Array, lines: string[]): boolean;
+  /**
+   * Whether the fsck of the blob `id` would look at its content (a `.gitmodules` or
+   * `.gitattributes` blob a checked tree named): blobs it would not are never read. Absent:
+   * every blob is read and checked.
+   */
+  wantsBlob?(id: string): boolean;
   /** The `.gitmodules` / `.gitattributes` blobs a tree named that were not checked yet */
   pendingBlobs(): string[];
   /** index-pack's `fsck_finish` of one of them, read from the repository (or absent) */
@@ -207,6 +385,11 @@ export interface ReceivedPackCheckOptions {
   fsck?: ReceivedObjectsFsck;
   /** Check that every object a received object names was received or is here */
   links: boolean;
+  /**
+   * The links the import read from the objects' content: used when it reported every received
+   * commit, tree and tag, else the objects are read back through `repository`
+   */
+  receivedLinks?: ReceivedLinks;
   /** The shallow commits index-pack is given (`--shallow-file`): their parents are not named */
   shallow: ReadonlySet<string>;
   /** Whether the pack was kept (git then reads index-pack's output, and words its death so) */
@@ -244,6 +427,7 @@ export async function checkReceivedPack(
   if (fsck?.startError) fail(fsck.startError);
   if (fsck && repository.loadObject) {
     for (const { id, type } of received.ordered()) {
+      if (type === "blob" && fsck.wantsBlob && !fsck.wantsBlob(id)) continue;
       const object = await repository.loadObject(id);
       if (!object) continue;
       if (fsck.checkObject(id, type, object.content, lines))
@@ -261,20 +445,29 @@ export async function checkReceivedPack(
       if (await repository.has(link)) present.add(link);
       else missing.add(link);
     };
-    for (const { id, type } of received.ordered()) {
-      if (type === "commit") {
-        const info = await repository.getCommitInfo?.(id);
-        if (!info) continue;
-        if (info.tree) await check(info.tree);
-        if (!options.shallow.has(id)) for (const parent of info.parents) await check(parent);
-      } else if (type === "tree") {
-        for (const entry of (await repository.getTreeEntries?.(id)) ?? []) {
-          if ((entry.mode & 0o170000) === 0o160000) continue; // a gitlink: not followed
-          await check(entry.id);
+    const collected = options.receivedLinks;
+    if (collected && collected.reportedCount >= received.nonBlobs) {
+      const foreign: string[] = [];
+      collected.forEach((raw, at) => {
+        if (!received.hasRaw(raw, at)) foreign.push(rawToHex(raw, at));
+      });
+      for (const link of foreign) await check(link);
+    } else {
+      for (const { id, type } of received.ordered()) {
+        if (type === "commit") {
+          const info = await repository.getCommitInfo?.(id);
+          if (!info) continue;
+          if (info.tree) await check(info.tree);
+          if (!options.shallow.has(id)) for (const parent of info.parents) await check(parent);
+        } else if (type === "tree") {
+          for (const entry of (await repository.getTreeEntries?.(id)) ?? []) {
+            if ((entry.mode & 0o170000) === 0o160000) continue; // a gitlink: not followed
+            await check(entry.id);
+          }
+        } else if (type === "tag") {
+          const tag = await repository.getTagInfo?.(id);
+          if (tag) await check(tag.object);
         }
-      } else if (type === "tag") {
-        const tag = await repository.getTagInfo?.(id);
-        if (tag) await check(tag.object);
       }
     }
     if (missing.size > 0) {

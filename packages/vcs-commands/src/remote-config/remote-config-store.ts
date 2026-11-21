@@ -75,6 +75,11 @@ interface GitConfigLike {
    * written (undefined for a variable without `=`), as `GitWorkingCopyConfig` gives them.
    */
   getAllWithOrigin?(key: string): ConfigValueWhere[];
+  /**
+   * Optional: every variable of the configuration in its order, keys canonical (section and
+   * name in lower case), as `GitWorkingCopyConfig` lists them
+   */
+  listWithOrigin?(): (ConfigValueWhere & { key: string })[];
 }
 
 /** A config value, its text as written and where it was read (see {@link RemoteConfigStore.valuesWithOrigin}). */
@@ -522,6 +527,20 @@ export class RemoteConfigStore {
       .getAll(key)
       .filter((value) => value !== undefined && value !== null)
       .map((value) => ({ text: value === true ? undefined : String(value) }));
+  }
+
+  /**
+   * Every variable whose canonical key starts with `prefix` (lower case), in the
+   * configuration's order with its text (undefined for a variable without `=`), as git's
+   * config callbacks see them; undefined when the config cannot list its variables.
+   */
+  entriesWithPrefix(prefix: string): { key: string; value: string | undefined }[] | undefined {
+    if (!this.config.listWithOrigin) return undefined;
+    const lower = prefix.toLowerCase();
+    return this.config
+      .listWithOrigin()
+      .filter((e) => e.key.startsWith(lower))
+      .map((e) => ({ key: e.key, value: e.text }));
   }
 
   /** Every value of a config variable (`branch.main.merge` may repeat). */

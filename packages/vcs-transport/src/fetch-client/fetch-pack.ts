@@ -443,8 +443,9 @@ async function receivePack(
     readSidebandPack(pkts, onProgress && ((m) => onProgress(m.trim()))),
     counted,
   );
+  let imported: PackImportResult | undefined;
   try {
-    const imported = await request.importPack(pack);
+    imported = await request.importPack(pack);
     for await (const _ of pack) {
       // the rest of the pack section, after what the import read
     }
@@ -463,6 +464,9 @@ async function receivePack(
     // the body ends it; the generator is closed once it is free
     await pkts.cancel();
     pack.return(undefined).catch(() => {});
+    // objects imported aside before the response failed (a sideband error after the pack): not
+    // published, and not left in the repository
+    await imported?.quarantine?.discard().catch(() => {});
     throw error;
   }
 }

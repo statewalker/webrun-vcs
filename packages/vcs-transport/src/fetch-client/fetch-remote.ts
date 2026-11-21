@@ -21,6 +21,7 @@ import {
   checkReceivedPack,
   connectivityErrors,
   FetchCheckError,
+  ReceivedLinks,
   ReceivedObjects,
   type ReceivedObjectsFsck,
 } from "./fetch-checks.js";
@@ -428,6 +429,12 @@ export async function fetchFromConnection(
     const links = strictLinks && (!!options.fsckObjects || !deepening);
     const received =
       !options.dryRun && (links || options.fsckObjects) ? new ReceivedObjects() : undefined;
+    // the shallow commits index-pack is given (the shallow file as this fetch leaves it, and a
+    // shallow server's): known once the shallow-info is in, before the pack's objects come
+    const grafts = () =>
+      new Set([...applyShallow(shallow, update), ...(serverShallow?.list ?? [])]);
+    // the objects' links, read while the import holds them (index-pack's fsck_walk)
+    const receivedLinks = received && links ? new ReceivedLinks(grafts) : undefined;
     const fetched = await fetchPack(connection, source, {
       wants,
       localTips,
@@ -444,6 +451,9 @@ export async function fetchFromConnection(
               // checked before anything sees them: a refused pack leaves no object behind
               ...(received
                 ? { quarantine: true, onObject: (id, type, entry) => received.add(id, type, entry) }
+                : {}),
+              ...(receivedLinks
+                ? { onContent: (id, type, content) => receivedLinks.add(id, type, content) }
                 : {}),
             }),
       onShallowUpdate: async (u) => {
@@ -465,25 +475,26 @@ export async function fetchFromConnection(
       ...request,
     });
     const { quarantine, ...imported } = fetched.imported;
-    if (received) {
-      // index-pack's --strict / --check-self-contained-and-connected, with the shallow
-      // commits it is given (the shallow file as this fetch leaves it, and a shallow server's)
-      const grafts = new Set([...applyShallow(shallow, update), ...(serverShallow?.list ?? [])]);
-      try {
+    let committed = false;
+    try {
+      if (received) {
+        // index-pack's --strict / --check-self-contained-and-connected
         const checked = await checkReceivedPack(quarantine?.repository ?? repository, received, {
           fsck: options.fsckObjects,
           links,
-          shallow: grafts,
+          ...(receivedLinks ? { receivedLinks } : {}),
+          shallow: grafts(),
           kept: imported.packId !== undefined,
         });
         packMessages.push(...checked.messages);
         if (links && checked.selfContained) selfContained.push(received);
-      } catch (error) {
-        await quarantine?.discard();
-        throw error;
       }
+      await quarantine?.commit();
+      committed = true;
+    } finally {
+      // a refused pack (or any failure before the commit) leaves no object behind
+      if (!committed) await quarantine?.discard().catch(() => {});
     }
-    await quarantine?.commit();
     if (!options.dryRun) packFetched = true;
     const after = applyShallow(shallow, update);
     // fetch-pack: a deepening fetch (not a clone) checks what it brought against the new

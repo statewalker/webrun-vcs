@@ -32,7 +32,7 @@ import type {
   TreeEntryInfo,
 } from "../api/repository-facade.js";
 import { computeShallowUpdate } from "../fsm/fetch/upload-pack-graph.js";
-import { lenientCommitHeader, lenientTagTarget } from "../utils/index.js";
+import { lenientCommitHeader, lenientTagTarget, storedObjectType } from "../utils/index.js";
 
 /**
  * Configuration for creating RepositoryFacade using History facade.
@@ -118,6 +118,24 @@ function createRepositoryFacadeFromHistory(
     new DefaultSerializationApi({ history });
 
   const alternates = history.objects?.alternates;
+  /**
+   * An object the typed store could not parse, read leniently when it is of `type` (its header
+   * read first: an object of another type, or absent, is not read whole); undefined otherwise,
+   * and when it cannot be read.
+   */
+  const lenientObject = async <T>(
+    oid: string,
+    type: GitObjectTypeName,
+    parse: (content: Uint8Array) => T | undefined,
+  ): Promise<T | undefined> => {
+    if ((await storedObjectType(history.objects, oid)) !== type) return undefined;
+    try {
+      const object = await facade.loadObject?.(oid);
+      return object?.type === type ? parse(object.content) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
   const facade: RepositoryFacade = {
     // the alternates' refs, for receive-pack's `.have` lines
     ...(alternates ? { alternateRefs: () => alternates.refs() } : {}),
@@ -206,8 +224,7 @@ function createRepositoryFacadeFromHistory(
         return { parents: commit.parents, time: commit.committer.timestamp, tree: commit.tree };
       }
       // a commit the typed store cannot parse (an author line fsck refuses): git walks it
-      const object = await facade.loadObject?.(oid);
-      return object?.type === "commit" ? lenientCommitHeader(object.content) : undefined;
+      return lenientObject(oid, "commit", lenientCommitHeader);
     },
 
     async getObjectType(oid: string): Promise<GitObjectTypeName | undefined> {
@@ -290,8 +307,7 @@ function createRepositoryFacadeFromHistory(
       } catch {
         // a tag the typed store cannot parse: read as git's parse_tag_buffer reads it
       }
-      const object = await facade.loadObject?.(oid);
-      return object?.type === "tag" ? lenientTagTarget(object.content) : undefined;
+      return lenientObject(oid, "tag", lenientTagTarget);
     },
 
     async computeShallowBoundaries(wants: Set<string>, depth: number): Promise<Set<string>> {

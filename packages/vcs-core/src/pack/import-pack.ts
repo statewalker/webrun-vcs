@@ -91,9 +91,29 @@ export async function importPack(
   options: ImportPackOptions = {},
 ): Promise<ImportPackResult> {
   if (options.quarantine && objects.beginQuarantine) {
-    const quarantine = await objects.beginQuarantine();
+    // an empty stream imports nothing: no quarantine is opened for it (none to leave behind)
+    const it = pack[Symbol.asyncIterator]();
+    let first = await it.next();
+    while (!first.done && first.value.length === 0) first = await it.next();
+    if (first.done) return { count: 0, types: { commit: 0, tree: 0, blob: 0, tag: 0 } };
+    const head = first.value;
+    const rest = (async function* () {
+      try {
+        yield head;
+        for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
+      } finally {
+        await it.return?.()?.catch?.(() => {});
+      }
+    })();
+    let quarantine: ObjectQuarantine;
     try {
-      const result = await importPack(quarantine.objects, pack, {
+      quarantine = await objects.beginQuarantine();
+    } catch (err) {
+      await it.return?.()?.catch?.(() => {});
+      throw err;
+    }
+    try {
+      const result = await importPack(quarantine.objects, rest, {
         ...options,
         quarantine: false,
         packs: quarantine.packs,
@@ -171,6 +191,7 @@ async function importStream(
       maxObjectSize,
       baseCacheBytes: options.baseCacheBytes,
       ...(options.onObject ? { onObject: options.onObject } : {}),
+      ...(options.onContent ? { onContent: options.onContent } : {}),
     });
     return { count: kept.count, types: kept.types, kept };
   }

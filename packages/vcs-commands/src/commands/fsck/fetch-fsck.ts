@@ -19,7 +19,7 @@ import type { GitObjectTypeName, ReceivedObjectsFsck } from "@statewalker/vcs-tr
 import { parseGitBool } from "@statewalker/vcs-utils";
 
 import { TransportError } from "../../errors/index.js";
-import { FSCK_MSG_IDS, FsckMessageTypes, type FsckMsgId } from "./fsck-msg-ids.js";
+import { FSCK_MSG_IDS, FsckMessageTypes, type FsckMsgId, parseFsckMsgId } from "./fsck-msg-ids.js";
 import { fsckBlob, fsckCommit, fsckTag, fsckTree } from "./fsck-object-checks.js";
 
 /** What {@link fetchFsckOf} reads. */
@@ -34,6 +34,18 @@ export interface FetchFsckSource {
   baseDir?: string;
   /** `$HOME`, for a skip list path starting with `~/` */
   home?: string;
+  /**
+   * Every `fetch.fsck.*` variable in the configuration's order, keys canonical (lower case),
+   * when the configuration can list them: git reads them so (fetch_pack_fsck_config), warns of
+   * message ids it does not know and dies at the first demoted fatal one in that order.
+   * Absent: each known message id is read with `value` (last value wins), unknown ones unseen.
+   */
+  entries?(prefix: string): { key: string; value: string | undefined }[] | undefined;
+  /**
+   * Receives the warnings git's fetch-pack prints when it starts (`warning: Skipping unknown
+   * msg id '<id>'`): printed only when a fetch-pack conversation runs
+   */
+  warnings?: string[];
 }
 
 /**
@@ -42,33 +54,62 @@ export interface FetchFsckSource {
  *
  * A `fetch.fsck.<msg-id>` whose value is not `error`, `warn` or `ignore` throws git's `fatal:
  * Unknown fsck message type: '<value>'` (fetch-pack dies reading its settings, checked or not);
- * one demoting a fatal message makes index-pack die (`Cannot demote <id> to <type>`). Message
- * ids git does not know are not read (git skips them with a warning).
+ * one demoting a fatal message makes index-pack die (`Cannot demote <id> to <type>`, the first
+ * in the configuration's order where `entries` lists them). Message ids git does not know are
+ * skipped with git's warning (`warnings`), and a `fetch.fsckObjects` or `transfer.fsckObjects`
+ * that is no boolean throws git's `fatal: bad boolean config value`. git reads these settings
+ * when fetch-pack starts, so an up-to-date fetch (no fetch-pack) does not die of them there;
+ * ours reads them before the fetch.
  */
 export async function fetchFsckOf(
   source: FetchFsckSource,
   enabled?: boolean,
 ): Promise<ReceivedObjectsFsck | undefined> {
+  // fetch_pack_config's repo_config_get_bool: a value that is no boolean dies (both are read)
   const bool = (key: string) => {
     const v = source.value(key);
-    return v === undefined ? undefined : parseGitBool(v);
+    if (v === undefined) return undefined;
+    const parsed = parseGitBool(v);
+    if (parsed === undefined) {
+      throw new TransportError(`fatal: bad boolean config value '${v}' for '${key.toLowerCase()}'`);
+    }
+    return parsed;
   };
-  const on = enabled ?? bool("fetch.fsckObjects") ?? bool("transfer.fsckObjects") ?? false;
+  const fetchFsck = bool("fetch.fsckObjects");
+  const transferFsck = bool("transfer.fsckObjects");
+  const on = enabled ?? fetchFsck ?? transferFsck ?? false;
   const types = new FsckMessageTypes({ strict: true });
   let startError: string | undefined;
-  for (const id of Object.keys(FSCK_MSG_IDS) as FsckMsgId[]) {
-    const value = source.value(`fetch.fsck.${id}`);
-    if (value === undefined) continue;
+  const setType = (id: FsckMsgId, value: string) => {
     // fetch_pack_fsck_config: is_valid_msg_type's parse_msg_type dies on any other value
     if (value !== "error" && value !== "warn" && value !== "ignore") {
       throw new TransportError(`fatal: Unknown fsck message type: '${value}'`);
     }
-    // index-pack's fsck_set_msg_type
+    // index-pack's fsck_set_msg_types, in the order of its --strict list: it dies at the first
+    // fatal message demoted
     if (value !== "error" && FSCK_MSG_IDS[id] === "fatal") {
       startError ??= `fatal: Cannot demote ${id.toLowerCase()} to ${value}`;
-      continue;
+      return;
     }
     types.set(id, value);
+  };
+  const listed = source.entries?.("fetch.fsck.");
+  if (listed) {
+    for (const { key, value } of listed) {
+      const msgId = key.slice("fetch.fsck.".length);
+      if (msgId === "skiplist" || value === undefined) continue;
+      const id = parseFsckMsgId(msgId);
+      if (!id) {
+        source.warnings?.push(`warning: Skipping unknown msg id '${msgId}'`);
+        continue;
+      }
+      setType(id, value);
+    }
+  } else {
+    for (const id of Object.keys(FSCK_MSG_IDS) as FsckMsgId[]) {
+      const value = source.value(`fetch.fsck.${id}`);
+      if (value !== undefined) setType(id, value);
+    }
   }
   if (!on) return undefined;
 
@@ -129,6 +170,9 @@ export async function fetchFsckOf(
 
   const fsck: ReceivedObjectsFsck = {
     ...(startError ? { startError } : {}),
+    // index-pack's fsck of a blob looks at nothing but a .gitmodules or .gitattributes one
+    // named by a tree already checked: any other is never read
+    wantsBlob: (id: string) => gitmodulesFound.has(id) || gitattributesFound.has(id),
     checkObject(id: string, type: GitObjectTypeName, content: Uint8Array, lines: string[]) {
       const report = reporter(id, lines);
       switch (type) {

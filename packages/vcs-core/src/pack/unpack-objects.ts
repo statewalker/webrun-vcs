@@ -53,6 +53,12 @@ export interface UnpackObjectsOptions {
    * entry in the pack (its index, and whether it was sent as a delta)
    */
   onObject?: (id: ObjectId, type: ObjectTypeString, entry: PackEntryInfo) => void;
+  /**
+   * Called with the content of every commit, tree and tag of the pack when it is stored (one
+   * over `bigObjectThreshold`, streamed, is not reported); `content` is only valid during the
+   * call (see `InstallPackOptions.onContent`)
+   */
+  onContent?: (id: ObjectId, type: ObjectTypeString, content: Uint8Array) => void;
 }
 
 /** Where a received object was in its pack (see `UnpackObjectsOptions.onObject`). */
@@ -357,6 +363,7 @@ export async function unpackObjects(
       result.written++;
     }
     record(i, id, type);
+    if (type !== "blob") options.onContent?.(id, type, data);
     cache.put(id, { type, data });
     return id;
   };

@@ -194,6 +194,7 @@ export class DefaultSerializationApi implements SerializationApi {
       unpackLimit: options.keepPack ? 1 : this.unpackLimit,
       quarantine: options.quarantine,
       ...(options.onObject ? { onObject: options.onObject } : {}),
+      ...(options.onContent ? { onContent: options.onContent } : {}),
     });
     return {
       objectsImported: r.count,

@@ -66,6 +66,12 @@ export interface PackImportOptions {
    * `PackEntryInfo`)
    */
   onObject?: (id: ObjectId, type: ObjectTypeString, entry: PackEntryInfo) => void;
+  /**
+   * Called with the content of every received commit, tree and tag while it is in memory, in
+   * no particular order (`content` is only valid during the call): what index-pack reads the
+   * links of. An object too large to hold (streamed into a store) is not reported.
+   */
+  onContent?: (id: ObjectId, type: ObjectTypeString, content: Uint8Array) => void;
 }
 
 /**

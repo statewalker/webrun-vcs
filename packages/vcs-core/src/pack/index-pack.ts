@@ -64,7 +64,21 @@ export interface InstallPackOptions {
    * objects, not reported.
    */
   onObject?: (id: ObjectId, type: ObjectTypeString, entry: PackEntryInfo) => void;
+  /**
+   * Called with the content of every received commit, tree and tag as soon as it is known
+   * (an entry sent whole while the pack is parsed, a delta when it is resolved), in no
+   * particular order; `content` is only valid during the call. What git's index-pack reads the
+   * links of (`--check-self-contained-and-connected`, `--strict`) while the object is in memory.
+   */
+  onContent?: ObjectContentCallback;
 }
+
+/** See `InstallPackOptions.onContent` (and `UnpackObjectsOptions.onContent`). */
+export type ObjectContentCallback = (
+  id: ObjectId,
+  type: ObjectTypeString,
+  content: Uint8Array,
+) => void;
 
 export interface InstalledPack {
   /** hex SHA-1 of the installed pack (its trailer); the files are `pack-<packId>.pack` / `.idx` */
@@ -248,12 +262,18 @@ class SequentialReader {
 }
 
 /** Phase 1: one pass over the stored pack. */
-async function parse(files: FilesApi, path: string, packLen: number, maxObjectSize: number) {
+async function parse(
+  files: FilesApi,
+  path: string,
+  packLen: number,
+  maxObjectSize: number,
+  onContent?: ObjectContentCallback,
+) {
   if (packLen < 32) throw new PackError("pack too short");
   const pool = createInflaterPool();
   const r = new SequentialReader(files.read(path), packLen - 20);
   try {
-    return await parseWith(r, pool, packLen, maxObjectSize);
+    return await parseWith(r, pool, packLen, maxObjectSize, onContent);
   } finally {
     await r.close();
   }
@@ -264,6 +284,7 @@ async function parseWith(
   pool: InflaterPool,
   packLen: number,
   maxObjectSize: number,
+  onContent?: ObjectContentCallback,
 ) {
   const head = await r.bytes(12);
   if (String.fromCharCode(...head.subarray(0, 4)) !== "PACK")
@@ -336,6 +357,8 @@ async function parseWith(
     let got = 0;
     const typeName = TYPE_NAMES[kind];
     const objHash = typeName ? createSha1().update(enc.encode(`${typeName} ${size}\0`)) : undefined;
+    // a commit, tree or tag sent whole is kept while it inflates, for `onContent`
+    const content = onContent && typeName && typeName !== "blob" ? new Uint8Array(size) : undefined;
     try {
       await r.inflate(inflater, (out) => {
         got += out.length;
@@ -343,6 +366,7 @@ async function parseWith(
         if (got > size)
           throw new PackError(`entry at ${offset} inflates past its declared ${size} bytes`);
         objHash?.update(out);
+        content?.set(out, got - out.length);
       });
     } catch (err) {
       inflater.abort();
@@ -358,6 +382,9 @@ async function parseWith(
     if (objHash) {
       t.oid.set(objHash.digest(), i * 20);
       t.type[i] = kind;
+      if (content && onContent) {
+        onContent(hex(t.oid.subarray(i * 20, i * 20 + 20)), typeName as ObjectTypeString, content);
+      }
     }
   }
   t.n = count;
@@ -500,7 +527,11 @@ class Resolver {
   constructor(
     private readonly t: Entries,
     private readonly load: (i: number) => Promise<Uint8Array>,
-    private readonly opts: { maxObjectSize: number; baseCacheBytes: number },
+    private readonly opts: {
+      maxObjectSize: number;
+      baseCacheBytes: number;
+      onContent?: ObjectContentCallback;
+    },
   ) {
     const n = t.n;
     this.ofsHead = new Int32Array(n).fill(-1);
@@ -684,6 +715,13 @@ class Resolver {
       t.type[child] = type;
       t.base[child] = this.sI[d] as number;
       t.oid.set(objectId(TYPE_NAMES[type] as ObjectTypeString, result), child * 20);
+      if (this.opts.onContent && TYPE_NAMES[type] !== "blob") {
+        this.opts.onContent(
+          hex(t.oid.subarray(child * 20, child * 20 + 20)),
+          TYPE_NAMES[type] as ObjectTypeString,
+          result,
+        );
+      }
       if (!this.hasMore(d)) this.pop(); // release the parent before descending
       if (this.hasChildren(child)) this.push(child, type, result);
     }
@@ -1010,7 +1048,7 @@ export async function installPack(
     if (stats?.kind !== "file" || stats.size === undefined)
       throw new PackError("pack was not stored");
     const packLen = stats.size;
-    const parsed = await parse(files, tmpPack, packLen, maxObjectSize);
+    const parsed = await parse(files, tmpPack, packLen, maxObjectSize, options.onContent);
     const t = parsed.t;
     const received = t.n;
     const dataEnd = packLen - 20;
@@ -1025,7 +1063,11 @@ export async function installPack(
     const resolver = new Resolver(
       t,
       (i) => loadEntry(read, t, i, endOf(i), parsed.pool.acquire()),
-      { maxObjectSize, baseCacheBytes },
+      {
+        maxObjectSize,
+        baseCacheBytes,
+        ...(options.onContent ? { onContent: options.onContent } : {}),
+      },
     );
     for (let i = 0; i < received; i++)
       if (t.type[i] && t.kind[i] !== OFS_DELTA && t.kind[i] !== REF_DELTA)

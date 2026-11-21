@@ -70,3 +70,30 @@ export function lenientTagTarget(content: Uint8Array): TagTargetInfo | undefined
   if (name !== "commit" && name !== "tree" && name !== "blob" && name !== "tag") return undefined;
   return { object: object.slice(7), type: name as GitObjectTypeName };
 }
+
+/** The part of an object store {@link storedObjectType} reads. */
+export interface ObjectHeaderSource {
+  get(
+    oid: string,
+  ): Promise<{ type: string; content: AsyncIterable<Uint8Array> } | undefined | null>;
+}
+
+/**
+ * An object's type from its header, the content released unread; undefined when the object is
+ * absent or cannot be read. The lenient readers ask it first, so an object that simply is not a
+ * commit (or a tag) is never read whole.
+ */
+export async function storedObjectType(
+  objects: ObjectHeaderSource | undefined,
+  oid: string,
+): Promise<string | undefined> {
+  if (!objects) return undefined;
+  try {
+    const object = await objects.get(oid);
+    if (!object) return undefined;
+    await object.content[Symbol.asyncIterator]().return?.();
+    return object.type;
+  } catch {
+    return undefined;
+  }
+}

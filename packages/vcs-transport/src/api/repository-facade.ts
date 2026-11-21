@@ -52,6 +52,12 @@ export interface PackImportOptions {
    * and entry in the pack
    */
   onObject?: (id: string, type: GitObjectTypeName, entry: PackEntryInfo) => void;
+  /**
+   * Called with the content of every received commit, tree and tag while it is in memory
+   * (`content` only valid during the call; an object too large to hold is not reported): a
+   * fetch reads the objects' links from it, as index-pack does, instead of reading them back
+   */
+  onContent?: (id: string, type: GitObjectTypeName, content: Uint8Array) => void;
 }
 
 /**

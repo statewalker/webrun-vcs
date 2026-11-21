@@ -696,9 +696,12 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     // fetch.fsckObjects / transfer.fsckObjects: index-pack --strict over each received pack
     const compatibility = this.compatibility ?? this.hooks.compatibility;
     const environment = hostEnvironmentOf(this.workingCopy);
+    const fsckWarnings: string[] = [];
     const fsck = await fetchFsckOf(
       {
         value: (key) => store.value(key),
+        entries: (prefix) => store.entriesWithPrefix(prefix),
+        warnings: fsckWarnings,
         compatibility,
         ...(environment
           ? { readFile: (path: string) => environment.readFile(path), home: environment.home }
@@ -775,7 +778,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
         throw new TransportError(`fatal: ${message}`, undefined, { cause: error });
       }
       if (error instanceof FetchCheckError) {
-        const lines = [...error.lines];
+        // fetch-pack ran: its start-up warnings came first
+        const lines = [...fsckWarnings, ...error.lines];
         // store_updated_refs: the ref tips' check failed; nothing is written
         if (error.check === "refs") {
           lines.push(`error: ${anonymizeUrl(remoteUrl)} did not send all necessary objects`);
@@ -785,7 +789,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       }
       throw error;
     });
-    // index-pack's fsck warnings
+    // fetch-pack's start-up warnings (when it ran), then index-pack's fsck warnings
+    if (result.imports.length > 0) messages.push(...fsckWarnings);
     messages.push(...(result.packCheckMessages ?? []));
 
     const advertisedRefs = new Map<string, ObjectId>();
