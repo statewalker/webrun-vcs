@@ -1117,3 +1117,95 @@ describeGit(
     });
   },
 );
+
+describeGit("git sparse-checkout clean against native git", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "sparse-clean-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** A cone of k, with untracked and ignored files left in s/ and u/ (and s/t/). */
+  function leftovers(dir: string) {
+    base(dir);
+    put(dir, ".gitignore", "*.o\n");
+    gitOk(root, dir, "add", ".gitignore");
+    gitOk(root, dir, "commit", "-q", "-m", "ignore");
+    run(dir, ["sparse-checkout", "set", "k"]);
+    put(dir, "s/untracked", "u\n");
+    put(dir, "s/t/deep", "d\n");
+    put(dir, "u/x.o", "o\n");
+  }
+
+  it("2.43 knows no clean subcommand; 2.5x refuses outside a sparse checkout", async () => {
+    const { native, ours } = twins(base);
+    await twinSparse(native, ours, ["clean"]);
+    await twinSparse(native, ours, ["clean", "--bogus"]);
+  });
+
+  it.skipIf(version === "2.43")("refuses non-cone patterns, and without --force", async () => {
+    const { native, ours } = twins((dir) => {
+      base(dir);
+      run(dir, ["sparse-checkout", "set", "--no-cone", "/k/"]);
+    });
+    await twinSparse(native, ours, ["clean", "-f"]);
+    await twinSparse(native, ours, ["set", "--cone", "k"]);
+    await twinSparse(native, ours, ["clean"]);
+    await twinSparse(native, ours, ["clean", "--bogus"]);
+    await twinSparse(native, ours, ["clean", "-x"]);
+    await twinSparse(native, ours, ["clean", "--verbose=1"]);
+    await twinSparse(native, ours, ["clean", "-h"]);
+  });
+
+  it.skipIf(version === "2.43")("--dry-run and -v list what --force removes", async () => {
+    const { native, ours } = twins(leftovers);
+    await twinSparse(native, ours, ["clean", "-n"]);
+    await twinSparse(native, ours, ["clean", "--dry", "-v", "extra"]);
+    await twinSparse(native, ours, ["clean", "-nf"]);
+    await twinSparse(native, ours, ["clean", "-f", "-v"]);
+    await twinSparse(native, ours, ["clean", "-f"]);
+  });
+
+  it.skipIf(version === "2.43")("clean.requireForce=false removes without --force", async () => {
+    const { native, ours } = twins((dir) => {
+      leftovers(dir);
+      gitOk(root, dir, "config", "clean.requireForce", "false");
+    });
+    await twinSparse(native, ours, ["clean"]);
+    for (const dir of [native, ours]) gitOk(root, dir, "config", "clean.requireForce", "bogus");
+    await twinSparse(native, ours, ["clean", "-f"]);
+  });
+
+  it.skipIf(version === "2.43")(
+    "a directory with a tracked file in the worktree is no sparse directory, its subdirectory is",
+    async () => {
+      const { native, ours } = twins((dir) => {
+        leftovers(dir);
+        // s/c back in the worktree: s/ is not collapsed, s/t/ still is
+        gitOk(root, dir, "update-index", "--no-skip-worktree", "s/c");
+        gitOk(root, dir, "checkout", "--", "s/c");
+      });
+      await twinSparse(native, ours, ["clean", "-f", "-v"]);
+      await twinSparse(native, ours, ["clean", "-f"]);
+    },
+  );
+
+  it.skipIf(version === "2.43")("the typed setters run the same clean", async () => {
+    const { native, ours } = twins(leftovers);
+    const r = run(native, ["sparse-checkout", "clean", "--dry-run", "--verbose"]);
+    const result = await (await openOurs(ours))
+      .sparseCheckout()
+      .setSubcommand("clean")
+      .setDryRun(true)
+      .setVerbose(true)
+      .call();
+    expect(result.stdout).toBe(r.stdout);
+    const forced = await (await openOurs(ours))
+      .sparseCheckout()
+      .setSubcommand("clean")
+      .setForce(true)
+      .call();
+    expect(forced.stdout).toBe("Removing s/\nRemoving u/\n");
+    expect(existsSync(join(ours, "s"))).toBe(false);
+    expect(existsSync(join(ours, "k/a"))).toBe(true);
+  });
+});

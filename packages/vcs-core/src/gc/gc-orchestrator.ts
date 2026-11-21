@@ -10,6 +10,7 @@
 
 import type { ObjectId } from "../common/id/index.js";
 import { readGraftParents } from "../history/commits/index.js";
+import { historyWithoutLazyFetch } from "../history/create-history.js";
 import type { History } from "../history/history.js";
 import type { CompactResult, GcStrategy, StorageStats } from "./gc-strategy.js";
 
@@ -126,31 +127,36 @@ export class GcOrchestrator {
     } = options;
 
     // Step 1: Collect the roots
-    const { roots, shallow, grafts } = await this.collectRoots(options.readGraftFile);
+    const { roots, shallow, grafts, keep } = await this.collectRoots(options.readGraftFile);
+    // the walks read no absent object of a partial clone (git's fetch_if_missing = 0)
+    const history = historyWithoutLazyFetch(this.history);
 
     // Step 2: Walk reachable objects; a missing or corrupt one throws before anything changes
     const reachable = new Set<ObjectId>();
-    for await (const oid of this.history.collectReachableObjects(roots, new Set(), {
+    for await (const oid of history.collectReachableObjects(roots, new Set(), {
       missing: "throw",
       shallow,
       grafts,
       verifyBlobs: options.verifyBlobs ?? true,
+      known: keep,
     })) {
       reachable.add(oid);
     }
 
-    // Step 3: Compute unreachable objects, less the recent ones and what they reach
+    // Step 3: Compute unreachable objects, less the kept and the recent ones and what they reach
     const unreachable = await this.computeUnreachable(reachable);
+    for (const id of keep) unreachable.delete(id);
     let keptRecentObjects = 0;
     if (unreachable.size > 0 && pruneExpireMs > 0 && this.strategy.recentObjects) {
       const recent = await this.strategy.recentObjects(new Set(unreachable), pruneExpireMs);
       if (recent.size > 0) {
         // git's add_unseen_recent_objects_to_traversal: what a recent object reaches stays
         // too; it may lead to objects that are gone (ignore_missing_links)
-        for await (const oid of this.history.collectReachableObjects(recent, new Set(), {
+        const known = new Set([...reachable, ...keep]);
+        for await (const oid of history.collectReachableObjects(recent, new Set(), {
           shallow,
           grafts,
-          known: reachable,
+          known,
         })) {
           if (unreachable.delete(oid)) keptRecentObjects++;
         }
@@ -207,6 +213,7 @@ export class GcOrchestrator {
     roots: Set<ObjectId>;
     shallow: Set<ObjectId>;
     grafts: Map<ObjectId, ObjectId[]>;
+    keep: Set<ObjectId>;
   }> {
     const refs = this.history.refs;
     const roots = new Set<ObjectId>();
@@ -228,7 +235,8 @@ export class GcOrchestrator {
     for (const id of extra?.roots ?? []) add(id);
     for (const id of extra?.shallow ?? []) shallow.add(id);
     const grafts = await readGraftParents(refs, readGraftFile);
-    return { roots, shallow, grafts };
+    const keep = new Set<ObjectId>(extra?.keep ?? []);
+    return { roots, shallow, grafts, keep };
   }
 
   /**

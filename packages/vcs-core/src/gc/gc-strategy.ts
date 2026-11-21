@@ -136,4 +136,11 @@ export interface GcRoots {
   roots: Iterable<ObjectId>;
   /** Shallow commits: their parents may be absent */
   shallow?: Iterable<ObjectId>;
+  /**
+   * Objects kept without being walked, present or not (a partial clone's promisor objects:
+   * the objects of promisor packs and the absent objects they name, which git's walks leave
+   * out with `--exclude-promisor-objects`): never pruned, never required, and what they
+   * reach is kept only when a root or another kept walk reaches it
+   */
+  keep?: Iterable<ObjectId>;
 }

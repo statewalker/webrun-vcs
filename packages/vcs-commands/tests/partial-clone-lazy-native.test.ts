@@ -20,8 +20,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
-import { PromisorFetchError } from "@statewalker/vcs-core";
-import { createGitFilesBackend, gc, repack } from "@statewalker/vcs-store-files";
+import { GcOrchestrator, PromisorFetchError } from "@statewalker/vcs-core";
+import { createGitFilesBackend, FileGcStrategy, gc, repack } from "@statewalker/vcs-store-files";
 import { createBasePathResolver, createServedFetchHandler } from "@statewalker/vcs-transport";
 import {
   createNodeFilesApi,
@@ -930,5 +930,188 @@ describeGit("partial clones with lazy fetch, as native git", () => {
     } finally {
       await server.close();
     }
+  });
+
+  /** Every object a repository stores (packed or loose), sorted. */
+  const storedOf = (dir: string) =>
+    git(dir, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)")
+      .split("\n")
+      .filter(Boolean)
+      .sort();
+
+  it("the gc orchestrator prunes a partial clone as git gc --prune=now", async () => {
+    const t = await twins("orchestrator");
+    commitInBoth(t);
+    // lazily fetched blobs: side's, by a switch there and back
+    await (await reopen(t.dir)).switch().setName("side").call();
+    await (await reopen(t.dir)).switch().setName("main").call();
+    for (const args of [
+      ["switch", "-q", "side"],
+      ["switch", "-q", "main"],
+    ]) {
+      const r = await gitAsync(root, t.theirs, args);
+      expect(r.status, r.stderr).toBe(0);
+    }
+    // unreachable loose objects: a blob, and a commit (with its tree and blob) left behind
+    const dropped: string[] = [];
+    for (const dir of [t.theirs, t.dir]) {
+      putFile(dir, "dangling.txt", "dangling\n");
+      dropped.push(git(dir, "hash-object", "-w", "dangling.txt").trim());
+      rmSync(join(dir, "dangling.txt"));
+      putFile(dir, "gone.txt", "gone\n");
+      git(dir, "add", "gone.txt");
+      gitOut(root, dir, ["commit", "-qm", "gone"], commitEnv(8));
+      dropped.push(git(dir, "rev-parse", "HEAD").trim());
+      git(dir, "reset", "-q", "--hard", "HEAD~1");
+      rmSync(join(dir, ".git/logs"), { recursive: true, force: true });
+      rmSync(join(dir, ".git/ORIG_HEAD"), { force: true });
+    }
+    expect(storedOf(t.dir)).toEqual(storedOf(t.theirs));
+    const g = gitRun(root, t.theirs, ["gc", "-q", "--prune=now"]);
+    expect(g.status, g.stderr).toBe(0);
+    const backend = await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: t.dir }) });
+    const result = await new GcOrchestrator(backend.history, new FileGcStrategy(backend)).run({
+      pruneExpireMs: 0,
+      compact: true,
+    });
+    expect(result.prunedObjects).toBeGreaterThanOrEqual(4);
+    const stored = storedOf(t.dir);
+    expect(stored).toEqual(storedOf(t.theirs));
+    for (const id of dropped) expect(stored).not.toContain(id);
+    expect(objectsOf(t.dir)).toEqual(objectsOf(t.theirs));
+    const fsck = gitRun(root, t.dir, ["fsck"]);
+    expect(fsck.status, fsck.stdout + fsck.stderr).toBe(0);
+    // still a working partial clone
+    expect(git(t.dir, "status", "--porcelain")).toBe("");
+  });
+
+  describe.skipIf(nativeVersion === "2.43")("backfill, as git backfill", () => {
+    let server: { server: LoopbackServer; requests: string[][]; close(): Promise<void> };
+    let url: string;
+
+    beforeAll(async () => {
+      // a history of several commits over a few directories
+      const work = join(root, "backfill-work");
+      git(root, "init", "-q", "-b", "main", work);
+      const files = ["top.txt", "a/x.txt", "a/y.txt", "b/z.txt", "b/sub/w.txt", "c/v.txt"];
+      for (let round = 0; round < 4; round++) {
+        files.forEach((f, i) => {
+          if ((i + round) % 2 === 0 || round === 0) putFile(work, f, `${f} ${round}\n`);
+        });
+        if (round === 2) putFile(work, "a/copy.txt", "top.txt 0\n");
+        git(work, "add", "-A");
+        gitOut(root, work, ["commit", "-qm", `r${round}`], commitEnv(round + 1));
+      }
+      const bare = join(srv, "backfill.git");
+      git(root, "clone", "-q", "--bare", "--no-local", work, bare);
+      git(bare, "config", "uploadpack.allowFilter", "true");
+      git(bare, "config", "uploadpack.allowAnySHA1InWant", "true");
+      noMaintenance(bare);
+      // a server recording the ids each fetch request wants
+      const backend = nativeGitHttpBackend(srv, root);
+      const requests: string[][] = [];
+      const loopback = await serveOnLoopback(async (request) => {
+        const u = new URL(request.url);
+        if (request.method === "POST" && u.pathname.endsWith("/git-upload-pack")) {
+          const raw = Buffer.from(await request.clone().arrayBuffer());
+          const body = request.headers.get("content-encoding") === "gzip" ? gunzipSync(raw) : raw;
+          const text = body.toString("latin1");
+          if (!text.includes("command=ls-refs")) {
+            requests.push(
+              [...text.matchAll(/want ([0-9a-f]{40})/g)].map((m) => m[1] as string).sort(),
+            );
+          }
+        }
+        return backend.fetch(request);
+      });
+      server = {
+        server: loopback,
+        requests,
+        close: async () => {
+          await loopback.close();
+          backend.close();
+        },
+      };
+      url = `${loopback.baseUrl}/backfill.git`;
+    });
+
+    afterAll(async () => {
+      await server?.close();
+    });
+
+    /** A native partial clone and ours, checked out, with `prepare` run natively in both. */
+    async function backfillTwins(prepare?: (dir: string) => Promise<void>) {
+      const theirs = join(root, `n-backfill-${counter++}`);
+      const r = await gitAsync(root, root, ["clone", "-q", "--filter=blob:none", url, theirs]);
+      expect(r.status, r.stderr).toBe(0);
+      const { dir, ours } = await oursAt("o-backfill");
+      await ours.clone().setURI(url).setFilter("blob:none").call();
+      for (const d of [theirs, dir]) await prepare?.(d);
+      return { theirs, dir };
+    }
+
+    /** The requests of native `git backfill <args>`, then ours, with the same options. */
+    async function compare(
+      args: string[],
+      configure: (cmd: ReturnType<Git["backfill"]>) => void,
+      prepare?: (dir: string) => Promise<void>,
+    ) {
+      const t = await backfillTwins(prepare);
+      const before = server.requests.length;
+      const r = await gitAsync(root, t.theirs, ["backfill", ...args]);
+      expect(r.status, r.stderr).toBe(0);
+      const theirs = server.requests.slice(before);
+      const mid = server.requests.length;
+      const cmd = (await reopen(t.dir)).backfill();
+      configure(cmd);
+      const result = await cmd.call();
+      expect(result.exitCode).toBe(0);
+      const mine = server.requests.slice(mid);
+      expect(mine).toEqual(theirs);
+      expect(result.batches.map((b) => [...b].sort())).toEqual(mine);
+      expect(objectsOf(t.dir)).toEqual(objectsOf(t.theirs));
+      return { theirs, mine, t };
+    }
+
+    it.each([1, 2, 3, 5])(
+      "--min-batch-size=%i: the same requests, each asking the same blobs",
+      async (n) => {
+        const { mine, t } = await compare([`--min-batch-size=${n}`], (c) => c.setMinBatchSize(n));
+        expect(mine.length).toBeGreaterThan(1);
+        // nothing is missing any more
+        expect(objectsOf(t.dir).some((id) => id.startsWith("?"))).toBe(false);
+      },
+    );
+
+    it("the default batch size: one request for every missing blob", async () => {
+      const { mine } = await compare([], () => {});
+      expect(mine.length).toBe(1);
+    });
+
+    it("a revision range walks the boundary commits' trees, unless --no-include-edges", async () => {
+      await compare(["--min-batch-size=2", "HEAD~1..HEAD"], (c) =>
+        c.setMinBatchSize(2).addRevision("HEAD~1..HEAD"),
+      );
+      await compare(["--no-include-edges", "HEAD~2..HEAD"], (c) =>
+        c.setIncludeEdges(false).addRevision("HEAD~2..HEAD"),
+      );
+    });
+
+    it("--sparse is the default in a sparse checkout: paths outside the cone are left", async () => {
+      const sparse = async (dir: string) => {
+        const r = await gitAsync(root, dir, ["sparse-checkout", "set", "a", "b/sub"]);
+        expect(r.status, r.stderr).toBe(0);
+      };
+      const { t } = await compare(["--min-batch-size=2"], (c) => c.setMinBatchSize(2), sparse);
+      expect(objectsOf(t.dir).some((id) => id.startsWith("?"))).toBe(true);
+      await compare(["--no-sparse"], (c) => c.setSparse(false), sparse);
+    });
+
+    it("2.43 has no backfill command", async () => {
+      const { dir } = await oursAt("o-backfill-243");
+      const result = await (await reopen(dir)).backfill().setCompatibility("2.43").call();
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe("git: 'backfill' is not a git command. See 'git --help'.\n");
+    });
   });
 });

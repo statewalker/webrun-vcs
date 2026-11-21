@@ -130,7 +130,8 @@ export interface SparseApplyOutcome {
   unlinkWarnings: string[];
 }
 
-async function entryList(staging: Staging): Promise<readonly StagingEntry[]> {
+/** The staging's entries in index order. */
+export async function entryList(staging: Staging): Promise<readonly StagingEntry[]> {
   const list = staging.entryList?.();
   if (list) return list;
   const out: StagingEntry[] = [];
@@ -618,31 +619,8 @@ export async function cleanTrackedSparseDirectories(
   const worktree = ctx.worktree;
   if (!worktree || !patterns.cone) return "";
   const entries = await entryList(ctx.staging);
-  if (entries.length === 0 || entries.some((e) => e.stage !== 0)) return "";
-  // the directories holding an entry that keeps them from being collapsed
-  const blocked = new Set<string>();
-  const dirs: string[] = [];
-  const seen = new Set<string>();
-  for (const entry of entries) {
-    // an intent-to-add entry leaves every cache-tree node above it invalid (update_one)
-    const stays = !entry.skipWorktree || entry.mode === FileMode.GITLINK || entry.intentToAdd;
-    for (let k = entry.path.indexOf("/"); k > 0; k = entry.path.indexOf("/", k + 1)) {
-      const dir = entry.path.slice(0, k + 1);
-      if (!seen.has(dir)) {
-        seen.add(dir);
-        dirs.push(dir);
-      }
-      if (stays) blocked.add(dir);
-    }
-  }
-  // convert_to_sparse_rec: top-down, the first directory outside the cone that can be
-  // collapsed stands for everything beneath it
-  const sparseDirs: string[] = [];
-  for (const dir of dirs) {
-    if (sparseDirs.some((d) => dir.startsWith(d))) continue;
-    if (blocked.has(dir) || patterns.includes(dir)) continue;
-    sparseDirs.push(dir);
-  }
+  const sparseDirs = sparseDirectoriesOf(entries, patterns);
+  if (!sparseDirs) return "";
   let text = "";
   for (const dir of sparseDirs) {
     const path = dir.slice(0, -1);
@@ -657,6 +635,52 @@ export async function cleanTrackedSparseDirectories(
     if (!removed) text += `warning: failed to remove directory '${dir}'\n`;
   }
   return text;
+}
+
+/**
+ * The sparse directories git's `convert_to_sparse` (`SPARSE_INDEX_MEMORY_ONLY` too) makes of
+ * a full index under cone-mode `patterns`: top-down, each directory outside the cone whose
+ * entries are all skip-worktree, merged, no gitlink and not intent-to-add (an intent-to-add
+ * entry leaves every cache-tree node above it invalid), with a trailing slash, in index
+ * order. Undefined where git does not convert: no entries, an unmerged entry, patterns not
+ * of the cone's shape.
+ *
+ * @example
+ * ```typescript
+ * sparseDirectoriesOf(entries, patterns); // ["c/", "e/"]
+ * ```
+ */
+export function sparseDirectoriesOf(
+  entries: readonly StagingEntry[],
+  patterns: SparseCheckoutPatterns,
+): string[] | undefined {
+  if (!patterns.cone || entries.length === 0 || entries.some((e) => e.stage !== 0)) {
+    return undefined;
+  }
+  // the directories holding an entry that keeps them from being collapsed
+  const blocked = new Set<string>();
+  const dirs: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    const stays = !entry.skipWorktree || entry.mode === FileMode.GITLINK || entry.intentToAdd;
+    for (let k = entry.path.indexOf("/"); k > 0; k = entry.path.indexOf("/", k + 1)) {
+      const dir = entry.path.slice(0, k + 1);
+      if (!seen.has(dir)) {
+        seen.add(dir);
+        dirs.push(dir);
+      }
+      if (stays) blocked.add(dir);
+    }
+  }
+  // convert_to_sparse_rec: the first directory outside the cone that can be collapsed
+  // stands for everything beneath it
+  const sparseDirs: string[] = [];
+  for (const dir of dirs) {
+    if (sparseDirs.some((d) => dir.startsWith(d))) continue;
+    if (blocked.has(dir) || patterns.includes(dir)) continue;
+    sparseDirs.push(dir);
+  }
+  return sparseDirs;
 }
 
 /**

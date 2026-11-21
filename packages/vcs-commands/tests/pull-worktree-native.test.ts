@@ -94,3 +94,123 @@ describeGit("pull writes the worktree as native git", () => {
     expect(snapshot(root, ours, normalize)).toEqual(snapshot(root, native, normalize));
   });
 });
+
+describeGit("pull on an unborn branch, as native git", () => {
+  let root: string;
+  let backend: NativeGitHttpBackend;
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "pull-unborn-"));
+    backend = nativeGitHttpBackend(root, root);
+    globalThis.fetch = backend.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    backend?.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** The remote with one commit, and two unborn repositories that track its main. */
+  function setup(): { native: string; ours: string } {
+    const work = join(root, "work");
+    gitOk(root, root, "init", "-q", "-b", "main", work);
+    put(work, "a.txt", "a\n");
+    put(work, "f.txt", "f\n");
+    gitOk(root, work, "add", ".");
+    gitOk(root, work, "commit", "-q", "-m", "base");
+    gitOk(root, root, "clone", "-q", "--bare", work, join(root, "src.git"));
+    const native = join(root, "native");
+    const ours = join(root, "ours");
+    for (const dir of [native, ours]) {
+      gitOk(root, root, "init", "-q", "-b", "main", dir);
+      gitOk(root, dir, "remote", "add", "origin", join(root, "src.git"));
+      gitOk(root, dir, "config", "branch.main.remote", "origin");
+      gitOk(root, dir, "config", "branch.main.merge", "refs/heads/main");
+    }
+    gitOk(root, ours, "config", "remote.origin.url", URL);
+    return { native, ours };
+  }
+
+  const both = (dirs: { native: string; ours: string }, fn: (dir: string) => void) => {
+    fn(dirs.native);
+    fn(dirs.ours);
+  };
+
+  it("pull --rebase refuses staged changes before fetching, as git", async () => {
+    const dirs = setup();
+    both(dirs, (dir) => {
+      put(dir, "s.txt", "staged\n");
+      gitOk(root, dir, "add", "s.txt");
+    });
+    const theirs = git(root, dirs.native, "pull", "--rebase");
+    expect(theirs.status).toBe(128);
+    const result = await (await openOurs(dirs.ours)).pull().setRebase(true).call();
+    expect(result.successful).toBe(false);
+    expect(result.fetchResult).toBeUndefined();
+    expect(result.rebaseResult?.status).toBe(RebaseStatus.FAILED);
+    expect(`${result.rebaseResult?.message}\n`).toBe(theirs.stderr);
+    expect(snapshot(root, dirs.ours)).toEqual(snapshot(root, dirs.native));
+    // nothing fetched on either side
+    expect(git(root, dirs.ours, "rev-parse", "-q", "--verify", "origin/main").status).toBe(1);
+    expect(git(root, dirs.native, "rev-parse", "-q", "--verify", "origin/main").status).toBe(1);
+  });
+
+  it("an index file without entries refuses too, and --autostash does not help", async () => {
+    const dirs = setup();
+    both(dirs, (dir) => {
+      put(dir, "s.txt", "x\n");
+      gitOk(root, dir, "add", "s.txt");
+      gitOk(root, dir, "rm", "-q", "--cached", "s.txt");
+    });
+    const theirs = git(root, dirs.native, "pull", "--rebase", "--autostash");
+    expect(theirs.status).toBe(128);
+    const result = await (await openOurs(dirs.ours))
+      .pull()
+      .setRebase(true)
+      .setAutoStash(true)
+      .call();
+    expect(result.rebaseResult?.status).toBe(RebaseStatus.FAILED);
+    expect(`${result.rebaseResult?.message}\n`).toBe(theirs.stderr);
+  });
+
+  it("pull --rebase with only untracked files pulls into the void, as git", async () => {
+    const dirs = setup();
+    both(dirs, (dir) => put(dir, "u.txt", "u\n"));
+    gitOk(root, dirs.native, "pull", "-q", "--rebase");
+    const result = await (await openOurs(dirs.ours)).pull().setRebase(true).call();
+    expect(result.successful).toBe(true);
+    expect(snapshot(root, dirs.ours)).toEqual(snapshot(root, dirs.native));
+  });
+
+  it("a merging pull keeps the staged changes it does not overwrite, as git", async () => {
+    const dirs = setup();
+    both(dirs, (dir) => {
+      put(dir, "s.txt", "staged\n");
+      gitOk(root, dir, "add", "s.txt");
+    });
+    gitOk(root, dirs.native, "pull", "-q", "--no-rebase");
+    const result = await (await openOurs(dirs.ours)).pull().setRebase(false).call();
+    expect(result.successful).toBe(true);
+    expect(snapshot(root, dirs.ours)).toEqual(snapshot(root, dirs.native));
+    // refs_update_ref(..., "initial pull"): HEAD's log and its branch's
+    for (const ref of ["HEAD", "main"]) {
+      const log = (dir: string) => gitOk(root, dir, "reflog", "show", "--format=%gs", ref);
+      expect(log(dirs.ours)).toBe(log(dirs.native));
+    }
+  });
+
+  it("a merging pull refuses a staged file it would overwrite, as git", async () => {
+    const dirs = setup();
+    both(dirs, (dir) => {
+      put(dir, "a.txt", "other\n");
+      gitOk(root, dir, "add", "a.txt");
+    });
+    const theirs = git(root, dirs.native, "pull", "-q", "--no-rebase");
+    expect(theirs.status).toBe(1);
+    const result = await (await openOurs(dirs.ours)).pull().setRebase(false).call();
+    expect(result.successful).toBe(false);
+    expect(snapshot(root, dirs.ours)).toEqual(snapshot(root, dirs.native));
+  });
+});

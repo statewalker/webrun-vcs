@@ -6,6 +6,7 @@ import {
   AddCommand,
   AmCommand,
   ApplyCommand,
+  BackfillCommand,
   BisectCommand,
   BisectLogCommand,
   BisectNextCommand,
@@ -1095,7 +1096,7 @@ export class Git implements Disposable {
 
   /**
    * `git sparse-checkout <subcommand>`: `init`, `set`, `add`, `list`, `reapply`, `disable`
-   * and `check-rules`, over git's own files (`info/sparse-checkout`, `config.worktree`).
+   * `check-rules` and (git 2.5x) `clean`, over git's own files (`info/sparse-checkout`, `config.worktree`).
    *
    * @example
    * ```typescript
@@ -1106,6 +1107,19 @@ export class Git implements Disposable {
   sparseCheckout(): SparseCheckoutCommand {
     this.checkClosed();
     return new SparseCheckoutCommand(this._workingCopy);
+  }
+
+  /**
+   * `git backfill` (git 2.49+): a partial clone's missing blobs fetched in batches of paths.
+   *
+   * @example
+   * ```typescript
+   * const { batches } = await git.backfill().setMinBatchSize(1000).call();
+   * ```
+   */
+  backfill(): BackfillCommand {
+    this.checkClosed();
+    return new BackfillCommand(this._workingCopy);
   }
 
   // ============ Bisect Operations ============
