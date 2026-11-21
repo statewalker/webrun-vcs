@@ -467,7 +467,9 @@ export class PushCommand extends TransportCommand<PushResult> {
     let result: PushClientResult;
     // the remote's reference-transaction hook writes to the pushing user's stderr directly
     const transactionHooks =
-      localRemote === undefined ? undefined : remoteHookSession(this.workingCopy, localRemote);
+      localRemote === undefined
+        ? undefined
+        : remoteHookSession(this.workingCopy, localRemote, { localPush: true });
     // --receive-pack, else remote.<name>.receivepack
     const receivePack = this.receivePack ?? this.remoteProgram(this.remote, "receivepack");
     try {
@@ -480,7 +482,9 @@ export class PushCommand extends TransportCommand<PushResult> {
         },
         (connection) => pushToConnection(connection, pushOptions),
         // receive-pack runs the remote repository's hooks
-        localRemote === undefined ? undefined : remoteHookSession(this.workingCopy, localRemote),
+        localRemote === undefined
+          ? undefined
+          : remoteHookSession(this.workingCopy, localRemote, { localPush: true }),
         transactionHooks,
       );
     } catch (error) {

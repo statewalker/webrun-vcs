@@ -195,6 +195,19 @@ async function nativeLoopback(dir: string): Promise<LoopbackServer> {
   };
 }
 
+/**
+ * No background maintenance in a repository a local push reaches: connect.c starts its
+ * receive-pack with `local_repo_env` cleared (`GIT_CONFIG_COUNT` included), so the test
+ * environment's command-line `maintenance.auto=false` / `gc.auto=0` do not reach it, and
+ * git 2.5x's receive-pack would detach `git maintenance run --auto` there (changing
+ * `objects/` while the test copies it). Its own config turns that off.
+ */
+function noMaintenance(repo: string): void {
+  git(repo, ["config", "maintenance.auto", "false"]);
+  git(repo, ["config", "gc.auto", "0"]);
+  git(repo, ["config", "receive.autogc", "false"]);
+}
+
 /** `<dir>/src` (main, other, an annotated tag) and `<dir>/bare.git` holding them, loose. */
 function base(dir: string): void {
   const src = join(dir, "src");
@@ -206,6 +219,7 @@ function base(dir: string): void {
   git(src, ["branch", "other"]);
   git(src, ["tag", "-a", "-m", "t", "v1"]);
   git(dir, ["init", "-q", "--bare", "-b", "main", "bare.git"]);
+  noMaintenance(join(dir, "bare.git"));
   git(src, ["push", "-q", "../bare.git", "main", "other", "v1"]);
 }
 
@@ -264,6 +278,7 @@ describeGit("served dumb HTTP: as git http-backend serves it", () => {
     const dir = join(root, "r");
     base(dir);
     git(dir, ["clone", "-q", "--bare", "--shared", "bare.git", "borrower.git"]);
+    noMaintenance(join(dir, "borrower.git"));
     // no annotated tag only the alternate holds: our object store reads no alternates, so
     // info/refs could not peel it
     git(join(dir, "borrower.git"), ["tag", "-d", "v1"]);

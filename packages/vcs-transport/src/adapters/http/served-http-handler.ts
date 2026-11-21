@@ -40,6 +40,7 @@ import {
   type ServedRepository,
   type ServedRequestContext,
 } from "../../operations/serve-git-connection.js";
+import type { ServedGitFileStats } from "../../operations/served-git-files.js";
 import { configBoolOf } from "../../operations/server-config.js";
 import { parseGitProtocolEnv } from "../../protocol/git-daemon-request.js";
 import { visibleRefs } from "../../protocol/hidden-refs.js";
@@ -125,11 +126,14 @@ export interface ServedHttpHandlerOptions {
    * packs, `objects/info/alternates`, `objects/info/http-alternates`, loose objects, packs and
    * their indexes) from `ServedRepository.files` (404 without it). Served only where
    * upload-pack is served (403 otherwise), and `info/refs` without the refs upload-pack hides
-   * (`transfer.hideRefs`, `uploadpack.hideRefs`), where http-backend lists every ref; the
-   * object files still hold what hidden refs reach, so a server that relies on hidden refs
-   * turns this off. Off, they are refused (403). Unset or true, a repository's
-   * `http.getanyfile` decides (unless `allowOverride` is false); false refuses it whatever
-   * the repository's config says
+   * (`transfer.hideRefs`, `uploadpack.hideRefs`), where http-backend lists every ref. The
+   * object files hold what hidden refs reach, so they fail closed: while any hidden-ref
+   * pattern applies (the operator's `settings`, the repository's config or the resolver's
+   * settings), `objects/...` is refused (403) unless this is explicitly true or the
+   * repository sets `http.getanyfile=true`; `HEAD` and `info/refs` are still served. Off,
+   * every dumb request is refused (403). Unset or true, a repository's `http.getanyfile`
+   * decides (unless `allowOverride` is false); false refuses it whatever the repository's
+   * config says. A `HEAD` request is answered with the headers only, no file opened
    */
   getAnyFile?: boolean;
   /**
@@ -435,6 +439,7 @@ async function dumbFile(
   route: Route,
   path: string,
   logger: ServedHttpHandlerOptions["logger"],
+  headOnly = false,
 ): Promise<HttpResponse> {
   const files = served.files;
   if (!files) {
@@ -458,7 +463,9 @@ async function dumbFile(
   const type = FILE_TYPES[route];
   if (type === undefined) return refusal(404);
   const cache = route === "text-file" ? NO_CACHE_HEADERS : cacheForeverHeaders();
-  const file = await files.read(path);
+  const file: (ServedGitFileStats & { content?: ReadableStream<Uint8Array> }) | undefined = headOnly
+    ? await files.stat(path)
+    : await files.read(path);
   if (!file) {
     logger?.info(`Cannot open '${path}': No such file or directory`);
     return refusal(404);
@@ -473,7 +480,7 @@ async function dumbFile(
         ? { "Last-Modified": httpBackendDate(file.lastModified) }
         : {}),
     },
-    body: file.content,
+    body: file.content ?? new Uint8Array(0),
   };
 }
 
@@ -566,13 +573,11 @@ export function createServedHttpHandler(
     if (rpcName === undefined) {
       // the dumb protocol: on unless turned off (as http-backend), never where upload-pack
       // is not served, and without the refs upload-pack hides
-      const getAnyFile =
-        options.getAnyFile !== false &&
-        ((options.allowOverride === false
+      const explicit =
+        options.allowOverride === false || options.getAnyFile === false
           ? undefined
-          : configBoolOf(served.config, "http.getanyfile")) ??
-          options.getAnyFile ??
-          true);
+          : configBoolOf(served.config, "http.getanyfile");
+      const getAnyFile = options.getAnyFile !== false && (explicit ?? options.getAnyFile ?? true);
       if (!getAnyFile) {
         logger?.info("Unsupported service: getanyfile");
         return refusal(403);
@@ -582,12 +587,18 @@ export function createServedHttpHandler(
         logger?.info(uploadPack.refused);
         return refusal(403);
       }
+      // HEAD answers the head of a GET without its body (and never opens a file)
+      const headOnly = request.method === "HEAD";
+      const answer = (response: HttpResponse): HttpResponse =>
+        headOnly && response.body instanceof Uint8Array && response.body.length > 0
+          ? { ...response, body: new Uint8Array(0) }
+          : response;
       try {
+        const settings = resolveServeSettings(options.settings, served);
+        const hidden = [...(settings.hideRefs ?? []), ...(settings.uploadPackHideRefs ?? [])];
         if (match.route === "info-refs") {
-          const settings = resolveServeSettings(options.settings, served);
-          const hidden = [...(settings.hideRefs ?? []), ...(settings.uploadPackHideRefs ?? [])];
           const body = await textRefs(served, hidden);
-          return {
+          return answer({
             status: 200,
             headers: {
               ...NO_CACHE_HEADERS,
@@ -595,17 +606,26 @@ export function createServedHttpHandler(
               "Content-Type": "text/plain",
             },
             body,
-          };
+          });
         }
         if (match.route === "head") {
           const body = await textHead(served);
-          return {
+          return answer({
             status: 200,
             headers: { "Content-Length": String(body.length), "Content-Type": "text/plain" },
             body,
-          };
+          });
         }
-        return await dumbFile(served, match.route, request.path.slice(fileAt + 1), logger);
+        // fail closed: the object files hold what hidden refs reach, so with refs hidden they
+        // are served only where the operator (getAnyFile: true) or the repository
+        // (http.getanyfile=true) asked for them explicitly
+        if (hidden.length > 0 && options.getAnyFile !== true && explicit !== true) {
+          logger?.info("Unsupported service: getanyfile");
+          return refusal(403);
+        }
+        return answer(
+          await dumbFile(served, match.route, request.path.slice(fileAt + 1), logger, headOnly),
+        );
       } catch (error) {
         logger?.error(`Error answering ${request.path}`, error);
         return internalError();

@@ -184,7 +184,37 @@ export interface HookHost {
    * order, for git 2.5x's configured hooks; absent: none are configured
    */
   hookSettings?(): HookSetting[];
+  /**
+   * Variables of the host every hook of this repository runs without unless a call sets them
+   * itself: the receive side of a local push, which git starts with `local_repo_env` cleared
+   * ({@link LOCAL_REPO_ENV}, connect.c)
+   */
+  unsetEnv?: readonly string[];
 }
+
+/**
+ * environment.c's `local_repo_env` (git 2.43 and 2.56): the variables naming the local
+ * repository, which connect.c removes from the environment of a receive-pack or upload-pack
+ * it starts for a local (or `ext::`, `ssh` on the same host) remote, so the remote's hooks
+ * never see the pushing repository's objects, config or index.
+ */
+export const LOCAL_REPO_ENV: readonly string[] = [
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CONFIG",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_IMPLICIT_WORK_TREE",
+  "GIT_GRAFT_FILE",
+  "GIT_INDEX_FILE",
+  "GIT_NO_REPLACE_OBJECTS",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_PREFIX",
+  "GIT_SHALLOW_FILE",
+  "GIT_COMMON_DIR",
+];
 
 /** One `hook.<name>.<variable>` setting (git 2.5x's configured hooks). */
 export interface HookSetting {
@@ -761,6 +791,8 @@ export class HookSession {
    * objects appended to, as tmp-objdir.c's `env_append` appends them.
    */
   get hostAlternateObjectDirectories(): string | undefined {
+    // the receive side of a local push runs without them (local_repo_env)
+    if (this.host.unsetEnv?.includes("GIT_ALTERNATE_OBJECT_DIRECTORIES")) return undefined;
     return this.host.environment()?.alternateObjectDirectories;
   }
 
@@ -1059,7 +1091,13 @@ export class HookSession {
       ...this.processEnv,
       ...(options.env ?? {}),
     };
-    const unsetEnv = options.unsetEnv ?? [];
+    // the call's own unset variables, then the host's (local_repo_env) the call does not set
+    const unsetEnv = [
+      ...(options.unsetEnv ?? []),
+      ...(this.host.unsetEnv ?? []).filter(
+        (key) => options.env?.[key] === undefined && !options.unsetEnv?.includes(key),
+      ),
+    ];
     for (const key of unsetEnv) delete env[key];
     let outcome: HookOutcome | undefined;
     try {

@@ -516,3 +516,160 @@ describe("createServedFetchHandler: dumb files and content types (as git http-ba
     expect(refused.status).toBe(403);
   });
 });
+
+describe("createServedFetchHandler: dumb files fail closed under hidden refs; HEAD; confinement", () => {
+  const enc = new TextEncoder();
+  const PACK = `pack-${"1".repeat(40)}`;
+  const LOOSE = `objects/ab/${"c".repeat(38)}`;
+
+  async function storage() {
+    const files = createSymlinkFilesApi(createInMemoryFilesApi());
+    await files.write(`/srv/repo.git/${LOOSE}`, [enc.encode("loose bytes")]);
+    await files.write(`/srv/repo.git/objects/pack/${PACK}.pack`, [enc.encode("PACK")]);
+    await files.write(`/srv/repo.git/objects/pack/${PACK}.idx`, [enc.encode("IDX")]);
+    await files.write("/srv/repo.git/config", [enc.encode("[core]\n\tsecret = yes\n")]);
+    return files;
+  }
+
+  it("with refs hidden, objects/... is refused (403) unless getAnyFile or http.getanyfile is explicitly true", async () => {
+    const files = await storage();
+    const served = { files: servedGitFilesOf(files, "/srv/repo.git") };
+    const objectPaths = [
+      "/repo.git/objects/info/packs",
+      `/repo.git/objects/pack/${PACK}.pack`,
+      `/repo.git/objects/pack/${PACK}.idx`,
+      `/repo.git/${LOOSE}`,
+      "/repo.git/objects/info/alternates",
+    ];
+    const infos: string[] = [];
+    const logger = { info: (m: string) => infos.push(m), error: () => undefined };
+    // the operator's hidden refs
+    const { repository } = await setup(served);
+    const operator = handlerFor(repository, { settings: { hideRefs: ["refs/secret"] }, logger });
+    for (const path of objectPaths) {
+      const response = await get(operator.handler, path);
+      expect(response.status, path).toBe(403);
+      expect(await response.text()).toBe("");
+    }
+    expect(infos).toContain("Unsupported service: getanyfile");
+    // HEAD and info/refs stay: they leave the hidden refs out
+    expect((await get(operator.handler, "/repo.git/HEAD")).status).toBe(200);
+    expect((await get(operator.handler, "/repo.git/info/refs")).status).toBe(200);
+    // the repository's transfer.hideRefs / uploadpack.hideRefs, the resolver's settings
+    for (const config of <Record<string, string>[]>[
+      { "transfer.hideRefs": "refs/x" },
+      { "uploadpack.hideRefs": "refs/x" },
+    ]) {
+      const { handler } = handlerFor({ ...repository, config: configOf(config) });
+      expect((await get(handler, "/repo.git/objects/info/packs")).status).toBe(403);
+    }
+    const resolver = handlerFor({ ...repository, settings: { uploadPackHideRefs: ["refs/x"] } });
+    expect((await get(resolver.handler, `/repo.git/objects/pack/${PACK}.pack`)).status).toBe(403);
+    // explicit opt-in: the operator's getAnyFile: true or the repository's http.getanyfile=true
+    const optIn = handlerFor(repository, {
+      settings: { hideRefs: ["refs/secret"] },
+      getAnyFile: true,
+    });
+    expect((await get(optIn.handler, "/repo.git/objects/info/packs")).status).toBe(200);
+    const pack = await get(optIn.handler, `/repo.git/objects/pack/${PACK}.pack`);
+    expect(pack.status).toBe(200);
+    expect(await pack.text()).toBe("PACK");
+    const configured = handlerFor(
+      { ...repository, config: configOf({ "http.getanyfile": "true" }) },
+      { settings: { hideRefs: ["refs/secret"] } },
+    );
+    expect((await get(configured.handler, `/repo.git/objects/pack/${PACK}.pack`)).status).toBe(200);
+    // allowOverride false: the repository's true does not count
+    const noOverride = handlerFor(
+      { ...repository, config: configOf({ "http.getanyfile": "true" }) },
+      { settings: { hideRefs: ["refs/secret"] }, allowOverride: false },
+    );
+    expect((await get(noOverride.handler, "/repo.git/objects/info/packs")).status).toBe(403);
+    // nothing hidden: git's default (served)
+    expect((await get(handlerFor(repository).handler, "/repo.git/objects/info/packs")).status).toBe(
+      200,
+    );
+  });
+
+  it("a HEAD request answers the headers without opening the file; a GET opens it at the first read", async () => {
+    const files = await storage();
+    const opened: string[] = [];
+    const spied = new Proxy(files, {
+      get(target, key, receiver) {
+        if (key === "read") {
+          return (path: string, ...rest: unknown[]) => {
+            opened.push(path);
+            return (target.read as (...a: unknown[]) => AsyncIterable<Uint8Array>)(path, ...rest);
+          };
+        }
+        const value = Reflect.get(target, key, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const gitFiles = servedGitFilesOf(spied, "/srv/repo.git");
+    const { repository } = await setup({ files: gitFiles });
+    const { handler } = handlerFor(repository);
+    for (let i = 0; i < 50; i++) {
+      for (const path of [`/repo.git/objects/pack/${PACK}.pack`, `/repo.git/${LOOSE}`]) {
+        const head = await handler(new Request(`http://localhost${path}`, { method: "HEAD" }));
+        expect(head.status).toBe(200);
+        expect(await head.text()).toBe("");
+      }
+    }
+    const head = await handler(
+      new Request(`http://localhost/repo.git/objects/pack/${PACK}.pack`, { method: "HEAD" }),
+    );
+    expect(head.headers.get("content-length")).toBe("4");
+    expect(head.headers.get("content-type")).toBe("application/x-git-packed-objects");
+    expect(opened).toEqual([]);
+    // HEAD of a missing file: 404
+    const missing = await handler(
+      new Request(`http://localhost/repo.git/objects/ab/${"d".repeat(38)}`, { method: "HEAD" }),
+    );
+    expect(missing.status).toBe(404);
+    // a GET's stream opens the file when read, not before; a cancelled one is closed
+    const file = await gitFiles.read(LOOSE);
+    expect(opened).toEqual([]);
+    await file?.content.cancel();
+    expect(opened).toEqual([]);
+    const loose = await get(handler, `/repo.git/${LOOSE}`);
+    expect(await loose.text()).toBe("loose bytes");
+    expect(opened).toEqual([`/srv/repo.git/${LOOSE}`]);
+  });
+
+  it("only the object directory is served: an alternates file linked to ../config is not", async () => {
+    const files = await storage();
+    await files.symlink?.(enc.encode("../../config"), "/srv/repo.git/objects/info/alternates");
+    const { repository } = await setup({ files: servedGitFilesOf(files, "/srv/repo.git") });
+    const { handler } = handlerFor(repository);
+    expect((await get(handler, "/repo.git/objects/info/alternates")).status).toBe(404);
+    const gitFiles = servedGitFilesOf(files, "/srv/repo.git");
+    expect(await gitFiles.read("config")).toBeUndefined();
+    expect(await gitFiles.stat("objects/../config")).toBeUndefined();
+  });
+
+  it("an objects directory linked by an absolute path: followed inside the storage's root directory", async () => {
+    const enc2 = new TextEncoder();
+    const files = createSymlinkFilesApi(createInMemoryFilesApi());
+    await files.write(`/shared/objects/${LOOSE.slice("objects/".length)}`, [enc2.encode("shared")]);
+    await files.write("/srv/repo.git/HEAD", [enc2.encode("ref: refs/heads/main\n")]);
+    await files.symlink?.(enc2.encode("/host/root/shared/objects"), "/srv/repo.git/objects");
+    // the storage knows where it is on the host: the link is followed
+    const rooted = new Proxy(files, {
+      get(target, key, receiver) {
+        if (key === "rootDirectory") return "/host/root";
+        const value = Reflect.get(target, key, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const served = servedGitFilesOf(rooted, "/srv/repo.git");
+    const file = await served.read(LOOSE);
+    expect(file?.size).toBe(6);
+    expect(await new Response(file?.content).text()).toBe("shared");
+    // a target outside the root, or a storage that does not know its root: not served
+    expect(await servedGitFilesOf(files, "/srv/repo.git").read(LOOSE)).toBeUndefined();
+    await files.remove("/srv/repo.git/objects");
+    await files.symlink?.(enc2.encode("/elsewhere/objects"), "/srv/repo.git/objects");
+    expect(await servedGitFilesOf(rooted, "/srv/repo.git").read(LOOSE)).toBeUndefined();
+  });
+});

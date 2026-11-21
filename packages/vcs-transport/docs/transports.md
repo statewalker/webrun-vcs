@@ -170,7 +170,7 @@ with two differences that matter to a server of many tenants' repositories:
 |---|---|---|---|
 | upload-pack (fetch, clone) | served | `http.uploadpack` | `enableUploadPack` |
 | receive-pack (push) | served only to a request with a `remoteUser` | `http.receivepack` | `enableReceivePack` |
-| dumb protocol (`HEAD`, `info/refs`, `objects/...`) | served | `http.getanyfile` | `getAnyFile` |
+| dumb protocol (`HEAD`, `info/refs`, `objects/...`) | served; `objects/...` refused while refs are hidden | `http.getanyfile` | `getAnyFile` |
 
 - An option the operator sets to `false` is final: a repository's `http.receivepack=true` (or
   `http.uploadpack`, `http.getanyfile`) cannot turn back on what the operator turned off, where
@@ -236,17 +236,39 @@ in-memory store, has no loose objects or packs on disk to hand out: its dumb `HE
 `info/refs` are still answered from its refs, and every `objects/...` path is a `404`, so a
 dumb client cannot clone it (a smart client can).
 
-Three differences from http-backend keep a server of many tenants' repositories safe:
+Four differences from http-backend keep a server of many tenants' repositories safe:
 
-- A file whose path, symbolic links followed where the FilesApi can read them, leaves the git
-  directory is a `404`; http-backend opens whatever a link names.
+- The object files fail closed under hidden refs. They hold everything, the objects only
+  hidden refs reach included, so while any hidden-ref pattern applies to upload-pack (the
+  operator's `settings.hideRefs` / `uploadPackHideRefs`, the repository's `transfer.hideRefs` /
+  `uploadpack.hideRefs`, a resolver's `ServedRepository.settings`), every `objects/...` path
+  is refused (`403`, as a disabled `getanyfile`) unless the operator passes `getAnyFile: true`
+  or the repository sets `http.getanyfile=true` explicitly (and `allowOverride` is not
+  false). `HEAD` and `info/refs` are still served: they leave the hidden refs out. With
+  nothing hidden, http-backend's default stands and the files are served.
+
+  ```ts
+  // hidden refs, and the dumb protocol's files served anyway (their objects included)
+  createServedFetchHandler({ resolveRepository, settings: { hideRefs: ["refs/internal"] }, getAnyFile: true });
+  ```
+
+- Only the object directory is served: a file whose path, symbolic links followed where the
+  FilesApi can read them, leaves `<git dir>/objects` (as resolved) is a `404`, so an
+  `objects/info/alternates` linked to `../config` hands out nothing; http-backend opens
+  whatever a link names. An absolute link (an `objects` directory linked to
+  `/srv/shared/objects`) is followed only when the FilesApi tells where it is rooted on the
+  host (`rootDirectory`, as the Node FilesApi does) and the target lies below that root;
+  otherwise what it names is a `404`.
 - A refusal or a missing file carries the no-cache headers once. http-backend sends them
   after the headers its route already set (a second copy, or beside a loose object's one-year
   caching).
-- The object files hold everything, the objects only hidden refs reach included: hiding refs
-  from `info/refs` keeps their names out of sight, not their objects. A server that relies on
-  hidden refs (or on `uploadpack.allowAnySHA1InWant` staying off) turns the dumb protocol off
-  with `getAnyFile: false`.
+- A `HEAD` request for a file is answered with its headers (`Content-Length` from its
+  stats) and no body, without opening it; a `GET` opens the file at the first read of its
+  body and closes it when the response is cancelled.
+
+A server that relies on `uploadpack.allowAnySHA1InWant` staying off without hiding refs (an
+unreachable object a client must not fetch by id) turns the dumb protocol off with
+`getAnyFile: false`: its object files hand out every object the repository holds.
 
 ## git://
 

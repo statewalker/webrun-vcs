@@ -8,7 +8,7 @@
  * Each case runs native git in one copy of a pusher and its bare remote and ours (with the
  * Node hook runner) in the other.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -715,3 +715,44 @@ describeGit(
     });
   },
 );
+
+/**
+ * connect.c starts the receive-pack of a local push with `local_repo_env` cleared: the
+ * remote's hooks never see the pushing side's `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+ * `GIT_OBJECT_DIRECTORY` or `GIT_CONFIG_COUNT`, and a quarantined pre-receive's alternates
+ * name the receiving repository's objects alone.
+ */
+describeGit("push hooks: a local push clears the pushing side's repository variables", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-push-local-env-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("GIT_ALTERNATE_OBJECT_DIRECTORIES=<x> git push ../bare.git: pre-receive gets <bare.git>/./objects only, update none", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    // an empty object directory both pushes name (outside the twins)
+    const alt = join(root, "alt-objects");
+    mkdirSync(join(alt, "pack"), { recursive: true });
+    await expectPush(
+      dir,
+      ["../bare.git", "main"],
+      (p) => p.setRemote("../bare.git").add("main"),
+      "local_repo_env",
+      (twin) => {
+        twin.env.GIT_ALTERNATE_OBJECT_DIRECTORIES = alt;
+        twin.env.HOOK_EXTRA_VARS =
+          "GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_OBJECT_DIRECTORY GIT_CONFIG_COUNT";
+      },
+    );
+    const log = readFileSync(`${dir}-ours.hooklog`, "latin1").replaceAll(`${dir}-ours`, "<twin>");
+    const section = (name: string) => log.slice(log.indexOf(`== ${name}`)).split("\n== ")[0];
+    expect(section("pre-push")).toContain(`GIT_ALTERNATE_OBJECT_DIRECTORIES=${alt}\n`);
+    expect(section("pre-receive")).toContain(
+      "GIT_ALTERNATE_OBJECT_DIRECTORIES=<twin>/bare.git/./objects\n",
+    );
+    expect(section("pre-receive")).not.toContain("GIT_CONFIG_COUNT=");
+    expect(section("update")).not.toContain("GIT_ALTERNATE_OBJECT_DIRECTORIES=");
+    expect(section("update")).not.toContain("GIT_OBJECT_DIRECTORY=");
+  });
+});
