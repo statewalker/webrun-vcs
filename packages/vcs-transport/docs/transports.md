@@ -149,7 +149,11 @@ output relayed as `remote:` lines), push-to-checkout for `receive.denyCurrentBra
 and the reference-transaction hook through `ServedRepository.around`, which lasts until the push
 has ended, not only until the response head is out. pre-receive gets `GIT_QUARANTINE_PATH`,
 `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` as git sets them, so a hook running
-native git (`git cat-file -t $new`) reads the pushed objects before they are published.
+native git (`git cat-file -t $new`) reads the pushed objects before they are published. As in
+tmp-objdir.c's `env_append`, the repository's objects are appended to the
+`GIT_ALTERNATE_OBJECT_DIRECTORIES` the host sets (the host environment's
+`alternateObjectDirectories`; `createNodeGitHostEnvironment` reads it from `env`), after a `:`
+and C-quoted when the directory holds a `:` or starts with `"`.
 Every hook of the push (reference-transaction and push-to-checkout included) inherits
 `REMOTE_USER` and `REMOTE_ADDR` from `remoteUser` and `remoteAddr`, and, where the host sets no
 committer, `GIT_COMMITTER_NAME=<user>` and `GIT_COMMITTER_EMAIL=<user>@http.<addr>`
@@ -166,25 +170,83 @@ with two differences that matter to a server of many tenants' repositories:
 |---|---|---|---|
 | upload-pack (fetch, clone) | served | `http.uploadpack` | `enableUploadPack` |
 | receive-pack (push) | served only to a request with a `remoteUser` | `http.receivepack` | `enableReceivePack` |
-| dumb `HEAD`, `info/refs` | refused (http-backend: served) | `http.getanyfile` | `getAnyFile` |
+| dumb protocol (`HEAD`, `info/refs`, `objects/...`) | served | `http.getanyfile` | `getAnyFile` |
 
 - An option the operator sets to `false` is final: a repository's `http.receivepack=true` (or
   `http.uploadpack`, `http.getanyfile`) cannot turn back on what the operator turned off, where
   http-backend lets the repository's config decide. An option left unset (or `true`) is still
   overridden by the repository's config, as in git.
-- The dumb protocol is off unless `getAnyFile` or the repository's `http.getanyfile=true` turns it
-  on, since this handler serves no object files anyway. Turned on, `HEAD` and `info/refs` are
-  answered only where upload-pack is served (`403` otherwise), and `info/refs` leaves out the refs
-  upload-pack hides (`transfer.hideRefs`, `uploadpack.hideRefs`), where http-backend lists them all.
+- The dumb protocol is answered only where upload-pack is served (`403` otherwise), where
+  http-backend serves it whatever `http.uploadpack` says, and `info/refs` leaves out the refs
+  upload-pack hides (`transfer.hideRefs`, `uploadpack.hideRefs`), where http-backend lists them
+  all.
+
+A POST to `git-upload-pack` or `git-receive-pack` whose `Content-Type` is not exactly
+`application/x-git-<service>-request` is answered `415 Unsupported Media Type` with
+http-backend's body, `Expected POST with Content-Type '<expected>', but received '<actual>'
+instead.`, after the service check (a refused service is still a `403`).
 
 A service that is not enabled, or an unknown one, is answered `403` with an empty body, as
 http-backend answers it ("Service not enabled: 'receive-pack'" goes to `logger.info`, where
 http-backend writes it to its stderr); a native client prints `The requested URL returned error:
 403`. An unknown path or repository is a `404`, the wrong method a `405` with `Allow`.
-`allowOverride: false` keeps the repositories' `http.*` from overriding the options. Dumb-protocol
-object files (`objects/...`) are never served: a dumb client cannot fetch from this handler. A
+`allowOverride: false` keeps the repositories' `http.*` from overriding the options. A
 failure (a throwing `remoteUser`, `remoteAddr` or `around`, an `around` that returns without serving)
 is a `500` with the fixed body `Internal server error`; the detail goes to `logger.error`.
+
+#### The dumb protocol
+
+With `http.getanyfile` on (the default, as in http-backend) a native client that speaks only
+the dumb protocol (`GIT_SMART_HTTP=0`, or an old client) clones and fetches from the handler
+as from http-backend:
+
+```console
+$ GIT_SMART_HTTP=0 git clone https://git.example.com/r.git
+```
+
+The handler answers http-backend's dumb routes with its content types and cache headers:
+
+| Path | Content-Type | Caching |
+|---|---|---|
+| `HEAD`, `info/refs` | `text/plain` | `info/refs` no-cache; `HEAD` none, as http-backend |
+| `objects/info/packs` | `text/plain; charset=utf-8` | no-cache |
+| `objects/info/alternates`, `objects/info/http-alternates` | `text/plain` | no-cache |
+| `objects/xx/<38 or 62 hex>` | `application/x-git-loose-object` | a year (`public, max-age=31536000`) |
+| `objects/pack/pack-<hex>.pack` | `application/x-git-packed-objects` | a year |
+| `objects/pack/pack-<hex>.idx` | `application/x-git-packed-objects-toc` | a year |
+
+`HEAD` and `info/refs` come from the refs, as http-backend generates them, and so does
+`objects/info/packs`: one `P pack-<hex>.pack` line per pack of the repository's own (not its
+alternates'), the youngest first, then an empty line. `git update-server-info` is not needed,
+and the files it writes are not read. The other files are read from the git directory
+through `ServedRepository.files`, with `Content-Length` and `Last-Modified` as
+`send_local_file` sends them; a missing one is a `404`. Paths outside http-backend's table
+(upper-case hex, a short name) are a `404` before any lookup.
+
+The files of a repository with `objects/info/alternates` are served as they are (a dumb client
+then fetches from the alternate, given `http.followRedirects=true`), but the repository's
+object store reads no alternates: an annotated tag whose object only an alternate holds is
+listed in `info/refs` without its peeled `^{}` line, where http-backend peels it.
+
+`servedRepositoryOf` sets `files` for a repository opened from a FilesApi
+(`OpenedRepository.files`, set by `Worktree.openRepository`), reading below its repository
+directory (a linked worktree's common directory). A resolver of its own builds it with
+`servedGitFilesOf(files, gitDir)`. A repository without `files`, one kept in a key-value, SQL or
+in-memory store, has no loose objects or packs on disk to hand out: its dumb `HEAD` and
+`info/refs` are still answered from its refs, and every `objects/...` path is a `404`, so a
+dumb client cannot clone it (a smart client can).
+
+Three differences from http-backend keep a server of many tenants' repositories safe:
+
+- A file whose path, symbolic links followed where the FilesApi can read them, leaves the git
+  directory is a `404`; http-backend opens whatever a link names.
+- A refusal or a missing file carries the no-cache headers once. http-backend sends them
+  after the headers its route already set (a second copy, or beside a loose object's one-year
+  caching).
+- The object files hold everything, the objects only hidden refs reach included: hiding refs
+  from `info/refs` keeps their names out of sight, not their objects. A server that relies on
+  hidden refs (or on `uploadpack.allowAnySHA1InWant` staying off) turns the dumb protocol off
+  with `getAnyFile: false`.
 
 ## git://
 

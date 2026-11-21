@@ -74,6 +74,7 @@ export interface NodeGitHostEnvironment {
   replaceRefBase?: string;
   graftFile?: string;
   printSha1Ellipsis?: boolean;
+  alternateObjectDirectories?: string;
   notesRef?: string;
   notesDisplayRef?: string;
   notesRewriteRef?: string;
@@ -216,6 +217,9 @@ export function createNodeGitHostEnvironment(
     ...(env.GIT_GRAFT_FILE !== undefined ? { graftFile: env.GIT_GRAFT_FILE } : {}),
     // git's print_sha1_ellipsis: "yes" in any case
     ...(env.GIT_PRINT_SHA1_ELLIPSIS?.toLowerCase() === "yes" ? { printSha1Ellipsis: true } : {}),
+    ...(env.GIT_ALTERNATE_OBJECT_DIRECTORIES !== undefined
+      ? { alternateObjectDirectories: env.GIT_ALTERNATE_OBJECT_DIRECTORIES }
+      : {}),
     ...(env.GIT_NOTES_REF !== undefined ? { notesRef: env.GIT_NOTES_REF } : {}),
     ...(env.GIT_NOTES_DISPLAY_REF !== undefined
       ? { notesDisplayRef: env.GIT_NOTES_DISPLAY_REF }

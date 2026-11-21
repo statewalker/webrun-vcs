@@ -483,6 +483,12 @@ export interface OpenedRepository {
   config?: OpenedRepositoryConfig;
   /** Its worktrees: the main one and the linked ones (git's `get_worktrees`) */
   worktrees?: LinkedWorktrees;
+  /**
+   * The storage its directories are in (`gitDir` and `commonDir` are paths of it): what a
+   * server reads the files of its git directory through (a dumb HTTP client's objects and
+   * packs, `servedRepositoryOf`)
+   */
+  files?: FilesApi;
 }
 
 /** The configuration of an {@link OpenedRepository}, values as written. */

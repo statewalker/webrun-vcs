@@ -77,7 +77,7 @@ export interface BasePathResolverOptions {
 const MAX_LINKS = 40;
 
 /** `path`'s components, `.` and empty ones dropped, `..` applied; null when it climbs above the root. */
-function normalize(path: string): string | null {
+export function normalize(path: string): string | null {
   const out: string[] = [];
   for (const part of path.split("/")) {
     if (part === "" || part === ".") continue;
@@ -92,7 +92,7 @@ function normalize(path: string): string | null {
 }
 
 /** Whether `path` is `dir` or below it (both normalized). */
-function inside(path: string, dir: string): boolean {
+export function inside(path: string, dir: string): boolean {
   return dir === "/" || path === dir || path.startsWith(`${dir}/`);
 }
 
@@ -101,7 +101,7 @@ function inside(path: string, dir: string): boolean {
  * null when one cannot be followed inside the storage (an absolute target names the host's
  * filesystem, not the storage's), or there are too many. Lexical when `files` cannot tell.
  */
-async function realPath(files: FilesApi, path: string): Promise<string | null> {
+export async function realPath(files: FilesApi, path: string): Promise<string | null> {
   const posix = files as PosixFilesApi;
   if (!posix.lstat || !posix.readlink) return normalize(path);
   const pending = path.split("/").filter((p) => p !== "" && p !== ".");

@@ -1459,6 +1459,7 @@ export class FileWorktree implements Worktree {
           })),
       },
       worktrees,
+      files,
     };
   }
 

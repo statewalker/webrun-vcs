@@ -7,8 +7,8 @@
  * repository's own config, its hooks run for a push (pre-receive, update, post-receive,
  * post-update, push-to-checkout, reference-transaction through `around`), and the services
  * are enabled as http-backend enables them (`http.uploadpack`, `http.receivepack`,
- * `http.getanyfile`), except that what the operator turns off stays off whatever a
- * repository's config says, and the dumb protocol is off unless asked for.
+ * `http.getanyfile`, the dumb protocol's object files read through `ServedRepository.files`),
+ * except that what the operator turns off stays off whatever a repository's config says.
  *
  * @example
  * ```ts
@@ -119,14 +119,16 @@ export interface ServedHttpHandlerOptions {
    */
   enableReceivePack?: boolean;
   /**
-   * Answer the dumb protocol's requests (http-backend's `http.getanyfile`), default false
-   * here where http-backend's is true: this server serves no object files (`objects/...` is
-   * a 404 whatever this says), so a dumb client cannot clone from it anyway. On, `HEAD` and
-   * `info/refs` without a service are served from the refs, only where upload-pack is
-   * served (403 otherwise) and without the refs upload-pack hides (`transfer.hideRefs`,
-   * `uploadpack.hideRefs`), where http-backend lists every ref. Off, they are refused (403).
-   * Unset, a repository's `http.getanyfile=true` turns it on, as true turns it on and its
-   * `http.getanyfile=false` off (unless `allowOverride` is false); false refuses it whatever
+   * Answer the dumb protocol's requests (http-backend's `http.getanyfile`), default true as
+   * in http-backend: `HEAD` and `info/refs` without a service from the refs, and the git
+   * directory's files a dumb client fetches (`objects/info/packs` generated from the local
+   * packs, `objects/info/alternates`, `objects/info/http-alternates`, loose objects, packs and
+   * their indexes) from `ServedRepository.files` (404 without it). Served only where
+   * upload-pack is served (403 otherwise), and `info/refs` without the refs upload-pack hides
+   * (`transfer.hideRefs`, `uploadpack.hideRefs`), where http-backend lists every ref; the
+   * object files still hold what hidden refs reach, so a server that relies on hidden refs
+   * turns this off. Off, they are refused (403). Unset or true, a repository's
+   * `http.getanyfile` decides (unless `allowOverride` is false); false refuses it whatever
    * the repository's config says
    */
   getAnyFile?: boolean;
@@ -165,7 +167,7 @@ const RPC_SERVICES: Record<string, string> = {
   "upload-archive": "uploadarchive",
 };
 
-type Route = "head" | "info-refs" | "file" | "rpc";
+type Route = "head" | "info-refs" | "text-file" | "info-packs" | "loose" | "pack" | "idx" | "rpc";
 
 /** http-backend's request table (`services[]`): method, path suffix, what it serves. */
 const ROUTES: Array<{ method: "GET" | "POST"; pattern: RegExp; route: Route }> = [
@@ -173,18 +175,24 @@ const ROUTES: Array<{ method: "GET" | "POST"; pattern: RegExp; route: Route }> =
   { method: "GET", pattern: /\/info\/refs$/, route: "info-refs" },
   {
     method: "GET",
-    pattern: /\/objects\/info\/(?:alternates|http-alternates|packs)$/,
-    route: "file",
+    pattern: /\/objects\/info\/(?:alternates|http-alternates)$/,
+    route: "text-file",
   },
+  { method: "GET", pattern: /\/objects\/info\/packs$/, route: "info-packs" },
   {
     method: "GET",
     pattern: /\/objects\/[0-9a-f]{2}\/(?:[0-9a-f]{38}|[0-9a-f]{62})$/,
-    route: "file",
+    route: "loose",
   },
   {
     method: "GET",
-    pattern: /\/objects\/pack\/pack-(?:[0-9a-f]{40}|[0-9a-f]{64})\.(?:pack|idx)$/,
-    route: "file",
+    pattern: /\/objects\/pack\/pack-(?:[0-9a-f]{40}|[0-9a-f]{64})\.pack$/,
+    route: "pack",
+  },
+  {
+    method: "GET",
+    pattern: /\/objects\/pack\/pack-(?:[0-9a-f]{40}|[0-9a-f]{64})\.idx$/,
+    route: "idx",
   },
   { method: "POST", pattern: /\/git-upload-pack$/, route: "rpc" },
   { method: "POST", pattern: /\/git-upload-archive$/, route: "rpc" },
@@ -223,6 +231,37 @@ function decodeRepoPath(path: string): string | undefined {
     out.push(decoded);
   }
   return out.join("/");
+}
+
+/** The content types of http-backend's `send_local_file`, per route. */
+const FILE_TYPES: Partial<Record<Route, string>> = {
+  "text-file": "text/plain",
+  loose: "application/x-git-loose-object",
+  pack: "application/x-git-packed-objects",
+  idx: "application/x-git-packed-objects-toc",
+};
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** git's `show_date(when, 0, DATE_RFC2822)` (http-backend's `hdr_date`): `Sat, 2 Jan 2027 03:04:05 +0000`. */
+function httpBackendDate(ms: number): string {
+  const d = new Date(Math.floor(ms / 1000) * 1000);
+  const two = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${WEEKDAYS[d.getUTCDay()]}, ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ` +
+    `${d.getUTCFullYear()} ${two(d.getUTCHours())}:${two(d.getUTCMinutes())}:` +
+    `${two(d.getUTCSeconds())} +0000`
+  );
+}
+
+/** http-backend's `hdr_cache_forever`: what never changes (objects, packs) cached for a year. */
+function cacheForeverHeaders(now = Date.now()): Record<string, string> {
+  return {
+    Date: httpBackendDate(now),
+    Expires: httpBackendDate(now + 31536000 * 1000),
+    "Cache-Control": "public, max-age=31536000",
+  };
 }
 
 /** An answer with no body, as http-backend's `not_found` / `forbidden` (the reason on its stderr). */
@@ -385,6 +424,60 @@ async function textHead(served: ServedRepository): Promise<Uint8Array> {
 }
 
 /**
+ * A dumb-protocol file (`path` in the git directory, as http-backend's `cmd_arg`): the
+ * generated `objects/info/packs` (`get_info_packs`: `P <pack>` per local pack, then an empty
+ * line), else the file as `send_local_file` sends it, with `hdr_nocache` (alternates) or
+ * `hdr_cache_forever` (objects, packs, indexes); 404 when missing or when the repository
+ * has no files to serve (`ServedRepository.files`).
+ */
+async function dumbFile(
+  served: ServedRepository,
+  route: Route,
+  path: string,
+  logger: ServedHttpHandlerOptions["logger"],
+): Promise<HttpResponse> {
+  const files = served.files;
+  if (!files) {
+    logger?.info(`Cannot open '${path}': the repository has no files to serve`);
+    return refusal(404);
+  }
+  if (route === "info-packs") {
+    let text = "";
+    for (const pack of await files.localPacks()) text += `P ${pack}\n`;
+    const body = textEncoder.encode(`${text}\n`);
+    return {
+      status: 200,
+      headers: {
+        ...NO_CACHE_HEADERS,
+        "Content-Length": String(body.length),
+        "Content-Type": "text/plain; charset=utf-8",
+      },
+      body,
+    };
+  }
+  const type = FILE_TYPES[route];
+  if (type === undefined) return refusal(404);
+  const cache = route === "text-file" ? NO_CACHE_HEADERS : cacheForeverHeaders();
+  const file = await files.read(path);
+  if (!file) {
+    logger?.info(`Cannot open '${path}': No such file or directory`);
+    return refusal(404);
+  }
+  return {
+    status: 200,
+    headers: {
+      ...cache,
+      "Content-Length": String(file.size),
+      "Content-Type": type,
+      ...(file.lastModified !== undefined
+        ? { "Last-Modified": httpBackendDate(file.lastModified) }
+        : {}),
+    },
+    body: file.content,
+  };
+}
+
+/**
  * Creates a smart-HTTP handler over served repositories, as git's `http-backend` serves
  * the repositories of a project root (see the module's example).
  *
@@ -404,6 +497,7 @@ export function createServedHttpHandler(
     const method = request.method === "HEAD" ? "GET" : request.method;
     let match: (typeof ROUTES)[number] | undefined;
     let repoPath = "";
+    let fileAt = 0;
     for (const entry of ROUTES) {
       const found = entry.pattern.exec(request.path);
       if (!found) continue;
@@ -415,6 +509,7 @@ export function createServedHttpHandler(
         };
       }
       match = entry;
+      fileAt = found.index;
       const decoded = decodeRepoPath(request.path.slice(0, found.index));
       if (decoded === undefined) {
         logger?.info(`Request not supported: '${request.path}'`);
@@ -469,15 +564,15 @@ export function createServedHttpHandler(
     }
 
     if (rpcName === undefined) {
-      // the dumb protocol: off unless turned on (no object files are served here), never
-      // where upload-pack is not served, and without the refs upload-pack hides
+      // the dumb protocol: on unless turned off (as http-backend), never where upload-pack
+      // is not served, and without the refs upload-pack hides
       const getAnyFile =
         options.getAnyFile !== false &&
         ((options.allowOverride === false
           ? undefined
           : configBoolOf(served.config, "http.getanyfile")) ??
           options.getAnyFile ??
-          false);
+          true);
       if (!getAnyFile) {
         logger?.info("Unsupported service: getanyfile");
         return refusal(403);
@@ -491,25 +586,30 @@ export function createServedHttpHandler(
         if (match.route === "info-refs") {
           const settings = resolveServeSettings(options.settings, served);
           const hidden = [...(settings.hideRefs ?? []), ...(settings.uploadPackHideRefs ?? [])];
+          const body = await textRefs(served, hidden);
           return {
             status: 200,
-            headers: { ...NO_CACHE_HEADERS, "Content-Type": "text/plain" },
-            body: await textRefs(served, hidden),
+            headers: {
+              ...NO_CACHE_HEADERS,
+              "Content-Length": String(body.length),
+              "Content-Type": "text/plain",
+            },
+            body,
           };
         }
         if (match.route === "head") {
+          const body = await textHead(served);
           return {
             status: 200,
-            headers: { "Content-Type": "text/plain" },
-            body: await textHead(served),
+            headers: { "Content-Length": String(body.length), "Content-Type": "text/plain" },
+            body,
           };
         }
+        return await dumbFile(served, match.route, request.path.slice(fileAt + 1), logger);
       } catch (error) {
         logger?.error(`Error answering ${request.path}`, error);
         return internalError();
       }
-      logger?.info(`Cannot open '${request.path}': files are not served`);
-      return refusal(404);
     }
 
     const selected = selectService(rpcName, served, options, remoteUser);
@@ -518,6 +618,20 @@ export function createServedHttpHandler(
       return refusal(403);
     }
     const { service } = selected;
+    if (match.route === "rpc") {
+      // check_content_type: the request body's type, exactly
+      const accepted = `application/x-git-${service.slice(4)}-request`;
+      const actual = header(request, "content-type") ?? "";
+      if (actual !== accepted) {
+        return {
+          status: 415,
+          headers: { ...NO_CACHE_HEADERS },
+          body: textEncoder.encode(
+            `Expected POST with Content-Type '${accepted}', but received '${actual}' instead.\n`,
+          ),
+        };
+      }
+    }
     const settings = resolveServeSettings(options.settings, served);
     const serverOptions = httpOptionsOf(settings, options);
     const { repository, refStore } = served;

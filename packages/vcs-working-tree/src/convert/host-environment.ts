@@ -105,6 +105,11 @@ export interface GitHostEnvironment {
    * where git's `print_sha1_ellipsis` asks for it (checkout's "HEAD is now at <abbrev>...")
    */
   printSha1Ellipsis?: boolean;
+  /**
+   * `$GIT_ALTERNATE_OBJECT_DIRECTORIES` as set: the alternates a quarantined push's
+   * pre-receive gets the repository's objects appended to (tmp-objdir.c's `env_append`)
+   */
+  alternateObjectDirectories?: string;
   /** `$GIT_NOTES_REF`: the notes ref of `git notes` and of `git log` (over `core.notesRef`) */
   notesRef?: string;
   /** `$GIT_NOTES_DISPLAY_REF`: the notes refs `git log` shows (colon-separated globs) */

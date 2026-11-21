@@ -11,6 +11,7 @@ import {
   type ServedRepository,
   type ServedRequestContext,
   type ServerConfigReader,
+  servedGitFilesOf,
 } from "@statewalker/vcs-transport";
 import type { OpenedRepository } from "@statewalker/vcs-working-tree";
 import type { HookSession } from "./git-hooks.js";
@@ -49,7 +50,8 @@ const EMPTY_CONFIG: ServerConfigReader = { getAll: () => [] };
  * An opened repository (`Worktree.openRepository`) as a git server serves it: its objects and
  * refs, its configuration (git-daemon's `daemon.<service>`, `receive.*`, hidden refs), and the
  * settings of git's receive-pack (the current branch and the branches its worktrees have checked
- * out, `receive.denyCurrentBranch=updateInstead`, the hooks given).
+ * out, `receive.denyCurrentBranch=updateInstead`, the hooks given), and the files of its git
+ * directory a dumb HTTP client fetches, where it is in a FilesApi (`OpenedRepository.files`).
  *
  * The `receive.*` and hidden ref settings are not in `settings` but left to `config`, so
  * `serveGitService` applies only what the repository's config sets over the operator's
@@ -90,6 +92,10 @@ export async function servedRepositoryOf(
     refStore: createTransportRefStore(remote.history.refs),
     config: remote.config ?? EMPTY_CONFIG,
     settings: settings as GitServeSettings,
+    // a dumb HTTP client's files (objects, packs), read from the repository directory
+    ...(remote.files
+      ? { files: servedGitFilesOf(remote.files, remote.commonDir ?? remote.gitDir) }
+      : {}),
     ...(hooks?.enabled
       ? {
           // the client's variables (http-backend's REMOTE_USER, ...) reach the

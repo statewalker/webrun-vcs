@@ -755,6 +755,15 @@ export class HookSession {
     return this.host.environment()?.committer ?? {};
   }
 
+  /**
+   * The host's `GIT_ALTERNATE_OBJECT_DIRECTORIES` (the host environment's
+   * `alternateObjectDirectories`): what a quarantined pre-receive gets the repository's
+   * objects appended to, as tmp-objdir.c's `env_append` appends them.
+   */
+  get hostAlternateObjectDirectories(): string | undefined {
+    return this.host.environment()?.alternateObjectDirectories;
+  }
+
   /** Whether hooks can run at all: the host environment has a runner. */
   get enabled(): boolean {
     return this.runner !== undefined;

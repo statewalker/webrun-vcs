@@ -6,6 +6,7 @@
  * and the quarantine path handed to pre-receive.
  */
 
+import { createInMemoryFilesApi, createSymlinkFilesApi } from "@statewalker/vcs-utils/files";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -14,6 +15,7 @@ import {
   type ServedHttpHandlerOptions,
   type ServedRepository,
   type ServerConfigReader,
+  servedGitFilesOf,
 } from "../src/index.js";
 import {
   clientWithNewCommits,
@@ -228,18 +230,20 @@ describe("createServedFetchHandler: settings, hooks and around", () => {
   });
 });
 
-describe("createServedFetchHandler: the dumb protocol off by default, hidden refs, operator's false", () => {
-  it("HEAD and info/refs are refused unless getAnyFile or http.getanyfile turns them on", async () => {
+describe("createServedFetchHandler: the dumb protocol on by default, hidden refs, operator's false", () => {
+  it("HEAD and info/refs are served unless getAnyFile or http.getanyfile turns them off", async () => {
     const { repository } = await setup();
     const { handler } = handlerFor(repository);
-    expect((await get(handler, "/repo.git/HEAD")).status).toBe(403);
-    expect((await get(handler, "/repo.git/info/refs")).status).toBe(403);
-    // left unset by the operator, the repository's config turns it on (as http-backend)
+    // on by default, as http-backend's http.getanyfile
+    expect((await get(handler, "/repo.git/HEAD")).status).toBe(200);
+    expect((await get(handler, "/repo.git/info/refs")).status).toBe(200);
+    // left unset by the operator, the repository's config turns it off (as http-backend)
     const configured = handlerFor({
       ...repository,
-      config: configOf({ "http.getanyfile": "true" }),
+      config: configOf({ "http.getanyfile": "false" }),
     });
-    expect((await get(configured.handler, "/repo.git/info/refs")).status).toBe(200);
+    expect((await get(configured.handler, "/repo.git/info/refs")).status).toBe(403);
+    expect((await get(configured.handler, "/repo.git/HEAD")).status).toBe(403);
     // the operator's false wins over the repository's true
     const closed = handlerFor(
       { ...repository, config: configOf({ "http.getanyfile": "true" }) },
@@ -247,6 +251,9 @@ describe("createServedFetchHandler: the dumb protocol off by default, hidden ref
     );
     expect((await get(closed.handler, "/repo.git/HEAD")).status).toBe(403);
     expect((await get(closed.handler, "/repo.git/info/refs")).status).toBe(403);
+    // a repository without files (a key-value store): its object files are a 404
+    expect((await get(handler, "/repo.git/objects/info/packs")).status).toBe(404);
+    expect((await get(handler, `/repo.git/objects/ab/${"c".repeat(38)}`)).status).toBe(404);
   });
 
   it("info/refs hides what upload-pack hides; refused where upload-pack is not served", async () => {
@@ -394,5 +401,118 @@ describe("createServedFetchHandler: decoded paths, failures", () => {
       { http: true, remoteUser: "alice", remoteAddr: "10.0.0.7" },
       { user: "alice", addr: "10.0.0.7" },
     ]);
+  });
+});
+
+describe("createServedFetchHandler: dumb files and content types (as git http-backend)", () => {
+  const enc = new TextEncoder();
+  const LOOSE = `objects/ab/${"c".repeat(38)}`;
+  const PACK = `pack-${"1".repeat(40)}`;
+  const LONELY = `pack-${"2".repeat(40)}`;
+
+  async function storage() {
+    const files = createSymlinkFilesApi(createInMemoryFilesApi());
+    await files.write(`/srv/repo.git/${LOOSE}`, [enc.encode("loose bytes")]);
+    await files.write(`/srv/repo.git/objects/pack/${PACK}.pack`, [enc.encode("PACK")]);
+    await files.write(`/srv/repo.git/objects/pack/${PACK}.idx`, [enc.encode("IDX")]);
+    // an index without its pack is no pack (add_packed_git)
+    await files.write(`/srv/repo.git/objects/pack/${LONELY}.idx`, [enc.encode("IDX")]);
+    await files.write("/srv/repo.git/objects/info/alternates", [enc.encode("../other\n")]);
+    await files.write("/srv/secret", [enc.encode("secret")]);
+    return files;
+  }
+
+  it("serves objects/info/packs, loose objects, packs and alternates with http-backend's headers", async () => {
+    const files = await storage();
+    const { repository } = await setup({ files: servedGitFilesOf(files, "/srv/repo.git") });
+    const { handler } = handlerFor(repository);
+
+    const packs = await get(handler, "/repo.git/objects/info/packs");
+    expect(packs.status).toBe(200);
+    expect(packs.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(packs.headers.get("cache-control")).toBe("no-cache, max-age=0, must-revalidate");
+    expect(await packs.text()).toBe(`P ${PACK}.pack\n\n`);
+
+    const loose = await get(handler, `/repo.git/${LOOSE}`);
+    expect(loose.status).toBe(200);
+    expect(loose.headers.get("content-type")).toBe("application/x-git-loose-object");
+    expect(loose.headers.get("cache-control")).toBe("public, max-age=31536000");
+    expect(loose.headers.get("content-length")).toBe("11");
+    expect(await loose.text()).toBe("loose bytes");
+    const date = Date.parse(loose.headers.get("date") ?? "");
+    const expires = Date.parse(loose.headers.get("expires") ?? "");
+    expect(expires - date).toBe(31536000 * 1000);
+
+    const pack = await get(handler, `/repo.git/objects/pack/${PACK}.pack`);
+    expect(pack.headers.get("content-type")).toBe("application/x-git-packed-objects");
+    expect(await pack.text()).toBe("PACK");
+    const idx = await get(handler, `/repo.git/objects/pack/${PACK}.idx`);
+    expect(idx.headers.get("content-type")).toBe("application/x-git-packed-objects-toc");
+
+    const alternates = await get(handler, "/repo.git/objects/info/alternates");
+    expect(alternates.headers.get("content-type")).toBe("text/plain");
+    expect(alternates.headers.get("pragma")).toBe("no-cache");
+    expect(await alternates.text()).toBe("../other\n");
+
+    // missing: a 404 without body
+    for (const path of [
+      "/repo.git/objects/info/http-alternates",
+      `/repo.git/objects/pack/${LONELY}.pack`,
+      `/repo.git/objects/ab/${"d".repeat(38)}`,
+    ]) {
+      const missing = await get(handler, path);
+      expect(missing.status, path).toBe(404);
+      expect(await missing.text()).toBe("");
+    }
+    // not in http-backend's table (upper case, short names): 404
+    expect((await get(handler, `/repo.git/objects/AB/${"c".repeat(38)}`)).status).toBe(404);
+    expect((await get(handler, "/repo.git/objects/ab/cd")).status).toBe(404);
+  });
+
+  it("a file whose link leads outside the git directory is not served", async () => {
+    const files = await storage();
+    const link = `/srv/repo.git/objects/ab/${"e".repeat(38)}`;
+    await files.symlink?.(enc.encode("../../../secret"), link);
+    expect((await files.lstat?.(link))?.kind).toBe("symlink");
+    const { repository } = await setup({ files: servedGitFilesOf(files, "/srv/repo.git") });
+    const { handler } = handlerFor(repository);
+    expect((await get(handler, `/repo.git/objects/ab/${"e".repeat(38)}`)).status).toBe(404);
+  });
+
+  it("http.getanyfile=false refuses the files (403); upload-pack off refuses them too", async () => {
+    const files = await storage();
+    const { repository } = await setup({
+      files: servedGitFilesOf(files, "/srv/repo.git"),
+      config: configOf({ "http.getanyfile": "false" }),
+    });
+    expect((await get(handlerFor(repository).handler, `/repo.git/${LOOSE}`)).status).toBe(403);
+    const { repository: noUpload } = await setup({
+      files: servedGitFilesOf(files, "/srv/repo.git"),
+      config: configOf({ "http.uploadpack": "false" }),
+    });
+    expect((await get(handlerFor(noUpload).handler, `/repo.git/${LOOSE}`)).status).toBe(403);
+  });
+
+  it("a POST of the wrong Content-Type is 415, after the service check", async () => {
+    const { repository } = await setup();
+    const { handler } = handlerFor(repository, { remoteUser: () => "alice" });
+    const wrong = await post(handler, "/repo.git/git-upload-pack", new Uint8Array(0), {
+      "content-type": "text/plain",
+    });
+    expect(wrong.status).toBe(415);
+    expect(wrong.headers.get("cache-control")).toBe("no-cache, max-age=0, must-revalidate");
+    expect(await wrong.text()).toBe(
+      "Expected POST with Content-Type 'application/x-git-upload-pack-request', but received 'text/plain' instead.\n",
+    );
+    const receive = await post(handler, "/repo.git/git-receive-pack", new Uint8Array(0), {
+      "content-type": "application/x-git-upload-pack-request",
+    });
+    expect(receive.status).toBe(415);
+    // a service not enabled is refused before its type is looked at
+    const anonymous = handlerFor(repository).handler;
+    const refused = await post(anonymous, "/repo.git/git-receive-pack", new Uint8Array(0), {
+      "content-type": "text/plain",
+    });
+    expect(refused.status).toBe(403);
   });
 });
