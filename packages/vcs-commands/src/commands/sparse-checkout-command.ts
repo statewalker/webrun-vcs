@@ -507,8 +507,11 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
   /**
    * sparse_checkout_clean (git 2.5x): every directory the index collapses to a sparse
    * directory (`convert_to_sparse` in memory, whatever `index.sparse` says) is removed with
-   * all it holds, untracked and ignored files too; a directory missing from the worktree, or
-   * reached through a symbolic link, is passed over.
+   * all it holds, untracked and ignored files too; a directory missing from the worktree is
+   * passed over. A sparse directory that is a symbolic link in the worktree is passed over
+   * too, where git follows it (`remove_dir_recursively` of the path) and empties the
+   * directory it points to, which may lie outside the worktree: ours keeps that data, the
+   * safer choice.
    */
   private async clean(rest: string[]): Promise<number> {
     const state = this.runState();

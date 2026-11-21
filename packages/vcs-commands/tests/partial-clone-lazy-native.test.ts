@@ -1002,6 +1002,10 @@ describeGit("partial clones with lazy fetch, as native git", () => {
         git(work, "add", "-A");
         gitOut(root, work, ["commit", "-qm", `r${round}`], commitEnv(round + 1));
       }
+      // an annotated tag of an old commit, one of a tree and one of a blob no longer in HEAD
+      gitOut(root, work, ["tag", "-a", "-m", "v1", "v1", "HEAD~2"], commitEnv(9));
+      gitOut(root, work, ["tag", "-a", "-m", "tree", "treetag", "HEAD~1^{tree}"], commitEnv(9));
+      gitOut(root, work, ["tag", "-a", "-m", "blob", "blobtag", "HEAD~3:c/v.txt"], commitEnv(9));
       const bare = join(srv, "backfill.git");
       git(root, "clone", "-q", "--bare", "--no-local", work, bare);
       git(bare, "config", "uploadpack.allowFilter", "true");
@@ -1105,6 +1109,82 @@ describeGit("partial clones with lazy fetch, as native git", () => {
       const { t } = await compare(["--min-batch-size=2"], (c) => c.setMinBatchSize(2), sparse);
       expect(objectsOf(t.dir).some((id) => id.startsWith("?"))).toBe(true);
       await compare(["--no-sparse"], (c) => c.setSparse(false), sparse);
+    });
+
+    it("an annotated tag is peeled: v1 walks its commit, v1..main and main ^v1 exclude it", async () => {
+      const { mine } = await compare(["v1"], (c) => c.addRevision("v1"));
+      expect(mine.length).toBe(1);
+      await compare(["--min-batch-size=2", "v1..main"], (c) =>
+        c.setMinBatchSize(2).addRevision("v1..main"),
+      );
+      await compare(["main", "^v1"], (c) => c.setArguments(["main", "^v1"]));
+      await compare(["--no-include-edges", "main", "--not", "v1"], (c) =>
+        c.setArguments(["--no-include-edges", "main", "--not", "v1"]),
+      );
+    });
+
+    it("a tree revision with a path is walked from there; a blob with a path is fetched", async () => {
+      const { mine } = await compare(["HEAD~2:a"], (c) => c.addRevision("HEAD~2:a"));
+      expect(mine.length).toBe(1);
+      await compare(["HEAD~3:b", "HEAD~1"], (c) => c.setArguments(["HEAD~3:b", "HEAD~1"]));
+      // the blob is missing: parse_object fetches it lazily, alone
+      await compare(["HEAD~3:a/x.txt"], (c) => c.addRevision("HEAD~3:a/x.txt"));
+      // a tree by id alone, or through a tag, is not walked; a tagged blob is fetched
+      await compare(["treetag", "HEAD~1^{tree}"], (c) =>
+        c.setArguments(["treetag", "HEAD~1^{tree}"]),
+      );
+      await compare(["blobtag"], (c) => c.addRevision("blobtag"));
+      // an excluded blob is parsed (fetched) all the same, and excludes nothing
+      await compare(["--min-batch-size=4", "main", "^HEAD~3:a/x.txt"], (c) =>
+        c.setArguments(["--min-batch-size=4", "main", "^HEAD~3:a/x.txt"]),
+      );
+    });
+
+    it("--all walks every ref and HEAD", async () => {
+      const { mine } = await compare(["--all"], (c) => c.setAll(true));
+      expect(mine.length).toBeGreaterThan(0);
+      await compare(["--min-batch-size=3", "--all", "--not", "v1"], (c) =>
+        c.setMinBatchSize(3).setArguments(["--all", "--not", "v1"]),
+      );
+    });
+
+    it("-- <path> limits the walk to the history and blobs of those paths", async () => {
+      const { mine } = await compare(["--", "a"], (c) => c.addPath("a"));
+      expect(mine.length).toBe(1);
+      await compare(["--min-batch-size=1", "--", "b/sub", "top.txt"], (c) =>
+        c.setArguments(["--min-batch-size=1", "--", "b/sub", "top.txt"]),
+      );
+      await compare(["HEAD~2..HEAD", "--", "b/"], (c) =>
+        c.addRevision("HEAD~2..HEAD").addPath("b/"),
+      );
+      await compare(["v1", "--", "c"], (c) => c.setArguments(["v1", "--", "c"]));
+    });
+
+    it("refuses what git refuses with git's message, and the rev-list options ours lacks", async () => {
+      const t = await backfillTwins();
+      for (const args of [
+        ["nosuch"],
+        ["nosuch", "--"],
+        ["HEAD:nosuch"],
+        ["-S", "x"],
+        ["--diff-filter=M"],
+        ["--follow", "--", "a"],
+      ]) {
+        const r = await gitAsync(root, t.theirs, ["backfill", ...args]);
+        const result = await (await reopen(t.dir)).backfill().setArguments(args).call();
+        expect({ exit: result.exitCode, stderr: result.stderr }, args.join(" ")).toEqual({
+          exit: r.status,
+          stderr: r.stderr,
+        });
+        expect(result.batches).toEqual([]);
+      }
+      // accepted by git, refused by ours rather than ignored
+      for (const args of [["--since=1"], ["--max-count=1"], ["--branches"], ["--", "a/*"]]) {
+        const result = await (await reopen(t.dir)).backfill().setArguments(args).call();
+        expect(result.exitCode, args.join(" ")).toBe(128);
+        expect(result.stderr).toMatch(/^fatal: .*not supported by backfill/);
+        expect(result.batches).toEqual([]);
+      }
     });
 
     it("2.43 has no backfill command", async () => {

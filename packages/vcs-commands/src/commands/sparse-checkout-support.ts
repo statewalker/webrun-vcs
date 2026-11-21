@@ -608,9 +608,10 @@ export async function updateSparsity(
 /**
  * git's `clean_tracked_sparse_directories` after `update_sparsity` (cone mode only, an index
  * without unmerged entries): each top-most directory outside the cone whose entries are all
- * skip-worktree, none a submodule or intent-to-add (what `convert_to_sparse` collapses) is removed with
- * what is left in it when that is only ignored files, else warned about. A directory reached
- * through a symbolic link is never entered. Returns git's warning lines.
+ * skip-worktree, none a submodule and none below a directory holding an intent-to-add entry
+ * (what `convert_to_sparse` collapses, `sparseDirectoriesOf`) is removed with what is left
+ * in it when that is only ignored files, else warned about. A directory reached through a
+ * symbolic link is never entered. Returns git's warning lines.
  */
 export async function cleanTrackedSparseDirectories(
   ctx: { worktree?: Worktree; staging: Staging },
@@ -640,10 +641,14 @@ export async function cleanTrackedSparseDirectories(
 /**
  * The sparse directories git's `convert_to_sparse` (`SPARSE_INDEX_MEMORY_ONLY` too) makes of
  * a full index under cone-mode `patterns`: top-down, each directory outside the cone whose
- * entries are all skip-worktree, merged, no gitlink and not intent-to-add (an intent-to-add
- * entry leaves every cache-tree node above it invalid), with a trailing slash, in index
- * order. Undefined where git does not convert: no entries, an unmerged entry, patterns not
- * of the cone's shape.
+ * entries are all skip-worktree, merged and no gitlink, with a trailing slash, in index
+ * order. git converts over a cache-tree computed for the index itself (`cache_tree_update`
+ * unless fully valid), so the only invalid nodes are the directories holding an
+ * intent-to-add entry anywhere below them (`update_one` invalidates up to the root), and
+ * `convert_to_sparse_rec` copies an invalid node entry by entry without recursing: no
+ * directory at or below such a directory collapses (the root's own validity is never
+ * checked). Undefined where git does not convert: no entries, an unmerged entry, patterns
+ * not of the cone's shape.
  *
  * @example
  * ```typescript
@@ -659,6 +664,8 @@ export function sparseDirectoriesOf(
   }
   // the directories holding an entry that keeps them from being collapsed
   const blocked = new Set<string>();
+  // the directories whose cache-tree node is invalid: an intent-to-add entry below them
+  const invalid = new Set<string>();
   const dirs: string[] = [];
   const seen = new Set<string>();
   for (const entry of entries) {
@@ -670,14 +677,23 @@ export function sparseDirectoriesOf(
         dirs.push(dir);
       }
       if (stays) blocked.add(dir);
+      if (entry.intentToAdd) invalid.add(dir);
     }
   }
+  // the directory or one of its ancestors (the root aside) is an invalid node, which
+  // convert_to_sparse_rec copies entry by entry and never enters
+  const underInvalid = (dir: string) => {
+    for (let k = dir.indexOf("/"); k > 0; k = dir.indexOf("/", k + 1)) {
+      if (invalid.has(dir.slice(0, k + 1))) return true;
+    }
+    return false;
+  };
   // convert_to_sparse_rec: the first directory outside the cone that can be collapsed
   // stands for everything beneath it
   const sparseDirs: string[] = [];
   for (const dir of dirs) {
     if (sparseDirs.some((d) => dir.startsWith(d))) continue;
-    if (blocked.has(dir) || patterns.includes(dir)) continue;
+    if (blocked.has(dir) || patterns.includes(dir) || underInvalid(dir)) continue;
     sparseDirs.push(dir);
   }
   return sparseDirs;

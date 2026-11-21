@@ -1209,3 +1209,80 @@ describeGit("git sparse-checkout clean against native git", () => {
     expect(existsSync(join(ours, "k/a"))).toBe(true);
   });
 });
+
+describeGit(
+  "sparse-checkout clean and reapply below an intent-to-add entry, against native git",
+  () => {
+    beforeAll(() => {
+      root = mkdtempSync(join(tmpdir(), "sparse-clean-ita-"));
+    });
+    afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+    /**
+     * A cone of k with an intent-to-add s/ita (s/ and the root invalid in git's cache-tree),
+     * an untracked s/t/untracked and an ignored s/t/x.o below the candidate s/t/; u/ stays a
+     * sparse directory with an ignored u/y.o.
+     */
+    function itaAbove(dir: string) {
+      base(dir);
+      put(dir, ".gitignore", "*.o\n");
+      gitOk(root, dir, "add", ".gitignore");
+      gitOk(root, dir, "commit", "-q", "-m", "ignore");
+      run(dir, ["sparse-checkout", "set", "k"]);
+      put(dir, "s/ita", "i\n");
+      gitOk(root, dir, "add", "--sparse", "-N", "s/ita");
+      put(dir, "s/t/untracked", "precious\n");
+      put(dir, "s/t/x.o", "o\n");
+      put(dir, "u/y.o", "o\n");
+    }
+
+    it.skipIf(version === "2.43")(
+      "clean never collapses a directory below one holding an intent-to-add entry",
+      async () => {
+        const { native, ours } = twins(itaAbove);
+        await twinSparse(native, ours, ["clean", "-n"]);
+        await twinSparse(native, ours, ["clean", "-n", "-v"]);
+        await twinSparse(native, ours, ["clean", "-f"]);
+        expect(readFileSync(join(ours, "s/t/untracked"), "utf8")).toBe("precious\n");
+        expect(existsSync(join(ours, "u"))).toBe(false);
+      },
+    );
+
+    it.skipIf(version === "2.43")(
+      "clean: a sibling of a directory holding an intent-to-add entry stays when their parent holds it too",
+      async () => {
+        const { native, ours } = twins((dir) => {
+          base(dir);
+          put(dir, "s/x/f", "f\n");
+          gitOk(root, dir, "add", "s/x/f");
+          gitOk(root, dir, "commit", "-q", "-m", "x");
+          run(dir, ["sparse-checkout", "set", "k"]);
+          // s/t/ita: s/ and s/t/ invalid, so s/x/ (valid itself) is never reached
+          put(dir, "s/t/ita", "i\n");
+          gitOk(root, dir, "add", "--sparse", "-N", "s/t/ita");
+          put(dir, "s/x/left", "l\n");
+          put(dir, "u/left", "l\n");
+        });
+        await twinSparse(native, ours, ["clean", "-n"]);
+        await twinSparse(native, ours, ["clean", "-f"]);
+      },
+    );
+
+    // 2.43's convert_to_sparse_rec lacks the invalid-node check (a span of -1 walks back over
+    // the entries it rewrites: s/ warned about four times, removed with s/ita when nothing
+    // untracked is left); ours keeps 2.5x's rule in both
+    it.skipIf(version === "2.43")(
+      "reapply keeps a directory below one holding an intent-to-add entry",
+      async () => {
+        const { native, ours } = twins(itaAbove);
+        await twinSparse(native, ours, ["reapply"]);
+        expect(readFileSync(join(ours, "s/t/untracked"), "utf8")).toBe("precious\n");
+        // only ignored files left below s/t/: still kept, as git keeps them
+        for (const dir of [native, ours]) rmSync(join(dir, "s/t/untracked"));
+        await twinSparse(native, ours, ["reapply"]);
+        expect(readFileSync(join(ours, "s/t/x.o"), "utf8")).toBe("o\n");
+        await twinSparse(native, ours, ["set", "k"]);
+      },
+    );
+  },
+);
