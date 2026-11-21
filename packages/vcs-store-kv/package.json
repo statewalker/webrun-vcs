@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-store-kv",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Key-value storage backend for StateWalker VCS",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"

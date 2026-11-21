@@ -1,7 +1,0 @@
----
-"@statewalker/vcs-working-tree": minor
-"@statewalker/vcs-store-files": minor
-"@statewalker/vcs-commands": minor
----
-
-Read and write git's split index (`link`) and sparse index (`sdir`) as git does. A split index is merged with its `sharedindex.<id>` on read and written split again (`core.splitIndex`, a new shared index past `splitIndex.maxPercentChange`, old ones removed per `splitIndex.sharedIndexExpire`, modes per `core.sharedRepository`), the same edits giving the index and shared index bytes native git writes; `core.splitIndex=false` writes it whole. A sparse index is expanded on read and collapsed on write when `index.sparse`, cone mode and the entries allow it (`convert_to_sparse`), with its `TREE` and `sdir` extensions. `sparse-checkout --sparse-index` now records `index.sparse=true` and converts the index (`--no-sparse-index` expands it, with git 2.5x's `advice.sparseIndexExpanded` hint), writing `config.worktree` only once the worktree config is on. Stagings take an `IndexHost` (`setIndexHost`), report `indexLayout()` and can `holdWrites()`; gc and fsck read split and sparse indexes (`readIndexFileEntries`). Other required extensions are still refused. A sparse directory is only ever written as the tree its entries make (an intent-to-add entry below keeps it expanded, a stale cache-tree is computed again), `core.splitIndex=true` on a sparse index fails with git's `cannot use split index with a sparse index`, and a linked worktree's sparse index is read with the repository's trees.

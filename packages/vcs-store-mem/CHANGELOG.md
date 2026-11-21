@@ -1,5 +1,157 @@
 # @statewalker/vcs-store-mem
 
+## 0.6.0
+
+### Minor Changes
+
+- 8a603c0: **Status detects renames and reads submodules as git; `clean -X`; racy smudging on every staging store.**
+  
+  - **vcs-commands (behaviour change):** `git.status()` detects renames as git's default `status.renames=true`: a path removed from the index paired with one added to it is one entry `R  old -> new` (porcelain v2 `2 R. ... R<score> new<TAB>old`), a path deleted from the worktree paired with an intent-to-add file is ` R old -> new`; untracked files are never paired. Scores and pairing follow git's `diffcore_rename` (exact renames, unique basenames at 75%, then the best pairs at 50%, `diff.renameLimit`/`status.renameLimit`, default 1000). `status.renames` (else `diff.renames`) and new `setRenames(boolean)` (`--[no-]renames`) and `setRenameLimit(n)` control it. New `Status.renamed` (new path to old path), `StatusFileEntry.renamedFrom`/`renameScore`/`intentToAdd`, status code `R`. The paths stay in `added`/`removed`/`missing` too.
+  - **vcs-commands (behaviour change):** a populated submodule's own index and worktree are read (as git's `is_submodule_modified`): tracked changes inside show ` M sub` with v2 `S.M.`, untracked files `S..U`, with a new commit `SCMU`; nested submodules count as git counts them. `diff.ignoreSubmodules`, `submodule.<name>.ignore` (config, then `.gitmodules`) and new `setIgnoreSubmodules("none" | "untracked" | "dirty" | "all")` (`--ignore-submodules`) behave as git; `setUntracked(false)` also stops looking for untracked files inside submodules. New `StatusFileEntry.submoduleModified`/`submoduleUntracked`, exported `submoduleToken()`.
+  - **vcs-commands:** new `CleanCommand.setIgnoredOnly(true)` is `git clean -X`: only ignored files go (with `-d`, ignored directories and directories holding only ignored content, as git; path filters as git's).
+  - **vcs-commands:** stash apply's rename detection uses the same git-exact detection (`detectRenames`, git's similarity estimate).
+  - **vcs-store-files:** an absolute submodule gitdir (`gitdir: /abs/.git/modules/sub`, older git, `--separate-git-dir`) inside the FilesApi's root directory is read (status sees its commit and content; `clean -d` removes a directory whose absolute gitfile names a place without HEAD); outside the root it stays unreadable (shown clean, kept by clean). New `FileWorktree.openGitlink(path)` opens a populated submodule as a working copy through the same FilesApi.
+  - **vcs-working-tree:** new optional `Worktree.openGitlink(path)`.
+  - **vcs-utils:** new optional `PosixFilesApi.rootDirectory` (the real directory a local FilesApi is rooted at), which `PosixNodeFilesApi` already exposes.
+  - **vcs-store-mem, vcs-store-kv, vcs-store-sql:** the staging stores implement `setRacyCheck`: every write (editor, builder, `write()`) smudges racily clean entries that changed (size 0) against the time of the store's previous write, as `GitStaging`/`FileStagingStore` do. The KV and SQL stores keep that time with their entries (`staging:__meta__`; new SQL migration 8, `staging_meta`) and `read()` restores it.
+
+### Patch Changes
+
+- eadd78c: **`commit --only` takes the listed paths literally under the index lock, and no staging writes a tree with two entries of one name.**
+  
+  - **vcs-commands:** `commit --only` lists paths as git's `list_paths` (pathspec magic and globs such as `d/`, `*.md`, `:(glob)d/**`, `:!d/x`, `./a`, matched against the index and HEAD, each element reported when it matches nothing) and takes each one as `add_remove_files` does: a file staged, a path gone removed, and a path that is now a directory refused before anything changes (`'a' does not have a commit checked out`), where it used to leave both `a` and `a/inner` staged and commit a corrupt tree. A glob character in a path no longer stages untracked files it happens to match.
+  - **vcs-commands:** `commit --only` and `commit -a` hold `index.lock` from before they edit the index until HEAD has moved, as git does: the new index goes into the lock and is renamed over the index after the ref update; a concurrent writer is refused meanwhile, and a failed commit leaves the index (and the instance's unwritten edits) as they were.
+  - **vcs-commands:** `add` replaces the entries a new one clashes with as a file or a directory (git's `check_file_directory_conflict`: adding `a/b` removes `a`, adding `a` removes `a/...`), and a path given an entry or removed has its cache-tree path invalidated as git's index edits do, so `TREE` matches git's byte for byte while conflicts remain.
+  - **vcs-working-tree:** `Staging.lockIndex()` (optional; `GitStaging` and `FileStagingStore` implement it) holds the index lock for a write committed or rolled back later, on top of `IndexFile.lock()`. `verifyTreePaths` refuses a file that is also a directory ("You have both a and a/b"), checked by every staging's `writeTree`. `RemoveStagingStages` is the edit `IndexEditor.remove(path, stage)` records. A cache-tree set with `setCacheTree` is what `getCacheTree` returns until the write.
+  - **vcs-store-files, vcs-store-mem, vcs-store-kv, vcs-store-sql:** `removeEntry(path, stage)` and `editor.remove(path, stage)` remove only that stage, and `editor.remove(path)` every stage of a conflicted path.
+  - **Tests:** the staging suite (vcs-testing) checks stage-specific removal and the file/directory refusal of `writeTree`, and runs for `FileStagingStore` and `GitStaging` too.
+- eadd78c: **Index flags and the cache-tree survive index rewrites as in git, and more sequencer leftovers match git.**
+  
+  - `reset --hard`, `reset --mixed`, `checkout -f`, `reset --merge`/`--keep` and the autostash reset of `merge --autostash` and rebase keep skip-worktree and assume-unchanged flags as unpack-trees does. An entry the target leaves unchanged keeps its flags. A changed entry keeps its skip-worktree bit. A skip-worktree file the tree keeps is not written. Before this, `git ls-files -v` showed every flag dropped. `Staging.readTree` takes `keepMatching` (`true` keeps the old entry, `"flags"` keeps only its flags) for this one-way merge.
+  - An entry whose flags cheat is checked against its file by its stat, as git's `verify_uptodate_1` does. `reset --hard` and `checkout -f` refuse such an entry when they would change or delete it over a changed file ("Entry 'f' not uptodate. Cannot merge."). A branch switch refuses an assume-unchanged file whose stat changed, even when its content did not.
+  - `stash apply --index` applies the stash's index as git does: a `diff-tree --binary` of it, run through `apply --cached`. A hunk whose context the index no longer has now fails with "error: patch failed: ...", "patch does not apply" and "conflicts in index. Try without --index.", where we used to merge it.
+  - `am --skip` cleans the index as git's `clean_index` does (the same as `am --abort`): a refusal ends with "failed to clean index", and a merge state left behind is removed.
+  - The cache-tree (`TREE`) now survives index edits as in git. When entries change, the paths that changed go invalid and every other directory stays valid. Before this, the whole extension was dropped. So a commit after an edit keeps an untouched subtree stored as 100664, and the commit ids match native git. `commit` writes the index with a fully valid cache-tree (git's `prepare_index`), and `checkout`, `reset --merge` and `reset --keep` update it before they write (`cache_tree_update` with `WRITE_TREE_REPAIR`). The `TREE` bytes match native git's.
+  - `verifyCacheTree` (vcs-working-tree) checks that every valid cache-tree node describes the index entries below it, for tests and fsck.
+- eadd78c: **`add -N` no longer turns a tracked file into a deletion, and `commit --only` commits what git commits.**
+  
+  - **vcs-commands:** `add -N` leaves a path with a stage-0 entry (tracked or already intent-to-add) as it is, as git's `ADD_CACHE_NEW_ONLY`; before, a tracked file became an empty intent-to-add entry and the next commit deleted it. A conflicted path still has its stages replaced, as git does.
+  - **vcs-commands:** `commit --only <paths>` is git's partial commit: the paths the given ones name in the index or HEAD are taken from the worktree (cleaned; a file gone removed, an intent-to-add file with its content) into the index and into HEAD's tree, which is committed; the index keeps its other staged changes and is written once the commit is made. A path nothing knows fails with git's `pathspec ... did not match`, a partial commit during a merge, cherry-pick or rebase is refused, other unmerged paths do not stop it, and an amend starts from HEAD.
+  - **vcs-commands:** every index-writing command (add, rm, commit, reset, checkout, switch, merge, cherry-pick, revert, rebase, am, pull, stash push/apply, apply `--index`/`--cached`, and clean for reading) reads the index again at its start when another writer replaced it, as git does, and refuses with `IndexChangedError` before touching anything only when the instance holds unwritten edits. `commit` now re-reads instead of refusing.
+  - **vcs-working-tree, vcs-store-files, vcs-store-mem, vcs-store-kv, vcs-store-sql:** the stagings' builders and editors copy the whole stat data of an entry (nanoseconds, uid, gid), so an index rewritten around a few paths (`rm` of many entries, `commit --only`) no longer leaves the others stat-dirty. `Staging.hasUnwrittenChanges()` (optional) tells whether an instance holds edits made since it read or wrote the index.
+- eadd78c: **A staged deletion survives `stash apply --index`, and `rm` keeps the flags of the other entries.**
+  
+  - `stash apply --index` could write a cache-tree that no longer described the index: a path removed from the index outside the merged paths stayed in a valid directory node, and the next commit (ours or native git's) put the deleted file back. The index it leaves now has git's fully valid cache-tree (`reset_tree`'s `cache_tree_update`).
+  - A cache-tree set with `setCacheTree` no longer goes stale when entries change before the write. The staging records the entries it describes, and the write invalidates every path that changed since, as it already did for the cache-tree read from the index.
+  - Intent-to-add entries are left out of every tree, as git's `update_one` leaves them out, even when they are also skip-worktree. Before this, `git add -N new; git update-index --skip-worktree new` committed `new` as an empty file.
+  - `rm` keeps the other entries as they are. Before this, it rebuilt them from path, mode and id: intent-to-add entries became real entries naming a blob never written, and skip-worktree, assume-unchanged and the stat data were dropped. `commit --only` also gives the index its own entries back once it has written its tree.
+  - `commit` refuses an index that another writer replaced since this instance read it (`IndexChangedError`), as index writes do, instead of committing the stale entries.
+  - `rebase` goes on over a dirty assume-unchanged or skip-worktree file, as git's `require_clean_work_tree` does. The stat check of flagged entries counts an intent-to-add entry as changed and finds no racy entry in an index without a timestamp, as git's `ie_match_stat` does.
+- c80355f: **Merge, rebase, cherry-pick and revert do work proportional to what they change, not to the repository.** Output is unchanged; in a repository of 5000 files on the files backend a merge of five changes a side goes from about 1.1 s to about 0.3 s, a 200-commit rebase from 58 s to 10 s, and a rebase onto 1000 upstream commits from 7.6 s to 1.9 s.
+  
+  - **vcs-commands:** a merge over stored trees reads them as git's merge-ort does: a directory all three trees hold with the same id is one entry, never read (`prunedFlatTrees`), and a directory taken whole from one side is that side's tree. Only when directory renames are found (or the base is a virtual merge of several bases) are the whole trees merged, as before. The result is stored by rewriting only the changed directories, HEAD and the result are compared by tree ids (`treeDelta`), so only the paths that change are checked against the index and worktree and written, and "the index matches HEAD" compares tree ids computed from the index (as git's cache-tree) instead of reading HEAD's whole tree. A worktree file whose stat matches its index entry, on an entry older than the index (not racy), is no longer hashed (git's `ie_match_stat`); the clean-worktree check of a rebase stats files several at a time. The index is read and rewritten without an await per entry.
+  - **vcs-core:** trees are cached by id once read or stored (and concurrent reads of one tree read it once), commits once parsed. The caches never serve an object the store no longer holds: the stores report each object removal (`noteObjectRemoved`, a process-wide `objectRemovalEpoch`), and a cache hit read before the last removal is checked with `objects.has` first, so a tree or commit that gc, prune, a repack or a discarded quarantine removed in the same process reads as absent on every backend; decoding and encoding trees no longer re-encode names per comparison or convert ids through regular expressions. Pack reads go through a shared cache of 64 KiB windows (long entries still stream from the file). A write of an object held in memory is hashed first and skipped when the object is already stored (git's `freshen_object`); `StagingBlobStore.isFresh` (optional) tells the object kernel.
+  - **vcs-commands, the index as git leaves it:** merge, cherry-pick, revert and rebase write the cache-tree (`TREE` extension) unpack-trees writes, from the index's own cache-tree with only the changed directories computed again (conflicted paths and the directories of intent-to-add entries invalid); a refused merge leaves the index restore_state leaves. An entry the merge updates keeps its skip-worktree bit. `cherry-pick -n` and `revert -n` rewrite the index as git's `write_index_as_tree` does when its cache-tree is not fully valid, so an entry as new as the rewritten index is racy and a same-size local edit behind a matching stat is refused, as git refuses it; the stat-match skip trusts a matching stat only on an entry older than the index (an exact stat match on a racy entry is read too). A refused merge drops the change of an assume-unchanged file, as restore_state's `reset --hard` does.
+  - **vcs-working-tree:** the index is written in version 3 exactly when an entry has an extended flag (skip-worktree, intent-to-add) and in version 2 otherwise, and only such entries carry the extended flags word (git's `do_write_index`); the cache-tree is read and written (`CacheTree`, `cacheTreeOfTree`, `updateCacheTree`, `Staging.getCacheTree` / `setCacheTree`, optional). The tree of an index leaves out its intent-to-add entries, as git's write-tree (also in the memory, KV and SQL stagings). An index rewrite encodes only the entries that changed (the bytes of an unchanged entry are reused) and compares entries instead of hashing them to decide whether the cache-tree survives; the checksum is converted to hex once. `Staging.entryList()` (optional) gives every entry at once.
+  - **vcs-store-files:** a loose object is read without checking first that its file exists, a ref without an extra existence check (a files API whose read throws for a missing file still reads it as absent), and the index builder's stage check is linear.
+  - **vcs-utils:** `bytesToHex` uses a lookup table.
+- 1efa875: **Paths that are not UTF-8 in pattern files, patches, command text and the SQL store, as in git.**
+  
+  - **vcs-utils:** `decodeGitPatternFile` reads a pattern file as git does (bytes through `decodeGitPath`, a leading BOM skipped); `unquoteGitPath` is git's `unquote_c_style` on bytes. The patch parser reads C-quoted names (`"a/caf\351.txt"`, in `diff --git`, `---`/`+++`, `rename`/`copy` lines and `diff --cc`) and raw names (`core.quotePath=false`) as the paths trees and the index hold, and splits two unquoted names with spaces where both halves name the same path, as `git apply` does.
+  - **vcs-working-tree, vcs-store-files:** `.gitignore`, `info/exclude`, `core.excludesFile` and `.gitattributes` keep their bytes: a latin-1 rule (`caf\xe9.txt`, `*\xe9*`) matches the path bytes git matches, so status, clean, add and the `text`/`eol`/`ident` conversions agree with git.
+  - **vcs-commands:** `DiffCommand.callText()` and `DiffFormatter.toString()` decode the output bytes with `decodeGitPath`: a byte that is not UTF-8 is an escape instead of U+FFFD, and `encodeGitPath(text)` is `callBytes()`. `formatStatusPorcelain` takes `{ quotePath }` (`core.quotePath=false` prints the bytes) and quotes control characters with git's letters (`\r`, `\a`, ...). `diff.orderFile` patterns keep their bytes. State files (`MERGE_MSG`, ...) are written and read as bytes, so a conflicted latin-1 path is listed as git lists it, and conflict lists and the stash and sequencer path orders follow git's byte order (`compareGitPaths`).
+  - **vcs-store-sql:** paths and tree entry names in TEXT columns (`tree_entry`, `tree_delta_entry`, `staging_entry`) store a lone surrogate as U+0001 and four hex digits (`toSqlPath` / `fromSqlPath`), since drivers turn it into U+FFFD. UTF-8 names are stored unchanged, so no migration is needed. A tree rebuilt from the store keeps its id.
+  - **vcs-store-sql, vcs-store-kv, vcs-store-mem:** staging entries sort in git's byte order (`compareGitPaths`) instead of UTF-16 code units.
+- Updated dependencies [a8277da]
+- Updated dependencies [a8277da]
+- Updated dependencies [a8277da]
+- Updated dependencies [d333a4d]
+- Updated dependencies [09aa062]
+- Updated dependencies [8681320]
+- Updated dependencies [d5158af]
+- Updated dependencies [d84c354]
+- Updated dependencies [d84c354]
+- Updated dependencies [f1cab9d]
+- Updated dependencies [8a603c0]
+- Updated dependencies [8a603c0]
+- Updated dependencies [05a5cae]
+- Updated dependencies [9517fc9]
+- Updated dependencies [1777896]
+- Updated dependencies [1777896]
+- Updated dependencies [e306a5e]
+- Updated dependencies [d489ee7]
+- Updated dependencies [20c317e]
+- Updated dependencies [eadd78c]
+- Updated dependencies [21d6866]
+- Updated dependencies [e1c44ca]
+- Updated dependencies [457680a]
+- Updated dependencies [7f697fd]
+- Updated dependencies [257e9cf]
+- Updated dependencies [de6af72]
+- Updated dependencies [a8df903]
+- Updated dependencies [0a39cdc]
+- Updated dependencies [57846c3]
+- Updated dependencies [f078ebd]
+- Updated dependencies [5863bf1]
+- Updated dependencies [35239a9]
+- Updated dependencies [65474c5]
+- Updated dependencies [32f7288]
+- Updated dependencies [53ecad0]
+- Updated dependencies [bbf5ca1]
+- Updated dependencies [df0147c]
+- Updated dependencies [8a603c0]
+- Updated dependencies [eadd78c]
+- Updated dependencies [eadd78c]
+- Updated dependencies [eadd78c]
+- Updated dependencies [54f881d]
+- Updated dependencies [9cf798e]
+- Updated dependencies [7314646]
+- Updated dependencies [8329312]
+- Updated dependencies [2ce29f8]
+- Updated dependencies [2ce29f8]
+- Updated dependencies [2d0759a]
+- Updated dependencies [c80355f]
+- Updated dependencies [422447b]
+- Updated dependencies [7314646]
+- Updated dependencies [c3ee332]
+- Updated dependencies [9e462a8]
+- Updated dependencies [1efa875]
+- Updated dependencies [98be9b5]
+- Updated dependencies [87d6d55]
+- Updated dependencies [af93342]
+- Updated dependencies [d489ee7]
+- Updated dependencies [d489ee7]
+- Updated dependencies [2796b2d]
+- Updated dependencies [7c63add]
+- Updated dependencies [68ef504]
+- Updated dependencies [9234799]
+- Updated dependencies [32ab2c4]
+- Updated dependencies [68c571d]
+- Updated dependencies [f745816]
+- Updated dependencies [b7426bc]
+- Updated dependencies [d676bf4]
+- Updated dependencies [65e2515]
+- Updated dependencies [68cedb7]
+- Updated dependencies [e8828f6]
+- Updated dependencies [f62ca9b]
+- Updated dependencies [f0d8ddd]
+- Updated dependencies [8a603c0]
+- Updated dependencies [0b1ccae]
+- Updated dependencies [0b1ccae]
+- Updated dependencies [eb5ad83]
+- Updated dependencies [8a603c0]
+- Updated dependencies [7a834b2]
+- Updated dependencies [21b0bd6]
+- Updated dependencies [b31fadc]
+- Updated dependencies [5558be8]
+- Updated dependencies [c80355f]
+- Updated dependencies [35239a9]
+- Updated dependencies [819e88c]
+- Updated dependencies [0798366]
+  - @statewalker/vcs-working-tree@0.6.0
+  - @statewalker/vcs-utils@0.6.0
+  - @statewalker/vcs-core@0.6.0
+
 ## 0.5.0
 
 ### Minor Changes
