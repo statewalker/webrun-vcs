@@ -563,6 +563,12 @@ export class GitStaging implements Staging {
     if (cleared) this._entries = cleared;
   }
 
+  isUnborn(): boolean | undefined {
+    // the index file this instance last read or wrote: null when the read found none
+    const checksum = this.indexFile.currentChecksum;
+    return checksum === undefined ? undefined : checksum === null;
+  }
+
   getUpdateTime(): number {
     return this.updateTime;
   }

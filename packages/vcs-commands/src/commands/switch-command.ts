@@ -62,6 +62,7 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
   private force = false;
   private ignoreOtherWorktrees = false;
   private merge = false;
+  private compatibility: "2.43" | "2.56" = "2.56";
 
   /**
    * The branch to switch to; with `-c`/`-C` the start point, with `--detach` the commit.
@@ -175,6 +176,16 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     return this;
   }
 
+  /**
+   * The git version whose `-m` refusal this switch reproduces (default 2.56): see
+   * `CheckoutCommand.setCompatibility`.
+   */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
+
   /** `--ignore-other-worktrees`: switch to a branch another worktree has checked out. */
   setIgnoreOtherWorktrees(ignore: boolean): this {
     this.checkCallable();
@@ -271,6 +282,7 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
       .setIgnoreOtherWorktrees(this.ignoreOtherWorktrees)
       .setTrack(this.track)
       .setMerge(this.merge)
+      .setCompatibility(this.compatibility)
       .setOnlyMergeOnSwitchingBranches(true);
     if (this.guess !== undefined) checkout.setGuess(this.guess);
     if (this.hasReflogAction()) checkout.setReflogAction(this.reflogAction("checkout"));

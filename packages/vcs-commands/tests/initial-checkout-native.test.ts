@@ -458,3 +458,186 @@ async function openLinked(repo: string): Promise<Git> {
   });
   return Git.fromWorkingCopy(await linked.openCurrent());
 }
+
+/** Whether the native git on PATH is 2.43 (`checkout -m` without autostash). */
+function nativeIs243(): boolean {
+  return /^git version 2\.43\./.test(execFileSync("git", ["--version"], { encoding: "utf8" }));
+}
+
+/** Runs one of our commands: its message (result or error) and git's exit status. */
+async function outcome(
+  call: () => Promise<{ status?: unknown; message?: string; exitCode?: number }>,
+  failed: (result: { status?: unknown }) => boolean,
+): Promise<{ status: number; message: string }> {
+  try {
+    const result = await call();
+    return {
+      status: failed(result) ? (result.exitCode ?? 1) : (result.exitCode ?? 0),
+      message: result.message ?? "",
+    };
+  } catch (error) {
+    return {
+      status: (error as { exitCode?: number }).exitCode ?? -1,
+      message: (error as Error).message,
+    };
+  }
+}
+
+describeGit("an unborn index: autostash and checkout --orphan <start-point>, native twins", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "initial-checkout-native-"));
+    home = join(root, "home");
+    mkdirSync(home);
+  });
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  it("checkout -m with an untracked file in the way: no autostash (2.5x refuses as a plain switch, 2.43 dies on the staged deletions)", async () => {
+    const legacy = nativeIs243();
+    for (const command of ["checkout", "switch"] as const) {
+      const t = twins();
+      for (const repo of [t.native, t.ours]) put(repo, "o.txt", "u\n");
+      const native = attempt(t.native, command, "-m", "other");
+      const git = await open(t.ours);
+      const ours = await outcome(
+        () =>
+          command === "checkout"
+            ? git
+                .checkout()
+                .setName("other")
+                .setMerge(true)
+                .setCompatibility(legacy ? "2.43" : "2.56")
+                .call()
+            : git
+                .switch()
+                .setName("other")
+                .setMerge(true)
+                .setCompatibility(legacy ? "2.43" : "2.56")
+                .call(),
+        (r) => r.status !== CheckoutStatus.OK,
+      );
+      expect(native.status).toBe(legacy ? 128 : 1);
+      expect(ours).toEqual({ status: native.status, message: native.stderr.trimEnd() });
+      expect(ours.message).not.toContain("autostash");
+      expectSame(t);
+      expect(existsSync(join(t.ours, ".git/index"))).toBe(false);
+      expect(run(t.ours, "stash", "list")).toBe("");
+    }
+  });
+
+  it("merge --autostash and rebase --autostash with an untracked file in the way: nothing stashed", async () => {
+    const m = twins();
+    for (const repo of [m.native, m.ours]) put(repo, "o.txt", "u\n");
+    const nm = attempt(m.native, "merge", "--autostash", "origin/other");
+    const om = await outcome(
+      () =>
+        (async () => {
+          const git = await open(m.ours);
+          return git.merge().include("origin/other").setAutoStash(true).call() as Promise<{
+            status?: unknown;
+            message?: string;
+          }>;
+        })(),
+      () => true,
+    );
+    expect(nm.status).toBe(1);
+    expect(om.status).toBe(1);
+    expect(`${om.message}\n`).toContain(nm.stderr);
+    expect(om.message).not.toContain("autostash");
+    expectSame(m);
+    expect(run(m.ours, "stash", "list")).toBe("");
+
+    const r = twins();
+    for (const repo of [r.native, r.ours]) put(repo, "o.txt", "u\n");
+    const nr = attempt(r.native, "rebase", "--autostash", "origin/other");
+    const or = await outcome(
+      async () =>
+        (await open(r.ours)).rebase().setUpstream("origin/other").setAutoStash(true).call(),
+      () => true,
+    );
+    expect({ status: or.status, message: `${or.message}\n` }).toEqual({
+      status: nr.status,
+      message: nr.stderr,
+    });
+    expectSame(r);
+    expect(run(r.ours, "stash", "list")).toBe("");
+  });
+
+  it("checkout --orphan <new> <start-point> merges to the start point's tree (unborn index, index of HEAD, local changes refused)", async () => {
+    // an unborn index: the start point's tree checked out
+    const u = twins();
+    run(u.native, "checkout", "-q", "--orphan", "x", "origin/other");
+    await (await open(u.ours))
+      .checkout()
+      .setOrphan(true)
+      .setName("x")
+      .setStartPoint("origin/other")
+      .call();
+    expectSame(u);
+
+    // an index of HEAD (checked out first): a two-way merge from HEAD to the start point
+    const c = twins();
+    for (const repo of [c.native, c.ours]) run(repo, "checkout", "-q", "main");
+    put(c.native, "d/b.txt", "local\n");
+    put(c.ours, "d/b.txt", "local\n");
+    run(c.native, "checkout", "-q", "--orphan", "x", "origin/other");
+    const rc = await (await open(c.ours))
+      .checkout()
+      .setOrphan(true)
+      .setName("x")
+      .setStartPoint("origin/other")
+      .call();
+    expect(rc.status).toBe(CheckoutStatus.OK);
+    expectSame(c);
+
+    // a local change the switch would lose refuses it
+    const l = twins();
+    for (const repo of [l.native, l.ours]) {
+      run(repo, "checkout", "-q", "main");
+      put(repo, "a.txt", "dirty\n");
+    }
+    const nl = attempt(l.native, "checkout", "--orphan", "x", "origin/other");
+    expect(nl.status).toBe(1);
+    const rl = await (await open(l.ours))
+      .checkout()
+      .setOrphan(true)
+      .setName("x")
+      .setStartPoint("origin/other")
+      .call();
+    expect(rl.status).toBe(CheckoutStatus.CONFLICTS);
+    expect(rl.message).toBe(nl.stderr.trimEnd());
+    expectSame(l);
+
+    // an untracked file in the way of the unborn index's checkout
+    const t = twins();
+    for (const repo of [t.native, t.ours]) put(repo, "o.txt", "u\n");
+    const nt = attempt(t.native, "checkout", "--orphan", "x", "origin/other");
+    expect(nt.status).toBe(1);
+    const rt = await (await open(t.ours))
+      .checkout()
+      .setOrphan(true)
+      .setName("x")
+      .setStartPoint("origin/other")
+      .call();
+    expect(rt.message).toBe(nt.stderr.trimEnd());
+    expectSame(t);
+
+    // refusals before anything changes: an existing branch, a start point that is no commit
+    const r = twins();
+    for (const args of [["main", "origin/other"], ["x", "nope"], ["main"]]) {
+      const n = attempt(r.native, "checkout", "--orphan", ...args);
+      const cmd = (await open(r.ours))
+        .checkout()
+        .setOrphan(true)
+        .setName(args[0] ?? "");
+      if (args[1] !== undefined) cmd.setStartPoint(args[1]);
+      const o = await outcome(
+        () => cmd.call(),
+        (x) => x.status !== CheckoutStatus.OK,
+      );
+      expect(o).toEqual({ status: n.status, message: n.stderr.trimEnd() });
+    }
+    expectSame(r);
+  });
+});

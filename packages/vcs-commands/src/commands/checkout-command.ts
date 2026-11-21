@@ -41,6 +41,7 @@ import {
   type Ref,
 } from "@statewalker/vcs-core";
 import { type ConflictStyle, parseGitBool } from "@statewalker/vcs-utils";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
   cacheTreeOfTree,
@@ -234,7 +235,14 @@ type SwitchPlan =
       logName: string;
       tracking: CreateTracking;
     }
-  | { kind: "orphan"; branch: string; targetId?: undefined; logName: string }
+  | {
+      kind: "orphan";
+      branch: string;
+      targetId?: undefined;
+      logName: string;
+      /** `checkout --orphan <new> <start-point>`: the commit whose tree the switch merges to */
+      startId?: ObjectId;
+    }
   | { kind: "detach"; targetId: ObjectId; logName: string }
   | { kind: "stay"; targetId: ObjectId; logName: string };
 
@@ -688,7 +696,14 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     return this;
   }
 
-  /** The git version whose prompts {@link setPatch} reproduces (default 2.56). */
+  /**
+   * The git version this checkout reproduces where they differ (default 2.56): the prompts
+   * of {@link setPatch}, and {@link setMerge}'s refusal. Under 2.43 a `-m` switch the
+   * two-way merge refuses dies with `fatal: cannot continue with staged changes in the
+   * following files:` when the index differs from HEAD (an unborn index always does, with
+   * HEAD's files as staged deletions), exit 128; 2.43's in-place merge of unstaged changes
+   * is not reproduced (the switch then takes 2.56's autostash).
+   */
   setCompatibility(version: PatchCompatibility): this {
     this.checkCallable();
     this.patchCompatibility = version;
@@ -810,6 +825,9 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     label: string,
     base: string,
   ): Promise<CheckoutResult | undefined> {
+    // create_autostash: nothing to stash in an unborn index (no unstaged changes without
+    // entries, has_uncommitted_changes 0 by is_index_unborn), so the refusal stands
+    if (await isIndexUnborn(this.staging)) return undefined;
     const message = `autostash while switching to '${label}'`;
     const stashId = await new StashCreateCommand(this._workingCopy)
       .setRef(null)
@@ -1126,13 +1144,18 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // (merged_entry: written, untracked files in the way refused) instead of reading HEAD's
     // files as staged deletions. `checkout --orphan` merges HEAD into HEAD (the new branch
     // keeps its tree), which then checks HEAD's files out too.
+    // `checkout --orphan <new> <start-point>` merges to the start point's tree as a switch to
+    // that commit would.
     const unborn = !this.force && (await isIndexUnborn(this.staging));
+    const orphanStart = switchTo.kind === "orphan" ? switchTo.startId : undefined;
     const orphanCheckout = unborn && this.orphan && !this.orphanFromEmptyTree;
-    const targetTreeId = orphanCheckout
-      ? headTreeId
-      : targetId
-        ? await this.commits.getTree(targetId)
-        : undefined;
+    const targetTreeId = orphanStart
+      ? await this.commits.getTree(orphanStart)
+      : orphanCheckout
+        ? headTreeId
+        : targetId
+          ? await this.commits.getTree(targetId)
+          : undefined;
     // in a sparse checkout, unpack-trees with its patterns: a path that stays outside is
     // neither checked nor touched in the worktree (its index entry still switches)
     const sparse = await SparseUnpack.start({
@@ -1163,7 +1186,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
 
     // (an orphan branch keeps index and worktree as they are, as git's checkout --orphan;
     // switch --orphan switches to the empty tree)
-    const keepAll = this.orphan && !this.orphanFromEmptyTree && !orphanCheckout;
+    const keepAll =
+      this.orphan && !this.orphanFromEmptyTree && !orphanCheckout && orphanStart === undefined;
     if (!this.force && !keepAll && unmerged.size > 0) {
       return {
         status: CheckoutStatus.CONFLICTS,
@@ -1297,6 +1321,19 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // in the way) falls back to an autostash, run by call() outside this worktree batch;
     // with nothing to stash the refusal stands
     const refused = local.length + untracked.length + untrackedRemoved.length + lostDirs.length;
+    if (this.merge && headId && refused > 0 && this.patchCompatibility === "2.43") {
+      // git 2.43's merge_working_tree: a failed two-way merge under `-m` dies when the index
+      // holds changes against HEAD (repo_index_has_changes), an unborn index's missing
+      // entries included (staged deletions of every HEAD file)
+      const staged = [...new Set([...index.keys(), ...head.keys()])]
+        .filter((p) => !sameSide(index.get(p), head.get(p)))
+        .sort(compareGitPaths);
+      if (staged.length > 0) {
+        throw new SwitchRefusedError(
+          `fatal: cannot continue with staged changes in the following files:\n${staged.join(" ")}`,
+        );
+      }
+    }
     if (this.merge && headId && refused > 0) {
       const left = await this.getCurrentBranch();
       // the base's label: the branch left, else its commit uniquely abbreviated
@@ -1594,7 +1631,16 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     }
     if (this.orphan || this.createBranch) {
       if (!isValidBranchName(given)) throw new InvalidRefNameError(given);
-      if (this.orphan) return { kind: "orphan", branch: given, logName: given };
+      if (this.orphan && this.startPoint === undefined) {
+        // validate_new_branchname
+        if (await this.refsStore.has(`refs/heads/${given}`)) {
+          throw new RefAlreadyExistsError(
+            `refs/heads/${given}`,
+            `fatal: a branch named '${given}' already exists`,
+          );
+        }
+        return { kind: "orphan", branch: given, logName: given };
+      }
       // the start point as git's setup_branch_path names it: `-` and @{-N} expanded (the
       // reflog's "Created from feat", the branch tracked). git's parse_branchname_arg reads
       // it before validate_new_branchname looks at the branch: a start point that names
@@ -1617,13 +1663,19 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         );
       }
       // validate_new_branchname: `-b` refuses an existing branch, `-B` resets it
-      if (!this.forceCreateBranch && (await this.refsStore.has(`refs/heads/${given}`))) {
+      if (
+        (this.orphan || !this.forceCreateBranch) &&
+        (await this.refsStore.has(`refs/heads/${given}`))
+      ) {
         throw new RefAlreadyExistsError(
           `refs/heads/${given}`,
           `fatal: a branch named '${given}' already exists`,
         );
       }
       if (!targetId) throw nonCommit;
+      // `checkout --orphan <new> <start-point>`: the index and worktree merge to the start
+      // point's tree (switch_branches with the start point's commit), the new branch unborn
+      if (this.orphan) return { kind: "orphan", branch: given, logName: given, startId: targetId };
       return {
         kind: "create",
         branch: given,

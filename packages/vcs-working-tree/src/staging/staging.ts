@@ -299,6 +299,14 @@ export interface Staging {
   getUpdateTime(): number;
 
   /**
+   * Whether this instance's last read found no index file and nothing has been written
+   * since (git's `is_index_unborn` before the entry count: `!istate->timestamp.sec`).
+   * Undefined when unknown (never read) or for stores without an index file (memory, KV,
+   * SQL); `isIndexUnborn` then falls back to {@link getUpdateTime}.
+   */
+  isUnborn?(): boolean | undefined;
+
+  /**
    * Stores fresh stats for entries still as compared (compare-and-set), as git's index
    * refresh: for an index file, written only when the file is unchanged since read, and
    * without writing other in-memory edits. Returns whether anything was stored. Absent:

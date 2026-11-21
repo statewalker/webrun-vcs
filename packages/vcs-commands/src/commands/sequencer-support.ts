@@ -15,6 +15,7 @@ import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   entryStatOf,
   type IndexEntryOptions,
+  isIndexUnborn,
   type StagingEntry,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
@@ -704,12 +705,15 @@ async function verifyAbsent(
 /**
  * git's autostash (`rebase.autoStash`, `merge.autoStash`): the local changes saved as a
  * stash commit (not on `refs/stash`), the index and worktree reset to HEAD. Undefined when
- * there is nothing to save.
+ * there is nothing to save: git's create_autostash stashes only on `has_unstaged_changes ||
+ * has_uncommitted_changes`, and an unborn index (no index file) has neither (no entries to
+ * differ from their files, `has_uncommitted_changes` 0 by `is_index_unborn`).
  */
 export async function createAutostash(
   ctx: SequencerContext,
   headId: ObjectId,
 ): Promise<ObjectId | undefined> {
+  if (await isIndexUnborn(ctx.staging)) return undefined;
   const id = await new StashCreateCommand(ctx.workingCopy)
     .setRef(null)
     .setMessage("autostash")
