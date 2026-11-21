@@ -549,6 +549,8 @@ export async function rewriteIndex(
      * the write then smudges the racily clean entries it keeps, as `write_locked_index`
      */
     upToDate?: boolean;
+    /** False: the index built in memory, left for the caller to write (through its lock) */
+    write?: boolean;
   } = {},
 ): Promise<void> {
   // the kept entries are in the index's order already: only the changes are sorted, then
@@ -602,7 +604,7 @@ export async function rewriteIndex(
   if (options.cacheTree) staging.setCacheTree?.(options.cacheTree);
   // unpack-trees' cache_tree_update before its index write
   if (options.updateCacheTreeWith) await updateIndexCacheTree(staging, options.updateCacheTreeWith);
-  await staging.write();
+  if (options.write !== false) await staging.write();
 }
 
 /** Whether the index holds exactly `tree` (no staged change; git's index_differs_from). */

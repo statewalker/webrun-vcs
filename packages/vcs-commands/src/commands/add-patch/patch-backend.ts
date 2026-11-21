@@ -159,15 +159,37 @@ export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
  * entries whose files still hold their content take the files' stat, the index is written
  * (racily clean entries smudged), and each unmerged path is reported as `<path>: needs
  * merge` on standard output, which is what the call returns.
+ *
+ * @internal
  */
-class IndexRefresh extends GitCommand<string> {
+export class IndexRefresh extends GitCommand<string> {
+  private gentle = false;
+
+  /**
+   * git's `gentle`: an index lock another process holds is no failure (the index refreshed
+   * in memory, nothing written, no message)
+   */
+  setGentle(gentle = true): this {
+    this.gentle = gentle;
+    return this;
+  }
+
   async call(): Promise<string> {
+    return (await this.refresh()).output;
+  }
+
+  /**
+   * The refresh, telling whether `refresh_index` found errors (an unmerged entry remains:
+   * `has_errors`, which makes `repo_refresh_and_write_index` return 1).
+   */
+  async refresh(): Promise<{ output: string; hasErrors: boolean }> {
     await this.readCurrentIndex(false);
     const staging = this.staging;
     const worktree = this.workingCopy.worktree;
     const entries: StagingEntry[] = [];
     for await (const entry of staging.entryList?.() ?? staging.entries()) entries.push(entry);
     let out = "";
+    let hasErrors = false;
     const updates: IndexStatUpdate[] = [];
     if (worktree) {
       const trust = worktreeModeTrust(this.workingCopy, worktree);
@@ -183,6 +205,7 @@ class IndexRefresh extends GitCommand<string> {
       for await (const { item: entry, current } of withWorktreeEntries(worktree, entries, stated)) {
         if (entry.stage !== 0) {
           if (entry.path !== lastUnmerged) out += `${entry.path}: needs merge\n`;
+          hasErrors = true;
           lastUnmerged = entry.path;
           continue;
         }
@@ -204,8 +227,13 @@ class IndexRefresh extends GitCommand<string> {
       }
       await editor.finish();
     }
-    // written whether or not an entry changed (write_locked_index)
-    await staging.write();
-    return out;
+    // written whether or not an entry changed (write_locked_index); a gentle refresh that
+    // cannot take the lock keeps its result in memory
+    try {
+      await staging.write();
+    } catch (error) {
+      if (!this.gentle || (error as Error)?.name !== "IndexLockedError") throw error;
+    }
+    return { output: out, hasErrors };
   }
 }
