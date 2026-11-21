@@ -18,7 +18,7 @@
  *     basePath: "/srv/git",
  *     exportAll: true, // GIT_HTTP_EXPORT_ALL
  *     openRepository: async (gitDir) => {
- *       const opened = await worktree.openRepository?.(gitDir);
+ *       const opened = await worktree.openRepository?.(gitDir, { configIncludes: "files" });
  *       return opened && servedRepositoryOf(opened, { hooks }); // vcs-commands
  *     },
  *   }),

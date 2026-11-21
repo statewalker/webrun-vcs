@@ -156,6 +156,12 @@ export interface HookLayout {
   /** Where the hook runs: the worktree top, the git directory when bare */
   cwd: string;
   bare: boolean;
+  /**
+   * The git directory as git exports it to hooks (`GIT_DIR`): set when the worktree's `.git`
+   * is a gitfile (a linked worktree, a submodule), as git's discovery exports the directory
+   * the gitfile names (setup.c, `read_gitfile_gently`); absent for a `.git` directory
+   */
+  gitDirEnv?: string;
 }
 
 /**
@@ -509,7 +515,43 @@ async function hookLayout(workingCopy: WorkingCopy): Promise<HookLayout | undefi
   const bareValue = configValue(workingCopy, "core.bare");
   const bare = bareValue !== undefined && configBool(workingCopy, "core.bare", false);
   const dir = normalizeFilesPath(gitDir);
-  return { files, top, gitDir: dir, cwd: bare ? dir : top, bare };
+  const gitDirEnv = bare ? undefined : await gitfileTarget(files, top);
+  return {
+    files,
+    top,
+    gitDir: dir,
+    cwd: bare ? dir : top,
+    bare,
+    ...(gitDirEnv ? { gitDirEnv } : {}),
+  };
+}
+
+/**
+ * The host path of the git directory the gitfile `<top>/.git` names (relative to its
+ * directory, or absolute), as git's discovery exports it to its children; undefined when
+ * `.git` is no gitfile or the FilesApi has no host path.
+ */
+async function gitfileTarget(files: FilesApi, top: string): Promise<string | undefined> {
+  const path = joinFilesPath(top, ".git");
+  try {
+    if ((await files.stats(path))?.kind !== "file") return undefined;
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of files.read(path)) chunks.push(chunk);
+    const text = decoder.decode(chunks.length === 1 ? chunks[0] : concat(chunks));
+    const m = /^gitdir: (.*?)\r?\n?$/.exec(text.split("\n")[0] ?? "");
+    const target = m?.[1];
+    if (!target) return undefined;
+    if (target.startsWith("/")) return normalizeHostPath(target);
+    const topHost = hostPathOf(files, top);
+    return topHost ? normalizeHostPath(`${topHost}/${target}`) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** An absolute host path with `.` and `..` components resolved. */
+function normalizeHostPath(path: string): string {
+  return `/${normalizeFilesPath(path)}`;
 }
 
 /** The common git directory of `gitDir` (its `commondir` file), as a FilesApi path. */
@@ -969,6 +1011,7 @@ export class HookSession {
         ...(stdin ? { stdin } : {}),
         env: {
           ...(options.prefix === false ? {} : { GIT_PREFIX: "" }),
+          ...(layout.gitDirEnv ? { GIT_DIR: layout.gitDirEnv } : {}),
           ...this.processEnv,
           ...(options.env ?? {}),
         },
@@ -1097,7 +1140,7 @@ export function refTransactionHookOf(
       const zero = nullIdLike(u.new ?? u.old ?? undefined);
       const next = u.newTarget !== undefined ? `ref:${u.newTarget}` : (u.new ?? zero);
       const line = (name: string) => `${u.old ?? zero} ${next} ${name}\n`;
-      if (state === "preparing") lines.push(line(u.requested));
+      if (state === "preparing" || context?.asAsked) lines.push(line(u.requested));
       else if (legacy && u.requested !== u.name) {
         lines.push(line(u.requested));
         for (const n of u.through ?? []) appended.push(line(n));

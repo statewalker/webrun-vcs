@@ -20,6 +20,12 @@
  * `logs/HEAD`, as git's `split_head_update` does: also when the branch keeps its value. A batch with refs of both kinds commits
  * the repository's refs first, then the worktree's: it is atomic within each part only.
  *
+ * The reference-transaction hook (`setTransactionHook`) hears each part's transactions as
+ * git's files backend runs it for a linked worktree: the worktree's own refs (HEAD, root refs,
+ * `refs/bisect/`, ...) and the repository's alike, an update made through the worktree's HEAD
+ * told as asked (`HEAD` in `preparing`, its branch afterwards), `pack-refs` as the repository's.
+ * A batch with refs of both kinds runs it once per part, where git runs one transaction.
+ *
  * @module
  */
 
@@ -34,7 +40,11 @@ import type {
   RefLogOptions,
   ReflogDeleteOptions,
   ReflogReader,
+  RefRemoveAllOptions,
+  RefRemoveOptions,
   Refs,
+  RefTransactionHook,
+  RefTransactionUpdate,
   RefUpdateResult,
   SymbolicRef,
   SymbolicRefLogOptions,
@@ -79,9 +89,20 @@ export function createWorktreeRefs(options: WorktreeRefsOptions): Refs {
   return new WorktreeRefs(options);
 }
 
+/** A store that tells a reference-transaction hook about its transactions. */
+interface HookableRefs {
+  setTransactionHook?(hook: RefTransactionHook | undefined): void;
+}
+
+/** How an update of the repository's refs was asked for through this worktree's refs. */
+type AskedAs = Pick<RefTransactionUpdate, "requested" | "viaHead" | "through">;
+
 class WorktreeRefs implements Refs {
   private readonly common: Refs;
   private readonly own: Refs;
+  private transactionHook?: RefTransactionHook;
+  /** The refs of the repository's batch in flight, as this worktree's batch asked for them */
+  private askedAs?: Map<string, AskedAs>;
 
   constructor(private readonly options: WorktreeRefsOptions) {
     this.common = options.common;
@@ -92,6 +113,40 @@ class WorktreeRefs implements Refs {
       reflogIdentity: options.reflogIdentity,
       resolveOutside: async (name) =>
         isPerWorktreeRef(name) ? undefined : (await this.common.resolve(name))?.objectId,
+    });
+  }
+
+  /**
+   * Tells `hook` about the transactions of both stores (see the module's notes); the
+   * repository's store given as `common` gets a hook of its own while one is set here.
+   */
+  setTransactionHook(hook: RefTransactionHook | undefined): void {
+    this.transactionHook = hook;
+    (this.own as HookableRefs).setTransactionHook?.(hook);
+    (this.common as HookableRefs).setTransactionHook?.(
+      hook ? (state, updates, context) => hook(state, this.asAsked(updates), context) : undefined,
+    );
+  }
+
+  /** The hook {@link setTransactionHook} installed, if any. */
+  getTransactionHook(): RefTransactionHook | undefined {
+    return this.transactionHook;
+  }
+
+  /** The repository's updates as this worktree's batch asked for them (`HEAD` for its branch). */
+  private asAsked(updates: readonly RefTransactionUpdate[]): readonly RefTransactionUpdate[] {
+    const asked = this.askedAs;
+    if (!asked) return updates;
+    return updates.map((u) => {
+      const as = asked.get(u.name);
+      if (!as || u.requested !== u.name) return u;
+      const { viaHead: _v, through: _t, ...rest } = u;
+      return {
+        ...rest,
+        requested: as.requested,
+        ...(as.viaHead ? { viaHead: true } : {}),
+        ...(as.through?.length ? { through: as.through } : {}),
+      };
     });
   }
 
@@ -145,8 +200,31 @@ class WorktreeRefs implements Refs {
     return this.store(name).setSymbolic(name, target, log);
   }
 
-  remove(name: string): Promise<boolean> {
-    return this.store(name).remove(name);
+  remove(name: string, options?: RefRemoveOptions): Promise<boolean> {
+    return this.store(name).remove(name, options);
+  }
+
+  /**
+   * Deletes `refNames` as git's `delete_refs`: the repository's through its store, this
+   * worktree's own through the worktree's (each in one transaction, or as 2.43 with `legacy`).
+   */
+  async removeAll(refNames: string[], options?: RefRemoveAllOptions): Promise<void> {
+    const own = refNames.filter(isPerWorktreeRef);
+    const common = refNames.filter((n) => !isPerWorktreeRef(n));
+    let error: unknown;
+    for (const [store, names] of [
+      [this.common, common],
+      [this.own, own],
+    ] as const) {
+      if (names.length === 0) continue;
+      try {
+        if (store.removeAll) await store.removeAll(names, options);
+        else for (const name of names) await store.remove(name, { deleteRefs: true });
+      } catch (e) {
+        error ??= e;
+      }
+    }
+    if (error !== undefined) throw error;
   }
 
   /** `name` with a per-worktree symbolic ref followed into the repository's refs. */
@@ -166,6 +244,7 @@ class WorktreeRefs implements Refs {
     const commonCommands: RefCommand[] = [];
     const ownCommands: RefCommand[] = [];
     const logged: { via: string[]; name: string }[] = [];
+    const askedAs = new Map<string, AskedAs>();
     const head = await this.own.get("HEAD").catch(() => undefined);
     const headTarget = head && isSymbolicRef(head) ? head.target : undefined;
     for (const command of commands) {
@@ -177,13 +256,28 @@ class WorktreeRefs implements Refs {
         if (via.length > 0) logged.push({ via, name: target });
         else if (target === headTarget) logged.push({ via: ["HEAD"], name: target });
       }
+      // the hook hears the update as git's files backend splits it: the symbolic ref asked
+      // for (`HEAD`), the refs between it and the branch, and HEAD's log of its branch
+      if (!isPerWorktreeRef(target)) {
+        if (via.length > 0) {
+          askedAs.set(target, { requested: command.name, through: via.slice(1) });
+        } else if (target === headTarget && command.new !== null) {
+          askedAs.set(target, { requested: target, viaHead: true });
+        }
+      }
       const rewritten = target === command.name ? command : { ...command, name: target };
       (isPerWorktreeRef(target) ? ownCommands : commonCommands).push(rewritten);
     }
     const before = new Map<string, ObjectId | undefined>();
     for (const { name } of logged) before.set(name, (await this.common.resolve(name))?.objectId);
     if (commonCommands.length > 0) {
-      const result = await this.common.batch(commonCommands, options);
+      this.askedAs = askedAs;
+      let result: BatchResult;
+      try {
+        result = await this.common.batch(commonCommands, options);
+      } finally {
+        this.askedAs = undefined;
+      }
       if (!result.ok) return result;
     }
     // the worktree's HEAD records an update made through it (split_head_update), even one

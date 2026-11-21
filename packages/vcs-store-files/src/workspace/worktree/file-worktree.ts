@@ -40,6 +40,7 @@ import type {
   NestedRepositoryState,
   NewHasher,
   OpenedRepository,
+  OpenRepositoryOptions,
   UntrackedScanHost,
   Worktree,
   WorktreeCapabilities,
@@ -1346,7 +1347,10 @@ export class FileWorktree implements Worktree {
     });
   }
 
-  async openRepository(location: string): Promise<OpenedRepository | undefined> {
+  async openRepository(
+    location: string,
+    options: OpenRepositoryOptions = {},
+  ): Promise<OpenedRepository | undefined> {
     const base = this.locate(location);
     if (base === undefined) return undefined;
     // enter_repo (strict = 0): each suffix in turn, a gitfile followed
@@ -1365,7 +1369,7 @@ export class FileWorktree implements Worktree {
       // is_git_directory: HEAD here, objects and refs here or in the `commondir` named
       const found = await this.gitDirectoryAt(gitDir, gitDir).catch(() => undefined);
       if (found?.state !== "repository") continue;
-      return this.openRepositoryAt(found.gitDir, found.commonDir);
+      return this.openRepositoryAt(found.gitDir, found.commonDir, options);
     }
     return undefined;
   }
@@ -1375,15 +1379,22 @@ export class FileWorktree implements Worktree {
    * (the same, unless `gitDir` is a linked worktree's): its history (HEAD the git
    * directory's own), configuration and worktrees.
    */
-  private async openRepositoryAt(gitDir: string, commonDir: string): Promise<OpenedRepository> {
+  private async openRepositoryAt(
+    gitDir: string,
+    commonDir: string,
+    options: OpenRepositoryOptions,
+  ): Promise<OpenedRepository> {
     const files = this.rootFiles;
     const environment = this.environment ? { environment: this.environment } : {};
+    const includes =
+      options.configIncludes === undefined ? {} : { includes: options.configIncludes };
     const backend = await createGitFilesBackend({ files, gitDir: commonDir, ...environment });
     const worktrees = await openGitLinkedWorktrees({
       files,
       gitDir,
       history: backend.history,
       ...environment,
+      ...includes,
     });
     let history = backend.history;
     if (gitDir !== commonDir) {
@@ -1402,14 +1413,20 @@ export class FileWorktree implements Worktree {
         });
       }
     }
+    // the storage's root directory and links, for includes (git's host rule, or confined)
+    const posix = files as PosixFilesApi;
     const config = await createWorkingCopyConfig(
       {
         read: async (p) => ((await files.exists(p)) ? readFile(files, p) : undefined),
         write: (p, content) => files.write(p, [content]),
+        ...(files.rootDirectory ? { rootDirectory: files.rootDirectory } : {}),
+        ...(posix.lstat && posix.readlink
+          ? { lstat: posix.lstat.bind(posix), readlink: posix.readlink.bind(posix) }
+          : {}),
       },
       commonDir,
       undefined,
-      environment,
+      { ...environment, ...includes },
     );
     const textOf = (o: { text: string | undefined }) => o.text ?? null;
     return {

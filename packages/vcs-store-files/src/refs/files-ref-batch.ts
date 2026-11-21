@@ -1368,8 +1368,9 @@ export function createFilesRefOps(
     const hook = options.transactionHook?.();
     const verdict = hook ? await hook("preparing", transactionUpdates(updates)) : undefined;
     if (verdict === false || typeof verdict === "string") {
-      // ref_transaction_abort tells the hook whatever the state
-      await hook?.("aborted", transactionUpdates(updates));
+      // ref_transaction_abort tells the hook whatever the state (the updates as asked: the
+      // backend has not split them yet)
+      await hook?.("aborted", transactionUpdates(updates), { asAsked: true });
       throw new RefTransactionAbortedError("preparing", verdict || undefined);
     }
     return updates.length === 1

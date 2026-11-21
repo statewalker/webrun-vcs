@@ -623,6 +623,11 @@ export interface RefTransactionContext {
   packed?: boolean;
   /** Made by this git version only: a hook following the other leaves the call out */
   only?: "2.43" | "2.56";
+  /**
+   * The updates are told as asked (`requested`), not as written: an `aborted` after a
+   * refusal in `preparing`, before git's backend split the symbolic refs (HEAD) it goes through
+   */
+  asAsked?: boolean;
 }
 
 /** How a ref store removes a ref, where git's commands differ (see {@link RefTransactionContext}). */

@@ -54,6 +54,16 @@ export class ConfigParseError extends Error {
 export interface ConfigFilesApi {
   read(path: string): Promise<Uint8Array | undefined>;
   write(path: string, content: Uint8Array): Promise<void>;
+  /**
+   * The host directory these paths are relative to: an include climbing above it is read
+   * from the host (git's), or, with `includes: "files"`, an absolute include inside it is
+   * read through these paths
+   */
+  rootDirectory?: string;
+  /** What `path` is without following a last symbolic link (checked by `includes: "files"`) */
+  lstat?(path: string): Promise<{ kind: string } | undefined>;
+  /** The target of the symbolic link at `path` (followed by `includes: "files"`) */
+  readlink?(path: string): Promise<Uint8Array | undefined>;
 }
 
 /**
@@ -1029,8 +1039,16 @@ export interface GitConfigOptions {
    * browser), only this file and what it includes are read.
    */
   environment?: GitHostEnvironment;
-  /** Follow `include.path` / `includeIf.*.path` (default true) */
-  includes?: boolean;
+  /**
+   * Follow `include.path` / `includeIf.*.path` (default true, as git: a relative path beside
+   * the including file, `~/` and absolute paths and those climbing above the files API read
+   * from the host through `environment`). `"files"` confines the includes of the repository's
+   * own files (`config`, `config.worktree` and what they include) to the files API: a path
+   * that climbs above its root, a `~/` path, an absolute path outside its `rootDirectory` and
+   * a symbolic link leading out of it are skipped (absolute paths inside it are read through
+   * it); the system and global files keep git's rules. `false` follows none.
+   */
+  includes?: boolean | "files";
   /**
    * The git directory as the host names it (an absolute path on Node), matched by
    * `includeIf.gitdir:` and used for `./` in its patterns. Default: the directory of this file.
@@ -1134,6 +1152,56 @@ function isIncludeKey(key: string): boolean {
   return key === "include.path" || (key.startsWith("includeif.") && key.endsWith(".path"));
 }
 
+/** Most symbolic links followed while confining an include (the kernel's ELOOP limit). */
+const MAX_INCLUDE_LINKS = 40;
+
+/**
+ * `path` (in `files`) with the symbolic links on it followed through `files.lstat` /
+ * `readlink`, without its leading `/`: undefined when a link climbs above the root or
+ * names a host path outside `files.rootDirectory`, or there are too many. Lexical when
+ * `files` cannot tell links apart.
+ */
+async function confinedRealPath(files: ConfigFilesApi, path: string): Promise<string | undefined> {
+  const absolute = path.startsWith("/");
+  const pending = path.split("/").filter((p) => p !== "" && p !== ".");
+  if (!files.lstat || !files.readlink) return pending.join("/");
+  const root = files.rootDirectory?.replace(/\/+$/, "");
+  const out: string[] = [];
+  let links = 0;
+  while (pending.length > 0) {
+    const part = pending.shift() as string;
+    if (part === "..") {
+      if (out.length === 0) return undefined;
+      out.pop();
+      continue;
+    }
+    out.push(part);
+    const current = `${absolute ? "/" : ""}${out.join("/")}`;
+    const stat = await files.lstat(current).catch(() => undefined);
+    if (stat?.kind !== "symlink") continue;
+    if (++links > MAX_INCLUDE_LINKS) return undefined;
+    const raw = await files.readlink(current).catch(() => undefined);
+    if (!raw) return undefined;
+    const target = new TextDecoder().decode(raw);
+    out.pop();
+    if (target.startsWith("/")) {
+      // a host path: followed only inside the root directory
+      const host = resolveDots(target).path;
+      if (root === undefined || (host !== root && !host.startsWith(`${root}/`))) return undefined;
+      out.length = 0;
+      pending.unshift(
+        ...host
+          .slice(root.length)
+          .split("/")
+          .filter((p) => p !== "" && p !== "."),
+      );
+    } else {
+      pending.unshift(...target.split("/").filter((p) => p !== "" && p !== "."));
+    }
+  }
+  return out.join("/");
+}
+
 /** Reads config files of the chain, following their include directives as git does. */
 class ChainReader {
   private branch?: Promise<string | undefined>;
@@ -1208,12 +1276,13 @@ class ChainReader {
         `exceeded maximum include depth (${MAX_INCLUDE_DEPTH}) while including\n\t${value}\n\tfrom\n\t${from.path}\nThis might be due to circular includes.`,
       );
     }
-    const target = this.resolvePath(value, from);
+    const target = await this.resolvePath(value, from);
     if (target) await this.readFile(target, out, depth);
   }
 
   /** git's `handle_path_include`: `~/` in the home, a relative path beside `from`. */
-  private resolvePath(value: string, from: ConfigSource): ConfigSource | undefined {
+  private async resolvePath(value: string, from: ConfigSource): Promise<ConfigSource | undefined> {
+    if (this.options.includes === "files" && !from.host) return this.confinedPath(value, from);
     const env = this.env;
     if (value.startsWith("~")) {
       const expanded = expandUserPath(value, env);
@@ -1236,6 +1305,35 @@ class ChainReader {
       return { read: env.readFile, path: host.path, host: true, ...scopeOf(from) };
     }
     return { read: from.read, path: joined.path, host: from.host, ...scopeOf(from) };
+  }
+
+  /**
+   * An include of the repository's own files confined to the files API (`includes: "files"`):
+   * the path beside `from` (or an absolute one inside the root directory); undefined when it
+   * climbs out or a symbolic link on it leads out of the files API.
+   */
+  private async confinedPath(value: string, from: ConfigSource): Promise<ConfigSource | undefined> {
+    const files = (this.config as unknown as { files: ConfigFilesApi }).files;
+    let path: string;
+    if (value.startsWith("~")) return undefined;
+    if (value.startsWith("/")) {
+      const root = files.rootDirectory?.replace(/\/+$/, "");
+      if (root === undefined) return undefined;
+      const host = resolveDots(value);
+      if (host.path !== root && !host.path.startsWith(`${root}/`)) return undefined;
+      path = `/${host.path.slice(root.length + 1)}`;
+    } else {
+      const joined = resolveDots(`${dirOf(from.path)}${value}`);
+      if (joined.escapes) return undefined;
+      path = joined.path;
+    }
+    // refused when a symbolic link on the way leads out; read as the files API reads it
+    // (the Node one follows no link at all), so this rule never reads more than git's
+    if ((await confinedRealPath(files, path)) === undefined) return undefined;
+    const bare = path.replace(/^\/+/, "");
+    // the including file's spelling of the path (leading `/` or not), for its origin
+    const spelled = from.path.startsWith("/") ? `/${bare}` : bare;
+    return { read: from.read, path: spelled, ...scopeOf(from) };
   }
 
   private gitDirPath(): string {

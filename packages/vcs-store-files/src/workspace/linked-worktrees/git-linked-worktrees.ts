@@ -45,7 +45,7 @@ import type {
   WorktreeRepairReport,
 } from "@statewalker/vcs-working-tree";
 
-import { createFileRefStore, createWorktreeRefs } from "../../refs/index.js";
+import { createFileRefStore, createWorktreeRefs, peelTag } from "../../refs/index.js";
 import { GitCheckout, type GitCheckoutFilesApi } from "../checkout/index.js";
 import {
   HostPaths,
@@ -78,7 +78,7 @@ const GITFILE_NOT_A_REPO = 7;
 
 /** Options of {@link openGitLinkedWorktrees}. */
 export interface GitLinkedWorktreesOptions
-  extends Pick<GitConfigOptions, "environment">,
+  extends Pick<GitConfigOptions, "environment" | "includes">,
     Omit<ContentFilterSetup, "environment"> {
   /** The FilesApi the repository and its worktrees are in. */
   files: FilesApi;
@@ -213,9 +213,19 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
 
   private async repositoryConfig(): Promise<GitWorkingCopyConfig> {
     if (!this.config) {
-      this.config = await createWorkingCopyConfig(this.configFiles(), this.commonDir);
+      this.config = await createWorkingCopyConfig(
+        this.configFiles(),
+        this.commonDir,
+        undefined,
+        this.includeOptions(),
+      );
     }
     return this.config;
+  }
+
+  /** The include rule the options give (git's by default). */
+  private includeOptions(): Pick<GitConfigOptions, "includes"> {
+    return this.options.includes === undefined ? {} : { includes: this.options.includes };
   }
 
   private configFiles() {
@@ -270,10 +280,19 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       // setting (a linked worktree of a bare repository logs the branches it moves, as git
       // runs there as in a non-bare repository), and without the repository's HEAD logging
       // a branch it points at (this worktree's own HEAD logs it, as git's split_head_update)
+      // packed-refs is the repository's: written with the main store's peeling (git's
+      // packed store is the common directory's, whichever worktree writes it)
+      const objects = this.history.objects;
       const common = createFileRefStore(this.files, this.commonDir, {
         logAllRefUpdates,
         reflogIdentity: identity,
         logHeadUpdates: false,
+        ...(objects
+          ? {
+              peel: (id: ObjectId) => peelTag(objects, id),
+              hasObject: (id: ObjectId) => objects.has(id),
+            }
+          : {}),
       });
       refs = createWorktreeRefs({
         common,
@@ -815,6 +834,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     if (!current?.bare) return (await this.openCurrent()) as WorkingCopy & WorktreeAdmin;
     const config = await createWorkingCopyConfig(this.configFiles(), this.commonDir, undefined, {
       ...(this.options.environment ? { environment: this.options.environment } : {}),
+      ...this.includeOptions(),
       gitDirPath: this.paths.hostPath(this.commonDir),
     });
     // the bare repository's own directory, for local remotes and hooks (never a work tree)
@@ -834,7 +854,8 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       getRoot: () => place.getRoot(),
       getGitDir: () => place.getGitDir?.(),
       getFiles: () => place.getFiles?.() as FilesApi,
-      openRepository: (location) => place.openRepository?.(location) ?? Promise.resolve(undefined),
+      openRepository: (location, options) =>
+        place.openRepository?.(location, options) ?? Promise.resolve(undefined),
       readFetchHead: () => readFetchHead(),
       writeFetchHead: async (content, options) => {
         const path = `${this.commonDir}/FETCH_HEAD`;
@@ -910,6 +931,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     });
     const configOptions: GitConfigOptions = {
       ...(this.options.environment ? { environment: this.options.environment } : {}),
+      ...this.includeOptions(),
       gitDirPath: this.paths.hostPath(gitDir),
     };
     if (gitDir !== this.commonDir) {
