@@ -57,6 +57,19 @@ export interface ConnectivityOptions {
   firstStepBudget?: number;
 }
 
+/**
+ * What `git rev-list --objects` stops at first when a check fails (see
+ * {@link PushConnectivity.failure}): a tip or a tag's target missing (`object`), a commit the
+ * walk needed (`commit`, with the commit naming it), a tree or a blob under a new commit.
+ */
+export interface ConnectivityFailure {
+  kind: "object" | "commit" | "tree" | "blob";
+  /** The object missing (or of the wrong type) */
+  id: string;
+  /** For `commit`: a commit that names it as a parent */
+  child?: string;
+}
+
 /** The verdict for one tip. */
 export interface TipVerdict {
   /** Every object the tip needs is present */
@@ -172,6 +185,8 @@ export class PushConnectivity {
   /** Tips that are commits (or tags peeled to one): the commit */
   private readonly commitOf = new Map<string, string>();
   private readonly checker: ObjectChecker;
+  /** The tips given to {@link analyze}, and what each one's own check found missing */
+  private direct = new Map<string, string | undefined>();
 
   constructor(
     private readonly repository: RepositoryFacade,
@@ -192,6 +207,8 @@ export class PushConnectivity {
         this.objects++;
         const ok = await this.repository.has(tip);
         this.verdicts.set(tip, { ok, missing: ok ? undefined : tip, reachesShallow: false });
+        this.direct.set(tip, ok ? undefined : tip);
+        if (!ok) this.checker.markMissing(tip);
       }
       return;
     }
@@ -203,6 +220,7 @@ export class PushConnectivity {
       direct.set(tip, result.missing);
       if (result.commit) this.commitOf.set(tip, result.commit);
     }
+    this.direct = direct;
     const roots = [...new Set(this.commitOf.values())];
 
     // step 1: stop at the ref tips; the exact walk when something looks wrong
@@ -235,6 +253,39 @@ export class PushConnectivity {
   /** The verdict of a tip given to {@link analyze}. */
   verdict(tip: string): TipVerdict {
     return this.verdicts.get(tip) ?? { ok: false, missing: tip, reachesShallow: false };
+  }
+
+  /**
+   * Where `git rev-list --objects <tips>` would stop when something is missing, in its order:
+   * a tip (or a tag's target) while it reads them, then a commit the walk needs, then a tree
+   * or blob of a tree tip, then of a new commit; undefined when every tip is complete.
+   */
+  failure(): ConnectivityFailure | undefined {
+    const kindOf = (id: string) => this.checker.missingKind(id);
+    for (const [tip, missing] of this.direct) {
+      if (missing === tip && kindOf(missing) === "object") return { kind: "object", id: missing };
+    }
+    for (const missing of this.direct.values()) {
+      if (missing !== undefined && kindOf(missing) === "object") {
+        return { kind: "object", id: missing };
+      }
+    }
+    for (const node of this.nodes.values()) {
+      if (!node.missing) continue;
+      const child = [...this.nodes.values()].find((n) => n.parents.includes(node.oid));
+      return { kind: "commit", id: node.oid, ...(child ? { child: child.oid } : {}) };
+    }
+    const treeFailure = (id: string): ConnectivityFailure => {
+      const kind = kindOf(id);
+      return { kind: kind === "tree" || kind === "blob" ? kind : "object", id };
+    };
+    for (const missing of this.direct.values()) {
+      if (missing !== undefined) return treeFailure(missing);
+    }
+    for (const node of this.nodes.values()) {
+      if (node.broken !== undefined) return treeFailure(node.broken);
+    }
+    return undefined;
   }
 
   /** The new commits (oids) reachable from `tips`. */
@@ -455,8 +506,20 @@ class ObjectChecker {
   private readonly missing = new Set<string>();
   /** Trees with something missing under them: what */
   private readonly brokenTrees = new Map<string, string>();
+  /** What each object found missing was expected to be */
+  private readonly kinds = new Map<string, "object" | "tree" | "blob">();
 
   constructor(private readonly repository: RepositoryFacade) {}
+
+  /** Records `id` as a missing tip. */
+  markMissing(id: string): void {
+    this.kinds.set(id, "object");
+  }
+
+  /** How an object found missing was reached: as a tip or tag target, a tree, a blob. */
+  missingKind(id: string): "object" | "tree" | "blob" | undefined {
+    return this.kinds.get(id);
+  }
 
   /**
    * A tip: tags are followed (their target types checked), trees and blobs checked, a commit
@@ -467,14 +530,20 @@ class ObjectChecker {
     let want: GitObjectTypeName | undefined;
     for (let depth = 0; depth < 64; depth++) {
       const type = await this.repository.getObjectType?.(oid);
-      if (!type || (want !== undefined && type !== want)) return { missing: oid };
+      if (!type || (want !== undefined && type !== want)) {
+        this.kinds.set(oid, "object");
+        return { missing: oid };
+      }
       if (type === "commit") return { commit: oid };
       if (type === "tree") return { missing: await this.checkTree(oid, undefined) };
       this.objects++;
       this.checked.add(oid);
       if (type === "blob") return {};
       const tag = await this.repository.getTagInfo?.(oid);
-      if (!tag) return { missing: oid };
+      if (!tag) {
+        this.kinds.set(oid, "object");
+        return { missing: oid };
+      }
       oid = tag.object;
       want = tag.type;
     }
@@ -494,6 +563,7 @@ class ObjectChecker {
     const entries = await this.repository.getTreeEntries?.(tree);
     if (!entries) {
       this.brokenTrees.set(tree, tree);
+      if (!this.kinds.has(tree)) this.kinds.set(tree, "tree");
       return tree;
     }
     let baseEntries: Map<string, { id: string; mode: number }> | undefined;
@@ -514,6 +584,7 @@ class ObjectChecker {
       } else if (!this.checked.has(entry.id)) {
         if (this.missing.has(entry.id) || !(await this.repository.has(entry.id))) {
           this.missing.add(entry.id);
+          if (!this.kinds.has(entry.id)) this.kinds.set(entry.id, "blob");
           missing = entry.id;
         } else {
           this.checked.add(entry.id);

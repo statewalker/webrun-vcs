@@ -203,6 +203,8 @@ function fakeServer(options: {
   shallowInfo?: string[];
   /** Acknowledge each commit once only (git's upload-pack re-ACKs every common have) */
   ackOnce?: boolean;
+  /** The pack section's packets (default: an empty pack on band 1, then a flush) */
+  packSection?: Uint8Array[];
 }): { connection: UploadPackConnection; rounds: Round[] } {
   const rounds: Round[] = [];
   const acked = new Set<string>();
@@ -224,7 +226,7 @@ function fakeServer(options: {
             "no-progress",
           ].map((c) => [c, ""]),
         );
-  const pack = [band(1, EMPTY_PACK), FLUSH];
+  const pack = options.packSection ?? [band(1, EMPTY_PACK), FLUSH];
   const respond = (chunks: Uint8Array[]): PktStream => {
     if (!options.stateless) {
       pipe.push(...chunks);
@@ -443,5 +445,58 @@ describe("fetchPack negotiation against a scripted server", () => {
     expect(rounds.map((r) => r.haves.length)).toEqual([16, 16, 32, 32, 32, 32, 32, 8]);
     expect(rounds.map((r) => r.wants)).toEqual([1, 0, 0, 0, 0, 0, 0, 0]);
     expect(rounds.at(-1)?.done).toBe(true);
+  });
+});
+
+describe("fetchPack: a failure after the import leaves no quarantine", () => {
+  /** An import that reads the first chunk only (as a pack import stops at the pack's end) */
+  const quarantinedImport = () => {
+    const discarded: number[] = [];
+    const importPack = async (pack: AsyncIterable<Uint8Array>): Promise<PackImportResult> => {
+      await pack[Symbol.asyncIterator]().next(); // not closed: the rest is the response's
+      return {
+        objectsImported: 0,
+        blobsWithDelta: 0,
+        treesImported: 0,
+        commitsImported: 0,
+        tagsImported: 0,
+        quarantine: {
+          repository: {} as never,
+          commit: async () => {},
+          discard: async () => {
+            discarded.push(1);
+          },
+        },
+      };
+    };
+    return { importPack, discarded };
+  };
+
+  it("a sideband error after the pack started: the import's quarantine is discarded", async () => {
+    const g = new Graph();
+    const { connection } = fakeServer({
+      version: 2,
+      stateless: true,
+      has: new Set(),
+      packSection: [band(1, EMPTY_PACK.subarray(0, 12)), band(3, enc.encode("broken\n")), FLUSH],
+    });
+    const { importPack, discarded } = quarantinedImport();
+    await expect(fetchPack(connection, g, request([], { importPack }))).rejects.toThrow(/broken/);
+    expect(discarded).toEqual([1]);
+  });
+
+  it("no pack at all: the import's quarantine is discarded", async () => {
+    const g = new Graph();
+    const { connection } = fakeServer({
+      version: 2,
+      stateless: true,
+      has: new Set(),
+      packSection: [FLUSH],
+    });
+    const { importPack, discarded } = quarantinedImport();
+    await expect(fetchPack(connection, g, request([], { importPack }))).rejects.toThrow(
+      "upload-pack sent no pack for the wanted objects",
+    );
+    expect(discarded).toEqual([1]);
   });
 });

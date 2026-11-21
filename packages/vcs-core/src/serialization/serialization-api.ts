@@ -14,6 +14,7 @@
 import type { ObjectId } from "../common/id/index.js";
 import type { ObjectQuarantine } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
+import type { PackEntryInfo } from "../pack/unpack-objects.js";
 
 /**
  * Result of importing a pack file
@@ -59,6 +60,18 @@ export interface PackImportOptions {
    * `TRANS_OPT_KEEP`, which `git clone` sets: `fetch-pack --keep`)
    */
   keepPack?: boolean;
+  /**
+   * Called for every received object once it is stored (unpacked) or its pack resolved (kept),
+   * with its entry in the pack: what git's index-pack checks with `--strict` (see
+   * `PackEntryInfo`)
+   */
+  onObject?: (id: ObjectId, type: ObjectTypeString, entry: PackEntryInfo) => void;
+  /**
+   * Called with the content of every received commit, tree and tag while it is in memory, in
+   * no particular order (`content` is only valid during the call): what index-pack reads the
+   * links of. An object too large to hold (streamed into a store) is not reported.
+   */
+  onContent?: (id: ObjectId, type: ObjectTypeString, content: Uint8Array) => void;
 }
 
 /**

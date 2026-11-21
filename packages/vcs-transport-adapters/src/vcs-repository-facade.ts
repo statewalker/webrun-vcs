@@ -14,15 +14,18 @@ import {
   serializeTag,
   serializeTree,
 } from "@statewalker/vcs-core";
-import type {
-  CommitGraphInfo,
-  ExportPackOptions,
-  GitObjectTypeName,
-  PackImportOptions,
-  PackImportResult,
-  RepositoryFacade,
-  TagTargetInfo,
-  TreeEntryInfo,
+import {
+  type CommitGraphInfo,
+  type ExportPackOptions,
+  type GitObjectTypeName,
+  lenientCommitHeader,
+  lenientTagTarget,
+  type PackImportOptions,
+  type PackImportResult,
+  type RepositoryFacade,
+  storedObjectType,
+  type TagTargetInfo,
+  type TreeEntryInfo,
 } from "@statewalker/vcs-transport";
 import { toArray } from "@statewalker/vcs-utils/streams";
 
@@ -226,12 +229,37 @@ export class VcsRepositoryFacade implements RepositoryFacade {
     const commits = this.history.commits;
     if (commits.getHeader) {
       // from the commit-graph when it has the commit (nothing is read)
-      const h = await commits.getHeader(oid, { checkExists: options.checkExists });
-      return h ? { parents: h.parents, time: h.commitTime, tree: h.tree } : undefined;
+      const h = await commits
+        .getHeader(oid, { checkExists: options.checkExists })
+        .catch(() => undefined);
+      if (h) return { parents: h.parents, time: h.commitTime, tree: h.tree };
+    } else {
+      const commit = await commits.load(oid).catch(() => undefined);
+      if (commit) {
+        return { parents: commit.parents, time: commit.committer.timestamp, tree: commit.tree };
+      }
     }
-    const commit = await commits.load(oid);
-    if (!commit) return undefined;
-    return { parents: commit.parents, time: commit.committer.timestamp, tree: commit.tree };
+    // a commit the typed store cannot parse (an author line fsck refuses): git walks it
+    return this.lenientObject(oid, "commit", lenientCommitHeader);
+  }
+
+  /**
+   * An object the typed store could not parse, read leniently when it is of `type` (its header
+   * read first: an object of another type, or absent, is not read whole); undefined otherwise,
+   * and when it cannot be read.
+   */
+  private async lenientObject<T>(
+    oid: string,
+    type: GitObjectTypeName,
+    parse: (content: Uint8Array) => T | undefined,
+  ): Promise<T | undefined> {
+    if ((await storedObjectType(this.history.objects, oid)) !== type) return undefined;
+    try {
+      const object = await this.loadObject(oid);
+      return object?.type === type ? parse(object.content) : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -253,18 +281,54 @@ export class VcsRepositoryFacade implements RepositoryFacade {
   async getTagInfo(oid: string): Promise<TagTargetInfo | undefined> {
     try {
       const tag = await this.history.tags.load(oid);
-      if (!tag) return undefined;
-      return { object: tag.object, type: OBJECT_TYPE_NAMES[tag.objectType] ?? "commit" };
+      if (tag) return { object: tag.object, type: OBJECT_TYPE_NAMES[tag.objectType] ?? "commit" };
     } catch {
-      return undefined;
+      // a tag the typed store cannot parse: read as git's parse_tag_buffer reads it
     }
+    return this.lenientObject(oid, "tag", lenientTagTarget);
+  }
+
+  /**
+   * An object's type and content, undefined when absent (a fetch's `fetch.fsckObjects`).
+   */
+  async loadObject(
+    oid: string,
+  ): Promise<{ type: GitObjectTypeName; content: Uint8Array } | undefined> {
+    const objects = this.history.objects;
+    if (!objects) return undefined;
+    const object = await objects.get(oid);
+    if (!object) return undefined;
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for await (const chunk of object.content) {
+      chunks.push(chunk);
+      size += chunk.length;
+    }
+    const content = chunks.length === 1 ? (chunks[0] as Uint8Array) : new Uint8Array(size);
+    if (chunks.length !== 1) {
+      let at = 0;
+      for (const chunk of chunks) {
+        content.set(chunk, at);
+        at += chunk.length;
+      }
+    }
+    return { type: object.type, content };
   }
 
   /**
    * The object's type (receive-pack checks branch tips are commits), undefined when absent.
    */
   async getObjectType(oid: string): Promise<GitObjectTypeName | undefined> {
-    if (await this.history.commits.load(oid)) return "commit";
+    const objects = this.history.objects;
+    if (objects) {
+      // the type from the object header (a commit the typed store cannot parse is one too);
+      // the content is released unread
+      const object = await objects.get(oid);
+      if (!object) return undefined;
+      await object.content[Symbol.asyncIterator]().return?.();
+      return object.type;
+    }
+    if (await this.history.commits.load(oid).catch(() => undefined)) return "commit";
     if (await this.getTagInfo(oid)) return "tag";
     if ((await this.getTreeEntries(oid)) !== undefined) return "tree";
     return (await this.history.blobs.has(oid)) ? "blob" : undefined;

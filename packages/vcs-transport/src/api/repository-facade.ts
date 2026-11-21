@@ -29,7 +29,10 @@
  * ```
  */
 
-import type { PackImportResult as CorePackImportResult } from "@statewalker/vcs-core";
+import type {
+  PackImportResult as CorePackImportResult,
+  PackEntryInfo,
+} from "@statewalker/vcs-core";
 
 /** Options of {@link RepositoryFacade.importPack}. */
 export interface PackImportOptions {
@@ -44,6 +47,17 @@ export interface PackImportOptions {
    * never unpacking a small one into loose objects
    */
   keepPack?: boolean;
+  /**
+   * Called for every received object (git's index-pack `--strict` checks them): its id, type
+   * and entry in the pack
+   */
+  onObject?: (id: string, type: GitObjectTypeName, entry: PackEntryInfo) => void;
+  /**
+   * Called with the content of every received commit, tree and tag while it is in memory
+   * (`content` only valid during the call; an object too large to hold is not reported): a
+   * fetch reads the objects' links from it, as index-pack does, instead of reading them back
+   */
+  onContent?: (id: string, type: GitObjectTypeName, content: Uint8Array) => void;
 }
 
 /**
@@ -283,6 +297,12 @@ export interface RepositoryFacade {
 
   /** What an annotated tag points at, or undefined when `oid` is not a tag here. */
   getTagInfo?(oid: string): Promise<TagTargetInfo | undefined>;
+
+  /**
+   * An object's type and whole content (without the `<type> <size>` header), or undefined
+   * when absent: what a fetch's `fetch.fsckObjects` checks read.
+   */
+  loadObject?(oid: string): Promise<{ type: GitObjectTypeName; content: Uint8Array } | undefined>;
 
   /**
    * The ids of the local objects that start with `prefix` (an abbreviated id, 4 or more hex

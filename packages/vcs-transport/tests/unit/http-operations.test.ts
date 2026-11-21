@@ -33,10 +33,13 @@ function localRepo(onPack?: (pack: AsyncIterable<Uint8Array>) => Promise<void>) 
   const refs = new Map<string, string>();
   const received: number[] = [];
   const updates: string[] = [];
+  // the wants are here once a pack came in (the connectivity check asks)
+  let imported = false;
   const repository = {
     async importPack(pack: AsyncIterable<Uint8Array>) {
       if (onPack) await onPack(pack);
       else for await (const chunk of pack) received.push(...chunk);
+      imported = true;
       return {
         objectsImported: 0,
         blobsWithDelta: 0,
@@ -46,7 +49,7 @@ function localRepo(onPack?: (pack: AsyncIterable<Uint8Array>) => Promise<void>) 
       };
     },
     exportPack: async function* () {},
-    has: async () => false,
+    has: async () => imported,
     walkAncestors: async function* () {},
   } as unknown as RepositoryFacade;
   const refStore: RefStore = {

@@ -3,6 +3,7 @@ import { computeAlternatePath, HostPaths, hostRootOf } from "@statewalker/vcs-st
 import {
   createRepositoryFacade,
   createTransportRefStore,
+  FetchCheckError,
   fetchFromConnection,
   type RefspecResolver,
   type FetchOptions as TransportFetchOptions,
@@ -23,7 +24,9 @@ import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js"
 import { TransportCommand } from "../transport-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
+import { fetchFsckOf } from "./fsck/index.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
+import { hostEnvironmentOf } from "./git-ident.js";
 import { copyLocalObjects } from "./local-clone.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
@@ -678,6 +681,20 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         ? "all"
         : toTagMode(this.tagOption);
 
+    // fetch.fsckObjects / transfer.fsckObjects (the clone's own config, `-c` settings included)
+    const environment = hostEnvironmentOf(this.workingCopy);
+    const fsckWarnings: string[] = [];
+    const fsck = await fetchFsckOf({
+      value: (key) => RemoteConfigStore.from(this.workingCopy).value(key),
+      entries: (prefix) => RemoteConfigStore.from(this.workingCopy).entriesWithPrefix(prefix),
+      warnings: fsckWarnings,
+      compatibility: this.hooks.compatibility,
+      ...(environment
+        ? { readFile: (path: string) => environment.readFile(path), home: environment.home }
+        : {}),
+      baseDir: await this.hostWorkingDir(),
+    });
+
     const fetchOptions: TransportFetchOptions = {
       url: sourceUrl,
       auth: this.credentials,
@@ -700,6 +717,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       cloning: true,
       // clone.c sets TRANS_OPT_KEEP: the pack is kept whatever its size
       keepPack: true,
+      ...(fsck ? { fsckObjects: fsck } : {}),
       ...(copyObjects
         ? {
             beforeFetch: async (remoteRefs) => {
@@ -720,7 +738,18 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     };
     const result = await withRemoteUploadPack(remote, sessionOptions, (connection) =>
       fetchFromConnection(connection, fetchOptions),
-    );
+    ).catch((error: unknown) => {
+      if (!(error instanceof FetchCheckError)) throw error;
+      // what was received is refused before any ref is written: index-pack died, or
+      // update_remote_refs' check of the refs found history missing (git then removes the
+      // clone, as for any failure: the caller's destination)
+      // fetch-pack ran: its start-up warnings came first
+      const lines = [...fsckWarnings, ...error.lines];
+      if (error.check === "refs") lines.push("fatal: remote did not send all necessary objects");
+      throw new FetchCheckError(error.check, lines, 128);
+    });
+    if (result.imports.length > 0) messages.push(...fsckWarnings.map((w) => `${w}\n`));
+    messages.push(...(result.packCheckMessages ?? []).map((w) => `${w}\n`));
     // write_remote_refs dies when its transaction fails
     if (result.refTransactionError !== undefined) {
       throw new TransportError(`fatal: ${result.refTransactionError}`);

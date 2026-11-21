@@ -22,6 +22,12 @@ export {
   withIdleTimeout,
   withWriteTimeout,
 } from "./idle-timeout.js";
+export {
+  lenientCommitHeader,
+  lenientTagTarget,
+  type ObjectHeaderSource,
+  storedObjectType,
+} from "./lenient-headers.js";
 export type { RefSpec } from "./refspec.js";
 export {
   defaultFetchRefSpec,
