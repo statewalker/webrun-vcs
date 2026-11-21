@@ -77,7 +77,7 @@ export interface BasePathResolverOptions {
 const MAX_LINKS = 40;
 
 /** `path`'s components, `.` and empty ones dropped, `..` applied; null when it climbs above the root. */
-function normalize(path: string): string | null {
+export function normalize(path: string): string | null {
   const out: string[] = [];
   for (const part of path.split("/")) {
     if (part === "" || part === ".") continue;
@@ -92,7 +92,7 @@ function normalize(path: string): string | null {
 }
 
 /** Whether `path` is `dir` or below it (both normalized). */
-function inside(path: string, dir: string): boolean {
+export function inside(path: string, dir: string): boolean {
   return dir === "/" || path === dir || path.startsWith(`${dir}/`);
 }
 
@@ -100,8 +100,15 @@ function inside(path: string, dir: string): boolean {
  * The path with the symbolic links on it followed through `files.lstat` / `readlink`;
  * null when one cannot be followed inside the storage (an absolute target names the host's
  * filesystem, not the storage's), or there are too many. Lexical when `files` cannot tell.
+ * With `hostRoot` (where the storage's root is on the host: a FilesApi's `rootDirectory`),
+ * an absolute target inside it is followed as the storage path it names.
  */
-async function realPath(files: FilesApi, path: string): Promise<string | null> {
+export async function realPath(
+  files: FilesApi,
+  path: string,
+  options: { hostRoot?: string } = {},
+): Promise<string | null> {
+  const hostRoot = options.hostRoot?.replace(/\/+$/, "");
   const posix = files as PosixFilesApi;
   if (!posix.lstat || !posix.readlink) return normalize(path);
   const pending = path.split("/").filter((p) => p !== "" && p !== ".");
@@ -122,8 +129,22 @@ async function realPath(files: FilesApi, path: string): Promise<string | null> {
     const target = await posix.readlink(current).catch(() => undefined);
     if (!target) return null;
     const text = new TextDecoder().decode(target);
-    if (text.startsWith("/")) return null;
     out.pop();
+    if (text.startsWith("/")) {
+      // an absolute target names the host's filesystem: the storage's only below its root
+      const absolute = normalize(text);
+      if (hostRoot === undefined || absolute === null || !inside(absolute, hostRoot || "/")) {
+        return null;
+      }
+      out.length = 0;
+      pending.unshift(
+        ...absolute
+          .slice(hostRoot.length)
+          .split("/")
+          .filter((p) => p !== ""),
+      );
+      continue;
+    }
     pending.unshift(...text.split("/").filter((p) => p !== "" && p !== "."));
   }
   return `/${out.join("/")}`;

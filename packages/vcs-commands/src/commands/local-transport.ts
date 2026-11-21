@@ -27,10 +27,12 @@ import {
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { LinkedWorktrees, OpenedRepository, WorkingCopy } from "@statewalker/vcs-working-tree";
 import { GitApiError, TransportError } from "../errors/index.js";
+import { quoteCStyleBody } from "../results/index.js";
 import {
   HookSession,
   hookHostOf,
   hookSettingsFromEntries,
+  LOCAL_REPO_ENV,
   refTransactionHookOf,
 } from "./git-hooks.js";
 import { ReadTreeCommand } from "./read-tree-command.js";
@@ -447,10 +449,18 @@ async function receiveOver<T>(
  * The hooks of a repository a local push reaches (git's receive-pack runs them there): found
  * in its git directory (or its `core.hooksPath`), run in its git directory, through the host
  * environment of the working copy pushing. Undefined without a runner or a FilesApi.
+ *
+ * With `localPush` (a push to a path: git's connect.c starts receive-pack with
+ * `local_repo_env` cleared), the hooks run without the pushing side's repository variables
+ * ({@link LOCAL_REPO_ENV}: `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_DIR`, `GIT_INDEX_FILE`,
+ * `GIT_CONFIG_COUNT`, ...), so a quarantined pre-receive's alternates name the receiving
+ * repository's objects alone. Without it (a served push over HTTP or git://, where the
+ * server's own environment is receive-pack's) the host's variables reach them.
  */
 export function remoteHookSession(
   workingCopy: WorkingCopy,
   remote: OpenedRepository,
+  options: { localPush?: boolean } = {},
 ): HookSession | undefined {
   const local = hookHostOf(workingCopy);
   if (!local.environment()?.hookRunner) return undefined;
@@ -473,6 +483,7 @@ export function remoteHookSession(
     layout: async () => ({ files: files as FilesApi, top, gitDir, cwd: gitDir, bare: remote.bare }),
     configValue: setting,
     environment: () => local.environment(),
+    ...(options.localPush ? { unsetEnv: LOCAL_REPO_ENV } : {}),
     // git 2.5x's configured hooks (hook.<name>.*) of the receiving repository: receive-pack
     // runs pre-receive, update, post-receive, post-update, push-to-checkout and
     // reference-transaction through the hook API (only proc-receive through find_hook)
@@ -514,9 +525,10 @@ async function pushToCheckout(
  * tmp-objdir.c's `tmp_objdir_env` for a hook run while the push's objects are quarantined
  * (`ctx.quarantinePath`: pre-receive, as git's receive-pack hands `odb_transaction_env` to
  * it): `GIT_QUARANTINE_PATH` and `GIT_OBJECT_DIRECTORY` name the quarantine,
- * `GIT_ALTERNATE_OBJECT_DIRECTORIES` the repository's objects (git appends them to the
- * alternates receive-pack was given; ours names them alone), absolute where the repository's files have a host path, so native git run
- * by the hook reads the pushed objects. Nothing once the objects are published.
+ * `GIT_ALTERNATE_OBJECT_DIRECTORIES` the repository's objects, appended to the host's own
+ * (`env_append`: after a `:`, C-quoted when the directory holds a `:` or starts with `"`),
+ * absolute where the repository's files have a host path, so native git run by the hook
+ * reads the pushed objects. Nothing once the objects are published.
  */
 export async function quarantineEnv(
   hooks: HookSession,
@@ -536,12 +548,12 @@ export async function quarantineEnv(
   const env: Record<string, string> = { GIT_QUARANTINE_PATH: path, GIT_OBJECT_DIRECTORY: path };
   if (objects) {
     const dir = host && below ? `${host}/./objects` : await hooks.hookPathOf(objects.path);
-    // env_append: quoted (C style) when it holds the separator or starts with a quote
+    // env_append: quoted (quote_c_style) when it holds the separator or starts with a quote,
+    // after the alternates receive-pack was given
     const value =
-      dir.includes(":") || dir.startsWith('"')
-        ? `"${dir.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
-        : dir;
-    env.GIT_ALTERNATE_OBJECT_DIRECTORIES = value;
+      dir.includes(":") || dir.startsWith('"') ? `"${quoteCStyleBody(dir) ?? dir}"` : dir;
+    const old = hooks.hostAlternateObjectDirectories;
+    env.GIT_ALTERNATE_OBJECT_DIRECTORIES = old === undefined ? value : `${old}:${value}`;
   }
   return env;
 }

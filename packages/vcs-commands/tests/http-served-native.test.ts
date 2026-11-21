@@ -36,7 +36,11 @@ import {
 import { type LoopbackServer, serveOnLoopback } from "./http-loopback-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync } from "./native-connect-support.js";
-import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
+import {
+  nativeGitAvailable,
+  nativeGitHttpBackend,
+  noMaintenance,
+} from "./native-git-http-backend.js";
 import { gitOut, putFile } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
@@ -64,6 +68,8 @@ function base(dir: string, config: Record<string, string> = { "http.receivepack"
   git(src, ["commit", "-qm", "a"]);
   git(src, ["branch", "other"]);
   git(dir, ["init", "-q", "--bare", "-b", "main", "bare.git"]);
+  // native local pushes reach it: no background maintenance there
+  noMaintenance(join(dir, "bare.git"));
   for (const [key, value] of Object.entries(config)) {
     git(join(dir, "bare.git"), ["config", key, value]);
   }
@@ -303,8 +309,8 @@ describeGit("served smart HTTP: http-backend's service rules", () => {
     git(join(dir, "src"), ["push", "-q", "../bare.git", "main", "other", "v1"]);
     const [theirs, mine] = hookTwins(root, dir);
     const backend = nativeGitHttpBackend(theirs.dir, root);
-    // ours serves the dumb protocol only when asked (http-backend's http.getanyfile is on)
-    const ours = await ourServer(mine, { getAnyFile: true });
+    // the dumb protocol is on by default, as http-backend's http.getanyfile
+    const ours = await ourServer(mine);
     try {
       const answer = async (
         fetcher: (r: Request) => Promise<Response>,
@@ -329,12 +335,6 @@ describeGit("served smart HTTP: http-backend's service rules", () => {
         ]) {
           const expected = await answer(backend.fetch, "http://localhost", path);
           const got = await answer(ourFetch, ours.server.baseUrl, path);
-          // files are not served by ours: only the refusal (getanyfile off) must agree there
-          if (path.includes("/objects/") && !off) {
-            expect(expected.status, path).toBe(200);
-            expect(got.status, path).toBe(404);
-            continue;
-          }
           expect(got, `${path} (getanyfile ${off ? "off" : "on"})`).toEqual(expected);
         }
       }
@@ -426,6 +426,7 @@ describeGit("served smart HTTP: the client's variables, decoded paths, missing d
     const prepare = (t: HookTwin) => {
       for (const name of names) {
         git(t.dir, ["clone", "-q", "--bare", "src", name]);
+        noMaintenance(join(t.dir, name));
         git(join(t.dir, name), ["config", "http.receivepack", "true"]);
       }
     };
@@ -516,5 +517,34 @@ describeGit("served smart HTTP: a broken hook configuration (as git http-backend
     git(join(dir, "bare.git"), ["config", "hook.x.event", "post-receive"]);
     const { native } = await expectTwins(dir, ["push", "<url>/bare.git", "main"], "broken");
     if (nativeIs25x) expect(native.status).not.toBe(0);
+  });
+});
+
+/**
+ * tmp-objdir.c's `env_append`: the quarantined pre-receive's `GIT_ALTERNATE_OBJECT_DIRECTORIES`
+ * is the one receive-pack was given, then the repository's objects.
+ */
+describeGit("served smart HTTP: the alternates a quarantined pre-receive is given", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "http-served-alternates-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("GIT_ALTERNATE_OBJECT_DIRECTORIES of the server, the repository's objects appended", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    const hook = join(dir, "bare.git/hooks/pre-receive");
+    writeFileSync(hook, CAT_FILE_HOOK);
+    chmodSync(hook, 0o755);
+    // an object directory of nothing (one holding the pushed objects would keep them out of
+    // native git's repository: receive-pack writes no object an alternate has)
+    mkdirSync(join(dir, "alt-objects/pack"), { recursive: true });
+    const alternates = (twinDir: string) => `${twinDir}/alt-objects`;
+    const { mine } = await expectTwins(dir, ["push", "<url>/bare.git", "main"], "alternates", {
+      native: { GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates(`${dir}-native`) },
+      oursEnv: (twin) => ({ ...twin.env, GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates(twin.dir) }),
+    });
+    expect(logOf(mine)).toContain("alternates=<twin>/alt-objects:<twin>/bare.git/./objects");
+    expect(logOf(mine)).toContain("cat-file refs/heads/main commit");
   });
 });

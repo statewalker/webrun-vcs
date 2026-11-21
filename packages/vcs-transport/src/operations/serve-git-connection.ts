@@ -39,6 +39,7 @@ import {
 } from "../protocol/git-daemon-request.js";
 import { encodePacket } from "../protocol/pkt-line-codec.js";
 import { type ServeOverDuplexOptions, serveOverDuplex } from "./serve-over-duplex.js";
+import type { ServedGitFiles } from "./served-git-files.js";
 import {
   configBoolOf,
   explicitServerSettingsFromConfig,
@@ -69,6 +70,14 @@ export interface ServedRepository {
    * repository's config says sets it here
    */
   settings?: GitServeSettings;
+  /**
+   * The files of its git directory a dumb HTTP client fetches (`objects/info/alternates`,
+   * loose objects, packs; `createServedHttpHandler` with `http.getanyfile`), as
+   * `servedGitFilesOf` reads them from a files-backed repository. Without it (a repository in
+   * a key-value or SQL store) the dumb protocol has `HEAD` and `info/refs` only, and every
+   * `objects/...` request is answered 404
+   */
+  files?: ServedGitFiles;
   /**
    * Runs around the serving of one request (`serve`), for what the repository's owner
    * installs for its duration: the repository's reference-transaction hook while

@@ -37,6 +37,28 @@ export function nativeGitEnv(home: string): Record<string, string> {
   };
 }
 
+/**
+ * No background maintenance in a repository a native local push reaches: connect.c starts its
+ * receive-pack with `local_repo_env` cleared (`GIT_CONFIG_COUNT` included), so the command-line
+ * `maintenance.auto=false` / `gc.auto=0` of {@link nativeGitEnv} (and `testEnv`) do not reach
+ * it, and git 2.5x's receive-pack would detach `git maintenance run --auto` with the
+ * repository's own config (changing `objects/` while the test copies or reads it). Its own
+ * config turns that off.
+ */
+export function noMaintenance(repo: string): void {
+  for (const [key, value] of [
+    ["maintenance.auto", "false"],
+    ["gc.auto", "0"],
+    ["receive.autogc", "false"],
+  ]) {
+    execFileSync("git", ["config", key, value], {
+      cwd: repo,
+      env: nativeGitEnv(repo),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  }
+}
+
 /** Whether native git (with http-backend) can be run. */
 export function nativeGitAvailable(): boolean {
   try {
