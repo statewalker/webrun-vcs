@@ -10,7 +10,7 @@ import {
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
-import type { Worktree } from "@statewalker/vcs-working-tree";
+import { isIndexUnborn, type Worktree } from "@statewalker/vcs-working-tree";
 
 import {
   CommitNotFoundError,
@@ -819,7 +819,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       });
       if (refused) {
         await unstash();
-        return { status: RebaseStatus.FAILED, message: refused.message, output };
+        // the merge backend's checkout_onto, a fast-forward included
+        return {
+          status: RebaseStatus.FAILED,
+          message: `${refused.message}\nerror: could not detach HEAD`,
+          output,
+        };
       }
       await state.setRef("ORIG_HEAD", headId);
       await this.refsStore.set("HEAD", onto, this.startLog());
@@ -2837,7 +2842,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   ): Promise<RebaseResult | undefined> {
     const { index, unmerged } = await readIndex(this.staging);
     const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
-    const staged = indexChanges(index, headTree);
+    // has_uncommitted_changes: an unborn index (no index file) has none
+    const staged = (await isIndexUnborn(this.staging)) ? [] : indexChanges(index, headTree);
     const unstaged: string[] = [...unmerged];
     if (worktree) {
       const trust = worktreeModeTrust(this.workingCopy, worktree);

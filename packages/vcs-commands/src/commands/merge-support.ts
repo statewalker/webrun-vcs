@@ -867,6 +867,12 @@ export interface SwitchTreesOptions {
    * one `error:` line ("Entry 'x' would be overwritten by merge. Cannot merge.", ...)
    */
   plainErrors?: boolean;
+  /**
+   * unpack-trees' `initial_checkout` (`read-tree -m H M` into an unborn index,
+   * `isIndexUnborn`): a path of `target` missing from the index is taken as new
+   * (written, untracked files in the way refused), never as a staged deletion
+   */
+  initialCheckout?: boolean;
 }
 
 /** git's default unpack-trees messages (`unpack_plumbing_errors`) for one refused path. */
@@ -914,7 +920,7 @@ async function switchTreesWith(
     const h = head.get(path);
     const t = target.get(path);
     const i = index.get(path);
-    if (sameEntry(h, t)) continue;
+    if (sameEntry(h, t) && !(options.initialCheckout && t && !i)) continue;
     if (i) {
       if (t && sameEntry(i, t)) continue;
       if (!sameEntry(i, h)) {
@@ -930,8 +936,8 @@ async function switchTreesWith(
       continue;
     }
     if (t) {
-      // a staged deletion of a path the target changes
-      if (h) staged.push(path);
+      // a staged deletion of a path the target changes (none in an initial checkout)
+      if (h && !options.initialCheckout) staged.push(path);
       else updates.push(path);
       continue;
     }

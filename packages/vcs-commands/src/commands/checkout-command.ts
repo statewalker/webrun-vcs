@@ -41,10 +41,12 @@ import {
   type Ref,
 } from "@statewalker/vcs-core";
 import { type ConflictStyle, parseGitBool } from "@statewalker/vcs-utils";
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
   cacheTreeOfTree,
   entryStatOf,
+  isIndexUnborn,
   type StagingEntry,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
@@ -233,7 +235,14 @@ type SwitchPlan =
       logName: string;
       tracking: CreateTracking;
     }
-  | { kind: "orphan"; branch: string; targetId?: undefined; logName: string }
+  | {
+      kind: "orphan";
+      branch: string;
+      targetId?: undefined;
+      logName: string;
+      /** `checkout --orphan <new> <start-point>`: the commit whose tree the switch merges to */
+      startId?: ObjectId;
+    }
   | { kind: "detach"; targetId: ObjectId; logName: string }
   | { kind: "stay"; targetId: ObjectId; logName: string };
 
@@ -262,6 +271,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private ignoreOtherWorktrees = false;
   private detach = false;
   private orphanFromEmptyTree = false;
+  private onlyMergeOnSwitchingBranches = false;
   private track = TrackMode.DEFAULT;
   private guess?: boolean;
   private protectUntracked = false;
@@ -419,6 +429,30 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     this.checkCallable();
     this.guess = guess;
     return this;
+  }
+
+  /**
+   * git's `only_merge_on_switching_branches` (`git switch`, and `git checkout -b <new>`
+   * given exactly so): a switch that names no target (a new branch without a start point,
+   * `--detach` without a commit) only moves HEAD, leaving the index and the worktree as
+   * they are (no index write, no check of unmerged entries, an unborn index left unborn).
+   * By default, as `git checkout` with any other arguments, such a switch still runs the
+   * two-way merge from HEAD to HEAD (an unborn index is then checked out).
+   *
+   * @param only Whether only a switch to a named target merges
+   * @returns this for chaining
+   */
+  setOnlyMergeOnSwitchingBranches(only: boolean): this {
+    this.checkCallable();
+    this.onlyMergeOnSwitchingBranches = only;
+    return this;
+  }
+
+  /** Whether this switch skips merge_working_tree (see {@link setOnlyMergeOnSwitchingBranches}). */
+  private skipsMergeWorkingTree(): boolean {
+    if (!this.onlyMergeOnSwitchingBranches || this.orphan) return false;
+    if (this.createBranch || this.forceCreateBranch) return this.startPoint === undefined;
+    return this.detach && this.name === undefined;
   }
 
   /**
@@ -662,7 +696,14 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     return this;
   }
 
-  /** The git version whose prompts {@link setPatch} reproduces (default 2.56). */
+  /**
+   * The git version this checkout reproduces where they differ (default 2.56): the prompts
+   * of {@link setPatch}, and {@link setMerge}'s refusal. Under 2.43 a `-m` switch the
+   * two-way merge refuses dies with `fatal: cannot continue with staged changes in the
+   * following files:` when the index differs from HEAD (an unborn index always does, with
+   * HEAD's files as staged deletions), exit 128; 2.43's in-place merge of unstaged changes
+   * is not reproduced (the switch then takes 2.56's autostash).
+   */
   setCompatibility(version: PatchCompatibility): this {
     this.checkCallable();
     this.patchCompatibility = version;
@@ -784,6 +825,9 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     label: string,
     base: string,
   ): Promise<CheckoutResult | undefined> {
+    // create_autostash: nothing to stash in an unborn index (no unstaged changes without
+    // entries, has_uncommitted_changes 0 by is_index_unborn), so the refusal stands
+    if (await isIndexUnborn(this.staging)) return undefined;
     const message = `autostash while switching to '${label}'`;
     const stashId = await new StashCreateCommand(this._workingCopy)
       .setRef(null)
@@ -957,6 +1001,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       .setDetach(this.detach)
       .setTrack(this.track)
       .setOrphanFromEmptyTree(this.orphanFromEmptyTree)
+      .setOnlyMergeOnSwitchingBranches(this.onlyMergeOnSwitchingBranches)
       .setProtectUntracked(this.protectUntracked);
     if (this.createBranch) copy.setCreateBranch(true);
     if (this.name !== undefined) copy.setName(this.name);
@@ -1085,8 +1130,32 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       }
     }
 
+    // git's switch_branches without a target name (`switch -c <new>` or `switch --detach`
+    // without a start point, the bare `checkout -b <new>`: only_merge_on_switching_branches)
+    // does not run merge_working_tree: index and worktree stay as they are, an unborn index
+    // is not checked out
+    if (this.skipsMergeWorkingTree()) return this.updateRefsForSwitch(switchTo, [], [], []);
+
     // Get target tree for conflict detection and checkout
-    const targetTreeId = targetId ? await this.commits.getTree(targetId) : undefined;
+    const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
+    const headTreeId = headId ? await this.commits.getTree(headId) : undefined;
+    // git's initial checkout (`topts.initial_checkout = is_index_unborn(...)`): with no index
+    // file and no entries, twoway_merge takes every path of the target as new
+    // (merged_entry: written, untracked files in the way refused) instead of reading HEAD's
+    // files as staged deletions. `checkout --orphan` merges HEAD into HEAD (the new branch
+    // keeps its tree), which then checks HEAD's files out too.
+    // `checkout --orphan <new> <start-point>` merges to the start point's tree as a switch to
+    // that commit would.
+    const unborn = !this.force && (await isIndexUnborn(this.staging));
+    const orphanStart = switchTo.kind === "orphan" ? switchTo.startId : undefined;
+    const orphanCheckout = unborn && this.orphan && !this.orphanFromEmptyTree;
+    const targetTreeId = orphanStart
+      ? await this.commits.getTree(orphanStart)
+      : orphanCheckout
+        ? headTreeId
+        : targetId
+          ? await this.commits.getTree(targetId)
+          : undefined;
     // in a sparse checkout, unpack-trees with its patterns: a path that stays outside is
     // neither checked nor touched in the worktree (its index entry still switches)
     const sparse = await SparseUnpack.start({
@@ -1104,8 +1173,6 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // untracked files in the way and an index with unmerged entries. With `setForce`, as
     // `git checkout -f`, the target's tree replaces index and worktree whatever they hold.
     const worktree = this.worktreeAccess;
-    const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
-    const headTreeId = headId ? await this.commits.getTree(headId) : undefined;
     const head = new Map<string, Side>();
     const target = new Map<string, Side>();
     if (headTreeId) await this.collectTreeEntries(headTreeId, "", head);
@@ -1119,7 +1186,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
 
     // (an orphan branch keeps index and worktree as they are, as git's checkout --orphan;
     // switch --orphan switches to the empty tree)
-    const keepAll = this.orphan && !this.orphanFromEmptyTree;
+    const keepAll =
+      this.orphan && !this.orphanFromEmptyTree && !orphanCheckout && orphanStart === undefined;
     if (!this.force && !keepAll && unmerged.size > 0) {
       return {
         status: CheckoutStatus.CONFLICTS,
@@ -1139,10 +1207,15 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     const lostDirs: string[] = [];
     const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
     const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
+    const initial = unborn && !keepAll;
     const paths = [...new Set([...head.keys(), ...target.keys()])].sort();
     for (const path of keepAll ? [] : paths) {
       const h = head.get(path);
       const t = target.get(path);
+      if (initial && t) {
+        switched.push(path);
+        continue;
+      }
       if (!this.force && sameSide(h, t)) continue;
       const i = index.get(path);
       if (this.force) {
@@ -1248,6 +1321,19 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // in the way) falls back to an autostash, run by call() outside this worktree batch;
     // with nothing to stash the refusal stands
     const refused = local.length + untracked.length + untrackedRemoved.length + lostDirs.length;
+    if (this.merge && headId && refused > 0 && this.patchCompatibility === "2.43") {
+      // git 2.43's merge_working_tree: a failed two-way merge under `-m` dies when the index
+      // holds changes against HEAD (repo_index_has_changes), an unborn index's missing
+      // entries included (staged deletions of every HEAD file)
+      const staged = [...new Set([...index.keys(), ...head.keys()])]
+        .filter((p) => !sameSide(index.get(p), head.get(p)))
+        .sort(compareGitPaths);
+      if (staged.length > 0) {
+        throw new SwitchRefusedError(
+          `fatal: cannot continue with staged changes in the following files:\n${staged.join(" ")}`,
+        );
+      }
+    }
     if (this.merge && headId && refused > 0) {
       const left = await this.getCurrentBranch();
       // the base's label: the branch left, else its commit uniquely abbreviated
@@ -1408,6 +1494,19 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       pushSparseWarnings(sparseWarnings, sparse, outcome, true);
     }
 
+    return this.updateRefsForSwitch(switchTo, updated, removed, sparseWarnings);
+  }
+
+  /**
+   * git's update_refs_for_switch after the index and worktree are switched (or left alone):
+   * the new branch, HEAD and its reflog, remove_branch_state.
+   */
+  private async updateRefsForSwitch(
+    switchTo: SwitchPlan,
+    updated: string[],
+    removed: string[],
+    sparseWarnings: string[],
+  ): Promise<CheckoutResult> {
     // HEAD's reflog line (git's update_refs_for_switch): "checkout: moving from <branch
     // left, or the detached HEAD's full id> to <the name as interpreted: `-` and @{-N}
     // expanded, the new branch's name>", read before anything moves
@@ -1532,7 +1631,16 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     }
     if (this.orphan || this.createBranch) {
       if (!isValidBranchName(given)) throw new InvalidRefNameError(given);
-      if (this.orphan) return { kind: "orphan", branch: given, logName: given };
+      if (this.orphan && this.startPoint === undefined) {
+        // validate_new_branchname
+        if (await this.refsStore.has(`refs/heads/${given}`)) {
+          throw new RefAlreadyExistsError(
+            `refs/heads/${given}`,
+            `fatal: a branch named '${given}' already exists`,
+          );
+        }
+        return { kind: "orphan", branch: given, logName: given };
+      }
       // the start point as git's setup_branch_path names it: `-` and @{-N} expanded (the
       // reflog's "Created from feat", the branch tracked). git's parse_branchname_arg reads
       // it before validate_new_branchname looks at the branch: a start point that names
@@ -1555,13 +1663,19 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         );
       }
       // validate_new_branchname: `-b` refuses an existing branch, `-B` resets it
-      if (!this.forceCreateBranch && (await this.refsStore.has(`refs/heads/${given}`))) {
+      if (
+        (this.orphan || !this.forceCreateBranch) &&
+        (await this.refsStore.has(`refs/heads/${given}`))
+      ) {
         throw new RefAlreadyExistsError(
           `refs/heads/${given}`,
           `fatal: a branch named '${given}' already exists`,
         );
       }
       if (!targetId) throw nonCommit;
+      // `checkout --orphan <new> <start-point>`: the index and worktree merge to the start
+      // point's tree (switch_branches with the start point's commit), the new branch unborn
+      if (this.orphan) return { kind: "orphan", branch: given, logName: given, startId: targetId };
       return {
         kind: "create",
         branch: given,
