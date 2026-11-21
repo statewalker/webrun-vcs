@@ -119,6 +119,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   private shallowSince?: Date;
   private shallowExcludes: string[] = [];
   private unshallow = false;
+  private updateShallow = false;
 
   /**
    * Set the remote to fetch from.
@@ -530,6 +531,18 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
+   * `git fetch --update-shallow`: from a shallow remote, the shallow commits the fetched
+   * history needs are added to `.git/shallow`. Without it, each ref whose new history needs
+   * one is left alone, as git leaves it (`warning: rejected <ref> because shallow roots are
+   * not allowed to be updated` for one that would have been merged).
+   */
+  setUpdateShallow(updateShallow: boolean): this {
+    this.checkCallable();
+    this.updateShallow = updateShallow;
+    return this;
+  }
+
+  /**
    * Whether unshallow mode is enabled.
    */
   isUnshallow(): boolean {
@@ -688,6 +701,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       deepenSince: this.shallowSince,
       deepenNot: this.shallowExcludes.length > 0 ? this.shallowExcludes : undefined,
       unshallow: this.unshallow || undefined,
+      updateShallow: this.updateShallow || undefined,
       force: this.forceUpdate,
       atomic: this.atomic || undefined,
       dryRun: this.dryRun,
@@ -730,7 +744,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     // a failed --atomic transaction: git's error after the ref lines
     if (result.refTransactionError !== undefined) errors.push(result.refTransactionError);
 
-    const entries = await this.fetchHeadEntries(result, {
+    const marked = await this.fetchHeadEntries(result, {
       given: given.length,
       merge: mergeRefs,
       // explicit refspecs (and the HEAD of an unconfigured remote) are all to merge;
@@ -739,6 +753,18 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       firstIsExact: given.length > 0 && !parseRefSpec(given[0]).wildcard,
       hasMerge: upstream !== undefined,
     });
+    // store_updated_refs: a ref rejected for the shallow commits it needs is skipped, with
+    // git's warning when it is for merge
+    for (const e of marked) {
+      if (e.shallowRejected && !e.notForMerge) {
+        messages.push(
+          `warning: rejected ${e.localRef ?? e.remoteRef} because shallow roots are not allowed to be updated`,
+        );
+      }
+    }
+    const entries: FetchHeadEntry[] = marked
+      .filter((e) => !e.shallowRejected)
+      .map(({ oid, remoteRef, notForMerge }) => ({ oid, remoteRef, notForMerge }));
     // do_fetch: a ref update refused (non-fast-forward, a tag it would clobber) jumps to the
     // cleanup, past set_head (git 2.48+): the remote HEAD is not followed. FETCH_HEAD has its
     // lines all the same (append_fetch_head writes each as the refs are stored), except with
@@ -870,7 +896,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     };
     for (const merge of [true, false]) {
       for (const f of result.fetched) {
-        if (toMerge.has(f.remoteRef) !== merge) continue;
+        if (f.shallowRejected || toMerge.has(f.remoteRef) !== merge) continue;
         if (f.localRef) {
           if (!backfilled.has(f.localRef)) lineOf(byLocal.get(f.localRef));
         } else if (
@@ -1055,12 +1081,16 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       firstIsExact: boolean;
       hasMerge: boolean;
     },
-  ): Promise<FetchHeadEntry[]> {
+  ): Promise<Array<FetchHeadEntry & { localRef?: string; shallowRejected?: boolean }>> {
     const mergeSpec = (index: number | undefined) =>
       index !== undefined && index >= marks.given && index < marks.given + marks.merge.length
         ? index - marks.given
         : undefined;
-    const entries: (FetchHeadEntry & { refspec?: number })[] = [];
+    const entries: (FetchHeadEntry & {
+      refspec?: number;
+      localRef?: string;
+      shallowRejected?: boolean;
+    })[] = [];
     for (const fetched of result.fetched) {
       if (mergeSpec(fetched.refspec) !== undefined) continue;
       const fromGiven = fetched.refspec !== undefined && fetched.refspec < marks.given;
@@ -1069,6 +1099,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
         remoteRef: fetched.remoteRef,
         notForMerge: !(marks.explicit && fromGiven),
         refspec: fetched.refspec,
+        localRef: fetched.localRef,
+        ...(fetched.shallowRejected ? { shallowRejected: true } : {}),
       });
     }
     if (!marks.explicit) {
@@ -1092,7 +1124,13 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       for (const fetched of result.fetched) {
         const k = mergeSpec(fetched.refspec);
         if (k === undefined || matched.has(k)) continue;
-        extra.push({ oid: fetched.oid, remoteRef: fetched.remoteRef, notForMerge: false });
+        extra.push({
+          oid: fetched.oid,
+          remoteRef: fetched.remoteRef,
+          notForMerge: false,
+          localRef: fetched.localRef,
+          ...(fetched.shallowRejected ? { shallowRejected: true } : {}),
+        });
       }
       const tagsAt = entries.findIndex((e) => e.refspec === undefined || e.refspec >= marks.given);
       entries.splice(tagsAt < 0 ? entries.length : tagsAt, 0, ...extra);
@@ -1100,7 +1138,13 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     for (const entry of entries) {
       if (!entry.notForMerge && !(await this.peelsToCommit(entry.oid))) entry.notForMerge = true;
     }
-    return entries.map(({ oid, remoteRef, notForMerge }) => ({ oid, remoteRef, notForMerge }));
+    return entries.map(({ oid, remoteRef, notForMerge, localRef, shallowRejected }) => ({
+      oid,
+      remoteRef,
+      notForMerge,
+      ...(localRef !== undefined ? { localRef } : {}),
+      ...(shallowRejected ? { shallowRejected } : {}),
+    }));
   }
 
   /** Whether `id` is a commit, or a tag (chain) of one (git's lookup_commit_reference_gently). */

@@ -130,6 +130,23 @@ export interface FetchClientOptions {
   /** Log none of the ref updates (`git clone` stores the remote's refs unlogged) */
   skipReflog?: boolean;
   /**
+   * A clone (fetch-pack's `args->cloning`): the shallow commits of a shallow server (sent
+   * without a deepen request) are recorded as they come, those the pack brought
+   */
+  cloning?: boolean;
+  /**
+   * `git fetch --update-shallow`: the shallow commits of a shallow server that the fetched
+   * history needs are added to the shallow file, where without it each ref whose new history
+   * needs one is rejected ("shallow roots are not allowed to be updated")
+   */
+  updateShallow?: boolean;
+  /**
+   * `git clone`'s write_remote_refs: the refs the refspecs map are written in one initial
+   * transaction (`BatchOptions.initial`: packed-refs on a files store), then each followed
+   * tag in a transaction of its own (write_followtags)
+   */
+  initialTransaction?: boolean;
+  /**
    * `core.abbrev` as `parseCoreAbbrev` of vcs-core reads it: the length the summaries'
    * ids start from (-1, the default, for git's automatic length; 40 for full ids). Each is
    * lengthened until unique among the local objects (`RepositoryFacade.abbrevLengths`).
@@ -219,6 +236,13 @@ export interface FetchedRef {
    * adds `refs/tags/*:refs/tags/*` after them); undefined for a tag auto-follow took
    */
   refspec?: number;
+  /**
+   * Rejected because its history needs shallow commits of a shallow server that this
+   * repository does not have as shallow (fetch-pack's REF_STATUS_REJECT_SHALLOW, without
+   * `updateShallow`): neither written nor listed in `FETCH_HEAD`; git warns about it when it
+   * would have been for merge
+   */
+  shallowRejected?: boolean;
 }
 
 /**
@@ -355,6 +379,7 @@ export async function fetchFromConnection(
   for (const oid of before?.completeTips ?? []) localTips.add(oid);
   const complete = new Completeness(repository, localTips);
   let shallow = shallowBefore;
+  let serverShallow: ServerShallowInfo | undefined;
   const runFetchPack = async (wants: string[], request: Partial<FetchPackRequest>) => {
     const knownCommon: string[] = [];
     for (const ref of remoteRefs) {
@@ -363,6 +388,16 @@ export async function fetchFromConnection(
       }
     }
     let update: ServerShallowUpdate = { shallow: [], unshallow: [] };
+    // fetch-pack's shallow_info of a shallow server's commits sent without a deepen request
+    // (v0: advertised after its refs; v2: a shallow-info without unshallow lines), split
+    // before the pack comes into those here (and not shallow here) and those not here
+    const deepening =
+      request.depth !== undefined ||
+      request.deepenSince !== undefined ||
+      (request.deepenNot?.length ?? 0) > 0;
+    if (connection.version === 0 && !deepening && connection.advertisedShallow?.length) {
+      serverShallow = await shallowInfoOf(repository, connection.advertisedShallow, shallow);
+    }
     const fetched = await fetchPack(connection, source, {
       wants,
       localTips,
@@ -374,7 +409,16 @@ export async function fetchFromConnection(
       importPack: options.dryRun
         ? drainPack
         : (pack) => repository.importPack(pack, options.keepPack ? { keepPack: true } : undefined),
-      onShallowUpdate: (u) => {
+      onShallowUpdate: async (u) => {
+        if (
+          connection.version === 2 &&
+          !deepening &&
+          u.unshallow.length === 0 &&
+          u.shallow.length > 0
+        ) {
+          serverShallow = await shallowInfoOf(repository, u.shallow, shallow);
+          return;
+        }
         update = u;
         const changed = applyShallow(shallow, u) !== shallow;
         if (changed && !refStore.setShallow && !options.dryRun) {
@@ -442,6 +486,12 @@ export async function fetchFromConnection(
       }
     }
   }
+  // the refs fetch-pack was asked for (transport_fetch_refs: those not up to date here)
+  const sought: PlannedRef[] = [];
+  for (const p of planned) {
+    if (!p.localRef || (await refStore.get(p.localRef)) !== p.oid) sought.push(p);
+  }
+  const shallowRejected = new Set<PlannedRef>();
   if (wants.length > 0) {
     await runFetchPack(wants, {
       depth,
@@ -449,6 +499,38 @@ export async function fetchFromConnection(
       deepenSince,
       deepenNot: options.deepenNot,
     });
+    // fetch-pack's update_shallow for the shallow commits of a shallow server
+    const info = serverShallow;
+    serverShallow = undefined;
+    if (info && !options.dryRun) {
+      const recorded = await updateServerShallow(info, {
+        repository,
+        refStore,
+        shallow,
+        cloning: options.cloning === true,
+        updateShallow: options.updateShallow === true,
+        sought,
+      });
+      if (recorded.shallow !== shallow) {
+        await refStore.setShallow?.(recorded.shallow, shallow);
+        shallow = recorded.shallow;
+      }
+      for (const p of recorded.rejected) shallowRejected.add(p);
+    }
+  }
+  if (shallowRejected.size > 0) {
+    // neither written nor in FETCH_HEAD; fetch.c skips them in its summary
+    for (let i = planned.length - 1; i >= 0; i--) {
+      if (shallowRejected.has(planned[i] as PlannedRef)) planned.splice(i, 1);
+    }
+    for (let i = opportunistic.length - 1; i >= 0; i--) {
+      const o = opportunistic[i] as PlannedRef;
+      if ([...shallowRejected].some((p) => p.remoteRef === o.remoteRef)) opportunistic.splice(i, 1);
+    }
+    const rejectedKeys = new Set([...shallowRejected].map((p) => `${p.remoteRef}\0${p.localRef}`));
+    for (const f of result.fetched) {
+      if (rejectedKeys.has(`${f.remoteRef}\0${f.localRef}`)) f.shallowRejected = true;
+    }
   }
 
   // tag auto-follow
@@ -571,6 +653,13 @@ export async function fetchFromConnection(
       reflogAction: options.reflogAction,
       ident: options.reflogIdent,
       skipReflog: options.skipReflog,
+      ...(options.initialTransaction
+        ? {
+            initial: new Set(
+              [...planned, ...opportunistic].flatMap((p) => (p.localRef ? [p.localRef] : [])),
+            ),
+          }
+        : {}),
     });
     if (failure !== undefined) result.refTransactionError = failure;
   }
@@ -649,4 +738,128 @@ async function drainPack(pack: AsyncIterable<Uint8Array>): Promise<PackImportRes
     commitsImported: 0,
     tagsImported: 0,
   };
+}
+
+/** fetch-pack's shallow_info: a shallow server's commits, split as prepare_shallow_info does. */
+interface ServerShallowInfo {
+  /** As the server sent them */
+  list: string[];
+  /** Here before the pack, and not shallow here */
+  ours: string[];
+  /** Not here before the pack */
+  theirs: string[];
+}
+
+async function shallowInfoOf(
+  repository: RepositoryFacade,
+  list: readonly string[],
+  ownShallow: readonly string[],
+): Promise<ServerShallowInfo> {
+  const own = new Set(ownShallow);
+  const ours: string[] = [];
+  const theirs: string[] = [];
+  for (const oid of list) {
+    if (!(await repository.has(oid))) theirs.push(oid);
+    else if (!own.has(oid)) ours.push(oid);
+  }
+  return { list: [...list], ours, theirs };
+}
+
+/**
+ * fetch-pack's update_shallow for a shallow server's commits once the pack is in: a clone
+ * records those the pack brought; otherwise, of those not here before, the ones the pack
+ * brought count (remove_nonexistent_theirs_shallow), and with `updateShallow` they and the
+ * ones here before are recorded, else each sought ref whose new history needs one is rejected
+ * (assign_shallow_commits_to_refs: walking down from the ref, stopping at the local refs' tips
+ * and at those commits, it reaches one not here before, or one here before that no local ref
+ * reaches). Returns the shallow file to write and the rejected refs.
+ */
+async function updateServerShallow(
+  info: ServerShallowInfo,
+  context: {
+    repository: RepositoryFacade;
+    refStore: RefStore;
+    shallow: string[];
+    cloning: boolean;
+    updateShallow: boolean;
+    sought: readonly PlannedRef[];
+  },
+): Promise<{ shallow: string[]; rejected: PlannedRef[] }> {
+  const { repository, refStore } = context;
+  const unchanged = { shallow: context.shallow, rejected: [] as PlannedRef[] };
+  const record = (extra: readonly string[]) => {
+    const after = applyShallow(context.shallow, { shallow: [...extra], unshallow: [] });
+    if (after !== context.shallow && !refStore.setShallow) {
+      throw new Error("The server sent shallow commits this ref store cannot record");
+    }
+    return { shallow: after, rejected: [] as PlannedRef[] };
+  };
+  if (info.list.length === 0) return unchanged;
+  if (context.cloning) {
+    // a clone: any shallow commit the pack brought (nothing was here before)
+    const extra: string[] = [];
+    for (const oid of info.list) if (await repository.has(oid)) extra.push(oid);
+    return extra.length > 0 ? record(extra) : unchanged;
+  }
+  if (info.ours.length === 0 && info.theirs.length === 0) return unchanged;
+  const theirs: string[] = [];
+  for (const oid of info.theirs) if (await repository.has(oid)) theirs.push(oid);
+  if (info.ours.length === 0 && theirs.length === 0) return unchanged;
+  if (context.updateShallow) return record([...info.ours, ...theirs]);
+
+  const getCommitInfo = repository.getCommitInfo?.bind(repository);
+  // without the commit graph nothing can be checked: every sought ref is refused
+  if (!getCommitInfo) return { shallow: context.shallow, rejected: [...context.sought] };
+  const own = new Set(context.shallow);
+  const parentsOf = async (oid: string) =>
+    own.has(oid) ? [] : ((await getCommitInfo(oid))?.parents ?? []);
+  const peel = async (oid: string) => {
+    let id = oid;
+    for (let i = 0; i < 16 && repository.peelTag; i++) {
+      const next = await repository.peelTag(id);
+      if (!next || next === id) break;
+      id = next;
+    }
+    return (await getCommitInfo(id)) ? id : undefined;
+  };
+  const localTips = new Set<string>();
+  for (const [, oid] of await refStore.listAll()) {
+    const commit = await peel(oid);
+    if (commit) localTips.add(commit);
+  }
+  const oursSet = new Set(info.ours);
+  const theirsSet = new Set(theirs);
+  // the commits the local refs reach (in_merge_bases_many), walked once when first needed
+  let reachable: Set<string> | undefined;
+  const reachedLocally = async (oid: string) => {
+    if (!reachable) {
+      reachable = new Set();
+      const stack = [...localTips];
+      while (stack.length > 0) {
+        const c = stack.pop() as string;
+        if (reachable.has(c)) continue;
+        reachable.add(c);
+        stack.push(...(await parentsOf(c)));
+      }
+    }
+    return reachable.has(oid);
+  };
+  const rejected: PlannedRef[] = [];
+  for (const ref of context.sought) {
+    const tip = await peel(ref.oid);
+    if (!tip) continue;
+    let needs = false;
+    const seen = new Set<string>();
+    const stack = [tip];
+    while (stack.length > 0 && !needs) {
+      const c = stack.pop() as string;
+      if (seen.has(c) || localTips.has(c)) continue;
+      seen.add(c);
+      if (theirsSet.has(c)) needs = true;
+      else if (oursSet.has(c)) needs = !(await reachedLocally(c));
+      else stack.push(...(await parentsOf(c)));
+    }
+    if (needs) rejected.push(ref);
+  }
+  return { shallow: context.shallow, rejected };
 }

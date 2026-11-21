@@ -558,6 +558,10 @@ export async function handleInfoRefs(
     const capsStr = capabilities.join(" ");
     chunks.push(encodePacketLine(`${ZERO_OID} capabilities^{}\0${capsStr}\n`));
   }
+  // git's advertise_shallow_grafts: a shallow repository's shallow commits after the refs
+  for (const oid of (await refStore.getShallow?.()) ?? []) {
+    chunks.push(encodePacketLine(`shallow ${oid}\n`));
+  }
 
   chunks.push(encodeFlush());
 

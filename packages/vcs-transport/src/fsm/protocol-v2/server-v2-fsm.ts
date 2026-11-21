@@ -14,11 +14,13 @@ import {
   authorizeUpload,
   computeShallowUpdate,
   findUnreachableWant,
+  INFINITE_DEPTH,
   includeTagCandidates,
   notifyUpload,
   notOurRef,
   okToGiveUp,
   peelFully,
+  prepareServedShallow,
   resolveDeepenNot,
   type ShallowUpdate,
   sendPackStream,
@@ -301,6 +303,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
     async (ctx) => {
       try {
         const state = ctx.state as ServerV2State;
+        await prepareServedShallow(ctx);
         state.fetchRequest = createEmptyFetchRequest();
         state.sendAcks = undefined;
         state.shallowUpdate = undefined;
@@ -597,16 +600,25 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
         const state = ctx.state as ServerV2State;
         const req = state.fetchRequest;
 
-        // git's send_shallow_info: only for a deepen request, or a client that is shallow
+        // git's send_shallow_info: only for a deepen request, a client that is shallow, or a
+        // served repository that is shallow itself
+        const repositoryShallow = ctx.state.repositoryShallow ?? new Set<string>();
+        const byRevList = req?.deepenSince !== undefined || !!req?.deepenNot?.length;
         if (
           !req ||
           (req.deepen === 0 &&
-            req.deepenSince === undefined &&
-            !req.deepenNot?.length &&
-            req.shallow.length === 0)
+            !byRevList &&
+            req.shallow.length === 0 &&
+            repositoryShallow.size === 0)
         ) {
           return "NO_SHALLOW";
         }
+        // ...where a request that deepens nothing walks the whole history from the wants
+        // (deepen(INFINITE_DEPTH)): the shallow commits it reaches are the client's too
+        const depth =
+          req.deepen === 0 && !byRevList && repositoryShallow.size > 0
+            ? INFINITE_DEPTH
+            : req.deepen;
 
         let update: ShallowUpdate;
         try {
@@ -623,11 +635,12 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           update = await computeShallowUpdate(ctx.repository, {
             wants: ctx.state.wants,
             clientShallow: req.shallow,
-            depth: req.deepen,
+            depth,
             deepenRelative: req.deepenRelative,
             deepenSince: req.deepenSince,
             deepenNot,
             tips: [...(await ctx.refStore.listAll())].map(([, oid]) => oid),
+            serverShallow: repositoryShallow,
           });
         } catch (e) {
           if (!(e instanceof UploadPackRequestError)) throw e;

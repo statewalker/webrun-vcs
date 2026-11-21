@@ -127,6 +127,20 @@ export interface BatchOptions extends RefLogOptions {
    */
   skipReflog?: boolean;
   /**
+   * git's initial ref transaction (REF_TRANSACTION_FLAG_INITIAL, `git clone`'s
+   * write_remote_refs): every command creates a ref under `refs/` that does not exist yet. A
+   * git files store writes them all straight into packed-refs (no loose file, no reflog) and
+   * tells its reference-transaction hook as git does (2.43: `prepared`, `committed`; 2.5x:
+   * `preparing`, `prepared`, then the packed store's `preparing`, `prepared`, never
+   * `committed`). Other stores apply it as a plain batch.
+   *
+   * @example
+   * ```typescript
+   * await refs.batch([{ name: "refs/remotes/origin/main", old: null, new: id }], { initial: true });
+   * ```
+   */
+  initial?: boolean;
+  /**
    * A batch with no command still runs as a transaction its reference-transaction hook is
    * told about (`preparing`, `prepared`, `committed` with no line): git 2.5x's receive-pack
    * commits the transaction of a phase whose every update was refused
@@ -466,7 +480,8 @@ export function planReflog(updates: PlannedRefUpdate[], options: BatchOptions = 
   const writes: ReflogWrite[] = [];
   const create = logsByDefault;
   for (const u of updates) {
-    if (options.skipReflog) {
+    // an initial transaction stores its refs unlogged, as git's packed-refs holds no log
+    if (options.skipReflog || options.initial) {
       if (u.newValue === null) writes.push({ op: "drop", name: u.name });
       continue;
     }

@@ -305,6 +305,12 @@ export async function applyRefUpdates(
     reflogAction?: string;
     ident?: string;
     skipReflog?: boolean;
+    /**
+     * The refs written in one initial transaction (git clone's write_remote_refs:
+     * `BatchOptions.initial`, packed-refs on a files store) before the others, each of which
+     * is then written on its own (write_followtags). Git's error when it failed.
+     */
+    initial?: ReadonlySet<string>;
   } = {},
 ): Promise<string | undefined> {
   // git's fetch --atomic: a ref refused before the transaction (non-fast-forward, a tag it
@@ -367,7 +373,31 @@ export async function applyRefUpdates(
     }
     return transactionError(writes, result.rejected, refStore);
   }
-  for (const u of writes) {
+  let rest = writes;
+  if (options.initial) {
+    const initial = options.initial;
+    const first = writes.filter((u) => initial.has(u.localRef));
+    rest = writes.filter((u) => !initial.has(u.localRef));
+    if (first.length > 0) {
+      const result = await refStore.batch(
+        first.map((u) => ({ name: u.localRef, old: null, new: u.newOid })),
+        {
+          initial: true,
+          skipReflog: true,
+          ...(options.ident !== undefined ? { ident: options.ident } : {}),
+        },
+      );
+      if (!result.ok) {
+        const reasons = new Map(result.rejected.map((r) => [r.name, r.reason]));
+        for (const u of first) {
+          reject(u, reasons.get(u.localRef) ?? "initial transaction failed");
+          u.aborted = true;
+        }
+        return transactionError(first, result.rejected, refStore);
+      }
+    }
+  }
+  for (const u of rest) {
     const result = await refStore.batch([command(u)], logOf(u));
     if (!result.ok) reject(u, result.rejected[0]?.reason ?? "rejected");
   }
