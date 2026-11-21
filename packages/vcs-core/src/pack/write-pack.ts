@@ -208,7 +208,9 @@ export async function* writePack(
     for (const p of order) {
       const e = await options.packs.entry(p.id);
       if (!e) continue;
-      if (e.kind <= 4 && reuseDeltas && e.packId !== undefined) p.wholeIn = e.packId;
+      // git turns reuse_delta off without reuse_object (`-F`), and with it the same-pack skip
+      if (e.kind <= 4 && reuseDeltas && reuseObjects && e.packId !== undefined)
+        p.wholeIn = e.packId;
       if (e.kind <= 4 && reuseObjects) {
         p.reuse = e;
         p.type = TYPE_NAME[e.kind];
