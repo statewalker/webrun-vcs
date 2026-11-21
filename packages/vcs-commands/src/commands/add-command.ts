@@ -522,12 +522,6 @@ export class AddCommand extends GitCommand<AddResult> {
       paths: this.filepatterns,
       compatibility: this.compatibility,
       hookSource: this,
-      add: async ({ paths, update }) => {
-        const add = new AddCommand(this.workingCopy).shareHooksOf(this);
-        add.setCompatibility(this.compatibility).setUpdate(update);
-        for (const path of paths) add.addFilepattern(`:(literal)${path}`);
-        await add.call();
-      },
     });
     return {
       added: interactive.added,

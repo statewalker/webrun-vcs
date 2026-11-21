@@ -57,6 +57,8 @@ async function compare(
   answers: string[],
   paths: string[] = [],
   options: { context?: number; interHunkContext?: number } = {},
+  /** Evens out what names the repository's own directory (a lock file's path) */
+  normalize: (text: string, dir: string) => string = (text) => text,
 ): Promise<{ stdout: string; requests: PatchRequest[] }> {
   const flags = [
     ...(options.context !== undefined ? [`-U${options.context}`] : []),
@@ -79,8 +81,12 @@ async function compare(
   for (const p of paths) cmd.addFilepattern(p);
   if (flags.length > 0) cmd.setPatchOptions(options);
   const result = await cmd.call();
-  expect(result.interactive?.output).toBe(n.stdout);
-  expect(result.interactive?.errors).toBe(n.stderr);
+  expect(normalize(result.interactive?.output ?? "", dirs.ours)).toBe(
+    normalize(n.stdout, dirs.native),
+  );
+  expect(normalize(result.interactive?.errors ?? "", dirs.ours)).toBe(
+    normalize(n.stderr, dirs.native),
+  );
   expect(n.status).toBe(0);
   expect(snapshot(root, dirs.ours)).toEqual(snapshot(root, dirs.native));
   return { stdout: n.stdout, requests };
@@ -294,5 +300,102 @@ describeGit("add -i as native git", () => {
       context: 1,
       interHunkContext: 4,
     });
+  });
+  it("reports unmerged entries left after a revert, without 'reverted'", async () => {
+    const conflict = (dir: string) => {
+      put(dir, "c", "base\n");
+      gitOk(root, dir, "add", "c");
+      gitOk(root, dir, "commit", "-qm", "base");
+      gitOk(root, dir, "checkout", "-qb", "side");
+      put(dir, "c", "side\n");
+      put(dir, "n", "side\n");
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-qm", "side");
+      gitOk(root, dir, "checkout", "-q", "main");
+      put(dir, "c", "main\n");
+      put(dir, "n", "main\n");
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-qm", "main");
+      spawnSync("git", ["merge", "-q", "side"], { cwd: dir, env: nativeGitEnv(root) });
+      put(dir, "x", "x\n");
+      gitOk(root, dir, "add", "x");
+    };
+    const { stdout } = await compare(twins(conflict), ["r", "c", "", "r", "x"]);
+    expect(stdout).toContain("n: needs merge\n");
+    expect(stdout).not.toContain("reverted");
+  });
+
+  it("stages each path as add_file_to_index, stopping at one it cannot add", async () => {
+    const toDirectory = (dir: string) => {
+      put(dir, "s", "s\n");
+      put(dir, "t", "t\n");
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-qm", "base");
+      unlinkSync(join(dir, "s"));
+      put(dir, "s/x", "x\n");
+      put(dir, "t", "t2\n");
+    };
+    const failed = await compare(twins(toDirectory), ["u", "*", "", "s", "q"]);
+    expect(failed.stdout).not.toContain("updated");
+    const toRepository = (dir: string) => {
+      put(dir, "s", "s\n");
+      put(dir, "t", "t\n");
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-qm", "base");
+      unlinkSync(join(dir, "s"));
+      gitOk(root, dir, "init", "-q", "s");
+      put(dir, "t", "t2\n");
+    };
+    await compare(twins(toRepository), ["u", "*", "", "q"]);
+    const deleted = (dir: string) => {
+      put(dir, "s", "s\n");
+      put(dir, "t", "t\n");
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-qm", "base");
+      unlinkSync(join(dir, "t"));
+      put(dir, "s", "s2\n");
+      put(dir, "u", "u\n");
+    };
+    await compare(twins(deleted), ["u", "*", "", "a", "*", "", "s", "q"]);
+  });
+
+  it("adds untracked files outside the sparse-checkout patterns", async () => {
+    const sparse = (dir: string) => {
+      put(dir, "a", "a\n");
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-qm", "base");
+      gitOk(root, dir, "sparse-checkout", "set", "--no-cone", "/a");
+      put(dir, "d/new", "n\n");
+      put(dir, "new2", "n\n");
+    };
+    const { stdout } = await compare(twins(sparse, false), ["a", "*", "s", "q"]);
+    expect(stdout).toContain("added 2 paths\n");
+  });
+
+  it("reports the index lock another process holds", async () => {
+    const locked = (dir: string) => {
+      put(dir, "a", "a\n");
+      gitOk(root, dir, "add", ".");
+      gitOk(root, dir, "commit", "-qm", "base");
+      put(dir, "a", "b\n");
+      gitOk(root, dir, "add", "a");
+      put(dir, "a", "c\n");
+      put(dir, "u", "u\n");
+      put(dir, ".git/index.lock", "");
+    };
+    const dirs = twins(locked, false);
+    const normalize = (text: string, dir: string) => text.split(dir).join("<dir>");
+    const answers = ["u", "1", "", "r", "1", "", "a", "1", "", "q"];
+    await compare(dirs, answers, [], {}, normalize);
+    for (const dir of [dirs.native, dirs.ours]) unlinkSync(join(dir, ".git/index.lock"));
+  });
+
+  it("numbers names in strcmp order (UTF-8 bytes)", async () => {
+    const names = (dir: string) => {
+      put(dir, "\uff5e", "x\n");
+      put(dir, "\u{1f600}", "y\n");
+      put(dir, "b", "z\n");
+    };
+    await compare(twins(names, false), ["a", "3", "", "s", "q"]);
   });
 });

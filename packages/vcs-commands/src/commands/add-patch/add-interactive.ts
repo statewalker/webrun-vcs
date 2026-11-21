@@ -7,12 +7,19 @@
  */
 
 import { EMPTY_TREE_ID, type ObjectId } from "@statewalker/vcs-core";
-import type { ResolveUndoRecord, StagingEntry } from "@statewalker/vcs-working-tree";
+import type {
+  ResolveUndoRecord,
+  StagingEntry,
+  StagingIndexLock,
+  Worktree,
+} from "@statewalker/vcs-working-tree";
 
+import { GitApiError } from "../../errors/index.js";
 import { GitCommand } from "../../git-command.js";
 import type { WorkingCopy } from "../../types.js";
+import { worktreeModeTrust } from "../core-config.js";
 import { DiffCommand } from "../diff-command.js";
-import { addLeadingDirs, stageZeroClashes } from "../index-adder.js";
+import { AddToIndexError, addLeadingDirs, IndexAdder, stageZeroClashes } from "../index-adder.js";
 import { flatTree, rewriteIndex } from "../merge-support.js";
 import { StatusCommand } from "../status-command.js";
 import type { PatchCompatibility, PatchRequest, PatchSelector } from "./add-patch.js";
@@ -32,9 +39,6 @@ export interface AddInteractiveResult {
   reverted: string[];
 }
 
-/** The `git add` a session runs for update and add untracked (`add_file_to_index`). */
-export type InteractiveAdder = (options: { paths: string[]; update: boolean }) => Promise<void>;
-
 /** Options of {@link runAddInteractive}. */
 export interface AddInteractiveOptions extends PatchOptions {
   selector: PatchSelector;
@@ -42,8 +46,6 @@ export interface AddInteractiveOptions extends PatchOptions {
   paths?: string[];
   /** Default 2.56 */
   compatibility?: PatchCompatibility;
-  /** Stages paths as `add_file_to_index` does (an `AddCommand`) */
-  add: InteractiveAdder;
   /** The command running the session: hooks of the index writes run in its session */
   hookSource?: GitCommand<unknown>;
 }
@@ -71,8 +73,21 @@ const newItem = (name: string): Item => ({
   worktree: newAddDel(),
 });
 
-/** strcmp's order (the paths' code points, as their UTF-8 bytes sort) */
-const byName = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+/**
+ * strcmp's order: the paths' UTF-8 bytes, which sort as their code points (not as UTF-16
+ * code units: U+FF5E before U+1F600, whose surrogates come first in UTF-16)
+ */
+function byName(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a.charCodeAt(i);
+    const y = b.charCodeAt(i);
+    if (x === y) continue;
+    if (x < 0xd800 && y < 0xd800) return x - y;
+    return (a.codePointAt(i) as number) - (b.codePointAt(i) as number);
+  }
+  return a.length - b.length;
+}
 
 const isAscii = (c: string | undefined) => c !== undefined && c.charCodeAt(0) < 0x80;
 const isDigit = (c: string | undefined) => c !== undefined && c >= "0" && c <= "9";
@@ -204,6 +219,7 @@ class AddInteractiveSession extends GitCommand<AddInteractiveResult> {
     private readonly options: AddInteractiveOptions,
   ) {
     super(workingCopy);
+    if (options.hookSource) this.shareHooksOf(options.hookSource);
   }
 
   private get modern(): boolean {
@@ -253,9 +269,12 @@ class AddInteractiveSession extends GitCommand<AddInteractiveResult> {
           "           - (empty) select nothing\n";
       },
     };
-    // repo_refresh_and_write_index (REFRESH_QUIET): its `needs merge` lines go to stdout
+    // repo_refresh_and_write_index (REFRESH_QUIET, gentle: an index lock another process
+    // holds leaves the refresh in memory, unreported): its `needs merge` lines go to stdout
     try {
-      this.out += await this.sharing(new IndexRefresh(this.workingCopy)).call();
+      this.out += (
+        await this.sharing(new IndexRefresh(this.workingCopy)).setGentle().refresh()
+      ).output;
     } catch {
       this.err += "warning: could not refresh index\n";
     }
@@ -554,16 +573,109 @@ class AddInteractiveSession extends GitCommand<AddInteractiveResult> {
     this.out += "\n";
   }
 
-  /** add_file_to_index (or remove_file_from_index) of each path; false on a failure */
-  private async stage(paths: string[], update: boolean): Promise<boolean> {
+  /**
+   * `repo_hold_locked_index(LOCK_REPORT_ON_ERROR)`: the index lock (null for a staging
+   * without an index file), or false with git's error printed when another process holds it.
+   */
+  private async holdIndex(): Promise<StagingIndexLock | null | false> {
+    await this.readCurrentIndex(false);
+    const staging = this.staging;
+    if (!staging.lockIndex) return null;
     try {
-      await this.options.add({ paths, update });
+      return await staging.lockIndex();
+    } catch (error) {
+      if ((error as Error)?.name !== "IndexLockedError") throw error;
+      // lockfile.c's unable_to_lock_message, the lock named by its absolute path
+      const lockPath = await this.hooks.gitPath("index.lock", true);
+      const advice = this.modern
+        ? "Another git process seems to be running in this repository, or the lock file may be stale\n"
+        : "Another git process seems to be running in this repository, e.g.\n" +
+          "an editor opened by 'git commit'. Please make sure all processes\n" +
+          "are terminated then try again. If it still fails, a git process\n" +
+          "may have crashed in this repository earlier:\n" +
+          "remove the file manually to continue.\n";
+      this.err += `error: Unable to create '${lockPath}': File exists.\n\n${advice}`;
+      return false;
+    }
+  }
+
+  /** The index written through the lock held (`write_locked_index(COMMIT_LOCK)`). */
+  private async commitIndex(lock: StagingIndexLock | null): Promise<void> {
+    if (!lock) return this.staging.write();
+    await lock.write();
+    await lock.commit();
+  }
+
+  /**
+   * run_update's and run_add_untracked's loop under the index lock: `add_file_to_index` of
+   * each path (update: `remove_file_from_index` of a file gone), stopping at the first that
+   * fails (`could not stage`) with the index left unwritten (the paths before it staged in
+   * memory, as git's index keeps them); no pathspec or sparse-checkout check. False on a
+   * failure.
+   */
+  private async stage(paths: string[], update: boolean): Promise<boolean> {
+    const lock = await this.holdIndex();
+    if (lock === false) return false;
+    let written = false;
+    try {
+      const worktree = this.workingCopy.worktree;
+      if (!worktree) throw new GitApiError("fatal: this operation must be run in a work tree");
+      const adder = await IndexAdder.open(
+        this.staging,
+        this.blobs,
+        worktreeModeTrust(this.workingCopy, worktree),
+      );
+      for (const path of paths) {
+        const failure = await this.stageOne(adder, worktree, path, update);
+        if (failure) {
+          await adder.finish();
+          for (const line of failure) this.err += `${line}\n`;
+          this.err += `error: could not stage '${path}'\n`;
+          return false;
+        }
+      }
+      await adder.finish();
+      await this.commitIndex(lock);
+      written = true;
       this.added.push(...paths);
       return true;
+    } finally {
+      if (!written) await lock?.rollback();
+    }
+  }
+
+  /** add_file_to_index (or remove_file_from_index) of one path: git's error lines, if any. */
+  private async stageOne(
+    adder: IndexAdder,
+    worktree: Worktree,
+    path: string,
+    update: boolean,
+  ): Promise<string[] | undefined> {
+    const entry = await worktree.getEntry(path);
+    if (!entry) {
+      if (await worktree.isSpecialFile?.(path)) {
+        return [`error: ${path}: can only add regular files, symbolic links or git-directories`];
+      }
+      if (update) {
+        adder.remove(path);
+        return undefined;
+      }
+      // add_file_to_index's die_errno
+      throw new GitApiError(`fatal: unable to stat '${path}': No such file or directory`);
+    }
+    try {
+      await adder.add(worktree, path, entry, {
+        onWarning: (message) => {
+          this.err += `${message}\n`;
+        },
+      });
+      return undefined;
     } catch (error) {
-      const message = (error as Error).message ?? String(error);
-      this.err += `${message.startsWith("error:") || message.startsWith("fatal:") ? message : `error: could not stage '${paths[0]}'`}\n`;
-      return false;
+      if (!(error instanceof AddToIndexError)) throw error;
+      // git 2.43's add_to_index has no "unable to index file" line
+      return this.modern
+        ? error.lines
+        : error.lines.filter((line) => !line.startsWith("error: unable to index file"));
     }
   }
 
@@ -578,15 +690,37 @@ class AddInteractiveSession extends GitCommand<AddInteractiveResult> {
       this.sortedFiles(),
       this.fileChooser("Revert"),
     );
-    if (count > 0) {
-      const paths = this.chosen();
-      await this.revertPaths(paths);
-      // repo_refresh_and_write_index after the write
-      this.out += await this.sharing(new IndexRefresh(this.workingCopy)).call();
-      this.reverted.push(...paths);
-      this.out += `reverted ${count} path${count === 1 ? "" : "s"}\n`;
-    }
+    if (count > 0) await this.revertChosen(count);
     this.out += "\n";
+  }
+
+  /** run_revert once the paths are chosen: under the index lock, then a gentle refresh. */
+  private async revertChosen(count: number): Promise<void> {
+    const lock = await this.holdIndex();
+    if (lock === false) return;
+    const paths = this.chosen();
+    let written = false;
+    try {
+      await this.revertPaths(paths);
+      await this.commitIndex(lock);
+      written = true;
+    } finally {
+      if (!written) await lock?.rollback();
+    }
+    this.reverted.push(...paths);
+    // repo_refresh_and_write_index (gentle) after the write: "reverted" only when it found
+    // no error (an unmerged entry left) and could write
+    let clean = false;
+    try {
+      const refreshed = await this.sharing(new IndexRefresh(this.workingCopy))
+        .setGentle()
+        .refresh();
+      this.out += refreshed.output;
+      clean = !refreshed.hasErrors;
+    } catch {
+      clean = false;
+    }
+    if (clean) this.out += `reverted ${count} path${count === 1 ? "" : "s"}\n`;
   }
 
   /**
@@ -596,7 +730,6 @@ class AddInteractiveSession extends GitCommand<AddInteractiveResult> {
    * untracked now.").
    */
   private async revertPaths(paths: string[]): Promise<void> {
-    await this.readCurrentIndex(false);
     const head = await this.headId();
     const treeId = head ? await this.revisionResolver().peelToType(head, "tree") : undefined;
     const tree = await flatTree(this.trees, treeId);
@@ -668,8 +801,10 @@ class AddInteractiveSession extends GitCommand<AddInteractiveResult> {
       ]);
     }
     if (undo.length > 0) this.staging.recordResolveUndo?.(undo);
-    if (changes.size > 0) await rewriteIndex(this.staging, changes, { upToDate: false });
-    else await this.staging.write();
+    // written by the caller, through its lock
+    if (changes.size > 0) {
+      await rewriteIndex(this.staging, changes, { upToDate: false, write: false });
+    }
   }
 
   private async runAddUntracked(): Promise<void> {
