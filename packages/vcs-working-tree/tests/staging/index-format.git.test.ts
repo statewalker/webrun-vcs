@@ -186,17 +186,37 @@ describe("GitStaging rewrites git's index through index.lock, keeping what still
     expect(git(dir, ["ls-files", "--resolve-undo"])).toBe(undoBefore);
   });
 
-  it("refuses to rewrite a split index (required 'link' extension)", async () => {
+  it("reads and rewrites a split index (required 'link' extension), REUC kept", async () => {
     const dir = resolvedConflictRepo();
     git(dir, ["update-index", "--split-index"]);
     const before = readFileSync(join(dir, ".git/index"));
     expect((await parseIndexFile(new Uint8Array(before))).extensions).toContain("link");
+    const listed = git(dir, ["ls-files", "-s"]);
+    const undoBefore = git(dir, ["ls-files", "--resolve-undo"]);
     const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
-    // its entries cannot be read without the shared index, so it is refused on read
-    await expect(staging.read()).rejects.toThrow("required extension 'link'");
-    // and a write after that failed read does not replace it with an empty index
-    await expect(staging.write()).rejects.toThrow("required extension 'link'");
-    expect(readFileSync(join(dir, ".git/index")).equals(before)).toBe(true);
+    await staging.read();
+    await staging.write();
+    const after = await parseIndexFile(new Uint8Array(readFileSync(join(dir, ".git/index"))));
+    expect(after.extensions[0]).toBe("link");
+    expect(after.extensions).toContain("REUC");
+    expect(git(dir, ["ls-files", "-s"])).toBe(listed);
+    expect(git(dir, ["ls-files", "--resolve-undo"])).toBe(undoBefore);
+    expect(existsSync(join(dir, ".git/index.lock"))).toBe(false);
+  });
+
+  it("refuses to rewrite an index with an unknown required extension", async () => {
+    const dir = resolvedConflictRepo();
+    const index = readFileSync(join(dir, ".git/index"));
+    const body = index.subarray(0, index.length - 20);
+    const ext = Buffer.concat([Buffer.from("zzzz"), Buffer.from([0, 0, 0, 0])]);
+    const content = Buffer.concat([body, ext]);
+    const bytes = Buffer.concat([content, createHash("sha1").update(content).digest()]);
+    writeFileSync(join(dir, ".git/index"), bytes);
+    const staging = createGitStaging(createNodeFilesApi({ rootDir: dir }), ".git/index");
+    await expect(staging.read()).rejects.toThrow("required extension 'zzzz'");
+    // a write after that failed read does not replace it with an empty index
+    await expect(staging.write()).rejects.toThrow("required extension 'zzzz'");
+    expect(readFileSync(join(dir, ".git/index")).equals(bytes)).toBe(true);
     expect(existsSync(join(dir, ".git/index.lock"))).toBe(false);
   });
 

@@ -262,15 +262,14 @@ describeGit("git sparse-checkout against native git", () => {
     await twinSparse(native, ours, ["list"]);
   });
 
-  it("--no-sparse-index records index.sparse=false; --sparse-index is refused", async () => {
+  it("--no-sparse-index records index.sparse=false; --sparse-index index.sparse=true", async () => {
     const { native, ours } = twins(base);
     await twinSparse(native, ours, ["set", "--no-sparse-index", "k"]);
-    const result = await (await openOurs(ours))
-      .sparseCheckout()
-      .setArguments(["set", "--sparse-index", "k"])
-      .call();
-    expect(result.exitCode).toBe(128);
-    expect(result.stderr).toBe("fatal: the sparse index is not supported\n");
+    await twinSparse(native, ours, ["set", "--sparse-index", "k"]);
+    expect(gitOk(root, ours, "ls-files", "--sparse")).toBe(
+      gitOk(root, native, "ls-files", "--sparse"),
+    );
+    await twinSparse(native, ours, ["reapply", "--no-sparse-index"]);
   });
 
   it("the typed setters run as their command line", async () => {

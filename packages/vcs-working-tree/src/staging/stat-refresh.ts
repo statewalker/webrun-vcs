@@ -142,9 +142,9 @@ export async function refreshIndexFile(
   untrackedCache?: UntrackedCache | null,
 ): Promise<StagingEntry[] | undefined> {
   const untrackedChanged = untrackedCache !== undefined;
-  if ((updates.length === 0 && !untrackedChanged) || current.currentChecksum === undefined) {
-    return undefined;
-  }
+  if (current.currentChecksum === undefined) return undefined;
+  const rewrite = updates.length === 0 && !untrackedChanged && (await current.wantsRewrite());
+  if (updates.length === 0 && !untrackedChanged && !rewrite) return undefined;
   try {
     const read = await fresh.read();
     if (!read || fresh.currentChecksum !== current.currentChecksum) return undefined;
@@ -154,7 +154,8 @@ export async function refreshIndexFile(
       (skipWorktreeCleared && clearSkipWorktreeFlags(read.entries, skipWorktreeCleared)) ||
       read.entries;
     // a changed untracked cache is written even with no stat to store (UNTRACKED_CHANGED)
-    const entries = applyStatUpdates(base, updates, now) ?? (untrackedChanged ? base : undefined);
+    const entries =
+      applyStatUpdates(base, updates, now) ?? (untrackedChanged || rewrite ? base : undefined);
     if (!entries) return undefined;
     // the cache was scanned against the in-memory entries: given those, the write
     // invalidates the directory of every path they add or remove against the entries

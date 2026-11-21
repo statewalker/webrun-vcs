@@ -19,6 +19,7 @@ import {
   runSteps,
   type Steps,
   scanPackObjects,
+  type Trees,
   verifyCommitGraph,
 } from "@statewalker/vcs-core";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
@@ -27,9 +28,9 @@ import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import {
   type CacheTree,
   parseCacheTree,
-  parseIndexFile,
   parseResolveUndo,
   type ResolveUndoRecord,
+  readIndexFileEntries,
   type Staging,
 } from "@statewalker/vcs-working-tree";
 
@@ -422,7 +423,11 @@ export class FsckCommand extends GitCommand<FsckResult> {
       DEFAULT_BIG_FILE_THRESHOLD;
     const objects = this.workingCopy.history.objects;
     if (!objects) throw new Error("fsck needs the object store (history.objects)");
-    const stores: RunStores = { refs: this.refsStore, staging: () => this.staging };
+    const stores: RunStores = {
+      refs: this.refsStore,
+      staging: () => this.staging,
+      trees: () => this.storedTrees,
+    };
     const run = new FsckRun(stores, objects, types, {
       connectivityOnly: this._connectivityOnly,
       dangling: this._dangling,
@@ -482,6 +487,8 @@ export class FsckCommand extends GitCommand<FsckResult> {
 /** The stores a run reads besides the objects. */
 interface RunStores {
   refs: Refs;
+  /** The trees as stored (a sparse index expands from them) */
+  trees: () => Pick<Trees, "load" | "store">;
   /** The staging area (throws when the working copy has none). */
   staging: () => Staging;
 }
@@ -2398,7 +2405,19 @@ class FsckRun {
     for (const wt of await this.worktrees()) {
       const indexPath = pathOf(wt.dir as string, "index");
       if ((await files.stats(indexPath))?.kind !== "file") continue;
-      const parsed = await parseIndexFile(await readAll(files, indexPath));
+      // a split index merged with its shared index, a sparse index expanded (repo_read_index)
+      let read: Awaited<ReturnType<typeof readIndexFileEntries>>;
+      try {
+        read = await readIndexFileEntries(files, indexPath, {
+          gitDir: wt.dir as string,
+          trees: this.stores.trees(),
+        });
+      } catch {
+        // a sparse directory whose tree is missing: its own entry stands for it
+        read = await readIndexFileEntries(files, indexPath, { gitDir: wt.dir as string });
+      }
+      if (!read) continue;
+      const parsed = { entries: read.entries, extensionData: read.extensions };
       const prefix = wt.current ? "" : indexPath;
       const entries = parsed.entries.map((e) => ({
         path: e.path,

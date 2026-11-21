@@ -321,7 +321,10 @@ export class ResetCommand extends GitCommand<Ref> {
    */
   async call(): Promise<Ref> {
     // git writes the index once: one post-index-change run, after the worktree is updated
-    return this.withOneIndexWrite("last", () => this.resetOnce());
+    // a whole-tree reset writes the index and then the stat of the files it wrote: held back
+    // and written once, as git's one write (the patch and path modes read the index back)
+    const wholeTree = !this.patch && this.paths.length === 0 && !this.pathspecFileGiven;
+    return this.withOneIndexWrite("last", () => this.resetOnce(), { holdWrites: wholeTree });
   }
 
   private async resetOnce(): Promise<Ref> {

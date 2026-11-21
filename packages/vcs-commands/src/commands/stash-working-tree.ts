@@ -35,6 +35,7 @@ import {
 
 import type { CommandTrees } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { markIndexUpdate } from "./post-index-change.js";
 import type { StashResetOptions, StashWorkingTreeProvider } from "./stash-create-command.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import { pruneEmptyParents, removeDirectoryIfEmpty } from "./worktree-overwrite-checks.js";
@@ -264,6 +265,8 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
     const refresh = refreshableEntries(scan).filter((u) => !stale.has(u.path));
     // a reset --hard writes a new index (unpack-trees): the resolve-undo records go
     this.context.staging.clearResolveUndo?.();
+    // git's `reset --hard` child: an unpack-trees write that updates the worktree
+    if (!filter) markIndexUpdate(this.context.staging, { workdir: true });
     await this.write(headTree, target, stale);
     await refreshIndexStats(this.context.staging, refresh);
   }

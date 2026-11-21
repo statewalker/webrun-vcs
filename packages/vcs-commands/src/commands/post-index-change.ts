@@ -54,3 +54,9 @@ export function postIndexChangeHookOf(hooks: HookSession, staging: Staging): () 
     });
   };
 }
+
+/** Whether the next write of `staging` follows an unpack-trees update (not cleared). */
+export function peekIndexUpdate(staging: object): { workdir: boolean; skipWorktree: boolean } {
+  const flags = pending.get(staging);
+  return { workdir: flags?.workdir === true, skipWorktree: flags?.skipWorktree === true };
+}

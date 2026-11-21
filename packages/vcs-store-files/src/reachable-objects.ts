@@ -19,9 +19,9 @@
  * them, so `git gc --prune=now` may delete a commit only they name (one fetched into
  * `FETCH_HEAD` alone, or a merged branch deleted mid-merge); we keep it.
  *
- * A split index (a `link` extension) is refused: its entries live partly in a shared index
- * file, so the blobs staged there would silently stop being roots. gc and repack throw before
- * changing anything; `git update-index --no-split-index` turns it back into one file.
+ * A split index (a `link` extension) is read with its shared index (`sharedindex.<id>`), so
+ * the blobs staged there stay roots; a sparse index's sparse directories are roots as the
+ * trees they name.
  */
 
 import type {
@@ -34,7 +34,7 @@ import type {
 } from "@statewalker/vcs-core";
 import { isSymbolicRef, joinPath, listObjects, readGraftParents } from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
-import { parseIndexFile, parseResolveUndo } from "@statewalker/vcs-working-tree";
+import { parseResolveUndo, readIndexFileEntries } from "@statewalker/vcs-working-tree";
 
 import { readAllRefs } from "./refs/index.js";
 
@@ -305,25 +305,11 @@ async function indexIds(
   indexPath: string,
 ): Promise<{ entries: ObjectId[]; extra: ObjectId[] }> {
   if ((await files.stats(indexPath))?.kind !== "file") return { entries: [], extra: [] };
-  const parts: Uint8Array[] = [];
-  let length = 0;
-  for await (const c of files.read(indexPath)) {
-    parts.push(c);
-    length += c.length;
-  }
-  const data = new Uint8Array(length);
-  let at = 0;
-  for (const p of parts) {
-    data.set(p, at);
-    at += p.length;
-  }
-  const parsed = await parseIndexFile(data);
-  if (parsed.extensions.includes("link")) {
-    throw new Error(
-      `${indexPath} is a split index (link extension), which gc and repack do not read: ` +
-        "run `git update-index --no-split-index` first",
-    );
-  }
+  // a split index merged with its shared index; a sparse index's directories stay trees
+  const gitDir = indexPath.slice(0, Math.max(0, indexPath.lastIndexOf("/")));
+  const read = await readIndexFileEntries(files, indexPath, { gitDir });
+  if (!read) return { entries: [], extra: [] };
+  const parsed = { entries: read.entries, extensionData: read.extensions };
   const entries = parsed.entries.filter((e) => e.mode !== GITLINK).map((e) => e.objectId);
   const ids: ObjectId[] = [];
   for (const ext of parsed.extensionData) {

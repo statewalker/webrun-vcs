@@ -5,7 +5,8 @@
  * four-character signature. A signature that starts with an uppercase letter is
  * optional: a reader that does not understand it may ignore it. One that starts
  * with a lowercase letter is required: a reader that does not understand it must
- * not use the index (`link`, the split index; `sdir`, the sparse index).
+ * not use the index (`link`, the split index; `sdir`, the sparse index; both handled by
+ * `IndexFile`, see below).
  *
  * When we rewrite an index git wrote, we keep only the extensions we know, as
  * git drops the optional extensions it does not know when it rewrites:
@@ -17,8 +18,16 @@
  * | `FSMN` (fsmonitor) | the entries did not change; dropped otherwise |
  * | `REUC` (resolve-undo) | always, every record (dropped only when it cannot be parsed) |
  * | `EOIE`, `IEOT` (offsets into the file) | never; git writes them again when configured to |
+ * | `link` (split index) | read: merged with `sharedindex.<id>` (`split-index.ts`); written again while the index stays split (`core.splitIndex`, `splitIndex.*`), dropped when it is unsplit |
+ * | `sdir` (sparse index) | read: every sparse directory expanded from its tree (`sparse-index.ts`); written again when `index.sparse`, cone mode and the entries allow it |
  * | any other uppercase signature | never: an optional extension we do not know is dropped |
- * | any lowercase signature | never: the rewrite is refused (`UnsupportedIndexExtensionError`) |
+ * | any other lowercase signature | never: the rewrite is refused (`UnsupportedIndexExtensionError`) |
+ *
+ * `IndexFile` reads and writes `link` and `sdir` itself: the entries a staging holds are
+ * always the whole, merged and expanded index. A write splits the index against a shared
+ * index as git's `write_locked_index` does (a new shared index when more than
+ * `splitIndex.maxPercentChange` percent of the entries are not shared, old ones removed per
+ * `splitIndex.sharedIndexExpire`), or collapses it as `convert_to_sparse` does.
  *
  * "The entries did not change" means the same (path, stage, mode, object id,
  * intent-to-add) list; stat data may differ.
@@ -36,13 +45,16 @@ import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { IndexExtension } from "./index-format.js";
 import type { StagingEntry } from "./types.js";
 
-/** An index holds a required extension we cannot write back (`link`, `sdir`, ...). */
+/**
+ * An index holds a required extension we cannot read or write back: one we do not know, or a
+ * sparse index (`sdir`) with no trees to expand it from.
+ */
 export class UnsupportedIndexExtensionError extends Error {
   override name = "UnsupportedIndexExtensionError";
   constructor(readonly signature: string) {
     super(
       `index has the required extension '${signature}', which this implementation does not ` +
-        `support; refusing to rewrite it (for a split index run 'git update-index --no-split-index')`,
+        "support; refusing to rewrite it",
     );
   }
 }

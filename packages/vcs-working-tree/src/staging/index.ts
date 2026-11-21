@@ -12,6 +12,10 @@ export * from "./index-extensions.js";
 export * from "./index-file.js";
 // Index format (DIRC parsing/serialization)
 export * from "./index-format.js";
+// Sparse index (sdir): expanded on read, collapsed on write
+export * from "./sparse-index.js";
+// Split index (link): shared index merged on read, split on write
+export * from "./split-index.js";
 // Staging interface
 export * from "./staging.js";
 export * from "./staging-edits.js";

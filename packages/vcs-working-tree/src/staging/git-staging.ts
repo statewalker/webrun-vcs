@@ -14,7 +14,12 @@ import type { UntrackedCache } from "../status/untracked-cache.js";
 import type { CacheTree } from "./cache-tree.js";
 import { verifyTreePaths } from "./conflict-utils.js";
 import type { ResolveUndoRecord } from "./index-extensions.js";
-import { IndexFile, type IndexFilePending, readIndexChecksum } from "./index-file.js";
+import {
+  IndexFile,
+  type IndexFilePending,
+  type IndexHost,
+  readIndexChecksum,
+} from "./index-file.js";
 import { INDEX_VERSION_2, type IndexVersion, reuseEntryEncoding } from "./index-format.js";
 import type {
   ConflictResolution,
@@ -405,7 +410,25 @@ export class GitStaging implements Staging {
     this.updateTime = read.lastModified;
   }
 
+  /** Writes held back by `holdWrites`: one write once they are let go. */
+  private held: { pending: boolean } | undefined;
+
+  holdWrites(): () => Promise<void> {
+    if (this.held) return async () => {};
+    const held = { pending: false };
+    this.held = held;
+    return async () => {
+      if (this.held !== held) return;
+      this.held = undefined;
+      if (held.pending) await this.write();
+    };
+  }
+
   async write(): Promise<void> {
+    if (this.held) {
+      this.held.pending = true;
+      return;
+    }
     this.indexFile.version = this.version;
     // git's smudging of racily clean entries, against the index as it was read or written
     this._entries = await smudgeRacilyClean(
@@ -507,6 +530,18 @@ export class GitStaging implements Staging {
 
   getWriteHook(): (() => Promise<void>) | undefined {
     return this.writeHook;
+  }
+
+  setIndexHost(host: IndexHost | undefined): void {
+    this.indexFile.setHost(host);
+  }
+
+  getIndexHost(): IndexHost | undefined {
+    return this.indexFile.getHost();
+  }
+
+  indexLayout(): { split: boolean; sparse: boolean } {
+    return { split: this.indexFile.isSplit, sparse: this.indexFile.isSparse };
   }
 
   /** The index file's own mtime (0 when unknown: every entry is then racy). */
@@ -1002,6 +1037,15 @@ export interface GitStagingOptions {
    * milliseconds (default 0: fail at once with `IndexLockedError`, as git does).
    */
   lockTimeoutMs?: number;
+  /**
+   * The repository's git directory, where a split index's shared indexes live (default: the
+   * index file's directory).
+   */
+  gitDir?: string;
+  /** What the index file reads from the repository (see `Staging.setIndexHost`). */
+  host?: IndexHost;
+  /** The trees a sparse index expands from when no host gives any */
+  defaultTrees?: Pick<Trees, "load" | "store">;
 }
 
 /**
