@@ -1,7 +1,12 @@
 import type { ObjectId } from "@statewalker/vcs-core";
 // Import from the package root only: vcs-core ships a single runtime file
 // (dist/index.js); its subpaths resolve for types but not at runtime.
-import { type FilesApi, isSymbolicRef, parseCoreAbbrev } from "@statewalker/vcs-core";
+import {
+  type FilesApi,
+  historyWithoutLazyFetch,
+  isSymbolicRef,
+  parseCoreAbbrev,
+} from "@statewalker/vcs-core";
 import { writeCommitGraph } from "@statewalker/vcs-store-files";
 import {
   anonymizeUrl,
@@ -49,7 +54,6 @@ import {
   promisorOf,
   promisorRemotes,
   registerPartialClone,
-  withoutLazyFetch,
 } from "./promisor-remote.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
 import { worktreeUsingBranch } from "./worktree-support.js";
@@ -771,7 +775,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       headers: this.headers,
       timeout: this.timeout,
       gzipRequests: this.gzipRequests,
-      repository: createRepositoryFacade({ history }),
+      repository: createRepositoryFacade({ history: historyWithoutLazyFetch(history) }),
       refStore: createTransportRefStore(history.refs),
       refspecs,
       opportunisticRefspecs: opportunistic.length > 0 ? opportunistic : undefined,
@@ -825,11 +829,10 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       ...this.remoteSessionOptions(),
       ...(uploadPack !== undefined ? { program: uploadPack } : {}),
     };
-    // git's fetch runs with fetch_if_missing = 0: its walks never fetch lazily
-    const result = await withoutLazyFetch(this._workingCopy, () =>
-      withRemoteUploadPack(remote, sessionOptions, (connection) =>
-        fetchFromConnection(connection, fetchOptions),
-      ),
+    // git's fetch runs with fetch_if_missing = 0: its walks read through the history's view
+    // without lazy fetch (the facade above), never a store-wide switch
+    const result = await withRemoteUploadPack(remote, sessionOptions, (connection) =>
+      fetchFromConnection(connection, fetchOptions),
     ).catch((error: unknown) => {
       // git dies on a source that names no remote ref (a hidden one included)
       const message = error instanceof Error ? error.message : "";

@@ -13,6 +13,13 @@ export interface PromisorExclusions {
   readonly inPacks: ReadonlySet<ObjectId>;
   /** What the reachability walk neither lists nor walks through */
   readonly excluded: ReadonlySet<ObjectId>;
+  /**
+   * The stored objects outside the promisor packs that promisor objects link to (a local
+   * commit the server built on, fetched back as a parent): walked as roots, so gc never
+   * prunes them even where no promisor pack of `repack_local_links` holds them (git 2.43's
+   * fetches, or one made before it)
+   */
+  readonly roots: ReadonlySet<ObjectId>;
 }
 
 /**
@@ -35,13 +42,14 @@ export async function promisorExclusions(
   if (!promisor) return undefined;
   const format = await readRepositoryFormat(files, gitDir);
   if (format.partialClone === undefined) return undefined;
-  // the walks read no absent object: nothing is fetched (git's fetch_if_missing = 0)
-  return promisor.withoutLazyFetch(async () => {
-    const inPacks = await promisor.promisorPackObjects();
-    const excluded = new Set(inPacks);
-    for (const id of await promisor.promisedObjects()) {
-      if (!excluded.has(id) && !(await objects.has(id))) excluded.add(id);
-    }
-    return { inPacks, excluded };
-  });
+  // `has` never fetches; the promisor's own reads never do
+  const inPacks = await promisor.promisorPackObjects();
+  const excluded = new Set(inPacks);
+  const roots = new Set<ObjectId>();
+  for (const id of await promisor.promisedObjects()) {
+    if (excluded.has(id)) continue;
+    if (await objects.has(id)) roots.add(id);
+    else excluded.add(id);
+  }
+  return { inPacks, excluded, roots };
 }

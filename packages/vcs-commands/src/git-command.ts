@@ -381,6 +381,34 @@ export abstract class GitCommand<T> {
   }
 
   /**
+   * Runs `enter` as each entry point of the command (`call`, `callText`, ...) starts; the
+   * function it returns runs when that call ends, whatever the outcome (subclasses scope
+   * state to their calls with it: a transport command's promisor fetcher).
+   */
+  protected aroundEntryPoints(enter: () => (() => void) | undefined): void {
+    const self = this as unknown as Record<string, unknown>;
+    for (const name of entryPointNames(Object.getPrototypeOf(this))) {
+      const method = self[name];
+      if (typeof method !== "function") continue;
+      self[name] = (...args: unknown[]) => {
+        const leave = enter();
+        let result: unknown;
+        try {
+          result = (method as (...a: unknown[]) => unknown).apply(this, args);
+        } catch (error) {
+          leave?.();
+          throw error;
+        }
+        if (leave && result && typeof (result as Promise<unknown>).finally === "function") {
+          return (result as Promise<unknown>).finally(leave);
+        }
+        leave?.();
+        return result;
+      };
+    }
+  }
+
+  /**
    * Lets git's content filter resolve an attribute source (`$GIT_ATTR_SOURCE`, `attr.tree`)
    * with git's revision syntax over this repository.
    */

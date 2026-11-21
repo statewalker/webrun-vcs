@@ -10,6 +10,7 @@ import {
   graftFileBaseDir,
   graftFileReader,
   joinPath,
+  objectsWithoutLazyFetch,
   sweepPackTemporaries,
 } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
@@ -203,7 +204,10 @@ export async function gc(options: GcOptions): Promise<GcResult> {
   const { history, files, gitDir = ".git", dryRun = false } = options;
   if (!(options.objects ?? history.objects))
     throw new Error("gc needs the object kernel: pass objects or a files backend history");
-  if (dryRun) return collect(options);
+  // the walks read no absent object of a partial clone (git's fetch_if_missing = 0): they
+  // read through the store's view without lazy fetch, not a store-wide switch
+  const direct = objectsWithoutLazyFetch((options.objects ?? history.objects) as GitObjects);
+  if (dryRun) return collect({ ...options, objects: direct });
   const lock = await acquireGcLock(files, gitDir);
   if (!lock) {
     return {
@@ -221,11 +225,7 @@ export async function gc(options: GcOptions): Promise<GcResult> {
     };
   }
   try {
-    // the walks read no absent object of a partial clone (git's fetch_if_missing = 0)
-    const promisor = (options.objects ?? history.objects)?.promisor;
-    return promisor
-      ? await promisor.withoutLazyFetch(() => collect(options))
-      : await collect(options);
+    return await collect({ ...options, objects: direct });
   } finally {
     await lock.release();
   }
@@ -301,7 +301,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
     objects,
     commitGraph: history.commitGraph,
     ...(readGraftFile ? { readGraftFile } : {}),
-    ...(exclusions ? { excludeObjects: exclusions.excluded } : {}),
+    ...(exclusions ? { excludeObjects: exclusions.excluded, extraRoots: exclusions.roots } : {}),
   });
   const reachable = new Set<string>(listed.map((o) => o.id));
   // a promisor object left loose is not pruned (the promisor remote has it, but so may nothing

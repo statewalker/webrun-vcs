@@ -5,19 +5,33 @@
  * git's order, as the `git -c fetch.negotiationAlgorithm=noop fetch <remote> --no-tags
  * --no-write-fetch-head --recurse-submodules=no --filter=blob:none --stdin` git runs.
  *
+ * Every command installs the default fetcher (smart HTTP, no credentials) when the store has
+ * none. Clone, fetch and pull install one built from their own transports, credentials,
+ * headers and timeout for the length of their call, then put the previous one back. For later
+ * commands of a repository that needs credentials or custom transports, install a fetcher
+ * once with {@link installPromisorFetcher}: it stays until replaced.
+ *
  * @example
  * ```typescript
- * // installed by every command on its repository; explicitly, with other transports:
- * installPromisorFetcher(workingCopy, { transports, credentials });
- * await git.checkout().setName("main").call(); // the missing blobs come in one fetch
+ * await git.clone().setURI(url).setFilter("blob:none").setCredentials(auth).call();
+ * // later commands of this store fetch with the same credentials:
+ * installPromisorFetcher(workingCopy, { transports, credentials: auth });
+ * await git.switch().setName("side").call(); // the missing blobs come in one fetch
  * ```
  */
 
-import type { ObjectId, ObjectPromisor, PromisorFetcher } from "@statewalker/vcs-core";
 import {
+  historyWithoutLazyFetch,
+  type ObjectId,
+  type ObjectPromisor,
+  type PromisorFetcher,
+} from "@statewalker/vcs-core";
+import {
+  anonymizeUrl,
   type Credentials,
   createDefaultTransports,
   createRepositoryFacade,
+  FetchCheckError,
   fetchPromisedObjects,
   type GitTransportRegistry,
 } from "@statewalker/vcs-transport";
@@ -137,11 +151,10 @@ export function createPromisorFetcher(
   options: PromisorFetcherOptions = {},
 ): PromisorFetcher {
   const store = () => RemoteConfigStore.from(workingCopy);
-  const noLazyFetch = () => {
-    const environment = hostEnvironmentOf(workingCopy);
-    const compatibility = options.compatibility ?? environment?.hookRunner?.compatibility ?? "2.56";
-    return compatibility !== "2.43" && environment?.noLazyFetch === true;
-  };
+  const compatibilityOf = () =>
+    options.compatibility ?? hostEnvironmentOf(workingCopy)?.hookRunner?.compatibility ?? "2.56";
+  const noLazyFetch = () =>
+    compatibilityOf() !== "2.43" && hostEnvironmentOf(workingCopy)?.noLazyFetch === true;
   let warned = false;
   const promisor = () => workingCopy.history.objects?.promisor;
   const fetchFrom = async (remote: PromisorRemote, ids: readonly ObjectId[]) => {
@@ -154,8 +167,25 @@ export function createPromisorFetcher(
     }
     const config = store();
     const url = config.remoteUrlOf(remote.name);
-    const history = workingCopy.history;
+    // the child fetch runs with fetch_if_missing = 0: it reads through the history's view
+    // without lazy fetch (a read elsewhere meanwhile still fetches)
+    const history = historyWithoutLazyFetch(workingCopy.history);
+    const compatibility = compatibilityOf();
     const run = async () => {
+      // fetch-pack's --fsck-objects (fetch.fsckObjects, else transfer.fsckObjects); loaded
+      // when first needed, as the transport's modules (fsck imports GitCommand)
+      const { fetchFsckOf } = await import("./fsck/index.js");
+      const environment = hostEnvironmentOf(workingCopy);
+      const fsckWarnings: string[] = [];
+      const fsck = await fetchFsckOf({
+        value: (key) => config.value(key),
+        entries: (prefix) => config.entriesWithPrefix(prefix),
+        warnings: fsckWarnings,
+        compatibility,
+        ...(environment
+          ? { readFile: (path: string) => environment.readFile(path), home: environment.home }
+          : {}),
+      });
       // loaded when first needed: GitCommand installs this fetcher, and the transport's
       // modules (local remotes run commands) import GitCommand
       const { prepareRemote, protocolVersionOf, withRemoteUploadPack } = await import(
@@ -174,22 +204,45 @@ export function createPromisorFetcher(
           ...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
           protocolVersion: protocolVersionOf(config),
         },
-        (connection) =>
-          fetchPromisedObjects(connection, {
-            repository: createRepositoryFacade({ history }),
-            ids,
-            filter: "blob:none",
-          }),
+        async (connection) => {
+          try {
+            await fetchPromisedObjects(connection, {
+              repository: createRepositoryFacade({ history }),
+              ids,
+              filter: "blob:none",
+              url: anonymizeUrl(url),
+              compatibility,
+              ...(fsck ? { fsckObjects: fsck } : {}),
+            });
+          } catch (error) {
+            // fetch-pack ran: its start-up warnings came first
+            if (error instanceof FetchCheckError) {
+              throw new FetchCheckError(
+                error.check,
+                [...fsckWarnings, ...error.lines],
+                error.exitCode,
+              );
+            }
+            throw error;
+          }
+        },
       );
     };
     try {
-      // git's fetch runs with fetch_if_missing = 0
-      const p = promisor();
-      await (p ? p.withoutLazyFetch(run) : run());
+      await run();
       return true;
     } catch (error) {
+      const warnings = promisor()?.warnings;
+      if (error instanceof FetchCheckError) {
+        // git's lines as the child fetch printed them
+        warnings?.push(...error.lines);
+        return false;
+      }
       const message = error instanceof Error ? error.message : String(error);
-      promisor()?.warnings.push(message.startsWith("fatal:") ? message : `fatal: ${message}`);
+      const lines = message.split("\n");
+      for (const line of lines) {
+        warnings?.push(/^(fatal|error|warning):/.test(line) ? line : `fatal: ${line}`);
+      }
       return false;
     }
   };
@@ -242,13 +295,4 @@ export function promisorOf(workingCopy: WorkingCopy): ObjectPromisor | undefined
   } catch {
     return undefined;
   }
-}
-
-/**
- * Runs `body` with lazy fetching off in the working copy's repository (git's
- * `fetch_if_missing = 0`: fsck, gc, fetch).
- */
-export function withoutLazyFetch<T>(workingCopy: WorkingCopy, body: () => Promise<T>): Promise<T> {
-  const promisor = promisorOf(workingCopy);
-  return promisor ? promisor.withoutLazyFetch(body) : body();
 }

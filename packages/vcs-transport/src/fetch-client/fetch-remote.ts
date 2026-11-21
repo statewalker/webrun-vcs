@@ -3,6 +3,7 @@
  * negotiate and import the pack, keep the shallow file, follow tags, update the refs.
  */
 
+import { outgoingLinks } from "@statewalker/vcs-core";
 import type { PackImportResult, RepositoryFacade } from "../api/repository-facade.js";
 import type { RefStore } from "../context/process-context.js";
 import { INFINITE_DEPTH } from "../fsm/index.js";
@@ -465,6 +466,8 @@ export async function fetchFromConnection(
       new Set([...applyShallow(shallow, update), ...(serverShallow?.list ?? [])]);
     // the objects' links, read while the import holds them (index-pack's fsck_walk)
     const receivedLinks = received && links ? new ReceivedLinks(grafts) : undefined;
+    // a promisor pack's outgoing links (index-pack --promisor's repack_local_links)
+    const outgoing = filter && !options.dryRun ? new Set<string>() : undefined;
     const fetched = await fetchPack(connection, source, {
       wants,
       localTips: options.refetch ? [] : localTips,
@@ -484,8 +487,13 @@ export async function fetchFromConnection(
               ...(received
                 ? { quarantine: true, onObject: (id, type, entry) => received.add(id, type, entry) }
                 : {}),
-              ...(receivedLinks
-                ? { onContent: (id, type, content) => receivedLinks.add(id, type, content) }
+              ...(receivedLinks || outgoing
+                ? {
+                    onContent: (id, type, content) => {
+                      receivedLinks?.add(id, type, content);
+                      if (outgoing) for (const l of outgoingLinks(type, content)) outgoing.add(l);
+                    },
+                  }
                 : {}),
             }),
       onShallowUpdate: async (u) => {
@@ -537,6 +545,8 @@ export async function fetchFromConnection(
         !(connection.stateless && connection.version !== 2);
       const content = kept ? promisorSought.map((r) => `${r.oid} ${r.name}\n`).join("") : "";
       await repository.markPromisorPack?.(imported.packId, content);
+      // git 2.48+: the local objects the pack links to go into a promisor pack of their own
+      if (outgoing && outgoing.size > 0) await repository.repackLocalLinks?.(outgoing);
     }
     if (!options.dryRun) packFetched = true;
     const after = applyShallow(shallow, update);
@@ -909,6 +919,15 @@ export interface FetchPromisedOptions {
   onProgress?: (message: string) => void;
   /** Warnings fetch-pack prints */
   onWarning?: (line: string) => void;
+  /**
+   * `fetch.fsckObjects` / `transfer.fsckObjects` (`fetchFsckOf`): fetch-pack passes the
+   * promisor fetch's index-pack `--fsck-objects`, which checks the objects, never their links
+   */
+  fsckObjects?: ReceivedObjectsFsck;
+  /** The remote's URL, as git's check names it (`error: <url> did not send all ...`) */
+  url?: string;
+  /** git 2.43 prints an empty line after that error */
+  compatibility?: "2.43" | "2.56";
 }
 
 /** What {@link fetchPromisedObjects} did. */
@@ -943,6 +962,8 @@ export async function fetchPromisedObjects(
   const { repository } = options;
   const wants = [...new Set(options.ids)];
   if (wants.length === 0) throw new Error("fetchPromisedObjects: nothing to fetch");
+  const received = new ReceivedObjects();
+  const outgoing = new Set<string>();
   const fetched = await fetchPack(connection, negotiatorSource(repository), {
     wants,
     localTips: [],
@@ -951,17 +972,60 @@ export async function fetchPromisedObjects(
     ...(options.onWarning ? { onWarning: options.onWarning } : {}),
     includeTag: false,
     ...(options.onProgress ? { onProgress: options.onProgress } : {}),
-    importPack: (pack) => repository.importPack(pack, { keepPack: true }),
+    importPack: (pack) =>
+      repository.importPack(pack, {
+        keepPack: true,
+        // checked before anything sees them: a pack without the wanted objects leaves none
+        quarantine: true,
+        onObject: (id, type, entry) => received.add(id, type, entry),
+        onContent: (_id, type, content) => {
+          for (const l of outgoingLinks(type, content)) outgoing.add(l);
+        },
+      }),
   });
   const { quarantine, ...imported } = fetched.imported;
-  await quarantine?.commit();
+  // fetch-pack keeps (locks) the pack itself at transfer.unpackLimit's 100 objects, not for the
+  // `git fetch-pack` remote-curl runs for smart HTTP v0 (given no lock file)
+  const kept =
+    fetched.packObjects >= DEFAULT_UNPACK_LIMIT &&
+    !(connection.stateless && connection.version !== 2);
+  let committed = false;
+  try {
+    if (options.fsckObjects) {
+      // index-pack --fsck-objects: the objects only (a promisor pack's links are promised)
+      await checkReceivedPack(quarantine?.repository ?? repository, received, {
+        fsck: options.fsckObjects,
+        links: false,
+        shallow: new Set<string>(),
+        kept,
+      });
+    }
+    // the lazy fetch's check_connected: every wanted object came (a server that answered
+    // with others fails the fetch, and the caller dies "could not fetch")
+    const absent = wants.find((id) => !received.has(id));
+    if (absent !== undefined) {
+      throw new FetchCheckError(
+        "refs",
+        [
+          // check_connected's rev-list dies on the first wanted object not there
+          `fatal: bad revision '${absent}'`,
+          `error: ${options.url ?? "remote"} did not send all necessary objects`,
+          ...(options.compatibility === "2.43" ? [""] : []),
+        ],
+        1,
+      );
+    }
+    await quarantine?.commit();
+    committed = true;
+  } finally {
+    if (!committed) await quarantine?.discard().catch(() => {});
+  }
   if (imported.packId !== undefined) {
     // from_promisor: index-pack --promisor, then the sought refs for a pack fetch-pack locks
-    const kept =
-      fetched.packObjects >= DEFAULT_UNPACK_LIMIT &&
-      !(connection.stateless && connection.version !== 2);
     const content = kept ? wants.map((id) => `${id} ${id}\n`).join("") : "";
     await repository.markPromisorPack?.(imported.packId, content);
+    // git 2.48+: the local objects the pack links to go into a promisor pack of their own
+    if (outgoing.size > 0) await repository.repackLocalLinks?.(outgoing);
   }
   return { imported, packObjects: fetched.packObjects, packBytes: fetched.packBytes };
 }

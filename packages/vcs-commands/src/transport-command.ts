@@ -4,7 +4,8 @@ import {
   type GitTransportRegistry,
   type ProgressInfo,
 } from "@statewalker/vcs-transport";
-
+import type { WorkingCopy } from "@statewalker/vcs-working-tree";
+import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
 import {
   openResolvedRemote,
   type PreparedRemote,
@@ -64,6 +65,36 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
   protected progressMessageCallback?: (message: string) => void;
   /** The transports remote URLs are reached through (undefined: the defaults) */
   private transportRegistry?: GitTransportRegistry;
+
+  constructor(workingCopy: WorkingCopy) {
+    super(workingCopy);
+    // a partial clone's lazy fetch during the call (a clone's checkout, a pull's merge) reaches
+    // the promisor remote as this command does: its transports, credentials, headers, timeout;
+    // the store's previous fetcher comes back when the call ends
+    this.aroundEntryPoints(() => {
+      if (
+        !this.transportRegistry &&
+        !this.credentials &&
+        !this.headers &&
+        this.timeout === undefined
+      ) {
+        return undefined;
+      }
+      const promisor = promisorOf(this._workingCopy);
+      if (!promisor) return undefined;
+      const previous = promisor.fetcher;
+      const fetcher = createPromisorFetcher(this._workingCopy, {
+        ...(this.transportRegistry ? { transports: this.transportRegistry } : {}),
+        ...(this.credentials ? { credentials: this.credentials } : {}),
+        ...(this.headers ? { headers: this.headers } : {}),
+        ...(this.timeout !== undefined ? { timeout: this.timeout } : {}),
+      });
+      promisor.setFetcher(fetcher);
+      return () => {
+        if (promisor.fetcher === fetcher) promisor.setFetcher(previous);
+      };
+    });
+  }
 
   /**
    * Set the transports non-local remotes are reached through: the registry's connector for a

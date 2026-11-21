@@ -4,6 +4,7 @@
  * receive-pack read from it.
  */
 
+import { historyWithoutLazyFetch } from "@statewalker/vcs-core";
 import {
   createRepositoryFacade,
   createTransportRefStore,
@@ -80,15 +81,6 @@ const EMPTY_CONFIG: ServerConfigReader = { getAll: () => [] };
  * });
  * ```
  */
-/** Runs `serve` with the repository's lazy fetch off (git's upload-pack: GIT_NO_LAZY_FETCH). */
-function withoutLazyFetchOf<T>(
-  remote: Pick<OpenedRepository, "history">,
-  serve: () => Promise<T>,
-): Promise<T> {
-  const promisor = remote.history.objects?.promisor;
-  return promisor ? promisor.withoutLazyFetch(serve) : serve();
-}
-
 export async function servedRepositoryOf(
   remote: OpenedRepository,
   options: ServedRepositoryOptions = {},
@@ -100,7 +92,7 @@ export async function servedRepositoryOf(
   const hooks = options.hooks;
   return {
     repository: createRepositoryFacade({
-      history: remote.history,
+      history: historyWithoutLazyFetch(remote.history),
       // git's pack.useBitmaps (pack-objects reads it from the served repository)
       useBitmaps: servedUseBitmaps(remote),
       // a sparse:oid filter's patterns
@@ -116,8 +108,10 @@ export async function servedRepositoryOf(
       ? { files: servedGitFilesOf(remote.files, remote.commonDir ?? remote.gitDir) }
       : {}),
     around: <T>(service: string, serve: () => Promise<T>, client?: ServedRequestContext) => {
-      // upload-pack sets GIT_NO_LAZY_FETCH: a served partial clone never fetches lazily
-      if (service !== "git-receive-pack") return withoutLazyFetchOf(remote, serve);
+      // a served partial clone never fetches lazily (upload-pack's GIT_NO_LAZY_FETCH,
+      // receive-pack's rev-list --exclude-promisor-objects): the facade reads through the
+      // history's view without lazy fetch
+      if (service !== "git-receive-pack") return serve();
       if (!hooks?.enabled) return serve();
       // the client's variables (http-backend's REMOTE_USER, ...) reach the
       // reference-transaction hook too, as every child of receive-pack inherits them

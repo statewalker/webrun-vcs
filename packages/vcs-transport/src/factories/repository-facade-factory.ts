@@ -210,6 +210,23 @@ function createRepositoryFacadeFromHistory(
       return (await serialization.markPromisorPack?.(packId, content)) ?? false;
     },
 
+    async repackLocalLinks(links: Iterable<string>): Promise<string | undefined> {
+      const promisor = history.objects?.promisor;
+      if (!promisor || !serialization.markPromisorPack) return undefined;
+      const ids = await promisor.localLinkObjects(links);
+      if (ids.length === 0) return undefined;
+      // pack-objects writes the pack, index-pack the empty `.promisor` beside it
+      const pack = serialization.createPack(
+        (async function* () {
+          yield* ids;
+        })(),
+      );
+      const { packId } = await serialization.importPack(pack, { keepPack: true });
+      if (packId === undefined) return undefined;
+      await serialization.markPromisorPack(packId, "");
+      return packId;
+    },
+
     async *exportPack(
       wants: Set<string>,
       exclude: Set<string>,

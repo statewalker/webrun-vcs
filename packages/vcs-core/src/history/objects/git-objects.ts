@@ -162,6 +162,12 @@ export interface GitObjects {
    * fetch only once a fetcher is installed (vcs-commands installs one).
    */
   readonly promisor?: ObjectPromisor;
+  /**
+   * The same store with reads that never fetch from a promisor remote (git's
+   * `fetch_if_missing = 0`), for walks over promised objects; absent on stores without lazy
+   * fetch (see `objectsWithoutLazyFetch`)
+   */
+  readonly withoutLazyFetch?: GitObjects;
 }
 
 /**

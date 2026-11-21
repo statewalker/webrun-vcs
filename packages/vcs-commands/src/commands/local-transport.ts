@@ -5,7 +5,7 @@
  * is decided in `remote-transport.ts` (`resolveRemote`).
  */
 
-import type { RefTransactionHook } from "@statewalker/vcs-core";
+import { historyWithoutLazyFetch, type RefTransactionHook } from "@statewalker/vcs-core";
 import {
   createRepositoryFacade,
   createTransportRefStore,
@@ -143,12 +143,13 @@ export async function withLocalUploadPack<T>(
   const head = await remote.history.refs.get("HEAD").catch(() => undefined);
   const settings = serverSettingsOf(remote);
   const [client, server] = createDuplexPair();
-  // upload-pack never fetches lazily (GIT_NO_LAZY_FETCH)
-  const serving = withoutLazyFetchOf(remote, () =>
+  // upload-pack never fetches lazily (GIT_NO_LAZY_FETCH): it reads through the history's
+  // view without lazy fetch, as receive-pack does (rev-list --exclude-promisor-objects)
+  const serving = (async () =>
     serveOverDuplex({
       duplex: server,
       repository: createRepositoryFacade({
-        history: remote.history,
+        history: historyWithoutLazyFetch(remote.history),
         useBitmaps: servedUseBitmaps(remote),
         sparseFilterPatterns: sparseFilterMatcher,
         maxTreeDepth: servedMaxTreeDepth(remote),
@@ -163,8 +164,7 @@ export async function withLocalUploadPack<T>(
       // uploadpack.allowFilter and uploadpackfilter.*
       ...(settings.uploadPackFilter ? { uploadPackFilter: settings.uploadPackFilter } : {}),
       ...(head && "target" in head ? { currentBranch: head.target } : {}),
-    }),
-  ).finally(() => server.close?.());
+    }))().finally(() => server.close?.());
   try {
     const connection = await openDuplexConnection(client, { closeDuplex: true });
     try {
@@ -178,15 +178,6 @@ export async function withLocalUploadPack<T>(
     await client.close?.();
     await serving.catch(() => undefined);
   }
-}
-
-/** Runs `serve` with the repository's lazy fetch off (git's upload-pack: GIT_NO_LAZY_FETCH). */
-function withoutLazyFetchOf<T>(
-  remote: Pick<OpenedRepository, "history">,
-  serve: () => Promise<T>,
-): Promise<T> {
-  const promisor = remote.history.objects?.promisor;
-  return promisor ? promisor.withoutLazyFetch(serve) : serve();
 }
 
 /**
@@ -453,7 +444,7 @@ async function receiveOver<T>(
     ...(await receivePackSettingsOf(remote, hooks, receiveHooks)),
     duplex: server,
     repository: createRepositoryFacade({
-      history: remote.history,
+      history: historyWithoutLazyFetch(remote.history),
       useBitmaps: servedUseBitmaps(remote),
       sparseFilterPatterns: sparseFilterMatcher,
       maxTreeDepth: servedMaxTreeDepth(remote),

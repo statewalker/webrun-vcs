@@ -9,6 +9,8 @@ import { createGitObjects, type GitObjects } from "../../../src/history/objects/
 import {
   createObjectPromisor,
   namedObjects,
+  objectsWithoutLazyFetch,
+  outgoingLinks,
   PromisorFetchError,
   type PromisorFetcher,
   type PromisorPack,
@@ -76,8 +78,8 @@ describe("lazy fetch of absent objects", () => {
   });
 
   it("withoutLazyFetch reads absent objects as absent", async () => {
-    const { objects, ids, batches, promisor } = await setup();
-    const found = await promisor.withoutLazyFetch(() => objects.get(ids[0] as string));
+    const { objects, ids, batches } = await setup();
+    const found = await objectsWithoutLazyFetch(objects).get(ids[0] as string);
     expect(found).toBeUndefined();
     expect(batches).toEqual([]);
   });
@@ -107,5 +109,92 @@ describe("lazy fetch of absent objects", () => {
       parent,
     ]);
     expect(namedObjects("tag", enc.encode(`object ${tree}\ntype tree\n\nmsg\n`))).toEqual([tree]);
+  });
+  it("a read in another task still fetches while a walk reads without lazy fetch", async () => {
+    const { objects, ids, batches } = await setup();
+    const direct = objectsWithoutLazyFetch(objects);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // the walk: reads without lazy fetch, still running while the other task reads
+    const walk = (async () => {
+      const before = await direct.get(ids[0] as string);
+      await gate;
+      const after = await direct.get(ids[1] as string);
+      return [before, after];
+    })();
+    const other = await objects.get(ids[1] as string);
+    release();
+    expect(await walk).toEqual([undefined, expect.anything()]);
+    expect(other).toBeDefined();
+    expect(batches).toEqual([[ids[1]]]);
+    expect(direct.withoutLazyFetch).toBe(direct);
+  });
+
+  it("a fetch that succeeds without the object is PromisorFetchError, not a miss", async () => {
+    const local = createGitObjects(rawStorageStaging(new MemoryRawStorage()));
+    const promisor = createObjectPromisor({ objects: local, promisorPacks: async () => [] });
+    let fetches = 0;
+    // the server answers with another object: the fetch reports success
+    promisor.setFetcher({
+      hasPromisorRemote: () => true,
+      fetch: async () => {
+        fetches++;
+        return [];
+      },
+    });
+    const lazy = withLazyFetch(local, promisor);
+    const id = "3333333333333333333333333333333333333333";
+    await expect(lazy.get(id)).rejects.toThrow(PromisorFetchError);
+    expect(fetches).toBe(1);
+  });
+
+  it("outgoing links: a tree's subtrees only, a commit's tree and parents", () => {
+    const sub = new Uint8Array(20).fill(0xaa);
+    const blob = new Uint8Array(20).fill(0xbb);
+    const tree = new Uint8Array([
+      ...enc.encode("100644 f\0"),
+      ...blob,
+      ...enc.encode("40000 d\0"),
+      ...sub,
+    ]);
+    expect(outgoingLinks("tree", tree)).toEqual(["a".repeat(40)]);
+    const commit = enc.encode(`tree ${"c".repeat(40)}\nparent ${"d".repeat(40)}\n\nm\n`);
+    expect(outgoingLinks("commit", commit)).toEqual(["c".repeat(40), "d".repeat(40)]);
+  });
+
+  it("localLinkObjects walks from local links, stopping at promisor packs", async () => {
+    const local = createGitObjects(rawStorageStaging(new MemoryRawStorage()));
+    const put = async (type: "blob" | "tree" | "commit", bytes: Uint8Array) =>
+      local.put(type, bytes.length, [bytes]);
+    const raw = (hex: string) => Uint8Array.from(hex.match(/../g) ?? [], (h) => parseInt(h, 16));
+    const blobA = await put("blob", enc.encode("a\n"));
+    const promisedTree = await put(
+      "tree",
+      new Uint8Array([...enc.encode("100644 a\0"), ...raw(blobA)]),
+    );
+    const base = await put("commit", enc.encode(`tree ${promisedTree}\n\nbase\n`));
+    const blobC = await put("blob", enc.encode("c\n"));
+    const absent = "4".repeat(40);
+    const localTree = await put(
+      "tree",
+      new Uint8Array([
+        ...enc.encode("100644 a\0"),
+        ...raw(blobA),
+        ...enc.encode("100644 c\0"),
+        ...raw(blobC),
+        ...enc.encode("100644 x\0"),
+        ...raw(absent),
+      ]),
+    );
+    const mine = await put("commit", enc.encode(`tree ${localTree}\nparent ${base}\n\nC\n`));
+    const inPack = new Set([promisedTree, base]);
+    const pack: PromisorPack = { packId: "p", ids: () => inPack, has: (x) => inPack.has(x) };
+    const promisor = createObjectPromisor({ objects: local, promisorPacks: async () => [pack] });
+    const listed = await promisor.localLinkObjects([mine, base, absent]);
+    // the boundary commit in a promisor pack is listed, its tree is not
+    expect(new Set(listed)).toEqual(new Set([mine, base, localTree, blobA, blobC]));
+    expect(await promisor.localLinkObjects([base, absent])).toEqual([]);
   });
 });

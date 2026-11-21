@@ -1,5 +1,6 @@
 import {
   type FilesApi,
+  historyWithoutLazyFetch,
   isSymbolicRef,
   type ObjectId,
   parseObjectFilter,
@@ -34,7 +35,7 @@ import { fetchFsckOf } from "./fsck/index.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { copyLocalObjects } from "./local-clone.js";
-import { promisorOf, withoutLazyFetch } from "./promisor-remote.js";
+import { promisorOf } from "./promisor-remote.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { isValidRemoteName } from "./remote-command.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
@@ -736,7 +737,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       headers: this.headers,
       timeout: this.timeout,
       gzipRequests: this.gzipRequests,
-      repository: createRepositoryFacade({ history }),
+      repository: createRepositoryFacade({ history: historyWithoutLazyFetch(history) }),
       refStore: createTransportRefStore(history.refs),
       refspecs,
       tags,
@@ -775,11 +776,10 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       ...this.remoteSessionOptions(),
       ...(this.uploadPack !== undefined ? { program: this.uploadPack } : {}),
     };
-    // fetch_if_missing = 0 while the fetch runs: its walks never fetch lazily
-    const result = await withoutLazyFetch(this._workingCopy, () =>
-      withRemoteUploadPack(remote, sessionOptions, (connection) =>
-        fetchFromConnection(connection, fetchOptions),
-      ),
+    // fetch_if_missing = 0 while the fetch runs: its walks read through the history's view
+    // without lazy fetch (the facade above)
+    const result = await withRemoteUploadPack(remote, sessionOptions, (connection) =>
+      fetchFromConnection(connection, fetchOptions),
     ).catch((error: unknown) => {
       if (!(error instanceof FetchCheckError)) throw error;
       // what was received is refused before any ref is written: index-pack died, or

@@ -36,7 +36,8 @@ export interface RepositoryFormat {
   /**
    * The promisor remote of a partial clone, whose objects may be absent: `extensions.partialClone`,
    * else the first remote with `remote.<name>.promisor = true` (what `git clone --filter`
-   * writes since git 2.29; git's `repo_has_promisor_remote` checks both)
+   * writes since git 2.29) or a `remote.<name>.partialclonefilter` (git's
+   * `promisor_remote_config`; `repo_has_promisor_remote` checks them all)
    */
   partialClone?: string;
   /** `extensions.worktreeConfig`: linked worktrees read their own `config.worktree` */
@@ -171,10 +172,18 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
     );
   }
   if (format.partialClone === undefined) {
+    // promisor_remote_config: a remote with `promisor = true`, or with a
+    // `partialclonefilter` whatever its value, is a promisor remote (the first in config order)
     for (const key of config.listKeys("remote.")) {
-      if (!key.endsWith(".promisor") || key.length <= "remote..promisor".length) continue;
-      if (gitTrue(config.get(key))) {
-        format.partialClone = key.slice("remote.".length, -".promisor".length);
+      const lower = key.toLowerCase();
+      const suffix = lower.endsWith(".promisor")
+        ? ".promisor"
+        : lower.endsWith(".partialclonefilter")
+          ? ".partialclonefilter"
+          : undefined;
+      if (!suffix || key.length <= `remote.${suffix}`.length) continue;
+      if (suffix === ".partialclonefilter" || gitTrue(config.get(key))) {
+        format.partialClone = key.slice("remote.".length, -suffix.length);
         break;
       }
     }

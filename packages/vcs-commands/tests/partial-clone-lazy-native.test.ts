@@ -8,7 +8,15 @@
  * fetch per object read alone.
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
@@ -21,11 +29,15 @@ import {
 } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { openLocalRemote } from "../src/commands/local-transport.js";
-import { type Git, servedRepositoryOf } from "../src/index.js";
+import { type Git, installPromisorFetcher, servedRepositoryOf } from "../src/index.js";
 import { type LoopbackServer, serveOnLoopback } from "./http-loopback-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { gitAsync } from "./native-connect-support.js";
-import { nativeGitAvailable, nativeGitHttpBackend } from "./native-git-http-backend.js";
+import {
+  nativeGitAvailable,
+  nativeGitHttpBackend,
+  noMaintenance,
+} from "./native-git-http-backend.js";
 import { gitOut, gitRun, putFile, testEnv } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
@@ -590,5 +602,333 @@ describeGit("partial clones with lazy fetch, as native git", () => {
     expect(result?.filteredPack).toBeDefined();
     expect(packsOf(dir)).toEqual(packsOf(theirs));
     expect(gitRun(root, dir, ["fsck"]).status).toBe(0);
+  });
+
+  /** A bare copy of the server's repository, served by both servers, for a test to change. */
+  function serverCopy(name: string): { bare: string; path: string } {
+    const bare = join(srv, `${name}.git`);
+    git(root, "clone", "-q", "--bare", "--no-local", join(srv, "repo.git"), bare);
+    git(bare, "config", "uploadpack.allowFilter", "true");
+    git(bare, "config", "uploadpack.allowAnySHA1InWant", "true");
+    noMaintenance(bare);
+    return { bare, path: `/${name}.git` };
+  }
+
+  /**
+   * Whether a repository stores an object, read without lazy fetch (native `cat-file` would
+   * fetch it from the servers this process runs, which spawnSync would block)
+   */
+  const stores = async (dir: string, id: string) => {
+    const { objects } = await createGitFilesBackend({
+      files: createNodeFilesApi({ rootDir: dir }),
+    });
+    return objects.has(id);
+  };
+
+  /**
+   * git 2.48+'s repack_local_links: a local commit C, pushed and repacked, that the server then
+   * built D on. Native 2.56's filtered fetch of D packs C (with what it reaches outside the
+   * promisor packs) into one more promisor pack, so gc keeps it; ours too. git 2.43 has no
+   * repack_local_links: its gc then loses C (and dies on the missing object), which ours never
+   * does (C is a root of its walk as a promisor object's local link).
+   */
+  async function localLinkTwins(name: string) {
+    const { bare, path } = serverCopy(name);
+    const url = `${native.server.baseUrl}${path}`;
+    const theirs = join(root, `n-${name}-${counter++}`);
+    expect(
+      (await gitAsync(root, root, ["clone", "-q", "--filter=blob:none", url, theirs])).status,
+    ).toBe(0);
+    const { dir, ours } = await oursAt(`o-${name}`);
+    await ours.clone().setURI(url).setFilter("blob:none").call();
+    commitInBoth({ theirs, dir });
+    const c = git(theirs, "rev-parse", "HEAD").trim();
+    git(theirs, "push", "-q", bare, "main");
+    git(theirs, "repack", "-a", "-d", "-q");
+    await repack(await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: dir }) }));
+    // the server builds D on C
+    const work = join(root, `w-${name}-${counter++}`);
+    git(root, "clone", "-q", "--no-local", bare, work);
+    putFile(work, "d.txt", "d\n");
+    git(work, "add", "d.txt");
+    gitOut(root, work, ["commit", "-qm", "D"], commitEnv(9));
+    git(work, "push", "-q", bare, "main");
+    return { theirs, dir, url, c };
+  }
+
+  /** main moved to origin/main, the reflogs gone: only promisor objects name C. */
+  function forgetLocalCommit(dir: string) {
+    git(dir, "update-ref", "refs/heads/main", "refs/remotes/origin/main");
+    rmSync(join(dir, ".git/logs"), { recursive: true, force: true });
+  }
+
+  it("a fetch packs the local commits a promisor pack links to, so gc keeps them", async () => {
+    const t = await localLinkTwins("locallinks");
+    const r = await gitAsync(root, t.theirs, ["fetch", "-q", "origin"]);
+    expect(r.status, r.stderr).toBe(0);
+    await (await reopen(t.dir)).fetch().setRemote("origin").call();
+    if (nativeVersion === "2.56") expect(packsOf(t.dir)).toEqual(packsOf(t.theirs));
+    for (const dir of [t.theirs, t.dir]) forgetLocalCommit(dir);
+    const backend = await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: t.dir }) });
+    const result = await gc({ ...backend, pruneExpireMs: 0, writeCommitGraph: false });
+    expect(result.skipped).toBe(false);
+    expect(await stores(t.dir, t.c)).toBe(true);
+    const fsck = gitRun(root, t.dir, ["fsck"]);
+    expect(fsck.status, fsck.stdout + fsck.stderr).toBe(0);
+    if (nativeVersion === "2.56") {
+      const g = gitRun(root, t.theirs, ["gc", "-q", "--prune=now"]);
+      expect(g.status, g.stderr).toBe(0);
+      expect(await stores(t.theirs, t.c)).toBe(true);
+      expect(packsOf(t.dir)).toEqual(packsOf(t.theirs));
+      expect(promisorFiles(t.dir)).toEqual(promisorFiles(t.theirs));
+    }
+  });
+
+  it("gc keeps a local commit only a promisor commit links to, with no pack holding it apart", async () => {
+    const t = await localLinkTwins("locallinks-gc");
+    // native's fetch (2.43: no repack_local_links; 2.56: its extra pack made an ordinary one)
+    const r = await gitAsync(root, t.theirs, ["fetch", "-q", "origin"]);
+    expect(r.status, r.stderr).toBe(0);
+    const pack = join(t.theirs, ".git/objects/pack");
+    for (const name of readdirSync(pack).filter((n) => n.endsWith(".promisor"))) {
+      const idx = join(pack, name.replace(/\.promisor$/, ".idx"));
+      const ids = execFileSync("git", ["show-index"], {
+        input: readFileSync(idx),
+        env: testEnv(root),
+      }).toString();
+      if (ids.includes(t.c)) rmSync(join(pack, name));
+    }
+    forgetLocalCommit(t.theirs);
+    const backend = await createGitFilesBackend({
+      files: createNodeFilesApi({ rootDir: t.theirs }),
+    });
+    await gc({ ...backend, pruneExpireMs: 0, writeCommitGraph: false });
+    expect(await stores(t.theirs, t.c)).toBe(true);
+    const fsck = gitRun(root, t.theirs, ["fsck"]);
+    expect(fsck.status, fsck.stdout + fsck.stderr).toBe(0);
+  });
+
+  it("a lazy fetch whose pack lacks the object fails as git's, and is not retried silently", async () => {
+    const { bare, path } = serverCopy("wrongpack");
+    const t = await twins("wrongpack");
+    const wanted = git(t.theirs, "rev-parse", "origin/side:side.txt").trim();
+    const other = git(bare, "rev-parse", "main:a.txt").trim();
+    // a server whose pack-objects answers any want with one other blob
+    const hook = join(root, `wrong-pack-${counter++}.sh`);
+    writeFileSync(
+      hook,
+      `#!/bin/sh\ncat >/dev/null\necho ${other} | git pack-objects --stdout -q\n`,
+      { mode: 0o755 },
+    );
+    const backend = nativeGitHttpBackend(srv, root, {
+      GIT_CONFIG_COUNT: "3",
+      GIT_CONFIG_KEY_2: "uploadpack.packObjectsHook",
+      GIT_CONFIG_VALUE_2: hook,
+    });
+    const server = await serveOnLoopback((r) => backend.fetch(r));
+    try {
+      const url = `${server.baseUrl}${path}`;
+      for (const dir of [t.theirs, t.dir]) git(dir, "remote", "set-url", "origin", url);
+      const n = await gitAsync(root, t.theirs, ["cat-file", "-p", wanted]);
+      expect(n.status).toBe(128);
+      const g = await reopen(t.dir);
+      // the fetcher every command installs (none constructed here)
+      const promisor = installPromisorFetcher(g.workingCopy, { compatibility: nativeVersion });
+      const before = promisor?.fetchCount ?? 0;
+      let error: unknown;
+      try {
+        await g.workingCopy.history.blobs.load(wanted);
+      } catch (e) {
+        error = e;
+      }
+      expect(error).toBeInstanceOf(PromisorFetchError);
+      const lines = [
+        ...(error as PromisorFetchError).warnings,
+        `fatal: ${(error as PromisorFetchError).message}`,
+      ];
+      expect(lines.join("\n")).toBe(n.stderr.trimEnd());
+      expect(promisor?.fetchCount).toBe(before + 1);
+      // nothing of the refused pack stays
+      expect(await stores(t.dir, other)).toBe(await stores(t.theirs, other));
+    } finally {
+      await server.close();
+      backend.close();
+    }
+  });
+
+  it("the lazy fetch checks objects with transfer.fsckObjects, as fetch-pack's --fsck-objects", async () => {
+    const { bare, path } = serverCopy("badtree");
+    const blob = git(bare, "rev-parse", "main:a.txt").trim();
+    // a tree with two entries of one name (duplicateEntries, an error), named by nothing
+    const entry = Buffer.concat([Buffer.from("100644 a\0"), Buffer.from(blob, "hex")]);
+    const tree = execFileSync(
+      "git",
+      ["hash-object", "-t", "tree", "--literally", "-w", "--stdin"],
+      {
+        cwd: bare,
+        input: Buffer.concat([entry, entry]),
+        env: testEnv(root),
+      },
+    )
+      .toString()
+      .trim();
+    const url = `${native.server.baseUrl}${path}`;
+    const theirs = join(root, `n-badtree-${counter++}`);
+    expect(
+      (
+        await gitAsync(root, root, [
+          "clone",
+          "-q",
+          "--no-checkout",
+          "--filter=blob:none",
+          url,
+          theirs,
+        ])
+      ).status,
+    ).toBe(0);
+    const { dir, ours } = await oursAt("o-badtree");
+    await ours.clone().setURI(url).setFilter("blob:none").setNoCheckout(true).call();
+    for (const d of [theirs, dir]) git(d, "config", "transfer.fsckObjects", "true");
+    const n = await gitAsync(root, theirs, ["cat-file", "-t", tree]);
+    expect(n.status).toBe(128);
+    const g = await reopen(dir);
+    const promisor = installPromisorFetcher(g.workingCopy, { compatibility: nativeVersion });
+    const before = promisor?.warnings.length ?? 0;
+    expect(await g.workingCopy.history.objects?.get(tree)).toBeUndefined();
+    // the fetch's lines (cat-file's own death after them is not ours to print)
+    const nativeLines = n.stderr.trimEnd().split("\n");
+    expect(promisor?.warnings.slice(before)).toEqual(nativeLines.slice(0, -1));
+    expect(nativeLines.some((l) => l.includes("duplicateEntries"))).toBe(true);
+    expect(await stores(dir, tree)).toBe(false);
+  });
+
+  it("fsck with a corrupt promisor pack: git's lines and exit code", async () => {
+    const url = `${native.server.baseUrl}/repo.git`;
+    const theirs = join(root, `n-corrupt-${counter++}`);
+    expect(
+      (
+        await gitAsync(root, root, [
+          "clone",
+          "-q",
+          "--no-checkout",
+          "--filter=blob:none",
+          url,
+          theirs,
+        ])
+      ).status,
+    ).toBe(0);
+    const pack = join(theirs, ".git/objects/pack");
+    const file = join(pack, readdirSync(pack).find((n) => n.endsWith(".pack")) as string);
+    chmodSync(file, 0o644);
+    const bytes = readFileSync(file);
+    bytes.fill(0xff, bytes.length >> 1, (bytes.length >> 1) + 4);
+    writeFileSync(file, bytes);
+    const nativeFsck = gitRun(root, theirs, [
+      "fsck",
+      ...(nativeVersion === "2.56" ? ["--no-references"] : []),
+    ]);
+    const ours = await (await reopen(theirs))
+      .fsck()
+      .setRepositoryFiles({ files: createNodeFilesApi({ rootDir: theirs }), gitDir: ".git" })
+      .setCompatibility(nativeVersion)
+      .call();
+    expect(ours.output).toBe(nativeFsck.stdout);
+    expect(ours.errorOutput).toBe(nativeFsck.stderr);
+    expect(ours.exitCode).toBe(nativeFsck.status);
+  });
+
+  it("a remote with only partialclonefilter is a promisor remote to gc, as git", async () => {
+    const t = await twins("filteronly");
+    for (const dir of [t.theirs, t.dir]) git(dir, "config", "--unset", "remote.origin.promisor");
+    commitInBoth(t);
+    git(t.theirs, "gc", "-q");
+    const backend = await createGitFilesBackend({ files: createNodeFilesApi({ rootDir: t.dir }) });
+    const result = await gc({ ...backend, writeCommitGraph: false });
+    expect(result.skipped).toBe(false);
+    expect(packsOf(t.dir)).toEqual(packsOf(t.theirs));
+    expect(promisorFiles(t.dir)).toEqual(promisorFiles(t.theirs));
+    const fsck = gitRun(root, t.dir, ["fsck"]);
+    expect(fsck.status, fsck.stdout + fsck.stderr).toBe(0);
+  });
+
+  it("clone with credentials checks out through its own lazy fetch; later commands with the API", async () => {
+    const auth = `Basic ${Buffer.from("user:secret").toString("base64")}`;
+    const backend = nativeGitHttpBackend(srv, root);
+    const server = await serveOnLoopback(async (request) =>
+      request.headers.get("authorization") === auth
+        ? backend.fetch(request)
+        : new Response("auth needed", {
+            status: 401,
+            headers: { "WWW-Authenticate": 'Basic realm="git"' },
+          }),
+    );
+    try {
+      const url = `${server.baseUrl}/repo.git`;
+      const credentials = { username: "user", password: "secret" };
+      const { dir, ours } = await oursAt("o-auth");
+      await ours.clone().setURI(url).setFilter("blob:none").setCredentials(credentials).call();
+      const theirs = join(root, `n-auth-${counter++}`);
+      const r = await gitAsync(root, root, [
+        "clone",
+        "-q",
+        "--filter=blob:none",
+        `${server.baseUrl.replace("http://", "http://user:secret@")}/repo.git`,
+        theirs,
+      ]);
+      expect(r.status, r.stderr).toBe(0);
+      expect(worktreeFiles(dir)).toEqual(worktreeFiles(theirs));
+      // a later command: the fetcher the library installs for this store
+      const g = await reopen(dir);
+      installPromisorFetcher(g.workingCopy, { credentials });
+      await g.switch().setName("side").call();
+      expect((await gitAsync(root, theirs, ["switch", "-q", "side"])).status).toBe(0);
+      expect(worktreeFiles(dir)).toEqual(worktreeFiles(theirs));
+    } finally {
+      await server.close();
+      backend.close();
+    }
+  });
+
+  it("a push received by a served partial clone never fetches lazily", async () => {
+    // the served repository: a partial clone of the server, with a fetcher that counts
+    const t = await twins("served-push");
+    git(t.dir, "config", "http.receivepack", "true");
+    git(t.dir, "config", "receive.denyCurrentBranch", "ignore");
+    noMaintenance(t.dir);
+    const asked: string[][] = [];
+    const resolveRepository = createBasePathResolver({
+      files: createNodeFilesApi({ rootDir: root }),
+      exportAll: true,
+      openRepository: async (gitDir) => {
+        const opened = await openLocalRemote(host.workingCopy, `..${gitDir}`).catch(
+          () => undefined,
+        );
+        opened?.history.objects?.promisor?.setFetcher({
+          hasPromisorRemote: () => true,
+          fetch: async (ids) => {
+            asked.push([...ids]);
+            return ids;
+          },
+        });
+        return opened ? servedRepositoryOf(opened) : undefined;
+      },
+    });
+    const server = await serveOnLoopback(createServedFetchHandler({ resolveRepository }));
+    try {
+      // a full clone pushes a commit changing one file of a tree whose other blobs the
+      // partial clone lacks
+      const full = join(root, `full-push-${counter++}`);
+      git(root, "clone", "-q", "--no-local", join(srv, "repo.git"), full);
+      git(full, "checkout", "-q", "-b", "pushed", "origin/side");
+      putFile(full, "dir/c.txt", "pushed\n");
+      git(full, "commit", "-qam", "pushed");
+      const url = `${server.baseUrl}/${t.dir.slice(root.length + 1)}/.git`;
+      const r = await gitAsync(root, full, ["push", "-q", url, "pushed"]);
+      expect(r.status, r.stderr).toBe(0);
+      expect(asked).toEqual([]);
+      expect(git(t.dir, "rev-parse", "pushed").trim()).toBe(git(full, "rev-parse", "HEAD").trim());
+    } finally {
+      await server.close();
+    }
   });
 });

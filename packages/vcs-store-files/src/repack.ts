@@ -25,6 +25,7 @@ import {
   BitmapClosureError,
   createGitObjects,
   joinPath,
+  objectsWithoutLazyFetch,
   type PackFile,
   parseObjectFilter,
   resolveObjectFilter,
@@ -351,7 +352,9 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
     });
     alternatesErrors = await assertAlternatesReadable(options, "repack");
   }
-  const run = async () => {
+  // pack-objects runs with fetch_if_missing = 0: every read goes through the store's view
+  // without lazy fetch
+  const run = async (options: RepackOptions) => {
     // a partial clone: its promisor objects stay out of the walk (--exclude-promisor-objects)
     const exclusions = await promisorExclusions(options.objects, options.files, options.gitDir);
     // The snapshot first: a pack installed during the walk is never removed
@@ -364,14 +367,12 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
       objects: options.objects,
       commitGraph: options.history.commitGraph,
       ...(options.readGraftFile ? { readGraftFile: options.readGraftFile } : {}),
-      ...(exclusions ? { excludeObjects: exclusions.excluded } : {}),
+      ...(exclusions ? { excludeObjects: exclusions.excluded, extraRoots: exclusions.roots } : {}),
       ...(filter ? { filter } : {}),
     });
     return repackListed(options, listed, snapshot, undefined, exclusions);
   };
-  // pack-objects runs with fetch_if_missing = 0
-  const promisor = options.objects.promisor;
-  const result = promisor ? await promisor.withoutLazyFetch(run) : await run();
+  const result = await run({ ...options, objects: objectsWithoutLazyFetch(options.objects) });
   return result && alternatesErrors.length > 0
     ? { ...result, errors: [...alternatesErrors] }
     : result;

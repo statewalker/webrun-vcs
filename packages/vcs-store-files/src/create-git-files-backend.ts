@@ -248,14 +248,31 @@ export async function createGitFilesBackend(
   // a partial clone's absent objects: fetched from its promisor remote on a read (once a
   // fetcher is installed: vcs-commands installs one), its promisor packs known by their
   // `.promisor` files
+  const promisorPacks = promisorPacksOf(files, packDir, packs);
   const promisor = createObjectPromisor({
     objects: stored,
-    promisorPacks: promisorPacksOf(files, packDir, packs),
+    promisorPacks,
+    storedOutsidePromisorPacks: async (id) => {
+      if (await loose.has(id)) return true;
+      const marked = new Set((await promisorPacks()).map((p) => p.packId));
+      for (const pack of await packs.packs()) {
+        if (!marked.has(pack.packId) && pack.has(id)) return true;
+      }
+      return false;
+    },
   });
   const objects = withLazyFetch(stored, promisor);
-  // receive-pack keeps a pushed pack in objects/tmp_objdir-incoming-* until the push is accepted
+  // receive-pack keeps a pushed pack in objects/tmp_objdir-incoming-* until the push is
+  // accepted; reads through a quarantine never fetch (receive-pack's and fetch's checks run
+  // with git's fetch_if_missing = 0)
   objects.beginQuarantine = () =>
-    beginFilesQuarantine({ files, objectsDir, objects, packs, freshenMaxAgeMs });
+    beginFilesQuarantine({
+      files,
+      objectsDir,
+      objects: objects.withoutLazyFetch ?? objects,
+      packs,
+      freshenMaxAgeMs,
+    });
   const reflog = await readRefStoreConfig(files, gitDir, includes);
   const refStore = createFileRefStore(files, gitDir, {
     atomicFiles: options.atomicFiles,
