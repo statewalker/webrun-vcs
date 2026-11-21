@@ -4,9 +4,11 @@
  * git loose object). It never parses commits or trees, so whatever bytes git
  * produced keep their id.
  */
+
 import type { ObjectId } from "../../common/id/index.js";
 import type { InstalledPack, InstallPackOptions } from "../../pack/index-pack.js";
 import type { PackSet } from "../../pack/pack-set.js";
+import type { ObjectPromisor } from "./object-promisor.js";
 import type { ObjectTypeString } from "./object-types.js";
 
 /** `put` rejects with this when the content is not as long as the size given for it. */
@@ -154,6 +156,12 @@ export interface GitObjects {
    * after the store's own; writes and removals never reach them.
    */
   readonly alternates?: ObjectAlternates;
+  /**
+   * The partial clone side of the store (see `withLazyFetch`): its lazy fetch, batch
+   * prefetches and promisor objects. Present on the files backend; reads of absent objects
+   * fetch only once a fetcher is installed (vcs-commands installs one).
+   */
+  readonly promisor?: ObjectPromisor;
 }
 
 /**

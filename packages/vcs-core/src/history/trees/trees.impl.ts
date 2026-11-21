@@ -12,6 +12,7 @@ import {
   type GitObjects,
   InvalidObjectIdError,
 } from "../objects/git-objects.js";
+import { PromisorFetchError } from "../objects/object-promisor.js";
 import {
   hasObjectOfType,
   objectHeader,
@@ -138,7 +139,7 @@ class GitTreeStore implements Trees {
     } catch (e) {
       if (e instanceof InvalidObjectIdError) return undefined;
       // a stored object whose header cannot be read: as `has` reports it
-      if (e instanceof CorruptObjectError) throw e;
+      if (e instanceof CorruptObjectError || e instanceof PromisorFetchError) throw e;
       const reason = e instanceof Error ? `: ${e.message}` : "";
       throw new CorruptObjectError(`object ${id} is stored but cannot be read${reason}`, {
         cause: e,

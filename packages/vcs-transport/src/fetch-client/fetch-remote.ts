@@ -132,6 +132,12 @@ export interface FetchClientOptions {
    * lazily: reading an absent blob fails.
    */
   filter?: string;
+  /**
+   * `git fetch --refetch`: every selected tip is wanted again and nothing local is offered
+   * (fetch-pack's `refetch`: no `have`, no tip counted complete), so the whole history comes
+   * again (under `filter`, what it keeps), as when the repository was cloned
+   */
+  refetch?: boolean;
   /** Warnings fetch-pack prints (`warning: ...`) */
   onWarning?: (line: string) => void;
   /** Allow every update to be a non-fast-forward (`--force`) */
@@ -434,7 +440,7 @@ export async function fetchFromConnection(
   let packFetched = false;
   const runFetchPack = async (wants: string[], request: Partial<FetchPackRequest>) => {
     const knownCommon: string[] = [];
-    for (const ref of remoteRefs) {
+    for (const ref of options.refetch ? [] : remoteRefs) {
       if (ref.oid && !knownCommon.includes(ref.oid) && (await complete.isComplete(ref.oid))) {
         knownCommon.push(ref.oid);
       }
@@ -461,7 +467,7 @@ export async function fetchFromConnection(
     const receivedLinks = received && links ? new ReceivedLinks(grafts) : undefined;
     const fetched = await fetchPack(connection, source, {
       wants,
-      localTips,
+      localTips: options.refetch ? [] : localTips,
       knownCommon,
       shallow,
       filter: options.filter,
@@ -537,10 +543,13 @@ export async function fetchFromConnection(
     // fetch-pack: a deepening fetch (not a clone) checks what it brought against the new
     // shallow commits, without `--not --all`, before the shallow file changes
     if (!options.dryRun && !options.cloning && deepening) {
+      // a promisor pack's absent objects are promised (check_connected's partial clone case)
+      const promised = filter ? filterPromises(filter) : undefined;
       const lines = await connectivityErrors(repository, wants, {
         known: [],
         shallow: new Set(after),
         deepening: true,
+        ...(promised ? { promised } : {}),
       });
       if (lines) {
         throw new FetchCheckError(
@@ -587,7 +596,7 @@ export async function fetchFromConnection(
   const wanted = new Set<string>();
   for (const p of planned) {
     if (wanted.has(p.oid)) continue;
-    if (deepen || !(await complete.isComplete(p.oid))) {
+    if (deepen || options.refetch || !(await complete.isComplete(p.oid))) {
       wants.push(p.oid);
       wanted.add(p.oid);
     }
@@ -884,6 +893,77 @@ function applyShallow(before: string[], update: ServerShallowUpdate): string[] {
   const after = [...set].sort();
   const same = after.length === before.length && [...before].sort().every((o, i) => o === after[i]);
   return same ? before : after;
+}
+
+/** What {@link fetchPromisedObjects} fetches, and where it goes. */
+export interface FetchPromisedOptions {
+  /** Where the pack goes (kept, marked as a promisor pack) */
+  repository: RepositoryFacade;
+  /** The objects to fetch, by id (git's `--stdin` refspecs of the lazy fetch) */
+  ids: readonly string[];
+  /** The filter of the fetch (git's lazy fetch passes `blob:none`) */
+  filter?: string;
+  /** The client's shallow commits, sent as `shallow` lines */
+  shallow?: readonly string[];
+  /** Progress messages from the server */
+  onProgress?: (message: string) => void;
+  /** Warnings fetch-pack prints */
+  onWarning?: (line: string) => void;
+}
+
+/** What {@link fetchPromisedObjects} did. */
+export interface FetchPromisedResult {
+  /** The pack import's report */
+  imported: PackImportResult;
+  /** Objects in the pack as sent */
+  packObjects: number;
+  /** Bytes of the pack */
+  packBytes: number;
+}
+
+/**
+ * A partial clone's lazy fetch over `connection`, as the `git -c
+ * fetch.negotiationAlgorithm=noop fetch <remote> --no-tags --no-write-fetch-head
+ * --recurse-submodules=no --filter=blob:none --stdin` that promisor-remote.c runs: the ids
+ * are wanted by id (no ref listing: every refspec is an exact id, and no tag is followed), no
+ * `have` is sent (the noop negotiator), the pack is kept as a promisor pack (index-pack
+ * `--promisor`; its `.promisor` file names the ids, `<id> <id>`, when fetch-pack keeps the
+ * pack itself: 100 objects or more, not over smart HTTP v0), and no ref, FETCH_HEAD or
+ * shallow file is written.
+ *
+ * @example
+ * ```typescript
+ * await fetchPromisedObjects(connection, { repository, ids: [blobId], filter: "blob:none" });
+ * ```
+ */
+export async function fetchPromisedObjects(
+  connection: UploadPackConnection,
+  options: FetchPromisedOptions,
+): Promise<FetchPromisedResult> {
+  const { repository } = options;
+  const wants = [...new Set(options.ids)];
+  if (wants.length === 0) throw new Error("fetchPromisedObjects: nothing to fetch");
+  const fetched = await fetchPack(connection, negotiatorSource(repository), {
+    wants,
+    localTips: [],
+    shallow: [...(options.shallow ?? [])],
+    ...(options.filter ? { filter: options.filter } : {}),
+    ...(options.onWarning ? { onWarning: options.onWarning } : {}),
+    includeTag: false,
+    ...(options.onProgress ? { onProgress: options.onProgress } : {}),
+    importPack: (pack) => repository.importPack(pack, { keepPack: true }),
+  });
+  const { quarantine, ...imported } = fetched.imported;
+  await quarantine?.commit();
+  if (imported.packId !== undefined) {
+    // from_promisor: index-pack --promisor, then the sought refs for a pack fetch-pack locks
+    const kept =
+      fetched.packObjects >= DEFAULT_UNPACK_LIMIT &&
+      !(connection.stateless && connection.version !== 2);
+    const content = kept ? wants.map((id) => `${id} ${id}\n`).join("") : "";
+    await repository.markPromisorPack?.(imported.packId, content);
+  }
+  return { imported, packObjects: fetched.packObjects, packBytes: fetched.packBytes };
 }
 
 /** The local history as the negotiator reads it. */

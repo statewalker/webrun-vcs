@@ -58,6 +58,7 @@ export {
 } from "./notes-tree.js";
 export * from "./pack-refs-command.js";
 export * from "./pretty-format.js";
+export * from "./promisor-remote.js";
 export * from "./pull-command.js";
 export * from "./push-command.js";
 export * from "./read-tree-command.js";

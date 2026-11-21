@@ -69,6 +69,7 @@ export interface NodeGitHostEnvironment {
   defaultEmail?: string;
   attrSource?: string;
   noReplaceObjects?: boolean;
+  noLazyFetch?: boolean;
   protocolFromUser?: boolean;
   allowProtocol?: string;
   replaceRefBase?: string;
@@ -207,6 +208,7 @@ export function createNodeGitHostEnvironment(
     ...(env.GIT_ATTR_SOURCE !== undefined ? { attrSource: env.GIT_ATTR_SOURCE } : {}),
     // git: set to anything (even empty) turns replace refs off
     ...(env.GIT_NO_REPLACE_OBJECTS !== undefined ? { noReplaceObjects: true } : {}),
+    ...(env.GIT_NO_LAZY_FETCH !== undefined ? { noLazyFetch: envBool(env.GIT_NO_LAZY_FETCH) } : {}),
     // git_env_bool("GIT_PROTOCOL_FROM_USER", 1)
     ...(env.GIT_PROTOCOL_FROM_USER !== undefined
       ? { protocolFromUser: envBool(env.GIT_PROTOCOL_FROM_USER) }

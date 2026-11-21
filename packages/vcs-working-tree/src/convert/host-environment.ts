@@ -79,6 +79,12 @@ export interface GitHostEnvironment {
    */
   noReplaceObjects?: boolean;
   /**
+   * `$GIT_NO_LAZY_FETCH` as a boolean (git's `git_env_bool`, default false; git 2.45+): a
+   * partial clone fetches no absent object on a read (`fetch_if_missing = 0`), and a batch
+   * asked for is refused with "lazy fetching disabled; some objects may not be available"
+   */
+  noLazyFetch?: boolean;
+  /**
    * `$GIT_PROTOCOL_FROM_USER` as a boolean (git's `git_env_bool`, default true): whether
    * transports whose `protocol.<name>.allow` is `user` may be used (false when git runs a
    * command on the user's behalf, as for submodules)

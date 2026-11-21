@@ -434,6 +434,37 @@ class OrtMerge {
   }
 
   /**
+   * merge-ort's prefetch_for_content_merges: a partial clone fetches, in one batch, the
+   * regular files of each path whose content both sides changed differently (and neither
+   * like the base), in reverse path order
+   */
+  private async prefetchForContentMerges(plist: readonly string[]): Promise<void> {
+    if (!this.blobs.prefetch) return;
+    const ids: ObjectId[] = [];
+    const regular = (e: CheckedEntry | undefined): e is CheckedEntry =>
+      e !== undefined && (e.mode & 0o170000) === 0o100000;
+    for (let k = plist.length - 1; k >= 0; k--) {
+      const info = this.paths.get(plist[k] as string);
+      if (!info || info.clean) continue;
+      const [base, ours, theirs] = info.stages;
+      if (info.matchMask || info.filemask < 6 || !regular(ours) || !regular(theirs)) continue;
+      if (ours.objectId === theirs.objectId) continue;
+      if (
+        info.filemask === 7 &&
+        regular(base) &&
+        (base.objectId === ours.objectId || base.objectId === theirs.objectId)
+      ) {
+        continue;
+      }
+      for (let i = 0; i < 3; i++) {
+        const e = info.stages[i];
+        if (info.filemask & (1 << i) && regular(e)) ids.push(e.objectId);
+      }
+    }
+    await this.blobs.prefetch(ids);
+  }
+
+  /**
    * clear_or_reinit_internal_opts(reinitialize) for a redo: everything but the renames the
    * first pass found (and the directory rename counts, as git keeps them)
    */
@@ -744,6 +775,11 @@ class OrtMerge {
         renameEmpty: false,
         renameLimit: this.options.renameLimit ?? 7000,
         load: (c) => readBlob(this.blobs, c.id),
+        prefetch: async (wanted) => {
+          await this.blobs.prefetch?.(
+            wanted.filter((w) => w.candidate.mode !== FileMode.GITLINK).map((w) => w.candidate.id),
+          );
+        },
         relevantSources: this.relevant[side],
         dirsRemoved: this.dirsRemoved[side],
         dirRenameCount: this.dirRenameCount[side],
@@ -1330,6 +1366,7 @@ class OrtMerge {
 
   private async processEntries(): Promise<void> {
     const plist = [...this.paths.keys()].sort(sortDirsNextToChildren);
+    await this.prefetchForContentMerges(plist);
     for (let k = plist.length - 1; k >= 0; k--) {
       const path = plist[k];
       const info = this.paths.get(path);

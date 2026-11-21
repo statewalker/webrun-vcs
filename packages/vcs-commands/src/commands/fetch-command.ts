@@ -44,6 +44,13 @@ import {
 import { TransportCommand } from "../transport-command.js";
 import { fetchFsckOf } from "./fsck/index.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import {
+  hasPromisorRemote,
+  promisorOf,
+  promisorRemotes,
+  registerPartialClone,
+  withoutLazyFetch,
+} from "./promisor-remote.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
 import { worktreeUsingBranch } from "./worktree-support.js";
 
@@ -124,6 +131,9 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   private shallowExcludes: string[] = [];
   private unshallow = false;
   private updateShallow = false;
+  /** `--filter=<spec>` (a string), `--no-filter` (false), or neither */
+  private filterSpec?: string | false;
+  private refetch = false;
 
   /**
    * Set the remote to fetch from.
@@ -302,6 +312,31 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   /** Whether the ref lines are porcelain ones (`--porcelain`). */
   isPorcelain(): boolean {
     return this.porcelain;
+  }
+
+  /**
+   * Partial fetch (`git fetch --filter=<spec>`), or `false` for `--no-filter`. Unset, a
+   * fetch from a promisor remote of a partial clone uses its `remote.<name>.partialclonefilter`
+   * (git's fetch_one_setup_partial); a filter given registers the remote as a promisor remote
+   * first when it is not one with a filter (partial_clone_register:
+   * `core.repositoryformatversion = 1`, `remote.<name>.promisor`, `.partialclonefilter`). A
+   * pack fetched under a filter is kept as a promisor pack.
+   */
+  setFilter(spec: string | false): this {
+    this.checkCallable();
+    this.filterSpec = spec;
+    return this;
+  }
+
+  /**
+   * `git fetch --refetch`: everything the refspecs select is fetched again, as a fresh clone
+   * would (no local commit offered as a `have`, no tip counted as here), under the filter in
+   * use: how a partial clone changes its filter.
+   */
+  setRefetch(refetch: boolean): this {
+    this.checkCallable();
+    this.refetch = refetch;
+    return this;
   }
 
   /**
@@ -597,6 +632,9 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       ...(this.appendFetchHead ? ["--append"] : []),
       ...(this.writeFetchHead ? [] : ["--no-write-fetch-head"]),
       ...(this.refmap ?? []).map((spec) => `--refmap=${spec}`),
+      ...(typeof this.filterSpec === "string" ? [`--filter=${this.filterSpec}`] : []),
+      ...(this.filterSpec === false ? ["--no-filter"] : []),
+      ...(this.refetch ? ["--refetch"] : []),
     ];
   }
 
@@ -693,6 +731,22 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const writesFetchHead = !this.dryRun && this.writeFetchHead && !!checkout?.writeFetchHead;
     if (writesFetchHead && !this.appendFetchHead) await checkout.writeFetchHead?.("");
 
+    // fetch_one_setup_partial: the filter given (the remote registered as a promisor remote),
+    // else a promisor remote's own filter
+    let filter: string | undefined;
+    if (this.filterSpec !== false && !this.dryRun) {
+      if (typeof this.filterSpec === "string") {
+        filter = this.filterSpec;
+        if (viaConfig) {
+          registerPartialClone(store, this.remote, filter);
+          await store.save();
+          promisorOf(this._workingCopy)?.fetcher?.invalidate?.();
+        }
+      } else if (hasPromisorRemote(store)) {
+        filter = promisorRemotes(store).find((r) => r.name === this.remote)?.partialCloneFilter;
+      }
+    } else if (typeof this.filterSpec === "string") filter = this.filterSpec;
+
     // fetch.fsckObjects / transfer.fsckObjects: index-pack --strict over each received pack
     const compatibility = this.compatibility ?? this.hooks.compatibility;
     const environment = hostEnvironmentOf(this.workingCopy);
@@ -762,6 +816,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       reflogIdent: this.reflogLine("").ident,
       abbrev: parseCoreAbbrev(store.value("core.abbrev")) ?? -1,
       ...(fsck ? { fsckObjects: fsck } : {}),
+      ...(filter ? { filter } : {}),
+      ...(this.refetch ? { refetch: true } : {}),
     };
     // --upload-pack, else remote.<name>.uploadpack (transport_get)
     const uploadPack = this.uploadPack ?? this.remoteProgram(this.remote, "uploadpack");
@@ -769,8 +825,11 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       ...this.remoteSessionOptions(),
       ...(uploadPack !== undefined ? { program: uploadPack } : {}),
     };
-    const result = await withRemoteUploadPack(remote, sessionOptions, (connection) =>
-      fetchFromConnection(connection, fetchOptions),
+    // git's fetch runs with fetch_if_missing = 0: its walks never fetch lazily
+    const result = await withoutLazyFetch(this._workingCopy, () =>
+      withRemoteUploadPack(remote, sessionOptions, (connection) =>
+        fetchFromConnection(connection, fetchOptions),
+      ),
     ).catch((error: unknown) => {
       // git dies on a source that names no remote ref (a hidden one included)
       const message = error instanceof Error ? error.message : "";

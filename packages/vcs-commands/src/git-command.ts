@@ -62,6 +62,7 @@ import {
 import { indexHostOf } from "./commands/index-host.js";
 import type { NotesContext } from "./commands/notes-support.js";
 import { postIndexChangeHookOf } from "./commands/post-index-change.js";
+import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
 import { reflogLine } from "./commands/reflog-messages.js";
 import {
   type ArgumentFiles,
@@ -346,6 +347,10 @@ export abstract class GitCommand<T> {
   constructor(workingCopy: WorkingCopy) {
     this._workingCopy = workingCopy;
     this.installAttributesSource();
+    // a partial clone's absent objects come from its promisor remotes (unless the library
+    // user installed a fetcher of their own)
+    const promisor = promisorOf(workingCopy);
+    if (promisor && !promisor.fetcher) promisor.setFetcher(createPromisorFetcher(workingCopy));
     this.releaseHooksAfterCalls();
   }
 

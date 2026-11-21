@@ -16,6 +16,7 @@ import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { assertAlternatesReadable } from "./alternates/index.js";
 import { readCommitGraphSettings, writeCommitGraph } from "./commit-graph.js";
+import { promisorExclusions } from "./promisor-objects.js";
 import { sweepQuarantines } from "./quarantine/files-quarantine.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { createFilesRefOps } from "./refs/index.js";
@@ -26,7 +27,7 @@ import {
   repackListed,
   snapshotPacks,
 } from "./repack.js";
-import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
+import { readRepositoryFormat } from "./repository-format.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
@@ -175,8 +176,11 @@ export interface GcResult {
  *    `git gc` does: `objects/info/commit-graph`, replacing a split chain.
  *
  * In a repository with `extensions.preciousObjects`, only steps 3 and 7 run, as `git gc` skips its
- * repack and prune there. A partial clone (`extensions.partialClone`, a promisor remote) is
- * refused with `UnsupportedRepositoryFormatError` before anything changes. In a repository
+ * repack and prune there. In a partial clone (`extensions.partialClone`, a promisor remote)
+ * the walk leaves the promisor objects out (`--exclude-promisor-objects`: the objects of
+ * promisor packs, and the absent objects they name), and the repack writes every object of
+ * the promisor packs into a promisor pack of its own (git's `repack_promisor_objects`, an
+ * empty `.promisor` file). In a repository
  * with alternates (`objects/info/alternates`) what they reach is walked through them, and the
  * repack leaves out what they hold (`git gc` runs `repack -d -l`); only the repository's own
  * objects are ever deleted. An alternate git cannot read either (gone, a path that cannot be
@@ -217,7 +221,11 @@ export async function gc(options: GcOptions): Promise<GcResult> {
     };
   }
   try {
-    return await collect(options);
+    // the walks read no absent object of a partial clone (git's fetch_if_missing = 0)
+    const promisor = (options.objects ?? history.objects)?.promisor;
+    return promisor
+      ? await promisor.withoutLazyFetch(() => collect(options))
+      : await collect(options);
   } finally {
     await lock.release();
   }
@@ -237,10 +245,10 @@ async function collect(options: GcOptions): Promise<GcResult> {
   const objectsDir = joinPath(gitDir, "objects");
   const looseStorage = new FileRawStorage(files, objectsDir);
 
-  // A partial clone's absent objects come from its promisor remote, which we do not handle:
-  // refused. preciousObjects: as git gc, refs are packed, but nothing is repacked or pruned.
+  // preciousObjects: as git gc, refs are packed, but nothing is repacked or pruned. A partial
+  // clone's promisor objects stay out of the walk, its promisor packs are repacked apart
   const format = await readRepositoryFormat(files, gitDir);
-  if (format.partialClone !== undefined) assertObjectsDeletable(format, "gc");
+  const exclusions = dryRun ? undefined : await promisorExclusions(objects, files, gitDir);
   // git's errors reading the alternates (a directory gone, ...) are printed and gc goes on: the
   // walk below fails on a root or a local commit's object that only they held. Alternates git
   // reads and we cannot (alternates: false, outside the storage) are refused.
@@ -293,8 +301,12 @@ async function collect(options: GcOptions): Promise<GcResult> {
     objects,
     commitGraph: history.commitGraph,
     ...(readGraftFile ? { readGraftFile } : {}),
+    ...(exclusions ? { excludeObjects: exclusions.excluded } : {}),
   });
   const reachable = new Set<string>(listed.map((o) => o.id));
+  // a promisor object left loose is not pruned (the promisor remote has it, but so may nothing
+  // else here)
+  for (const id of exclusions?.excluded ?? []) reachable.add(id);
 
   // Step 3: pack refs (reachability does not change)
   let refsPacked = false;
@@ -327,6 +339,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
       listed,
       snapshot,
       loosened,
+      exclusions,
     );
   }
 

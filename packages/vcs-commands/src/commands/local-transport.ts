@@ -143,25 +143,28 @@ export async function withLocalUploadPack<T>(
   const head = await remote.history.refs.get("HEAD").catch(() => undefined);
   const settings = serverSettingsOf(remote);
   const [client, server] = createDuplexPair();
-  const serving = serveOverDuplex({
-    duplex: server,
-    repository: createRepositoryFacade({
-      history: remote.history,
-      useBitmaps: servedUseBitmaps(remote),
-      sparseFilterPatterns: sparseFilterMatcher,
-      maxTreeDepth: servedMaxTreeDepth(remote),
+  // upload-pack never fetches lazily (GIT_NO_LAZY_FETCH)
+  const serving = withoutLazyFetchOf(remote, () =>
+    serveOverDuplex({
+      duplex: server,
+      repository: createRepositoryFacade({
+        history: remote.history,
+        useBitmaps: servedUseBitmaps(remote),
+        sparseFilterPatterns: sparseFilterMatcher,
+        maxTreeDepth: servedMaxTreeDepth(remote),
+      }),
+      refStore: createTransportRefStore(remote.history.refs),
+      service: "git-upload-pack",
+      ...((options.protocolVersion ?? 2) === 2 ? { protocolVersion: "2" as const } : {}),
+      // GIT_PROTOCOL=version=1: upload-pack's `version 1` line before its advertisement
+      ...(options.protocolVersion === 1 ? { announceVersion1: true } : {}),
+      // uploadpack.hideRefs and transfer.hideRefs, in the order git reads them
+      uploadPackHideRefs: settings.uploadPackHideRefs,
+      // uploadpack.allowFilter and uploadpackfilter.*
+      ...(settings.uploadPackFilter ? { uploadPackFilter: settings.uploadPackFilter } : {}),
+      ...(head && "target" in head ? { currentBranch: head.target } : {}),
     }),
-    refStore: createTransportRefStore(remote.history.refs),
-    service: "git-upload-pack",
-    ...((options.protocolVersion ?? 2) === 2 ? { protocolVersion: "2" as const } : {}),
-    // GIT_PROTOCOL=version=1: upload-pack's `version 1` line before its advertisement
-    ...(options.protocolVersion === 1 ? { announceVersion1: true } : {}),
-    // uploadpack.hideRefs and transfer.hideRefs, in the order git reads them
-    uploadPackHideRefs: settings.uploadPackHideRefs,
-    // uploadpack.allowFilter and uploadpackfilter.*
-    ...(settings.uploadPackFilter ? { uploadPackFilter: settings.uploadPackFilter } : {}),
-    ...(head && "target" in head ? { currentBranch: head.target } : {}),
-  }).finally(() => server.close?.());
+  ).finally(() => server.close?.());
   try {
     const connection = await openDuplexConnection(client, { closeDuplex: true });
     try {
@@ -175,6 +178,15 @@ export async function withLocalUploadPack<T>(
     await client.close?.();
     await serving.catch(() => undefined);
   }
+}
+
+/** Runs `serve` with the repository's lazy fetch off (git's upload-pack: GIT_NO_LAZY_FETCH). */
+function withoutLazyFetchOf<T>(
+  remote: Pick<OpenedRepository, "history">,
+  serve: () => Promise<T>,
+): Promise<T> {
+  const promisor = remote.history.objects?.promisor;
+  return promisor ? promisor.withoutLazyFetch(serve) : serve();
 }
 
 /**

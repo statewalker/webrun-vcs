@@ -36,8 +36,10 @@ import {
 } from "@statewalker/vcs-working-tree";
 
 import { GitCommand } from "../../git-command.js";
+import { RemoteConfigStore } from "../../remote-config/index.js";
 import { hostEnvironmentOf } from "../git-ident.js";
 import { configBool, configValue } from "../merge-config.js";
+import { hasPromisorRemote } from "../promisor-remote.js";
 import { DEFAULT_BIG_FILE_THRESHOLD, readLooseObject } from "./fsck-loose.js";
 import { FSCK_MSG_IDS, FsckMessageTypes, type FsckMsgId } from "./fsck-msg-ids.js";
 import {
@@ -259,8 +261,13 @@ function treeLineSound(data: Uint8Array): boolean {
  * verify` (unless `core.commitGraph` is false): its messages follow the rest on stderr and a
  * failure sets exit bit 16 (`FSCK_ERROR_COMMIT_GRAPH`).
  *
+ * In a partial clone (a promisor remote) the promisor objects are taken as git's fsck takes
+ * them (`is_promisor_object`: the objects of promisor packs and the objects they name): marked
+ * reachable without being walked further, never reported missing, valid as ref and reflog
+ * values; nothing is fetched lazily while fsck runs.
+ *
  * Not done: the ref database checks of `git refs verify` (git 2.45+),
- * multi-pack-index and reverse-index verification, promisor objects, the commit-graphs
+ * multi-pack-index and reverse-index verification, the commit-graphs
  * of alternates, `fsck.skipList`, and explicit `<object>` heads. The objects of alternates
  * (`history.objects.alternates`) are read and checked as git's default `--full` reads them
  * (their dangling objects listed too): 2.56 source by source, 2.43 every source's loose
@@ -431,7 +438,14 @@ export class FsckCommand extends GitCommand<FsckResult> {
       staging: () => this.staging,
       trees: () => this.storedTrees,
     };
+    // fsck knows how to handle missing promisor objects (fetch_if_missing = 0)
+    const promisor = objects.promisor;
+    const promised =
+      promisor && hasPromisorRemote(RemoteConfigStore.from(this.workingCopy))
+        ? await promisor.withoutLazyFetch(() => promisor.promisedObjects())
+        : undefined;
     const run = new FsckRun(stores, objects, types, {
+      ...(promised && promised.size > 0 ? { promised } : {}),
       connectivityOnly: this._connectivityOnly,
       dangling: this._dangling,
       unreachable: this._unreachable,
@@ -471,7 +485,7 @@ export class FsckCommand extends GitCommand<FsckResult> {
           (configBool(this.workingCopy, "commitGraph.readChangedPaths", true) ? -1 : 0),
       },
     });
-    const result = await run.run();
+    const result = promisor ? await promisor.withoutLazyFetch(() => run.run()) : await run.run();
     // git prints the alternates' error lines when it first reads an object: first on stderr
     // (once here; git repeats them in its child processes)
     const alternates = this.alternatesErrors();
@@ -497,6 +511,11 @@ interface RunStores {
 }
 
 interface RunOptions {
+  /**
+   * A partial clone's promisor objects (git's `is_promisor_object`): reachable without being
+   * walked, never missing, valid ref and reflog values; absent outside a partial clone
+   */
+  promised?: ReadonlySet<string>;
   connectivityOnly: boolean;
   dangling: boolean;
   unreachable: boolean;
@@ -2038,6 +2057,11 @@ class FsckRun {
     if (n === undefined || t.type(n) !== type) return false;
     const flags = t.flags(n);
     if (flags & REACHABLE) return true;
+    if (this.o.promised?.has(t.id(n))) {
+      // a promisor object: reachable, not walked further (mark_object)
+      t.addFlags(n, REACHABLE);
+      return true;
+    }
     if (!(flags & HAS_OBJ)) return false;
     t.addFlags(n, REACHABLE);
     this.pending.push(n);
@@ -2054,6 +2078,10 @@ class FsckRun {
     if (n !== undefined && (type === "any" || parent === undefined || t.type(n) === type)) {
       const flags = t.flags(n);
       if (flags & REACHABLE) return 0;
+      if (this.o.promised?.has(t.id(n))) {
+        t.addFlags(n, REACHABLE);
+        return 0;
+      }
       if (flags & HAS_OBJ) {
         t.addFlags(n, REACHABLE);
         this.pending.push(n);
@@ -2091,6 +2119,8 @@ class FsckRun {
     }
     if (t.flags(n) & REACHABLE) return 0;
     t.addFlags(n, REACHABLE);
+    // a promisor object needs no further recursion (it is not missing: it will be fetched)
+    if (this.o.promised?.has(t.id(n))) return 0;
     if (!(t.flags(n) & HAS_OBJ)) {
       const id = t.id(n);
       if (parent !== undefined && !(await this.hasObject(id))) {
@@ -2119,6 +2149,11 @@ class FsckRun {
   private async handleRef(name: string, id: string): Promise<void> {
     const n = await this.parseObject(id);
     if (n === undefined) {
+      // a promisor object: a valid ref
+      if (this.o.promised?.has(id)) {
+        this.defaultRefs++;
+        return;
+      }
       this.error(`${name}: invalid sha1 pointer ${id}`, id);
       this.errorsFound |= FSCK_ERROR_REACHABLE;
       return;
@@ -2141,7 +2176,7 @@ class FsckRun {
       if (timestamp) this.putName(id, `${refname}@{${timestamp}}`);
       this.t.addFlags(n, USED);
       await this.markObject(n, "any", undefined);
-    } else {
+    } else if (!this.o.promised?.has(id)) {
       this.error(`${refname}: invalid reflog entry ${id}`, id);
       this.errorsFound |= FSCK_ERROR_REACHABLE;
     }
@@ -2188,6 +2223,10 @@ class FsckRun {
     const snapshotRef = async (name: string, id: string) => {
       const n = await this.parseObject(id);
       if (n === undefined) {
+        if (this.o.promised?.has(id)) {
+          this.defaultRefs++;
+          return;
+        }
         this.error(`${name}: invalid sha1 pointer ${id}`, id);
         this.errorsFound |= FSCK_ERROR_REACHABLE;
         return;
@@ -3009,7 +3048,7 @@ class FsckRun {
       const id = t.id(n);
       const flags = t.flags(n);
       if (flags & REACHABLE) {
-        if (flags & HAS_OBJ || this.inPack(id)) continue;
+        if (this.o.promised?.has(id) || flags & HAS_OBJ || this.inPack(id)) continue;
         const type = await this.printableType(n);
         this.emit({
           kind: "missing",

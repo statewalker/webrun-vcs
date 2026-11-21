@@ -84,6 +84,19 @@ export interface Blobs extends ObjectStorage<BlobContent> {
    * ```
    */
   open?(id: ObjectId): Promise<BlobRead | undefined>;
+  /**
+   * Fetches, in one batch, those of `ids` a partial clone lacks from its promisor remote
+   * (git's `promisor_remote_get_direct` before a checkout writes files, a diff prints
+   * patches, a merge merges contents); nothing where every blob is here. Optional: stores
+   * without promisor remotes leave it out.
+   */
+  prefetch?(ids: Iterable<ObjectId>): Promise<void>;
+  /**
+   * Whether an absent blob may still be read, fetched from a promisor remote (a partial
+   * clone with promisor remotes and a fetcher): a checkout's plan then takes absent blobs,
+   * which its writes fetch. Optional: absent means no.
+   */
+  mayFetch?(): boolean;
 }
 
 /** A blob read once (see `Blobs.open`). */

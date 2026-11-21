@@ -18,10 +18,13 @@ import type {
 import {
   createGitObjects,
   createHistoryFromComponents,
+  createObjectPromisor,
   graftFileBaseDir,
   graftFileReader,
   joinPath,
   openPackSet,
+  type PromisorPack,
+  withLazyFetch,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
@@ -241,7 +244,15 @@ export async function createGitFilesBackend(
   }
   const loose = createGitObjects(skipPacked(staging, packs, alternates));
   const local = withPacks(loose, packs);
-  const objects = alternates ? withAlternates(local, alternates) : local;
+  const stored = alternates ? withAlternates(local, alternates) : local;
+  // a partial clone's absent objects: fetched from its promisor remote on a read (once a
+  // fetcher is installed: vcs-commands installs one), its promisor packs known by their
+  // `.promisor` files
+  const promisor = createObjectPromisor({
+    objects: stored,
+    promisorPacks: promisorPacksOf(files, packDir, packs),
+  });
+  const objects = withLazyFetch(stored, promisor);
   // receive-pack keeps a pushed pack in objects/tmp_objdir-incoming-* until the push is accepted
   objects.beginQuarantine = () =>
     beginFilesQuarantine({ files, objectsDir, objects, packs, freshenMaxAgeMs });
@@ -402,4 +413,42 @@ async function createGitDirectoryStructure(
       `[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = ${gitDir === "." ? "true" : "false"}\n`,
     ),
   ]);
+}
+
+/**
+ * The promisor packs of a pack directory, in lookup order: those with a `pack-<id>.promisor`
+ * file (git's `pack_promisor`), each file looked up once per pack.
+ */
+export function promisorPacksOf(
+  files: FilesApi,
+  packDir: string,
+  packs: PackSet,
+): () => Promise<readonly PromisorPack[]> {
+  const known = new Map<string, Promise<boolean>>();
+  // a pack marked later (fetch-pack writes the file after index-pack) is looked up again
+  const { writePromisor } = packs;
+  if (writePromisor) {
+    packs.writePromisor = async (packId, content) => {
+      try {
+        await writePromisor.call(packs, packId, content);
+      } finally {
+        known.delete(packId);
+      }
+    };
+  }
+  return async () => {
+    const out: PromisorPack[] = [];
+    for (const pack of await packs.packs()) {
+      let marked = known.get(pack.packId);
+      if (!marked) {
+        marked = files
+          .stats(joinPath(packDir, `pack-${pack.packId}.promisor`))
+          .then((s) => s?.kind === "file")
+          .catch(() => false);
+        known.set(pack.packId, marked);
+      }
+      if (await marked) out.push(pack);
+    }
+    return out;
+  };
 }

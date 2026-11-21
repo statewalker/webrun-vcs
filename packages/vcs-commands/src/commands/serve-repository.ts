@@ -80,6 +80,15 @@ const EMPTY_CONFIG: ServerConfigReader = { getAll: () => [] };
  * });
  * ```
  */
+/** Runs `serve` with the repository's lazy fetch off (git's upload-pack: GIT_NO_LAZY_FETCH). */
+function withoutLazyFetchOf<T>(
+  remote: Pick<OpenedRepository, "history">,
+  serve: () => Promise<T>,
+): Promise<T> {
+  const promisor = remote.history.objects?.promisor;
+  return promisor ? promisor.withoutLazyFetch(serve) : serve();
+}
+
 export async function servedRepositoryOf(
   remote: OpenedRepository,
   options: ServedRepositoryOptions = {},
@@ -106,17 +115,15 @@ export async function servedRepositoryOf(
     ...(remote.files
       ? { files: servedGitFilesOf(remote.files, remote.commonDir ?? remote.gitDir) }
       : {}),
-    ...(hooks?.enabled
-      ? {
-          // the client's variables (http-backend's REMOTE_USER, ...) reach the
-          // reference-transaction hook too, as every child of receive-pack inherits them
-          around: <T>(service: string, serve: () => Promise<T>, client?: ServedRequestContext) => {
-            if (service !== "git-receive-pack") return serve();
-            const env = httpBackendEnv(hooks, client);
-            const session = Object.keys(env).length > 0 ? hooks.withEnv(env) : hooks;
-            return withReceiveTransactionHook(remote, session, serve);
-          },
-        }
-      : {}),
+    around: <T>(service: string, serve: () => Promise<T>, client?: ServedRequestContext) => {
+      // upload-pack sets GIT_NO_LAZY_FETCH: a served partial clone never fetches lazily
+      if (service !== "git-receive-pack") return withoutLazyFetchOf(remote, serve);
+      if (!hooks?.enabled) return serve();
+      // the client's variables (http-backend's REMOTE_USER, ...) reach the
+      // reference-transaction hook too, as every child of receive-pack inherits them
+      const env = httpBackendEnv(hooks, client);
+      const session = Object.keys(env).length > 0 ? hooks.withEnv(env) : hooks;
+      return withReceiveTransactionHook(remote, session, serve);
+    },
   };
 }

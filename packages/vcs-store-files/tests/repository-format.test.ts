@@ -156,17 +156,18 @@ describe("gc in a precious-objects repository", () => {
 });
 
 describe("gc in a partial clone", () => {
-  it("gc(), repack() and GcOrchestrator refuse, deleting nothing", async () => {
+  it("GcOrchestrator refuses, deleting nothing; gc() and repack() run as git's", async () => {
     const { files, backend, orphan } = await backendWith("\tpartialClone = origin\n");
-    await expect(gc({ history: backend.history, files, pruneExpireMs: 0 })).rejects.toThrow(
-      /cannot gc in a partial clone/,
-    );
-    await expect(repack(backend)).rejects.toBeInstanceOf(UnsupportedRepositoryFormatError);
     const orchestrator = new GcOrchestrator(backend.history, new FileGcStrategy(backend));
     await expect(orchestrator.run({ pruneExpireMs: 0 })).rejects.toThrow(
       /cannot prune in a partial clone/,
     );
     expect(await backend.history.blobs.has(orphan)).toBe(true);
+    // the promisor objects stay out of the walk; what nothing reaches is pruned
+    await repack(backend);
+    const result = await gc({ history: backend.history, files, pruneExpireMs: 0 });
+    expect(result.skipped).toBe(false);
+    expect(await backend.history.blobs.has(orphan)).toBe(false);
   });
 });
 

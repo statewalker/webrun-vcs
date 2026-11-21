@@ -113,6 +113,13 @@ export interface ListObjectsOptions {
    * walk, which reads no trees.
    */
   maxTreeDepth?: number;
+  /**
+   * Objects never listed nor walked through, as `--exclude-promisor-objects` excludes a
+   * partial clone's promisor objects (revision.c marks every object of a promisor pack
+   * `UNINTERESTING | SEEN`, and skips a missing object a promisor object names): a want among
+   * them is skipped unread, a commit among them is not walked, a tree among them is not read.
+   */
+  excludeObjects?: Iterable<ObjectId>;
 }
 
 /** git's default `core.maxTreeDepth` (`DEFAULT_MAX_ALLOWED_TREE_DEPTH`, outside MSVC builds). */
@@ -211,6 +218,9 @@ export async function* listObjects(
   const has = (id: ObjectId, f: number) => (flags.get(id) & f) !== 0;
   const set = (id: ObjectId, f: number) => flags.add(id, f);
   const commits = new Map<ObjectId, CommitInfo>();
+  // --exclude-promisor-objects: marked as git's mark_uninteresting marks them
+  for (const id of options.excludeObjects ?? []) set(id, SEEN | UNINTERESTING | BOUNDARY);
+  const excluded = (id: ObjectId) => options.excludeObjects !== undefined && has(id, BOUNDARY);
   const shallow = new Set(options.shallow ?? []);
   const grafts = options.grafts;
   const parentsOf = (id: ObjectId, c: CommitInfo): ObjectId[] => {
@@ -323,6 +333,7 @@ export async function* listObjects(
   const start = async (tip: ObjectId, uninteresting: boolean) => {
     let id = tip;
     for (;;) {
+      if (excluded(id)) return;
       // a want is read (a missing one throws, though a stale commit-graph still lists it)
       const known = commits.get(id) ?? (uninteresting ? await fromHeader(id) : undefined);
       if (known) {

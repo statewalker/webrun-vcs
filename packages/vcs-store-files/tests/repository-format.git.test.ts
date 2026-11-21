@@ -5,7 +5,7 @@
  * there; in a repository with alternates they delete only its own objects. Reftable needs git 2.45 or newer: that test is skipped on older gits.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GcOrchestrator } from "@statewalker/vcs-core";
@@ -232,7 +232,7 @@ describe("format extensions read as git_config_bool", () => {
 });
 
 describe("a partial clone", () => {
-  it("opens, but gc(), repack() and GcOrchestrator refuse and delete nothing", async () => {
+  it("opens; GcOrchestrator refuses, gc() and repack() keep the promisor packs apart", async () => {
     const src = nativeRepo();
     git(src, ["config", "uploadpack.allowFilter", "true"]);
     const dir = join(tempDir("repo-format-partial-"), "clone");
@@ -246,16 +246,20 @@ describe("a partial clone", () => {
     expect((await backend.history.refs.resolve("HEAD"))?.objectId).toBe(
       git(dir, ["rev-parse", "HEAD"]).trim(),
     );
-    await expect(
-      gc({ history: backend.history, files: backend.files, pruneExpireMs: 0 }),
-    ).rejects.toThrow(/cannot gc in a partial clone/);
-    await expect(repack(backend)).rejects.toBeInstanceOf(UnsupportedRepositoryFormatError);
     const orchestrator = new GcOrchestrator(backend.history, new FileGcStrategy(backend));
     await expect(orchestrator.run({ pruneExpireMs: 0 })).rejects.toThrow(
       /cannot prune in a partial clone/,
     );
     expect(stored(dir)).toEqual(before);
     expect(before.has(orphan)).toBe(true);
+    // git's gc in a partial clone: the promisor objects repacked into a promisor pack, the
+    // old unreachable loose blob pruned, the repository whole to native fsck
+    await repack(backend);
+    await gc({ history: backend.history, files: backend.files, pruneExpireMs: 0 });
+    expect(stored(dir).has(orphan)).toBe(false);
+    const packDir = join(dir, ".git/objects/pack");
+    expect(readdirSync(packDir).filter((n) => n.endsWith(".promisor")).length).toBe(1);
+    expect(spawnSync("git", ["fsck"], { cwd: dir, env: GIT_ENV }).status).toBe(0);
   });
 });
 

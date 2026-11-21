@@ -1122,6 +1122,18 @@ export class StatusCommand extends GitCommand<Status> {
         return undefined;
       }
     };
+    // diffcore-rename's prefetches: a partial clone's absent blobs in one batch (the
+    // worktree side's files are no blobs)
+    const prefetch = async (
+      wanted: Array<{ candidate: RenameCandidate; side: "source" | "destination" }>,
+      sourcesOnly = false,
+    ) => {
+      const ids = wanted
+        .filter((w) => !sourcesOnly || w.side === "source")
+        .filter((w) => w.candidate.mode !== 0o160000)
+        .map((w) => w.candidate.id);
+      await this.blobs.prefetch?.(ids);
+    };
     // git's diff warning when inexact renames were skipped (git status itself prints none)
     let needed = 0;
     const onRenameLimit = (n: number) => {
@@ -1143,6 +1155,7 @@ export class StatusCommand extends GitCommand<Status> {
       const pairs = await detectRenames(indexSources, indexDestinations, {
         renameLimit: limit,
         onRenameLimit,
+        prefetch: (wanted) => prefetch(wanted),
         size: (c) => blobSize(c.id),
         load: (c) => blob(c.id),
       });
@@ -1213,6 +1226,7 @@ export class StatusCommand extends GitCommand<Status> {
           {
             renameLimit: limit,
             onRenameLimit,
+            prefetch: (wanted) => prefetch(wanted, true),
             size: async (c, role) =>
               role === "source"
                 ? blobSize(c.id)
