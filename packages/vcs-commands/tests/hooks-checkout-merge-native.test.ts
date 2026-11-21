@@ -371,3 +371,52 @@ describeGit("clone through a symbolic link: post-checkout's GIT_DIR (as native g
     expect(logOf(mine, "c-ours")).toBe(logOf(theirs, "c-native"));
   });
 });
+
+describeGit(
+  "cherry-pick's ref lock message names the git directory as git does (review fix)",
+  () => {
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "hooks-lock-path-"));
+    });
+    afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+    it("a repository reached through a symbolic link: the logical $PWD path, not the real one", async () => {
+      const real = join(root, "real");
+      const link = join(root, "lnk");
+      mkdirSync(real, { recursive: true });
+      symlinkSync(real, link);
+      const dir = join(link, "r");
+      mkdirSync(dir, { recursive: true });
+      git(dir, ["init", "-q", "-b", "main"]);
+      putFile(dir, "a.txt", "a\n");
+      git(dir, ["add", "-A"]);
+      git(dir, ["commit", "-qm", "base"]);
+      git(dir, ["checkout", "-q", "-b", "side"]);
+      putFile(dir, "c.txt", "c\n");
+      git(dir, ["add", "-A"]);
+      git(dir, ["commit", "-qm", "side one"]);
+      git(dir, ["checkout", "-q", "main"]);
+      const side = git(dir, ["rev-parse", "side"]).trim();
+      const [theirs, mine] = hookTwins(root, dir);
+      for (const twin of [theirs, mine]) putFile(twin.dir, ".git/refs/heads/main.lock", "");
+      // a shell started in the link names its directory so ($PWD), as absolute_path prefers it
+      const native = nativeIn(theirs, root, ["cherry-pick", side], { PWD: theirs.dir });
+      expect(native.status).not.toBe(0);
+      const lockLine = (text: string, twinDir: string) =>
+        text
+          .split("\n")
+          .find((l) => l.startsWith("error: cannot lock ref"))
+          ?.replaceAll(twinDir, "<twin>");
+      expect(lockLine(native.stderr, theirs.dir)).toContain("'<twin>/.git/refs/heads/main.lock'");
+      const error = await (await oursIn(mine))
+        .cherryPick()
+        .include(side)
+        .call()
+        .then(
+          () => undefined,
+          (e: unknown) => e as Error,
+        );
+      expect(lockLine(error?.message ?? "", mine.dir)).toBe(lockLine(native.stderr, theirs.dir));
+    });
+  },
+);

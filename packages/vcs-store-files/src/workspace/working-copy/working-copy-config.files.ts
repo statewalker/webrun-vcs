@@ -42,6 +42,8 @@ export function configFilesApiOf(
   const readOnly = options.readOnly;
   return {
     read: async (path) => ((await files.exists(path)) ? readFile(files, path) : undefined),
+    readPrefix: async (path, maxBytes) =>
+      (await files.exists(path)) ? readPrefix(files, path, maxBytes) : undefined,
     write: readOnly
       ? async () => {
           throw new Error(readOnly);
@@ -52,6 +54,26 @@ export function configFilesApiOf(
       ? { lstat: posix.lstat.bind(posix), readlink: posix.readlink.bind(posix) }
       : {}),
   };
+}
+
+/** At most `maxBytes` bytes from the start of the file at `path`. */
+async function readPrefix(files: FilesApi, path: string, maxBytes: number): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for await (const chunk of files.read(path, { start: 0, length: maxBytes })) {
+    const part = chunk.length > maxBytes - total ? chunk.subarray(0, maxBytes - total) : chunk;
+    chunks.push(part);
+    total += part.length;
+    if (total >= maxBytes) break;
+  }
+  if (chunks.length === 1) return chunks[0];
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
 }
 
 /**
@@ -86,6 +108,12 @@ export class ConfigParseError extends Error {
  */
 export interface ConfigFilesApi {
   read(path: string): Promise<Uint8Array | undefined>;
+  /**
+   * At most `maxBytes` bytes from the start of the file, so a confined include (`includes:
+   * "files"`) never reads more than its cap plus one byte; without it the whole file is read
+   * and its length checked after
+   */
+  readPrefix?(path: string, maxBytes: number): Promise<Uint8Array | undefined>;
   write(path: string, content: Uint8Array): Promise<void>;
   /**
    * The host directory these paths are relative to: an include climbing above it is read
@@ -1389,9 +1417,14 @@ class ChainReader {
     // the including file's spelling of the path (leading `/` or not), for its origin
     const spelled = from.path.startsWith("/") ? `/${real}` : real;
     const stat = await files.lstat(spelled).catch(() => undefined);
-    if (stat?.kind !== "file" || (stat.size ?? 0) > MAX_CONFINED_INCLUDE_SIZE) return undefined;
+    // no size, no include: the cap is checked before the read and enforced by it (a file
+    // grown since the lstat is read no further than one byte past the cap, then skipped)
+    if (stat?.kind !== "file" || stat.size === undefined) return undefined;
+    if (stat.size > MAX_CONFINED_INCLUDE_SIZE) return undefined;
     const read = async (p: string) => {
-      const content = await files.read(p);
+      const content = files.readPrefix
+        ? await files.readPrefix(p, MAX_CONFINED_INCLUDE_SIZE + 1)
+        : await files.read(p);
       return content && content.length > MAX_CONFINED_INCLUDE_SIZE ? undefined : content;
     };
     return { read, path: spelled, ...scopeOf(from) };

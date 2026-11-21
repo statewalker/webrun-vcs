@@ -869,11 +869,18 @@ export class HookSession {
     return undefined;
   }
 
-  /** The git directory's absolute host path, where the repository's files have one. */
-  async hostGitDir(): Promise<string | undefined> {
+  /**
+   * The git directory's absolute host path, where the repository's files have one: its real
+   * path (symbolic links followed), as git names it after a `getcwd` (clone's GIT_DIR, the
+   * receive side's `absolute_path` in the git directory), or with `{ real: false }` as the
+   * host names it, as git's `absolute_path` of `.git` from the top keeps the logical `$PWD`
+   * (lockfile.c's "Unable to create" message).
+   */
+  async hostGitDir(options: { real?: boolean } = {}): Promise<string | undefined> {
     const layout = await this.host.layout();
     const host = layout ? hostPathOf(layout.files, layout.gitDir) : undefined;
-    return host ? realHostPath(host, this.host.environment()) : undefined;
+    if (!host || options.real === false) return host;
+    return realHostPath(host, this.host.environment());
   }
 
   /** Whether `name` exists as an executable hook (git's `hook_exists`), giving no hint. */

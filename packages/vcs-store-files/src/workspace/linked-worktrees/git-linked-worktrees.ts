@@ -232,9 +232,16 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
 
   /** The config files, with the storage's root and links (what confined includes check) */
   private configFiles(): ConfigFilesApi {
+    const base = configFilesApiOf(this.files);
     return {
-      ...configFilesApiOf(this.files),
+      ...base,
       read: (path: string) => readIfFile(this.files, path),
+      // a directory reads as absent here too; a confined include no further than its cap
+      readPrefix: async (path: string, maxBytes: number) => {
+        const kind = (await this.files.stats(path).catch(() => undefined))?.kind;
+        if (kind !== "file" || !base.readPrefix) return undefined;
+        return base.readPrefix(path, maxBytes).catch(() => undefined);
+      },
     };
   }
 

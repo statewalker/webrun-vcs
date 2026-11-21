@@ -211,8 +211,9 @@ class WorktreeRefs implements Refs {
     const own = refNames.filter(isPerWorktreeRef);
     const common = refNames.filter((n) => !isPerWorktreeRef(n));
     // the repository's first: a transaction refused there (by the hook) deletes none of
-    // this worktree's own either, as git's delete_refs gives up the whole transaction; a
-    // ref that fails on its own (2.43's one-by-one deletion) leaves the others going
+    // this worktree's own either, as git's delete_refs gives up the whole transaction. As
+    // 2.43 (`legacy`) only the packed store's refusal stops everything: there each ref is
+    // deleted in a transaction of its own, and files_delete_refs goes on past one refused
     let error: unknown;
     for (const [store, names] of [
       [this.common, common],
@@ -223,7 +224,7 @@ class WorktreeRefs implements Refs {
         if (store.removeAll) await store.removeAll(names, options);
         else for (const name of names) await store.remove(name, { deleteRefs: true });
       } catch (e) {
-        if (e instanceof RefTransactionAbortedError) throw e;
+        if (e instanceof RefTransactionAbortedError && (!options?.legacy || e.packed)) throw e;
         error ??= e;
       }
     }

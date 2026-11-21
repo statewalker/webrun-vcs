@@ -186,7 +186,7 @@ describe("config includes: git's rule, confined to the files API, or none", () =
               links[hostOf(p)] !== undefined
                 ? { kind: "symlink" }
                 : host[hostOf(p)] !== undefined
-                  ? { kind: "file" }
+                  ? { kind: "file", size: enc.encode(host[hostOf(p)]).length }
                   : { kind: "directory" },
             readlink: async (p: string) => {
               const target = links[hostOf(p)];
@@ -309,13 +309,14 @@ describe('config includes "files": confined to the repository, size-capped', () 
     expect(open.getAll("secret.token")).toEqual(["b-secret"]);
   });
 
-  it("createGitFilesBackend reads its settings under the same rule", async () => {
-    // tenantB's config would make tenantA's format one this store refuses
+  it("createGitFilesBackend's format check follows no include, whatever the rule", async () => {
+    // tenantB's config would make tenantA's format one this store refuses, were it included:
+    // git's read_repository_format reads the config file alone (git_config_from_file)
     const b = bare("tenantB", []);
     writeFileSync(join(b, "config"), "[core]\n\trepositoryformatversion = 2\n");
     bare("tenantA", ["[include]", "\tpath = ../tenantB.git/config"]);
     const files = createNodeFilesApi({ rootDir: base });
-    await expect(createGitFilesBackend({ files, gitDir: "tenantA.git" })).rejects.toThrow();
+    await expect(createGitFilesBackend({ files, gitDir: "tenantA.git" })).resolves.toBeDefined();
     await expect(
       createGitFilesBackend({ files, gitDir: "tenantA.git", configIncludes: "files" }),
     ).resolves.toBeDefined();
@@ -429,5 +430,65 @@ describe("FileWorktree.openRepository of a linked worktree's git directory", () 
         config.getAll("probe.gitdir"),
       ]).toEqual([["yes"], ["yes"], ["yes"]]);
     }
+  });
+});
+
+describe('config includes "files": the size cap holds on the read itself (review fix)', () => {
+  const enc = new TextEncoder();
+  const big = enc.encode(`[probe]\n\tbig = yes\n${`# ${"x".repeat(1022)}\n`.repeat(1025)}`);
+  const small = enc.encode("[probe]\n\tsmall = yes\n");
+  const config = enc.encode("[include]\n\tpath = big.cfg\n\tpath = small.cfg\n");
+
+  /** `.git/config` including big.cfg and small.cfg; `size` is what lstat tells of each. */
+  async function openWith(size: (path: string, real: number) => number | undefined) {
+    const contents = new Map([
+      [".git/config", config],
+      [".git/big.cfg", big],
+      [".git/small.cfg", small],
+    ]);
+    const asked: { path: string; maxBytes?: number; length: number }[] = [];
+    const read = async (path: string, maxBytes?: number) => {
+      const bytes = contents.get(path);
+      if (!bytes) return undefined;
+      const out = maxBytes === undefined ? bytes : bytes.subarray(0, maxBytes);
+      asked.push({ path, ...(maxBytes === undefined ? {} : { maxBytes }), length: out.length });
+      return out;
+    };
+    const loaded = await createWorkingCopyConfig(
+      {
+        read: (path: string) => read(path),
+        readPrefix: read,
+        write: async () => {},
+        lstat: async (path: string) => {
+          const bytes = contents.get(path);
+          if (!bytes) return undefined;
+          const s = size(path, bytes.length);
+          return s === undefined ? { kind: "file" } : { kind: "file", size: s };
+        },
+        readlink: async () => undefined,
+      },
+      ".git",
+      undefined,
+      { includes: "files" },
+    );
+    return { loaded, asked };
+  }
+
+  it("a file grown past the cap since its lstat is read no further than the cap plus one byte", async () => {
+    // lstat reports the size from before the file grew
+    const { loaded, asked } = await openWith((_path, real) => Math.min(real, 100));
+    expect(loaded.getAll("probe.big")).toEqual([]);
+    expect(loaded.getAll("probe.small")).toHaveLength(1);
+    const bigRead = asked.find((a) => a.path === ".git/big.cfg");
+    expect(bigRead?.maxBytes).toBe(1024 * 1024 + 1);
+    expect(bigRead?.length).toBe(1024 * 1024 + 1);
+  });
+
+  it("an lstat that gives no size follows no include", async () => {
+    const { loaded, asked } = await openWith((path, real) =>
+      path.endsWith("small.cfg") ? undefined : real,
+    );
+    expect(loaded.getAll("probe.small")).toEqual([]);
+    expect(asked.some((a) => a.path === ".git/small.cfg")).toBe(false);
   });
 });

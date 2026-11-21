@@ -1690,7 +1690,7 @@ export function createFilesRefOps(
       const verdict = await hook?.("prepared", told, { packed: true });
       if (verdict === false || typeof verdict === "string") {
         await hook?.("aborted", told, { packed: true });
-        throw new RefTransactionAbortedError("prepared", verdict || undefined);
+        throw new RefTransactionAbortedError("prepared", verdict || undefined, { packed: true });
       }
       const fresh = await readPacked();
       for (const name of unique) fresh.delete(name);

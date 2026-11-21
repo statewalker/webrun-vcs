@@ -192,7 +192,10 @@ function gitTrue(value: unknown): boolean {
 
 /**
  * Reads `<gitDir>/config` and checks its repository format (see `checkRepositoryFormat`). A
- * repository without a config reads as version 0 with no extensions.
+ * repository without a config reads as version 0 with no extensions. Include directives are
+ * never followed here: git's `read_repository_format` reads the file through
+ * `git_config_from_file`, which has no includes, so a `core.repositoryformatversion` set only
+ * by an included file does not count.
  *
  * @example
  * ```typescript
@@ -202,16 +205,12 @@ function gitTrue(value: unknown): boolean {
 export async function readRepositoryFormat(
   files: FilesApi,
   gitDir = ".git",
-  options: {
-    /** Which include directives of the repository's config are followed (git's: all) */
-    includes?: boolean | "files";
-  } = {},
 ): Promise<RepositoryFormat> {
   const config = await createWorkingCopyConfig(
     configFilesApiOf(files, { readOnly: "the repository format check never writes the config" }),
     gitDir,
     undefined,
-    options.includes === undefined ? {} : { includes: options.includes },
+    { includes: false },
   );
   return checkRepositoryFormat(config);
 }

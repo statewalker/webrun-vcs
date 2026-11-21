@@ -159,9 +159,10 @@ export async function createGitFilesBackend(
   const packDir = joinPath(objectsDir, "pack");
 
   // git's check_repository_format: a version or extension we cannot honour (reftable refs,
-  // sha256 objects, an unknown v1 extension) is refused before anything is read or written
+  // sha256 objects, an unknown v1 extension) is refused before anything is read or written.
+  // Like git's read_repository_format it reads the config file alone, without includes.
+  await readRepositoryFormat(files, gitDir);
   const includes = options.configIncludes === undefined ? {} : { includes: options.configIncludes };
-  await readRepositoryFormat(files, gitDir, includes);
 
   if (create) {
     await createGitDirectoryStructure(files, gitDir, objectsDir);

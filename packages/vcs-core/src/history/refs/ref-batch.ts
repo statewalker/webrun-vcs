@@ -656,11 +656,18 @@ export interface RefRemoveAllOptions {
 
 /** A ref transaction its hook aborted (git: "in '<state>' phase, update aborted by ..."). */
 export class RefTransactionAbortedError extends Error {
+  /**
+   * The packed store's transaction of git 2.43's `delete_refs` was refused (before any ref
+   * was deleted), rather than the transaction of one ref (see `RefRemoveAllOptions.legacy`)
+   */
+  readonly packed: boolean;
   constructor(
     readonly state: "preparing" | "prepared",
     message = `in '${state}' phase, update aborted by the reference-transaction hook`,
+    options: { packed?: boolean } = {},
   ) {
     super(message);
     this.name = "RefTransactionAbortedError";
+    this.packed = options.packed ?? false;
   }
 }
