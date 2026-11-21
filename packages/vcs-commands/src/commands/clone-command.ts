@@ -692,8 +692,12 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       deepenSince: shallowSince,
       deepenNot: shallowExcludes.length > 0 ? shallowExcludes : undefined,
       onProgress: this.progressMessageCallback,
-      // git's write_remote_refs: one initial transaction, no reflog
+      // git's write_remote_refs: one initial transaction (packed-refs), no reflog; the
+      // followed tags of a single-branch clone each on their own (write_followtags)
       skipReflog: true,
+      initialTransaction: true,
+      // fetch-pack's args->cloning: a shallow source's shallow commits are recorded
+      cloning: true,
       // clone.c sets TRANS_OPT_KEEP: the pack is kept whatever its size
       keepPack: true,
       ...(copyObjects
@@ -717,6 +721,10 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     const result = await withRemoteUploadPack(remote, sessionOptions, (connection) =>
       fetchFromConnection(connection, fetchOptions),
     );
+    // write_remote_refs dies when its transaction fails
+    if (result.refTransactionError !== undefined) {
+      throw new TransportError(`fatal: ${result.refTransactionError}`);
+    }
     const cloneLog = this.reflogLine(reflogMessages.clone(repo));
     const trackingUpdates: TrackingRefUpdate[] = result.refUpdates.map(toTrackingRefUpdate);
 
@@ -734,6 +742,18 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     // an empty remote without unborn HEAD: git's default branch (the one init named)
     if (!detachedTag && !this.bare && defaultBranch === undefined && result.isEmpty) {
       defaultBranch = (await this.localHeadBranch()) ?? "main";
+    }
+
+    // git's update_remote_refs (before update_head): refs/remotes/<name>/HEAD names the tracking ref of the
+    // remote's default branch, when the clone took that branch
+    const remoteHead = advertisedDefaultBranch?.startsWith("refs/heads/")
+      ? toBranchName(advertisedDefaultBranch)
+      : undefined;
+    if (!this.bare && remoteHead) {
+      const target = `refs/remotes/${this.remoteName}/${remoteHead}`;
+      if ((await this.refsStore.resolve(target))?.objectId) {
+        await this.refsStore.setSymbolic(`refs/remotes/${this.remoteName}/HEAD`, target, cloneLog);
+      }
     }
 
     if (detachedTag) {
@@ -761,7 +781,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       // the branch is written through it, logged "clone: from <url>" in both reflogs
       await this.refsStore.setSymbolic("HEAD", localRef);
       if (tip?.objectId) {
-        await this.refsStore.set(localRef, tip.objectId, cloneLog);
+        // update_head's refs_update_ref("HEAD"): through HEAD, unchecked
+        const written = await this.refsStore.batch([{ name: "HEAD", new: tip.objectId }], cloneLog);
+        if (!written.ok) throw new TransportError(`fatal: unable to update ${localRef}`);
         headCommit = tip.objectId;
         if (!this.noCheckout) checkoutId = tip.objectId;
       }
@@ -772,18 +794,6 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       if (defaultBranch) {
         await this.refsStore.setSymbolic("HEAD", `refs/heads/${defaultBranch}`);
         headCommit = (await this.refsStore.resolve("HEAD"))?.objectId;
-      }
-    }
-
-    // git's update_remote_refs: refs/remotes/<name>/HEAD names the tracking ref of the
-    // remote's default branch, when the clone took that branch
-    const remoteHead = advertisedDefaultBranch?.startsWith("refs/heads/")
-      ? toBranchName(advertisedDefaultBranch)
-      : undefined;
-    if (!this.bare && remoteHead) {
-      const target = `refs/remotes/${this.remoteName}/${remoteHead}`;
-      if ((await this.refsStore.resolve(target))?.objectId) {
-        await this.refsStore.setSymbolic(`refs/remotes/${this.remoteName}/HEAD`, target, cloneLog);
       }
     }
 

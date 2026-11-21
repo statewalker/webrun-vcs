@@ -9,6 +9,7 @@
  */
 
 import {
+  compareRefNames,
   createRef,
   createSymbolicRef,
   type FilesApi,
@@ -234,12 +235,16 @@ export async function readAllRefs(
     await readLooseRefsRecursive(files, gitDir, refsPrefix, again, options);
     if (!sameLoose(loose, again)) continue;
     const looseNames = new Set(loose.map((r) => r.name));
-    refs.push(...loose);
+    const merged = [...loose];
     for (const packedRef of packedRefs) {
       if (!looseNames.has(packedRef.name) && packedRef.name.startsWith(prefix)) {
-        refs.push(packedRef);
+        merged.push(packedRef);
       }
     }
+    // in git's order: loose and packed refs merged by name (refs/ref-cache.c, the packed
+    // iterator), whichever store holds each
+    merged.sort((a, b) => compareRefNames(a.name, b.name));
+    refs.push(...merged);
     return refs;
   }
   throw new Error("refs kept changing while listing them");

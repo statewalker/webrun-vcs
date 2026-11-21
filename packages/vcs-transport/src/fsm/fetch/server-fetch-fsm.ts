@@ -18,6 +18,7 @@ import {
   getState,
   getTransport,
   type ProcessContext,
+  setRepository,
 } from "../../context/context-adapters.js";
 import { ZERO_OID } from "../../protocol/constants.js";
 import { visibleRefs } from "../../protocol/hidden-refs.js";
@@ -31,6 +32,7 @@ import {
   peelFully,
   resolveDeepenNot,
   UploadPackRequestError,
+  withServedShallow,
 } from "./upload-pack-graph.js";
 import {
   authorizeUpload,
@@ -140,6 +142,22 @@ async function okToGiveUp(ctx: ProcessContext): Promise<boolean> {
   return ready;
 }
 
+/**
+ * The served repository's own shallow commits (git's `is_repository_shallow`), read once per
+ * session; when there are any, the context's repository becomes their grafted view
+ * (`withServedShallow`: walks and packs stop at them).
+ */
+export async function prepareServedShallow(ctx: ProcessContext): Promise<ReadonlySet<string>> {
+  const state = getState(ctx);
+  if (!state.repositoryShallow) {
+    state.repositoryShallow = new Set((await getRefStore(ctx).getShallow?.()) ?? []);
+  }
+  const repository = getRepository(ctx);
+  const served = withServedShallow(repository, state.repositoryShallow);
+  if (served !== repository) setRepository(ctx, served);
+  return state.repositoryShallow;
+}
+
 /** The v0 request as upload-pack's hooks see it. */
 function uploadRequest(ctx: ProcessContext): UploadPackRequestParts {
   const state = getState(ctx);
@@ -217,9 +235,9 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const config = getConfig(ctx);
       const state = getState(ctx);
       const output = getOutput(ctx);
-      const repository = getRepository(ctx);
-
       try {
+        const repositoryShallow = await prepareServedShallow(ctx);
+        const repository = getRepository(ctx);
         const refs = await refStore.listAll();
         const capabilities =
           config.serverCapabilities ??
@@ -232,6 +250,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         // Empty repository: send special capabilities^{} line
         if (refsArray.length === 0) {
           await transport.writeLine(`${ZERO_OID} capabilities^{}\0${capabilities.join(" ")}`);
+          for (const oid of repositoryShallow) await transport.writeLine(`shallow ${oid}`);
           await transport.writeFlush();
           state.advertisedCapabilities = new Set(capabilities);
           return "EMPTY_REPO";
@@ -246,6 +265,8 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           state.refs.set(name, oid);
           first = false;
         }
+        // git's advertise_shallow_grafts: a shallow repository's shallow commits after the refs
+        for (const oid of repositoryShallow) await transport.writeLine(`shallow ${oid}`);
         await transport.writeFlush();
         state.advertisedCapabilities = new Set(capabilities);
         return "REFS_SENT";
@@ -265,6 +286,8 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
       const output = getOutput(ctx);
 
       try {
+        // a stateless request starts here (its advertisement was another request)
+        await prepareServedShallow(ctx);
         let hasShallow = false;
         let hasFilter = false;
 
@@ -390,9 +413,13 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
               }
               break;
             case "REACHABLE_COMMIT_TIP":
-              // Reachable from any ref tip
+              // Reachable from any ref tip (a shallow repository's grafted view withholds
+              // isReachableFromAnyTip: its graph is walked from the ref store's tips)
               if (repository.isReachableFromAnyTip) {
                 valid = await repository.isReachableFromAnyTip(oid);
+              } else if (repository.getCommitInfo) {
+                const tips = [...(await refStore.listAll())].map(([, id]) => id);
+                valid = !(await findUnreachableWant(repository, [oid], tips));
               } else {
                 valid = [...state.refs.values()].includes(oid);
               }
@@ -524,6 +551,7 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
           deepenSince: state.deepenSince,
           deepenNot,
           tips: state.refs.values(),
+          serverShallow: state.repositoryShallow,
         });
         state.serverShallow = new Set(update.shallow);
         state.serverUnshallow = new Set(update.unshallow);

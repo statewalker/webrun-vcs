@@ -8,10 +8,27 @@
 import { describe, expect, it } from "vitest";
 import type { CommitGraphInfo, RepositoryFacade } from "../src/api/repository-facade.js";
 import {
+  getOutput,
+  getState,
+  type ProcessContext,
+  setConfig,
+  setOutput,
+  setRefStore,
+  setRepository,
+  setState,
+} from "../src/context/context-adapters.js";
+import { HandlerOutput } from "../src/context/handler-output.js";
+import { ProcessConfiguration } from "../src/context/process-config.js";
+import type { RefStore } from "../src/context/process-context.js";
+import { ProtocolState } from "../src/context/protocol-state.js";
+import { serverFetchHandlers } from "../src/fsm/fetch/index.js";
+import {
   computeShallowUpdate,
+  findUnreachableWant,
   INFINITE_DEPTH,
   okToGiveUp,
   UploadPackRequestError,
+  withServedShallow,
 } from "../src/fsm/fetch/upload-pack-graph.js";
 
 type Graph = Map<string, { parents: string[]; time: number }>;
@@ -128,5 +145,98 @@ describe("computeShallowUpdate without getCommitInfo", () => {
         }),
       ).rejects.toBeInstanceOf(UploadPackRequestError);
     }
+  });
+});
+
+describe("withServedShallow", () => {
+  // main: c1 <- c2 <- c3 <- c4, the served repository shallow at c3 (c1, c2 still stored)
+  const chain = (): Graph =>
+    new Map([
+      ["c1", { parents: [], time: 100 }],
+      ["c2", { parents: ["c1"], time: 200 }],
+      ["c3", { parents: ["c2"], time: 300 }],
+      ["c4", { parents: ["c3"], time: 400 }],
+    ]);
+
+  it("refuses to serve a shallow repository without the commit graph", () => {
+    const { repository } = graphFacade(chain());
+    const bare = { ...repository, getCommitInfo: undefined } as unknown as RepositoryFacade;
+    expect(() => withServedShallow(bare, new Set(["c3"]))).toThrow(UploadPackRequestError);
+    // a repository that is not shallow is served as it is
+    expect(withServedShallow(bare, new Set())).toBe(bare);
+  });
+
+  it("walks and checks reachability through the grafted history", async () => {
+    const { repository } = graphFacade(chain());
+    const served = withServedShallow(
+      { ...repository, isReachableFromAnyTip: async () => true } as unknown as RepositoryFacade,
+      new Set(["c3"]),
+    );
+    const walked: string[] = [];
+    for await (const oid of served.walkAncestors("c4")) walked.push(oid);
+    expect(walked).toEqual(["c4", "c3"]);
+    expect(await served.isReachableFrom?.("c3", ["c4"])).toBe(true);
+    expect(await served.isReachableFrom?.("c2", ["c4"])).toBe(false);
+    expect(served.isReachableFromAnyTip).toBeUndefined();
+    // a want below the boundary is no ref's: refused as git's reachability check does
+    expect(await findUnreachableWant(served, ["c3"], ["c4"])).toBeUndefined();
+    expect(await findUnreachableWant(served, ["c2"], ["c4"])).toBe("c2");
+  });
+
+  for (const policy of ["REACHABLE_COMMIT", "REACHABLE_COMMIT_TIP"] as const) {
+    it(`${policy} refuses a want below the served repository's shallow commits`, async () => {
+      const { repository } = graphFacade(chain());
+      const served = withServedShallow(
+        { ...repository, isReachableFromAnyTip: async () => true } as unknown as RepositoryFacade,
+        new Set(["c3"]),
+      );
+      const refStore = {
+        get: async () => undefined,
+        update: async () => {},
+        listAll: async () => [["refs/heads/main", "c4"]],
+      } as unknown as RefStore;
+      const validate = async (want: string) => {
+        const ctx: ProcessContext = {};
+        setRepository(ctx, served);
+        setRefStore(ctx, refStore);
+        setState(ctx, new ProtocolState());
+        setOutput(ctx, new HandlerOutput());
+        const config = new ProcessConfiguration();
+        config.requestPolicy = policy;
+        setConfig(ctx, config);
+        getState(ctx).refs.set("refs/heads/main", "c4");
+        getState(ctx).wants.add(want);
+        const handler = serverFetchHandlers.get("VALIDATE_WANTS");
+        if (!handler) throw new Error("no VALIDATE_WANTS");
+        return { event: await handler(ctx), output: getOutput(ctx) };
+      };
+      expect((await validate("c3")).event).toBe("VALID");
+      const refused = await validate("c2");
+      expect(refused.event).toBe("INVALID_WANT");
+      expect(refused.output.invalidWant).toBe("c2");
+    });
+  }
+});
+
+describe("computeShallowUpdate of a shallow server's deepen(INFINITE)", () => {
+  it("unshallows nothing when the client's shallow commits are grafts too", async () => {
+    // c1 <- c2 <- c3 <- c4 <- c5: the server shallow at c2, the client at c4
+    const graph: Graph = new Map([
+      ["c1", { parents: [], time: 100 }],
+      ["c2", { parents: ["c1"], time: 200 }],
+      ["c3", { parents: ["c2"], time: 300 }],
+      ["c4", { parents: ["c3"], time: 400 }],
+      ["c5", { parents: ["c4"], time: 500 }],
+    ]);
+    const { repository } = graphFacade(graph);
+    const update = await computeShallowUpdate(repository, {
+      wants: ["c5"],
+      clientShallow: ["c4"],
+      depth: INFINITE_DEPTH,
+      serverShallow: new Set(["c2", "c4"]),
+    });
+    expect(update.shallow).toEqual([]);
+    expect(update.unshallow).toEqual([]);
+    expect([...update.packShallow]).toEqual(["c4"]);
   });
 });

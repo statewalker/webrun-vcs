@@ -1303,6 +1303,13 @@ export function createFilesRefOps(
       }
       return { ok: true, rejected: [] };
     }
+    // an initial transaction creates refs under refs/ only (packed-refs holds no other)
+    const notInitial = batchOptions.initial
+      ? commands.filter((c) => c.new === null || !c.name.startsWith("refs/"))
+      : [];
+    if (notInitial.length) {
+      return fail(notInitial.map((c) => ({ name: c.name, reason: "invalid-command" as const })));
+    }
     // a root ref (ORIG_HEAD, ...) written on its own, as git's refs_update_ref writes it; a
     // symbolic one naming a ref under refs/ (unless replaced) is written through to that ref,
     // the hook told the root ref asked for, as git splits a symbolic ref's update
@@ -1375,10 +1382,70 @@ export function createFilesRefOps(
       await hook?.("aborted", transactionUpdates(updates), { asAsked: true });
       throw new RefTransactionAbortedError("preparing", verdict || undefined);
     }
+    if (batchOptions.initial) return initial(updates, hook);
     return updates.length === 1
       ? single(updates[0] as Update, batchOptions, hook)
       : multi(updates, batchOptions, hook);
   };
+
+  /**
+   * git's initial ref transaction (files_transaction_finish_initial, `git clone`'s
+   * write_remote_refs): the new refs go straight into packed-refs under packed-refs.lock, no
+   * loose file and no reflog. Told to the hook as the version makes it: `prepared` (both),
+   * then 2.5x's nested packed-store transaction (`preparing`, `prepared`; neither version's
+   * initial commit runs `committed` there) and 2.43's `committed`. `preparing` was told by
+   * the caller (2.5x only: 2.43's hook never hears it). A ref that exists already, a
+   * deletion or a name outside `refs/` is refused (git's BUG for an initial transaction).
+   */
+  async function initial(
+    updates: Update[],
+    hook: RefTransactionHook | undefined,
+  ): Promise<BatchResult> {
+    const invalid = updates.filter(
+      (u) => u.newValue === null || !u.name.startsWith("refs/") || u.name !== u.requested,
+    );
+    if (invalid.length) {
+      return fail(invalid.map((u) => ({ name: u.requested, reason: "invalid-command" as const })));
+    }
+    const existing = updates.filter((u) => u.current !== undefined);
+    if (existing.length) {
+      return fail(existing.map((u) => ({ name: u.requested, reason: "mismatch" as const })));
+    }
+    const told = transactionUpdates(updates);
+    const refuse = async (
+      state: "preparing" | "prepared",
+      verdict: boolean | string | undefined,
+      context?: { packed: true; only: "2.56" },
+    ): Promise<RefTransactionAbortedError | undefined> => {
+      if (verdict !== false && typeof verdict !== "string") return undefined;
+      await hook?.("aborted", told, context);
+      return new RefTransactionAbortedError(state, verdict || undefined);
+    };
+    if (hook) {
+      const refused = await refuse("prepared", await hook("prepared", told));
+      if (refused) throw refused;
+    }
+    let refused: RefTransactionAbortedError | undefined;
+    const result = await withPackedLock(async (commitNew) => {
+      const packed = await readPacked();
+      const df = await conflicts(updates, packed, new Set());
+      if (df.length) return fail(df);
+      if (hook) {
+        const context = { packed: true, only: "2.56" } as const;
+        for (const state of ["preparing", "prepared"] as const) {
+          refused = await refuse(state, await hook(state, told, context), context);
+          if (refused) return fail([]);
+        }
+      }
+      for (const u of updates) packed.set(u.name, { id: u.newValue as ObjectId });
+      await commitNew(await serializePacked(packed, options.peel));
+      return { ok: true, rejected: [] } as BatchResult;
+    });
+    if (refused) throw refused;
+    if (result === "held") return fail([{ name: PACKED, reason: "locked" }]);
+    if (result.ok) await hook?.("committed", told, { only: "2.43" });
+    return result;
+  }
 
   async function sweepTemporaries(): Promise<number> {
     if (!(await files.exists(PACKED_NEW))) return 0;

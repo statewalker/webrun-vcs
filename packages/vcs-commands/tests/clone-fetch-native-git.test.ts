@@ -52,6 +52,24 @@ const describeGit = nativeGitAvailable() ? describe : describe.skip;
 /** How our side reaches the remote; FETCH_HEAD shows it without `.git`. */
 const URL = "http://git.test/src.git";
 
+/** packed-refs and every loose ref (path and content) below `gitDir`. */
+function refFilesOf(gitDir: string): { packed?: string; loose: string[] } {
+  const loose: string[] = [];
+  const walk = (rel: string) => {
+    for (const e of readdirSync(join(gitDir, rel), { withFileTypes: true })) {
+      const r = `${rel}/${e.name}`;
+      if (e.isDirectory()) walk(r);
+      else loose.push(`${r} ${readFileSync(join(gitDir, r), "utf8")}`);
+    }
+  };
+  walk("refs");
+  const packedPath = join(gitDir, "packed-refs");
+  return {
+    ...(existsSync(packedPath) ? { packed: readFileSync(packedPath, "utf8") } : {}),
+    loose: loose.sort(),
+  };
+}
+
 describeGit("clone and fetch parity with native git", () => {
   let root: string;
   let src: string;
@@ -209,7 +227,9 @@ describeGit("clone and fetch parity with native git", () => {
     const native = join(root, "native");
     const { git: ourGit } = await openOurs(ours);
     await variant.ours(ourGit.clone().setURI(URL)).call();
-    git(root, "clone", "-q", ...variant.native, src, native);
+    // (--no-local: a fetch as ours over HTTP; a local clone copies every object, so its
+    // followed tags would be every tag)
+    git(root, "clone", "-q", "--no-local", ...variant.native, src, native);
 
     // native git reads our .git/config; for a bare clone both look at the config file
     const nativeGitDir = variant.native.includes("--bare") || variant.native.includes("--mirror");
@@ -232,6 +252,11 @@ describeGit("clone and fetch parity with native git", () => {
       }
     };
     expect(symref(ours)).toBe(symref(native));
+    // git's initial ref transaction: the cloned refs in packed-refs, byte for byte, and
+    // only HEAD's branch and the remote HEAD loose
+    const ourGitDir = join(ours, ".git");
+    const nativeDir = nativeGitDir ? native : join(native, ".git");
+    expect(refFilesOf(ourGitDir)).toEqual(refFilesOf(nativeDir));
     if (!nativeGitDir) {
       // the checked-out branch and its upstream, as native git resolves them
       expect(git(ours, "rev-parse", "--abbrev-ref", "HEAD")).toBe(

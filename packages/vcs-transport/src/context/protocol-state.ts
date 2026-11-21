@@ -156,6 +156,12 @@ export class ProtocolState {
   /** The pack's shallow set (server FSM): its commits' parents are not walked */
   packShallow?: Set<string>;
 
+  /**
+   * The served repository's own shallow commits (server FSM, git's `.git/shallow` read by
+   * `is_repository_shallow`); read once per session
+   */
+  repositoryShallow?: ReadonlySet<string>;
+
   /** Further pack tips (server FSM): the parents of unshallowed commits */
   extraWants?: Set<string>;
 

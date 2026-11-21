@@ -3,8 +3,7 @@
  * clone.c's `clone_local` does: its objects directory copied (loose objects, packs, info files
  * byte for byte), its `objects/info/alternates` entries carried over as absolute paths, the
  * refs listed through the transport; `--reference` still copies, `--no-local` fetches,
- * `--depth` is ignored with git's warning. (A shallow source is fetched instead, as git does,
- * but serving a fetch from a shallow repository is not implemented: no twin.)
+ * `--depth` is ignored with git's warning.
  */
 
 import { createHash } from "node:crypto";
@@ -95,8 +94,12 @@ function stateOf(repo: string) {
   const gitDir = join(repo, ".git");
   return {
     head: read(join(gitDir, "HEAD")),
-    // (git's initial ref transaction writes packed-refs, ours loose refs: the values compared)
     refs: git(repo, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"),
+    // git's initial ref transaction: the cloned refs in packed-refs, the rest loose
+    packed: read(join(gitDir, "packed-refs")),
+    loose: git(repo, "for-each-ref", "--format=%(refname)")
+      .split("\n")
+      .filter((name) => name && existsSync(join(gitDir, name))),
     config: read(join(gitDir, "config")),
     alternates: read(join(gitDir, "objects/info/alternates")),
     shallow: read(join(gitDir, "shallow")),

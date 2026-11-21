@@ -30,6 +30,84 @@ export function notOurRef(oid: string): string {
 /** A request upload-pack refuses (sent to the client as `ERR <message>`). */
 export class UploadPackRequestError extends Error {}
 
+const SERVED_SHALLOW = Symbol("servedShallow");
+
+/**
+ * The repository as upload-pack walks it when it is shallow itself (git reads its
+ * `.git/shallow` as grafts without parents, `register_shallow`): `shallow`'s commits have no
+ * parents in `getCommitInfo`, `walkAncestors` and `isReachableFrom` (so a want below the
+ * boundary is refused, as git's reachability checks walk the grafted history), every pack
+ * stops at them, and `isReachableFromAnyTip` is withheld (callers walk the grafted graph from
+ * the ref store's tips instead). The same repository when `shallow` is empty (or it is
+ * wrapped already).
+ *
+ * @throws UploadPackRequestError when the repository is shallow and has no commit graph
+ * (`getCommitInfo`): its history could not be cut at the shallow commits
+ *
+ * @example
+ * ```ts
+ * const served = withServedShallow(repository, new Set(await refStore.getShallow()));
+ * ```
+ */
+export function withServedShallow(
+  repository: RepositoryFacade,
+  shallow: ReadonlySet<string>,
+): RepositoryFacade {
+  if (shallow.size === 0 || (repository as { [SERVED_SHALLOW]?: true })[SERVED_SHALLOW]) {
+    return repository;
+  }
+  const getCommitInfo = repository.getCommitInfo?.bind(repository);
+  if (!getCommitInfo) {
+    throw new UploadPackRequestError("serving a shallow repository is not supported");
+  }
+  const grafted: NonNullable<RepositoryFacade["getCommitInfo"]> = async (oid, options) => {
+    const info = await getCommitInfo(oid, options);
+    return info && shallow.has(oid) ? { ...info, parents: [] } : info;
+  };
+  const overrides: Partial<RepositoryFacade> & { [SERVED_SHALLOW]: true } = {
+    [SERVED_SHALLOW]: true,
+    getCommitInfo: grafted,
+    walkAncestors: async function* (start: string) {
+      const seen = new Set<string>();
+      const stack = [start];
+      while (stack.length > 0) {
+        const oid = stack.pop() as string;
+        if (seen.has(oid)) continue;
+        seen.add(oid);
+        const info = await grafted(oid);
+        if (!info) continue;
+        yield oid;
+        stack.push(...info.parents);
+      }
+    },
+    isReachableFrom: async (oid: string, from: string | string[]) => {
+      const seen = new Set<string>();
+      const stack = Array.isArray(from) ? [...from] : [from];
+      while (stack.length > 0) {
+        const c = stack.pop() as string;
+        if (c === oid) return true;
+        if (seen.has(c)) continue;
+        seen.add(c);
+        stack.push(...((await grafted(c))?.parents ?? []));
+      }
+      return false;
+    },
+    isReachableFromAnyTip: undefined,
+    exportPack: (wants, exclude, options) =>
+      repository.exportPack(wants, exclude, {
+        ...options,
+        shallow: new Set([...(options?.shallow ?? []), ...shallow]),
+      }),
+  };
+  return new Proxy(repository, {
+    get(target, prop, receiver) {
+      if (Object.hasOwn(overrides, prop)) return (overrides as Record<PropertyKey, unknown>)[prop];
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 /** Commit reads, memoized for one request. */
 class CommitGraph {
   private readonly cache = new Map<string, CommitGraphInfo | null>();
@@ -218,6 +296,13 @@ export interface ShallowRequest {
   deepenNot?: string[];
   /** The advertised tips (`deepen-relative` uses the client shallows reachable from them) */
   tips?: Iterable<string>;
+  /**
+   * The served repository's own shallow commits (`withServedShallow` walks them without
+   * parents): a `deepen` walk reaching one makes it a shallow commit of the answer, as git's
+   * get_shallow_commits does for a graft without parents, and `deepen 2147483647` walks the
+   * history instead of unshallowing every client shallow commit
+   */
+  serverShallow?: ReadonlySet<string>;
 }
 
 /** The shallow section of a fetch response, and how the pack must be cut to match it. */
@@ -276,6 +361,9 @@ export async function computeShallowUpdate(
   }
 
   if (!graph.supported) {
+    if (request.serverShallow?.size) {
+      throw new UploadPackRequestError("serving a shallow repository is not supported");
+    }
     if (byRevList || !repository.computeShallowBoundaries) {
       throw new UploadPackRequestError(
         byRevList ? "deepen-since and deepen-not are not supported" : "shallow is not supported",
@@ -297,7 +385,8 @@ export async function computeShallowUpdate(
     return result(shallow, notShallow);
   }
 
-  if (depth >= INFINITE_DEPTH) {
+  const grafts = request.serverShallow ?? new Set<string>();
+  if (depth >= INFINITE_DEPTH && grafts.size === 0) {
     // --unshallow: every client shallow commit goes
     return result([], clientShallow);
   }
@@ -312,7 +401,7 @@ export async function computeShallowUpdate(
     heads = [];
     for (const want of request.wants) heads.push(await graph.peel(want));
   }
-  const { shallow, notShallow } = await shallowAtDepth(graph, heads, walkDepth);
+  const { shallow, notShallow } = await shallowAtDepth(graph, heads, walkDepth, grafts);
   return result(shallow, notShallow);
 }
 
@@ -337,34 +426,67 @@ async function finish(
   return { shallow, unshallow, packShallow, extraWants };
 }
 
-/** git's get_shallow_commits: breadth first, so each commit is met at its smallest depth. */
+/**
+ * git's get_shallow_commits (shallow.c `get_shallows_or_depth`), step for step: a depth-first
+ * walk from each head in turn (its depth reset to 0), each commit's depth kept, a parent
+ * walked again when it is reached at a smaller depth; a commit at `depth`, or a shallow commit
+ * of the served repository (`grafts`, a graft without parents), is a shallow commit, listed
+ * newest first (commit_list_insert) and again each time it is reached again, as git sends it.
+ */
 async function shallowAtDepth(
   graph: CommitGraph,
-  heads: Iterable<string>,
+  heads: readonly string[],
   depth: number,
+  grafts: ReadonlySet<string> = new Set(),
 ): Promise<{ shallow: string[]; notShallow: Set<string> }> {
-  const shallow: string[] = [];
+  const result: string[] = [];
   const notShallow = new Set<string>();
-  const seen = new Set<string>();
-  let level: string[] = [];
-  for (const head of heads) if (await graph.get(head)) level.push(head);
-  for (let d = 1; level.length > 0; d++) {
-    const next: string[] = [];
-    for (const oid of level) {
-      if (seen.has(oid)) continue;
-      seen.add(oid);
-      const commit = await graph.get(oid);
-      if (!commit) continue; // a parent this repository lacks
-      if (d >= depth) {
-        shallow.push(oid);
+  const depths = new Map<string, number>();
+  const stack: string[] = [];
+  let commit: string | undefined;
+  let curDepth = 0;
+  let i = 0;
+  while (commit !== undefined || i < heads.length || stack.length > 0) {
+    if (commit === undefined) {
+      if (i < heads.length) {
+        const head = heads[i++] as string;
+        if (!(await graph.get(head))) continue;
+        commit = head;
+        depths.set(commit, 0);
+        curDepth = 0;
       } else {
-        notShallow.add(oid);
-        next.push(...commit.parents);
+        commit = stack.pop() as string;
+        curDepth = depths.get(commit) ?? 0;
       }
     }
-    level = next;
+    const info = await graph.get(commit);
+    curDepth++;
+    if (!info) {
+      // a parent this repository lacks: git dies (parse_commit_or_die); nothing to walk
+      commit = undefined;
+      continue;
+    }
+    if ((depth < INFINITE_DEPTH && curDepth >= depth) || grafts.has(commit)) {
+      result.unshift(commit);
+      commit = undefined;
+      continue;
+    }
+    notShallow.add(commit);
+    const parents = info.parents;
+    commit = undefined;
+    for (let k = 0; k < parents.length; k++) {
+      const parent = parents[k] as string;
+      const known = depths.get(parent);
+      if (known !== undefined && curDepth >= known) continue;
+      depths.set(parent, curDepth);
+      if (k < parents.length - 1) {
+        stack.push(parent);
+      } else {
+        commit = parent;
+      }
+    }
   }
-  return { shallow, notShallow };
+  return { shallow: result, notShallow };
 }
 
 /** git's get_shallow_commits_by_rev_list over `rev-list --max-age=<since> <wants> --not <refs>`. */

@@ -93,6 +93,20 @@ export function createRefBatchTests(
       await ctx.cleanup?.();
     });
 
+    itMulti("an initial batch (git clone's) creates its refs unlogged", async () => {
+      const r = await refs.batch(
+        [
+          { name: "refs/remotes/origin/main", old: null, new: oid(1) },
+          { name: "refs/tags/v1", new: oid(2) },
+        ],
+        { initial: true, message: "clone" },
+      );
+      expect(r).toEqual({ ok: true, rejected: [] });
+      expect((await refs.resolve("refs/remotes/origin/main"))?.objectId).toBe(oid(1));
+      expect((await refs.resolve("refs/tags/v1"))?.objectId).toBe(oid(2));
+      if (options.reflog) expect(await logOf("refs/remotes/origin/main")).toEqual([]);
+    });
+
     itMulti("applies a batch of creates; get, resolve and list agree", async () => {
       const r = await refs.batch([
         { name: "refs/heads/main", old: null, new: oid(1) },

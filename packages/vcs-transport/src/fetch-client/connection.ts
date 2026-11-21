@@ -42,6 +42,11 @@ export interface UploadPackConnection {
   readonly capabilities: ReadonlyMap<string, string>;
   /** v0: the advertised refs (HEAD with its symref). v2 lists refs with `ls-refs` instead. */
   readonly advertisedRefs?: readonly RemoteRef[];
+  /**
+   * v0: the server's own shallow commits, advertised after its refs (git's
+   * advertise_shallow_grafts); empty for a complete repository. v2 sends them in `shallow-info`.
+   */
+  readonly advertisedShallow?: readonly string[];
   /** Sends one request and returns the stream its answer is read from. */
   request(body: Uint8Array[]): Promise<PktStream>;
   /** Ends the exchange (v2 over a duplex: a final flush), releasing the stream. */
@@ -128,6 +133,7 @@ export async function openHttpConnection(
     stateless: true,
     capabilities: greeting.capabilities,
     advertisedRefs: greeting.refs,
+    advertisedShallow: greeting.shallow ?? [],
     async request(body) {
       await current?.cancel();
       const payload =
@@ -260,6 +266,7 @@ export async function openDuplexConnection(
     stateless: false,
     capabilities: greeting.capabilities,
     advertisedRefs: greeting.refs,
+    advertisedShallow: greeting.shallow ?? [],
     async request(body) {
       requested = true;
       for (const chunk of body) await wait(async () => duplex.write(chunk));
@@ -293,6 +300,8 @@ export interface ServerGreeting {
   capabilities: Map<string, string>;
   /** v0: the advertised refs (HEAD with its symref; `.have` lines as refs named `.have`) */
   refs?: RemoteRef[];
+  /** v0: the shallow commits of a shallow server (`shallow <oid>` after the refs) */
+  shallow?: string[];
 }
 
 /**
@@ -322,6 +331,7 @@ export async function readServerGreeting(
   const byName = new Map<string, RemoteRef>();
   let pkt: Pkt | undefined = first;
   if (pkt.type === "data" && pkt.text === "version 1") pkt = await pkts.read();
+  const shallow: string[] = [];
   let firstLine = true;
   while (pkt && pkt.type !== "flush") {
     if (pkt.type !== "data")
@@ -346,6 +356,14 @@ export async function readServerGreeting(
         line = line.slice(0, nul);
       }
     }
+    if (line.startsWith("shallow ")) {
+      // a shallow server's shallow commits (get_remote_heads: after the refs)
+      const oid = line.slice(8).trim();
+      if (!/^[0-9a-f]{40}$/.test(oid)) throw new TransportError(`protocol error: ${line}`);
+      shallow.push(oid);
+      pkt = await pkts.read();
+      continue;
+    }
     const space = line.indexOf(" ");
     if (space === 40) {
       const oid = line.slice(0, 40);
@@ -366,7 +384,7 @@ export async function readServerGreeting(
     const ref = byName.get(name);
     if (ref) ref.symref = target;
   }
-  return { version: 0, capabilities, refs };
+  return { version: 0, capabilities, refs, shallow };
 }
 
 /**
