@@ -13,6 +13,7 @@ import {
   encodeGitPath,
   parseGitBool,
 } from "@statewalker/vcs-utils/encoding";
+import { type FilesApi, type PosixFilesApi, readFile } from "@statewalker/vcs-utils/files";
 import {
   expandUserPath,
   type GitHostEnvironment,
@@ -20,6 +21,60 @@ import {
   wildmatch,
   xdgConfigPath,
 } from "@statewalker/vcs-working-tree";
+
+/**
+ * The config files of a repository in `files`: read and written through it, with its root
+ * directory and, where it has them, `lstat` / `readlink` (what `includes: "files"` needs to
+ * confine includes; it follows none without them).
+ *
+ * @example
+ * ```ts
+ * const config = await createWorkingCopyConfig(configFilesApiOf(files), ".git", undefined, {
+ *   includes: "files",
+ * });
+ * ```
+ */
+export function configFilesApiOf(
+  files: FilesApi,
+  options: { readOnly?: string } = {},
+): ConfigFilesApi {
+  const posix = files as PosixFilesApi;
+  const readOnly = options.readOnly;
+  return {
+    read: async (path) => ((await files.exists(path)) ? readFile(files, path) : undefined),
+    readPrefix: async (path, maxBytes) =>
+      (await files.exists(path)) ? readPrefix(files, path, maxBytes) : undefined,
+    write: readOnly
+      ? async () => {
+          throw new Error(readOnly);
+        }
+      : (path, content) => files.write(path, [content]),
+    ...(posix.rootDirectory ? { rootDirectory: posix.rootDirectory } : {}),
+    ...(posix.lstat && posix.readlink
+      ? { lstat: posix.lstat.bind(posix), readlink: posix.readlink.bind(posix) }
+      : {}),
+  };
+}
+
+/** At most `maxBytes` bytes from the start of the file at `path`. */
+async function readPrefix(files: FilesApi, path: string, maxBytes: number): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for await (const chunk of files.read(path, { start: 0, length: maxBytes })) {
+    const part = chunk.length > maxBytes - total ? chunk.subarray(0, maxBytes - total) : chunk;
+    chunks.push(part);
+    total += part.length;
+    if (total >= maxBytes) break;
+  }
+  if (chunks.length === 1) return chunks[0];
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
+}
 
 /**
  * Thrown where git refuses a config file (`fatal: bad config line <n> in file <file>`): an
@@ -53,7 +108,26 @@ export class ConfigParseError extends Error {
  */
 export interface ConfigFilesApi {
   read(path: string): Promise<Uint8Array | undefined>;
+  /**
+   * At most `maxBytes` bytes from the start of the file, so a confined include (`includes:
+   * "files"`) never reads more than its cap plus one byte; without it the whole file is read
+   * and its length checked after
+   */
+  readPrefix?(path: string, maxBytes: number): Promise<Uint8Array | undefined>;
   write(path: string, content: Uint8Array): Promise<void>;
+  /**
+   * The host directory these paths are relative to: an include climbing above it is read
+   * from the host (git's), or, with `includes: "files"`, an absolute include inside it is
+   * read through these paths
+   */
+  rootDirectory?: string;
+  /**
+   * What `path` is without following a last symbolic link, and its size (checked by
+   * `includes: "files"`, which follows no include without it)
+   */
+  lstat?(path: string): Promise<{ kind: string; size?: number } | undefined>;
+  /** The target of the symbolic link at `path` (followed by `includes: "files"`) */
+  readlink?(path: string): Promise<Uint8Array | undefined>;
 }
 
 /**
@@ -1029,8 +1103,23 @@ export interface GitConfigOptions {
    * browser), only this file and what it includes are read.
    */
   environment?: GitHostEnvironment;
-  /** Follow `include.path` / `includeIf.*.path` (default true) */
-  includes?: boolean;
+  /**
+   * Follow `include.path` / `includeIf.*.path` (default true, as git: a relative path beside
+   * the including file, `~/` and absolute paths and those climbing above the files API read
+   * from the host through `environment`). `"files"` confines the includes of the repository's
+   * own files (`config`, `config.worktree` and what they include) to the repository's
+   * directories ({@link includeRoots}): a `~/` path, a path that resolves (its symbolic links
+   * followed through the files API's `lstat` / `readlink`) outside them and a file above
+   * {@link MAX_CONFINED_INCLUDE_SIZE} are skipped, and so is every include where the files API
+   * cannot tell links apart; the system and global files keep git's rules. `false` follows none.
+   */
+  includes?: boolean | "files";
+  /**
+   * With `includes: "files"`, the directories (paths of the files API) an include may be read
+   * from. Default: the directory of this file (the common git directory) and that of
+   * {@link worktreeConfigPath} (a linked worktree's git directory) when given.
+   */
+  includeRoots?: string[];
   /**
    * The git directory as the host names it (an absolute path on Node), matched by
    * `includeIf.gitdir:` and used for `./` in its patterns. Default: the directory of this file.
@@ -1134,6 +1223,63 @@ function isIncludeKey(key: string): boolean {
   return key === "include.path" || (key.startsWith("includeif.") && key.endsWith(".path"));
 }
 
+/**
+ * The largest file an include confined to the repository (`includes: "files"`) reads: our
+ * hardening for servers (git has no limit), so a repository's config cannot make the server
+ * read a pack file as configuration. A larger one is skipped as if missing.
+ */
+export const MAX_CONFINED_INCLUDE_SIZE = 1024 * 1024;
+
+/** Most symbolic links followed while confining an include (the kernel's ELOOP limit). */
+const MAX_INCLUDE_LINKS = 40;
+
+/**
+ * `path` (in `files`) with the symbolic links on it followed through `files.lstat` /
+ * `readlink`, without its leading `/`: undefined when a link climbs above the root or
+ * names a host path outside `files.rootDirectory`, there are too many, or `files` cannot
+ * tell links apart.
+ */
+async function confinedRealPath(files: ConfigFilesApi, path: string): Promise<string | undefined> {
+  const absolute = path.startsWith("/");
+  const pending = path.split("/").filter((p) => p !== "" && p !== ".");
+  if (!files.lstat || !files.readlink) return undefined;
+  const root = files.rootDirectory?.replace(/\/+$/, "");
+  const out: string[] = [];
+  let links = 0;
+  while (pending.length > 0) {
+    const part = pending.shift() as string;
+    if (part === "..") {
+      if (out.length === 0) return undefined;
+      out.pop();
+      continue;
+    }
+    out.push(part);
+    const current = `${absolute ? "/" : ""}${out.join("/")}`;
+    const stat = await files.lstat(current).catch(() => undefined);
+    if (stat?.kind !== "symlink") continue;
+    if (++links > MAX_INCLUDE_LINKS) return undefined;
+    const raw = await files.readlink(current).catch(() => undefined);
+    if (!raw) return undefined;
+    const target = new TextDecoder().decode(raw);
+    out.pop();
+    if (target.startsWith("/")) {
+      // a host path: followed only inside the root directory
+      const host = resolveDots(target).path;
+      if (root === undefined || (host !== root && !host.startsWith(`${root}/`))) return undefined;
+      out.length = 0;
+      pending.unshift(
+        ...host
+          .slice(root.length)
+          .split("/")
+          .filter((p) => p !== "" && p !== "."),
+      );
+    } else {
+      pending.unshift(...target.split("/").filter((p) => p !== "" && p !== "."));
+    }
+  }
+  return out.join("/");
+}
+
 /** Reads config files of the chain, following their include directives as git does. */
 class ChainReader {
   private branch?: Promise<string | undefined>;
@@ -1208,12 +1354,13 @@ class ChainReader {
         `exceeded maximum include depth (${MAX_INCLUDE_DEPTH}) while including\n\t${value}\n\tfrom\n\t${from.path}\nThis might be due to circular includes.`,
       );
     }
-    const target = this.resolvePath(value, from);
+    const target = await this.resolvePath(value, from);
     if (target) await this.readFile(target, out, depth);
   }
 
   /** git's `handle_path_include`: `~/` in the home, a relative path beside `from`. */
-  private resolvePath(value: string, from: ConfigSource): ConfigSource | undefined {
+  private async resolvePath(value: string, from: ConfigSource): Promise<ConfigSource | undefined> {
+    if (this.options.includes === "files" && !from.host) return this.confinedPath(value, from);
     const env = this.env;
     if (value.startsWith("~")) {
       const expanded = expandUserPath(value, env);
@@ -1236,6 +1383,62 @@ class ChainReader {
       return { read: env.readFile, path: host.path, host: true, ...scopeOf(from) };
     }
     return { read: from.read, path: joined.path, host: from.host, ...scopeOf(from) };
+  }
+
+  /**
+   * An include of the repository's own files confined to its directories (`includes:
+   * "files"`): the path beside `from` (or an absolute one inside the root directory), read
+   * where its symbolic links lead; undefined when that is outside {@link includeRoots}, the
+   * file is larger than {@link MAX_CONFINED_INCLUDE_SIZE}, or the files API cannot tell links
+   * apart.
+   */
+  private async confinedPath(value: string, from: ConfigSource): Promise<ConfigSource | undefined> {
+    const files = (this.config as unknown as { files: ConfigFilesApi }).files;
+    let path: string;
+    if (value.startsWith("~") || !files.lstat) return undefined;
+    if (value.startsWith("/")) {
+      const root = files.rootDirectory?.replace(/\/+$/, "");
+      if (root === undefined) return undefined;
+      const host = resolveDots(value);
+      if (host.path !== root && !host.path.startsWith(`${root}/`)) return undefined;
+      path = `/${host.path.slice(root.length + 1)}`;
+    } else {
+      const joined = resolveDots(`${dirOf(from.path)}${value}`);
+      if (joined.escapes) return undefined;
+      path = joined.path;
+    }
+    // where its symbolic links lead, which must be inside the repository's directories; the
+    // file read is that one (no link left on the way to swap after the check)
+    const real = await confinedRealPath(files, path);
+    if (real === undefined) return undefined;
+    if (!this.includeRoots().some((r) => r === "" || real === r || real.startsWith(`${r}/`))) {
+      return undefined;
+    }
+    // the including file's spelling of the path (leading `/` or not), for its origin
+    const spelled = from.path.startsWith("/") ? `/${real}` : real;
+    const stat = await files.lstat(spelled).catch(() => undefined);
+    // no size, no include: the cap is checked before the read and enforced by it (a file
+    // grown since the lstat is read no further than one byte past the cap, then skipped)
+    if (stat?.kind !== "file" || stat.size === undefined) return undefined;
+    if (stat.size > MAX_CONFINED_INCLUDE_SIZE) return undefined;
+    const read = async (p: string) => {
+      const content = files.readPrefix
+        ? await files.readPrefix(p, MAX_CONFINED_INCLUDE_SIZE + 1)
+        : await files.read(p);
+      return content && content.length > MAX_CONFINED_INCLUDE_SIZE ? undefined : content;
+    };
+    return { read, path: spelled, ...scopeOf(from) };
+  }
+
+  /** The directories confined includes may be read from, without leading or trailing `/`. */
+  private includeRoots(): string[] {
+    const strip = (p: string) => resolveDots(p).path.replace(/^\/+/, "");
+    if (this.options.includeRoots) return this.options.includeRoots.map(strip);
+    const roots = [strip(dirOf(this.configPath()))];
+    if (this.options.worktreeConfigPath !== undefined) {
+      roots.push(strip(dirOf(this.options.worktreeConfigPath)));
+    }
+    return roots;
   }
 
   private gitDirPath(): string {

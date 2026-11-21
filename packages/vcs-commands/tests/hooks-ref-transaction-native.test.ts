@@ -1291,3 +1291,28 @@ exit 0
     },
   );
 });
+
+/**
+ * A refusal in `preparing` (2.5x) gives the transaction up before the files backend split
+ * the symbolic ref a commit goes through: `aborted` lists HEAD as asked, not its branch.
+ */
+describeGit("reference-transaction hook: a commit refused in preparing (as native git)", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "hooks-reftx-asked-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("aborted tells HEAD as asked", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    putFile(dir, "a.txt", "a2\n");
+    git(dir, ["add", "a.txt"]);
+    await expectTwins(
+      dir,
+      ["commit", "-qm", "two"],
+      (g) => attempt(g.commit().setMessage("two")),
+      "refused commit",
+      (t) => hookExit(t, "reference-transaction", 1),
+    );
+  });
+});

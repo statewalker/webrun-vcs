@@ -66,7 +66,10 @@ const EMPTY_CONFIG: ServerConfigReader = { getAll: () => [] };
  *     basePath: "/srv",
  *     exportAll: true, // else only repositories with git-daemon-export-ok
  *     openRepository: async (gitDir) => {
- *       const opened = await worktree.openRepository?.(gitDir).catch(() => undefined);
+ *       // includes of the repository's config confined to the storage (on a shared host)
+ *       const opened = await worktree
+ *         .openRepository?.(gitDir, { configIncludes: "files" })
+ *         .catch(() => undefined);
  *       return opened && (await servedRepositoryOf(opened));
  *     },
  *   }),

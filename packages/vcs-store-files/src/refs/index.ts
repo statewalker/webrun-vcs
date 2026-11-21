@@ -8,6 +8,7 @@
 export * from "./files-ref-batch.js";
 export * from "./packed-refs-reader.js";
 export * from "./packed-refs-writer.js";
+export * from "./peel-tag.js";
 export * from "./ref-reader.js";
 export * from "./ref-store.files.js";
 export * from "./ref-writer.js";

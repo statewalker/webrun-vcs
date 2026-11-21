@@ -12,7 +12,7 @@ import { type FilesApi, readFile } from "@statewalker/vcs-utils/files";
 import { NodeFilesApi } from "@statewalker/webrun-files-node";
 
 import type { NodeHookRunner } from "./node-hook-runner.js";
-import { statHostFile } from "./posix-node-files-api.js";
+import { realHostPath, statHostFile } from "./posix-node-files-api.js";
 
 /** Where the files are; each defaults to the process environment, as git reads it. */
 export interface NodeGitHostEnvironmentOptions {
@@ -55,6 +55,7 @@ export interface NodeGitHostEnvironmentOptions {
 export interface NodeGitHostEnvironment {
   readFile(path: string): Promise<Uint8Array | undefined>;
   statFile?(path: string): Promise<import("@statewalker/vcs-utils/files").LinkStats | undefined>;
+  realPath?(path: string): Promise<string | undefined>;
   systemName?: string;
   disableUntrackedCache?: boolean;
   forceUntrackedCache?: boolean;
@@ -183,6 +184,8 @@ export function createNodeGitHostEnvironment(
       : {
           statFile: async (path: string) =>
             statHostFile(path.startsWith("/") ? path : `${process.cwd()}/${path}`),
+          realPath: (path: string) =>
+            realHostPath(path.startsWith("/") ? path : `${process.cwd()}/${path}`),
         }),
     // uname's sysname (the untracked cache's ident: "Linux", "Darwin", "Windows_NT")
     systemName: osType(),

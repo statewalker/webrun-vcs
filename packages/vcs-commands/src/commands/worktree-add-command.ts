@@ -379,6 +379,8 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
     let hookExitCode: number | undefined;
     if (this.checkout && !orphan && commitId !== undefined && this.hooks.enabled) {
       const root = (workingCopy.worktree as { getRoot?(): string }).getRoot?.();
+      // run without GIT_DIR and GIT_WORK_TREE (add_worktree unsets both): the hook finds
+      // the new worktree's repository from its directory
       const code = await runPostCheckoutHook(
         this.hooks,
         undefined,
@@ -386,6 +388,8 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
         true,
         undefined,
         root,
+        true,
+        ["GIT_DIR", "GIT_WORK_TREE"],
       );
       if (code !== 0) hookExitCode = code;
     }

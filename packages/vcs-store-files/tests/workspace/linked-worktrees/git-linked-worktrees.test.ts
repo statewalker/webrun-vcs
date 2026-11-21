@@ -287,3 +287,132 @@ describe("GitLinkedWorktrees: directories that cannot be listed or removed", () 
     expect((await files.stats("/repo/.git/worktrees"))?.kind).toBe("directory");
   });
 });
+
+describe("WorktreeRefs and the reference-transaction hook", () => {
+  type Hook = (
+    state: string,
+    updates: readonly { name: string; requested: string }[],
+  ) => Promise<boolean | string | undefined>;
+  interface HookedRefs {
+    setTransactionHook(hook: Hook | undefined): void;
+    removeAll(names: string[]): Promise<void>;
+  }
+
+  async function linked() {
+    const { files, history, worktrees, commit } = await repository();
+    const created = await worktrees.create({
+      path: "/wt",
+      head: { ref: "refs/heads/feat" },
+      ident: "T <t@e> 5 +0000",
+    });
+    const refs = createWorktreeRefs({
+      common: history.refs,
+      files,
+      gitDir: `/repo/.git/worktrees/${created.id}`,
+    });
+    return { files, history, refs, commit };
+  }
+
+  it("concurrent batches each tell their updates as they asked for them", async () => {
+    const { history, refs, commit } = await linked();
+    await history.refs.set("refs/heads/other", commit);
+    const seen: string[] = [];
+    // each state waits a little, so the batches overlap
+    (refs as unknown as HookedRefs).setTransactionHook(async (state, updates) => {
+      seen.push(`${state} ${updates.map((u) => u.requested).join(",")}`);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      return undefined;
+    });
+    const results = await Promise.all([
+      refs.batch([{ name: "HEAD", new: commit }]),
+      refs.batch([{ name: "refs/heads/other", new: commit }]),
+      refs.batch([{ name: "HEAD", new: commit }]),
+    ]);
+    expect(results.every((r) => r.ok)).toBe(true);
+    const told = (requested: string) =>
+      ["committed", "prepared", "preparing"].map((state) => `${state} ${requested}`);
+    expect(seen.sort()).toEqual(
+      [...told("HEAD"), ...told("HEAD"), ...told("refs/heads/other")].sort(),
+    );
+  });
+
+  it("removeAll: a refusal of the repository's transaction deletes none of the worktree's", async () => {
+    const { history, refs, commit } = await linked();
+    await history.refs.set("refs/heads/gone", commit);
+    await refs.set("refs/worktree/kept", commit);
+    (refs as unknown as HookedRefs).setTransactionHook(async (state, updates) =>
+      state === "preparing" && updates.some((u) => u.name.startsWith("refs/heads/"))
+        ? "refused"
+        : undefined,
+    );
+    await expect(
+      (refs as unknown as HookedRefs).removeAll(["refs/heads/gone", "refs/worktree/kept"]),
+    ).rejects.toThrow();
+    (refs as unknown as HookedRefs).setTransactionHook(undefined);
+    expect((await history.refs.resolve("refs/heads/gone"))?.objectId).toBe(commit);
+    expect((await refs.resolve("refs/worktree/kept"))?.objectId).toBe(commit);
+  });
+});
+
+describe("WorktreeRefs.removeAll as git 2.43 (legacy, review fix)", () => {
+  type Hook = (
+    state: string,
+    updates: readonly { name: string }[],
+    context?: { packed?: boolean },
+  ) => Promise<boolean | string | undefined>;
+  interface HookedRefs {
+    setTransactionHook(hook: Hook | undefined): void;
+    removeAll(names: string[], options?: { legacy?: boolean }): Promise<void>;
+  }
+
+  async function linked() {
+    const { files, history, worktrees, commit } = await repository();
+    const created = await worktrees.create({
+      path: "/wt",
+      head: { ref: "refs/heads/feat" },
+      ident: "T <t@e> 5 +0000",
+    });
+    const refs = createWorktreeRefs({
+      common: history.refs,
+      files,
+      gitDir: `/repo/.git/worktrees/${created.id}`,
+    }) as unknown as HookedRefs & Awaited<ReturnType<typeof createWorktreeRefs>>;
+    return { history, refs, commit };
+  }
+
+  it("a refusal of one repository ref's own transaction still deletes the worktree's refs", async () => {
+    const { history, refs, commit } = await linked();
+    await history.refs.set("refs/heads/kept", commit);
+    await history.refs.set("refs/heads/gone", commit);
+    await refs.set("refs/worktree/gone", commit);
+    refs.setTransactionHook(async (state, updates, context) =>
+      state === "prepared" && !context?.packed && updates.some((u) => u.name === "refs/heads/kept")
+        ? "refused"
+        : undefined,
+    );
+    await expect(
+      refs.removeAll(["refs/heads/kept", "refs/heads/gone", "refs/worktree/gone"], {
+        legacy: true,
+      }),
+    ).rejects.toThrow(/aborted|refused/);
+    refs.setTransactionHook(undefined);
+    expect((await history.refs.resolve("refs/heads/kept"))?.objectId).toBe(commit);
+    expect(await history.refs.resolve("refs/heads/gone")).toBeUndefined();
+    expect(await refs.resolve("refs/worktree/gone")).toBeUndefined();
+  });
+
+  it("a refusal of the packed store's transaction deletes nothing", async () => {
+    const { history, refs, commit } = await linked();
+    await history.refs.set("refs/heads/kept", commit);
+    await refs.set("refs/worktree/kept", commit);
+    refs.setTransactionHook(async (state, _updates, context) =>
+      state === "prepared" && context?.packed ? "refused" : undefined,
+    );
+    await expect(
+      refs.removeAll(["refs/heads/kept", "refs/worktree/kept"], { legacy: true }),
+    ).rejects.toThrow();
+    refs.setTransactionHook(undefined);
+    expect((await history.refs.resolve("refs/heads/kept"))?.objectId).toBe(commit);
+    expect((await refs.resolve("refs/worktree/kept"))?.objectId).toBe(commit);
+  });
+});

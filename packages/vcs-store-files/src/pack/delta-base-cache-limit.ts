@@ -5,8 +5,10 @@
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
-import { readFile } from "@statewalker/vcs-utils/files";
-import { createWorkingCopyConfig } from "../workspace/working-copy/working-copy-config.files.js";
+import {
+  configFilesApiOf,
+  createWorkingCopyConfig,
+} from "../workspace/working-copy/working-copy-config.files.js";
 
 /**
  * `core.deltaBaseCacheLimit` of the repository at `gitDir`, or undefined when it is unset or
@@ -21,15 +23,18 @@ import { createWorkingCopyConfig } from "../workspace/working-copy/working-copy-
 export async function readDeltaBaseCacheLimit(
   files: FilesApi,
   gitDir = ".git",
+  options: {
+    /** Which include directives of the repository's config are followed (git's: all) */
+    includes?: boolean | "files";
+  } = {},
 ): Promise<number | undefined> {
   const config = await createWorkingCopyConfig(
-    {
-      read: async (path) => ((await files.exists(path)) ? readFile(files, path) : undefined),
-      write: async () => {
-        throw new Error("reading core.deltaBaseCacheLimit never writes the config");
-      },
-    },
+    configFilesApiOf(files, {
+      readOnly: "reading core.deltaBaseCacheLimit never writes the config",
+    }),
     gitDir,
+    undefined,
+    options.includes === undefined ? {} : { includes: options.includes },
   );
   return parseConfigSize(config.get("core.deltaBaseCacheLimit"));
 }

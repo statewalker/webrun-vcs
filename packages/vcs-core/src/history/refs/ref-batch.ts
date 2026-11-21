@@ -132,6 +132,11 @@ export interface BatchOptions extends RefLogOptions {
    * commits the transaction of a phase whose every update was refused
    */
   emptyTransaction?: boolean;
+  /**
+   * The reference-transaction hook of this batch alone, told in place of the one the store
+   * has installed (a wrapping store tells each batch's updates as that batch asked for them)
+   */
+  transactionHook?: RefTransactionHook;
 }
 
 /** A consistent view of a store's refs, read while planning one batch. */
@@ -623,6 +628,11 @@ export interface RefTransactionContext {
   packed?: boolean;
   /** Made by this git version only: a hook following the other leaves the call out */
   only?: "2.43" | "2.56";
+  /**
+   * The updates are told as asked (`requested`), not as written: an `aborted` after a
+   * refusal in `preparing`, before git's backend split the symbolic refs (HEAD) it goes through
+   */
+  asAsked?: boolean;
 }
 
 /** How a ref store removes a ref, where git's commands differ (see {@link RefTransactionContext}). */
@@ -646,11 +656,18 @@ export interface RefRemoveAllOptions {
 
 /** A ref transaction its hook aborted (git: "in '<state>' phase, update aborted by ..."). */
 export class RefTransactionAbortedError extends Error {
+  /**
+   * The packed store's transaction of git 2.43's `delete_refs` was refused (before any ref
+   * was deleted), rather than the transaction of one ref (see `RefRemoveAllOptions.legacy`)
+   */
+  readonly packed: boolean;
   constructor(
     readonly state: "preparing" | "prepared",
     message = `in '${state}' phase, update aborted by the reference-transaction hook`,
+    options: { packed?: boolean } = {},
   ) {
     super(message);
     this.name = "RefTransactionAbortedError";
+    this.packed = options.packed ?? false;
   }
 }

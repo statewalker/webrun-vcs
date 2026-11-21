@@ -20,7 +20,10 @@ import type { FilesApi } from "@statewalker/vcs-core";
 import { decodeGitPath, parseGitBool } from "@statewalker/vcs-utils/encoding";
 import { readFile } from "@statewalker/vcs-utils/files";
 
-import { createWorkingCopyConfig } from "./workspace/working-copy/working-copy-config.files.js";
+import {
+  configFilesApiOf,
+  createWorkingCopyConfig,
+} from "./workspace/working-copy/working-copy-config.files.js";
 
 /** The highest `core.repositoryformatversion` we read, as git's `GIT_REPO_VERSION_READ`. */
 export const REPOSITORY_FORMAT_VERSION_READ = 1;
@@ -189,7 +192,10 @@ function gitTrue(value: unknown): boolean {
 
 /**
  * Reads `<gitDir>/config` and checks its repository format (see `checkRepositoryFormat`). A
- * repository without a config reads as version 0 with no extensions.
+ * repository without a config reads as version 0 with no extensions. Include directives are
+ * never followed here: git's `read_repository_format` reads the file through
+ * `git_config_from_file`, which has no includes, so a `core.repositoryformatversion` set only
+ * by an included file does not count.
  *
  * @example
  * ```typescript
@@ -201,13 +207,10 @@ export async function readRepositoryFormat(
   gitDir = ".git",
 ): Promise<RepositoryFormat> {
   const config = await createWorkingCopyConfig(
-    {
-      read: async (path) => ((await files.exists(path)) ? readFile(files, path) : undefined),
-      write: async () => {
-        throw new Error("the repository format check never writes the config");
-      },
-    },
+    configFilesApiOf(files, { readOnly: "the repository format check never writes the config" }),
     gitDir,
+    undefined,
+    { includes: false },
   );
   return checkRepositoryFormat(config);
 }

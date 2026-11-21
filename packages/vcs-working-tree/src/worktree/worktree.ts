@@ -349,9 +349,13 @@ export interface Worktree {
    * `<path>.git`, a gitfile followed. A relative location is read from the worktree top
    * (where git runs a fetch), an absolute one in the real directory the storage is rooted
    * at (from its root when that is unknown). Undefined when no repository is there or it
-   * lies beyond the storage's root.
+   * lies beyond the storage's root. `options.configIncludes` decides which include
+   * directives of its configuration are followed (see {@link OpenRepositoryOptions}).
    */
-  openRepository?(location: string): Promise<OpenedRepository | undefined>;
+  openRepository?(
+    location: string,
+    options?: OpenRepositoryOptions,
+  ): Promise<OpenedRepository | undefined>;
 
   /**
    * The repository directory of the submodule at `path`, in this worktree's FilesApi: its
@@ -434,6 +438,29 @@ export interface WorktreeExtended extends Worktree {
   watch?(
     callback: (events: Array<{ path: string; type: "add" | "change" | "remove" }>) => void,
   ): () => void;
+}
+
+/**
+ * How {@link Worktree.openRepository} reads the repository's configuration.
+ *
+ * @example
+ * ```ts
+ * // a server: the repository's includes stay inside the storage
+ * const opened = await worktree.openRepository?.(gitDir, { configIncludes: "files" });
+ * ```
+ */
+export interface OpenRepositoryOptions {
+  /**
+   * Which `include.path` / `includeIf.*.path` directives of the repository's own config are
+   * followed. `true` (the default, as git): every one, a `~/`, absolute or climbing path read
+   * from the host through the worktree's environment. `"files"`: only those naming a file
+   * inside the repository's own git directory (its common directory and, for a linked
+   * worktree's, that git directory: no other repository of the storage), where its symbolic
+   * links lead, no `~/` path, and no file above 1 MiB (our hardening; git has no limit), for a
+   * server whose repositories' owners must not read the host's files; none where the storage
+   * cannot tell links apart. `false`: none. The system and global files keep git's rules.
+   */
+  configIncludes?: boolean | "files";
 }
 
 /** A repository {@link Worktree.openRepository} opened. */

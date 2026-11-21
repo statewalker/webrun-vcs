@@ -18,6 +18,11 @@ export interface GitHostEnvironment {
    */
   statFile?(path: string): Promise<LinkStats | undefined>;
   /**
+   * The real path of a host path, its symbolic links followed (`realpath(3)`): the git
+   * directory as git exports it to hooks (`GIT_DIR`). Absent: paths are taken as given.
+   */
+  realPath?(path: string): Promise<string | undefined>;
+  /**
    * The operating system's name as `uname` gives it (`Linux`, `Darwin`): git's untracked
    * cache is valid only for the worktree location and system it names. Absent: no untracked
    * cache is used.
@@ -152,6 +157,11 @@ export interface HookInvocation {
   stdin?: Uint8Array;
   /** The variables git sets for this hook (added to the host's own) */
   env: Record<string, string>;
+  /**
+   * Variables removed from the host's own for this hook (git's `opt.env` entries without a
+   * value: `worktree add` unsets `GIT_DIR` and `GIT_WORK_TREE` for post-checkout)
+   */
+  unsetEnv?: string[];
   /** The directory the hook runs in, as a path of the repository's files ("" for the root) */
   cwd: string;
   /** That directory on the host, where the repository's files have one */

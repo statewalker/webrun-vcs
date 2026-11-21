@@ -13,7 +13,6 @@ import type {
   FilesApi,
   GitObjects,
   History,
-  ObjectId,
   PackSet,
 } from "@statewalker/vcs-core";
 import {
@@ -25,17 +24,20 @@ import {
   openPackSet,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
-import { type AtomicFiles, readFile } from "@statewalker/vcs-utils/files";
+import type { AtomicFiles } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { createFilesCommitGraphProvider } from "./commit-graph.js";
 import { readDeltaBaseCacheLimit, skipPacked, withPacks } from "./pack/index.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
-import { createFileRefStore, type FileRefStore } from "./refs/ref-store.files.js";
+import { createFileRefStore, type FileRefStore, peelTag } from "./refs/index.js";
 import { readRepositoryFormat } from "./repository-format.js";
 import { resolveLinkedGitDir } from "./resolve-linked-git-dir.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
-import { createWorkingCopyConfig } from "./workspace/working-copy/working-copy-config.files.js";
+import {
+  configFilesApiOf,
+  createWorkingCopyConfig,
+} from "./workspace/working-copy/working-copy-config.files.js";
 
 /**
  * Options for creating a file-backed Git storage backend.
@@ -89,6 +91,12 @@ export interface GitFilesBackendOptions {
    * grafts file (`GIT_GRAFT_FILE`) is read in place of `info/grafts` (`refs.readGrafts`).
    */
   environment?: GitHostEnvironment;
+  /**
+   * Which include directives of the repository's config are followed while its settings are
+   * read here (see `GitConfigOptions.includes`): git's rule by default, `"files"` confined to
+   * the repository's directory (a server's repositories), `false` none.
+   */
+  configIncludes?: boolean | "files";
 }
 
 /**
@@ -151,8 +159,10 @@ export async function createGitFilesBackend(
   const packDir = joinPath(objectsDir, "pack");
 
   // git's check_repository_format: a version or extension we cannot honour (reftable refs,
-  // sha256 objects, an unknown v1 extension) is refused before anything is read or written
+  // sha256 objects, an unknown v1 extension) is refused before anything is read or written.
+  // Like git's read_repository_format it reads the config file alone, without includes.
   await readRepositoryFormat(files, gitDir);
+  const includes = options.configIncludes === undefined ? {} : { includes: options.configIncludes };
 
   if (create) {
     await createGitDirectoryStructure(files, gitDir, objectsDir);
@@ -173,14 +183,14 @@ export async function createGitFilesBackend(
     externalBase: (id) => looseOnly.get(id),
     freshenMaxAgeMs,
     // git's core.deltaBaseCacheLimit (96 MiB when unset)
-    baseCacheBytes: await readDeltaBaseCacheLimit(files, gitDir),
+    baseCacheBytes: await readDeltaBaseCacheLimit(files, gitDir, includes),
   });
   const loose = createGitObjects(skipPacked(staging, packs));
   const objects = withPacks(loose, packs);
   // receive-pack keeps a pushed pack in objects/tmp_objdir-incoming-* until the push is accepted
   objects.beginQuarantine = () =>
     beginFilesQuarantine({ files, objectsDir, objects, packs, freshenMaxAgeMs });
-  const reflog = await readRefStoreConfig(files, gitDir);
+  const reflog = await readRefStoreConfig(files, gitDir, includes);
   const refStore = createFileRefStore(files, gitDir, {
     atomicFiles: options.atomicFiles,
     refLockTimeoutMs: options.refLockTimeoutMs ?? reflog.refLockTimeoutMs,
@@ -207,6 +217,7 @@ export async function createGitFilesBackend(
     gitDir,
     refs: refStore,
     environment: options.environment,
+    ...(options.configIncludes === undefined ? {} : { configIncludes: options.configIncludes }),
   });
   invalidateOnCompatibilityChange(refStore, commitGraph);
   const history = createHistoryFromComponents({
@@ -217,42 +228,6 @@ export async function createGitFilesBackend(
   });
 
   return { history, objects, packs, looseStorage, files, gitDir };
-}
-
-/**
- * What an annotated tag peels to, following a chain of tags (git's `peel_object`): undefined
- * when `id` is not a tag or a tag on the way is missing or malformed (the object a tag names
- * as no tag is not read: it may be missing).
- */
-async function peelTag(objects: GitObjects, id: ObjectId): Promise<ObjectId | undefined> {
-  let current = id;
-  for (let depth = 0; depth < 64; depth++) {
-    const object = await objects.get(current);
-    if (!object) return undefined;
-    if (object.type !== "tag") {
-      await object.content[Symbol.asyncIterator]().return?.();
-      return current === id ? undefined : current;
-    }
-    let bytes = object.bytes;
-    if (!bytes) {
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of object.content) chunks.push(chunk);
-      bytes = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
-      let offset = 0;
-      for (const chunk of chunks) {
-        bytes.set(chunk, offset);
-        offset += chunk.length;
-      }
-    }
-    const head = new TextDecoder().decode(bytes.subarray(0, 64));
-    const m = /^object ([0-9a-f]{40})\ntype ([a-z]+)\n/.exec(head);
-    if (!m) return undefined;
-    current = m[1] as ObjectId;
-    // git's deref_tag_noverify stops at the first object the tag names as no tag, without
-    // reading it: a tag of a missing commit still peels to that commit's id
-    if (m[2] !== "tag") return current;
-  }
-  return undefined;
 }
 
 /**
@@ -294,6 +269,7 @@ function invalidateOnCompatibilityChange(refs: FileRefStore, commitGraph: Commit
 async function readRefStoreConfig(
   files: FilesApi,
   gitDir: string,
+  options: { includes?: boolean | "files" },
 ): Promise<{
   logAllRefUpdates: boolean | "always";
   identity?: { name: string; email: string };
@@ -301,11 +277,10 @@ async function readRefStoreConfig(
   packedLockTimeoutMs?: number;
 }> {
   const config = await createWorkingCopyConfig(
-    {
-      read: async (path) => ((await files.exists(path)) ? readFile(files, path) : undefined),
-      write: (path, content) => files.write(path, [content]),
-    },
+    configFilesApiOf(files),
     gitDir,
+    undefined,
+    options.includes === undefined ? {} : { includes: options.includes },
   );
   const setting = config.get("core.logAllRefUpdates");
   const logAllRefUpdates =

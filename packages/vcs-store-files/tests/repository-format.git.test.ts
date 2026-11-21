@@ -5,7 +5,7 @@
  * but gc and repack delete nothing there. Reftable needs git 2.45 or newer: that test is skipped on older gits.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, mkdtempSync, rmSync, utimesSync } from "node:fs";
+import { cpSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInMemoryFilesApi, GcOrchestrator } from "@statewalker/vcs-core";
@@ -250,5 +250,24 @@ describe("a partial clone", () => {
     );
     expect(stored(dir)).toEqual(before);
     expect(before.has(orphan)).toBe(true);
+  });
+});
+
+describe("the format check reads the config without includes (review fix)", () => {
+  it("a repositoryformatversion set only by an included file does not count, as git's read_repository_format", async () => {
+    const dir = nativeRepo();
+    writeFileSync(join(dir, ".git/inc.cfg"), "[core]\n\trepositoryformatversion = 99\n");
+    git(dir, ["config", "include.path", "inc.cfg"]);
+    // git reads the included value elsewhere, but its format check ignores it
+    expect(git(dir, ["config", "core.repositoryformatversion"]).trim()).toBe("99");
+    git(dir, ["status", "--porcelain"]);
+    for (const configIncludes of [undefined, true, "files"] as const) {
+      const { history } = await createGitFilesBackend({
+        files: createNodeFilesApi({ rootDir: dir }),
+        ...(configIncludes === undefined ? {} : { configIncludes }),
+      });
+      await history.initialize();
+      expect(await history.refs.resolve("HEAD")).toBeDefined();
+    }
   });
 });

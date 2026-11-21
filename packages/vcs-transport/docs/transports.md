@@ -122,7 +122,10 @@ const handleGit = createServedFetchHandler({
     basePath: "/srv/git",  // http-backend's GIT_PROJECT_ROOT
     exportAll: true,       // GIT_HTTP_EXPORT_ALL (else git-daemon-export-ok is required)
     openRepository: async (gitDir) => {
-      const opened = await host.worktree.openRepository?.(`..${gitDir}`);
+      // the repository's config includes stay inside the storage (see "Security notes")
+      const opened = await host.worktree.openRepository?.(`..${gitDir}`, {
+        configIncludes: "files",
+      });
       if (!opened) return undefined;
       const hooks = remoteHookSession(host, opened); // host: a WorkingCopy with a hook runner
       return servedRepositoryOf(opened, hooks ? { hooks } : {});
@@ -493,6 +496,29 @@ channel's `serve` and reach it with `createWebrunConnector({ call: () => call })
   the repository's config sets explicitly, then the resolver's `ServedRepository.settings`. A rule
   that must hold whatever a repository's config says goes in the last layer; hidden-ref lists are
   concatenated across the layers, so a repository cannot unhide what the resolver hides.
+- **Confine config includes on a shared host.** `Worktree.openRepository(location, options)`
+  reads the opened repository's config as git does by default (`configIncludes: true`): an
+  `include.path` or `includeIf.*.path` with a `~/` path, an absolute path or one climbing above
+  the storage (`../../etc/x`) is read from the host's filesystem through the worktree's
+  environment. That is what a local fetch from `../other` expects, and git-daemon and
+  http-backend do the same, so it stays the default. But on a server whose repositories are
+  configured by people who must not read the server's files, an include would bring any file
+  the server process can read into the repository's settings (and a device or a huge file
+  into its memory). Open served repositories with `configIncludes: "files"`: only files inside
+  the repository's own git directory are included (its common directory, and a linked
+  worktree's git directory: not another tenant's `../other.git/config`), where their symbolic
+  links lead, no `~/` path, an absolute path only inside the storage's `rootDirectory`, and none
+  larger than 1 MiB (`MAX_CONFINED_INCLUDE_SIZE`, our hardening: git has no limit, and a pack file
+  is no configuration); or `false` to follow none. A storage without `lstat`/`readlink` cannot
+  tell links apart, so `"files"` follows no include there. The system and global config files
+  are the operator's and keep git's rules either way. The same option reaches the settings the
+  object and ref stores read (`createGitFilesBackend({ configIncludes })`).
+- **Hooks already run the owner's code.** With a hook runner installed, a served repository's
+  `pre-receive`, `update` and `post-receive` scripts run on the server with its rights, so its
+  owner can read whatever the server can, includes or not. Include confinement matters for
+  serving without hooks (no `hookRunner`, or hooks for repositories whose owners are trusted
+  only); confine the hooks themselves with the runner (a sandbox, a container) where owners
+  are not trusted.
 - **Identity is the transport's.** Over ssh and httpeers the transport proves who is calling;
   never take an identity from the payload. Over plain git:// and WebSocket there is none: put
   them behind something that authenticates, or serve read-only data.

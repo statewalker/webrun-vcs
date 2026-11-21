@@ -56,6 +56,11 @@ export interface HookCallOptions {
    * repository; `clone` and the receive side do not)
    */
   prefix?: boolean;
+  /**
+   * Variables the hook runs without, the host's own and the session's included (git's
+   * `opt.env` entries without a value: `worktree add` unsets `GIT_DIR` and `GIT_WORK_TREE`)
+   */
+  unsetEnv?: string[];
 }
 
 /** What running a hook gave: its exit code and output as text. */
@@ -156,6 +161,13 @@ export interface HookLayout {
   /** Where the hook runs: the worktree top, the git directory when bare */
   cwd: string;
   bare: boolean;
+  /**
+   * The git directory as git exports it to hooks (`GIT_DIR`): where the worktree's `.git` is
+   * a gitfile (a linked worktree, a submodule), the real path of the git directory it names
+   * (setup.c, `read_gitfile_gently`'s `real_pathdup`); `.` in a bare repository (discovered
+   * from its top, where hooks run); absent for a `.git` directory, which git does not export
+   */
+  gitDirEnv?: string;
 }
 
 /**
@@ -499,8 +511,9 @@ async function hookLayout(workingCopy: WorkingCopy): Promise<HookLayout | undefi
   try {
     worktree = workingCopy.worktree as typeof worktree;
   } catch {
-    // a bare repository's working copy refuses its worktree
-    return undefined;
+    // a bare repository's working copy refuses its worktree: its hooks run in the
+    // repository's directory (`WorktreeAdmin.bareRepository`)
+    worktree = (workingCopy as { bareRepository?: typeof worktree }).bareRepository;
   }
   const files = worktree?.getFiles?.();
   const gitDir = worktree?.getGitDir?.();
@@ -509,7 +522,71 @@ async function hookLayout(workingCopy: WorkingCopy): Promise<HookLayout | undefi
   const bareValue = configValue(workingCopy, "core.bare");
   const bare = bareValue !== undefined && configBool(workingCopy, "core.bare", false);
   const dir = normalizeFilesPath(gitDir);
-  return { files, top, gitDir: dir, cwd: bare ? dir : top, bare };
+  const gitDirEnv = await gitDirEnvOf(files, top, bare, hostEnvironmentOf(workingCopy));
+  return {
+    files,
+    top,
+    gitDir: dir,
+    cwd: bare ? dir : top,
+    bare,
+    ...(gitDirEnv ? { gitDirEnv } : {}),
+  };
+}
+
+/**
+ * `GIT_DIR` as git's discovery exports it to hooks (see {@link HookLayout.gitDirEnv}): for a
+ * gitfile `<top>/.git`, the real path of the git directory it names (a linked worktree's own:
+ * the worktree's `getGitDir()` is the repository's common directory), as `read_gitfile_gently`
+ * resolves it; `.` for a bare repository; undefined otherwise.
+ */
+async function gitDirEnvOf(
+  files: FilesApi,
+  top: string,
+  bare: boolean,
+  environment: GitHostEnvironment | undefined,
+): Promise<string | undefined> {
+  const dotGit = joinFilesPath(top, ".git");
+  const gitfile = await files
+    .stats(dotGit)
+    .then((s) => s?.kind === "file")
+    .catch(() => false);
+  if (!gitfile) return bare ? "." : undefined;
+  const host = await gitfileTarget(files, dotGit);
+  return host ? realHostPath(host, environment) : undefined;
+}
+
+/** `path` with its symbolic links followed where the host can tell (`realpath(3)`). */
+async function realHostPath(
+  path: string,
+  environment: GitHostEnvironment | undefined,
+): Promise<string> {
+  return (await environment?.realPath?.(path).catch(() => undefined)) ?? path;
+}
+
+/**
+ * The host path of the git directory the gitfile at `path` names (relative to its
+ * directory, or absolute); undefined when it names none or the FilesApi has no host path.
+ */
+async function gitfileTarget(files: FilesApi, path: string): Promise<string | undefined> {
+  const top = normalizeFilesPath(path.slice(0, Math.max(0, path.lastIndexOf("/"))));
+  try {
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of files.read(path)) chunks.push(chunk);
+    const text = decoder.decode(chunks.length === 1 ? chunks[0] : concat(chunks));
+    const m = /^gitdir: (.*?)\r?\n?$/.exec(text.split("\n")[0] ?? "");
+    const target = m?.[1];
+    if (!target) return undefined;
+    if (target.startsWith("/")) return normalizeHostPath(target);
+    const topHost = hostPathOf(files, top);
+    return topHost ? normalizeHostPath(`${topHost}/${target}`) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** An absolute host path with `.` and `..` components resolved. */
+function normalizeHostPath(path: string): string {
+  return `/${normalizeFilesPath(path)}`;
 }
 
 /** The common git directory of `gitDir` (its `commondir` file), as a FilesApi path. */
@@ -792,10 +869,18 @@ export class HookSession {
     return undefined;
   }
 
-  /** The git directory's absolute host path, where the repository's files have one. */
-  async hostGitDir(): Promise<string | undefined> {
+  /**
+   * The git directory's absolute host path, where the repository's files have one: its real
+   * path (symbolic links followed), as git names it after a `getcwd` (clone's GIT_DIR, the
+   * receive side's `absolute_path` in the git directory), or with `{ real: false }` as the
+   * host names it, as git's `absolute_path` of `.git` from the top keeps the logical `$PWD`
+   * (lockfile.c's "Unable to create" message).
+   */
+  async hostGitDir(options: { real?: boolean } = {}): Promise<string | undefined> {
     const layout = await this.host.layout();
-    return layout ? hostPathOf(layout.files, layout.gitDir) : undefined;
+    const host = layout ? hostPathOf(layout.files, layout.gitDir) : undefined;
+    if (!host || options.real === false) return host;
+    return realHostPath(host, this.host.environment());
   }
 
   /** Whether `name` exists as an executable hook (git's `hook_exists`), giving no hint. */
@@ -959,6 +1044,14 @@ export class HookSession {
         : typeof options.stdin === "string"
           ? encoder.encode(options.stdin)
           : options.stdin;
+    const env: Record<string, string> = {
+      ...(options.prefix === false ? {} : { GIT_PREFIX: "" }),
+      ...(layout.gitDirEnv ? { GIT_DIR: layout.gitDirEnv } : {}),
+      ...this.processEnv,
+      ...(options.env ?? {}),
+    };
+    const unsetEnv = options.unsetEnv ?? [];
+    for (const key of unsetEnv) delete env[key];
     let outcome: HookOutcome | undefined;
     try {
       outcome = await runner.run({
@@ -967,11 +1060,8 @@ export class HookSession {
         ...(hook.hostPath ? { hostPath: hook.hostPath } : {}),
         args: options.args ?? [],
         ...(stdin ? { stdin } : {}),
-        env: {
-          ...(options.prefix === false ? {} : { GIT_PREFIX: "" }),
-          ...this.processEnv,
-          ...(options.env ?? {}),
-        },
+        env,
+        ...(unsetEnv.length > 0 ? { unsetEnv } : {}),
         cwd,
         ...(hostCwd ? { hostCwd } : {}),
         stdoutToStderr: !options.keepStdout,
@@ -1016,6 +1106,8 @@ export async function runPostCheckoutHook(
   dir?: string,
   /** Whether git's setup exported `GIT_PREFIX` (not for clone) */
   prefix = true,
+  /** Variables the hook runs without (`worktree add`: `GIT_DIR`, `GIT_WORK_TREE`) */
+  unsetEnv?: string[],
 ): Promise<number> {
   if (!hooks.enabled) return 0;
   const like = oldId ?? newId;
@@ -1024,6 +1116,7 @@ export async function runPostCheckoutHook(
     ...(env ? { env } : {}),
     ...(dir !== undefined ? { dir } : {}),
     prefix,
+    ...(unsetEnv ? { unsetEnv } : {}),
   });
   return result?.exitCode ?? 0;
 }
@@ -1097,7 +1190,7 @@ export function refTransactionHookOf(
       const zero = nullIdLike(u.new ?? u.old ?? undefined);
       const next = u.newTarget !== undefined ? `ref:${u.newTarget}` : (u.new ?? zero);
       const line = (name: string) => `${u.old ?? zero} ${next} ${name}\n`;
-      if (state === "preparing") lines.push(line(u.requested));
+      if (state === "preparing" || context?.asAsked) lines.push(line(u.requested));
       else if (legacy && u.requested !== u.name) {
         lines.push(line(u.requested));
         for (const n of u.through ?? []) appended.push(line(n));

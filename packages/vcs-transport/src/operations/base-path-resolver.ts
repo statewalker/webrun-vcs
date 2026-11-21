@@ -10,7 +10,8 @@
  *   files,                    // the storage the repositories are in
  *   basePath: "/srv/git",     // git-daemon's --base-path
  *   openRepository: async (gitDir) => {
- *     const opened = await worktree.openRepository?.(gitDir);
+ *     // a server: the repository's config includes stay inside the storage
+ *     const opened = await worktree.openRepository?.(gitDir, { configIncludes: "files" });
  *     return opened && servedRepositoryOf(opened); // vcs-commands
  *   },
  * });

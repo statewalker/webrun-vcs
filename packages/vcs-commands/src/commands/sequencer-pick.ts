@@ -698,9 +698,10 @@ export class PickSequencer {
       if (!ref || !("target" in ref)) break;
       name = ref.target;
     }
-    // lockfile.c names the lock by its resolved (absolute) path
+    // lockfile.c names the lock by its absolute path: git runs from the top, where
+    // absolute_path keeps the logical $PWD (symbolic links not followed)
     const gitDir =
-      (await this.deps.hooks?.hostGitDir().catch(() => undefined)) ??
+      (await this.deps.hooks?.hostGitDir({ real: false }).catch(() => undefined)) ??
       (this.deps.workingCopy as { config?: { hostGitDir?: string } }).config?.hostGitDir;
     const lockPath = `${gitDir ? gitDir.replace(/\/+$/, "") : ".git"}/${name}.lock`;
     const legacy = this.deps.hooks?.compatibility === "2.43";
