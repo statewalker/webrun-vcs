@@ -24,10 +24,12 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import {
+  type AddInteractiveResult,
   type PatchOptions,
   type PatchResult,
   type PatchSelector,
   patchModeFor,
+  runAddInteractive,
   runPatchSelection,
 } from "./add-patch/index.js";
 import { worktreeModeTrust } from "./core-config.js";
@@ -92,6 +94,9 @@ export interface AddResult {
 
   /** With {@link AddCommand.setPatch}: what the hunk selection printed and applied */
   readonly patch?: PatchResult;
+
+  /** With {@link AddCommand.setInteractive}: what `git add -i` printed and did */
+  readonly interactive?: AddInteractiveResult;
 }
 
 /**
@@ -123,6 +128,7 @@ export class AddCommand extends GitCommand<AddResult> {
   private sparsePatterns?: SparseCheckoutPatterns;
   private verbose = false;
   private patch = false;
+  private interactive = false;
   private patchSelector?: PatchSelector;
   private patchOptions: PatchOptions = {};
 
@@ -427,6 +433,31 @@ export class AddCommand extends GitCommand<AddResult> {
     return this;
   }
 
+  /**
+   * `git add -i` (`--interactive`): add-interactive.c's session. The status of the paths
+   * the pathspec names is listed, then the "*** Commands ***" menu offers status, update,
+   * revert, add untracked, patch, diff, quit and help until `quit` (or the end of input).
+   * Every read git makes from standard input goes to {@link setPatchSelector}: the menus and
+   * file selections as `choose` requests ("What now> ", "Update>> ", ...), patch mode's
+   * prompts as `add -p` asks them. The result's `interactive` carries git's standard output
+   * and standard error; {@link setCompatibility} picks the version (2.43 takes no `-U`,
+   * `--inter-hunk-context` or `--no-auto-advance` from {@link setPatchOptions}). The other
+   * options but the pathspec do not apply ({@link setPatch} wins when both are set).
+   *
+   * @example
+   * ```typescript
+   * const answers = ["u", "1-2", "", "q"];
+   * const { interactive } = await git.add().setInteractive(true)
+   *   .setPatchSelector(() => answers.shift()).call();
+   * process.stdout.write(interactive?.output ?? "");
+   * ```
+   */
+  setInteractive(interactive: boolean): this {
+    this.checkCallable();
+    this.interactive = interactive;
+    return this;
+  }
+
   /** Answers the prompts of {@link setPatch} (git's reads from standard input and its editor). */
   setPatchSelector(selector: PatchSelector): this {
     this.checkCallable();
@@ -469,6 +500,47 @@ export class AddCommand extends GitCommand<AddResult> {
     };
   }
 
+  /** `git add -i`: the session, staging through `add_file_to_index` (this command's kind). */
+  private async callInteractive(): Promise<AddResult> {
+    if (this.dryRun) {
+      throw new IncompatibleOptionsError(
+        ["--dry-run", "--interactive/--patch"],
+        "fatal: options '--dry-run' and '--interactive/--patch' cannot be used together",
+      );
+    }
+    const selector = this.patchSelector;
+    if (!selector) {
+      throw new InvalidArgumentError(
+        "patchSelector",
+        undefined,
+        "interactive mode needs a selector (setPatchSelector) to answer its prompts",
+      );
+    }
+    const interactive = await runAddInteractive(this.workingCopy, {
+      ...this.patchOptions,
+      selector,
+      paths: this.filepatterns,
+      compatibility: this.compatibility,
+      hookSource: this,
+      add: async ({ paths, update }) => {
+        const add = new AddCommand(this.workingCopy).shareHooksOf(this);
+        add.setCompatibility(this.compatibility).setUpdate(update);
+        for (const path of paths) add.addFilepattern(`:(literal)${path}`);
+        await add.call();
+      },
+    });
+    return {
+      added: interactive.added,
+      skipped: [],
+      ignored: [],
+      removed: [],
+      totalProcessed: interactive.added.length,
+      warnings: [],
+      output: [],
+      interactive,
+    };
+  }
+
   /**
    * Execute the add command.
    *
@@ -484,6 +556,7 @@ export class AddCommand extends GitCommand<AddResult> {
     // unwritten edits (refused)
     await this.readCurrentIndex();
     if (this.patch) return this.callPatch();
+    if (this.interactive) return this.callInteractive();
     this.sparsePatterns = await this.sparseCheckoutPatterns();
 
     // Validate options - update and all are mutually exclusive

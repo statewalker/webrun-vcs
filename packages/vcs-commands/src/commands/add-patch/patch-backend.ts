@@ -159,8 +159,10 @@ export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
  * entries whose files still hold their content take the files' stat, the index is written
  * (racily clean entries smudged), and each unmerged path is reported as `<path>: needs
  * merge` on standard output, which is what the call returns.
+ *
+ * @internal
  */
-class IndexRefresh extends GitCommand<string> {
+export class IndexRefresh extends GitCommand<string> {
   async call(): Promise<string> {
     await this.readCurrentIndex(false);
     const staging = this.staging;

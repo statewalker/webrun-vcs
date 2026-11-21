@@ -1,0 +1,5 @@
+---
+"@statewalker/vcs-commands": minor
+---
+
+**`git add -i` as a library API.** `add().setInteractive(true)` runs add-interactive.c's session: the status listing (staged/unstaged columns, `+N/-M`, `unchanged`, `nothing`, `binary`), the "*** Commands ***" menu with git's `[x]` unique-prefix brackets, and its actions status, update, revert (an unborn HEAD included, "note: <path> is untracked now."), add untracked, patch (the `add -p` engine over the chosen files) and diff (`git diff -p --cached` with the diff configuration), help and quit. Every read git makes from standard input goes to the `setPatchSelector` callback: menus and file selections as the new `choose` request (numbers, ranges `1-3`/`3-`, prefixes, `*`, `-` to deselect, `?`, an empty line or the end of input, with git's quirks), hunk prompts as before. The result's `interactive` carries git's standard output and standard error; `setCompatibility("2.43")` drops the 2.5x `-U`/`--inter-hunk-context`/`--no-auto-advance` options. `DiffCommand.callDiffstat()` gives a comparison's diffstat files (unmerged paths marked).

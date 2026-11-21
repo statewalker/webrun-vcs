@@ -62,6 +62,24 @@ export type PatchRequest =
       /** `/` without a pattern: "search for regex? " */
       type: "search";
       prompt: string;
+    }
+  | {
+      /**
+       * `git add -i`'s menus (add-interactive.c's `list_and_choose`): the main loop's
+       * "What now> " (one item), or a selection of files ("Update>> ", "Revert>> ", "Add
+       * untracked>> ", "Patch update>> ", "Review diff>> "), answered with numbers, ranges
+       * (`1-3`, `3-`), unique prefixes, `*`, `-` to deselect, `?` for help, an empty line to
+       * finish
+       */
+      type: "choose";
+      /** The prompt as git prints it (`What now> `, `Update>> `) */
+      prompt: string;
+      /** One item is chosen (the main menu), not several */
+      singleton: boolean;
+      /** The items listed, in their order (numbered from 1) */
+      items: string[];
+      /** What `git add -i` would have printed so far */
+      output: string;
     };
 
 /**

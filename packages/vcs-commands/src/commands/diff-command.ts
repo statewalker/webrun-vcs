@@ -40,6 +40,7 @@ import {
   type DiffDriver,
   type DiffFilePair,
   type DiffOutputOptions,
+  type DiffstatFile,
   type DiffstatOptions,
   diffDriverOf,
   formatNameOnly,
@@ -361,6 +362,20 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private ignoreSubmodulesOverride?: SubmoduleIgnoreMode;
   /** The index read instead of the working copy's (see {@link setTemporaryIndex}) */
   private temporaryIndex?: Staging;
+  /** Intent-to-add entries are in the index as empty files (plumbing's `diff-index --cached`) */
+  private intentToAddVisible = false;
+
+  /**
+   * Show intent-to-add entries in a `--cached` comparison as the empty files they name, as
+   * plumbing's `diff-index --cached` does (porcelain `git diff` sets `ita_invisible_in_index`).
+   *
+   * @internal
+   */
+  setIntentToAddVisible(visible: boolean): this {
+    this.checkCallable();
+    this.intentToAddVisible = visible;
+    return this;
+  }
 
   /**
    * Set the old (base) tree/commit for comparison.
@@ -581,6 +596,36 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const sink = new ByteSink();
     await this.writeFormats(sink, [format], collected);
     return sink.bytes();
+  }
+
+  /**
+   * The diffstat of the comparison, one file per pair in git's order (`compute_diffstat` of
+   * the diff queue, as a `DIFF_FORMAT_CALLBACK` consumer sees it): an unmerged path as a
+   * file with `isUnmerged` and no counts, followed by what the diff holds for it besides.
+   * No renames unless {@link setRenames} asks, no textconv.
+   */
+  async callDiffstat(): Promise<DiffstatFile[]> {
+    this.checkCallable();
+    this.setCallable(false);
+    this.dirtyThisCall = this.dirtySubmodules ?? false;
+    const collected = await this.collect(this.renames ?? false, false);
+    const entries = await this.ordered(collected.entries);
+    this.textOptions = { ...this.textOptions, textconv: false };
+    const options = this.outputOptions();
+    const files: DiffstatFile[] = [];
+    for (const entry of entries) {
+      if (entry.unmerged) {
+        files.push({
+          name: entry.oldPath ?? entry.newPath ?? "",
+          isRenamed: false,
+          isBinary: false,
+          isUnmerged: true,
+          added: 0,
+          deleted: 0,
+        });
+      } else files.push(...(await computeDiffstat([diffEntryToPair(entry, this.blobs)], options)));
+    }
+    return files;
   }
 
   /**
@@ -1692,7 +1737,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         stages.set(entry.stage, entry);
         continue;
       }
-      if (entry.intentToAdd) continue;
+      if (entry.intentToAdd && !this.intentToAddVisible) continue;
       sides.set(entry.path, { mode: entry.mode, id: entry.objectId });
     }
     return { sides, unmerged };
