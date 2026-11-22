@@ -23,6 +23,7 @@ import {
   type WorkingCopy,
 } from "@statewalker/vcs-working-tree";
 
+import { InvalidConfigError } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { approxidateCareful } from "./git-date.js";
 import { hostEnvironmentOf } from "./git-ident.js";
@@ -55,9 +56,12 @@ const INDEX_FORMAT_DEFAULT = 3;
 const INDEX_FORMAT_LB = 2;
 const INDEX_FORMAT_UB = 4;
 
-/** `index.version` is not an integer: git dies when it reads its repository settings. */
-export class IndexVersionConfigError extends Error {
-  override name = "IndexVersionConfigError";
+/**
+ * `index.version` is not an integer: git dies when it reads its repository settings
+ * (`prepare_repo_settings`), which every command but `git config` does before it reads or
+ * writes anything.
+ */
+export class IndexVersionConfigError extends InvalidConfigError {
   /** git's stderr */
   readonly lines: string[];
   /** @param file the configuration file it was read from (none: the command line) */
@@ -67,9 +71,32 @@ export class IndexVersionConfigError extends Error {
   ) {
     const where = file ? ` in file ${file}` : "";
     const line = `fatal: bad numeric config value '${value}' for 'index.version'${where}: invalid unit`;
-    super(line);
+    super("index.version", line);
+    this.name = "IndexVersionConfigError";
     this.lines = [line];
   }
+}
+
+/**
+ * The death git's `prepare_repo_settings` gives a non-integer `index.version`, or undefined.
+ * Commands check it as they start (`GitCommand.checkConfigOnLoad`), so a command git refuses
+ * to run changes nothing: checkout would otherwise update the worktree and only then fail
+ * to write the index.
+ *
+ * ```typescript
+ * // .git/config: [index] version = four
+ * indexVersionConfigError(workingCopy)?.lines;
+ * // ["fatal: bad numeric config value 'four' for 'index.version' in file .git/config: invalid unit"]
+ * ```
+ */
+export function indexVersionConfigError(
+  workingCopy: WorkingCopy,
+): IndexVersionConfigError | undefined {
+  if (!workingCopy.config) return undefined;
+  const config = RemoteConfigStore.from(workingCopy);
+  const configured = configValueOf(config, "index.version");
+  if (configured === undefined || parseGitInt(configured) !== undefined) return undefined;
+  return new IndexVersionConfigError(configured, versionOrigin(config));
 }
 
 /**

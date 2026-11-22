@@ -294,14 +294,61 @@ describeGit("index.version, GIT_INDEX_VERSION and feature.manyFiles against nati
       "fatal: bad numeric config value 'four' for 'index.version' in file .git/config: invalid unit",
     );
     const g = await ours(dir);
-    const error = await g
-      .add()
-      .addFilepattern(".")
-      .call()
+    // refused as the command starts: its setters already throw (as for core.disambiguate)
+    const error = await Promise.resolve()
+      .then(() => g.add().addFilepattern(".").call())
       .catch((e: unknown) => e);
     expect(error).toBeInstanceOf(IndexVersionConfigError);
     expect((error as IndexVersionConfigError).lines).toEqual([native.stderr.trimEnd()]);
     expect(indexFiles(dir).size).toBe(0);
+  });
+
+  it("an index.version that is not a number: every command refuses before it changes anything", async () => {
+    const dir = repo();
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "one"]);
+    git(dir, ["checkout", "-qb", "topic"]);
+    put(dir, "a.txt", "topic\n");
+    put(dir, "new.txt", "new\n");
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "two"]);
+    git(dir, ["checkout", "-q", "main"]);
+    put(dir, "zeta.txt", "local change\n");
+    git(dir, ["config", "index.version", "four"]);
+    const worktree = () =>
+      ["a.txt", "new.txt", "zeta.txt"].map((p) => {
+        try {
+          return readFileSync(join(dir, p), "utf8");
+        } catch {
+          return undefined;
+        }
+      });
+    const before = { state: saveState(dir), files: worktree() };
+    const expected =
+      "fatal: bad numeric config value 'four' for 'index.version' in file .git/config: invalid unit";
+    for (const args of [["checkout", "topic"], ["reset", "--hard", "topic"], ["status"]]) {
+      const native = spawnSync("git", args, { cwd: dir, env: env(), encoding: "utf8" });
+      expect(native.status).toBe(128);
+      expect(native.stderr.trimEnd()).toBe(expected);
+    }
+    expect(saveState(dir)).toEqual(before.state);
+    expect(worktree()).toEqual(before.files);
+
+    const g = await ours(dir);
+    const runs: Array<() => Promise<unknown>> = [
+      () => g.checkout().setName("topic").call(),
+      () => g.reset().setRef("topic").setMode(ResetMode.HARD).call(),
+      () => g.status().call(),
+    ];
+    for (const run of runs) {
+      const error = await Promise.resolve()
+        .then(run)
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(IndexVersionConfigError);
+      expect((error as IndexVersionConfigError).lines).toEqual([expected]);
+      expect(saveState(dir)).toEqual(before.state);
+      expect(worktree()).toEqual(before.files);
+    }
   });
 
   it("a split index under index.version=4: shared and split files in version 4", async () => {

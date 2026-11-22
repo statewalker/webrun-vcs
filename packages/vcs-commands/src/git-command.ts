@@ -60,7 +60,7 @@ import {
   resolveIdentDate,
   withoutCrud,
 } from "./commands/git-ident.js";
-import { indexHostOf } from "./commands/index-host.js";
+import { indexHostOf, indexVersionConfigError } from "./commands/index-host.js";
 import type { NotesContext } from "./commands/notes-support.js";
 import { postIndexChangeHookOf } from "./commands/post-index-change.js";
 import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
@@ -1230,6 +1230,9 @@ export abstract class GitCommand<T> {
   protected checkConfigOnLoad(): void {
     const failure = configLoadError(this._workingCopy);
     if (failure) throw new InvalidConfigError(failure.key, failure.message);
+    // prepare_repo_settings, which every command but `git config` runs before its work
+    const indexVersion = indexVersionConfigError(this._workingCopy);
+    if (indexVersion) throw indexVersion;
   }
 
   /**
