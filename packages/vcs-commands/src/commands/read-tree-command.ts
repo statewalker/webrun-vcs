@@ -17,7 +17,7 @@ import {
 
 import { ReadTreeFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
-import { worktreeModeTrust } from "./core-config.js";
+import { coreBool, worktreeModeTrust } from "./core-config.js";
 import {
   firstPlainError,
   flatTree,
@@ -29,11 +29,13 @@ import {
 } from "./merge-support.js";
 import { resetMerge } from "./sequencer-support.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
-import { writeTreeRestorePlan } from "./tree-restore.js";
+import { restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import {
   type CheckedEntry,
   entryNotUptodate,
+  IndexCaseFolding,
   pruneEmptyParents,
+  removeCaseVariants,
   untrackedUnder,
 } from "./worktree-overwrite-checks.js";
 
@@ -387,6 +389,9 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
     const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
     const indexTime = this.staging.getUpdateTime();
     const removing: string[] = [];
+    // core.ignorecase: verify_absent asks the source index folding case
+    const folding = await this.caseFolding(worktree, index);
+    const caseVariants: string[] = [];
     for (const path of checking) {
       if (index.has(path)) {
         throw new ReadTreeFailedError(
@@ -408,7 +413,10 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
         }
         beneath.delete(path);
       }
-      const error = await verifyAbsent(worktree, path, (p) => index.has(p), "untracked");
+      const error = await verifyAbsent(worktree, path, (p) => index.has(p), "untracked", {
+        folding,
+        caseVariants,
+      });
       if (error) throw new ReadTreeFailedError(error, [path]);
     }
     const paths = checking.filter((p) => !beneath.has(p));
@@ -436,6 +444,8 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
           await pruneEmptyParents(worktree, old);
         }
       }
+      // what verify_clean_subdirectory took as tracked goes with the directory
+      await removeCaseVariants(worktree, caseVariants);
       if (writing.size > 0) await this.writeFiles(ctx, worktree, target, writing, index);
     }
     const changes = new Map<string, IndexEntryOptions[]>();
@@ -457,6 +467,15 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       const outcome = await sparse.finish(ctx, { written: writing });
       pushSparseWarnings(result.warnings, sparse, outcome, false);
     }
+  }
+
+  /** The source index's case-folding lookups under `core.ignorecase` (undefined: off). */
+  private async caseFolding(
+    worktree: Worktree | undefined,
+    index: Map<string, unknown>,
+  ): Promise<IndexCaseFolding | undefined> {
+    if (!worktree || !coreBool(this.workingCopy, "ignorecase", false)) return undefined;
+    return new IndexCaseFolding(index, await restoreCaseOptions(worktree, true));
   }
 
   /** The files of `writing` written from `target` (smudged with the result's attributes). */
@@ -512,6 +531,9 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       ? worktreeModeTrust(this.workingCopy, checkedWorktree)
       : undefined;
     const indexTime = this.staging.getUpdateTime();
+    // core.ignorecase: verify_absent asks the source index folding case
+    const folding = await this.caseFolding(worktree, indexEntries);
+    const caseVariants: string[] = [];
 
     const paths = new Set<string>(indexEntries.keys());
     for (const m of flat) for (const p of m.keys()) paths.add(p);
@@ -551,6 +573,8 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       if (!worktree || quiet(path)) return;
       const error = await verifyAbsent(worktree, path, (p) => indexEntries.has(p), kind, {
         leadingOk: removedHere,
+        folding,
+        caseVariants,
       });
       if (error) fail(error, path);
     };
@@ -706,6 +730,8 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
           await pruneEmptyParents(worktree, path);
         }
       }
+      // what verify_clean_subdirectory took as tracked goes with the directory
+      await removeCaseVariants(worktree, caseVariants);
       if (writing.size > 0) await this.writeFiles(ctx, worktree, target, writing, indexEntries);
       for (const path of writing) {
         const stat = await worktree.getEntry(path);
@@ -795,7 +821,13 @@ async function verifyAbsent(
   path: string,
   tracked: (path: string) => boolean,
   kind: "untracked" | "untrackedRemoved",
-  options: { leadingOk?: (path: string) => boolean } = {},
+  options: {
+    leadingOk?: (path: string) => boolean;
+    /** `core.ignorecase`'s folding lookups of the source index (icase_exists, read_directory) */
+    folding?: IndexCaseFolding;
+    /** Receives the case variants a replaced directory holds (removed before the writes) */
+    caseVariants?: string[];
+  } = {},
 ): Promise<string | undefined> {
   const parts = path.split("/");
   for (let k = 1; k < parts.length; k++) {
@@ -804,17 +836,22 @@ async function verifyAbsent(
     if (!entry) return undefined;
     if (entry.isDirectory) continue;
     if (options.leadingOk?.(prefix) || (await worktree.isIgnored(prefix))) return undefined;
+    // check_ok_to_remove: a case variant of an index entry's own file (icase_exists)
+    if (await options.folding?.exists(worktree, prefix, entry)) return undefined;
     return firstPlainError({ [kind]: [prefix] });
   }
   const entry = await worktree.getEntry(path).catch(() => undefined);
   if (!entry) return undefined;
   if (entry.isDirectory) {
     if (entry.mode === FileMode.GITLINK) return undefined;
-    if (await untrackedUnder(worktree, path, tracked)) {
+    const variants = options.caseVariants ? options.folding?.variants() : undefined;
+    if (await untrackedUnder(worktree, path, tracked, false, variants)) {
       return firstPlainError({ lostDir: [path] });
     }
+    if (variants) options.caseVariants?.push(...variants.found);
     return undefined;
   }
   if (await worktree.isIgnored(path)) return undefined;
+  if (await options.folding?.exists(worktree, path, entry)) return undefined;
   return firstPlainError({ [kind]: [path] });
 }

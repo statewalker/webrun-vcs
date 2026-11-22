@@ -85,6 +85,12 @@ export interface GitHostEnvironment {
    */
   noLazyFetch?: boolean;
   /**
+   * `$GIT_INDEX_VERSION` as given: the version a new index is written in, before
+   * `index.version` and `feature.manyFiles` (read-cache.c `get_index_format_default`; a
+   * value that is not 2, 3 or 4 falls back to 3 with a warning)
+   */
+  indexVersion?: string;
+  /**
    * `$GIT_PROTOCOL_FROM_USER` as a boolean (git's `git_env_bool`, default true): whether
    * transports whose `protocol.<name>.allow` is `user` may be used (false when git runs a
    * command on the user's behalf, as for submodules)

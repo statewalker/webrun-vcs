@@ -4,7 +4,7 @@
  * outcome (refusal message, status, index, file contents) compared. Also checkout and
  * the worktree's ignore rules read fresh as native git reads them.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   cpSync,
@@ -1250,4 +1250,66 @@ describeGit("stash apply --index keeps the cache-tree describing the index it le
     expect(run(dir, "ls-tree", "-r", "--name-only", "HEAD")).toBe("a/b/w\na/x\nc/v\nf");
     expect(run(dir, "rev-parse", "HEAD^{tree}")).toBe(run(native, "rev-parse", "HEAD^{tree}"));
   });
+});
+
+// unstage_changes_unless_new puts each entry the merge removed back with add_index_entry's
+// ADD_CACHE_OK_TO_ADD alone: one clashing with a file the stash adds (a directory the stash
+// replaced by a file, or the reverse) is refused with git's error and stays out of the index
+describeGit("stash apply replacing a directory by a file keeps no clashing entry", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "stash-df-unstage-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  for (const [label, build] of [
+    [
+      "a directory replaced by a file",
+      (dir: string) => {
+        mkdirSync(join(dir, "d"));
+        writeFileSync(join(dir, "d/x.txt"), "x\n");
+        writeFileSync(join(dir, "k.txt"), "k\n");
+        run(dir, "add", ".");
+        run(dir, "commit", "-q", "-m", "c1");
+        run(dir, "rm", "-rq", "d");
+        writeFileSync(join(dir, "d"), "stashed\n");
+        run(dir, "add", "d");
+      },
+    ],
+    [
+      "a file replaced by a directory",
+      (dir: string) => {
+        writeFileSync(join(dir, "d"), "file\n");
+        writeFileSync(join(dir, "k.txt"), "k\n");
+        run(dir, "add", ".");
+        run(dir, "commit", "-q", "-m", "c1");
+        run(dir, "rm", "-q", "d");
+        mkdirSync(join(dir, "d"));
+        writeFileSync(join(dir, "d/x.txt"), "stashed\n");
+        run(dir, "add", "d");
+      },
+    ],
+  ] as const) {
+    it(label, async () => {
+      const native = join(root, "native");
+      const dir = join(root, "ours");
+      for (const repo of [native, dir]) {
+        run(root, "init", "-q", "-b", "main", repo);
+        build(repo);
+        run(repo, "stash", "-q");
+      }
+      const applied = spawnSync("git", ["stash", "apply", "-q"], {
+        cwd: native,
+        env: nativeGitEnv(root),
+        encoding: "utf8",
+      });
+      expect(applied.status).toBe(0);
+      const { ours } = await open(dir);
+      const result = await ours.stashApply().call();
+      expect(result.status).toBe("ok");
+      expect(result.warnings).toEqual([applied.stderr.trimEnd()]);
+      expect(applied.stderr).toMatch(/^error: '.*' appears as both a file and as a directory\n$/);
+      expect(run(dir, "ls-files", "-s")).toBe(run(native, "ls-files", "-s"));
+      expect(status(dir)).toBe(status(native));
+    });
+  }
 });

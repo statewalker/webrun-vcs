@@ -295,6 +295,15 @@ export interface Staging {
   hasUnwrittenChanges?(): boolean;
 
   /**
+   * Whether the configuration has a write of the index change it although no entry changed
+   * (git's `cache_changed` bits set when it reads the index): `core.splitIndex` splitting or
+   * unsplitting it, and with `untrackedCache` `core.untrackedCache` adding or removing the
+   * untracked cache. A command writing only a changed index (git's `SKIP_IF_UNCHANGED`, as
+   * `add`) writes then too. Absent: never.
+   */
+  wantsRewrite?(options?: { untrackedCache?: boolean }): Promise<boolean>;
+
+  /**
    * Get last update time (ms since epoch)
    */
   getUpdateTime(): number;
