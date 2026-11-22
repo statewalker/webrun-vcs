@@ -9,7 +9,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
@@ -87,7 +87,7 @@ describeGit("a local remote another user owns, as native git", () => {
     );
   });
 
-  it("push: safe.directory lets it through", async () => {
+  it("push: safe.directory on the command line never reaches receive-pack (local_repo_env)", async () => {
     const pusher = join(root, "pusher");
     const allow = {
       ...DIFFERENT,
@@ -95,6 +95,28 @@ describeGit("a local remote another user owns, as native git", () => {
       GIT_CONFIG_KEY_0: "safe.directory",
       GIT_CONFIG_VALUE_0: join(root, "bare.git"),
     };
+    const native = gitRun(root, root, ["push", join(root, "bare.git"), "main:refs/heads/c"], {
+      ...allow,
+      GIT_DIR: join(pusher, ".git"),
+    });
+    expect(native.status).toBe(128);
+    const g = await ours(pusher, allow);
+    const ourError = await failure(() =>
+      g.push().setRemote(join(root, "bare.git")).setRefSpecs("main:refs/heads/c").call(),
+    );
+    expect(ourError).toBe(native.stderr);
+  });
+
+  it("push: a global safe.directory lets it through", async () => {
+    const pusher = join(root, "pusher");
+    const global = join(root, "global-safe.cfg");
+    writeFileSync(global, `[safe]\n\tdirectory = ${join(root, "bare.git")}\n`);
+    const allow = { ...DIFFERENT, GIT_CONFIG_GLOBAL: global };
+    const native = gitRun(root, root, ["push", join(root, "bare.git"), "main:refs/heads/g"], {
+      ...allow,
+      GIT_DIR: join(pusher, ".git"),
+    });
+    expect(native.status).toBe(0);
     const g = await ours(pusher, allow);
     const result = await g
       .push()

@@ -94,6 +94,8 @@ export interface NodeGitHostEnvironment {
   assumeDifferentOwner?: boolean;
   commandLineConfig?: Array<{ key: string; value: string | undefined }>;
   commandLineConfigError?: string;
+  ceilingDirectories?: string;
+  discoveryAcrossFilesystem?: boolean;
   prefix?: string;
   expandUserHome?(name: string): Promise<string | undefined>;
 }
@@ -320,8 +322,10 @@ export function commandLineConfigOf(
  * `GIT_ATTR_SOURCE` for the tree attributes are read from, `GIT_NO_REPLACE_OBJECTS` and
  * `GIT_REPLACE_REF_BASE` for replace refs, `GIT_GRAFT_FILE` for the grafts file,
  * `GIT_PRINT_SHA1_ELLIPSIS` for the `...` after abbreviated ids, `GIT_NOTES_REF`,
- * `GIT_NOTES_DISPLAY_REF`, `GIT_NOTES_REWRITE_REF`, `GIT_NOTES_REWRITE_MODE` for notes),
- * files read by absolute path. The system files default to `/etc/gitconfig` and
+ * `GIT_NOTES_DISPLAY_REF`, `GIT_NOTES_REWRITE_REF`, `GIT_NOTES_REWRITE_MODE` for notes,
+ * `GIT_CONFIG_COUNT` / `GIT_CONFIG_PARAMETERS` for the command-line config every config read
+ * applies last, `GIT_CEILING_DIRECTORIES` and `GIT_DISCOVERY_ACROSS_FILESYSTEM` for
+ * repository discovery), files read by absolute path. The system files default to `/etc/gitconfig` and
  * `/etc/gitattributes`.
  *
  * @example
@@ -466,6 +470,11 @@ export function createNodeGitHostEnvironment(
     ...(envBool(env.GIT_TEST_ASSUME_DIFFERENT_OWNER) ? { assumeDifferentOwner: true } : {}),
     ...(commandLineConfig.length > 0 ? { commandLineConfig } : {}),
     ...(commandLineConfigError !== undefined ? { commandLineConfigError } : {}),
+    // repository discovery: where it stops climbing
+    ...(env.GIT_CEILING_DIRECTORIES !== undefined
+      ? { ceilingDirectories: env.GIT_CEILING_DIRECTORIES }
+      : {}),
+    ...(envBool(env.GIT_DISCOVERY_ACROSS_FILESYSTEM) ? { discoveryAcrossFilesystem: true } : {}),
     prefix: options.prefix ?? "/usr",
   };
 }

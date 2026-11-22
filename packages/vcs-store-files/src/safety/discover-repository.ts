@@ -7,7 +7,13 @@
  */
 
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
-import { type FilesApi, joinPath, normalizePath, readFile } from "@statewalker/vcs-utils/files";
+import {
+  type FilesApi,
+  joinPath,
+  normalizePath,
+  type PosixFilesApi,
+  readFile,
+} from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { parseGitfile } from "../workspace/git-dir/index.js";
@@ -67,6 +73,23 @@ export class NotAGitRepositoryError extends Error {
 }
 
 /**
+ * Discovery stopped at a file system boundary (git's `GIT_DIR_HIT_MOUNT_POINT`, exit 128):
+ * the parent of the mount point lies on another device, and `$GIT_DISCOVERY_ACROSS_FILESYSTEM`
+ * is not set.
+ */
+export class FilesystemBoundaryError extends NotAGitRepositoryError {
+  constructor(
+    /** The directory git names: the first one above the boundary, as the host names it */
+    readonly mountPoint: string,
+  ) {
+    super(
+      `fatal: not a git repository (or any parent up to mount point ${mountPoint})\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).`,
+    );
+    this.name = "FilesystemBoundaryError";
+  }
+}
+
+/**
  * Finds the repository `cwd` is in, as git's setup does: in each directory from `cwd` up to
  * the storage's root, a `.git` gitfile (its target must be a git directory), a `.git`
  * directory that is one, then the directory itself as a bare repository. A found
@@ -76,6 +99,12 @@ export class NotAGitRepositoryError extends Error {
  * while `safe.bareRepository` is `explicit`, unless it is a `.git` directory or a linked
  * worktree's or submodule's git directory inside one (2.44+). An explicit `gitDir` is used
  * as given.
+ *
+ * Discovery climbs no higher than the environment's `ceilingDirectories`
+ * (`$GIT_CEILING_DIRECTORIES`: the directories below the longest ceiling above `cwd` are
+ * searched, the ceiling itself not; `NotAGitRepositoryError` past it) and, unless
+ * `discoveryAcrossFilesystem`, stops where the device id of the FilesApi's `lstat` changes
+ * (`FilesystemBoundaryError`; no check where the storage reports no device).
  *
  * The protection is opt-in: a library caller gets git's local checks only by discovering the
  * repository here first. Constructing a `FileWorktree` or calling `createGitFilesBackend`
@@ -103,6 +132,13 @@ export async function discoverRepository(
   const check = options.checkOwnership !== false;
   const cwdHost = hostPathOf(files, normalizePath(options.cwd ?? "/"));
   let dir = normalizePath(options.cwd ?? "/");
+  // GIT_CEILING_DIRECTORIES: how many directories above cwd may be searched
+  const levels = await ceilingLevels(environment, cwdHost);
+  // one_filesystem: the device of cwd, compared with each directory climbed to
+  const deviceOf = async (path: string) =>
+    (await (files as PosixFilesApi).lstat?.(path).catch(() => undefined))?.dev;
+  const device = environment?.discoveryAcrossFilesystem ? undefined : await deviceOf(dir);
+  let level = 0;
   for (;;) {
     const dotGit = joinPath(dir, ".git");
     const kind = (await files.stats(dotGit).catch(() => undefined))?.kind;
@@ -169,8 +205,65 @@ export async function discoverRepository(
       return { gitDir: dir, bare: true, warnings };
     }
     if (dir === "/") throw new NotAGitRepositoryError();
+    if (levels !== undefined && level >= levels) throw new NotAGitRepositoryError();
     dir = dir.slice(0, dir.lastIndexOf("/")) || "/";
+    level++;
+    if (device !== undefined) {
+      const dev = await deviceOf(dir);
+      if (dev !== undefined && dev !== device) {
+        throw new FilesystemBoundaryError(hostPathOf(files, dir));
+      }
+    }
   }
+}
+
+/**
+ * setup.c's ceiling: the entries of `$GIT_CEILING_DIRECTORIES` canonicalised
+ * (`canonicalize_ceiling_entry`: a relative entry dropped, `realPath` until an empty entry,
+ * an entry that does not resolve dropped), then `longest_ancestor_length` against the real
+ * path of `cwd`: the number of directories above `cwd` discovery may search, undefined
+ * without a ceiling above it.
+ */
+async function ceilingLevels(
+  environment: GitHostEnvironment | undefined,
+  cwdHost: string,
+): Promise<number | undefined> {
+  const value = environment?.ceilingDirectories;
+  if (value === undefined) return undefined;
+  const ceilings: string[] = [];
+  let emptyFound = false;
+  for (const entry of value.split(":")) {
+    if (entry === "") {
+      emptyFound = true;
+      continue;
+    }
+    if (!entry.startsWith("/")) continue;
+    if (emptyFound || !environment?.realPath) {
+      ceilings.push(entry);
+      continue;
+    }
+    const real = await environment.realPath(entry).catch(() => undefined);
+    if (real !== undefined) ceilings.push(real);
+  }
+  // getcwd: the physical directory
+  const cwd = (await environment?.realPath?.(cwdHost).catch(() => undefined)) ?? cwdHost;
+  if (cwd === "/") return undefined;
+  let longest = -1;
+  for (const ceiling of ceilings) {
+    let len = ceiling.length;
+    if (len > 0 && ceiling.endsWith("/")) len--;
+    if (!cwd.startsWith(ceiling.slice(0, len)) || cwd[len] !== "/" || cwd.length === len + 1) {
+      continue;
+    }
+    if (len > longest) longest = len;
+  }
+  if (longest < 0) return undefined;
+  // the components of cwd below the ceiling, less cwd itself
+  const below = cwd
+    .slice(longest)
+    .split("/")
+    .filter((part) => part !== "").length;
+  return below - 1;
 }
 
 /** A gitfile's `gitdir:` as a path of `files`: relative to `dir`, or absolute in its root. */

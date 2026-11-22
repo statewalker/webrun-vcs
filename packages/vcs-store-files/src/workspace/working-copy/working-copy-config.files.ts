@@ -263,6 +263,11 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   private baseEntries: ConfigEntry[] = [];
   /** Entries of `config.worktree`, when `extensions.worktreeConfig` is set */
   private overlayEntries: ConfigEntry[] = [];
+  /**
+   * Entries of the command line ({@link GitHostEnvironment.commandLineConfig}, with what
+   * their includes bring in), read last in scope `command`
+   */
+  private commandEntries: ConfigEntry[] = [];
   /** Entries an include directive of this file brings in, by the directive's line */
   private includedEntries = new Map<ConfigLine, ConfigEntry[]>();
   /** Every value of the chain in order, computed when first read after a change */
@@ -311,6 +316,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const followIncludes = this.options.includes !== false;
     const reader = new ChainReader(this, env, this.options, followIncludes);
     const base: ConfigEntry[] = [];
+    this.commandEntries = [];
     if (env) {
       const hostSource = (path: string, scope: ConfigScope): ConfigSource => ({
         read: env.readFile,
@@ -344,6 +350,17 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
       this.overlayEntries = overlay;
     }
     this.resolvedCache = undefined;
+    // do_git_config_sequence: the command line last, once every file is read (a file git
+    // cannot parse dies first); git dies on command-line config it cannot parse
+    if (env && this.options.commandLine !== false) {
+      if (env.commandLineConfigError !== undefined) {
+        throw new CommandLineConfigError(env.commandLineConfigError);
+      }
+      const command: ConfigEntry[] = [];
+      await reader.readCommandLine(env.commandLineConfig ?? [], command);
+      this.commandEntries = command;
+      this.resolvedCache = undefined;
+    }
     await this.noteHead(reader);
   }
 
@@ -453,6 +470,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
       for (const value of values) out.push({ key, value });
     }
     out.push(...this.overlayEntries);
+    out.push(...this.commandEntries);
     this.resolvedCache = out;
     return out;
   }
@@ -538,8 +556,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
         ? {
             value: e.value,
             text: e.origin.text,
-            file: e.origin.file,
-            line: e.origin.line,
+            ...(e.origin.file !== undefined ? { file: e.origin.file } : {}),
+            ...(e.origin.line !== undefined ? { line: e.origin.line } : {}),
             ...(e.scope ? { scope: e.scope } : {}),
           }
         : {
@@ -569,8 +587,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
             key: e.key,
             value: e.value,
             text: e.origin.text,
-            file: e.origin.file,
-            line: e.origin.line,
+            ...(e.origin.file !== undefined ? { file: e.origin.file } : {}),
+            ...(e.origin.line !== undefined ? { line: e.origin.line } : {}),
             ...(e.scope ? { scope: e.scope } : {}),
           }
         : {
@@ -1147,14 +1165,58 @@ export interface GitConfigOptions {
   withoutGitDir?: boolean;
   /** With {@link withoutGitDir}: remote URLs of the command line, also matched by `hasconfig` */
   extraRemoteUrls?: string[];
+  /**
+   * Read the environment's command-line configuration ({@link
+   * GitHostEnvironment.commandLineConfig}, `$GIT_CONFIG_COUNT` / `$GIT_CONFIG_PARAMETERS`)
+   * after every file, in scope `command`, as git's `do_git_config_sequence` (default true;
+   * nothing without an environment). Its `include.path` / `includeIf.*.path` are followed
+   * (a relative path is git's fatal `relative config includes must come from files`), and
+   * {@link GitHostEnvironment.commandLineConfigError} makes {@link GitWorkingCopyConfig.load}
+   * throw {@link CommandLineConfigError}, as git dies at its first config read.
+   */
+  commandLine?: boolean;
+}
+
+/**
+ * The command-line configuration git cannot parse (exit 128): its message is git's lines,
+ * `error: <reason>` and `fatal: unable to parse command-line config`. Thrown by every config
+ * read that includes the command line, as git dies at its first config read.
+ */
+export class CommandLineConfigError extends Error {
+  readonly exitCode = 128;
+  constructor(message: string) {
+    super(message);
+    this.name = "CommandLineConfigError";
+  }
+}
+
+/** git's lines for command-line config whose include git refuses (`error:` + `fatal:`). */
+const commandLineFailure = (reason: string) =>
+  `error: ${reason}\nfatal: unable to parse command-line config`;
+
+/**
+ * `git config --show-origin`'s origin of a value: `file:<file>` (`file:.git/config`),
+ * `command line:` for a value of the command line, empty for one set in memory.
+ *
+ * @example
+ * ```typescript
+ * for (const e of config.listWithOrigin()) console.log(`${showOrigin(e)}\t${e.key}`);
+ * ```
+ */
+export function showOrigin(entry: { file?: string; scope?: ConfigScope }): string {
+  if (entry.file !== undefined) return `file:${entry.file}`;
+  return entry.scope === "command" ? "command line:" : "";
 }
 
 /** One value of the chain. */
 interface ConfigEntry {
   key: string;
   value: unknown;
-  /** Where it was read (absent for a value set in memory and not saved yet) */
-  origin?: { file: string; line: number; text: string | undefined };
+  /**
+   * Where it was read (absent for a value set in memory and not saved yet); no file and line
+   * for a value of the command line
+   */
+  origin?: { file?: string; line?: number; text: string | undefined };
   /** The scope of the file it belongs to (see {@link ConfigScope}) */
   scope?: ConfigScope;
 }
@@ -1171,7 +1233,11 @@ export interface ConfigValueOrigin {
    * undefined for a variable written without `=` (git's NULL value: "missing value")
    */
   text: string | undefined;
-  /** The file, as the host or the files API names it; absent for a value set in memory */
+  /**
+   * The file, as the host or the files API names it; absent for a value set in memory and
+   * for one of the command line (scope `command`, `git config --show-origin`'s
+   * `command line:`; a file a command-line include brings in has its file)
+   */
   file?: string;
   /** Its line in that file, from 1 */
   line?: number;
@@ -1193,6 +1259,11 @@ interface ConfigSource {
   host?: boolean;
   /** The scope of its values (an included file's: the including file's) */
   scope?: ConfigScope;
+  /**
+   * The command line (git's `CONFIG_ORIGIN_CMDLINE`): no file, so a relative include from it
+   * is refused and a `gitdir:./` condition never holds
+   */
+  commandLine?: boolean;
 }
 
 /** An included file's values have the scope of the file that includes it. */
@@ -1398,6 +1469,30 @@ class ChainReader {
     }
   }
 
+  /**
+   * Appends the command line's entries (git's `git_config_from_parameters`) to `out`, in
+   * scope `command`, each include directive followed where it stands.
+   */
+  async readCommandLine(
+    entries: ReadonlyArray<{ key: string; value: string | undefined }>,
+    out: ConfigEntry[],
+  ): Promise<void> {
+    const source: ConfigSource = {
+      read: async () => undefined,
+      path: "",
+      host: true,
+      scope: "command",
+      commandLine: true,
+    };
+    for (const { key, value: text } of entries) {
+      const value = convertValue(text);
+      out.push({ key, value, origin: { text }, scope: "command" });
+      if (this.followIncludes && isIncludeKey(key)) {
+        await this.include(key, value, source, out, 1);
+      }
+    }
+  }
+
   /** Follows one include directive of `from`. */
   async include(
     key: string,
@@ -1418,7 +1513,7 @@ class ChainReader {
     }
     if (depth > MAX_INCLUDE_DEPTH) {
       throw new Error(
-        `exceeded maximum include depth (${MAX_INCLUDE_DEPTH}) while including\n\t${value}\n\tfrom\n\t${from.path}\nThis might be due to circular includes.`,
+        `exceeded maximum include depth (${MAX_INCLUDE_DEPTH}) while including\n\t${value}\n\tfrom\n\t${from.commandLine ? "the command line" : from.path}\nThis might be due to circular includes.`,
       );
     }
     const target = await this.resolvePath(value, from);
@@ -1437,6 +1532,12 @@ class ChainReader {
     }
     if (value.startsWith("/")) {
       return env ? { read: env.readFile, path: value, host: true, ...scopeOf(from) } : undefined;
+    }
+    // handle_path_include: a relative path needs a file to be relative to
+    if (from.commandLine) {
+      throw new CommandLineConfigError(
+        commandLineFailure("relative config includes must come from files"),
+      );
     }
     // beside `from`, its `.` and `..` resolved (a FilesApi does not resolve them itself)
     const joined = resolveDots(`${dirOf(from.path)}${value}`);
@@ -1595,6 +1696,9 @@ class ChainReader {
       if (expanded === undefined) return false;
       pattern = expanded;
       if (pattern.startsWith("./")) {
+        // git's "relative config include conditionals must come from files" (an error,
+        // the condition false)
+        if (from.commandLine) return false;
         // relative to the including file's directory, known only as the host names it
         const dir = from.path === this.configPath() ? `${this.gitDirPath()}/` : dirOf(from.path);
         pattern = `${dir}${pattern.slice(2)}`;

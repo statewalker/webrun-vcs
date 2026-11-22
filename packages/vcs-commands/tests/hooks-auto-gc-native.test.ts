@@ -69,6 +69,9 @@ function base(loose: number): string {
 const gcAuto = (twin: HookTwin) =>
   nativeIn(twin, root, ["gc", "--auto"], { GIT_CONFIG_COUNT: "1" });
 
+/** Ours alike: the command line (which ours reads too) without `gc.auto=0`. */
+const oursAuto = (twin: HookTwin) => oursIn(twin, { GIT_CONFIG_COUNT: "1" });
+
 const seventeen = (twin: HookTwin) => readdirSync(join(twin.dir, ".git/objects/17")).sort();
 
 describeGit("pre-auto-gc hook: gc --auto as native git", () => {
@@ -80,7 +83,7 @@ describeGit("pre-auto-gc hook: gc --auto as native git", () => {
   it("below the thresholds: no hook, nothing done", async () => {
     const [theirs, mine] = hookTwins(root, base(1));
     const native = gcAuto(theirs);
-    const result = await (await oursIn(mine)).gc().setAuto(true).call();
+    const result = await (await oursAuto(mine)).gc().setAuto(true).call();
     expect(native.status).toBe(0);
     expect(result.autoSkipped).toBe("not-needed");
     expect(hookLog(mine)).toBe(hookLog(theirs));
@@ -91,7 +94,7 @@ describeGit("pre-auto-gc hook: gc --auto as native git", () => {
     const [theirs, mine] = hookTwins(root, base(2));
     for (const t of [theirs, mine]) hookExit(t, "pre-auto-gc", 1);
     const native = gcAuto(theirs);
-    const result = await (await oursIn(mine)).gc().setAuto(true).call();
+    const result = await (await oursAuto(mine)).gc().setAuto(true).call();
     expect(native.status).toBe(0);
     expect(result.autoSkipped).toBe("hook");
     expect(hookLog(mine)).toBe(hookLog(theirs));
@@ -103,7 +106,7 @@ describeGit("pre-auto-gc hook: gc --auto as native git", () => {
   it("above gc.auto, the hook agreeing: housekeeping runs, git's message", async () => {
     const [theirs, mine] = hookTwins(root, base(2));
     const native = gcAuto(theirs);
-    const result = await (await oursIn(mine)).gc().setAuto(true).call();
+    const result = await (await oursAuto(mine)).gc().setAuto(true).call();
     expect(native.status).toBe(0);
     expect(result.autoSkipped).toBeUndefined();
     expect(hookLog(mine)).toBe(hookLog(theirs));
@@ -115,7 +118,7 @@ describeGit("pre-auto-gc hook: gc --auto as native git", () => {
     git(dir, ["config", "gc.auto", "0"]);
     const [theirs, mine] = hookTwins(root, dir);
     gcAuto(theirs);
-    const result = await (await oursIn(mine)).gc().setAuto(true).call();
+    const result = await (await oursAuto(mine)).gc().setAuto(true).call();
     expect(result.autoSkipped).toBe("not-needed");
     expect(hookLog(mine)).toBe(hookLog(theirs));
     expect(hookLog(mine)).toBe("");
@@ -151,7 +154,7 @@ describeGit("gc --auto: pack-refs --auto in 2.5x (as native git)", () => {
       installHooks(join(dir, ".git/hooks"), ["reference-transaction"]);
       const [theirs, mine] = hookTwins(root, dir);
       const native = gcAuto(theirs);
-      const result = await (await oursIn(mine)).gc().setAuto(true).call();
+      const result = await (await oursAuto(mine)).gc().setAuto(true).call();
       expect(native.status).toBe(0);
       expect(result.autoSkipped).toBeUndefined();
       expect(hookLog(mine)).toBe(hookLog(theirs));

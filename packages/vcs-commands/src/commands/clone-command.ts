@@ -567,7 +567,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     // a bare repository's working copy opens it from its git directory
     const worktree = repositoryPlaceOf(this.workingCopy);
     const isRepositoryPath = await worktree
-      ?.openRepository?.(uri, { checkOwnership: false })
+      ?.openRepository?.(uri, { checkOwnership: false, commandLineConfig: false })
       .then((opened) => opened !== undefined)
       .catch(() => false);
     let repo: string;

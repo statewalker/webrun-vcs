@@ -60,6 +60,7 @@ import {
   MemoryWorkingCopy,
   smudgeContent,
   type WorkingCopy,
+  withoutCommandLineConfig,
 } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "../../create-git-files-backend.js";
 import { assertValidOwnership, hostPathOf } from "../../safety/index.js";
@@ -1383,7 +1384,10 @@ export class FileWorktree implements Worktree {
       // target and the path entered (the gitfile itself when there is one), checked before
       // anything of the repository is read (its config, includes and alternates)
       const files = this.rootFiles;
-      const environment = this.environment;
+      // the process's own environment (clone's copy check runs in it), and the opened
+      // repository's: without the command line for a local transport's remote side
+      const own = this.environment;
+      const environment = options.commandLineConfig === false ? withoutCommandLineConfig(own) : own;
       const cwd = hostPathOf(files, this.rootPath || "/");
       const compatibility = options.compatibility ?? "2.56";
       const checkOwnership = async (check: { gitDirOnly?: boolean; path?: string } = {}) => {
@@ -1392,7 +1396,7 @@ export class FileWorktree implements Worktree {
           const dir = gitfileTarget ?? candidate;
           await assertValidOwnership({
             files,
-            ...(environment ? { environment } : {}),
+            ...(own ? { environment: own } : {}),
             gitDir: dir,
             reportPath: check.path ?? hostPathOf(files, dir),
             cwd,
@@ -1429,7 +1433,11 @@ export class FileWorktree implements Worktree {
     options: OpenRepositoryOptions,
   ): Promise<OpenedRepository> {
     const files = this.rootFiles;
-    const environment = this.environment ? { environment: this.environment } : {};
+    const opened =
+      options.commandLineConfig === false
+        ? withoutCommandLineConfig(this.environment)
+        : this.environment;
+    const environment = opened ? { environment: opened } : {};
     const includes =
       options.configIncludes === undefined ? {} : { includes: options.configIncludes };
     const backend = await createGitFilesBackend({
