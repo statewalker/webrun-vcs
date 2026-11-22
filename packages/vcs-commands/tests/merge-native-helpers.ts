@@ -98,6 +98,8 @@ export async function openOurs(
    * `dir`, so it reaches what lies beside the repository too
    */
   worktreePath = "",
+  /** Give the worktree the environment too (its local remotes' ownership checks) */
+  worktreeEnvironment = false,
 ): Promise<Git> {
   const files = createNodeFilesApi({ rootDir: dir });
   const gitDir = worktreePath ? `${worktreePath}/.git` : ".git";
@@ -153,6 +155,7 @@ export async function openOurs(
     gitDir,
     blobs: history.blobs,
     trees: history.trees,
+    ...(worktreeEnvironment && environment ? { environment } : {}),
   });
   const wc = new MemoryWorkingCopy({ history, checkout, worktree, config });
   return Git.fromWorkingCopy(wc);

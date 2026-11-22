@@ -36,6 +36,8 @@ export * from "./repack.js";
 export * from "./repository-format.js";
 // A `.git` or `.git/objects` linked elsewhere, resolved through the FilesApi
 export * from "./resolve-linked-git-dir.js";
+// Repository safety: ownership (safe.directory), safe.bareRepository, discovery
+export * from "./safety/index.js";
 // Storage implementations (file-dependent)
 export * from "./storage/index.js";
 // Workspace implementations (file-dependent)

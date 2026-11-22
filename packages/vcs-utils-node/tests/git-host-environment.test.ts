@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInMemoryFilesApi } from "@statewalker/vcs-utils/files";
 import { describe, expect, it } from "vitest";
-import { createNodeGitHostEnvironment } from "../src/files/index.js";
+import { commandLineConfigOf, createNodeGitHostEnvironment } from "../src/files/index.js";
 
 describe("createNodeGitHostEnvironment", () => {
   it("reads host files by absolute path through a Node FilesApi", async () => {
@@ -71,5 +71,51 @@ describe("createNodeGitHostEnvironment", () => {
       undefined,
       undefined,
     ]);
+  });
+});
+
+describe("createNodeGitHostEnvironment: ownership checks and command-line config", () => {
+  it("takes the effective uid from the process unless given or turned off", () => {
+    const env = createNodeGitHostEnvironment({ env: {} });
+    expect(env.effectiveUid).toBe(process.geteuid?.());
+    expect(createNodeGitHostEnvironment({ env: {}, effectiveUid: 42 }).effectiveUid).toBe(42);
+    expect(createNodeGitHostEnvironment({ env: {}, effectiveUid: null }).effectiveUid).toBe(
+      undefined,
+    );
+    const sudo = createNodeGitHostEnvironment({
+      env: { SUDO_UID: "1000", GIT_TEST_ASSUME_DIFFERENT_OWNER: "true" },
+    });
+    expect(sudo.sudoUid).toBe("1000");
+    expect(sudo.assumeDifferentOwner).toBe(true);
+    expect(env.prefix).toBe("/usr");
+  });
+
+  it("reads GIT_CONFIG_COUNT pairs, then GIT_CONFIG_PARAMETERS, as git passes `-c`", () => {
+    expect(
+      commandLineConfigOf({
+        GIT_CONFIG_COUNT: "2",
+        GIT_CONFIG_KEY_0: "Safe.Directory",
+        GIT_CONFIG_VALUE_0: "/a",
+        GIT_CONFIG_KEY_1: "url.HTTPS://X/.insteadOf",
+        GIT_CONFIG_VALUE_1: "x:",
+        GIT_CONFIG_PARAMETERS: "'safe.directory=/b' 'safe.directory'='/it'\\''s' 'core.bare'",
+      }),
+    ).toEqual([
+      { key: "safe.directory", value: "/a" },
+      { key: "url.HTTPS://X/.insteadof", value: "x:" },
+      { key: "safe.directory", value: "/b" },
+      { key: "safe.directory", value: "/it's" },
+      { key: "core.bare", value: undefined },
+    ]);
+    // a missing pair or a bogus count gives nothing of that variable
+    expect(
+      commandLineConfigOf({
+        GIT_CONFIG_COUNT: "2",
+        GIT_CONFIG_KEY_0: "a.b",
+        GIT_CONFIG_VALUE_0: "1",
+      }),
+    ).toEqual([]);
+    expect(commandLineConfigOf({ GIT_CONFIG_COUNT: "x" })).toEqual([]);
+    expect(commandLineConfigOf({ GIT_CONFIG_PARAMETERS: "safe.directory=/x" })).toEqual([]);
   });
 });

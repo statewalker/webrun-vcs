@@ -137,6 +137,33 @@ export interface GitHostEnvironment {
    * `@statewalker/vcs-utils-node` spawns them on Node).
    */
   hookRunner?: HookRunner;
+  /**
+   * The process's effective user id (POSIX `geteuid`): what git compares the owner of a
+   * repository with before it uses one (`safe.directory`, "detected dubious ownership").
+   * Absent (a browser, Windows), or with a FilesApi whose `lstat` reports no `uid`, the
+   * ownership checks pass, as on systems without file owners.
+   */
+  effectiveUid?: number;
+  /**
+   * `$SUDO_UID` as set: when {@link effectiveUid} is root, a repository owned by this user
+   * counts as the user's own (git's `extract_id_from_env`)
+   */
+  sudoUid?: string;
+  /** `$GIT_TEST_ASSUME_DIFFERENT_OWNER` is true: every repository fails the ownership check */
+  assumeDifferentOwner?: boolean;
+  /**
+   * The configuration given on git's command line (`git -c`), as git passes it to its child
+   * processes in `$GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` and then
+   * `$GIT_CONFIG_PARAMETERS`, in that order; keys canonical (section and variable in lower
+   * case), a value undefined for a key given without `=`. Read with the system and global
+   * files as git's protected configuration (`safe.directory`, `safe.bareRepository`).
+   */
+  commandLineConfig?: Array<{ key: string; value: string | undefined }>;
+  /**
+   * git's runtime prefix (`system_path`, `/usr` for a distribution's git): what `%(prefix)/`
+   * in a path setting expands to. Absent, such a relative path names nothing.
+   */
+  prefix?: string;
 }
 
 /**

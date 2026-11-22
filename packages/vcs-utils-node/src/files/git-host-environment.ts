@@ -49,6 +49,13 @@ export interface NodeGitHostEnvironmentOptions {
    * hooks were supported
    */
   hookRunner?: NodeHookRunner;
+  /**
+   * The effective user id the ownership checks compare repository owners with (default:
+   * `process.geteuid()`, absent on Windows); `null` turns the checks off
+   */
+  effectiveUid?: number | null;
+  /** git's runtime prefix for `%(prefix)/` (default `/usr`, as a distribution's git) */
+  prefix?: string;
 }
 
 /** The environment as `GitHostEnvironment` describes it. */
@@ -82,6 +89,11 @@ export interface NodeGitHostEnvironment {
   notesRewriteMode?: string;
   pathspecs?: { literal?: string; glob?: string; noglob?: string; icase?: string };
   hookRunner?: NodeHookRunner;
+  effectiveUid?: number;
+  sudoUid?: string;
+  assumeDifferentOwner?: boolean;
+  commandLineConfig?: Array<{ key: string; value: string | undefined }>;
+  prefix?: string;
 }
 
 /**
@@ -119,6 +131,119 @@ function envBool(value: string | undefined): boolean {
   if (value === undefined) return false;
   const text = value.trim().toLowerCase();
   return !["", "0", "false", "no", "off"].includes(text);
+}
+
+/**
+ * A config key as git's `git_config_parse_key` canonicalizes it: section and variable in
+ * lower case, a subsection as written; undefined for a key git refuses (no section or no
+ * variable, a variable not starting with a letter or holding anything but letters, digits
+ * and `-`, a newline anywhere).
+ */
+function canonicalConfigKey(key: string): string | undefined {
+  const first = key.indexOf(".");
+  const last = key.lastIndexOf(".");
+  if (first <= 0 || last === key.length - 1 || key.includes("\n")) return undefined;
+  const section = key.slice(0, first);
+  const variable = key.slice(last + 1);
+  if (!/^[A-Za-z0-9-]+$/.test(section) || !/^[A-Za-z][A-Za-z0-9-]*$/.test(variable)) {
+    return undefined;
+  }
+  const subsection = first === last ? undefined : key.slice(first + 1, last);
+  const head = section.toLowerCase();
+  const tail = variable.toLowerCase();
+  return subsection === undefined ? `${head}.${tail}` : `${head}.${subsection}.${tail}`;
+}
+
+/**
+ * One shell-quoted word at `text[at]` as git's `sq_dequote_step` reads it (`'...'`, with
+ * `'\''` and `'\!'` for a quote and a bang); undefined when the text is not quoted so.
+ */
+function sqWord(text: string, at: number): { word: string; end: number } | undefined {
+  if (text[at] !== "'") return undefined;
+  let word = "";
+  let i = at + 1;
+  for (;;) {
+    const close = text.indexOf("'", i);
+    if (close < 0) return undefined;
+    word += text.slice(i, close);
+    i = close + 1;
+    if (text[i] === "\\" && (text[i + 1] === "'" || text[i + 1] === "!") && text[i + 2] === "'") {
+      word += text[i + 1];
+      i += 3;
+      continue;
+    }
+    return { word, end: i };
+  }
+}
+
+/**
+ * The command-line configuration git passes to its child processes (config.c's
+ * `git_config_from_parameters`): `GIT_CONFIG_COUNT` pairs first, then the entries of
+ * `GIT_CONFIG_PARAMETERS` (`'key=value'`, or 2.31's `'key'='value'`, a key alone without a
+ * value). A malformed variable (git's "bogus count", "bogus format") contributes nothing.
+ */
+export function commandLineConfigOf(
+  env: Record<string, string | undefined>,
+): Array<{ key: string; value: string | undefined }> {
+  const out: Array<{ key: string; value: string | undefined }> = [];
+  const add = (key: string, value: string | undefined) => {
+    const canonical = canonicalConfigKey(key);
+    if (canonical !== undefined) out.push({ key: canonical, value });
+  };
+  const count = env.GIT_CONFIG_COUNT;
+  if (count !== undefined && /^\s*\+?\d+$/.test(count)) {
+    const n = Number.parseInt(count, 10);
+    const pairs: Array<[string, string]> = [];
+    let complete = true;
+    for (let i = 0; i < n && i < 10000; i++) {
+      const key = env[`GIT_CONFIG_KEY_${i}`];
+      const value = env[`GIT_CONFIG_VALUE_${i}`];
+      if (key === undefined || value === undefined) {
+        complete = false;
+        break;
+      }
+      pairs.push([key, value]);
+    }
+    if (complete) for (const [key, value] of pairs) add(key, value);
+  }
+  const parameters = env.GIT_CONFIG_PARAMETERS;
+  if (parameters !== undefined) {
+    const entries: Array<[string, string | undefined]> = [];
+    let i = 0;
+    let ok = true;
+    for (;;) {
+      while (parameters[i] === " ") i++;
+      if (i >= parameters.length) break;
+      const first = sqWord(parameters, i);
+      if (!first) {
+        ok = false;
+        break;
+      }
+      i = first.end;
+      if (parameters[i] === "=") {
+        // 2.31's form: 'key'='value', or 'key'= for an empty value
+        const second = sqWord(parameters, i + 1);
+        if (second) {
+          entries.push([first.word, second.word]);
+          i = second.end;
+        } else {
+          entries.push([first.word, ""]);
+          i += 1;
+        }
+      } else {
+        const eq = first.word.indexOf("=");
+        entries.push(
+          eq < 0 ? [first.word, undefined] : [first.word.slice(0, eq), first.word.slice(eq + 1)],
+        );
+      }
+      if (i < parameters.length && parameters[i] !== " ") {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) for (const [key, value] of entries) add(key, value);
+  }
+  return out;
 }
 
 /**
@@ -169,6 +294,12 @@ export function createNodeGitHostEnvironment(
     ...(env.GIT_ICASE_PATHSPECS !== undefined ? { icase: env.GIT_ICASE_PATHSPECS } : {}),
   };
   const pathspecs = Object.keys(pathspecFlags).length > 0 ? pathspecFlags : undefined;
+  const effectiveUid =
+    options.effectiveUid === null
+      ? undefined
+      : (options.effectiveUid ??
+        (typeof process.geteuid === "function" ? process.geteuid() : undefined));
+  const commandLineConfig = commandLineConfigOf(env);
   return {
     readFile: async (path: string) => {
       try {
@@ -235,5 +366,11 @@ export function createNodeGitHostEnvironment(
     // the global pathspec magic, as given (git_env_bool reads them when a pathspec is parsed)
     ...(pathspecs ? { pathspecs } : {}),
     ...(options.hookRunner ? { hookRunner: options.hookRunner } : {}),
+    // the ownership checks (safe.directory): the effective uid, sudo's, git's test switch
+    ...(effectiveUid !== undefined ? { effectiveUid } : {}),
+    ...(env.SUDO_UID !== undefined ? { sudoUid: env.SUDO_UID } : {}),
+    ...(envBool(env.GIT_TEST_ASSUME_DIFFERENT_OWNER) ? { assumeDifferentOwner: true } : {}),
+    ...(commandLineConfig.length > 0 ? { commandLineConfig } : {}),
+    prefix: options.prefix ?? "/usr",
   };
 }

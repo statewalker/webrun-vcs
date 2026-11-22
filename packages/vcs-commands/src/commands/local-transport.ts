@@ -45,10 +45,13 @@ import { ReadTreeCommand } from "./read-tree-command.js";
 import { StatusCommand } from "./status-command.js";
 import { repositoryPlaceOf, usesBranch, worktreeUsingBranch } from "./worktree-support.js";
 
-const NOT_A_REPOSITORY = (path: string) =>
-  `fatal: '${path}' does not appear to be a git repository\n` +
+/** The client's lines when the remote end of a local transport died. */
+const COULD_NOT_READ =
   "fatal: Could not read from remote repository.\n\n" +
   "Please make sure you have the correct access rights\nand the repository exists.";
+
+const NOT_A_REPOSITORY = (path: string) =>
+  `fatal: '${path}' does not appear to be a git repository\n${COULD_NOT_READ}`;
 
 /**
  * A connected pair of in-memory duplex streams: what one side writes, the other reads. `end`
@@ -122,8 +125,10 @@ export async function openLocalRemote(
   path: string,
 ): Promise<OpenedRepository> {
   // a bare repository opens it from its git directory, as git runs there
+  // upload-pack opens it whatever its owner (git 2.48+'s ENTER_REPO_ANY_OWNER_OK);
+  // receive-pack checks before it serves (withLocalReceivePack)
   const opened = await repositoryPlaceOf(workingCopy)
-    ?.openRepository?.(path)
+    ?.openRepository?.(path, { checkOwnership: false })
     .catch(() => undefined);
   if (!opened) throw new TransportError(NOT_A_REPOSITORY(path));
   return opened;
@@ -323,6 +328,16 @@ export async function withLocalReceivePack<T>(
   /** `protocol.version`: 1 has receive-pack answer `version 1` first (2 is v0 for a push) */
   options: { protocolVersion?: 0 | 1 | 2 } = {},
 ): Promise<T> {
+  // receive-pack's enter_repo(path, 0): a repository another user owns is refused (git's
+  // die_upon_dubious_ownership in the child), and the client sees the connection fail
+  try {
+    await remote.checkOwnership?.();
+  } catch (error) {
+    if (error instanceof Error && error.name === "DubiousOwnershipError") {
+      throw new TransportError(`${error.message}\n${COULD_NOT_READ}`);
+    }
+    throw error;
+  }
   const receiveHooks = hooks?.enabled ? scriptReceiveHooks(hooks) : undefined;
   // the remote's reference-transaction hook on its ref store while receive-pack runs (its
   // output goes to the pushing user's stderr directly, not through the side-band)
