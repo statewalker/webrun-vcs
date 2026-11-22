@@ -398,6 +398,38 @@ export function createGitObjects(
     }
   }
 
+  /**
+   * The chunks of `content` while they total at most `size` bytes plus one chunk: an array
+   * when the content ended there, else those chunks followed by the rest of the content.
+   */
+  async function gatherSmall(
+    content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+    size: number,
+  ): Promise<Uint8Array[] | AsyncIterable<Uint8Array>> {
+    const it =
+      Symbol.asyncIterator in Object(content)
+        ? (content as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]()
+        : (content as Iterable<Uint8Array>)[Symbol.iterator]();
+    const head: Uint8Array[] = [];
+    let total = 0;
+    while (total <= size) {
+      const r = await it.next();
+      if (r.done) return head;
+      head.push(r.value);
+      total += r.value.length;
+    }
+    return (async function* () {
+      let done = false;
+      try {
+        yield* head;
+        for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
+        done = true;
+      } finally {
+        if (!done) await it.return?.();
+      }
+    })();
+  }
+
   async function put(
     type: ObjectTypeString,
     size: number,
@@ -411,6 +443,13 @@ export function createGitObjects(
     // for the object again. A small one is compressed in one synchronous call, at git's
     // level for loose objects.
     let known: string | undefined;
+    if (!Array.isArray(content) && size <= SYNC_DEFLATE_MAX) {
+      // a small object read from a stream (a worktree file): gathered first, at most one chunk
+      // past its declared size, so it is hashed and compressed in memory as below (a
+      // compression stream per small file costs more than the file); a size that does not
+      // match is reported by the streaming path, as before
+      content = await gatherSmall(content, size);
+    }
     if (Array.isArray(content)) {
       const chunks = content as Uint8Array[];
       let total = 0;

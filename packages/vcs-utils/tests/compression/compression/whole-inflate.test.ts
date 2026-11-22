@@ -695,3 +695,42 @@ describe("inflateWhole on handcrafted dynamic blocks", () => {
     expect(Buffer.from(got.data).equals(Buffer.from(want))).toBe(true);
   });
 });
+
+describe("inflateWhole differential fuzz: small objects back to back", () => {
+  it("decodes runs of small streams as node zlib does, each into its own view of a shared slab", () => {
+    // as a pack read does it: many small objects in a row (the dynamic tables and scratch
+    // state of one call left behind for the next), each written into a slab view whose
+    // neighbours must stay untouched
+    const r = rng(0x5eed479);
+    const slab = new Uint8Array(32 * 1024);
+    let used = 0;
+    for (let round = 0; round < 3000; round++) {
+      const n = r() < 0.1 ? Math.floor(r() * 8) : Math.floor(r() * 2048);
+      const raw = sample(r, n);
+      // a git object header in front, as loose objects and pack entries hold
+      const framed = new Uint8Array(Buffer.concat([Buffer.from(`blob ${n}\0`), raw]));
+      const d = deflaters[Math.floor(r() * deflaters.length)] as (typeof deflaters)[number];
+      const z = new Uint8Array(deflateSync(framed, d.opts));
+      const want = inflateSync(z);
+      if (used + framed.length + 16 > slab.length) {
+        slab.fill(0);
+        used = 0;
+      }
+      const at = used + 8;
+      slab.fill(0xa5, used, at); // a guard before the view
+      slab.fill(0x5a, at + framed.length, at + framed.length + 8); // and after it
+      const into = slab.subarray(at, at + framed.length);
+      // with the next object's bytes after the stream, as a pack window has them
+      const input = new Uint8Array(z.length + 16);
+      input.set(z);
+      input.fill(0x78, z.length);
+      const got = inflateWhole(input, { into });
+      expect(got.length, `round ${round} (${d.name}, ${n} bytes)`).toBe(want.length);
+      expect(got.consumed, `round ${round}`).toBe(z.length);
+      expect(Buffer.from(into).equals(want), `round ${round} (${d.name})`).toBe(true);
+      for (let k = used; k < at; k++) expect(slab[k]).toBe(0xa5);
+      for (let k = at + framed.length; k < at + framed.length + 8; k++) expect(slab[k]).toBe(0x5a);
+      used = at + framed.length + 8;
+    }
+  });
+});

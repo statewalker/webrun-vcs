@@ -615,10 +615,26 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
     this.dirtyThisCall = this.dirtySubmodules ?? format === "patch";
     this.readUiConfig();
-    const collected = await this.collect(renames, format === "patch", PREFETCH_FORMATS.has(format));
-    const sink = new ByteSink();
-    await this.writeFormats(sink, [format], collected);
-    return sink.bytes();
+    return this.inOneOperation(async () => {
+      const collected = await this.collect(
+        renames,
+        format === "patch",
+        PREFETCH_FORMATS.has(format),
+      );
+      const sink = new ByteSink();
+      await this.writeFormats(sink, [format], collected);
+      return sink.bytes();
+    });
+  }
+
+  /**
+   * Runs `fn` as one worktree operation (`Worktree.batch`): the configuration, attributes and
+   * ignore files read once for every path the diff prints, instead of once per path (each
+   * attributes lookup outside an operation opens one of its own). As `git log` runs its diffs.
+   */
+  private inOneOperation<T>(fn: () => Promise<T>): Promise<T> {
+    const worktree = this.worktreeIfAny;
+    return worktree?.batch ? worktree.batch(fn) : fn();
   }
 
   /**
@@ -631,6 +647,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.checkCallable();
     this.setCallable(false);
     this.dirtyThisCall = this.dirtySubmodules ?? false;
+    return this.inOneOperation(() => this.diffstatFiles());
+  }
+
+  /** {@link callDiffstat}'s files. */
+  private async diffstatFiles(): Promise<DiffstatFile[]> {
     const collected = await this.collect(this.renames ?? false, false);
     const entries = await this.ordered(collected.entries);
     this.textOptions = { ...this.textOptions, textconv: false };

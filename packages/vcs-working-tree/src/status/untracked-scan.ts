@@ -547,33 +547,44 @@ export async function scanUntracked(
     const fromDisk = listing !== undefined;
     // read_cached_dir: the disk's entries, else the cached subdirectories reached last
     // time, then the cached untracked names
-    let items: CachedDirEntry[];
-    if (listing) items = listing.map((entry) => ({ kind: "disk", entry }));
-    else {
+    let items: CachedDirEntry[] | undefined;
+    if (!listing) {
       const cached = node as UntrackedCacheDir;
       items = [];
       for (const sub of [...cached.dirs]) if (sub.recurse) items.push({ kind: "dir", node: sub });
       for (const name of cached.untracked) items.push({ kind: "file", name });
     }
     const trackedHere = fromDisk ? options.trackedIn?.(dir) : undefined;
-    for (const item of items) {
+    const count = listing ? listing.length : (items as CachedDirEntry[]).length;
+    for (let k = 0; k < count; k++) {
       let state: number;
       let path: string;
       let name: string;
-      if (item.kind === "disk") {
-        ({ state, path, name } = await treatPath(dir, node, item.entry, trackedHere));
-      } else if (item.kind === "dir") {
-        // treat_path_fast: a directory read only to check it is checked again so
-        name = `${item.node.name}/`;
-        path = join(dir, name);
-        nodes.set(stripSlash(path), item.node);
-        state = item.node.checkOnly
-          ? await readDirectoryRecursive(stripSlash(path), item.node, true, false)
-          : PATH_RECURSE;
+      if (listing) {
+        const entry = listing[k] as DirectoryEntry;
+        // a tracked file (of a known kind) is nothing to the walk: treatPath would give
+        // PATH_NONE, which changes neither the state nor the result, so it is skipped here
+        // without a promise, a path or a result object per file
+        if (entry.kind !== undefined && entry.kind !== "directory" && trackedHere?.has(entry.name))
+          continue;
+        ({ state, path, name } = await treatPath(dir, node, entry, trackedHere));
       } else {
-        name = item.name;
-        path = join(dir, name);
-        state = PATH_UNTRACKED;
+        const item = (items as CachedDirEntry[])[k] as CachedDirEntry;
+        if (item.kind === "disk") {
+          ({ state, path, name } = await treatPath(dir, node, item.entry, trackedHere));
+        } else if (item.kind === "dir") {
+          // treat_path_fast: a directory read only to check it is checked again so
+          name = `${item.node.name}/`;
+          path = join(dir, name);
+          nodes.set(stripSlash(path), item.node);
+          state = item.node.checkOnly
+            ? await readDirectoryRecursive(stripSlash(path), item.node, true, false)
+            : PATH_RECURSE;
+        } else {
+          name = item.name;
+          path = join(dir, name);
+          state = PATH_UNTRACKED;
+        }
       }
       if (state > dirState) dirState = state;
       if (state === PATH_RECURSE) {
