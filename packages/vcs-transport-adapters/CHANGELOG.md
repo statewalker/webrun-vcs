@@ -1,5 +1,123 @@
 # @statewalker/vcs-transport-adapters
 
+## 0.6.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-core crosses a breaking line
+  - @statewalker/vcs-transport crosses a breaking line
+  - @statewalker/vcs-utils crosses a breaking line
+
+### Patch Changes
+
+- d84c354: **Tree entry modes read as git reads them (`canon_mode`), everywhere.**
+  
+  A tree that stores a blob as 100664 (older git wrote it) now reads as 100644, as git's `decode_tree_entry` reads it, so a repository with such trees behaves as with native git: `status` is clean after `reset --hard`, and `merge`, `checkout`, `cherry-pick`, `revert`, `rebase` (patch-ids), `stash`, `reset`, `diff` and `log` no longer see a mode change between 100664 and 100644, or refuse with "local changes would be overwritten".
+  
+  - **vcs-core:** the tree store's `load`, `entries` and `getEntry` give canonical modes (`canonTreeMode`: a regular file 100644 or 100755 by its owner's execute bit, a symlink 120000, a directory 40000, anything else a gitlink); `raw` still gives the stored bytes, and serializing a stored tree (`SerializationApi`) copies them. `decodeTreeBytes(bytes, { canonicalModes: true })` reads canonical modes (without the option, modes as stored), and `treeModesRewritten(entries)` says whether such a list came from a tree written with other modes (encoding it again makes another tree). fsck keeps reading the modes as stored (`badFilemode` for 100664 under `--strict`).
+  - **vcs-working-tree:** the files and git stagings' `writeTree` reuses the directories the index's cache-tree has valid, as git's write-tree does (a tree primed by a reset keeps its stored 100664 modes). `updateCacheTree` computes a directory as the canonical tree its entries make: where the stored tree holds other modes, that tree is valid only if stored (git's `WRITE_TREE_REPAIR`), else invalid.
+  - **vcs-commands:** `reset --hard` primes the cache-tree with the target tree (`prime_cache_tree`) and `reset --mixed` keeps it with the changed paths invalid; `stash apply` invalidates the paths it merges. A combined diff's `-U0` hunk header prints a count below zero as git's `%lu` does (`+1,18446744073709551615`), in `diff` and `log --cc`.
+  - **vcs-store-sql**, **vcs-transport-adapters:** syncing a tree to the SQL store and an object's size read the stored bytes; the native SQL tree store reads canonical modes.
+- 1777896: **Commit-graph walks give a full walk's answers on graphs whose generations cannot be trusted.**
+  
+  - **vcs-core:** `CommitGraph.generationsTrusted` checks the whole graph once, on first use: generations cut and order walks only when the graph has generation numbers (`generationNumbersEnabled`), every record decodes, none is 0 and each is above its parents'. Otherwise every generation is Infinity (git reads a stored 0 as GENERATION_NUMBER_INFINITY), so `isAncestor`, `findMergeBase` and merge-ort's merge bases are right on graphs with zero levels (git before 2.18), a corrupt record, or corrected dates git 2.43 truncated past 2^32. `getHeader(id, { checkExists: true })` also looks the commit up in the object store (git's GIT_COMMIT_GRAPH_PARANOIA). A graph that fails to load is not loaded again until `invalidate()`. `listObjects` reads its wants, so a missing one throws even when a stale graph lists it. A split write gives the layers it merged away a new mtime, as git's `mark_commit_graphs`, and expires them with one clock read (the default expire time is that same now), so they are always expired as in git. `isAncestor` and `findMergeBase` read one graph for the whole walk: a graph written and loaded while they run is not mixed in (commits outside the walk's graph are read from the object store). `Commits.headerReader()` gives a header reader bound to the graph loaded now. `createGitFilesHistory` takes and exposes the `commitGraph` provider.
+  - **vcs-store-files:** `gc` reports a failed commit-graph write in `commitGraphError` and keeps what it did before, as `git gc`. The backend, `gc` and `writeCommitGraph` take an `environment`: the commit-graph settings are then read from the system and global config too. `createGitFilesHistoryFromFiles` passes the backend's commit-graph on (`History.commitGraph`); `FileWorktree` takes an `environment` for the submodules `openGitlink` opens. The backend reloads the graph after its ref store changes the `shallow` file or a replace ref.
+  - **vcs-commands:** the merge-base queue is ordered by generation only when the graph trusts them, and one merge-base computation reads one graph (`commitsBaseSource` takes a `headerReader` once). `InitCommand.setEnvironment` passes the host's environment to the repository it opens, so a global `core.commitGraph` is honoured.
+  - **vcs-transport-adapters:** `getCommitInfo(oid, { checkExists: true })` does not report a commit that only a stale commit-graph lists; without it (upload-pack's walks) the graph is read unchecked, as git does by default.
+  - **vcs-transport:** `RepositoryFacade.getCommitInfo` takes `{ checkExists }`; receive-pack asks for it for the type of a new tip and in its connectivity check.
+- 1777896: **Commit-graphs: read, written and verified as git does, and used by history walks.**
+  
+  On a 5000-commit repository with a graph, a walk of every commit takes 3.5 ms instead of 49 ms, a merge base of distant commits 3 to 5 ms instead of 41 to 48 ms, and an ancestor check about 2 ms instead of 40 ms, level with `git rev-list` and `git merge-base` over the same graph.
+  
+  - **vcs-core (`history/commit-graph`):** `readCommitGraph` loads `objects/info/commit-graph` or the split chain in `info/commit-graphs/` as git's `commit-graph.c` does (header, chunk table, OIDF, OIDL, CDAT, EDGE, GDA2/GDO2, BIDX/BDAT, BASE; git's checks and messages on load; a broken chain kept up to its last good layer). `CommitGraph` gives each commit's parents, tree, date, topological level and generation (corrected commit date with GDA2) without reading the commit; `bloomMayContainPath` queries its changed-path filters. `writeCommitGraphFile` writes files byte-identical to `git commit-graph write` (`--append`, `--split[=no-merge|replace]`, `--size-multiple`, `--max-commits`, `--expire-time`, `--[no-]changed-paths` with murmur3 hash versions 1 and 2, `--max-new-filters`; GDA2 unless `commitGraph.generationVersion=1`; the filters of an existing graph kept). `verifyCommitGraph` is `git commit-graph verify`. `loadRepositoryCommitGraph` and `commitGraphCompatible` follow git's `prepare_commit_graph`: no graph with `core.commitGraph=false`, replace refs, grafts or a shallow repository.
+  - **vcs-core (commits):** `createCommits(objects, { commitGraph })`; `Commits.getHeader` (tree, parents, commit time, generation) and `getParents`, `getTree` and `walkAncestry` read the graph for the commits it has and parse the others (a stale graph is fine). `findMergeBase` is now git 2.56's merge-base (`paint_down_to_common` over a queue ordered by generation then date, with its side-exhaustion exit in the graph; redundant bases removed), returning every merge base, best first, as `git merge-base --all` (it returned the first common ancestor of a depth-first walk). `isAncestor` and the redundancy check skip commits whose generation shows they cannot reach the commit sought. `getMergeBases` and `isAncestorOf` (`commit-reach.ts`) are exported. `History.commitGraph` is the provider; `listObjects` takes a `commitHeader` lookup.
+  - **vcs-store-files:** the files backend reads the repository's graph on first use. `writeCommitGraph` is `git commit-graph write --reachable` (or from given commits) in a repository; `readCommitGraphSettings` reads the config. `gc` writes the graph at the end when `gc.writeCommitGraph` is true (the default), as `git gc`, and its reachability walk reads commits from the graph.
+  - **vcs-commands:** `fsck` verifies the commit-graph as git's fsck runs `git commit-graph verify` (exit bit 16, `FSCK_ERROR_COMMIT_GRAPH`). merge, rebase, pull, octopus and merge-ort's virtual bases use the store's walks and the graph's generations (the merge-base queue ordered by generation when the graph has corrected dates, as git orders it).
+  - **vcs-transport-adapters:** upload-pack and receive-pack walks read commits from the graph.
+- de6af72: **Fetch and clone check what they received, as git does.**
+  
+  - **vcs-transport:** `fetchFromConnection` runs git's `check_connected` before it writes any ref: every new ref tip must reach only objects that are here, down to the existing refs and the alternates' refs (`connectivityErrors`, receive-pack's walk, so a fetch on top of a branch reads only what it brought). A deepening fetch is checked against its new shallow commits before the shallow file changes; a clone checks the refs it writes, except those in a pack index-pack found self-contained. A failure throws `FetchCheckError` with rev-list's lines (`fatal: bad object`, `error: Could not read`, `fatal: bad tree object`, `fatal: missing blob object`). `FetchClientOptions.fsckObjects` runs index-pack's `--strict` over each received pack (imported into a quarantine, so a refused pack leaves nothing behind): fsck of every object and every named object received or present (`fatal: did not receive expected object`), as a clone's `--check-self-contained-and-connected` also does. `RepositoryFacade.loadObject` reads an object's content, `PackImportOptions.onObject` reports each received object, and commits and tags the typed stores refuse are walked as git parses them (`lenientCommitHeader`, `lenientTagTarget`).
+  - **vcs-core:** pack imports report every received object with its place in the pack (`onObject` of `importPack`, `installPack` and `SerializationApi.importPack`: whole entries first, then deltas).
+  - **vcs-commands:** `git fetch` fails with git's `error: <url> did not send all necessary objects` (exit 1) and `git clone` with `fatal: remote did not send all necessary objects` when a server leaves history out, writing no ref. `fetch.fsckObjects` / `transfer.fsckObjects` (or `FetchCommand.setCheckFetchedObjects`) check received objects with `fetch.fsck.<msg-id>` severities and `fetch.fsck.skipList` (`fetchFsckOf`), in git's words (`error: object <id>: <msg-id>: <message>`, `fatal: fsck error in packed object`, `fatal: index-pack failed`). `FetchCommand.setCompatibility` picks 2.43's or 2.5x's output.
+  - **Received links read in memory:** pack imports report the content of every received commit, tree and tag while they hold it (`onContent` of `importPack`, `installPack`, `unpackObjects`, `SerializationApi.importPack` and `PackImportOptions`), and the fetch client checks index-pack's links from it (`ReceivedLinks`) instead of reading every object back: a clone's self-contained check of 219k objects takes 30 ms instead of 4 s. An import into a quarantine opens none for an empty stream, and a fetch discards its quarantine on any failure before the commit (a response error after the pack included). fsck reads only the blobs it checks (`ReceivedObjectsFsck.wantsBlob`). Lenient commit/tag reads ask the object's type first (`storedObjectType`) and are used by `VcsRepositoryFacade.getCommitInfo` with a commit-graph too; `VcsRepositoryFacade.getObjectType` reads the object header. `fetch.fsck.*` is read in config order where the config lists its variables (`RemoteConfigStore.entriesWithPrefix`): unknown ids give git's `warning: Skipping unknown msg id '<id>'`, the first demoted fatal id dies, and a `fetch.fsckObjects`/`transfer.fsckObjects` that is no boolean dies with `fatal: bad boolean config value`.
+- Updated dependencies [a86d47a]
+- Updated dependencies [d5158af]
+- Updated dependencies [d84c354]
+- Updated dependencies [d84c354]
+- Updated dependencies [05a5cae]
+- Updated dependencies [9517fc9]
+- Updated dependencies [0135cdd]
+- Updated dependencies [1777896]
+- Updated dependencies [1777896]
+- Updated dependencies [20c317e]
+- Updated dependencies [21d6866]
+- Updated dependencies [e1c44ca]
+- Updated dependencies [457680a]
+- Updated dependencies [7f697fd]
+- Updated dependencies [4e839be]
+- Updated dependencies [257e9cf]
+- Updated dependencies [de6af72]
+- Updated dependencies [a8df903]
+- Updated dependencies [0a39cdc]
+- Updated dependencies [57846c3]
+- Updated dependencies [f078ebd]
+- Updated dependencies [5863bf1]
+- Updated dependencies [35239a9]
+- Updated dependencies [32f7288]
+- Updated dependencies [53ecad0]
+- Updated dependencies [bbf5ca1]
+- Updated dependencies [df0147c]
+- Updated dependencies [c72622c]
+- Updated dependencies [54f881d]
+- Updated dependencies [7314646]
+- Updated dependencies [8329312]
+- Updated dependencies [2ce29f8]
+- Updated dependencies [2ce29f8]
+- Updated dependencies [2d0759a]
+- Updated dependencies [c80355f]
+- Updated dependencies [7314646]
+- Updated dependencies [79b57ea]
+- Updated dependencies [c3ee332]
+- Updated dependencies [bd31e0f]
+- Updated dependencies [9e462a8]
+- Updated dependencies [1efa875]
+- Updated dependencies [98be9b5]
+- Updated dependencies [87d6d55]
+- Updated dependencies [af93342]
+- Updated dependencies [d489ee7]
+- Updated dependencies [d489ee7]
+- Updated dependencies [2796b2d]
+- Updated dependencies [7c63add]
+- Updated dependencies [966768c]
+- Updated dependencies [68ef504]
+- Updated dependencies [bd2140b]
+- Updated dependencies [7dc8308]
+- Updated dependencies [979230c]
+- Updated dependencies [979230c]
+- Updated dependencies [9234799]
+- Updated dependencies [32ab2c4]
+- Updated dependencies [68c571d]
+- Updated dependencies [f745816]
+- Updated dependencies [2523eff]
+- Updated dependencies [b7426bc]
+- Updated dependencies [d676bf4]
+- Updated dependencies [65e2515]
+- Updated dependencies [68cedb7]
+- Updated dependencies [f0d8ddd]
+- Updated dependencies [0b1ccae]
+- Updated dependencies [eb5ad83]
+- Updated dependencies [8a603c0]
+- Updated dependencies [b31fadc]
+- Updated dependencies [5558be8]
+- Updated dependencies [c80355f]
+- Updated dependencies [35239a9]
+- Updated dependencies [0798366]
+  - @statewalker/vcs-core@0.6.0
+  - @statewalker/vcs-utils@0.6.0
+  - @statewalker/vcs-transport@0.6.0
+
 ## 0.5.0
 
 ### Minor Changes
