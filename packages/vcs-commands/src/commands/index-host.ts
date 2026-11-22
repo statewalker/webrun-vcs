@@ -75,6 +75,13 @@ export async function indexSettingsOf(
     const v = parseGitBool(split);
     if (v !== undefined) settings.splitIndex = v;
   }
+  // repo-settings.c: feature.manyFiles implies index.skipHash, which overrides it
+  const manyFiles = configValueOf(config, "feature.manyFiles");
+  const manyFilesOn = manyFiles === undefined ? false : (parseGitBool(manyFiles) ?? false);
+  const skipHash = configValueOf(config, "index.skipHash");
+  if (skipHash === undefined ? manyFilesOn : (parseGitBool(skipHash) ?? manyFilesOn)) {
+    settings.skipHash = true;
+  }
   const max = configValueOf(config, "splitIndex.maxPercentChange");
   if (max !== undefined && /^\s*-?\d+\s*$/.test(max)) {
     const n = Number.parseInt(max, 10);

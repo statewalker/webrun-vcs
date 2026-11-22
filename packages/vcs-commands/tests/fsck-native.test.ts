@@ -1736,21 +1736,73 @@ describeGit("fsck against native git", () => {
     const corrupt = readFileSync(indexFile);
     const theirs = native(dir, ["fsck", ...noReferences]);
     expect(theirs.status).toBe(128);
-    expect(theirs.stderr).toContain("bad index file sha1 signature");
+    expect(theirs.stderr).toBe("error: bad index file sha1 signature\nfatal: index file corrupt\n");
     const files = createNodeFilesApi({ rootDir: dir });
-    await expect(
-      (await openOurs(dir))
-        .fsck()
-        .setRepositoryFiles({ files })
-        .setCompatibility(compatibility)
-        .call(),
-    ).rejects.toThrow(/checksum mismatch/);
+    const ours = await (await openOurs(dir))
+      .fsck()
+      .setRepositoryFiles({ files })
+      .setCompatibility(compatibility)
+      .call();
+    expect(ours.exitCode).toBe(128);
+    expect(ours.errorOutput).toBe(theirs.stderr);
+    expect(ours.output).toBe(theirs.stdout);
     // status reads it (and, refreshing, writes it anew)
     const status = native(dir, ["status", "--porcelain"]);
     expect(status.status).toBe(0);
     expect(status.stdout).toBe(" M a\n");
     writeFileSync(indexFile, corrupt);
-    const ours = await (await openOurs(dir)).status().call();
-    expect([...ours.modified]).toEqual(["a"]);
+    const status2 = await (await openOurs(dir)).status().call();
+    expect([...status2.modified]).toEqual(["a"]);
+  });
+
+  // fsck reads every worktree's index and a split index's shared index with
+  // verify_index_checksum: a wrong content byte or trailer dies as the main index does
+  it("a linked worktree's index, a shared index's content or trailer: git's death", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n", "d/b": "b\n" }, "one");
+    g(dir, "worktree", "add", "-q", join(root, `wt${n++}`));
+    g(dir, "-c", "core.splitIndex=true", "update-index", "--split-index");
+    const gitDir = join(dir, ".git");
+    const shared = readdirSync(gitDir).find((f) => f.startsWith("sharedindex.")) as string;
+    expect(shared).toBeDefined();
+    const wtIndex = join(
+      gitDir,
+      "worktrees",
+      readdirSync(join(gitDir, "worktrees"))[0] as string,
+      "index",
+    );
+    const cases: [string, number][] = [
+      [wtIndex, -1],
+      [join(gitDir, shared), 20],
+      [join(gitDir, shared), -1],
+    ];
+    for (const [file, at] of cases) {
+      const before = readFileSync(file);
+      flipByte(file, at);
+      const theirs = native(dir, ["fsck", ...noReferences]);
+      expect(theirs.status).toBe(128);
+      expect(theirs.stderr).toBe(
+        "error: bad index file sha1 signature\nfatal: index file corrupt\n",
+      );
+      const ours = await (await openOurs(dir))
+        .fsck()
+        .setRepositoryFiles({ files: createNodeFilesApi({ rootDir: dir }) })
+        .setCompatibility(compatibility)
+        .call();
+      expect([ours.exitCode, ours.errorOutput, ours.output]).toEqual([
+        128,
+        theirs.stderr,
+        theirs.stdout,
+      ]);
+      writeFileSync(file, before);
+    }
+    // intact again: both pass
+    expect(native(dir, ["fsck", ...noReferences]).status).toBe(0);
+    const clean = await (await openOurs(dir))
+      .fsck()
+      .setRepositoryFiles({ files: createNodeFilesApi({ rootDir: dir }) })
+      .setCompatibility(compatibility)
+      .call();
+    expect(clean.exitCode).toBe(0);
   });
 });

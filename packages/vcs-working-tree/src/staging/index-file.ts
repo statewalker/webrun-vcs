@@ -21,7 +21,7 @@
  * git between our read and our write is refused instead of overwritten.
  */
 import { readFile, type Trees } from "@statewalker/vcs-core";
-import { bytesToHex } from "@statewalker/vcs-utils";
+import { bytesToHex, sha1 } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
 import {
@@ -126,6 +126,13 @@ export interface IndexSettings {
    * a split index such a path's shared entry is deleted and the new entry written whole.
    */
   readded?: ReadonlySet<string>;
+  /**
+   * `index.skipHash` (default `feature.manyFiles`): the index file is written with a null
+   * trailer instead of its SHA-1 (do_write_index's `skip_hash`). A new shared index of a split
+   * index is still hashed: its name and the link's id are that hash (git would write
+   * `sharedindex.0000…` and a link naming no shared index, losing the entries).
+   */
+  skipHash?: boolean;
 }
 
 /**
@@ -216,9 +223,26 @@ export class IndexChangedError extends Error {
 /** Size of the trailing SHA-1 checksum of an index file. */
 const INDEX_CHECKSUM_SIZE = 20;
 
+/** Prefix of the identity of an index whose trailer is null (see {@link indexFileIdentity}). */
+const NULL_TRAILER_IDENTITY = "skiphash:";
+
 /**
- * The trailing checksum of the index at `indexPath` as hex, or `null` when
- * there is no index file. Reads only the last 20 bytes.
+ * What tells one index file's bytes from another's: the trailing checksum as hex, or, for a
+ * null trailer (`index.skipHash`, which every write under that setting has), `skiphash:` and
+ * the SHA-1 of the whole file, since the trailer then says nothing about the content.
+ */
+export async function indexFileIdentity(data: Uint8Array): Promise<string> {
+  const tail = data.subarray(Math.max(0, data.length - INDEX_CHECKSUM_SIZE));
+  if (tail.length === INDEX_CHECKSUM_SIZE && tail.every((b) => b === 0)) {
+    return NULL_TRAILER_IDENTITY + bytesToHex(await sha1(data));
+  }
+  return bytesToHex(tail);
+}
+
+/**
+ * The identity of the index at `indexPath` ({@link indexFileIdentity}: its trailing checksum
+ * as hex), or `null` when there is no index file. Reads only the last 20 bytes, unless they
+ * are null (`index.skipHash`): the whole file is then read and hashed.
  */
 export async function readIndexChecksum(
   files: FilesApi,
@@ -238,6 +262,9 @@ export async function readIndexChecksum(
     tail.set(chunk.subarray(0, n), at);
     at += n;
     if (at === INDEX_CHECKSUM_SIZE) break;
+  }
+  if (at === INDEX_CHECKSUM_SIZE && tail.every((b) => b === 0)) {
+    return indexFileIdentity(await readFile(files, indexPath));
   }
   return bytesToHex(tail.subarray(0, at));
 }
@@ -280,6 +307,8 @@ export interface IndexWriteOptions {
   source?: IndexEncoding;
   /** Called with the entries as encoded in the index written */
   onEncoding?: (encoding: IndexEncoding) => void;
+  /** A null trailer instead of the SHA-1 (`index.skipHash`) */
+  skipHash?: boolean;
 }
 
 const RETRY_DELAY_MS = 20;
@@ -295,7 +324,8 @@ const RETRY_DELAY_MS = 20;
  * await writeIndexFile(files, ".git/index", entries);
  * ```
  *
- * @returns The trailing checksum of the index written, as hex
+ * @returns The identity of the index written: its trailing checksum as hex (see
+ *   `indexFileIdentity` for a null trailer)
  * @throws IndexLockedError when the lock exists (after `lockTimeoutMs`)
  * @throws IndexChangedError when `expectedChecksum` is given and the index differs
  */
@@ -306,13 +336,15 @@ export async function writeIndexFile(
   options: IndexWriteOptions = {},
 ): Promise<string> {
   // validates every path and object id now, before the lock exists
-  const {
-    bytes: content,
-    checksum,
-    encoding,
-  } = await encodeIndexFileBytes(entries, options.version ?? INDEX_VERSION_2, options.extensions, {
-    ...(options.source ? { source: options.source } : {}),
-  });
+  const { bytes: content, encoding } = await encodeIndexFileBytes(
+    entries,
+    options.version ?? INDEX_VERSION_2,
+    options.extensions,
+    {
+      ...(options.source ? { source: options.source } : {}),
+      ...(options.skipHash ? { skipHash: true } : {}),
+    },
+  );
   // the lock is created holding the new index: one exclusive create, then one rename
   const lockPath = `${indexPath}.lock`;
   const atomic = atomicFilesOver(files, "");
@@ -332,7 +364,7 @@ export async function writeIndexFile(
     throw error;
   }
   if (encoding) options.onEncoding?.(encoding);
-  return bytesToHex(checksum);
+  return indexFileIdentity(content);
 }
 
 /**
@@ -574,7 +606,10 @@ export class IndexFile {
       entries,
       this.version,
       extensions,
-      this.encoding ? { source: this.encoding } : {},
+      {
+        ...(this.encoding ? { source: this.encoding } : {}),
+        ...(settings.skipHash ? { skipHash: true } : {}),
+      },
     );
     return { bytes, checksum, encoding, extensions, split: undefined };
   }
@@ -626,10 +661,12 @@ export class IndexFile {
     }
     const sharedId = shared ? shared.id : "0".repeat(40);
     const { items, link } = prepareSplitWrite(classification, sharedId);
-    const main = await encodeIndexInOrder(items, this.version, [
-      { signature: "link", data: link },
-      ...extensions,
-    ]);
+    const main = await encodeIndexInOrder(
+      items,
+      this.version,
+      [{ signature: "link", data: link }, ...extensions],
+      settings.skipHash ? { skipHash: true } : {},
+    );
     const finalShared = shared;
     const finalClassification = classification;
     return {
@@ -728,7 +765,7 @@ export class IndexFile {
         },
       );
       if (kept && (await sparseIndexMatches(kept.entries, entries, trees))) {
-        return this.sparsePlan(kept.entries, kept.cacheTree, tree, rest);
+        return this.sparsePlan(kept.entries, kept.cacheTree, tree, rest, settings.skipHash);
       }
     }
     let fromIndex = true;
@@ -746,7 +783,7 @@ export class IndexFile {
       collapsed = collapseSparseIndex(entries, tree, inCheckout);
       if (!(await sparseIndexMatches(collapsed.entries, entries, trees))) return undefined;
     }
-    return this.sparsePlan(collapsed.entries, collapsed.cacheTree, tree, rest);
+    return this.sparsePlan(collapsed.entries, collapsed.cacheTree, tree, rest, settings.skipHash);
   }
 
   /** The bytes of a sparse index: its entries, its cache-tree, the other extensions, `sdir`. */
@@ -755,6 +792,7 @@ export class IndexFile {
     sparseTree: CacheTree | undefined,
     fullTree: CacheTree | undefined,
     rest: IndexExtension[],
+    skipHash?: boolean,
   ): Promise<IndexWritePlan> {
     const onDisk: IndexExtension[] = [
       ...(sparseTree ? [{ signature: "TREE", data: encodeCacheTree(sparseTree) }] : []),
@@ -765,7 +803,11 @@ export class IndexFile {
       sparseEntries,
       this.version,
       onDisk,
-      { ...(this.encoding ? { source: this.encoding } : {}), sparseDirectories: true },
+      {
+        ...(this.encoding ? { source: this.encoding } : {}),
+        sparseDirectories: true,
+        ...(skipHash ? { skipHash: true } : {}),
+      },
     );
     // in memory the index stays full, with the full index's cache-tree
     const kept: IndexExtension[] = [
@@ -824,7 +866,7 @@ export class IndexFile {
     this.split = decoded.split;
     this.lastEntries = decoded.split ? decoded.entries.slice() : [];
     this.sparseDirs = decoded.sparseDirs;
-    this.checksum = bytesToHex(data.subarray(Math.max(0, data.length - INDEX_CHECKSUM_SIZE)));
+    this.checksum = await indexFileIdentity(data);
     this.version = decoded.version;
     this.extensions = decoded.extensions;
     this.entriesKept = this.extensions.length > 0 ? decoded.entries.slice() : undefined;
@@ -1038,7 +1080,7 @@ export class IndexFile {
     }
     await plan.after?.();
     this.host?.written?.();
-    this.checksum = bytesToHex(plan.checksum);
+    this.checksum = await indexFileIdentity(plan.bytes);
     this.encoding = plan.encoding;
     this.split = plan.split;
     this.lastEntries = plan.split ? entries.slice() : [];
@@ -1109,7 +1151,7 @@ export class IndexFile {
         pending = {
           entries: entries.slice(),
           extensions: plan.extensions,
-          checksum: bytesToHex(plan.checksum),
+          checksum: await indexFileIdentity(plan.bytes),
           encoding: plan.encoding,
           split: plan.split,
           sparseDirs: plan.sparseDirs,
@@ -1163,7 +1205,7 @@ export class IndexFile {
         pending = {
           entries: parsed.entries.slice(),
           extensions: parsed.extensions,
-          checksum: bytesToHex(data.subarray(Math.max(0, data.length - INDEX_CHECKSUM_SIZE))),
+          checksum: await indexFileIdentity(data),
           encoding: parsed.encoding,
           split: parsed.split,
           sparseDirs: parsed.sparseDirs,

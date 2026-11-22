@@ -33,6 +33,7 @@ import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import {
   type CacheTree,
+  IndexCorruptError,
   parseCacheTree,
   parseResolveUndo,
   type ResolveUndoRecord,
@@ -821,7 +822,11 @@ class FsckRun {
     const walkAt = this.findings.length;
     if (snapshot) await this.processSnapshot(snapshot);
     else await this.processRefs();
-    await this.processIndexes();
+    const indexDeath = await this.processIndexes();
+    if (indexDeath) {
+      for (const pack of this.opened.values()) pack?.close();
+      return this.death(indexDeath);
+    }
     if (this.o.connectivityOnly) this.graph = await this.loadCommitGraph();
     if (packed) await this.scanPacks(packed, loose ?? []);
     try {
@@ -2664,12 +2669,17 @@ class FsckRun {
     return logs;
   }
 
-  /** git's index pass: every worktree's index (`fsck_index`). */
-  private async processIndexes(): Promise<void> {
+  /**
+   * git's index pass: every worktree's index (`fsck_index`). Returns git's lines when it dies
+   * reading one (`read_index_from` with `verify_index_checksum`: a wrong trailer, of the index
+   * or its shared index, is `error: bad index file sha1 signature` then `fatal: index file
+   * corrupt`, exit 128).
+   */
+  private async processIndexes(): Promise<readonly string[] | undefined> {
     const files = this.files;
     if (!files) {
       await this.storeIndex();
-      return;
+      return undefined;
     }
     for (const wt of await this.worktrees()) {
       const indexPath = pathOf(wt.dir as string, "index");
@@ -2683,12 +2693,16 @@ class FsckRun {
           trees: this.stores.trees(),
           verifyChecksum: true,
         });
-      } catch {
-        // a sparse directory whose tree is missing: its own entry stands for it
-        read = await readIndexFileEntries(files, indexPath, {
-          gitDir: wt.dir as string,
-          verifyChecksum: true,
-        });
+      } catch (error) {
+        if (error instanceof IndexCorruptError) return error.lines;
+        // a sparse directory whose tree is missing: its own entry stands for it (the index
+        // and its shared index were hashed before the expansion failed)
+        try {
+          read = await readIndexFileEntries(files, indexPath, { gitDir: wt.dir as string });
+        } catch (again) {
+          if (again instanceof IndexCorruptError) return again.lines;
+          throw again;
+        }
       }
       if (!read) continue;
       const parsed = { entries: read.entries, extensionData: read.extensions };
@@ -2706,6 +2720,7 @@ class FsckRun {
       }
       await this.fsckIndex(entries, cacheTree, resolveUndo, indexPath, prefix);
     }
+    return undefined;
   }
 
   /** The staging area of a store without files, as the current worktree's index. */
