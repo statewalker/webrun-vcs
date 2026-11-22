@@ -4,8 +4,11 @@
  * JGit's `IgnoreRuleSpecialCasesTest`, `FastIgnoreRuleTest` and
  * `IgnoreMatcherParametrizedTest` hold several hundred curated (pattern, path) cases:
  * wildcards, classes, escapes, `**`, anchors, directory-only rules, negations. They are
- * extracted into `fixtures/jgit-ignore-cases.json` by `scripts/extract-jgit-ignore-cases.mjs`
- * (JGit, Eclipse Distribution License 1.0). JGit's expected values are not the oracle: for each
+ * extracted into `fixtures/jgit-ignore-cases.json` by `scripts/extract-jgit-ignore-cases.mjs`.
+ * The cases come from Eclipse JGit, under the Eclipse Distribution License v. 1.0
+ * (SPDX-License-Identifier: BSD-3-Clause): Copyright (C) 2008, 2025 Florian Köberle and others;
+ * Copyright (C) 2014, Andrey Loskutov and others; Copyright (C) 2010, Red Hat Inc. and others.
+ * JGit's expected values are not the oracle: for each
  * case a `.gitignore` holding the pattern and the path (a file, or a directory when it ends
  * with `/`) are written to disk, native `git check-ignore --no-index -v` decides, and our
  * `isIgnored` and worktree walk must agree. Where JGit's own expectation differs from git,
