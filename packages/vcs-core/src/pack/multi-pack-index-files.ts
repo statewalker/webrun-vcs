@@ -17,6 +17,15 @@ import {
   parseMultiPackIndex,
 } from "./multi-pack-index.js";
 
+/**
+ * The most layers, and layer bytes in all, of an incremental chain we load (git has no limit). A
+ * crafted served repository could otherwise make every lookup walk tens of thousands of layers,
+ * or hold gigabytes; past either the chain is refused (a recorded warning) and the packs are
+ * searched without it.
+ */
+export const MAX_MIDX_CHAIN_LAYERS = 4096;
+export const MAX_MIDX_CHAIN_BYTES = 2 ** 31;
+
 /** What loading a pack directory's midx gave. */
 export interface LoadedMultiPackIndex {
   /** the midx (the tip layer of a chain), undefined when there is none or it was refused */
@@ -56,11 +65,14 @@ export async function loadMultiPackIndex(
   files: FilesApi,
   packDir: string,
   options: {
-    /** 2.43 does not check the fan-out's order on load */
+    /** 2.43 does not check the fan-out's order on load, and dies on a version 2 file */
     compatibility?: "2.43" | "2.56";
   } = {},
 ): Promise<LoadedMultiPackIndex> {
-  const parseOptions = { checkFanoutOrder: options.compatibility !== "2.43" };
+  const parseOptions = {
+    checkFanoutOrder: options.compatibility !== "2.43",
+    acceptVersion2: options.compatibility !== "2.43",
+  };
   const errors: string[] = [];
   const path = `${packDir}/${MIDX_FILE}`;
   const bytes = await readFile(files, path);
@@ -86,8 +98,15 @@ export async function loadMultiPackIndex(
     return { errors, fileExists };
   }
   const count = Math.floor(chain.length / 41);
+  if (count > MAX_MIDX_CHAIN_LAYERS) {
+    errors.push(
+      `warning: multi-pack-index chain has too many layers (${count} > ${MAX_MIDX_CHAIN_LAYERS}); ignoring it`,
+    );
+    return { errors, fileExists };
+  }
   const lines = new TextDecoder().decode(chain).split("\n");
   let tip: MultiPackIndex | undefined;
+  let chainBytes = 0;
   for (let i = 0; i < count && i < lines.length; i++) {
     const line = lines[i] as string;
     if (!/^[0-9a-f]{40}$/.test(line)) {
@@ -95,6 +114,13 @@ export async function loadMultiPackIndex(
       break;
     }
     const layerPath = `${packDir}/${MIDX_CHAIN_DIR}/multi-pack-index-${line}.midx`;
+    chainBytes += (await files.stats(layerPath))?.size ?? 0;
+    if (chainBytes > MAX_MIDX_CHAIN_BYTES) {
+      errors.push(
+        `warning: multi-pack-index chain layers exceed ${MAX_MIDX_CHAIN_BYTES} bytes; ignoring it`,
+      );
+      return { errors, fileExists };
+    }
     const layer = await readFile(files, layerPath);
     let m: MultiPackIndex | undefined;
     if (layer) {

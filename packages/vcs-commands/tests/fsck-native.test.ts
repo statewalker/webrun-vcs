@@ -1672,4 +1672,56 @@ describeGit("fsck against native git", () => {
       expect(ours.exitCode).toBe(theirs.status);
     }
   });
+  it("a midx pack-int-id out of range: verify's fatal line and fsck's exit code as native", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n" }, "one");
+    g(dir, "repack", "-dq");
+    commitFiles(dir, { a: "a2\n", "d/b": "b\n" }, "two");
+    g(dir, "repack", "-dq");
+    commitFiles(dir, { a: "a3\n" }, "three");
+    g(dir, "repack", "-dq");
+    g(dir, "multi-pack-index", "write");
+    const midx = join(dir, ".git", "objects", "pack", "multi-pack-index");
+    const good = readFileSync(midx);
+    let ooff = -1;
+    for (let k = 0; k < (good[6] as number); k++)
+      if (good.toString("latin1", 12 + 12 * k, 16 + 12 * k) === "OOFF")
+        ooff = good.readUInt32BE(12 + 12 * k + 8);
+    const files = createNodeFilesApi({ rootDir: dir });
+    // every object in turn (the tip, older commits, trees, blobs): git dies where it reads
+    // that object through the midx, else only its multi-pack-index verify child does
+    const objects = g(dir, "cat-file", "--batch-check=%(objectname)", "--batch-all-objects")
+      .split("\n")
+      .filter(Boolean);
+    const theirsRows: unknown[] = [];
+    const oursRows: unknown[] = [];
+    for (let pos = 0; pos < objects.length; pos++) {
+      const bytes = Buffer.from(good);
+      bytes.writeUInt32BE(7, ooff + 8 * pos);
+      createHash("sha1")
+        .update(bytes.subarray(0, bytes.length - 20))
+        .digest()
+        .copy(bytes, bytes.length - 20);
+      chmodSync(midx, 0o644);
+      writeFileSync(midx, bytes);
+      for (const connectivityOnly of [false, true]) {
+        const theirs = native(dir, [
+          "fsck",
+          ...noReferences,
+          ...(connectivityOnly ? ["--connectivity-only"] : []),
+        ]);
+        const ours = await (await openOurs(dir))
+          .fsck()
+          .setRepositoryFiles({ files })
+          .setCompatibility(compatibility)
+          .setConnectivityOnly(connectivityOnly)
+          .call();
+        theirsRows.push([pos, connectivityOnly, theirs.status, theirs.stderr]);
+        oursRows.push([pos, connectivityOnly, ours.exitCode, ours.errorOutput]);
+      }
+    }
+    expect(oursRows).toEqual(theirsRows);
+    // git dies where it reads the object through the midx (exit 128) for some of them
+    expect(theirsRows.some((r) => (r as unknown[])[2] === 128)).toBe(true);
+  });
 });

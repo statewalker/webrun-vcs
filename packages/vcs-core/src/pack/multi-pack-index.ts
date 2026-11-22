@@ -22,6 +22,13 @@
  * (`multi-pack-index.d/multi-pack-index-chain`, 2.5x) links layers through `base`: positions
  * and pack-int-ids of a layer follow those of its bases.
  *
+ * Hardening beyond git (a crafted midx in a served repository must not crash or misdirect us):
+ * PNAM entries must be plain `pack-<hex>.idx` names (git joins them into paths unchecked, so its
+ * `expire` unlinks `../../x.pack`), lookups walk a chain's layers in a loop (no recursion per
+ * layer), `multiPackIndexBitmapPack` refuses an `RIDX` that is not a permutation and `BTMP`
+ * ranges that disagree with it (git reads past its arrays there), and `badPackIntId` finds the
+ * pack-int-id git dies on (`bad pack-int-id`) before a reader uses the file.
+ *
  * `encodeMultiPackIndex` writes git's bytes for given packs (midx-write.c's
  * `write_midx_internal`): entries de-duplicated by preferred pack, then newest pack mtime,
  * then the pack's discovery order; packs named in name order; `RIDX` (and `BTMP` for 2.44+)
@@ -111,6 +118,10 @@ export interface MultiPackIndex {
   packNameAt(id: number): string;
   /** Whether a layer of the chain names the pack (`pack-x.idx` or `pack-x.pack`). */
   containsPack(name: string): boolean;
+  /** The chain position of `id` in this layer alone, -1 when absent. */
+  findInLayer(id: ObjectId): number;
+  /** Whether this layer alone names the pack. */
+  layerContainsPack(name: string): boolean;
   /** Whether the trailing checksum matches the contents (git's `midx_checksum_valid`). */
   checksumValid(): boolean;
   /** This layer's fan-out entry `i` (objects whose first byte is at most `i`). */
@@ -128,6 +139,13 @@ export function cmpIdxOrPackName(idxOrPackName: string, idxName: string): number
 }
 
 const hex32 = (n: number) => n.toString(16);
+
+/**
+ * The PNAM entries we accept: `pack-<hex>.idx`, as git writes them. git takes any name and joins
+ * it into a path (a crafted `../../victim/pack-v.idx` makes its `expire` unlink files outside the
+ * pack directory); we refuse such a midx instead.
+ */
+const PACK_NAME = /^pack-[0-9a-f]+\.idx$/;
 
 /** one decoded id per lookup, reused (lookups are synchronous) */
 const SCRATCH = new Uint8Array(HASH_SIZE);
@@ -183,6 +201,8 @@ export function parseMultiPackIndex(
   options: {
     /** check the fan-out's order on load (2.5x; 2.43 leaves it to `verify`). Default true */
     checkFanoutOrder?: boolean;
+    /** accept version 2 files (2.5x; 2.43 dies on them: "version 2 not recognized"). Default true */
+    acceptVersion2?: boolean;
   } = {},
 ): MultiPackIndex {
   if (bytes.length < HEADER_SIZE + HASH_SIZE)
@@ -195,7 +215,7 @@ export function parseMultiPackIndex(
       true,
     );
   const version = bytes[4] as number;
-  if (version !== 1 && version !== 2)
+  if (version !== 1 && (version !== 2 || options.acceptVersion2 === false))
     throw new MultiPackIndexError(`multi-pack-index version ${version} not recognized`, true);
   const hashVersion = bytes[5] as number;
   if (hashVersion !== 1)
@@ -260,6 +280,10 @@ export function parseMultiPackIndex(
     if (e >= pend)
       throw new MultiPackIndexError("multi-pack-index pack-name chunk is too short", true);
     const name = dec.decode(bytes.subarray(p, e));
+    if (!PACK_NAME.test(name))
+      throw new MultiPackIndexError(
+        `multi-pack-index pack name '${name}' is not a pack index name; ignoring ${path}`,
+      );
     if (version === 1 && i > 0 && name <= (packNames[i - 1] as string))
       throw new MultiPackIndexError(
         `multi-pack-index pack names out of order: '${packNames[i - 1]}' before '${name}'`,
@@ -342,9 +366,20 @@ export function parseMultiPackIndex(
     ...(bitmappedPacks ? { bitmappedPacks } : {}),
     find(id) {
       if (!decodeId(id, SCRATCH)) return -1;
+      // the layers in a loop: a chain of thousands of layers must not grow the stack
+      for (let m: MultiPackIndex | undefined = self; m; m = m.base) {
+        const local = (LAYER_FIND.get(m) as (key: Uint8Array) => number)(SCRATCH);
+        if (local >= 0) return local + m.numObjectsInBase;
+      }
+      return -1;
+    },
+    findInLayer(id) {
+      if (!decodeId(id, SCRATCH)) return -1;
       const local = findLocal(SCRATCH);
-      if (local >= 0) return local + numObjectsInBase;
-      return base ? base.find(id) : -1;
+      return local >= 0 ? local + numObjectsInBase : -1;
+    },
+    layerContainsPack(name) {
+      return layerContains(name);
     },
     idAt(pos) {
       const m = layerOf(pos);
@@ -376,7 +411,9 @@ export function parseMultiPackIndex(
       return m.packNames[id - m.numPacksInBase] as string;
     },
     containsPack(name) {
-      return layerContains(name) || (base?.containsPack(name) ?? false);
+      for (let m: MultiPackIndex | undefined = self; m; m = m.base)
+        if (m.layerContainsPack(name)) return true;
+      return false;
     },
     fanout(i) {
       return view.getUint32(oidf.start + 4 * i);
@@ -388,7 +425,33 @@ export function parseMultiPackIndex(
       return bytesToHex(sum) === checksum;
     },
   };
+  LAYER_FIND.set(self, findLocal);
   return self;
+}
+
+/** each parsed layer's own lookup by decoded id (the chain's `find` walks them in a loop) */
+const LAYER_FIND = new WeakMap<MultiPackIndex, (key: Uint8Array) => number>();
+
+/**
+ * The first pack-int-id of the chain that names no pack of its layer, with git's message
+ * (`bad pack-int-id: N (M total packs)`: git dies when it first reads that object's pack), or
+ * undefined when every id is in range.
+ */
+export function badPackIntId(midx: MultiPackIndex): string | undefined {
+  return badPackIntIdAt(midx)?.message;
+}
+
+/** `badPackIntId` with the chain position of the object whose pack-int-id is out of range. */
+export function badPackIntIdAt(midx: MultiPackIndex): { pos: number; message: string } | undefined {
+  for (let m: MultiPackIndex | undefined = midx; m; m = m.base) {
+    const total = m.numPacks + m.numPacksInBase;
+    for (let i = 0; i < m.numObjects; i++) {
+      const pos = m.numObjectsInBase + i;
+      const id = m.packIntIdAt(pos);
+      if (id >= total) return { pos, message: `bad pack-int-id: ${id} (${total} total packs)` };
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -400,6 +463,7 @@ export function multiPackIndexBitmapPack(midx: MultiPackIndex): BitmapPack {
   const rev = midx.revIndex;
   if (!rev || midx.base)
     throw new MultiPackIndexError(`could not load reverse index for MIDX ${midx.checksum}`);
+  checkBitmapChunks(midx, rev);
   return {
     packId: midx.checksum,
     count: midx.numObjects,
@@ -407,6 +471,38 @@ export function multiPackIndexBitmapPack(midx: MultiPackIndex): BitmapPack {
     idAt: (i) => midx.idAt(i),
     indexOf: (id) => midx.find(id),
   };
+}
+
+/**
+ * What a midx bitmap trusts in `RIDX` and `BTMP`: the reverse index must be a permutation of
+ * the midx positions (git indexes its arrays with these values unchecked and crashes on a
+ * crafted file; we would read ids as ""), and each pack's bitmapped range must lie inside the
+ * pseudo-pack order and hold exactly that pack's objects. Throws `MultiPackIndexError`.
+ */
+function checkBitmapChunks(midx: MultiPackIndex, rev: Uint32Array): void {
+  const n = midx.numObjects;
+  const corrupt = (what: string) =>
+    new MultiPackIndexError(`multi-pack-index ${what} is corrupt; ignoring its bitmap`);
+  if (rev.length !== n) throw corrupt("reverse index (RIDX)");
+  const seen = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const pos = rev[i] as number;
+    if (pos >= n || seen[pos]) throw corrupt("reverse index (RIDX)");
+    seen[pos] = 1;
+  }
+  const btmp = midx.bitmappedPacks;
+  if (!btmp) return;
+  if (btmp.length !== midx.numPacks) throw corrupt("bitmapped packs (BTMP)");
+  let covered = 0;
+  for (let k = 0; k < btmp.length; k++) {
+    const { pos, nr } = btmp[k] as { pos: number; nr: number };
+    if (nr === 0) continue;
+    if (pos + nr > n) throw corrupt("bitmapped packs (BTMP)");
+    for (let i = pos; i < pos + nr; i++)
+      if (midx.packIntIdAt(rev[i] as number) !== k) throw corrupt("bitmapped packs (BTMP)");
+    covered += nr;
+  }
+  if (covered !== n) throw corrupt("bitmapped packs (BTMP)");
 }
 
 /** One pack given to `encodeMultiPackIndex`. */

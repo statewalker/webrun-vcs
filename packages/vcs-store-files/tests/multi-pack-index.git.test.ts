@@ -8,6 +8,7 @@
  * native fsck and `multi-pack-index verify` fail with "failed to load pack in position N".
  */
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   mkdirSync,
@@ -21,7 +22,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DefaultSerializationApi } from "@statewalker/vcs-core";
+import { DefaultSerializationApi, encodeMultiPackIndex, openPack } from "@statewalker/vcs-core";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import {
@@ -710,4 +711,196 @@ describe("midx bitmaps read and served", () => {
     expect(await b.packs.bitmap?.()).toBeUndefined();
     expect(b.packs.bitmapErrors).toEqual(["error: checksum doesn't match in pack and bitmap"]);
   });
+});
+
+/** rewrites a midx's trailing checksum after a test changed its bytes */
+function resumMidx(bytes: Buffer): Buffer {
+  const out = Buffer.from(bytes);
+  createHash("sha1")
+    .update(out.subarray(0, out.length - 20))
+    .digest()
+    .copy(out, out.length - 20);
+  return out;
+}
+
+/** the start of chunk `name` in a midx */
+function midxChunk(bytes: Buffer, name: string): number {
+  for (let k = 0; k < (bytes[6] as number); k++)
+    if (bytes.toString("latin1", 12 + 12 * k, 16 + 12 * k) === name)
+      return bytes.readUInt32BE(12 + 12 * k + 8);
+  throw new Error(`no ${name} chunk`);
+}
+
+describe("midx hardening (review of P4.74)", () => {
+  it("expire deletes nothing while a pack the midx selects objects from is gone (native would)", async () => {
+    const dir = packedRepo(3);
+    git(dir, ["repack", "-aq"]); // a 4th pack holding every object: the midx selects it
+    git(dir, ["multi-pack-index", "write"]);
+    const objects = allObjects(dir);
+    const midx = (await (await backend(dir)).packs.multiPackIndex?.()) as {
+      packNames: readonly string[];
+      numObjects: number;
+      packIntIdAt(pos: number): number;
+    };
+    const selected = midx.packIntIdAt(0);
+    const winner = midx.packNames[selected] as string;
+    const aside = mkdtempSync(join(tmpdir(), "midx-aside-"));
+    dirs.push(aside);
+    for (const ext of [".pack", ".idx", ".rev"]) {
+      const name = winner.replace(/\.idx$/, ext);
+      if (listPack(dir).includes(name)) renameSync(join(packDir(dir), name), join(aside, name));
+    }
+    const before = listPack(dir);
+
+    const r = await multiPackIndexExpire({ files: files(dir), compatibility });
+
+    expect(r.stderr).toEqual([`error: could not load pack ${selected}`]);
+    expect(r.exitCode).toBe(compatibility === "2.43" ? 1 : 255);
+    expect(listPack(dir)).toEqual(before); // the three old packs (the only copies) stay
+    rmSync(midxPath(dir));
+    expect(allObjects(dir)).toEqual(objects);
+  });
+
+  it("expire touches nothing outside the pack directory for a midx naming ../ paths", async () => {
+    const dir = packedRepo(3);
+    const victim = join(dir, "victim");
+    mkdirSync(victim);
+    writeFileSync(join(victim, "pack-v.pack"), "keep me");
+    writeFileSync(join(victim, "pack-v.idx"), "keep me");
+    // a midx of four packs, the last (selecting nothing) named ../../../victim/pack-v.idx
+    const real = packNames(dir, ".idx");
+    const sources = await Promise.all(
+      real.map(async (name) => {
+        const p = await openPack(
+          files(dir),
+          `.git/objects/pack/${name.replace(/\.idx$/, ".pack")}`,
+          `.git/objects/pack/${name}`,
+        );
+        return { name, mtime: 1, count: p.count, idAt: p.idAt, offsetAt: p.offsetAt };
+      }),
+    );
+    const evil = {
+      name: "../../../victim/pack-v.idx",
+      mtime: 0,
+      count: 0,
+      idAt: () => "",
+      offsetAt: () => 0,
+    };
+    writeFileSync(midxPath(dir), encodeMultiPackIndex({ packs: [evil, ...sources] }).bytes);
+    const r = await multiPackIndexExpire({ files: files(dir), compatibility });
+    expect(r.exitCode).toBe(0);
+    expect(r.stderr).toEqual([
+      "error: multi-pack-index pack name '../../../victim/pack-v.idx' is not a pack index name; ignoring .git/objects/pack/multi-pack-index",
+    ]);
+    expect(readdirSync(victim).sort()).toEqual(["pack-v.idx", "pack-v.pack"]);
+    expect(packNames(dir, ".pack").length).toBe(3);
+  });
+
+  it("a pack-int-id out of range: verify dies as native, fsck's exit code, the pack set ignores the midx", async () => {
+    const dir = packedRepo(3);
+    git(dir, ["multi-pack-index", "write"]);
+    const reference = nativeContents(dir);
+    const bytes = readFileSync(midxPath(dir));
+    bytes.writeUInt32BE(7, midxChunk(bytes, "OOFF") + 8 * 2);
+    chmodSync(midxPath(dir), 0o644);
+    writeFileSync(midxPath(dir), resumMidx(bytes));
+
+    const n = gitRun(dir, ["multi-pack-index", "verify"]);
+    const o = await multiPackIndexVerify({ files: files(dir), compatibility });
+    expect(n.err.trimEnd()).toBe("fatal: bad pack-int-id: 7 (3 total packs)");
+    expect(o.stderr.join("\n")).toBe(n.err.trimEnd());
+    expect(o.exitCode).toBe(128);
+    expect(n.status).toBe(128);
+    expect(gitRun(dir, ["fsck", "--no-progress"]).status).toBe(compatibility === "2.43" ? 32 : 1);
+
+    const b = await expectOursReadsAll(dir, reference);
+    expect(await b.packs.multiPackIndex?.()).toBeUndefined();
+    expect(b.packs.midxErrors).toEqual(["fatal: bad pack-int-id: 7 (3 total packs)"]);
+  });
+
+  it("a crafted RIDX: the midx bitmap is refused and the walk answers", async () => {
+    const dir = packedRepo(3);
+    git(dir, ["multi-pack-index", "write", "--bitmap"]);
+    const bytes = readFileSync(midxPath(dir));
+    const ridx = midxChunk(bytes, "RIDX");
+    bytes.writeUInt32BE(bytes.readUInt32BE(ridx), ridx + 4); // a duplicate position
+    const crafted = resumMidx(bytes);
+    // the bitmap is named after the midx checksum: keep it findable under the new one
+    const oldBitmap = midxFiles(dir).find((f) => f.endsWith(".bitmap")) as string;
+    const newSum = crafted.subarray(crafted.length - 20).toString("hex");
+    chmodSync(midxPath(dir), 0o644);
+    writeFileSync(midxPath(dir), crafted);
+    renameSync(
+      join(packDir(dir), oldBitmap),
+      join(packDir(dir), `multi-pack-index-${newSum}.bitmap`),
+    );
+    const b = await backend(dir);
+    expect(await b.packs.multiPackIndex?.()).toBeDefined();
+    expect(await b.packs.bitmap?.()).toBeUndefined();
+    expect(b.packs.bitmapErrors).toEqual([
+      "error: multi-pack-index reverse index (RIDX) is corrupt; ignoring its bitmap",
+    ]);
+    for (const id of allObjects(dir)) expect(await b.packs.has(id)).toBe(true);
+  });
+
+  it.runIf(is25x)(
+    "midx.version=2: native's bytes; 1 rewrites it; others are git's errors",
+    async () => {
+      const dir = packedRepo(3);
+      for (const args of [[], ["--bitmap"]]) {
+        git(dir, ["config", "midx.version", "2"]);
+        const native = nativeMidx(dir, args);
+        expect(native[4]).toBe(2);
+        const r = await multiPackIndexWrite({
+          files: files(dir),
+          compatibility,
+          bitmap: args.length > 0,
+        });
+        expect(r.stderr).toEqual([]);
+        expect(Buffer.from(readFileSync(midxPath(dir))).equals(native)).toBe(true);
+        // the same version: up to date; version 1 asked: rewritten
+        expect(
+          (await multiPackIndexWrite({ files: files(dir), compatibility, bitmap: args.length > 0 }))
+            .written,
+        ).toBeUndefined();
+        git(dir, ["config", "midx.version", "1"]);
+        const again = await multiPackIndexWrite({
+          files: files(dir),
+          compatibility,
+          bitmap: args.length > 0,
+        });
+        expect(again.written).toBeDefined();
+        expect(readFileSync(midxPath(dir))[4]).toBe(1);
+        for (const f of midxFiles(dir)) rmSync(join(packDir(dir), f), { force: true });
+      }
+      for (const value of ["3", "abc"]) {
+        git(dir, ["config", "midx.version", value]);
+        const n = gitRun(dir, ["multi-pack-index", "write"]);
+        const o = await multiPackIndexWrite({ files: files(dir), compatibility });
+        expect(o.stderr.join("\n")).toBe(n.err.trimEnd());
+        expect(o.exitCode).toBe(n.status);
+      }
+    },
+  );
+
+  it.runIf(!is25x)(
+    "2.43 ignores midx.version (version 1) and dies on a version 2 file",
+    async () => {
+      const dir = packedRepo(3);
+      git(dir, ["config", "midx.version", "2"]);
+      const native = nativeMidx(dir);
+      expect(native[4]).toBe(1);
+      const r = await multiPackIndexWrite({ files: files(dir), compatibility });
+      expect(r.stderr).toEqual([]);
+      expect(Buffer.from(readFileSync(midxPath(dir))).equals(native)).toBe(true);
+      const v2 = Buffer.from(native);
+      v2[4] = 2;
+      chmodSync(midxPath(dir), 0o644);
+      writeFileSync(midxPath(dir), resumMidx(v2));
+      const n = gitRun(dir, ["multi-pack-index", "verify"]);
+      const o = await multiPackIndexVerify({ files: files(dir), compatibility });
+      expect(o.stderr.join("\n")).toBe(n.err.trimEnd());
+      expect(o.exitCode).toBe(n.status);
+    },
+  );
 });

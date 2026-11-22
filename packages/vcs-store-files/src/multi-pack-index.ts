@@ -14,10 +14,21 @@
  * readdir order (`listKinds(..., { readdirOrder: true })` where the FilesApi has it), a valid
  * existing midx is reused as git reuses it (its packs first, its entries as packs of mtime 0),
  * and files go through `multi-pack-index.lock`, renamed over the target, then git's
- * `clear_midx_files` removes what the new midx no longer uses.
+ * `clear_midx_files` removes what the new midx no longer uses. `midx.version` (2.5x) picks the
+ * version byte as `write_midx_internal` reads it; 2.43 ignores the key and writes version 1.
+ *
+ * Where we are deliberately safer than git:
+ * - `expire` checks, before its first unlink, that the midx's checksum holds and that every pack
+ *   the midx selects objects from opens. git unlinks the packs selecting nothing first and only
+ *   then finds (in its rewrite) that a pack holding their objects is gone, so a midx left naming a
+ *   deleted pack made it delete the only remaining copies. We refuse instead (`error: could not
+ *   load pack N`, nothing deleted), also under 2.43 compatibility, where git says nothing.
+ * - a write reusing a midx whose pack is gone fails with 2.5x's `error: could not load pack N` under
+ *   2.43 compatibility too: 2.43 exits 0 and leaves the midx naming the missing pack.
  */
 import {
   BitmapClosureError,
+  badPackIntId,
   clearIncrementalMultiPackIndex,
   encodeMultiPackIndex,
   type FilesApi,
@@ -43,6 +54,10 @@ import {
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import { createGitFilesBackend } from "./create-git-files-backend.js";
 import { type BitmapSettings, isPreferredBitmapTip, readBitmapSettings } from "./repack.js";
+import {
+  configFilesApiOf,
+  createWorkingCopyConfig,
+} from "./workspace/working-copy/working-copy-config.files.js";
 
 /** What a `git multi-pack-index` subcommand printed and its exit status. */
 export interface MultiPackIndexCommandResult {
@@ -140,7 +155,8 @@ async function openPackInfo(c: Ctx, idxName: string): Promise<PackInfo | string>
   const base = idxName.slice(0, -4);
   const packPath = `${c.packDir}/${`${base}.pack`}`;
   const idxPath = `${c.packDir}/${idxName}`;
-  const st = await c.files.stats(packPath);
+  // a name the FilesApi refuses (outside its root, say) reads as a pack that is not there
+  const st = await c.files.stats(packPath).catch(() => undefined);
   if (st?.kind !== "file") return `warning: failed to add packfile '${idxPath}'`;
   let pack: PackFile;
   try {
@@ -148,13 +164,15 @@ async function openPackInfo(c: Ctx, idxName: string): Promise<PackInfo | string>
   } catch {
     return `warning: failed to open pack-index '${idxPath}'`;
   }
+  const isFile = async (path: string) =>
+    (await c.files.stats(path).catch(() => undefined))?.kind === "file";
   return {
     name: idxName,
     pack,
     mtime: Math.floor((st.lastModified ?? 0) / 1000),
     size: st.size ?? 0,
-    keep: (await c.files.stats(`${c.packDir}/${`${base}.keep`}`))?.kind === "file",
-    cruft: (await c.files.stats(`${c.packDir}/${`${base}.mtimes`}`))?.kind === "file",
+    keep: await isFile(`${c.packDir}/${`${base}.keep`}`),
+    cruft: await isFile(`${c.packDir}/${`${base}.mtimes`}`),
   };
 }
 
@@ -180,9 +198,13 @@ const stripExt = (name: string, ext: string) =>
   name.endsWith(ext) ? name.slice(0, -ext.length) : name;
 
 /** git's midx_needs_update (2.5x): the midx's packs are exactly `packs`, checksum valid. */
-function midxNeedsUpdate(midx: MultiPackIndex, packs: readonly PackInfo[]): boolean {
+function midxNeedsUpdate(
+  midx: MultiPackIndex,
+  packs: readonly PackInfo[],
+  version: number,
+): boolean {
   if (!midx.checksumValid()) return true;
-  if (midx.version !== 1) return true;
+  if (midx.version !== version) return true;
   if (packs.length !== midx.numPacks + midx.numPacksInBase) return true;
   const names = new Set(packs.map((p) => stripExt(p.name, ".idx")));
   for (let m: MultiPackIndex | undefined = midx; m; m = m.base) {
@@ -282,6 +304,12 @@ async function writeInternal(
     ...(written ? { written } : {}),
   });
 
+  // midx.version (2.5x's write_midx_internal: repo_config_get_int, then 1 or 2 only)
+  const version = c.compatibility === "2.43" ? 1 : await readMidxVersion(c);
+  if (typeof version === "string") {
+    c.stderr.push(version);
+    return done(128);
+  }
   const loaded = await loadMultiPackIndex(c.files, c.packDir, c);
   c.stderr.push(...loaded.errors);
   if (loaded.fatal) return done(128);
@@ -336,7 +364,7 @@ async function writeInternal(
   if (!drop) {
     const midx = reuse ?? loaded.midx;
     // both versions leave an up-to-date midx alone (2.43 and 2.5x alike)
-    const upToDate = midx && !incremental && !midxNeedsUpdate(midx, packs);
+    const upToDate = midx && !incremental && !midxNeedsUpdate(midx, packs, version);
     if (midx && upToDate) {
       const bitmapPath = `${c.packDir}/${`multi-pack-index-${midx.checksum}.bitmap`}`;
       const bitmapExists = (await c.files.stats(bitmapPath))?.kind === "file";
@@ -427,6 +455,7 @@ async function writeInternal(
       ...(preferred !== undefined ? { preferred } : {}),
       revIndex: wantRevIndex,
       bitmappedPacks: c.compatibility === "2.56",
+      version,
       ...(dropped ? { dropped } : {}),
       ...(incremental && base ? { baseObjects: base.numObjects + base.numObjectsInBase } : {}),
     });
@@ -487,6 +516,28 @@ async function writeInternal(
   }
   await clearMidxFilesAfterWrite(c, hashes, incremental);
   return done(0, encoded.checksum);
+}
+
+/**
+ * `midx.version` as git reads it (`repo_config_get_int`: the last value, with k/m/g units): 1 or
+ * 2, else git's fatal line.
+ */
+async function readMidxVersion(c: Ctx): Promise<number | string> {
+  const config = await createWorkingCopyConfig(configFilesApiOf(c.files), c.gitDir);
+  const last = config.getAllWithOrigin("midx.version").at(-1);
+  if (!last) return 1;
+  const value = last.text ?? String(last.value);
+  const m = /^\s*([-+]?\d+)([kmg]?)\s*$/i.exec(value);
+  // git names the file of a value read from one (die_bad_number)
+  const where = last.file ? ` in file ${last.file}` : "";
+  if (!m)
+    return `fatal: bad numeric config value '${value}' for 'midx.version'${where}: invalid unit`;
+  const unit = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[
+    (m[2] as string).toLowerCase() as "" | "k" | "m" | "g"
+  ];
+  const n = Number(m[1]) * unit;
+  if (n !== 1 && n !== 2) return `fatal: unknown MIDX version: ${n}`;
+  return n;
 }
 
 /**
@@ -565,7 +616,9 @@ export async function multiPackIndexVerify(
   }
   const lines = verifyMidxLines(m, await openMidxPacks(c, m), c.compatibility);
   c.stderr.push(...lines);
-  return { exitCode: lines.length ? 1 : 0, stdout: "", stderr: c.stderr };
+  // a pack-int-id out of range: git dies there (`fatal: bad pack-int-id`)
+  const died = lines.at(-1)?.startsWith("fatal: ") ?? false;
+  return { exitCode: died ? 128 : lines.length ? 1 : 0, stdout: "", stderr: c.stderr };
 }
 
 /**
@@ -589,7 +642,10 @@ async function openMidxPacks(
   return out;
 }
 
-/** verify_midx_file's reports, in its order. */
+/**
+ * verify_midx_file's reports, in its order. A pack-int-id out of range ends the list with git's
+ * `fatal: bad pack-int-id: N (M total packs)`, where git dies (`midx_for_pack`).
+ */
 export function verifyMidxLines(
   m: MultiPackIndex,
   packs: readonly ({ pack: PackFile } | { indexUnavailable: string } | undefined)[],
@@ -622,6 +678,11 @@ export function verifyMidxLines(
     }
   }
   const all = m.numObjects + m.numObjectsInBase;
+  const totalPacks = (pos: number) => {
+    let l: MultiPackIndex = m;
+    while (l.base && pos < l.numObjectsInBase) l = l.base;
+    return l.numPacks + l.numPacksInBase;
+  };
   const pairs: { pos: number; pack: number }[] = [];
   for (let i = 0; i < all; i++) pairs.push({ pos: i, pack: m.packIntIdAt(i) });
   // glibc's qsort is a stable merge sort here: positions stay in order within a pack
@@ -629,6 +690,10 @@ export function verifyMidxLines(
   const sorted = head.concat(pairs.slice(m.numObjects));
   for (const { pos, pack } of sorted) {
     const id = m.idAt(pos);
+    if (pack >= totalPacks(pos)) {
+      out.push(`fatal: bad pack-int-id: ${pack} (${totalPacks(pos)} total packs)`);
+      return out;
+    }
     const info = packs[pack];
     if (!info || "indexUnavailable" in info) {
       if (info) out.push(`error: packfile ${info.indexUnavailable} index unavailable`);
@@ -660,16 +725,36 @@ export async function multiPackIndexExpire(
     c.stderr.push("fatal: cannot expire packs from an incremental multi-pack-index");
     return { exitCode: 128, stdout: "", stderr: c.stderr };
   }
+  const bad = badPackIntId(m);
+  if (bad) {
+    c.stderr.push(`fatal: ${bad}`);
+    return { exitCode: 128, stdout: "", stderr: c.stderr };
+  }
   const count = new Uint32Array(m.numPacks);
   for (let i = 0; i < m.numObjects; i++) count[m.packIntIdAt(i)]++;
+  // Everything is checked before the first unlink (git checks nothing here): the checksum, and
+  // that every pack the midx still selects objects from opens. Otherwise the packs selecting
+  // nothing may hold the only copies left (a midx naming a deleted pack), and git's later
+  // rewrite fails only after it has unlinked them. The PNAM names were checked on load.
+  if (!m.checksumValid()) {
+    c.stderr.push("error: multi-pack-index checksum mismatch; not expiring any pack");
+    return { exitCode: failure(c), stdout: "", stderr: c.stderr };
+  }
   const toDrop: string[] = [];
   for (let i = 0; i < m.numPacks; i++) {
-    if (count[i]) continue;
     const info = await openPackInfo(c, m.packNames[i] as string);
+    if (typeof info !== "string") info.pack.close();
+    if (count[i]) {
+      if (typeof info === "string") {
+        c.stderr.push(`error: could not load pack ${i}`);
+        return { exitCode: failure(c), stdout: "", stderr: c.stderr };
+      }
+      continue;
+    }
     if (typeof info === "string" || info.keep || info.cruft) continue;
     toDrop.push(m.packNames[i] as string);
-    await unlinkPack(c, stripExt(m.packNames[i] as string, ".idx"));
   }
+  for (const name of toDrop) await unlinkPack(c, stripExt(name, ".idx"));
   if (toDrop.length === 0) return { exitCode: 0, stdout: "", stderr: c.stderr };
   const result = await writeInternal(c, { ...options, packsToDrop: toDrop });
   return result;
@@ -705,6 +790,11 @@ export async function multiPackIndexRepack(
   if (!m) return { exitCode: 0, stdout: "", stderr: c.stderr };
   if (m.base) {
     c.stderr.push("fatal: cannot repack an incremental multi-pack-index");
+    return { exitCode: 128, stdout: "", stderr: c.stderr };
+  }
+  const bad = badPackIntId(m);
+  if (bad) {
+    c.stderr.push(`fatal: ${bad}`);
     return { exitCode: 128, stdout: "", stderr: c.stderr };
   }
   const infos = await openMidxPacks(c, m);

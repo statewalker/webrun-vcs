@@ -1,4 +1,5 @@
 import {
+  badPackIntIdAt,
   type CommitGraph,
   commitGraphCompatible,
   type FilesApi,
@@ -628,6 +629,8 @@ class FsckRun {
   private promised?: ReadonlySet<string>;
   /** git 2.43's death when the walk first asks about a promisor object (see `run`) */
   private promisorDeathAt?: { at: number; error: PromisorObjectReadError };
+  /** the first midx entry whose pack-int-id is out of range (git dies when it reads it) */
+  private midxBadEntry?: { id: string; line: string };
   /**
    * The commit grafts of `info/grafts` (git's parse_commit_buffer gives a grafted commit those
    * parents, its own not looked up), and what reading them reported, printed when the first
@@ -725,6 +728,9 @@ class FsckRun {
         compatibility: this.o.compatibility,
       });
       if (loaded.fatal) return this.death(loaded.errors);
+      const bad = loaded.midx && badPackIntIdAt(loaded.midx);
+      if (bad && loaded.midx)
+        this.midxBadEntry = { id: loaded.midx.idAt(bad.pos), line: `fatal: ${bad.message}` };
     }
     this.graftFileExists = (await this.graftFileText()) !== undefined;
     this.graftsFile = this.graftFileExists && this.o.graftsAdvice;
@@ -738,6 +744,11 @@ class FsckRun {
     if (this.files) this.packs = await this.listPacks();
     // git 2.45+: the refs are snapshotted before the objects are read
     const snapshot = this.o.compatibility === "2.56" ? await this.snapshotRefs() : undefined;
+    // 2.5x parses each ref's object at the snapshot, through the midx: a tip whose pack-int-id
+    // is out of range dies there
+    const badMidx = this.midxBadEntry;
+    if (snapshot && badMidx && snapshot.some((r) => r.id === badMidx.id))
+      return this.death([badMidx.line]);
 
     /** connectivity-only: each pack's objects by idx position, and the loose ones */
     let packed: Int32Array[] | undefined;
@@ -807,6 +818,7 @@ class FsckRun {
         } as ReadonlySet<string>;
       }
     }
+    const walkAt = this.findings.length;
     if (snapshot) await this.processSnapshot(snapshot);
     else await this.processRefs();
     await this.processIndexes();
@@ -814,6 +826,20 @@ class FsckRun {
     if (packed) await this.scanPacks(packed, loose ?? []);
     try {
       await this.checkConnectivity();
+      // the walk reads through the midx what it parses again (every object but blobs when
+      // connectivity only, else the trees, whose buffers git frees once checked): an object of
+      // a pack-int-id out of range dies there, after the lines printed before the walk
+      if (badMidx) {
+        const n = this.t.lookup(badMidx.id);
+        if (
+          n >= 0 &&
+          this.t.flags(n) & REACHABLE &&
+          (this.o.connectivityOnly ? this.t.type(n) !== OBJ_BLOB : this.t.type(n) === OBJ_TREE)
+        ) {
+          this.findings.length = walkAt;
+          return this.death([badMidx.line]);
+        }
+      }
       await this.verifyCommitGraph();
       // 2.43 checks every pack's bitmap last, --connectivity-only too (ERROR_BITMAP, 0200)
       if (

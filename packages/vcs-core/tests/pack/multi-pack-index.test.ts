@@ -7,13 +7,17 @@ import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { describe, expect, it } from "vitest";
 import { createInMemoryFilesApi } from "../../src/common/files/index.js";
 import {
+  badPackIntId,
   clearMultiPackIndex,
   clearMultiPackIndexNaming,
   cmpIdxOrPackName,
   encodeMultiPackIndex,
   loadMultiPackIndex,
+  MAX_MIDX_CHAIN_LAYERS,
   type MidxPackSource,
+  type MultiPackIndex,
   MultiPackIndexError,
+  multiPackIndexBitmapPack,
   parseMultiPackIndex,
 } from "../../src/pack/index.js";
 
@@ -236,5 +240,109 @@ describe("midx files", () => {
     const left: string[] = [];
     for await (const f of files.list(dir)) left.push(f.name);
     expect(left).toEqual(["pack-aaaa.idx"]);
+  });
+});
+
+/** the start of chunk `name` (4 ASCII letters) in a midx */
+function chunkAt(bytes: Uint8Array, name: string): number {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const want = [...name].reduce((v, ch) => v * 256 + ch.charCodeAt(0), 0);
+  for (let k = 0; k < (bytes[6] as number); k++)
+    if (view.getUint32(12 + 12 * k) === want) return view.getUint32(12 + 12 * k + 8);
+  throw new Error(`no ${name} chunk`);
+}
+
+describe("crafted multi-pack-indexes (served repositories)", () => {
+  it("refuses PNAM entries that are not plain pack-<hex>.idx names", async () => {
+    for (const name of ["../x.idx", "../../../victim/pack-v.idx", "sub/pack-aaaa.idx"]) {
+      const e = encodeMultiPackIndex({ packs: [pack(name, [id(1)], 1)] });
+      expect(() => parseMultiPackIndex(e.bytes, "midx")).toThrow(MultiPackIndexError);
+      const files = createInMemoryFilesApi();
+      await files.write("/objects/pack/multi-pack-index", [e.bytes]);
+      const loaded = await loadMultiPackIndex(files, "/objects/pack");
+      expect(loaded.midx).toBeUndefined();
+      expect(loaded.fatal).toBeUndefined();
+      expect(loaded.errors).toEqual([
+        `error: multi-pack-index pack name '${name}' is not a pack index name; ignoring /objects/pack/multi-pack-index`,
+      ]);
+    }
+  });
+
+  it("a 20,000-layer chain: lookups loop over the layers; the loader refuses it", async () => {
+    const n = 20000;
+    const files = createInMemoryFilesApi();
+    const dir = "/objects/pack";
+    const sums: string[] = [];
+    let tip: MultiPackIndex | undefined;
+    for (let i = 0; i < n; i++) {
+      // empty layers but the first, each naming a pack of its own
+      const e = encodeMultiPackIndex({
+        packs: [pack(`pack-${i.toString(16).padStart(8, "0")}.idx`, i === 0 ? [id(7)] : [], i)],
+      });
+      sums.push(e.checksum);
+      await files.write(`${dir}/multi-pack-index.d/multi-pack-index-${e.checksum}.midx`, [e.bytes]);
+      tip = parseMultiPackIndex(e.bytes, `layer-${i}`, tip);
+    }
+    const m = tip as MultiPackIndex;
+    expect(m.numPacksInBase).toBe(n - 1);
+    expect(m.find(id(7))).toBe(0);
+    expect(m.find(id(8))).toBe(-1);
+    expect(m.containsPack("pack-00000000.pack")).toBe(true);
+    expect(m.containsPack("pack-ffffffff.pack")).toBe(false);
+    expect(m.packNameAt(m.packIntIdAt(0))).toBe("pack-00000000.idx");
+    expect(badPackIntId(m)).toBeUndefined();
+
+    await files.write(`${dir}/multi-pack-index.d/multi-pack-index-chain`, [
+      new TextEncoder().encode(sums.map((s) => `${s}\n`).join("")),
+    ]);
+    const loaded = await loadMultiPackIndex(files, dir);
+    expect(loaded.midx).toBeUndefined();
+    expect(loaded.fatal).toBeUndefined();
+    expect(loaded.errors).toEqual([
+      `warning: multi-pack-index chain has too many layers (${n} > ${MAX_MIDX_CHAIN_LAYERS}); ignoring it`,
+    ]);
+  }, 60_000);
+
+  it("refuses a midx bitmap over a RIDX that is no permutation or BTMP ranges that disagree", () => {
+    const e = encodeMultiPackIndex({
+      packs: [packA, packB],
+      revIndex: true,
+      bitmappedPacks: true,
+    });
+    const good = parseMultiPackIndex(e.bytes, "midx");
+    expect(multiPackIndexBitmapPack(good).count).toBe(4);
+    const craft = (edit: (view: DataView) => void) => {
+      const out = Uint8Array.from(e.bytes);
+      edit(new DataView(out.buffer));
+      return parseMultiPackIndex(resum(out), "midx");
+    };
+    const ridx = chunkAt(e.bytes, "RIDX");
+    const btmp = chunkAt(e.bytes, "BTMP");
+    const bad = [
+      craft((v) => v.setUint32(ridx + 4, v.getUint32(ridx))), // a duplicate
+      craft((v) => v.setUint32(ridx, 1000)), // out of range (git: idAt() would be "")
+      craft((v) => v.setUint32(btmp + 4, 1000)), // a range past the objects
+      craft((v) => v.setUint32(btmp, 1)), // a range holding the other pack's objects
+    ];
+    for (const m of bad) expect(() => multiPackIndexBitmapPack(m)).toThrow(MultiPackIndexError);
+  });
+
+  it("badPackIntId names a pack-int-id past the packs, as git dies on it", () => {
+    const e = encodeMultiPackIndex({ packs: [packA, packB] });
+    const out = Uint8Array.from(e.bytes);
+    new DataView(out.buffer).setUint32(chunkAt(out, "OOFF") + 8, 7);
+    const m = parseMultiPackIndex(resum(out), "midx");
+    expect(badPackIntId(m)).toBe("bad pack-int-id: 7 (2 total packs)");
+    expect(badPackIntId(parseMultiPackIndex(e.bytes, "midx"))).toBeUndefined();
+  });
+
+  it("version 2: read by 2.5x, refused fatally as 2.43 refuses it", async () => {
+    const e = encodeMultiPackIndex({ packs: [packA], version: 2 });
+    const files = createInMemoryFilesApi();
+    await files.write("/p/multi-pack-index", [e.bytes]);
+    expect((await loadMultiPackIndex(files, "/p")).midx?.version).toBe(2);
+    const old = await loadMultiPackIndex(files, "/p", { compatibility: "2.43" });
+    expect(old.midx).toBeUndefined();
+    expect(old.errors).toEqual(["fatal: multi-pack-index version 2 not recognized"]);
   });
 });

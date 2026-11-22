@@ -25,10 +25,12 @@ import {
   PackError,
 } from "./index-pack.js";
 import {
+  badPackIntId,
   MIDX_CHAIN_DIR,
   MIDX_CHAIN_FILE,
   MIDX_FILE,
   type MultiPackIndex,
+  MultiPackIndexError,
   multiPackIndexBitmapPack,
 } from "./multi-pack-index.js";
 import { clearMultiPackIndexNaming, loadMultiPackIndex } from "./multi-pack-index-files.js";
@@ -302,8 +304,12 @@ export async function openPackSet(
       if (sig !== "undefined:undefined:undefined:undefined") {
         const loaded = await loadMultiPackIndex(files, dir);
         errors.push(...loaded.errors);
+        const bad = loaded.midx && badPackIntId(loaded.midx);
         if (loaded.midx && !loaded.midx.checksumValid()) {
           errors.push("warning: ignoring existing multi-pack-index; checksum mismatch");
+        } else if (bad) {
+          // git dies on the first lookup of such an object; we search the packs without it
+          errors.push(`fatal: ${bad}`);
         } else if (loaded.midx) midxLoaded = loaded.midx;
       }
       midxErrors = errors;
@@ -729,7 +735,8 @@ export async function openPackSet(
           index: parsePackBitmap(await readBytes(path), multiPackIndexBitmapPack(m), path),
         };
       } catch (e) {
-        if (!(e instanceof PackBitmapError)) throw e;
+        // a crafted RIDX/BTMP (MultiPackIndexError) refuses the bitmap: the walk answers
+        if (!(e instanceof PackBitmapError) && !(e instanceof MultiPackIndexError)) throw e;
         midxBitmap = { key, error: `error: ${e.message}` };
       }
     }

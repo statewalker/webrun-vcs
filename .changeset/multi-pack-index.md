@@ -35,3 +35,11 @@ packs that stay before anything is removed.
 - vcs-commands: fsck runs `multi-pack-index verify` per source (2.5x after each source's packs,
   object bit; 2.43 last, bit 040), checks the midx bitmap's checksum, and dies on a midx git
   refuses fatally.
+
+Crafted or damaged midxes cannot cost data or crash us: `expire` checks the checksum and that
+every pack still selecting objects opens before it deletes anything (git deletes the only
+copies left when a midx names a missing pack), PNAM entries must be `pack-<hex>.idx` names,
+incremental chains are capped and walked without recursion, a midx bitmap's `RIDX`/`BTMP` are
+checked before use, and a pack-int-id out of range is git's `fatal: bad pack-int-id` in verify
+and fsck while the pack set falls back to the packs; `midx.version=2` writes version 2 files as
+2.5x does.
