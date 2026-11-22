@@ -193,6 +193,11 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
   /**
    * The untracked files of a pathspec stash removed (git adds them and applies the stash's
    * diff in reverse, `git apply --index -R`): each file, then the directories it leaves empty.
+   *
+   * A deliberate divergence under `core.ignorecase`: for `stash push -u -- A` with `A/y.txt`
+   * beside a tracked `a/`, git's `add` stages `a/y.txt` (adjust_dirname_case) and its
+   * reverse apply then fails ("No valid patches in input"), leaving the file on disk and
+   * staged after saving the stash; ours removes the file the stash saved, losing nothing.
    */
   private async removeUntracked(
     scan: IndexScan,

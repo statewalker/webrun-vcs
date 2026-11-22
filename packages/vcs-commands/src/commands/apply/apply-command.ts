@@ -316,8 +316,10 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
     // is read again (refused while this instance holds unwritten edits)
     if (this.index || this.cached) await this.readCurrentIndex();
     // one worktree operation: the attributes files and the configuration read once for every
-    // file the patch converts, not once per file
-    const run = await this.inOneOperation(() => this.run());
+    // file the patch converts, not once per file, and kept as read while it writes (apply.c
+    // converts through convert.c's attribute stack, built on its first check and kept: a
+    // `.gitattributes` the patch adds or changes converts none of the files written with it)
+    const run = await this.inOneOperation(() => this.run(), { keepAttributes: true });
     return {
       exitCode: run.status,
       output: latin1ToText(run.stdout),

@@ -742,11 +742,16 @@ export class AddCommand extends GitCommand<AddResult> {
     const errors: string[] = [];
     const addedSet = new Set<string>();
     // add_to_index's adjust_dirname_case (core.ignorecase): a new file's leading directories
-    // take the index's spelling, built on first use
+    // take the index's spelling, built on first use, without the entries this command
+    // removed before (remove_name_hash drops a directory they leave empty; a dry run,
+    // ADD_CACHE_PRETEND, removes nothing)
     let dirnameCase: IndexDirnameCase | undefined;
     const indexName = (path: string): string => {
       if (!coreBool(this.workingCopy, "ignorecase", false) || !path.includes("/")) return path;
-      dirnameCase ??= new IndexDirnameCase(index.map((group) => group.path));
+      if (!dirnameCase) {
+        dirnameCase = new IndexDirnameCase(index.map((group) => group.path));
+        if (!this.dryRun) for (const gone of removed) dirnameCase.forget(gone);
+      }
       const name = dirnameCase.adjust(path);
       if (!this.dryRun) dirnameCase.note(name);
       return name;

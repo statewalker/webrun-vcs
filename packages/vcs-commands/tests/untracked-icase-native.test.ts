@@ -13,7 +13,6 @@
  * `*.log` ignores beside `T.LOG`, an ignored `n.LOG` (the pattern folds case too),
  * `KEEP.TXT` beside the tracked `keep.txt`, and an untracked directory `U/`.
  */
-import { execFileSync } from "node:child_process";
 import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -151,6 +150,41 @@ describeGit("untracked walks under core.ignorecase: native git's name hashes", (
     });
   }
 
+  // add_files_to_cache runs first: its removals (remove_name_hash) drop a directory they
+  // leave empty from the name hash, so adjust_dirname_case no longer spells a new file by it
+  for (const [label, args, keep] of [
+    ["add -A, the directory emptied", ["-A"], false],
+    ["add ., the directory emptied", ["."], false],
+    ["add -A, the directory partly emptied", ["-A"], true],
+    ["add -n -A, a dry run removing nothing", ["-n", "-A"], false],
+  ] as const) {
+    it(`${label}: a new file's directory is spelled by the index as it stands`, async () => {
+      const theirs = join(root, "theirs");
+      const mine = join(root, "mine");
+      for (const dir of [theirs, mine]) {
+        git(root, ["init", "-q", dir]);
+        git(dir, ["config", "core.ignorecase", "true"]);
+        putFile(dir, "d/x.txt", "x\n");
+        putFile(dir, "d/z.txt", "z\n");
+        git(dir, ["add", "d"]);
+        git(dir, ["commit", "-qm", "init"]);
+        rmSync(join(dir, keep ? "d/x.txt" : "d"), { recursive: true });
+        putFile(dir, "D/y.txt", "y\n");
+      }
+      const dry = (args as readonly string[]).includes("-n");
+      const native = git(theirs, ["add", ...args]);
+      const ours = await openRepo(root, mine, DATES);
+      const result = await ours.add().addFilepattern(".").setDryRun(dry).call();
+      if (dry) {
+        expect(result.output ?? []).toEqual(native.split("\n").filter(Boolean));
+      }
+      expect(git(mine, ["ls-files", "-s"])).toEqual(git(theirs, ["ls-files", "-s"]));
+      if (!dry) {
+        expect(git(theirs, ["ls-files"])).toContain(keep ? "d/y.txt" : "D/y.txt");
+      }
+    });
+  }
+
   for (const [flag, all] of [
     ["-u", false],
     ["-a", true],
@@ -165,6 +199,29 @@ describeGit("untracked walks under core.ignorecase: native git's name hashes", (
       expect(listTree(mine)).toEqual(listTree(theirs));
     });
   }
+
+  // A deliberate divergence: native git saves the stash, then its `git apply --index -R`
+  // fails ("No valid patches in input": the stash's diff names `a/y.txt`, the file is
+  // `A/y.txt`), exit 1 in 2.43 and 128 in 2.5x, leaving `A/y.txt` on disk and `a/y.txt`
+  // staged. Ours removes the file it saved in the stash's untracked tree and succeeds.
+  it("stash push -u -- A: an untracked case variant of a tracked directory is saved and removed", async () => {
+    const { theirs, mine, ours } = await twins();
+    const native = gitRun(root, theirs, ["stash", "push", "-u", "-q", "--", "A"], DATES);
+    expect(native.status).not.toBe(0);
+    expect(native.stderr).toContain("No valid patches in input");
+    expect(listTree(theirs)).toContain("A/y.txt");
+    expect(git(theirs, ["ls-files"])).toContain("a/y.txt");
+
+    await ours.stashCreate().setIncludeUntracked(true).addPath("A").call();
+    const untracked = (dir: string) =>
+      git(dir, ["ls-tree", "-r", "--name-only", "stash@{0}^3"]).split("\n").filter(Boolean);
+    expect(untracked(mine)).toEqual(untracked(theirs));
+    expect(listTree(mine)).not.toContain("A/y.txt");
+    expect(git(mine, ["ls-files"])).not.toContain("y.txt");
+    // native: "AD a/y.txt" (staged under the index's spelling) beside "?? U/"
+    expect(git(theirs, ["status", "--porcelain"])).toBe("AD a/y.txt\n?? U/\n");
+    expect(git(mine, ["status", "--porcelain"])).toBe("?? U/\n");
+  });
 
   it("checkout: an untracked case variant of an index path is in the way of a new file", async () => {
     const { theirs, mine } = await twins();
@@ -196,5 +253,17 @@ describe("IndexDirnameCase (adjust_dirname_case)", () => {
     expect(dirs.adjust("q/z2")).toBe("Q/z2");
     dirs.note("a/C/new.txt");
     expect(dirs.adjust("A/c/D/e")).toBe("a/C/D/e");
+  });
+
+  it("forgets a directory once the entries in it are removed (remove_dir_entry)", () => {
+    const dirs = new IndexDirnameCase(["d/x", "d/z", "D/e/f"]);
+    dirs.forget("d/x");
+    expect(dirs.adjust("D/y")).toBe("d/y");
+    dirs.forget("d/z");
+    // "d/e" still holds "D/e/f", so "d" stays
+    expect(dirs.adjust("D/y")).toBe("d/y");
+    dirs.forget("D/e/f");
+    expect(dirs.adjust("D/y")).toBe("D/y");
+    expect(dirs.adjust("d/E/g")).toBe("d/E/g");
   });
 });

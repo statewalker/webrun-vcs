@@ -15,6 +15,7 @@ import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import {
   type AttributesIndex,
   attributesIndexOfTree,
+  type OperationOptions,
   type WorktreeContentFilter,
 } from "./content-filter.js";
 import { hashCleanedContent, isConvertedMode, smudgeContent } from "./filtered-content.js";
@@ -182,9 +183,9 @@ export class MemoryWorktree implements Worktree {
   }
 
   /** Runs `fn` as one operation of the content filter (its files read once). */
-  batch<T>(fn: () => Promise<T>): Promise<T> {
+  batch<T>(fn: () => Promise<T>, options?: OperationOptions): Promise<T> {
     const filter = this.filter;
-    return filter?.batch ? filter.batch(fn) : fn();
+    return filter?.batch ? filter.batch(fn, options) : fn();
   }
 
   async computeHash(path: string): Promise<ObjectId> {

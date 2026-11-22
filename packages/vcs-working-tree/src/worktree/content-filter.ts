@@ -142,9 +142,22 @@ export interface WorktreeContentFilter {
   /**
    * Runs `fn` as one operation: the configuration and the attributes files are read once
    * for all of it (dropped when it ends), except a `.gitattributes` the worktree changes
-   * meanwhile ({@link noteChanged}). Nested operations join the outer one.
+   * meanwhile ({@link noteChanged}). Nested operations join the outer one; with
+   * `keepAttributes`, the attributes read stay as read until `fn` ends, nested or not.
    */
-  batch?<T>(fn: () => Promise<T>): Promise<T>;
+  batch?<T>(fn: () => Promise<T>, options?: OperationOptions): Promise<T>;
+}
+
+/** How a worktree operation ({@link WorktreeContentFilter.batch}) reads attributes. */
+export interface OperationOptions {
+  /**
+   * The attributes of a directory, once read, are kept while `fn` runs even when the
+   * worktree changes its `.gitattributes` meanwhile (read again once `fn` ends): `git
+   * apply` converts the files it writes through convert.c's attribute stack, built on its
+   * first conversion and kept, so a `.gitattributes` the patch adds does not convert the
+   * files written with it.
+   */
+  keepAttributes?: boolean;
 }
 
 /** Collects an iterable of chunks into one array. */

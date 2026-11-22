@@ -79,25 +79,46 @@ export class AddToIndexError extends Error {
  * dirs.adjust("A/B/new.txt"); // "a/b/new.txt"
  * dirs.adjust("A/C/new.txt"); // "a/C/new.txt"
  * dirs.note("a/C/new.txt"); // later adds see "a/C" too
+ * dirs.forget("a/b/two.txt"); // "a/b" is empty and gone
+ * dirs.adjust("A/B/new.txt"); // "a/B/new.txt"
  * ```
  *
  * Each directory keeps the spelling of the first path that made it, in index order (the
- * hash is built from the entries in order, then grows with each entry added).
+ * hash is built from the entries in order, then grows with each entry added), for as long
+ * as it holds something: as name-hash.c's `dir_entry`, it counts the entries and
+ * directories directly in it, and an entry removed from the index (`forget`) drops each
+ * directory it leaves empty, so a later add spells that directory afresh.
  */
 export class IndexDirnameCase {
-  /** Folded directory → its spelling */
-  private readonly dirs = new Map<string, string>();
+  /** Folded directory → its spelling and how many entries and directories it holds */
+  private readonly dirs = new Map<string, { spelling: string; count: number }>();
 
   constructor(paths: Iterable<string>) {
     for (const path of paths) this.note(path);
   }
 
-  /** Records the leading directories of an entry added to the index. */
+  /** Records the leading directories of an entry added to the index (`hash_dir_entry`). */
   note(path: string): void {
-    for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
+    for (let at = path.lastIndexOf("/"); at > 0; at = path.lastIndexOf("/", at - 1)) {
       const dir = path.slice(0, at);
       const key = foldAsciiCase(dir);
-      if (!this.dirs.has(key)) this.dirs.set(key, dir);
+      const found = this.dirs.get(key);
+      if (found) {
+        found.count++;
+        return;
+      }
+      // a new directory counts in its parent's entry
+      this.dirs.set(key, { spelling: dir, count: 1 });
+    }
+  }
+
+  /** Forgets an entry removed from the index (`remove_dir_entry`). */
+  forget(path: string): void {
+    for (let at = path.lastIndexOf("/"); at > 0; at = path.lastIndexOf("/", at - 1)) {
+      const key = foldAsciiCase(path.slice(0, at));
+      const found = this.dirs.get(key);
+      if (!found || --found.count > 0) return;
+      this.dirs.delete(key);
     }
   }
 
@@ -109,7 +130,7 @@ export class IndexDirnameCase {
     let name = path;
     let start = 0;
     for (let at = name.indexOf("/"); at >= 0; at = name.indexOf("/", at + 1)) {
-      const spelled = this.dirs.get(foldAsciiCase(name.slice(0, at)));
+      const spelled = this.dirs.get(foldAsciiCase(name.slice(0, at)))?.spelling;
       if (spelled === undefined) continue;
       name = name.slice(0, start) + spelled.slice(start, at) + name.slice(at);
       start = at + 1;
