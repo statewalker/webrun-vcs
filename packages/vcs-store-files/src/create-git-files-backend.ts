@@ -42,6 +42,7 @@ import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 import {
   configFilesApiOf,
   createWorkingCopyConfig,
+  type GitWorkingCopyConfig,
 } from "./workspace/working-copy/working-copy-config.files.js";
 
 /**
@@ -218,7 +219,18 @@ export async function createGitFilesBackend(
   });
   const looseOnly = createGitObjects(staging);
   // git's core.deltaBaseCacheLimit (96 MiB when unset) and core.multiPackIndex (default on)
-  const packSettings = await readPackSetSettings(files, gitDir, settingsOptions);
+  // one load of the sequence for the pack and ref store settings (nothing writes the config
+  // in between: a created repository's is written above)
+  const settingsConfig = await createWorkingCopyConfig(
+    configFilesApiOf(files, { readOnly: "reading the store settings never writes the config" }),
+    gitDir,
+    undefined,
+    settingsOptions,
+  );
+  const packSettings = await readPackSetSettings(files, gitDir, {
+    ...settingsOptions,
+    config: settingsConfig,
+  });
   const packs = await openPackSet(files, packDir, {
     externalBase: (id) => looseOnly.get(id),
     freshenMaxAgeMs,
@@ -285,7 +297,7 @@ export async function createGitFilesBackend(
       packs,
       freshenMaxAgeMs,
     });
-  const reflog = await readRefStoreConfig(files, gitDir, settingsOptions);
+  const reflog = readRefStoreConfig(settingsConfig);
   const refStore = createFileRefStore(files, gitDir, {
     atomicFiles: options.atomicFiles,
     refLockTimeoutMs: options.refLockTimeoutMs ?? reflog.refLockTimeoutMs,
@@ -369,20 +381,12 @@ function invalidateOnCompatibilityChange(refs: FileRefStore, commitGraph: Commit
  * lock timeouts core.filesRefLockTimeout and core.packedRefsTimeout (undefined when unset
  * or not an integer: the store's defaults, 100 and 1000 ms).
  */
-async function readRefStoreConfig(
-  files: FilesApi,
-  gitDir: string,
-  options: { includes?: boolean | "files"; environment?: GitHostEnvironment },
-): Promise<{
+function readRefStoreConfig(config: Pick<GitWorkingCopyConfig, "get">): {
   logAllRefUpdates: boolean | "always";
   identity?: { name: string; email: string };
   refLockTimeoutMs?: number;
   packedLockTimeoutMs?: number;
-}> {
-  const config = await createWorkingCopyConfig(configFilesApiOf(files), gitDir, undefined, {
-    ...(options.includes === undefined ? {} : { includes: options.includes }),
-    ...(options.environment ? { environment: options.environment } : {}),
-  });
+} {
   const setting = config.get("core.logAllRefUpdates");
   const logAllRefUpdates =
     typeof setting === "string" && setting.toLowerCase() === "always"

@@ -111,7 +111,8 @@ export function sharedIndexPath(gitDir: string, id: string): string {
 /**
  * Read `sharedindex.<id>` from `gitDir` (else from `indexDir`, the index file's directory, as
  * `read_index_from` falls back to it), checking that its checksum is `id`. The shared index
- * is freshened (its mtime set to now), as git signals that it is in use.
+ * is freshened (its mtime set to now), as git signals that it is in use. `verifyChecksum`
+ * hashes its content too (fsck's `verify_index_checksum`), reading it again even when cached.
  *
  * @throws Error when it is missing or broken (git: `broken index, expect <id> in <path>`)
  */
@@ -120,6 +121,7 @@ export async function readSharedIndex(
   gitDir: string,
   id: string,
   indexDir: string = gitDir,
+  verifyChecksum = false,
 ): Promise<SharedIndex> {
   let path = sharedIndexPath(gitDir, id);
   if ((await files.stats(path))?.kind !== "file") {
@@ -129,10 +131,12 @@ export async function readSharedIndex(
     }
     path = fallback;
   }
-  let shared = sharedCache.get(id);
+  let shared = verifyChecksum ? undefined : sharedCache.get(id);
   if (!shared) {
     const data = await readFile(files, path);
-    const parsed = await parseIndexFile(data, { keepEncoding: true });
+    // read_index_from of the shared index: hashed only in fsck (verify_hdr), its trailer
+    // compared with the link's id below
+    const parsed = await parseIndexFile(data, { keepEncoding: true, verifyChecksum });
     const got = bytesToHex(data.subarray(data.length - 20));
     if (got !== id) throw new Error(`broken index, expect ${id} in ${path}, got ${got}`);
     shared = {

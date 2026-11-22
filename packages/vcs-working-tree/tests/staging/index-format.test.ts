@@ -828,3 +828,21 @@ describe("parseIndexFile: paths checked as their bytes are read", () => {
     expect(parsed.entries.map((e) => e.path).sort()).toEqual([...good].sort());
   });
 });
+
+// read-cache.c verify_hdr: the trailer is hashed only with verify_index_checksum (fsck), and
+// never when it is null (index.skipHash)
+describe("parseIndexFile: the trailing checksum, as git checks it", () => {
+  it("takes a wrong trailer as it is when not asked to verify", async () => {
+    const data = await createMinimalIndex();
+    data[data.length - 1] ^= 0xff;
+    const parsed = await parseIndexFile(data, { verifyChecksum: false });
+    expect(parsed.entries).toHaveLength(0);
+  });
+
+  it("accepts a null trailer (index.skipHash) even when verifying", async () => {
+    const data = await createMinimalIndex();
+    data.fill(0, data.length - 20);
+    const parsed = await parseIndexFile(data, { verifyChecksum: true });
+    expect(parsed.entries).toHaveLength(0);
+  });
+});

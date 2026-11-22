@@ -267,3 +267,78 @@ describe("IndexDirnameCase (adjust_dirname_case)", () => {
     expect(dirs.adjust("d/E/g")).toBe("d/E/g");
   });
 });
+
+// unpack-trees' verify_clean_subdirectory asks read_directory, whose index lookups fold case
+// under core.ignorecase (index_file_exists, directory_exists_in_index_icase): a directory a
+// checkout replaces by a file may hold case variants of its tracked files, which go with it
+describeGit(
+  "checkout replacing a directory under core.ignorecase: verify_clean_subdirectory",
+  () => {
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "untracked-icase-dir-"));
+    });
+    afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+    /** `d/x.txt` and `d/sub/a.txt` on main, a file `d` on `side`, then `extra` put in `d/` */
+    function buildReplaced(dir: string, extra: string[]): void {
+      git(root, ["init", "-q", "-b", "main", dir]);
+      git(dir, ["config", "core.ignorecase", "true"]);
+      putFile(dir, "d/x.txt", "x\n");
+      putFile(dir, "d/sub/a.txt", "a\n");
+      putFile(dir, "k.txt", "k\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "init"]);
+      git(dir, ["checkout", "-q", "-b", "side"]);
+      git(dir, ["rm", "-rq", "d"]);
+      putFile(dir, "d", "file\n");
+      git(dir, ["add", "d"]);
+      git(dir, ["commit", "-qm", "side"]);
+      git(dir, ["checkout", "-q", "main"]);
+      for (const path of extra) putFile(dir, path, `${path}\n`);
+    }
+
+    for (const [label, extra, refused] of [
+      ["a case variant of a tracked file goes with the directory", ["d/X.txt"], false],
+      ["a variant of a tracked directory and file goes too", ["d/SUB/A.TXT"], false],
+      ["both variants at once", ["d/X.TXT", "d/Sub/a.txt"], false],
+      ["a new file in the directory refuses the checkout", ["d/new.txt"], true],
+      ["a new file in a variant of a tracked directory refuses it", ["d/SUB/b.txt"], true],
+      ["a variant beside a new file still refuses it", ["d/X.txt", "d/y.txt"], true],
+    ] as const) {
+      it(label, async () => {
+        const theirs = join(root, "theirs");
+        const mine = join(root, "mine");
+        buildReplaced(theirs, [...extra]);
+        buildReplaced(mine, [...extra]);
+        const native = gitRun(root, theirs, ["checkout", "side"], DATES);
+        expect(native.status !== 0).toBe(refused);
+        if (refused) expect(native.stderr).toContain("would lose untracked files in them");
+        const ours = await openRepo(root, mine, DATES);
+        const result = await ours.checkout().setName("side").call();
+        expect((result.conflicts ?? []).length > 0).toBe(refused);
+        expect(listTree(mine)).toEqual(listTree(theirs));
+        expect(git(mine, ["symbolic-ref", "HEAD"])).toEqual(git(theirs, ["symbolic-ref", "HEAD"]));
+        expect(git(mine, ["ls-files", "-s"])).toEqual(git(theirs, ["ls-files", "-s"]));
+        expect(git(mine, ["status", "--porcelain"])).toEqual(
+          git(theirs, ["status", "--porcelain"]),
+        );
+      });
+    }
+
+    it("without core.ignorecase a case variant refuses the checkout, as in git", async () => {
+      const theirs = join(root, "theirs");
+      const mine = join(root, "mine");
+      for (const dir of [theirs, mine]) {
+        buildReplaced(dir, ["d/X.txt"]);
+        git(dir, ["config", "core.ignorecase", "false"]);
+      }
+      const native = gitRun(root, theirs, ["checkout", "side"], DATES);
+      expect(native.status).not.toBe(0);
+      const ours = await openRepo(root, mine, DATES);
+      const result = await ours.checkout().setName("side").call();
+      expect(result.conflicts ?? []).toEqual(["d"]);
+      expect(listTree(mine)).toEqual(listTree(theirs));
+      expect(listTree(mine)).toContain("d/X.txt");
+    });
+  },
+);

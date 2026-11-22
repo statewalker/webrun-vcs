@@ -2677,13 +2677,18 @@ class FsckRun {
       // a split index merged with its shared index, a sparse index expanded (repo_read_index)
       let read: Awaited<ReturnType<typeof readIndexFileEntries>>;
       try {
+        // fsck alone checks the index's trailing hash (verify_index_checksum)
         read = await readIndexFileEntries(files, indexPath, {
           gitDir: wt.dir as string,
           trees: this.stores.trees(),
+          verifyChecksum: true,
         });
       } catch {
         // a sparse directory whose tree is missing: its own entry stands for it
-        read = await readIndexFileEntries(files, indexPath, { gitDir: wt.dir as string });
+        read = await readIndexFileEntries(files, indexPath, {
+          gitDir: wt.dir as string,
+          verifyChecksum: true,
+        });
       }
       if (!read) continue;
       const parsed = { entries: read.entries, extensionData: read.extensions };

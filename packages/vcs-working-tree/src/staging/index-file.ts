@@ -394,6 +394,11 @@ export class IndexFile {
       defaultTrees?: Pick<Trees, "load" | "store">;
       /** A sparse index's sparse directory entries kept as they are (read only: never written) */
       keepSparseDirectories?: boolean;
+      /**
+       * Check the index's trailing SHA-1 on read, as git's fsck alone does
+       * (`verify_index_checksum`); other reads take the trailer as it is
+       */
+      verifyChecksum?: boolean;
     } = {},
   ) {
     this.host = options.host;
@@ -474,7 +479,10 @@ export class IndexFile {
    *   without trees to expand it from
    */
   private async decode(data: Uint8Array): Promise<DecodedIndex> {
-    const parsed = await parseIndexFile(data, { keepEncoding: true });
+    const parsed = await parseIndexFile(data, {
+      keepEncoding: true,
+      verifyChecksum: this.options.verifyChecksum === true,
+    });
     let linkData: Uint8Array | undefined;
     let sparse = false;
     const others: IndexExtension[] = [];
@@ -494,7 +502,13 @@ export class IndexFile {
       } else {
         const indexDir =
           this.path.lastIndexOf("/") < 0 ? "" : this.path.slice(0, this.path.lastIndexOf("/"));
-        const shared = await readSharedIndex(this.files, this.gitDir, link.baseId, indexDir);
+        const shared = await readSharedIndex(
+          this.files,
+          this.gitDir,
+          link.baseId,
+          indexDir,
+          this.options.verifyChecksum === true,
+        );
         entries = mergeSplitIndex(parsed.entries, link, shared);
         encoding = shared.encoding;
         split = { shared };
@@ -1493,10 +1507,16 @@ export function parseSharedRepository(value: string | undefined): number {
 export async function readIndexFileEntries(
   files: FilesApi,
   indexPath: string,
-  options: { gitDir?: string; trees?: Pick<Trees, "load" | "store"> } = {},
+  options: {
+    gitDir?: string;
+    trees?: Pick<Trees, "load" | "store">;
+    /** Check the trailing SHA-1, as git's fsck does (`verify_index_checksum`) */
+    verifyChecksum?: boolean;
+  } = {},
 ): Promise<{ entries: StagingEntry[]; extensions: readonly IndexExtension[] } | undefined> {
   const file = new IndexFile(files, indexPath, {
     ...(options.gitDir !== undefined ? { gitDir: options.gitDir } : {}),
+    ...(options.verifyChecksum ? { verifyChecksum: true } : {}),
     ...(options.trees ? { defaultTrees: options.trees } : { keepSparseDirectories: true }),
   });
   const read = await file.read();

@@ -1724,4 +1724,33 @@ describeGit("fsck against native git", () => {
     // git dies where it reads the object through the midx (exit 128) for some of them
     expect(theirsRows.some((r) => (r as unknown[])[2] === 128)).toBe(true);
   });
+
+  // read-cache.c verify_hdr hashes the index only under verify_index_checksum, which fsck
+  // alone sets: other commands read an index whose trailer is wrong, fsck refuses it
+  it("an index with a wrong trailer: read by status, refused by fsck", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n", "d/b": "b\n" }, "one");
+    put(dir, "a", "changed\n");
+    const indexFile = join(dir, ".git", "index");
+    flipByte(indexFile, -1);
+    const corrupt = readFileSync(indexFile);
+    const theirs = native(dir, ["fsck", ...noReferences]);
+    expect(theirs.status).toBe(128);
+    expect(theirs.stderr).toContain("bad index file sha1 signature");
+    const files = createNodeFilesApi({ rootDir: dir });
+    await expect(
+      (await openOurs(dir))
+        .fsck()
+        .setRepositoryFiles({ files })
+        .setCompatibility(compatibility)
+        .call(),
+    ).rejects.toThrow(/checksum mismatch/);
+    // status reads it (and, refreshing, writes it anew)
+    const status = native(dir, ["status", "--porcelain"]);
+    expect(status.status).toBe(0);
+    expect(status.stdout).toBe(" M a\n");
+    writeFileSync(indexFile, corrupt);
+    const ours = await (await openOurs(dir)).status().call();
+    expect([...ours.modified]).toEqual(["a"]);
+  });
 });

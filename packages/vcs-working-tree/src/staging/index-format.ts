@@ -128,6 +128,12 @@ export interface ParseIndexOptions {
    * afterwards.
    */
   keepEncoding?: boolean;
+  /**
+   * Check the trailing SHA-1 against the content (default true). git checks it only in
+   * `fsck` (read-cache.c `verify_hdr` with `verify_index_checksum`, set by fsck alone), and
+   * never for a null trailer (`index.skipHash`); index reads elsewhere pass false.
+   */
+  verifyChecksum?: boolean;
 }
 
 /** An index extension as stored: a four-character signature and its payload. */
@@ -175,13 +181,15 @@ export async function parseIndexFile(
   }
   offset += 4;
 
-  // Verify checksum before parsing entries
-  const contentWithoutChecksum = data.subarray(0, data.length - CHECKSUM_SIZE);
-  const storedChecksum = data.subarray(data.length - CHECKSUM_SIZE);
-  const computedChecksum = await sha1(contentWithoutChecksum);
-
-  if (!arraysEqual(storedChecksum, computedChecksum)) {
-    throw new Error("Index file checksum mismatch");
+  // Verify checksum before parsing entries (verify_hdr: a null trailer is index.skipHash's)
+  if (options.verifyChecksum !== false) {
+    const storedChecksum = data.subarray(data.length - CHECKSUM_SIZE);
+    if (storedChecksum.some((b) => b !== 0)) {
+      const computedChecksum = await sha1(data.subarray(0, data.length - CHECKSUM_SIZE));
+      if (!arraysEqual(storedChecksum, computedChecksum)) {
+        throw new Error("Index file checksum mismatch");
+      }
+    }
   }
 
   // Parse entries, in one pass over the bytes (no result object per entry besides the entry)
