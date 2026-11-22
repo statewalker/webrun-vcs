@@ -1,5 +1,95 @@
 # @statewalker/vcs-transport-httpeers
 
+## 0.3.0
+
+### Minor Changes
+
+- c72622c: **httpeers connectors, a server side for `messagePortDuplex`, and a transports guide.**
+  
+  - `@statewalker/vcs-transport-httpeers`: `createHttpeersConnector(options)` registers mesh peers with a `GitTransportRegistry`, so vcs-commands' clone, fetch, pull, push and ls-remote reach them. `httpeers://<peer>/<repo>` (default `mode: "http"`) is smart HTTP over the mesh through `meshRemoteFetch`: a webrun caller to the peer (`call(peer)`, with the membership token, sent only to that peer's origin) or a `fetchImpl` that already reaches peers (`peerUrl`). `httpeers+git://<peer>/<repo>` (`mode: "native"`) is git's native protocol on a stream the host opens (`openStream`, e.g. httpeers-libp2p's `openDuplex`), the token in the stream's open frame. `meshGitDuplexHandler(options)` serves that side, mounted at `HTTPEERS_GIT_DUPLEX_PATH` (`/git`) of httpeers-libp2p's duplex mounts: the token is verified as `meshGitHandler` verifies a request's (a refusal is git's `ERR access denied: …`), then `serveGitConnection` serves the repository the request line names with the same capability rules (`git:read` to fetch; `git:write`, or `git:write-own` inside `refs/peers/<peerId>/*`, to push; receive-pack only with `enableReceivePack`; `daemon.*` never overrides). The stream's proven peer is its only identity (an `access.provenPeer` is ignored). Its `guard(serve, caller, context)` option wraps each authorized stream, e.g. with httpeers-access's `guardStream` to end a revoked member's stream; `MeshCaller.issuedAt` (the token's `iat`) lets a member re-admitted with a newer token through. The peer of an httpeers URL must be letters, digits, `-` or `_` (no `user@`, no `:port`); a `fetchImpl` needs `peerUrl`, which carries the case-sensitive peer id in the path, and a `call` connector addresses its requests to `HTTPEERS_CALL_ORIGIN`. `withMeshToken`/`meshRemoteFetch` take a `scope`: the token goes only to that base URL and below it, and a redirect out of it is refused; the connector pins the token to the repository's URL, as every peer behind one edge shares an origin.
+  - `@statewalker/vcs-transport`: `serveOverPort(port, run, options?)` runs any server (`serveOverDuplex` for a fixed service, `serveGitService`) on one end of a port whose other end is `messagePortDuplex`: the non-deprecated replacement for the server side of `createMessagePortDuplex`. `serveOverPort` and `serveGitOverPort` close their port once the session is over (right away when the client took the whole answer, else `lingerTimeout`, default `DEFAULT_PORT_LINGER_TIMEOUT` = 1 s, after the server settled), which closes the other end of a `MessageChannel` too, so a session nobody closes keeps no worker or Node process alive; their teardown closes the port as well. `messagePortDuplex`'s `close` closes its port (idempotent), and a real `MessagePort`'s `close` event fails a session whose other end went away instead of leaving it waiting. `webrunServerDuplex` takes `onDrained` (the run settled and every byte it wrote was handed on). `createDuplexConnector` aborts a pending `open` when the request's `signal` aborts, as when `connectTimeout` passes. A user guide, `docs/transports.md`, covers choosing a transport, registering connectors with `Git.fromWorkingCopy(workingCopy, { transports })`, client and server examples for HTTP, git://, ssh, MessagePort, WebSocket, libp2p and HTTPeers, and the security notes for serving. `createMessagePortDuplex`, `messagePortFetch` and `messagePortServe` stay deprecated (the integration tests still use them).
+  - `@statewalker/vcs-workspace`: the `duplexRemote` example uses `messagePortDuplex` / `serveOverPort`.
+
+### Patch Changes
+
+- Updated dependencies [09aa062]
+- Updated dependencies [a86d47a]
+- Updated dependencies [d5158af]
+- Updated dependencies [d84c354]
+- Updated dependencies [d84c354]
+- Updated dependencies [05a5cae]
+- Updated dependencies [9517fc9]
+- Updated dependencies [0135cdd]
+- Updated dependencies [1777896]
+- Updated dependencies [1777896]
+- Updated dependencies [20c317e]
+- Updated dependencies [21d6866]
+- Updated dependencies [e1c44ca]
+- Updated dependencies [457680a]
+- Updated dependencies [7f697fd]
+- Updated dependencies [4e839be]
+- Updated dependencies [257e9cf]
+- Updated dependencies [de6af72]
+- Updated dependencies [a8df903]
+- Updated dependencies [0a39cdc]
+- Updated dependencies [57846c3]
+- Updated dependencies [f078ebd]
+- Updated dependencies [5863bf1]
+- Updated dependencies [35239a9]
+- Updated dependencies [32f7288]
+- Updated dependencies [53ecad0]
+- Updated dependencies [bbf5ca1]
+- Updated dependencies [df0147c]
+- Updated dependencies [c72622c]
+- Updated dependencies [54f881d]
+- Updated dependencies [7314646]
+- Updated dependencies [8329312]
+- Updated dependencies [2ce29f8]
+- Updated dependencies [2ce29f8]
+- Updated dependencies [2d0759a]
+- Updated dependencies [c80355f]
+- Updated dependencies [7314646]
+- Updated dependencies [79b57ea]
+- Updated dependencies [c3ee332]
+- Updated dependencies [bd31e0f]
+- Updated dependencies [9e462a8]
+- Updated dependencies [1efa875]
+- Updated dependencies [98be9b5]
+- Updated dependencies [87d6d55]
+- Updated dependencies [af93342]
+- Updated dependencies [d489ee7]
+- Updated dependencies [d489ee7]
+- Updated dependencies [2796b2d]
+- Updated dependencies [7c63add]
+- Updated dependencies [966768c]
+- Updated dependencies [68ef504]
+- Updated dependencies [bd2140b]
+- Updated dependencies [7dc8308]
+- Updated dependencies [979230c]
+- Updated dependencies [979230c]
+- Updated dependencies [9234799]
+- Updated dependencies [32ab2c4]
+- Updated dependencies [68c571d]
+- Updated dependencies [f745816]
+- Updated dependencies [2523eff]
+- Updated dependencies [b7426bc]
+- Updated dependencies [d676bf4]
+- Updated dependencies [65e2515]
+- Updated dependencies [68cedb7]
+- Updated dependencies [f0d8ddd]
+- Updated dependencies [0b1ccae]
+- Updated dependencies [eb5ad83]
+- Updated dependencies [8a603c0]
+- Updated dependencies [b31fadc]
+- Updated dependencies [5558be8]
+- Updated dependencies [c80355f]
+- Updated dependencies [35239a9]
+- Updated dependencies [0798366]
+  - @statewalker/vcs-transport-lfs@0.5.0
+  - @statewalker/vcs-core@0.6.0
+  - @statewalker/vcs-utils@0.6.0
+  - @statewalker/vcs-transport@0.6.0
+
 ## 0.2.0
 
 ### Minor Changes
