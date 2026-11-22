@@ -1,0 +1,4256 @@
+[
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimplePatternCase0",
+    "pattern": "",
+    "path": "",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimplePatternCase1",
+    "pattern": "ab",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimplePatternCase2",
+    "pattern": "ab",
+    "path": "ab",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimplePatternCase3",
+    "pattern": "ab",
+    "path": "ac",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimplePatternCase4",
+    "pattern": "ab",
+    "path": "abc",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleWildcardCase0",
+    "pattern": "?",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleWildCardCase1",
+    "pattern": "??",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleWildCardCase2",
+    "pattern": "??",
+    "path": "ab",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleWildCardCase3",
+    "pattern": "??",
+    "path": "abc",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleStarCase0",
+    "pattern": "*",
+    "path": "",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleStarCase1",
+    "pattern": "*",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleStarCase2",
+    "pattern": "*",
+    "path": "ab",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSimpleStarCase0",
+    "pattern": "a*b",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSimpleStarCase1",
+    "pattern": "a*c",
+    "path": "ac",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSimpleStarCase2",
+    "pattern": "a*c",
+    "path": "ab",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSimpleStarCase3",
+    "pattern": "a*c",
+    "path": "abc",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testManySolutionsCase0",
+    "pattern": "a*a*a",
+    "path": "aaa",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testManySolutionsCase1",
+    "pattern": "a*a*a",
+    "path": "aaaa",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testManySolutionsCase2",
+    "pattern": "a*a*a",
+    "path": "ababa",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testManySolutionsCase3",
+    "pattern": "a*a*a",
+    "path": "aaaaaaaa",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testManySolutionsCase4",
+    "pattern": "a*a*a",
+    "path": "aaaaaaab",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleGroupCase0",
+    "pattern": "[ab]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleGroupCase1",
+    "pattern": "[ab]",
+    "path": "b",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleGroupCase2",
+    "pattern": "[ab]",
+    "path": "ab",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleGroupRangeCase0",
+    "pattern": "[b-d]",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleGroupRangeCase1",
+    "pattern": "[b-d]",
+    "path": "b",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleGroupRangeCase2",
+    "pattern": "[b-d]",
+    "path": "c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleGroupRangeCase3",
+    "pattern": "[b-d]",
+    "path": "d",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleGroupRangeCase4",
+    "pattern": "[b-d]",
+    "path": "e",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testVerySimpleGroupRangeCase5",
+    "pattern": "[b-d]",
+    "path": "-",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testTwoGroupsCase0",
+    "pattern": "[b-d][ab]",
+    "path": "bb",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testTwoGroupsCase1",
+    "pattern": "[b-d][ab]",
+    "path": "ca",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testTwoGroupsCase2",
+    "pattern": "[b-d][ab]",
+    "path": "fa",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testTwoGroupsCase3",
+    "pattern": "[b-d][ab]",
+    "path": "bc",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testTwoRangesInOneGroupCase0",
+    "pattern": "[b-ce-e]",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testTwoRangesInOneGroupCase1",
+    "pattern": "[b-ce-e]",
+    "path": "b",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testTwoRangesInOneGroupCase2",
+    "pattern": "[b-ce-e]",
+    "path": "c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testTwoRangesInOneGroupCase3",
+    "pattern": "[b-ce-e]",
+    "path": "d",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testTwoRangesInOneGroupCase4",
+    "pattern": "[b-ce-e]",
+    "path": "e",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testTwoRangesInOneGroupCase5",
+    "pattern": "[b-ce-e]",
+    "path": "f",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testIncompleteRangesInOneGroupCase0",
+    "pattern": "a[b-]",
+    "path": "ab",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testIncompleteRangesInOneGroupCase1",
+    "pattern": "a[b-]",
+    "path": "ac",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testIncompleteRangesInOneGroupCase2",
+    "pattern": "a[b-]",
+    "path": "a-",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCombinedRangesInOneGroupCase0",
+    "pattern": "[a-c-e]",
+    "path": "b",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCombinedRangesInOneGroupCase1",
+    "pattern": "[a-c-e]",
+    "path": "d",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCombinedRangesInOneGroupCase2",
+    "pattern": "[a-c-e]",
+    "path": "e",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testInversedGroupCase0",
+    "pattern": "[!b-c]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testInversedGroupCase1",
+    "pattern": "[!b-c]",
+    "path": "b",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testInversedGroupCase2",
+    "pattern": "[!b-c]",
+    "path": "c",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testInversedGroupCase3",
+    "pattern": "[!b-c]",
+    "path": "d",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testAlphaGroupCase0",
+    "pattern": "[[:alpha:]]",
+    "path": "d",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testAlphaGroupCase1",
+    "pattern": "[[:alpha:]]",
+    "path": ":",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testAlphaGroupCase2",
+    "pattern": "[[:alpha:]]",
+    "path": "ö",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#test2AlphaGroupsCase0",
+    "pattern": "[[:alpha:]][[:alpha:]]",
+    "path": "aö",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#test2AlphaGroupsCase0",
+    "pattern": "[[:alpha:]][[:alpha:]]",
+    "path": "a1",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testAlnumGroupCase0",
+    "pattern": "[[:alnum:]]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testAlnumGroupCase1",
+    "pattern": "[[:alnum:]]",
+    "path": "1",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testAlnumGroupCase2",
+    "pattern": "[[:alnum:]]",
+    "path": ":",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBlankGroupCase0",
+    "pattern": "[[:blank:]]",
+    "path": " ",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBlankGroupCase1",
+    "pattern": "[[:blank:]]",
+    "path": "\t",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBlankGroupCase2",
+    "pattern": "[[:blank:]]",
+    "path": "\r",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBlankGroupCase3",
+    "pattern": "[[:blank:]]",
+    "path": "\n",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBlankGroupCase4",
+    "pattern": "[[:blank:]]",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCntrlGroupCase0",
+    "pattern": "[[:cntrl:]]",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDigitGroupCase0",
+    "pattern": "[[:digit:]]",
+    "path": "0",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDigitGroupCase1",
+    "pattern": "[[:digit:]]",
+    "path": "5",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDigitGroupCase2",
+    "pattern": "[[:digit:]]",
+    "path": "9",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDigitGroupCase3",
+    "pattern": "[[:digit:]]",
+    "path": "۹",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDigitGroupCase4",
+    "pattern": "[[:digit:]]",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDigitGroupCase5",
+    "pattern": "[[:digit:]]",
+    "path": "]",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testGraphGroupCase0",
+    "pattern": "[[:graph:]]",
+    "path": "]",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testGraphGroupCase1",
+    "pattern": "[[:graph:]]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testGraphGroupCase2",
+    "pattern": "[[:graph:]]",
+    "path": ".",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testGraphGroupCase3",
+    "pattern": "[[:graph:]]",
+    "path": "0",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testGraphGroupCase4",
+    "pattern": "[[:graph:]]",
+    "path": " ",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testGraphGroupCase5",
+    "pattern": "[[:graph:]]",
+    "path": "ö",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testLowerGroupCase0",
+    "pattern": "[[:lower:]]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testLowerGroupCase1",
+    "pattern": "[[:lower:]]",
+    "path": "h",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testLowerGroupCase2",
+    "pattern": "[[:lower:]]",
+    "path": "A",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testLowerGroupCase3",
+    "pattern": "[[:lower:]]",
+    "path": "H",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testLowerGroupCase4",
+    "pattern": "[[:lower:]]",
+    "path": "ä",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testLowerGroupCase5",
+    "pattern": "[[:lower:]]",
+    "path": ".",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPrintGroupCase0",
+    "pattern": "[[:print:]]",
+    "path": "]",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPrintGroupCase1",
+    "pattern": "[[:print:]]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPrintGroupCase2",
+    "pattern": "[[:print:]]",
+    "path": ".",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPrintGroupCase3",
+    "pattern": "[[:print:]]",
+    "path": "0",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPrintGroupCase4",
+    "pattern": "[[:print:]]",
+    "path": " ",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPrintGroupCase5",
+    "pattern": "[[:print:]]",
+    "path": "ö",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPunctGroupCase0",
+    "pattern": "[[:punct:]]",
+    "path": ".",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPunctGroupCase1",
+    "pattern": "[[:punct:]]",
+    "path": "@",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPunctGroupCase2",
+    "pattern": "[[:punct:]]",
+    "path": " ",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPunctGroupCase3",
+    "pattern": "[[:punct:]]",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpaceGroupCase0",
+    "pattern": "[[:space:]]",
+    "path": " ",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpaceGroupCase1",
+    "pattern": "[[:space:]]",
+    "path": "\t",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpaceGroupCase2",
+    "pattern": "[[:space:]]",
+    "path": "\r",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpaceGroupCase3",
+    "pattern": "[[:space:]]",
+    "path": "\n",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpaceGroupCase4",
+    "pattern": "[[:space:]]",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUpperGroupCase0",
+    "pattern": "[[:upper:]]",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUpperGroupCase1",
+    "pattern": "[[:upper:]]",
+    "path": "h",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUpperGroupCase2",
+    "pattern": "[[:upper:]]",
+    "path": "A",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUpperGroupCase3",
+    "pattern": "[[:upper:]]",
+    "path": "H",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUpperGroupCase4",
+    "pattern": "[[:upper:]]",
+    "path": "Ä",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUpperGroupCase5",
+    "pattern": "[[:upper:]]",
+    "path": ".",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testXDigitGroupCase0",
+    "pattern": "[[:xdigit:]]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testXDigitGroupCase1",
+    "pattern": "[[:xdigit:]]",
+    "path": "d",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testXDigitGroupCase2",
+    "pattern": "[[:xdigit:]]",
+    "path": "f",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testXDigitGroupCase3",
+    "pattern": "[[:xdigit:]]",
+    "path": "0",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testXDigitGroupCase4",
+    "pattern": "[[:xdigit:]]",
+    "path": "5",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testXDigitGroupCase5",
+    "pattern": "[[:xdigit:]]",
+    "path": "9",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testXDigitGroupCase6",
+    "pattern": "[[:xdigit:]]",
+    "path": "۹",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testXDigitGroupCase7",
+    "pattern": "[[:xdigit:]]",
+    "path": ".",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testWordGroupCase0",
+    "pattern": "[[:word:]]",
+    "path": "g",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testWordGroupCase1",
+    "pattern": "[[:word:]]",
+    "path": "ö",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testWordGroupCase2",
+    "pattern": "[[:word:]]",
+    "path": "5",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testWordGroupCase3",
+    "pattern": "[[:word:]]",
+    "path": "_",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testWordGroupCase4",
+    "pattern": "[[:word:]]",
+    "path": " ",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testWordGroupCase5",
+    "pattern": "[[:word:]]",
+    "path": ".",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testMixedGroupCase0",
+    "pattern": "[A[:lower:]C3-5]",
+    "path": "A",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testMixedGroupCase1",
+    "pattern": "[A[:lower:]C3-5]",
+    "path": "C",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testMixedGroupCase2",
+    "pattern": "[A[:lower:]C3-5]",
+    "path": "e",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testMixedGroupCase3",
+    "pattern": "[A[:lower:]C3-5]",
+    "path": "3",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testMixedGroupCase4",
+    "pattern": "[A[:lower:]C3-5]",
+    "path": "4",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testMixedGroupCase5",
+    "pattern": "[A[:lower:]C3-5]",
+    "path": "5",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testMixedGroupCase6",
+    "pattern": "[A[:lower:]C3-5]",
+    "path": "B",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testMixedGroupCase7",
+    "pattern": "[A[:lower:]C3-5]",
+    "path": "2",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testMixedGroupCase8",
+    "pattern": "[A[:lower:]C3-5]",
+    "path": "6",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testMixedGroupCase9",
+    "pattern": "[A[:lower:]C3-5]",
+    "path": ".",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpecialGroupCase0",
+    "pattern": "[[]",
+    "path": "[",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpecialGroupCase1",
+    "pattern": "[]]",
+    "path": "]",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpecialGroupCase2",
+    "pattern": "[]a]",
+    "path": "]",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpecialGroupCase3",
+    "pattern": "[a[]",
+    "path": "[",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpecialGroupCase4",
+    "pattern": "[a[]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpecialGroupCase5",
+    "pattern": "[!]]",
+    "path": "]",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpecialGroupCase6",
+    "pattern": "[!]]",
+    "path": "x",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpecialGroupCase7",
+    "pattern": "[:]]",
+    "path": ":]",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpecialGroupCase8",
+    "pattern": "[:]]",
+    "path": ":",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpecialGroupCase9",
+    "pattern": "][",
+    "path": "][",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpecialGroupCase10",
+    "pattern": "[[:]",
+    "path": ":",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testSpecialGroupCase10",
+    "pattern": "[[:]",
+    "path": "[",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUnsupportedGroupCase0",
+    "pattern": "[[=a=]]",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUnsupportedGroupCase0",
+    "pattern": "[[=a=]]",
+    "path": "=",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUnsupportedGroupCase0",
+    "pattern": "[=a=]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUnsupportedGroupCase0",
+    "pattern": "[=a=]",
+    "path": "=",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUnsupportedGroupCase01",
+    "pattern": "[.a.]*[.a.]",
+    "path": "aha",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUnsupportedGroupCase1",
+    "pattern": "[[.a.]]",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUnsupportedGroupCase1",
+    "pattern": "[[.a.]]",
+    "path": ".",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUnsupportedGroupCase1",
+    "pattern": "[.a.]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testUnsupportedGroupCase1",
+    "pattern": "[.a.]",
+    "path": ".",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedBracket1",
+    "pattern": "\\[",
+    "path": "[",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedBracket2",
+    "pattern": "\\[[a]",
+    "path": "[",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedBracket3",
+    "pattern": "\\[[a]",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedBracket4",
+    "pattern": "\\[[a]",
+    "path": "[a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedBracket5",
+    "pattern": "[a\\]]",
+    "path": "]",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedBracket6",
+    "pattern": "[a\\]]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testIgnoredBackslash",
+    "pattern": "a\\b\\c",
+    "path": "abc",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedBackslash",
+    "pattern": "a\\\\b",
+    "path": "a\\b",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedBackslash",
+    "pattern": "a\\\\b\\c",
+    "path": "a\\bc",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedExclamationMark",
+    "pattern": "\\!b!.txt",
+    "path": "!b!.txt",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedExclamationMark",
+    "pattern": "a\\!b!.txt",
+    "path": "a!b!.txt",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedHash",
+    "pattern": "\\#b",
+    "path": "#b",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedHash",
+    "pattern": "a\\#",
+    "path": "a#",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedTrailingSpaces",
+    "pattern": "\\ ",
+    "path": " ",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testEscapedTrailingSpaces",
+    "pattern": "a\\ ",
+    "path": "a ",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testNotEscapingBackslash",
+    "pattern": "\\out",
+    "path": "out",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testNotEscapingBackslash",
+    "pattern": "\\out",
+    "path": "a/out",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testNotEscapingBackslash",
+    "pattern": "c:\\/",
+    "path": "c:/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testNotEscapingBackslash",
+    "pattern": "c:\\/",
+    "path": "a/c:/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testNotEscapingBackslash",
+    "pattern": "c:\\tmp",
+    "path": "c:tmp",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testNotEscapingBackslash",
+    "pattern": "c:\\tmp",
+    "path": "a/c:tmp",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testNotEscapingBackslash",
+    "pattern": "foo\\/bar",
+    "path": "foo/bar",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testNotEscapingBackslash",
+    "pattern": "foo\\/bar\\/",
+    "path": "foo/bar/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testMultipleEscapedCharacters1",
+    "pattern": "\\]a?c\\*\\[d\\?\\]",
+    "path": "]abc*[d?]",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "a\\",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "\\a",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "a/\\",
+    "path": "a/",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "a/b\\",
+    "path": "a/b",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "\\a/b",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "/\\a",
+    "path": "/a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "\\a\\b\\c\\",
+    "path": "abc",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "\\a\\b\\c",
+    "path": "abc",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "/\\a/\\b/\\c\\",
+    "path": "a/b/c",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "/\\a/\\b/\\c",
+    "path": "a/b/c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "/\\a\\/\\b\\/\\c",
+    "path": "a/b/c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "foo\\",
+    "path": "foo",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "foo\\",
+    "path": "foo\\",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "foo\\\\",
+    "path": "foo\\",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "\\/a",
+    "path": "/a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslash",
+    "pattern": "\\/a",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*[\\x]y",
+    "path": "f\\y",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*[\\x]y",
+    "path": "fxy",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*[\\\\x]y",
+    "path": "f\\y",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*[\\\\x]y",
+    "path": "fxy",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*[\\x]y",
+    "path": "foo\\y",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*[\\x]y",
+    "path": "fooxy",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*[\\\\x]y",
+    "path": "foo\\y",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*[\\\\x]y",
+    "path": "fooxy",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*a\\y",
+    "path": "fa\\y",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*a\\y",
+    "path": "fay",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*a\\y",
+    "path": "fooa\\y",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*a\\y",
+    "path": "fooay",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*a\\\\y",
+    "path": "fa\\y",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f*a\\\\y",
+    "path": "fooa\\y",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f\\*y",
+    "path": "fooy",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "f\\*y",
+    "path": "f*y",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBackslashInRegexp",
+    "pattern": "/\\a*A\\/\\b*B\\/\\c*C",
+    "path": "afooA/bfooB/cC",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDollar",
+    "pattern": "$",
+    "path": "$",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDollar",
+    "pattern": "$x",
+    "path": "$x",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDollar",
+    "pattern": "$x",
+    "path": "x$",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDollar",
+    "pattern": "$x",
+    "path": "$",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDollar",
+    "pattern": "$x.*",
+    "path": "$x.a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDollar",
+    "pattern": "*$",
+    "path": "x$",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDollar",
+    "pattern": "*.$",
+    "path": "x.$",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDollar",
+    "pattern": "$*x",
+    "path": "$ax",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDollar",
+    "pattern": "x*$",
+    "path": "xa$",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDollar",
+    "pattern": "x*$",
+    "path": "xa",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testDollar",
+    "pattern": "[a$b]",
+    "path": "$",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCaret",
+    "pattern": "^",
+    "path": "^",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCaret",
+    "pattern": "^x",
+    "path": "^x",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCaret",
+    "pattern": "^x",
+    "path": "x^",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCaret",
+    "pattern": "^x",
+    "path": "^",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCaret",
+    "pattern": "^x.*",
+    "path": "^x.a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCaret",
+    "pattern": "*^",
+    "path": "x^",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCaret",
+    "pattern": "*.^",
+    "path": "x.^",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCaret",
+    "pattern": "x*^",
+    "path": "xa^",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCaret",
+    "pattern": "^*x",
+    "path": "^ax",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCaret",
+    "pattern": "^*x",
+    "path": "ax",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testCaret",
+    "pattern": "[a^b]",
+    "path": "^",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPlus",
+    "pattern": "+",
+    "path": "+",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPlus",
+    "pattern": "+x",
+    "path": "+x",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPlus",
+    "pattern": "+x",
+    "path": "x+",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPlus",
+    "pattern": "+x",
+    "path": "+",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPlus",
+    "pattern": "x+",
+    "path": "xx",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPlus",
+    "pattern": "+x.*",
+    "path": "+x.a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPlus",
+    "pattern": "*+",
+    "path": "x+",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPlus",
+    "pattern": "*.+",
+    "path": "x.+",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPlus",
+    "pattern": "x*+",
+    "path": "xa+",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPlus",
+    "pattern": "+*x",
+    "path": "+ax",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPlus",
+    "pattern": "+*x",
+    "path": "ax",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPlus",
+    "pattern": "[a+b]",
+    "path": "+",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPipe",
+    "pattern": "|",
+    "path": "|",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPipe",
+    "pattern": "|x",
+    "path": "|x",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPipe",
+    "pattern": "|x",
+    "path": "x|",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPipe",
+    "pattern": "|x",
+    "path": "|",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPipe",
+    "pattern": "x|x",
+    "path": "xx",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPipe",
+    "pattern": "x|x.*",
+    "path": "x|x.a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPipe",
+    "pattern": "*|",
+    "path": "x|",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPipe",
+    "pattern": "*.|",
+    "path": "x.|",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPipe",
+    "pattern": "x*|a",
+    "path": "xb|a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPipe",
+    "pattern": "b|*x",
+    "path": "b|ax",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPipe",
+    "pattern": "b|*x",
+    "path": "ax",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testPipe",
+    "pattern": "[a|b]",
+    "path": "|",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBrackets",
+    "pattern": "{}*()",
+    "path": "{}x()",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBrackets",
+    "pattern": "[a{}()b][a{}()b]?[a{}()b][a{}()b]",
+    "path": "{}x()",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBrackets",
+    "pattern": "x*{x}3",
+    "path": "xa{x}3",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBrackets",
+    "pattern": "a*{x}3",
+    "path": "axxx",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBrackets",
+    "pattern": "?",
+    "path": "[",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBrackets",
+    "pattern": "*",
+    "path": "[",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched1",
+    "pattern": "[",
+    "path": "[",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched1",
+    "pattern": "[*",
+    "path": "[",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched1",
+    "pattern": "*[",
+    "path": "[",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched1",
+    "pattern": "*[",
+    "path": "a[",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched1",
+    "pattern": "[a][",
+    "path": "a[",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched1",
+    "pattern": "*[",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched1",
+    "pattern": "[a",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched1",
+    "pattern": "[*",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched1",
+    "pattern": "[*a",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched2",
+    "pattern": "*]",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched2",
+    "pattern": "]a",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched2",
+    "pattern": "]*",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched2",
+    "pattern": "]*a",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched2",
+    "pattern": "]",
+    "path": "]",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched2",
+    "pattern": "]*",
+    "path": "]",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched2",
+    "pattern": "]*",
+    "path": "]a",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched2",
+    "pattern": "*]",
+    "path": "]",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsUnmatched2",
+    "pattern": "*]",
+    "path": "a]",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsRandom",
+    "pattern": "[\\]",
+    "path": "[$0+//r4a\\d]",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsRandom",
+    "pattern": "[:]]sZX]",
+    "path": "[:]]sZX]",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testBracketsRandom",
+    "pattern": "[:]]:]]]",
+    "path": "[:]]:]]]",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testFilePathSimpleCase",
+    "pattern": "a/b",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testFilePathCase0",
+    "pattern": "a*b",
+    "path": "a/b",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testFilePathCase1",
+    "pattern": "a?b",
+    "path": "a/b",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testFilePathCase2",
+    "pattern": "a*b",
+    "path": "a\\b",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreRuleSpecialCasesTest#testFilePathCase3",
+    "pattern": "a?b",
+    "path": "a\\b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "][a]",
+    "path": "]a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]",
+    "path": "b/a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]",
+    "path": "b/a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]",
+    "path": "b/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]",
+    "path": "/a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]",
+    "path": "/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]",
+    "path": "c/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]",
+    "path": "c/b/a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "/[a]",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "/[a]",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "/[a]",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "/[a]",
+    "path": "/a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "/[a]",
+    "path": "/a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "/[a]",
+    "path": "/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]/",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]/",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]/",
+    "path": "/a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "[a]/",
+    "path": "/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "/[a]/",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "/[a]/",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "/[a]/",
+    "path": "/a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimpleCharClass",
+    "pattern": "/[a]/",
+    "path": "/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]",
+    "path": "x",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]",
+    "path": "x/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]",
+    "path": "x/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]",
+    "path": "b/x",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]",
+    "path": "b/x/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]",
+    "path": "b/x/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]",
+    "path": "/x/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]",
+    "path": "/x/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]",
+    "path": "c/x/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]",
+    "path": "c/b/x",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "/[v-z]",
+    "path": "x",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "/[v-z]",
+    "path": "x/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "/[v-z]",
+    "path": "x/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "/[v-z]",
+    "path": "/x",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "/[v-z]",
+    "path": "/x/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "/[v-z]",
+    "path": "/x/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]/",
+    "path": "x/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]/",
+    "path": "x/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]/",
+    "path": "/x/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "[v-z]/",
+    "path": "/x/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "/[v-z]/",
+    "path": "x/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "/[v-z]/",
+    "path": "x/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "/[v-z]/",
+    "path": "/x/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testCharClass",
+    "pattern": "/[v-z]/",
+    "path": "/x/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testTrailingSpaces",
+    "pattern": "a ",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testTrailingSpaces",
+    "pattern": "a/ ",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testTrailingSpaces",
+    "pattern": "a/ ",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testTrailingSpaces",
+    "pattern": "a/\\ ",
+    "path": "a/ ",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testTrailingSpaces",
+    "pattern": "a/\\ ",
+    "path": "a/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testTrailingSpaces",
+    "pattern": "a/\\ ",
+    "path": "a/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testTrailingSpaces",
+    "pattern": "/ ",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDot",
+    "pattern": "*.a",
+    "path": ".a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDot",
+    "pattern": "*.a",
+    "path": "/.a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDot",
+    "pattern": "*.a",
+    "path": "a.a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDot",
+    "pattern": "*.a",
+    "path": "/b.a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDot",
+    "pattern": "*.a",
+    "path": "b.a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDot",
+    "pattern": "*.a",
+    "path": "/a/b.a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDot",
+    "pattern": "*.a",
+    "path": "/b/.a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDotDoNotMatch",
+    "pattern": "*.a",
+    "path": ".ab",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDotDoNotMatch",
+    "pattern": "*.a",
+    "path": "/.ab",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDotDoNotMatch",
+    "pattern": "*.a",
+    "path": "/b.ba",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDotDoNotMatch",
+    "pattern": "*.a",
+    "path": "a.ab",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDotDoNotMatch",
+    "pattern": "*.a",
+    "path": "/b.ab",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDotDoNotMatch",
+    "pattern": "*.a",
+    "path": "b.ab",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDotDoNotMatch",
+    "pattern": "*.a",
+    "path": "/a/b.ab",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsteriskDotDoNotMatch",
+    "pattern": "*.a",
+    "path": "/b/.ab",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "a.*",
+    "path": "a.",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "a.*",
+    "path": "a./",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "a.*",
+    "path": "a.b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "a.*",
+    "path": "b/a.b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "a.*",
+    "path": "b/a.b/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "a.*",
+    "path": "b/a.b/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "a.*",
+    "path": "/a.b/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "a.*",
+    "path": "/a.b/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "a.*",
+    "path": "c/a.b/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "a.*",
+    "path": "c/b/a.b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "/a.*",
+    "path": "a.b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "/a.*",
+    "path": "a.b/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "/a.*",
+    "path": "a.b/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "/a.*",
+    "path": "/a.b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "/a.*",
+    "path": "/a.b/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "/a.*",
+    "path": "/a.b/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "/a.*/b",
+    "path": "a.b/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "/a.*/b",
+    "path": "/a.b/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "/a.*/b",
+    "path": "/a.bc/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testDotAsteriskMatch",
+    "pattern": "/a.*/b",
+    "path": "/a./b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "ab",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "b/ab",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "b/ab/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "b/ab/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "b/abc",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "b/abc/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "b/abc/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "/abc/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "/abc/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "c/abc/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "a*",
+    "path": "c/b/abc",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "/a*",
+    "path": "abc",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "/a*",
+    "path": "abc/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "/a*",
+    "path": "abc/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "/a*",
+    "path": "/abc",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "/a*",
+    "path": "/abc/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "/a*",
+    "path": "/abc/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "/a*/b",
+    "path": "abc/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "/a*/b",
+    "path": "/abc/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "/a*/b",
+    "path": "/abcd/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testAsterisk",
+    "pattern": "/a*/b",
+    "path": "/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "a?",
+    "path": "ab",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "a?",
+    "path": "ab/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "a?",
+    "path": "b/ab",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "a?",
+    "path": "b/ab/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "a?",
+    "path": "b/ab/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "a?",
+    "path": "/ab/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "a?",
+    "path": "/ab/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "a?",
+    "path": "c/ab/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "a?",
+    "path": "c/b/ab",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "/a?",
+    "path": "ab",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "/a?",
+    "path": "ab/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "/a?",
+    "path": "ab/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "/a?",
+    "path": "/ab",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "/a?",
+    "path": "/ab/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "/a?",
+    "path": "/ab/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "/a?/b",
+    "path": "ab/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmark",
+    "pattern": "/a?/b",
+    "path": "/ab/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "a?",
+    "path": "a/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "a?",
+    "path": "abc",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "a?",
+    "path": "abc/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "a?",
+    "path": "b/abc",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "a?",
+    "path": "b/abc/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "a?",
+    "path": "/abc/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "a?",
+    "path": "/abc/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "a?",
+    "path": "c/abc/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "a?",
+    "path": "c/b/abc",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "/a?",
+    "path": "abc",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "/a?",
+    "path": "abc/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "/a?",
+    "path": "abc/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "/a?",
+    "path": "/abc",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "/a?",
+    "path": "/abc/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "/a?",
+    "path": "/abc/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "/a?/b",
+    "path": "abc/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "/a?/b",
+    "path": "/abc/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testQuestionmarkDoNotMatch",
+    "pattern": "/a?/b",
+    "path": "/a/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a",
+    "path": "b/a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a",
+    "path": "b/a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a",
+    "path": "b/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a",
+    "path": "/a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a",
+    "path": "/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a",
+    "path": "c/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a",
+    "path": "c/b/a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "/a",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "/a",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "/a",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "/a",
+    "path": "/a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "/a",
+    "path": "/a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "/a",
+    "path": "/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a/",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a/",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a/",
+    "path": "/a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "a/",
+    "path": "/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "/a/",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "/a/",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "/a/",
+    "path": "/a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatterns",
+    "pattern": "/a/",
+    "path": "/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "abc",
+    "path": "a/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "abc",
+    "path": "a/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "a",
+    "path": "ab",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "a",
+    "path": "ba",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "a",
+    "path": "aa",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "a",
+    "path": "b/ab",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "a",
+    "path": "b/ba",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "a",
+    "path": "b/ba/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "a",
+    "path": "b/ba/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "a",
+    "path": "/aa",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "a",
+    "path": "aa/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "a",
+    "path": "/aa/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "/a",
+    "path": "b/a",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "/a",
+    "path": "/b/a/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "a/",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "a/",
+    "path": "b/a",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "/a/",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "/a/",
+    "path": "/a",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSimplePatternsDoNotMatch",
+    "pattern": "/a/",
+    "path": "b/a",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegments",
+    "pattern": "/a/b",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegments",
+    "pattern": "/a/b",
+    "path": "/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegments",
+    "pattern": "/a/b",
+    "path": "/a/b/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegments",
+    "pattern": "/a/b",
+    "path": "/a/b/c",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegments",
+    "pattern": "a/b",
+    "path": "/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegments",
+    "pattern": "a/b",
+    "path": "/a/b/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegments",
+    "pattern": "a/b",
+    "path": "/a/b/c",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegments",
+    "pattern": "a/b/",
+    "path": "a/b/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegments",
+    "pattern": "a/b/",
+    "path": "/a/b/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegments",
+    "pattern": "a/b/",
+    "path": "/a/b/c",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "a/b",
+    "path": "/a/bb",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "a/b",
+    "path": "/aa/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "a/b",
+    "path": "a/bb",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "a/b",
+    "path": "aa/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "a/b",
+    "path": "c/aa/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "a/b",
+    "path": "c/a/bb",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "a/b/",
+    "path": "/a/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "/a/b/",
+    "path": "/a/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "/a/b",
+    "path": "c/a/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "/a/b/",
+    "path": "c/a/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "/a/b/",
+    "path": "c/a/b/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "a/b",
+    "path": "c/a/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "a/b",
+    "path": "c/a/b/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "a/b",
+    "path": "c/a/b/c",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "a/b/",
+    "path": "c/a/b/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testSegmentsDoNotMatch",
+    "pattern": "a/b/",
+    "path": "c/a/b/c",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/a/b",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/a/b",
+    "path": "c/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/a/b",
+    "path": "c/d/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/**/a/b",
+    "path": "c/d/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "/**/a/b",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "/**/a/b",
+    "path": "c/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "/**/a/b",
+    "path": "c/d/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "/**/**/a/b",
+    "path": "c/d/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "a/b/**",
+    "path": "a/b/c",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "a/b/**",
+    "path": "a/b/c/d/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "a/b/**/**",
+    "path": "a/b/c/d",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/a/**/b",
+    "path": "c/d/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/a/**/b",
+    "path": "c/d/a/e/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/**/a/**/**/b",
+    "path": "c/d/a/e/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "/**/a/**/b",
+    "path": "c/d/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "/**/a/**/b",
+    "path": "c/d/a/e/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "/**/**/a/**/**/b",
+    "path": "c/d/a/e/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "a/**/b",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "a/**/b",
+    "path": "a/c/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "a/**/b",
+    "path": "a/c/d/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "a/**/**/b",
+    "path": "a/c/d/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "a/**/b/**/c",
+    "path": "a/c/b/d/c",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "a/**/**/b/**/**/c",
+    "path": "a/c/b/d/c",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/",
+    "path": "a/b/c",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/**/",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/**/",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/**/",
+    "path": "a/b/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/**/",
+    "path": "a/b/c",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "x/**/",
+    "path": "x/a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "x/**/",
+    "path": "x/a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "x/**/",
+    "path": "x/a/b/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/x/",
+    "path": "a/x/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatch",
+    "pattern": "**/x/",
+    "path": "a/b/x/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "a/**",
+    "path": "a/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "a/b/**",
+    "path": "a/b/",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "a/**",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "a/b/**",
+    "path": "a/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "a/b/**/",
+    "path": "a/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "a/b/**/**",
+    "path": "a/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "**/a/b",
+    "path": "a/c/b",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "!/**/*.zip",
+    "path": "c/a/b.zip",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "!**/*.zip",
+    "path": "c/a/b.zip",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "a/**/b",
+    "path": "a/c/bb",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "**/",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "**/**/",
+    "path": "a",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testWildmatchDoNotMatch",
+    "pattern": "**/x/",
+    "path": "a/b/x",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testPathMatch",
+    "pattern": "**",
+    "path": "a",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testPathMatch",
+    "pattern": "**",
+    "path": "a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testPathMatch",
+    "pattern": "**",
+    "path": "a/b",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testPathMatch",
+    "pattern": "**/",
+    "path": "a/b/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testPathMatch",
+    "pattern": "x/**/",
+    "path": "x/a",
+    "jgit": false
+  },
+  {
+    "source": "FastIgnoreRuleTest#testPathMatch",
+    "pattern": "x/**/",
+    "path": "x/y/a/",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testFileNameWithLineTerminator",
+    "pattern": "a?",
+    "path": "a\r",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testFileNameWithLineTerminator",
+    "pattern": "a?",
+    "path": "dir/a\r",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testFileNameWithLineTerminator",
+    "pattern": "a?",
+    "path": "a\r/file",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testFileNameWithLineTerminator",
+    "pattern": "*a",
+    "path": "\ra",
+    "jgit": true
+  },
+  {
+    "source": "FastIgnoreRuleTest#testFileNameWithLineTerminator",
+    "pattern": "dir/*a*",
+    "path": "dir/\ra\r",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testBasic",
+    "pattern": "/test.stp",
+    "path": "/test.stp",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testBasic",
+    "pattern": "#/test.stp",
+    "path": "/test.stp",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.st?",
+    "path": "/test.stp",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.st?",
+    "path": "/anothertest.stg",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.st?",
+    "path": "/anothertest.st0",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.st?",
+    "path": "/anothertest.sta1",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.st?",
+    "path": "/another/test.sta1",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/*.st?",
+    "path": "/test.stp",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/*.st?",
+    "path": "/anothertest.stg",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/*.st?",
+    "path": "/anothertest.st0",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/*.st?",
+    "path": "/anothertest.sta1",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/*.st?",
+    "path": "/another/test.sta1",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.sta[0-5]",
+    "path": "/test.sta5",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.sta[0-5]",
+    "path": "/test.sta4",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.sta[0-5]",
+    "path": "/test.sta3",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.sta[0-5]",
+    "path": "/test.sta2",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.sta[0-5]",
+    "path": "/test.sta1",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.sta[0-5]",
+    "path": "/test.sta0",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.sta[0-5]",
+    "path": "/anothertest.sta2",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.sta[0-5]",
+    "path": "test.stag",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "*.sta[0-5]",
+    "path": "test.sta6",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/[tv]est.sta[a-d]",
+    "path": "/test.staa",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/[tv]est.sta[a-d]",
+    "path": "/test.stab",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/[tv]est.sta[a-d]",
+    "path": "/test.stac",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/[tv]est.sta[a-d]",
+    "path": "/test.stad",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/[tv]est.sta[a-d]",
+    "path": "/vest.stac",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/[tv]est.sta[a-d]",
+    "path": "test.stae",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/[tv]est.sta[a-d]",
+    "path": "test.sta9",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/src/ne?",
+    "path": "/src/new/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/src/ne?",
+    "path": "/src/new",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/src/ne?",
+    "path": "/src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/src/ne?",
+    "path": "/src/new/a/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "/src/ne?",
+    "path": "/src/new.c",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "ne?",
+    "path": "/src/new/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "ne?",
+    "path": "/src/new",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "ne?",
+    "path": "/src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "ne?",
+    "path": "/src/new/a/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "ne?",
+    "path": "/neb",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testFileNameWildcards",
+    "pattern": "ne?",
+    "path": "/src/new.c",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.st?",
+    "path": "test.stp",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.st?",
+    "path": "anothertest.stg",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.st?",
+    "path": "anothertest.st0",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.st?",
+    "path": "anothertest.sta1",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.st?",
+    "path": "another/test.sta1",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.sta[0-5]",
+    "path": "test.sta5",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.sta[0-5]",
+    "path": "test.sta4",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.sta[0-5]",
+    "path": "test.sta3",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.sta[0-5]",
+    "path": "test.sta2",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.sta[0-5]",
+    "path": "test.sta1",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.sta[0-5]",
+    "path": "test.sta0",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.sta[0-5]",
+    "path": "anothertest.sta2",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.sta[0-5]",
+    "path": "test.stag",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/*.sta[0-5]",
+    "path": "test.sta6",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/[tv]est.sta[a-d]",
+    "path": "test.staa",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/[tv]est.sta[a-d]",
+    "path": "test.stab",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/[tv]est.sta[a-d]",
+    "path": "test.stac",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/[tv]est.sta[a-d]",
+    "path": "test.stad",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/[tv]est.sta[a-d]",
+    "path": "vest.stac",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/src/ne?",
+    "path": "src/new/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/src/ne?",
+    "path": "src/new",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/src/ne?",
+    "path": "src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/src/ne?",
+    "path": "src/new/a/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "/src/ne?",
+    "path": "src/new.c",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "ne?",
+    "path": "src/new/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "ne?",
+    "path": "src/new",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "ne?",
+    "path": "src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "ne?",
+    "path": "src/new/a/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "ne?",
+    "path": "neb",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testTargetWithoutLeadingSlash",
+    "pattern": "ne?",
+    "path": "src/new.c",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/*/*.c",
+    "path": "/file/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/*/*.c",
+    "path": "/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/*/*.c",
+    "path": "/src/new/a.c",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/src/new",
+    "path": "/src/new/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/src/new",
+    "path": "/src/new",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/src/new",
+    "path": "/src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/src/new",
+    "path": "/src/new/a/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/src/new",
+    "path": "/src/new.c",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/src/new/",
+    "path": "/src/new/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/src/new/",
+    "path": "/src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/src/new/",
+    "path": "/src/new/a/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/src/new/",
+    "path": "/src/new",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "/src/new/",
+    "path": "/src/new.c",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "b1",
+    "path": "/src/new/a/b1/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "b1",
+    "path": "/src/new/a/b2/file.c",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "b1",
+    "path": "/src/new/a/bb1/file.c",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testParentDirectoryGitIgnores",
+    "pattern": "b1",
+    "path": "/src/new/a/file.c",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndNoRegex",
+    "pattern": "/src/",
+    "path": "/src/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndNoRegex",
+    "pattern": "/src/",
+    "path": "/src/new",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndNoRegex",
+    "pattern": "/src/",
+    "path": "/src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndNoRegex",
+    "pattern": "/src/",
+    "path": "/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndNoRegex",
+    "pattern": "/src/",
+    "path": "/src",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndNoRegex",
+    "pattern": "/src/",
+    "path": "/srcA/",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex1",
+    "pattern": "a/*/src/",
+    "path": "a/b/src/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex1",
+    "pattern": "a/*/src/",
+    "path": "a/b/src/new",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex1",
+    "pattern": "a/*/src/",
+    "path": "a/b/src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex1",
+    "pattern": "a/*/src/",
+    "path": "a/b/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex1",
+    "pattern": "a/*/src/",
+    "path": "a/b/src",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex1",
+    "pattern": "a/*/src/",
+    "path": "a/b/srcA/",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex2",
+    "pattern": "a/[a-b]/src/",
+    "path": "a/b/src/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex2",
+    "pattern": "a/[a-b]/src/",
+    "path": "a/b/src/new",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex2",
+    "pattern": "a/[a-b]/src/",
+    "path": "a/b/src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex2",
+    "pattern": "a/[a-b]/src/",
+    "path": "a/b/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex2",
+    "pattern": "a/[a-b]/src/",
+    "path": "a/b/src",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex2",
+    "pattern": "a/[a-b]/src/",
+    "path": "a/b/srcA/",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex3",
+    "pattern": "**/src/",
+    "path": "a/b/src/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex3",
+    "pattern": "**/src/",
+    "path": "a/b/src/new",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex3",
+    "pattern": "**/src/",
+    "path": "a/b/src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex3",
+    "pattern": "**/src/",
+    "path": "a/b/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex3",
+    "pattern": "**/src/",
+    "path": "a/b/src",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testDirModeAndRegex3",
+    "pattern": "**/src/",
+    "path": "a/b/srcA/",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "*.stp",
+    "path": "/test.stp",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "*.stp",
+    "path": "/src/test.stp",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "*.stp",
+    "path": "/test.stp1",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "*.stp",
+    "path": "/test.astp",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "src",
+    "path": "/src",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "src",
+    "path": "/src/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "src",
+    "path": "/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "src",
+    "path": "/src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "src",
+    "path": "/new/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "src",
+    "path": "/file/src",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "src/",
+    "path": "/src/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "src/",
+    "path": "/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "src/",
+    "path": "/src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "src/",
+    "path": "/new/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "src/",
+    "path": "/src",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "src/",
+    "path": "/file/src",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?rc",
+    "path": "/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?rc",
+    "path": "/src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?rc",
+    "path": "/new/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?rc",
+    "path": "/file/src",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?rc",
+    "path": "/src/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/src/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/new/src/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/file/src",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/src/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/srb/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/grb/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/new/crb/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/file/3rb",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/xrb/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/3ra/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/5ra/new/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/new/1ra/a.c",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/file/dra",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/era/",
+    "jgit": true
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/crg",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNameOnlyMatches",
+    "pattern": "?r[a-c]",
+    "path": "/cr3",
+    "jgit": false
+  },
+  {
+    "source": "IgnoreMatcherParametrizedTest#testNegation",
+    "pattern": "!/test.stp",
+    "path": "/test.stp",
+    "jgit": true
+  }
+]
