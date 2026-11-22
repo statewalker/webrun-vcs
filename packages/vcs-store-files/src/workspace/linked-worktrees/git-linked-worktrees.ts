@@ -216,12 +216,12 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
 
   private async repositoryConfig(): Promise<GitWorkingCopyConfig> {
     if (!this.config) {
-      this.config = await createWorkingCopyConfig(
-        this.configFiles(),
-        this.commonDir,
-        undefined,
-        this.includeOptions(),
-      );
+      // git's whole sequence (the command line last), as repo_config reads core.bare and
+      // core.logAllRefUpdates
+      this.config = await createWorkingCopyConfig(this.configFiles(), this.commonDir, undefined, {
+        ...this.includeOptions(),
+        ...(this.options.environment ? { environment: this.options.environment } : {}),
+      });
     }
     return this.config;
   }

@@ -155,17 +155,35 @@ export interface GitHostEnvironment {
    * The configuration given on git's command line (`git -c`), as git passes it to its child
    * processes in `$GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` and then
    * `$GIT_CONFIG_PARAMETERS`, in that order; keys canonical (section and variable in lower
-   * case), a value undefined for a key given without `=`. Read with the system and global
-   * files as git's protected configuration (`safe.directory`, `safe.bareRepository`).
+   * case), a value undefined for a key given without `=`. git reads it last, in scope
+   * `command` (`git config --show-origin`: `command line:`), on every config read: the
+   * configuration chain of a working copy, of a submodule (git's `prepare_other_repo_env`
+   * keeps it) and of a repository opened for serving, and the protected configuration
+   * (`safe.directory`, `safe.bareRepository`). The remote side of a local transport never
+   * sees it (`local_repo_env` clears it: `Worktree.openRepository`'s `commandLineConfig:
+   * false`).
    */
   commandLineConfig?: Array<{ key: string; value: string | undefined }>;
   /**
    * The command-line configuration could not be parsed (a bogus `$GIT_CONFIG_PARAMETERS` or
    * `$GIT_CONFIG_COUNT`, a missing `GIT_CONFIG_KEY_<n>`): git's lines, `error: <reason>` and
-   * `fatal: unable to parse command-line config`. git dies at its first config read, so the
-   * protected configuration's readers refuse with it (exit 128).
+   * `fatal: unable to parse command-line config`. git dies at its first config read, so every
+   * config read that includes the command line refuses with it (`CommandLineConfigError`,
+   * exit 128).
    */
   commandLineConfigError?: string;
+  /**
+   * `$GIT_CEILING_DIRECTORIES` as set: a colon-separated list of absolute host paths
+   * repository discovery does not climb to (each canonicalised with {@link realPath} until an
+   * empty entry, relative entries ignored; setup.c's `canonicalize_ceiling_entry`)
+   */
+  ceilingDirectories?: string;
+  /**
+   * `$GIT_DISCOVERY_ACROSS_FILESYSTEM` is true: repository discovery climbs past a file
+   * system boundary (default: it stops where the device id of the FilesApi's `lstat`
+   * changes, "Stopping at filesystem boundary")
+   */
+  discoveryAcrossFilesystem?: boolean;
   /**
    * The home directory of user `name`, for `~name/` in path settings (git's `getpwnam`):
    * undefined when there is no such user (git then dies "failed to expand user dir").
@@ -312,4 +330,37 @@ export function xdgConfigPath(
   if (environment?.xdgConfigHome) return join(join(environment.xdgConfigHome, "git"), name);
   if (environment?.home) return join(join(join(environment.home, ".config"), "git"), name);
   return undefined;
+}
+
+/**
+ * `environment` as git's `local_repo_env` leaves it for the remote side of a local transport
+ * (`git-upload-pack '<path>'`, `git-receive-pack '<path>'` started by `connect.c`): without
+ * the command-line configuration ({@link GitHostEnvironment.commandLineConfig} and its
+ * error), everything else kept. Undefined stays undefined.
+ *
+ * @example
+ * ```typescript
+ * const remote = withoutCommandLineConfig(environment); // `git -c x.y=1 push ../r`: r sees no x.y
+ * ```
+ */
+export function withoutCommandLineConfig<T extends GitHostEnvironment | undefined>(
+  environment: T,
+): T {
+  if (!environment) return environment;
+  if (
+    environment.commandLineConfig === undefined &&
+    environment.commandLineConfigError === undefined
+  ) {
+    return environment;
+  }
+  const proto = Object.getPrototypeOf(environment);
+  if (proto === Object.prototype || proto === null) {
+    const { commandLineConfig: _c, commandLineConfigError: _e, ...rest } = environment;
+    return rest as T;
+  }
+  // a class instance: its methods stay reachable through the prototype chain
+  return Object.create(environment, {
+    commandLineConfig: { value: undefined, enumerable: true },
+    commandLineConfigError: { value: undefined, enumerable: true },
+  }) as T;
 }

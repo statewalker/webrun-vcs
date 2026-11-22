@@ -752,3 +752,22 @@ describe("createServedFetchHandler: a repository another user owns", () => {
     expect((await get(other, "/repo.git/info/refs?service=git-upload-pack")).status).toBe(404);
   });
 });
+
+describe("createServedFetchHandler: command-line config git dies on", () => {
+  it("answers 500 for CommandLineConfigError and ConfigIncludeDepthError", async () => {
+    for (const name of ["CommandLineConfigError", "ConfigIncludeDepthError"]) {
+      const handler = createServedFetchHandler({
+        resolveRepository: async () => {
+          const error = new Error(
+            "error: relative config includes must come from files\nfatal: unable to parse command-line config",
+          );
+          error.name = name;
+          throw error;
+        },
+      });
+      const response = await get(handler, "/repo.git/info/refs?service=git-upload-pack");
+      expect(response.status, name).toBe(500);
+      expect(await response.text(), name).not.toContain("command-line");
+    }
+  });
+});

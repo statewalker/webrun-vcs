@@ -535,9 +535,17 @@ function clientLines(stderr: string, url: string): string[] {
       (l) =>
         l.length > 0 &&
         // the connection's death after a receive-pack that died differs by transport
-        !/hung up|unexpected disconnect|^fatal: the remote end/.test(l),
+        !/hung up|unexpected disconnect|^fatal: the remote end/.test(l) &&
+        !hookWriteRace(l),
     );
 }
+
+/**
+ * A hook receive-pack refused (an unknown version) may or may not still write before
+ * its pipe closes: its `fatal: packet write failed` comes and goes with timing, for
+ * native git and ours alike (t5411 compares only the `remote: error:` lines there).
+ */
+const hookWriteRace = (line: string) => /^(remote: )?fatal: packet write failed/.test(line);
 
 /** The ref lines of a push's report (`To`, ` * `, ` ! `, ...). */
 const refLines = (lines: string[]) =>
@@ -626,7 +634,7 @@ const remoteLinesOf = (messages: string[]) =>
     .replace(/\r/g, "\n")
     .split("\n")
     // progress a client shows only on a terminal
-    .filter((l) => l.length > 0 && !l.startsWith("Checking connectivity"))
+    .filter((l) => l.length > 0 && !l.startsWith("Checking connectivity") && !hookWriteRace(l))
     .map((l) => `remote: ${l}`.trimEnd());
 
 const remoteOnly = (lines: string[]) =>

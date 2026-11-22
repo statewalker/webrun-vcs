@@ -482,6 +482,17 @@ export interface OpenRepositoryOptions {
   checkOwnership?: boolean;
   /** The rules of this git version where the ownership checks differ (default 2.56) */
   compatibility?: "2.43" | "2.56";
+  /**
+   * Whether the worktree environment's command-line configuration
+   * (`GitHostEnvironment.commandLineConfig`, `git -c`) applies to the repository opened:
+   * its config reads, its ownership check (`safe.directory`) and the stores opened with it
+   * (default true, as in a server process: git's http-backend, receive-pack and
+   * upload-pack read the `-c` they were started with). False for the remote side of a
+   * local transport, which git starts with `local_repo_env` cleared (`git -c x=1 push
+   * ../r`: r's receive-pack sees no `x`); {@link OpenedRepository.checkOwnership}'s
+   * `gitDirOnly` check (clone's own copy of the objects) still reads it.
+   */
+  commandLineConfig?: boolean;
 }
 
 /** A repository {@link Worktree.openRepository} opened. */
@@ -527,7 +538,7 @@ export interface OpenedRepositoryConfig {
   list(): Array<{ key: string; value: string | null }>;
   /**
    * Every entry in the order git reads them with where it was read: the file and line (for
-   * git's `bad config variable` messages) and the file's scope (`local`, `global`, ...)
+   * git's `bad config variable` messages) and the file's scope (`local`, `global`, ..., `command` for the command line, whose own values have no file)
    */
   listWithOrigin?(): Array<{
     key: string;

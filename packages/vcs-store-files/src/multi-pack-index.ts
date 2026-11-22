@@ -52,6 +52,7 @@ import {
   writePackBitmap,
 } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
+import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "./create-git-files-backend.js";
 import { type BitmapSettings, isPreferredBitmapTip, readBitmapSettings } from "./repack.js";
 import {
@@ -77,6 +78,12 @@ export interface MultiPackIndexOptions {
   objectsDir?: string;
   /** whose behaviour to follow where versions differ (default 2.56) */
   compatibility?: "2.43" | "2.56";
+  /**
+   * The user's environment: `midx.version` and the bitmap settings come from git's whole
+   * sequence (system, global, the repository's, `config.worktree`, the command line, so
+   * `git -c midx.version=2 multi-pack-index write`); absent, the repository's file alone
+   */
+  environment?: GitHostEnvironment;
 }
 
 export interface MultiPackIndexWriteOptions extends MultiPackIndexOptions {
@@ -105,6 +112,7 @@ interface Ctx {
   packDir: string;
   compatibility: "2.43" | "2.56";
   stderr: string[];
+  environment?: GitHostEnvironment;
 }
 
 const failure = (c: Ctx) => (c.compatibility === "2.43" ? 1 : 255);
@@ -118,6 +126,7 @@ function ctxOf(options: MultiPackIndexOptions): Ctx {
     packDir: `${(options.objectsDir ?? `${gitDir}/objects`).replace(/\/+$/, "")}/pack`,
     compatibility: options.compatibility ?? "2.56",
     stderr: [],
+    ...(options.environment ? { environment: options.environment } : {}),
   };
 }
 
@@ -523,7 +532,9 @@ async function writeInternal(
  * 2, else git's fatal line.
  */
 async function readMidxVersion(c: Ctx): Promise<number | string> {
-  const config = await createWorkingCopyConfig(configFilesApiOf(c.files), c.gitDir);
+  const config = await createWorkingCopyConfig(configFilesApiOf(c.files), c.gitDir, undefined, {
+    ...(c.environment ? { environment: c.environment } : {}),
+  });
   const last = config.getAllWithOrigin("midx.version").at(-1);
   if (!last) return 1;
   const value = last.text ?? String(last.value);
@@ -550,10 +561,19 @@ async function writeMidxBitmap(
   midx: MultiPackIndex,
   given?: Partial<BitmapSettings>,
 ): Promise<void> {
-  const backend = await createGitFilesBackend({ files: c.files, gitDir: c.gitDir });
+  const backend = await createGitFilesBackend({
+    files: c.files,
+    gitDir: c.gitDir,
+    ...(c.environment ? { environment: c.environment } : {}),
+  });
   const objects = objectsWithoutLazyFetch(backend.objects);
   const refs = backend.history.refs;
-  const settings = { ...(await readBitmapSettings(c.files, c.gitDir)), ...given };
+  const settings = {
+    ...(await readBitmapSettings(c.files, c.gitDir, {
+      ...(c.environment ? { environment: c.environment } : {}),
+    })),
+    ...given,
+  };
   const wants: ObjectId[] = [];
   const preferred: ObjectId[] = [];
   for await (const ref of refs.list()) {
@@ -835,7 +855,11 @@ export async function multiPackIndexRepack(
   }
   if (include.reduce((s, v) => s + v, 0) <= 1) return { exitCode: 0, stdout: "", stderr: c.stderr };
 
-  const backend = await createGitFilesBackend({ files: c.files, gitDir: c.gitDir });
+  const backend = await createGitFilesBackend({
+    files: c.files,
+    gitDir: c.gitDir,
+    ...(c.environment ? { environment: c.environment } : {}),
+  });
   const objects = objectsWithoutLazyFetch(backend.objects);
   const ids: ListedObject[] = [];
   for (let i = 0; i < m.numObjects; i++) {

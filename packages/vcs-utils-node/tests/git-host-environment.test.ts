@@ -153,3 +153,20 @@ describe("createNodeGitHostEnvironment: ownership checks and command-line config
     expect(await env.expandUserHome?.("nobody-here-at-all")).toBeUndefined();
   });
 });
+
+describe("createNodeGitHostEnvironment: repository discovery", () => {
+  it("reads GIT_CEILING_DIRECTORIES as set and GIT_DISCOVERY_ACROSS_FILESYSTEM as a bool", () => {
+    const env = createNodeGitHostEnvironment({
+      env: { GIT_CEILING_DIRECTORIES: "/a::/b", GIT_DISCOVERY_ACROSS_FILESYSTEM: "yes" },
+      effectiveUid: null,
+    });
+    expect(env.ceilingDirectories).toBe("/a::/b");
+    expect(env.discoveryAcrossFilesystem).toBe(true);
+    const none = createNodeGitHostEnvironment({
+      env: { GIT_DISCOVERY_ACROSS_FILESYSTEM: "0" },
+      effectiveUid: null,
+    });
+    expect(none.ceilingDirectories).toBeUndefined();
+    expect(none.discoveryAcrossFilesystem).toBeUndefined();
+  });
+});

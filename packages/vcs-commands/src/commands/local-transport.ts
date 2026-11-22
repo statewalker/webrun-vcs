@@ -128,7 +128,7 @@ export async function openLocalRemote(
   // upload-pack opens it whatever its owner (git 2.48+'s ENTER_REPO_ANY_OWNER_OK);
   // receive-pack checks before it serves (withLocalReceivePack)
   const opened = await repositoryPlaceOf(workingCopy)
-    ?.openRepository?.(path, { checkOwnership: false })
+    ?.openRepository?.(path, { checkOwnership: false, commandLineConfig: false })
     .catch(() => undefined);
   if (!opened) throw new TransportError(NOT_A_REPOSITORY(path));
   return opened;
