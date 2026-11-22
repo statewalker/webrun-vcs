@@ -400,12 +400,14 @@ export function createGitObjects(
 
   /**
    * The chunks of `content` while they total at most `size` bytes plus one chunk: an array
-   * when the content ended there, else those chunks followed by the rest of the content.
+   * when the content ended there, else those chunks followed by the rest of the content,
+   * with `close` to end the source when the rest may not be read to its end. Each gathered
+   * chunk is copied: a source may refill one buffer for every chunk it yields.
    */
   async function gatherSmall(
     content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
     size: number,
-  ): Promise<Uint8Array[] | AsyncIterable<Uint8Array>> {
+  ): Promise<Uint8Array[] | { rest: AsyncIterable<Uint8Array>; close: () => Promise<void> }> {
     const it =
       Symbol.asyncIterator in Object(content)
         ? (content as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]()
@@ -415,19 +417,25 @@ export function createGitObjects(
     while (total <= size) {
       const r = await it.next();
       if (r.done) return head;
-      head.push(r.value);
+      head.push(r.value.slice());
       total += r.value.length;
     }
-    return (async function* () {
-      let done = false;
+    let ended = false;
+    const close = async () => {
+      if (ended) return;
+      ended = true;
+      await it.return?.();
+    };
+    async function* rest() {
       try {
         yield* head;
         for (let r = await it.next(); !r.done; r = await it.next()) yield r.value;
-        done = true;
+        ended = true;
       } finally {
-        if (!done) await it.return?.();
+        await close();
       }
-    })();
+    }
+    return { rest: rest(), close };
   }
 
   async function put(
@@ -443,12 +451,18 @@ export function createGitObjects(
     // for the object again. A small one is compressed in one synchronous call, at git's
     // level for loose objects.
     let known: string | undefined;
+    let closeSource: (() => Promise<void>) | undefined;
     if (!Array.isArray(content) && size <= SYNC_DEFLATE_MAX) {
       // a small object read from a stream (a worktree file): gathered first, at most one chunk
       // past its declared size, so it is hashed and compressed in memory as below (a
       // compression stream per small file costs more than the file); a size that does not
       // match is reported by the streaming path, as before
-      content = await gatherSmall(content, size);
+      const gathered = await gatherSmall(content, size);
+      if (Array.isArray(gathered)) content = gathered;
+      else {
+        content = gathered.rest;
+        closeSource = gathered.close;
+      }
     }
     if (Array.isArray(content)) {
       const chunks = content as Uint8Array[];
@@ -470,18 +484,27 @@ export function createGitObjects(
       }
     }
     const hasher = known === undefined ? newHasher() : undefined;
+    // a streamed source may refill one buffer for every chunk, while the compressor can still
+    // hold the previous one: such chunks are copied (an array's chunks are the caller's to keep)
+    const streamed = !Array.isArray(content);
     async function* framed() {
       yield enc.encode(`${type} ${size}\0`);
-      yield* content;
+      if (!streamed) yield* content;
+      else for await (const chunk of content) yield chunk.slice();
     }
     const sizeError = (declared: number, actual: number) => new SizeMismatchError(declared, actual);
     const id = known;
-    const r = await store.putStaged(
-      deflate(checkedRaw(framed(), { hasher, sizeError })),
-      () => id ?? hex(hasher as Hasher),
-      id !== undefined && store.isFresh ? { notFresh: true } : undefined,
-    );
-    return r.id;
+    try {
+      const r = await store.putStaged(
+        deflate(checkedRaw(framed(), { hasher, sizeError })),
+        () => id ?? hex(hasher as Hasher),
+        id !== undefined && store.isFresh ? { notFresh: true } : undefined,
+      );
+      return r.id;
+    } finally {
+      // a store that fails (or stops reading) before the end leaves the source open
+      await closeSource?.();
+    }
   }
 
   const objects: GitObjects = {

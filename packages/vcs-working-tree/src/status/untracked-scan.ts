@@ -30,7 +30,7 @@
  * order) is git's, so the cache written afterwards holds the bytes git would write.
  */
 
-import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import { compareGitPaths, foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 import type { DirectoryEntry, LinkStats } from "@statewalker/vcs-utils/files";
 import {
   DIR_HIDE_EMPTY_DIRECTORIES,
@@ -94,14 +94,26 @@ export interface UntrackedScanHost {
 
 /** What the index tells the scan, and the cache it may use. */
 export interface UntrackedScanOptions {
-  /** Whether the index has an entry at `path` (any stage) */
+  /**
+   * Whether the index has an entry at `path` (any stage): git's `index_file_exists`, which
+   * folds case under `core.ignorecase` (a file differing from an index path only by case is
+   * then tracked: neither untracked nor recorded in the untracked cache)
+   */
   isTracked(path: string): boolean;
   /**
+   * Whether the index has an entry at exactly `path` (`index_name_is_other`, which never
+   * folds case: an ignored path's check); default {@link isTracked}
+   */
+  isTrackedExactly?(path: string): boolean;
+  /**
    * The names of the index entries directly in `dir` (any stage), asked once per directory
-   * listed: faster than `isTracked` per file. Optional.
+   * listed: faster than `isTracked` per file, and folding case as it does. Optional.
    */
   trackedIn?(dir: string): ReadonlySet<string>;
-  /** git's `directory_exists_in_index`: entries below `dir`, or a gitlink at it */
+  /**
+   * git's `directory_exists_in_index`: entries below `dir`, or a gitlink at it (under
+   * `core.ignorecase`, `directory_exists_in_index_icase`: folding case)
+   */
   indexDirectory(dir: string): "directory" | "gitlink" | undefined;
   /**
    * The id git takes for a `.gitignore` from the index instead of hashing the file: the
@@ -387,8 +399,9 @@ export async function scanUntracked(
     entries.push(path);
   };
   /** `dir_add_ignored`: an ignored path, unless the index has it (`index_name_is_other`). */
+  const isTrackedExactly = options.isTrackedExactly ?? options.isTracked;
   const addIgnored = (path: string) => {
-    if (options.isTracked(stripSlash(path))) return;
+    if (isTrackedExactly(stripSlash(path))) return;
     ignored.push(path);
   };
 
@@ -694,14 +707,51 @@ export async function scanUntracked(
  */
 export class IndexPathLookup {
   private readonly paths: readonly string[];
+  private readonly ignoreCase: boolean;
+  /** Under `ignoreCase`: the folded paths, and the folded names directly in each folded directory */
+  private folded?: { paths: Set<string>; dirs: Map<string, CaseFoldedNames> };
 
-  /** @param paths The index's paths in index order (byte order; repeated for stages) */
-  constructor(paths: readonly string[]) {
+  /**
+   * @param paths The index's paths in index order (byte order; repeated for stages)
+   * @param options `ignoreCase` (`core.ignorecase`): `has`, `hasEntriesBelow` and
+   *   `trackedIn` fold ASCII case, as git's name hashes (`index_file_exists` with icase,
+   *   `index_dir_exists`) do
+   */
+  constructor(paths: readonly string[], options: { ignoreCase?: boolean } = {}) {
     let sorted = true;
     for (let i = 1; i < paths.length && sorted; i++) {
       if (compareGitPaths(paths[i - 1] as string, paths[i] as string) > 0) sorted = false;
     }
     this.paths = sorted ? paths : [...paths].sort(compareGitPaths);
+    this.ignoreCase = options.ignoreCase ?? false;
+  }
+
+  /** The folded lookups, built on first use. */
+  private foldedLookups(): { paths: Set<string>; dirs: Map<string, CaseFoldedNames> } {
+    if (this.folded) return this.folded;
+    const paths = new Set<string>();
+    const dirs = new Map<string, CaseFoldedNames>([["", new CaseFoldedNames()]]);
+    for (const path of this.paths) {
+      const key = foldAsciiCase(path);
+      if (paths.has(key)) continue;
+      paths.add(key);
+      // every leading directory (git's directory hash), the name in its parent
+      let start = 0;
+      for (let at = key.indexOf("/"); at >= 0; at = key.indexOf("/", at + 1)) {
+        const dir = key.slice(0, at);
+        if (!dirs.has(dir)) dirs.set(dir, new CaseFoldedNames());
+        start = at + 1;
+      }
+      (dirs.get(start ? key.slice(0, start - 1) : "") as CaseFoldedNames).add(key.slice(start));
+    }
+    this.folded = { paths, dirs };
+    return this.folded;
+  }
+
+  /** Whether the index has an entry at exactly `path` (any stage), whatever `ignoreCase` says. */
+  hasExactly(path: string): boolean {
+    const at = this.lowerBound(path);
+    return at < this.paths.length && this.paths[at] === path;
   }
 
   /** The first position whose path is not before `key`. */
@@ -716,10 +766,10 @@ export class IndexPathLookup {
     return lo;
   }
 
-  /** Whether the index has an entry at `path` (any stage). */
+  /** Whether the index has an entry at `path` (any stage), folding case under `ignoreCase`. */
   has(path: string): boolean {
-    const at = this.lowerBound(path);
-    return at < this.paths.length && this.paths[at] === path;
+    if (this.hasExactly(path)) return true;
+    return this.ignoreCase && this.foldedLookups().paths.has(foldAsciiCase(path));
   }
 
   /** The paths, in index order. */
@@ -729,13 +779,21 @@ export class IndexPathLookup {
 
   /** Whether some path lies below `dir` (git's `index_directory`). */
   hasEntriesBelow(dir: string): boolean {
+    if (this.ignoreCase) return this.foldedLookups().dirs.has(foldAsciiCase(dir));
     const prefix = `${dir}/`;
     const at = this.lowerBound(prefix);
     return at < this.paths.length && (this.paths[at] as string).startsWith(prefix);
   }
 
-  /** The names of the paths directly in `dir` ("" the root); subdirectories skipped whole. */
-  trackedIn(dir: string): Set<string> {
+  /**
+   * The names of the paths directly in `dir` ("" the root); subdirectories skipped whole.
+   * Under `ignoreCase`, `dir` folds case, and so do the names (listed folded; `has` folds
+   * the name it is asked).
+   */
+  trackedIn(dir: string): ReadonlySet<string> {
+    if (this.ignoreCase) {
+      return this.foldedLookups().dirs.get(foldAsciiCase(dir)) ?? new CaseFoldedNames();
+    }
     const prefix = dir ? `${dir}/` : "";
     const names = new Set<string>();
     let i = prefix ? this.lowerBound(prefix) : 0;
@@ -753,5 +811,12 @@ export class IndexPathLookup {
       i = this.lowerBound(`${path.slice(0, slash)}0`, i + 1);
     }
     return names;
+  }
+}
+
+/** Names kept folded (ASCII lower case), `has` folding the name asked. */
+class CaseFoldedNames extends Set<string> {
+  override has(name: string): boolean {
+    return super.has(foldAsciiCase(name));
   }
 }

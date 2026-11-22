@@ -1,5 +1,6 @@
 import { type Commits, countAheadBehind, FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
+import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 import {
   type CacheTree,
   compareWithWorktree,
@@ -48,7 +49,7 @@ import {
   type StatusSide,
   submoduleToken,
 } from "../results/status-result.js";
-import { worktreeModeTrust } from "./core-config.js";
+import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { DiffCommand } from "./diff-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { OperationState } from "./merge-support.js";
@@ -1016,11 +1017,22 @@ export class StatusCommand extends GitCommand<Status> {
           ? await untrackedCache.forScan(flags)
           : undefined;
       const ignoreFiles = this.indexIgnoreOids(all, upToDate);
+      // dir.c asks the index through its name hashes, which fold case under core.ignorecase
+      // (index_file_exists, directory_exists_in_index_icase): a file or directory differing
+      // from an index path only by case is tracked, never untracked
+      const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
+      const scanIndex = ignoreCase ? new IndexPathLookup(index.all, { ignoreCase: true }) : index;
+      const scanGitlinks = ignoreCase ? new Set([...gitlinks].map(foldAsciiCase)) : gitlinks;
       const result = await scanUntracked(host ?? (await walkUntrackedScanHost(worktree)), {
-        isTracked: (p) => tracked.has(p),
-        trackedIn: (dir) => index.trackedIn(dir),
+        isTracked: (p) => scanIndex.has(p),
+        isTrackedExactly: (p) => index.hasExactly(p),
+        trackedIn: (dir) => scanIndex.trackedIn(dir),
         indexDirectory: (dir) =>
-          gitlinks.has(dir) ? "gitlink" : index.hasEntriesBelow(dir) ? "directory" : undefined,
+          scanGitlinks.has(ignoreCase ? foldAsciiCase(dir) : dir)
+            ? "gitlink"
+            : scanIndex.hasEntriesBelow(dir)
+              ? "directory"
+              : undefined,
         indexIgnoreOid: (p) => ignoreFiles.upToDate.get(p),
         skipWorktreeIgnoreOid: (p) => ignoreFiles.skipWorktree.get(p),
         flags,

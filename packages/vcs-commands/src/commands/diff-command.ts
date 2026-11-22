@@ -8,6 +8,7 @@ import {
 import { ByteSink, parseGitBool, type XdiffAlgorithm } from "@statewalker/vcs-utils";
 import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
+  type AttributesIndex,
   collectChunks,
   compareWithWorktree,
   expandUserPath,
@@ -70,6 +71,12 @@ import {
   showSubmoduleDiffSummary,
   submoduleHeader,
 } from "./submodule-summary.js";
+
+/** An index without in-tree attributes files: the attribute stack of a diff of two trees. */
+const WITHOUT_INDEX_ATTRIBUTES: { direction: "checkin"; index: AttributesIndex } = {
+  direction: "checkin",
+  index: { attributesBlob: () => undefined },
+};
 
 /** The output formats of {@link DiffCommand.callText} */
 /**
@@ -697,38 +704,40 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
     this.dirtyThisCall = this.dirtySubmodules ?? formats.includes("patch");
     this.readUiConfig();
-    let followPath = follow;
-    let followChange: ChangeType.RENAME | ChangeType.COPY | undefined;
-    let collected: { entries: DiffEntry[]; combined: CombinedEntry[] };
-    if (follow !== undefined) {
-      const spec = this.pathspecItems;
-      this.pathspecItems = [parsePathspecItem(`:(literal)${follow}`)];
-      collected = await this.collect(false, false);
-      const only = collected.entries[0];
-      if (collected.entries.length === 1 && only?.changeType === ChangeType.ADD) {
-        this.pathspecItems = spec;
-        const found = await this.followSource(only);
-        if (found) {
-          collected = { entries: [found], combined: [] };
-          followPath = found.oldPath;
-          followChange = found.changeType as ChangeType.RENAME | ChangeType.COPY;
+    return this.inOneOperation(async () => {
+      let followPath = follow;
+      let followChange: ChangeType.RENAME | ChangeType.COPY | undefined;
+      let collected: { entries: DiffEntry[]; combined: CombinedEntry[] };
+      if (follow !== undefined) {
+        const spec = this.pathspecItems;
+        this.pathspecItems = [parsePathspecItem(`:(literal)${follow}`)];
+        collected = await this.collect(false, false);
+        const only = collected.entries[0];
+        if (collected.entries.length === 1 && only?.changeType === ChangeType.ADD) {
+          this.pathspecItems = spec;
+          const found = await this.followSource(only);
+          if (found) {
+            collected = { entries: [found], combined: [] };
+            followPath = found.oldPath;
+            followChange = found.changeType as ChangeType.RENAME | ChangeType.COPY;
+          }
         }
+      } else {
+        collected = await this.collect(
+          renames,
+          formats.includes("patch"),
+          formats.some((f) => PREFETCH_FORMATS.has(f)),
+        );
       }
-    } else {
-      collected = await this.collect(
-        renames,
-        formats.includes("patch"),
-        formats.some((f) => PREFETCH_FORMATS.has(f)),
-      );
-    }
-    const followed = {
-      ...(followPath !== undefined ? { followPath } : {}),
-      ...(followChange !== undefined ? { followChange } : {}),
-    };
-    if (collected.entries.length === 0 && collected.combined.length === 0) return followed;
-    const sink = new ByteSink();
-    await this.writeFormats(sink, formats, collected);
-    return { bytes: sink.bytes(), ...followed };
+      const followed = {
+        ...(followPath !== undefined ? { followPath } : {}),
+        ...(followChange !== undefined ? { followChange } : {}),
+      };
+      if (collected.entries.length === 0 && collected.combined.length === 0) return followed;
+      const sink = new ByteSink();
+      await this.writeFormats(sink, formats, collected);
+      return { bytes: sink.bytes(), ...followed };
+    });
   }
 
   /**
@@ -1206,9 +1215,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           attributes?: (
             path: string,
             names?: readonly string[],
+            context?: { direction: "checkin"; index?: AttributesIndex },
           ) => Promise<Map<string, true | false | string | undefined>>;
         }
       | undefined;
+    // a diff of two trees reads no index (builtin/diff.c's builtin_diff_tree, `git log -p`,
+    // `git show`): the in-tree attributes come from the worktree alone, never the index's
+    const context = this.newTree !== undefined ? WITHOUT_INDEX_ATTRIBUTES : undefined;
     const drivers = new Map<string, Promise<DiffDriver | undefined>>();
     const runner =
       (this.textOptions.textconv ?? true) ? textconvRunnerOf(this.workingCopy) : undefined;
@@ -1227,7 +1240,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           let found = drivers.get(path);
           if (!found) {
             found = (async () => {
-              const attrs = await filter.attributes?.(path, ["diff"]);
+              const attrs = await filter.attributes?.(path, ["diff"], context);
               return withTextconv(diffDriverOf(attrs?.get("diff"), get));
             })();
             drivers.set(path, found);

@@ -175,3 +175,61 @@ describe("createGitObjects: small streamed objects compressed in memory", () => 
     await expect(objects.put("blob", 10, failing())).rejects.toBe(failure);
   });
 });
+
+describe("createGitObjects: streamed chunks consumed as yielded", () => {
+  /** Yields `bytes` through one buffer of `width` bytes, refilled for every chunk. */
+  async function* reusing(bytes: Uint8Array, width: number) {
+    const buffer = new Uint8Array(width);
+    for (let at = 0; at < bytes.length; at += width) {
+      const n = Math.min(width, bytes.length - at);
+      buffer.set(bytes.subarray(at, at + n));
+      yield buffer.subarray(0, n);
+    }
+  }
+
+  function pattern(size: number): Uint8Array {
+    const bytes = new Uint8Array(size);
+    for (let i = 0; i < size; i++) bytes[i] = (i * 31 + (i >> 8)) & 0xff;
+    return bytes;
+  }
+
+  for (const size of [8000, 200_000]) {
+    it(`stores a ${size}-byte blob from a source that reuses its buffer`, async () => {
+      const bytes = pattern(size);
+      const expected = await createGitObjects(rawStorageStaging(new MemoryRawStorage())).put(
+        "blob",
+        size,
+        [bytes],
+      );
+      const objects = createGitObjects(rawStorageStaging(new MemoryRawStorage()));
+      const id = await objects.put("blob", size, reusing(bytes, 1000));
+      expect(id).toBe(expected);
+      const obj = await objects.get(id, { verify: true });
+      let total = 0;
+      for await (const c of obj?.content ?? []) total += c.length;
+      expect(total).toBe(size);
+    });
+  }
+
+  it("closes a small declared source that turns out longer when the store fails first", async () => {
+    const storage = rawStorageStaging(new MemoryRawStorage());
+    const failure = new Error("store failed");
+    const failing = {
+      ...storage,
+      putStaged: async () => {
+        throw failure;
+      },
+    } as typeof storage;
+    const objects = createGitObjects(failing);
+    let returned = false;
+    async function* long() {
+      try {
+        for (let i = 0; i < 100; i++) yield enc.encode("0123456789");
+      } finally {
+        returned = true;
+      }
+    }
+    await expect(objects.put("blob", 15, long())).rejects.toBe(failure);
+    expect(returned).toBe(true);
+  });
+});

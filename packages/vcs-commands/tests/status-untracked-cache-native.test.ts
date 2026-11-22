@@ -620,3 +620,59 @@ describeGit("untracked cache in normal mode: native git and ours write the same 
     }
   }, 120_000);
 });
+
+describeGit("untracked files under core.ignorecase: index paths matched folding case", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "status-untr-icase-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  for (const [mode, build] of [
+    ["all", repo],
+    ["normal", repoNormal],
+  ] as const) {
+    it(`hides files and enters directories differing from tracked ones only by case (-u${mode})`, async () => {
+      const dir = join(root, "r");
+      build(dir);
+      git(dir, ["config", "core.ignorecase", "true"]);
+      const steps: Array<[string, () => void]> = [
+        ["first scan (no cache yet)", () => {}],
+        // dir.c's index_file_exists(icase): TWO.txt is a/b/two.txt
+        ["a file named as a tracked one in another case", () => put(dir, "a/b/TWO.txt", "2\n")],
+        [
+          "a skip-worktree file's name in another case",
+          () => {
+            git(dir, ["update-index", "--skip-worktree", "e/f/g/five.txt"]);
+            rmSync(join(dir, "e/f/g/five.txt"));
+            put(dir, "e/f/g/Five.txt", "5\n");
+          },
+        ],
+        // directory_exists_in_index_icase: A/ is a/, entered, not shown as A/
+        [
+          "a directory named as a tracked one in another case",
+          () => {
+            put(dir, "A/ONE.txt", "1\n");
+            put(dir, "A/other.txt", "o\n");
+          },
+        ],
+        ["nothing changed (from the cache)", () => {}],
+      ];
+      let i = 0;
+      for (const [name, change] of steps) {
+        change();
+        dateBack(dir);
+        const keep = i++ % 2 === 0 ? "native" : "ours";
+        try {
+          const status = await expectTwins(dir, keep);
+          expect(status.untracked.has("a/b/TWO.txt")).toBe(false);
+          expect(status.untracked.has("e/f/g/Five.txt")).toBe(false);
+        } catch (error) {
+          throw new Error(`step "${name}": ${(error as Error).message}`);
+        }
+      }
+      expect(git(dir, ["status", "--porcelain"])).toBe(uncachedStatus(dir));
+      expect(uncachedStatus(dir)).toContain("?? A/other.txt\n");
+      expect(uncachedStatus(dir)).not.toContain("ONE.txt");
+    }, 60_000);
+  }
+});
