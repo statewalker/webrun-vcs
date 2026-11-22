@@ -227,7 +227,8 @@ type ConfigLine =
  *
  * ## Known limitations
  *
- * - `includeIf.hasconfig:remote.*.url:` is not evaluated (never true).
+ * - `includeIf.hasconfig:remote.*.url:` is not evaluated (never true), except in a read
+ *   {@link GitConfigOptions.withoutGitDir} (git's protected configuration).
  * - A malformed section header (e.g. an unterminated quote) is kept verbatim
  *   but ignored, so the following variables are attributed to the previous
  *   section. `git` rejects the whole file instead. Reading such a file is
@@ -1132,6 +1133,20 @@ export interface GitConfigOptions {
    * next to this file, read through its FilesApi.
    */
   readHead?: () => Promise<string | undefined>;
+  /**
+   * Read with no repository, as git's `read_protected_config` does (it passes no git
+   * directory): `includeIf.gitdir:`, `gitdir/i:` and `onbranch:` are never true
+   * (`include_by_path` and `include_by_branch` answer 0 without one), so this file's
+   * directory never counts as a git directory. `includeIf.hasconfig:remote.*.url:` is
+   * evaluated, as git evaluates it there: against the `remote.<name>.url` values of the
+   * system and global files (their includes followed, every `hasconfig` one taken) and
+   * {@link extraRemoteUrls}; a file such an include brings in may set no remote URL (git's
+   * fatal "remote URLs cannot be configured in file directly or indirectly included by
+   * includeIf.hasconfig:remote.*.url").
+   */
+  withoutGitDir?: boolean;
+  /** With {@link withoutGitDir}: remote URLs of the command line, also matched by `hasconfig` */
+  extraRemoteUrls?: string[];
 }
 
 /** One value of the chain. */
@@ -1218,6 +1233,30 @@ function resolveDots(path: string): { path: string; escapes: boolean } {
 
 const isTrue = (value: unknown) => parseGitBool(value) === true;
 
+/** The `includeIf` condition git matches against the configured remote URLs. */
+const HASCONFIG_REMOTE_URL = "hasconfig:remote.*.url:";
+
+/** `remote.<name>.url` (the name may be empty, as `parse_config_key` gives it). */
+function isRemoteUrlKey(key: string): boolean {
+  const first = key.indexOf(".");
+  const last = key.lastIndexOf(".");
+  return (
+    first > 0 &&
+    last > first &&
+    key.slice(0, first).toLowerCase() === "remote" &&
+    key.slice(last + 1).toLowerCase() === "url"
+  );
+}
+
+/** git's `forbid_remote_url`: a remote URL in a file a `hasconfig` include brought in. */
+function forbidRemoteUrl(key: string): void {
+  if (isRemoteUrlKey(key)) {
+    throw new Error(
+      "fatal: remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url",
+    );
+  }
+}
+
 /** `include.path` or `includeif.<condition>.path`. */
 function isIncludeKey(key: string): boolean {
   return key === "include.path" || (key.startsWith("includeif.") && key.endsWith(".path"));
@@ -1283,16 +1322,32 @@ async function confinedRealPath(files: ConfigFilesApi, path: string): Promise<st
 /** Reads config files of the chain, following their include directives as git does. */
 class ChainReader {
   private branch?: Promise<string | undefined>;
+  /** The remote URLs `hasconfig:remote.*.url:` matches ({@link GitConfigOptions.withoutGitDir}) */
+  private remoteUrls?: Promise<string[]>;
 
   constructor(
     private readonly config: GitWorkingCopyConfig,
     private readonly env: GitHostEnvironment | undefined,
     private readonly options: GitConfigOptions,
     private readonly followIncludes: boolean,
+    /**
+     * git's `unconditional_remote_url` pass (`populate_remote_urls`): every `hasconfig`
+     * condition holds, and what it includes may set no remote URL
+     */
+    private readonly unconditionalRemoteUrl = false,
   ) {}
 
-  /** Appends the entries of `source` (and what it includes) to `out`; nothing when absent. */
-  async readFile(source: ConfigSource, out: ConfigEntry[], depth: number): Promise<void> {
+  /**
+   * Appends the entries of `source` (and what it includes) to `out`; nothing when absent.
+   * `forbidRemoteUrls` reads a file a `hasconfig` include brought in during the
+   * unconditional pass (git's `forbid_remote_url`): nothing is kept, a remote URL is fatal.
+   */
+  async readFile(
+    source: ConfigSource,
+    out: ConfigEntry[],
+    depth: number,
+    forbidRemoteUrls = false,
+  ): Promise<void> {
     let content: Uint8Array | undefined;
     try {
       content = await source.read(source.path);
@@ -1308,6 +1363,10 @@ class ChainReader {
       lineEnd += physicalLines(line);
       if (line.kind === "text" && line.topLevel) {
         const { key, value, written } = line.topLevel;
+        if (forbidRemoteUrls) {
+          forbidRemoteUrl(key);
+          continue;
+        }
         out.push({
           key,
           value,
@@ -1320,18 +1379,21 @@ class ChainReader {
       if (key === undefined) continue;
       const value =
         line.kind === "entry" ? line.value : line.kind === "section" ? line.inlineValue : undefined;
-      out.push({
-        key,
-        value,
-        origin: {
-          file,
-          line: lineEnd,
-          text: writtenValueOfLine(line),
-        },
-        ...(source.scope ? { scope: source.scope } : {}),
-      });
+      if (forbidRemoteUrls) forbidRemoteUrl(key);
+      else {
+        out.push({
+          key,
+          value,
+          origin: {
+            file,
+            line: lineEnd,
+            text: writtenValueOfLine(line),
+          },
+          ...(source.scope ? { scope: source.scope } : {}),
+        });
+      }
       if (this.followIncludes && isIncludeKey(key)) {
-        await this.include(key, value, source, out, depth + 1);
+        await this.include(key, value, source, out, depth + 1, forbidRemoteUrls);
       }
     }
   }
@@ -1343,11 +1405,16 @@ class ChainReader {
     from: ConfigSource,
     out: ConfigEntry[],
     depth: number,
+    forbidRemoteUrls = false,
   ): Promise<void> {
     if (typeof value !== "string" || value === "") return;
+    let forbid = forbidRemoteUrls;
     if (key !== "include.path") {
       const condition = key.slice("includeif.".length, -".path".length);
       if (!(await this.conditionHolds(condition, from))) return;
+      // git_config_include: in the unconditional pass, what a condition brings in may set
+      // no remote URL (git swaps in forbid_remote_url for it and what it includes)
+      if (this.unconditionalRemoteUrl) forbid = true;
     }
     if (depth > MAX_INCLUDE_DEPTH) {
       throw new Error(
@@ -1355,7 +1422,7 @@ class ChainReader {
       );
     }
     const target = await this.resolvePath(value, from);
-    if (target) await this.readFile(target, out, depth);
+    if (target) await this.readFile(target, out, depth, forbid);
   }
 
   /** git's `handle_path_include`: `~/` in the home, a relative path beside `from`. */
@@ -1471,9 +1538,56 @@ class ChainReader {
     return ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : undefined;
   }
 
+  /**
+   * git's `populate_remote_urls` for a read without a git directory: the `remote.<name>.url`
+   * values of the system and global files, every include followed (`hasconfig` ones taken
+   * as true, their files forbidden to set remote URLs), then
+   * {@link GitConfigOptions.extraRemoteUrls} (the command line).
+   */
+  private async collectRemoteUrls(): Promise<string[]> {
+    const env = this.env;
+    const pass = new ChainReader(this.config, env, this.options, this.followIncludes, true);
+    const entries: ConfigEntry[] = [];
+    if (env) {
+      const hostSource = (path: string, scope: ConfigScope): ConfigSource => ({
+        read: env.readFile,
+        path,
+        host: true,
+        scope,
+      });
+      if (env.systemConfig) await pass.readFile(hostSource(env.systemConfig, "system"), entries, 0);
+      if (env.globalConfig) {
+        await pass.readFile(hostSource(env.globalConfig, "global"), entries, 0);
+      } else {
+        const xdg = xdgConfigPath(env, "config");
+        if (xdg) await pass.readFile(hostSource(xdg, "global"), entries, 0);
+        const userConfig = expandUserPath("~/.gitconfig", env);
+        if (userConfig) await pass.readFile(hostSource(userConfig, "global"), entries, 0);
+      }
+    }
+    const urls: string[] = [];
+    for (const entry of entries) {
+      if (isRemoteUrlKey(entry.key) && typeof entry.value === "string") urls.push(entry.value);
+    }
+    urls.push(...(this.options.extraRemoteUrls ?? []));
+    return urls;
+  }
+
   /** git's `include_condition_is_true`. */
   private async conditionHolds(condition: string, from: ConfigSource): Promise<boolean> {
+    const noGitDir = this.options.withoutGitDir === true;
+    if (condition.startsWith(HASCONFIG_REMOTE_URL)) {
+      // evaluated only where git's protected read is (no repository config to collect from)
+      if (!noGitDir) return false;
+      if (this.unconditionalRemoteUrl) return true;
+      const pattern = condition.slice(HASCONFIG_REMOTE_URL.length);
+      this.remoteUrls ??= this.collectRemoteUrls();
+      const urls = await this.remoteUrls;
+      return urls.some((url) => wildmatch(pattern, url, { pathname: true }));
+    }
     const gitdir = /^gitdir(\/i)?:/.exec(condition);
+    // include_by_path and include_by_branch answer 0 without a git directory / repository
+    if (noGitDir && (gitdir || condition.startsWith("onbranch:"))) return false;
     if (gitdir) {
       const icase = gitdir[1] !== undefined;
       let pattern = condition.slice(gitdir[0].length);

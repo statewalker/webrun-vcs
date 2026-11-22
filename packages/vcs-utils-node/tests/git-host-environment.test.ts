@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInMemoryFilesApi } from "@statewalker/vcs-utils/files";
 import { describe, expect, it } from "vitest";
-import { createNodeGitHostEnvironment } from "../src/files/index.js";
+import { commandLineConfigOf, createNodeGitHostEnvironment } from "../src/files/index.js";
 
 describe("createNodeGitHostEnvironment", () => {
   it("reads host files by absolute path through a Node FilesApi", async () => {
@@ -71,5 +71,85 @@ describe("createNodeGitHostEnvironment", () => {
       undefined,
       undefined,
     ]);
+  });
+});
+
+describe("createNodeGitHostEnvironment: ownership checks and command-line config", () => {
+  it("takes the effective uid from the process unless given or turned off", () => {
+    const env = createNodeGitHostEnvironment({ env: {} });
+    expect(env.effectiveUid).toBe(process.geteuid?.());
+    expect(createNodeGitHostEnvironment({ env: {}, effectiveUid: 42 }).effectiveUid).toBe(42);
+    expect(createNodeGitHostEnvironment({ env: {}, effectiveUid: null }).effectiveUid).toBe(
+      undefined,
+    );
+    const sudo = createNodeGitHostEnvironment({
+      env: { SUDO_UID: "1000", GIT_TEST_ASSUME_DIFFERENT_OWNER: "true" },
+    });
+    expect(sudo.sudoUid).toBe("1000");
+    expect(sudo.assumeDifferentOwner).toBe(true);
+    expect(env.prefix).toBe("/usr");
+  });
+
+  it("reads GIT_CONFIG_COUNT pairs, then GIT_CONFIG_PARAMETERS, as git passes `-c`", () => {
+    expect(
+      commandLineConfigOf({
+        GIT_CONFIG_COUNT: "2",
+        GIT_CONFIG_KEY_0: "Safe.Directory",
+        GIT_CONFIG_VALUE_0: "/a",
+        GIT_CONFIG_KEY_1: "url.HTTPS://X/.insteadOf",
+        GIT_CONFIG_VALUE_1: "x:",
+        GIT_CONFIG_PARAMETERS: "'safe.directory=/b' 'safe.directory'='/it'\\''s' 'core.bare'",
+      }),
+    ).toEqual([
+      { key: "safe.directory", value: "/a" },
+      { key: "url.HTTPS://X/.insteadof", value: "x:" },
+      { key: "safe.directory", value: "/b" },
+      { key: "safe.directory", value: "/it's" },
+      { key: "core.bare", value: undefined },
+    ]);
+    // a missing pair, a bogus count or an unquoted entry is git's fatal error
+    const fatal = (reason: string) =>
+      `error: ${reason}\nfatal: unable to parse command-line config`;
+    expect(() =>
+      commandLineConfigOf({
+        GIT_CONFIG_COUNT: "2",
+        GIT_CONFIG_KEY_0: "a.b",
+        GIT_CONFIG_VALUE_0: "1",
+      }),
+    ).toThrow(fatal("missing config key GIT_CONFIG_KEY_1"));
+    expect(() => commandLineConfigOf({ GIT_CONFIG_COUNT: "x" })).toThrow(
+      fatal("bogus count in GIT_CONFIG_COUNT"),
+    );
+    expect(() => commandLineConfigOf({ GIT_CONFIG_PARAMETERS: "safe.directory=/x" })).toThrow(
+      fatal("bogus format in GIT_CONFIG_PARAMETERS"),
+    );
+  });
+
+  it("keeps unparseable command-line config as the error git dies with", () => {
+    const env = createNodeGitHostEnvironment({
+      env: { GIT_CONFIG_PARAMETERS: "'=x'" },
+      effectiveUid: null,
+    });
+    expect(env.commandLineConfig).toBeUndefined();
+    expect(env.commandLineConfigError).toBe(
+      "error: bogus config parameter: =x\nfatal: unable to parse command-line config",
+    );
+    // 'key'= has no value (git's NULL), git's isspace separates entries
+    expect(commandLineConfigOf({ GIT_CONFIG_PARAMETERS: "'a.b'=\t'c.d=1'\n" })).toEqual([
+      { key: "a.b", value: undefined },
+      { key: "c.d", value: "1" },
+    ]);
+  });
+
+  it("expands ~user/ from /etc/passwd read through its FilesApi", async () => {
+    const files = createInMemoryFilesApi();
+    await files.write("/etc/passwd", [
+      new TextEncoder().encode(
+        "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000::/home/al:/bin/sh\n",
+      ),
+    ]);
+    const env = createNodeGitHostEnvironment({ env: {}, files });
+    expect(await env.expandUserHome?.("alice")).toBe("/home/al");
+    expect(await env.expandUserHome?.("nobody-here-at-all")).toBeUndefined();
   });
 });

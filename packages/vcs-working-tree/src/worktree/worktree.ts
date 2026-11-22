@@ -469,6 +469,19 @@ export interface OpenRepositoryOptions {
    * repositories of owners who must not borrow each other's objects passes false.
    */
   alternates?: boolean;
+  /**
+   * Refuse a repository another user owns, as git's `enter_repo` does for receive-pack,
+   * http-backend and git-daemon (default true): the gitfile it was reached through and its
+   * git directory must belong to the current user (`GitHostEnvironment.effectiveUid`,
+   * `$SUDO_UID` for root), or the protected configuration's `safe.directory` must list it;
+   * else `openRepository` throws git's `DubiousOwnershipError` ("detected dubious ownership in
+   * repository at '<path>'"). A no-op where owners cannot be told (no effective uid, a
+   * storage without owners). False opens it whatever its owner, as git 2.48+'s upload-pack
+   * does (`ENTER_REPO_ANY_OWNER_OK`); {@link OpenedRepository.checkOwnership} checks later.
+   */
+  checkOwnership?: boolean;
+  /** The rules of this git version where the ownership checks differ (default 2.56) */
+  compatibility?: "2.43" | "2.56";
 }
 
 /** A repository {@link Worktree.openRepository} opened. */
@@ -497,6 +510,13 @@ export interface OpenedRepository {
    * packs, `servedRepositoryOf`)
    */
   files?: FilesApi;
+  /**
+   * git's ownership check of this repository (see {@link OpenRepositoryOptions.checkOwnership}):
+   * resolves when it may be used, throws `DubiousOwnershipError` when not. `gitDirOnly`
+   * checks only the git directory, as `git clone` does before it copies a local repository's
+   * objects (clone.c's `copy_or_link_directory`), naming it as cloned.
+   */
+  checkOwnership?(options?: { gitDirOnly?: boolean; path?: string }): Promise<void>;
 }
 
 /** The configuration of an {@link OpenedRepository}, values as written. */

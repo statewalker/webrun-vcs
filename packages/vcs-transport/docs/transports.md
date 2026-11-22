@@ -614,6 +614,34 @@ channel's `serve` and reach it with `createWebrunConnector({ call: () => call })
   applied to a repository `openRepository` opens (git clears it, `local_repo_env`, for the
   upload-pack or receive-pack of another repository); `configIncludes: "files"` does not touch
   alternates, which are no configuration.
+- **Repositories other users own are refused.** `Worktree.openRepository` checks the opened
+  repository's owner as git's `enter_repo` does for receive-pack, http-backend and git-daemon:
+  its git directory (and the gitfile it was reached through) must belong to the server's user,
+  or the protected configuration (system and global files, `git -c` through
+  `$GIT_CONFIG_PARAMETERS` / `$GIT_CONFIG_COUNT`; never the repository's own config) must list
+  it in `safe.directory` (`*`, a path, `<path>/*`); else it throws `DubiousOwnershipError`
+  with git's "detected dubious ownership in repository at '<path>'" text, before the
+  repository's config (and its includes) or alternates are read. A resolver that lets it
+  through gets git's answers: `createServedFetchHandler` a 500 with no detail (http-backend's
+  `die_webcgi`), `serveGitConnection` / `serveGitService` a dropped connection with no `ERR`
+  line (git daemon's child dies); a resolver that answers `undefined` serves a "not a
+  repository" refusal instead. Owners come from the storage's
+  `lstat` (`LinkStats.uid`) and the user from `GitHostEnvironment.effectiveUid`
+  (`createNodeGitHostEnvironment` takes `process.geteuid()`, `$SUDO_UID` for root): where
+  either is missing (a browser, in-memory, KV/SQL or remote storage, Windows) the check passes,
+  as git's does without file owners. A server whose storage belongs to one service user (the
+  usual case) never notices; a server that serves other users' repositories on purpose lists
+  them (`safe.directory=*`, or `/srv/git/*`) or opens them with `checkOwnership: false`. A
+  local fetch, ls-remote and `clone --no-local` open their source whatever its owner (git
+  2.48+'s upload-pack); a local push and a local clone's copy check it.
+  `discoverRepository` (vcs-store-files) is git's setup discovery with both checks:
+  dubious ownership, and `safe.bareRepository=explicit` refusing a bare repository found by
+  walking up (not a `.git` directory or a linked worktree's or submodule's git directory
+  inside one; never an explicit `gitDir`). These checks are opt-in for library callers: a
+  `FileWorktree` or `createGitFilesBackend` constructed directly opens what it is given
+  unchecked, so code that opens repositories from a user-supplied directory discovers them
+  with `discoverRepository` first. The owner checks need a `GitHostEnvironment` with
+  `effectiveUid`.
 - **Hooks already run the owner's code.** With a hook runner installed, a served repository's
   `pre-receive`, `update` and `post-receive` scripts run on the server with its rights, so its
   owner can read whatever the server can, includes or not. Include confinement matters for

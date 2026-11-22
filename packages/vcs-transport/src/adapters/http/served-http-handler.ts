@@ -219,6 +219,11 @@ function internalError(): HttpResponse {
   };
 }
 
+/** A resolver's refusal of a repository another user owns (git's dubious ownership). */
+function isDubiousOwnership(error: unknown): boolean {
+  return error instanceof Error && error.name === "DubiousOwnershipError";
+}
+
 /**
  * The repository path of a request path, each segment percent-decoded (as a web server
  * decodes `PATH_INFO` for http-backend); undefined when a segment does not decode or
@@ -567,6 +572,9 @@ export function createServedHttpHandler(
         served = await options.resolveRepository(repoPath, serviceRequest);
       } catch (error) {
         logger?.error(`Error resolving repository ${repoPath}`, error);
+        // enter_repo's die_upon_dubious_ownership: http-backend's die_webcgi answers 500 (its
+        // message goes to the server's log only)
+        if (isDubiousOwnership(error)) return internalError();
         served = undefined;
       }
     }

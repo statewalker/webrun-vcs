@@ -1143,3 +1143,37 @@ describe("createBasePathResolver: empty users and paths", () => {
     expect(duplex.written()).toBe(line("ERR '' does not appear to be a git repository"));
   });
 });
+
+describe("serveGitConnection: a repository another user owns", () => {
+  const dubious = async () => {
+    const error = new Error("fatal: detected dubious ownership in repository at '/srv/r.git'");
+    error.name = "DubiousOwnershipError";
+    throw error;
+  };
+
+  it("drops the connection without an ERR line, as git daemon's child dies", async () => {
+    for (const informativeErrors of [false, true]) {
+      const duplex = serverSide(pkt("git-upload-pack /r.git\0host=h\0"));
+      const result = await serveGitConnection({
+        duplex,
+        resolveRepository: dubious,
+        informativeErrors,
+      });
+      expect(duplex.written()).toBe("");
+      expect(duplex.closed).toBe(true);
+      expect(result).toMatchObject({ success: false, request: { path: "/r.git" } });
+      expect(result.error).toContain("dubious ownership");
+    }
+  });
+
+  it("any other resolver error is still the not-a-repository refusal", async () => {
+    const duplex = serverSide(pkt("git-upload-pack /r.git\0host=h\0"));
+    await serveGitConnection({
+      duplex,
+      resolveRepository: async () => {
+        throw new Error("boom");
+      },
+    });
+    expect(duplex.written()).toBe(line("ERR access denied or repository not exported: /r.git"));
+  });
+});

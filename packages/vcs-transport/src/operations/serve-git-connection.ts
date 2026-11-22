@@ -559,7 +559,13 @@ export async function serveGitService(
   let served: ServedRepository | undefined;
   try {
     served = await options.resolveRepository(path, request);
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.name === "DubiousOwnershipError") {
+      // enter_repo's die_upon_dubious_ownership kills git daemon's child (and an ssh
+      // session's receive-pack): the connection ends without an ERR line
+      if (options.closeDuplex !== false) await closeQuietly(duplex);
+      return { success: false, error: error.message, refused: error.message, request };
+    }
     served = undefined;
   }
   if (!served) return refuse("no such repository");

@@ -567,7 +567,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     // a bare repository's working copy opens it from its git directory
     const worktree = repositoryPlaceOf(this.workingCopy);
     const isRepositoryPath = await worktree
-      ?.openRepository?.(uri)
+      ?.openRepository?.(uri, { checkOwnership: false })
       .then((opened) => opened !== undefined)
       .catch(() => false);
     let repo: string;
@@ -969,6 +969,18 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     return messages;
   }
 
+  /** git's `die_upon_dubious_ownership(NULL, NULL, src_repo)` before a local clone copies. */
+  private async refuseDubiousSource(source: OpenedRepository, path: string): Promise<void> {
+    try {
+      await source.checkOwnership?.({ gitDirOnly: true, path });
+    } catch (error) {
+      if (error instanceof Error && error.name === "DubiousOwnershipError") {
+        throw new TransportError(error.message);
+      }
+      throw error;
+    }
+  }
+
   /**
    * clone_local's copy of the source's objects (see `local-clone.ts`), or undefined where
    * either side keeps no files (the clone then fetches).
@@ -985,6 +997,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     if (!files || gitDir === undefined || !sourceFiles || !alternates) return undefined;
     const commonDir = (source.commonDir ?? source.gitDir).replace(/\/+$/, "");
     return async () => {
+      // clone.c's copy_or_link_directory: a source another user owns is refused (2.45.1+,
+      // CVE-2024-32004), unless safe.directory lists it
+      await this.refuseDubiousSource(source, sourceGitDirPath(files, source, repo));
       const result = await copyLocalObjects({
         source: {
           files: sourceFiles,
@@ -1042,7 +1057,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         throw refuse();
       }
       if (source) {
-        const self = await worktree.openRepository?.(".").catch(() => undefined);
+        const self = await worktree
+          .openRepository?.(".", { checkOwnership: false })
+          .catch(() => undefined);
         if (self && (self.commonDir ?? self.gitDir) === (source.commonDir ?? source.gitDir)) {
           throw refuse();
         }

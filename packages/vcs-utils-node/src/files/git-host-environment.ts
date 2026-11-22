@@ -5,7 +5,7 @@
  * (`core.autocrlf`, `core.attributesFile`, includes with `~/`) apply as in git. Its shape is
  * `GitHostEnvironment` of `@statewalker/vcs-working-tree`.
  */
-import { homedir, type as osType } from "node:os";
+import { homedir, type as osType, userInfo } from "node:os";
 
 import { type FilesApi, readFile } from "@statewalker/vcs-utils/files";
 
@@ -49,6 +49,13 @@ export interface NodeGitHostEnvironmentOptions {
    * hooks were supported
    */
   hookRunner?: NodeHookRunner;
+  /**
+   * The effective user id the ownership checks compare repository owners with (default:
+   * `process.geteuid()`, absent on Windows); `null` turns the checks off
+   */
+  effectiveUid?: number | null;
+  /** git's runtime prefix for `%(prefix)/` (default `/usr`, as a distribution's git) */
+  prefix?: string;
 }
 
 /** The environment as `GitHostEnvironment` describes it. */
@@ -82,6 +89,13 @@ export interface NodeGitHostEnvironment {
   notesRewriteMode?: string;
   pathspecs?: { literal?: string; glob?: string; noglob?: string; icase?: string };
   hookRunner?: NodeHookRunner;
+  effectiveUid?: number;
+  sudoUid?: string;
+  assumeDifferentOwner?: boolean;
+  commandLineConfig?: Array<{ key: string; value: string | undefined }>;
+  commandLineConfigError?: string;
+  prefix?: string;
+  expandUserHome?(name: string): Promise<string | undefined>;
 }
 
 /**
@@ -119,6 +133,183 @@ function envBool(value: string | undefined): boolean {
   if (value === undefined) return false;
   const text = value.trim().toLowerCase();
   return !["", "0", "false", "no", "off"].includes(text);
+}
+
+/**
+ * Command-line configuration git cannot parse (config.c's `git_config_from_parameters`
+ * failing): git dies at its first config read, `error: <reason>` then `fatal: unable to
+ * parse command-line config` (exit 128).
+ */
+export class CommandLineConfigError extends Error {
+  readonly exitCode = 128;
+  constructor(
+    /** git's `error:` text (`bogus format in GIT_CONFIG_PARAMETERS`) */
+    readonly reason: string,
+  ) {
+    super(`error: ${reason}\nfatal: unable to parse command-line config`);
+    this.name = "CommandLineConfigError";
+  }
+}
+
+/** git's `isspace` (sane_ctype's GIT_SPACE: space, tab, newline, carriage return). */
+const isGitSpace = (c: string | undefined) => c === " " || c === "\t" || c === "\n" || c === "\r";
+
+/** git's `iskeychar`: an ASCII letter, digit or `-`. */
+const isKeyChar = (c: string) => /^[A-Za-z0-9-]$/.test(c);
+
+/**
+ * A config key as git's `config_parse_pair` / `git_config_parse_key` takes it: section and
+ * variable in lower case, a subsection as written; a key git refuses throws
+ * {@link CommandLineConfigError} with its reason.
+ */
+function canonicalConfigKey(key: string): string {
+  if (key === "") throw new CommandLineConfigError("empty config key");
+  const last = key.lastIndexOf(".");
+  if (last <= 0) throw new CommandLineConfigError(`key does not contain a section: ${key}`);
+  if (last === key.length - 1) {
+    throw new CommandLineConfigError(`key does not contain variable name: ${key}`);
+  }
+  let out = "";
+  let dot = false;
+  for (let i = 0; i < key.length; i++) {
+    const c = key[i] as string;
+    if (c === ".") dot = true;
+    if (!dot || i > last) {
+      if (!isKeyChar(c) || (i === last + 1 && !/^[A-Za-z]$/.test(c))) {
+        throw new CommandLineConfigError(`invalid key: ${key}`);
+      }
+      out += c.toLowerCase();
+    } else if (c === "\n") {
+      throw new CommandLineConfigError(`invalid key (newline): ${key}`);
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+/**
+ * git's `sq_dequote_step` at `text[at]`: one shell-quoted word (`'...'`, with `'\''` and
+ * `'\!'` for a quote and a bang), and where the text goes on after it (null at its end);
+ * undefined when the text is not quoted so.
+ */
+function sqDequoteStep(
+  text: string,
+  at: number,
+): { word: string; next: number | null } | undefined {
+  if (text[at] !== "'") return undefined;
+  let word = "";
+  let src = at;
+  for (;;) {
+    src++;
+    if (src >= text.length) return undefined;
+    const c = text[src] as string;
+    if (c !== "'") {
+      word += c;
+      continue;
+    }
+    src++;
+    if (src >= text.length) return { word, next: null };
+    if (
+      text[src] === "\\" &&
+      (text[src + 1] === "'" || text[src + 1] === "!") &&
+      text[src + 2] === "'"
+    ) {
+      word += text[src + 1];
+      src += 2;
+      continue;
+    }
+    return { word, next: src };
+  }
+}
+
+/**
+ * `$GIT_CONFIG_COUNT` as `strtoul(..., 10)` with nothing after the digits: the count, or
+ * git's reason to refuse it.
+ */
+function configCountOf(text: string): number {
+  if (text === "") return 0;
+  const match = /^[ \t\n\v\f\r]*([+-]?)(\d+)$/.exec(text);
+  if (!match) throw new CommandLineConfigError("bogus count in GIT_CONFIG_COUNT");
+  const digits = BigInt(match[2] as string);
+  // a negative count wraps to a huge unsigned one, as does one past ULONG_MAX (ERANGE)
+  if ((match[1] === "-" && digits !== 0n) || digits > 2147483647n) {
+    throw new CommandLineConfigError("too many entries in GIT_CONFIG_COUNT");
+  }
+  return Number(digits);
+}
+
+/**
+ * The command-line configuration git passes to its child processes (config.c's
+ * `git_config_from_parameters`): `GIT_CONFIG_COUNT` pairs first, then the entries of
+ * `GIT_CONFIG_PARAMETERS` (`'key=value'`, or 2.31's `'key'='value'`; a key alone, or
+ * `'key'=`, has no value: git's NULL). Anything git cannot parse (a bogus count, a missing
+ * `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`, an entry not quoted as git quotes it, a key
+ * without a section) throws {@link CommandLineConfigError} with git's reason, as git dies.
+ *
+ * @example
+ * ```typescript
+ * commandLineConfigOf({ GIT_CONFIG_PARAMETERS: "'safe.directory'='*'" });
+ * // [{ key: "safe.directory", value: "*" }]
+ * ```
+ */
+export function commandLineConfigOf(
+  env: Record<string, string | undefined>,
+): Array<{ key: string; value: string | undefined }> {
+  const out: Array<{ key: string; value: string | undefined }> = [];
+  const add = (key: string, value: string | undefined) => {
+    out.push({ key: canonicalConfigKey(key), value });
+  };
+  const count = env.GIT_CONFIG_COUNT;
+  if (count !== undefined) {
+    const n = configCountOf(count);
+    for (let i = 0; i < n; i++) {
+      const key = env[`GIT_CONFIG_KEY_${i}`];
+      if (key === undefined)
+        throw new CommandLineConfigError(`missing config key GIT_CONFIG_KEY_${i}`);
+      const value = env[`GIT_CONFIG_VALUE_${i}`];
+      if (value === undefined) {
+        throw new CommandLineConfigError(`missing config value GIT_CONFIG_VALUE_${i}`);
+      }
+      add(key, value);
+    }
+  }
+  const text = env.GIT_CONFIG_PARAMETERS;
+  if (text !== undefined) {
+    const bogus = () => new CommandLineConfigError("bogus format in GIT_CONFIG_PARAMETERS");
+    // parse_config_env_list
+    let cur: number | null = 0;
+    while (cur !== null && cur < text.length) {
+      const step = sqDequoteStep(text, cur);
+      if (!step) throw bogus();
+      const word = step.word;
+      cur = step.next;
+      if (cur === null || isGitSpace(text[cur])) {
+        // old-style 'key=value' (git_config_parse_parameter)
+        const eq = word.indexOf("=");
+        const key = eq < 0 ? word : word.slice(0, eq);
+        if (key === "") throw new CommandLineConfigError(`bogus config parameter: ${word}`);
+        add(key, eq < 0 ? undefined : word.slice(eq + 1));
+      } else if (text[cur] === "=") {
+        // new-style 'key'='value', or 'key'= (no value)
+        cur++;
+        if (text[cur] === "'") {
+          const value = sqDequoteStep(text, cur);
+          if (!value || (value.next !== null && !isGitSpace(text[value.next]))) throw bogus();
+          cur = value.next;
+          add(word, value.word);
+        } else if (cur >= text.length || isGitSpace(text[cur])) {
+          add(word, undefined);
+        } else {
+          throw bogus();
+        }
+      } else {
+        throw bogus();
+      }
+      if (cur !== null) while (cur < text.length && isGitSpace(text[cur])) cur++;
+    }
+  }
+  return out;
 }
 
 /**
@@ -169,16 +360,50 @@ export function createNodeGitHostEnvironment(
     ...(env.GIT_ICASE_PATHSPECS !== undefined ? { icase: env.GIT_ICASE_PATHSPECS } : {}),
   };
   const pathspecs = Object.keys(pathspecFlags).length > 0 ? pathspecFlags : undefined;
+  const effectiveUid =
+    options.effectiveUid === null
+      ? undefined
+      : (options.effectiveUid ??
+        (typeof process.geteuid === "function" ? process.geteuid() : undefined));
+  // git dies at its first config read on command-line config it cannot parse: kept as the
+  // error for the readers of the protected configuration to throw
+  let commandLineConfig: Array<{ key: string; value: string | undefined }> = [];
+  let commandLineConfigError: string | undefined;
+  try {
+    commandLineConfig = commandLineConfigOf(env);
+  } catch (error) {
+    if (!(error instanceof CommandLineConfigError)) throw error;
+    commandLineConfigError = error.message;
+  }
+  const readHostFile = async (path: string) => {
+    try {
+      const [files, relative] = options.files ? [options.files, path] : hostFiles(path);
+      // A FilesApi reads a missing file as empty: only read what is a file.
+      if ((await files.stats(relative))?.kind !== "file") return undefined;
+      return await readFile(files, relative);
+    } catch {
+      return undefined;
+    }
+  };
   return {
-    readFile: async (path: string) => {
-      try {
-        const [files, relative] = options.files ? [options.files, path] : hostFiles(path);
-        // A FilesApi reads a missing file as empty: only read what is a file.
-        if ((await files.stats(relative))?.kind !== "file") return undefined;
-        return await readFile(files, relative);
-      } catch {
-        return undefined;
+    readFile: readHostFile,
+    // `~user/` (git's getpwnam): the user's entry in /etc/passwd, read through the FilesApi,
+    // else the current user's own home when the name is theirs (a directory service user)
+    expandUserHome: async (name: string) => {
+      const passwd = await readHostFile("/etc/passwd");
+      if (passwd) {
+        for (const line of new TextDecoder().decode(passwd).split("\n")) {
+          const fields = line.split(":");
+          if (fields.length >= 7 && fields[0] === name) return fields[5];
+        }
       }
+      try {
+        const me = userInfo();
+        if (me.username === name) return me.homedir;
+      } catch {
+        // no user entry for this process
+      }
+      return undefined;
     },
     // the host's own files only (an injected FilesApi has no stat of them)
     ...(options.files
@@ -235,5 +460,12 @@ export function createNodeGitHostEnvironment(
     // the global pathspec magic, as given (git_env_bool reads them when a pathspec is parsed)
     ...(pathspecs ? { pathspecs } : {}),
     ...(options.hookRunner ? { hookRunner: options.hookRunner } : {}),
+    // the ownership checks (safe.directory): the effective uid, sudo's, git's test switch
+    ...(effectiveUid !== undefined ? { effectiveUid } : {}),
+    ...(env.SUDO_UID !== undefined ? { sudoUid: env.SUDO_UID } : {}),
+    ...(envBool(env.GIT_TEST_ASSUME_DIFFERENT_OWNER) ? { assumeDifferentOwner: true } : {}),
+    ...(commandLineConfig.length > 0 ? { commandLineConfig } : {}),
+    ...(commandLineConfigError !== undefined ? { commandLineConfigError } : {}),
+    prefix: options.prefix ?? "/usr",
   };
 }
