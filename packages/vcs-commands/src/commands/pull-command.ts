@@ -1,5 +1,6 @@
 import type { FilesApi } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
+import { isIndexUnborn } from "@statewalker/vcs-working-tree";
 
 import { NoHeadError } from "../errors/index.js";
 import { FastForwardMode, isMergeSuccessful, type MergeStrategy } from "../results/merge-result.js";
@@ -240,6 +241,20 @@ export class PullCommand extends TransportCommand<PullResult> {
     const autoStash = rebase
       ? (pullAutoStash ?? parseGitBool(this.config("rebase.autoStash")) ?? false)
       : pullAutoStash;
+    const origHead = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
+    if (rebase && origHead === undefined && !(await isIndexUnborn(this.staging))) {
+      // git's pull.c: an unborn branch with an index file (even one without entries) is
+      // refused before the fetch, --autostash or not
+      return {
+        rebaseResult: {
+          status: RebaseStatus.FAILED,
+          message: "fatal: Updating an unborn branch with changes added to the index.",
+        },
+        successful: false,
+        rebaseUsed: true,
+        fetchedFrom: this.remote,
+      };
+    }
     if (rebase && !autoStash) {
       // require_clean_work_tree("pull with rebase"), before anything is fetched
       const refusal = await new RebaseCommand(this._workingCopy).checkCleanWorkTree(
@@ -307,6 +322,22 @@ export class PullCommand extends TransportCommand<PullResult> {
       return {
         fetchResult,
         successful: true,
+        rebaseUsed: false,
+        fetchedFrom: this.remote,
+      };
+    }
+
+    // pull_into_void: an unborn branch (rebasing or not) branches off what was fetched, a
+    // two-way switch from the empty tree keeping the staged changes it does not overwrite
+    const headNow = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
+    if (origHead === undefined && headNow === undefined) {
+      const mergeResult = await new MergeCommand(this._workingCopy)
+        .shareHooksOf(this)
+        .callIntoVoid(trackingRefResolved.objectId);
+      return {
+        fetchResult,
+        mergeResult,
+        successful: isMergeSuccessful(mergeResult.status),
         rebaseUsed: false,
         fetchedFrom: this.remote,
       };

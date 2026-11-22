@@ -2,6 +2,7 @@ export * from "./add-command.js";
 export * from "./add-patch/index.js";
 export * from "./am/index.js";
 export * from "./apply/index.js";
+export * from "./backfill-command.js";
 export * from "./bisect/index.js";
 export * from "./blame-command.js";
 export * from "./branch-command.js";

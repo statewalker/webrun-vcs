@@ -37,7 +37,7 @@ describe("repository format check", () => {
     ["noop-v1 in version 1", v(1, "\tnoop-v1 = true\n")],
     ["worktreeConfig", v(1, "\tworktreeConfig = true\n")],
     ["preciousObjects (opens; gc refuses)", v(0, "\tpreciousObjects = true\n")],
-    ["partialClone (opens; gc refuses)", v(1, "\tpartialClone = origin\n")],
+    ["partialClone (opens)", v(1, "\tpartialClone = origin\n")],
     ["objectFormat = sha1", v(1, "\tobjectFormat = sha1\n")],
     ["refStorage = files", v(1, "\trefStorage = files\n")],
     ["relativeWorktrees", v(1, "\trelativeWorktrees = true\n")],
@@ -156,12 +156,11 @@ describe("gc in a precious-objects repository", () => {
 });
 
 describe("gc in a partial clone", () => {
-  it("GcOrchestrator refuses, deleting nothing; gc() and repack() run as git's", async () => {
+  it("GcOrchestrator, gc() and repack() prune what nothing reaches, as git's", async () => {
     const { files, backend, orphan } = await backendWith("\tpartialClone = origin\n");
     const orchestrator = new GcOrchestrator(backend.history, new FileGcStrategy(backend));
-    await expect(orchestrator.run({ pruneExpireMs: 0 })).rejects.toThrow(
-      /cannot prune in a partial clone/,
-    );
+    const pruned = await orchestrator.run({ pruneExpireMs: 0, dryRun: true });
+    expect(pruned.prunedObjects).toBe(1);
     expect(await backend.history.blobs.has(orphan)).toBe(true);
     // the promisor objects stay out of the walk; what nothing reaches is pruned
     await repack(backend);

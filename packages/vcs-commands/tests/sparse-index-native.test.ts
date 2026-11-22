@@ -413,3 +413,54 @@ describeGit("sparse index with intent-to-add entries, against native git", () =>
     expect(run(dir, ["fsck", "--no-progress", "--no-dangling"]).exit).toBe(0);
   });
 });
+
+describeGit("sparse index below an intent-to-add entry, against native git", () => {
+  // 2.43's convert_to_sparse_rec collapses invalid directories too (no `span < 0` check)
+  it.runIf(version === "2.56")(
+    "converting a full index never collapses a directory below one holding an intent-to-add entry",
+    async () => {
+      const dir = repo();
+      git(dir, ["sparse-checkout", "set", "k"]);
+      git(dir, ["config", "advice.sparseIndexExpanded", "false"]);
+      // s/ita: s/ invalid, so s/t/ stays expanded; u/v/ita: u/ and u/v/ invalid, u/v/w/ too
+      put(dir, "s/ita", "i\n");
+      put(dir, "u/v/ita", "i\n");
+      git(dir, ["add", "--sparse", "-N", "s/ita", "u/v/ita"]);
+      settle(dir);
+      const { native, ours: mine } = copies(dir);
+      const args = ["reapply", "--sparse-index"];
+      expect(await sparseCheckout(mine, args)).toEqual(run(native, ["sparse-checkout", ...args]));
+      const s = await structure(mine);
+      expect(s).toEqual(await structure(native));
+      expect(s.entries.filter((e) => e.startsWith("40000"))).toEqual([]);
+      expect(view(mine)).toEqual(view(native));
+    },
+  );
+
+  it.runIf(version === "2.56")(
+    "a directory read sparse stays collapsed when an intent-to-add entry lands above it, as git keeps it",
+    async () => {
+      const dir = repo();
+      git(dir, ["sparse-checkout", "set", "--sparse-index", "k"]);
+      git(dir, ["config", "advice.sparseIndexExpanded", "false"]);
+      // s/c back in the worktree: s/ expanded, s/t/ a sparse directory
+      git(dir, ["config", "index.sparse", "false"]);
+      git(dir, ["update-index", "--no-skip-worktree", "s/c"]);
+      git(dir, ["checkout", "--", "s/c"]);
+      git(dir, ["config", "index.sparse", "true"]);
+      git(dir, ["update-index", "-q", "--refresh"]);
+      expect(git(dir, ["ls-files", "--sparse"])).toBe("k/a\nk/sub/b\ns/c\ns/t/\ntop\nu/");
+      put(dir, "s/ita", "i\n");
+      git(dir, ["add", "--sparse", "-N", "s/ita"]);
+      expect(git(dir, ["ls-files", "--sparse"])).toBe("k/a\nk/sub/b\ns/c\ns/ita\ns/t/\ntop\nu/");
+      put(dir, "k/a", "changed\n");
+      settle(dir);
+      const { native, ours: mine } = copies(dir);
+      git(native, ["add", "k/a"]);
+      await (await ours(mine)).add().addFilepattern("k/a").call();
+      expect(await structure(mine)).toEqual(await structure(native));
+      expect(git(mine, ["ls-files", "--sparse"])).toBe("k/a\nk/sub/b\ns/c\ns/ita\ns/t/\ntop\nu/");
+      expect(view(mine)).toEqual(view(native));
+    },
+  );
+});

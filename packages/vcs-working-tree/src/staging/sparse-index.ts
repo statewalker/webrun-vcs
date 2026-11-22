@@ -115,7 +115,9 @@ export async function expandSparseIndex(
  * `path_in_sparse_checkout` of the directory's path with its trailing slash) becomes one
  * sparse directory entry when every entry below it is skip-worktree, merged and no gitlink,
  * and its cache-tree node is valid (an intent-to-add entry leaves every node above it
- * invalid, as `update_one` does, so its directory is never collapsed). Also returns the sparse index's cache-tree (git's
+ * invalid, as `update_one` does, so its directory is never collapsed). An invalid node is
+ * copied entry by entry and never entered, so no directory below it collapses either (the
+ * root's own validity is never checked). Also returns the sparse index's cache-tree (git's
  * `cache_tree_update` after the conversion): a sparse directory counts as one entry.
  */
 export function collapseSparseIndex(
@@ -208,7 +210,10 @@ export function sparseCacheTreeOf(
  * below the directory). Undefined when a directory read sparse no longer qualifies (an entry
  * below it intent-to-add included: git's cache-tree leaves that directory invalid), or its
  * tree cannot be had: git would have expanded the index, and the write converts the full
- * index instead. A directory is never written as a tree its entries do not make.
+ * index instead. A directory is never written as a tree its entries do not make. An
+ * intent-to-add entry outside a directory read sparse, above it, keeps it collapsed: git's
+ * index stays collapsed (`convert_to_sparse` does nothing to it), though a conversion of
+ * the full index would not collapse it.
  */
 export async function recollapseSparseIndex(
   entries: readonly StagingEntry[],

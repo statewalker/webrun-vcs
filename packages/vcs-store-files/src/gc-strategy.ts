@@ -20,9 +20,10 @@ import type {
   ObjectId,
   StorageStats,
 } from "@statewalker/vcs-core";
-import { joinPath } from "@statewalker/vcs-core";
+import { joinPath, objectsWithoutLazyFetch } from "@statewalker/vcs-core";
 
 import { assertAlternatesReadable } from "./alternates/index.js";
+import { promisorExclusions } from "./promisor-objects.js";
 import { collectReachabilityRoots } from "./reachable-objects.js";
 
 import { type RepackTarget, repack } from "./repack.js";
@@ -65,18 +66,27 @@ export class FileGcStrategy implements GcStrategy {
    * HEAD, the index, every reflog file, linked worktrees and pseudo-refs; strict, as `gc()`.
    * Called first by the orchestrator, so it also refuses, before anything is pruned, a
    * repository with `extensions.preciousObjects` (git: "cannot prune in a precious-objects
-   * repo") or a partial clone (`extensions.partialClone`, a promisor remote):
-   * `UnsupportedRepositoryFormatError`. Alternates are read: only the repository's own loose
+   * repo"): `UnsupportedRepositoryFormatError`. In a partial clone (a promisor remote) the
+   * promisor objects (`promisorExclusions`: the objects of promisor packs and the absent
+   * objects they name) are kept without being walked (`GcRoots.keep`), and the local objects
+   * promisor objects link to are roots (`PromisorExclusions.roots`), as `git gc` keeps them. Alternates are read: only the repository's own loose
    * objects are pruned. git's non-fatal alternates errors (a directory gone, ...) do not stop
    * it, alternates git reads and this store cannot do (`AlternatesUnreadableError`, see gc).
    */
   async collectRoots(): Promise<GcRoots> {
-    const { files, gitDir, history, objects } = this.target;
-    assertObjectsDeletable(await readRepositoryFormat(files, gitDir), "prune");
+    const { files, gitDir, history } = this.target;
+    // the walks read no absent object of a partial clone (git's fetch_if_missing = 0)
+    const objects = objectsWithoutLazyFetch(this.target.objects);
+    assertObjectsDeletable(await readRepositoryFormat(files, gitDir), "prune", {
+      partialClone: "allow",
+    });
     await assertAlternatesReadable({ files, gitDir, objects }, "prune");
-    return {
-      roots: await collectReachabilityRoots({ files, gitDir, refs: history.refs, objects }),
-    };
+    const roots = await collectReachabilityRoots({ files, gitDir, refs: history.refs, objects });
+    // a partial clone: its promisor objects are kept unwalked, the local objects they link to
+    // walked as roots (gc's --exclude-promisor-objects and repack_local_links)
+    const exclusions = await promisorExclusions(objects, files, gitDir);
+    if (!exclusions) return { roots };
+    return { roots: [...roots, ...exclusions.roots], keep: exclusions.excluded };
   }
 
   /**

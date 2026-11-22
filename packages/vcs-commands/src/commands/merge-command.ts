@@ -406,6 +406,51 @@ export class MergeCommand extends GitCommand<MergeResult> {
     return this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result;
   }
 
+  /**
+   * git pull's `pull_into_void` on an unborn branch: `checkout_fast_forward` from the empty
+   * tree to `mergeHead` (a two-way switch, so a staged change the commit does not touch is
+   * kept, one it would overwrite refuses the pull), then HEAD's branch created at it with the
+   * reflog line `initial pull`. Used by {@link PullCommand}; a one-shot call like
+   * {@link call}.
+   */
+  async callIntoVoid(mergeHead: ObjectId): Promise<MergeResult> {
+    this.checkCallable();
+    this.setCallable(false);
+    await this.readCurrentIndex();
+    const worktree = this.worktreeAccess;
+    const run = async (): Promise<MergeResult> => {
+      const targetTree = await this.commits.getTree(mergeHead);
+      const target = await flatTree(this.trees, targetTree);
+      const refused = await switchTrees(this.context(worktree), new Map(), target, {
+        action: "merge",
+        operation: "merge",
+        targetTree,
+      });
+      if (refused) {
+        return {
+          status: MergeStatus.FAILED,
+          mergedCommits: [mergeHead],
+          message: refused.message,
+          failingPaths: failing(refused.paths),
+          output: [],
+        };
+      }
+      // refs_update_ref("HEAD", merge_head, curr_head): the message as it is, no action
+      const head = await this.refsStore.get("HEAD");
+      const name =
+        head && "target" in head && typeof head.target === "string" ? head.target : "HEAD";
+      await this.refsStore.set(name, mergeHead, this.reflogLine("initial pull", this.committer));
+      return {
+        status: MergeStatus.FAST_FORWARD,
+        newHead: mergeHead,
+        mergedCommits: [mergeHead],
+        output: [],
+      };
+    };
+    const result = await (worktree?.batch ? worktree.batch(run) : run());
+    return this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result;
+  }
+
   /** What the sparse checkout printed while the result was written (see MergeResult.warnings). */
   private readonly sparseWarnings: string[] = [];
 

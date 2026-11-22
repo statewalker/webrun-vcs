@@ -1,8 +1,8 @@
 /**
  * The repository format check against repositories native git made: a reftable or sha256
  * repository, or one with an unknown version-1 extension, is refused when opened (git refuses
- * the last one too); preciousObjects and partial clones open, but gc and repack delete nothing
- * there; in a repository with alternates they delete only its own objects. Reftable needs git 2.45 or newer: that test is skipped on older gits.
+ * the last one too); preciousObjects repositories open, but gc and repack delete nothing
+ * there; partial clones open and gc keeps their promisor objects; in a repository with alternates they delete only its own objects. Reftable needs git 2.45 or newer: that test is skipped on older gits.
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { cpSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
@@ -232,7 +232,7 @@ describe("format extensions read as git_config_bool", () => {
 });
 
 describe("a partial clone", () => {
-  it("opens; GcOrchestrator refuses, gc() and repack() keep the promisor packs apart", async () => {
+  it("opens; GcOrchestrator prunes, gc() and repack() keep the promisor packs apart", async () => {
     const src = nativeRepo();
     git(src, ["config", "uploadpack.allowFilter", "true"]);
     const dir = join(tempDir("repo-format-partial-"), "clone");
@@ -247,11 +247,12 @@ describe("a partial clone", () => {
       git(dir, ["rev-parse", "HEAD"]).trim(),
     );
     const orchestrator = new GcOrchestrator(backend.history, new FileGcStrategy(backend));
-    await expect(orchestrator.run({ pruneExpireMs: 0 })).rejects.toThrow(
-      /cannot prune in a partial clone/,
-    );
-    expect(stored(dir)).toEqual(before);
     expect(before.has(orphan)).toBe(true);
+    // the orchestrator prunes the old unreachable loose blob, the promisor objects kept
+    const result = await orchestrator.run({ pruneExpireMs: 0 });
+    expect(result.prunedObjects).toBe(1);
+    expect(stored(dir)).toEqual(new Set([...before].filter((id) => id !== orphan)));
+    expect(spawnSync("git", ["fsck"], { cwd: dir, env: GIT_ENV }).status).toBe(0);
     // git's gc in a partial clone: the promisor objects repacked into a promisor pack, the
     // old unreachable loose blob pruned, the repository whole to native fsck
     await repack(backend);

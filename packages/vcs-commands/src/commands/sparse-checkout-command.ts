@@ -15,6 +15,7 @@
  * ```
  */
 
+import { FileMode, joinPath, type PosixFilesApi } from "@statewalker/vcs-core";
 import { GitWorkingCopyConfig } from "@statewalker/vcs-store-files";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import {
@@ -31,6 +32,7 @@ import {
   sparsePatternsFromLines,
   splitPatternLines,
   type WorkingCopyConfig,
+  type Worktree,
 } from "@statewalker/vcs-working-tree";
 
 import { GitCommand } from "../git-command.js";
@@ -38,8 +40,10 @@ import { RemoteConfigStore } from "../remote-config/index.js";
 import { quotePath } from "../results/quote-path.js";
 import {
   cleanTrackedSparseDirectories,
+  entryList,
   readSparseCheckoutFile,
   sparseCheckoutConfig,
+  sparseDirectoriesOf,
   sparseWarningText,
   updateSparsity,
 } from "./sparse-checkout-support.js";
@@ -67,7 +71,8 @@ export type SparseCheckoutSubcommand =
   | "list"
   | "reapply"
   | "disable"
-  | "check-rules";
+  | "check-rules"
+  | "clean";
 
 const SUBCOMMANDS = new Set<string>([
   "list",
@@ -186,6 +191,9 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
   private stdin: Uint8Array = new Uint8Array();
   private rulesFileText?: string;
   private compatibility: SparseCheckoutCompatibility = "2.56";
+  private dryRun = false;
+  private force = false;
+  private verbose = false;
 
   private out = "";
   private err = "";
@@ -246,6 +254,27 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
     return this;
   }
 
+  /** `clean --dry-run` (`-n`): print what would be removed, remove nothing. */
+  setDryRun(dryRun: boolean): this {
+    this.checkCallable();
+    this.dryRun = dryRun;
+    return this;
+  }
+
+  /** `clean --force` (`-f`), needed unless `--dry-run` or `clean.requireForce=false`. */
+  setForce(force: boolean): this {
+    this.checkCallable();
+    this.force = force;
+    return this;
+  }
+
+  /** `clean --verbose` (`-v`): each file removed, not only its directory. */
+  setVerbose(verbose: boolean): this {
+    this.checkCallable();
+    this.verbose = verbose;
+    return this;
+  }
+
   /** `check-rules -z`: input and output terminated by NUL. */
   setNulTerminated(nul: boolean): this {
     this.checkCallable();
@@ -296,6 +325,11 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
       args.push("--stdin");
     }
     if (this.nulTerminated) args.push("-z");
+    if (this.subcommand === "clean") {
+      if (this.dryRun) args.push("--dry-run");
+      if (this.force) args.push("--force");
+      if (this.verbose) args.push("--verbose");
+    }
     if (this.patterns.length > 0) args.push("--", ...this.patterns);
     return args;
   }
@@ -320,9 +354,7 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
       if (sub.startsWith("-") && sub !== "-") throw this.usage("", unknownOption(sub));
       throw this.usage("", `unknown subcommand: \`${sub}'`);
     }
-    if (sub === "clean") {
-      throw new SparseDie("sparse-checkout clean needs a sparse index, which is not supported");
-    }
+    if (sub === "clean") return this.clean(rest);
     const opts = this.parseOptions(sub, rest);
     const state = this.runState();
     // disable expands the index on purpose: no hint
@@ -471,6 +503,111 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
   }
 
   // ---------------------------------------------------------------- subcommands
+
+  /**
+   * sparse_checkout_clean (git 2.5x): every directory the index collapses to a sparse
+   * directory (`convert_to_sparse` in memory, whatever `index.sparse` says) is removed with
+   * all it holds, untracked and ignored files too; a directory missing from the worktree is
+   * passed over. A sparse directory that is a symbolic link in the worktree is passed over
+   * too, where git follows it (`remove_dir_recursively` of the path) and empties the
+   * directory it points to, which may lie outside the worktree: ours keeps that data, the
+   * safer choice.
+   */
+  private async clean(rest: string[]): Promise<number> {
+    const state = this.runState();
+    // setup_work_tree, then the mode checks before parse_options
+    if (!state.apply) throw new SparseDie("must be in a sparse-checkout to clean directories");
+    if (!state.cone) {
+      throw new SparseDie("must be in a cone-mode sparse-checkout to clean directories");
+    }
+    const opts = parseCleanOptions(rest);
+    if (opts.help) {
+      this.out += CLEAN_USAGE;
+      return 0;
+    }
+    if (opts.error !== undefined) {
+      // a value given to a flag is reported alone, as parse_options does
+      const usage = opts.error.endsWith("takes no value") ? "" : CLEAN_USAGE;
+      throw new SparseDie(`error: ${opts.error}\n${usage}`, 129, true);
+    }
+    const raw = RemoteConfigStore.from(this.workingCopy).value("clean.requireforce");
+    let requireForce = true;
+    if (raw !== undefined) {
+      const parsed = parseGitBool(raw);
+      if (parsed === undefined) {
+        throw new SparseDie(`bad boolean config value '${raw}' for 'clean.requireforce'`);
+      }
+      requireForce = parsed;
+    }
+    if (requireForce && !opts.force && !opts.dryRun) {
+      throw new SparseDie("for safety, refusing to clean without one of --force or --dry-run");
+    }
+    const content = await readSparseCheckoutFile(this.workingCopy);
+    const patterns = sparsePatternsFromLines(
+      content === undefined ? [] : splitPatternLines(content),
+      state.cone,
+      state.ignoreCase,
+    );
+    const dirs = sparseDirectoriesOf(await entryList(this.staging), patterns);
+    if (!dirs) {
+      throw new SparseDie(
+        "failed to convert index to a sparse index; resolve merge conflicts and try again",
+      );
+    }
+    const worktree = this.worktreeAccess;
+    if (!worktree) return 0;
+    const message = opts.dryRun ? "Would remove" : "Removing";
+    for (const dir of dirs) {
+      const path = dir.slice(0, -1);
+      const current = await worktree.getEntry(path).catch(() => undefined);
+      if (!current?.isDirectory || current.mode === FileMode.SYMLINK) continue;
+      if (opts.verbose) {
+        for (const file of await this.filesBelow(worktree, dir)) this.out += `${message} ${file}\n`;
+      } else {
+        this.out += `${message} ${dir}\n`;
+      }
+      if (opts.dryRun) continue;
+      const removed = await worktree.remove(path, { recursive: true }).catch(() => false);
+      if (!removed) this.warn(`failed to remove '${dir}'`);
+    }
+    return 0;
+  }
+
+  /**
+   * dir.c's for_each_file_in_dir under `dir` (with its trailing slash): the regular files,
+   * depth first in readdir order; symbolic links and other kinds are not listed.
+   */
+  private async filesBelow(worktree: Worktree, dir: string): Promise<string[]> {
+    const files = worktree.getFiles?.() as PosixFilesApi | undefined;
+    const root = worktree.getRoot?.() ?? "";
+    if (!files) return [];
+    const full = (path: string) => (root ? joinPath(root, path) : path);
+    const out: string[] = [];
+    const walk = async (prefix: string): Promise<void> => {
+      let entries: { name: string; kind?: string }[] = [];
+      try {
+        if (files.listKinds) {
+          entries = await files.listKinds(full(prefix.slice(0, -1)), { readdirOrder: true });
+        } else {
+          for await (const e of files.list(full(prefix.slice(0, -1)))) {
+            entries.push({ name: e.name, kind: e.kind });
+          }
+        }
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const path = `${prefix}${entry.name}`;
+        let kind = entry.kind;
+        if (kind === undefined)
+          kind = (await files.lstat?.(full(path)).catch(() => undefined))?.kind;
+        if (kind === "file") out.push(path);
+        else if (kind === "directory") await walk(`${path}/`);
+      }
+    };
+    await walk(dir);
+    return out;
+  }
 
   /** sparse_checkout_list */
   private async list(state: RunState): Promise<number> {
@@ -1033,6 +1170,78 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
 }
 
 // ------------------------------------------------------------------ helpers
+
+const CLEAN_USAGE =
+  "usage: git sparse-checkout clean [-n|--dry-run]\n\n" +
+  "    -n, --[no-]dry-run    dry run\n" +
+  "    -f, --[no-]force      force\n" +
+  "    -v, --[no-]verbose    report each affected file, not just directories\n\n";
+
+/**
+ * parse_options of `sparse-checkout clean`: `-n`/`--dry-run`, `-f`/`--force` and
+ * `-v`/`--verbose` (bundled short options, unique prefixes, `--no-` forms), anywhere before
+ * `--`; other arguments are ignored, as git ignores them.
+ */
+function parseCleanOptions(rest: string[]): {
+  dryRun: boolean;
+  force: boolean;
+  verbose: boolean;
+  help?: boolean;
+  error?: string;
+} {
+  const opts = { dryRun: false, force: false, verbose: false };
+  const longs = ["dry-run", "force", "verbose"] as const;
+  const set = (name: (typeof longs)[number], value: boolean) => {
+    if (name === "dry-run") opts.dryRun = value;
+    else if (name === "force") opts.force = value;
+    else opts.verbose = value;
+  };
+  for (const arg of rest) {
+    if (arg === "--") break;
+    if (arg === "-h") return { ...opts, help: true };
+    if (!arg.startsWith("-") || arg === "-") continue;
+    if (!arg.startsWith("--")) {
+      for (const c of arg.slice(1)) {
+        if (c === "n") opts.dryRun = true;
+        else if (c === "f") opts.force = true;
+        else if (c === "v") opts.verbose = true;
+        else if (c === "h") return { ...opts, help: true };
+        else return { ...opts, error: `unknown switch \`${c}'` };
+      }
+      continue;
+    }
+    let name = arg.slice(2);
+    const eq = name.indexOf("=");
+    const hasValue = eq >= 0;
+    if (hasValue) name = name.slice(0, eq);
+    let negated = false;
+    let candidates: string[] = longs.filter((l) => l === name);
+    if (candidates.length === 0 && name.startsWith("no-")) {
+      candidates = longs.filter((l) => l === name.slice(3));
+      negated = candidates.length > 0;
+    }
+    if (candidates.length === 0) {
+      const all = [
+        ...longs.map((l) => [l, false] as const),
+        ...longs.map((l) => [l, true] as const),
+      ];
+      const found = all.filter(([l, neg]) => (neg ? `no-${l}` : l).startsWith(name));
+      if (found.length > 1) {
+        const names = found.slice(0, 2).map(([l, neg]) => `--${neg ? "no-" : ""}${l}`);
+        return { ...opts, error: `ambiguous option: ${name} (could be ${names.join(" or ")})` };
+      }
+      if (found.length === 1) {
+        candidates = [(found[0] as readonly [string, boolean])[0]];
+        negated = (found[0] as readonly [string, boolean])[1];
+      }
+    }
+    const match = candidates[0] as (typeof longs)[number] | undefined;
+    if (!match) return { ...opts, error: `unknown option \`${name}'` };
+    if (hasValue) return { ...opts, error: `option \`${match}' takes no value` };
+    set(match, !negated);
+  }
+  return opts;
+}
 
 function unknownOption(arg: string): string {
   return arg.startsWith("--") ? `unknown option \`${arg.slice(2)}'` : `unknown switch \`${arg[1]}'`;
