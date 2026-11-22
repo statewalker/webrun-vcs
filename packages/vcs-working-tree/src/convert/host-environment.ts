@@ -246,10 +246,31 @@ export interface HookOutcome {
 export interface HookRunner {
   run(invocation: HookInvocation): Promise<HookOutcome | undefined>;
   /**
+   * Starts the hook and hands back the running process, its stdin and stdout piped to the
+   * caller (git's `start_command` with `in = out = -1`: receive-pack talks to proc-receive
+   * while it runs); undefined when the script cannot be started ("no hook"). Without it such
+   * a hook is given its whole stdin at once through {@link run}.
+   */
+  start?(invocation: HookInvocation): Promise<HookProcess | undefined>;
+  /**
    * The git version whose wording and order the hooks follow where versions differ (the
    * `advice.ignoredHook` hint, reference-transaction's states); default `2.56`
    */
   compatibility?: "2.43" | "2.56";
+}
+
+/** A hook running, talked to while it runs (see {@link HookRunner.start}). */
+export interface HookProcess {
+  /** Writes to its stdin; rejects once it closed it (it exited) */
+  write(data: Uint8Array): Promise<void>;
+  /** Closes its stdin */
+  closeStdin(): Promise<void>;
+  /** Its stdout, as it writes it */
+  readonly stdout: AsyncIterable<Uint8Array>;
+  /** Stops reading its stdout, closing the pipe (its later writes fail, as after git's `close`) */
+  closeStdout(): void;
+  /** Waits for it to exit: its exit code and stderr (`stdout` empty: read through {@link stdout}) */
+  wait(): Promise<HookOutcome>;
 }
 
 const join = (dir: string, name: string) =>

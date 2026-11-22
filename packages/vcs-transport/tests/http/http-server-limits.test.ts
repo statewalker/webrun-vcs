@@ -180,12 +180,11 @@ describe("smart-HTTP server: wants and capabilities", () => {
     expect(text).not.toContain("PACK");
   });
 
-  it("receive-pack does not advertise report-status-v2", async () => {
+  it("receive-pack advertises report-status and report-status-v2, as git's", async () => {
     const { repo } = await serverRepo();
     const response = await handleReceivePackInfoRefs(repo.refStore);
     const text = decoder.decode(await bodyBytes(response));
-    expect(text).toContain("report-status");
-    expect(text).not.toContain("report-status-v2");
+    expect(text).toContain("report-status report-status-v2");
   });
 
   it("upload-pack (v0) advertises only what it implements, by policy", () => {

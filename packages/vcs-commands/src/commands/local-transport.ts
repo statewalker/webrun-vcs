@@ -431,6 +431,8 @@ export async function receivePackSettingsOf(
     publishBeforeUpdate: true,
     // ... and runs pre-receive with every command, refused ones included (skip_broken 0)
     preReceiveSeesRefused: true,
+    // receive.procReceiveRefs: the commands the proc-receive hook takes
+    ...(settings.procReceiveRefs?.length ? { procReceiveRefs: settings.procReceiveRefs } : {}),
     // git 2.5x updates the refs of a push that is not atomic in two batches
     ...(hooks?.enabled && hooks.compatibility !== "2.43" ? { batchNonAtomic: true } : {}),
     // ... git 2.43 updates each ref after its update hook
@@ -542,7 +544,8 @@ export function remoteHookSession(
     ...(options.localPush ? { unsetEnv: LOCAL_REPO_ENV } : {}),
     // git 2.5x's configured hooks (hook.<name>.*) of the receiving repository: receive-pack
     // runs pre-receive, update, post-receive, post-update, push-to-checkout and
-    // reference-transaction through the hook API (only proc-receive through find_hook)
+    // reference-transaction through the hook API (proc-receive through find_hook alone:
+    // `HookSession.start`)
     hookSettings: () => {
       const config = remote.config;
       if (!config) return [];
@@ -653,10 +656,13 @@ function hookClientEnv(hooks: HookSession, ctx: ReceivePackHookContext | undefin
 
 /**
  * receive-pack's hooks as scripts (builtin/receive-pack.c `run_receive_hook`,
- * `run_update_hook`, `run_update_post_hook`): pre-receive and post-receive read
- * `<old> <new> <ref>` lines on stdin (with `GIT_PUSH_OPTION_COUNT` and the options), update
- * is told one ref, post-update the refs that moved; each runs with `GIT_DIR=.` and its
- * output goes to the pushing user (side-band, git's "remote: " lines).
+ * `run_update_hook`, `run_update_post_hook`, `run_proc_receive_hook`): pre-receive and
+ * post-receive read `<old> <new> <ref>` lines on stdin (with `GIT_PUSH_OPTION_COUNT` and the
+ * options; post-receive the proc-receive hook's reports in place of their commands), update
+ * is told one ref, post-update the refs that moved, proc-receive is started and talked to
+ * over its stdin and stdout (found as `find_hook` finds it: no configured hook); each runs
+ * with `GIT_DIR=.` and its output goes to the pushing user (side-band, git's "remote: "
+ * lines).
  */
 function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
   const lines = (commands: readonly ReceiveCommand[]) =>
@@ -708,9 +714,17 @@ function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
     },
     postReceive: async (commands, ctx) => {
       await run("post-receive", ctx, { stdin: lines(commands), env: optionEnv(ctx) });
-      if (commands.length > 0) {
-        await run("post-update", ctx, { args: commands.map((c) => c.refName) });
-      }
+      // run_update_post_hook: the refs pushed (not the proc-receive hook's reports)
+      const refs = commands.filter((c) => !c.report).map((c) => c.pushedRef ?? c.refName);
+      if (refs.length > 0) await run("post-update", ctx, { args: refs });
     },
+    // run_proc_receive_hook: its stdin and stdout piped, its stderr relayed to the user; the
+    // objects are published by now (no quarantine variables) and no push option variables
+    procReceive: (ctx) =>
+      hooks.start("proc-receive", {
+        env: { ...hookClientEnv(hooks, ctx), GIT_DIR: "." },
+        prefix: false,
+        onStderr: (text) => ctx.message(text),
+      }),
   };
 }

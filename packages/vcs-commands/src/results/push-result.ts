@@ -51,6 +51,25 @@ export interface RemoteRefUpdate {
   forceUpdate: boolean;
   /** Whether this was a delete operation */
   delete: boolean;
+  /**
+   * What the server reported doing instead (report-status-v2, from its proc-receive hook):
+   * one entry per rewrite, `refName`/`oldObjectId`/`newObjectId` absent where the update's own
+   * value stands (git prints a status line per entry and follows each with its
+   * remote-tracking ref)
+   */
+  reports?: RemoteRefReport[];
+}
+
+/** One rewrite the server reported for a pushed ref. */
+export interface RemoteRefReport {
+  /** The ref the server changed (`option refname`) */
+  refName?: string;
+  /** Its value before (`option old-oid`) */
+  oldObjectId?: ObjectId;
+  /** Its value after (`option new-oid`) */
+  newObjectId?: ObjectId;
+  /** A forced update (`option forced-update`) */
+  forcedUpdate?: boolean;
 }
 
 /**
@@ -76,6 +95,11 @@ export interface PushResult {
    * `core.abbrev`, the status column `transport_summary_width` wide
    */
   display?: string[];
+  /**
+   * What `git push --porcelain` prints on stdout: `To <url>`, a
+   * `<flag>\t<from>:<to>\t<summary>` line per ref (and per server report), `Done`
+   */
+  porcelain?: string[];
 }
 
 /**

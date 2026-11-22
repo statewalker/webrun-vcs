@@ -61,11 +61,29 @@ export interface PushRefUpdate {
   /** The server's reason for `remote-rejected` */
   message?: string;
   /**
+   * What the server reported doing instead (report-status-v2's `option` lines, from a
+   * proc-receive hook): one entry per rewrite, each field absent where the update's own value
+   * stands. git prints one status line per entry and updates the remote-tracking ref of each.
+   */
+  reports?: PushRefReport[];
+  /**
    * git's status column: `[new branch]`, `abc1234..def5678`, `+ abc1234...def5678 (forced
    * update)`, `[up to date]`, `[deleted]`, `[rejected] (fetch first)`, `[remote rejected]
    * (hook declined)`, …
    */
   summary: string;
+}
+
+/** One rewrite the server reported for an update (git's `struct ref_push_report`). */
+export interface PushRefReport {
+  /** The ref the server changed (`option refname`) */
+  refName?: string;
+  /** Its value before (`option old-oid`) */
+  oldOid?: string;
+  /** Its value after (`option new-oid`) */
+  newOid?: string;
+  /** A forced update (`option forced-update`) */
+  forcedUpdate?: boolean;
 }
 
 /** What the local repository has, as the push refspecs see it. */

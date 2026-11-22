@@ -49,6 +49,29 @@ export interface PushCommand {
    * its old value (git deletes it anyway, "allowing deletion of corrupt ref")
    */
   expectedOid?: string;
+  /**
+   * Server side: the command goes to the proc-receive hook (`PROC_RECEIVE_SCHEDULED`), and
+   * the hook reported on it (`PROC_RECEIVE_RETURNED`); 0 or absent: receive-pack updates it
+   */
+  procReceive?: number;
+  /** Server side: the rewrites the proc-receive hook reported (`report-status-v2`'s options) */
+  reports?: RefPushReport[];
+}
+
+/**
+ * One rewrite the proc-receive hook reported for a command (git's `struct ref_push_report`):
+ * what the client is told happened instead of the command, each field absent where the
+ * command's own value stands.
+ */
+export interface RefPushReport {
+  /** The ref actually changed (`option refname`) */
+  refName?: string;
+  /** Its value before (`option old-oid`) */
+  oldOid?: string;
+  /** Its value after (`option new-oid`) */
+  newOid?: string;
+  /** A forced update (`option forced-update`) */
+  forcedUpdate?: boolean;
 }
 
 /**

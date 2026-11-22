@@ -280,6 +280,8 @@ export interface ReceivePackServerOptions {
   publishBeforeUpdate?: boolean;
   /** pre-receive sees the commands refused before it too (git's receive-pack; see `ReceivePackConfig`) */
   preReceiveSeesRefused?: boolean;
+  /** git's `receive.procReceiveRefs` (see `ReceivePackConfig.procReceiveRefs`) */
+  procReceiveRefs?: readonly string[];
 }
 
 /**
@@ -1095,6 +1097,7 @@ export async function handleReceivePack(
       ...(rp.interleaveUpdateHook ? { interleaveUpdateHook: true } : {}),
       ...(rp.publishBeforeUpdate ? { publishBeforeUpdate: true } : {}),
       ...(rp.preReceiveSeesRefused ? { preReceiveSeesRefused: true } : {}),
+      ...(rp.procReceiveRefs?.length ? { procReceiveRefs: rp.procReceiveRefs } : {}),
       logger: options.logger,
       request: {
         method: request.method,

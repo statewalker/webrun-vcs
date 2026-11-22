@@ -30,9 +30,20 @@ export interface NodeHookOutcome {
   stderr: Uint8Array;
 }
 
+/** A hook running, its stdin and stdout piped (`HookProcess`). */
+export interface NodeHookProcess {
+  write(data: Uint8Array): Promise<void>;
+  closeStdin(): Promise<void>;
+  readonly stdout: AsyncIterable<Uint8Array>;
+  closeStdout(): void;
+  wait(): Promise<NodeHookOutcome>;
+}
+
 /** The runner (`HookRunner`). */
 export interface NodeHookRunner {
   run(invocation: NodeHookInvocation): Promise<NodeHookOutcome | undefined>;
+  /** Starts the hook with its stdin and stdout piped (git's `in = out = -1`: proc-receive) */
+  start(invocation: NodeHookInvocation): Promise<NodeHookProcess | undefined>;
   compatibility?: "2.43" | "2.56";
 }
 
@@ -63,6 +74,94 @@ export function createNodeHookRunner(options: NodeHookRunnerOptions = {}): NodeH
   return {
     ...(options.compatibility ? { compatibility: options.compatibility } : {}),
     run: (invocation) => runHook(invocation, options),
+    start: (invocation) => startHook(invocation, options),
+  };
+}
+
+/**
+ * Starts a hook as {@link runHook} would run it, its stdin and stdout piped to the caller
+ * (a script: its stdout is never sent to stderr here). Undefined when there is no script.
+ */
+async function startHook(
+  invocation: NodeHookInvocation,
+  options: NodeHookRunnerOptions,
+): Promise<NodeHookProcess | undefined> {
+  const base = options.env ?? process.env;
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(base)) if (value !== undefined) env[key] = value;
+  for (const key of invocation.unsetEnv ?? []) delete env[key];
+  Object.assign(env, invocation.env);
+  const cwd = invocation.hostCwd ?? options.defaultCwd ?? process.cwd();
+  let command: string;
+  let args: string[];
+  if (invocation.command !== undefined) {
+    command = "/bin/sh";
+    args = ["-c", `${invocation.command} "$@"`, invocation.command, ...invocation.args];
+  } else {
+    const script =
+      invocation.path.startsWith("/") || invocation.hostCwd ? invocation.path : invocation.hostPath;
+    if (!script) return undefined;
+    command = script;
+    args = invocation.args;
+  }
+  const child = spawn(command, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+  const err: Buffer[] = [];
+  child.stderr?.on("data", (chunk: Buffer) => err.push(chunk));
+  let failed: Error | undefined;
+  child.on("error", (error) => {
+    failed = error;
+  });
+  // git ignores SIGPIPE while it talks to the hook: a write after it exited fails instead
+  child.stdin?.on("error", () => {});
+  child.stdout?.on("error", () => {});
+  const exited = new Promise<NodeHookOutcome>((resolve) => {
+    child.on("close", (code, signal) => {
+      if (failed) {
+        resolve({
+          exitCode: 1,
+          stdout: new Uint8Array(),
+          stderr: new TextEncoder().encode(
+            `error: cannot run ${invocation.path}: ${failed.message}\n`,
+          ),
+        });
+        return;
+      }
+      const signalNumber = signal ? (signalNumbers[signal] ?? 0) : 0;
+      resolve({
+        exitCode: code ?? 128 + signalNumber,
+        stdout: new Uint8Array(),
+        stderr: new Uint8Array(Buffer.concat(err)),
+      });
+    });
+  });
+  const stdout = child.stdout;
+  return {
+    write: (data) =>
+      new Promise<void>((resolve, reject) => {
+        const stdin = child.stdin;
+        if (!stdin || stdin.destroyed || stdin.writableEnded || failed) {
+          reject(new Error("the hook closed its stdin"));
+          return;
+        }
+        stdin.write(Buffer.from(data), (error) => (error ? reject(error) : resolve()));
+      }),
+    closeStdin: async () => {
+      child.stdin?.end();
+    },
+    stdout: {
+      async *[Symbol.asyncIterator]() {
+        if (!stdout) return;
+        try {
+          for await (const chunk of stdout) yield new Uint8Array(chunk as Buffer);
+        } catch {
+          // the pipe was closed
+        }
+      },
+    },
+    closeStdout: () => {
+      stdout?.destroy();
+    },
+    wait: () => exited,
   };
 }
 

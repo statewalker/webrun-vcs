@@ -48,6 +48,15 @@ import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js"
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { isAncestorOf, PushConnectivity } from "./connectivity.js";
 import {
+  PROC_RECEIVE_RETURNED,
+  PROC_RECEIVE_SCHEDULED,
+  type ProcReceiveProcess,
+  parseProcReceiveRef,
+  procReceiveRefMatches,
+  reportV2Lines,
+  runProcReceive,
+} from "./proc-receive.js";
+import {
   DEFAULT_MAX_PUSH_COMMANDS,
   DEFAULT_RECEIVE_KEEP_ALIVE_MS,
   type HookVerdict,
@@ -131,9 +140,10 @@ export const serverPushTransitions: FsmTransition[] = [
   ["RUN_POST_RECEIVE_HOOK", "NO_HOOK", ""],
 ];
 
-/** The capabilities receive-pack advertises (report-status-v2 is not: decision P3.4). */
+/** The capabilities receive-pack advertises (git's `report-status report-status-v2 ...`). */
 export const RECEIVE_PACK_CAPABILITIES: readonly string[] = [
   "report-status",
+  "report-status-v2",
   "delete-refs",
   "ofs-delta",
   "side-band-64k",
@@ -523,6 +533,8 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const commands = state.pushCommands ?? [];
       // git's reject_updates_to_hidden: after the connectivity check, before pre-receive
       rejectHiddenUpdates(ctx, commands);
+      // then the commands receive.procReceiveRefs names are marked for the proc-receive hook
+      scheduleProcReceive(ctx, commands);
       const open = commands.filter((cmd) => cmd.result === "NOT_ATTEMPTED");
       // git's run_receive_hook with skip_broken=0: every command, refused ones included
       const fed = receivePackConfig(ctx).preReceiveSeesRefused ? commands : open;
@@ -594,6 +606,17 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         ) {
           await publishQuarantine(ctx);
         }
+        // the proc-receive hook takes its commands (the objects published first, as git
+        // migrates them before it runs the hook)
+        try {
+          await runProcReceiveHook(ctx);
+        } catch (e) {
+          if (isTransactionAborted(e)) {
+            getOutput(ctx).error = `fatal: ${(e as Error).message}`;
+            return "DIED";
+          }
+          throw e;
+        }
         try {
           await validateCommands(ctx);
         } catch (e) {
@@ -607,6 +630,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           await discardQuarantine(ctx);
           return internalError(ctx, state.peerGone);
         }
+        failProcReceivedOnAtomicFailure(state);
         const commands = state.pushCommands ?? [];
         const invalidCount = commands.filter((c) => c.result !== "NOT_ATTEMPTED").length;
         if (invalidCount === commands.length) {
@@ -664,13 +688,15 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           const reached = blocked ? [] : state.shallowConnectivity.shallowReachedFrom(tips);
           if (reached.length > 0) await repository.updateShallow(reached);
         }
-        return await applyUpdates(
+        const applied = await applyUpdates(
           state,
           refStore,
           atomic,
           blocked,
           receivePackConfig(ctx).batchNonAtomic === true,
         );
+        failProcReceivedOnAtomicFailure(state);
+        return applied;
       } catch (e) {
         if (isTransactionAborted(e)) {
           // refs.c dies when the reference-transaction hook aborts: receive-pack ends
@@ -697,14 +723,16 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         await discardQuarantine(ctx);
         await state.bandQueue;
         const useSideband = state.capabilities.has("side-band-64k");
-        if (state.capabilities.has("report-status")) {
+        // report-status-v2 when the client asked for it (the proc-receive hook's rewrites as
+        // option lines: git's report_v2), else report-status
+        const v2 = state.capabilities.has("report-status-v2");
+        if (v2 || state.capabilities.has("report-status")) {
           const lines = [`unpack ${state.unpackStatus ?? "ok"}`];
           for (const cmd of state.pushCommands ?? []) {
-            lines.push(
-              cmd.result === "OK"
-                ? `ok ${cmd.refName}`
-                : `ng ${cmd.refName} ${oneLine(cmd.message ?? "") || "rejected"}`,
-            );
+            const reason = oneLine(cmd.message ?? "") || "rejected";
+            if (v2) lines.push(...reportV2Lines(cmd, reason));
+            else
+              lines.push(cmd.result === "OK" ? `ok ${cmd.refName}` : `ng ${cmd.refName} ${reason}`);
           }
           if (useSideband) {
             // The report is a pkt-line stream inside channel 1
@@ -738,7 +766,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
     async (ctx) => {
       const state = getState<ServerPushState>(ctx);
       const hook = receivePackHooks(ctx)?.postReceive;
-      const applied = (state.appliedCommands ?? []).map(toReceiveCommand);
+      const applied = postReceiveCommands(state);
       if (!hook || applied.length === 0) {
         await closeRelayedBand(ctx);
         return "NO_HOOK";
@@ -804,6 +832,10 @@ interface ServerPushState extends ProtocolState {
   peerGone?: unknown;
   hookContext?: ReceivePackHookContext;
   reportSent?: boolean;
+  /** The proc-receive hook ran (some command was scheduled for it) */
+  procReceiveRan?: boolean;
+  /** An atomic push's transaction failed: the error its commands without one get */
+  atomicFailure?: string;
 }
 
 /** Context with hooks set directly (older callers). */
@@ -1171,6 +1203,7 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
   const commands = state.pushCommands ?? [];
   const atomic = state.capabilities.has("atomic");
   const failOpen = (message: string) => {
+    state.atomicFailure = message;
     for (const c of commands) {
       if (c.result === "NOT_ATTEMPTED") {
         c.result = "ATOMIC_REJECTED";
@@ -1212,6 +1245,8 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
   // The same ref twice: git's ref transaction refuses ("multiple updates for ref")
   const seen = new Set<string>();
   for (const cmd of commands) {
+    // the proc-receive hook's commands are never in receive-pack's transaction
+    if (cmd.procReceive) continue;
     if (!seen.has(cmd.refName)) {
       seen.add(cmd.refName);
       continue;
@@ -1530,6 +1565,7 @@ async function applyUpdates(
   const open = all.filter((c) => c.result === "NOT_ATTEMPTED");
   state.appliedCommands = [...(state.eagerlyApplied ?? [])];
   if (atomic && blocked) {
+    state.atomicFailure = ATOMIC_PUSH_FAILURE;
     for (const c of open) {
       c.result = "ATOMIC_REJECTED";
       c.message = ATOMIC_PUSH_FAILURE;
@@ -1542,6 +1578,7 @@ async function applyUpdates(
   const pending = open.filter((c) => c.result === "NOT_ATTEMPTED");
   // a failed transaction fails the commands it held; those refused before keep their errors
   const failTransaction = (): "ATOMIC_FAILED" => {
+    state.atomicFailure = ATOMIC_TRANSACTION_FAILED;
     for (const c of open) {
       c.result = "ATOMIC_REJECTED";
       c.message = ATOMIC_TRANSACTION_FAILED;
@@ -1700,4 +1737,117 @@ async function closeRelayedBand(ctx: ProcessContext): Promise<void> {
   if (!state.flushAfterPostReceive) return;
   state.flushAfterPostReceive = false;
   await getTransport(ctx).writeFlush();
+}
+
+/**
+ * Marks the open commands `receive.procReceiveRefs` matches for the proc-receive hook (git's
+ * execute_commands, after reject_updates_to_hidden and before pre-receive).
+ */
+function scheduleProcReceive(ctx: ProcessContext, commands: PushCommand[]): void {
+  const values = receivePackConfig(ctx).procReceiveRefs;
+  if (!values?.length) return;
+  const refs = values.map(parseProcReceiveRef);
+  for (const cmd of commands) {
+    if (cmd.result !== "NOT_ATTEMPTED") continue;
+    if (procReceiveRefMatches(refs, cmd)) cmd.procReceive = PROC_RECEIVE_SCHEDULED;
+  }
+}
+
+/**
+ * git's `run_proc_receive_hook` and what execute_commands does with its outcome: the
+ * commands it took are done (`ok`, with their reports) or refused (`ng`, or git's "fail to
+ * run proc-receive hook", for every open command of an atomic push when the hook failed).
+ * They are left out of receive-pack's own updates (the update hook, the ref transaction);
+ * an atomic push with nothing left for its transaction commits an empty one, as git does.
+ */
+async function runProcReceiveHook(ctx: ProcessContext): Promise<void> {
+  const state = getState<ServerPushState>(ctx);
+  const commands = state.pushCommands ?? [];
+  if (!commands.some((c) => c.procReceive && c.result === "NOT_ATTEMPTED")) return;
+  state.procReceiveRan = true;
+  // the hook reads the pushed objects from the repository
+  await publishQuarantine(ctx);
+  const atomic = state.capabilities.has("atomic");
+  let process: ProcReceiveProcess | undefined;
+  try {
+    process = (await receivePackHooks(ctx)?.procReceive?.(hookContext(ctx))) ?? undefined;
+  } catch (e) {
+    logError(ctx, "proc-receive hook failed to start", e);
+    process = undefined;
+  }
+  const { code, error } = await runProcReceive(process, commands, {
+    atomic,
+    ...(state.capabilities.has("push-options") ? { pushOptions: state.pushOptions ?? [] } : {}),
+  });
+  if (error) await sendError(ctx, error);
+  const decided = state.refusedBeforeTransaction ?? new Set<PushCommand>();
+  state.refusedBeforeTransaction = decided;
+  for (const cmd of commands) {
+    if (cmd.result !== "NOT_ATTEMPTED") {
+      if (cmd.procReceive) decided.add(cmd);
+      continue;
+    }
+    const returned = ((cmd.procReceive ?? 0) & PROC_RECEIVE_RETURNED) !== 0;
+    if (code !== 0 && !returned && (cmd.procReceive || atomic)) {
+      reject(cmd, "fail to run proc-receive hook");
+      decided.add(cmd);
+    } else if (cmd.procReceive) {
+      cmd.result = "OK";
+      decided.add(cmd);
+    }
+  }
+  // execute_commands_atomic begins and commits its transaction whatever is left in it
+  if (atomic && !commands.some((c) => c.result === "NOT_ATTEMPTED")) {
+    const batch = getRefStore(ctx).batch?.bind(getRefStore(ctx));
+    if (batch) await batch([], { message: "push", emptyTransaction: true });
+  }
+}
+
+/**
+ * An atomic push whose transaction failed: git's execute_commands_atomic gives its error to
+ * every command without one, the proc-receive hook's `ok` ones included.
+ */
+function failProcReceivedOnAtomicFailure(state: ServerPushState): void {
+  if (!state.procReceiveRan || !state.capabilities.has("atomic")) return;
+  const failure = state.atomicFailure;
+  if (failure === undefined) return;
+  for (const cmd of state.pushCommands ?? []) {
+    if (cmd.procReceive && cmd.result === "OK") {
+      cmd.result = "ATOMIC_REJECTED";
+      cmd.message = failure;
+    }
+  }
+}
+
+/**
+ * The commands post-receive is told of, in the order they came (git's run_receive_hook with
+ * skip_broken): those applied and those the proc-receive hook took, each command with
+ * reports given as its reports (the report's ref and ids where it names them).
+ */
+function postReceiveCommands(state: ServerPushState): ReceiveCommand[] {
+  const applied = state.appliedCommands ?? [];
+  const reported = (state.pushCommands ?? []).some((c) => c.reports?.length);
+  if (!state.procReceiveRan && !reported) return applied.map(toReceiveCommand);
+  const appliedSet = new Set(applied);
+  const out: ReceiveCommand[] = [];
+  for (const cmd of state.pushCommands ?? []) {
+    if (!appliedSet.has(cmd) && !(cmd.procReceive && cmd.result === "OK")) continue;
+    if (!cmd.reports?.length) {
+      out.push(toReceiveCommand(cmd));
+      continue;
+    }
+    cmd.reports.forEach((report, i) => {
+      const oldOid = report.oldOid ?? cmd.oldOid;
+      const newOid = report.newOid ?? cmd.newOid;
+      out.push({
+        refName: report.refName ?? cmd.refName,
+        oldOid,
+        newOid,
+        type: newOid === ZERO_OID ? "DELETE" : oldOid === ZERO_OID ? "CREATE" : "UPDATE",
+        pushedRef: cmd.refName,
+        report: i,
+      });
+    });
+  }
+  return out;
 }

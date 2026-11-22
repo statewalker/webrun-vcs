@@ -19,12 +19,15 @@ import { pushSummaryIds } from "./push-status.js";
 import { resolveRevision } from "./revision.js";
 
 const OID = /^[0-9a-f]{40}$/;
+/** git's parse_oid_hex: an id at the start of the value */
+const OID_PREFIX = /^[0-9a-fA-F]{40}/;
 
 import {
   type ForceWithLease,
   isPushSuccess,
   matchPushRefs,
   type PushObjectSource,
+  type PushRefReport,
   PushRefspecError,
   type PushRefUpdate,
   pushSummary,
@@ -151,6 +154,13 @@ export async function pushToConnection(
   // local objects, the column as wide as the longest pair
   const ids = pushSummaryIds(result.remoteRefs, result.updates);
   for (const u of result.updates) ids.push(u.oldOid, u.newOid);
+  // the ids of the server's reports are abbreviated too (not measured for the column)
+  for (const u of result.updates) {
+    for (const r of u.reports ?? []) {
+      if (r.oldOid) ids.push(r.oldOid);
+      if (r.newOid) ids.push(r.newOid);
+    }
+  }
   const lengths = await abbrevLengthsOf(options.repository, ids, options.abbrev ?? -1);
   for (const u of result.updates) u.summary = pushSummary(u, lengths);
   result.abbrevLengths = lengths;
@@ -268,7 +278,11 @@ async function sendPack(
   }
 
   const requested: string[] = [];
-  if (caps.has("report-status")) requested.push("report-status");
+  // report-status-v2 when the server offers it (the rewrites of its proc-receive hook), else
+  // report-status (send-pack's status_report 2 and 1)
+  const reportV2 = caps.has("report-status-v2");
+  if (reportV2) requested.push("report-status-v2");
+  else if (caps.has("report-status")) requested.push("report-status");
   if (caps.has("side-band-64k")) requested.push("side-band-64k");
   if (options.quiet && caps.has("quiet")) requested.push("quiet");
   if (options.atomic) requested.push("atomic");
@@ -353,7 +367,7 @@ async function sendPack(
   };
   const answer = await connection.send(body);
 
-  if (!caps.has("report-status")) {
+  if (!reportV2 && !caps.has("report-status")) {
     // git: without report-status every sent command is taken as done
     for (const u of toSend) setStatus(u, "ok");
     result.ok = updates.every((u) => isPushSuccess(u.status));
@@ -378,16 +392,46 @@ async function sendPack(
   }
   const reported = new Set<PushRefUpdate>();
   const byRef = new Map(toSend.map((u) => [u.remoteRef, u]));
+  // git's receive_status: the `option` lines after an `ok` add a report to that ref
+  let hint: PushRefUpdate | undefined;
+  let current: PushRefReport | undefined;
+  let newReport = false;
   for (
     let line = first === undefined ? undefined : await report.readLine();
     line !== undefined;
     line = await report.readLine()
   ) {
-    if (line.startsWith("option ")) continue; // report-status-v2 (not asked for)
+    if (line.startsWith("option ")) {
+      // "'option' without a matching 'ok/ng' directive": git's error, the line ignored
+      if (!hint || !(current || newReport)) continue;
+      if (newReport) {
+        current = {};
+        hint.reports = [...(hint.reports ?? []), current];
+        newReport = false;
+      }
+      const rest = line.slice(7);
+      const space = rest.indexOf(" ");
+      const key = space < 0 ? rest : rest.slice(0, space);
+      const val = space < 0 ? undefined : rest.slice(space + 1);
+      const oid =
+        val !== undefined && OID_PREFIX.test(val) ? val.slice(0, 40).toLowerCase() : undefined;
+      if (key === "refname") {
+        if (val === undefined) delete current?.refName;
+        else (current as PushRefReport).refName = val;
+      } else if (key === "old-oid" && oid) (current as PushRefReport).oldOid = oid;
+      else if (key === "new-oid" && oid) (current as PushRefReport).newOid = oid;
+      else if (key === "forced-update") (current as PushRefReport).forcedUpdate = true;
+      continue;
+    }
+    current = undefined;
+    newReport = false;
     let ref: string;
     let message: string | undefined;
     if (line.startsWith("ok ")) {
-      ref = line.slice(3);
+      // `ok <ref> [<message>]`: the ref ends at a space
+      const rest = line.slice(3);
+      const space = rest.indexOf(" ");
+      ref = space < 0 ? rest : rest.slice(0, space);
     } else if (line.startsWith("ng ")) {
       const rest = line.slice(3);
       const space = rest.indexOf(" ");
@@ -400,10 +444,13 @@ async function sendPack(
       break;
     }
     const update = byRef.get(ref);
+    hint = update;
     if (!update) continue; // git: a report of a ref not pushed is ignored
     reported.add(update);
-    if (message === undefined) setStatus(update, "ok");
-    else {
+    if (message === undefined) {
+      setStatus(update, "ok");
+      newReport = true;
+    } else {
       update.message = message;
       setStatus(update, "remote-rejected");
     }

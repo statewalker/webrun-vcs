@@ -57,6 +57,11 @@ export interface ServerConfigSettings {
    * filter advertised, as git's default)
    */
   uploadPackFilter?: UploadPackFilterPolicy;
+  /**
+   * receive-pack's `receive.procReceiveRefs` values, in order: the commands the proc-receive
+   * hook takes (absent: none set)
+   */
+  procReceiveRefs?: string[];
 }
 
 /** The keys of {@link ServerConfigSettings.uploadPackFilter} without a subsection list. */
@@ -199,6 +204,11 @@ export function explicitServerSettingsFromConfig(
   if (receive.length > 0) out.receivePackHideRefs = receive;
   const filter = filterPolicy(config);
   if (filter) out.uploadPackFilter = filter;
+  // a key without a value is an error in git (config_error_nonbool); skipped here
+  const procReceive = config
+    .getAll("receive.procReceiveRefs")
+    .filter((v): v is string => typeof v === "string");
+  if (procReceive.length > 0) out.procReceiveRefs = procReceive;
   return out;
 }
 

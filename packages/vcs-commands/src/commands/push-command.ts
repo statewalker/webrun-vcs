@@ -530,11 +530,21 @@ export class PushCommand extends TransportCommand<PushResult> {
     if (!this.dryRun) {
       for (const update of result.updates) {
         if (update.status !== "ok" && update.status !== "up-to-date") continue;
-        const local = tracking(update.remoteRef);
-        if (!local) continue;
-        if (update.newOid === ZERO_OBJECT_ID) await history.refs.remove(local);
-        // git's update_tracking_ref: "update by push"
-        else await history.refs.set(local, update.newOid, this.reflogLine("update by push"));
+        // transport_update_tracking_ref: one per report of the server (its ref and new id
+        // where it names them), else the update's own
+        const targets = update.reports?.length
+          ? update.reports.map((r) => ({
+              ref: r.refName ?? update.remoteRef,
+              oid: r.newOid ?? update.newOid,
+            }))
+          : [{ ref: update.remoteRef, oid: update.newOid }];
+        for (const target of targets) {
+          const local = tracking(target.ref);
+          if (!local) continue;
+          if (target.oid === ZERO_OBJECT_ID) await history.refs.remove(local);
+          // git's update_tracking_ref: "update by push"
+          else await history.refs.set(local, target.oid, this.reflogLine("update by push"));
+        }
       }
     }
 
@@ -548,6 +558,16 @@ export class PushCommand extends TransportCommand<PushResult> {
       summary: update.summary,
       forceUpdate: update.force,
       delete: update.newOid === ZERO_OBJECT_ID,
+      ...(update.reports?.length
+        ? {
+            reports: update.reports.map((r) => ({
+              ...(r.refName !== undefined ? { refName: r.refName } : {}),
+              ...(r.oldOid !== undefined ? { oldObjectId: r.oldOid } : {}),
+              ...(r.newOid !== undefined ? { newObjectId: r.newOid } : {}),
+              ...(r.forcedUpdate ? { forcedUpdate: true } : {}),
+            })),
+          }
+        : {}),
     }));
 
     return {
@@ -557,6 +577,7 @@ export class PushCommand extends TransportCommand<PushResult> {
       objectCount: result.packObjects,
       messages,
       display: formatPushStatus(result, { dest: remoteUrl }),
+      porcelain: formatPushStatus(result, { dest: remoteUrl, porcelain: true }),
     };
   }
 
