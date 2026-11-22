@@ -186,6 +186,17 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
       return (await packs.has(id)) || (await loose.has(id));
     },
 
+    // a packed copy's headers (`PackSet.header`); anything else (loose objects, a copy whose
+    // headers cannot answer) is read by `objectHeader` through `get`, which falls back as above
+    ...(packs.header
+      ? { header: (id: string) => (packs.header as NonNullable<PackSet["header"]>)(id) }
+      : {}),
+    ...(packs.objectType
+      ? {
+          objectType: (id: string) => (packs.objectType as NonNullable<PackSet["objectType"]>)(id),
+        }
+      : {}),
+
     async *list() {
       // one snapshot of the packs, for the packed ids and to skip loose ids already in a pack's
       // idx (no set of every id)

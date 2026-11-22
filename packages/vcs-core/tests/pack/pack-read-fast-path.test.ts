@@ -339,3 +339,66 @@ describe("openPack: getNow, without a promise when nothing is read", () => {
     expect(same((await pack.get(oidOf("blob", top)))?.bytes as Uint8Array, top)).toBe(true);
   });
 });
+
+describe("openPack: header, the type and size from the entry headers", () => {
+  const A = text(30, "head A");
+  const { data: B, d: dAB } = extend(A, "plus B\n");
+  const { data: C, d: dBC } = extend(B, "plus C\n");
+  const { data: D, d: dCD } = extend(C, "plus D\n");
+  const tree = enc.encode("100644 a\0aaaaaaaaaaaaaaaaaaaa");
+
+  it("answers as `get` for whole entries and OFS/REF chains, without resolving them", async () => {
+    const files = createInMemoryFilesApi();
+    const { pack } = await open(files, [
+      { kind: 3, data: A },
+      { kind: 6, data: dAB, baseIdx: 0 },
+      { kind: 7, data: dBC, baseOid: oidOf("blob", B) },
+      { kind: 6, data: dCD, baseIdx: 2 },
+      { kind: 2, data: tree },
+    ]);
+    const header = pack.header?.bind(pack);
+    expect(header).toBeDefined();
+    for (const [type, data] of [
+      ["blob", A],
+      ["blob", B],
+      ["blob", C],
+      ["blob", D],
+      ["tree", tree],
+    ] as const) {
+      expect(await header?.(oidOf(type, data))).toEqual({ type, size: data.length });
+    }
+    for (const [type, data] of [
+      ["blob", D],
+      ["tree", tree],
+    ] as const) {
+      expect(await pack.objectType?.(oidOf(type, data))).toBe(type);
+    }
+    expect(await pack.objectType?.(oidOf("blob", text(1, "absent")))).toBeUndefined();
+    // headers only: no delta was applied, nothing was cached
+    expect(pack.stats.inflations).toBe(0);
+    expect(pack.stats.cachedBytes).toBe(0);
+    expect(await header?.(oidOf("blob", text(1, "absent")))).toBeUndefined();
+    // with the chain's bases cached (by a read), the answers stay the same
+    await pack.get(oidOf("blob", D));
+    for (const data of [B, C, D]) {
+      expect(await header?.(oidOf("blob", data))).toEqual({ type: "blob", size: data.length });
+    }
+  });
+
+  it("leaves a REF_DELTA whose base is outside the pack to `get`", async () => {
+    const files = createInMemoryFilesApi();
+    const outside = text(10, "outside");
+    const { data: top, d } = extend(outside, "top\n");
+    const built = buildPack([{ kind: 7, data: d, baseOid: oidOf("blob", outside) }]);
+    const base = `${PACK_DIR}/pack-thin`;
+    await files.write(`${base}.pack`, [built.bytes]);
+    const entry = built.bytes.subarray(built.offsets[0] as number, built.ends[0] as number);
+    const idx = writePackIdx(
+      [{ id: oidOf("blob", top), offset: built.offsets[0] as number, crc32: crc32(entry) }],
+      built.bytes.subarray(built.bytes.length - 20),
+    );
+    await files.write(`${base}.idx`, [idx]);
+    const pack = (await openPack(files, `${base}.pack`, `${base}.idx`)) as PackFile;
+    expect(await pack.header?.(oidOf("blob", top))).toBeUndefined();
+  });
+});

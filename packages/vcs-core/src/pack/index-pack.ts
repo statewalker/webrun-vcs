@@ -22,6 +22,7 @@ import {
   compressBlockPako,
   createInflaterPool,
   type InflaterPool,
+  inflateWhole,
   type StreamInflater,
 } from "@statewalker/vcs-utils/compression";
 import { applyGitDelta, DeltaError } from "@statewalker/vcs-utils/diff";
@@ -113,6 +114,24 @@ const TYPE_CODE: Record<ObjectTypeString, number> = { commit: 1, tree: 2, blob: 
 const OFS_DELTA = 6;
 const REF_DELTA = 7;
 const SLICE = 1024; // inflater input per push: one push yields at most ~1 MiB
+/**
+ * Entries of at most this many bytes are inflated in one pass (`inflateWhole`) when their whole
+ * stream is in the chunk at hand; the others, and those that fail there, are streamed.
+ */
+const WHOLE_INFLATE_MAX = 1 << 20;
+
+/** A buffer reused for data only read while it is inflated (hashed, never kept). */
+class Scratch {
+  private buf = new Uint8Array(4096);
+  take(size: number): Uint8Array {
+    if (size > this.buf.length) {
+      let n = this.buf.length;
+      while (n < size) n *= 2;
+      this.buf = new Uint8Array(n);
+    }
+    return this.buf.subarray(0, size);
+  }
+}
 /** smallest possible entry: a 1-byte header and an 8-byte zlib stream (empty, fixed block) */
 const MIN_ENTRY = 9;
 const hex = bytesToHex;
@@ -208,41 +227,76 @@ function cmpOid(a: Uint8Array, ai: number, b: Uint8Array, bi: number): number {
   return 0;
 }
 
-/** Sequential reader over a stored file: tracks position, the pack hash and the entry CRC. */
+/**
+ * Sequential reader over a stored file: tracks position, the pack hash and the entry CRC.
+ * Consumed bytes reach the CRC and the hash in runs (`account`, before the CRC or the hash is
+ * read and before the chunk is replaced), not byte by byte: an entry header is a few bytes,
+ * and a hash update per byte costs more than the entry's own inflate.
+ */
 class SequentialReader {
   pos = 0;
-  crc = new CRC32();
+  private readonly crc = new CRC32();
   private chunk: Uint8Array = new Uint8Array(0);
   private at = 0;
+  /** `chunk[mark, at)` is consumed but not yet in the CRC and the hash */
+  private mark = 0;
+  /** the stream position of `chunk[mark]` */
+  private markPos = 0;
   private readonly it: AsyncIterator<Uint8Array>;
-  readonly hasher: Hasher = createSha1();
+  private readonly hasher: Hasher = createSha1();
   constructor(
     source: AsyncIterable<Uint8Array>,
     private readonly hashedLength: number,
   ) {
     this.it = source[Symbol.asyncIterator]();
   }
-  private consumed(bytes: Uint8Array) {
+  /** Feeds the consumed bytes not yet accounted for to the CRC and the hash. */
+  private account() {
+    if (this.at <= this.mark) return;
+    const bytes = this.chunk.subarray(this.mark, this.at);
     this.crc.update(bytes);
-    const room = this.hashedLength - this.pos;
+    const room = this.hashedLength - this.markPos;
     if (room > 0) this.hasher.update(room >= bytes.length ? bytes : bytes.subarray(0, room));
-    this.pos += bytes.length;
+    this.markPos += bytes.length;
+    this.mark = this.at;
+  }
+  /** Starts the CRC of an entry. */
+  resetCrc() {
+    this.account();
+    this.crc.reset();
+  }
+  /** The CRC of the bytes consumed since `resetCrc`. */
+  crcValue(): number {
+    this.account();
+    return this.crc.getValue();
+  }
+  /** The hash of the first `hashedLength` bytes (all of them consumed). */
+  digest(): Uint8Array {
+    this.account();
+    return this.hasher.digest();
   }
   private async fill(): Promise<boolean> {
     while (this.at >= this.chunk.length) {
+      this.account();
       const r = await this.it.next();
       if (r.done) return false;
       this.chunk = r.value;
       this.at = 0;
+      this.mark = 0;
     }
     return true;
   }
+  /** The next byte when the current chunk has one (no await), else -1. */
+  byteNow(): number {
+    if (this.at >= this.chunk.length) return -1;
+    this.pos++;
+    return this.chunk[this.at++] as number;
+  }
   async byte(): Promise<number> {
+    const b = this.byteNow();
+    if (b >= 0) return b;
     if (!(await this.fill())) throw new PackError(`pack truncated at ${this.pos}`);
-    const b = this.chunk.subarray(this.at, this.at + 1);
-    this.at++;
-    this.consumed(b);
-    return b[0] as number;
+    return this.byteNow();
   }
   async bytes(n: number): Promise<Uint8Array> {
     const out = new Uint8Array(n);
@@ -250,13 +304,31 @@ class SequentialReader {
     while (o < n) {
       if (!(await this.fill())) throw new PackError(`pack truncated at ${this.pos}`);
       const k = Math.min(n - o, this.chunk.length - this.at);
-      const part = this.chunk.subarray(this.at, this.at + k);
-      out.set(part, o);
+      out.set(this.chunk.subarray(this.at, this.at + k), o);
       this.at += k;
+      this.pos += k;
       o += k;
-      this.consumed(part);
     }
     return out;
+  }
+  /**
+   * Inflates a zlib stream that lies whole in the current chunk into `into`, which it must
+   * fill exactly, and consumes it: true then. False, consuming nothing, otherwise (the stream
+   * runs past the chunk, is corrupt, or inflates to another size): the caller inflates it with
+   * `inflate`, which reports any error as it always has.
+   */
+  inflateWholeInChunk(into: Uint8Array): boolean {
+    if (this.at >= this.chunk.length) return false;
+    let r: { length: number; consumed: number };
+    try {
+      r = inflateWhole(this.chunk.subarray(this.at), { into });
+    } catch {
+      return false;
+    }
+    if (r.length !== into.length) return false;
+    this.at += r.consumed;
+    this.pos += r.consumed;
+    return true;
   }
   async inflate(inflater: StreamInflater, sink: (out: Uint8Array) => void): Promise<void> {
     for (;;) {
@@ -266,8 +338,8 @@ class SequentialReader {
       const r = inflater.push(slice);
       for (const o of r.out) sink(o);
       const used = r.done ? r.consumed : slice.length;
-      this.consumed(slice.subarray(0, used));
       this.at += used;
+      this.pos += used;
       if (r.done) return;
     }
   }
@@ -375,6 +447,7 @@ async function parseWith(
   // Tables start small and grow (capped at the declared count) as entries are parsed:
   // a header can claim up to (size - 32) / 9 entries, and only parsed entries earn memory.
   const t = new Entries(Math.min(count, 4096));
+  const scratch = new Scratch();
   for (let i = 0; i < count; i++) {
     if (i === t.cap) {
       // grow towards the count the bytes parsed so far predict (average entry size, +6%), but
@@ -383,17 +456,19 @@ async function parseWith(
       const next = Math.min(t.cap * 2, Math.max(Math.ceil(t.cap * 1.25), predicted));
       t.growTo(Math.min(count, next));
     }
-    r.crc.reset();
+    r.resetCrc();
     const offset = r.pos;
     if (offset >= packLen - 20) throw new PackError(`entry ${i} starts inside the trailer`);
-    let b = await r.byte();
+    let b = r.byteNow();
+    if (b < 0) b = await r.byte();
     const kind = (b >> 4) & 7;
     if (!TYPE_NAMES[kind] && kind !== OFS_DELTA && kind !== REF_DELTA)
       throw new PackError(`bad object type ${kind} at ${offset}`);
     let size = b & 0x0f;
     let mul = 16;
     while (b & 0x80) {
-      b = await r.byte();
+      b = r.byteNow();
+      if (b < 0) b = await r.byte();
       size += (b & 0x7f) * mul;
       mul *= 128;
       if (mul > 2 ** 53) throw new PackError(`object size overflow at ${offset}`);
@@ -408,10 +483,12 @@ async function parseWith(
     t.size[i] = size;
     t.base[i] = -1;
     if (kind === OFS_DELTA) {
-      b = await r.byte();
+      b = r.byteNow();
+      if (b < 0) b = await r.byte();
       let back = b & 0x7f;
       while (b & 0x80) {
-        b = await r.byte();
+        b = r.byteNow();
+        if (b < 0) b = await r.byte();
         back = (back + 1) * 128 + (b & 0x7f);
         if (back > offset) break; // already before the pack start: refused below
       }
@@ -426,7 +503,6 @@ async function parseWith(
       t.refOid.set(await r.bytes(20), i * 20);
     }
     t.hdr[i] = r.pos - offset;
-    const inflater = pool.acquire();
     let got = 0;
     const typeName = TYPE_NAMES[kind];
     const objHash = typeName ? createSha1().update(objectHeaderBytes(typeName, size)) : undefined;
@@ -437,27 +513,36 @@ async function parseWith(
         : typeName
           ? undefined
           : stash.reserve(i, size); // a delta's data, kept for phase 2
-    try {
-      await r.inflate(inflater, (out) => {
-        got += out.length;
-        // stop at the first byte past the declared size: never inflate a bomb to its end
-        if (got > size)
-          throw new PackError(`entry at ${offset} inflates past its declared ${size} bytes`);
-        objHash?.update(out);
-        content?.set(out, got - out.length);
-      });
-    } catch (err) {
-      inflater.abort();
-      stash.drop(i);
-      // zlib errors are the pack's; storage errors (EIO…) pass through unchanged
-      if (err instanceof CompressionError) {
-        throw new PackError(`entry at ${offset}: ${(err as Error).message}`);
+    // in one pass when the whole stream is in the chunk at hand (most entries are small), else
+    // streamed as it arrives
+    const whole = size <= WHOLE_INFLATE_MAX ? (content ?? scratch.take(size)) : undefined;
+    if (whole && r.inflateWholeInChunk(whole)) {
+      got = size;
+      objHash?.update(whole);
+    } else {
+      const inflater = pool.acquire();
+      try {
+        await r.inflate(inflater, (out) => {
+          got += out.length;
+          // stop at the first byte past the declared size: never inflate a bomb to its end
+          if (got > size)
+            throw new PackError(`entry at ${offset} inflates past its declared ${size} bytes`);
+          objHash?.update(out);
+          content?.set(out, got - out.length);
+        });
+      } catch (err) {
+        inflater.abort();
+        stash.drop(i);
+        // zlib errors are the pack's; storage errors (EIO…) pass through unchanged
+        if (err instanceof CompressionError) {
+          throw new PackError(`entry at ${offset}: ${(err as Error).message}`);
+        }
+        throw err;
       }
-      throw err;
     }
     if (got !== size)
       throw new PackError(`entry at ${offset} inflates to ${got} bytes, header says ${size}`);
-    t.crc[i] = r.crc.getValue();
+    t.crc[i] = r.crcValue();
     if (objHash) {
       t.oid.set(objHash.digest(), i * 20);
       t.type[i] = kind;
@@ -474,7 +559,7 @@ async function parseWith(
         : "the last entry runs into the trailer",
     );
   }
-  const expected = hex(r.hasher.digest());
+  const expected = hex(r.digest());
   const trailer = hex(await r.bytes(20));
   if (trailer !== expected)
     throw new PackError(`pack checksum mismatch: trailer ${trailer}, content ${expected}`);
@@ -570,7 +655,25 @@ async function loadEntry(
   let o = 0;
   let done = false;
   try {
-    for await (const c of read(dataStart, end - dataStart)) {
+    let source: AsyncIterable<Uint8Array> | Iterable<Uint8Array> = read(dataStart, end - dataStart);
+    if (size <= WHOLE_INFLATE_MAX) {
+      // the extent at once: inflated in one pass when it comes as one chunk and inflates to
+      // exactly its size; else streamed from the chunks read (errors reported as always)
+      const chunks: Uint8Array[] = [];
+      for await (const c of source) chunks.push(c);
+      if (chunks.length === 1) {
+        try {
+          if (inflateWhole(chunks[0] as Uint8Array, { into: out }).length === size) {
+            inflater.abort();
+            return out;
+          }
+        } catch {
+          // streamed below
+        }
+      }
+      source = chunks;
+    }
+    for await (const c of source) {
       for (let at = 0; at < c.length && !done; at += SLICE) {
         const r = inflater.push(c.subarray(at, at + SLICE));
         for (const x of r.out) {

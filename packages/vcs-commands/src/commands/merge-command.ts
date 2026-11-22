@@ -567,8 +567,14 @@ export class MergeCommand extends GitCommand<MergeResult> {
     // git records where HEAD was before every merge
     await state.setRef("ORIG_HEAD", headId);
 
+    // git's cmd_merge: the merge bases answer all three questions in one walk. src is an
+    // ancestor of HEAD exactly when it is their only merge base (already up to date), HEAD is
+    // one of src exactly when HEAD is (fast-forward); otherwise they are the merge's bases.
+    const bases = srcId === headId ? [headId] : await this.commits.findMergeBase(headId, srcId);
+    const onlyBase = bases.length === 1 ? bases[0] : undefined;
+
     // Check if already up to date (src is ancestor of HEAD)
-    if (await this.isAncestor(srcId, headId)) {
+    if (onlyBase === srcId) {
       // finish_up_to_date: remove_merge_branch_state (an AUTO_MERGE left behind goes)
       return {
         status: MergeStatus.ALREADY_UP_TO_DATE,
@@ -583,11 +589,11 @@ export class MergeCommand extends GitCommand<MergeResult> {
     }
 
     // Check if fast-forward is possible (HEAD is ancestor of src)
-    const canFastForward = await this.isAncestor(headId, srcId);
+    const canFastForward = onlyBase === headId;
     const fastForward = canFastForward && this.ffMode() !== FastForwardMode.NO_FF;
 
     // git refuses unrelated histories before anything is stashed or written
-    const mergeBases = fastForward ? [] : await this.commits.findMergeBase(headId, srcId);
+    const mergeBases = fastForward ? [] : bases;
     if (!fastForward && mergeBases.length === 0 && !this.allowUnrelated) {
       throw new NoMergeBaseError([headId, srcId], UNRELATED_HISTORIES_MESSAGE);
     }
