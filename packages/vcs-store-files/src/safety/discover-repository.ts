@@ -11,7 +11,7 @@ import { type FilesApi, joinPath, normalizePath, readFile } from "@statewalker/v
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { parseGitfile } from "../workspace/git-dir/index.js";
-import { type ProtectedConfigEntry, readProtectedConfig } from "./protected-config.js";
+import { readProtectedConfig } from "./protected-config.js";
 import {
   allowedBareRepository,
   assertValidOwnership,
@@ -77,6 +77,13 @@ export class NotAGitRepositoryError extends Error {
  * worktree's or submodule's git directory inside one (2.44+). An explicit `gitDir` is used
  * as given.
  *
+ * The protection is opt-in: a library caller gets git's local checks only by discovering the
+ * repository here first. Constructing a `FileWorktree` or calling `createGitFilesBackend`
+ * directly opens whatever it is given, unchecked. The owner checks need an `environment`
+ * with `effectiveUid` (the Node host sets it from `process.geteuid()`) and a FilesApi whose
+ * `lstat` reports owners; without either they pass. The protected configuration is read
+ * only when an owner check fails or a bare repository is found, as git reads it.
+ *
  * @example
  * ```typescript
  * const files = createNodeFilesApi({ rootDir: "/" });
@@ -94,11 +101,6 @@ export async function discoverRepository(
     return { gitDir, bare: !/\/\.git$/.test(gitDir), warnings: [] };
   }
   const check = options.checkOwnership !== false;
-  let protectedConfig: ProtectedConfigEntry[] | undefined;
-  const config = async () => {
-    protectedConfig ??= await readProtectedConfig(environment);
-    return protectedConfig;
-  };
   const cwdHost = hostPathOf(files, normalizePath(options.cwd ?? "/"));
   let dir = normalizePath(options.cwd ?? "/");
   for (;;) {
@@ -132,7 +134,7 @@ export async function discoverRepository(
             reportPath: hostPathOf(files, dir),
             cwd: cwdHost,
             compatibility,
-            protectedConfig: await config(),
+            // read only once the owners do not match, as git reads it
           })
         : [];
       return {
@@ -145,7 +147,8 @@ export async function discoverRepository(
     }
     if (await isGitDirectory(files, dir)) {
       const host = hostPathOf(files, dir);
-      const entries = await config();
+      // the protected configuration, read here for safe.bareRepository (get_allowed_bare_repo)
+      const entries = await readProtectedConfig(environment);
       if (
         allowedBareRepository(entries) === "explicit" &&
         !isImplicitBareRepository(host, compatibility)

@@ -1379,14 +1379,14 @@ export class FileWorktree implements Worktree {
       // is_git_directory: HEAD here, objects and refs here or in the `commondir` named
       const found = await this.gitDirectoryAt(gitDir, gitDir).catch(() => undefined);
       if (found?.state !== "repository") continue;
-      const opened = await this.openRepositoryAt(found.gitDir, found.commonDir, options);
       // enter_repo: die_upon_dubious_ownership(gitfile, NULL, used_path), the gitfile's
-      // target and the path entered (the gitfile itself when there is one)
+      // target and the path entered (the gitfile itself when there is one), checked before
+      // anything of the repository is read (its config, includes and alternates)
       const files = this.rootFiles;
       const environment = this.environment;
       const cwd = hostPathOf(files, this.rootPath || "/");
       const compatibility = options.compatibility ?? "2.56";
-      opened.checkOwnership = async (check = {}) => {
+      const checkOwnership = async (check: { gitDirOnly?: boolean; path?: string } = {}) => {
         if (check.gitDirOnly) {
           // clone.c's copy_or_link_directory: ensure_valid_ownership(NULL, NULL, src_repo)
           const dir = gitfileTarget ?? candidate;
@@ -1410,7 +1410,9 @@ export class FileWorktree implements Worktree {
           compatibility,
         });
       };
-      if (options.checkOwnership !== false) await opened.checkOwnership();
+      if (options.checkOwnership !== false) await checkOwnership();
+      const opened = await this.openRepositoryAt(found.gitDir, found.commonDir, options);
+      opened.checkOwnership = checkOwnership;
       return opened;
     }
     return undefined;

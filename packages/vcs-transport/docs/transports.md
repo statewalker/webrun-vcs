@@ -620,8 +620,12 @@ channel's `serve` and reach it with `createWebrunConnector({ call: () => call })
   or the protected configuration (system and global files, `git -c` through
   `$GIT_CONFIG_PARAMETERS` / `$GIT_CONFIG_COUNT`; never the repository's own config) must list
   it in `safe.directory` (`*`, a path, `<path>/*`); else it throws `DubiousOwnershipError`
-  with git's "detected dubious ownership in repository at '<path>'" text, so a resolver that
-  answers `undefined` on errors serves nothing. Owners come from the storage's
+  with git's "detected dubious ownership in repository at '<path>'" text, before the
+  repository's config (and its includes) or alternates are read. A resolver that lets it
+  through gets git's answers: `createServedFetchHandler` a 500 with no detail (http-backend's
+  `die_webcgi`), `serveGitConnection` / `serveGitService` a dropped connection with no `ERR`
+  line (git daemon's child dies); a resolver that answers `undefined` serves a "not a
+  repository" refusal instead. Owners come from the storage's
   `lstat` (`LinkStats.uid`) and the user from `GitHostEnvironment.effectiveUid`
   (`createNodeGitHostEnvironment` takes `process.geteuid()`, `$SUDO_UID` for root): where
   either is missing (a browser, in-memory, KV/SQL or remote storage, Windows) the check passes,
@@ -633,7 +637,11 @@ channel's `serve` and reach it with `createWebrunConnector({ call: () => call })
   `discoverRepository` (vcs-store-files) is git's setup discovery with both checks:
   dubious ownership, and `safe.bareRepository=explicit` refusing a bare repository found by
   walking up (not a `.git` directory or a linked worktree's or submodule's git directory
-  inside one; never an explicit `gitDir`).
+  inside one; never an explicit `gitDir`). These checks are opt-in for library callers: a
+  `FileWorktree` or `createGitFilesBackend` constructed directly opens what it is given
+  unchecked, so code that opens repositories from a user-supplied directory discovers them
+  with `discoverRepository` first. The owner checks need a `GitHostEnvironment` with
+  `effectiveUid`.
 - **Hooks already run the owner's code.** With a hook runner installed, a served repository's
   `pre-receive`, `update` and `post-receive` scripts run on the server with its rights, so its
   owner can read whatever the server can, includes or not. Include confinement matters for

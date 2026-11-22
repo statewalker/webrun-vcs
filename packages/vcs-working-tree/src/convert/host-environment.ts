@@ -160,6 +160,20 @@ export interface GitHostEnvironment {
    */
   commandLineConfig?: Array<{ key: string; value: string | undefined }>;
   /**
+   * The command-line configuration could not be parsed (a bogus `$GIT_CONFIG_PARAMETERS` or
+   * `$GIT_CONFIG_COUNT`, a missing `GIT_CONFIG_KEY_<n>`): git's lines, `error: <reason>` and
+   * `fatal: unable to parse command-line config`. git dies at its first config read, so the
+   * protected configuration's readers refuse with it (exit 128).
+   */
+  commandLineConfigError?: string;
+  /**
+   * The home directory of user `name`, for `~name/` in path settings (git's `getpwnam`):
+   * undefined when there is no such user (git then dies "failed to expand user dir").
+   * Absent, `~name/` cannot be expanded here: the ownership checks skip such a
+   * `safe.directory` entry.
+   */
+  expandUserHome?(name: string): Promise<string | undefined>;
+  /**
    * git's runtime prefix (`system_path`, `/usr` for a distribution's git): what `%(prefix)/`
    * in a path setting expands to. Absent, such a relative path names nothing.
    */

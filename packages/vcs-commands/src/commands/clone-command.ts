@@ -969,10 +969,6 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     return messages;
   }
 
-  /**
-   * clone_local's copy of the source's objects (see `local-clone.ts`), or undefined where
-   * either side keeps no files (the clone then fetches).
-   */
   /** git's `die_upon_dubious_ownership(NULL, NULL, src_repo)` before a local clone copies. */
   private async refuseDubiousSource(source: OpenedRepository, path: string): Promise<void> {
     try {
@@ -985,6 +981,10 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     }
   }
 
+  /**
+   * clone_local's copy of the source's objects (see `local-clone.ts`), or undefined where
+   * either side keeps no files (the clone then fetches).
+   */
   private localObjectsCopy(
     worktree: Pick<Worktree, "getRoot" | "getFiles" | "getGitDir"> | undefined,
     source: OpenedRepository,

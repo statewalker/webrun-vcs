@@ -107,15 +107,49 @@ describe("createNodeGitHostEnvironment: ownership checks and command-line config
       { key: "safe.directory", value: "/it's" },
       { key: "core.bare", value: undefined },
     ]);
-    // a missing pair or a bogus count gives nothing of that variable
-    expect(
+    // a missing pair, a bogus count or an unquoted entry is git's fatal error
+    const fatal = (reason: string) =>
+      `error: ${reason}\nfatal: unable to parse command-line config`;
+    expect(() =>
       commandLineConfigOf({
         GIT_CONFIG_COUNT: "2",
         GIT_CONFIG_KEY_0: "a.b",
         GIT_CONFIG_VALUE_0: "1",
       }),
-    ).toEqual([]);
-    expect(commandLineConfigOf({ GIT_CONFIG_COUNT: "x" })).toEqual([]);
-    expect(commandLineConfigOf({ GIT_CONFIG_PARAMETERS: "safe.directory=/x" })).toEqual([]);
+    ).toThrow(fatal("missing config key GIT_CONFIG_KEY_1"));
+    expect(() => commandLineConfigOf({ GIT_CONFIG_COUNT: "x" })).toThrow(
+      fatal("bogus count in GIT_CONFIG_COUNT"),
+    );
+    expect(() => commandLineConfigOf({ GIT_CONFIG_PARAMETERS: "safe.directory=/x" })).toThrow(
+      fatal("bogus format in GIT_CONFIG_PARAMETERS"),
+    );
+  });
+
+  it("keeps unparseable command-line config as the error git dies with", () => {
+    const env = createNodeGitHostEnvironment({
+      env: { GIT_CONFIG_PARAMETERS: "'=x'" },
+      effectiveUid: null,
+    });
+    expect(env.commandLineConfig).toBeUndefined();
+    expect(env.commandLineConfigError).toBe(
+      "error: bogus config parameter: =x\nfatal: unable to parse command-line config",
+    );
+    // 'key'= has no value (git's NULL), git's isspace separates entries
+    expect(commandLineConfigOf({ GIT_CONFIG_PARAMETERS: "'a.b'=\t'c.d=1'\n" })).toEqual([
+      { key: "a.b", value: undefined },
+      { key: "c.d", value: "1" },
+    ]);
+  });
+
+  it("expands ~user/ from /etc/passwd read through its FilesApi", async () => {
+    const files = createInMemoryFilesApi();
+    await files.write("/etc/passwd", [
+      new TextEncoder().encode(
+        "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000::/home/al:/bin/sh\n",
+      ),
+    ]);
+    const env = createNodeGitHostEnvironment({ env: {}, files });
+    expect(await env.expandUserHome?.("alice")).toBe("/home/al");
+    expect(await env.expandUserHome?.("nobody-here-at-all")).toBeUndefined();
   });
 });

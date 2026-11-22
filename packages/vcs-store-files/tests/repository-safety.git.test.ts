@@ -395,3 +395,203 @@ describe("enter_repo's check of another repository (receive-pack)", () => {
     await expect(opened?.checkOwnership?.()).rejects.toThrow("detected dubious ownership");
   });
 });
+
+describe("the protected configuration has no git directory (read_protected_config)", () => {
+  // conditions of the global file's includes, each bringing in safe.directory=*
+  const inc = () => join(T, "inc-safe");
+  const globalWith = (name: string, text: string) => {
+    const file = join(T, `global-${name}`);
+    writeFileSync(inc(), "[safe]\n\tdirectory = *\n");
+    writeFileSync(file, text);
+    execFileSync("chmod", ["a+r", file, inc()]);
+    return { GIT_CONFIG_GLOBAL: file };
+  };
+  const cases: Array<[string, string, Record<string, string>]> = [
+    ["gitdir:/", `[includeIf "gitdir:/"]\n\tpath = ${join(T, "inc-safe")}\n`, {}],
+    ["gitdir:**", `[includeIf "gitdir:**"]\n\tpath = ${join(T, "inc-safe")}\n`, {}],
+    ["gitdir/i:/", `[includeIf "gitdir/i:/"]\n\tpath = ${join(T, "inc-safe")}\n`, {}],
+    ["onbranch:**", `[includeIf "onbranch:**"]\n\tpath = ${join(T, "inc-safe")}\n`, {}],
+    [
+      "hasconfig on a global remote URL",
+      `[remote "o"]\n\turl = https://example.com/x\n[includeIf "hasconfig:remote.*.url:https://example.com/**"]\n\tpath = ${join(T, "inc-safe")}\n`,
+      {},
+    ],
+    [
+      "hasconfig on a command-line remote URL",
+      `[includeIf "hasconfig:remote.*.url:https://example.com/**"]\n\tpath = ${join(T, "inc-safe")}\n`,
+      { GIT_CONFIG_PARAMETERS: "'remote.o.url'='https://example.com/x'" },
+    ],
+    [
+      "hasconfig on no matching URL",
+      `[remote "o"]\n\turl = https://other.example/x\n[includeIf "hasconfig:remote.*.url:https://example.com/**"]\n\tpath = ${join(T, "inc-safe")}\n`,
+      {},
+    ],
+  ];
+  for (const [name, text, extra] of cases) {
+    it(`includeIf "${name}" in the global file`, async () => {
+      const cwd = join(T, "repo");
+      const env = { ...DIFFERENT, ...globalWith(name.replace(/[^a-z]/gi, "-"), text), ...extra };
+      expect(await ours(cwd, env)).toEqual(native(cwd, env));
+    });
+  }
+
+  it("gitdir:/ and gitdir:** are refused as dubious ownership", async () => {
+    const cwd = join(T, "repo");
+    for (const pattern of ["/", "**"]) {
+      const env = {
+        ...DIFFERENT,
+        ...globalWith(
+          `refused${pattern.length}`,
+          `[includeIf "gitdir:${pattern}"]\n\tpath = ${inc()}\n`,
+        ),
+      };
+      const outcome = native(cwd, env);
+      expect(outcome.exit).toBe(128);
+      expect(outcome.stderr).toContain("detected dubious ownership");
+      expect(await ours(cwd, env)).toEqual(outcome);
+    }
+  });
+
+  it("a remote URL in a file hasconfig brings in is fatal", async () => {
+    const cwd = join(T, "repo");
+    const bad = join(T, "inc-remote");
+    writeFileSync(bad, '[remote "p"]\n\turl = https://example.com/y\n');
+    execFileSync("chmod", ["a+r", bad]);
+    const env = {
+      ...DIFFERENT,
+      ...globalWith(
+        "forbidden",
+        `[remote "o"]\n\turl = https://example.com/x\n[includeIf "hasconfig:remote.*.url:https://example.com/**"]\n\tpath = ${bad}\n`,
+      ),
+    };
+    expect(await ours(cwd, env)).toEqual(native(cwd, env));
+  });
+});
+
+describe("unparseable command-line config is fatal (git_config_from_parameters)", () => {
+  const cases: Array<[string, Record<string, string>]> = [
+    ["'safe.directory=' junk", { GIT_CONFIG_PARAMETERS: "'safe.directory=' junk" }],
+    [
+      "COUNT=2 with only pair 0",
+      { GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "safe.directory", GIT_CONFIG_VALUE_0: "*" },
+    ],
+    ["COUNT=1 without a value", { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "safe.directory" }],
+    ["'=x'", { GIT_CONFIG_PARAMETERS: "'=x'" }],
+    ["bad", { GIT_CONFIG_PARAMETERS: "bad" }],
+    [
+      'COUNT="1 "',
+      { GIT_CONFIG_COUNT: "1 ", GIT_CONFIG_KEY_0: "safe.directory", GIT_CONFIG_VALUE_0: "*" },
+    ],
+    ["COUNT=x", { GIT_CONFIG_COUNT: "x" }],
+    ["COUNT=-1", { GIT_CONFIG_COUNT: "-1" }],
+    [
+      "a key without a section",
+      { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "bad", GIT_CONFIG_VALUE_0: "x" },
+    ],
+    ["an invalid key", { GIT_CONFIG_PARAMETERS: "'a.1b=x'" }],
+    ["a tab separator", { GIT_CONFIG_PARAMETERS: "'a.b=1'\t'safe.directory=*'" }],
+    ["a newline separator", { GIT_CONFIG_PARAMETERS: "'a.b=1'\n'safe.directory=*'" }],
+    ["a vertical tab separator", { GIT_CONFIG_PARAMETERS: "'a.b=1'\v'safe.directory=*'" }],
+    ["a leading space", { GIT_CONFIG_PARAMETERS: " 'safe.directory=*'" }],
+    ["new style with a quoted value", { GIT_CONFIG_PARAMETERS: "'safe.directory'='*'" }],
+    ["new style without a value", { GIT_CONFIG_PARAMETERS: "'safe.directory'= 'x.y=1'" }],
+    ["new style with junk", { GIT_CONFIG_PARAMETERS: "'safe.directory'=*" }],
+  ];
+  for (const [name, env] of cases) {
+    it(name, async () => {
+      const cwd = join(T, "repo");
+      const full = { ...DIFFERENT, ...env };
+      expect(await ours(cwd, full)).toEqual(native(cwd, full));
+    });
+  }
+
+  it("refuses with git's lines (the cases are not all one outcome)", () => {
+    const cwd = join(T, "repo");
+    expect(native(cwd, { ...DIFFERENT, GIT_CONFIG_PARAMETERS: "bad" })).toEqual({
+      exit: 128,
+      stderr:
+        "error: bogus format in GIT_CONFIG_PARAMETERS\nfatal: unable to parse command-line config\n",
+    });
+    expect(
+      native(cwd, { ...DIFFERENT, GIT_CONFIG_PARAMETERS: "'a.b=1'\t'safe.directory=*'" }).exit,
+    ).toBe(0);
+  });
+});
+
+describe("safe.directory paths git cannot normalize or expand", () => {
+  for (const [name, entries] of [
+    ["a missing directory with /*/", [["safe.directory", `${T}/missing/*/`]]],
+    ["the parent with /*/", [["safe.directory", `${T}/*/`]]],
+    [
+      "~nobody/ after *",
+      [
+        ["safe.directory", "*"],
+        ["safe.directory", "~nobody/x"],
+      ],
+    ],
+    ["~nobody/ alone", [["safe.directory", "~nobody/x"]]],
+    ["an unknown ~user/", [["safe.directory", "~no-such-user-here/x"]]],
+  ] as Array<[string, Array<[string, string]>]>) {
+    it(name, async () => {
+      const cwd = join(T, "repo");
+      const env = { ...DIFFERENT, ...commandLine(entries) };
+      expect(await ours(cwd, env)).toEqual(native(cwd, env));
+    });
+  }
+
+  it("skips a ~user/ entry where the host cannot expand it", async () => {
+    const files = createNodeFilesApi({ rootDir: "/" });
+    const base = createNodeGitHostEnvironment({
+      env: {
+        ...BASE_ENV,
+        ...DIFFERENT,
+        ...commandLine([
+          ["safe.directory", "*"],
+          ["safe.directory", "~nobody/x"],
+        ]),
+      },
+    });
+    const { expandUserHome: _, ...environment } = base;
+    const found = await discoverRepository({
+      files,
+      cwd: join(T, "repo"),
+      environment,
+      compatibility,
+    });
+    expect(found.gitDir).toBe(join(T, "repo", ".git"));
+  });
+});
+
+describe("enter_repo checks the owner before reading the repository", () => {
+  it("a bare repository with a broken config, as another owner", async () => {
+    const bare = join(T, "broken-config.git");
+    git(T, ["init", "-q", "--bare", bare]);
+    writeFileSync(join(bare, "config"), "[core\n");
+    execFileSync("chmod", ["-R", "a+rX", bare]);
+    const files = createNodeFilesApi({ rootDir: "/" });
+    const environment = createNodeGitHostEnvironment({ env: { ...BASE_ENV, ...DIFFERENT } });
+    const { history } = await createGitFilesBackend({ files, gitDir: `${T}/repo/.git` });
+    const worktree = new FileWorktree({
+      files,
+      rootPath: T,
+      gitDir: `${T}/repo/.git`,
+      blobs: history.blobs,
+      trees: history.trees,
+      environment,
+    });
+    let ourOutcome: Outcome;
+    try {
+      await worktree.openRepository(bare, { compatibility });
+      ourOutcome = { exit: 0, stderr: "" };
+    } catch (error) {
+      ourOutcome = { exit: 128, stderr: `${(error as Error).message}\n` };
+    }
+    const run = spawnSync("git", ["receive-pack", "--advertise-refs", bare], {
+      cwd: T,
+      env: { ...BASE_ENV, ...DIFFERENT },
+    });
+    const nativeOutcome = { exit: run.status ?? -1, stderr: run.stderr.toString() };
+    expect(nativeOutcome.stderr).toContain("detected dubious ownership");
+    expect(ourOutcome).toEqual(nativeOutcome);
+  });
+});

@@ -719,3 +719,36 @@ describe("createServedFetchHandler: a repository's http.getanyfile=true under hi
     }
   });
 });
+
+describe("createServedFetchHandler: a repository another user owns", () => {
+  it("answers 500 without detail, as http-backend's die_webcgi", async () => {
+    const handler = createServedFetchHandler({
+      resolveRepository: async () => {
+        const error = new Error(
+          "fatal: detected dubious ownership in repository at '/srv/secret/repo.git'",
+        );
+        error.name = "DubiousOwnershipError";
+        throw error;
+      },
+    });
+    for (const path of [
+      "/repo.git/info/refs?service=git-upload-pack",
+      "/repo.git/info/refs",
+      "/repo.git/HEAD",
+    ]) {
+      const response = await get(handler, path);
+      expect(response.status, path).toBe(500);
+      expect(response.headers.get("cache-control"), path).toContain("no-cache");
+      const body = await response.text();
+      expect(body, path).not.toContain("dubious");
+      expect(body, path).not.toContain("/srv/secret");
+    }
+    // any other resolver error stays a 404
+    const other = createServedFetchHandler({
+      resolveRepository: async () => {
+        throw new Error("boom");
+      },
+    });
+    expect((await get(other, "/repo.git/info/refs?service=git-upload-pack")).status).toBe(404);
+  });
+});

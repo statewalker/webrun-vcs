@@ -301,8 +301,9 @@ export function isImplicitBareRepository(
 /**
  * A path setting as git's `git_config_pathname` reads it: 2.5x's `:(optional)` prefix (a
  * missing file then names nothing), `%(prefix)/` (git's runtime prefix; an absolute path
- * after it as it is), `~/` (the home directory). `~user/` cannot be expanded here, which git
- * dies on.
+ * after it as it is), `~/` (the home directory), `~user/` (through the host's
+ * `expandUserHome`; an unknown user is git's fatal "failed to expand user dir", and without
+ * the hook the entry names nothing).
  */
 async function configPathname(
   value: string,
@@ -321,6 +322,15 @@ async function configPathname(
     if (rest.startsWith("/")) path = rest;
     else if (environment?.prefix) path = `${environment.prefix.replace(/\/+$/, "")}/${rest}`;
     else return undefined;
+  } else if (text.startsWith("~") && !text.startsWith("~/") && text !== "~") {
+    // interpolate_path's getpwnam: through the host, or (without one) not expandable here,
+    // the entry skipped
+    const slash = text.indexOf("/");
+    const name = slash < 0 ? text.slice(1) : text.slice(1, slash);
+    if (!environment?.expandUserHome) return undefined;
+    const home = await environment.expandUserHome(name);
+    if (home === undefined) throw new Error(`fatal: failed to expand user dir in: '${text}'`);
+    path = `${home}${slash < 0 ? "" : text.slice(slash)}`;
   } else {
     path = expandUserPath(text, environment);
     if (path === undefined) throw new Error(`fatal: failed to expand user dir in: '${text}'`);
@@ -342,12 +352,14 @@ async function realPathOf(
   if (!environment?.realPath) return absolute ? lexicalPath(path) : undefined;
   const real = await environment.realPath(path).catch(() => undefined);
   if (real !== undefined) return real;
-  const trimmed = path.replace(/\/+$/, "");
-  const slash = trimmed.lastIndexOf("/");
+  // strbuf_realpath_1 allows only the last component to be missing: a missing one followed
+  // by a slash (`<dir>/*/`) leaves a component to go, and fails
+  if (path.endsWith("/")) return undefined;
+  const slash = path.lastIndexOf("/");
   if (slash < 0) return undefined;
-  const last = trimmed.slice(slash + 1);
+  const last = path.slice(slash + 1);
   if (last === "" || last === "." || last === "..") return undefined;
-  const parent = await environment.realPath(trimmed.slice(0, slash) || "/").catch(() => undefined);
+  const parent = await environment.realPath(path.slice(0, slash) || "/").catch(() => undefined);
   if (parent === undefined) return undefined;
   return parent === "/" ? `/${last}` : `${parent}/${last}`;
 }

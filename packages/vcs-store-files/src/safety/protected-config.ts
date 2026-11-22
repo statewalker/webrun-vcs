@@ -9,6 +9,18 @@ import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { GitWorkingCopyConfig } from "../workspace/working-copy/index.js";
 
+/**
+ * The command-line configuration git cannot parse (exit 128): its message is git's two lines,
+ * `error: <reason>` and `fatal: unable to parse command-line config`.
+ */
+export class CommandLineConfigError extends Error {
+  readonly exitCode = 128;
+  constructor(message: string) {
+    super(message);
+    this.name = "CommandLineConfigError";
+  }
+}
+
 /** One value of the protected configuration, in the order git reads them. */
 export interface ProtectedConfigEntry {
   /** The canonical key (`safe.directory`) */
@@ -39,8 +51,14 @@ export async function readProtectedConfig(
   environment: GitHostEnvironment | undefined,
 ): Promise<ProtectedConfigEntry[]> {
   if (!environment) return [];
+  // config_with_options: the files are read first, then git dies on the command line
+  const unparseable = environment.commandLineConfigError;
+  const commandLine = environment.commandLineConfig ?? [];
   // the chain around a repository config that does not exist: only the system and global
-  // files (with their includes) are read, as git's config_with_options with ignore_repo
+  // files (with their includes) are read, as git's config_with_options with ignore_repo;
+  // and, as git passes no git directory there, `gitdir:` / `onbranch:` conditions are false
+  // (the placeholder path never counts as one), `hasconfig:remote.*.url:` matched against
+  // the remote URLs of these files and of the command line
   const config = new GitWorkingCopyConfig(
     {
       read: async () => undefined,
@@ -49,7 +67,14 @@ export async function readProtectedConfig(
       },
     },
     "/\u0000protected/config",
-    { environment, includes: true },
+    {
+      environment,
+      includes: true,
+      withoutGitDir: true,
+      extraRemoteUrls: commandLine.flatMap(({ key, value }) =>
+        /^remote\..*\.url$/i.test(key) && value !== undefined ? [value] : [],
+      ),
+    },
   );
   await config.load();
   const out: ProtectedConfigEntry[] = [];
@@ -63,7 +88,8 @@ export async function readProtectedConfig(
       ...(entry.line !== undefined ? { line: entry.line } : {}),
     });
   }
-  for (const { key, value } of environment.commandLineConfig ?? []) {
+  if (unparseable !== undefined) throw new CommandLineConfigError(unparseable);
+  for (const { key, value } of commandLine) {
     out.push({ key, value, scope: "command" });
   }
   return out;
