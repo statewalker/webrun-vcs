@@ -123,3 +123,113 @@ describe("createGitObjects: small loose objects in one read", () => {
     return out;
   }
 });
+
+describe("createGitObjects: small streamed objects compressed in memory", () => {
+  async function* chunks(...parts: string[]) {
+    for (const p of parts) yield enc.encode(p);
+  }
+
+  it("stores a small object given as a stream as the same object an array stores", async () => {
+    const streamed = new MemoryRawStorage();
+    const listed = new MemoryRawStorage();
+    const a = createGitObjects(rawStorageStaging(streamed));
+    const b = createGitObjects(rawStorageStaging(listed));
+    const id = await a.put("blob", 12, chunks("hello ", "world\n"));
+    expect(id).toBe(await b.put("blob", 12, [enc.encode("hello world\n")]));
+    expect(await text((await a.get(id, { verify: true }))?.content ?? [])).toBe("hello world\n");
+    // a second put of a stored object keeps it (and stores nothing new)
+    expect(await a.put("blob", 12, chunks("hello world\n"))).toBe(id);
+    const keys: string[] = [];
+    for await (const k of streamed.keys()) keys.push(k);
+    expect(keys).toEqual([id]);
+  });
+
+  it("refuses a stream shorter or longer than its declared size, storing nothing", async () => {
+    const raw = new MemoryRawStorage();
+    const objects = createGitObjects(rawStorageStaging(raw));
+    await expect(objects.put("blob", 20, chunks("hello\n"))).rejects.toThrow(/size/i);
+    await expect(objects.put("blob", 3, chunks("hel", "lo\n"))).rejects.toThrow(/size/i);
+    // longer than the declared size by many chunks: the rest is read through the stream path
+    let returned = false;
+    async function* long() {
+      try {
+        for (let i = 0; i < 100; i++) yield enc.encode("0123456789");
+      } finally {
+        returned = true;
+      }
+    }
+    await expect(objects.put("blob", 15, long())).rejects.toThrow(/size/i);
+    expect(returned).toBe(true);
+    const keys: string[] = [];
+    for await (const k of raw.keys()) keys.push(k);
+    expect(keys).toEqual([]);
+  });
+
+  it("passes a failing stream's error through", async () => {
+    const objects = createGitObjects(rawStorageStaging(new MemoryRawStorage()));
+    const failure = new Error("read failed");
+    async function* failing() {
+      yield enc.encode("part");
+      throw failure;
+    }
+    await expect(objects.put("blob", 10, failing())).rejects.toBe(failure);
+  });
+});
+
+describe("createGitObjects: streamed chunks consumed as yielded", () => {
+  /** Yields `bytes` through one buffer of `width` bytes, refilled for every chunk. */
+  async function* reusing(bytes: Uint8Array, width: number) {
+    const buffer = new Uint8Array(width);
+    for (let at = 0; at < bytes.length; at += width) {
+      const n = Math.min(width, bytes.length - at);
+      buffer.set(bytes.subarray(at, at + n));
+      yield buffer.subarray(0, n);
+    }
+  }
+
+  function pattern(size: number): Uint8Array {
+    const bytes = new Uint8Array(size);
+    for (let i = 0; i < size; i++) bytes[i] = (i * 31 + (i >> 8)) & 0xff;
+    return bytes;
+  }
+
+  for (const size of [8000, 200_000]) {
+    it(`stores a ${size}-byte blob from a source that reuses its buffer`, async () => {
+      const bytes = pattern(size);
+      const expected = await createGitObjects(rawStorageStaging(new MemoryRawStorage())).put(
+        "blob",
+        size,
+        [bytes],
+      );
+      const objects = createGitObjects(rawStorageStaging(new MemoryRawStorage()));
+      const id = await objects.put("blob", size, reusing(bytes, 1000));
+      expect(id).toBe(expected);
+      const obj = await objects.get(id, { verify: true });
+      let total = 0;
+      for await (const c of obj?.content ?? []) total += c.length;
+      expect(total).toBe(size);
+    });
+  }
+
+  it("closes a small declared source that turns out longer when the store fails first", async () => {
+    const storage = rawStorageStaging(new MemoryRawStorage());
+    const failure = new Error("store failed");
+    const failing = {
+      ...storage,
+      putStaged: async () => {
+        throw failure;
+      },
+    } as typeof storage;
+    const objects = createGitObjects(failing);
+    let returned = false;
+    async function* long() {
+      try {
+        for (let i = 0; i < 100; i++) yield enc.encode("0123456789");
+      } finally {
+        returned = true;
+      }
+    }
+    await expect(objects.put("blob", 15, long())).rejects.toBe(failure);
+    expect(returned).toBe(true);
+  });
+});

@@ -386,3 +386,53 @@ describe("scanUntracked with the cache", () => {
     expect(t.listed).toContain("a/b");
   });
 });
+
+describe("scanUntracked over tracked files", () => {
+  /** A tree whose listings leave some kinds unknown (DT_UNKNOWN), counting the lstats asked */
+  class CountingTree extends FakeTree {
+    lstats: string[] = [];
+    unknownKinds = new Set<string>();
+    override async listDirectory(dir: string): Promise<DirectoryEntry[]> {
+      const entries = await super.listDirectory(dir);
+      const prefix = dir ? `${dir}/` : "";
+      return entries.map((e) => (this.unknownKinds.has(prefix + e.name) ? { name: e.name } : e));
+    }
+    override async lstat(path: string): Promise<LinkStats | undefined> {
+      this.lstats.push(path);
+      return super.lstat(path);
+    }
+  }
+  const scan = (tree: FakeTree, tracked: string[]) => {
+    const index = new IndexPathLookup([...tracked].sort());
+    return scanUntracked(tree, {
+      isTracked: (p) => index.has(p),
+      trackedIn: (d) => index.trackedIn(d),
+      indexDirectory: (d) => (index.hasEntriesBelow(d) ? "directory" : undefined),
+      indexSeconds: 100_000,
+    });
+  };
+
+  it("passes tracked files over without a stat, and still enters a tracked name that is now a directory", async () => {
+    const t = new CountingTree();
+    for (const p of ["a/t1", "a/t2", "a/t3", "top"]) t.write(p);
+    t.write("a/u1");
+    // "gone" is tracked as a file but a directory holding an untracked file now
+    t.write("gone/inside");
+    // "odd" is tracked, listed without its kind: stat'ed to learn it
+    t.write("a/odd");
+    t.unknownKinds.add("a/odd");
+    const result = await scan(t, ["a/t1", "a/t2", "a/t3", "a/odd", "gone", "top"]);
+    expect(result.paths).toEqual(["a/u1", "gone/inside"]);
+    expect(t.lstats.filter((p) => p !== "" && !p.endsWith("/"))).toEqual(["a/odd"]);
+  });
+
+  it("reports the same files whatever the index holds besides them", async () => {
+    const t = new FakeTree();
+    for (let i = 0; i < 50; i++) t.write(`d/f${i}`);
+    t.write("d/new");
+    t.write("d/sub/x");
+    const tracked = Array.from({ length: 50 }, (_, i) => `d/f${i}`);
+    expect((await scan(t, tracked)).paths).toEqual(["d/new", "d/sub/x"]);
+    expect([...(await scan(t, [])).paths].sort()).toEqual([...tracked, "d/new", "d/sub/x"].sort());
+  });
+});

@@ -58,6 +58,11 @@ export interface GitObjects {
    * `StagingBlobStore`). Returns git's id.
    * Rejects with `SizeMismatchError`, storing nothing, when `content` is not
    * `size` bytes long.
+   *
+   * Each chunk is consumed as it is yielded: a source may reuse one buffer for every
+   * chunk (the store copies what it keeps before asking for the next one). When the store
+   * fails before reading `content` to its end, the iterator taken from it is closed
+   * (`return()`).
    */
   put(
     type: ObjectTypeString,
