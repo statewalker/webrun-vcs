@@ -13,7 +13,7 @@
  * Each compares the client's lines, the hook logs (every receive hook's arguments, stdin and
  * variables; what proc-receive read: the version line, commands, push options) and the refs.
  */
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createBasePathResolver, createServedFetchHandler } from "@statewalker/vcs-transport";
@@ -397,7 +397,76 @@ const SCENARIOS: Scenario[] = [
     push: [":refs/heads/main", "b:refs/heads/topic", "HEAD:refs/heads/next", ":refs/tags/v123"],
     prepare: (src) => git(src, ["push", "-q", "../bare.git", "main:refs/heads/topic", "v123"]),
   },
+  {
+    // the server names an object the client lacks: refs_update_ref refuses the tracking
+    // ref (an error line, the push still succeeds)
+    label: "a new-oid the client does not have",
+    refs: ["refs/for"],
+    hook: () => [
+      "-r",
+      "ok refs/for/main/topic",
+      "-r",
+      `option new-oid ${"1".repeat(40)}`,
+      "-r",
+      "ok refs/for/main/topic",
+      "-r",
+      "option refname refs/heads/rewritten",
+      "-r",
+      `option new-oid ${"2".repeat(40)}`,
+    ],
+    push: ["HEAD:refs/for/main/topic"],
+    shows: ["with nonexistent object 1111111111111111111111111111111111111111"],
+  },
+  {
+    // tracking refs of names refs.c refuses (check_refname_format, refname_is_safe)
+    label: "refnames no ref may have",
+    refs: ["refs/for"],
+    hook: () => [
+      "-r",
+      "ok refs/for/main/topic",
+      "-r",
+      "option refname refs/heads/a..b",
+      "-r",
+      "ok refs/for/main/topic",
+      "-r",
+      "option refname refs/heads/../../../zz",
+      "-r",
+      "ok refs/for/main/topic",
+      "-r",
+      "option refname refs/for/../../x",
+      "-r",
+      `option new-oid ${ZERO}`,
+      "-r",
+      "ok refs/for/main/topic",
+      "-r",
+      "option refname refs/for/a..b",
+      "-r",
+      `option new-oid ${ZERO}`,
+      "-r",
+      "ok refs/for/main/topic",
+      "-r",
+      "option refname refs/for/fine",
+    ],
+    push: ["HEAD:refs/for/main/topic"],
+    shows: ["refusing to update ref with bad name 'refs/remotes/origin/a..b'"],
+  },
+  {
+    // `ng <ref> ` keeps its empty reason: `[remote rejected] ... ()`
+    label: "an ng with an empty reason",
+    refs: ["refs/for"],
+    hook: () => ["-r", "ng refs/for/main/topic ", "-r", "ng refs/for/main/other"],
+    push: ["HEAD:refs/for/main/topic", "HEAD:refs/for/main/other"],
+    shows: [" ! [remote rejected] HEAD -> refs/for/main/topic ()"],
+  },
 ];
+
+/** git's lines about the server's report and the tracking refs (`PushResult.errors`). */
+const reportErrorLines = (lines: string[]) =>
+  lines.filter((l) =>
+    /^(error|warning): (update_ref failed|refusing to update|'option' without|remote reported status)/.test(
+      l,
+    ),
+  );
 
 /** `<dir>/src` (main at A, b at B, tag v123 on A), `<dir>/bare.git` (main at A, hooks). */
 function base(dir: string, tool: string, scenario: Scenario): void {
@@ -647,6 +716,9 @@ describeGit("proc-receive: a local push, native and ours", () => {
           } else {
             expect(ours.result.display, `${label}: display`).toEqual(refLines(nativeStderr));
           }
+          expect(ours.result.errors ?? [], `${label}: errors`).toEqual(
+            reportErrorLines(nativeStderr),
+          );
         }
         expect(trackingOf(join(mine.dir, "src")), `${label}: tracking`).toBe(
           trackingOf(join(theirs.dir, "src")),
@@ -672,10 +744,17 @@ describeGit("proc-receive: our client pushing to native receive-pack", () => {
         const theirServer = await nativeServer(theirs);
         let native: { status: number | null; stdout: string; stderr: string };
         try {
+          // through the configured remote, as ours: the tracking refs follow
+          git(join(theirs.dir, "src"), [
+            "remote",
+            "set-url",
+            "origin",
+            `${theirServer.baseUrl}/bare.git`,
+          ]);
           native = await gitAsync(
             root,
             join(theirs.dir, "src"),
-            ["push", ...nativeOptions(s, porcelain), `${theirServer.baseUrl}/bare.git`, ...s.push],
+            ["push", ...nativeOptions(s, porcelain), "origin", ...s.push],
             theirs.env,
           );
           native.stdout = native.stdout.replaceAll(theirServer.baseUrl, "<url>");
@@ -720,8 +799,37 @@ describeGit("proc-receive: our client pushing to native receive-pack", () => {
           } else {
             expect(ours.result.display, `${label}: display`).toEqual(refLines(nativeStderr));
           }
+          expect(ours.result.errors ?? [], `${label}: errors`).toEqual(
+            reportErrorLines(nativeStderr),
+          );
         }
+        expect(trackingOf(join(mine.dir, "src")), `${label}: tracking`).toBe(
+          trackingOf(join(theirs.dir, "src")),
+        );
       }
     }, 60_000);
   }
+});
+
+describeGit("proc-receive: receive.procReceiveRefs without a value", () => {
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "proc-receive-nonbool-"));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("receive-pack dies reading its config (config_error_nonbool), before the advertisement", async () => {
+    const dir = join(root, "r");
+    const s: Scenario = { label: "nonbool", refs: [], push: ["HEAD:refs/for/main/topic"] };
+    base(dir, writeProcReceiveTool(root), s);
+    appendFileSync(join(dir, "bare.git", "config"), "[receive]\n\tprocReceiveRefs\n");
+    const [theirs, mine] = hookTwins(root, dir);
+    const native = gitRun(root, join(theirs.dir, "src"), ["push", "origin", ...s.push], theirs.env);
+    expect(native.status).toBe(128);
+    expect(native.stderr).toContain("error: missing value for 'receive.procreceiverefs'");
+    const ours = await oursPush(mine, s, "origin");
+    expect(ours.result).toBeUndefined();
+    // receive-pack's lines and the client's, as native git prints them
+    expect((ours.error as Error).message).toBe(native.stderr.trimEnd());
+    expect(refsOf(join(mine.dir, "bare.git"))).toBe(refsOf(join(theirs.dir, "bare.git")));
+  }, 60_000);
 });

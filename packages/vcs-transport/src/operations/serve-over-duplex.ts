@@ -94,6 +94,8 @@ export interface ServeOverDuplexOptions {
   preReceiveSeesRefused?: boolean;
   /** receive-pack: git's `receive.procReceiveRefs` (see `ReceivePackConfig.procReceiveRefs`) */
   procReceiveRefs?: readonly string[];
+  /** receive-pack: a setting git cannot read (see `ReceivePackConfig.configError`) */
+  receivePackConfigError?: string;
   /** upload-pack hooks: authorize (before the negotiation), postUpload (after the pack) */
   uploadPackHooks?: UploadPackHooks;
   /**
@@ -272,6 +274,9 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       ...(options.publishBeforeUpdate ? { publishBeforeUpdate: true } : {}),
       ...(options.preReceiveSeesRefused ? { preReceiveSeesRefused: true } : {}),
       ...(options.procReceiveRefs?.length ? { procReceiveRefs: options.procReceiveRefs } : {}),
+      ...(options.receivePackConfigError !== undefined
+        ? { configError: options.receivePackConfigError }
+        : {}),
     },
   };
   // post-receive tasks: started once the report is written (detached from this call)

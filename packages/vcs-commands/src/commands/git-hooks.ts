@@ -85,6 +85,8 @@ export interface StartedHook {
   closeStdout(): void;
   /** Waits for it to exit (its stderr kept in the session's output): its exit code */
   wait(): Promise<number>;
+  /** Stops it, where the runner can (`HookProcess.kill`) */
+  kill?(): void;
 }
 
 /** A hook found: where it is, for the runner and for git's messages. */
@@ -1082,7 +1084,8 @@ export class HookSession {
    * Starts the hook `name` found as git's `find_hook` finds it (the hooks directory's script
    * alone: no configured hook, as receive-pack's proc-receive), its stdin and stdout piped to
    * the caller. Undefined when there is none (or no runner). Its stderr is kept in
-   * {@link output} once it exited (`wait()`), and handed to `onStderr` then.
+   * {@link output} and handed to `onStderr` as it comes where the runner streams it (git's
+   * `copy_to_sideband`), else once it exited; either way all of it before `wait()` resolves.
    *
    * A runner that cannot start a hook it talks to (no `HookRunner.start`) gets a process that
    * takes the whole stdin first (`interactive: false`): the hook runs once its stdin is closed.
@@ -1113,9 +1116,19 @@ export class HookSession {
       return outcome?.exitCode ?? 0;
     };
     if (runner.start) {
+      // its stderr relayed chunk by chunk, in order, every chunk before wait() resolves
+      const streamed = new TextDecoder();
+      let relayed: Promise<void> = Promise.resolve();
+      const relay = (text: string) => {
+        if (!text) return;
+        this.append(text);
+        relayed = relayed.then(() => options.onStderr?.(text)).catch(() => {});
+      };
       let process: HookProcess | undefined;
       try {
-        process = await runner.start(invocation);
+        process = await runner.start(invocation, {
+          onStderr: (chunk) => relay(streamed.decode(chunk, { stream: true })),
+        });
       } catch (error) {
         const text = `error: cannot run ${hook.path}: ${String((error as Error)?.message ?? error)}\n`;
         this.append(text);
@@ -1130,7 +1143,13 @@ export class HookSession {
         closeStdin: () => started.closeStdin(),
         stdout: started.stdout,
         closeStdout: () => started.closeStdout(),
-        wait: async () => finish(await started.wait()),
+        wait: async () => {
+          const outcome = await started.wait();
+          relay(streamed.decode());
+          await relayed;
+          return finish(outcome);
+        },
+        ...(started.kill ? { kill: () => started.kill?.() } : {}),
       };
     }
     // the whole stdin first, then one run

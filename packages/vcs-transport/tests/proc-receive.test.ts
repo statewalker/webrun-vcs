@@ -269,3 +269,114 @@ describe("receive-pack: the proc-receive hook", () => {
     expect(run.report).toEqual(["unpack ok", "ng refs/for/x not now"]);
   });
 });
+
+describe("receive-pack: a proc-receive hook past hookTimeoutMs", () => {
+  /** A hook that answers the version, reads the commands, then hangs until killed. */
+  function hungHook(report: string[] = []): { process: ProcReceiveProcess; killed: () => number } {
+    const hook = scriptedHook(report);
+    let kills = 0;
+    let stop: (() => void) | undefined;
+    const stopped = new Promise<void>((resolve) => {
+      stop = resolve;
+    });
+    const inner = hook.process.stdout[Symbol.asyncIterator]();
+    let sent = 0;
+    const process: ProcReceiveProcess = {
+      ...hook.process,
+      stdout: {
+        async *[Symbol.asyncIterator]() {
+          for (;;) {
+            // the version and `report` (no flush after it): then nothing until killed
+            const next = await Promise.race([inner.next(), stopped.then(() => undefined)]);
+            if (!next || next.done) return;
+            const text = decoder.decode(next.value);
+            if (text === "0000" && sent > 0) {
+              await stopped;
+              return;
+            }
+            if (text === "0000") sent++;
+            yield next.value;
+          }
+        },
+      },
+      wait: async () => {
+        await stopped;
+        return 143;
+      },
+      kill: () => {
+        kills++;
+        stop?.();
+      },
+    };
+    return { process, killed: () => kills };
+  }
+
+  async function push(hook: ProcReceiveProcess, atomic: boolean, errors: unknown[]) {
+    const { repo } = await serverRepo();
+    const { client, commits } = await clientWithNewCommits(1);
+    const n0 = commits[0] as string;
+    return runReceivePack(
+      repo,
+      {
+        commands: [
+          `${ZERO} ${n0} refs/for/x`,
+          `${ZERO} ${n0} refs/for/y`,
+          `${ZERO} ${n0} refs/heads/z`,
+        ],
+        caps: `report-status-v2 side-band-64k${atomic ? " atomic" : ""}`,
+        pack: await fullPackOf(client, [n0]),
+      },
+      {
+        procReceiveRefs: ["refs/for"],
+        hookTimeoutMs: 100,
+        hooks: { procReceive: () => hook },
+        logger: { error: (_m, e) => errors.push(e) },
+      },
+    );
+  }
+
+  it("kills the hook; the commands it did not report fail to run it", async () => {
+    const hook = hungHook(["ok refs/for/x"]);
+    const errors: unknown[] = [];
+    const run = await push(hook.process, false, errors);
+    expect(hook.killed()).toBe(1);
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ok refs/for/x",
+      "ng refs/for/y fail to run proc-receive hook",
+      "ok refs/heads/z",
+    ]);
+    expect(errors.some((e) => (e as Error)?.name === "HookTimeoutError")).toBe(true);
+  });
+
+  it("an atomic push fails whole", async () => {
+    const hook = hungHook(["ok refs/for/x"]);
+    const run = await push(hook.process, true, []);
+    expect(hook.killed()).toBe(1);
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ng refs/for/x fail to run proc-receive hook",
+      "ng refs/for/y fail to run proc-receive hook",
+      "ng refs/heads/z fail to run proc-receive hook",
+    ]);
+  });
+});
+
+describe("receive-pack: an `ng` of the proc-receive hook", () => {
+  it("keeps an empty reason (git's report: `ng <ref> `)", async () => {
+    const { repo } = await serverRepo();
+    const { client, commits } = await clientWithNewCommits(1);
+    const n0 = commits[0] as string;
+    const hook = scriptedHook(["ng refs/for/x ", "ng refs/for/y"]);
+    const run = await runReceivePack(
+      repo,
+      {
+        commands: [`${ZERO} ${n0} refs/for/x`, `${ZERO} ${n0} refs/for/y`],
+        caps: "report-status-v2 side-band-64k",
+        pack: await fullPackOf(client, [n0]),
+      },
+      { procReceiveRefs: ["refs/for"], hooks: { procReceive: () => hook.process } },
+    );
+    expect(run.report).toEqual(["unpack ok", "ng refs/for/x ", "ng refs/for/y failed"]);
+  });
+});

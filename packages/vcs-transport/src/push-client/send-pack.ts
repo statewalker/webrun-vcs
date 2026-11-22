@@ -126,6 +126,17 @@ export interface PushClientResult {
   abbrevLengths: AbbrevLengths;
   /** git's `transport_summary_width` of the push: the width of the status column */
   summaryWidth: number;
+  /**
+   * git's error and warning lines of reading the server's report (receive_status: `error:
+   * 'option' without a matching 'ok/ng' directive`, `warning: remote reported status on
+   * unknown ref: <ref>`), in order
+   */
+  reportErrors?: string[];
+  /**
+   * The report broke git's rules (receive_status returned -1: an `option` line without its
+   * `ok`): the push fails (git exits 1) whatever the refs' statuses say
+   */
+  reportFailed?: boolean;
 }
 
 /**
@@ -392,6 +403,9 @@ async function sendPack(
   }
   const reported = new Set<PushRefUpdate>();
   const byRef = new Map(toSend.map((u) => [u.remoteRef, u]));
+  const unsent = new Set(updates.filter((u) => !toSend.includes(u)).map((u) => u.remoteRef));
+  const reportErrors: string[] = [];
+  let optionWithoutStatus = false;
   // git's receive_status: the `option` lines after an `ok` add a report to that ref
   let hint: PushRefUpdate | undefined;
   let current: PushRefReport | undefined;
@@ -402,8 +416,15 @@ async function sendPack(
     line = await report.readLine()
   ) {
     if (line.startsWith("option ")) {
-      // "'option' without a matching 'ok/ng' directive": git's error, the line ignored
-      if (!hint || !(current || newReport)) continue;
+      // git's error (once), the line ignored, the push failed
+      if (!hint || !(current || newReport)) {
+        if (!optionWithoutStatus) {
+          reportErrors.push("error: 'option' without a matching 'ok/ng' directive");
+        }
+        optionWithoutStatus = true;
+        result.reportFailed = true;
+        continue;
+      }
       if (newReport) {
         current = {};
         hint.reports = [...(hint.reports ?? []), current];
@@ -445,7 +466,15 @@ async function sendPack(
     }
     const update = byRef.get(ref);
     hint = update;
-    if (!update) continue; // git: a report of a ref not pushed is ignored
+    if (!update) {
+      // git warns of a report on a ref it did not send, and ignores it (the hint lost)
+      reportErrors.push(
+        unsent.has(ref)
+          ? `warning: remote reported status on unexpected ref: ${ref}`
+          : `warning: remote reported status on unknown ref: ${ref}`,
+      );
+      continue;
+    }
     reported.add(update);
     if (message === undefined) {
       setStatus(update, "ok");
@@ -467,7 +496,9 @@ async function sendPack(
       // the report is in: a broken tail changes nothing
     }
   }
-  result.ok = result.unpack.ok && updates.every((u) => isPushSuccess(u.status));
+  if (reportErrors.length > 0) result.reportErrors = reportErrors;
+  result.ok =
+    result.unpack.ok && !result.reportFailed && updates.every((u) => isPushSuccess(u.status));
   return result;
 }
 

@@ -37,13 +37,24 @@ export interface NodeHookProcess {
   readonly stdout: AsyncIterable<Uint8Array>;
   closeStdout(): void;
   wait(): Promise<NodeHookOutcome>;
+  /** Kills the child (SIGTERM) */
+  kill(): void;
+}
+
+/** How a started hook's stderr is handed back (`HookStartOptions`). */
+export interface NodeHookStartOptions {
+  /** Each chunk of its stderr as it comes (the outcome's stderr then empty) */
+  onStderr?(chunk: Uint8Array): void;
 }
 
 /** The runner (`HookRunner`). */
 export interface NodeHookRunner {
   run(invocation: NodeHookInvocation): Promise<NodeHookOutcome | undefined>;
   /** Starts the hook with its stdin and stdout piped (git's `in = out = -1`: proc-receive) */
-  start(invocation: NodeHookInvocation): Promise<NodeHookProcess | undefined>;
+  start(
+    invocation: NodeHookInvocation,
+    startOptions?: NodeHookStartOptions,
+  ): Promise<NodeHookProcess | undefined>;
   compatibility?: "2.43" | "2.56";
 }
 
@@ -74,7 +85,7 @@ export function createNodeHookRunner(options: NodeHookRunnerOptions = {}): NodeH
   return {
     ...(options.compatibility ? { compatibility: options.compatibility } : {}),
     run: (invocation) => runHook(invocation, options),
-    start: (invocation) => startHook(invocation, options),
+    start: (invocation, startOptions) => startHook(invocation, options, startOptions),
   };
 }
 
@@ -85,6 +96,7 @@ export function createNodeHookRunner(options: NodeHookRunnerOptions = {}): NodeH
 async function startHook(
   invocation: NodeHookInvocation,
   options: NodeHookRunnerOptions,
+  startOptions: NodeHookStartOptions = {},
 ): Promise<NodeHookProcess | undefined> {
   const base = options.env ?? process.env;
   const env: Record<string, string> = {};
@@ -106,7 +118,12 @@ async function startHook(
   }
   const child = spawn(command, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
   const err: Buffer[] = [];
-  child.stderr?.on("data", (chunk: Buffer) => err.push(chunk));
+  // streamed as it comes (git's copy_to_sideband), else kept for the outcome
+  const onStderr = startOptions.onStderr;
+  child.stderr?.on("data", (chunk: Buffer) => {
+    if (onStderr) onStderr(new Uint8Array(chunk));
+    else err.push(chunk);
+  });
   let failed: Error | undefined;
   child.on("error", (error) => {
     failed = error;
@@ -162,6 +179,13 @@ async function startHook(
       stdout?.destroy();
     },
     wait: () => exited,
+    kill: () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      // a child of the script may hold the pipes open: close our ends, so the exit is seen
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    },
   };
 }
 

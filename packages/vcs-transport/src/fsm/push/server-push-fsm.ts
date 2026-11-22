@@ -175,6 +175,12 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
   [
     "SEND_ADVERTISEMENT",
     async (ctx) => {
+      // receive_pack_config dies on a setting it cannot read, before the advertisement
+      const configError = receivePackConfig(ctx).configError;
+      if (configError !== undefined) {
+        getOutput(ctx).error = configError;
+        return "ERROR";
+      }
       const transport = getTransport(ctx);
       const refStore = getRefStore(ctx);
       const state = getState(ctx);
@@ -729,7 +735,12 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         if (v2 || state.capabilities.has("report-status")) {
           const lines = [`unpack ${state.unpackStatus ?? "ok"}`];
           for (const cmd of state.pushCommands ?? []) {
-            const reason = oneLine(cmd.message ?? "") || "rejected";
+            // a proc-receive `ng <ref> ` keeps its empty reason (git's report: `ng <ref> `,
+            // the client's `[remote rejected] ... ()`)
+            const reason =
+              cmd.procReceive && cmd.message !== undefined
+                ? oneLine(cmd.message)
+                : oneLine(cmd.message ?? "") || "rejected";
             if (v2) lines.push(...reportV2Lines(cmd, reason));
             else
               lines.push(cmd.result === "OK" ? `ok ${cmd.refName}` : `ng ${cmd.refName} ${reason}`);
@@ -952,13 +963,18 @@ async function timedHook<T>(
   ctx: ProcessContext,
   name: string,
   run: () => T | Promise<T>,
+  onTimeout?: () => void,
 ): Promise<T> {
   const ms = receivePackConfig(ctx).hookTimeoutMs;
   const pending = Promise.resolve().then(run);
   if (!ms || ms <= 0) return pending;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new HookTimeoutError(name, ms)), ms);
+    timer = setTimeout(() => {
+      // before anything else runs: the caller stops the hook and ignores what it says next
+      onTimeout?.();
+      reject(new HookTimeoutError(name, ms));
+    }, ms);
   });
   pending.catch(() => {}); // a late failure after the timeout is not unhandled
   try {
@@ -1768,17 +1784,44 @@ async function runProcReceiveHook(ctx: ProcessContext): Promise<void> {
   // the hook reads the pushed objects from the repository
   await publishQuarantine(ctx);
   const atomic = state.capabilities.has("atomic");
+  // hookTimeoutMs covers the whole conversation: once it passes the hook is killed and what
+  // it says later is ignored (`cancelled`)
+  let cancelled = false;
   let process: ProcReceiveProcess | undefined;
+  let code: number;
+  let error: string | undefined;
   try {
-    process = (await receivePackHooks(ctx)?.procReceive?.(hookContext(ctx))) ?? undefined;
+    ({ code, error } = await timedHook(
+      ctx,
+      "proc-receive",
+      async () => {
+        try {
+          process = (await receivePackHooks(ctx)?.procReceive?.(hookContext(ctx))) ?? undefined;
+        } catch (e) {
+          logError(ctx, "proc-receive hook failed to start", e);
+          process = undefined;
+        }
+        // timed out while it started: stop it at once
+        if (cancelled) process?.kill?.();
+        return runProcReceive(process, commands, {
+          atomic,
+          ...(state.capabilities.has("push-options")
+            ? { pushOptions: state.pushOptions ?? [] }
+            : {}),
+          cancelled: () => cancelled,
+        });
+      },
+      () => {
+        cancelled = true;
+        killHook(ctx, process);
+      },
+    ));
   } catch (e) {
-    logError(ctx, "proc-receive hook failed to start", e);
-    process = undefined;
+    if (!(e instanceof HookTimeoutError)) throw e;
+    logError(ctx, "proc-receive hook failed", e);
+    code = -1;
+    error = undefined;
   }
-  const { code, error } = await runProcReceive(process, commands, {
-    atomic,
-    ...(state.capabilities.has("push-options") ? { pushOptions: state.pushOptions ?? [] } : {}),
-  });
   if (error) await sendError(ctx, error);
   const decided = state.refusedBeforeTransaction ?? new Set<PushCommand>();
   state.refusedBeforeTransaction = decided;
@@ -1787,7 +1830,9 @@ async function runProcReceiveHook(ctx: ProcessContext): Promise<void> {
       if (cmd.procReceive) decided.add(cmd);
       continue;
     }
-    const returned = ((cmd.procReceive ?? 0) & PROC_RECEIVE_RETURNED) !== 0;
+    // timed out: an atomic push fails whole, the hook's `ok`s included
+    const returned =
+      !(cancelled && atomic) && ((cmd.procReceive ?? 0) & PROC_RECEIVE_RETURNED) !== 0;
     if (code !== 0 && !returned && (cmd.procReceive || atomic)) {
       reject(cmd, "fail to run proc-receive hook");
       decided.add(cmd);
@@ -1800,6 +1845,15 @@ async function runProcReceiveHook(ctx: ProcessContext): Promise<void> {
   if (atomic && !commands.some((c) => c.result === "NOT_ATTEMPTED")) {
     const batch = getRefStore(ctx).batch?.bind(getRefStore(ctx));
     if (batch) await batch([], { message: "push", emptyTransaction: true });
+  }
+}
+
+/** Stops a proc-receive hook receive-pack gave up on (a runner without `kill` cannot). */
+function killHook(ctx: ProcessContext, process: ProcReceiveProcess | undefined): void {
+  try {
+    process?.kill?.();
+  } catch (e) {
+    logError(ctx, "proc-receive hook could not be stopped", e);
   }
 }
 

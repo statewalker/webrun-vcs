@@ -251,12 +251,22 @@ export interface HookRunner {
    * while it runs); undefined when the script cannot be started ("no hook"). Without it such
    * a hook is given its whole stdin at once through {@link run}.
    */
-  start?(invocation: HookInvocation): Promise<HookProcess | undefined>;
+  start?(invocation: HookInvocation, options?: HookStartOptions): Promise<HookProcess | undefined>;
   /**
    * The git version whose wording and order the hooks follow where versions differ (the
    * `advice.ignoredHook` hint, reference-transaction's states); default `2.56`
    */
   compatibility?: "2.43" | "2.56";
+}
+
+/** How {@link HookRunner.start} hands back a started hook's stderr. */
+export interface HookStartOptions {
+  /**
+   * Called with each chunk of the hook's stderr as it writes it (git's `copy_to_sideband`);
+   * the outcome of `wait()` then has no stderr. A runner calls it for every chunk before
+   * `wait()` resolves.
+   */
+  onStderr?(chunk: Uint8Array): void;
 }
 
 /** A hook running, talked to while it runs (see {@link HookRunner.start}). */
@@ -271,6 +281,8 @@ export interface HookProcess {
   closeStdout(): void;
   /** Waits for it to exit: its exit code and stderr (`stdout` empty: read through {@link stdout}) */
   wait(): Promise<HookOutcome>;
+  /** Stops it (receive-pack gave up on it: `hookTimeoutMs`); optional */
+  kill?(): void;
 }
 
 const join = (dir: string, name: string) =>

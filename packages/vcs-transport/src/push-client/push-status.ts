@@ -158,6 +158,8 @@ export interface PushStatusSource {
   summaryWidth?: number;
   /** The server's `unpack` line (`PushClientResult.unpack`): `Done` needs it ok under porcelain */
   unpack?: { ok: boolean; message?: string };
+  /** The server's report was broken (`PushClientResult.reportFailed`): no `Done` */
+  reportFailed?: boolean;
 }
 
 /**
@@ -212,11 +214,15 @@ export function formatPushStatus(
   if (porcelain) {
     // send_pack returns 0 under --porcelain once the report is read (refused refs or not)
     const failed =
-      result.unpack?.ok === false || result.updates.some((u) => u.status === "atomic-push-failed");
+      result.unpack?.ok === false ||
+      result.reportFailed === true ||
+      result.updates.some((u) => u.status === "atomic-push-failed");
     if (!failed) lines.push("Done");
     return lines;
   }
   // push.c: nothing pushed and nothing refused
-  if (!result.updates.some((u) => u.status !== "up-to-date")) lines.push("Everything up-to-date");
+  if (!result.reportFailed && !result.updates.some((u) => u.status !== "up-to-date")) {
+    lines.push("Everything up-to-date");
+  }
   return lines;
 }

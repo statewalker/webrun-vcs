@@ -1,4 +1,4 @@
-import { parseCoreAbbrev } from "@statewalker/vcs-core";
+import { isValidRefName, parseCoreAbbrev } from "@statewalker/vcs-core";
 import {
   createRepositoryFacade,
   createTransportRefStore,
@@ -23,6 +23,7 @@ import {
   InvalidRemoteError,
   NonFastForwardError,
   PushRejectedException,
+  TransportError,
 } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type PushResult, PushStatus, type RemoteRefUpdate } from "../results/push-result.js";
@@ -527,6 +528,17 @@ export class PushCommand extends TransportCommand<PushResult> {
 
     // git updates the remote-tracking refs of what the server accepted, and of what it had
     // already (transport.c: update_tracking_ref for ok and up-to-date refs)
+    // receive_status's lines (read with the report), then the tracking refs' errors
+    const trackingErrors: string[] = [...(result.reportErrors ?? [])];
+    const objects = history.objects;
+    // odb_has_object; a store without its object kernel asks the typed stores
+    const objectExists = async (id: string): Promise<boolean> => {
+      if (objects) return objects.has(id).catch(() => false);
+      for (const s of [this.commits, this.trees, this.blobs, this.tagsStore]) {
+        if (s && (await s.has(id).catch(() => false))) return true;
+      }
+      return false;
+    };
     if (!this.dryRun) {
       for (const update of result.updates) {
         if (update.status !== "ok" && update.status !== "up-to-date") continue;
@@ -541,9 +553,47 @@ export class PushCommand extends TransportCommand<PushResult> {
         for (const target of targets) {
           const local = tracking(target.ref);
           if (!local) continue;
-          if (target.oid === ZERO_OBJECT_ID) await history.refs.remove(local);
-          // git's update_tracking_ref: "update by push"
-          else await history.refs.set(local, target.oid, this.reflogLine("update by push"));
+          // update_one_tracking_ref: refs_delete_ref / refs_update_ref, whose refusals are
+          // error lines (the push is done: git exits 0). The names and ids come from the
+          // server (a proc-receive hook's `option refname` / `new-oid`): a bad name or an
+          // object we lack is refused, as refs.c's transaction refuses it
+          if (target.oid === ZERO_OBJECT_ID) {
+            if (!refNameIsSafe(local)) {
+              trackingErrors.push(`error: refusing to update ref with bad name '${local}'`);
+              continue;
+            }
+            // a safe name no ref store holds (`a..b`) has nothing to delete
+            if (!isValidRefName(local, { allowOneLevel: true })) continue;
+            try {
+              await history.refs.remove(local);
+            } catch (e) {
+              trackingErrors.push(`error: ${errorText(e)}`);
+            }
+            continue;
+          }
+          const failed = (reason: string) =>
+            trackingErrors.push(`error: update_ref failed for ref '${local}': ${reason}`);
+          if (!isValidRefName(local, { allowOneLevel: true })) {
+            failed(`refusing to update ref with bad name '${local}'`);
+            continue;
+          }
+          if (!(await objectExists(target.oid))) {
+            // 2.43's files backend wraps the error in "cannot update ref"; 2.5x's
+            // ref_transaction_update says it alone
+            const reason = `trying to write ref '${local}' with nonexistent object ${target.oid}`;
+            failed(
+              this.hooks.compatibility !== "2.43"
+                ? reason
+                : `cannot update ref '${local}': ${reason}`,
+            );
+            continue;
+          }
+          try {
+            // git's update_tracking_ref: "update by push"
+            await history.refs.set(local, target.oid, this.reflogLine("update by push"));
+          } catch (e) {
+            failed(errorText(e));
+          }
         }
       }
     }
@@ -578,6 +628,8 @@ export class PushCommand extends TransportCommand<PushResult> {
       messages,
       display: formatPushStatus(result, { dest: remoteUrl }),
       porcelain: formatPushStatus(result, { dest: remoteUrl, porcelain: true }),
+      ...(trackingErrors.length ? { errors: trackingErrors } : {}),
+      ...(result.reportFailed ? { failed: true } : {}),
     };
   }
 
@@ -616,6 +668,10 @@ export class PushCommand extends TransportCommand<PushResult> {
    */
   async callOrThrow(): Promise<PushResult> {
     const result = await this.call();
+    if (result.failed) {
+      // git's "failed to push some refs to '<url>'"
+      throw new TransportError("failed to push some refs", result.uri, { exitCode: 1 });
+    }
 
     for (const update of result.remoteUpdates) {
       if (update.status === PushStatus.REJECTED_NONFASTFORWARD) {
@@ -751,4 +807,23 @@ export class PushCommand extends TransportCommand<PushResult> {
       return spec ? (expandFromSource(spec, remoteRef).destination ?? undefined) : undefined;
     };
   }
+}
+
+/** An error's message, as git's strbuf of a failed ref update. */
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * refs.c's `refname_is_safe`, which a deletion's name must pass: under `refs/`, a name that
+ * stays under it as written (no empty, `.` or `..` component, no leading or trailing `/`);
+ * outside it, uppercase letters and `_` only (`ORIG_HEAD`).
+ */
+function refNameIsSafe(name: string): boolean {
+  if (name.startsWith("refs/")) {
+    const rest = name.slice(5);
+    if (!rest) return false;
+    return rest.split("/").every((c) => c !== "" && c !== "." && c !== "..");
+  }
+  return /^[A-Z_]+$/.test(name);
 }

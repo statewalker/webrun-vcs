@@ -325,4 +325,10 @@ export interface ReceivePackConfig {
    * (`ReceivePackHooks.procReceive`) instead of being updated by receive-pack
    */
   procReceiveRefs?: readonly string[];
+  /**
+   * What receive-pack prints as it dies on a setting it cannot read (see
+   * `ServerConfigSettings.receivePackConfigError`): it dies before the advertisement, the
+   * text as `output.error`, as git's receive_pack_config dies
+   */
+  configError?: string;
 }

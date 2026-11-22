@@ -100,6 +100,18 @@ export interface PushResult {
    * `<flag>\t<from>:<to>\t<summary>` line per ref (and per server report), `Done`
    */
   porcelain?: string[];
+  /**
+   * git's error lines after the push (stderr): the remote-tracking refs it could not update,
+   * as transport.c's update_one_tracking_ref reports them (`error: update_ref failed for ref
+   * '<ref>': ...`); the push itself succeeded (git exits 0)
+   */
+  errors?: string[];
+  /**
+   * The push failed although every ref's status says otherwise: the server's report broke
+   * git's rules (an `option` line without its `ok`; git exits 1, its porcelain output has no
+   * `Done`)
+   */
+  failed?: boolean;
 }
 
 /**

@@ -47,6 +47,12 @@ export interface ProcReceiveProcess {
   closeStdout?(): void;
   /** Waits for the hook to exit: its exit code */
   wait(): Promise<number>;
+  /**
+   * Stops the hook (the Node runner kills the child): receive-pack calls it when the hook ran
+   * past `hookTimeoutMs`, or when the run is given up. Optional: without it a hung hook is
+   * left running and its late answer ignored.
+   */
+  kill?(): void;
 }
 
 /** A `receive.procReceiveRefs` value (git's `struct proc_receive_ref`). */
@@ -166,6 +172,7 @@ async function readProcReceiveReport(
   pkts: PktStream,
   commands: ProcReceiveCommand[],
   errors: string[],
+  cancelled: () => boolean,
 ): Promise<number> {
   let hint: ProcReceiveCommand | undefined;
   let report: RefPushReport | undefined;
@@ -179,6 +186,8 @@ async function readProcReceiveReport(
   };
   for (;;) {
     const line = await readPkt(pkts);
+    // given up (timed out): what comes after is not the hook's report any more
+    if (cancelled()) return -1;
     if (line === "eof" || line === "flush") {
       if (line === "eof" && response === 0) {
         errors.push("proc-receive exited abnormally");
@@ -280,6 +289,11 @@ export interface ProcReceiveRun {
   atomic: boolean;
   /** The client sent push options (the `push-options` feature), and those options */
   pushOptions?: readonly string[];
+  /**
+   * Whether receive-pack gave the run up (the hook timed out): from then on nothing the hook
+   * says changes a command
+   */
+  cancelled?: () => boolean;
 }
 
 /**
@@ -368,7 +382,9 @@ export async function runProcReceive(
           code = -1;
         }
       }
-      if (code === 0) code = await readProcReceiveReport(pkts, commands, errors);
+      if (code === 0) {
+        code = await readProcReceiveReport(pkts, commands, errors, run.cancelled ?? (() => false));
+      }
     }
   } finally {
     // git closes both pipes, then waits for the hook
