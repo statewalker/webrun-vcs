@@ -246,10 +246,43 @@ export interface HookOutcome {
 export interface HookRunner {
   run(invocation: HookInvocation): Promise<HookOutcome | undefined>;
   /**
+   * Starts the hook and hands back the running process, its stdin and stdout piped to the
+   * caller (git's `start_command` with `in = out = -1`: receive-pack talks to proc-receive
+   * while it runs); undefined when the script cannot be started ("no hook"). Without it such
+   * a hook is given its whole stdin at once through {@link run}.
+   */
+  start?(invocation: HookInvocation, options?: HookStartOptions): Promise<HookProcess | undefined>;
+  /**
    * The git version whose wording and order the hooks follow where versions differ (the
    * `advice.ignoredHook` hint, reference-transaction's states); default `2.56`
    */
   compatibility?: "2.43" | "2.56";
+}
+
+/** How {@link HookRunner.start} hands back a started hook's stderr. */
+export interface HookStartOptions {
+  /**
+   * Called with each chunk of the hook's stderr as it writes it (git's `copy_to_sideband`);
+   * the outcome of `wait()` then has no stderr. A runner calls it for every chunk before
+   * `wait()` resolves.
+   */
+  onStderr?(chunk: Uint8Array): void;
+}
+
+/** A hook running, talked to while it runs (see {@link HookRunner.start}). */
+export interface HookProcess {
+  /** Writes to its stdin; rejects once it closed it (it exited) */
+  write(data: Uint8Array): Promise<void>;
+  /** Closes its stdin */
+  closeStdin(): Promise<void>;
+  /** Its stdout, as it writes it */
+  readonly stdout: AsyncIterable<Uint8Array>;
+  /** Stops reading its stdout, closing the pipe (its later writes fail, as after git's `close`) */
+  closeStdout(): void;
+  /** Waits for it to exit: its exit code and stderr (`stdout` empty: read through {@link stdout}) */
+  wait(): Promise<HookOutcome>;
+  /** Stops it (receive-pack gave up on it: `hookTimeoutMs`); optional */
+  kill?(): void;
 }
 
 const join = (dir: string, name: string) =>

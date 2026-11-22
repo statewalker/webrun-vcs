@@ -24,7 +24,7 @@ import type {
   SymbolicRef,
   SymbolicRefLogOptions,
 } from "@statewalker/vcs-core";
-import { isRefObjectId, isUpdatableRefName } from "@statewalker/vcs-core";
+import { isRefObjectId, isUpdatableRefName, isValidRefName } from "@statewalker/vcs-core";
 import { type AtomicFiles, atomicFilesOver } from "@statewalker/vcs-utils/files";
 
 import {
@@ -213,6 +213,12 @@ export class FileRefStore implements Refs {
     // repository no git can open; the batch refuses it too, this covers ORIG_HEAD and kin
     if (!isRefObjectId(objectId)) {
       throw new RefUpdateRejectedError([{ name: refName, reason: "invalid-object-id" }]);
+    }
+    // a name git's ref transaction refuses (check_refname_format, one level allowed:
+    // `refs/heads/a..b`, `refs/../x`) is never written: it would leave a file no git reads
+    // as a ref, or one outside the refs
+    if (!isValidRefName(refName, { allowOneLevel: true })) {
+      throw new RefUpdateRejectedError([{ name: refName, reason: "invalid-name" }]);
     }
     if (isRootRefName(refName)) return this.ops.writeRootRef(refName, objectId);
     if (!isUpdatableRefName(refName)) return this.ops.writeLoose(refName, `${objectId}\n`);

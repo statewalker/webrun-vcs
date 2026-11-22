@@ -33,6 +33,7 @@ import {
   deleteReflogLine,
   isRefObjectId,
   isUpdatableRefName,
+  isValidRefName,
   planRefBatch,
   planReflog,
   ReflogEntryNotFoundError,
@@ -258,6 +259,10 @@ export class KVRefStore implements Refs {
     // a direct value is an object id, never a name (see isRefObjectId)
     if (!isRefObjectId(objectId)) {
       throw new Error(`cannot update ${refName}: ${refName}: invalid-object-id`);
+    }
+    // a name git's ref transaction refuses (check_refname_format, one level allowed)
+    if (!isValidRefName(refName, { allowOneLevel: true })) {
+      throw new Error(`cannot update ${refName}: ${refName}: invalid-name`);
     }
     if (log && isUpdatableRefName(refName)) {
       const r = await this.batch([{ name: refName, new: objectId, noDeref: true }], log);

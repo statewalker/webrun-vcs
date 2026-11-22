@@ -44,6 +44,8 @@ const CONFIG_KEYS = [
   "shallowUpdate",
   "uploadPackHideRefs",
   "receivePackHideRefs",
+  "procReceiveRefs",
+  "receivePackConfigError",
 ] as const;
 
 /** A repository without a config reads as one with nothing set: git's defaults. */

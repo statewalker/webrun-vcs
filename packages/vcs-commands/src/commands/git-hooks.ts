@@ -26,7 +26,9 @@ import type { FilesApi } from "@statewalker/vcs-utils/files";
 import {
   expandUserPath,
   type GitHostEnvironment,
+  type HookInvocation,
   type HookOutcome,
+  type HookProcess,
   type HookRunner,
   type WorkingCopy,
 } from "@statewalker/vcs-working-tree";
@@ -68,6 +70,23 @@ export interface HookResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+}
+
+/**
+ * A hook started by {@link HookSession.start}: its stdin and stdout, and its exit. The shape
+ * of the transport's `ProcReceiveProcess`.
+ */
+export interface StartedHook {
+  /** false: it takes its whole stdin before it runs (the runner has no `start`) */
+  readonly interactive: boolean;
+  write(data: Uint8Array): Promise<void>;
+  closeStdin(): Promise<void>;
+  readonly stdout: AsyncIterable<Uint8Array>;
+  closeStdout(): void;
+  /** Waits for it to exit (its stderr kept in the session's output): its exit code */
+  wait(): Promise<number>;
+  /** Stops it, where the runner can (`HookProcess.kill`) */
+  kill?(): void;
 }
 
 /** A hook found: where it is, for the runner and for git's messages. */
@@ -1061,14 +1080,112 @@ export class HookSession {
     return ran;
   }
 
-  /** Runs one hook of `name` (see {@link run}). */
-  private async runOne(
-    runner: HookRunner,
+  /**
+   * Starts the hook `name` found as git's `find_hook` finds it (the hooks directory's script
+   * alone: no configured hook, as receive-pack's proc-receive), its stdin and stdout piped to
+   * the caller. Undefined when there is none (or no runner). Its stderr is kept in
+   * {@link output} and handed to `onStderr` as it comes where the runner streams it (git's
+   * `copy_to_sideband`), else once it exited; either way all of it before `wait()` resolves.
+   *
+   * A runner that cannot start a hook it talks to (no `HookRunner.start`) gets a process that
+   * takes the whole stdin first (`interactive: false`): the hook runs once its stdin is closed.
+   */
+  async start(
+    name: string,
+    options: HookCallOptions & { onStderr?: (text: string) => Promise<void> | void } = {},
+  ): Promise<StartedHook | undefined> {
+    const runner = this.runner;
+    if (!runner) return undefined;
+    const found = await this.find(name);
+    if (!found) return undefined;
+    const layout = await this.host.layout();
+    if (!layout) return undefined;
+    const { invocation, hook } = this.invocationOf(
+      layout,
+      name,
+      { kind: "traditional", found },
+      {
+        ...options,
+        keepStdout: true,
+      },
+    );
+    const finish = async (outcome: HookOutcome | undefined): Promise<number> => {
+      const stderr = outcome ? decoder.decode(outcome.stderr) : "";
+      this.append(stderr);
+      if (stderr) await options.onStderr?.(stderr);
+      return outcome?.exitCode ?? 0;
+    };
+    if (runner.start) {
+      // its stderr relayed chunk by chunk, in order, every chunk before wait() resolves
+      const streamed = new TextDecoder();
+      let relayed: Promise<void> = Promise.resolve();
+      const relay = (text: string) => {
+        if (!text) return;
+        this.append(text);
+        relayed = relayed.then(() => options.onStderr?.(text)).catch(() => {});
+      };
+      let process: HookProcess | undefined;
+      try {
+        process = await runner.start(invocation, {
+          onStderr: (chunk) => relay(streamed.decode(chunk, { stream: true })),
+        });
+      } catch (error) {
+        const text = `error: cannot run ${hook.path}: ${String((error as Error)?.message ?? error)}\n`;
+        this.append(text);
+        await options.onStderr?.(text);
+        return undefined;
+      }
+      if (!process) return undefined;
+      const started = process;
+      return {
+        interactive: true,
+        write: (data) => started.write(data),
+        closeStdin: () => started.closeStdin(),
+        stdout: started.stdout,
+        closeStdout: () => started.closeStdout(),
+        wait: async () => {
+          const outcome = await started.wait();
+          relay(streamed.decode());
+          await relayed;
+          return finish(outcome);
+        },
+        ...(started.kill ? { kill: () => started.kill?.() } : {}),
+      };
+    }
+    // the whole stdin first, then one run
+    const chunks: Uint8Array[] = [];
+    let ran: Promise<HookOutcome | undefined> | undefined;
+    const runOnce = () => {
+      ran ??= runner.run({ ...invocation, stdin: concat(chunks) }).catch(() => undefined);
+      return ran;
+    };
+    return {
+      interactive: false,
+      write: async (data) => {
+        if (ran) throw new Error("the hook's stdin is closed");
+        chunks.push(data.slice());
+      },
+      closeStdin: async () => {
+        void runOnce();
+      },
+      stdout: {
+        async *[Symbol.asyncIterator]() {
+          const outcome = await runOnce();
+          if (outcome?.stdout.length) yield outcome.stdout;
+        },
+      },
+      closeStdout: () => {},
+      wait: async () => finish(await runOnce()),
+    };
+  }
+
+  /** The invocation of one hook of `name` (see {@link runOne}). */
+  private invocationOf(
     layout: HookLayout,
     name: string,
     toRun: HookToRun,
     options: HookCallOptions,
-  ): Promise<HookResult | undefined> {
+  ): { invocation: HookInvocation; hook: FoundHook } {
     const cwd = options.dir !== undefined ? normalizeFilesPath(options.dir) : layout.cwd;
     const hostCwd = hostPathOf(layout.files, cwd);
     const hook: FoundHook = toRun.kind === "traditional" ? toRun.found : { path: toRun.command };
@@ -1099,21 +1216,34 @@ export class HookSession {
       ),
     ];
     for (const key of unsetEnv) delete env[key];
+    const invocation: HookInvocation = {
+      name,
+      path,
+      ...(hook.hostPath ? { hostPath: hook.hostPath } : {}),
+      args: options.args ?? [],
+      ...(stdin ? { stdin } : {}),
+      env,
+      ...(unsetEnv.length > 0 ? { unsetEnv } : {}),
+      cwd,
+      ...(hostCwd ? { hostCwd } : {}),
+      stdoutToStderr: !options.keepStdout,
+      ...(toRun.kind === "configured" ? { command: toRun.command } : {}),
+    };
+    return { invocation, hook };
+  }
+
+  /** Runs one hook of `name` (see {@link run}). */
+  private async runOne(
+    runner: HookRunner,
+    layout: HookLayout,
+    name: string,
+    toRun: HookToRun,
+    options: HookCallOptions,
+  ): Promise<HookResult | undefined> {
+    const { invocation, hook } = this.invocationOf(layout, name, toRun, options);
     let outcome: HookOutcome | undefined;
     try {
-      outcome = await runner.run({
-        name,
-        path,
-        ...(hook.hostPath ? { hostPath: hook.hostPath } : {}),
-        args: options.args ?? [],
-        ...(stdin ? { stdin } : {}),
-        env,
-        ...(unsetEnv.length > 0 ? { unsetEnv } : {}),
-        cwd,
-        ...(hostCwd ? { hostCwd } : {}),
-        stdoutToStderr: !options.keepStdout,
-        ...(toRun.kind === "configured" ? { command: toRun.command } : {}),
-      });
+      outcome = await runner.run(invocation);
     } catch (error) {
       // git's notify_start_failure: the hook counts as failed
       this.append(

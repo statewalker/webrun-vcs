@@ -17,6 +17,7 @@ import {
   type SymbolicRefLogOptions,
   symrefReflogWrites,
 } from "./ref-batch.js";
+import { isValidRefName } from "./ref-name.js";
 import type { Ref, SymbolicRef } from "./ref-types.js";
 import { RefStorage } from "./ref-types.js";
 import {
@@ -146,6 +147,10 @@ export class MemoryRefs implements Refs {
     // a direct value is an object id, never a name (see isRefObjectId)
     if (!isRefObjectId(objectId)) {
       return Promise.reject(new Error(`cannot update ${name}: ${name}: invalid-object-id`));
+    }
+    // a name git's ref transaction refuses (check_refname_format, one level allowed)
+    if (!isValidRefName(name, { allowOneLevel: true })) {
+      return Promise.reject(new Error(`cannot update ${name}: ${name}: invalid-name`));
     }
     return this.exclusive(async () => {
       if (!log || !isUpdatableRefName(name)) {

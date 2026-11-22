@@ -3,6 +3,7 @@
  */
 
 import type { RepositoryFacade } from "../../api/repository-facade.js";
+import type { ProcReceiveProcess } from "./proc-receive.js";
 import type { PushCommandType } from "./types.js";
 
 /** A push command as receive-pack's hooks see it. */
@@ -15,6 +16,13 @@ export interface ReceiveCommand {
   readonly newOid: string;
   /** Create, update or delete */
   readonly type: PushCommandType;
+  /**
+   * post-receive only: the ref the client pushed, when this entry is a rewrite the
+   * proc-receive hook reported for it (`refName` and the ids are then the report's)
+   */
+  readonly pushedRef?: string;
+  /** post-receive only: the rewrite's position among its command's reports (0 for the first) */
+  readonly report?: number;
 }
 
 /** The smart-HTTP request a push came in (handed to the hooks by the HTTP handlers). */
@@ -130,6 +138,16 @@ export interface ReceivePackHooks {
    * Detached: it cannot change the outcome, and what it throws is logged.
    */
   postReceive?(commands: readonly ReceiveCommand[], ctx: ReceivePackHookContext): unknown;
+  /**
+   * git's proc-receive hook, started for the commands `receive.procReceiveRefs` matches
+   * (`ReceivePackConfig.procReceiveRefs`): the running hook receive-pack talks to over git's
+   * proc-receive protocol, or undefined when there is none (git's "cannot find hook
+   * 'proc-receive'", and those commands fail). Its stderr goes to the user (`ctx.message`)
+   * before `wait()` resolves.
+   */
+  procReceive?(
+    ctx: ReceivePackHookContext,
+  ): ProcReceiveProcess | undefined | Promise<ProcReceiveProcess | undefined>;
 }
 
 /** A logger for receive-pack (hook failures after the report). */
@@ -301,4 +319,16 @@ export interface ReceivePackConfig {
    * pre-receive when none is open.
    */
   preReceiveSeesRefused?: boolean;
+  /**
+   * git's `receive.procReceiveRefs` values, in order (`[<modifiers>:]<prefix>`; see
+   * `parseProcReceiveRef`): the commands they match are handed to the proc-receive hook
+   * (`ReceivePackHooks.procReceive`) instead of being updated by receive-pack
+   */
+  procReceiveRefs?: readonly string[];
+  /**
+   * What receive-pack prints as it dies on a setting it cannot read (see
+   * `ServerConfigSettings.receivePackConfigError`): it dies before the advertisement, the
+   * text as `output.error`, as git's receive_pack_config dies
+   */
+  configError?: string;
 }

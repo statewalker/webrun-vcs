@@ -280,6 +280,10 @@ export interface ReceivePackServerOptions {
   publishBeforeUpdate?: boolean;
   /** pre-receive sees the commands refused before it too (git's receive-pack; see `ReceivePackConfig`) */
   preReceiveSeesRefused?: boolean;
+  /** git's `receive.procReceiveRefs` (see `ReceivePackConfig.procReceiveRefs`) */
+  procReceiveRefs?: readonly string[];
+  /** A receive-pack setting git cannot read (see `ReceivePackConfig.configError`) */
+  receivePackConfigError?: string;
 }
 
 /**
@@ -937,6 +941,10 @@ export async function handleReceivePackInfoRefs(
   version1 = false,
   repository?: Pick<RepositoryFacade, "alternateRefs">,
 ): Promise<HttpResponse> {
+  // receive-pack dies reading its config (receive.procReceiveRefs without a value): nothing
+  // is advertised, the response a server error
+  const unreadable = options.receivePack?.receivePackConfigError;
+  if (unreadable !== undefined) return plain(500, unreadable);
   // The refs under refs/ but the hidden ones (write_head_info: never HEAD)
   const refs = receivePackRefs(await refStore.listAll(), receivePackHiddenRefs(options));
   // write_head_info: then the alternates' refs as `.have`, each object id once and none an
@@ -1026,6 +1034,8 @@ export async function handleReceivePack(
   context: HttpHandlerContext = {},
 ): Promise<HttpResponse> {
   if (!request.body) return plain(400, "Missing request body");
+  const unreadable = options.receivePack?.receivePackConfigError;
+  if (unreadable !== undefined) return plain(500, unreadable);
 
   const limit = options.maxRequestBodyBytes ?? DEFAULT_MAX_RECEIVE_PACK_REQUEST_BYTES;
   const input = requestBody(request, request.body, limit);
@@ -1095,6 +1105,10 @@ export async function handleReceivePack(
       ...(rp.interleaveUpdateHook ? { interleaveUpdateHook: true } : {}),
       ...(rp.publishBeforeUpdate ? { publishBeforeUpdate: true } : {}),
       ...(rp.preReceiveSeesRefused ? { preReceiveSeesRefused: true } : {}),
+      ...(rp.procReceiveRefs?.length ? { procReceiveRefs: rp.procReceiveRefs } : {}),
+      ...(rp.receivePackConfigError !== undefined
+        ? { configError: rp.receivePackConfigError }
+        : {}),
       logger: options.logger,
       request: {
         method: request.method,

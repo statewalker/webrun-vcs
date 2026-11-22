@@ -55,29 +55,37 @@ export function createRepositoryController(ctx: AppContext): () => void {
   const logModel = getActivityLogModel(ctx);
   const actionsModel = getUserActionsModel(ctx);
 
+  // Repository operations run one at a time, in the order they were asked for: a
+  // checkout after a received push must have written the index before a following
+  // refresh or add reads it (otherwise a commit made right after can drop pushed files).
+  let queue: Promise<void> = Promise.resolve();
+  function serialized(operation: () => Promise<void>): void {
+    queue = queue.then(operation, operation);
+  }
+
   // Listen to user actions via typed action adapters
   register(
     listenInitRepoAction(actionsModel, () => {
-      handleInit();
+      serialized(() => handleInit());
     }),
   );
 
   register(
     listenRefreshRepoAction(actionsModel, () => {
-      handleRefresh();
+      serialized(() => handleRefresh());
     }),
   );
 
   register(
     listenCheckoutAction(actionsModel, () => {
-      handleCheckoutHead();
+      serialized(() => handleCheckoutHead());
     }),
   );
 
   register(
     listenAddFileAction(actionsModel, (actions) => {
       for (const { name, content } of actions) {
-        handleAddFile(name, content);
+        serialized(() => handleAddFile(name, content));
       }
     }),
   );
@@ -85,7 +93,7 @@ export function createRepositoryController(ctx: AppContext): () => void {
   register(
     listenCreateCommitAction(actionsModel, (actions) => {
       for (const { message } of actions) {
-        handleCommit(message);
+        serialized(() => handleCommit(message));
       }
     }),
   );
@@ -93,7 +101,7 @@ export function createRepositoryController(ctx: AppContext): () => void {
   register(
     listenStageFileAction(actionsModel, (actions) => {
       for (const { path } of actions) {
-        handleStageFile(path);
+        serialized(() => handleStageFile(path));
       }
     }),
   );
@@ -101,20 +109,20 @@ export function createRepositoryController(ctx: AppContext): () => void {
   register(
     listenUnstageFileAction(actionsModel, (actions) => {
       for (const { path } of actions) {
-        handleUnstageFile(path);
+        serialized(() => handleUnstageFile(path));
       }
     }),
   );
 
   register(
     listenStageAllAction(actionsModel, () => {
-      handleStageAll();
+      serialized(() => handleStageAll());
     }),
   );
 
   register(
     listenOpenRepoAction(actionsModel, () => {
-      handleOpenRepository();
+      serialized(() => handleOpenRepository());
     }),
   );
 

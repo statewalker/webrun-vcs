@@ -375,7 +375,7 @@ describe("receive-pack: protocol and limits", () => {
     expect(await repo.refStore.get("refs/heads/p3")).toBe(n0);
   });
 
-  it("push options reach the hooks; report-status-v2 is not advertised", async () => {
+  it("push options reach the hooks", async () => {
     const { repo } = await serverRepo();
     const { client, commits } = await clientWithNewCommits(1);
     const n0 = commits[0] as string;

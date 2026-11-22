@@ -33,6 +33,11 @@ export interface ServerConfigReader {
    * `transfer.hideRefs` patterns come first.
    */
   list?(): Iterable<{ key: string; value: unknown }>;
+  /**
+   * Every entry with where it was read (the file and line of git's `bad config variable`
+   * message). Optional: without it the message names no place.
+   */
+  listWithOrigin?(): Iterable<{ key: string; value: unknown; file?: string; line?: number }>;
 }
 
 /** What {@link serverSettingsFromConfig} reads. */
@@ -57,6 +62,19 @@ export interface ServerConfigSettings {
    * filter advertised, as git's default)
    */
   uploadPackFilter?: UploadPackFilterPolicy;
+  /**
+   * receive-pack's `receive.procReceiveRefs` values, in order: the commands the proc-receive
+   * hook takes (absent: none set)
+   */
+  procReceiveRefs?: string[];
+  /**
+   * A receive-pack setting git cannot read (`receive.procReceiveRefs` without a value,
+   * config_error_nonbool): what receive-pack prints as it dies reading its config, before it
+   * advertises anything (`error: missing value for 'receive.procreceiverefs'`, then `fatal:
+   * bad config variable 'receive.procreceiverefs' in file '<file>' at line <n>` where the
+   * config tells the place)
+   */
+  receivePackConfigError?: string;
 }
 
 /** The keys of {@link ServerConfigSettings.uploadPackFilter} without a subsection list. */
@@ -157,6 +175,21 @@ function hideRefs(config: ServerConfigReader, section: string): string[] {
   return out;
 }
 
+/**
+ * git's `config_error_nonbool` and the death of its config reader: `error: missing value for
+ * '<key>'`, then `fatal: bad config variable '<key>' in file '<file>' at line <n>` (the first
+ * such entry, where the config tells its place).
+ */
+function nonBoolError(config: ServerConfigReader, key: string): string {
+  const error = `error: missing value for '${key}'`;
+  for (const entry of config.listWithOrigin?.() ?? []) {
+    if (entry.key.toLowerCase() !== key || typeof entry.value === "string") continue;
+    if (entry.file === undefined || entry.line === undefined) break;
+    return `${error}\nfatal: bad config variable '${key}' in file '${entry.file}' at line ${entry.line}`;
+  }
+  return error;
+}
+
 /** git's defaults: what {@link serverSettingsFromConfig} gives for an empty configuration. */
 export const GIT_SERVER_SETTINGS_DEFAULTS: Readonly<ServerConfigSettings> = Object.freeze({
   allowDeletes: true,
@@ -199,6 +232,13 @@ export function explicitServerSettingsFromConfig(
   if (receive.length > 0) out.receivePackHideRefs = receive;
   const filter = filterPolicy(config);
   if (filter) out.uploadPackFilter = filter;
+  // a key without a value is an error in git (config_error_nonbool): receive-pack dies
+  const procReceiveValues = config.getAll("receive.procReceiveRefs");
+  const procReceive = procReceiveValues.filter((v): v is string => typeof v === "string");
+  if (procReceive.length > 0) out.procReceiveRefs = procReceive;
+  if (procReceive.length < procReceiveValues.length) {
+    out.receivePackConfigError = nonBoolError(config, "receive.procreceiverefs");
+  }
   return out;
 }
 

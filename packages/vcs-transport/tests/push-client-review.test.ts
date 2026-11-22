@@ -293,6 +293,25 @@ describe("the report, shallow lines, leases for the rest (send-pack.c)", () => {
     expect(result.updates[0]?.summary).toBe("[remote rejected] (failed)");
   });
 
+  it("report-status-v2: an option without its ok fails the push; unknown refs warn", async () => {
+    const caps = "report-status report-status-v2 delete-refs";
+    const { result } = await run(
+      setup(caps),
+      `${pkt("unpack ok\n")}${pkt("option refname refs/x\n")}${pkt("ok refs/heads/nope\n")}` +
+        `${pkt("option refname refs/y\n")}${pkt("ok refs/heads/main\n")}` +
+        `${pkt("option refname refs/heads/rewritten\n")}0000`,
+    );
+    expect(result.reportErrors).toEqual([
+      "error: 'option' without a matching 'ok/ng' directive",
+      "warning: remote reported status on unknown ref: refs/heads/nope",
+    ]);
+    expect(result.reportFailed).toBe(true);
+    expect(result.ok).toBe(false);
+    // what was reported stands
+    expect(result.updates[0]?.status).toBe("ok");
+    expect(result.updates[0]?.reports).toEqual([{ refName: "refs/heads/rewritten" }]);
+  });
+
   it("a shallow repository sends its shallow lines first, and a pack cut there", async () => {
     const S = "5".repeat(40);
     const { posted, exports } = await run(

@@ -21,7 +21,7 @@ import {
   prettifyRefName,
   transportSummaryWidth,
 } from "../summary/index.js";
-import type { PushRefUpdate } from "./push-refs.js";
+import type { PushRefReport, PushRefUpdate } from "./push-refs.js";
 
 /** One ref's line, as git's `print_ref_status` takes it. */
 export interface PushStatusParts {
@@ -37,9 +37,16 @@ export interface PushStatusParts {
 
 /**
  * The flag, summary, local side and reason of an update, as git's `print_one_push_report` and
- * `print_ok_ref_status` choose them; ids abbreviated by `lengths` (7 digits without).
+ * `print_ok_ref_status` choose them; ids abbreviated by `lengths` (7 digits without). With a
+ * `report` (one of `update.reports`, a rewrite the server's proc-receive hook reported), an
+ * accepted update is shown with the report's old and new ids, ref and forced flag where it
+ * gives them.
  */
-export function pushStatusParts(update: PushRefUpdate, lengths?: AbbrevLengths): PushStatusParts {
+export function pushStatusParts(
+  update: PushRefUpdate,
+  lengths?: AbbrevLengths,
+  report?: PushRefReport,
+): PushStatusParts {
   const deletion = update.newOid === ZERO_OID;
   // the local side: the ref pushed, else the source as written (`HEAD`, `HEAD~1`, an id),
   // a delete's "(delete)" (alloc_delete_ref)
@@ -83,8 +90,10 @@ export function pushStatusParts(update: PushRefUpdate, lengths?: AbbrevLengths):
       };
     case "ok": {
       if (deletion) return { flag: "-", summary: "[deleted]" };
-      if (update.oldOid === ZERO_OID) {
-        const name = update.remoteRef;
+      const oldOid = report?.oldOid ?? update.oldOid;
+      const newOid = report?.newOid ?? update.newOid;
+      if (oldOid === ZERO_OID) {
+        const name = report?.refName ?? update.remoteRef;
         const summary = name.startsWith("refs/tags/")
           ? "[new tag]"
           : name.startsWith("refs/heads/")
@@ -93,8 +102,8 @@ export function pushStatusParts(update: PushRefUpdate, lengths?: AbbrevLengths):
         return { flag: "*", summary, from: peer };
       }
       const range = (dots: string) =>
-        `${abbreviate(update.oldOid, lengths)}${dots}${abbreviate(update.newOid, lengths)}`;
-      if (update.forced) {
+        `${abbreviate(oldOid, lengths)}${dots}${abbreviate(newOid, lengths)}`;
+      if (report?.forcedUpdate || update.forced) {
         return { flag: "+", summary: range("..."), from: peer, message: "forced update" };
       }
       return { flag: " ", summary: range(".."), from: peer };
@@ -129,6 +138,12 @@ export interface FormatPushStatusOptions {
   dest: string;
   /** Also the refs already up to date (`git push -v`) */
   verbose?: boolean;
+  /**
+   * `git push --porcelain`: the lines git prints on stdout (`To <dest>`, then
+   * `<flag>\t<from>:<to>\t<summary> (<reason>)` per ref, every ref up to date included, and
+   * `Done` once the server's report was read), no `Everything up-to-date`
+   */
+  porcelain?: boolean;
 }
 
 /** What {@link formatPushStatus} reads of a push result. */
@@ -141,6 +156,10 @@ export interface PushStatusSource {
   abbrevLengths?: AbbrevLengths;
   /** The summary column's width (`PushClientResult.summaryWidth`) */
   summaryWidth?: number;
+  /** The server's `unpack` line (`PushClientResult.unpack`): `Done` needs it ok under porcelain */
+  unpack?: { ok: boolean; message?: string };
+  /** The server's report was broken (`PushClientResult.reportFailed`): no `Done` */
+  reportFailed?: boolean;
 }
 
 /**
@@ -164,19 +183,46 @@ export function formatPushStatus(
     .sort((a, b) => a.key - b.key)
     .map((e) => e.u);
   const lines: string[] = [];
-  const print = (u: PushRefUpdate) => {
+  const porcelain = options.porcelain === true;
+  // print_ref_status, once per report of the server (print_one_push_status)
+  const printOne = (u: PushRefUpdate, report?: PushRefReport) => {
     if (lines.length === 0) lines.push(`To ${anonymizeUrl(options.dest)}`);
-    const p = pushStatusParts(u, lengths);
-    const to = prettifyRefName(u.remoteRef);
+    const p = pushStatusParts(u, lengths, report);
+    const toName = report?.refName ?? u.remoteRef;
+    if (porcelain) {
+      let line =
+        p.from !== undefined ? `${p.flag}\t${p.from}:${toName}\t` : `${p.flag}\t:${toName}\t`;
+      line += p.message !== undefined ? `${p.summary} (${p.message})` : p.summary;
+      lines.push(line);
+      return;
+    }
+    const to = prettifyRefName(toName);
     let line = ` ${p.flag} ${padSummary(p.summary, width)} `;
     line += p.from !== undefined ? `${prettifyRefName(p.from)} -> ${to}` : to;
     if (p.message !== undefined) line += ` (${p.message})`;
     lines.push(line);
   };
-  if (options.verbose) for (const u of sorted) if (u.status === "up-to-date") print(u);
+  const print = (u: PushRefUpdate) => {
+    if (!u.reports?.length) printOne(u);
+    else for (const report of u.reports) printOne(u, report);
+  };
+  if (options.verbose || porcelain) {
+    for (const u of sorted) if (u.status === "up-to-date") print(u);
+  }
   for (const u of sorted) if (u.status === "ok") print(u);
   for (const u of sorted) if (u.status !== "ok" && u.status !== "up-to-date") print(u);
+  if (porcelain) {
+    // send_pack returns 0 under --porcelain once the report is read (refused refs or not)
+    const failed =
+      result.unpack?.ok === false ||
+      result.reportFailed === true ||
+      result.updates.some((u) => u.status === "atomic-push-failed");
+    if (!failed) lines.push("Done");
+    return lines;
+  }
   // push.c: nothing pushed and nothing refused
-  if (!result.updates.some((u) => u.status !== "up-to-date")) lines.push("Everything up-to-date");
+  if (!result.reportFailed && !result.updates.some((u) => u.status !== "up-to-date")) {
+    lines.push("Everything up-to-date");
+  }
   return lines;
 }
