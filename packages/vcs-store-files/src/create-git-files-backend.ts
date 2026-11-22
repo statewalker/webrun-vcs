@@ -90,9 +90,12 @@ export interface GitFilesBackendOptions {
   /** Reflog name and email; read from `user.name` / `user.email` in the config when omitted. */
   reflogIdentity?: { name: string; email: string };
   /**
-   * The user's environment (`createNodeGitHostEnvironment` on Node): the commit-graph
-   * settings (`core.commitGraph`, `commitGraph.*`) are then read from the system and global
-   * config files too, as git reads them. Absent, only the repository's config is read. Its
+   * The user's environment (`createNodeGitHostEnvironment` on Node): the settings read here
+   * (`core.logAllRefUpdates`, `core.bare`, the lock timeouts, `core.multiPackIndex`,
+   * `core.deltaBaseCacheLimit`, the commit-graph's, the alternates') then come from git's
+   * whole sequence: the system and global files, the repository's, `config.worktree` and the
+   * command line (`commandLineConfig`, `git -c`), as git reads them. Absent, only the
+   * repository's config is read; the repository format is always its file alone. Its
    * grafts file (`GIT_GRAFT_FILE`) is read in place of `info/grafts` (`refs.readGrafts`).
    */
   environment?: GitHostEnvironment;
@@ -191,6 +194,13 @@ export async function createGitFilesBackend(
   // Like git's read_repository_format it reads the config file alone, without includes.
   await readRepositoryFormat(files, gitDir);
   const includes = options.configIncludes === undefined ? {} : { includes: options.configIncludes };
+  // the settings read below come from git's whole sequence (system, global, the repository's
+  // file, config.worktree, the command line), as git's repo_config reads them; only the
+  // repository format above is the file alone
+  const settingsOptions = {
+    ...includes,
+    ...(options.environment ? { environment: options.environment } : {}),
+  };
 
   if (create) {
     await createGitDirectoryStructure(files, gitDir, objectsDir);
@@ -208,7 +218,7 @@ export async function createGitFilesBackend(
   });
   const looseOnly = createGitObjects(staging);
   // git's core.deltaBaseCacheLimit (96 MiB when unset) and core.multiPackIndex (default on)
-  const packSettings = await readPackSetSettings(files, gitDir, includes);
+  const packSettings = await readPackSetSettings(files, gitDir, settingsOptions);
   const packs = await openPackSet(files, packDir, {
     externalBase: (id) => looseOnly.get(id),
     freshenMaxAgeMs,
@@ -230,7 +240,7 @@ export async function createGitFilesBackend(
           ...(options.workTree !== undefined ? { workTree: options.workTree } : {}),
           ...(options.onAlternatesError ? { onError: options.onAlternatesError } : {}),
           readConfig: () =>
-            createWorkingCopyConfig(configFilesApiOf(files), gitDir, undefined, includes),
+            createWorkingCopyConfig(configFilesApiOf(files), gitDir, undefined, settingsOptions),
         });
   if (alternates) {
     // clone --dissociate: copy what is borrowed (repack -a -d), then stop borrowing
@@ -275,7 +285,7 @@ export async function createGitFilesBackend(
       packs,
       freshenMaxAgeMs,
     });
-  const reflog = await readRefStoreConfig(files, gitDir, includes);
+  const reflog = await readRefStoreConfig(files, gitDir, settingsOptions);
   const refStore = createFileRefStore(files, gitDir, {
     atomicFiles: options.atomicFiles,
     refLockTimeoutMs: options.refLockTimeoutMs ?? reflog.refLockTimeoutMs,
@@ -352,7 +362,8 @@ function invalidateOnCompatibilityChange(refs: FileRefStore, commitGraph: Commit
 }
 
 /**
- * The ref store settings of the repository's config, as git reads them: core.logAllRefUpdates
+ * The ref store settings of the repository's config, as git reads them (with an environment,
+ * through the whole sequence, the command line last): core.logAllRefUpdates
  * (a boolean or "always"), defaulting to true unless core.bare is true; user.name and
  * user.email for the reflog identity (each defaulting to webrun-vcs <vcs@localhost>); the
  * lock timeouts core.filesRefLockTimeout and core.packedRefsTimeout (undefined when unset
@@ -361,19 +372,17 @@ function invalidateOnCompatibilityChange(refs: FileRefStore, commitGraph: Commit
 async function readRefStoreConfig(
   files: FilesApi,
   gitDir: string,
-  options: { includes?: boolean | "files" },
+  options: { includes?: boolean | "files"; environment?: GitHostEnvironment },
 ): Promise<{
   logAllRefUpdates: boolean | "always";
   identity?: { name: string; email: string };
   refLockTimeoutMs?: number;
   packedLockTimeoutMs?: number;
 }> {
-  const config = await createWorkingCopyConfig(
-    configFilesApiOf(files),
-    gitDir,
-    undefined,
-    options.includes === undefined ? {} : { includes: options.includes },
-  );
+  const config = await createWorkingCopyConfig(configFilesApiOf(files), gitDir, undefined, {
+    ...(options.includes === undefined ? {} : { includes: options.includes }),
+    ...(options.environment ? { environment: options.environment } : {}),
+  });
   const setting = config.get("core.logAllRefUpdates");
   const logAllRefUpdates =
     typeof setting === "string" && setting.toLowerCase() === "always"

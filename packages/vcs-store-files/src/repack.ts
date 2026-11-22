@@ -610,6 +610,7 @@ export async function repackListed(
         files,
         gitDir,
         compatibility: options.compatibility ?? "2.56",
+        ...(options.environment ? { environment: options.environment } : {}),
         stdinPacks: [...include].sort(),
         preferredPack: `pack-${packId}.pack`,
         bitmap: midxBitmap,

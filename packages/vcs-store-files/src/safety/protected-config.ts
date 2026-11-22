@@ -31,6 +31,7 @@ export interface ProtectedConfigEntry {
  *
  * @example
  * ```typescript
+ * // without `env`, process.env: its GIT_CONFIG_COUNT / GIT_CONFIG_PARAMETERS (`git -c`) count
  * const entries = await readProtectedConfig(createNodeGitHostEnvironment());
  * entries.filter((e) => e.key === "safe.directory").map((e) => e.value);
  * ```
@@ -39,14 +40,13 @@ export async function readProtectedConfig(
   environment: GitHostEnvironment | undefined,
 ): Promise<ProtectedConfigEntry[]> {
   if (!environment) return [];
-  const commandLine = environment.commandLineConfig ?? [];
   // the chain around a repository config that does not exist: the system and global files
   // (with their includes), then the command line (its includes too; git dies on command-line
   // config it cannot parse once the files are read), as git's config_with_options with
   // ignore_repo; and, as git passes no git directory there, `gitdir:` / `onbranch:`
   // conditions are false (the placeholder path never counts as one),
   // `hasconfig:remote.*.url:` matched against the remote URLs of these files and of the
-  // command line
+  // command line, what its includes bring in too (populate_remote_urls)
   const config = new GitWorkingCopyConfig(
     {
       read: async () => undefined,
@@ -59,9 +59,6 @@ export async function readProtectedConfig(
       environment,
       includes: true,
       withoutGitDir: true,
-      extraRemoteUrls: commandLine.flatMap(({ key, value }) =>
-        /^remote\..*\.url$/i.test(key) && value !== undefined ? [value] : [],
-      ),
     },
   );
   await config.load();

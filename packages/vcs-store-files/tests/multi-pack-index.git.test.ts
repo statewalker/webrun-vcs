@@ -23,7 +23,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DefaultSerializationApi, encodeMultiPackIndex, openPack } from "@statewalker/vcs-core";
-import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import {
+  createNodeFilesApi,
+  createNodeGitHostEnvironment,
+} from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   createGitFilesBackend,
@@ -903,4 +906,53 @@ describe("midx hardening (review of P4.74)", () => {
       expect(o.exitCode).toBe(n.status);
     },
   );
+});
+
+describe("midx settings from the command line (git -c)", () => {
+  /** The environment of `git -c <key>=<value>` (git's `$GIT_CONFIG_PARAMETERS`). */
+  const commandLine = (key: string, value: string) =>
+    createNodeGitHostEnvironment({
+      env: Object.fromEntries(
+        Object.entries({ ...GIT_ENV, GIT_CONFIG_PARAMETERS: `'${key}'='${value}'` }).filter(
+          (e): e is [string, string] => e[1] !== undefined,
+        ),
+      ),
+      effectiveUid: null,
+    });
+
+  it.runIf(is25x)("-c midx.version=2 multi-pack-index write: native's bytes", async () => {
+    const dir = packedRepo(3);
+    for (const args of [[], ["--bitmap"]]) {
+      execFileSync("git", ["-c", "midx.version=2", "multi-pack-index", "write", ...args], {
+        cwd: dir,
+        env: GIT_ENV,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const native = readFileSync(midxPath(dir));
+      expect(native[4]).toBe(2);
+      for (const f of midxFiles(dir)) rmSync(join(packDir(dir), f), { force: true });
+      const r = await multiPackIndexWrite({
+        files: files(dir),
+        compatibility,
+        bitmap: args.length > 0,
+        environment: commandLine("midx.version", "2"),
+      });
+      expect(r.stderr).toEqual([]);
+      expect(Buffer.from(readFileSync(midxPath(dir))).equals(native)).toBe(true);
+      for (const f of midxFiles(dir)) rmSync(join(packDir(dir), f), { force: true });
+    }
+    // a bad value of the command line: git's message names no file
+    const n = spawnSync("git", ["-c", "midx.version=abc", "multi-pack-index", "write"], {
+      cwd: dir,
+      env: GIT_ENV,
+      encoding: "utf8",
+    });
+    const o = await multiPackIndexWrite({
+      files: files(dir),
+      compatibility,
+      environment: commandLine("midx.version", "abc"),
+    });
+    expect(o.stderr.join("\n")).toBe(n.stderr.trimEnd());
+    expect(o.exitCode).toBe(n.status);
+  });
 });

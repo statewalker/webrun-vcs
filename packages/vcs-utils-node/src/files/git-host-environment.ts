@@ -330,8 +330,12 @@ export function commandLineConfigOf(
  *
  * @example
  * ```typescript
+ * // without `env`, process.env: its GIT_CONFIG_COUNT / GIT_CONFIG_PARAMETERS (a parent
+ * // git's `-c`, or the shell's own) apply last to every config read
  * const environment = createNodeGitHostEnvironment();
  * const config = new GitWorkingCopyConfig(io, ".git/config", { environment });
+ * // a test or a server pins the variables instead
+ * const pinned = createNodeGitHostEnvironment({ env: { HOME: "/home/u", PATH: "/usr/bin" } });
  * ```
  */
 export function createNodeGitHostEnvironment(

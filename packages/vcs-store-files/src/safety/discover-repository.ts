@@ -104,7 +104,10 @@ export class FilesystemBoundaryError extends NotAGitRepositoryError {
  * (`$GIT_CEILING_DIRECTORIES`: the directories below the longest ceiling above `cwd` are
  * searched, the ceiling itself not; `NotAGitRepositoryError` past it) and, unless
  * `discoveryAcrossFilesystem`, stops where the device id of the FilesApi's `lstat` changes
- * (`FilesystemBoundaryError`; no check where the storage reports no device).
+ * (`FilesystemBoundaryError`; no check where the storage reports no device). As git's
+ * `strbuf_getcwd`, it climbs the physical directory: `cwd` is resolved to its real path
+ * (the environment's `realPath`) and mapped back into the FilesApi first, so a `cwd` reached
+ * through a symbolic link is searched, and counted against the ceiling, where it really is.
  *
  * The protection is opt-in: a library caller gets git's local checks only by discovering the
  * repository here first. Constructing a `FileWorktree` or calling `createGitFilesBackend`
@@ -130,11 +133,14 @@ export async function discoverRepository(
     return { gitDir, bare: !/\/\.git$/.test(gitDir), warnings: [] };
   }
   const check = options.checkOwnership !== false;
-  const cwdHost = hostPathOf(files, normalizePath(options.cwd ?? "/"));
-  let dir = normalizePath(options.cwd ?? "/");
+  // strbuf_getcwd: git climbs the physical directory (a cwd reached through a symbolic link
+  // is searched where it really is, its ceiling and device counted there)
+  let dir = await physicalPath(files, environment, normalizePath(options.cwd ?? "/"));
+  const cwdHost = hostPathOf(files, dir);
   // GIT_CEILING_DIRECTORIES: how many directories above cwd may be searched
   const levels = await ceilingLevels(environment, cwdHost);
-  // one_filesystem: the device of cwd, compared with each directory climbed to
+  // one_filesystem: the device of cwd, compared with each directory climbed to (lstat is
+  // stat here: no component of the physical path is a link)
   const deviceOf = async (path: string) =>
     (await (files as PosixFilesApi).lstat?.(path).catch(() => undefined))?.dev;
   const device = environment?.discoveryAcrossFilesystem ? undefined : await deviceOf(dir);
@@ -215,6 +221,31 @@ export async function discoverRepository(
       }
     }
   }
+}
+
+/**
+ * `path` of `files` as the host's real path names it, mapped back into `files` (git's
+ * `strbuf_getcwd`, a physical directory); `path` itself without the environment's `realPath`,
+ * for a storage that is no host directory, or where the real path lies outside the storage.
+ */
+async function physicalPath(
+  files: FilesApi,
+  environment: GitHostEnvironment | undefined,
+  path: string,
+): Promise<string> {
+  const realPath = environment?.realPath;
+  const root = (files as { rootDirectory?: string }).rootDirectory?.replace(/\/+$/, "");
+  if (!realPath || root === undefined) return path;
+  const real = await realPath(hostPathOf(files, path)).catch(() => undefined);
+  if (real === undefined) return path;
+  const roots = [root];
+  const realRoot = await realPath(root || "/").catch(() => undefined);
+  if (realRoot !== undefined && realRoot !== root) roots.push(realRoot.replace(/\/+$/, ""));
+  for (const base of roots) {
+    if (real === base || (base === "" && real === "/")) return "/";
+    if (real.startsWith(`${base}/`)) return normalizePath(real.slice(base.length));
+  }
+  return path;
 }
 
 /**

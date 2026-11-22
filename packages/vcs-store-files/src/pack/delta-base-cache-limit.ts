@@ -6,6 +6,7 @@
 
 import type { FilesApi } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
+import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import {
   configFilesApiOf,
   createWorkingCopyConfig,
@@ -27,6 +28,8 @@ export async function readDeltaBaseCacheLimit(
   options: {
     /** Which include directives of the repository's config are followed (git's: all) */
     includes?: boolean | "files";
+    /** The user's environment: the whole sequence is read, the command line last */
+    environment?: GitHostEnvironment;
   } = {},
 ): Promise<number | undefined> {
   return (await readPackSetSettings(files, gitDir, options)).baseCacheBytes;
@@ -35,12 +38,13 @@ export async function readDeltaBaseCacheLimit(
 /**
  * The config a pack set reads, in one pass: `core.deltaBaseCacheLimit` and
  * `core.multiPackIndex` (git's default true; an empty or unparsable value reads as git's
- * `git_config_bool` would, false for empty).
+ * `git_config_bool` would, false for empty). With an `environment`, from git's whole sequence
+ * (system, global, the repository's, `config.worktree`, the command line).
  */
 export async function readPackSetSettings(
   files: FilesApi,
   gitDir = ".git",
-  options: { includes?: boolean | "files" } = {},
+  options: { includes?: boolean | "files"; environment?: GitHostEnvironment } = {},
 ): Promise<{ baseCacheBytes?: number; multiPackIndex: boolean }> {
   const config = await createWorkingCopyConfig(
     configFilesApiOf(files, {
@@ -48,7 +52,10 @@ export async function readPackSetSettings(
     }),
     gitDir,
     undefined,
-    options.includes === undefined ? {} : { includes: options.includes },
+    {
+      ...(options.includes === undefined ? {} : { includes: options.includes }),
+      ...(options.environment ? { environment: options.environment } : {}),
+    },
   );
   const midx = config.get("core.multiPackIndex");
   const multiPackIndex =

@@ -13,7 +13,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CommandLineConfigError,
+  ConfigIncludeDepthError,
   createGitFilesBackend,
+  discoverRepository,
+  GitWorkingCopyConfig,
   openGitLinkedWorktrees,
   showOrigin,
 } from "@statewalker/vcs-store-files";
@@ -26,6 +29,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Git, PushStatus } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable, nativeGitEnv } from "./native-git-http-backend.js";
+import { gitAtLeast } from "./native-git-working-copy.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
 
@@ -366,5 +370,247 @@ describeGit("the remote side of a local transport does not see -c (local_repo_en
     const refs = (dir: string) => git(join(dir, "src"), ["for-each-ref", "refs/remotes/d"]);
     expect(refs(mine)).toBe(refs(theirs));
     expect(refs(theirs)).toContain("refs/remotes/d/secret");
+  });
+});
+
+/** The native git's version as our compatibility setting names it. */
+const nativeCompatibility = (): "2.43" | "2.56" =>
+  gitAtLeast(execFileSync("git", ["--version"], { encoding: "utf8" }), 2, 44) ? "2.56" : "2.43";
+
+/**
+ * Our Git on `repo` with the environment given to the stores too (`createGitFilesBackend`),
+ * so their own reads (the ref store's core.logAllRefUpdates) see the command line.
+ */
+async function openWithStores(
+  repo: string,
+  pairs: Array<[string, string | undefined]>,
+  over: Env = {},
+): Promise<Git> {
+  const env = clean({ ...nativeGitEnv(home), GIT_CONFIG_PARAMETERS: parametersOf(pairs), ...over });
+  const files = createNodeFilesApi({ rootDir: repo });
+  const environment = createNodeGitHostEnvironment({ env, effectiveUid: null });
+  const { history } = await createGitFilesBackend({ files, gitDir: ".git", environment });
+  const worktrees = await openGitLinkedWorktrees({ files, gitDir: ".git", history, environment });
+  return Git.fromWorkingCopy(await worktrees.openCurrent());
+}
+
+/** The reflogs of a repository (paths below `.git/logs`, each with its line count). */
+function reflogs(repo: string): string[] {
+  const out = git(repo, ["for-each-ref", "--format=%(refname)"])
+    .split("\n")
+    .filter(Boolean)
+    .concat("HEAD");
+  return out
+    .map((ref) => {
+      try {
+        const text = readFileSync(join(repo, ".git", "logs", ref), "latin1");
+        return `${ref} ${text.split("\n").filter(Boolean).length}`;
+      } catch {
+        return `${ref} -`;
+      }
+    })
+    .sort();
+}
+
+describeGit("store-internal config reads see -c and the global file (native twins)", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "cmdline-config-stores-"));
+    home = join(root, "home");
+    mkdirSync(home);
+  });
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  it("-c core.logAllRefUpdates=false: branch writes no reflog", async () => {
+    const t = twins();
+    const pairs: Array<[string, string]> = [["core.logAllRefUpdates", "false"]];
+    git(t.native, [...dashC(pairs), "branch", "b2"]);
+    await (await openWithStores(t.ours, pairs)).branchCreate().setName("b2").call();
+    expect(reflogs(t.ours)).toEqual(reflogs(t.native));
+    expect(reflogs(t.native)).toContain("refs/heads/b2 -");
+  });
+
+  it("-c core.logAllRefUpdates=false: checkout -b writes no reflog of the branch", async () => {
+    const t = twins();
+    const pairs: Array<[string, string]> = [["core.logAllRefUpdates", "false"]];
+    git(t.native, [...dashC(pairs), "checkout", "-q", "-b", "b3"]);
+    await (await openWithStores(t.ours, pairs))
+      .checkout()
+      .setCreateBranch(true)
+      .setName("b3")
+      .call();
+    expect(reflogs(t.ours)).toEqual(reflogs(t.native));
+    expect(reflogs(t.native)).toContain("refs/heads/b3 -");
+  });
+
+  it("-c core.logAllRefUpdates=always: tag writes a reflog", async () => {
+    const t = twins();
+    const pairs: Array<[string, string]> = [["core.logAllRefUpdates", "always"]];
+    git(t.native, [...dashC(pairs), "tag", "t1"]);
+    await (await openWithStores(t.ours, pairs)).tag().setName("t1").call();
+    expect(reflogs(t.ours)).toEqual(reflogs(t.native));
+    expect(reflogs(t.native)).toContain("refs/tags/t1 1");
+  });
+
+  it("core.logAllRefUpdates=always in the global file: tag writes a reflog", async () => {
+    const t = twins();
+    const global = join(root, `global-${counter}.cfg`);
+    writeFileSync(global, "[core]\n\tlogAllRefUpdates = always\n");
+    // git init wrote `logallrefupdates = true` into each repository: drop it
+    for (const repo of [t.native, t.ours])
+      git(repo, ["config", "--unset", "core.logAllRefUpdates"]);
+    const over: Env = { GIT_CONFIG_GLOBAL: global };
+    git(t.native, ["tag", "t2"], { ...nativeGitEnv(home), ...over });
+    await (await openWithStores(t.ours, [], over)).tag().setName("t2").call();
+    expect(reflogs(t.ours)).toEqual(reflogs(t.native));
+    expect(reflogs(t.native)).toContain("refs/tags/t2 1");
+  });
+});
+
+describeGit("command-line includes and conditions as git reads them (native twins)", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "cmdline-config-includes-"));
+    home = join(root, "home");
+    mkdirSync(home);
+  });
+  afterAll(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Our config of `repo`, `pairs` on the command line, read as `compatibility`. */
+  async function configOf(repo: string, pairs: Array<[string, string]>, over: Env = {}) {
+    const env = clean({
+      ...nativeGitEnv(home),
+      GIT_CONFIG_PARAMETERS: parametersOf(pairs),
+      ...over,
+    });
+    const environment = createNodeGitHostEnvironment({ env, effectiveUid: null });
+    const config = new GitWorkingCopyConfig(
+      {
+        read: async (path: string) => {
+          try {
+            return new Uint8Array(readFileSync(join(repo, path)));
+          } catch {
+            return undefined;
+          }
+        },
+        write: async () => undefined,
+        rootDirectory: repo,
+      },
+      ".git/config",
+      { environment, gitDirPath: join(repo, ".git"), compatibility: nativeCompatibility() },
+    );
+    await config.load();
+    return config;
+  }
+
+  it("includeIf.gitdir:./ from -c: git's error, applied by 2.5x only", async () => {
+    const t = twins();
+    const included = join(root, `cond-${counter}.cfg`);
+    writeFileSync(included, "[x]\n\ty = 1\n");
+    const pairs: Array<[string, string]> = [["includeIf.gitdir:./.path", included]];
+    const native = run(t.native, [...dashC(pairs), "config", "x.y"]);
+    const config = await configOf(t.ours, pairs);
+    const value = config.get("x.y");
+    expect({
+      status: value === undefined ? 1 : 0,
+      stdout: value === undefined ? "" : `${value}\n`,
+      stderr: config.loadErrors.map((l) => `${l}\n`).join(""),
+    }).toEqual(native);
+    expect(native.stderr).toBe(
+      "error: relative config include conditionals must come from files\n",
+    );
+    expect(native.status).toBe(nativeCompatibility() === "2.43" ? 1 : 0);
+  });
+
+  it("-c include.path naming a directory: git's warning, then fatal", async () => {
+    const t = twins();
+    const dir = join(root, `adir-${counter}`);
+    mkdirSync(dir);
+    const pairs: Array<[string, string]> = [["include.path", dir]];
+    const native = run(t.native, [...dashC(pairs), "status"]);
+    expect(native.status).toBe(128);
+    const error = await open(t.ours, pairs).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(CommandLineConfigError);
+    expect((error as CommandLineConfigError).exitCode).toBe(128);
+    expect(`${(error as Error).message}\n`).toBe(native.stderr);
+  });
+
+  it("an include loop through -c: git's fatal, absolute paths", async () => {
+    const t = twins();
+    const one = join(root, `loop1-${counter}.cfg`);
+    const two = join(root, `loop2-${counter}.cfg`);
+    writeFileSync(one, `[include]\n\tpath = ${two}\n`);
+    writeFileSync(two, `[include]\n\tpath = ${one}\n`);
+    const pairs: Array<[string, string]> = [["include.path", one]];
+    const native = run(t.native, [...dashC(pairs), "status"]);
+    expect(native.status).toBe(128);
+    const error = await open(t.ours, pairs).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(ConfigIncludeDepthError);
+    expect((error as ConfigIncludeDepthError).exitCode).toBe(128);
+    expect(`${(error as Error).message}\n`).toBe(native.stderr);
+  });
+
+  it("includeIf.hasconfig:remote.*.url: matches the repository's remotes and -c includes'", async () => {
+    const t = twins();
+    for (const repo of [t.native, t.ours]) {
+      git(repo, ["remote", "add", "origin", "https://example.com/r.git"]);
+    }
+    const viaRepo = join(root, `has-repo-${counter}.cfg`);
+    writeFileSync(viaRepo, "[foo]\n\trepo = yes\n");
+    const remotes = join(root, `has-remotes-${counter}.cfg`);
+    writeFileSync(remotes, '[remote "x"]\n\turl = https://h/z\n');
+    const viaCli = join(root, `has-cli-${counter}.cfg`);
+    writeFileSync(viaCli, "[foo]\n\tcli = yes\n");
+    const pairs: Array<[string, string]> = [
+      ["includeIf.hasconfig:remote.*.url:https://example.com/**.path", viaRepo],
+      ["include.path", remotes],
+      ["includeIf.hasconfig:remote.*.url:https://h/**.path", viaCli],
+      ["includeIf.hasconfig:remote.*.url:https://nowhere/**.path", viaCli],
+    ];
+    const theirs = git(t.native, [...dashC(pairs), "config", "--get-regexp", "^foo\\."]);
+    expect(theirs).toBe("foo.repo yes\nfoo.cli yes\n");
+    const config = await configOf(t.ours, pairs);
+    const ours = config
+      .listWithOrigin()
+      .filter((e) => e.key.startsWith("foo."))
+      .map((e) => `${e.key} ${e.text}\n`)
+      .join("");
+    expect(ours).toBe(theirs);
+  });
+
+  it("the protected config's hasconfig sees remote URLs a -c include brings in", async () => {
+    const t = twins();
+    const remotes = join(root, `prot-remotes-${counter}.cfg`);
+    writeFileSync(remotes, '[remote "x"]\n\turl = https://h/z\n');
+    const safe = join(root, `prot-safe-${counter}.cfg`);
+    writeFileSync(safe, "[safe]\n\tdirectory = *\n");
+    const pairs: Array<[string, string]> = [
+      ["include.path", remotes],
+      ["includeIf.hasconfig:remote.*.url:https://h/**.path", safe],
+    ];
+    const over: Env = { GIT_TEST_ASSUME_DIFFERENT_OWNER: "1" };
+    const outcome = async (p: Array<[string, string]>) => {
+      const env = clean({ ...nativeGitEnv(home), GIT_CONFIG_PARAMETERS: parametersOf(p), ...over });
+      const environment = createNodeGitHostEnvironment({ env });
+      const files = createNodeFilesApi({ rootDir: "/" });
+      return discoverRepository({ files, cwd: t.ours, environment }).then(
+        () => 0,
+        (e: unknown) => (e as { exitCode?: number }).exitCode ?? 1,
+      );
+    };
+    const native = (p: Array<[string, string]>) =>
+      run(t.native, [...dashC(p), "status", "-s"], { ...nativeGitEnv(home), ...over }).status;
+    expect(native(pairs)).toBe(0);
+    expect(await outcome(pairs)).toBe(0);
+    expect(native(pairs.slice(1))).toBe(128);
+    expect(await outcome(pairs.slice(1))).toBe(128);
   });
 });

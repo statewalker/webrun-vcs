@@ -272,6 +272,24 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   private includedEntries = new Map<ConfigLine, ConfigEntry[]>();
   /** Every value of the chain in order, computed when first read after a change */
   private resolvedCache?: ConfigEntry[];
+  /** git's `error:` lines of the last read of the chain */
+  private errorLines: string[] = [];
+
+  /**
+   * The `error:` lines git prints while it reads this configuration, from the last
+   * {@link load} (git prints them on every config read, so a command reading the
+   * configuration twice prints them twice): `error: relative config include conditionals
+   * must come from files` for a `includeIf.gitdir:./…` of the command line.
+   */
+  get loadErrors(): readonly string[] {
+    return this.errorLines;
+  }
+
+  /** @internal Records one of git's error lines of the current read. */
+  noteLoadError(line: string): void {
+    this.errorLines.push(line);
+    this.options.onError?.(line);
+  }
 
   /** The user's environment the chain reads global files from (absent: none are read) */
   readonly environment?: GitHostEnvironment;
@@ -317,6 +335,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const reader = new ChainReader(this, env, this.options, followIncludes);
     const base: ConfigEntry[] = [];
     this.commandEntries = [];
+    this.errorLines = [];
     if (env) {
       const hostSource = (path: string, scope: ConfigScope): ConfigSource => ({
         read: env.readFile,
@@ -1163,8 +1182,21 @@ export interface GitConfigOptions {
    * includeIf.hasconfig:remote.*.url").
    */
   withoutGitDir?: boolean;
-  /** With {@link withoutGitDir}: remote URLs of the command line, also matched by `hasconfig` */
+  /**
+   * Further remote URLs `hasconfig:remote.*.url:` matches, after those of the whole sequence
+   * (the command line's, with what its includes bring in, are read from the environment)
+   */
   extraRemoteUrls?: string[];
+  /**
+   * The git version whose rules apply where config reading differs (default 2.56): a
+   * `includeIf.gitdir:./…` given on the command line holds in 2.5x (git's
+   * `prepare_include_condition_pattern` fails with -1, which `include_by_path` passes on as
+   * true) and not in 2.43; both print `error: relative config include conditionals must come
+   * from files` ({@link GitWorkingCopyConfig.loadErrors}).
+   */
+  compatibility?: "2.43" | "2.56";
+  /** Each of git's `error:` lines while the chain is read (see {@link GitWorkingCopyConfig.loadErrors}) */
+  onError?: (line: string) => void;
   /**
    * Read the environment's command-line configuration ({@link
    * GitHostEnvironment.commandLineConfig}, `$GIT_CONFIG_COUNT` / `$GIT_CONFIG_PARAMETERS`)
@@ -1187,6 +1219,25 @@ export class CommandLineConfigError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "CommandLineConfigError";
+  }
+}
+
+/**
+ * An include chain deeper than git's `MAX_INCLUDE_DEPTH` (git dies, exit 128, most likely
+ * on circular includes): the message is git's `include_depth_advice` with its `fatal:`.
+ */
+export class ConfigIncludeDepthError extends Error {
+  readonly exitCode = 128;
+  constructor(
+    /** The include's path as git resolved it (absolute for a host file) */
+    readonly path: string,
+    /** The file including it, or `the command line` */
+    readonly from: string,
+  ) {
+    super(
+      `fatal: exceeded maximum include depth (${MAX_INCLUDE_DEPTH}) while including\n\t${path}\nfrom\n\t${from}\nThis might be due to circular includes.`,
+    );
+    this.name = "ConfigIncludeDepthError";
   }
 }
 
@@ -1511,13 +1562,26 @@ class ChainReader {
       // no remote URL (git swaps in forbid_remote_url for it and what it includes)
       if (this.unconditionalRemoteUrl) forbid = true;
     }
+    const target = await this.resolvePath(value, from);
+    if (!target) return;
+    // handle_path_include: a command-line include naming a directory fails to open (git's
+    // fopen_or_warn), and so does the command line
+    if (from.commandLine && target.host && this.env?.statFile) {
+      const stat = await this.env.statFile(target.path).catch(() => undefined);
+      if (stat?.kind === "directory") {
+        throw new CommandLineConfigError(
+          `warning: unable to access '${target.path}': Is a directory\nfatal: unable to parse command-line config`,
+        );
+      }
+    }
     if (depth > MAX_INCLUDE_DEPTH) {
-      throw new Error(
-        `exceeded maximum include depth (${MAX_INCLUDE_DEPTH}) while including\n\t${value}\n\tfrom\n\t${from.commandLine ? "the command line" : from.path}\nThis might be due to circular includes.`,
+      // git's include_depth_advice: the path resolved, and the file including it
+      throw new ConfigIncludeDepthError(
+        originName(target.path, target.host),
+        from.commandLine ? "the command line" : originName(from.path, from.host),
       );
     }
-    const target = await this.resolvePath(value, from);
-    if (target) await this.readFile(target, out, depth, forbid);
+    await this.readFile(target, out, depth, forbid);
   }
 
   /** git's `handle_path_include`: `~/` in the home, a relative path beside `from`. */
@@ -1640,10 +1704,11 @@ class ChainReader {
   }
 
   /**
-   * git's `populate_remote_urls` for a read without a git directory: the `remote.<name>.url`
-   * values of the system and global files, every include followed (`hasconfig` ones taken
-   * as true, their files forbidden to set remote URLs), then
-   * {@link GitConfigOptions.extraRemoteUrls} (the command line).
+   * git's `populate_remote_urls`: the `remote.<name>.url` values of the whole sequence
+   * (`do_git_config_sequence`: the system and global files, the repository's file and
+   * `config.worktree` unless read {@link GitConfigOptions.withoutGitDir}, the command line),
+   * every include followed (`hasconfig` ones taken as true, their files forbidden to set
+   * remote URLs), then {@link GitConfigOptions.extraRemoteUrls}.
    */
   private async collectRemoteUrls(): Promise<string[]> {
     const env = this.env;
@@ -1666,6 +1731,22 @@ class ChainReader {
         if (userConfig) await pass.readFile(hostSource(userConfig, "global"), entries, 0);
       }
     }
+    if (this.options.withoutGitDir !== true) {
+      const files = (this.config as unknown as { files: ConfigFilesApi }).files;
+      const path = this.configPath();
+      const read = (p: string) => files.read(p);
+      await pass.readFile({ read, path, scope: "local" }, entries, 0);
+      const worktreeConfig = entries
+        .filter((e) => e.key.toLowerCase() === "extensions.worktreeconfig")
+        .at(-1);
+      if (worktreeConfig && isTrue(worktreeConfig.value)) {
+        const overlay = this.options.worktreeConfigPath ?? `${dirOf(path)}config.worktree`;
+        await pass.readFile({ read, path: overlay, scope: "worktree" }, entries, 0);
+      }
+    }
+    if (env && this.options.commandLine !== false && env.commandLineConfigError === undefined) {
+      await pass.readCommandLine(env.commandLineConfig ?? [], entries);
+    }
     const urls: string[] = [];
     for (const entry of entries) {
       if (isRemoteUrlKey(entry.key) && typeof entry.value === "string") urls.push(entry.value);
@@ -1678,8 +1759,6 @@ class ChainReader {
   private async conditionHolds(condition: string, from: ConfigSource): Promise<boolean> {
     const noGitDir = this.options.withoutGitDir === true;
     if (condition.startsWith(HASCONFIG_REMOTE_URL)) {
-      // evaluated only where git's protected read is (no repository config to collect from)
-      if (!noGitDir) return false;
       if (this.unconditionalRemoteUrl) return true;
       const pattern = condition.slice(HASCONFIG_REMOTE_URL.length);
       this.remoteUrls ??= this.collectRemoteUrls();
@@ -1696,9 +1775,14 @@ class ChainReader {
       if (expanded === undefined) return false;
       pattern = expanded;
       if (pattern.startsWith("./")) {
-        // git's "relative config include conditionals must come from files" (an error,
-        // the condition false)
-        if (from.commandLine) return false;
+        // prepare_include_condition_pattern: an error, its -1 read as true by 2.5x's
+        // include_condition_is_true, as false by 2.43's
+        if (from.commandLine) {
+          this.config.noteLoadError(
+            "error: relative config include conditionals must come from files",
+          );
+          return this.options.compatibility !== "2.43";
+        }
         // relative to the including file's directory, known only as the host names it
         const dir = from.path === this.configPath() ? `${this.gitDirPath()}/` : dirOf(from.path);
         pattern = `${dir}${pattern.slice(2)}`;

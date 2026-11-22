@@ -90,11 +90,16 @@ describe("command-line config in the chain", () => {
         { key: "after.include", value: "1" },
       ],
     });
+    // 2.43: the relative condition of the command line never holds (2.5x: see below)
     const config = new GitWorkingCopyConfig(memory({}), ".git/config", {
       environment,
       gitDirPath: "/work/p/.git",
+      compatibility: "2.43",
     });
     await config.load();
+    expect(config.loadErrors).toEqual([
+      "error: relative config include conditionals must come from files",
+    ]);
     expect(config.get("foo.bar")).toBe("abs");
     expect(config.get("foo.baz")).toBe("home");
     expect(config.getAll("cond.x")).toEqual([1]);

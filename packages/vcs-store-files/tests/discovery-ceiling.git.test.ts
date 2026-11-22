@@ -194,3 +194,48 @@ describe("the file system boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM)", () => {
     expect(found.gitDir).toBe("/outer/.git");
   });
 });
+
+describeGit("discovery climbs the physical directory (native twins)", () => {
+  // T is a repository; T/l links to T/a/b/c/r, a plain directory below the ceiling T/a/b
+  let top = "";
+  beforeAll(() => {
+    top = realpathSync(mkdtempSync(join(tmpdir(), "discovery-physical-")));
+    execFileSync("git", ["init", "-q", top], { env: envOf({}) });
+    mkdirSync(join(top, "a", "b", "c", "r", "s"), { recursive: true });
+    symlinkSync(join(top, "a", "b", "c", "r"), join(top, "l"));
+  });
+  afterAll(() => {
+    if (top) rmSync(top, { recursive: true, force: true });
+  });
+
+  it("a ceiling on the physical path is not bypassed through a linked cwd", async () => {
+    const over = { GIT_CEILING_DIRECTORIES: join(top, "a", "b") };
+    const dir = join(top, "l", "s");
+    const expected = native(dir, over);
+    expect(expected.exit).toBe(128);
+    expect(expected.out).toContain("not a git repository");
+    expect(await ours(dir, over)).toEqual(expected);
+  });
+
+  it("without a ceiling the physical parents are searched", async () => {
+    const dir = join(top, "l", "s");
+    const expected = native(dir, {});
+    expect(expected.out).toBe(`${top}/.git\n`);
+    expect(await ours(dir, {})).toEqual(expected);
+  });
+
+  it("a FilesApi rooted elsewhere maps the real path back into it", async () => {
+    const files = createNodeFilesApi({ rootDir: top });
+    const environment = createNodeGitHostEnvironment({
+      env: envOf({ GIT_CEILING_DIRECTORIES: join(top, "a", "b") }),
+      effectiveUid: null,
+    });
+    await expect(discoverRepository({ files, cwd: "/l/s", environment })).rejects.toBeInstanceOf(
+      NotAGitRepositoryError,
+    );
+    const free = createNodeGitHostEnvironment({ env: envOf({}), effectiveUid: null });
+    expect((await discoverRepository({ files, cwd: "/l/s", environment: free })).gitDir).toBe(
+      "/.git",
+    );
+  });
+});
