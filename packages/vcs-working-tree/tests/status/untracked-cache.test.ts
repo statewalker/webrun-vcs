@@ -436,3 +436,27 @@ describe("scanUntracked over tracked files", () => {
     expect([...(await scan(t, [])).paths].sort()).toEqual([...tracked, "d/new", "d/sub/x"].sort());
   });
 });
+
+describe("IndexPathLookup.indexDirectory (directory_exists_in_index)", () => {
+  it("lets a gitlink win without core.ignorecase, the directory hash with it", () => {
+    const paths = ["Sub", "sub/x", "z/y"];
+    const exact = new IndexPathLookup(paths, { gitlinks: ["Sub"] });
+    expect(exact.indexDirectory("Sub")).toBe("gitlink");
+    expect(exact.indexDirectory("sub")).toBe("directory");
+    expect(exact.indexDirectory("SUB")).toBeUndefined();
+    expect(exact.indexDirectory("Z")).toBeUndefined();
+    const icase = new IndexPathLookup(paths, { gitlinks: ["Sub"], ignoreCase: true });
+    expect(icase.indexDirectory("SUB")).toBe("directory");
+    expect(icase.indexDirectory("Z")).toBe("directory");
+    const onlyLink = new IndexPathLookup(["Sub"], { gitlinks: ["Sub"], ignoreCase: true });
+    expect(onlyLink.indexDirectory("sUB")).toBe("gitlink");
+    expect(onlyLink.has("SUB")).toBe(true);
+    expect(onlyLink.hasExactly("SUB")).toBe(false);
+  });
+
+  it("takes paths known to be sorted as they are", () => {
+    const sorted = new IndexPathLookup(["a/x", "b"], { sorted: true });
+    expect(sorted.all).toEqual(["a/x", "b"]);
+    expect(new IndexPathLookup(["b", "a/x"]).all).toEqual(["a/x", "b"]);
+  });
+});

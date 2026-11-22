@@ -20,7 +20,7 @@ import {
   compareWithWorktree,
   defaultModeTrust,
   findUntrackedFiles,
-  trackedUnder,
+  untrackedIndexPredicates,
   type WorktreeComparison,
   withWorktreeEntries,
 } from "../status/worktree-status.js";
@@ -44,6 +44,11 @@ export interface StashTreesSource {
    * check for changes cover (the index tree is always the whole index); absent: every path
    */
   pathFilter?: (path: string) => boolean;
+  /**
+   * `core.ignorecase`: the untracked walk folds case asking the index, as dir.c's name
+   * hashes do (a file differing from an index path only by case is tracked)
+   */
+  ignoreCase?: boolean;
 }
 
 /** A blob, link or gitlink of a flattened tree. */
@@ -375,8 +380,9 @@ export async function createUntrackedTree(
   const tracked = new Set<string>();
   for await (const entry of staging.entries()) tracked.add(entry.path);
   const result = new Map<string, FlatTreeEntry>();
-  for await (const file of findUntrackedFiles(worktree, (p) => tracked.has(p), {
-    hasTrackedUnder: trackedUnder(tracked),
+  const index = untrackedIndexPredicates(tracked, source.ignoreCase);
+  for await (const file of findUntrackedFiles(worktree, index.isTracked, {
+    hasTrackedUnder: index.hasTrackedUnder,
     includeIgnored: options.includeIgnored,
     ...(source.pathFilter ? { filter: source.pathFilter } : {}),
   })) {

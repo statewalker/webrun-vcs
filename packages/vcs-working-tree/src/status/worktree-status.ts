@@ -14,7 +14,7 @@ import type { StagingEntry } from "../staging/types.js";
 import type { WorktreeEntry } from "../worktree/types.js";
 import type { Worktree } from "../worktree/worktree.js";
 import { modeFromWorktree, type WorktreeModeTrust } from "../worktree/worktree-mode.js";
-import type { UntrackedScanHost } from "./untracked-scan.js";
+import { IndexPathLookup, type UntrackedScanHost } from "./untracked-scan.js";
 
 const S_IFMT = 0o170000;
 
@@ -624,6 +624,29 @@ export function directoriesOf(paths: Iterable<string>): Set<string> {
     for (let k = path.indexOf("/"); k > 0; k = path.indexOf("/", k + 1)) dirs.add(path.slice(0, k));
   }
   return dirs;
+}
+
+/**
+ * {@link findUntrackedFiles}' `isTracked` and `hasTrackedUnder` over the index's paths, as
+ * dir.c asks its name hashes: under `ignoreCase` (`core.ignorecase`) a file differing from
+ * an index path only by case is tracked (`index_file_exists` with icase), and a directory so
+ * differing from a tracked one holds tracked paths (`directory_exists_in_index_icase`).
+ *
+ * ```typescript
+ * const { isTracked, hasTrackedUnder } = untrackedIndexPredicates(["a/b/two.txt"], true);
+ * isTracked("a/b/TWO.txt"); // true
+ * hasTrackedUnder("A"); // true
+ * ```
+ */
+export function untrackedIndexPredicates(
+  paths: Iterable<string>,
+  ignoreCase = false,
+): { isTracked: (path: string) => boolean; hasTrackedUnder: (dir: string) => boolean } {
+  const lookup = new IndexPathLookup([...paths], { ignoreCase });
+  return {
+    isTracked: (path) => lookup.has(path),
+    hasTrackedUnder: (dir) => lookup.hasEntriesBelow(dir),
+  };
 }
 
 /** A `hasTrackedUnder` predicate for {@link findUntrackedFiles} over the tracked paths. */

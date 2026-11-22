@@ -41,6 +41,7 @@ import type {
   NewHasher,
   OpenedRepository,
   OpenRepositoryOptions,
+  OperationOptions,
   UntrackedScanHost,
   Worktree,
   WorktreeCapabilities,
@@ -233,15 +234,15 @@ export class FileWorktree implements Worktree {
    * cache of directories verified not to be links, dropped when the batch ends (git's
    * per-command lstat cache), and the ignore rules are read once for the whole batch, as
    * are the content filter's configuration and attributes files. Nested batches join the
-   * outer one.
+   * outer one (`options` still reach the content filter's operation).
    */
-  async batch<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.batchIgnores) return fn();
+  async batch<T>(fn: () => Promise<T>, options?: OperationOptions): Promise<T> {
+    const filter = this.filter;
+    if (this.batchIgnores) return options && filter?.batch ? filter.batch(fn, options) : fn();
     this.batchIgnores = new Set();
     if (this.rootFiles.withLstatCache) this.scoped = this.rootFiles.withLstatCache();
     try {
-      const filter = this.filter;
-      return await (filter?.batch ? filter.batch(fn) : fn());
+      return await (filter?.batch ? filter.batch(fn, options) : fn());
     } finally {
       this.scoped = undefined;
       this.batchIgnores = undefined;

@@ -706,6 +706,59 @@ describeGit("git apply as native git", () => {
     }
   }, 180_000);
 
+  it("converts the files it writes by the attributes read before the patch", async () => {
+    // apply.c reads attributes through convert.c's attribute stack, built on the first
+    // conversion and kept: a `.gitattributes` the same patch adds (or changes) does not
+    // convert the files written with it
+    const cases: [string, Setup, Setup][] = [
+      [
+        "a new root .gitattributes",
+        (d) => put(d, "keep.txt", "k\n"),
+        (d) => {
+          put(d, ".gitattributes", "*.txt text eol=crlf\n");
+          put(d, "a.txt", "a\nb\n");
+          put(d, "sub/b.txt", "b\n");
+        },
+      ],
+      [
+        "a new sub/.gitattributes beside a changed file",
+        (d) => {
+          put(d, "sub/m.txt", "m\n");
+          put(d, "z.txt", "z\n");
+        },
+        (d) => {
+          put(d, "sub/.gitattributes", "*.txt text eol=crlf\n");
+          put(d, "sub/m.txt", "m\nn\n");
+          put(d, "sub/new.txt", "new\n");
+          put(d, "z.txt", "z\ny\n");
+        },
+      ],
+      [
+        "a changed root .gitattributes",
+        (d) => {
+          put(d, ".gitattributes", "*.txt text eol=crlf\n");
+          put(d, "m.txt", "m\n");
+        },
+        (d) => {
+          put(d, ".gitattributes", "*.txt text eol=lf\n");
+          put(d, "m.txt", "m\nn\n");
+          put(d, "new.txt", "new\n");
+        },
+      ],
+    ];
+    for (const [label, build, change] of cases) {
+      const { patch, base } = nativeDiff(build, change);
+      for (const args of [[], ["--index"]]) {
+        await compareApply(
+          twins(base),
+          patch,
+          { args, configure: (c) => configureArgs(c, args) },
+          `${label} ${args}`,
+        );
+      }
+    }
+  }, 180_000);
+
   it("applies submodule patches as native git does", async () => {
     const a = "1111111111111111111111111111111111111111";
     const b = "2222222222222222222222222222222222222222";

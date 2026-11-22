@@ -36,6 +36,7 @@ import {
   type ContentConversionOptions,
   collectChunks,
   isAttributesFile,
+  type OperationOptions,
   type WorktreeContentFilter,
 } from "../worktree/content-filter.js";
 import type { NewHasher } from "../worktree/hash-worktree-file.js";
@@ -347,6 +348,10 @@ interface Scope {
   };
   /** The attribute source's tree, resolved once (undefined: none applies) */
   source?: Promise<AttributesSourceTree | undefined>;
+  /** Operations keeping the attributes as read (`keepAttributes`) running now */
+  keeping: number;
+  /** The directories whose `.gitattributes` changed while they were kept */
+  keptChanges: Set<string>;
 }
 
 /**
@@ -452,17 +457,35 @@ export class GitContentFilter implements WorktreeContentFilter {
     const refresh = (this.options.config as { refresh?: () => Promise<unknown> } | undefined)
       ?.refresh;
     if (typeof refresh === "function") await refresh.call(this.options.config);
-    return { settings: this.settings(), memos: new Map(), outer: {} };
+    return {
+      settings: this.settings(),
+      memos: new Map(),
+      outer: {},
+      keeping: 0,
+      keptChanges: new Set(),
+    };
   }
 
-  async batch<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.scope) return fn();
-    this.scope = await this.openScope();
+  async batch<T>(fn: () => Promise<T>, options?: OperationOptions): Promise<T> {
+    const outer = this.scope;
+    const scope = outer ?? (await this.openScope());
+    this.scope = scope;
+    const keep = options?.keepAttributes === true;
+    if (keep) scope.keeping++;
     try {
       return await fn();
     } finally {
-      this.scope = undefined;
+      if (keep && --scope.keeping === 0) {
+        // the attributes kept as read are read again from now on
+        for (const dir of scope.keptChanges) this.dropDirectory(scope, dir);
+        scope.keptChanges.clear();
+      }
+      if (!outer) this.scope = undefined;
     }
+  }
+
+  private dropDirectory(scope: Scope, dir: string): void {
+    for (const { memo } of scope.memos.values()) memo.dropDirectory(dir);
   }
 
   /** The operation's scope, or a scope of its own for a call outside one. */
@@ -474,7 +497,9 @@ export class GitContentFilter implements WorktreeContentFilter {
     if (!isAttributesFile(path)) return;
     this.worktreeFiles.delete(path);
     const dir = dirOfAttributesFile(path);
-    if (this.scope) for (const { memo } of this.scope.memos.values()) memo.dropDirectory(dir);
+    if (!this.scope) return;
+    if (this.scope.keeping > 0) this.scope.keptChanges.add(dir);
+    else this.dropDirectory(this.scope, dir);
   }
 
   /** The files outside the tree, read once per scope. */

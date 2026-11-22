@@ -305,7 +305,8 @@ export class AmCommand extends GitCommand<AmResult> {
     // unwritten edits (refused)
     await this.readCurrentIndex();
     try {
-      return await this.run();
+      // one worktree operation for every patch applied (attributes read once)
+      return await this.inOneOperation(() => this.run());
     } catch (error) {
       if (error instanceof AmStop) return this.result(error.status);
       throw error;

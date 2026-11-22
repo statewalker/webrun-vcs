@@ -20,7 +20,11 @@ import type { FilesApi } from "@statewalker/vcs-utils/files";
 import type { LinkedWorktrees } from "../linked-worktrees/index.js";
 import type { UntrackedScanHost } from "../status/untracked-scan.js";
 import type { WorkingCopy } from "../working-copy.js";
-import type { ContentAttributesContext, WorktreeContentFilter } from "./content-filter.js";
+import type {
+  ContentAttributesContext,
+  OperationOptions,
+  WorktreeContentFilter,
+} from "./content-filter.js";
 import type { WorktreeEntry } from "./types.js";
 
 // Re-export types for consumers
@@ -210,9 +214,10 @@ export interface Worktree {
    * Runs `fn` as one batch of operations (a checkout's checks and writes), which may share
    * a cache of directories verified not to be links and one reading of the ignore rules
    * (`.gitignore` files, exclude files), both dropped when the batch ends. Outside a batch,
-   * every walk and ignore check reads the rules afresh.
+   * every walk and ignore check reads the rules afresh. `options` go to the content
+   * filter's operation ({@link WorktreeContentFilter.batch}), nested batches included.
    */
-  batch?<T>(fn: () => Promise<T>): Promise<T>;
+  batch?<T>(fn: () => Promise<T>, options?: OperationOptions): Promise<T>;
 
   /**
    * The content filter (git's clean and smudge conversions) this worktree applies, when one

@@ -38,6 +38,7 @@ import {
   clearSkipWorktreeFromPresentFiles,
   compareWithWorktree,
   IndexChangedError,
+  type OperationOptions,
   type SparseCheckoutPatterns,
   type Staging,
   type WorkingCopy,
@@ -1172,6 +1173,18 @@ export abstract class GitCommand<T> {
    */
   protected get worktreeAccess(): Worktree | undefined {
     return this._workingCopy.worktree;
+  }
+
+  /**
+   * Runs `fn` as one worktree operation (`Worktree.batch`, which nests): the configuration,
+   * `info/attributes` and the `.gitattributes` files are read once for every path the
+   * command converts, filters or checks, instead of once per path (each attributes lookup
+   * outside an operation opens one of its own). Without a worktree, `fn` runs as it is.
+   * `options` go to the content filter's operation (`keepAttributes`).
+   */
+  protected inOneOperation<T>(fn: () => Promise<T>, options?: OperationOptions): Promise<T> {
+    const worktree = "worktree" in this._workingCopy ? this._workingCopy.worktree : undefined;
+    return worktree?.batch ? worktree.batch(fn, options) : fn();
   }
 
   /**

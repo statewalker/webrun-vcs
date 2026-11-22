@@ -3,6 +3,7 @@ import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   applyStatUpdate,
   compareWithWorktree,
+  IndexPathLookup,
   type IndexStatUpdate,
   type NestedRepositoryState,
   type SparseCheckoutPatterns,
@@ -32,12 +33,13 @@ import {
   runAddInteractive,
   runPatchSelection,
 } from "./add-patch/index.js";
-import { worktreeModeTrust } from "./core-config.js";
+import { coreBool, worktreeModeTrust } from "./core-config.js";
 import {
   AddToIndexError,
   chmodIndexEntries,
   gitlinkHeadState,
   IndexAdder,
+  IndexDirnameCase,
   readGitlinkHead,
 } from "./index-adder.js";
 import { configBool } from "./merge-config.js";
@@ -739,18 +741,36 @@ export class AddCommand extends GitCommand<AddResult> {
     const failed: string[] = [];
     const errors: string[] = [];
     const addedSet = new Set<string>();
+    // add_to_index's adjust_dirname_case (core.ignorecase): a new file's leading directories
+    // take the index's spelling, built on first use, without the entries this command
+    // removed before (remove_name_hash drops a directory they leave empty; a dry run,
+    // ADD_CACHE_PRETEND, removes nothing)
+    let dirnameCase: IndexDirnameCase | undefined;
+    const indexName = (path: string): string => {
+      if (!coreBool(this.workingCopy, "ignorecase", false) || !path.includes("/")) return path;
+      if (!dirnameCase) {
+        dirnameCase = new IndexDirnameCase(index.map((group) => group.path));
+        if (!this.dryRun) for (const gone of removed) dirnameCase.forget(gone);
+      }
+      const name = dirnameCase.adjust(path);
+      if (!this.dryRun) dirnameCase.note(name);
+      return name;
+    };
     const addOne = async (
       path: string,
       entry: WorktreeEntry,
       displayPath: string,
       indexed?: StagingEntry,
+      untrackedFile = false,
     ): Promise<"ok" | "failed"> => {
       try {
+        const name = untrackedFile ? indexName(path) : path;
         const outcome = await adder.add(worktree, path, entry, {
           intentToAdd: this.intentToAdd,
           displayPath,
           onWarning: (message) => warnings.push(message),
           ...(indexed ? { indexed } : {}),
+          ...(name !== path ? { indexPath: name } : {}),
         });
         // a file turned repository is met twice (`add .`): tracked, then untracked
         if (!addedSet.has(path)) {
@@ -890,7 +910,10 @@ export class AddCommand extends GitCommand<AddResult> {
         sparseUntracked.push(displayPath);
         continue;
       }
-      if ((await addOne(file.path, file.entry, displayPath)) === "failed") {
+      const untrackedFile = !file.repository;
+      if (
+        (await addOne(file.path, file.entry, displayPath, undefined, untrackedFile)) === "failed"
+      ) {
         if (!ignoreErrors) {
           throw new AddFailedError(
             [...messages, ...errors, "fatal: adding files failed"].join("\n"),
@@ -1181,6 +1204,15 @@ export class AddCommand extends GitCommand<AddResult> {
         trackedDirs.add(path.slice(0, at));
       }
     }
+    // dir.c asks the index through its name hashes, which fold case under core.ignorecase:
+    // a file differing from an index path only by case is tracked (treat_path's
+    // index_file_exists, dir_add_name), a directory so differing from a tracked one is
+    // entered (directory_exists_in_index_icase); an ignored directory is checked exactly
+    // (dir_add_ignored's index_name_is_other)
+    const lookup = new IndexPathLookup([...indexPaths], {
+      ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+      gitlinks: gitlinkPaths,
+    });
     const ignoredDirs = new Set<string>();
     const prefix = await this.walkPrefix(worktree, items);
     if (prefix && !this.force) {
@@ -1203,7 +1235,7 @@ export class AddCommand extends GitCommand<AddResult> {
       // a directory whose `.git` is no repository is an ordinary one (git's treat_directory)
       enterNonRepositoryGitDirs: true,
       // a tracked file is passed over (below too), unstat'ed (git's treat_path)
-      skipFile: (path) => indexPaths.has(path),
+      skipFile: (path) => lookup.has(path),
       ...(prefix ? { pathPrefix: prefix } : {}),
       // git's "could not open directory" for a directory its scan opens: not one it passes
       // over as ignored, nor one the pathspec cannot reach into
@@ -1223,20 +1255,14 @@ export class AddCommand extends GitCommand<AddResult> {
       const underIgnored = parent !== "" && ignoredDirs.has(parent);
       if (!this.force && (entry.isIgnored || underIgnored)) {
         if (entry.isDirectory) ignoredDirs.add(entry.path);
-        if (indexPaths.has(entry.path)) continue;
+        if (entry.isDirectory ? indexPaths.has(entry.path) : lookup.has(entry.path)) continue;
         if (!entry.isDirectory && matchPathspec(items, entry.path, 0)) skipped.push(entry.path);
         if (!underIgnored && excludeMatchesPathspec(items, entry.path)) ignored.push(entry.path);
         continue;
       }
       if (entry.isDirectory) {
         // a repository of its own, nothing of it tracked: one entry, `sub/`
-        if (
-          entry.mode !== FileMode.GITLINK ||
-          gitlinkPaths.has(entry.path) ||
-          trackedDirs.has(entry.path)
-        ) {
-          continue;
-        }
+        if (entry.mode !== FileMode.GITLINK || lookup.indexDirectory(entry.path)) continue;
         const state = await nestedRepositoryState(worktree, entry.path);
         if (state === "repository") {
           if (matchPathspecSeen(items, entry.path, DO_MATCH_DIRECTORY, seen)) {
@@ -1247,7 +1273,7 @@ export class AddCommand extends GitCommand<AddResult> {
         }
         continue;
       }
-      if (indexPaths.has(entry.path)) continue;
+      if (lookup.has(entry.path)) continue;
       if (matchPathspecSeen(items, entry.path, 0, seen)) {
         untracked.push({ path: entry.path, entry, repository: false });
       }
