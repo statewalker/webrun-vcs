@@ -5,6 +5,7 @@
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import {
   configFilesApiOf,
   createWorkingCopyConfig,
@@ -28,15 +29,36 @@ export async function readDeltaBaseCacheLimit(
     includes?: boolean | "files";
   } = {},
 ): Promise<number | undefined> {
+  return (await readPackSetSettings(files, gitDir, options)).baseCacheBytes;
+}
+
+/**
+ * The config a pack set reads, in one pass: `core.deltaBaseCacheLimit` and
+ * `core.multiPackIndex` (git's default true; an empty or unparsable value reads as git's
+ * `git_config_bool` would, false for empty).
+ */
+export async function readPackSetSettings(
+  files: FilesApi,
+  gitDir = ".git",
+  options: { includes?: boolean | "files" } = {},
+): Promise<{ baseCacheBytes?: number; multiPackIndex: boolean }> {
   const config = await createWorkingCopyConfig(
     configFilesApiOf(files, {
-      readOnly: "reading core.deltaBaseCacheLimit never writes the config",
+      readOnly: "reading the pack settings never writes the config",
     }),
     gitDir,
     undefined,
     options.includes === undefined ? {} : { includes: options.includes },
   );
-  return parseConfigSize(config.get("core.deltaBaseCacheLimit"));
+  const midx = config.get("core.multiPackIndex");
+  const multiPackIndex =
+    midx === undefined || midx === null
+      ? true
+      : typeof midx === "boolean"
+        ? midx
+        : (parseGitBool(String(midx)) ?? true);
+  const baseCacheBytes = parseConfigSize(config.get("core.deltaBaseCacheLimit"));
+  return { ...(baseCacheBytes !== undefined ? { baseCacheBytes } : {}), multiPackIndex };
 }
 
 /** A size as git_parse_ulong reads it (decimal, 0x hex or 0 octal, then k, m or g). */
