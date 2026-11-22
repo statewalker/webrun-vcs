@@ -40,7 +40,7 @@ import { MissingObjectError } from "./list-objects.js";
 import type { PackedEntry, PackedEntryKind } from "./pack-file.js";
 
 /** What `writePack` reads objects from. */
-export type PackObjectSource = Pick<GitObjects, "get">;
+export type PackObjectSource = Pick<GitObjects, "get" | "header">;
 
 /** An object to write: its id, or its id with what is known of it (as `listObjects` yields). */
 export type PackObjectRef =
@@ -509,6 +509,13 @@ export function packNameHashBytes(bytes: Uint8Array): number {
 /** The type and size of each searchable object, read from its header. */
 async function header(objects: PackObjectSource, p: Planned): Promise<boolean> {
   if (p.type !== undefined && p.size !== undefined) return true;
+  // the entry headers when the store can answer from them (no delta chain applied)
+  const h = objects.header ? await objects.header(p.id) : undefined;
+  if (h) {
+    p.type = h.type;
+    p.size = h.size;
+    return true;
+  }
   const o = await objects.get(p.id);
   if (!o) {
     if (p.have) return false;

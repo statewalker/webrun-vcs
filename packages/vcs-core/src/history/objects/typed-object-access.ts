@@ -23,13 +23,18 @@ export function storeObject(
 /**
  * The object's type and size, or undefined if it is absent. The read is released at once
  * (`return()` on the content before iterating it). What is read before that depends on the
- * store: a loose object's header; for a packed object, the first chunk of a whole object, or
- * the resolved result of a delta.
+ * store: a loose object's header; for a packed object, the entry headers (`GitObjects.header`,
+ * without applying a delta chain), else the first chunk of a whole object or the resolved
+ * result of a delta.
  */
 export async function objectHeader(
   objects: GitObjects,
   id: ObjectId,
 ): Promise<{ type: ObjectTypeString; size: number } | undefined> {
+  if (objects.header) {
+    const h = await objects.header(id);
+    if (h) return h;
+  }
   const obj = await objects.get(id);
   if (!obj) return undefined;
   await obj.content[Symbol.asyncIterator]().return?.();
@@ -40,6 +45,11 @@ export async function objectHeader(
  * Whether the stored object `id` has `type`: false if it is absent or of another type. An
  * object that is stored but whose header cannot be read throws `CorruptObjectError` instead
  * of reading as absent, so a reachability walk (gc) never skips what lies behind it.
+ *
+ * Like git's `oid_object_info`, a packed copy's type comes from its pack headers alone
+ * (`objectType`): the object's data is not inflated, so a copy whose data (or a delta base's)
+ * is corrupt still answers here. Corruption surfaces where content is read (`get`, fsck,
+ * checkout, the walk into trees), never as a missing object.
  */
 export async function hasObjectOfType(
   objects: GitObjects,
@@ -47,6 +57,9 @@ export async function hasObjectOfType(
   type: ObjectTypeString,
 ): Promise<boolean> {
   if (!(await objects.has(id))) return false;
+  // the type from a packed copy's headers alone, when the store can read them
+  const known = objects.objectType ? await objects.objectType(id) : undefined;
+  if (known) return known === type;
   let header: Awaited<ReturnType<typeof objectHeader>>;
   try {
     header = await objectHeader(objects, id);

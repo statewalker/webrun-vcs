@@ -134,6 +134,9 @@ class GitBlobStore implements Blobs {
    * Get blob size in bytes
    */
   async size(id: ObjectId): Promise<number> {
+    // from a packed copy's headers when the store has them (no delta chain applied)
+    const h = this.objects.header ? await this.objects.header(id) : undefined;
+    if (h) return h.type === "blob" ? h.size : -1;
     const blob = await this.read(id);
     if (!blob) return -1;
     if (!blob.bytes) await blob.content[Symbol.asyncIterator]().return?.();

@@ -689,3 +689,83 @@ describe("installPack: deltas kept from phase 1 (deltaStashBytes)", () => {
     expect(counter.reads).toBeLessThan(2 + 100);
   });
 });
+
+describe("installPack: entries inflated whole or streamed, by how the stored pack is read", () => {
+  /** `files` whose reads of `.pack` files come in `size`-byte chunks. */
+  function rechunked(size: number) {
+    const files = createInMemoryFilesApi();
+    const read = files.read.bind(files);
+    files.read = (path, o) => {
+      const source = read(path, o);
+      if (!path.endsWith(".pack")) return source;
+      return (async function* () {
+        for await (const c of source) {
+          for (let at = 0; at < c.length; at += size) yield c.subarray(at, at + size);
+        }
+      })();
+    };
+    return files;
+  }
+
+  const tree = enc.encode(`100644 a\0${"\x02".repeat(20)}`);
+  const commit = enc.encode("tree 0000000000000000000000000000000000000000\n\nchunks\n");
+  const big = enc.encode(Array.from({ length: 3000 }, (_, i) => `big line ${i}\n`).join(""));
+  const entries: Entry[] = [
+    { kind: 3, data: A },
+    { kind: 6, data: dAB, baseIdx: 0 },
+    { kind: 7, data: dBC, baseOid: Bid },
+    { kind: 2, data: tree },
+    { kind: 1, data: commit },
+    { kind: 3, data: big },
+    { kind: 3, data: new Uint8Array(0) },
+  ];
+
+  it("writes the same idx and reports the same contents whatever the chunk size", async () => {
+    const built = buildPack(entries);
+    const results: { idx: Uint8Array; seen: string[] }[] = [];
+    for (const size of [1, 3, 17, 100, 4096, 1 << 20]) {
+      const files = rechunked(size);
+      const seen: string[] = [];
+      const r = await installPack(files, PACK_DIR, chunks(built.bytes, 5), {
+        onContent: (id, type, content) => seen.push(`${id} ${type} ${sha1hex(content)}`),
+      });
+      expect(r.count).toBe(entries.length);
+      results.push({ idx: await readIdx(files, r.packId), seen });
+    }
+    const [first, ...rest] = results;
+    for (const r of rest) {
+      expect(Buffer.from(r.idx).equals(Buffer.from(first?.idx as Uint8Array))).toBe(true);
+      expect(r.seen).toEqual(first?.seen);
+    }
+    const listedIds = [...readPackIndex(first?.idx as Uint8Array).entries()].map((e) => e.id);
+    expect(listedIds.sort()).toEqual(
+      [
+        Aid,
+        Bid,
+        Cid,
+        oidOf("tree", tree),
+        oidOf("commit", commit),
+        oidOf("blob", big),
+        oidOf("blob", new Uint8Array(0)),
+      ].sort(),
+    );
+  });
+
+  it("refuses a corrupt or mis-sized entry with the same error whatever the chunk size", async () => {
+    const shortSize = buildPack([{ kind: 3, data: A, sizeOverride: A.length + 1 }]).bytes;
+    const longSize = buildPack([{ kind: 3, data: A, sizeOverride: A.length - 1 }]).bytes;
+    const damaged = buildPack([{ kind: 3, data: A }]);
+    const corrupt = damaged.bytes.slice();
+    // the deflate data after the zlib header and the first bytes: broken mid-stream
+    corrupt.fill(0xff, (damaged.offsets[0] as number) + 6, (damaged.ends[0] as number) - 6);
+    for (const bytes of [shortSize, longSize, corrupt]) {
+      const messages = new Set<string>();
+      for (const size of [1, 7, 1 << 20]) {
+        const err = await installPack(rechunked(size), PACK_DIR, chunks(bytes)).catch((e) => e);
+        expect(err).toBeInstanceOf(CorruptObjectError);
+        messages.add(String((err as Error).message));
+      }
+      expect(messages.size).toBe(1);
+    }
+  });
+});

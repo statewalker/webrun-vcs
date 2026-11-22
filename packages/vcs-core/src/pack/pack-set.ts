@@ -17,6 +17,7 @@
 import type { FilesApi } from "../common/files/index.js";
 import type { ObjectId } from "../common/id/index.js";
 import { CorruptObjectError, type GitObject } from "../history/objects/git-objects.js";
+import type { ObjectTypeString } from "../history/objects/object-types.js";
 import { noteObjectRemoved } from "../storage/raw/object-removals.js";
 import {
   type InstalledPack,
@@ -118,6 +119,15 @@ export interface PackSet {
     id: ObjectId,
     options?: { verify?: boolean },
   ): GitObject | undefined | Promise<GitObject | undefined>;
+  /**
+   * The object's type and size from the entry headers of the copy `get` would read first
+   * (`PackFile.header`), without resolving it. Undefined when no pack holds a copy, or when
+   * that copy's headers cannot answer: `get` then reads it (and reports its errors). Optional:
+   * a wrapper of a set may leave it out.
+   */
+  header?(id: ObjectId): Promise<{ type: ObjectTypeString; size: number } | undefined>;
+  /** `header`'s type alone (`PackFile.objectType`): a delta's size is not read. */
+  objectType?(id: ObjectId): Promise<ObjectTypeString | undefined>;
   /**
    * The object's entry as stored in the first pack holding a sound copy (for reuse), with the
    * id of that pack.
@@ -633,6 +643,19 @@ export async function openPackSet(
     return undefined;
   }
 
+  /** The pack `get` reads `id` from first, unless that copy is known corrupt (then none). */
+  function firstCopy(id: ObjectId): PackFile | undefined {
+    if (!isId(id)) return undefined;
+    const snapshot = packs;
+    let p: PackFile | undefined;
+    if (midx && snapshot.length >= MIDX_LOOKUP_MIN_PACKS) {
+      const m = midxPack(id);
+      if (m && holds(m, id)) p = m;
+    }
+    p ??= snapshot.find((q) => q.has(id));
+    return p && !isBad(p, id) ? p : undefined;
+  }
+
   async function findEntry(
     id: ObjectId,
     rescan: boolean,
@@ -859,6 +882,14 @@ export async function openPackSet(
         return runSteps(lookupSteps(id, opts, true, resume));
       }
       return runSteps(lookupSteps(id, opts, true));
+    },
+    async header(id) {
+      const p = firstCopy(id);
+      return p?.header ? p.header(id) : undefined;
+    },
+    async objectType(id) {
+      const p = firstCopy(id);
+      return p?.objectType ? p.objectType(id) : undefined;
     },
     entry: (id) => findEntry(id, true),
     async *list(o) {

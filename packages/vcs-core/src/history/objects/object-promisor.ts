@@ -421,7 +421,14 @@ export function withLazyFetch(objects: GitObjects, promisor: ObjectPromisor): Gi
     getRaw: (id) => objects.getRaw(id),
   };
   // the optional methods, as `objects` has them when called
-  for (const key of ["listPrefix", "approximateCount", "sweepStale", "beginQuarantine"] as const) {
+  for (const key of [
+    "listPrefix",
+    "approximateCount",
+    "sweepStale",
+    "beginQuarantine",
+    "header",
+    "objectType",
+  ] as const) {
     Object.defineProperty(lazy, key, {
       configurable: true,
       enumerable: true,

@@ -181,6 +181,18 @@ export interface PackFile extends Pack {
     id: ObjectId,
     options?: PackGetOptions,
   ): GitObject | undefined | Promise<GitObject | undefined>;
+  /**
+   * The object's type and size from the entry headers alone, as git's packed_object_info
+   * reads them: a whole entry's header, or a delta's target size (the start of its
+   * instructions, inflated) and the type of the whole entry at the bottom of its chain (only
+   * headers read on the way). Nothing is resolved or cached. Undefined when the pack holds no
+   * entry for `id`, and when the headers cannot answer (a REF_DELTA base outside the pack, an
+   * entry that cannot be read): the caller then reads the object (`get`), which reports any
+   * error as it does.
+   */
+  header?(id: ObjectId): Promise<{ type: ObjectTypeString; size: number } | undefined>;
+  /** `header`'s type alone: a delta's size is not read. */
+  objectType?(id: ObjectId): Promise<ObjectTypeString | undefined>;
   /** Drops this pack's objects from the base cache. */
   close(): void;
   /**
@@ -1180,6 +1192,18 @@ export async function openPack(
     return parseHead(offset, end, peekRange(offset, n) ?? (await readRangeAll(offset, n)));
   };
 
+  /** `readHead` when the header's bytes are in a loaded window, else undefined. */
+  const headNow = (offset: number): EntryHead | undefined => {
+    const end = entryEnd(offset);
+    const bytes = peekRange(offset, Math.min(32, end - offset));
+    return bytes ? parseHead(offset, end, bytes) : undefined;
+  };
+
+  /** The header, its window loaded first (one read per window, as entries are read). */
+  const headLoaded = async (offset: number): Promise<EntryHead> => {
+    await loadWindow(Math.floor(offset / WINDOW));
+    return headNow(offset) ?? readHead(offset);
+  };
   /** An entry's header and, for a small entry, its compressed bytes (in memory, one read). */
   const withData = (offset: number, end: number, bytes: Uint8Array): LoadedEntry => {
     const e = parseHead(offset, end, bytes);
@@ -1663,6 +1687,73 @@ export async function openPack(
     return fromEntry(id, o, offset, l);
   };
 
+  /** A delta entry's target size: the second size of its instructions (undefined if unread). */
+  const deltaTargetSize = (e: EntryHead): number | undefined | Promise<number | undefined> => {
+    const l = loadEntry(e.offset);
+    return l instanceof Promise ? l.then(targetSizeOf) : targetSizeOf(l);
+  };
+  const targetSizeOf = (l: LoadedEntry): number | undefined => {
+    if (!l.data) return undefined;
+    // two sizes of at most 10 bytes each: a buffer of 20 bytes, in the heap
+    const out = new Uint8Array(20);
+    const r = inflateWhole(l.data, { into: out, partial: true });
+    let p = 0;
+    for (let k = 0; k < 2; k++) {
+      let size = 0;
+      let mul = 1;
+      for (;;) {
+        if (p >= r.length) return undefined;
+        const b = out[p++] as number;
+        size += (b & 0x7f) * mul;
+        mul *= 128;
+        if (!(b & 0x80)) break;
+      }
+      if (k === 1) return size;
+    }
+    return undefined;
+  };
+
+  /** `header`; without `wantSize` a delta's size is not read (-1): its type alone is. */
+  const header = async (
+    id: ObjectId,
+    wantSize = true,
+  ): Promise<{ type: ObjectTypeString; size: number } | undefined> => {
+    const i = t.find(id);
+    if (i < 0) return undefined;
+    let offset = t.offsetOf(i);
+    const hit = cacheGet(offset);
+    if (hit) return { type: hit.type, size: hit.data.length };
+    // synchronous while the headers are in loaded windows
+    let e = headNow(offset) ?? (await headLoaded(offset));
+    const type = TYPES[e.kind];
+    if (type) return { type, size: e.size };
+    let size = -1;
+    if (wantSize) {
+      let sized = deltaTargetSize(e);
+      if (sized instanceof Promise) sized = await sized;
+      if (sized === undefined) return undefined;
+      size = sized;
+    }
+    for (let depth = 0; depth < MAX_CHAIN; depth++) {
+      let base: number;
+      if (e.kind === OFS_DELTA) {
+        base = e.baseOffset as number;
+        if (!(base >= 12 && base < offset)) return undefined;
+      } else if (e.kind === REF_DELTA) {
+        const bi = e.baseId === undefined ? -1 : t.find(e.baseId);
+        if (bi < 0) return undefined; // outside the pack: resolved by `get`
+        base = t.offsetOf(bi);
+      } else return undefined;
+      const cachedBase = cacheGet(base);
+      if (cachedBase) return { type: cachedBase.type, size };
+      offset = base;
+      e = headNow(offset) ?? (await headLoaded(offset));
+      const baseType = TYPES[e.kind];
+      if (baseType) return { type: baseType, size };
+    }
+    return undefined;
+  };
+
   /** The object whose entry `l` (at `offset`) is loaded. */
   const fromEntry = (
     id: ObjectId,
@@ -1741,6 +1832,21 @@ export async function openPack(
       get idCompares() {
         return t.checks().compares;
       },
+    },
+    async header(id) {
+      try {
+        return await header(id);
+      } catch {
+        // a corrupt idx bucket or entry: `get` reports it
+        return undefined;
+      }
+    },
+    async objectType(id) {
+      try {
+        return (await header(id, false))?.type;
+      } catch {
+        return undefined;
+      }
     },
     verifyIndex: () => t.verify(),
     packOrder: () => permutation(),

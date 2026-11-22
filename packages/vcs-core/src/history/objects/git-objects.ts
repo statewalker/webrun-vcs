@@ -107,6 +107,16 @@ export interface GitObjects {
     id: ObjectId,
     options?: { verify?: boolean },
   ): GitObject | undefined | Promise<GitObject | undefined>;
+  /**
+   * The type and size of an object the store holds at hand, read from its headers without
+   * resolving its content (a packed delta's chain is not applied), as git's
+   * `oid_object_info`. Undefined means "ask `get`": the object is absent here, or its
+   * headers cannot answer (`get` then reports any error). Optional: `objectHeader` falls
+   * back to `get`.
+   */
+  header?(id: ObjectId): Promise<{ type: ObjectTypeString; size: number } | undefined>;
+  /** `header`'s type alone, for stores where the size costs more to read (a packed delta). */
+  objectType?(id: ObjectId): Promise<ObjectTypeString | undefined>;
   /** Whether the object is stored; false for anything that is not an id. */
   has(id: ObjectId): Promise<boolean>;
   /** Stored object ids (40 lowercase hex), whatever else the store holds. */
