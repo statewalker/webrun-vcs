@@ -56,6 +56,12 @@ const P_OBJECTID = 40;
 const P_FLAGS = 60;
 const P_FLAGS2 = 62;
 
+/**
+ * The fewest bytes an entry takes: its fixed part, then a version 2/3 name's NUL and padding
+ * (64), or a version 4 name's varint and NUL (64)
+ */
+const MIN_ENTRY_SIZE = 64;
+
 /** Maximum path length stored in flags (12 bits) */
 const NAME_MASK = 0xfff;
 
@@ -128,6 +134,48 @@ export interface ParseIndexOptions {
    * afterwards.
    */
   keepEncoding?: boolean;
+  /**
+   * Check the trailing SHA-1 against the content (default true). git checks it only in
+   * `fsck` (read-cache.c `verify_hdr` with `verify_index_checksum`, set by fsck alone), and
+   * never for a null trailer (`index.skipHash`); index reads elsewhere pass false.
+   */
+  verifyChecksum?: boolean;
+}
+
+/**
+ * An index file git refuses to read: `lines` are what git prints on stderr before it exits
+ * with status 128 (read-cache.c `do_read_index`: `verify_hdr`'s error then `die("index file
+ * corrupt")`, or `create_from_disk`'s own death). Thrown by {@link parseIndexFile} for a bad
+ * signature, version or trailing hash (`verifyChecksum`), and for entries or names that do not
+ * fit in the file (git reads past its mapping there; ours refuses).
+ *
+ * @example
+ * ```typescript
+ * try { await parseIndexFile(bytes, { verifyChecksum: true }); }
+ * catch (e) { if (e instanceof IndexCorruptError) console.error(e.lines.join("\n")); }
+ * ```
+ */
+export class IndexCorruptError extends Error {
+  override name = "IndexCorruptError";
+  /** git's exit status */
+  readonly exitCode = 128;
+  constructor(
+    message: string,
+    /** git's stderr lines, without newlines */
+    readonly lines: readonly string[] = ["fatal: index file corrupt"],
+  ) {
+    super(message);
+  }
+}
+
+/** git's `index file corrupt` death after an error line of `verify_hdr` */
+function corruptIndex(message: string, gitError?: string): IndexCorruptError {
+  return new IndexCorruptError(
+    message,
+    gitError === undefined
+      ? ["fatal: index file corrupt"]
+      : [`error: ${gitError}`, "fatal: index file corrupt"],
+  );
 }
 
 /** An index extension as stored: a four-character signature and its payload. */
@@ -156,32 +204,39 @@ export async function parseIndexFile(
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 0;
 
-  // Parse header
+  // Parse header (verify_hdr; git prints the signature as the host reads it, little-endian)
   const signature = view.getUint32(offset);
   if (signature !== INDEX_SIGNATURE) {
-    throw new Error(`Invalid index file signature: expected DIRC, got ${signature.toString(16)}`);
+    throw corruptIndex(
+      `Invalid index file signature: expected DIRC, got ${signature.toString(16)}`,
+      `bad signature 0x${view.getUint32(offset, true).toString(16).padStart(8, "0")}`,
+    );
   }
   offset += 4;
 
   const version = view.getUint32(offset) as IndexVersion;
   if (version < INDEX_VERSION_2 || version > INDEX_VERSION_4) {
-    throw new Error(`Unsupported index version: ${version}`);
+    throw corruptIndex(`Unsupported index version: ${version}`, `bad index version ${version | 0}`);
   }
   offset += 4;
 
   const entryCount = view.getUint32(offset);
-  if (entryCount < 0) {
-    throw new Error("Invalid entry count");
-  }
   offset += 4;
+  // every entry takes at least MIN_ENTRY_SIZE bytes: a count the file cannot hold is corrupt
+  // (checked before anything is allocated for the entries)
+  if (entryCount > (data.length - HEADER_SIZE - CHECKSUM_SIZE) / MIN_ENTRY_SIZE) {
+    throw corruptIndex(`Index file corrupt: ${entryCount} entries in ${data.length} bytes`);
+  }
 
-  // Verify checksum before parsing entries
-  const contentWithoutChecksum = data.subarray(0, data.length - CHECKSUM_SIZE);
-  const storedChecksum = data.subarray(data.length - CHECKSUM_SIZE);
-  const computedChecksum = await sha1(contentWithoutChecksum);
-
-  if (!arraysEqual(storedChecksum, computedChecksum)) {
-    throw new Error("Index file checksum mismatch");
+  // Verify checksum before parsing entries (verify_hdr: a null trailer is index.skipHash's)
+  if (options.verifyChecksum !== false) {
+    const storedChecksum = data.subarray(data.length - CHECKSUM_SIZE);
+    if (storedChecksum.some((b) => b !== 0)) {
+      const computedChecksum = await sha1(data.subarray(0, data.length - CHECKSUM_SIZE));
+      if (!arraysEqual(storedChecksum, computedChecksum)) {
+        throw corruptIndex("Index file checksum mismatch", "bad index file sha1 signature");
+      }
+    }
   }
 
   // Parse entries, in one pass over the bytes (no result object per entry besides the entry)
@@ -209,6 +264,9 @@ export async function parseIndexFile(
     offset = parsedEnd;
   }
   if (offsets) offsets[entryCount] = offset;
+  if (offset > data.length - CHECKSUM_SIZE) {
+    throw corruptIndex(`Index file corrupt: entries end past the checksum (at ${offset})`);
+  }
 
   // Extensions: a 4-byte signature and a 4-byte size, then the data, up to the checksum
   const extensions: string[] = [];
@@ -328,6 +386,11 @@ function parseEntry(
   previousPath: string,
 ): StagingEntry {
   const startOffset = offset;
+  // the entry's fixed part (and its name, checked below) must end before the trailer
+  const end = data.length - CHECKSUM_SIZE;
+  if (offset + INFO_LEN > end) {
+    throw corruptIndex(`Index file corrupt: entry at ${offset} past the end of the entries`);
+  }
 
   // Timestamps (ctime, mtime - each 8 bytes: seconds + nanoseconds)
   const ctimeSeconds = view.getUint32(offset);
@@ -375,14 +438,19 @@ function parseEntry(
   let skipWorktree = false;
 
   if (hasExtended) {
+    if (offset + 2 > end) {
+      throw corruptIndex(`Index file corrupt: entry at ${startOffset} past the end of the entries`);
+    }
     const extFlags = view.getUint16(offset) << 16;
     offset += 2;
     intentToAdd = (extFlags & INTENT_TO_ADD) !== 0;
     skipWorktree = (extFlags & SKIP_WORKTREE) !== 0;
 
-    // Check for unsupported extended flags
+    // Check for unsupported extended flags (create_from_disk's death)
     if ((extFlags & ~EXTENDED_FLAGS) !== 0) {
-      throw new Error(`Unrecognized extended flags: ${extFlags.toString(16)}`);
+      throw new IndexCorruptError(`Unrecognized extended flags: ${extFlags.toString(16)}`, [
+        `fatal: unknown index entry format 0x${(extFlags >>> 0).toString(16).padStart(8, "0")}`,
+      ]);
     }
   }
 
@@ -392,19 +460,20 @@ function parseEntry(
   if (version === INDEX_VERSION_4) {
     // Version 4: path compression
     // Read varint for bytes to remove from previous path
-    const { value: toRemove, bytesRead } = readVarint(data, offset);
+    const { value: toRemove, bytesRead } = readVarint(data, offset, end);
     offset += bytesRead;
 
     // Read null-terminated path suffix
-    const { bytes: suffix, nextOffset: pathEnd } = readNullTerminated(data, offset);
+    const { bytes: suffix, nextOffset: pathEnd } = readNullTerminated(data, offset, end);
     offset = pathEnd;
 
     // Reconstruct path: prefix from previous + suffix (counted in bytes)
     const previous = encodeGitPath(previousPath);
     const prefixLen = previous.length - toRemove;
     if (prefixLen < 0) {
-      throw new Error(
+      throw new IndexCorruptError(
         `Invalid path compression: removing ${toRemove} from ${previous.length} bytes`,
+        [`fatal: malformed name field in the index, near path '${previousPath}'`],
       );
     }
     const whole = new Uint8Array(prefixLen + suffix.length);
@@ -413,28 +482,25 @@ function parseEntry(
     path = decodeGitPath(whole);
     parsedPathChecked = false;
   } else {
-    // Version 2/3: uncompressed path
+    // Version 2/3: uncompressed path, its length from the flags (CE_NAMEMASK) unless 0xfff
+    let length = nameLength;
     if (nameLength === NAME_MASK) {
-      // Long path (>= 0xfff bytes)
-      const { value: pathStr, nextOffset: pathEnd } = readNullTerminated(data, offset);
+      // Long path (>= 0xfff bytes): up to its NUL (create_from_disk's strlen)
+      const { value: pathStr, nextOffset: pathEnd } = readNullTerminated(data, offset, end);
       path = pathStr;
       parsedPathChecked = false;
-      offset = pathEnd;
+      length = pathEnd - 1 - offset;
     } else {
       // Short path
-      path = pathAt(data, offset, nameLength);
-      offset += nameLength;
-
-      // Skip null terminator
-      if (data[offset] === 0) {
-        offset++;
+      if (offset + nameLength > end) {
+        throw corruptIndex(`Index file corrupt: name of entry at ${startOffset} past the end`);
       }
+      path = pathAt(data, offset, nameLength);
     }
 
-    // Padding to 8-byte boundary (version 2/3 only)
-    const entryLen = offset - startOffset;
-    const alignedLen = (entryLen + 7) & ~7;
-    offset = startOffset + alignedLen;
+    // The entry's size as git works it out (ondisk_ce_size): the name and one NUL, padded to
+    // 8 bytes, whatever the byte after the name holds
+    offset = startOffset + ((offset - startOffset + length + 8) & ~7);
   }
 
   // Paths are validated by the caller, once the extensions are known
@@ -520,20 +586,29 @@ export async function encodeIndexFileBytes(
   entries: readonly StagingEntry[],
   version: IndexVersion = INDEX_VERSION_2,
   extensions: readonly IndexExtension[] = [],
-  options: { source?: IndexEncoding; sparseDirectories?: boolean } = {},
+  options: {
+    source?: IndexEncoding;
+    sparseDirectories?: boolean;
+    /**
+     * Write a null trailer instead of the SHA-1 (`index.skipHash`, implied by
+     * `feature.manyFiles`: do_write_index's `skip_hash`); the checksum returned is that null one
+     */
+    skipHash?: boolean;
+  } = {},
 ): Promise<{ bytes: Uint8Array; checksum: Uint8Array; encoding?: IndexEncoding }> {
   const written = writtenVersion(entries, version);
   const sparse = options.sparseDirectories === true;
   const sortedEntries = checkedSorted(entries, extensions, written === INDEX_VERSION_4, sparse);
   if (written === INDEX_VERSION_4) {
     const bytes = concatBytes([...encodeSorted(sortedEntries, written, extensions)]);
-    return { bytes, checksum: bytes.subarray(bytes.length - 20) };
+    if (options.skipHash) bytes.fill(0, bytes.length - CHECKSUM_SIZE);
+    return { bytes, checksum: bytes.subarray(bytes.length - CHECKSUM_SIZE) };
   }
   const source = options.source?.version === written ? options.source : undefined;
   const offsets = new Int32Array(sortedEntries.length + 1);
   const { out, size } = encodeFlat(sortedEntries, written, extensions, 20, source, offsets, sparse);
-  const checksum = await sha1(out.subarray(0, size));
-  out.set(checksum, size);
+  // (a null trailer: `out` is zeroed past `size`)
+  if (!options.skipHash) out.set(await sha1(out.subarray(0, size)), size);
   // the entries' records point into `out` (a later encode copies their bytes from there):
   // the caller gets a copy, so changing it cannot slip into a later index under a valid
   // checksum
@@ -1043,19 +1118,29 @@ function writeEntryHeader(
 /**
  * Read a varint from data.
  */
-function readVarint(data: Uint8Array, offset: number): { value: number; bytesRead: number } {
+function readVarint(
+  data: Uint8Array,
+  offset: number,
+  end: number = data.length,
+): { value: number; bytesRead: number } {
   let value = 0;
   let bytesRead = 0;
 
-  let b = data[offset + bytesRead];
-  bytesRead++;
+  const next = (): number => {
+    if (offset + bytesRead >= end) {
+      throw corruptIndex(`Index file corrupt: name field at ${offset} past the end`);
+    }
+    return data[offset + bytesRead++] as number;
+  };
+  let b = next();
   value = b & 0x7f;
 
   while ((b & 0x80) !== 0) {
     value++;
-    b = data[offset + bytesRead];
-    bytesRead++;
-    value = (value << 7) | (b & 0x7f);
+    b = next();
+    // (a number no name could be stripped by: refused by the caller)
+    value = value * 128 + (b & 0x7f);
+    if (value > 0x7fffffff) value = 0x7fffffff;
   }
 
   return { value, bytesRead };
@@ -1088,10 +1173,11 @@ function encodeVarint(value: number): Uint8Array {
 function readNullTerminated(
   data: Uint8Array,
   offset: number,
+  limit: number = data.length,
 ): { value: string; bytes: Uint8Array; nextOffset: number } {
-  let end = offset;
-  while (end < data.length && data[end] !== 0) {
-    end++;
+  const end = data.subarray(0, limit).indexOf(0, offset);
+  if (end < 0) {
+    throw corruptIndex(`Index file corrupt: unterminated name at ${offset}`);
   }
 
   const bytes = data.subarray(offset, end);
@@ -1227,11 +1313,14 @@ export interface OrderedIndexItem {
  * ```typescript
  * const { bytes } = await encodeIndexInOrder([{ entry, path: "" }], 2, [link]);
  * ```
+ *
+ * `skipHash` writes a null trailer (`index.skipHash`).
  */
 export async function encodeIndexInOrder(
   items: readonly OrderedIndexItem[],
   version: IndexVersion,
   extensions: readonly IndexExtension[],
+  options: { skipHash?: boolean } = {},
 ): Promise<{ bytes: Uint8Array; checksum: Uint8Array }> {
   const written = writtenVersion(
     items.map((i) => i.entry),
@@ -1277,10 +1366,9 @@ export async function encodeIndexInOrder(
     parts.push(head, ext.data);
   }
   const body = concatBytes(parts);
-  const checksum = await sha1(body);
   const bytes = new Uint8Array(body.length + CHECKSUM_SIZE);
   bytes.set(body);
-  bytes.set(checksum, body.length);
+  if (!options.skipHash) bytes.set(await sha1(body), body.length);
   return { bytes, checksum: bytes.subarray(body.length) };
 }
 

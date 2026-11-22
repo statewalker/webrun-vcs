@@ -75,15 +75,31 @@ export async function indexSettingsOf(
     const v = parseGitBool(split);
     if (v !== undefined) settings.splitIndex = v;
   }
+  // repo-settings.c: feature.manyFiles implies index.skipHash, which overrides it
+  const manyFiles = configValueOf(config, "feature.manyFiles");
+  const manyFilesOn = manyFiles === undefined ? false : (parseGitBool(manyFiles) ?? false);
+  const skipHash = configValueOf(config, "index.skipHash");
+  if (skipHash === undefined ? manyFilesOn : (parseGitBool(skipHash) ?? manyFilesOn)) {
+    settings.skipHash = true;
+  }
   const max = configValueOf(config, "splitIndex.maxPercentChange");
   if (max !== undefined && /^\s*-?\d+\s*$/.test(max)) {
     const n = Number.parseInt(max, 10);
     if (n >= 0 && n <= 100) settings.maxPercentChange = n;
   }
-  settings.sharedIndexExpireBefore = sharedIndexExpireDate(
-    configValueOf(config, "splitIndex.sharedIndexExpire"),
-    Math.floor(Date.now() / 1000),
-  );
+  // worked out when a write expires shared indexes (a split index only): approxidate's first
+  // run costs a command's start milliseconds; the time is the settings' own
+  const now = Math.floor(Date.now() / 1000);
+  const expireValue = configValueOf(config, "splitIndex.sharedIndexExpire");
+  let expireBefore: number | undefined;
+  Object.defineProperty(settings, "sharedIndexExpireBefore", {
+    get: () => {
+      expireBefore ??= sharedIndexExpireDate(expireValue, now);
+      return expireBefore;
+    },
+    enumerable: true,
+    configurable: true,
+  });
   try {
     settings.sharedRepository = parseSharedRepository(
       configValueOf(config, "core.sharedRepository"),

@@ -9,6 +9,7 @@ import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 import {
   basicStatMatches,
+  IndexPathLookup,
   type StagingEntry,
   type Worktree,
   type WorktreeEntry,
@@ -134,6 +135,13 @@ export async function worktreeModified(
  * lose by replacing it: an untracked file or link that is not ignored, or a nested
  * repository (a directory with a `.git` that is not a tracked submodule), the directory
  * itself being one included. `tracked` tells the paths the index keeps track of there.
+ *
+ * `caseVariants` is `core.ignorecase`: git's `read_directory` asks the index through name
+ * hashes that fold ASCII case (`index_file_exists` with icase), so a file the index has
+ * only in another case is no untracked file, and goes with the directory. Such files are
+ * collected in `caseVariants.found` (complete when the answer is false); a nested
+ * repository is still asked exactly (git would take it as a case variant of a tracked
+ * submodule and remove it; ours keeps it and refuses).
  */
 export async function untrackedUnder(
   worktree: Worktree,
@@ -141,6 +149,7 @@ export async function untrackedUnder(
   tracked: (path: string) => boolean,
   /** Ignored files count too (git's `verify_clean_subdirectory` without `o->internal.dir`) */
   includeIgnored = false,
+  caseVariants?: { index: IndexPathLookup; found: string[] },
 ): Promise<boolean> {
   if (!tracked(dir) && (await isNestedRepository(worktree, dir))) return true;
   for await (const inside of worktree.walk({
@@ -153,7 +162,12 @@ export async function untrackedUnder(
       if (inside.mode === FileMode.GITLINK && !tracked(inside.path)) return true;
       continue;
     }
-    if (!tracked(inside.path)) return true;
+    if (tracked(inside.path)) continue;
+    if (caseVariants?.index.has(inside.path)) {
+      caseVariants.found.push(inside.path);
+      continue;
+    }
+    return true;
   }
   return false;
 }
@@ -173,6 +187,14 @@ export interface InTheWay {
    * operation does not remove (never replaced behind the index's back)
    */
   lostDirs: string[];
+  /**
+   * Under `core.ignorecase`: untracked files in a directory a written file replaces that the
+   * index has in another case. git's `verify_clean_subdirectory` takes them as tracked and
+   * its checkout removes them with the directory. Collected only with
+   * `caseVariantsExpendable` (else they are in the way, as before); the operation removes
+   * them before its writes, the directory then holding nothing it would lose.
+   */
+  caseVariants?: string[];
 }
 
 /**
@@ -194,23 +216,31 @@ export async function findInTheWay(
     ignoreCase?: boolean;
     /** Whether the worktree folds case ({@link Worktree.foldsCase}); undefined: unknown */
     foldsCase?: boolean;
+    /**
+     * With `ignoreCase`: case variants of index paths in a directory a file replaces are no
+     * untracked files (`verify_clean_subdirectory`'s read_directory) but `caseVariants`,
+     * which the caller removes before it writes (checkout). Without it they are in the way.
+     */
+    caseVariantsExpendable?: boolean;
   },
 ): Promise<InTheWay> {
   const { writes, removes, index } = options;
   const untracked = new Set<string>();
   const lostDirs: string[] = [];
+  const caseVariants: string[] = [];
+  let folded: IndexPathLookup | undefined;
   // the index by folded path (git's index_file_exists with icase: memihash and strncasecmp
   // fold ASCII letters only), built only when needed
-  let folded: Map<string, unknown> | undefined;
+  let foldedEntries: Map<string, unknown> | undefined;
   const otherCase = (path: string): CheckedEntry | undefined => {
-    if (!folded) {
-      folded = new Map();
+    if (!foldedEntries) {
+      foldedEntries = new Map();
       for (const [p, e] of index) {
         const key = foldAsciiCase(p);
-        if (!folded.has(key)) folded.set(key, e);
+        if (!foldedEntries.has(key)) foldedEntries.set(key, e);
       }
     }
-    const entry = folded.get(foldAsciiCase(path)) as CheckedEntry | undefined;
+    const entry = foldedEntries.get(foldAsciiCase(path)) as CheckedEntry | undefined;
     return typeof entry?.mode === "number" ? entry : undefined;
   };
   const icaseExists = async (path: string, current: WorktreeEntry): Promise<boolean> => {
@@ -257,15 +287,27 @@ export async function findInTheWay(
     const entry = await worktree.getEntry(path);
     if (!entry) continue;
     if (entry.isDirectory) {
-      // untracked files and nested repositories there would be lost (git refuses)
+      // untracked files and nested repositories there would be lost (git refuses); under
+      // core.ignorecase the source index is asked folding case (read_directory's
+      // index_file_exists): a case variant of a tracked file there goes with the directory
       const keeps = (p: string) => tracked(p) || removes.has(p);
-      if (await untrackedUnder(worktree, path, keeps)) lostDirs.push(path);
+      folded ??=
+        options.ignoreCase && options.caseVariantsExpendable
+          ? new IndexPathLookup([...index.keys()], { ignoreCase: true })
+          : undefined;
+      const variants = folded ? { index: folded, found: [] as string[] } : undefined;
+      if (await untrackedUnder(worktree, path, keeps, false, variants)) lostDirs.push(path);
+      else if (variants) caseVariants.push(...variants.found);
       continue;
     }
     if (await icaseExists(path, entry)) continue;
     if (!(await worktree.isIgnored(path))) untracked.add(path);
   }
-  return { untracked: [...untracked], lostDirs };
+  return {
+    untracked: [...untracked],
+    lostDirs,
+    ...(options.caseVariantsExpendable ? { caseVariants } : {}),
+  };
 }
 
 /**

@@ -113,9 +113,14 @@ export function filesStagingStore(
     files;
   // Temporary names: `tmp_obj_`, a random part per store (renewed on a collision) and a
   // counter, as unique as git's mkstemp names without asking for random bytes per object.
-  let tmpBase = `${TMP_PREFIX}${randomPart(8)}`;
+  // Drawn at the first write: a store opened only to read never asks for random bytes (the
+  // first `getRandomValues` loads the runtime's crypto, milliseconds of a command's start).
+  let tmpBase: string | undefined;
   let tmpSeq = 0;
-  const tmpName = () => `${tmpBase}${(tmpSeq++).toString(36)}`;
+  const tmpName = () => {
+    tmpBase ??= `${TMP_PREFIX}${randomPart(8)}`;
+    return `${tmpBase}${(tmpSeq++).toString(36)}`;
+  };
   const pathOf = (id: string) => joinPath(objectsDir, id.slice(0, 2), id.slice(2));
   const isFile = async (path: string) => (await io.stats(path))?.kind === "file";
   /** "absent", "fresh" (young or of unknown age) or "stale" (older than the freshen window) */

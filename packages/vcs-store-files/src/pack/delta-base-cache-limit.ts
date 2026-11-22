@@ -10,6 +10,7 @@ import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import {
   configFilesApiOf,
   createWorkingCopyConfig,
+  type GitWorkingCopyConfig,
 } from "../workspace/working-copy/working-copy-config.files.js";
 
 /**
@@ -44,19 +45,26 @@ export async function readDeltaBaseCacheLimit(
 export async function readPackSetSettings(
   files: FilesApi,
   gitDir = ".git",
-  options: { includes?: boolean | "files"; environment?: GitHostEnvironment } = {},
+  options: {
+    includes?: boolean | "files";
+    environment?: GitHostEnvironment;
+    /** The config already loaded for these options: read instead of loading it again */
+    config?: Pick<GitWorkingCopyConfig, "get">;
+  } = {},
 ): Promise<{ baseCacheBytes?: number; multiPackIndex: boolean }> {
-  const config = await createWorkingCopyConfig(
-    configFilesApiOf(files, {
-      readOnly: "reading the pack settings never writes the config",
-    }),
-    gitDir,
-    undefined,
-    {
-      ...(options.includes === undefined ? {} : { includes: options.includes }),
-      ...(options.environment ? { environment: options.environment } : {}),
-    },
-  );
+  const config =
+    options.config ??
+    (await createWorkingCopyConfig(
+      configFilesApiOf(files, {
+        readOnly: "reading the pack settings never writes the config",
+      }),
+      gitDir,
+      undefined,
+      {
+        ...(options.includes === undefined ? {} : { includes: options.includes }),
+        ...(options.environment ? { environment: options.environment } : {}),
+      },
+    ));
   const midx = config.get("core.multiPackIndex");
   const multiPackIndex =
     midx === undefined || midx === null

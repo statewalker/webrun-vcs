@@ -17,6 +17,7 @@ import {
   INDEX_VERSION_2,
   INDEX_VERSION_3,
   INDEX_VERSION_4,
+  IndexCorruptError,
   type IndexVersion,
   parseIndexFile,
   serializeIndexFile,
@@ -826,5 +827,187 @@ describe("parseIndexFile: paths checked as their bytes are read", () => {
     ];
     const parsed = await parseIndexFile(await indexWithPaths(good));
     expect(parsed.entries.map((e) => e.path).sort()).toEqual([...good].sort());
+  });
+});
+
+// read-cache.c verify_hdr: the trailer is hashed only with verify_index_checksum (fsck), and
+// never when it is null (index.skipHash)
+describe("parseIndexFile: the trailing checksum, as git checks it", () => {
+  it("takes a wrong trailer as it is when not asked to verify", async () => {
+    const data = await createMinimalIndex();
+    data[data.length - 1] ^= 0xff;
+    const parsed = await parseIndexFile(data, { verifyChecksum: false });
+    expect(parsed.entries).toHaveLength(0);
+  });
+
+  it("accepts a null trailer (index.skipHash) even when verifying", async () => {
+    const data = await createMinimalIndex();
+    data.fill(0, data.length - 20);
+    const parsed = await parseIndexFile(data, { verifyChecksum: true });
+    expect(parsed.entries).toHaveLength(0);
+  });
+});
+
+// read-cache.c reads entries from the mapping without bounds checks; a file whose bytes no
+// longer match its trailer is read as it is (no hash outside fsck), so ours checks every
+// length and offset and refuses corrupt input with IndexCorruptError
+describe("parseIndexFile: corrupt input", () => {
+  const entry = (path: string, i: number, extra: Partial<StagingEntry> = {}): StagingEntry => ({
+    path,
+    mode: 0o100644,
+    objectId: (i + 1).toString(16).padStart(40, "0"),
+    stage: 0,
+    size: i,
+    mtime: 1_700_000_000_000,
+    ...extra,
+  });
+  const sample = (version: IndexVersion) =>
+    encodeIndexFileBytes(
+      [entry("a", 0), entry("dir/b.txt", 1, { skipWorktree: true }), entry("dir/c", 2)],
+      version,
+      [{ signature: "ZZZZ", data: new Uint8Array([1, 2, 3]) }],
+    ).then((r) => r.bytes);
+
+  it("reports a wrong trailer with git's lines when verifying", async () => {
+    const data = (await sample(INDEX_VERSION_2)).slice();
+    data[data.length - 1] ^= 1;
+    const error = await parseIndexFile(data, { verifyChecksum: true }).catch((e) => e);
+    expect(error).toBeInstanceOf(IndexCorruptError);
+    expect(error.lines).toEqual([
+      "error: bad index file sha1 signature",
+      "fatal: index file corrupt",
+    ]);
+    expect(error.exitCode).toBe(128);
+  });
+
+  it("reports a bad signature and version as verify_hdr does", async () => {
+    const data = (await sample(INDEX_VERSION_2)).slice();
+    data[0] = 0x58; // "XIRC", printed as the little-endian host reads it
+    const bad = await parseIndexFile(data, { verifyChecksum: false }).catch((e) => e);
+    expect(bad.lines).toEqual(["error: bad signature 0x43524958", "fatal: index file corrupt"]);
+    const version = (await sample(INDEX_VERSION_2)).slice();
+    version[7] = 9;
+    const v = await parseIndexFile(version, { verifyChecksum: false }).catch((e) => e);
+    expect(v.lines).toEqual(["error: bad index version 9", "fatal: index file corrupt"]);
+  });
+
+  it("refuses every truncation of versions 2, 3 and 4 with an error, never a crash", async () => {
+    for (const version of [INDEX_VERSION_2, INDEX_VERSION_3, INDEX_VERSION_4] as const) {
+      const data = await sample(version);
+      // dropping bytes before the trailer: the entries or extensions run into the trailer
+      for (let cut = 1; cut < data.length - 12; cut++) {
+        const truncated = data.slice(0, data.length - cut);
+        let parsed: Awaited<ReturnType<typeof parseIndexFile>> | undefined;
+        try {
+          parsed = await parseIndexFile(truncated, { verifyChecksum: false });
+        } catch (error) {
+          expect(error).toBeInstanceOf(Error);
+          expect((error as Error).message).not.toMatch(
+            /offset is outside|out of bounds|Invalid array/i,
+          );
+        }
+        // what parsed lies in the file: every entry's path is one of the paths written
+        for (const e of parsed?.entries ?? [])
+          expect(["a", "dir/b.txt", "dir/c"]).toContain(e.path);
+      }
+    }
+  });
+
+  it("refuses a huge entry count before allocating anything", async () => {
+    const data = (await sample(INDEX_VERSION_2)).slice();
+    new DataView(data.buffer).setUint32(8, 0xffffffff);
+    await expect(parseIndexFile(data, { verifyChecksum: false })).rejects.toBeInstanceOf(
+      IndexCorruptError,
+    );
+    new DataView(data.buffer).setUint32(8, 4);
+    await expect(parseIndexFile(data, { verifyChecksum: false })).rejects.toBeInstanceOf(
+      IndexCorruptError,
+    );
+  });
+
+  it("stops at an extension whose size runs past the trailer", async () => {
+    const data = (await sample(INDEX_VERSION_2)).slice();
+    const at = data.length - 20 - 3 - 8;
+    expect(new TextDecoder().decode(data.subarray(at, at + 4))).toBe("ZZZZ");
+    new DataView(data.buffer).setUint32(at + 4, 0x7fffffff);
+    const parsed = await parseIndexFile(data, { verifyChecksum: false });
+    expect(parsed.entries).toHaveLength(3);
+    expect(parsed.extensions).toEqual([]);
+  });
+
+  it("refuses names past the end: a flags length, a long name without NUL, a v4 varint", async () => {
+    const v2 = (await encodeIndexFileBytes([entry("a", 0)], INDEX_VERSION_2)).bytes.slice();
+    const flags = new DataView(v2.buffer);
+    flags.setUint16(12 + 60, 0x0ff0); // a name of 4080 bytes in a 104-byte file
+    await expect(parseIndexFile(v2, { verifyChecksum: false })).rejects.toBeInstanceOf(
+      IndexCorruptError,
+    );
+    flags.setUint16(12 + 60, 0x0fff); // CE_NAMEMASK: up to a NUL, which never comes
+    v2.fill(0x61, 12 + 62, v2.length - 20);
+    await expect(parseIndexFile(v2, { verifyChecksum: false })).rejects.toBeInstanceOf(
+      IndexCorruptError,
+    );
+    const v4 = (await encodeIndexFileBytes([entry("a", 0)], INDEX_VERSION_4)).bytes.slice();
+    v4.fill(0xff, 12 + 62, v4.length - 20); // a varint that never ends
+    await expect(parseIndexFile(v4, { verifyChecksum: false })).rejects.toBeInstanceOf(
+      IndexCorruptError,
+    );
+    // a strip longer than the previous name: create_from_disk's death
+    const two = (
+      await encodeIndexFileBytes([entry("a", 0), entry("b", 1)], INDEX_VERSION_4)
+    ).bytes.slice();
+    two[12 + 62 + 3 + 62] = 5;
+    const error = await parseIndexFile(two, { verifyChecksum: false }).catch((e) => e);
+    expect(error.lines).toEqual(["fatal: malformed name field in the index, near path 'a'"]);
+  });
+
+  it("sizes a version 2 entry as git does whatever the byte after its name holds", async () => {
+    // "ab": 62 + 2 bytes, then the NUL and padding to 72; a garbage NUL keeps the entry size
+    const bytes = (
+      await encodeIndexFileBytes([entry("ab", 0), entry("c", 1)], INDEX_VERSION_2)
+    ).bytes.slice();
+    expect(bytes[12 + 64]).toBe(0);
+    bytes[12 + 64] = 0x55;
+    const parsed = await parseIndexFile(bytes, { verifyChecksum: false });
+    expect(parsed.entries.map((e) => e.path)).toEqual(["ab", "c"]);
+  });
+
+  it("random byte flips never crash the parser", async () => {
+    let seed = 12345;
+    const random = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed;
+    };
+    for (const version of [INDEX_VERSION_2, INDEX_VERSION_3, INDEX_VERSION_4] as const) {
+      const data = await sample(version);
+      for (let round = 0; round < 300; round++) {
+        const copy = data.slice();
+        for (let k = 0; k < 3; k++) copy[12 + (random() % (copy.length - 32))] = random() & 0xff;
+        await parseIndexFile(copy, { verifyChecksum: false }).catch((error: unknown) => {
+          expect(error).toBeInstanceOf(Error);
+          expect((error as Error).message).not.toMatch(/outside the bounds|Invalid array/i);
+        });
+      }
+    }
+  });
+});
+
+describe("encodeIndexFileBytes: index.skipHash", () => {
+  it("writes a null trailer, versions 2 and 4 alike, the rest unchanged", async () => {
+    const entries: StagingEntry[] = [
+      { path: "a", mode: 0o100644, objectId: "1".repeat(40), stage: 0, size: 1, mtime: 0 },
+    ];
+    for (const version of [INDEX_VERSION_2, INDEX_VERSION_4] as const) {
+      const hashed = await encodeIndexFileBytes(entries, version);
+      const skipped = await encodeIndexFileBytes(entries, version, [], { skipHash: true });
+      expect(skipped.bytes.length).toBe(hashed.bytes.length);
+      expect(skipped.bytes.subarray(-20).every((b) => b === 0)).toBe(true);
+      expect(skipped.checksum.every((b) => b === 0)).toBe(true);
+      expect(
+        Buffer.from(skipped.bytes.subarray(0, -20)).equals(
+          Buffer.from(hashed.bytes.subarray(0, -20)),
+        ),
+      ).toBe(true);
+    }
   });
 });

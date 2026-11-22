@@ -609,4 +609,93 @@ describeGit("split index and sparse index together, against native git", () => {
     expect(parsed.extensions).not.toContain("sdir");
     expect(git(dir, ["status", "--porcelain"])).toBe("M  f1.txt");
   });
+
+  // read-cache.c do_write_index: `index.skipHash` (default `feature.manyFiles`, repo-settings.c,
+  // both versions) writes 20 zero bytes where the trailer goes
+  it("index.skipHash and feature.manyFiles write a null trailer, as git", async () => {
+    const zero = (bytes: Buffer | undefined) => bytes?.subarray(-20).every((b) => b === 0) === true;
+    for (const config of [
+      ["index.skipHash", "true"],
+      ["feature.manyFiles", "true"],
+    ]) {
+      const dir = repo();
+      git(dir, ["config", ...(config as [string, string])]);
+      // (manyFiles' core.untrackedCache=write makes git's add write an untracked cache too)
+      git(dir, ["config", "core.untrackedCache", "false"]);
+      put(dir, "f3.txt", "three\n");
+      const added = await twins(
+        dir,
+        () => git(dir, ["add", "f3.txt"]),
+        (g) => g.add().addFilepattern("f3.txt").call(),
+      );
+      // the index read was version 2, which git keeps (manyFiles' version 4 is for new ones)
+      expectSame(added);
+      expect(zero(added.ours.get("index"))).toBe(true);
+      const committed = await twins(
+        dir,
+        () => git(dir, ["commit", "-q", "-m", "second"]),
+        (g) => g.commit().setMessage("second\n").call(),
+      );
+      expectSame(committed);
+      expect(zero(committed.ours.get("index"))).toBe(true);
+      // ours reads its own null-trailer index again, and so does git (fsck included)
+      put(dir, "f4.txt", "four\n");
+      const status = await (await ours(dir)).status().call();
+      expect([...status.modified]).toEqual(["f4.txt"]);
+      expect(git(dir, ["status", "--porcelain"])).toBe(" M f4.txt");
+      git(dir, ["fsck"]);
+    }
+    // index.skipHash=false overrides feature.manyFiles
+    const dir = repo();
+    git(dir, ["config", "feature.manyFiles", "true"]);
+    git(dir, ["config", "index.skipHash", "false"]);
+    git(dir, ["config", "core.untrackedCache", "false"]);
+    put(dir, "f3.txt", "three\n");
+    const added = await twins(
+      dir,
+      () => git(dir, ["add", "f3.txt"]),
+      (g) => g.add().addFilepattern("f3.txt").call(),
+    );
+    expectSame(added);
+    expect(zero(added.ours.get("index"))).toBe(false);
+  });
+
+  it("a null-trailer index changed by native git is read again by a staging", async () => {
+    const dir = repo();
+    git(dir, ["config", "index.skipHash", "true"]);
+    const g = await ours(dir);
+    await g.status().call();
+    put(dir, "f2.txt", "two\n");
+    // git's write keeps a null trailer: the staging tells the files apart by their content
+    git(dir, ["add", "f2.txt"]);
+    put(dir, "f7.txt", "seven\n");
+    await g.add().addFilepattern("f7.txt").call();
+    expect(git(dir, ["status", "--porcelain"]).split("\n").sort()).toEqual([
+      "M  f2.txt",
+      "M  f7.txt",
+    ]);
+  });
+
+  // git with core.splitIndex and index.skipHash names its shared index sharedindex.000... and
+  // its link names no shared index, so the entries are lost (both versions); ours hashes the
+  // shared index (its name and the link's id) and writes the split file's trailer null
+  it("a split index under index.skipHash: a null trailer, a hashed shared index", async () => {
+    const dir = repo();
+    git(dir, ["config", "core.splitIndex", "true"]);
+    git(dir, ["config", "index.skipHash", "true"]);
+    await (await ours(dir)).status().call();
+    const files = indexFiles(dir);
+    const shared = [...files.keys()].filter((n) => n.startsWith("sharedindex."));
+    expect(shared).toHaveLength(1);
+    expect(shared[0]).not.toBe(`sharedindex.${"0".repeat(40)}`);
+    expect(
+      files
+        .get("index")
+        ?.subarray(-20)
+        .every((b) => b === 0),
+    ).toBe(true);
+    expect(git(dir, ["ls-files"]).split("\n")).toHaveLength(12);
+    expect(git(dir, ["status", "--porcelain"])).toBe("");
+    git(dir, ["fsck"]);
+  });
 });

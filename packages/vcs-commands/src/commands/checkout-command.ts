@@ -1205,6 +1205,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     const untracked: string[] = [];
     const untrackedRemoved: string[] = [];
     const lostDirs: string[] = [];
+    /** Case variants of index paths in directories files replace (see findInTheWay) */
+    const caseVariants: string[] = [];
     const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
     const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
     const initial = unborn && !keepAll;
@@ -1262,9 +1264,11 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         removes: new Set(switched.filter((p) => !target.has(p))),
         index,
         ...(await restoreCaseOptions(worktree, ignoreCase)),
+        caseVariantsExpendable: true,
       });
       untracked.push(...found.untracked);
       lostDirs.push(...found.lostDirs);
+      caseVariants.push(...(found.caseVariants ?? []));
     }
     // a reset that protects untracked files (switch --discard-changes): unpack-trees'
     // own messages, one line per path
@@ -1274,7 +1278,9 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         removes: new Set(switched.filter((p) => !target.has(p))),
         index,
         ...(await restoreCaseOptions(worktree, ignoreCase)),
+        caseVariantsExpendable: true,
       });
+      caseVariants.push(...(found.caseVariants ?? []));
       const lines = [
         ...found.untracked.map((p) => ({
           p,
@@ -1393,6 +1399,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         await worktree.remove(path);
         await pruneEmptyParents(worktree, path);
         removed.push(path);
+      }
+      // core.ignorecase: what verify_clean_subdirectory took as tracked in a directory a
+      // file replaces goes with the directory, as git's checkout_entry removes the subtree
+      for (const path of caseVariants) {
+        await worktree.remove(path);
+        await pruneEmptyParents(worktree, path);
       }
       // a forced checkout also drops tracked files no tree holds any more
       if (this.force) {
