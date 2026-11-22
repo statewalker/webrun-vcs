@@ -119,6 +119,8 @@ const SLICE = 1024; // inflater input per push: one push yields at most ~1 MiB
  * stream is in the chunk at hand; the others, and those that fail there, are streamed.
  */
 const WHOLE_INFLATE_MAX = 1 << 20;
+/** The largest compressed extent a re-read collects before inflating in one pass. */
+const WHOLE_EXTENT_MAX = 1 << 16;
 
 /** A buffer reused for data only read while it is inflated (hashed, never kept). */
 class Scratch {
@@ -656,9 +658,11 @@ async function loadEntry(
   let done = false;
   try {
     let source: AsyncIterable<Uint8Array> | Iterable<Uint8Array> = read(dataStart, end - dataStart);
-    if (size <= WHOLE_INFLATE_MAX) {
+    if (size <= WHOLE_INFLATE_MAX && end - dataStart <= WHOLE_EXTENT_MAX) {
       // the extent at once: inflated in one pass when it comes as one chunk and inflates to
-      // exactly its size; else streamed from the chunks read (errors reported as always)
+      // exactly its size; else streamed from the chunks read (errors reported as always). The
+      // compressed extent is bounded too: a small object padded with empty deflate blocks can
+      // span far more than it inflates to, and such an extent keeps streaming as before
       const chunks: Uint8Array[] = [];
       for await (const c of source) chunks.push(c);
       if (chunks.length === 1) {

@@ -45,6 +45,11 @@ export async function objectHeader(
  * Whether the stored object `id` has `type`: false if it is absent or of another type. An
  * object that is stored but whose header cannot be read throws `CorruptObjectError` instead
  * of reading as absent, so a reachability walk (gc) never skips what lies behind it.
+ *
+ * Like git's `oid_object_info`, a packed copy's type comes from its pack headers alone
+ * (`objectType`): the object's data is not inflated, so a copy whose data (or a delta base's)
+ * is corrupt still answers here. Corruption surfaces where content is read (`get`, fsck,
+ * checkout, the walk into trees), never as a missing object.
  */
 export async function hasObjectOfType(
   objects: GitObjects,
