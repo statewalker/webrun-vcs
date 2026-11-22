@@ -197,6 +197,8 @@ export interface PackFile extends Pack {
   idAt(i: number): ObjectId;
   /** The idx position of `id`, -1 when the pack does not hold it. */
   indexOf(id: ObjectId): number;
+  /** The pack offset of the entry at idx position `i`. */
+  offsetAt(i: number): number;
 }
 
 const TYPES: (ObjectTypeString | undefined)[] = [undefined, "commit", "tree", "blob", "tag"];
@@ -1743,6 +1745,7 @@ export async function openPack(
     verifyIndex: () => t.verify(),
     packOrder: () => permutation(),
     idAt: (i) => hex(t.idAt(i)),
+    offsetAt: (i) => t.offsetOf(i),
     indexOf(id) {
       try {
         return t.find(id);

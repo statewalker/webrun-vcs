@@ -8,6 +8,7 @@ import {
   graftFileBaseDir,
   graftFileReader,
   isSymbolicRef,
+  loadMultiPackIndex,
   objectsWithoutLazyFetch,
   openPack,
   type PackFile,
@@ -24,6 +25,7 @@ import {
   type Trees,
   verifyCommitGraph,
 } from "@statewalker/vcs-core";
+import { multiPackIndexVerify } from "@statewalker/vcs-store-files";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { readFile } from "@statewalker/vcs-utils/files";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
@@ -36,7 +38,6 @@ import {
   readIndexFileEntries,
   type Staging,
 } from "@statewalker/vcs-working-tree";
-
 import { GitCommand } from "../../git-command.js";
 import { RemoteConfigStore } from "../../remote-config/index.js";
 import { hostEnvironmentOf } from "../git-ident.js";
@@ -82,6 +83,8 @@ export const FSCK_ERROR_PACK = 0o4;
 export const FSCK_ERROR_REFS = 0o10;
 /** `git commit-graph verify` failed (git's ERROR_COMMIT_GRAPH). */
 export const FSCK_ERROR_COMMIT_GRAPH = 0o20;
+/** `git multi-pack-index verify` failed, in git 2.43 (its ERROR_MULTI_PACK_INDEX; 2.5x: object bit). */
+export const FSCK_ERROR_MULTI_PACK_INDEX_243 = 0o40;
 /** A bitmap file's checksum is wrong, in git 2.43 (its ERROR_BITMAP; 2.5x sets the object bit). */
 export const FSCK_ERROR_BITMAP_243 = 0o200;
 
@@ -106,7 +109,9 @@ export type FsckFindingKind =
   /** `notice: ...` and `bad sha1 file: ...` */
   | "notice"
   /** what `git commit-graph verify` prints (fsck runs it unless `core.commitGraph` is false) */
-  | "commit-graph";
+  | "commit-graph"
+  /** what `git multi-pack-index verify` prints (unless `core.multiPackIndex` is false) */
+  | "multi-pack-index";
 
 /** One line of output, as git prints it, with what it is about. */
 export interface FsckFinding {
@@ -268,8 +273,12 @@ function treeLineSound(data: Uint8Array): boolean {
  * reachable without being walked further, never reported missing, valid as ref and reflog
  * values; nothing is fetched lazily while fsck runs.
  *
+ * The multi-pack-index is verified as git runs `git multi-pack-index verify` for each source
+ * (unless `core.multiPackIndex` is false): 2.5x after the source's packs (object bit), 2.43 last
+ * (exit bit 040); a midx git refuses fatally on load ends fsck with status 128.
+ *
  * Not done: the ref database checks of `git refs verify` (git 2.45+),
- * multi-pack-index and reverse-index verification, the commit-graphs
+ * reverse-index verification, the commit-graphs
  * of alternates, `fsck.skipList`, and explicit `<object>` heads. The objects of alternates
  * (`history.objects.alternates`) are read and checked as git's default `--full` reads them
  * (their dangling objects listed too): 2.56 source by source, 2.43 every source's loose
@@ -482,6 +491,7 @@ export class FsckCommand extends GitCommand<FsckResult> {
             }
           : this.graftFileBase(),
       ),
+      multiPackIndex: configBool(this.workingCopy, "core.multiPackIndex", true),
       commitGraph: {
         enabled: configBool(this.workingCopy, "core.commitGraph", true),
         generationVersion:
@@ -554,6 +564,8 @@ interface RunOptions {
   graphCommitsKept: number;
   /** `core.commitGraph` and the graph read settings, for `git commit-graph verify` */
   commitGraph: { enabled: boolean; generationVersion: number; changedPathsVersion: number };
+  /** `core.multiPackIndex`: fsck runs `git multi-pack-index verify` for each source */
+  multiPackIndex?: boolean;
   /** The alternates' objects directories in `repository.files`, in git's order */
   alternateDirs?: readonly string[];
 }
@@ -705,6 +717,15 @@ class FsckRun {
   }
 
   async run(): Promise<FsckResult> {
+    // git loads the midx when it first reads a packed object and dies on one it refuses
+    // fatally (a wrong signature or version, a required chunk missing; 2.5x: a fan-out out of
+    // order too)
+    if (this.files && this.o.multiPackIndex !== false) {
+      const loaded = await loadMultiPackIndex(this.files, pathOf(this.looseDir(), "pack"), {
+        compatibility: this.o.compatibility,
+      });
+      if (loaded.fatal) return this.death(loaded.errors);
+    }
     this.graftFileExists = (await this.graftFileText()) !== undefined;
     this.graftsFile = this.graftFileExists && this.o.graftsAdvice;
     this.graftsHint = this.graftsFile;
@@ -746,7 +767,13 @@ class FsckRun {
             const packs = step.packs.map((k) => this.packs[k] as RepoPack);
             await this.fsckPacks(packs);
             // 2.5x's verify_bitmap_files, after the source's packs (2.43: at the end)
-            if (this.o.compatibility === "2.56" && (await this.verifyBitmapFiles(packs)))
+            if (
+              this.o.compatibility === "2.56" &&
+              (await this.verifyBitmapFiles(packs, step.dir ?? this.looseDir()))
+            )
+              this.errorsFound |= FSCK_ERROR_OBJECT;
+            // then 2.5x's verify_midx: `git multi-pack-index verify --object-dir <source>`
+            if (this.o.compatibility === "2.56" && (await this.verifyMultiPackIndex(step.dir)))
               this.errorsFound |= FSCK_ERROR_OBJECT;
           }
         }
@@ -795,6 +822,12 @@ class FsckRun {
         (await this.verifyBitmapFiles(this.packs))
       )
         this.errorsFound |= FSCK_ERROR_BITMAP_243;
+      // 2.43 runs `git multi-pack-index verify` for every source last (ERROR_MULTI_PACK_INDEX)
+      if (this.files && this.o.compatibility === "2.43") {
+        for (const dir of this.sourceDirs())
+          if (await this.verifyMultiPackIndex(dir))
+            this.errorsFound |= FSCK_ERROR_MULTI_PACK_INDEX_243;
+      }
     } finally {
       for (const pack of this.opened.values()) pack?.close();
     }
@@ -807,6 +840,42 @@ class FsckRun {
     const err = this.findings.filter((f) => f.stream === "stderr").map((f) => `${f.text}\n`);
     return {
       exitCode: this.errorsFound,
+      findings: this.findings,
+      output: out.join(""),
+      errorOutput: err.join(""),
+      statistics: {
+        objectsRead: this.objectsRead,
+        commitsFromGraph: this.graphParsed,
+        objectsScanned: this.objectsScanned,
+        linksKept: this.kidsLength + this.scanKidsLength,
+        graphCommitsKept: this.graphCommitsKept,
+      },
+    };
+  }
+
+  /**
+   * One `git multi-pack-index verify --object-dir <objectsDir>` child of fsck: its stderr
+   * follows; true when it failed. Nothing without `core.multiPackIndex` or a FilesApi.
+   */
+  private async verifyMultiPackIndex(objectsDir: string | undefined): Promise<boolean> {
+    if (!this.files || objectsDir === undefined || this.o.multiPackIndex === false) return false;
+    const result = await multiPackIndexVerify({
+      files: this.files,
+      objectsDir,
+      compatibility: this.o.compatibility,
+    });
+    for (const text of result.stderr)
+      this.emit({ kind: "multi-pack-index", stream: "stderr", text });
+    return result.exitCode !== 0;
+  }
+
+  /** A death with git's lines on stderr: exit 128. */
+  private death(lines: readonly string[]): FsckResult {
+    for (const text of lines) this.emit({ kind: "error", stream: "stderr", text });
+    const err = this.findings.filter((f) => f.stream === "stderr").map((f) => `${f.text}\n`);
+    const out = this.findings.filter((f) => f.stream === "stdout").map((f) => `${f.text}\n`);
+    return {
+      exitCode: 128,
       findings: this.findings,
       output: out.join(""),
       errorOutput: err.join(""),
@@ -1467,7 +1536,7 @@ class FsckRun {
    * pack. Each step names a source's loose objects (`loose`) or the packs to read (`packs`,
    * indexes into `this.packs`).
    */
-  private sourceSteps(): ({ loose: string } | { packs: number[] })[] {
+  private sourceSteps(): ({ loose: string } | { packs: number[]; dir?: string })[] {
     const dirs = this.sourceDirs();
     const all = this.packs.map((_, k) => k);
     if (this.o.compatibility === "2.43") {
@@ -1475,7 +1544,7 @@ class FsckRun {
     }
     return dirs.flatMap((loose, i) => [
       { loose },
-      { packs: all.filter((k) => (this.packs[k] as RepoPack).source === i) },
+      { packs: all.filter((k) => (this.packs[k] as RepoPack).source === i), dir: loose },
     ]);
   }
 
@@ -1982,11 +2051,23 @@ class FsckRun {
    * git's `verify_bitmap_files`: the trailing SHA-1 of each pack's `.bitmap` (a missing file
    * is fine). True if one is wrong.
    */
-  private async verifyBitmapFiles(packs: readonly RepoPack[]): Promise<boolean> {
+  private async verifyBitmapFiles(
+    packs: readonly RepoPack[],
+    objectsDir: string = this.looseDir(),
+  ): Promise<boolean> {
     const files = this.files as FilesApi;
     let bad = false;
-    for (const p of packs) {
-      const path = `${p.packPath.replace(/\.pack$/, "")}.bitmap`;
+    // the multi-pack-index's bitmap first (its name carries the midx checksum)
+    const paths: string[] = [];
+    if (this.o.multiPackIndex !== false) {
+      const loaded = await loadMultiPackIndex(files, pathOf(objectsDir, "pack"), {
+        compatibility: this.o.compatibility,
+      });
+      if (loaded.midx)
+        paths.push(pathOf(objectsDir, "pack", `multi-pack-index-${loaded.midx.checksum}.bitmap`));
+    }
+    for (const p of packs) paths.push(`${p.packPath.replace(/\.pack$/, "")}.bitmap`);
+    for (const path of paths) {
       const st = await files.stats(path).catch(() => undefined);
       if (st?.kind !== "file") continue;
       const size = st.size ?? 0;

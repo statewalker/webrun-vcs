@@ -31,7 +31,7 @@ import type { AtomicFiles } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { openObjectAlternates, withAlternates } from "./alternates/index.js";
 import { createFilesCommitGraphProvider } from "./commit-graph.js";
-import { readDeltaBaseCacheLimit, skipPacked, withPacks } from "./pack/index.js";
+import { readPackSetSettings, skipPacked, withPacks } from "./pack/index.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
 import { createFileRefStore, type FileRefStore, peelTag } from "./refs/index.js";
 import { repack } from "./repack.js";
@@ -207,11 +207,13 @@ export async function createGitFilesBackend(
     cacheDirectoryChecks: true,
   });
   const looseOnly = createGitObjects(staging);
+  // git's core.deltaBaseCacheLimit (96 MiB when unset) and core.multiPackIndex (default on)
+  const packSettings = await readPackSetSettings(files, gitDir, includes);
   const packs = await openPackSet(files, packDir, {
     externalBase: (id) => looseOnly.get(id),
     freshenMaxAgeMs,
-    // git's core.deltaBaseCacheLimit (96 MiB when unset)
-    baseCacheBytes: await readDeltaBaseCacheLimit(files, gitDir, includes),
+    baseCacheBytes: packSettings.baseCacheBytes,
+    multiPackIndex: packSettings.multiPackIndex,
   });
   // the alternates (git's other odb sources): read after the repository's own objects, never
   // written; an object one holds is not written here (odb_freshen_object)

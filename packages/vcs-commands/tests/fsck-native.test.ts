@@ -1596,4 +1596,80 @@ describeGit("fsck against native git", () => {
     expect(oursOnly.errorOutput).toBe(theirsOnly.stderr);
     expect(oursOnly.exitCode).toBe(theirsOnly.status);
   });
+  it("verifies the multi-pack-index (git multi-pack-index verify): stale, damaged, refused", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n" }, "one");
+    g(dir, "repack", "-dq");
+    commitFiles(dir, { a: "a2\n", "d/b": "b\n" }, "two");
+    g(dir, "repack", "-dq");
+    g(dir, "multi-pack-index", "write");
+    const files = createNodeFilesApi({ rootDir: dir });
+    const run = async (connectivityOnly = false) =>
+      (await openOurs(dir))
+        .fsck()
+        .setRepositoryFiles({ files })
+        .setCompatibility(compatibility)
+        .setConnectivityOnly(connectivityOnly)
+        .call();
+    const same = async () => {
+      const theirs = native(dir, ["fsck", ...noReferences]);
+      const ours = await run();
+      expect(ours.errorOutput).toBe(theirs.stderr);
+      expect(ours.exitCode).toBe(theirs.status);
+      const theirsOnly = native(dir, ["fsck", ...noReferences, "--connectivity-only"]);
+      const oursOnly = await run(true);
+      expect(oursOnly.errorOutput).toBe(theirsOnly.stderr);
+      expect(oursOnly.exitCode).toBe(theirsOnly.status);
+    };
+    await same(); // a sound midx passes
+    const packDir = join(dir, ".git", "objects", "pack");
+    const midx = join(packDir, "multi-pack-index");
+    const good = readFileSync(midx);
+    // a damaged checksum (a damaged id would hide objects from native git, which reads
+    // midx-covered packs only through the midx; ours checks the checksum and reads the packs)
+    flipByte(midx, good.length - 1);
+    await same();
+    // a wrong signature: both die at load
+    writeFileSync(midx, good);
+    flipByte(midx, 0);
+    await same();
+    // stale: a pack it names is gone, its objects packed again elsewhere
+    writeFileSync(midx, good);
+    g(dir, "repack", "-aq");
+    const old = readdirSync(packDir).filter((f) => f.endsWith(".pack"));
+    const gone = old.find(
+      (f) => g(dir, "verify-pack", "-v", join(packDir, f)).split("\n").length < 8,
+    );
+    for (const ext of [".pack", ".idx", ".rev"])
+      rmSync(join(packDir, (gone ?? (old[0] as string)).replace(/\.pack$/, ext)), { force: true });
+    await same();
+  });
+  it("a midx bitmap whose checksum is wrong is reported as git's verify_bitmap_files does", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n" }, "one");
+    g(dir, "repack", "-dq");
+    commitFiles(dir, { a: "a2\n" }, "two");
+    g(dir, "repack", "-dq");
+    g(dir, "multi-pack-index", "write", "--bitmap");
+    const packDir = join(dir, ".git", "objects", "pack");
+    const bitmap = readdirSync(packDir).find((f) => f.endsWith(".bitmap")) as string;
+    chmodSync(join(packDir, bitmap), 0o644);
+    flipByte(join(packDir, bitmap), 40);
+    const files = createNodeFilesApi({ rootDir: dir });
+    for (const connectivityOnly of [false, true]) {
+      const theirs = native(dir, [
+        "fsck",
+        ...noReferences,
+        ...(connectivityOnly ? ["--connectivity-only"] : []),
+      ]);
+      const ours = await (await openOurs(dir))
+        .fsck()
+        .setRepositoryFiles({ files })
+        .setCompatibility(compatibility)
+        .setConnectivityOnly(connectivityOnly)
+        .call();
+      expect(ours.errorOutput).toBe(theirs.stderr);
+      expect(ours.exitCode).toBe(theirs.status);
+    }
+  });
 });

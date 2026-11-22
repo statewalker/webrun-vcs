@@ -79,6 +79,12 @@ export interface PackBitmapWriteOptions {
   compatibility?: "2.43" | "2.56";
   /** A commit's tree, parents and date without reading it (the commit-graph). */
   commitHeader?: ListObjectsOptions["commitHeader"];
+  /**
+   * Name an unlisted tag by its `tag` header (default true, as pack-objects' listing names
+   * it); a multi-pack bitmap names nothing (every name hash 0, as git's midx writer leaves
+   * them).
+   */
+  nameTags?: boolean;
 }
 
 interface CommitData {
@@ -162,7 +168,7 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
     else if (o.type === "tag") tagsToName.push(p);
   }
   // a tag listed without a name is named by its `tag` header, as the revision walk names it
-  for (const p of tagsToName) {
+  for (const p of options.nameTags === false ? [] : tagsToName) {
     const { data } = await read(pack.idAt(order[p] as number));
     hashes[p] = packNameHashBytes(tagName(data));
   }

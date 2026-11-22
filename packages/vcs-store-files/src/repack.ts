@@ -23,6 +23,7 @@ import type {
 } from "@statewalker/vcs-core";
 import {
   BitmapClosureError,
+  clearMultiPackIndexNaming,
   createGitObjects,
   joinPath,
   objectsWithoutLazyFetch,
@@ -36,6 +37,7 @@ import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { assertAlternatesReadable } from "./alternates/index.js";
+import { type MultiPackIndexWriteOptions, multiPackIndexWrite } from "./multi-pack-index.js";
 import { type PromisorExclusions, promisorExclusions } from "./promisor-objects.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
@@ -143,6 +145,15 @@ export interface RepackOptions extends RepackTarget {
   environment?: GitHostEnvironment;
   /** Bitmap entry order: 2.5x's (default) or 2.43's. */
   compatibility?: "2.43" | "2.56";
+  /**
+   * `git repack --write-midx` (`-m`): once the new packs are installed, a multi-pack-index over
+   * the packs that stay (`.keep` packs, the new ones, and with `all: false` every existing pack)
+   * is written before anything is removed, the new pack preferred (`multiPackIndexWrite` with
+   * `--stdin-packs`). A bitmap asked for (`writeBitmaps`) then goes to the midx, not the pack.
+   */
+  writeMidx?: boolean;
+  /** @internal writes the midx bitmap (see `MultiPackIndexWriteOptions.writeBitmap`) */
+  writeMidxBitmap?: MultiPackIndexWriteOptions["writeBitmap"];
 }
 
 /** The bitmap settings of a repository's config. */
@@ -253,6 +264,8 @@ export interface RepackResult {
   objectCount: number;
   /** Number of loose object files removed */
   looseObjectsRemoved: number;
+  /** The checksum of the multi-pack-index written (`writeMidx`) */
+  midx?: string;
   /** Packs removed (`pack-<id>`): replaced by the new one */
   packsRemoved: string[];
   /** Packs kept because they have a `.keep` file (`pack-<id>`) */
@@ -421,9 +434,14 @@ export async function repackListed(
   // (git's default for -a in a bare repository) does not
   const bitmaps = await bitmapPlan(options, all, alternates.length > 0, warnings);
   // git's pack_kept_objects: the option, repack.packKeptObjects, else whether a bitmap is
-  // asked for (write_bitmaps > 0, git's default for -b)
+  // asked for (write_bitmaps > 0, git's default for -b) without --write-midx
   const packKeptObjects =
-    options.packKeptObjects ?? bitmaps.settings?.packKeptObjects ?? bitmaps.explicit === true;
+    options.packKeptObjects ??
+    bitmaps.settings?.packKeptObjects ??
+    (bitmaps.explicit === true && !options.writeMidx);
+  // --write-midx: a bitmap asked for is the midx's (pack-objects writes none)
+  const midxBitmap = options.writeMidx === true && bitmaps.mode !== "off";
+  if (options.writeMidx) bitmaps.mode = "off";
 
   // -a: everything reachable but what .keep packs hold (all of it with --pack-kept-objects);
   // -d alone: what no pack holds (an alternate's included: pack-objects --unpacked); -l:
@@ -580,6 +598,42 @@ export async function repackListed(
     }
 
     const packsRemoved = removable.map((r) => `pack-${r.pack.packId}`);
+    // --write-midx: the midx of what stays, written before anything is removed
+    let midxWritten: string | undefined;
+    if (options.writeMidx) {
+      const removed = new Set(removable.map((r) => r.pack.packId));
+      const include = new Set<string>();
+      for (const p of kept) include.add(`pack-${p.packId}.idx`);
+      for (const id of newPacks) include.add(`pack-${id}.idx`);
+      for (const p of replaced) if (!removed.has(p.packId)) include.add(`pack-${p.packId}.idx`);
+      const midx = await multiPackIndexWrite({
+        files,
+        gitDir,
+        compatibility: options.compatibility ?? "2.56",
+        stdinPacks: [...include].sort(),
+        preferredPack: `pack-${packId}.pack`,
+        bitmap: midxBitmap,
+        ...(options.writeMidxBitmap ? { writeBitmap: options.writeMidxBitmap } : {}),
+      });
+      if (midx.exitCode !== 0) throw new Error(midx.stderr.join("\n"));
+      midxWritten = midx.written;
+      // remove_redundant_bitmaps: the packs' own bitmaps give way to the midx's
+      if (midxBitmap)
+        for (const name of include) {
+          const bitmap = joinPath(packDir, name.replace(/\.idx$/, ".bitmap"));
+          if (await files.exists(bitmap)) await files.remove(bitmap);
+        }
+    }
+    // git's repack_remove_redundant_pack: a multi-pack-index naming a pack about to go is
+    // cleared first (with its bitmaps and an incremental chain), or native git would read a
+    // midx whose packs are missing (fsck and `multi-pack-index verify` fail, writes refuse it)
+    if (packsRemoved.length)
+      await clearMultiPackIndexNaming(
+        files,
+        packDir,
+        packsRemoved.map((name) => `${name}.pack`),
+        { wroteIncremental: false },
+      );
     if (packsRemoved.length) await packs.remove(removable.map((r) => r.pack.packId));
 
     const looseObjectsRemoved = await prunePacked(looseStorage, packs, alternates);
@@ -597,6 +651,7 @@ export async function repackListed(
         : {}),
       ...(filteredPack ? { filteredPack: `pack-${filteredPack}` } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
+      ...(midxWritten ? { midx: midxWritten } : {}),
     };
   }
 }

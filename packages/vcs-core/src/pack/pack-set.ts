@@ -24,6 +24,14 @@ import {
   installPack,
   PackError,
 } from "./index-pack.js";
+import {
+  MIDX_CHAIN_DIR,
+  MIDX_CHAIN_FILE,
+  MIDX_FILE,
+  type MultiPackIndex,
+  multiPackIndexBitmapPack,
+} from "./multi-pack-index.js";
+import { clearMultiPackIndexNaming, loadMultiPackIndex } from "./multi-pack-index-files.js";
 import { PackBitmapError, type PackBitmapIndex, parsePackBitmap } from "./pack-bitmap.js";
 import {
   DEFAULT_DELTA_BASE_CACHE_LIMIT,
@@ -67,6 +75,12 @@ export interface OpenPackSetOptions {
    * such packs loose.
    */
   freshenMaxAgeMs?: number;
+  /**
+   * Use the directory's multi-pack-index (git's `core.multiPackIndex`, default true): lookups
+   * try the pack the midx names for an object first. A midx git would refuse, one whose
+   * checksum does not match, or one naming packs that are gone is not used (`midxErrors`).
+   */
+  multiPackIndex?: boolean;
 }
 
 /** The packs of one directory, read as one object store. */
@@ -149,9 +163,18 @@ export interface PackSet {
    * index file (wrong header)`, ...), from its last call.
    */
   readonly bitmapErrors?: readonly string[];
+  /** The multi-pack-index lookups use, after a rescan within the rate limit; optional. */
+  multiPackIndex?(): Promise<MultiPackIndex | undefined>;
+  /** Why the directory's multi-pack-index is not used (git's lines), from the last scan. */
+  readonly midxErrors?: readonly string[];
 }
 
 const OID = /^[0-9a-f]{40}$/;
+/**
+ * Packs from which on a lookup asks the midx first: measured on 1860 objects, one pack reads
+ * 25% slower through a midx, thirty packs two to three times faster.
+ */
+const MIDX_LOOKUP_MIN_PACKS = 3;
 const PACK_IDX = /^pack-[0-9a-f]{40}\.idx$/;
 const EXTENSIONS = [".idx", ".pack", ".keep", ".rev", ".bitmap", ".promisor", ".mtimes"];
 const isId = (id: unknown): id is ObjectId => typeof id === "string" && OID.test(id);
@@ -244,6 +267,63 @@ export async function openPackSet(
   };
   const holds = (p: PackFile, id: ObjectId) => p.has(id) && !isBad(p, id);
   const nameOf = (p: PackFile) => `pack-${p.packId}`;
+  /** the midx in use and its loaded packs by pack-int-id (undefined: missing) */
+  const useMidx = options.multiPackIndex ?? true;
+  let midx: MultiPackIndex | undefined;
+  let midxPacks: (PackFile | undefined)[] = [];
+  let midxSig = "";
+  let midxErrors: string[] = [];
+  let midxLoaded: MultiPackIndex | undefined;
+  /** The pack the midx names for `id`, when it is loaded (git's midx_fill_entry). */
+  const midxPack = (id: ObjectId): PackFile | undefined => {
+    const m = midx;
+    // with one or two packs their own idx answer faster than a midx search plus the idx's
+    if (!m || packs.length < MIDX_LOOKUP_MIN_PACKS) return undefined;
+    const pos = m.find(id);
+    if (pos < 0) return undefined;
+    const p = midxPacks[m.packIntIdAt(pos)];
+    return p && byName.get(nameOf(p)) === p ? p : undefined;
+  };
+  const midxSignature = async () => {
+    const [a, b] = await Promise.all([
+      files.stats(`${dir}/${MIDX_FILE}`),
+      files.stats(`${dir}/${MIDX_CHAIN_DIR}/${MIDX_CHAIN_FILE}`),
+    ]);
+    return `${a?.size}:${a?.lastModified}:${b?.size}:${b?.lastModified}`;
+  };
+  /** (Re)loads the midx when its files changed; maps its packs to the loaded ones. */
+  const loadMidx = async () => {
+    if (!useMidx) return;
+    const sig = await midxSignature();
+    if (sig !== midxSig) {
+      midxSig = sig;
+      midxLoaded = undefined;
+      const errors: string[] = [];
+      if (sig !== "undefined:undefined:undefined:undefined") {
+        const loaded = await loadMultiPackIndex(files, dir);
+        errors.push(...loaded.errors);
+        if (loaded.midx && !loaded.midx.checksumValid()) {
+          errors.push("warning: ignoring existing multi-pack-index; checksum mismatch");
+        } else if (loaded.midx) midxLoaded = loaded.midx;
+      }
+      midxErrors = errors;
+    }
+    midx = undefined;
+    midxPacks = [];
+    const m = midxLoaded;
+    if (!m) return;
+    const mapped: (PackFile | undefined)[] = [];
+    for (let id = 0; id < m.numPacks + m.numPacksInBase; id++) {
+      const name = m.packNameAt(id).replace(/\.idx$/, "");
+      const p = byName.get(name);
+      // a stale midx (naming a pack that is gone or cannot be opened) is not used: every
+      // pack is then searched, so no object it would have hidden is missed
+      if (!p) return;
+      mapped.push(p);
+    }
+    midx = m;
+    midxPacks = mapped;
+  };
   const drop = (p: PackFile) => {
     packs = packs.filter((x) => x !== p);
     if (byName.get(nameOf(p)) === p) byName.delete(nameOf(p));
@@ -393,6 +473,7 @@ export async function openPackSet(
       packs = [...kept, ...packs];
       changed = true;
     }
+    await loadMidx();
     return changed;
   };
 
@@ -493,6 +574,20 @@ export async function openPackSet(
     // no pack holds what is not an id (`has` parses it): checked only before a rescan
     let failed: unknown;
     let vanished = false;
+    // the pack the midx names first (git reads midx-covered packs through it); any failure
+    // there is left to the loop below, which tries that copy again and marks it bad
+    if (!resume && midx && packs.length >= MIDX_LOOKUP_MIN_PACKS) {
+      const p = midxPack(id);
+      if (p && holds(p, id)) {
+        try {
+          let obj = p.getNow(id, o);
+          if (obj instanceof Promise) obj = (yield obj) as GitObject | undefined;
+          if (obj) return yield* guarded(p, id, obj);
+        } catch {
+          // the loop reads it again
+        }
+      }
+    }
     // `packs` is replaced, never changed in place: this loop sees one snapshot
     const snapshot = resume?.packs ?? packs;
     for (let k = resume?.at ?? 0; k < snapshot.length; k++) {
@@ -597,10 +692,56 @@ export async function openPackSet(
     { signature: string; index?: PackBitmapIndex; error?: string }
   >();
   let bitmapErrors: string[] = [];
+  /** the loaded midx bitmap, by its path and its file's size and mtime */
+  let midxBitmap: { key: string; index?: PackBitmapIndex; error?: string } | undefined;
+  const readBytes = async (path: string): Promise<Uint8Array> => {
+    const chunks: Uint8Array[] = [];
+    let n = 0;
+    for await (const c of files.read(path)) {
+      chunks.push(c);
+      n += c.length;
+    }
+    if (chunks.length === 1) return chunks[0] as Uint8Array;
+    const bytes = new Uint8Array(n);
+    let at = 0;
+    for (const c of chunks) {
+      bytes.set(c, at);
+      at += c.length;
+    }
+    return bytes;
+  };
+  /**
+   * The midx's bitmap (`multi-pack-index-<checksum>.bitmap`), which git prefers over the packs'
+   * own: its header must name this midx's checksum (a bitmap left from an older midx is
+   * refused), its bits are the midx's pseudo-pack order.
+   */
+  const loadMidxBitmap = async (errors: string[]): Promise<PackBitmapIndex | undefined> => {
+    const m = midx;
+    if (!m || m.base || !m.revIndex) return undefined;
+    const path = `${dir}/multi-pack-index-${m.checksum}.bitmap`;
+    const st = await files.stats(path);
+    if (st?.kind !== "file") return undefined;
+    const key = `${path}:${st.size}:${st.lastModified}`;
+    if (midxBitmap?.key !== key) {
+      try {
+        midxBitmap = {
+          key,
+          index: parsePackBitmap(await readBytes(path), multiPackIndexBitmapPack(m), path),
+        };
+      } catch (e) {
+        if (!(e instanceof PackBitmapError)) throw e;
+        midxBitmap = { key, error: `error: ${e.message}` };
+      }
+    }
+    if (midxBitmap.error) errors.push(midxBitmap.error);
+    return midxBitmap.index;
+  };
   const bitmap = async (): Promise<PackBitmapIndex | undefined> => {
     await rescanOnMiss();
     const errors: string[] = [];
     try {
+      const fromMidx = await loadMidxBitmap(errors);
+      if (fromMidx) return fromMidx;
       for (const p of [...packs]) {
         const path = `${dir}/${nameOf(p)}.bitmap`;
         const st = await files.stats(path);
@@ -650,8 +791,19 @@ export async function openPackSet(
     get bitmapErrors() {
       return bitmapErrors;
     },
+    get midxErrors() {
+      return midxErrors;
+    },
+    async multiPackIndex() {
+      await rescanOnMiss();
+      return midx;
+    },
     async has(id) {
       if (!isId(id)) return false;
+      if (midx && packs.length >= MIDX_LOOKUP_MIN_PACKS) {
+        const p = midxPack(id);
+        if (p && holds(p, id)) return true;
+      }
       if (packs.some((p) => holds(p, id))) return true;
       return (await rescanOnMiss()) && packs.some((p) => holds(p, id));
     },
@@ -683,6 +835,8 @@ export async function openPackSet(
       // the common case without a generator: the first pack holding `id` has it in memory
       const snapshot = packs;
       const opts = { verify: o?.verify };
+      if (midx && snapshot.length >= MIDX_LOOKUP_MIN_PACKS)
+        return runSteps(lookupSteps(id, opts, true));
       for (let k = 0; k < snapshot.length; k++) {
         const p = snapshot[k] as PackFile;
         if (!p.has(id)) continue;
@@ -776,6 +930,13 @@ export async function openPackSet(
       await files.write(`${dir}/pack-${packId}.promisor`, [new TextEncoder().encode(content)]);
     },
     async remove(packIds) {
+      // a midx naming a pack about to go is cleared first, as git's repack does
+      if (packIds.length)
+        await clearMultiPackIndexNaming(
+          files,
+          dir,
+          packIds.map((id) => `pack-${id}.pack`),
+        );
       for (const packId of packIds) {
         const name = `pack-${packId}`;
         removedAt.set(name, ++removals);
@@ -796,6 +957,7 @@ export async function openPackSet(
       }
       // objects only in the removed packs are gone: cached parses are checked again
       if (packIds.length) noteObjectRemoved();
+      await loadMidx();
     },
   };
 }
