@@ -315,7 +315,9 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
     // git apply --index/--cached reads the index at its start: one another writer replaced
     // is read again (refused while this instance holds unwritten edits)
     if (this.index || this.cached) await this.readCurrentIndex();
-    const run = await this.run();
+    // one worktree operation: the attributes files and the configuration read once for every
+    // file the patch converts, not once per file
+    const run = await this.inOneOperation(() => this.run());
     return {
       exitCode: run.status,
       output: latin1ToText(run.stdout),

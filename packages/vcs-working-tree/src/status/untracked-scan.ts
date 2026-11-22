@@ -703,11 +703,19 @@ export async function scanUntracked(
  * const index = new IndexPathLookup(staging.entryList().map((e) => e.path));
  * index.trackedIn("src"); // Set { "a.ts", "b.ts" }
  * index.hasEntriesBelow("src"); // true
+ *
+ * // core.ignorecase, as every untracked walk asks the index (status, add, clean, stash -u)
+ * const icase = new IndexPathLookup(paths, { ignoreCase: true, gitlinks: ["Sub"] });
+ * icase.has("SRC/A.TS"); // true: index_file_exists with icase
+ * icase.hasExactly("SRC/A.TS"); // false: index_name_is_other's exact check
+ * icase.indexDirectory("sub"); // "gitlink": directory_exists_in_index_icase
  * ```
  */
 export class IndexPathLookup {
   private readonly paths: readonly string[];
   private readonly ignoreCase: boolean;
+  /** The gitlinks' paths (folded under `ignoreCase`) */
+  private readonly gitlinks: ReadonlySet<string>;
   /** Under `ignoreCase`: the folded paths, and the folded names directly in each folded directory */
   private folded?: { paths: Set<string>; dirs: Map<string, CaseFoldedNames> };
 
@@ -715,15 +723,36 @@ export class IndexPathLookup {
    * @param paths The index's paths in index order (byte order; repeated for stages)
    * @param options `ignoreCase` (`core.ignorecase`): `has`, `hasEntriesBelow` and
    *   `trackedIn` fold ASCII case, as git's name hashes (`index_file_exists` with icase,
-   *   `index_dir_exists`) do
+   *   `index_dir_exists`) do; `gitlinks`: the paths of the index's submodule entries, for
+   *   {@link indexDirectory}; `sorted`: the paths are known to be in byte order already (the
+   *   `all` of another lookup), not checked again
    */
-  constructor(paths: readonly string[], options: { ignoreCase?: boolean } = {}) {
+  constructor(
+    paths: readonly string[],
+    options: { ignoreCase?: boolean; gitlinks?: Iterable<string>; sorted?: boolean } = {},
+  ) {
     let sorted = true;
-    for (let i = 1; i < paths.length && sorted; i++) {
+    for (let i = 1; i < paths.length && !options.sorted && sorted; i++) {
       if (compareGitPaths(paths[i - 1] as string, paths[i] as string) > 0) sorted = false;
     }
     this.paths = sorted ? paths : [...paths].sort(compareGitPaths);
     this.ignoreCase = options.ignoreCase ?? false;
+    const fold = this.ignoreCase ? foldAsciiCase : (p: string) => p;
+    this.gitlinks = new Set([...(options.gitlinks ?? [])].map(fold));
+  }
+
+  /**
+   * git's `directory_exists_in_index`: "gitlink" for a submodule entry at `dir`, "directory"
+   * for entries below it. Without `ignoreCase` the gitlink wins (it sorts first); with it,
+   * `directory_exists_in_index_icase` asks the directory hash first, both folding case.
+   */
+  indexDirectory(dir: string): "directory" | "gitlink" | undefined {
+    if (this.ignoreCase) {
+      if (this.hasEntriesBelow(dir)) return "directory";
+      return this.gitlinks.has(foldAsciiCase(dir)) ? "gitlink" : undefined;
+    }
+    if (this.gitlinks.has(dir)) return "gitlink";
+    return this.hasEntriesBelow(dir) ? "directory" : undefined;
   }
 
   /** The folded lookups, built on first use. */

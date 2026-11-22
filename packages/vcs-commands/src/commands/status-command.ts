@@ -1,6 +1,5 @@
 import { type Commits, countAheadBehind, FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
-import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 import {
   type CacheTree,
   compareWithWorktree,
@@ -1021,18 +1020,12 @@ export class StatusCommand extends GitCommand<Status> {
       // (index_file_exists, directory_exists_in_index_icase): a file or directory differing
       // from an index path only by case is tracked, never untracked
       const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
-      const scanIndex = ignoreCase ? new IndexPathLookup(index.all, { ignoreCase: true }) : index;
-      const scanGitlinks = ignoreCase ? new Set([...gitlinks].map(foldAsciiCase)) : gitlinks;
+      const scanIndex = new IndexPathLookup(index.all, { ignoreCase, gitlinks, sorted: true });
       const result = await scanUntracked(host ?? (await walkUntrackedScanHost(worktree)), {
         isTracked: (p) => scanIndex.has(p),
         isTrackedExactly: (p) => index.hasExactly(p),
         trackedIn: (dir) => scanIndex.trackedIn(dir),
-        indexDirectory: (dir) =>
-          scanGitlinks.has(ignoreCase ? foldAsciiCase(dir) : dir)
-            ? "gitlink"
-            : scanIndex.hasEntriesBelow(dir)
-              ? "directory"
-              : undefined,
+        indexDirectory: (dir) => scanIndex.indexDirectory(dir),
         indexIgnoreOid: (p) => ignoreFiles.upToDate.get(p),
         skipWorktreeIgnoreOid: (p) => ignoreFiles.skipWorktree.get(p),
         flags,

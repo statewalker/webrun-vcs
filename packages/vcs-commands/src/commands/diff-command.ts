@@ -635,16 +635,6 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   }
 
   /**
-   * Runs `fn` as one worktree operation (`Worktree.batch`): the configuration, attributes and
-   * ignore files read once for every path the diff prints, instead of once per path (each
-   * attributes lookup outside an operation opens one of its own). As `git log` runs its diffs.
-   */
-  private inOneOperation<T>(fn: () => Promise<T>): Promise<T> {
-    const worktree = this.worktreeIfAny;
-    return worktree?.batch ? worktree.batch(fn) : fn();
-  }
-
-  /**
    * The diffstat of the comparison, one file per pair in git's order (`compute_diffstat` of
    * the diff queue, as a `DIFF_FORMAT_CALLBACK` consumer sees it): an unmerged path as a
    * file with `isUnmerged` and no counts, followed by what the diff holds for it besides.

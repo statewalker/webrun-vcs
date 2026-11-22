@@ -15,7 +15,6 @@ import {
   createIndexTree,
   createUntrackedTree,
   createWorktreeTree,
-  directoriesOf,
   type EntryStat,
   entryStatOf,
   findUntrackedFiles,
@@ -28,7 +27,7 @@ import {
   type Staging,
   type StashTreesSource,
   scanIndex,
-  trackedUnder,
+  untrackedIndexPredicates,
   type WorkingCopy,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
@@ -78,7 +77,13 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
       worktree,
       trust: worktreeModeTrust(workingCopy, worktree),
       ...(pathFilter ? { pathFilter } : {}),
+      ignoreCase: this.ignoreCase,
     };
+  }
+
+  /** `core.ignorecase`: the untracked walks fold case asking the index (dir.c's name hashes) */
+  private get ignoreCase(): boolean {
+    return coreBool(this.context.workingCopy, "ignorecase", false);
   }
 
   /** The index compared with the worktree, once. */
@@ -106,8 +111,9 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
     const scan = await this.scan();
     if (await hasTrackedChanges(this.source, await this.context.headTree(), scan)) return true;
     if (!options?.includeUntracked) return false;
-    for await (const file of findUntrackedFiles(this.context.worktree, (p) => scan.paths.has(p), {
-      hasTrackedUnder: trackedUnder(scan.paths),
+    const index = untrackedIndexPredicates(scan.paths, this.ignoreCase);
+    for await (const file of findUntrackedFiles(this.context.worktree, index.isTracked, {
+      hasTrackedUnder: index.hasTrackedUnder,
       includeIgnored: options.includeIgnored,
       ...(this.context.pathFilter ? { filter: this.context.pathFilter } : {}),
     })) {
@@ -195,8 +201,9 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
   ): Promise<void> {
     const { worktree } = this.context;
     const untracked: string[] = [];
-    for await (const file of findUntrackedFiles(worktree, (p) => scan.paths.has(p), {
-      hasTrackedUnder: trackedUnder(scan.paths),
+    const index = untrackedIndexPredicates(scan.paths, this.ignoreCase);
+    for await (const file of findUntrackedFiles(worktree, index.isTracked, {
+      hasTrackedUnder: index.hasTrackedUnder,
       includeIgnored: ignored,
       filter,
     })) {
@@ -215,8 +222,8 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
    */
   private async clean(scan: IndexScan, ignored: boolean): Promise<void> {
     const { worktree } = this.context;
-    const tracked = scan.paths;
-    const trackedDirs = directoriesOf(tracked);
+    // git clean's scan folds case asking the index under core.ignorecase
+    const index = untrackedIndexPredicates(scan.paths, this.ignoreCase);
     const untracked: string[] = [];
     const dirs: string[] = [];
     // a `.git` naming no repository (an empty directory, a gitfile of garbage) is listed
@@ -227,10 +234,14 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
       enterNonRepositoryGitDirs: true,
     })) {
       if (entry.isDirectory) {
-        if (entry.mode !== FileMode.GITLINK && !trackedDirs.has(entry.path)) dirs.push(entry.path);
+        if (entry.mode !== FileMode.GITLINK && !index.hasTrackedUnder(entry.path)) {
+          dirs.push(entry.path);
+        }
         continue;
       }
-      if (!tracked.has(entry.path) && (ignored || !entry.isIgnored)) untracked.push(entry.path);
+      if (!index.isTracked(entry.path) && (ignored || !entry.isIgnored)) {
+        untracked.push(entry.path);
+      }
     }
     const fake = { nonRepositoryGitDirs: true };
     for (const path of untracked) await worktree.remove(path, fake);

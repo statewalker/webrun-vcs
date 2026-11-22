@@ -9,7 +9,7 @@ import {
   isValidWorktreePath,
   type ObjectId,
 } from "@statewalker/vcs-core";
-import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import { compareGitPaths, foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 import {
   basicStatMatches,
   DeleteStagingEntry,
@@ -44,6 +44,12 @@ export interface AddToIndexOptions {
   renormalize?: boolean;
   /** The path as git names it in its messages (`sub/` for a directory found untracked) */
   displayPath?: string;
+  /**
+   * The index's name for a file read at the given path, when they differ: the leading
+   * directories spelled as the index has them (`adjust_dirname_case` under
+   * `core.ignorecase`, {@link IndexDirnameCase})
+   */
+  indexPath?: string;
   onWarning?: (message: string) => void;
   /**
    * The path's stage-0 entry in the index as the adder was opened over it, when the caller
@@ -60,6 +66,55 @@ export class AddToIndexError extends Error {
   ) {
     super(lines.join("\n"));
     this.name = "AddToIndexError";
+  }
+}
+
+/**
+ * The index's directories as git's name hash spells them, for `add_to_index`'s
+ * `adjust_dirname_case` under `core.ignorecase`: a new file's leading directories that
+ * match an index directory folding ASCII case take that directory's spelling.
+ *
+ * ```typescript
+ * const dirs = new IndexDirnameCase(["a/b/two.txt"]);
+ * dirs.adjust("A/B/new.txt"); // "a/b/new.txt"
+ * dirs.adjust("A/C/new.txt"); // "a/C/new.txt"
+ * dirs.note("a/C/new.txt"); // later adds see "a/C" too
+ * ```
+ *
+ * Each directory keeps the spelling of the first path that made it, in index order (the
+ * hash is built from the entries in order, then grows with each entry added).
+ */
+export class IndexDirnameCase {
+  /** Folded directory → its spelling */
+  private readonly dirs = new Map<string, string>();
+
+  constructor(paths: Iterable<string>) {
+    for (const path of paths) this.note(path);
+  }
+
+  /** Records the leading directories of an entry added to the index. */
+  note(path: string): void {
+    for (let at = path.indexOf("/"); at >= 0; at = path.indexOf("/", at + 1)) {
+      const dir = path.slice(0, at);
+      const key = foldAsciiCase(dir);
+      if (!this.dirs.has(key)) this.dirs.set(key, dir);
+    }
+  }
+
+  /**
+   * git's `adjust_dirname_case`: each leading directory found in the hash copies its
+   * spelling over the part of the name since the last directory found.
+   */
+  adjust(path: string): string {
+    let name = path;
+    let start = 0;
+    for (let at = name.indexOf("/"); at >= 0; at = name.indexOf("/", at + 1)) {
+      const spelled = this.dirs.get(foldAsciiCase(name.slice(0, at)));
+      if (spelled === undefined) continue;
+      name = name.slice(0, start) + spelled.slice(start, at) + name.slice(at);
+      start = at + 1;
+    }
+    return name;
   }
 }
 
@@ -288,13 +343,24 @@ export class IndexAdder {
     entry: WorktreeEntry,
     options: AddToIndexOptions = {},
   ): Promise<AddOutcome> {
+    if (entry.isDirectory) {
+      const hint = options.indexed;
+      const indexed = !this.hasStage0(path)
+        ? undefined
+        : hint && hint.path === path && hint.stage === 0
+          ? hint
+          : await this.staging.getEntry(path);
+      return this.addGitlink(worktree, path, entry, indexed, options);
+    }
+    // the index's name of the file (add_to_index's adjust_dirname_case under
+    // core.ignorecase), the worktree read at `path`
+    const name = options.indexPath ?? path;
     const hint = options.indexed;
-    const indexed = !this.hasStage0(path)
+    const indexed = !this.hasStage0(name)
       ? undefined
-      : hint && hint.path === path && hint.stage === 0
+      : hint && hint.path === name && hint.stage === 0
         ? hint
-        : await this.staging.getEntry(path);
-    if (entry.isDirectory) return this.addGitlink(worktree, path, entry, indexed, options);
+        : await this.staging.getEntry(name);
     // a tracked file whose stat still matches its entry (and is not racily clean) is not
     // read again (nor its line endings checked); a renormalisation always reads it. git's
     // add_to_index returns so before add_index_entry verifies the path
@@ -309,11 +375,11 @@ export class IndexAdder {
     // add_index_entry's verify_path (after the file is hashed; never with ADD_CACHE_PRETEND)
     if (!this.pretend) {
       const mode = modeFromWorktree(entry.mode, indexed?.mode, this.trust);
-      if (!isValidWorktreePath(path, mode)) {
-        const name = options.displayPath ?? path;
+      if (!isValidWorktreePath(name, mode)) {
+        const shown = options.displayPath ?? path;
         throw new AddToIndexError(path, [
-          `error: invalid path '${name}'`,
-          `error: unable to add '${name}' to index`,
+          `error: invalid path '${shown}'`,
+          `error: unable to add '${shown}' to index`,
         ]);
       }
     }
@@ -324,30 +390,30 @@ export class IndexAdder {
       if (indexed && this.statUnchanged(indexed, entry)) return "unchanged";
       await this.storeEmptyBlob();
       if (indexed) {
-        if (!this.pretend) this.touched.add(path);
+        if (!this.pretend) this.touched.add(name);
         return indexed.objectId === EMPTY_BLOB_ID ? "same" : "added";
       }
       if (this.pretend) return "added";
-      this.resolve(path);
-      this.clearConflicts(path);
+      this.resolve(name);
+      this.clearConflicts(name);
       // the empty blob's id, flagged intent-to-add, without stat data, as git records it
       // (never an empty or all-zero id, which a worktree hash could be compared against)
       const mode = modeFromWorktree(entry.mode, undefined, this.trust);
       this.editor.add(
         new UpdateStagingEntry(
-          path,
+          name,
           EMPTY_BLOB_ID,
           mode,
           { size: 0, mtime: 0 },
           { intentToAdd: true },
         ),
       );
-      this.markAdded(path);
+      this.markAdded(name);
       return "added";
     }
 
     // the mode git's ce_mode_from_stat would record
-    const known = indexed ?? this.unmerged.get(path)?.[0];
+    const known = indexed ?? this.unmerged.get(name)?.[0];
     if (this.pretend) {
       // git's ADD_CACHE_PRETEND: hashed, never written
       const id = await worktree.computeHash(path);
@@ -360,7 +426,7 @@ export class IndexAdder {
       ...(options.renormalize ? { renormalize: true } : {}),
     });
     const mode = modeFromWorktree(stored.entry.mode, known?.mode, this.trust);
-    this.stage(path, stored.id, mode, entryStatOf(stored.entry));
+    this.stage(name, stored.id, mode, entryStatOf(stored.entry));
     return indexed && indexed.objectId === stored.id && indexed.mode === mode ? "same" : "added";
   }
 

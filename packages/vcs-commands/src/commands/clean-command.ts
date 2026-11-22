@@ -1,11 +1,12 @@
 import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
 import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
-  directoriesOf,
+  IndexPathLookup,
   unreadableDirectoryWarning,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import { GitCommand } from "../git-command.js";
+import { coreBool } from "./core-config.js";
 import {
   DO_MATCH_LEADING_PATHSPEC,
   MATCHED_RECURSIVELY_LEADING_PATHSPEC,
@@ -205,7 +206,13 @@ export class CleanCommand extends GitCommand<CleanResult> {
       tracked.add(entry.path);
       if (entry.mode === FileMode.GITLINK) gitlinks.add(entry.path);
     }
-    const { root, nodes } = await this.loadTree(worktree, tracked);
+    // dir.c asks the index through its name hashes, which fold case under core.ignorecase
+    // (index_file_exists, directory_exists_in_index_icase); index_name_is_other stays exact
+    const index = new IndexPathLookup([...tracked], {
+      ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+      gitlinks,
+    });
+    const { root, nodes } = await this.loadTree(worktree, index);
     const removeDirectories = this.directories || this.paths.size > 0;
     const pathspec = parsePathspec([...this.paths], { attr: true });
     // `:(attr:...)`: the attributes of the files and directories read (a directory's by its
@@ -216,8 +223,7 @@ export class CleanCommand extends GitCommand<CleanResult> {
     const scan = new DirectoryScan({
       nodes,
       tracked,
-      trackedDirs: directoriesOf(tracked),
-      gitlinks,
+      index,
       pathspec,
       // -x: no ignore rules at all (git does not set up the standard excludes)
       excludes: this.ignoredOnly || this.ignore,
@@ -252,7 +258,7 @@ export class CleanCommand extends GitCommand<CleanResult> {
    */
   private async loadTree(
     worktree: Worktree,
-    tracked: Set<string>,
+    index: IndexPathLookup,
   ): Promise<{ root: CleanNode; nodes: Map<string, CleanNode> }> {
     const root: CleanNode = node("", true);
     const nodes = new Map<string, CleanNode>([["", root]]);
@@ -264,14 +270,13 @@ export class CleanCommand extends GitCommand<CleanResult> {
       const parent = parentOf(dir);
       if (!parent?.directory || parent.repository) return undefined;
       const made = node(dir, true);
-      made.tracked = tracked.has(dir);
+      made.tracked = index.has(dir);
       made.gitDir = parent.gitDir;
       parent.children.push(made);
       nodes.set(dir, made);
       return made;
     };
     const unreadable = new Map<string, unknown>();
-    const trackedDirs = directoriesOf(tracked);
     const load = async (pathPrefix?: string) => {
       for await (const entry of worktree.walk({
         includeIgnored: true,
@@ -286,7 +291,7 @@ export class CleanCommand extends GitCommand<CleanResult> {
         if (!parent?.directory || (parent.repository && !parent.entered)) continue;
         const n = node(entry.path, entry.isDirectory);
         n.ignored = entry.isIgnored === true;
-        n.tracked = tracked.has(entry.path);
+        n.tracked = index.has(entry.path);
         n.gitDir = entry.name === ".git" || parent.gitDir;
         if (entry.isDirectory && entry.mode === FileMode.GITLINK) {
           const state = worktree.repositoryState
@@ -306,7 +311,7 @@ export class CleanCommand extends GitCommand<CleanResult> {
         parent.children.push(n);
         nodes.set(entry.path, n);
         // git's scan enters a directory the index tracks paths in, a repository or not
-        if (n.repository && trackedDirs.has(n.path)) {
+        if (n.repository && index.indexDirectory(n.path) === "directory") {
           n.entered = true;
           await load(n.path);
         }
@@ -466,9 +471,10 @@ class DirectoryScan {
   constructor(
     private readonly o: {
       nodes: Map<string, CleanNode>;
+      /** The index's paths, as `index_name_is_other` asks them (exactly) */
       tracked: Set<string>;
-      trackedDirs: Set<string>;
-      gitlinks: Set<string>;
+      /** The index as the name hashes answer (folding case under `core.ignorecase`) */
+      index: IndexPathLookup;
       pathspec: PathspecItem[];
       excludes: boolean;
       showIgnored: boolean;
@@ -491,8 +497,9 @@ class DirectoryScan {
     return !this.o.tracked.has(name.endsWith("/") ? name.slice(0, -1) : name);
   }
 
+  /** git's `dir_add_name`: never a path the index has (`index_file_exists`, icase too). */
   private addName(name: string): void {
-    if (this.o.tracked.has(name)) return;
+    if (this.o.index.has(name)) return;
     this.entries.push(name);
   }
 
@@ -535,9 +542,11 @@ class DirectoryScan {
 
   private treatDirectory(n: CleanNode, dirname: string, excluded: boolean): number {
     // git's directory_exists_in_index: the index entry of the name itself sorts first, so a
-    // submodule there wins over paths below it
-    if (this.o.gitlinks.has(n.path)) return PATH_NONE;
-    if (this.o.trackedDirs.has(n.path)) return PATH_RECURSE;
+    // submodule there wins over paths below it (under core.ignorecase the directory hash is
+    // asked first, folding case)
+    const inIndex = this.o.index.indexDirectory(n.path);
+    if (inIndex === "gitlink") return PATH_NONE;
+    if (inIndex === "directory") return PATH_RECURSE;
     let matchesHow = 0;
     if (this.hasPathspec && !excluded) {
       matchesHow = this.match(dirname, DO_MATCH_LEADING_PATHSPEC);

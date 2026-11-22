@@ -1175,6 +1175,17 @@ export abstract class GitCommand<T> {
   }
 
   /**
+   * Runs `fn` as one worktree operation (`Worktree.batch`, which nests): the configuration,
+   * `info/attributes` and the `.gitattributes` files are read once for every path the
+   * command converts, filters or checks, instead of once per path (each attributes lookup
+   * outside an operation opens one of its own). Without a worktree, `fn` runs as it is.
+   */
+  protected inOneOperation<T>(fn: () => Promise<T>): Promise<T> {
+    const worktree = "worktree" in this._workingCopy ? this._workingCopy.worktree : undefined;
+    return worktree?.batch ? worktree.batch(fn) : fn();
+  }
+
+  /**
    * Get the WorkingCopy.
    */
   protected get workingCopy(): WorkingCopy {
