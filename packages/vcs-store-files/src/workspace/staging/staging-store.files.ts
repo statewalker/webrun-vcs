@@ -62,7 +62,8 @@ export class FileStagingStore implements Staging {
   private unwritten = false;
   /** Skip-worktree flags cleared when the index was read, not yet in the index file */
   private skipWorktreeCleared = new Set<string>();
-  private version: IndexVersion = INDEX_VERSION_2;
+  /** The index's version (git's `istate->version`): undefined while no index file was read */
+  private version: IndexVersion | undefined;
   private readonly indexFile: IndexFile;
 
   constructor(
@@ -510,9 +511,10 @@ export class FileStagingStore implements Staging {
     this.unwritten = false;
     this.skipWorktreeCleared = new Set();
     if (!read) {
-      // No index file - start empty
+      // No index file - start empty, in the version the first write is configured for
       this._entries = [];
       this.updateTime = 0;
+      this.version = undefined;
       return;
     }
     this._entries = read.entries;
@@ -549,6 +551,7 @@ export class FileStagingStore implements Staging {
       (entry) => this.asRead.has(entry),
     );
     await this.indexFile.write(this._entries);
+    this.version = this.indexFile.version;
     this.unwritten = false;
     this.skipWorktreeCleared = new Set();
     this.asRead.reset(this._entries);
@@ -581,6 +584,7 @@ export class FileStagingStore implements Staging {
       commit: async () => {
         await lock.commit();
         if (!written) return;
+        this.version = this.indexFile.version;
         // the index now holds what was written (make no edits between write and commit)
         this.unwritten = false;
         this.skipWorktreeCleared = new Set();
@@ -662,6 +666,10 @@ export class FileStagingStore implements Staging {
     } catch {
       return 0;
     }
+  }
+
+  wantsRewrite(options?: { untrackedCache?: boolean }): Promise<boolean> {
+    return this.indexFile.wantsRewrite(options);
   }
 
   hasUnwrittenChanges(): boolean {
@@ -795,7 +803,7 @@ export class FileStagingStore implements Staging {
 
   /** @internal - Get index version */
   _getVersion(): IndexVersion {
-    return this.version;
+    return this.version ?? INDEX_VERSION_2;
   }
 
   /** @internal - Set index version */
@@ -812,7 +820,7 @@ interface SavedFileStagingState extends StagingState {
   readonly unwritten: boolean;
   readonly skipWorktreeCleared: ReadonlySet<string>;
   readonly updateTime: number;
-  readonly version: IndexVersion;
+  readonly version: IndexVersion | undefined;
   readonly pending: IndexFilePending;
 }
 

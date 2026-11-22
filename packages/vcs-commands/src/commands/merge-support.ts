@@ -49,6 +49,7 @@ import {
   findInTheWay,
   overwriteMessage,
   pruneEmptyParents,
+  removeCaseVariants,
 } from "./worktree-overwrite-checks.js";
 
 const sameEntry = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
@@ -957,8 +958,10 @@ async function switchTreesWith(
         removes: new Set(deleting),
         index,
         ...(await restoreCaseOptions(worktree, ignoreCase)),
+        // verify_clean_subdirectory's read_directory folds case: removed before the writes
+        caseVariantsExpendable: true,
       })
-    : { untracked: [], lostDirs: [] };
+    : { untracked: [], lostDirs: [], caseVariants: [] };
   const message = options.plainErrors
     ? firstPlainError({
         wouldOverwrite: staged,
@@ -1019,6 +1022,9 @@ async function switchTreesWith(
       await worktree.remove(path);
       await pruneEmptyParents(worktree, path);
     }
+    // core.ignorecase: what verify_clean_subdirectory took as tracked in a directory a file
+    // replaces goes with the directory (checkout_entry removes the subtree)
+    await removeCaseVariants(worktree, found.caseVariants ?? []);
     if (writing.size > 0) {
       // only the written paths are planned (each validated, its blob checked)
       const plan = await planPathsRestore(

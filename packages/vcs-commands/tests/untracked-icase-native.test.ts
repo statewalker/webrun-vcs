@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { IndexDirnameCase } from "../src/commands/index-adder.js";
-import type { Git } from "../src/index.js";
+import { type Git, ResetMode } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitOut, gitRun, openRepo, putFile } from "./status-native-support.js";
 
@@ -337,6 +337,157 @@ describeGit(
       const ours = await openRepo(root, mine, DATES);
       const result = await ours.checkout().setName("side").call();
       expect(result.conflicts ?? []).toEqual(["d"]);
+      expect(listTree(mine)).toEqual(listTree(theirs));
+      expect(listTree(mine)).toContain("d/X.txt");
+    });
+  },
+);
+
+// every unpack-trees caller runs verify_absent and verify_clean_subdirectory with the same
+// case-folding index lookups (icase_exists, read_directory's index_file_exists): read-tree
+// -m -u (one and two trees; three leave this file/directory change conflicted), merge (fast-forward and the merge-ort result's
+// checkout), cherry-pick, stash apply and reset --merge/--keep pass over a case variant of a
+// tracked file in a directory a file replaces, and remove it with the directory
+describeGit(
+  "unpack-trees callers replacing a directory under core.ignorecase: verify_clean_subdirectory",
+  () => {
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "untracked-icase-unpack-"));
+    });
+    afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+    /**
+     * `d/x.txt` and `d/sub/a.txt` on main, a file `d` on `side` (and, with `diverged`, a
+     * commit of main's own after it), a stash replacing `d` by a file, then `extra` put in `d/`
+     */
+    function buildReplaced(dir: string, extra: readonly string[], diverged: boolean): void {
+      git(root, ["init", "-q", "-b", "main", dir]);
+      git(dir, ["config", "core.ignorecase", "true"]);
+      git(dir, ["config", "core.trustctime", "false"]);
+      putFile(dir, "d/x.txt", "x\n");
+      putFile(dir, "d/sub/a.txt", "a\n");
+      putFile(dir, "k.txt", "k\n");
+      git(dir, ["add", "."]);
+      git(dir, ["commit", "-qm", "init"]);
+      git(dir, ["checkout", "-q", "-b", "side"]);
+      git(dir, ["rm", "-rq", "d"]);
+      putFile(dir, "d", "file\n");
+      git(dir, ["add", "d"]);
+      git(dir, ["commit", "-qm", "side"]);
+      git(dir, ["checkout", "-q", "main"]);
+      if (diverged) {
+        putFile(dir, "m.txt", "m\n");
+        git(dir, ["add", "m.txt"]);
+        git(dir, ["commit", "-qm", "main"]);
+      }
+      // a stash whose worktree replaces d by a file
+      git(dir, ["rm", "-rq", "d"]);
+      putFile(dir, "d", "stashed\n");
+      git(dir, ["add", "d"]);
+      git(dir, ["stash", "-q"]);
+      for (const path of extra) putFile(dir, path, `${path}\n`);
+      // what a copy changes (ctime, inode) is refreshed, as read-tree trusts the stat data
+      git(dir, ["update-index", "-q", "--refresh"]);
+    }
+
+    const CASES: ReadonlyArray<{
+      label: string;
+      args: string[];
+      run: (git: Git) => Promise<unknown>;
+      diverged?: boolean;
+    }> = [
+      {
+        label: "read-tree -m -u <tree> (oneway_merge)",
+        args: ["read-tree", "-m", "-u", "side"],
+        run: (g) => g.readTree().addTree("side").setMerge(true).setUpdate(true).call(),
+      },
+      {
+        label: "read-tree -m -u <head> <tree> (twoway_merge)",
+        args: ["read-tree", "-m", "-u", "main", "side"],
+        run: (g) =>
+          g.readTree().addTree("main").addTree("side").setMerge(true).setUpdate(true).call(),
+      },
+      {
+        label: "merge, fast-forward",
+        args: ["merge", "-q", "side"],
+        run: (g) => g.merge().include("side").call(),
+      },
+      {
+        label: "merge, the merge-ort result's checkout",
+        args: ["merge", "-q", "--no-edit", "side"],
+        run: (g) => g.merge().include("side").call(),
+        diverged: true,
+      },
+      {
+        label: "cherry-pick",
+        args: ["cherry-pick", "side"],
+        run: (g) => g.cherryPick().include("side").call(),
+        diverged: true,
+      },
+      {
+        label: "stash apply",
+        args: ["stash", "apply", "-q"],
+        run: (g) => g.stashApply().call(),
+      },
+      {
+        label: "reset --merge",
+        args: ["reset", "-q", "--merge", "side"],
+        run: (g) => g.reset().setRef("side").setMode(ResetMode.MERGE).call(),
+      },
+      {
+        label: "reset --keep",
+        args: ["reset", "-q", "--keep", "side"],
+        run: (g) => g.reset().setRef("side").setMode(ResetMode.KEEP).call(),
+      },
+    ];
+
+    for (const { label, args, run, diverged } of CASES) {
+      for (const [what, extra, refused] of [
+        [
+          "a case variant of a tracked file goes with the directory",
+          ["d/X.txt", "d/SUB/A.TXT"],
+          false,
+        ],
+        ["a new file in the directory still refuses", ["d/X.txt", "d/new.txt"], true],
+      ] as const) {
+        it(`${label}: ${what}`, async () => {
+          const theirs = join(root, "theirs");
+          const mine = join(root, "mine");
+          buildReplaced(theirs, extra, diverged === true);
+          buildReplaced(mine, extra, diverged === true);
+          const native = gitRun(root, theirs, args, DATES);
+          expect(native.status !== 0, native.stderr).toBe(refused);
+          const ours = await openRepo(root, mine, DATES);
+          const error = await run(ours).then(
+            () => undefined,
+            (e: unknown) => e,
+          );
+          if (!refused) expect(error).toBeUndefined();
+          expect(listTree(mine)).toEqual(listTree(theirs));
+          expect(git(mine, ["rev-parse", "HEAD"])).toEqual(git(theirs, ["rev-parse", "HEAD"]));
+          expect(git(mine, ["ls-files", "-s"])).toEqual(git(theirs, ["ls-files", "-s"]));
+          expect(git(mine, ["status", "--porcelain"])).toEqual(
+            git(theirs, ["status", "--porcelain"]),
+          );
+          // nothing the refusal names is lost
+          if (refused) expect(listTree(mine)).toContain("d/new.txt");
+        });
+      }
+    }
+
+    it("without core.ignorecase read-tree -m -u still refuses over a case variant", async () => {
+      const theirs = join(root, "theirs");
+      const mine = join(root, "mine");
+      for (const dir of [theirs, mine]) {
+        buildReplaced(dir, ["d/X.txt"], false);
+        git(dir, ["config", "core.ignorecase", "false"]);
+      }
+      const native = gitRun(root, theirs, ["read-tree", "-m", "-u", "main", "side"], DATES);
+      expect(native.status).not.toBe(0);
+      const ours = await openRepo(root, mine, DATES);
+      await expect(
+        ours.readTree().addTree("main").addTree("side").setMerge(true).setUpdate(true).call(),
+      ).rejects.toThrow();
       expect(listTree(mine)).toEqual(listTree(theirs));
       expect(listTree(mine)).toContain("d/X.txt");
     });

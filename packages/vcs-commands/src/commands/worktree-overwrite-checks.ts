@@ -178,6 +178,86 @@ async function isNestedRepository(worktree: Worktree, dir: string): Promise<bool
   return worktree.exists(`${dir}/.git`);
 }
 
+/**
+ * How unpack-trees asks the source index under `core.ignorecase` (its name hashes fold ASCII
+ * case): `icase_exists` for a file in the way, and `read_directory`'s `index_file_exists`
+ * for the files of a directory a file replaces (`verify_clean_subdirectory`).
+ *
+ * ```typescript
+ * const folding = new IndexCaseFolding(index, await restoreCaseOptions(worktree, ignoreCase));
+ * if (await folding.exists(worktree, path, entry)) continue; // that entry's own file
+ * const variants = folding.variants(); // pass to untrackedUnder, remove `found` before writing
+ * ```
+ */
+export class IndexCaseFolding {
+  private foldedEntries: Map<string, unknown> | undefined;
+  private lookup: IndexPathLookup | undefined;
+
+  constructor(
+    /** The source index's entries by path (their stat compared by {@link exists}) */
+    private readonly index: Map<string, unknown>,
+    private readonly options: { ignoreCase?: boolean; foldsCase?: boolean },
+  ) {}
+
+  /** Whether `core.ignorecase` is on (nothing folds otherwise). */
+  get active(): boolean {
+    return this.options.ignoreCase === true;
+  }
+
+  /** The index entry at `path` in another case (ASCII letters only, as memihash), if any. */
+  private otherCase(path: string): CheckedEntry | undefined {
+    if (!this.foldedEntries) {
+      this.foldedEntries = new Map();
+      for (const [p, e] of this.index) {
+        const key = foldAsciiCase(p);
+        if (!this.foldedEntries.has(key)) this.foldedEntries.set(key, e);
+      }
+    }
+    const entry = this.foldedEntries.get(foldAsciiCase(path)) as CheckedEntry | undefined;
+    return typeof entry?.mode === "number" ? entry : undefined;
+  }
+
+  /**
+   * git's `icase_exists`: the file at `path` is an index entry seen in another case, so no
+   * obstacle (a case-only rename on a case-folding worktree). Only where the worktree folds
+   * case (`foldsCase` not false) and the file's stat matches that entry's.
+   */
+  async exists(worktree: Worktree, path: string, current: WorktreeEntry): Promise<boolean> {
+    if (!this.options.ignoreCase || this.options.foldsCase === false) return false;
+    const entry = this.otherCase(path);
+    if (!entry) return false;
+    if ((current.mode === FileMode.SYMLINK) !== (entry.mode === FileMode.SYMLINK)) return false;
+    if (basicStatMatches(entry as StagingEntry, current)) return true;
+    // an entry without a usable stat (a store that records none): its content tells
+    return !entry.mtime && !(await differsFrom(worktree, path, entry, current));
+  }
+
+  /**
+   * The case-folding lookup {@link untrackedUnder} takes as `caseVariants` (a fresh `found`
+   * list each call); undefined without `core.ignorecase`.
+   */
+  variants(): { index: IndexPathLookup; found: string[] } | undefined {
+    if (!this.options.ignoreCase) return undefined;
+    this.lookup ??= new IndexPathLookup([...this.index.keys()], { ignoreCase: true });
+    return { index: this.lookup, found: [] };
+  }
+}
+
+/**
+ * Removes the case variants a check found expendable (see {@link InTheWay.caseVariants}),
+ * once every refusal check has passed and before the first write: git's `checkout_entry`
+ * removes the directory's subtree where it writes the file.
+ */
+export async function removeCaseVariants(
+  worktree: Worktree,
+  paths: Iterable<string>,
+): Promise<void> {
+  for (const path of paths) {
+    await worktree.remove(path);
+    await pruneEmptyParents(worktree, path);
+  }
+}
+
 /** What stands where an operation writes: untracked files, and directories with some. */
 export interface InTheWay {
   /** Untracked files or links on a written path, or on a leading component of one */
@@ -228,30 +308,9 @@ export async function findInTheWay(
   const untracked = new Set<string>();
   const lostDirs: string[] = [];
   const caseVariants: string[] = [];
-  let folded: IndexPathLookup | undefined;
   // the index by folded path (git's index_file_exists with icase: memihash and strncasecmp
   // fold ASCII letters only), built only when needed
-  let foldedEntries: Map<string, unknown> | undefined;
-  const otherCase = (path: string): CheckedEntry | undefined => {
-    if (!foldedEntries) {
-      foldedEntries = new Map();
-      for (const [p, e] of index) {
-        const key = foldAsciiCase(p);
-        if (!foldedEntries.has(key)) foldedEntries.set(key, e);
-      }
-    }
-    const entry = foldedEntries.get(foldAsciiCase(path)) as CheckedEntry | undefined;
-    return typeof entry?.mode === "number" ? entry : undefined;
-  };
-  const icaseExists = async (path: string, current: WorktreeEntry): Promise<boolean> => {
-    if (!options.ignoreCase || options.foldsCase === false) return false;
-    const entry = otherCase(path);
-    if (!entry) return false;
-    if ((current.mode === FileMode.SYMLINK) !== (entry.mode === FileMode.SYMLINK)) return false;
-    if (basicStatMatches(entry as StagingEntry, current)) return true;
-    // an entry without a usable stat (a store that records none): its content tells
-    return !entry.mtime && !(await differsFrom(worktree, path, entry, current));
-  };
+  const folding = new IndexCaseFolding(index, options);
   const tracked = (p: string) => index.has(p) && !removes.has(p);
   // directories holding tracked files that stay: a file written there would replace them
   // (read from the index only when something is written)
@@ -280,7 +339,11 @@ export async function findInTheWay(
       const prefix = parts.slice(0, k).join("/");
       const entry = await worktree.getEntry(prefix);
       if (!entry || entry.isDirectory || removes.has(prefix)) continue;
-      if (!(await worktree.isIgnored(prefix))) untracked.add(prefix);
+      // check_ok_to_remove of a leading path: ignored, or an index entry's own file in
+      // another case (icase_exists), is no obstacle
+      if (!(await worktree.isIgnored(prefix)) && !(await folding.exists(worktree, prefix, entry))) {
+        untracked.add(prefix);
+      }
       blocked = true;
     }
     if (blocked) continue;
@@ -291,16 +354,12 @@ export async function findInTheWay(
       // core.ignorecase the source index is asked folding case (read_directory's
       // index_file_exists): a case variant of a tracked file there goes with the directory
       const keeps = (p: string) => tracked(p) || removes.has(p);
-      folded ??=
-        options.ignoreCase && options.caseVariantsExpendable
-          ? new IndexPathLookup([...index.keys()], { ignoreCase: true })
-          : undefined;
-      const variants = folded ? { index: folded, found: [] as string[] } : undefined;
+      const variants = options.caseVariantsExpendable ? folding.variants() : undefined;
       if (await untrackedUnder(worktree, path, keeps, false, variants)) lostDirs.push(path);
       else if (variants) caseVariants.push(...variants.found);
       continue;
     }
-    if (await icaseExists(path, entry)) continue;
+    if (await folding.exists(worktree, path, entry)) continue;
     if (!(await worktree.isIgnored(path))) untracked.add(path);
   }
   return {

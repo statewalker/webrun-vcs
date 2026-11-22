@@ -27,8 +27,10 @@ import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils
 import {
   encodeUntrackedCache,
   invalidateUntrackedPath,
+  newUntrackedCache,
   parseUntrackedCache,
   type UntrackedCache,
+  untrackedCacheIdentIs,
 } from "../status/untracked-cache.js";
 import {
   type CacheTree,
@@ -133,6 +135,27 @@ export interface IndexSettings {
    * `sharedindex.0000…` and a link naming no shared index, losing the entries).
    */
   skipHash?: boolean;
+  /**
+   * The version a new index is written in (read-cache.c `get_index_format_default`:
+   * `$GIT_INDEX_VERSION`, else `index.version`, else 4 under `feature.manyFiles`, else 3,
+   * which the write lowers to 2 when no entry needs extended flags). An index read from a
+   * file keeps the file's version, as git's `istate->version`: only an index with no file
+   * behind it (none was there when it was read) takes this one.
+   */
+  version?: IndexVersion;
+  /** The warning git prints when it falls back from an invalid `version` (written once per new index) */
+  versionWarning?: string;
+  /**
+   * `core.untrackedCache` as git's `tweak_untracked_cache` applies it to every index it
+   * reads (default `write` under `feature.manyFiles`): `remove` drops the `UNTR` extension,
+   * `write` adds an empty one (`newUntrackedCache`: `untrackedIdent`, `untrackedFlags`, no
+   * root) when there is none or its ident is another's; undefined keeps it as it is.
+   */
+  untrackedCache?: "write" | "remove";
+  /** The ident a cache `untrackedCache: "write"` adds names (git's `set_untracked_ident`); none: nothing added */
+  untrackedIdent?: string;
+  /** The dir flags a cache `untrackedCache: "write"` adds is made for (`new_untracked_cache_flags`) */
+  untrackedFlags?: number;
 }
 
 /**
@@ -151,6 +174,8 @@ export interface IndexHost {
   settings?(): IndexSettings | Promise<IndexSettings>;
   /** Called once a write used the settings (the index file or its lock written). */
   written?(): void;
+  /** Receives the warnings a write prints (git's stderr: an invalid `index.version`) */
+  warn?(line: string): void;
   /** The trees a sparse index expands from (`load`) and collapses into (`store`) */
   trees?: Pick<Trees, "load" | "store">;
 }
@@ -181,6 +206,8 @@ interface IndexWritePlan {
   /** The extensions the instance holds once written (the full index's) */
   extensions: IndexExtension[];
   split: SplitState | undefined;
+  /** The version written in (the main file's, for a split index) */
+  version: IndexVersion;
   /** The sparse directories written (a sparse index) */
   sparseDirs?: string[];
   /** Run before the index file is in place (a new shared index written) */
@@ -375,7 +402,12 @@ export async function writeIndexFile(
  * @internal
  */
 export class IndexFile {
-  version: IndexVersion = INDEX_VERSION_2;
+  /**
+   * The version of the index read (git's `istate->version`), or of the last write;
+   * undefined while no index file was read: the next write takes the configured default
+   * (`IndexSettings.version`).
+   */
+  version: IndexVersion | undefined;
   /** The entries as encoded in the index last read or written: a write copies their bytes */
   private encoding: IndexEncoding | undefined;
   private extensions: IndexExtension[] = [];
@@ -454,11 +486,22 @@ export class IndexFile {
   /**
    * Whether the configuration asks for the index file to be written again although no entry
    * changed: `core.splitIndex` splits an index read whole, or unsplits one read split (git
-   * marks the index changed then: `SPLIT_INDEX_ORDERED`, `remove_split_index`).
+   * marks the index changed then: `SPLIT_INDEX_ORDERED`, `remove_split_index`). With
+   * `untrackedCache`, also when `core.untrackedCache` adds or removes the untracked cache
+   * (`UNTRACKED_CHANGED`), even with no index file yet: git's `SKIP_IF_UNCHANGED` writes
+   * (`add`), its `repo_update_index_if_able` after a refresh only with stats to store.
    */
-  async wantsRewrite(): Promise<boolean> {
-    if (this.refused || this.checksum === undefined || this.checksum === null) return false;
+  async wantsRewrite(options: { untrackedCache?: boolean } = {}): Promise<boolean> {
+    if (this.refused || this.checksum === undefined) return false;
+    if (this.checksum === null && !options.untrackedCache) return false;
     const settings = (await this.host?.settings?.()) ?? {};
+    // tweak_untracked_cache marks the index changed (UNTRACKED_CHANGED) when it adds or
+    // removes the cache: a write that skips an unchanged index still writes then
+    if (options.untrackedCache) {
+      const extensions = this.checksum === null ? [] : this.extensions;
+      if (tweakUntrackedCache(extensions, settings) !== extensions) return true;
+      if (this.checksum === null) return false;
+    }
     if (settings.splitIndex === true && this.split === undefined && this.sparseDirs !== undefined) {
       throw new Error(SPLIT_WITH_SPARSE);
     }
@@ -589,9 +632,15 @@ export class IndexFile {
    */
   private async plan(
     entries: readonly StagingEntry[],
-    extensions: IndexExtension[],
+    given: IndexExtension[],
   ): Promise<IndexWritePlan> {
     const settings: IndexSettings = (await this.host?.settings?.()) ?? {};
+    // do_write_index: an index with no version yet takes get_index_format_default's
+    if (this.version === undefined && settings.versionWarning) {
+      this.host?.warn?.(settings.versionWarning);
+    }
+    const version = this.version ?? settings.version ?? INDEX_VERSION_2;
+    const extensions = tweakUntrackedCache(given, settings);
     let split = this.split;
     if (settings.splitIndex === false) split = undefined;
     else if (settings.splitIndex === true && !split) {
@@ -599,19 +648,14 @@ export class IndexFile {
       if (this.sparseDirs !== undefined) throw new Error(SPLIT_WITH_SPARSE);
       split = { ordered: true };
     }
-    if (split) return this.planSplit(entries, extensions, split, settings);
-    const sparse = await this.planSparse(entries, extensions, settings);
+    if (split) return this.planSplit(entries, extensions, split, settings, version);
+    const sparse = await this.planSparse(entries, extensions, settings, version);
     if (sparse) return sparse;
-    const { bytes, checksum, encoding } = await encodeIndexFileBytes(
-      entries,
-      this.version,
-      extensions,
-      {
-        ...(this.encoding ? { source: this.encoding } : {}),
-        ...(settings.skipHash ? { skipHash: true } : {}),
-      },
-    );
-    return { bytes, checksum, encoding, extensions, split: undefined };
+    const { bytes, checksum, encoding } = await encodeIndexFileBytes(entries, version, extensions, {
+      ...(this.encoding ? { source: this.encoding } : {}),
+      ...(settings.skipHash ? { skipHash: true } : {}),
+    });
+    return { bytes, checksum, encoding, extensions, split: undefined, version };
   }
 
   /** `write_locked_index` of a split index: a new shared index when due, then the split file. */
@@ -620,6 +664,7 @@ export class IndexFile {
     extensions: IndexExtension[],
     split: SplitState,
     settings: IndexSettings,
+    version: IndexVersion,
   ): Promise<IndexWritePlan> {
     let shared = split.shared;
     let classification: SplitClassification = shared
@@ -639,7 +684,7 @@ export class IndexFile {
     if (newShared) {
       const written = await encodeIndexFileBytes(
         entries,
-        this.version,
+        version,
         [],
         this.encoding ? { source: this.encoding } : {},
       );
@@ -648,7 +693,7 @@ export class IndexFile {
       const fresh: SharedIndex = {
         id,
         entries: sortedEntries,
-        version: written.encoding?.version ?? this.version,
+        version: written.encoding?.version ?? version,
         ...(written.encoding ? { encoding: written.encoding } : {}),
       };
       shared = fresh;
@@ -663,7 +708,7 @@ export class IndexFile {
     const { items, link } = prepareSplitWrite(classification, sharedId);
     const main = await encodeIndexInOrder(
       items,
-      this.version,
+      version,
       [{ signature: "link", data: link }, ...extensions],
       settings.skipHash ? { skipHash: true } : {},
     );
@@ -674,6 +719,7 @@ export class IndexFile {
       checksum: main.checksum,
       encoding: finalShared?.encoding,
       extensions,
+      version,
       split: finalShared ? { shared: finalShared } : {},
       ...(before ? { before } : {}),
       after: async () => {
@@ -729,6 +775,7 @@ export class IndexFile {
     entries: readonly StagingEntry[],
     extensions: IndexExtension[],
     settings: IndexSettings,
+    version: IndexVersion,
   ): Promise<IndexWritePlan | undefined> {
     const patterns = settings.sparse;
     const trees = this.host?.trees ?? this.options.defaultTrees;
@@ -765,7 +812,14 @@ export class IndexFile {
         },
       );
       if (kept && (await sparseIndexMatches(kept.entries, entries, trees))) {
-        return this.sparsePlan(kept.entries, kept.cacheTree, tree, rest, settings.skipHash);
+        return this.sparsePlan(
+          kept.entries,
+          kept.cacheTree,
+          tree,
+          rest,
+          version,
+          settings.skipHash,
+        );
       }
     }
     let fromIndex = true;
@@ -783,7 +837,14 @@ export class IndexFile {
       collapsed = collapseSparseIndex(entries, tree, inCheckout);
       if (!(await sparseIndexMatches(collapsed.entries, entries, trees))) return undefined;
     }
-    return this.sparsePlan(collapsed.entries, collapsed.cacheTree, tree, rest, settings.skipHash);
+    return this.sparsePlan(
+      collapsed.entries,
+      collapsed.cacheTree,
+      tree,
+      rest,
+      version,
+      settings.skipHash,
+    );
   }
 
   /** The bytes of a sparse index: its entries, its cache-tree, the other extensions, `sdir`. */
@@ -792,6 +853,7 @@ export class IndexFile {
     sparseTree: CacheTree | undefined,
     fullTree: CacheTree | undefined,
     rest: IndexExtension[],
+    version: IndexVersion,
     skipHash?: boolean,
   ): Promise<IndexWritePlan> {
     const onDisk: IndexExtension[] = [
@@ -801,7 +863,7 @@ export class IndexFile {
     ];
     const { bytes, checksum, encoding } = await encodeIndexFileBytes(
       sparseEntries,
-      this.version,
+      version,
       onDisk,
       {
         ...(this.encoding ? { source: this.encoding } : {}),
@@ -819,6 +881,7 @@ export class IndexFile {
       checksum,
       encoding,
       extensions: kept,
+      version,
       split: undefined,
       sparseDirs: sparseEntries.filter(isSparseDirectoryEntry).map((e) => e.path),
     };
@@ -847,6 +910,7 @@ export class IndexFile {
       this.lastEntries = [];
       this.sparseDirs = undefined;
       this.checksum = null;
+      this.version = undefined;
       return undefined;
     }
     const data = await readFile(this.files, this.path);
@@ -1085,6 +1149,7 @@ export class IndexFile {
     this.split = plan.split;
     this.lastEntries = plan.split ? entries.slice() : [];
     this.sparseDirs = plan.sparseDirs;
+    this.version = plan.version;
     this.wrote(entries, plan.extensions);
   }
 
@@ -1122,6 +1187,7 @@ export class IndexFile {
           encoding: IndexEncoding | undefined;
           split: SplitState | undefined;
           sparseDirs?: string[];
+          version?: IndexVersion;
           after?: () => Promise<void>;
         }
       | undefined;
@@ -1155,6 +1221,7 @@ export class IndexFile {
           encoding: plan.encoding,
           split: plan.split,
           sparseDirs: plan.sparseDirs,
+          version: plan.version,
           after: plan.after,
         };
       },
@@ -1178,6 +1245,7 @@ export class IndexFile {
         this.split = pending.split;
         this.lastEntries = pending.split ? pending.entries.slice() : [];
         this.sparseDirs = pending.sparseDirs;
+        if (pending.version !== undefined) this.version = pending.version;
         this.wrote(pending.entries, pending.extensions);
       },
       rollback: async () => {
@@ -1404,6 +1472,30 @@ function withUntrackedCache(
     at++;
   }
   return [...others.slice(0, at), { signature: "UNTR", data: untracked }, ...others.slice(at)];
+}
+
+/**
+ * git's `tweak_untracked_cache` on the index a write carries: `core.untrackedCache=false`
+ * removes the `UNTR` extension, `true` adds an empty cache (`add_untracked_cache`) when there
+ * is none or its ident names another worktree or system; a cache of other flags is kept.
+ */
+function tweakUntrackedCache(
+  extensions: IndexExtension[],
+  settings: IndexSettings,
+): IndexExtension[] {
+  if (settings.untrackedCache === "remove") {
+    return extensions.some((e) => e.signature === "UNTR")
+      ? extensions.filter((e) => e.signature !== "UNTR")
+      : extensions;
+  }
+  if (settings.untrackedCache !== "write" || settings.untrackedIdent === undefined) {
+    return extensions;
+  }
+  const ext = extensions.find((e) => e.signature === "UNTR");
+  const current = ext ? parseUntrackedCache(ext.data) : undefined;
+  if (current && untrackedCacheIdentIs(current, settings.untrackedIdent)) return extensions;
+  const fresh = newUntrackedCache(settings.untrackedIdent, settings.untrackedFlags ?? 0);
+  return withUntrackedCache(extensions, encodeUntrackedCache(fresh));
 }
 
 /** The (path, stage) keys of `a` and `b` (sorted lists) that only one of them has. */

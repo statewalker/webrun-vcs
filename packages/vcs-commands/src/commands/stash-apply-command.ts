@@ -39,6 +39,7 @@ import {
   findInTheWay,
   overwriteMessage,
   pruneEmptyParents,
+  removeCaseVariants,
   removeDirectoryIfEmpty,
   worktreeDiffers,
 } from "./worktree-overwrite-checks.js";
@@ -409,6 +410,8 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       removes: new Set([...removes, ...movedFrom]),
       index,
       ...caseOptions,
+      // verify_clean_subdirectory's read_directory folds case: removed before the writes
+      caseVariantsExpendable: true,
     });
     // the stashed untracked files (their paths validated before any write); restored
     // after the merge, as git restores them (`checkout-index --all` of their own index)
@@ -453,6 +456,9 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       );
       await sparse.unlink(worktree, unlink);
     }
+    // core.ignorecase: what verify_clean_subdirectory took as tracked in a directory a file
+    // replaces goes with the directory (checkout_entry removes the subtree)
+    await removeCaseVariants(worktree, found.caseVariants ?? []);
     // a file a file/directory conflict moves aside goes to `<path>~<side>` first
     for (const conflict of conflicts.values()) {
       if (!conflict.moveFrom) continue;
@@ -541,6 +547,8 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       this.staging.setCacheTree(tree);
     }
     const editor = this.staging.createEditor();
+    /** git's errors from putting back entries the merge removed (unstage_changes_unless_new) */
+    const unstageErrors: string[] = [];
     const stage = async (path: string, entry: CheckedEntry, stageNumber: 0 | 1 | 2 | 3) => {
       // the worktree's stat only for a file that holds the staged blob (else it is rehashed)
       let stats: { size: number; mtime: number; ctime?: number } | undefined;
@@ -600,14 +608,37 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       await updateIndexCacheTree(this.staging, this.trees);
     } else {
       // the index keeps its entries, plus the files the stash adds (git stages them)
+      const added = new Set<string>();
       for (const path of changed) {
         const result = merge.result.get(path);
-        if (result && !ours.has(path)) await stage(path, result, 0);
+        if (result && !ours.has(path)) {
+          await stage(path, result, 0);
+          added.add(path);
+        }
+      }
+      // unstage_changes_unless_new puts back what the merge removed with add_index_entry's
+      // ADD_CACHE_OK_TO_ADD alone: an entry clashing with an added file as a file or a
+      // directory is refused ("appears as both a file and as a directory") and stays out
+      const addedDirs = new Set<string>();
+      for (const path of added) {
+        for (let at = path.indexOf("/"); at > 0; at = path.indexOf("/", at + 1)) {
+          addedDirs.add(path.slice(0, at));
+        }
+      }
+      for (const path of changed) {
+        if (!ours.has(path) || merge.result.has(path) || conflicts.has(path)) continue;
+        let clash = addedDirs.has(path);
+        for (let at = path.indexOf("/"); at > 0 && !clash; at = path.indexOf("/", at + 1)) {
+          clash = added.has(path.slice(0, at));
+        }
+        if (!clash) continue;
+        editor.remove(path);
+        unstageErrors.push(`error: '${path}' appears as both a file and as a directory`);
       }
       await editor.finish();
     }
     await this.staging.write();
-    const warnings = await this.finishSparse(sparse, worktree, writing);
+    const warnings = [...unstageErrors, ...(await this.finishSparse(sparse, worktree, writing))];
     await this.writeUntracked(untrackedPlan, worktree, stashId, trust.symlinks);
 
     return {

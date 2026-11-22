@@ -972,10 +972,17 @@ export class AddCommand extends GitCommand<AddResult> {
 
   /**
    * Writes the index when this add changed it (git's `write_locked_index` with
-   * `SKIP_IF_UNCHANGED`: skip-worktree flags cleared on reading alone write nothing).
+   * `SKIP_IF_UNCHANGED`: skip-worktree flags cleared on reading alone write nothing), or when
+   * the configuration changes it on reading (`core.splitIndex`, `core.untrackedCache`: git's
+   * `tweak_split_index` and `tweak_untracked_cache` mark the index changed).
    */
   private async writeIfChanged(): Promise<void> {
-    if (this.staging.hasUnwrittenChanges?.() === false) return;
+    if (
+      this.staging.hasUnwrittenChanges?.() === false &&
+      !(await this.staging.wantsRewrite?.({ untrackedCache: true }))
+    ) {
+      return;
+    }
     await this.staging.write();
   }
 

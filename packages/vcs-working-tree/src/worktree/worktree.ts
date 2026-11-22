@@ -277,6 +277,12 @@ export interface Worktree {
    * through `walk`, and no untracked cache is used.
    */
   untrackedScanHost?(): Promise<UntrackedScanHost>;
+
+  /**
+   * The worktree's root as the host names it (an absolute path on Node); undefined when not
+   * known. git's untracked cache names it in its ident (`Location <path>, system <name>`).
+   */
+  readonly hostPath?: string;
   getEntry(path: string): Promise<WorktreeEntry | undefined>;
   /**
    * {@link getEntry} of many paths at once, the answers in the order of `paths`: the stat

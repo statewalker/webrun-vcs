@@ -21,7 +21,7 @@ import {
 } from "@statewalker/vcs-working-tree";
 import type { CommandCommits, CommandRefs } from "../git-command.js";
 import { StashApplyStatus } from "../results/stash-result.js";
-import { worktreeModeTrust } from "./core-config.js";
+import { coreBool, worktreeModeTrust } from "./core-config.js";
 import {
   flatTree,
   type MergeRefusal,
@@ -37,11 +37,13 @@ import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
 import { StashCreateCommand } from "./stash-create-command.js";
 import { STASH_REF } from "./stash-list-command.js";
-import { writeTreeRestorePlan } from "./tree-restore.js";
+import { restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import {
   type CheckedEntry,
   flaggedEntryDiffers,
+  IndexCaseFolding,
   pruneEmptyParents,
+  removeCaseVariants,
   untrackedUnder,
   worktreeDiffers,
   worktreeModified,
@@ -149,6 +151,10 @@ async function resetMergeWith(
   const checked = conflictEntries.size > 0 ? new Map([...index, ...conflictEntries]) : index;
   const trust = checkedWorktree ? worktreeModeTrust(ctx.workingCopy, checkedWorktree) : undefined;
   const indexTime = ctx.staging.getUpdateTime();
+  // core.ignorecase: verify_absent asks the source index folding case (icase_exists,
+  // verify_clean_subdirectory's read_directory); the case variants found go before the writes
+  const folding = await caseFoldingOf(ctx, checked);
+  const caseVariants: string[] = [];
   const refuse = (message: string, path: string): MergeRefusal => ({
     message: options.plain
       ? `error: ${message}`
@@ -220,6 +226,8 @@ async function resetMergeWith(
             indexTime,
             refuse,
             notUptodate,
+            folding,
+            caseVariants,
           })
         : undefined;
       if (refusal) return refusedWith(refusal);
@@ -250,6 +258,9 @@ async function resetMergeWith(
         await pruneEmptyParents(worktree, path);
       }
     }
+    // core.ignorecase: what verify_clean_subdirectory took as tracked in a directory a file
+    // replaces goes with the directory (checkout_entry removes the subtree)
+    await removeCaseVariants(worktree, caseVariants);
     if (writing.size > 0) {
       const plan = await planPathsRestore(ctx, target, targetTree, writing, "reset");
       await writeTreeRestorePlan(worktree, ctx.blobs, plan, "reset", {
@@ -402,6 +413,8 @@ async function resetKeepWith(
   const worktree = ctx.worktree;
   const trust = worktree ? worktreeModeTrust(ctx.workingCopy, worktree) : undefined;
   const indexTime = ctx.staging.getUpdateTime();
+  const folding = await caseFoldingOf(ctx, index);
+  const caseVariants: string[] = [];
   const refuse = (message: string, path: string): MergeRefusal => ({
     message: `error: ${message}\nfatal: Could not reset index file to revision '${label}'.`,
     paths: [path],
@@ -444,6 +457,8 @@ async function resetKeepWith(
         indexTime,
         refuse,
         notUptodate,
+        folding,
+        caseVariants,
       });
       if (refusal) return refusedWith(refusal);
     }
@@ -471,6 +486,9 @@ async function resetKeepWith(
         await pruneEmptyParents(worktree, path);
       }
     }
+    // core.ignorecase: what verify_clean_subdirectory took as tracked in a directory a file
+    // replaces goes with the directory (checkout_entry removes the subtree)
+    await removeCaseVariants(worktree, caseVariants);
     if (writing.size > 0) {
       const plan = await planPathsRestore(ctx, target, targetTree, writing, "reset");
       await writeTreeRestorePlan(worktree, ctx.blobs, plan, "reset", {
@@ -662,6 +680,10 @@ async function verifyAbsent(
     indexTime?: number;
     refuse: (message: string, path: string) => MergeRefusal;
     notUptodate: (path: string) => MergeRefusal;
+    /** `core.ignorecase`'s folding lookups of the source index */
+    folding?: IndexCaseFolding;
+    /** Receives the case variants a replaced directory holds (removed before the writes) */
+    caseVariants?: string[];
   },
 ): Promise<MergeRefusal | undefined> {
   const overwritten = (p: string) =>
@@ -674,6 +696,8 @@ async function verifyAbsent(
     if (!entry) return undefined;
     if (entry.isDirectory) continue;
     if (removing.has(prefix) || (await worktree.isIgnored(prefix))) return undefined;
+    // check_ok_to_remove: a case variant of an index entry's own file (icase_exists)
+    if (await options.folding?.exists(worktree, prefix, entry)) return undefined;
     return overwritten(prefix);
   }
   const entry = await worktree.getEntry(path);
@@ -693,13 +717,25 @@ async function verifyAbsent(
         return options.notUptodate(p);
       }
     }
-    if (await untrackedUnder(worktree, path, options.tracked)) {
+    const variants = options.caseVariants ? options.folding?.variants() : undefined;
+    if (await untrackedUnder(worktree, path, options.tracked, false, variants)) {
       return options.refuse(`Updating '${path}' would lose untracked files in it`, path);
     }
+    if (variants) options.caseVariants?.push(...variants.found);
     return undefined;
   }
   if (await worktree.isIgnored(path)) return undefined;
+  if (await options.folding?.exists(worktree, path, entry)) return undefined;
   return overwritten(path);
+}
+
+/** The source index's case-folding lookups under `core.ignorecase` (undefined: off). */
+async function caseFoldingOf(
+  ctx: SequencerContext,
+  index: Map<string, CheckedEntry>,
+): Promise<IndexCaseFolding | undefined> {
+  if (!ctx.worktree || !coreBool(ctx.workingCopy, "ignorecase", false)) return undefined;
+  return new IndexCaseFolding(index, await restoreCaseOptions(ctx.worktree, true));
 }
 
 /**
