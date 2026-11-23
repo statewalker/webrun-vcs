@@ -57,6 +57,11 @@ export const DEFAULT_FETCH_REFSPECS = ["+refs/heads/*:refs/heads/*", "+refs/tags
 export type TagMode =
   /** Tags pointing at fetched objects (git's default) */
   | "auto"
+  /**
+   * Tags pointing at fetched objects even when no refspec writes a ref (remote.c's
+   * `fetch_tags = 1`: a remote read from a `branches/` file)
+   */
+  | "auto-always"
   /** Every tag (`refs/tags/*:refs/tags/*`) */
   | "all"
   /** Only tags the refspecs select */
@@ -320,11 +325,12 @@ export async function fetchFromConnection(
   // git follows tags only when a refspec writes a ref (fetch.c: autotags); fetching
   // objects only (`git fetch <url> main`, or HEAD) creates no tag
   const writesRefs = (specs: readonly string[]) =>
-    tags === "auto" &&
-    specs.some((spec) => {
-      const parsed = parseRefSpec(spec);
-      return !parsed.negative && !!parsed.destination;
-    });
+    tags === "auto-always" ||
+    (tags === "auto" &&
+      specs.some((spec) => {
+        const parsed = parseRefSpec(spec);
+        return !parsed.negative && !!parsed.destination;
+      }));
 
   // shallow state and options
   const shallowBefore = (await refStore.getShallow?.()) ?? [];

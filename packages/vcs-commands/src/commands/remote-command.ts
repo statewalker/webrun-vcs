@@ -9,6 +9,7 @@ import {
 } from "@statewalker/vcs-transport";
 
 import {
+  GitApiError,
   InvalidArgumentError,
   InvalidRemoteError,
   MissingArgumentError,
@@ -26,6 +27,7 @@ import {
   RemoteConfigStore,
 } from "../remote-config/index.js";
 import { TransportCommand } from "../transport-command.js";
+import { removeLegacyRemoteFile } from "./legacy-remotes.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
 
 export type { RemoteConfig };
@@ -347,14 +349,45 @@ export class RemoteRenameCommand extends GitCommand<RemoteRenameResult> {
     if (!newName) throw new MissingArgumentError("newName", "New remote name must be specified");
 
     const store = RemoteConfigStore.from(this.workingCopy);
+    // remote_get: a remote missing from the configuration may be read from .git/remotes/ or
+    // .git/branches/ (git 2.x; 2.5x warns), and counts as configured
+    const warnings: string[] = (await this.loadLegacyRemote(oldName))
+      .filter((m) => m.startsWith("warning: "))
+      .map((m) => m.slice("warning: ".length));
     if (!store.isConfigured(oldName)) {
       throw new RemoteNotFoundError(oldName, `No such remote: '${oldName}'`);
+    }
+    const legacyOrigin = store.legacyOrigin(oldName);
+    if (oldName === newName && legacyOrigin) {
+      // migrate_file: the remote as read goes into the configuration, the file goes away
+      // read whole before writing: once it has a URL, the configuration hides the file
+      const urls = store.remoteUrls(oldName);
+      const push = store.pushRefspecs(oldName);
+      const fetch = store.configuredFetchRefspecs(oldName);
+      for (const url of urls) store.addValue(`remote.${oldName}.url`, url);
+      for (const spec of push) store.addValue(`remote.${oldName}.push`, spec);
+      for (const spec of fetch) store.addValue(`remote.${oldName}.fetch`, spec);
+      await store.save();
+      await removeLegacyRemoteFile(this.workingCopy, legacyOrigin, oldName);
+      return { remote: store.read(oldName), warnings };
+    }
+    if (oldName !== newName) {
+      for (const m of await this.loadLegacyRemote(newName)) {
+        if (m.startsWith("warning: ")) warnings.push(m.slice("warning: ".length));
+      }
     }
     if (store.isConfigured(newName)) {
       throw new RemoteAlreadyExistsError(newName, `remote ${newName} already exists.`);
     }
     if (!isValidRemoteName(newName)) {
       throw new InvalidArgumentError("newName", newName, `'${newName}' is not a valid remote name`);
+    }
+    // git_config_rename_section finds no section to rename for a remote read from a file
+    if (!store.hasSection(oldName)) {
+      throw new GitApiError(
+        `Could not rename config section 'remote.${oldName}' to 'remote.${newName}'`,
+        { exitCode: 1 },
+      );
     }
 
     const fetch = store.configuredFetchRefspecs(oldName);
@@ -399,7 +432,6 @@ export class RemoteRenameCommand extends GitCommand<RemoteRenameResult> {
     }
 
     store.rename(oldName, newName);
-    const warnings: string[] = [];
     if (fetch.length > 0) {
       const rewritten = fetch.map((spec) => {
         const at = spec.indexOf(oldContext);

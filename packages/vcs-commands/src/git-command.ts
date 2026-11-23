@@ -63,6 +63,7 @@ import {
   withoutCrud,
 } from "./commands/git-ident.js";
 import { indexHostOf, indexVersionConfigError } from "./commands/index-host.js";
+import { loadLegacyRemote } from "./commands/legacy-remotes.js";
 import type { NotesContext } from "./commands/notes-support.js";
 import { postIndexChangeHookOf } from "./commands/post-index-change.js";
 import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
@@ -463,6 +464,17 @@ export abstract class GitCommand<T> {
   protected get hooks(): HookSession {
     if (!this.hookSession) this.hookSession = new HookSession(this._workingCopy);
     return this.hookSession;
+  }
+
+  /**
+   * Reads the legacy remote `name` (`$GIT_COMMON_DIR/remotes/<name>`, then `branches/<name>`)
+   * as git 2.x's `remote_get` does before it looks the remote up, so this working copy's
+   * `RemoteConfigStore`s see it (see `loadLegacyRemote`); nothing under git 3.0.
+   *
+   * @returns what git prints on stderr reading them, for this command's compatibility
+   */
+  protected async loadLegacyRemote(name: string): Promise<string[]> {
+    return (await loadLegacyRemote(this._workingCopy, name, this.hooks.compatibility)).messages;
   }
 
   /**

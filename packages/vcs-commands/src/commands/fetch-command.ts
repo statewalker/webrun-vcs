@@ -658,6 +658,9 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     this.checkCallable();
     this.setCallable(false);
 
+    // remote_get: a remote the configuration gives no URL may come from .git/remotes/ or
+    // .git/branches/ (git 2.x); 2.5x warns that it read one
+    const legacyMessages = await this.loadLegacyRemote(this.remote);
     // Resolve remote URL
     const remoteUrl = await this.resolveRemoteUrl(this.remote);
     if (!remoteUrl) {
@@ -716,7 +719,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       : (this.refmap ?? configured).filter((spec) => spec !== "");
     // do_fetch: refs/remotes/<name>/HEAD follows the remote HEAD on a configured fetch
     const followHead = fromConfig && configured.length > 0 ? this.followRemoteHead(store) : null;
-    const messages: string[] = [];
+    const messages: string[] = [...legacyMessages];
     const errors: string[] = [];
     const trackingUpdates: TrackingRefUpdate[] = [];
 
@@ -797,7 +800,10 @@ export class FetchCommand extends TransportCommand<FetchResult> {
         return defer ? { deletes: pruned.map((u) => u.localRef) } : undefined;
       },
       missingRefsOk: useConfig,
-      tags: toTagMode(this.effectiveTagOption()),
+      tags:
+        !this.tagOptionSet && store.followsTagsAlways(this.remote)
+          ? "auto-always"
+          : toTagMode(this.effectiveTagOption()),
       depth: this.depth,
       deepenSince: this.shallowSince,
       deepenNot: this.shallowExcludes.length > 0 ? this.shallowExcludes : undefined,

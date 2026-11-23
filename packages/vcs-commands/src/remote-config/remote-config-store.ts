@@ -34,6 +34,52 @@ export function defaultFetchRefspec(name: string): string {
   return `+refs/heads/*:refs/remotes/${name}/*`;
 }
 
+/* ------------------------------------------------------- legacy remotes */
+
+/**
+ * A remote read from `$GIT_COMMON_DIR/remotes/<name>` or `$GIT_COMMON_DIR/branches/<name>`,
+ * as git 2.x's remote.c `read_remotes_file` and `read_branches_file` read them (git 3.0 reads
+ * neither). Loaded by `loadLegacyRemote` (vcs-commands `legacy-remotes.ts`) and seen by every
+ * {@link RemoteConfigStore} of the working copy while the remote has no `remote.<name>.url`.
+ */
+export interface LegacyRemote {
+  /** The file that defined it last (remote.c's `REMOTE_REMOTES` or `REMOTE_BRANCHES`) */
+  origin: "remotes" | "branches";
+  /** Its URLs as written (`URL:` lines, or the branches file's URL), before `insteadOf` */
+  urls: string[];
+  /** `Pull:` lines, or the branches file's `refs/heads/<branch>:refs/heads/<name>` */
+  fetchRefspecs: string[];
+  /** `Push:` lines, or the branches file's `HEAD:refs/heads/<branch>` */
+  pushRefspecs: string[];
+  /** A branches file's remote follows tags whatever its refspecs (remote.c: `fetch_tags = 1`) */
+  followTags: boolean;
+}
+
+/** The legacy remotes loaded for each working copy, by name. */
+const legacyRemotes = new WeakMap<object, Map<string, LegacyRemote>>();
+
+/**
+ * Records (or, with undefined, forgets) the legacy remote `name` of a working copy, for
+ * every {@link RemoteConfigStore} of it. `loadLegacyRemote` calls it each time it reads the
+ * files, so what the stores see is what the files held at the last load.
+ */
+export function setLegacyRemote(
+  workingCopy: WorkingCopy,
+  name: string,
+  remote: LegacyRemote | undefined,
+): void {
+  let byName = legacyRemotes.get(workingCopy);
+  if (remote === undefined) {
+    byName?.delete(name);
+    return;
+  }
+  if (!byName) {
+    byName = new Map();
+    legacyRemotes.set(workingCopy, byName);
+  }
+  byName.set(name, remote);
+}
+
 /* ------------------------------------------------------- config plumbing */
 
 /**
@@ -215,7 +261,11 @@ class PlainObjectConfig implements GitConfigLike {
  * a real remote to `git remote`, and so it is here — it simply has no URL.
  */
 export class RemoteConfigStore {
-  private constructor(private readonly config: GitConfigLike) {}
+  private constructor(
+    private readonly config: GitConfigLike,
+    /** The working copy whose legacy remotes ({@link setLegacyRemote}) this store sees */
+    private readonly owner?: WorkingCopy,
+  ) {}
 
   /**
    * Wrap a working copy's configuration.
@@ -225,18 +275,54 @@ export class RemoteConfigStore {
    */
   static from(workingCopy: WorkingCopy): RemoteConfigStore {
     const config = workingCopy.config;
-    if (isGitConfigLike(config)) return new RemoteConfigStore(config);
-    return new RemoteConfigStore(new PlainObjectConfig((config ?? {}) as Record<string, unknown>));
+    if (isGitConfigLike(config)) return new RemoteConfigStore(config, workingCopy);
+    return new RemoteConfigStore(
+      new PlainObjectConfig((config ?? {}) as Record<string, unknown>),
+      workingCopy,
+    );
   }
 
-  /** Remote names that have a config section. */
+  /** Remote names that have a config section (git's `for_each_remote`: no legacy remotes). */
   configuredNames(): string[] {
     return this.config.subsections("remote");
   }
 
-  /** Whether the remote has a config section. */
+  /**
+   * Whether the remote is configured (git's `remote_is_configured`): it has a config section,
+   * or a legacy remote file loaded for it defines it ({@link legacyOrigin}).
+   */
   isConfigured(name: string): boolean {
+    return this.hasSection(name) || this.legacy(name) !== undefined;
+  }
+
+  /** Whether the remote has a `[remote "<name>"]` config section. */
+  hasSection(name: string): boolean {
     return this.configuredNames().includes(name);
+  }
+
+  /**
+   * The file a remote was read from when a legacy remote file defines it (`remotes` or
+   * `branches`, see {@link LegacyRemote}); undefined for a remote of the configuration.
+   */
+  legacyOrigin(name: string): "remotes" | "branches" | undefined {
+    return this.legacy(name)?.origin;
+  }
+
+  /** Whether a fetch from the remote follows tags whatever its refspecs (a branches file). */
+  followsTagsAlways(name: string): boolean {
+    return this.legacy(name)?.followTags ?? false;
+  }
+
+  /**
+   * The legacy remote `name`, while it applies: git reads the files only for a remote the
+   * configuration gives no URL (remote.c `remotes_remote_get_1`'s `valid_remote`), and then
+   * adds what they say to what the configuration says.
+   */
+  private legacy(name: string): LegacyRemote | undefined {
+    if (!this.owner) return undefined;
+    const remote = legacyRemotes.get(this.owner)?.get(name);
+    if (!remote || this.urlList(name, "url").length > 0) return undefined;
+    return remote;
   }
 
   /**
@@ -248,22 +334,30 @@ export class RemoteConfigStore {
    * when none applies: the fetch URLs are pushed to).
    */
   read(name: string): RemoteConfig {
-    const fetchRefspecs = this.strings(name, "fetch");
+    const fetchRefspecs = this.configuredFetchRefspecs(name);
+    // a legacy remote has no default: remote.c reads only what its file says
+    const fallback = this.legacy(name) ? [] : [defaultFetchRefspec(name)];
     return {
       name,
       urls: this.remoteUrls(name),
       pushUrls: this.aliasedPushUrls(name),
-      fetchRefspecs: fetchRefspecs.length > 0 ? fetchRefspecs : [defaultFetchRefspec(name)],
-      pushRefspecs: this.strings(name, "push"),
+      fetchRefspecs: fetchRefspecs.length > 0 ? fetchRefspecs : fallback,
+      pushRefspecs: this.pushRefspecs(name),
     };
   }
 
   /**
    * The `remote.<name>.fetch` lines as configured, without the default {@link read} fills
-   * in: a remote without any fetches only its HEAD, as `git fetch <name>` does.
+   * in: a remote without any fetches only its HEAD, as `git fetch <name>` does. A legacy
+   * remote's refspecs ({@link LegacyRemote}) follow the configuration's.
    */
   configuredFetchRefspecs(name: string): string[] {
-    return this.strings(name, "fetch");
+    return [...this.strings(name, "fetch"), ...(this.legacy(name)?.fetchRefspecs ?? [])];
+  }
+
+  /** The `remote.<name>.push` lines, then a legacy remote's push refspecs. */
+  pushRefspecs(name: string): string[] {
+    return [...this.strings(name, "push"), ...(this.legacy(name)?.pushRefspecs ?? [])];
   }
 
   /** Write every field of a remote, replacing whatever was there. */
@@ -423,7 +517,13 @@ export class RemoteConfigStore {
    * clears those before it: git's `add_url`), each rewritten by `url.<base>.insteadOf`.
    */
   remoteUrls(name: string): string[] {
-    return this.urlList(name, "url").map((url) => this.aliasUrl(url) ?? url);
+    return this.rawUrls(name).map((url) => this.aliasUrl(url) ?? url);
+  }
+
+  /** The `remote.<name>.url` lines (see {@link urlList}), else a legacy remote's URLs. */
+  private rawUrls(name: string): string[] {
+    const configured = this.urlList(name, "url");
+    return configured.length > 0 ? configured : (this.legacy(name)?.urls ?? []);
   }
 
   /**
@@ -444,6 +544,16 @@ export class RemoteConfigStore {
    */
   private aliasedPushUrls(name: string): string[] {
     const pushUrls = this.urlList(name, "pushurl").map((url) => this.aliasUrl(url) ?? url);
+    const legacy = this.legacy(name);
+    if (legacy) {
+      // add_url_alias: each URL a legacy file gives adds its pushInsteadOf rewrite, whatever
+      // pushurl lines the configuration has
+      for (const url of legacy.urls) {
+        const alias = this.aliasUrl(url, { push: true });
+        if (alias !== undefined) pushUrls.push(alias);
+      }
+      return pushUrls;
+    }
     if (pushUrls.length > 0) return pushUrls;
     const aliased: string[] = [];
     for (const url of this.urlList(name, "url")) {
@@ -565,6 +675,11 @@ export class RemoteConfigStore {
   /** Sets a config variable, replacing every value it had. */
   setValue(key: string, value: string): void {
     this.config.set(key, value);
+  }
+
+  /** Adds a value to a config variable after the ones it has (`git config --add`). */
+  addValue(key: string, value: string): void {
+    this.config.add(key, value);
   }
 
   /** Sets every value of a config variable, in order (none: unset). */

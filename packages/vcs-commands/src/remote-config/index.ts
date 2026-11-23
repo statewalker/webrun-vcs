@@ -6,8 +6,10 @@
 
 export {
   defaultFetchRefspec,
+  type LegacyRemote,
   listRemoteNames,
   type RemoteConfig,
   RemoteConfigStore,
+  setLegacyRemote,
 } from "./remote-config-store.js";
 export { deleteRefs, moveRefs, type RefMove } from "./remote-refs.js";
