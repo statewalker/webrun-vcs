@@ -242,7 +242,7 @@ export class AmCommand extends GitCommand<AmResult> {
 
   /**
    * `-S` (true) / `--no-gpg-sign` (false): whether to sign the commits; undefined (the
-   * default) leaves it to `commit.gpgSign`. No signer exists yet: a patch to commit signed
+   * default) leaves it to `commit.gpgSign`. Not signed yet: a patch to commit signed
    * fails as git's does when gpg cannot sign (`error: gpg failed to sign the data:`,
    * `fatal: failed to write commit object`, exit 128), the patch left applied to the index
    * in `.git/rebase-apply` and nothing committed.

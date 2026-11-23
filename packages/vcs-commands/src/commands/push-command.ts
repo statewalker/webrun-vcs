@@ -283,7 +283,7 @@ export class PushCommand extends TransportCommand<PushResult> {
    * certificate; undefined (the default) leaves it to `push.gpgSign` (a boolean or
    * `if-asked`). A server that takes no certificate refuses a signed push (`fatal: the
    * receiving end does not support --signed push`) and gets an `if-asked` one unsigned,
-   * with git's warning ({@link PushResult.warnings}). No signer exists yet: a certificate
+   * with git's warning ({@link PushResult.warnings}). Not signed yet: a certificate
    * the server takes fails as git fails when gpg cannot sign (`error: gpg failed to sign
    * the data:`, `fatal: failed to sign the push certificate`, exit 128:
    * {@link SigningFailedError}), before anything is sent.

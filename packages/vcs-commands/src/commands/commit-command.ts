@@ -83,7 +83,7 @@ import {
 import { PathspecAttributes } from "./pathspec-attributes.js";
 import { type CommitReflogKind, reflogMessages, updateHead } from "./reflog-messages.js";
 import { applyAutostash } from "./sequencer-support.js";
-import { refuseCommitSigning, signRequestOf } from "./signing.js";
+import { signCommit, signRequestOf } from "./signing.js";
 import {
   cutLine,
   readShowUntrackedFiles,
@@ -418,10 +418,13 @@ export class CommitCommand extends GitCommand<CommitResult> {
 
   /**
    * `-S` (true) / `--no-gpg-sign` (false): whether to sign the commit; undefined (the
-   * default) leaves it to `commit.gpgSign`. No signer exists yet, so a commit asked to be
-   * signed fails as git fails when gpg cannot sign (`error: gpg failed to sign the data:`,
-   * `fatal: failed to write commit object`, exit 128: {@link SigningFailedError}) once
-   * everything before the signing is done, and nothing is committed.
+   * default) leaves it to `commit.gpgSign`. The commit is signed with the default key
+   * (`user.signingKey`, else as `gpg.format` says) through the host's signer
+   * (`GitHostEnvironment.signer`) and carries the signature in its `gpgsig` header
+   * ({@link signCommit}). Without a signer, or when it fails, the commit fails as git fails
+   * when gpg cannot sign (`error: gpg failed to sign the data:`, `fatal: failed to write
+   * commit object`, exit 128: {@link SigningFailedError}) once everything before the signing
+   * is done, and nothing is committed.
    */
   setSign(sign: boolean | undefined): this {
     this.checkCallable();
@@ -2083,17 +2086,15 @@ export class CommitCommand extends GitCommand<CommitResult> {
   ): Promise<CommitResult> {
     const { author, committer, finalMessage, state, amendedId } = info;
 
-    // Create commit
-    const commit: Commit = {
-      tree: treeId,
-      parents,
-      author,
-      committer,
-      message: finalMessage,
-    };
-
-    // commit_tree_extended signs the commit before writing it: no signer, git's failure
-    refuseCommitSigning(signRequestOf(this.workingCopy, this.sign));
+    // Create commit; commit_tree_extended signs it before writing it (without a signer, or
+    // when the signer fails: git's failure, nothing written)
+    const sign = signRequestOf(this.workingCopy, this.sign);
+    const commit: Commit = await signCommit(
+      this.workingCopy,
+      sign,
+      { tree: treeId, parents, author, committer, message: finalMessage },
+      sign === undefined ? {} : { cwd: await this.signingCwd() },
+    );
     const commitId = await this.commits.store(commit);
 
     // Update HEAD/branch ref, with git's reflog line in the branch's log and HEAD's
@@ -2154,6 +2155,15 @@ export class CommitCommand extends GitCommand<CommitResult> {
 
     // Return commit with its ID (like JGit's RevCommit)
     return { ...commit, id: commitId };
+  }
+
+  /** The host directory the signing program runs in, if the repository has one. */
+  private async signingCwd(): Promise<string | undefined> {
+    try {
+      return await this.hooks.hostWorkingDirectory();
+    } catch {
+      return undefined;
+    }
   }
 
   /**
