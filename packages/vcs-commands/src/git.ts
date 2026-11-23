@@ -1218,12 +1218,19 @@ export class Git implements Disposable {
   /**
    * Create a StashCreateCommand for stashing changes.
    *
+   * Despite its name this is `git stash push`: the stash is stored in `refs/stash` and the
+   * index and the worktree are reset to HEAD. git's `git stash create` (the stash commit
+   * only: worktree, index and `refs/stash` untouched) is `stashCreate().setRef(null)`.
+   *
    * @example
    * ```typescript
-   * // the working copy's index and worktree are stashed, then reset to HEAD
+   * // git stash push -m "WIP: feature work": stashed, then reset to HEAD
    * const stashCommit = await git.stashCreate()
    *   .setMessage("WIP: feature work")
    *   .call();
+   *
+   * // git stash create "msg": the commit id only, nothing else changes
+   * const id = await git.stashCreate().setRef(null).setMessage("msg").call();
    * ```
    */
   stashCreate(): StashCreateCommand {
