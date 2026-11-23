@@ -7,7 +7,7 @@ import {
 } from "@statewalker/vcs-core";
 import { FileStagingStore } from "@statewalker/vcs-store-files";
 import { compilePosixRegex, type PosixRegex } from "@statewalker/vcs-utils";
-import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import {
   expandUserPath,
@@ -37,8 +37,15 @@ import { AddCommand } from "./add-command.js";
 import { worktreeModeTrust } from "./core-config.js";
 import { DEFAULT_DATE_MODE, showDate } from "./date-format.js";
 import { approxidateCareful } from "./git-date.js";
-import { hostEnvironmentOf, InvalidDateError, parseGitDate, withoutCrud } from "./git-ident.js";
+import {
+  hostEnvironmentOf,
+  InvalidDateError,
+  InvalidIdentError,
+  parseGitDate,
+  withoutCrud,
+} from "./git-ident.js";
 import { IndexAdder, readGitlinkHead } from "./index-adder.js";
+import { reencodedCommitForReuse } from "./log-output.js";
 import {
   flatTree,
   OperationState,
@@ -1197,9 +1204,51 @@ export class CommitCommand extends GitCommand<CommitResult> {
       );
       const commit = await this.commits.load(id);
       if (!commit) throw new RefNotFoundError(name, `fatal: could not lookup commit '${name}'`);
-      this.reused = commit;
+      this.reused = await this.reencodedCommit(id, commit);
     }
     if (this.forceDate) this.forcedDate();
+  }
+
+  /**
+   * read_commit_message's logmsg_reencode, for the commit `-C` or `--amend` reuses: a commit
+   * whose `encoding` header names another encoding than UTF-8 gets its message and author
+   * name converted (log-output's `reencodedCommitForReuse`). Only UTF-8 output is supported:
+   * under a non-UTF-8 `i18n.commitEncoding` the commit is taken as stored.
+   */
+  private async reencodedCommit(id: ObjectId, commit: Commit): Promise<Commit> {
+    const encoding = commit.encoding;
+    if (!encoding || /^utf-?8$/i.test(encoding.trim())) return commit;
+    const output = RemoteConfigStore.from(this.workingCopy).value("i18n.commitEncoding");
+    if (output !== undefined && !/^utf-?8$/i.test(output.trim())) return commit;
+    const raw = await this.rawObjectBytes(id);
+    const reencoded = raw ? reencodedCommitForReuse(decodeGitPath(raw)) : undefined;
+    if (!reencoded) return commit;
+    const name = reencoded.author?.name ?? commit.author.name;
+    return { ...commit, message: reencoded.message, author: { ...commit.author, name } };
+  }
+
+  /** An object's stored content, undefined when it cannot be read raw. */
+  private async rawObjectBytes(id: ObjectId): Promise<Uint8Array | undefined> {
+    try {
+      const obj = await this.workingCopy.history?.objects?.get(id);
+      if (!obj) return undefined;
+      if (obj.bytes) return obj.bytes;
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for await (const c of obj.content) {
+        chunks.push(c);
+        size += c.length;
+      }
+      const out = new Uint8Array(size);
+      let at = 0;
+      for (const c of chunks) {
+        out.set(c, at);
+        at += c.length;
+      }
+      return out;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -1485,6 +1534,59 @@ export class CommitCommand extends GitCommand<CommitResult> {
       throw new NoMessageError();
     }
 
+    let previousCommit: Commit | undefined;
+    let amendedId: ObjectId | undefined;
+
+    if (this.amend) {
+      const headId = await this.resolveHead();
+      amendedId = headId;
+      const loaded = await this.commits.load(headId);
+      if (!loaded) {
+        throw new NoHeadError("Cannot amend: HEAD commit not found");
+      }
+      // (read_commit_message: the message and author in the output encoding)
+      previousCommit = await this.reencodedCommit(headId, loaded);
+    }
+
+    // The author (git's determine_author_info, which prepare_to_commit runs before the
+    // pre-commit hook): the one given; else an amended commit's or
+    // a concluded cherry-pick's author (its date too; `--author` replaces only the name and
+    // email), unless --reset-author; else resolved as git does (GIT_AUTHOR_*, author.*,
+    // user.*, GIT_AUTHOR_DATE or now)
+    let author = this.author;
+    if (!author) {
+      // (git's author_message: a cherry-pick's CHERRY_PICK_HEAD, else -C's commit, else the
+      // amended HEAD)
+      const kept = this.resetAuthor
+        ? undefined
+        : pickHead
+          ? (await this.commits.load(pickHead))?.author
+          : reused
+            ? reused.author
+            : this.amend && previousCommit
+              ? previousCommit.author
+              : undefined;
+      // fmt_ident's IDENT_STRICT refusals of the name chosen (an empty one, crud only)
+      if (kept || this.authorName) {
+        strictAuthorName(
+          this.authorName?.name ?? (kept as PersonIdent).name,
+          this.authorName?.email ?? (kept as PersonIdent).email,
+        );
+      }
+      if (kept) {
+        author = this.authorName
+          ? {
+              ...kept,
+              name: withoutCrud(this.authorName.name),
+              email: withoutCrud(this.authorName.email),
+            }
+          : kept;
+      } else if (this.authorName) author = this.datedIdent("author", this.authorName);
+      else author = this.resolveAuthor(this.committer ?? this.committerName);
+    }
+    // --date: the author's date, whatever gave the rest
+    const forced = this.forcedDate();
+    if (forced) author = { ...author, ...forced };
     // prepare_to_commit's pre-commit hook (not with --no-verify), over the index the commit
     // records (the lock `-a` and a partial commit wrote); a hook that ran may have changed
     // the index, which is read again (git's discard_index + read_index_from)
@@ -1547,49 +1649,6 @@ export class CommitCommand extends GitCommand<CommitResult> {
       // a stored subtree no edit touched stays the one stored)
       treeId = await writeIndexAsTree(this.staging, this.trees, this.objectFormat);
     }
-    let previousCommit: Commit | undefined;
-    let amendedId: ObjectId | undefined;
-
-    if (this.amend) {
-      const headId = await this.resolveHead();
-      amendedId = headId;
-      previousCommit = await this.commits.load(headId);
-      if (!previousCommit) {
-        throw new NoHeadError("Cannot amend: HEAD commit not found");
-      }
-    }
-
-    // The author (git's determine_author_info): the one given; else an amended commit's or
-    // a concluded cherry-pick's author (its date too; `--author` replaces only the name and
-    // email), unless --reset-author; else resolved as git does (GIT_AUTHOR_*, author.*,
-    // user.*, GIT_AUTHOR_DATE or now)
-    let author = this.author;
-    if (!author) {
-      // (git's author_message: a cherry-pick's CHERRY_PICK_HEAD, else -C's commit, else the
-      // amended HEAD)
-      const kept = this.resetAuthor
-        ? undefined
-        : pickHead
-          ? (await this.commits.load(pickHead))?.author
-          : reused
-            ? reused.author
-            : this.amend && previousCommit
-              ? previousCommit.author
-              : undefined;
-      if (kept) {
-        author = this.authorName
-          ? {
-              ...kept,
-              name: withoutCrud(this.authorName.name),
-              email: withoutCrud(this.authorName.email),
-            }
-          : kept;
-      } else if (this.authorName) author = this.datedIdent("author", this.authorName);
-      else author = this.resolveAuthor(this.committer ?? this.committerName);
-    }
-    // --date: the author's date, whatever gave the rest
-    const forced = this.forcedDate();
-    if (forced) author = { ...author, ...forced };
     // the committer: always resolved (GIT_COMMITTER_*, committer.*, user.*), unless given
     const committer =
       this.committer ??
@@ -2450,4 +2509,15 @@ export type CommitEditor = (path: string, text: string) => Promise<unknown>;
 export interface CommitDryRunResult extends StatusTextResult {
   /** 0 when there is something to commit, 1 when not (dry_run_commit) */
   exitCode: number;
+}
+
+/**
+ * fmt_ident's IDENT_STRICT checks of an author name given or kept (`--author`, `-C`,
+ * `--amend`): an empty name, or one of crud only, refused with git's line.
+ */
+function strictAuthorName(name: string, email: string): void {
+  if (name === "") throw new InvalidIdentError("author", "empty", email, false);
+  if (![...name].some((c) => !(c <= " " || ",:;<>\"\\'".includes(c)))) {
+    throw new InvalidIdentError("author", "crud", name, false);
+  }
 }

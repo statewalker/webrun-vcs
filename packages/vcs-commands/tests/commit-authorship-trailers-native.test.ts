@@ -173,6 +173,31 @@ async function expectCommit(
   return { failed: native.status !== 0, stderr: native.stderr };
 }
 
+/**
+ * A commit object written as given (`hash-object --literally`) in both twins, on branch
+ * `name`, whose parent is HEAD and tree HEAD's: what native git cannot make with `commit`
+ * (an empty author name, Latin-1 bytes under an `encoding` header).
+ */
+function literalCommit(t: Twin, name: string, headers: string, body: Buffer): void {
+  for (const repo of [t.native, t.ours]) {
+    const tree = gitOk(repo, envOf(), "rev-parse", "HEAD^{tree}").trim();
+    const parent = gitOk(repo, envOf(), "rev-parse", "HEAD").trim();
+    const bytes = Buffer.concat([
+      Buffer.from(`tree ${tree}\nparent ${parent}\n`),
+      Buffer.from(headers, "latin1"),
+      Buffer.from("\n"),
+      body,
+    ]);
+    const r = spawnSync("git", ["hash-object", "-t", "commit", "-w", "--stdin", "--literally"], {
+      cwd: repo,
+      env: envOf() as Record<string, string>,
+      input: bytes,
+    });
+    const id = r.stdout.toString().trim();
+    gitOk(repo, envOf(), "update-ref", `refs/heads/${name}`, id);
+  }
+}
+
 const message = (t: Twin) => gitOk(t.native, envOf(), "log", "-1", "--format=%B");
 
 describeGit("commit -s, --trailer, --author, --date, -C: native twins", () => {
@@ -474,6 +499,63 @@ describeGit("commit -s, --trailer, --author, --date, -C: native twins", () => {
     gitOk(t.ours, envOf(), "add", ".");
     await expectCommit(t, ["--allow-empty-message", "-m", "  \n\n"], (c) =>
       c.setAllowEmptyMessage(true).setMessage("  \n\n"),
+    );
+  });
+
+  // t7509 "--author" refusals; ident.c fmt_ident under IDENT_STRICT: an empty name, or one of
+  // crud only, whether given (`--author`) or kept (`-C`, `--amend`)
+  it("an empty or crud-only author name is refused, given or kept", async () => {
+    for (const arg of ["<x@y>", " <x@y>", " ;, <x@y>"]) {
+      const t = twins();
+      const { failed } = await expectCommit(t, [`--author=${arg}`, "-m", "x"], (c) =>
+        c.setAuthor(arg).setMessage("x"),
+      );
+      expect(failed).toBe(true);
+    }
+    const t = twins();
+    literalCommit(
+      t,
+      "nameless",
+      "author  <e@example.com> 1600000000 +0000\ncommitter C <c@example.com> 1600000000 +0000\n",
+      Buffer.from("nameless\n"),
+    );
+    expect(
+      (await expectCommit(t, ["-C", "nameless"], (c) => c.setReuseMessage("nameless"))).failed,
+    ).toBe(true);
+    // a name given, or the author reset: the kept name is not used
+    await expectCommit(t, ["-C", "nameless", "--author=N <n@example.com>"], (c) =>
+      c.setReuseMessage("nameless").setAuthor("N <n@example.com>"),
+    );
+    await expectCommit(t, ["--amend", "-C", "nameless", "--reset-author"], (c) =>
+      c.setAmend(true).setReuseMessage("nameless").setResetAuthor(true),
+    );
+    for (const repo of [t.native, t.ours]) gitOk(repo, envOf(), "checkout", "-q", "nameless");
+    expect(
+      (await expectCommit(t, ["--amend", "--no-edit"], (c) => c.setAmend(true).setEdit(false)))
+        .failed,
+    ).toBe(true);
+  });
+
+  // t3900-i18n-commit "commit with -C keeps the encoding" (read_commit_message's
+  // logmsg_reencode): a Latin-1 commit reused or amended in a UTF-8 repository
+  it("-C and --amend of a commit in another encoding: its message and author re-encoded", async () => {
+    const t = twins();
+    literalCommit(
+      t,
+      "latin",
+      "author Ren\xe9 <r@example.com> 1600000000 +0000\ncommitter C <c@example.com> 1600000000 +0000\nencoding ISO-8859-1\n",
+      Buffer.from("caf\xe9 cr\xe8me\n\nna\xefve body\n", "latin1"),
+    );
+    await expectCommit(t, ["-C", "latin"], (c) => c.setReuseMessage("latin"));
+    expect(message(t)).toBe("café crème\n\nnaïve body\n\n");
+    for (const repo of [t.native, t.ours]) {
+      gitOk(repo, envOf(), "checkout", "-q", "latin");
+      put(repo, "l.txt", "l\n");
+      gitOk(repo, envOf(), "add", "l.txt");
+    }
+    await expectCommit(t, ["--amend", "--no-edit"], (c) => c.setAmend(true).setEdit(false));
+    await expectCommit(t, ["--amend", "-s", "--no-edit"], (c) =>
+      c.setAmend(true).setSignoff(true).setEdit(false),
     );
   });
 });
