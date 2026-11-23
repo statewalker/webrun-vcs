@@ -85,6 +85,14 @@ export interface GitHostEnvironment {
    */
   noLazyFetch?: boolean;
   /**
+   * Behave as a git built with `WITH_BREAKING_CHANGES` (the changes planned for git 3.0, in
+   * `Documentation/BreakingChanges.adoc`): new repositories in reftable on `main`,
+   * `safe.bareRepository` defaulting to `explicit`, and the removed features (grafts,
+   * `core.commentString=auto`, `.git/branches/` and `.git/remotes/`) gone. Default false: git
+   * 2.5x. git has no environment variable for it (a build option); the host sets it.
+   */
+  breakingChanges?: boolean;
+  /**
    * `$GIT_INDEX_VERSION` as given: the version a new index is written in, before
    * `index.version` and `feature.manyFiles` (read-cache.c `get_index_format_default`; a
    * value that is not 2, 3 or 4 falls back to 3 with a warning)
