@@ -39,6 +39,11 @@ export interface NodeGitHostEnvironmentOptions {
   /** The environment variables read (default: `process.env`) */
   env?: Record<string, string | undefined>;
   /**
+   * Behave as a git built with `WITH_BREAKING_CHANGES` (git 3.0's changes; default false).
+   * A build option in git, so no environment variable sets it.
+   */
+  breakingChanges?: boolean;
+  /**
    * The file system the files are read from, by their absolute paths (default: the host's,
    * through a Node FilesApi rooted at `/`, or at the drive of a Windows path). Pass a
    * composite or in-memory FilesApi to read them from elsewhere.
@@ -77,6 +82,7 @@ export interface NodeGitHostEnvironment {
   attrSource?: string;
   noReplaceObjects?: boolean;
   noLazyFetch?: boolean;
+  breakingChanges?: boolean;
   indexVersion?: string;
   protocolFromUser?: boolean;
   allowProtocol?: string;
@@ -443,6 +449,7 @@ export function createNodeGitHostEnvironment(
     // git: set to anything (even empty) turns replace refs off
     ...(env.GIT_NO_REPLACE_OBJECTS !== undefined ? { noReplaceObjects: true } : {}),
     ...(env.GIT_NO_LAZY_FETCH !== undefined ? { noLazyFetch: envBool(env.GIT_NO_LAZY_FETCH) } : {}),
+    ...(options.breakingChanges ? { breakingChanges: true } : {}),
     // the version of a new index (get_index_format_default), as given
     ...(env.GIT_INDEX_VERSION !== undefined ? { indexVersion: env.GIT_INDEX_VERSION } : {}),
     // git_env_bool("GIT_PROTOCOL_FROM_USER", 1)
