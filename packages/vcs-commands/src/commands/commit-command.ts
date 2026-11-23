@@ -45,6 +45,7 @@ import {
   withoutCrud,
 } from "./git-ident.js";
 import { IndexAdder, readGitlinkHead } from "./index-adder.js";
+import { readRepositoryMailmap } from "./mailmap.js";
 import {
   flatTree,
   OperationState,
@@ -1231,6 +1232,29 @@ export class CommitCommand extends GitCommand<CommitResult> {
     if (this.forceDate) this.forcedDate();
   }
 
+  /** A blob's bytes, undefined when it cannot be read. */
+  private async readBlobBytes(id: ObjectId): Promise<Uint8Array | undefined> {
+    try {
+      const content = await this.blobs.load(id);
+      if (!content) return undefined;
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for await (const c of content) {
+        chunks.push(c);
+        size += c.length;
+      }
+      const out = new Uint8Array(size);
+      let at = 0;
+      for (const c of chunks) {
+        out.set(c, at);
+        at += c.length;
+      }
+      return out;
+    } catch {
+      return undefined;
+    }
+  }
+
   /**
    * `--date` (parse_force_date): the date as `parse_date` reads it, else as `approxidate`
    * does, refused as git refuses it.
@@ -1262,7 +1286,18 @@ export class CommitCommand extends GitCommand<CommitResult> {
         `fatal: '${name}': ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    const mailmap = await this.loadMailmap(RemoteConfigStore.from(this.workingCopy));
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const mailmap = await readRepositoryMailmap({
+      config: (key) => config.value(key),
+      worktree: this.worktreeAccess,
+      environment: hostEnvironmentOf(this.workingCopy),
+      readBlobNamed: async (blob) => {
+        const id = await this.revisionResolver()
+          .resolve(blob)
+          .catch(() => undefined);
+        return id ? this.readBlobBytes(id) : undefined;
+      },
+    });
     const encoder = new TextEncoder();
     // revision.c's walk of --all: refs under refs/ in name order, then HEAD, tags peeled;
     // commits come out by commit date, newest first

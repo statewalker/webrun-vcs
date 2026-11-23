@@ -32,7 +32,7 @@ import {
   type LogOutputOptions,
   LogPrinter,
 } from "./log-output.js";
-import type { Mailmap } from "./mailmap.js";
+import { type Mailmap, readRepositoryMailmap } from "./mailmap.js";
 import { configBool, configValue } from "./merge-config.js";
 import {
   addRefsByGlob,
@@ -1398,6 +1398,21 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       }
     }
     return out;
+  }
+
+  /** mailmap.c's read_mailmap: `.mailmap` (not in a bare repository), `mailmap.blob`, `mailmap.file` */
+  private async loadMailmap(config: RemoteConfigStore): Promise<Mailmap> {
+    return readRepositoryMailmap({
+      config: (key) => config.value(key),
+      worktree: this.worktreeAccess,
+      environment: hostEnvironmentOf(this._workingCopy),
+      readBlobNamed: async (name) => {
+        const id = await this.revisionResolver()
+          .resolve(name)
+          .catch(() => undefined);
+        return id ? this.readBlob(id) : undefined;
+      },
+    });
   }
 
   /**
