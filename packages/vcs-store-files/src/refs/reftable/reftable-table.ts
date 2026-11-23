@@ -596,14 +596,9 @@ class Reftable implements ReftableTable {
     if (type === TYPE_LOG) {
       // block_len is the inflated length, block header included; the deflated stream follows
       const skip = headerOff + 4;
-      // git's writer never fills a block past the table's block size (block.c's
-      // block_writer_add), deflated or not
-      if (this.blockSize > 0 && blockLen > this.blockSize) {
-        fail(
-          name,
-          `log block at ${offset} of ${blockLen} bytes, past the block size ${this.blockSize}`,
-        );
-      }
+      // a log block may be longer than the table's block size (reftable.adoc; JGit writes
+      // them twice its ref block size), so only block_len's 24 bits bound it; the held
+      // ceiling bounds the blocks a read inflates at once
       budget.charge(Math.ceil(blockLen / INFLATE_COST_DIVISOR), name);
       // held whole while it is read: released by `drop` when the reader moves on
       budget.hold(blockLen, name);

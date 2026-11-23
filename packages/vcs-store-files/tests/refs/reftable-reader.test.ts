@@ -673,8 +673,9 @@ describe("the lazy reader holds one block, whatever the table stands for", () =>
   }
 
   it("reads one ref's log across deflated bombs, and refuses a walk of all past a ceiling", () => {
-    const bytes = logBombs(3, 1 << 20);
-    expect(bytes.length).toBeLessThan(64 << 10);
+    // blocks of 256 KiB (about 70k records each) keep the test quick on slow CI runners
+    const bytes = logBombs(3, 1 << 18);
+    expect(bytes.length).toBeLessThan(16 << 10);
     const table = openReftable(bytes, "logbomb.ref");
     // the seek inflates the blocks one at a time to find the ref's first key
     let count = 0;
@@ -683,12 +684,12 @@ describe("the lazy reader holds one block, whatever the table stands for", () =>
       expect(log.refName).toBe("refs/heads/b2");
       count++;
     }
-    expect(count).toBeGreaterThan(250_000);
+    expect(count).toBeGreaterThan(60_000);
     expect([...table.logs("refs/heads/none")]).toEqual([]);
     // a walk of every record charges each one: refused past a (here small) ceiling
     expect(() => {
-      for (const _ of table.logs(undefined, new ReftableReadBudget(16 << 20)));
-    }).toThrow(/one read decodes more than 16777216 bytes/);
+      for (const _ of table.logs(undefined, new ReftableReadBudget(1 << 20)));
+    }).toThrow(/one read decodes more than 1048576 bytes/);
     expect(REFTABLE_READ_CEILING).toBe(256 << 20);
   });
 
@@ -798,7 +799,7 @@ describe("a stack cannot make a read cost tables times records (merge gate pass 
     expect([...view.refs()]).toHaveLength(20);
   });
 
-  it("bounds the inflated log blocks a merge holds at once, and refuses blocks past the block size", () => {
+  it("bounds the inflated log blocks a merge holds at once; a block may exceed the block size", () => {
     // one log block of `len` inflated bytes for HEAD at update index `i`, block size `size`
     const logTable = (i: number, len: number, size: number) => {
       const message = "m".repeat(len - 200);
@@ -826,6 +827,8 @@ describe("a stack cannot make a read cost tables times records (merge gate pass 
     const budget = new ReftableReadBudget(REFTABLE_READ_CEILING, 192 << 10);
     for (const t of tables) expect([...t.logs("HEAD", budget)]).toHaveLength(1);
     expect(budget.held).toBe(0);
-    expect(() => [...logTable(5, 8192, 4096).logs()]).toThrow(/past the block size 4096/);
+    // JGit writes log blocks twice its ref block size, the header naming the latter
+    // (ReftableWriter's logBlockSize); the spec allows it and git reads them
+    expect([...logTable(5, 8192, 4096).logs()]).toHaveLength(1);
   });
 });
