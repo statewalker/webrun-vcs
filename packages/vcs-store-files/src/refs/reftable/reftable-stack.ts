@@ -18,8 +18,10 @@
  * ref, newest update index first, a log deletion hiding the entry. Each call decodes only
  * what it needs, under one {@link ReftableReadBudget}. Tables are immutable, so each is
  * opened once and kept by name (opening checks only its header and footer); `tables.list` is
- * read again on each `read()`. A table named there but gone (a concurrent compaction) makes
- * the read start over, as git's reload does.
+ * read again on each `read()`. A table named there but gone or read short (a concurrent
+ * compaction deleted it) makes the read start over when `tables.list` changed meanwhile, for
+ * up to {@link REFTABLE_RELOAD_DEADLINE_MS}, as git's reload does; with the list unchanged the
+ * table is missing and the read fails.
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
@@ -67,7 +69,13 @@ const TABLES_LIST = "tables.list";
  * read then decodes only what it needs); a stack of more is refused, not read.
  */
 export const REFTABLE_STACK_BYTES_CEILING = 512 * 1024 * 1024;
-const MAX_RELOADS = 10;
+/**
+ * How long a read keeps reloading a stack whose `tables.list` changes under it (a concurrent
+ * compaction deleting tables it named): git's `reftable_stack_reload_maybe_reuse` gives up
+ * after 3 seconds, once it has tried more than 3 times.
+ */
+export const REFTABLE_RELOAD_DEADLINE_MS = 3000;
+const RELOAD_TRIES_BEFORE_DEADLINE = 3;
 /** A table name git writes: `0x<min>-0x<max>-<random>.ref`; nothing naming another directory */
 const TABLE_NAME = /^[^/\\]+\.ref$/;
 
@@ -76,6 +84,7 @@ export function createReftableStackReader(
   files: FilesApi,
   dir: string,
   bytesCeiling = REFTABLE_STACK_BYTES_CEILING,
+  reloadDeadlineMs = REFTABLE_RELOAD_DEADLINE_MS,
 ): ReftableStackReader {
   const tables = new Map<string, ReftableTable>();
   let cached: { list: string; view: ReftableView } | undefined;
@@ -98,58 +107,105 @@ export function createReftableStackReader(
     return out;
   };
 
-  const read = async (): Promise<ReftableView> => {
-    for (let attempt = 0; attempt < MAX_RELOADS; attempt++) {
-      const listBytes = await readFile(joinPath(dir, TABLES_LIST));
-      const list = listBytes ? new TextDecoder().decode(listBytes) : "";
-      if (cached && cached.list === list) return cached.view;
-      const names = list.split("\n").filter((line) => line.length > 0);
-      const seen = new Set<string>();
-      for (const name of names) {
-        if (!TABLE_NAME.test(name) || name === "." || name === "..") {
-          throw new ReftableFormatError(TABLES_LIST, `bad table name '${name}'`);
-        }
-        if (seen.has(name))
-          throw new ReftableFormatError(TABLES_LIST, `table '${name}' named twice`);
-        seen.add(name);
+  const readList = async (): Promise<string> => {
+    const listBytes = await readFile(joinPath(dir, TABLES_LIST));
+    return listBytes ? new TextDecoder().decode(listBytes) : "";
+  };
+
+  /**
+   * The table `name`, opened, or `missing` when it is gone or reads short of the size it was
+   * listed with (deleted between the stat and the read: a missing file reads as no bytes).
+   */
+  const loadTable = async (name: string, held: number): Promise<ReftableTable | "missing"> => {
+    const cachedTable = tables.get(name);
+    if (cachedTable) return cachedTable;
+    const path = joinPath(dir, name);
+    const stats = await files.stats(path);
+    if (stats?.kind !== "file") return "missing";
+    const size = stats.size ?? 0;
+    if (held + size > bytesCeiling) throw tooLarge();
+    const bytes = await readFile(path);
+    if (!bytes || bytes.length === 0 || bytes.length < size) return "missing";
+    const table = openReftable(bytes, name);
+    tables.set(name, table);
+    return table;
+  };
+
+  /**
+   * One load of the stack `list` names (git's `reftable_stack_reload_once`): the view, or
+   * `missing` with the error to give when the list has not changed since.
+   */
+  const loadOnce = async (
+    list: string,
+  ): Promise<{ view: ReftableView } | { missing: ReftableFormatError }> => {
+    const names = list.split("\n").filter((line) => line.length > 0);
+    const seen = new Set<string>();
+    for (const name of names) {
+      if (!TABLE_NAME.test(name) || name === "." || name === "..") {
+        throw new ReftableFormatError(TABLES_LIST, `bad table name '${name}'`);
       }
-      const loaded: ReftableTable[] = [];
-      let gone = false;
-      let held = 0;
-      for (const name of names) {
-        let table = tables.get(name);
-        if (!table) {
-          const path = joinPath(dir, name);
-          const size = (await files.stats(path))?.size ?? 0;
-          if (held + size > bytesCeiling) throw tooLarge();
-          const bytes = await readFile(path);
-          if (!bytes) {
-            gone = true;
-            break;
-          }
-          table = openReftable(bytes, name);
-          tables.set(name, table);
-        }
-        held += table.size;
-        if (held > bytesCeiling) throw tooLarge();
-        // git's stack writer gives each table update indexes past the last one's (stack.c)
-        const previous = loaded.at(-1);
-        if (previous && table.minUpdateIndex <= previous.maxUpdateIndex) {
-          throw new ReftableFormatError(
-            name,
-            `update indexes from ${table.minUpdateIndex}, not past ${previous.maxUpdateIndex} of '${previous.name}' below it`,
-          );
-        }
-        loaded.push(table);
-      }
-      if (gone) continue;
-      // forget tables no longer listed (compacted away)
-      for (const name of [...tables.keys()]) if (!names.includes(name)) tables.delete(name);
-      const view = mergeReftables(loaded);
-      cached = { list, view };
-      return view;
+      if (seen.has(name)) throw new ReftableFormatError(TABLES_LIST, `table '${name}' named twice`);
+      seen.add(name);
     }
-    throw new ReftableFormatError(TABLES_LIST, "a table it names is missing");
+    const loaded: ReftableTable[] = [];
+    let held = 0;
+    for (const name of names) {
+      let table: ReftableTable | "missing";
+      try {
+        table = await loadTable(name, held);
+      } catch (error) {
+        // a table replaced mid-read reads as corrupt: only a list that changed explains it
+        if (error instanceof ReftableFormatError && !tables.has(name)) return { missing: error };
+        throw error;
+      }
+      if (table === "missing") {
+        return { missing: new ReftableFormatError(TABLES_LIST, `table '${name}' is missing`) };
+      }
+      held += table.size;
+      if (held > bytesCeiling) throw tooLarge();
+      // git's stack writer gives each table update indexes past the last one's (stack.c)
+      const previous = loaded.at(-1);
+      if (previous && table.minUpdateIndex <= previous.maxUpdateIndex) {
+        throw new ReftableFormatError(
+          name,
+          `update indexes from ${table.minUpdateIndex}, not past ${previous.maxUpdateIndex} of '${previous.name}' below it`,
+        );
+      }
+      loaded.push(table);
+    }
+    // forget tables no longer listed (compacted away)
+    for (const name of [...tables.keys()]) if (!seen.has(name)) tables.delete(name);
+    return { view: mergeReftables(loaded) };
+  };
+
+  /**
+   * git's `reftable_stack_reload_maybe_reuse`: a table the list names but that is gone makes
+   * the read start over only when `tables.list` changed meanwhile (a concurrent writer
+   * compacted it away); unchanged, the table is missing for good and the read fails. Retries
+   * back off as git's (a delay growing by up to its own length plus a millisecond) and stop
+   * past the deadline once more than three were made.
+   */
+  const read = async (): Promise<ReftableView> => {
+    const deadline = Date.now() + reloadDeadlineMs;
+    let delay = 0;
+    for (let tries = 1; ; tries++) {
+      if (tries > RELOAD_TRIES_BEFORE_DEADLINE && Date.now() >= deadline) {
+        throw new ReftableFormatError(
+          TABLES_LIST,
+          `it kept changing while its tables were read (${tries - 1} tries)`,
+        );
+      }
+      const list = await readList();
+      if (cached && cached.list === list) return cached.view;
+      const loaded = await loadOnce(list);
+      if ("view" in loaded) {
+        cached = { list, view: loaded.view };
+        return loaded.view;
+      }
+      if ((await readList()) === list) throw loaded.missing;
+      delay = delay + Math.floor(delay * Math.random()) + 1;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
   };
 
   const tooLarge = () =>
