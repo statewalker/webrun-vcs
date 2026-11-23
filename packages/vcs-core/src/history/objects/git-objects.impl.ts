@@ -16,7 +16,7 @@ import {
   inflateWhole,
   LOOSE_OBJECT_COMPRESSION_LEVEL,
 } from "@statewalker/vcs-utils/compression";
-import { createSha1, type Hasher } from "@statewalker/vcs-utils/hash/hasher";
+import { type Hasher, isHexObjectId, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { SizeMismatchError } from "@statewalker/vcs-utils/pack";
 import type { StagingBlobStore } from "../../storage/adapters/staging-blob-store.js";
@@ -36,7 +36,6 @@ import type { ObjectTypeString } from "./object-types.js";
 type Header = { type: ObjectTypeString; size: number };
 
 const TYPES = new Set<string>(["blob", "tree", "commit", "tag"]);
-const OID = /^[0-9a-f]{40}$/;
 /** "commit " plus 16 digits plus NUL fits; git's MAX_HEADER_LEN is similar. */
 const MAX_HEADER = 32;
 /**
@@ -45,12 +44,6 @@ const MAX_HEADER = 32;
  */
 const INFLATE_SLICE = 1024;
 const enc = new TextEncoder();
-
-const isId = (id: unknown): id is string => typeof id === "string" && OID.test(id);
-
-function checkId(id: string): void {
-  if (!isId(id)) throw new InvalidObjectIdError(`not an object id: ${String(id)}`);
-}
 
 /** Parse `"<type> <size>"` (without the NUL) as git does: a known type, a canonical decimal size. */
 function parseHeader(bytes: Uint8Array): Header {
@@ -312,7 +305,7 @@ async function* replay(
 }
 
 /**
- * Git objects over `store`: SHA-1 ids, zlib loose-object bytes.
+ * Git objects over `store`: SHA-1 ids (or `options.objectFormat`'s), zlib loose-object bytes.
  *
  * @example
  * ```typescript
@@ -325,8 +318,13 @@ export function createGitObjects(
   options: GitObjectsOptions = {},
 ): GitObjects {
   const spoolThreshold = options.spoolThreshold ?? DEFAULT_SPOOL_THRESHOLD;
-  // Ids are SHA-1 (git's default object format); SHA-256 repositories are not supported.
-  const newHasher = createSha1;
+  // the repository's object format: SHA-1 (git's default) or SHA-256
+  const objectFormat = options.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const newHasher = objectFormat.createHasher;
+  const isId = (id: unknown): id is string => isHexObjectId(id, objectFormat);
+  const checkId = (id: string): void => {
+    if (!isId(id)) throw new InvalidObjectIdError(`not an object id: ${String(id)}`);
+  };
   const pool = createInflaterPool();
   const hex = (h: Hasher) => bytesToHex(h.digest());
 
@@ -508,6 +506,7 @@ export function createGitObjects(
   }
 
   const objects: GitObjects = {
+    objectFormat,
     put,
 
     async putUnsized(type, content) {

@@ -7,6 +7,7 @@
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
+import { nullObjectIdLike } from "@statewalker/vcs-utils";
 
 import type { OperationState } from "../merge-support.js";
 import {
@@ -801,7 +802,7 @@ export class BisectEngine {
       }
       if (!id) this.error(`Bad rev input: ${head}`);
       // git goes on with whatever it read (the null id)
-      revs.push(id ?? "0000000000000000000000000000000000000000");
+      revs.push(id ?? nullObjectIdLike(revs[0]));
     }
     for (const arg of revArgs) {
       const id = await this.ctx.resolve(arg);

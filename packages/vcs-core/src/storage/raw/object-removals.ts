@@ -40,7 +40,7 @@ const counter: RemovalCounter = (() => {
 })();
 
 /** A key that names an object: an id, alone or as the last segment (a quarantine's prefix). */
-const OBJECT_KEY = /(?:^|\/)[0-9a-f]{40}$/;
+const OBJECT_KEY = /(?:^|\/)(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** The current count of removals; compare two readings to learn whether anything went. */
 export function objectRemovalEpoch(): number {

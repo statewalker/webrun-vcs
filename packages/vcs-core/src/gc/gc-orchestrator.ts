@@ -8,13 +8,12 @@
  * 3. Delegate storage operations to the GcStrategy
  */
 
+import { isNullObjectId } from "@statewalker/vcs-utils/hash";
 import type { ObjectId } from "../common/id/index.js";
 import { readGraftParents } from "../history/commits/index.js";
 import { historyWithoutLazyFetch } from "../history/create-history.js";
 import type { History } from "../history/history.js";
 import type { CompactResult, GcStrategy, StorageStats } from "./gc-strategy.js";
-
-const ZERO_ID = "0".repeat(40);
 
 /**
  * Options for a GC run.
@@ -218,7 +217,7 @@ export class GcOrchestrator {
     const refs = this.history.refs;
     const roots = new Set<ObjectId>();
     const add = (id: ObjectId | undefined) => {
-      if (id && id !== ZERO_ID) roots.add(id);
+      if (id && !isNullObjectId(id)) roots.add(id);
     };
     const names = new Set<string>(["HEAD"]);
     for await (const ref of refs.list()) names.add(ref.name);

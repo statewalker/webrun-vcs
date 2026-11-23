@@ -1,4 +1,5 @@
 import type { Blobs, ObjectId, TreeEntry } from "@statewalker/vcs-core";
+import { isNullObjectId, type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils";
 
 import type { CommandTrees } from "../git-command.js";
 
@@ -18,9 +19,8 @@ import type { CommandTrees } from "../git-command.js";
  * ```
  */
 
+/** SHA-1's null id: `NOTES_NULL_ID` (a SHA-256 tree's is its format's, `NotesTree.nullId`) */
 const NULL_ID = "0".repeat(40);
-const RAW = 20;
-const HEX = 40;
 
 const PTR_NULL = 0;
 const PTR_INTERNAL = 1;
@@ -61,11 +61,14 @@ export type CombineNotes = (
 export interface NotesStores {
   blobs: Blobs;
   trees: CommandTrees;
+  /** The repository's object format (default: the blobs', else SHA-1) */
+  objectFormat?: ObjectFormat;
 }
 
 const typeOf = (p: Ptr): number => (p === null ? PTR_NULL : p.type);
 const nibble = (n: number, key: string): number => Number.parseInt(key[n] ?? "0", 16);
-const prefixLength = (subtreeKey: string): number => Number.parseInt(subtreeKey.slice(HEX - 2), 16);
+/** A subtree key's prefix length in bytes: its last byte (the key is an id's length long) */
+const prefixLength = (subtreeKey: string): number => Number.parseInt(subtreeKey.slice(-2), 16);
 /** SUBTREE_SHA1_PREFIXCMP: whether `key` starts with the prefix of `subtree` (0: it does). */
 const prefixMatches = (key: string, subtreeKey: string): boolean => {
   const len = prefixLength(subtreeKey) * 2;
@@ -88,7 +91,7 @@ function compareBytes(a: string, b: string): number {
 }
 
 async function readBytes(blobs: Blobs, id: ObjectId): Promise<Uint8Array | undefined> {
-  if (id === NULL_ID) return undefined;
+  if (isNullObjectId(id)) return undefined;
   const content = await blobs.load(id).catch(() => undefined);
   if (!content) return undefined;
   const chunks: Uint8Array[] = [];
@@ -193,11 +196,20 @@ export class NotesTree {
   /** A change was made since loading (t->dirty) */
   dirty = false;
 
+  /** Raw id bytes of the repository's format (20 for SHA-1, 32 for SHA-256): notes' path lengths */
+  private readonly raw: number;
+  /** The repository's null id: adding it as a note removes one */
+  readonly nullId: ObjectId;
+
   private constructor(
     private readonly stores: NotesStores,
     /** The tree's combine function (t->combine_notes) */
     readonly combine: CombineNotes,
-  ) {}
+  ) {
+    const format = stores.objectFormat ?? stores.blobs.objectFormat ?? SHA1_OBJECT_FORMAT;
+    this.raw = format.rawLength;
+    this.nullId = format.nullId;
+  }
 
   /**
    * init_notes's load: the stored tree `treeId` as an unread subtree of the root (read
@@ -209,7 +221,7 @@ export class NotesTree {
     combine: CombineNotes = combineNotesConcatenate,
   ): Promise<NotesTree> {
     const t = new NotesTree(stores, combine);
-    if (treeId) await t.loadSubtree({ type: PTR_SUBTREE, key: NULL_ID, val: treeId }, t.root, 0);
+    if (treeId) await t.loadSubtree({ type: PTR_SUBTREE, key: t.nullId, val: treeId }, t.root, 0);
     return t;
   }
 
@@ -254,7 +266,7 @@ export class NotesTree {
     const existing = await this.get(to);
     if (!force && existing) return false;
     if (note) await this.add(to, note, combine);
-    else if (existing) await this.add(to, NULL_ID, combine);
+    else if (existing) await this.add(to, this.nullId, combine);
     return true;
   }
 
@@ -403,7 +415,7 @@ export class NotesTree {
     const { node, n, i } = await this.search(tree, n0, entry.key);
     const l = node.a[i] ?? null;
     if (l === null) {
-      if (entry.val !== NULL_ID) node.a[i] = entry;
+      if (!isNullObjectId(entry.val)) node.a[i] = entry;
       return;
     }
     if (l.type === PTR_NOTE) {
@@ -411,7 +423,7 @@ export class NotesTree {
         if (l.key === entry.key) {
           if (l.val === entry.val) return;
           l.val = await combine(this.stores, l.val, entry.val);
-          if (l.val === NULL_ID) await this.removeLeaf(node, n, entry.key);
+          if (isNullObjectId(l.val)) await this.removeLeaf(node, n, entry.key);
           return;
         }
       } else if (prefixMatches(l.key, entry.key)) {
@@ -426,7 +438,7 @@ export class NotesTree {
       }
     }
     // a non-matching leaf: both under a new int_node
-    if (entry.val === NULL_ID) return;
+    if (isNullObjectId(entry.val)) return;
     const created = newNode();
     await this.insert(created, n + 1, l as Leaf, combine);
     node.a[i] = created;
@@ -461,7 +473,7 @@ export class NotesTree {
     for (const entry of entries) {
       const name = entry.name;
       let leaf: Leaf | undefined;
-      if (name.length === 2 * (RAW - prefixLen)) {
+      if (name.length === 2 * (this.raw - prefixLen)) {
         if (isRegular(entry.mode) && isHex(name)) {
           leaf = { type: PTR_NOTE, key: prefix + name.toLowerCase(), val: entry.id };
         }
@@ -471,7 +483,7 @@ export class NotesTree {
           const key =
             prefix +
             name.toLowerCase() +
-            "00".repeat(RAW - len - 1) +
+            "00".repeat(this.raw - len - 1) +
             len.toString(16).padStart(2, "0");
           leaf = { type: PTR_SUBTREE, key, val: entry.id };
         }
@@ -593,7 +605,10 @@ function pathWithFanout(key: string, fanout: number): string {
 /** notes.c's GIT_NOTES_DEFAULT_REF */
 export const NOTES_DEFAULT_REF = "refs/notes/commits";
 
-/** The null object id, which adding as a note removes one. */
+/**
+ * SHA-1's null object id, which adding as a note removes one (any format's null id does: see
+ * `NotesTree.nullId` for the repository's own).
+ */
 export const NOTES_NULL_ID = NULL_ID;
 
 /** Reads a note blob's bytes (undefined for a missing one). */

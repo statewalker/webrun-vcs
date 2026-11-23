@@ -9,8 +9,6 @@ import { quotePath } from "../results/quote-path.js";
 import { abbrevLengths } from "./core-config.js";
 import { parseExpiry, requireWorktrees, type WorktreeExpiry } from "./worktree-support.js";
 
-const ZERO_ID = "0000000000000000000000000000000000000000";
-
 /** A worktree as `git worktree list` shows it. */
 export interface WorktreeListEntry extends WorktreeInfo {
   /** Why it can be pruned (`should_prune_worktree` with `--expire`), when it can. */
@@ -126,7 +124,7 @@ export class WorktreeListCommand extends GitCommand<WorktreeListResult> {
     let out = `worktree ${wt.path}${lt}`;
     if (wt.bare) out += `bare${lt}`;
     else {
-      out += `HEAD ${wt.head ?? ZERO_ID}${lt}`;
+      out += `HEAD ${wt.head ?? this.objectFormat.nullId}${lt}`;
       if (wt.detached) out += `detached${lt}`;
       else if (wt.headRef) out += `branch ${wt.headRef}${lt}`;
     }
@@ -146,7 +144,7 @@ export class WorktreeListCommand extends GitCommand<WorktreeListResult> {
   /** git's `measure_widths` and `show_worktree`. */
   private async lines(entries: WorktreeListEntry[]): Promise<string> {
     const verbose = this.format === "verbose";
-    const ids = entries.map((wt) => wt.head ?? ZERO_ID);
+    const ids = entries.map((wt) => wt.head ?? this.objectFormat.nullId);
     const lengths = await abbrevLengths(this.workingCopy, ids);
     const abbrevLen = Math.max(...ids.map((id) => lengths.get(id) ?? 7));
     const fully = this.quotePathFully();
@@ -161,7 +159,7 @@ export class WorktreeListCommand extends GitCommand<WorktreeListResult> {
       let line = `${display[i]}${" ".repeat(pad + maxWidth - width(display[i]))}`;
       if (wt.bare) line += "(bare)";
       else {
-        const id = wt.head ?? ZERO_ID;
+        const id = wt.head ?? this.objectFormat.nullId;
         line += `${id.slice(0, lengths.get(id) ?? 7).padEnd(abbrevLen)} `;
         if (wt.detached) line += "(detached HEAD)";
         else if (wt.headRef) line += `[${await shortenUnambiguousRef(this.refsStore, wt.headRef)}]`;

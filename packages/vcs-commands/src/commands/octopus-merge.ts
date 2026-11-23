@@ -300,11 +300,12 @@ async function mergeOneFile(
     }
     const [n1, n2] = [tempName(), tempName()];
     output.push(o ? `Auto-merging ${path}` : `Added ${path} in both, but differently.`);
-    if (!o && !(await ctx.blobs.has(EMPTY_BLOB_ID))) {
+    const emptyBlob = ctx.blobs.objectFormat?.emptyBlobId ?? EMPTY_BLOB_ID;
+    if (!o && !(await ctx.blobs.has(emptyBlob))) {
       // the script's base is the empty blob, which `hash-object` never stored: unpack-file
       // and merge-file fail, ours stays in the worktree
       errors.push(
-        `fatal: unable to read blob object ${EMPTY_BLOB_ID}`,
+        `fatal: unable to read blob object ${emptyBlob}`,
         "error: Could not stat : No such file or directory",
         `ERROR: content conflict in ${path}`,
       );

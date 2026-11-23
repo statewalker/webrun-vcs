@@ -153,7 +153,8 @@ export class FileWorktree implements Worktree {
     this.autoLoadGitignore = options.autoLoadGitignore ?? true;
     this.gitDir = options.gitDir;
     this.globalExcludesFile = options.globalExcludesFile;
-    this.newHasher = options.newHasher ?? createSha1;
+    // the repository's hash (a SHA-256 repository's files are named in SHA-256), from its blobs
+    this.newHasher = options.newHasher ?? options.blobs?.objectFormat?.createHasher ?? createSha1;
     if (options.environment) this.environment = options.environment;
   }
 
@@ -1346,7 +1347,7 @@ export class FileWorktree implements Worktree {
       gitDir,
       blobs: history.blobs,
       trees: history.trees,
-      newHasher: this.newHasher,
+      // the submodule's own format, from its blobs (a superproject's may differ)
       ...environment,
     });
     return new MemoryWorkingCopy({

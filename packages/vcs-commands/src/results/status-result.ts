@@ -1,4 +1,5 @@
 import type { ObjectId } from "@statewalker/vcs-core";
+import { nullObjectIdLike } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { StageStateValue } from "@statewalker/vcs-working-tree";
 import { quoteCStyleBody } from "./quote-path.js";
@@ -176,8 +177,6 @@ function comparePaths(a: string, b: string): number {
   return compareGitPaths(a, b);
 }
 
-const ZERO_ID = "0".repeat(40);
-
 /**
  * The submodule field of a porcelain v2 line: `N...` for a path that is no submodule, else
  * `S` and whether its commit changed (`C`), it has tracked changes (`M`) and untracked files
@@ -268,6 +267,10 @@ export function formatStatusPorcelain(
     }
     const xy = `${e.index === " " ? "." : e.index}${e.worktree === " " ? "." : e.worktree}`;
     const sub = submoduleToken(e);
+    // the null id of the repository's format: as long as the entry's other ids
+    const ZERO_ID = nullObjectIdLike(
+      e.head?.id ?? e.staged?.id ?? e.stages?.find((x) => x !== undefined)?.id,
+    );
     if (from !== undefined) {
       lines.push(
         [

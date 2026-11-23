@@ -45,7 +45,7 @@ import {
   inflateWhole,
   TruncatedStreamError,
 } from "@statewalker/vcs-utils/compression";
-import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { createSha1, type Hasher } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 
 /** git's MAX_HEADER_LEN */
@@ -132,6 +132,8 @@ async function readFile(files: FilesApi, path: string): Promise<Uint8Array | und
 export interface LooseReadOptions {
   /** `core.bigFileThreshold`: larger blobs are streamed (default 512 MiB). */
   bigFileThreshold?: number;
+  /** The repository's hash (its `ObjectFormat.createHasher`); SHA-1 by default */
+  newHasher?: () => Hasher;
 }
 
 /** Reads the loose object `id` stored at `path`, as `read_loose_object` does. */
@@ -185,7 +187,14 @@ export async function readLooseObject(
   const headerLength = nul + 1;
 
   if (type === "blob" && size > (options.bigFileThreshold ?? DEFAULT_BIG_FILE_THRESHOLD)) {
-    const streamed = checkStreamOid(data, headerLength, size, path, id);
+    const streamed = checkStreamOid(
+      data,
+      headerLength,
+      size,
+      path,
+      id,
+      options.newHasher ?? createSha1,
+    );
     if (streamed.length > 0) return { errors: streamed };
     return { errors, object: { type, size } };
   }
@@ -230,7 +239,7 @@ export async function readLooseObject(
     errors.push(`unable to unpack contents of ${path}`);
     return { errors };
   }
-  const hasher = createSha1()
+  const hasher = (options.newHasher ?? createSha1)()
     .update(enc.encode(`${type} ${size}\0`))
     .update(content);
   for (let left = missing; left > 0; left -= ZEROS.length) {
@@ -257,8 +266,9 @@ function checkStreamOid(
   size: number,
   path: string,
   id: string,
+  newHasher: () => Hasher,
 ): string[] {
-  const hasher = createSha1();
+  const hasher = newHasher();
   const inflater = createInflater();
   let produced = 0;
   const limit = headerLength + size;

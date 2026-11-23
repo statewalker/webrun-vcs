@@ -12,6 +12,7 @@ import {
   findAbbrevLengths,
   type GitObjects,
   type ObjectId,
+  objectFormatOf,
   parseCoreAbbrev,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
@@ -165,8 +166,11 @@ export function createIdAbbreviator(
     ids: Iterable<ObjectId>,
     minLength?: number,
   ): Promise<Map<ObjectId, number>> => {
+    const hexLength = objectFormatOf(workingCopy.history).hexLength;
     let start =
-      minLength ?? parseCoreAbbrev(RemoteConfigStore.from(workingCopy).value("core.abbrev")) ?? -1;
+      minLength ??
+      parseCoreAbbrev(RemoteConfigStore.from(workingCopy).value("core.abbrev"), hexLength) ??
+      -1;
     const objects = workingCopy.history?.objects;
     if (objects) {
       if (start < 0) {
@@ -175,7 +179,8 @@ export function createIdAbbreviator(
       }
       return findAbbrevLengths(objects, ids, start, listings);
     }
-    const fixed = start < 0 ? DEFAULT_ABBREV_LENGTH : start === 0 ? 40 : Math.min(start, 40);
+    const fixed =
+      start < 0 ? DEFAULT_ABBREV_LENGTH : start === 0 ? hexLength : Math.min(start, hexLength);
     return new Map([...ids].map((id) => [id, fixed]));
   };
   return {

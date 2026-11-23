@@ -32,7 +32,17 @@ const GT = 0x3e;
 const ZERO = 0x30;
 const SLASH = 0x2f;
 const NUL = 0;
-const HEX = 40;
+/**
+ * The id lengths of the repository's object format: `rawLength` bytes in trees, `hexLength`
+ * digits in commits and tags (git's `rawsz`/`hexsz`). SHA-1's unless given.
+ */
+export interface IdShape {
+  readonly rawLength: number;
+  readonly hexLength: number;
+}
+
+/** SHA-1's ids: 20 bytes, 40 hex digits */
+export const SHA1_ID_SHAPE: IdShape = { rawLength: 20, hexLength: 40 };
 const S_IFMT = 0o170000;
 const S_IFREG = 0o100000;
 const S_IFDIR = 0o040000;
@@ -53,10 +63,10 @@ function startsWith(buf: Uint8Array, at: number, prefix: string): boolean {
   return true;
 }
 
-/** git's `parse_oid_hex`: 40 hex digits (either case) at `at`; the end, or -1. */
-function parseOidHex(buf: Uint8Array, at: number): number {
-  for (let i = 0; i < HEX; i++) if (!isHexDigit(buf[at + i])) return -1;
-  return at + HEX;
+/** git's `parse_oid_hex`: 40 (64) hex digits (either case) at `at`; the end, or -1. */
+function parseOidHex(buf: Uint8Array, at: number, hex: number): number {
+  for (let i = 0; i < hex; i++) if (!isHexDigit(buf[at + i])) return -1;
+  return at + hex;
 }
 
 function indexOf(buf: Uint8Array, byte: number, from: number, end = buf.length): number {
@@ -161,7 +171,12 @@ function fsckIdent(
 }
 
 /** git's `fsck_commit`. Returns nonzero when an error was reported (or a fatal check stopped it). */
-export function fsckCommit(buf: Uint8Array, report: FsckReport): number {
+export function fsckCommit(
+  buf: Uint8Array,
+  report: FsckReport,
+  shape: IdShape = SHA1_ID_SHAPE,
+): number {
+  const HEX = shape.hexLength;
   const headers = verifyHeaders(buf, report);
   if (headers.stop) return headers.value || -1;
   const end = buf.length;
@@ -170,7 +185,7 @@ export function fsckCommit(buf: Uint8Array, report: FsckReport): number {
     return report("missingTree", "invalid format - expected 'tree' line");
   }
   p += 5;
-  let q = parseOidHex(buf, p);
+  let q = parseOidHex(buf, p, HEX);
   if (q < 0 || buf[q] !== NL) {
     const err = report("badTreeSha1", "invalid 'tree' line format - bad sha1");
     if (err) return err;
@@ -180,7 +195,7 @@ export function fsckCommit(buf: Uint8Array, report: FsckReport): number {
   p = q + 1;
   while (p < end && startsWith(buf, p, "parent ")) {
     p += 7;
-    q = parseOidHex(buf, p);
+    q = parseOidHex(buf, p, HEX);
     if (q < 0 || buf[q] !== NL) {
       const err = report("badParentSha1", "invalid 'parent' line format - bad sha1");
       if (err) return err;
@@ -222,7 +237,7 @@ const TYPE_NAMES = ["commit", "tree", "blob", "tag"];
 export function fsckTag(
   buf: Uint8Array,
   report: FsckReport,
-  options: { gpgsig?: boolean } = {},
+  options: { gpgsig?: boolean; shape?: IdShape } = {},
 ): number {
   const headers = verifyHeaders(buf, report);
   if (headers.stop) return headers.value || -1;
@@ -232,7 +247,7 @@ export function fsckTag(
     return report("missingObject", "invalid format - expected 'object' line");
   }
   p += 7;
-  let q = parseOidHex(buf, p);
+  let q = parseOidHex(buf, p, (options.shape ?? SHA1_ID_SHAPE).hexLength);
   if (q < 0 || buf[q] !== NL) {
     const ret = report("badObjectSha1", "invalid 'object' line format - bad sha1");
     if (ret) return ret;
@@ -318,20 +333,24 @@ export interface RawTreeEntry {
   mode: number;
   /** The name's bytes. */
   name: Uint8Array;
-  /** Offset of the entry's 20 id bytes in the tree (`treeEntryId` gives the hex). */
+  /** Offset of the entry's id bytes (20, 32 for SHA-256) in the tree (`treeEntryId` gives the hex). */
   idAt: number;
   /** Offset of the entry's mode text in the tree. */
   at: number;
 }
 
 /** The id of a tree entry, as hex. */
-export function treeEntryId(buf: Uint8Array, entry: RawTreeEntry): string {
-  return bytesToHex(buf.subarray(entry.idAt, entry.idAt + 20));
+export function treeEntryId(
+  buf: Uint8Array,
+  entry: RawTreeEntry,
+  shape: IdShape = SHA1_ID_SHAPE,
+): string {
+  return bytesToHex(buf.subarray(entry.idAt, entry.idAt + shape.rawLength));
 }
 
-/** Whether the 20 id bytes at `at` are all zero (the null id). */
-function isNullIdAt(buf: Uint8Array, at: number): boolean {
-  for (let i = at; i < at + 20; i++) if (buf[i] !== 0) return false;
+/** Whether the `raw` id bytes at `at` are all zero (the null id). */
+function isNullIdAt(buf: Uint8Array, at: number, raw: number): boolean {
+  for (let i = at; i < at + raw; i++) if (buf[i] !== 0) return false;
   return true;
 }
 
@@ -339,9 +358,9 @@ function isNullIdAt(buf: Uint8Array, at: number): boolean {
  * Decodes the entry at `at` as git's `decode_tree_entry`: returns it, or the error git prints
  * (`too-short tree object`, `malformed mode in tree entry`, `empty filename in tree entry`).
  */
-function decodeTreeEntry(buf: Uint8Array, at: number): RawTreeEntry | string {
+function decodeTreeEntry(buf: Uint8Array, at: number, raw: number): RawTreeEntry | string {
   const size = buf.length - at;
-  if (size < 23 || buf[at + size - 21] !== NUL) return "too-short tree object";
+  if (size < raw + 3 || buf[at + size - raw - 1] !== NUL) return "too-short tree object";
   if (buf[at] === SP) return "malformed mode in tree entry";
   let p = at;
   let mode = 0;
@@ -373,21 +392,22 @@ export interface TreeWalk {
  * walk with `die("too-short tree file")` when an entry runs past the end; that is reported as a
  * decoding error here.
  */
-export function walkTree(buf: Uint8Array): TreeWalk {
+export function walkTree(buf: Uint8Array, shape: IdShape = SHA1_ID_SHAPE): TreeWalk {
+  const raw = shape.rawLength;
   const entries: RawTreeEntry[] = [];
   if (buf.length === 0) return { entries };
   let at = 0;
-  let entry = decodeTreeEntry(buf, at);
+  let entry = decodeTreeEntry(buf, at, raw);
   if (typeof entry === "string") return { entries, initError: entry };
   for (;;) {
-    const next = entry.idAt + 20;
+    const next = entry.idAt + raw;
     if (next > buf.length) return { entries, error: "too-short tree file" };
     at = next;
     if (at >= buf.length) {
       entries.push(entry);
       return { entries };
     }
-    const decoded = decodeTreeEntry(buf, at);
+    const decoded = decodeTreeEntry(buf, at, raw);
     if (typeof decoded === "string") return { entries, error: decoded };
     entries.push(entry);
     entry = decoded;
@@ -396,7 +416,7 @@ export function walkTree(buf: Uint8Array): TreeWalk {
 
 /**
  * A tree's entries as `walkTree` decodes them, without an object per entry: entry `i` has its
- * mode at `fields[3 * i]`, the offset of its name at `fields[3 * i + 1]` and of its 20 id bytes
+ * mode at `fields[3 * i]`, the offset of its name at `fields[3 * i + 1]` and of its id bytes
  * at `fields[3 * i + 2]` (the name ends at the NUL before them).
  */
 export interface TreeEntryTable {
@@ -415,7 +435,12 @@ const NO_FIELDS = new Int32Array(0);
  * `reuse`, the table and its fields are that table's, overwritten (grown when too short): a
  * walk that decodes one tree at a time allocates nothing per tree.
  */
-export function scanTree(buf: Uint8Array, reuse?: TreeEntryTable): TreeEntryTable {
+export function scanTree(
+  buf: Uint8Array,
+  reuse?: TreeEntryTable,
+  shape: IdShape = SHA1_ID_SHAPE,
+): TreeEntryTable {
+  const raw = shape.rawLength;
   const len = buf.length;
   const out: TreeEntryTable = reuse ?? { count: 0, fields: NO_FIELDS };
   out.count = 0;
@@ -427,17 +452,17 @@ export function scanTree(buf: Uint8Array, reuse?: TreeEntryTable): TreeEntryTabl
   }
   // an entry takes at least 24 bytes (a mode digit, a space, a name byte, a NUL and the id);
   // one more slot for the entry decoded past the last one kept
-  const need = 3 * (Math.floor(len / 23) + 2);
+  const need = 3 * (Math.floor(len / (raw + 3)) + 2);
   if (out.fields.length < need) out.fields = new Int32Array(reuse ? Math.max(need, 3 * 64) : need);
   const fields = out.fields;
-  let err = decodeTreeEntryInto(buf, 0, fields, 0);
+  let err = decodeTreeEntryInto(buf, 0, fields, 0, raw);
   if (err) {
     out.initError = err;
     return out;
   }
   let count = 0;
   for (;;) {
-    const next = (fields[3 * count + 2] as number) + 20;
+    const next = (fields[3 * count + 2] as number) + raw;
     if (next > len) {
       out.count = count;
       out.error = "too-short tree file";
@@ -447,7 +472,7 @@ export function scanTree(buf: Uint8Array, reuse?: TreeEntryTable): TreeEntryTabl
       out.count = count + 1;
       return out;
     }
-    err = decodeTreeEntryInto(buf, next, fields, count + 1);
+    err = decodeTreeEntryInto(buf, next, fields, count + 1, raw);
     if (err) {
       out.count = count;
       out.error = err;
@@ -463,9 +488,10 @@ function decodeTreeEntryInto(
   at: number,
   fields: Int32Array,
   k: number,
+  raw: number,
 ): string | undefined {
   const size = buf.length - at;
-  if (size < 23 || buf[at + size - 21] !== NUL) return "too-short tree object";
+  if (size < raw + 3 || buf[at + size - raw - 1] !== NUL) return "too-short tree object";
   if (buf[at] === SP) return "malformed mode in tree entry";
   let p = at;
   let mode = 0;
@@ -572,8 +598,11 @@ export function fsckTree(
   report: FsckReport,
   onDecodeError: (message: string) => void,
   found: TreeFindings,
-  table: TreeEntryTable = scanTree(buf),
+  table?: TreeEntryTable,
+  shape: IdShape = SHA1_ID_SHAPE,
 ): number {
+  const raw = shape.rawLength;
+  table ??= scanTree(buf, undefined, shape);
   let retval = 0;
   let hasNullSha1 = false;
   let hasFullPath = false;
@@ -604,10 +633,10 @@ export function fsckTree(
     const start = f[3 * i + 1] as number;
     const idAt = f[3 * i + 2] as number;
     const end = idAt - 1;
-    hasNullSha1 ||= isNullIdAt(buf, idAt);
+    hasNullSha1 ||= isNullIdAt(buf, idAt, raw);
     hasEmptyName ||= end === start;
     // the entry's mode text starts where the one before ended
-    hasZeroPad ||= buf[i === 0 ? 0 : (f[3 * i - 1] as number) + 20] === ZERO;
+    hasZeroPad ||= buf[i === 0 ? 0 : (f[3 * i - 1] as number) + raw] === ZERO;
     hasLargeName ||= end - start > types.maxTreeEntryLength;
     // the name checks below can match only a name that starts with a dot, or holds a `~`, a
     // backslash or a non-ASCII byte: most names skip them
@@ -618,7 +647,7 @@ export function fsckTree(
       else if (c === 0x7e || c === 0x5c || c >= 0x80) plain = false;
     }
     if (!plain) {
-      const entryId = () => bytesToHex(buf.subarray(idAt, idAt + 20));
+      const entryId = () => bytesToHex(buf.subarray(idAt, idAt + raw));
       const text = dec.decode(buf.subarray(start, end));
       hasDot ||= text === ".";
       hasDotdot ||= text === "..";
@@ -952,31 +981,41 @@ export interface ParsedCommit {
  * git's `parse_commit_buffer`: the tree and parents, or the error it prints. Ids are
  * lowercased (git's `get_oid_hex` accepts either case).
  */
-export function parseCommitBuffer(buf: Uint8Array, id: string): ParsedCommit | { error: string } {
-  const links = parseCommitLinks(buf, id);
+export function parseCommitBuffer(
+  buf: Uint8Array,
+  id: string,
+  shape: IdShape = SHA1_ID_SHAPE,
+): ParsedCommit | { error: string } {
+  const links = parseCommitLinks(buf, id, shape);
   if ("error" in links) return links;
   return {
-    tree: hexIdAt(buf, links.tree),
-    parents: links.parents.map((at) => hexIdAt(buf, at)),
+    tree: hexIdAt(buf, links.tree, shape),
+    parents: links.parents.map((at) => hexIdAt(buf, at, shape)),
   };
 }
 
-/** `parseCommitBuffer` with the ids left in place: where each one's 40 hex digits start. */
+/** `parseCommitBuffer` with the ids left in place: where each one's 40 (64) hex digits start. */
 export function parseCommitLinks(
   buf: Uint8Array,
   id: string,
+  shape: IdShape = SHA1_ID_SHAPE,
 ): { tree: number; parents: number[] } | { error: string } {
+  const HEX = shape.hexLength;
   const tail = buf.length;
   const treeLen = HEX + 5;
   const parentLen = HEX + 7;
   if (tail <= treeLen + 1 || !startsWith(buf, 0, "tree ") || buf[treeLen] !== NL) {
     return { error: `bogus commit object ${id}` };
   }
-  if (parseOidHex(buf, 5) < 0) return { error: `bad tree pointer in commit ${id}` };
+  if (parseOidHex(buf, 5, HEX) < 0) return { error: `bad tree pointer in commit ${id}` };
   const parents: number[] = [];
   let p = treeLen + 1;
   while (p + parentLen < tail && startsWith(buf, p, "parent ")) {
-    if (tail <= p + parentLen + 1 || parseOidHex(buf, p + 7) < 0 || buf[p + parentLen] !== NL) {
+    if (
+      tail <= p + parentLen + 1 ||
+      parseOidHex(buf, p + 7, HEX) < 0 ||
+      buf[p + parentLen] !== NL
+    ) {
       return { error: `bad parents in commit ${id}` };
     }
     parents.push(p + 7);
@@ -985,14 +1024,14 @@ export function parseCommitLinks(
   return { tree: 5, parents };
 }
 
-/** The 40 hex digits at `at` (checked by `parseOidHex`), lowercased. */
-export function hexIdAt(buf: Uint8Array, at: number): string {
-  return dec.decode(buf.subarray(at, at + HEX)).toLowerCase();
+/** The 40 (64) hex digits at `at` (checked by `parseOidHex`), lowercased. */
+export function hexIdAt(buf: Uint8Array, at: number, shape: IdShape = SHA1_ID_SHAPE): string {
+  return dec.decode(buf.subarray(at, at + shape.hexLength)).toLowerCase();
 }
 
-/** The 20 bytes of the 40 hex digits at `at` (either case, checked), written into `out`. */
+/** The bytes of the hex id at `at` (either case, checked), written into `out` (its length). */
 export function rawIdAt(buf: Uint8Array, at: number, out: Uint8Array): Uint8Array {
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < out.length; i++) {
     const hi = buf[at + 2 * i] as number;
     const lo = buf[at + 2 * i + 1] as number;
     out[i] = (nibble(hi) << 4) | nibble(lo);
@@ -1019,11 +1058,13 @@ export interface ParsedTag {
 export function parseTagBuffer(
   buf: Uint8Array,
   id: string,
+  shape: IdShape = SHA1_ID_SHAPE,
 ): ParsedTag | { error: string | undefined } {
+  const HEX = shape.hexLength;
   const tail = buf.length;
   if (tail < HEX + 24) return { error: undefined };
   if (!startsWith(buf, 0, "object ")) return { error: undefined };
-  const q = parseOidHex(buf, 7);
+  const q = parseOidHex(buf, 7, HEX);
   if (q < 0 || buf[q] !== NL) return { error: undefined };
   const object = dec.decode(buf.subarray(7, q)).toLowerCase();
   let p = q + 1;

@@ -50,8 +50,8 @@ import type {
 /** git's MAXREPLACEDEPTH */
 const MAX_REPLACE_DEPTH = 5;
 
-const OID_PREFIX = /^[0-9a-fA-F]{40}/;
-const OID = /^[0-9a-f]{40}$/;
+const OID_PREFIX = /^(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40})/;
+const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** The replacements a history walk reads commits through. */
 export interface ObjectReplacements {
@@ -89,8 +89,9 @@ export function parseGraftFile(text: string): {
     let rest = line;
     let ok = OID_PREFIX.test(rest);
     while (ok) {
-      ids.push(rest.slice(0, 40).toLowerCase());
-      rest = rest.slice(40);
+      const length = (OID_PREFIX.exec(rest) as RegExpExecArray)[0].length;
+      ids.push(rest.slice(0, length).toLowerCase());
+      rest = rest.slice(length);
       if (rest === "") break;
       // one whitespace character, then the next id
       ok = /^[ \t\n\r]/.test(rest) && OID_PREFIX.test(rest.slice(1));
@@ -282,7 +283,9 @@ export async function loadObjectReplacements(
         messages.push(`warning: bad replace ref name: ${trimmed}`);
         continue;
       }
-      const original = name.slice(0, 40).toLowerCase();
+      const original = name
+        .slice(0, (OID_PREFIX.exec(name) as RegExpExecArray)[0].length)
+        .toLowerCase();
       const value =
         "objectId" in entry && entry.objectId
           ? entry.objectId

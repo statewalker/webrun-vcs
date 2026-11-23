@@ -2,6 +2,7 @@ import type { FilesApi, History } from "@statewalker/vcs-core";
 import { type GcResult, parseExpiryDate, gc as storeGc } from "@statewalker/vcs-store-files";
 import { parseGitInt } from "@statewalker/vcs-utils";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
+import { assertSha1ObjectFormat } from "@statewalker/vcs-utils/hash";
 
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
@@ -285,6 +286,8 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
   async call(): Promise<GCCommandResult> {
     this.checkCallable();
     this.setCallable(false);
+    // a SHA-256 repository's packs are not written yet: gc and its repack are refused
+    assertSha1ObjectFormat(this.objectFormat, "gc");
 
     const startTime = Date.now();
     let refsPacked = false;

@@ -29,7 +29,7 @@ export const QUARANTINE_DIR_PREFIX = "tmp_objdir-incoming-";
 const FANOUT = /^[0-9a-f]{2}$/;
 /** git's freshen window, as `createGitFilesBackend`'s default `freshenMaxAgeMs`. */
 const DEFAULT_FRESHEN_MAX_AGE_MS = 60 * 60 * 1000;
-const REST = /^[0-9a-f]{38}$/;
+const REST = /^(?:[0-9a-f]{38}|[0-9a-f]{62})$/;
 
 /**
  * Quarantine directories open in this process, with when each was last used:

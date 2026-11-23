@@ -15,6 +15,7 @@ import {
   sweepPackTemporaries,
 } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
+import { assertSha1ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { assertAlternatesReadable } from "./alternates/index.js";
 import { readCommitGraphSettings, writeCommitGraph } from "./commit-graph.js";
@@ -363,6 +364,8 @@ async function collect(options: GcOptions): Promise<GcResult> {
   // preciousObjects: as git gc, refs are packed, but nothing is repacked or pruned. A partial
   // clone's promisor objects stay out of the walk, its promisor packs are repacked apart
   const format = await readRepositoryFormat(files, gitDir);
+  // a SHA-256 repository: its packs and the walks' files (index, packs) are not read yet
+  assertSha1ObjectFormat(format.objectFormat, "gc");
   const exclusions = dryRun ? undefined : await promisorExclusions(objects, files, gitDir);
   // git's errors reading the alternates (a directory gone, ...) are printed and gc goes on: the
   // walk below fails on a root or a local commit's object that only they held. Alternates git
