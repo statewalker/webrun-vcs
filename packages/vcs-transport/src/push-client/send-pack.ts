@@ -113,6 +113,11 @@ export interface PushClientResult {
   ok: boolean;
   /** The server's `unpack` line (absent when no request was sent, or without report-status) */
   unpack?: { ok: boolean; message?: string };
+  /**
+   * Pushed over a stateless connection (smart HTTP): git's send-pack runs there as remote-curl's
+   * helper, whose refused unpack does not fail `transport_push` (porcelain `Done` still printed)
+   */
+  stateless?: boolean;
   /** The capabilities asked for on the first command */
   capabilities: string[];
   /** Objects in the pack as sent (its header); 0 without a pack */
@@ -413,10 +418,15 @@ async function sendPack(
     const unpackStatus = first.slice(7);
     result.unpack = unpackStatus === "ok" ? { ok: true } : { ok: false, message: unpackStatus };
   }
+  if (connection.stateless) result.stateless = true;
   const reported = new Set<PushRefUpdate>();
   const byRef = new Map(toSend.map((u) => [u.remoteRef, u]));
   const unsent = new Set(updates.filter((u) => !toSend.includes(u)).map((u) => u.remoteRef));
   const reportErrors: string[] = [];
+  // receive_status's error() for the unpack line
+  if (!result.unpack.ok && first?.startsWith("unpack ")) {
+    reportErrors.push(`error: remote unpack failed: ${result.unpack.message}`);
+  }
   let optionWithoutStatus = false;
   // git's receive_status: the `option` lines after an `ok` add a report to that ref
   let hint: PushRefUpdate | undefined;

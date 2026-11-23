@@ -3,6 +3,7 @@
  */
 
 import type { RepositoryFacade } from "../../api/repository-facade.js";
+import type { ReceivedObjectsFsck } from "../../fetch-client/fetch-checks.js";
 import type { ProcReceiveProcess } from "./proc-receive.js";
 import type { PushCommandType } from "./types.js";
 
@@ -325,6 +326,17 @@ export interface ReceivePackConfig {
    * (`ReceivePackHooks.procReceive`) instead of being updated by receive-pack
    */
   procReceiveRefs?: readonly string[];
+  /**
+   * `receive.fsckObjects` (else `transfer.fsckObjects`): the fsck of one push's objects, made
+   * anew for each push (it keeps the `.gitmodules` blobs it found), or undefined when the
+   * push is not checked (vcs-commands' `receiveFsckOf` reads git's settings). With it every
+   * received object is checked before anything sees it, as git's receive-pack has
+   * unpack-objects or index-pack run `--strict`: their messages go to the client's progress
+   * channel, and a refused pack is discarded with the unpack status `unpack-objects abnormal
+   * exit` (a pack the store unpacked) or `index-pack abnormal exit` (one it kept), every
+   * command `unpacker error`.
+   */
+  fsckObjects?: () => ReceivedObjectsFsck | undefined | Promise<ReceivedObjectsFsck | undefined>;
   /**
    * What receive-pack prints as it dies on a setting it cannot read (see
    * `ServerConfigSettings.receivePackConfigError`): it dies before the advertisement, the

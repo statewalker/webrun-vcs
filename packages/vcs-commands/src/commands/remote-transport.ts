@@ -32,7 +32,12 @@ import { InvalidConfigError, TransportError } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import type { HookSession } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
-import { openLocalRemote, withLocalReceivePack, withLocalUploadPack } from "./local-transport.js";
+import {
+  openLocalRemote,
+  type ReceivePackHost,
+  withLocalReceivePack,
+  withLocalUploadPack,
+} from "./local-transport.js";
 
 /** A remote URL resolved to the transport that reaches it. */
 export type ResolvedRemote =
@@ -362,10 +367,13 @@ export async function withRemoteReceivePack<T>(
   run: (connection: ReceivePackConnection) => Promise<T>,
   hooks?: HookSession,
   transactionHooks?: HookSession,
+  /** A local receive-pack's host and its config warnings (see `withLocalReceivePack`) */
+  local: { host?: ReceivePackHost; onWarning?: (line: string) => void } = {},
 ): Promise<T> {
   if (remote.kind === "local") {
     return withLocalReceivePack(remote.repository, run, hooks, transactionHooks, {
       protocolVersion: options.protocolVersion,
+      ...local,
     });
   }
   return withRemoteSession(remote, "git-receive-pack", options, async (session, request) => {
