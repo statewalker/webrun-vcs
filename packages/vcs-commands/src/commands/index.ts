@@ -84,6 +84,7 @@ export {
 export * from "./remote-command.js";
 export * from "./reset-command.js";
 export * from "./restore-command.js";
+export * from "./rev-filter/index.js";
 export * from "./rev-list-command.js";
 export * from "./rev-parse-command.js";
 export * from "./revert-command.js";

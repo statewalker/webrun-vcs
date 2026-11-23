@@ -1,6 +1,7 @@
 import { type ObjectId, parsePersonIdent } from "@statewalker/vcs-core";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
+import { InvalidConfigError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type DateMode, DEFAULT_DATE_MODE, parseDateMode, showDate } from "./date-format.js";
@@ -374,7 +375,16 @@ abstract class NotesMessageCommand<T> extends NotesSubcommand<T> {
     let text = d.count > 0 ? d.buf : oldNote ? ((await this.readNoteText(oldNote)) ?? "") : "";
     text += `\n${comment}\n${comment} ${NOTE_TEMPLATE}\n${comment}\n`;
     // write_commented_object: `git show --stat --no-notes <object>`, commented
-    const shown = await this.showObject(object);
+    let shown: Awaited<ReturnType<typeof this.showObject>>;
+    try {
+      shown = await this.showObject(object);
+    } catch (e) {
+      // the `git show` child died on its configuration (a bad grep.patternType)
+      if (!(e instanceof InvalidConfigError)) throw e;
+      const error = new NotesError(`failed to finish 'show' for object '${object}'`);
+      error.errors = `${errors.join("")}${e.message}\n`;
+      throw error;
+    }
     if (shown === undefined || "error" in shown) {
       const error = new NotesError(`failed to finish 'show' for object '${object}'`);
       const why = shown ? `error: ${shown.error}\n` : `fatal: bad object ${object}\n`;

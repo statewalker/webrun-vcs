@@ -18,7 +18,7 @@ import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
 import type { AttributesResolver, ContentAttributesContext } from "@statewalker/vcs-working-tree";
 
-import { GitApiError, IncompatibleOptionsError } from "../errors/index.js";
+import { GitApiError, IncompatibleOptionsError, InvalidConfigError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type CombinedDiffOptions, writeCombinedDiff } from "../results/combined-diff.js";
@@ -61,6 +61,12 @@ import {
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
 import { loadRefDecorations } from "./pretty-format.js";
+import {
+  type CommitFilter,
+  CommitFilters,
+  type FilteredCommit,
+  type GrepPatternType,
+} from "./rev-filter/index.js";
 import { readDiffSubmoduleConfig } from "./submodule-summary.js";
 
 /** What {@link LogCommand.callBytes} asks of the walk. */
@@ -201,6 +207,21 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private authorPattern?: string;
   private committerPattern?: string;
   private revFilter = RevFilter.ALL;
+  /** `--grep` patterns */
+  private readonly grepMessages: string[] = [];
+  /** `--author` patterns */
+  private readonly grepAuthors: string[] = [];
+  /** `--committer` patterns */
+  private readonly grepCommitters: string[] = [];
+  private allMatch = false;
+  private invertGrep = false;
+  private regexpIgnoreCase = false;
+  private patternType?: GrepPatternType;
+  private useMailmap?: boolean;
+  private logConfig = true;
+  private readonly commitFilters: CommitFilter[] = [];
+  /** The filter of the walk under way (git's options and the added filters) */
+  private activeFilter?: CommitFilter;
   private useBloomFilters = true;
   private readonly statistics: LogPathStatistics = {
     bloomDefinitelyNot: 0,
@@ -406,6 +427,106 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
+   * `--grep=<pattern>`: commits whose message has a line matching the pattern (several:
+   * any of them, every one with {@link setAllMatch}). Patterns are basic POSIX regexes unless
+   * {@link setPatternType} or `grep.patternType`/`grep.extendedRegexp` say otherwise, matched
+   * as git's grep.c matches them (`--grep=` matches every commit with a message part).
+   *
+   * @example
+   * ```typescript
+   * // git log --grep=fix --grep=bug --all-match -i
+   * await git.log().addGrep("fix").addGrep("bug").setAllMatch(true).setRegexpIgnoreCase(true).call();
+   * ```
+   */
+  addGrep(pattern: string): this {
+    this.checkCallable();
+    this.grepMessages.push(pattern);
+    return this;
+  }
+
+  /**
+   * `--author=<pattern>`: commits whose `author` header line (name and email, the date left
+   * out; mapped through the mailmap under `log.mailmap`) matches the pattern; several are
+   * or-ed. Unlike {@link setAuthorFilter}, the pattern is git's (a basic regex, case-sensitive
+   * without {@link setRegexpIgnoreCase}).
+   */
+  addAuthor(pattern: string): this {
+    this.checkCallable();
+    this.grepAuthors.push(pattern);
+    return this;
+  }
+
+  /** `--committer=<pattern>`: as {@link addAuthor}, on the `committer` header line. */
+  addCommitter(pattern: string): this {
+    this.checkCallable();
+    this.grepCommitters.push(pattern);
+    return this;
+  }
+
+  /** `--all-match`: every `--grep` pattern must match (author and committer patterns always must). */
+  setAllMatch(allMatch: boolean): this {
+    this.checkCallable();
+    this.allMatch = allMatch;
+    return this;
+  }
+
+  /** `--invert-grep`: commits whose message matches no `--grep` pattern (not `--author`'s). */
+  setInvertGrep(invert: boolean): this {
+    this.checkCallable();
+    this.invertGrep = invert;
+    return this;
+  }
+
+  /** `-i` / `--regexp-ignore-case`: the patterns fold ASCII case. */
+  setRegexpIgnoreCase(ignoreCase: boolean): this {
+    this.checkCallable();
+    this.regexpIgnoreCase = ignoreCase;
+    return this;
+  }
+
+  /**
+   * The patterns' type: `--basic-regexp`, `-E` (`extended`), `-F` (`fixed`) or `-P`
+   * (`perl`: refused as a git built without PCRE refuses it, unless the pattern has no regex
+   * character). Default: `grep.patternType`, else `grep.extendedRegexp`, else basic.
+   */
+  setPatternType(type: GrepPatternType): this {
+    this.checkCallable();
+    this.patternType = type;
+    return this;
+  }
+
+  /**
+   * Whether `--author`/`--committer` match the identities as the mailmap maps them
+   * (`--use-mailmap`/`--no-mailmap`; default `log.mailmap`, true, as `git log`).
+   */
+  setUseMailmap(use: boolean): this {
+    this.checkCallable();
+    this.useMailmap = use;
+    return this;
+  }
+
+  /**
+   * Whether the filters read `git log`'s configuration (default true): `grep.patternType`,
+   * `grep.extendedRegexp` and `log.mailmap`. False reads none of them, as `git rev-list`.
+   */
+  setLogConfig(read: boolean): this {
+    this.checkCallable();
+    this.logConfig = read;
+    return this;
+  }
+
+  /**
+   * A filter of the commits shown (see `CommitFilters`); several must all include a commit,
+   * as must git's options above. The walk still goes through the commits a filter hides, and
+   * `setMaxCount`/`setSkip` count only shown ones.
+   */
+  addCommitFilter(filter: CommitFilter): this {
+    this.checkCallable();
+    this.commitFilters.push(filter);
+    return this;
+  }
+
+  /**
    * Whether a path-limited walk asks the commit-graph's changed-path Bloom filters before it
    * compares trees (default true, as git does whenever the graph has filters).
    */
@@ -452,6 +573,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     this.setCallable(false);
     // git_log_config ends in git_diff_ui_config: a diff.submodule without a value dies
     readDiffSubmoduleConfig(this.workingCopy);
+    this.activeFilter = await this.buildCommitFilter();
 
     // the commits given, in order, the refs of `all()` where it was called; HEAD without
     // either
@@ -467,6 +589,74 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       pending.push({ id: await this.resolveHead(), exclude: false });
     }
     return this.walk(pending);
+  }
+
+  /**
+   * The walk's filter: git's `--grep`/`--author`/`--committer` options as one `commit_match`
+   * (revision.c), then the filters added. The walk reads `grep.patternType` (and refuses a
+   * value git does not know) only when a pattern is given; the log output (`callBytes`, git
+   * log and git show) reads it on every run, as git does.
+   */
+  private async buildCommitFilter(): Promise<CommitFilter | undefined> {
+    const filters: CommitFilter[] = [];
+    const headers = this.grepAuthors.length > 0 || this.grepCommitters.length > 0;
+    // the grep configuration and the mailmap are read only for a walk that greps: the
+    // commands walking through LogCommand for git's other commands (bisect, notes, rev-list)
+    // never see them
+    if (this.grepMessages.length > 0 || headers) {
+      let type = this.patternType;
+      if (this.logConfig) {
+        const configured = this.configuredPatternType();
+        if (type === undefined) type = configured;
+        if (type === undefined && configBool(this.workingCopy, "grep.extendedRegexp", false)) {
+          type = "extended";
+        }
+      }
+      let mailmap: Mailmap | undefined;
+      const mapped =
+        this.useMailmap ??
+        (this.logConfig ? configBool(this.workingCopy, "log.mailmap", true) : false);
+      if (headers && mapped)
+        mailmap = await this.loadMailmap(RemoteConfigStore.from(this._workingCopy));
+      filters.push(
+        CommitFilters.grep({
+          messages: this.grepMessages,
+          authors: this.grepAuthors,
+          committers: this.grepCommitters,
+          allMatch: this.allMatch,
+          invertGrep: this.invertGrep,
+          ignoreCase: this.regexpIgnoreCase,
+          patternType: type,
+          mailmap,
+        }),
+      );
+    }
+    filters.push(...this.commitFilters);
+    return filters.length > 0 ? CommitFilters.and(...filters) : undefined;
+  }
+
+  /**
+   * `grep.patternType` as grep_config reads it (`default` is undefined); a value git does not
+   * know dies, as every `git log`/`git show` dies on it whatever it is asked.
+   */
+  private configuredPatternType(): GrepPatternType | undefined {
+    const value = configValue(this.workingCopy, "grep.patternType");
+    if (value === undefined || value === "default") return undefined;
+    if (value === "basic" || value === "extended" || value === "fixed" || value === "perl") {
+      return value;
+    }
+    throw new InvalidConfigError(
+      "grep.patternType",
+      `fatal: bad grep.patterntype argument: ${value}`,
+    );
+  }
+
+  /** The bytes of a commit as the walk reads it (the replacement's under replace refs) */
+  private async rawCommit(id: ObjectId, replacements?: ObjectReplacements): Promise<Uint8Array> {
+    const read = replacements ? replacementOf(replacements.replace, id) : id;
+    const bytes = await this.readObjectBytes(read);
+    if (!bytes) throw new GitApiError(`could not read commit ${id}`);
+    return bytes;
   }
 
   /** The commit an annotated tag (or a chain of them) tags; any other id as it is. */
@@ -704,6 +894,17 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (shallow.has(id)) commit.parents = [];
       if (this.authorPattern !== undefined && !this.matchesAuthor(commit)) return undefined;
       if (this.committerPattern !== undefined && !this.matchesCommitter(commit)) return undefined;
+      const filter = this.activeFilter;
+      if (filter) {
+        const view: FilteredCommit = {
+          id,
+          parentCount: parents,
+          commitTime: t.date(n),
+          raw: async () => bytes ?? (await this.rawCommit(id, replacements)),
+          commit: async () => commit,
+        };
+        if (!(await filter.include(view))) return undefined;
+      }
       return { ...commit, id };
     };
 
@@ -979,6 +1180,11 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         "options '--graph' and '--reverse' cannot be used together",
       );
     }
+    // git log and git show read grep_config before anything else (a bad grep.patternType
+    // dies there); the walk alone (rev-list, bisect's own walks) reads it only to grep
+    if (this.logConfig) this.configuredPatternType();
+    // --use-mailmap/--no-mailmap: what --author/--committer match too
+    if (options.mailmap !== undefined) this.useMailmap ??= options.mailmap;
     const host = this.outputHost(options);
     const paths = [...this.paths];
     // the pathspec as git holds it: the excluded paths as `:(exclude)` elements, `.` when
