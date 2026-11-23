@@ -58,7 +58,7 @@ const entry = (
 describe("SHA-256 index file", () => {
   it("writes 32-byte ids and a SHA-256 trailer, and reads them back (versions 2 and 4)", async () => {
     const entries = [entry("a.txt", ID_A), entry("dir/b.txt", ID_B)];
-    for (const version of [INDEX_VERSION_2, INDEX_VERSION_4]) {
+    for (const version of [INDEX_VERSION_2, INDEX_VERSION_4] as const) {
       const { bytes, checksum } = await encodeIndexFileBytes(entries, version, [], {
         objectFormat: format,
       });
