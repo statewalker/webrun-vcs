@@ -10,4 +10,4 @@ Signed commits (statewalker/statewalker-root#288). A host now supplies a signer,
 - `createNodeSigner` (vcs-utils-node) runs gpg, gpgsm or ssh-keygen as git does, with the same arguments, stdin, `--status-fd=2` and `SIG_CREATED` check, and reports failures with git's messages.
 - `createSshSigner` (vcs-commands) signs in-process with an Ed25519 OpenSSH key through Web Crypto. Its signatures are ssh-keygen's byte for byte.
 
-Without a signer, a request to sign is still refused as before. Tags, the merge/pick/rebase/am family and push certificates still refuse; their own tickets will add signing.
+Without a signer, a request to sign is still refused as before. Tags, merge and pick commits made in-process (the merge/pick/rebase/am family) and push certificates still refuse; their own tickets will add signing. Commits these commands leave to `git commit` (`merge --continue`, an edited or resolved pick or revert) go through `commit` and sign.

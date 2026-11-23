@@ -84,7 +84,17 @@ function run(
   cwd: string | undefined,
   options: NodeSignerOptions,
 ): Promise<RunResult> {
-  const [program, ...rest] = args as [string, ...string[]];
+  const [program = "", ...rest] = args;
+  if (program === "") {
+    // an empty command line (an empty gpg.ssh.defaultKeyCommand): execvp of "" fails, which
+    // start_command reports with no program name
+    return Promise.resolve({
+      code: -1,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+      startError: "error: cannot run : No such file or directory",
+    });
+  }
   return new Promise((resolve) => {
     const child = spawn(program, rest, {
       cwd: cwd ?? options.defaultCwd ?? process.cwd(),

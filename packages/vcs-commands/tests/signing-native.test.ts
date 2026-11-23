@@ -426,6 +426,8 @@ describeGit("signed commits against native git", () => {
       const cases: { config: Record<string, string>; exit: number }[] = [
         { config: { "gpg.format": "ssh" }, exit: 128 },
         { config: { "gpg.format": "ssh", "gpg.ssh.defaultKeyCommand": "false" }, exit: 128 },
+        // an empty command: start_command's "cannot run " with no program name
+        { config: { "gpg.format": "ssh", "gpg.ssh.defaultKeyCommand": "" }, exit: 128 },
         {
           config: { "gpg.format": "ssh", "gpg.ssh.defaultKeyCommand": "echo not-a-key" },
           exit: 128,
