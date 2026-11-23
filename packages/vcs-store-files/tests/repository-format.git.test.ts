@@ -1,6 +1,7 @@
 /**
- * The repository format check against repositories native git made: a reftable or sha256
- * repository, or one with an unknown version-1 extension, is refused when opened (git refuses
+ * The repository format check against repositories native git made: a sha256 repository,
+ * or one with an unknown version-1 extension, is refused when opened (a reftable one opens,
+ * its writes refused) (git refuses
  * the last one too); preciousObjects repositories open, but gc and repack delete nothing
  * there; partial clones open and gc keeps their promisor objects; in a repository with alternates they delete only its own objects. Reftable needs git 2.45 or newer: that test is skipped on older gits.
  */
@@ -16,6 +17,7 @@ import {
   createGitFilesBackend,
   FileGcStrategy,
   gc,
+  ReftableWriteUnsupportedError,
   repack,
   UnsupportedRepositoryFormatError,
 } from "../src/index.js";
@@ -118,10 +120,14 @@ describe("repositories we cannot read are refused when opened", () => {
     await expect(open(dir)).rejects.toThrow(/extensions\.objectFormat = sha256/);
   });
 
-  it.skipIf(!reftableSupported)("a reftable repository", async () => {
+  it.skipIf(!reftableSupported)("a reftable repository opens, its writes refused", async () => {
     const dir = nativeRepo(["--ref-format=reftable"]);
-    await expect(open(dir)).rejects.toBeInstanceOf(UnsupportedRepositoryFormatError);
-    await expect(open(dir)).rejects.toThrow(/extensions\.refStorage = reftable/);
+    const { history } = await open(dir);
+    const head = git(dir, ["rev-parse", "HEAD"]).trim();
+    expect((await history.refs.resolve("HEAD"))?.objectId).toBe(head);
+    await expect(history.refs.set("refs/heads/x", head)).rejects.toBeInstanceOf(
+      ReftableWriteUnsupportedError,
+    );
   });
 
   it("an unknown version-1 extension, which native git refuses too", async () => {

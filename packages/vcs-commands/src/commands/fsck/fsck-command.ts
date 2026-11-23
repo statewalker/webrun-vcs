@@ -295,6 +295,11 @@ function treeLineSound(data: Uint8Array): boolean {
  * ```
  */
 export class FsckCommand extends GitCommand<FsckResult> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private _strict = false;
 
   /** git's fsck and gc read the objects as stored, never through replace refs. */

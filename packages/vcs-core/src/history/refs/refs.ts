@@ -281,4 +281,17 @@ export interface Refs {
    * @returns How many refs were packed
    */
   packRefs?(refNames: string[], options?: PackRefsOptions): Promise<number>;
+
+  /**
+   * The error every write of a store that only reads throws (a reftable repository, whose
+   * writes are not implemented yet), so a command that would write refs can refuse before
+   * it changes anything else; undefined, or absent, when the store writes.
+   *
+   * @example
+   * ```typescript
+   * const refusal = refs.writeRefusal?.("refs/heads/topic");
+   * if (refusal) throw refusal;
+   * ```
+   */
+  writeRefusal?(refName?: string): Error | undefined;
 }

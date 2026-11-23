@@ -104,6 +104,11 @@ const GIT_REFUSED: Record<string, string> = {
  * [<revision-range>]`: see the module documentation.
  */
 export class BackfillCommand extends GitCommand<BackfillResult> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private minBatchSize = 50000;
   private sparse?: boolean;
   private includeEdges = true;

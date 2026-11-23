@@ -58,6 +58,11 @@ const MAIL_DEFAULT_WRAP = 72;
  * ```
  */
 export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private revisions: string[] = [];
   private maxCount?: number;
   private root = false;

@@ -78,6 +78,11 @@ export interface CleanResult {
  * ```
  */
 export class CleanCommand extends GitCommand<CleanResult> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private paths = new Set<string>();
   private dryRun = true; // Default to dry-run for safety
   private directories = false;

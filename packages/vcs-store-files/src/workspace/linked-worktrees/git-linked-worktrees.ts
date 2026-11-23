@@ -46,7 +46,13 @@ import type {
 } from "@statewalker/vcs-working-tree";
 import { readIndexFileEntries } from "@statewalker/vcs-working-tree";
 
-import { createFileRefStore, createWorktreeRefs, peelTag } from "../../refs/index.js";
+import {
+  createFileRefStore,
+  createReftableRefStore,
+  createWorktreeRefs,
+  peelTag,
+  ReftableRefStore,
+} from "../../refs/index.js";
 import { GitCheckout, type GitCheckoutFilesApi } from "../checkout/index.js";
 import {
   HostPaths,
@@ -285,6 +291,12 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
   private async refsOfDir(gitDir: string): Promise<Refs> {
     if (gitDir === this.commonDir) return this.history.refs;
     let refs = this.refsByDir.get(gitDir);
+    if (!refs && this.history.refs instanceof ReftableRefStore) {
+      // a reftable repository: the worktree's own stack (worktrees/<id>/reftable) over the
+      // repository's
+      refs = createReftableRefStore({ files: this.files, gitDir, commonDir: this.commonDir });
+      this.refsByDir.set(gitDir, refs);
+    }
     if (!refs) {
       const { logAllRefUpdates, identity } = await this.reflogSettings();
       // the repository's refs as this worktree updates them: under the worktree's reflog

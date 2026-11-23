@@ -158,6 +158,11 @@ export interface NotesListResult extends NotesResult {
  * ```
  */
 export class NotesListCommand extends NotesSubcommand<NotesListResult> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private object?: string;
 
   /** The object whose note is shown (default: every note listed). */
@@ -757,6 +762,11 @@ export interface NotesShowResult extends NotesResult {
 
 /** `git notes show [<object>]`: the note's text (`git show <note>`). */
 export class NotesShowCommand extends NotesSubcommand<NotesShowResult> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private object?: string;
 
   /** The object (default `HEAD`). */
@@ -884,6 +894,11 @@ export class NotesPruneCommand extends NotesSubcommand<NotesPruneResult> {
 
 /** `git notes get-ref`: the notes ref used. */
 export class NotesGetRefCommand extends NotesSubcommand<string> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   protected async execute(): Promise<string> {
     return this.notesRef();
   }

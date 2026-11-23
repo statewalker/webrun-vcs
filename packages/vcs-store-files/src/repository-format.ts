@@ -10,14 +10,17 @@
  * ignores every other extension, except the version-1 ones, which it refuses; version 1
  * refuses any extension it does not know; a version above 1 is refused.
  *
- * Beyond git's own check, what git knows but we do not implement is refused too: the
- * reftable ref storage (`extensions.refStorage = reftable`), sha256 objects
- * (`extensions.objectFormat = sha256`) and a compatibility object format
- * (`extensions.compatObjectFormat`).
+ * Beyond git's own check, what git knows but we do not implement is refused too: sha256
+ * objects (`extensions.objectFormat = sha256`) and a compatibility object format
+ * (`extensions.compatObjectFormat`). The reftable ref storage (`extensions.refStorage =
+ * reftable`) is read; its writes are refused by its ref store (`ReftableRefStore`), and so is
+ * deleting objects there (`assertObjectsDeletable`: gc's reachability reads reflogs as files).
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
+
+import { ReftableWriteUnsupportedError } from "./refs/reftable/index.js";
 
 import {
   configFilesApiOf,
@@ -44,6 +47,12 @@ export interface RepositoryFormat {
   worktreeConfig: boolean;
   /** `extensions.relativeWorktrees` (version 1): worktree links are relative paths */
   relativeWorktrees: boolean;
+  /**
+   * `extensions.refStorage` (version 1): `files` (loose refs and packed-refs, the default) or
+   * `reftable` (`.git/reftable/`, read only here: writes refuse with
+   * `ReftableWriteUnsupportedError`)
+   */
+  refStorage: "files" | "reftable";
 }
 
 /** A repository whose format version or extensions we cannot read or write safely. */
@@ -86,6 +95,7 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
     preciousObjects: false,
     worktreeConfig: false,
     relativeWorktrees: false,
+    refStorage: "files",
   };
   const unknown: string[] = [];
   const v1Only: string[] = [];
@@ -141,7 +151,7 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
             `invalid value for 'extensions.refstorage': '${String(value)}'`,
           );
         }
-        if (name !== "files") unsupported.push(`extensions.refStorage = ${name}`);
+        format.refStorage = name;
         break;
       }
       case "relativeworktrees":
@@ -168,7 +178,7 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
   }
   if (unsupported.length > 0) {
     throw new UnsupportedRepositoryFormatError(
-      `repository format not supported by webrun-vcs (files refs and sha1 objects only):${unsupported.map((e) => `\n\t${e}`).join("")}`,
+      `repository format not supported by webrun-vcs (sha1 objects only):${unsupported.map((e) => `\n\t${e}`).join("")}`,
     );
   }
   if (format.partialClone === undefined) {
@@ -207,7 +217,7 @@ function gitTrue(value: unknown): boolean {
  *
  * @example
  * ```typescript
- * const format = await readRepositoryFormat(files, ".git"); // throws for a reftable repository
+ * const format = await readRepositoryFormat(files, ".git"); // throws for a sha256 repository
  * ```
  */
 export async function readRepositoryFormat(
@@ -227,8 +237,9 @@ export async function readRepositoryFormat(
  * Refuses to delete objects where the repository format forbids it: `preciousObjects` (git's
  * "cannot prune in a precious-objects repo") and partial clones, whose absent objects a
  * promisor remote provides, unless `partialClone: "allow"` (gc and repack, which keep the
- * promisor packs apart as git does; a bare prune does not). `operation` names what
- * was asked ("prune", "repack", "gc").
+ * promisor packs apart as git does; a bare prune does not), and reftable repositories
+ * (`ReftableWriteUnsupportedError`: the reachability walks read reflogs as files). `operation`
+ * names what was asked ("prune", "repack", "gc").
  *
  * @example
  * ```typescript
@@ -240,6 +251,11 @@ export function assertObjectsDeletable(
   operation: string,
   options: { partialClone?: "refuse" | "allow" } = {},
 ): void {
+  if (format.refStorage === "reftable") {
+    // the reachability walks read reflogs and per-worktree refs as files: in a reftable
+    // repository they would miss what only the reftable reflogs keep
+    throw new ReftableWriteUnsupportedError();
+  }
   if (format.preciousObjects) {
     throw new UnsupportedRepositoryFormatError(
       `cannot ${operation} in a precious-objects repo (extensions.preciousObjects)`,

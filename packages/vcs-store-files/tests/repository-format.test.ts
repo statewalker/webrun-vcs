@@ -7,9 +7,12 @@ import { createInMemoryFilesApi, GcOrchestrator } from "@statewalker/vcs-core";
 import { describe, expect, it } from "vitest";
 
 import {
+  assertObjectsDeletable,
   createGitFilesBackend,
   FileGcStrategy,
   gc,
+  ReftableRefStore,
+  ReftableWriteUnsupportedError,
   readRepositoryFormat,
   repack,
   UnsupportedRepositoryFormatError,
@@ -65,7 +68,6 @@ describe("repository format check", () => {
       v(0, "\trefStorage = files\n"),
       /repo version is 0, but v1-only extension found:\n\trefstorage/,
     ],
-    ["reftable refs", v(1, "\trefStorage = reftable\n"), /extensions\.refStorage = reftable/],
     ["sha256 objects", v(1, "\tobjectFormat = sha256\n"), /extensions\.objectFormat = sha256/],
     [
       "a compatibility object format",
@@ -90,12 +92,36 @@ describe("repository format check", () => {
   });
 
   it("refuses before writing anything, even with create", async () => {
-    const config = v(1, "\trefStorage = reftable\n");
+    const config = v(1, "\tobjectFormat = sha256\n");
     const files = await repoWithConfig(config);
     await expect(createGitFilesBackend({ files, create: true })).rejects.toBeInstanceOf(
       UnsupportedRepositoryFormatError,
     );
     expect(new TextDecoder().decode(await readAll(files, ".git/config"))).toBe(config);
+  });
+
+  it("reads reftable refs, refusing to create or prune there", async () => {
+    const config = v(1, "\trefStorage = reftable\n");
+    const files = await repoWithConfig(config);
+    expect((await readRepositoryFormat(files, ".git")).refStorage).toBe("reftable");
+    await expect(createGitFilesBackend({ files, create: true })).rejects.toBeInstanceOf(
+      ReftableWriteUnsupportedError,
+    );
+    expect(new TextDecoder().decode(await readAll(files, ".git/config"))).toBe(config);
+    const { history } = await createGitFilesBackend({ files });
+    expect(history.refs).toBeInstanceOf(ReftableRefStore);
+    expect(() =>
+      assertObjectsDeletable(
+        {
+          version: 1,
+          preciousObjects: false,
+          worktreeConfig: false,
+          relativeWorktrees: false,
+          refStorage: "reftable",
+        },
+        "prune",
+      ),
+    ).toThrow(ReftableWriteUnsupportedError);
   });
 
   it("reads what the format allows", async () => {
@@ -108,6 +134,7 @@ describe("repository format check", () => {
       partialClone: "origin",
       worktreeConfig: false,
       relativeWorktrees: false,
+      refStorage: "files",
     });
   });
 

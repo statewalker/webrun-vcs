@@ -45,6 +45,11 @@ export interface RevParseResult {
  * branch`, `fatal: log for 'x' only has 2 entries`).
  */
 export class RevParseCommand extends GitCommand<RevParseResult> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private revision?: string;
   private readonly args: string[] = [];
   private prefix = "";

@@ -36,6 +36,11 @@ import { type ParsedRevisionArgs, parseRevisionArgs } from "./revision-range.js"
  * (`fatal: bad revision 'x'`, as `git log x --`).
  */
 export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private readonly revisions: string[] = [];
   private readonly mixed: string[] = [];
   private committish = true;

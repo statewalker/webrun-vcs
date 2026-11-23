@@ -301,6 +301,11 @@ class CommitQueue {
  * ```
  */
 export class BlameCommand extends GitCommand<BlameResult> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private filePath?: string;
   private startCommit?: ObjectId;
   private followRenames = true;

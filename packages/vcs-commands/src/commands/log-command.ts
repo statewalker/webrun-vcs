@@ -190,6 +190,11 @@ export enum RevFilter {
  * ```
  */
 export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private startCommits: ObjectId[] = [];
   /** The commits given, included and excluded, in the order given (git's pending list) */
   private readonly pending: { id: ObjectId; exclude: boolean }[] = [];
