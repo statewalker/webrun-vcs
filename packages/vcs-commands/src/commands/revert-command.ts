@@ -51,6 +51,8 @@ export class RevertCommand extends GitCommand<RevertResult> {
   private operation = SequencerOperation.START;
   private committer?: PersonIdent;
   private edit?: boolean;
+  /** `-S[<keyid>]` / `--no-gpg-sign` (undefined: `commit.gpgSign`) */
+  private sign?: boolean | string;
   private editor?: CommitEditor;
 
   /**
@@ -195,6 +197,26 @@ export class RevertCommand extends GitCommand<RevertResult> {
   }
 
   /**
+   * `-S` (true) / `--no-gpg-sign` (false): whether to sign the commits made; undefined (the
+   * default) leaves it to `commit.gpgSign`. No signer exists yet: a commit asked to be
+   * signed fails as git's does when gpg cannot sign (`error: gpg failed to sign the data:`,
+   * `error: failed to write commit object`; 2.43 adds `fatal: revert failed`, exit 128, 2.5x
+   * exits 1: {@link SigningFailedError}), the pick left in progress and nothing committed.
+   */
+  setSign(sign: boolean | undefined): this {
+    this.checkCallable();
+    this.sign = sign;
+    return this;
+  }
+
+  /** `-S<keyid>`: sign with this key (see {@link setSign}). */
+  setSigningKey(keyId: string): this {
+    this.checkCallable();
+    this.sign = keyId;
+    return this;
+  }
+
+  /**
    * The editor of {@link setEdit} (git's `core.editor` / `GIT_EDITOR`): see
    * `CommitCommand.setEditor`. Without one the template is kept as it is (comments stripped).
    */
@@ -222,6 +244,9 @@ export class RevertCommand extends GitCommand<RevertResult> {
       if (!mode.edit) commit.setCleanupMode(CleanupMode.STRIP);
     }
     if (this.editor) commit.setEditor(this.editor);
+    // run_git_commit passes -S<key> (the run's gpg_sign) to git commit
+    if (typeof this.sign === "string") commit.setSigningKey(this.sign);
+    else if (this.sign !== undefined) commit.setSign(this.sign);
     if (this.committer) commit.setCommitterIdent(this.committer);
     const status = RemoteConfigStore.from(this.workingCopy).value("commit.status");
     commit.setIncludeStatus(status === undefined ? true : (parseGitBool(status) ?? true));
@@ -269,6 +294,7 @@ export class RevertCommand extends GitCommand<RevertResult> {
         oursLabel: this.ourCommitName,
         committer: this.committer,
         edit: this.edit,
+        sign: this.sign,
         reflogAction: this.reflogAction(this.reflogPrefix.replace(/:$/, "")),
       },
     );
