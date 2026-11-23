@@ -13,7 +13,6 @@ import {
   GRAPH_EXTRA_EDGES_NEEDED,
   GRAPH_LAST_EDGE,
   GRAPH_PARENT_NONE,
-  HASH_SIZE,
 } from "./commit-graph-format.js";
 
 /** A commit as the graph stores it. */
@@ -42,11 +41,17 @@ export class CommitGraphCorruptError extends Error {
 }
 
 const HEX_DIGITS = Array.from("0123456789abcdef", (c) => c.charCodeAt(0));
-const hexCodes = new Array<number>(2 * HASH_SIZE);
+/** One scratch array of char codes per id width (20 or 32 bytes) */
+const HEX_CODES = new Map<number, number[]>();
 
-/** The 40-digit hex id of the 20 bytes at `at` (the fastest way to build one in V8). */
-function hexAt(bytes: Uint8Array, at: number): ObjectId {
-  for (let i = 0; i < HASH_SIZE; i++) {
+/** The hex id of the `size` bytes at `at` (the fastest way to build one in V8). */
+function hexAt(bytes: Uint8Array, at: number, size: number): ObjectId {
+  let hexCodes = HEX_CODES.get(size);
+  if (!hexCodes) {
+    hexCodes = new Array<number>(2 * size);
+    HEX_CODES.set(size, hexCodes);
+  }
+  for (let i = 0; i < size; i++) {
     const v = bytes[at + i] as number;
     hexCodes[2 * i] = HEX_DIGITS[v >> 4] as number;
     hexCodes[2 * i + 1] = HEX_DIGITS[v & 15] as number;
@@ -54,10 +59,11 @@ function hexAt(bytes: Uint8Array, at: number): ObjectId {
   return String.fromCharCode.apply(null, hexCodes);
 }
 
-/** Parses a 40-digit lowercase hex id into `out`; false when it is not one. */
+/** Parses a hex id of `out.length` bytes into `out`; false when it is not one. */
 function parseOid(id: string, out: Uint8Array): boolean {
-  if (id.length !== 2 * HASH_SIZE) return false;
-  for (let i = 0; i < HASH_SIZE; i++) {
+  const size = out.length;
+  if (id.length !== 2 * size) return false;
+  for (let i = 0; i < size; i++) {
     const hi = hexValue(id.charCodeAt(2 * i));
     const lo = hexValue(id.charCodeAt(2 * i + 1));
     if (hi < 0 || lo < 0) return false;
@@ -89,9 +95,11 @@ export class CommitGraph {
   private readonly ids: (ObjectId | undefined)[];
   /** Positions of the ids decoded so far (walks look up the parents they were given) */
   private readonly positions = new Map<ObjectId, number>();
-  private readonly scratch = new Uint8Array(HASH_SIZE);
+  private readonly scratch: Uint8Array;
   /** Total commits in all layers */
   readonly size: number;
+  /** Bytes of an id in every layer (the object format's `rawLength`) */
+  readonly hashSize: number;
 
   /**
    * @param layers the chain, base first; each layer's `numCommitsInBase` already set
@@ -101,6 +109,11 @@ export class CommitGraph {
     for (const l of layers) n += l.numCommits;
     this.size = n;
     this.ids = new Array(n);
+    const hashSize = layers[0]?.hashSize ?? 20;
+    if (layers.some((l) => l.hashSize !== hashSize))
+      throw new CommitGraphCorruptError("commit-graph layers of different object formats");
+    this.hashSize = hashSize;
+    this.scratch = new Uint8Array(hashSize);
   }
 
   /** The topmost layer. */
@@ -172,7 +185,7 @@ export class CommitGraph {
         const below = (p: number, g: number) => p < total && (gens[p] as number) < g;
         for (let local = 0; local < layer.numCommits; local++) {
           const g = gens[layer.numCommitsInBase + local] as number;
-          const at = layer.dataOffset(local) + HASH_SIZE;
+          const at = layer.dataOffset(local) + layer.hashSize;
           const first = layer.u32(at);
           if (first === GRAPH_PARENT_NONE) continue;
           if (!below(first, g)) return false;
@@ -214,7 +227,7 @@ export class CommitGraph {
     return this.positionOfBytes(this.scratch);
   }
 
-  /** The global position of a 20-byte id, or -1. */
+  /** The global position of a raw id (`hashSize` bytes), or -1. */
   positionOfBytes(id: Uint8Array): number {
     for (let i = this.layers.length - 1; i >= 0; i--) {
       const layer = this.layers[i] as CommitGraphLayer;
@@ -246,7 +259,7 @@ export class CommitGraph {
     let id = this.ids[pos];
     if (id === undefined) {
       const [layer, local] = this.locate(pos);
-      id = hexAt(layer.bytes, layer.oidLookup.offset + HASH_SIZE * local);
+      id = hexAt(layer.bytes, layer.oidLookup.offset + layer.hashSize * local, layer.hashSize);
       this.ids[pos] = id;
       this.positions.set(id, pos);
     }
@@ -256,7 +269,7 @@ export class CommitGraph {
   /** The root tree at global position `pos`. */
   treeAt(pos: number): ObjectId {
     const [layer, local] = this.locate(pos);
-    return hexAt(layer.bytes, layer.dataOffset(local));
+    return hexAt(layer.bytes, layer.dataOffset(local), layer.hashSize);
   }
 
   /** The committer date at global position `pos`. */
@@ -305,7 +318,7 @@ export class CommitGraph {
   parentPositionsAt(pos: number): number[] {
     const [layer, local] = this.locate(pos);
     const total = layer.numCommits + layer.numCommitsInBase;
-    const at = layer.dataOffset(local) + HASH_SIZE;
+    const at = layer.dataOffset(local) + layer.hashSize;
     const check = (p: number) => {
       if (p >= total) throw new CommitGraphCorruptError(`invalid parent position ${p}`);
       return p;

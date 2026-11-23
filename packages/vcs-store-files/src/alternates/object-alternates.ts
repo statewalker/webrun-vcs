@@ -41,7 +41,7 @@ import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
-import { assertNoMultiPackIndexInFormat, skipPacked, withPacks } from "../pack/index.js";
+import { skipPacked, withPacks } from "../pack/index.js";
 import { createFileRefStore } from "../refs/index.js";
 import { filesStagingStore } from "../storage/loose/files-staging-store.js";
 import { HostPaths, hostRootOf } from "../workspace/git-dir/index.js";
@@ -193,8 +193,6 @@ export async function openObjectAlternates(
   const openSource = async (dir: string): Promise<Source> => {
     const { freshenMaxAgeMs } = options;
     const objectFormat = options.objectFormat ?? SHA1_OBJECT_FORMAT;
-    // a SHA-256 alternate's multi-pack-index is not read yet (see assertNoMultiPackIndexInFormat)
-    await assertNoMultiPackIndexInFormat(files, joinPath(dir, "pack"), objectFormat);
     const staging = filesStagingStore(files, dir, { freshenMaxAgeMs });
     const looseOnly = createGitObjects(staging, { objectFormat });
     const packs: PackSet = await openPackSet(files, joinPath(dir, "pack"), {

@@ -91,16 +91,17 @@ describe("repository format check", () => {
     await expect(createGitFilesBackend({ files })).rejects.toThrow(message);
   });
 
-  it("reads sha256 objects (extensions.objectFormat), refusing a multi-pack-index", async () => {
+  it("reads sha256 objects (extensions.objectFormat), with or without a multi-pack-index", async () => {
     const files = await repoWithConfig(v(1, "\tobjectFormat = sha256\n"));
     expect((await readRepositoryFormat(files, ".git")).objectFormat.name).toBe("sha256");
     const { history } = await createGitFilesBackend({ files });
     const id = await history.blobs.store([new TextEncoder().encode("hello\n")]);
     expect(id).toBe("2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4");
+    // a broken multi-pack-index no longer refuses the repository (T3c): it is not used
     await files.write(".git/objects/pack/multi-pack-index", [new Uint8Array(8)]);
-    await expect(createGitFilesBackend({ files })).rejects.toThrow(
-      "webrun-vcs does not support the multi-pack-index in sha256 repositories yet",
-    );
+    const reopened = await createGitFilesBackend({ files });
+    expect(await reopened.packs.multiPackIndex?.()).toBeUndefined();
+    expect(await reopened.history.blobs.has(id)).toBe(true);
   });
 
   it("refuses before writing anything, even with create", async () => {

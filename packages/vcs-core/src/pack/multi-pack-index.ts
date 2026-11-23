@@ -8,9 +8,12 @@
  * if (pos >= 0) console.log(midx.packNameAt(midx.packIntIdAt(pos)), midx.offsetAt(pos));
  * ```
  *
- * The file is a chunk file: a 12-byte header (`MIDX`, version 1 or 2, hash version 1, the chunk
- * count, a zero byte, the pack count), a table of contents of `(id, offset)` pairs ending with a
- * zero id, the chunks, and the SHA-1 of everything before it. Chunks: `PNAM` (the packs' `.idx`
+ * The file is a chunk file: a 12-byte header (`MIDX`, version 1 or 2, the hash version (1 for
+ * SHA-1, 2 for SHA-256), the chunk count, a zero byte, the pack count), a table of contents of
+ * `(id, offset)` pairs ending with a zero id, the chunks, and the hash of everything before it.
+ * Ids and the trailer are the repository's object format's `rawLength` bytes (`objectFormat`
+ * of the parse and encode options, SHA-1 by default): a midx is read for the format of its
+ * repository, never guessed from its size. Chunks: `PNAM` (the packs' `.idx`
  * names, NUL-terminated, sorted in version 1), `OIDF` (fan-out), `OIDL` (sorted ids), `OOFF`
  * (pack-int-id and offset per object), `LOFF` (64-bit offsets), `RIDX` (the pseudo-pack order a
  * multi-pack bitmap uses) and `BTMP` (each pack's first bit and bit count, git 2.44+).
@@ -34,14 +37,13 @@
  * then the pack's discovery order; packs named in name order; `RIDX` (and `BTMP` for 2.44+)
  * with a reverse index or bitmap.
  */
-import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
 import type { BitmapPack } from "./pack-bitmap.js";
 
 export const MIDX_SIGNATURE = 0x4d494458; // "MIDX"
 const HEADER_SIZE = 12;
-const HASH_SIZE = 20;
 const TOC_ENTRY = 12;
 const CHUNK_PNAM = 0x504e414d;
 const CHUNK_OIDF = 0x4f494446;
@@ -90,6 +92,8 @@ const dieAfter = (prior: string, chunk: string) =>
 export interface MultiPackIndex {
   readonly path: string;
   readonly version: number;
+  /** the object format the file was read in (its ids and trailer are `rawLength` bytes) */
+  readonly objectFormat: ObjectFormat;
   /** packs and objects of this layer */
   readonly numPacks: number;
   readonly numObjects: number;
@@ -147,14 +151,16 @@ const hex32 = (n: number) => n.toString(16);
  */
 const PACK_NAME = /^pack-[0-9a-f]+\.idx$/;
 
-/** one decoded id per lookup, reused (lookups are synchronous) */
-const SCRATCH = new Uint8Array(HASH_SIZE);
+/** one decoded id per lookup and id width, reused (lookups are synchronous) */
+const SCRATCH_SHA1 = new Uint8Array(20);
+const SCRATCH_SHA256 = new Uint8Array(32);
 const nibble = (c: number) =>
   c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1;
-/** Decodes a 40-digit hex id into `out`; false when it is not one. */
+/** Decodes a hex id of `out.length` bytes into `out`; false when it is not one. */
 function decodeId(id: string, out: Uint8Array): boolean {
-  if (id.length !== 40) return false;
-  for (let i = 0; i < HASH_SIZE; i++) {
+  const size = out.length;
+  if (id.length !== 2 * size) return false;
+  for (let i = 0; i < size; i++) {
     const hi = nibble(id.charCodeAt(2 * i));
     const lo = nibble(id.charCodeAt(2 * i + 1));
     if (hi < 0 || lo < 0) return false;
@@ -167,6 +173,7 @@ function readToc(
   bytes: Uint8Array,
   view: DataView,
   chunkCount: number,
+  HASH_SIZE: number,
 ): Map<number, { start: number; size: number }> {
   const chunks = new Map<number, { start: number; size: number }>();
   let at = HEADER_SIZE;
@@ -203,8 +210,18 @@ export function parseMultiPackIndex(
     checkFanoutOrder?: boolean;
     /** accept version 2 files (2.5x; 2.43 dies on them: "version 2 not recognized"). Default true */
     acceptVersion2?: boolean;
+    /**
+     * the repository's object format (default SHA-1): the header's hash version must be its
+     * `version`, ids and the trailer are its `rawLength` bytes
+     */
+    objectFormat?: ObjectFormat;
   } = {},
 ): MultiPackIndex {
+  const objectFormat = options.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const HASH_SIZE = objectFormat.rawLength;
+  const SCRATCH = HASH_SIZE === 32 ? SCRATCH_SHA256 : SCRATCH_SHA1;
+  if (base && base.objectFormat.rawLength !== HASH_SIZE)
+    throw new MultiPackIndexError(`multi-pack-index ${path} is of another object format`);
   if (bytes.length < HEADER_SIZE + HASH_SIZE)
     throw new MultiPackIndexError(`multi-pack-index file ${path} is too small`);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -218,13 +235,13 @@ export function parseMultiPackIndex(
   if (version !== 1 && (version !== 2 || options.acceptVersion2 === false))
     throw new MultiPackIndexError(`multi-pack-index version ${version} not recognized`, true);
   const hashVersion = bytes[5] as number;
-  if (hashVersion !== 1)
+  if (hashVersion !== objectFormat.version)
     throw new MultiPackIndexError(
-      `multi-pack-index hash version ${hashVersion} does not match version 1`,
+      `multi-pack-index hash version ${hashVersion} does not match version ${objectFormat.version}`,
     );
   const chunkCount = bytes[6] as number;
   const numPacks = view.getUint32(8);
-  const chunks = readToc(bytes, view, chunkCount);
+  const chunks = readToc(bytes, view, chunkCount, HASH_SIZE);
 
   const pnam = chunks.get(CHUNK_PNAM);
   if (!pnam)
@@ -329,7 +346,7 @@ export function parseMultiPackIndex(
     while (m.base && pos < m.numObjectsInBase) m = m.base;
     return m;
   };
-  /** compares the 20 id bytes at `o` with `key` */
+  /** compares the id bytes at `o` with `key` */
   const cmpAt = (o: number, key: Uint8Array) => {
     for (let k = 0; k < HASH_SIZE; k++) {
       const d = (bytes[o + k] as number) - (key[k] as number);
@@ -354,6 +371,7 @@ export function parseMultiPackIndex(
   const self: MultiPackIndex = {
     path,
     version,
+    objectFormat,
     numPacks,
     numObjects,
     numPacksInBase,
@@ -419,7 +437,8 @@ export function parseMultiPackIndex(
       return view.getUint32(oidf.start + 4 * i);
     },
     checksumValid() {
-      const sum = createSha1()
+      const sum = objectFormat
+        .createHasher()
         .update(bytes.subarray(0, bytes.length - HASH_SIZE))
         .digest();
       return bytesToHex(sum) === checksum;
@@ -467,6 +486,7 @@ export function multiPackIndexBitmapPack(midx: MultiPackIndex): BitmapPack {
   return {
     packId: midx.checksum,
     count: midx.numObjects,
+    objectFormat: midx.objectFormat,
     packOrder: () => rev,
     idAt: (i) => midx.idAt(i),
     indexOf: (id) => midx.find(id),
@@ -541,6 +561,11 @@ export interface EncodeMultiPackIndexOptions {
   version?: number;
   /** objects of the base layers of an incremental write: `RIDX` and `BTMP` count from there */
   baseObjects?: number;
+  /**
+   * the repository's object format (default SHA-1): the header's hash version, the width of
+   * ids and of the trailer; ids of another width are refused
+   */
+  objectFormat?: ObjectFormat;
 }
 
 export interface EncodedMultiPackIndex {
@@ -580,6 +605,12 @@ function entryCompare(a: Entry, b: Entry): number {
  */
 export function encodeMultiPackIndex(options: EncodeMultiPackIndexOptions): EncodedMultiPackIndex {
   const { packs, existing, dropped } = options;
+  const objectFormat = options.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const HASH_SIZE = objectFormat.rawLength;
+  if (existing && existing.objectFormat.rawLength !== HASH_SIZE)
+    throw new MultiPackIndexError(
+      `cannot reuse a ${existing.objectFormat.name} multi-pack-index in a ${objectFormat.name} repository`,
+    );
   const preferred = options.preferred;
   const startPack = existing ? existing.numPacks + existing.numPacksInBase : 0;
   const all: Entry[] = [];
@@ -705,7 +736,12 @@ export function encodeMultiPackIndex(options: EncodeMultiPackIndexOptions): Enco
     id: CHUNK_OIDL,
     size: n * HASH_SIZE,
     write(_v, b, at) {
-      for (let i = 0; i < n; i++) b.set(hexToBytes((entries[i] as Entry).id), at + i * HASH_SIZE);
+      for (let i = 0; i < n; i++) {
+        const id = (entries[i] as Entry).id;
+        if (id.length !== 2 * HASH_SIZE)
+          throw new MultiPackIndexError(`object id ${id} is not a ${objectFormat.name} id`);
+        b.set(hexToBytes(id), at + i * HASH_SIZE);
+      }
     },
   });
   chunks.push({
@@ -767,7 +803,7 @@ export function encodeMultiPackIndex(options: EncodeMultiPackIndexOptions): Enco
   const v = new DataView(out.buffer);
   v.setUint32(0, MIDX_SIGNATURE);
   out[4] = options.version ?? 1;
-  out[5] = 1;
+  out[5] = objectFormat.version;
   out[6] = chunks.length;
   out[7] = 0;
   v.setUint32(8, packOrder.length);
@@ -785,7 +821,7 @@ export function encodeMultiPackIndex(options: EncodeMultiPackIndexOptions): Enco
     toc += TOC_ENTRY;
   }
   setBig(toc + 4, offset);
-  const sum = createSha1().update(out.subarray(0, offset)).digest();
+  const sum = objectFormat.createHasher().update(out.subarray(0, offset)).digest();
   out.set(sum, offset);
   const packOf = new Uint32Array(n);
   for (let i = 0; i < n; i++) packOf[i] = perm[(entries[i] as Entry).pack] as number;

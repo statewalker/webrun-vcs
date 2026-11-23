@@ -17,6 +17,9 @@
  * `clear_midx_files` removes what the new midx no longer uses. `midx.version` (2.5x) picks the
  * version byte as `write_midx_internal` reads it; 2.43 ignores the key and writes version 1.
  *
+ * A SHA-256 repository's midx (hash version 2, 32-byte ids and trailer) is read and written in
+ * its format (`readRepositoryFormat` of `gitDir`), its chain lines 64 hex digits long.
+ *
  * Where we are deliberately safer than git:
  * - `expire` checks, before its first unlink, that the midx's checksum holds and that every pack
  *   the midx selects objects from opens. git unlinks the packs selecting nothing first and only
@@ -52,7 +55,7 @@ import {
   writePackBitmap,
 } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
-import { UnsupportedObjectFormatError } from "@statewalker/vcs-utils/hash";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "./create-git-files-backend.js";
 import { type BitmapSettings, isPreferredBitmapTip, readBitmapSettings } from "./repack.js";
@@ -115,26 +118,21 @@ interface Ctx {
   compatibility: "2.43" | "2.56";
   stderr: string[];
   environment?: GitHostEnvironment;
+  /** the repository's object format (`extensions.objectFormat`) */
+  objectFormat: ObjectFormat;
 }
 
 const failure = (c: Ctx) => (c.compatibility === "2.43" ? 1 : 255);
 
 /**
- * Refuses a SHA-256 repository: the multi-pack-index reader and writer hold 20-byte ids
- * (`UnsupportedObjectFormatError`).
+ * The command's context: the pack directory and the repository's object format (the midx's
+ * hash version and id width, as git's `the_hash_algo`; SHA-1 when the format cannot be read).
  */
-async function assertMidxObjectFormat(options: MultiPackIndexOptions): Promise<void> {
-  const format = await readRepositoryFormat(options.files, options.gitDir ?? ".git").catch(
-    () => undefined,
-  );
-  if (format && format.objectFormat.name !== "sha1") {
-    throw new UnsupportedObjectFormatError("the multi-pack-index", format.objectFormat.name);
-  }
-}
-
-function ctxOf(options: MultiPackIndexOptions): Ctx {
+async function ctxOf(options: MultiPackIndexOptions): Promise<Ctx> {
   const gitDir = options.gitDir ?? ".git";
+  const format = await readRepositoryFormat(options.files, gitDir).catch(() => undefined);
   return {
+    objectFormat: format?.objectFormat ?? SHA1_OBJECT_FORMAT,
     files: options.files,
     gitDir,
     // as git names it in messages (`.git/objects/pack`), not normalized
@@ -184,7 +182,7 @@ async function openPackInfo(c: Ctx, idxName: string): Promise<PackInfo | string>
   if (st?.kind !== "file") return `warning: failed to add packfile '${idxPath}'`;
   let pack: PackFile;
   try {
-    pack = await openPack(c.files, packPath, idxPath);
+    pack = await openPack(c.files, packPath, idxPath, { objectFormat: c.objectFormat });
   } catch {
     return `warning: failed to open pack-index '${idxPath}'`;
   }
@@ -299,8 +297,7 @@ async function readAll(files: FilesApi, path: string): Promise<Uint8Array> {
 export async function multiPackIndexWrite(
   options: MultiPackIndexWriteOptions,
 ): Promise<MultiPackIndexCommandResult> {
-  await assertMidxObjectFormat(options);
-  const c = ctxOf(options);
+  const c = await ctxOf(options);
   try {
     return await writeInternal(c, options);
   } catch (e) {
@@ -483,6 +480,7 @@ async function writeInternal(
       version,
       ...(dropped ? { dropped } : {}),
       ...(incremental && base ? { baseObjects: base.numObjects + base.numObjectsInBase } : {}),
+      objectFormat: c.objectFormat,
     });
   } catch (e) {
     if (e instanceof MultiPackIndexError) {
@@ -494,7 +492,9 @@ async function writeInternal(
 
   // the bitmap first (git commits the midx's lock only once its bitmap is written)
   if (wantRevIndex && !incremental) {
-    const midx = parseMultiPackIndex(encoded.bytes, `${c.packDir}/${MIDX_FILE}`);
+    const midx = parseMultiPackIndex(encoded.bytes, `${c.packDir}/${MIDX_FILE}`, undefined, {
+      objectFormat: c.objectFormat,
+    });
     try {
       const write = options.writeBitmap ?? ((m) => writeMidxBitmap(c, m, options.bitmapSettings));
       await write(midx);
@@ -638,7 +638,7 @@ function cmpName(idxOrPackName: string, idxName: string): number {
 export async function multiPackIndexVerify(
   options: MultiPackIndexOptions,
 ): Promise<MultiPackIndexCommandResult> {
-  const c = ctxOf(options);
+  const c = await ctxOf(options);
   const loaded = await loadMultiPackIndex(c.files, c.packDir, c);
   c.stderr.push(...loaded.errors);
   if (loaded.fatal) return { exitCode: 128, stdout: "", stderr: c.stderr };
@@ -751,8 +751,7 @@ export function verifyMidxLines(
 export async function multiPackIndexExpire(
   options: MultiPackIndexOptions,
 ): Promise<MultiPackIndexCommandResult> {
-  await assertMidxObjectFormat(options);
-  const c = ctxOf(options);
+  const c = await ctxOf(options);
   const loaded = await loadMultiPackIndex(c.files, c.packDir, c);
   c.stderr.push(...loaded.errors);
   if (loaded.fatal) return { exitCode: 128, stdout: "", stderr: c.stderr };
@@ -819,8 +818,7 @@ export interface MultiPackIndexRepackOptions extends MultiPackIndexOptions {
 export async function multiPackIndexRepack(
   options: MultiPackIndexRepackOptions,
 ): Promise<MultiPackIndexCommandResult> {
-  await assertMidxObjectFormat(options);
-  const c = ctxOf(options);
+  const c = await ctxOf(options);
   const loaded = await loadMultiPackIndex(c.files, c.packDir, c);
   c.stderr.push(...loaded.errors);
   if (loaded.fatal) return { exitCode: 128, stdout: "", stderr: c.stderr };

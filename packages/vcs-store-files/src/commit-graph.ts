@@ -27,7 +27,7 @@ import {
   writeCommitGraphFile,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
-import { assertSha1ObjectFormat } from "@statewalker/vcs-utils/hash";
+import { isHexObjectId, type ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { readAllRefs } from "./refs/index.js";
@@ -128,6 +128,8 @@ export function createFilesCommitGraphProvider(options: {
    * repository's own objects directory and these is used
    */
   alternateObjectDirs?: () => Promise<readonly string[]>;
+  /** The repository's object format (default SHA-1): the graph's hash version and id width */
+  objectFormat?: ObjectFormat;
 }): CommitGraphProvider {
   const { files, refs, environment } = options;
   const gitDir = options.gitDir ?? ".git";
@@ -141,7 +143,9 @@ export function createFilesCommitGraphProvider(options: {
       files,
       gitDir,
       refs,
-      settings,
+      settings: options.objectFormat
+        ? { ...settings, objectFormat: options.objectFormat }
+        : settings,
       ...(readGraftFile ? { readGraftFile } : {}),
       ...(options.alternateObjectDirs ? { alternateObjectDirs: options.alternateObjectDirs } : {}),
     });
@@ -206,46 +210,20 @@ export interface WriteCommitGraphOptions {
  * await writeCommitGraph({ files, objects, refs: history.refs, commitGraph: history.commitGraph });
  * ```
  */
-/**
- * Removes the commit-graph files of `objectsDir` (`info/commit-graph` and the split chain
- * `info/commit-graphs/`), for a repository whose graph cannot be written (SHA-256, until it
- * has a writer) after gc or repack removed or replaced objects: a graph naming a pruned
- * commit makes git's fsck and `commit-graph verify` fail ("Could not read"), and git rebuilds
- * a missing one at its next gc. Readers treat a missing graph as none; a reader that opened
- * the files keeps reading them (unlinked, not truncated). Returns whether anything was removed.
- *
- * @example
- * ```typescript
- * await removeCommitGraphFiles(files, ".git/objects");
- * ```
- */
-export async function removeCommitGraphFiles(
-  files: FilesApi,
-  objectsDir: string,
-): Promise<boolean> {
-  let removed = false;
-  for (const path of [
-    joinPath(objectsDir, "info", "commit-graph"),
-    joinPath(objectsDir, "info", "commit-graphs"),
-  ]) {
-    if (!(await files.stats(path))) continue;
-    await files.remove(path);
-    removed = true;
-  }
-  return removed;
-}
-
 export async function writeCommitGraph(
   options: WriteCommitGraphOptions,
 ): Promise<WriteCommitGraphFileResult> {
   const { files, objects, refs } = options;
-  // a SHA-256 repository's commit-graph (32-byte ids) is not written yet
-  assertSha1ObjectFormat(objectFormatOf(objects), "the commit-graph");
+  // the graph's hash version, id width and trailer are the repository's object format's
+  const objectFormat = objectFormatOf(objects);
   const gitDir = options.gitDir ?? ".git";
   const objectsDir = joinPath(gitDir, "objects");
-  const settings = await readCommitGraphSettings(files, gitDir, {
-    environment: options.environment,
-  });
+  const settings = {
+    ...(await readCommitGraphSettings(files, gitDir, {
+      environment: options.environment,
+    })),
+    objectFormat,
+  };
   const none = (warnings: string[] = []): WriteCommitGraphFileResult => ({
     written: false,
     commits: 0,
@@ -262,6 +240,7 @@ export async function writeCommitGraph(
       gitDir,
       refs,
       useReplaceRefs: (options.replaceRefs ?? false) && settings.useReplaceRefs,
+      objectFormat,
       readGraftFile: graftFileReader(options.environment, {
         files,
         dir: graftFileBaseDir(gitDir),
@@ -273,13 +252,14 @@ export async function writeCommitGraph(
   const commits =
     options.commits && !options.reachable
       ? [...options.commits]
-      : await reachableTips(files, gitDir, objects);
+      : await reachableTips(files, gitDir, objects, objectFormat);
   const existing = await readCommitGraph(files, objectsDir, settings);
   try {
     return await writeCommitGraphFile({
       files,
       objectsDir,
       objects,
+      objectFormat,
       commits,
       existing,
       append: options.append,
@@ -306,6 +286,7 @@ async function reachableTips(
   files: FilesApi,
   gitDir: string,
   objects: Pick<GitObjects, "get">,
+  objectFormat: ObjectFormat,
 ): Promise<ObjectId[]> {
   const stored = await readAllRefs(files, gitDir, "refs/");
   const byName = new Map(stored.map((r) => [r.name, r]));
@@ -332,7 +313,7 @@ async function reachableTips(
         await obj.content[Symbol.asyncIterator]().return?.();
         break;
       }
-      const target = await tagTarget(obj);
+      const target = await tagTarget(obj, objectFormat);
       if (!target) break;
       id = target;
     }
@@ -341,7 +322,10 @@ async function reachableTips(
 }
 
 /** The `object` line of a tag. */
-async function tagTarget(obj: NonNullable<Awaited<ReturnType<GitObjects["get"]>>>) {
+async function tagTarget(
+  obj: NonNullable<Awaited<ReturnType<GitObjects["get"]>>>,
+  objectFormat: ObjectFormat,
+) {
   let bytes = obj.bytes;
   if (!bytes) {
     const chunks: Uint8Array[] = [];
@@ -353,7 +337,7 @@ async function tagTarget(obj: NonNullable<Awaited<ReturnType<GitObjects["get"]>>
       at += c.length;
     }
   }
-  const first = new TextDecoder().decode(bytes.subarray(0, 64)).split("\n")[0] ?? "";
-  const m = /^object ([0-9a-f]{40})$/.exec(first);
-  return m?.[1];
+  const first = new TextDecoder().decode(bytes.subarray(0, 96)).split("\n")[0] ?? "";
+  const id = first.startsWith("object ") ? first.slice(7) : "";
+  return isHexObjectId(id, objectFormat) ? id : undefined;
 }

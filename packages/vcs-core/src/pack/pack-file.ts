@@ -92,6 +92,8 @@ export interface Pack {
   readonly packId: string;
   /** objects in the pack */
   readonly count: number;
+  /** The object format of its ids and checksums (SHA-1 when absent) */
+  readonly objectFormat?: ObjectFormat;
   /** Whether the idx lists `id` (false also when its fan-out bucket is corrupt: `get` fails). */
   has(id: ObjectId): boolean;
   /** The ids in idx order (sorted). */
@@ -1881,6 +1883,7 @@ export async function openPack(
   return {
     packId,
     count: n,
+    objectFormat: format,
     packPath,
     idxPath,
     stats: {

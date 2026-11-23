@@ -1499,7 +1499,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (!obj && !failed) return undefined;
       if (obj?.bytes && obj.type === "commit") {
         try {
-          const header = parseGraphCommit(obj.bytes, id);
+          const header = parseGraphCommit(obj.bytes, id, this.objectFormat);
           return { ...header, raw: obj.bytes };
         } catch {
           // read as the commit store reads it

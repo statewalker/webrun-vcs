@@ -5,10 +5,10 @@
  * follow git's own tests, named per case: t0001-init.sh (object formats at init), t1006-cat-file.sh
  * (object reads), t1450-fsck.sh (fsck of a SHA-256 repository).
  *
- * What a SHA-256 repository does not support yet (the multi-pack-index, the commit-graph, the
- * transports) is refused with `UnsupportedObjectFormatError`: ours read the repositories here
- * with an in-memory index. Packs and the index file have their own twins
- * (`sha256-packs-native.test.ts`).
+ * What a SHA-256 repository does not support yet (reftables, the transports) is refused with
+ * `UnsupportedObjectFormatError`: ours read the repositories here with an in-memory index.
+ * Packs and the index file have their own twins (`sha256-packs-native.test.ts`), and so do
+ * commit-graphs, multi-pack-indexes and bitmaps (`sha256-graph-midx-native.test.ts`).
  */
 
 import { spawnSync } from "node:child_process";
@@ -581,7 +581,7 @@ describeGit("SHA-256 repositories against native git", () => {
       expect(native(dir, ["fsck", ...(modern ? ["--no-references"] : [])]).status).toBe(0);
     });
 
-    it("refuses what has no SHA-256 path yet: the multi-pack-index", async () => {
+    it("gc and a native multi-pack-index (once refused, read since T3c)", async () => {
       const dir = nativeRepo();
       const git = await openOurs(dir);
       await git.gc().call();
@@ -591,7 +591,8 @@ describeGit("SHA-256 repositories against native git", () => {
       g(dir, "repack", "-q", "-a", "-d");
       await openOurs(dir);
       g(dir, "multi-pack-index", "write");
-      await expect(openOurs(dir)).rejects.toThrow(UnsupportedObjectFormatError);
+      // T3c: a SHA-256 multi-pack-index opens and is read
+      await openOurs(dir);
     });
 
     // reftable tables of a SHA-256 repository (hash id `s256`) are neither read nor written
