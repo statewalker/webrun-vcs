@@ -109,6 +109,8 @@ export async function bitmapWalk(
   options: BitmapWalkOptions,
 ): Promise<BitmapWalkResult> {
   const count = index.count;
+  // bytes of a tree entry's id: the pack's object format's
+  const raw = index.pack.objectFormat?.rawLength ?? 20;
   const extIds: ObjectId[] = [];
   const extTypes: ObjectTypeString[] = [];
   const extHashes: number[] = [];
@@ -188,10 +190,10 @@ export async function bitmapWalk(
         out.set(extend(id, "tree", path));
         const data = o.data;
         for (let at = 0; at < data.length; ) {
-          const e = scanTreeEntry(data, at);
+          const e = scanTreeEntry(data, at, raw);
           at = e.next;
           if (e.kind === TREE_ENTRY_GITLINK) continue;
-          const eid = bytesToHex(data.subarray(e.nul + 1, e.nul + 21));
+          const eid = bytesToHex(data.subarray(e.nul + 1, e.nul + 1 + raw));
           const p = posOf(eid);
           if (known(p)) continue;
           // paths only matter to objects outside the pack (their name hash)
