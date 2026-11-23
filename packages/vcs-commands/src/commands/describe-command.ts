@@ -57,11 +57,6 @@ export interface DescribeResult {
  * ```
  */
 export class DescribeCommand extends GitCommand<DescribeResult> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private target?: ObjectId;
   private longFormat = false;
   private useTags = false;

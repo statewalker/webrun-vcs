@@ -17,7 +17,6 @@ import {
   createGitFilesBackend,
   FileGcStrategy,
   gc,
-  ReftableWriteUnsupportedError,
   repack,
   UnsupportedRepositoryFormatError,
 } from "../src/index.js";
@@ -120,14 +119,13 @@ describe("repositories we cannot read are refused when opened", () => {
     await expect(open(dir)).rejects.toThrow(/extensions\.objectFormat = sha256/);
   });
 
-  it.skipIf(!reftableSupported)("a reftable repository opens, its writes refused", async () => {
+  it.skipIf(!reftableSupported)("a reftable repository opens and takes writes", async () => {
     const dir = nativeRepo(["--ref-format=reftable"]);
     const { history } = await open(dir);
     const head = git(dir, ["rev-parse", "HEAD"]).trim();
     expect((await history.refs.resolve("HEAD"))?.objectId).toBe(head);
-    await expect(history.refs.set("refs/heads/x", head)).rejects.toBeInstanceOf(
-      ReftableWriteUnsupportedError,
-    );
+    await history.refs.set("refs/heads/x", head);
+    expect(git(dir, ["rev-parse", "refs/heads/x"]).trim()).toBe(head);
   });
 
   it("an unknown version-1 extension, which native git refuses too", async () => {

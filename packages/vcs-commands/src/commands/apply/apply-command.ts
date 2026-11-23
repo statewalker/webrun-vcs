@@ -73,11 +73,6 @@ interface PatchSource {
  * ```
  */
 export class ApplyCommand extends GitCommand<ApplyResult> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private patches: PatchSource[] = [];
   private index = false;
   private cached = false;

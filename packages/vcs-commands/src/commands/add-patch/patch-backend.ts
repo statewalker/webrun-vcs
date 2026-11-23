@@ -163,11 +163,6 @@ export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
  * @internal
  */
 export class IndexRefresh extends GitCommand<string> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private gentle = false;
 
   /**

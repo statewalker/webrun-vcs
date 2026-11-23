@@ -398,6 +398,23 @@ describe("InitCommand", () => {
   });
 });
 
+describe("InitCommand of a repository with a config but no HEAD", () => {
+  it("writes HEAD at the branch asked for, without the re-init warning", async () => {
+    const files = createInMemoryFilesApi();
+    await files.write(".git/config", [
+      new TextEncoder().encode("[core]\n\trepositoryformatversion = 0\n\tbare = false\n"),
+    ]);
+    const result = await new InitCommand()
+      .setFilesApi(files)
+      .setGitDir(".git")
+      .setInitialBranch("topic")
+      .call();
+    expect(result.warnings ?? []).toEqual([]);
+    const head = await result.repository.refs.get("HEAD");
+    expect(head && "target" in head ? head.target : undefined).toBe("refs/heads/topic");
+  });
+});
+
 async function collect(stream: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   for await (const chunk of stream) chunks.push(chunk);

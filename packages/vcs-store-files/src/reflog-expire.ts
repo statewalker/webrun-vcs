@@ -147,6 +147,25 @@ export async function expireReflogs(options: ExpireReflogsOptions): Promise<Expi
   };
 
   const graph = new CommitGraph(objects);
+  // a reftable store (of whichever worktree gc runs in): the repository's, whose reflogs
+  // are the main worktree's and the shared ones, the linked worktrees' named by id
+  const repository =
+    (options.refs as { repositoryStore?(): ExpireReflogsOptions["refs"] }).repositoryStore?.call(
+      options.refs,
+    ) ?? options.refs;
+  const reftable = repository as Partial<ReftableReflogs>;
+  if (reftable.reflogNames && reftable.expireReflog) {
+    // names and each reflog's own ref from the repository's store; what a HEAD's entries
+    // must be reachable from is the current worktree's view (reflog.c's refs_for_each_ref
+    // over get_main_ref_store: its own refs/bisect/, refs/worktree/, refs/rewritten/)
+    return expireReftableReflogs(
+      reftable as ReftableReflogs,
+      { ...options, refs: repository },
+      policyOf,
+      graph,
+      options.refs,
+    );
+  }
   const reflogs = await collectReflogs(files, gitDir);
   const atomic = atomicFilesOver(files, gitDir);
   const result: ExpireReflogsResult = {
@@ -218,6 +237,83 @@ export async function expireReflogs(options: ExpireReflogsOptions): Promise<Expi
       }
     } finally {
       if (!options.dryRun) await atomic.remove(lock);
+    }
+  }
+  return result;
+}
+
+/** The reflog operations of a reftable ref store (`ReftableRefStore`). */
+interface ReftableReflogs {
+  reflogNames(worktree?: string): Promise<string[]>;
+  expireReflog(
+    name: string,
+    prune: (
+      entries: readonly { oldId: string; newId: string; time: number }[],
+    ) => Promise<boolean[]>,
+    options?: { dryRun?: boolean },
+  ): Promise<number>;
+}
+
+/**
+ * `git reflog expire --all` in a reftable repository (reftable_be_reflog_expire): each
+ * reflog of the repository and of its linked worktrees (`worktrees/<id>/...`), every one
+ * rewritten in a table of its own whatever it loses, as git writes them.
+ */
+async function expireReftableReflogs(
+  refs: ReftableReflogs,
+  options: ExpireReflogsOptions,
+  policyOf: (ref: string) => Policy,
+  graph: CommitGraph,
+  /** The current worktree's refs: every ref's tip there is what HEADs' entries must reach */
+  currentRefs: Pick<Refs, "list">,
+): Promise<ExpireReflogsResult> {
+  const { files, gitDir = ".git" } = options;
+  const names = await refs.reflogNames();
+  const worktrees = joinPath(gitDir, "worktrees");
+  if ((await files.stats(worktrees))?.kind === "directory") {
+    const ids: string[] = [];
+    for await (const e of files.list(worktrees)) if (e.kind === "directory") ids.push(e.name);
+    for (const id of ids.sort()) {
+      for (const name of await refs.reflogNames(id)) {
+        if (name.startsWith("worktrees/")) names.push(name);
+      }
+    }
+  }
+  const result: ExpireReflogsResult = { reflogs: names, pruned: 0, errors: [] };
+  let allTips: ObjectId[] | undefined;
+  for (const name of names) {
+    const policy = policyOf(name);
+    const head = name === "HEAD" || /^worktrees\/[^/]+\/HEAD$/.test(name);
+    let kind: "always" | "normal" | "head";
+    let reach: ((id: ObjectId) => Promise<boolean>) | undefined;
+    if (!policy.unreachable || head) kind = "head";
+    else {
+      const tip = (await options.refs.resolve(name).catch(() => undefined))?.objectId;
+      const commit = tip ? await graph.peelToCommit(tip) : undefined;
+      kind = commit ? "normal" : "always";
+      if (commit) reach = graph.reachability([commit]);
+    }
+    if (policy.unreachable <= policy.total) kind = "always";
+    if (kind === "head") {
+      allTips ??= await refTips(currentRefs, graph);
+      reach = graph.reachability(allTips);
+    }
+    try {
+      result.pruned += await refs.expireReflog(
+        name,
+        async (entries) => {
+          const verdicts: boolean[] = [];
+          for (const e of entries) {
+            verdicts.push(
+              await shouldExpire({ ...e, timestamp: e.time }, policy, kind, reach, graph),
+            );
+          }
+          return verdicts;
+        },
+        { dryRun: options.dryRun === true },
+      );
+    } catch (error) {
+      result.errors.push(`error: cannot lock ref '${name}': ${(error as Error).message}`);
     }
   }
   return result;

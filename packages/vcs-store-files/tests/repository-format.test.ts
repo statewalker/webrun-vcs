@@ -12,7 +12,6 @@ import {
   FileGcStrategy,
   gc,
   ReftableRefStore,
-  ReftableWriteUnsupportedError,
   readRepositoryFormat,
   repack,
   UnsupportedRepositoryFormatError,
@@ -100,14 +99,10 @@ describe("repository format check", () => {
     expect(new TextDecoder().decode(await readAll(files, ".git/config"))).toBe(config);
   });
 
-  it("reads reftable refs, refusing to create or prune there", async () => {
+  it("reads and writes reftable refs, and creates reftable repositories", async () => {
     const config = v(1, "\trefStorage = reftable\n");
     const files = await repoWithConfig(config);
     expect((await readRepositoryFormat(files, ".git")).refStorage).toBe("reftable");
-    await expect(createGitFilesBackend({ files, create: true })).rejects.toBeInstanceOf(
-      ReftableWriteUnsupportedError,
-    );
-    expect(new TextDecoder().decode(await readAll(files, ".git/config"))).toBe(config);
     const { history } = await createGitFilesBackend({ files });
     expect(history.refs).toBeInstanceOf(ReftableRefStore);
     expect(() =>
@@ -121,7 +116,17 @@ describe("repository format check", () => {
         },
         "prune",
       ),
-    ).toThrow(ReftableWriteUnsupportedError);
+    ).not.toThrow();
+    const fresh = createInMemoryFilesApi();
+    const created = await createGitFilesBackend({
+      files: fresh,
+      create: true,
+      refFormat: "reftable",
+    });
+    expect(created.history.refs).toBeInstanceOf(ReftableRefStore);
+    expect((await readRepositoryFormat(fresh, ".git")).refStorage).toBe("reftable");
+    const head = await created.history.refs.get("HEAD");
+    expect(head && "target" in head ? head.target : undefined).toBe("refs/heads/main");
   });
 
   it("reads what the format allows", async () => {

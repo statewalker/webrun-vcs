@@ -367,10 +367,6 @@ export abstract class GitCommand<T> {
       const method = self[name];
       if (typeof method !== "function") continue;
       self[name] = (...args: unknown[]) => {
-        // a store that only reads (a reftable repository): a command that may write refs
-        // refuses before it changes anything
-        const refusal = this.refWriteRefusal();
-        if (refusal) return Promise.reject(refusal);
         let result: unknown;
         try {
           result = (method as (...a: unknown[]) => unknown).apply(this, args);
@@ -385,28 +381,6 @@ export abstract class GitCommand<T> {
         return result;
       };
     }
-  }
-
-  /**
-   * Whether the command may write refs (or reflogs). A command that never does (log, status,
-   * diff, listings, index-only commands) says false, so it runs on a ref store that only reads
-   * (`Refs.writeRefusal`: a reftable repository); every other command refuses there before
-   * its call starts.
-   */
-  protected get writesRefs(): boolean {
-    return true;
-  }
-
-  /** The error the ref store gives for writes, when this command may write refs. */
-  private refWriteRefusal(): Error | undefined {
-    if (!this.writesRefs) return undefined;
-    let refs: Refs | undefined;
-    try {
-      refs = (this._workingCopy as { history?: { refs?: Refs } }).history?.refs;
-    } catch {
-      return undefined; // no history: the command fails as it did
-    }
-    return refs?.writeRefusal?.();
   }
 
   /**

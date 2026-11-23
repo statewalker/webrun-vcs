@@ -68,11 +68,6 @@ export interface VerifyPackResult {
  * ```
  */
 export class VerifyPackCommand extends GitCommand<VerifyPackResult> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private _files?: FilesApi;
   private readonly _packs: string[] = [];
   private _verbose = false;

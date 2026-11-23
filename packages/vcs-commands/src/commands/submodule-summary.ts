@@ -100,11 +100,6 @@ export class SubmoduleWalkError extends Error {}
  * abbreviations. Opened by {@link openSubmoduleRepository}.
  */
 export class SubmoduleRepository extends GitCommand<never> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private abbreviations?: IdAbbreviator;
   /** Whether the repository is the one checked out at the path (not `modules/<name>`) */
   populated = false;
