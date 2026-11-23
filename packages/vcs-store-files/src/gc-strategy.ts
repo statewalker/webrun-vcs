@@ -31,7 +31,8 @@ import { assertObjectsDeletable, readRepositoryFormat } from "./repository-forma
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
 /** A loose object file name, fan-out directory included. */
-const OBJECT_ID = /^[0-9a-f]{40}$/;
+/** A full object id of either format (a repository has one) */
+const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
  * Options for creating a FileGcStrategy: the repository (`createGitFilesBackend`'s result).

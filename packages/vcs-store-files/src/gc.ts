@@ -10,12 +10,12 @@ import {
   graftFileBaseDir,
   graftFileReader,
   joinPath,
+  objectFormatOf,
   objectsWithoutLazyFetch,
   parsePackMtimes,
   sweepPackTemporaries,
 } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
-import { assertSha1ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { assertAlternatesReadable } from "./alternates/index.js";
 import { readCommitGraphSettings, writeCommitGraph } from "./commit-graph.js";
@@ -44,9 +44,10 @@ import {
 } from "./workspace/working-copy/working-copy-config.files.js";
 
 /** A loose object file name, fan-out directory included. */
-const OBJECT_ID = /^[0-9a-f]{40}$/;
+/** A full object id of either format (a repository has one) */
+const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 /** A pack file name. */
-const PACK_FILE = /^pack-[0-9a-f]{40}\.pack$/;
+const PACK_FILE = /^pack-(?:[0-9a-f]{40}|[0-9a-f]{64})\.pack$/;
 /** git ignores a `gc.pid` older than this (a gc that crashed). */
 const GC_LOCK_STALE_MS = 12 * 60 * 60 * 1000;
 /** The least age of a `.pack` without an `.idx` that gc removes (one may be being installed). */
@@ -364,8 +365,6 @@ async function collect(options: GcOptions): Promise<GcResult> {
   // preciousObjects: as git gc, refs are packed, but nothing is repacked or pruned. A partial
   // clone's promisor objects stay out of the walk, its promisor packs are repacked apart
   const format = await readRepositoryFormat(files, gitDir);
-  // a SHA-256 repository: its packs and the walks' files (index, packs) are not read yet
-  assertSha1ObjectFormat(format.objectFormat, "gc");
   const exclusions = dryRun ? undefined : await promisorExclusions(objects, files, gitDir);
   // git's errors reading the alternates (a directory gone, ...) are printed and gc goes on: the
   // walk below fails on a root or a local commit's object that only they held. Alternates git
@@ -594,7 +593,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
     const kept = new Set(reachable);
     if (compatibility !== "2.43") {
       const pending = [];
-      for (const id of await rebaseFileRoots(files, gitDir))
+      for (const id of await rebaseFileRoots(files, gitDir, format.objectFormat))
         if (!kept.has(id) && (await objects.has(id))) pending.push(id);
       while (pending.length > 0) {
         const id = pending.pop() as string;
@@ -684,7 +683,8 @@ async function collect(options: GcOptions): Promise<GcResult> {
     let inSeventeen = 0;
     const fan = joinPath(objectsDir, "17");
     if ((await files.stats(fan))?.kind === "directory")
-      for await (const e of files.list(fan)) if (/^[0-9a-f]{38}$/.test(e.name)) inSeventeen++;
+      for await (const e of files.list(fan))
+        if (/^(?:[0-9a-f]{38}|[0-9a-f]{62})$/.test(e.name)) inSeventeen++;
     if (inSeventeen > Math.ceil(gcSettings.gcAuto / 256))
       warnings.push(
         "warning: There are too many unreachable loose objects; run 'git prune' to remove them.",
@@ -910,6 +910,11 @@ async function gcCommitGraph(
   const { history, files, gitDir = ".git", environment } = options;
   if (options.dryRun) return { commitGraphWritten: false };
   try {
+    // a SHA-256 repository's commit-graph is not written yet: skipped unless asked for (then
+    // writeCommitGraph's UnsupportedObjectFormatError is the reported error)
+    if (objectFormatOf(objects).name !== "sha1" && options.writeCommitGraph !== true) {
+      return { commitGraphWritten: false };
+    }
     const enabled =
       options.writeCommitGraph ??
       (await readCommitGraphSettings(files, gitDir, { environment })).gcWriteCommitGraph;

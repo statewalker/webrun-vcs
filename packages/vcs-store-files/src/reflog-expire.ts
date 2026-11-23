@@ -19,8 +19,8 @@ import {
   createWorkingCopyConfig,
 } from "./workspace/working-copy/working-copy-config.files.js";
 
-const OID = /^[0-9a-f]{40}$/;
-const ZERO = "0".repeat(40);
+/** A full id of either format (an entry's two ids are of one: checked in `parseEntry`). */
+const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const DAY = 24 * 3600;
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -331,7 +331,7 @@ async function shouldExpire(
   if (entry.timestamp < policy.unreachable) {
     if (kind === "always") return true;
     const unreachable = async (id: string) => {
-      if (id === ZERO) return false;
+      if (/^0+$/.test(id)) return false;
       const commit = await graph.peelToCommit(id);
       // not a commit: kept
       if (!commit) return false;
@@ -349,11 +349,13 @@ async function shouldExpire(
 function parseEntry(
   line: string,
 ): { oldId: string; newId: string; timestamp: number; line: string } | undefined {
-  const oldId = line.slice(0, 40);
-  const newId = line.slice(41, 81);
-  if (!OID.test(oldId) || !OID.test(newId) || line[40] !== " " || line[81] !== " ")
+  // the ids' width: SHA-256's when the 65th character ends the first id
+  const hex = line[64] === " " && line[40] !== " " ? 64 : 40;
+  const oldId = line.slice(0, hex);
+  const newId = line.slice(hex + 1, 2 * hex + 1);
+  if (!OID.test(oldId) || !OID.test(newId) || line[hex] !== " " || line[2 * hex + 1] !== " ")
     return undefined;
-  const gt = line.indexOf(">", 82);
+  const gt = line.indexOf(">", 2 * hex + 2);
   if (gt < 0 || line[gt + 1] !== " ") return undefined;
   const m = /^(\d+) ([+-]\d{4})/.exec(line.slice(gt + 2));
   if (!m || Number(m[1]) === 0) return undefined;
@@ -489,7 +491,7 @@ class CommitGraph {
         break;
       }
       if (o.type !== "tag") break;
-      const m = /^object ([0-9a-f]{40})$/m.exec(o.text);
+      const m = /^object ([0-9a-f]{40}|[0-9a-f]{64})$/m.exec(o.text);
       if (!m) break;
       at = m[1] as string;
     }
@@ -538,7 +540,7 @@ function findHeaderEnd(bytes: Uint8Array): number {
 function parseParents(header: string): ObjectId[] {
   const out: ObjectId[] = [];
   for (const line of header.split("\n")) {
-    if (line.startsWith("parent ") && OID.test(line.slice(7, 47))) out.push(line.slice(7, 47));
+    if (line.startsWith("parent ") && OID.test(line.slice(7))) out.push(line.slice(7));
   }
   return out;
 }

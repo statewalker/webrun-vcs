@@ -35,7 +35,7 @@ import {
   writePackBitmap,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
-import { assertSha1ObjectFormat } from "@statewalker/vcs-utils/hash";
+import { UnsupportedObjectFormatError } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { assertAlternatesReadable } from "./alternates/index.js";
 import { writeCruftPacks } from "./cruft-pack.js";
@@ -60,7 +60,8 @@ import {
 export const DEFAULT_PRUNE_EXPIRE_MS = 14 * 24 * 60 * 60 * 1000;
 
 /** A loose object file name, fan-out directory included. */
-const OBJECT_ID = /^[0-9a-f]{40}$/;
+/** A full object id of either format (a repository has one) */
+const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** The repository a repack works on: the fields of `createGitFilesBackend`'s result. */
 export interface RepackTarget {
@@ -403,8 +404,11 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
   // delete packs in a precious-objects repo")
   // git's errors reading the alternates are printed and repack goes on (see gc)
   let alternatesErrors: readonly string[] = options.objects.alternates?.errors ?? [];
-  // a SHA-256 repository's packs are not written yet
-  assertSha1ObjectFormat(objectFormatOf(options.objects), "repack");
+  // a SHA-256 repository's multi-pack-index is not written yet
+  const objectFormat = objectFormatOf(options.objects);
+  if (options.writeMidx && objectFormat.name !== "sha1") {
+    throw new UnsupportedObjectFormatError("the multi-pack-index", objectFormat.name);
+  }
   if (!options.dryRun) {
     assertObjectsDeletable(await readRepositoryFormat(options.files, options.gitDir), "repack", {
       partialClone: "allow",
@@ -796,6 +800,13 @@ async function bitmapPlan(
           : "off";
   if (mode === "off") return { ...base, mode };
   if (!all) throw new IncrementalBitmapError();
+  // a SHA-256 repository's bitmaps are not written yet: refused when asked for (-b,
+  // repack.writeBitmaps), skipped when only git's default for a bare repository wants one
+  const objectFormat = objectFormatOf(options.objects);
+  if (objectFormat.name !== "sha1") {
+    if (mode === "loud") throw new UnsupportedObjectFormatError("pack bitmaps", objectFormat.name);
+    return { ...base, mode: "off" };
+  }
   if (options.local && hasAlternates) {
     // git warns even for its default (write_bitmaps = -1 is true there)
     warnings.push(NO_CLOSURE_BITMAP_WARNING);

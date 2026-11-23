@@ -2,7 +2,6 @@ import type { FilesApi, History } from "@statewalker/vcs-core";
 import { type GcResult, parseExpiryDate, gc as storeGc } from "@statewalker/vcs-store-files";
 import { parseGitInt } from "@statewalker/vcs-utils";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
-import { assertSha1ObjectFormat } from "@statewalker/vcs-utils/hash";
 
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
@@ -209,7 +208,9 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
     }
     // the loose objects estimated from one fan-out directory, against the limit rounded up
     // to a multiple of 256
-    const inSeventeen = (await names("17")).filter((n) => /^[0-9a-f]{38}$/.test(n)).length;
+    const inSeventeen = (await names("17")).filter((n) =>
+      /^(?:[0-9a-f]{38}|[0-9a-f]{62})$/.test(n),
+    ).length;
     return inSeventeen * 256 > Math.ceil(gcAuto / 256) * 256;
   }
 
@@ -286,8 +287,6 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
   async call(): Promise<GCCommandResult> {
     this.checkCallable();
     this.setCallable(false);
-    // a SHA-256 repository's packs are not written yet: gc and its repack are refused
-    assertSha1ObjectFormat(this.objectFormat, "gc");
 
     const startTime = Date.now();
     let refsPacked = false;

@@ -22,11 +22,18 @@ import type {
   PackSet,
   WritePackOptions,
 } from "@statewalker/vcs-core";
-import { decodeTreeBytes, joinPath, parsePackMtimes, writePack } from "@statewalker/vcs-core";
+import {
+  decodeTreeBytes,
+  joinPath,
+  objectFormatOf,
+  parsePackMtimes,
+  writePack,
+} from "@statewalker/vcs-core";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
 /** A loose object file name. */
-const OBJECT_ID = /^[0-9a-f]{40}$/;
+/** A full object id of either format (a repository has one) */
+const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 /** git's smallest `--max-pack-size` (pack-objects: "minimum pack size limit is 1 MiB"). */
 export const MIN_PACK_SIZE_LIMIT = 1024 * 1024;
 
@@ -257,14 +264,14 @@ export async function objectLinks(objects: GitObjects, id: ObjectId): Promise<Ob
   const bytes = o.bytes ?? (await collect(o.content));
   if (type === "tree") {
     // gitlinks name commits of other repositories: not walked (as git's traversal)
-    return decodeTreeBytes(bytes)
+    return decodeTreeBytes(bytes, { idLength: objectFormatOf(objects).rawLength })
       .filter((e) => e.mode !== 0o160000)
       .map((e) => e.id);
   }
   const text = new TextDecoder().decode(bytes.subarray(0, headerEnd(bytes)));
   const links: ObjectId[] = [];
   for (const line of text.split("\n")) {
-    const m = /^(tree|parent|object) ([0-9a-f]{40})$/.exec(line);
+    const m = /^(tree|parent|object) ([0-9a-f]{40}|[0-9a-f]{64})$/.exec(line);
     if (m) links.push(m[2] as string);
   }
   return links;

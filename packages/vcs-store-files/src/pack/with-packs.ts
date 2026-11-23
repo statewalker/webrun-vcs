@@ -20,7 +20,8 @@ import {
   type Steps,
 } from "@statewalker/vcs-core";
 
-const OID = /^[0-9a-f]{40}$/;
+/** A full object id of either format (the packs answer for their own) */
+const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const isId = (id: unknown): id is string => typeof id === "string" && OID.test(id);
 
 function closeSource(content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>): void {

@@ -13,8 +13,9 @@
  * Beyond git's own check, what git knows but we do not implement is refused too: a
  * compatibility object format (`extensions.compatObjectFormat`). A SHA-256 repository
  * (`extensions.objectFormat = sha256`) opens: its objects, refs and reflogs are read and
- * written with 32-byte ids; what has no SHA-256 path yet (pack files, the index file, the
- * commit-graph, reftable tables, the transports) refuses with `UnsupportedObjectFormatError`.
+ * written with 32-byte ids, its packs, `.idx`, `.rev`, `.mtimes` and index file too; what has
+ * no SHA-256 path yet (the commit-graph, the multi-pack-index, bitmaps, reftable tables, the
+ * transports) refuses with `UnsupportedObjectFormatError`.
  * The reftable ref storage (`extensions.refStorage = reftable`) is read and written by its ref
  * store (`ReftableRefStore`).
  */
@@ -22,7 +23,6 @@
 import type { FilesApi } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import {
-  assertSha1ObjectFormat,
   type ObjectFormat,
   objectFormatByName,
   SHA1_OBJECT_FORMAT,
@@ -262,8 +262,6 @@ export function assertObjectsDeletable(
   operation: string,
   options: { partialClone?: "refuse" | "allow" } = {},
 ): void {
-  // the reachability walks, repack and prune read packs, the index and reflogs as SHA-1 ids
-  assertSha1ObjectFormat(format.objectFormat, operation);
   if (format.preciousObjects) {
     throw new UnsupportedRepositoryFormatError(
       `cannot ${operation} in a precious-objects repo (extensions.preciousObjects)`,

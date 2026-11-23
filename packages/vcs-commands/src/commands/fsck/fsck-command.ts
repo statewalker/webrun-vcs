@@ -31,12 +31,7 @@ import {
 import { multiPackIndexVerify } from "@statewalker/vcs-store-files";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { readFile } from "@statewalker/vcs-utils/files";
-import {
-  assertSha1ObjectFormat,
-  isNullObjectId,
-  type ObjectFormat,
-} from "@statewalker/vcs-utils/hash";
-import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { isNullObjectId, type ObjectFormat } from "@statewalker/vcs-utils/hash";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import {
   type CacheTree,
@@ -194,7 +189,7 @@ export interface FsckRepositoryFiles {
 }
 
 const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-const PACK_IDX = /^pack-[0-9a-f]{40}\.idx$/;
+const PACK_IDX = /^pack-(?:[0-9a-f]{40}|[0-9a-f]{64})\.idx$/;
 /** Refs one worktree has of its own (git's `is_per_worktree_ref`). */
 const PER_WORKTREE = /^(?:refs\/(?:bisect|worktree|rewritten)\/|[A-Z_]+$)/;
 const dec = new TextDecoder();
@@ -1547,14 +1542,16 @@ class FsckRun {
     if ((await files.stats(dir))?.kind !== "directory") return [];
     const found: (RepoPack & { mtime: number })[] = [];
     for await (const e of files.list(dir)) {
+      // the repository's format: a pack named in another is not one of its packs
       if (e.kind !== "file" || !PACK_IDX.test(e.name)) continue;
+      if (e.name.length !== "pack-.idx".length + this.format.hexLength) continue;
       const idxPath = pathOf(dir, e.name);
       const packPath = `${idxPath.slice(0, -4)}.pack`;
       const stats = await files.stats(packPath);
       if (stats?.kind !== "file") continue;
       try {
         const idxBytes = await readAll(files, idxPath);
-        const idx = readPackIndex(idxBytes);
+        const idx = readPackIndex(idxBytes, this.format.rawLength);
         found.push({ packPath, idxPath, idx, idxBytes, source, mtime: stats.lastModified ?? 0 });
       } catch {
         // git does not list a pack whose idx cannot be opened
@@ -2137,8 +2134,8 @@ class FsckRun {
   }
 
   /**
-   * git's `verify_bitmap_files`: the trailing SHA-1 of each pack's `.bitmap` (a missing file
-   * is fine). True if one is wrong.
+   * git's `verify_bitmap_files`: the trailing hash (SHA-1, or SHA-256 in a SHA-256 repository)
+   * of each pack's `.bitmap` (a missing file is fine). True if one is wrong.
    */
   private async verifyBitmapFiles(
     packs: readonly RepoPack[],
@@ -2160,14 +2157,15 @@ class FsckRun {
       const st = await files.stats(path).catch(() => undefined);
       if (st?.kind !== "file") continue;
       const size = st.size ?? 0;
-      let valid = size >= 20;
+      const raw = this.format.rawLength;
+      let valid = size >= raw;
       if (valid) {
-        const hasher = createSha1();
-        for await (const c of files.read(path, { start: 0, length: size - 20 })) hasher.update(c);
+        const hasher = this.format.createHasher();
+        for await (const c of files.read(path, { start: 0, length: size - raw })) hasher.update(c);
         const sum = hasher.digest();
         const tail: number[] = [];
-        for await (const c of files.read(path, { start: size - 20, length: 20 })) tail.push(...c);
-        valid = tail.length === 20 && sum.every((b, i) => b === tail[i]);
+        for await (const c of files.read(path, { start: size - raw, length: raw })) tail.push(...c);
+        valid = tail.length === raw && sum.every((b, i) => b === tail[i]);
       }
       if (!valid) {
         this.error(`bitmap file '${path}' has invalid checksum`);
@@ -2241,6 +2239,7 @@ class FsckRun {
           externalBase: (id) => this.readObject(id),
           read: { bytes: p.idxBytes, idx: p.idx },
           keepBlob: this.keepBlob,
+          ...(this.sha1 ? {} : { objectFormat: this.format }),
         },
       );
       if (result.failed) err = 1;
@@ -2771,8 +2770,6 @@ class FsckRun {
     for (const wt of await this.worktrees()) {
       const indexPath = pathOf(wt.dir as string, "index");
       if ((await files.stats(indexPath))?.kind !== "file") continue;
-      // a SHA-256 repository's index (32-byte ids) is not read yet
-      assertSha1ObjectFormat(this.format, "the index file");
       // a split index merged with its shared index, a sparse index expanded (repo_read_index)
       let read: Awaited<ReturnType<typeof readIndexFileEntries>>;
       try {
@@ -2781,13 +2778,17 @@ class FsckRun {
           gitDir: wt.dir as string,
           trees: this.stores.trees(),
           verifyChecksum: true,
+          objectFormat: this.format,
         });
       } catch (error) {
         if (error instanceof IndexCorruptError) return error.lines;
         // a sparse directory whose tree is missing: its own entry stands for it (the index
         // and its shared index were hashed before the expansion failed)
         try {
-          read = await readIndexFileEntries(files, indexPath, { gitDir: wt.dir as string });
+          read = await readIndexFileEntries(files, indexPath, {
+            gitDir: wt.dir as string,
+            objectFormat: this.format,
+          });
         } catch (again) {
           if (again instanceof IndexCorruptError) return again.lines;
           throw again;
@@ -2804,8 +2805,9 @@ class FsckRun {
       let cacheTree: CacheTree | undefined;
       let resolveUndo: ResolveUndoRecord[] = [];
       for (const ext of parsed.extensionData) {
-        if (ext.signature === "TREE") cacheTree = parseCacheTree(ext.data);
-        else if (ext.signature === "REUC") resolveUndo = parseResolveUndo(ext.data);
+        const raw = this.format.rawLength;
+        if (ext.signature === "TREE") cacheTree = parseCacheTree(ext.data, raw);
+        else if (ext.signature === "REUC") resolveUndo = parseResolveUndo(ext.data, raw);
       }
       await this.fsckIndex(entries, cacheTree, resolveUndo, indexPath, prefix);
     }
@@ -2925,8 +2927,9 @@ class FsckRun {
             const n = ns[pos] as number;
             if (type === OBJ_COMMIT && decided && !decided[n]) {
               decided[n] = 1;
-              const at = p.idx.version > 1 ? 8 + 1024 + pos * 20 : 1024 + 4 + pos * 24;
-              this.keepGraphCommit(bytesToHex(p.idxBytes.subarray(at, at + 20)), content);
+              const raw = this.format.rawLength;
+              const at = p.idx.version > 1 ? 8 + 1024 + pos * raw : 1024 + 4 + pos * (raw + 4);
+              this.keepGraphCommit(bytesToHex(p.idxBytes.subarray(at, at + raw)), content);
             }
             if (type === OBJ_COMMIT && !withCommits) return;
             if (claimed[n]) return;

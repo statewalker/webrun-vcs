@@ -35,20 +35,37 @@ import type {
   ResolvedObjectFilter,
   SymbolicRef,
 } from "@statewalker/vcs-core";
-import { isSymbolicRef, joinPath, listObjects, readGraftParents } from "@statewalker/vcs-core";
+import {
+  isSymbolicRef,
+  joinPath,
+  listObjects,
+  objectFormatOf,
+  readGraftParents,
+} from "@statewalker/vcs-core";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
+import {
+  isHexObjectId,
+  type ObjectFormat,
+  SHA1_OBJECT_FORMAT,
+  SHA256_OBJECT_FORMAT,
+} from "@statewalker/vcs-utils/hash";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { parseResolveUndo, readIndexFileEntries } from "@statewalker/vcs-working-tree";
 
 import { readAllRefs } from "./refs/index.js";
 
-const OID = /^[0-9a-f]{40}$/;
-const ZERO = "0".repeat(40);
 /** The empty blob and tree: git reads them whether stored or not (`find_cached_object`). */
 const VIRTUAL = new Set([
-  "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
-  "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+  SHA1_OBJECT_FORMAT.emptyBlobId,
+  SHA1_OBJECT_FORMAT.emptyTreeId,
+  SHA256_OBJECT_FORMAT.emptyBlobId,
+  SHA256_OBJECT_FORMAT.emptyTreeId,
 ]);
+
+/** Whether `id` is a full id of `format`, not its null id. */
+function isIdOf(id: string | undefined, format: ObjectFormat): id is string {
+  return id !== undefined && isHexObjectId(id, format) && id !== format.nullId;
+}
 
 /**
  * A root gc, repack and prune cannot do without is not stored: a ref, HEAD or an index entry
@@ -149,6 +166,7 @@ async function collectRoots(
   const refs =
     (roots.refs as { repositoryStore?(): Refs }).repositoryStore?.call(roots.refs) ?? roots.refs;
   const gitDir = roots.gitDir ?? ".git";
+  const format = objectFormatOf(objects as GitObjects);
   const tips = new Set<ObjectId>();
   // roots that must be stored, with git's message when one is not (the first naming wins)
   const required = new Map<ObjectId, string>();
@@ -198,10 +216,12 @@ async function collectRoots(
 
   const logIds = reftable
     ? await storeReflogIds(refs, await reftable.reflogNames())
-    : await reflogIds(files, joinPath(gitDir, "logs"));
+    : await reflogIds(files, joinPath(gitDir, "logs"), format);
   for (const id of logIds) tips.add(id);
-  requireIndex(await indexIds(files, joinPath(gitDir, "index")));
-  if (roots.rebaseFiles) for (const id of await rebaseFileIds(files, gitDir)) tips.add(id);
+  requireIndex(await indexIds(files, joinPath(gitDir, "index"), format));
+  if (roots.rebaseFiles) {
+    for (const id of await rebaseFileIds(files, gitDir, format)) tips.add(id);
+  }
   for (const id of roots.extraRoots ?? []) tips.add(id);
 
   // Linked worktrees: their HEAD, index and reflogs live under worktrees/<name>/
@@ -212,9 +232,14 @@ async function collectRoots(
       const label = `worktrees/${wt.path.slice(wt.path.lastIndexOf("/") + 1)}`;
       const id = reftable
         ? (await refs.resolve(`${label}/HEAD`))?.objectId
-        : await worktreeHead(files, joinPath(wt.path, "HEAD"), async (target) => {
-            return resolveStored(target) ?? (await refs.resolve(target))?.objectId;
-          });
+        : await worktreeHead(
+            files,
+            joinPath(wt.path, "HEAD"),
+            async (target) => {
+              return resolveStored(target) ?? (await refs.resolve(target))?.objectId;
+            },
+            format,
+          );
       if (id) require(id, `bad object ${label}/HEAD`);
       // its per-worktree refs (refs/bisect/*, refs/worktree/*, refs/rewritten/*), always loose
       // (in its own stack in a reftable repository)
@@ -238,10 +263,12 @@ async function collectRoots(
               n.startsWith(`${label}/`),
             ),
           )
-        : await reflogIds(files, joinPath(wt.path, "logs"));
+        : await reflogIds(files, joinPath(wt.path, "logs"), format);
       for (const id of wtLogIds) tips.add(id);
-      requireIndex(await indexIds(files, joinPath(wt.path, "index")));
-      if (roots.rebaseFiles) for (const id of await rebaseFileIds(files, wt.path)) tips.add(id);
+      requireIndex(await indexIds(files, joinPath(wt.path, "index"), format));
+      if (roots.rebaseFiles) {
+        for (const id of await rebaseFileIds(files, wt.path, format)) tips.add(id);
+      }
     }
   }
 
@@ -260,12 +287,14 @@ async function worktreeHead(
   files: FilesApi,
   path: string,
   resolve: (name: string) => Promise<ObjectId | undefined>,
+  format: ObjectFormat,
 ): Promise<ObjectId | undefined> {
   const text = (await readText(files, path))?.trim();
   if (!text) return undefined;
   if (text.startsWith("ref:")) return resolve(text.slice(4).trim());
-  const id = text.slice(0, 40).toLowerCase();
-  if (!OID.test(id)) throw new Error(`Invalid worktree HEAD ${path}: ${text.slice(0, 60)}`);
+  const id = text.slice(0, format.hexLength).toLowerCase();
+  if (!isHexObjectId(id, format))
+    throw new Error(`Invalid worktree HEAD ${path}: ${text.slice(0, 60)}`);
   return id;
 }
 
@@ -321,22 +350,30 @@ const REBASE_FILES = [
  * The ids git 2.5x's prune adds from the rebase files (`add_rebase_files`) of the repository
  * and of each linked worktree.
  */
-export async function rebaseFileRoots(files: FilesApi, gitDir = ".git"): Promise<ObjectId[]> {
-  const ids = await rebaseFileIds(files, gitDir);
+export async function rebaseFileRoots(
+  files: FilesApi,
+  gitDir = ".git",
+  format: ObjectFormat = SHA1_OBJECT_FORMAT,
+): Promise<ObjectId[]> {
+  const ids = await rebaseFileIds(files, gitDir, format);
   const worktrees = joinPath(gitDir, "worktrees");
   if ((await files.stats(worktrees))?.kind === "directory")
     for await (const wt of files.list(worktrees))
-      if (wt.kind === "directory") ids.push(...(await rebaseFileIds(files, wt.path)));
+      if (wt.kind === "directory") ids.push(...(await rebaseFileIds(files, wt.path, format)));
   return ids;
 }
 
 /** The object ids the rebase files in `dir` name (the first line of each). */
-async function rebaseFileIds(files: FilesApi, dir: string): Promise<ObjectId[]> {
+async function rebaseFileIds(
+  files: FilesApi,
+  dir: string,
+  format: ObjectFormat,
+): Promise<ObjectId[]> {
   const ids: ObjectId[] = [];
   for (const name of REBASE_FILES) {
     const text = await readText(files, joinPath(dir, name));
-    const id = text?.slice(0, 40).toLowerCase();
-    if (id && OID.test(id) && id !== ZERO) ids.push(id);
+    const id = text?.slice(0, format.hexLength).toLowerCase();
+    if (isIdOf(id, format)) ids.push(id);
   }
   return ids;
 }
@@ -376,15 +413,20 @@ async function storeReflogIds(refs: Refs, names: string[]): Promise<ObjectId[]> 
     const reader = await refs.getReflog?.(name);
     if (!reader) continue;
     for (const e of await reader.getReverseEntries()) {
-      if (OID.test(e.oldId) && e.oldId !== ZERO) ids.push(e.oldId);
-      if (OID.test(e.newId) && e.newId !== ZERO) ids.push(e.newId);
+      if (isHexObjectId(e.oldId) && !/^0+$/.test(e.oldId)) ids.push(e.oldId);
+      if (isHexObjectId(e.newId) && !/^0+$/.test(e.newId)) ids.push(e.newId);
     }
   }
   return ids;
 }
 
 /** The old and new ids of every entry of every reflog under `logsDir`. */
-async function reflogIds(files: FilesApi, logsDir: string): Promise<ObjectId[]> {
+async function reflogIds(
+  files: FilesApi,
+  logsDir: string,
+  format: ObjectFormat,
+): Promise<ObjectId[]> {
+  const hex = format.hexLength;
   const ids: ObjectId[] = [];
   if ((await files.stats(logsDir))?.kind !== "directory") return ids;
   const walk = async (dir: string) => {
@@ -395,10 +437,10 @@ async function reflogIds(files: FilesApi, logsDir: string): Promise<ObjectId[]> 
       }
       const text = await readText(files, e.path);
       for (const line of text?.split("\n") ?? []) {
-        const oldId = line.slice(0, 40);
-        const newId = line.slice(41, 81);
-        if (OID.test(oldId) && oldId !== ZERO) ids.push(oldId);
-        if (OID.test(newId) && newId !== ZERO) ids.push(newId);
+        const oldId = line.slice(0, hex);
+        const newId = line.slice(hex + 1, 2 * hex + 1);
+        if (isIdOf(oldId, format)) ids.push(oldId);
+        if (isIdOf(newId, format)) ids.push(newId);
       }
     }
   };
@@ -418,11 +460,15 @@ interface IndexRoots {
  * The object ids the index records: its entries' (gitlinks excepted), and the cache-tree's
  * and resolve-undo's (`extra`), in git's order (do_add_index_objects_to_pending).
  */
-async function indexIds(files: FilesApi, indexPath: string): Promise<IndexRoots> {
+async function indexIds(
+  files: FilesApi,
+  indexPath: string,
+  format: ObjectFormat,
+): Promise<IndexRoots> {
   if ((await files.stats(indexPath))?.kind !== "file") return { entries: [], extra: [] };
   // a split index merged with its shared index; a sparse index's directories stay trees
   const gitDir = indexPath.slice(0, Math.max(0, indexPath.lastIndexOf("/")));
-  const read = await readIndexFileEntries(files, indexPath, { gitDir });
+  const read = await readIndexFileEntries(files, indexPath, { gitDir, objectFormat: format });
   if (!read) return { entries: [], extra: [] };
   const parsed = { entries: read.entries, extensionData: read.extensions };
   const entries = parsed.entries
@@ -431,10 +477,11 @@ async function indexIds(files: FilesApi, indexPath: string): Promise<IndexRoots>
     .map((e) => ({ id: e.objectId, path: e.path.endsWith("/") ? e.path.slice(0, -1) : e.path }));
   const ids: { id: ObjectId; path: string }[] = [];
   for (const ext of parsed.extensionData) {
-    if (ext.signature === "TREE") ids.push(...cacheTreeIds(ext.data, indexPath));
-    else if (ext.signature === "REUC") {
+    if (ext.signature === "TREE") {
+      ids.push(...cacheTreeIds(ext.data, indexPath, format.rawLength));
+    } else if (ext.signature === "REUC") {
       // git's add_resolve_undo_to_pending: `git checkout -m` recreates a conflict from them
-      for (const record of parseResolveUndo(ext.data)) {
+      for (const record of parseResolveUndo(ext.data, format.rawLength)) {
         record.objectIds.forEach((id, i) => {
           if (id && record.modes[i] !== GITLINK) ids.push({ id, path: record.path });
         });
@@ -450,7 +497,11 @@ async function indexIds(files: FilesApi, indexPath: string): Promise<IndexRoots>
  * then the tree id unless the entry count is -1 (an invalidated node); its subtrees follow it.
  * git's `add_cache_tree` keeps them.
  */
-function cacheTreeIds(data: Uint8Array, indexPath: string): { id: ObjectId; path: string }[] {
+function cacheTreeIds(
+  data: Uint8Array,
+  indexPath: string,
+  rawLength: number,
+): { id: ObjectId; path: string }[] {
   const ids: { id: ObjectId; path: string }[] = [];
   // the open directories: their path and how many subtrees are still to come
   const open: { path: string; left: number }[] = [];
@@ -471,9 +522,11 @@ function cacheTreeIds(data: Uint8Array, indexPath: string): { id: ObjectId; path
     }
     open.push({ path, left: Math.max(0, Number(subtrees) || 0) });
     if (Number(count) < 0) continue;
-    if (p + 20 > data.length) throw new Error(`${indexPath}: malformed cache-tree extension`);
-    ids.push({ id: bytesToHex(data.subarray(p, p + 20)), path });
-    p += 20;
+    if (p + rawLength > data.length) {
+      throw new Error(`${indexPath}: malformed cache-tree extension`);
+    }
+    ids.push({ id: bytesToHex(data.subarray(p, p + rawLength)), path });
+    p += rawLength;
   }
   return ids;
 }

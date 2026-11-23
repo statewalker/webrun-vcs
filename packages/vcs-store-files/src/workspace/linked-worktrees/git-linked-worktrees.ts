@@ -360,7 +360,11 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       const text = (await this.readText(path))?.trim();
       if (!text) return undefined;
       if (text.startsWith("refs/heads/")) return text;
-      if (text.startsWith("refs/") || /^[0-9a-f]{40}$/.test(text) || text === "detached HEAD") {
+      if (
+        text.startsWith("refs/") ||
+        /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(text) ||
+        text === "detached HEAD"
+      ) {
         return undefined;
       }
       return `refs/heads/${text}`;
@@ -565,7 +569,11 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     // read_index_from: a split index merged (its shared index in the worktree's git
     // directory), a sparse index read as it is (sparse directories are no gitlinks); an index
     // git cannot read makes it die, so the error is thrown, never taken as no submodules
-    const read = await readIndexFileEntries(this.files, `${gitDir}/index`, { gitDir });
+    const objectFormat = this.history.objects?.objectFormat;
+    const read = await readIndexFileEntries(this.files, `${gitDir}/index`, {
+      gitDir,
+      ...(objectFormat ? { objectFormat } : {}),
+    });
     if (!read) return false;
     const root = this.fromHost(entry.path);
     if (root === undefined) return false;
