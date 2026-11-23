@@ -289,11 +289,11 @@ export function createTransportApi(duplex: Duplex, state: ProtocolState): Transp
     // Parses the pack header and object boundaries to read exactly one
     // complete pack, then stops — preventing deadlock when the duplex
     // is shared with subsequent protocol exchanges (e.g., push report-status).
-    async *readRawPack(): AsyncGenerator<Uint8Array> {
+    async *readRawPack(hashSize?: number): AsyncGenerator<Uint8Array> {
       // Use the reader's own buffer and iterator to avoid creating a
       // competing duplex iterator that could consume report-status data.
       const { stream, restore } = reader.createRawStream();
-      const leftover: Uint8Array = yield* readPackFromStream(stream);
+      const leftover: Uint8Array = yield* readPackFromStream(stream, hashSize);
       // Put any unconsumed bytes back so the PktLineReader can use them
       // for subsequent reads (e.g., report-status after pack).
       restore(leftover);

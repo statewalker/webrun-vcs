@@ -89,7 +89,7 @@ export interface TransportApi {
    * after pkt-line commands, regardless of sideband capability.
    * @yields Pack data chunks
    */
-  readRawPack(): AsyncGenerator<Uint8Array>;
+  readRawPack(hashSize?: number): AsyncGenerator<Uint8Array>;
 
   /**
    * Writes pack data stream.

@@ -4,6 +4,7 @@
  * report.
  */
 
+import { isHexObjectId } from "@statewalker/vcs-utils/hash";
 import type { RepositoryFacade } from "../api/repository-facade.js";
 import type { RefStore } from "../context/process-context.js";
 import {
@@ -12,16 +13,15 @@ import {
   type RemoteRef,
   readSidebandPack,
 } from "../fetch-client/index.js";
-import { encodeFlush, encodePacketLine, TransportError, ZERO_OID } from "../protocol/index.js";
+import {
+  encodeFlush,
+  encodePacketLine,
+  ObjectFormatMismatchError,
+  TransportError,
+} from "../protocol/index.js";
+import { formatOf, isNullId } from "../protocol/object-format.js";
 import { type AbbrevLengths, abbrevLengthsOf, transportSummaryWidth } from "../summary/index.js";
 import type { ReceivePackConnection } from "./connection.js";
-import { pushSummaryIds } from "./push-status.js";
-import { resolveRevision } from "./revision.js";
-
-const OID = /^[0-9a-f]{40}$/;
-/** git's parse_oid_hex: an id at the start of the value */
-const OID_PREFIX = /^[0-9a-fA-F]{40}/;
-
 import {
   type ForceWithLease,
   isPushSuccess,
@@ -34,6 +34,8 @@ import {
   refnameMatch,
   setPushStatus,
 } from "./push-refs.js";
+import { pushSummaryIds } from "./push-status.js";
+import { resolveRevision } from "./revision.js";
 
 /** What a push sends, beyond the connection. */
 export interface PushClientOptions {
@@ -216,6 +218,10 @@ async function sendPack(
   }
   const { repository, refStore } = options;
   const remoteRefs = [...connection.advertisedRefs];
+  // the ids the push sends are of the local repository's format (checked against the
+  // server's below, as send_pack does)
+  const format = formatOf(repository);
+  const ZERO_OID = format.nullId;
 
   // the refs
   const localRefs = new Map<string, string>();
@@ -235,7 +241,7 @@ async function sendPack(
       resolveRevision: revision,
     },
     remoteRefs,
-    { prune: options.prune },
+    { prune: options.prune, objectFormat: format },
   );
   // leases (git's apply_cas): an entry naming the ref wins; one without a ref (or `true`)
   // covers every other pushed ref at its remote-tracking value
@@ -248,8 +254,8 @@ async function sendPack(
     const expected = new Map<ForceWithLease, string>();
     for (const l of named) {
       // git: "cannot parse expected object name" before anything is sent
-      if (l.expect === undefined || l.expect === "" || l.expect === ZERO_OID) continue;
-      const oid = OID.test(l.expect) ? l.expect : await revision(l.expect);
+      if (l.expect === undefined || l.expect === "" || isNullId(l.expect)) continue;
+      const oid = isHexObjectId(l.expect, format) ? l.expect : await revision(l.expect);
       if (!oid) throw new PushRefspecError(`cannot parse expected object name '${l.expect}'`);
       expected.set(l, oid);
     }
@@ -275,11 +281,18 @@ async function sendPack(
   if (options.prePush && !(await options.prePush(updates))) {
     throw new PushRefusedByHookError(updates);
   }
+  // send_pack's server_supports_hash: a server naming no format speaks SHA-1
+  const serverFormat = caps.get("object-format");
+  if ((serverFormat || "sha1") !== format.name) {
+    throw new ObjectFormatMismatchError(
+      "the receiving end does not support this repository's hash algorithm",
+    );
+  }
 
   // what the server allows (send_pack)
   if (!caps.has("delete-refs")) {
     for (const u of updates) {
-      if (u.status === "ok" && u.newOid === ZERO_OID) setStatus(u, "rejected-nodelete");
+      if (u.status === "ok" && isNullId(u.newOid)) setStatus(u, "rejected-nodelete");
     }
   }
   const toSend = updates.filter((u) => u.status === "ok");
@@ -298,8 +311,7 @@ async function sendPack(
   if (options.quiet && caps.has("quiet")) requested.push("quiet");
   if (options.atomic) requested.push("atomic");
   if (options.pushOptions?.length) requested.push("push-options");
-  const objectFormat = caps.get("object-format");
-  if (objectFormat !== undefined) requested.push(`object-format=${objectFormat || "sha1"}`);
+  if (serverFormat !== undefined) requested.push(`object-format=${format.name}`);
   if (caps.has("agent")) requested.push(`agent=${CLIENT_AGENT}`);
 
   const result: PushClientResult = {
@@ -335,12 +347,12 @@ async function sendPack(
     for (const option of options.pushOptions) request.push(encodePacketLine(`${option}\n`));
     request.push(encodeFlush());
   }
-  const tips = [...new Set(toSend.filter((u) => u.newOid !== ZERO_OID).map((u) => u.newOid))];
+  const tips = [...new Set(toSend.filter((u) => !isNullId(u.newOid)).map((u) => u.newOid))];
   // the edges: every advertised tip (and `.have`) here, as send-pack feeds `^old` to
   // pack-objects; the receiver has their whole history
   const haves = new Set<string>();
   for (const oid of [...remoteRefs.map((r) => r.oid), ...connection.extraHaves]) {
-    if (oid && oid !== ZERO_OID && !haves.has(oid) && (await repository.has(oid))) {
+    if (oid && !isNullId(oid) && !haves.has(oid) && (await repository.has(oid))) {
       haves.add(oid);
     }
   }
@@ -434,8 +446,12 @@ async function sendPack(
       const space = rest.indexOf(" ");
       const key = space < 0 ? rest : rest.slice(0, space);
       const val = space < 0 ? undefined : rest.slice(space + 1);
+      // git's parse_oid_hex of the repository's format: an id at the start of the value
+      const head = val?.slice(0, format.hexLength);
       const oid =
-        val !== undefined && OID_PREFIX.test(val) ? val.slice(0, 40).toLowerCase() : undefined;
+        head !== undefined && isHexObjectId(head.toLowerCase(), format)
+          ? head.toLowerCase()
+          : undefined;
       if (key === "refname") {
         if (val === undefined) delete current?.refName;
         else (current as PushRefReport).refName = val;

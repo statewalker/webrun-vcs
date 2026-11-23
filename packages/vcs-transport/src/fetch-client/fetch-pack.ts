@@ -3,7 +3,9 @@
  * {@link UploadPackConnection}: protocol v0 (stateful or stateless) and v2.
  */
 
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { PackImportResult } from "../api/repository-facade.js";
+import { ObjectFormatMismatchError } from "../protocol/errors.js";
 import {
   encodeDelim,
   encodeFlush,
@@ -11,6 +13,7 @@ import {
   ServerError,
   TransportError,
 } from "../protocol/index.js";
+import { formatOf, mismatchedAlgorithms } from "../protocol/object-format.js";
 import type { UploadPackConnection } from "./connection.js";
 import { Negotiator, type NegotiatorSource } from "./negotiator.js";
 import { type PktStream, readSidebandPack } from "./pkt-stream.js";
@@ -66,6 +69,12 @@ export interface FetchPackRequest {
   includeTag?: boolean;
   /** Progress messages (side-band channel 2); without it the client asks for `no-progress` */
   onProgress?: (message: string) => void;
+  /**
+   * The local repository's object format (SHA-1 when absent): a server speaking another one
+   * is refused before anything is asked (git's "mismatched algorithms" in v2, "Server does
+   * not support this repository's object format" in v0)
+   */
+  objectFormat?: ObjectFormat;
   /** Stores the pack as it arrives (never buffered whole) */
   importPack(pack: AsyncIterable<Uint8Array>): Promise<PackImportResult>;
   /**
@@ -117,6 +126,7 @@ export async function fetchPack(
   request: FetchPackRequest,
 ): Promise<FetchPackResult> {
   if (request.wants.length === 0) throw new Error("fetchPack: nothing to fetch");
+  checkObjectFormat(connection, formatOf(request));
   if (request.filter && !serverSupportsFilter(connection)) {
     request.onWarning?.(FILTER_NOT_RECOGNIZED);
     request = { ...request, filter: undefined };
@@ -133,6 +143,29 @@ export async function fetchPack(
   return connection.version === 2
     ? fetchPackV2(connection, negotiator, request, shallow)
     : fetchPackV0(connection, negotiator, request, shallow, deepen);
+}
+
+/**
+ * The server's object format against the local repository's, as git checks it before it
+ * asks for anything: v2's write_command_and_capabilities (`mismatched algorithms: client
+ * <ours>; server <theirs>`, or `the server does not support algorithm '<ours>'` from a v2
+ * server naming none), v0's do_fetch_pack (`Server does not support this repository's object
+ * format`: a server naming none speaks SHA-1).
+ */
+export function checkObjectFormat(connection: UploadPackConnection, local: ObjectFormat): void {
+  const named = connection.capabilities.get("object-format");
+  if (connection.version === 2) {
+    if (named !== undefined) {
+      if (named !== local.name)
+        throw new ObjectFormatMismatchError(mismatchedAlgorithms(local, named));
+    } else if (local.name !== "sha1") {
+      throw new ObjectFormatMismatchError(`the server does not support algorithm '${local.name}'`);
+    }
+    return;
+  }
+  if ((named ?? "sha1") !== local.name) {
+    throw new ObjectFormatMismatchError("Server does not support this repository's object format");
+  }
 }
 
 function fetchFeatures(connection: UploadPackConnection): Set<string> {
@@ -328,8 +361,11 @@ async function fetchPackV0(
 
 function parseAck(line: string): { oid: string; status?: string } | undefined {
   if (!line.startsWith("ACK ")) return undefined;
-  const oid = line.slice(4, 44);
-  const status = line.slice(45) || undefined;
+  // `ACK <oid>[ <status>]`, the id of the format the server speaks
+  const rest = line.slice(4);
+  const space = rest.indexOf(" ");
+  const oid = space < 0 ? rest : rest.slice(0, space);
+  const status = space < 0 ? undefined : rest.slice(space + 1) || undefined;
   return { oid, status };
 }
 
@@ -346,7 +382,11 @@ async function fetchPackV2(
   const caps = connection.capabilities;
   const head: Uint8Array[] = [encodePacketLine("command=fetch")];
   if (caps.has("agent")) head.push(encodePacketLine(`agent=${CLIENT_AGENT}`));
-  if (caps.get("object-format") === "sha1") head.push(encodePacketLine("object-format=sha1"));
+  // write_command_and_capabilities: the client's own format, once checked against the
+  // server's (checkObjectFormat)
+  if (caps.has("object-format")) {
+    head.push(encodePacketLine(`object-format=${formatOf(request).name}`));
+  }
   head.push(encodeDelim());
   head.push(encodePacketLine("thin-pack"));
   if (!request.onProgress) head.push(encodePacketLine("no-progress"));
@@ -404,7 +444,8 @@ async function fetchPackV2(
           continue;
         }
         if (!line.startsWith("ACK ")) throw new TransportError(`Unexpected ${line}`);
-        const oid = line.slice(4, 44);
+        const rest = line.slice(4);
+        const oid = rest.includes(" ") ? rest.slice(0, rest.indexOf(" ")) : rest;
         if (!(await negotiator.ack(oid))) commons.push(oid);
         // git's do_fetch_pack_v2: any ACK (a re-sent common one too) resets the count
         seenAck = true;

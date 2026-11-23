@@ -4,16 +4,12 @@
  */
 
 import { outgoingLinks } from "@statewalker/vcs-core";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { PackImportResult, RepositoryFacade } from "../api/repository-facade.js";
 import type { RefStore } from "../context/process-context.js";
 import { INFINITE_DEPTH } from "../fsm/index.js";
-import {
-  encodeDelim,
-  encodeFlush,
-  encodePacketLine,
-  TransportError,
-  ZERO_OID,
-} from "../protocol/index.js";
+import { encodeDelim, encodeFlush, encodePacketLine, TransportError } from "../protocol/index.js";
+import { formatOf, isObjectIdOf, remoteObjectFormat } from "../protocol/object-format.js";
 import { type AbbrevLengths, abbrevLengthsOf, transportSummaryWidth } from "../summary/index.js";
 import { parseRefSpec } from "../utils/index.js";
 import { Completeness } from "./completeness.js";
@@ -107,6 +103,14 @@ export interface FetchClientOptions {
    * listing its refs), counted as local tips, so the refs they name are written without
    * fetching anything.
    */
+  /**
+   * Called with the remote's object format (its `object-format` capability, SHA-1 without one)
+   * once the remote refs are listed, before `beforeFetch` and before anything is fetched or
+   * written: where git's clone initializes the new repository with the remote's hash. It may
+   * throw to stop the fetch. A remote of another format than `repository`'s then fails the
+   * fetch as git does ({@link ObjectFormatMismatchError}).
+   */
+  onRemoteObjectFormat?: (format: ObjectFormat) => void | Promise<void>;
   beforeFetch?: (
     remoteRefs: readonly RemoteRef[],
     refMap: readonly { remoteRef: string; localRef?: string }[],
@@ -411,6 +415,10 @@ export async function fetchFromConnection(
         .map(({ refspec: _refspec, ...p }) => p)
     : [];
 
+  // the remote's hash, as git's clone learns it from the handshake
+  await options.onRemoteObjectFormat?.(
+    remoteObjectFormat(connection.capabilities) ?? SHA1_OBJECT_FORMAT,
+  );
   const before = options.beforeFetch
     ? await options.beforeFetch(remoteRefs, [...planned, ...opportunistic])
     : undefined;
@@ -465,17 +473,21 @@ export async function fetchFromConnection(
     }
     const links = strictLinks && (!!options.fsckObjects || !deepening);
     const received =
-      !options.dryRun && (links || options.fsckObjects) ? new ReceivedObjects() : undefined;
+      !options.dryRun && (links || options.fsckObjects)
+        ? new ReceivedObjects(formatOf(repository).rawLength)
+        : undefined;
     // the shallow commits index-pack is given (the shallow file as this fetch leaves it, and a
     // shallow server's): known once the shallow-info is in, before the pack's objects come
     const grafts = () =>
       new Set([...applyShallow(shallow, update), ...(serverShallow?.list ?? [])]);
     // the objects' links, read while the import holds them (index-pack's fsck_walk)
-    const receivedLinks = received && links ? new ReceivedLinks(grafts) : undefined;
+    const receivedLinks =
+      received && links ? new ReceivedLinks(grafts, formatOf(repository).rawLength) : undefined;
     // a promisor pack's outgoing links (index-pack --promisor's repack_local_links)
     const outgoing = filter && !options.dryRun ? new Set<string>() : undefined;
     const fetched = await fetchPack(connection, source, {
       wants,
+      ...(repository.objectFormat ? { objectFormat: repository.objectFormat } : {}),
       localTips: options.refetch ? [] : localTips,
       knownCommon,
       shallow,
@@ -749,7 +761,7 @@ export async function fetchFromConnection(
     ...opportunistic,
     ...followed.filter((p) => tagsOfTips.has(p.remoteRef)),
   ];
-  const widthIds = inRefMap.flatMap((p) => [p.oid, ZERO_OID]);
+  const widthIds = inRefMap.flatMap((p) => [p.oid, formatOf(repository).nullId]);
   const abbrevIds = [...widthIds];
   for (const p of [...planned, ...followed, ...opportunistic]) {
     abbrevIds.push(p.oid);
@@ -871,7 +883,15 @@ export async function lsRefs(
   const caps = connection.capabilities;
   const body: Uint8Array[] = [encodePacketLine("command=ls-refs")];
   if (caps.has("agent")) body.push(encodePacketLine(`agent=${CLIENT_AGENT}`));
-  if (caps.get("object-format") === "sha1") body.push(encodePacketLine("object-format=sha1"));
+  // connect.c's send_capabilities: the server's format echoed (ls-refs never refuses another
+  // one: ls-remote lists a SHA-256 remote from a SHA-1 repository); its ids are of that format
+  const format = remoteObjectFormat(caps);
+  if (!format) {
+    throw new TransportError(
+      `unknown object format '${caps.get("object-format")}' specified by server`,
+    );
+  }
+  if (caps.has("object-format")) body.push(encodePacketLine(`object-format=${format.name}`));
   body.push(encodeDelim());
   body.push(encodePacketLine("symrefs"));
   body.push(encodePacketLine("peel"));
@@ -888,7 +908,7 @@ export async function lsRefs(
     if (!oid || !name) throw new TransportError(`Unexpected ls-refs line: ${line}`);
     const ref: RemoteRef = { name };
     if (oid !== "unborn") {
-      if (!/^[0-9a-f]{40}$/.test(oid)) throw new TransportError(`Unexpected ls-refs line: ${line}`);
+      if (!isObjectIdOf(oid, format)) throw new TransportError(`Unexpected ls-refs line: ${line}`);
       ref.oid = oid;
     }
     for (const attr of parts.slice(2)) {
@@ -968,10 +988,11 @@ export async function fetchPromisedObjects(
   const { repository } = options;
   const wants = [...new Set(options.ids)];
   if (wants.length === 0) throw new Error("fetchPromisedObjects: nothing to fetch");
-  const received = new ReceivedObjects();
+  const received = new ReceivedObjects(formatOf(repository).rawLength);
   const outgoing = new Set<string>();
   const fetched = await fetchPack(connection, negotiatorSource(repository), {
     wants,
+    ...(repository.objectFormat ? { objectFormat: repository.objectFormat } : {}),
     localTips: [],
     shallow: [...(options.shallow ?? [])],
     ...(options.filter ? { filter: options.filter } : {}),

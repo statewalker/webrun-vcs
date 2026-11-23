@@ -2,6 +2,7 @@
  * Which local refs a fetch writes, and whether it may (git's update_local_ref).
  */
 
+import { nullObjectIdLike } from "@statewalker/vcs-utils/hash";
 import type { RepositoryFacade } from "../api/repository-facade.js";
 import type { RefStore } from "../context/process-context.js";
 import type { RefSpec } from "../protocol/index.js";
@@ -114,7 +115,7 @@ export function mapRefs(
       }
       continue;
     }
-    if (/^[0-9a-f]{40}$/.test(spec.source)) {
+    if (isFullHexId(spec.source)) {
       add({
         remoteRef: spec.source,
         localRef: localRefOf(spec.destination),
@@ -149,7 +150,7 @@ export function missingSources(
   const missing: string[] = [];
   for (const spec of refspecs.map(parseRefSpec)) {
     if (spec.negative || !spec.source || spec.wildcard) continue;
-    if (/^[0-9a-f]{40}$/.test(spec.source)) continue;
+    if (isFullHexId(spec.source)) continue;
     if (!dwimRef(spec, byName)?.oid) missing.push(spec.source);
   }
   return missing;
@@ -161,7 +162,7 @@ export function refPrefixes(refspecs: readonly string[]): string[] {
   for (const spec of refspecs.map(parseRefSpec)) {
     if (spec.negative || !spec.source) continue;
     const source = spec.source;
-    if (/^[0-9a-f]{40}$/.test(source)) continue;
+    if (isFullHexId(source)) continue;
     if (spec.wildcard) {
       prefixes.add(source.slice(0, source.indexOf("*")));
     } else if (source.startsWith("refs/") || source === "HEAD") {
@@ -345,7 +346,7 @@ export async function applyRefUpdates(
   if (!refStore.batch) {
     for (const u of writes) await refStore.update(u.localRef, u.newOid);
     // the zero id deletes, as in a push command
-    for (const name of deletes) await refStore.update(name, ZERO_OID);
+    for (const name of deletes) await refStore.update(name, nullObjectIdLike(writes[0]?.newOid));
     return undefined;
   }
   if (options.atomic) {
@@ -404,7 +405,10 @@ export async function applyRefUpdates(
   return undefined;
 }
 
-const ZERO_OID = "0000000000000000000000000000000000000000";
+/** A refspec source that is a full object id (of either format: the remote's ids). */
+function isFullHexId(source: string): boolean {
+  return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(source);
+}
 
 /**
  * The error git's ref transaction reports when an atomic fetch's commit fails: for a name
@@ -439,8 +443,9 @@ async function transactionError(
   const first = rejected[0];
   const update = writes.find((u) => u.localRef === first?.name);
   if (first?.reason === "mismatch" && update) {
-    const now = (await refStore.get(update.localRef)) ?? ZERO_OID;
-    return `cannot lock ref '${update.localRef}': is at ${now} but expected ${update.oldOid ?? ZERO_OID}`;
+    const zero = nullObjectIdLike(update.newOid);
+    const now = (await refStore.get(update.localRef)) ?? zero;
+    return `cannot lock ref '${update.localRef}': is at ${now} but expected ${update.oldOid ?? zero}`;
   }
   return `cannot lock ref '${first?.name ?? names[0]}': ${first?.reason ?? "transaction failed"}`;
 }

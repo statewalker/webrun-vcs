@@ -13,9 +13,6 @@ import { BufferedByteReader } from "@statewalker/vcs-utils/streams";
 /** Pack file signature "PACK" (0x5041434B) */
 const PACK_SIGNATURE = 0x5041434b;
 
-/** SHA-1 hash size in bytes */
-const HASH_SIZE = 20;
-
 /** Pack header size: 4 (magic) + 4 (version) + 4 (count) */
 const PACK_HEADER_SIZE = 12;
 
@@ -33,10 +30,13 @@ const REF_DELTA = 7;
  * checksum, then stops — without consuming any bytes beyond the pack.
  *
  * @param stream - Raw byte stream (e.g., from a duplex after pkt-line drain)
+ * @param hashSize - Raw bytes of the repository's ids: REF_DELTA bases and the trailing
+ *   checksum (20 for SHA-1, 32 for SHA-256)
  * @yields Chunks of pack data as they are read
  */
 export async function* readPackFromStream(
   stream: AsyncIterable<Uint8Array>,
+  hashSize = 20,
 ): AsyncGenerator<Uint8Array, Uint8Array> {
   const reader = new BufferedByteReader(stream[Symbol.asyncIterator]());
 
@@ -93,8 +93,8 @@ export async function* readPackFromStream(
       }
       yield new Uint8Array(ofsBytes);
     } else if (type === REF_DELTA) {
-      // REF_DELTA: read 20-byte base object ID
-      const baseId = await reader.readExact(HASH_SIZE);
+      // REF_DELTA: read the base object ID
+      const baseId = await reader.readExact(hashSize);
       yield baseId;
     }
 
@@ -103,8 +103,8 @@ export async function* readPackFromStream(
     yield compressedData;
   }
 
-  // 3. Read and yield the 20-byte pack checksum
-  const checksum = await reader.readExact(HASH_SIZE);
+  // 3. Read and yield the pack checksum
+  const checksum = await reader.readExact(hashSize);
   yield checksum;
 
   // Return any leftover bytes so the caller can restore them

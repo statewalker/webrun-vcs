@@ -15,7 +15,13 @@ export interface RevisionSource {
   /** The local objects: existence, commits (parents, tree), tags, abbreviated ids */
   repository: Pick<
     RepositoryFacade,
-    "has" | "getCommitInfo" | "peelTag" | "getObjectType" | "getTagInfo" | "resolvePrefix"
+    | "has"
+    | "getCommitInfo"
+    | "peelTag"
+    | "getObjectType"
+    | "getTagInfo"
+    | "resolvePrefix"
+    | "objectFormat"
   >;
 }
 
@@ -94,10 +100,17 @@ async function resolveBase(base: string, source: RevisionSource): Promise<string
     const oid = source.refs.get(rule.replace("%s", base));
     if (oid) return oid;
   }
-  if (/^[0-9a-f]{40}$/.test(base)) {
+  // a full id of the repository's width (git's get_oid_hex: the_hash_algo's hexsz)
+  const hex = source.repository.objectFormat?.hexLength ?? 40;
+  if (base.length === hex && /^[0-9a-f]+$/.test(base)) {
     return (await source.repository.has(base)) ? base : undefined;
   }
-  if (/^[0-9a-f]{4,39}$/.test(base) && source.repository.resolvePrefix) {
+  if (
+    base.length >= 4 &&
+    base.length < hex &&
+    /^[0-9a-f]+$/.test(base) &&
+    source.repository.resolvePrefix
+  ) {
     const found = await source.repository.resolvePrefix(base);
     return found.length === 1 ? found[0] : undefined;
   }

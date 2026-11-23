@@ -56,8 +56,8 @@ import {
   serverPushHandlers,
   serverPushTransitions,
 } from "../../fsm/push/server-push-fsm.js";
-import { ZERO_OID } from "../../protocol/constants.js";
 import { receivePackRefs, visibleRefs } from "../../protocol/hidden-refs.js";
+import { formatOf, v0ObjectFormatCapabilities } from "../../protocol/object-format.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import { readStreamWithIdleTimeout, withWriteTimeout } from "../../utils/idle-timeout.js";
 import { createSimpleDuplex } from "./http-duplex.js";
@@ -552,6 +552,8 @@ export async function handleInfoRefs(
   if (version1) chunks.push(encodePacketLine("version 1\n"));
 
   // Default capabilities (copied: the symref below must not change the caller's array)
+  // `object-format=sha256` for a SHA-256 repository (a SHA-1 one advertises as before)
+  const format = formatOf(repository);
   const capabilities = withFilterCapability(
     options.capabilities ?? DEFAULT_UPLOAD_PACK_CAPABILITIES,
     options.uploadPackFilter,
@@ -566,9 +568,10 @@ export async function handleInfoRefs(
   }
 
   // First ref with capabilities
+  const advertised = v0ObjectFormatCapabilities(capabilities, format);
   if (refs.length > 0) {
     const [firstRefName, firstOid] = refs[0] as [string, string];
-    const capsStr = capabilities.join(" ");
+    const capsStr = advertised.join(" ");
     chunks.push(encodePacketLine(`${firstOid} ${firstRefName}\0${capsStr}\n`));
     const firstPeeled = await peelFully(repository, firstOid);
     if (firstPeeled) chunks.push(encodePacketLine(`${firstPeeled} ${firstRefName}^{}\n`));
@@ -581,9 +584,9 @@ export async function handleInfoRefs(
       if (peeled) chunks.push(encodePacketLine(`${peeled} ${refName}^{}\n`));
     }
   } else {
-    // Empty repo - send capabilities with zero OID
-    const capsStr = capabilities.join(" ");
-    chunks.push(encodePacketLine(`${ZERO_OID} capabilities^{}\0${capsStr}\n`));
+    // Empty repo - send capabilities with the null id
+    const capsStr = advertised.join(" ");
+    chunks.push(encodePacketLine(`${format.nullId} capabilities^{}\0${capsStr}\n`));
   }
   // git's advertise_shallow_grafts: a shallow repository's shallow commits after the refs
   for (const oid of (await refStore.getShallow?.()) ?? []) {
@@ -665,7 +668,7 @@ export function isProtocolV2Request(
  */
 export function handleInfoRefsV2(
   options: HttpServerOptions = {},
-  repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType">,
+  repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType" | "objectFormat">,
 ): HttpResponse {
   const unreadable = uploadPackConfigError(options);
   if (unreadable) return unreadable;
@@ -939,7 +942,7 @@ export async function handleReceivePackInfoRefs(
   refStore: RefStore,
   options: HttpServerOptions = {},
   version1 = false,
-  repository?: Pick<RepositoryFacade, "alternateRefs">,
+  repository?: Pick<RepositoryFacade, "alternateRefs" | "objectFormat">,
 ): Promise<HttpResponse> {
   // receive-pack dies reading its config (receive.procReceiveRefs without a value): nothing
   // is advertised, the response a server error
@@ -966,7 +969,12 @@ export async function handleReceivePackInfoRefs(
   if (version1) chunks.push(encodePacketLine("version 1\n"));
 
   // Default capabilities for receive-pack
-  const capabilities = options.capabilities ?? RECEIVE_PACK_CAPABILITIES;
+  // `object-format=sha256` for a SHA-256 repository (a SHA-1 one advertises as before)
+  const format = formatOf(repository);
+  const capabilities = v0ObjectFormatCapabilities(
+    options.capabilities ?? RECEIVE_PACK_CAPABILITIES,
+    format,
+  );
 
   // First ref with capabilities
   if (refs.length > 0) {
@@ -980,9 +988,9 @@ export async function handleReceivePackInfoRefs(
       chunks.push(encodePacketLine(`${oid} ${refName}\n`));
     }
   } else {
-    // Empty repo - send capabilities with zero OID
+    // Empty repo - send capabilities with the null id
     const capsStr = capabilities.join(" ");
-    chunks.push(encodePacketLine(`${ZERO_OID} capabilities^{}\0${capsStr}\n`));
+    chunks.push(encodePacketLine(`${format.nullId} capabilities^{}\0${capsStr}\n`));
   }
 
   chunks.push(encodeFlush());

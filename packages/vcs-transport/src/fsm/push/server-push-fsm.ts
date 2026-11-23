@@ -44,6 +44,12 @@ import {
 import type { RefStore } from "../../context/process-context.js";
 import type { ProtocolState } from "../../context/protocol-state.js";
 import { isRefHidden, receivePackRefs } from "../../protocol/hidden-refs.js";
+import {
+  formatOf,
+  isNullId,
+  isObjectIdOf,
+  v0ObjectFormatCapabilities,
+} from "../../protocol/object-format.js";
 import { encodeFlush, encodePacketLine } from "../../protocol/pkt-line-codec.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { isAncestorOf, PushConnectivity } from "./connectivity.js";
@@ -66,7 +72,7 @@ import {
   type ReceivePackHookContext,
   type ReceivePackHooks,
 } from "./receive-pack-types.js";
-import { type PushCommand, type PushCommandType, ZERO_OID } from "./types.js";
+import type { PushCommand, PushCommandType } from "./types.js";
 
 /**
  * Server push FSM transitions.
@@ -152,8 +158,6 @@ export const RECEIVE_PACK_CAPABILITIES: readonly string[] = [
   "quiet",
 ];
 
-const OID = /^[0-9a-f]{40}$/;
-
 /** The reason given for every command when the authorize hook throws (details: the log). */
 const AUTHORIZE_FAILED = "authorization failed";
 
@@ -187,7 +191,12 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const output = getOutput(ctx);
       try {
         const refs = await refStore.listAll();
-        const capabilities = getConfig(ctx).serverCapabilities ?? RECEIVE_PACK_CAPABILITIES;
+        // `object-format=sha256` for a SHA-256 repository (a SHA-1 one advertises as before)
+        const format = formatOf(getRepository(ctx));
+        const capabilities = v0ObjectFormatCapabilities(
+          getConfig(ctx).serverCapabilities ?? RECEIVE_PACK_CAPABILITIES,
+          format,
+        );
 
         let first = true;
         // the refs under refs/ but the hidden ones (git's receive.hideRefs): never HEAD
@@ -204,7 +213,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
 
         // Empty repository
         if (refsArray.length === 0 && haves.length === 0) {
-          await transport.writeLine(`${ZERO_OID} capabilities^{}\0${capabilities.join(" ")}`);
+          await transport.writeLine(`${format.nullId} capabilities^{}\0${capabilities.join(" ")}`);
           await transport.writeFlush();
           // READ_COMMANDS populates state.capabilities with the client's request.
           return "EMPTY_REPO";
@@ -242,6 +251,9 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       try {
         const pushCommands: PushCommand[] = [];
         const shallow: string[] = [];
+        // ids are read in the repository's format (git's get_oid_hex / parse_oid_hex)
+        const format = formatOf(getRepository(ctx));
+        const OID = { test: (id: string) => isObjectIdOf(id, format) };
 
         while (true) {
           const pkt = await transport.readPktLine();
@@ -269,10 +281,18 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           // Capabilities after a NUL (the first command carries them)
           const nul = line.indexOf("\0");
           if (nul >= 0) {
-            for (const c of line.slice(nul + 1).split(" ")) {
+            const features = line.slice(nul + 1).split(" ");
+            for (const c of features) {
               if (c) state.capabilities.add(c);
             }
             line = line.slice(0, nul);
+            // read_head_info: a client naming no object format speaks SHA-1; another one
+            // than the repository's dies (git: `die("error: unsupported object format ...")`)
+            const named = features.find((c) => c.startsWith("object-format="));
+            const hash = named ? named.slice("object-format=".length) : "sha1";
+            if (hash !== format.name) {
+              return protocolError(ctx, `error: unsupported object format '${hash}'`);
+            }
           }
 
           // old-oid SP new-oid SP refname (indexOf, not split with a limit: it truncates)
@@ -286,9 +306,9 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           }
 
           let type: PushCommandType;
-          if (newOid === ZERO_OID) {
+          if (isNullId(newOid)) {
             type = "DELETE";
-          } else if (oldOid === ZERO_OID) {
+          } else if (isNullId(oldOid)) {
             type = "CREATE";
           } else {
             type = "UPDATE"; // fast-forward checked later
@@ -422,7 +442,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
             await rp.discardPack();
           } else if (rp.drainRefusedPack) {
             try {
-              for await (const _ of transport.readRawPack()) {
+              for await (const _ of transport.readRawPack(formatOf(getRepository(ctx)).rawLength)) {
                 // discarded
               }
             } catch {
@@ -434,7 +454,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
 
         // The client sends the raw pack after the pkt-line commands, whatever side-band says
         // (side-band is for the server's answer only).
-        state.packStream = transport.readRawPack();
+        state.packStream = transport.readRawPack(formatOf(getRepository(ctx)).rawLength);
         return "PACK_RECEIVED";
       } catch (e) {
         output.error = String(e);
@@ -992,6 +1012,11 @@ function receivePackHooks(ctx: ProcessContext): ReceivePackHooks | undefined {
   return receivePackConfig(ctx).hooks ?? (ctx as ContextWithHooks).hooks;
 }
 
+/** The null id of the format `like` is an id of (a command's other id). */
+function nullIdOf(like: string): string {
+  return "0".repeat(like.length === 64 ? 64 : 40);
+}
+
 function protocolError(ctx: ProcessContext, message: string): string {
   const output = getOutput(ctx);
   output.error = message;
@@ -1308,10 +1333,10 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
     // git deletes an existing ref even when the client sent the zero id as its old value
     // ("allowing deletion of corrupt ref"); the deletion rules still apply here
     const existing = state.refs.get(name);
-    if (isDelete && cmd.oldOid === ZERO_OID && existing !== undefined) {
+    if (isDelete && isNullId(cmd.oldOid) && existing !== undefined) {
       cmd.expectedOid = existing;
     }
-    if (isDelete && (cmd.oldOid !== ZERO_OID || existing !== undefined)) {
+    if (isDelete && (!isNullId(cmd.oldOid) || existing !== undefined)) {
       if (config.allowDeletes === false && name.startsWith("refs/heads/")) {
         await sendError(ctx, `denying ref deletion for ${name}`);
         cmd.result = "REJECTED_NODELETE";
@@ -1337,13 +1362,13 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
     }
 
     // the old value the client saw (git's ref transaction checks it, when it commits)
-    const current = existing ?? ZERO_OID;
-    if (cmd.oldOid !== current && !(isDelete && cmd.oldOid === ZERO_OID)) {
+    const current = existing ?? formatOf(getRepository(ctx)).nullId;
+    if (cmd.oldOid !== current && !(isDelete && isNullId(cmd.oldOid))) {
       await sendError(
         ctx,
-        current === ZERO_OID
+        isNullId(current)
           ? `cannot lock ref '${name}': unable to resolve reference '${name}'`
-          : cmd.oldOid === ZERO_OID
+          : isNullId(cmd.oldOid)
             ? `cannot lock ref '${name}': reference already exists`
             : `cannot lock ref '${name}': is at ${current} but expected ${cmd.oldOid}`,
       );
@@ -1451,7 +1476,7 @@ async function validateCommands(ctx: ProcessContext): Promise<void> {
   if (!atomic && !eager && rp.batchNonAtomic === true && batch && !state.shallowConnectivity) {
     for (const deletions of [true, false]) {
       const phase = commands.filter(
-        (c) => c.result === "NOT_ATTEMPTED" && (c.newOid === ZERO_OID) === deletions,
+        (c) => c.result === "NOT_ATTEMPTED" && isNullId(c.newOid) === deletions,
       );
       if (phase.length === 0) continue;
       for (const cmd of phase) await check(cmd);
@@ -1522,7 +1547,7 @@ function isAncestor(ctx: ProcessContext, ancestor: string, oid: string): Promise
  * not among the commands post-receive and post-update are told of: `did_not_exist`).
  */
 function isNoop(cmd: PushCommand): boolean {
-  return cmd.oldOid === ZERO_OID && cmd.newOid === ZERO_OID && cmd.expectedOid === undefined;
+  return isNullId(cmd.oldOid) && isNullId(cmd.newOid) && cmd.expectedOid === undefined;
 }
 
 /** The batch command for a push command; git's zero id means "absent" on both sides. */
@@ -1531,8 +1556,8 @@ function toRefCommand(cmd: PushCommand): RefCommand {
   if (isNoop(cmd)) return { name: cmd.refName, new: null, noDeref: true };
   return {
     name: cmd.refName,
-    old: cmd.expectedOid ?? (cmd.oldOid === ZERO_OID ? null : cmd.oldOid),
-    new: cmd.newOid === ZERO_OID ? null : cmd.newOid,
+    old: cmd.expectedOid ?? (isNullId(cmd.oldOid) ? null : cmd.oldOid),
+    new: isNullId(cmd.newOid) ? null : cmd.newOid,
     noDeref: true, // receive-pack names refs directly, as git does
   };
 }
@@ -1722,7 +1747,7 @@ async function applyOneByOne(
 
   for (const cmd of pending) {
     try {
-      await refStore.update(cmd.refName, cmd.type === "DELETE" ? ZERO_OID : cmd.newOid);
+      await refStore.update(cmd.refName, cmd.type === "DELETE" ? nullIdOf(cmd.oldOid) : cmd.newOid);
       cmd.result = "OK";
       appliedCommands.push(cmd);
     } catch (e) {
@@ -1897,7 +1922,7 @@ function postReceiveCommands(state: ServerPushState): ReceiveCommand[] {
         refName: report.refName ?? cmd.refName,
         oldOid,
         newOid,
-        type: newOid === ZERO_OID ? "DELETE" : oldOid === ZERO_OID ? "CREATE" : "UPDATE",
+        type: isNullId(newOid) ? "DELETE" : isNullId(oldOid) ? "CREATE" : "UPDATE",
         pushedRef: cmd.refName,
         report: i,
       });

@@ -10,6 +10,7 @@
 import type { PktLineResult } from "../../api/transport-api.js";
 import type { ProcessContext } from "../../context/process-context.js";
 import { isRefHidden, visibleRefs } from "../../protocol/hidden-refs.js";
+import { formatOf, isObjectIdOf } from "../../protocol/object-format.js";
 import {
   authorizeUpload,
   computeShallowUpdate,
@@ -812,7 +813,7 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           if (size) await writeRaw(ctx, "size");
           if (type) await writeRaw(ctx, "type");
           for (const oid of objectIds) {
-            if (!OID_PATTERN.test(oid)) {
+            if (!isObjectIdOf(oid, formatOf(ctx.repository))) {
               await writeRaw(
                 ctx,
                 `ERR object-info: protocol error, expected to get oid, not '${oid}'`,
@@ -899,8 +900,6 @@ const V2_COMMANDS = new Set(["ls-refs", "fetch", "object-info"]);
 
 /** Object formats git knows (`object-format=` of a request). */
 const KNOWN_OBJECT_FORMATS = new Set(["sha1", "sha256"]);
-
-const OID_PATTERN = /^[0-9a-f]{40}$/;
 
 const textEncoder = new TextEncoder();
 

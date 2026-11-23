@@ -4,8 +4,9 @@
  * (up to date, fast-forward, fetch first, non-fast-forward, tags, `--force-with-lease`).
  */
 
+import { isHexObjectId, type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { RemoteRef } from "../fetch-client/index.js";
-import { ZERO_OID } from "../protocol/index.js";
+import { isNullId } from "../protocol/object-format.js";
 import type { AbbrevLengths } from "../summary/index.js";
 import { pushStatusParts } from "./push-status.js";
 
@@ -47,13 +48,13 @@ export interface PushRefUpdate {
    * `HEAD` (also for `@`), or the object name as written (`HEAD~1`, an id)
    */
   source?: string;
-  /** The remote's value in its advertisement ({@link ZERO_OID}: absent): the command's old id */
+  /** The remote's value in its advertisement (the null id: absent): the command's old id */
   oldOid: string;
-  /** The value pushed ({@link ZERO_OID}: a delete) */
+  /** The value pushed (the null id: a delete) */
   newOid: string;
   /** Whether the update may be a non-fast-forward (`+`, `force`, or a lease that holds) */
   force: boolean;
-  /** `--force-with-lease`: the value the remote ref must have ({@link ZERO_OID}: absent) */
+  /** `--force-with-lease`: the value the remote ref must have (the null id: absent) */
   expectedOid?: string;
   status: PushRefStatus;
   /** Whether an update that is not a fast-forward was allowed by force */
@@ -120,9 +121,12 @@ export interface MatchPushRefsOptions {
    * (`git push --prune`; with `+refs/*:refs/*`, `--mirror`)
    */
   prune?: boolean;
+  /**
+   * The local repository's object format (SHA-1 when absent): the null id of creations and
+   * deletions, the width of an object id given as a source
+   */
+  objectFormat?: ObjectFormat;
 }
-
-const OID_PATTERN = /^[0-9a-f]{40}$/;
 
 /** git's error for a short destination it cannot place (remote.c). */
 function unqualifiedDestination(dst: string, src: string): PushRefspecError {
@@ -206,6 +210,8 @@ export async function matchPushRefs(
   remoteRefs: readonly Pick<RemoteRef, "name" | "oid">[],
   options: MatchPushRefsOptions = {},
 ): Promise<MatchedPushRef[]> {
+  const format = options.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const ZERO_OID = format.nullId;
   const remote = new Map<string, string>();
   for (const ref of remoteRefs) {
     if (ref.oid && ref.name.startsWith("refs/")) remote.set(ref.name, ref.oid);
@@ -256,7 +262,7 @@ export async function matchPushRefs(
         source = "HEAD";
       } else {
         const oid =
-          OID_PATTERN.test(p.src) && (await local.hasObject?.(p.src))
+          isHexObjectId(p.src, format) && (await local.hasObject?.(p.src))
             ? p.src
             : await local.resolveRevision?.(p.src);
         if (!oid) throw new PushRefspecError(`src refspec ${p.src} does not match any`);
@@ -281,7 +287,7 @@ export async function matchPushRefs(
         remoteRef = match;
       } else if (dst.startsWith("refs/")) {
         remoteRef = dst;
-      } else if (newOid === ZERO_OID) {
+      } else if (isNullId(newOid)) {
         throw new PushRefspecError(`unable to delete '${dst}': remote ref does not exist`);
       } else if (srcRef?.startsWith("refs/heads/")) {
         remoteRef = `refs/heads/${dst}`;
@@ -382,7 +388,7 @@ export interface ForceWithLease {
   ref?: string;
   /**
    * The value it must have: an object id or any revision here (`main~1`, an abbreviated id);
-   * {@link ZERO_OID} or "" for "must not exist". Omitted: the remote ref's remote-tracking value
+   * the null id or "" for "must not exist". Omitted: the remote ref's remote-tracking value
    * here (see `PushClientOptions.trackingValue`).
    */
   expect?: string;
@@ -417,7 +423,7 @@ export async function setPushStatus(
   const updates: PushRefUpdate[] = [];
   for (const m of matched) {
     let force = m.force || !!options.force;
-    const deletion = m.newOid === ZERO_OID;
+    const deletion = isNullId(m.newOid);
     const expectedOid = options.leases?.get(m.remoteRef);
     const update: PushRefUpdate = {
       remoteRef: m.remoteRef,
@@ -438,7 +444,7 @@ export async function setPushStatus(
       continue;
     }
     let reject: PushRefStatus | undefined;
-    if (!deletion && m.oldOid !== ZERO_OID) {
+    if (!deletion && !isNullId(m.oldOid)) {
       if (m.remoteRef.startsWith("refs/tags/")) reject = "rejected-already-exists";
       else if (!(await objects.has(m.oldOid))) reject = "rejected-fetch-first";
       else {

@@ -7,10 +7,12 @@
  * git://). Either speaks protocol v2 when the server does, protocol v0 otherwise.
  */
 
+import { SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { Credentials } from "../api/credentials.js";
 import { type Duplex, endDuplex } from "../api/duplex.js";
 import { authorizationHeader } from "../operations/http-auth.js";
 import { AuthenticationError, ServerError, TransportError } from "../protocol/index.js";
+import { isObjectIdOf, remoteObjectFormat } from "../protocol/object-format.js";
 import { anonymizeUrl } from "./fetch-head.js";
 import { abortErrorOf, IdleTimer } from "./idle-timer.js";
 import { type Pkt, PktStream } from "./pkt-stream.js";
@@ -356,18 +358,21 @@ export async function readServerGreeting(
         line = line.slice(0, nul);
       }
     }
+    // the ids are of the format the first line names (connect.c's process_capabilities:
+    // `object-format=<hash>`, SHA-1 without one or for a name git does not know)
+    const format = remoteObjectFormat(capabilities) ?? SHA1_OBJECT_FORMAT;
     if (line.startsWith("shallow ")) {
       // a shallow server's shallow commits (get_remote_heads: after the refs)
       const oid = line.slice(8).trim();
-      if (!/^[0-9a-f]{40}$/.test(oid)) throw new TransportError(`protocol error: ${line}`);
+      if (!isObjectIdOf(oid, format)) throw new TransportError(`protocol error: ${line}`);
       shallow.push(oid);
       pkt = await pkts.read();
       continue;
     }
     const space = line.indexOf(" ");
-    if (space === 40) {
-      const oid = line.slice(0, 40);
-      const name = line.slice(41);
+    if (space === format.hexLength) {
+      const oid = line.slice(0, space);
+      const name = line.slice(space + 1);
       if (name.endsWith("^{}")) {
         const tag = byName.get(name.slice(0, -3));
         if (tag) tag.peeled = oid;

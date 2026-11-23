@@ -25,7 +25,6 @@ import {
   type SymbolicRef,
   TreeDepthError,
 } from "@statewalker/vcs-core";
-import { assertSha1ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type {
   CommitGraphInfo,
   ExportPackOptions,
@@ -96,9 +95,6 @@ export interface HistoryFacadeConfig {
  * ```
  */
 export function createRepositoryFacade(config: HistoryFacadeConfig): RepositoryFacade {
-  // the protocols' object-format capability and SHA-256 packs are not implemented yet: a
-  // SHA-256 repository is neither served nor fetched into
-  assertSha1ObjectFormat(objectFormatOf(config.history), "fetch, push and serving");
   const facade = createRepositoryFacadeFromHistory(
     config.history,
     config.useBitmaps,
@@ -192,6 +188,8 @@ function createRepositoryFacadeFromHistory(
     return sparseFilterPatterns(new TextDecoder().decode(object.content));
   };
   const facade: RepositoryFacade = {
+    // the hash of the ids: the `object-format` capability, the null id, id widths
+    objectFormat: objectFormatOf(history),
     // the alternates' refs, for receive-pack's `.have` lines
     ...(alternates ? { alternateRefs: () => alternates.refs() } : {}),
     // ─────────────────────────────────────────────────────────────────
@@ -384,7 +382,8 @@ function createRepositoryFacadeFromHistory(
 
     async abbrevLengths(ids: readonly string[], minLength: number): Promise<Map<string, number>> {
       if (!history.objects) {
-        const fixed = minLength < 0 ? 7 : minLength === 0 ? 40 : Math.min(minLength, 40);
+        const hex = objectFormatOf(history).hexLength;
+        const fixed = minLength < 0 ? 7 : minLength === 0 ? hex : Math.min(minLength, hex);
         return new Map(ids.map((id) => [id, fixed]));
       }
       return findAbbrevLengths(history.objects, ids, minLength);
@@ -479,7 +478,8 @@ async function resolveRevisionOf(
 ): Promise<string | undefined> {
   // get_oid_hex takes either case; a full id wins over a ref of that name
   const lower = /^[0-9a-fA-F]+$/.test(rev) ? rev.toLowerCase() : undefined;
-  if (lower?.length === 40) return (await facade.has(lower)) ? lower : undefined;
+  if (lower?.length === objectFormatOf(history).hexLength)
+    return (await facade.has(lower)) ? lower : undefined;
   const refs = new Map<string, string>();
   let head: string | undefined;
   for await (const ref of history.refs.list()) {
