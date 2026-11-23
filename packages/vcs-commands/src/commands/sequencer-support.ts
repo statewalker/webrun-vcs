@@ -49,6 +49,7 @@ import {
   worktreeDiffers,
   worktreeModified,
 } from "./worktree-overwrite-checks.js";
+import { firstInvalidPath, worktreePathRules } from "./worktree-path-rules.js";
 
 /** What resetting the index and worktree needs. */
 export interface SequencerContext extends MergeWriteContext {
@@ -163,6 +164,9 @@ async function resetMergeWith(
     paths: [path],
   });
   const notUptodate = (path: string) => refuse(`Entry '${path}' not uptodate. Cannot merge.`, path);
+  // add_index_entry's verify_path: a path git refuses stops the reset before any write
+  const invalid = firstInvalidPath(target, index, worktreePathRules(ctx.workingCopy, ctx.worktree));
+  if (invalid !== undefined) return refusedWith(refuse(`invalid path '${invalid}'`, invalid));
   // verify_uptodate_1: an entry whose flags cheat (assume-unchanged, skip-worktree) is checked
   // by its stat even by a hard reset; any other only when not resetting hard
   const notUptodateEntry = async (i: CheckedEntry): Promise<boolean> => {
@@ -425,6 +429,9 @@ async function resetKeepWith(
     paths: [path],
   });
   const notUptodate = (path: string) => refuse(`Entry '${path}' not uptodate. Cannot merge.`, path);
+  // add_index_entry's verify_path: a path git refuses stops the reset before any write
+  const invalid = firstInvalidPath(target, index, worktreePathRules(ctx.workingCopy, ctx.worktree));
+  if (invalid !== undefined) return refusedWith(refuse(`invalid path '${invalid}'`, invalid));
   const changes: string[] = [];
   const removing = new Set<string>();
   const paths = [...new Set([...index.keys(), ...head.keys(), ...target.keys()])].sort(

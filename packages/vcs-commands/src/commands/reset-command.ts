@@ -18,6 +18,7 @@ import {
   type Worktree,
   withWorktreeEntries,
 } from "@statewalker/vcs-working-tree";
+import { InvalidPathError } from "../errors/checkout-errors.js";
 import {
   IncompatibleOptionsError,
   InvalidArgumentError,
@@ -54,6 +55,7 @@ import { moveHeadAsReset, removeBranchState, resetKeep, resetMerge } from "./seq
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import { flaggedEntryDiffers, pruneEmptyParents } from "./worktree-overwrite-checks.js";
+import { treePathRefusal, worktreePathRules } from "./worktree-path-rules.js";
 
 /** Names this operation in restore failure messages. */
 const RESET_HARD = "reset --hard";
@@ -377,6 +379,29 @@ export class ResetCommand extends GitCommand<Ref> {
           `fatal: Cannot do a ${this.mode} reset in the middle of a merge.`,
         );
       }
+    }
+    // unpack-trees' add_index_entry (verify_path): a target tree holding a path git refuses
+    // (or an entry it cannot decode) stops the reset before the index, worktree or HEAD move
+    if (this.mode !== ResetMode.SOFT) {
+      const commit = await this.commits.load(targetId);
+      const refusal = commit
+        ? await treePathRefusal(
+            this.trees,
+            commit.tree,
+            worktreePathRules(this.workingCopy, this.worktreeAccess),
+          )
+        : undefined;
+      if (refusal instanceof InvalidPathError) {
+        // a mixed reset reads the tree through a diff (read_from_tree's make_cache_entry),
+        // the others through unpack-trees (reset_index)
+        throw new ResetRefusedError(
+          this.mode === ResetMode.MIXED
+            ? `${refusal.message}\nfatal: make_cache_entry failed for path '${refusal.path}'`
+            : `${refusal.message}\nfatal: Could not reset index file to revision '${targetRef}'.`,
+          [refusal.path],
+        );
+      }
+      if (refusal) throw refusal;
     }
     // --merge and --keep: the index and worktree first, refused before anything changes
     if (this.mode === ResetMode.MERGE || this.mode === ResetMode.KEEP) {
@@ -888,7 +913,7 @@ export async function restoreWorktreeHard(
   const fullPlan = await planTreeRestore(trees, blobs, treeId, RESET_HARD, {
     symlinks: true,
     ...(await restoreCaseOptions(worktree, coreBool(workingCopy, "ignorecase", false))),
-    windows: worktree.capabilities?.windowsPaths === true,
+    ...worktreePathRules(workingCopy, worktree),
     reservedNames: worktree.capabilities?.reservedNames,
   });
   // a skip-worktree entry the tree keeps is not checked out (oneway_merge skips it); in a

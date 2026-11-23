@@ -53,6 +53,7 @@ import {
   pruneEmptyParents,
   removeCaseVariants,
 } from "./worktree-overwrite-checks.js";
+import { firstInvalidPath, worktreePathRules } from "./worktree-path-rules.js";
 
 const sameEntry = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
   a === undefined || b === undefined ? a === b : a.objectId === b.objectId && a.mode === b.mode;
@@ -441,7 +442,7 @@ export async function planPathsRestore(
   const worktree = ctx.worktree;
   const options = {
     symlinks: true,
-    windows: worktree?.capabilities?.windowsPaths === true,
+    ...worktreePathRules(ctx.workingCopy, worktree),
     reservedNames: worktree?.capabilities?.reservedNames,
   };
   const caseOptions = await restoreCaseOptions(
@@ -921,6 +922,14 @@ async function switchTreesWith(
   sparse: SparseUnpack | undefined,
 ): Promise<{ refused?: MergeRefusal; written: Set<string> }> {
   const { index, unmerged } = await readIndex(ctx.staging);
+  // add_index_entry's verify_path: a path git refuses stops the switch before any write
+  const invalid = firstInvalidPath(target, index, worktreePathRules(ctx.workingCopy, ctx.worktree));
+  if (invalid !== undefined) {
+    return {
+      refused: { message: `error: invalid path '${invalid}'`, paths: [invalid] },
+      written: new Set(),
+    };
+  }
   // a path staying outside the sparse checkout: neither checked nor touched in the worktree
   const quiet = (path: string) => sparse?.leavesAlone(path) === true;
   const update = options.update !== false;

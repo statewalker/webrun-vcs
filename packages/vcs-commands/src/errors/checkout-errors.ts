@@ -84,3 +84,32 @@ export class SwitchRefusedError extends GitApiError {
     this.name = "SwitchRefusedError";
   }
 }
+
+/**
+ * Thrown when a tree would put a path git's `verify_path` refuses into the index or the
+ * worktree (`.git` under any spelling `core.protectNTFS`/`core.protectHFS` cover, `..`, an
+ * empty or absolute component, a symlinked `.gitmodules`): git's `error: invalid path
+ * '<path>'`, given before anything is written. Commands that die there add their own lines
+ * (`reset --hard`'s `fatal: Could not reset index file to revision '<rev>'.`).
+ */
+export class InvalidPathError extends GitApiError {
+  /** The path refused, as git names it (the entry's full path) */
+  readonly path: string;
+
+  constructor(path: string, message?: string, exitCode?: number) {
+    super(message ?? `error: invalid path '${path}'`, exitCode === undefined ? {} : { exitCode });
+    this.name = "InvalidPathError";
+    this.path = path;
+  }
+}
+
+/**
+ * Thrown when a tree holds an entry with an empty name: git dies reading it
+ * (`decode_tree_entry`: `fatal: empty filename in tree entry`, exit 128).
+ */
+export class EmptyTreeEntryNameError extends GitApiError {
+  constructor() {
+    super("fatal: empty filename in tree entry");
+    this.name = "EmptyTreeEntryNameError";
+  }
+}

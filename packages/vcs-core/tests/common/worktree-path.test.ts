@@ -3,6 +3,7 @@ import {
   assertValidWorktreePath,
   isGitWorktreeFile,
   isValidWorktreePath,
+  protectHFSDefault,
 } from "../../src/index.js";
 
 // git's verify_path with core.protectHFS and core.protectNTFS on (CVE-2014-9390): a tree path
@@ -164,5 +165,45 @@ describe("isGitWorktreeFile", () => {
   it("refuses a symlink at the NTFS fallback short name of .gitmodules", () => {
     expect(isValidWorktreePath("gi7eba~1", 0o120000)).toBe(false);
     expect(isValidWorktreePath("gi7eba~1", 0o100644)).toBe(true);
+  });
+});
+
+// core.protectNTFS / core.protectHFS turned off: verify_path still refuses `.git` in any case,
+// `.`, `..` and a symlinked `.gitmodules`, but no longer the filesystems' other spellings.
+describe("isValidWorktreePath with protections off", () => {
+  const off = { protectNTFS: false, protectHFS: false };
+  for (const path of [
+    "git~1/config",
+    ".git./config",
+    ".git /config",
+    "a\\.git\\config",
+    "‌.git/config",
+  ]) {
+    it(`accepts ${JSON.stringify(path)}`, () =>
+      expect(isValidWorktreePath(path, undefined, off)).toBe(true));
+  }
+  for (const path of [".git/config", ".GIT/config", "../x", "a/./b", ""]) {
+    it(`still refuses ${JSON.stringify(path)}`, () =>
+      expect(isValidWorktreePath(path, undefined, off)).toBe(false));
+  }
+  it("refuses a symlinked .gitmodules in any case, but not its NTFS short name", () => {
+    expect(isValidWorktreePath(".GitModules", 0o120000, off)).toBe(false);
+    expect(isValidWorktreePath("gitmod~1", 0o120000, off)).toBe(true);
+    expect(
+      isValidWorktreePath("gitmod~1", 0o120000, { protectNTFS: true, protectHFS: false }),
+    ).toBe(false);
+    expect(
+      isValidWorktreePath(".gitmodules‌", 0o120000, { protectNTFS: false, protectHFS: true }),
+    ).toBe(false);
+  });
+  it("applies each protection alone", () => {
+    expect(isValidWorktreePath("git~1/x", undefined, { protectHFS: false })).toBe(false);
+    expect(isValidWorktreePath("‌.git/x", undefined, { protectHFS: false })).toBe(true);
+    expect(isValidWorktreePath("‌.git/x", undefined, { protectNTFS: false })).toBe(false);
+  });
+  it("defaults protectHFS as git: on macOS only", () => {
+    expect(protectHFSDefault("Darwin")).toBe(true);
+    expect(protectHFSDefault("Linux")).toBe(false);
+    expect(protectHFSDefault(undefined)).toBe(false);
   });
 });

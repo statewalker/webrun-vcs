@@ -26,7 +26,9 @@ import {
   type LinkStats,
   normalizePath,
   type PosixFilesApi,
+  protectHFSDefault,
   readFile,
+  type WorktreePathOptions,
 } from "@statewalker/vcs-core";
 import { decodeGitPath, decodeGitPatternFile } from "@statewalker/vcs-utils/encoding";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
@@ -180,9 +182,17 @@ export class FileWorktree implements Worktree {
     return this.files.pathSeparators?.includes("\\") ?? false;
   }
 
-  /** The path rules of this worktree's platform (verify_path). */
-  private get pathRules(): { windows: boolean } {
-    return { windows: this.windowsPaths };
+  /**
+   * The path rules of this worktree's platform (verify_path): `core.protectNTFS` on, as git's
+   * default, `core.protectHFS` on macOS only (`protectHFSDefault` of the environment's
+   * system). Commands check tree paths with the configuration first (`worktreePathRules`).
+   */
+  private get pathRules(): WorktreePathOptions {
+    return {
+      windows: this.windowsPaths,
+      protectNTFS: true,
+      protectHFS: protectHFSDefault(this.environment?.systemName),
+    };
   }
 
   /** git init's case and Unicode folding probe, under the repository's `gitDir`. */

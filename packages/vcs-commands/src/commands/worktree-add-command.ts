@@ -10,12 +10,12 @@ import type {
   NewWorktreeHead,
   WorkingCopy,
 } from "@statewalker/vcs-working-tree";
-
 import { WorktreeError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { abbrevLengths, coreBool, worktreeModeTrust } from "./core-config.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
 import { checkoutFreshTree } from "./tree-restore.js";
+import { worktreePathRules } from "./worktree-path-rules.js";
 import {
   checkCandidatePath,
   refuseIfCheckedOut,
@@ -432,6 +432,7 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
         worktree,
         symlinks: worktreeModeTrust(workingCopy, worktree).symlinks,
         ignoreCase: coreBool(workingCopy, "ignorecase", false),
+        pathRules: worktreePathRules(workingCopy, worktree),
       },
       commit.tree,
       "worktree add",

@@ -15,9 +15,16 @@ async function read(files: ReturnType<typeof createInMemoryFilesApi>, path: stri
 }
 
 describe("FileWorktree refuses paths that name .git", () => {
-  const spellings = [".git", ".GIT", "git~1", ".git. ", "‌.git"];
+  // the HFS+ spelling (`‌.git`) only on macOS, as git's core.protectHFS default
+  const spellings: Array<[string, string | undefined]> = [
+    [".git", undefined],
+    [".GIT", undefined],
+    ["git~1", undefined],
+    [".git. ", undefined],
+    ["‌.git", "Darwin"],
+  ];
 
-  for (const dotgit of spellings) {
+  for (const [dotgit, systemName] of spellings) {
     it(`checkoutTree does not write through a tree entry ${JSON.stringify(dotgit)}`, async () => {
       const files = createInMemoryFilesApi();
       await files.write("/repo/.git/config", [enc.encode("original")]);
@@ -36,6 +43,7 @@ describe("FileWorktree refuses paths that name .git", () => {
         rootPath: "/repo",
         blobs: stores.blobs,
         trees: stores.trees,
+        ...(systemName ? { environment: { systemName, readFile: async () => undefined } } : {}),
       });
 
       const result = await worktree.checkoutTree(root, { force: true });
@@ -45,6 +53,20 @@ describe("FileWorktree refuses paths that name .git", () => {
       expect(await read(files, "/repo/.git/config")).toBe("original");
     });
   }
+
+  it("writes an HFS+ spelling of .git off macOS (core.protectHFS's default)", async () => {
+    const files = createInMemoryFilesApi();
+    const stores = createMemoryHistory();
+    const worktree = createFileWorktree({
+      files,
+      rootPath: "/repo",
+      blobs: stores.blobs,
+      trees: stores.trees,
+      environment: { systemName: "Linux", readFile: async () => undefined },
+    });
+    await worktree.writeContent("‌.git/config", enc.encode("x"));
+    expect(await read(files, "/repo/‌.git/config")).toBe("x");
+  });
 
   it("writeContent, mkdir and rename refuse a .git path", async () => {
     const files = createInMemoryFilesApi();

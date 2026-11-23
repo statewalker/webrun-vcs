@@ -16,7 +16,6 @@ import {
   type Worktree,
   type WorktreeEntry,
 } from "@statewalker/vcs-working-tree";
-
 import {
   EmptyCommitError,
   GitApiError,
@@ -74,6 +73,7 @@ import {
 } from "./status-command.js";
 import { type CommitWhence, StatusPrinter } from "./status-format.js";
 import { readDiffSubmoduleConfig } from "./submodule-summary.js";
+import { worktreePathRules } from "./worktree-path-rules.js";
 
 /**
  * Result of a commit operation.
@@ -1878,7 +1878,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
         found.set(path, entry);
       }
       const trust = worktreeModeTrust(this.workingCopy, worktree);
-      const adder = await IndexAdder.open(this.staging, this.blobs, trust);
+      const adder = await IndexAdder.open(this.staging, this.blobs, trust, {
+        pathRules: worktreePathRules(this.workingCopy),
+      });
       for (const path of taken) {
         const entry = found.get(path);
         if (entry) await adder.add(worktree, path, entry);

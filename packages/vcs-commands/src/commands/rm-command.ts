@@ -5,7 +5,6 @@ import {
   type Worktree,
   withWorktreeEntries,
 } from "@statewalker/vcs-working-tree";
-
 import { InvalidConfigError, NoFilepatternError, RmFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { worktreeModeTrust } from "./core-config.js";
@@ -26,6 +25,7 @@ import {
   removeDirectoryIfEmpty,
   statThroughLeadingLinks,
 } from "./worktree-overwrite-checks.js";
+import { worktreePathRules } from "./worktree-path-rules.js";
 
 /**
  * Result of RmCommand execution.
@@ -354,7 +354,9 @@ export class RmCommand extends GitCommand<RmResult> {
     const trust = worktree
       ? worktreeModeTrust(this.workingCopy, worktree)
       : { executable: true, symlinks: true };
-    const adder = await IndexAdder.open(this.staging, this.blobs, trust);
+    const adder = await IndexAdder.open(this.staging, this.blobs, trust, {
+      pathRules: worktreePathRules(this.workingCopy),
+    });
     for (const path of removedPaths) adder.remove(path);
     if (gitmodulesEdited && worktree) {
       const entry = await worktree.getEntry(".gitmodules");

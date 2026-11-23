@@ -17,7 +17,6 @@ import {
 import { parseGitInt } from "@statewalker/vcs-utils/encoding";
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { OpenedRepository, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
-
 import {
   CloneCheckoutError,
   CloneDestinationError,
@@ -44,6 +43,7 @@ import { withRemoteUploadPack } from "./remote-transport.js";
 import { SparseCheckoutCommand } from "./sparse-checkout-command.js";
 import { SparseUnpack } from "./sparse-checkout-support.js";
 import { checkoutFreshTree } from "./tree-restore.js";
+import { worktreePathRules } from "./worktree-path-rules.js";
 import { repositoryPlaceOf, worktreeAdminWorkingCopy } from "./worktree-support.js";
 
 /** The settings a clone reopened with another object format runs with again. */
@@ -1296,6 +1296,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         worktree,
         symlinks: worktree ? this.symlinksEnabled(worktree) : false,
         ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+        pathRules: worktreePathRules(this.workingCopy, worktree),
         ...(sparse ? { writes: (path: string) => sparse.writes(path) } : {}),
       },
       commit.tree,

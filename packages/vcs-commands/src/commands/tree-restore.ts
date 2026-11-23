@@ -9,7 +9,7 @@
  */
 
 import type { Blobs, ObjectId } from "@statewalker/vcs-core";
-import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
+import { FileMode, isValidWorktreePath, type WorktreePathOptions } from "@statewalker/vcs-core";
 import {
   attributesIndexOf,
   type ContentAttributesContext,
@@ -17,8 +17,9 @@ import {
   type Staging,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
-
+import { InvalidPathError } from "../errors/index.js";
 import type { CommandTrees } from "../git-command.js";
+import { withTreePathRefusal } from "./worktree-path-rules.js";
 
 /** One file a restore plans to write back into the working tree. */
 export interface RestoreEntry {
@@ -71,6 +72,10 @@ export interface TreeRestoreOptions {
   foldsCase?: boolean;
   /** The worktree is on Windows (`capabilities.windowsPaths`): git's Windows path rules. */
   windows?: boolean;
+  /** `core.protectNTFS` (default true; `worktreePathRules` reads it) */
+  protectNTFS?: boolean;
+  /** `core.protectHFS` (default true here; `worktreePathRules` gives git's default) */
+  protectHFS?: boolean;
   /** Top-level names the worktree's storage reserves (`capabilities.reservedNames`) */
   reservedNames?: string[];
   /**
@@ -104,8 +109,20 @@ export async function planTreeRestore(
   options: TreeRestoreOptions = {},
 ): Promise<TreeRestorePlan> {
   const plan: TreeRestorePlan = { entries: [], paths: new Set(), gitlinks: [], collided: [] };
-  await planInto(trees, blobs, treeId, "", operation, plan, options, new Map());
+  // a name the tree decoder refuses (`..`, `/`, empty) is reported as git reports it
+  await withTreePathRefusal(trees, [treeId], pathRulesOf(options), () =>
+    planInto(trees, blobs, treeId, "", operation, plan, options, new Map()),
+  );
   return plan;
+}
+
+/** The `verify_path` rules of restore options. */
+function pathRulesOf(options: TreeRestoreOptions): WorktreePathOptions {
+  return {
+    windows: options.windows === true,
+    protectNTFS: options.protectNTFS !== false,
+    protectHFS: options.protectHFS !== false,
+  };
 }
 
 /**
@@ -199,15 +216,21 @@ async function planInto(
 ): Promise<void> {
   for await (const entry of trees.loadTree(treeId)) {
     const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+    // a name the storage reserves at the worktree's root (a simulated-links table)
     if (
-      !isValidWorktreePath(path, entry.mode, { windows: options.windows === true }) ||
-      // a name the storage reserves at the worktree's root (a simulated-links table)
-      (prefix === "" &&
-        options.reservedNames?.some(
-          (name) => entry.name.normalize("NFC").toLowerCase() === name.toLowerCase(),
-        ))
+      prefix === "" &&
+      options.reservedNames?.some(
+        (name) => entry.name.normalize("NFC").toLowerCase() === name.toLowerCase(),
+      )
     ) {
       throw new Error(`${operation} cannot restore ${JSON.stringify(path)}: invalid path`);
+    }
+    // verify_path checks the index's entries: files, links and submodules by full path
+    if (
+      entry.mode !== FileMode.TREE &&
+      !isValidWorktreePath(path, entry.mode, pathRulesOf(options))
+    ) {
+      throw new InvalidPathError(path);
     }
 
     if (entry.mode === FileMode.TREE) {
@@ -355,8 +378,10 @@ export async function planFlatRestore(
     const entry = target.get(path);
     if (!entry) continue;
     const top = path.includes("/") ? path.slice(0, path.indexOf("/")) : path;
+    if (!isValidWorktreePath(path, entry.mode, pathRulesOf(options))) {
+      throw new InvalidPathError(path);
+    }
     if (
-      !isValidWorktreePath(path, entry.mode, { windows: options.windows === true }) ||
       options.reservedNames?.some(
         (name) => top.normalize("NFC").toLowerCase() === name.toLowerCase(),
       )
@@ -398,6 +423,8 @@ export interface FreshCheckoutTarget {
    * stays out of the worktree, as unpack-trees' loop #2 marks it); default every path.
    */
   writes?: (path: string) => boolean;
+  /** git's `verify_path` rules (`worktreePathRules`); default both protections on */
+  pathRules?: WorktreePathOptions;
 }
 
 /**
@@ -423,6 +450,7 @@ export async function checkoutFreshTree(
     symlinks: true,
     ...(await restoreCaseOptions(worktree, target.ignoreCase)),
     windows: worktree.capabilities?.windowsPaths === true,
+    ...target.pathRules,
     reservedNames: worktree.capabilities?.reservedNames,
   });
   const writes = target.writes;
