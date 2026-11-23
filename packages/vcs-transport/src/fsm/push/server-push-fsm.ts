@@ -1834,6 +1834,7 @@ async function runProcReceiveHook(ctx: ProcessContext): Promise<void> {
             ? { pushOptions: state.pushOptions ?? [] }
             : {}),
           cancelled: () => cancelled,
+          objectFormat: formatOf(getRepository(ctx)),
         });
       },
       () => {

@@ -611,7 +611,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
    * (`initialize_repository_version` with `transport_get_hash_algo`): the destination, still
    * empty, is switched to `format` and reopened (`LinkedWorktrees.reopenWithObjectFormat`),
    * and the clone runs again into it. What the first attempt wrote before it learned the
-   * format (the alternates of `--reference` / `--shared`) is removed first.
+   * format (the alternates of `--reference` / `--shared`) is removed once the destination
+   * passed the check.
    */
   private async cloneReopenedAs(format: ObjectFormat): Promise<CloneResult> {
     const worktrees = this._workingCopy.worktrees;
@@ -623,11 +624,16 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     const place = repositoryPlaceOf(this.workingCopy);
     const files = place?.getFiles?.();
     const gitDir = place?.getGitDir?.();
+    // checked first (no refs, no objects of its own): a refused destination keeps its
+    // alternates
+    const admin = await worktrees.reopenWithObjectFormat(format);
     if (files && gitDir !== undefined) {
       const file = `${gitDir}/objects/info/alternates`;
-      if ((await files.stats(file))?.kind === "file") await files.remove(file);
+      if ((await files.stats(file))?.kind === "file") {
+        await files.remove(file);
+        await admin.history.objects?.alternates?.refresh();
+      }
     }
-    const admin = await worktrees.reopenWithObjectFormat(format);
     const workingCopy = worktreeAdminWorkingCopy(admin);
     const next = new CloneCommand(workingCopy);
     const self = this as unknown as Record<string, unknown>;

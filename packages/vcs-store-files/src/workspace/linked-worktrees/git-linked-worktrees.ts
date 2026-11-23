@@ -894,7 +894,15 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       if (!isSymbolicRef(ref))
         throw new Error("cannot change the object format of a repository with refs");
     }
-    for await (const _id of this.history.objects?.list?.() ?? []) {
+    // the repository's own objects: what its alternates hold is not its own (the caller
+    // removes `objects/info/alternates` only once this check passed)
+    const own = await createGitFilesBackend({
+      files: this.files,
+      gitDir: this.commonDir,
+      alternates: false,
+      ...(this.options.includes === undefined ? {} : { configIncludes: this.options.includes }),
+    });
+    for await (const _id of own.history.objects?.list?.() ?? []) {
       throw new Error("cannot change the object format of a repository with objects");
     }
     const config = await createWorkingCopyConfig(configFilesApiOf(this.files), this.commonDir);

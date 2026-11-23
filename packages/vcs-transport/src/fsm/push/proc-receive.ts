@@ -17,6 +17,8 @@
  * `report-status-v2`) or `fall-through` (receive-pack updates the ref itself after all).
  */
 
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
+
 import { PktStream } from "../../fetch-client/pkt-stream.js";
 import { isNullId } from "../../protocol/object-format.js";
 import { encodeFlush, encodePacket } from "../../protocol/pkt-line-codec.js";
@@ -133,12 +135,14 @@ function fail(cmd: PushCommand, message: string): void {
   cmd.message = message;
 }
 
-/** git's `parse_oid_hex` on the start of `value`: a lowercase id, or undefined. */
-function parseOidHex(value: string | undefined): string | undefined {
-  if (value === undefined) return undefined;
-  // the hook answers in the repository's format: a 64-digit id is SHA-256's, else SHA-1's
-  const m = /^(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40})/.exec(value);
-  return m ? m[0].toLowerCase() : undefined;
+/**
+ * git's `parse_oid_hex` on the start of `value`: the first `hexLength` digits (the
+ * repository's `hexsz`, whatever follows them), lowercased, or undefined.
+ */
+function parseOidHex(value: string | undefined, hexLength: number): string | undefined {
+  if (value === undefined || value.length < hexLength) return undefined;
+  const id = value.slice(0, hexLength);
+  return /^[0-9a-fA-F]*$/.test(id) ? id.toLowerCase() : undefined;
 }
 
 /** C's `atoi`: the leading decimal number (after blanks and a sign), 0 when none. */
@@ -175,6 +179,7 @@ async function readProcReceiveReport(
   commands: ProcReceiveCommand[],
   errors: string[],
   cancelled: () => boolean,
+  hexLength: number,
 ): Promise<number> {
   let hint: ProcReceiveCommand | undefined;
   let report: RefPushReport | undefined;
@@ -230,10 +235,10 @@ async function readProcReceiveReport(
       if (key === "refname") {
         if (val === undefined) delete target.refName;
         else target.refName = val;
-      } else if (key === "old-oid" && parseOidHex(val) !== undefined) {
-        target.oldOid = parseOidHex(val);
-      } else if (key === "new-oid" && parseOidHex(val) !== undefined) {
-        target.newOid = parseOidHex(val);
+      } else if (key === "old-oid" && parseOidHex(val, hexLength) !== undefined) {
+        target.oldOid = parseOidHex(val, hexLength);
+      } else if (key === "new-oid" && parseOidHex(val, hexLength) !== undefined) {
+        target.newOid = parseOidHex(val, hexLength);
       } else if (key === "forced-update") {
         target.forcedUpdate = true;
       } else if (key === "fall-through") {
@@ -296,6 +301,8 @@ export interface ProcReceiveRun {
    * says changes a command
    */
   cancelled?: () => boolean;
+  /** The repository's object format: the hook's `old-oid`/`new-oid` are read in it (default SHA-1) */
+  objectFormat?: ObjectFormat;
 }
 
 /**
@@ -385,7 +392,13 @@ export async function runProcReceive(
         }
       }
       if (code === 0) {
-        code = await readProcReceiveReport(pkts, commands, errors, run.cancelled ?? (() => false));
+        code = await readProcReceiveReport(
+          pkts,
+          commands,
+          errors,
+          run.cancelled ?? (() => false),
+          run.objectFormat?.hexLength ?? 40,
+        );
       }
     }
   } finally {

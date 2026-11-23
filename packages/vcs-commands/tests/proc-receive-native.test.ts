@@ -188,6 +188,31 @@ const SCENARIOS: Scenario[] = [
     shows: ["HEAD -> refs/pull/123/head"],
   },
   {
+    // parse_oid_hex reads the repository's hexsz digits: a 64-digit id in a SHA-1
+    // repository is its first 40, fewer digits are no id (the option is ignored)
+    label: "ids longer and shorter than the repository's",
+    refs: ["refs/for"],
+    hook: () => [
+      "-v",
+      "-r",
+      "ok refs/for/main/topic",
+      "-r",
+      "option refname refs/pull/123/head",
+      "-r",
+      `option old-oid ${A}${"f".repeat(24)}`,
+      "-r",
+      `option new-oid ${B}${"0".repeat(24)}`,
+      "-r",
+      "ok refs/for/main/topic",
+      "-r",
+      "option refname refs/pull/124/head",
+      "-r",
+      `option new-oid ${B.slice(0, 39)}`,
+    ],
+    push: ["HEAD:refs/for/main/topic"],
+    shows: ["HEAD -> refs/pull/123/head"],
+  },
+  {
     label: "forced update",
     refs: ["refs/for"],
     hook: () => [
