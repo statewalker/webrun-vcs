@@ -89,6 +89,11 @@ export interface PushResult {
   /** Server messages */
   messages: string[];
   /**
+   * git's own warnings before the push, one message each: 2.5x's deprecation warning for a
+   * remote read from `.git/remotes/` or `.git/branches/`; absent when there are none
+   */
+  warnings?: string[];
+  /**
    * The report git prints on stderr (`To <url>`, ` * [new branch]  main -> main`,
    * `   1a2b3c4..5d6e7f8  main -> main`, ` ! [rejected]  main -> main (fetch first)`,
    * `Everything up-to-date`), ids abbreviated as git's find_unique_abbrev under

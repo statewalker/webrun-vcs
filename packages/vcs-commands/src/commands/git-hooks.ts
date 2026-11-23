@@ -638,6 +638,17 @@ function normalizeHostPath(path: string): string {
   return `/${normalizeFilesPath(path)}`;
 }
 
+/**
+ * A file of a working copy's common git directory (`remotes/<name>`, `packed-refs`) as the
+ * repository's FilesApi names it; undefined when the working copy has no files layout.
+ */
+export async function commonGitFileOf(
+  workingCopy: WorkingCopy,
+  name: string,
+): Promise<{ files: FilesApi; path: string } | undefined> {
+  return new HookSession(hookHostOf(workingCopy)).commonGitFile(name);
+}
+
 /** The common git directory of `gitDir` (its `commondir` file), as a FilesApi path. */
 async function commonDirOf(files: FilesApi, gitDir: string): Promise<string> {
   const path = joinFilesPath(gitDir, "commondir");
