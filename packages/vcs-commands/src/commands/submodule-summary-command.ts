@@ -1,4 +1,4 @@
-import { EMPTY_TREE_ID, type ObjectId } from "@statewalker/vcs-core";
+import type { ObjectId } from "@statewalker/vcs-core";
 
 import { IncompatibleOptionsError, RevisionError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
@@ -122,7 +122,7 @@ export class SubmoduleSummaryCommand extends GitCommand<string> {
     if (resolved !== undefined) head = resolved;
     else if (first === "HEAD") {
       // before the first commit: compare with an empty tree
-      head = EMPTY_TREE_ID;
+      head = this.objectFormat.emptyTreeId;
     } else {
       paths.unshift(first);
       const fallback = await this.resolveTree("HEAD");

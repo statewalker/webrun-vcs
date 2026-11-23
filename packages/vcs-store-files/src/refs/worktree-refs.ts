@@ -75,7 +75,7 @@ export function isPerWorktreeRef(name: string): boolean {
 
 /** Options of {@link createWorktreeRefs}. */
 export interface WorktreeRefsOptions
-  extends Pick<FilesRefBatchOptions, "logAllRefUpdates" | "reflogIdentity"> {
+  extends Pick<FilesRefBatchOptions, "logAllRefUpdates" | "reflogIdentity" | "objectFormat"> {
   /** The repository's refs (the main worktree's store). */
   common: Refs;
   /** The FilesApi the worktree's git directory is in. */
@@ -107,6 +107,7 @@ class WorktreeRefs implements Refs {
     // HEAD here names a branch of the repository: its old value (compared and logged by a
     // `noDeref` update of HEAD, as `checkout --detach` or a rebase's start make) is read there
     this.own = createFileRefStore(options.files, options.gitDir, {
+      ...(options.objectFormat ? { objectFormat: options.objectFormat } : {}),
       logAllRefUpdates: options.logAllRefUpdates,
       reflogIdentity: options.reflogIdentity,
       resolveOutside: async (name) =>

@@ -52,7 +52,7 @@ import {
 } from "@statewalker/vcs-core";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
-import { nullObjectIdLike } from "@statewalker/vcs-utils/hash";
+import { nullObjectIdLike, type ObjectFormat } from "@statewalker/vcs-utils/hash";
 import { parseReflogLine } from "./reflog-reader.js";
 
 const enc = new TextEncoder();
@@ -65,6 +65,8 @@ const ZERO_ID = "0".repeat(40);
 const MAX_SYMREF_READS = 5;
 
 export interface FilesRefBatchOptions {
+  /** The repository's object format: the ids a direct value may be (default SHA-1) */
+  objectFormat?: ObjectFormat;
   /**
    * Told about each batch's states (git's reference-transaction hook); read when each batch
    * starts, so it can be set after the store is made
@@ -754,6 +756,7 @@ export function createFilesRefOps(
     const plan = await planRefBatch(
       updates.map((u) => ({ name: u.name, new: u.newValue, noDeref: true })),
       {
+        ...(options.objectFormat ? { objectFormat: options.objectFormat } : {}),
         read: async (n) =>
           (await readRef(n, packed, read)) ??
           (!mine.has(n) && (await files.exists(`${n}.lock`))
@@ -1336,7 +1339,12 @@ export function createFilesRefOps(
       }
       return batchAs([{ ...only, name: throughTo }], batchOptions, only.name, through);
     }
-    if (only && only.new !== null && isRootRefName(only.name) && isRefObjectId(only.new)) {
+    if (
+      only &&
+      only.new !== null &&
+      isRootRefName(only.name) &&
+      isRefObjectId(only.new, options.objectFormat)
+    ) {
       try {
         await writeRootRef(only.name, only.new, only.old);
         return { ok: true, rejected: [] };
@@ -1349,6 +1357,7 @@ export function createFilesRefOps(
     const packed = await readPacked();
     const read = onceEach();
     const plan = await planRefBatch(commands, {
+      ...(options.objectFormat ? { objectFormat: options.objectFormat } : {}),
       read: (name) => readRefOrOutside(name, packed, read),
       hasChildren: async (name) => {
         for (const k of packed.keys()) if (k.startsWith(`${name}/`)) return true;

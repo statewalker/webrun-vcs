@@ -145,7 +145,9 @@ export function createHistoryFromComponents(config: HistoryComponentsConfig): Hi
   if (typeof given.batch === "function") {
     refs = config.refs as Refs;
   } else if (given.type === "memory") {
-    refs = createMemoryRefs();
+    refs = createMemoryRefs(
+      config.objects.objectFormat ? { objectFormat: config.objects.objectFormat } : {},
+    );
   } else {
     throw new Error(
       `createHistoryFromComponents: refs must be a Refs implementation or { type: "memory" }, got ${JSON.stringify(given.type ?? given)}`,

@@ -1,4 +1,4 @@
-import { EMPTY_TREE_ID, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
+import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { flattenTree, type Staging } from "@statewalker/vcs-working-tree";
 
 import {
@@ -860,7 +860,7 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
     // of the reset index or of the index tree, else nothing is checked out
     let keepIndex = this.keepIndex;
     let checkoutErrors: string[] = [];
-    if (keepIndex && indexTree !== EMPTY_TREE_ID) {
+    if (keepIndex && indexTree !== this.objectFormat.emptyTreeId) {
       const seen = items.map(() => 0);
       const mark = (path: string, mode: number) =>
         matchPathspecSeen(items, path, mode === 0o160000 ? DO_MATCH_DIRECTORY : 0, seen);

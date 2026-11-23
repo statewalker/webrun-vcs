@@ -26,6 +26,7 @@ import type {
 } from "@statewalker/vcs-core";
 import { isRefObjectId, isUpdatableRefName, isValidRefName } from "@statewalker/vcs-core";
 import { type AtomicFiles, atomicFilesOver } from "@statewalker/vcs-utils/files";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 
 import {
   createFilesRefOps,
@@ -64,6 +65,8 @@ const GRAFTS_FILE = "info/grafts";
 export class FileRefStore implements Refs {
   private readonly ops: FilesRefOps;
   private readonly atomic: AtomicFiles;
+  /** The ids a direct value may be (default SHA-1) */
+  private readonly objectFormat?: ObjectFormat;
 
   private transactionHook?: RefTransactionHook;
 
@@ -73,6 +76,7 @@ export class FileRefStore implements Refs {
     options: FileRefStoreOptions = {},
   ) {
     this.atomic = options.atomicFiles ?? atomicFilesOver(files, gitDir);
+    this.objectFormat = options.objectFormat;
     this.ops = createFilesRefOps(this.atomic, {
       ...options,
       transactionHook: () => this.transactionHook,
@@ -211,7 +215,7 @@ export class FileRefStore implements Refs {
   async set(refName: string, objectId: ObjectId, log?: RefLogOptions): Promise<void> {
     // a direct value is an object id: a name written here (HEAD holding "main\n") leaves a
     // repository no git can open; the batch refuses it too, this covers ORIG_HEAD and kin
-    if (!isRefObjectId(objectId)) {
+    if (!isRefObjectId(objectId, this.objectFormat)) {
       throw new RefUpdateRejectedError([{ name: refName, reason: "invalid-object-id" }]);
     }
     // a name git's ref transaction refuses (check_refname_format, one level allowed:

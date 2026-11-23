@@ -393,6 +393,13 @@ describeGit("SHA-256 repositories against native git", () => {
       }
       const patch = await git.log().callText({ patch: true, stat: true });
       expect(patch).toBe(native(dir, ["log", "-p", "--stat"]).stdout);
+      const full = await git
+        .diff()
+        .setOldTree("v1")
+        .setNewTree("HEAD")
+        .setOptions({ fullIndex: true })
+        .callText();
+      expect(full).toBe(native(dir, ["diff", "--full-index", "v1", "HEAD"]).stdout);
       const names = await git.log().callText({ nameStatus: true });
       expect(names).toBe(native(dir, ["log", "--name-status"]).stdout);
       const diff = await git.diff().setOldTree("v1").setNewTree("HEAD").callText();

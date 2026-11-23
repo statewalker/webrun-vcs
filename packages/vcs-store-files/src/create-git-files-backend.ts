@@ -351,6 +351,7 @@ export async function createGitFilesBackend(
           packedLockTimeoutMs: options.packedLockTimeoutMs ?? reflog.packedLockTimeoutMs,
           logAllRefUpdates: options.logAllRefUpdates ?? reflog.logAllRefUpdates,
           reflogIdentity: options.reflogIdentity ?? reflog.identity,
+          objectFormat,
           peel: (id) => peelTag(objects, id),
           hasObject: (id) => objects.has(id),
         });

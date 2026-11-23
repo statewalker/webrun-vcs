@@ -1370,7 +1370,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           dense,
           workingTreeFile: false,
           context: this.diffOptions.context ?? (Number.isFinite(context) ? context : 3),
-          abbreviate: (id) => id.slice(0, this.diffOptions.fullIndex ? 40 : (lengths.get(id) ?? 7)),
+          abbreviate: (id) =>
+            id.slice(0, this.diffOptions.fullIndex ? id.length : (lengths.get(id) ?? 7)),
           quotePath: quote,
         },
       );

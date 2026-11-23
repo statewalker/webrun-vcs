@@ -1041,7 +1041,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           : driver?.binary !== undefined
             ? { binary: driver.binary }
             : {}),
-        abbreviate: (id) => id.slice(0, options.fullIndex ? 40 : (lengths?.get(id) ?? 7)),
+        abbreviate: (id) => id.slice(0, options.fullIndex ? id.length : (lengths?.get(id) ?? 7)),
       },
     );
   }

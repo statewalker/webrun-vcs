@@ -1,6 +1,5 @@
 import {
   type Commit,
-  EMPTY_TREE_ID,
   isSymbolicRef,
   listObjectsWithPrefix,
   type ObjectId,
@@ -1511,7 +1510,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // dropped (drop_redundant_commits), kept (keep_redundant_commits) or stops the rebase
     let allowEmpty = false;
     if (treeId === headTreeId) {
-      if (commit.tree === (parentTreeId ?? EMPTY_TREE_ID)) allowEmpty = true;
+      if (commit.tree === (parentTreeId ?? this.objectFormat.emptyTreeId)) allowEmpty = true;
       else if (await state.exists(`${DIR}/keep_redundant_commits`)) allowEmpty = true;
       else if (await state.exists(`${DIR}/drop_redundant_commits`)) {
         await state.removeRef("AUTO_MERGE");
@@ -1533,7 +1532,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       if (!allowEmpty && head.parents.length <= 1) {
         const parentTree = head.parents[0]
           ? await this.commits.getTree(head.parents[0])
-          : EMPTY_TREE_ID;
+          : this.objectFormat.emptyTreeId;
         if (parentTree === treeId) {
           // do_commit: REBASE_HEAD written before git commit runs
           await state.setRef("REBASE_HEAD", item.id);
@@ -2443,7 +2442,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       if (!commit) throw new CommitNotFoundError(id);
       const parentTree = commit.parents[0]
         ? (await this.loadCommit(commit.parents[0]))?.tree
-        : EMPTY_TREE_ID;
+        : this.objectFormat.emptyTreeId;
       const empty = commit.tree === parentTree;
       if (!empty && skipped.has(id)) continue;
       if (empty && !keepEmpty) continue;
@@ -3326,7 +3325,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     if (!commit) return false;
     const parentTree = commit.parents[0]
       ? (await this.loadCommit(commit.parents[0]))?.tree
-      : EMPTY_TREE_ID;
+      : this.objectFormat.emptyTreeId;
     return commit.tree === parentTree;
   }
 

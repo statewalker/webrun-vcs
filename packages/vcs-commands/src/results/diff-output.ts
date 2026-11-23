@@ -28,6 +28,7 @@ import {
   createSha1,
   diffLineCounts,
   type FindFunction,
+  nullObjectIdLike,
   type UnifiedDiffOptions,
   type UnifiedDiffResult,
   unifiedDiffHunks,
@@ -164,7 +165,6 @@ export interface DiffOutputOptions
 
 const S_IFMT = 0o170000;
 const GITLINK_MODE = 0o160000;
-const NULL_ID = "0".repeat(40);
 const FIRST_FEW_BYTES = 8000;
 const GIT_DIFF_BIG_FILE_THRESHOLD = 512 * 1024 * 1024;
 
@@ -211,6 +211,8 @@ class LoadedSide {
   constructor(
     readonly spec: DiffSideSpec | undefined,
     readonly driver: DiffDriver | undefined,
+    /** The other side's id: an absent side's null id is as long (64 zeros in SHA-256) */
+    private readonly otherId?: string,
   ) {}
 
   get valid(): boolean {
@@ -222,7 +224,7 @@ class LoadedSide {
   }
 
   get id(): string {
-    return this.spec?.id ?? NULL_ID;
+    return this.spec?.id ?? nullObjectIdLike(this.otherId);
   }
 
   read(): Promise<Uint8Array> {
@@ -356,7 +358,7 @@ function metainfo(
       id.slice(
         0,
         options.fullIndex || fullIndex
-          ? 40
+          ? id.length
           : (options.abbrevLengths?.get(id) ?? options.abbrev ?? 7),
       );
     text += `index ${abbrev(one.id)}..${abbrev(two.id)}`;
@@ -393,8 +395,8 @@ async function builtinDiff(
   const other = pathTwo !== name ? pathTwo : undefined;
   const oneDriver = await driverOf(options, pathOne);
   const twoDriver = pathTwo === pathOne ? oneDriver : await driverOf(options, pathTwo);
-  const one = new LoadedSide(pair.old, contentDriver(pair.old, oneDriver));
-  const two = new LoadedSide(pair.new, contentDriver(pair.new, twoDriver));
+  const one = new LoadedSide(pair.old, contentDriver(pair.old, oneDriver), pair.new?.id);
+  const two = new LoadedSide(pair.new, contentDriver(pair.new, twoDriver), pair.old?.id);
   // a side with a textconv driver (git's get_textconv: valid sides only) is text
   const textconvOne = one.driver?.textconv;
   const textconvTwo = two.driver?.textconv;
@@ -546,8 +548,8 @@ export async function computeDiffstat(
     const pathOne = nameA;
     const oneDriver = await driverOf(options, pathOne);
     const twoDriver = nameB === nameA ? oneDriver : await driverOf(options, nameB);
-    const one = new LoadedSide(pair.old, contentDriver(pair.old, oneDriver));
-    const two = new LoadedSide(pair.new, contentDriver(pair.new, twoDriver));
+    const one = new LoadedSide(pair.old, contentDriver(pair.old, oneDriver), pair.new?.id);
+    const two = new LoadedSide(pair.new, contentDriver(pair.new, twoDriver), pair.old?.id);
     // git's may_differ: both ids known and equal, or the contents are compared
     const mayDiffer = !(
       one.valid &&

@@ -2,7 +2,7 @@
  * `git read-tree` (builtin/read-tree.c over unpack-trees.c): read trees into the index,
  * merging them with it (`-m`: one-, two- and three-way), optionally updating the worktree.
  */
-import { EMPTY_TREE_ID, FileMode, type ObjectId } from "@statewalker/vcs-core";
+import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
@@ -299,7 +299,9 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
     const entries = await this.entryList();
     const trees = this.trees;
     return repairCacheTree(
-      { has: async (id: ObjectId) => id === EMPTY_TREE_ID || (await trees.has(id)) },
+      {
+        has: async (id: ObjectId) => id === this.objectFormat.emptyTreeId || (await trees.has(id)),
+      },
       entries,
     );
   }
