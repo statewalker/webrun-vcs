@@ -12,6 +12,7 @@ import {
   quoteRefValue,
   RefFilterError,
   rstripRef,
+  trimTrailingSpaces,
   versionCompare,
 } from "../src/index.js";
 import { backends, createInitializedGitFromFactory } from "./test-helper.js";
@@ -48,6 +49,17 @@ describe("ref-filter helpers", () => {
     expect(rstripRef("refs/heads/main", 1)).toBe("refs/heads");
     expect(rstripRef("refs/heads/main", -2)).toBe("refs/heads");
     expect(rstripRef("refs/heads/main", 5)).toBe("");
+  });
+
+  it("trims a mailmap name's trailing spaces in linear time (hostile author names)", () => {
+    expect(trimTrailingSpaces("A U Thor  ")).toBe("A U Thor");
+    expect(trimTrailingSpaces("   ")).toBe("");
+    expect(trimTrailingSpaces("x")).toBe("x");
+    // a fetched commit's `author <200k spaces>x <e@x>`: `/ +$/` takes minutes on this in V8
+    const hostile = `${" ".repeat(200_000)}x `;
+    const started = performance.now();
+    expect(trimTrailingSpaces(hostile)).toBe(`${" ".repeat(200_000)}x`);
+    expect(performance.now() - started).toBeLessThan(200);
   });
 
   it("quotes values for each language", () => {

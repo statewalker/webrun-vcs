@@ -322,12 +322,23 @@ function copyEmail(line: string, opt: NonNullable<UsedAtom["email"]>): string {
   return end < 0 ? "" : rest.slice(0, end);
 }
 
+/**
+ * `s` without its trailing spaces, in one backwards pass (split_ident_line's trim). Never a
+ * `/ +$/` regex: V8 retries it from every space of a long run, quadratic on the hostile
+ * author names a fetched commit may carry.
+ */
+export function trimTrailingSpaces(s: string): string {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 32) end--;
+  return end === s.length ? s : s.slice(0, end);
+}
+
 /** apply_mailmap_to_header for one identity line's value (`name <email> rest`). */
 function mailmapLine(line: string, mailmap: Mailmap): string {
   const lt = line.indexOf("<");
   const gt = line.indexOf(">", lt + 1);
   if (lt < 0 || gt < 0) return line;
-  const name = line.slice(0, lt).replace(/ +$/, "");
+  const name = trimTrailingSpaces(line.slice(0, lt));
   const email = line.slice(lt + 1, gt);
   const mapped = mailmap.map(name, email);
   if (mapped.name === name && mapped.email === email) return line;
