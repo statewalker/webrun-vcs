@@ -189,7 +189,8 @@ export async function expireReflogs(options: ExpireReflogsOptions): Promise<Expi
       const kept: string[] = [];
       let pruned = 0;
       const lines = text.split("\n");
-      if (lines[lines.length - 1] === "") lines.pop();
+      // the last line without its newline is corrupt to show_one_reflog_ent
+      const unterminated = lines.pop() as string;
       for (const line of lines) {
         const entry = parseEntry(line);
         if (!entry) {
@@ -198,14 +199,16 @@ export async function expireReflogs(options: ExpireReflogsOptions): Promise<Expi
           continue;
         }
         if (await shouldExpire(entry, policy, kind, reach, graph)) pruned++;
-        else kept.push(line);
+        else kept.push(entry.line);
       }
+      if (unterminated !== "") pruned++;
       result.pruned += pruned;
-      if (!options.dryRun && pruned > 0) {
+      // files_reflog_expire writes the log anew whatever it pruned, each entry as
+      // expire_reflog_ent prints it (`<tz>\t<message>`, a tab even before an empty message)
+      const rewritten = kept.map((l) => `${l}\n`).join("");
+      if (!options.dryRun && rewritten !== text) {
         const logLock = `${reflog.logPath}.lock`;
-        if (
-          !(await atomic.createExclusive(logLock, enc.encode(kept.map((l) => `${l}\n`).join(""))))
-        ) {
+        if (!(await atomic.createExclusive(logLock, enc.encode(rewritten)))) {
           result.errors.push(
             `error: Unable to create '${joinPath(gitDir, logLock)}': File exists.`,
           );
@@ -243,19 +246,31 @@ async function shouldExpire(
   return false;
 }
 
-/** One reflog line: `<old> <new> <ident> <timestamp> <tz>\t<message>`. */
-function parseEntry(line: string): { oldId: string; newId: string; timestamp: number } | undefined {
+/**
+ * One reflog line: `<old> <new> <ident> <timestamp> <tz>\t<message>`, as show_one_reflog_ent
+ * parses it (the ident up to its first `>`), with `line` as expire_reflog_ent writes it back.
+ */
+function parseEntry(
+  line: string,
+): { oldId: string; newId: string; timestamp: number; line: string } | undefined {
   const oldId = line.slice(0, 40);
   const newId = line.slice(41, 81);
   if (!OID.test(oldId) || !OID.test(newId) || line[40] !== " " || line[81] !== " ")
     return undefined;
-  const tab = line.indexOf("\t");
-  const head = tab < 0 ? line : line.slice(0, tab);
-  const gt = head.lastIndexOf("> ");
-  if (gt < 0) return undefined;
-  const m = /^(\d+) [+-]\d{4}$/.exec(head.slice(gt + 2));
-  if (!m) return undefined;
-  return { oldId, newId, timestamp: Number(m[1]) };
+  const gt = line.indexOf(">", 82);
+  if (gt < 0 || line[gt + 1] !== " ") return undefined;
+  const m = /^(\d+) ([+-]\d{4})/.exec(line.slice(gt + 2));
+  if (!m || Number(m[1]) === 0) return undefined;
+  let rest = line.slice(gt + 2 + (m[0] as string).length);
+  if (rest.startsWith("\t")) rest = rest.slice(1);
+  const tzNumber = Number.parseInt(m[2] as string, 10);
+  const tz = `${tzNumber < 0 ? "-" : "+"}${String(Math.abs(tzNumber)).padStart(4, "0")}`;
+  return {
+    oldId,
+    newId,
+    timestamp: Number(m[1]),
+    line: `${line.slice(0, gt + 1)} ${m[1]} ${tz}\t${rest}`,
+  };
 }
 
 /** A reflog: its name as git names it, the ref file and the log file under the git directory. */

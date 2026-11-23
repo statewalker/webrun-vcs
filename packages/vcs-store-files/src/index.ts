@@ -36,10 +36,14 @@ export * from "./refs/index.js";
 export * from "./repack.js";
 // core.repositoryformatversion and extensions.*, checked as git does
 export * from "./repository-format.js";
+// `git rerere gc`, as gc runs it
+export * from "./rerere-gc.js";
 // A `.git` or `.git/objects` linked elsewhere, resolved through the FilesApi
 export * from "./resolve-linked-git-dir.js";
 // Repository safety: ownership (safe.directory), safe.bareRepository, discovery
 export * from "./safety/index.js";
+// `git update-server-info`, as repack runs it
+export * from "./server-info.js";
 // Storage implementations (file-dependent)
 export * from "./storage/index.js";
 // Workspace implementations (file-dependent)

@@ -1,18 +1,27 @@
-import type { ObjectId } from "@statewalker/vcs-core";
+import type { FilesApi, History } from "@statewalker/vcs-core";
+import { type GcResult, parseExpiryDate, gc as storeGc } from "@statewalker/vcs-store-files";
 import { parseGitInt } from "@statewalker/vcs-utils";
+import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
+import { hostEnvironmentOf } from "./git-ident.js";
 import { WorktreePruneCommand } from "./worktree-prune-command.js";
 
 /**
  * Result of garbage collection
  */
 export interface GCCommandResult {
-  /** Number of objects removed */
+  /**
+   * Objects the repository no longer stores: distinct object ids (loose or packed) in its own
+   * objects directory before the gc, less those after it. 0 without a files backend.
+   */
   objectsRemoved: number;
-  /** Bytes freed by removing objects */
+  /**
+   * Bytes freed in the objects directory (loose object files and the pack directory's files),
+   * before less after: negative when the gc made it grow (a cruft pack beside packs kept)
+   */
   bytesFreed: number;
   /** Whether refs were packed */
   refsPacked: boolean;
@@ -25,19 +34,26 @@ export interface GCCommandResult {
   worktreesPruned: string[];
   /**
    * `setAuto(true)` only: why nothing was done (git's `gc --auto` returning at once): no
-   * housekeeping needed (`not-needed`, gc.auto 0 included), or the pre-auto-gc hook refused
-   * it (`hook`)
+   * housekeeping needed (`not-needed`, gc.auto 0 included), the pre-auto-gc hook refused
+   * it (`hook`), or another gc holds `gc.pid` (`running`)
    */
-  autoSkipped?: "not-needed" | "hook";
+  autoSkipped?: "not-needed" | "hook" | "running";
   /** `setAuto(true)` and run: git's "Auto packing the repository ..." lines (its stderr) */
   messages?: string[];
   /**
    * git's error lines (its stderr): first the alternates' (`alternatesErrors()`, once: git's
    * repack and prune children repeat them), then those while packing refs (also in the hook
    * output): a loose ref whose object is missing stays loose, a ref changed before its prune
-   * keeps its loose file
+   * keeps its loose file; then the reflog expiry's
    */
   errors?: string[];
+  /** git's warnings (a bitmap not written, `--auto`'s "too many unreachable loose objects") */
+  warnings?: string[];
+  /**
+   * What the store's gc did (repack, prune, reflog expiry, rerere gc, commit-graph), where the
+   * repository is a files repository; absent otherwise (only refs and worktrees are handled)
+   */
+  details?: GcResult;
 }
 
 /** git's defaults: `gc.auto` loose objects, `gc.autoPackLimit` packs. */
@@ -45,38 +61,33 @@ const GC_AUTO_DEFAULT = 6700;
 const GC_AUTO_PACK_LIMIT_DEFAULT = 50;
 
 /**
- * Run garbage collection on the repository.
+ * Run garbage collection on the repository: `git gc`.
  *
- * Equivalent to `git gc`.
- *
- * Garbage collection removes unreachable objects and optimizes
- * repository storage. This includes:
- * - Removing objects not reachable from any ref
- * - Packing loose refs into packed-refs
- * - Repacking objects into pack files (optional)
- *
- * Based on JGit's GarbageCollectCommand.
+ * Over a files repository it runs what `git gc` runs, in git's order (builtin/gc.c): `pack-refs
+ * --all --prune` (`gc.packRefs`), `reflog expire --all` (`gc.reflogExpire*`), `worktree prune
+ * --expire <gc.worktreePruneExpire>` and `rerere gc` (`gc.rerereResolved`/`Unresolved`), the
+ * repack (`repack -d -l` with `--cruft --cruft-expiration=<gc.pruneExpire>` (`gc.cruftPacks`,
+ * default), `-A --unpack-unreachable=<expire>` without cruft packs, or `-a` for `--prune=now`;
+ * `--keep-pack` for `--keep-largest-pack`/`gc.bigPackThreshold`; `-f --depth --window` for
+ * `--aggressive`; a bitmap in a bare repository), `update-server-info`, `prune --expire
+ * <expire>` (with `prune_shallow`), and the commit-graph (`gc.writeCommitGraph`). git 2.43 runs
+ * the worktree prune and rerere gc after the prune, 2.5x before the repack: the hook runner's
+ * compatibility decides. Without a files repository only refs are packed and worktrees pruned.
  *
  * @example
  * ```typescript
- * // Basic garbage collection
  * const result = await git.gc().call();
  * console.log(`Removed ${result.objectsRemoved} objects`);
  *
- * // Aggressive GC with repacking
- * const result = await git.gc()
- *   .setAggressive(true)
- *   .call();
+ * // git gc --aggressive --prune=now
+ * await git.gc().setAggressive(true).setPrune("now").call();
  *
- * // GC with expiration date (keep recent unreachable objects)
- * const twoWeeksAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
- * const result = await git.gc()
- *   .setExpire(twoWeeksAgo)
- *   .call();
+ * // git gc --no-prune
+ * await git.gc().setPrune(false).call();
  * ```
  */
 export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
-  private _packRefs = true;
+  private _packRefs?: boolean;
 
   /** git's fsck and gc read the objects as stored, never through replace refs. */
   protected override readsReplacedObjects(): boolean {
@@ -84,15 +95,21 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
   }
   private _aggressive = false;
   private _expire?: Date;
+  private _prune?: string | boolean;
   private _auto = false;
+  private _quiet = false;
+  private _cruft?: boolean;
+  private _maxCruftSize?: number;
+  private _keepLargestPack?: boolean;
 
   /**
    * `git gc --auto`: housekeeping only when needed (git's `need_to_gc`: more loose objects
    * than `gc.auto`, estimated from `objects/17` as git does, default 6700, or more packs
    * without a `.keep` than `gc.autoPackLimit`, default 50; 0 or less turns either check
    * off, `gc.auto=0` all of auto gc), and only when the pre-auto-gc hook, run first, agrees.
-   * No command runs it by itself: callers decide when (git's `maintenance.auto` after a
-   * commit, merge or fetch is not reproduced).
+   * With too many packs the repack is a full one, else an incremental one (the reachable loose
+   * objects into a new pack). No command runs it by itself: callers decide when (git's
+   * `maintenance.auto` after a commit, merge or fetch is not reproduced).
    *
    * @example
    * ```typescript
@@ -106,10 +123,50 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
     return this;
   }
 
+  /** `--quiet`: no "Auto packing the repository ..." messages. */
+  setQuiet(quiet: boolean): this {
+    this.checkCallable();
+    this._quiet = quiet;
+    return this;
+  }
+
   /**
-   * Whether `gc --auto` has work to do (git's `need_to_gc` / `odb_optimize_required` for the
-   * incremental strategy), read from the common directory's `objects/`.
+   * `--prune=<date>` (a git expiry date: `now`, `never`, `2.weeks.ago`, a `Date`), `--prune`
+   * (true: `gc.pruneExpire`, default two weeks) or `--no-prune` (false: nothing unreachable
+   * expires, `git prune` does not run).
    */
+  setPrune(prune: string | Date | boolean): this {
+    this.checkCallable();
+    if (prune instanceof Date) this._expire = prune;
+    else this._prune = prune;
+    return this;
+  }
+
+  /** `--cruft` / `--no-cruft` (default `gc.cruftPacks`, true). */
+  setCruft(cruft: boolean): this {
+    this.checkCallable();
+    this._cruft = cruft;
+    return this;
+  }
+
+  /** `--max-cruft-size=<bytes>` (default `gc.maxCruftSize`). */
+  setMaxCruftSize(bytes: number): this {
+    this.checkCallable();
+    this._maxCruftSize = bytes;
+    return this;
+  }
+
+  /**
+   * `--keep-largest-pack` (true) / `--no-keep-largest-pack` (false): the largest non-cruft
+   * pack is kept as it is; false also ignores `gc.bigPackThreshold`.
+   */
+  setKeepLargestPack(keep: boolean): this {
+    this.checkCallable();
+    this._keepLargestPack = keep;
+    return this;
+  }
+
+  /** git's `need_to_gc`: whether `gc --auto` has work to do. */
   private async needsAutoGc(): Promise<boolean> {
     const config = RemoteConfigStore.from(this.workingCopy);
     // git_config_int: k, m and g units, hex and octal; git dies on anything else
@@ -156,11 +213,8 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
   }
 
   /**
-   * Set aggressive mode.
-   *
-   * In aggressive mode, GC will also repack objects for better compression.
-   *
-   * @param aggressive Whether to run aggressive GC
+   * `--aggressive`: deltas searched again (`repack -f`) with `gc.aggressiveWindow` (250) and
+   * `gc.aggressiveDepth` (50).
    */
   setAggressive(aggressive: boolean): this {
     this.checkCallable();
@@ -169,11 +223,8 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
   }
 
   /**
-   * Set whether to pack refs.
-   *
-   * When true (default), loose refs are packed into packed-refs.
-   *
-   * @param packRefs Whether to pack refs
+   * Whether to pack refs (`git pack-refs --all --prune`). Default: `gc.packRefs` (true;
+   * `notbare` packs them only in a repository with a worktree).
    */
   setPackRefs(packRefs: boolean): this {
     this.checkCallable();
@@ -182,18 +233,48 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
   }
 
   /**
-   * Set expiration date for unreachable objects.
-   *
-   * Objects unreachable but modified after this date will not be deleted.
-   * This provides a grace period to prevent deleting objects that might
-   * still be needed by in-progress operations.
-   *
-   * @param expire Expiration date (objects older than this may be deleted)
+   * `--prune=<date>`: unreachable objects older than this date expire; younger ones stay
+   * (loose, or in a cruft pack) in case a write in progress needs them.
    */
   setExpire(expire: Date): this {
     this.checkCallable();
     this._expire = expire;
     return this;
+  }
+
+  /** The repository's files backend: its FilesApi, common git directory and history. */
+  private async filesRepository(): Promise<
+    { files: FilesApi; gitDir: string; history: History } | undefined
+  > {
+    const history = this.workingCopy.history as History | undefined;
+    if (!history?.objects || !history.packs) return undefined;
+    const objects = await this.hooks.commonGitFile("objects");
+    if (!objects) return undefined;
+    return { files: objects.files, gitDir: objects.path.replace(/\/?objects$/, ""), history };
+  }
+
+  /** The prune expiry in milliseconds before now, undefined for the config's. */
+  private pruneExpireMs(): number | undefined {
+    if (this._expire) return Math.max(0, Date.now() - this._expire.getTime());
+    if (typeof this._prune !== "string") return undefined;
+    const nowMs = Date.now();
+    const cutoff = parseExpiryDate(this._prune, Math.floor(nowMs / 1000), "--prune");
+    if (cutoff === 0) return Number.POSITIVE_INFINITY;
+    if (cutoff === Number.POSITIVE_INFINITY) return 0;
+    return Math.max(0, nowMs - cutoff * 1000);
+  }
+
+  /** `gc.packRefs`: a boolean, or `notbare` (packed unless the repository is bare). */
+  private packRefsConfigured(): boolean {
+    if (this._packRefs !== undefined) return this._packRefs;
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const value = config.value("gc.packRefs");
+    if (value === undefined) return true;
+    if (value === "notbare") {
+      const bare = config.value("core.bare");
+      return !(bare !== undefined && (parseGitBool(bare) ?? false));
+    }
+    return parseGitBool(value) ?? true;
   }
 
   /**
@@ -206,51 +287,32 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
     this.setCallable(false);
 
     const startTime = Date.now();
-    const objectsRemoved = 0;
-    const bytesFreed = 0;
     let refsPacked = false;
     const messages: string[] = [];
+    const skipped = (autoSkipped: "not-needed" | "hook" | "running"): GCCommandResult => ({
+      objectsRemoved: 0,
+      bytesFreed: 0,
+      refsPacked,
+      durationMs: Date.now() - startTime,
+      worktreesPruned: [],
+      autoSkipped,
+    });
     if (this._auto) {
-      const skipped = (autoSkipped: "not-needed" | "hook"): GCCommandResult => ({
-        objectsRemoved,
-        bytesFreed,
-        refsPacked,
-        durationMs: Date.now() - startTime,
-        worktreesPruned: [],
-        autoSkipped,
-      });
       if (!(await this.needsAutoGc())) return skipped("not-needed");
       // git's `gc --auto`: the pre-auto-gc hook may refuse the housekeeping
       const hook = await this.hooks.run("pre-auto-gc");
       if (hook && hook.exitCode !== 0) return skipped("hook");
-      messages.push(
-        "Auto packing the repository for optimum performance.",
-        'See "git help gc" for manual housekeeping.',
-      );
+      if (!this._quiet)
+        messages.push(
+          "Auto packing the repository for optimum performance.",
+          'See "git help gc" for manual housekeeping.',
+        );
     }
 
-    // Collect all ref roots
-    const roots: ObjectId[] = [];
-    for await (const ref of this.refsStore.list("refs/")) {
-      if ("objectId" in ref && ref.objectId) {
-        roots.push(ref.objectId);
-      }
-    }
-
-    // Also include HEAD if it points to a commit
-    const head = await this.refsStore.resolve("HEAD");
-    if (head?.objectId) {
-      roots.push(head.objectId);
-    }
-
-    // Run garbage collection if GCController is available
-    // Note: This requires access to the Repository's gc property
-    // For now, we'll check if the ref store supports the gc operations
-
-    // Check if refs support packRefs
-    // (`pack-refs --all --prune`; git 2.5x's `gc --auto` adds `--auto`, should_pack_refs)
+    // `pack-refs --all --prune` (git 2.5x's `gc --auto` adds `--auto`, should_pack_refs)
     const errors: string[] = [];
-    if (this._packRefs && this.refsStore.packRefs) {
+    const packRefs = async () => {
+      if (!this.refsStore.packRefs) return;
       await this.refsStore.packRefs([], {
         all: true,
         deleteLoose: true,
@@ -261,41 +323,78 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
         },
       });
       refsPacked = true;
-    }
+    };
 
-    // git gc prunes the administrative files of gone worktrees (gc.worktreePruneExpire)
+    // `worktree prune --expire <gc.worktreePruneExpire>`
     const worktreesPruned: string[] = [];
-    if (this.workingCopy.worktrees) {
+    const pruneWorktrees = async () => {
+      if (!this.workingCopy.worktrees) return;
       const expire =
         RemoteConfigStore.from(this.workingCopy).value("gc.worktreePruneExpire") ?? "3.months.ago";
       const { pruned } = await new WorktreePruneCommand(this.workingCopy).setExpire(expire).call();
       for (const p of pruned) worktreesPruned.push(p.id);
+    };
+
+    const repository = await this.filesRepository();
+    if (!repository) {
+      // no files backend: refs and worktrees only
+      if (this.packRefsConfigured()) await packRefs();
+      await pruneWorktrees();
+      return {
+        objectsRemoved: 0,
+        bytesFreed: 0,
+        refsPacked,
+        durationMs: Date.now() - startTime,
+        worktreesPruned,
+        ...(this._auto ? { messages } : {}),
+        ...(errors.length > 0 || this.alternatesErrors().length > 0
+          ? { errors: [...this.alternatesErrors(), ...errors] }
+          : {}),
+      };
     }
 
-    // Note: Full GC requires Repository.gc which provides access to
-    // GCController with collectGarbage(). This command provides the
-    // interface but full implementation requires Repository access.
-    // The WorkingCopy interface doesn't expose gc, so we'd need to extend
-    // the interface or use a different pattern.
-
-    // For aggressive mode, we could trigger repack here
-    // But that also requires access to the GCController
-    // Reserved for future implementation:
-    // - this._aggressive: trigger full repack with better compression
-    // - this._expire: pass to collectGarbage() for expiration filtering
-    void this._aggressive;
-    void this._expire;
-
+    const environment = hostEnvironmentOf(this.workingCopy);
+    const pruneExpireMs = this.pruneExpireMs();
+    const details = await storeGc({
+      history: repository.history,
+      files: repository.files,
+      gitDir: repository.gitDir,
+      compatibility: this.hooks.compatibility,
+      ...(environment ? { environment } : {}),
+      packRefs: this.packRefsConfigured(),
+      packRefsStep: packRefs,
+      beforeObjects: pruneWorktrees,
+      afterObjects: pruneWorktrees,
+      ...(this._prune === false ? { prune: false } : {}),
+      ...(pruneExpireMs !== undefined ? { pruneExpireMs } : {}),
+      ...(this._cruft !== undefined ? { cruftPacks: this._cruft } : {}),
+      ...(this._maxCruftSize !== undefined ? { maxCruftSize: this._maxCruftSize } : {}),
+      ...(this._keepLargestPack !== undefined ? { keepLargestPack: this._keepLargestPack } : {}),
+      ...(this._aggressive ? { aggressive: true } : {}),
+      ...(this._auto ? { auto: true } : {}),
+    });
+    if (details.skipped) {
+      if (this._auto) return skipped("running");
+      throw new GitApiError(
+        "fatal: gc is already running on this repository (gc.pid is held; remove it if no gc runs)",
+      );
+    }
+    const storage = details.storage;
+    const allErrors = [...this.alternatesErrors(), ...errors, ...(details.errors ?? [])];
+    // the alternates' lines come once (the store's gc repeats them)
+    const uniqueErrors = allErrors.filter(
+      (line, i) => !this.alternatesErrors().includes(line) || allErrors.indexOf(line) === i,
+    );
     return {
-      objectsRemoved,
-      bytesFreed,
+      objectsRemoved: storage ? storage.before.objects - storage.after.objects : 0,
+      bytesFreed: storage ? storage.before.bytes - storage.after.bytes : 0,
       refsPacked,
       durationMs: Date.now() - startTime,
       worktreesPruned,
       ...(this._auto ? { messages } : {}),
-      ...(errors.length > 0 || this.alternatesErrors().length > 0
-        ? { errors: [...this.alternatesErrors(), ...errors] }
-        : {}),
+      ...(uniqueErrors.length > 0 ? { errors: uniqueErrors } : {}),
+      ...(details.warnings ? { warnings: details.warnings } : {}),
+      details,
     };
   }
 }
