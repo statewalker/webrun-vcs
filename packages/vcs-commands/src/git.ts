@@ -70,7 +70,13 @@ import {
   StashDropCommand,
   StashListCommand,
   StatusCommand,
+  SubmoduleDeinitCommand,
+  SubmoduleForeachCommand,
+  SubmoduleInitCommand,
+  SubmoduleSetBranchCommand,
+  SubmoduleSetUrlCommand,
   SubmoduleSummaryCommand,
+  SubmoduleSyncCommand,
   SwitchCommand,
   TagCommand,
   VerifyPackCommand,
@@ -846,6 +852,84 @@ export class Git implements Disposable {
   submoduleSummary(): SubmoduleSummaryCommand {
     this.checkClosed();
     return new SubmoduleSummaryCommand(this._workingCopy);
+  }
+
+  /**
+   * `git submodule init`: register the submodules of `.gitmodules` in `.git/config`.
+   *
+   * @example
+   * ```typescript
+   * const { stderr } = await git.submoduleInit().call();
+   * ```
+   */
+  submoduleInit(): SubmoduleInitCommand {
+    this.checkClosed();
+    return new SubmoduleInitCommand(this._workingCopy);
+  }
+
+  /**
+   * `git submodule deinit`: empty submodules' worktrees and unregister them.
+   *
+   * @example
+   * ```typescript
+   * await git.submoduleDeinit().addPath("lib").setForce(true).call();
+   * ```
+   */
+  submoduleDeinit(): SubmoduleDeinitCommand {
+    this.checkClosed();
+    return new SubmoduleDeinitCommand(this._workingCopy);
+  }
+
+  /**
+   * `git submodule sync`: register submodules' URLs again from `.gitmodules`.
+   *
+   * @example
+   * ```typescript
+   * await git.submoduleSync().setRecursive(true).call();
+   * ```
+   */
+  submoduleSync(): SubmoduleSyncCommand {
+    this.checkClosed();
+    return new SubmoduleSyncCommand(this._workingCopy);
+  }
+
+  /**
+   * `git submodule set-url <path> <newurl>`.
+   *
+   * @example
+   * ```typescript
+   * await git.submoduleSetUrl().setPath("lib").setUrl("../lib2").call();
+   * ```
+   */
+  submoduleSetUrl(): SubmoduleSetUrlCommand {
+    this.checkClosed();
+    return new SubmoduleSetUrlCommand(this._workingCopy);
+  }
+
+  /**
+   * `git submodule set-branch (-b <branch> | -d) <path>`.
+   *
+   * @example
+   * ```typescript
+   * await git.submoduleSetBranch().setPath("lib").setBranch("stable").call();
+   * ```
+   */
+  submoduleSetBranch(): SubmoduleSetBranchCommand {
+    this.checkClosed();
+    return new SubmoduleSetBranchCommand(this._workingCopy);
+  }
+
+  /**
+   * `git submodule foreach`: a command (or callback) in each populated submodule.
+   *
+   * @example
+   * ```typescript
+   * await git.submoduleForeach().setCommand(["git status --short"]).call();
+   * ```
+   */
+  submoduleForeach(): SubmoduleForeachCommand {
+    this.checkClosed();
+    return new SubmoduleForeachCommand(this._workingCopy);
   }
 
   // ============ Diff Operations ============
