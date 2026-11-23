@@ -605,7 +605,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       await editor.finish();
       // reset_tree's unpack-trees ends with cache_tree_update: the invalid directories
       // computed from the index (fully valid)
-      await updateIndexCacheTree(this.staging, this.trees);
+      await updateIndexCacheTree(this.staging, this.trees, this.objectFormat);
     } else {
       // the index keeps its entries, plus the files the stash adds (git stages them)
       const added = new Set<string>();

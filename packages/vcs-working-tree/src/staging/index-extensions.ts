@@ -175,8 +175,14 @@ export function parseResolveUndo(data: Uint8Array, rawLength = 20): ResolveUndoR
   return records;
 }
 
-/** Encode resolve-undo records as a `REUC` payload. */
-export function encodeResolveUndo(records: readonly ResolveUndoRecord[]): Uint8Array {
+/**
+ * Encode resolve-undo records as a `REUC` payload, ids `rawLength` bytes long (20, or 32 in a
+ * SHA-256 repository): an id of another width is refused.
+ */
+export function encodeResolveUndo(
+  records: readonly ResolveUndoRecord[],
+  rawLength = 20,
+): Uint8Array {
   const parts: Uint8Array[] = [];
   for (const r of records) {
     parts.push(encodeGitPath(`${r.path}\0${r.modes.map((m) => m.toString(8)).join("\0")}\0`));
@@ -184,7 +190,7 @@ export function encodeResolveUndo(records: readonly ResolveUndoRecord[]): Uint8A
       const id = r.objectIds[i];
       if (m === 0) return;
       if (!id) throw new Error(`REUC record for ${r.path}: missing object id for stage ${i + 1}`);
-      parts.push(objectIdToBytes(id));
+      parts.push(objectIdToBytes(id, rawLength));
     });
   }
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));

@@ -298,6 +298,8 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
         has: async (id: ObjectId) => id === this.objectFormat.emptyTreeId || (await trees.has(id)),
       },
       entries,
+      // the repository's format: an empty index has no id to tell it (read-tree --empty)
+      this.objectFormat,
     );
   }
 

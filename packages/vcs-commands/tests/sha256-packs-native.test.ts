@@ -687,6 +687,35 @@ describeGit("SHA-256 packs and index files against native git", () => {
       expect(fsckOf(dir)).toEqual(fsckOf(twin));
     });
 
+    // review of #236 (C1), t1000-read-tree-m-3way.sh's `read-tree --empty`: the cache-tree ours
+    // writes holds the SHA-256 empty tree (32 bytes), never SHA-1's
+    it("read-tree --empty writes a SHA-256 empty-tree cache-tree git reads", async () => {
+      const dir = nativeRepo();
+      const twin = fresh();
+      spawnSync("cp", ["-a", dir, twin]);
+      g(twin, "read-tree", "--empty");
+      const git = await openOurs(dir);
+      await git.readTree().setEmpty(true).call();
+      const treeOf = async (d: string) =>
+        (
+          await parseIndexFile(new Uint8Array(readFileSync(join(d, ".git", "index"))), {
+            objectFormat: SHA256_OBJECT_FORMAT,
+            verifyChecksum: true,
+          })
+        ).extensionData.find((e) => e.signature === "TREE")?.data;
+      const ours = await treeOf(dir);
+      const theirs = await treeOf(twin);
+      expect(Buffer.from(ours ?? new Uint8Array()).toString("hex")).toBe(
+        Buffer.from(theirs ?? new Uint8Array()).toString("hex"),
+      );
+      expect(g(dir, "ls-files", "-s")).toBe("");
+      expect(native(dir, ["status", "--porcelain"]).stdout).toBe(
+        native(twin, ["status", "--porcelain"]).stdout,
+      );
+      expect(native(dir, fsckArgs())).toEqual(native(twin, fsckArgs()));
+      expect(g(dir, "write-tree")).toBe(SHA256_OBJECT_FORMAT.emptyTreeId);
+    });
+
     // porcelain over the index: status, add, commit -a, read by native git
     it("status, add and commit -a work over git's index and git reads ours", async () => {
       const dir = nativeRepo();

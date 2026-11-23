@@ -11,11 +11,13 @@ import {
   collectTreeBytes,
   FileMode,
   type ObjectId,
+  objectFormatOf,
   type RefLogOptions,
   type TreeEntry,
 } from "@statewalker/vcs-core";
 import { bytesToHex, createSha1, objectFormatByHexLength } from "@statewalker/vcs-utils";
 import { compareGitPaths, decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import {
   attributesIndexOf,
   type CacheTree,
@@ -484,6 +486,8 @@ export async function readIndex(
 export async function writeIndexAsTree(
   staging: Staging,
   trees: CommandTrees,
+  /** the repository's object format, the cache-tree's trees are hashed in */
+  format: ObjectFormat,
   options: { write?: boolean } = {},
 ): Promise<ObjectId> {
   if (!staging.getCacheTree || !staging.setCacheTree) return staging.writeTree(trees);
@@ -491,7 +495,7 @@ export async function writeIndexAsTree(
   const treeId = await staging.writeTree(trees);
   if (!previous || !cacheTreeFullyValid(previous)) {
     // the valid directories kept, the others computed (cache_tree_update)
-    const cacheTree = await updateCacheTree(trees, treeId, previous);
+    const cacheTree = await updateCacheTree(trees, treeId, previous, format);
     for (const entry of await indexEntryList(staging)) {
       if (entry.intentToAdd) {
         invalidateCacheTreeForIntentToAdd(cacheTree, entry.path);
@@ -511,13 +515,18 @@ export async function writeIndexAsTree(
  * directories of intent-to-add entries left invalid; nothing where the index has conflicts.
  * Sets the cache-tree the next `write` writes.
  */
-export async function updateIndexCacheTree(staging: Staging, trees: CommandTrees): Promise<void> {
+export async function updateIndexCacheTree(
+  staging: Staging,
+  trees: CommandTrees,
+  /** the repository's object format, the cache-tree's trees are hashed in */
+  format: ObjectFormat,
+): Promise<void> {
   if (!staging.getCacheTree || !staging.setCacheTree) return;
   if (await staging.hasConflicts()) return;
   const previous = staging.getCacheTree();
   if (previous && cacheTreeFullyValid(previous)) return;
   const treeId = await staging.writeTree(trees);
-  const cacheTree = await updateCacheTree(trees, treeId, previous);
+  const cacheTree = await updateCacheTree(trees, treeId, previous, format);
   for (const entry of await indexEntryList(staging)) {
     if (entry.intentToAdd) {
       invalidateCacheTreeForIntentToAdd(cacheTree, entry.path);
@@ -546,7 +555,7 @@ export async function rewriteIndex(
   staging: Staging,
   changes: Map<string, IndexEntryInput[]>,
   options: {
-    updateCacheTreeWith?: CommandTrees;
+    updateCacheTreeWith?: { trees: CommandTrees; format: ObjectFormat };
     cacheTree?: CacheTree;
     /**
      * Whether the kept entries count as up to date (default true: the merge family refreshes
@@ -608,7 +617,10 @@ export async function rewriteIndex(
   // a cache-tree computed for the entries just built
   if (options.cacheTree) staging.setCacheTree?.(options.cacheTree);
   // unpack-trees' cache_tree_update before its index write
-  if (options.updateCacheTreeWith) await updateIndexCacheTree(staging, options.updateCacheTreeWith);
+  if (options.updateCacheTreeWith) {
+    const { trees, format } = options.updateCacheTreeWith;
+    await updateIndexCacheTree(staging, trees, format);
+  }
   if (options.write !== false) await staging.write();
 }
 
@@ -1124,7 +1136,12 @@ async function switchTreesWith(
     if (previous) {
       for (const path of [...updates, ...removes]) invalidateCacheTreePath(previous, path);
     }
-    const cacheTree = await updateCacheTree(ctx.trees, options.targetTree, previous);
+    const cacheTree = await updateCacheTree(
+      ctx.trees,
+      options.targetTree,
+      previous,
+      objectFormatOf(ctx.workingCopy.history),
+    );
     // the index the switch leaves is the target only where it switched: an entry it kept
     // (a staged change the two trees agree on, carried over) differs from the target, and
     // its directories are invalid, as cache_tree_update computes them from the index

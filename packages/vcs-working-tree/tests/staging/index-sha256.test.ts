@@ -8,7 +8,14 @@
 import { createInMemoryFilesApi } from "@statewalker/vcs-utils/files";
 import { SHA256_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { describe, expect, it } from "vitest";
-import { encodeCacheTree, parseCacheTree } from "../../src/staging/cache-tree.js";
+import {
+  encodeCacheTree,
+  parseCacheTree,
+  repairCacheTree,
+  storeCacheTree,
+  treeIdOfEntries,
+  updateCacheTree,
+} from "../../src/staging/cache-tree.js";
 import { encodeResolveUndo, parseResolveUndo } from "../../src/staging/index-extensions.js";
 import { IndexFile } from "../../src/staging/index-file.js";
 import {
@@ -100,7 +107,7 @@ describe("SHA-256 index file", () => {
       id: ID_A,
       subtrees: [{ name: "dir", tree: { entryCount: 1, id: ID_B, subtrees: [] } }],
     };
-    expect(parseCacheTree(encodeCacheTree(tree), 32)).toEqual(tree);
+    expect(parseCacheTree(encodeCacheTree(tree, 32), 32)).toEqual(tree);
     const records = [
       {
         path: "a.txt",
@@ -112,10 +119,10 @@ describe("SHA-256 index file", () => {
         ],
       },
     ];
-    expect(parseResolveUndo(encodeResolveUndo(records), 32)).toEqual(records);
+    expect(parseResolveUndo(encodeResolveUndo(records, 32), 32)).toEqual(records);
     const deleted = new EwahBitmap();
     deleted.set(1);
-    const link = encodeLinkExtension(ID_A, deleted, new EwahBitmap());
+    const link = encodeLinkExtension(ID_A, deleted, new EwahBitmap(), 32);
     expect(parseLinkExtension(link, 32)).toEqual({ baseId: ID_A, deleted: [1], replaced: [] });
     const cache = newUntrackedCache("Location /w, system Linux", 6, format);
     expect(cache.infoExclude.oid).toBe(format.nullId);
@@ -131,7 +138,7 @@ describe("SHA-256 index file", () => {
   });
 
   it("writes a split index whose link names a SHA-256 shared index", async () => {
-    const link = encodeLinkExtension(format.nullId, new EwahBitmap(), new EwahBitmap());
+    const link = encodeLinkExtension(format.nullId, new EwahBitmap(), new EwahBitmap(), 32);
     const { bytes } = await encodeIndexInOrder(
       [{ entry: entry("a.txt", ID_A), path: "a.txt" }],
       INDEX_VERSION_2,
@@ -158,5 +165,50 @@ describe("SHA-256 index file", () => {
     // a write after another writer is refused by checksum, as in SHA-1
     await again.write([entry("a.txt", ID_B)]);
     await expect(file.write([entry("a.txt", ID_A)])).rejects.toThrow();
+  });
+
+  // review of #236 (C1): `read-tree --empty` wrote SHA-1's 20-byte empty tree into a SHA-256
+  // index's TREE, the format guessed from the (absent) entries
+  it("computes cache-trees in the format given, never guessed from the entries", async () => {
+    const has = async (id: string) => id === format.emptyTreeId;
+    const empty = await repairCacheTree({ has }, [], format);
+    expect(empty).toEqual({ entryCount: 0, id: format.emptyTreeId, subtrees: [] });
+    const bytes = encodeCacheTree(empty as NonNullable<typeof empty>, format.rawLength);
+    // "", NUL, "0 0\n", then the 32-byte id
+    expect(bytes.length).toBe(5 + 32);
+    expect(parseCacheTree(bytes, 32).id).toBe(format.emptyTreeId);
+    const stored = await storeCacheTree(async () => format.emptyTreeId, [], format);
+    expect(stored?.id).toBe(format.emptyTreeId);
+    expect(await treeIdOfEntries([], format)).toBe(format.emptyTreeId);
+    const updated = await updateCacheTree(
+      { load: async () => undefined, has: async () => false, entries: async () => [] },
+      format.emptyTreeId,
+      undefined,
+      format,
+    );
+    expect(updated.id).toBe(format.emptyTreeId);
+  });
+
+  it("encoders refuse ids of another width than the index's", () => {
+    const sha1Tree = {
+      entryCount: 0,
+      id: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+      subtrees: [],
+    };
+    expect(() => encodeCacheTree(sha1Tree, 32)).toThrow();
+    expect(() => encodeCacheTree({ entryCount: 0, id: ID_A, subtrees: [] }, 20)).toThrow();
+    const record = {
+      path: "a.txt",
+      modes: [0o100644, 0, 0] as [number, number, number],
+      objectIds: ["a".repeat(40), undefined, undefined] as [
+        string | undefined,
+        string | undefined,
+        string | undefined,
+      ],
+    };
+    expect(() => encodeResolveUndo([record], 32)).toThrow();
+    expect(() =>
+      encodeLinkExtension("a".repeat(40), new EwahBitmap(), new EwahBitmap(), 32),
+    ).toThrow();
   });
 });

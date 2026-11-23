@@ -678,7 +678,10 @@ export class IndexFile {
         .filter((e) => e.signature !== "TREE")
         .filter((e) => e.signature !== "FSMN");
       if (full.cacheTree) {
-        extensions = [{ signature: "TREE", data: encodeCacheTree(full.cacheTree) }, ...extensions];
+        extensions = [
+          { signature: "TREE", data: encodeCacheTree(full.cacheTree, this.rawLength) },
+          ...extensions,
+        ];
       }
     }
     if (linkData || sparse) validateIndexEntryPaths(entries);
@@ -764,7 +767,7 @@ export class IndexFile {
       before = () => this.writeSharedIndex(written.bytes, id, settings);
     }
     const sharedId = shared ? shared.id : this.format.nullId;
-    const { items, link } = prepareSplitWrite(classification, sharedId);
+    const { items, link } = prepareSplitWrite(classification, sharedId, this.rawLength);
     const main = await encodeIndexInOrder(
       items,
       version,
@@ -853,7 +856,7 @@ export class IndexFile {
     // ones holding an intent-to-add entry invalid; undefined when it cannot be had
     const computed = async (list: readonly StagingEntry[]) => {
       try {
-        return await storeCacheTree((items) => trees.store(items), list);
+        return await storeCacheTree((items) => trees.store(items), list, this.format);
       } catch {
         return undefined;
       }
@@ -870,7 +873,7 @@ export class IndexFile {
           return t && t.entryCount >= 0 ? t.id : undefined;
         },
       );
-      if (kept && (await sparseIndexMatches(kept.entries, entries, trees))) {
+      if (kept && (await sparseIndexMatches(kept.entries, entries, trees, this.format))) {
         return this.sparsePlan(
           kept.entries,
           kept.cacheTree,
@@ -888,13 +891,14 @@ export class IndexFile {
       if (!tree) return undefined;
     }
     let collapsed = collapseSparseIndex(entries, tree, inCheckout);
-    if (!(await sparseIndexMatches(collapsed.entries, entries, trees))) {
+    if (!(await sparseIndexMatches(collapsed.entries, entries, trees, this.format))) {
       // a cache-tree that no longer describes the entries: computed again, never written
       if (!fromIndex) return undefined;
       tree = await computed(entries);
       if (!tree) return undefined;
       collapsed = collapseSparseIndex(entries, tree, inCheckout);
-      if (!(await sparseIndexMatches(collapsed.entries, entries, trees))) return undefined;
+      if (!(await sparseIndexMatches(collapsed.entries, entries, trees, this.format)))
+        return undefined;
     }
     return this.sparsePlan(
       collapsed.entries,
@@ -916,7 +920,9 @@ export class IndexFile {
     skipHash?: boolean,
   ): Promise<IndexWritePlan> {
     const onDisk: IndexExtension[] = [
-      ...(sparseTree ? [{ signature: "TREE", data: encodeCacheTree(sparseTree) }] : []),
+      ...(sparseTree
+        ? [{ signature: "TREE", data: encodeCacheTree(sparseTree, this.rawLength) }]
+        : []),
       ...rest,
       { signature: SPARSE_DIRECTORIES_EXTENSION, data: new Uint8Array(0) },
     ];
@@ -933,7 +939,7 @@ export class IndexFile {
     );
     // in memory the index stays full, with the full index's cache-tree
     const kept: IndexExtension[] = [
-      ...(fullTree ? [{ signature: "TREE", data: encodeCacheTree(fullTree) }] : []),
+      ...(fullTree ? [{ signature: "TREE", data: encodeCacheTree(fullTree, this.rawLength) }] : []),
       ...rest,
     ];
     return {
@@ -1034,7 +1040,7 @@ export class IndexFile {
       return;
     }
     const at = others.findIndex((e) => e.signature === "TREE") + 1;
-    const reuc = { signature: "REUC", data: encodeResolveUndo(kept) };
+    const reuc = { signature: "REUC", data: encodeResolveUndo(kept, this.rawLength) };
     this.extensions = [...others.slice(0, at), reuc, ...others.slice(at)];
   }
 
@@ -1070,7 +1076,7 @@ export class IndexFile {
       byPath.set(record.path, { path: record.path, modes, objectIds });
     }
     const sorted = [...byPath.values()].sort((a, b) => compareGitPaths(a.path, b.path));
-    const reuc = { signature: "REUC", data: encodeResolveUndo(sorted) };
+    const reuc = { signature: "REUC", data: encodeResolveUndo(sorted, this.rawLength) };
     const others = this.extensions.filter((e) => e.signature !== "REUC");
     // git writes it after the cache-tree
     const at = others.findIndex((e) => e.signature === "TREE") + 1;
@@ -1375,7 +1381,7 @@ export class IndexFile {
     if (tree && describesEntries(tree, entries)) {
       // git writes the cache-tree first
       extensions = [
-        { signature: "TREE", data: encodeCacheTree(tree) },
+        { signature: "TREE", data: encodeCacheTree(tree, this.rawLength) },
         ...extensions.filter((e) => e.signature !== "TREE"),
       ];
     }

@@ -8,6 +8,7 @@ import {
   FileMode,
   formatPersonIdent,
   type ObjectId,
+  objectFormatOf,
   type PersonIdent,
   type RefLogOptions,
 } from "@statewalker/vcs-core";
@@ -297,7 +298,9 @@ async function resetMergeWith(
   }
   // unpack-trees writes a new index: no resolve-undo record survives the reset
   ctx.staging.clearResolveUndo?.();
-  await rewriteIndex(ctx.staging, edits, { updateCacheTreeWith: ctx.trees });
+  await rewriteIndex(ctx.staging, edits, {
+    updateCacheTreeWith: { trees: ctx.trees, format: objectFormatOf(ctx.workingCopy.history) },
+  });
   return { written: worktree ? writing : new Set() };
 }
 
@@ -360,7 +363,9 @@ export async function resetUnmergedToHead(
     ]);
   }
   ctx.staging.clearResolveUndo?.();
-  await rewriteIndex(ctx.staging, edits, { updateCacheTreeWith: ctx.trees });
+  await rewriteIndex(ctx.staging, edits, {
+    updateCacheTreeWith: { trees: ctx.trees, format: objectFormatOf(ctx.workingCopy.history) },
+  });
 }
 
 /**
@@ -519,7 +524,9 @@ async function resetKeepWith(
     ]);
   }
   ctx.staging.clearResolveUndo?.();
-  await rewriteIndex(ctx.staging, edits, { updateCacheTreeWith: ctx.trees });
+  await rewriteIndex(ctx.staging, edits, {
+    updateCacheTreeWith: { trees: ctx.trees, format: objectFormatOf(ctx.workingCopy.history) },
+  });
   return { written: worktree ? writing : new Set() };
 }
 

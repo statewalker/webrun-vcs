@@ -28,11 +28,7 @@ import {
 } from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
-import {
-  type ObjectFormat,
-  objectFormatByHexLength,
-  SHA1_OBJECT_FORMAT,
-} from "@statewalker/vcs-utils/hash";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 
 /** One directory of a cache-tree. */
 export interface CacheTree {
@@ -87,12 +83,14 @@ export async function cacheTreeOfTree(
  *
  * A node computed is the tree the index's entries make, whose modes are canonical: where the
  * stored tree holds other modes (100664), that is another tree, valid only when it is stored
- * (git's `WRITE_TREE_REPAIR`) and invalid otherwise, as its parents are.
+ * (git's `WRITE_TREE_REPAIR`) and invalid otherwise, as its parents are. Trees are hashed in
+ * `format`, the repository's object format.
  */
 export async function updateCacheTree(
   trees: Pick<Trees, "load" | "has" | "entries">,
   treeId: ObjectId,
   previous: CacheTree | undefined,
+  format: ObjectFormat,
 ): Promise<CacheTree> {
   if (previous && previous.entryCount >= 0 && previous.id === treeId) {
     return copyCacheTree(previous);
@@ -109,7 +107,7 @@ export async function updateCacheTree(
   const ids = new Map<string, ObjectId>();
   for (const dir of dirs) {
     const before = previous?.subtrees.find((s) => s.name === dir.name)?.tree;
-    const tree = await updateCacheTree(trees, dir.id, before);
+    const tree = await updateCacheTree(trees, dir.id, before, format);
     if (tree.entryCount < 0 || !tree.id) valid = false;
     else {
       node.entryCount += tree.entryCount;
@@ -122,7 +120,7 @@ export async function updateCacheTree(
   if (valid && changed) {
     const id = await canonicalTreeId(
       entries.map((e) => (e.mode === FileMode.TREE ? { ...e, id: ids.get(e.name) ?? e.id } : e)),
-      formatOfId(treeId),
+      format,
     );
     if (id !== treeId) {
       if (await trees.has(id)) node.id = id;
@@ -233,22 +231,12 @@ async function treeEntriesOf(
 }
 
 /**
- * The object format ids like `id` are in (a 64-hex id: SHA-256), SHA-1 for anything else: the
- * index holds the ids of one repository, so one id tells the format of all.
+ * The id of the tree `entries` make (not stored), hashed in `format` (the repository's: never
+ * guessed from the ids, an empty tree has none).
  */
-function formatOfId(id: string | undefined): ObjectFormat {
-  return objectFormatByHexLength(id?.length ?? 40) ?? SHA1_OBJECT_FORMAT;
-}
-
-/** The format of the ids `entries` hold (SHA-1 when there are none). */
-function formatOfEntries(entries: readonly { objectId: ObjectId }[]): ObjectFormat {
-  return formatOfId(entries[0]?.objectId);
-}
-
-/** The id of the tree `entries` make (not stored), in `format` (else the ids' own format). */
 async function canonicalTreeId(
   entries: readonly TreeEntry[],
-  format: ObjectFormat = formatOfId(entries[0]?.id),
+  format: ObjectFormat,
 ): Promise<ObjectId> {
   const bytes = await collectTreeBytes(entries);
   const hasher = format.createHasher().update(new TextEncoder().encode(`tree ${bytes.length}\0`));
@@ -315,12 +303,16 @@ export function cacheTreeFullyValid(tree: CacheTree): boolean {
   return tree.subtrees.every((s) => cacheTreeFullyValid(s.tree));
 }
 
-/** The `TREE` extension payload of `tree`. */
-export function encodeCacheTree(tree: CacheTree): Uint8Array {
+/**
+ * The `TREE` extension payload of `tree`, its ids `rawLength` bytes long (20, SHA-1's; 32 in a
+ * SHA-256 repository). An id of another width is refused (`InvalidObjectIdError`), never
+ * written into an index of the other format.
+ */
+export function encodeCacheTree(tree: CacheTree, rawLength = 20): Uint8Array {
   const parts: Uint8Array[] = [];
   const write = (name: string, node: CacheTree) => {
     parts.push(encodeGitPath(`${name}\0${node.entryCount} ${node.subtrees.length}\n`));
-    if (node.entryCount >= 0 && node.id) parts.push(objectIdToBytes(node.id));
+    if (node.entryCount >= 0 && node.id) parts.push(objectIdToBytes(node.id, rawLength));
     for (const sub of node.subtrees) write(sub.name, sub.tree);
   };
   write("", tree);
@@ -438,8 +430,11 @@ export async function verifyCacheTree(
  * so the `TREE` written matches git's byte for byte.
  *
  * ```typescript
- * staging.setCacheTree?.(await repairCacheTree(trees, staging.entryList?.() ?? []));
+ * staging.setCacheTree?.(await repairCacheTree(trees, staging.entryList?.() ?? [], format));
  * ```
+ *
+ * Trees are hashed in `format`, the repository's object format (an index without entries has
+ * no id to tell it: `read-tree --empty`).
  */
 export async function repairCacheTree(
   trees: Pick<Trees, "has">,
@@ -450,11 +445,11 @@ export async function repairCacheTree(
     stage: number;
     intentToAdd?: boolean;
   }[],
+  format: ObjectFormat,
 ): Promise<CacheTree | undefined> {
   if (entries.some((e) => e.stage !== 0)) return undefined;
   /** The tree id a node computed, kept even while the node is invalid (git's `it->oid`). */
   const oids = new Map<CacheTree, ObjectId>();
-  const format = formatOfEntries(entries);
   const emptyTree = format.emptyTreeId;
   /** `update_one` of the entries from `start` under `base`: how many it covers, or -1. */
   const update = async (node: CacheTree, start: number, base: string): Promise<number> => {
@@ -531,8 +526,11 @@ export async function repairCacheTree(
  * stored. Undefined when the index has unmerged entries.
  *
  * ```typescript
- * const tree = await storeCacheTree((entries) => trees.store(entries), staging.entryList());
+ * const tree = await storeCacheTree((entries) => trees.store(entries), staging.entryList(), format);
  * ```
+ *
+ * `format` is the repository's object format (its empty tree is the one an intent-to-add-only
+ * directory leaves out).
  */
 export async function storeCacheTree(
   store: (entries: TreeEntry[]) => Promise<ObjectId>,
@@ -543,10 +541,10 @@ export async function storeCacheTree(
     stage: number;
     intentToAdd?: boolean;
   }[],
+  format: ObjectFormat,
 ): Promise<CacheTree | undefined> {
   if (entries.some((e) => e.stage !== 0)) return undefined;
   const oids = new Map<CacheTree, ObjectId>();
-  const format = formatOfEntries(entries);
   const emptyTree = format.emptyTreeId;
   const update = async (node: CacheTree, start: number, base: string): Promise<number> => {
     const inBase = (i: number) => {
@@ -613,7 +611,7 @@ export async function storeCacheTree(
 /**
  * The id of the tree `entries` make (paths relative to it, in index order), hashed and not
  * stored; undefined when an entry is unmerged or intent-to-add (no tree holds it: git's
- * `update_one` leaves such a directory invalid).
+ * `update_one` leaves such a directory invalid). Hashed in `format`, the repository's.
  */
 export async function treeIdOfEntries(
   entries: readonly {
@@ -623,10 +621,10 @@ export async function treeIdOfEntries(
     stage: number;
     intentToAdd?: boolean;
   }[],
+  format: ObjectFormat,
 ): Promise<ObjectId | undefined> {
   if (entries.some((e) => e.stage !== 0 || e.intentToAdd)) return undefined;
-  const format = formatOfEntries(entries);
-  const tree = await storeCacheTree((items) => canonicalTreeId(items, format), entries);
+  const tree = await storeCacheTree((items) => canonicalTreeId(items, format), entries, format);
   return tree && tree.entryCount >= 0 ? tree.id : undefined;
 }
 

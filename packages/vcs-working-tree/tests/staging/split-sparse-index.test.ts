@@ -4,6 +4,7 @@
  * ones before a write, and expanding and collapsing sparse directories with their cache-tree.
  */
 import { createInMemoryFilesApi } from "@statewalker/vcs-utils/files";
+import { SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { describe, expect, it } from "vitest";
 import {
   type CacheTree,
@@ -192,7 +193,11 @@ describe("sparse index", () => {
       entry("u/e", 5, sw),
       entry("v/f", 6),
     ];
-    const tree = (await storeCacheTree((l) => trees.store(l), full)) as CacheTree;
+    const tree = (await storeCacheTree(
+      (l) => trees.store(l),
+      full,
+      SHA1_OBJECT_FORMAT,
+    )) as CacheTree;
     const inCone = (p: string) => p === "k/" || p === "v/";
     const sparse = collapseSparseIndex(full, tree, inCone);
     expect(sparse.entries.map((e) => `${e.mode.toString(8)} ${e.path}`)).toEqual([
@@ -227,7 +232,11 @@ describe("sparse index", () => {
   it("a directory with an entry not skip-worktree, or inside the cone, stays expanded", async () => {
     const trees = memoryTrees();
     const full = [entry("s/c", 2, { skipWorktree: true }), entry("s/d", 3), entry("u/e", 5)];
-    const tree = (await storeCacheTree((l) => trees.store(l), full)) as CacheTree;
+    const tree = (await storeCacheTree(
+      (l) => trees.store(l),
+      full,
+      SHA1_OBJECT_FORMAT,
+    )) as CacheTree;
     const sparse = collapseSparseIndex(full, tree, (p) => p === "u/");
     expect(sparse.entries.map((e) => e.path)).toEqual(["s/c", "s/d", "u/e"]);
   });
@@ -328,7 +337,11 @@ describe("sparse index writes stand for the full index", () => {
     // the entries it describes
     const other = base();
     other[2] = entry("out/b.txt", 99, sw);
-    const stale = (await storeCacheTree((l) => trees.store(l), other)) as CacheTree;
+    const stale = (await storeCacheTree(
+      (l) => trees.store(l),
+      other,
+      SHA1_OBJECT_FORMAT,
+    )) as CacheTree;
     file.setCacheTree(stale);
     await file.write(entries);
     const written = await expectStandsFor(files, trees, entries);

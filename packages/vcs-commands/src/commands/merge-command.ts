@@ -1308,7 +1308,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
     let savedTree: ObjectId | undefined;
     let indexTree: ObjectId | undefined;
     if (await provider.hasLocalChanges()) {
-      indexTree = await writeIndexAsTree(this.staging, this.trees);
+      indexTree = await writeIndexAsTree(this.staging, this.trees, this.objectFormat);
       savedTree = await provider.getWorkingTree();
     }
     // nothing saved: the reset alone, which leaves the index exactly HEAD (read-tree's

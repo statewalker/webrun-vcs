@@ -977,7 +977,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
    * checkout do before the write).
    */
   private async writeSwitchedIndex(): Promise<void> {
-    await updateIndexCacheTree(this.staging, this.trees);
+    await updateIndexCacheTree(this.staging, this.trees, this.objectFormat);
     markIndexUpdate(this.staging, { workdir: true });
     await this.staging.write();
   }

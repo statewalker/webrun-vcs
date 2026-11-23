@@ -62,8 +62,19 @@ export function parseLinkExtension(data: Uint8Array, rawLength = 20): LinkExtens
   return { baseId, deleted: [...del.bitmap.bits()], replaced: [...rep.bitmap.bits()] };
 }
 
-/** git's `write_link_extension`: the shared index's id, then the delete and replace bitmaps. */
-export function encodeLinkExtension(baseId: string, deleted: Ewah, replaced: Ewah): Uint8Array {
+/**
+ * git's `write_link_extension`: the shared index's id (`rawLength` bytes: 20, or 32 in a
+ * SHA-256 repository; another width is refused), then the delete and replace bitmaps.
+ */
+export function encodeLinkExtension(
+  baseId: string,
+  deleted: Ewah,
+  replaced: Ewah,
+  rawLength = 20,
+): Uint8Array {
+  if (baseId.length !== 2 * rawLength || !/^[0-9a-f]+$/.test(baseId)) {
+    throw new Error(`not a ${rawLength}-byte shared index id: ${JSON.stringify(baseId)}`);
+  }
   const out: number[] = [];
   for (let i = 0; i < baseId.length; i += 2) {
     out.push(Number.parseInt(baseId.slice(i, i + 2), 16));
@@ -348,6 +359,8 @@ export function tooManyNotSharedEntries(
 export function prepareSplitWrite(
   classification: SplitClassification,
   sharedId: string,
+  /** bytes of the shared index's id: 20, or 32 in a SHA-256 repository */
+  rawLength = 20,
 ): { items: OrderedIndexItem[]; link: Uint8Array } {
   const deleted = new Ewah();
   const replaced = new Ewah();
@@ -362,7 +375,7 @@ export function prepareSplitWrite(
     }
   }
   for (const entry of added) items.push({ entry, path: entry.path });
-  return { items, link: encodeLinkExtension(sharedId, deleted, replaced) };
+  return { items, link: encodeLinkExtension(sharedId, deleted, replaced, rawLength) };
 }
 
 /** After a split write: the entries remember where they stand in the shared index. */
