@@ -111,23 +111,40 @@ export function compareTreeEntryNames(
 }
 
 /**
+ * A tree entry name that cannot become a path component: empty, `.`, `..`, or holding `/`
+ * or a NUL. Trees are decoded strictly (their names become worktree paths), so a tree
+ * holding one cannot be read; commands report it as git does (`invalid path '<path>'`,
+ * `empty filename in tree entry`) by walking the raw tree again.
+ */
+export class InvalidTreeEntryNameError extends Error {
+  /** The refused name */
+  readonly entryName: string;
+
+  constructor(entryName: string, message: string) {
+    super(message);
+    this.name = "InvalidTreeEntryNameError";
+    this.entryName = entryName;
+  }
+}
+
+/**
  * Validate tree entry name
  *
  * @param name Entry name to validate
- * @throws Error if name is invalid
+ * @throws InvalidTreeEntryNameError if name is invalid
  */
 function validateEntryName(name: string): void {
   if (name === "") {
-    throw new Error("Tree entry name cannot be empty");
+    throw new InvalidTreeEntryNameError(name, "Tree entry name cannot be empty");
   }
   if (name === "." || name === "..") {
-    throw new Error(`Tree entry name cannot be '${name}'`);
+    throw new InvalidTreeEntryNameError(name, `Tree entry name cannot be '${name}'`);
   }
   if (name.includes("/")) {
-    throw new Error("Tree entry name cannot contain '/'");
+    throw new InvalidTreeEntryNameError(name, "Tree entry name cannot contain '/'");
   }
   if (name.includes("\0")) {
-    throw new Error("Tree entry name cannot contain null bytes");
+    throw new InvalidTreeEntryNameError(name, "Tree entry name cannot contain null bytes");
   }
   // only the strings `decodeGitPath` makes stand for bytes; any other lone surrogate would
   // encode to the same bytes as another name (two entries of one name in a tree)
