@@ -899,7 +899,7 @@ describeGit("SHA-256 commit-graphs, multi-pack-indexes and bitmaps against nativ
       const { packs } = await open(dir);
       expect(await packs.bitmap?.()).toBeUndefined();
       expect(packs.bitmapErrors).toHaveLength(1);
-      expect(packs.bitmapErrors[0]).toMatch(
+      expect(packs.bitmapErrors?.[0]).toMatch(
         /^error: bitmap file '.*\.bitmap' has invalid checksum$/,
       );
     });
