@@ -5,8 +5,8 @@
  * follow git's own tests, named per case: t0001-init.sh (object formats at init), t1006-cat-file.sh
  * (object reads), t1450-fsck.sh (fsck of a SHA-256 repository).
  *
- * What a SHA-256 repository does not support yet (reftables, the transports) is refused with
- * `UnsupportedObjectFormatError`: ours read the repositories here with an in-memory index.
+ * SHA-256 reftable repositories open and init here; their own twins are
+ * `sha256-reftable-git3-native.test.ts`. Ours reads the repositories here with an in-memory index.
  * Packs and the index file have their own twins (`sha256-packs-native.test.ts`), and so do
  * commit-graphs, multi-pack-indexes and bitmaps (`sha256-graph-midx-native.test.ts`).
  */
@@ -21,7 +21,7 @@ import {
   GitWorkingCopyConfig,
 } from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
-import { SHA256_OBJECT_FORMAT, UnsupportedObjectFormatError } from "@statewalker/vcs-utils";
+import { SHA256_OBJECT_FORMAT } from "@statewalker/vcs-utils";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import {
   type GitHostEnvironment,
@@ -595,9 +595,8 @@ describeGit("SHA-256 repositories against native git", () => {
       await openOurs(dir);
     });
 
-    // reftable tables of a SHA-256 repository (hash id `s256`) are neither read nor written
-    // yet (git 2.45+ writes them)
-    it("refuses a SHA-256 reftable repository cleanly, on open and on init", async () => {
+    // reftable tables of a SHA-256 repository (version 2, hash id `s256`; git 2.45+ writes them)
+    it("opens a SHA-256 reftable repository native git wrote, and inits one native git reads", async () => {
       if (modern) {
         const dir = fresh();
         g(root, "init", "-q", "--object-format=sha256", "--ref-format=reftable", dir);
@@ -606,21 +605,26 @@ describeGit("SHA-256 repositories against native git", () => {
         g(dir, "commit", "-q", "-m", "one");
         rmSync(join(dir, ".git", "index"));
         const files = createNodeFilesApi({ rootDir: dir });
-        await expect(createGitFilesBackend({ files, gitDir: ".git" })).rejects.toThrow(
-          "webrun-vcs does not support reftable refs in sha256 repositories yet",
-        );
+        const { history } = await createGitFilesBackend({ files, gitDir: ".git" });
+        expect((await history.refs.resolve("HEAD"))?.objectId).toBe(g(dir, "rev-parse", "HEAD"));
       }
       const files = createNodeFilesApi({ rootDir: root });
       const name = fresh().slice(root.length + 1);
-      await expect(
-        Git.init()
-          .setFilesApi(files)
-          .setDirectory(name)
-          .setObjectFormat("sha256")
-          .setRefFormat("reftable")
-          .call(),
-      ).rejects.toBeInstanceOf(UnsupportedObjectFormatError);
-      expect(existsSync(join(root, name, ".git", "config"))).toBe(false);
+      await Git.init()
+        .setFilesApi(files)
+        .setDirectory(name)
+        .setObjectFormat("sha256")
+        .setRefFormat("reftable")
+        .setInitialBranch("main")
+        .call();
+      expect(readFileSync(join(root, name, ".git", "config"), "utf8")).toContain(
+        "[extensions]\n\tobjectformat = sha256\n\trefstorage = reftable\n",
+      );
+      if (modern) {
+        expect(g(join(root, name), "rev-parse", "--show-object-format")).toBe("sha256");
+        expect(g(join(root, name), "rev-parse", "--show-ref-format")).toBe("reftable");
+        expect(g(join(root, name), "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+      }
     });
   });
 

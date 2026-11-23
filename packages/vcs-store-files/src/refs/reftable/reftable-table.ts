@@ -40,15 +40,22 @@
  * and value, each name it materialises, each log block it inflates) may not exceed
  * {@link REFTABLE_READ_CEILING}. What a call holds is then bounded by what its caller keeps,
  * never by the table's size times an amplification. Version 1 tables (SHA-1) and version 2
- * tables with hash id `sha1` are read; SHA-256 tables (`s256`) are refused
- * (`ReftableUnsupportedError`).
+ * tables with hash id `sha1` or `s256` (SHA-256: 32-byte ids in ref and log records and obj
+ * keys) are read; the table's own hash id gives its id width. Told the repository's format
+ * (`OpenReftableOptions.objectFormat`), a table of another hash is refused as git's merged
+ * table refuses it (`REFTABLE_FORMAT_ERROR`, "corrupt reftable file").
  */
 
 import { inflateWhole } from "@statewalker/vcs-utils/compression";
+import {
+  type ObjectFormat,
+  SHA1_OBJECT_FORMAT,
+  SHA256_OBJECT_FORMAT,
+} from "@statewalker/vcs-utils/hash";
 import { crc32 } from "@statewalker/vcs-utils/hash/crc32";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 
-import { ReftableFormatError, ReftableUnsupportedError } from "./reftable-errors.js";
+import { ReftableFormatError } from "./reftable-errors.js";
 
 /** The value of a ref record (`value_type` 0 to 3). */
 export type ReftableRefValue =
@@ -115,6 +122,8 @@ export interface ReftableTable {
   readonly name: string;
   /** 1, or 2 (with a hash id) */
   readonly version: 1 | 2;
+  /** The table's hash (version 1: SHA-1; version 2: its hash id), which sizes its ids */
+  readonly objectFormat: ObjectFormat;
   /** The header's block size (0 for an unaligned table) */
   readonly blockSize: number;
   readonly minUpdateIndex: number;
@@ -207,7 +216,6 @@ export class ReftableReadBudget {
 }
 
 const MAGIC = [0x52, 0x45, 0x46, 0x54]; // "REFT"
-const HASH_SIZE = 20;
 const FORMAT_ID_SHA1 = 0x73686131; // "sha1"
 const FORMAT_ID_SHA256 = 0x73323536; // "s256"
 const TYPE_REF = 0x72; // 'r'
@@ -463,13 +471,29 @@ class Cursor {
   }
 }
 
+/** Options of {@link openReftable}. */
+export interface OpenReftableOptions {
+  /**
+   * The repository's object format: a table of another hash is refused (git's
+   * `reftable_merged_table_new`). Undefined: the table is read in its own hash.
+   */
+  objectFormat?: ObjectFormat;
+}
+
 /** Opens a table held whole in memory; see the module's notes. */
-export function openReftable(bytes: Uint8Array, name = "<reftable>"): ReftableTable {
-  return new Reftable(bytes, name);
+export function openReftable(
+  bytes: Uint8Array,
+  name = "<reftable>",
+  options: OpenReftableOptions = {},
+): ReftableTable {
+  return new Reftable(bytes, name, options.objectFormat);
 }
 
 class Reftable implements ReftableTable {
   readonly version: 1 | 2;
+  readonly objectFormat: ObjectFormat;
+  /** The width of an object id in this table (20 or 32) */
+  private readonly hashSize: number;
   readonly blockSize: number;
   readonly minUpdateIndex: number;
   readonly maxUpdateIndex: number;
@@ -487,6 +511,7 @@ class Reftable implements ReftableTable {
   constructor(
     private readonly bytes: Uint8Array,
     readonly name: string,
+    expected?: ObjectFormat,
   ) {
     this.size = bytes.length;
     const bad = (detail: string): never => fail(name, detail);
@@ -502,13 +527,18 @@ class Reftable implements ReftableTable {
     if (bytes.length < hSize + fSize) {
       bad(`truncated: ${bytes.length} bytes, shorter than a header and a footer`);
     }
+    let format = SHA1_OBJECT_FORMAT;
     if (version === 2) {
       const hashId = be32(bytes, 24);
-      if (hashId === FORMAT_ID_SHA256) {
-        throw new ReftableUnsupportedError(name, "SHA-256 tables (hash id 's256') are not read");
-      }
-      if (hashId !== FORMAT_ID_SHA1) bad(`unknown hash id 0x${hashId.toString(16)}`);
+      if (hashId === FORMAT_ID_SHA256) format = SHA256_OBJECT_FORMAT;
+      else if (hashId !== FORMAT_ID_SHA1) bad(`unknown hash id 0x${hashId.toString(16)}`);
     }
+    if (expected && expected.name !== format.name) {
+      // git's reftable_merged_table_new: REFTABLE_FORMAT_ERROR, "corrupt reftable file"
+      bad(`corrupt reftable file: a ${format.name} table in a ${expected.name} repository`);
+    }
+    this.objectFormat = format;
+    this.hashSize = format.rawLength;
     this.blockSize = be24(bytes, 5);
     const toIndex = (value: bigint, what: string): number => {
       if (value > BigInt(Number.MAX_SAFE_INTEGER)) bad(`${what} ${value} out of range`);
@@ -904,18 +934,18 @@ class Reftable implements ReftableTable {
         value = { type: "deletion" };
         break;
       case 1: {
-        const id = c.take(HASH_SIZE, "ref value");
+        const id = c.take(this.hashSize, "ref value");
         if (materialise) {
-          c.budget.charge(2 * HASH_SIZE, this.name);
+          c.budget.charge(2 * this.hashSize, this.name);
           value = { type: "id", id: bytesToHex(id) };
         }
         break;
       }
       case 2: {
-        const id = c.take(HASH_SIZE, "ref value");
-        const peeled = c.take(HASH_SIZE, "ref value");
+        const id = c.take(this.hashSize, "ref value");
+        const peeled = c.take(this.hashSize, "ref value");
         if (materialise) {
-          c.budget.charge(4 * HASH_SIZE, this.name);
+          c.budget.charge(4 * this.hashSize, this.name);
           value = { type: "peeled", id: bytesToHex(id), peeled: bytesToHex(peeled) };
         }
         break;
@@ -946,8 +976,8 @@ class Reftable implements ReftableTable {
     if (c.type === 0) return undefined;
     if (c.type !== 1)
       fail(this.name, `block at ${c.block.offset}: unknown log value type ${c.type}`);
-    const oldId = c.take(HASH_SIZE, "log value");
-    const newId = c.take(HASH_SIZE, "log value");
+    const oldId = c.take(this.hashSize, "log value");
+    const newId = c.take(this.hashSize, "log value");
     const text = (what: string): Uint8Array => c.take(c.varint(), what);
     const who = text("log name");
     const email = text("log email");
@@ -955,7 +985,10 @@ class Reftable implements ReftableTable {
     const tzRaw = be16(c.take(2, "log time zone"), 0);
     const message = text("log message");
     if (!materialise) return undefined;
-    c.budget.charge(4 * HASH_SIZE + 3 * (who.length + email.length + message.length), this.name);
+    c.budget.charge(
+      4 * this.hashSize + 3 * (who.length + email.length + message.length),
+      this.name,
+    );
     return {
       oldId: bytesToHex(oldId),
       newId: bytesToHex(newId),

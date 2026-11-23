@@ -6,6 +6,7 @@
  */
 import { deflateSync } from "node:zlib";
 import { createInMemoryFilesApi, type FilesApi, isSymbolicRef } from "@statewalker/vcs-core";
+import { SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -136,13 +137,15 @@ describe("parseReftable", () => {
     expect(table.refs).toEqual([]);
   });
 
-  it("reads version 2 tables with the sha1 hash id and refuses SHA-256 ones", () => {
+  it("reads version 2 tables with the sha1 hash id and refuses SHA-256 ones in a SHA-1 repository", () => {
     const v2 = parseReftable(buildReftable({ ...sample, version: 2 }).bytes);
     expect(v2.version).toBe(2);
     expect(v2.refs).toHaveLength(4);
-    expect(() =>
-      parseReftable(buildReftable({ ...sample, version: 2, hashId: "s256" }).bytes, "t.ref"),
-    ).toThrow(ReftableUnsupportedError);
+    const s256 = buildReftable({ ...sample, version: 2, hashId: "s256" }).bytes;
+    expect(openReftable(s256, "t.ref").objectFormat.name).toBe("sha256");
+    expect(() => openReftable(s256, "t.ref", { objectFormat: SHA1_OBJECT_FORMAT })).toThrow(
+      /corrupt reftable file/,
+    );
     expectFormatError(buildReftable({ ...sample, version: 2, hashId: "md5!" }).bytes, /hash id/);
   });
 });

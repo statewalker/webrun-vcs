@@ -102,8 +102,11 @@ export interface ReftableStackWriter {
 const TABLES_LIST = "tables.list";
 const DEFAULT_LOCK_TIMEOUT = 100;
 const DEFAULT_GEOMETRIC_FACTOR = 2;
-/** git's table header size of version 1, less one (stack_segments_for_compaction) */
-const SIZE_OVERHEAD = 24 - 1;
+/**
+ * git's table header size less one (stack_segments_for_compaction): 23 for SHA-1's version 1,
+ * 27 for SHA-256's version 2
+ */
+const sizeOverhead = (version: 1 | 2) => (version === 1 ? 24 : 28) - 1;
 const enc = new TextEncoder();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const STALE_TABLE = /^0x([0-9a-f]{12})-0x([0-9a-f]{12})-[0-9a-f]{8}\.ref$/;
@@ -189,6 +192,10 @@ export function createReftableStackWriter(
 ): ReftableStackWriter {
   const atomic: AtomicFiles = atomicFilesOver(files, dir);
   const lockTimeout = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT;
+  // the tables are written in the stack's format (the reader refuses any other)
+  const objectFormat = options.objectFormat ?? reader.objectFormat;
+  const writeOptions = { ...options, objectFormat };
+  const overhead = sizeOverhead(objectFormat.name === "sha1" ? 1 : 2);
 
   /** git's flock_acquire: `<path>.lock` created exclusively, retried until the timeout. */
   async function lock(path: string, timeoutMs: number): Promise<boolean> {
@@ -257,7 +264,7 @@ export function createReftableStackWriter(
             `reftable: a table from update index ${content.minUpdateIndex}, below ${nextUpdateIndex}`,
           );
         }
-        const bytes = writeReftable(content, options);
+        const bytes = writeReftable(content, writeOptions);
         if (!bytes) return undefined;
         const name = await placeTable(
           bytes,
@@ -351,7 +358,7 @@ export function createReftableStackWriter(
             }),
           ),
       };
-      const bytes = writeReftable(content, options);
+      const bytes = writeReftable(content, writeOptions);
       // git's stack_compact_locked: into a temporary that no clean takes for a table
       // (`.temp.<random>`, not `.ref`); it gets its table name only under the relocked list
       // (a `.ref` file appears only while tables.list.lock is held, which every clean takes)
@@ -411,7 +418,7 @@ export function createReftableStackWriter(
     }
   }
 
-  const sizesOf = (view: ReftableView) => view.parts.map((t) => t.size - SIZE_OVERHEAD);
+  const sizesOf = (view: ReftableView) => view.parts.map((t) => t.size - overhead);
 
   async function compactionRequired(geometric: boolean): Promise<boolean> {
     const view = await reader.read();
