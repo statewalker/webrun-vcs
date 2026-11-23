@@ -1,7 +1,6 @@
 /**
- * The errors of the reftable reader: a table or `tables.list` that is not well formed, a
- * format we do not read (SHA-256 tables), and a write to a reftable repository, which this
- * implementation does not do yet.
+ * The errors of the reftable reader: a table or `tables.list` that is not well formed, and a
+ * format we do not read (SHA-256 tables).
  */
 
 /**
@@ -26,23 +25,5 @@ export class ReftableUnsupportedError extends Error {
   ) {
     super(`reftable: unsupported table '${table}': ${detail}`);
     this.name = "ReftableUnsupportedError";
-  }
-}
-
-/**
- * A ref write (an update, a deletion, a reflog change, packing) asked of a repository whose
- * refs are stored in the reftable format: this implementation reads such repositories but
- * does not write them yet. Thrown before anything is changed. `refName` names the first ref
- * the write would have changed, when there is one.
- */
-export class ReftableWriteUnsupportedError extends Error {
-  readonly code = "EREFTABLE_READONLY";
-  constructor(readonly refName?: string) {
-    super(
-      refName === undefined
-        ? "unable to write refs: writing the reftable ref storage (extensions.refStorage = reftable) is not supported"
-        : `cannot lock ref '${refName}': writing the reftable ref storage (extensions.refStorage = reftable) is not supported`,
-    );
-    this.name = "ReftableWriteUnsupportedError";
   }
 }

@@ -4,20 +4,12 @@
  * native git and then read by ours; refs, symbolic refs, peeled tags, reflogs and revisions
  * are compared with `git for-each-ref`, `git symbolic-ref`, `git reflog show` and
  * `git rev-parse`, and commands (log, status, branch and tag listings, rev-parse) with their
- * native output. Writes refuse with `ReftableWriteUnsupportedError` and change nothing.
+ * native output. Writes are twinned in `reftable-write-git3-native.test.ts`.
  *
  * Scenarios come from git's `t/t0610-reftable-basics.sh` (named in each test), ported by hand.
  */
 import { spawnSync } from "node:child_process";
-import {
-  appendFileSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  statSync,
-} from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isSymbolicRef, type Refs } from "@statewalker/vcs-core";
@@ -25,7 +17,6 @@ import {
   createGitFilesBackend,
   openGitLinkedWorktrees,
   openReftable,
-  ReftableWriteUnsupportedError,
 } from "@statewalker/vcs-store-files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -373,34 +364,21 @@ describe.skipIf(!git3)("reading reftable repositories (git 3.0 oracle)", () => {
       );
     });
 
-    it("writes refuse with ReftableWriteUnsupportedError and leave the repository unchanged", async () => {
+    it("writes go to the reftable stack, and native git reads them (statewalker-root#229)", async () => {
       const git = await build();
+      await git.branchCreate().setName("topic").call();
+      await git.tag().setName("t2").call();
       g(repo, ["add", "file1.txt"]);
-      const before = snapshot(join(repo, ".git"));
-      const worktreeBefore = readFileSync(join(repo, "file1.txt"), "utf8");
-      await expect(git.branchCreate().setName("topic").call()).rejects.toBeInstanceOf(
-        ReftableWriteUnsupportedError,
+      await git.commit().setMessage("written by ours").call();
+      await git.checkout().setName("maint").call();
+      expect(g(repo, ["for-each-ref", "--format=%(refname)", "refs/heads/topic"])).toBe(
+        "refs/heads/topic\n",
       );
-      await expect(git.branchCreate().setName("topic").call()).rejects.toThrow(
-        "writing the reftable ref storage (extensions.refStorage = reftable) is not supported",
-      );
-      await expect(git.tag().setName("t2").call()).rejects.toBeInstanceOf(
-        ReftableWriteUnsupportedError,
-      );
-      await expect(git.commit().setMessage("refused").call()).rejects.toBeInstanceOf(
-        ReftableWriteUnsupportedError,
-      );
-      await expect(git.checkout().setName("maint").call()).rejects.toBeInstanceOf(
-        ReftableWriteUnsupportedError,
-      );
-      // fsck reads reflogs and worktree HEADs as files: refused until it reads them from the
-      // reftable stack (statewalker-root#229), rather than misreport reflog-only objects
-      await expect(git.fsck().call()).rejects.toBeInstanceOf(ReftableWriteUnsupportedError);
-      expect(snapshot(join(repo, ".git"))).toEqual(before);
-      expect(readFileSync(join(repo, "file1.txt"), "utf8")).toBe(worktreeBefore);
-      // native git still reads the repository as before
-      expect(g(repo, ["for-each-ref", "--format=%(refname)", "refs/heads/topic"])).toBe("");
+      expect(g(repo, ["symbolic-ref", "HEAD"])).toBe("refs/heads/maint\n");
+      expect(g(repo, ["log", "-1", "--format=%s", "main"])).toBe("written by ours\n");
       expect(g(repo, ["fsck", "--no-progress"])).toBe("");
+      expect(g(repo, ["refs", "verify"])).toBe("");
+      expect((await git.fsck().call()).exitCode).toBe(0);
     });
   });
 
@@ -465,18 +443,3 @@ describe.skipIf(!git3)("reading reftable repositories (git 3.0 oracle)", () => {
     expect((await refs.resolve(last))?.objectId).toBe(head);
   });
 });
-
-/** Every file under `dir` with its bytes (as hex) and mtime: what a write would change. */
-function snapshot(dir: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  const walk = (d: string, prefix: string) => {
-    for (const name of readdirSync(d).sort()) {
-      const full = join(d, name);
-      const s = statSync(full);
-      if (s.isDirectory()) walk(full, `${prefix}${name}/`);
-      else out[`${prefix}${name}`] = `${s.mtimeMs} ${readFileSync(full).toString("hex")}`;
-    }
-  };
-  walk(dir, "");
-  return out;
-}

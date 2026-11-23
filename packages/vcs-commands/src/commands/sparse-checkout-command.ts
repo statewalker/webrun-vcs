@@ -180,11 +180,6 @@ interface RunState {
  * config is on, else in the repository's config, as git).
  */
 export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private args?: string[];
   private subcommand?: SparseCheckoutSubcommand;
   private patterns: string[] = [];

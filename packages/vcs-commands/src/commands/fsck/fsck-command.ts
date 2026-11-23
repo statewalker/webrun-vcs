@@ -298,11 +298,6 @@ function treeLineSound(data: Uint8Array): boolean {
  * ```
  */
 export class FsckCommand extends GitCommand<FsckResult> {
-  // fsck writes no refs, but it reads reflogs and linked worktrees' HEADs as files, which a
-  // reftable repository keeps in its tables: it would report reflog-only objects as
-  // dangling. It keeps the default (refused on a read-only reftable store) until fsck reads
-  // them through the ref store (statewalker-root#229).
-
   private _strict = false;
 
   /** git's fsck and gc read the objects as stored, never through replace refs. */
@@ -2597,6 +2592,12 @@ class FsckRun {
       if (!head) return invalid();
       if (isSymbolicRef(head)) symref = head.target;
       else id = head.objectId;
+    } else if ("reflogNames" in this.stores.refs) {
+      // a reftable repository: the linked worktree's HEAD is in its own stack
+      const head = await this.stores.refs.get(name);
+      if (!head) return invalid();
+      if (isSymbolicRef(head)) symref = head.target;
+      else id = head.objectId;
     } else {
       const text = (
         await readText(this.files as FilesApi, pathOf(wt.dir as string, "HEAD"))
@@ -2640,6 +2641,13 @@ class FsckRun {
   /** The reflogs of one worktree, in git's order (sorted by name, as git 2.45+ lists them). */
   private async reflogs(wt: WorktreeState): Promise<Reflog[]> {
     const files = this.files;
+    // a reftable repository keeps its reflogs in its tables: listed by the ref store
+    const reftable = this.stores.refs as { reflogNames?(worktree?: string): Promise<string[]> };
+    if (reftable.reflogNames) {
+      const dir = wt.dir as string;
+      const id = wt.current ? undefined : dir.slice(dir.lastIndexOf("/") + 1);
+      return this.storeReflogs(await reftable.reflogNames(id));
+    }
     if (!files) return wt.current ? this.storeReflogs() : [];
     const logs: Reflog[] = [];
     const collectDir = async (base: string, keep: (name: string) => boolean, prefix: string) => {
@@ -2681,12 +2689,15 @@ class FsckRun {
   }
 
   /** Reflogs through the refs store (a store without files): HEAD and every ref. */
-  private async storeReflogs(): Promise<Reflog[]> {
+  private async storeReflogs(listed?: string[]): Promise<Reflog[]> {
     const refs = this.stores.refs;
     if (!refs.getReflog) return [];
-    const names = ["HEAD"];
-    for await (const ref of refs.list("refs/")) names.push(ref.name);
-    const sorted = [...new Set(names)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    let sorted = listed;
+    if (!sorted) {
+      const names = ["HEAD"];
+      for await (const ref of refs.list("refs/")) names.push(ref.name);
+      sorted = [...new Set(names)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    }
     const logs: Reflog[] = [];
     for (const name of sorted) {
       const reader = await refs.getReflog(name);

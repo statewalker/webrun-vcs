@@ -108,11 +108,6 @@ export interface AddResult {
  * for staging files with various options.
  */
 export class AddCommand extends GitCommand<AddResult> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private filepatterns: string[] = [];
   private update = false;
   private all: boolean | undefined;

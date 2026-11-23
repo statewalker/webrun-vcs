@@ -17,7 +17,6 @@ import {
   ReftableFormatError,
   ReftableReadBudget,
   ReftableUnsupportedError,
-  ReftableWriteUnsupportedError,
 } from "../../src/refs/reftable/index.js";
 import { buildReftable, type FixtureTable, fixFooterCrc, varint } from "./reftable-fixture.js";
 
@@ -370,28 +369,28 @@ describe("the reftable ref store", () => {
     expect(await refs.getReflog("refs/heads/main2")).toBeUndefined();
   });
 
-  it("refuses every write with ReftableWriteUnsupportedError, changing nothing", async () => {
+  it("writes a table per transaction over a stack it reads (statewalker-root#229)", async () => {
     const files = await repository({ "0x01-0x03-aa.ref": sample });
-    const refs = createReftableRefStore({ files, gitDir: ".git" });
-    const writes = [
-      () => refs.set("refs/heads/x", A),
-      () => refs.setSymbolic("HEAD", "refs/heads/x"),
-      () => refs.remove("refs/heads/main"),
-      () => refs.removeAll(["refs/heads/main"]),
-      () => refs.batch([{ name: "refs/heads/x", new: A }]),
-      () => refs.compareAndSwap("refs/heads/main", A, B),
-      () => refs.deleteReflogEntry("HEAD", 0),
-      () => refs.packRefs([], { all: true }),
-      () => refs.optimize(),
-      () => refs.setShallow([A]),
-    ];
-    for (const write of writes) {
-      await expect(write()).rejects.toBeInstanceOf(ReftableWriteUnsupportedError);
-    }
-    await expect(refs.set("refs/heads/x", A)).rejects.toThrow(
-      "cannot lock ref 'refs/heads/x': writing the reftable ref storage (extensions.refStorage = reftable) is not supported",
-    );
-    expect(refs.writeRefusal()).toBeInstanceOf(ReftableWriteUnsupportedError);
+    const refs = createReftableRefStore({
+      files,
+      gitDir: ".git",
+      write: { autoCompaction: false },
+    });
+    await refs.set("refs/heads/x", A, {
+      ident: "T <t@example.com> 1700000000 +0000",
+      message: "x",
+    });
+    expect((await refs.resolve("refs/heads/x"))?.objectId).toBe(A);
+    expect((await refs.resolve("refs/heads/main"))?.objectId).toBe(A);
+    const list = new TextDecoder().decode(await readAll(files, ".git/reftable/tables.list"));
+    const names = list.split("\n").filter(Boolean);
+    expect(names.length).toBe(2);
+    expect(names[1]).toMatch(/^0x000000000004-0x000000000004-[0-9a-f]{8}\.ref$/);
+    expect(await refs.remove("refs/heads/x")).toBe(true);
+    expect(await refs.get("refs/heads/x")).toBeUndefined();
+    await refs.packRefs([], { all: true });
+    const packed = new TextDecoder().decode(await readAll(files, ".git/reftable/tables.list"));
+    expect(packed.split("\n").filter(Boolean).length).toBe(1);
     expect((await refs.resolve("refs/heads/main"))?.objectId).toBe(A);
   });
 
@@ -832,3 +831,9 @@ describe("a stack cannot make a read cost tables times records (merge gate pass 
     expect([...logTable(5, 8192, 4096).logs()]).toHaveLength(1);
   });
 });
+
+async function readAll(files: ReturnType<typeof createInMemoryFilesApi>, path: string) {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of files.read(path)) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}

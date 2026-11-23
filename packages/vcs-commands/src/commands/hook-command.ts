@@ -47,11 +47,6 @@ export interface HookRunResult {
  * in (the worktree top).
  */
 export class HookRunCommand extends GitCommand<HookRunResult> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private name?: string;
   private args: string[] = [];
   private ignoreMissing = false;
@@ -164,11 +159,6 @@ export interface HookListResult {
  * `git hook list`: the command throws its usage error there.
  */
 export class HookListCommand extends GitCommand<HookListResult> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private name?: string;
   private nul = false;
   private showScope = false;

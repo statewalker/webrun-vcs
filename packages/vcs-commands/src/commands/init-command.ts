@@ -26,6 +26,7 @@ import { Git } from "../git.js";
 import type { InitResult } from "../results/init-result.js";
 import {
   defaultInitialBranch,
+  defaultRefFormat,
   InvalidInitialBranchError,
   isValidBranchName,
 } from "./default-branch.js";
@@ -78,6 +79,8 @@ export class InitCommand {
   private worktreeEnabled = false;
   private worktreeStore?: Worktree;
   private environment?: GitHostEnvironment;
+  /** `--ref-format`; undefined: git's default (see {@link defaultRefFormat}) */
+  private refFormat?: string;
   private callable = true;
 
   /**
@@ -152,6 +155,21 @@ export class InitCommand {
   setInitialBranch(branch: string): this {
     this.checkCallable();
     this.initialBranch = branch;
+    return this;
+  }
+
+  /**
+   * Set the ref storage format of a new repository (`git init --ref-format`): `files` (loose
+   * refs and packed-refs) or `reftable` (`.git/reftable`). Without it, git's default:
+   * `$GIT_DEFAULT_REF_FORMAT`, `init.defaultRefFormat`, else `files`, or `reftable` with
+   * `GitHostEnvironment.breakingChanges` (git 3.0). An existing repository keeps its format.
+   *
+   * @param format "files" or "reftable"
+   * @returns this for method chaining
+   */
+  setRefFormat(format: "files" | "reftable" | string): this {
+    this.checkCallable();
+    this.refFormat = format;
     return this;
   }
 
@@ -290,6 +308,11 @@ export class InitCommand {
       // re-created: creating rewrites the config, and its remotes and settings with it.
       const fresh = !hasHead && !(await isFile(`${dir}/config`));
       if (!hasHead) await chooseBranch();
+      // the ref storage of a repository created here (an existing one keeps its own)
+      const refFormat = fresh
+        ? await defaultRefFormat(this.environment, this.refFormat)
+        : undefined;
+      if (refFormat) warnings.push(...refFormat.warnings);
       else if (this.initialBranch !== undefined) {
         warnings.push(`warning: re-init: ignored --initial-branch=${this.initialBranch}`);
       }
@@ -299,6 +322,7 @@ export class InitCommand {
           gitDir,
           create,
           defaultBranch: initialBranch,
+          ...(create && refFormat ? { refFormat: refFormat.format } : {}),
           ...(this.environment ? { environment: this.environment } : {}),
         });
       if (fresh && this.bare && dir !== ".") {

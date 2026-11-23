@@ -29,11 +29,6 @@ import { GitCommand } from "../git-command.js";
  * ```
  */
 export class ReflogCommand extends GitCommand<ReflogEntry[]> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private ref = "HEAD";
 
   /**

@@ -347,11 +347,6 @@ export class DeleteTagCommand extends GitCommand<string[]> {
  * ```
  */
 export class ListTagCommand extends GitCommand<Ref[]> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   /**
    * Execute the tag listing.
    *

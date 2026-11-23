@@ -120,11 +120,6 @@ function normalizePath(path: string): string | undefined {
  * and `.gitmodules` path follow it, `.gitmodules` staged again.
  */
 export class MvCommand extends GitCommand<MvResult> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private sources: string[] = [];
   private destination: string | undefined;
   private force = false;

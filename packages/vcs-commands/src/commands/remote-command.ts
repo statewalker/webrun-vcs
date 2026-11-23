@@ -510,11 +510,6 @@ function formatIdent(who: { name: string; email: string; timestamp: number; tzOf
  * ```
  */
 export class RemoteListCommand extends GitCommand<RemoteConfig[]> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   /**
    * Execute the remote list operation.
    *
@@ -547,11 +542,6 @@ export class RemoteListCommand extends GitCommand<RemoteConfig[]> {
  * ```
  */
 export class RemoteGetUrlCommand extends GitCommand<string[]> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private remoteName?: string;
   private push = false;
   private all = false;
@@ -612,11 +602,6 @@ export class RemoteGetUrlCommand extends GitCommand<string[]> {
  * ```
  */
 export class RemoteSetUrlCommand extends GitCommand<RemoteConfig> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private remoteName?: string;
   private remoteUri?: string;
   private pushUri = false;

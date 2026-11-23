@@ -78,7 +78,13 @@ async function oursInit(
   if (branch !== undefined) init.setInitialBranch(branch);
   try {
     const result = await init.call();
-    const head = execFileSync("git", ["symbolic-ref", "HEAD"], { cwd: dir, env, encoding: "utf8" });
+    // git 3.0's repositories are reftable ones: read by the git 3.0 build
+    const reader = breakingChanges && git3 ? git3 : "git";
+    const head = execFileSync(reader, ["symbolic-ref", "HEAD"], {
+      cwd: dir,
+      env,
+      encoding: "utf8",
+    });
     return {
       exit: 0,
       head: head.trim(),
@@ -173,7 +179,8 @@ describe("the initial branch of a new repository (git 2.x)", () => {
 describe("symbolic refs are files, never symlinks (core.preferSymlinkRefs is gone in git 3.0)", () => {
   it("HEAD of a new repository and after a branch switch", async () => {
     const dir = fresh("sym");
-    const env = nativeGitEnv(root);
+    // a files repository (git 3.0 creates reftable ones, whose HEAD file is a stub)
+    const env = { ...nativeGitEnv(root), GIT_DEFAULT_REF_FORMAT: "files" };
     await oursInit(dir, env, true);
     const g = await openOurs(dir, createNodeGitHostEnvironment({ env, breakingChanges: true }));
     const head = () => lstatSync(join(dir, ".git", "HEAD"));

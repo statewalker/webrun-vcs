@@ -30,8 +30,10 @@ import type {
   GitObjects,
   ListedObject,
   ObjectId,
+  Ref,
   Refs,
   ResolvedObjectFilter,
+  SymbolicRef,
 } from "@statewalker/vcs-core";
 import { isSymbolicRef, joinPath, listObjects, readGraftParents } from "@statewalker/vcs-core";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
@@ -165,8 +167,11 @@ async function collectRoots(
     }
   };
 
+  // a reftable repository keeps its refs, per-worktree refs and reflogs in its stacks: read
+  // through the ref store (its `refs/heads` and HEAD files are stubs for older gits)
+  const reftable = reftableRoots(refs);
   // The refs on storage, strictly: a ref that cannot be read throws instead of being skipped
-  const stored = await readAllRefs(files, gitDir, "", { strict: true });
+  const stored = reftable ? [] : await readAllRefs(files, gitDir, "", { strict: true });
   const byName = new Map(stored.map((r) => [r.name, r]));
   const resolveStored = (name: string): ObjectId | undefined => {
     let ref = byName.get(name);
@@ -186,7 +191,10 @@ async function collectRoots(
   const head = await refs.resolve("HEAD");
   if (head?.objectId) require(head.objectId, "bad object HEAD");
 
-  for (const id of await reflogIds(files, joinPath(gitDir, "logs"))) tips.add(id);
+  const logIds = reftable
+    ? await storeReflogIds(refs, await reftable.reflogNames())
+    : await reflogIds(files, joinPath(gitDir, "logs"));
+  for (const id of logIds) tips.add(id);
   requireIndex(await indexIds(files, joinPath(gitDir, "index")));
   if (roots.rebaseFiles) for (const id of await rebaseFileIds(files, gitDir)) tips.add(id);
   for (const id of roots.extraRoots ?? []) tips.add(id);
@@ -197,12 +205,17 @@ async function collectRoots(
     for await (const wt of files.list(worktrees)) {
       if (wt.kind !== "directory") continue;
       const label = `worktrees/${wt.path.slice(wt.path.lastIndexOf("/") + 1)}`;
-      const id = await worktreeHead(files, joinPath(wt.path, "HEAD"), async (target) => {
-        return resolveStored(target) ?? (await refs.resolve(target))?.objectId;
-      });
+      const id = reftable
+        ? (await refs.resolve(`${label}/HEAD`))?.objectId
+        : await worktreeHead(files, joinPath(wt.path, "HEAD"), async (target) => {
+            return resolveStored(target) ?? (await refs.resolve(target))?.objectId;
+          });
       if (id) require(id, `bad object ${label}/HEAD`);
       // its per-worktree refs (refs/bisect/*, refs/worktree/*, refs/rewritten/*), always loose
-      const own = await readAllRefs(files, wt.path, "refs/", { strict: true });
+      // (in its own stack in a reftable repository)
+      const own = reftable
+        ? await reftable.worktreeRefs(label.slice("worktrees/".length))
+        : await readAllRefs(files, wt.path, "refs/", { strict: true });
       const ownByName = new Map(own.map((r) => [r.name, r]));
       for (const ref of own) {
         let target: typeof ref | undefined = ref;
@@ -213,7 +226,15 @@ async function collectRoots(
         if (target && !isSymbolicRef(target) && target.objectId)
           require(target.objectId, `bad object ${label}/${ref.name}`);
       }
-      for (const id of await reflogIds(files, joinPath(wt.path, "logs"))) tips.add(id);
+      const wtLogIds = reftable
+        ? await storeReflogIds(
+            refs,
+            (await reftable.reflogNames(label.slice("worktrees/".length))).filter((n) =>
+              n.startsWith(`${label}/`),
+            ),
+          )
+        : await reflogIds(files, joinPath(wt.path, "logs"));
+      for (const id of wtLogIds) tips.add(id);
       requireIndex(await indexIds(files, joinPath(wt.path, "index")));
       if (roots.rebaseFiles) for (const id of await rebaseFileIds(files, wt.path)) tips.add(id);
     }
@@ -321,6 +342,40 @@ async function readText(files: FilesApi, path: string): Promise<string | undefin
   let out = "";
   for await (const c of files.read(path)) out += dec.decode(c, { stream: true });
   return out + dec.decode();
+}
+
+/** The reftable ref store's listings (`ReftableRefStore`), when `refs` is one. */
+function reftableRoots(refs: Refs):
+  | {
+      reflogNames(worktree?: string): Promise<string[]>;
+      worktreeRefs(worktree: string): Promise<(Ref | SymbolicRef)[]>;
+    }
+  | undefined {
+  const r = refs as Partial<{
+    reflogNames(worktree?: string): Promise<string[]>;
+    worktreeRefs(worktree: string): Promise<(Ref | SymbolicRef)[]>;
+  }>;
+  return r.reflogNames && r.worktreeRefs
+    ? {
+        reflogNames: (w) => (r.reflogNames as (w?: string) => Promise<string[]>).call(refs, w),
+        worktreeRefs: (w) =>
+          (r.worktreeRefs as (w: string) => Promise<(Ref | SymbolicRef)[]>).call(refs, w),
+      }
+    : undefined;
+}
+
+/** The old and new ids of every entry of the reflogs `names`, read through the ref store. */
+async function storeReflogIds(refs: Refs, names: string[]): Promise<ObjectId[]> {
+  const ids: ObjectId[] = [];
+  for (const name of names) {
+    const reader = await refs.getReflog?.(name);
+    if (!reader) continue;
+    for (const e of await reader.getReverseEntries()) {
+      if (OID.test(e.oldId) && e.oldId !== ZERO) ids.push(e.oldId);
+      if (OID.test(e.newId) && e.newId !== ZERO) ids.push(e.newId);
+    }
+  }
+  return ids;
 }
 
 /** The old and new ids of every entry of every reflog under `logsDir`. */

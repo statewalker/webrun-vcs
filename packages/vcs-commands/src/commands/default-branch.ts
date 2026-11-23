@@ -120,3 +120,77 @@ function defaultBranchHint(name: string, breakingChanges: boolean | undefined): 
   const withOff = `${text}\nDisable this message with "git config set ${scope}advice.defaultBranchName false"`;
   return withOff.split("\n").map((line) => (line === "" ? "hint:" : `hint: ${line}`));
 }
+
+/** A ref storage format git does not know: git dies (exit 128). */
+export class UnknownRefFormatError extends Error {
+  override name = "UnknownRefFormatError";
+  readonly lines: string[];
+  constructor(
+    readonly value: string,
+    source: "command line" | "GIT_DEFAULT_REF_FORMAT",
+  ) {
+    const line =
+      source === "command line"
+        ? `fatal: unknown ref storage format specified via command line: '${value}'`
+        : `fatal: unknown ref storage format specified via GIT_DEFAULT_REF_FORMAT: '${value}'`;
+    super(line);
+    this.lines = [line];
+  }
+}
+
+/** The ref storage format of a new repository, and git's warnings while choosing it. */
+export interface DefaultRefFormat {
+  format: "files" | "reftable";
+  warnings: string[];
+}
+
+const refFormatOf = (value: string): "files" | "reftable" | undefined =>
+  value === "files" || value === "reftable" ? value : undefined;
+
+/**
+ * The ref storage format git gives a new repository (setup.c `repository_format_configure`):
+ * `requested` (`git init --ref-format`), else `$GIT_DEFAULT_REF_FORMAT`
+ * (`GitHostEnvironment.defaultRefFormat`), else `init.defaultRefFormat` from the system,
+ * global and command-line config (`feature.experimental` choosing reftable while that is
+ * unset), else `files`, or `reftable` with `GitHostEnvironment.breakingChanges` (git 3.0).
+ * An unknown name given or in the environment dies (`UnknownRefFormatError`); one in the
+ * config warns and is passed over.
+ *
+ * @example
+ * ```typescript
+ * const { format } = await defaultRefFormat(environment); // "reftable" under git 3.0
+ * ```
+ */
+export async function defaultRefFormat(
+  environment: GitHostEnvironment | undefined,
+  requested?: string,
+): Promise<DefaultRefFormat> {
+  const warnings: string[] = [];
+  if (requested !== undefined) {
+    const format = refFormatOf(requested);
+    if (!format) throw new UnknownRefFormatError(requested, "command line");
+    return { format, warnings };
+  }
+  const env = environment?.defaultRefFormat;
+  if (env !== undefined) {
+    const format = refFormatOf(env);
+    if (!format) throw new UnknownRefFormatError(env, "GIT_DEFAULT_REF_FORMAT");
+    return { format, warnings };
+  }
+  let configured: "files" | "reftable" | undefined;
+  for (const e of await readProtectedConfig(environment)) {
+    if (e.key === "init.defaultrefformat" || e.key === "init.defaultrefstorageformat") {
+      const value = e.value ?? "";
+      configured = refFormatOf(value);
+      if (!configured) warnings.push(`warning: unknown ref storage format '${value}'`);
+    } else if (
+      e.key === "feature.experimental" &&
+      configured === undefined &&
+      parseGitBool(e.value ?? "true") === true
+    ) {
+      configured = "reftable";
+    }
+  }
+  if (configured) return { format: configured, warnings };
+  return { format: environment?.breakingChanges ? "reftable" : "files", warnings };
+}
