@@ -454,9 +454,10 @@ const CUT_LINE = "------------------------ >8 ------------------------";
 
 /** commit.c's ignored_log_message_bytes: the trailing comments, blank lines, scissors. */
 function ignoredBytes(buf: string, len: number, comment: string): number {
-  // wt_status_locate_end (strstr over the whole input)
+  // wt_status_locate_end (strstr over the whole input; wt-status.c's cut_line ends with its
+  // line end, so a cut line with text after it is no cut line)
   let cutoff = len;
-  const pattern = `\n${comment} ${CUT_LINE}`;
+  const pattern = `\n${comment} ${CUT_LINE}\n`;
   if (buf.startsWith(pattern.slice(1))) cutoff = 0;
   else {
     const p = buf.indexOf(pattern);

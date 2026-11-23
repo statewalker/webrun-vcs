@@ -1058,6 +1058,19 @@ const SCENARIOS: Scenario[] = [
     args: tr("A: 1"),
     input: "s\n\nKey: v\n\nConflicts:\n\tfile\n# comment\n",
   },
+  // wt-status.c's cut_line ends with its line end: a cut line with text after it is no cut line
+  {
+    name: "a cut line with trailing text is not a cut line (--parse)",
+    args: ["--parse"],
+    input:
+      "Subj\n\nKey: v\n# ------------------------ >8 ------------------------ junk\nmore text\n",
+  },
+  {
+    name: "a cut line with trailing text is not a cut line (a trailer added)",
+    args: tr("Acked-by: A"),
+    input:
+      "Subj\n\nKey: v\n# ------------------------ >8 ------------------------ junk\nmore text\n",
+  },
   {
     name: "--in-place",
     args: ["--in-place", ...tr("Reviewed-by: Alice"), "message"],
