@@ -581,6 +581,7 @@ export abstract class GitCommand<T> {
       author: () => this.resolveAuthor(),
       committer: () => this.resolveCommitter(),
       reflogLine: (message) => this.reflogLine(message),
+      objectFormat: this.objectFormat,
       // a full object id is itself (get_oid_basic); the resolver would also look for refs
       // spelled as it, for an ambiguity warning the notes commands do not print — a ref
       // lookup per line of `git notes copy --stdin` that costs most of its time

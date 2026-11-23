@@ -412,7 +412,7 @@ export class IndexAdder {
       await this.storeEmptyBlob();
       if (indexed) {
         if (!this.pretend) this.touched.add(name);
-        return indexed.objectId === EMPTY_BLOB_ID ? "same" : "added";
+        return indexed.objectId === this.emptyBlobId ? "same" : "added";
       }
       if (this.pretend) return "added";
       this.resolve(name);
@@ -423,7 +423,7 @@ export class IndexAdder {
       this.editor.add(
         new UpdateStagingEntry(
           name,
-          EMPTY_BLOB_ID,
+          this.emptyBlobId,
           mode,
           { size: 0, mtime: 0 },
           { intentToAdd: true },
@@ -500,7 +500,7 @@ export class IndexAdder {
       this.editor.add(
         new UpdateStagingEntry(
           path,
-          EMPTY_BLOB_ID,
+          this.emptyBlobId,
           FileMode.GITLINK,
           { size: 0, mtime: 0 },
           { intentToAdd: true },
@@ -542,6 +542,11 @@ export class IndexAdder {
   }
 
   /** git's `set_object_name_for_intent_to_add_entry`: the empty blob written (once). */
+  /** The empty blob's id in the repository's format (the id an intent-to-add entry gets) */
+  private get emptyBlobId(): ObjectId {
+    return this.blobs.objectFormat?.emptyBlobId ?? EMPTY_BLOB_ID;
+  }
+
   private async storeEmptyBlob(): Promise<void> {
     if (this.emptyBlobStored) return;
     this.emptyBlobStored = true;

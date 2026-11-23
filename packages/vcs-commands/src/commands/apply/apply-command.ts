@@ -564,6 +564,7 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
     rejectWorktree: Worktree | undefined,
   ): ApplyIO {
     const blobs = this.blobs;
+    const format = this.objectFormat;
     const toPath = latin1ToPath;
     const readAll = async (content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>) => {
       const chunks: Uint8Array[] = [];
@@ -682,10 +683,19 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
       },
       hasObject: (oid) => blobs.has(oid),
       writeBlob: async (content) => blobs.store([latin1ToBytes(content)]),
+      // the repository's hash (git's the_hash_algo)
       hashBlob: async (content) =>
-        bytesToHex(sha1Of(latin1ToBytes(`blob ${content.length}\0`), latin1ToBytes(content))),
+        format.name === "sha1"
+          ? bytesToHex(sha1Of(latin1ToBytes(`blob ${content.length}\0`), latin1ToBytes(content)))
+          : bytesToHex(
+              format
+                .createHasher()
+                .update(latin1ToBytes(`blob ${content.length}\0`))
+                .update(latin1ToBytes(content))
+                .digest(),
+            ),
       resolveBlob: async (prefix) => {
-        if (!/^[0-9a-f]{4,40}$/.test(prefix)) return undefined;
+        if (!/^[0-9a-f]{4,64}$/.test(prefix) || prefix.length > format.hexLength) return undefined;
         try {
           const id = await resolver().resolve(prefix);
           return id && (await blobs.has(id)) ? id : undefined;

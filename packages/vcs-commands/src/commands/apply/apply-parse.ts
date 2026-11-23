@@ -618,12 +618,13 @@ export class ApplyParser {
       const dot = buf.indexOf(".", line);
       const eol0 = buf.indexOf("\n", line);
       const eol = eol0 < 0 ? buf.length : eol0;
-      if (dot < 0 || buf[dot + 1] !== "." || 40 < dot - line) return 0;
+      // at most a full id's digits (64 in SHA-256, git's hexsz)
+      if (dot < 0 || buf[dot + 1] !== "." || 64 < dot - line) return 0;
       const oldPrefix = buf.slice(line, dot);
       const l2 = dot + 2;
       let ptr = buf.indexOf(" ", l2);
       if (ptr < 0 || eol < ptr) ptr = eol;
-      if (40 < ptr - l2) return 0;
+      if (64 < ptr - l2) return 0;
       patch.oldOidPrefix = oldPrefix;
       patch.newOidPrefix = buf.slice(l2, ptr);
       if (buf[ptr] === " ") return mode(ptr + 1 - at, (m) => (patch.oldMode = m));

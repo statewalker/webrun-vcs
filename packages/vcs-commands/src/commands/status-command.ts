@@ -716,7 +716,7 @@ export class StatusCommand extends GitCommand<Status> {
     }
     const cached = new DiffCommand(this.workingCopy)
       .setCached(true)
-      .setOldTree(o.referenceId ?? EMPTY_TREE)
+      .setOldTree(o.referenceId ?? this.objectFormat.emptyTreeId)
       .setOptions({ ...(cachedPrefixes ?? {}) });
     if (this.renames !== undefined) cached.setRenames(this.renames);
     out += await cached.callText("patch");
@@ -1458,9 +1458,6 @@ function cfgBool(config: RemoteConfigStore, key: string, fallback: boolean): boo
   const value = config.value(key);
   return value === undefined ? fallback : (parseGitBool(value) ?? fallback);
 }
-
-/** git's empty tree, the side compared with before the first commit. */
-const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /** The comment-line string of status's commented lines. */
 function commentLineString(workingCopy: WorkingCopy): string {

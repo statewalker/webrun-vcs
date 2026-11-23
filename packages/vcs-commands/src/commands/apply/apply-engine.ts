@@ -759,7 +759,8 @@ export class ApplyEngine extends ApplyParser {
 
   private async applyBinary(img: Target, patch: FilePatch): Promise<number> {
     const name = patch.oldName ?? patch.newName;
-    const hex = /^[0-9a-f]{40}$/;
+    // a full id of either format (git's hexsz digits)
+    const hex = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
     if (!hex.test(patch.oldOidPrefix) || !hex.test(patch.newOidPrefix))
       return this.error(`cannot apply binary patch to '${name}' without full index line`);
     if (patch.oldName !== null) {
@@ -1328,13 +1329,11 @@ export class ApplyEngine extends ApplyParser {
   private async addIndexFile(name: string, mode: number, buf: string): Promise<number> {
     if (this.itaOnly) {
       // set_object_name_for_intent_to_add_entry: the empty blob it names is written
-      await this.io.writeBlob("");
-      return this.addIndexEntries(name, [
-        { mode, oid: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391", intentToAdd: true },
-      ]);
+      const emptyBlob = await this.io.writeBlob("");
+      return this.addIndexEntries(name, [{ mode, oid: emptyBlob, intentToAdd: true }]);
     }
     if (isGitlink(mode)) {
-      const m = /^Subproject commit ([0-9a-f]{40})/.exec(buf);
+      const m = /^Subproject commit ([0-9a-f]{64}|[0-9a-f]{40})/.exec(buf);
       if (!m) return this.error(`corrupt patch for submodule ${name}`);
       return this.addIndexEntries(name, [{ mode, oid: m[1] as string }]);
     }

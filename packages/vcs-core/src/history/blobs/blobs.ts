@@ -5,6 +5,7 @@
  * and consistent method names (remove instead of delete).
  */
 
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { ObjectId } from "../../common/index.js";
 import type { ObjectStorage } from "../objects/index.js";
 
@@ -25,6 +26,12 @@ export type BlobContent = AsyncIterable<Uint8Array>;
  * The load() method returns a streaming AsyncIterable for memory efficiency.
  */
 export interface Blobs extends ObjectStorage<BlobContent> {
+  /**
+   * The repository's object format: the hash a worktree names files with (`git hash-object`).
+   * Absent: SHA-1.
+   */
+  readonly objectFormat?: ObjectFormat;
+
   /**
    * Store blob content
    *

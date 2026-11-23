@@ -28,8 +28,6 @@ import {
 import { TransportCommand } from "../transport-command.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
 
-const ZERO_ID = "0".repeat(40);
-
 export type { RemoteConfig };
 
 /**
@@ -387,8 +385,8 @@ export class RemoteRenameCommand extends GitCommand<RemoteRenameResult> {
             });
           }
           reflog.push({
-            oldId: id ?? ZERO_ID,
-            newId: id ?? ZERO_ID,
+            oldId: id ?? this.objectFormat.nullId,
+            newId: id ?? this.objectFormat.nullId,
             ...(renameLine.ident !== undefined ? { ident: renameLine.ident } : {}),
             message: `remote: renamed ${ref.name} to ${to}`,
           });

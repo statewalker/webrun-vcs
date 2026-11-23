@@ -7,6 +7,7 @@
  */
 
 import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
+import { nullObjectIdLike } from "@statewalker/vcs-utils";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { GitCommand } from "../git-command.js";
 import { ChangeType } from "../results/diff-entry.js";
@@ -725,7 +726,11 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
           ...(!del && e.newId ? { new: { mode: e.newMode as number, id: e.newId } } : {}),
         });
       }
-      ids.push(changes.length ? await patchIdOfChanges(this.blobs, changes) : "0".repeat(40));
+      ids.push(
+        changes.length
+          ? await patchIdOfChanges(this.blobs, changes, { objectFormat: this.objectFormat })
+          : this.objectFormat.nullId,
+      );
     }
     let text = `\nbase-commit: ${base}\n`;
     for (let i = ids.length - 1; i >= 0; i--) text += `prerequisite-patch-id: ${ids[i]}\n`;
@@ -765,7 +770,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     const date = fromIdent
       ? { timestamp: 0, tzOffset: "+0000" }
       : { timestamp: mail.committer.timestamp, tzOffset: mail.committer.tzOffset };
-    let text = `From ${mail.zeroCommit ? "0".repeat(40) : head} Mon Sep 17 00:00:00 2001\n`;
+    let text = `From ${mail.zeroCommit ? nullObjectIdLike(head) : head} Mon Sep 17 00:00:00 2001\n`;
     text += mail.thread;
     text += mailFromHeader(who.name, who.email, { encodeHeaders: mail.encodeHeaders });
     text += `Date: ${showDate(date.timestamp, date.tzOffset, { type: "rfc2822", local: false })}\n`;

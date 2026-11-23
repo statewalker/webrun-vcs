@@ -5,6 +5,7 @@
  * Blobs are the simplest object type - just raw binary content.
  */
 
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { ObjectId } from "../../common/id/index.js";
 import {
   CorruptObjectError,
@@ -27,7 +28,11 @@ import type { BlobRead, Blobs } from "./blobs.js";
  * Delegates all operations to GitObjects with "blob" type.
  */
 class GitBlobStore implements Blobs {
-  constructor(private readonly objects: GitObjects) {}
+  constructor(private readonly objects: GitObjects) {
+    if (objects.objectFormat) this.objectFormat = objects.objectFormat;
+  }
+
+  readonly objectFormat?: ObjectFormat;
 
   /**
    * Store a blob: in one pass with `size`, else through `putUnsized` (small

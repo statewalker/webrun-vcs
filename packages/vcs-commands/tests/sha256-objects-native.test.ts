@@ -585,4 +585,110 @@ describeGit("SHA-256 repositories against native git", () => {
       await expect(openOurs(dir)).rejects.toThrow(UnsupportedObjectFormatError);
     });
   });
+
+  // ---------------------------------------------------------------- notes (t3301-notes.sh)
+
+  describe("notes (t3301-notes.sh)", () => {
+    it("reads native notes, writes notes native git lists", async () => {
+      const dir = nativeRepo();
+      const head = g(dir, "rev-parse", "HEAD");
+      const side = g(dir, "rev-parse", "side");
+      g(dir, "notes", "add", "-m", "native note", side);
+      const git = await openOurs(dir);
+      expect((await git.notes().show().setObject("side").call()).output).toBe("native note\n");
+      await git.notes().add().setObject(head).addMessage("our note").call();
+      expect(g(dir, "notes", "show", head)).toBe("our note");
+      const listed = await git.notes().list().call();
+      expect(listed.notes.map((n) => n.object).sort()).toEqual([head, side].sort());
+      expect(listed.output).toBe(`${g(dir, "notes", "list")}\n`);
+      await git.notes().remove().addObjects(side).call();
+      expect(g(dir, "notes", "list").split("\n")).toHaveLength(1);
+      const fsck = native(dir, ["fsck", "--strict", ...(modern ? ["--no-references"] : [])]);
+      expect([fsck.status, fsck.stderr]).toEqual([0, ""]);
+    });
+
+    // "notes in a fanned-out tree" (fast-import's fanout, t3303's many notes)
+    it("reads and changes a fanned-out notes tree as git does", async () => {
+      const dir = nativeRepo();
+      let commits = "";
+      for (let i = 0; i < 300; i++) {
+        commits += `commit refs/heads/many\nmark :${i + 1}\ncommitter A <a@x> ${1000 + i} +0000\ndata 2\nc\n`;
+        commits += `${i ? `from :${i}\n` : ""}M 644 inline f\ndata ${String(i).length + 1}\n${i}\n\n`;
+      }
+      expect(
+        native(dir, ["-c", "fastimport.unpackLimit=100000", "fast-import", "--quiet"], commits)
+          .status,
+      ).toBe(0);
+      const ids = g(dir, "rev-list", "many").split("\n");
+      let notes = "commit refs/notes/commits\ncommitter A <a@x> 0 +0000\ndata 2\nn\n";
+      ids.forEach((id, i) => {
+        notes += `N inline ${id}\ndata ${String(i).length + 1}\n${i}\n`;
+      });
+      expect(
+        native(dir, ["-c", "fastimport.unpackLimit=100000", "fast-import", "--quiet"], notes)
+          .status,
+      ).toBe(0);
+      // fanned out: two-digit directories at the top
+      expect(g(dir, "ls-tree", "refs/notes/commits").split("\n")[0]).toMatch(/^040000 tree /);
+      const git = await openOurs(dir);
+      expect(
+        (
+          await git
+            .notes()
+            .show()
+            .setObject(ids[5] as string)
+            .call()
+        ).output,
+      ).toBe("5\n");
+      const all = await git.notes().list().call();
+      expect(all.notes).toHaveLength(300);
+      expect(all.output).toBe(`${g(dir, "notes", "list")}\n`);
+      const head = g(dir, "rev-parse", "main");
+      await git.notes().add().setObject(head).addMessage("ours").call();
+      expect(g(dir, "notes", "list").split("\n")).toHaveLength(301);
+      expect(g(dir, "notes", "show", head)).toBe("ours");
+      expect(g(dir, "notes", "show", ids[7] as string)).toBe("7");
+      const fsck = native(dir, ["fsck", "--strict", ...(modern ? ["--no-references"] : [])]);
+      expect([fsck.status, fsck.stderr]).toEqual([0, ""]);
+    });
+  });
+
+  // ---------------------------------------------------------------- the worktree
+
+  describe("the worktree hashes in the repository's format", () => {
+    it("ours commits, status is clean, diff empty, a checkout switches", async () => {
+      const dir = fresh();
+      const files = createNodeFilesApi({ rootDir: root });
+      const { git } = await Git.init()
+        .setFilesApi(files)
+        .setDirectory(dir.slice(root.length + 1))
+        .setObjectFormat("sha256")
+        .setInitialBranch("main")
+        .setWorktree(true)
+        .setStagingStore(new MemoryStagingStore())
+        .call();
+      put(dir, "a.txt", "hello\n");
+      put(dir, "d/b.txt", "bee\n");
+      await git.add().addFilepattern(".").call();
+      const first = await git.commit().setMessage("first").call();
+      expect(first.id).toHaveLength(64);
+      expect(g(dir, "rev-parse", "HEAD:a.txt")).toBe(
+        native(dir, ["hash-object", "a.txt"]).stdout.trim(),
+      );
+      const status = await git.status().call();
+      expect(status.isClean()).toBe(true);
+      expect(await git.diff().call()).toEqual([]);
+      await git.checkout().setCreateBranch(true).setName("side").call();
+      put(dir, "a.txt", "side\n");
+      await git.add().addFilepattern("a.txt").call();
+      await git.commit().setMessage("side").call();
+      await git.checkout().setName("main").call();
+      expect(readFileSync(join(dir, "a.txt"), "utf8")).toBe("hello\n");
+      expect((await git.status().call()).isClean()).toBe(true);
+      const fsck = native(dir, ["fsck", "--strict", ...(modern ? ["--no-references"] : [])]);
+      expect([fsck.status, fsck.stderr]).toEqual([0, ""]);
+      expect(g(dir, "log", "--format=%s", "side")).toBe("side\nfirst");
+      expect(g(dir, "ls-tree", "-r", "--name-only", "main")).toBe("a.txt\nd/b.txt");
+    });
+  });
 });

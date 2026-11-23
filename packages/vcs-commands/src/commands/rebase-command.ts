@@ -182,8 +182,6 @@ type PickOutcome =
     }
   | { kind: "reschedule"; result: RebaseResult & { reschedule?: boolean } };
 
-const ZERO_ID = "0000000000000000000000000000000000000000";
-
 /**
  * What a todo command came to: nothing (go on), `checkTodo` (go on, the list read again if
  * it changed), or a result that stops the rebase (`reschedule`: the command goes back).
@@ -2403,7 +2401,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         }
         if (buf === "") buf = `rev-${await this.abbreviateObjectId(oid)}`;
         if (
-          (buf.length === 40 && /^[0-9a-fA-F]{40}$/.test(buf)) ||
+          (buf.length === this.objectFormat.hexLength && /^[0-9a-fA-F]+$/.test(buf)) ||
           buf === "#" ||
           labels.has(buf)
         ) {
@@ -3605,7 +3603,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         } else {
           out.push({ action: RebaseAction.UPDATE_REF, id: "", rest: name, blankAfter: true });
           if (!records.some((r) => r.ref === name)) {
-            records.push({ ref: name, before: values.get(name) ?? ZERO_ID, after: ZERO_ID });
+            records.push({
+              ref: name,
+              before: values.get(name) ?? this.objectFormat.nullId,
+              after: this.objectFormat.nullId,
+            });
           }
         }
       }
@@ -3625,14 +3627,18 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       .map((item) => item.rest ?? "");
     let updated = false;
     const kept = records.filter((r) => {
-      const keep = r.after !== ZERO_ID || named.includes(r.ref);
+      const keep = r.after !== this.objectFormat.nullId || named.includes(r.ref);
       if (!keep) updated = true;
       return keep;
     });
     for (const ref of named) {
       if (!kept.some((r) => r.ref === ref)) {
         const value = (await this.refsStore.resolve(ref).catch(() => undefined))?.objectId;
-        kept.push({ ref, before: value ?? ZERO_ID, after: ZERO_ID });
+        kept.push({
+          ref,
+          before: value ?? this.objectFormat.nullId,
+          after: this.objectFormat.nullId,
+        });
         updated = true;
       }
     }
@@ -3662,7 +3668,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const failed: string[] = [];
     for (const record of records) {
       const value = (await this.refsStore.resolve(record.ref).catch(() => undefined))?.objectId;
-      if ((value ?? ZERO_ID) !== record.before || record.after === ZERO_ID) {
+      if (
+        (value ?? this.objectFormat.nullId) !== record.before ||
+        record.after === this.objectFormat.nullId
+      ) {
         failed.push(record.ref);
         continue;
       }
@@ -3848,7 +3857,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       const parentTree = commit.parents[0]
         ? (await this.loadCommit(commit.parents[0]))?.tree
         : undefined;
-      return patchId(trees, this.blobs, parentTree, commit.tree, { headerOnly });
+      return patchId(trees, this.blobs, parentTree, commit.tree, {
+        headerOnly,
+        objectFormat: this.objectFormat,
+      });
     };
     const full = new Map<ObjectId, string | undefined>();
     const fullOf = async (id: ObjectId) => {

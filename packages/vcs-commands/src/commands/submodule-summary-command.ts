@@ -6,7 +6,6 @@ import { RemoteConfigStore } from "../remote-config/index.js";
 import { ChangeType, type DiffEntry } from "../results/diff-entry.js";
 import { DiffCommand } from "./diff-command.js";
 import {
-  NULL_OBJECT_ID,
   openSubmoduleRepository,
   readGitmodulesEntries,
   type SubmoduleRepository,
@@ -199,8 +198,8 @@ export class SubmoduleSummaryCommand extends GitCommand<string> {
       out.push({
         modSrc,
         modDst,
-        oidSrc: modSrc ? (e.oldId ?? NULL_OBJECT_ID) : NULL_OBJECT_ID,
-        oidDst: modDst ? (e.newId ?? NULL_OBJECT_ID) : NULL_OBJECT_ID,
+        oidSrc: modSrc ? (e.oldId ?? this.objectFormat.nullId) : this.objectFormat.nullId,
+        oidDst: modDst ? (e.newId ?? this.objectFormat.nullId) : this.objectFormat.nullId,
         status,
         path: (e.oldPath ?? e.newPath) as string,
       });
@@ -259,9 +258,9 @@ export class SubmoduleSummaryCommand extends GitCommand<string> {
   /** generate_submodule_summary and print_submodule_summary for one submodule. */
   private async generate(p: ModuleChange): Promise<string> {
     const worktree = this.worktreeAccess;
-    if (!this.cached && p.oidDst === NULL_OBJECT_ID && isGitlink(p.modDst)) {
+    if (!this.cached && p.oidDst === this.objectFormat.nullId && isGitlink(p.modDst)) {
       const sub = await openSubmoduleRepository(this.workingCopy, p.path);
-      if (sub?.populated) p.oidDst = (await sub.head()) ?? NULL_OBJECT_ID;
+      if (sub?.populated) p.oidDst = (await sub.head()) ?? this.objectFormat.nullId;
     }
     const repo = worktree ? await this.repositoryAt(p.path) : undefined;
     let missingSrc = false;

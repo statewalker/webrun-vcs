@@ -24,7 +24,7 @@
  */
 
 import type { ObjectId } from "../../common/id/index.js";
-import type { GitObject, GitObjects } from "./git-objects.js";
+import { type GitObject, type GitObjects, objectFormatOf } from "./git-objects.js";
 
 /** Fetches absent objects from the promisor remotes (what vcs-commands supplies). */
 export interface PromisorFetcher {
@@ -153,7 +153,7 @@ export interface ObjectPromisor {
 /** What {@link createObjectPromisor} reads. */
 export interface ObjectPromisorOptions {
   /** The store's objects, without lazy fetching (reads of promisor packs' objects) */
-  objects: Pick<GitObjects, "get" | "has">;
+  objects: Pick<GitObjects, "get" | "has" | "objectFormat">;
   /** The store's promisor packs (packs with a `.promisor` file), in lookup order */
   promisorPacks(): Promise<readonly PromisorPack[]>;
   /**
@@ -164,10 +164,12 @@ export interface ObjectPromisorOptions {
   storedOutsidePromisorPacks?(id: ObjectId): Promise<boolean>;
 }
 
-const OID = /^[0-9a-f]{40}$/;
+const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** The partial clone side of a store: see {@link ObjectPromisor}. */
 export function createObjectPromisor(options: ObjectPromisorOptions): ObjectPromisor {
+  // raw id bytes of the store's trees (20, or 32 in a SHA-256 repository)
+  const idLength = objectFormatOf(options.objects).rawLength;
   let fetcher: PromisorFetcher | undefined;
   let fetchCount = 0;
   const warnings: string[] = [];
@@ -212,7 +214,7 @@ export function createObjectPromisor(options: ObjectPromisorOptions): ObjectProm
           continue;
         }
         const bytes = obj.bytes ?? (await collect(obj.content));
-        for (const named of namedObjects(obj.type, bytes)) promised.add(named);
+        for (const named of namedObjects(obj.type, bytes, idLength)) promised.add(named);
       } catch (error) {
         if (skipUnreadable) continue;
         throw new PromisorObjectReadError(id, packOf.get(id) ?? "", error);
@@ -315,7 +317,7 @@ export function createObjectPromisor(options: ObjectPromisorOptions): ObjectProm
         seen.add(id);
         out.push(id);
         const bytes = obj.bytes ?? (await collect(obj.content));
-        for (const entry of treeEntries(bytes)) {
+        for (const entry of treeEntries(bytes, idLength)) {
           if (entry.mode === "160000") continue;
           if (entry.mode === "40000") await walkTree(entry.id);
           else if (!seen.has(entry.id) && (await options.objects.has(entry.id))) {
@@ -343,7 +345,7 @@ export function createObjectPromisor(options: ObjectPromisorOptions): ObjectProm
         out.push(id);
         if (obj.type === "tag") {
           const bytes = obj.bytes ?? (await collect(obj.content));
-          pending.push(...namedObjects("tag", bytes));
+          pending.push(...namedObjects("tag", bytes, idLength));
         } else await skip(obj);
       }
       // the commit walk (process_parents: a commit in a promisor pack is listed, its parents
@@ -361,7 +363,7 @@ export function createObjectPromisor(options: ObjectPromisorOptions): ObjectProm
         seen.add(id);
         out.push(id);
         const bytes = obj.bytes ?? (await collect(obj.content));
-        const [tree, ...parents] = namedObjects("commit", bytes);
+        const [tree, ...parents] = namedObjects("commit", bytes, idLength);
         if (tree) commitTrees.push(tree);
         await settle(id);
         if (!packs.has(id)) for (const p of parents) if (!seen.has(p)) commits.push(p);
@@ -519,22 +521,22 @@ async function collect(content: AsyncIterable<Uint8Array>): Promise<Uint8Array> 
 const HEX = "0123456789abcdef";
 
 /** A tree's entries: mode (as stored, `40000` for a subtree) and id. */
-export function treeEntries(bytes: Uint8Array): { mode: string; id: ObjectId }[] {
+export function treeEntries(bytes: Uint8Array, idLength = 20): { mode: string; id: ObjectId }[] {
   const out: { mode: string; id: ObjectId }[] = [];
   let at = 0;
   while (at < bytes.length) {
     const space = bytes.indexOf(0x20, at);
     const nul = bytes.indexOf(0, at);
-    if (space < 0 || nul < 0 || nul + 21 > bytes.length) break;
+    if (space < 0 || nul < 0 || nul + 1 + idLength > bytes.length) break;
     let mode = "";
     for (let i = at; i < space; i++) mode += String.fromCharCode(bytes[i] as number);
     let id = "";
-    for (let i = nul + 1; i < nul + 21; i++) {
+    for (let i = nul + 1; i < nul + 1 + idLength; i++) {
       const b = bytes[i] as number;
       id += HEX[b >> 4] + HEX[b & 15];
     }
     out.push({ mode: mode.replace(/^0+/, ""), id });
-    at = nul + 21;
+    at = nul + 1 + idLength;
   }
   return out;
 }
@@ -544,30 +546,30 @@ export function treeEntries(bytes: Uint8Array): { mode: string; id: ObjectId }[]
  * `do_record_outgoing_links`): a commit's tree and parents, a tag's object, a tree's subtrees
  * (not its blobs).
  */
-export function outgoingLinks(type: string, bytes: Uint8Array): ObjectId[] {
+export function outgoingLinks(type: string, bytes: Uint8Array, idLength = 20): ObjectId[] {
   if (type === "tree") {
-    return treeEntries(bytes)
+    return treeEntries(bytes, idLength)
       .filter((e) => e.mode === "40000")
       .map((e) => e.id);
   }
-  return namedObjects(type, bytes);
+  return namedObjects(type, bytes, idLength);
 }
 
 /** The ids an object names (git's add_promisor_object): tree entries, commit tree and parents, tag object. */
-export function namedObjects(type: string, bytes: Uint8Array): ObjectId[] {
+export function namedObjects(type: string, bytes: Uint8Array, idLength = 20): ObjectId[] {
   const out: ObjectId[] = [];
   if (type === "tree") {
     let at = 0;
     while (at < bytes.length) {
       const nul = bytes.indexOf(0, at);
-      if (nul < 0 || nul + 21 > bytes.length) break;
+      if (nul < 0 || nul + 1 + idLength > bytes.length) break;
       let id = "";
-      for (let i = nul + 1; i < nul + 21; i++) {
+      for (let i = nul + 1; i < nul + 1 + idLength; i++) {
         const b = bytes[i] as number;
         id += HEX[b >> 4] + HEX[b & 15];
       }
       out.push(id);
-      at = nul + 21;
+      at = nul + 1 + idLength;
     }
     return out;
   }
