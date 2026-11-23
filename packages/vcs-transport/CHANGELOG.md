@@ -1,5 +1,49 @@
 # @statewalker/vcs-transport
 
+## 0.7.0
+
+### Minor Changes
+
+- 990a2f7: **Legacy remotes in `.git/remotes/` and `.git/branches/`, as git 2.x reads them.**
+  
+  - **Remote lookup:** a remote the configuration gives no URL is read from `$GIT_COMMON_DIR/remotes/<name>` (`URL:`, `Pull:`, `Push:` lines), then `$GIT_COMMON_DIR/branches/<name>` (`<url>[#<branch>]`: fetches `refs/heads/<branch>:refs/heads/<name>`, pushes `HEAD:refs/heads/<branch>`, the branch `init.defaultBranch` else `master`, tags always followed), as remote.c's `read_remotes_file` / `read_branches_file`, by fetch, pull, push, ls-remote, `@{upstream}` and `@{push}`. Its refspecs follow those of a configuration section without URL. git 2.5x's deprecation warning is in `FetchResult.messages`, the new `PushResult.warnings` and `RemoteRenameResult.warnings` (2.43 prints none).
+  - **`remote rename <name> <name>`** migrates such a remote into the configuration and deletes its file (builtin/remote.c `migrate_file`); renaming it to another name fails as git does (`Could not rename config section`, exit 1).
+  - **pull** from such a remote fetches with its own refspecs and merges the FETCH_HEAD entry marked for merge (pull.c `get_merge_heads`; no candidate fails as `die_no_merge_candidates`, exit 1). When the fetch moves the checked-out branch (a branches file named after it), the index and worktree are fast-forwarded from the old head first, with pull.c's warning in the new `PullResult.warnings` (`MergeCommand.callCheckoutFastForward`, merge.c's `checkout_fast_forward`); local changes in the way fail as git (exit 128).
+  - With `GitHostEnvironment.breakingChanges` (git 3.0) neither file is read, as before.
+  - **vcs-transport:** `TagMode` `"auto-always"` follows tags even when no refspec writes a ref (remote.c's `fetch_tags = 1`).
+- f91199d: **SHA-256 repositories open: their loose objects, trees, commits, tags and refs read and write with 64-hex ids.**
+  
+  - **vcs-utils:** `ObjectFormat` (git's `struct git_hash_algo`): `SHA1_OBJECT_FORMAT` and `SHA256_OBJECT_FORMAT` with their raw and hex lengths, null id, empty tree and blob ids, signature header and hashers; `objectFormatByName`, `isHexObjectId`, `isNullObjectId`, `nullObjectIdLike`. `sha256()` is a one-shot SHA-256 on Web Crypto (the portable incremental hasher where there is none); `computeObjectId(type, content, format?)` hashes in the given format. `UnsupportedObjectFormatError` and `assertSha1ObjectFormat` refuse what has no SHA-256 path yet.
+  - **Worktrees:** `FileWorktree` and `MemoryWorktree` hash files in the repository's format by default (`Blobs.objectFormat`), so status, diff and checkout agree with the stored blobs in a SHA-256 repository.
+  - **vcs-core:** a store carries its format (`GitObjects.objectFormat`, `createGitObjects(store, { objectFormat })`, `History.objectFormat`, `objectFormatOf()`); trees are encoded and decoded with the format's id length (`decodeTreeBytes(…, { idLength })`, `TreeEntryCursor(bytes, idLength)`), commits sign with `gpgsig-sha256` in SHA-256 (`CommitSignatureHeader`), the empty tree is the format's, abbreviations reach 64 digits (`parseCoreAbbrev(value, hexLength)`), refs check direct values against the format (`isRefObjectId(value, format)`, `RefBatchView.objectFormat`, `createMemoryRefs({ objectFormat })`, `createMemoryHistory({ objectFormat })`), and reflogs write 64-zero null ids.
+  - **vcs-store-files:** `extensions.objectFormat = sha256` is no longer refused (`RepositoryFormat.objectFormat`); `createGitFilesBackend({ create: true, objectFormat })` writes `core.repositoryformatversion = 1` and `extensions.objectformat`. Refused with `UnsupportedObjectFormatError` until their tickets land: a SHA-256 repository holding packs (or a multi-pack-index) and every pack write into one, its index file (`FileStagingStore`, through `GitStagingOptions.objectFormat`), gc, repack and prune, and writing its commit-graph (which is not read either).
+  - **vcs-transport:** fetch, push and serving refuse a SHA-256 repository (`createRepositoryFacade`) until the protocols' `object-format` capability is implemented.
+  - **vcs-commands:** `init().setObjectFormat("sha256")`, `$GIT_DEFAULT_HASH` (`GitHostEnvironment.defaultHash`) and `init.defaultObjectFormat` choose a new repository's format; re-initialising with another one throws `ReinitializeHashError` ("attempt to reinitialize repository with different hash"), an unknown name `UnknownHashAlgorithmError`. `rev-parse --show-object-format` (`addArgument`, `showObjectFormat()`), full and abbreviated 64-hex revisions, `log`, `diff` (`--full-index` too), `fsck` and `notes` (fanned-out trees too) work in SHA-256 repositories; `gc` refuses them. Patch-ids, `format-patch`'s zero commit, porcelain v2 status, rebase's ref updates, `worktree list`, `apply` and submodule summaries use the repository's null and empty ids.
+- 48b5a7e: **SHA-256 repositories are cloned, fetched, pushed and served: the protocols' `object-format` capability.**
+  
+  - **vcs-transport:** `createRepositoryFacade` no longer refuses a SHA-256 history and gives the facade `objectFormat`. Servers advertise `object-format=sha256` for a SHA-256 repository (v0: on the first ref line, before `agent=`, and an empty repository's `capabilities^{}` line carries a 64-zero id; v2: `object-format=sha256`); a SHA-1 repository's v0 advertisement is unchanged and its v2 one still says `object-format=sha1`. upload-pack v2 refuses a client of another format (`mismatched object format: server sha256; client sha1`), receive-pack one whose commands name another (`error: unsupported object format 'sha1'`), and both read ids, shallow lines, object-info ids and the received pack's REF_DELTA bases and trailer in the repository's width (`readRawPack(hashSize)`, `readPackFromStream(stream, hashSize)`). Clients read the advertisement in the server's format (`remoteObjectFormat`), echo it in `ls-refs` (an ls-remote of a SHA-256 remote from a SHA-1 repository lists its ids, as git), and refuse to fetch or push across formats with `ObjectFormatMismatchError` carrying git's message (`mismatched algorithms: client sha1; server sha256` in v2, `Server does not support this repository's object format` in v0, `the receiving end does not support this repository's hash algorithm` for push). `FetchClientOptions.onRemoteObjectFormat` reports the remote's hash once its refs are listed; `MatchPushRefsOptions.objectFormat` gives push the null id and id width; `ReceivedObjects`/`ReceivedLinks` take the raw width. New helpers: `formatOf`, `v0ObjectFormatCapabilities`, `v2ObjectFormatCapabilities`, `isObjectIdOf`, `isNullId`, `mismatchedAlgorithms`. The duplex v0 upload-pack now advertises `symref=HEAD:<branch>` as the smart-HTTP one does.
+  - **vcs-working-tree:** `LinkedWorktrees.reopenWithObjectFormat(format)` (optional): an empty repository switched to another hash and opened again.
+  - **vcs-store-files:** `GitLinkedWorktrees.reopenWithObjectFormat` writes `extensions.objectFormat` (and `core.repositoryformatversion = 1`) into an empty repository and opens it again with the working copy's options.
+  - **vcs-commands:** a clone takes the remote's hash, as git's: an empty destination of another format is reopened with it (`CloneResult.workingCopy`, which `Git.clone()` adopts); a destination whose storage cannot be reopened refuses (`fatal: cannot clone a sha256 repository into this sha1 repository`). `fetch` and `push` report a format mismatch as git's `fatal:` line; their null ids (FETCH_HEAD, porcelain, pre-push stdin) follow the repository's format.
+
+### Patch Changes
+
+- d0db396: **SHA-256 transport follow-ups (#241).**
+  
+  - **clone:** a clone switching the destination's object format checks first that the destination holds no refs and no objects of its own (`reopenWithObjectFormat` no longer counts what its alternates hold), and only then removes `objects/info/alternates`: a refused destination keeps its alternates file.
+  - **proc-receive:** the hook's `option old-oid`/`option new-oid` are read as git's `parse_oid_hex`, at the repository's hex length (`ProcReceiveRun.objectFormat`): in a SHA-1 repository a 64-digit id is its first 40 digits, in a SHA-256 repository a 40-digit id is no id and the option is ignored.
+- Updated dependencies [a8726f7]
+- Updated dependencies [a8726f7]
+- Updated dependencies [a8726f7]
+- Updated dependencies [a8726f7]
+- Updated dependencies [f291133]
+- Updated dependencies [d5813ff]
+- Updated dependencies [1038d26]
+- Updated dependencies [f91199d]
+- Updated dependencies [ca9b22b]
+  - @statewalker/vcs-core@0.7.0
+  - @statewalker/vcs-utils@0.7.0
+
 ## 0.6.0
 
 ### Minor Changes
