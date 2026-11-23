@@ -6,7 +6,6 @@
 
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import { joinPath } from "@statewalker/vcs-utils/files";
-import { sha1 } from "@statewalker/vcs-utils/hash";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 
 import type { ObjectId } from "../../common/id/index.js";
@@ -15,7 +14,6 @@ import {
   type CommitGraphLayer,
   type CommitGraphReadSettings,
   GENERATION_NUMBER_V1_MAX,
-  HASH_SIZE,
   parseCommitGraphLayer,
 } from "./commit-graph-format.js";
 import { COMMIT_GRAPH_FILE, readCommitGraph, readGraphFile } from "./commit-graph-reader.js";
@@ -110,8 +108,8 @@ async function verifyLayer(
     index === full.layers.length - 1 ? full : new CommitGraph(full.layers.slice(0, index + 1));
   const base = layer.numCommitsInBase;
 
-  const body = layer.bytes.subarray(0, layer.bytes.length - HASH_SIZE);
-  if (bytesToHex(await sha1(body)) !== layer.hash) {
+  const body = layer.bytes.subarray(0, layer.bytes.length - layer.hashSize);
+  if (bytesToHex(await layer.objectFormat.digest(body)) !== layer.hash) {
     report("the commit-graph file has incorrect checksum and is likely corrupt");
     state.error = ERROR_HASH;
   }

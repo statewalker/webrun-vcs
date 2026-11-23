@@ -3,7 +3,7 @@
  * Documentation/gitformat-commit-graph):
  *
  * ```text
- * header   "CGPH" | version 1 | hash version (1: SHA-1) | chunk count | base graph count
+ * header   "CGPH" | version 1 | hash version (1: SHA-1, 2: SHA-256) | chunk count | base graph count
  * TOC      (chunk count + 1) entries of chunk id (4 bytes) and offset (8 bytes), the last id 0
  * OIDF     256 fanout counts (4 bytes each)
  * OIDL     the commit ids, sorted
@@ -16,13 +16,19 @@
  * BIDX     per commit: the end of its changed-path Bloom filter in BDAT
  * BDAT     hash version, hash count, bits per entry, then the filters
  * BASE     the checksums of the layers below this one (split chains)
- * trailer  SHA-1 of everything before it
+ * trailer  the hash of everything before it (SHA-1, or SHA-256 in a SHA-256 repository)
  * ```
+ *
+ * Ids, the BASE checksums and the trailer are `rawLength` bytes of the repository's object
+ * format (git's `rawsz`), and the header's hash version is the format's (`oid_version`): a
+ * layer is parsed for the format it is read in (`CommitGraphReadSettings.objectFormat`), never
+ * guessed from its length.
  *
  * Validation is git's on load: signature, version, hash version, the size of the table of
  * contents and of each chunk, the fanout order. The checksum is checked only by `verify`.
  */
 
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 
 export const GRAPH_SIGNATURE = 0x43475048; // "CGPH"
@@ -46,9 +52,20 @@ export const GRAPH_LAST_EDGE = 0x80000000;
 export const GRAPH_HEADER_SIZE = 8;
 export const GRAPH_FANOUT_SIZE = 4 * 256;
 export const CHUNK_TOC_ENTRY_SIZE = 12;
+/** A SHA-1 id's bytes (a layer's own width is `CommitGraphLayer.hashSize`). */
 export const HASH_SIZE = 20;
-/** Tree id, two parent positions, generation and date. */
+/** A SHA-1 layer's CDAT record: tree id, two parent positions, generation and date. */
 export const GRAPH_DATA_WIDTH = HASH_SIZE + 16;
+
+/** git's graph_data_width: a CDAT record of ids `rawLength` bytes wide. */
+export function graphDataWidth(rawLength: number): number {
+  return rawLength + 16;
+}
+
+/** git's graph_min_size for ids `rawLength` bytes wide. */
+export function graphMinSize(rawLength: number): number {
+  return GRAPH_HEADER_SIZE + 4 * CHUNK_TOC_ENTRY_SIZE + GRAPH_FANOUT_SIZE + rawLength;
+}
 export const CORRECTED_COMMIT_DATE_OFFSET_OVERFLOW = 0x80000000;
 /** git's GENERATION_NUMBER_V1_MAX: the largest topological level CDAT holds. */
 export const GENERATION_NUMBER_V1_MAX = 0x3fffffff;
@@ -59,9 +76,8 @@ export const BLOOMDATA_CHUNK_HEADER_SIZE = 12;
 /** git's DEFAULT_BLOOM_MAX_CHANGES. */
 export const DEFAULT_BLOOM_MAX_CHANGES = 512;
 
-/** git's graph_min_size: header, four TOC entries, the fanout and the trailer. */
-export const GRAPH_MIN_SIZE =
-  GRAPH_HEADER_SIZE + 4 * CHUNK_TOC_ENTRY_SIZE + GRAPH_FANOUT_SIZE + HASH_SIZE;
+/** git's graph_min_size of a SHA-1 layer: header, four TOC entries, the fanout and the trailer. */
+export const GRAPH_MIN_SIZE = graphMinSize(HASH_SIZE);
 
 /** The changed-path Bloom filter settings of a layer (BDAT's header). */
 export interface BloomFilterSettings {
@@ -90,6 +106,11 @@ export interface CommitGraphReadSettings {
    * makes it 0): BIDX/BDAT are read unless it is 0
    */
   changedPathsVersion?: number;
+  /**
+   * The repository's object format (default SHA-1): the header's hash version must be its
+   * `version`, and ids, BASE entries and the trailer are its `rawLength` bytes wide
+   */
+  objectFormat?: ObjectFormat;
 }
 
 /** A chunk's place in the file. */
@@ -116,6 +137,12 @@ export class CommitGraphLayer {
   readonly headerBaseCount: number;
   /** The chunk ids in the order of the table of contents */
   readonly chunkIds: number[];
+  /** The object format the layer was read in */
+  readonly objectFormat: ObjectFormat;
+  /** Bytes of an id (the format's `rawLength`: git's `rawsz`) */
+  readonly hashSize: number;
+  /** Bytes of a CDAT record (`hashSize + 16`) */
+  readonly dataWidth: number;
 
   readonly fanout: ChunkRef;
   readonly oidLookup: ChunkRef;
@@ -148,7 +175,11 @@ export class CommitGraphLayer {
       bloomData?: ChunkRef;
       bloomSettings?: BloomFilterSettings;
     },
+    objectFormat: ObjectFormat = SHA1_OBJECT_FORMAT,
   ) {
+    this.objectFormat = objectFormat;
+    this.hashSize = objectFormat.rawLength;
+    this.dataWidth = graphDataWidth(this.hashSize);
     this.view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     this.numCommits = parts.numCommits;
     this.headerBaseCount = parts.headerBaseCount;
@@ -164,7 +195,7 @@ export class CommitGraphLayer {
     this.bloomData = parts.bloomData;
     this.bloomSettings = parts.bloomSettings;
     this.readGenerationData = parts.generationData !== undefined;
-    this.hash = bytesToHex(bytes.subarray(bytes.length - HASH_SIZE));
+    this.hash = bytesToHex(bytes.subarray(bytes.length - this.hashSize));
   }
 
   /** A big-endian 32-bit value at `offset`. */
@@ -179,22 +210,23 @@ export class CommitGraphLayer {
 
   /** The id bytes of local position `i`. */
   oidBytes(i: number): Uint8Array {
-    const at = this.oidLookup.offset + HASH_SIZE * i;
-    return this.bytes.subarray(at, at + HASH_SIZE);
+    const at = this.oidLookup.offset + this.hashSize * i;
+    return this.bytes.subarray(at, at + this.hashSize);
   }
 
-  /** The local position of `id` (20 bytes), or -1 (git's bsearch_hash over the fanout). */
+  /** The local position of `id` (`hashSize` bytes), or -1 (git's bsearch_hash over the fanout). */
   find(id: Uint8Array): number {
     const first = id[0] as number;
     let lo = first === 0 ? 0 : this.fanoutAt(first - 1);
     let hi = this.fanoutAt(first);
     const bytes = this.bytes;
     const base = this.oidLookup.offset;
+    const size = this.hashSize;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      const at = base + HASH_SIZE * mid;
+      const at = base + size * mid;
       let cmp = 0;
-      for (let k = 0; k < HASH_SIZE; k++) {
+      for (let k = 0; k < size; k++) {
         const d = (bytes[at + k] as number) - (id[k] as number);
         if (d !== 0) {
           cmp = d;
@@ -210,18 +242,18 @@ export class CommitGraphLayer {
 
   /** The offset of local position `i`'s CDAT record. */
   dataOffset(i: number): number {
-    return this.commitData.offset + GRAPH_DATA_WIDTH * i;
+    return this.commitData.offset + this.dataWidth * i;
   }
 
   /** The commit date of local position `i` (34 bits, as git stores it). */
   commitDate(i: number): number {
-    const at = this.dataOffset(i) + HASH_SIZE + 8;
+    const at = this.dataOffset(i) + this.hashSize + 8;
     return (this.u32(at) & 0x3) * 0x100000000 + this.u32(at + 4);
   }
 
   /** The topological level of local position `i` (CDAT's 30 bits: generation v1). */
   topoLevel(i: number): number {
-    return this.u32(this.dataOffset(i) + HASH_SIZE + 8) >>> 2;
+    return this.u32(this.dataOffset(i) + this.hashSize + 8) >>> 2;
   }
 
   /** The changed-path filter of local position `i`, or undefined (git's load_bloom_filter_from_graph). */
@@ -251,10 +283,11 @@ function readTableOfContents(
   tocOffset: number,
   count: number,
   report: (d: CommitGraphDiagnostic) => void,
+  hashSize: number,
 ): TocEntry[] | undefined {
   const entries: TocEntry[] = [];
   let at = tocOffset;
-  const limit = bytes.length - HASH_SIZE;
+  const limit = bytes.length - hashSize;
   for (let n = 0; n < count; n++) {
     const id = view.getUint32(at);
     const offset = Number(view.getBigUint64(at + 4));
@@ -304,7 +337,10 @@ export function parseCommitGraphLayer(
   diagnostics: CommitGraphDiagnostic[] = [],
 ): CommitGraphLayer | undefined {
   const report = (d: CommitGraphDiagnostic) => diagnostics.push(d);
-  if (bytes.length < GRAPH_MIN_SIZE) {
+  const objectFormat = settings.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const hashSize = objectFormat.rawLength;
+  const dataWidth = graphDataWidth(hashSize);
+  if (bytes.length < graphMinSize(hashSize)) {
     report({ level: "error", message: "commit-graph file is too small" });
     return undefined;
   }
@@ -326,10 +362,10 @@ export function parseCommitGraphLayer(
     return undefined;
   }
   const hashVersion = bytes[5] as number;
-  if (hashVersion !== GRAPH_HASH_VERSION_SHA1) {
+  if (hashVersion !== objectFormat.version) {
     report({
       level: "error",
-      message: `commit-graph hash version ${hex8(hashVersion)} does not match version ${hex8(GRAPH_HASH_VERSION_SHA1)}`,
+      message: `commit-graph hash version ${hex8(hashVersion)} does not match version ${hex8(objectFormat.version)}`,
     });
     return undefined;
   }
@@ -337,7 +373,7 @@ export function parseCommitGraphLayer(
   const headerBaseCount = bytes[7] as number;
   if (
     bytes.length <
-    GRAPH_HEADER_SIZE + (numChunks + 1) * CHUNK_TOC_ENTRY_SIZE + GRAPH_FANOUT_SIZE + HASH_SIZE
+    GRAPH_HEADER_SIZE + (numChunks + 1) * CHUNK_TOC_ENTRY_SIZE + GRAPH_FANOUT_SIZE + hashSize
   ) {
     report({
       level: "error",
@@ -345,7 +381,7 @@ export function parseCommitGraphLayer(
     });
     return undefined;
   }
-  const toc = readTableOfContents(bytes, view, GRAPH_HEADER_SIZE, numChunks, report);
+  const toc = readTableOfContents(bytes, view, GRAPH_HEADER_SIZE, numChunks, report, hashSize);
   if (!toc) return undefined;
   const chunk = (id: number): ChunkRef | undefined => {
     const e = toc.find((c) => c.id === id);
@@ -378,10 +414,10 @@ export function parseCommitGraphLayer(
     return undefined;
   }
   const oidLookup = chunk(CHUNK_OID_LOOKUP);
-  if (oidLookup && Math.floor(oidLookup.size / HASH_SIZE) !== numCommits) {
+  if (oidLookup && Math.floor(oidLookup.size / hashSize) !== numCommits) {
     report({ level: "error", message: "commit-graph OID lookup chunk is the wrong size" });
   }
-  if (!oidLookup || Math.floor(oidLookup.size / HASH_SIZE) !== numCommits) {
+  if (!oidLookup || Math.floor(oidLookup.size / hashSize) !== numCommits) {
     report({
       level: "error",
       message: "commit-graph required OID lookup chunk missing or corrupted",
@@ -389,10 +425,10 @@ export function parseCommitGraphLayer(
     return undefined;
   }
   const commitData = chunk(CHUNK_COMMIT_DATA);
-  if (commitData && Math.floor(commitData.size / GRAPH_DATA_WIDTH) !== numCommits) {
+  if (commitData && Math.floor(commitData.size / dataWidth) !== numCommits) {
     report({ level: "error", message: "commit-graph commit data chunk is wrong size" });
   }
-  if (!commitData || Math.floor(commitData.size / GRAPH_DATA_WIDTH) !== numCommits) {
+  if (!commitData || Math.floor(commitData.size / dataWidth) !== numCommits) {
     report({
       level: "error",
       message: "commit-graph required commit data chunk missing or corrupted",
@@ -454,19 +490,24 @@ export function parseCommitGraphLayer(
     }
   }
 
-  return new CommitGraphLayer(bytes, path, {
-    numCommits,
-    headerBaseCount,
-    chunkIds: toc.map((e) => e.id),
-    fanout,
-    oidLookup,
-    commitData,
-    generationData,
-    generationOverflow,
-    extraEdges,
-    baseGraphs,
-    bloomIndexes,
-    bloomData,
-    bloomSettings,
-  });
+  return new CommitGraphLayer(
+    bytes,
+    path,
+    {
+      numCommits,
+      headerBaseCount,
+      chunkIds: toc.map((e) => e.id),
+      fanout,
+      oidLookup,
+      commitData,
+      generationData,
+      generationOverflow,
+      extraEdges,
+      baseGraphs,
+      bloomIndexes,
+      bloomData,
+      bloomSettings,
+    },
+    objectFormat,
+  );
 }
