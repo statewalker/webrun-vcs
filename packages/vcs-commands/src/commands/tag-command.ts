@@ -1,5 +1,6 @@
 import type { AnnotatedTag, ObjectId, PersonIdent, Ref } from "@statewalker/vcs-core";
 import { compareRefNames, isValidTagName, ObjectType } from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import {
@@ -10,9 +11,11 @@ import {
   StoreNotAvailableError,
 } from "../errors/index.js";
 import { type CommandCommits, GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import { abbrevLengths } from "./core-config.js";
 import { type CleanupMode, tagMessageFromOption } from "./message-cleanup.js";
 import { canonicalObjectId, isFullHexObjectId } from "./object-id-input.js";
+import { SIGNING_FAILED_LINES, SigningFailedError } from "./signing.js";
 
 /**
  * Create a tag (lightweight or annotated).
@@ -55,7 +58,10 @@ export class TagCommand extends GitCommand<Ref> {
   private taggerName?: { name: string; email: string };
   private annotated = false;
   private force = false;
-  private signed = false;
+  /** `-s` / `--no-sign` (undefined: `tag.gpgSign`) */
+  private signed?: boolean;
+  /** `-u <key-id>` */
+  private signingKey?: string;
   private cleanupMode?: CleanupMode;
 
   /**
@@ -174,15 +180,29 @@ export class TagCommand extends GitCommand<Ref> {
   }
 
   /**
-   * Set whether to create a signed tag.
+   * `-s` (true) / `--no-sign` (false): whether to make a signed tag (an annotated one);
+   * undefined (the default) leaves it to `tag.gpgSign`, and `tag.forceSignAnnotated` signs
+   * a tag with a message not made with {@link setAnnotated}, as git's does.
    *
-   * Note: Signing is not implemented yet.
+   * No signer exists yet: a tag asked to be signed fails as git fails when gpg cannot sign
+   * (`error: gpg failed to sign the data:`, `error: unable to sign the tag`, exit 128:
+   * {@link SigningFailedError}), and neither a tag object nor a ref is written.
    *
    * @param signed Whether to sign
    */
-  setSigned(signed: boolean): this {
+  setSigned(signed: boolean | undefined): this {
     this.checkCallable();
     this.signed = signed;
+    return this;
+  }
+
+  /**
+   * `-u <key-id>`: make a tag signed with this key (whatever {@link setSigned} says, as
+   * git's `-u` with `--no-sign`); refused as {@link setSigned} says.
+   */
+  setSigningKey(keyId: string): this {
+    this.checkCallable();
+    this.signingKey = keyId;
     return this;
   }
 
@@ -220,9 +240,23 @@ export class TagCommand extends GitCommand<Ref> {
           ? this.objectId
           : await this.resolveRevision(this.objectId);
 
+    // git's cmd_tag: -u signs whatever --no-sign says, -s/--no-sign win over tag.gpgSign
+    const config = RemoteConfigStore.from(this.workingCopy);
+    let sign =
+      this.signingKey !== undefined ||
+      (this.signed ?? configBool(config.value("tag.gpgSign"), false));
     // Determine if we should create annotated tag
     // (an empty message too: git's `tag -m ""` makes an annotated tag)
-    const createAnnotated = this.annotated || this.message !== undefined || this.signed;
+    const createAnnotated = this.annotated || this.message !== undefined || sign;
+    // tag.forceSignAnnotated signs a tag object not asked for with -a (git's
+    // `force_sign_annotate && !annotate`)
+    if (
+      createAnnotated &&
+      !this.annotated &&
+      configBool(config.value("tag.forceSignAnnotated"), false)
+    ) {
+      sign = true;
+    }
 
     let tagObjectId: ObjectId;
 
@@ -252,6 +286,8 @@ export class TagCommand extends GitCommand<Ref> {
             : "",
       };
 
+      // build_tag_object signs before writing: no signer, git's failure (exit(128))
+      if (sign) throw await this.tagSigningFailed();
       tagObjectId = await this.tagsStore.storeTag(tag);
     } else {
       // Lightweight tag - just point to the object
@@ -273,6 +309,39 @@ export class TagCommand extends GitCommand<Ref> {
     const ref = await this.refsStore.get(refName);
     return ref as Ref;
   }
+
+  /**
+   * git's failure to sign a tag (create_tag): gpg's error, `error: unable to sign the tag`,
+   * and where the message was left (`TAG_EDITMSG` in the git directory, named as git names
+   * it from the top of the worktree: `.git/TAG_EDITMSG`), exit 128.
+   */
+  private async tagSigningFailed(): Promise<SigningFailedError> {
+    const gitDir = (await this.hooks.hostGitDir({ real: false }).catch(() => undefined))?.replace(
+      /\/+$/,
+      "",
+    );
+    const top = (await this.hostWorkingDir())?.replace(/\/+$/, "");
+    const path =
+      gitDir === undefined
+        ? ".git/TAG_EDITMSG"
+        : top !== undefined && gitDir.startsWith(`${top}/`)
+          ? `${gitDir.slice(top.length + 1)}/TAG_EDITMSG`
+          : `${gitDir}/TAG_EDITMSG`;
+    return new SigningFailedError(
+      [
+        ...SIGNING_FAILED_LINES,
+        "error: unable to sign the tag",
+        `The tag message has been left in ${path}`,
+      ].join("\n"),
+      this.signingKey ?? "",
+      128,
+    );
+  }
+}
+
+/** A git boolean (`git_config_bool`), else `fallback`. */
+function configBool(value: string | undefined, fallback: boolean): boolean {
+  return value === undefined ? fallback : (parseGitBool(value) ?? fallback);
 }
 
 /**
