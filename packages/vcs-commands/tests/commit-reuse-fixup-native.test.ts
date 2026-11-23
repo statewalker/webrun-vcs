@@ -515,4 +515,81 @@ describeGit("commit -C/-c and --fixup/--squash: as native git", () => {
     expect(head(mine)).toBe(head(theirs));
     expect(git(theirs, ["log", "--format=%s", "main"])).not.toMatch(/fixup!|amend!|squash!/);
   });
+
+  it("--amend --squash=HEAD: `squash! ` before HEAD's message, as git's use_message (t7500)", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    await expectCommit(
+      dir,
+      ["--amend", "--squash", "HEAD"],
+      (c) => c.setAmend(true).setSquash("HEAD"),
+      "--amend --squash=HEAD",
+    );
+    await expectCommit(
+      dir,
+      ["--amend", "--squash", "HEAD~1"],
+      (c) => c.setAmend(true).setSquash("HEAD~1"),
+      "--amend --squash=HEAD~1",
+    );
+  });
+
+  it("commits with an encoding header are read in the commit output encoding (t7500, t3900)", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    // UTF-8 bytes recorded as ISO-8859-1 (git converts them again), then true Latin-1 bytes
+    git(
+      dir,
+      ["-c", "i18n.commitEncoding=ISO-8859-1", "commit", "-qm", "Caf\u00e9 first\n\nbody \u00e9"],
+      {
+        ...OTHER,
+        GIT_AUTHOR_NAME: "J\u00f6rg",
+      },
+    );
+    putFile(dir, "c.txt", "c\n");
+    git(dir, ["add", "c.txt"]);
+    putFile(dir, "../msg-latin1", "Caf\u00e9 second\n\nna\u00efve body\n");
+    git(
+      dir,
+      ["-c", "i18n.commitEncoding=ISO-8859-1", "commit", "-q", "-F", "../msg-latin1"],
+      OTHER,
+    );
+    putFile(dir, "d.txt", "d\n");
+    git(dir, ["add", "d.txt"]);
+    for (const target of ["HEAD", "HEAD~1"]) {
+      await expectCommit(dir, ["--fixup", target], (c) => c.setFixup(target), `--fixup ${target}`);
+      await expectCommit(
+        dir,
+        ["--squash", target, "-m", "more"],
+        (c) => c.setSquash(target).setMessage("more"),
+        `--squash ${target}`,
+      );
+      await expectCommit(
+        dir,
+        ["--fixup", `amend:${target}`],
+        (c) => c.setFixup(`amend:${target}`),
+        `--fixup=amend:${target}`,
+      );
+      await expectCommit(dir, ["-C", target], (c) => c.setReuseMessage(target), `-C ${target}`);
+    }
+    await expectCommit(
+      dir,
+      ["--amend", "--no-edit"],
+      (c) => c.setAmend(true).setEdit(false),
+      "--amend of a Latin-1 commit",
+    );
+    // the fixup ours makes pairs with its target under native --autosquash
+    const [theirs, mine] = await expectCommit(
+      dir,
+      ["--fixup", "HEAD~1"],
+      (c) => c.setFixup("HEAD~1"),
+      "--fixup for autosquash",
+    );
+    const env = { GIT_SEQUENCE_EDITOR: ":", GIT_EDITOR: ":" };
+    for (const d of [theirs, mine]) {
+      const r = gitRun(root, d, ["rebase", "-i", "--autosquash", "HEAD~3"], env);
+      expect(r.status, r.stderr).toBe(0);
+      expect(git(d, ["log", "-3", "--format=%s"])).not.toMatch(/fixup!/);
+    }
+    expect(head(mine)).toBe(head(theirs));
+  });
 });

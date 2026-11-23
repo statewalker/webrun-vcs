@@ -48,6 +48,7 @@ import { DEFAULT_DATE_MODE, showDate } from "./date-format.js";
 import { approxidateCareful } from "./git-date.js";
 import { hostEnvironmentOf, InvalidDateError, parseGitDate, withoutCrud } from "./git-ident.js";
 import { IndexAdder, readGitlinkHead } from "./index-adder.js";
+import { reencodedCommitParts } from "./log-output.js";
 import {
   flatTree,
   OperationState,
@@ -1471,7 +1472,50 @@ export class CommitCommand extends GitCommand<CommitResult> {
           : fatal,
       );
     }
-    return commit;
+    return this.inCommitOutputEncoding(peeled.id, commit);
+  }
+
+  /**
+   * A commit's message and author as `git commit` reads another commit's (read_commit_message,
+   * format_commit_message): converted from its `encoding` header into the commit output
+   * encoding (`i18n.commitEncoding`, else UTF-8). Ours writes UTF-8 messages only, so a
+   * commit is converted only when that encoding is UTF-8.
+   */
+  private async inCommitOutputEncoding(id: ObjectId, commit: Commit): Promise<Commit> {
+    if (commit.encoding === undefined) return commit;
+    const configured = RemoteConfigStore.from(this.workingCopy).value("i18n.commitEncoding");
+    const output = configured ? configured : "UTF-8";
+    if (!/^utf-?8$/i.test(output)) return commit;
+    const raw = await this.readRawObject(id);
+    const parts = raw && reencodedCommitParts(raw, output);
+    if (!parts) return commit;
+    return { ...commit, message: parts.message, ...(parts.author ? { author: parts.author } : {}) };
+  }
+
+  /** The stored bytes of an object (undefined where the store cannot give them). */
+  private async readRawObject(id: ObjectId): Promise<Uint8Array | undefined> {
+    const objects = this.workingCopy.history?.objects;
+    if (!objects) return undefined;
+    try {
+      const obj = await objects.get(id);
+      if (!obj) return undefined;
+      if (obj.bytes) return obj.bytes;
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for await (const c of obj.content) {
+        chunks.push(c);
+        size += c.length;
+      }
+      const out = new Uint8Array(size);
+      let at = 0;
+      for (const c of chunks) {
+        out.set(c, at);
+        at += c.length;
+      }
+      return out;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -1483,7 +1527,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     let prefix = "";
     if (this.squashFrom !== undefined) {
       prefix =
-        this.reused && this.reusedName() === this.squashFrom
+        (this.reusedName() ?? (this.amend && !this.fixup ? "HEAD" : undefined)) === this.squashFrom
           ? "squash! "
           : autosquashSubject("squash", (await this.lookupCommit(this.squashFrom)).message);
     }
@@ -1790,6 +1834,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
       if (!previousCommit) {
         throw new NoHeadError("Cannot amend: HEAD commit not found");
       }
+      // (its message and author as git reads them: use_message = "HEAD")
+      previousCommit = await this.inCommitOutputEncoding(headId, previousCommit);
     }
 
     // The author (git's determine_author_info): the one given; else an amended commit's or
