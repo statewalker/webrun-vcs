@@ -39,7 +39,9 @@ export async function abbrevLengthsOf(
       // the fixed length below
     }
   }
-  const fixed = abbrev < 0 ? FALLBACK_ABBREV_LENGTH : abbrev === 0 ? 40 : Math.min(abbrev, 40);
+  // a full id is the format's width (git's hexsz)
+  const hex = wanted[0]?.length === 64 ? 64 : 40;
+  const fixed = abbrev < 0 ? FALLBACK_ABBREV_LENGTH : abbrev === 0 ? hex : Math.min(abbrev, hex);
   return new Map(wanted.map((id) => [id, fixed]));
 }
 

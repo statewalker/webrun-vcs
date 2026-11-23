@@ -33,6 +33,7 @@ import type {
   PackImportResult as CorePackImportResult,
   PackEntryInfo,
 } from "@statewalker/vcs-core";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 
 /** Options of {@link RepositoryFacade.importPack}. */
 export interface PackImportOptions {
@@ -160,6 +161,13 @@ export interface TagTargetInfo {
 }
 
 export interface RepositoryFacade {
+  /**
+   * The repository's object format (`extensions.objectFormat`): the hash its ids are and the
+   * `object-format` capability the servers advertise and the clients check (git's
+   * `the_hash_algo`). Absent: SHA-1.
+   */
+  readonly objectFormat?: ObjectFormat;
+
   /**
    * Imports a pack stream into the repository.
    * Parses pack format and stores objects.

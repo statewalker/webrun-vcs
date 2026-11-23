@@ -13,7 +13,7 @@
  */
 
 import { anonymizeUrl } from "../fetch-client/index.js";
-import { ZERO_OID } from "../protocol/index.js";
+import { isNullId } from "../protocol/object-format.js";
 import {
   type AbbrevLengths,
   abbreviate,
@@ -47,7 +47,7 @@ export function pushStatusParts(
   lengths?: AbbrevLengths,
   report?: PushRefReport,
 ): PushStatusParts {
-  const deletion = update.newOid === ZERO_OID;
+  const deletion = isNullId(update.newOid);
   // the local side: the ref pushed, else the source as written (`HEAD`, `HEAD~1`, an id),
   // a delete's "(delete)" (alloc_delete_ref)
   const peer = update.source ?? update.localRef ?? (deletion ? "(delete)" : update.newOid);
@@ -92,7 +92,7 @@ export function pushStatusParts(
       if (deletion) return { flag: "-", summary: "[deleted]" };
       const oldOid = report?.oldOid ?? update.oldOid;
       const newOid = report?.newOid ?? update.newOid;
-      if (oldOid === ZERO_OID) {
+      if (isNullId(oldOid)) {
         const name = report?.refName ?? update.remoteRef;
         const summary = name.startsWith("refs/tags/")
           ? "[new tag]"
@@ -113,7 +113,7 @@ export function pushStatusParts(
 
 /**
  * The ids `transport_summary_width` measures: each advertised ref's value and what it is
- * pushed to ({@link ZERO_OID} when not pushed), then each new remote ref's absent old value
+ * pushed to (the null id when not pushed), then each new remote ref's absent old value
  * and its new one.
  */
 export function pushSummaryIds(
@@ -126,7 +126,7 @@ export function pushSummaryIds(
   for (const r of remoteRefs) {
     if (!r.oid || r.name.endsWith("^{}") || advertised.has(r.name)) continue;
     advertised.add(r.name);
-    ids.push(r.oid, byRef.get(r.name)?.newOid ?? ZERO_OID);
+    ids.push(r.oid, byRef.get(r.name)?.newOid ?? "0".repeat(r.oid.length === 64 ? 64 : 40));
   }
   for (const u of updates) if (!advertised.has(u.remoteRef)) ids.push(u.oldOid, u.newOid);
   return ids;

@@ -20,8 +20,8 @@ import {
   type ProcessContext,
   setRepository,
 } from "../../context/context-adapters.js";
-import { ZERO_OID } from "../../protocol/constants.js";
 import { visibleRefs } from "../../protocol/hidden-refs.js";
+import { formatOf, v0ObjectFormatCapabilities } from "../../protocol/object-format.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
 import { sendPackStream } from "./send-pack-stream.js";
 import { checkUploadPackFilter, withFilterCapability } from "./upload-pack-filter.js";
@@ -244,19 +244,31 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
         const repository = getRepository(ctx);
         const refs = await refStore.listAll();
         // `filter` with uploadpack.allowFilter, after the others (git puts it near the end)
-        const capabilities = withFilterCapability(
+        // `object-format=sha256` for a SHA-256 repository (a SHA-1 one advertises as before)
+        const format = formatOf(repository);
+        const offered = withFilterCapability(
           config.serverCapabilities ??
             defaultUploadPackCapabilities(config.requestPolicy, repository),
           config.uploadPackFilter,
         );
-
-        let first = true;
+        // upload-pack's symref=HEAD:<branch> (as the smart-HTTP advertisement has it): a
+        // client cloning in v0 learns the remote HEAD's branch from it
         // hidden refs are neither advertised nor "ours" under the ADVERTISED policy
         const refsArray = visibleRefs(refs, config.hiddenRefs);
+        // (only a HEAD that resolves: an unborn one is not advertised, nor its symref)
+        const headTarget = refsArray.some(([name]) => name === "HEAD")
+          ? await refStore.getSymrefTarget?.("HEAD")
+          : undefined;
+        if (headTarget && !offered.some((c) => c.startsWith("symref="))) {
+          offered.push(`symref=HEAD:${headTarget}`);
+        }
+        const capabilities = v0ObjectFormatCapabilities(offered, format);
+
+        let first = true;
 
         // Empty repository: send special capabilities^{} line
         if (refsArray.length === 0) {
-          await transport.writeLine(`${ZERO_OID} capabilities^{}\0${capabilities.join(" ")}`);
+          await transport.writeLine(`${format.nullId} capabilities^{}\0${capabilities.join(" ")}`);
           for (const oid of repositoryShallow) await transport.writeLine(`shallow ${oid}`);
           await transport.writeFlush();
           state.advertisedCapabilities = new Set(capabilities);

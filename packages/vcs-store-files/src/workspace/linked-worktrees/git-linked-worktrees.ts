@@ -32,7 +32,7 @@ import {
   type PosixFilesApi,
   tryReadFile,
 } from "@statewalker/vcs-utils/files";
-import { isHexObjectId } from "@statewalker/vcs-utils/hash";
+import { isHexObjectId, type ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type {
   ContentFilterSetup,
   CreatedLinkedWorktree,
@@ -46,7 +46,7 @@ import type {
   WorktreeRepairReport,
 } from "@statewalker/vcs-working-tree";
 import { readIndexFileEntries } from "@statewalker/vcs-working-tree";
-
+import { createGitFilesBackend } from "../../create-git-files-backend.js";
 import {
   createFileRefStore,
   createWorktreeRefs,
@@ -881,6 +881,40 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
    * bare repository gives its history and configuration, without a working copy; a
    * worktree gives its working copy ({@link openCurrent}).
    */
+  /**
+   * git clone's `initialize_repository_version` (see {@link LinkedWorktrees}): an empty
+   * repository switched to `format` and opened again, with these options. Refused for a
+   * repository that holds objects or refs, and for a linked worktree.
+   */
+  async reopenWithObjectFormat(format: ObjectFormat): Promise<WorktreeAdmin> {
+    if (this.gitDir !== this.commonDir) {
+      throw new Error("cannot change the object format from a linked worktree");
+    }
+    for await (const ref of this.history.refs.list()) {
+      if (!isSymbolicRef(ref))
+        throw new Error("cannot change the object format of a repository with refs");
+    }
+    for await (const _id of this.history.objects?.list?.() ?? []) {
+      throw new Error("cannot change the object format of a repository with objects");
+    }
+    const config = await createWorkingCopyConfig(configFilesApiOf(this.files), this.commonDir);
+    if (format.name === "sha1") {
+      config.unset("extensions.objectFormat");
+    } else {
+      config.set("core.repositoryformatversion", "1");
+      config.set("extensions.objectFormat", format.name);
+    }
+    await config.save();
+    const { history } = await createGitFilesBackend({
+      files: this.files,
+      gitDir: this.commonDir,
+      ...(this.options.environment ? { environment: this.options.environment } : {}),
+      ...(this.options.includes === undefined ? {} : { configIncludes: this.options.includes }),
+    });
+    const reopened = await openGitLinkedWorktrees({ ...this.options, history });
+    return reopened.openAdmin();
+  }
+
   async openAdmin(): Promise<WorktreeAdmin> {
     const current = (await this.list()).find((wt) => wt.current);
     // the current working copy (open() gives every one its worktrees)

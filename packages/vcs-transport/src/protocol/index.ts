@@ -6,6 +6,7 @@ export * from "./errors.js";
 export * from "./git-daemon-request.js";
 export * from "./git-request-parser.js";
 export * from "./hidden-refs.js";
+export * from "./object-format.js";
 export * from "./pkt-line-codec.js";
 export * from "./report-status.js";
 export * from "./sideband.js";

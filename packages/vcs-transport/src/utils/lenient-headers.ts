@@ -17,7 +17,8 @@ import type {
 } from "../api/repository-facade.js";
 
 const decoder = new TextDecoder();
-const HEX40 = /^[0-9a-f]{40}$/;
+// a full id of either format (the object is read in its repository's)
+const HEX40 = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** The header lines of an object, up to the first empty line. */
 function headerLines(content: Uint8Array): string[] {

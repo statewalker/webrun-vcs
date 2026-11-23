@@ -77,3 +77,16 @@ export class RepositoryNotFoundError extends TransportError {
     this.url = url;
   }
 }
+
+/**
+ * The local repository and the remote name objects with different hashes (git dies:
+ * `mismatched algorithms: client sha1; server sha256`, `Server does not support this
+ * repository's object format`, `the receiving end does not support this repository's hash
+ * algorithm`). The message is git's, without its `fatal: `; nothing was fetched or pushed.
+ */
+export class ObjectFormatMismatchError extends TransportError {
+  constructor(message: string) {
+    super(message);
+    this.name = "ObjectFormatMismatchError";
+  }
+}

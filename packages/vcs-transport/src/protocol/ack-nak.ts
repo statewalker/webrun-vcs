@@ -42,7 +42,7 @@ export function parseAckNak(line: string): AckNackResult {
     const parts = rest.split(" ");
     const idHex = parts[0];
 
-    if (idHex.length !== OBJECT_ID_STRING_LENGTH) {
+    if (idHex.length !== OBJECT_ID_STRING_LENGTH && idHex.length !== 64) {
       throw new PackProtocolError(`Expected ACK/NAK, got: ${line}`);
     }
 
@@ -92,7 +92,7 @@ export function parseAckNakV2(line: string): AckNackResult {
   if (line.startsWith(PACKET_ACK) || line.startsWith("ACK ")) {
     const idHex = line.slice(4).trim();
 
-    if (idHex.length !== OBJECT_ID_STRING_LENGTH) {
+    if (idHex.length !== OBJECT_ID_STRING_LENGTH && idHex.length !== 64) {
       throw new PackProtocolError(`Expected ACK/NAK, got: ${line}`);
     }
 

@@ -15,7 +15,8 @@ import {
   type FetchOptions as TransportFetchOptions,
 } from "@statewalker/vcs-transport";
 import { parseGitInt } from "@statewalker/vcs-utils/encoding";
-import type { OpenedRepository, Worktree } from "@statewalker/vcs-working-tree";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
+import type { OpenedRepository, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
 
 import {
   CloneCheckoutError,
@@ -43,7 +44,48 @@ import { withRemoteUploadPack } from "./remote-transport.js";
 import { SparseCheckoutCommand } from "./sparse-checkout-command.js";
 import { SparseUnpack } from "./sparse-checkout-support.js";
 import { checkoutFreshTree } from "./tree-restore.js";
-import { repositoryPlaceOf } from "./worktree-support.js";
+import { repositoryPlaceOf, worktreeAdminWorkingCopy } from "./worktree-support.js";
+
+/** The settings a clone reopened with another object format runs with again. */
+const CLONE_SETTINGS = [
+  "uri",
+  "branch",
+  "depth",
+  "filterSpec",
+  "uploadPack",
+  "bare",
+  "noCheckout",
+  "sparse",
+  "remoteName",
+  "cloneAllBranches",
+  "mirror",
+  "singleBranch",
+  "branchesToClone",
+  "tagOption",
+  "shallowSince",
+  "shallowExcludes",
+  "directory",
+  "shared",
+  "local",
+  "dissociate",
+  "references",
+  "credentials",
+  "timeout",
+  "headers",
+  "gzipRequests",
+  "progressCallback",
+  "progressMessageCallback",
+  "transportRegistry",
+  "useReplaceRefsOverride",
+  "reflogActionOverride",
+];
+
+/** The remote names objects with another hash than the destination (see `cloneReopenedAs`). */
+class RemoteObjectFormatSwitch extends Error {
+  constructor(readonly format: ObjectFormat) {
+    super(`the remote repository's object format is ${format.name}`);
+  }
+}
 
 /** Names the clone's checkout in failure messages. */
 const CLONE = "clone";
@@ -545,7 +587,59 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   async call(): Promise<CloneResult> {
     this.checkCallable();
     this.setCallable(false);
+    try {
+      return await this.cloneOnce();
+    } catch (error) {
+      if (!(error instanceof RemoteObjectFormatSwitch)) throw error;
+      return this.cloneReopenedAs(error.format);
+    }
+  }
 
+  /**
+   * Called with the working copy a clone reopened with the remote's object format (see
+   * {@link CloneResult.workingCopy}): `Git.clone()` takes it as its own.
+   */
+  onWorkingCopyReopened(listener: (workingCopy: WorkingCopy) => void): this {
+    this.reopenedListener = listener;
+    return this;
+  }
+
+  private reopenedListener?: (workingCopy: WorkingCopy) => void;
+
+  /**
+   * git's clone initializes the new repository with the hash the remote names
+   * (`initialize_repository_version` with `transport_get_hash_algo`): the destination, still
+   * empty, is switched to `format` and reopened (`LinkedWorktrees.reopenWithObjectFormat`),
+   * and the clone runs again into it. What the first attempt wrote before it learned the
+   * format (the alternates of `--reference` / `--shared`) is removed first.
+   */
+  private async cloneReopenedAs(format: ObjectFormat): Promise<CloneResult> {
+    const worktrees = this._workingCopy.worktrees;
+    if (!worktrees?.reopenWithObjectFormat) {
+      throw new TransportError(
+        `fatal: cannot clone a ${format.name} repository into this ${this.objectFormat.name} repository`,
+      );
+    }
+    const place = repositoryPlaceOf(this.workingCopy);
+    const files = place?.getFiles?.();
+    const gitDir = place?.getGitDir?.();
+    if (files && gitDir !== undefined) {
+      const file = `${gitDir}/objects/info/alternates`;
+      if ((await files.stats(file))?.kind === "file") await files.remove(file);
+    }
+    const admin = await worktrees.reopenWithObjectFormat(format);
+    const workingCopy = worktreeAdminWorkingCopy(admin);
+    const next = new CloneCommand(workingCopy);
+    const self = this as unknown as Record<string, unknown>;
+    const other = next as unknown as Record<string, unknown>;
+    for (const key of CLONE_SETTINGS) if (key in self) other[key] = self[key];
+    next.shareHooksOf(this);
+    const result = await next.call();
+    this.reopenedListener?.(workingCopy);
+    return { ...result, workingCopy };
+  }
+
+  private async cloneOnce(): Promise<CloneResult> {
     if (!this.uri) {
       throw new InvalidRemoteError("", "URI must be specified for clone");
     }
@@ -759,6 +853,11 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         ? { filter: this.filterSpec, onWarning: (line: string) => messages.push(`${line}\n`) }
         : {}),
       ...(fsck ? { fsckObjects: fsck } : {}),
+      // git's clone takes the remote's hash: a destination of another one is reopened with it
+      // before anything is fetched (cloneReopenedAs)
+      onRemoteObjectFormat: (format) => {
+        if (format.name !== this.objectFormat.name) throw new RemoteObjectFormatSwitch(format);
+      },
       ...(copyObjects
         ? {
             beforeFetch: async (remoteRefs) => {

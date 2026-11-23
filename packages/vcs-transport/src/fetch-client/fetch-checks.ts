@@ -61,12 +61,17 @@ function hexDigit(c: number): number {
  * each): the order index-pack checks them in, and a set to ask whether an id was received.
  */
 export class ReceivedObjects {
-  private ids = new Uint8Array(20 * 256);
+  private ids: Uint8Array;
   private types = new Uint8Array(256);
   private entries = new Uint32Array(256);
   private deltas = new Uint8Array(256);
   private slots = new Int32Array(512);
   private n = 0;
+
+  /** @param w The raw width of the ids (20, SHA-1; 32, SHA-256: the repository's format) */
+  constructor(readonly w: number = 20) {
+    this.ids = new Uint8Array(w * 256);
+  }
 
   /** How many objects were received. */
   get size(): number {
@@ -75,13 +80,14 @@ export class ReceivedObjects {
 
   /** Records a received object (the pack import's `onObject`). */
   add(id: string, type: GitObjectTypeName, entry: PackEntryInfo): void {
-    if (id.length !== 40) return;
+    const w = this.w;
+    if (id.length !== 2 * w) return;
     if (this.n === this.types.length) this.grow();
-    const at = this.n * 20;
-    for (let i = 0; i < 20; i++) {
+    const at = this.n * w;
+    for (let i = 0; i < w; i++) {
       this.ids[at + i] = (hexDigit(id.charCodeAt(2 * i)) << 4) | hexDigit(id.charCodeAt(2 * i + 1));
     }
-    if (this.find(this.ids.subarray(at, at + 20)) >= 0) return; // a duplicate entry
+    if (this.find(this.ids.subarray(at, at + w)) >= 0) return; // a duplicate entry
     this.types[this.n] = TYPE_CODES[type];
     this.entries[this.n] = entry.index;
     this.deltas[this.n] = entry.delta ? 1 : 0;
@@ -90,7 +96,7 @@ export class ReceivedObjects {
     else this.insert(this.n - 1);
   }
 
-  /** Whether the id at `raw[at..at+20)` came with the pack. */
+  /** Whether the id at `raw[at..at+w)` came with the pack. */
   hasRaw(raw: Uint8Array, at: number): boolean {
     return this.find(raw, at) >= 0;
   }
@@ -104,9 +110,10 @@ export class ReceivedObjects {
 
   /** Whether `id` came with the pack. */
   has(id: string): boolean {
-    if (id.length !== 40) return false;
-    const raw = new Uint8Array(20);
-    for (let i = 0; i < 20; i++) {
+    const w = this.w;
+    if (id.length !== 2 * w) return false;
+    const raw = new Uint8Array(w);
+    for (let i = 0; i < w; i++) {
       const hi = hexDigit(id.charCodeAt(2 * i));
       const lo = hexDigit(id.charCodeAt(2 * i + 1));
       if (hi < 0 || lo < 0) return false;
@@ -129,8 +136,8 @@ export class ReceivedObjects {
     );
     for (const i of order) {
       let id = "";
-      for (let k = 0; k < 20; k++) {
-        id += (this.ids[i * 20 + k] as number).toString(16).padStart(2, "0");
+      for (let k = 0; k < this.w; k++) {
+        id += (this.ids[i * this.w + k] as number).toString(16).padStart(2, "0");
       }
       yield { id, type: TYPE_BY_CODE[this.types[i] as number] as GitObjectTypeName };
     }
@@ -138,7 +145,7 @@ export class ReceivedObjects {
 
   private grow(): void {
     const cap = this.types.length * 2;
-    const ids = new Uint8Array(cap * 20);
+    const ids = new Uint8Array(cap * this.w);
     ids.set(this.ids);
     this.ids = ids;
     for (const key of ["types", "deltas"] as const) {
@@ -166,9 +173,9 @@ export class ReceivedObjects {
     for (let s = this.hash(raw, rawAt) & mask; ; s = (s + 1) & mask) {
       const v = this.slots[s] as number;
       if (v === 0) return -1;
-      const at = (v - 1) * 20;
+      const at = (v - 1) * this.w;
       let same = true;
-      for (let k = 0; k < 20; k++) {
+      for (let k = 0; k < this.w; k++) {
         if (this.ids[at + k] !== raw[rawAt + k]) {
           same = false;
           break;
@@ -180,7 +187,7 @@ export class ReceivedObjects {
 
   private insert(i: number): void {
     const mask = this.slots.length - 1;
-    let s = this.hash(this.ids, i * 20) & mask;
+    let s = this.hash(this.ids, i * this.w) & mask;
     while (this.slots[s] !== 0) s = (s + 1) & mask;
     this.slots[s] = i + 1;
   }
@@ -191,37 +198,41 @@ export class ReceivedObjects {
   }
 }
 
-/** A set of raw 20-byte object ids, open addressing over one byte array. */
+/** A set of raw object ids of one width, open addressing over one byte array. */
 class RawIdSet {
-  private ids = new Uint8Array(20 * 256);
+  private ids: Uint8Array;
   private slots = new Int32Array(512);
   private n = 0;
+
+  constructor(readonly w: number) {
+    this.ids = new Uint8Array(w * 256);
+  }
 
   get size(): number {
     return this.n;
   }
 
-  /** Adds the id at `raw[at..at+20)`; false when it was there already. */
+  /** Adds the id at `raw[at..at+w)`; false when it was there already. */
   add(raw: Uint8Array, at: number): boolean {
     const mask = this.slots.length - 1;
     let s = idHash(raw, at) & mask;
     for (; ; s = (s + 1) & mask) {
       const v = this.slots[s] as number;
       if (v === 0) break;
-      if (sameId(this.ids, (v - 1) * 20, raw, at)) return false;
+      if (sameId(this.ids, (v - 1) * this.w, raw, at, this.w)) return false;
     }
-    if (this.n * 20 === this.ids.length) {
+    if (this.n * this.w === this.ids.length) {
       const ids = new Uint8Array(this.ids.length * 2);
       ids.set(this.ids);
       this.ids = ids;
     }
-    this.ids.set(raw.subarray(at, at + 20), this.n * 20);
+    this.ids.set(raw.subarray(at, at + this.w), this.n * this.w);
     this.n++;
     if (this.n * 2 > this.slots.length) {
       this.slots = new Int32Array(this.slots.length * 2);
       const m = this.slots.length - 1;
       for (let i = 0; i < this.n; i++) {
-        let t = idHash(this.ids, i * 20) & m;
+        let t = idHash(this.ids, i * this.w) & m;
         while (this.slots[t] !== 0) t = (t + 1) & m;
         this.slots[t] = i + 1;
       }
@@ -233,7 +244,7 @@ class RawIdSet {
 
   /** Calls `fn` with each id (the shared array and its offset), in insertion order. */
   forEach(fn: (raw: Uint8Array, at: number) => void): void {
-    for (let i = 0; i < this.n; i++) fn(this.ids, i * 20);
+    for (let i = 0; i < this.n; i++) fn(this.ids, i * this.w);
   }
 }
 
@@ -247,21 +258,24 @@ function idHash(raw: Uint8Array, at: number): number {
   );
 }
 
-function sameId(a: Uint8Array, ai: number, b: Uint8Array, bi: number): boolean {
-  for (let k = 0; k < 20; k++) if (a[ai + k] !== b[bi + k]) return false;
+function sameId(a: Uint8Array, ai: number, b: Uint8Array, bi: number, w: number): boolean {
+  for (let k = 0; k < w; k++) if (a[ai + k] !== b[bi + k]) return false;
   return true;
 }
 
-function rawToHex(raw: Uint8Array, at: number): string {
+function rawToHex(raw: Uint8Array, at: number, w: number): string {
   let id = "";
-  for (let k = 0; k < 20; k++) id += (raw[at + k] as number).toString(16).padStart(2, "0");
+  for (let k = 0; k < w; k++) id += (raw[at + k] as number).toString(16).padStart(2, "0");
   return id;
 }
 
-/** Parses 40 hex digits of `content` at `at` into `out`; false when they are not hex. */
+/**
+ * Parses `2 * out.length` hex digits of `content` at `at` into `out`; false when they are not
+ * hex.
+ */
 function parseHexId(content: Uint8Array, at: number, out: Uint8Array): boolean {
-  if (at + 40 > content.length) return false;
-  for (let i = 0; i < 20; i++) {
+  if (at + 2 * out.length > content.length) return false;
+  for (let i = 0; i < out.length; i++) {
     const hi = hexDigit(content[at + 2 * i] as number);
     const lo = hexDigit(content[at + 2 * i + 1] as number);
     if (hi < 0 || lo < 0) return false;
@@ -285,13 +299,23 @@ function startsWith(content: Uint8Array, at: number, word: string): boolean {
  * reads nothing back from the store.
  */
 export class ReceivedLinks {
-  private readonly links = new RawIdSet();
-  private readonly reported = new RawIdSet();
-  private readonly scratch = new Uint8Array(20);
+  private readonly links: RawIdSet;
+  private readonly reported: RawIdSet;
+  private readonly scratch: Uint8Array;
   private shallow: ReadonlySet<string> | undefined;
 
-  /** `shallow` gives the shallow commits index-pack is given, asked once the first commit comes. */
-  constructor(private readonly shallowOf: () => ReadonlySet<string>) {}
+  /**
+   * `shallow` gives the shallow commits index-pack is given, asked once the first commit comes;
+   * `w` is the raw width of the repository's ids (20 for SHA-1, 32 for SHA-256).
+   */
+  constructor(
+    private readonly shallowOf: () => ReadonlySet<string>,
+    readonly w: number = 20,
+  ) {
+    this.links = new RawIdSet(w);
+    this.reported = new RawIdSet(w);
+    this.scratch = new Uint8Array(w);
+  }
 
   /** How many distinct objects were reported */
   get reportedCount(): number {
@@ -306,13 +330,13 @@ export class ReceivedLinks {
       let at = 0;
       if (startsWith(content, at, "tree ") && parseHexId(content, at + 5, this.scratch)) {
         this.links.add(this.scratch, 0);
-        at += 46;
+        at += 5 + 2 * this.w + 1;
       }
       this.shallow ??= this.shallowOf();
       if (this.shallow.has(id)) return;
       while (startsWith(content, at, "parent ") && parseHexId(content, at + 7, this.scratch)) {
         this.links.add(this.scratch, 0);
-        at += 48;
+        at += 7 + 2 * this.w + 1;
       }
     } else if (type === "tag") {
       if (startsWith(content, 0, "object ") && parseHexId(content, 7, this.scratch))
@@ -327,9 +351,9 @@ export class ReceivedLinks {
         }
         while (at < content.length && content[at] !== 0) at++;
         at++;
-        if (at + 20 > content.length) break;
+        if (at + this.w > content.length) break;
         if ((mode & 0o170000) !== 0o160000) this.links.add(content, at); // gitlinks: not followed
-        at += 20;
+        at += this.w;
       }
     }
   }
@@ -341,8 +365,8 @@ export class ReceivedLinks {
 }
 
 function parseHexIdString(id: string, out: Uint8Array): boolean {
-  if (id.length !== 40) return false;
-  for (let i = 0; i < 20; i++) {
+  if (id.length !== 2 * out.length) return false;
+  for (let i = 0; i < out.length; i++) {
     const hi = hexDigit(id.charCodeAt(2 * i));
     const lo = hexDigit(id.charCodeAt(2 * i + 1));
     if (hi < 0 || lo < 0) return false;
@@ -449,7 +473,7 @@ export async function checkReceivedPack(
     if (collected && collected.reportedCount >= received.nonBlobs) {
       const foreign: string[] = [];
       collected.forEach((raw, at) => {
-        if (!received.hasRaw(raw, at)) foreign.push(rawToHex(raw, at));
+        if (!received.hasRaw(raw, at)) foreign.push(rawToHex(raw, at, received.w));
       });
       for (const link of foreign) await check(link);
     } else {

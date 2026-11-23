@@ -1,11 +1,12 @@
 /**
  * The transport `RefStore` over a vcs-core `Refs`.
  */
+
 import { isSymbolicRef, type Refs } from "@statewalker/vcs-core";
+import { isNullId } from "../protocol/object-format.js";
 import type { RefStore } from "./process-context.js";
 
 /** git's zero id: "no object", used by push commands for creates and deletes. */
-const ZERO_ID = "0".repeat(40);
 
 /**
  * Adapt a vcs-core `Refs` to the transport `RefStore`. Pushes received through
@@ -24,7 +25,8 @@ export function createTransportRefStore(refs: Refs): RefStore {
     },
     async update(name, oid) {
       // The zero id deletes, as in a push command.
-      if (oid === ZERO_ID) await refs.remove(name);
+      // the null id of either format deletes the ref
+      if (isNullId(oid)) await refs.remove(name);
       else await refs.set(name, oid);
     },
     batch: (commands, options) => refs.batch(commands, options),

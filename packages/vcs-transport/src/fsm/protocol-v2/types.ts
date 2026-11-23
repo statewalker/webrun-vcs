@@ -3,6 +3,7 @@
  */
 
 import type { RepositoryFacade } from "../../api/repository-facade.js";
+import { formatOf, v2ObjectFormatCapabilities } from "../../protocol/object-format.js";
 import { type UploadPackFilterPolicy, withFilterFeature } from "../fetch/upload-pack-filter.js";
 
 /**
@@ -94,11 +95,15 @@ export const OBJECT_INFO_CAPABILITY = "object-info=size type";
 export function serverV2Capabilities(
   capabilities: readonly string[] = SERVER_V2_CAPABILITIES,
   advertiseObjectInfo = false,
-  repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType">,
+  repository?: Pick<RepositoryFacade, "getObjectSize" | "getObjectType" | "objectFormat">,
   uploadPackFilter?: UploadPackFilterPolicy,
 ): string[] {
-  // `fetch=... filter` with uploadpack.allowFilter
-  const list = withFilterFeature(capabilities, uploadPackFilter);
+  // `fetch=... filter` with uploadpack.allowFilter; `object-format=` names the repository's
+  // hash (serve.c's object_format_advertise)
+  const list = v2ObjectFormatCapabilities(
+    withFilterFeature(capabilities, uploadPackFilter),
+    formatOf(repository),
+  );
   const named = list.some((c) => c === "object-info" || c.startsWith("object-info="));
   if (!advertiseObjectInfo || named) return list;
   const attributes = objectInfoAttributes(repository);

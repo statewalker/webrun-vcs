@@ -7,6 +7,7 @@ import {
   formatPushStatus,
   mapRejectReason,
   matchSource,
+  ObjectFormatMismatchError,
   type PushClientResult,
   type PushCommandResult,
   type PushRefUpdate,
@@ -16,6 +17,7 @@ import {
   type PushOptions as TransportPushOptions,
 } from "@statewalker/vcs-transport";
 import { parseGitBool, parseGitInt } from "@statewalker/vcs-utils/encoding";
+import { isNullObjectId } from "@statewalker/vcs-utils/hash";
 
 import {
   HookFailedError,
@@ -30,9 +32,6 @@ import { type PushResult, PushStatus, type RemoteRefUpdate } from "../results/pu
 import { TransportCommand } from "../transport-command.js";
 import { remoteHookSession } from "./local-transport.js";
 import { withRemoteReceivePack } from "./remote-transport.js";
-
-/** All-zero object id — Git's "no object", used to express a ref delete. */
-const ZERO_OBJECT_ID = "0".repeat(40);
 
 /**
  * How a server's rejection reason (`ng <ref> <reason>`) lands on the statuses this package
@@ -524,6 +523,10 @@ export class PushCommand extends TransportCommand<PushResult> {
         transactionHooks,
       );
     } catch (error) {
+      // send_pack dies: the remote's repository names objects with another hash
+      if (error instanceof ObjectFormatMismatchError) {
+        throw new TransportError(`fatal: ${error.message}`, undefined, { cause: error });
+      }
       if (error instanceof PushRefusedByHookError) {
         throw new HookFailedError(
           "pre-push",
@@ -568,7 +571,7 @@ export class PushCommand extends TransportCommand<PushResult> {
           // error lines (the push is done: git exits 0). The names and ids come from the
           // server (a proc-receive hook's `option refname` / `new-oid`): a bad name or an
           // object we lack is refused, as refs.c's transaction refuses it
-          if (target.oid === ZERO_OBJECT_ID) {
+          if (isNullObjectId(target.oid)) {
             if (!refNameIsSafe(local)) {
               trackingErrors.push(`error: refusing to update ref with bad name '${local}'`);
               continue;
@@ -618,7 +621,7 @@ export class PushCommand extends TransportCommand<PushResult> {
       message: update.message ?? (update.status === "ok" ? undefined : update.summary),
       summary: update.summary,
       forceUpdate: update.force,
-      delete: update.newOid === ZERO_OBJECT_ID,
+      delete: isNullObjectId(update.newOid),
       ...(update.reports?.length
         ? {
             reports: update.reports.map((r) => ({
@@ -657,7 +660,7 @@ export class PushCommand extends TransportCommand<PushResult> {
     exit: (code: number) => void,
   ): Promise<boolean> {
     const skipped = new Set(["rejected-nonfastforward", "rejected-stale", "up-to-date"]);
-    const zero = "0".repeat(40);
+    const zero = this.objectFormat.nullId;
     const stdin = updates
       .filter((u) => !skipped.has(u.status))
       .map((u) => {

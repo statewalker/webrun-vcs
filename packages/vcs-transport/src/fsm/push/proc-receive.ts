@@ -18,8 +18,9 @@
  */
 
 import { PktStream } from "../../fetch-client/pkt-stream.js";
+import { isNullId } from "../../protocol/object-format.js";
 import { encodeFlush, encodePacket } from "../../protocol/pkt-line-codec.js";
-import { type PushCommand, type RefPushReport, ZERO_OID } from "./types.js";
+import type { PushCommand, RefPushReport } from "./types.js";
 
 /** A command scheduled for the hook (git's `RUN_PROC_RECEIVE_SCHEDULED`). */
 export const PROC_RECEIVE_SCHEDULED = 1;
@@ -100,8 +101,8 @@ export function procReceiveRefMatches(
   cmd: Pick<PushCommand, "refName" | "oldOid" | "newOid">,
 ): boolean {
   for (const p of refs) {
-    const isAdd = cmd.oldOid === ZERO_OID;
-    const isDelete = cmd.newOid === ZERO_OID;
+    const isAdd = isNullId(cmd.oldOid);
+    const isDelete = isNullId(cmd.newOid);
     if (!p.wantAdd && isAdd) continue;
     if (!p.wantDelete && isDelete) continue;
     if (!p.wantModify && !isAdd && !isDelete) continue;
@@ -135,8 +136,9 @@ function fail(cmd: PushCommand, message: string): void {
 /** git's `parse_oid_hex` on the start of `value`: a lowercase id, or undefined. */
 function parseOidHex(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
-  const hex = value.slice(0, 40);
-  return /^[0-9a-fA-F]{40}$/.test(hex) ? hex.toLowerCase() : undefined;
+  // the hook answers in the repository's format: a 64-digit id is SHA-256's, else SHA-1's
+  const m = /^(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40})/.exec(value);
+  return m ? m[0].toLowerCase() : undefined;
 }
 
 /** C's `atoi`: the leading decimal number (after blanks and a sign), 0 when none. */

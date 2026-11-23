@@ -132,7 +132,7 @@ export interface GitOptions {
  * ```
  */
 export class Git implements Disposable {
-  private readonly _workingCopy: WorkingCopy;
+  private _workingCopy: WorkingCopy;
   private readonly transports?: GitTransportRegistry;
   private closed = false;
 
@@ -950,7 +950,13 @@ export class Git implements Disposable {
    */
   clone(): CloneCommand {
     this.checkClosed();
-    return this.withTransports(new CloneCommand(this._workingCopy));
+    // a clone that switches the repository to the remote's object format reopens it: this
+    // facade then works on the reopened working copy
+    return this.withTransports(
+      new CloneCommand(this._workingCopy).onWorkingCopyReopened((workingCopy) => {
+        this._workingCopy = workingCopy;
+      }),
+    );
   }
 
   /**
