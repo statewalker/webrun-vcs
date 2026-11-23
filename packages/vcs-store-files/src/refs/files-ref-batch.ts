@@ -52,7 +52,11 @@ import {
 } from "@statewalker/vcs-core";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
-import { nullObjectIdLike, type ObjectFormat } from "@statewalker/vcs-utils/hash";
+import {
+  nullObjectIdLike,
+  type ObjectFormat,
+  SHA1_OBJECT_FORMAT,
+} from "@statewalker/vcs-utils/hash";
 import { parseReflogLine } from "./reflog-reader.js";
 
 const enc = new TextEncoder();
@@ -60,7 +64,6 @@ const dec = new TextDecoder();
 const PACKED = "packed-refs";
 /** git's temporary for a packed-refs rewrite (packed-backend.c write_with_updates). */
 const PACKED_NEW = "packed-refs.new";
-const ZERO_ID = "0".repeat(40);
 /** Follow at most this many refs along a symbolic chain (git's read limit). */
 const MAX_SYMREF_READS = 5;
 
@@ -447,6 +450,8 @@ export function createFilesRefOps(
   files: AtomicFiles,
   options: FilesRefBatchOptions = {},
 ): FilesRefOps {
+  // the null id of the repository's format, as the placeholder of a ref being written
+  const zeroId = (options.objectFormat ?? SHA1_OBJECT_FORMAT).nullId;
   const refLockTimeout = options.refLockTimeoutMs ?? 100;
   const packedLockTimeout = options.packedLockTimeoutMs ?? 1000;
   const logAll = options.logAllRefUpdates ?? true;
@@ -760,7 +765,7 @@ export function createFilesRefOps(
         read: async (n) =>
           (await readRef(n, packed, read)) ??
           (!mine.has(n) && (await files.exists(`${n}.lock`))
-            ? { name: n, objectId: ZERO_ID, storage: RefStorage.LOOSE, peeled: false }
+            ? { name: n, objectId: zeroId, storage: RefStorage.LOOSE, peeled: false }
             : undefined),
         hasChildren: async (n) => {
           for (const k of packed.keys()) if (k.startsWith(`${n}/`)) return true;
@@ -1486,7 +1491,7 @@ export function createFilesRefOps(
     let ours = true;
     try {
       if (isUpdatableRefName(name)) {
-        const u = { name, requested: name, newValue: ZERO_ID } as Update;
+        const u = { name, requested: name, newValue: zeroId } as Update;
         const df = await conflicts([u], await readPacked(), new Set([name]));
         if (df.length) throw new RefUpdateRejectedError(df);
       }
