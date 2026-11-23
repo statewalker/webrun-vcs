@@ -1,6 +1,5 @@
 import {
   type Commit,
-  EMPTY_TREE_ID,
   FileMode,
   type ObjectId,
   type PersonIdent,
@@ -763,7 +762,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       // `cache_nr - ita_nr > 0`. The recorded tree says both without a status run.
       const parentTree = ctx.firstParent
         ? (await this.commits.load(ctx.firstParent))?.tree
-        : EMPTY_TREE_ID;
+        : this.objectFormat.emptyTreeId;
       committable = ctx.treeId !== parentTree;
     }
     // COMMIT_EDITMSG written in full, then an empty commit refused before the editor runs
@@ -1407,7 +1406,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       // no first parent (an initial commit, or --amend of a root commit): git counts the
       // index, `cache_nr - ita_nr > 0`; only intent-to-add entries (or none) leave the tree
       // empty
-      if (treeId === EMPTY_TREE_ID) throw new EmptyCommitError();
+      if (treeId === this.objectFormat.emptyTreeId) throw new EmptyCommitError();
       return;
     }
     if (this.amend && (previousCommit?.parents.length ?? 0) > 1) return;

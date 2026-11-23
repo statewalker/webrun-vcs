@@ -7,7 +7,13 @@
  */
 
 import { type Blobs, compareTreeEntries, FileMode, type ObjectId } from "@statewalker/vcs-core";
-import { bytesToHex, createSha1, type Hasher, unifiedDiffHunks } from "@statewalker/vcs-utils";
+import {
+  bytesToHex,
+  type Hasher,
+  type ObjectFormat,
+  SHA1_OBJECT_FORMAT,
+  unifiedDiffHunks,
+} from "@statewalker/vcs-utils";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
 import type { CommandTrees } from "../git-command.js";
@@ -102,7 +108,7 @@ export async function patchId(
   blobs: Blobs,
   parentTree: ObjectId | undefined,
   tree: ObjectId,
-  options: { headerOnly?: boolean } = {},
+  options: { headerOnly?: boolean; objectFormat?: ObjectFormat } = {},
 ): Promise<string | undefined> {
   const changes = await treeChanges(trees, parentTree, tree);
   if (changes.length === 0) return undefined;
@@ -124,11 +130,13 @@ export interface PatchIdChange {
 export async function patchIdOfChanges(
   blobs: Blobs,
   changes: PatchIdChange[],
-  options: { headerOnly?: boolean } = {},
+  options: { headerOnly?: boolean; objectFormat?: ObjectFormat } = {},
 ): Promise<string> {
-  const sum = new Uint8Array(20);
+  // the repository's hash (git's the_hash_algo): a SHA-256 repository's patch-ids are 64-hex
+  const format = options.objectFormat ?? blobs.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const sum = new Uint8Array(format.rawLength);
   for (const change of changes) {
-    const h = createSha1();
+    const h = format.createHasher();
     const newPath = removeSpace(encodeGitPath(change.path));
     const oldPath =
       change.oldPath !== undefined ? removeSpace(encodeGitPath(change.oldPath)) : newPath;
@@ -156,8 +164,8 @@ export async function patchIdOfChanges(
     if (options.headerOnly) {
       // only the header
     } else if (isBinary(a) || isBinary(b)) {
-      str(h, change.old?.id ?? "0".repeat(40));
-      str(h, change.new?.id ?? "0".repeat(40));
+      str(h, change.old?.id ?? format.nullId);
+      str(h, change.new?.id ?? format.nullId);
     } else {
       if (!change.old) {
         str(h, "---/dev/null");
@@ -186,7 +194,7 @@ export async function patchIdOfChanges(
     // flush_one_hunk: the file's hash added to the sum, bytewise with carry
     const digest = h.digest();
     let carry = 0;
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < sum.length; i++) {
       carry += sum[i] + digest[i];
       sum[i] = carry & 0xff;
       carry >>= 8;

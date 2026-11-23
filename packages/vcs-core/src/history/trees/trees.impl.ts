@@ -11,6 +11,7 @@ import {
   CorruptObjectError,
   type GitObjects,
   InvalidObjectIdError,
+  objectFormatOf,
 } from "../objects/git-objects.js";
 import { PromisorFetchError } from "../objects/object-promisor.js";
 import {
@@ -20,7 +21,7 @@ import {
   storeObject,
 } from "../objects/typed-object-access.js";
 import type { TreeEntry } from "./tree-entry.js";
-import { collectTreeBytes, decodeTreeBytes, EMPTY_TREE_ID } from "./tree-format.js";
+import { collectTreeBytes, decodeTreeBytes } from "./tree-format.js";
 import type { Trees } from "./trees.js";
 
 /**
@@ -45,10 +46,22 @@ class GitTreeStore implements Trees {
   /** Reads in flight, by tree id */
   private readonly reading = new Map<ObjectId, Promise<readonly TreeEntry[] | undefined>>();
 
+  /** The empty tree's id in the repository's object format */
+  private readonly emptyTreeId: ObjectId;
+  /** Raw id bytes of a tree entry: 20 (SHA-1) or 32 (SHA-256) */
+  private readonly idLength: number;
+  /** How stored trees are decoded: canonical modes, the format's id length */
+  private readonly decodeOptions: { canonicalModes: true; idLength: number };
+
   constructor(
     private readonly objects: GitObjects,
     private readonly maxCachedEntries = DEFAULT_MAX_CACHED_ENTRIES,
-  ) {}
+  ) {
+    const format = objectFormatOf(objects);
+    this.emptyTreeId = format.emptyTreeId;
+    this.idLength = format.rawLength;
+    this.decodeOptions = { ...CANONICAL, idLength: format.rawLength };
+  }
 
   // ============ New Trees Interface ============
 
@@ -56,11 +69,11 @@ class GitTreeStore implements Trees {
    * Store tree entries (new interface)
    */
   async store(entries: AsyncIterable<TreeEntry> | Iterable<TreeEntry>): Promise<ObjectId> {
-    const bytes = await collectTreeBytes(entries);
+    const bytes = await collectTreeBytes(entries, this.idLength);
     const epoch = objectRemovalEpoch();
     const id = await storeObject(this.objects, "tree", [bytes]);
     // a tree just stored is read next (a merge's result, a rebase's next HEAD)
-    if (!this.cache.has(id)) this.remember(id, decodeTreeBytes(bytes, CANONICAL), epoch);
+    if (!this.cache.has(id)) this.remember(id, decodeTreeBytes(bytes, this.decodeOptions), epoch);
     return id;
   }
 
@@ -71,7 +84,7 @@ class GitTreeStore implements Trees {
    */
   async load(id: ObjectId): Promise<AsyncIterable<TreeEntry> | undefined> {
     // Handle empty tree specially
-    if (id === EMPTY_TREE_ID) {
+    if (id === this.emptyTreeId) {
       return emptyTreeEntries();
     }
 
@@ -82,7 +95,7 @@ class GitTreeStore implements Trees {
 
   /** The entries as stored and cached, shared (see `Trees.entries`). */
   entries(id: ObjectId): Promise<readonly TreeEntry[] | undefined> {
-    if (id === EMPTY_TREE_ID) return Promise.resolve(NO_ENTRIES);
+    if (id === this.emptyTreeId) return Promise.resolve(NO_ENTRIES);
     return this.read(id);
   }
 
@@ -173,7 +186,7 @@ class GitTreeStore implements Trees {
 
   /** The stored content (see `Trees.raw`), kept a while as the decoded entries are. */
   async raw(id: ObjectId): Promise<Uint8Array | undefined> {
-    if (id === EMPTY_TREE_ID) return NO_BYTES;
+    if (id === this.emptyTreeId) return NO_BYTES;
     const hit = this.rawCache.get(id);
     if (hit) {
       this.rawCache.delete(id);
@@ -202,7 +215,7 @@ class GitTreeStore implements Trees {
   }
 
   private decoded(id: ObjectId, bytes: Uint8Array, epoch: number): readonly TreeEntry[] {
-    const entries = decodeTreeBytes(bytes, CANONICAL);
+    const entries = decodeTreeBytes(bytes, this.decodeOptions);
     this.forget(id);
     this.remember(id, entries, epoch);
     return entries;
@@ -242,7 +255,7 @@ class GitTreeStore implements Trees {
    * Get specific entry from tree
    */
   async getEntry(treeId: ObjectId, name: string): Promise<TreeEntry | undefined> {
-    if (treeId === EMPTY_TREE_ID) return undefined;
+    if (treeId === this.emptyTreeId) return undefined;
     const entries = await this.read(treeId);
     const entry = entries?.find((e) => e.name === name);
     return entry ? { ...entry } : undefined;
@@ -254,7 +267,7 @@ class GitTreeStore implements Trees {
    * The empty tree is always considered to exist.
    */
   async has(id: ObjectId): Promise<boolean> {
-    if (id === EMPTY_TREE_ID) {
+    if (id === this.emptyTreeId) {
       return true;
     }
     return hasObjectOfType(this.objects, id, "tree");
@@ -280,7 +293,7 @@ class GitTreeStore implements Trees {
    * Get well-known empty tree ID
    */
   getEmptyTreeId(): ObjectId {
-    return EMPTY_TREE_ID;
+    return this.emptyTreeId;
   }
 }
 

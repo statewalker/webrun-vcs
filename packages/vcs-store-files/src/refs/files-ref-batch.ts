@@ -52,6 +52,11 @@ import {
 } from "@statewalker/vcs-core";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
+import {
+  nullObjectIdLike,
+  type ObjectFormat,
+  SHA1_OBJECT_FORMAT,
+} from "@statewalker/vcs-utils/hash";
 import { parseReflogLine } from "./reflog-reader.js";
 
 const enc = new TextEncoder();
@@ -59,11 +64,12 @@ const dec = new TextDecoder();
 const PACKED = "packed-refs";
 /** git's temporary for a packed-refs rewrite (packed-backend.c write_with_updates). */
 const PACKED_NEW = "packed-refs.new";
-const ZERO_ID = "0".repeat(40);
 /** Follow at most this many refs along a symbolic chain (git's read limit). */
 const MAX_SYMREF_READS = 5;
 
 export interface FilesRefBatchOptions {
+  /** The repository's object format: the ids a direct value may be (default SHA-1) */
+  objectFormat?: ObjectFormat;
   /**
    * Told about each batch's states (git's reference-transaction hook); read when each batch
    * starts, so it can be set after the store is made
@@ -239,10 +245,12 @@ function parsePacked(text: string | undefined): Map<string, PackedEntry> {
       }
       continue;
     }
-    if (line.indexOf(" ") !== 40) throw new Error(`malformed packed-refs line: ${line}`);
-    const name = line.slice(41);
+    // a SHA-1 id (40 hex digits) or a SHA-256 one (64)
+    const space = line.indexOf(" ");
+    if (space !== 40 && space !== 64) throw new Error(`malformed packed-refs line: ${line}`);
+    const name = line.slice(space + 1);
     last = {
-      id: line.slice(0, 40).toLowerCase(),
+      id: line.slice(0, space).toLowerCase(),
       known: fully || (tags && name.startsWith("refs/tags/")),
     };
     out.set(name, last);
@@ -442,6 +450,8 @@ export function createFilesRefOps(
   files: AtomicFiles,
   options: FilesRefBatchOptions = {},
 ): FilesRefOps {
+  // the null id of the repository's format, as the placeholder of a ref being written
+  const zeroId = (options.objectFormat ?? SHA1_OBJECT_FORMAT).nullId;
   const refLockTimeout = options.refLockTimeoutMs ?? 100;
   const packedLockTimeout = options.packedLockTimeoutMs ?? 1000;
   const logAll = options.logAllRefUpdates ?? true;
@@ -489,7 +499,7 @@ export function createFilesRefOps(
     const sym = /^ref:\s*(\S+)/.exec(text);
     if (sym) return { target: sym[1] as string };
     // git's parse_oid_hex reads either case; the id is kept lowercase, as git writes it
-    const m = /^([0-9a-fA-F]{40})(?:\s|$)/.exec(text);
+    const m = /^([0-9a-fA-F]{64}|[0-9a-fA-F]{40})(?:\s|$)/.exec(text);
     if (!m) throw new Error(`${name} is broken: ${JSON.stringify(text.slice(0, 50))}`);
     return { id: (m[1] as string).toLowerCase() };
   }
@@ -684,8 +694,10 @@ export function createFilesRefOps(
     const append = appendLog;
     for (const u of updates) {
       try {
-        const old = current(u) ?? ZERO_ID;
-        const next = u.newValue ?? ZERO_ID;
+        const known = current(u);
+        // the null id of the repository's format: as long as the other side's id
+        const old = known ?? nullObjectIdLike(u.newValue ?? undefined);
+        const next = u.newValue ?? nullObjectIdLike(known);
         const text = u.message !== undefined ? normalizeMessage(u.message) : message;
         const line = encodeGitPath(`${old} ${next} ${ident}${text ? `\t${text}` : ""}\n`);
         if (u.newValue === null) {
@@ -749,10 +761,11 @@ export function createFilesRefOps(
     const plan = await planRefBatch(
       updates.map((u) => ({ name: u.name, new: u.newValue, noDeref: true })),
       {
+        ...(options.objectFormat ? { objectFormat: options.objectFormat } : {}),
         read: async (n) =>
           (await readRef(n, packed, read)) ??
           (!mine.has(n) && (await files.exists(`${n}.lock`))
-            ? { name: n, objectId: ZERO_ID, storage: RefStorage.LOOSE, peeled: false }
+            ? { name: n, objectId: zeroId, storage: RefStorage.LOOSE, peeled: false }
             : undefined),
         hasChildren: async (n) => {
           for (const k of packed.keys()) if (k.startsWith(`${n}/`)) return true;
@@ -1331,7 +1344,12 @@ export function createFilesRefOps(
       }
       return batchAs([{ ...only, name: throughTo }], batchOptions, only.name, through);
     }
-    if (only && only.new !== null && isRootRefName(only.name) && isRefObjectId(only.new)) {
+    if (
+      only &&
+      only.new !== null &&
+      isRootRefName(only.name) &&
+      isRefObjectId(only.new, options.objectFormat)
+    ) {
       try {
         await writeRootRef(only.name, only.new, only.old);
         return { ok: true, rejected: [] };
@@ -1344,6 +1362,7 @@ export function createFilesRefOps(
     const packed = await readPacked();
     const read = onceEach();
     const plan = await planRefBatch(commands, {
+      ...(options.objectFormat ? { objectFormat: options.objectFormat } : {}),
       read: (name) => readRefOrOutside(name, packed, read),
       hasChildren: async (name) => {
         for (const k of packed.keys()) if (k.startsWith(`${name}/`)) return true;
@@ -1472,7 +1491,7 @@ export function createFilesRefOps(
     let ours = true;
     try {
       if (isUpdatableRefName(name)) {
-        const u = { name, requested: name, newValue: ZERO_ID } as Update;
+        const u = { name, requested: name, newValue: zeroId } as Update;
         const df = await conflicts([u], await readPacked(), new Set([name]));
         if (df.length) throw new RefUpdateRejectedError(df);
       }
@@ -1800,7 +1819,15 @@ export function createFilesRefOps(
       const lines = text
         .split("\n")
         .filter((l) => l !== "" && parseReflogLine(l) !== undefined)
-        .map((l) => ({ oldId: l.slice(0, 40), newId: l.slice(41, 81), rest: l.slice(81) }));
+        .map((l) => {
+          // ids of the repository's format: 40 hex digits, or 64 (SHA-256)
+          const n = l.indexOf(" ");
+          return {
+            oldId: l.slice(0, n),
+            newId: l.slice(n + 1, 2 * n + 1),
+            rest: l.slice(2 * n + 1),
+          };
+        });
       const kept = deleteReflogLine(lines, index, o.rewrite);
       if (!kept) throw new ReflogEntryNotFoundError(name, index);
       const out = kept.map((l) => `${l.oldId} ${l.newId}${l.rest}\n`).join("");

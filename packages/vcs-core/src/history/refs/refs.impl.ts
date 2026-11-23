@@ -2,6 +2,7 @@
  * In-memory Refs implementation (`MemoryRefs`).
  */
 
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { ObjectId } from "../../common/id/index.js";
 import {
   type BatchOptions,
@@ -45,6 +46,9 @@ type InternalRefEntry =
  * No persistence - data is lost when the instance is garbage collected.
  */
 export class MemoryRefs implements Refs {
+  /** @param objectFormat The ids a direct value may be (default SHA-1) */
+  constructor(private readonly objectFormat?: ObjectFormat) {}
+
   private refs = new Map<string, InternalRefEntry>();
   /** The shallow commits (git's shallow file), sorted. */
   private shallow: ObjectId[] = [];
@@ -145,7 +149,7 @@ export class MemoryRefs implements Refs {
    */
   set(name: string, objectId: ObjectId, log?: RefLogOptions): Promise<void> {
     // a direct value is an object id, never a name (see isRefObjectId)
-    if (!isRefObjectId(objectId)) {
+    if (!isRefObjectId(objectId, this.objectFormat)) {
       return Promise.reject(new Error(`cannot update ${name}: ${name}: invalid-object-id`));
     }
     // a name git's ref transaction refuses (check_refname_format, one level allowed)
@@ -203,6 +207,7 @@ export class MemoryRefs implements Refs {
   /** Plan and apply a batch; call only while holding the write lock. */
   private async applyBatch(commands: RefCommand[], options?: BatchOptions): Promise<BatchResult> {
     const plan = await planRefBatch(commands, {
+      ...(this.objectFormat ? { objectFormat: this.objectFormat } : {}),
       read: (name) => this.entryToRef(name),
       hasChildren: (name) => {
         const prefix = `${name}/`;
@@ -296,8 +301,8 @@ export class MemoryRefs implements Refs {
  *
  * @returns MemoryRefs instance
  */
-export function createMemoryRefs(): Refs {
-  return new MemoryRefs();
+export function createMemoryRefs(options: { objectFormat?: ObjectFormat } = {}): Refs {
+  return new MemoryRefs(options.objectFormat);
 }
 
 /** Whether two id lists hold the same ids (order and duplicates aside). */

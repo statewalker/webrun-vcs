@@ -20,7 +20,7 @@ import { hostEnvironmentOf } from "./git-ident.js";
 import { configBool, configValue } from "./merge-config.js";
 import type { RevisionResolver } from "./revision-resolver.js";
 
-const FULL_ID = /^[0-9a-fA-F]{40}$/;
+const FULL_ID = /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/;
 
 /**
  * Resolves attribute sources through `resolver` (a fresh one per lookup). A full object id

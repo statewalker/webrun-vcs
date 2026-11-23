@@ -6,7 +6,7 @@
  * what git prints gathered as its standard output and standard error.
  */
 
-import { EMPTY_TREE_ID, type ObjectId } from "@statewalker/vcs-core";
+import type { ObjectId } from "@statewalker/vcs-core";
 import type {
   ResolveUndoRecord,
   StagingEntry,
@@ -512,7 +512,7 @@ class AddInteractiveSession extends GitCommand<AddInteractiveResult> {
       const diff = new DiffCommand(this.workingCopy).setRenames(false).setCombineMerges(false);
       if (fromIndex) {
         diff
-          .setOldTree(head ?? EMPTY_TREE_ID)
+          .setOldTree(head ?? this.objectFormat.emptyTreeId)
           .setCached(true)
           .setIntentToAddVisible(true);
       } else diff.setIgnoreSubmodules("dirty");
@@ -892,7 +892,7 @@ class AddInteractiveSession extends GitCommand<AddInteractiveResult> {
       const { context, interHunkContext } = this.options;
       const diff = new DiffCommand(this.workingCopy)
         .setCached(true)
-        .setOldTree(head ?? EMPTY_TREE_ID)
+        .setOldTree(head ?? this.objectFormat.emptyTreeId)
         .setPathspec(this.chosen());
       if (this.modern) {
         diff.setOptions({

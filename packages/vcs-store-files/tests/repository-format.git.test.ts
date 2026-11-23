@@ -1,7 +1,7 @@
 /**
- * The repository format check against repositories native git made: a sha256 repository,
- * or one with an unknown version-1 extension, is refused when opened (a reftable one opens,
- * its writes refused) (git refuses
+ * The repository format check against repositories native git made: a sha256 repository
+ * opens (refused once it holds packs, which are not read in SHA-256 yet), one with an unknown
+ * version-1 extension is refused when opened (a reftable one opens, its writes refused) (git refuses
  * the last one too); preciousObjects repositories open, but gc and repack delete nothing
  * there; partial clones open and gc keeps their promisor objects; in a repository with alternates they delete only its own objects. Reftable needs git 2.45 or newer: that test is skipped on older gits.
  */
@@ -10,6 +10,7 @@ import { cpSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GcOrchestrator } from "@statewalker/vcs-core";
+import { UnsupportedObjectFormatError } from "@statewalker/vcs-utils/hash";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
 import {
@@ -18,7 +19,6 @@ import {
   FileGcStrategy,
   gc,
   repack,
-  UnsupportedRepositoryFormatError,
 } from "../src/index.js";
 
 const dirs: string[] = [];
@@ -113,10 +113,17 @@ const reftableSupported =
   }).status === 0;
 
 describe("repositories we cannot read are refused when opened", () => {
-  it("a sha256 repository", async () => {
+  it("a sha256 repository opens; one with packs is refused until packs read SHA-256 ids", async () => {
     const dir = nativeRepo(["--object-format=sha256"]);
-    await expect(open(dir)).rejects.toBeInstanceOf(UnsupportedRepositoryFormatError);
-    await expect(open(dir)).rejects.toThrow(/extensions\.objectFormat = sha256/);
+    const { history } = await open(dir);
+    expect(history.objectFormat?.name).toBe("sha256");
+    const head = git(dir, ["rev-parse", "HEAD"]).trim();
+    expect((await history.refs.resolve("HEAD"))?.objectId).toBe(head);
+    expect((await history.commits.load(head))?.tree).toBe(
+      git(dir, ["rev-parse", "HEAD^{tree}"]).trim(),
+    );
+    git(dir, ["repack", "-q", "-a", "-d"]);
+    await expect(open(dir)).rejects.toBeInstanceOf(UnsupportedObjectFormatError);
   });
 
   it.skipIf(!reftableSupported)("a reftable repository opens and takes writes", async () => {

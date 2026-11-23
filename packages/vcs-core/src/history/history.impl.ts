@@ -2,6 +2,7 @@
  * History implementation - concrete classes for the History interface
  */
 
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { BackendCapabilities } from "../backend/storage-backend.js";
 import type { ObjectId } from "../common/id/index.js";
 import { MissingObjectError } from "../pack/list-objects.js";
@@ -12,11 +13,11 @@ import type { Blobs } from "./blobs/blobs.js";
 import type { CommitGraphProvider } from "./commit-graph/commit-graph-provider.js";
 import type { Commits } from "./commits/commits.js";
 import type { CollectReachableOptions, History, HistoryWithOperations } from "./history.js";
-import { CorruptObjectError, type GitObjects } from "./objects/git-objects.js";
+import { CorruptObjectError, type GitObjects, objectFormatOf } from "./objects/git-objects.js";
 import { PromisorFetchError } from "./objects/object-promisor.js";
 import type { Refs } from "./refs/refs.js";
 import type { Tags } from "./tags/tags.js";
-import { decodeTreeEntries, EMPTY_TREE_ID } from "./trees/index.js";
+import { decodeTreeEntries } from "./trees/index.js";
 import type { Trees } from "./trees/trees.js";
 
 /** The object kernel (and packs) under a history's typed stores, when it has one. */
@@ -28,7 +29,7 @@ export interface HistoryKernel {
 
 /** A gitlink: a submodule's commit, which lives in another repository and is not walked. */
 const GITLINK_MODE = 0o160000;
-const OBJECT_ID = /^[0-9a-f]{40}$/;
+const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const textDecoder = new TextDecoder();
 
 /** A reachable object stored but unreadable or undecodable: the walk stops instead of skipping it. */
@@ -59,7 +60,7 @@ function commitLinks(oid: string, data: Uint8Array): string[] {
 
 /** The object a tag points to (its `object` line). */
 function tagTarget(oid: string, data: Uint8Array): string {
-  const first = textDecoder.decode(data.subarray(0, Math.min(data.length, 64))).split("\n")[0];
+  const first = textDecoder.decode(data.subarray(0, Math.min(data.length, 128))).split("\n")[0];
   const target = first?.startsWith("object ") ? first.slice(7).trim() : "";
   if (!OBJECT_ID.test(target)) throw corrupt(oid, "is a tag without a valid object");
   return target;
@@ -111,7 +112,8 @@ async function readChildIds(
       ? e
       : corrupt(oid, "is stored but cannot be read", e);
   }
-  if (!obj) return oid === EMPTY_TREE_ID ? [] : undefined;
+  const format = objectFormatOf(objects);
+  if (!obj) return oid === format.emptyTreeId ? [] : undefined;
   const it = obj.content[Symbol.asyncIterator]();
   const content: AsyncIterable<Uint8Array> = { [Symbol.asyncIterator]: () => it };
   try {
@@ -120,7 +122,7 @@ async function readChildIds(
         return commitLinks(oid, await readAll(content, obj.size));
       case "tree": {
         const ids: string[] = [];
-        for await (const entry of decodeTreeEntries(content)) {
+        for await (const entry of decodeTreeEntries(content, format.rawLength)) {
           if (entry.mode !== GITLINK_MODE) ids.push(entry.id);
         }
         return ids;
@@ -174,8 +176,10 @@ export class HistoryImpl implements History {
     this.objects = kernel.objects;
     this.packs = kernel.packs;
     this.commitGraph = kernel.commitGraph;
+    if (kernel.objects?.objectFormat) this.objectFormat = kernel.objects.objectFormat;
   }
 
+  readonly objectFormat?: ObjectFormat;
   readonly objects?: GitObjects;
   readonly packs?: PackSet;
   readonly commitGraph?: CommitGraphProvider;

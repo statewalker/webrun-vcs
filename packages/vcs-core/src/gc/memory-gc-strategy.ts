@@ -8,7 +8,7 @@
 import type { RawStorage } from "../storage/raw/raw-storage.js";
 import type { CompactResult, DeltaCandidatePair, GcStrategy, StorageStats } from "./gc-strategy.js";
 
-const OBJECT_ID = /^[0-9a-f]{40}$/;
+const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
  * GcStrategy backed by in-memory RawStorage.

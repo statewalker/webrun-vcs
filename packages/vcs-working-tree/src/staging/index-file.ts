@@ -24,6 +24,7 @@ import { readFile, type Trees } from "@statewalker/vcs-core";
 import { bytesToHex, sha1 } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
+import { assertSha1ObjectFormat, type ObjectFormat } from "@statewalker/vcs-utils/hash";
 import {
   encodeUntrackedCache,
   invalidateUntrackedPath,
@@ -401,6 +402,12 @@ export async function writeIndexFile(
  *
  * @internal
  */
+/**
+ * The repository's object format as an index file is told it: the format, or a lookup run on
+ * the first read, write or lock (the repository's config read lazily).
+ */
+export type IndexObjectFormat = ObjectFormat | (() => Promise<ObjectFormat | undefined>);
+
 export class IndexFile {
   /**
    * The version of the index read (git's `istate->version`), or of the last write;
@@ -463,9 +470,29 @@ export class IndexFile {
        * (`verify_index_checksum`); other reads take the trailer as it is
        */
       verifyChecksum?: boolean;
+      /**
+       * The repository's object format, or how to learn it: an index of another format than
+       * SHA-1 (32-byte ids) is refused on read, write and lock with
+       * `UnsupportedObjectFormatError` until the index reads such ids
+       */
+      objectFormat?: IndexObjectFormat;
     } = {},
   ) {
     this.host = options.host;
+  }
+
+  /** The object format check, run once (see `options.objectFormat`) */
+  private formatChecked: Promise<void> | undefined;
+
+  /** Refuses an index of a repository whose objects are not SHA-1 (see `options.objectFormat`). */
+  private checkObjectFormat(): Promise<void> | undefined {
+    const given = this.options.objectFormat;
+    if (given === undefined) return undefined;
+    this.formatChecked ??= (async () => {
+      const format = typeof given === "function" ? await given() : given;
+      assertSha1ObjectFormat(format, "the index file");
+    })();
+    return this.formatChecked;
   }
 
   /** The checksum of the index this instance last read or wrote (`null`: none; `undefined`: never read). */
@@ -894,6 +921,7 @@ export class IndexFile {
    *   (a split or sparse index), whose entries cannot be read without it
    */
   async read(): Promise<{ entries: StagingEntry[]; lastModified: number } | undefined> {
+    await this.checkObjectFormat();
     // a cache-tree set for a write of the entries before goes with them
     this.pendingCacheTree = undefined;
     this.pendingEntries = undefined;
@@ -1121,6 +1149,7 @@ export class IndexFile {
    */
   async write(entries: readonly StagingEntry[]): Promise<void> {
     if (this.refused) throw this.refused;
+    await this.checkObjectFormat();
     const prepared = this.prepareWrite(entries);
     const plan = await this.plan(entries, prepared.extensions);
     // the lock is created holding the new index: one exclusive create, then one rename
@@ -1170,6 +1199,7 @@ export class IndexFile {
    */
   async lock(): Promise<IndexFileLock> {
     if (this.refused) throw this.refused;
+    await this.checkObjectFormat();
     const lockPath = `${this.path}.lock`;
     const atomic = atomicFilesOver(this.files, "");
     const deadline = Date.now() + (this.options.lockTimeoutMs ?? 0);

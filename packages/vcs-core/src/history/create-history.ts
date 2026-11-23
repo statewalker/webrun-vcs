@@ -11,6 +11,7 @@
  * - createMemoryHistory(): Basic in-memory (without operations)
  */
 
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import {
   type GitFilesStorageBackendConfig,
   PackSetDeltaApi,
@@ -144,7 +145,9 @@ export function createHistoryFromComponents(config: HistoryComponentsConfig): Hi
   if (typeof given.batch === "function") {
     refs = config.refs as Refs;
   } else if (given.type === "memory") {
-    refs = createMemoryRefs();
+    refs = createMemoryRefs(
+      config.objects.objectFormat ? { objectFormat: config.objects.objectFormat } : {},
+    );
   } else {
     throw new Error(
       `createHistoryFromComponents: refs must be a Refs implementation or { type: "memory" }, got ${JSON.stringify(given.type ?? given)}`,
@@ -182,9 +185,12 @@ export function createHistoryFromComponents(config: HistoryComponentsConfig): Hi
  * await history.close();
  * ```
  */
-export function createMemoryHistory(): History {
+export function createMemoryHistory(options: { objectFormat?: ObjectFormat } = {}): History {
   const objectStorage = new MemoryRawStorage();
-  const objects = createGitObjects(rawStorageStaging(objectStorage));
+  const objects = createGitObjects(
+    rawStorageStaging(objectStorage),
+    options.objectFormat ? { objectFormat: options.objectFormat } : {},
+  );
   return createHistoryFromComponents({
     objects,
     refs: { type: "memory" },

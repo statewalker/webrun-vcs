@@ -135,6 +135,7 @@ export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
   }
 
   return {
+    ...(loose.objectFormat ? { objectFormat: loose.objectFormat } : {}),
     put: (type, size, content) => loose.put(type, size, content),
 
     putUnsized: (type, content) => loose.putUnsized(type, content),

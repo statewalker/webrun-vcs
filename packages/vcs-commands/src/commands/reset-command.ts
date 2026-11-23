@@ -1,11 +1,4 @@
-import {
-  type Blobs,
-  EMPTY_BLOB_ID,
-  EMPTY_TREE_ID,
-  FileMode,
-  type ObjectId,
-  type Ref,
-} from "@statewalker/vcs-core";
+import { type Blobs, FileMode, type ObjectId, type Ref } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   applyStatUpdate,
@@ -184,8 +177,8 @@ export class ResetCommand extends GitCommand<Ref> {
     }
     const rev = this.ref === undefined || this.ref === "@" ? "HEAD" : this.ref;
     const head = await this.refsStore.resolve("HEAD");
-    const diffRevision = rev === "HEAD" && !head?.objectId ? EMPTY_TREE_ID : rev;
-    if (diffRevision !== EMPTY_TREE_ID) await this.resolveRef(rev);
+    const diffRevision = rev === "HEAD" && !head?.objectId ? this.objectFormat.emptyTreeId : rev;
+    if (diffRevision !== this.objectFormat.emptyTreeId) await this.resolveRef(rev);
     this.patchResult = await runPatchSelection(this.workingCopy, {
       hookSource: this,
       ...this.patchOptions,
@@ -729,7 +722,7 @@ export class ResetCommand extends GitCommand<Ref> {
           path,
           // make_cache_entry of a path the tree lacks: create_ce_mode(0), a regular file
           mode: t ? t.mode : FileMode.REGULAR_FILE,
-          objectId: t ? t.objectId : EMPTY_BLOB_ID,
+          objectId: t ? t.objectId : this.objectFormat.emptyBlobId,
           stage: 0,
           size: 0,
           mtime: 0,

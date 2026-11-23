@@ -217,7 +217,7 @@ export class AddCommand implements Add {
           // or all-zero id, which a worktree hash could be compared against)
           new UpdateStagingEntry(
             file.path,
-            EMPTY_BLOB_ID,
+            this.blobs.objectFormat?.emptyBlobId ?? EMPTY_BLOB_ID,
             mode,
             { size: 0, mtime: Date.now() },
             { intentToAdd: true },

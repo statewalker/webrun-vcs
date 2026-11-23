@@ -36,6 +36,7 @@ export function overlayObjects(top: GitObjects, base: GitObjects): GitObjects {
     return id;
   };
   return {
+    ...(top.objectFormat ? { objectFormat: top.objectFormat } : {}),
     put: async (type, size, content) => dropIfPublished(await top.put(type, size, content)),
     putUnsized: async (type, content) => dropIfPublished(await top.putUnsized(type, content)),
     async putRaw(id, raw) {

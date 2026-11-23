@@ -1,5 +1,5 @@
 import type { ObjectId } from "@statewalker/vcs-core";
-import { mergeLines } from "@statewalker/vcs-utils";
+import { mergeLines, type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { collectChunks } from "@statewalker/vcs-working-tree";
 import type { CommandRefs } from "../git-command.js";
@@ -19,7 +19,6 @@ import {
   combineNotesCatSortUniq,
   combineNotesConcatenate,
   combineNotesOverwrite,
-  NOTES_NULL_ID,
   type NotesTree,
   readNoteBytes,
 } from "./notes-tree.js";
@@ -38,7 +37,6 @@ const STRATEGIES: readonly NotesMergeStrategy[] = [
 const WORKTREE = "NOTES_MERGE_WORKTREE";
 /** notes-merge.c's `uninitialized`: no local change recorded */
 const UNINITIALIZED = "f".repeat(40);
-const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /** `git notes merge` (with `--commit` / `--abort`). */
 export interface NotesMergeResult extends NotesResult {
@@ -314,13 +312,14 @@ export class NotesMergeCommand extends NotesSubcommand<NotesMergeResult> {
     const ctx = this.ctx;
     const msg = partial.message;
     for (const name of names) {
-      if (!/^[0-9a-fA-F]{40}/.test(name)) {
+      const hexLength = this.objectFormat.hexLength;
+      if (!new RegExp(`^[0-9a-fA-F]{${hexLength}}`).test(name)) {
         if (this.verbosity >= 3) {
           output.push(`Skipping non-SHA1 entry '${this.gitPath(WORKTREE)}/${name}'\n`);
         }
         continue;
       }
-      const obj = name.slice(0, 40).toLowerCase();
+      const obj = name.slice(0, hexLength).toLowerCase();
       const blob = await this.storeResolvedNote(name, errors);
       await tree.add(obj, blob);
       if (this.verbosity >= 4) output.push(`Added resolved note for object ${obj}: ${blob}\n`);
@@ -501,6 +500,15 @@ class NotesMerge {
   private hasWorktree = false;
   private commitMsg: string;
 
+  /** The repository's object format: its null id, empty tree and note path lengths */
+  private get format(): ObjectFormat {
+    return this.ctx.objectFormat ?? SHA1_OBJECT_FORMAT;
+  }
+
+  private get nullId(): ObjectId {
+    return this.format.nullId;
+  }
+
   constructor(
     private readonly ctx: NotesContext,
     private readonly checkout: {
@@ -554,8 +562,8 @@ class NotesMerge {
     let baseId: ObjectId;
     let baseTree: ObjectId;
     if (bases.length === 0) {
-      baseId = NOTES_NULL_ID;
-      baseTree = EMPTY_TREE;
+      baseId = this.nullId;
+      baseTree = this.format.emptyTreeId;
       this.say(4, "No merge base found; doing history-less merge\n");
     } else {
       baseId = bases[0] as ObjectId;
@@ -588,7 +596,8 @@ class NotesMerge {
         if ((e.mode & 0o170000) === 0o040000) await walk(e.id, `${prefix}${e.name}/`);
         else {
           const hex = `${prefix}${e.name}`.replaceAll("/", "");
-          if (/^[0-9a-fA-F]{40}$/.test(hex)) out.set(hex.toLowerCase(), e.id);
+          if (hex.length === this.format.hexLength && /^[0-9a-fA-F]+$/.test(hex))
+            out.set(hex.toLowerCase(), e.id);
         }
       }
     };
@@ -608,10 +617,10 @@ class NotesMerge {
     const r = await this.flatNotes(remote);
     const changes: MergePair[] = [];
     for (const obj of [...new Set([...b.keys(), ...r.keys()])].sort()) {
-      const bv = b.get(obj) ?? NOTES_NULL_ID;
-      const rv = r.get(obj) ?? NOTES_NULL_ID;
+      const bv = b.get(obj) ?? this.nullId;
+      const rv = r.get(obj) ?? this.nullId;
       if (bv === rv) continue;
-      const lv = l.get(obj) ?? NOTES_NULL_ID;
+      const lv = l.get(obj) ?? this.nullId;
       changes.push({ obj, base: bv, local: lv === bv ? UNINITIALIZED : lv, remote: rv });
     }
     let conflicts = 0;
@@ -690,20 +699,20 @@ class NotesMerge {
     this.commitMsg += `\t${p.obj}\n`;
     this.say(2, `Auto-merging notes for ${p.obj}\n`);
     await this.checkWorktree();
-    if (p.local === NOTES_NULL_ID) {
+    if (p.local === this.nullId) {
       this.say(
         1,
         `CONFLICT (delete/modify): Notes for object ${p.obj} deleted in ${lref} and modified in ${rref}. Version from ${rref} left in tree.\n`,
       );
       await this.writeToWorktree(p.obj, await this.readBlob(p.remote));
-    } else if (p.remote === NOTES_NULL_ID) {
+    } else if (p.remote === this.nullId) {
       this.say(
         1,
         `CONFLICT (delete/modify): Notes for object ${p.obj} deleted in ${rref} and modified in ${lref}. Version from ${lref} left in tree.\n`,
       );
       await this.writeToWorktree(p.obj, await this.readBlob(p.local));
     } else {
-      const reason = p.base === NOTES_NULL_ID ? "add/add" : "content";
+      const reason = p.base === this.nullId ? "add/add" : "content";
       this.say(1, `CONFLICT (${reason}): Merge conflict in notes for object ${p.obj}\n`);
       await this.llMerge(p);
     }

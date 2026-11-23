@@ -46,7 +46,7 @@ import {
 } from "@statewalker/vcs-core";
 import { applyGitDelta } from "@statewalker/vcs-utils/diff";
 import { CRC32 } from "@statewalker/vcs-utils/hash/crc32";
-import { createSha1, Sha1, sha1Of } from "@statewalker/vcs-utils/hash/hasher";
+import { createSha1, type Hasher, Sha1, sha1Of } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { allocBytes } from "@statewalker/vcs-utils/streams";
 
@@ -589,13 +589,16 @@ function unpackError(entry: PackScanEntry, packPath: string, e: unknown): Unpack
 const enc = new TextEncoder();
 
 /** The git object id of `content` as `type`: SHA-1 over its header and content, as hex. */
-export function objectIdOf(type: string, content: Uint8Array): string {
+export function objectIdOf(type: string, content: Uint8Array, newHasher?: () => Hasher): string {
   let n = 0;
   for (let i = 0; i < type.length; i++) header[n++] = type.charCodeAt(i);
   header[n++] = 0x20;
   const size = String(content.length);
   for (let i = 0; i < size.length; i++) header[n++] = size.charCodeAt(i);
   header[n++] = 0;
+  if (newHasher) {
+    return bytesToHex(newHasher().update(header.subarray(0, n)).update(content).digest());
+  }
   return bytesToHex(sha1Of(header.subarray(0, n), content));
 }
 

@@ -1,11 +1,10 @@
 /**
  * A `ReflogReader` over reflog lines kept in memory (or loaded from a store).
  */
+import { nullObjectIdLike } from "@statewalker/vcs-utils/hash";
 import { parsePersonIdent } from "../format/person-ident.js";
 import type { ReflogLine } from "./ref-batch.js";
 import type { ReflogEntry, ReflogReader } from "./reflog-types.js";
-
-const ZERO_ID = "0".repeat(40);
 
 /** Options of `Refs.deleteReflogEntry`, as the flags of `git reflog delete`. */
 export interface ReflogDeleteOptions {
@@ -52,7 +51,7 @@ export function deleteReflogLine<L extends { oldId: string; newId: string }>(
   if (!Number.isInteger(index) || index < 0 || at < 0) return undefined;
   const kept = lines.filter((_, i) => i !== at);
   if (!rewrite) return kept;
-  let previous = ZERO_ID;
+  let previous = nullObjectIdLike(kept[0]?.newId);
   return kept.map((line) => {
     const out = { ...line, oldId: previous };
     previous = line.newId;
