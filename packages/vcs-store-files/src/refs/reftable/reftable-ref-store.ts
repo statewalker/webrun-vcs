@@ -200,7 +200,7 @@ export class ReftableRefStore implements Refs {
     if (isPseudoRef(name)) return readLooseRef(this.files, this.gitDir, name);
     const where = this.stackFor(name);
     if (!where) return undefined;
-    const record = (await where.stack.read()).refs.get(where.name);
+    const record = (await where.stack.read()).getRef(where.name);
     return record ? toRef(name, record) : undefined;
   }
 
@@ -222,65 +222,80 @@ export class ReftableRefStore implements Refs {
       const head = await this.get("HEAD");
       if (head) yield head;
     }
+    // only refs under refs/ are listed: seek the longer of the prefix and "refs/"
+    const seek = prefix.startsWith("refs/") ? prefix : "refs/".startsWith(prefix) ? "refs/" : "";
+    if (seek === "") return;
     const main = await this.main.read();
     const own = this.own ? await this.own.read() : undefined;
-    const out: (Ref | SymbolicRef)[] = [];
-    const take = (record: ReftableRefRecord) => {
-      if (!record.name.startsWith("refs/") || !record.name.startsWith(prefix)) return;
-      const ref = toRef(record.name, record);
-      if (ref) out.push(ref);
-    };
     if (!own) {
-      for (const record of main.sortedRefs) take(record);
-    } else {
-      // git's ref_iterator_select: the worktree's refs, and the repository's shared ones
-      const mine = own.sortedRefs;
-      const shared = main.sortedRefs.filter(
-        (r) => parseWorktreeRef(r.name).kind === "shared" && !own.refs.has(r.name),
-      );
-      let i = 0;
-      let j = 0;
-      while (i < mine.length || j < shared.length) {
-        const a = mine[i];
-        const b = shared[j];
-        if (a && (!b || compareKeys(a.key, b.key) < 0)) {
-          take(a);
-          i++;
-        } else if (b) {
-          take(b);
-          j++;
-        }
+      for (const record of main.refs(seek)) {
+        const ref = toRef(record.name, record);
+        if (ref) yield ref;
       }
+      return;
     }
-    for (const ref of out) yield ref;
+    // git's ref_iterator_select: the worktree's refs, and the repository's shared ones (the
+    // worktree's own winning on equal names)
+    const mine = own.refs(seek);
+    const shared = (function* () {
+      for (const r of main.refs(seek)) if (parseWorktreeRef(r.name).kind === "shared") yield r;
+    })();
+    let a = mine.next();
+    let b = shared.next();
+    while (!a.done || !b.done) {
+      let record: ReftableRefRecord;
+      if (!a.done && (b.done || compareKeys(a.value.key, b.value.key) <= 0)) {
+        record = a.value;
+        if (!b.done && compareKeys(a.value.key, b.value.key) === 0) b = shared.next();
+        a = mine.next();
+      } else {
+        record = (b as IteratorYieldResult<ReftableRefRecord>).value;
+        b = shared.next();
+      }
+      const ref = toRef(record.name, record);
+      if (ref) yield ref;
+    }
   }
 
   async getReflog(name: string): Promise<ReflogReader | undefined> {
     const where = this.stackFor(name);
     if (!where) return undefined;
+    // a snapshot of the stack's tables; each read below walks the reflog lazily again,
+    // decoding only the entries it returns (and those before them)
     const view = await where.stack.read();
-    if (!view.hasLogs(where.name)) return undefined;
-    const entries: ReflogEntry[] = [];
-    for (const log of view.logsOf(where.name)) {
-      const u = log.update;
-      // both ids zero: git's reflog existence marker, never shown
-      if (!u || (u.oldId === ZERO_ID && u.newId === ZERO_ID)) continue;
-      entries.push({
-        oldId: u.oldId,
-        newId: u.newId,
-        who: {
-          name: u.name,
-          email: u.email,
-          timestamp: u.time,
-          tzOffset: minutesToTz(u.tzOffset),
-        },
-        comment: u.message.endsWith("\n") ? u.message.slice(0, -1) : u.message,
-      });
+    const refName = where.name;
+    if (!view.hasLogs(refName)) return undefined;
+    function* entries(): Generator<ReflogEntry> {
+      for (const log of view.logs(refName)) {
+        const u = log.update;
+        // both ids zero: git's reflog existence marker, never shown
+        if (!u || (u.oldId === ZERO_ID && u.newId === ZERO_ID)) continue;
+        yield {
+          oldId: u.oldId,
+          newId: u.newId,
+          who: {
+            name: u.name,
+            email: u.email,
+            timestamp: u.time,
+            tzOffset: minutesToTz(u.tzOffset),
+          },
+          comment: u.message.endsWith("\n") ? u.message.slice(0, -1) : u.message,
+        };
+      }
     }
+    const take = (max: number): ReflogEntry[] => {
+      const out: ReflogEntry[] = [];
+      if (max <= 0) return out;
+      for (const entry of entries()) {
+        out.push(entry);
+        if (out.length >= max) break;
+      }
+      return out;
+    };
     return {
-      getLastEntry: async () => entries[0],
-      getReverseEntries: async (max = Number.MAX_SAFE_INTEGER) => entries.slice(0, max),
-      getReverseEntry: async (index) => entries[index],
+      getLastEntry: async () => take(1)[0],
+      getReverseEntries: async (max = Number.MAX_SAFE_INTEGER) => take(max),
+      getReverseEntry: async (index) => (index < 0 ? undefined : take(index + 1)[index]),
     };
   }
 

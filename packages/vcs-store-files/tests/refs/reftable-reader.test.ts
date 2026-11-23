@@ -12,12 +12,32 @@ import {
   createReftableRefStore,
   createReftableStackReader,
   mergeReftables,
-  parseReftable,
+  openReftable,
+  REFTABLE_READ_CEILING,
   ReftableFormatError,
+  ReftableReadBudget,
   ReftableUnsupportedError,
   ReftableWriteUnsupportedError,
 } from "../../src/refs/reftable/index.js";
 import { buildReftable, type FixtureTable, fixFooterCrc, varint } from "./reftable-fixture.js";
+
+/**
+ * The whole table as the eager reader gave it: opened, verified block by block (`verify`),
+ * and every ref and log record listed.
+ */
+function parseReftable(bytes: Uint8Array, name?: string) {
+  const table = openReftable(bytes, name);
+  const { blocks } = table.verify();
+  const { version, minUpdateIndex, maxUpdateIndex } = table;
+  return {
+    version,
+    minUpdateIndex,
+    maxUpdateIndex,
+    blocks,
+    refs: [...table.refs()],
+    logs: [...table.logs()],
+  };
+}
 
 const A = "1111111111111111111111111111111111111111";
 const B = "2222222222222222222222222222222222222222";
@@ -266,8 +286,8 @@ describe("parseReftable refuses crafted and corrupt tables", () => {
 });
 
 describe("the merged view of a stack", () => {
-  const base = parseReftable(buildReftable(sample).bytes, "base.ref");
-  const top = parseReftable(
+  const base = openReftable(buildReftable(sample).bytes, "base.ref");
+  const top = openReftable(
     buildReftable({
       minUpdateIndex: 4,
       maxUpdateIndex: 5,
@@ -286,17 +306,17 @@ describe("the merged view of a stack", () => {
 
   it("takes the newest table's record and hides deleted refs", () => {
     const view = mergeReftables([base, top]);
-    expect(view.sortedRefs.map((r) => [r.name, r.value])).toEqual([
+    expect([...view.refs()].map((r) => [r.name, r.value])).toEqual([
       ["HEAD", { type: "symref", target: "refs/heads/main" }],
       ["refs/heads/main", { type: "id", id: C }],
       ["refs/tags/v1", { type: "peeled", id: C, peeled: A }],
     ]);
-    expect(view.refs.has("refs/heads/main2")).toBe(false);
+    expect(view.getRef("refs/heads/main2")).toBeUndefined();
   });
 
   it("orders logs newest first and lets deletions hide entries", () => {
     const view = mergeReftables([base, top]);
-    expect(view.logsOf("HEAD").map((l) => [l.updateIndex, l.update?.message])).toEqual([
+    expect([...view.logs("HEAD")].map((l) => [l.updateIndex, l.update?.message])).toEqual([
       [4, "commit: three\n"],
       [2, "commit: two\n"],
     ]);
@@ -476,10 +496,14 @@ describe("a crafted table cannot make the parser allocate without bound", () => 
     return bytes;
   }
 
-  it("refuses keys that expand far past the table's own bytes", () => {
+  it("refuses a listing whose names expand past the per-read ceiling", () => {
     const bytes = longPrefixTable(2000, 30000);
     const started = Date.now();
-    expect(() => parseReftable(bytes, "crafted.ref")).toThrow(/keys expand past 256x the file/);
+    const table = openReftable(bytes, "crafted.ref");
+    // a lookup scans keys in one scratch buffer: no name is built but the one it returns
+    expect(table.getRef("b")).toBeUndefined();
+    expect(table.getRef("a".repeat(2010))?.name.length).toBe(2010);
+    expect(() => [...table.refs()]).toThrow(/one read decodes more than 268435456 bytes/);
     expect(Date.now() - started).toBeLessThan(2000);
   });
 
@@ -534,13 +558,146 @@ describe("a crafted log block cannot inflate into gigabytes of records", () => {
     return bytes;
   }
 
-  it("refuses more records than the file has bytes", () => {
-    // inflates within the budget (64x the file plus 16 MiB), but each record is a fraction of
-    // a file byte: refused after about the file's size in records, not millions of them
+  it("reads a block of a million tombstones one record at a time, keeping none", () => {
+    // each record is a fraction of a file byte, as git's `reflog expire` tombstones are: the
+    // reader inflates the one block and streams its records; a reflog read drops them all
     const bytes = logBomb(4 << 20);
     expect(bytes.length).toBeLessThan(64 << 10);
     const started = Date.now();
-    expect(() => parseReftable(bytes, "bomb.ref")).toThrow(/more records than the file has bytes/);
-    expect(Date.now() - started).toBeLessThan(2000);
+    const table = openReftable(bytes, "bomb.ref");
+    let count = 0;
+    for (const log of table.logs("refs/heads/b")) if (log.update === undefined) count++;
+    expect(count).toBeGreaterThan(1_000_000);
+    expect([...mergeReftables([table]).logs("refs/heads/b")]).toEqual([]);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+});
+
+describe("the lazy reader holds one block, whatever the table stands for", () => {
+  /**
+   * One ref block of records each repeating the whole previous key plus one `byte` (0x80:
+   * not UTF-8), about five file bytes a record: the eager parser kept some 830 times the
+   * file in memory (3 MB took 2.4 GB; 6.5 MB aborted V8 in DecodeUTF8), pass 3 of the merge
+   * gate of statewalker/webrun-vcs#225. Lookups scan it in one scratch buffer; listings
+   * meet the per-read ceiling.
+   */
+  function refBomb(size: number, byte: number): Uint8Array {
+    const head = [0x52, 0x45, 0x46, 0x54, 1, 0, 0, 0, ...[0, 0, 0, 0, 0, 0, 0, 1]];
+    head.push(...[0, 0, 0, 0, 0, 0, 0, 1]);
+    const records = new Uint8Array(size);
+    let pos = 0;
+    records.set([0, 8, 0x72, 0], pos); // "r", a deletion record
+    pos += 4;
+    for (let length = 1; pos + 8 < size; length++) {
+      const v = varint(length);
+      records.set([...v, 8, byte, 0], pos);
+      pos += v.length + 3;
+    }
+    const blockLen = head.length + 4 + pos + 5;
+    const bytes = new Uint8Array(blockLen + 68);
+    bytes.set(head, 0);
+    bytes.set([0x72, (blockLen >> 16) & 255, (blockLen >> 8) & 255, blockLen & 255], 24);
+    bytes.set(records.subarray(0, pos), 28);
+    bytes.set([0, 0, 28, 0, 1], 28 + pos);
+    bytes.set(head, blockLen);
+    fixFooterCrc(bytes, blockLen);
+    return bytes;
+  }
+
+  for (const byte of [0x80, 0x61]) {
+    it(`looks up and lists a 3 MB long-prefix ref block (suffix 0x${byte.toString(16)})`, async () => {
+      const bytes = refBomb(3 << 20, byte);
+      const started = Date.now();
+      const table = openReftable(bytes, "refbomb.ref");
+      expect(table.getRef("refs/heads/main")).toBeUndefined();
+      expect(table.getRef("r")?.value).toEqual({ type: "deletion" });
+      expect([...table.refs("refs/")]).toEqual([]);
+      expect(() => [...table.refs()]).toThrow(ReftableFormatError);
+      expect(() => [...table.refs()]).toThrow(/per-read ceiling/);
+      // the ref store lists refs under refs/ only: nothing, at once
+      const files = createInMemoryFilesApi();
+      await files.write(".git/reftable/0x01-0x01-bb.ref", [bytes]);
+      await files.write(".git/reftable/tables.list", [
+        new TextEncoder().encode("0x01-0x01-bb.ref\n"),
+      ]);
+      const refs = createReftableRefStore({ files, gitDir: ".git" });
+      const listed: string[] = [];
+      for await (const r of refs.list()) listed.push(r.name);
+      expect(listed).toEqual([]);
+      expect(await refs.get("refs/heads/main")).toBeUndefined();
+      expect(Date.now() - started).toBeLessThan(10000);
+    });
+  }
+
+  /** `blocks` deflated log blocks of `blockLen` bytes, each of tombstones of one ref. */
+  function logBombs(blocks: number, blockLen: number): Uint8Array {
+    const parts: Buffer[] = [];
+    const header = Buffer.alloc(24);
+    header.write("REFT", 0);
+    header[4] = 1;
+    header.writeBigUInt64BE(1n, 8);
+    header.writeBigUInt64BE(1n, 16);
+    parts.push(header);
+    for (let b = 0; b < blocks; b++) {
+      const skip = b === 0 ? 28 : 4;
+      const ref = Buffer.from(`refs/heads/b${b}`);
+      const body = Buffer.alloc(blockLen);
+      let pos = 0;
+      let last: Buffer | undefined;
+      for (let c = 0; ; c++) {
+        const k = Buffer.alloc(ref.length + 9);
+        ref.copy(k);
+        k.writeBigUInt64BE(0xffffffffff000000n + BigInt(c), ref.length + 1);
+        let p = 0;
+        if (last) while (p < k.length && k[p] === last[p]) p++;
+        const rec = [...varint(p), ...varint((k.length - p) * 8), ...k.subarray(p)];
+        if (skip + pos + rec.length + 5 > blockLen) break;
+        for (const x of rec) body[pos++] = x;
+        last = k;
+      }
+      const len = skip + pos + 5;
+      const inflated = Buffer.alloc(len - skip);
+      body.copy(inflated, 0, 0, pos);
+      inflated.writeUIntBE(skip, pos, 3);
+      inflated.writeUInt16BE(1, pos + 3);
+      parts.push(Buffer.from([0x67, (len >> 16) & 255, (len >> 8) & 255, len & 255]));
+      parts.push(deflateSync(inflated, { level: 9 }));
+    }
+    const footer = Buffer.alloc(68);
+    header.copy(footer, 0);
+    parts.push(footer);
+    const bytes = new Uint8Array(Buffer.concat(parts));
+    fixFooterCrc(bytes, bytes.length - 68);
+    return bytes;
+  }
+
+  it("reads one ref's log across deflated bombs, and refuses a walk of all past a ceiling", () => {
+    const bytes = logBombs(3, 1 << 20);
+    expect(bytes.length).toBeLessThan(64 << 10);
+    const table = openReftable(bytes, "logbomb.ref");
+    // the seek inflates the blocks one at a time to find the ref's first key
+    let count = 0;
+    for (const log of table.logs("refs/heads/b2")) {
+      expect(log.update).toBeUndefined();
+      expect(log.refName).toBe("refs/heads/b2");
+      count++;
+    }
+    expect(count).toBeGreaterThan(250_000);
+    expect([...table.logs("refs/heads/none")]).toEqual([]);
+    // a walk of every record charges each one: refused past a (here small) ceiling
+    expect(() => {
+      for (const _ of table.logs(undefined, new ReftableReadBudget(16 << 20)));
+    }).toThrow(/one read decodes more than 16777216 bytes/);
+    expect(REFTABLE_READ_CEILING).toBe(256 << 20);
+  });
+
+  it("follows a log block bound: a block may not inflate past its header's length", () => {
+    const bytes = logBombs(1, 1 << 16);
+    const copy = bytes.slice();
+    // block_len one byte short of what the stream inflates to
+    copy[26] = (copy[26] as number) - 1;
+    expect(() => [...openReftable(copy, "t.ref").logs()]).toThrow(
+      /log block at 0 (inflates to|does not inflate)/,
+    );
   });
 });

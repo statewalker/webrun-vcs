@@ -1,31 +1,47 @@
 /**
- * One reftable file read whole (git's `reftable/table.c`, `block.c`, `record.c`; the format is
- * `Documentation/technical/reftable.adoc`).
+ * One reftable file, read lazily as git's `reftable/reader.c` reads it (`block.c`,
+ * `record.c`; the format is `Documentation/technical/reftable.adoc`).
  *
  * @example
  * ```typescript
- * const table = parseReftable(bytes, "0x000000000001-0x000000000004-70da100a.ref");
- * for (const ref of table.refs) console.log(ref.name, ref.updateIndex, ref.value);
+ * const table = openReftable(bytes, "0x000000000001-0x000000000004-70da100a.ref");
+ * table.getRef("refs/heads/main"); // a seek: the index (or the blocks' first keys), restarts
+ * for (const ref of table.refs("refs/tags/")) console.log(ref.name, ref.value);
+ * for (const log of table.logs("HEAD")) console.log(log.updateIndex, log.update?.message);
  * ```
  *
  * A table is a header, the ref blocks, the ref index, the obj blocks and their index, the log
  * blocks and their index, and a footer that repeats the header, gives where each section
- * starts and ends with a CRC-32. Every section is walked block by block and every record is
- * decoded, so a crafted table is refused (`ReftableFormatError`) rather than read past its
- * bounds:
+ * starts and ends with a CRC-32. Opening a table checks only the header, the footer (magic,
+ * header copy, CRC-32) and the section positions: nothing is decoded until it is asked for,
+ * and memory beyond the file's bytes is one block (a log block inflated) per iterator.
  *
- *  - the footer's magic, header copy and CRC-32, and section positions in file order before it;
- *  - each block's type, length (within its section; at least its header and restart count)
- *    and restart table (offsets ascending, inside the record area, each one the start of a
- *    record whose key is not prefix compressed);
- *  - each record's prefix length (at most the previous key's), suffix, varints (no overflow)
- *    and value, inside the record area; keys strictly ascending through a section;
- *  - log blocks inflated (vcs-utils' `inflateWhole`) to exactly the length their header gives;
- *  - index records naming a block start of the section they index.
+ *  - `getRef(name)` seeks as git's reader does: through the ref index when the table has one
+ *    (each index record names the block holding keys up to its own), else a walk over the ref
+ *    blocks' first keys; then a binary search over the block's restart points and a scan of
+ *    one restart interval. Keys are rebuilt in one scratch buffer; only the record returned
+ *    gets a name string.
+ *  - `refs(prefix)` and `logs(refName)` are generators decoding one block at a time; log
+ *    records of one ref share its name string.
+ *  - `verify()` walks every block and record in file order (an fsck of the table).
  *
- * The obj blocks and the indexes are checked but not used: lookups scan the ref records, which
- * are few enough to hold in memory. Version 1 tables (SHA-1) and version 2 tables with hash id
- * `sha1` are read; SHA-256 tables (`s256`) are refused (`ReftableUnsupportedError`).
+ * Whatever is decoded is checked, so a crafted table is refused (`ReftableFormatError`) rather
+ * than read past its bounds: each block's type, length (within its section) and restart table
+ * (offsets ascending, inside the record area, each one the start of a record whose key is not
+ * prefix compressed); each record's prefix length (at most the previous key's), suffix,
+ * varints and value inside the record area; keys strictly ascending; log blocks inflated to
+ * exactly the length their header gives (at most 16 MiB: `block_len` is 24 bits); index
+ * records naming a block before themselves.
+ *
+ * Prefix compression and deflate let a small table stand for very many or very long keys
+ * (a key repeating its whole predecessor plus one byte costs two file bytes; a deflated log
+ * block of tombstones a fraction of a byte per record), so each call gets a
+ * {@link ReftableReadBudget}: the bytes it decodes (a fixed cost per record, its key suffix
+ * and value, each name it materialises, each log block it inflates) may not exceed
+ * {@link REFTABLE_READ_CEILING}. What a call holds is then bounded by what its caller keeps,
+ * never by the table's size times an amplification. Version 1 tables (SHA-1) and version 2
+ * tables with hash id `sha1` are read; SHA-256 tables (`s256`) are refused
+ * (`ReftableUnsupportedError`).
  */
 
 import { inflateWhole } from "@statewalker/vcs-utils/compression";
@@ -74,7 +90,26 @@ export interface ReftableLogRecord {
   readonly update?: ReftableLogUpdate;
 }
 
-/** A parsed reftable. */
+/** A log record whose update is read on demand (`ReftableTable.logHeads`). */
+export interface ReftableLogHead {
+  readonly refName: string;
+  readonly refKey: Uint8Array;
+  readonly updateIndex: number;
+  /** A deletion record: `read()` gives undefined */
+  readonly deletion: boolean;
+  /** The update; only once, and only before the generator moves on */
+  read(): ReftableLogUpdate | undefined;
+}
+
+/** How many blocks of each kind a table holds (ref, index, obj, log). */
+export interface ReftableBlockCounts {
+  ref: number;
+  index: number;
+  obj: number;
+  log: number;
+}
+
+/** An opened reftable: its header, and lazy reads of its records. */
 export interface ReftableTable {
   /** The file's name (for messages) */
   readonly name: string;
@@ -84,14 +119,61 @@ export interface ReftableTable {
   readonly blockSize: number;
   readonly minUpdateIndex: number;
   readonly maxUpdateIndex: number;
-  /** Ref records in key order, deletions included */
-  readonly refs: readonly ReftableRefRecord[];
-  /** Log records in key order: by ref name, then newest update index first */
-  readonly logs: readonly ReftableLogRecord[];
-  /** How many blocks of each kind the sections hold (ref, index, obj, log) */
-  readonly blocks: { ref: number; index: number; obj: number; log: number };
   /** The footer's `obj_id_len` (0 without obj blocks) */
   readonly objectIdLength: number;
+  /** The ref record of `name`, a deletion record included; undefined when the table has none */
+  getRef(name: string, budget?: ReftableReadBudget): ReftableRefRecord | undefined;
+  /** Ref records whose name starts with `prefix`, in key order, deletions included */
+  refs(prefix?: string, budget?: ReftableReadBudget): Generator<ReftableRefRecord>;
+  /**
+   * Log records in key order (by ref name, then newest update index first), deletions
+   * included: of `refName` only when given, else all of them.
+   */
+  logs(refName?: string, budget?: ReftableReadBudget): Generator<ReftableLogRecord>;
+  /**
+   * As `logs`, but each record's update is decoded only when `read()` is called, before the
+   * generator moves on (a merge reads only the records no newer table hides).
+   */
+  logHeads(refName?: string, budget?: ReftableReadBudget): Generator<ReftableLogHead>;
+  /** Walks every block and record in file order and checks them (fsck); the block counts. */
+  verify(budget?: ReftableReadBudget): { blocks: ReftableBlockCounts };
+}
+
+/**
+ * The most bytes one read (a lookup, a listing, a reflog read, a verify) may decode: 256 MiB,
+ * counted as {@link ReftableReadBudget} counts them. Real reads stay far below it (a listing
+ * of a million refs charges about 100 MiB); crafted tables meet it instead of exhausting
+ * memory.
+ */
+export const REFTABLE_READ_CEILING = 256 * 1024 * 1024;
+
+/** What each record visited costs besides its key suffix (its decoding). */
+const RECORD_COST = 16;
+/** Inflating a log block costs its inflated length over this (real logs inflate a few times) */
+const INFLATE_COST_DIVISOR = 8;
+
+/**
+ * The bytes one read has decoded: `RECORD_COST` plus the key suffix of each record visited,
+ * what it materialises (three bytes per byte of each name or text it decodes, for a copy and
+ * a string of two bytes a character at worst; 40 per object id in hex), and an eighth of each
+ * log block it inflates. A record passed over (a seek's scan, a value a newer table hides)
+ * costs its suffix and `RECORD_COST` only, so a stack of tombstones over a long reflog is
+ * read, while the names and values a read returns, and the blocks it inflates, stay bounded.
+ * Past `ceiling`, the read is refused with `ReftableFormatError`.
+ */
+export class ReftableReadBudget {
+  used = 0;
+  constructor(readonly ceiling = REFTABLE_READ_CEILING) {}
+
+  charge(bytes: number, table: string): void {
+    this.used += bytes;
+    if (this.used > this.ceiling) {
+      throw new ReftableFormatError(
+        table,
+        `one read decodes more than ${this.ceiling} bytes (the per-read ceiling)`,
+      );
+    }
+  }
 }
 
 const MAGIC = [0x52, 0x45, 0x46, 0x54]; // "REFT"
@@ -102,11 +184,11 @@ const TYPE_REF = 0x72; // 'r'
 const TYPE_LOG = 0x67; // 'g'
 const TYPE_OBJ = 0x6f; // 'o'
 const TYPE_INDEX = 0x69; // 'i'
+/** Index levels a seek follows at most (git writes as many as it needs; each is 1/n the last) */
+const MAX_INDEX_DEPTH = 32;
 
 const utf8 = new TextDecoder();
-
-/** The sections of a table, in file order. */
-type SectionKind = "ref" | "refIndex" | "obj" | "objIndex" | "log" | "logIndex";
+const encoder = new TextEncoder();
 
 /** The header's length for a version (24, or 28 with the hash id). */
 function headerSize(version: number): number {
@@ -148,450 +230,817 @@ export function compareKeys(a: Uint8Array, b: Uint8Array): number {
   return a.length - b.length;
 }
 
+function fail(table: string, detail: string): never {
+  throw new ReftableFormatError(table, detail);
+}
+
 /** A block of a section, its records' bytes in hand (a log block inflated). */
 interface Block {
+  /** Where it starts in the file */
+  offset: number;
+  type: number;
   /** The block's bytes from its start (the file's start for the first block) */
   data: Uint8Array;
   /** Where its records start: after the file header (first block) and the block header */
   recordsStart: number;
   /** Where the restart table starts: the records end there */
   recordsEnd: number;
-  restarts: Set<number>;
+  /** Restart offsets, ascending, inside the records */
+  restarts: Uint32Array;
   /** The bytes the block takes in the file, padding included */
   fullSize: number;
 }
 
-/**
- * Parses a reftable file held whole in memory. Throws `ReftableFormatError` for a file that is
- * not well formed and `ReftableUnsupportedError` for a SHA-256 table. `name` names the table in
- * those errors.
- */
-/**
- * What a table may make us decode, charged against the bytes of the file itself (never the
- * inflated ones, which a crafted log block multiplies by thousands):
- *  - log blocks may inflate to `MAX_INFLATE_FACTOR` times the file, plus the slack (real
- *    reflogs, 20 random id bytes per entry, deflate far less);
- *  - the records decoded may number the file's bytes plus the slack (each kept record costs
- *    a few hundred bytes of heap; a real one takes at least a few file bytes, more when
- *    deflated, as its new id is random);
- *  - the keys rebuilt from prefix compression may total `MAX_KEY_FACTOR` times the file, plus
- *    the slack (a large `reftable.restartInterval` with long names legitimately repeats each
- *    name for a few bytes; quadratic copies are what this stops).
- */
-const MAX_INFLATE_FACTOR = 64;
-const MAX_INFLATE_SLACK = 16 << 20;
-const MAX_RECORDS_SLACK = 1 << 16;
-const MAX_KEY_FACTOR = 256;
-const MAX_KEY_SLACK = 16 << 20;
+/** A section of blocks of one type: where it starts, the bound of its blocks, its index. */
+interface Section {
+  type: number;
+  start: number;
+  end: number;
+  /** The index root's position, 0 without an index */
+  index: number;
+}
 
-export function parseReftable(bytes: Uint8Array, name = "<reftable>"): ReftableTable {
-  const fail = (detail: string): never => {
-    throw new ReftableFormatError(name, detail);
-  };
+/**
+ * Walks the records of blocks: each key rebuilt in one scratch buffer against the previous
+ * one (prefix compression), restarts and key order checked, every byte charged to the read's
+ * budget. `nextKey` stops at a record's value; the caller reads it (`varint`, `take`) or skips
+ * it, then calls `endValue`.
+ */
+class Cursor {
+  key = new Uint8Array(64);
+  keyLen = 0;
+  /** The key in hand is the previous record's: the next one must sort after it */
+  hasPrev = false;
+  /** At a block's start: the next key is not prefix compressed */
+  fresh = true;
+  block!: Block;
+  pos = 0;
+  nextRestart = 0;
+  prefix = 0;
+  suffix = 0;
+  type = 0;
+  valueStart = 0;
+  /** The previous log record's ref name, reused while records keep it */
+  lastRefName = "";
+  lastRefKey: Uint8Array = new Uint8Array(0);
+  /** Log heads handed out: a head reads its value only while it is the last one */
+  records = 0;
 
-  // header: magic, version, block size, update indexes (and a hash id in version 2)
-  if (bytes.length < 24) fail(`truncated: ${bytes.length} bytes, shorter than a header`);
-  for (let i = 0; i < 4; i++) if (bytes[i] !== MAGIC[i]) fail("bad magic (not 'REFT')");
-  const version = bytes[4] as number;
-  if (version !== 1 && version !== 2) fail(`unknown version ${version}`);
-  const hSize = headerSize(version);
-  const fSize = footerSize(version);
-  if (bytes.length < hSize + fSize) {
-    fail(`truncated: ${bytes.length} bytes, shorter than a header and a footer`);
-  }
-  if (version === 2) {
-    const hashId = be32(bytes, 24);
-    if (hashId === FORMAT_ID_SHA256) {
-      throw new ReftableUnsupportedError(name, "SHA-256 tables (hash id 's256') are not read");
+  constructor(
+    readonly table: string,
+    readonly budget: ReftableReadBudget,
+    readonly what: string,
+  ) {}
+
+  /** Starts at `pos` of `block`; `keepOrder` checks the first key against the key in hand. */
+  enter(block: Block, pos: number, keepOrder: boolean): void {
+    this.block = block;
+    this.pos = pos;
+    this.fresh = true;
+    if (!keepOrder) this.hasPrev = false;
+    const r = block.restarts;
+    let lo = 0;
+    let hi = r.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if ((r[mid] as number) < pos) lo = mid + 1;
+      else hi = mid;
     }
-    if (hashId !== FORMAT_ID_SHA1) fail(`unknown hash id 0x${hashId.toString(16)}`);
+    this.nextRestart = lo;
   }
-  const blockSize = be24(bytes, 5);
-  const toIndex = (value: bigint, what: string): number => {
-    if (value > BigInt(Number.MAX_SAFE_INTEGER)) fail(`${what} ${value} out of range`);
-    return Number(value);
-  };
-  const minUpdateIndex = toIndex(be64(bytes, 8), "min_update_index");
-  const maxUpdateIndex = toIndex(be64(bytes, 16), "max_update_index");
 
-  // footer: the header again, the section positions and a CRC-32 of all that
-  const footerStart = bytes.length - fSize;
-  for (let i = 0; i < hSize; i++) {
-    if (bytes[footerStart + i] !== bytes[i]) fail("footer does not repeat the header");
-  }
-  const crcAt = footerStart + fSize - 4;
-  if (crc32(bytes.subarray(footerStart, crcAt)) !== be32(bytes, crcAt)) {
-    fail("footer CRC-32 mismatch");
-  }
-  let at = footerStart + hSize;
-  const position = (what: string): number => {
-    const value = be64(bytes, at);
-    at += 8;
-    if (value >= BigInt(footerStart)) fail(`${what} ${value} past the last block`);
-    return Number(value);
-  };
-  const refIndexPos = position("ref_index_position");
-  const objField = be64(bytes, at);
-  at += 8;
-  const objectIdLength = Number(objField & 31n);
-  const objPosBig = objField >> 5n;
-  if (objPosBig >= BigInt(footerStart)) fail(`obj_position ${objPosBig} past the last block`);
-  const objPos = Number(objPosBig);
-  if (objPos > 0 && objectIdLength === 0) fail("obj blocks without an obj_id_len");
-  const objIndexPos = position("obj_index_position");
-  const logPos = position("log_position");
-  const logIndexPos = position("log_index_position");
-
-  // the blocks in file order: ref blocks, the ref index, obj blocks and their index, log
-  // blocks and their index (an index's lower levels before its root, the footer's position)
-  const firstType = footerStart > hSize ? (bytes[hSize] as number) : undefined;
-  if (firstType !== undefined && firstType !== TYPE_REF && firstType !== TYPE_LOG) {
-    fail(`the first block is of type 0x${firstType.toString(16)}, neither ref nor log`);
-  }
-  if (firstType === undefined && (refIndexPos || objPos || objIndexPos || logPos || logIndexPos)) {
-    fail("an empty table names sections");
-  }
-  if (firstType === TYPE_LOG && logPos > 0) fail("a log-only table with a log_position");
-  if (objPos > 0 && logPos > 0 && objPos >= logPos) fail("obj blocks after the log blocks");
-
-  const readVarint = (data: Uint8Array, pos: number, end: number): [number, number] => {
-    if (pos >= end) fail("varint past the end of its block");
+  varint(): number {
+    const data = this.block.data;
+    const end = this.block.recordsEnd;
+    let pos = this.pos;
+    if (pos >= end) fail(this.table, "varint past the end of its block");
     let c = data[pos++] as number;
     let value = c & 0x7f;
     while (c & 0x80) {
       value += 1;
-      if (value > Math.floor(Number.MAX_SAFE_INTEGER / 128)) fail("varint overflow");
-      if (pos >= end) fail("varint past the end of its block");
+      if (value > Math.floor(Number.MAX_SAFE_INTEGER / 128)) fail(this.table, "varint overflow");
+      if (pos >= end) fail(this.table, "varint past the end of its block");
       c = data[pos++] as number;
       value = value * 128 + (c & 0x7f);
     }
-    return [value, pos];
-  };
+    this.pos = pos;
+    return value;
+  }
 
-  let inflatedBytes = 0;
-  /** The block at `offset` of a section ending at `end`, checked against its bounds. */
-  const readBlock = (offset: number, type: number, end: number): Block => {
-    const headerOff = offset === 0 ? hSize : 0;
-    if (offset + headerOff + 4 > end) fail(`block at ${offset} runs past its section`);
-    const blockType = bytes[offset + headerOff] as number;
-    if (blockType !== type) {
-      fail(
-        `block at ${offset} is of type 0x${blockType.toString(16)}, expected 0x${type.toString(16)}`,
-      );
+  take(n: number, what: string): Uint8Array {
+    if (this.pos + n > this.block.recordsEnd) fail(this.table, `${what} runs past the records`);
+    const out = this.block.data.subarray(this.pos, this.pos + n);
+    this.pos += n;
+    return out;
+  }
+
+  /** Reads the next record's key; false at the end of the block (checked then). */
+  nextKey(): boolean {
+    const b = this.block;
+    const at = `block at ${b.offset}`;
+    if (this.pos >= b.recordsEnd) {
+      if (this.pos > b.recordsEnd) fail(this.table, `${at}: record runs past the records`);
+      if (this.nextRestart < b.restarts.length) {
+        fail(this.table, `${at}: a restart offset is not a record start`);
+      }
+      return false;
+    }
+    const start = this.pos;
+    let isRestart = false;
+    if (this.nextRestart < b.restarts.length) {
+      const r = b.restarts[this.nextRestart] as number;
+      if (start > r) fail(this.table, `${at}: a restart offset is not a record start`);
+      if (start === r) {
+        isRestart = true;
+        this.nextRestart++;
+      }
+    }
+    const prefix = this.varint();
+    const suffixAndType = this.varint();
+    const suffix = Math.floor(suffixAndType / 8);
+    if (isRestart && prefix !== 0) fail(this.table, `${at}: restart record with a compressed key`);
+    if (prefix > (this.fresh ? 0 : this.keyLen)) {
+      fail(this.table, `${at}: key prefix longer than the last key`);
+    }
+    const pos = this.pos;
+    if (pos + suffix > b.recordsEnd) fail(this.table, `${at}: key runs past the records`);
+    const data = b.data;
+    let key = this.key;
+    if (this.hasPrev) {
+      // the new key shares [0, prefix) with the last one: compare from there on
+      const n = Math.min(suffix, this.keyLen - prefix);
+      let c = 0;
+      for (let i = 0; i < n && c === 0; i++) {
+        c = (data[pos + i] as number) - (key[prefix + i] as number);
+      }
+      if (c === 0) c = prefix + suffix - this.keyLen;
+      if (c <= 0) fail(this.table, `${this.what} records out of order`);
+    }
+    const length = prefix + suffix;
+    if (length > key.length) {
+      const grown = new Uint8Array(Math.max(length, key.length * 2));
+      grown.set(key.subarray(0, prefix));
+      key = grown;
+      this.key = grown;
+    }
+    key.set(data.subarray(pos, pos + suffix), prefix);
+    this.keyLen = length;
+    this.hasPrev = true;
+    this.fresh = false;
+    this.prefix = prefix;
+    this.suffix = suffix;
+    this.type = suffixAndType % 8;
+    this.pos = pos + suffix;
+    this.valueStart = this.pos;
+    return true;
+  }
+
+  /** Charges the record (its cost, key suffix and value) once its value is read. */
+  endValue(): void {
+    if (this.pos > this.block.recordsEnd) {
+      fail(this.table, `block at ${this.block.offset}: record runs past the records`);
+    }
+    this.budget.charge(RECORD_COST + this.suffix, this.table);
+  }
+
+  /** The key in hand against `want`, as `compareKeys`. */
+  compareTo(want: Uint8Array): number {
+    const key = this.key;
+    const n = Math.min(this.keyLen, want.length);
+    for (let i = 0; i < n; i++) {
+      const d = (key[i] as number) - (want[i] as number);
+      if (d !== 0) return d;
+    }
+    return this.keyLen - want.length;
+  }
+
+  startsWith(prefix: Uint8Array): boolean {
+    if (this.keyLen < prefix.length) return false;
+    const key = this.key;
+    for (let i = 0; i < prefix.length; i++) if (key[i] !== prefix[i]) return false;
+    return true;
+  }
+
+  /** The key in hand's first `n` bytes, copied, and as a string (charged). */
+  materialise(n: number): [Uint8Array, string] {
+    this.budget.charge(3 * n, this.table);
+    const bytes = this.key.slice(0, n);
+    return [bytes, utf8.decode(bytes)];
+  }
+}
+
+/** Opens a table held whole in memory; see the module's notes. */
+export function openReftable(bytes: Uint8Array, name = "<reftable>"): ReftableTable {
+  return new Reftable(bytes, name);
+}
+
+class Reftable implements ReftableTable {
+  readonly version: 1 | 2;
+  readonly blockSize: number;
+  readonly minUpdateIndex: number;
+  readonly maxUpdateIndex: number;
+  readonly objectIdLength: number;
+  private readonly hSize: number;
+  private readonly footerStart: number;
+  private readonly firstType: number | undefined;
+  private readonly refIndexPos: number;
+  private readonly objPos: number;
+  private readonly objIndexPos: number;
+  private readonly logPos: number;
+  private readonly logIndexPos: number;
+
+  constructor(
+    private readonly bytes: Uint8Array,
+    readonly name: string,
+  ) {
+    const bad = (detail: string): never => fail(name, detail);
+    // header: magic, version, block size, update indexes (and a hash id in version 2)
+    if (bytes.length < 24) bad(`truncated: ${bytes.length} bytes, shorter than a header`);
+    for (let i = 0; i < 4; i++) if (bytes[i] !== MAGIC[i]) bad("bad magic (not 'REFT')");
+    const version = bytes[4] as number;
+    if (version !== 1 && version !== 2) bad(`unknown version ${version}`);
+    this.version = version as 1 | 2;
+    const hSize = headerSize(version);
+    const fSize = footerSize(version);
+    this.hSize = hSize;
+    if (bytes.length < hSize + fSize) {
+      bad(`truncated: ${bytes.length} bytes, shorter than a header and a footer`);
+    }
+    if (version === 2) {
+      const hashId = be32(bytes, 24);
+      if (hashId === FORMAT_ID_SHA256) {
+        throw new ReftableUnsupportedError(name, "SHA-256 tables (hash id 's256') are not read");
+      }
+      if (hashId !== FORMAT_ID_SHA1) bad(`unknown hash id 0x${hashId.toString(16)}`);
+    }
+    this.blockSize = be24(bytes, 5);
+    const toIndex = (value: bigint, what: string): number => {
+      if (value > BigInt(Number.MAX_SAFE_INTEGER)) bad(`${what} ${value} out of range`);
+      return Number(value);
+    };
+    this.minUpdateIndex = toIndex(be64(bytes, 8), "min_update_index");
+    this.maxUpdateIndex = toIndex(be64(bytes, 16), "max_update_index");
+
+    // footer: the header again, the section positions and a CRC-32 of all that
+    const footerStart = bytes.length - fSize;
+    this.footerStart = footerStart;
+    for (let i = 0; i < hSize; i++) {
+      if (bytes[footerStart + i] !== bytes[i]) bad("footer does not repeat the header");
+    }
+    const crcAt = footerStart + fSize - 4;
+    if (crc32(bytes.subarray(footerStart, crcAt)) !== be32(bytes, crcAt)) {
+      bad("footer CRC-32 mismatch");
+    }
+    let at = footerStart + hSize;
+    const position = (what: string): number => {
+      const value = be64(bytes, at);
+      at += 8;
+      if (value >= BigInt(footerStart)) bad(`${what} ${value} past the last block`);
+      return Number(value);
+    };
+    this.refIndexPos = position("ref_index_position");
+    const objField = be64(bytes, at);
+    at += 8;
+    this.objectIdLength = Number(objField & 31n);
+    const objPosBig = objField >> 5n;
+    if (objPosBig >= BigInt(footerStart)) bad(`obj_position ${objPosBig} past the last block`);
+    this.objPos = Number(objPosBig);
+    if (this.objPos > 0 && this.objectIdLength === 0) bad("obj blocks without an obj_id_len");
+    this.objIndexPos = position("obj_index_position");
+    this.logPos = position("log_position");
+    this.logIndexPos = position("log_index_position");
+
+    const firstType = footerStart > hSize ? (bytes[hSize] as number) : undefined;
+    this.firstType = firstType;
+    if (firstType !== undefined && firstType !== TYPE_REF && firstType !== TYPE_LOG) {
+      bad(`the first block is of type 0x${firstType.toString(16)}, neither ref nor log`);
+    }
+    if (
+      firstType === undefined &&
+      (this.refIndexPos || this.objPos || this.objIndexPos || this.logPos || this.logIndexPos)
+    ) {
+      bad("an empty table names sections");
+    }
+    if (firstType === TYPE_LOG && this.logPos > 0) bad("a log-only table with a log_position");
+    if (this.objPos > 0 && this.logPos > 0 && this.objPos >= this.logPos) {
+      bad("obj blocks after the log blocks");
+    }
+    if (firstType === TYPE_LOG && (this.refIndexPos || this.objPos || this.objIndexPos)) {
+      bad("a log-only table names ref or obj sections");
+    }
+  }
+
+  /** The ref or log section, or undefined when the table has none. */
+  private section(type: number): Section | undefined {
+    if (type === TYPE_REF) {
+      if (this.firstType !== TYPE_REF) return undefined;
+      const end = [this.objPos, this.logPos].find((p) => p > 0) ?? this.footerStart;
+      return { type, start: 0, end, index: this.refIndexPos };
+    }
+    const start = this.logPos > 0 ? this.logPos : this.firstType === TYPE_LOG ? 0 : undefined;
+    if (start === undefined) return undefined;
+    return { type, start, end: this.footerStart, index: this.logIndexPos };
+  }
+
+  /** The block at `offset`, whose bytes stay before `end`: any type, checked. */
+  private readBlock(offset: number, end: number, budget: ReftableReadBudget): Block {
+    const bytes = this.bytes;
+    const name = this.name;
+    const headerOff = offset === 0 ? this.hSize : 0;
+    if (offset + headerOff + 4 > end) fail(name, `block at ${offset} runs past its section`);
+    const type = bytes[offset + headerOff] as number;
+    if (type !== TYPE_REF && type !== TYPE_LOG && type !== TYPE_OBJ && type !== TYPE_INDEX) {
+      fail(name, `block at ${offset} is of unknown type 0x${type.toString(16)}`);
     }
     const blockLen = be24(bytes, offset + headerOff + 1);
-    if (blockLen < headerOff + 4 + 2) fail(`block at ${offset} too short (${blockLen} bytes)`);
+    if (blockLen < headerOff + 4 + 2)
+      fail(name, `block at ${offset} too short (${blockLen} bytes)`);
     let data: Uint8Array;
     let fullSize: number;
     if (type === TYPE_LOG) {
       // block_len is the inflated length, block header included; the deflated stream follows
       const skip = headerOff + 4;
-      inflatedBytes += blockLen;
-      if (inflatedBytes > MAX_INFLATE_FACTOR * bytes.length + MAX_INFLATE_SLACK) {
-        fail(`log block at ${offset}: log blocks inflate past ${MAX_INFLATE_FACTOR}x the file`);
-      }
+      budget.charge(Math.ceil(blockLen / INFLATE_COST_DIVISOR), name);
       data = new Uint8Array(blockLen);
       data.set(bytes.subarray(offset, offset + skip));
       let consumed: number;
       try {
-        const r = inflateWhole(bytes.subarray(offset + skip, end), {
-          into: data.subarray(skip),
-        });
+        const r = inflateWhole(bytes.subarray(offset + skip, end), { into: data.subarray(skip) });
         if (r.length !== blockLen - skip) {
-          fail(`log block at ${offset} inflates to ${r.length + skip} bytes, not ${blockLen}`);
+          fail(
+            name,
+            `log block at ${offset} inflates to ${r.length + skip} bytes, not ${blockLen}`,
+          );
         }
         consumed = r.consumed;
       } catch (error) {
         if (error instanceof ReftableFormatError) throw error;
-        fail(`log block at ${offset} does not inflate: ${(error as Error).message}`);
-        throw error;
+        fail(name, `log block at ${offset} does not inflate: ${(error as Error).message}`);
       }
       fullSize = skip + consumed;
     } else {
-      if (offset + blockLen > end)
-        fail(`block at ${offset} (${blockLen} bytes) runs past its section`);
+      if (offset + blockLen > end) {
+        fail(name, `block at ${offset} (${blockLen} bytes) runs past its section`);
+      }
       data = bytes.subarray(offset, offset + blockLen);
       // padded to the block size unless the next byte starts another block (git's
       // reftable_block_init)
       fullSize = blockLen;
-      if (blockSize > 0 && blockLen < blockSize && offset + blockLen < bytes.length) {
-        if (bytes[offset + blockLen] === 0) fullSize = blockSize;
+      if (this.blockSize > 0 && blockLen < this.blockSize && offset + blockLen < bytes.length) {
+        if (bytes[offset + blockLen] === 0) fullSize = this.blockSize;
       }
     }
     const restartCount = be16(data, blockLen - 2);
     const recordsStart = headerOff + 4;
     const recordsEnd = blockLen - 2 - 3 * restartCount;
-    if (restartCount === 0) fail(`block at ${offset} has no restart point`);
-    if (recordsEnd < recordsStart) fail(`block at ${offset}: restart table overlaps its header`);
-    const restarts = new Set<number>();
+    if (restartCount === 0) fail(name, `block at ${offset} has no restart point`);
+    if (recordsEnd < recordsStart) {
+      fail(name, `block at ${offset}: restart table overlaps its header`);
+    }
+    const restarts = new Uint32Array(restartCount);
     let previous = -1;
     for (let i = 0; i < restartCount; i++) {
       const r = be24(data, recordsEnd + 3 * i);
       if (r < recordsStart || r >= recordsEnd || r <= previous) {
-        fail(`block at ${offset}: restart offset ${r} out of range`);
+        fail(name, `block at ${offset}: restart offset ${r} out of range`);
       }
-      restarts.add(r);
+      restarts[i] = r;
       previous = r;
     }
-    return { data, recordsStart, recordsEnd, restarts, fullSize };
-  };
+    return { offset, type, data, recordsStart, recordsEnd, restarts, fullSize };
+  }
+
+  /** The block of `section` at `offset`, or undefined where the section's blocks end. */
+  private blockAt(section: Section, offset: number, budget: ReftableReadBudget) {
+    if (offset >= section.end) return undefined;
+    const headerOff = offset === 0 ? this.hSize : 0;
+    if (offset + headerOff >= section.end) return undefined;
+    if (this.bytes[offset + headerOff] !== section.type) return undefined;
+    return this.readBlock(offset, section.end, budget);
+  }
+
+  /** The key of the record at `pos` (a restart: not compressed) against `want`. */
+  private keyAtCompare(block: Block, pos: number, want: Uint8Array, budget: ReftableReadBudget) {
+    const c = new Cursor(this.name, budget, "");
+    c.enter(block, pos, false);
+    c.nextRestart = block.restarts.length; // checked by the scan that follows, not here
+    c.nextKey();
+    if (c.prefix !== 0)
+      fail(this.name, `block at ${block.offset}: restart record with a compressed key`);
+    budget.charge(c.suffix, this.name);
+    return c.compareTo(want);
+  }
 
   /**
-   * Each record of a block: its key (prefix compressed against the previous one) and value
-   * type, `decodeValue` reading the value; checks restarts start uncompressed keys.
+   * Where a scan for the first key at or after `want` starts in `block`: the last restart
+   * whose key is not past `want` (git's block_iter_seek_key), else the records' start.
    */
-  // Budgets of the whole table, against the file's bytes (see MAX_INFLATE_FACTOR).
-  let keyBytes = 0;
-  let records = 0;
-  const eachRecord = (
-    block: Block,
-    offset: number,
-    decodeValue: (key: Uint8Array, type: number, pos: number) => number,
-  ): void => {
-    const { data, recordsEnd, restarts } = block;
-    let pos = block.recordsStart;
-    let lastKey = new Uint8Array(0);
-    let seen = 0;
-    while (pos < recordsEnd) {
-      const start = pos;
-      let prefix: number;
-      let suffixAndType: number;
-      [prefix, pos] = readVarint(data, pos, recordsEnd);
-      [suffixAndType, pos] = readVarint(data, pos, recordsEnd);
-      const suffix = Math.floor(suffixAndType / 8);
-      const type = suffixAndType % 8;
-      if (restarts.has(start)) {
-        seen++;
-        if (prefix !== 0) fail(`block at ${offset}: restart record with a compressed key`);
-      }
-      if (prefix > lastKey.length) fail(`block at ${offset}: key prefix longer than the last key`);
-      if (pos + suffix > recordsEnd) fail(`block at ${offset}: key runs past the records`);
-      keyBytes += prefix + suffix;
-      if (keyBytes > MAX_KEY_FACTOR * bytes.length + MAX_KEY_SLACK) {
-        fail(`block at ${offset}: keys expand past ${MAX_KEY_FACTOR}x the file`);
-      }
-      if (++records > bytes.length + MAX_RECORDS_SLACK) {
-        fail(`block at ${offset}: more records than the file has bytes`);
-      }
-      const key = new Uint8Array(prefix + suffix);
-      key.set(lastKey.subarray(0, prefix));
-      key.set(data.subarray(pos, pos + suffix), prefix);
-      pos = decodeValue(key, type, pos + suffix);
-      if (pos > recordsEnd) fail(`block at ${offset}: record runs past the records`);
-      lastKey = key;
+  private restartBefore(block: Block, want: Uint8Array, budget: ReftableReadBudget): number {
+    const r = block.restarts;
+    let lo = 0;
+    let hi = r.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.keyAtCompare(block, r[mid] as number, want, budget) > 0) hi = mid;
+      else lo = mid + 1;
     }
-    if (seen !== restarts.size) fail(`block at ${offset}: a restart offset is not a record start`);
-  };
+    return lo === 0 ? block.recordsStart : (r[lo - 1] as number);
+  }
 
-  const bytesAt = (data: Uint8Array, pos: number, n: number, end: number, what: string) => {
-    if (pos + n > end) fail(`${what} runs past the records`);
-    return data.subarray(pos, pos + n);
-  };
-
-  const refs: ReftableRefRecord[] = [];
-  const logs: ReftableLogRecord[] = [];
-  const blocks = { ref: 0, index: 0, obj: 0, log: 0 };
-  const indexTargets: {
-    kind: SectionKind;
-    also?: SectionKind;
-    position: number;
-    offset: number;
-  }[] = [];
-  let lastRefKey: Uint8Array | undefined;
-  let lastLogKey: Uint8Array | undefined;
-
-  /** Each section's rank in file order; an index takes the rank after the data it follows */
-  const RANK = { ref: 0, refIndex: 1, obj: 2, objIndex: 3, log: 4, logIndex: 5 } as const;
-  const startsByRank = [0, 1, 2, 3, 4, 5].map(() => new Set<number>());
-  let rank = 0;
-  // an empty table: the footer right after the header
-  for (let offset = 0; firstType !== undefined && offset < footerStart; ) {
-    const headerOff = offset === 0 ? hSize : 0;
-    if (offset + headerOff >= footerStart) fail(`block at ${offset} runs past the last block`);
-    const type = bytes[offset + headerOff] as number;
-    let kind: SectionKind;
-    if (type === TYPE_REF) kind = "ref";
-    else if (type === TYPE_OBJ) kind = "obj";
-    else if (type === TYPE_LOG) kind = "log";
-    else if (type === TYPE_INDEX) {
-      if (offset === 0) fail("the first block is an index");
-      kind = rank <= RANK.refIndex ? "refIndex" : rank <= RANK.objIndex ? "objIndex" : "logIndex";
-    } else {
-      fail(`block at ${offset} is of unknown type 0x${type.toString(16)}`);
-      throw new Error("unreachable");
-    }
-    if (RANK[kind] < rank) fail(`block at ${offset} (${kind}) out of section order`);
-    if (kind === "obj" && RANK[kind] > rank && offset !== objPos) {
-      fail(`obj blocks start at ${offset}, not at obj_position ${objPos}`);
-    }
-    if (kind === "log" && RANK[kind] > rank && offset !== logPos) {
-      fail(`log blocks start at ${offset}, not at log_position ${logPos}`);
-    }
-    rank = RANK[kind];
-    // a block stays within its section: before the next data section the footer names
-    const end = [objPos, logPos, footerStart].find((p) => p > offset) ?? footerStart;
-    const block = readBlock(offset, type, kind === "log" ? footerStart : end);
-    startsByRank[rank]?.add(offset);
-    const { data, recordsEnd } = block;
-    const blockOffset = offset;
-    switch (kind) {
-      case "ref":
-        blocks.ref++;
-        eachRecord(block, offset, (key, type, pos) => {
-          if (lastRefKey && compareKeys(lastRefKey, key) >= 0) fail("ref records out of order");
-          lastRefKey = key;
-          let delta: number;
-          [delta, pos] = readVarint(data, pos, recordsEnd);
-          const updateIndex = minUpdateIndex + delta;
-          if (!Number.isSafeInteger(updateIndex)) fail("update index out of range");
-          let value: ReftableRefValue;
-          switch (type) {
-            case 0:
-              value = { type: "deletion" };
-              break;
-            case 1:
-              value = {
-                type: "id",
-                id: bytesToHex(bytesAt(data, pos, HASH_SIZE, recordsEnd, "ref value")),
-              };
-              pos += HASH_SIZE;
-              break;
-            case 2:
-              value = {
-                type: "peeled",
-                id: bytesToHex(bytesAt(data, pos, HASH_SIZE, recordsEnd, "ref value")),
-                peeled: bytesToHex(
-                  bytesAt(data, pos + HASH_SIZE, HASH_SIZE, recordsEnd, "ref value"),
-                ),
-              };
-              pos += 2 * HASH_SIZE;
-              break;
-            case 3: {
-              let len: number;
-              [len, pos] = readVarint(data, pos, recordsEnd);
-              const target = bytesAt(data, pos, len, recordsEnd, "symref target");
-              value = { type: "symref", target: utf8.decode(target) };
-              pos += len;
-              break;
+  /**
+   * The block of `section` where keys at or after `want` start, and where to scan from in it;
+   * undefined when every key sorts before `want` (an index says so) or there are no blocks.
+   */
+  private seek(
+    section: Section,
+    want: Uint8Array,
+    budget: ReftableReadBudget,
+  ): { block: Block; start: number } | undefined {
+    if (section.index > 0) {
+      // the index's top level starts at the footer's position and may span several blocks:
+      // walked as a section of its own (git's reader_seek_indexed seeks it linearly)
+      const top: Section = { type: TYPE_INDEX, start: section.index, end: section.end, index: 0 };
+      if (this.blockAt(top, top.start, budget) === undefined) {
+        fail(this.name, `index position ${section.index} starts no index block`);
+      }
+      let level: { block: Block; start: number } | undefined = this.linearSeek(top, want, budget);
+      let levelSection: Section | undefined = top;
+      for (let depth = 0; level; depth++) {
+        if (depth >= MAX_INDEX_DEPTH) fail(this.name, "index deeper than any table needs");
+        // the first index record whose key (its block's last) is not before `want`; on the
+        // top level the scan may go on into the next block, below it stays in its block
+        const c = new Cursor(this.name, budget, "index");
+        let block = level.block;
+        c.enter(block, level.start, false);
+        let target: number | undefined;
+        for (;;) {
+          while (target === undefined && c.nextKey()) {
+            if (c.type !== 0) {
+              fail(this.name, `block at ${block.offset}: index record of value type ${c.type}`);
             }
-            default:
-              fail(`block at ${blockOffset}: unknown ref value type ${type}`);
-              throw new Error("unreachable");
+            const position = c.varint();
+            c.endValue();
+            if (c.compareTo(want) >= 0) target = position;
           }
-          refs.push({ name: utf8.decode(key), key, updateIndex, value });
-          return pos;
-        });
-        break;
-      case "log":
-        blocks.log++;
-        eachRecord(block, offset, (key, type, pos) => {
-          if (lastLogKey && compareKeys(lastLogKey, key) >= 0) fail("log records out of order");
-          lastLogKey = key;
-          if (key.length < 9 || key[key.length - 9] !== 0) fail("log key without its update index");
-          const refKey = key.subarray(0, key.length - 9);
-          const reversed = be64(key, key.length - 8);
-          const updateIndex = toIndex(0xffffffffffffffffn - reversed, "log update index");
-          const refName = utf8.decode(refKey);
-          if (type === 0) {
-            logs.push({ refName, refKey, updateIndex });
-            return pos;
+          if (target !== undefined || !levelSection) break;
+          const next = this.blockAt(levelSection, block.offset + block.fullSize, budget);
+          if (!next) break;
+          block = next;
+          c.enter(block, block.recordsStart, true);
+        }
+        if (target === undefined) return undefined;
+        if (target >= block.offset) {
+          fail(this.name, `index block at ${block.offset} names position ${target}, not before it`);
+        }
+        const found = this.readBlock(target, section.end, budget);
+        if (found.type === TYPE_INDEX) {
+          level = { block: found, start: this.restartBefore(found, want, budget) };
+          levelSection = undefined;
+          continue;
+        }
+        if (found.type !== section.type) {
+          fail(this.name, `index block at ${block.offset} names a block of another section`);
+        }
+        return { block: found, start: this.restartBefore(found, want, budget) };
+      }
+      return undefined;
+    }
+    return this.linearSeek(section, want, budget);
+  }
+
+  /** The last block of `section` whose first key is not past `want` (git's reader_seek_linear). */
+  private linearSeek(
+    section: Section,
+    want: Uint8Array,
+    budget: ReftableReadBudget,
+  ): { block: Block; start: number } | undefined {
+    let found: Block | undefined;
+    for (let offset = section.start; ; ) {
+      const block = this.blockAt(section, offset, budget);
+      if (!block) break;
+      if (found && this.keyAtCompare(block, block.recordsStart, want, budget) > 0) break;
+      found = block;
+      offset += block.fullSize;
+    }
+    if (!found) return undefined;
+    return { block: found, start: this.restartBefore(found, want, budget) };
+  }
+
+  /**
+   * Each record of `section` from the first key at or after `want` (or from the start), the
+   * cursor at its value; the caller reads the value or leaves it to be skipped. Blocks are
+   * read one at a time, in order, while their type is the section's.
+   */
+  private *walk(
+    section: Section | undefined,
+    want: Uint8Array | undefined,
+    budget: ReftableReadBudget,
+    skipValue: (c: Cursor) => void,
+  ): Generator<Cursor> {
+    if (!section) return;
+    const what = section.type === TYPE_REF ? "ref" : "log";
+    let block: Block | undefined;
+    let start: number;
+    if (want) {
+      const found = this.seek(section, want, budget);
+      if (!found) return;
+      block = found.block;
+      start = found.start;
+    } else {
+      block = this.blockAt(section, section.start, budget);
+      if (!block) return;
+      start = block.recordsStart;
+    }
+    const c = new Cursor(this.name, budget, what);
+    c.enter(block, start, false);
+    let seeking = want !== undefined;
+    for (;;) {
+      while (c.nextKey()) {
+        if (seeking && c.compareTo(want as Uint8Array) < 0) {
+          skipValue(c);
+          c.endValue();
+          continue;
+        }
+        seeking = false;
+        const valueStart = c.pos;
+        yield c;
+        if (c.pos === valueStart) skipValue(c);
+        c.endValue();
+      }
+      const next = this.blockAt(section, block.offset + block.fullSize, budget);
+      if (!next) return;
+      block = next;
+      c.enter(block, block.recordsStart, true);
+    }
+  }
+
+  getRef(name: string, budget = new ReftableReadBudget()): ReftableRefRecord | undefined {
+    const want = encoder.encode(name);
+    for (const c of this.walk(this.section(TYPE_REF), want, budget, (c) => this.refValue(c))) {
+      if (c.compareTo(want) !== 0) return undefined;
+      return this.refRecord(c);
+    }
+    return undefined;
+  }
+
+  *refs(prefix = "", budget = new ReftableReadBudget()): Generator<ReftableRefRecord> {
+    const want = prefix ? encoder.encode(prefix) : undefined;
+    for (const c of this.walk(this.section(TYPE_REF), want, budget, (c) => this.refValue(c))) {
+      if (want && !c.startsWith(want)) return;
+      yield this.refRecord(c);
+    }
+  }
+
+  *logs(refName?: string, budget = new ReftableReadBudget()): Generator<ReftableLogRecord> {
+    for (const head of this.logHeads(refName, budget)) {
+      const { refName, refKey, updateIndex } = head;
+      yield { refName, refKey, updateIndex, update: head.read() };
+    }
+  }
+
+  *logHeads(refName?: string, budget = new ReftableReadBudget()): Generator<ReftableLogHead> {
+    let want: Uint8Array | undefined;
+    if (refName !== undefined) {
+      const nameBytes = encoder.encode(refName);
+      want = new Uint8Array(nameBytes.length + 1);
+      want.set(nameBytes);
+    }
+    let lastRefLen = -1;
+    for (const c of this.walk(this.section(TYPE_LOG), want, budget, (c) => this.logValue(c))) {
+      const len = c.keyLen;
+      if (len < 9 || c.key[len - 9] !== 0) fail(this.name, "log key without its update index");
+      const refLen = len - 9;
+      // the same ref as the last record when its name is as long and the prefix covers it
+      const same = refLen === lastRefLen && c.prefix >= refLen;
+      if (want) {
+        if (!same && (refLen !== want.length - 1 || !c.startsWith(want))) return;
+      }
+      if (!same) [c.lastRefKey, c.lastRefName] = c.materialise(refLen);
+      lastRefLen = refLen;
+      const hi = 0xffffffff - be32(c.key, len - 8);
+      const lo = 0xffffffff - be32(c.key, len - 4);
+      if (hi >= 0x200000) fail(this.name, "log update index out of range");
+      const updateIndex = hi * 0x100000000 + lo;
+      const seq = ++c.records;
+      yield {
+        refName: c.lastRefName,
+        refKey: c.lastRefKey,
+        updateIndex,
+        deletion: c.type === 0,
+        read: () => {
+          if (c.records !== seq || c.pos !== c.valueStart) {
+            throw new Error("reftable: a log head is read once, before its iterator moves on");
           }
-          if (type !== 1) fail(`block at ${blockOffset}: unknown log value type ${type}`);
-          const oldId = bytesToHex(bytesAt(data, pos, HASH_SIZE, recordsEnd, "log value"));
-          const newId = bytesToHex(
-            bytesAt(data, pos + HASH_SIZE, HASH_SIZE, recordsEnd, "log value"),
-          );
-          pos += 2 * HASH_SIZE;
-          const text = (what: string): string => {
-            let len: number;
-            [len, pos] = readVarint(data, pos, recordsEnd);
-            const out = utf8.decode(bytesAt(data, pos, len, recordsEnd, what));
-            pos += len;
-            return out;
-          };
-          const who = text("log name");
-          const email = text("log email");
-          let time: number;
-          [time, pos] = readVarint(data, pos, recordsEnd);
-          const tz = bytesAt(data, pos, 2, recordsEnd, "log time zone");
-          const tzRaw = be16(tz, 0);
-          const tzOffset = tzRaw >= 0x8000 ? tzRaw - 0x10000 : tzRaw;
-          pos += 2;
-          const message = text("log message");
-          logs.push({
-            refName,
-            refKey,
-            updateIndex,
-            update: { oldId, newId, name: who, email, time, tzOffset, message },
-          });
-          return pos;
-        });
+          return this.logValue(c, true);
+        },
+      };
+    }
+  }
+
+  /** Reads a ref record's value (materialised when asked): its update index and value. */
+  private refValue(c: Cursor, materialise = false): [number, ReftableRefValue] | undefined {
+    const delta = c.varint();
+    const updateIndex = this.minUpdateIndex + delta;
+    if (!Number.isSafeInteger(updateIndex)) fail(this.name, "update index out of range");
+    let value: ReftableRefValue | undefined;
+    switch (c.type) {
+      case 0:
+        value = { type: "deletion" };
         break;
-      case "obj":
-        blocks.obj++;
-        eachRecord(block, offset, (_key, type, pos) => {
-          let count = type;
-          if (count === 0) [count, pos] = readVarint(data, pos, recordsEnd);
-          let prior = 0;
-          for (let i = 0; i < count; i++) {
-            let delta: number;
-            [delta, pos] = readVarint(data, pos, recordsEnd);
-            const target = i === 0 ? delta : prior + delta;
-            if (target >= footerStart) fail(`obj record names position ${target} past the blocks`);
-            indexTargets.push({ kind: "ref", position: target, offset: blockOffset });
-            prior = target;
+      case 1: {
+        const id = c.take(HASH_SIZE, "ref value");
+        if (materialise) {
+          c.budget.charge(2 * HASH_SIZE, this.name);
+          value = { type: "id", id: bytesToHex(id) };
+        }
+        break;
+      }
+      case 2: {
+        const id = c.take(HASH_SIZE, "ref value");
+        const peeled = c.take(HASH_SIZE, "ref value");
+        if (materialise) {
+          c.budget.charge(4 * HASH_SIZE, this.name);
+          value = { type: "peeled", id: bytesToHex(id), peeled: bytesToHex(peeled) };
+        }
+        break;
+      }
+      case 3: {
+        const len = c.varint();
+        const target = c.take(len, "symref target");
+        if (materialise) {
+          c.budget.charge(3 * len, this.name);
+          value = { type: "symref", target: utf8.decode(target) };
+        }
+        break;
+      }
+      default:
+        fail(this.name, `block at ${c.block.offset}: unknown ref value type ${c.type}`);
+    }
+    return value ? [updateIndex, value] : undefined;
+  }
+
+  private refRecord(c: Cursor): ReftableRefRecord {
+    const [key, name] = c.materialise(c.keyLen);
+    const [updateIndex, value] = this.refValue(c, true) as [number, ReftableRefValue];
+    return { name, key, updateIndex, value };
+  }
+
+  /** Reads a log record's value: the update (materialised when asked), none for a deletion. */
+  private logValue(c: Cursor, materialise = false): ReftableLogUpdate | undefined {
+    if (c.type === 0) return undefined;
+    if (c.type !== 1)
+      fail(this.name, `block at ${c.block.offset}: unknown log value type ${c.type}`);
+    const oldId = c.take(HASH_SIZE, "log value");
+    const newId = c.take(HASH_SIZE, "log value");
+    const text = (what: string): Uint8Array => c.take(c.varint(), what);
+    const who = text("log name");
+    const email = text("log email");
+    const time = c.varint();
+    const tzRaw = be16(c.take(2, "log time zone"), 0);
+    const message = text("log message");
+    if (!materialise) return undefined;
+    c.budget.charge(4 * HASH_SIZE + 3 * (who.length + email.length + message.length), this.name);
+    return {
+      oldId: bytesToHex(oldId),
+      newId: bytesToHex(newId),
+      name: utf8.decode(who),
+      email: utf8.decode(email),
+      time,
+      tzOffset: tzRaw >= 0x8000 ? tzRaw - 0x10000 : tzRaw,
+      message: utf8.decode(message),
+    };
+  }
+
+  verify(budget = new ReftableReadBudget()): { blocks: ReftableBlockCounts } {
+    const name = this.name;
+    const blocks = { ref: 0, index: 0, obj: 0, log: 0 };
+    if (this.firstType === undefined) return { blocks };
+    type Kind = "ref" | "refIndex" | "obj" | "objIndex" | "log" | "logIndex";
+    /** Each section's rank in file order; an index takes the rank after the data it follows */
+    const RANK = { ref: 0, refIndex: 1, obj: 2, objIndex: 3, log: 4, logIndex: 5 } as const;
+    const startsByRank = [0, 1, 2, 3, 4, 5].map(() => new Set<number>());
+    // block positions index and obj records name: [indexed rank, also (an index's own) rank]
+    const targets: number[] = [];
+    const targetRanks: number[] = [];
+    const targetBlocks: number[] = [];
+    const { objPos, logPos, footerStart } = this;
+    let rank = 0;
+    let cursor: Cursor | undefined;
+    for (let offset = 0; offset < footerStart; ) {
+      const headerOff = offset === 0 ? this.hSize : 0;
+      if (offset + headerOff >= footerStart)
+        fail(name, `block at ${offset} runs past the last block`);
+      const type = this.bytes[offset + headerOff] as number;
+      let kind: Kind;
+      if (type === TYPE_REF) kind = "ref";
+      else if (type === TYPE_OBJ) kind = "obj";
+      else if (type === TYPE_LOG) kind = "log";
+      else if (type === TYPE_INDEX) {
+        if (offset === 0) fail(name, "the first block is an index");
+        kind = rank <= RANK.refIndex ? "refIndex" : rank <= RANK.objIndex ? "objIndex" : "logIndex";
+      } else {
+        fail(name, `block at ${offset} is of unknown type 0x${type.toString(16)}`);
+      }
+      if (RANK[kind] < rank) fail(name, `block at ${offset} (${kind}) out of section order`);
+      if (kind === "obj" && RANK[kind] > rank && offset !== objPos) {
+        fail(name, `obj blocks start at ${offset}, not at obj_position ${objPos}`);
+      }
+      if (kind === "log" && RANK[kind] > rank && offset !== logPos) {
+        fail(name, `log blocks start at ${offset}, not at log_position ${logPos}`);
+      }
+      // keys ascend through the ref and the log section (an index's levels each restart)
+      const keepOrder =
+        cursor !== undefined && RANK[kind] === rank && (kind === "ref" || kind === "log");
+      rank = RANK[kind];
+      const end = [objPos, logPos, footerStart].find((p) => p > offset) ?? footerStart;
+      const block = this.readBlock(offset, kind === "log" ? footerStart : end, budget);
+      startsByRank[rank]?.add(offset);
+      const c: Cursor =
+        keepOrder && cursor ? cursor : new Cursor(name, budget, kind === "obj" ? "obj" : kind);
+      cursor = c;
+      c.enter(block, block.recordsStart, keepOrder);
+      switch (kind) {
+        case "ref":
+          blocks.ref++;
+          while (c.nextKey()) {
+            this.refValue(c);
+            c.endValue();
           }
-          return pos;
-        });
-        break;
-      default: {
-        // an index: each record names a block of the section it indexes, or a lower level
-        blocks.index++;
-        const indexed: SectionKind =
-          kind === "refIndex" ? "ref" : kind === "objIndex" ? "obj" : "log";
-        const level = kind;
-        eachRecord(block, offset, (_key, type, pos) => {
-          if (type !== 0) fail(`block at ${blockOffset}: index record of value type ${type}`);
-          let target: number;
-          [target, pos] = readVarint(data, pos, recordsEnd);
-          indexTargets.push({ kind: indexed, also: level, position: target, offset: blockOffset });
-          return pos;
-        });
+          break;
+        case "log":
+          blocks.log++;
+          while (c.nextKey()) {
+            const len = c.keyLen;
+            if (len < 9 || c.key[len - 9] !== 0) fail(name, "log key without its update index");
+            if (0xffffffff - be32(c.key, len - 8) >= 0x200000) {
+              fail(name, "log update index out of range");
+            }
+            this.logValue(c);
+            c.endValue();
+          }
+          break;
+        case "obj":
+          blocks.obj++;
+          while (c.nextKey()) {
+            let count = c.type;
+            if (count === 0) count = c.varint();
+            let prior = 0;
+            for (let i = 0; i < count; i++) {
+              const delta = c.varint();
+              const target = i === 0 ? delta : prior + delta;
+              if (target >= footerStart) {
+                fail(name, `obj record names position ${target} past the blocks`);
+              }
+              targets.push(target);
+              targetRanks.push(RANK.ref, -1);
+              targetBlocks.push(offset);
+              prior = target;
+            }
+            c.endValue();
+          }
+          break;
+        default: {
+          // an index: each record names a block of the section it indexes, or a lower level
+          blocks.index++;
+          const indexed =
+            kind === "refIndex" ? RANK.ref : kind === "objIndex" ? RANK.obj : RANK.log;
+          while (c.nextKey()) {
+            if (c.type !== 0)
+              fail(name, `block at ${offset}: index record of value type ${c.type}`);
+            targets.push(c.varint());
+            targetRanks.push(indexed, rank);
+            targetBlocks.push(offset);
+            c.endValue();
+          }
+        }
+      }
+      offset += block.fullSize;
+    }
+    // the footer's index roots start index blocks of their section
+    const roots: [number, number, string][] = [
+      [this.refIndexPos, RANK.refIndex, "ref_index_position"],
+      [this.objIndexPos, RANK.objIndex, "obj_index_position"],
+      [this.logIndexPos, RANK.logIndex, "log_index_position"],
+    ];
+    for (const [position, r, what] of roots) {
+      if (position > 0 && !startsByRank[r]?.has(position)) {
+        fail(name, `${what} ${position} starts no index block`);
       }
     }
-    offset += block.fullSize;
-  }
-
-  // the footer's index roots start index blocks of their section
-  const roots: [number, number, string][] = [
-    [refIndexPos, RANK.refIndex, "ref_index_position"],
-    [objIndexPos, RANK.objIndex, "obj_index_position"],
-    [logIndexPos, RANK.logIndex, "log_index_position"],
-  ];
-  for (const [position, r, what] of roots) {
-    if (position > 0 && !startsByRank[r]?.has(position)) {
-      fail(`${what} ${position} starts no index block`);
+    if (objPos > 0 && !startsByRank[RANK.obj]?.has(objPos))
+      fail(name, "obj_position starts no obj block");
+    if (logPos > 0 && !startsByRank[RANK.log]?.has(logPos))
+      fail(name, "log_position starts no log block");
+    for (let i = 0; i < targets.length; i++) {
+      const t = targets[i] as number;
+      if (startsByRank[targetRanks[2 * i] as number]?.has(t)) continue;
+      const also = targetRanks[2 * i + 1] as number;
+      if (also >= 0 && startsByRank[also]?.has(t)) continue;
+      fail(
+        name,
+        `block at ${targetBlocks[i]} names position ${t}, which starts no block it indexes`,
+      );
     }
+    return { blocks };
   }
-  if (objPos > 0 && !startsByRank[RANK.obj]?.has(objPos)) fail("obj_position starts no obj block");
-  if (logPos > 0 && !startsByRank[RANK.log]?.has(logPos)) fail("log_position starts no log block");
-  // index and obj records point at block starts: of the indexed section, or (an index's
-  // records) at a lower level of the same index
-  for (const t of indexTargets) {
-    if (startsByRank[RANK[t.kind]]?.has(t.position)) continue;
-    if (t.also && startsByRank[RANK[t.also]]?.has(t.position)) continue;
-    fail(`block at ${t.offset} names position ${t.position}, which starts no block it indexes`);
-  }
-
-  return {
-    name,
-    version: version as 1 | 2,
-    blockSize,
-    minUpdateIndex,
-    maxUpdateIndex,
-    refs,
-    logs,
-    blocks,
-    objectIdLength,
-  };
 }

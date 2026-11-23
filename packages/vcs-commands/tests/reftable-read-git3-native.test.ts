@@ -9,14 +9,22 @@
  * Scenarios come from git's `t/t0610-reftable-basics.sh` (named in each test), ported by hand.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isSymbolicRef, type Refs } from "@statewalker/vcs-core";
 import {
   createGitFilesBackend,
   openGitLinkedWorktrees,
-  parseReftable,
+  openReftable,
   ReftableWriteUnsupportedError,
 } from "@statewalker/vcs-store-files";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
@@ -163,8 +171,8 @@ describe.skipIf(!git3)("reading reftable repositories (git 3.0 oracle)", () => {
     expect(tables.length).toBeGreaterThan(1);
     // the newest tables hold deletion records hiding the older ones
     const deletions = tables
-      .map((t) => parseReftable(new Uint8Array(readFileSync(join(stack, t))), t))
-      .flatMap((t) => t.refs.filter((r) => r.value.type === "deletion").map((r) => r.name));
+      .map((t) => openReftable(new Uint8Array(readFileSync(join(stack, t))), t))
+      .flatMap((t) => [...t.refs()].filter((r) => r.value.type === "deletion").map((r) => r.name));
     expect(deletions.sort()).toEqual(["refs/heads/doomed", "refs/tags/file"]);
     const refs = await oursRefs();
     expect(await refs.get("refs/tags/file")).toBeUndefined();
@@ -215,11 +223,15 @@ describe.skipIf(!git3)("reading reftable repositories (git 3.0 oracle)", () => {
     g(repo, ["pack-refs"]);
     const stack = join(repo, ".git", "reftable");
     const [only] = tablesOf(stack);
-    const table = parseReftable(new Uint8Array(readFileSync(join(stack, only as string))), only);
+    const table = openReftable(new Uint8Array(readFileSync(join(stack, only as string))), only);
     expect(table.blockSize).toBe(512);
-    expect(table.blocks.ref).toBeGreaterThan(20);
-    expect(table.blocks.index).toBeGreaterThan(0);
-    expect(table.blocks.obj).toBeGreaterThan(0);
+    const { blocks } = table.verify();
+    expect(blocks.ref).toBeGreaterThan(20);
+    expect(blocks.index).toBeGreaterThan(0);
+    expect(blocks.obj).toBeGreaterThan(0);
+    // a lookup through the ref index, and one past the last key
+    expect(table.getRef("refs/heads/topic/0300-xxxxxx")?.value.type).toBe("id");
+    expect(table.getRef("refs/zzz")).toBeUndefined();
     await expectSameRefs(repo, await oursRefs(), ["HEAD", "refs/heads/main"]);
     // a prefix listing, in name order
     const refs = await oursRefs();
@@ -390,6 +402,67 @@ describe.skipIf(!git3)("reading reftable repositories (git 3.0 oracle)", () => {
       expect(g(repo, ["for-each-ref", "--format=%(refname)", "refs/heads/topic"])).toBe("");
       expect(g(repo, ["fsck", "--no-progress"])).toBe("");
     });
+  });
+
+  it("reflog expire's tombstones: more records than the table has bytes", async () => {
+    // a files repository with a long reflog, migrated, then expired: git writes one deletion
+    // record per entry, deflated to less than a byte each (statewalker/webrun-vcs#225)
+    g(root, ["init", "-q", "--ref-format=files", "repo"]);
+    commit(repo, "one", 1);
+    const id = g(repo, ["rev-parse", "HEAD"]).trim();
+    const n = 50000;
+    const lines: string[] = [];
+    for (let i = 0; i < n; i++) {
+      lines.push(`${id} ${id} T <t@example.com> ${1700000000 + i} +0000\tupdate ${i}\n`);
+    }
+    appendFileSync(join(repo, ".git", "logs", "refs", "heads", "main"), lines.join(""));
+    g(repo, ["refs", "migrate", "--ref-format=reftable"]);
+    g(repo, [
+      "-c",
+      "reftable.blockSize=65536",
+      "reflog",
+      "expire",
+      "--expire=now",
+      "--expire-unreachable=now",
+      "refs/heads/main",
+    ]);
+    const stack = join(repo, ".git", "reftable");
+    const newest = tablesOf(stack).at(-1) as string;
+    const bytes = new Uint8Array(readFileSync(join(stack, newest)));
+    const table = openReftable(bytes, newest);
+    let tombstones = 0;
+    for (const log of table.logs("refs/heads/main")) if (!log.update) tombstones++;
+    expect(tombstones).toBeGreaterThan(n);
+    expect(tombstones).toBeGreaterThan(bytes.length);
+    const refs = await oursRefs();
+    await expectSameRefs(repo, refs, ["HEAD", "refs/heads/main"]);
+    expect(nativeReflog(repo, "refs/heads/main")).toBe("");
+    expect(await (await refs.getReflog?.("refs/heads/main"))?.getReverseEntries()).toEqual([]);
+  });
+
+  it("a large reftable.restartInterval with long names: names repeated per record", async () => {
+    init();
+    g(repo, ["config", "reftable.restartInterval", "65535"]);
+    commit(repo, "base", 1);
+    const head = g(repo, ["rev-parse", "HEAD"]).trim();
+    const lines: string[] = [];
+    for (let i = 0; i < 300; i++) {
+      lines.push(`create refs/heads/${"n".repeat(250)}/${String(i).padStart(4, "0")} ${head}\n`);
+    }
+    spawnSync(git3 as string, ["update-ref", "--stdin"], {
+      cwd: repo,
+      env: nativeGit3Env(root),
+      input: lines.join(""),
+    });
+    g(repo, ["pack-refs"]);
+    const stack = join(repo, ".git", "reftable");
+    const [only] = tablesOf(stack);
+    const table = openReftable(new Uint8Array(readFileSync(join(stack, only as string))), only);
+    expect(table.verify().blocks.ref).toBeGreaterThan(0);
+    const refs = await oursRefs();
+    await expectSameRefs(repo, refs, ["HEAD", "refs/heads/main"]);
+    const last = `refs/heads/${"n".repeat(250)}/0299`;
+    expect((await refs.resolve(last))?.objectId).toBe(head);
   });
 });
 

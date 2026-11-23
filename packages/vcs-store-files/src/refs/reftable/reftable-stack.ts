@@ -6,16 +6,20 @@
  * ```typescript
  * const stack = createReftableStackReader(files, ".git/reftable");
  * const view = await stack.read();
- * view.refs.get("refs/heads/main"); // the newest table's record, deletions hiding older ones
- * view.logsOf("HEAD"); // newest first
+ * view.getRef("refs/heads/main"); // the newest table's record, deletions hiding older ones
+ * for (const ref of view.refs("refs/heads/")) console.log(ref.name);
+ * for (const log of view.logs("HEAD")) console.log(log.update?.message); // newest first
  * ```
  *
- * The merged view follows git's merged iterator: for one key the newest table's record wins
- * (a ref deletion hides the ref, a log deletion the entry), refs are in name order (bytes),
- * logs by name and then newest update index first. Tables are immutable, so each is parsed
- * once and kept by name; `tables.list` is read again on each `read()`, and the view rebuilt
- * when it changed (native git writing meanwhile). A table named there but gone (a concurrent
- * compaction) makes the read start over, as git's reload does.
+ * The merged view follows git's merged iterator, lazily: a lookup asks the tables newest
+ * first and stops at the first record (a deletion hides the ref); a listing is a k-way merge
+ * of the tables' sorted iterators, the newest table winning on equal keys and deletions
+ * dropped, refs in name (byte) order; a ref's reflog merges the tables' log records of that
+ * ref, newest update index first, a log deletion hiding the entry. Each call decodes only
+ * what it needs, under one {@link ReftableReadBudget}. Tables are immutable, so each is
+ * opened once and kept by name (opening checks only its header and footer); `tables.list` is
+ * read again on each `read()`. A table named there but gone (a concurrent compaction) makes
+ * the read start over, as git's reload does.
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
@@ -24,8 +28,10 @@ import { joinPath } from "@statewalker/vcs-utils/files";
 import { ReftableFormatError } from "./reftable-errors.js";
 import {
   compareKeys,
-  parseReftable,
+  openReftable,
+  type ReftableLogHead,
   type ReftableLogRecord,
+  ReftableReadBudget,
   type ReftableRefRecord,
   type ReftableTable,
 } from "./reftable-table.js";
@@ -34,12 +40,12 @@ import {
 export interface ReftableView {
   /** The table names, oldest first (`tables.list`) */
   readonly tables: readonly string[];
-  /** Every ref the newest record of which is not a deletion, by name */
-  readonly refs: ReadonlyMap<string, ReftableRefRecord>;
-  /** Those refs in name (byte) order */
-  readonly sortedRefs: readonly ReftableRefRecord[];
+  /** The ref's newest record, undefined when that is a deletion or there is none */
+  getRef(name: string): ReftableRefRecord | undefined;
+  /** The refs whose name starts with `prefix` and whose newest record is not a deletion, in name (byte) order */
+  refs(prefix?: string): Generator<ReftableRefRecord>;
   /** The log records of a ref, newest first, deletions removed (git's reflog order) */
-  logsOf(refName: string): readonly ReftableLogRecord[];
+  logs(refName: string): Generator<ReftableLogRecord>;
   /** Whether git's reflog_exists holds: a log record of the ref that is not a deletion */
   hasLogs(refName: string): boolean;
 }
@@ -57,7 +63,7 @@ const MAX_RELOADS = 10;
 /** A table name git writes: `0x<min>-0x<max>-<random>.ref`; nothing naming another directory */
 const TABLE_NAME = /^[^/\\]+\.ref$/;
 
-/** A reader of the stack in `dir`, its parsed tables cached by name. */
+/** A reader of the stack in `dir`, its opened tables cached by name. */
 export function createReftableStackReader(files: FilesApi, dir: string): ReftableStackReader {
   const tables = new Map<string, ReftableTable>();
   let cached: { list: string; view: ReftableView } | undefined;
@@ -101,7 +107,7 @@ export function createReftableStackReader(files: FilesApi, dir: string): Reftabl
             gone = true;
             break;
           }
-          table = parseReftable(bytes, name);
+          table = openReftable(bytes, name);
           tables.set(name, table);
         }
         loaded.push(table);
@@ -120,37 +126,73 @@ export function createReftableStackReader(files: FilesApi, dir: string): Reftabl
 }
 
 /**
- * The merged view of `tables`, oldest first: for each key the newest table's record.
+ * The merged view of `tables`, oldest first: for each key the newest table's record. Each
+ * call reads the tables lazily, under a budget of its own.
  */
 export function mergeReftables(tables: readonly ReftableTable[]): ReftableView {
-  const newest = new Map<string, ReftableRefRecord>();
-  const logsByRef = new Map<string, Map<number, ReftableLogRecord>>();
-  for (const table of tables) {
-    for (const ref of table.refs) newest.set(ref.name, ref);
-    for (const log of table.logs) {
-      let byIndex = logsByRef.get(log.refName);
-      if (!byIndex) {
-        byIndex = new Map();
-        logsByRef.set(log.refName, byIndex);
+  const getRef = (name: string): ReftableRefRecord | undefined => {
+    const budget = new ReftableReadBudget();
+    for (let i = tables.length - 1; i >= 0; i--) {
+      const record = (tables[i] as ReftableTable).getRef(name, budget);
+      if (record) return record.value.type === "deletion" ? undefined : record;
+    }
+    return undefined;
+  };
+
+  function* refs(prefix = ""): Generator<ReftableRefRecord> {
+    const budget = new ReftableReadBudget();
+    const iterators = tables.map((t) => t.refs(prefix, budget));
+    const heads = iterators.map((it) => it.next());
+    for (;;) {
+      // the smallest key; on equal keys the newest table's (scanned newest first)
+      let best: ReftableRefRecord | undefined;
+      for (let i = heads.length - 1; i >= 0; i--) {
+        const head = heads[i] as IteratorResult<ReftableRefRecord>;
+        if (head.done) continue;
+        if (!best || compareKeys(head.value.key, best.key) < 0) best = head.value;
       }
-      byIndex.set(log.updateIndex, log);
+      if (!best) return;
+      for (let i = 0; i < heads.length; i++) {
+        const head = heads[i] as IteratorResult<ReftableRefRecord>;
+        if (!head.done && compareKeys(head.value.key, best.key) === 0) {
+          heads[i] = (iterators[i] as Generator<ReftableRefRecord>).next();
+        }
+      }
+      if (best.value.type !== "deletion") yield best;
     }
   }
-  const refs = new Map<string, ReftableRefRecord>();
-  for (const [name, ref] of newest) if (ref.value.type !== "deletion") refs.set(name, ref);
-  const sortedRefs = [...refs.values()].sort((a, b) => compareKeys(a.key, b.key));
-  const logs = new Map<string, ReftableLogRecord[]>();
-  for (const [name, byIndex] of logsByRef) {
-    const entries = [...byIndex.values()]
-      .filter((log) => log.update !== undefined)
-      .sort((a, b) => b.updateIndex - a.updateIndex);
-    if (entries.length > 0) logs.set(name, entries);
+
+  function* logs(refName: string): Generator<ReftableLogRecord> {
+    const budget = new ReftableReadBudget();
+    const iterators = tables.map((t) => t.logHeads(refName, budget));
+    const heads = iterators.map((it) => it.next());
+    for (;;) {
+      // the newest update index; on equal ones the newest table's
+      let best: ReftableLogHead | undefined;
+      for (let i = heads.length - 1; i >= 0; i--) {
+        const head = heads[i] as IteratorResult<ReftableLogHead>;
+        if (head.done) continue;
+        if (!best || head.value.updateIndex > best.updateIndex) best = head.value;
+      }
+      if (!best) return;
+      // decoded before any iterator moves on; the records it hides never are
+      const update = best.deletion ? undefined : best.read();
+      const { refKey, updateIndex } = best;
+      for (let i = 0; i < heads.length; i++) {
+        const head = heads[i] as IteratorResult<ReftableLogHead>;
+        if (!head.done && head.value.updateIndex === updateIndex) {
+          heads[i] = (iterators[i] as Generator<ReftableLogHead>).next();
+        }
+      }
+      if (update) yield { refName: best.refName, refKey, updateIndex, update };
+    }
   }
+
   return {
     tables: tables.map((t) => t.name),
+    getRef,
     refs,
-    sortedRefs,
-    logsOf: (refName) => logs.get(refName) ?? [],
-    hasLogs: (refName) => logs.has(refName),
+    logs,
+    hasLogs: (refName) => !logs(refName).next().done,
   };
 }
