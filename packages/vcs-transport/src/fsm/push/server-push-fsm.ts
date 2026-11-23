@@ -43,6 +43,14 @@ import {
 } from "../../context/context-adapters.js";
 import type { RefStore } from "../../context/process-context.js";
 import type { ProtocolState } from "../../context/protocol-state.js";
+import {
+  checkReceivedPack,
+  checkUnpackedObjects,
+  connectivityFailureLines,
+  FetchCheckError,
+  ReceivedObjects,
+  type ReceivedObjectsFsck,
+} from "../../fetch-client/fetch-checks.js";
 import { isRefHidden, receivePackRefs } from "../../protocol/hidden-refs.js";
 import {
   formatOf,
@@ -472,13 +480,29 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const state = getState<ServerPushState>(ctx);
       try {
         if (state.packStream) {
+          // receive.fsckObjects: unpack-objects / index-pack `--strict`
+          const fsck = await receivePackConfig(ctx).fsckObjects?.();
+          const received = fsck ? new ReceivedObjects(formatOf(repository).rawLength) : undefined;
           // kept aside until the push is accepted (when the repository can quarantine)
           const { quarantine, ...result } = await repository.importPack(state.packStream, {
             quarantine: true,
+            ...(received ? { onObject: (id, type, entry) => received.add(id, type, entry) } : {}),
           });
           state.quarantine = quarantine;
           output.packResult = result;
           if (!quarantine) warnNoQuarantine(ctx, repository);
+          if (fsck && received) {
+            const refused = await fsckReceived(ctx, fsck, received, result.packId !== undefined);
+            if (refused !== undefined) {
+              // git: the child died; nothing it received is kept
+              await discardQuarantine(ctx);
+              state.unpackStatus = refused;
+              for (const cmd of state.pushCommands ?? []) {
+                if (cmd.result === "NOT_ATTEMPTED") reject(cmd, "unpacker error");
+              }
+              return "UNPACK_FAILED";
+            }
+          }
         }
         return "UNPACK_OK";
       } catch (e) {
@@ -544,6 +568,10 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         }
         if (shallowAllowed && theirs.size > 0) state.shallowConnectivity = conn;
         if (!failed) return "CONNECTIVITY_OK";
+        // check_connected's rev-list dies on the progress channel (its err_fd)
+        for (const line of await connectivityFailureLines(repository, conn, tips, [...known])) {
+          await sendMessage(ctx, line);
+        }
         return "CONNECTIVITY_FAILED";
       } catch (e) {
         return internalError(ctx, e);
@@ -880,6 +908,45 @@ interface ContextWithHooks extends ProcessContext {
  */
 function pushView(ctx: ProcessContext): RepositoryFacade {
   return getState<ServerPushState>(ctx).quarantine?.repository ?? getRepository(ctx);
+}
+
+/**
+ * The fsck of a push's objects (`receive.fsckObjects`), as the child git's receive-pack runs:
+ * unpack-objects `--strict` for a pack it unpacked, index-pack `--strict` for one it kept (git's
+ * choice by `receive.unpackLimit`; ours is the store's: a kept pack has a `packId`). Their
+ * messages (fsck errors and warnings, the death) reach the client on the progress channel.
+ * Returns the unpack status of a refused pack (`unpack-objects abnormal exit`, `index-pack
+ * abnormal exit`), undefined when it passed.
+ */
+async function fsckReceived(
+  ctx: ProcessContext,
+  fsck: ReceivedObjectsFsck,
+  received: ReceivedObjects,
+  kept: boolean,
+): Promise<string | undefined> {
+  const state = getState<ServerPushState>(ctx);
+  const repository = pushView(ctx);
+  // the child is given the client's shallow commits (receive-pack's --shallow-file)
+  const shallow = new Set(state.pushShallow ?? []);
+  try {
+    const messages = kept
+      ? (
+          await checkReceivedPack(repository, received, {
+            fsck,
+            links: true,
+            shallow,
+            kept,
+            tail: null,
+          })
+        ).messages
+      : await checkUnpackedObjects(repository, received, { fsck, shallow });
+    for (const line of messages) await sendMessage(ctx, line);
+    return undefined;
+  } catch (e) {
+    if (!(e instanceof FetchCheckError)) throw e;
+    for (const line of e.lines) await sendMessage(ctx, line);
+    return kept ? "index-pack abnormal exit" : "unpack-objects abnormal exit";
+  }
 }
 
 /** Publishes the quarantined objects into the repository (git's tmp_objdir_migrate). */

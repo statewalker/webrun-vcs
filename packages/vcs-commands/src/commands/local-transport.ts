@@ -6,6 +6,7 @@
  */
 
 import { historyWithoutLazyFetch, type RefTransactionHook } from "@statewalker/vcs-core";
+import { configFilesApiOf, readConfinedFile } from "@statewalker/vcs-store-files";
 import {
   createRepositoryFacade,
   createTransportRefStore,
@@ -25,8 +26,9 @@ import {
   type UploadPackConnection,
 } from "@statewalker/vcs-transport";
 import { parseGitBool, parseGitInt } from "@statewalker/vcs-utils/encoding";
-import type { FilesApi } from "@statewalker/vcs-utils/files";
+import { type FilesApi, readFile } from "@statewalker/vcs-utils/files";
 import {
+  type GitHostEnvironment,
   type LinkedWorktrees,
   type OpenedRepository,
   sparseFilterMatcher,
@@ -34,6 +36,7 @@ import {
 } from "@statewalker/vcs-working-tree";
 import { GitApiError, TransportError } from "../errors/index.js";
 import { quoteCStyleBody } from "../results/index.js";
+import { type ReceiveFsckSettings, receiveFsckOf } from "./fsck/index.js";
 import {
   HookSession,
   hookHostOf,
@@ -340,8 +343,17 @@ export async function withLocalReceivePack<T>(
    * output reaches the pushing user's stderr directly, not as "remote: " lines
    */
   transactionHooks: HookSession | undefined = hooks,
-  /** `protocol.version`: 1 has receive-pack answer `version 1` first (2 is v0 for a push) */
-  options: { protocolVersion?: 0 | 1 | 2 } = {},
+  /**
+   * `protocol.version`: 1 has receive-pack answer `version 1` first (2 is v0 for a push);
+   * `host`: where receive-pack runs ({@link ReceivePackHost}); `onWarning`: receive-pack's own
+   * warnings as it reads its config (`warning: skipping unknown msg id '<id>'`), which git's
+   * local transport shows on the pushing user's stderr
+   */
+  options: {
+    protocolVersion?: 0 | 1 | 2;
+    host?: ReceivePackHost;
+    onWarning?: (line: string) => void;
+  } = {},
 ): Promise<T> {
   // receive-pack's enter_repo(path, 0): a repository another user owns is refused (git's
   // die_upon_dubious_ownership in the child), and the client sees the connection fail
@@ -357,7 +369,7 @@ export async function withLocalReceivePack<T>(
   // the remote's reference-transaction hook on its ref store while receive-pack runs (its
   // output goes to the pushing user's stderr directly, not through the side-band)
   return withReceiveTransactionHook(remote, transactionHooks, () =>
-    receiveOver(remote, run, hooks, receiveHooks, options.protocolVersion === 1),
+    receiveOver(remote, run, hooks, receiveHooks, options.protocolVersion === 1, options),
   );
 }
 
@@ -414,11 +426,83 @@ export async function withReceiveTransactionHook<T>(
   }
 }
 
+/** Where receive-pack runs: what it reads besides the served repository. */
+export interface ReceivePackHost {
+  /** The host environment (absolute and `~/` skip lists, `$HOME`) */
+  environment?: GitHostEnvironment;
+  /** Whose messages to give where git 2.43 and 2.5x differ (default 2.5x) */
+  compatibility?: "2.43" | "2.56";
+  /**
+   * The repository is someone else's (served): files its configuration names (a
+   * `receive.fsck.skipList`) are read only inside its own git directories, as confined
+   * includes (`configIncludes: "files"`), never from the host; a local push into one's own
+   * repository reads them as git does
+   */
+  confineFiles?: boolean;
+}
+
+/**
+ * receive-pack's `receive.fsckObjects` / `transfer.fsckObjects` settings of the repository it
+ * serves (`receiveFsckOf`): skip lists named by a relative path are read from its git
+ * directory (receive-pack's working directory), absolute ones from the host; with
+ * `confineFiles` (a served repository) only files inside its own git directories, where their
+ * links lead and capped as confined includes (`readConfinedFile`), anything else unreadable.
+ */
+export function receiveFsckSettingsOf(
+  remote: OpenedRepository,
+  host: ReceivePackHost = {},
+): ReceiveFsckSettings {
+  const config = remote.config;
+  if (!config) return { warnings: [] };
+  const gitDir = remote.gitDir.replace(/^\/+/, "").replace(/\/+$/, "");
+  const files = remote.files;
+  const environment = host.environment;
+  const listWithOrigin = config.listWithOrigin?.bind(config);
+  // receive-pack runs in the git directory: git names its files from there (`config`)
+  const entries = () =>
+    listWithOrigin
+      ? listWithOrigin().map((e) =>
+          e.file?.replace(/^\/+/, "").startsWith(`${gitDir}/`)
+            ? { ...e, file: e.file.replace(/^\/+/, "").slice(gitDir.length + 1) }
+            : e,
+        )
+      : config.list();
+  if (host.confineFiles) {
+    // a served repository's skip list: only its own files, where their links lead, capped
+    const roots = [gitDir];
+    const common = remote.commonDir?.replace(/^\/+/, "").replace(/\/+$/, "");
+    if (common !== undefined && common !== gitDir) roots.push(common);
+    const confined = files ? configFilesApiOf(files) : undefined;
+    return receiveFsckOf({
+      entries,
+      compatibility: host.compatibility ?? "2.56",
+      readFile: async (path) =>
+        confined
+          ? readConfinedFile(confined, path, { baseDir: gitDir, roots }).catch(() => undefined)
+          : undefined,
+    });
+  }
+  return receiveFsckOf({
+    entries,
+    compatibility: host.compatibility ?? "2.56",
+    ...(environment?.home ? { home: environment.home } : {}),
+    readFile: async (path) => {
+      if (path.startsWith("/") && environment) return environment.readFile(path);
+      if (!files) return undefined;
+      const full = path.startsWith("/") ? path : `${gitDir}/${path}`;
+      // a missing file reads as no bytes in some FilesApis: ask first
+      if ((await files.stats(full).catch(() => undefined))?.kind !== "file") return undefined;
+      return readFile(files, full);
+    },
+  });
+}
+
 /**
  * The settings git's receive-pack takes from the repository it serves: the policies and hidden
  * refs of its config (`serverSettingsFromConfig`), its current branch and the branches its
- * worktrees have checked out, `updateInstead` (push-to-checkout, push-to-deploy), and, with
- * hooks, pre-receive / update / post-receive run as git's receive-pack runs them.
+ * worktrees have checked out, `updateInstead` (push-to-checkout, push-to-deploy), the fsck of
+ * pushed objects (`receive.fsckObjects`, {@link receiveFsckSettingsOf}) and, with hooks,
+ * pre-receive / update / post-receive run as git's receive-pack runs them.
  */
 export async function receivePackSettingsOf(
   remote: OpenedRepository,
@@ -426,9 +510,15 @@ export async function receivePackSettingsOf(
   receiveHooks: ReceivePackHooks | undefined = hooks?.enabled
     ? scriptReceiveHooks(hooks)
     : undefined,
+  host: ReceivePackHost = {},
 ): Promise<GitServeSettings> {
   const head = await remote.history.refs.get("HEAD").catch(() => undefined);
   const settings = serverSettingsOf(remote);
+  const fsck = receiveFsckSettingsOf(remote, {
+    compatibility: hooks?.compatibility,
+    ...host,
+  });
+  const configError = settings.receivePackConfigError ?? fsck.configError;
   const checkedOut = await checkedOutBranches(remote.worktrees);
   const worktrees = remote.worktrees;
   return {
@@ -448,9 +538,9 @@ export async function receivePackSettingsOf(
     preReceiveSeesRefused: true,
     // receive.procReceiveRefs: the commands the proc-receive hook takes
     ...(settings.procReceiveRefs?.length ? { procReceiveRefs: settings.procReceiveRefs } : {}),
-    ...(settings.receivePackConfigError !== undefined
-      ? { receivePackConfigError: settings.receivePackConfigError }
-      : {}),
+    ...(configError !== undefined ? { receivePackConfigError: configError } : {}),
+    // receive.fsckObjects: unpack-objects / index-pack --strict
+    ...(fsck.fsckObjects ? { fsckObjects: fsck.fsckObjects } : {}),
     // git 2.5x updates the refs of a push that is not atomic in two batches
     ...(hooks?.enabled && hooks.compatibility !== "2.43" ? { batchNonAtomic: true } : {}),
     // ... git 2.43 updates each ref after its update hook
@@ -473,9 +563,15 @@ async function receiveOver<T>(
   hooks: HookSession | undefined,
   receiveHooks: ReceivePackHooks | undefined,
   version1: boolean,
+  options: { host?: ReceivePackHost; onWarning?: (line: string) => void } = {},
 ): Promise<T> {
   const [client, server] = createDuplexPair();
-  const settings = await receivePackSettingsOf(remote, hooks, receiveHooks);
+  const host = options.host ?? {};
+  const settings = await receivePackSettingsOf(remote, hooks, receiveHooks, host);
+  // receive-pack's warnings as it reads its config, on the shared stderr
+  if (options.onWarning) {
+    for (const line of receiveFsckSettingsOf(remote, host).warnings) options.onWarning(line);
+  }
   const serving = serveOverDuplex({
     ...settings,
     duplex: server,
