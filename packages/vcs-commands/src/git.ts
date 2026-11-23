@@ -37,6 +37,7 @@ import {
   HookListCommand,
   HookRunCommand,
   InitCommand,
+  InterpretTrailersCommand,
   ListBranchCommand,
   ListTagCommand,
   LogCommand,
@@ -759,6 +760,21 @@ export class Git implements Disposable {
   verifyPack(): VerifyPackCommand {
     this.checkClosed();
     return new VerifyPackCommand(this._workingCopy);
+  }
+
+  /**
+   * Create an InterpretTrailersCommand that adds or parses the trailers of a message
+   * (`git interpret-trailers`), with the `trailer.*` configuration.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.interpretTrailers().setInput("Fix\n").addTrailer("Acked-by: A").call();
+   * // "Fix\n\nAcked-by: A\n"
+   * ```
+   */
+  interpretTrailers(): InterpretTrailersCommand {
+    this.checkClosed();
+    return new InterpretTrailersCommand(this._workingCopy);
   }
 
   /**
