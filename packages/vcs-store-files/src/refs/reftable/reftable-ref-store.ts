@@ -61,6 +61,7 @@ import {
   ReflogEntryNotFoundError,
   RefStorage,
   RefTransactionAbortedError,
+  reflogInChain,
   symrefReflogWrites,
 } from "@statewalker/vcs-core";
 import { atomicFilesOver, joinPath } from "@statewalker/vcs-utils/files";
@@ -1000,7 +1001,9 @@ export class ReftableRefStore implements Refs {
         const at = this.stackFor(also);
         if (!at) continue;
         const atView = tx.addition(at.stack).view;
-        if (!this.shouldLog(at.name, atView, false)) continue;
+        // REF_FORCE_CREATE_REFLOG reaches the symbolic refs on the way, not HEAD-also
+        const force = o.createReflog === true && reflogInChain(u, also);
+        if (!this.shouldLog(at.name, atView, force)) continue;
         tx.log(at.stack, this.logLine(at.name, tx.addition(at.stack).nextUpdateIndex, line));
       }
     }

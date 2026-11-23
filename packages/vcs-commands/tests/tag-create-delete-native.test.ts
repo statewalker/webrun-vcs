@@ -133,7 +133,7 @@ interface Case {
   /** [major, minor] native git must be at least */
   since?: [number, number];
   /** A script run in both copies first */
-  before?: string;
+  before?: string | ((backend: Backend) => string);
 }
 
 type Backend = "files" | "reftable";
@@ -235,12 +235,17 @@ function filesUnder(dir: string, prefix = ""): Record<string, string> {
 
 /** What a case leaves: refs, reflogs (as the files backend writes them), TAG_EDITMSG, objects. */
 function snapshot(dir: string, backend: Backend) {
-  const refs = gitOk(dir, ["for-each-ref", "--format=%(refname) %(objectname) %(*objectname)"]);
+  const refs = gitOk(dir, [
+    "for-each-ref",
+    "--format=%(refname) %(objectname) %(*objectname) %(symref)",
+  ]);
   let logsDir = join(dir, ".git", "logs");
   let migrated: string | undefined;
   if (backend === "reftable") {
     migrated = mkdtempSync(join(root, "migrated-"));
     cpSync(dir, migrated, { recursive: true });
+    // a case's own lock (a held ref store) would stop the migration
+    rmSync(join(migrated, ".git", "reftable", "tables.list.lock"), { force: true });
     gitOk(migrated, ["refs", "migrate", "--ref-format=files"]);
     logsDir = join(migrated, ".git", "logs");
   }
@@ -275,8 +280,9 @@ async function twin(base: string, backend: Backend, c: Case): Promise<void> {
   cpSync(base, ours, { recursive: true });
   try {
     if (c.before) {
-      sh(native, c.before);
-      sh(ours, c.before);
+      const before = typeof c.before === "string" ? c.before : c.before(backend);
+      sh(native, before);
+      sh(ours, before);
     }
     const seenFile = join(root, "seen.txt");
     rmSync(seenFile, { force: true });
@@ -290,6 +296,9 @@ async function twin(base: string, backend: Backend, c: Case): Promise<void> {
       expected.status,
     );
     expect(actual.stdout, `${label} (stdout)`).toBe(expected.stdout);
+    // a lock file is named by its path: each copy's own
+    expected.stderr = expected.stderr.replaceAll(native, "<repo>");
+    actual.stderr = actual.stderr.replaceAll(ours, "<repo>");
     if (c.editor === "fail") {
       // git names the editor first (`error: there was a problem with the editor 'false'`)
       expect(expected.stderr.endsWith(actual.stderr), `${label} (stderr)`).toBe(true);
@@ -350,6 +359,14 @@ test_tick`;
       { args: ["-f", "-m", "new annotation", "annotated"] },
       { args: ["-f", "-m", "of a tree", "annotated", "HEAD^{tree}"] },
       { args: ["-f", "annotated"] },
+      // a symbolic tag ref: -f updates the ref it points to (no REF_NO_DEREF), as git
+      { args: ["-f", "s", "HEAD~1"], before: "git symbolic-ref refs/tags/s refs/heads/main" },
+      {
+        args: ["-f", "--create-reflog", "s", "HEAD~1"],
+        before: "git symbolic-ref refs/tags/s refs/heads/main",
+      },
+      { args: ["-f", "s", "HEAD~1"], before: "git symbolic-ref refs/tags/s refs/tags/mytag" },
+      { args: ["s", "HEAD~1"], before: "git symbolic-ref refs/tags/s refs/tags/mytag" },
       // a tag of a tag: git's nested-tag advice
       { args: ["-m", "nested", "nest", "annotated"] },
       { args: ["-f", "-m", "nested", "mytag", "annotated"] },
@@ -393,6 +410,22 @@ test_tick`;
       { args: ["-d", "refs/tags/mytag"] },
       // packed tags
       { args: ["-d", "mytag", "annotated"], before: "git pack-refs --all" },
+      // a ref locked by another process: git 2.5x deletes none (one transaction), 2.43
+      // each it can; the lock file's path is each copy's own
+      {
+        args: ["-d", "mytag", "annotated", "nope"],
+        before: (b) =>
+          b === "files"
+            ? "touch .git/refs/tags/annotated.lock"
+            : "touch .git/reftable/tables.list.lock",
+      },
+      {
+        args: ["-d", "annotated"],
+        before: (b) =>
+          b === "files"
+            ? "touch .git/refs/tags/annotated.lock"
+            : "touch .git/reftable/tables.list.lock",
+      },
       // reflogs go with their tags
       { args: ["-d", "logged"], before: "git tag --create-reflog logged" },
     ];

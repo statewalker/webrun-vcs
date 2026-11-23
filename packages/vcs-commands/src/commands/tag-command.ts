@@ -505,7 +505,8 @@ export class TagCommand extends GitCommand<Ref> {
     );
     // one transaction: the tag from the value read (none, or `prev` under -f)
     const result = await this.refsStore.batch(
-      [{ name: refName, old: prev ?? null, new: tagObjectId, noDeref: true }],
+      // no REF_NO_DEREF: a symbolic tag ref is updated through (git moves what it names)
+      [{ name: refName, old: prev ?? null, new: tagObjectId }],
       { ...this.reflogLine(log), ...(this.createReflog ? { createReflog: true } : {}) },
     );
     if (!result.ok) {
@@ -744,9 +745,15 @@ export class DeleteTagCommand extends GitCommand<string[]> {
       errors.push(...lines);
       failure = new GitApiError(lines.join("\n"), { exitCode: 1 });
     } else if (names.length > 0) {
-      const outcome = await this.removeRefsAsGit(names);
+      const outcome = await this.removeRefsAsGit(names, undefined, compatibility === "2.43");
       removed = outcome.removed;
-      if (outcome.error !== undefined) throw outcome.error;
+      if (outcome.error !== undefined) {
+        // delete_tags reports the failure and goes on to print what was deleted (exit 1)
+        const failed = names.filter((n) => !removed.includes(n));
+        const lines = await this.deleteFailureLines(outcome.error, names, failed, compatibility);
+        errors.push(...lines);
+        failure = new GitApiError(lines.join("\n"), { exitCode: 1, cause: outcome.error });
+      }
     }
 
     let output = "";
@@ -761,6 +768,63 @@ export class DeleteTagCommand extends GitCommand<string[]> {
       refusals,
       ...(failure ? { failure } : {}),
     };
+  }
+
+  /**
+   * git's lines for a failed refs_delete_refs: 2.5x's one transaction (`could not delete
+   * references: <why>`, `reference <ref>: <why>` for one ref; the files backend's lock
+   * message names the lock file, reftable's says `cannot lock references`), or 2.43's
+   * files_delete_refs, which deletes each ref on its own (`cannot lock ref` with lockfile.c's
+   * longer advice, then `could not remove reference <ref>`, per ref it could not delete).
+   */
+  private async deleteFailureLines(
+    error: unknown,
+    names: string[],
+    failed: string[],
+    compatibility: "2.43" | "2.56",
+  ): Promise<string[]> {
+    const rejected = (error as { rejected?: { name: string; reason: string }[] }).rejected;
+    const locked = rejected?.find((r) => r.reason === "locked")?.name;
+    const reftable =
+      RemoteConfigStore.from(this.workingCopy).value("extensions.refStorage")?.toLowerCase() ===
+      "reftable";
+    const gitDir = (await this.hooks.hostGitDir({ real: false }).catch(() => undefined))?.replace(
+      /\/+$/,
+      "",
+    );
+    const lockText = (ref: string, legacy: boolean) =>
+      [
+        `cannot lock ref '${ref}': Unable to create '${gitDir ?? ".git"}/${ref}.lock': File exists.`,
+        "",
+        ...(legacy
+          ? [
+              "Another git process seems to be running in this repository, e.g.",
+              "an editor opened by 'git commit'. Please make sure all processes",
+              "are terminated then try again. If it still fails, a git process",
+              "may have crashed in this repository earlier:",
+              "remove the file manually to continue.",
+            ]
+          : [
+              "Another git process seems to be running in this repository, or the lock file may be stale",
+            ]),
+      ].join("\n");
+    const message = error instanceof Error ? error.message : String(error);
+    if (compatibility === "2.43" && !reftable) {
+      const lines: string[] = [];
+      for (const ref of failed) {
+        if (locked !== undefined) lines.push(`error: ${lockText(ref, true)}`);
+        lines.push(`error: could not remove reference ${ref}`);
+      }
+      return lines.length > 0 ? lines : [`error: ${message}`];
+    }
+    const why =
+      locked === undefined
+        ? message
+        : reftable
+          ? "cannot lock references"
+          : lockText(locked, false);
+    const what = names.length === 1 ? `reference ${names[0]}` : "references";
+    return [`error: could not delete ${what}: ${why}`];
   }
 }
 

@@ -877,13 +877,15 @@ export abstract class GitCommand<T> {
   protected async removeRefsAsGit(
     names: string[],
     message?: string,
+    /** As git 2.43 (default: the hooks' compatibility is 2.43) */
+    legacy = this.hooks.compatibility === "2.43",
   ): Promise<{ removed: string[]; error?: unknown }> {
     const refs = this.refsStore;
     let error: unknown;
     try {
       if (refs.removeAll) {
         await refs.removeAll(names, {
-          legacy: this.hooks.compatibility === "2.43",
+          legacy,
           ...(message !== undefined ? { message } : {}),
         });
       } else {
