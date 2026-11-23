@@ -8,6 +8,7 @@ export {
   defaultFetchRefspec,
   type LegacyRemote,
   listRemoteNames,
+  type RemoteChoice,
   type RemoteConfig,
   RemoteConfigStore,
   setLegacyRemote,

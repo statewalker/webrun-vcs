@@ -173,6 +173,54 @@ describeGit("push without a remote (native git)", () => {
     expect(r.ourReceived).toEqual([]);
   });
 
+  it("takes a URL or path in branch.<name>.pushRemote, as git takes any explicit name", async () => {
+    const r = await pushBoth((dir, add) => {
+      add("origin");
+      add("other");
+      // the configured value is a path, no remote of that name: remote_get adds a URL alias
+      git(dir, "config", "branch.main.pushRemote", `../${dir.slice(root.length + 1)}-other.git`);
+    });
+    expect(r.native.status).toBe(0);
+    expect(r.error).toBeUndefined();
+    expect(r.nativeReceived).toEqual(["other"]);
+    expect(r.ourReceived).toEqual(r.nativeReceived);
+  });
+
+  it("takes a path in remote.pushDefault and branch.<name>.remote", async () => {
+    for (const key of ["remote.pushDefault", "branch.main.remote"]) {
+      const r = await pushBoth((dir, add) => {
+        add("origin");
+        add("third");
+        git(dir, "config", key, `../${dir.slice(root.length + 1)}-third.git`);
+      });
+      expect(r.native.status).toBe(0);
+      expect(r.error).toBeUndefined();
+      expect(r.nativeReceived).toEqual(["third"]);
+      expect(r.ourReceived).toEqual(r.nativeReceived);
+    }
+  });
+
+  it("pushes to the repository itself for branch.<name>.remote = . (git branch --track)", async () => {
+    const n = `n${counter}`;
+    const o = `o${counter}`;
+    counter++;
+    for (const name of [n, o]) {
+      build(name, (dir, add) => {
+        add("origin");
+        git(dir, "config", "branch.main.remote", ".");
+        // push.default=current pushes main onto main of `.`: up to date
+      });
+    }
+    const native = gitRun(root, join(root, n), ["push", "--porcelain"]);
+    expect(native.status).toBe(0);
+    const result = await (await ours(o)).push().call();
+    expect(result.remoteUpdates.map((u) => `${u.remoteName} ${u.status}`)).toEqual([
+      "refs/heads/main up-to-date",
+    ]);
+    expect(received(n)).toEqual([]);
+    expect(received(o)).toEqual([]);
+  });
+
   it("an explicit remote still wins over every setting", async () => {
     const n = `n${counter}`;
     counter++;

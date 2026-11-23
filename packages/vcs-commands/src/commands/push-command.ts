@@ -121,6 +121,8 @@ export class PushCommand extends TransportCommand<PushResult> {
   /** The remote, once set or resolved in `call` (git's `pushremote_for_branch`) */
   private remote = "origin";
   private remoteGiven = false;
+  /** Whether the remote was set or came from the configuration (git's `explicit`) */
+  private remoteExplicit = false;
   private refSpecs: string[] = [];
   private force = false;
   private atomic = false;
@@ -158,6 +160,7 @@ export class PushCommand extends TransportCommand<PushResult> {
     this.checkCallable();
     this.remote = remote;
     this.remoteGiven = true;
+    this.remoteExplicit = true;
     return this;
   }
 
@@ -439,15 +442,18 @@ export class PushCommand extends TransportCommand<PushResult> {
     if (!this.remoteGiven) {
       const ref = await this.getCurrentBranch();
       const branch = ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : undefined;
-      this.remote = RemoteConfigStore.from(this.workingCopy).pushRemoteForBranch(branch);
+      const choice = RemoteConfigStore.from(this.workingCopy).pushRemoteChoiceForBranch(branch);
+      this.remote = choice.name;
+      this.remoteExplicit = choice.explicit;
     }
     // pushremote_get: a remote the configuration gives no URL may come from .git/remotes/ or
     // .git/branches/ (git 2.x)
     const legacyWarnings = await this.loadLegacyRemote(this.remote);
     const warnings = legacyWarnings.length > 0 ? { warnings: legacyWarnings } : {};
-    // git's push.c: a remote chosen by default must be configured (remote_get(NULL) gives no
-    // remote otherwise), where a name given is also tried as a path or URL
-    if (!this.remoteGiven && !RemoteConfigStore.from(this.workingCopy).isConfigured(this.remote)) {
+    // git's push.c: a fallback remote (the one configured, origin) must be configured
+    // (remote_get(NULL) gives no remote otherwise); a name given or taken from the
+    // configuration is also tried as a URL or path (remotes_remote_get_1's add_url_alias)
+    if (!this.remoteExplicit && !RemoteConfigStore.from(this.workingCopy).isConfigured(this.remote)) {
       throw new InvalidRemoteError(
         this.remote,
         "No configured push destination.\nEither specify the URL from the command-line or " +
