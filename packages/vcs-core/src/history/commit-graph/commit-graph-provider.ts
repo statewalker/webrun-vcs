@@ -9,6 +9,7 @@
 
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import { joinPath } from "@statewalker/vcs-utils/files";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 
 import type { Refs } from "../refs/refs.js";
 import type { CommitGraph } from "./commit-graph.js";
@@ -28,6 +29,11 @@ export interface CommitGraphSettings {
   changedPathsVersion: number;
   /** `core.useReplaceRefs` (default true; false also for GIT_NO_REPLACE_OBJECTS) */
   useReplaceRefs: boolean;
+  /**
+   * The repository's object format (default SHA-1): the graph's hash version and id width,
+   * and the ids of replace refs and grafts
+   */
+  objectFormat?: ObjectFormat;
 }
 
 /** git's defaults. */
@@ -119,10 +125,21 @@ export interface CommitGraphRepository {
    * `info/grafts`.
    */
   readGraftFile?: () => Promise<string | undefined>;
+  /** The repository's object format (default SHA-1): replace refs and grafts name its ids */
+  objectFormat?: ObjectFormat;
 }
 
-const OID40 = /^[0-9a-fA-F]{40}/;
-const GRAFT_LINE = /^[0-9a-fA-F]{40}(\s[0-9a-fA-F]{40})*$/;
+/** A replace ref's name and a graft line, of ids `hexLength` digits long (git's get_oid_hex). */
+const ID_PATTERNS = {
+  40: {
+    replaceRef: /^[0-9a-fA-F]{40}/,
+    graftLine: /^[0-9a-fA-F]{40}(\s[0-9a-fA-F]{40})*$/,
+  },
+  64: {
+    replaceRef: /^[0-9a-fA-F]{64}/,
+    graftLine: /^[0-9a-fA-F]{64}(\s[0-9a-fA-F]{64})*$/,
+  },
+} as const;
 
 /**
  * git's commit_graph_compatible: false with replace refs (`refs/replace/<id>`, unless replace
@@ -136,9 +153,10 @@ const GRAFT_LINE = /^[0-9a-fA-F]{40}(\s[0-9a-fA-F]{40})*$/;
  */
 export async function commitGraphCompatible(repo: CommitGraphRepository): Promise<boolean> {
   const { files, gitDir } = repo;
+  const patterns = ID_PATTERNS[repo.objectFormat?.hexLength ?? 40];
   if ((repo.useReplaceRefs ?? true) && repo.refs) {
     for await (const ref of repo.refs.list("refs/replace/")) {
-      if (OID40.test(ref.name.slice("refs/replace/".length))) return false;
+      if (patterns.replaceRef.test(ref.name.slice("refs/replace/".length))) return false;
     }
   }
   const grafts = repo.readGraftFile
@@ -150,7 +168,7 @@ export async function commitGraphCompatible(repo: CommitGraphRepository): Promis
     for (const raw of grafts.split("\n")) {
       const line = raw.trimEnd();
       if (line === "" || line.startsWith("#")) continue;
-      if (GRAFT_LINE.test(line)) return false;
+      if (patterns.graftLine.test(line)) return false;
     }
   }
   if ((await files.stats(joinPath(gitDir, "shallow")))?.kind === "file") return false;
@@ -189,7 +207,13 @@ export async function loadRepositoryCommitGraph(
 ): Promise<CommitGraph | undefined> {
   const settings = { ...DEFAULT_COMMIT_GRAPH_SETTINGS, ...options.settings };
   if (!settings.enabled) return undefined;
-  if (!(await commitGraphCompatible({ ...options, useReplaceRefs: settings.useReplaceRefs }))) {
+  if (
+    !(await commitGraphCompatible({
+      ...options,
+      useReplaceRefs: settings.useReplaceRefs,
+      ...(settings.objectFormat ? { objectFormat: settings.objectFormat } : {}),
+    }))
+  ) {
     return undefined;
   }
   const objectsDir = options.objectsDir ?? joinPath(options.gitDir, "objects");

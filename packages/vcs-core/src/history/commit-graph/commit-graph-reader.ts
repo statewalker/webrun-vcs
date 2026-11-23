@@ -9,13 +9,13 @@
 
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import { joinPath, readFile } from "@statewalker/vcs-utils/files";
+import { SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 
 import { CommitGraph } from "./commit-graph.js";
 import {
   type CommitGraphDiagnostic,
   type CommitGraphLayer,
   type CommitGraphReadSettings,
-  HASH_SIZE,
   parseCommitGraphLayer,
 } from "./commit-graph-format.js";
 
@@ -61,7 +61,8 @@ export interface CommitGraphReadResult {
   files: string[];
 }
 
-const HEX40 = /^[0-9a-f]{40}/;
+/** A chain line's hash of `hexLength` digits (git's get_oid_hex: the format's `hexsz`). */
+const CHAIN_LINE = { 40: /^[0-9a-f]{40}/, 64: /^[0-9a-f]{64}/ } as const;
 
 /**
  * Reads the commit-graph of the object directory `objectsDir` (a path within `files`).
@@ -118,14 +119,16 @@ async function readChain(
   const content = await readGraphFile(files, chainPath);
   const none = { opened: "none" as const, incompleteChain: false, files: [] };
   if (!content) return none;
-  if (content.length < 2 * HASH_SIZE) {
+  const format = settings.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const hexLength = format.hexLength;
+  if (content.length < hexLength) {
     // an empty chain file is the same as none
     if (content.length > 0) {
       diagnostics.push({ level: "warning", message: "commit-graph chain file too small" });
     }
     return none;
   }
-  const count = Math.floor(content.length / (2 * HASH_SIZE + 1));
+  const count = Math.floor(content.length / (hexLength + 1));
   const lines = new TextDecoder().decode(content).split("\n");
   const layers: CommitGraphLayer[] = [];
   const paths: string[] = [];
@@ -134,7 +137,7 @@ async function readChain(
   for (let i = 0; i < count && i < lines.length; i++) {
     const line = lines[i] as string;
     if (i === lines.length - 1 && line === "") break;
-    if (!HEX40.test(line)) {
+    if (!CHAIN_LINE[hexLength].test(line)) {
       diagnostics.push({
         level: "warning",
         message: `invalid commit-graph chain: line '${line}' not a hash`,
@@ -142,7 +145,8 @@ async function readChain(
       valid = false;
       break;
     }
-    hashes.push(line.slice(0, 2 * HASH_SIZE));
+    const hash = line.slice(0, hexLength);
+    hashes.push(hash);
     // the first object directory whose layer of that name loads holds it
     let layer: CommitGraphLayer | undefined;
     let path = "";
@@ -183,15 +187,16 @@ function addToChain(
     return false;
   }
   const baseSize = layer.baseGraphs?.size ?? 0;
-  if (Math.floor(baseSize / HASH_SIZE) < n) {
+  const hashSize = layer.hashSize;
+  if (Math.floor(baseSize / hashSize) < n) {
     diagnostics.push({ level: "warning", message: "commit-graph base graphs chunk is too small" });
     return false;
   }
   for (let k = n - 1; k >= 0; k--) {
     const below = chain[k] as CommitGraphLayer;
-    const at = (layer.baseGraphs?.offset ?? 0) + HASH_SIZE * k;
+    const at = (layer.baseGraphs?.offset ?? 0) + hashSize * k;
     let named = "";
-    for (let b = 0; b < HASH_SIZE; b++) {
+    for (let b = 0; b < hashSize; b++) {
       named += (layer.bytes[at + b] as number).toString(16).padStart(2, "0");
     }
     if (hashes[k] !== below.hash || named !== below.hash) {

@@ -10,7 +10,6 @@ import {
   graftFileBaseDir,
   graftFileReader,
   joinPath,
-  objectFormatOf,
   objectsWithoutLazyFetch,
   parsePackMtimes,
   sweepPackTemporaries,
@@ -19,11 +18,7 @@ import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { assertAlternatesReadable } from "./alternates/index.js";
-import {
-  readCommitGraphSettings,
-  removeCommitGraphFiles,
-  writeCommitGraph,
-} from "./commit-graph.js";
+import { readCommitGraphSettings, writeCommitGraph } from "./commit-graph.js";
 import { objectLinks } from "./cruft-pack.js";
 import { looseFileNamePattern, objectIdPattern, packFilePattern } from "./object-names.js";
 import { configBool, parseConfigSize } from "./pack/delta-base-cache-limit.js";
@@ -435,15 +430,6 @@ async function collect(options: GcOptions): Promise<GcResult> {
     if (compatibility === "2.43") await otherTasks();
     // clean_pack_garbage: a lone .idx and the files beside it
     const removedPackGarbage = dryRun ? 0 : await cleanPackGarbage(files, objectsDir);
-    // a SHA-256 repository's graph cannot be rewritten yet: one naming objects this gc
-    // removed would leave git's fsck failing ("Could not read"); it goes, git rebuilds it
-    if (
-      !dryRun &&
-      format.objectFormat.name !== "sha1" &&
-      (partial.repack !== null || partial.removedObjects > 0)
-    ) {
-      await removeCommitGraphFiles(files, objectsDir);
-    }
     const commitGraph = await gcCommitGraph(options, objects);
     const after =
       storageBefore && packs
@@ -943,11 +929,6 @@ async function gcCommitGraph(
   const { history, files, gitDir = ".git", environment } = options;
   if (options.dryRun) return { commitGraphWritten: false };
   try {
-    // a SHA-256 repository's commit-graph is not written yet: skipped unless asked for (then
-    // writeCommitGraph's UnsupportedObjectFormatError is the reported error)
-    if (objectFormatOf(objects).name !== "sha1" && options.writeCommitGraph !== true) {
-      return { commitGraphWritten: false };
-    }
     const enabled =
       options.writeCommitGraph ??
       (await readCommitGraphSettings(files, gitDir, { environment })).gcWriteCommitGraph;

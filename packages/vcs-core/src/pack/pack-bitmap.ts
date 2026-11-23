@@ -8,10 +8,14 @@
  *  - four EWAH bitmaps of the objects of each type (commits, trees, blobs, tags);
  *  - one entry per selected commit: its position in the idx, an XOR offset (the entry's
  *    bitmap is stored XORed with the one that many entries before it), flags, the bitmap;
- *  - optional sections at the end, before the trailing SHA-1: pseudo-merges (skipped: their
+ *  - optional sections at the end, before the trailing hash: pseudo-merges (skipped: their
  *    commits are read as if absent), the lookup table (entries are read in order anyway, which
  *    gives the same bitmaps) and the name-hash cache (one 32-bit path hash per object, in idx
  *    order).
+ *
+ * The pack checksum in the header and the trailing hash are the repository's object format's
+ * (`rawLength` bytes; SHA-256 in a SHA-256 repository): the header is 12 bytes plus that width.
+ * The pack's format (`BitmapPack.objectFormat`, SHA-1 when absent) decides, never the file.
  *
  * Bit `n` stands for the `n`-th object of the pack in pack order (by offset), which comes from
  * the pack's reverse index (`PackFile.packOrder`, computed from the idx's offsets).
@@ -26,7 +30,7 @@
  * mark objects outside the pack.
  */
 import { EwahBitmap } from "@statewalker/vcs-utils";
-import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
@@ -37,14 +41,19 @@ export const BITMAP_OPT_LOOKUP_TABLE = 0x10;
 export const BITMAP_OPT_PSEUDO_MERGES = 0x20;
 /** git's MAX_XOR_OFFSET: an entry is XORed with one of the 160 before it at most. */
 export const MAX_BITMAP_XOR_OFFSET = 160;
-const HEADER_SIZE = 32;
-const HASH_SIZE = 20;
+/** The header before the pack checksum: `BITM`, version, options, entry count. */
+const HEADER_FIXED = 12;
 const LOOKUP_TRIPLET = 16;
 
 /** What a bitmap needs of its pack: the idx order, the pack order, lookups. */
 export interface BitmapPack {
   readonly packId: string;
   readonly count: number;
+  /**
+   * The object format of the pack's repository (SHA-1 when absent): the width of the bitmap's
+   * pack checksum and trailer, and the hash of the trailer
+   */
+  readonly objectFormat?: ObjectFormat;
   /** For each entry in pack order, its idx position. */
   packOrder(): Uint32Array;
   idAt(i: number): ObjectId;
@@ -108,6 +117,9 @@ export interface PackBitmapIndex {
  * ```
  */
 export function parsePackBitmap(bytes: Uint8Array, pack: BitmapPack, path = ""): PackBitmapIndex {
+  const format = pack.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const HASH_SIZE = format.rawLength;
+  const HEADER_SIZE = HEADER_FIXED + HASH_SIZE;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const size = bytes.length;
   if (size < HEADER_SIZE + HASH_SIZE)
@@ -119,12 +131,13 @@ export function parsePackBitmap(bytes: Uint8Array, pack: BitmapPack, path = ""):
     throw new PackBitmapError(`unsupported version '${version}' for bitmap index file`);
   const options = view.getUint16(6);
   const entryCount = view.getUint32(8);
-  const packChecksum = bytesToHex(bytes.subarray(12, 32));
+  const packChecksum = bytesToHex(bytes.subarray(HEADER_FIXED, HEADER_SIZE));
   if ((options & BITMAP_OPT_FULL_DAG) === 0)
     throw new PackBitmapError(
       "unsupported options for bitmap index file (Git requires BITMAP_OPT_FULL_DAG)",
     );
-  const sum = createSha1()
+  const sum = format
+    .createHasher()
     .update(bytes.subarray(0, size - HASH_SIZE))
     .digest();
   for (let i = 0; i < HASH_SIZE; i++) {

@@ -3,6 +3,7 @@
  * read them, without the commit-graph: what the writer stores and `verify` compares against.
  */
 
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 
 import type { ObjectId } from "../../common/id/index.js";
@@ -20,9 +21,6 @@ export class CommitParseError extends Error {
   override name = "CommitParseError";
 }
 
-const TREE_ENTRY_LEN = 45; // "tree " + 40 hex
-const PARENT_ENTRY_LEN = 47; // "parent " + 40 hex
-
 function hexValue(c: number): number {
   if (c >= 48 && c <= 57) return c - 48;
   if (c >= 97 && c <= 102) return c - 87;
@@ -30,12 +28,15 @@ function hexValue(c: number): number {
   return -1;
 }
 
-/** git's get_oid_hex at `at`: 40 hex digits (either case), lowercase hex id, or undefined. */
-function oidAt(data: Uint8Array, at: number): ObjectId | undefined {
-  if (at + 40 > data.length) return undefined;
+/**
+ * git's get_oid_hex at `at`: `hexLength` hex digits (either case), lowercase hex id, or
+ * undefined.
+ */
+function oidAt(data: Uint8Array, at: number, hexLength: number): ObjectId | undefined {
+  if (at + hexLength > data.length) return undefined;
   // the usual case, lowercase digits: the id is those bytes as they are
   let lower = true;
-  for (let i = at; i < at + 40; i++) {
+  for (let i = at; i < at + hexLength; i++) {
     const c = data[i] as number;
     if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) {
       lower = false;
@@ -45,11 +46,11 @@ function oidAt(data: Uint8Array, at: number): ObjectId | undefined {
   if (lower) {
     return String.fromCharCode.apply(
       null,
-      data.subarray(at, at + 40) as unknown as number[],
+      data.subarray(at, at + hexLength) as unknown as number[],
     ) as ObjectId;
   }
-  const raw = new Uint8Array(20);
-  for (let i = 0; i < 20; i++) {
+  const raw = new Uint8Array(hexLength / 2);
+  for (let i = 0; i < raw.length; i++) {
     const hi = hexValue(data[at + 2 * i] as number);
     const lo = hexValue(data[at + 2 * i + 1] as number);
     if (hi < 0 || lo < 0) return undefined;
@@ -119,26 +120,34 @@ export function parseCommitDate(data: Uint8Array, start: number): number {
 
 /**
  * The tree, parents and date of a commit's raw bytes, as git's parse_commit_buffer (without
- * grafts): throws `CommitParseError` with git's message when the header is malformed.
+ * grafts): throws `CommitParseError` with git's message when the header is malformed. Ids
+ * are `format.hexLength` digits (SHA-1 by default), as git's parse_commit_buffer reads them.
  *
  * @example
  * ```typescript
  * const { tree, parents, date } = parseGraphCommit(bytes, id);
  * ```
  */
-export function parseGraphCommit(data: Uint8Array, id = ""): GraphCommitData {
+export function parseGraphCommit(
+  data: Uint8Array,
+  id = "",
+  format: ObjectFormat = SHA1_OBJECT_FORMAT,
+): GraphCommitData {
+  const hexLength = format.hexLength;
+  const TREE_ENTRY_LEN = 5 + hexLength; // "tree " + hex
+  const PARENT_ENTRY_LEN = 7 + hexLength; // "parent " + hex
   const tail = data.length;
   let p = 0;
   if (tail <= p + TREE_ENTRY_LEN + 1 || !startsWith(data, p, "tree ")) {
     throw new CommitParseError(`bogus commit object ${id}`);
   }
   if (data[p + TREE_ENTRY_LEN] !== 0x0a) throw new CommitParseError(`bogus commit object ${id}`);
-  const tree = oidAt(data, p + 5);
+  const tree = oidAt(data, p + 5, hexLength);
   if (!tree) throw new CommitParseError(`bad tree pointer in commit ${id}`);
   p += TREE_ENTRY_LEN + 1;
   const parents: ObjectId[] = [];
   while (p + PARENT_ENTRY_LEN < tail && startsWith(data, p, "parent ")) {
-    const parent = tail <= p + PARENT_ENTRY_LEN + 1 ? undefined : oidAt(data, p + 7);
+    const parent = tail <= p + PARENT_ENTRY_LEN + 1 ? undefined : oidAt(data, p + 7, hexLength);
     if (!parent || data[p + PARENT_ENTRY_LEN] !== 0x0a) {
       throw new CommitParseError(`bad parents in commit ${id}`);
     }

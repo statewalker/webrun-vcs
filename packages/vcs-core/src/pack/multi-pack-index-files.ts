@@ -7,6 +7,7 @@
  * if (loaded.midx?.containsPack("pack-1234.pack")) await clearMultiPackIndex(files, packDir);
  * ```
  */
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { FilesApi } from "../common/files/index.js";
 import {
   MIDX_CHAIN_DIR,
@@ -67,12 +68,20 @@ export async function loadMultiPackIndex(
   options: {
     /** 2.43 does not check the fan-out's order on load, and dies on a version 2 file */
     compatibility?: "2.43" | "2.56";
+    /**
+     * The repository's object format (default SHA-1): the files' hash version and id width,
+     * and the chain's lines (`hexLength` digits each)
+     */
+    objectFormat?: ObjectFormat;
   } = {},
 ): Promise<LoadedMultiPackIndex> {
   const parseOptions = {
     checkFanoutOrder: options.compatibility !== "2.43",
     acceptVersion2: options.compatibility !== "2.43",
+    ...(options.objectFormat ? { objectFormat: options.objectFormat } : {}),
   };
+  const hexLength = options.objectFormat?.hexLength ?? 40;
+  const chainLine = hexLength === 64 ? /^[0-9a-f]{64}$/ : /^[0-9a-f]{40}$/;
   const errors: string[] = [];
   const path = `${packDir}/${MIDX_FILE}`;
   const bytes = await readFile(files, path);
@@ -93,11 +102,11 @@ export async function loadMultiPackIndex(
   const chainPath = `${packDir}/${MIDX_CHAIN_DIR}/${MIDX_CHAIN_FILE}`;
   const chain = await readFile(files, chainPath);
   if (!chain || chain.length === 0) return { errors, fileExists };
-  if (chain.length < 40) {
+  if (chain.length < hexLength) {
     errors.push("warning: multi-pack-index chain file too small");
     return { errors, fileExists };
   }
-  const count = Math.floor(chain.length / 41);
+  const count = Math.floor(chain.length / (hexLength + 1));
   if (count > MAX_MIDX_CHAIN_LAYERS) {
     errors.push(
       `warning: multi-pack-index chain has too many layers (${count} > ${MAX_MIDX_CHAIN_LAYERS}); ignoring it`,
@@ -109,7 +118,7 @@ export async function loadMultiPackIndex(
   let chainBytes = 0;
   for (let i = 0; i < count && i < lines.length; i++) {
     const line = lines[i] as string;
-    if (!/^[0-9a-f]{40}$/.test(line)) {
+    if (!chainLine.test(line)) {
       errors.push(`warning: invalid multi-pack-index chain: line '${line}' not a hash`);
       break;
     }
@@ -202,9 +211,17 @@ export async function clearMultiPackIndexNaming(
   files: FilesApi,
   packDir: string,
   packNames: readonly string[],
-  options: { wroteIncremental?: boolean; midx?: MultiPackIndex } = {},
+  options: { wroteIncremental?: boolean; midx?: MultiPackIndex; objectFormat?: ObjectFormat } = {},
 ): Promise<boolean> {
-  const midx = options.midx ?? (await loadMultiPackIndex(files, packDir)).midx;
+  const midx =
+    options.midx ??
+    (
+      await loadMultiPackIndex(
+        files,
+        packDir,
+        options.objectFormat ? { objectFormat: options.objectFormat } : {},
+      )
+    ).midx;
   if (!midx) return false;
   if (!packNames.some((name) => midx.containsPack(name.endsWith(".pack") ? name : `${name}.pack`)))
     return false;

@@ -25,7 +25,7 @@
  */
 
 import { EwahBitmap, RawBitmap } from "@statewalker/vcs-utils";
-import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
@@ -109,6 +109,11 @@ interface CommitData {
  */
 export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<Uint8Array> {
   const { pack, objects } = options;
+  // the pack's object format: the width of its ids, of the header's checksum and the trailer
+  const format = pack.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const raw = format.rawLength;
+  if (pack.packId.length !== format.hexLength)
+    throw new Error(`pack checksum must be ${raw} bytes in a ${format.name} repository`);
   const count = pack.count;
   const order = pack.packOrder();
   const packPos = new Uint32Array(count);
@@ -241,10 +246,10 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
     const { data } = await read(id);
     const out: number[] = [];
     for (let at = 0; at < data.length; ) {
-      const e = scanTreeEntry(data, at);
+      const e = scanTreeEntry(data, at, raw);
       at = e.next;
       if (e.kind === TREE_ENTRY_GITLINK) continue;
-      const eid = hexOf(data, e.nul + 1);
+      const eid = hexOf(data, e.nul + 1, raw);
       const p = need(eid);
       // trees as -(pos + 1), blobs as pos
       out.push(e.kind === TREE_ENTRY_TREE ? -(p + 1) : p);
@@ -327,7 +332,8 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
   let flags = BITMAP_OPT_FULL_DAG;
   if (hashCache) flags |= BITMAP_OPT_HASH_CACHE;
   if (lookupTable) flags |= BITMAP_OPT_LOOKUP_TABLE;
-  let size = 32;
+  const headerSize = 12 + raw;
+  let size = headerSize;
   for (const b of typeBitmaps) size += b.serializedSize;
   const offsets: number[] = [];
   for (const b of writeAs) {
@@ -336,7 +342,7 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
   }
   if (lookupTable) size += entries.length * 16;
   if (hashCache) size += count * 4;
-  size += 20;
+  size += raw;
   const out = new Uint8Array(size);
   const view = new DataView(out.buffer);
   out.set([0x42, 0x49, 0x54, 0x4d], 0);
@@ -344,7 +350,7 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
   view.setUint16(6, flags);
   view.setUint32(8, entries.length);
   out.set(hexToBytes(pack.packId), 12);
-  let at = 32;
+  let at = headerSize;
   for (const b of typeBitmaps) at = b.writeTo(out, at);
   const commitIdxPos = entries.map((c) => order[c.pos] as number);
   for (let i = 0; i < entries.length; i++) {
@@ -374,7 +380,7 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
       at += 4;
     }
   }
-  out.set(createSha1().update(out.subarray(0, at)).digest(), at);
+  out.set(format.createHasher().update(out.subarray(0, at)).digest(), at);
   return out;
 }
 
@@ -401,9 +407,9 @@ function stableSort<T>(items: T[], cmp: (a: T, b: T) => number): void {
   for (let i = 0; i < items.length; i++) items[i] = (indexed[i] as { v: T }).v;
 }
 
-function hexOf(data: Uint8Array, at: number): ObjectId {
+function hexOf(data: Uint8Array, at: number, raw: number): ObjectId {
   let s = "";
-  for (let i = 0; i < 20; i++) s += ((data[at + i] as number) + 0x100).toString(16).slice(1);
+  for (let i = 0; i < raw; i++) s += ((data[at + i] as number) + 0x100).toString(16).slice(1);
   return s;
 }
 

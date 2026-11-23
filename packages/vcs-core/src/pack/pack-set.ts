@@ -97,9 +97,8 @@ export interface OpenPackSetOptions {
   readReverseIndex?: boolean;
   /**
    * The repository's object format (default SHA-1): the width of the packs' ids, checksums
-   * and file names. In a SHA-256 repository the multi-pack-index and the bitmaps (whose
-   * readers hold 20-byte ids) are not used: lookups go through each pack's `.idx`, walks
-   * without bitmaps.
+   * and file names, and of the multi-pack-index's and the bitmaps' ids and checksums (read for
+   * this format: a file of another hash version is refused).
    */
   objectFormat?: ObjectFormat;
 }
@@ -302,8 +301,7 @@ export async function openPackSet(
   const holds = (p: PackFile, id: ObjectId) => p.has(id) && !isBad(p, id);
   const nameOf = (p: PackFile) => `pack-${p.packId}`;
   /** the midx in use and its loaded packs by pack-int-id (undefined: missing) */
-  // a SHA-256 repository's midx is not read yet (its reader holds 20-byte ids)
-  const useMidx = (options.multiPackIndex ?? true) && sha1;
+  const useMidx = options.multiPackIndex ?? true;
   let midx: MultiPackIndex | undefined;
   let midxPacks: (PackFile | undefined)[] = [];
   let midxSig = "";
@@ -335,7 +333,7 @@ export async function openPackSet(
       midxLoaded = undefined;
       const errors: string[] = [];
       if (sig !== "undefined:undefined:undefined:undefined") {
-        const loaded = await loadMultiPackIndex(files, dir);
+        const loaded = await loadMultiPackIndex(files, dir, sha1 ? {} : { objectFormat });
         errors.push(...loaded.errors);
         const bad = loaded.midx && badPackIntId(loaded.midx);
         if (loaded.midx && !loaded.midx.checksumValid()) {
@@ -792,8 +790,6 @@ export async function openPackSet(
     return midxBitmap.index;
   };
   const bitmap = async (): Promise<PackBitmapIndex | undefined> => {
-    // a SHA-256 repository's bitmaps are not read yet (their reader holds 20-byte ids)
-    if (!sha1) return undefined;
     await rescanOnMiss();
     const errors: string[] = [];
     try {
@@ -1009,6 +1005,7 @@ export async function openPackSet(
           files,
           dir,
           packIds.map((id) => `pack-${id}.pack`),
+          sha1 ? {} : { objectFormat },
         );
       for (const packId of packIds) {
         const name = `pack-${packId}`;

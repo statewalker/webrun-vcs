@@ -15,13 +15,13 @@
 import { OrderedMap } from "@statewalker/vcs-utils";
 import type { FilesApi, PosixFilesApi } from "@statewalker/vcs-utils/files";
 import { atomicFilesOver, joinPath } from "@statewalker/vcs-utils/files";
-import { createSha1 } from "@statewalker/vcs-utils/hash";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
 import type { ObjectId } from "../../common/id/index.js";
 import { readPackIndex } from "../../pack/pack-index-reader.js";
 import { scanPackObjects } from "../../pack/pack-order-scan.js";
-import type { GitObject, GitObjects } from "../objects/git-objects.js";
+import { type GitObject, type GitObjects, objectFormatOf } from "../objects/git-objects.js";
 import { canonTreeMode } from "../trees/index.js";
 import { computeBloomFilter, DEFAULT_BLOOM_FILTER_SETTINGS } from "./bloom-filter.js";
 import type { CommitGraph } from "./commit-graph.js";
@@ -43,13 +43,12 @@ import {
   GENERATION_NUMBER_V2_OFFSET_MAX,
   GRAPH_EDGE_LAST_MASK,
   GRAPH_EXTRA_EDGES_NEEDED,
-  GRAPH_HASH_VERSION_SHA1,
   GRAPH_HEADER_SIZE,
   GRAPH_LAST_EDGE,
   GRAPH_PARENT_NONE,
   GRAPH_SIGNATURE,
   GRAPH_VERSION,
-  HASH_SIZE,
+  graphDataWidth,
 } from "./commit-graph-format.js";
 import {
   COMMIT_GRAPH_CHAIN_FILE,
@@ -69,7 +68,12 @@ export interface WriteCommitGraphFileOptions {
   /** The object directory, a path within `files` (".git/objects") */
   objectsDir: string;
   /** The objects: commits (and, for Bloom filters, trees) are read from here */
-  objects: Pick<GitObjects, "get">;
+  objects: Pick<GitObjects, "get"> & { readonly objectFormat?: ObjectFormat };
+  /**
+   * The repository's object format (default: the objects'): the header's hash version, the
+   * width of ids, BASE entries and the trailer, and the hash of the trailer
+   */
+  objectFormat?: ObjectFormat;
   /**
    * The commits to start from: `--reachable` passes the commits the refs point to (peeled),
    * `--stdin-commits` its list. Everything they reach is written too.
@@ -161,6 +165,7 @@ interface WriteCommit {
 function readCommitData(
   objects: Pick<GitObjects, "get">,
   id: ObjectId,
+  format: ObjectFormat,
 ): GraphCommitData | undefined | Promise<GraphCommitData | undefined> {
   let obj: GitObject | undefined | Promise<GitObject | undefined>;
   try {
@@ -171,26 +176,32 @@ function readCommitData(
   }
   if (obj instanceof Promise) {
     return obj.then(
-      (x) => commitDataOf(x, id),
+      (x) => commitDataOf(x, id, format),
       () => undefined,
     );
   }
-  return commitDataOf(obj, id);
+  return commitDataOf(obj, id, format);
 }
 
 function commitDataOf(
   obj: GitObject | undefined,
   id: ObjectId,
+  format: ObjectFormat,
 ): GraphCommitData | undefined | Promise<GraphCommitData | undefined> {
   if (!obj) return undefined;
-  if (!obj.bytes) return objectBytes(obj).then((data) => parseCommitOf(obj.type, data, id));
-  return parseCommitOf(obj.type, obj.bytes, id);
+  if (!obj.bytes) return objectBytes(obj).then((data) => parseCommitOf(obj.type, data, id, format));
+  return parseCommitOf(obj.type, obj.bytes, id, format);
 }
 
-function parseCommitOf(type: string, data: Uint8Array, id: ObjectId): GraphCommitData | undefined {
+function parseCommitOf(
+  type: string,
+  data: Uint8Array,
+  id: ObjectId,
+  format: ObjectFormat,
+): GraphCommitData | undefined {
   if (type !== "commit") return undefined;
   try {
-    return parseGraphCommit(data, id);
+    return parseGraphCommit(data, id, format);
   } catch {
     return undefined;
   }
@@ -245,6 +256,8 @@ export async function writeCommitGraphFile(
   options: WriteCommitGraphFileOptions,
 ): Promise<WriteCommitGraphFileResult> {
   const { files, objectsDir, objects } = options;
+  const format = options.objectFormat ?? objectFormatOf(objects);
+  const raw = format.rawLength;
   const now = options.now ?? Date.now;
   const warnings: string[] = [];
   const result = (extra: Partial<WriteCommitGraphFileResult> = {}): WriteCommitGraphFileResult => ({
@@ -315,7 +328,7 @@ export async function writeCommitGraphFile(
     }
     if (!data) {
       reads.commits++;
-      const read = readCommitData(objects, id);
+      const read = readCommitData(objects, id, format);
       if (read instanceof Promise) {
         return read.then((d) => {
           if (d) parsed.set(id, d);
@@ -497,6 +510,7 @@ export async function writeCommitGraphFile(
       options.maxNewFilters,
       reads,
       { files, objectsDir, prefetch: options.prefetch },
+      format,
     );
   }
 
@@ -527,14 +541,14 @@ export async function writeCommitGraphFile(
   });
   chunks.push({
     id: CHUNK_OID_LOOKUP,
-    size: HASH_SIZE * n,
+    size: raw * n,
     write: (w) => {
       for (const c of commits) w.bytes(c.idBytes);
     },
   });
   chunks.push({
     id: CHUNK_COMMIT_DATA,
-    size: (HASH_SIZE + 16) * n,
+    size: graphDataWidth(raw) * n,
     write: (w) => {
       let edges = 0;
       for (let i = 0; i < n; i++) {
@@ -629,7 +643,7 @@ export async function writeCommitGraphFile(
   if (numAfter > 1) {
     chunks.push({
       id: CHUNK_BASE,
-      size: HASH_SIZE * (numAfter - 1),
+      size: raw * (numAfter - 1),
       write: (w) => {
         for (const layer of baseLayers) w.bytes(hexToBytes(layer.hash));
       },
@@ -641,10 +655,10 @@ export async function writeCommitGraphFile(
 
   const tocSize = (chunks.length + 1) * CHUNK_TOC_ENTRY_SIZE;
   const body = chunks.reduce((s, c) => s + c.size, 0);
-  const w = new Writer(GRAPH_HEADER_SIZE + tocSize + body + HASH_SIZE);
+  const w = new Writer(GRAPH_HEADER_SIZE + tocSize + body + raw);
   w.u32(GRAPH_SIGNATURE);
   w.u8(GRAPH_VERSION);
-  w.u8(GRAPH_HASH_VERSION_SHA1);
+  w.u8(format.version);
   w.u8(chunks.length);
   w.u8(numAfter - 1);
   let offset = GRAPH_HEADER_SIZE + tocSize;
@@ -664,7 +678,7 @@ export async function writeCommitGraphFile(
       );
     }
   }
-  const hash = createSha1().update(w.buf.subarray(0, w.at)).digest();
+  const hash = format.createHasher().update(w.buf.subarray(0, w.at)).digest();
   w.bytes(hash);
   const fileHash = bytesToHex(hash);
   const content = w.buf;
@@ -832,7 +846,8 @@ async function computeFilters(
   existing: CommitGraph | undefined,
   maxNewFilters: number | undefined,
   reads: { commits: number; trees: number; treesScanned?: number },
-  packs?: { files: FilesApi; objectsDir: string; prefetch?: CommitGraphPrefetch },
+  packs: { files: FilesApi; objectsDir: string; prefetch?: CommitGraphPrefetch } | undefined,
+  format: ObjectFormat,
 ): Promise<(Uint8Array | undefined)[]> {
   const filters: (Uint8Array | undefined)[] = new Array(commits.length);
   // commit_gen_cmp: lower generation first, then older
@@ -845,7 +860,7 @@ async function computeFilters(
   });
   const limit = maxNewFilters !== undefined && maxNewFilters >= 0 ? maxNewFilters : commits.length;
   let computed = 0;
-  const trees = new TreeReader(objects);
+  const trees = new TreeReader(objects, format);
   // many filters to compute: the packs' trees unpacked first, in one read in pack order each
   if (packs) {
     let missing = 0;
@@ -861,6 +876,7 @@ async function computeFilters(
         packs.objectsDir,
         wanted * (tuning.objectsPerFilter ?? PREFETCH_OBJECTS_PER_FILTER),
         tuning.bytes ?? PREFETCH_BYTES,
+        format.rawLength,
       );
       if (found.size > 0) {
         trees.prefetched = found;
@@ -876,7 +892,7 @@ async function computeFilters(
     const pos = existing ? existing.position(id) : -1;
     if (pos >= 0) return (existing as CommitGraph).treeAt(pos);
     reads.commits++;
-    const read = readCommitData(objects, id);
+    const read = readCommitData(objects, id, format);
     return read instanceof Promise ? read.then((d) => d?.tree) : read?.tree;
   };
   for (const i of order) {
@@ -906,14 +922,20 @@ async function computeFilters(
 const EMPTY = new Uint8Array(0);
 
 /**
- * Values by object id, the ids kept as their 20 bytes in an open-addressing table (keyed by
- * their first four bytes): looked up straight from a tree's bytes, without a hex string.
+ * Values by object id, the ids kept as their raw bytes (`size`: 20 or 32) in an
+ * open-addressing table (keyed by their first four bytes): looked up straight from a tree's
+ * bytes, without a hex string.
  */
 class IdTable<T> {
-  private ids = new Uint8Array(20 * 1024);
+  private ids: Uint8Array;
   private readonly values: T[] = [];
   private slots = new Int32Array(2048).fill(-1);
-  private readonly scratch = new Uint8Array(20);
+  private readonly scratch: Uint8Array;
+
+  constructor(private readonly idSize: number) {
+    this.ids = new Uint8Array(idSize * 1024);
+    this.scratch = new Uint8Array(idSize);
+  }
 
   get size(): number {
     return this.values.length;
@@ -927,9 +949,10 @@ class IdTable<T> {
 
   /** The value of a hex id, if any. */
   get(id: ObjectId): T | undefined {
-    if (id.length !== 40) return undefined;
+    const size = this.idSize;
+    if (id.length !== 2 * size) return undefined;
     const raw = this.scratch;
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < size; i++) {
       const hi = id.charCodeAt(2 * i);
       const lo = id.charCodeAt(2 * i + 1);
       raw[i] = (((hi > 57 ? hi - 87 : hi - 48) << 4) | (lo > 57 ? lo - 87 : lo - 48)) & 0xff;
@@ -942,12 +965,13 @@ class IdTable<T> {
     if (this.find(buf, at) >= 0) return;
     const n = this.values.length;
     if (2 * (n + 1) > this.slots.length) this.grow();
-    if (20 * (n + 1) > this.ids.length) {
+    const size = this.idSize;
+    if (size * (n + 1) > this.ids.length) {
       const ids = new Uint8Array(this.ids.length * 2);
       ids.set(this.ids);
       this.ids = ids;
     }
-    this.ids.set(buf.subarray(at, at + 20), 20 * n);
+    this.ids.set(buf.subarray(at, at + size), size * n);
     this.values.push(value);
     this.insert(n);
   }
@@ -956,20 +980,21 @@ class IdTable<T> {
     const slots = this.slots;
     const mask = slots.length - 1;
     const ids = this.ids;
+    const size = this.idSize;
     for (let s = keyAt(buf, at) & mask; ; s = (s + 1) & mask) {
       const i = slots[s] as number;
       if (i < 0) return -1;
       let k = 0;
-      const o = 20 * i;
-      while (k < 20 && ids[o + k] === buf[at + k]) k++;
-      if (k === 20) return i;
+      const o = size * i;
+      while (k < size && ids[o + k] === buf[at + k]) k++;
+      if (k === size) return i;
     }
   }
 
   private insert(i: number): void {
     const slots = this.slots;
     const mask = slots.length - 1;
-    let s = keyAt(this.ids, 20 * i) & mask;
+    let s = keyAt(this.ids, this.idSize * i) & mask;
     while ((slots[s] as number) >= 0) s = (s + 1) & mask;
     slots[s] = i;
   }
@@ -1018,8 +1043,9 @@ async function packedTrees(
   objectsDir: string,
   budget: number,
   maxBytes: number,
+  rawLength: number,
 ): Promise<IdTable<Uint8Array>> {
-  const out = new IdTable<Uint8Array>();
+  const out = new IdTable<Uint8Array>(rawLength);
   const dir = joinPath(objectsDir, "pack");
   let bytes = 0;
   try {
@@ -1035,7 +1061,7 @@ async function packedTrees(
     for (const { idxPath } of found) {
       if (bytes > maxBytes || left <= 0) break;
       const idxBytes = await readFileBytes(files, idxPath);
-      const idx = readPackIndex(idxBytes);
+      const idx = readPackIndex(idxBytes, rawLength);
       if (idx.objectCount > left) continue;
       left -= idx.objectCount;
       const idsAt = 8 + 1024;
@@ -1047,7 +1073,7 @@ async function packedTrees(
         (type) => type === 2,
         (pos, _type, content) => {
           const size = out.size;
-          out.add(idxBytes, idsAt + pos * 20, content);
+          out.add(idxBytes, idsAt + pos * rawLength, content);
           if (out.size > size) bytes += content.length;
           // the cap reached: the rest of the pack is not read
           return bytes <= maxBytes;
@@ -1096,7 +1122,15 @@ class TreeReader {
   /** Trees unpacked beforehand (`packedTrees`), by id */
   prefetched?: IdTable<Uint8Array>;
 
-  constructor(private readonly objects: Pick<GitObjects, "get">) {}
+  /** Bytes of an id in the trees read */
+  get rawLength(): number {
+    return this.format.rawLength;
+  }
+
+  constructor(
+    private readonly objects: Pick<GitObjects, "get">,
+    private readonly format: ObjectFormat,
+  ) {}
 
   /** The tree's bytes, without a promise when cached or held in memory by the store. */
   tree(id: ObjectId): Uint8Array | Promise<Uint8Array> {
@@ -1132,7 +1166,7 @@ class TreeReader {
   }
 
   private keep(id: ObjectId, type: string, data: Uint8Array): Uint8Array | Promise<Uint8Array> {
-    if (type === "commit") return this.tree(parseGraphCommit(data, id).tree);
+    if (type === "commit") return this.tree(parseGraphCommit(data, id, this.format).tree);
     if (type !== "tree") throw new Error(`object ${id} is not a tree`);
     this.cache.set(id, data);
     this.cacheBytes += data.length;
@@ -1166,7 +1200,11 @@ class Entries {
   mode = 0;
   name = 0;
   nul = 0;
-  constructor(readonly d: Uint8Array) {}
+  constructor(
+    readonly d: Uint8Array,
+    /** Bytes of an entry's id (the object format's `rawLength`) */
+    readonly raw: number,
+  ) {}
   get done(): boolean {
     return this.at >= this.d.length;
   }
@@ -1183,7 +1221,7 @@ class Entries {
     this.nul = p;
   }
   skip(): void {
-    this.at = this.nul + 1 + HASH_SIZE;
+    this.at = this.nul + 1 + this.raw;
   }
   nameBytes(): Uint8Array {
     return this.d.subarray(this.name, this.nul);
@@ -1213,10 +1251,11 @@ function sameRawEntry(a: Entries, b: Entries): boolean {
     pb++;
     if (c === 0) break;
   }
-  if (pa + HASH_SIZE > la || pb + HASH_SIZE > db.length) return false;
-  for (let k = 0; k < HASH_SIZE; k++) if (da[pa + k] !== db[pb + k]) return false;
-  a.at = pa + HASH_SIZE;
-  b.at = pb + HASH_SIZE;
+  const raw = a.raw;
+  if (pa + raw > la || pb + raw > db.length) return false;
+  for (let k = 0; k < raw; k++) if (da[pa + k] !== db[pb + k]) return false;
+  a.at = pa + raw;
+  b.at = pb + raw;
   return true;
 }
 
@@ -1243,7 +1282,7 @@ function compareEntries(a: Entries, b: Entries): number {
 /** Whether the decoded entries at two cursors (of one name) have the same mode and id. */
 function sameModeAndId(a: Entries, b: Entries): boolean {
   if (a.mode !== b.mode) return false;
-  for (let k = 1; k <= HASH_SIZE; k++) if (a.d[a.nul + k] !== b.d[b.nul + k]) return false;
+  for (let k = 1; k <= a.raw; k++) if (a.d[a.nul + k] !== b.d[b.nul + k]) return false;
   return true;
 }
 
@@ -1297,6 +1336,7 @@ function changedPathsNow(
   to: ObjectId,
   max: number,
 ): Uint8Array[] | undefined | TreeNeeded {
+  const raw = trees.rawLength;
   const leaves: Uint8Array[] = [];
   let tooMany = false;
   const leaf = (path: Uint8Array) => {
@@ -1309,7 +1349,7 @@ function changedPathsNow(
     else {
       const hit = trees.prefetched?.getRaw(ref.d, ref.at);
       if (hit) return hit;
-      id = bytesToHex(ref.d.subarray(ref.at, ref.at + HASH_SIZE));
+      id = bytesToHex(ref.d.subarray(ref.at, ref.at + raw));
     }
     const t = pinned.get(id) ?? trees.tree(id);
     if (t instanceof Promise) throw new TreeNeeded(id, t);
@@ -1317,7 +1357,7 @@ function changedPathsNow(
   };
   // every file of a tree added or deleted
   const all = (tree: TreeRef, prefix: Uint8Array): void => {
-    const e = new Entries(read(tree));
+    const e = new Entries(read(tree), raw);
     while (!e.done && !tooMany) {
       e.read();
       one(e, prefix);
@@ -1332,8 +1372,8 @@ function changedPathsNow(
     else leaf(path);
   };
   const diff = (a: TreeRef | undefined, b: TreeRef, prefix: Uint8Array): void => {
-    const ea = new Entries(a ? read(a) : EMPTY);
-    const eb = new Entries(read(b));
+    const ea = new Entries(a ? read(a) : EMPTY, raw);
+    const eb = new Entries(read(b), raw);
     while (!tooMany) {
       if (ea.done) {
         if (eb.done) break;
@@ -1430,10 +1470,11 @@ class Writer {
     this.buf.set(b, this.at);
     this.at += b.length;
   }
-  /** A 40-digit lowercase hex id as its 20 bytes. */
+  /** A lowercase hex id as its raw bytes (half its length). */
   hex(id: string) {
     const buf = this.buf;
-    for (let i = 0; i < 20; i++) {
+    const size = id.length >>> 1;
+    for (let i = 0; i < size; i++) {
       const hi = id.charCodeAt(2 * i);
       const lo = id.charCodeAt(2 * i + 1);
       buf[this.at++] =
