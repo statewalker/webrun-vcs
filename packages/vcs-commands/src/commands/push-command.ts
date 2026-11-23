@@ -453,7 +453,10 @@ export class PushCommand extends TransportCommand<PushResult> {
     // git's push.c: a fallback remote (the one configured, origin) must be configured
     // (remote_get(NULL) gives no remote otherwise); a name given or taken from the
     // configuration is also tried as a URL or path (remotes_remote_get_1's add_url_alias)
-    if (!this.remoteExplicit && !RemoteConfigStore.from(this.workingCopy).isConfigured(this.remote)) {
+    if (
+      !this.remoteExplicit &&
+      !RemoteConfigStore.from(this.workingCopy).isConfigured(this.remote)
+    ) {
       throw new InvalidRemoteError(
         this.remote,
         "No configured push destination.\nEither specify the URL from the command-line or " +
