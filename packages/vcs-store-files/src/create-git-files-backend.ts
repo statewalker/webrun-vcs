@@ -16,7 +16,6 @@ import type {
   PackSet,
 } from "@statewalker/vcs-core";
 import {
-  createCommitGraphProvider,
   createGitObjects,
   createHistoryFromComponents,
   createObjectPromisor,
@@ -37,13 +36,7 @@ import {
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { openObjectAlternates, withAlternates } from "./alternates/index.js";
 import { createFilesCommitGraphProvider } from "./commit-graph.js";
-import {
-  assertNoMultiPackIndexInFormat,
-  parseConfigInt,
-  readPackSetSettings,
-  skipPacked,
-  withPacks,
-} from "./pack/index.js";
+import { parseConfigInt, readPackSetSettings, skipPacked, withPacks } from "./pack/index.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
 import {
   createFileRefStore,
@@ -196,9 +189,8 @@ export interface GitFilesBackendResult {
  * implement (`extensions.compatObjectFormat`) throws `UnsupportedRepositoryFormatError`. A
  * SHA-256 repository (`extensions.objectFormat = sha256`) opens with 32-byte object ids
  * (`objects.objectFormat`): its packs, `.idx`, `.rev` and `.mtimes` hold 32-byte ids and
- * SHA-256 checksums. One holding a multi-pack-index is refused with
- * `UnsupportedObjectFormatError` (its reader holds 20-byte ids), its bitmaps are not used and
- * its commit-graph is not read.
+ * SHA-256 checksums, and so do its multi-pack-index (and chain), bitmaps and commit-graph
+ * (hash version 2).
  *
  * @example
  * ```typescript
@@ -230,8 +222,7 @@ export async function createGitFilesBackend(
   // Like git's read_repository_format it reads the config file alone, without includes.
   const format = await readRepositoryFormat(files, gitDir);
   const refStorage = create && options.refFormat === "reftable" ? "reftable" : format.refStorage;
-  // the hash naming the objects (`extensions.objectFormat`): SHA-1, or SHA-256 (whose
-  // multi-pack-index is not read yet: a SHA-256 repository holding one is refused here)
+  // the hash naming the objects (`extensions.objectFormat`): SHA-1, or SHA-256
   const objectFormat = options.objectFormat ?? format.objectFormat;
   if (objectFormat.name !== format.objectFormat.name && !create) {
     throw new UnsupportedObjectFormatError(
@@ -239,7 +230,6 @@ export async function createGitFilesBackend(
       objectFormat.name,
     );
   }
-  await assertNoMultiPackIndexInFormat(files, packDir, objectFormat);
   // a SHA-256 reftable (hash id `s256`) is neither read nor written yet
   if (objectFormat.name !== "sha1" && refStorage === "reftable") {
     throw new UnsupportedObjectFormatError("reftable refs", objectFormat.name);
@@ -385,26 +375,22 @@ export async function createGitFilesBackend(
   // HEAD as git init writes it (create_symref): `ref: …` into HEAD.lock, renamed over HEAD
   if (create) await refStore.setSymbolic("HEAD", `refs/heads/${defaultBranch}`);
 
-  // the commit-graph (objects/info/commit-graph or its split chain), read on first use; a
-  // SHA-256 repository's is not read (its 32-byte ids are not read yet): walks read commits
-  const commitGraph =
-    objectFormat.name !== "sha1"
-      ? createCommitGraphProvider(async () => undefined)
-      : createFilesCommitGraphProvider({
-          files,
-          gitDir,
-          refs: refStore,
-          environment: options.environment,
-          ...(options.configIncludes === undefined
-            ? {}
-            : { configIncludes: options.configIncludes }),
-          // git's prepare_commit_graph: the alternates' graphs after the repository's own
-          ...(alternates
-            ? {
-                alternateObjectDirs: async () => (await alternates.list()).map((a) => a.objectsDir),
-              }
-            : {}),
-        });
+  // the commit-graph (objects/info/commit-graph or its split chain), read on first use in
+  // the repository's object format
+  const commitGraph = createFilesCommitGraphProvider({
+    files,
+    gitDir,
+    refs: refStore,
+    environment: options.environment,
+    ...(options.configIncludes === undefined ? {} : { configIncludes: options.configIncludes }),
+    // git's prepare_commit_graph: the alternates' graphs after the repository's own
+    ...(alternates
+      ? {
+          alternateObjectDirs: async () => (await alternates.list()).map((a) => a.objectsDir),
+        }
+      : {}),
+    ...(objectFormat.name === "sha1" ? {} : { objectFormat }),
+  });
   invalidateOnCompatibilityChange(refStore, commitGraph);
   // an alternate linked later (clone --shared, --reference, each one added or re-read) may
   // bring a graph or the layers a chain builds on

@@ -4,6 +4,5 @@
  */
 
 export * from "./delta-base-cache-limit.js";
-export * from "./object-format-packs.js";
 export * from "./pack-write-settings.js";
 export * from "./with-packs.js";

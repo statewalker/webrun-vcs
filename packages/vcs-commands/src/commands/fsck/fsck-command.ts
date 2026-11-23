@@ -733,6 +733,11 @@ class FsckRun {
     this.gitDir = (o.repository?.gitDir ?? ".git").replace(/\/+$/, "");
   }
 
+  /** The commit-graph read settings, in the repository's object format. */
+  private get graphSettings() {
+    return { ...this.o.commitGraph, objectFormat: this.format };
+  }
+
   async run(): Promise<FsckResult> {
     // git loads the midx when it first reads a packed object and dies on one it refuses
     // fatally (a wrong signature or version, a required chunk missing; 2.5x: a fan-out out of
@@ -740,6 +745,7 @@ class FsckRun {
     if (this.files && this.o.multiPackIndex !== false) {
       const loaded = await loadMultiPackIndex(this.files, pathOf(this.looseDir(), "pack"), {
         compatibility: this.o.compatibility,
+        objectFormat: this.format,
       });
       if (loaded.fatal) return this.death(loaded.errors);
       const bad = loaded.midx && badPackIntIdAt(loaded.midx);
@@ -975,7 +981,7 @@ class FsckRun {
    * stderr follows, and a failure sets ERROR_COMMIT_GRAPH.
    */
   private async verifyCommitGraph(): Promise<void> {
-    const settings = this.o.commitGraph;
+    const settings = this.graphSettings;
     if (!this.files || !settings.enabled) return;
     // fsck itself loads the graph when it parses the commit of a ref (parse_object looks it
     // up there first; fsck disables replace refs): what loading prints comes once from fsck,
@@ -986,6 +992,7 @@ class FsckRun {
         files: this.files,
         gitDir: this.gitDir,
         useReplaceRefs: false,
+        objectFormat: this.format,
         readGraftFile: () => this.graftFileText(),
       }))
     ) {
@@ -1002,7 +1009,7 @@ class FsckRun {
 
   /** One `git commit-graph verify --object-dir <objectsDir>` child of fsck. */
   private async verifySourceCommitGraph(objectsDir: string): Promise<void> {
-    const settings = this.o.commitGraph;
+    const settings = this.graphSettings;
     if (!this.files) return;
     // git's `git commit-graph verify` reads each commit (in the graph's order) from the first
     // pack of its most-recently-used list that has it: a commit in several packs is read from
@@ -1085,7 +1092,7 @@ class FsckRun {
     const parse = (o: GitObject | undefined, data: Uint8Array) => {
       if (o?.type !== "commit") return undefined;
       reachGrafts(note, data);
-      return parseGraphCommit(data, id);
+      return parseGraphCommit(data, id, this.format);
     };
     const slow = async (o: GitObject | undefined | Promise<GitObject | undefined>) => {
       try {
@@ -1121,7 +1128,7 @@ class FsckRun {
       if (obj?.type !== "commit") return undefined;
       const data = await collect(obj);
       parsing(data);
-      return parseGraphCommit(data, id);
+      return parseGraphCommit(data, id, this.format);
     } catch {
       return undefined;
     }
@@ -1149,7 +1156,7 @@ class FsckRun {
     const map = this.graphCommits;
     if (!map || this.graphCommitsKept >= this.o.graphCommitsKept || map.has(id)) return;
     try {
-      map.set(id, parseGraphCommit(content, id));
+      map.set(id, parseGraphCommit(content, id, this.format));
       this.graphCommitsKept++;
     } catch {
       // read again (and failed again) by the verification
@@ -1169,7 +1176,7 @@ class FsckRun {
    * loads. Undefined otherwise: commits are read from the object store.
    */
   private async loadCommitGraph(): Promise<CommitGraph | undefined> {
-    const settings = this.o.commitGraph;
+    const settings = this.graphSettings;
     if (!this.files || !settings.enabled) return undefined;
     try {
       if (
@@ -1177,6 +1184,7 @@ class FsckRun {
           files: this.files,
           gitDir: this.gitDir,
           useReplaceRefs: false,
+          objectFormat: this.format,
           readGraftFile: () => this.graftFileText(),
         }))
       ) {
@@ -2152,6 +2160,7 @@ class FsckRun {
     if (this.o.multiPackIndex !== false) {
       const loaded = await loadMultiPackIndex(files, pathOf(objectsDir, "pack"), {
         compatibility: this.o.compatibility,
+        objectFormat: this.format,
       });
       if (loaded.midx)
         paths.push(pathOf(objectsDir, "pack", `multi-pack-index-${loaded.midx.checksum}.bitmap`));
