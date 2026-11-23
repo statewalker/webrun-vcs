@@ -4,6 +4,7 @@
  * tables, each refused with a clear error rather than read past its bounds. The twins against
  * native git's tables are vcs-commands' `reftable-read-git3-native.test.ts`.
  */
+import { deflateSync } from "node:zlib";
 import { createInMemoryFilesApi, isSymbolicRef } from "@statewalker/vcs-core";
 import { describe, expect, it } from "vitest";
 
@@ -478,12 +479,68 @@ describe("a crafted table cannot make the parser allocate without bound", () => 
   it("refuses keys that expand far past the table's own bytes", () => {
     const bytes = longPrefixTable(2000, 30000);
     const started = Date.now();
-    expect(() => parseReftable(bytes, "crafted.ref")).toThrow(/keys expand past 16x/);
+    expect(() => parseReftable(bytes, "crafted.ref")).toThrow(/keys expand past 256x the file/);
     expect(Date.now() - started).toBeLessThan(2000);
   });
 
   it("still reads the same shape when it stays small", () => {
     const table = parseReftable(longPrefixTable(20, 50), "small.ref");
     expect(table.refs).toHaveLength(51);
+  });
+});
+
+describe("a crafted log block cannot inflate into gigabytes of records", () => {
+  /**
+   * One log block of `blockLen` inflated bytes holding deletion records of a few bytes each,
+   * prefix compressed and deflated to almost nothing: a 124 KiB table of 5.5 million records
+   * took 2.6 GB before the budget was charged against the file's own bytes (pass 2 of the
+   * merge gate of statewalker/webrun-vcs#225).
+   */
+  function logBomb(blockLen: number): Uint8Array {
+    const header = Buffer.alloc(24);
+    header.write("REFT", 0);
+    header[4] = 1;
+    header.writeUIntBE(4096, 5, 3);
+    header.writeBigUInt64BE(1n, 8);
+    header.writeBigUInt64BE(1n, 16);
+    const skip = 28;
+    const ref = Buffer.from("refs/heads/b");
+    const body = Buffer.alloc(blockLen);
+    let pos = 0;
+    let last: Buffer | undefined;
+    for (let c = 0; ; c++) {
+      const k = Buffer.alloc(ref.length + 9);
+      ref.copy(k);
+      k.writeBigUInt64BE(0xffffffffff000000n + BigInt(c), ref.length + 1);
+      let p = 0;
+      if (last) while (p < k.length && k[p] === last[p]) p++;
+      const rec = [...varint(p), ...varint((k.length - p) * 8), ...k.subarray(p)];
+      if (skip + pos + rec.length + 5 > blockLen) break;
+      for (const x of rec) body[pos++] = x;
+      last = k;
+    }
+    const len = skip + pos + 5;
+    const inflated = Buffer.alloc(len - skip);
+    body.copy(inflated, 0, 0, pos);
+    inflated.writeUIntBE(28, pos, 3);
+    inflated.writeUInt16BE(1, pos + 3);
+    const blockHead = Buffer.from([0x67, (len >> 16) & 255, (len >> 8) & 255, len & 255]);
+    const footer = Buffer.alloc(68);
+    header.copy(footer, 0);
+    const bytes = new Uint8Array(
+      Buffer.concat([header, blockHead, deflateSync(inflated, { level: 9 }), footer]),
+    );
+    fixFooterCrc(bytes, bytes.length - 68);
+    return bytes;
+  }
+
+  it("refuses more records than the file has bytes", () => {
+    // inflates within the budget (64x the file plus 16 MiB), but each record is a fraction of
+    // a file byte: refused after about the file's size in records, not millions of them
+    const bytes = logBomb(4 << 20);
+    expect(bytes.length).toBeLessThan(64 << 10);
+    const started = Date.now();
+    expect(() => parseReftable(bytes, "bomb.ref")).toThrow(/more records than the file has bytes/);
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 });

@@ -166,9 +166,23 @@ interface Block {
  * not well formed and `ReftableUnsupportedError` for a SHA-256 table. `name` names the table in
  * those errors.
  */
-/** The key bytes a table may expand to: this many times its record bytes, plus the slack. */
-const MAX_KEY_BYTES_FACTOR = 16;
-const MAX_KEY_BYTES_SLACK = 1 << 20;
+/**
+ * What a table may make us decode, charged against the bytes of the file itself (never the
+ * inflated ones, which a crafted log block multiplies by thousands):
+ *  - log blocks may inflate to `MAX_INFLATE_FACTOR` times the file, plus the slack (real
+ *    reflogs, 20 random id bytes per entry, deflate far less);
+ *  - the records decoded may number the file's bytes plus the slack (each kept record costs
+ *    a few hundred bytes of heap; a real one takes at least a few file bytes, more when
+ *    deflated, as its new id is random);
+ *  - the keys rebuilt from prefix compression may total `MAX_KEY_FACTOR` times the file, plus
+ *    the slack (a large `reftable.restartInterval` with long names legitimately repeats each
+ *    name for a few bytes; quadratic copies are what this stops).
+ */
+const MAX_INFLATE_FACTOR = 64;
+const MAX_INFLATE_SLACK = 16 << 20;
+const MAX_RECORDS_SLACK = 1 << 16;
+const MAX_KEY_FACTOR = 256;
+const MAX_KEY_SLACK = 16 << 20;
 
 export function parseReftable(bytes: Uint8Array, name = "<reftable>"): ReftableTable {
   const fail = (detail: string): never => {
@@ -254,6 +268,7 @@ export function parseReftable(bytes: Uint8Array, name = "<reftable>"): ReftableT
     return [value, pos];
   };
 
+  let inflatedBytes = 0;
   /** The block at `offset` of a section ending at `end`, checked against its bounds. */
   const readBlock = (offset: number, type: number, end: number): Block => {
     const headerOff = offset === 0 ? hSize : 0;
@@ -271,6 +286,10 @@ export function parseReftable(bytes: Uint8Array, name = "<reftable>"): ReftableT
     if (type === TYPE_LOG) {
       // block_len is the inflated length, block header included; the deflated stream follows
       const skip = headerOff + 4;
+      inflatedBytes += blockLen;
+      if (inflatedBytes > MAX_INFLATE_FACTOR * bytes.length + MAX_INFLATE_SLACK) {
+        fail(`log block at ${offset}: log blocks inflate past ${MAX_INFLATE_FACTOR}x the file`);
+      }
       data = new Uint8Array(blockLen);
       data.set(bytes.subarray(offset, offset + skip));
       let consumed: number;
@@ -321,12 +340,9 @@ export function parseReftable(bytes: Uint8Array, name = "<reftable>"): ReftableT
    * Each record of a block: its key (prefix compressed against the previous one) and value
    * type, `decodeValue` reading the value; checks restarts start uncompressed keys.
    */
-  // The key bytes a table may make us keep: prefix compression lets each record repeat its
-  // whole predecessor for a few bytes, so a crafted table of a few hundred KiB could make
-  // the copies quadratic (gigabytes). Real tables keep well under twice their record bytes;
-  // the budget grows with the records read (inflated, for log blocks).
+  // Budgets of the whole table, against the file's bytes (see MAX_INFLATE_FACTOR).
   let keyBytes = 0;
-  let recordBytes = 0;
+  let records = 0;
   const eachRecord = (
     block: Block,
     offset: number,
@@ -334,7 +350,6 @@ export function parseReftable(bytes: Uint8Array, name = "<reftable>"): ReftableT
   ): void => {
     const { data, recordsEnd, restarts } = block;
     let pos = block.recordsStart;
-    recordBytes += recordsEnd - block.recordsStart;
     let lastKey = new Uint8Array(0);
     let seen = 0;
     while (pos < recordsEnd) {
@@ -352,8 +367,11 @@ export function parseReftable(bytes: Uint8Array, name = "<reftable>"): ReftableT
       if (prefix > lastKey.length) fail(`block at ${offset}: key prefix longer than the last key`);
       if (pos + suffix > recordsEnd) fail(`block at ${offset}: key runs past the records`);
       keyBytes += prefix + suffix;
-      if (keyBytes > MAX_KEY_BYTES_FACTOR * recordBytes + MAX_KEY_BYTES_SLACK) {
-        fail(`block at ${offset}: keys expand past ${MAX_KEY_BYTES_FACTOR}x the table's records`);
+      if (keyBytes > MAX_KEY_FACTOR * bytes.length + MAX_KEY_SLACK) {
+        fail(`block at ${offset}: keys expand past ${MAX_KEY_FACTOR}x the file`);
+      }
+      if (++records > bytes.length + MAX_RECORDS_SLACK) {
+        fail(`block at ${offset}: more records than the file has bytes`);
       }
       const key = new Uint8Array(prefix + suffix);
       key.set(lastKey.subarray(0, prefix));
