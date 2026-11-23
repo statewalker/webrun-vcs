@@ -20,6 +20,7 @@ import { readCommitGraphSettings, writeCommitGraph } from "./commit-graph.js";
 import { promisorExclusions } from "./promisor-objects.js";
 import { sweepQuarantines } from "./quarantine/files-quarantine.js";
 import { listReachableObjects } from "./reachable-objects.js";
+import { expireReflogs, gcExpiresReflogs } from "./reflog-expire.js";
 import { createFilesRefOps } from "./refs/index.js";
 import {
   DEFAULT_PRUNE_EXPIRE_MS,
@@ -80,6 +81,15 @@ export interface GcOptions {
    * never removes such files; set this only to clean up after a crash sooner.
    */
   orphanPackExpiryMs?: number;
+  /**
+   * Expire reflog entries before what is reachable is computed, as `git gc` runs `git reflog
+   * expire --all` (`gc.reflogExpire`, default 90 days; `gc.reflogExpireUnreachable`, 30 days;
+   * `gc.<pattern>.reflogExpire[Unreachable]`; see `expireReflogs`). Default true unless both
+   * settings are `never`. Not done in a dry run.
+   */
+  expireReflogs?: boolean;
+  /** "Now" for the reflog expiry, in seconds since the epoch (default the clock's). */
+  now?: number;
   /** Pack loose refs into packed-refs, as `git gc` (`git pack-refs --all`). Default true. */
   packRefs?: boolean;
   /** Repack reachable objects into one pack (`git repack -A -d`). Default true. */
@@ -140,6 +150,8 @@ export interface GcResult {
   skipped: boolean;
   /** Whether loose refs were packed */
   refsPacked: boolean;
+  /** Reflog entries the reflog step removed (absent when it did not run) */
+  reflogEntriesPruned?: number;
   /** What the repack did; null if it did not run or found nothing to pack */
   repack: RepackResult | null;
   /** Whether a commit-graph was written */
@@ -162,21 +174,23 @@ export interface GcResult {
  * Run garbage collection on a file-backed repository.
  *
  * 1. Takes `gc.pid` with an exclusive create; if another gc holds it, returns `skipped`.
- * 2. Snapshots the installed packs, then lists the objects reachable from every ref, HEAD, the
+ * 2. Expires reflog entries (`git reflog expire --all`, `expireReflogs`), unless `gc.reflogExpire`
+ *    and `gc.reflogExpireUnreachable` are both `never`.
+ * 3. Snapshots the installed packs, then lists the objects reachable from every ref, HEAD, the
  *    reflogs, the index and every linked worktree's HEAD, index and reflogs. A ref that cannot
  *    be read makes gc throw here, before anything is changed.
- * 3. Packs refs (`history.refs.packRefs`, when the store has it).
- * 4. Repacks what is reachable into one pack and deletes the snapshot's packs (`.keep` packs
+ * 4. Packs refs (`history.refs.packRefs`, when the store has it).
+ * 5. Repacks what is reachable into one pack and deletes the snapshot's packs (`.keep` packs
  *    stay; a pack installed during the walk is never deleted) and the loose copies now packed.
  *    Unreachable objects of the deleted packs are written loose first, unless their pack is
  *    older than `pruneExpireMs` (`git repack -A -d --unpack-unreachable`).
- * 5. Prunes the unreachable loose objects older than `pruneExpireMs`.
- * 6. Sweeps stale temporaries (`tmp_obj_*`, `objects/pack/tmp_*`, `packed-refs.new`) and `.pack` files without
+ * 6. Prunes the unreachable loose objects older than `pruneExpireMs`.
+ * 7. Sweeps stale temporaries (`tmp_obj_*`, `objects/pack/tmp_*`, `packed-refs.new`) and `.pack` files without
  *    an `.idx`.
- * 7. Writes the commit-graph of what the refs reach (`gc.writeCommitGraph`, default true), as
+ * 8. Writes the commit-graph of what the refs reach (`gc.writeCommitGraph`, default true), as
  *    `git gc` does: `objects/info/commit-graph`, replacing a split chain.
  *
- * In a repository with `extensions.preciousObjects`, only steps 3 and 7 run, as `git gc` skips its
+ * In a repository with `extensions.preciousObjects`, only steps 2, 4 and 8 run, as `git gc` skips its
  * repack and prune there. In a partial clone (`extensions.partialClone`, a promisor remote)
  * the walk leaves the promisor objects out (`--exclude-promisor-objects`: the objects of
  * promisor packs, and the absent objects they name), and the repack writes every object of
@@ -255,7 +269,33 @@ async function collect(options: GcOptions): Promise<GcResult> {
   const alternatesErrors = dryRun
     ? (objects.alternates?.errors ?? [])
     : await assertAlternatesReadable({ files, gitDir, objects }, "gc");
-  const errors = alternatesErrors.length > 0 ? { errors: [...alternatesErrors] } : {};
+  // git gc's gc_before_repack: `reflog expire --all` before anything is walked (pack-refs
+  // does not change what is reachable)
+  const reflogErrors: string[] = [];
+  let reflogEntriesPruned: number | undefined;
+  if (
+    !dryRun &&
+    (options.expireReflogs ??
+      (await gcExpiresReflogs(files, gitDir, {
+        ...(options.environment ? { environment: options.environment } : {}),
+      })))
+  ) {
+    const expired = await expireReflogs({
+      files,
+      gitDir,
+      refs: history.refs,
+      objects,
+      ...(options.environment ? { environment: options.environment } : {}),
+      ...(options.now !== undefined ? { now: options.now } : {}),
+    });
+    reflogEntriesPruned = expired.pruned;
+    reflogErrors.push(...expired.errors);
+  }
+  const allErrors = [...alternatesErrors, ...reflogErrors];
+  const errors = {
+    ...(allErrors.length > 0 ? { errors: allErrors } : {}),
+    ...(reflogEntriesPruned !== undefined ? { reflogEntriesPruned } : {}),
+  };
   if (format.preciousObjects) {
     let refsPacked = false;
     if ((options.packRefs ?? true) && !dryRun && history.refs.packRefs) {

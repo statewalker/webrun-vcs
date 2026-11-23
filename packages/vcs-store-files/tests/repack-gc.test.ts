@@ -376,7 +376,14 @@ describe("P2.6 review: a pack installed during the reachability walk", () => {
   it("gc keeps that pack and its objects, even with --prune=now", async () => {
     const b = await setUp();
     const { history, pushed } = await pushDuringWalk(b);
-    const result = await gc({ history, files: b.files, packs: b.packs, pruneExpireMs: 0 });
+    // the push hooks the walk's ref listing: the reflog step, which lists refs first, is off
+    const result = await gc({
+      history,
+      files: b.files,
+      packs: b.packs,
+      pruneExpireMs: 0,
+      expireReflogs: false,
+    });
     expect(pushed.blob).toBeDefined();
     expect(result.repack?.packsRemoved).not.toContain(`pack-${pushed.packId}`);
     const fresh = await open(b.files, false);
@@ -518,7 +525,8 @@ describe("P2.6 review: linked worktrees are roots", () => {
       enc.encode(`${"0".repeat(40)} ${logged.commit} T <t@t> 1700000000 +0000\tcheckout\n`),
     ]);
 
-    await gc({ history: b.history, files: b.files, pruneExpireMs: 0 });
+    // the reflog entry is dated 2023: the reflog step would expire it
+    await gc({ history: b.history, files: b.files, pruneExpireMs: 0, expireReflogs: false });
 
     const keep = [
       detached.commit,

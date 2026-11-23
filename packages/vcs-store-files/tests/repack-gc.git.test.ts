@@ -148,7 +148,13 @@ describe("repack and gc against native git", () => {
     const objects = allObjects(dir);
     const b = await backend(dir);
 
-    const result = await gc({ history: b.history, files: b.files, pruneExpireMs: 0 });
+    // the entries are dated 2023: as with git gc below, the reflog step must not expire them
+    const result = await gc({
+      history: b.history,
+      files: b.files,
+      pruneExpireMs: 0,
+      expireReflogs: false,
+    });
 
     expect(result.removedObjects).toBe(0);
     expectValid(dir);
