@@ -160,7 +160,18 @@ describe("gc's reflog step (t1410, t6500)", () => {
     // the scenario has entries to expire of both kinds
     expect(before["logs/HEAD"]?.split("\n").length).toBeGreaterThan(5);
     const [native, ours] = twins(dir);
-    git(native, ["gc", "-q", "--prune=now"]);
+    // git's documented defaults, given to native git explicitly: 2.56.x swapped them in
+    // reflog.h (REFLOG_EXPIRE_OPTIONS_INIT: total 30 days, unreachable 90), so it expires
+    // every entry older than 30 days; 2.43 and master keep 90 and 30, as ours does
+    git(native, [
+      "-c",
+      "gc.reflogExpire=90.days.ago",
+      "-c",
+      "gc.reflogExpireUnreachable=30.days.ago",
+      "gc",
+      "-q",
+      "--prune=now",
+    ]);
     const r = await ourGc(ours);
     expect(r.reflogEntriesPruned).toBeGreaterThan(0);
     expect(reflogs(ours)).toEqual(reflogs(native));
