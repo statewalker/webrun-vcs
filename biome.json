@@ -72,7 +72,8 @@
       "includes": [
         "packages/vcs-testing-gitea/**",
         "packages/vcs-utils-node/src/files/posix-node-files-api.ts",
-        "packages/vcs-utils-node/src/files/replace-file.ts"
+        "packages/vcs-utils-node/src/files/replace-file.ts",
+        "packages/vcs-utils-node/src/files/node-signer.ts"
       ],
       "linter": {
         "rules": {
