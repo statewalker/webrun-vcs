@@ -284,6 +284,8 @@ export interface ReceivePackServerOptions {
   procReceiveRefs?: readonly string[];
   /** A receive-pack setting git cannot read (see `ReceivePackConfig.configError`) */
   receivePackConfigError?: string;
+  /** `receive.fsckObjects`: the fsck of each push's objects (see `ReceivePackConfig.fsckObjects`) */
+  fsckObjects?: ReceivePackConfig["fsckObjects"];
 }
 
 /**
@@ -1117,6 +1119,7 @@ export async function handleReceivePack(
       ...(rp.receivePackConfigError !== undefined
         ? { configError: rp.receivePackConfigError }
         : {}),
+      ...(rp.fsckObjects ? { fsckObjects: rp.fsckObjects } : {}),
       logger: options.logger,
       request: {
         method: request.method,
