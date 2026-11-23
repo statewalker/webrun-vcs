@@ -23,6 +23,11 @@ import {
 } from "@statewalker/vcs-working-tree";
 
 import { Git } from "../git.js";
+import {
+  defaultInitialBranch,
+  InvalidInitialBranchError,
+  isValidBranchName,
+} from "./default-branch.js";
 import type { InitResult } from "../results/init-result.js";
 
 /**
@@ -67,7 +72,8 @@ export class InitCommand {
   private directory?: string;
   private gitDir?: string;
   private bare = false;
-  private initialBranch = "main";
+  /** `--initial-branch`; undefined: git's default (see {@link defaultInitialBranch}) */
+  private initialBranch?: string;
   private stagingStore?: Staging;
   private worktreeEnabled = false;
   private worktreeStore?: Worktree;
@@ -136,8 +142,9 @@ export class InitCommand {
   /**
    * Set the initial branch name.
    *
-   * This is the branch that HEAD will point to after initialization.
-   * Defaults to "main".
+   * This is the branch that HEAD will point to after initialization. Without it, git's
+   * default: `init.defaultBranch` from the system or global configuration (or `git -c`),
+   * else `master`, or `main` with `GitHostEnvironment.breakingChanges` (git 3.0).
    *
    * @param branch The initial branch name
    * @returns this for method chaining
@@ -243,6 +250,19 @@ export class InitCommand {
     this.checkCallable();
     this.setCallable(false);
 
+    // git's -b / init.defaultBranch / built-in default (repo_default_branch_name); an invalid
+    // name dies before anything is created
+    if (this.initialBranch !== undefined && !isValidBranchName(this.initialBranch)) {
+      throw new InvalidInitialBranchError(this.initialBranch);
+    }
+    const chosen =
+      this.initialBranch !== undefined
+        ? { name: this.initialBranch }
+        : await defaultInitialBranch(this.environment);
+    const initialBranch = chosen.name;
+    // re-initialising an existing repository keeps its HEAD and prints no hint
+    let hints = chosen.hint;
+
     // Use in-memory FilesApi if none provided
     const files = this.files ?? createInMemoryFilesApi();
 
@@ -264,12 +284,13 @@ export class InitCommand {
       // A repository with a config but no HEAD (damaged or half-made) is opened, not
       // re-created: creating rewrites the config, and its remotes and settings with it.
       const fresh = !hasHead && !(await isFile(`${dir}/config`));
+      if (!fresh) hints = undefined;
       const open = (create: boolean) =>
         createGitFilesHistoryFromFiles({
           files: repoFiles,
           gitDir,
           create,
-          defaultBranch: this.initialBranch,
+          defaultBranch: initialBranch,
           ...(this.environment ? { environment: this.environment } : {}),
         });
       if (fresh && this.bare && dir !== ".") {
@@ -292,7 +313,7 @@ export class InitCommand {
         }
       }
       if (!hasHead && !fresh) {
-        await history.refs.setSymbolic("HEAD", `refs/heads/${this.initialBranch}`);
+        await history.refs.setSymbolic("HEAD", `refs/heads/${initialBranch}`);
       }
       // The index lives in the repository too: a reopened repository keeps what was staged
       // (its last commit's files), so the next commit does not drop them.
@@ -309,7 +330,7 @@ export class InitCommand {
       history = createMemoryHistory();
       await history.initialize();
       // Set initial branch by creating symbolic ref for HEAD
-      await history.refs.setSymbolic("HEAD", `refs/heads/${this.initialBranch}`);
+      await history.refs.setSymbolic("HEAD", `refs/heads/${initialBranch}`);
       staging = this.stagingStore ?? new MemoryStagingStore();
     }
 
@@ -405,7 +426,8 @@ export class InitCommand {
       git,
       workingCopy,
       repository: history,
-      initialBranch: this.initialBranch,
+      initialBranch,
+      ...(hints ? { hints } : {}),
       bare: this.bare,
       gitDir,
     };

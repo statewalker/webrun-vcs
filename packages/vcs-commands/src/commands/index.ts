@@ -31,6 +31,8 @@ export {
   indexVersionConfigError,
   takeIndexWarnings,
 } from "./index-host.js";
+export * from "./comment-char-config.js";
+export * from "./default-branch.js";
 export * from "./init-command.js";
 export { httpBackendEnv, quarantineEnv, remoteHookSession } from "./local-transport.js";
 export * from "./log-command.js";

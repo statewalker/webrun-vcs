@@ -33,6 +33,7 @@ import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
 import { fetchFsckOf } from "./fsck/index.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
+import { defaultInitialBranch } from "./default-branch.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { copyLocalObjects } from "./local-clone.js";
 import { promisorOf } from "./promisor-remote.js";
@@ -812,7 +813,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     let checkoutId: ObjectId | undefined;
     // an empty remote without unborn HEAD: git's default branch (the one init named)
     if (!detachedTag && !this.bare && defaultBranch === undefined && result.isEmpty) {
-      defaultBranch = (await this.localHeadBranch()) ?? "main";
+      defaultBranch =
+        (await this.localHeadBranch()) ??
+        (await defaultInitialBranch(hostEnvironmentOf(this._workingCopy))).name;
     }
 
     // git's update_remote_refs (before update_head): refs/remotes/<name>/HEAD names the tracking ref of the
@@ -896,7 +899,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
 
     const cloneResult: CloneResult = {
       fetchResult,
-      defaultBranch: defaultBranch ?? "main",
+      defaultBranch:
+        defaultBranch ?? (await defaultInitialBranch(hostEnvironmentOf(this._workingCopy))).name,
       remoteName: this.remoteName,
       bare: this.bare,
       headCommit,

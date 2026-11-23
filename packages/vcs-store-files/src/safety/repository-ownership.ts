@@ -267,11 +267,15 @@ export async function assertValidOwnership(
 }
 
 /**
- * The protected `safe.bareRepository` (setup.c's `get_allowed_bare_repo`): `all` (the
- * default) or `explicit`; the last value wins, any other value is git's fatal config error.
+ * The protected `safe.bareRepository` (setup.c's `get_allowed_bare_repo`): `all` or
+ * `explicit`; the last value wins, any other value is git's fatal config error. The default is
+ * `all`, or `explicit` in a git built with `WITH_BREAKING_CHANGES` (git 3.0, `breakingChanges`).
  */
-export function allowedBareRepository(entries: ProtectedConfigEntry[]): "all" | "explicit" {
-  let allowed: "all" | "explicit" = "all";
+export function allowedBareRepository(
+  entries: ProtectedConfigEntry[],
+  breakingChanges?: boolean,
+): "all" | "explicit" {
+  let allowed: "all" | "explicit" = breakingChanges ? "explicit" : "all";
   for (const entry of entries) {
     if (entry.key !== "safe.barerepository") continue;
     if (entry.value === "explicit" || entry.value === "all") allowed = entry.value;
