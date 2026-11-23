@@ -901,6 +901,59 @@ export class HookSession {
   }
 
   /**
+   * Runs a shell command git runs for a setting (trailer.c's `apply_command`: `use_shell`,
+   * stdin closed, `local_repo_env` unset) in the directory git runs in, through the hook
+   * runner: its exit code, stdout and stderr (not kept in {@link output}: the caller places
+   * it). Undefined without a runner or a layout (the command is not run); a runner that
+   * cannot start it answers as a failure (exit code 1).
+   */
+  async runShellCommand(
+    name: string,
+    command: string,
+    args: string[] = [],
+  ): Promise<{ exitCode: number; stdout: string; stderr: string } | undefined> {
+    const runner = this.runner;
+    if (!runner) return undefined;
+    const layout = await this.host.layout();
+    if (!layout) return undefined;
+    const { invocation } = this.invocationOf(
+      layout,
+      name,
+      { kind: "configured", name, command },
+      { args, keepStdout: true, prefix: false, unsetEnv: [...LOCAL_REPO_ENV] },
+    );
+    let outcome: HookOutcome | undefined;
+    try {
+      outcome = await runner.run(invocation);
+    } catch {
+      outcome = undefined;
+    }
+    if (!outcome) return { exitCode: 1, stdout: "", stderr: "" };
+    return {
+      exitCode: outcome.exitCode,
+      stdout: decoder.decode(outcome.stdout),
+      stderr: decoder.decode(outcome.stderr),
+    };
+  }
+
+  /**
+   * A file a git option names as the repository's FilesApi reaches it: a relative path from
+   * the directory git runs in (the worktree top). Undefined without a layout, or for a path
+   * outside the FilesApi.
+   */
+  async fileAt(path: string): Promise<{ files: FilesApi; path: string } | undefined> {
+    const layout = await this.host.layout();
+    if (!layout) return undefined;
+    if (path.startsWith("/")) {
+      const filesPath = filesPathOfHost(layout.files, path);
+      return filesPath === undefined ? undefined : { files: layout.files, path: filesPath };
+    }
+    const joined = joinFilesPath(layout.cwd, path);
+    if (leavesFilesRoot(joined)) return undefined;
+    return { files: layout.files, path: normalizeFilesPath(joined) };
+  }
+
+  /**
    * The bytes of a file a git option names (`git hook run --to-stdin=<path>`): a relative
    * path from the directory git runs in (the worktree top, the git directory when bare),
    * through the repository's FilesApi; an absolute one through it when it lies there, else
