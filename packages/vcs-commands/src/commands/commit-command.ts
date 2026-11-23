@@ -1813,6 +1813,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
       if (!previousCommit) {
         throw new NoHeadError("Cannot amend: HEAD commit not found");
       }
+      // (its message and author as git reads them: use_message = "HEAD")
+      previousCommit = await this.inCommitOutputEncoding(headId, previousCommit);
     }
 
     // The author (git's determine_author_info, which prepare_to_commit runs before the
@@ -1820,6 +1822,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // a concluded cherry-pick's author (its date too; `--author` replaces only the name and
     // email), unless --reset-author; else resolved as git does (GIT_AUTHOR_*, author.*,
     // user.*, GIT_AUTHOR_DATE or now)
+    // (`--amend --fixup` keeps no author: git's author_message is use_message's, which
+    // --fixup leaves unset)
+    const amendKeeps = this.amend && !!previousCommit && !this.fixup;
     let author = this.author;
     if (!author) {
       // (git's author_message: a cherry-pick's CHERRY_PICK_HEAD, else -C's commit, else the
@@ -1830,8 +1835,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
           ? (await this.commits.load(pickHead))?.author
           : reused
             ? reused.author
-            : this.amend && previousCommit
-              ? previousCommit.author
+            : amendKeeps
+              ? previousCommit?.author
               : undefined;
       // fmt_ident's IDENT_STRICT refusals of the name chosen (an empty one, crud only)
       if (kept || this.authorName) {
@@ -1916,54 +1921,6 @@ export class CommitCommand extends GitCommand<CommitResult> {
       // a stored subtree no edit touched stays the one stored)
       treeId = await writeIndexAsTree(this.staging, this.trees, this.objectFormat);
     }
-    let previousCommit: Commit | undefined;
-    let amendedId: ObjectId | undefined;
-
-    if (this.amend) {
-      const headId = await this.resolveHead();
-      amendedId = headId;
-      previousCommit = await this.commits.load(headId);
-      if (!previousCommit) {
-        throw new NoHeadError("Cannot amend: HEAD commit not found");
-      }
-      // (its message and author as git reads them: use_message = "HEAD")
-      previousCommit = await this.inCommitOutputEncoding(headId, previousCommit);
-    }
-
-    // The author (git's determine_author_info): the one given; else an amended commit's or
-    // a concluded cherry-pick's author (its date too; `--author` replaces only the name and
-    // email), unless --reset-author; else resolved as git does (GIT_AUTHOR_*, author.*,
-    // user.*, GIT_AUTHOR_DATE or now)
-    // (`--amend --fixup` keeps no author: git's author_message is use_message's, which
-    // --fixup leaves unset)
-    const amendKeeps = this.amend && !!previousCommit && !this.fixup;
-    let author = this.author;
-    if (!author) {
-      // (git's author_message: a cherry-pick's CHERRY_PICK_HEAD, else -C's commit, else the
-      // amended HEAD)
-      const kept = this.resetAuthor
-        ? undefined
-        : pickHead
-          ? (await this.commits.load(pickHead))?.author
-          : reused
-            ? reused.author
-            : amendKeeps
-              ? previousCommit?.author
-              : undefined;
-      if (kept) {
-        author = this.authorName
-          ? {
-              ...kept,
-              name: withoutCrud(this.authorName.name),
-              email: withoutCrud(this.authorName.email),
-            }
-          : kept;
-      } else if (this.authorName) author = this.datedIdent("author", this.authorName);
-      else author = this.resolveAuthor(this.committer ?? this.committerName);
-    }
-    // --date: the author's date, whatever gave the rest
-    const forced = this.forcedDate();
-    if (forced) author = { ...author, ...forced };
     // the committer: always resolved (GIT_COMMITTER_*, committer.*, user.*), unless given
     const committer =
       this.committer ??
