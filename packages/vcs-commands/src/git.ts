@@ -30,6 +30,7 @@ import {
   DescribeCommand,
   DiffCommand,
   FetchCommand,
+  ForEachRefCommand,
   FormatPatchCommand,
   FsckCommand,
   GarbageCollectCommand,
@@ -662,6 +663,27 @@ export class Git implements Disposable {
   revList(): RevListCommand {
     this.checkClosed();
     return new RevListCommand(this._workingCopy);
+  }
+
+  // ============ Ref listing ============
+
+  /**
+   * Create a ForEachRefCommand: git's `for-each-ref`, the refs filtered, sorted and
+   * formatted by git's ref-filter.
+   *
+   * @example
+   * ```typescript
+   * const { output } = await git
+   *   .forEachRef()
+   *   .setFormat("%(refname:short) %(objectname:short)")
+   *   .setSort("-creatordate")
+   *   .setPatterns("refs/tags/")
+   *   .call();
+   * ```
+   */
+  forEachRef(): ForEachRefCommand {
+    this.checkClosed();
+    return new ForEachRefCommand(this._workingCopy);
   }
 
   // ============ Describe Operations ============
