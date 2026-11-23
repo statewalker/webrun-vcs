@@ -1,5 +1,26 @@
 # @statewalker/vcs-utils-node
 
+## 0.7.0
+
+### Minor Changes
+
+- d5813ff: **Reftable repositories can be written and created.** Every ref write of a reftable repository is one transaction appending one table to each stack it changes (`ReftableRefStore` over `createReftableStackWriter`: `tables.list.lock`, a table renamed into place, the lock committed over `tables.list`), its reflog entries in the same table, the reference-transaction hook told `preparing`, `prepared`, `committed` or `aborted` as git's reftable backend does (symbolic refs and root refs included). Tables are written as git's `reftable/writer.c` writes them (`writeReftable`: padded ref blocks, multi-level indexes, obj blocks, deflated log blocks), honouring `reftable.blockSize`, `restartInterval`, `indexObjects`, `geometricFactor` and `lockTimeout`; the stack is compacted geometrically after each write, and whole by `pack-refs`/gc (stale tables removed). `InitCommand.setRefFormat("reftable")`, `GIT_DEFAULT_REF_FORMAT` (`GitHostEnvironment.defaultRefFormat`), `init.defaultRefFormat` and, with `breakingChanges`, git 3.0's default create reftable repositories (`createGitFilesBackend({ create: true, refFormat })`); clones into them write the initial transaction there. Reflog expiry, `reflog delete` and stash drop rewrite reflogs as `reftable_be_reflog_expire`; gc, repack, prune and fsck read reflogs and linked worktrees' refs through the ref store (`ReftableRefStore.reflogNames`, `worktreeRefs`), and `worktree add` writes the new worktree's HEAD into its own stack. The write refusal is gone: `ReftableWriteUnsupportedError` and `Refs.writeRefusal` are removed.
+- f91199d: **SHA-256 repositories open: their loose objects, trees, commits, tags and refs read and write with 64-hex ids.**
+  
+  - **vcs-utils:** `ObjectFormat` (git's `struct git_hash_algo`): `SHA1_OBJECT_FORMAT` and `SHA256_OBJECT_FORMAT` with their raw and hex lengths, null id, empty tree and blob ids, signature header and hashers; `objectFormatByName`, `isHexObjectId`, `isNullObjectId`, `nullObjectIdLike`. `sha256()` is a one-shot SHA-256 on Web Crypto (the portable incremental hasher where there is none); `computeObjectId(type, content, format?)` hashes in the given format. `UnsupportedObjectFormatError` and `assertSha1ObjectFormat` refuse what has no SHA-256 path yet.
+  - **Worktrees:** `FileWorktree` and `MemoryWorktree` hash files in the repository's format by default (`Blobs.objectFormat`), so status, diff and checkout agree with the stored blobs in a SHA-256 repository.
+  - **vcs-core:** a store carries its format (`GitObjects.objectFormat`, `createGitObjects(store, { objectFormat })`, `History.objectFormat`, `objectFormatOf()`); trees are encoded and decoded with the format's id length (`decodeTreeBytes(…, { idLength })`, `TreeEntryCursor(bytes, idLength)`), commits sign with `gpgsig-sha256` in SHA-256 (`CommitSignatureHeader`), the empty tree is the format's, abbreviations reach 64 digits (`parseCoreAbbrev(value, hexLength)`), refs check direct values against the format (`isRefObjectId(value, format)`, `RefBatchView.objectFormat`, `createMemoryRefs({ objectFormat })`, `createMemoryHistory({ objectFormat })`), and reflogs write 64-zero null ids.
+  - **vcs-store-files:** `extensions.objectFormat = sha256` is no longer refused (`RepositoryFormat.objectFormat`); `createGitFilesBackend({ create: true, objectFormat })` writes `core.repositoryformatversion = 1` and `extensions.objectformat`. Refused with `UnsupportedObjectFormatError` until their tickets land: a SHA-256 repository holding packs (or a multi-pack-index) and every pack write into one, its index file (`FileStagingStore`, through `GitStagingOptions.objectFormat`), gc, repack and prune, and writing its commit-graph (which is not read either).
+  - **vcs-transport:** fetch, push and serving refuse a SHA-256 repository (`createRepositoryFacade`) until the protocols' `object-format` capability is implemented.
+  - **vcs-commands:** `init().setObjectFormat("sha256")`, `$GIT_DEFAULT_HASH` (`GitHostEnvironment.defaultHash`) and `init.defaultObjectFormat` choose a new repository's format; re-initialising with another one throws `ReinitializeHashError` ("attempt to reinitialize repository with different hash"), an unknown name `UnknownHashAlgorithmError`. `rev-parse --show-object-format` (`addArgument`, `showObjectFormat()`), full and abbreviated 64-hex revisions, `log`, `diff` (`--full-index` too), `fsck` and `notes` (fanned-out trees too) work in SHA-256 repositories; `gc` refuses them. Patch-ids, `format-patch`'s zero commit, porcelain v2 status, rebase's ref updates, `worktree list`, `apply` and submodule summaries use the repository's null and empty ids.
+
+### Patch Changes
+
+- e215caf: **git 3.0 switch.** `GitHostEnvironment.breakingChanges` (and `createNodeGitHostEnvironment({ breakingChanges })`) asks for the behaviour of a git built with `WITH_BREAKING_CHANGES`, the changes planned for git 3.0. Off by default (git 2.5x). The behaviours it changes follow in later releases.
+- Updated dependencies [a8726f7]
+- Updated dependencies [f91199d]
+  - @statewalker/vcs-utils@0.7.0
+
 ## 0.6.0
 
 ### Minor Changes

@@ -1,6 +1,6 @@
 {
   "name": "@statewalker/vcs-store-mem",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "In-memory storage backend for StateWalker VCS",
   "bugs": {
     "url": "https://github.com/statewalker/webrun-vcs/issues"
