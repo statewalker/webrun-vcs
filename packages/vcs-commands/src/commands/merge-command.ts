@@ -1,5 +1,9 @@
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
-import { DEFAULT_BIG_FILE_THRESHOLD, FileMode } from "@statewalker/vcs-core";
+import {
+  DEFAULT_BIG_FILE_THRESHOLD,
+  FileMode,
+  InvalidTreeEntryNameError,
+} from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
@@ -12,6 +16,7 @@ import {
   invalidateCacheTreePath,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
+import { InvalidPathError } from "../errors/checkout-errors.js";
 import { InvalidArgumentError } from "../errors/command-errors.js";
 import { GitApiError } from "../errors/git-api-error.js";
 import {
@@ -76,6 +81,7 @@ import {
   pruneEmptyParents,
   worktreeModified,
 } from "./worktree-overwrite-checks.js";
+import { treePathRefusal, worktreePathRules } from "./worktree-path-rules.js";
 
 /** What `git merge` is asked to do. */
 export enum MergeOperation {
@@ -656,10 +662,48 @@ export class MergeCommand extends GitCommand<MergeResult> {
     }
 
     return this.withAutostash(state, worktree, headId, () =>
-      fastForward
-        ? this.doFastForward(headId, srcId, head, state, worktree)
-        : this.doMerge(headId, srcId, srcRef, head, state, worktree, mergeBases),
+      this.refusingTreePaths(headId, srcId, fastForward, worktree, () =>
+        fastForward
+          ? this.doFastForward(headId, srcId, head, state, worktree)
+          : this.doMerge(headId, srcId, srcRef, head, state, worktree, mergeBases),
+      ),
     );
+  }
+
+  /**
+   * Runs a merge's write; when a tree holds a name the decoder refuses (`..`, `/` in a name,
+   * an empty name), answers as git: `error: invalid path '<path>'` (with merge-ort's
+   * `Merge with strategy ort failed.` when not a fast-forward), or the empty name's death.
+   */
+  private async refusingTreePaths(
+    headId: ObjectId,
+    srcId: ObjectId,
+    fastForward: boolean,
+    worktree: Worktree | undefined,
+    body: () => Promise<MergeResult>,
+  ): Promise<MergeResult> {
+    try {
+      return await body();
+    } catch (error) {
+      if (!(error instanceof InvalidTreeEntryNameError)) throw error;
+      const rules = worktreePathRules(this.workingCopy, worktree);
+      for (const id of [srcId, headId]) {
+        const tree = await this.commits.getTree(id);
+        const refusal = tree ? await treePathRefusal(this.trees, tree, rules) : undefined;
+        if (!refusal) continue;
+        if (!(refusal instanceof InvalidPathError)) throw refusal;
+        return {
+          status: MergeStatus.FAILED,
+          newHead: headId,
+          mergedCommits: [headId, srcId],
+          message: fastForward
+            ? refusal.message
+            : `${refusal.message}\nMerge with strategy ort failed.`,
+          failingPaths: failing([refusal.path]),
+        };
+      }
+      throw error;
+    }
   }
 
   /**

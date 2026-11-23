@@ -2,6 +2,7 @@
  * `git read-tree` (builtin/read-tree.c over unpack-trees.c): read trees into the index,
  * merging them with it (`-m`: one-, two- and three-way), optionally updating the worktree.
  */
+
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
@@ -14,7 +15,7 @@ import {
   type StagingEntry,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
-
+import { InvalidPathError } from "../errors/checkout-errors.js";
 import { ReadTreeFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
@@ -38,6 +39,7 @@ import {
   removeCaseVariants,
   untrackedUnder,
 } from "./worktree-overwrite-checks.js";
+import { firstInvalidPath, withTreePathRefusal, worktreePathRules } from "./worktree-path-rules.js";
 
 /** unpack-trees' `MAX_UNPACK_TREES`. */
 const MAX_UNPACK_TREES = 8;
@@ -168,6 +170,22 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
   }
 
   async call(): Promise<ReadTreeResult> {
+    // a tree entry the decoder refuses (`..`, `/` in a name, an empty name): git's message
+    const trees: ObjectId[] = [];
+    return withTreePathRefusal(
+      this.trees,
+      () => trees,
+      worktreePathRules(this.workingCopy, this.update ? this.worktreeAccess : undefined),
+      () => this.callOnce(trees),
+      (refusal) =>
+        refusal instanceof InvalidPathError
+          ? new ReadTreeFailedError(refusal.message, [refusal.path])
+          : refusal,
+    );
+  }
+
+  /** {@link call}, collecting the trees it reads into `read`. */
+  private async callOnce(read: ObjectId[]): Promise<ReadTreeResult> {
     this.checkCallable();
     this.setCallable(false);
     const fatal = (message: string): never => {
@@ -206,6 +224,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       if (!id) fatal(`Not a valid object name ${name}`);
       if (!tree) fatal(`failed to unpack tree object ${name}`);
       treeIds.push(tree as ObjectId);
+      read.push(tree as ObjectId);
     }
     if (treeIds.length === 0 && !this.empty && !merge) {
       result.warnings.push(
@@ -334,6 +353,14 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
         }
         entries.set(path, e);
       }
+    }
+    const invalid = firstInvalidPath(
+      entries,
+      new Map(),
+      worktreePathRules(this.workingCopy, this.update ? this.worktreeAccess : undefined),
+    );
+    if (invalid !== undefined) {
+      throw new ReadTreeFailedError(`error: invalid path '${invalid}'`, [invalid]);
     }
     assertNoStageZeroClash(new Set(entries.keys()));
     const builder = this.staging.createBuilder();

@@ -498,4 +498,24 @@ git merge -q main`,
     ];
     for (const c of cases) await twin(dir, c);
   });
+
+  it("call() lists thousands of packed branches in linear time (gate H1 of statewalker/webrun-vcs#262)", {
+    timeout: 120_000,
+  }, async () => {
+    // 5,000 packed branches: one ref store lookup per kept branch read packed-refs again for
+    // each (quadratic: 3,000 refs took 4 s, 20,000 ran out of memory)
+    const dir = repo(
+      "many-packed",
+      `git init -q && test_commit one &&
+       for i in $(seq 1 5000); do echo "create refs/heads/b$i HEAD"; done | git update-ref --stdin &&
+       git pack-refs --all`,
+    );
+    const git = await openOurs(dir);
+    const started = Date.now();
+    const refs = await git.branchList().call();
+    const elapsed = Date.now() - started;
+    expect(refs.length).toBe(5001);
+    expect(refs[0]?.name).toBe("refs/heads/b1");
+    expect(elapsed).toBeLessThan(3_000);
+  });
 });

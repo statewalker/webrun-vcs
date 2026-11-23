@@ -591,11 +591,17 @@ export class ListBranchCommand extends RefListingCommand<Ref[]> {
     this.checkCallable();
     this.setCallable(false);
     const { items } = await filterRefs(this.filterSource(), await this.filterOptions(this.kind()));
+    // one listing of the refs, not a lookup per kept branch (a packed ref's lookup reads
+    // packed-refs again: quadratic over thousands of branches)
+    const listed = new Map<string, Ref>();
+    for await (const ref of this.refsStore.list("refs/")) {
+      if (!isSymbolicRef(ref)) listed.set(ref.name, ref);
+    }
     const branches: Ref[] = [];
     for (const item of items) {
       if (item.flags.symref) continue;
-      const ref = await this.refsStore.get(item.refname);
-      if (ref && !isSymbolicRef(ref)) branches.push(ref);
+      const ref = listed.get(item.refname);
+      if (ref) branches.push(ref);
     }
     branches.sort((a, b) => compareRefNames(a.name, b.name));
     return branches;

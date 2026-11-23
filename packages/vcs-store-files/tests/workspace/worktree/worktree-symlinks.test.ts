@@ -67,6 +67,8 @@ describe("FileWorktree and symbolic links", () => {
       executable: true,
       symlinks: true,
       windowsPaths: process.platform === "win32",
+      // the worktree's own verify_path guard: NTFS and HFS+ spellings of .git refused everywhere
+      protects: { ntfs: true, hfs: true },
     });
   });
 
