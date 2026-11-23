@@ -651,8 +651,12 @@ async function collect(options: GcOptions): Promise<GcResult> {
     if (shallow.length > 0 && !dryRun) {
       const stay = shallow.filter((id) => kept.has(id) || walked.has(id));
       if (stay.length < shallow.length) {
-        shallowPruned = shallow.length - stay.length;
-        await writeShallow(files, gitDir, stay);
+        // git's prune_shallow: under shallow.lock, dying when another writer holds it or the
+        // file changed since it was read (a concurrent fetch's new boundary is never undone)
+        if (history.refs.setShallow) {
+          await history.refs.setShallow(stay, shallow);
+          shallowPruned = shallow.length - stay.length;
+        }
       }
     }
 
@@ -787,27 +791,6 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
   return out;
 }
 
-/** Rewrites `shallow` with `ids` (sorted, as git writes its grafts), or removes it if none. */
-async function writeShallow(files: FilesApi, gitDir: string, ids: readonly string[]) {
-  const path = joinPath(gitDir, "shallow");
-  if (ids.length === 0) {
-    await files.remove(path);
-    return;
-  }
-  const tmp = joinPath(gitDir, `shallow_${Math.random().toString(36).slice(2, 8)}`);
-  await files.write(tmp, [
-    new TextEncoder().encode(
-      [...ids]
-        .sort()
-        .map((id) => `${id}\n`)
-        .join(""),
-    ),
-  ]);
-  if (!(await files.move(tmp, path))) {
-    await files.remove(tmp).catch(() => false);
-    throw new Error(`unable to write ${path}`);
-  }
-}
 
 /**
  * git gc's clean_pack_garbage: in `objects/pack`, a pack whose `.idx` has no `.pack` beside

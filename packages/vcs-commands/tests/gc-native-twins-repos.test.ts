@@ -6,18 +6,29 @@
  * t5310-pack-bitmaps), grafts (t6001-rev-list-graft, t5304-prune) and `--auto`
  * (t6500-gc).
  */
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  copyTwin,
   DAY,
   gcTwins,
   initRepo,
   NativeRepo,
   NOW,
+  nativeGc,
   newCase,
+  openOursGc,
   seventeenBlobs,
 } from "./gc-native-twins-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
@@ -337,5 +348,43 @@ describeGit("gc twins: --auto", () => {
       r.git(["repack", "-dq"]);
     }
     await gcTwins(root, caseDir, { ...auto, twice: false });
+  });
+});
+
+describeGit("gc and a concurrent shallow writer", () => {
+  it("prune_shallow takes shallow.lock: a held lock fails gc and leaves shallow, as native", async () => {
+    const caseDir = newCase(root, "shallow-locked");
+    const server = initRepo(root, caseDir, false, "server");
+    server.commit("one", { "a.txt": "a\n" });
+    server.commit("two", { "a.txt": "a2\n" });
+    server.git(["checkout", "-q", "-b", "side", "HEAD~1"]);
+    server.commit("side", { "s.txt": "s\n" });
+    server.git(["checkout", "-q", "main"]);
+    const src = new NativeRepo(root, join(caseDir, "src"));
+    src.git([
+      "clone",
+      "-q",
+      "--depth=1",
+      "--no-single-branch",
+      `file://${join(caseDir, "src", "server")}`,
+      "repo",
+    ]);
+    const r = new NativeRepo(root, join(caseDir, "src", "repo"));
+    r.git(["update-ref", "-d", "refs/remotes/origin/side"]);
+    r.git(["reflog", "expire", "--expire=now", "--all"]);
+    // a fetch updating shallow holds its lock
+    writeFileSync(join(caseDir, "src", "repo", ".git", "shallow.lock"), "");
+    const native = copyTwin(caseDir, "native");
+    const ours = copyTwin(caseDir, "ours");
+    const shallowOf = (twin: string) => readFileSync(join(twin, "repo", ".git", "shallow"), "utf8");
+    const before = shallowOf(ours);
+    expect(before.trim().split("\n")).toHaveLength(2);
+    const theirs = nativeGc(root, join(native, "repo"), ["--prune=now"]);
+    expect(theirs.status).not.toBe(0);
+    expect(theirs.stderr).toContain("shallow.lock");
+    const git = await openOursGc(root, ours);
+    await expect(git.gc().setPrune("now").call()).rejects.toThrow(/shallow/);
+    expect(shallowOf(ours)).toBe(before);
+    expect(shallowOf(native)).toBe(before);
   });
 });
