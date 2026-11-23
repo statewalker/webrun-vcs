@@ -6,6 +6,7 @@ import {
   type TreeEntry,
 } from "@statewalker/vcs-core";
 import { FileStagingStore } from "@statewalker/vcs-store-files";
+import { compilePosixRegex, type PosixRegex } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import {
@@ -35,8 +36,16 @@ import { RemoteConfigStore } from "../remote-config/index.js";
 import { AddCommand } from "./add-command.js";
 import { worktreeModeTrust } from "./core-config.js";
 import { DEFAULT_DATE_MODE, showDate } from "./date-format.js";
-import { hostEnvironmentOf, withoutCrud } from "./git-ident.js";
+import { approxidateCareful } from "./git-date.js";
+import {
+  hostEnvironmentOf,
+  InvalidDateError,
+  InvalidIdentError,
+  parseGitDate,
+  withoutCrud,
+} from "./git-ident.js";
 import { IndexAdder, readGitlinkHead } from "./index-adder.js";
+import { readRepositoryMailmap } from "./mailmap.js";
 import {
   flatTree,
   OperationState,
@@ -75,6 +84,15 @@ import {
 } from "./status-command.js";
 import { type CommitWhence, StatusPrinter } from "./status-format.js";
 import { readDiffSubmoduleConfig } from "./submodule-summary.js";
+import {
+  amendWithTrailers,
+  appendSignoff,
+  ignoredLogMessageBytes,
+  signoffLine,
+  type TrailerCommandRunner,
+  trailerConfigOf,
+  validateTrailerArgs,
+} from "./trailers.js";
 
 /**
  * Result of a commit operation.
@@ -166,6 +184,16 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private nullTermination = false;
   private aheadBehind?: boolean;
   private templateFile?: string;
+  /** `--author=<string>` as given: `Name <email>`, or a pattern of an existing author */
+  private authorString?: string;
+  /** `--date=<date>`, and the clock its relative forms count from */
+  private forceDate?: { text: string; now?: number };
+  private signoff = false;
+  private trailerArgs: string[] = [];
+  /** `-C <commit>`: the commit whose message (and author) are reused */
+  private reuseMessage?: string;
+  /** The commit `-C` names, read once the options are checked */
+  private reused?: Commit;
 
   /**
    * Set the commit message, as git's `commit -m` takes it: its last line is ended and it is
@@ -224,17 +252,78 @@ export class CommitCommand extends GitCommand<CommitResult> {
   }
 
   /**
-   * Set the author identity.
+   * Set the author identity (git's `--author`): a name and an email, or one string as git's
+   * `--author=<author>` takes it. A string with a `>` is `Name <email>` (refused as
+   * `fatal: malformed --author parameter` without a `<`); any other is a pattern looked up as
+   * git's `find_author_by_nickname` does: the newest commit of `--all` whose (mailmapped)
+   * author matches it as a basic regular expression, ignoring case, gives its `Name <email>`,
+   * else `fatal: --author '<x>' is not 'Name <email>' and matches no existing author`.
    *
-   * @param name Author name
+   * @example
+   * ```typescript
+   * await git.commit().setAuthor("Ada <ada@example.com>").setMessage("m").call();
+   * await git.commit().setAuthor("ada").setMessage("m").call(); // an existing author
+   * ```
+   *
+   * @param name Author name, or the whole `--author` string when `email` is not given
    * @param email Author email
    */
-  setAuthor(name: string, email: string): this {
+  setAuthor(name: string, email?: string): this {
     this.checkCallable();
     // git's --author: the name and email; the date is the amended commit's, the picked
     // commit's, else GIT_AUTHOR_DATE or now
     this.author = undefined;
-    this.authorName = { name, email };
+    if (email === undefined) {
+      this.authorName = undefined;
+      this.authorString = name;
+    } else {
+      this.authorString = undefined;
+      this.authorName = { name, email };
+    }
+    return this;
+  }
+
+  /**
+   * `--date=<date>`: the author's date, in any form git's `parse_date` reads (`@<seconds>
+   * <offset>`, RFC 2822, ISO 8601, ...) or else as `approxidate` reads it (`yesterday`,
+   * `2.weeks.ago`, `noon`), counting from `now` (seconds; default the command's clock, git's
+   * `GIT_TEST_DATE_NOW`). A date git cannot read fails as `fatal: invalid date format: <date>`.
+   */
+  setDate(date: string, options: { now?: number } = {}): this {
+    this.checkCallable();
+    this.forceDate = { text: date, ...(options.now !== undefined ? { now: options.now } : {}) };
+    return this;
+  }
+
+  /**
+   * `-s` / `--signoff`: a `Signed-off-by: <committer>` trailer added to the message as git's
+   * `append_signoff` adds it (after a blank line unless the message ends with trailers; none
+   * when the last trailer is that line already).
+   */
+  setSignoff(signoff: boolean): this {
+    this.checkCallable();
+    this.signoff = signoff;
+    return this;
+  }
+
+  /**
+   * `--trailer <token>[(=|:)<value>]`: a trailer added to the message as `git
+   * interpret-trailers --no-divider --trailer` adds it (`trailer.*` configuration applies).
+   * Each call adds one, in order.
+   */
+  addTrailer(trailer: string): this {
+    this.checkCallable();
+    this.trailerArgs.push(trailer);
+    return this;
+  }
+
+  /**
+   * `-C <commit>`: the commit's message taken as it is, and its author (name, email and
+   * date) unless {@link setResetAuthor}. With {@link setEdit}(true) it is `-c`.
+   */
+  setReuseMessage(commit: string): this {
+    this.checkCallable();
+    this.reuseMessage = commit;
     return this;
   }
 
@@ -277,8 +366,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
   }
 
   /**
-   * `--reset-author`: an amended commit, or the commit that concludes a cherry-pick, is
-   * authored as a new one (the author resolved as git resolves it, dated now) instead of
+   * `--reset-author`: an amended commit, a `-C` commit, or the commit that concludes a
+   * cherry-pick, is authored as a new one (the author resolved as git resolves it, dated now) instead of
    * keeping the earlier commit's author.
    *
    * @param reset Whether to reset the author
@@ -646,7 +735,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
   /** git's use_editor: an editor is set, and no message is given or `-e` asks for it. */
   private usesEditor(): boolean {
     if (!this.editor || this.edit === false) return false;
-    return this.edit === true || this.message === undefined;
+    return this.edit === true || (this.message === undefined && this.reuseMessage === undefined);
   }
 
   /**
@@ -676,7 +765,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
     const { state } = ctx;
     const config = RemoteConfigStore.from(this.workingCopy);
     const mode = editorCleanupMode(this.workingCopy, this.cleanupMode);
-    const templateText = await this.readTemplate(config);
+    // (-m and -C drop the template: git frees template_file)
+    const templateText =
+      this.message !== undefined || this.reused ? undefined : await this.readTemplate(config);
     const rebasing = (await state.read("rebase-merge/head-name")) !== undefined;
     const whence: CommitWhence =
       ctx.mergeHeads.length > 0
@@ -692,6 +783,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     const mergeMsg = await state.read("MERGE_MSG");
     const squashMsg = await state.read("SQUASH_MSG");
     if (this.message !== undefined) sb = completeLine(this.message);
+    else if (this.reused) sb = this.reused.message.replace(/^(?:[ \t\r]*\n)+/, "");
     else if (this.amend && ctx.previousCommit) {
       sb = ctx.previousCommit.message.replace(/^(?:[ \t\r]*\n)+/, "");
     } else if (mergeMsg !== undefined) {
@@ -705,11 +797,13 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // clean_message_contents: not for a template, which goes in as it is
     const fromTemplate =
       this.message === undefined &&
+      !this.reused &&
       !(this.amend && ctx.previousCommit) &&
       mergeMsg === undefined &&
       squashMsg === undefined &&
       templateText !== undefined;
     if (mode !== CleanupMode.VERBATIM && !fromTemplate) sb = stripspace(sb);
+    sb = this.signedOff(sb, ctx.committer);
     // core.commentChar=auto: a character the message does not start a line with
     const comment = commentPrefixOf(this.workingCopy, sb);
     // (a prepared message taken without an editor: as `--no-status`, unless asked for)
@@ -791,8 +885,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
         : this.objectFormat.emptyTreeId;
       committable = ctx.treeId !== parentTree;
     }
-    // COMMIT_EDITMSG written in full, then an empty commit refused before the editor runs
+    // COMMIT_EDITMSG written in full, its trailers added (amend_file_with_trailers), then an
+    // empty commit refused before the editor runs
     await state.write("COMMIT_EDITMSG", template);
+    template = await this.withTrailers(template, state, comment);
     const isMerge = (ctx.previousCommit?.parents.length ?? 0) > 1;
     if (!committable && whence !== "merge" && !this.allowEmpty && !(this.amend && isMerge)) {
       throw new EmptyCommitError();
@@ -833,6 +929,59 @@ export class CommitCommand extends GitCommand<CommitResult> {
       cleanup: mode === CleanupMode.VERBATIM ? mode : CleanupMode.STRIP,
       untouched: templateUntouched(text, templateText, mode, comment),
     };
+  }
+
+  /**
+   * `-s`: the message so far with the committer's sign-off (append_signoff with
+   * ignored_log_message_bytes: before trailing comments and the scissors line).
+   */
+  private signedOff(message: string, committer: PersonIdent): string {
+    if (!this.signoff) return message;
+    const config = trailerConfigOf(this.workingCopy);
+    return appendSignoff(
+      message,
+      signoffLine(committer),
+      config,
+      false,
+      ignoredLogMessageBytes(message, config.commentString),
+    );
+  }
+
+  /**
+   * `--trailer`: COMMIT_EDITMSG (written as `message`) with the trailers added, as git's
+   * amend_file_with_trailers (2.43: a child `interpret-trailers --in-place --no-divider`,
+   * which takes an empty argument for nothing and refuses none); the new text, written back.
+   */
+  private async withTrailers(
+    message: string,
+    state: OperationState,
+    comment: string | undefined,
+  ): Promise<string> {
+    if (this.trailerArgs.length === 0) return message;
+    const hooks = this.hooks;
+    const compatibility = hooks.compatibility;
+    const config = {
+      ...trailerConfigOf(this.workingCopy),
+      ...(comment !== undefined ? { commentString: comment } : {}),
+      compatibility,
+    };
+    let args = this.trailerArgs;
+    if (compatibility === "2.43") args = args.filter((a) => a !== "");
+    else {
+      const refused = validateTrailerArgs(args, config);
+      if (refused !== undefined) {
+        throw new GitApiError(`${refused}\nfatal: unable to pass trailers to --trailers`, {
+          exitCode: 128,
+        });
+      }
+    }
+    if (args.length === 0) return message;
+    const runCommand: TrailerCommandRunner | undefined = hooks.enabled
+      ? (command) => hooks.runShellCommand("trailer", command.command, command.args)
+      : undefined;
+    const { output } = await amendWithTrailers(message, args, config, runCommand);
+    await state.write("COMMIT_EDITMSG", output);
+    return output;
   }
 
   /**
@@ -995,6 +1144,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     readShowUntrackedFiles(this.workingCopy);
     // ... and git_diff_ui_config: a diff.submodule without a value dies
     readDiffSubmoduleConfig(this.workingCopy);
+    await this.parseAuthorOptions();
     // the index as it is now: one another writer replaced is read again (git reads the
     // index at its start), unless this instance holds unwritten edits (refused)
     await this.readCurrentIndex();
@@ -1032,6 +1182,177 @@ export class CommitCommand extends GitCommand<CommitResult> {
       await index.release();
       throw error;
     }
+  }
+
+  /**
+   * parse_and_validate_options' handling of `--author`, `-m` with `-C`, `--reset-author`,
+   * and `-C`'s commit (read_commit_message), in git's order.
+   */
+  private async parseAuthorOptions(): Promise<void> {
+    if (this.authorString !== undefined) {
+      let text = this.authorString;
+      if (!text.includes(">")) text = await this.findAuthorByNickname(text);
+      if (this.resetAuthor) {
+        throw new IncompatibleOptionsError(
+          ["--reset-author", "--author"],
+          "fatal: options '--reset-author' and '--author' cannot be used together",
+        );
+      }
+      // split_ident_line: the name up to the `<` (trailing spaces dropped), the email up to
+      // the first `>` after it
+      const lt = text.indexOf("<");
+      const gt = lt < 0 ? -1 : text.indexOf(">", lt + 1);
+      if (gt < 0) {
+        throw new InvalidArgumentError(
+          "author",
+          this.authorString,
+          "fatal: malformed --author parameter",
+        );
+      }
+      const name = text.slice(0, lt).replace(/[ \t\n\v\f\r]+$/, "");
+      this.authorName = { name, email: text.slice(lt + 1, gt) };
+    }
+    if (this.message !== undefined && this.reuseMessage !== undefined) {
+      throw new IncompatibleOptionsError(
+        ["-m", "-C"],
+        "fatal: options '-m' and '-C' cannot be used together",
+      );
+    }
+    if (this.reuseMessage !== undefined) {
+      const name = this.reuseMessage;
+      const id = await this.resolveRef(name, (n) => `fatal: could not lookup commit '${n}'`).catch(
+        (error) => {
+          if (error instanceof RefNotFoundError) {
+            throw new RefNotFoundError(name, `fatal: could not lookup commit '${name}'`);
+          }
+          throw error;
+        },
+      );
+      const commit = await this.commits.load(id);
+      if (!commit) throw new RefNotFoundError(name, `fatal: could not lookup commit '${name}'`);
+      this.reused = commit;
+    }
+    if (this.forceDate) this.forcedDate();
+  }
+
+  /** A blob's bytes, undefined when it cannot be read. */
+  private async readBlobBytes(id: ObjectId): Promise<Uint8Array | undefined> {
+    try {
+      const content = await this.blobs.load(id);
+      if (!content) return undefined;
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for await (const c of content) {
+        chunks.push(c);
+        size += c.length;
+      }
+      const out = new Uint8Array(size);
+      let at = 0;
+      for (const c of chunks) {
+        out.set(c, at);
+        at += c.length;
+      }
+      return out;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * `--date` (parse_force_date): the date as `parse_date` reads it, else as `approxidate`
+   * does, refused as git refuses it.
+   */
+  private forcedDate(): Pick<PersonIdent, "timestamp" | "tzOffset"> | undefined {
+    if (!this.forceDate) return undefined;
+    const { text } = this.forceDate;
+    const parsed = parseGitDate(text);
+    if (parsed) return parsed;
+    const approx = approxidateCareful(text, this.forceDate.now ?? this.clock());
+    // fmt_ident's parse_date of `@<seconds>`: the local offset of that time
+    const date = approx.error ? undefined : parseGitDate(`@${approx.timestamp}`);
+    if (!date) throw new InvalidDateError(text);
+    return date;
+  }
+
+  /**
+   * builtin/commit.c's find_author_by_nickname: the first commit of `rev-list --all -i
+   * --author=<name>` (newest first, the mailmap applied before matching) gives `%aN <%aE>`.
+   */
+  private async findAuthorByNickname(name: string): Promise<string> {
+    let pattern: PosixRegex;
+    try {
+      pattern = compilePosixRegex(name, { icase: true });
+    } catch (error) {
+      throw new InvalidArgumentError(
+        "author",
+        name,
+        `fatal: '${name}': ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const mailmap = await readRepositoryMailmap({
+      config: (key) => config.value(key),
+      worktree: this.worktreeAccess,
+      environment: hostEnvironmentOf(this.workingCopy),
+      readBlobNamed: async (blob) => {
+        const id = await this.revisionResolver()
+          .resolve(blob)
+          .catch(() => undefined);
+        return id ? this.readBlobBytes(id) : undefined;
+      },
+    });
+    const encoder = new TextEncoder();
+    // revision.c's walk of --all: refs under refs/ in name order, then HEAD, tags peeled;
+    // commits come out by commit date, newest first
+    const starts: { name: string; id: ObjectId }[] = [];
+    for await (const ref of this.refsStore.list()) {
+      if (!ref.name.startsWith("refs/")) continue;
+      let id = "objectId" in ref ? ref.objectId : undefined;
+      if (!id) id = (await this.refsStore.resolve(ref.name).catch(() => undefined))?.objectId;
+      if (id) starts.push({ name: ref.name, id });
+    }
+    starts.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    const head = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
+    const ids = starts.map((s) => s.id);
+    if (head) ids.push(head);
+    const queue: { id: ObjectId; commit: Commit; date: number; order: number }[] = [];
+    const seen = new Set<ObjectId>();
+    let order = 0;
+    const put = async (start: ObjectId) => {
+      let id = start;
+      const tags = this.tagsStore;
+      for (let depth = 0; depth < 32 && tags && (await tags.has(id).catch(() => false)); depth++) {
+        const tag = await tags.load(id).catch(() => undefined);
+        if (!tag) break;
+        id = tag.object;
+      }
+      if (seen.has(id)) return;
+      const commit = await this.commits.load(id).catch(() => undefined);
+      if (!commit) return;
+      seen.add(id);
+      queue.push({ id, commit, date: commit.committer.timestamp, order: order++ });
+    };
+    for (const id of ids) await put(id);
+    while (queue.length > 0) {
+      let best = 0;
+      for (let i = 1; i < queue.length; i++) {
+        const a = queue[i] as (typeof queue)[number];
+        const b = queue[best] as (typeof queue)[number];
+        if (a.date > b.date || (a.date === b.date && a.order < b.order)) best = i;
+      }
+      const [next] = queue.splice(best, 1);
+      if (!next) break;
+      const who = mailmap.map(next.commit.author.name, next.commit.author.email);
+      if (pattern.test(encoder.encode(`${who.name} <${who.email}>`))) {
+        return `${who.name} <${who.email}>`;
+      }
+      for (const parent of next.commit.parents) await put(parent);
+    }
+    throw new InvalidArgumentError(
+      "author",
+      name,
+      `fatal: --author '${name}' is not 'Name <email>' and matches no existing author`,
+    );
   }
 
   /** `-i <paths>`: parse_and_validate_options' and prepare_index's refusals. */
@@ -1084,6 +1405,13 @@ export class CommitCommand extends GitCommand<CommitResult> {
     const state = new OperationState(this.workingCopy.checkout, this.refsStore);
     const mergeHeads = await this.mergeHeads(state);
     const pickHead = await state.ref("CHERRY_PICK_HEAD");
+    if (this.resetAuthor && !this.amend && !this.reused && !pickHead) {
+      throw new InvalidArgumentError(
+        "reset-author",
+        true,
+        "fatal: --reset-author can be used only with -C, -c or --amend.",
+      );
+    }
     if (this.amend && mergeHeads.length > 0) {
       throw new InvalidArgumentError(
         "amend",
@@ -1208,17 +1536,73 @@ export class CommitCommand extends GitCommand<CommitResult> {
     const mergeMsgPresent =
       (await state.read("MERGE_MSG")) !== undefined ||
       (await state.read("SQUASH_MSG")) !== undefined;
+    const reused = this.reused;
     const editorLike =
       this.usesEditor() ||
-      (this.message === undefined && !this.amend && this.edit !== false && mergeMsgPresent);
+      (this.message === undefined &&
+        !reused &&
+        !this.amend &&
+        this.edit !== false &&
+        mergeMsgPresent);
     const editor: CommitEditor = this.usesEditor()
       ? (this.editor as CommitEditor)
       : async () => undefined;
     const message = this.message;
-    if (!editorLike && message === undefined && !this.amend && !mergeMsgPresent) {
+    if (!editorLike && message === undefined && !reused && !this.amend && !mergeMsgPresent) {
       throw new NoMessageError();
     }
 
+    let previousCommit: Commit | undefined;
+    let amendedId: ObjectId | undefined;
+
+    if (this.amend) {
+      const headId = await this.resolveHead();
+      amendedId = headId;
+      previousCommit = await this.commits.load(headId);
+      if (!previousCommit) {
+        throw new NoHeadError("Cannot amend: HEAD commit not found");
+      }
+    }
+
+    // The author (git's determine_author_info, which prepare_to_commit runs before the
+    // pre-commit hook): the one given; else an amended commit's or
+    // a concluded cherry-pick's author (its date too; `--author` replaces only the name and
+    // email), unless --reset-author; else resolved as git does (GIT_AUTHOR_*, author.*,
+    // user.*, GIT_AUTHOR_DATE or now)
+    let author = this.author;
+    if (!author) {
+      // (git's author_message: a cherry-pick's CHERRY_PICK_HEAD, else -C's commit, else the
+      // amended HEAD)
+      const kept = this.resetAuthor
+        ? undefined
+        : pickHead
+          ? (await this.commits.load(pickHead))?.author
+          : reused
+            ? reused.author
+            : this.amend && previousCommit
+              ? previousCommit.author
+              : undefined;
+      // fmt_ident's IDENT_STRICT refusals of the name chosen (an empty one, crud only)
+      if (kept || this.authorName) {
+        strictAuthorName(
+          this.authorName?.name ?? (kept as PersonIdent).name,
+          this.authorName?.email ?? (kept as PersonIdent).email,
+        );
+      }
+      if (kept) {
+        author = this.authorName
+          ? {
+              ...kept,
+              name: withoutCrud(this.authorName.name),
+              email: withoutCrud(this.authorName.email),
+            }
+          : kept;
+      } else if (this.authorName) author = this.datedIdent("author", this.authorName);
+      else author = this.resolveAuthor(this.committer ?? this.committerName);
+    }
+    // --date: the author's date, whatever gave the rest
+    const forced = this.forcedDate();
+    if (forced) author = { ...author, ...forced };
     // prepare_to_commit's pre-commit hook (not with --no-verify), over the index the commit
     // records (the lock `-a` and a partial commit wrote); a hook that ran may have changed
     // the index, which is read again (git's discard_index + read_index_from)
@@ -1281,42 +1665,6 @@ export class CommitCommand extends GitCommand<CommitResult> {
       // a stored subtree no edit touched stays the one stored)
       treeId = await writeIndexAsTree(this.staging, this.trees, this.objectFormat);
     }
-    let previousCommit: Commit | undefined;
-    let amendedId: ObjectId | undefined;
-
-    if (this.amend) {
-      const headId = await this.resolveHead();
-      amendedId = headId;
-      previousCommit = await this.commits.load(headId);
-      if (!previousCommit) {
-        throw new NoHeadError("Cannot amend: HEAD commit not found");
-      }
-    }
-
-    // The author (git's determine_author_info): the one given; else an amended commit's or
-    // a concluded cherry-pick's author (its date too; `--author` replaces only the name and
-    // email), unless --reset-author; else resolved as git does (GIT_AUTHOR_*, author.*,
-    // user.*, GIT_AUTHOR_DATE or now)
-    let author = this.author;
-    if (!author) {
-      const kept = this.resetAuthor
-        ? undefined
-        : this.amend && previousCommit
-          ? previousCommit.author
-          : pickHead
-            ? (await this.commits.load(pickHead))?.author
-            : undefined;
-      if (kept) {
-        author = this.authorName
-          ? {
-              ...kept,
-              name: withoutCrud(this.authorName.name),
-              email: withoutCrud(this.authorName.email),
-            }
-          : kept;
-      } else if (this.authorName) author = this.datedIdent("author", this.authorName);
-      else author = this.resolveAuthor(this.committer ?? this.committerName);
-    }
     // the committer: always resolved (GIT_COMMITTER_*, committer.*, user.*), unless given
     const committer =
       this.committer ??
@@ -1339,7 +1687,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
           previousCommit,
           author,
           committer,
-          authorKept: !this.author && !this.resetAuthor && (!!previousCommit || !!pickHead),
+          // author_date_is_interesting: an author_message, or --date
+          authorKept:
+            !this.author &&
+            (this.forceDate !== undefined ||
+              (!this.resetAuthor && (!!previousCommit || !!pickHead || !!reused))),
           hookEnv,
         },
         editor,
@@ -1356,6 +1708,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       cleanup = commitCleanupMode(this.workingCopy, this.cleanupMode);
       let sb: string;
       if (message !== undefined) sb = completeLine(message);
+      else if (reused) sb = reused.message.replace(/^(?:[ \t\r]*\n)+/, "");
       else if (previousCommit) sb = previousCommit.message.replace(/^(?:[ \t\r]*\n)+/, "");
       else {
         const mergeMsg = await state.read("MERGE_MSG");
@@ -1363,7 +1716,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
         sb = mergeMsg !== undefined ? `${squashMsg ?? ""}${mergeMsg}` : (squashMsg ?? "");
       }
       if (cleanup !== CleanupMode.VERBATIM) sb = stripspace(sb);
+      sb = this.signedOff(sb, committer);
       await state.write("COMMIT_EDITMSG", sb);
+      // amend_file_with_trailers over COMMIT_EDITMSG
+      sb = await this.withTrailers(sb, state, undefined);
       await this.refuseNothingToCommit(treeId, parents, mergeHeads, previousCommit);
       // prepare-commit-msg and commit-msg, which may rewrite COMMIT_EDITMSG: the commit
       // takes the file's text (cmd_commit reads it back)
@@ -1593,6 +1949,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     pickHead: ObjectId | undefined,
   ): string[] {
     if (this.message !== undefined) return ["message"];
+    if (this.reuseMessage !== undefined) return ["commit", this.reuseMessage];
     // --amend without a message reuses HEAD's (git's use_message = "HEAD")
     if (this.amend) return ["commit", "HEAD"];
     if (mergeMsg !== undefined) return [squashMsg !== undefined ? "squash" : "merge"];
@@ -2177,4 +2534,15 @@ export type CommitEditor = (path: string, text: string) => Promise<unknown>;
 export interface CommitDryRunResult extends StatusTextResult {
   /** 0 when there is something to commit, 1 when not (dry_run_commit) */
   exitCode: number;
+}
+
+/**
+ * fmt_ident's IDENT_STRICT checks of an author name given or kept (`--author`, `-C`,
+ * `--amend`): an empty name, or one of crud only, refused with git's line.
+ */
+function strictAuthorName(name: string, email: string): void {
+  if (name === "") throw new InvalidIdentError("author", "empty", email, false);
+  if (![...name].some((c) => !(c <= " " || ",:;<>\"\\'".includes(c)))) {
+    throw new InvalidIdentError("author", "crud", name, false);
+  }
 }
