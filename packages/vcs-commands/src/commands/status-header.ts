@@ -105,7 +105,10 @@ export async function readStatusHeader(
 }
 
 /** wt-status.c's `get_branch`: a rebase's or bisect's branch file as status names it. */
-async function getBranch(source: StatusHeaderSource, name: string): Promise<string | undefined> {
+async function getBranch(
+  source: Omit<StatusHeaderSource, "tracking">,
+  name: string,
+): Promise<string | undefined> {
   const text = await source.state.read(name);
   if (text === undefined || text.length === 0) return undefined;
   const value = text.replace(/\n+$/, "");
@@ -121,7 +124,7 @@ async function getBranch(source: StatusHeaderSource, name: string): Promise<stri
 
 /** wt_status_get_state (and the split-commit and todo reads of the long format). */
 async function readStatusState(
-  source: StatusHeaderSource,
+  source: Omit<StatusHeaderSource, "tracking">,
   branch: string | undefined,
   options: StatusHeaderOptions,
 ): Promise<StatusState> {
@@ -210,7 +213,10 @@ async function readStatusState(
 }
 
 /** wt_status_get_detached_from: the last `checkout: moving from X to Y` of HEAD's reflog. */
-async function detachedFrom(source: StatusHeaderSource, state: StatusState): Promise<void> {
+async function detachedFrom(
+  source: Omit<StatusHeaderSource, "tracking">,
+  state: StatusState,
+): Promise<void> {
   const log = await source.refs.getReflog?.("HEAD");
   if (!log) return;
   let target: string | undefined;
@@ -246,7 +252,7 @@ async function detachedFrom(source: StatusHeaderSource, state: StatusState): Pro
 
 /** split_commit_in_progress. */
 async function splitCommitInProgress(
-  source: StatusHeaderSource,
+  source: Omit<StatusHeaderSource, "tracking">,
   branch: string | undefined,
   options: StatusHeaderOptions,
 ): Promise<boolean> {
@@ -271,7 +277,10 @@ async function splitCommitInProgress(
  * and blank lines dropped, the object names of picks (and the like) abbreviated. Undefined
  * when the file is missing.
  */
-async function todoList(source: StatusHeaderSource, name: string): Promise<string[] | undefined> {
+async function todoList(
+  source: Omit<StatusHeaderSource, "tracking">,
+  name: string,
+): Promise<string[] | undefined> {
   const text = await source.state.read(name);
   if (text === undefined) return undefined;
   const out: string[] = [];
@@ -287,7 +296,7 @@ async function todoList(source: StatusHeaderSource, name: string): Promise<strin
 }
 
 /** The comment character of todo files (`core.commentChar`, default `#`). */
-function commentChar(source: StatusHeaderSource): string {
+function commentChar(source: Omit<StatusHeaderSource, "tracking">): string {
   const value = source.config("core.commentChar") ?? source.config("core.commentString");
   return value && value !== "auto" ? value : "#";
 }
@@ -309,7 +318,10 @@ const ABBREVIATED_COMMANDS = new Set([
 ]);
 
 /** format_todo_line: the object name after the command abbreviated where it is one. */
-async function formatTodoLine(source: StatusHeaderSource, line: string): Promise<string> {
+async function formatTodoLine(
+  source: Omit<StatusHeaderSource, "tracking">,
+  line: string,
+): Promise<string> {
   const m = /^(\S+)([ \t]+)(.*)$/.exec(line);
   if (!m) return line;
   const command = m[1] as string;
@@ -329,4 +341,26 @@ async function formatTodoLine(source: StatusHeaderSource, line: string): Promise
   const abbrev = await source.abbreviate(word.toLowerCase());
   if (!word.startsWith(abbrev)) return line;
   return `${command}${m[2]}${lead}${abbrev}${rest.slice(word.length)}`;
+}
+
+/**
+ * ref-filter.c's get_head_description: how `git branch` names a detached HEAD
+ * (`(HEAD detached at v1)`, `(no branch, rebasing main)`, ...).
+ */
+export async function readHeadDescription(
+  source: Omit<StatusHeaderSource, "tracking" | "entries">,
+): Promise<string> {
+  const state = await readStatusState({ ...source, entries: [] }, "HEAD", {});
+  if (state.rebaseInProgress || state.rebaseInteractiveInProgress) {
+    return state.branch !== undefined
+      ? `(no branch, rebasing ${state.branch})`
+      : `(no branch, rebasing detached HEAD ${state.detachedFrom ?? ""})`;
+  }
+  if (state.bisectInProgress) return `(no branch, bisect started on ${state.bisectingFrom ?? ""})`;
+  if (state.detachedFrom !== undefined) {
+    return state.detachedAt
+      ? `(HEAD detached at ${state.detachedFrom})`
+      : `(HEAD detached from ${state.detachedFrom})`;
+  }
+  return "(no branch)";
 }

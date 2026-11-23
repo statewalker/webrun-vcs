@@ -92,6 +92,8 @@ export interface RefFilterOptions {
   noMerged?: readonly ObjectId[];
   /** `--start-after`: refs sorting after this name only */
   startAfter?: string;
+  /** Only refs naming a commit (`branch -v`: git's `filter->verbose`) */
+  needCommit?: boolean;
 }
 
 /** A sort key (git's `struct ref_sorting`). */
@@ -291,6 +293,7 @@ export async function filterRefs(
     filter.matchAsPath ? matchNameAsPath(list, name, icase) : matchPattern(list, name, icase);
   const pointsAt = filter.pointsAt?.length ? new Set(filter.pointsAt) : undefined;
   const reach =
+    !!filter.needCommit ||
     !!filter.contains?.length ||
     !!filter.noContains?.length ||
     !!filter.merged?.length ||

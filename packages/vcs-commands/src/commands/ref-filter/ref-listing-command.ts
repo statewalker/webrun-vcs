@@ -17,6 +17,7 @@ import {
 
 import { wildmatch } from "@statewalker/vcs-working-tree";
 
+import { RefFilterError } from "../../errors/index.js";
 import { GitCommand } from "../../git-command.js";
 import { RemoteConfigStore } from "../../remote-config/index.js";
 import { applyRefspecs } from "../branch-tracking.js";
@@ -159,6 +160,67 @@ export abstract class RefListingCommand<T> extends GitCommand<T> {
       ...(objectId ? { objectId } : {}),
       packed: entry.storage === RefStorage.PACKED,
       ...(peeled ? { peeledId: peeled } : {}),
+    };
+  }
+
+  /**
+   * The objects of `--points-at` and the commits of `--contains`, `--no-contains`,
+   * `--merged` and `--no-merged`, resolved as parse_options' callbacks do, with their
+   * refusals (`error: malformed object name x`, `error: object ... is a tree, not a commit`).
+   *
+   * @throws RefFilterError where git's option parsing fails (129) or dies (128)
+   */
+  protected async resolveFilterArgs(args: {
+    pointsAt: readonly string[];
+    contains: readonly string[];
+    noContains: readonly string[];
+    merged: readonly string[];
+    noMerged: readonly string[];
+  }): Promise<{
+    pointsAt: ObjectId[];
+    contains: ObjectId[];
+    noContains: ObjectId[];
+    merged: ObjectId[];
+    noMerged: ObjectId[];
+  }> {
+    const resolver = this.revisionResolver();
+    const usage = (message: string) => new RefFilterError(message, 129);
+    const objectOf = async (name: string) =>
+      resolver.resolve(name, { quiet: true }).catch(() => undefined);
+    const pointsAt: ObjectId[] = [];
+    for (const name of args.pointsAt) {
+      const id = await objectOf(name);
+      if (!id) throw usage(`error: malformed object name '${name}'`);
+      pointsAt.push(id);
+    }
+    const commitsOf = async (names: readonly string[], merge: string | undefined) => {
+      const out: ObjectId[] = [];
+      for (const name of names) {
+        const id = await objectOf(name);
+        if (!id) {
+          if (merge) throw new RefFilterError(`fatal: malformed object name ${name}`, 128);
+          throw usage(`error: malformed object name ${name}`);
+        }
+        const commit = await resolver.commitReference(id).catch(() => undefined);
+        if (!commit) {
+          const type = (await resolver.objectType(id).catch(() => undefined)) ?? "unknown";
+          const notCommit = `error: object ${id} is a ${type}, not a commit`;
+          throw usage(
+            merge
+              ? `${notCommit}\nerror: option \`${merge}' must point to a commit`
+              : `${notCommit}\nerror: no such commit ${name}`,
+          );
+        }
+        out.push(commit);
+      }
+      return out;
+    };
+    return {
+      pointsAt,
+      contains: await commitsOf(args.contains, undefined),
+      noContains: await commitsOf(args.noContains, undefined),
+      merged: await commitsOf(args.merged, "merged"),
+      noMerged: await commitsOf(args.noMerged, "no-merged"),
     };
   }
 
