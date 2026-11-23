@@ -288,7 +288,10 @@ describeGit("gc twins: expiry and storage", () => {
   it("t5329-pack-objects-cruft 'gc.maxCruftSize'", async () => {
     const { caseDir, r } = base("max-cruft");
     for (let i = 0; i < 3; i++) {
-      const noise = Array.from({ length: 30000 }, (_, k) => ((k * 2654435761 + i) >>> 7) % 997).join(",");
+      const noise = Array.from(
+        { length: 30000 },
+        (_, k) => ((k * 2654435761 + i) >>> 7) % 997,
+      ).join(",");
       r.blob(`${i}:${noise}\n`);
     }
     r.git(["config", "gc.maxCruftSize", "1m"]);

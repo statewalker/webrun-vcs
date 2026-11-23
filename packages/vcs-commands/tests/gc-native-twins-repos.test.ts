@@ -17,7 +17,6 @@ import {
   initRepo,
   NativeRepo,
   NOW,
-  nativeIs25x,
   newCase,
   seventeenBlobs,
 } from "./gc-native-twins-support.js";
@@ -87,22 +86,18 @@ describeGit("gc twins: linked worktrees", () => {
   });
 
   // 2.43 prunes worktrees after the repack (what only a pruned worktree reached is packed);
-  // git master's gc.c runs `worktree prune` before the object step (the objects become
-  // unreachable: cruft), as ours under 2.5x compatibility. Which 2.5x release moved it is not
-  // pinned, so on 2.5x this runs only with GC_TWINS_ALL=1 (checked against git master)
-  it.runIf(!nativeIs25x || process.env.GC_TWINS_ALL === "1")(
-    "what only a pruned worktree reached is packed first",
-    async () => {
-      const { caseDir, r } = base("worktree-gone-objects");
-      const gone = join(caseDir, "src", "gone");
-      r.git(["worktree", "add", "-q", "--detach", gone]);
-      new NativeRepo(root, gone).commit("only there", { "g.txt": "g\n" });
-      rmSync(gone, { recursive: true });
-      const old = NOW - 100 * DAY;
-      utimesSync(join(r.gitDir, "worktrees", "gone", "index"), old, old);
-      await gcTwins(root, caseDir);
-    },
-  );
+  // 2.56.1 and git master run `worktree prune` before the object step (the objects become
+  // unreachable: cruft), as ours under 2.5x compatibility
+  it("what only a pruned worktree reached: packed (2.43), cruft (2.56)", async () => {
+    const { caseDir, r } = base("worktree-gone-objects");
+    const gone = join(caseDir, "src", "gone");
+    r.git(["worktree", "add", "-q", "--detach", gone]);
+    new NativeRepo(root, gone).commit("only there", { "g.txt": "g\n" });
+    rmSync(gone, { recursive: true });
+    const old = NOW - 100 * DAY;
+    utimesSync(join(r.gitDir, "worktrees", "gone", "index"), old, old);
+    await gcTwins(root, caseDir);
+  });
 });
 
 describeGit("gc twins: rerere", () => {

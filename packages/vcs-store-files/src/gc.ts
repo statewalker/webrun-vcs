@@ -1,8 +1,8 @@
 /**
- * Garbage collection for file-backed Git repositories, as `git gc`: repack what is reachable
- * into one pack (`git repack -A -d`: unreachable packed objects are loosened, not dropped, until
- * they expire), pack refs, prune unreachable loose objects older than a grace period
- * (`git prune --expire`), and sweep temporaries. One gc at a time, under `gc.pid`.
+ * Garbage collection for file-backed Git repositories, as `git gc`: pack refs, expire reflogs,
+ * repack what is reachable into one pack (unreachable objects into a cruft pack until they
+ * expire), prune unreachable loose objects older than a grace period (`git prune --expire`),
+ * sweep temporaries and write the commit-graph. One gc at a time, under `gc.pid`.
  */
 
 import type { FilesApi, GitObjects, History, PackSet } from "@statewalker/vcs-core";
@@ -260,27 +260,34 @@ export interface StorageCount {
 /**
  * Run garbage collection on a file-backed repository.
  *
+ * In git gc's order (builtin/gc.c):
  * 1. Takes `gc.pid` with an exclusive create; if another gc holds it, returns `skipped`.
- * 2. Expires reflog entries (`git reflog expire --all`, `expireReflogs`), unless `gc.reflogExpire`
+ * 2. Packs refs (`git pack-refs --all --prune`: `packRefsStep`, else `history.refs.packRefs`).
+ * 3. Expires reflog entries (`git reflog expire --all`, `expireReflogs`), unless `gc.reflogExpire`
  *    and `gc.reflogExpireUnreachable` are both `never`.
- * 3. Snapshots the installed packs, then lists the objects reachable from every ref, HEAD, the
- *    reflogs, the index and every linked worktree's HEAD, index and reflogs. A ref that cannot
- *    be read makes gc throw here, before anything is changed.
- * 4. Packs refs (`history.refs.packRefs`, when the store has it).
- * 5. Repacks what is reachable into one pack and deletes the snapshot's packs (`.keep` packs
- *    stay; a pack installed during the walk is never deleted) and the loose copies now packed.
- *    Unreachable objects of the deleted packs, and unreachable loose objects, go into a cruft
- *    pack (`gc.cruftPacks`, default; `git repack --cruft`), dropped once older than
- *    `pruneExpireMs` unless a younger one reaches them; with `gc.cruftPacks=false` they are
- *    written loose unless their pack is older than `pruneExpireMs` (`git repack -A -d
- *    --unpack-unreachable`).
- * 6. Prunes the unreachable loose objects older than `pruneExpireMs`.
- * 7. Sweeps stale temporaries (`tmp_obj_*`, `objects/pack/tmp_*`, `packed-refs.new`) and `.pack` files without
- *    an `.idx`.
- * 8. Writes the commit-graph of what the refs reach (`gc.writeCommitGraph`, default true), as
- *    `git gc` does: `objects/info/commit-graph`, replacing a split chain.
+ * 4. Runs `beforeObjects` and `rerere gc` (2.5x's place; under 2.43 compatibility they run
+ *    after step 8).
+ * 5. Snapshots the installed packs, then lists the objects reachable from every ref, HEAD, the
+ *    reflogs, the index and every linked worktree's HEAD, index and reflogs (no pseudo-ref:
+ *    git's `rev-list --all` lists none). A ref that cannot be read makes gc throw here.
+ * 6. Repacks (`git repack -d -l`): everything reachable into one pack, deleting the snapshot's
+ *    packs (`.keep` packs and the `--keep-pack` ones stay; a pack installed during the walk is
+ *    never deleted) and the loose copies now packed. Unreachable objects of the deleted packs,
+ *    and unreachable loose objects, go into a cruft pack (`gc.cruftPacks`, default; `--cruft`),
+ *    dropped once older than `pruneExpireMs` unless a younger one reaches them; with
+ *    `gc.cruftPacks=false` they are written loose unless their pack is older than
+ *    `pruneExpireMs` (`-A --unpack-unreachable`); `--prune=now` keeps none (`-a`). `auto`
+ *    makes it incremental (the reachable loose objects only) unless there are too many packs.
+ *    Then `update-server-info`.
+ * 7. Prunes (`git prune --expire`, unless `prune: false`): unreachable loose objects older than
+ *    `pruneExpireMs` that no younger unreachable object (loose or packed) reaches, the shallow
+ *    commits nothing reached (`prune_shallow`), stale temporaries; also `packed-refs.new`,
+ *    quarantines and `.pack` files without an `.idx` (beyond git).
+ * 8. Removes lone `.idx` files with their siblings (`clean_pack_garbage`), then writes the
+ *    commit-graph of what the refs reach (`gc.writeCommitGraph`, default true):
+ *    `objects/info/commit-graph`, replacing a split chain.
  *
- * In a repository with `extensions.preciousObjects`, only steps 2, 4 and 8 run, as `git gc` skips its
+ * In a repository with `extensions.preciousObjects`, steps 6 and 7 are skipped, as `git gc` skips its
  * repack and prune there. In a partial clone (`extensions.partialClone`, a promisor remote)
  * the walk leaves the promisor objects out (`--exclude-promisor-objects`: the objects of
  * promisor packs, and the absent objects they name), and the repack writes every object of
@@ -336,12 +343,7 @@ export async function gc(options: GcOptions): Promise<GcResult> {
 }
 
 async function collect(options: GcOptions): Promise<GcResult> {
-  const {
-    history,
-    files,
-    gitDir = ".git",
-    dryRun = false,
-  } = options;
+  const { history, files, gitDir = ".git", dryRun = false } = options;
   const compatibility = options.compatibility ?? "2.56";
   // gc.pruneExpire, gc.cruftPacks, gc.maxCruftSize, ... (git's gc_config)
   const gcSettings = await readGcSettings(files, gitDir, options.environment);
