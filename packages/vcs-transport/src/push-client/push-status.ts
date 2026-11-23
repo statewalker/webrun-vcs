@@ -158,6 +158,8 @@ export interface PushStatusSource {
   summaryWidth?: number;
   /** The server's `unpack` line (`PushClientResult.unpack`): `Done` needs it ok under porcelain */
   unpack?: { ok: boolean; message?: string };
+  /** Pushed over smart HTTP (`PushClientResult.stateless`): a refused unpack keeps `Done` */
+  stateless?: boolean;
   /** The server's report was broken (`PushClientResult.reportFailed`): no `Done` */
   reportFailed?: boolean;
 }
@@ -214,7 +216,7 @@ export function formatPushStatus(
   if (porcelain) {
     // send_pack returns 0 under --porcelain once the report is read (refused refs or not)
     const failed =
-      result.unpack?.ok === false ||
+      (result.unpack?.ok === false && result.stateless !== true) ||
       result.reportFailed === true ||
       result.updates.some((u) => u.status === "atomic-push-failed");
     if (!failed) lines.push("Done");

@@ -96,6 +96,8 @@ export interface ServeOverDuplexOptions {
   procReceiveRefs?: readonly string[];
   /** receive-pack: a setting git cannot read (see `ReceivePackConfig.configError`) */
   receivePackConfigError?: string;
+  /** receive-pack: `receive.fsckObjects` (see `ReceivePackConfig.fsckObjects`) */
+  fsckObjects?: ReceivePackConfig["fsckObjects"];
   /** upload-pack hooks: authorize (before the negotiation), postUpload (after the pack) */
   uploadPackHooks?: UploadPackHooks;
   /**
@@ -277,6 +279,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       ...(options.receivePackConfigError !== undefined
         ? { configError: options.receivePackConfigError }
         : {}),
+      ...(options.fsckObjects ? { fsckObjects: options.fsckObjects } : {}),
     },
   };
   // post-receive tasks: started once the report is written (detached from this call)
