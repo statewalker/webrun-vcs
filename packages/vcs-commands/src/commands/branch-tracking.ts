@@ -7,7 +7,8 @@
  * @example
  * ```typescript
  * // `git switch -c topic origin/topic`: branch.topic.remote=origin, .merge=refs/heads/topic
- * await setupTracking(workingCopy, refs, "topic", "refs/remotes/origin/topic", TrackMode.DEFAULT);
+ * const { plan } = planTracking(workingCopy, "topic", "refs/remotes/origin/topic", TrackMode.DEFAULT);
+ * if (plan) await installTracking(workingCopy, "topic", plan); // ["branch 'topic' set up to track 'origin/topic'."]
  * ```
  */
 
@@ -220,6 +221,64 @@ export async function endOfSymbolicChain(refs: Refs, name: string): Promise<stri
   return undefined;
 }
 
+/** The git version whose wording a tracking message follows (hints differ). */
+export type TrackingCompatibility = "2.43" | "2.56";
+
+/**
+ * git's `advise()` lines of `text`: `hint: <line>`, an empty line `hint:` (2.43 wrote
+ * `hint: ` with the space).
+ */
+export function hintLines(text: string, compatibility: TrackingCompatibility = "2.56"): string[] {
+  return text
+    .split("\n")
+    .map((line) => (line === "" && compatibility !== "2.43" ? "hint:" : `hint: ${line}`));
+}
+
+/** The closing line of `advise_if_enabled`, as the version words it. */
+export function disableHint(name: string, compatibility: TrackingCompatibility = "2.56"): string {
+  const command = compatibility === "2.43" ? "git config" : "git config set";
+  return `hint: Disable this message with "${command} advice.${name} false"`;
+}
+
+/** Whether an advice is enabled (`advice.<name>`, on unless set false). */
+function adviceEnabled(config: RemoteConfigStore, name: string): boolean {
+  const value = config.value(`advice.${name}`);
+  return value === undefined ? true : (parseGitBool(value) ?? true);
+}
+
+/**
+ * git's `upstream_missing` death of `dwim_branch_start` under `--track` /
+ * `--set-upstream-to`: `fatal: the requested upstream branch '<start>' does not exist`,
+ * with the `advice.setUpstreamFailure` hint.
+ */
+export function upstreamMissingError(
+  workingCopy: WorkingCopy,
+  start: string,
+  compatibility: TrackingCompatibility = "2.56",
+): InvalidArgumentError {
+  const config = RemoteConfigStore.from(workingCopy);
+  const lines = [`fatal: the requested upstream branch '${start}' does not exist`];
+  if (adviceEnabled(config, "setUpstreamFailure")) {
+    lines.push(
+      ...hintLines(
+        [
+          "",
+          "If you are planning on basing your work on an upstream",
+          "branch that already exists at the remote, you may need to",
+          'run "git fetch" to retrieve it.',
+          "",
+          "If you are planning to push out a new local branch that",
+          "will track its remote counterpart, you may want to use",
+          '"git push -u" to set the upstream config as you push.',
+        ].join("\n"),
+        compatibility,
+      ),
+      disableHint("setUpstreamFailure", compatibility),
+    );
+  }
+  return new InvalidArgumentError("upstream", start, lines.join("\n"));
+}
+
 /**
  * The upstream configuration {@link planTracking} decided on: `branch.<name>.remote` (none
  * for a local start, written as `.`), `.merge` and whether `.rebase` is set.
@@ -231,101 +290,167 @@ export interface TrackingPlan {
 }
 
 /**
+ * What {@link planTracking} decided: the plan (none when nothing is tracked) and the
+ * warnings git prints instead (`warning: asked to inherit tracking from '<b>', but no
+ * remote is set`, `warning: not setting branch '<b>' as its own upstream`).
+ */
+export interface TrackingDecision {
+  readonly plan?: TrackingPlan;
+  readonly warnings: string[];
+}
+
+/** Options of {@link planTracking}. */
+export interface PlanTrackingOptions {
+  /** The git version whose hints the refusals follow (default 2.56). */
+  compatibility?: TrackingCompatibility;
+}
+
+/**
  * git's `setup_tracking` up to the point it writes: what a new branch that starts at the
  * branch `startRef` (a full ref name, see {@link trackableStart}) tracks, as `mode` and
  * `branch.autoSetupMerge` say. Nothing is written; {@link installTracking} does that.
  *
- * @returns the plan, or undefined when nothing is tracked
+ * @returns the plan (none when nothing is tracked) with git's warnings
  * @throws RefNotFoundError when several remotes fetch into `startRef` (git's `not
- *   tracking: ambiguous information for ref '<ref>'`)
+ *   tracking: ambiguous information for ref '<ref>'` and the `advice.ambiguousFetchRefspec`
+ *   hint)
+ * @throws InvalidArgumentError when several refs are inherited and `branch.autoSetupRebase`
+ *   asks for rebasing (`cannot inherit upstream tracking configuration of multiple refs
+ *   when rebasing is requested`)
  */
 export function planTracking(
   workingCopy: WorkingCopy,
   newBranch: string,
   startRef: string,
   mode: TrackMode,
-): TrackingPlan | undefined {
+  options: PlanTrackingOptions = {},
+): TrackingDecision {
   const config = RemoteConfigStore.from(workingCopy);
   const track = effectiveTrack(config, mode);
-  if (track === "never") return undefined;
+  const none: TrackingDecision = { warnings: [] };
+  if (track === "never") return none;
 
   let remote: string | undefined;
   let merges: string[] = [];
   let matches = 0;
   if (track === "inherit") {
+    // inherit_tracking: branch_get(<bare>)'s remote and merge configuration
     const bare = startRef.replace(/^refs\/heads\//, "");
     remote = config.value(`branch.${bare}.remote`);
     merges = config.values(`branch.${bare}.merge`);
-    // git warns (asked to inherit tracking from '<b>', but no remote/merge is set) and
-    // sets nothing up
-    if (!remote || merges.length === 0) return undefined;
+    if (!remote) {
+      return {
+        warnings: [`warning: asked to inherit tracking from '${bare}', but no remote is set`],
+      };
+    }
+    if (merges.length === 0) {
+      return {
+        warnings: [
+          `warning: asked to inherit tracking from '${bare}', but no merge configuration is set`,
+        ],
+      };
+    }
   } else {
+    const ambiguous: string[] = [];
     for (const name of config.configuredNames()) {
       const src = sourceForTracking(config, name, startRef);
       if (!src) continue;
       matches++;
+      if (matches === 2 && remote) ambiguous.push(remote);
+      if (matches >= 2) ambiguous.push(name);
       remote = name;
       merges = [src];
     }
-    if (matches === 0 && track !== "always" && track !== "explicit") return undefined;
+    if (matches === 0 && track !== "always" && track !== "explicit") return none;
     if (matches > 1) {
-      throw new RefNotFoundError(
-        startRef,
-        `fatal: not tracking: ambiguous information for ref '${startRef}'`,
-      );
+      const lines = [`fatal: not tracking: ambiguous information for ref '${startRef}'`];
+      if (adviceEnabled(config, "ambiguousFetchRefspec")) {
+        lines.push(
+          ...hintLines(
+            [
+              "There are multiple remotes whose fetch refspecs map to the remote",
+              `tracking ref '${startRef}':`,
+              ...ambiguous.map((name) => `  ${name}`),
+              "",
+              "This is typically a configuration error.",
+              "",
+              "To support setting up tracking branches, ensure that",
+              "different remotes' fetch refspecs map into different",
+              "tracking namespaces.",
+            ].join("\n"),
+            options.compatibility,
+          ),
+        );
+      }
+      throw new RefNotFoundError(startRef, lines.join("\n"));
     }
     if (track === "simple") {
       const tracked = merges[0]?.startsWith("refs/heads/") ? merges[0].slice(11) : undefined;
-      if (tracked !== newBranch) return undefined;
+      if (tracked !== newBranch) return none;
     }
     if (merges.length === 0) merges = [startRef];
   }
 
-  // install_branch_config_multiple_remotes: never a branch as its own upstream
-  if (!remote && merges.some((m) => m === `refs/heads/${newBranch}`)) return undefined;
+  // install_branch_config_multiple_remotes
   const autoRebase = (config.value("branch.autoSetupRebase") ?? "never").toLowerCase();
   const rebase =
     autoRebase === "always" ||
     (autoRebase === "local" && remote === undefined) ||
     (autoRebase === "remote" && remote !== undefined);
-  return { remote, merges, rebase };
+  if (rebase && merges.length > 1) {
+    throw new InvalidArgumentError(
+      "track",
+      startRef,
+      "fatal: cannot inherit upstream tracking configuration of multiple refs when rebasing is requested",
+    );
+  }
+  // never a branch as its own upstream
+  if (!remote && merges.some((m) => m === `refs/heads/${newBranch}`)) {
+    return { warnings: [`warning: not setting branch '${newBranch}' as its own upstream`] };
+  }
+  return { plan: { remote, merges, rebase }, warnings: [] };
 }
 
 /**
- * Write a {@link TrackingPlan} as `branch.<newBranch>.*` and save the configuration.
+ * What git prints once it wrote a {@link TrackingPlan} (`BRANCH_CONFIG_VERBOSE`):
+ * `branch '<b>' set up to track '<remote>/<branch>'.` (`... by rebasing.`), the local
+ * branch's name alone for `remote = .` set up by `--track`, `./<branch>` for one inherited,
+ * one line per upstream after `branch '<b>' set up to track:` for several.
+ */
+export function trackingMessage(newBranch: string, plan: TrackingPlan): string[] {
+  const names = plan.merges.map((merge) => {
+    const short = merge.replace(/^refs\/heads\//, "");
+    return plan.remote !== undefined ? `${plan.remote}/${short}` : short;
+  });
+  if (names.length === 1) {
+    return [
+      plan.rebase
+        ? `branch '${newBranch}' set up to track '${names[0]}' by rebasing.`
+        : `branch '${newBranch}' set up to track '${names[0]}'.`,
+    ];
+  }
+  return [`branch '${newBranch}' set up to track:`, ...names.map((name) => `  ${name}`)];
+}
+
+/**
+ * Write a {@link TrackingPlan} as `branch.<newBranch>.*` and save the configuration, as
+ * git's `install_branch_config_multiple_remotes`: `.remote` set, every `.merge` replaced,
+ * `.rebase = true` when rebasing.
  *
- * @returns the upstream set up (`origin/topic`, a local `main`)
+ * @returns what git prints (see {@link trackingMessage})
  */
 export async function installTracking(
   workingCopy: WorkingCopy,
   newBranch: string,
   plan: TrackingPlan,
-): Promise<string> {
+): Promise<string[]> {
   const config = RemoteConfigStore.from(workingCopy);
   const { remote, merges } = plan;
   config.setValue(`branch.${newBranch}.remote`, remote ?? ".");
-  config.setValues(`branch.${newBranch}.merge`, merges);
+  // the merges replaced: every old one unset, the new ones added at the section's end
+  config.unset(`branch.${newBranch}.merge`);
+  for (const merge of merges) config.addValue(`branch.${newBranch}.merge`, merge);
   if (plan.rebase) config.setValue(`branch.${newBranch}.rebase`, "true");
   await config.save();
-  const first = merges[0] ?? "";
-  const short = first.replace(/^refs\/heads\//, "");
-  return remote && remote !== "." ? `${remote}/${short}` : short;
-}
-
-/**
- * git's `setup_tracking`: `branch.<name>.remote` and `branch.<name>.merge` (and
- * `branch.<name>.rebase` as `branch.autoSetupRebase` asks) for a new branch that starts at
- * the branch `startRef` (a full ref name, see {@link trackableStart}), as `mode` and
- * `branch.autoSetupMerge` say. The configuration is saved.
- *
- * @returns the upstream set up (`origin/topic`, a local `main`), or undefined when none
- */
-export async function setupTracking(
-  workingCopy: WorkingCopy,
-  newBranch: string,
-  startRef: string,
-  mode: TrackMode,
-): Promise<string | undefined> {
-  const plan = planTracking(workingCopy, newBranch, startRef, mode);
-  return plan ? installTracking(workingCopy, newBranch, plan) : undefined;
+  return trackingMessage(newBranch, plan);
 }

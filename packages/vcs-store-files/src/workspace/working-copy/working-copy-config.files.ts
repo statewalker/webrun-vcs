@@ -247,6 +247,12 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   /** Keys whose values differ from the parsed file. */
   private readonly dirtyKeys: Set<string> = new Set();
   /**
+   * Keys unset and then given values again before a save: git's `set_multivar` finds no
+   * line of them left, so their new lines go to the end of the section, not where the old
+   * ones stood.
+   */
+  private readonly relocated: Set<string> = new Set();
+  /**
    * Keys as `set`/`add` spelled them: a line written for one names the variable as given
    * (`sparseCheckout`), as git's `write_pair` does.
    */
@@ -538,6 +544,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     this.lines = parsed.lines;
     this.trailingNewline = parsed.trailingNewline;
     this.dirtyKeys.clear();
+    this.relocated.clear();
     this.removedSections.clear();
     this.loaded = true;
     await this.resolveOwnIncludes();
@@ -663,6 +670,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const canonical = requireCanonicalKey(key);
     requireStorableValue(key, value);
     this.spelling.set(canonical, key);
+    this.relocateIfUnset(canonical);
     this.values.set(canonical, [value]);
     this.dirtyKeys.add(canonical);
     this.mirror(canonical);
@@ -679,12 +687,23 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const canonical = requireCanonicalKey(key);
     requireStorableValue(key, value);
     this.spelling.set(canonical, key);
+    this.relocateIfUnset(canonical);
     const values = this.values.get(canonical);
     if (values) values.push(value);
     else this.values.set(canonical, [value]);
     this.dirtyKeys.add(canonical);
     this.mirror(canonical);
     this.resolvedCache = undefined;
+  }
+
+  /** A key unset in this session gets new values: they are written at its section's end. */
+  private relocateIfUnset(canonical: string): void {
+    const values = this.values.get(canonical);
+    if (!values || values.length > 0 || !this.dirtyKeys.has(canonical)) return;
+    this.relocated.add(canonical);
+    // new keys of a section are written in the order they were given values
+    this.values.delete(canonical);
+    this.values.set(canonical, values);
   }
 
   /**
@@ -1052,7 +1071,11 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const fileKeys = new Set<string>();
     for (const line of this.lines) {
       const key = keyOfLine(line);
-      if (key !== undefined && !this.removedSections.has(sectionOfLine(line) ?? "")) {
+      if (
+        key !== undefined &&
+        !this.relocated.has(key) &&
+        !this.removedSections.has(sectionOfLine(line) ?? "")
+      ) {
         fileKeys.add(key);
       }
     }
@@ -1089,24 +1112,66 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
       for (const value of this.values.get(key) ?? []) out.push(formatEntry(name, value));
     };
 
+    // git's maybe_remove_section: a section block whose every variable this write unsets
+    // loses its header too, unless a comment stands in it or right before it
+    let block: { start: number; removed: boolean; kept: boolean; comment: boolean } | undefined;
+    let commentBefore = false;
+    // blank lines right before a header go with it (git removes from the previous entry on)
+    let blankRun = 0;
+    const finishBlock = (): void => {
+      if (block?.removed && !block.kept && !block.comment) out.splice(block.start);
+      block = undefined;
+    };
+
     this.lines.forEach((line, index) => {
       const section = sectionOfLine(line);
       const dropped = section !== undefined && this.removedSections.has(section);
 
       if (!dropped) {
         if (line.kind === "entry") {
-          if (this.dirtyKeys.has(line.key)) emitValues(line.key);
-          else out.push(line.text);
-        } else if (
-          line.kind === "section" &&
-          line.inlineKey !== undefined &&
-          this.dirtyKeys.has(line.inlineKey)
-        ) {
-          // Rewrite the header without its inline variable, then re-emit it.
-          out.push(formatSectionHeader(line.section));
-          emitValues(line.inlineKey);
+          if (this.relocated.has(line.key)) {
+            if (block) block.removed = true;
+          } else if (this.dirtyKeys.has(line.key)) {
+            const before = out.length;
+            emitValues(line.key);
+            if (block) {
+              if (out.length === before) block.removed = true;
+              else block.kept = true;
+            }
+          } else {
+            out.push(line.text);
+            if (block) block.kept = true;
+          }
+          commentBefore = false;
+          blankRun = 0;
+        } else if (line.kind === "section") {
+          finishBlock();
+          block = {
+            start: out.length - blankRun,
+            removed: false,
+            kept: false,
+            comment: commentBefore,
+          };
+          commentBefore = false;
+          blankRun = 0;
+          if (line.inlineKey !== undefined && this.dirtyKeys.has(line.inlineKey)) {
+            // Rewrite the header without its inline variable, then re-emit it.
+            out.push(formatSectionHeader(line.section));
+            const before = out.length;
+            emitValues(line.inlineKey);
+            if (out.length === before) block.removed = true;
+            else block.kept = true;
+          } else {
+            out.push(line.text);
+            if (line.inlineKey !== undefined) block.kept = true;
+          }
         } else {
           out.push(line.text);
+          if (line.text.trim() !== "") {
+            commentBefore = true;
+            blankRun = 0;
+            if (block) block.comment = true;
+          } else blankRun++;
         }
       }
 
@@ -1114,10 +1179,13 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
         if (at !== index || this.removedSections.has(section2)) continue;
         const keys = newKeysBySection.get(section2);
         if (!keys) continue;
+        const before = out.length;
         for (const key of keys) emitValues(key);
+        if (block && out.length > before) block.kept = true;
         filledSections.add(section2);
       }
     });
+    finishBlock();
 
     // Sections that do not exist in the file yet.
     for (const [section, keys] of newKeysBySection) {
