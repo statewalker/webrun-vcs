@@ -366,6 +366,11 @@ const algorithmValue = (v: string | undefined): XdiffAlgorithm | undefined => {
  * ```
  */
 export class DiffCommand extends GitCommand<DiffEntry[]> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private oldTree?: string;
   private newTree?: string;
   private cached = false;

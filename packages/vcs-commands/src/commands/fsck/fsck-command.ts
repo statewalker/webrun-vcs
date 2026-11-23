@@ -298,6 +298,11 @@ function treeLineSound(data: Uint8Array): boolean {
  * ```
  */
 export class FsckCommand extends GitCommand<FsckResult> {
+  // fsck writes no refs, but it reads reflogs and linked worktrees' HEADs as files, which a
+  // reftable repository keeps in its tables: it would report reflog-only objects as
+  // dangling. It keeps the default (refused on a read-only reftable store) until fsck reads
+  // them through the ref store (statewalker-root#229).
+
   private _strict = false;
 
   /** git's fsck and gc read the objects as stored, never through replace refs. */

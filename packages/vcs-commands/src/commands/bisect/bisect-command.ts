@@ -710,6 +710,11 @@ export class BisectResetCommand extends BisectCommand {
 
 /** `git bisect terms [--term-good | --term-bad]` */
 export class BisectTermsCommand extends BisectCommand {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   /** Refused: the command builds its own arguments. */
   protected override acceptArguments(args: string[]): void {
     refuseArguments("BisectTermsCommand", args);
@@ -731,6 +736,11 @@ export class BisectTermsCommand extends BisectCommand {
 
 /** `git bisect log`: the bisection's log (its stdout). */
 export class BisectLogCommand extends BisectCommand {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   /** Refused: the command builds its own arguments. */
   protected override acceptArguments(args: string[]): void {
     refuseArguments("BisectLogCommand", args);

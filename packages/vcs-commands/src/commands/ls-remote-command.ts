@@ -64,6 +64,11 @@ export interface LsRemoteResult {
  * ```
  */
 export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private remote?: string;
   private heads = false;
   private tags = false;

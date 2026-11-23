@@ -362,6 +362,11 @@ export class DeleteBranchCommand extends GitCommand<string[]> {
  * ```
  */
 export class ListBranchCommand extends GitCommand<Ref[]> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private listMode = ListBranchMode.LOCAL;
   private containsCommit?: ObjectId;
 

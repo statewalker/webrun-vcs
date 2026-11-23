@@ -25,6 +25,11 @@ export const STASH_REF = "refs/stash";
  * ```
  */
 export class StashListCommand extends GitCommand<StashEntry[]> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   /**
    * Execute the stash list command.
    *

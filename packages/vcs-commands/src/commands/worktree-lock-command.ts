@@ -19,6 +19,11 @@ import { findLinkedWorktree as findLinked, requireWorktrees } from "./worktree-s
  * already locked. The reason goes into `.git/worktrees/<id>/locked` (a line end added).
  */
 export class WorktreeLockCommand extends GitCommand<WorktreeInfo> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private worktree?: string;
   private reason = "";
 
@@ -70,6 +75,11 @@ export class WorktreeLockCommand extends GitCommand<WorktreeInfo> {
  * Refused (`WorktreeError`): no such worktree, the main worktree, a worktree not locked.
  */
 export class WorktreeUnlockCommand extends GitCommand<WorktreeInfo> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private worktree?: string;
 
   /** The worktree: a path, or a unique suffix of one. */

@@ -33,7 +33,14 @@ import { openObjectAlternates, withAlternates } from "./alternates/index.js";
 import { createFilesCommitGraphProvider } from "./commit-graph.js";
 import { parseConfigInt, readPackSetSettings, skipPacked, withPacks } from "./pack/index.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
-import { createFileRefStore, type FileRefStore, peelTag } from "./refs/index.js";
+import {
+  createFileRefStore,
+  createReftableRefStore,
+  type FileRefStore,
+  peelTag,
+  ReftableRefStore,
+  ReftableWriteUnsupportedError,
+} from "./refs/index.js";
 import { repack } from "./repack.js";
 import { readRepositoryFormat } from "./repository-format.js";
 import { resolveLinkedGitDir } from "./resolve-linked-git-dir.js";
@@ -193,7 +200,8 @@ export async function createGitFilesBackend(
   // git's check_repository_format: a version or extension we cannot honour (reftable refs,
   // sha256 objects, an unknown v1 extension) is refused before anything is read or written.
   // Like git's read_repository_format it reads the config file alone, without includes.
-  await readRepositoryFormat(files, gitDir);
+  const format = await readRepositoryFormat(files, gitDir);
+  if (format.refStorage === "reftable" && create) throw new ReftableWriteUnsupportedError();
   const includes = options.configIncludes === undefined ? {} : { includes: options.configIncludes };
   // the settings read below come from git's whole sequence (system, global, the repository's
   // file, config.worktree, the command line), as git's repo_config reads them; only the
@@ -300,15 +308,20 @@ export async function createGitFilesBackend(
       freshenMaxAgeMs,
     });
   const reflog = readRefStoreConfig(settingsConfig);
-  const refStore = createFileRefStore(files, gitDir, {
-    atomicFiles: options.atomicFiles,
-    refLockTimeoutMs: options.refLockTimeoutMs ?? reflog.refLockTimeoutMs,
-    packedLockTimeoutMs: options.packedLockTimeoutMs ?? reflog.packedLockTimeoutMs,
-    logAllRefUpdates: options.logAllRefUpdates ?? reflog.logAllRefUpdates,
-    reflogIdentity: options.reflogIdentity ?? reflog.identity,
-    peel: (id) => peelTag(objects, id),
-    hasObject: (id) => objects.has(id),
-  });
+  // a reftable repository's refs are read from `<git dir>/reftable` (writes refused); a files
+  // repository's from loose refs and packed-refs
+  const refStore: FileRefStore | ReftableRefStore =
+    format.refStorage === "reftable"
+      ? createReftableRefStore({ files, gitDir })
+      : createFileRefStore(files, gitDir, {
+          atomicFiles: options.atomicFiles,
+          refLockTimeoutMs: options.refLockTimeoutMs ?? reflog.refLockTimeoutMs,
+          packedLockTimeoutMs: options.packedLockTimeoutMs ?? reflog.packedLockTimeoutMs,
+          logAllRefUpdates: options.logAllRefUpdates ?? reflog.logAllRefUpdates,
+          reflogIdentity: options.reflogIdentity ?? reflog.identity,
+          peel: (id) => peelTag(objects, id),
+          hasObject: (id) => objects.has(id),
+        });
   // GIT_GRAFT_FILE: the environment's grafts file is the one read (gc, repack and the
   // walks keep and follow its grafts), in place of info/grafts; a relative one from the
   // worktree top (the git directory when bare), where git's setup has changed to
@@ -332,7 +345,9 @@ export async function createGitFilesBackend(
       ? { alternateObjectDirs: async () => (await alternates.list()).map((a) => a.objectsDir) }
       : {}),
   });
-  invalidateOnCompatibilityChange(refStore, commitGraph);
+  // (a reftable store never writes)
+  if (!(refStore instanceof ReftableRefStore))
+    invalidateOnCompatibilityChange(refStore, commitGraph);
   // an alternate linked later (clone --shared, --reference, each one added or re-read) may
   // bring a graph or the layers a chain builds on
   alternates?.onChange(() => commitGraph.invalidate());

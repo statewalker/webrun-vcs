@@ -77,6 +77,11 @@ const same = (a: CheckedEntry | undefined, b: CheckedEntry | undefined) =>
  * stored (`cache_tree_update` with `WRITE_TREE_REPAIR`), none while conflicts remain.
  */
 export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
+  /** Never writes refs: runs in a repository whose ref store only reads. */
+  protected override get writesRefs(): boolean {
+    return false;
+  }
+
   private treeishes: string[] = [];
   private merge = false;
   private reset = false;

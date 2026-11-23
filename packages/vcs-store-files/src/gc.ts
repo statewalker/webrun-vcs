@@ -25,6 +25,7 @@ import { sweepQuarantines } from "./quarantine/files-quarantine.js";
 import { listReachableObjects, rebaseFileRoots } from "./reachable-objects.js";
 import { expireReflogs, gcExpiresReflogs, parseExpiryDate } from "./reflog-expire.js";
 import { createFilesRefOps } from "./refs/index.js";
+import { ReftableWriteUnsupportedError } from "./refs/reftable/index.js";
 import {
   DEFAULT_PRUNE_EXPIRE_MS,
   type PackSnapshot,
@@ -363,6 +364,8 @@ async function collect(options: GcOptions): Promise<GcResult> {
   // preciousObjects: as git gc, refs are packed, but nothing is repacked or pruned. A partial
   // clone's promisor objects stay out of the walk, its promisor packs are repacked apart
   const format = await readRepositoryFormat(files, gitDir);
+  // a reftable repository: its refs cannot be packed nor its objects pruned here yet
+  if (format.refStorage === "reftable" && !dryRun) throw new ReftableWriteUnsupportedError();
   const exclusions = dryRun ? undefined : await promisorExclusions(objects, files, gitDir);
   // git's errors reading the alternates (a directory gone, ...) are printed and gc goes on: the
   // walk below fails on a root or a local commit's object that only they held. Alternates git
