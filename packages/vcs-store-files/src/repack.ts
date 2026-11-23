@@ -47,6 +47,7 @@ import {
 import { type PromisorExclusions, promisorExclusions } from "./promisor-objects.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
+import { updateServerInfo } from "./server-info.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 import {
@@ -179,6 +180,17 @@ export interface RepackOptions extends RepackTarget {
    * given as an object overrides their window and depth.
    */
   packSettings?: PackWriteSettings;
+  /**
+   * `git repack --keep-pack=<name>` (gc's `--keep-largest-pack`, `gc.bigPackThreshold`): packs
+   * (`pack-<id>.pack`, `pack-<id>` or the id) treated as kept in core: never replaced, their
+   * objects left out of the new pack (whatever `packKeptObjects` says) and of a cruft pack.
+   */
+  keepPacks?: readonly string[];
+  /**
+   * Write `info/refs` and `objects/info/packs` at the end (`updateServerInfo`), as git's
+   * repack does unless `-n`. Default true; not in a dry run.
+   */
+  updateServerInfo?: boolean;
   /** @internal writes the midx bitmap (see `MultiPackIndexWriteOptions.writeBitmap`) */
   writeMidxBitmap?: MultiPackIndexWriteOptions["writeBitmap"];
 }
@@ -417,6 +429,8 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
     return repackListed(options, listed, snapshot, undefined, exclusions);
   };
   const result = await run({ ...options, objects: objectsWithoutLazyFetch(options.objects) });
+  if (!options.dryRun && (options.updateServerInfo ?? true))
+    await updateServerInfo({ ...options, gitDir: options.gitDir ?? ".git" });
   return result && alternatesErrors.length > 0
     ? { ...result, errors: [...alternatesErrors] }
     : result;
@@ -454,8 +468,14 @@ export async function repackListed(
   const before = snapshot.packs;
   const kept: Pack[] = [];
   const replaced: Pack[] = [];
+  // --keep-pack: kept in core, whatever --pack-kept-objects says
+  const inCore = new Set(
+    (options.keepPacks ?? []).map((n) => n.replace(/^pack-/, "").replace(/\.pack$/, "")),
+  );
+  const keptInCore: Pack[] = [];
   for (const p of before) {
-    if (await files.exists(joinPath(packDir, `pack-${p.packId}.keep`))) kept.push(p);
+    if (inCore.has(p.packId)) keptInCore.push(p);
+    else if (await files.exists(joinPath(packDir, `pack-${p.packId}.keep`))) kept.push(p);
     else replaced.push(p);
   }
 
@@ -477,7 +497,7 @@ export async function repackListed(
   // -a: everything reachable but what .keep packs hold (all of it with --pack-kept-objects);
   // -d alone: what no pack holds (an alternate's included: pack-objects --unpacked); -l:
   // nothing an alternate holds
-  const skip = all ? (packKeptObjects ? [] : kept) : before;
+  const skip = all ? (packKeptObjects ? keptInCore : [...kept, ...keptInCore]) : before;
   const borrowed = async (id: ObjectId) => {
     for (const alt of alternates) {
       if (options.local ? await alt.objects.has(id) : !all && (await alt.packs.has(id)))
@@ -516,7 +536,7 @@ export async function repackListed(
     bitmaps.mode = "off";
   }
 
-  const keptPacks = kept.map((p) => `pack-${p.packId}`);
+  const keptPacks = [...kept, ...keptInCore].map((p) => `pack-${p.packId}`);
   if (dryRun) {
     return {
       packName: "",
@@ -660,6 +680,7 @@ export async function repackListed(
         // the new pack holds only reachable objects; .keep packs and the promisor pack stay
         keep: [
           ...kept,
+          ...keptInCore,
           ...(await packs.packs()).filter(
             (p) => p.packId === promisorPack || p.packId === filteredPack,
           ),
@@ -677,7 +698,7 @@ export async function repackListed(
     if (options.writeMidx) {
       const removed = new Set(removable.map((r) => r.pack.packId));
       const include = new Set<string>();
-      for (const p of kept) include.add(`pack-${p.packId}.idx`);
+      for (const p of [...kept, ...keptInCore]) include.add(`pack-${p.packId}.idx`);
       for (const id of newPacks) include.add(`pack-${id}.idx`);
       for (const p of replaced) if (!removed.has(p.packId)) include.add(`pack-${p.packId}.idx`);
       const midx = await multiPackIndexWrite({

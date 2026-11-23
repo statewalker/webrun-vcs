@@ -11,6 +11,7 @@ import {
   graftFileReader,
   joinPath,
   objectsWithoutLazyFetch,
+  parsePackMtimes,
   sweepPackTemporaries,
 } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
@@ -21,7 +22,7 @@ import { objectLinks } from "./cruft-pack.js";
 import { configBool, parseConfigSize } from "./pack/delta-base-cache-limit.js";
 import { promisorExclusions } from "./promisor-objects.js";
 import { sweepQuarantines } from "./quarantine/files-quarantine.js";
-import { listReachableObjects } from "./reachable-objects.js";
+import { listReachableObjects, rebaseFileRoots } from "./reachable-objects.js";
 import { expireReflogs, gcExpiresReflogs, parseExpiryDate } from "./reflog-expire.js";
 import { createFilesRefOps } from "./refs/index.js";
 import {
@@ -32,6 +33,8 @@ import {
   snapshotPacks,
 } from "./repack.js";
 import { readRepositoryFormat } from "./repository-format.js";
+import { type RerereGcResult, rerereGc } from "./rerere-gc.js";
+import { updateServerInfo } from "./server-info.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 import {
@@ -137,6 +140,50 @@ export interface GcOptions {
    * keep objects out of it.
    */
   writeBitmaps?: boolean;
+  /**
+   * `git gc --no-prune` (false): nothing unreachable expires (the cruft pack keeps it all, or
+   * `-A` loosens it all) and `git prune` does not run. Default true.
+   */
+  prune?: boolean;
+  /**
+   * `--aggressive`: `repack -f --depth=<gc.aggressiveDepth> --window=<gc.aggressiveWindow>`
+   * (defaults 50 and 250): deltas searched again rather than reused.
+   */
+  aggressive?: boolean;
+  /**
+   * `--keep-largest-pack` (true): the largest non-cruft pack is kept (`repack --keep-pack`);
+   * false keeps none, whatever `gc.bigPackThreshold` says. Default: every pack of at least
+   * `gc.bigPackThreshold` bytes is kept, none when unset.
+   */
+  keepLargestPack?: boolean;
+  /**
+   * `--auto`'s object step (git's `odb_optimize` with `ODB_OPTIMIZE_AUTO`): with more packs
+   * than `gc.autoPackLimit` (`.keep` ones aside) a full repack keeping the packs over
+   * `gc.bigPackThreshold` (only the largest when they are `gc.autoPackLimit` or more, none
+   * without a threshold); otherwise an incremental one (`repack -d -l
+   * --no-write-bitmap-index`: the reachable loose objects only). The caller decides whether
+   * an auto gc is needed (`needsAutoGc`).
+   */
+  auto?: boolean;
+  /**
+   * The git version followed where versions differ: 2.5x's prune keeps what the rebase files
+   * (`rebase-*\/autostash`, `rebase-*\/orig-head`) name, 2.43's does not. Default "2.56".
+   */
+  compatibility?: "2.43" | "2.56";
+  /**
+   * Runs in place of `history.refs.packRefs` when refs are packed (`packRefs`): a command's
+   * pack-refs running the reference-transaction hook.
+   */
+  packRefsStep?: () => Promise<void>;
+  /**
+   * Runs after the reflog expiry and before the repack: git 2.5x's place of `worktree
+   * prune` and `rerere gc` (gc.c runs them before the object step).
+   */
+  beforeObjects?: () => Promise<void>;
+  /** Runs after the prune, before the commit-graph: 2.43's place of the same steps. */
+  afterObjects?: () => Promise<void>;
+  /** `rerere gc` in git's place (see `beforeObjects`). Default true. */
+  rerereGc?: boolean;
 }
 
 /**
@@ -174,6 +221,20 @@ export interface GcResult {
   repack: RepackResult | null;
   /** Whether a commit-graph was written */
   commitGraphWritten: boolean;
+  /** `--auto`: which repack ran ("full" with too many packs, else "incremental") */
+  autoRepack?: "full" | "incremental";
+  /** The packs `--keep-largest-pack` or `gc.bigPackThreshold` kept (`pack-<id>`) */
+  keptLargePacks?: string[];
+  /** What rerere gc removed (absent when it did not run) */
+  rerere?: RerereGcResult;
+  /** Commits the prune dropped from `shallow` (git prune's `prune_shallow`) */
+  shallowPruned?: number;
+  /** Lone `.idx` files (and their siblings) removed, as git gc's `clean_pack_garbage` */
+  removedPackGarbage?: number;
+  /** The repository's own objects and their bytes on storage, before and after */
+  storage?: { before: StorageCount; after: StorageCount };
+  /** git's warnings (`--auto`: "There are too many unreachable loose objects; ...") */
+  warnings?: string[];
   /**
    * Why writing the commit-graph failed, when it did. git's gc reports the error and still
    * succeeds (it ignores what write_commit_graph_reachable returns): what the repack and prune
@@ -186,6 +247,14 @@ export interface GcResult {
    * prints to stderr and goes on; absent when there are none
    */
   errors?: string[];
+}
+
+/** The objects a repository stores itself (loose and packed) and their bytes. */
+export interface StorageCount {
+  /** distinct object ids, loose or packed */
+  objects: number;
+  /** bytes of the loose object files and of the pack directory's files */
+  bytes: number;
 }
 
 /**
@@ -274,13 +343,19 @@ async function collect(options: GcOptions): Promise<GcResult> {
     dryRun = false,
     tmpExpiryMs = DEFAULT_PRUNE_EXPIRE_MS,
   } = options;
-  // gc.pruneExpire, gc.cruftPacks, gc.maxCruftSize (git's gc_config)
+  const compatibility = options.compatibility ?? "2.56";
+  // gc.pruneExpire, gc.cruftPacks, gc.maxCruftSize, ... (git's gc_config)
   const gcSettings = await readGcSettings(files, gitDir, options.environment);
-  const pruneExpireMs = options.pruneExpireMs ?? gcSettings.pruneExpireMs;
+  // --no-prune: nothing unreachable expires, and prune does not run
+  const pruneStep = options.prune ?? true;
+  const pruneExpireMs = pruneStep
+    ? (options.pruneExpireMs ?? gcSettings.pruneExpireMs)
+    : Number.POSITIVE_INFINITY;
   const objects = (options.objects ?? history.objects) as GitObjects;
   const packs = options.packs ?? history.packs;
   const objectsDir = joinPath(gitDir, "objects");
   const looseStorage = new FileRawStorage(files, objectsDir);
+  const warnings: string[] = [];
 
   // preciousObjects: as git gc, refs are packed, but nothing is repacked or pruned. A partial
   // clone's promisor objects stay out of the walk, its promisor packs are repacked apart
@@ -292,8 +367,20 @@ async function collect(options: GcOptions): Promise<GcResult> {
   const alternatesErrors = dryRun
     ? (objects.alternates?.errors ?? [])
     : await assertAlternatesReadable({ files, gitDir, objects }, "gc");
-  // git gc's gc_before_repack: `reflog expire --all` before anything is walked (pack-refs
-  // does not change what is reachable)
+  const storageBefore =
+    dryRun || !packs ? undefined : await storageCount(files, objectsDir, looseStorage, packs);
+
+  // git gc's foreground tasks: `pack-refs --all --prune`, then `reflog expire --all`
+  let refsPacked = false;
+  if ((options.packRefs ?? true) && !dryRun) {
+    if (options.packRefsStep) {
+      await options.packRefsStep();
+      refsPacked = true;
+    } else if (history.refs.packRefs) {
+      await history.refs.packRefs([], { all: true, deleteLoose: true });
+      refsPacked = true;
+    }
+  }
   const reflogErrors: string[] = [];
   let reflogEntriesPruned: number | undefined;
   if (
@@ -314,18 +401,48 @@ async function collect(options: GcOptions): Promise<GcResult> {
     reflogEntriesPruned = expired.pruned;
     reflogErrors.push(...expired.errors);
   }
+
+  // worktree prune and rerere gc: before the object step in 2.5x, after it in 2.43
+  let rerere: RerereGcResult | undefined;
+  const otherTasks = async () => {
+    if (dryRun) return;
+    if (compatibility === "2.43") await options.afterObjects?.();
+    else await options.beforeObjects?.();
+    if (options.rerereGc ?? true)
+      rerere = await rerereGc({
+        files,
+        gitDir,
+        ...(options.environment ? { environment: options.environment } : {}),
+        ...(options.now !== undefined ? { now: options.now } : {}),
+      });
+  };
+  if (compatibility !== "2.43") await otherTasks();
+
   const allErrors = [...alternatesErrors, ...reflogErrors];
-  const errors = {
-    ...(allErrors.length > 0 ? { errors: allErrors } : {}),
-    ...(reflogEntriesPruned !== undefined ? { reflogEntriesPruned } : {}),
+  const finish = async (
+    partial: Omit<GcResult, "commitGraphWritten" | "commitGraphError">,
+  ): Promise<GcResult> => {
+    if (compatibility === "2.43") await otherTasks();
+    // clean_pack_garbage: a lone .idx and the files beside it
+    const removedPackGarbage = dryRun ? 0 : await cleanPackGarbage(files, objectsDir);
+    const commitGraph = await gcCommitGraph(options, objects);
+    const after =
+      storageBefore && packs
+        ? await storageCount(files, objectsDir, looseStorage, packs)
+        : undefined;
+    return {
+      ...partial,
+      ...commitGraph,
+      ...(allErrors.length > 0 ? { errors: allErrors } : {}),
+      ...(reflogEntriesPruned !== undefined ? { reflogEntriesPruned } : {}),
+      ...(rerere ? { rerere } : {}),
+      ...(removedPackGarbage ? { removedPackGarbage } : {}),
+      ...(storageBefore && after ? { storage: { before: storageBefore, after } } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
+    };
   };
   if (format.preciousObjects) {
-    let refsPacked = false;
-    if ((options.packRefs ?? true) && !dryRun && history.refs.packRefs) {
-      await history.refs.packRefs([], { all: true, deleteLoose: true });
-      refsPacked = true;
-    }
-    return {
+    return finish({
       removedObjects: 0,
       keptRecentObjects: 0,
       reachableObjects: 0,
@@ -336,9 +453,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
       refsPacked,
       repack: null,
       skipped: false,
-      ...(await gcCommitGraph(options, objects)),
-      ...errors,
-    };
+    });
   }
 
   const looseBefore: string[] = [];
@@ -347,13 +462,41 @@ async function collect(options: GcOptions): Promise<GcResult> {
     if (OBJECT_ID.test(key)) looseBefore.push(key);
   }
 
-  // Step 2: the packs a repack may replace, then what is reachable (a pack installed during
-  // the walk is not in the snapshot, so it is never removed). A ref that cannot be read
-  // throws here, before anything is changed.
+  // The packs a repack may replace, then what is reachable (a pack installed during the walk
+  // is not in the snapshot, so it is never removed). A ref that cannot be read throws here,
+  // before anything is changed.
   const repacking = (options.repack ?? true) && !dryRun && packs !== undefined;
   let snapshot: PackSnapshot | undefined;
   if (repacking && packs) snapshot = await snapshotPacks(packs);
   const startedAt = snapshot?.walkStartedAt ?? Date.now();
+
+  // the repack's mode (odb_source_files_optimize): -a/-A/--cruft with the packs kept, or
+  // --auto's incremental repack while there are not too many packs
+  let all = true;
+  let autoRepack: GcResult["autoRepack"];
+  let keepPacks: string[] = [];
+  if (snapshot) {
+    const local = await describePacks(files, objectsDir, snapshot.packs);
+    const threshold = gcSettings.bigPackThreshold;
+    if (options.auto) {
+      const limit = gcSettings.autoPackLimit;
+      const tooMany = limit > 0 && local.filter((p) => !p.keep).length > limit;
+      autoRepack = tooMany ? "full" : "incremental";
+      if (!tooMany) all = false;
+      else if (threshold) {
+        keepPacks = basePacks(local, threshold);
+        // keep_pack.nr >= gc_auto_pack_limit: only the largest
+        if (keepPacks.length >= limit) keepPacks = basePacks(local, 0);
+      }
+      // without a threshold git keeps the largest only when repacking it would take more than
+      // half the memory (estimate_repack_memory): not estimated here, nothing is kept
+    } else if (options.keepLargestPack !== undefined) {
+      if (options.keepLargestPack) keepPacks = basePacks(local, 0);
+    } else if (threshold) {
+      keepPacks = basePacks(local, threshold);
+    }
+  }
+
   const readGraftFile =
     options.readGraftFile ??
     graftFileReader(options.environment, { files, dir: graftFileBaseDir(gitDir) });
@@ -371,18 +514,20 @@ async function collect(options: GcOptions): Promise<GcResult> {
   // else here)
   for (const id of exclusions?.excluded ?? []) reachable.add(id);
 
-  // Step 3: pack refs (reachability does not change)
-  let refsPacked = false;
-  if ((options.packRefs ?? true) && !dryRun && history.refs.packRefs) {
-    await history.refs.packRefs([], { all: true, deleteLoose: true });
-    refsPacked = true;
-  }
-
-  // Step 4: repack -A -d
+  // repack -d -l (-a | -A | --cruft) [--keep-pack ...] [-f --depth --window]
   let repackResult: RepackResult | null = null;
   // the unreachable objects the repack left loose: the prune below keeps them
   const loosened = new Set<string>();
   if (repacking && packs && snapshot) {
+    const aggressive = options.aggressive
+      ? {
+          reuseDeltas: false,
+          deltaSearch: {
+            window: gcSettings.aggressiveWindow,
+            depth: gcSettings.aggressiveDepth,
+          },
+        }
+      : {};
     repackResult = await repackListed(
       {
         history,
@@ -391,8 +536,11 @@ async function collect(options: GcOptions): Promise<GcResult> {
         looseStorage,
         files,
         gitDir,
+        all,
+        ...aggressive,
+        ...(keepPacks.length ? { keepPacks } : {}),
         // --prune=now: repack -a (nothing unreachable kept); else --cruft, or -A
-        ...(pruneExpireMs <= 0
+        ...(!all || pruneExpireMs <= 0
           ? {}
           : (options.cruftPacks ?? gcSettings.cruftPacks)
             ? {
@@ -407,86 +555,133 @@ async function collect(options: GcOptions): Promise<GcResult> {
             : { unpackUnreachable: true, unpackUnreachableExpireMs: pruneExpireMs }),
         // git gc: repack -d -l, what alternates hold stays theirs
         local: true,
-        // a bare repository's gc writes a bitmap (git's repack default for -a in a bare one)
+        compatibility,
+        // a bare repository's gc writes a bitmap (git's repack default for -a in a bare one);
+        // --auto's incremental repack never does
         ...(options.environment ? { environment: options.environment } : {}),
-        ...(options.writeBitmaps !== undefined ? { writeBitmaps: options.writeBitmaps } : {}),
+        ...(!all
+          ? { writeBitmaps: false }
+          : options.writeBitmaps !== undefined
+            ? { writeBitmaps: options.writeBitmaps }
+            : {}),
       },
       listed,
       snapshot,
       loosened,
       exclusions,
     );
+    for (const w of repackResult?.warnings ?? []) warnings.push(w);
+    // repack's update_server_info, even when nothing was packed
+    await updateServerInfo({ files, gitDir, objects, packs });
   }
 
-  // Step 5: prune unreachable loose objects older than the grace period, keeping what a
-  // younger unreachable object reaches (git prune's mark_reachable_objects with mark_recent)
-  const cutoff = startedAt - pruneExpireMs;
+  // git prune --expire <gc.pruneExpire>: unreachable loose objects older than the grace
+  // period go, keeping what a younger unreachable object (loose or packed) reaches
+  // (mark_reachable_objects with mark_recent); 2.5x keeps what the rebase files name too
   let removedObjects = 0;
   let keptRecentObjects = 0;
-  const expiredLoose: string[] = [];
-  const recent: string[] = [];
-  for await (const key of looseStorage.keys()) {
-    if (!OBJECT_ID.test(key) || reachable.has(key)) continue;
-    // written, renewed or found fresh by the unpack step: its pack was young
-    if (loosened.has(key)) {
-      keptRecentObjects++;
-      recent.push(key);
-      continue;
-    }
-    const path = joinPath(objectsDir, key.slice(0, 2), key.slice(2));
-    const modified = (await files.stats(path))?.lastModified;
-    // An unknown age is never expired, unless every unreachable object goes (--prune=now)
-    const expired = pruneExpireMs <= 0 || (modified !== undefined && modified < cutoff);
-    if (!expired) {
-      keptRecentObjects++;
-      recent.push(key);
-      continue;
-    }
-    expiredLoose.push(key);
-  }
-  if (expiredLoose.length > 0 && recent.length > 0) {
-    const candidates = new Set(expiredLoose);
-    const walked = new Set<string>();
-    const pending = [...recent];
-    while (pending.length > 0) {
-      const id = pending.pop() as string;
-      if (walked.has(id)) continue;
-      walked.add(id);
-      for (const link of await objectLinks(objects, id)) {
-        if (walked.has(link) || reachable.has(link)) continue;
-        if (candidates.delete(link)) keptRecentObjects++;
-        pending.push(link);
-      }
-    }
-    expiredLoose.length = 0;
-    expiredLoose.push(...candidates);
-  }
-  for (const key of expiredLoose) {
-    if (dryRun || (await looseStorage.remove(key))) removedObjects++;
-  }
-
-  // Step 6: temporaries and orphaned packs
   let removedTemporaries = 0;
   let removedOrphanPacks = 0;
   let removedQuarantines = 0;
-  if (!dryRun) {
-    const packDir = joinPath(objectsDir, "pack");
-    removedTemporaries += await filesStagingStore(files, objectsDir).sweepStaged(tmpExpiryMs);
-    removedTemporaries += (await sweepPackTemporaries(files, packDir, tmpExpiryMs)).length;
-    removedQuarantines = await sweepQuarantines(files, objectsDir, tmpExpiryMs);
-    // packed-refs.new is written only under packed-refs.lock: stale whenever the lock is free
-    removedTemporaries += await createFilesRefOps(
-      atomicFilesOver(files, gitDir),
-    ).sweepTemporaries();
-    const orphanExpiry =
-      options.orphanPackExpiryMs ?? Math.max(tmpExpiryMs, ORPHAN_PACK_MIN_AGE_MS);
-    removedOrphanPacks = await sweepOrphanPacks(files, packDir, orphanExpiry);
+  let shallowPruned: number | undefined;
+  if (pruneStep) {
+    const kept = new Set(reachable);
+    if (compatibility !== "2.43") {
+      const pending = [];
+      for (const id of await rebaseFileRoots(files, gitDir))
+        if (!kept.has(id) && (await objects.has(id))) pending.push(id);
+      while (pending.length > 0) {
+        const id = pending.pop() as string;
+        if (kept.has(id)) continue;
+        kept.add(id);
+        for (const link of await objectLinks(objects, id)) if (!kept.has(link)) pending.push(link);
+      }
+    }
+    const cutoff = startedAt - pruneExpireMs;
+    const expiredLoose: string[] = [];
+    const recent: string[] = [];
+    for await (const key of looseStorage.keys()) {
+      if (!OBJECT_ID.test(key) || kept.has(key)) continue;
+      // written, renewed or found fresh by the unpack step: its pack was young
+      if (loosened.has(key)) {
+        keptRecentObjects++;
+        recent.push(key);
+        continue;
+      }
+      const path = joinPath(objectsDir, key.slice(0, 2), key.slice(2));
+      const modified = (await files.stats(path))?.lastModified;
+      // An unknown age is never expired, unless every unreachable object goes (--prune=now)
+      const expired = pruneExpireMs <= 0 || (modified !== undefined && modified < cutoff);
+      if (!expired) {
+        keptRecentObjects++;
+        recent.push(key);
+        continue;
+      }
+      expiredLoose.push(key);
+    }
+    const shallow = (await history.refs.getShallow?.().catch(() => [])) ?? [];
+    if ((expiredLoose.length > 0 || shallow.length > 0) && pruneExpireMs > 0 && packs) {
+      // add_unseen_recent_objects_to_traversal: recent packed objects seed the walk too
+      for (const id of await recentPacked(files, objectsDir, packs, cutoff, kept)) recent.push(id);
+    }
+    const walked = new Set<string>();
+    if ((expiredLoose.length > 0 || shallow.length > 0) && recent.length > 0) {
+      const candidates = new Set(expiredLoose);
+      const pending = [...recent];
+      while (pending.length > 0) {
+        const id = pending.pop() as string;
+        if (walked.has(id)) continue;
+        walked.add(id);
+        for (const link of await objectLinks(objects, id)) {
+          if (walked.has(link) || kept.has(link)) continue;
+          if (candidates.delete(link)) keptRecentObjects++;
+          pending.push(link);
+        }
+      }
+      expiredLoose.length = 0;
+      expiredLoose.push(...candidates);
+    }
+    for (const key of expiredLoose) {
+      if (dryRun || (await looseStorage.remove(key))) removedObjects++;
+    }
+    // prune_shallow: the shallow commits the walks did not reach leave `shallow`
+    if (shallow.length > 0 && !dryRun) {
+      const stay = shallow.filter((id) => kept.has(id) || walked.has(id));
+      if (stay.length < shallow.length) {
+        shallowPruned = shallow.length - stay.length;
+        await writeShallow(files, gitDir, stay);
+      }
+    }
+
+    // temporaries and orphaned packs
+    if (!dryRun) {
+      const packDir = joinPath(objectsDir, "pack");
+      removedTemporaries += await filesStagingStore(files, objectsDir).sweepStaged(tmpExpiryMs);
+      removedTemporaries += (await sweepPackTemporaries(files, packDir, tmpExpiryMs)).length;
+      removedQuarantines = await sweepQuarantines(files, objectsDir, tmpExpiryMs);
+      // packed-refs.new is written only under packed-refs.lock: stale whenever the lock is free
+      removedTemporaries += await createFilesRefOps(
+        atomicFilesOver(files, gitDir),
+      ).sweepTemporaries();
+      const orphanExpiry =
+        options.orphanPackExpiryMs ?? Math.max(tmpExpiryMs, ORPHAN_PACK_MIN_AGE_MS);
+      removedOrphanPacks = await sweepOrphanPacks(files, packDir, orphanExpiry);
+    }
   }
 
-  // Step 7: the commit-graph (git gc's write_commit_graph_reachable)
-  const commitGraph = await gcCommitGraph(options, objects);
+  // --auto: git's warning when the prune left too many loose objects
+  if (options.auto && !dryRun && gcSettings.gcAuto > 0) {
+    let inSeventeen = 0;
+    const fan = joinPath(objectsDir, "17");
+    if ((await files.stats(fan))?.kind === "directory")
+      for await (const e of files.list(fan)) if (/^[0-9a-f]{38}$/.test(e.name)) inSeventeen++;
+    if (inSeventeen > Math.ceil(gcSettings.gcAuto / 256))
+      warnings.push(
+        "warning: There are too many unreachable loose objects; run 'git prune' to remove them.",
+      );
+  }
 
-  return {
+  return finish({
     removedObjects,
     keptRecentObjects,
     reachableObjects: reachable.size,
@@ -497,17 +692,184 @@ async function collect(options: GcOptions): Promise<GcResult> {
     refsPacked,
     repack: repackResult,
     skipped: false,
-    ...commitGraph,
-    ...errors,
-  };
+    ...(autoRepack ? { autoRepack } : {}),
+    ...(keepPacks.length ? { keptLargePacks: keepPacks.map((p) => p.replace(/\.pack$/, "")) } : {}),
+    ...(shallowPruned !== undefined ? { shallowPruned } : {}),
+  });
 }
 
-/** git gc's settings of the object step: `gc.pruneExpire`, `gc.cruftPacks`, `gc.maxCruftSize`. */
+/** A local pack as gc's find_base_packs and too_many_packs see it. */
+interface PackInfo {
+  name: string;
+  size: number;
+  keep: boolean;
+  cruft: boolean;
+}
+
+async function describePacks(
+  files: FilesApi,
+  objectsDir: string,
+  packs: readonly { packId: string }[],
+): Promise<PackInfo[]> {
+  const out: PackInfo[] = [];
+  for (const p of packs) {
+    const base = joinPath(objectsDir, "pack", `pack-${p.packId}`);
+    out.push({
+      name: `pack-${p.packId}.pack`,
+      size: (await files.stats(`${base}.pack`))?.size ?? 0,
+      keep: await files.exists(`${base}.keep`),
+      cruft: await files.exists(`${base}.mtimes`),
+    });
+  }
+  return out;
+}
+
+/**
+ * find_base_packs: with a limit, every non-cruft pack of at least that size; without, the
+ * largest non-cruft pack (the first of the largest, in the order the packs are listed).
+ */
+function basePacks(packs: readonly PackInfo[], limit: number): string[] {
+  const candidates = packs.filter((p) => !p.cruft);
+  if (limit) return candidates.filter((p) => p.size >= limit).map((p) => p.name);
+  let base: PackInfo | undefined;
+  for (const p of candidates) if (!base || base.size < p.size) base = p;
+  return base ? [base.name] : [];
+}
+
+/**
+ * The unreachable packed objects newer than `cutoff` (ms): a cruft pack's by its `.mtimes`,
+ * any other pack's by the pack's own time (git's add_recent_packed).
+ */
+async function recentPacked(
+  files: FilesApi,
+  objectsDir: string,
+  packs: PackSet,
+  cutoffMs: number,
+  kept: ReadonlySet<string>,
+): Promise<string[]> {
+  const out: string[] = [];
+  const cutoff = Math.floor(cutoffMs / 1000);
+  await packs.refresh();
+  for (const pack of await packs.packs()) {
+    const base = joinPath(objectsDir, "pack", `pack-${pack.packId}`);
+    let times: Uint32Array | undefined;
+    if ((await files.stats(`${base}.mtimes`))?.kind === "file") {
+      try {
+        const parts: Uint8Array[] = [];
+        for await (const c of files.read(`${base}.mtimes`)) parts.push(c);
+        times = parsePackMtimes(concatBytes(parts), pack.count, `${base}.mtimes`);
+      } catch {
+        times = undefined;
+      }
+    }
+    const modified = (await files.stats(`${base}.pack`))?.lastModified;
+    const packTime = modified === undefined ? Number.POSITIVE_INFINITY : modified / 1000;
+    let at = 0;
+    for (const id of pack.ids()) {
+      const t = times ? (times[at] as number) : packTime;
+      at++;
+      if (t > cutoff && !kept.has(id)) out.push(id);
+    }
+  }
+  return out;
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+
+/** Rewrites `shallow` with `ids` (sorted, as git writes its grafts), or removes it if none. */
+async function writeShallow(files: FilesApi, gitDir: string, ids: readonly string[]) {
+  const path = joinPath(gitDir, "shallow");
+  if (ids.length === 0) {
+    await files.remove(path);
+    return;
+  }
+  const tmp = joinPath(gitDir, `shallow_${Math.random().toString(36).slice(2, 8)}`);
+  await files.write(tmp, [
+    new TextEncoder().encode(
+      [...ids]
+        .sort()
+        .map((id) => `${id}\n`)
+        .join(""),
+    ),
+  ]);
+  if (!(await files.move(tmp, path))) {
+    await files.remove(tmp).catch(() => false);
+    throw new Error(`unable to write ${path}`);
+  }
+}
+
+/**
+ * git gc's clean_pack_garbage: in `objects/pack`, a pack whose `.idx` has no `.pack` beside
+ * it loses every file of its name (`.idx`, `.rev`, `.bitmap`, `.keep`, `.promisor`,
+ * `.mtimes`). Returns how many files were removed.
+ */
+async function cleanPackGarbage(files: FilesApi, objectsDir: string): Promise<number> {
+  const packDir = joinPath(objectsDir, "pack");
+  if ((await files.stats(packDir))?.kind !== "directory") return 0;
+  const known = /\.(idx|rev|pack|bitmap|keep|promisor|mtimes)$/;
+  const groups = new Map<string, string[]>();
+  for await (const e of files.list(packDir)) {
+    if (e.kind !== "file" || !known.test(e.name) || e.name.startsWith("multi-pack-index")) continue;
+    const base = e.name.slice(0, e.name.lastIndexOf(".") + 1);
+    groups.set(base, [...(groups.get(base) ?? []), e.name]);
+  }
+  let removed = 0;
+  for (const [base, names] of groups) {
+    if (!names.includes(`${base}idx`) || names.includes(`${base}pack`)) continue;
+    for (const n of names) if (await files.remove(joinPath(packDir, n))) removed++;
+  }
+  return removed;
+}
+
+/** The repository's own objects (distinct ids, loose and packed) and their bytes. */
+async function storageCount(
+  files: FilesApi,
+  objectsDir: string,
+  looseStorage: FileRawStorage,
+  packs: PackSet,
+): Promise<StorageCount> {
+  const ids = new Set<string>();
+  let bytes = 0;
+  for await (const key of looseStorage.keys()) {
+    if (!OBJECT_ID.test(key)) continue;
+    ids.add(key);
+    bytes += (await files.stats(joinPath(objectsDir, key.slice(0, 2), key.slice(2))))?.size ?? 0;
+  }
+  await packs.refresh();
+  for (const p of await packs.packs()) for (const id of p.ids()) ids.add(id);
+  const packDir = joinPath(objectsDir, "pack");
+  if ((await files.stats(packDir))?.kind === "directory")
+    for await (const e of files.list(packDir))
+      if (e.kind === "file") bytes += (await files.stats(e.path))?.size ?? 0;
+  return { objects: ids.size, bytes };
+}
+
+/** git gc's settings (gc_config, odb_source_files_optimize). */
+interface GcSettings {
+  pruneExpireMs: number;
+  cruftPacks: boolean;
+  maxCruftSize?: number;
+  aggressiveWindow: number;
+  aggressiveDepth: number;
+  bigPackThreshold: number;
+  autoPackLimit: number;
+  gcAuto: number;
+}
+
+/** git gc's settings of the object step: `gc.pruneExpire`, `gc.cruftPacks`, `gc.maxCruftSize`, ... */
 async function readGcSettings(
   files: FilesApi,
   gitDir: string,
   environment?: GitHostEnvironment,
-): Promise<{ pruneExpireMs: number; cruftPacks: boolean; maxCruftSize?: number }> {
+): Promise<GcSettings> {
   const config = await createWorkingCopyConfig(
     configFilesApiOf(files, { readOnly: "reading the gc settings never writes the config" }),
     gitDir,
@@ -529,10 +891,22 @@ async function readGcSettings(
   }
   const cruft = config.get("gc.cruftPacks");
   const maxCruftSize = parseConfigSize(config.get("gc.maxCruftSize"));
+  const int = (key: string, fallback: number) => {
+    const v = config.get(key);
+    if (v === undefined || v === null) return fallback;
+    const n = parseConfigSize(String(v).replace(/^-/, ""));
+    if (n === undefined) return fallback;
+    return String(v).trim().startsWith("-") ? -n : n;
+  };
   return {
     pruneExpireMs,
     cruftPacks: configBool(cruft, true),
     ...(maxCruftSize ? { maxCruftSize } : {}),
+    aggressiveWindow: int("gc.aggressiveWindow", 250),
+    aggressiveDepth: int("gc.aggressiveDepth", 50),
+    bigPackThreshold: parseConfigSize(config.get("gc.bigPackThreshold")) ?? 0,
+    autoPackLimit: int("gc.autoPackLimit", 50),
+    gcAuto: int("gc.auto", 6700),
   };
 }
 
