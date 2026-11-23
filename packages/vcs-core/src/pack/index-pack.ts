@@ -34,6 +34,8 @@ import type { FilesApi } from "../common/files/index.js";
 import type { ObjectId } from "../common/id/index.js";
 import { CorruptObjectError } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
+import { encodePackMtimes } from "./pack-mtimes.js";
+import { encodeReverseIndex } from "./pack-reverse-index.js";
 import type { PackEntryInfo } from "./unpack-objects.js";
 
 /** A pack refused by `installPack`: corrupt, hostile, over a limit, or with unresolvable deltas. */
@@ -82,6 +84,18 @@ export interface InstallPackOptions {
    * links of (`--check-self-contained-and-connected`, `--strict`) while the object is in memory.
    */
   onContent?: ObjectContentCallback;
+  /**
+   * Write `pack-<id>.rev` (RIDX v1) beside the pack, as git's index-pack does while
+   * `pack.writeReverseIndex` is true (its default since 2.41). Default false here; the pack
+   * set's `install` passes its own setting.
+   */
+  writeReverseIndex?: boolean;
+  /**
+   * Makes the pack a cruft pack: `pack-<id>.mtimes` holds this time (seconds) for each
+   * object, renamed into place after the `.rev` and before the `.idx`, as git's pack-objects
+   * `--cruft` writes it. When the same pack is installed already, its `.mtimes` is replaced.
+   */
+  mtimes?: (id: ObjectId) => number;
 }
 
 /** See `InstallPackOptions.onContent` (and `UnpackObjectsOptions.onContent`). */
@@ -935,13 +949,21 @@ class Resolver {
   }
 }
 
-/** `.idx` version 2 over the first `n` entries of a table, laid out as git's write_idx_file. */
-function writeIdxFrom(t: Entries, packChecksum: Uint8Array): Uint8Array {
-  const n = t.n;
-  // ties (duplicate objects) stay in pack order, as git's sort does on every pack tested
-  const order = new Uint32Array(n);
-  for (let i = 0; i < n; i++) order[i] = i;
+/** The entries in idx order; ties (duplicate objects) stay in pack order, as git's sort does. */
+function idxOrder(t: Entries): Uint32Array {
+  const order = new Uint32Array(t.n);
+  for (let i = 0; i < t.n; i++) order[i] = i;
   order.sort((a, b) => cmpOid(t.oid, a, t.oid, b) || a - b);
+  return order;
+}
+
+/** `.idx` version 2 over the first `n` entries of a table, laid out as git's write_idx_file. */
+function writeIdxFrom(
+  t: Entries,
+  packChecksum: Uint8Array,
+  order: Uint32Array = idxOrder(t),
+): Uint8Array {
+  const n = t.n;
   let large = 0;
   for (let i = 0; i < n; i++) if ((t.offset[i] as number) > 0x7fffffff) large++;
   const size = 8 + 256 * 4 + n * 20 + n * 4 + n * 4 + large * 8 + 40;
@@ -1248,6 +1270,8 @@ export async function installPack(
   const id = rand();
   const tmpPack = `${dir}/tmp_pack_${id}`;
   const tmpIdx = `${dir}/tmp_idx_${id}`;
+  const tmpRev = `${dir}/tmp_rev_${id}`;
+  const tmpMtimes = `${dir}/tmp_mtimes_${id}`;
   const tmpFixed = `${dir}/tmp_pack_${id}_fixed`;
   const win = new WindowReader(files, windowBytes, windowCount);
   let appended: AppendedStore | undefined;
@@ -1333,23 +1357,56 @@ export async function installPack(
       for (const path of store.paths) await files.remove(path);
     }
     const packId = hex(packChecksum);
-    const idx = writeIdxFrom(t, packChecksum);
+    const order = idxOrder(t);
+    const idx = writeIdxFrom(t, packChecksum, order);
     const types: Record<ObjectTypeString, number> = { commit: 0, tree: 0, blob: 0, tag: 0 };
     for (let i = 0; i < t.n; i++) types[TYPE_NAMES[t.type[i] as number] as ObjectTypeString]++;
     const result: InstalledPack = { packId, count: t.n, appended: appendedCount, types };
     const name = `${dir}/pack-${packId}`;
+    const mtimesOf = options.mtimes;
+    const mtimesBytes = mtimesOf
+      ? encodePackMtimes(
+          Array.from(order, (i) => mtimesOf(hex(t.oid.subarray(i * 20, i * 20 + 20)))),
+          packChecksum,
+        )
+      : undefined;
     if ((await files.exists(`${name}.pack`)) && (await files.exists(`${name}.idx`))) {
       // the same pack is already installed (a repeated fetch): keep it, as git does
       await files.remove(packFile);
+      if (mtimesBytes) {
+        // the same cruft pack written again: its times are the new ones
+        await files.write(tmpMtimes, [mtimesBytes]);
+        if (!(await files.move(tmpMtimes, `${name}.mtimes`)))
+          throw new Error(`could not move ${tmpMtimes}`);
+      }
       return result;
     }
     await files.write(tmpIdx, [idx]);
-    // The pack goes first, then its idx (as git): readers ignore a pack without one.
-    // A leftover pack-<id>.pack from a crash is replaced here (move overwrites).
+    if (options.writeReverseIndex) {
+      // entries are in pack order here: the idx position of each (git's write_rev_file)
+      const rev = new Uint32Array(t.n);
+      for (let k = 0; k < t.n; k++) rev[order[k] as number] = k;
+      await files.write(tmpRev, [encodeReverseIndex(rev, packChecksum)]);
+    }
+    if (mtimesBytes) await files.write(tmpMtimes, [mtimesBytes]);
+    // The pack goes first, then its reverse index, then its idx (git's pack_copy_priority):
+    // readers ignore a pack without an idx. A leftover pack-<id>.pack from a crash is
+    // replaced here (move overwrites).
     if (!(await files.move(packFile, `${name}.pack`)))
       throw new Error(`could not move ${packFile}`);
+    if (options.writeReverseIndex && !(await files.move(tmpRev, `${name}.rev`))) {
+      await safeRemove(files, `${name}.pack`);
+      throw new Error(`could not move ${tmpRev}`);
+    }
+    if (mtimesBytes && !(await files.move(tmpMtimes, `${name}.mtimes`))) {
+      await safeRemove(files, `${name}.pack`);
+      if (options.writeReverseIndex) await safeRemove(files, `${name}.rev`);
+      throw new Error(`could not move ${tmpMtimes}`);
+    }
     if (!(await files.move(tmpIdx, `${name}.idx`))) {
       await safeRemove(files, `${name}.pack`); // no orphan pack without its idx
+      if (options.writeReverseIndex) await safeRemove(files, `${name}.rev`);
+      if (mtimesBytes) await safeRemove(files, `${name}.mtimes`);
       throw new Error(`could not move ${tmpIdx}`);
     }
     return result;
@@ -1357,7 +1414,7 @@ export async function installPack(
     win.release();
     stash.release();
     appended?.release();
-    for (const p of [tmpPack, tmpIdx, tmpFixed, ...(appended?.allPaths ?? [])]) {
+    for (const p of [tmpPack, tmpIdx, tmpRev, tmpMtimes, tmpFixed, ...(appended?.allPaths ?? [])]) {
       await safeRemove(files, p);
     }
     throw e;

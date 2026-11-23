@@ -28,6 +28,8 @@ export * from "./promisor-objects.js";
 export * from "./quarantine/index.js";
 // Reachability roots (refs, reflogs, index) for repack and gc
 export * from "./reachable-objects.js";
+// `git reflog expire --all`, as gc runs it
+export * from "./reflog-expire.js";
 // Refs (file-dependent)
 export * from "./refs/index.js";
 // Repack

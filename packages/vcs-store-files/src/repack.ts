@@ -37,7 +37,13 @@ import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { assertAlternatesReadable } from "./alternates/index.js";
+import { writeCruftPacks } from "./cruft-pack.js";
 import { type MultiPackIndexWriteOptions, multiPackIndexWrite } from "./multi-pack-index.js";
+import {
+  type PackWriteSettings,
+  packDeltaSearch,
+  readPackWriteSettings,
+} from "./pack/pack-write-settings.js";
 import { type PromisorExclusions, promisorExclusions } from "./promisor-objects.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
@@ -118,6 +124,21 @@ export interface RepackOptions extends RepackTarget {
   /** The expiry of `unpackUnreachable` (git's gc.pruneExpire). Default two weeks. */
   unpackUnreachableExpireMs?: number;
   /**
+   * `git repack --cruft` (with `all`, in place of `unpackUnreachable`): the unreachable
+   * objects of the replaced packs and the unreachable loose objects go into a cruft pack
+   * (`.pack`, `.idx`, `.mtimes`, and `.rev` under `pack.writeReverseIndex`), each with the
+   * newest time of its copies, before the replaced packs are removed (see
+   * `writeCruftPacks`). `gc()` sets it from `gc.cruftPacks` (default true).
+   */
+  cruft?: boolean;
+  /**
+   * `--cruft-expiration` (seconds since the epoch): cruft objects not newer than this are
+   * dropped unless a newer one reaches them. Undefined: none expires.
+   */
+  cruftExpiration?: number;
+  /** `--max-cruft-size` (bytes, at least 1 MiB as git's): cruft packs are split to stay under it. */
+  maxCruftSize?: number;
+  /**
    * Reads the grafts file in place of `info/grafts` (git's `GIT_GRAFT_FILE`;
    * `graftFileReader(environment)` makes one): what its grafts reach is packed.
    */
@@ -152,6 +173,12 @@ export interface RepackOptions extends RepackTarget {
    * `--stdin-packs`). A bitmap asked for (`writeBitmaps`) then goes to the midx, not the pack.
    */
   writeMidx?: boolean;
+  /**
+   * The `pack.*` settings (`readPackWriteSettings`): read from the config (with
+   * `environment`'s system, global and command-line config) when not given. `deltaSearch`
+   * given as an object overrides their window and depth.
+   */
+  packSettings?: PackWriteSettings;
   /** @internal writes the midx bitmap (see `MultiPackIndexWriteOptions.writeBitmap`) */
   writeMidxBitmap?: MultiPackIndexWriteOptions["writeBitmap"];
 }
@@ -283,6 +310,10 @@ export interface RepackResult {
   promisorPack?: { packName: string; objectCount: number };
   /** `filter`: the pack of the objects the filter left out (`pack-<id>`), when any was */
   filteredPack?: string;
+  /** `cruft`: the cruft packs written (`pack-<id>`), when any was */
+  cruftPacks?: string[];
+  /** `cruft`: the objects written to them */
+  cruftObjects?: number;
   /**
    * git's error lines from reading the alternates, which git repack prints to stderr and goes
    * on (`repack()` only; gc reports them in its own result); absent when there are none
@@ -497,17 +528,26 @@ export async function repackListed(
     };
   }
 
+  // pack-objects' own settings: pack.window, pack.depth, pack.compression, ...
+  const settings =
+    options.packSettings ??
+    (await readPackWriteSettings(files, gitDir, {
+      ...(options.environment ? { environment: options.environment } : {}),
+    }));
   const packOptions = {
     packs,
     reuseObjects: options.reuseObjects ?? true,
     reuseDeltas: options.reuseDeltas ?? true,
-    deltaSearch: options.deltaSearch ?? true,
+    deltaSearch: packDeltaSearch(settings, options.deltaSearch),
     bigFileThreshold: options.bigFileThreshold,
+    ...(settings.compression !== undefined ? { compression: settings.compression } : {}),
   };
+  // pack.writeReverseIndex: a `.rev` beside each pack written (git 2.41+ default)
+  const installOptions = { writeReverseIndex: settings.writeReverseIndex };
   // the promisor pack first, with its (empty) `.promisor` file, as repack-promisor.c writes it
   let promisorPack: string | undefined;
   if (promised.length > 0) {
-    const written = await packs.install(writePack(objects, promised, packOptions));
+    const written = await packs.install(writePack(objects, promised, packOptions), installOptions);
     promisorPack = written.packId;
     if (packs.writePromisor) await packs.writePromisor(promisorPack, "");
     else await files.write(joinPath(packDir, `pack-${promisorPack}.promisor`), []);
@@ -518,7 +558,7 @@ export async function repackListed(
   }
   // One stream: objects are read one at a time, the pack goes straight into its temporary file
   const stream = writePack(objects, ids, packOptions);
-  const installed = await packs.install(stream);
+  const installed = await packs.install(stream, installOptions);
   // Install before remove: every reader finds each object in the new pack from now on
   await packs.refresh();
   let bitmapWritten: boolean;
@@ -559,7 +599,8 @@ export async function repackListed(
         }
       }
       if (left.length > 0) {
-        filteredPack = (await packs.install(writePack(objects, left, packOptions))).packId;
+        filteredPack = (await packs.install(writePack(objects, left, packOptions), installOptions))
+          .packId;
         newPacks.add(filteredPack);
         await packs.refresh();
       }
@@ -576,8 +617,41 @@ export async function repackListed(
       }
     }
 
+    // --cruft: the unreachable objects of the packs about to go, and the unreachable loose
+    // ones, into a cruft pack (pack-objects --cruft, the new packs and .keep packs fresh)
+    let cruft: { packNames: string[]; objectCount: number } | undefined;
+    if (options.cruft && all) {
+      cruft = await writeCruftPacks({
+        files,
+        gitDir,
+        objects,
+        packs,
+        looseStorage,
+        discard: removable,
+        now: Math.floor(Date.now() / 1000),
+        packOptions,
+        writeReverseIndex: settings.writeReverseIndex,
+        ...(options.cruftExpiration !== undefined ? { expiration: options.cruftExpiration } : {}),
+        ...(options.maxCruftSize !== undefined ? { maxSize: options.maxCruftSize } : {}),
+        skip: async (id) => {
+          // -l: what an alternate holds; a partial clone's promisor objects stay out
+          if (exclusions?.excluded.has(id)) return true;
+          if (options.local)
+            for (const alt of alternates) if (await alt.objects.has(id)) return true;
+          return false;
+        },
+      });
+      // a cruft pack that comes out the same as a replaced one stays
+      for (const name of cruft?.packNames ?? []) {
+        const id = name.slice("pack-".length);
+        newPacks.add(id);
+        const at = removable.findIndex((r) => r.pack.packId === id);
+        if (at >= 0) removable.splice(at, 1);
+      }
+    }
+
     let unpackedObjects = 0;
-    if (options.unpackUnreachable && removable.length) {
+    if (options.unpackUnreachable && !options.cruft && removable.length) {
       unpackedObjects = await unpackUnreachable({
         files,
         gitDir,
@@ -651,6 +725,7 @@ export async function repackListed(
         ? { promisorPack: { packName: `pack-${promisorPack}`, objectCount: promised.length } }
         : {}),
       ...(filteredPack ? { filteredPack: `pack-${filteredPack}` } : {}),
+      ...(cruft ? { cruftPacks: cruft.packNames, cruftObjects: cruft.objectCount } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
       ...(midxWritten ? { midx: midxWritten } : {}),
     };

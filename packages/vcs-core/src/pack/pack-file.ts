@@ -53,6 +53,11 @@ import type { ObjectId } from "../common/id/index.js";
 import { type GitObject, ObjectIdMismatchError } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 import { PackError } from "./index-pack.js";
+import {
+  parseReverseIndex,
+  ReverseIndexError,
+  verifyReverseIndexFile,
+} from "./pack-reverse-index.js";
 
 /** Pack entry kinds: 1–4 whole objects (commit, tree, blob, tag), 6 OFS_DELTA, 7 REF_DELTA. */
 export type PackedEntryKind = 1 | 2 | 3 | 4 | 6 | 7;
@@ -146,6 +151,11 @@ export interface OpenPackOptions {
   verifyIndex?: boolean;
   /** The idx file's bytes, when the caller has read them already (not read again). */
   idxBytes?: Uint8Array;
+  /**
+   * Whether `loadReverseIndex` reads `pack-<id>.rev` (git's `pack.readReverseIndex`, default
+   * true). Without it the pack order is always computed from the idx's offsets.
+   */
+  readReverseIndex?: boolean;
 }
 
 /** Counters, for tests and diagnostics. */
@@ -205,6 +215,20 @@ export interface PackFile extends Pack {
    * (`.rev`), computed from the idx's offsets. A pack bitmap's bit positions are pack order.
    */
   packOrder(): Uint32Array;
+  /**
+   * Reads the pack's `.rev` file (git's load_pack_revindex), so `packOrder` takes the pack
+   * order from it instead of sorting the idx's offsets; once per pack, before `packOrder` is
+   * first asked. "absent" when there is none (or reading reverse indexes is off), "loaded"
+   * when it is used, else git's error line (`reverse-index file ... is corrupt`, ...): the
+   * order is then computed, as git falls back to create_pack_revindex_in_memory. A file whose
+   * positions do not follow the idx's offsets is refused too (git would trust it).
+   */
+  loadReverseIndex?(): Promise<"absent" | "loaded" | string>;
+  /**
+   * fsck's verify_pack_revindex: undefined when the pack has no `.rev`, or when it matches
+   * the order computed from the idx and its checksum holds; else git's error lines.
+   */
+  verifyReverseIndex?(): Promise<string[] | undefined>;
   /** The id at position `i` of the idx (sorted order). */
   idAt(i: number): ObjectId;
   /** The idx position of `id`, -1 when the pack does not hold it. */
@@ -999,6 +1023,38 @@ export async function openPack(
       sorted = s;
     }
     return sorted;
+  };
+  /** the `.rev` file's path */
+  const revPath = `${packPath.replace(/\.pack$/, "")}.rev`;
+  let revLoad: Promise<"absent" | "loaded" | string> | undefined;
+  /** reads the `.rev` (see `PackFile.loadReverseIndex`) */
+  const loadReverseIndex = (): Promise<"absent" | "loaded" | string> => {
+    revLoad ??= (async () => {
+      if (perm || options.readReverseIndex === false) return "absent";
+      const st = await files.stats(revPath);
+      if (st?.kind !== "file") return "absent";
+      try {
+        const order = parseReverseIndex(await readAll(files, revPath), n, revPath);
+        // git trusts the positions; a wrong one would misplace every bitmap bit and entry
+        // extent, so they must follow the offsets (which also makes them a permutation)
+        let prev = -1;
+        for (let p = 0; p < n; p++) {
+          const i = order[p] as number;
+          const off = i < n ? t.offsetOf(i) : -1;
+          if (off <= prev)
+            throw new ReverseIndexError(
+              `reverse-index file ${revPath} does not follow the pack's offsets`,
+            );
+          prev = off;
+        }
+        perm ??= order;
+        return "loaded";
+      } catch (e) {
+        if (e instanceof ReverseIndexError) return `error: ${e.message}`;
+        return `error: failed to read ${revPath}`;
+      }
+    })();
+    return revLoad;
   };
   /** For each entry in pack order, its position in the idx (built when first needed). */
   const permutation = (): Uint32Array => {
@@ -1850,6 +1906,11 @@ export async function openPack(
     },
     verifyIndex: () => t.verify(),
     packOrder: () => permutation(),
+    loadReverseIndex,
+    async verifyReverseIndex() {
+      if (options.readReverseIndex === false) return undefined;
+      return verifyReverseIndexFile(files, packPath, n, (i) => t.offsetOf(i));
+    },
     idAt: (i) => hex(t.idAt(i)),
     offsetAt: (i) => t.offsetOf(i),
     indexOf(id) {

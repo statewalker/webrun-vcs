@@ -18,7 +18,7 @@
  *  - thin packs: deltas against `haves` the receiver has, which are not written;
  *  - a base is always written before its deltas, whatever the order of `ids`.
  */
-import { deflate } from "@statewalker/vcs-utils/compression";
+import { deflate, deflatePako } from "@statewalker/vcs-utils/compression";
 import {
   createGitDeltaIndex,
   encodeGitDelta,
@@ -105,6 +105,12 @@ export interface WritePackOptions {
   bigFileThreshold?: number;
   /** Called after each entry is written (for an idx: offsets and CRC-32). */
   onEntry?: (entry: WrittenPackEntry) => void;
+  /**
+   * zlib level of the entries written (git's `pack.compression`, else `core.compression`;
+   * -1 is zlib's default, 6). Entries copied as stored keep theirs, as git's do without `-F`.
+   * Default: the runtime's deflate at its default level.
+   */
+  compression?: number;
 }
 
 /** One entry as written. */
@@ -183,6 +189,13 @@ export async function* writePack(
   const reuseObjects = options.reuseObjects ?? true;
   const reuseDeltas = options.reuseDeltas ?? true;
   const ofsDelta = options.ofsDelta ?? true;
+  const level = options.compression;
+  if (level !== undefined && (!Number.isInteger(level) || level < -1 || level > 9))
+    throw new RangeError(`bad pack compression level ${level}`);
+  const compress =
+    level === undefined
+      ? (s: AsyncIterable<Uint8Array>) => deflate(s)
+      : (s: AsyncIterable<Uint8Array>) => deflatePako(s, { level });
   const bigFileThreshold = options.bigFileThreshold ?? DEFAULT_BIG_FILE_THRESHOLD;
   const search =
     options.deltaSearch === true ? {} : options.deltaSearch ? options.deltaSearch : undefined;
@@ -332,13 +345,13 @@ export async function* writePack(
       baseId = p.deltaBase.id;
       kind = deltaKind(p.deltaBase.have ? undefined : p.deltaBase, ofsDelta);
       emit(deltaHeader(kind, d.length, start, p.deltaBase.have ? undefined : p.deltaBase, baseId));
-      for await (const c of deflate(once(d))) emit(c);
+      for await (const c of compress(once(d))) emit(c);
     } else {
       const o = await objects.get(p.id);
       if (!o) throw new MissingObjectError(`object ${p.id} is missing`);
       kind = TYPE_CODE[o.type];
       emit(entryHeader(kind, o.size));
-      for await (const c of deflate(sized(o, p.id))) {
+      for await (const c of compress(sized(o, p.id))) {
         emit(c);
         while (full.length) yield full.shift() as Uint8Array;
       }

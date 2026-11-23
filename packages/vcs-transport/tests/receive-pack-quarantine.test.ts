@@ -361,7 +361,12 @@ describe("receive-pack quarantine on the files backend (kept packs)", () => {
     expect(run.report).toEqual(["unpack ok", "ng refs/heads/main pre-receive hook declined"]);
     // the pack waited in the quarantine while the hook ran
     expect(quarantineSeen).toHaveLength(1);
-    expect(quarantinedPack.map((n) => n.slice(n.lastIndexOf(".")))).toEqual([".idx", ".pack"]);
+    // index-pack writes the .rev beside the pack (pack.writeReverseIndex, default since 2.41)
+    expect(quarantinedPack.map((n) => n.slice(n.lastIndexOf(".")))).toEqual([
+      ".idx",
+      ".pack",
+      ".rev",
+    ]);
     expect(await listNames(files, "objects")).toEqual(objectsBefore);
     expect(await listNames(files, "objects/pack")).toEqual(packsBefore);
     expect(await storedIds(repo)).toEqual(idsBefore);
@@ -374,7 +379,7 @@ describe("receive-pack quarantine on the files backend (kept packs)", () => {
     const run = await runReceivePack(repo, { commands: [`${c2} ${tip} refs/heads/main`], pack });
     expect(run.report).toEqual(["unpack ok", "ok refs/heads/main"]);
     const packsAfter = await listNames(files, "objects/pack");
-    expect(packsAfter.length).toBe(packsBefore.length + 2); // .pack and .idx
+    expect(packsAfter.length).toBe(packsBefore.length + 3); // .pack, .idx and .rev
     expect((await listNames(files, "objects")).some((n) => n.startsWith("tmp_objdir-"))).toBe(
       false,
     );

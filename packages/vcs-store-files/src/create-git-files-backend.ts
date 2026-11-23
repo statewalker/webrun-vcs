@@ -31,7 +31,7 @@ import type { AtomicFiles } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { openObjectAlternates, withAlternates } from "./alternates/index.js";
 import { createFilesCommitGraphProvider } from "./commit-graph.js";
-import { readPackSetSettings, skipPacked, withPacks } from "./pack/index.js";
+import { parseConfigInt, readPackSetSettings, skipPacked, withPacks } from "./pack/index.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
 import { createFileRefStore, type FileRefStore, peelTag } from "./refs/index.js";
 import { repack } from "./repack.js";
@@ -236,6 +236,8 @@ export async function createGitFilesBackend(
     freshenMaxAgeMs,
     baseCacheBytes: packSettings.baseCacheBytes,
     multiPackIndex: packSettings.multiPackIndex,
+    writeReverseIndex: packSettings.writeReverseIndex,
+    readReverseIndex: packSettings.readReverseIndex,
   });
   // the alternates (git's other odb sources): read after the repository's own objects, never
   // written; an object one holds is not written here (odb_freshen_object)
@@ -404,24 +406,6 @@ function readRefStoreConfig(config: Pick<GitWorkingCopyConfig, "get">): {
     refLockTimeoutMs: parseConfigInt(config.get("core.filesRefLockTimeout")),
     packedLockTimeoutMs: parseConfigInt(config.get("core.packedRefsTimeout")),
   };
-}
-
-/** An integer as git_config_int reads it (sign, decimal, 0x hex or 0 octal, then k, m or g). */
-function parseConfigInt(value: unknown): number | undefined {
-  if (typeof value === "number") return Number.isSafeInteger(value) ? value : undefined;
-  if (typeof value !== "string") return undefined;
-  const match = /^\s*([-+]?)(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)([kKmMgG]?)\s*$/.exec(value);
-  if (!match) return undefined;
-  const digits = match[2] as string;
-  const magnitude =
-    digits.length > 2 && (digits[1] === "x" || digits[1] === "X")
-      ? Number.parseInt(digits.slice(2), 16)
-      : digits.length > 1 && digits.startsWith("0")
-        ? Number.parseInt(digits.slice(1), 8)
-        : Number.parseInt(digits, 10);
-  const unit = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[(match[3] as string).toLowerCase()];
-  const n = magnitude * (unit ?? 1) * (match[1] === "-" ? -1 : 1);
-  return Number.isSafeInteger(n) ? n : undefined;
 }
 
 /**
