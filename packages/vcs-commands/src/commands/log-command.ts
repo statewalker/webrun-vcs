@@ -6,7 +6,6 @@ import {
   type CommitGraph,
   canonTreeMode,
   commitFromBytes,
-  EMPTY_TREE_ID,
   type GitObject,
   type ObjectId,
   type ObjectReplacements,
@@ -67,8 +66,6 @@ import {
 import { PathspecAttributes } from "./pathspec-attributes.js";
 import { loadRefDecorations } from "./pretty-format.js";
 import { readDiffSubmoduleConfig } from "./submodule-summary.js";
-
-const NULL_OBJECT_ID = "0".repeat(40);
 
 /** What {@link LogCommand.callBytes} asks of the walk. */
 interface OutputWalk {
@@ -1151,7 +1148,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       diff: async (entry, parent, formats, options) => {
         // the trees themselves: a full id names its object, so no revision is looked up
         const diff = new DiffCommand(this._workingCopy)
-          .setOldTree(parent ? await treeOf(parent) : EMPTY_TREE_ID)
+          .setOldTree(parent ? await treeOf(parent) : this.objectFormat.emptyTreeId)
           .setNewTree(entry.commit.tree)
           .shareReadsOf(this);
         diff.setOptions({
@@ -1219,7 +1216,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     prefix = "",
     out = new Map<string, { mode: number; id: ObjectId }>(),
   ): Promise<Map<string, { mode: number; id: ObjectId }>> {
-    if (tree === EMPTY_TREE_ID) return out;
+    if (tree === this.objectFormat.emptyTreeId) return out;
     for await (const entry of this.trees.loadTree(tree)) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
       if ((entry.mode & 0o170000) === 0o040000) await this.flatTree(entry.id, path, out);
@@ -1308,7 +1305,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     if (paths.length === 0 || !options.patch) {
       return { paths: paths.length, names: names.bytes(), patch: sink.bytes() };
     }
-    const ids = new Set<string>([NULL_OBJECT_ID]);
+    const ids = new Set<string>([this.objectFormat.nullId]);
     for (const path of paths) {
       const r = result.get(path);
       if (r) ids.add(r.id);
@@ -1346,21 +1343,30 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       const sides = [];
       for (let k = 0; k < parents.length; k++) {
         const e = sideOf(parents[k] as Map<string, { mode: number; id: ObjectId }>, k, path);
-        sides.push({ id: e?.id ?? NULL_OBJECT_ID, mode: e?.mode ?? 0, content: await read(e) });
+        sides.push({
+          id: e?.id ?? this.objectFormat.nullId,
+          mode: e?.mode ?? 0,
+          content: await read(e),
+        });
       }
       writeCombinedDiff(
         sink,
         {
           path,
           parents: sides,
-          result: { id: r?.id ?? NULL_OBJECT_ID, mode: r?.mode ?? 0, content: await read(r) },
+          result: {
+            id: r?.id ?? this.objectFormat.nullId,
+            mode: r?.mode ?? 0,
+            content: await read(r),
+          },
         },
         {
           ...xdiffOptions,
           dense,
           workingTreeFile: false,
           context: this.diffOptions.context ?? (Number.isFinite(context) ? context : 3),
-          abbreviate: (id) => id.slice(0, this.diffOptions.fullIndex ? 40 : (lengths.get(id) ?? 7)),
+          abbreviate: (id) =>
+            id.slice(0, this.diffOptions.fullIndex ? id.length : (lengths.get(id) ?? 7)),
           quotePath: quote,
         },
       );
@@ -1660,8 +1666,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     // git reads the parent's tree, then the commit's
     const da = a ? await this.requireTree(a) : EMPTY_TREE;
     const db = b ? await this.requireTree(b) : EMPTY_TREE;
-    const ca = new RawEntries(da);
-    const cb = new RawEntries(db);
+    const ca = new RawEntries(da, this.objectFormat.rawLength);
+    const cb = new RawEntries(db, this.objectFormat.rawLength);
     // entries are matched where they lie in the tree's bytes: no name is decoded; an `:(attr)`
     // element waits for the attributes of a path, then the entry is matched again
     const skip = (c: RawEntries): Promise<void> | undefined => {
@@ -1793,7 +1799,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     i: number,
   ): Promise<boolean> {
     // the whole tree (`.`, `:/`): a root commit compares with the empty tree, as in git
-    if (parts.length === 0) return (a ?? EMPTY_TREE_ID) !== (b ?? EMPTY_TREE_ID);
+    const empty = this.objectFormat.emptyTreeId;
+    if (parts.length === 0) return (a ?? empty) !== (b ?? empty);
     const name = parts[i] as Uint8Array;
     const ea = a ? await this.entryOf(a, name) : undefined;
     const eb = b ? await this.entryOf(b, name) : undefined;
@@ -1820,7 +1827,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const raw = await this.rawTree(tree);
     if (raw === null) return this.trees.getEntry(tree, NAME_DECODER.decode(name));
     if (raw === undefined) throw new GitApiError(`unable to read tree (${tree})`);
-    return findRawEntry(raw, name);
+    return findRawEntry(raw, name, this.objectFormat.rawLength);
   }
 
   /** The replace refs a walk's tree reads follow; undefined without any. */
@@ -1834,7 +1841,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private async rawTree(tree: ObjectId): Promise<Uint8Array | undefined | null> {
     const id = this.treeReplacements ? replacementOf(this.treeReplacements, tree) : tree;
     // the empty tree, which a store need not hold
-    if (id === EMPTY_TREE_ID) return EMPTY_TREE;
+    if (id === this.objectFormat.emptyTreeId) return EMPTY_TREE;
     const cached = this.rawTrees.get(id);
     if (cached) {
       this.rawTrees.delete(id);
@@ -2128,7 +2135,11 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
 }
 
 /** The entry named `name` (raw bytes) in raw tree `d`: its id and mode, or undefined. */
-function findRawEntry(d: Uint8Array, name: Uint8Array): { id: ObjectId; mode: number } | undefined {
+function findRawEntry(
+  d: Uint8Array,
+  name: Uint8Array,
+  idLength: number,
+): { id: ObjectId; mode: number } | undefined {
   let p = 0;
   const n = name.length;
   while (p < d.length) {
@@ -2141,9 +2152,9 @@ function findRawEntry(d: Uint8Array, name: Uint8Array): { id: ObjectId; mode: nu
     if (p - start === n) {
       let k = 0;
       while (k < n && d[start + k] === name[k]) k++;
-      if (k === n) return { id: bytesToHex(d.subarray(idAt, idAt + 20)), mode };
+      if (k === n) return { id: bytesToHex(d.subarray(idAt, idAt + idLength)), mode };
     }
-    p = idAt + 20;
+    p = idAt + idLength;
   }
   return undefined;
 }
@@ -2233,7 +2244,11 @@ class RawEntries {
   nameStart = 0;
   /** where the name ends (its NUL; the id follows) */
   nul = 0;
-  constructor(readonly d: Uint8Array) {}
+  /** @param idLength raw id bytes per entry: 20 (SHA-1) or 32 (SHA-256) */
+  constructor(
+    readonly d: Uint8Array,
+    readonly idLength = 20,
+  ) {}
   get done(): boolean {
     return this.at >= this.d.length;
   }
@@ -2249,10 +2264,10 @@ class RawEntries {
     this.nul = p;
   }
   next(): void {
-    this.at = this.nul + 21;
+    this.at = this.nul + 1 + this.idLength;
   }
   id(): ObjectId {
-    return bytesToHex(this.d.subarray(this.nul + 1, this.nul + 21));
+    return bytesToHex(this.d.subarray(this.nul + 1, this.nul + 1 + this.idLength));
   }
   /** The base of the entries below this one (a directory): `base`, its name and "/". */
   below(base: Uint8Array): Uint8Array {
@@ -2264,7 +2279,7 @@ class RawEntries {
     return out;
   }
   sameId(other: RawEntries): boolean {
-    for (let k = 1; k <= 20; k++) {
+    for (let k = 1; k <= this.idLength; k++) {
       if (this.d[this.nul + k] !== other.d[other.nul + k]) return false;
     }
     return true;

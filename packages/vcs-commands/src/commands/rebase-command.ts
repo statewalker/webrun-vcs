@@ -1,6 +1,5 @@
 import {
   type Commit,
-  EMPTY_TREE_ID,
   isSymbolicRef,
   listObjectsWithPrefix,
   type ObjectId,
@@ -182,8 +181,6 @@ type PickOutcome =
       message?: string;
     }
   | { kind: "reschedule"; result: RebaseResult & { reschedule?: boolean } };
-
-const ZERO_ID = "0000000000000000000000000000000000000000";
 
 /**
  * What a todo command came to: nothing (go on), `checkTodo` (go on, the list read again if
@@ -1511,7 +1508,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // dropped (drop_redundant_commits), kept (keep_redundant_commits) or stops the rebase
     let allowEmpty = false;
     if (treeId === headTreeId) {
-      if (commit.tree === (parentTreeId ?? EMPTY_TREE_ID)) allowEmpty = true;
+      if (commit.tree === (parentTreeId ?? this.objectFormat.emptyTreeId)) allowEmpty = true;
       else if (await state.exists(`${DIR}/keep_redundant_commits`)) allowEmpty = true;
       else if (await state.exists(`${DIR}/drop_redundant_commits`)) {
         await state.removeRef("AUTO_MERGE");
@@ -1533,7 +1530,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       if (!allowEmpty && head.parents.length <= 1) {
         const parentTree = head.parents[0]
           ? await this.commits.getTree(head.parents[0])
-          : EMPTY_TREE_ID;
+          : this.objectFormat.emptyTreeId;
         if (parentTree === treeId) {
           // do_commit: REBASE_HEAD written before git commit runs
           await state.setRef("REBASE_HEAD", item.id);
@@ -2404,7 +2401,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         }
         if (buf === "") buf = `rev-${await this.abbreviateObjectId(oid)}`;
         if (
-          (buf.length === 40 && /^[0-9a-fA-F]{40}$/.test(buf)) ||
+          (buf.length === this.objectFormat.hexLength && /^[0-9a-fA-F]+$/.test(buf)) ||
           buf === "#" ||
           labels.has(buf)
         ) {
@@ -2443,7 +2440,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       if (!commit) throw new CommitNotFoundError(id);
       const parentTree = commit.parents[0]
         ? (await this.loadCommit(commit.parents[0]))?.tree
-        : EMPTY_TREE_ID;
+        : this.objectFormat.emptyTreeId;
       const empty = commit.tree === parentTree;
       if (!empty && skipped.has(id)) continue;
       if (empty && !keepEmpty) continue;
@@ -3326,7 +3323,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     if (!commit) return false;
     const parentTree = commit.parents[0]
       ? (await this.loadCommit(commit.parents[0]))?.tree
-      : EMPTY_TREE_ID;
+      : this.objectFormat.emptyTreeId;
     return commit.tree === parentTree;
   }
 
@@ -3606,7 +3603,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         } else {
           out.push({ action: RebaseAction.UPDATE_REF, id: "", rest: name, blankAfter: true });
           if (!records.some((r) => r.ref === name)) {
-            records.push({ ref: name, before: values.get(name) ?? ZERO_ID, after: ZERO_ID });
+            records.push({
+              ref: name,
+              before: values.get(name) ?? this.objectFormat.nullId,
+              after: this.objectFormat.nullId,
+            });
           }
         }
       }
@@ -3626,14 +3627,18 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       .map((item) => item.rest ?? "");
     let updated = false;
     const kept = records.filter((r) => {
-      const keep = r.after !== ZERO_ID || named.includes(r.ref);
+      const keep = r.after !== this.objectFormat.nullId || named.includes(r.ref);
       if (!keep) updated = true;
       return keep;
     });
     for (const ref of named) {
       if (!kept.some((r) => r.ref === ref)) {
         const value = (await this.refsStore.resolve(ref).catch(() => undefined))?.objectId;
-        kept.push({ ref, before: value ?? ZERO_ID, after: ZERO_ID });
+        kept.push({
+          ref,
+          before: value ?? this.objectFormat.nullId,
+          after: this.objectFormat.nullId,
+        });
         updated = true;
       }
     }
@@ -3663,7 +3668,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const failed: string[] = [];
     for (const record of records) {
       const value = (await this.refsStore.resolve(record.ref).catch(() => undefined))?.objectId;
-      if ((value ?? ZERO_ID) !== record.before || record.after === ZERO_ID) {
+      if (
+        (value ?? this.objectFormat.nullId) !== record.before ||
+        record.after === this.objectFormat.nullId
+      ) {
         failed.push(record.ref);
         continue;
       }
@@ -3849,7 +3857,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       const parentTree = commit.parents[0]
         ? (await this.loadCommit(commit.parents[0]))?.tree
         : undefined;
-      return patchId(trees, this.blobs, parentTree, commit.tree, { headerOnly });
+      return patchId(trees, this.blobs, parentTree, commit.tree, {
+        headerOnly,
+        objectFormat: this.objectFormat,
+      });
     };
     const full = new Map<ObjectId, string | undefined>();
     const fullOf = async (id: ObjectId) => {

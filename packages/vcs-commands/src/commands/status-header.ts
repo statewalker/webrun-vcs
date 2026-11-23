@@ -112,7 +112,9 @@ async function getBranch(source: StatusHeaderSource, name: string): Promise<stri
   if (!value) return undefined;
   if (value.startsWith("refs/heads/")) return value.slice("refs/heads/".length);
   if (value.startsWith("refs/")) return value;
-  if (/^[0-9a-fA-F]{40}/.test(value)) return source.abbreviate(value.slice(0, 40).toLowerCase());
+  // a SHA-256 id (64 hex digits), else a SHA-1 one
+  const hex = /^[0-9a-fA-F]{64}/.test(value) ? 64 : /^[0-9a-fA-F]{40}/.test(value) ? 40 : 0;
+  if (hex) return source.abbreviate(value.slice(0, hex).toLowerCase());
   if (value === "detached HEAD") return undefined;
   return value;
 }

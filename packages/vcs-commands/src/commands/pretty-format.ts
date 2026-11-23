@@ -198,12 +198,13 @@ export async function loadRefDecorations(
     if (name.startsWith(replaceBase)) {
       if (options.useReplaceRefs === false) return;
       const hex = name.slice(replaceBase.length);
+      const hexLength = /^[0-9a-fA-F]{64}/.test(hex) ? 64 : 40;
       if (!/^[0-9a-fA-F]{40}/.test(hex)) {
         // add_ref_decoration: get_oid_hex of what follows the base
         options.onWarning?.(`warning: invalid replace ref ${name}`);
         return;
       }
-      const original = hex.slice(0, 40).toLowerCase();
+      const original = hex.slice(0, hexLength).toLowerCase();
       if (options.hasObject && !(await options.hasObject(original))) return;
       add(original, { type: "grafted", name: "replaced" });
       return;

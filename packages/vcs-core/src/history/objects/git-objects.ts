@@ -5,6 +5,7 @@
  * produced keep their id.
  */
 
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { ObjectId } from "../../common/id/index.js";
 import type { InstalledPack, InstallPackOptions } from "../../pack/index-pack.js";
 import type { PackSet } from "../../pack/pack-set.js";
@@ -52,6 +53,12 @@ export interface ListPrefixOptions {
 }
 
 export interface GitObjects {
+  /**
+   * The repository's object format (`extensions.objectFormat`): the hash its ids are, their
+   * lengths, the null and empty ids. Absent: SHA-1, git's default (see `objectFormatOf`).
+   * Wrappers of a store pass it through.
+   */
+  readonly objectFormat?: ObjectFormat;
   /**
    * Store an object in one pass over `content`: frame, hash, deflate and stage
    * together. Memory stays bounded where the store writes as it receives (see
@@ -295,6 +302,8 @@ export interface ObjectQuarantine {
 
 /** Options of `createGitObjects`. */
 export interface GitObjectsOptions {
+  /** The object format ids are computed and checked in (default SHA-1) */
+  objectFormat?: ObjectFormat;
   /**
    * `putUnsized` keeps content up to this many bytes in memory and spools longer
    * content to the store's temporary storage. Default `DEFAULT_SPOOL_THRESHOLD`.
@@ -315,7 +324,7 @@ export class ObjectIdMismatchError extends CorruptObjectError {
   override name = "ObjectIdMismatchError";
 }
 
-/** A string that is not an object id (40 lowercase hex) where one is required. */
+/** A string that is not an object id (40 or 64 lowercase hex) where one is required. */
 export class InvalidObjectIdError extends Error {
   override name = "InvalidObjectIdError";
 }
@@ -329,8 +338,9 @@ const HEX_VALUE: Int8Array = (() => {
 })();
 
 /**
- * The 20 bytes of a SHA-1 object id, for the binary formats that store ids raw
- * (tree entries, index entries, pack indexes).
+ * The raw bytes of an object id (20 for SHA-1, 32 for SHA-256), for the binary formats that
+ * store ids raw (tree entries, index entries, pack indexes). With `rawLength`, only an id of
+ * that format is accepted.
  *
  * @example
  * ```typescript
@@ -338,18 +348,43 @@ const HEX_VALUE: Int8Array = (() => {
  * objectIdToBytes("ce01362"); // throws InvalidObjectIdError
  * ```
  *
- * @throws InvalidObjectIdError unless `id` is exactly 40 lowercase hex characters
+ * @throws InvalidObjectIdError unless `id` is exactly 40 or 64 (`rawLength * 2`) lowercase
+ *   hex characters
  */
-export function objectIdToBytes(id: string): Uint8Array {
-  if (typeof id !== "string" || id.length !== 40) {
+export function objectIdToBytes(id: string, rawLength?: number): Uint8Array {
+  if (
+    typeof id !== "string" ||
+    (rawLength === undefined ? id.length !== 40 && id.length !== 64 : id.length !== rawLength * 2)
+  ) {
     throw new InvalidObjectIdError(`not an object id: ${JSON.stringify(id)}`);
   }
-  const bytes = new Uint8Array(20);
-  for (let i = 0; i < 20; i++) {
+  const n = id.length >> 1;
+  const bytes = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
     const hi = HEX_VALUE[id.charCodeAt(i * 2)] ?? -1;
     const lo = HEX_VALUE[id.charCodeAt(i * 2 + 1)] ?? -1;
     if (hi < 0 || lo < 0) throw new InvalidObjectIdError(`not an object id: ${JSON.stringify(id)}`);
     bytes[i] = (hi << 4) | lo;
   }
   return bytes;
+}
+
+/**
+ * The object format of a store (or of anything carrying one, a `History`): its
+ * `objectFormat` (or its `objects`'), SHA-1 when it has none.
+ *
+ * @example
+ * ```typescript
+ * objectFormatOf(history.objects).hexLength; // 40, or 64 in a sha256 repository
+ * ```
+ */
+export function objectFormatOf(
+  holder:
+    | {
+        readonly objectFormat?: ObjectFormat;
+        readonly objects?: { readonly objectFormat?: ObjectFormat };
+      }
+    | undefined,
+): ObjectFormat {
+  return holder?.objectFormat ?? holder?.objects?.objectFormat ?? SHA1_OBJECT_FORMAT;
 }

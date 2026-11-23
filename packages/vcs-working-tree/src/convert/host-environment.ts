@@ -93,6 +93,12 @@ export interface GitHostEnvironment {
    */
   breakingChanges?: boolean;
   /**
+   * `$GIT_DEFAULT_HASH` as given: the object format of a repository `init` creates without
+   * `--object-format` (`sha1`, `sha256`; before `init.defaultObjectFormat`). Another name makes
+   * init die with "unknown hash algorithm".
+   */
+  defaultHash?: string;
+  /**
    * `$GIT_INDEX_VERSION` as given: the version a new index is written in, before
    * `index.version` and `feature.manyFiles` (read-cache.c `get_index_format_default`; a
    * value that is not 2, 3 or 4 falls back to 3 with a warning)

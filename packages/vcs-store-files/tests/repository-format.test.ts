@@ -3,7 +3,9 @@
  * which `core.repositoryformatversion` and `extensions.*` combinations open, and which are
  * refused, by createGitFilesBackend, gc(), repack() and FileGcStrategy.
  */
+
 import { createInMemoryFilesApi, GcOrchestrator } from "@statewalker/vcs-core";
+import { SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -67,7 +69,6 @@ describe("repository format check", () => {
       v(0, "\trefStorage = files\n"),
       /repo version is 0, but v1-only extension found:\n\trefstorage/,
     ],
-    ["sha256 objects", v(1, "\tobjectFormat = sha256\n"), /extensions\.objectFormat = sha256/],
     [
       "a compatibility object format",
       v(1, "\tobjectFormat = sha1\n\tcompatObjectFormat = sha256\n"),
@@ -90,8 +91,20 @@ describe("repository format check", () => {
     await expect(createGitFilesBackend({ files })).rejects.toThrow(message);
   });
 
+  it("reads sha256 objects (extensions.objectFormat), refusing their packs", async () => {
+    const files = await repoWithConfig(v(1, "\tobjectFormat = sha256\n"));
+    expect((await readRepositoryFormat(files, ".git")).objectFormat.name).toBe("sha256");
+    const { history } = await createGitFilesBackend({ files });
+    const id = await history.blobs.store([new TextEncoder().encode("hello\n")]);
+    expect(id).toBe("2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4");
+    await files.write(".git/objects/pack/pack-1.idx", [new Uint8Array(8)]);
+    await expect(createGitFilesBackend({ files })).rejects.toThrow(
+      "webrun-vcs does not support pack files in sha256 repositories yet",
+    );
+  });
+
   it("refuses before writing anything, even with create", async () => {
-    const config = v(1, "\tobjectFormat = sha256\n");
+    const config = v(1, "\tobjectFormat = sha1\n\tcompatObjectFormat = sha256\n");
     const files = await repoWithConfig(config);
     await expect(createGitFilesBackend({ files, create: true })).rejects.toBeInstanceOf(
       UnsupportedRepositoryFormatError,
@@ -113,6 +126,7 @@ describe("repository format check", () => {
           worktreeConfig: false,
           relativeWorktrees: false,
           refStorage: "reftable",
+          objectFormat: SHA1_OBJECT_FORMAT,
         },
         "prune",
       ),
@@ -140,6 +154,7 @@ describe("repository format check", () => {
       worktreeConfig: false,
       relativeWorktrees: false,
       refStorage: "files",
+      objectFormat: SHA1_OBJECT_FORMAT,
     });
   });
 

@@ -31,7 +31,7 @@ import { findPackedRef, readPackedRefs } from "./packed-refs-reader.js";
 /** Maximum depth for resolving symbolic refs */
 const MAX_SYMBOLIC_REF_DEPTH = 5;
 
-const OID = /^[0-9a-f]{40}$/;
+const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** How refs are listed. */
 export interface ReadRefsOptions {
@@ -140,7 +140,9 @@ export function parseRefContent(refName: string, content: Uint8Array): Ref | Sym
     throw new Error(`Invalid ref content in ${refName}: too short`);
   }
 
-  return createRef(refName, objectId.substring(0, 40) as ObjectId, RefStorage.LOOSE);
+  // a SHA-256 id (64 hex digits), else a SHA-1 one (40) and whatever follows it
+  const length = /^[0-9a-f]{64}(?:\s|$)/.test(objectId) ? 64 : OBJECT_ID_STRING_LENGTH;
+  return createRef(refName, objectId.substring(0, length) as ObjectId, RefStorage.LOOSE);
 }
 
 /**

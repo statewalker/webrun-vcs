@@ -23,10 +23,11 @@
  */
 
 import type { ObjectId } from "../../common/id/index.js";
-import type { GitObjects, ListPrefixOptions } from "./git-objects.js";
+import { type GitObjects, type ListPrefixOptions, objectFormatOf } from "./git-objects.js";
 
 /** git's `FALLBACK_DEFAULT_ABBREV` */
 export const DEFAULT_ABBREV_LENGTH = 7;
+/** SHA-1's hex length, the default where no store gives a format */
 const HEX_LENGTH = 40;
 
 /** `msb(count) + 1` halved and rounded up, at least 7: the "auto" length for `count` objects */
@@ -39,17 +40,21 @@ export function autoAbbrevLength(count: number): number {
 
 /**
  * `core.abbrev` as git reads it: unset and "auto" give -1 (the automatic length), a false
- * boolean ("false", "no", "off") the full length, a number from 4 up that number; anything
- * else (git refuses it) undefined.
+ * boolean ("false", "no", "off") the full length (`hexLength`: 40, or 64 in a SHA-256
+ * repository), a number from 4 up that number (at most the full length); anything else (git
+ * refuses it) undefined.
  */
-export function parseCoreAbbrev(value: string | undefined): number | undefined {
+export function parseCoreAbbrev(
+  value: string | undefined,
+  hexLength: number = HEX_LENGTH,
+): number | undefined {
   if (value === undefined) return -1;
   const v = value.trim().toLowerCase();
   if (v === "auto") return -1;
-  if (v === "false" || v === "no" || v === "off" || v === "") return HEX_LENGTH;
+  if (v === "false" || v === "no" || v === "off" || v === "") return hexLength;
   if (!/^-?\d+$/.test(v)) return undefined;
   const n = Number(v);
-  return n >= 4 ? Math.min(n, HEX_LENGTH) : undefined;
+  return n >= 4 ? Math.min(n, hexLength) : undefined;
 }
 
 /** git's `MINIMUM_ABBREV`: an abbreviated id has at least 4 hex digits. */
@@ -78,15 +83,16 @@ export async function* listObjectsWithPrefix(
   }
 }
 
-function commonHexPrefix(a: string, b: string): number {
+function commonHexPrefix(a: string, b: string, hexLength: number): number {
   let i = 0;
-  while (i < HEX_LENGTH && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+  while (i < hexLength && a.charCodeAt(i) === b.charCodeAt(i)) i++;
   return i;
 }
 
 /**
  * The abbreviated length of each id (`repo_find_unique_abbrev`), from `minLength` (-1, the
- * default, for git's automatic length; 0 or 40 and more for full ids). `options.cache` is
+ * default, for git's automatic length; 0 or the full length (40, 64 in a SHA-256 repository)
+ * and more for full ids). `options.cache` is
  * handed to the store's prefix lookups (see `GitObjects.listPrefix`).
  */
 export async function findAbbrevLengths(
@@ -97,6 +103,7 @@ export async function findAbbrevLengths(
 ): Promise<Map<ObjectId, number>> {
   const wanted = [...new Set(ids)];
   const out = new Map<ObjectId, number>();
+  const HEX_LENGTH = objectFormatOf(objects).hexLength;
   if (wanted.length === 0) return out;
   let start = minLength;
   if (start < 0) {
@@ -125,7 +132,7 @@ export async function findAbbrevLengths(
       let len = start;
       for (const other of near) {
         if (other === id) continue;
-        const common = commonHexPrefix(id, other);
+        const common = commonHexPrefix(id, other, HEX_LENGTH);
         if (common !== HEX_LENGTH && common >= len) len = common + 1;
       }
       out.set(id, Math.min(len, HEX_LENGTH));
@@ -147,7 +154,7 @@ export async function findAbbrevLengths(
     let len = start;
     const extend = (other: string | undefined) => {
       if (other === undefined || other === id) return;
-      const common = commonHexPrefix(id, other);
+      const common = commonHexPrefix(id, other, HEX_LENGTH);
       if (common !== HEX_LENGTH && common >= len) len = common + 1;
     };
     extend(all[lo - 1]);

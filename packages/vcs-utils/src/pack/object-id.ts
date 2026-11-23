@@ -7,7 +7,7 @@
  * Content-Length), because the header that starts the hash carries it.
  */
 import { createSha1, type Hasher } from "../hash/hasher/index.js";
-import { sha1 } from "../hash/sha1/index.js";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "../hash/object-format/index.js";
 import { bytesToHex } from "../hash/utils/index.js";
 
 /** Thrown when a stream's length differs from the size declared for it. */
@@ -41,7 +41,8 @@ const encoder = new TextEncoder();
 const NATIVE_THRESHOLD = 64 * 1024;
 
 /**
- * Compute a git object id from content in memory.
+ * Compute a git object id from content in memory, with the SHA-1 of git's default object
+ * format unless `format` names another (`SHA256_OBJECT_FORMAT`).
  *
  * @example
  * ```typescript
@@ -49,15 +50,19 @@ const NATIVE_THRESHOLD = 64 * 1024;
  * // "ce013625030ba8dba906f756967f9e9ca394464a"
  * ```
  */
-export async function computeObjectId(typeStr: string, content: Uint8Array): Promise<string> {
+export async function computeObjectId(
+  typeStr: string,
+  content: Uint8Array,
+  format: ObjectFormat = SHA1_OBJECT_FORMAT,
+): Promise<string> {
   const header = encoder.encode(`${typeStr} ${content.length}\0`);
   if (content.length >= NATIVE_THRESHOLD && hasWebCrypto()) {
     const full = new Uint8Array(header.length + content.length);
     full.set(header, 0);
     full.set(content, header.length);
-    return bytesToHex(await sha1(full));
+    return bytesToHex(await format.digest(full));
   }
-  return bytesToHex(createSha1().update(header).update(content).digest());
+  return bytesToHex(format.createHasher().update(header).update(content).digest());
 }
 
 function hasWebCrypto(): boolean {

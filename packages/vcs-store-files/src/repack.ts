@@ -26,6 +26,7 @@ import {
   clearMultiPackIndexNaming,
   createGitObjects,
   joinPath,
+  objectFormatOf,
   objectsWithoutLazyFetch,
   type PackFile,
   parseObjectFilter,
@@ -34,8 +35,8 @@ import {
   writePackBitmap,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
+import { assertSha1ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
-
 import { assertAlternatesReadable } from "./alternates/index.js";
 import { writeCruftPacks } from "./cruft-pack.js";
 import { type MultiPackIndexWriteOptions, multiPackIndexWrite } from "./multi-pack-index.js";
@@ -402,6 +403,8 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
   // delete packs in a precious-objects repo")
   // git's errors reading the alternates are printed and repack goes on (see gc)
   let alternatesErrors: readonly string[] = options.objects.alternates?.errors ?? [];
+  // a SHA-256 repository's packs are not written yet
+  assertSha1ObjectFormat(objectFormatOf(options.objects), "repack");
   if (!options.dryRun) {
     assertObjectsDeletable(await readRepositoryFormat(options.files, options.gitDir), "repack", {
       partialClone: "allow",

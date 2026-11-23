@@ -25,8 +25,8 @@ export async function peelTag(objects: GitObjects, id: ObjectId): Promise<Object
         offset += chunk.length;
       }
     }
-    const head = new TextDecoder().decode(bytes.subarray(0, 64));
-    const m = /^object ([0-9a-f]{40})\ntype ([a-z]+)\n/.exec(head);
+    const head = new TextDecoder().decode(bytes.subarray(0, 96));
+    const m = /^object ([0-9a-f]{40}|[0-9a-f]{64})\ntype ([a-z]+)\n/.exec(head);
     if (!m) return undefined;
     current = m[1] as ObjectId;
     // git's deref_tag_noverify stops at the first object the tag names as no tag, without

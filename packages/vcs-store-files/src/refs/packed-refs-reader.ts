@@ -59,7 +59,7 @@ export async function readPackedRefs(
     if ((await files.stats(packedRefsPath))?.kind !== "file") return { refs: [], peeled: false };
     const parsed = parsePackedRefs(new TextDecoder().decode(await readFile(files, packedRefsPath)));
     for (const r of parsed.refs) {
-      if (!/^[0-9a-f]{40}$/.test(r.objectId ?? "") || !r.name) {
+      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(r.objectId ?? "") || !r.name) {
         throw new Error(`Invalid packed ref ${r.name || "(no name)"} in ${PACKED_REFS}`);
       }
     }
@@ -137,8 +137,8 @@ export function parsePackedRefs(content: string): PackedRefs {
     const objectId = line.substring(0, spaceIdx).toLowerCase() as ObjectId;
     const name = line.substring(spaceIdx + 1);
 
-    // Validate object ID length (should be 40 hex chars)
-    if (objectId.length !== OBJECT_ID_STRING_LENGTH) {
+    // Validate object ID length (40 hex chars, 64 in a SHA-256 repository)
+    if (objectId.length !== OBJECT_ID_STRING_LENGTH && objectId.length !== 64) {
       throw new Error(
         `Invalid object ID in packed-refs: "${objectId}" (length ${objectId.length}, expected ${OBJECT_ID_STRING_LENGTH})`,
       );

@@ -14,7 +14,7 @@ import {
   type RefLogOptions,
   type TreeEntry,
 } from "@statewalker/vcs-core";
-import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
+import { bytesToHex, createSha1, objectFormatByHexLength } from "@statewalker/vcs-utils";
 import { compareGitPaths, decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
@@ -195,6 +195,9 @@ interface IndexDir {
 /** The index's stage-0 entries as directories, each with the id its tree would have. */
 async function indexDirs(index: Map<string, CheckedEntry>): Promise<IndexDir> {
   const root: IndexDir = { files: new Map(), dirs: new Map() };
+  const first = index.values().next().value as CheckedEntry | undefined;
+  const newHasher =
+    objectFormatByHexLength(first?.objectId.length ?? 40)?.createHasher ?? createSha1;
   for (const [path, entry] of index) {
     let dir = root;
     let from = 0;
@@ -218,7 +221,8 @@ async function indexDirs(index: Map<string, CheckedEntry>): Promise<IndexDir> {
     let id: ObjectId;
     try {
       const bytes = await collectTreeBytes(entries);
-      const hasher = createSha1().update(new TextEncoder().encode(`tree ${bytes.length}\0`));
+      // the index's own format: its ids are SHA-256 ones in a SHA-256 repository
+      const hasher = newHasher().update(new TextEncoder().encode(`tree ${bytes.length}\0`));
       id = bytesToHex(hasher.update(bytes).digest());
     } catch {
       // a name no tree can hold: never the id of a stored tree

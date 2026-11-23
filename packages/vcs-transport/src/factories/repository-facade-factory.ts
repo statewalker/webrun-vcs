@@ -17,6 +17,7 @@ import {
   type History,
   type HistoryWithOperations,
   type ObjectQuarantine,
+  objectFormatOf,
   parseObjectFilter,
   type Ref,
   resolveObjectFilter,
@@ -24,6 +25,7 @@ import {
   type SymbolicRef,
   TreeDepthError,
 } from "@statewalker/vcs-core";
+import { assertSha1ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type {
   CommitGraphInfo,
   ExportPackOptions,
@@ -94,6 +96,9 @@ export interface HistoryFacadeConfig {
  * ```
  */
 export function createRepositoryFacade(config: HistoryFacadeConfig): RepositoryFacade {
+  // the protocols' object-format capability and SHA-256 packs are not implemented yet: a
+  // SHA-256 repository is neither served nor fetched into
+  assertSha1ObjectFormat(objectFormatOf(config.history), "fetch, push and serving");
   const facade = createRepositoryFacadeFromHistory(
     config.history,
     config.useBitmaps,

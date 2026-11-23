@@ -313,6 +313,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
         logAllRefUpdates,
         reflogIdentity: identity,
         logHeadUpdates: false,
+        ...(objects?.objectFormat ? { objectFormat: objects.objectFormat } : {}),
         ...(objects
           ? {
               peel: (id: ObjectId) => peelTag(objects, id),
@@ -322,6 +323,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       });
       refs = createWorktreeRefs({
         common,
+        ...(objects?.objectFormat ? { objectFormat: objects.objectFormat } : {}),
         files: this.files,
         gitDir,
         logAllRefUpdates,

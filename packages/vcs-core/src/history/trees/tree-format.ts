@@ -23,6 +23,7 @@ import type { TreeEntry } from "./tree-entry.js";
 
 const SPACE = 0x20;
 const NULL = 0x00;
+/** Raw id bytes of SHA-1 trees (git's default object format); SHA-256 trees hold 32 */
 const OBJECT_ID_LENGTH = GitFormat.OBJECT_ID_LENGTH; // 20 bytes
 
 /**
@@ -142,10 +143,13 @@ function validateEntryName(name: string): void {
  * in canonical Git order before encoding.
  *
  * @param entries Tree entries (any order)
+ * @param idLength The raw id length of the repository's object format (20 for SHA-1, 32 for
+ *   SHA-256): an entry id of another format is refused. Default: each id's own length.
  * @yields Byte chunks of serialized tree
  */
 export async function* encodeTreeEntries(
   entries: AsyncIterable<TreeEntry> | Iterable<TreeEntry>,
+  idLength?: number,
 ): AsyncGenerator<Uint8Array> {
   // Collect and sort entries (each name encoded once)
   const collected: { entry: TreeEntry; name: Uint8Array; tree: boolean }[] = [];
@@ -159,9 +163,9 @@ export async function* encodeTreeEntries(
   let size = 0;
   for (const { entry, name } of collected) {
     const mode = encodeMode(entry.mode);
-    const id = objectIdToBytes(entry.id);
+    const id = objectIdToBytes(entry.id, idLength);
     parts.push({ mode, name, id });
-    size += mode.length + 1 + name.length + 1 + OBJECT_ID_LENGTH;
+    size += mode.length + 1 + name.length + 1 + id.length;
   }
   // Build entries: mode SP name NUL sha1
   const out = new Uint8Array(size);
@@ -174,7 +178,7 @@ export async function* encodeTreeEntries(
     offset += name.length;
     out[offset++] = NULL;
     out.set(id, offset);
-    offset += OBJECT_ID_LENGTH;
+    offset += id.length;
   }
   if (size > 0) yield out;
 }
@@ -193,7 +197,8 @@ export async function computeTreeSize(
   for await (const entry of entries) {
     const mode = encodeMode(entry.mode);
     const name = encodeGitPath(entry.name);
-    size += mode.length + 1 + name.length + 1 + OBJECT_ID_LENGTH;
+    // a hex id of either format: 40 (SHA-1, 20 raw bytes) or 64 (SHA-256, 32)
+    size += mode.length + 1 + name.length + 1 + (entry.id.length >> 1 || OBJECT_ID_LENGTH);
   }
 
   return size;
@@ -203,10 +208,12 @@ export async function computeTreeSize(
  * Decode tree entries from byte stream
  *
  * @param input Async byte stream (without header)
+ * @param idLength Raw id bytes per entry: 20 (SHA-1, the default) or 32 (SHA-256)
  * @yields Tree entries in stored order
  */
 export async function* decodeTreeEntries(
   input: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
+  idLength: number = OBJECT_ID_LENGTH,
 ): AsyncGenerator<TreeEntry> {
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -224,7 +231,7 @@ export async function* decodeTreeEntries(
       at += chunk.length;
     }
   }
-  yield* decodeTreeBytes(buffer);
+  yield* decodeTreeBytes(buffer, { idLength });
 }
 
 /**
@@ -242,14 +249,16 @@ export async function* decodeTreeEntries(
  * ```
  *
  * @param buffer Serialized tree content
- * @param options `canonicalModes`: modes as git's walks see them
+ * @param options `canonicalModes`: modes as git's walks see them; `idLength`: raw id bytes
+ *   per entry, 20 (SHA-1, the default) or 32 (a SHA-256 repository's trees)
  * @returns Tree entries in stored order
  */
 export function decodeTreeBytes(
   buffer: Uint8Array,
-  options?: { canonicalModes?: boolean },
+  options?: { canonicalModes?: boolean; idLength?: number },
 ): TreeEntry[] {
   const canonical = options?.canonicalModes === true;
+  const OBJECT_ID_LENGTH = options?.idLength ?? GitFormat.OBJECT_ID_LENGTH;
   let rewritten = false;
   const out: TreeEntry[] = [];
   let offset = 0;
@@ -340,7 +349,14 @@ export class TreeEntryCursor {
   private nameEnd = 0;
   private end = 0;
 
-  constructor(readonly bytes: Uint8Array) {
+  /**
+   * @param bytes The tree's content
+   * @param idLength Raw id bytes per entry: 20 (SHA-1, the default) or 32 (SHA-256)
+   */
+  constructor(
+    readonly bytes: Uint8Array,
+    readonly idLength: number = OBJECT_ID_LENGTH,
+  ) {
     this.parse(0);
   }
 
@@ -391,7 +407,7 @@ export class TreeEntryCursor {
     const b = other.bytes;
     const ai = this.nameEnd + 1;
     const bi = other.nameEnd + 1;
-    for (let k = 0; k < OBJECT_ID_LENGTH; k++) if (a[ai + k] !== b[bi + k]) return false;
+    for (let k = 0, n = this.idLength; k < n; k++) if (a[ai + k] !== b[bi + k]) return false;
     return true;
   }
 
@@ -403,13 +419,13 @@ export class TreeEntryCursor {
     }
     const spacePos = buffer.indexOf(SPACE, offset);
     const nullPos = spacePos < 0 ? -1 : buffer.indexOf(NULL, spacePos + 1);
-    if (nullPos < 0 || nullPos + 1 + OBJECT_ID_LENGTH > buffer.length) {
+    if (nullPos < 0 || nullPos + 1 + this.idLength > buffer.length) {
       throw new Error("Invalid tree format: truncated entry");
     }
     this.mode = canonTreeMode(parseModeAt(buffer, offset, spacePos));
     this.nameStart = spacePos + 1;
     this.nameEnd = nullPos;
-    this.end = nullPos + 1 + OBJECT_ID_LENGTH;
+    this.end = nullPos + 1 + this.idLength;
   }
 }
 
@@ -421,8 +437,9 @@ export class TreeEntryCursor {
  */
 export async function collectTreeBytes(
   entries: AsyncIterable<TreeEntry> | Iterable<TreeEntry>,
+  idLength?: number,
 ): Promise<Uint8Array> {
-  return collect(encodeTreeEntries(entries));
+  return collect(encodeTreeEntries(entries, idLength));
 }
 
 /**
@@ -431,8 +448,11 @@ export async function collectTreeBytes(
  * @param data Serialized tree content (without header)
  * @returns Array of tree entries
  */
-export async function parseTreeFromBytes(data: Uint8Array): Promise<TreeEntry[]> {
-  return toArray(decodeTreeEntries([data]));
+export async function parseTreeFromBytes(
+  data: Uint8Array,
+  idLength: number = OBJECT_ID_LENGTH,
+): Promise<TreeEntry[]> {
+  return toArray(decodeTreeEntries([data], idLength));
 }
 
 /**
@@ -465,7 +485,7 @@ export function serializeTree(entries: TreeEntry[]): Uint8Array {
     const id = objectIdToBytes(entry.id);
 
     encodedEntries.push({ mode, name, id });
-    totalSize += mode.length + 1 + name.length + 1 + OBJECT_ID_LENGTH;
+    totalSize += mode.length + 1 + name.length + 1 + id.length;
   }
 
   // Build result
@@ -486,7 +506,7 @@ export function serializeTree(entries: TreeEntry[]): Uint8Array {
     offset += 1;
 
     result.set(id, offset);
-    offset += OBJECT_ID_LENGTH;
+    offset += id.length;
   }
 
   return result;
@@ -498,7 +518,11 @@ export function serializeTree(entries: TreeEntry[]): Uint8Array {
  * @param data Serialized tree content (without header)
  * @yields Tree entries in order
  */
-export function* parseTree(data: Uint8Array): Generator<TreeEntry> {
+export function* parseTree(
+  data: Uint8Array,
+  idLength: number = OBJECT_ID_LENGTH,
+): Generator<TreeEntry> {
+  const OBJECT_ID_LENGTH = idLength;
   let offset = 0;
 
   while (offset < data.length) {
@@ -546,11 +570,15 @@ export function* parseTree(data: Uint8Array): Generator<TreeEntry> {
  * @param data Serialized tree content (without header)
  * @returns Array of tree entries
  */
-export function parseTreeToArray(data: Uint8Array): TreeEntry[] {
-  return Array.from(parseTree(data));
+export function parseTreeToArray(
+  data: Uint8Array,
+  idLength: number = OBJECT_ID_LENGTH,
+): TreeEntry[] {
+  return Array.from(parseTree(data, idLength));
 }
 
 /**
- * Well-known empty tree SHA-1 hash
+ * Well-known empty tree SHA-1 hash (a SHA-256 repository's is
+ * `SHA256_OBJECT_FORMAT.emptyTreeId`: see `ObjectFormat.emptyTreeId`)
  */
 export const EMPTY_TREE_ID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";

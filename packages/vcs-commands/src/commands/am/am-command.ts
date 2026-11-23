@@ -747,7 +747,7 @@ export class AmCommand extends GitCommand<AmResult> {
       if (p.isNew > 0) continue;
       let oid: string | undefined;
       try {
-        oid = /^[0-9a-f]{4,40}$/.test(p.oldOidPrefix)
+        oid = /^[0-9a-f]{4,64}$/.test(p.oldOidPrefix)
           ? await resolver.resolve(p.oldOidPrefix)
           : undefined;
         if (oid && !(await this.blobs.has(oid))) oid = undefined;

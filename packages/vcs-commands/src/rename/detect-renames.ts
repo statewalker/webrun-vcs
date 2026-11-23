@@ -6,6 +6,7 @@
  */
 
 import { EMPTY_BLOB_ID, type ObjectId } from "@statewalker/vcs-core";
+import { SHA256_OBJECT_FORMAT } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   estimateSimilarity,
@@ -303,7 +304,10 @@ export async function detectRenames(
   const configured = options.renameLimit ?? DEFAULT_RENAME_LIMIT;
   const renameLimit = configured <= 0 ? MAX_RENAME_LIMIT : configured;
   // merges leave empty files out of rename detection (git's rename_empty = 0)
-  const keep = (c: RenameCandidate) => options.renameEmpty !== false || c.id !== EMPTY_BLOB_ID;
+  // the empty blob of either object format
+  const keep = (c: RenameCandidate) =>
+    options.renameEmpty !== false ||
+    (c.id !== EMPTY_BLOB_ID && c.id !== SHA256_OBJECT_FORMAT.emptyBlobId);
   // in path order, or as given (a merge: the order its trees were read in)
   const src = options.keepOrder ? sources.filter(keep) : sources.filter(keep).sort(byPath);
   const dst = options.keepOrder

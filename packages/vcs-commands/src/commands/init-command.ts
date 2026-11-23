@@ -10,10 +10,18 @@ import {
   createGitFilesHistoryFromFiles,
   FileStagingStore,
   probeCaseFolding,
+  readProtectedConfig,
+  readRepositoryFormat,
   resolveLinkedGitDir,
 } from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
-import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils";
+import {
+  decodeGitPath,
+  encodeGitPath,
+  type ObjectFormat,
+  objectFormatByName,
+  SHA1_OBJECT_FORMAT,
+} from "@statewalker/vcs-utils";
 import {
   createMemoryCheckout,
   type GitHostEnvironment,
@@ -79,9 +87,28 @@ export class InitCommand {
   private worktreeEnabled = false;
   private worktreeStore?: Worktree;
   private environment?: GitHostEnvironment;
+  /** `--object-format`; undefined: `$GIT_DEFAULT_HASH`, `init.defaultObjectFormat`, else sha1 */
+  private objectFormatName?: string;
   /** `--ref-format`; undefined: git's default (see {@link defaultRefFormat}) */
   private refFormat?: string;
   private callable = true;
+
+  /**
+   * Set the object format of the new repository (`git init --object-format=<format>`):
+   * `sha1` (git's default) or `sha256`. Without it, `$GIT_DEFAULT_HASH`
+   * (`GitHostEnvironment.defaultHash`), then `init.defaultObjectFormat` from the system or
+   * global configuration (or `git -c`), else SHA-1. A name git does not know fails the call
+   * (`UnknownHashAlgorithmError`), and so does re-initialising an existing repository with
+   * another format (`ReinitializeHashError`); an existing repository keeps its own otherwise.
+   *
+   * @param format `sha1` or `sha256`
+   * @returns this for method chaining
+   */
+  setObjectFormat(format: string): this {
+    this.checkCallable();
+    this.objectFormatName = format;
+    return this;
+  }
 
   /**
    * Set the FilesApi implementation for storage.
@@ -286,6 +313,11 @@ export class InitCommand {
       hints = chosen.hint;
     };
 
+    // an explicit --object-format git does not know dies before anything is written
+    const explicitFormat =
+      this.objectFormatName === undefined ? undefined : knownHashAlgorithm(this.objectFormatName);
+    let objectFormat: ObjectFormat = SHA1_OBJECT_FORMAT;
+
     // Use in-memory FilesApi if none provided
     const files = this.files ?? createInMemoryFilesApi();
 
@@ -307,6 +339,16 @@ export class InitCommand {
       // A repository with a config but no HEAD (damaged or half-made) is opened, not
       // re-created: creating rewrites the config, and its remotes and settings with it.
       const fresh = !hasHead && !(await isFile(`${dir}/config`));
+      if (fresh) {
+        objectFormat = explicitFormat ?? (await this.defaultObjectFormat(warnings));
+      } else {
+        // validate_hash_algorithm: an existing repository keeps its format, and refuses
+        // another one asked for explicitly (git 2.5x ignores $GIT_DEFAULT_HASH there)
+        objectFormat = (await readRepositoryFormat(repoFiles, dir)).objectFormat;
+        if (explicitFormat && explicitFormat.name !== objectFormat.name) {
+          throw new ReinitializeHashError();
+        }
+      }
       if (!hasHead) await chooseBranch();
       else if (this.initialBranch !== undefined) {
         warnings.push(`warning: re-init: ignored --initial-branch=${this.initialBranch}`);
@@ -322,6 +364,7 @@ export class InitCommand {
           gitDir,
           create,
           defaultBranch: initialBranch,
+          ...(create ? { objectFormat } : {}),
           ...(create && refFormat ? { refFormat: refFormat.format } : {}),
           ...(this.environment ? { environment: this.environment } : {}),
         });
@@ -362,13 +405,15 @@ export class InitCommand {
       } else if (this.bare) {
         staging = new MemoryStagingStore();
       } else {
-        const fileStaging = new FileStagingStore(repoFiles, `${dir}/index`);
-        await fileStaging.read();
+        const fileStaging = new FileStagingStore(repoFiles, `${dir}/index`, { objectFormat });
+        // a SHA-256 repository's index is not read yet: its first use refuses
+        if (objectFormat.name === "sha1") await fileStaging.read();
         staging = fileStaging;
       }
     } else {
+      objectFormat = explicitFormat ?? (await this.defaultObjectFormat(warnings));
       await chooseBranch();
-      history = createMemoryHistory();
+      history = createMemoryHistory({ objectFormat });
       await history.initialize();
       // Set initial branch by creating symbolic ref for HEAD
       await history.refs.setSymbolic("HEAD", `refs/heads/${initialBranch}`);
@@ -476,6 +521,26 @@ export class InitCommand {
   }
 
   /**
+   * The format of a new repository without `--object-format` (validate_hash_algorithm):
+   * `$GIT_DEFAULT_HASH` (an unknown name dies), else `init.defaultObjectFormat` (git 2.45+;
+   * an unknown name warns and is ignored), else SHA-1.
+   */
+  private async defaultObjectFormat(warnings: string[]): Promise<ObjectFormat> {
+    const env = this.environment?.defaultHash;
+    if (env !== undefined) return knownHashAlgorithm(env);
+    const config = await readProtectedConfig(this.environment);
+    const configured = config
+      .filter((e) => e.key.toLowerCase() === "init.defaultobjectformat")
+      .at(-1);
+    if (configured?.value !== undefined) {
+      const found = objectFormatByName(configured.value);
+      if (found) return found;
+      warnings.push(`warning: unknown hash algorithm '${configured.value}'`);
+    }
+    return SHA1_OBJECT_FORMAT;
+  }
+
+  /**
    * Resolve the git directory path based on configuration.
    */
   private resolveGitDir(): string {
@@ -515,6 +580,33 @@ export class InitCommand {
   private setCallable(value: boolean): void {
     this.callable = value;
   }
+}
+
+/** `--object-format` or `$GIT_DEFAULT_HASH` names no format git knows: git dies (exit 128). */
+export class UnknownHashAlgorithmError extends Error {
+  override name = "UnknownHashAlgorithmError";
+  readonly lines: string[];
+  constructor(readonly value: string) {
+    const line = `fatal: unknown hash algorithm '${value}'`;
+    super(line);
+    this.lines = [line];
+  }
+}
+
+/** `--object-format` names another format than the existing repository's: git dies (exit 128). */
+export class ReinitializeHashError extends Error {
+  override name = "ReinitializeHashError";
+  readonly lines = ["fatal: attempt to reinitialize repository with different hash"];
+  constructor() {
+    super("fatal: attempt to reinitialize repository with different hash");
+  }
+}
+
+/** The format named `name`, or `UnknownHashAlgorithmError` (git's `hash_algo_by_name`). */
+function knownHashAlgorithm(name: string): ObjectFormat {
+  const found = objectFormatByName(name);
+  if (!found) throw new UnknownHashAlgorithmError(name);
+  return found;
 }
 
 /** Sets `core.bare = true` in a config file written by the git directory layout. */

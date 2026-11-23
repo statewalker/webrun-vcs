@@ -21,6 +21,7 @@
  * @see HistoryWithOperations for advanced operations (GC, delta, serialization)
  */
 
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { BackendCapabilities } from "../backend/storage-backend.js";
 import type { ObjectId } from "../common/id/index.js";
 import type { PackSet } from "../pack/pack-set.js";
@@ -91,6 +92,13 @@ export interface History {
    * Absent for stores that keep parsed objects only (such as the SQL native stores).
    */
   readonly objects?: GitObjects;
+
+  /**
+   * The repository's object format (`extensions.objectFormat`): SHA-1 when absent. Commands
+   * read it through `objectFormatOf(history)` for the null id, the empty tree and blob, id
+   * lengths and abbreviations.
+   */
+  readonly objectFormat?: ObjectFormat;
 
   /**
    * The installed packs, where the backend keeps packs (the files backend). Large received packs
