@@ -184,6 +184,10 @@ export interface GcOptions {
   afterObjects?: () => Promise<void>;
   /** `rerere gc` in git's place (see `beforeObjects`). Default true. */
   rerereGc?: boolean;
+  /**
+   * `git gc --force`: `gc.pid` is taken whoever holds it (`gc.pid.lock` still has to be free).
+   */
+  force?: boolean;
 }
 
 /**
@@ -208,11 +212,18 @@ export interface GcResult {
    */
   removedQuarantines: number;
   /**
-   * True if another gc holds `gc.pid` (git's "gc is already running"): nothing was done. A lock
-   * older than 12 hours is taken over, as git does; without `lastModified` from the FilesApi a
-   * lock's age is unknown and it is never taken over (remove `gc.pid` by hand after a crash).
+   * True if another gc holds `gc.pid` (git's "gc is already running", `lockHolder`) or another
+   * process holds `gc.pid.lock` (`lockFileExists`): nothing was done. As git's
+   * `lock_repo_for_gc`, a `gc.pid` older than 12 hours, one that does not read `<pid> <host>`,
+   * and one of this host whose process is gone (with the environment's `gcProcess`) are taken
+   * over; without `lastModified` from the FilesApi a lock's age is unknown and it is taken
+   * over only on those other grounds. `gc.pid.lock` is never taken over (git dies on it).
    */
   skipped: boolean;
+  /** Who holds `gc.pid` when gc was skipped for it */
+  lockHolder?: GcLockHolder;
+  /** `gc.pid.lock` existed: another process was taking or checking the gc lock */
+  lockFileExists?: boolean;
   /** Whether loose refs were packed */
   refsPacked: boolean;
   /** Reflog entries the reflog step removed (absent when it did not run) */
@@ -261,7 +272,8 @@ export interface StorageCount {
  * Run garbage collection on a file-backed repository.
  *
  * In git gc's order (builtin/gc.c):
- * 1. Takes `gc.pid` with an exclusive create; if another gc holds it, returns `skipped`.
+ * 1. Takes `gc.pid` as git's `lock_repo_for_gc` (under `gc.pid.lock`, see `acquireGcLock`); if
+ *    another gc holds it, returns `skipped`.
  * 2. Packs refs (`git pack-refs --all --prune`: `packRefsStep`, else `history.refs.packRefs`).
  * 3. Expires reflog entries (`git reflog expire --all`, `expireReflogs`), unless `gc.reflogExpire`
  *    and `gc.reflogExpireUnreachable` are both `never`.
@@ -319,9 +331,13 @@ export async function gc(options: GcOptions): Promise<GcResult> {
   // read through the store's view without lazy fetch, not a store-wide switch
   const direct = objectsWithoutLazyFetch((options.objects ?? history.objects) as GitObjects);
   if (dryRun) return collect({ ...options, objects: direct });
-  const lock = await acquireGcLock(files, gitDir);
-  if (!lock) {
+  const lock = await acquireGcLock(files, gitDir, {
+    ...(options.force ? { force: true } : {}),
+    ...(options.environment ? { environment: options.environment } : {}),
+  });
+  if (!("release" in lock)) {
     return {
+      ...(lock.holder ? { lockHolder: lock.holder } : { lockFileExists: true }),
       removedObjects: 0,
       keptRecentObjects: 0,
       reachableObjects: 0,
@@ -508,15 +524,22 @@ async function collect(options: GcOptions): Promise<GcResult> {
   const readGraftFile =
     options.readGraftFile ??
     graftFileReader(options.environment, { files, dir: graftFileBaseDir(gitDir) });
-  const listed = await listReachableObjects({
-    files,
-    gitDir,
-    refs: history.refs,
-    objects,
-    commitGraph: history.commitGraph,
-    ...(readGraftFile ? { readGraftFile } : {}),
-    ...(exclusions ? { excludeObjects: exclusions.excluded, extraRoots: exclusions.roots } : {}),
-  });
+  const walkReachable = () =>
+    listReachableObjects({
+      files,
+      gitDir,
+      refs: history.refs,
+      objects,
+      commitGraph: history.commitGraph,
+      ...(readGraftFile ? { readGraftFile } : {}),
+      ...(exclusions ? { excludeObjects: exclusions.excluded, extraRoots: exclusions.roots } : {}),
+    });
+  // the refs as the walk saw them: git's prune is a process of its own that walks the refs again
+  // after the repack, so a ref moved meanwhile (to an object no write freshened: `branch`,
+  // `update-ref`, `reset` to a reflog entry) protects what it names; ours walks again when they
+  // changed
+  const tipsBefore = await refTips(history.refs);
+  const listed = await walkReachable();
   const reachable = new Set<string>(listed.map((o) => o.id));
   // a promisor object left loose is not pruned (the promisor remote has it, but so may nothing
   // else here)
@@ -606,6 +629,8 @@ async function collect(options: GcOptions): Promise<GcResult> {
       }
     }
     const cutoff = startedAt - pruneExpireMs;
+    if (!dryRun && (await refTips(history.refs)) !== tipsBefore)
+      for (const o of await walkReachable()) kept.add(o.id);
     const expiredLoose: string[] = [];
     const recent: string[] = [];
     for await (const key of looseStorage.keys()) {
@@ -658,6 +683,19 @@ async function collect(options: GcOptions): Promise<GcResult> {
       expiredLoose.push(...candidates);
     }
     for (const key of expiredLoose) {
+      // A write that found this object stored has freshened it since it was stat'ed (git's
+      // odb_freshen_object): it is about to be named, so it stays. The stat right before the
+      // unlink narrows the window to what git's prune leaves (prune_object checks the mtime
+      // and unlinks at once).
+      if (!dryRun && pruneExpireMs > 0) {
+        const path = joinPath(objectsDir, key.slice(0, 2), key.slice(2));
+        const stats = await files.stats(path);
+        if (!stats) continue; // gone already (another prune)
+        if (stats.lastModified === undefined || stats.lastModified >= cutoff) {
+          keptRecentObjects++;
+          continue;
+        }
+      }
       if (dryRun || (await looseStorage.remove(key))) removedObjects++;
     }
     // prune_shallow: the shallow commits the walks did not reach leave `shallow`
@@ -722,6 +760,17 @@ async function collect(options: GcOptions): Promise<GcResult> {
     ...(keepPacks.length ? { keptLargePacks: keepPacks.map((p) => p.replace(/\.pack$/, "")) } : {}),
     ...(shallowPruned !== undefined ? { shallowPruned } : {}),
   });
+}
+
+/** The refs and HEAD, as a string that changes whenever one of them moves. */
+async function refTips(refs: History["refs"]): Promise<string> {
+  const lines: string[] = [];
+  for await (const r of refs.list())
+    lines.push("target" in r ? `${r.name} -> ${r.target}` : `${r.name} ${r.objectId ?? ""}`);
+  const head = await refs.resolve("HEAD").catch(() => undefined);
+  lines.sort();
+  lines.push(`HEAD ${head?.objectId ?? ""}`);
+  return lines.join("\n");
 }
 
 /** A local pack as gc's find_base_packs and too_many_packs see it. */
@@ -978,56 +1027,72 @@ async function sweepOrphanPacks(
   return removed;
 }
 
+/** Who holds `gc.pid`: git's "gc is already running on machine '<host>' pid <pid>". */
+export interface GcLockHolder {
+  machine: string;
+  pid: number;
+}
+
 /**
- * Takes `gc.pid` with an exclusive create (git's gc lock), writing a random token into it.
- * Undefined if another gc holds it. A lock older than 12 hours is left by a gc that crashed and
- * is taken over, as git does: under `gc.pid.takeover` (one takeover at a time), the lock is
- * removed if it is still stale and created again exclusively, then read back to check that it
- * holds our token. Without `lastModified` a lock's age is unknown and it is never taken over.
- * `release` removes the lock only while it still holds our token.
+ * git's `lock_repo_for_gc`: under `gc.pid.lock` (an exclusive create; undefined `lock` when
+ * another process holds it, git's "Unable to create '.../gc.pid.lock': File exists"), reads
+ * `gc.pid`. Unless `force`, a `gc.pid` younger than 12 hours that reads `<pid> <host>` is
+ * held (the `holder`) when the host is another one or its process still runs (without
+ * `gcProcess` in the environment, always); otherwise `<our pid> <our host>` is written into
+ * `gc.pid.lock`, which is renamed over `gc.pid`. A lock whose age is unknown (no
+ * `lastModified`) counts as young. `release` removes `gc.pid` while it still reads as ours
+ * (git unlinks it at exit; ours leaves a lock another gc took over meanwhile).
  */
-async function acquireGcLock(files: FilesApi, gitDir: string) {
+export async function acquireGcLock(
+  files: FilesApi,
+  gitDir: string,
+  options: { force?: boolean; environment?: GitHostEnvironment } = {},
+): Promise<
+  | { release(): Promise<void>; holder?: undefined; lockExists?: undefined }
+  | { holder: GcLockHolder; lockExists?: undefined }
+  | { lockExists: true; holder?: undefined }
+> {
   const atomic = atomicFilesOver(files, gitDir);
   const name = "gc.pid";
-  const guard = "gc.pid.takeover";
-  const token = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) =>
-    b.toString(16).padStart(2, "0"),
-  ).join("");
-  const content = new TextEncoder().encode(`0 webrun-vcs ${token} ${Date.now()}\n`);
-  const isStale = async (path: string) => {
-    const modified = (await files.stats(joinPath(gitDir, path)))?.lastModified;
-    return modified !== undefined && Date.now() - modified > GC_LOCK_STALE_MS;
-  };
-  const holdsToken = async () => {
+  const lockName = "gc.pid.lock";
+  const me = options.environment?.gcProcess;
+  const myHost = me?.hostName || "unknown";
+  const text = `${me?.pid ?? 0} ${myHost}`;
+  const content = new TextEncoder().encode(text);
+  const readLock = async () => {
+    if (!(await atomic.exists(name))) return undefined;
     const dec = new TextDecoder();
-    let text = "";
-    for await (const c of atomic.read(name)) text += dec.decode(c, { stream: true });
-    return (text + dec.decode()).includes(token);
+    let out = "";
+    for await (const c of atomic.read(name)) out += dec.decode(c, { stream: true });
+    return out + dec.decode();
   };
 
-  let taken = await atomic.createExclusive(name, content);
-  if (!taken && (await isStale(name))) {
-    // Two gcs that both found the lock stale would each remove it, the second removing the
-    // lock the first had just taken: the takeover itself is exclusive.
-    if (await isStale(guard)) await atomic.remove(guard); // a takeover that crashed
-    if (await atomic.createExclusive(guard, content)) {
-      try {
-        // Still stale: not a lock a takeover that finished meanwhile has just written
-        if (await isStale(name)) {
-          await atomic.remove(name);
-          taken = await atomic.createExclusive(name, content);
-        }
-      } finally {
-        await atomic.remove(guard);
+  if (!(await atomic.createExclusive(lockName, content))) return { lockExists: true };
+  let committed = false;
+  try {
+    if (!options.force) {
+      const stats = await files.stats(joinPath(gitDir, name));
+      const current = stats?.kind === "file" ? await readLock() : undefined;
+      const modified = stats?.lastModified;
+      // fscanf("%u %255s"): a pid and a host name; anything else is no lock
+      const parsed = current?.match(/^\s*(\d+)\s+(\S{1,255})/);
+      const young = modified === undefined || Date.now() - modified <= GC_LOCK_STALE_MS;
+      if (parsed && young) {
+        const holder = { pid: Number(parsed[1]), machine: parsed[2] as string };
+        // "be gentle to concurrent gc on remote hosts"; on this one, kill(pid, 0)
+        const held = holder.machine !== myHost || !me || me.isRunning(holder.pid);
+        if (held) return { holder };
       }
     }
+    await atomic.replace(lockName, name);
+    committed = true;
+  } finally {
+    if (!committed) await atomic.remove(lockName);
   }
-  if (taken && !(await holdsToken())) taken = false;
-  if (!taken) return undefined;
   return {
     release: async () => {
       // Another gc may have taken the lock over (it found ours stale): leave its lock alone
-      if (await holdsToken()) await atomic.remove(name);
+      if ((await readLock()) === text) await atomic.remove(name);
     },
   };
 }
