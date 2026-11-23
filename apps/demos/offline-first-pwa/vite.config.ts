@@ -28,6 +28,8 @@ export default defineConfig({
         ],
       },
       workbox: {
+        // the whole VCS is one offline bundle (git gc included), past workbox's 2 MiB default
+        maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
         globPatterns: ["**/*.{js,css,html,ico,png,svg}"],
         runtimeCaching: [
           {
