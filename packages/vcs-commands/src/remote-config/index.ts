@@ -5,6 +5,7 @@
  */
 
 export {
+  type ConfigValueWhere,
   defaultFetchRefspec,
   type LegacyRemote,
   listRemoteNames,

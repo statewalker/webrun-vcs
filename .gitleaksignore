@@ -1,0 +1,2 @@
+# ssh-signer.ts's OpenSSH key parser (a regex over the armor), not a key; the source no longer spells the header out
+011bf0eea4a1b5ba4cc1a6dcfc80f7dfd4e57a16:packages/vcs-commands/src/commands/ssh-signer.ts:private-key:12
