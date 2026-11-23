@@ -791,7 +791,6 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
   return out;
 }
 
-
 /**
  * git gc's clean_pack_garbage: in `objects/pack`, a pack whose `.idx` has no `.pack` beside
  * it loses every file of its name (`.idx`, `.rev`, `.bitmap`, `.keep`, `.promisor`,
