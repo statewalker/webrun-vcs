@@ -26,6 +26,7 @@
  */
 
 import type { History, ObjectId, Refs } from "@statewalker/vcs-core";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { Checkout } from "../checkout/index.js";
 import type { WorkingCopy, WorkingCopyConfig } from "../working-copy.js";
 import type { Worktree } from "../worktree/index.js";
@@ -215,6 +216,16 @@ export interface LinkedWorktrees {
    * working tree is made up at the git directory); otherwise the current working copy.
    */
   openAdmin(): Promise<WorktreeAdmin>;
+
+  /**
+   * git clone's `initialize_repository_version` once the remote's hash is known: the
+   * repository, still empty (no objects, no refs but HEAD), is switched to `format`
+   * (`core.repositoryformatversion` and `extensions.objectFormat`) and opened again; the
+   * result replaces this storage's working copy or administration, whose history still
+   * names objects with the old hash. Optional: a storage without it clones only a remote of
+   * its own format.
+   */
+  reopenWithObjectFormat?(format: ObjectFormat): Promise<WorktreeAdmin>;
 
   /**
    * Point `entry`'s HEAD at the branch `target` (`ref: <target>`) through that worktree's

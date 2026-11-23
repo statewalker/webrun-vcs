@@ -1,4 +1,5 @@
 import type { ObjectId } from "@statewalker/vcs-core";
+import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import type { FetchResult } from "./fetch-result.js";
 
@@ -40,4 +41,12 @@ export interface CloneResult {
    * alternate for '<path>': <reason>" lines, each with its newline
    */
   messages?: string[];
+
+  /**
+   * The repository's working copy when the clone switched it to the remote's object format
+   * (git's clone takes the hash the remote names: a SHA-256 remote makes a SHA-256
+   * repository): the working copy the command was made for still names objects with the old
+   * hash and must not be used any more. `Git.clone()` takes this one as its own.
+   */
+  workingCopy?: WorkingCopy;
 }

@@ -25,14 +25,15 @@ import {
   formatFetchHead,
   matchDestination,
   matchSource,
+  ObjectFormatMismatchError,
   parseRefSpec,
   type RefSpec,
   type TagMode,
   type FetchOptions as TransportFetchOptions,
   transportSummaryWidth,
-  ZERO_OID,
 } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
+import { nullObjectIdLike } from "@statewalker/vcs-utils/hash";
 import type { WorktreeAdmin } from "@statewalker/vcs-working-tree";
 import {
   FetchIntoCheckedOutBranchError,
@@ -845,6 +846,10 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       if (message.startsWith("couldn't find remote ref ")) {
         throw new TransportError(`fatal: ${message}`, undefined, { cause: error });
       }
+      // fetch-pack dies: the remote names objects with another hash
+      if (error instanceof ObjectFormatMismatchError) {
+        throw new TransportError(`fatal: ${message}`, undefined, { cause: error });
+      }
       if (error instanceof FetchCheckError) {
         // fetch-pack ran: its start-up warnings came first
         const lines = [...fsckWarnings, ...error.lines];
@@ -991,6 +996,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const lines: string[] = [];
     const pruned = tracking.filter((u) => u.status === RefUpdateStatus.DELETED);
     if (pruned.length > 0) {
+      const ZERO_OID = this.objectFormat.nullId;
       const ids = pruned.flatMap((u) => [ZERO_OID, u.oldObjectId ?? ZERO_OID]);
       const width = transportSummaryWidth(ids, await this.idAbbreviator().lengths(ids));
       const prunedEntries = pruned.map((u) => ({
@@ -1035,7 +1041,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
             summary: fetchHeadKind(f.remoteRef),
             remote: f.remoteRef,
             local: "FETCH_HEAD",
-            oldOid: ZERO_OID,
+            oldOid: this.objectFormat.nullId,
             newOid: f.oid,
           });
         }
@@ -1482,5 +1488,7 @@ function refusedUpdate(result: FetchClientResult): boolean {
  * the old and new ids in full (zeros for none), the local ref's full name.
  */
 function porcelainLine(entry: FetchDisplayEntry): string {
-  return `${entry.code} ${entry.oldOid ?? ZERO_OID} ${entry.newOid ?? ZERO_OID} ${entry.local}`;
+  // zeros of the width of the entry's other id (the repository's format)
+  const zero = nullObjectIdLike(entry.oldOid ?? entry.newOid);
+  return `${entry.code} ${entry.oldOid ?? zero} ${entry.newOid ?? zero} ${entry.local}`;
 }
