@@ -66,6 +66,14 @@ export interface PushClientOptions {
   trackingValue?: (remoteRef: string) => Promise<string | undefined>;
   /** All refs or none (`--atomic`); the server must advertise `atomic` */
   atomic?: boolean;
+  /**
+   * `--signed` / `push.gpgSign` (git's SEND_PACK_PUSH_CERT_*): `"always"` needs a server that
+   * advertises `push-cert`, `"if-asked"` signs only for one that does (else warns and pushes
+   * unsigned); undefined signs nothing. Push certificates cannot be signed here yet (no
+   * signer): a push that must sign one fails ({@link PushCertificateError}) before any
+   * command is sent, as git fails when gpg cannot sign.
+   */
+  signed?: "always" | "if-asked";
   /** Push options for the server's hooks (`-o`); the server must advertise `push-options` */
   pushOptions?: string[];
   /** Delete remote refs a pattern's destination covers whose local source is gone (`--prune`) */
@@ -95,6 +103,22 @@ export interface PushClientOptions {
   prePush?: (updates: readonly PushRefUpdate[]) => Promise<boolean>;
 }
 
+/**
+ * A push certificate that cannot be sent (send_pack): the server does not take one
+ * (`unsupported`: `the receiving end does not support --signed push`) or it could not be
+ * signed (`signing`: `failed to sign the push certificate`, after gpg's error). Nothing was
+ * sent.
+ */
+export class PushCertificateError extends TransportError {
+  constructor(
+    message: string,
+    readonly reason: "unsupported" | "signing",
+  ) {
+    super(message);
+    this.name = "PushCertificateError";
+  }
+}
+
 /** A push the pre-push hook refused (git: "failed to push some refs"): nothing was sent. */
 export class PushRefusedByHookError extends TransportError {
   constructor(readonly updates: readonly PushRefUpdate[]) {
@@ -113,8 +137,18 @@ export interface PushClientResult {
   ok: boolean;
   /** The server's `unpack` line (absent when no request was sent, or without report-status) */
   unpack?: { ok: boolean; message?: string };
+  /**
+   * Pushed over a stateless connection (smart HTTP): git's send-pack runs there as remote-curl's
+   * helper, whose refused unpack does not fail `transport_push` (porcelain `Done` still printed)
+   */
+  stateless?: boolean;
   /** The capabilities asked for on the first command */
   capabilities: string[];
+  /**
+   * send_pack's warnings (`warning: not sending a push certificate since the receiving end
+   * does not support --signed push`), in order
+   */
+  warnings?: string[];
   /** Objects in the pack as sent (its header); 0 without a pack */
   packObjects: number;
   /** Bytes of the pack */
@@ -289,6 +323,23 @@ async function sendPack(
     );
   }
 
+  // send_pack: a push certificate for a server that takes one (its nonce advertised as
+  // `push-cert=<nonce>`), else a refusal (always) or a warning (if-asked)
+  const warnings: string[] = [];
+  const pushCert = options.signed !== undefined && caps.has("push-cert");
+  if (options.signed && !pushCert) {
+    if (options.signed === "always") {
+      throw new PushCertificateError(
+        "the receiving end does not support --signed push",
+        "unsupported",
+      );
+    } else {
+      warnings.push(
+        "warning: not sending a push certificate since the receiving end does not support --signed push",
+      );
+    }
+  }
+
   // what the server allows (send_pack)
   if (!caps.has("delete-refs")) {
     for (const u of updates) {
@@ -299,6 +350,11 @@ async function sendPack(
   if (options.atomic && updates.some((u) => !isPushSuccess(u.status))) {
     for (const u of toSend) setStatus(u, "atomic-push-failed");
     toSend.length = 0;
+  }
+  // generate_push_cert signs only when a command is sent (update_seen), never in a dry run:
+  // nothing signs one here yet, so such a push is refused as git refuses when gpg cannot sign
+  if (pushCert && toSend.length > 0 && !options.dryRun) {
+    throw new PushCertificateError("failed to sign the push certificate", "signing");
   }
 
   const requested: string[] = [];
@@ -319,6 +375,7 @@ async function sendPack(
     updates,
     ok: false,
     capabilities: requested,
+    ...(warnings.length > 0 ? { warnings } : {}),
     packObjects: 0,
     packBytes: 0,
     bytesSent: 0,
@@ -413,10 +470,15 @@ async function sendPack(
     const unpackStatus = first.slice(7);
     result.unpack = unpackStatus === "ok" ? { ok: true } : { ok: false, message: unpackStatus };
   }
+  if (connection.stateless) result.stateless = true;
   const reported = new Set<PushRefUpdate>();
   const byRef = new Map(toSend.map((u) => [u.remoteRef, u]));
   const unsent = new Set(updates.filter((u) => !toSend.includes(u)).map((u) => u.remoteRef));
   const reportErrors: string[] = [];
+  // receive_status's error() for the unpack line
+  if (!result.unpack.ok && first?.startsWith("unpack ")) {
+    reportErrors.push(`error: remote unpack failed: ${result.unpack.message}`);
+  }
   let optionWithoutStatus = false;
   // git's receive_status: the `option` lines after an `ok` add a report to that ref
   let hint: PushRefUpdate | undefined;

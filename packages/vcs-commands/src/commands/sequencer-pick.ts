@@ -50,6 +50,12 @@ import {
   removeBranchState,
   resetMerge,
 } from "./sequencer-support.js";
+import {
+  SIGNING_FAILED_LINES,
+  SigningFailedError,
+  type SignRequest,
+  signRequestOf,
+} from "./signing.js";
 
 /** What the sequencer does with each commit. */
 export type PickAction = "pick" | "revert";
@@ -131,6 +137,11 @@ export interface PickOptions {
    * (git's `options.edit`), left out when neither was given.
    */
   edit?: boolean;
+  /**
+   * `-S[<keyid>]` (true or the key) / `--no-gpg-sign` (false); undefined: `commit.gpgSign`.
+   * Saved in `sequencer/opts` (`options.gpg-sign`) for a run of several commits.
+   */
+  sign?: boolean | string;
 }
 
 const ACTION_NAME = { pick: "cherry-pick", revert: "revert" } as const;
@@ -152,6 +163,8 @@ export class PickSequencer {
   private readonly abbreviator: IdAbbreviator;
   /** `--edit` / `--no-edit` (git's opts->edit, unset: undefined), read back from the opts */
   private edit: boolean | undefined;
+  /** What the commits are signed with (git's opts->gpg_sign), read back from the opts */
+  private sign: SignRequest;
 
   constructor(
     private readonly deps: SequencerDeps,
@@ -160,6 +173,7 @@ export class PickSequencer {
     this.flats = new FlatTreeCache(deps.trees);
     this.abbreviator = createIdAbbreviator(deps.workingCopy);
     this.edit = options.edit;
+    this.sign = signRequestOf(deps.workingCopy, options.sign);
   }
 
   private get name(): string {
@@ -201,6 +215,7 @@ export class PickSequencer {
       const opts: string[] = [];
       if (this.options.noCommit) opts.push("\tno-commit = true\n");
       if (this.edit !== undefined) opts.push(`\tedit = ${this.edit}\n`);
+      if (this.sign !== undefined) opts.push(`\tgpg-sign = ${this.sign}\n`);
       if (opts.length > 0) await state.write("sequencer/opts", `[options]\n${opts.join("")}`);
     }
     return this.run(todo, todo.length > 1);
@@ -589,8 +604,9 @@ export class PickSequencer {
   }
 
   /**
-   * read_populate_opts: `options.edit` of `sequencer/opts` (git config's syntax, the last
-   * value wins), the `--edit` / `--no-edit` the run started with.
+   * read_populate_opts: `options.edit` and `options.gpg-sign` of `sequencer/opts` (git
+   * config's syntax, the last value wins), the `--edit` / `--no-edit` and `-S` the run
+   * started with.
    */
   private async readSavedOptions(): Promise<void> {
     const text = await this.deps.state.read("sequencer/opts");
@@ -604,8 +620,15 @@ export class PickSequencer {
         continue;
       }
       const entry = /^([A-Za-z][A-Za-z0-9-]*)\s*=\s*(.*)$/.exec(line);
-      if (section !== "options" || !entry || entry[1].toLowerCase() !== "edit") continue;
-      const value = parseGitBool(entry[2].replace(/^"(.*)"$/, "$1"));
+      if (section !== "options" || !entry) continue;
+      const name = entry[1].toLowerCase();
+      const text = entry[2].replace(/^"(.*)"$/, "$1");
+      if (name === "gpg-sign") {
+        this.sign = text;
+        continue;
+      }
+      if (name !== "edit") continue;
+      const value = parseGitBool(text);
       if (value !== undefined) this.edit = value;
     }
   }
@@ -663,10 +686,30 @@ export class PickSequencer {
     // try_to_commit: prepare-commit-msg may rewrite the message; post-commit after
     const hooks = this.deps.hooks;
     const text = hooks ? await sequencerPrepareMessage(hooks, this.deps.state, message) : message;
+    if (this.sign !== undefined) throw this.signingFailed(this.sign);
     const id = await this.deps.commits.store({ tree, parents, author, committer, message: text });
     await this.moveHead(id, reflogMessage);
     if (hooks) await sequencerPostCommit(hooks);
     return id;
+  }
+
+  /**
+   * try_to_commit's failure to sign (no signer exists): gpg's error and `error: failed to
+   * write commit object`, then in git 2.43 `fatal: <action> failed` (exit 128); 2.5x returns
+   * after the error (exit 1). The pick stays in progress (CHERRY_PICK_HEAD, MERGE_MSG), as
+   * git leaves it.
+   */
+  private signingFailed(sign: string): SigningFailedError {
+    const legacy = this.deps.hooks?.compatibility === "2.43";
+    return new SigningFailedError(
+      [
+        ...SIGNING_FAILED_LINES,
+        "error: failed to write commit object",
+        ...(legacy ? [`fatal: ${this.name} failed`] : []),
+      ].join("\n"),
+      sign,
+      legacy ? 128 : 1,
+    );
   }
 
   /** HEAD (its branch, when attached) moved to `id`, with `message` in the reflogs. */
