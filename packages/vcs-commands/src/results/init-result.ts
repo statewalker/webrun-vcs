@@ -21,6 +21,15 @@ export interface InitResult {
   /** Initial branch name */
   initialBranch: string;
 
+  /**
+   * git's `advice.defaultBranchName` hint (stderr lines), when the branch is the built-in
+   * default: no `--initial-branch`, no `init.defaultBranch`, the advice not turned off
+   */
+  hints?: string[];
+
+  /** git's warnings (stderr lines): `re-init: ignored --initial-branch=<name>` */
+  warnings?: string[];
+
   /** Whether this is a bare repository */
   bare: boolean;
 
