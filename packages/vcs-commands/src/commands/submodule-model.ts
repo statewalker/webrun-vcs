@@ -15,7 +15,7 @@
  * await model.gitDirOf("lib"); // ".git/modules/lib"
  * ```
  */
-import type { ObjectId } from "@statewalker/vcs-core";
+import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import {
   ConfigParseError,
   configFilesApiOf,
@@ -23,6 +23,7 @@ import {
   readRepositoryFormat,
 } from "@statewalker/vcs-store-files";
 import { parseGitBool } from "@statewalker/vcs-utils";
+import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
 import { collectChunks, type WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { GitApiError, InvalidConfigError } from "../errors/index.js";
@@ -428,27 +429,173 @@ export class SubmoduleModel {
    * git's `submodule_name_to_gitdir`: where the repository of the submodule `name` lives,
    * as a path of the working copy's FilesApi: `<common git dir>/modules/<name>`, or under
    * `extensions.submodulePathConfig` the `submodule.<name>.gitdir` setting (relative to the
-   * worktree top).
+   * worktree top). The place is checked as git checks it (`validate_submodule_git_dir`):
+   * a legacy git directory inside another submodule's (`modules/hippo/hooks` while
+   * `modules/hippo` is a repository: CVE-2019-1387), or an encoded one that names a nested
+   * place or another submodule's, is refused.
    *
-   * @throws GitApiError where git dies: no `submodule.<name>.gitdir` under the extension, or
-   * a git directory inside another submodule's
+   * @throws SubmoduleGitDirError where git dies: no `submodule.<name>.gitdir` under the
+   * extension, or a git directory the check refuses
    */
   async gitDirOf(name: string): Promise<string | undefined> {
     const common = await commonGitFileOf(this.workingCopy, "modules");
     if (!common) return undefined;
-    if (await submodulePathConfigOf(this.workingCopy)) {
+    const encoded = await submodulePathConfigOf(this.workingCopy);
+    let gitDir: string;
+    if (encoded) {
       const key = `submodule.${name}.gitdir`;
       const value = this.configText(key);
       if (typeof value !== "string") {
-        throw new GitApiError(
+        throw new SubmoduleGitDirError(
           `fatal: the '${key}' config does not exist for module '${name}'. Please ensure it is set, for example by running something like: 'git config ${key} .git/modules/${name}'. For details see the extensions.submodulePathConfig documentation.`,
         );
       }
-      const root = this.workingCopy.worktree?.getRoot?.() ?? "";
-      return joinFilesPath(root, value);
+      gitDir = joinFilesPath(this.worktreeRoot, value);
+    } else gitDir = `${common.path}/${name}`;
+    const refusal = await validateSubmoduleGitDir(this.workingCopy, gitDir, name, { encoded });
+    if (refusal !== undefined) {
+      const shown = this.shownPath(gitDir);
+      throw new SubmoduleGitDirError(
+        [
+          ...refusal,
+          "hint: enabling extensions.submodulePathConfig might fix the following error, if it's not already enabled.",
+          `fatal: refusing to create/use '${shown}' in another submodule's  git dir.`,
+        ].join("\n"),
+        refusal,
+      );
     }
-    return `${common.path}/${name}`;
+    return gitDir;
   }
+
+  private get worktreeRoot(): string {
+    return this.workingCopy.worktree?.getRoot?.() ?? "";
+  }
+
+  /** A FilesApi path as git names it from the worktree top (`.git/modules/x`). */
+  shownPath(path: string): string {
+    return relativeFilesPath(this.worktreeRoot, path);
+  }
+}
+
+/**
+ * A submodule's git directory git refuses to create or use (`submodule_name_to_gitdir`
+ * dying): `message` is git's lines; `refusal` the `error:` lines of the check alone.
+ */
+export class SubmoduleGitDirError extends GitApiError {
+  constructor(
+    message: string,
+    readonly refusal: readonly string[] = [],
+  ) {
+    super(message, { exitCode: 128 });
+    this.name = "SubmoduleGitDirError";
+  }
+}
+
+/** `path` relative to `from` (FilesApi paths). */
+export function relativeFilesPath(from: string, path: string): string {
+  const a = from.split("/").filter(Boolean);
+  const b = path.split("/").filter(Boolean);
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return [...a.slice(i).map(() => ".."), ...b.slice(i)].join("/") || ".";
+}
+
+/** git's `is_git_directory`: HEAD (a file or link), `objects/` and `refs/` at `path`. */
+async function isGitDirectory(workingCopy: WorkingCopy, path: string): Promise<boolean> {
+  const files = workingCopy.worktree?.getFiles?.() as PosixFilesApi | undefined;
+  if (!files) return false;
+  const kind = async (p: string) => {
+    const st = files.lstat
+      ? await files.lstat(p).catch(() => undefined)
+      : await files.stats(p).catch(() => undefined);
+    return st?.kind;
+  };
+  const head = await kind(`${path}/HEAD`);
+  return (
+    (head === "file" || head === "symlink") &&
+    (await kind(`${path}/objects`)) === "directory" &&
+    (await kind(`${path}/refs`)) === "directory"
+  );
+}
+
+/**
+ * git's `validate_submodule_git_dir` of the git directory `gitDir` (a FilesApi path) of the
+ * submodule `name`: the `error:` lines of a refusal (none for the encoded layout, which git
+ * refuses silently), undefined when the place is fine.
+ *
+ * - Legacy layout (`validate_submodule_legacy_git_dir`): no leading directory of `gitDir`
+ *   within the name (`modules/hippo` of `modules/hippo/hooks`) may be a repository.
+ * - `extensions.submodulePathConfig` (`validate_submodule_encoded_git_dir`): the part after
+ *   the last `/modules/` holds no `/`, and an existing repository there is no other
+ *   submodule's `gitdir` (case-folding conflicts are not checked).
+ */
+export async function validateSubmoduleGitDir(
+  workingCopy: WorkingCopy,
+  gitDir: string,
+  name: string,
+  options: { encoded: boolean },
+): Promise<string[] | undefined> {
+  const root = workingCopy.worktree?.getRoot?.() ?? "";
+  if (options.encoded) {
+    const at = gitDir.lastIndexOf("/modules/");
+    if (at < 0 || gitDir.slice(at + "/modules/".length).includes("/")) return [];
+    if (!(await isGitDirectory(workingCopy, gitDir))) return undefined;
+    // find_conflict_by_gitdir_cb: another submodule's gitdir resolving to the same place
+    const entries = RemoteConfigStore.from(workingCopy).entriesWithPrefix("submodule.") ?? [];
+    for (const { key, value } of entries) {
+      if (!key.endsWith(".gitdir") || value === undefined) continue;
+      const other = key.slice("submodule.".length, -".gitdir".length);
+      // git compares the names with strncmp over the other name's length
+      if (name.slice(0, other.length) === other) continue;
+      if (joinFilesPath(root, value) === gitDir) return [];
+    }
+    return undefined;
+  }
+  if (!gitDir.endsWith(`/${name}`)) return undefined;
+  const start = gitDir.length - name.length;
+  for (let i = start; i < gitDir.length; i++) {
+    const c = gitDir[i];
+    if (c !== "/") continue;
+    const prefix = gitDir.slice(0, i);
+    if (await isGitDirectory(workingCopy, prefix)) {
+      return [
+        `error: submodule git dir '${relativeFilesPath(root, gitDir)}' is inside git dir '${relativeFilesPath(root, prefix)}'`,
+      ];
+    }
+  }
+  return undefined;
+}
+
+/**
+ * git's `validate_submodule_path` (2.5x): the `error:` line refusing a submodule path whose
+ * leading component, or itself, is a symbolic link, undefined when none is. Missing
+ * components are fine. Read with the FilesApi's `lstat`, else the worktree's entries.
+ */
+export async function validateSubmodulePath(
+  workingCopy: WorkingCopy,
+  path: string,
+): Promise<string | undefined> {
+  const worktree = workingCopy.worktree;
+  const files = worktree?.getFiles?.() as PosixFilesApi | undefined;
+  const root = worktree?.getRoot?.() ?? "";
+  const isLink = async (p: string): Promise<boolean> => {
+    if (files?.lstat) {
+      const st = await files.lstat(joinFilesPath(root, p)).catch(() => undefined);
+      return st?.kind === "symlink";
+    }
+    const entry = await worktree?.getEntry(p).catch(() => undefined);
+    return entry?.mode === FileMode.SYMLINK;
+  };
+  for (let i = 0; i < path.length; i++) {
+    if (path[i] !== "/") continue;
+    if (await isLink(path.slice(0, i))) {
+      return `error: expected '${path.slice(0, i)}' in submodule path '${path}' not to be a symbolic link`;
+    }
+  }
+  if (await isLink(path)) {
+    return `error: expected submodule path '${path}' not to be a symbolic link`;
+  }
+  return undefined;
 }
 
 /** Whether the repository's format has `extensions.submodulePathConfig` (git 2.52 and later). */

@@ -318,6 +318,131 @@ git clone -q ../up sub
   });
 });
 
+describeGit("submodule git directories and paths git refuses", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "submodule-cmds-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** `hippo` (populated) and `hippo/hooks` at `hooks`, whose git dir would be inside hippo's. */
+  const HIPPO = `
+git init -q -b main up; (cd up; echo x>x; git add x; git commit -qm x)
+U=$(git -C up rev-parse HEAD)
+git init -q -b main sup; cd sup; echo a>a; git add a; git commit -qm a
+git submodule add -q ../up hippo
+git update-index --add --cacheinfo 160000,$U,hooks
+git config -f .gitmodules submodule.hippo/hooks.path hooks
+git config -f .gitmodules submodule.hippo/hooks.url ../up
+git add .gitmodules; git commit -qm m
+git submodule init -q
+`;
+
+  it("refuses a git dir inside another submodule's (t7450's hippo/hooks, CVE-2019-1387)", async () => {
+    // relocating a .git directory: refused by 2.43 and 2.5x, each in its own words
+    const absorb = twins(`${HIPPO}
+git clone -q ../up hooks
+`);
+    await expectTwins(absorb, [
+      [
+        ["deinit", "-f", "hooks"],
+        (g) =>
+          g
+            .submoduleDeinit()
+            .setCompatibility(compatibility)
+            .setForce(true)
+            .addPath("hooks")
+            .call(),
+      ],
+    ]);
+    // unsetting core.worktree there: 2.5x refuses after clearing the directory; 2.43 does not
+    // check (it writes into hippo's hooks directory), ours refuses as 2.5x
+    const unset = twins(`${HIPPO}
+mkdir hooks
+`);
+    const step: Step = [
+      ["deinit", "-f", "hooks"],
+      (g) => g.submoduleDeinit().setForce(true).addPath("hooks").call(),
+    ];
+    if (is25x) await expectTwins(unset, [step]);
+    else {
+      const o = await oursRun(async () => step[1](await ours(join(unset.ours, "sup"))));
+      expect(o.exitCode).toBe(128);
+      expect(o.stderr).toContain(
+        "error: submodule git dir '.git/modules/hippo/hooks' is inside git dir '.git/modules/hippo'",
+      );
+      expect(o.stderr).toContain(
+        "fatal: refusing to create/use '.git/modules/hippo/hooks' in another submodule's  git dir.",
+      );
+      expect(existsSync(join(unset.ours, "sup/.git/modules/hippo/hooks/config"))).toBe(false);
+    }
+  });
+
+  it("refuses a submodule path with a symbolic link among its components (2.5x)", async () => {
+    const t = twins(`
+git init -q -b main up; (cd up; echo x>x; git add x; git commit -qm x)
+git init -q -b main sup; cd sup; echo a>a; git add a; git commit -qm a
+git submodule add -q ../up dir/s2; git commit -qm s
+mkdir -p ../outside/s2/.git; echo keep > ../outside/s2/keep; echo keep > ../outside/s2/.git/HEAD
+rm -rf dir; ln -s ../outside dir
+`);
+    const steps: Step[] = [
+      [
+        ["deinit", "-f", "dir/s2"],
+        (g) => g.submoduleDeinit().setForce(true).addPath("dir/s2").call(),
+      ],
+      [["deinit", "--all"], (g) => g.submoduleDeinit().setAll(true).call()],
+      [["foreach", "echo hi"], (g) => g.submoduleForeach().setCommand(["echo hi"]).call()],
+      [["sync"], (g) => g.submoduleSync().setCompatibility(compatibility).call()],
+    ];
+    if (is25x) await expectTwins(t, steps);
+    for (const [args, run] of steps) {
+      const o = await oursRun(async () => run(await ours(join(t.ours, "sup"))));
+      expect(o, args.join(" ")).toEqual({
+        stdout: "",
+        stderr: "error: expected 'dir' in submodule path 'dir/s2' not to be a symbolic link\n",
+        exitCode: 128,
+      });
+    }
+    expect(readFileSync(join(t.ours, "outside/s2/keep"), "utf8")).toBe("keep\n");
+    expect(readFileSync(join(t.ours, "outside/s2/.git/HEAD"), "utf8")).toBe("keep\n");
+  });
+
+  it("compares hostile names as strings, not patterns, in deinit", async () => {
+    // git runs `git config --get-regexp 'submodule.<name>\.'`: a name with pattern characters
+    // matches nothing there, so git keeps `(a|aa)+$`'s section; ours compares the name as a
+    // string (never compiling a name from .gitmodules) and removes it, in linear time
+    const evil = `${"a".repeat(48)}!`;
+    const t = twins(`
+git init -q -b main up; (cd up; echo x>x; git add x; git commit -qm x)
+U=$(git -C up rev-parse HEAD)
+git init -q -b main sup; cd sup; echo a>a; git add a; git commit -qm a
+git update-index --add --cacheinfo 160000,$U,p1 --cacheinfo 160000,$U,p2
+printf '%s\\n' '[submodule "(a|aa)+$"]' '	path = p1' '	url = ../up' '[submodule "${evil}"]' '	path = p2' '	url = ../up' > .gitmodules
+git add .gitmodules; git commit -qm m
+git submodule init -q
+`);
+    const started = Date.now();
+    const o = await oursRun(async () =>
+      (await ours(join(t.ours, "sup"))).submoduleDeinit().setAll(true).call(),
+    );
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(o).toEqual({
+      stdout: `Submodule '(a|aa)+$' (../up) unregistered for path 'p1'\nSubmodule '${evil}' (../up) unregistered for path 'p2'\n`,
+      stderr: "",
+      exitCode: 0,
+    });
+    const n = nativeRun(join(t.native, "sup"), ["deinit", "--all"]);
+    expect(n.stdout).toBe(`Submodule '${evil}' (../up) unregistered for path 'p2'\n`);
+    const mine = snapshot(join(t.ours, "sup"), t.ours);
+    const theirs = snapshot(join(t.native, "sup"), t.native);
+    expect(mine[".git/config"]).not.toContain("submodule");
+    expect(theirs[".git/config"]).toContain('[submodule "(a|aa)+$"]');
+    delete mine[".git/config"];
+    delete theirs[".git/config"];
+    expect(mine).toEqual(theirs);
+  });
+});
+
 describeGit("git submodule sync (t7403, SubmoduleSyncTest)", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-cmds-"));

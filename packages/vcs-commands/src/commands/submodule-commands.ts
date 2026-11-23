@@ -25,14 +25,18 @@ import {
   defaultRemoteOf,
   isRelativeSubmoduleUrl,
   joinFilesPath,
+  relativeFilesPath,
   remoteFromUrl,
   resolveRelativeUrl,
+  SubmoduleGitDirError,
   SubmoduleModel,
   type SubmoduleSettings,
   setInConfigFile,
   submodulePathConfigOf,
   submoduleUpdateTypeName,
   upPathOf,
+  validateSubmoduleGitDir,
+  validateSubmodulePath,
   worktreeHostPath,
 } from "./submodule-model.js";
 
@@ -118,6 +122,12 @@ abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandResult> {
   setSuperPrefix(prefix: string): this {
     this.superPrefix = prefix;
     return this;
+  }
+
+  /** git's `validate_submodule_path`: dies (its `error:` line, exit 128) on a symlinked path. */
+  protected async validatePath(path: string): Promise<void> {
+    const refusal = await validateSubmodulePath(this.workingCopy, path);
+    if (refusal !== undefined) this.die(refusal);
   }
 
   protected displayPath(path: string): string {
@@ -209,6 +219,7 @@ abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandResult> {
   protected async syncSubmodule(path: string, recursive: boolean): Promise<void> {
     const model = await this.model();
     if (!model.isActive(path)) return;
+    await this.validatePath(path);
     const sub = model.fromPath(path) as SubmoduleSettings;
     let subOriginUrl = "";
     let superConfigUrl = "";
@@ -373,7 +384,7 @@ export class SubmoduleInitCommand extends SubmoduleCommandBase {
     const modules = await commonGitFileOf(this.workingCopy, "modules");
     const root = this.worktreeAccess?.getRoot() ?? "";
     if (!modules) return;
-    const base = relativeTo(root, modules.path);
+    const base = relativeFilesPath(root, modules.path);
     const encode = (upper: boolean) =>
       [...new TextEncoder().encode(name)]
         .map((b) => {
@@ -391,7 +402,8 @@ export class SubmoduleInitCommand extends SubmoduleCommandBase {
     const key = `submodule.${name}.gitdir`;
     const model = await this.model();
     for (const candidate of candidates) {
-      if (!(await this.validEncodedGitDir(candidate, name))) continue;
+      const path = joinFilesPath(root, candidate);
+      if (await validateSubmoduleGitDir(this.workingCopy, path, name, { encoded: true })) continue;
       if (typeof model.configText(key) === "string") return;
       await this.setConfig(key, candidate);
       return;
@@ -400,40 +412,6 @@ export class SubmoduleInitCommand extends SubmoduleCommandBase {
       `fatal: failed to set a valid default config for '${key}'. Please ensure it is set, for example by running something like: 'git config ${key} .git/modules/${name}'`,
     );
   }
-
-  /** submodule.c's `validate_submodule_encoded_git_dir` (case-folding conflicts aside). */
-  private async validEncodedGitDir(gitDir: string, name: string): Promise<boolean> {
-    const at = gitDir.lastIndexOf("/modules/");
-    if (at < 0 || gitDir.slice(at + "/modules/".length).includes("/")) return false;
-    const files = this.worktreeAccess?.getFiles?.();
-    const root = this.worktreeAccess?.getRoot() ?? "";
-    const path = joinFilesPath(root, gitDir);
-    const kind = async (p: string) => (await files?.stats(p).catch(() => undefined))?.kind;
-    const isGitDir =
-      (await kind(`${path}/HEAD`)) === "file" &&
-      (await kind(`${path}/objects`)) === "directory" &&
-      (await kind(`${path}/refs`)) === "directory";
-    if (!isGitDir) return true;
-    // find_conflict_by_gitdir_cb: another submodule's gitdir resolving to the same place
-    const entries = RemoteConfigStore.from(this.workingCopy).entriesWithPrefix("submodule.") ?? [];
-    for (const { key, value } of entries) {
-      if (!key.endsWith(".gitdir") || value === undefined) continue;
-      const other = key.slice("submodule.".length, -".gitdir".length);
-      // git compares the names with strncmp over the other name's length
-      if (name.slice(0, other.length) === other) continue;
-      if (joinFilesPath(root, value) === path) return false;
-    }
-    return true;
-  }
-}
-
-/** `path` relative to `from` (FilesApi paths). */
-function relativeTo(from: string, path: string): string {
-  const a = from.split("/").filter(Boolean);
-  const b = path.split("/").filter(Boolean);
-  let i = 0;
-  while (i < a.length && i < b.length && a[i] === b[i]) i++;
-  return [...a.slice(i).map(() => ".."), ...b.slice(i)].join("/") || ".";
 }
 
 const DEINIT_USAGE = [
@@ -498,6 +476,7 @@ export class SubmoduleDeinitCommand extends SubmoduleCommandBase {
   }
 
   private async deinitSubmodule(path: string): Promise<void> {
+    await this.validatePath(path);
     const model = await this.model();
     const sub = model.fromPath(path);
     if (!sub) return;
@@ -549,17 +528,16 @@ export class SubmoduleDeinitCommand extends SubmoduleCommandBase {
     }
   }
 
-  /** Whether a configuration key matches git's `submodule.<name>\.` (a regular expression). */
+  /**
+   * Whether the configuration holds a `submodule.<name>.*` variable (git runs `git config
+   * --get-regexp 'submodule.<name>\.'`; the name is compared as a string, never compiled
+   * into a pattern: a name from `.gitmodules` is untrusted).
+   */
   private registered(store: RemoteConfigStore, name: string): boolean {
-    const entries = store.entriesWithPrefix("");
+    const entries = store.entriesWithPrefix("submodule.");
     if (!entries) return store.values(`submodule.${name}.url`).length > 0;
-    let pattern: RegExp;
-    try {
-      pattern = new RegExp(`submodule.${name}\\.`);
-    } catch {
-      return false;
-    }
-    return entries.some((e) => pattern.test(e.key));
+    const prefix = `submodule.${name}.`;
+    return entries.some((e) => e.key.startsWith(prefix) && e.key.length > prefix.length);
   }
 
   /** submodule.c's `submodule_unset_core_worktree`. */
@@ -567,9 +545,12 @@ export class SubmoduleDeinitCommand extends SubmoduleCommandBase {
     const model = await this.model();
     let gitDir: string | undefined;
     try {
+      await this.validatePath(sub.path ?? "");
       gitDir = await model.gitDirOf(sub.name);
     } catch (error) {
-      if (error instanceof GitApiError) this.die(error.message);
+      if (error instanceof GitApiError && !(error instanceof SubmoduleCommandError)) {
+        this.die(error.message);
+      }
       throw error;
     }
     const done =
@@ -589,15 +570,8 @@ export class SubmoduleDeinitCommand extends SubmoduleCommandBase {
     const worktree = this.worktreeAccess;
     const files = worktree?.getFiles?.();
     if (!worktree || !files) return;
+    await this.validatePath(path);
     const model = await this.model();
-    let target: string | undefined;
-    try {
-      target = await model.gitDirOf(name);
-    } catch (error) {
-      if (error instanceof GitApiError) this.die(error.message);
-      throw error;
-    }
-    if (target === undefined) return;
     const source = this.filesPath(`${path}/.git`);
     const host = (p: string) => {
       const root = (files as { rootDirectory?: string }).rootDirectory;
@@ -610,6 +584,19 @@ export class SubmoduleDeinitCommand extends SubmoduleCommandBase {
     )?.environment;
     const real = async (p: string) =>
       (await environment?.realPath?.(host(p)).catch(() => undefined)) ?? host(p);
+    let target: string | undefined;
+    try {
+      target = await model.gitDirOf(name);
+    } catch (error) {
+      if (error instanceof SubmoduleGitDirError && this.compatibility === "2.43") {
+        // relocate_single_git_dir_into_superproject of 2.43
+        this.out.stderr += error.refusal.map((l) => `${l}\n`).join("");
+        this.die(`fatal: refusing to move '${await real(source)}' into an existing git dir`);
+      }
+      if (error instanceof GitApiError) this.die(error.message);
+      throw error;
+    }
+    if (target === undefined) return;
     const parent = target.slice(0, Math.max(0, target.lastIndexOf("/")));
     if (parent) await files.mkdir(parent);
     const from = await real(source);
@@ -850,6 +837,7 @@ export class SubmoduleForeachCommand extends SubmoduleCommandBase {
     if (!list) return this.finish();
     const toplevel = await worktreeHostPath(this.workingCopy);
     for (const { path, id } of list) {
+      await this.validatePath(path);
       const dp = this.displayPath(path);
       const model = await this.model();
       const sub = model.fromPath(path);

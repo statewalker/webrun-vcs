@@ -164,7 +164,7 @@ printf '[submodule "s"]\\n\\tpath = s\\n\\turl = ../two\\n' > .gitmodules
 git add .gitmodules
 printf '[submodule "s"]\\n\\tpath = s\\n\\turl = ../three\\n' > .gitmodules
 git config submodule.active 's*'
-git config submodule.s.gitdir custom`);
+git config submodule.s.gitdir .git/modules/custom`);
       const head = sh("git -C r rev-parse HEAD").trim();
       const load = async (commit?: string) =>
         SubmoduleModel.load((await openOurs(dir)).workingCopy, commit ? { commit } : {});
@@ -193,7 +193,13 @@ git config submodule.s.gitdir custom`);
         "cd r; git config core.repositoryformatversion 1; git config extensions.submodulePathConfig true",
       );
       model = await load();
-      expect(await model.gitDirOf("s")).toBe("custom");
+      expect(await model.gitDirOf("s")).toBe(".git/modules/custom");
+      // validate_submodule_encoded_git_dir: a gitdir outside `modules/`, or nested, is refused
+      sh("cd r; git config -f .git/config submodule.s.gitdir .git/modules/a/b");
+      model = await load();
+      await expect(model.gitDirOf("s")).rejects.toThrow(
+        "fatal: refusing to create/use '.git/modules/a/b' in another submodule's  git dir.",
+      );
       await expect(model.gitDirOf("other")).rejects.toThrow(
         "the 'submodule.other.gitdir' config does not exist",
       );
