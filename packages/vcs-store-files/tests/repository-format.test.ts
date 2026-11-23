@@ -128,6 +128,7 @@ describe("repository format check", () => {
           relativeWorktrees: false,
           refStorage: "reftable",
           objectFormat: SHA1_OBJECT_FORMAT,
+          submodulePathConfig: false,
         },
         "prune",
       ),
@@ -156,7 +157,16 @@ describe("repository format check", () => {
       relativeWorktrees: false,
       refStorage: "files",
       objectFormat: SHA1_OBJECT_FORMAT,
+      submodulePathConfig: false,
     });
+  });
+
+  it("reads extensions.submodulePathConfig (version 1 only)", async () => {
+    const files = await repoWithConfig(v(1, "\tsubmodulePathConfig = true\n"));
+    expect((await readRepositoryFormat(files, ".git")).submodulePathConfig).toBe(true);
+    await expect(
+      readRepositoryFormat(await repoWithConfig(v(0, "\tsubmodulePathConfig = true\n")), ".git"),
+    ).rejects.toThrow(/v1-only extension/);
   });
 
   it("a remote marked promisor makes a partial clone, as git clone --filter writes it", async () => {
