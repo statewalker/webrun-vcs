@@ -256,11 +256,16 @@ function filesUnder(
  * The state of a repository after gc. `expiration` names the times a cruft pack gives
  * objects only reachable from younger unreachable ones (git's `--cruft-expiration`, "now"
  * minus the grace period at the time each gc ran): those come out as `EXPIRATION`.
+ * `previousGc` names the times the twin's previous gc ran: a cruft pack gives an unreachable
+ * object it finds in a pack that pack's mtime (pack-objects.c, `p->mtime`), so an object a
+ * previous gc packed carries the time that gc wrote its pack, which differs between the twins
+ * (each gc runs at its own time): those come out as `PREVIOUS_GC`.
  */
 export function gcSnapshot(
   gitDir: string,
   twinDir: string,
   expiration?: { from: number; to: number },
+  previousGc?: { from: number; to: number },
 ): GcSnapshot {
   const packDir = join(gitDir, "objects", "pack");
   const names = existsSync(packDir) ? readdirSync(packDir).sort() : [];
@@ -299,7 +304,9 @@ export function gcSnapshot(
       listed = ids.map((id, i) => {
         const t = times[i] as number;
         const exp = expiration && t >= expiration.from - 2 && t <= expiration.to + 2;
-        return `${id}@${exp ? "EXPIRATION" : t}`;
+        // a file's mtime comes from the kernel's coarse clock, which may lag Date.now()
+        const prev = previousGc && t >= previousGc.from - 1 && t <= previousGc.to;
+        return `${id}@${exp ? "EXPIRATION" : prev ? "PREVIOUS_GC" : t}`;
       });
     }
     const extra: Record<string, string> = {};
@@ -504,6 +511,10 @@ export async function gcTwins(
   const gitDirOf = (twin: string) =>
     existsSync(join(twin, repo, ".git")) ? join(twin, repo, ".git") : join(twin, repo);
 
+  // when each twin's previous gc ran (native's from t0 to t1, ours from t1 to t2)
+  let previous:
+    | { native: { from: number; to: number }; ours: { from: number; to: number } }
+    | undefined;
   const round = async (n: number) => {
     const t0 = Math.floor(Date.now() / 1000);
     const theirs = nativeGc(home, join(native, repo), run.args ?? [], run.env);
@@ -513,8 +524,13 @@ export async function gcTwins(
     const cmd = git.gc();
     const result = await (run.ours ? run.ours(cmd) : cmd).call();
     const t2 = Math.floor(Date.now() / 1000);
-    const a = normalize(gcSnapshot(gitDirOf(native), native, { from: t0 - grace, to: t1 - grace }));
-    const b = normalize(gcSnapshot(gitDirOf(ours), ours, { from: t1 - grace, to: t2 - grace }));
+    const a = normalize(
+      gcSnapshot(gitDirOf(native), native, { from: t0 - grace, to: t1 - grace }, previous?.native),
+    );
+    const b = normalize(
+      gcSnapshot(gitDirOf(ours), ours, { from: t1 - grace, to: t2 - grace }, previous?.ours),
+    );
+    previous = { native: { from: t0, to: t1 }, ours: { from: t1, to: t2 } };
     if (process.env.GC_TWIN_DEBUG) console.log(JSON.stringify({ n, native: a, result }, null, 1));
     expect(b, `round ${n}`).toEqual(a);
     // native fsck --strict finds in ours what it finds in its own result
