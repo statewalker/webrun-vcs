@@ -64,6 +64,7 @@ import {
   symrefReflogWrites,
 } from "@statewalker/vcs-core";
 import { atomicFilesOver, joinPath } from "@statewalker/vcs-utils/files";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 
 import { isRootRefName, RefUpdateRejectedError } from "../files-ref-batch.js";
 import { readLooseRef } from "../ref-reader.js";
@@ -91,7 +92,6 @@ import type { ReftableLogWrite, ReftableRefWrite } from "./reftable-writer.js";
 
 /** git's symref depth limit while resolving. */
 const MAX_SYMREF_DEPTH = 5;
-const ZERO_ID = "0000000000000000000000000000000000000000";
 
 /** Options of {@link createReftableRefStore}. */
 export interface ReftableRefStoreOptions {
@@ -101,6 +101,12 @@ export interface ReftableRefStoreOptions {
   gitDir: string;
   /** The repository's directory (git's common dir); default `gitDir` */
   commonDir?: string;
+  /**
+   * The repository's object format (`extensions.objectFormat`; SHA-1 by default): tables are
+   * written in it (version 2 with hash id `s256` for SHA-256), values must be ids of it, and
+   * a table of another hash is refused (git's "corrupt reftable file")
+   */
+  objectFormat?: ObjectFormat;
   /** git's write options (`reftable.blockSize`, `restartInterval`, `indexObjects`, `geometricFactor`, `lockTimeout`) */
   write?: ReftableStackWriteOptions;
   /**
@@ -203,9 +209,15 @@ export class ReftableRefStore implements Refs {
   /** The `shallow` and grafts files, which stay files */
   private readonly fileState: FileRefStore;
   private transactionHook?: RefTransactionHook;
+  /** The repository's object format */
+  readonly objectFormat: ObjectFormat;
+  /** The format's null id (reflog lines of creations and deletions, existence markers) */
+  private readonly zeroId: string;
 
   constructor(options: ReftableRefStoreOptions) {
     this.options = options;
+    this.objectFormat = options.objectFormat ?? SHA1_OBJECT_FORMAT;
+    this.zeroId = this.objectFormat.nullId;
     this.files = options.files;
     this.gitDir = options.gitDir;
     this.commonDir = options.commonDir ?? options.gitDir;
@@ -217,8 +229,13 @@ export class ReftableRefStore implements Refs {
   }
 
   private handle(dir: string): StackHandle {
-    const reader = createReftableStackReader(this.files, dir);
-    const writer = createReftableStackWriter(this.files, dir, reader, this.options.write);
+    const reader = createReftableStackReader(this.files, dir, {
+      objectFormat: this.objectFormat,
+    });
+    const writer = createReftableStackWriter(this.files, dir, reader, {
+      ...this.options.write,
+      objectFormat: this.objectFormat,
+    });
     return { dir, reader, writer };
   }
 
@@ -361,11 +378,12 @@ export class ReftableRefStore implements Refs {
     const view = await where.stack.reader.read();
     const refName = where.name;
     if (!view.hasLogs(refName)) return undefined;
+    const zeroId = this.zeroId;
     function* entries(): Generator<ReflogEntry> {
       for (const log of view.logs(refName)) {
         const u = log.update;
         // both ids zero: git's reflog existence marker, never shown
-        if (!u || (u.oldId === ZERO_ID && u.newId === ZERO_ID)) continue;
+        if (!u || (u.oldId === zeroId && u.newId === zeroId)) continue;
         yield {
           oldId: u.oldId,
           newId: u.newId,
@@ -416,7 +434,7 @@ export class ReftableRefStore implements Refs {
    * Throws `RefUpdateRejectedError` with nothing changed.
    */
   async set(name: string, objectId: ObjectId, log?: RefLogOptions): Promise<void> {
-    if (!isRefObjectId(objectId)) {
+    if (!isRefObjectId(objectId, this.objectFormat)) {
       throw new RefUpdateRejectedError([{ name, reason: "invalid-object-id" }]);
     }
     if (isPseudoRef(name)) return this.writePseudoRef(name, `${objectId}\n`);
@@ -599,7 +617,7 @@ export class ReftableRefStore implements Refs {
       const records: { updateIndex: number; update: ReftableLogUpdate }[] = [];
       for (const log of view.logs(where.name)) {
         const u = log.update;
-        if (!u || (u.oldId === ZERO_ID && u.newId === ZERO_ID)) continue;
+        if (!u || (u.oldId === this.zeroId && u.newId === this.zeroId)) continue;
         records.push({ updateIndex: log.updateIndex, update: u });
       }
       const verdicts = await prune(records.map((r) => r.update));
@@ -626,8 +644,8 @@ export class ReftableRefStore implements Refs {
           refName: where.name,
           updateIndex: ts,
           update: {
-            oldId: ZERO_ID,
-            newId: ZERO_ID,
+            oldId: this.zeroId,
+            newId: this.zeroId,
             name: "",
             email: "",
             time: 0,
@@ -642,7 +660,7 @@ export class ReftableRefStore implements Refs {
       if (
         options.updateRef &&
         lastHash !== undefined &&
-        lastHash !== ZERO_ID &&
+        lastHash !== this.zeroId &&
         current &&
         current.value.type !== "symref"
       ) {
@@ -829,6 +847,7 @@ export class ReftableRefStore implements Refs {
     const plan = await planRefBatch(commands, {
       read: (name) => this.get(name),
       hasChildren: (name) => this.hasChildren(name),
+      objectFormat: this.objectFormat,
     });
     if (!plan.ok) return plan;
     return {
@@ -843,7 +862,7 @@ export class ReftableRefStore implements Refs {
 
   /** A root ref's one update: the name itself, its old value checked, no reflog. */
   private async planRoot(c: RefCommand): Promise<Plan> {
-    if (c.new !== null && !isRefObjectId(c.new)) {
+    if (c.new !== null && !isRefObjectId(c.new, this.objectFormat)) {
       return { ok: false, rejected: [{ name: c.name, reason: "invalid-object-id" }] };
     }
     if (c.new === null && c.old === null) {
@@ -939,8 +958,8 @@ export class ReftableRefStore implements Refs {
       const symbolic = u.current !== undefined && isSymbolicRef(u.current);
       const message = u.message ?? batchMessage;
       const line: ReflogLine = {
-        oldId: u.oldValue ?? ZERO_ID,
-        newId: u.newValue ?? ZERO_ID,
+        oldId: u.oldValue ?? this.zeroId,
+        newId: u.newValue ?? this.zeroId,
         ident,
         message,
       };

@@ -26,6 +26,7 @@
 
 import type { FilesApi } from "@statewalker/vcs-core";
 import { joinPath } from "@statewalker/vcs-utils/files";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 
 import { ReftableFormatError } from "./reftable-errors.js";
 import {
@@ -59,6 +60,8 @@ export interface ReftableView {
 export interface ReftableStackReader {
   /** The stack's directory (`<git dir>/reftable`, `<common dir>/worktrees/<id>/reftable`) */
   readonly dir: string;
+  /** The repository's object format, which every table must have */
+  readonly objectFormat: ObjectFormat;
   /** The merged view as `tables.list` names it now (an empty view when it does not exist) */
   read(): Promise<ReftableView>;
 }
@@ -79,13 +82,36 @@ const RELOAD_TRIES_BEFORE_DEADLINE = 3;
 /** A table name git writes: `0x<min>-0x<max>-<random>.ref`; nothing naming another directory */
 const TABLE_NAME = /^[^/\\]+\.ref$/;
 
-/** A reader of the stack in `dir`, its opened tables cached by name. */
+/** Options of {@link createReftableStackReader}. */
+export interface ReftableStackReaderOptions {
+  /**
+   * The repository's object format (SHA-1 by default, as git's stack): a table of another
+   * hash is refused (`ReftableFormatError`, git's "corrupt reftable file")
+   */
+  objectFormat?: ObjectFormat;
+  /** The most table bytes held at once ({@link REFTABLE_STACK_BYTES_CEILING}) */
+  bytesCeiling?: number;
+  /** How long a read reloads a changing list ({@link REFTABLE_RELOAD_DEADLINE_MS}) */
+  reloadDeadlineMs?: number;
+}
+
+/**
+ * A reader of the stack in `dir`, its opened tables cached by name. The third argument is
+ * the options, or (as before) the bytes ceiling followed by the reload deadline.
+ */
 export function createReftableStackReader(
   files: FilesApi,
   dir: string,
-  bytesCeiling = REFTABLE_STACK_BYTES_CEILING,
-  reloadDeadlineMs = REFTABLE_RELOAD_DEADLINE_MS,
+  optionsOrCeiling: ReftableStackReaderOptions | number = {},
+  deadline?: number,
 ): ReftableStackReader {
+  const options: ReftableStackReaderOptions =
+    typeof optionsOrCeiling === "number"
+      ? { bytesCeiling: optionsOrCeiling, reloadDeadlineMs: deadline }
+      : { reloadDeadlineMs: deadline, ...optionsOrCeiling };
+  const bytesCeiling = options.bytesCeiling ?? REFTABLE_STACK_BYTES_CEILING;
+  const reloadDeadlineMs = options.reloadDeadlineMs ?? REFTABLE_RELOAD_DEADLINE_MS;
+  const objectFormat = options.objectFormat ?? SHA1_OBJECT_FORMAT;
   const tables = new Map<string, ReftableTable>();
   let cached: { list: string; view: ReftableView } | undefined;
 
@@ -126,7 +152,7 @@ export function createReftableStackReader(
     if (held + size > bytesCeiling) throw tooLarge();
     const bytes = await readFile(path);
     if (!bytes || bytes.length === 0 || bytes.length < size) return "missing";
-    const table = openReftable(bytes, name);
+    const table = openReftable(bytes, name, { objectFormat });
     tables.set(name, table);
     return table;
   };
@@ -211,7 +237,7 @@ export function createReftableStackReader(
   const tooLarge = () =>
     new ReftableFormatError(TABLES_LIST, `its tables hold more than ${bytesCeiling} bytes`);
 
-  return { dir, read };
+  return { dir, objectFormat, read };
 }
 
 /**

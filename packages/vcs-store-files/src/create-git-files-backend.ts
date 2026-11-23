@@ -230,10 +230,6 @@ export async function createGitFilesBackend(
       objectFormat.name,
     );
   }
-  // a SHA-256 reftable (hash id `s256`) is neither read nor written yet
-  if (objectFormat.name !== "sha1" && refStorage === "reftable") {
-    throw new UnsupportedObjectFormatError("reftable refs", objectFormat.name);
-  }
   const includes = options.configIncludes === undefined ? {} : { includes: options.configIncludes };
   // the settings read below come from git's whole sequence (system, global, the repository's
   // file, config.worktree, the command line), as git's repo_config reads them; only the
@@ -349,6 +345,8 @@ export async function createGitFilesBackend(
       ? createReftableRefStore({
           files,
           gitDir,
+          // the stacks' tables are of the repository's hash (version 2, `s256`, for SHA-256)
+          objectFormat,
           write: readReftableWriteOptions(settingsConfig, options.environment),
           logAllRefUpdates: options.logAllRefUpdates ?? reflog.logAllRefUpdates,
           reflogIdentity: options.reflogIdentity ?? reflog.identity,
@@ -495,9 +493,11 @@ async function createGitDirectoryStructure(
     ]);
     await files.write(joinPath(gitDir, "HEAD"), [encoder.encode("ref: refs/heads/.invalid\n")]);
     await files.mkdir(joinPath(gitDir, "reftable"));
+    // git writes `objectformat` before `refstorage` (initialize_repository_version)
+    const hash = objectFormat.name === "sha1" ? "" : `\tobjectformat = ${objectFormat.name}\n`;
     await files.write(joinPath(gitDir, "config"), [
       encoder.encode(
-        `[extensions]\n\trefstorage = reftable\n[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = ${bare}\n`,
+        `[extensions]\n${hash}\trefstorage = reftable\n[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = ${bare}\n`,
       ),
     ]);
     return;

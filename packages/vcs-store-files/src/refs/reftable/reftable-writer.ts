@@ -21,10 +21,13 @@
  * the header with each section's position and a CRC-32. A record is prefix compressed
  * against the previous key of its block; every key that shares nothing with it, and every
  * `restartInterval`th record, is a restart point. Records must come in key order: refs by
- * name, logs by name then newest update index first (the writer sorts them).
+ * name, logs by name then newest update index first (the writer sorts them). A SHA-1 table
+ * is version 1 (24-byte header, 68-byte footer); a SHA-256 one version 2 with hash id `s256`
+ * (28 and 72 bytes) and 32-byte ids, as git's `writer_version`.
  */
 
 import { deflateSync } from "@statewalker/vcs-utils/compression";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { crc32 } from "@statewalker/vcs-utils/hash/crc32";
 import { hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
@@ -43,6 +46,8 @@ export interface ReftableWriteOptions {
   unpadded?: boolean;
   /** Log messages written as given (otherwise one line ending in a newline) */
   exactLogMessage?: boolean;
+  /** The repository's object format (SHA-1 by default): the table's version, hash id, id width */
+  objectFormat?: ObjectFormat;
 }
 
 /** A ref record to write: an absolute update index, within the table's limits. */
@@ -84,10 +89,7 @@ const TYPE_REF = 0x72;
 const TYPE_LOG = 0x67;
 const TYPE_OBJ = 0x6f;
 const TYPE_INDEX = 0x69;
-/** git writes version 1 for SHA-1 tables */
-const VERSION = 1;
-const HEADER_SIZE = 24;
-const FOOTER_SIZE = 68;
+const FORMAT_ID_SHA256 = 0x73323536; // "s256"
 const LOG_COMPRESSION_LEVEL = 9;
 
 const encoder = new TextEncoder();
@@ -266,8 +268,13 @@ function logKey(refName: string, updateIndex: number): Uint8Array {
   return key;
 }
 
-function hashBytes(hex: string): Uint8Array {
-  if (!/^[0-9a-f]{40}$/.test(hex)) throw new ReftableWriteError(`not an object id: '${hex}'`);
+const HEX = /^[0-9a-f]+$/;
+
+/** The id's bytes; refused unless it is a full lowercase id of the table's format. */
+function hashBytes(hex: string, format: ObjectFormat): Uint8Array {
+  if (hex.length !== format.hexLength || !HEX.test(hex)) {
+    throw new ReftableWriteError(`not a ${format.name} object id: '${hex}'`);
+  }
   return hexToBytes(hex);
 }
 
@@ -290,6 +297,12 @@ export function writeReftable(
   if (blockSize >= 1 << 24) throw new ReftableWriteError("block size must be below 16 MiB");
   const indexObjects = options.indexObjects !== false;
   const unpadded = options.unpadded === true;
+  const format = options.objectFormat ?? SHA1_OBJECT_FORMAT;
+  // git's writer_version: 1 for SHA-1, 2 (with the hash id) otherwise
+  const version = format.name === "sha1" ? 1 : 2;
+  const headerSize = version === 1 ? 24 : 28;
+  const footerSize = headerSize + 5 * 8 + 4;
+  const id = (hex: string) => hashBytes(hex, format);
   const { minUpdateIndex: min, maxUpdateIndex: max } = content;
   if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max) || min < 0 || max < min) {
     throw new ReftableWriteError(`bad update index range ${min}..${max}`);
@@ -323,10 +336,16 @@ export function writeReftable(
           : stats.idx;
 
   const header = (dest: Uint8Array) => {
-    dest.set([0x52, 0x45, 0x46, 0x54, VERSION]);
+    dest.set([0x52, 0x45, 0x46, 0x54, version]);
     put24(dest, 5, blockSize);
     put64(dest, 8, min);
     put64(dest, 16, max);
+    if (version === 2) {
+      dest[24] = (FORMAT_ID_SHA256 >>> 24) & 0xff;
+      dest[25] = (FORMAT_ID_SHA256 >>> 16) & 0xff;
+      dest[26] = (FORMAT_ID_SHA256 >>> 8) & 0xff;
+      dest[27] = FORMAT_ID_SHA256 & 0xff;
+    }
   };
 
   const paddedWrite = (data: Uint8Array, padding: number) => {
@@ -340,7 +359,7 @@ export function writeReftable(
 
   const reinit = (type: number) => {
     lastKey = EMPTY;
-    writer = new BlockWriter(type, blockSize, next === 0 ? HEADER_SIZE : 0, restartInterval);
+    writer = new BlockWriter(type, blockSize, next === 0 ? headerSize : 0, restartInterval);
   };
 
   const flushBlock = () => {
@@ -408,8 +427,8 @@ export function writeReftable(
     const hashes = [...objIndex.keys()].sort();
     let maxCommon = 1;
     for (let i = 1; i < hashes.length; i++) {
-      const a = hashBytes(hashes[i - 1] as string);
-      const b = hashBytes(hashes[i] as string);
+      const a = id(hashes[i - 1] as string);
+      const b = id(hashes[i] as string);
       maxCommon = Math.max(maxCommon, commonPrefix(a, b));
     }
     objectIdLength = maxCommon + 1;
@@ -417,7 +436,7 @@ export function writeReftable(
     for (const hex of hashes) {
       const offsets = objIndex.get(hex) as number[];
       const record = (offsetCount: number): BlockRecord => ({
-        key: hashBytes(hex).subarray(0, objectIdLength),
+        key: id(hex).subarray(0, objectIdLength),
         valueType: offsetCount > 0 && offsetCount < 8 ? offsetCount : 0,
         encode: (out) => {
           if (offsetCount === 0 || offsetCount >= 8) out.varint(offsetCount);
@@ -470,10 +489,10 @@ export function writeReftable(
       valueType,
       encode: (out) => {
         out.varint(delta);
-        if (value.type === "id") out.put(hashBytes(value.id));
+        if (value.type === "id") out.put(id(value.id));
         else if (value.type === "peeled") {
-          out.put(hashBytes(value.id));
-          out.put(hashBytes(value.peeled));
+          out.put(id(value.id));
+          out.put(id(value.peeled));
         } else if (value.type === "symref") out.string(encoder.encode(value.target));
       },
     });
@@ -508,8 +527,8 @@ export function writeReftable(
         }
         message += "\n";
       }
-      const old = hashBytes(update.oldId);
-      const neu = hashBytes(update.newId);
+      const old = id(update.oldId);
+      const neu = id(update.newId);
       const name = encoder.encode(update.name);
       const email = encoder.encode(update.email);
       const text = encoder.encode(message);
@@ -536,18 +555,20 @@ export function writeReftable(
   pendingPadding = 0;
   if (empty) return undefined;
 
-  const footer = new Uint8Array(FOOTER_SIZE);
+  const footer = new Uint8Array(footerSize);
   header(footer);
-  put64(footer, 24, stats.ref.indexOffset);
-  put64(footer, 32, (BigInt(stats.obj.offset) << 5n) | BigInt(objectIdLength));
-  put64(footer, 40, stats.obj.indexOffset);
-  put64(footer, 48, stats.log.offset);
-  put64(footer, 56, stats.log.indexOffset);
-  const crc = crc32(footer.subarray(0, 64));
-  footer[64] = (crc >>> 24) & 0xff;
-  footer[65] = (crc >>> 16) & 0xff;
-  footer[66] = (crc >>> 8) & 0xff;
-  footer[67] = crc & 0xff;
+  const h = headerSize;
+  put64(footer, h, stats.ref.indexOffset);
+  put64(footer, h + 8, (BigInt(stats.obj.offset) << 5n) | BigInt(objectIdLength));
+  put64(footer, h + 16, stats.obj.indexOffset);
+  put64(footer, h + 24, stats.log.offset);
+  put64(footer, h + 32, stats.log.indexOffset);
+  const crcAt = h + 40;
+  const crc = crc32(footer.subarray(0, crcAt));
+  footer[crcAt] = (crc >>> 24) & 0xff;
+  footer[crcAt + 1] = (crc >>> 16) & 0xff;
+  footer[crcAt + 2] = (crc >>> 8) & 0xff;
+  footer[crcAt + 3] = crc & 0xff;
   chunks.push(footer);
 
   let length = 0;

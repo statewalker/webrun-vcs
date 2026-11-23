@@ -1,6 +1,6 @@
 /**
- * The errors of the reftable reader: a table or `tables.list` that is not well formed, and a
- * format we do not read (SHA-256 tables).
+ * The errors of the reftable reader: a table or `tables.list` that is not well formed (a
+ * table of another hash than the repository's included), and a table we do not read.
  */
 
 /**
@@ -17,7 +17,10 @@ export class ReftableFormatError extends Error {
   }
 }
 
-/** A reftable we do not read: a SHA-256 table (version 2 with hash id `s256`). */
+/**
+ * A reftable we do not read. Nothing raises it since SHA-256 tables (version 2, hash id
+ * `s256`) are read; kept for callers that tell it apart.
+ */
 export class ReftableUnsupportedError extends Error {
   constructor(
     readonly table: string,
