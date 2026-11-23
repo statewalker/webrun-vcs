@@ -1,11 +1,15 @@
 import {
-  EMPTY_TREE_ID,
   type FileModeValue,
   type ObjectId,
   type TreeEntry,
   TreeEntryCursor,
 } from "@statewalker/vcs-core";
-import { ByteSink, parseGitBool, type XdiffAlgorithm } from "@statewalker/vcs-utils";
+import {
+  ByteSink,
+  isNullObjectId,
+  parseGitBool,
+  type XdiffAlgorithm,
+} from "@statewalker/vcs-utils";
 import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   type AttributesIndex,
@@ -92,7 +96,8 @@ const PREFETCH_FORMATS = new Set<string>(["patch", "stat", "numstat", "shortstat
 function prefetchIds(entries: readonly DiffEntry[]): ObjectId[] {
   const out: ObjectId[] = [];
   const add = (id: ObjectId | undefined, mode: number | undefined) => {
-    if (id && id !== NULL_ID && mode !== GITLINK && mode !== undefined && mode !== 0) out.push(id);
+    if (id && !isNullObjectId(id) && mode !== GITLINK && mode !== undefined && mode !== 0)
+      out.push(id);
   };
   for (const e of entries) {
     if (e.unmerged) continue;
@@ -262,7 +267,6 @@ function submoduleIgnoreValue(
 
 const S_IFMT = 0o170000;
 const GITLINK = 0o160000;
-const NULL_ID = "0".repeat(40);
 const encoder = new TextEncoder();
 
 /** The chunks as one array. */
@@ -805,7 +809,12 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       const pair: DiffFilePair = entry.unmerged
         ? {
             status: "M",
-            old: contentSide(entry.oldPath ?? "", 0, NULL_ID, async () => new Uint8Array(0)),
+            old: contentSide(
+              entry.oldPath ?? "",
+              0,
+              this.objectFormat.nullId,
+              async () => new Uint8Array(0),
+            ),
           }
         : this.withTextconvInputs(diffEntryToPair(entry, this.blobs), entry);
       if (entry.unmerged) unmerged.add(pair);
@@ -827,7 +836,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       // combine-diff.c's index lines take DEFAULT_ABBREV, whatever --abbrev says
       let combinedLengths: ReadonlyMap<string, number> | undefined;
       if (!options.fullIndex) {
-        const ids = new Set<string>([NULL_ID]);
+        const ids = new Set<string>([this.objectFormat.nullId]);
         for (const c of combined) {
           ids.add(c.ours.objectId);
           ids.add(c.theirs.objectId);
@@ -868,8 +877,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
             const ids = new Set<string>();
             for (const pair of pairs) {
               if (unmerged.has(pair)) continue;
-              ids.add(pair.old?.id ?? NULL_ID);
-              ids.add(pair.new?.id ?? NULL_ID);
+              ids.add(pair.old?.id ?? this.objectFormat.nullId);
+              ids.add(pair.new?.id ?? this.objectFormat.nullId);
             }
             // `--abbrev=<n>`: at least n digits
             options.abbrevLengths = await this.idAbbreviator().lengths(ids, options.abbrev);
@@ -934,8 +943,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     format: SubmoduleDiffFormat,
   ): Promise<void> {
     const path = pair.old?.path ?? pair.new?.path ?? "";
-    const one = pair.old?.id ?? NULL_ID;
-    const two = pair.new?.id ?? NULL_ID;
+    const one = pair.old?.id ?? this.objectFormat.nullId;
+    const two = pair.new?.id ?? this.objectFormat.nullId;
     const dirt = pair.new?.submoduleDirt;
     // strbuf_add_unique_abbrev(..., DEFAULT_ABBREV): the superproject's abbreviation
     const abbreviate = (id: ObjectId) => this.idAbbreviator().abbreviate(id);
@@ -948,7 +957,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const header = await submoduleHeader({ path, one, two, dirt, sub, abbreviate });
     sink.text(header.text);
     // a valid left and right commit (or none on that side) to diff
-    if (!(header.left || one === NULL_ID) || !(header.right || two === NULL_ID)) return;
+    if (
+      !(header.left || one === this.objectFormat.nullId) ||
+      !(header.right || two === this.objectFormat.nullId)
+    )
+      return;
     if (!sub) return;
     const failed = "(diff failed)\n";
     // `git diff` runs in the submodule's directory: one that holds no repository of its own
@@ -958,14 +971,14 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       return;
     }
     const inner = new DiffCommand(sub.repository)
-      .setOldTree(header.left ? one : EMPTY_TREE_ID)
+      .setOldTree(header.left ? one : this.objectFormat.emptyTreeId)
       .setSubmoduleFormat("diff")
       .setOptions({
         srcPrefix: `${options.srcPrefix ?? "a/"}${path}/`,
         dstPrefix: `${options.dstPrefix ?? "b/"}${path}/`,
       });
     // modified content: the submodule's worktree is diffed, not its commit
-    if (!dirt?.modified) inner.setNewTree(header.right ? two : EMPTY_TREE_ID);
+    if (!dirt?.modified) inner.setNewTree(header.right ? two : this.objectFormat.emptyTreeId);
     try {
       sink.push(await inner.callBytes("patch"));
     } catch {
@@ -986,7 +999,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const textconv = driver?.textconv;
     const stage = async (e: StageEntry) => {
       const side = blobSide(this.blobs, c.path, e.mode, e.objectId);
-      const convert = textconv && (e.mode & S_IFMT) !== GITLINK && e.objectId !== NULL_ID;
+      const convert =
+        textconv && (e.mode & S_IFMT) !== GITLINK && e.objectId !== this.objectFormat.nullId;
       return {
         id: e.objectId,
         mode: e.mode,
@@ -1002,7 +1016,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     if (worktree && file) {
       if (file.isDirectory) {
         mode = GITLINK;
-        content = encoder.encode(`Subproject commit ${NULL_ID}\n`);
+        content = encoder.encode(`Subproject commit ${this.objectFormat.nullId}\n`);
       } else {
         const kind = file.mode & S_IFMT;
         mode = kind === 0o120000 ? 0o120000 : file.mode & 0o111 ? 0o100755 : 0o100644;
@@ -1018,7 +1032,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       {
         path: c.path,
         parents: [await stage(c.ours), await stage(c.theirs)],
-        result: { id: NULL_ID, mode, content },
+        result: { id: this.objectFormat.nullId, mode, content },
       },
       {
         ...options,
@@ -1632,7 +1646,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private async treeSide(refOrId: string, implicitHead = false): Promise<Map<string, Side>> {
     const out = new Map<string, Side>();
     // the empty tree (a root commit's parent side), which a store need not hold
-    if (refOrId === EMPTY_TREE_ID) return out;
+    if (refOrId === this.objectFormat.emptyTreeId) return out;
     let treeId: ObjectId;
     try {
       treeId = await this.resolveTreeId(refOrId);
@@ -1657,11 +1671,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const oldSide = new Map<string, Side>();
     const newSide = new Map<string, Side>();
     const treeOf = async (ref: string, implicit: boolean): Promise<ObjectId | undefined> => {
-      if (ref === EMPTY_TREE_ID) return undefined;
+      if (ref === this.objectFormat.emptyTreeId) return undefined;
       // a tree's full id (as `git log -p` passes its commits' trees): read at once, its
       // entries kept for the comparison
       const trees = this.trees;
-      if (/^[0-9a-f]{40}$/.test(ref)) {
+      if (this.isFullObjectId(ref)) {
         const known = trees.raw ? trees.raw(ref) : trees.entries?.(ref);
         if (known && (await known)) return ref;
       }
@@ -1692,8 +1706,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   ): Promise<void> {
     if (a === b) return;
     if (this.trees.raw) return this.diffRawTrees(a, b, prefix, oldSide, newSide);
-    const ea = a === undefined || a === EMPTY_TREE_ID ? [] : await this.treeEntries(a);
-    const eb = b === undefined || b === EMPTY_TREE_ID ? [] : await this.treeEntries(b);
+    const ea =
+      a === undefined || a === this.objectFormat.emptyTreeId ? [] : await this.treeEntries(a);
+    const eb =
+      b === undefined || b === this.objectFormat.emptyTreeId ? [] : await this.treeEntries(b);
     let i = 0;
     let j = 0;
     while (i < ea.length || j < eb.length) {
@@ -1746,9 +1762,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     if (a === b) return;
     const trees = this.trees;
     const read = async (id: ObjectId | undefined) =>
-      id === undefined || id === EMPTY_TREE_ID ? NO_BYTES : ((await trees.raw?.(id)) ?? NO_BYTES);
-    const x = new TreeEntryCursor(await read(a));
-    const y = new TreeEntryCursor(await read(b));
+      id === undefined || id === this.objectFormat.emptyTreeId
+        ? NO_BYTES
+        : ((await trees.raw?.(id)) ?? NO_BYTES);
+    const x = new TreeEntryCursor(await read(a), this.objectFormat.rawLength);
+    const y = new TreeEntryCursor(await read(b), this.objectFormat.rawLength);
     const pathOf = (name: string) => (prefix ? `${prefix}/${name}` : name);
     while (!x.done || !y.done) {
       const order = x.done ? 1 : y.done ? -1 : x.compare(y);
@@ -1945,7 +1963,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    */
   private async resolveTreeId(refOrId: string): Promise<ObjectId> {
     // a full object id names that object, as get_oid takes it: no ref is looked up
-    if (/^[0-9a-f]{40}$/.test(refOrId)) {
+    if (this.isFullObjectId(refOrId)) {
       const tree = await this.revisionResolver()
         .peelToType(refOrId, "tree")
         .catch(() => undefined);
@@ -1955,7 +1973,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     try {
       id = await this.resolveRevision(refOrId);
     } catch (e) {
-      if (/^[0-9a-f]{40}$/.test(refOrId) && (await this.isTree(refOrId))) return refOrId;
+      if (this.isFullObjectId(refOrId) && (await this.isTree(refOrId))) return refOrId;
       if (refOrId === "HEAD") throw new NoHeadError("HEAD cannot be resolved");
       if (e instanceof RefNotFoundError) {
         throw new RefNotFoundError(refOrId, `bad revision '${refOrId}'`);

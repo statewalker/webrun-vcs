@@ -12,6 +12,10 @@
  * // without --verify: ranges and set notation, one line per object as git prints them
  * const { lines } = await git.revParse().addArgument("main..feat").addArgument("v1^!").call();
  * // lines: ["<feat>", "^<main>", "<v1's commit>", "^<its parent>"]
+ *
+ * // the repository's hash
+ * const { lines: [format] } = await git.revParse().addArgument("--show-object-format").call();
+ * // format: "sha1", or "sha256"
  * ```
  */
 
@@ -73,6 +77,14 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
     this.checkCallable();
     this.prefix = prefix === "" || prefix.endsWith("/") ? prefix : `${prefix}/`;
     return this;
+  }
+
+  /**
+   * `git rev-parse --show-object-format`: the repository's object format (`sha1`, `sha256`),
+   * as the result's `lines` give it with `addArgument("--show-object-format")`.
+   */
+  showObjectFormat(): string {
+    return this.objectFormat.name;
   }
 
   /** The revision to resolve (`HEAD~2`, `@{u}`, `main@{yesterday}`, `:/fix`, `HEAD:a.txt`). */
@@ -145,6 +157,16 @@ export class RevParseCommand extends GitCommand<RevParseResult> {
       if (arg === "--") {
         asIs = 2;
         lines.push(arg);
+        continue;
+      }
+      // --show-object-format[=storage|input|output]: the repository's hash (all three agree
+      // without a compatibility format)
+      if (arg === "--show-object-format" || arg.startsWith("--show-object-format=")) {
+        const mode = arg.slice("--show-object-format=".length);
+        if (arg.includes("=") && mode !== "storage" && mode !== "input" && mode !== "output") {
+          throw new RevisionError(arg, `fatal: unknown mode for --show-object-format: ${mode}`);
+        }
+        lines.push(this.objectFormat.name);
         continue;
       }
       if (await this.tryDifference(resolver, arg, lines)) continue;

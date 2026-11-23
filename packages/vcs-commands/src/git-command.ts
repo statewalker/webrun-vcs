@@ -29,9 +29,10 @@ import {
   isSymbolicRef,
   type LoadedObjectReplacements,
   loadObjectReplacements,
+  objectFormatOf,
   overlayMethods,
 } from "@statewalker/vcs-core";
-import { OrderedMap, parseGitBool } from "@statewalker/vcs-utils";
+import { type ObjectFormat, OrderedMap, parseGitBool } from "@statewalker/vcs-utils";
 import {
   type AttributesSourceResolver,
   basicStatMatches,
@@ -584,7 +585,7 @@ export abstract class GitCommand<T> {
       // spelled as it, for an ambiguity warning the notes commands do not print — a ref
       // lookup per line of `git notes copy --stdin` that costs most of its time
       resolve: (name) =>
-        /^[0-9a-fA-F]{40}$/.test(name)
+        name.length === this.objectFormat.hexLength && /^[0-9a-fA-F]+$/.test(name)
           ? Promise.resolve(name.toLowerCase())
           : this.revisionResolver()
               .resolve(name)
@@ -593,6 +594,19 @@ export abstract class GitCommand<T> {
   }
 
   // ============ Store Accessors ============
+
+  /**
+   * The repository's object format (`extensions.objectFormat`): the length of its ids, its
+   * null id, empty tree and empty blob. SHA-1 unless the repository is SHA-256.
+   */
+  protected get objectFormat(): ObjectFormat {
+    return objectFormatOf(this._workingCopy.history);
+  }
+
+  /** Whether `id` is a full lowercase hex id of the repository's format (40, or 64 digits) */
+  protected isFullObjectId(id: string): boolean {
+    return id.length === this.objectFormat.hexLength && /^[0-9a-f]+$/.test(id);
+  }
 
   /**
    * Whether this command reads objects through replace refs and grafts (see {@link commits}).

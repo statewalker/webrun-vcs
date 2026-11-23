@@ -10,6 +10,7 @@ import {
   graftFileReader,
   isSymbolicRef,
   loadMultiPackIndex,
+  objectFormatOf,
   objectsWithoutLazyFetch,
   openPack,
   type PackFile,
@@ -30,6 +31,11 @@ import {
 import { multiPackIndexVerify } from "@statewalker/vcs-store-files";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { readFile } from "@statewalker/vcs-utils/files";
+import {
+  assertSha1ObjectFormat,
+  isNullObjectId,
+  type ObjectFormat,
+} from "@statewalker/vcs-utils/hash";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import {
@@ -187,9 +193,7 @@ export interface FsckRepositoryFiles {
   gitDir?: string;
 }
 
-const ZERO_ID = "0000000000000000000000000000000000000000";
-const OID = /^[0-9a-f]{40}$/;
-const LOOSE_NAME = /^[0-9a-f]{38}$/;
+const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const PACK_IDX = /^pack-[0-9a-f]{40}\.idx$/;
 /** Refs one worktree has of its own (git's `is_per_worktree_ref`). */
 const PER_WORKTREE = /^(?:refs\/(?:bisect|worktree|rewritten)\/|[A-Z_]+$)/;
@@ -622,7 +626,13 @@ interface WorktreeState {
 
 /** One `git fsck` run (builtin/fsck.c's globals). */
 class FsckRun {
-  private readonly t = new ObjectTable();
+  private readonly t: ObjectTable;
+  /** The repository's object format: its ids' lengths in trees, commits, tags and names */
+  private readonly format: ObjectFormat;
+  /** Whether the format is SHA-1 (its own fast hash paths) */
+  private readonly sha1: boolean;
+  /** A loose object's file name: the id after its fan-out directory (38 or 62 digits) */
+  private readonly looseName: RegExp;
   private readonly findings: FsckFinding[] = [];
   private errorsFound = 0;
   private readonly pending: number[] = [];
@@ -677,7 +687,7 @@ class FsckRun {
    */
   private readonly badCopy = new Set<string>();
   /** Where an id parsed from hex is written for a lookup. */
-  private readonly idScratch = new Uint8Array(20);
+  private readonly idScratch: Uint8Array;
   /**
    * The object `parseObject` read last: the connectivity walk of a tree it parsed walks these
    * bytes instead of reading the tree again (git's parse_tree reads it once).
@@ -721,6 +731,11 @@ class FsckRun {
     private readonly types: FsckMessageTypes,
     private readonly o: RunOptions,
   ) {
+    this.format = objectFormatOf(objects);
+    this.sha1 = this.format.name === "sha1";
+    this.t = new ObjectTable(this.format.rawLength);
+    this.idScratch = new Uint8Array(this.format.rawLength);
+    this.looseName = new RegExp(`^[0-9a-f]{${this.format.hexLength - 2}}$`);
     if (o.nameObjects) this.names = new Map();
     this.showUnreachable = o.unreachable;
     this.recordTrees = !o.connectivityOnly && !o.nameObjects;
@@ -1572,7 +1587,7 @@ class FsckRun {
       // in the order the files list them, as git's readdir loop: it decides hash collisions
       for (const e of entries) {
         const path = pathOf(dir, e.name);
-        yield LOOSE_NAME.test(e.name)
+        yield this.looseName.test(e.name)
           ? { id: sub + e.name, path, name: e.name }
           : { path, name: e.name };
       }
@@ -1604,11 +1619,12 @@ class FsckRun {
   private async forEachStored(
     visit: (raw: Uint8Array, at: number, pack: number, pos: number) => void | Promise<void>,
   ): Promise<void> {
-    const scratch = new Uint8Array(20);
-    // ids listed here are 40 lowercase hex digits
+    const raw = this.format.rawLength;
+    const scratch = new Uint8Array(raw);
+    // ids listed here are 40 (64) lowercase hex digits
     const nibble = (c: number) => (c <= 0x39 ? c - 0x30 : c - 0x57);
     const parsed = (id: string) => {
-      for (let i = 0; i < 20; i++)
+      for (let i = 0; i < raw; i++)
         scratch[i] = (nibble(id.charCodeAt(2 * i)) << 4) | nibble(id.charCodeAt(2 * i + 1));
       return scratch;
     };
@@ -1673,7 +1689,7 @@ class FsckRun {
     if (type === OBJ_COMMIT) {
       if (this.graftsHint) this.adviseGrafts();
       if (this.graftErrors.length > 0) this.reportGraftErrors();
-      const parsed = parseCommitLinks(content, id);
+      const parsed = parseCommitLinks(content, id, this.format);
       if ("error" in parsed) {
         this.error(parsed.error, id);
         return undefined;
@@ -1682,7 +1698,10 @@ class FsckRun {
       const tree = t.lookupTypedRaw(rawIdAt(content, parsed.tree, raw), 0, OBJ_TREE);
       if (typeof tree !== "number") {
         this.error(tree.error);
-        this.error(`bad tree pointer ${hexIdAt(content, parsed.tree)} in commit ${id}`, id);
+        this.error(
+          `bad tree pointer ${hexIdAt(content, parsed.tree, this.format)} in commit ${id}`,
+          id,
+        );
         return undefined;
       }
       const parents: number[] = [];
@@ -1702,7 +1721,7 @@ class FsckRun {
           const parent = t.lookupTypedRaw(rawIdAt(content, at, raw), 0, OBJ_COMMIT);
           if (typeof parent !== "number") {
             this.error(parent.error);
-            this.error(`bad parent ${hexIdAt(content, at)} in commit ${id}`, id);
+            this.error(`bad parent ${hexIdAt(content, at, this.format)} in commit ${id}`, id);
             return undefined;
           }
           parents.push(parent);
@@ -1713,7 +1732,7 @@ class FsckRun {
       return n;
     }
     // tag
-    const parsed = parseTagBuffer(content, id);
+    const parsed = parseTagBuffer(content, id, this.format);
     if ("error" in parsed) {
       if (parsed.error) this.error(parsed.error, id);
       return undefined;
@@ -1754,7 +1773,10 @@ class FsckRun {
    * the store: a verified read would mark the copy bad there, and git reads it again as it is.
    */
   private parseVerified(id: string, obj: Whole | undefined): number | undefined {
-    if (obj && objectIdOf(obj.type, obj.content) !== id) {
+    if (
+      obj &&
+      objectIdOf(obj.type, obj.content, this.sha1 ? undefined : this.format.createHasher) !== id
+    ) {
       this.error(`hash mismatch ${id}`, id);
       return undefined;
     }
@@ -1910,7 +1932,7 @@ class FsckRun {
     const t = this.t;
     const type = t.type(n);
     if (type === OBJ_TREE) {
-      const walk = scanTree(content, this.usedTable);
+      const walk = scanTree(content, this.usedTable, this.format);
       this.lastTree = { content, table: walk };
       if (walk.initError) {
         this.error(walk.initError);
@@ -1980,15 +2002,19 @@ class FsckRun {
           (m) => this.error(m),
           found,
           last?.content === content ? last.table : undefined,
+          this.format,
         );
         for (const g of found.gitmodules) this.gitmodulesFound.add(g);
         for (const g of found.gitattributes) this.gitattributesFound.add(g);
         return r;
       }
       case OBJ_COMMIT:
-        return fsckCommit(content, report);
+        return fsckCommit(content, report, this.format);
       case OBJ_TAG:
-        return fsckTag(content, report, { gpgsig: this.o.compatibility !== "2.43" });
+        return fsckTag(content, report, {
+          gpgsig: this.o.compatibility !== "2.43",
+          shape: this.format,
+        });
       default:
         return report("unknownType", `unknown type '${type}' (internal fsck error)`);
     }
@@ -2072,6 +2098,7 @@ class FsckRun {
       }
       const read = await readLooseObject(files, e.path, e.id, {
         bigFileThreshold: this.o.bigFileThreshold,
+        newHasher: this.format.createHasher,
       });
       for (const m of read.errors) this.error(m, e.id);
       if (read.errors.length > 0) this.badCopy.add(e.id);
@@ -2396,7 +2423,7 @@ class FsckRun {
 
   /** git's `fsck_handle_reflog_oid`. */
   private async handleReflogOid(refname: string, id: string, timestamp: number): Promise<void> {
-    if (id === ZERO_ID) return;
+    if (isNullObjectId(id)) return;
     const n = this.t.lookup(id);
     if (n >= 0 && this.t.flags(n) & HAS_OBJ) {
       if (timestamp) this.putName(id, `${refname}@{${timestamp}}`);
@@ -2414,9 +2441,9 @@ class FsckRun {
    */
   private async resolvedId(name: string): Promise<string> {
     try {
-      return (await this.followChain(name, 0))?.id || ZERO_ID;
+      return (await this.followChain(name, 0))?.id || this.format.nullId;
     } catch {
-      return ZERO_ID;
+      return this.format.nullId;
     }
   }
 
@@ -2470,7 +2497,7 @@ class FsckRun {
     for (const name of [...new Set(listed)]) await snapshotRef(name, await this.resolvedId(name));
     for (const wt of await this.worktrees()) {
       const id = await this.headId(wt);
-      if (id && id !== ZERO_ID) await snapshotRef(wt.headName, id);
+      if (id && !isNullObjectId(id)) await snapshotRef(wt.headName, id);
     }
     return snapshot;
   }
@@ -2518,7 +2545,8 @@ class FsckRun {
     const text = (await readText(this.files as FilesApi, pathOf(wt.dir as string, "HEAD")))?.trim();
     if (!text) return undefined;
     if (text.startsWith("ref:")) return (await this.followChain(text.slice(4).trim(), 1))?.id;
-    return OID.test(text.slice(0, 40)) ? text.slice(0, 40) : undefined;
+    const id = text.slice(0, this.format.hexLength);
+    return OID.test(id) ? id : undefined;
   }
 
   /**
@@ -2603,7 +2631,8 @@ class FsckRun {
       )?.trim();
       if (!text) return invalid();
       if (text.startsWith("ref:")) symref = text.slice(4).trim();
-      else if (OID.test(text.slice(0, 40))) id = text.slice(0, 40);
+      else if (OID.test(text.slice(0, this.format.hexLength)))
+        id = text.slice(0, this.format.hexLength);
       else return invalid();
     }
     if (symref !== undefined) {
@@ -2618,10 +2647,10 @@ class FsckRun {
       this.errorsFound |= FSCK_ERROR_REFS;
       this.error(`${name} points to something strange (${target})`);
       // git still takes what HEAD resolves to as a root
-      if (id && id !== ZERO_ID) await this.handleRef(name, id);
+      if (id && !isNullObjectId(id)) await this.handleRef(name, id);
       return;
     }
-    if (!id || id === ZERO_ID) {
+    if (!id || isNullObjectId(id)) {
       if (target === undefined) {
         this.errorsFound |= FSCK_ERROR_REFS;
         this.error(`${name}: detached HEAD points at nothing`);
@@ -2660,7 +2689,7 @@ class FsckRun {
         logs.push({
           name: prefix + f.name,
           path: pathOf(base, f.name),
-          entries: parseReflog(await readText(files, f.path)),
+          entries: parseReflog(await readText(files, f.path), this.format.hexLength),
         });
       }
     };
@@ -2720,6 +2749,8 @@ class FsckRun {
     for (const wt of await this.worktrees()) {
       const indexPath = pathOf(wt.dir as string, "index");
       if ((await files.stats(indexPath))?.kind !== "file") continue;
+      // a SHA-256 repository's index (32-byte ids) is not read yet
+      assertSha1ObjectFormat(this.format, "the index file");
       // a split index merged with its shared index, a sparse index expanded (repo_read_index)
       let read: Awaited<ReturnType<typeof readIndexFileEntries>>;
       try {
@@ -2906,12 +2937,13 @@ class FsckRun {
       // the entries as `scanTree` decodes them, for a tree it decodes without an error (any
       // other is left to the walk, which reports it)
       const len = content.length;
-      if (len > 0 && (len < 23 || content[len - 21] !== 0)) return true;
-      if (!this.reserveScanKids(1 + Math.floor(len / 23))) return false;
+      const raw = this.format.rawLength;
+      if (len > 0 && (len < raw + 3 || content[len - raw - 1] !== 0)) return true;
+      if (!this.reserveScanKids(1 + Math.floor(len / (raw + 3)))) return false;
       const kids = this.scanKids;
       let p = 0;
       while (p < len) {
-        if (len - p < 23 || content[p] === 0x20) return true;
+        if (len - p < raw + 3 || content[p] === 0x20) return true;
         let mode = 0;
         for (;;) {
           const c = content[p++] as number;
@@ -2921,9 +2953,9 @@ class FsckRun {
         }
         if (content[p] === 0) return true;
         while (p < len && content[p] !== 0) p++;
-        if (p + 21 > len) return true;
+        if (p + 1 + raw > len) return true;
         const idAt = p + 1;
-        p = idAt + 20;
+        p = idAt + raw;
         const format = mode & 0o170000;
         // gitlinks are not walked (canon_mode makes every other format one)
         if (format !== 0o100000 && format !== 0o120000 && format !== 0o040000) continue;
@@ -2932,7 +2964,7 @@ class FsckRun {
         kids[at++] = (c << 1) | (format === 0o040000 ? 1 : 0);
       }
     } else {
-      const parsed = parseCommitLinks(content, "");
+      const parsed = parseCommitLinks(content, "", this.format);
       if ("error" in parsed) return true;
       if (!this.reserveScanKids(2 + parsed.parents.length)) return false;
       const kids = this.scanKids;
@@ -3095,7 +3127,7 @@ class FsckRun {
           return;
         }
         t.addFlags(n, PARSED);
-        const walk = scanTree(obj.content, this.walkTable);
+        const walk = scanTree(obj.content, this.walkTable, this.format);
         if (walk.initError) {
           this.error(walk.initError);
           return;
@@ -3368,14 +3400,14 @@ async function readText(files: FilesApi, path: string): Promise<string | undefin
 }
 
 /** The entries of a reflog file, oldest first: old id, new id and the entry's timestamp. */
-function parseReflog(text: string | undefined): Reflog["entries"] {
+function parseReflog(text: string | undefined, hex = 40): Reflog["entries"] {
   const entries: Reflog["entries"] = [];
   for (const line of text?.split("\n") ?? []) {
-    const oldId = line.slice(0, 40);
-    const newId = line.slice(41, 81);
+    const oldId = line.slice(0, hex);
+    const newId = line.slice(hex + 1, 2 * hex + 1);
     if (!OID.test(oldId) || !OID.test(newId)) continue;
     const tab = line.indexOf("\t");
-    const ident = tab < 0 ? line.slice(82) : line.slice(82, tab);
+    const ident = tab < 0 ? line.slice(2 * hex + 2) : line.slice(2 * hex + 2, tab);
     const m = /> (\d+) [+-]\d{4}$/.exec(ident);
     entries.push({ oldId, newId, timestamp: m ? Number(m[1]) : 0 });
   }

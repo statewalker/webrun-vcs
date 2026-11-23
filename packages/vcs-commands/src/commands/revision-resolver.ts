@@ -37,8 +37,9 @@ import {
   isValidRefName,
   listObjectsWithPrefix,
   MINIMUM_ABBREV_LENGTH,
+  objectFormatOf,
 } from "@statewalker/vcs-core";
-import { compilePosixRegex, parseGitBool } from "@statewalker/vcs-utils";
+import { compilePosixRegex, isNullObjectId, parseGitBool } from "@statewalker/vcs-utils";
 import type { Staging, WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { RevisionError } from "../errors/index.js";
@@ -69,7 +70,7 @@ export interface RevisionSources {
    * The object store, for abbreviated ids (its `listPrefix`, else `list`); without it the
    * typed stores' `keys()` are listed
    */
-  objects?: Pick<GitObjects, "list" | "listPrefix">;
+  objects?: Pick<GitObjects, "list" | "listPrefix" | "objectFormat">;
   /**
    * The lengths git abbreviates ids to (`repo_find_unique_abbrev` with `core.abbrev`), for
    * the candidates of an ambiguous short id; 7 digits without it
@@ -123,8 +124,7 @@ type ShortOid =
 const HEX_DIGIT = /^[0-9a-fA-F]$/;
 const isHexDigit = (c: string | undefined) => c !== undefined && HEX_DIGIT.test(c);
 
-const ZERO_ID = "0000000000000000000000000000000000000000";
-const HEX_ID = /^[0-9a-fA-F]{40}$/;
+const HEX_DIGITS = /^[0-9a-fA-F]+$/;
 
 /** git's `object_name_msg` advice after a 40-hex name that is also a ref. */
 const OBJECT_NAME_ADVICE = [
@@ -193,7 +193,17 @@ export class RevisionResolver {
   constructor(
     private readonly sources: RevisionSources,
     private readonly now: () => number = () => Math.floor(Date.now() / 1000),
-  ) {}
+  ) {
+    this.hexLength = objectFormatOf(sources.objects).hexLength;
+  }
+
+  /** The repository's full hex id length: 40, or 64 in a SHA-256 repository (git's hexsz) */
+  private readonly hexLength: number;
+
+  /** Whether `str` is a full hex object id of the repository's format, in any case */
+  private isFullHex(str: string): boolean {
+    return str.length === this.hexLength && HEX_DIGITS.test(str);
+  }
 
   /**
    * The object `name` names, or undefined when it names none (git's `unknown revision`).
@@ -456,7 +466,7 @@ export class RevisionResolver {
    * object or not), a ref, `<ref>@{<n>|<date>}`, `@{-N}`.
    */
   private async basic(str: string, flags: ResolveOptions = {}): Promise<ObjectId | undefined> {
-    if (HEX_ID.test(str)) {
+    if (this.isFullHex(str)) {
       // warn_on_object_refname_ambiguity: a ref spelled as the 40-hex
       if (this.warnAmbiguousRefs() && (await this.dwimRefAll(str)).length > 0) {
         this.warnings.push(`warning: refname '${str}' is ambiguous.`);
@@ -492,7 +502,7 @@ export class RevisionResolver {
 
     if (nthPrior) {
       const prior = await this.nthPriorCheckout(base);
-      if (typeof prior === "object" && HEX_ID.test(prior.value)) {
+      if (typeof prior === "object" && this.isFullHex(prior.value)) {
         return (await this.objectType(prior.value.toLowerCase()))
           ? prior.value.toLowerCase()
           : undefined;
@@ -539,7 +549,7 @@ export class RevisionResolver {
             `warning: log for '${shown}' only goes back to ${formatRfc2822Date(read.cutoffTime, read.cutoffTz)}`,
           );
         }
-      } else if (!(nth === read.cutoffCount && read.id !== ZERO_ID)) {
+      } else if (!(nth === read.cutoffCount && !isNullObjectId(read.id))) {
         throw this.fatal(str, `log for '${shown}' only has ${read.cutoffCount} entries`);
       }
     }
@@ -565,14 +575,14 @@ export class RevisionResolver {
     const log = await this.sources.refs.getReflog?.(ref);
     const entries = log ? await log.getReverseEntries() : [];
     let cnt = nth;
-    let ooid = ZERO_ID;
+    let ooid: ObjectId | undefined;
     let reccnt = 0;
     let id = current;
     for (const entry of entries) {
       const timestamp = entry.who.timestamp;
       if (timestamp <= atTime || cnt === 0) {
         const date = formatRfc2822Date(timestamp, entry.who.tzOffset);
-        if (ooid !== ZERO_ID) {
+        if (ooid !== undefined && !isNullObjectId(ooid)) {
           id = entry.newId;
           if (ooid !== entry.newId) {
             this.warnings.push(`warning: log for ref ${ref} has gap after ${date}`);
@@ -603,7 +613,7 @@ export class RevisionResolver {
     const oldest = entries[entries.length - 1];
     if (!oldest) throw this.fatal(ref, `log for ${ref} is empty`);
     id = oldest.oldId;
-    if (atTime && id === ZERO_ID) id = oldest.newId;
+    if (atTime && isNullObjectId(id)) id = oldest.newId;
     return {
       id,
       missing: true,
@@ -998,7 +1008,7 @@ export class RevisionResolver {
   // ------------------------------------------------------------------ short ids
 
   /**
-   * git's `get_short_oid`: the one stored object whose id starts with `name` (4 to 40 hex
+   * git's `get_short_oid`: the one stored object whose id starts with `name` (4 to 40 hex, 64 in a SHA-256 repository,
    * digits, any case). Of several, the one the hint (`flags.hint`, else `core.disambiguate`)
    * accepts, when it accepts exactly one. An ambiguity is reported, unless quiet, as git
    * reports it: `error: short object ID <prefix> is ambiguous` and `hint:` lines listing the
@@ -1006,7 +1016,11 @@ export class RevisionResolver {
    * when it accepts several.
    */
   private async shortOid(name: string, flags: ResolveOptions = {}): Promise<ShortOid> {
-    if (name.length < MINIMUM_ABBREV_LENGTH || name.length > 40 || !/^[0-9a-fA-F]+$/.test(name)) {
+    if (
+      name.length < MINIMUM_ABBREV_LENGTH ||
+      name.length > this.hexLength ||
+      !HEX_DIGITS.test(name)
+    ) {
       return { status: "invalid" };
     }
     const prefix = name.toLowerCase();
