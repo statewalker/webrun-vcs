@@ -5,7 +5,7 @@
  * native git's tables are vcs-commands' `reftable-read-git3-native.test.ts`.
  */
 import { deflateSync } from "node:zlib";
-import { createInMemoryFilesApi, isSymbolicRef } from "@statewalker/vcs-core";
+import { createInMemoryFilesApi, type FilesApi, isSymbolicRef } from "@statewalker/vcs-core";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -837,3 +837,98 @@ async function readAll(files: ReturnType<typeof createInMemoryFilesApi>, path: s
   for await (const chunk of files.read(path)) chunks.push(chunk);
   return Buffer.concat(chunks);
 }
+
+describe("a stack read while a compaction deletes its tables (webrun-vcs#232)", () => {
+  const older = {
+    minUpdateIndex: 1,
+    maxUpdateIndex: 1,
+    refs: [{ name: "refs/heads/a", updateIndex: 1, id: A }],
+  } satisfies FixtureTable;
+  const newer = {
+    minUpdateIndex: 2,
+    maxUpdateIndex: 2,
+    refs: [{ name: "refs/heads/b", updateIndex: 2, id: B }],
+  } satisfies FixtureTable;
+  const merged = {
+    minUpdateIndex: 1,
+    maxUpdateIndex: 2,
+    refs: [
+      { name: "refs/heads/a", updateIndex: 1, id: A },
+      { name: "refs/heads/b", updateIndex: 2, id: B },
+    ],
+  } satisfies FixtureTable;
+  const listOf = (...names: string[]) =>
+    new TextEncoder().encode(names.map((n) => `${n}\n`).join(""));
+
+  /** `files`, running `between(path)` once a table at `path` was stated, before it is read. */
+  function deletingBetweenStatAndRead(
+    files: FilesApi,
+    between: (path: string) => Promise<void>,
+  ): FilesApi {
+    const stated = new Set<string>();
+    return new Proxy(files, {
+      get(target, property, receiver) {
+        if (property === "stats") {
+          return async (path: string) => {
+            const stats = await target.stats(path);
+            if (path.endsWith(".ref") && stats) stated.add(path);
+            return stats;
+          };
+        }
+        if (property === "read") {
+          return (path: string, options?: unknown) =>
+            (async function* () {
+              if (stated.delete(path)) await between(path);
+              yield* target.read(path, options as never);
+            })();
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }
+
+  it("reloads tables.list when a table it named is deleted between its stat and its read", async () => {
+    const memory = await repository({ "0x01-0x01-aa.ref": older, "0x02-0x02-bb.ref": newer });
+    let compactions = 0;
+    const files = deletingBetweenStatAndRead(memory, async (path) => {
+      if (!path.endsWith("0x01-0x01-aa.ref") || compactions++ > 0) return;
+      // a concurrent compaction: the merged table listed, both old tables removed
+      await memory.write(".git/reftable/0x01-0x02-cc.ref", [buildReftable(merged).bytes]);
+      await memory.write(".git/reftable/tables.list", [listOf("0x01-0x02-cc.ref")]);
+      await memory.remove(".git/reftable/0x01-0x01-aa.ref");
+      await memory.remove(".git/reftable/0x02-0x02-bb.ref");
+    });
+    const view = await createReftableStackReader(files, ".git/reftable").read();
+    expect(compactions).toBe(1);
+    expect(view.tables).toEqual(["0x01-0x02-cc.ref"]);
+    expect([...view.refs()].map((r) => r.name)).toEqual(["refs/heads/a", "refs/heads/b"]);
+  });
+
+  it("fails as git does when a table stays missing while tables.list is unchanged", async () => {
+    const memory = await repository({ "0x01-0x01-aa.ref": older, "0x02-0x02-bb.ref": newer });
+    const files = deletingBetweenStatAndRead(memory, async (path) => {
+      if (path.endsWith("0x02-0x02-bb.ref")) await memory.remove(path);
+    });
+    const read = createReftableStackReader(files, ".git/reftable").read();
+    await expect(read).rejects.toBeInstanceOf(ReftableFormatError);
+    await expect(read).rejects.toThrow(/table '0x02-0x02-bb\.ref' is missing/);
+    await expect(read).rejects.not.toThrow(/truncated/);
+  });
+
+  it("gives up past its deadline when tables.list keeps changing", async () => {
+    const memory = await repository({ "0x01-0x01-aa.ref": older });
+    let round = 0;
+    const files = deletingBetweenStatAndRead(memory, async (path) => {
+      // every read finds its table compacted into a new one, itself gone before it is read
+      round++;
+      const next = `0x01-0x01-${String(round).padStart(4, "0")}.ref`;
+      await memory.write(`.git/reftable/${next}`, [buildReftable(older).bytes]);
+      await memory.write(".git/reftable/tables.list", [listOf(next)]);
+      await memory.remove(path);
+    });
+    const read = createReftableStackReader(files, ".git/reftable", undefined, 20).read();
+    await expect(read).rejects.toThrow(/kept changing/);
+    expect(round).toBeGreaterThan(3);
+  });
+});

@@ -2530,8 +2530,10 @@ class FsckRun {
 
   /** What a worktree's HEAD resolves to, if anything (within git's 5 reads, HEAD's included). */
   private async headId(wt: WorktreeState): Promise<string | undefined> {
-    if (wt.current) {
-      const head = await this.repositoryRefs().get("HEAD");
+    // a reftable repository keeps a linked worktree's HEAD in that worktree's stack (its
+    // `HEAD` file is git's `ref: refs/heads/.invalid` stub), read as `worktrees/<id>/HEAD`
+    if (wt.current || this.isReftable()) {
+      const head = await this.repositoryRefs().get(wt.headName);
       if (!head) return undefined;
       if (!isSymbolicRef(head)) return head.objectId;
       return (await this.followChain(head.target, 1))?.id;
@@ -2555,6 +2557,10 @@ class FsckRun {
       }
       if (logName.startsWith("worktrees/")) {
         if (!wt.dir || !logName.endsWith("/HEAD") || logName.split("/").length !== 3) return false;
+        if (this.isReftable()) {
+          const head = await this.repositoryRefs().get(logName);
+          return !!head && isSymbolicRef(head) && !(await this.followChain(head.target, 1));
+        }
         const text = (await readText(this.files as FilesApi, pathOf(wt.dir, "HEAD")))?.trim();
         return !!text?.startsWith("ref:") && !(await this.followChain(text.slice(4).trim(), 1));
       }
@@ -2572,6 +2578,11 @@ class FsckRun {
   private repositoryRefs(): Refs {
     const refs = this.stores.refs as Refs & { repositoryStore?(): Refs };
     return refs.repositoryStore?.() ?? refs;
+  }
+
+  /** Whether the refs are a reftable store (whose linked worktrees' HEADs are in their stacks). */
+  private isReftable(): boolean {
+    return "reflogNames" in this.stores.refs;
   }
 
   /** The main worktree, then the linked ones (`.git/worktrees/<id>`). */
@@ -2629,7 +2640,7 @@ class FsckRun {
       if (!head) return invalid();
       if (isSymbolicRef(head)) symref = head.target;
       else id = head.objectId;
-    } else if ("reflogNames" in this.stores.refs) {
+    } else if (this.isReftable()) {
       // a reftable repository: the linked worktree's HEAD is in its own stack
       const head = await this.repositoryRefs().get(name);
       if (!head) return invalid();
