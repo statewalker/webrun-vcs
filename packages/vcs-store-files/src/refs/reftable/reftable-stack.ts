@@ -39,6 +39,8 @@ import {
 export interface ReftableView {
   /** The table names, oldest first (`tables.list`) */
   readonly tables: readonly string[];
+  /** The opened tables, oldest first (what a writer compacts and numbers after) */
+  readonly parts: readonly ReftableTable[];
   /** The ref's newest record, undefined when that is a deletion or there is none */
   getRef(name: string): ReftableRefRecord | undefined;
   /** The refs whose name starts with `prefix` and whose newest record is not a deletion, in name (byte) order */
@@ -47,6 +49,8 @@ export interface ReftableView {
   logs(refName: string): Generator<ReftableLogRecord>;
   /** Whether git's reflog_exists holds: a log record of the ref that is not a deletion */
   hasLogs(refName: string): boolean;
+  /** The names that have log records in some table (deleted ones included), in byte order */
+  logNames(): string[];
 }
 
 /** Reads a stack directory into its merged view. */
@@ -161,7 +165,7 @@ export function createReftableStackReader(
  * sorts before `b`'s, `same` whether the keys are equal. Each record is yielded before any
  * iterator moves on, so a lazy record can still be read.
  */
-function* mergeByHeap<T>(
+export function* mergeByHeap<T>(
   iterators: Iterator<T>[],
   before: (a: T, b: T) => boolean,
   same: (a: T, b: T) => boolean,
@@ -252,9 +256,23 @@ export function mergeReftables(tables: readonly ReftableTable[]): ReftableView {
 
   return {
     tables: tables.map((t) => t.name),
+    parts: tables,
     getRef,
     refs,
     logs,
     hasLogs: (refName) => !logs(refName).next().done,
+    logNames: () => {
+      const budget = new ReftableReadBudget();
+      const names = new Map<string, Uint8Array>();
+      for (const t of tables) {
+        let last = "";
+        for (const head of t.logHeads(undefined, budget)) {
+          if (head.refName === last) continue;
+          last = head.refName;
+          names.set(head.refName, head.refKey);
+        }
+      }
+      return [...names.values()].sort(compareKeys).map((k) => new TextDecoder().decode(k));
+    },
   };
 }

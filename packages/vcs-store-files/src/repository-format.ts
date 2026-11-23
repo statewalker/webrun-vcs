@@ -14,9 +14,9 @@
  * compatibility object format (`extensions.compatObjectFormat`). A SHA-256 repository
  * (`extensions.objectFormat = sha256`) opens: its objects, refs and reflogs are read and
  * written with 32-byte ids; what has no SHA-256 path yet (pack files, the index file, the
- * commit-graph, the transports) refuses with `UnsupportedObjectFormatError`. The reftable ref storage (`extensions.refStorage =
- * reftable`) is read; its writes are refused by its ref store (`ReftableRefStore`), and so is
- * deleting objects there (`assertObjectsDeletable`: gc's reachability reads reflogs as files).
+ * commit-graph, reftable tables, the transports) refuses with `UnsupportedObjectFormatError`.
+ * The reftable ref storage (`extensions.refStorage = reftable`) is read and written by its ref
+ * store (`ReftableRefStore`).
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
@@ -27,8 +27,6 @@ import {
   objectFormatByName,
   SHA1_OBJECT_FORMAT,
 } from "@statewalker/vcs-utils/hash";
-
-import { ReftableWriteUnsupportedError } from "./refs/reftable/index.js";
 
 import {
   configFilesApiOf,
@@ -57,8 +55,7 @@ export interface RepositoryFormat {
   relativeWorktrees: boolean;
   /**
    * `extensions.refStorage` (version 1): `files` (loose refs and packed-refs, the default) or
-   * `reftable` (`.git/reftable/`, read only here: writes refuse with
-   * `ReftableWriteUnsupportedError`)
+   * `reftable` (`.git/reftable/`, `ReftableRefStore`)
    */
   refStorage: "files" | "reftable";
   /**
@@ -252,8 +249,7 @@ export async function readRepositoryFormat(
  * Refuses to delete objects where the repository format forbids it: `preciousObjects` (git's
  * "cannot prune in a precious-objects repo") and partial clones, whose absent objects a
  * promisor remote provides, unless `partialClone: "allow"` (gc and repack, which keep the
- * promisor packs apart as git does; a bare prune does not), and reftable repositories
- * (`ReftableWriteUnsupportedError`: the reachability walks read reflogs as files). `operation`
+ * promisor packs apart as git does; a bare prune does not). `operation`
  * names what was asked ("prune", "repack", "gc").
  *
  * @example
@@ -266,11 +262,6 @@ export function assertObjectsDeletable(
   operation: string,
   options: { partialClone?: "refuse" | "allow" } = {},
 ): void {
-  if (format.refStorage === "reftable") {
-    // the reachability walks read reflogs and per-worktree refs as files: in a reftable
-    // repository they would miss what only the reftable reflogs keep
-    throw new ReftableWriteUnsupportedError();
-  }
   // the reachability walks, repack and prune read packs, the index and reflogs as SHA-1 ids
   assertSha1ObjectFormat(format.objectFormat, operation);
   if (format.preciousObjects) {

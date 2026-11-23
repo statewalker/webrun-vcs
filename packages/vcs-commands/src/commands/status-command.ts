@@ -312,11 +312,6 @@ export async function readSubmoduleDirt(
  * ```
  */
 export class StatusCommand extends GitCommand<Status> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private paths: string[] = [];
   /** The pathspec of the running status (git's `s->pathspec`), parsed from `paths` */
   private pathspec: PathspecItem[] = [];

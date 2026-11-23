@@ -29,7 +29,11 @@ import {
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
-import { type ObjectFormat, UnsupportedObjectFormatError } from "@statewalker/vcs-utils/hash";
+import {
+  type ObjectFormat,
+  SHA1_OBJECT_FORMAT,
+  UnsupportedObjectFormatError,
+} from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { openObjectAlternates, withAlternates } from "./alternates/index.js";
 import { createFilesCommitGraphProvider } from "./commit-graph.js";
@@ -47,8 +51,8 @@ import {
   createReftableRefStore,
   type FileRefStore,
   peelTag,
-  ReftableRefStore,
-  ReftableWriteUnsupportedError,
+  type ReftableRefStore,
+  type ReftableStackWriteOptions,
 } from "./refs/index.js";
 import { repack } from "./repack.js";
 import { readRepositoryFormat } from "./repository-format.js";
@@ -79,6 +83,12 @@ export interface GitFilesBackendOptions {
   objectFormat?: ObjectFormat;
   /** Default branch name when creating a new repository (default: "main") */
   defaultBranch?: string;
+  /**
+   * The ref storage of a repository created here (`create`): `files` (the default) or
+   * `reftable` (`extensions.refStorage`, the refs in `<git dir>/reftable`, as `git init
+   * --ref-format=reftable` lays them out)
+   */
+  refFormat?: "files" | "reftable";
   /**
    * Lock-file primitives rooted at the `.git` directory, for atomic ref batches.
    * Defaults to `atomicFilesOver(files, ".git")`: cross-process when the FilesApi has
@@ -219,7 +229,7 @@ export async function createGitFilesBackend(
   // object format, an unknown v1 extension) is refused before anything is read or written.
   // Like git's read_repository_format it reads the config file alone, without includes.
   const format = await readRepositoryFormat(files, gitDir);
-  if (format.refStorage === "reftable" && create) throw new ReftableWriteUnsupportedError();
+  const refStorage = create && options.refFormat === "reftable" ? "reftable" : format.refStorage;
   // the hash naming the objects (`extensions.objectFormat`): SHA-1, or SHA-256 (whose packs
   // are not read yet: a SHA-256 repository holding packs is refused here)
   const objectFormat = options.objectFormat ?? format.objectFormat;
@@ -230,6 +240,10 @@ export async function createGitFilesBackend(
     );
   }
   await assertNoPacksInFormat(files, packDir, objectFormat);
+  // a SHA-256 reftable (hash id `s256`) is neither read nor written yet
+  if (objectFormat.name !== "sha1" && refStorage === "reftable") {
+    throw new UnsupportedObjectFormatError("reftable refs", objectFormat.name);
+  }
   const includes = options.configIncludes === undefined ? {} : { includes: options.configIncludes };
   // the settings read below come from git's whole sequence (system, global, the repository's
   // file, config.worktree, the command line), as git's repo_config reads them; only the
@@ -240,7 +254,7 @@ export async function createGitFilesBackend(
   };
 
   if (create) {
-    await createGitDirectoryStructure(files, gitDir, objectsDir, objectFormat);
+    await createGitDirectoryStructure(files, gitDir, objectsDir, refStorage, objectFormat);
   }
 
   // Objects: the installed packs first, then the kernel over git's loose layout
@@ -340,11 +354,18 @@ export async function createGitFilesBackend(
       freshenMaxAgeMs,
     });
   const reflog = readRefStoreConfig(settingsConfig);
-  // a reftable repository's refs are read from `<git dir>/reftable` (writes refused); a files
-  // repository's from loose refs and packed-refs
+  // a reftable repository's refs are in `<git dir>/reftable`; a files repository's are loose
+  // refs and packed-refs
   const refStore: FileRefStore | ReftableRefStore =
-    format.refStorage === "reftable"
-      ? createReftableRefStore({ files, gitDir })
+    refStorage === "reftable"
+      ? createReftableRefStore({
+          files,
+          gitDir,
+          write: readReftableWriteOptions(settingsConfig, options.environment),
+          logAllRefUpdates: options.logAllRefUpdates ?? reflog.logAllRefUpdates,
+          reflogIdentity: options.reflogIdentity ?? reflog.identity,
+          peel: (id) => peelTag(objects, id),
+        })
       : createFileRefStore(files, gitDir, {
           atomicFiles: options.atomicFiles,
           refLockTimeoutMs: options.refLockTimeoutMs ?? reflog.refLockTimeoutMs,
@@ -386,9 +407,7 @@ export async function createGitFilesBackend(
               }
             : {}),
         });
-  // (a reftable store never writes)
-  if (!(refStore instanceof ReftableRefStore))
-    invalidateOnCompatibilityChange(refStore, commitGraph);
+  invalidateOnCompatibilityChange(refStore, commitGraph);
   // an alternate linked later (clone --shared, --reference, each one added or re-read) may
   // bring a graph or the layers a chain builds on
   alternates?.onChange(() => commitGraph.invalidate());
@@ -408,7 +427,10 @@ export async function createGitFilesBackend(
  * next walk loads it again (or finds it unusable). Changes made by another process (native
  * `git replace`, a `git fetch --depth`) are not seen until `commitGraph.invalidate()`.
  */
-function invalidateOnCompatibilityChange(refs: FileRefStore, commitGraph: CommitGraphProvider) {
+function invalidateOnCompatibilityChange(
+  refs: FileRefStore | ReftableRefStore,
+  commitGraph: CommitGraphProvider,
+) {
   const replace = (name: string) => name.startsWith("refs/replace/");
   const after = async <T>(change: Promise<T>, touches: boolean): Promise<T> => {
     try {
@@ -471,25 +493,82 @@ async function createGitDirectoryStructure(
   files: FilesApi,
   gitDir: string,
   objectsDir: string,
-  objectFormat: ObjectFormat,
+  refStorage: "files" | "reftable" = "files",
+  objectFormat: ObjectFormat = SHA1_OBJECT_FORMAT,
 ): Promise<void> {
   await files.mkdir(gitDir);
   await files.mkdir(objectsDir);
   await files.mkdir(joinPath(objectsDir, "pack"));
   await files.mkdir(joinPath(gitDir, "refs"));
+  const encoder = new TextEncoder();
+  const bare = gitDir === "." ? "true" : "false";
+  if (refStorage === "reftable") {
+    // git's layout for older gits (refs.c refs_init_db / setup.c): HEAD naming an invalid
+    // branch, `refs/heads` a file, so that a git without reftable support refuses the
+    // repository instead of reading it as an empty one
+    await files.write(joinPath(gitDir, "refs", "heads"), [
+      encoder.encode("this repository uses the reftable format\n"),
+    ]);
+    await files.write(joinPath(gitDir, "HEAD"), [encoder.encode("ref: refs/heads/.invalid\n")]);
+    await files.mkdir(joinPath(gitDir, "reftable"));
+    await files.write(joinPath(gitDir, "config"), [
+      encoder.encode(
+        `[extensions]\n\trefstorage = reftable\n[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = ${bare}\n`,
+      ),
+    ]);
+    return;
+  }
   await files.mkdir(joinPath(gitDir, "refs", "heads"));
   await files.mkdir(joinPath(gitDir, "refs", "tags"));
 
-  const encoder = new TextEncoder();
   // a SHA-256 repository is version 1 with `extensions.objectformat` (git's
   // initialize_repository_version)
   const sha1 = objectFormat.name === "sha1";
   await files.write(joinPath(gitDir, "config"), [
     encoder.encode(
-      `[core]\n\trepositoryformatversion = ${sha1 ? 0 : 1}\n\tfilemode = true\n\tbare = ${gitDir === "." ? "true" : "false"}\n` +
+      `[core]\n\trepositoryformatversion = ${sha1 ? 0 : 1}\n\tfilemode = true\n\tbare = ${bare}\n` +
         (sha1 ? "" : `[extensions]\n\tobjectformat = ${objectFormat.name}\n`),
     ),
   ]);
+}
+
+/**
+ * git's reftable write options from the config (refs/reftable-backend.c reftable_be_config):
+ * `reftable.blockSize`, `restartInterval`, `indexObjects`, `geometricFactor`,
+ * `lockTimeout` (100 ms by default); `$GIT_TEST_REFTABLE_AUTOCOMPACTION` turns compaction off.
+ */
+export function readReftableWriteOptions(
+  config: Pick<GitWorkingCopyConfig, "get">,
+  environment?: GitHostEnvironment,
+): ReftableStackWriteOptions {
+  const int = (key: string) => parseConfigInt(config.get(key));
+  const blockSize = int("reftable.blockSize");
+  if (blockSize !== undefined && blockSize > 16777215) {
+    throw new Error("reftable block size cannot exceed 16MB");
+  }
+  const restartInterval = int("reftable.restartInterval");
+  if (restartInterval !== undefined && restartInterval > 65535) {
+    throw new Error("reftable block size cannot exceed 65535");
+  }
+  const indexObjects = config.get("reftable.indexObjects");
+  const geometricFactor = int("reftable.geometricFactor");
+  if (geometricFactor !== undefined && geometricFactor > 255) {
+    throw new Error("reftable geometric factor cannot exceed 255");
+  }
+  const lockTimeoutMs = int("reftable.lockTimeout");
+  if (lockTimeoutMs !== undefined && lockTimeoutMs < 0 && lockTimeoutMs !== -1) {
+    throw new Error("reftable lock timeout does not support negative values other than -1");
+  }
+  return {
+    ...(blockSize ? { blockSize } : {}),
+    ...(restartInterval ? { restartInterval } : {}),
+    ...(indexObjects !== undefined && parseGitBool(indexObjects) === false
+      ? { indexObjects: false }
+      : {}),
+    ...(geometricFactor ? { geometricFactor } : {}),
+    lockTimeoutMs: lockTimeoutMs ?? 100,
+    ...(environment?.reftableAutoCompaction === false ? { autoCompaction: false } : {}),
+  };
 }
 
 /**

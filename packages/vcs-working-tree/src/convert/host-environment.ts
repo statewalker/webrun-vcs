@@ -105,6 +105,16 @@ export interface GitHostEnvironment {
    */
   indexVersion?: string;
   /**
+   * `$GIT_DEFAULT_REF_FORMAT` as given: the ref storage of a new repository (`files` or
+   * `reftable`), before `init.defaultRefFormat` (setup.c `repo_default_ref_format`)
+   */
+  defaultRefFormat?: string;
+  /**
+   * `$GIT_TEST_REFTABLE_AUTOCOMPACTION` as a boolean: false turns off the reftable stack's
+   * compaction after each write (git's test knob; default true)
+   */
+  reftableAutoCompaction?: boolean;
+  /**
    * `$GIT_PROTOCOL_FROM_USER` as a boolean (git's `git_env_bool`, default true): whether
    * transports whose `protocol.<name>.allow` is `user` may be used (false when git runs a
    * command on the user's behalf, as for submodules)

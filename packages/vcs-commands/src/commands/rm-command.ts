@@ -69,11 +69,6 @@ export interface RmResult {
  * ```
  */
 export class RmCommand extends GitCommand<RmResult> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private filepatterns: string[] = [];
   private cached = false;
   private sparse = false;

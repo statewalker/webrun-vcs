@@ -454,6 +454,14 @@ export function createNodeGitHostEnvironment(
     ...(env.GIT_DEFAULT_HASH !== undefined ? { defaultHash: env.GIT_DEFAULT_HASH } : {}),
     // the version of a new index (get_index_format_default), as given
     ...(env.GIT_INDEX_VERSION !== undefined ? { indexVersion: env.GIT_INDEX_VERSION } : {}),
+    ...(env.GIT_DEFAULT_REF_FORMAT !== undefined
+      ? { defaultRefFormat: env.GIT_DEFAULT_REF_FORMAT }
+      : {}),
+    ...(env.GIT_TEST_REFTABLE_AUTOCOMPACTION !== undefined
+      ? {
+          reftableAutoCompaction: !/^(false|no|off|0)$/i.test(env.GIT_TEST_REFTABLE_AUTOCOMPACTION),
+        }
+      : {}),
     // git_env_bool("GIT_PROTOCOL_FROM_USER", 1)
     ...(env.GIT_PROTOCOL_FROM_USER !== undefined
       ? { protocolFromUser: envBool(env.GIT_PROTOCOL_FROM_USER) }

@@ -48,11 +48,6 @@ export type WorktreeListFormat = "default" | "verbose" | "porcelain";
  * `setLegacyColumns(true)` gives older git's (paths as they are, two spaces).
  */
 export class WorktreeListCommand extends GitCommand<WorktreeListResult> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private format: WorktreeListFormat = "default";
   private nul = false;
   private expire: WorktreeExpiry = Number.POSITIVE_INFINITY;

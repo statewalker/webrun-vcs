@@ -48,7 +48,6 @@ import { readIndexFileEntries } from "@statewalker/vcs-working-tree";
 
 import {
   createFileRefStore,
-  createReftableRefStore,
   createWorktreeRefs,
   peelTag,
   ReftableRefStore,
@@ -293,8 +292,12 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     let refs = this.refsByDir.get(gitDir);
     if (!refs && this.history.refs instanceof ReftableRefStore) {
       // a reftable repository: the worktree's own stack (worktrees/<id>/reftable) over the
-      // repository's
-      refs = createReftableRefStore({ files: this.files, gitDir, commonDir: this.commonDir });
+      // repository's, under the worktree's reflog setting
+      const { logAllRefUpdates, identity } = await this.reflogSettings();
+      refs = this.history.refs.forGitDir(gitDir, {
+        logAllRefUpdates,
+        ...(identity ? { reflogIdentity: identity } : {}),
+      });
       this.refsByDir.set(gitDir, refs);
     }
     if (!refs) {
@@ -614,8 +617,25 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       await this.writeText(`${admin}/gitdir`, `${this.paths.hostPath(`${path}/.git`)}\n`);
       await this.writeText(`${path}/.git`, `gitdir: ${this.paths.hostPath(admin)}\n`);
       const head = "id" in options.head ? options.head.id : `ref: ${options.head.ref}`;
-      await this.writeText(`${admin}/HEAD`, `${head}\n`);
+      const reftable = this.history.refs instanceof ReftableRefStore;
+      // a reftable repository: HEAD and `refs/heads` are stubs for older gits, the worktree's
+      // HEAD goes into its own stack (worktrees/<id>/reftable), logged there
+      await this.writeText(`${admin}/HEAD`, reftable ? "ref: refs/heads/.invalid\n" : `${head}\n`);
       await this.writeText(`${admin}/commondir`, "../..\n");
+      if (reftable) {
+        await this.writeText(`${admin}/refs/heads`, "this repository uses the reftable format\n");
+        const refs = await this.refsOfDir(admin);
+        const settings = await this.reflogSettings();
+        const callerLogs =
+          this.gitDir === this.commonDir ? settings.repositoryDefault : settings.logAllRefUpdates;
+        const log =
+          callerLogs !== false
+            ? { message: "", ...(options.ident ? { ident: options.ident } : {}) }
+            : undefined;
+        if ("id" in options.head) await refs.set("HEAD", options.head.id, log);
+        else await refs.setSymbolic("HEAD", options.head.ref, log);
+        return created;
+      }
       // update-ref / symbolic-ref log the new HEAD: no message, from the zero id. git 2.5x
       // writes it in the calling process, so the calling repository's core.logAllRefUpdates
       // default decides: from a bare repository itself (no setting) nothing is logged, from
@@ -897,6 +917,11 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
   ): Promise<void> {
     const gitDir = entry.id === undefined ? this.commonDir : this.adminDir(entry.id);
     const refs = await this.refsOfDir(gitDir);
+    if (refs instanceof ReftableRefStore) {
+      // the stack logs the change itself, as its ref store logs (core.logAllRefUpdates)
+      await refs.setSymbolic("HEAD", target, log);
+      return;
+    }
     const old = (await refs.resolve("HEAD").catch(() => undefined))?.objectId;
     await refs.setSymbolic("HEAD", target);
     const next = (await refs.resolve(target).catch(() => undefined))?.objectId;
@@ -963,6 +988,10 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     if (gitDir !== this.commonDir) {
       configOptions.worktreeConfigPath = `${gitDir}/config.worktree`;
       configOptions.readHead = async () => {
+        if (refs instanceof ReftableRefStore) {
+          const head = await refs.get("HEAD").catch(() => undefined);
+          return head && isSymbolicRef(head) ? head.target : undefined;
+        }
         const text = (await this.readText(`${gitDir}/HEAD`))?.trim();
         return text?.startsWith("ref: ") ? text.slice(5).trim() : undefined;
       };

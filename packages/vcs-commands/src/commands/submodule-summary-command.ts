@@ -49,11 +49,6 @@ interface ModuleChange {
  * ```
  */
 export class SubmoduleSummaryCommand extends GitCommand<string> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private cached = false;
   private files = false;
   private forStatus = false;

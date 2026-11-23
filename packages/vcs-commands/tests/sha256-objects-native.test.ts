@@ -18,7 +18,6 @@ import {
   createGitFilesBackend,
   FileStagingStore,
   GitWorkingCopyConfig,
-  ReftableUnsupportedError,
 } from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
 import { SHA256_OBJECT_FORMAT, UnsupportedObjectFormatError } from "@statewalker/vcs-utils";
@@ -586,11 +585,10 @@ describeGit("SHA-256 repositories against native git", () => {
       await expect(openOurs(dir)).rejects.toThrow(UnsupportedObjectFormatError);
     });
 
-    // reftable tables of a SHA-256 repository (hash id `s256`) are not read yet (git 2.45+)
-    it.skipIf(!nativeGitAvailable())(
-      "refuses a SHA-256 reftable repository's refs cleanly",
-      async () => {
-        if (!modern) return;
+    // reftable tables of a SHA-256 repository (hash id `s256`) are neither read nor written
+    // yet (git 2.45+ writes them)
+    it("refuses a SHA-256 reftable repository cleanly, on open and on init", async () => {
+      if (modern) {
         const dir = fresh();
         g(root, "init", "-q", "--object-format=sha256", "--ref-format=reftable", dir);
         put(dir, "a.txt", "a\n");
@@ -598,10 +596,22 @@ describeGit("SHA-256 repositories against native git", () => {
         g(dir, "commit", "-q", "-m", "one");
         rmSync(join(dir, ".git", "index"));
         const files = createNodeFilesApi({ rootDir: dir });
-        const { history } = await createGitFilesBackend({ files, gitDir: ".git" });
-        await expect(history.refs.resolve("HEAD")).rejects.toBeInstanceOf(ReftableUnsupportedError);
-      },
-    );
+        await expect(createGitFilesBackend({ files, gitDir: ".git" })).rejects.toThrow(
+          "webrun-vcs does not support reftable refs in sha256 repositories yet",
+        );
+      }
+      const files = createNodeFilesApi({ rootDir: root });
+      const name = fresh().slice(root.length + 1);
+      await expect(
+        Git.init()
+          .setFilesApi(files)
+          .setDirectory(name)
+          .setObjectFormat("sha256")
+          .setRefFormat("reftable")
+          .call(),
+      ).rejects.toBeInstanceOf(UnsupportedObjectFormatError);
+      expect(existsSync(join(root, name, ".git", "config"))).toBe(false);
+    });
   });
 
   // ---------------------------------------------------------------- notes (t3301-notes.sh)

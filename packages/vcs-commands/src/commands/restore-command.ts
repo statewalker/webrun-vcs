@@ -55,11 +55,6 @@ import { globalPathspecMagic, parsePathspecFile } from "./pathspec.js";
  * git's restore has no `--ignore-unmatch`: an element matching nothing is always an error.
  */
 export class RestoreCommand extends GitCommand<CheckoutResult> {
-  /** Never writes refs: runs in a repository whose ref store only reads. */
-  protected override get writesRefs(): boolean {
-    return false;
-  }
-
   private readonly paths: string[] = [];
   private pathspecFromFile: string[] = [];
   /** Whether `--pathspec-from-file` was given (an empty file included) */

@@ -1,7 +1,6 @@
 /**
- * The errors of the reftable reader: a table or `tables.list` that is not well formed, a
- * format we do not read (SHA-256 tables), and a write to a reftable repository, which this
- * implementation does not do yet.
+ * The errors of the reftable reader: a table or `tables.list` that is not well formed, and a
+ * format we do not read (SHA-256 tables).
  */
 
 /**
@@ -30,19 +29,22 @@ export class ReftableUnsupportedError extends Error {
 }
 
 /**
- * A ref write (an update, a deletion, a reflog change, packing) asked of a repository whose
- * refs are stored in the reftable format: this implementation reads such repositories but
- * does not write them yet. Thrown before anything is changed. `refName` names the first ref
- * the write would have changed, when there is one.
+ * A transaction over several stacks (a linked worktree's and the repository's) whose tables
+ * were listed in some of them when listing them in the next failed: the update is applied
+ * to `committed` stacks only (git's reftable backend commits stack after stack too). The
+ * other stacks' tables and locks are removed; `cause` is the failure.
  */
-export class ReftableWriteUnsupportedError extends Error {
-  readonly code = "EREFTABLE_READONLY";
-  constructor(readonly refName?: string) {
+export class ReftablePartialCommitError extends Error {
+  readonly code = "EPARTIAL";
+  constructor(
+    readonly committed: readonly string[],
+    readonly failed: string,
+    options?: { cause?: unknown },
+  ) {
     super(
-      refName === undefined
-        ? "unable to write refs: writing the reftable ref storage (extensions.refStorage = reftable) is not supported"
-        : `cannot lock ref '${refName}': writing the reftable ref storage (extensions.refStorage = reftable) is not supported`,
+      `reftable: transaction failure: committed in ${committed.join(", ")} but not in ${failed}`,
+      options,
     );
-    this.name = "ReftableWriteUnsupportedError";
+    this.name = "ReftablePartialCommitError";
   }
 }
