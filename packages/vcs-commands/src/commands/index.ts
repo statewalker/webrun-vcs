@@ -74,6 +74,7 @@ export * from "./push-command.js";
 export * from "./read-tree-command.js";
 export * from "./rebase-command.js";
 export * from "./ref-decoration-filter.js";
+export * from "./ref-filter/index.js";
 export * from "./reflog-command.js";
 export {
   committerIdent,
@@ -101,6 +102,8 @@ export * from "./stash-list-command.js";
 export * from "./stash-working-tree.js";
 export * from "./status-command.js";
 export * from "./status-format.js";
+export * from "./submodule-commands.js";
+export * from "./submodule-model.js";
 export * from "./submodule-summary.js";
 export * from "./submodule-summary-command.js";
 export * from "./switch-command.js";

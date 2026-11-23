@@ -46,9 +46,16 @@ import {
 import { worktreeModeTrust } from "./core-config.js";
 import { DEFAULT_DATE_MODE, showDate } from "./date-format.js";
 import { approxidateCareful } from "./git-date.js";
-import { hostEnvironmentOf, InvalidDateError, parseGitDate, withoutCrud } from "./git-ident.js";
+import {
+  hostEnvironmentOf,
+  InvalidDateError,
+  InvalidIdentError,
+  parseGitDate,
+  withoutCrud,
+} from "./git-ident.js";
 import { IndexAdder, readGitlinkHead } from "./index-adder.js";
 import { reencodedCommitParts } from "./log-output.js";
+import { readRepositoryMailmap } from "./mailmap.js";
 import {
   flatTree,
   OperationState,
@@ -1290,6 +1297,29 @@ export class CommitCommand extends GitCommand<CommitResult> {
     if (this.forceDate) this.forcedDate();
   }
 
+  /** A blob's bytes, undefined when it cannot be read. */
+  private async readBlobBytes(id: ObjectId): Promise<Uint8Array | undefined> {
+    try {
+      const content = await this.blobs.load(id);
+      if (!content) return undefined;
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for await (const c of content) {
+        chunks.push(c);
+        size += c.length;
+      }
+      const out = new Uint8Array(size);
+      let at = 0;
+      for (const c of chunks) {
+        out.set(c, at);
+        at += c.length;
+      }
+      return out;
+    } catch {
+      return undefined;
+    }
+  }
+
   /**
    * `--date` (parse_force_date): the date as `parse_date` reads it, else as `approxidate`
    * does, refused as git refuses it.
@@ -1321,7 +1351,18 @@ export class CommitCommand extends GitCommand<CommitResult> {
         `fatal: '${name}': ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    const mailmap = await this.loadMailmap(RemoteConfigStore.from(this.workingCopy));
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const mailmap = await readRepositoryMailmap({
+      config: (key) => config.value(key),
+      worktree: this.worktreeAccess,
+      environment: hostEnvironmentOf(this.workingCopy),
+      readBlobNamed: async (blob) => {
+        const id = await this.revisionResolver()
+          .resolve(blob)
+          .catch(() => undefined);
+        return id ? this.readBlobBytes(id) : undefined;
+      },
+    });
     const encoder = new TextEncoder();
     // revision.c's walk of --all: refs under refs/ in name order, then HEAD, tags peeled;
     // commits come out by commit date, newest first
@@ -1762,6 +1803,57 @@ export class CommitCommand extends GitCommand<CommitResult> {
       throw new NoMessageError();
     }
 
+    let previousCommit: Commit | undefined;
+    let amendedId: ObjectId | undefined;
+
+    if (this.amend) {
+      const headId = await this.resolveHead();
+      amendedId = headId;
+      previousCommit = await this.commits.load(headId);
+      if (!previousCommit) {
+        throw new NoHeadError("Cannot amend: HEAD commit not found");
+      }
+    }
+
+    // The author (git's determine_author_info, which prepare_to_commit runs before the
+    // pre-commit hook): the one given; else an amended commit's or
+    // a concluded cherry-pick's author (its date too; `--author` replaces only the name and
+    // email), unless --reset-author; else resolved as git does (GIT_AUTHOR_*, author.*,
+    // user.*, GIT_AUTHOR_DATE or now)
+    let author = this.author;
+    if (!author) {
+      // (git's author_message: a cherry-pick's CHERRY_PICK_HEAD, else -C's commit, else the
+      // amended HEAD)
+      const kept = this.resetAuthor
+        ? undefined
+        : pickHead
+          ? (await this.commits.load(pickHead))?.author
+          : reused
+            ? reused.author
+            : this.amend && previousCommit
+              ? previousCommit.author
+              : undefined;
+      // fmt_ident's IDENT_STRICT refusals of the name chosen (an empty one, crud only)
+      if (kept || this.authorName) {
+        strictAuthorName(
+          this.authorName?.name ?? (kept as PersonIdent).name,
+          this.authorName?.email ?? (kept as PersonIdent).email,
+        );
+      }
+      if (kept) {
+        author = this.authorName
+          ? {
+              ...kept,
+              name: withoutCrud(this.authorName.name),
+              email: withoutCrud(this.authorName.email),
+            }
+          : kept;
+      } else if (this.authorName) author = this.datedIdent("author", this.authorName);
+      else author = this.resolveAuthor(this.committer ?? this.committerName);
+    }
+    // --date: the author's date, whatever gave the rest
+    const forced = this.forcedDate();
+    if (forced) author = { ...author, ...forced };
     // prepare_to_commit's pre-commit hook (not with --no-verify), over the index the commit
     // records (the lock `-a` and a partial commit wrote); a hook that ran may have changed
     // the index, which is read again (git's discard_index + read_index_from)
@@ -2747,4 +2839,15 @@ export type CommitEditor = (path: string, text: string) => Promise<unknown>;
 export interface CommitDryRunResult extends StatusTextResult {
   /** 0 when there is something to commit, 1 when not (dry_run_commit) */
   exitCode: number;
+}
+
+/**
+ * fmt_ident's IDENT_STRICT checks of an author name given or kept (`--author`, `-C`,
+ * `--amend`): an empty name, or one of crud only, refused with git's line.
+ */
+function strictAuthorName(name: string, email: string): void {
+  if (name === "") throw new InvalidIdentError("author", "empty", email, false);
+  if (![...name].some((c) => !(c <= " " || ",:;<>\"\\'".includes(c)))) {
+    throw new InvalidIdentError("author", "crud", name, false);
+  }
 }

@@ -63,6 +63,11 @@ export interface RepositoryFormat {
    * or SHA-256
    */
   objectFormat: ObjectFormat;
+  /**
+   * `extensions.submodulePathConfig` (version 1, git 2.52 and later): each submodule's git
+   * directory is `submodule.<name>.gitdir`, which `git submodule init` writes
+   */
+  submodulePathConfig: boolean;
 }
 
 /** A repository whose format version or extensions we cannot read or write safely. */
@@ -107,6 +112,7 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
     relativeWorktrees: false,
     refStorage: "files",
     objectFormat: SHA1_OBJECT_FORMAT,
+    submodulePathConfig: false,
   };
   const unknown: string[] = [];
   const v1Only: string[] = [];
@@ -170,7 +176,7 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
         format.relativeWorktrees = configBool(value, key);
         break;
       case "submodulepathconfig":
-        configBool(value, key);
+        format.submodulePathConfig = configBool(value, key);
         break;
       default:
         unknown.push(ext);
