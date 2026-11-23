@@ -68,7 +68,7 @@ export async function loadLegacyRemote(
     const branchesFile = await readGitFile(workingCopy, `branches/${name}`);
     if (branchesFile !== undefined) {
       if (compatibility !== "2.43") messages.push(deprecationWarning("branches", name));
-      const line = (branchesFile.split("\n")[0] ?? "").trim();
+      const line = trimGitSpace(branchesFile.split("\n")[0] ?? "");
       if (line) {
         const at = line.indexOf("#");
         let branch: string;
@@ -117,7 +117,7 @@ export function isValidRemoteNick(name: string): boolean {
 
 /**
  * Parses a `remotes/<name>` file as `read_remotes_file`: each line, its trailing
- * whitespace dropped, is a `URL:`, `Push:` or `Pull:` line (the value's leading whitespace
+ * whitespace (git's `isspace`: space, `\t`, `\n`, `\r`) dropped, is a `URL:`, `Push:` or `Pull:` line (the value's leading whitespace
  * dropped) or ignored.
  */
 export function parseRemotesFile(
@@ -129,13 +129,22 @@ export function parseRemotesFile(
   const lines = text.split("\n");
   if (lines.at(-1) === "") lines.pop();
   for (const raw of lines) {
-    const line = raw.replace(/[\t\n\v\f\r ]+$/, "");
-    const value = (prefix: string) => line.slice(prefix.length).replace(/^[\t\n\v\f\r ]+/, "");
+    const line = raw.replace(/[\t\n\r ]+$/, "");
+    const value = (prefix: string) => line.slice(prefix.length).replace(/^[\t\n\r ]+/, "");
     if (line.startsWith("URL:")) urls.push(value("URL:"));
     else if (line.startsWith("Push:")) pushRefspecs.push(value("Push:"));
     else if (line.startsWith("Pull:")) fetchRefspecs.push(value("Pull:"));
   }
   return { urls, fetchRefspecs, pushRefspecs };
+}
+
+/**
+ * `strbuf_trim`: leading and trailing whitespace dropped as git's `isspace` (sane_ctype.h:
+ * space, `\t`, `\n`, `\r` only; a vertical tab or form feed is kept, as JavaScript's
+ * `trim()` would not).
+ */
+function trimGitSpace(text: string): string {
+  return text.replace(/^[\t\n\r ]+/, "").replace(/[\t\n\r ]+$/, "");
 }
 
 /** 2.5x's `warn_about_deprecated_remote_type`, as `warning()` prints it. */

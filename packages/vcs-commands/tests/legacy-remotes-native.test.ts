@@ -411,3 +411,100 @@ function gitRunWith(
     stderr: r.stderr.toString("latin1"),
   };
 }
+
+describeGit("pull from a branches remote, as native git 2.x (pull.c)", () => {
+  let base = "";
+  let n = 0;
+  const run = (cwd: string, ...args: string[]) => gitOut(base, cwd, args, DATES);
+  beforeAll(() => {
+    base = mkdtempSync(join(tmpdir(), "legacy-remotes-pull-"));
+    const up = join(base, "up");
+    mkdirSync(up);
+    run(up, "init", "-q", "-b", "main");
+    putFile(up, "a.txt", "a\n");
+    run(up, "add", "a.txt");
+    run(up, "commit", "-qm", "one");
+    run(up, "branch", "old");
+    putFile(up, "b.txt", "b\n");
+    run(up, "add", "b.txt");
+    run(up, "commit", "-qm", "two");
+  });
+  afterAll(() => rmSync(base, { recursive: true, force: true }));
+
+  /** Twins on main at `old` ("one"), each with `.git/branches/<name>` holding `content`. */
+  function pullTwins(name: string, content: string): [string, string] {
+    const pair: [string, string] = [`n${n}`, `o${n}`];
+    n++;
+    for (const d of pair) {
+      const dir = join(base, d);
+      mkdirSync(dir);
+      run(dir, "init", "-q", "-b", "main");
+      run(dir, "fetch", "-q", "--update-head-ok", "../up", "old:refs/heads/main");
+      run(dir, "reset", "-q", "--hard", "main");
+      putFile(join(dir, ".git"), `branches/${name}`, content);
+    }
+    return pair;
+  }
+
+  async function oursAt(name: string): Promise<Git> {
+    const env = testEnv(base, DATES);
+    return openOurs(
+      base,
+      createNodeGitHostEnvironment({
+        env,
+        hookRunner: createNodeHookRunner({ env, compatibility: nativeIs25x ? "2.56" : "2.43" }),
+      }),
+      undefined,
+      name,
+    );
+  }
+
+  const state = (d: string) => ({
+    refs: run(join(base, d), "for-each-ref", "--format=%(refname) %(objectname)"),
+    head: run(join(base, d), "rev-parse", "HEAD"),
+    status: run(join(base, d), "status", "--porcelain", "-uall"),
+  });
+
+  /** git's warning() lines of stderr (the first prefixed, the rest as printed). */
+  const fastForwardWarning = (stderr: string) => {
+    const lines = stderr.split("\n");
+    const at = lines.findIndex((l) => l.startsWith("warning: fetch updated the current branch"));
+    return at < 0 ? [] : [lines.slice(at, at + 3).join("\n")];
+  };
+
+  it("fetch moving the checked-out branch fast-forwards the worktree (pull.c, orig_head != curr_head)", async () => {
+    const [nd, od] = pullTwins("main", "../up#main\n");
+    const native = gitRun(base, join(base, nd), ["pull", "main"], DATES);
+    expect(native.status, native.stderr).toBe(0);
+    const result = await (await oursAt(od)).pull().setRemote("main").call();
+    expect(result.successful).toBe(true);
+    expect(state(od)).toEqual(state(nd));
+    expect(state(od).status).toBe("");
+    expect(result.warnings ?? []).toEqual(fastForwardWarning(native.stderr));
+  });
+
+  it("a fast-forward of the worktree that local changes block dies as git", async () => {
+    const [nd, od] = pullTwins("main", "../up#main\n");
+    for (const d of [nd, od]) putFile(join(base, d), "b.txt", "mine\n");
+    const native = gitRun(base, join(base, nd), ["pull", "main"], DATES);
+    const error = await failure(async () => (await oursAt(od)).pull().setRemote("main").call());
+    expect(error?.exitCode).toBe(native.status);
+    const lines = native.stderr.split("\n");
+    const from = lines.findIndex((l) => l.startsWith("warning: fetch updated the current"));
+    expect(`${error?.message}\n`).toBe(`${lines.slice(from).join("\n")}`);
+    expect(state(od)).toEqual(state(nd));
+  });
+
+  it("merges the branch the branches file names, not the current branch's name", async () => {
+    const [nd, od] = pullTwins("vendor", "../up#old\n");
+    // main ahead of `old`: the pull of `old` is already up to date
+    for (const d of [nd, od]) run(join(base, d), "fetch", "-q", "../up", "main:refs/heads/x");
+    for (const d of [nd, od]) run(join(base, d), "reset", "-q", "--hard", "x");
+    const native = gitRun(base, join(base, nd), ["pull", "vendor"], DATES);
+    expect(native.status, native.stderr).toBe(0);
+    const result = await (await oursAt(od)).pull().setRemote("vendor").call();
+    expect(result.successful).toBe(true);
+    expect(state(od)).toEqual(state(nd));
+    expect(state(od).refs).toContain("refs/heads/vendor ");
+  });
+});
