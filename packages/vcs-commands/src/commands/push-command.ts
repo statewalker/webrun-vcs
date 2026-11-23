@@ -8,6 +8,7 @@ import {
   mapRejectReason,
   matchSource,
   ObjectFormatMismatchError,
+  PushCertificateError,
   type PushClientResult,
   type PushCommandResult,
   type PushRefUpdate,
@@ -33,6 +34,7 @@ import { TransportCommand } from "../transport-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { remoteHookSession } from "./local-transport.js";
 import { withRemoteReceivePack } from "./remote-transport.js";
+import { SIGNING_FAILED_LINES, SigningFailedError } from "./signing.js";
 
 /**
  * How a server's rejection reason (`ng <ref> <reason>`) lands on the statuses this package
@@ -127,6 +129,8 @@ export class PushCommand extends TransportCommand<PushResult> {
   private refSpecs: string[] = [];
   private force = false;
   private atomic = false;
+  /** `--[no-]signed[=if-asked]` (undefined: `push.gpgSign`) */
+  private signed?: boolean | "if-asked";
   private noVerify = false;
 
   /** `--no-verify`: the pre-push hook does not run. */
@@ -272,6 +276,37 @@ export class PushCommand extends TransportCommand<PushResult> {
     this.checkCallable();
     this.atomic = atomic;
     return this;
+  }
+
+  /**
+   * `--signed` (true), `--no-signed` (false) or `--signed=if-asked`: whether to sign a push
+   * certificate; undefined (the default) leaves it to `push.gpgSign` (a boolean or
+   * `if-asked`). A server that takes no certificate refuses a signed push (`fatal: the
+   * receiving end does not support --signed push`) and gets an `if-asked` one unsigned,
+   * with git's warning ({@link PushResult.warnings}). No signer exists yet: a certificate
+   * the server takes fails as git fails when gpg cannot sign (`error: gpg failed to sign
+   * the data:`, `fatal: failed to sign the push certificate`, exit 128:
+   * {@link SigningFailedError}), before anything is sent.
+   */
+  setSigned(signed: boolean | "if-asked" | undefined): this {
+    this.checkCallable();
+    this.signed = signed;
+    return this;
+  }
+
+  /**
+   * The push certificate asked for (git's SEND_PACK_PUSH_CERT_*): the option, else
+   * `push.gpgSign` (a boolean or `if-asked`, case-insensitive; another value signs nothing).
+   */
+  private pushCertMode(): "always" | "if-asked" | undefined {
+    let value: boolean | "if-asked" | undefined = this.signed;
+    if (value === undefined) {
+      const raw = RemoteConfigStore.from(this.workingCopy).value("push.gpgSign");
+      if (raw !== undefined) {
+        value = raw.trim().toLowerCase() === "if-asked" ? "if-asked" : parseGitBool(raw);
+      }
+    }
+    return value === true ? "always" : value === "if-asked" ? "if-asked" : undefined;
   }
 
   /**
@@ -506,6 +541,7 @@ export class PushCommand extends TransportCommand<PushResult> {
       refspecs,
       force: this.force,
       atomic: this.atomic,
+      ...(this.pushCertMode() ? { signed: this.pushCertMode() } : {}),
       thin: this.thin,
       dryRun: this.dryRun,
       prune: this.prune,
@@ -568,6 +604,17 @@ export class PushCommand extends TransportCommand<PushResult> {
       // send_pack dies: the remote's repository names objects with another hash
       if (error instanceof ObjectFormatMismatchError) {
         throw new TransportError(`fatal: ${error.message}`, undefined, { cause: error });
+      }
+      // send_pack dies: no push certificate for this server, or none could be signed
+      if (error instanceof PushCertificateError) {
+        if (error.reason === "unsupported") {
+          throw new TransportError(`fatal: ${error.message}`, undefined, { cause: error });
+        }
+        throw new SigningFailedError(
+          [...SIGNING_FAILED_LINES, `fatal: ${error.message}`].join("\n"),
+          "",
+          128,
+        );
       }
       if (error instanceof PushRefusedByHookError) {
         throw new HookFailedError(
@@ -682,8 +729,10 @@ export class PushCommand extends TransportCommand<PushResult> {
       bytesSent: result.bytesSent,
       objectCount: result.packObjects,
       messages,
-      ...(legacyWarnings.length + receiveWarnings.length > 0
-        ? { warnings: [...legacyWarnings, ...receiveWarnings] }
+      // git's order: the legacy-remote deprecation, receive-pack's startup warnings (a local
+      // push), then send-pack's (an unsent push certificate)
+      ...(legacyWarnings.length + receiveWarnings.length + (result.warnings?.length ?? 0) > 0
+        ? { warnings: [...legacyWarnings, ...receiveWarnings, ...(result.warnings ?? [])] }
         : {}),
       display: formatPushStatus(result, { dest: remoteUrl }),
       porcelain: formatPushStatus(result, { dest: remoteUrl, porcelain: true }),

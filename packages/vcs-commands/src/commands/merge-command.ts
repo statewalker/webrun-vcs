@@ -72,6 +72,7 @@ import {
   saveAutostash,
   squashMessage,
 } from "./sequencer-support.js";
+import { refuseCommitSigning, signRequestOf } from "./signing.js";
 import { readSparseCheckoutPatterns, sparseCheckoutConfig } from "./sparse-checkout-support.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
 import { readDiffSubmoduleConfig } from "./submodule-summary.js";
@@ -147,6 +148,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
   private cleanupMode?: CleanupMode;
   private inProcess = false;
   private noVerify = false;
+  /** `-S[<keyid>]` / `--no-gpg-sign` (undefined: `commit.gpgSign`) */
+  private sign?: boolean | string;
 
   /**
    * `--no-verify`: the `pre-merge-commit` and `commit-msg` hooks do not run
@@ -155,6 +158,27 @@ export class MergeCommand extends GitCommand<MergeResult> {
   setNoVerify(noVerify: boolean): this {
     this.checkCallable();
     this.noVerify = noVerify;
+    return this;
+  }
+
+  /**
+   * `-S` (true) / `--no-gpg-sign` (false): whether to sign the merge commit; undefined (the
+   * default) leaves it to `commit.gpgSign`. No signer exists yet: a merge commit asked to be
+   * signed fails as git's does when gpg cannot sign (`error: gpg failed to sign the data:`,
+   * `fatal: failed to write commit object`, exit 128: {@link SigningFailedError}), the merge
+   * left in progress as git leaves it (MERGE_HEAD, the merged index and files) and no commit
+   * made. A fast-forward or a merge stopped before its commit signs nothing.
+   */
+  setSign(sign: boolean | undefined): this {
+    this.checkCallable();
+    this.sign = sign;
+    return this;
+  }
+
+  /** `-S<keyid>`: sign with this key (see {@link setSign}). */
+  setSigningKey(keyId: string): this {
+    this.checkCallable();
+    this.sign = keyId;
     return this;
   }
 
@@ -1016,6 +1040,9 @@ export class MergeCommand extends GitCommand<MergeResult> {
         output,
       };
     }
+    await this.refuseSigning(() =>
+      this.writeMergeState(state, srcId, hooked.stateText ?? this.message ?? message),
+    );
     const newCommitId = await this.storeCommit(treeId, [headId, srcId], cleaned);
     await this.updateHead(head, newCommitId, reflogMessages.mergeMade(this.strategyName()));
     // the commit ends the merge: git's remove_merge_branch_state
@@ -1179,6 +1206,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
         output,
       };
     }
+    await this.refuseSigning(() => writeState(hooked.stateText ?? this.message ?? message));
     const newCommitId = await this.storeCommit(treeId, parents, cleaned);
     await this.updateHead(head, newCommitId, reflogMessages.mergeMade(strategy));
     output.push(`Merge made by the '${strategy}' strategy.`);
@@ -1568,9 +1596,11 @@ export class MergeCommand extends GitCommand<MergeResult> {
     state: OperationState,
     message: string,
     writeState: (text: string) => Promise<void>,
-  ): Promise<{ message: string; refused?: string }> {
+  ): Promise<{ message: string; refused?: string; stateText?: string }> {
     // (a merge a rebase makes in process runs no hooks of its own)
-    if (!this.hooks.enabled || this.inProcess) return { message: this.cleanup(message) };
+    if (!this.hooks.enabled || this.inProcess) {
+      return { message: this.cleanup(message), stateText: this.message ?? message };
+    }
     const env = {
       GIT_INDEX_FILE: await this.hooks.gitPath("index"),
       GIT_EDITOR: ":",
@@ -1601,7 +1631,19 @@ export class MergeCommand extends GitCommand<MergeResult> {
     // the commit ends the merge (remove_merge_branch_state)
     await state.removeRef("MERGE_HEAD");
     await state.remove("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE");
-    return { message: this.cleanup(text) };
+    return { message: this.cleanup(text), stateText: text };
+  }
+
+  /**
+   * A merge commit asked to be signed (`-S`, `commit.gpgSign`) fails as git's does when gpg
+   * cannot sign: prepare_to_commit has written the merge state (MERGE_MSG as the hooks left
+   * it) and commit_tree dies, so the merge stays in progress for `git commit`.
+   */
+  private async refuseSigning(writeState: () => Promise<void>): Promise<void> {
+    const sign = signRequestOf(this.workingCopy, this.sign);
+    if (sign === undefined) return;
+    if (!this.inProcess) await writeState();
+    refuseCommitSigning(sign);
   }
 
   /** MERGE_HEAD, MERGE_MSG and MERGE_MODE of a merge stopped before its commit. */
@@ -1638,6 +1680,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
     const author = this.author ?? this.resolveAuthor(this.committer);
     const committer = this.committer ?? this.resolveCommitter(author);
     const commit: Commit = { tree, parents, author, committer, message };
+    // commit_tree signs before writing: no signer, git's failure
+    refuseCommitSigning(signRequestOf(this.workingCopy, this.sign));
     return this.commits.store(commit);
   }
 
