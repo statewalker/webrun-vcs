@@ -192,7 +192,7 @@ export async function discoverRepository(
       // the protected configuration, read here for safe.bareRepository (get_allowed_bare_repo)
       const entries = await readProtectedConfig(environment);
       if (
-        allowedBareRepository(entries) === "explicit" &&
+        allowedBareRepository(entries, environment?.breakingChanges) === "explicit" &&
         !isImplicitBareRepository(host, compatibility)
       ) {
         throw new UnsafeBareRepositoryError(host);

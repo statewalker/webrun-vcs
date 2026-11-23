@@ -543,6 +543,17 @@ export class RemoteConfigStore {
       .map((e) => ({ key: e.key, value: e.text }));
   }
 
+  /**
+   * Every value of the variables `keys` (canonical, lower case) in the configuration's order,
+   * with where each was read (file, scope; none for the command line); undefined when the
+   * config cannot list its variables.
+   */
+  entriesWithOriginFor(keys: string[]): (ConfigValueWhere & { key: string })[] | undefined {
+    if (!this.config.listWithOrigin) return undefined;
+    const wanted = new Set(keys.map((k) => k.toLowerCase()));
+    return this.config.listWithOrigin().filter((e) => wanted.has(e.key));
+  }
+
   /** Every value of a config variable (`branch.main.merge` may repeat). */
   values(key: string): string[] {
     return this.config
