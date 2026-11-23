@@ -39,7 +39,13 @@ jobs:
 
       - name: git master's commit
         id: git-master
-        run: echo "sha=$(git ls-remote https://github.com/git/git refs/heads/master | cut -f1)" >> "$GITHUB_OUTPUT"
+        # A failed ls-remote must fail the job: an empty sha would cache a build under a key
+        # every later failure restores, whatever master is.
+        run: |
+          set -o pipefail
+          sha=$(git ls-remote https://github.com/git/git refs/heads/master | cut -f1)
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Restore the git 3.0 build
         id: git3-cache
