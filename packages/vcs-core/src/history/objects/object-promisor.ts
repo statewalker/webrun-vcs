@@ -411,6 +411,7 @@ export function withLazyFetch(objects: GitObjects, promisor: ObjectPromisor): Gi
     return fetchThenRead(id, opts);
   };
   const lazy: GitObjects = {
+    ...(objects.objectFormat ? { objectFormat: objects.objectFormat } : {}),
     put: (...args) => objects.put(...args),
     putUnsized: (...args) => objects.putUnsized(...args),
     putRaw: (...args) => objects.putRaw(...args),

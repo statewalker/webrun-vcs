@@ -135,5 +135,5 @@ export interface BlobsExtended extends Blobs {
   findBySize?(minSize: number, maxSize: number): AsyncIterable<ObjectId>;
 }
 
-/** The id of the empty blob (`git hash-object /dev/null`). */
+/** The id of the empty blob (`git hash-object /dev/null`) in SHA-1 (`ObjectFormat.emptyBlobId` in another format). */
 export const EMPTY_BLOB_ID = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";

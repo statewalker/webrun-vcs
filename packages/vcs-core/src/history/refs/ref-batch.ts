@@ -6,6 +6,7 @@
  * A backend reads a consistent view of its refs, calls `planRefBatch`, and
  * applies the planned updates atomically (or reports the rejections).
  */
+import { isHexObjectId, nullObjectIdLike, type ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { ObjectId } from "../../common/id/index.js";
 import { isValidRefName } from "./ref-name.js";
 import { isSymbolicRef, type Ref, type SymbolicRef } from "./ref-types.js";
@@ -221,7 +222,7 @@ function sanitizeOwnLine(line: OwnReflogLine): OwnReflogLine {
 
 /**
  * Whether `value` may be written as a ref's direct value: a full lowercase hex object id
- * (SHA-1, the one object format the stores read). A name (`main`) written there leaves a ref no git can read, `HEAD`
+ * (SHA-1's 40 digits, or SHA-256's 64; of `format` when given). A name (`main`) written there leaves a ref no git can read, `HEAD`
  * holding `main\n` is no repository to git at all, so every ref store refuses it.
  *
  * @example
@@ -230,8 +231,8 @@ function sanitizeOwnLine(line: OwnReflogLine): OwnReflogLine {
  * isRefObjectId("main"); // false
  * ```
  */
-export function isRefObjectId(value: unknown): value is string {
-  return typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+export function isRefObjectId(value: unknown, format?: ObjectFormat): value is string {
+  return isHexObjectId(value, format);
 }
 
 /** Names a batch may update: `HEAD`, or a valid name under `refs/`. */
@@ -461,7 +462,6 @@ export type ReflogWrite =
   | { op: "append"; name: string; line: ReflogLine; create: boolean }
   | { op: "drop"; name: string };
 
-const ZERO_ID = "0".repeat(40);
 /** Refs git logs even without an existing reflog (core.logAllRefUpdates=true, non-bare). */
 const LOGGED_BY_DEFAULT = ["refs/heads/", "refs/remotes/", "refs/notes/"];
 
@@ -486,8 +486,8 @@ export function planReflog(updates: PlannedRefUpdate[], options: BatchOptions = 
       continue;
     }
     const line: ReflogLine = {
-      oldId: u.oldValue ?? ZERO_ID,
-      newId: u.newValue ?? ZERO_ID,
+      oldId: u.oldValue ?? nullObjectIdLike(u.newValue ?? undefined),
+      newId: u.newValue ?? nullObjectIdLike(u.oldValue ?? undefined),
       ident,
       message: u.message !== undefined ? u.message.replace(/\s+/g, " ").trim() : message,
     };
@@ -578,7 +578,7 @@ export function symrefReflogLine(
 ): ReflogLine | undefined {
   if (log?.message === undefined || next === undefined) return undefined;
   return {
-    oldId: old ?? ZERO_ID,
+    oldId: old ?? nullObjectIdLike(next),
     newId: next,
     ident: log.ident ?? defaultReflogIdent(),
     message: log.message.replace(/\s+/g, " ").trim(),

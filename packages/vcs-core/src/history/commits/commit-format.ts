@@ -20,16 +20,23 @@ import type { Commit } from "./commits.js";
 
 const LF = "\n";
 
+/** The header holding a commit's signature in the repository's format (`ObjectFormat.signatureHeader`). */
+export type CommitSignatureHeader = "gpgsig" | "gpgsig-sha256";
+
 /**
  * Encode commit entries to byte stream
  *
  * Accepts both sync and async iterables.
  *
  * @param entries Commit entries in order
+ * @param signatureHeader The header a `gpgsig` entry is written as: `gpgsig` in a SHA-1
+ *   repository, `gpgsig-sha256` in a SHA-256 one (git's `gpg_sig_headers`)
  * @yields Byte chunks of serialized commit
  */
+
 export async function* encodeCommitEntries(
   entries: AsyncIterable<CommitEntry> | Iterable<CommitEntry>,
+  signatureHeader: CommitSignatureHeader = "gpgsig",
 ): AsyncGenerator<Uint8Array> {
   // Build commit content
 
@@ -58,7 +65,7 @@ export async function* encodeCommitEntries(
       case "gpgsig": {
         // GPG signature with continuation lines
         const sigLines = entry.value.split("\n");
-        yield line(`gpgsig ${sigLines[0]}`);
+        yield line(`${signatureHeader} ${sigLines[0]}`);
         for (let i = 1; i < sigLines.length; i++) {
           yield line(` ${sigLines[i]}`);
         }
@@ -99,9 +106,10 @@ export async function computeCommitSize(
  */
 export async function* decodeCommitEntries(
   input: Iterable<Uint8Array> | AsyncIterable<Uint8Array>,
+  signatureHeader: CommitSignatureHeader = "gpgsig",
 ): AsyncGenerator<CommitEntry> {
   // keepDelimiter=true preserves trailing "\n" for byte-level round-trip fidelity
-  const parser = new CommitLineParser();
+  const parser = new CommitLineParser(signatureHeader);
   for await (const rawLine of toLines(input, true)) yield* parser.line(rawLine);
   yield* parser.end();
 }
@@ -124,7 +132,11 @@ function decodeText(data: Uint8Array): string {
  * Parse a whole commit held in memory: the commit `entriesToCommit(decodeCommitEntries([data]))`
  * gives, without generators (a rev-walk parses every commit it reads). Throws as it does.
  */
-export function commitFromBytes(data: Uint8Array): Commit {
+export function commitFromBytes(
+  data: Uint8Array,
+  signatureHeader: CommitSignatureHeader = "gpgsig",
+): Commit {
+  const sigLength = signatureHeader.length;
   const text = decodeText(data);
   // the fields as `CommitBuilder` collects them (a repeated header: the last one)
   let tree: string | undefined;
@@ -182,7 +194,8 @@ export function commitFromBytes(data: Uint8Array): Commit {
           if (keyLength === 8 && text.startsWith("encoding", at)) encoding = text.slice(from, stop);
           break;
         case 103: // g
-          if (keyLength === 6 && text.startsWith("gpgsig", at)) gpg = [text.slice(from, stop)];
+          if (keyLength === sigLength && text.startsWith(signatureHeader, at))
+            gpg = [text.slice(from, stop)];
           break;
       }
     }
@@ -202,6 +215,7 @@ export function commitFromBytes(data: Uint8Array): Commit {
 
 /** The line-by-line state of commit decoding (lines with their "\n"). */
 class CommitLineParser {
+  constructor(private readonly signatureHeader: CommitSignatureHeader = "gpgsig") {}
   private inGpgSig = false;
   private readonly gpgSigLines: string[] = [];
   private messageLines: string[] | undefined;
@@ -254,7 +268,7 @@ class CommitLineParser {
         case "encoding":
           yield { type: "encoding", value };
           break;
-        case "gpgsig":
+        case this.signatureHeader:
           this.inGpgSig = true;
           this.gpgSigLines.push(value);
           break;

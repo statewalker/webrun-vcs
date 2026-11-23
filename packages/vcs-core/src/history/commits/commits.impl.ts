@@ -10,7 +10,7 @@ import type { ObjectId } from "../../common/id/index.js";
 import { objectRemovalEpoch } from "../../storage/raw/object-removals.js";
 import { type CommitGraph, CommitGraphCorruptError } from "../commit-graph/commit-graph.js";
 import type { CommitGraphProvider } from "../commit-graph/commit-graph-provider.js";
-import type { GitObject, GitObjects } from "../objects/git-objects.js";
+import { type GitObject, type GitObjects, objectFormatOf } from "../objects/git-objects.js";
 import {
   hasObjectOfType,
   objectHeader,
@@ -18,6 +18,7 @@ import {
   storeObject,
 } from "../objects/typed-object-access.js";
 import {
+  type CommitSignatureHeader,
   commitFromBytes,
   commitToEntries,
   decodeCommitEntries,
@@ -63,7 +64,11 @@ class GitCommitStore implements Commits {
     options: CommitsOptions = {},
   ) {
     this.commitGraph = options.commitGraph;
+    this.signatureHeader = objectFormatOf(objects).signatureHeader;
   }
+
+  /** `gpgsig` in a SHA-1 repository, `gpgsig-sha256` in a SHA-256 one */
+  private readonly signatureHeader: CommitSignatureHeader;
 
   /** The commit-graph, loaded on first use; undefined when there is none (or it failed to load). */
   private graph(): CommitGraph | undefined | Promise<CommitGraph | undefined> {
@@ -236,7 +241,7 @@ class GitCommitStore implements Commits {
    */
   async store(commit: Commit): Promise<ObjectId> {
     const entries = commitToEntries(commit);
-    return storeObject(this.objects, "commit", encodeCommitEntries(entries));
+    return storeObject(this.objects, "commit", encodeCommitEntries(entries, this.signatureHeader));
   }
 
   /**
@@ -268,7 +273,9 @@ class GitCommitStore implements Commits {
     }
     if (!obj) return undefined;
     // in memory already: decoded without another await
-    const commit = obj.bytes ? fromBytes(obj.type, obj.bytes) : await this.readStream(obj);
+    const commit = obj.bytes
+      ? fromBytes(obj.type, obj.bytes, this.signatureHeader)
+      : await this.readStream(obj);
     if (commit) {
       this.cache.set(id, { commit: copyCommit(commit), epoch });
       if (this.cache.size > MAX_CACHED_COMMITS) {
@@ -283,7 +290,9 @@ class GitCommitStore implements Commits {
     const it = obj.content[Symbol.asyncIterator]();
     try {
       if (obj.type !== "commit") return undefined;
-      return await entriesToCommit(decodeCommitEntries({ [Symbol.asyncIterator]: () => it }));
+      return await entriesToCommit(
+        decodeCommitEntries({ [Symbol.asyncIterator]: () => it }, this.signatureHeader),
+      );
     } catch {
       return undefined;
     } finally {
@@ -413,10 +422,14 @@ class GitCommitStore implements Commits {
 const MAX_CACHED_COMMITS = 10_000;
 
 /** The commit in `bytes`, or undefined if it is not a commit or does not parse. */
-function fromBytes(type: string, bytes: Uint8Array): Commit | undefined {
+function fromBytes(
+  type: string,
+  bytes: Uint8Array,
+  signatureHeader: CommitSignatureHeader,
+): Commit | undefined {
   if (type !== "commit") return undefined;
   try {
-    return commitFromBytes(bytes);
+    return commitFromBytes(bytes, signatureHeader);
   } catch {
     return undefined;
   }
