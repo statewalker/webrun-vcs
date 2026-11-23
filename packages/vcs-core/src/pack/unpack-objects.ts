@@ -21,10 +21,15 @@
  */
 import { CompressionError, createInflaterPool } from "@statewalker/vcs-utils/compression";
 import { applyGitDelta, DeltaError } from "@statewalker/vcs-utils/diff";
-import { createSha1, type Hasher } from "@statewalker/vcs-utils/hash/hasher";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
+import type { Hasher } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
-import { type GitObjects, ObjectIdMismatchError } from "../history/objects/git-objects.js";
+import {
+  type GitObjects,
+  ObjectIdMismatchError,
+  objectFormatOf,
+} from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 import { PackError } from "./index-pack.js";
 import { DeltaBaseCache, type ResolvedObject } from "./pack-file.js";
@@ -35,7 +40,8 @@ export class ObjectCollisionError extends PackError {
 }
 
 /** The parts of the object kernel `unpackObjects` writes and reads through. */
-export type UnpackTarget = Pick<GitObjects, "put" | "putRaw" | "get" | "getRaw" | "has">;
+export type UnpackTarget = Pick<GitObjects, "put" | "putRaw" | "get" | "getRaw" | "has"> &
+  Partial<Pick<GitObjects, "objectFormat">>;
 
 export interface UnpackObjectsOptions {
   /** Largest object (or delta) accepted, by its header and by delta results. Default 1 GiB. */
@@ -59,6 +65,8 @@ export interface UnpackObjectsOptions {
    * call (see `InstallPackOptions.onContent`)
    */
   onContent?: (id: ObjectId, type: ObjectTypeString, content: Uint8Array) => void;
+  /** The object format (default: the store's, `objectFormatOf(objects)`) */
+  objectFormat?: ObjectFormat;
 }
 
 /** Where a received object was in its pack (see `UnpackObjectsOptions.onObject`). */
@@ -102,9 +110,10 @@ class StreamReader {
   private chunk: Uint8Array = new Uint8Array(0);
   private at = 0;
   private readonly it: AsyncIterator<Uint8Array>;
-  private hasher: Hasher | undefined = createSha1();
-  constructor(source: AsyncIterable<Uint8Array>) {
+  private hasher: Hasher | undefined;
+  constructor(source: AsyncIterable<Uint8Array>, format: ObjectFormat) {
     this.it = source[Symbol.asyncIterator]();
+    this.hasher = format.createHasher();
   }
   private consumed(bytes: Uint8Array) {
     this.hasher?.update(bytes);
@@ -188,7 +197,7 @@ class StreamReader {
     }
     return out;
   }
-  /** The SHA-1 of everything read so far; later bytes (the trailer) are not hashed. */
+  /** The hash of everything read so far; later bytes (the trailer) are not hashed. */
   digest(): Uint8Array {
     const h = this.hasher as Hasher;
     this.hasher = undefined;
@@ -212,7 +221,11 @@ class Entries {
   n = 0;
   offset = new Float64Array(256);
   type = new Uint8Array(256); // resolved type 1-4, 0 while a delta waits for its base
-  oid = new Uint8Array(256 * 20);
+  oid: Uint8Array;
+  /** bytes of an id */
+  constructor(readonly raw: number) {
+    this.oid = new Uint8Array(256 * raw);
+  }
   push(offset: number): number {
     if (this.n === this.offset.length) {
       const cap = this.n * 2;
@@ -222,7 +235,7 @@ class Entries {
       const t = new Uint8Array(cap);
       t.set(this.type);
       this.type = t;
-      const d = new Uint8Array(cap * 20);
+      const d = new Uint8Array(cap * this.raw);
       d.set(this.oid);
       this.oid = d;
     }
@@ -243,7 +256,7 @@ class Entries {
     return -1;
   }
   id(i: number): ObjectId {
-    return hex(this.oid.subarray(i * 20, i * 20 + 20));
+    return hex(this.oid.subarray(i * this.raw, (i + 1) * this.raw));
   }
 }
 
@@ -283,6 +296,8 @@ export async function unpackObjects(
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;
   const bigObjectThreshold = Math.min(options.bigObjectThreshold ?? 16 * 2 ** 20, maxObjectSize);
   const cache = new DeltaBaseCache(options.baseCacheBytes ?? 16 * 2 ** 20);
+  const format = options.objectFormat ?? objectFormatOf(objects as GitObjects);
+  const raw = format.rawLength;
   const result: UnpackResult = {
     count: 0,
     written: 0,
@@ -290,7 +305,7 @@ export async function unpackObjects(
     deltas: 0,
     types: { commit: 0, tree: 0, blob: 0, tag: 0 },
   };
-  const t = new Entries();
+  const t = new Entries(raw);
   /** waiting deltas, keyed by base id or by "#<index>" of a base entry that itself waits */
   const waiting = new Map<string, Waiting[]>();
   /** Entries sent as deltas (`onObject` says so) */
@@ -350,10 +365,12 @@ export async function unpackObjects(
   /** Stores a materialised object (or checks the stored copy) and records entry i. */
   const store = async (i: number, type: ObjectTypeString, data: Uint8Array) => {
     const head = header(type, data.length);
-    const id = hex(createSha1().update(head).update(data).digest());
+    const id = hex(format.createHasher().update(head).update(data).digest());
     if (await objects.has(id)) {
       if (!(await sameAsStored(id, head, data)))
-        throw new ObjectCollisionError(`SHA-1 collision found with ${id}: the bytes differ`);
+        throw new ObjectCollisionError(
+          `${format.name === "sha1" ? "SHA-1" : "SHA-256"} collision found with ${id}: the bytes differ`,
+        );
       // written again so the store renews its copy (git's freshen: an old unreachable object
       // the push is about to name must not be pruned by a concurrent gc); the store keeps it
       await objects.putRaw(id, [head, data]);
@@ -370,7 +387,7 @@ export async function unpackObjects(
 
   const record = (i: number, id: ObjectId, type: ObjectTypeString) => {
     t.type[i] = TYPE_CODE[type];
-    t.oid.set(hexToBytes(id), i * 20);
+    t.oid.set(hexToBytes(id), i * raw);
     result.types[type]++;
     options.onObject?.(id, type, { index: i, delta: deltaEntries.has(i) });
   };
@@ -409,7 +426,7 @@ export async function unpackObjects(
     }
   };
 
-  const r = new StreamReader(pack);
+  const r = new StreamReader(pack, format);
   try {
     const head = await r.bytes(12);
     if (String.fromCharCode(...head.subarray(0, 4)) !== "PACK")
@@ -455,14 +472,14 @@ export async function unpackObjects(
             `OFS_DELTA at ${offset} points to ${baseOffset}, not an earlier entry`,
           );
       } else if (kind === REF_DELTA) {
-        baseId = hex(await r.bytes(20));
+        baseId = hex(await r.bytes(raw));
       }
       const i = t.push(offset);
       const typeName = TYPE_NAMES[kind];
       if (typeName) {
         if (size > bigObjectThreshold) {
           // streamed into the store, hashed on the way: the store's id must be the pack's
-          const hasher = createSha1().update(header(typeName, size));
+          const hasher = format.createHasher().update(header(typeName, size));
           const body = (async function* () {
             for await (const c of r.inflate(size, offset)) {
               hasher.update(c);
@@ -505,7 +522,7 @@ export async function unpackObjects(
     }
 
     const expected = hex(r.digest());
-    const trailer = hex(await r.bytes(20));
+    const trailer = hex(await r.bytes(raw));
     if (trailer !== expected)
       throw new PackError(`pack checksum mismatch: trailer ${trailer}, content ${expected}`);
     if (!(await r.atEnd())) throw new PackError("bytes after the pack trailer");

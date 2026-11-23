@@ -34,8 +34,11 @@ export interface PackIndex {
   /** Version of the index format (1 or 2) */
   readonly version: number;
 
-  /** Pack file checksum (last 20 bytes of pack file) */
+  /** Pack file checksum (the pack's trailer: 20 bytes SHA-1, 32 SHA-256) */
   readonly packChecksum: Uint8Array;
+
+  /** Bytes of an id and of each checksum: 20 (SHA-1), 32 (SHA-256). Absent: 20 */
+  readonly rawLength?: number;
 
   /** Index file checksum */
   readonly indexChecksum: Uint8Array;

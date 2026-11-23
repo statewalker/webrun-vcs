@@ -25,8 +25,8 @@ import {
   type GitDeltaIndex,
 } from "@statewalker/vcs-utils/diff";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import { CRC32 } from "@statewalker/vcs-utils/hash/crc32";
-import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
 import { hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
 import { DEFAULT_BIG_FILE_THRESHOLD } from "../history/blobs/index.js";
@@ -34,13 +34,14 @@ import { DEFAULT_BIG_FILE_THRESHOLD } from "../history/blobs/index.js";
 // still available from `@statewalker/vcs-core/pack`, where it used to be defined
 export { DEFAULT_BIG_FILE_THRESHOLD };
 
-import type { GitObject, GitObjects } from "../history/objects/git-objects.js";
+import { type GitObject, type GitObjects, objectFormatOf } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
 import { MissingObjectError } from "./list-objects.js";
 import type { PackedEntry, PackedEntryKind } from "./pack-file.js";
 
 /** What `writePack` reads objects from. */
-export type PackObjectSource = Pick<GitObjects, "get" | "header">;
+export type PackObjectSource = Pick<GitObjects, "get" | "header"> &
+  Partial<Pick<GitObjects, "objectFormat">>;
 
 /** An object to write: its id, or its id with what is known of it (as `listObjects` yields). */
 export type PackObjectRef =
@@ -111,6 +112,11 @@ export interface WritePackOptions {
    * Default: the runtime's deflate at its default level.
    */
   compression?: number;
+  /**
+   * The object format (default: the store's, `objectFormatOf(objects)`): the pack's trailer
+   * hash and the width of REF_DELTA base ids
+   */
+  objectFormat?: ObjectFormat;
 }
 
 /** One entry as written. */
@@ -186,6 +192,7 @@ export async function* writePack(
   ids: readonly PackObjectRef[],
   options: WritePackOptions = {},
 ): AsyncGenerator<Uint8Array> {
+  const format = options.objectFormat ?? objectFormatOf(objects as GitObjects);
   const reuseObjects = options.reuseObjects ?? true;
   const reuseDeltas = options.reuseDeltas ?? true;
   const ofsDelta = options.ofsDelta ?? true;
@@ -258,7 +265,9 @@ export async function* writePack(
     limitReusedChains(order, search?.depth ?? DEFAULT_DEPTH);
   }
 
-  if (search) await searchDeltas(objects, order, haves, search, bigFileThreshold);
+  if (search) {
+    await searchDeltas(objects, order, haves, search, bigFileThreshold, format.rawLength);
+  }
 
   // ---- write ----
   // Bases first (an OFS delta points back to its base), each object once: the order the
@@ -278,7 +287,7 @@ export async function* writePack(
 
   // Output goes through one buffer, hashed and yielded when full (or at a streamed object):
   // entries are mostly small, and a chunk (and a hash update) per header costs more than they do.
-  const hasher = createSha1();
+  const hasher = format.createHasher();
   let offset = 0;
   let crc: CRC32 | undefined;
   let buf = new Uint8Array(OUT_CHUNK);
@@ -390,8 +399,9 @@ function deltaHeader(
 ): Uint8Array {
   const n = putEntryHeader(kind, size);
   if (kind !== OFS_DELTA) {
-    HEADER.set(hexToBytes(baseId), n);
-    return HEADER.subarray(0, n + 20);
+    const raw = hexToBytes(baseId);
+    HEADER.set(raw, n);
+    return HEADER.subarray(0, n + raw.length);
   }
   // the back-offset: big-endian 7-bit groups, each continuation adding one
   let back = at - (base?.offset as number);
@@ -582,6 +592,7 @@ async function searchDeltas(
   haves: Map<ObjectId, Planned>,
   o: DeltaSearchOptions,
   bigFileThreshold: number,
+  rawLength: number,
 ) {
   const windowSize = o.window ?? 10;
   const maxDepth = o.depth ?? 50;
@@ -641,7 +652,8 @@ async function searchDeltas(
         let maxSize: number;
         let refDepth: number;
         if (!best) {
-          maxSize = Math.floor(trgSize / 2) - 20;
+          // try_delta: trg_size / 2 - the_hash_algo->rawsz
+          maxSize = Math.floor(trgSize / 2) - rawLength;
           refDepth = 1;
         } else {
           maxSize = best.delta.length;

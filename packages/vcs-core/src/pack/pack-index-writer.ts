@@ -9,7 +9,7 @@
  * - jgit/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/file/PackIndexWriterV2.java
  */
 
-import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
+import { type ObjectFormat, objectFormatByRawLength } from "@statewalker/vcs-utils/hash";
 import { hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
 /** Magic bytes for V2+ index: 0xFF, 't', 'O', 'c' */
@@ -18,8 +18,15 @@ const TOC_SIGNATURE = new Uint8Array([0xff, 0x74, 0x4f, 0x63]);
 /** Number of fanout buckets (one per possible first byte) */
 const FANOUT_SIZE = 256;
 
-/** SHA-1 hash size in bytes */
-const OBJECT_ID_LENGTH = 20;
+/**
+ * The object format of an idx whose pack checksum is `packChecksum`: its width tells SHA-1
+ * (20 bytes) from SHA-256 (32), and the ids and the idx's own checksum take the same width.
+ */
+function formatOfChecksum(packChecksum: Uint8Array): ObjectFormat {
+  const format = objectFormatByRawLength(packChecksum.length);
+  if (!format) throw new Error(`pack checksum of ${packChecksum.length} bytes`);
+  return format;
+}
 
 /** Maximum offset for V1 format (32-bit unsigned) */
 const MAX_OFFSET_V1 = 0xffffffff;
@@ -140,13 +147,15 @@ function buildFanoutTable(entries: readonly PackIndexWriterEntry[]): number[] {
  * Based on: jgit/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/file/PackIndexWriterV1.java
  *
  * @param entries Sorted list of entries to write (must be sorted by object ID)
- * @param packChecksum SHA-1 checksum of the pack data (last 20 bytes of pack file)
+ * @param packChecksum Checksum of the pack data (its trailer: 20 bytes SHA-1, 32 SHA-256)
  * @returns Complete index file data
  */
 export async function writePackIndexV1(
   entries: readonly PackIndexWriterEntry[],
   packChecksum: Uint8Array,
 ): Promise<Uint8Array> {
+  const format = formatOfChecksum(packChecksum);
+  const OBJECT_ID_LENGTH = format.rawLength;
   // Validate all entries can be stored in V1 format
   for (const entry of entries) {
     if (!canStoreV1(entry)) {
@@ -185,7 +194,7 @@ export async function writePackIndexV1(
   offset += OBJECT_ID_LENGTH;
 
   // Calculate and write index checksum (SHA-1 of everything before it)
-  const indexChecksum = await sha1(result.subarray(0, offset));
+  const indexChecksum = await format.digest(result.subarray(0, offset));
   result.set(indexChecksum, offset);
 
   return result;
@@ -208,13 +217,15 @@ export async function writePackIndexV1(
  * Based on: jgit/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/file/PackIndexWriterV2.java
  *
  * @param entries Sorted list of entries to write (must be sorted by object ID)
- * @param packChecksum SHA-1 checksum of the pack data (last 20 bytes of pack file)
+ * @param packChecksum Checksum of the pack data (its trailer: 20 bytes SHA-1, 32 SHA-256)
  * @returns Complete index file data
  */
 export async function writePackIndexV2(
   entries: readonly PackIndexWriterEntry[],
   packChecksum: Uint8Array,
 ): Promise<Uint8Array> {
+  const format = formatOfChecksum(packChecksum);
+  const OBJECT_ID_LENGTH = format.rawLength;
   // Count 64-bit offsets needed
   let offset64Count = 0;
   for (const entry of entries) {
@@ -288,7 +299,7 @@ export async function writePackIndexV2(
   offset += OBJECT_ID_LENGTH;
 
   // Calculate and write index checksum (SHA-1 of everything before it)
-  const indexChecksum = await sha1(result.subarray(0, offset));
+  const indexChecksum = await format.digest(result.subarray(0, offset));
   result.set(indexChecksum, offset);
 
   return result;
@@ -302,7 +313,7 @@ export async function writePackIndexV2(
  * Based on: jgit/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/file/BasePackIndexWriter.java#createOldestPossible
  *
  * @param entries Sorted list of entries to write (must be sorted by object ID)
- * @param packChecksum SHA-1 checksum of the pack data (last 20 bytes of pack file)
+ * @param packChecksum Checksum of the pack data (its trailer: 20 bytes SHA-1, 32 SHA-256)
  * @returns Complete index file data
  */
 export async function writePackIndex(
@@ -322,7 +333,7 @@ export async function writePackIndex(
  * Based on: jgit/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/file/BasePackIndexWriter.java#createVersion
  *
  * @param entries Sorted list of entries to write (must be sorted by object ID)
- * @param packChecksum SHA-1 checksum of the pack data (last 20 bytes of pack file)
+ * @param packChecksum Checksum of the pack data (its trailer: 20 bytes SHA-1, 32 SHA-256)
  * @param version Index format version (1 or 2)
  * @returns Complete index file data
  */
