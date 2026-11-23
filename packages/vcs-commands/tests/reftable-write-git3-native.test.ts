@@ -639,7 +639,10 @@ describe.skipIf(!git3)("writing reftable repositories (git 3.0 oracle)", () => {
       at(repo, ["commit", "-q", "--allow-empty", "-m", "c1"]);
       at(repo, ["worktree", "add", "-q", "-b", "wt1", "../wt1"]);
       const tree = at(repo, ["rev-parse", "HEAD^{tree}"]);
-      for (const [label, d] of [["main", repo], ["wt1", join(dir, "wt1")]] as const) {
+      for (const [label, d] of [
+        ["main", repo],
+        ["wt1", join(dir, "wt1")],
+      ] as const) {
         at(d, ["checkout", "-q", "--detach"]);
         at(d, ["commit", "-q", "--allow-empty", "-m", "a"]);
         const head = at(d, ["rev-parse", "HEAD"]);
@@ -660,14 +663,21 @@ describe.skipIf(!git3)("writing reftable repositories (git 3.0 oracle)", () => {
     g(join(root, "n", "wt1"), ["gc", "-q", "--prune=now"]);
     const env = createNodeGitHostEnvironment({ env: nativeGit3Env(root) });
     const files = createNodeFilesApi({ rootDir: join(root, "o") });
-    const { history } = await createGitFilesBackend({ files, gitDir: "repo/.git", environment: env });
+    const { history } = await createGitFilesBackend({
+      files,
+      gitDir: "repo/.git",
+      environment: env,
+    });
     const worktrees = await openGitLinkedWorktrees({
       files,
       gitDir: "repo/.git/worktrees/wt1",
       history,
       environment: env,
     });
-    await Git.fromWorkingCopy(await worktrees.openCurrent()).gc().setPrune("now").call();
+    await Git.fromWorkingCopy(await worktrees.openCurrent())
+      .gc()
+      .setPrune("now")
+      .call();
     for (const ref of ["HEAD", "worktrees/wt1/HEAD"]) {
       const show = (dir: string) => g(dir, ["reflog", "show", "--format=%H %gs", ref]);
       expect(`${ref}\n${show(ours)}`).toBe(`${ref}\n${show(theirs)}`);
