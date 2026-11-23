@@ -604,11 +604,17 @@ export class ListTagCommand extends RefListingCommand<Ref[]> {
     this.checkCallable();
     this.setCallable(false);
     const { items } = await filterRefs(this.filterSource(), await this.filterOptions());
+    // one listing of the tags, not a lookup per kept tag (a packed ref's lookup reads
+    // packed-refs again: quadratic over thousands of tags)
+    const listed = new Map<string, Ref>();
+    for await (const ref of this.refsStore.list("refs/tags/")) {
+      if ("objectId" in ref) listed.set(ref.name, ref);
+    }
     const tags: Ref[] = [];
     for (const item of items) {
       if (item.flags.symref) continue;
-      const ref = await this.refsStore.get(item.refname);
-      if (ref && "objectId" in ref) tags.push(ref);
+      const ref = listed.get(item.refname);
+      if (ref) tags.push(ref);
     }
     tags.sort((a, b) => compareRefNames(a.name, b.name));
     return tags;

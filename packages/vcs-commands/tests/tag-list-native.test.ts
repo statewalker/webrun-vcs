@@ -582,4 +582,24 @@ test_tick && git commit -q --allow-empty -m c3 && git branch c3`,
       ).toEqual(tags);
     }
   });
+
+  it("call() lists thousands of packed tags in linear time (gate H1 of statewalker/webrun-vcs#262)", {
+    timeout: 120_000,
+  }, async () => {
+    // 5,000 packed tags: one ref store lookup per kept tag read packed-refs again for each
+    // (quadratic: 3,000 tags took 4 s, 20,000 ran out of memory)
+    const dir = repo(
+      "many-packed",
+      `git init -q && test_commit one &&
+       for i in $(seq 1 5000); do echo "create refs/tags/t$i HEAD"; done | git update-ref --stdin &&
+       git pack-refs --all`,
+    );
+    const git = await openOurs(dir);
+    const started = Date.now();
+    const refs = await git.tagList().call();
+    const elapsed = Date.now() - started;
+    expect(refs.length).toBe(5001);
+    expect(refs[0]?.name).toBe("refs/tags/one");
+    expect(elapsed).toBeLessThan(3_000);
+  });
 });
