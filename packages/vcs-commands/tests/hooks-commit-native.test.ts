@@ -185,6 +185,25 @@ describeGit("commit hooks: as native git", () => {
     );
   });
 
+  // t7505-prepare-commit-msg-hook "with -C", t7513 "commit --trailer" with hooks
+  it("-C, -s and --trailer: prepare-commit-msg is told `commit <rev>` and sees the trailers", async () => {
+    const dir = join(root, "r");
+    base(dir);
+    await expectCommit(
+      dir,
+      ["-C", "HEAD", "-s", "--trailer", "Cc: C <c@example.com>"],
+      (c) => c.setReuseMessage("HEAD").setSignoff(true).addTrailer("Cc: C <c@example.com>"),
+      "-C HEAD -s --trailer",
+      (t) => hookEdit(t, "prepare-commit-msg", "\nprepared line\n"),
+    );
+    await expectCommit(
+      dir,
+      ["--amend", "--reset-author", "-C", "HEAD", "--no-post-rewrite"],
+      (c) => c.setAmend(true).setResetAuthor(true).setReuseMessage("HEAD").setNoPostRewrite(true),
+      "--amend --reset-author -C HEAD --no-post-rewrite",
+    );
+  });
+
   it("-a: the hooks see the index lock", async () => {
     const dir = join(root, "r");
     base(dir);
