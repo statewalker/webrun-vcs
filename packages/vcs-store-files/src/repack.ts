@@ -37,10 +37,17 @@ import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { assertAlternatesReadable } from "./alternates/index.js";
+import { writeCruftPacks } from "./cruft-pack.js";
 import { type MultiPackIndexWriteOptions, multiPackIndexWrite } from "./multi-pack-index.js";
+import {
+  type PackWriteSettings,
+  packDeltaSearch,
+  readPackWriteSettings,
+} from "./pack/pack-write-settings.js";
 import { type PromisorExclusions, promisorExclusions } from "./promisor-objects.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
+import { updateServerInfo } from "./server-info.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 import {
@@ -118,6 +125,21 @@ export interface RepackOptions extends RepackTarget {
   /** The expiry of `unpackUnreachable` (git's gc.pruneExpire). Default two weeks. */
   unpackUnreachableExpireMs?: number;
   /**
+   * `git repack --cruft` (with `all`, in place of `unpackUnreachable`): the unreachable
+   * objects of the replaced packs and the unreachable loose objects go into a cruft pack
+   * (`.pack`, `.idx`, `.mtimes`, and `.rev` under `pack.writeReverseIndex`), each with the
+   * newest time of its copies, before the replaced packs are removed (see
+   * `writeCruftPacks`). `gc()` sets it from `gc.cruftPacks` (default true).
+   */
+  cruft?: boolean;
+  /**
+   * `--cruft-expiration` (seconds since the epoch): cruft objects not newer than this are
+   * dropped unless a newer one reaches them. Undefined: none expires.
+   */
+  cruftExpiration?: number;
+  /** `--max-cruft-size` (bytes, at least 1 MiB as git's): cruft packs are split to stay under it. */
+  maxCruftSize?: number;
+  /**
    * Reads the grafts file in place of `info/grafts` (git's `GIT_GRAFT_FILE`;
    * `graftFileReader(environment)` makes one): what its grafts reach is packed.
    */
@@ -152,6 +174,23 @@ export interface RepackOptions extends RepackTarget {
    * `--stdin-packs`). A bitmap asked for (`writeBitmaps`) then goes to the midx, not the pack.
    */
   writeMidx?: boolean;
+  /**
+   * The `pack.*` settings (`readPackWriteSettings`): read from the config (with
+   * `environment`'s system, global and command-line config) when not given. `deltaSearch`
+   * given as an object overrides their window and depth.
+   */
+  packSettings?: PackWriteSettings;
+  /**
+   * `git repack --keep-pack=<name>` (gc's `--keep-largest-pack`, `gc.bigPackThreshold`): packs
+   * (`pack-<id>.pack`, `pack-<id>` or the id) treated as kept in core: never replaced, their
+   * objects left out of the new pack (whatever `packKeptObjects` says) and of a cruft pack.
+   */
+  keepPacks?: readonly string[];
+  /**
+   * Write `info/refs` and `objects/info/packs` at the end (`updateServerInfo`), as git's
+   * repack does unless `-n`. Default true; not in a dry run.
+   */
+  updateServerInfo?: boolean;
   /** @internal writes the midx bitmap (see `MultiPackIndexWriteOptions.writeBitmap`) */
   writeMidxBitmap?: MultiPackIndexWriteOptions["writeBitmap"];
 }
@@ -283,6 +322,10 @@ export interface RepackResult {
   promisorPack?: { packName: string; objectCount: number };
   /** `filter`: the pack of the objects the filter left out (`pack-<id>`), when any was */
   filteredPack?: string;
+  /** `cruft`: the cruft packs written (`pack-<id>`), when any was */
+  cruftPacks?: string[];
+  /** `cruft`: the objects written to them */
+  cruftObjects?: number;
   /**
    * git's error lines from reading the alternates, which git repack prints to stderr and goes
    * on (`repack()` only; gc reports them in its own result); absent when there are none
@@ -386,6 +429,8 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
     return repackListed(options, listed, snapshot, undefined, exclusions);
   };
   const result = await run({ ...options, objects: objectsWithoutLazyFetch(options.objects) });
+  if (!options.dryRun && (options.updateServerInfo ?? true))
+    await updateServerInfo({ ...options, gitDir: options.gitDir ?? ".git" });
   return result && alternatesErrors.length > 0
     ? { ...result, errors: [...alternatesErrors] }
     : result;
@@ -423,8 +468,14 @@ export async function repackListed(
   const before = snapshot.packs;
   const kept: Pack[] = [];
   const replaced: Pack[] = [];
+  // --keep-pack: kept in core, whatever --pack-kept-objects says
+  const inCore = new Set(
+    (options.keepPacks ?? []).map((n) => n.replace(/^pack-/, "").replace(/\.pack$/, "")),
+  );
+  const keptInCore: Pack[] = [];
   for (const p of before) {
-    if (await files.exists(joinPath(packDir, `pack-${p.packId}.keep`))) kept.push(p);
+    if (inCore.has(p.packId)) keptInCore.push(p);
+    else if (await files.exists(joinPath(packDir, `pack-${p.packId}.keep`))) kept.push(p);
     else replaced.push(p);
   }
 
@@ -446,7 +497,7 @@ export async function repackListed(
   // -a: everything reachable but what .keep packs hold (all of it with --pack-kept-objects);
   // -d alone: what no pack holds (an alternate's included: pack-objects --unpacked); -l:
   // nothing an alternate holds
-  const skip = all ? (packKeptObjects ? [] : kept) : before;
+  const skip = all ? (packKeptObjects ? keptInCore : [...kept, ...keptInCore]) : before;
   const borrowed = async (id: ObjectId) => {
     for (const alt of alternates) {
       if (options.local ? await alt.objects.has(id) : !all && (await alt.packs.has(id)))
@@ -485,7 +536,7 @@ export async function repackListed(
     bitmaps.mode = "off";
   }
 
-  const keptPacks = kept.map((p) => `pack-${p.packId}`);
+  const keptPacks = [...kept, ...keptInCore].map((p) => `pack-${p.packId}`);
   if (dryRun) {
     return {
       packName: "",
@@ -497,17 +548,26 @@ export async function repackListed(
     };
   }
 
+  // pack-objects' own settings: pack.window, pack.depth, pack.compression, ...
+  const settings =
+    options.packSettings ??
+    (await readPackWriteSettings(files, gitDir, {
+      ...(options.environment ? { environment: options.environment } : {}),
+    }));
   const packOptions = {
     packs,
     reuseObjects: options.reuseObjects ?? true,
     reuseDeltas: options.reuseDeltas ?? true,
-    deltaSearch: options.deltaSearch ?? true,
+    deltaSearch: packDeltaSearch(settings, options.deltaSearch),
     bigFileThreshold: options.bigFileThreshold,
+    ...(settings.compression !== undefined ? { compression: settings.compression } : {}),
   };
+  // pack.writeReverseIndex: a `.rev` beside each pack written (git 2.41+ default)
+  const installOptions = { writeReverseIndex: settings.writeReverseIndex };
   // the promisor pack first, with its (empty) `.promisor` file, as repack-promisor.c writes it
   let promisorPack: string | undefined;
   if (promised.length > 0) {
-    const written = await packs.install(writePack(objects, promised, packOptions));
+    const written = await packs.install(writePack(objects, promised, packOptions), installOptions);
     promisorPack = written.packId;
     if (packs.writePromisor) await packs.writePromisor(promisorPack, "");
     else await files.write(joinPath(packDir, `pack-${promisorPack}.promisor`), []);
@@ -518,7 +578,7 @@ export async function repackListed(
   }
   // One stream: objects are read one at a time, the pack goes straight into its temporary file
   const stream = writePack(objects, ids, packOptions);
-  const installed = await packs.install(stream);
+  const installed = await packs.install(stream, installOptions);
   // Install before remove: every reader finds each object in the new pack from now on
   await packs.refresh();
   let bitmapWritten: boolean;
@@ -559,7 +619,8 @@ export async function repackListed(
         }
       }
       if (left.length > 0) {
-        filteredPack = (await packs.install(writePack(objects, left, packOptions))).packId;
+        filteredPack = (await packs.install(writePack(objects, left, packOptions), installOptions))
+          .packId;
         newPacks.add(filteredPack);
         await packs.refresh();
       }
@@ -576,8 +637,41 @@ export async function repackListed(
       }
     }
 
+    // --cruft: the unreachable objects of the packs about to go, and the unreachable loose
+    // ones, into a cruft pack (pack-objects --cruft, the new packs and .keep packs fresh)
+    let cruft: { packNames: string[]; objectCount: number } | undefined;
+    if (options.cruft && all) {
+      cruft = await writeCruftPacks({
+        files,
+        gitDir,
+        objects,
+        packs,
+        looseStorage,
+        discard: removable,
+        now: Math.floor(Date.now() / 1000),
+        packOptions,
+        writeReverseIndex: settings.writeReverseIndex,
+        ...(options.cruftExpiration !== undefined ? { expiration: options.cruftExpiration } : {}),
+        ...(options.maxCruftSize !== undefined ? { maxSize: options.maxCruftSize } : {}),
+        skip: async (id) => {
+          // -l: what an alternate holds; a partial clone's promisor objects stay out
+          if (exclusions?.excluded.has(id)) return true;
+          if (options.local)
+            for (const alt of alternates) if (await alt.objects.has(id)) return true;
+          return false;
+        },
+      });
+      // a cruft pack that comes out the same as a replaced one stays
+      for (const name of cruft?.packNames ?? []) {
+        const id = name.slice("pack-".length);
+        newPacks.add(id);
+        const at = removable.findIndex((r) => r.pack.packId === id);
+        if (at >= 0) removable.splice(at, 1);
+      }
+    }
+
     let unpackedObjects = 0;
-    if (options.unpackUnreachable && removable.length) {
+    if (options.unpackUnreachable && !options.cruft && removable.length) {
       unpackedObjects = await unpackUnreachable({
         files,
         gitDir,
@@ -586,6 +680,7 @@ export async function repackListed(
         // the new pack holds only reachable objects; .keep packs and the promisor pack stay
         keep: [
           ...kept,
+          ...keptInCore,
           ...(await packs.packs()).filter(
             (p) => p.packId === promisorPack || p.packId === filteredPack,
           ),
@@ -603,7 +698,7 @@ export async function repackListed(
     if (options.writeMidx) {
       const removed = new Set(removable.map((r) => r.pack.packId));
       const include = new Set<string>();
-      for (const p of kept) include.add(`pack-${p.packId}.idx`);
+      for (const p of [...kept, ...keptInCore]) include.add(`pack-${p.packId}.idx`);
       for (const id of newPacks) include.add(`pack-${id}.idx`);
       for (const p of replaced) if (!removed.has(p.packId)) include.add(`pack-${p.packId}.idx`);
       const midx = await multiPackIndexWrite({
@@ -651,6 +746,7 @@ export async function repackListed(
         ? { promisorPack: { packName: `pack-${promisorPack}`, objectCount: promised.length } }
         : {}),
       ...(filteredPack ? { filteredPack: `pack-${filteredPack}` } : {}),
+      ...(cruft ? { cruftPacks: cruft.packNames, cruftObjects: cruft.objectCount } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
       ...(midxWritten ? { midx: midxWritten } : {}),
     };

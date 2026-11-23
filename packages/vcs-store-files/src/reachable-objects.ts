@@ -12,12 +12,12 @@
  * walks the grafted ones). Replace refs are refs: the replacements are roots, and the objects
  * they replace stay reachable through whatever names them.
  *
- * Beyond git: the pseudo-refs of an operation in progress (`MERGE_HEAD`, `CHERRY_PICK_HEAD`,
- * `REVERT_HEAD`, `REBASE_HEAD`, `ORIG_HEAD`, `AUTO_MERGE`, `BISECT_HEAD`, `FETCH_HEAD`) and
- * the autostash of a merge or rebase (`MERGE_AUTOSTASH`, `rebase-merge/autostash`,
- * `rebase-apply/autostash`), of the repository and of each linked worktree, are roots too. git's `for_each_ref` does not list
- * them, so `git gc --prune=now` may delete a commit only they name (one fetched into
- * `FETCH_HEAD` alone, or a merged branch deleted mid-merge); we keep it.
+ * As git, the pseudo-refs of an operation in progress (`MERGE_HEAD`, `CHERRY_PICK_HEAD`,
+ * `ORIG_HEAD`, `FETCH_HEAD`, `MERGE_AUTOSTASH`, ...) are no roots: `rev-list --all` (repack's
+ * pack-objects) does not list them, so a commit only they name is unreachable (a cruft object
+ * that expires, or gone with `--prune=now`). git's prune (`mark_reachable_objects`, 2.5x:
+ * `add_rebase_files`) also keeps what `rebase-apply/` and `rebase-merge/`'s `autostash` and
+ * `orig-head` name, in every worktree: `rebaseFiles` adds those.
  *
  * A split index (a `link` extension) is read with its shared index (`sharedindex.<id>`), so
  * the blobs staged there stay roots; a sparse index's sparse directories are roots as the
@@ -96,14 +96,21 @@ export interface ReachabilityRoots {
   extraRoots?: Iterable<ObjectId>;
   /** A filter the listing applies (`git repack --filter=<spec>`'s pack-objects `--filter`) */
   filter?: ResolvedObjectFilter;
+  /**
+   * Also the commits `rebase-apply/autostash`, `rebase-apply/orig-head`,
+   * `rebase-merge/autostash` and `rebase-merge/orig-head` name, of the repository and of every
+   * linked worktree: git 2.5x's prune (`add_rebase_files`); repack and 2.43 do not
+   */
+  rebaseFiles?: boolean;
 }
 
 /**
  * The roots of reachability: every ref, HEAD, the old and new ids of every reflog entry
  * (`logs/HEAD`, `logs/refs/...`), the entries of the index (gitlinks excepted, every stage),
- * the trees of its cache-tree (TREE) and the blobs of its resolve-undo (REUC) extension, the
- * pseudo-refs (see above), and for each linked worktree (`worktrees/<name>/`) its HEAD
- * (detached or symbolic), index, reflogs and pseudo-refs, as git's `other_head_refs` and its
+ * the trees of its cache-tree (TREE) and the blobs of its resolve-undo (REUC) extension (with
+ * `rebaseFiles`, the rebase files: see above), and for each linked worktree
+ * (`worktrees/<name>/`) its HEAD (detached or symbolic), index and reflogs (and rebase
+ * files), as git's `other_head_refs` and its
  * worktree index and reflog walks. Roots the store does not have are left out (a reflog may
  * name objects pruned long ago).
  *
@@ -114,7 +121,7 @@ export interface ReachabilityRoots {
  * A ref, HEAD (a linked worktree's too) or index entry whose object is not stored throws
  * ({@link MissingRootError}: `bad object <name>`, `unable to read <id>`), as git's
  * `get_reference` and pack-objects die (an alternate that cannot be read hides what it holds:
- * pruning then would delete what the missing commits reach). Reflog entries, pseudo-refs and
+ * pruning then would delete what the missing commits reach). Reflog entries, rebase files and
  * the cache-tree's and resolve-undo's ids are left out when missing, as git tolerates them.
  *
  * @example
@@ -181,7 +188,7 @@ async function collectRoots(
 
   for (const id of await reflogIds(files, joinPath(gitDir, "logs"))) tips.add(id);
   requireIndex(await indexIds(files, joinPath(gitDir, "index")));
-  for (const id of await pseudoRefIds(files, gitDir)) tips.add(id);
+  if (roots.rebaseFiles) for (const id of await rebaseFileIds(files, gitDir)) tips.add(id);
   for (const id of roots.extraRoots ?? []) tips.add(id);
 
   // Linked worktrees: their HEAD, index and reflogs live under worktrees/<name>/
@@ -208,7 +215,7 @@ async function collectRoots(
       }
       for (const id of await reflogIds(files, joinPath(wt.path, "logs"))) tips.add(id);
       requireIndex(await indexIds(files, joinPath(wt.path, "index")));
-      for (const id of await pseudoRefIds(files, wt.path)) tips.add(id);
+      if (roots.rebaseFiles) for (const id of await rebaseFileIds(files, wt.path)) tips.add(id);
     }
   }
 
@@ -276,36 +283,34 @@ export async function listReachableObjects(roots: ReachabilityRoots): Promise<Li
   return listed;
 }
 
-/**
- * Pseudo-refs of an operation in progress, which name commits a reflog may not: a merge's
- * `MERGE_HEAD` (one line per merged head), `FETCH_HEAD` (one line per fetched ref), the
- * single-id ones, and the stash commits `--autostash` keeps while a merge or rebase runs
- * (`MERGE_AUTOSTASH`, `rebase-merge/autostash`, `rebase-apply/autostash`), which nothing else
- * names until they are applied or stored in the stash.
- */
-const PSEUDO_REFS = [
-  "ORIG_HEAD",
-  "MERGE_HEAD",
-  "CHERRY_PICK_HEAD",
-  "REVERT_HEAD",
-  "REBASE_HEAD",
-  "AUTO_MERGE",
-  "BISECT_HEAD",
-  "FETCH_HEAD",
-  "MERGE_AUTOSTASH",
-  "rebase-merge/autostash",
+/** The files git's prune (2.5x `add_rebase_files`) reads in each worktree's git directory. */
+const REBASE_FILES = [
   "rebase-apply/autostash",
+  "rebase-apply/orig-head",
+  "rebase-merge/autostash",
+  "rebase-merge/orig-head",
 ];
 
-/** The object ids at the start of the lines of the pseudo-refs in `dir`. */
-async function pseudoRefIds(files: FilesApi, dir: string): Promise<ObjectId[]> {
+/**
+ * The ids git 2.5x's prune adds from the rebase files (`add_rebase_files`) of the repository
+ * and of each linked worktree.
+ */
+export async function rebaseFileRoots(files: FilesApi, gitDir = ".git"): Promise<ObjectId[]> {
+  const ids = await rebaseFileIds(files, gitDir);
+  const worktrees = joinPath(gitDir, "worktrees");
+  if ((await files.stats(worktrees))?.kind === "directory")
+    for await (const wt of files.list(worktrees))
+      if (wt.kind === "directory") ids.push(...(await rebaseFileIds(files, wt.path)));
+  return ids;
+}
+
+/** The object ids the rebase files in `dir` name (the first line of each). */
+async function rebaseFileIds(files: FilesApi, dir: string): Promise<ObjectId[]> {
   const ids: ObjectId[] = [];
-  for (const name of PSEUDO_REFS) {
+  for (const name of REBASE_FILES) {
     const text = await readText(files, joinPath(dir, name));
-    for (const line of text?.split("\n") ?? []) {
-      const id = line.slice(0, 40).toLowerCase();
-      if (OID.test(id) && id !== ZERO) ids.push(id);
-    }
+    const id = text?.slice(0, 40).toLowerCase();
+    if (id && OID.test(id) && id !== ZERO) ids.push(id);
   }
   return ids;
 }

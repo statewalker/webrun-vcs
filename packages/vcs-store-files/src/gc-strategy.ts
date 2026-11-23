@@ -3,7 +3,7 @@
  *
  * Implements GcStrategy for file-backed repositories:
  * - collectRoots: what git keeps beyond the refs (`collectReachabilityRoots`: HEAD, the index
- *   with its cache-tree and resolve-undo, every reflog, linked worktrees, pseudo-refs)
+ *   with its cache-tree and resolve-undo, every reflog, linked worktrees, the rebase files)
  * - recentObjects: unreachable loose objects modified within the grace period (git's
  *   `gc.pruneExpire`), which the orchestrator keeps with what they reach
  * - prune: remove unreachable loose objects
@@ -63,7 +63,7 @@ export class FileGcStrategy implements GcStrategy {
   }
 
   /**
-   * HEAD, the index, every reflog file, linked worktrees and pseudo-refs; strict, as `gc()`.
+   * HEAD, the index, every reflog file, linked worktrees and the rebase files; strict, as `gc()`.
    * Called first by the orchestrator, so it also refuses, before anything is pruned, a
    * repository with `extensions.preciousObjects` (git: "cannot prune in a precious-objects
    * repo"): `UnsupportedRepositoryFormatError`. In a partial clone (a promisor remote) the
@@ -81,7 +81,14 @@ export class FileGcStrategy implements GcStrategy {
       partialClone: "allow",
     });
     await assertAlternatesReadable({ files, gitDir, objects }, "prune");
-    const roots = await collectReachabilityRoots({ files, gitDir, refs: history.refs, objects });
+    // git prune's roots (mark_reachable_objects): 2.5x's rebase files included
+    const roots = await collectReachabilityRoots({
+      files,
+      gitDir,
+      refs: history.refs,
+      objects,
+      rebaseFiles: true,
+    });
     // a partial clone: its promisor objects are kept unwalked, the local objects they link to
     // walked as roots (gc's --exclude-promisor-objects and repack_local_links)
     const exclusions = await promisorExclusions(objects, files, gitDir);

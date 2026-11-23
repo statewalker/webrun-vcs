@@ -1596,6 +1596,54 @@ describeGit("fsck against native git", () => {
     expect(oursOnly.errorOutput).toBe(theirsOnly.stderr);
     expect(oursOnly.exitCode).toBe(theirsOnly.status);
   });
+  it("a pack's .rev checked as git's verify_reverse_indices (t5325: invalid checksum, row position, corrupt)", async () => {
+    const dir = newRepo();
+    commitFiles(dir, { a: "a\n", "d/b": "b\n" }, "one");
+    commitFiles(dir, { a: "a2\n" }, "two");
+    g(dir, "-c", "pack.writeReverseIndex=true", "repack", "-adbq");
+    expect(await compare(dir, [])).toEqual({ stdout: "", stderr: "", exit: 0 });
+    const packDir = join(dir, ".git", "objects", "pack");
+    const rev = join(packDir, readdirSync(packDir).find((f) => f.endsWith(".rev")) as string);
+    const bitmap = readdirSync(packDir).find((f) => f.endsWith(".bitmap")) as string;
+    const files = createNodeFilesApi({ rootDir: dir });
+    const run = async (connectivityOnly: boolean) =>
+      (await openOurs(dir))
+        .fsck()
+        .setRepositoryFiles({ files })
+        .setCompatibility(compatibility)
+        .setConnectivityOnly(connectivityOnly)
+        .call();
+    const same = async () => {
+      for (const only of [false, true]) {
+        const theirs = native(dir, [
+          "fsck",
+          ...noReferences,
+          ...(only ? ["--connectivity-only"] : []),
+        ]);
+        const ours = await run(only);
+        expect(ours.errorOutput).toBe(theirs.stderr);
+        expect(ours.exitCode).toBe(theirs.status);
+      }
+    };
+    chmodSync(rev, 0o644);
+    const good = readFileSync(rev);
+    // two positions swapped: the checksum and both rows (2.43: bit 0100, --connectivity-only too)
+    const swapped = Buffer.from(good);
+    good.copy(swapped, 12, 16, 20);
+    good.copy(swapped, 16, 12, 16);
+    writeFileSync(rev, swapped);
+    await same();
+    // with a bad bitmap too: the .rev lines come first in both versions
+    flipByte(join(packDir, bitmap), 40);
+    await same();
+    // truncated: git cannot load it
+    writeFileSync(rev, good.subarray(0, good.length - 4));
+    await same();
+    // a bad checksum alone
+    writeFileSync(rev, good);
+    flipByte(rev, -1);
+    await same();
+  });
   it("verifies the multi-pack-index (git multi-pack-index verify): stale, damaged, refused", async () => {
     const dir = newRepo();
     commitFiles(dir, { a: "a\n" }, "one");

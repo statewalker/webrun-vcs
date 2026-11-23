@@ -1215,7 +1215,9 @@ export function createFilesRefOps(
           }
         }
       }
-      if (packedNow.size) await commit(await serializePacked(packed, options.peel));
+      // git's packed transaction writes packed-refs even with nothing to pack (an empty
+      // repository's gc leaves the header alone)
+      await commit(await serializePacked(packed, options.peel));
     });
     if (r === "held") throw new PackedRefsLockedError(packedLockTimeout);
     await hook?.("committed", told, { packed: true });

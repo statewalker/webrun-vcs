@@ -84,6 +84,16 @@ export interface OpenPackSetOptions {
    * checksum does not match, or one naming packs that are gone is not used (`midxErrors`).
    */
   multiPackIndex?: boolean;
+  /**
+   * Write `pack-<id>.rev` beside each pack `install` writes (git's `pack.writeReverseIndex`,
+   * default true since 2.41), unless the install says otherwise.
+   */
+  writeReverseIndex?: boolean;
+  /**
+   * Take each pack's order from its `.rev` file where one is present and valid (git's
+   * `pack.readReverseIndex`, default true); else it is computed from the idx's offsets.
+   */
+  readReverseIndex?: boolean;
 }
 
 /** The packs of one directory, read as one object store. */
@@ -147,6 +157,8 @@ export interface PackSet {
   listPrefix?(prefix: string, options?: { packs?: readonly Pack[] }): AsyncIterable<ObjectId>;
   /** The packs, in lookup order (newest first), after a rescan within the rate limit. */
   packs(): Promise<readonly Pack[]>;
+  /** Whether `install` writes `.rev` files unless told otherwise (`pack.writeReverseIndex`). */
+  readonly writeReverseIndex?: boolean;
   /** Installs a pack with `installPack` into the directory and adds it to the set. */
   install(source: AsyncIterable<Uint8Array>, options?: InstallPackOptions): Promise<InstalledPack>;
   /** Removes packs: `.idx` first, then `.pack`, and `.keep`, `.rev`, `.bitmap`… if present. */
@@ -422,6 +434,7 @@ export async function openPackSet(
         baseCache,
         maxObjectSize,
         externalBase,
+        ...(options.readReverseIndex === false ? { readReverseIndex: false } : {}),
       }).finally(() => opening.delete(name));
       opening.set(name, pending);
     }
@@ -798,6 +811,8 @@ export async function openPackSet(
               at += c.length;
             }
           }
+          // the pack order from its .rev where valid (git's load_pack_revindex)
+          await p.loadReverseIndex?.();
           const index = parsePackBitmap(bytes, p, path);
           loadedBitmaps.set(p, { signature: sig, index });
           return index;
@@ -930,8 +945,13 @@ export async function openPackSet(
       await rescanOnMiss();
       return [...packs];
     },
+    writeReverseIndex: options.writeReverseIndex ?? true,
     async install(source, o) {
-      const r = await installPack(files, dir, source, { maxObjectSize, ...o });
+      const r = await installPack(files, dir, source, {
+        maxObjectSize,
+        writeReverseIndex: options.writeReverseIndex ?? true,
+        ...o,
+      });
       const name = `pack-${r.packId}`;
       if (!byName.has(name)) {
         // taken before the open, as a scan does: the pack is retried once its files change

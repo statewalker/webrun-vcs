@@ -28,16 +28,22 @@ export * from "./promisor-objects.js";
 export * from "./quarantine/index.js";
 // Reachability roots (refs, reflogs, index) for repack and gc
 export * from "./reachable-objects.js";
+// `git reflog expire --all`, as gc runs it
+export * from "./reflog-expire.js";
 // Refs (file-dependent)
 export * from "./refs/index.js";
 // Repack
 export * from "./repack.js";
 // core.repositoryformatversion and extensions.*, checked as git does
 export * from "./repository-format.js";
+// `git rerere gc`, as gc runs it
+export * from "./rerere-gc.js";
 // A `.git` or `.git/objects` linked elsewhere, resolved through the FilesApi
 export * from "./resolve-linked-git-dir.js";
 // Repository safety: ownership (safe.directory), safe.bareRepository, discovery
 export * from "./safety/index.js";
+// `git update-server-info`, as repack runs it
+export * from "./server-info.js";
 // Storage implementations (file-dependent)
 export * from "./storage/index.js";
 // Workspace implementations (file-dependent)

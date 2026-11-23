@@ -111,6 +111,10 @@ export async function beginFilesQuarantine(
   const packs = await openPackSet(files, packDir, {
     externalBase: async (id) => (await looseOnly.get(id)) ?? options.objects.get(id),
     freshenMaxAgeMs,
+    // the repository's pack.writeReverseIndex
+    ...(options.packs.writeReverseIndex !== undefined
+      ? { writeReverseIndex: options.packs.writeReverseIndex }
+      : {}),
   });
   const quarantined = withPacks(createGitObjects(skipPacked(staging, packs)), packs);
   const overlay = overlayObjects(quarantined, options.objects);

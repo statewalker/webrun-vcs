@@ -273,11 +273,10 @@ describe("GcOrchestrator keeps what native git keeps", () => {
     git(dir, ["reset", "-q", "--hard", "HEAD~1"]);
     expireReflogs(dir);
     expect(git(dir, ["rev-parse", "ORIG_HEAD"]).trim()).toBe(id);
-    // git gc --prune=now deletes it (pseudo-refs are not roots there): we keep more
+    // git gc --prune=now deletes it (pseudo-refs are not roots there): so do we
     const { ours, native } = await check(dir, false);
     expect(native.has(id)).toBe(false);
-    expect(ours.has(id)).toBe(true);
-    git(dir, ["rev-parse", "--verify", "ORIG_HEAD^{tree}"]);
+    expect(ours.has(id)).toBe(false);
   });
 
   it("a merged commit only MERGE_HEAD names, mid-merge", async () => {
@@ -294,10 +293,10 @@ describe("GcOrchestrator keeps what native git keeps", () => {
     git(dir, ["branch", "-q", "-D", "topic"]);
     expireReflogs(dir);
     expect(git(dir, ["rev-parse", "MERGE_HEAD"]).trim()).toBe(topic);
-    // git gc --prune=now deletes it (pseudo-refs are not roots there): we keep more
+    // git gc --prune=now deletes it (pseudo-refs are not roots there): so do we
     const { ours, native } = await check(dir, false);
     expect(native.has(topic)).toBe(false);
-    expect(ours.has(topic)).toBe(true);
+    expect(ours.has(topic)).toBe(false);
   });
 
   it("a shallow clone: the absent parents beyond the boundary do not abort", async () => {
@@ -383,7 +382,11 @@ function conflictedWithDirtyWorktree(): string {
   return dir;
 }
 
-describe("GcOrchestrator keeps the autostash of a merge or rebase in progress", () => {
+/**
+ * git 2.5x's prune keeps the rebase files' autostash (`add_rebase_files`), and so does
+ * `FileGcStrategy`; `MERGE_AUTOSTASH` is a pseudo-ref, which git's gc drops, and so do we.
+ */
+describe("GcOrchestrator keeps the autostash of a rebase in progress", () => {
   it.each([
     [
       "rebase (merge backend): rebase-merge/autostash",
@@ -394,11 +397,6 @@ describe("GcOrchestrator keeps the autostash of a merge or rebase in progress", 
       "rebase --apply: rebase-apply/autostash",
       ["rebase", "--apply", "--autostash", "topic"],
       ".git/rebase-apply/autostash",
-    ],
-    [
-      "merge --autostash: MERGE_AUTOSTASH",
-      ["merge", "--autostash", "--no-edit", "topic"],
-      ".git/MERGE_AUTOSTASH",
     ],
   ])("%s", async (_name, args, file) => {
     const dir = conflictedWithDirtyWorktree();
