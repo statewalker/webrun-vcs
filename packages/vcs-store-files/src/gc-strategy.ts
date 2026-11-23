@@ -55,8 +55,6 @@ export type FileGcStrategyOptions = RepackTarget;
 export class FileGcStrategy implements GcStrategy {
   private readonly looseStorage: FileRawStorage;
   private readonly target: RepackTarget;
-  /** the grace period's cutoff of the last `recentObjects` (ms), checked again by `prune` */
-  private pruneCutoff: number | undefined;
 
   constructor(options: FileGcStrategyOptions) {
     this.looseStorage = options.looseStorage;
@@ -105,7 +103,6 @@ export class FileGcStrategy implements GcStrategy {
   async recentObjects(ids: Set<ObjectId>, pruneExpireMs: number): Promise<Set<ObjectId>> {
     const { files, gitDir = ".git" } = this.target;
     const cutoff = Date.now() - pruneExpireMs;
-    this.pruneCutoff = cutoff;
     const recent = new Set<ObjectId>();
     for (const id of ids) {
       const stats = await files.stats(joinPath(gitDir, "objects", id.slice(0, 2), id.slice(2)));
@@ -115,22 +112,9 @@ export class FileGcStrategy implements GcStrategy {
     return recent;
   }
 
-  /**
-   * Removes the loose objects among `unreachableIds`. After `recentObjects` judged them old, a
-   * file renewed since (a write that found the object stored freshens it, git's
-   * `odb_freshen_object`: it is about to be named) is kept, as prune checks the mtime right
-   * before its unlink.
-   */
   async prune(unreachableIds: Set<string>): Promise<number> {
-    const { files, gitDir = ".git" } = this.target;
-    const cutoff = this.pruneCutoff;
     let removed = 0;
     for (const id of unreachableIds) {
-      if (cutoff !== undefined) {
-        const path = joinPath(gitDir, "objects", id.slice(0, 2), id.slice(2));
-        const modified = (await files.stats(path))?.lastModified;
-        if (modified !== undefined && modified >= cutoff) continue;
-      }
       if (await this.looseStorage.remove(id)) {
         removed++;
       }

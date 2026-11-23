@@ -101,7 +101,6 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
   private _cruft?: boolean;
   private _maxCruftSize?: number;
   private _keepLargestPack?: boolean;
-  private _force = false;
 
   /**
    * `git gc --auto`: housekeeping only when needed (git's `need_to_gc`: more loose objects
@@ -213,16 +212,6 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
     const loose = new RegExp(`^[0-9a-f]{${this.objectFormat.hexLength - 2}}$`);
     const inSeventeen = (await names("17")).filter((n) => loose.test(n)).length;
     return inSeventeen * 256 > Math.ceil(gcAuto / 256) * 256;
-  }
-
-  /**
-   * `--force`: run even when `gc.pid` says another gc is running (git's `lock_repo_for_gc`
-   * with `force`); `gc.pid.lock` must still be free.
-   */
-  setForce(force: boolean): this {
-    this.checkCallable();
-    this._force = force;
-    return this;
   }
 
   /**
@@ -385,15 +374,11 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
       ...(this._keepLargestPack !== undefined ? { keepLargestPack: this._keepLargestPack } : {}),
       ...(this._aggressive ? { aggressive: true } : {}),
       ...(this._auto ? { auto: true } : {}),
-      ...(this._force ? { force: true } : {}),
     });
     if (details.skipped) {
-      // hold_lock_file_for_update(LOCK_DIE_ON_ERROR) dies, --auto too
-      if (details.lockFileExists) throw new GitApiError(this.gcLockFileMessage());
       if (this._auto) return skipped("running");
-      const holder = details.lockHolder;
       throw new GitApiError(
-        `fatal: gc is already running on machine '${holder?.machine}' pid ${holder?.pid} (use --force if not)`,
+        "fatal: gc is already running on this repository (gc.pid is held; remove it if no gc runs)",
       );
     }
     const storage = details.storage;
@@ -413,20 +398,5 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
       ...(details.warnings ? { warnings: details.warnings } : {}),
       details,
     };
-  }
-
-  /** git's `unable_to_lock_die` for `gc.pid.lock` (2.43's longer advice under its compatibility). */
-  private gcLockFileMessage(): string {
-    const gitDir = (this.workingCopy as { config?: { hostGitDir?: string } }).config?.hostGitDir;
-    const path = gitDir ? `${gitDir.replace(/\/+$/, "")}/gc.pid.lock` : ".git/gc.pid.lock";
-    const advice =
-      this.hooks.compatibility === "2.43"
-        ? "Another git process seems to be running in this repository, e.g.\n" +
-          "an editor opened by 'git commit'. Please make sure all processes\n" +
-          "are terminated then try again. If it still fails, a git process\n" +
-          "may have crashed in this repository earlier:\n" +
-          "remove the file manually to continue."
-        : "Another git process seems to be running in this repository, or the lock file may be stale";
-    return `fatal: Unable to create '${path}': File exists.\n\n${advice}`;
   }
 }

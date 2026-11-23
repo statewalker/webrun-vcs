@@ -693,16 +693,6 @@ export async function repackListed(
       });
     }
 
-    // A write that found one of its objects in a pack about to go freshened that pack since
-    // the list was made (git's freshen_packed_object): the object is about to be named, the
-    // pack stays (its objects are now in two packs, which every reader accepts)
-    for (let i = removable.length - 1; i >= 0; i--) {
-      const r = removable[i] as (typeof removable)[number];
-      const modified = (await files.stats(joinPath(packDir, `pack-${r.pack.packId}.pack`)))
-        ?.lastModified;
-      if (modified !== undefined && modified !== r.modified && modified > snapshot.walkStartedAt)
-        removable.splice(i, 1);
-    }
     const packsRemoved = removable.map((r) => `pack-${r.pack.packId}`);
     // --write-midx: the midx of what stays, written before anything is removed
     let midxWritten: string | undefined;

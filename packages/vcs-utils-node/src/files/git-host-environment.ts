@@ -5,7 +5,7 @@
  * (`core.autocrlf`, `core.attributesFile`, includes with `~/`) apply as in git. Its shape is
  * `GitHostEnvironment` of `@statewalker/vcs-working-tree`.
  */
-import { homedir, hostname, type as osType, userInfo } from "node:os";
+import { homedir, type as osType, userInfo } from "node:os";
 
 import { type FilesApi, readFile } from "@statewalker/vcs-utils/files";
 
@@ -69,8 +69,6 @@ export interface NodeGitHostEnvironment {
   statFile?(path: string): Promise<import("@statewalker/vcs-utils/files").LinkStats | undefined>;
   realPath?(path: string): Promise<string | undefined>;
   systemName?: string;
-  /** gc.pid's process id and host name, and whether a process of this host runs */
-  gcProcess?: { pid: number; hostName: string; isRunning(pid: number): boolean };
   disableUntrackedCache?: boolean;
   forceUntrackedCache?: boolean;
   home?: string;
@@ -433,19 +431,6 @@ export function createNodeGitHostEnvironment(
         }),
     // uname's sysname (the untracked cache's ident: "Linux", "Darwin", "Windows_NT")
     systemName: osType(),
-    // gc.pid's `<pid> <host>`, and kill(pid, 0) for a lock of this host (lock_repo_for_gc)
-    gcProcess: {
-      pid: process.pid,
-      hostName: gcHostName(),
-      isRunning: (pid: number) => {
-        try {
-          process.kill(pid, 0);
-          return true;
-        } catch (error) {
-          return (error as { code?: string }).code === "EPERM";
-        }
-      },
-    },
     ...(env.GIT_DISABLE_UNTRACKED_CACHE !== undefined && envBool(env.GIT_DISABLE_UNTRACKED_CACHE)
       ? { disableUntrackedCache: true }
       : {}),
@@ -516,13 +501,4 @@ export function createNodeGitHostEnvironment(
     ...(envBool(env.GIT_DISCOVERY_ACROSS_FILESYSTEM) ? { discoveryAcrossFilesystem: true } : {}),
     prefix: options.prefix ?? "/usr",
   };
-}
-
-/** The host's name as git's `xgethostname` gives it, "unknown" when there is none. */
-function gcHostName(): string {
-  try {
-    return hostname() || "unknown";
-  } catch {
-    return "unknown";
-  }
 }

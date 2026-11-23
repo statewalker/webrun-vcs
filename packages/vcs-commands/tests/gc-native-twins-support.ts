@@ -21,7 +21,6 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import type { FilesApi } from "@statewalker/vcs-core";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
 import {
   createNodeFilesApi,
@@ -411,10 +410,8 @@ export async function openOursGc(
   twinDir: string,
   repo = "repo",
   env: Record<string, string> = {},
-  /** wraps the twin's FilesApi (a test injecting steps into a gc) */
-  wrapFiles: (files: FilesApi) => FilesApi = (files) => files,
 ): Promise<Git> {
-  const files = wrapFiles(createNodeFilesApi({ rootDir: twinDir }));
+  const files = createNodeFilesApi({ rootDir: twinDir });
   const bare = !existsSync(join(twinDir, repo, ".git"));
   const gitDir = bare ? repo : `${repo}/.git`;
   const fullEnv = gcEnv(home, env);

@@ -150,7 +150,7 @@ describe("ref batches and gc through FilesApi.createExclusive", () => {
     expect(calls).toContain("/.git/packed-refs.lock");
   });
 
-  it("gcs on two FilesApi instances: one takes gc.pid (under gc.pid.lock), the other is skipped", async () => {
+  it("gcs on two FilesApi instances: one takes gc.pid, the other is skipped", async () => {
     const base = createInMemoryFilesApi();
     await createGitFilesBackend({ files: base, create: true });
     const one = withCreateExclusive(base);
@@ -162,9 +162,8 @@ describe("ref batches and gc through FilesApi.createExclusive", () => {
       gc({ history: b.history, files: two.files }),
     ]);
     expect([ra.skipped, rb.skipped].sort()).toEqual([false, true]);
-    expect(one.calls.some((p) => p.endsWith(".git/gc.pid.lock"))).toBe(true);
+    expect(one.calls.some((p) => p.endsWith(".git/gc.pid"))).toBe(true);
     expect(await base.exists(".git/gc.pid")).toBe(false);
-    expect(await base.exists(".git/gc.pid.lock")).toBe(false);
   });
 });
 

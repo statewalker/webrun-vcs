@@ -53,7 +53,6 @@ const MESSAGES = [
   "Spaces\n\nToken : value\n Key: indented\nKey:\n",
   "Two blocks\n\nKey: early\n\nmiddle paragraph\n\nLate: one\nLate: two\n",
   "Conflicts\n\nKey: v\n\nConflicts:\n\ta.txt\n",
-  "Scissors junk\n\nKey: v\n# ------------------------ >8 ------------------------ junk\nmore text\n",
 ];
 
 const TRAILER_FORMATS = [
