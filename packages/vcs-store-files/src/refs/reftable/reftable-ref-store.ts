@@ -68,6 +68,7 @@ import { atomicFilesOver, joinPath } from "@statewalker/vcs-utils/files";
 import { isRootRefName, RefUpdateRejectedError } from "../files-ref-batch.js";
 import { readLooseRef } from "../ref-reader.js";
 import { createFileRefStore, type FileRefStore } from "../ref-store.files.js";
+import { ReftablePartialCommitError } from "./reftable-errors.js";
 import {
   createReftableStackReader,
   type ReftableStackReader,
@@ -235,6 +236,20 @@ export class ReftableRefStore implements Refs {
       gitDir,
       commonDir: this.commonDir,
     });
+  }
+
+  /**
+   * The store of the repository's own git directory: the main worktree's refs (HEAD, root
+   * refs, `refs/bisect/` ...) and the shared ones; this store itself in the main worktree.
+   * gc, repack and fsck take their roots from it whichever worktree they run in.
+   */
+  repositoryStore(): ReftableRefStore {
+    return this.gitDir === this.commonDir ? this : this.forGitDir(this.commonDir);
+  }
+
+  /** git's reftable_stack_clean of this store's own stack (see `ReftableStackWriter.clean`). */
+  cleanStack(): Promise<void> {
+    return (this.own ?? this.main).writer.clean();
   }
 
   /**
@@ -755,7 +770,9 @@ export class ReftableRefStore implements Refs {
       for (;;) {
         let more = false;
         for (const u of planned.updates) {
-          for (const n of [u.name, ...u.reflogAlso]) {
+          // the stack of the ref asked for first (git queues the update as asked, then the
+          // ref it names, then HEAD's log-only update)
+          for (const n of [u.requested, u.name, ...u.reflogAlso]) {
             const where = this.stackFor(n);
             if (where && !tx.holds(where.stack)) {
               await tx.lock(where.stack);
@@ -1117,9 +1134,25 @@ class Transaction {
         logs,
       });
     }
-    const pending = [...this.additions.values()];
+    // stack after stack, in the order they were locked (git's reftable_be_transaction_finish);
+    // whatever fails, no stack is left locked
+    const pending = [...this.additions];
     this.additions.clear();
-    for (const addition of pending) await addition.commit();
+    let done = 0;
+    try {
+      for (const [, addition] of pending) {
+        await addition.commit();
+        done++;
+      }
+    } catch (error) {
+      for (const [, addition] of pending.slice(done)) await addition.rollback().catch(() => {});
+      if (done === 0) throw error;
+      throw new ReftablePartialCommitError(
+        pending.slice(0, done).map(([stack]) => stack.dir),
+        (pending[done] as [StackHandle, ReftableAddition])[0].dir,
+        { cause: error },
+      );
+    }
   }
 
   async rollback(): Promise<void> {

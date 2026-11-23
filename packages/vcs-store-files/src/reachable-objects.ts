@@ -142,7 +142,12 @@ export async function collectReachabilityRoots(roots: ReachabilityRoots): Promis
 async function collectRoots(
   roots: ReachabilityRoots,
 ): Promise<{ ids: ObjectId[]; paths: Map<ObjectId, string> }> {
-  const { files, refs, objects } = roots;
+  const { files, objects } = roots;
+  // a reftable store of a linked worktree reads that worktree's HEAD and own refs: the roots
+  // are the repository's (the main worktree's own refs and reflogs, git's other_head_refs),
+  // the linked worktrees' come from the loop over `worktrees/` below
+  const refs =
+    (roots.refs as { repositoryStore?(): Refs }).repositoryStore?.call(roots.refs) ?? roots.refs;
   const gitDir = roots.gitDir ?? ".git";
   const tips = new Set<ObjectId>();
   // roots that must be stored, with git's message when one is not (the first naming wins)

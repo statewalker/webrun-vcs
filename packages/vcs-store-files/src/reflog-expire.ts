@@ -147,9 +147,20 @@ export async function expireReflogs(options: ExpireReflogsOptions): Promise<Expi
   };
 
   const graph = new CommitGraph(objects);
-  const reftable = options.refs as Partial<ReftableReflogs>;
+  // a reftable store (of whichever worktree gc runs in): the repository's, whose reflogs
+  // are the main worktree's and the shared ones, the linked worktrees' named by id
+  const repository =
+    (options.refs as { repositoryStore?(): ExpireReflogsOptions["refs"] }).repositoryStore?.call(
+      options.refs,
+    ) ?? options.refs;
+  const reftable = repository as Partial<ReftableReflogs>;
   if (reftable.reflogNames && reftable.expireReflog) {
-    return expireReftableReflogs(reftable as ReftableReflogs, options, policyOf, graph);
+    return expireReftableReflogs(
+      reftable as ReftableReflogs,
+      { ...options, refs: repository },
+      policyOf,
+      graph,
+    );
   }
   const reflogs = await collectReflogs(files, gitDir);
   const atomic = atomicFilesOver(files, gitDir);

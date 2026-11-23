@@ -308,14 +308,14 @@ export class InitCommand {
       // re-created: creating rewrites the config, and its remotes and settings with it.
       const fresh = !hasHead && !(await isFile(`${dir}/config`));
       if (!hasHead) await chooseBranch();
+      else if (this.initialBranch !== undefined) {
+        warnings.push(`warning: re-init: ignored --initial-branch=${this.initialBranch}`);
+      }
       // the ref storage of a repository created here (an existing one keeps its own)
       const refFormat = fresh
         ? await defaultRefFormat(this.environment, this.refFormat)
         : undefined;
       if (refFormat) warnings.push(...refFormat.warnings);
-      else if (this.initialBranch !== undefined) {
-        warnings.push(`warning: re-init: ignored --initial-branch=${this.initialBranch}`);
-      }
       const open = (create: boolean) =>
         createGitFilesHistoryFromFiles({
           files: repoFiles,

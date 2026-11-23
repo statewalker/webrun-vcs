@@ -16,6 +16,7 @@ import {
   createReftableRefStore,
   createReftableStackReader,
   openReftable,
+  ReftablePartialCommitError,
   RefUpdateRejectedError,
 } from "../../src/refs/index.js";
 
@@ -223,5 +224,96 @@ describe("reftable ref store writes", () => {
     for await (const _ of refs.list("refs/heads/")) count++;
     expect(count).toBe(200);
     expect((await (await refs.getReflog("refs/heads/b7"))?.getLastEntry())?.comment).toBe("m7");
+  });
+
+  it("a clean running while a compaction writes never deletes the compacted table (C2)", async () => {
+    const base = createInMemoryFilesApi();
+    const other = createReftableRefStore({
+      files: base,
+      gitDir: ".git",
+      write: { autoCompaction: false },
+    });
+    // a FilesApi whose next take of tables.list.lock after the compaction released it first
+    // lets another writer clean the stack (git's reftable_stack_clean, or ours)
+    let takes = 0;
+    let armed = false;
+    const files = new Proxy(base, {
+      get(target, prop, receiver) {
+        if (prop === "createExclusive") {
+          return async (path: string, content: Uint8Array[]) => {
+            if (armed && path.endsWith("reftable/tables.list.lock") && ++takes === 2) {
+              await other.cleanStack();
+            }
+            return (
+              target.createExclusive as (p: string, c: Uint8Array[]) => Promise<boolean>
+            ).call(target, path, content);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const refs = createReftableRefStore({
+      files,
+      gitDir: ".git",
+      write: { autoCompaction: false },
+    });
+    await refs.initialize();
+    await refs.setSymbolic("HEAD", "refs/heads/main");
+    for (let i = 0; i < 3; i++) await refs.set(`refs/heads/b${i}`, A);
+    armed = true;
+    await refs.packRefs([], { all: true });
+    expect(takes).toBeGreaterThanOrEqual(2);
+    const [only, ...rest] = await tableNames(base);
+    expect(rest).toEqual([]);
+    expect(await base.exists(`.git/reftable/${only}`)).toBe(true);
+    for (let i = 0; i < 3; i++) expect((await refs.resolve(`refs/heads/b${i}`))?.objectId).toBe(A);
+  });
+
+  it("a transaction over two stacks whose commit fails releases every lock and says so (H1)", async () => {
+    for (const failing of ["worktrees/wt/reftable/tables.list", ".git/reftable/tables.list"]) {
+      const base = createInMemoryFilesApi();
+      const main = createReftableRefStore({ files: base, gitDir: ".git" });
+      await main.initialize();
+      await main.setSymbolic("HEAD", "refs/heads/main");
+      await main.set("refs/heads/main", A);
+      let fail = false;
+      const files = new Proxy(base, {
+        get(target, prop, receiver) {
+          if (prop === "move") {
+            return async (from: string, to: string) => {
+              if (fail && to.endsWith(failing) && !to.endsWith(`worktrees/wt/${failing}`)) {
+                throw new Error("injected");
+              }
+              return target.move(from, to);
+            };
+          }
+          const value = Reflect.get(target, prop, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const wt = createReftableRefStore({ files, gitDir: ".git/worktrees/wt", commonDir: ".git" });
+      await wt.setSymbolic("HEAD", "refs/heads/main");
+      fail = true;
+      // HEAD (the worktree's stack, committed first as git does) and its branch (the
+      // repository's stack)
+      const attempt = wt.batch([{ name: "HEAD", old: A, new: B }], { message: "x" });
+      if (failing.startsWith("worktrees")) {
+        await expect(attempt).rejects.toThrow("injected");
+        expect((await main.resolve("refs/heads/main"))?.objectId).toBe(A);
+      } else {
+        // the worktree's stack has the update, the repository's not: said, not hidden
+        await expect(attempt).rejects.toBeInstanceOf(ReftablePartialCommitError);
+      }
+      fail = false;
+      for (const lock of [
+        ".git/reftable/tables.list.lock",
+        ".git/worktrees/wt/reftable/tables.list.lock",
+      ]) {
+        expect(await base.exists(lock)).toBe(false);
+      }
+      expect((await wt.batch([{ name: "HEAD", new: C }], { message: "y" })).ok).toBe(true);
+      expect((await main.resolve("refs/heads/main"))?.objectId).toBe(C);
+    }
   });
 });

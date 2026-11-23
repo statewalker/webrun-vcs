@@ -505,10 +505,23 @@ describe.skipIf(!git3)("writing reftable repositories (git 3.0 oracle)", () => {
     await oursInit(repo);
     g(repo, ["config", "reftable.lockTimeout", "20000"]);
     const { c1 } = objects(repo);
+    // compactions of ours and of git's pack-refs run among the writes: a clean must never
+    // remove a compacted table before it is listed (review of #229, C2)
     const writers = Array.from({ length: 8 }, async (_, i) => {
       const refs = await oursRefs(repo);
       await refs.set(`refs/heads/ours-${i}`, c1, { message: `ours ${i}` });
+      if (i % 3 === 2) await refs.packRefs?.([], { all: true }).catch(() => 0);
     });
+    const packers = Array.from(
+      { length: 2 },
+      () =>
+        new Promise<void>((resolve) => {
+          spawn(git3 as string, ["pack-refs"], { cwd: repo, env: nativeGit3Env(root) }).on(
+            "exit",
+            () => resolve(),
+          );
+        }),
+    );
     const natives = Array.from(
       { length: 8 },
       (_, i) =>
@@ -522,12 +535,18 @@ describe.skipIf(!git3)("writing reftable repositories (git 3.0 oracle)", () => {
           );
         }),
     );
-    await Promise.all([...writers, ...natives]);
+    await Promise.all([...writers, ...natives, ...packers]);
     const names = g(repo, ["for-each-ref", "--format=%(refname)", "refs/heads/"])
       .split("\n")
       .filter(Boolean);
     expect(names.length).toBe(16);
     expect(g(repo, ["refs", "verify"])).toBe("");
+    const stack = join(repo, ".git", "reftable");
+    for (const name of readFileSync(join(stack, "tables.list"), "utf8")
+      .split("\n")
+      .filter(Boolean)) {
+      expect(existsSync(join(stack, name))).toBe(true);
+    }
   });
 
   it("worktree add by ours in a reftable repository (t0610 'worktree: adding worktree creates separate stack')", async () => {
@@ -552,6 +571,56 @@ describe.skipIf(!git3)("writing reftable repositories (git 3.0 oracle)", () => {
     expect(g(wt, ["rev-parse", "HEAD"])).toBe(g(repo, ["rev-parse", "HEAD"]));
     expect(g(repo, ["refs", "verify"])).toBe("");
     expect(g(repo, ["fsck", "--no-progress"])).toBe("");
+  });
+
+  it("gc run from a linked worktree keeps what only the main worktree reaches (its detached HEAD, refs/bisect, HEAD reflog)", async () => {
+    const repo = join(root, "repo");
+    g(root, ["init", "-q", "-b", "main", "repo"]);
+    g(repo, ["commit", "-q", "--allow-empty", "-m", "c1"]);
+    g(repo, ["worktree", "add", "-q", "-b", "wt", "../wt"]);
+    const wt = join(root, "wt");
+    g(wt, ["commit", "-q", "--allow-empty", "-m", "w1"]);
+    g(wt, ["checkout", "-q", "--detach"]);
+    g(wt, ["commit", "-q", "--allow-empty", "-m", "w2"]);
+    const tree = g(wt, ["rev-parse", "HEAD^{tree}"]).trim();
+    const ids: Record<string, string> = { wtHead: g(wt, ["rev-parse", "HEAD"]).trim() };
+    ids.wtBisect = g(wt, ["commit-tree", tree, "-m", "w3"]).trim();
+    g(wt, ["update-ref", "refs/bisect/bad", ids.wtBisect]);
+    g(repo, ["checkout", "-q", "--detach"]);
+    g(repo, ["commit", "-q", "--allow-empty", "-m", "m1"]);
+    g(repo, ["commit", "-q", "--allow-empty", "-m", "m2"]);
+    ids.mainReflog = g(repo, ["rev-parse", "HEAD"]).trim();
+    g(repo, ["reset", "-q", "--hard", "HEAD~1"]);
+    ids.mainHead = g(repo, ["rev-parse", "HEAD"]).trim();
+    ids.mainBisect = g(repo, ["commit-tree", tree, "-m", "m3"]).trim();
+    g(repo, ["update-ref", "refs/bisect/good", ids.mainBisect]);
+    // the entries carry the fixed 2005 dates of the test environment: kept from expiry
+    g(repo, ["config", "gc.reflogExpire", "never"]);
+    g(repo, ["config", "gc.reflogExpireUnreachable", "never"]);
+    const env = createNodeGitHostEnvironment({ env: nativeGit3Env(root) });
+    const files = createNodeFilesApi({ rootDir: root });
+    const { history } = await createGitFilesBackend({
+      files,
+      gitDir: "repo/.git",
+      environment: env,
+    });
+    for (const from of ["repo/.git/worktrees/wt", "repo/.git"]) {
+      const worktrees = await openGitLinkedWorktrees({
+        files,
+        gitDir: from,
+        history,
+        environment: env,
+      });
+      const git = Git.fromWorkingCopy(await worktrees.openCurrent());
+      await git.gc().setPrune("now").call();
+      for (const [what, id] of Object.entries(ids)) {
+        expect(`${what} ${run(git3 as string, repo, ["cat-file", "-t", id]).stdout}`).toBe(
+          `${what} commit\n`,
+        );
+      }
+      expect((await git.fsck().call()).exitCode).toBe(0);
+      expect(g(repo, ["fsck", "--no-progress", "--no-dangling"])).toBe("");
+    }
   });
 
   it("a held tables.list.lock times out as git's lock does (t0610 'ref transaction: retry acquiring tables.list lock')", async () => {

@@ -2505,7 +2505,7 @@ class FsckRun {
   /** What a worktree's HEAD resolves to, if anything (within git's 5 reads, HEAD's included). */
   private async headId(wt: WorktreeState): Promise<string | undefined> {
     if (wt.current) {
-      const head = await this.stores.refs.get("HEAD");
+      const head = await this.repositoryRefs().get("HEAD");
       if (!head) return undefined;
       if (!isSymbolicRef(head)) return head.objectId;
       return (await this.followChain(head.target, 1))?.id;
@@ -2535,6 +2535,16 @@ class FsckRun {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * The refs of the repository's own git directory: a reftable store opened for a linked
+   * worktree reads that worktree's HEAD, so fsck asks the repository's store
+   * (`ReftableRefStore.repositoryStore`) for the main worktree's; other stores as they are.
+   */
+  private repositoryRefs(): Refs {
+    const refs = this.stores.refs as Refs & { repositoryStore?(): Refs };
+    return refs.repositoryStore?.() ?? refs;
   }
 
   /** The main worktree, then the linked ones (`.git/worktrees/<id>`). */
@@ -2588,13 +2598,13 @@ class FsckRun {
     };
     let symref: string | undefined;
     if (wt.current) {
-      const head = await this.stores.refs.get("HEAD");
+      const head = await this.repositoryRefs().get("HEAD");
       if (!head) return invalid();
       if (isSymbolicRef(head)) symref = head.target;
       else id = head.objectId;
     } else if ("reflogNames" in this.stores.refs) {
       // a reftable repository: the linked worktree's HEAD is in its own stack
-      const head = await this.stores.refs.get(name);
+      const head = await this.repositoryRefs().get(name);
       if (!head) return invalid();
       if (isSymbolicRef(head)) symref = head.target;
       else id = head.objectId;
@@ -2642,11 +2652,13 @@ class FsckRun {
   private async reflogs(wt: WorktreeState): Promise<Reflog[]> {
     const files = this.files;
     // a reftable repository keeps its reflogs in its tables: listed by the ref store
-    const reftable = this.stores.refs as { reflogNames?(worktree?: string): Promise<string[]> };
+    const reftable = this.repositoryRefs() as {
+      reflogNames?(worktree?: string): Promise<string[]>;
+    };
     if (reftable.reflogNames) {
       const dir = wt.dir as string;
       const id = wt.current ? undefined : dir.slice(dir.lastIndexOf("/") + 1);
-      return this.storeReflogs(await reftable.reflogNames(id));
+      return this.storeReflogs(await reftable.reflogNames(id), this.repositoryRefs());
     }
     if (!files) return wt.current ? this.storeReflogs() : [];
     const logs: Reflog[] = [];
@@ -2689,8 +2701,7 @@ class FsckRun {
   }
 
   /** Reflogs through the refs store (a store without files): HEAD and every ref. */
-  private async storeReflogs(listed?: string[]): Promise<Reflog[]> {
-    const refs = this.stores.refs;
+  private async storeReflogs(listed?: string[], refs = this.stores.refs): Promise<Reflog[]> {
     if (!refs.getReflog) return [];
     let sorted = listed;
     if (!sorted) {

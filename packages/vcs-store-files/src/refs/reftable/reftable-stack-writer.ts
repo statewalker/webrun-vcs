@@ -91,6 +91,12 @@ export interface ReftableStackWriter {
   compactAll(): Promise<void>;
   /** Whether `autoCompact` (geometric) or `compactAll` (any two tables) would compact */
   compactionRequired(geometric: boolean): Promise<boolean>;
+  /**
+   * git's reftable_stack_clean: under `tables.list.lock`, removes the `.ref` files the list
+   * does not name, up to the stack's newest update index (a table file appears only while
+   * that lock is held: a compaction's merged table is a `.temp.*` file until then)
+   */
+  clean(): Promise<void>;
 }
 
 const TABLES_LIST = "tables.list";
@@ -346,10 +352,25 @@ export function createReftableStackWriter(
           ),
       };
       const bytes = writeReftable(content, options);
-      const name = bytes ? await placeTable(bytes, min, max, formatName(min, max)) : undefined;
+      // git's stack_compact_locked: into a temporary that no clean takes for a table
+      // (`.temp.<random>`, not `.ref`); it gets its table name only under the relocked list
+      // (a `.ref` file appears only while tables.list.lock is held, which every clean takes)
+      let temp: string | undefined;
+      if (bytes) {
+        temp = `${formatName(min, max)}.temp.${random32()}`;
+        try {
+          await atomic.write(temp, bytes);
+        } catch (error) {
+          await atomic.remove(temp).catch(() => false);
+          throw error;
+        }
+      }
+      const dropTemp = async () => {
+        if (temp) await atomic.remove(temp).catch(() => false);
+      };
 
       if (!(await lock(TABLES_LIST, lockTimeout))) {
-        if (name) await atomic.remove(name).catch(() => false);
+        await dropTemp();
         return "locked";
       }
       listLocked = true;
@@ -359,13 +380,24 @@ export function createReftableStackWriter(
       const same =
         at >= 0 && view.tables.slice(first, last + 1).every((n, j) => current[at + j] === n);
       if (!same) {
-        if (name) await atomic.remove(name).catch(() => false);
+        await dropTemp();
         return "outdated";
       }
-      const next = [...current.slice(0, at), ...(name ? [name] : []), ...current.slice(at + span)];
+      let name: string | undefined;
       try {
+        if (temp) {
+          name = `${formatName(min, max)}.ref`;
+          await atomic.replace(temp, name);
+          temp = undefined;
+        }
+        const next = [
+          ...current.slice(0, at),
+          ...(name ? [name] : []),
+          ...current.slice(at + span),
+        ];
         await commitList(next);
       } catch (error) {
+        await dropTemp();
         if (name) await atomic.remove(name).catch(() => false);
         throw error;
       }
@@ -429,5 +461,5 @@ export function createReftableStackWriter(
     await clean();
   }
 
-  return { dir, begin, autoCompact, compactAll, compactionRequired };
+  return { dir, begin, autoCompact, compactAll, compactionRequired, clean };
 }

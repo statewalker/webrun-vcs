@@ -27,3 +27,24 @@ export class ReftableUnsupportedError extends Error {
     this.name = "ReftableUnsupportedError";
   }
 }
+
+/**
+ * A transaction over several stacks (a linked worktree's and the repository's) whose tables
+ * were listed in some of them when listing them in the next failed: the update is applied
+ * to `committed` stacks only (git's reftable backend commits stack after stack too). The
+ * other stacks' tables and locks are removed; `cause` is the failure.
+ */
+export class ReftablePartialCommitError extends Error {
+  readonly code = "EPARTIAL";
+  constructor(
+    readonly committed: readonly string[],
+    readonly failed: string,
+    options?: { cause?: unknown },
+  ) {
+    super(
+      `reftable: transaction failure: committed in ${committed.join(", ")} but not in ${failed}`,
+      options,
+    );
+    this.name = "ReftablePartialCommitError";
+  }
+}
