@@ -96,7 +96,12 @@ import {
   removeBranchState,
   resetMerge,
 } from "./sequencer-support.js";
-import { SIGNING_FAILED_LINES, type SignRequest, signRequestOf } from "./signing.js";
+import {
+  SIGNING_FAILED_LINES,
+  SigningFailedError,
+  type SignRequest,
+  signRequestOf,
+} from "./signing.js";
 import { appendSignoff, trailerConfigOf } from "./trailers.js";
 import { worktreeModified } from "./worktree-overwrite-checks.js";
 import { usesBranch } from "./worktree-support.js";
@@ -180,6 +185,8 @@ type PickOutcome =
       conflicts: string[];
       /** What error_with_patch writes to `rebase-merge/message` */
       message?: string;
+      /** error_failed_squash's to_amend (default true): 2.43 stops a failed squash unamended */
+      toAmend?: boolean;
     }
   | { kind: "reschedule"; result: RebaseResult & { reschedule?: boolean } };
 
@@ -191,19 +198,49 @@ type StepOutcome =
   | (Partial<RebaseResult> & { reschedule?: boolean; checkTodo?: boolean })
   | undefined;
 
-/** sequencer.c's staged_changes_advice (no `-S`). */
-const STAGED_CHANGES_ADVICE = `error: you have staged changes in your working tree
+/** sequencer.c's staged_changes_advice, with the run's quoted `-S<key>` (gpg_sign_opt_quoted). */
+function stagedChangesAdvice(gpgSignOpt: string): string {
+  return `error: you have staged changes in your working tree
 If these changes are meant to be squashed into the previous commit, run:
 
-  git commit --amend 
+  git commit --amend ${gpgSignOpt}
 
 If they are meant to go into a new commit, run:
 
-  git commit 
+  git commit ${gpgSignOpt}
 
 In both cases, once you're done, continue with:
 
   git rebase --continue`;
+}
+
+/**
+ * commit_staged_changes' git commit dying on its signature (no signer exists): gpg's lines,
+ * git commit's death, then the sequencer's error; nothing committed, the stop kept.
+ */
+function commitStagedSigningFailure(error: SigningFailedError): RebaseResult {
+  return {
+    status: RebaseStatus.FAILED,
+    message: [
+      error.message,
+      "fatal: failed to write commit object",
+      "error: could not commit staged changes.",
+    ].join("\n"),
+  };
+}
+
+/**
+ * A reword's `git commit --amend -e` dying on its signature: gpg's lines and git commit's
+ * death, the rebase stopped with HEAD to amend; undefined for any other failure.
+ */
+function signingFailure(error: unknown): Extract<PickOutcome, { kind: "conflicts" }> | undefined {
+  if (!(error instanceof SigningFailedError)) return undefined;
+  return {
+    kind: "conflicts",
+    conflicts: [],
+    lines: [error.message, "fatal: failed to write commit object"],
+  };
+}
 
 /** rebase-interactive.c's edit_todo_list_advice. */
 const EDIT_TODO_ADVICE = [
@@ -573,6 +610,46 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         : signRequestOf(this.workingCopy, undefined);
     this.runSign = { key };
     return key;
+  }
+
+  /**
+   * commit_tree's signing of a commit the rebase makes: no signer exists, so a run that
+   * signs fails with gpg's lines ({@link SigningFailedError}); the step says what follows.
+   */
+  private async refuseSigning(state: OperationState): Promise<void> {
+    const sign = await this.signRequest(state);
+    if (sign !== undefined) throw new SigningFailedError(SIGNING_FAILED_LINES.join("\n"), sign);
+  }
+
+  /** sequencer.c's gpg_sign_opt_quoted: `'-S<key>'` (shell-quoted) when the run signs, else "". */
+  private async gpgSignOptQuoted(state: OperationState): Promise<string> {
+    const sign = await this.signRequest(state);
+    return sign === undefined
+      ? ""
+      : `'-S${sign.replaceAll("'", "'\\''").replaceAll("!", "'\\!'")}'`;
+  }
+
+  /**
+   * try_to_commit failing to sign a pick or a fixup: 2.43 reschedules the command (its
+   * `error:` lines, the rescheduled advice), 2.5x stops as after a conflict.
+   */
+  private signingStop(
+    item: TodoItem,
+    lines: string[],
+    options: { message?: string } = {},
+  ): PickOutcome {
+    if (this.hooks.compatibility === "2.43") {
+      return {
+        kind: "reschedule",
+        result: {
+          status: RebaseStatus.FAILED,
+          currentCommit: item.id,
+          message: lines.join("\n"),
+          reschedule: true,
+        },
+      };
+    }
+    return { kind: "conflicts", conflicts: [], lines, ...options };
   }
 
   /**
@@ -1330,7 +1407,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         conflicts: outcome.conflicts,
         message: [
           ...outcome.lines,
-          ...(await this.errorWithPatch(state, item.id, rest, { exitCode: 1, toAmend: true })),
+          ...(await this.errorWithPatch(state, item.id, rest, {
+            exitCode: 1,
+            toAmend: outcome.toAmend ?? true,
+          })),
         ].join("\n"),
       };
     }
@@ -1389,7 +1469,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       return [
         "You can amend the commit now, with",
         "",
-        "  git commit --amend ",
+        `  git commit --amend ${await this.gpgSignOptQuoted(state)}`,
         "",
         "Once you are satisfied with your changes, run",
         "",
@@ -1445,7 +1525,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           await this.rewordHead(state);
         } catch (error) {
           // fast_forward_edit's git commit failed: a stop with HEAD to amend
-          return editorFailure(error);
+          return signingFailure(error) ?? editorFailure(error);
         }
       }
       return { kind: "ok" };
@@ -1609,7 +1689,24 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           )) ?? "";
         if (signoff) message = stripspace(message);
       }
-      await this.amendHead(state, treeId, message, item.action, messageFile === "edit");
+      try {
+        await this.amendHead(state, treeId, message, item.action, messageFile === "edit");
+      } catch (error) {
+        if (!(error instanceof SigningFailedError)) throw error;
+        // the end of a chain with a squash is git commit's (it dies), the rest try_to_commit's
+        // (an error); then error_failed_squash, 2.43 rescheduling an in-process amend
+        if (messageFile === "edit") {
+          // git commit died before its cleanup: AUTO_MERGE stays
+          await state.setRef("AUTO_MERGE", treeId);
+          return {
+            kind: "conflicts",
+            conflicts: [],
+            lines: [error.message, "fatal: failed to write commit object"],
+            toAmend: this.hooks.compatibility !== "2.43",
+          };
+        }
+        return this.signingStop(item, [error.message, "error: failed to write commit object"]);
+      }
       // try_to_commit removes MERGE_MSG; git commit (the edited end of a chain) SQUASH_MSG too
       await state.remove("MERGE_MSG");
       if (messageFile === "edit") await state.remove("SQUASH_MSG");
@@ -1633,38 +1730,37 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
       // try_to_commit: a signed-off message is cleaned up as whitespace (else verbatim)
       const message = signoff ? stripspace(pickedMessage) : pickedMessage;
-      // commit_tree signs: no signer, git's failure (2.43 reschedules the pick, 2.5x stops
-      // as after a conflict, the merged result staged for `--continue`)
-      if ((await this.signRequest(state)) !== undefined) {
-        const lines = [...SIGNING_FAILED_LINES, "error: failed to write commit object"];
-        if (this.hooks.compatibility === "2.43") {
-          await state.setRef("CHERRY_PICK_HEAD", item.id);
-          return {
-            kind: "reschedule",
-            result: {
-              status: RebaseStatus.FAILED,
-              currentCommit: item.id,
-              message: lines.join("\n"),
-              reschedule: true,
-            },
-          };
-        }
-        await state.setRef("CHERRY_PICK_HEAD", item.id);
-        return { kind: "conflicts", conflicts: [], message: pickedMessage, lines };
-      }
       // do_pick_commit writes CHERRY_PICK_HEAD for the commit to come; do_commit deletes it
       // once try_to_commit made it
-      await state.withRefDuring("CHERRY_PICK_HEAD", item.id, () =>
-        this.commitOnto(state, unborn ? [] : [headId], treeId, commit.author, message, item.action),
-      );
+      try {
+        await state.withRefDuring("CHERRY_PICK_HEAD", item.id, () =>
+          this.commitOnto(
+            state,
+            unborn ? [] : [headId],
+            treeId,
+            commit.author,
+            message,
+            item.action,
+          ),
+        );
+      } catch (error) {
+        if (!(error instanceof SigningFailedError)) throw error;
+        // try_to_commit could not sign: 2.43 reschedules the pick, 2.5x stops as after a
+        // conflict, the merged result staged for `--continue` (CHERRY_PICK_HEAD left)
+        await state.setRef("CHERRY_PICK_HEAD", item.id);
+        return this.signingStop(item, [error.message, "error: failed to write commit object"], {
+          message: pickedMessage,
+        });
+      }
       // do_commit: the commit made, MERGE_MSG removed
       await state.remove("MERGE_MSG");
       if (item.action === RebaseAction.REWORD) {
         try {
           await this.rewordHead(state);
         } catch (error) {
-          // git commit --amend -e failed (the editor): the pick stays, the rebase stops
-          return { ...editorFailure(error), message: pickedMessage };
+          // git commit --amend -e failed (the editor, the signing): the pick stays, the
+          // rebase stops
+          return { ...(signingFailure(error) ?? editorFailure(error)), message: pickedMessage };
         }
       }
     }
@@ -2212,14 +2308,32 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // git commit -n -F MERGE_MSG --cleanup=verbatim (whitespace with --signoff, which the
     // merge does not get): the merge committed, its state removed
     const committed = (await state.exists(`${DIR}/signoff`)) ? stripspace(message) : message;
-    const newId = await this.commitOnto(
-      state,
-      [headId, head.id],
-      treeId,
-      author,
-      committed,
-      "merge",
-    );
+    let newId: ObjectId;
+    try {
+      newId = await this.commitOnto(state, [headId, head.id], treeId, author, committed, "merge");
+    } catch (error) {
+      if (!(error instanceof SigningFailedError)) throw error;
+      // do_merge's git commit dies signing: the merge stays staged (MERGE_HEAD, MERGE_MSG)
+      // for --continue, the rebase stops as at a conflicting merge (AUTO_MERGE written)
+      await state.setRef("AUTO_MERGE", treeId);
+      await state.write(`${DIR}/message`, message);
+      if (item.id) {
+        await state.write(`${DIR}/stopped-sha`, `${item.id}\n`);
+        await state.setRef("REBASE_HEAD", item.id);
+        await state.write(`${DIR}/patch`, "");
+      }
+      const short = item.id ? await this.abbreviateObjectId(item.id) : "";
+      return {
+        status: RebaseStatus.STOPPED,
+        ...(item.id ? { currentCommit: item.id } : {}),
+        conflicts: [],
+        message: [
+          error.message,
+          "fatal: failed to write commit object",
+          item.id ? `Could not apply ${short}... ${arg}` : `Could not merge ${arg}`,
+        ].join("\n"),
+      };
+    }
     // (git commit removes SQUASH_MSG too; the octopus' git merge leaves it)
     await state.remove("MERGE_MSG", "MERGE_HEAD", "MERGE_MODE", "SQUASH_MSG");
     await state.removeRef("AUTO_MERGE");
@@ -2264,6 +2378,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       .setCommitter(committer);
     // `merge -c`: --edit, the message cleaned up as an edited one
     if (item.editMessage) command.setCleanupMode(CleanupMode.STRIP);
+    // do_merge passes the run's -S<key> to git merge (which reads commit.gpgSign itself)
+    const sign = await this.signRequest(state);
+    if (sign !== undefined) command.setSigningKey(sign);
     // the merge inherits pull's GIT_REFLOG_ACTION, not the rebase's own action
     if (this.hasReflogAction()) command.setReflogAction(this.reflogAction("rebase"));
     for (const head of heads) command.include(head.id);
@@ -2311,6 +2428,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const commit = await this.commits.load(id);
     if (!commit) return;
     const message = cleanupMessage(commit.message, commentPrefixOf(this.workingCopy));
+    await this.refuseSigning(state);
     this.resetClock();
     let committer = this.committer ?? this.resolveCommitter();
     if (await state.exists(`${DIR}/cdate_is_adate`)) {
@@ -2689,7 +2807,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const treeId = await this.staging.writeTree(this.trees);
     const isClean = headCommit?.tree === treeId;
     if (!isClean && !(await state.exists(`${DIR}/message`))) {
-      return { status: RebaseStatus.FAILED, message: STAGED_CHANGES_ADVICE };
+      return {
+        status: RebaseStatus.FAILED,
+        message: stagedChangesAdvice(await this.gpgSignOptQuoted(state)),
+      };
     }
     let amend = false;
     let finalFixup = false;
@@ -2802,6 +2923,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         }
       }
     } catch (error) {
+      if (error instanceof SigningFailedError) return commitStagedSigningFailure(error);
       // git commit failed on its editor: nothing committed, the stop stays as it is
       return {
         status: RebaseStatus.FAILED,
@@ -2812,8 +2934,14 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     }
     if (gitCommit) {
       // committed above, with git commit's hooks
-    } else if (amend) await this.amendHead(state, treeId, message, "continue", true);
-    else {
+    } else if (amend) {
+      try {
+        await this.amendHead(state, treeId, message, "continue", true);
+      } catch (error) {
+        if (error instanceof SigningFailedError) return commitStagedSigningFailure(error);
+        throw error;
+      }
+    } else {
       // a stopped merge: its other parents (git commit reads MERGE_HEAD, one per line: an
       // octopus has several)
       const mergeHeads = ((await state.read("MERGE_HEAD")) ?? "")
@@ -2822,7 +2950,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         .filter((line) => /^[0-9a-f]{40,64}$/.test(line));
       const author =
         parseAuthorScript((await state.read(`${DIR}/author-script`)) ?? "") ?? this.resolveAuthor();
-      await this.commitOnto(state, [headId, ...mergeHeads], treeId, author, message, "continue");
+      try {
+        await this.commitOnto(state, [headId, ...mergeHeads], treeId, author, message, "continue");
+      } catch (error) {
+        if (error instanceof SigningFailedError) return commitStagedSigningFailure(error);
+        throw error;
+      }
     }
     // git commit's cleanup (SQUASH_MSG of a final squash too), then commit_staged_changes'
     await state.remove(`${DIR}/amend`, "MERGE_HEAD", "MERGE_MODE", "MERGE_MSG", "SQUASH_MSG");
@@ -2981,6 +3114,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           commentPrefixOf(this.workingCopy),
         )
       : await sequencerPrepareMessage(this.hooks, state, message);
+    // commit_tree signs: no signer, git's failure (each step says what follows)
+    await this.refuseSigning(state);
     const id = await this.commits.store({
       tree,
       parents,

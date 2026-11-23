@@ -12,6 +12,7 @@
  * `-u`, `tag.gpgSign`, `tag.forceSignAnnotated`, `--no-sign`) and t5534-push-signed
  * (`push --signed` / `push.gpgSign` against a receiving end without `push-cert`).
  */
+import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,7 +22,15 @@ import {
 } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { type Git, MergeStatus, RebaseStatus, SigningFailedError } from "../src/index.js";
+import {
+  type Git,
+  MergeStatus,
+  type PushResult,
+  PushStatus,
+  RebaseOperation,
+  RebaseStatus,
+  SigningFailedError,
+} from "../src/index.js";
 import { nativeIs25x } from "./hooks-native-support.js";
 import { git, gitOk, normalizeState, openOurs, put, snapshot } from "./merge-native-helpers.js";
 import {
@@ -382,6 +391,163 @@ describeGit("requests to sign refused as git refuses them when gpg fails", () =>
     });
   });
 
+  describe("rebase steps that commit (t7510-signed-commit, t3404-rebase-interactive)", () => {
+    /** Native git with the sequence editor `seq` (GIT_EDITOR=true). */
+    function gitSeq(dir: string, seq: string, ...args: string[]) {
+      const r = spawnSync("git", args, {
+        cwd: dir,
+        env: { ...nativeGitEnv(root), GIT_EDITOR: "true", GIT_SEQUENCE_EDITOR: seq },
+        encoding: "utf8",
+      });
+      return { status: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+    }
+
+    /** `side` (one, s1, s2) checked out, commit.gpgSign and a failing gpg.program. */
+    function chainTwins() {
+      const n = counter++;
+      const dirs = { native: join(root, `native-${n}`), ours: join(root, `ours-${n}`) };
+      for (const dir of [dirs.native, dirs.ours]) {
+        mkdirSync(dir, { recursive: true });
+        gitOk(root, dir, "init", "-q", "-b", "main");
+        put(dir, "a.txt", "a\n");
+        gitOk(root, dir, "add", "-A");
+        gitOk(root, dir, "commit", "-qm", "one");
+        gitOk(root, dir, "checkout", "-qb", "side");
+        for (const i of [1, 2]) {
+          put(dir, `s${i}.txt`, `${i}\n`);
+          gitOk(root, dir, "add", "-A");
+          gitOk(root, dir, "commit", "-qm", `s${i}`);
+        }
+        gitOk(root, dir, "config", "gpg.program", join(root, "failing-gpg"));
+        gitOk(root, dir, "config", "commit.gpgSign", "true");
+      }
+      return dirs;
+    }
+
+    /** git's stderr and our message as both versions agree on them. */
+    const lines = (text: string) =>
+      text
+        .replace(/Rebasing \(\d+\/\d+\)\r?/g, "")
+        // the progress line's erase-to-end (ESC [K)
+        .replaceAll(`${String.fromCharCode(27)}[K`, "")
+        .replace(/^(Could not apply [0-9a-f]+\.\.\.) (?!# )/m, "$1 # ")
+        .replace(/^(hint: {5}\w+ [0-9a-f]+) (?!# )/m, "$1 # ")
+        .replace(/^hint: $/gm, "hint:")
+        .replace(/\n+$/, "");
+
+    /** The todo's `n`th command line (1-based) turned into `action`. */
+    const retodo = (todo: string, n: number, action: string) => {
+      let seen = 0;
+      return todo
+        .split("\n")
+        .map((line) =>
+          /^(pick|p) /.test(line) && ++seen === n ? line.replace(/^\w+/, action) : line,
+        )
+        .join("\n");
+    };
+
+    function expectStop(
+      dirs: { native: string; ours: string },
+      native: { status: number; stderr: string },
+      result: { status: RebaseStatus; message?: string },
+      label: string,
+    ) {
+      expect(native.status, `${label}: ${native.stderr}`).toBe(1);
+      expect(native.stderr, label).toContain(GPG_FAILED.join("\n"));
+      expect(result.status, label).not.toBe(RebaseStatus.OK);
+      expect(lines(result.message ?? ""), label).toBe(lines(native.stderr));
+      expect(refs(dirs.ours), label).toBe(refs(dirs.native));
+      expect(snapshot(root, dirs.ours, normalizeState), label).toEqual(
+        snapshot(root, dirs.native, normalizeState),
+      );
+    }
+
+    it("fixup, squash and reword: refused where git commits, the branch unchanged", async () => {
+      const cases: [string, number][] = [
+        ["fixup", 2],
+        ["squash", 2],
+        ["reword", 2],
+        ["reword", 1],
+      ];
+      for (const [action, n] of cases) {
+        const dirs = chainTwins();
+        const native = gitSeq(
+          dirs.native,
+          `sed -i -e '${n}s/^pick/${action}/'`,
+          "rebase",
+          "-i",
+          "HEAD~2",
+        );
+        const command = (await ours(dirs.ours)).rebase();
+        command.runInteractively({
+          editTodo: (todo) => retodo(todo, n, action),
+          modifyCommitMessage: (text) => text,
+        });
+        await command.setUpstreamBranch("HEAD~2");
+        const result = await command.call();
+        expectStop(dirs, native, result, `${action} ${n}`);
+      }
+    });
+
+    it("--continue after a pick stopped on its signature: still refused", async () => {
+      const dirs = twins({ "commit.gpgSign": "true" }, "side");
+      git(root, dirs.native, "rebase", "main");
+      const first = (await ours(dirs.ours)).rebase();
+      await first.setUpstreamBranch("main");
+      await first.call();
+      const native = git(root, dirs.native, "rebase", "--continue");
+      const result = await (await ours(dirs.ours))
+        .rebase()
+        .setOperation(RebaseOperation.CONTINUE)
+        .call();
+      expect(native.status).toBe(1);
+      expect(result.status).not.toBe(RebaseStatus.OK);
+      expect(lines(result.message ?? "")).toBe(lines(native.stderr));
+      expect(refs(dirs.ours)).toBe(refs(dirs.native));
+      expect(snapshot(root, dirs.ours, normalizeState)).toEqual(
+        snapshot(root, dirs.native, normalizeState),
+      );
+    });
+
+    it("--rebase-merges: a merge made again stops on its signature", async () => {
+      const n = counter++;
+      const dirs = { native: join(root, `native-${n}`), ours: join(root, `ours-${n}`) };
+      for (const dir of [dirs.native, dirs.ours]) {
+        mkdirSync(dir, { recursive: true });
+        gitOk(root, dir, "init", "-q", "-b", "main");
+        put(dir, "a.txt", "a\n");
+        gitOk(root, dir, "add", "-A");
+        gitOk(root, dir, "commit", "-qm", "one");
+        gitOk(root, dir, "checkout", "-qb", "y");
+        put(dir, "y.txt", "y\n");
+        gitOk(root, dir, "add", "-A");
+        gitOk(root, dir, "commit", "-qm", "y1");
+        gitOk(root, dir, "checkout", "-qb", "side", "main");
+        // git's message (both versions label the merge `y` from it)
+        gitOk(root, dir, "merge", "-q", "--no-ff", "y");
+        gitOk(root, dir, "config", "gpg.program", join(root, "failing-gpg"));
+        gitOk(root, dir, "config", "commit.gpgSign", "true");
+      }
+      // the merge without -C: made again (with another message), never fast-forwarded
+      const native = gitSeq(
+        dirs.native,
+        "sed -i -e 's/^merge -C [0-9a-f]* \\([^ ]*\\) .*/merge \\1 # M2/'",
+        "rebase",
+        "-r",
+        "-i",
+        "main",
+      );
+      const command = (await ours(dirs.ours)).rebase().setRebaseMerges(true);
+      command.runInteractively({
+        editTodo: (todo) => todo.replace(/^merge -C [0-9a-f]+ (\S+) .*$/m, "merge $1 # M2"),
+        modifyCommitMessage: (text) => text,
+      });
+      await command.setUpstreamBranch("main");
+      const result = await command.call();
+      expectStop(dirs, native, result, "merge");
+    });
+  });
+
   describe("push (t5534-push-signed)", () => {
     function withRemote(dirs: { native: string; ours: string }) {
       for (const dir of [dirs.native, dirs.ours]) {
@@ -477,6 +643,55 @@ describeGit("requests to sign refused as git refuses them when gpg fails", () =>
         } else {
           expect(native.stderr).not.toContain("warning:");
           expect(result.warnings ?? []).toEqual([]);
+        }
+        expect(refs(join(dirs.ours, "remote.git"))).toBe(refs(join(dirs.native, "remote.git")));
+      }
+    });
+
+    it("a receiving end that takes certificates: nothing to send, nothing signed", async () => {
+      for (const how of ["up-to-date", "rejected"] as const) {
+        const dirs = twins();
+        withRemote(dirs);
+        for (const dir of [dirs.native, dirs.ours]) {
+          const remote = join(dir, "remote.git");
+          gitOk(root, remote, "config", "receive.certNonceSeed", "seed");
+          gitOk(root, remote, "config", "http.receivepack", "true");
+          gitOk(root, dir, "push", "-q", "origin", how === "up-to-date" ? "main" : "side:main");
+        }
+        const native = git(root, dirs.native, "push", "--signed", "origin", "main");
+        if (how === "up-to-date") {
+          expect(native.status).toBe(0);
+          expect(native.stderr).toBe("Everything up-to-date\n");
+        } else {
+          expect(native.status).toBe(1);
+          expect(native.stderr).toContain(" ! [rejected]        main -> main (non-fast-forward)");
+        }
+        const backend = nativeGitHttpBackend(dirs.ours, root);
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = backend.fetch;
+        try {
+          gitOk(root, dirs.ours, "remote", "set-url", "origin", "http://git.test/remote.git");
+          let result: PushResult | undefined;
+          const error = await thrown(async () => {
+            result = await (await ours(dirs.ours))
+              .push()
+              .setRemote("origin")
+              .setRefSpecs("main")
+              .setSigned(true)
+              .call();
+          });
+          expect(error).not.toBeInstanceOf(SigningFailedError);
+          if (how === "up-to-date") {
+            expect(error).toBeUndefined();
+            expect(result?.remoteUpdates.map((u) => u.status)).toEqual([PushStatus.UP_TO_DATE]);
+          } else if (!error) {
+            expect(result?.remoteUpdates.map((u) => u.status)).toEqual([
+              PushStatus.REJECTED_NONFASTFORWARD,
+            ]);
+          }
+        } finally {
+          globalThis.fetch = originalFetch;
+          backend.close();
         }
         expect(refs(join(dirs.ours, "remote.git"))).toBe(refs(join(dirs.native, "remote.git")));
       }

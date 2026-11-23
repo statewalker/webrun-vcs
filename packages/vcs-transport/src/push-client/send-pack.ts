@@ -319,15 +319,11 @@ async function sendPack(
   }
 
   // send_pack: a push certificate for a server that takes one (its nonce advertised as
-  // `push-cert=<nonce>`); nothing signs one here yet, so a push that must is refused as git
-  // refuses when gpg cannot sign (sign_buffer then dies in generate_push_cert)
+  // `push-cert=<nonce>`), else a refusal (always) or a warning (if-asked)
   const warnings: string[] = [];
-  if (options.signed) {
-    if (caps.has("push-cert")) {
-      if (!options.dryRun) {
-        throw new PushCertificateError("failed to sign the push certificate", "signing");
-      }
-    } else if (options.signed === "always") {
+  const pushCert = options.signed !== undefined && caps.has("push-cert");
+  if (options.signed && !pushCert) {
+    if (options.signed === "always") {
       throw new PushCertificateError(
         "the receiving end does not support --signed push",
         "unsupported",
@@ -349,6 +345,11 @@ async function sendPack(
   if (options.atomic && updates.some((u) => !isPushSuccess(u.status))) {
     for (const u of toSend) setStatus(u, "atomic-push-failed");
     toSend.length = 0;
+  }
+  // generate_push_cert signs only when a command is sent (update_seen), never in a dry run:
+  // nothing signs one here yet, so such a push is refused as git refuses when gpg cannot sign
+  if (pushCert && toSend.length > 0 && !options.dryRun) {
+    throw new PushCertificateError("failed to sign the push certificate", "signing");
   }
 
   const requested: string[] = [];
