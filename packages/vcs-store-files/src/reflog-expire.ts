@@ -155,11 +155,15 @@ export async function expireReflogs(options: ExpireReflogsOptions): Promise<Expi
     ) ?? options.refs;
   const reftable = repository as Partial<ReftableReflogs>;
   if (reftable.reflogNames && reftable.expireReflog) {
+    // names and each reflog's own ref from the repository's store; what a HEAD's entries
+    // must be reachable from is the current worktree's view (reflog.c's refs_for_each_ref
+    // over get_main_ref_store: its own refs/bisect/, refs/worktree/, refs/rewritten/)
     return expireReftableReflogs(
       reftable as ReftableReflogs,
       { ...options, refs: repository },
       policyOf,
       graph,
+      options.refs,
     );
   }
   const reflogs = await collectReflogs(files, gitDir);
@@ -260,6 +264,8 @@ async function expireReftableReflogs(
   options: ExpireReflogsOptions,
   policyOf: (ref: string) => Policy,
   graph: CommitGraph,
+  /** The current worktree's refs: every ref's tip there is what HEADs' entries must reach */
+  currentRefs: Pick<Refs, "list">,
 ): Promise<ExpireReflogsResult> {
   const { files, gitDir = ".git" } = options;
   const names = await refs.reflogNames();
@@ -289,7 +295,7 @@ async function expireReftableReflogs(
     }
     if (policy.unreachable <= policy.total) kind = "always";
     if (kind === "head") {
-      allTips ??= await refTips(options.refs, graph);
+      allTips ??= await refTips(currentRefs, graph);
       reach = graph.reachability(allTips);
     }
     try {

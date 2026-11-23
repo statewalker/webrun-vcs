@@ -623,6 +623,59 @@ describe.skipIf(!git3)("writing reftable repositories (git 3.0 oracle)", () => {
     }
   });
 
+  it("reflog expiry of gc run from a linked worktree reaches through that worktree's own refs, as git's (reflog.c)", async () => {
+    // two identical fixtures dated 60 days back (the unreachable entries expire after 30)
+    const build = (dir: string) => {
+      mkdirSync(dir, { recursive: true });
+      let t = Math.floor(Date.now() / 1000) - 60 * 86400;
+      t -= t % 3600;
+      const at = (cwd: string, args: string[]) => {
+        t += 60;
+        const date = `${t} +0000`;
+        return g(cwd, args, { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date }).trim();
+      };
+      const repo = join(dir, "repo");
+      at(dir, ["init", "-q", "-b", "main", "repo"]);
+      at(repo, ["commit", "-q", "--allow-empty", "-m", "c1"]);
+      at(repo, ["worktree", "add", "-q", "-b", "wt1", "../wt1"]);
+      const tree = at(repo, ["rev-parse", "HEAD^{tree}"]);
+      for (const [label, d] of [["main", repo], ["wt1", join(dir, "wt1")]] as const) {
+        at(d, ["checkout", "-q", "--detach"]);
+        at(d, ["commit", "-q", "--allow-empty", "-m", "a"]);
+        const head = at(d, ["rev-parse", "HEAD"]);
+        const bisect = at(d, ["commit-tree", tree, "-m", `bis ${label}`]);
+        const bis2 = at(d, ["commit-tree", tree, "-p", bisect, "-m", `bis2 ${label}`]);
+        // reachable only from this worktree's own refs/bisect/x
+        at(d, ["update-ref", "refs/bisect/x", bis2]);
+        at(d, ["update-ref", "-m", "tobis", "HEAD", bisect]);
+        // old and new reachable only from this worktree's own refs/bisect/x: kept by gc in
+        // this worktree, expired by gc in another (git's refs_for_each_ref of its own view)
+        at(d, ["update-ref", "-m", "tobis2", "HEAD", bis2]);
+        at(d, ["update-ref", "-m", "back", "HEAD", head]);
+      }
+      return repo;
+    };
+    const theirs = build(join(root, "n"));
+    const ours = build(join(root, "o"));
+    g(join(root, "n", "wt1"), ["gc", "-q", "--prune=now"]);
+    const env = createNodeGitHostEnvironment({ env: nativeGit3Env(root) });
+    const files = createNodeFilesApi({ rootDir: join(root, "o") });
+    const { history } = await createGitFilesBackend({ files, gitDir: "repo/.git", environment: env });
+    const worktrees = await openGitLinkedWorktrees({
+      files,
+      gitDir: "repo/.git/worktrees/wt1",
+      history,
+      environment: env,
+    });
+    await Git.fromWorkingCopy(await worktrees.openCurrent()).gc().setPrune("now").call();
+    for (const ref of ["HEAD", "worktrees/wt1/HEAD"]) {
+      const show = (dir: string) => g(dir, ["reflog", "show", "--format=%H %gs", ref]);
+      expect(`${ref}\n${show(ours)}`).toBe(`${ref}\n${show(theirs)}`);
+    }
+    expect(g(ours, ["reflog", "show", "--format=%gs", "worktrees/wt1/HEAD"])).toContain("tobis2");
+    expect(g(ours, ["reflog", "show", "--format=%gs", "HEAD"])).not.toContain("tobis2");
+  });
+
   it("a held tables.list.lock times out as git's lock does (t0610 'ref transaction: retry acquiring tables.list lock')", async () => {
     const repo = join(root, "repo");
     await oursInit(repo);

@@ -769,15 +769,19 @@ export class ReftableRefStore implements Refs {
       let planned: Plan = unlocked;
       for (;;) {
         let more = false;
-        for (const u of planned.updates) {
-          // the stack of the ref asked for first (git queues the update as asked, then the
-          // ref it names, then HEAD's log-only update)
-          for (const n of [u.requested, u.name, ...u.reflogAlso]) {
-            const where = this.stackFor(n);
-            if (where && !tx.holds(where.stack)) {
-              await tx.lock(where.stack);
-              more = true;
-            }
+        // git's order (reftable_be_transaction_prepare): the stacks of every ref asked for,
+        // then those of the refs symbolic ones name, then HEAD's log-only update's
+        const updates = planned.ok ? planned.updates : [];
+        const names = [
+          ...updates.map((u) => u.requested),
+          ...updates.map((u) => u.name),
+          ...updates.flatMap((u) => u.reflogAlso),
+        ];
+        for (const n of names) {
+          const where = this.stackFor(n);
+          if (where && !tx.holds(where.stack)) {
+            await tx.lock(where.stack);
+            more = true;
           }
         }
         planned = await plan();
