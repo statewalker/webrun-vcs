@@ -42,13 +42,13 @@ import {
   invalidateDirectory,
   invalidateGitignore,
   lookupUntracked,
-  NULL_OID,
   newUntrackedCacheDir,
   type StatMatchOptions,
   statDataMatches,
   statDataOf,
   type UntrackedCache,
   type UntrackedCacheDir,
+  untrackedNullOid,
   zeroStatData,
 } from "./untracked-cache.js";
 
@@ -352,19 +352,21 @@ export async function scanUntracked(
     const node = nodeOf(dir);
     // a directory the cache has valid with no .gitignore id is not read (git skips the
     // ENOENT it expects); otherwise its .gitignore is read and its id computed
-    if (node?.valid && node.excludeOid === NULL_OID) return;
+    if (node?.valid && node.excludeOid === untrackedNullOid(cache)) return;
     const read = await host.loadIgnoreFile(dir);
     if (!node || !cache) return;
     const path = join(dir, ".gitignore");
-    let oid = NULL_OID;
+    const nullOid = untrackedNullOid(cache);
+    let oid = nullOid;
     if (read.kind === "file") {
       oid =
         read.bytes.length === 0
-          ? await excludeFileOid(read.bytes)
-          : (options.indexIgnoreOid?.(path) ?? (await excludeFileOid(read.bytes)));
+          ? await excludeFileOid(read.bytes, cache.objectFormat)
+          : (options.indexIgnoreOid?.(path) ??
+            (await excludeFileOid(read.bytes, cache.objectFormat)));
     } else {
       // read_skip_worktree_file_from_index: a skip-worktree entry's blob, by its id
-      oid = options.skipWorktreeIgnoreOid?.(path) ?? NULL_OID;
+      oid = options.skipWorktreeIgnoreOid?.(path) ?? nullOid;
     }
     if (oid !== node.excludeOid) {
       invalidateGitignore(cache, node);

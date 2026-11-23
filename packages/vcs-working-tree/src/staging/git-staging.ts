@@ -570,7 +570,8 @@ export class GitStaging implements Staging {
     // the index on disk is another one than this instance read or wrote (by checksum)
     const current = this.indexFile.currentChecksum;
     if (current === undefined) return false;
-    return (await readIndexChecksum(this.files, this.indexPath)) !== current;
+    const size = this.indexFile.objectFormat.rawLength;
+    return (await readIndexChecksum(this.files, this.indexPath, size)) !== current;
   }
 
   /**
@@ -1056,8 +1057,8 @@ export interface GitStagingOptions {
   /** The trees a sparse index expands from when no host gives any */
   defaultTrees?: Pick<Trees, "load" | "store">;
   /**
-   * The repository's object format (or a lookup of it): an index of a repository whose objects
-   * are not SHA-1 is refused with `UnsupportedObjectFormatError` (its 32-byte ids are not read yet)
+   * The repository's object format (or a lookup of it): the width of the index's ids and
+   * trailer (SHA-1 when absent)
    */
   objectFormat?: IndexObjectFormat;
 }
