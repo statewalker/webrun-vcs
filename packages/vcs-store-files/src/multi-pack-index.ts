@@ -52,9 +52,11 @@ import {
   writePackBitmap,
 } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
+import { UnsupportedObjectFormatError } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "./create-git-files-backend.js";
 import { type BitmapSettings, isPreferredBitmapTip, readBitmapSettings } from "./repack.js";
+import { readRepositoryFormat } from "./repository-format.js";
 import {
   configFilesApiOf,
   createWorkingCopyConfig,
@@ -116,6 +118,19 @@ interface Ctx {
 }
 
 const failure = (c: Ctx) => (c.compatibility === "2.43" ? 1 : 255);
+
+/**
+ * Refuses a SHA-256 repository: the multi-pack-index reader and writer hold 20-byte ids
+ * (`UnsupportedObjectFormatError`).
+ */
+async function assertMidxObjectFormat(options: MultiPackIndexOptions): Promise<void> {
+  const format = await readRepositoryFormat(options.files, options.gitDir ?? ".git").catch(
+    () => undefined,
+  );
+  if (format && format.objectFormat.name !== "sha1") {
+    throw new UnsupportedObjectFormatError("the multi-pack-index", format.objectFormat.name);
+  }
+}
 
 function ctxOf(options: MultiPackIndexOptions): Ctx {
   const gitDir = options.gitDir ?? ".git";
@@ -284,6 +299,7 @@ async function readAll(files: FilesApi, path: string): Promise<Uint8Array> {
 export async function multiPackIndexWrite(
   options: MultiPackIndexWriteOptions,
 ): Promise<MultiPackIndexCommandResult> {
+  await assertMidxObjectFormat(options);
   const c = ctxOf(options);
   try {
     return await writeInternal(c, options);
@@ -735,6 +751,7 @@ export function verifyMidxLines(
 export async function multiPackIndexExpire(
   options: MultiPackIndexOptions,
 ): Promise<MultiPackIndexCommandResult> {
+  await assertMidxObjectFormat(options);
   const c = ctxOf(options);
   const loaded = await loadMultiPackIndex(c.files, c.packDir, c);
   c.stderr.push(...loaded.errors);
@@ -802,6 +819,7 @@ export interface MultiPackIndexRepackOptions extends MultiPackIndexOptions {
 export async function multiPackIndexRepack(
   options: MultiPackIndexRepackOptions,
 ): Promise<MultiPackIndexCommandResult> {
+  await assertMidxObjectFormat(options);
   const c = ctxOf(options);
   const loaded = await loadMultiPackIndex(c.files, c.packDir, c);
   c.stderr.push(...loaded.errors);

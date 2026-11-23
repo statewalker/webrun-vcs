@@ -22,6 +22,7 @@
  * read one at a time and never kept.
  */
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import type { ObjectId } from "../common/id/index.js";
 import type { GitObject, GitObjects } from "../history/objects/git-objects.js";
@@ -41,7 +42,8 @@ import { ObjectIdFlags } from "./object-id-flags.js";
 import type { PackBitmapIndex } from "./pack-bitmap.js";
 
 /** What `listObjects` reads: objects by id. */
-export type ListObjectsSource = Pick<GitObjects, "get"> & Partial<Pick<GitObjects, "getNow">>;
+export type ListObjectsSource = Pick<GitObjects, "get"> &
+  Partial<Pick<GitObjects, "getNow" | "objectFormat">>;
 
 export interface ListObjectsOptions {
   /** The tips to list from (commits, tags, trees or blobs). A missing want throws. */
@@ -214,7 +216,9 @@ export async function* listObjects(
     return;
   }
   const maxTreeDepth = options.maxTreeDepth ?? DEFAULT_MAX_TREE_DEPTH;
-  const flags = new ObjectIdFlags();
+  // the ids in tree bytes are the store's format's (20 bytes, 32 in SHA-256)
+  const raw = (objects.objectFormat ?? SHA1_OBJECT_FORMAT).rawLength;
+  const flags = new ObjectIdFlags(1024, raw);
   const has = (id: ObjectId, f: number) => (flags.get(id) & f) !== 0;
   const set = (id: ObjectId, f: number) => flags.add(id, f);
   const commits = new Map<ObjectId, CommitInfo>();
@@ -415,7 +419,7 @@ export async function* listObjects(
       onBoundary?.({ id: t, type: "tree", path });
       const data = o.data;
       for (let at = 0; at < data.length; ) {
-        const e = scanTreeEntry(data, at);
+        const e = scanTreeEntry(data, at, raw);
         at = e.next;
         if (e.kind === GITLINK) continue;
         if (flags.getAt(data, e.nul + 1) & BOUNDARY) continue;
@@ -423,11 +427,11 @@ export async function* listObjects(
         const name = onBoundary ? decodeGitPath(data.subarray(e.nameStart, e.nul)) : "";
         const p = path ? `${path}/${name}` : name;
         if (e.kind === TREE) {
-          stack.push({ id: bytesToHex(data.subarray(e.nul + 1, e.nul + 21)), path: p });
+          stack.push({ id: bytesToHex(data.subarray(e.nul + 1, e.nul + 1 + raw)), path: p });
         } else {
           flags.addAt(data, e.nul + 1, BOUNDARY | UNINTERESTING);
           onBoundary?.({
-            id: bytesToHex(data.subarray(e.nul + 1, e.nul + 21)),
+            id: bytesToHex(data.subarray(e.nul + 1, e.nul + 1 + raw)),
             type: "blob",
             path: p,
           });
@@ -531,10 +535,10 @@ export async function* listObjects(
       while (stack.length > 0) {
         const f = stack[stack.length - 1] as FilterFrame;
         if (f.at < f.data.length) {
-          const e = scanTreeEntry(f.data, f.at);
+          const e = scanTreeEntry(f.data, f.at, raw);
           f.at = e.next;
           if (e.kind === GITLINK) continue;
-          const eid = bytesToHex(f.data.subarray(e.nul + 1, e.nul + 21));
+          const eid = bytesToHex(f.data.subarray(e.nul + 1, e.nul + 1 + raw));
           const entryName = decodeGitPath(f.data.subarray(e.nameStart, e.nul));
           set(eid, NOT_USER_GIVEN);
           if (e.kind === TREE) {
@@ -593,11 +597,11 @@ export async function* listObjects(
         const data = o.data;
         // entries already listed or excluded are skipped before their names are decoded
         for (let at = 0; at < data.length; ) {
-          const e = scanTreeEntry(data, at);
+          const e = scanTreeEntry(data, at, raw);
           at = e.next;
           if (e.kind === GITLINK) continue;
           if (flags.getAt(data, e.nul + 1) & (UNINTERESTING | ADDED)) continue;
-          const eid = bytesToHex(data.subarray(e.nul + 1, e.nul + 21));
+          const eid = bytesToHex(data.subarray(e.nul + 1, e.nul + 1 + raw));
           const name = decodeGitPath(data.subarray(e.nameStart, e.nul));
           const p = path ? `${path}/${name}` : name;
           if (e.kind === TREE) subtrees.push({ id: eid, path: p, depth: depth + 1 });
@@ -720,8 +724,9 @@ export function parseCommitHeader(id: ObjectId, data: Uint8Array): CommitInfo {
   const parents: ObjectId[] = [];
   let time = 0;
   for (const line of text.split("\n")) {
-    if (line.startsWith("tree ")) tree = line.slice(5, 45);
-    else if (line.startsWith("parent ")) parents.push(line.slice(7, 47));
+    // ids of 40 hex digits, or 64 in a SHA-256 repository
+    if (line.startsWith("tree ")) tree = line.slice(5, line.length >= 69 ? 69 : 45);
+    else if (line.startsWith("parent ")) parents.push(line.slice(7, line.length >= 71 ? 71 : 47));
     else if (line.startsWith("committer ")) {
       const gt = line.lastIndexOf(">");
       const t = Number.parseInt(
@@ -740,9 +745,11 @@ export function parseCommitHeader(id: ObjectId, data: Uint8Array): CommitInfo {
 
 /** @internal the object a tag names */
 export function parseTagTarget(id: ObjectId, data: Uint8Array): ObjectId {
-  const text = dec.decode(data.subarray(0, Math.min(data.length, 64)));
+  const text = dec.decode(data.subarray(0, Math.min(data.length, 80)));
   if (!text.startsWith("object ")) throw new Error(`tag ${id} has no object`);
-  return text.slice(7, 47);
+  // 40 hex digits, or 64 in a SHA-256 repository
+  const nl = text.indexOf("\n");
+  return text.slice(7, nl === 71 ? 71 : 47);
 }
 
 function indexOfBlankLine(data: Uint8Array): number {
@@ -767,10 +774,12 @@ const GITLINK = TREE_ENTRY_GITLINK;
 export function scanTreeEntry(
   data: Uint8Array,
   at: number,
+  /** bytes of an id: 20, or 32 in a SHA-256 repository */
+  raw = 20,
 ): { kind: number; nameStart: number; nul: number; next: number } {
   const sp = data.indexOf(0x20, at);
   const nul = sp < 0 ? -1 : data.indexOf(0, sp);
-  if (sp < 0 || nul < 0 || nul + 21 > data.length) throw new Error("malformed tree");
+  if (sp < 0 || nul < 0 || nul + 1 + raw > data.length) throw new Error("malformed tree");
   const len = sp - at;
   const kind =
     len === 5 &&
@@ -789,5 +798,5 @@ export function scanTreeEntry(
           data[at + 5] === 0x30
         ? GITLINK
         : TREE_ENTRY_BLOB;
-  return { kind, nameStart: sp + 1, nul, next: nul + 21 };
+  return { kind, nameStart: sp + 1, nul, next: nul + 1 + raw };
 }

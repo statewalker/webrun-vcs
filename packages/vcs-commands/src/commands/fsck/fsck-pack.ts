@@ -45,8 +45,9 @@ import {
   readPackIndex,
 } from "@statewalker/vcs-core";
 import { applyGitDelta } from "@statewalker/vcs-utils/diff";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { CRC32 } from "@statewalker/vcs-utils/hash/crc32";
-import { createSha1, type Hasher, Sha1, sha1Of } from "@statewalker/vcs-utils/hash/hasher";
+import { type Hasher, sha1Of } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { allocBytes } from "@statewalker/vcs-utils/streams";
 
@@ -58,7 +59,7 @@ export interface PackScanEntry {
   sizeInPack: number;
   /** False when its CRC-32 is not the one the idx records (v2 idx only). */
   crcOk: boolean;
-  /** The idx's bytes, holding the id's 20 bytes at `idAt`. */
+  /** The idx's bytes, holding the id's bytes (20, or 32 in SHA-256) at `idAt`. */
   ids: Uint8Array;
   idAt: number;
   /**
@@ -106,6 +107,8 @@ export interface PackCheckOptions {
   read?: { bytes: Uint8Array; idx: PackIndex };
   /** Whether a blob's content is wanted (otherwise its entry's `content` is empty). */
   keepBlob: (id: string) => boolean;
+  /** The repository's object format (default SHA-1): ids, checksums and the hash checked */
+  objectFormat?: ObjectFormat;
 }
 
 /** What `checkPack` found. */
@@ -158,17 +161,22 @@ export async function checkPack(
   let idxBytes: Uint8Array;
   let idx: PackIndex;
   const read = options.read;
+  const format = options.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const raw = format.rawLength;
   try {
     // the idx as the caller read it, or read here: once either way
     idxBytes = read?.bytes ?? (await readAll(files, idxPath));
-    idx = read?.idx ?? readPackIndex(idxBytes);
+    idx = read?.idx ?? readPackIndex(idxBytes, raw);
   } catch {
     hooks.error(`packfile ${packPath} index not opened`);
     return { failed: true, opened: false };
   }
   // verify_pack_index
-  const idxSum = new Sha1().update(idxBytes.subarray(0, idxBytes.length - 20)).digest();
-  if (!sameBytes(idxSum, 0, idxBytes, idxBytes.length - 20)) {
+  const idxSum = format
+    .createHasher()
+    .update(idxBytes.subarray(0, idxBytes.length - raw))
+    .digest();
+  if (!sameBytes(idxSum, 0, idxBytes, idxBytes.length - raw, raw)) {
     hooks.error(`Packfile index for ${packPath} hash mismatch`);
     failed = true;
   }
@@ -178,6 +186,7 @@ export async function checkPack(
   try {
     pack = await openPack(files, packPath, idxPath, {
       idxBytes,
+      ...(format === SHA1_OBJECT_FORMAT ? {} : { objectFormat: format }),
       externalBase: externalBase
         ? async (id) => {
             const obj = await externalBase(id);
@@ -195,18 +204,18 @@ export async function checkPack(
   try {
     const stats = await files.stats(packPath);
     const packLength = stats?.size ?? 0;
-    const trailerAt = packLength - 20;
+    const trailerAt = packLength - raw;
 
     // the entries in pack order, with where each one's id is in the idx
     const v2 = idx.version > 1;
     const idsAt = v2 ? 8 + 1024 : 1024 + 4;
-    const idStride = v2 ? 20 : 24;
+    const idStride = v2 ? raw : raw + 4;
     const count = idx.objectCount;
-    const lookups = idLookups(idxBytes, v2, count);
-    const ids = hexIds(idxBytes, idsAt, idStride, count);
-    const crcAt = idsAt + count * 20;
+    const lookups = idLookups(idxBytes, v2, count, raw);
+    const ids = hexIds(idxBytes, idsAt, idStride, count, raw);
+    const crcAt = idsAt + count * raw;
     // in pack order (sorted by offset): each entry's idx position and offset
-    const { order, sorted } = packEntryOrder(idxBytes, v2, count);
+    const { order, sorted } = packEntryOrder(idxBytes, v2, count, raw);
     const n = count;
     const offsetOf = (k: number) => sorted[k] as number;
     const posOf = (k: number) => order[k] as number;
@@ -277,7 +286,7 @@ export async function checkPack(
       } else {
         return undefined;
       }
-      if (!hashesTo(type, data, idxBytes, idAtK(k))) return undefined;
+      if (!hashesTo(type, data, idxBytes, idAtK(k), format)) return undefined;
       keepBase(k, type, data);
       return { type, data };
     };
@@ -289,7 +298,7 @@ export async function checkPack(
       const offset = offsetOf(k);
       const head =
         v2 && bytes && fastAt(k)
-          ? parseEntryHead(bytes, sorted, k, entryEnd(k), (b) => ids(posOf(b)))
+          ? parseEntryHead(bytes, sorted, k, entryEnd(k), (b) => ids(posOf(b)), raw)
           : undefined;
       const id = ids(posOf(k));
       const entry: PackScanEntry = {
@@ -322,14 +331,14 @@ export async function checkPack(
           base: `failed to read delta base object ${baseId} at offset ${baseAt} from ${packPath}`,
         };
       };
-      const slow = unpackEntry(pack, packPath, entry, keepBlob);
+      const slow = unpackEntry(pack, packPath, entry, keepBlob, format);
       if (slow instanceof Promise) return slow.then((u) => hooks.entry(entry, noted(u), pack));
       return hooks.entry(entry, noted(slow), pack);
     };
 
-    // One pass: the pack's SHA-1, each entry's CRC-32 and bytes
-    const sha = new Sha1();
-    const trailer = new Uint8Array(20);
+    // One pass: the pack's hash, each entry's CRC-32 and bytes
+    const sha = format.createHasher();
+    const trailer = new Uint8Array(raw);
     let at = 0;
     let k = 0;
     let crc = new CRC32();
@@ -405,11 +414,11 @@ export async function checkPack(
       const r = visit(k, undefined);
       if (r instanceof Promise) await r;
     }
-    if (!sameBytes(sha.digest(), 0, trailer, 0)) {
+    if (!sameBytes(sha.digest(), 0, trailer, 0, raw)) {
       hooks.checksumError(`${packPath} pack checksum mismatch`);
       failed = true;
     }
-    if (!sameBytes(idx.packChecksum, 0, trailer, 0)) {
+    if (!sameBytes(idx.packChecksum, 0, trailer, 0, raw)) {
       hooks.checksumError(`${packPath} pack checksum does not match its index`);
       failed = true;
     }
@@ -442,36 +451,47 @@ function hexIds(
   idsAt: number,
   stride: number,
   n: number,
+  raw = 20,
 ): (pos: number) => string {
-  const text = new Uint8Array(n * 40);
+  const hex = 2 * raw;
+  const text = new Uint8Array(n * hex);
   for (let i = 0; i < n; i++) {
-    for (let k = 0, at = idsAt + i * stride, o = i * 40; k < 20; k++, o += 2) {
+    for (let k = 0, at = idsAt + i * stride, o = i * hex; k < raw; k++, o += 2) {
       const b = (idx[at + k] as number) ?? 0;
       text[o] = HEX_DIGITS[b >> 4] as number;
       text[o + 1] = HEX_DIGITS[b & 15] as number;
     }
   }
   const all = new TextDecoder().decode(text);
-  return (pos) => all.slice(pos * 40, pos * 40 + 40);
+  return (pos) => all.slice(pos * hex, pos * hex + hex);
 }
 
-function sameBytes(a: Uint8Array, at: number, b: Uint8Array, bt: number): boolean {
-  for (let i = 0; i < 20; i++) if (a[at + i] !== b[bt + i]) return false;
+function sameBytes(a: Uint8Array, at: number, b: Uint8Array, bt: number, n = 20): boolean {
+  for (let i = 0; i < n; i++) if (a[at + i] !== b[bt + i]) return false;
   return true;
 }
 
 /** Where `hashesTo` writes an object's `"<type> <size>\0"` header (it runs synchronously). */
 const header = new Uint8Array(32);
 
-/** Whether `content` as `type` hashes to the 20 id bytes at `idAt` in `ids`. */
-function hashesTo(type: string, content: Uint8Array, ids: Uint8Array, idAt: number): boolean {
+/** Whether `content` as `type` hashes (in `format`) to the id bytes at `idAt` in `ids`. */
+function hashesTo(
+  type: string,
+  content: Uint8Array,
+  ids: Uint8Array,
+  idAt: number,
+  format: ObjectFormat,
+): boolean {
   let n = 0;
   for (let i = 0; i < type.length; i++) header[n++] = type.charCodeAt(i);
   header[n++] = 0x20;
   const size = String(content.length);
   for (let i = 0; i < size.length; i++) header[n++] = size.charCodeAt(i);
   header[n++] = 0;
-  return sameBytes(sha1Of(header.subarray(0, n), content), 0, ids, idAt);
+  if (format.name === "sha1")
+    return sameBytes(sha1Of(header.subarray(0, n), content), 0, ids, idAt);
+  const digest = format.createHasher().update(header.subarray(0, n)).update(content).digest();
+  return sameBytes(digest, 0, ids, idAt, format.rawLength);
 }
 
 /** The whole content of an object read from a store. */
@@ -510,6 +530,7 @@ export function unpackEntry(
   packPath: string,
   entry: PackScanEntry,
   keepBlob: (id: string) => boolean,
+  format: ObjectFormat = SHA1_OBJECT_FORMAT,
 ): UnpackedEntry | Promise<UnpackedEntry> {
   let obj: GitObject | undefined | Promise<GitObject | undefined>;
   try {
@@ -519,11 +540,11 @@ export function unpackEntry(
   }
   if (obj instanceof Promise) {
     return obj.then(
-      (o) => hashEntry(o, packPath, entry, keepBlob),
+      (o) => hashEntry(o, packPath, entry, keepBlob, format),
       (e) => unpackError(entry, packPath, e),
     );
   }
-  return hashEntry(obj, packPath, entry, keepBlob);
+  return hashEntry(obj, packPath, entry, keepBlob, format);
 }
 
 function hashEntry(
@@ -531,11 +552,13 @@ function hashEntry(
   packPath: string,
   entry: PackScanEntry,
   keepBlob: (id: string) => boolean,
+  format: ObjectFormat,
 ): UnpackedEntry | Promise<UnpackedEntry> {
   if (!obj) return { error: cannotUnpack(entry, packPath), corrupt: false };
   const bytes = obj.bytes;
-  if (!bytes) return streamEntry(obj, packPath, entry, keepBlob);
-  if (objectIdOf(obj.type, bytes) !== entry.id) {
+  if (!bytes) return streamEntry(obj, packPath, entry, keepBlob, format);
+  const sha1 = format.name === "sha1";
+  if (objectIdOf(obj.type, bytes, sha1 ? undefined : format.createHasher) !== entry.id) {
     return { error: `packed ${entry.id} from ${packPath} is corrupt`, corrupt: true };
   }
   return { type: obj.type, content: obj.type === "blob" && !keepBlob(entry.id) ? EMPTY : bytes };
@@ -547,9 +570,10 @@ async function streamEntry(
   packPath: string,
   entry: PackScanEntry,
   keepBlob: (id: string) => boolean,
+  format: ObjectFormat,
 ): Promise<UnpackedEntry> {
   const keep = obj.type !== "blob" || keepBlob(entry.id);
-  const h = createSha1().update(enc.encode(`${obj.type} ${obj.size}\0`));
+  const h = format.createHasher().update(enc.encode(`${obj.type} ${obj.size}\0`));
   const parts: Uint8Array[] = [];
   let n = 0;
   try {
@@ -588,7 +612,10 @@ function unpackError(entry: PackScanEntry, packPath: string, e: unknown): Unpack
 
 const enc = new TextEncoder();
 
-/** The git object id of `content` as `type`: SHA-1 over its header and content, as hex. */
+/**
+ * The git object id of `content` as `type`: SHA-1 (or `newHasher`'s hash) over its header and
+ * content, as hex.
+ */
 export function objectIdOf(type: string, content: Uint8Array, newHasher?: () => Hasher): string {
   let n = 0;
   for (let i = 0; i < type.length; i++) header[n++] = type.charCodeAt(i);

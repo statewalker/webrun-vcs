@@ -206,6 +206,35 @@ export interface WriteCommitGraphOptions {
  * await writeCommitGraph({ files, objects, refs: history.refs, commitGraph: history.commitGraph });
  * ```
  */
+/**
+ * Removes the commit-graph files of `objectsDir` (`info/commit-graph` and the split chain
+ * `info/commit-graphs/`), for a repository whose graph cannot be written (SHA-256, until it
+ * has a writer) after gc or repack removed or replaced objects: a graph naming a pruned
+ * commit makes git's fsck and `commit-graph verify` fail ("Could not read"), and git rebuilds
+ * a missing one at its next gc. Readers treat a missing graph as none; a reader that opened
+ * the files keeps reading them (unlinked, not truncated). Returns whether anything was removed.
+ *
+ * @example
+ * ```typescript
+ * await removeCommitGraphFiles(files, ".git/objects");
+ * ```
+ */
+export async function removeCommitGraphFiles(
+  files: FilesApi,
+  objectsDir: string,
+): Promise<boolean> {
+  let removed = false;
+  for (const path of [
+    joinPath(objectsDir, "info", "commit-graph"),
+    joinPath(objectsDir, "info", "commit-graphs"),
+  ]) {
+    if (!(await files.stats(path))) continue;
+    await files.remove(path);
+    removed = true;
+  }
+  return removed;
+}
+
 export async function writeCommitGraph(
   options: WriteCommitGraphOptions,
 ): Promise<WriteCommitGraphFileResult> {

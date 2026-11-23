@@ -13,6 +13,7 @@
  */
 
 import { parseGitBool } from "@statewalker/vcs-utils";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import {
   DIR_HIDE_EMPTY_DIRECTORIES,
   DIR_SHOW_OTHER_DIRECTORIES,
@@ -20,7 +21,6 @@ import {
   expandUserPath,
   type GitHostEnvironment,
   invalidateGitignore,
-  NULL_OID,
   newUntrackedCache,
   newUntrackedCacheDir,
   type OidStat,
@@ -93,6 +93,7 @@ export function openUntrackedCache(
   config: UntrackedCacheConfig,
   environment: GitHostEnvironment | undefined,
   host: UntrackedScanHost | undefined,
+  objectFormat: ObjectFormat = SHA1_OBJECT_FORMAT,
 ): UntrackedCacheState {
   const supported = typeof staging.getUntrackedCache === "function";
   let cache = supported ? staging.getUntrackedCache?.() : undefined;
@@ -108,7 +109,7 @@ export function openUntrackedCache(
     changed = true;
   } else if (supported && setting === "write" && ident) {
     if (!cache || !untrackedCacheIdentIs(cache, ident)) {
-      cache = newUntrackedCache(ident, newUntrackedCacheFlags(config));
+      cache = newUntrackedCache(ident, newUntrackedCacheFlags(config), objectFormat);
       changed = true;
     }
   }
@@ -127,17 +128,17 @@ export function openUntrackedCache(
       // configured mode's, else kept for the scans of that mode and not used here
       if (cache.dirFlags !== flags) {
         if (cache.dirFlags === newUntrackedCacheFlags(config)) return undefined;
-        cache = newUntrackedCache(ident, flags);
+        cache = newUntrackedCache(ident, flags, objectFormat);
         changed = true;
       }
       if (!cache.root) {
         // a cache not yet initialized gets its root
-        cache.root = newUntrackedCacheDir("");
+        cache.root = newUntrackedCacheDir("", objectFormat.nullId);
         changed = true;
       }
       // $GIT_DIR/info/exclude and core.excludesFile: another id invalidates everything
-      const info = await readExcludeFile(await host.readInfoExclude?.());
-      const excludes = await readExcludesFile(config, environment);
+      const info = await readExcludeFile(await host.readInfoExclude?.(), objectFormat);
+      const excludes = await readExcludesFile(config, environment, objectFormat);
       if (info.oid !== cache.infoExclude.oid) {
         invalidateGitignore(cache, cache.root);
         cache.infoExclude = info;
@@ -164,9 +165,10 @@ export function openUntrackedCache(
 /** An exclude file's id and stat as git's `add_patterns` records them (no istate). */
 async function readExcludeFile(
   read: { bytes: Uint8Array; stat: import("@statewalker/vcs-utils/files").LinkStats } | undefined,
+  objectFormat: ObjectFormat,
 ): Promise<OidStat> {
-  if (!read) return { stat: zeroStatData(), oid: NULL_OID };
-  return { stat: statDataOf(read.stat), oid: await excludeFileOid(read.bytes) };
+  if (!read) return { stat: zeroStatData(), oid: objectFormat.nullId };
+  return { stat: statDataOf(read.stat), oid: await excludeFileOid(read.bytes, objectFormat) };
 }
 
 /**
@@ -176,19 +178,21 @@ async function readExcludeFile(
 async function readExcludesFile(
   config: UntrackedCacheConfig,
   environment: GitHostEnvironment | undefined,
+  objectFormat: ObjectFormat,
 ): Promise<OidStat> {
-  if (!environment) return { stat: zeroStatData(), oid: NULL_OID };
+  const none = { stat: zeroStatData(), oid: objectFormat.nullId };
+  if (!environment) return none;
   const configured = config.value("core.excludesFile");
   const path =
     configured !== undefined && configured !== ""
       ? expandUserPath(configured, environment)
       : xdgConfigPath(environment, "ignore");
-  if (!path) return { stat: zeroStatData(), oid: NULL_OID };
+  if (!path) return none;
   const bytes = await environment.readFile(path).catch(() => undefined);
-  if (!bytes) return { stat: zeroStatData(), oid: NULL_OID };
+  if (!bytes) return none;
   const stat = await environment.statFile?.(path).catch(() => undefined);
   return {
     stat: stat ? statDataOf(stat) : zeroStatData(),
-    oid: await excludeFileOid(bytes),
+    oid: await excludeFileOid(bytes, objectFormat),
   };
 }

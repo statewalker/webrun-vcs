@@ -14,13 +14,13 @@ import { joinPath } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { parseExpiryDate } from "./reflog-expire.js";
+import { readRepositoryFormat } from "./repository-format.js";
 import {
   configFilesApiOf,
   createWorkingCopyConfig,
 } from "./workspace/working-copy/working-copy-config.files.js";
 
 const DAY = 86400;
-const CONFLICT_ID = /^[0-9a-fA-F]{40}$/;
 
 export interface RerereGcOptions {
   files: FilesApi;
@@ -88,6 +88,9 @@ export async function rerereGc(o: RerereGcOptions): Promise<RerereGcResult> {
     if (st?.kind !== "file") return 0;
     return st.lastModified === undefined ? now : Math.floor(st.lastModified / 1000);
   };
+  // rerere's conflict ids are the repository's hash (rerere.c's hash_algo): its hex length
+  const hexLength = (await readRepositoryFormat(files, gitDir)).objectFormat.hexLength;
+  const CONFLICT_ID = new RegExp(`^[0-9a-fA-F]{${hexLength}}$`);
   const toRemove: string[] = [];
   for await (const entry of files.list(cache)) {
     if (entry.kind !== "directory" || !CONFLICT_ID.test(entry.name)) continue;

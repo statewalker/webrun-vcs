@@ -1,4 +1,5 @@
 import type { FilesApi } from "@statewalker/vcs-core";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 
 import { GitCommand } from "../../git-command.js";
 import { checkPack, type PackScanEntry, type UnpackedEntry } from "./fsck-pack.js";
@@ -116,7 +117,8 @@ export class VerifyPackCommand extends GitCommand<VerifyPackResult> {
         : path.endsWith(".pack")
           ? path.slice(0, -5)
           : path;
-      const report = await verifyOnePack(files, `${base}.pack`, `${base}.idx`);
+      // the repository's object format, as git's verify-pack reads packs with the_hash_algo
+      const report = await verifyOnePack(files, `${base}.pack`, `${base}.idx`, this.objectFormat);
       packs.push(report);
       for (const e of report.errors) err.push(`${e}\n`);
       if (report.ok && (this._verbose || this._statOnly)) {
@@ -151,6 +153,7 @@ async function verifyOnePack(
   files: FilesApi,
   packPath: string,
   idxPath: string,
+  objectFormat: ObjectFormat,
 ): Promise<VerifyPackReport> {
   const errors: string[] = [];
   const report: VerifyPackReport = {
@@ -214,7 +217,7 @@ async function verifyOnePack(
         );
       },
     },
-    { keepBlob: noBlob },
+    { keepBlob: noBlob, ...(objectFormat.name === "sha1" ? {} : { objectFormat }) },
   );
   if (!result.opened) return report;
   if (result.failed) ok = false;

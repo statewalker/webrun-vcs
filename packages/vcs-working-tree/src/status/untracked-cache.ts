@@ -23,14 +23,20 @@
  * exclude id) and the stat data and ids they select.
  */
 
-import { bytesToHex, createSha1, EwahBitmap as Ewah, hexToBytes } from "@statewalker/vcs-utils";
+import { bytesToHex, EwahBitmap as Ewah, hexToBytes } from "@statewalker/vcs-utils";
 import { compareGitPaths, decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { LinkStats } from "@statewalker/vcs-utils/files";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 
-/** The null object id: no exclude file. */
+/** The null object id: no exclude file (SHA-1's; a SHA-256 cache's is its format's `nullId`). */
 export const NULL_OID = "0000000000000000000000000000000000000000";
-/** The id of the empty blob (an exclude file of size 0). */
+/** The id of the empty blob (an exclude file of size 0), SHA-1's. */
 export const EMPTY_BLOB_OID = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+
+/** The null id of a cache's object format (no exclude file, no `.gitignore` read). */
+export function untrackedNullOid(cache: Pick<UntrackedCache, "objectFormat"> | undefined): string {
+  return (cache?.objectFormat ?? SHA1_OBJECT_FORMAT).nullId;
+}
 
 /** git's `dir_struct` flags the cache records (`dir_flags`). */
 export const DIR_SHOW_IGNORED = 1 << 0;
@@ -114,10 +120,15 @@ export interface UntrackedCache {
   gitignoreInvalidated: number;
   dirInvalidated: number;
   dirOpened: number;
+  /**
+   * The repository's object format: the width of the exclude ids (SHA-1 when absent). Set by
+   * {@link parseUntrackedCache} and {@link newUntrackedCache}; never written.
+   */
+  objectFormat?: ObjectFormat;
 }
 
-/** A directory node as git's `lookup_untracked` creates it. */
-export function newUntrackedCacheDir(name: string): UntrackedCacheDir {
+/** A directory node as git's `lookup_untracked` creates it (`nullOid`: the format's null id). */
+export function newUntrackedCacheDir(name: string, nullOid: string = NULL_OID): UntrackedCacheDir {
   return {
     name,
     untracked: [],
@@ -126,7 +137,7 @@ export function newUntrackedCacheDir(name: string): UntrackedCacheDir {
     checkOnly: false,
     recurse: false,
     stat: zeroStatData(),
-    excludeOid: NULL_OID,
+    excludeOid: nullOid,
   };
 }
 
@@ -139,14 +150,20 @@ export function untrackedCacheIdent(worktreePath: string, systemName: string): s
  * A new, empty cache (git's `new_untracked_cache`): the ident with its trailing NUL, no
  * exclude files, no root.
  */
-export function newUntrackedCache(ident: string, dirFlags: number): UntrackedCache {
+export function newUntrackedCache(
+  ident: string,
+  dirFlags: number,
+  objectFormat?: ObjectFormat,
+): UntrackedCache {
   const text = encodeGitPath(ident);
   const bytes = new Uint8Array(text.length + 1);
   bytes.set(text);
+  const nullOid = (objectFormat ?? SHA1_OBJECT_FORMAT).nullId;
   return {
+    ...(objectFormat && objectFormat !== SHA1_OBJECT_FORMAT ? { objectFormat } : {}),
     ident: bytes,
-    infoExclude: { stat: zeroStatData(), oid: NULL_OID },
-    excludesFile: { stat: zeroStatData(), oid: NULL_OID },
+    infoExclude: { stat: zeroStatData(), oid: nullOid },
+    excludesFile: { stat: zeroStatData(), oid: nullOid },
     dirFlags,
     excludePerDir: ".gitignore",
     dirCreated: 0,
@@ -235,11 +252,15 @@ export function statDataMatches(
 /**
  * The id git records for an exclude file it read from disk (`add_patterns`): the empty
  * blob for an empty file, else the blob id of its content with a newline appended (git
- * hashes the buffer it parsed, which ends in one more `\n` than the file).
+ * hashes the buffer it parsed, which ends in one more `\n` than the file), in `objectFormat`
+ * (SHA-1 by default).
  */
-export async function excludeFileOid(bytes: Uint8Array): Promise<string> {
-  if (bytes.length === 0) return EMPTY_BLOB_OID;
-  const hasher = createSha1();
+export async function excludeFileOid(
+  bytes: Uint8Array,
+  objectFormat: ObjectFormat = SHA1_OBJECT_FORMAT,
+): Promise<string> {
+  if (bytes.length === 0) return objectFormat.emptyBlobId;
+  const hasher = objectFormat.createHasher();
   hasher.update(encodeGitPath(`blob ${bytes.length + 1}\0`));
   hasher.update(bytes);
   hasher.update(NEWLINE);
@@ -272,7 +293,7 @@ export function lookupUntracked(
     else first = next + 1;
   }
   cache.dirCreated++;
-  const d = newUntrackedCacheDir(key);
+  const d = newUntrackedCacheDir(key, untrackedNullOid(cache));
   dir.dirs.splice(first, 0, d);
   return d;
 }
@@ -368,7 +389,6 @@ function readVarint(
 }
 
 const STAT_DATA_SIZE = 36;
-const HASH_SIZE = 20;
 /** `struct ondisk_untracked_cache`: two stat datas and the flags. */
 const OUC_SIZE = 2 * STAT_DATA_SIZE + 4;
 
@@ -431,14 +451,18 @@ function pushString(out: number[], text: string): void {
  * no untracked names and no check-only bit (git resets them as it writes, and so does this).
  */
 export function encodeUntrackedCache(cache: UntrackedCache): Uint8Array {
+  const format = cache.objectFormat ?? SHA1_OBJECT_FORMAT;
+  // an id in the cache's width (a null id of any width is the format's)
+  const idBytes = (oid: string): Uint8Array =>
+    /^0+$/.test(oid) ? new Uint8Array(format.rawLength) : hexToBytes(oid);
   const out: number[] = [];
   pushVarint(out, cache.ident.length);
   pushBytes(out, cache.ident);
   pushStat(out, cache.infoExclude.stat);
   pushStat(out, cache.excludesFile.stat);
   pushU32(out, cache.dirFlags >>> 0);
-  pushBytes(out, hexToBytes(cache.infoExclude.oid));
-  pushBytes(out, hexToBytes(cache.excludesFile.oid));
+  pushBytes(out, idBytes(cache.infoExclude.oid));
+  pushBytes(out, idBytes(cache.excludesFile.oid));
   pushString(out, cache.excludePerDir);
   if (!cache.root) {
     pushVarint(out, 0);
@@ -462,9 +486,9 @@ export function encodeUntrackedCache(cache: UntrackedCache): Uint8Array {
       valid.set(i);
       pushStat(stats, dir.stat);
     }
-    if (dir.excludeOid !== NULL_OID) {
+    if (!/^0+$/.test(dir.excludeOid)) {
       hashValid.set(i);
-      pushBytes(hashes, hexToBytes(dir.excludeOid));
+      pushBytes(hashes, idBytes(dir.excludeOid));
     }
     pushVarint(dirs, dir.untracked.length);
     let reached = 0;
@@ -488,9 +512,14 @@ export function encodeUntrackedCache(cache: UntrackedCache): Uint8Array {
 
 /**
  * The cache in a `UNTR` payload (git's `read_untracked_extension`); undefined when it is
- * malformed (git then has no cache). Every directory read is reached (`recurse`).
+ * malformed (git then has no cache). Every directory read is reached (`recurse`). Its ids are
+ * `objectFormat`'s (SHA-1 by default).
  */
-export function parseUntrackedCache(data: Uint8Array): UntrackedCache | undefined {
+export function parseUntrackedCache(
+  data: Uint8Array,
+  objectFormat: ObjectFormat = SHA1_OBJECT_FORMAT,
+): UntrackedCache | undefined {
+  const HASH_SIZE = objectFormat.rawLength;
   if (data.length <= 1 || data[data.length - 1] !== 0) return undefined;
   const end = data.length - 1;
   const identLen = readVarint(data, 0, end);
@@ -503,6 +532,7 @@ export function parseUntrackedCache(data: Uint8Array): UntrackedCache | undefine
   const nul = data.indexOf(0, next + excludePerDirOffset);
   if (nul < 0 || nul > end) return undefined;
   const cache: UntrackedCache = {
+    ...(objectFormat !== SHA1_OBJECT_FORMAT ? { objectFormat } : {}),
     ident,
     infoExclude: {
       stat: readStat(data, next),
@@ -535,7 +565,10 @@ export function parseUntrackedCache(data: Uint8Array): UntrackedCache | undefine
     next = dirsNr.next;
     const nameEnd = data.indexOf(0, next);
     if (nameEnd < 0 || nameEnd >= end) return undefined;
-    const dir = newUntrackedCacheDir(decodeGitPath(data.subarray(next, nameEnd)));
+    const dir = newUntrackedCacheDir(
+      decodeGitPath(data.subarray(next, nameEnd)),
+      objectFormat.nullId,
+    );
     dir.recurse = true;
     next = nameEnd + 1;
     for (let i = 0; i < untrackedNr.value; i++) {

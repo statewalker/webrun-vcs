@@ -1,22 +1,22 @@
 /**
  * Pack reverse indexes (`pack-<id>.rev`, RIDX version 1), as git's pack-write.c writes them
- * and pack-revindex.c reads them: a 12-byte header (`RIDX`, version 1, hash id 1 for SHA-1),
- * then for each object in pack order (by offset) its position in the `.idx` (big-endian
- * uint32), then the pack's checksum and the SHA-1 of everything before it.
+ * and pack-revindex.c reads them: a 12-byte header (`RIDX`, version 1, hash id 1 for SHA-1,
+ * 2 for SHA-256), then for each object in pack order (by offset) its position in the `.idx`
+ * (big-endian uint32), then the pack's checksum and the hash of everything before it (both of
+ * the object format's width).
  *
  * git writes one beside every pack it writes while `pack.writeReverseIndex` is true (the
  * default since 2.41) and reads it in place of sorting the idx's offsets while
  * `pack.readReverseIndex` is true (default).
  */
 
-import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 import type { FilesApi } from "../common/files/index.js";
 
 /** `RIDX` */
 const RIDX_SIGNATURE = 0x52494458;
 const RIDX_HEADER_SIZE = 12;
-const HASH_SIZE = 20;
 
 /** A `.rev` file git would refuse; the message is git's error (without `error: `). */
 export class ReverseIndexError extends Error {
@@ -25,7 +25,9 @@ export class ReverseIndexError extends Error {
 
 /**
  * Encodes a `.rev` file: `packOrder[p]` is the idx position of the object at pack position
- * `p` (`PackFile.packOrder()`), `packChecksum` the pack's trailer (20 bytes, or its hex).
+ * `p` (`PackFile.packOrder()`), `packChecksum` the pack's trailer (bytes, or its hex), of the
+ * repository's object format `format` (default SHA-1), whose hash id and hash the file is
+ * written with; a checksum of another width is refused.
  *
  * @example
  * ```typescript
@@ -36,23 +38,27 @@ export class ReverseIndexError extends Error {
 export function encodeReverseIndex(
   packOrder: ArrayLike<number>,
   packChecksum: Uint8Array | string,
+  format: ObjectFormat = SHA1_OBJECT_FORMAT,
 ): Uint8Array {
   const n = packOrder.length;
+  const checksum = typeof packChecksum === "string" ? hexToBytes(packChecksum) : packChecksum;
+  const HASH_SIZE = format.rawLength;
+  if (checksum.length !== HASH_SIZE) {
+    throw new Error(`pack checksum must be ${HASH_SIZE} bytes in a ${format.name} repository`);
+  }
   const out = new Uint8Array(RIDX_HEADER_SIZE + n * 4 + 2 * HASH_SIZE);
   const v = new DataView(out.buffer);
   v.setUint32(0, RIDX_SIGNATURE);
   v.setUint32(4, 1);
-  v.setUint32(8, 1);
+  v.setUint32(8, format.version);
   let p = RIDX_HEADER_SIZE;
   for (let i = 0; i < n; i++) {
     v.setUint32(p, packOrder[i] as number);
     p += 4;
   }
-  const checksum = typeof packChecksum === "string" ? hexToBytes(packChecksum) : packChecksum;
-  if (checksum.length !== HASH_SIZE) throw new Error("pack checksum must be 20 bytes");
   out.set(checksum, p);
   p += HASH_SIZE;
-  out.set(createSha1().update(out.subarray(0, p)).digest(), p);
+  out.set(format.createHasher().update(out.subarray(0, p)).digest(), p);
   return out;
 }
 
@@ -60,30 +66,34 @@ export function encodeReverseIndex(
  * Reads a `.rev` file of a pack of `count` objects, with git's checks of
  * `load_revindex_from_disk` (size, signature, version, hash id), each refusal git's message.
  * Returns the idx positions in pack order. `verify` adds what `verify_pack_revindex` (fsck)
- * checks first: the file's own checksum (`invalid checksum`).
+ * checks first: the file's own checksum (`invalid checksum`). The file is read as one of the
+ * repository's object format (`objectFormat`, default SHA-1): sized by its hash, and its hash
+ * id must be that format's (a `.rev` of the other format is refused).
  */
 export function parseReverseIndex(
   bytes: Uint8Array,
   count: number,
   name: string,
-  options: { verify?: boolean } = {},
+  options: { verify?: boolean; objectFormat?: ObjectFormat } = {},
 ): Uint32Array {
+  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const format = options.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const HASH_SIZE = format.rawLength;
   const min = RIDX_HEADER_SIZE + 2 * HASH_SIZE;
   if (bytes.length < min) throw new ReverseIndexError(`reverse-index file ${name} is too small`);
   if (bytes.length - min !== count * 4)
     throw new ReverseIndexError(`reverse-index file ${name} is corrupt`);
-  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   if (v.getUint32(0) !== RIDX_SIGNATURE)
     throw new ReverseIndexError(`reverse-index file ${name} has unknown signature`);
   const version = v.getUint32(4);
   if (version !== 1)
     throw new ReverseIndexError(`reverse-index file ${name} has unsupported version ${version}`);
   const hashId = v.getUint32(8);
-  if (hashId !== 1 && hashId !== 2)
+  if (hashId !== format.version)
     throw new ReverseIndexError(`reverse-index file ${name} has unsupported hash id ${hashId}`);
   if (options.verify) {
     const end = bytes.length - HASH_SIZE;
-    const sum = createSha1().update(bytes.subarray(0, end)).digest();
+    const sum = format.createHasher().update(bytes.subarray(0, end)).digest();
     for (let i = 0; i < HASH_SIZE; i++)
       if (sum[i] !== bytes[end + i]) throw new ReverseIndexError("invalid checksum");
   }
@@ -104,6 +114,8 @@ export async function verifyReverseIndexFile(
   packPath: string,
   count: number,
   offsetAt: (i: number) => number,
+  /** the repository's object format (default SHA-1) */
+  objectFormat: ObjectFormat = SHA1_OBJECT_FORMAT,
 ): Promise<string[] | undefined> {
   const revPath = `${packPath.replace(/\.pack$/, "")}.rev`;
   if ((await files.stats(revPath).catch(() => undefined))?.kind !== "file") return undefined;
@@ -121,14 +133,14 @@ export async function verifyReverseIndexFile(
   }
   let order: Uint32Array;
   try {
-    order = parseReverseIndex(bytes, count, revPath);
+    order = parseReverseIndex(bytes, count, revPath, { objectFormat });
   } catch (e) {
     if (!(e instanceof ReverseIndexError)) throw e;
     return [`error: ${e.message}`, `error: unable to load rev-index for pack '${packPath}'`];
   }
   const errors: string[] = [];
   try {
-    parseReverseIndex(bytes, count, revPath, { verify: true });
+    parseReverseIndex(bytes, count, revPath, { verify: true, objectFormat });
   } catch (e) {
     if (!(e instanceof ReverseIndexError)) throw e;
     errors.push(`error: ${e.message}`);

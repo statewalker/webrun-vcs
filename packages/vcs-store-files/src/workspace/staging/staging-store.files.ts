@@ -77,8 +77,8 @@ export class FileStagingStore implements Staging {
     this.indexFile = new IndexFile(files, indexPath, {
       ...options,
       defaultTrees: options.defaultTrees ?? lazyRepositoryTrees(files, gitDir),
-      // a SHA-256 repository's index (32-byte ids) is refused: read from its config when the
-      // first read or write comes
+      // a SHA-256 repository's index holds 32-byte ids: its format read from the config
+      // when the first read or write comes
       objectFormat: options.objectFormat ?? (() => repositoryObjectFormat(files, gitDir)),
     });
   }
@@ -685,7 +685,8 @@ export class FileStagingStore implements Staging {
     // the index on disk is another one than this instance read or wrote (by checksum)
     const current = this.indexFile.currentChecksum;
     if (current === undefined) return false;
-    return (await readIndexChecksum(this.files, this.indexPath)) !== current;
+    const size = this.indexFile.objectFormat.rawLength;
+    return (await readIndexChecksum(this.files, this.indexPath, size)) !== current;
   }
 
   /**

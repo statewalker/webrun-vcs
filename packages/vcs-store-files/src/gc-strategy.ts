@@ -20,9 +20,9 @@ import type {
   ObjectId,
   StorageStats,
 } from "@statewalker/vcs-core";
-import { joinPath, objectsWithoutLazyFetch } from "@statewalker/vcs-core";
-
+import { joinPath, objectFormatOf, objectsWithoutLazyFetch } from "@statewalker/vcs-core";
 import { assertAlternatesReadable } from "./alternates/index.js";
+import { objectIdPattern } from "./object-names.js";
 import { promisorExclusions } from "./promisor-objects.js";
 import { collectReachabilityRoots } from "./reachable-objects.js";
 
@@ -31,7 +31,6 @@ import { assertObjectsDeletable, readRepositoryFormat } from "./repository-forma
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
 /** A loose object file name, fan-out directory included. */
-const OBJECT_ID = /^[0-9a-f]{40}$/;
 
 /**
  * Options for creating a FileGcStrategy: the repository (`createGitFilesBackend`'s result).
@@ -147,6 +146,7 @@ export class FileGcStrategy implements GcStrategy {
     // Count loose objects
     let looseCount = 0;
     let looseSize = 0;
+    const OBJECT_ID = objectIdPattern(objectFormatOf(this.target.objects));
     for await (const key of this.looseStorage.keys()) {
       if (!OBJECT_ID.test(key)) continue;
       looseCount++;

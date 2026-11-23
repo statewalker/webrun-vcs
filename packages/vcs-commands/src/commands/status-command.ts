@@ -998,6 +998,7 @@ export class StatusCommand extends GitCommand<Status> {
       this.config,
       hostEnvironmentOf(this.workingCopy),
       host,
+      this.objectFormat,
     );
     if (worktree && this.resolvedUntracked !== "no") {
       // git's wt_status_collect_untracked: the dir flags of the modes

@@ -14,6 +14,7 @@ import {
   createGitObjects,
   joinPath,
   noteObjectRemoved,
+  objectFormatOf,
   openPackSet,
   overlayObjects,
   QUARANTINE_MAX_IDLE_MS,
@@ -107,8 +108,12 @@ export async function beginFilesQuarantine(
     throw e;
   }
   const staging = filesStagingStore(files, dir, { freshenMaxAgeMs });
-  const looseOnly = createGitObjects(staging);
+  // the repository's object format: received objects hash and pack in it
+  const objectFormat = objectFormatOf(options.objects);
+  const sha1 = objectFormat.name === "sha1";
+  const looseOnly = createGitObjects(staging, sha1 ? {} : { objectFormat });
   const packs = await openPackSet(files, packDir, {
+    ...(sha1 ? {} : { objectFormat }),
     externalBase: async (id) => (await looseOnly.get(id)) ?? options.objects.get(id),
     freshenMaxAgeMs,
     // the repository's pack.writeReverseIndex
@@ -116,7 +121,10 @@ export async function beginFilesQuarantine(
       ? { writeReverseIndex: options.packs.writeReverseIndex }
       : {}),
   });
-  const quarantined = withPacks(createGitObjects(skipPacked(staging, packs)), packs);
+  const quarantined = withPacks(
+    createGitObjects(skipPacked(staging, packs), sha1 ? {} : { objectFormat }),
+    packs,
+  );
   const overlay = overlayObjects(quarantined, options.objects);
 
   const close = async () => {

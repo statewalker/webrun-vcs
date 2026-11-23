@@ -35,11 +35,13 @@ import {
   writePackBitmap,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
-import { assertSha1ObjectFormat } from "@statewalker/vcs-utils/hash";
+import { type ObjectFormat, UnsupportedObjectFormatError } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { assertAlternatesReadable } from "./alternates/index.js";
+import { removeCommitGraphFiles } from "./commit-graph.js";
 import { writeCruftPacks } from "./cruft-pack.js";
 import { type MultiPackIndexWriteOptions, multiPackIndexWrite } from "./multi-pack-index.js";
+import { objectIdPattern } from "./object-names.js";
 import {
   type PackWriteSettings,
   packDeltaSearch,
@@ -60,7 +62,6 @@ import {
 export const DEFAULT_PRUNE_EXPIRE_MS = 14 * 24 * 60 * 60 * 1000;
 
 /** A loose object file name, fan-out directory included. */
-const OBJECT_ID = /^[0-9a-f]{40}$/;
 
 /** The repository a repack works on: the fields of `createGitFilesBackend`'s result. */
 export interface RepackTarget {
@@ -403,8 +404,11 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
   // delete packs in a precious-objects repo")
   // git's errors reading the alternates are printed and repack goes on (see gc)
   let alternatesErrors: readonly string[] = options.objects.alternates?.errors ?? [];
-  // a SHA-256 repository's packs are not written yet
-  assertSha1ObjectFormat(objectFormatOf(options.objects), "repack");
+  // a SHA-256 repository's multi-pack-index is not written yet
+  const objectFormat = objectFormatOf(options.objects);
+  if (options.writeMidx && objectFormat.name !== "sha1") {
+    throw new UnsupportedObjectFormatError("the multi-pack-index", objectFormat.name);
+  }
   if (!options.dryRun) {
     assertObjectsDeletable(await readRepositoryFormat(options.files, options.gitDir), "repack", {
       partialClone: "allow",
@@ -432,6 +436,16 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
     return repackListed(options, listed, snapshot, undefined, exclusions);
   };
   const result = await run({ ...options, objects: objectsWithoutLazyFetch(options.objects) });
+  // a SHA-256 repository's commit-graph cannot be rewritten yet: one naming objects the
+  // repack dropped would leave git's fsck failing; it goes, git rebuilds it
+  if (
+    result &&
+    !options.dryRun &&
+    objectFormat.name !== "sha1" &&
+    (result.packsRemoved.length > 0 || result.looseObjectsRemoved > 0)
+  ) {
+    await removeCommitGraphFiles(options.files, joinPath(options.gitDir ?? ".git", "objects"));
+  }
   if (!options.dryRun && (options.updateServerInfo ?? true))
     await updateServerInfo({ ...options, gitDir: options.gitDir ?? ".git" });
   return result && alternatesErrors.length > 0
@@ -735,7 +749,12 @@ export async function repackListed(
       );
     if (packsRemoved.length) await packs.remove(removable.map((r) => r.pack.packId));
 
-    const looseObjectsRemoved = await prunePacked(looseStorage, packs, alternates);
+    const looseObjectsRemoved = await prunePacked(
+      looseStorage,
+      packs,
+      objectFormatOf(objects),
+      alternates,
+    );
 
     return {
       packName: `pack-${packId}`,
@@ -796,6 +815,13 @@ async function bitmapPlan(
           : "off";
   if (mode === "off") return { ...base, mode };
   if (!all) throw new IncrementalBitmapError();
+  // a SHA-256 repository's bitmaps are not written yet: refused when asked for (-b,
+  // repack.writeBitmaps), skipped when only git's default for a bare repository wants one
+  const objectFormat = objectFormatOf(options.objects);
+  if (objectFormat.name !== "sha1") {
+    if (mode === "loud") throw new UnsupportedObjectFormatError("pack bitmaps", objectFormat.name);
+    return { ...base, mode: "off" };
+  }
   if (options.local && hasAlternates) {
     // git warns even for its default (write_bitmaps = -1 is true there)
     warnings.push(NO_CLOSURE_BITMAP_WARNING);
@@ -927,6 +953,8 @@ async function unpackUnreachable(o: {
 export async function prunePacked(
   looseStorage: FileRawStorage,
   packs: PackSet,
+  /** the repository's object format: loose names of the other width are no objects */
+  objectFormat: ObjectFormat,
   alternates: readonly { packs: PackSet }[] = [],
 ): Promise<number> {
   const packed = async (id: ObjectId) => {
@@ -934,6 +962,7 @@ export async function prunePacked(
     for (const alt of alternates) if (await alt.packs.has(id)) return true;
     return false;
   };
+  const OBJECT_ID = objectIdPattern(objectFormat);
   const loose: ObjectId[] = [];
   for await (const id of looseStorage.keys()) {
     // Only object files: native git writes objects/ab/tmp_obj_* while it works.

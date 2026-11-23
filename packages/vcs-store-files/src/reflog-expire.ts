@@ -10,17 +10,17 @@
  */
 
 import type { FilesApi, GitObjects, ObjectId, Refs } from "@statewalker/vcs-core";
-import { joinPath } from "@statewalker/vcs-core";
+import { joinPath, objectFormatOf } from "@statewalker/vcs-core";
 import { approxidateCareful } from "@statewalker/vcs-utils";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
+import { objectIdPattern } from "./object-names.js";
 import {
   configFilesApiOf,
   createWorkingCopyConfig,
 } from "./workspace/working-copy/working-copy-config.files.js";
 
-const OID = /^[0-9a-f]{40}$/;
-const ZERO = "0".repeat(40);
 const DAY = 24 * 3600;
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -99,6 +99,8 @@ export async function gcExpiresReflogs(
  */
 export async function expireReflogs(options: ExpireReflogsOptions): Promise<ExpireReflogsResult> {
   const { files, gitDir = ".git", objects } = options;
+  // ids of the repository's format (git's parse_oid_hex reads the_hash_algo's digits)
+  const format = objectFormatOf(objects);
   const now = options.now ?? Math.floor(Date.now() / 1000);
   const config = await readConfig(files, gitDir, options.environment);
   // reflog_expire_config: the defaults, then each gc.<pattern>.* in the order first seen
@@ -195,7 +197,7 @@ export async function expireReflogs(options: ExpireReflogsOptions): Promise<Expi
       let reach: ((id: ObjectId) => Promise<boolean>) | undefined;
       if (!policy.unreachable || head) kind = "head";
       else {
-        const tip = await resolveTip(options.refs, files, gitDir, reflog);
+        const tip = await resolveTip(options.refs, files, gitDir, reflog, format);
         const commit = tip ? await graph.peelToCommit(tip) : undefined;
         kind = commit ? "normal" : "always";
         if (commit) reach = graph.reachability([commit]);
@@ -211,7 +213,7 @@ export async function expireReflogs(options: ExpireReflogsOptions): Promise<Expi
       // the last line without its newline is corrupt to show_one_reflog_ent
       const unterminated = lines.pop() as string;
       for (const line of lines) {
-        const entry = parseEntry(line);
+        const entry = parseEntry(line, format);
         if (!entry) {
           // show_one_reflog_ent passes over a line it cannot parse: not written back
           pruned++;
@@ -331,7 +333,7 @@ async function shouldExpire(
   if (entry.timestamp < policy.unreachable) {
     if (kind === "always") return true;
     const unreachable = async (id: string) => {
-      if (id === ZERO) return false;
+      if (/^0+$/.test(id)) return false;
       const commit = await graph.peelToCommit(id);
       // not a commit: kept
       if (!commit) return false;
@@ -348,12 +350,15 @@ async function shouldExpire(
  */
 function parseEntry(
   line: string,
+  format: ObjectFormat,
 ): { oldId: string; newId: string; timestamp: number; line: string } | undefined {
-  const oldId = line.slice(0, 40);
-  const newId = line.slice(41, 81);
-  if (!OID.test(oldId) || !OID.test(newId) || line[40] !== " " || line[81] !== " ")
+  const hex = format.hexLength;
+  const OID = objectIdPattern(format);
+  const oldId = line.slice(0, hex);
+  const newId = line.slice(hex + 1, 2 * hex + 1);
+  if (!OID.test(oldId) || !OID.test(newId) || line[hex] !== " " || line[2 * hex + 1] !== " ")
     return undefined;
-  const gt = line.indexOf(">", 82);
+  const gt = line.indexOf(">", 2 * hex + 2);
   if (gt < 0 || line[gt + 1] !== " ") return undefined;
   const m = /^(\d+) ([+-]\d{4})/.exec(line.slice(gt + 2));
   if (!m || Number(m[1]) === 0) return undefined;
@@ -415,12 +420,13 @@ async function resolveTip(
   files: FilesApi,
   gitDir: string,
   reflog: ReflogFile,
+  format: ObjectFormat,
 ): Promise<ObjectId | undefined> {
   if (reflog.name.startsWith("worktrees/")) {
     // a linked worktree's own ref: its file, or a symbolic ref into the repository's refs
     const text = (await readText(files, joinPath(gitDir, reflog.refPath)))?.trim();
     if (!text) return undefined;
-    if (OID.test(text)) return text;
+    if (objectIdPattern(format).test(text)) return text;
     if (text.startsWith("ref: "))
       return (await refs.resolve(text.slice(5)).catch(() => undefined))?.objectId ?? undefined;
     return undefined;
@@ -445,7 +451,11 @@ async function refTips(refs: Pick<Refs, "list">, graph: CommitGraph): Promise<Ob
 class CommitGraph {
   private parents = new Map<ObjectId, ObjectId[] | null>();
   private peeled = new Map<ObjectId, ObjectId | null>();
-  constructor(private objects: GitObjects) {}
+  /** a full id of the repository's format */
+  private readonly oid: RegExp;
+  constructor(private objects: GitObjects) {
+    this.oid = objectIdPattern(objectFormatOf(objects));
+  }
 
   private async read(id: ObjectId): Promise<{ type: string; text: string } | undefined> {
     let o: Awaited<ReturnType<GitObjects["get"]>>;
@@ -485,12 +495,12 @@ class CommitGraph {
       if (!o) break;
       if (o.type === "commit") {
         result = at;
-        this.parents.set(at, parseParents(o.text));
+        this.parents.set(at, parseParents(o.text, this.oid));
         break;
       }
       if (o.type !== "tag") break;
-      const m = /^object ([0-9a-f]{40})$/m.exec(o.text);
-      if (!m) break;
+      const m = /^object ([0-9a-f]+)$/m.exec(o.text);
+      if (!m || !this.oid.test(m[1] as string)) break;
       at = m[1] as string;
     }
     this.peeled.set(id, result);
@@ -500,7 +510,7 @@ class CommitGraph {
   private async parentsOf(id: ObjectId): Promise<ObjectId[] | null> {
     if (this.parents.has(id)) return this.parents.get(id) as ObjectId[] | null;
     const o = await this.read(id);
-    const p = o?.type === "commit" ? parseParents(o.text) : null;
+    const p = o?.type === "commit" ? parseParents(o.text, this.oid) : null;
     this.parents.set(id, p);
     return p;
   }
@@ -535,10 +545,10 @@ function findHeaderEnd(bytes: Uint8Array): number {
   return bytes.length;
 }
 
-function parseParents(header: string): ObjectId[] {
+function parseParents(header: string, OID: RegExp): ObjectId[] {
   const out: ObjectId[] = [];
   for (const line of header.split("\n")) {
-    if (line.startsWith("parent ") && OID.test(line.slice(7, 47))) out.push(line.slice(7, 47));
+    if (line.startsWith("parent ") && OID.test(line.slice(7))) out.push(line.slice(7));
   }
   return out;
 }

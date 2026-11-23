@@ -5,9 +5,10 @@
  * follow git's own tests, named per case: t0001-init.sh (object formats at init), t1006-cat-file.sh
  * (object reads), t1450-fsck.sh (fsck of a SHA-256 repository).
  *
- * What a SHA-256 repository does not support yet (its pack files, the index file, the
- * commit-graph) is refused with `UnsupportedObjectFormatError`: the repositories here hold loose
- * objects only, and ours read them with an in-memory index.
+ * What a SHA-256 repository does not support yet (the multi-pack-index, the commit-graph, the
+ * transports) is refused with `UnsupportedObjectFormatError`: ours read the repositories here
+ * with an in-memory index. Packs and the index file have their own twins
+ * (`sha256-packs-native.test.ts`).
  */
 
 import { spawnSync } from "node:child_process";
@@ -413,10 +414,13 @@ describeGit("SHA-256 repositories against native git", () => {
     // "setup: create a repository with sha256" / "fsck on a clean repository"
     it("finds a native repository clean, and its dangling objects as git", async () => {
       const dir = nativeRepo();
-      // the index of a SHA-256 repository is not read yet: refused with a clear error
+      // the index of a SHA-256 repository is read with 32-byte ids (its format from the config)
       const files = createNodeFilesApi({ rootDir: dir });
       const staging = new FileStagingStore(files, ".git/index");
-      await expect(staging.read()).rejects.toThrow(UnsupportedObjectFormatError);
+      await staging.read();
+      const paths: string[] = [];
+      for await (const e of staging.entries()) paths.push(`${e.objectId} ${e.path}`);
+      expect(paths.join("\n")).toBe(g(dir, "ls-files", "--format=%(objectname) %(path)"));
       g(dir, "hash-object", "-w", "--stdin");
       put(dir, "dangling.txt", "dangling\n");
       g(dir, "hash-object", "-w", "dangling.txt");
@@ -577,11 +581,16 @@ describeGit("SHA-256 repositories against native git", () => {
       expect(native(dir, ["fsck", ...(modern ? ["--no-references"] : [])]).status).toBe(0);
     });
 
-    it("refuses what has no SHA-256 path yet: packs, gc, the index", async () => {
+    it("refuses what has no SHA-256 path yet: the multi-pack-index", async () => {
       const dir = nativeRepo();
       const git = await openOurs(dir);
-      await expect(git.gc().call()).rejects.toThrow(UnsupportedObjectFormatError);
+      await git.gc().call();
+      expect(native(dir, ["fsck", "--strict", ...(modern ? ["--no-references"] : [])]).status).toBe(
+        0,
+      );
       g(dir, "repack", "-q", "-a", "-d");
+      await openOurs(dir);
+      g(dir, "multi-pack-index", "write");
       await expect(openOurs(dir)).rejects.toThrow(UnsupportedObjectFormatError);
     });
 

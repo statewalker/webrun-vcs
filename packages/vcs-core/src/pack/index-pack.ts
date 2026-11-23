@@ -26,8 +26,9 @@ import {
   type StreamInflater,
 } from "@statewalker/vcs-utils/compression";
 import { applyGitDelta, DeltaError } from "@statewalker/vcs-utils/diff";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { CRC32 } from "@statewalker/vcs-utils/hash/crc32";
-import { createSha1, type Hasher } from "@statewalker/vcs-utils/hash/hasher";
+import type { Hasher } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 import { allocBytes } from "@statewalker/vcs-utils/streams";
 import type { FilesApi } from "../common/files/index.js";
@@ -96,6 +97,11 @@ export interface InstallPackOptions {
    * `--cruft` writes it. When the same pack is installed already, its `.mtimes` is replaced.
    */
   mtimes?: (id: ObjectId) => number;
+  /**
+   * The repository's object format (default SHA-1): the hash of the objects and of the pack's
+   * trailer, the width of REF_DELTA bases, of the idx's ids and of its checksums.
+   */
+  objectFormat?: ObjectFormat;
 }
 
 /** See `InstallPackOptions.onContent` (and `UnpackObjectsOptions.onContent`). */
@@ -106,7 +112,7 @@ export type ObjectContentCallback = (
 ) => void;
 
 export interface InstalledPack {
-  /** hex SHA-1 of the installed pack (its trailer); the files are `pack-<packId>.pack` / `.idx` */
+  /** hex hash of the installed pack (its trailer); the files are `pack-<packId>.pack` / `.idx` */
   packId: string;
   /** objects in the installed pack (received and appended) */
   count: number;
@@ -164,8 +170,8 @@ function objectHeaderBytes(type: ObjectTypeString, size: number): Uint8Array {
   return out;
 }
 
-const objectId = (type: ObjectTypeString, data: Uint8Array) =>
-  createSha1().update(objectHeaderBytes(type, data.length)).update(data).digest();
+const objectId = (type: ObjectTypeString, data: Uint8Array, format: ObjectFormat) =>
+  format.createHasher().update(objectHeaderBytes(type, data.length)).update(data).digest();
 
 /**
  * Struct-of-arrays entry table. Entries are in pack order (offsets ascending), appended bases
@@ -181,9 +187,15 @@ class Entries {
   kind: Uint8Array; // 1-4, 6, 7
   type: Uint8Array; // resolved type 1-4, 0 while unresolved
   hdr: Uint8Array; // header length: data starts at offset + hdr
-  oid: Uint8Array; // 20 bytes per entry, once resolved
-  refOid: Uint8Array; // 20 bytes per entry, REF_DELTA base ids
-  constructor(public cap: number) {
+  oid: Uint8Array; // `raw` bytes per entry, once resolved
+  refOid: Uint8Array; // `raw` bytes per entry, REF_DELTA base ids
+  /** bytes of an id: the object format's raw length */
+  readonly raw: number;
+  constructor(
+    public cap: number,
+    readonly format: ObjectFormat = SHA1_OBJECT_FORMAT,
+  ) {
+    this.raw = format.rawLength;
     this.offset = new Float64Array(cap);
     this.size = new Float64Array(cap);
     this.crc = new Uint32Array(cap);
@@ -191,8 +203,8 @@ class Entries {
     this.kind = new Uint8Array(cap);
     this.type = new Uint8Array(cap);
     this.hdr = new Uint8Array(cap);
-    this.oid = new Uint8Array(cap * 20);
-    this.refOid = new Uint8Array(cap * 20);
+    this.oid = new Uint8Array(cap * this.raw);
+    this.refOid = new Uint8Array(cap * this.raw);
   }
   /** Room for `more` entries beyond `n`. */
   reserve(more: number) {
@@ -213,9 +225,17 @@ class Entries {
     this.kind = g(this.kind);
     this.type = g(this.type);
     this.hdr = g(this.hdr);
-    this.oid = g(this.oid, 20);
-    this.refOid = g(this.refOid, 20);
+    this.oid = g(this.oid, this.raw);
+    this.refOid = g(this.refOid, this.raw);
     this.cap = cap;
+  }
+  /** The hex id of entry `i` (resolved) */
+  idOf(i: number): string {
+    return hex(this.oid.subarray(i * this.raw, (i + 1) * this.raw));
+  }
+  /** The hex base id of REF_DELTA entry `i` */
+  refIdOf(i: number): string {
+    return hex(this.refOid.subarray(i * this.raw, (i + 1) * this.raw));
   }
   /** index of the entry at `offset`, or -1 (binary search over the first `n` entries) */
   at(offset: number): number {
@@ -232,11 +252,11 @@ class Entries {
   }
 }
 
-/** compares 20-byte ids a[ai*20..] and b[bi*20..] */
-function cmpOid(a: Uint8Array, ai: number, b: Uint8Array, bi: number): number {
-  const x = ai * 20;
-  const y = bi * 20;
-  for (let k = 0; k < 20; k++) {
+/** compares `raw`-byte ids a[ai*raw..] and b[bi*raw..] */
+function cmpOid(a: Uint8Array, ai: number, b: Uint8Array, bi: number, raw: number): number {
+  const x = ai * raw;
+  const y = bi * raw;
+  for (let k = 0; k < raw; k++) {
     const d = (a[x + k] as number) - (b[y + k] as number);
     if (d) return d;
   }
@@ -259,12 +279,14 @@ class SequentialReader {
   /** the stream position of `chunk[mark]` */
   private markPos = 0;
   private readonly it: AsyncIterator<Uint8Array>;
-  private readonly hasher: Hasher = createSha1();
+  private readonly hasher: Hasher;
   constructor(
     source: AsyncIterable<Uint8Array>,
     private readonly hashedLength: number,
+    format: ObjectFormat,
   ) {
     this.it = source[Symbol.asyncIterator]();
+    this.hasher = format.createHasher();
   }
   /** Feeds the consumed bytes not yet accounted for to the CRC and the hash. */
   private account() {
@@ -427,13 +449,14 @@ async function parse(
   packLen: number,
   maxObjectSize: number,
   stash: DeltaStash,
+  format: ObjectFormat,
   onContent?: ObjectContentCallback,
 ) {
-  if (packLen < 32) throw new PackError("pack too short");
+  if (packLen < 12 + format.rawLength) throw new PackError("pack too short");
   const pool = createInflaterPool();
-  const r = new SequentialReader(files.read(path), packLen - 20);
+  const r = new SequentialReader(files.read(path), packLen - format.rawLength, format);
   try {
-    return await parseWith(r, pool, packLen, maxObjectSize, stash, onContent);
+    return await parseWith(r, pool, packLen, maxObjectSize, stash, format, onContent);
   } finally {
     await r.close();
   }
@@ -445,8 +468,10 @@ async function parseWith(
   packLen: number,
   maxObjectSize: number,
   stash: DeltaStash,
+  format: ObjectFormat,
   onContent?: ObjectContentCallback,
 ) {
+  const raw = format.rawLength;
   const head = await r.bytes(12);
   if (String.fromCharCode(...head.subarray(0, 4)) !== "PACK")
     throw new PackError("not a pack (bad signature)");
@@ -455,14 +480,14 @@ async function parseWith(
   const count = view.getUint32(8);
   if (version !== 2 && version !== 3) throw new PackError(`unsupported pack version ${version}`);
   // before allocating per-entry state: the pack must be able to hold what its header declares
-  if (count > Math.floor((packLen - 32) / MIN_ENTRY)) {
+  if (count > Math.floor((packLen - 12 - raw) / MIN_ENTRY)) {
     throw new PackError(
       `pack declares ${count} entries, more than its ${packLen} bytes can hold (truncated?)`,
     );
   }
   // Tables start small and grow (capped at the declared count) as entries are parsed:
   // a header can claim up to (size - 32) / 9 entries, and only parsed entries earn memory.
-  const t = new Entries(Math.min(count, 4096));
+  const t = new Entries(Math.min(count, 4096), format);
   const scratch = new Scratch();
   for (let i = 0; i < count; i++) {
     if (i === t.cap) {
@@ -474,7 +499,7 @@ async function parseWith(
     }
     r.resetCrc();
     const offset = r.pos;
-    if (offset >= packLen - 20) throw new PackError(`entry ${i} starts inside the trailer`);
+    if (offset >= packLen - raw) throw new PackError(`entry ${i} starts inside the trailer`);
     let b = r.byteNow();
     if (b < 0) b = await r.byte();
     const kind = (b >> 4) & 7;
@@ -516,12 +541,14 @@ async function parseWith(
       }
       t.base[i] = bi;
     } else if (kind === REF_DELTA) {
-      t.refOid.set(await r.bytes(20), i * 20);
+      t.refOid.set(await r.bytes(raw), i * raw);
     }
     t.hdr[i] = r.pos - offset;
     let got = 0;
     const typeName = TYPE_NAMES[kind];
-    const objHash = typeName ? createSha1().update(objectHeaderBytes(typeName, size)) : undefined;
+    const objHash = typeName
+      ? format.createHasher().update(objectHeaderBytes(typeName, size))
+      : undefined;
     // a commit, tree or tag sent whole is kept while it inflates, for `onContent`
     const content =
       onContent && typeName && typeName !== "blob"
@@ -560,23 +587,23 @@ async function parseWith(
       throw new PackError(`entry at ${offset} inflates to ${got} bytes, header says ${size}`);
     t.crc[i] = r.crcValue();
     if (objHash) {
-      t.oid.set(objHash.digest(), i * 20);
+      t.oid.set(objHash.digest(), i * raw);
       t.type[i] = kind;
       if (content && onContent && typeName) {
-        onContent(hex(t.oid.subarray(i * 20, i * 20 + 20)), typeName as ObjectTypeString, content);
+        onContent(t.idOf(i), typeName as ObjectTypeString, content);
       }
     }
   }
   t.n = count;
-  if (r.pos !== packLen - 20) {
+  if (r.pos !== packLen - raw) {
     throw new PackError(
-      r.pos < packLen - 20
-        ? `${packLen - 20 - r.pos} bytes after the last entry (junk after the pack, or a wrong count)`
+      r.pos < packLen - raw
+        ? `${packLen - raw - r.pos} bytes after the last entry (junk after the pack, or a wrong count)`
         : "the last entry runs into the trailer",
     );
   }
   const expected = hex(r.digest());
-  const trailer = hex(await r.bytes(20));
+  const trailer = hex(await r.bytes(raw));
   if (trailer !== expected)
     throw new PackError(`pack checksum mismatch: trailer ${trailer}, content ${expected}`);
   if (!(await r.atEnd())) throw new PackError("bytes after the pack trailer");
@@ -769,7 +796,7 @@ class Resolver {
     const refs = new Int32Array(refCount);
     let k = 0;
     for (let i = 0; i < n; i++) if (t.kind[i] === REF_DELTA) refs[k++] = i;
-    refs.sort((a, b) => cmpOid(t.refOid, a, t.refOid, b) || a - b);
+    refs.sort((a, b) => cmpOid(t.refOid, a, t.refOid, b, t.raw) || a - b);
     this.refs = refs;
   }
   /** Distinct base ids of the REF_DELTAs still unresolved (an upper bound on appended bases). */
@@ -779,7 +806,7 @@ class Resolver {
     let last = -1;
     for (const c of this.refs) {
       if (t.type[c]) continue;
-      if (last < 0 || cmpOid(t.refOid, last, t.refOid, c) !== 0) count++;
+      if (last < 0 || cmpOid(t.refOid, last, t.refOid, c, t.raw) !== 0) count++;
       last = c;
     }
     return count;
@@ -791,11 +818,14 @@ class Resolver {
     let hi = this.refs.length;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (cmpOid(t.refOid, this.refs[mid] as number, t.oid, i) < 0) lo = mid + 1;
+      if (cmpOid(t.refOid, this.refs[mid] as number, t.oid, i, t.raw) < 0) lo = mid + 1;
       else hi = mid;
     }
     let end = lo;
-    while (end < this.refs.length && cmpOid(t.refOid, this.refs[end] as number, t.oid, i) === 0)
+    while (
+      end < this.refs.length &&
+      cmpOid(t.refOid, this.refs[end] as number, t.oid, i, t.raw) === 0
+    )
       end++;
     return [lo, end];
   }
@@ -935,13 +965,9 @@ class Resolver {
       const result = this.patch(base, await this.load(child), t.offset[child] as number);
       t.type[child] = type;
       t.base[child] = this.sI[d] as number;
-      t.oid.set(objectId(TYPE_NAMES[type] as ObjectTypeString, result), child * 20);
+      t.oid.set(objectId(TYPE_NAMES[type] as ObjectTypeString, result, t.format), child * t.raw);
       if (this.opts.onContent && TYPE_NAMES[type] !== "blob") {
-        this.opts.onContent(
-          hex(t.oid.subarray(child * 20, child * 20 + 20)),
-          TYPE_NAMES[type] as ObjectTypeString,
-          result,
-        );
+        this.opts.onContent(t.idOf(child), TYPE_NAMES[type] as ObjectTypeString, result);
       }
       if (!this.hasMore(d)) this.pop(); // release the parent before descending
       if (this.hasChildren(child)) this.push(child, type, result);
@@ -953,7 +979,7 @@ class Resolver {
 function idxOrder(t: Entries): Uint32Array {
   const order = new Uint32Array(t.n);
   for (let i = 0; i < t.n; i++) order[i] = i;
-  order.sort((a, b) => cmpOid(t.oid, a, t.oid, b) || a - b);
+  order.sort((a, b) => cmpOid(t.oid, a, t.oid, b, t.raw) || a - b);
   return order;
 }
 
@@ -964,15 +990,16 @@ function writeIdxFrom(
   order: Uint32Array = idxOrder(t),
 ): Uint8Array {
   const n = t.n;
+  const raw = t.raw;
   let large = 0;
   for (let i = 0; i < n; i++) if ((t.offset[i] as number) > 0x7fffffff) large++;
-  const size = 8 + 256 * 4 + n * 20 + n * 4 + n * 4 + large * 8 + 40;
+  const size = 8 + 256 * 4 + n * raw + n * 4 + n * 4 + large * 8 + 2 * raw;
   const out = new Uint8Array(size);
   const v = new DataView(out.buffer);
   out.set([0xff, 0x74, 0x4f, 0x63], 0);
   v.setUint32(4, 2);
   const fan = new Uint32Array(256);
-  for (let i = 0; i < n; i++) (fan[t.oid[i * 20] as number] as number)++;
+  for (let i = 0; i < n; i++) (fan[t.oid[i * raw] as number] as number)++;
   let acc = 0;
   for (let i = 0; i < 256; i++) {
     acc += fan[i] as number;
@@ -980,8 +1007,8 @@ function writeIdxFrom(
   }
   let p = 8 + 1024;
   for (const i of order) {
-    out.set(t.oid.subarray(i * 20, i * 20 + 20), p);
-    p += 20;
+    out.set(t.oid.subarray(i * raw, i * raw + raw), p);
+    p += raw;
   }
   for (const i of order) {
     v.setUint32(p, t.crc[i] as number);
@@ -1002,24 +1029,30 @@ function writeIdxFrom(
     v.setUint32(p + 4, off >>> 0);
     p += 8;
   }
-  out.set(packChecksum.subarray(0, 20), p);
-  p += 20;
-  out.set(createSha1().update(out.subarray(0, p)).digest(), p);
+  out.set(packChecksum.subarray(0, raw), p);
+  p += raw;
+  out.set(t.format.createHasher().update(out.subarray(0, p)).digest(), p);
   return out;
 }
 
 /**
  * A pack index (`.idx` version 2) laid out byte for byte as `git index-pack` writes it: entries
  * sorted by id (duplicates in the given order), the fan-out table, CRC-32s, 31-bit offsets with
- * 64-bit offsets past 2 GiB, the pack checksum and the index's own SHA-1.
+ * 64-bit offsets past 2 GiB, the pack checksum and the index's own hash, in the repository's
+ * object format `format` (default SHA-1): ids and the checksum of another width are refused.
  */
 export function writePackIdx(
   entries: readonly PackIdxEntry[],
   packChecksum: Uint8Array,
+  format: ObjectFormat = SHA1_OBJECT_FORMAT,
 ): Uint8Array {
-  const t = new Entries(entries.length);
+  if (packChecksum.length !== format.rawLength) {
+    throw new PackError(`pack checksum of ${packChecksum.length} bytes in a ${format.name} pack`);
+  }
+  const t = new Entries(entries.length, format);
   entries.forEach((e, i) => {
-    t.oid.set(hexToBytes(e.id), i * 20);
+    if (e.id.length !== 2 * t.raw) throw new PackError(`not a ${format.name} object id: ${e.id}`);
+    t.oid.set(hexToBytes(e.id), i * t.raw);
     t.offset[i] = e.offset;
     t.crc[i] = e.crc32;
   });
@@ -1165,7 +1198,7 @@ async function completeThin(
   const misses = new Set<string>();
   for (let i = 0; i < received; i++) {
     if (t.kind[i] !== REF_DELTA || t.type[i]) continue;
-    const id = hex(t.refOid.subarray(i * 20, i * 20 + 20));
+    const id = t.refIdOf(i);
     if (misses.has(id)) continue;
     const base = await externalBase(id);
     if (!base) {
@@ -1176,7 +1209,7 @@ async function completeThin(
     if (!code) throw new PackError(`base ${id}: unknown type ${base.type}`);
     if (base.data.length > maxObjectSize)
       throw new PackError(`base ${id} is larger than the limit of ${maxObjectSize}`);
-    const actual = hex(objectId(base.type, base.data));
+    const actual = hex(objectId(base.type, base.data, t.format));
     if (actual !== id) throw new PackError(`base ${id} from the repository hashes to ${actual}`);
     // zlib level 6, as pako's default: valid for git, not byte-identical to git's own zlib
     const parts = [objectHeader(code, base.data.length), compressBlockPako(base.data)];
@@ -1197,7 +1230,7 @@ async function completeThin(
     t.hdr[k] = (parts[0] as Uint8Array).length;
     t.crc[k] = crc.getValue();
     t.base[k] = -1;
-    t.oid.set(t.refOid.subarray(i * 20, i * 20 + 20), k * 20);
+    t.oid.set(t.refOid.subarray(i * t.raw, (i + 1) * t.raw), k * t.raw);
     await resolver.resolveFrom(k, base.data);
   }
   await store.flush();
@@ -1216,9 +1249,10 @@ async function* completedPack(
   count: number,
   appended: string[],
   done: (trailer: Uint8Array) => void,
+  format: ObjectFormat,
 ): AsyncGenerator<Uint8Array> {
-  const h = createSha1();
-  const original = createSha1();
+  const h = format.createHasher();
+  const original = format.createHasher();
   const head = new Uint8Array(12);
   let o = 0;
   for await (const c of files.read(tmpPack, { start: 0, length: 12 })) {
@@ -1261,6 +1295,7 @@ export async function installPack(
   options: InstallPackOptions = {},
 ): Promise<InstalledPack> {
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;
+  const format = options.objectFormat ?? SHA1_OBJECT_FORMAT;
   const baseCacheBytes = options.baseCacheBytes ?? 32 * 2 ** 20;
   const maxPackSize = options.maxPackSize ?? Number.POSITIVE_INFINITY;
   const windowBytes = options.windowBytes ?? 2 ** 16;
@@ -1281,10 +1316,18 @@ export async function installPack(
     if (stats?.kind !== "file" || stats.size === undefined)
       throw new PackError("pack was not stored");
     const packLen = stats.size;
-    const parsed = await parse(files, tmpPack, packLen, maxObjectSize, stash, options.onContent);
+    const parsed = await parse(
+      files,
+      tmpPack,
+      packLen,
+      maxObjectSize,
+      stash,
+      format,
+      options.onContent,
+    );
     const t = parsed.t;
     const received = t.n;
-    const dataEnd = packLen - 20;
+    const dataEnd = packLen - format.rawLength;
     appended = new AppendedStore(files, `${dir}/tmp_thin_${id}_`, dataEnd);
     const store = appended;
     const read: RangeRead = (start, length) =>
@@ -1322,7 +1365,7 @@ export async function installPack(
     if (missing) {
       throw new PackError(
         firstRef >= 0
-          ? `${missing} unresolved deltas (thin pack? first missing base ${hex(t.refOid.subarray(firstRef * 20, firstRef * 20 + 20))})`
+          ? `${missing} unresolved deltas (thin pack? first missing base ${t.refIdOf(firstRef)})`
           : `${missing} deltas could not be resolved`,
       );
     }
@@ -1331,11 +1374,10 @@ export async function installPack(
         for (let i = 0; i < received; i++) {
           const isDelta = t.kind[i] === OFS_DELTA || t.kind[i] === REF_DELTA;
           if (isDelta !== delta) continue;
-          options.onObject(
-            hex(t.oid.subarray(i * 20, i * 20 + 20)),
-            TYPE_NAMES[t.type[i] as number] as ObjectTypeString,
-            { index: i, delta },
-          );
+          options.onObject(t.idOf(i), TYPE_NAMES[t.type[i] as number] as ObjectTypeString, {
+            index: i,
+            delta,
+          });
         }
       }
     }
@@ -1346,9 +1388,18 @@ export async function installPack(
       let fixed: Uint8Array | undefined;
       await files.write(
         tmpFixed,
-        completedPack(files, tmpPack, dataEnd, parsed.packId, t.n, store.paths, (trailer) => {
-          fixed = trailer;
-        }),
+        completedPack(
+          files,
+          tmpPack,
+          dataEnd,
+          parsed.packId,
+          t.n,
+          store.paths,
+          (trailer) => {
+            fixed = trailer;
+          },
+          format,
+        ),
       );
       if (!fixed) throw new PackError("the completed pack was not written");
       packChecksum = fixed;
@@ -1366,8 +1417,9 @@ export async function installPack(
     const mtimesOf = options.mtimes;
     const mtimesBytes = mtimesOf
       ? encodePackMtimes(
-          Array.from(order, (i) => mtimesOf(hex(t.oid.subarray(i * 20, i * 20 + 20)))),
+          Array.from(order, (i) => mtimesOf(t.idOf(i))),
           packChecksum,
+          format,
         )
       : undefined;
     if ((await files.exists(`${name}.pack`)) && (await files.exists(`${name}.idx`))) {
@@ -1386,7 +1438,7 @@ export async function installPack(
       // entries are in pack order here: the idx position of each (git's write_rev_file)
       const rev = new Uint32Array(t.n);
       for (let k = 0; k < t.n; k++) rev[order[k] as number] = k;
-      await files.write(tmpRev, [encodeReverseIndex(rev, packChecksum)]);
+      await files.write(tmpRev, [encodeReverseIndex(rev, packChecksum, format)]);
     }
     if (mtimesBytes) await files.write(tmpMtimes, [mtimesBytes]);
     // The pack goes first, then its reverse index, then its idx (git's pack_copy_priority):

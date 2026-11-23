@@ -24,8 +24,11 @@ import { allocBytes } from "@statewalker/vcs-utils/streams";
 import type { FilesApi } from "../common/files/index.js";
 import type { PackIndex } from "./types.js";
 
-/** Bytes of an entry kept for its header: the longest is a REF_DELTA's (at most 10 + 20). */
-export const PACK_ENTRY_HEAD_MAX = 32;
+/**
+ * Bytes of an entry kept for its header: the longest is a REF_DELTA's (at most 10 + 20 in
+ * SHA-1, 10 + 32 in SHA-256).
+ */
+export const PACK_ENTRY_HEAD_MAX = 44;
 /** The largest object accepted (`openPack`'s default). */
 export const PACK_MAX_OBJECT_SIZE = 2 ** 30;
 /** zlib's largest expansion. */
@@ -54,11 +57,12 @@ export function packEntryOrder(
   idxBytes: Uint8Array,
   v2: boolean,
   count: number,
+  rawLength = 20,
 ): { order: Uint32Array; sorted: Float64Array } {
   const idsAt = v2 ? 8 + 1024 : 1024 + 4;
-  const crcAt = idsAt + count * 20;
+  const crcAt = idsAt + count * rawLength;
   const offAt = v2 ? crcAt + count * 4 : 1024;
-  const offStride = v2 ? 4 : 24;
+  const offStride = v2 ? 4 : rawLength + 4;
   const largeAt = offAt + count * 4;
   const offsets = new Float64Array(count);
   for (let pos = 0; pos < count; pos++) {
@@ -112,12 +116,17 @@ function isSorted(a: Float64Array): boolean {
  * before searching it), the position is inside that bucket, and the offset is a 32-bit one
  * (a 64-bit offset is checked against its table when read).
  */
-export function packIdxLookups(idx: Uint8Array, v2: boolean, n: number): (pos: number) => boolean {
+export function packIdxLookups(
+  idx: Uint8Array,
+  v2: boolean,
+  n: number,
+  rawLength = 20,
+): (pos: number) => boolean {
   const view = new DataView(idx.buffer, idx.byteOffset, idx.byteLength);
   const fanAt = v2 ? 8 : 0;
   const idsAt = v2 ? 8 + 1024 : 1024 + 4;
-  const stride = v2 ? 20 : 24;
-  const offAt = 8 + 1024 + n * 24;
+  const stride = v2 ? rawLength : rawLength + 4;
+  const offAt = 8 + 1024 + n * (rawLength + 4);
   const fan = (b: number) => (b < 0 ? 0 : view.getUint32(fanAt + b * 4));
   const sound = new Uint8Array(256);
   for (let b = 0; b < 256; b++) {
@@ -129,7 +138,7 @@ export function packIdxLookups(idx: Uint8Array, v2: boolean, n: number): (pos: n
       if (idx[at] !== b) ok = false;
       else if (i > from) {
         let c = 0;
-        for (let j = 1; j < 20 && c === 0; j++)
+        for (let j = 1; j < rawLength && c === 0; j++)
           c = (idx[at + j] as number) - (idx[at - stride + j] as number);
         if (c <= 0) ok = false;
       }
@@ -174,6 +183,7 @@ export function parsePackEntryHead(
   k: number,
   end: number,
   idOf: (k: number) => string,
+  rawLength = 20,
 ): ScannedEntryHead | undefined {
   const offset = sorted[k] as number;
   const len = Math.min(h.length, PACK_ENTRY_HEAD_MAX);
@@ -217,9 +227,9 @@ export function parsePackEntryHead(
     base = lo;
     baseId = idOf(lo);
   } else if (kind === 7) {
-    if (p + 20 > len) return undefined;
-    baseId = bytesToHex(h.subarray(p, p + 20));
-    p += 20;
+    if (p + rawLength > len) return undefined;
+    baseId = bytesToHex(h.subarray(p, p + rawLength));
+    p += rawLength;
   } else if (kind < 1 || kind > 4) {
     return undefined;
   }
@@ -237,7 +247,13 @@ const BASE_BYTES = 32 * 2 ** 20;
 const GIVE_UP_AFTER = 256;
 
 /** The idx position of the id at `at` in `raw` (a binary search in its fan-out bucket), or -1. */
-function idxPosition(idx: Uint8Array, n: number, raw: Uint8Array, at: number): number {
+function idxPosition(
+  idx: Uint8Array,
+  n: number,
+  raw: Uint8Array,
+  at: number,
+  rawLength: number,
+): number {
   const first = raw[at] as number;
   let lo = first === 0 ? 0 : u32(idx, 8 + (first - 1) * 4);
   let hi = u32(idx, 8 + first * 4);
@@ -245,9 +261,11 @@ function idxPosition(idx: Uint8Array, n: number, raw: Uint8Array, at: number): n
   const idsAt = 8 + 1024;
   while (lo < hi) {
     const mid = (lo + hi) >>> 1;
-    const o = idsAt + mid * 20;
+    const o = idsAt + mid * rawLength;
     let c = 0;
-    for (let j = 0; j < 20 && c === 0; j++) c = (idx[o + j] as number) - (raw[at + j] as number);
+    for (let j = 0; j < rawLength && c === 0; j++) {
+      c = (idx[o + j] as number) - (raw[at + j] as number);
+    }
     if (c === 0) return mid;
     if (c < 0) lo = mid + 1;
     else hi = mid;
@@ -272,15 +290,16 @@ export async function scanPackObjects(
   const stats = await files.stats(packPath);
   if (stats?.kind !== "file" || stats.size === undefined) return 0;
   const packLength = stats.size;
-  const trailerAt = packLength - 20;
+  const rawLength = idx.rawLength ?? 20;
+  const trailerAt = packLength - rawLength;
   const v2 = idx.version > 1;
   if (!v2) return 0;
   const n = idx.objectCount;
-  const lookups = packIdxLookups(idxBytes, v2, n);
+  const lookups = packIdxLookups(idxBytes, v2, n, rawLength);
   // whether every idx entry is sound (the common case: no check per entry then)
   let sound = true;
   for (let pos = 0; pos < n && sound; pos++) sound = lookups(pos);
-  const { order, sorted } = packEntryOrder(idxBytes, v2, n);
+  const { order, sorted } = packEntryOrder(idxBytes, v2, n, rawLength);
   const entryEnd = (k: number) => (k + 1 < n ? (sorted[k + 1] as number) : trailerAt);
   for (let k = 0; k < n; k++) if (entryEnd(k) <= (sorted[k] as number)) return 0;
 
@@ -304,14 +323,14 @@ export async function scanPackObjects(
   const entry = (k: number, bytes: Uint8Array): void => {
     const pos = order[k] as number;
     if ((!sound && !lookups(pos)) || (sorted[k] as number) < 12) return;
-    const head = parsePackEntryHead(bytes, sorted, k, entryEnd(k), () => "");
+    const head = parsePackEntryHead(bytes, sorted, k, entryEnd(k), () => "", rawLength);
     if (!head) return;
     let type: number;
     if (head.kind <= 4) type = head.kind;
     else {
       if (head.kind === 7) {
         // the base, when it is an earlier entry of this pack
-        const at = idxPosition(idxBytes, n, bytes, head.dataAt - 20);
+        const at = idxPosition(idxBytes, n, bytes, head.dataAt - rawLength, rawLength);
         if (at >= 0 && !rank) {
           rank = new Uint32Array(n);
           for (let i = 0; i < n; i++) rank[order[i] as number] = i;

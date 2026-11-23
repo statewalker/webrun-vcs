@@ -6,7 +6,12 @@
  * `--continue`, `--skip` or `--abort` what we started and the other way round.
  */
 
-import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
+import {
+  type Commit,
+  type ObjectId,
+  objectFormatOf,
+  type PersonIdent,
+} from "@statewalker/vcs-core";
 import { compareGitPaths, parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { Worktree } from "@statewalker/vcs-working-tree";
 import { GitApiError } from "../errors/git-api-error.js";
@@ -255,7 +260,7 @@ export class PickSequencer {
     // with --no-commit the change is merged into the index as it is (git's
     // write_index_as_tree): each commit's change on top of the previous one's
     const headTreeId = this.options.noCommit
-      ? await writeIndexAsTree(deps.staging, deps.trees)
+      ? await writeIndexAsTree(deps.staging, deps.trees, objectFormatOf(deps.workingCopy.history))
       : headCommit.tree;
     // a commit is never made on top of staged changes (error_dirty_index)
     const { index } = await readIndex(deps.staging);

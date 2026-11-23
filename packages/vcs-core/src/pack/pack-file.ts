@@ -43,9 +43,8 @@ import {
   TruncatedStreamError,
 } from "@statewalker/vcs-utils/compression";
 import { applyGitDelta, DeltaError } from "@statewalker/vcs-utils/diff";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { CRC32, crc32 as crc32Of } from "@statewalker/vcs-utils/hash/crc32";
-import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
-import { sha1 } from "@statewalker/vcs-utils/hash/sha1";
 import { bytesToHex } from "@statewalker/vcs-utils/hash/utils";
 import { allocBytes } from "@statewalker/vcs-utils/streams";
 import type { FilesApi } from "../common/files/index.js";
@@ -89,7 +88,7 @@ export interface PackedEntry {
 
 /** One installed pack (`pack-<packId>.pack` and its `.idx`). */
 export interface Pack {
-  /** hex SHA-1 of the pack (its trailer, recorded in the idx) */
+  /** hex hash of the pack (its trailer, recorded in the idx): SHA-1, or SHA-256's 64 digits */
   readonly packId: string;
   /** objects in the pack */
   readonly count: number;
@@ -156,6 +155,11 @@ export interface OpenPackOptions {
    * true). Without it the pack order is always computed from the idx's offsets.
    */
   readReverseIndex?: boolean;
+  /**
+   * The repository's object format (default SHA-1): the width of the idx's ids and checksums,
+   * of REF_DELTA bases and of the pack's trailer (git sizes them all by `rawsz`).
+   */
+  objectFormat?: ObjectFormat;
 }
 
 /** Counters, for tests and diagnostics. */
@@ -717,13 +721,16 @@ const HEX_VALUE = new Int8Array(128).fill(-1);
 for (let c = 0; c < 10; c++) HEX_VALUE[48 + c] = c;
 for (let c = 0; c < 6; c++) HEX_VALUE[97 + c] = 10 + c;
 /** The id being looked up, as bytes (lookups are synchronous: one buffer serves all). */
-const idKey = new Uint8Array(20);
+const idKey = new Uint8Array(32);
 
-/** Writes the 40-digit lowercase hex `id` into `out` as 20 bytes; false if it is not an id. */
-function parseId(id: unknown, out: Uint8Array): boolean {
-  if (typeof id !== "string" || id.length !== 40) return false;
+/**
+ * Writes the `2 * raw`-digit lowercase hex `id` into `out` as `raw` bytes (20 SHA-1, 32
+ * SHA-256); false if it is not an id of that length.
+ */
+function parseId(id: unknown, out: Uint8Array, raw: number): boolean {
+  if (typeof id !== "string" || id.length !== 2 * raw) return false;
   let bad = 0;
-  for (let k = 0; k < 20; k++) {
+  for (let k = 0; k < raw; k++) {
     const hi = id.charCodeAt(2 * k);
     const lo = id.charCodeAt(2 * k + 1);
     // a code above 255 is no hex digit: it lands on a pair that is not one either
@@ -740,11 +747,12 @@ function parseId(id: unknown, out: Uint8Array): boolean {
  * object, in whole 8-byte entries). The rest is checked when used, so a corrupt idx fails with `PackError`,
  * never with wrong data or a read outside it: a fan-out bucket's ids are checked (sorted,
  * inside the bucket) the first time a lookup searches it, a 64-bit offset index when it is
- * read. `verify` checks everything at once (git's verify_pack_index), the idx's own SHA-1
- * included.
+ * read. `verify` checks everything at once (git's verify_pack_index), the idx's own hash
+ * included. Ids and the two trailing checksums are `format.rawLength` bytes.
  */
-function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
-  if (idx.length < 1024 + 40) throw new PackError(`${idxPath}: idx too short`);
+function parseIdx(idx: Uint8Array, idxPath: string, format: ObjectFormat): IdxTable {
+  const raw = format.rawLength;
+  if (idx.length < 1024 + 2 * raw) throw new PackError(`${idxPath}: idx too short`);
   const iv = new DataView(idx.buffer, idx.byteOffset, idx.byteLength);
   const v2 = iv.getUint32(0) === IDX_MAGIC;
   if (v2 && iv.getUint32(4) !== 2)
@@ -760,24 +768,24 @@ function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
   const n = prev;
   // layout: v2 ids | crcs | offsets | large offsets; v1 (offset, id) records
   const idsAt = v2 ? 8 + 1024 : 1024 + 4;
-  const idStride = v2 ? 20 : 24;
-  const crcAt = 8 + 1024 + n * 20;
+  const idStride = v2 ? raw : raw + 4;
+  const crcAt = 8 + 1024 + n * raw;
   const offAt = v2 ? crcAt + n * 4 : 1024;
-  const offStride = v2 ? 4 : 24;
+  const offStride = v2 ? 4 : raw + 4;
   const largeAt = v2 ? offAt + n * 4 : 0;
   /** 64-bit offsets the idx holds, by its length */
   let large = 0;
   if (v2) {
-    if (idx.length < largeAt + 40) throw new PackError(`${idxPath}: idx truncated`);
-    const extra = idx.length - largeAt - 40;
+    if (idx.length < largeAt + 2 * raw) throw new PackError(`${idxPath}: idx truncated`);
+    const extra = idx.length - largeAt - 2 * raw;
     // git allows n - 1 (the first entry, at offset 12, is never one); one per entry here
     if (extra % 8 !== 0 || extra > n * 8)
       throw new PackError(`${idxPath}: idx length does not match its tables`);
     large = extra / 8;
-  } else if (idx.length !== 1024 + n * 24 + 40) {
+  } else if (idx.length !== 1024 + n * (raw + 4) + 2 * raw) {
     throw new PackError(`${idxPath}: idx length does not match its object count`);
   }
-  const packId = hex(idx.subarray(idx.length - 40, idx.length - 20));
+  const packId = hex(idx.subarray(idx.length - 2 * raw, idx.length - raw));
 
   /**
    * A second fan-out level, by the ids' second byte, built for each bucket as it is checked:
@@ -798,7 +806,7 @@ function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
       if (idx[at] !== b) throw new PackError(`${idxPath}: id ${i} is outside its fan-out bucket`);
       if (i > from) {
         let c = 0;
-        for (let k = 1; k < 20 && c === 0; k++)
+        for (let k = 1; k < raw && c === 0; k++)
           c = (idx[at + k] as number) - (idx[at - idStride + k] as number);
         if (c <= 0) throw new PackError(`${idxPath}: ids not strictly sorted at ${i}`);
       }
@@ -821,7 +829,7 @@ function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
     version: v2 ? 2 : 1,
     count: n,
     packId,
-    idAt: (i) => idx.subarray(idsAt + i * idStride, idsAt + i * idStride + 20),
+    idAt: (i) => idx.subarray(idsAt + i * idStride, idsAt + i * idStride + raw),
     offsetOf(i) {
       const v = iv.getUint32(offAt + i * offStride);
       if (!v2 || !(v & 0x80000000)) return v;
@@ -835,7 +843,7 @@ function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
       // a pack set asks `has` and then `get` for the same id: the second lookup is free
       if (id === lastId) return lastFound;
       const key = idKey;
-      if (!parseId(id, key)) return -1;
+      if (!parseId(id, key, raw)) return -1;
       const b = key[0] as number;
       if (checked[b] === 0) {
         checkBucket(b, b ? fan(b - 1) : 0, fan(b));
@@ -862,7 +870,9 @@ function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
         const mid = (lo + hi) >>> 1;
         const at = idsAt + mid * idStride;
         let c = 0;
-        for (let k = from; k < 20 && c === 0; k++) c = (idx[at + k] as number) - (key[k] as number);
+        for (let k = from; k < raw && c === 0; k++) {
+          c = (idx[at + k] as number) - (key[k] as number);
+        }
         if (c === 0) {
           found = mid;
           break;
@@ -875,9 +885,9 @@ function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
       return found;
     },
     withPrefix(prefix) {
-      if (!/^[0-9a-f]{0,40}$/.test(prefix)) return [];
+      if (!/^[0-9a-f]*$/.test(prefix) || prefix.length > 2 * raw) return [];
       // the prefix as bytes, an odd last digit as the high nibble of its byte
-      const key = new Uint8Array(20);
+      const key = new Uint8Array(raw);
       for (let i = 0; i < prefix.length; i++) {
         const v = HEX_VALUE[prefix.charCodeAt(i)] as number;
         key[i >> 1] |= i & 1 ? v : v << 4;
@@ -924,9 +934,9 @@ function parseIdx(idx: Uint8Array, idxPath: string): IdxTable {
       return out;
     },
     async verify() {
-      // git's verify_pack_index: the idx's own SHA-1, then every entry
-      const sum = await sha1(idx.subarray(0, idx.length - 20));
-      if (hex(sum) !== hex(idx.subarray(idx.length - 20)))
+      // git's verify_pack_index: the idx's own hash, then every entry
+      const sum = await format.digest(idx.subarray(0, idx.length - raw));
+      if (hex(sum) !== hex(idx.subarray(idx.length - raw)))
         throw new PackError(`${idxPath}: idx checksum mismatch`);
       if (v2) {
         let held = 0;
@@ -975,10 +985,15 @@ export async function openPack(
     new DeltaBaseCache(options.baseCacheBytes ?? DEFAULT_DELTA_BASE_CACHE_LIMIT);
   const cacheLimit = cache.limit;
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;
+  const format = options.objectFormat ?? SHA1_OBJECT_FORMAT;
+  /** bytes of an id and of the trailer */
+  const raw = format.rawLength;
+  /** the longest entry header: a size of 10 bytes, then a REF_DELTA's base id */
+  const headMax = 12 + raw;
 
   const idx = options.idxBytes ?? (await readAll(files, idxPath));
   // git's check_packed_git_idx; the rest of the idx is checked as lookups use it
-  const t = parseIdx(idx, idxPath);
+  const t = parseIdx(idx, idxPath, format);
   if (options.verifyIndex) await t.verify();
   const n = t.count;
   const packId = t.packId;
@@ -986,7 +1001,7 @@ export async function openPack(
   if (stats?.kind !== "file" || stats.size === undefined || stats.size < 32)
     throw new PackError(`${packPath}: missing or too short`);
   const packLen = stats.size;
-  const trailer = hex(await readAll(files, packPath, packLen - 20, 20));
+  const trailer = hex(await readAll(files, packPath, packLen - raw, raw));
   if (trailer !== packId)
     throw new PackError(`${packPath}: trailer ${trailer} does not match the idx (${packId})`);
   const head = await readAll(files, packPath, 0, 12);
@@ -1034,7 +1049,9 @@ export async function openPack(
       const st = await files.stats(revPath);
       if (st?.kind !== "file") return "absent";
       try {
-        const order = parseReverseIndex(await readAll(files, revPath), n, revPath);
+        const order = parseReverseIndex(await readAll(files, revPath), n, revPath, {
+          objectFormat: format,
+        });
         // git trusts the positions; a wrong one would misplace every bitmap bit and entry
         // extent, so they must follow the offsets (which also makes them a permutation)
         let prev = -1;
@@ -1082,7 +1099,7 @@ export async function openPack(
   };
   const endOf = (offset: number): number => {
     const k = searchRev(offset, true);
-    return k < n ? ((sorted as Float64Array)[k] as number) : packLen - 20;
+    return k < n ? ((sorted as Float64Array)[k] as number) : packLen - raw;
   };
   /** The idx position of the entry at `offset`, -1 if none starts there. */
   const indexAt = (offset: number): number => {
@@ -1220,9 +1237,9 @@ export async function openPack(
       if (back === 0 || e.baseOffset < 12)
         throw new PackError(`${packPath}: OFS_DELTA at ${offset} points outside the pack`);
     } else if (kind === REF_DELTA) {
-      if (p + 20 > h.length) throw new PackError(`${packPath}: REF_DELTA at ${offset} truncated`);
-      e.baseId = hex(h.subarray(p, p + 20));
-      p += 20;
+      if (p + raw > h.length) throw new PackError(`${packPath}: REF_DELTA at ${offset} truncated`);
+      e.baseId = hex(h.subarray(p, p + raw));
+      p += raw;
     } else if (!TYPES[kind]) {
       throw new PackError(`${packPath}: bad object type ${kind} at ${offset}`);
     }
@@ -1244,14 +1261,14 @@ export async function openPack(
 
   const readHead = async (offset: number): Promise<EntryHead> => {
     const end = entryEnd(offset);
-    const n = Math.min(32, end - offset);
+    const n = Math.min(headMax, end - offset);
     return parseHead(offset, end, peekRange(offset, n) ?? (await readRangeAll(offset, n)));
   };
 
   /** `readHead` when the header's bytes are in a loaded window, else undefined. */
   const headNow = (offset: number): EntryHead | undefined => {
     const end = entryEnd(offset);
-    const bytes = peekRange(offset, Math.min(32, end - offset));
+    const bytes = peekRange(offset, Math.min(headMax, end - offset));
     return bytes ? parseHead(offset, end, bytes) : undefined;
   };
 
@@ -1324,7 +1341,7 @@ export async function openPack(
    * (`loadExact`). The window is read when not loaded.
    */
   const loadEntry = (offset: number): LoadedEntry | Promise<LoadedEntry> => {
-    if (offset < 12 || offset >= packLen - 20)
+    if (offset < 12 || offset >= packLen - raw)
       throw new PackError(`${packPath}: bad entry offset ${offset}`);
     const w = Math.floor(offset / WINDOW);
     const bytes = peekWindow(w);
@@ -1677,7 +1694,7 @@ export async function openPack(
     size: number,
     src: AsyncIterable<Uint8Array>,
   ): AsyncGenerator<Uint8Array> {
-    const h = createSha1().update(enc.encode(`${type} ${size}\0`));
+    const h = format.createHasher().update(enc.encode(`${type} ${size}\0`));
     for await (const c of src) {
       h.update(c);
       yield c;
@@ -1909,7 +1926,7 @@ export async function openPack(
     loadReverseIndex,
     async verifyReverseIndex() {
       if (options.readReverseIndex === false) return undefined;
-      return verifyReverseIndexFile(files, packPath, n, (i) => t.offsetOf(i));
+      return verifyReverseIndexFile(files, packPath, n, (i) => t.offsetOf(i), format);
     },
     idAt: (i) => hex(t.idAt(i)),
     offsetAt: (i) => t.offsetOf(i),

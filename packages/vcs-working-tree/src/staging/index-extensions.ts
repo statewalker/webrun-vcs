@@ -99,12 +99,14 @@ export function indexEntriesDigest(entries: readonly StagingEntry[]): string {
  * @param extensions The extensions as read (`ParsedIndex.extensionData`)
  * @param _entries The entries about to be written (unused; kept for the signature)
  * @param entriesChanged Whether `entries` differ from the entries read (see `indexEntriesDigest`)
+ * @param rawLength The raw length of the repository's ids (20 SHA-1, 32 SHA-256)
  * @throws UnsupportedIndexExtensionError when a required extension was read
  */
 export function carryIndexExtensions(
   extensions: readonly IndexExtension[],
   _entries: readonly StagingEntry[],
   entriesChanged: boolean,
+  rawLength = 20,
 ): IndexExtension[] {
   assertWritableIndexExtensions(extensions);
   const out: IndexExtension[] = [];
@@ -115,7 +117,7 @@ export function carryIndexExtensions(
       // kept; the index file invalidates what the entry changes touch
       out.push(ext);
     } else if (ext.signature === "REUC") {
-      if (isValidResolveUndo(ext.data)) out.push(ext);
+      if (isValidResolveUndo(ext.data, rawLength)) out.push(ext);
     }
     // EOIE, IEOT and unknown optional extensions are dropped
   }
@@ -123,9 +125,9 @@ export function carryIndexExtensions(
 }
 
 /** Whether a `REUC` payload parses; a corrupt one is dropped rather than failing the write. */
-function isValidResolveUndo(data: Uint8Array): boolean {
+function isValidResolveUndo(data: Uint8Array, rawLength: number): boolean {
   try {
-    parseResolveUndo(data);
+    parseResolveUndo(data, rawLength);
     return true;
   } catch {
     return false;
@@ -141,9 +143,10 @@ export interface ResolveUndoRecord {
 
 /**
  * Parse the payload of a `REUC` extension: per path, the path and three octal
- * modes as NUL-terminated ASCII, then a 20-byte id for each nonzero mode.
+ * modes as NUL-terminated ASCII, then an id for each nonzero mode (`rawLength` bytes: 20 in
+ * SHA-1, 32 in a SHA-256 repository).
  */
-export function parseResolveUndo(data: Uint8Array): ResolveUndoRecord[] {
+export function parseResolveUndo(data: Uint8Array, rawLength = 20): ResolveUndoRecord[] {
   const records: ResolveUndoRecord[] = [];
   let at = 0;
   const field = (): string => {
@@ -162,9 +165,9 @@ export function parseResolveUndo(data: Uint8Array): ResolveUndoRecord[] {
     }) as [number, number, number];
     const objectIds = modes.map((m) => {
       if (m === 0) return undefined;
-      if (at + 20 > data.length) throw new Error("REUC extension: truncated object id");
-      const id = bytesToHex(data.subarray(at, at + 20));
-      at += 20;
+      if (at + rawLength > data.length) throw new Error("REUC extension: truncated object id");
+      const id = bytesToHex(data.subarray(at, at + rawLength));
+      at += rawLength;
       return id;
     }) as ResolveUndoRecord["objectIds"];
     records.push({ path, modes, objectIds });
@@ -172,8 +175,14 @@ export function parseResolveUndo(data: Uint8Array): ResolveUndoRecord[] {
   return records;
 }
 
-/** Encode resolve-undo records as a `REUC` payload. */
-export function encodeResolveUndo(records: readonly ResolveUndoRecord[]): Uint8Array {
+/**
+ * Encode resolve-undo records as a `REUC` payload, ids `rawLength` bytes long (20, or 32 in a
+ * SHA-256 repository): an id of another width is refused.
+ */
+export function encodeResolveUndo(
+  records: readonly ResolveUndoRecord[],
+  rawLength = 20,
+): Uint8Array {
   const parts: Uint8Array[] = [];
   for (const r of records) {
     parts.push(encodeGitPath(`${r.path}\0${r.modes.map((m) => m.toString(8)).join("\0")}\0`));
@@ -181,7 +190,7 @@ export function encodeResolveUndo(records: readonly ResolveUndoRecord[]): Uint8A
       const id = r.objectIds[i];
       if (m === 0) return;
       if (!id) throw new Error(`REUC record for ${r.path}: missing object id for stage ${i + 1}`);
-      parts.push(objectIdToBytes(id));
+      parts.push(objectIdToBytes(id, rawLength));
     });
   }
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));

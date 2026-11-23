@@ -14,6 +14,7 @@
  *    and counts as absent for `has` and `freshen` (JGit's hasObject), so a repairing write lands;
  *  - one byte-bounded delta base cache serves every pack of the set.
  */
+import { isHexObjectId, type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { FilesApi } from "../common/files/index.js";
 import type { ObjectId } from "../common/id/index.js";
 import { CorruptObjectError, type GitObject } from "../history/objects/git-objects.js";
@@ -94,6 +95,13 @@ export interface OpenPackSetOptions {
    * `pack.readReverseIndex`, default true); else it is computed from the idx's offsets.
    */
   readReverseIndex?: boolean;
+  /**
+   * The repository's object format (default SHA-1): the width of the packs' ids, checksums
+   * and file names. In a SHA-256 repository the multi-pack-index and the bitmaps (whose
+   * readers hold 20-byte ids) are not used: lookups go through each pack's `.idx`, walks
+   * without bitmaps.
+   */
+  objectFormat?: ObjectFormat;
 }
 
 /** The packs of one directory, read as one object store. */
@@ -193,15 +201,12 @@ export interface PackSet {
   readonly midxErrors?: readonly string[];
 }
 
-const OID = /^[0-9a-f]{40}$/;
 /**
  * Packs from which on a lookup asks the midx first: measured on 1860 objects, one pack reads
  * 25% slower through a midx, thirty packs two to three times faster.
  */
 const MIDX_LOOKUP_MIN_PACKS = 3;
-const PACK_IDX = /^pack-[0-9a-f]{40}\.idx$/;
 const EXTENSIONS = [".idx", ".pack", ".keep", ".rev", ".bitmap", ".promisor", ".mtimes"];
-const isId = (id: unknown): id is ObjectId => typeof id === "string" && OID.test(id);
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /**
@@ -221,6 +226,11 @@ export async function openPackSet(
 ): Promise<PackSet> {
   const dir = packDir.replace(/\/+$/, "");
   const maxObjectSize = options.maxObjectSize ?? 2 ** 30;
+  const objectFormat = options.objectFormat ?? SHA1_OBJECT_FORMAT;
+  const sha1 = objectFormat.name === "sha1";
+  const hexLength = objectFormat.hexLength;
+  const PACK_IDX = new RegExp(`^pack-[0-9a-f]{${hexLength}}\\.idx$`);
+  const isId = (id: unknown): id is ObjectId => isHexObjectId(id, objectFormat);
   const rescanInterval = options.rescanIntervalMs ?? 1000;
   /** how long freshen trusts a pack it saw: capped, as a write it skips is never retried */
   const freshenTrust = Math.min(rescanInterval, 1000);
@@ -292,7 +302,8 @@ export async function openPackSet(
   const holds = (p: PackFile, id: ObjectId) => p.has(id) && !isBad(p, id);
   const nameOf = (p: PackFile) => `pack-${p.packId}`;
   /** the midx in use and its loaded packs by pack-int-id (undefined: missing) */
-  const useMidx = options.multiPackIndex ?? true;
+  // a SHA-256 repository's midx is not read yet (its reader holds 20-byte ids)
+  const useMidx = (options.multiPackIndex ?? true) && sha1;
   let midx: MultiPackIndex | undefined;
   let midxPacks: (PackFile | undefined)[] = [];
   let midxSig = "";
@@ -435,6 +446,7 @@ export async function openPackSet(
         maxObjectSize,
         externalBase,
         ...(options.readReverseIndex === false ? { readReverseIndex: false } : {}),
+        ...(sha1 ? {} : { objectFormat }),
       }).finally(() => opening.delete(name));
       opening.set(name, pending);
     }
@@ -780,6 +792,8 @@ export async function openPackSet(
     return midxBitmap.index;
   };
   const bitmap = async (): Promise<PackBitmapIndex | undefined> => {
+    // a SHA-256 repository's bitmaps are not read yet (their reader holds 20-byte ids)
+    if (!sha1) return undefined;
     await rescanOnMiss();
     const errors: string[] = [];
     try {
@@ -950,6 +964,7 @@ export async function openPackSet(
       const r = await installPack(files, dir, source, {
         maxObjectSize,
         writeReverseIndex: options.writeReverseIndex ?? true,
+        ...(sha1 ? {} : { objectFormat }),
         ...o,
       });
       const name = `pack-${r.packId}`;

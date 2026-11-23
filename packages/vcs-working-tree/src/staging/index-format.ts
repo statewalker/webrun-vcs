@@ -1,5 +1,4 @@
 import { objectIdToBytes } from "@statewalker/vcs-core";
-import { createSha1, sha1 } from "@statewalker/vcs-utils";
 import {
   compareGitPaths,
   decodeGitPath,
@@ -7,6 +6,11 @@ import {
   foldAsciiCase,
   hasEscapedBytes,
 } from "@statewalker/vcs-utils/encoding";
+import {
+  type ObjectFormat,
+  SHA1_OBJECT_FORMAT,
+  SHA256_OBJECT_FORMAT,
+} from "@statewalker/vcs-utils/hash";
 import type { MergeStageValue, StagingEntry } from "./types.js";
 
 /**
@@ -16,7 +20,11 @@ import type { MergeStageValue, StagingEntry } from "./types.js";
  * - Header: 12 bytes (signature + version + entry count)
  * - Entries: variable (62 bytes header + path + padding each)
  * - Extensions: optional (TREE, etc.)
- * - Checksum: 20 bytes SHA-1
+ * - Checksum: the repository's hash (20 bytes SHA-1, 32 bytes SHA-256)
+ *
+ * Each entry's object id and the trailer take the object format's raw length, so the
+ * fixed part of an entry is 62 bytes in SHA-1 and 74 in SHA-256 (git's `ondisk_cache_entry`
+ * sized by `the_hash_algo->rawsz`).
  */
 
 /** Index file signature "DIRC" */
@@ -34,16 +42,7 @@ export const INDEX_VERSION_4 = 4;
 /** Header size in bytes */
 const HEADER_SIZE = 12;
 
-/** Checksum size (SHA-1) */
-const CHECKSUM_SIZE = 20;
-
-/** Entry info length without extended flags */
-const INFO_LEN = 62;
-
-/** Entry info length with extended flags */
-const INFO_LEN_EXTENDED = 64;
-
-/** Bit positions in entry header */
+/** Bit positions in entry header (those after the object id are in {@link IndexLayout}) */
 const P_CTIME = 0;
 const P_MTIME = 8;
 const P_DEV = 16;
@@ -53,14 +52,53 @@ const P_UID = 28;
 const P_GID = 32;
 const P_SIZE = 36;
 const P_OBJECTID = 40;
-const P_FLAGS = 60;
-const P_FLAGS2 = 62;
 
 /**
- * The fewest bytes an entry takes: its fixed part, then a version 2/3 name's NUL and padding
- * (64), or a version 4 name's varint and NUL (64)
+ * Where an entry's fields after its object id are, and how long the trailer is, in one object
+ * format (git sizes `ondisk_cache_entry` by `rawsz`).
  */
-const MIN_ENTRY_SIZE = 64;
+interface IndexLayout {
+  format: ObjectFormat;
+  /** Bytes of a raw id */
+  rawLength: number;
+  /** The flags word (after the object id) */
+  pFlags: number;
+  /** The extended flags word */
+  pFlags2: number;
+  /** Entry info length without extended flags */
+  infoLen: number;
+  /** Entry info length with extended flags */
+  infoLenExtended: number;
+  /** The trailing checksum's size */
+  checksumSize: number;
+  /**
+   * The fewest bytes an entry takes: its fixed part, then a version 4 name's varint and NUL
+   * (a version 2/3 name's NUL and padding take more)
+   */
+  minEntrySize: number;
+}
+
+function makeLayout(format: ObjectFormat): IndexLayout {
+  const raw = format.rawLength;
+  return {
+    format,
+    rawLength: raw,
+    pFlags: P_OBJECTID + raw,
+    pFlags2: P_OBJECTID + raw + 2,
+    infoLen: P_OBJECTID + raw + 2,
+    infoLenExtended: P_OBJECTID + raw + 4,
+    checksumSize: raw,
+    minEntrySize: P_OBJECTID + raw + 4,
+  };
+}
+
+const SHA1_LAYOUT = makeLayout(SHA1_OBJECT_FORMAT);
+const SHA256_LAYOUT = makeLayout(SHA256_OBJECT_FORMAT);
+
+/** The layout of an index in `format` (SHA-1 when undefined). */
+function layoutOf(format: ObjectFormat | undefined): IndexLayout {
+  return format?.name === "sha256" ? SHA256_LAYOUT : SHA1_LAYOUT;
+}
 
 /** Maximum path length stored in flags (12 bits) */
 const NAME_MASK = 0xfff;
@@ -123,6 +161,8 @@ export interface IndexEncoding {
   buffer: Uint8Array;
   offsets: Int32Array;
   version: IndexVersion;
+  /** The raw id length of the entries' bytes (20 when absent): copied only into the same */
+  rawLength?: number;
 }
 
 /** Options of {@link parseIndexFile}. */
@@ -135,11 +175,16 @@ export interface ParseIndexOptions {
    */
   keepEncoding?: boolean;
   /**
-   * Check the trailing SHA-1 against the content (default true). git checks it only in
+   * Check the trailing hash against the content (default true). git checks it only in
    * `fsck` (read-cache.c `verify_hdr` with `verify_index_checksum`, set by fsck alone), and
    * never for a null trailer (`index.skipHash`); index reads elsewhere pass false.
    */
   verifyChecksum?: boolean;
+  /**
+   * The repository's object format: the width of entry ids, of the ids in extensions and of
+   * the trailer (default SHA-1)
+   */
+  objectFormat?: ObjectFormat;
 }
 
 /**
@@ -197,6 +242,8 @@ export async function parseIndexFile(
   data: Uint8Array,
   options: ParseIndexOptions = {},
 ): Promise<ParsedIndex> {
+  const layout = layoutOf(options.objectFormat);
+  const CHECKSUM_SIZE = layout.checksumSize;
   if (data.length < HEADER_SIZE + CHECKSUM_SIZE) {
     throw new Error("Index file too small");
   }
@@ -224,7 +271,7 @@ export async function parseIndexFile(
   offset += 4;
   // every entry takes at least MIN_ENTRY_SIZE bytes: a count the file cannot hold is corrupt
   // (checked before anything is allocated for the entries)
-  if (entryCount > (data.length - HEADER_SIZE - CHECKSUM_SIZE) / MIN_ENTRY_SIZE) {
+  if (entryCount > (data.length - HEADER_SIZE - CHECKSUM_SIZE) / layout.minEntrySize) {
     throw corruptIndex(`Index file corrupt: ${entryCount} entries in ${data.length} bytes`);
   }
 
@@ -232,7 +279,9 @@ export async function parseIndexFile(
   if (options.verifyChecksum !== false) {
     const storedChecksum = data.subarray(data.length - CHECKSUM_SIZE);
     if (storedChecksum.some((b) => b !== 0)) {
-      const computedChecksum = await sha1(data.subarray(0, data.length - CHECKSUM_SIZE));
+      const computedChecksum = await layout.format.digest(
+        data.subarray(0, data.length - CHECKSUM_SIZE),
+      );
       if (!arraysEqual(storedChecksum, computedChecksum)) {
         throw corruptIndex("Index file checksum mismatch", "bad index file sha1 signature");
       }
@@ -253,7 +302,7 @@ export async function parseIndexFile(
       ? new Int32Array(entryCount + 1)
       : undefined;
   for (let i = 0; i < entryCount; i++) {
-    const entry = parseEntry(data, view, offset, version, previousPath);
+    const entry = parseEntry(data, view, offset, version, previousPath, layout);
     entries[i] = entry;
     if (!parsedPathChecked) {
       unchecked ??= [];
@@ -295,23 +344,35 @@ export async function parseIndexFile(
     extensions,
     extensionData,
     // (the entries' list as parsed: the caller may edit the one it is given)
-    ...(offsets ? { encoding: { entries: entries.slice(), buffer: data, offsets, version } } : {}),
+    ...(offsets
+      ? {
+          encoding: {
+            entries: entries.slice(),
+            buffer: data,
+            offsets,
+            version,
+            rawLength: layout.rawLength,
+          },
+        }
+      : {}),
   };
 }
 
 /** The char codes of "0" to "f". */
 const HEX_CHARS = Array.from("0123456789abcdef", (c) => c.charCodeAt(0));
-/** The 40 char codes of the id {@link hexIdAt} is converting (it never awaits). */
-const ID_CHARS: number[] = new Array(40).fill(0);
+/** The char codes of the id {@link hexIdAt} is converting, by raw length (it never awaits). */
+const ID_CHARS_20: number[] = new Array(40).fill(0);
+const ID_CHARS_32: number[] = new Array(64).fill(0);
 
-/** The hex object id of the 20 bytes at `data[at]` (no view per id). */
-function hexIdAt(data: Uint8Array, at: number): string {
-  for (let i = 0; i < 20; i++) {
+/** The hex object id of the `rawLength` bytes at `data[at]` (no view per id). */
+function hexIdAt(data: Uint8Array, at: number, rawLength = 20): string {
+  const chars = rawLength === 32 ? ID_CHARS_32 : ID_CHARS_20;
+  for (let i = 0; i < rawLength; i++) {
     const b = data[at + i] as number;
-    ID_CHARS[2 * i] = HEX_CHARS[b >> 4] as number;
-    ID_CHARS[2 * i + 1] = HEX_CHARS[b & 15] as number;
+    chars[2 * i] = HEX_CHARS[b >> 4] as number;
+    chars[2 * i + 1] = HEX_CHARS[b & 15] as number;
   }
-  return String.fromCharCode.apply(null, ID_CHARS);
+  return String.fromCharCode.apply(null, chars);
 }
 
 /** Arrays of each length up to {@link SHORT_PATH}, reused to build ASCII paths. */
@@ -384,11 +445,12 @@ function parseEntry(
   offset: number,
   version: IndexVersion,
   previousPath: string,
+  layout: IndexLayout,
 ): StagingEntry {
   const startOffset = offset;
   // the entry's fixed part (and its name, checked below) must end before the trailer
-  const end = data.length - CHECKSUM_SIZE;
-  if (offset + INFO_LEN > end) {
+  const end = data.length - layout.checksumSize;
+  if (offset + layout.infoLen > end) {
     throw corruptIndex(`Index file corrupt: entry at ${offset} past the end of the entries`);
   }
 
@@ -420,9 +482,9 @@ function parseEntry(
   const size = view.getUint32(offset);
   offset += 4;
 
-  // Object ID (20 bytes SHA-1)
-  const objectId = hexIdAt(data, offset);
-  offset += 20;
+  // Object ID (the format's raw length)
+  const objectId = hexIdAt(data, offset, layout.rawLength);
+  offset += layout.rawLength;
 
   // Flags (2 bytes)
   const flags = view.getUint16(offset);
@@ -560,13 +622,15 @@ export function encodeIndexFile(
   entries: readonly StagingEntry[],
   version: IndexVersion = INDEX_VERSION_2,
   extensions: readonly IndexExtension[] = [],
+  objectFormat?: ObjectFormat,
 ): Iterable<Uint8Array> {
+  const layout = layoutOf(objectFormat);
   const written = writtenVersion(entries, version);
-  const sortedEntries = checkedSorted(entries, extensions, written === INDEX_VERSION_4);
-  if (written === INDEX_VERSION_4) return encodeSorted(sortedEntries, written, extensions);
+  const sortedEntries = checkedSorted(entries, extensions, written === INDEX_VERSION_4, layout);
+  if (written === INDEX_VERSION_4) return encodeSorted(sortedEntries, written, extensions, layout);
   // encoded (and so checked) now, before the first chunk is asked for
-  const { out, size } = encodeFlat(sortedEntries, written, extensions, 0);
-  return chunked(out, size);
+  const { out, size } = encodeFlat(sortedEntries, written, extensions, 0, layout);
+  return chunked(out, size, layout);
 }
 
 /**
@@ -590,25 +654,47 @@ export async function encodeIndexFileBytes(
     source?: IndexEncoding;
     sparseDirectories?: boolean;
     /**
-     * Write a null trailer instead of the SHA-1 (`index.skipHash`, implied by
+     * Write a null trailer instead of the hash (`index.skipHash`, implied by
      * `feature.manyFiles`: do_write_index's `skip_hash`); the checksum returned is that null one
      */
     skipHash?: boolean;
+    /** The repository's object format (default SHA-1) */
+    objectFormat?: ObjectFormat;
   } = {},
 ): Promise<{ bytes: Uint8Array; checksum: Uint8Array; encoding?: IndexEncoding }> {
+  const layout = layoutOf(options.objectFormat);
+  const CHECKSUM_SIZE = layout.checksumSize;
   const written = writtenVersion(entries, version);
   const sparse = options.sparseDirectories === true;
-  const sortedEntries = checkedSorted(entries, extensions, written === INDEX_VERSION_4, sparse);
+  const sortedEntries = checkedSorted(
+    entries,
+    extensions,
+    written === INDEX_VERSION_4,
+    layout,
+    sparse,
+  );
   if (written === INDEX_VERSION_4) {
-    const bytes = concatBytes([...encodeSorted(sortedEntries, written, extensions)]);
+    const bytes = concatBytes([...encodeSorted(sortedEntries, written, extensions, layout)]);
     if (options.skipHash) bytes.fill(0, bytes.length - CHECKSUM_SIZE);
     return { bytes, checksum: bytes.subarray(bytes.length - CHECKSUM_SIZE) };
   }
-  const source = options.source?.version === written ? options.source : undefined;
+  const source =
+    options.source?.version === written && (options.source.rawLength ?? 20) === layout.rawLength
+      ? options.source
+      : undefined;
   const offsets = new Int32Array(sortedEntries.length + 1);
-  const { out, size } = encodeFlat(sortedEntries, written, extensions, 20, source, offsets, sparse);
+  const { out, size } = encodeFlat(
+    sortedEntries,
+    written,
+    extensions,
+    CHECKSUM_SIZE,
+    layout,
+    source,
+    offsets,
+    sparse,
+  );
   // (a null trailer: `out` is zeroed past `size`)
-  if (!options.skipHash) out.set(await sha1(out.subarray(0, size)), size);
+  if (!options.skipHash) out.set(await layout.format.digest(out.subarray(0, size)), size);
   // the entries' records point into `out` (a later encode copies their bytes from there):
   // the caller gets a copy, so changing it cannot slip into a later index under a valid
   // checksum
@@ -616,7 +702,13 @@ export async function encodeIndexFileBytes(
   return {
     bytes,
     checksum: bytes.subarray(size),
-    encoding: { entries: sortedEntries, buffer: out, offsets, version: written },
+    encoding: {
+      entries: sortedEntries,
+      buffer: out,
+      offsets,
+      version: written,
+      rawLength: layout.rawLength,
+    },
   };
 }
 
@@ -631,6 +723,7 @@ function encodeFlat(
   version: IndexVersion,
   extensions: readonly IndexExtension[],
   spare: number,
+  layout: IndexLayout,
   source?: IndexEncoding,
   /** filled with where each entry starts in `out` (and where the entries end) */
   offsets?: Int32Array,
@@ -679,7 +772,12 @@ function encodeFlat(
     }
     const record = encodedEntries.get(entry);
     // (a buffer handed away since, detached, holds nothing any more)
-    if (record && record.version === version && record.buffer.length > 0) {
+    if (
+      record &&
+      record.version === version &&
+      record.rawLength === layout.rawLength &&
+      record.buffer.length > 0
+    ) {
       known[i] = record;
       size += record.length;
       continue;
@@ -692,7 +790,7 @@ function encodeFlat(
       encodedPaths[i] = bytes;
       pathLength = bytes.length;
     }
-    const infoLen = hasExtendedFlags(entry) ? INFO_LEN_EXTENDED : INFO_LEN;
+    const infoLen = hasExtendedFlags(entry) ? layout.infoLenExtended : layout.infoLen;
     size += (infoLen + pathLength + 8) & ~7;
   }
   for (const ext of extensions) size += 8 + ext.data.length;
@@ -750,19 +848,27 @@ function encodeFlat(
     }
     flushRun();
     const hasExtended = hasExtendedFlags(entry);
-    const infoLen = hasExtended ? INFO_LEN_EXTENDED : INFO_LEN;
+    const infoLen = hasExtended ? layout.infoLenExtended : layout.infoLen;
     const bytes = encodedPaths[i];
     const path = entry.path;
     const pathLength = bytes ? bytes.length : path.length;
-    writeEntryHeader(view, at, entry, pathLength, hasExtended);
+    writeEntryHeader(view, at, entry, pathLength, hasExtended, layout);
     // objectIdToBytes throws the error for an id that is none
-    if (!writeObjectId(out, at + P_OBJECTID, entry.objectId)) objectIdToBytes(entry.objectId);
+    if (!writeObjectId(out, at + P_OBJECTID, entry.objectId, layout.rawLength)) {
+      objectIdToBytes(entry.objectId, layout.rawLength);
+    }
     const pathAt = at + infoLen;
     if (bytes) out.set(bytes, pathAt);
     else for (let k = 0; k < pathLength; k++) out[pathAt + k] = path.charCodeAt(k);
     // the NUL and the padding are zero already
     const length = (infoLen + pathLength + 8) & ~7;
-    encodedEntries.set(entry, { version, buffer: out, offset: at, length });
+    encodedEntries.set(entry, {
+      version,
+      rawLength: layout.rawLength,
+      buffer: out,
+      offset: at,
+      length,
+    });
     at += length;
   }
   flushRun();
@@ -795,12 +901,12 @@ const HEX_DIGIT = (() => {
 })();
 
 /**
- * The 20 bytes of the object id `id` written at `at`; false (bytes undefined) when it is
- * not 40 lowercase hex digits.
+ * The `rawLength` bytes of the object id `id` written at `at`; false (bytes undefined) when
+ * it is not `2 * rawLength` lowercase hex digits.
  */
-function writeObjectId(out: Uint8Array, at: number, id: string): boolean {
-  if (typeof id !== "string" || id.length !== 40) return false;
-  for (let i = 0; i < 20; i++) {
+function writeObjectId(out: Uint8Array, at: number, id: string, rawLength = 20): boolean {
+  if (typeof id !== "string" || id.length !== 2 * rawLength) return false;
+  for (let i = 0; i < rawLength; i++) {
     const c1 = id.charCodeAt(2 * i);
     const c2 = id.charCodeAt(2 * i + 1);
     const hi = c1 < 128 ? (HEX_DIGIT[c1] as number) : -1;
@@ -816,6 +922,7 @@ function checkedSorted(
   entries: readonly StagingEntry[],
   extensions: readonly IndexExtension[],
   checkEntries: boolean,
+  layout: IndexLayout,
   sparseDirectories = false,
 ): StagingEntry[] {
   // versions 2 and 3 check each entry as they write it (encodeFlat), before any byte is out
@@ -823,7 +930,7 @@ function checkedSorted(
     // an entry encoded before was checked then (entries are never changed in place)
     if (encodedEntries.has(entry)) continue;
     validateEntryPath(entry, sparseDirectories);
-    objectIdToBytes(entry.objectId);
+    objectIdToBytes(entry.objectId, layout.rawLength);
   }
   for (const ext of extensions) {
     if (!/^[\x21-\x7e]{4}$/.test(ext.signature)) {
@@ -863,9 +970,9 @@ function hasExtendedFlags(entry: StagingEntry): boolean {
   return entry.intentToAdd === true || entry.skipWorktree === true;
 }
 
-/** The first `size` bytes of `out` in chunks of {@link INDEX_CHUNK_SIZE}, then their SHA-1. */
-function* chunked(out: Uint8Array, size: number): Generator<Uint8Array> {
-  const hasher = createSha1();
+/** The first `size` bytes of `out` in chunks of {@link INDEX_CHUNK_SIZE}, then their hash. */
+function* chunked(out: Uint8Array, size: number, layout: IndexLayout): Generator<Uint8Array> {
+  const hasher = layout.format.createHasher();
   for (let at = 0; at < size; at += INDEX_CHUNK_SIZE) {
     // a copy: the entries' records point into `out` (see encodeIndexFileBytes)
     const chunk = out.slice(at, Math.min(size, at + INDEX_CHUNK_SIZE));
@@ -879,8 +986,9 @@ function* encodeSorted(
   sortedEntries: StagingEntry[],
   version: IndexVersion,
   extensions: readonly IndexExtension[],
+  layout: IndexLayout,
 ): Generator<Uint8Array> {
-  const hasher = createSha1();
+  const hasher = layout.format.createHasher();
 
   const header = new Uint8Array(HEADER_SIZE);
   const headerView = new DataView(header.buffer);
@@ -900,7 +1008,7 @@ function* encodeSorted(
 
   let previousPath = "";
   for (const entry of sortedEntries) {
-    const entryBytes = serializeEntry(entry, previousPath);
+    const entryBytes = serializeEntry(entry, previousPath, layout);
     pending.push(entryBytes);
     pendingLength += entryBytes.length;
     previousPath = entry.path;
@@ -933,8 +1041,9 @@ export async function serializeIndexFile(
   entries: readonly StagingEntry[],
   version: IndexVersion = INDEX_VERSION_2,
   extensions: readonly IndexExtension[] = [],
+  objectFormat?: ObjectFormat,
 ): Promise<Uint8Array> {
-  return concatBytes([...encodeIndexFile(entries, version, extensions)]);
+  return concatBytes([...encodeIndexFile(entries, version, extensions, objectFormat)]);
 }
 
 /**
@@ -962,6 +1071,8 @@ const encodedEntries = new WeakMap<StagingEntry, EncodedEntry>();
  */
 interface EncodedEntry {
   version: IndexVersion;
+  /** The raw id length of the object format the bytes were written in */
+  rawLength: number;
   buffer: Uint8Array;
   offset: number;
   length: number;
@@ -998,10 +1109,14 @@ export function reuseEntryEncoding(source: object, copy: StagingEntry): void {
   }
 }
 
-function serializeEntry(entry: StagingEntry, previousPath: string): Uint8Array {
+function serializeEntry(
+  entry: StagingEntry,
+  previousPath: string,
+  layout: IndexLayout,
+): Uint8Array {
   const pathBytes = encodeGitPath(entry.path);
   // only an entry with an extended flag carries the word ("reduce extended entries")
-  return serializeEntryV4(entry, pathBytes, previousPath, hasExtendedFlags(entry));
+  return serializeEntryV4(entry, pathBytes, previousPath, hasExtendedFlags(entry), layout);
 }
 
 /**
@@ -1012,6 +1127,7 @@ function serializeEntryV4(
   pathBytes: Uint8Array,
   previousPath: string,
   hasExtended: boolean,
+  layout: IndexLayout,
 ): Uint8Array {
   // Find common prefix
   let commonLen = 0;
@@ -1028,14 +1144,14 @@ function serializeEntryV4(
   // Encode varint for bytes to remove
   const varintBytes = encodeVarint(toRemove);
 
-  const infoLen = hasExtended ? INFO_LEN_EXTENDED : INFO_LEN;
+  const infoLen = hasExtended ? layout.infoLenExtended : layout.infoLen;
   const totalLen = infoLen + varintBytes.length + suffix.length + 1; // +1 for null
 
   const buffer = new Uint8Array(totalLen);
   const view = new DataView(buffer.buffer);
 
-  writeEntryHeader(view, 0, entry, pathBytes.length, hasExtended);
-  buffer.set(objectIdToBytes(entry.objectId), P_OBJECTID);
+  writeEntryHeader(view, 0, entry, pathBytes.length, hasExtended, layout);
+  buffer.set(objectIdToBytes(entry.objectId, layout.rawLength), P_OBJECTID);
 
   let offset = infoLen;
   buffer.set(varintBytes, offset);
@@ -1081,6 +1197,7 @@ function writeEntryHeader(
   entry: StagingEntry,
   pathLength: number,
   hasExtended: boolean,
+  layout: IndexLayout = SHA1_LAYOUT,
 ): void {
   // ctime, mtime: seconds and nanoseconds (the exact nanoseconds when known, see timeParts)
   const ctime = entry.ctime ?? entry.mtime;
@@ -1104,14 +1221,14 @@ function writeEntryHeader(
   let flags = (entry.stage << 12) | nameLen;
   if (hasExtended) flags |= EXTENDED;
   if (entry.assumeValid) flags |= ASSUME_VALID;
-  view.setUint16(at + P_FLAGS, flags);
+  view.setUint16(at + layout.pFlags, flags);
 
   // extended flags
   if (hasExtended) {
     let extFlags = 0;
     if (entry.intentToAdd) extFlags |= INTENT_TO_ADD >>> 16;
     if (entry.skipWorktree) extFlags |= SKIP_WORKTREE >>> 16;
-    view.setUint16(at + P_FLAGS2, extFlags);
+    view.setUint16(at + layout.pFlags2, extFlags);
   }
 }
 
@@ -1314,14 +1431,16 @@ export interface OrderedIndexItem {
  * const { bytes } = await encodeIndexInOrder([{ entry, path: "" }], 2, [link]);
  * ```
  *
- * `skipHash` writes a null trailer (`index.skipHash`).
+ * `skipHash` writes a null trailer (`index.skipHash`); `objectFormat` sizes the ids and the
+ * trailer (default SHA-1).
  */
 export async function encodeIndexInOrder(
   items: readonly OrderedIndexItem[],
   version: IndexVersion,
   extensions: readonly IndexExtension[],
-  options: { skipHash?: boolean } = {},
+  options: { skipHash?: boolean; objectFormat?: ObjectFormat } = {},
 ): Promise<{ bytes: Uint8Array; checksum: Uint8Array }> {
+  const layout = layoutOf(options.objectFormat);
   const written = writtenVersion(
     items.map((i) => i.entry),
     version,
@@ -1335,26 +1454,26 @@ export async function encodeIndexInOrder(
   parts.push(header);
   let previous: Uint8Array = new Uint8Array(0);
   for (const { entry, path } of items) {
-    objectIdToBytes(entry.objectId);
+    const id = objectIdToBytes(entry.objectId, layout.rawLength);
     const name = encodeGitPath(path);
     const hasExtended = hasExtendedFlags(entry);
-    const infoLen = hasExtended ? INFO_LEN_EXTENDED : INFO_LEN;
+    const infoLen = hasExtended ? layout.infoLenExtended : layout.infoLen;
     if (written === INDEX_VERSION_4) {
       let common = 0;
       while (common < name.length && common < previous.length && name[common] === previous[common])
         common++;
       const varint = encodeVarint(previous.length - common);
       const out = new Uint8Array(infoLen + varint.length + name.length - common + 1);
-      writeEntryHeader(new DataView(out.buffer), 0, entry, name.length, hasExtended);
-      out.set(objectIdToBytes(entry.objectId), P_OBJECTID);
+      writeEntryHeader(new DataView(out.buffer), 0, entry, name.length, hasExtended, layout);
+      out.set(id, P_OBJECTID);
       out.set(varint, infoLen);
       out.set(name.subarray(common), infoLen + varint.length);
       parts.push(out);
       previous = name;
     } else {
       const out = new Uint8Array((infoLen + name.length + 8) & ~7);
-      writeEntryHeader(new DataView(out.buffer), 0, entry, name.length, hasExtended);
-      out.set(objectIdToBytes(entry.objectId), P_OBJECTID);
+      writeEntryHeader(new DataView(out.buffer), 0, entry, name.length, hasExtended, layout);
+      out.set(id, P_OBJECTID);
       out.set(name, infoLen);
       parts.push(out);
     }
@@ -1366,15 +1485,15 @@ export async function encodeIndexInOrder(
     parts.push(head, ext.data);
   }
   const body = concatBytes(parts);
-  const bytes = new Uint8Array(body.length + CHECKSUM_SIZE);
+  const bytes = new Uint8Array(body.length + layout.checksumSize);
   bytes.set(body);
-  if (!options.skipHash) bytes.set(await sha1(body), body.length);
+  if (!options.skipHash) bytes.set(await layout.format.digest(body), body.length);
   return { bytes, checksum: bytes.subarray(body.length) };
 }
 
 /** Scratch buffers of {@link sameOnDiskEntryData}. */
-const COMPARE_A = new DataView(new ArrayBuffer(INFO_LEN_EXTENDED));
-const COMPARE_B = new DataView(new ArrayBuffer(INFO_LEN_EXTENDED));
+const COMPARE_A = new DataView(new ArrayBuffer(SHA1_LAYOUT.infoLenExtended));
+const COMPARE_B = new DataView(new ArrayBuffer(SHA1_LAYOUT.infoLenExtended));
 
 /**
  * Whether two entries are written with the same data apart from their names: stat data,
@@ -1387,9 +1506,10 @@ export function sameOnDiskEntryData(a: StagingEntry, b: StagingEntry): boolean {
   if (extA !== hasExtendedFlags(b)) return false;
   writeEntryHeader(COMPARE_A, 0, a, 0, extA);
   writeEntryHeader(COMPARE_B, 0, b, 0, extA);
-  const len = extA ? INFO_LEN_EXTENDED : INFO_LEN;
+  // (written in the SHA-1 layout without their ids: the ids are compared above)
+  const len = extA ? SHA1_LAYOUT.infoLenExtended : SHA1_LAYOUT.infoLen;
   for (let i = 0; i < len; i++) {
-    if (i >= P_OBJECTID && i < P_FLAGS) continue;
+    if (i >= P_OBJECTID && i < SHA1_LAYOUT.pFlags) continue;
     if (COMPARE_A.getUint8(i) !== COMPARE_B.getUint8(i)) return false;
   }
   return true;

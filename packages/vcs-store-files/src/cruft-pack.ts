@@ -22,11 +22,17 @@ import type {
   PackSet,
   WritePackOptions,
 } from "@statewalker/vcs-core";
-import { decodeTreeBytes, joinPath, parsePackMtimes, writePack } from "@statewalker/vcs-core";
+import {
+  decodeTreeBytes,
+  joinPath,
+  objectFormatOf,
+  parsePackMtimes,
+  writePack,
+} from "@statewalker/vcs-core";
+import { objectIdPattern } from "./object-names.js";
 import type { FileRawStorage } from "./storage/raw/file-raw-storage.js";
 
 /** A loose object file name. */
-const OBJECT_ID = /^[0-9a-f]{40}$/;
 /** git's smallest `--max-pack-size` (pack-objects: "minimum pack size limit is 1 MiB"). */
 export const MIN_PACK_SIZE_LIMIT = 1024 * 1024;
 
@@ -101,6 +107,7 @@ export async function writeCruftPacks(o: CruftPackInput): Promise<CruftPackResul
           await readBytes(files, `${base}.mtimes`),
           pack.count,
           `${base}.mtimes`,
+          objectFormatOf(o.objects),
         );
       } catch {
         // git falls back to the pack's own mtime when the .mtimes cannot be loaded
@@ -119,6 +126,7 @@ export async function writeCruftPacks(o: CruftPackInput): Promise<CruftPackResul
       if (size !== undefined && !stored.has(id)) stored.set(id, size);
     }
   }
+  const OBJECT_ID = objectIdPattern(objectFormatOf(o.objects));
   for await (const id of o.looseStorage.keys()) {
     if (!OBJECT_ID.test(id) || (await excluded(id))) continue;
     const path = joinPath(o.gitDir, "objects", id.slice(0, 2), id.slice(2));
@@ -257,15 +265,16 @@ export async function objectLinks(objects: GitObjects, id: ObjectId): Promise<Ob
   const bytes = o.bytes ?? (await collect(o.content));
   if (type === "tree") {
     // gitlinks name commits of other repositories: not walked (as git's traversal)
-    return decodeTreeBytes(bytes)
+    return decodeTreeBytes(bytes, { idLength: objectFormatOf(objects).rawLength })
       .filter((e) => e.mode !== 0o160000)
       .map((e) => e.id);
   }
   const text = new TextDecoder().decode(bytes.subarray(0, headerEnd(bytes)));
   const links: ObjectId[] = [];
+  const oid = objectIdPattern(objectFormatOf(objects));
   for (const line of text.split("\n")) {
-    const m = /^(tree|parent|object) ([0-9a-f]{40})$/.exec(line);
-    if (m) links.push(m[2] as string);
+    const m = /^(tree|parent|object) ([0-9a-f]+)$/.exec(line);
+    if (m && oid.test(m[2] as string)) links.push(m[2] as string);
   }
   return links;
 }

@@ -113,7 +113,7 @@ const reftableSupported =
   }).status === 0;
 
 describe("repositories we cannot read are refused when opened", () => {
-  it("a sha256 repository opens; one with packs is refused until packs read SHA-256 ids", async () => {
+  it("a sha256 repository opens, its packs too; one with a multi-pack-index is refused", async () => {
     const dir = nativeRepo(["--object-format=sha256"]);
     const { history } = await open(dir);
     expect(history.objectFormat?.name).toBe("sha256");
@@ -123,6 +123,11 @@ describe("repositories we cannot read are refused when opened", () => {
       git(dir, ["rev-parse", "HEAD^{tree}"]).trim(),
     );
     git(dir, ["repack", "-q", "-a", "-d"]);
+    const packed = await open(dir);
+    expect((await packed.history.commits.load(head))?.tree).toBe(
+      git(dir, ["rev-parse", "HEAD^{tree}"]).trim(),
+    );
+    git(dir, ["multi-pack-index", "write"]);
     await expect(open(dir)).rejects.toBeInstanceOf(UnsupportedObjectFormatError);
   });
 

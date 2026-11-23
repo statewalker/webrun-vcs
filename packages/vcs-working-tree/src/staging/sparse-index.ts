@@ -16,6 +16,7 @@
  */
 
 import { FileMode, type ObjectId, type TreeEntry, type Trees } from "@statewalker/vcs-core";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import { type CacheTree, cacheTreeOfTree, copyCacheTree, treeIdOfEntries } from "./cache-tree.js";
 import type { StagingEntry } from "./types.js";
 
@@ -287,6 +288,8 @@ export async function sparseIndexMatches(
   sparse: readonly StagingEntry[],
   full: readonly StagingEntry[],
   trees: Pick<Trees, "load">,
+  /** the repository's object format, the trees' ids are hashed in */
+  format: ObjectFormat,
 ): Promise<boolean> {
   let j = 0;
   for (const e of sparse) {
@@ -301,7 +304,7 @@ export async function sparseIndexMatches(
     if (k === j) return false;
     const below = full.slice(j, k).map((x) => ({ ...x, path: x.path.slice(e.path.length) }));
     j = k;
-    const id = await treeIdOfEntries(below);
+    const id = await treeIdOfEntries(below, format);
     if (id === undefined) return false;
     if (id === e.objectId) continue;
     if (!(await treeHoldsEntries(trees, e.objectId, below))) return false;

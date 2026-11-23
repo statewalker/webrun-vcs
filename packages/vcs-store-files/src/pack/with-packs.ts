@@ -14,14 +14,13 @@ import {
   type GitObject,
   type GitObjects,
   listObjectsWithPrefix,
+  objectFormatOf,
   PackError,
   runSteps,
   runStepsAsync,
   type Steps,
 } from "@statewalker/vcs-core";
-
-const OID = /^[0-9a-f]{40}$/;
-const isId = (id: unknown): id is string => typeof id === "string" && OID.test(id);
+import { isHexObjectId } from "@statewalker/vcs-utils/hash";
 
 function closeSource(content: AsyncIterable<Uint8Array> | Iterable<Uint8Array>): void {
   const it =
@@ -100,6 +99,9 @@ export function skipPacked(
  * ```
  */
 export function withPacks(loose: GitObjects, packs: PackSet): GitObjects {
+  // an id of the repository's format (the packs hold no other)
+  const format = objectFormatOf(loose);
+  const isId = (id: unknown): id is string => isHexObjectId(id, format);
   /**
    * Packs, then loose objects. A packed copy that fails before `get` returns (a corrupt entry
    * header, a missing delta base, a broken first chunk) gives way to a loose copy; its error is

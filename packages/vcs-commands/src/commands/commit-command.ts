@@ -1154,7 +1154,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
         hostPath: await this.hooks.gitPath(name, true),
         reread: async () => {
           await temp.read();
-          return writeIndexAsTree(temp, this.trees, { write: false });
+          return writeIndexAsTree(temp, this.trees, this.objectFormat, { write: false });
         },
         remove,
       };
@@ -1245,13 +1245,15 @@ export class CommitCommand extends GitCommand<CommitResult> {
     } else if (index) {
       // `-a`: the index with a fully valid cache-tree (cache_tree_update), written into the
       // lock
-      treeId = await writeIndexAsTree(this.staging, this.trees, { write: false });
+      treeId = await writeIndexAsTree(this.staging, this.trees, this.objectFormat, {
+        write: false,
+      });
       await index.write();
     } else {
       // Normal mode: use full staging area; as git's prepare_index, the index is written
       // again with a fully valid cache-tree (cache_tree_update, which keeps the valid nodes:
       // a stored subtree no edit touched stays the one stored)
-      treeId = await writeIndexAsTree(this.staging, this.trees);
+      treeId = await writeIndexAsTree(this.staging, this.trees, this.objectFormat);
     }
     let previousCommit: Commit | undefined;
     let amendedId: ObjectId | undefined;
@@ -1886,7 +1888,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     }
     // the real index, with a cache-tree made valid as git's cache_tree_update before
     // write_locked_index (none while it holds conflicts: the edits' invalidations stay)
-    await updateIndexCacheTree(this.staging, this.trees);
+    await updateIndexCacheTree(this.staging, this.trees, this.objectFormat);
     await index.write();
 
     // the false index: HEAD's tree with the same paths as the index now has them

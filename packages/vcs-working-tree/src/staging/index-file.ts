@@ -24,7 +24,7 @@ import { readFile, type Trees } from "@statewalker/vcs-core";
 import { bytesToHex, sha1 } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
-import { assertSha1ObjectFormat, type ObjectFormat } from "@statewalker/vcs-utils/hash";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import {
   encodeUntrackedCache,
   invalidateUntrackedPath,
@@ -248,7 +248,7 @@ export class IndexChangedError extends Error {
   }
 }
 
-/** Size of the trailing SHA-1 checksum of an index file. */
+/** Size of the trailing SHA-1 checksum of an index file (a SHA-256 index's is 32 bytes). */
 const INDEX_CHECKSUM_SIZE = 20;
 
 /** Prefix of the identity of an index whose trailer is null (see {@link indexFileIdentity}). */
@@ -258,10 +258,14 @@ const NULL_TRAILER_IDENTITY = "skiphash:";
  * What tells one index file's bytes from another's: the trailing checksum as hex, or, for a
  * null trailer (`index.skipHash`, which every write under that setting has), `skiphash:` and
  * the SHA-1 of the whole file, since the trailer then says nothing about the content.
+ * `checksumSize` is the trailer's length: 20 bytes in SHA-1, 32 in a SHA-256 repository.
  */
-export async function indexFileIdentity(data: Uint8Array): Promise<string> {
-  const tail = data.subarray(Math.max(0, data.length - INDEX_CHECKSUM_SIZE));
-  if (tail.length === INDEX_CHECKSUM_SIZE && tail.every((b) => b === 0)) {
+export async function indexFileIdentity(
+  data: Uint8Array,
+  checksumSize: number = INDEX_CHECKSUM_SIZE,
+): Promise<string> {
+  const tail = data.subarray(Math.max(0, data.length - checksumSize));
+  if (tail.length === checksumSize && tail.every((b) => b === 0)) {
     return NULL_TRAILER_IDENTITY + bytesToHex(await sha1(data));
   }
   return bytesToHex(tail);
@@ -269,13 +273,16 @@ export async function indexFileIdentity(data: Uint8Array): Promise<string> {
 
 /**
  * The identity of the index at `indexPath` ({@link indexFileIdentity}: its trailing checksum
- * as hex), or `null` when there is no index file. Reads only the last 20 bytes, unless they
- * are null (`index.skipHash`): the whole file is then read and hashed.
+ * as hex), or `null` when there is no index file. Reads only the trailer (`checksumSize`
+ * bytes: 20, or 32 in a SHA-256 repository), unless it is null (`index.skipHash`): the whole
+ * file is then read and hashed.
  */
 export async function readIndexChecksum(
   files: FilesApi,
   indexPath: string,
+  checksumSize: number = INDEX_CHECKSUM_SIZE,
 ): Promise<string | null> {
+  const INDEX_CHECKSUM_SIZE = checksumSize;
   const stats = await files.stats(indexPath);
   if (stats?.kind !== "file") return null;
   const size = stats.size ?? 0;
@@ -292,7 +299,7 @@ export async function readIndexChecksum(
     if (at === INDEX_CHECKSUM_SIZE) break;
   }
   if (at === INDEX_CHECKSUM_SIZE && tail.every((b) => b === 0)) {
-    return indexFileIdentity(await readFile(files, indexPath));
+    return indexFileIdentity(await readFile(files, indexPath), checksumSize);
   }
   return bytesToHex(tail.subarray(0, at));
 }
@@ -337,6 +344,8 @@ export interface IndexWriteOptions {
   onEncoding?: (encoding: IndexEncoding) => void;
   /** A null trailer instead of the SHA-1 (`index.skipHash`) */
   skipHash?: boolean;
+  /** The repository's object format: ids and trailer of its width (default SHA-1) */
+  objectFormat?: ObjectFormat;
 }
 
 const RETRY_DELAY_MS = 20;
@@ -371,8 +380,10 @@ export async function writeIndexFile(
     {
       ...(options.source ? { source: options.source } : {}),
       ...(options.skipHash ? { skipHash: true } : {}),
+      ...(options.objectFormat ? { objectFormat: options.objectFormat } : {}),
     },
   );
+  const checksumSize = (options.objectFormat ?? SHA1_OBJECT_FORMAT).rawLength;
   // the lock is created holding the new index: one exclusive create, then one rename
   const lockPath = `${indexPath}.lock`;
   const atomic = atomicFilesOver(files, "");
@@ -383,7 +394,7 @@ export async function writeIndexFile(
   }
   try {
     if (options.expectedChecksum !== undefined) {
-      const current = await readIndexChecksum(files, indexPath);
+      const current = await readIndexChecksum(files, indexPath, checksumSize);
       if (current !== options.expectedChecksum) throw new IndexChangedError(indexPath);
     }
     await atomic.replace(lockPath, indexPath);
@@ -392,7 +403,7 @@ export async function writeIndexFile(
     throw error;
   }
   if (encoding) options.onEncoding?.(encoding);
-  return indexFileIdentity(content);
+  return indexFileIdentity(content, checksumSize);
 }
 
 /**
@@ -471,9 +482,9 @@ export class IndexFile {
        */
       verifyChecksum?: boolean;
       /**
-       * The repository's object format, or how to learn it: an index of another format than
-       * SHA-1 (32-byte ids) is refused on read, write and lock with
-       * `UnsupportedObjectFormatError` until the index reads such ids
+       * The repository's object format, or how to learn it (looked up on the first read,
+       * write or lock): the width of the entries' ids, of the ids in `TREE`, `REUC`, `link`
+       * and `UNTR`, and of the trailer. SHA-1 when absent.
        */
       objectFormat?: IndexObjectFormat;
     } = {},
@@ -481,18 +492,37 @@ export class IndexFile {
     this.host = options.host;
   }
 
-  /** The object format check, run once (see `options.objectFormat`) */
+  /** The object format lookup, run once (see `options.objectFormat`) */
   private formatChecked: Promise<void> | undefined;
 
-  /** Refuses an index of a repository whose objects are not SHA-1 (see `options.objectFormat`). */
+  /**
+   * The repository's object format (see `options.objectFormat`): SHA-1 until the lookup ran,
+   * which every read, write and lock does first.
+   */
+  private format: ObjectFormat = SHA1_OBJECT_FORMAT;
+
+  /** The object format of the ids and trailer this file reads and writes. */
+  get objectFormat(): ObjectFormat {
+    return this.format;
+  }
+
+  /** Learns the repository's object format (see `options.objectFormat`), once. */
   private checkObjectFormat(): Promise<void> | undefined {
     const given = this.options.objectFormat;
     if (given === undefined) return undefined;
+    if (typeof given !== "function") {
+      this.format = given;
+      return undefined;
+    }
     this.formatChecked ??= (async () => {
-      const format = typeof given === "function" ? await given() : given;
-      assertSha1ObjectFormat(format, "the index file");
+      this.format = (await given()) ?? SHA1_OBJECT_FORMAT;
     })();
     return this.formatChecked;
+  }
+
+  /** The raw id length of this file's object format */
+  private get rawLength(): number {
+    return this.format.rawLength;
   }
 
   /** The checksum of the index this instance last read or wrote (`null`: none; `undefined`: never read). */
@@ -526,7 +556,7 @@ export class IndexFile {
     // removes the cache: a write that skips an unchanged index still writes then
     if (options.untrackedCache) {
       const extensions = this.checksum === null ? [] : this.extensions;
-      if (tweakUntrackedCache(extensions, settings) !== extensions) return true;
+      if (tweakUntrackedCache(extensions, settings, this.format) !== extensions) return true;
       if (this.checksum === null) return false;
     }
     if (settings.splitIndex === true && this.split === undefined && this.sparseDirs !== undefined) {
@@ -554,6 +584,7 @@ export class IndexFile {
 
   /** Takes over what `other` (over the same file) last read or wrote. */
   adopt(other: IndexFile): void {
+    this.format = other.format;
     this.checksum = other.checksum;
     this.version = other.version;
     this.extensions = other.extensions;
@@ -584,6 +615,7 @@ export class IndexFile {
     const parsed = await parseIndexFile(data, {
       keepEncoding: true,
       verifyChecksum: this.options.verifyChecksum === true,
+      objectFormat: this.format,
     });
     let linkData: Uint8Array | undefined;
     let sparse = false;
@@ -598,7 +630,7 @@ export class IndexFile {
     let encoding = parsed.encoding;
     let split: SplitState | undefined;
     if (linkData) {
-      const link = parseLinkExtension(linkData);
+      const link = parseLinkExtension(linkData, this.rawLength);
       if (isNullIndexId(link.baseId)) {
         split = {};
       } else {
@@ -610,6 +642,7 @@ export class IndexFile {
           link.baseId,
           indexDir,
           this.options.verifyChecksum === true,
+          this.format,
         );
         entries = mergeSplitIndex(parsed.entries, link, shared);
         encoding = shared.encoding;
@@ -634,7 +667,7 @@ export class IndexFile {
       const treeExt = others.find((e) => e.signature === "TREE");
       let cacheTree: CacheTree | undefined;
       try {
-        cacheTree = treeExt ? parseCacheTree(treeExt.data) : undefined;
+        cacheTree = treeExt ? parseCacheTree(treeExt.data, this.rawLength) : undefined;
       } catch {
         cacheTree = undefined;
       }
@@ -645,7 +678,10 @@ export class IndexFile {
         .filter((e) => e.signature !== "TREE")
         .filter((e) => e.signature !== "FSMN");
       if (full.cacheTree) {
-        extensions = [{ signature: "TREE", data: encodeCacheTree(full.cacheTree) }, ...extensions];
+        extensions = [
+          { signature: "TREE", data: encodeCacheTree(full.cacheTree, this.rawLength) },
+          ...extensions,
+        ];
       }
     }
     if (linkData || sparse) validateIndexEntryPaths(entries);
@@ -667,7 +703,7 @@ export class IndexFile {
       this.host?.warn?.(settings.versionWarning);
     }
     const version = this.version ?? settings.version ?? INDEX_VERSION_2;
-    const extensions = tweakUntrackedCache(given, settings);
+    const extensions = tweakUntrackedCache(given, settings, this.format);
     let split = this.split;
     if (settings.splitIndex === false) split = undefined;
     else if (settings.splitIndex === true && !split) {
@@ -681,6 +717,7 @@ export class IndexFile {
     const { bytes, checksum, encoding } = await encodeIndexFileBytes(entries, version, extensions, {
       ...(this.encoding ? { source: this.encoding } : {}),
       ...(settings.skipHash ? { skipHash: true } : {}),
+      objectFormat: this.format,
     });
     return { bytes, checksum, encoding, extensions, split: undefined, version };
   }
@@ -709,12 +746,10 @@ export class IndexFile {
       tooManyNotSharedEntries(entries.length, classification.added.length, maxPercent);
     let before: (() => Promise<void>) | undefined;
     if (newShared) {
-      const written = await encodeIndexFileBytes(
-        entries,
-        version,
-        [],
-        this.encoding ? { source: this.encoding } : {},
-      );
+      const written = await encodeIndexFileBytes(entries, version, [], {
+        ...(this.encoding ? { source: this.encoding } : {}),
+        objectFormat: this.format,
+      });
       const id = bytesToHex(written.checksum);
       const sortedEntries = written.encoding?.entries ?? entries.slice();
       const fresh: SharedIndex = {
@@ -731,13 +766,13 @@ export class IndexFile {
       };
       before = () => this.writeSharedIndex(written.bytes, id, settings);
     }
-    const sharedId = shared ? shared.id : "0".repeat(40);
-    const { items, link } = prepareSplitWrite(classification, sharedId);
+    const sharedId = shared ? shared.id : this.format.nullId;
+    const { items, link } = prepareSplitWrite(classification, sharedId, this.rawLength);
     const main = await encodeIndexInOrder(
       items,
       version,
       [{ signature: "link", data: link }, ...extensions],
-      settings.skipHash ? { skipHash: true } : {},
+      { ...(settings.skipHash ? { skipHash: true } : {}), objectFormat: this.format },
     );
     const finalShared = shared;
     const finalClassification = classification;
@@ -811,7 +846,7 @@ export class IndexFile {
     const treeExt = extensions.find((e) => e.signature === "TREE");
     let tree: CacheTree | undefined;
     try {
-      tree = treeExt ? parseCacheTree(treeExt.data) : undefined;
+      tree = treeExt ? parseCacheTree(treeExt.data, this.rawLength) : undefined;
     } catch {
       tree = undefined;
     }
@@ -821,7 +856,7 @@ export class IndexFile {
     // ones holding an intent-to-add entry invalid; undefined when it cannot be had
     const computed = async (list: readonly StagingEntry[]) => {
       try {
-        return await storeCacheTree((items) => trees.store(items), list);
+        return await storeCacheTree((items) => trees.store(items), list, this.format);
       } catch {
         return undefined;
       }
@@ -838,7 +873,7 @@ export class IndexFile {
           return t && t.entryCount >= 0 ? t.id : undefined;
         },
       );
-      if (kept && (await sparseIndexMatches(kept.entries, entries, trees))) {
+      if (kept && (await sparseIndexMatches(kept.entries, entries, trees, this.format))) {
         return this.sparsePlan(
           kept.entries,
           kept.cacheTree,
@@ -856,13 +891,14 @@ export class IndexFile {
       if (!tree) return undefined;
     }
     let collapsed = collapseSparseIndex(entries, tree, inCheckout);
-    if (!(await sparseIndexMatches(collapsed.entries, entries, trees))) {
+    if (!(await sparseIndexMatches(collapsed.entries, entries, trees, this.format))) {
       // a cache-tree that no longer describes the entries: computed again, never written
       if (!fromIndex) return undefined;
       tree = await computed(entries);
       if (!tree) return undefined;
       collapsed = collapseSparseIndex(entries, tree, inCheckout);
-      if (!(await sparseIndexMatches(collapsed.entries, entries, trees))) return undefined;
+      if (!(await sparseIndexMatches(collapsed.entries, entries, trees, this.format)))
+        return undefined;
     }
     return this.sparsePlan(
       collapsed.entries,
@@ -884,7 +920,9 @@ export class IndexFile {
     skipHash?: boolean,
   ): Promise<IndexWritePlan> {
     const onDisk: IndexExtension[] = [
-      ...(sparseTree ? [{ signature: "TREE", data: encodeCacheTree(sparseTree) }] : []),
+      ...(sparseTree
+        ? [{ signature: "TREE", data: encodeCacheTree(sparseTree, this.rawLength) }]
+        : []),
       ...rest,
       { signature: SPARSE_DIRECTORIES_EXTENSION, data: new Uint8Array(0) },
     ];
@@ -896,11 +934,12 @@ export class IndexFile {
         ...(this.encoding ? { source: this.encoding } : {}),
         sparseDirectories: true,
         ...(skipHash ? { skipHash: true } : {}),
+        objectFormat: this.format,
       },
     );
     // in memory the index stays full, with the full index's cache-tree
     const kept: IndexExtension[] = [
-      ...(fullTree ? [{ signature: "TREE", data: encodeCacheTree(fullTree) }] : []),
+      ...(fullTree ? [{ signature: "TREE", data: encodeCacheTree(fullTree, this.rawLength) }] : []),
       ...rest,
     ];
     return {
@@ -958,7 +997,7 @@ export class IndexFile {
     this.split = decoded.split;
     this.lastEntries = decoded.split ? decoded.entries.slice() : [];
     this.sparseDirs = decoded.sparseDirs;
-    this.checksum = await indexFileIdentity(data);
+    this.checksum = await indexFileIdentity(data, this.rawLength);
     this.version = decoded.version;
     this.extensions = decoded.extensions;
     this.entriesKept = this.extensions.length > 0 ? decoded.entries.slice() : undefined;
@@ -984,7 +1023,7 @@ export class IndexFile {
     const existing = this.extensions.find((e) => e.signature === "REUC");
     if (!existing) return [];
     try {
-      return parseResolveUndo(existing.data);
+      return parseResolveUndo(existing.data, this.rawLength);
     } catch {
       return [];
     }
@@ -1001,7 +1040,7 @@ export class IndexFile {
       return;
     }
     const at = others.findIndex((e) => e.signature === "TREE") + 1;
-    const reuc = { signature: "REUC", data: encodeResolveUndo(kept) };
+    const reuc = { signature: "REUC", data: encodeResolveUndo(kept, this.rawLength) };
     this.extensions = [...others.slice(0, at), reuc, ...others.slice(at)];
   }
 
@@ -1016,7 +1055,7 @@ export class IndexFile {
     let list: ResolveUndoRecord[] = [];
     if (existing) {
       try {
-        list = parseResolveUndo(existing.data);
+        list = parseResolveUndo(existing.data, this.rawLength);
       } catch {
         list = [];
       }
@@ -1037,7 +1076,7 @@ export class IndexFile {
       byPath.set(record.path, { path: record.path, modes, objectIds });
     }
     const sorted = [...byPath.values()].sort((a, b) => compareGitPaths(a.path, b.path));
-    const reuc = { signature: "REUC", data: encodeResolveUndo(sorted) };
+    const reuc = { signature: "REUC", data: encodeResolveUndo(sorted, this.rawLength) };
     const others = this.extensions.filter((e) => e.signature !== "REUC");
     // git writes it after the cache-tree
     const at = others.findIndex((e) => e.signature === "TREE") + 1;
@@ -1078,7 +1117,7 @@ export class IndexFile {
     if (!ext || this.entriesKept === undefined) return undefined;
     let tree: CacheTree;
     try {
-      tree = parseCacheTree(ext.data);
+      tree = parseCacheTree(ext.data, this.rawLength);
     } catch {
       return undefined;
     }
@@ -1098,7 +1137,10 @@ export class IndexFile {
   untrackedCache(entries: readonly StagingEntry[]): UntrackedCache | undefined {
     if (this.pendingUntracked === null) return undefined;
     if (this.pendingUntracked) {
-      const cache = parseUntrackedCache(encodeUntrackedCache(this.pendingUntracked));
+      const cache = parseUntrackedCache(
+        encodeUntrackedCache(this.pendingUntracked),
+        this.pendingUntracked.objectFormat ?? this.format,
+      );
       if (cache && this.pendingUntrackedEntries) {
         invalidateAddedOrRemoved(cache, this.pendingUntrackedEntries, entries);
       }
@@ -1106,7 +1148,7 @@ export class IndexFile {
     }
     const ext = this.extensions.find((e) => e.signature === "UNTR");
     if (!ext) return undefined;
-    const cache = parseUntrackedCache(ext.data);
+    const cache = parseUntrackedCache(ext.data, this.format);
     if (cache && this.entriesKept) invalidateAddedOrRemoved(cache, this.entriesKept, entries);
     return cache;
   }
@@ -1162,7 +1204,7 @@ export class IndexFile {
     }
     try {
       if (this.checksum !== undefined) {
-        const current = await readIndexChecksum(this.files, this.path);
+        const current = await readIndexChecksum(this.files, this.path, this.rawLength);
         if (current !== this.checksum) throw new IndexChangedError(this.path);
       }
       await plan.before?.();
@@ -1173,7 +1215,7 @@ export class IndexFile {
     }
     await plan.after?.();
     this.host?.written?.();
-    this.checksum = await indexFileIdentity(plan.bytes);
+    this.checksum = await indexFileIdentity(plan.bytes, this.rawLength);
     this.encoding = plan.encoding;
     this.split = plan.split;
     this.lastEntries = plan.split ? entries.slice() : [];
@@ -1227,7 +1269,7 @@ export class IndexFile {
     };
     try {
       if (this.checksum !== undefined) {
-        const current = await readIndexChecksum(this.files, this.path);
+        const current = await readIndexChecksum(this.files, this.path, this.rawLength);
         if (current !== this.checksum) throw new IndexChangedError(this.path);
       }
     } catch (error) {
@@ -1247,7 +1289,7 @@ export class IndexFile {
         pending = {
           entries: entries.slice(),
           extensions: plan.extensions,
-          checksum: await indexFileIdentity(plan.bytes),
+          checksum: await indexFileIdentity(plan.bytes, this.rawLength),
           encoding: plan.encoding,
           split: plan.split,
           sparseDirs: plan.sparseDirs,
@@ -1303,7 +1345,7 @@ export class IndexFile {
         pending = {
           entries: parsed.entries.slice(),
           extensions: parsed.extensions,
-          checksum: await indexFileIdentity(data),
+          checksum: await indexFileIdentity(data, this.rawLength),
           encoding: parsed.encoding,
           split: parsed.split,
           sparseDirs: parsed.sparseDirs,
@@ -1318,7 +1360,7 @@ export class IndexFile {
     // what indexEntriesDigest compares: path, stage, mode, object id, intent-to-add
     const changed = this.entriesKept === undefined || !sameIndexEntries(this.entriesKept, entries);
     let extensions = withUntrackedCache(
-      carryIndexExtensions(this.extensions, entries, changed),
+      carryIndexExtensions(this.extensions, entries, changed, this.rawLength),
       this.untrackedPayload(entries, changed),
     );
     this.pendingUntracked = undefined;
@@ -1339,7 +1381,7 @@ export class IndexFile {
     if (tree && describesEntries(tree, entries)) {
       // git writes the cache-tree first
       extensions = [
-        { signature: "TREE", data: encodeCacheTree(tree) },
+        { signature: "TREE", data: encodeCacheTree(tree, this.rawLength) },
         ...extensions.filter((e) => e.signature !== "TREE"),
       ];
     }
@@ -1364,7 +1406,7 @@ export class IndexFile {
     if (!ext) return null;
     if (!changed || !this.entriesKept) return ext.data;
     if (!addsOrRemoves(this.entriesKept, entries)) return ext.data;
-    const cache = parseUntrackedCache(ext.data);
+    const cache = parseUntrackedCache(ext.data, this.format);
     // one git could not read either is dropped
     if (!cache) return null;
     invalidateAddedOrRemoved(cache, this.entriesKept, entries);
@@ -1512,6 +1554,7 @@ function withUntrackedCache(
 function tweakUntrackedCache(
   extensions: IndexExtension[],
   settings: IndexSettings,
+  objectFormat: ObjectFormat,
 ): IndexExtension[] {
   if (settings.untrackedCache === "remove") {
     return extensions.some((e) => e.signature === "UNTR")
@@ -1522,9 +1565,13 @@ function tweakUntrackedCache(
     return extensions;
   }
   const ext = extensions.find((e) => e.signature === "UNTR");
-  const current = ext ? parseUntrackedCache(ext.data) : undefined;
+  const current = ext ? parseUntrackedCache(ext.data, objectFormat) : undefined;
   if (current && untrackedCacheIdentIs(current, settings.untrackedIdent)) return extensions;
-  const fresh = newUntrackedCache(settings.untrackedIdent, settings.untrackedFlags ?? 0);
+  const fresh = newUntrackedCache(
+    settings.untrackedIdent,
+    settings.untrackedFlags ?? 0,
+    objectFormat,
+  );
   return withUntrackedCache(extensions, encodeUntrackedCache(fresh));
 }
 
@@ -1676,11 +1723,14 @@ export async function readIndexFileEntries(
     trees?: Pick<Trees, "load" | "store">;
     /** Check the trailing SHA-1, as git's fsck does (`verify_index_checksum`) */
     verifyChecksum?: boolean;
+    /** The repository's object format (default SHA-1), or how to learn it */
+    objectFormat?: IndexObjectFormat;
   } = {},
 ): Promise<{ entries: StagingEntry[]; extensions: readonly IndexExtension[] } | undefined> {
   const file = new IndexFile(files, indexPath, {
     ...(options.gitDir !== undefined ? { gitDir: options.gitDir } : {}),
     ...(options.verifyChecksum ? { verifyChecksum: true } : {}),
+    ...(options.objectFormat ? { objectFormat: options.objectFormat } : {}),
     ...(options.trees ? { defaultTrees: options.trees } : { keepSparseDirectories: true }),
   });
   const read = await file.read();

@@ -38,10 +38,9 @@ import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { openObjectAlternates, withAlternates } from "./alternates/index.js";
 import { createFilesCommitGraphProvider } from "./commit-graph.js";
 import {
-  assertNoPacksInFormat,
+  assertNoMultiPackIndexInFormat,
   parseConfigInt,
   readPackSetSettings,
-  refusePackWritesInFormat,
   skipPacked,
   withPacks,
 } from "./pack/index.js";
@@ -196,9 +195,10 @@ export interface GitFilesBackendResult {
  * `core.repositoryformatversion` above 1, an unknown version-1 extension, or one we do not
  * implement (`extensions.compatObjectFormat`) throws `UnsupportedRepositoryFormatError`. A
  * SHA-256 repository (`extensions.objectFormat = sha256`) opens with 32-byte object ids
- * (`objects.objectFormat`); one holding packs, and every pack write into one, is refused with
- * `UnsupportedObjectFormatError` until the pack formats read SHA-256 ids, and its
- * commit-graph is not read.
+ * (`objects.objectFormat`): its packs, `.idx`, `.rev` and `.mtimes` hold 32-byte ids and
+ * SHA-256 checksums. One holding a multi-pack-index is refused with
+ * `UnsupportedObjectFormatError` (its reader holds 20-byte ids), its bitmaps are not used and
+ * its commit-graph is not read.
  *
  * @example
  * ```typescript
@@ -230,8 +230,8 @@ export async function createGitFilesBackend(
   // Like git's read_repository_format it reads the config file alone, without includes.
   const format = await readRepositoryFormat(files, gitDir);
   const refStorage = create && options.refFormat === "reftable" ? "reftable" : format.refStorage;
-  // the hash naming the objects (`extensions.objectFormat`): SHA-1, or SHA-256 (whose packs
-  // are not read yet: a SHA-256 repository holding packs is refused here)
+  // the hash naming the objects (`extensions.objectFormat`): SHA-1, or SHA-256 (whose
+  // multi-pack-index is not read yet: a SHA-256 repository holding one is refused here)
   const objectFormat = options.objectFormat ?? format.objectFormat;
   if (objectFormat.name !== format.objectFormat.name && !create) {
     throw new UnsupportedObjectFormatError(
@@ -239,7 +239,7 @@ export async function createGitFilesBackend(
       objectFormat.name,
     );
   }
-  await assertNoPacksInFormat(files, packDir, objectFormat);
+  await assertNoMultiPackIndexInFormat(files, packDir, objectFormat);
   // a SHA-256 reftable (hash id `s256`) is neither read nor written yet
   if (objectFormat.name !== "sha1" && refStorage === "reftable") {
     throw new UnsupportedObjectFormatError("reftable refs", objectFormat.name);
@@ -281,17 +281,15 @@ export async function createGitFilesBackend(
     ...settingsOptions,
     config: settingsConfig,
   });
-  const packs = refusePackWritesInFormat(
-    await openPackSet(files, packDir, {
-      externalBase: (id) => looseOnly.get(id),
-      freshenMaxAgeMs,
-      baseCacheBytes: packSettings.baseCacheBytes,
-      multiPackIndex: packSettings.multiPackIndex,
-      writeReverseIndex: packSettings.writeReverseIndex,
-      readReverseIndex: packSettings.readReverseIndex,
-    }),
-    objectFormat,
-  );
+  const packs = await openPackSet(files, packDir, {
+    externalBase: (id) => looseOnly.get(id),
+    freshenMaxAgeMs,
+    baseCacheBytes: packSettings.baseCacheBytes,
+    multiPackIndex: packSettings.multiPackIndex,
+    writeReverseIndex: packSettings.writeReverseIndex,
+    readReverseIndex: packSettings.readReverseIndex,
+    ...(objectFormat.name === "sha1" ? {} : { objectFormat }),
+  });
   // the alternates (git's other odb sources): read after the repository's own objects, never
   // written; an object one holds is not written here (odb_freshen_object)
   const alternates =

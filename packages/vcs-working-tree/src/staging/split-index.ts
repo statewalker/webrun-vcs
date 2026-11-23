@@ -24,6 +24,7 @@ import { readFile } from "@statewalker/vcs-core";
 import { bytesToHex } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import { type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { Ewah } from "../status/untracked-cache.js";
 import {
   IndexCorruptError,
@@ -35,9 +36,6 @@ import {
 } from "./index-format.js";
 import type { StagingEntry } from "./types.js";
 
-/** The all-zero object id: a `link` naming no shared index. */
-const NULL_ID = "0".repeat(40);
-
 /** A `link` extension: the shared index's id and the bitmaps over its entries. */
 export interface LinkExtension {
   /** The shared index's checksum, hex (all zeros: none) */
@@ -48,12 +46,15 @@ export interface LinkExtension {
   replaced?: number[];
 }
 
-/** git's `read_link_extension`. */
-export function parseLinkExtension(data: Uint8Array): LinkExtension {
-  if (data.length < 20) throw new Error("corrupt link extension (too short)");
-  const baseId = bytesToHex(data.subarray(0, 20));
-  if (data.length === 20) return { baseId };
-  const del = Ewah.read(data, 20, data.length);
+/**
+ * git's `read_link_extension`: the shared index's id is `rawLength` bytes (20 SHA-1, 32 in a
+ * SHA-256 repository).
+ */
+export function parseLinkExtension(data: Uint8Array, rawLength = 20): LinkExtension {
+  if (data.length < rawLength) throw new Error("corrupt link extension (too short)");
+  const baseId = bytesToHex(data.subarray(0, rawLength));
+  if (data.length === rawLength) return { baseId };
+  const del = Ewah.read(data, rawLength, data.length);
   if (!del) throw new Error("corrupt delete bitmap in link extension");
   const rep = Ewah.read(data, del.next, data.length);
   if (!rep) throw new Error("corrupt replace bitmap in link extension");
@@ -61,10 +62,23 @@ export function parseLinkExtension(data: Uint8Array): LinkExtension {
   return { baseId, deleted: [...del.bitmap.bits()], replaced: [...rep.bitmap.bits()] };
 }
 
-/** git's `write_link_extension`: the shared index's id, then the delete and replace bitmaps. */
-export function encodeLinkExtension(baseId: string, deleted: Ewah, replaced: Ewah): Uint8Array {
+/**
+ * git's `write_link_extension`: the shared index's id (`rawLength` bytes: 20, or 32 in a
+ * SHA-256 repository; another width is refused), then the delete and replace bitmaps.
+ */
+export function encodeLinkExtension(
+  baseId: string,
+  deleted: Ewah,
+  replaced: Ewah,
+  rawLength = 20,
+): Uint8Array {
+  if (baseId.length !== 2 * rawLength || !/^[0-9a-f]+$/.test(baseId)) {
+    throw new Error(`not a ${rawLength}-byte shared index id: ${JSON.stringify(baseId)}`);
+  }
   const out: number[] = [];
-  for (let i = 0; i < 40; i += 2) out.push(Number.parseInt(baseId.slice(i, i + 2), 16));
+  for (let i = 0; i < baseId.length; i += 2) {
+    out.push(Number.parseInt(baseId.slice(i, i + 2), 16));
+  }
   deleted.serialize(out);
   replaced.serialize(out);
   return Uint8Array.from(out);
@@ -124,6 +138,7 @@ export async function readSharedIndex(
   id: string,
   indexDir: string = gitDir,
   verifyChecksum = false,
+  objectFormat: ObjectFormat = SHA1_OBJECT_FORMAT,
 ): Promise<SharedIndex> {
   let path = sharedIndexPath(gitDir, id);
   if ((await files.stats(path))?.kind !== "file") {
@@ -139,8 +154,8 @@ export async function readSharedIndex(
     const data = await readFile(files, path);
     // read_index_from of the shared index: hashed only in fsck (verify_hdr), its trailer
     // compared with the link's id below
-    const parsed = await parseIndexFile(data, { keepEncoding: true, verifyChecksum });
-    const got = bytesToHex(data.subarray(data.length - 20));
+    const parsed = await parseIndexFile(data, { keepEncoding: true, verifyChecksum, objectFormat });
+    const got = bytesToHex(data.subarray(data.length - objectFormat.rawLength));
     if (got !== id) {
       const message = `broken index, expect ${id} in ${sharedIndexPath(gitDir, id)}, got ${got}`;
       throw new IndexCorruptError(message, [`fatal: ${message}`]);
@@ -344,6 +359,8 @@ export function tooManyNotSharedEntries(
 export function prepareSplitWrite(
   classification: SplitClassification,
   sharedId: string,
+  /** bytes of the shared index's id: 20, or 32 in a SHA-256 repository */
+  rawLength = 20,
 ): { items: OrderedIndexItem[]; link: Uint8Array } {
   const deleted = new Ewah();
   const replaced = new Ewah();
@@ -358,7 +375,7 @@ export function prepareSplitWrite(
     }
   }
   for (const entry of added) items.push({ entry, path: entry.path });
-  return { items, link: encodeLinkExtension(sharedId, deleted, replaced) };
+  return { items, link: encodeLinkExtension(sharedId, deleted, replaced, rawLength) };
 }
 
 /** After a split write: the entries remember where they stand in the shared index. */
@@ -380,5 +397,5 @@ export function adoptSharedIndex(shared: SharedIndex): void {
 
 /** Whether an id is the all-zero id (a link without a shared index). */
 export function isNullIndexId(id: string): boolean {
-  return id === NULL_ID;
+  return /^0+$/.test(id) && (id.length === 40 || id.length === 64);
 }
