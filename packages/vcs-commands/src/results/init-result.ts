@@ -27,6 +27,9 @@ export interface InitResult {
    */
   hints?: string[];
 
+  /** git's warnings (stderr lines): `re-init: ignored --initial-branch=<name>` */
+  warnings?: string[];
+
   /** Whether this is a bare repository */
   bare: boolean;
 

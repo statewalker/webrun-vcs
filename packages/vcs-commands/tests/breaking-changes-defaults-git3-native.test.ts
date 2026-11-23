@@ -79,7 +79,11 @@ async function oursInit(
   try {
     const result = await init.call();
     const head = execFileSync("git", ["symbolic-ref", "HEAD"], { cwd: dir, env, encoding: "utf8" });
-    return { exit: 0, head: head.trim(), stderr: result.hints ?? [] };
+    return {
+      exit: 0,
+      head: head.trim(),
+      stderr: [...(result.warnings ?? []), ...(result.hints ?? [])],
+    };
   } catch (error) {
     return {
       exit: 128,
@@ -96,7 +100,9 @@ function nativeInit(bin: string, dir: string, env: Record<string, string>, branc
     ["init", ...(branch !== undefined ? ["-b", branch] : []), dir],
     env,
   );
-  const stderr = out.stderr.filter((l) => !l.startsWith("Initialized empty"));
+  const stderr = out.stderr.filter(
+    (l) => !l.startsWith("Initialized empty") && !l.startsWith("Reinitialized existing"),
+  );
   if (out.exit !== 0) return { exit: out.exit, head: "", stderr };
   const head = execFileSync(bin, ["symbolic-ref", "HEAD"], { cwd: dir, env, encoding: "utf8" });
   return { exit: 0, head: head.trim(), stderr };
@@ -128,6 +134,31 @@ describe("the initial branch of a new repository (git 2.x)", () => {
     const ours = await oursInit(fresh("o"), e, false);
     expect(ours.stderr).toEqual([]);
     if (native25x) expect(ours).toEqual(nativeInit("git", fresh("n"), e));
+  });
+
+  it("refuses an empty or valueless init.defaultBranch as git", async () => {
+    const empty = withConfig(env(), [["init.defaultBranch", ""]]);
+    expect(await oursInit(fresh("o"), empty, false)).toEqual(nativeInit("git", fresh("n"), empty));
+    const global = join(root, `global-${n++}`);
+    writeFileSync(global, "[init]\n\tdefaultBranch\n");
+    const valueless = { ...env(), GIT_CONFIG_GLOBAL: global };
+    const ours = await oursInit(fresh("o"), valueless, false);
+    expect(ours).toEqual(nativeInit("git", fresh("n"), valueless));
+    expect(ours.exit).toBe(128);
+  });
+
+  it("re-initialising keeps HEAD: no name is checked, -b is ignored with git's warning", async () => {
+    const theirs = fresh("n");
+    const ours = fresh("o");
+    nativeInit("git", theirs, env(), "keep");
+    await oursInit(ours, env(), false, "keep");
+    expect(await oursInit(ours, env(), false, "a..b")).toEqual(
+      nativeInit("git", theirs, env(), "a..b"),
+    );
+    const bad = withConfig(env(), [["init.defaultBranch", "a..b"]]);
+    const again = await oursInit(ours, bad, false);
+    expect(again).toEqual(nativeInit("git", theirs, bad));
+    expect(again).toMatchObject({ exit: 0, head: "refs/heads/keep" });
   });
 
   it("refuses an invalid init.defaultBranch or --initial-branch as git", async () => {

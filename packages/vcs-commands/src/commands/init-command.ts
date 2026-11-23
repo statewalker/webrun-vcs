@@ -250,18 +250,23 @@ export class InitCommand {
     this.checkCallable();
     this.setCallable(false);
 
-    // git's -b / init.defaultBranch / built-in default (repo_default_branch_name); an invalid
-    // name dies before anything is created
-    if (this.initialBranch !== undefined && !isValidBranchName(this.initialBranch)) {
-      throw new InvalidInitialBranchError(this.initialBranch);
-    }
-    const chosen =
-      this.initialBranch !== undefined
-        ? { name: this.initialBranch }
-        : await defaultInitialBranch(this.environment);
-    const initialBranch = chosen.name;
-    // re-initialising an existing repository keeps its HEAD and prints no hint
-    let hints = chosen.hint;
+    // git's -b / init.defaultBranch / built-in default (repo_default_branch_name), worked out
+    // only for a repository without HEAD (create_reference_database runs only then): an
+    // existing repository keeps its HEAD, ignores -b with a warning and checks no name
+    let initialBranch = "";
+    let hints: string[] | undefined;
+    const warnings: string[] = [];
+    const chooseBranch = async () => {
+      if (this.initialBranch !== undefined && !isValidBranchName(this.initialBranch)) {
+        throw new InvalidInitialBranchError(this.initialBranch);
+      }
+      const chosen =
+        this.initialBranch !== undefined
+          ? { name: this.initialBranch }
+          : await defaultInitialBranch(this.environment);
+      initialBranch = chosen.name;
+      hints = chosen.hint;
+    };
 
     // Use in-memory FilesApi if none provided
     const files = this.files ?? createInMemoryFilesApi();
@@ -284,7 +289,10 @@ export class InitCommand {
       // A repository with a config but no HEAD (damaged or half-made) is opened, not
       // re-created: creating rewrites the config, and its remotes and settings with it.
       const fresh = !hasHead && !(await isFile(`${dir}/config`));
-      if (!fresh) hints = undefined;
+      if (!hasHead) await chooseBranch();
+      else if (this.initialBranch !== undefined) {
+        warnings.push(`warning: re-init: ignored --initial-branch=${this.initialBranch}`);
+      }
       const open = (create: boolean) =>
         createGitFilesHistoryFromFiles({
           files: repoFiles,
@@ -303,6 +311,14 @@ export class InitCommand {
         history = await open(fresh);
       }
       await history.initialize();
+      if (hasHead) {
+        // the branch an existing repository's HEAD names (empty when detached)
+        const head = await history.refs.get("HEAD");
+        initialBranch =
+          head && "target" in head && head.target.startsWith("refs/heads/")
+            ? head.target.slice("refs/heads/".length)
+            : "";
+      }
       if (fresh) {
         // git init's probe: a filesystem that folds case or Unicode composition
         const folding = await probeCaseFolding(repoFiles as PosixFilesApi, dir);
@@ -327,6 +343,7 @@ export class InitCommand {
         staging = fileStaging;
       }
     } else {
+      await chooseBranch();
       history = createMemoryHistory();
       await history.initialize();
       // Set initial branch by creating symbolic ref for HEAD
@@ -428,6 +445,7 @@ export class InitCommand {
       repository: history,
       initialBranch,
       ...(hints ? { hints } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
       bare: this.bare,
       gitDir,
     };

@@ -33,6 +33,24 @@ export class InvalidDefaultBranchError extends Error {
   }
 }
 
+/**
+ * `init.defaultBranch` without a value (`[init] defaultBranch`): git's config parser dies
+ * (`missing value`, then the variable's location), exit 128.
+ */
+export class MissingDefaultBranchValueError extends Error {
+  override name = "MissingDefaultBranchValueError";
+  readonly lines: string[];
+  constructor(file?: string, line?: number) {
+    const fatal =
+      file !== undefined && line !== undefined
+        ? `fatal: bad config variable 'init.defaultbranch' in file '${file}' at line ${line}`
+        : "fatal: unable to parse 'init.defaultbranch' from command-line config";
+    const lines = ["error: missing value for 'init.defaultbranch'", fatal];
+    super(lines.join("\n"));
+    this.lines = lines;
+  }
+}
+
 /** `--initial-branch` names no valid branch: git dies (exit 128). */
 export class InvalidInitialBranchError extends Error {
   override name = "InvalidInitialBranchError";
@@ -53,7 +71,8 @@ export function isValidBranchName(name: string): boolean {
  * The initial branch of a repository created now. Reads the protected configuration (the
  * repository's own does not exist yet); without an environment, nothing is configured.
  *
- * @throws InvalidDefaultBranchError when `init.defaultBranch` names no valid branch
+ * @throws InvalidDefaultBranchError when `init.defaultBranch` names no valid branch (empty too)
+ * @throws MissingDefaultBranchValueError when `init.defaultBranch` has no value
  */
 export async function defaultInitialBranch(
   environment: GitHostEnvironment | undefined,
@@ -61,7 +80,11 @@ export async function defaultInitialBranch(
   const config = await readProtectedConfig(environment);
   const last = (key: string) => config.filter((e) => e.key === key).at(-1);
   const configured = last("init.defaultbranch");
-  if (configured?.value !== undefined && configured.value !== "") {
+  if (configured && configured.value === undefined) {
+    throw new MissingDefaultBranchValueError(configured.file, configured.line);
+  }
+  if (configured?.value !== undefined) {
+    // an empty value is no branch name either: git dies on it
     if (!isValidBranchName(configured.value)) {
       throw new InvalidDefaultBranchError(configured.value);
     }
@@ -92,6 +115,8 @@ function defaultBranchHint(name: string, breakingChanges: boolean | undefined): 
       "'development'. The just-created branch can be renamed via this command:\n" +
       "\n" +
       "\tgit branch -m <name>\n";
-  const withOff = `${text}\nDisable this message with "git config set --global advice.defaultBranchName false"`;
+  // released 2.5x says `git config set advice...`; git master (the 3.0 build) adds `--global`
+  const scope = breakingChanges ? "--global " : "";
+  const withOff = `${text}\nDisable this message with "git config set ${scope}advice.defaultBranchName false"`;
   return withOff.split("\n").map((line) => (line === "" ? "hint:" : `hint: ${line}`));
 }

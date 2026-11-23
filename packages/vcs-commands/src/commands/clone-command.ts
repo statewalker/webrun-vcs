@@ -899,8 +899,11 @@ export class CloneCommand extends TransportCommand<CloneResult> {
 
     const cloneResult: CloneResult = {
       fetchResult,
+      // as the empty-remote case above: the local HEAD's branch, else git's default
       defaultBranch:
-        defaultBranch ?? (await defaultInitialBranch(hostEnvironmentOf(this._workingCopy))).name,
+        defaultBranch ??
+        (await this.localHeadBranch()) ??
+        (await defaultInitialBranch(hostEnvironmentOf(this._workingCopy))).name,
       remoteName: this.remoteName,
       bare: this.bare,
       headCommit,
