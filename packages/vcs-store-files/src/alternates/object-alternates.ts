@@ -39,8 +39,9 @@ import {
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
-import { skipPacked, withPacks } from "../pack/index.js";
+import { assertNoPacksInFormat, skipPacked, withPacks } from "../pack/index.js";
 import { createFileRefStore } from "../refs/index.js";
 import { filesStagingStore } from "../storage/loose/files-staging-store.js";
 import { HostPaths, hostRootOf } from "../workspace/git-dir/index.js";
@@ -54,7 +55,7 @@ import { parseAlternates } from "./parse-alternates.js";
 
 /** git's limit on nested alternates (`depth + 1 > 5`). */
 export const MAX_ALTERNATE_DEPTH = 5;
-const OID = /^[0-9a-f]{40}$/;
+const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** Options of {@link openObjectAlternates}. */
 export interface ObjectAlternatesOptions {
@@ -90,6 +91,8 @@ export interface ObjectAlternatesOptions {
   readConfig?: () => Promise<{ get(key: string): unknown }>;
   /** Each of git's error lines (`error: ...`) while the alternates are read */
   onError?: (line: string) => void;
+  /** The repository's object format: the alternates' objects are named in it (default SHA-1) */
+  objectFormat?: ObjectFormat;
 }
 
 /**
@@ -189,13 +192,19 @@ export async function openObjectAlternates(
 
   const openSource = async (dir: string): Promise<Source> => {
     const { freshenMaxAgeMs } = options;
+    const objectFormat = options.objectFormat ?? SHA1_OBJECT_FORMAT;
+    // a SHA-256 alternate's packs are not read yet (see assertNoPacksInFormat)
+    await assertNoPacksInFormat(files, joinPath(dir, "pack"), objectFormat);
     const staging = filesStagingStore(files, dir, { freshenMaxAgeMs });
-    const looseOnly = createGitObjects(staging);
+    const looseOnly = createGitObjects(staging, { objectFormat });
     const packs: PackSet = await openPackSet(files, joinPath(dir, "pack"), {
       externalBase: (id) => looseOnly.get(id),
       freshenMaxAgeMs,
     });
-    const objects = withPacks(createGitObjects(skipPacked(staging, packs)), packs);
+    const objects = withPacks(
+      createGitObjects(skipPacked(staging, packs), { objectFormat }),
+      packs,
+    );
     return {
       path: display(dir),
       objectsDir: dir,

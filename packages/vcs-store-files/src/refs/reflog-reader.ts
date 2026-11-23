@@ -115,8 +115,9 @@ export function parseReflogLine(line: string): ReflogEntry | undefined {
   const newId = header.slice(firstSpace + 1, secondSpace);
   const identStr = header.slice(secondSpace + 1);
 
-  // Validate object IDs (40 hex characters)
-  if (oldId.length !== 40 || newId.length !== 40) return undefined;
+  // Validate object IDs (40 hex characters; 64 in a SHA-256 repository)
+  if (oldId.length !== newId.length || (oldId.length !== 40 && oldId.length !== 64))
+    return undefined;
 
   try {
     const who = parsePersonIdent(identStr);

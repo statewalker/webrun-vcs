@@ -111,7 +111,7 @@ export class FileRefStore implements Refs {
     return text
       .split("\n")
       .map((line) => line.toLowerCase())
-      .filter((line) => /^[0-9a-f]{40}$/.test(line))
+      .filter((line) => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(line))
       .sort();
   }
 

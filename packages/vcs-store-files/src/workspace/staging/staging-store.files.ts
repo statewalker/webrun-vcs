@@ -2,6 +2,7 @@ import type { ObjectId, TreeEntry, Trees } from "@statewalker/vcs-core";
 import { FileMode, type FilesApi } from "@statewalker/vcs-core";
 import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { tryReadFile } from "@statewalker/vcs-utils/files";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type {
   CacheTree,
   IndexBuilder,
@@ -39,6 +40,7 @@ import {
   verifyTreePaths,
 } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "../../create-git-files-backend.js";
+import { readRepositoryFormat } from "../../repository-format.js";
 import { HostPaths, isAbsoluteGitPath, parseCommonDir } from "../git-dir/index.js";
 
 /**
@@ -71,10 +73,13 @@ export class FileStagingStore implements Staging {
     private readonly indexPath: string,
     options: GitStagingOptions = {},
   ) {
+    const gitDir = options.gitDir ?? dirOf(indexPath);
     this.indexFile = new IndexFile(files, indexPath, {
       ...options,
-      defaultTrees:
-        options.defaultTrees ?? lazyRepositoryTrees(files, options.gitDir ?? dirOf(indexPath)),
+      defaultTrees: options.defaultTrees ?? lazyRepositoryTrees(files, gitDir),
+      // a SHA-256 repository's index (32-byte ids) is refused: read from its config when the
+      // first read or write comes
+      objectFormat: options.objectFormat ?? (() => repositoryObjectFormat(files, gitDir)),
     });
   }
 
@@ -1169,6 +1174,22 @@ function lazyRepositoryTrees(files: FilesApi, gitDir: string): Pick<Trees, "load
     load: async (id) => (await trees()).load(id),
     store: async (entries) => (await trees()).store(entries),
   };
+}
+
+/**
+ * The object format of the repository whose git directory is `gitDir` (its common directory's
+ * config); undefined when the config cannot be read or its format is refused anyway (the
+ * repository cannot be opened then, and the index is left to fail as before).
+ */
+async function repositoryObjectFormat(
+  files: FilesApi,
+  gitDir: string,
+): Promise<ObjectFormat | undefined> {
+  try {
+    return (await readRepositoryFormat(files, await commonDirOf(files, gitDir))).objectFormat;
+  } catch {
+    return undefined;
+  }
 }
 
 /** git's `get_common_dir_noenv` of `gitDir`, as a FilesApi path. */

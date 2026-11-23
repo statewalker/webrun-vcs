@@ -52,6 +52,7 @@ import {
 } from "@statewalker/vcs-core";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
+import { nullObjectIdLike } from "@statewalker/vcs-utils/hash";
 import { parseReflogLine } from "./reflog-reader.js";
 
 const enc = new TextEncoder();
@@ -239,10 +240,12 @@ function parsePacked(text: string | undefined): Map<string, PackedEntry> {
       }
       continue;
     }
-    if (line.indexOf(" ") !== 40) throw new Error(`malformed packed-refs line: ${line}`);
-    const name = line.slice(41);
+    // a SHA-1 id (40 hex digits) or a SHA-256 one (64)
+    const space = line.indexOf(" ");
+    if (space !== 40 && space !== 64) throw new Error(`malformed packed-refs line: ${line}`);
+    const name = line.slice(space + 1);
     last = {
-      id: line.slice(0, 40).toLowerCase(),
+      id: line.slice(0, space).toLowerCase(),
       known: fully || (tags && name.startsWith("refs/tags/")),
     };
     out.set(name, last);
@@ -489,7 +492,7 @@ export function createFilesRefOps(
     const sym = /^ref:\s*(\S+)/.exec(text);
     if (sym) return { target: sym[1] as string };
     // git's parse_oid_hex reads either case; the id is kept lowercase, as git writes it
-    const m = /^([0-9a-fA-F]{40})(?:\s|$)/.exec(text);
+    const m = /^([0-9a-fA-F]{64}|[0-9a-fA-F]{40})(?:\s|$)/.exec(text);
     if (!m) throw new Error(`${name} is broken: ${JSON.stringify(text.slice(0, 50))}`);
     return { id: (m[1] as string).toLowerCase() };
   }
@@ -684,8 +687,10 @@ export function createFilesRefOps(
     const append = appendLog;
     for (const u of updates) {
       try {
-        const old = current(u) ?? ZERO_ID;
-        const next = u.newValue ?? ZERO_ID;
+        const known = current(u);
+        // the null id of the repository's format: as long as the other side's id
+        const old = known ?? nullObjectIdLike(u.newValue ?? undefined);
+        const next = u.newValue ?? nullObjectIdLike(known);
         const text = u.message !== undefined ? normalizeMessage(u.message) : message;
         const line = encodeGitPath(`${old} ${next} ${ident}${text ? `\t${text}` : ""}\n`);
         if (u.newValue === null) {
@@ -1800,7 +1805,15 @@ export function createFilesRefOps(
       const lines = text
         .split("\n")
         .filter((l) => l !== "" && parseReflogLine(l) !== undefined)
-        .map((l) => ({ oldId: l.slice(0, 40), newId: l.slice(41, 81), rest: l.slice(81) }));
+        .map((l) => {
+          // ids of the repository's format: 40 hex digits, or 64 (SHA-256)
+          const n = l.indexOf(" ");
+          return {
+            oldId: l.slice(0, n),
+            newId: l.slice(n + 1, 2 * n + 1),
+            rest: l.slice(2 * n + 1),
+          };
+        });
       const kept = deleteReflogLine(lines, index, o.rewrite);
       if (!kept) throw new ReflogEntryNotFoundError(name, index);
       const out = kept.map((l) => `${l.oldId} ${l.newId}${l.rest}\n`).join("");

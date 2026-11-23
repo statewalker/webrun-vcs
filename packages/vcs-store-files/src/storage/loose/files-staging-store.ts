@@ -37,7 +37,8 @@ import {
 } from "@statewalker/vcs-utils/files";
 
 const FANOUT = /^[0-9a-f]{2}$/;
-const REST = /^[0-9a-f]{38}$/;
+/** A loose object file's name: the id after its fan-out directory (SHA-1 or SHA-256) */
+const REST = /^(?:[0-9a-f]{38}|[0-9a-f]{62})$/;
 const TMP_PREFIX = "tmp_obj_";
 /** git's freshen window, as `PackSet`'s `freshenMaxAgeMs`. */
 const DEFAULT_FRESHEN_MAX_AGE_MS = 60 * 60 * 1000;

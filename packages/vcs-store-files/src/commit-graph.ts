@@ -20,12 +20,14 @@ import {
   joinPath,
   loadRepositoryCommitGraph,
   type ObjectId,
+  objectFormatOf,
   type Refs,
   readCommitGraph,
   type WriteCommitGraphFileResult,
   writeCommitGraphFile,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
+import { assertSha1ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { readAllRefs } from "./refs/index.js";
@@ -152,7 +154,7 @@ export interface WriteCommitGraphOptions {
   /** Path of the `.git` directory within `files` (default ".git") */
   gitDir?: string;
   /** The object kernel commits and trees are read from */
-  objects: Pick<GitObjects, "get">;
+  objects: Pick<GitObjects, "get" | "objectFormat">;
   /** The refs (`--reachable` starts from each of them, and `refs/replace/` disables the graph) */
   refs: Refs;
   /** The provider to invalidate after writing (the commit store's) */
@@ -208,6 +210,8 @@ export async function writeCommitGraph(
   options: WriteCommitGraphOptions,
 ): Promise<WriteCommitGraphFileResult> {
   const { files, objects, refs } = options;
+  // a SHA-256 repository's commit-graph (32-byte ids) is not written yet
+  assertSha1ObjectFormat(objectFormatOf(objects), "the commit-graph");
   const gitDir = options.gitDir ?? ".git";
   const objectsDir = joinPath(gitDir, "objects");
   const settings = await readCommitGraphSettings(files, gitDir, {

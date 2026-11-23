@@ -10,15 +10,23 @@
  * ignores every other extension, except the version-1 ones, which it refuses; version 1
  * refuses any extension it does not know; a version above 1 is refused.
  *
- * Beyond git's own check, what git knows but we do not implement is refused too: sha256
- * objects (`extensions.objectFormat = sha256`) and a compatibility object format
- * (`extensions.compatObjectFormat`). The reftable ref storage (`extensions.refStorage =
+ * Beyond git's own check, what git knows but we do not implement is refused too: a
+ * compatibility object format (`extensions.compatObjectFormat`). A SHA-256 repository
+ * (`extensions.objectFormat = sha256`) opens: its objects, refs and reflogs are read and
+ * written with 32-byte ids; what has no SHA-256 path yet (pack files, the index file, the
+ * commit-graph, the transports) refuses with `UnsupportedObjectFormatError`. The reftable ref storage (`extensions.refStorage =
  * reftable`) is read; its writes are refused by its ref store (`ReftableRefStore`), and so is
  * deleting objects there (`assertObjectsDeletable`: gc's reachability reads reflogs as files).
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
+import {
+  assertSha1ObjectFormat,
+  type ObjectFormat,
+  objectFormatByName,
+  SHA1_OBJECT_FORMAT,
+} from "@statewalker/vcs-utils/hash";
 
 import { ReftableWriteUnsupportedError } from "./refs/reftable/index.js";
 
@@ -53,6 +61,11 @@ export interface RepositoryFormat {
    * `ReftableWriteUnsupportedError`)
    */
   refStorage: "files" | "reftable";
+  /**
+   * `extensions.objectFormat` (version 1): the hash naming the objects, SHA-1 (the default)
+   * or SHA-256
+   */
+  objectFormat: ObjectFormat;
 }
 
 /** A repository whose format version or extensions we cannot read or write safely. */
@@ -96,6 +109,7 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
     worktreeConfig: false,
     relativeWorktrees: false,
     refStorage: "files",
+    objectFormat: SHA1_OBJECT_FORMAT,
   };
   const unknown: string[] = [];
   const v1Only: string[] = [];
@@ -125,13 +139,14 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
       case "noop-v1":
         break;
       case "objectformat": {
-        const name = String(value);
-        if (name !== "sha1" && name !== "sha256") {
+        // git's hash_algo_by_name: the name exactly as git spells it
+        const found = typeof value === "string" ? objectFormatByName(value) : undefined;
+        if (!found) {
           throw new UnsupportedRepositoryFormatError(
             `invalid value for 'extensions.objectformat': '${String(value)}'`,
           );
         }
-        if (name !== "sha1") unsupported.push(`extensions.objectFormat = ${name}`);
+        format.objectFormat = found;
         break;
       }
       case "compatobjectformat": {
@@ -178,7 +193,7 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
   }
   if (unsupported.length > 0) {
     throw new UnsupportedRepositoryFormatError(
-      `repository format not supported by webrun-vcs (sha1 objects only):${unsupported.map((e) => `\n\t${e}`).join("")}`,
+      `repository format not supported by webrun-vcs:${unsupported.map((e) => `\n\t${e}`).join("")}`,
     );
   }
   if (format.partialClone === undefined) {
@@ -256,6 +271,8 @@ export function assertObjectsDeletable(
     // repository they would miss what only the reftable reflogs keep
     throw new ReftableWriteUnsupportedError();
   }
+  // the reachability walks, repack and prune read packs, the index and reflogs as SHA-1 ids
+  assertSha1ObjectFormat(format.objectFormat, operation);
   if (format.preciousObjects) {
     throw new UnsupportedRepositoryFormatError(
       `cannot ${operation} in a precious-objects repo (extensions.preciousObjects)`,

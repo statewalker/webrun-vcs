@@ -18,6 +18,7 @@ import {
   IndexFile,
   type IndexFilePending,
   type IndexHost,
+  type IndexObjectFormat,
   readIndexChecksum,
 } from "./index-file.js";
 import { INDEX_VERSION_2, type IndexVersion, reuseEntryEncoding } from "./index-format.js";
@@ -1054,6 +1055,11 @@ export interface GitStagingOptions {
   host?: IndexHost;
   /** The trees a sparse index expands from when no host gives any */
   defaultTrees?: Pick<Trees, "load" | "store">;
+  /**
+   * The repository's object format (or a lookup of it): an index of a repository whose objects
+   * are not SHA-1 is refused with `UnsupportedObjectFormatError` (its 32-byte ids are not read yet)
+   */
+  objectFormat?: IndexObjectFormat;
 }
 
 /**

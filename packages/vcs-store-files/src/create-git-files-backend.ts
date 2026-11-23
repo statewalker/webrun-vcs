@@ -16,6 +16,7 @@ import type {
   PackSet,
 } from "@statewalker/vcs-core";
 import {
+  createCommitGraphProvider,
   createGitObjects,
   createHistoryFromComponents,
   createObjectPromisor,
@@ -28,10 +29,18 @@ import {
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { AtomicFiles } from "@statewalker/vcs-utils/files";
+import { type ObjectFormat, UnsupportedObjectFormatError } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { openObjectAlternates, withAlternates } from "./alternates/index.js";
 import { createFilesCommitGraphProvider } from "./commit-graph.js";
-import { parseConfigInt, readPackSetSettings, skipPacked, withPacks } from "./pack/index.js";
+import {
+  assertNoPacksInFormat,
+  parseConfigInt,
+  readPackSetSettings,
+  refusePackWritesInFormat,
+  skipPacked,
+  withPacks,
+} from "./pack/index.js";
 import { beginFilesQuarantine } from "./quarantine/files-quarantine.js";
 import {
   createFileRefStore,
@@ -62,6 +71,12 @@ export interface GitFilesBackendOptions {
   gitDir?: string;
   /** Whether to create the .git directory structure if it doesn't exist (default: false) */
   create?: boolean;
+  /**
+   * The object format of a repository being created (`create`; default SHA-1, git's
+   * `--object-format`); written to its config as `extensions.objectFormat`. Opening an existing
+   * repository reads its own, and refuses another one given here.
+   */
+  objectFormat?: ObjectFormat;
   /** Default branch name when creating a new repository (default: "main") */
   defaultBranch?: string;
   /**
@@ -169,8 +184,11 @@ export interface GitFilesBackendResult {
  *
  * The repository's format is checked first, as git does (`readRepositoryFormat`): a
  * `core.repositoryformatversion` above 1, an unknown version-1 extension, or one we do not
- * implement (`extensions.refStorage = reftable`, `extensions.objectFormat = sha256`,
- * `extensions.compatObjectFormat`) throws `UnsupportedRepositoryFormatError`.
+ * implement (`extensions.compatObjectFormat`) throws `UnsupportedRepositoryFormatError`. A
+ * SHA-256 repository (`extensions.objectFormat = sha256`) opens with 32-byte object ids
+ * (`objects.objectFormat`); one holding packs, and every pack write into one, is refused with
+ * `UnsupportedObjectFormatError` until the pack formats read SHA-256 ids, and its
+ * commit-graph is not read.
  *
  * @example
  * ```typescript
@@ -197,11 +215,21 @@ export async function createGitFilesBackend(
   const objectsDir = joinPath(gitDir, "objects");
   const packDir = joinPath(objectsDir, "pack");
 
-  // git's check_repository_format: a version or extension we cannot honour (reftable refs,
-  // sha256 objects, an unknown v1 extension) is refused before anything is read or written.
+  // git's check_repository_format: a version or extension we cannot honour (a compatibility
+  // object format, an unknown v1 extension) is refused before anything is read or written.
   // Like git's read_repository_format it reads the config file alone, without includes.
   const format = await readRepositoryFormat(files, gitDir);
   if (format.refStorage === "reftable" && create) throw new ReftableWriteUnsupportedError();
+  // the hash naming the objects (`extensions.objectFormat`): SHA-1, or SHA-256 (whose packs
+  // are not read yet: a SHA-256 repository holding packs is refused here)
+  const objectFormat = options.objectFormat ?? format.objectFormat;
+  if (objectFormat.name !== format.objectFormat.name && !create) {
+    throw new UnsupportedObjectFormatError(
+      `opening a ${format.objectFormat.name} repository as ${objectFormat.name}`,
+      objectFormat.name,
+    );
+  }
+  await assertNoPacksInFormat(files, packDir, objectFormat);
   const includes = options.configIncludes === undefined ? {} : { includes: options.configIncludes };
   // the settings read below come from git's whole sequence (system, global, the repository's
   // file, config.worktree, the command line), as git's repo_config reads them; only the
@@ -212,7 +240,7 @@ export async function createGitFilesBackend(
   };
 
   if (create) {
-    await createGitDirectoryStructure(files, gitDir, objectsDir);
+    await createGitDirectoryStructure(files, gitDir, objectsDir, objectFormat);
   }
 
   // Objects: the installed packs first, then the kernel over git's loose layout
@@ -225,7 +253,7 @@ export async function createGitFilesBackend(
     freshenMaxAgeMs,
     cacheDirectoryChecks: true,
   });
-  const looseOnly = createGitObjects(staging);
+  const looseOnly = createGitObjects(staging, { objectFormat });
   // git's core.deltaBaseCacheLimit (96 MiB when unset) and core.multiPackIndex (default on)
   // one load of the sequence for the pack and ref store settings (nothing writes the config
   // in between: a created repository's is written above)
@@ -239,14 +267,17 @@ export async function createGitFilesBackend(
     ...settingsOptions,
     config: settingsConfig,
   });
-  const packs = await openPackSet(files, packDir, {
-    externalBase: (id) => looseOnly.get(id),
-    freshenMaxAgeMs,
-    baseCacheBytes: packSettings.baseCacheBytes,
-    multiPackIndex: packSettings.multiPackIndex,
-    writeReverseIndex: packSettings.writeReverseIndex,
-    readReverseIndex: packSettings.readReverseIndex,
-  });
+  const packs = refusePackWritesInFormat(
+    await openPackSet(files, packDir, {
+      externalBase: (id) => looseOnly.get(id),
+      freshenMaxAgeMs,
+      baseCacheBytes: packSettings.baseCacheBytes,
+      multiPackIndex: packSettings.multiPackIndex,
+      writeReverseIndex: packSettings.writeReverseIndex,
+      readReverseIndex: packSettings.readReverseIndex,
+    }),
+    objectFormat,
+  );
   // the alternates (git's other odb sources): read after the repository's own objects, never
   // written; an object one holds is not written here (odb_freshen_object)
   const alternates =
@@ -257,6 +288,7 @@ export async function createGitFilesBackend(
           gitDir,
           objectsDir,
           freshenMaxAgeMs,
+          objectFormat,
           ...(options.environment ? { environment: options.environment } : {}),
           ...(options.alternatesFromEnvironment === false ? { honorEnvironment: false } : {}),
           ...(options.workTree !== undefined ? { workTree: options.workTree } : {}),
@@ -276,7 +308,7 @@ export async function createGitFilesBackend(
       commitGraph.invalidate();
     };
   }
-  const loose = createGitObjects(skipPacked(staging, packs, alternates));
+  const loose = createGitObjects(skipPacked(staging, packs, alternates), { objectFormat });
   const local = withPacks(loose, packs);
   const stored = alternates ? withAlternates(local, alternates) : local;
   // a partial clone's absent objects: fetched from its promisor remote on a read (once a
@@ -333,18 +365,26 @@ export async function createGitFilesBackend(
   // HEAD as git init writes it (create_symref): `ref: …` into HEAD.lock, renamed over HEAD
   if (create) await refStore.setSymbolic("HEAD", `refs/heads/${defaultBranch}`);
 
-  // the commit-graph (objects/info/commit-graph or its split chain), read on first use
-  const commitGraph = createFilesCommitGraphProvider({
-    files,
-    gitDir,
-    refs: refStore,
-    environment: options.environment,
-    ...(options.configIncludes === undefined ? {} : { configIncludes: options.configIncludes }),
-    // git's prepare_commit_graph: the alternates' graphs after the repository's own
-    ...(alternates
-      ? { alternateObjectDirs: async () => (await alternates.list()).map((a) => a.objectsDir) }
-      : {}),
-  });
+  // the commit-graph (objects/info/commit-graph or its split chain), read on first use; a
+  // SHA-256 repository's is not read (its 32-byte ids are not read yet): walks read commits
+  const commitGraph =
+    objectFormat.name !== "sha1"
+      ? createCommitGraphProvider(async () => undefined)
+      : createFilesCommitGraphProvider({
+          files,
+          gitDir,
+          refs: refStore,
+          environment: options.environment,
+          ...(options.configIncludes === undefined
+            ? {}
+            : { configIncludes: options.configIncludes }),
+          // git's prepare_commit_graph: the alternates' graphs after the repository's own
+          ...(alternates
+            ? {
+                alternateObjectDirs: async () => (await alternates.list()).map((a) => a.objectsDir),
+              }
+            : {}),
+        });
   // (a reftable store never writes)
   if (!(refStore instanceof ReftableRefStore))
     invalidateOnCompatibilityChange(refStore, commitGraph);
@@ -430,6 +470,7 @@ async function createGitDirectoryStructure(
   files: FilesApi,
   gitDir: string,
   objectsDir: string,
+  objectFormat: ObjectFormat,
 ): Promise<void> {
   await files.mkdir(gitDir);
   await files.mkdir(objectsDir);
@@ -439,9 +480,13 @@ async function createGitDirectoryStructure(
   await files.mkdir(joinPath(gitDir, "refs", "tags"));
 
   const encoder = new TextEncoder();
+  // a SHA-256 repository is version 1 with `extensions.objectformat` (git's
+  // initialize_repository_version)
+  const sha1 = objectFormat.name === "sha1";
   await files.write(joinPath(gitDir, "config"), [
     encoder.encode(
-      `[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = ${gitDir === "." ? "true" : "false"}\n`,
+      `[core]\n\trepositoryformatversion = ${sha1 ? 0 : 1}\n\tfilemode = true\n\tbare = ${gitDir === "." ? "true" : "false"}\n` +
+        (sha1 ? "" : `[extensions]\n\tobjectformat = ${objectFormat.name}\n`),
     ),
   ]);
 }
