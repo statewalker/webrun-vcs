@@ -440,3 +440,50 @@ describe("the reftable ref store", () => {
     expect(await refs.get("HEAD")).toBeUndefined();
   });
 });
+
+describe("a crafted table cannot make the parser allocate without bound", () => {
+  /**
+   * Each record reuses its predecessor's whole key and adds one byte: a few bytes of table
+   * per record, a key copy as long as the key. Without a bound the copies are quadratic
+   * (a ~600 KiB table needed over 20 GB); the merge gate of statewalker/webrun-vcs#225.
+   */
+  function longPrefixTable(firstKey: number, records: number): Uint8Array {
+    const header = [0x52, 0x45, 0x46, 0x54, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const updateMax = [0, 0, 0, 0, 0, 0, 0, 1];
+    const head = [...header, ...updateMax];
+    const recs: number[] = [...varint(0), ...varint(firstKey * 8)];
+    for (let i = 0; i < firstKey; i++) recs.push(0x61);
+    recs.push(0); // update index delta of a deletion record
+    let length = firstKey;
+    for (let i = 0; i < records; i++) {
+      recs.push(...varint(length), ...varint(1 * 8), 0x61, 0);
+      length++;
+    }
+    const restart = [0, 0, 28, 0, 1]; // one restart, at the first record
+    const blockLen = head.length + 4 + recs.length + restart.length;
+    const block = [
+      0x72,
+      (blockLen >> 16) & 255,
+      (blockLen >> 8) & 255,
+      blockLen & 255,
+      ...recs,
+      ...restart,
+    ];
+    const footer = [...head, ...new Array(40).fill(0), 0, 0, 0, 0];
+    const bytes = Uint8Array.from([...head, ...block, ...footer]);
+    fixFooterCrc(bytes, head.length + block.length);
+    return bytes;
+  }
+
+  it("refuses keys that expand far past the table's own bytes", () => {
+    const bytes = longPrefixTable(2000, 30000);
+    const started = Date.now();
+    expect(() => parseReftable(bytes, "crafted.ref")).toThrow(/keys expand past 16x/);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it("still reads the same shape when it stays small", () => {
+    const table = parseReftable(longPrefixTable(20, 50), "small.ref");
+    expect(table.refs).toHaveLength(51);
+  });
+});

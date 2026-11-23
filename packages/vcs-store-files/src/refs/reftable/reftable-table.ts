@@ -166,6 +166,10 @@ interface Block {
  * not well formed and `ReftableUnsupportedError` for a SHA-256 table. `name` names the table in
  * those errors.
  */
+/** The key bytes a table may expand to: this many times its record bytes, plus the slack. */
+const MAX_KEY_BYTES_FACTOR = 16;
+const MAX_KEY_BYTES_SLACK = 1 << 20;
+
 export function parseReftable(bytes: Uint8Array, name = "<reftable>"): ReftableTable {
   const fail = (detail: string): never => {
     throw new ReftableFormatError(name, detail);
@@ -317,6 +321,12 @@ export function parseReftable(bytes: Uint8Array, name = "<reftable>"): ReftableT
    * Each record of a block: its key (prefix compressed against the previous one) and value
    * type, `decodeValue` reading the value; checks restarts start uncompressed keys.
    */
+  // The key bytes a table may make us keep: prefix compression lets each record repeat its
+  // whole predecessor for a few bytes, so a crafted table of a few hundred KiB could make
+  // the copies quadratic (gigabytes). Real tables keep well under twice their record bytes;
+  // the budget grows with the records read (inflated, for log blocks).
+  let keyBytes = 0;
+  let recordBytes = 0;
   const eachRecord = (
     block: Block,
     offset: number,
@@ -324,6 +334,7 @@ export function parseReftable(bytes: Uint8Array, name = "<reftable>"): ReftableT
   ): void => {
     const { data, recordsEnd, restarts } = block;
     let pos = block.recordsStart;
+    recordBytes += recordsEnd - block.recordsStart;
     let lastKey = new Uint8Array(0);
     let seen = 0;
     while (pos < recordsEnd) {
@@ -340,6 +351,10 @@ export function parseReftable(bytes: Uint8Array, name = "<reftable>"): ReftableT
       }
       if (prefix > lastKey.length) fail(`block at ${offset}: key prefix longer than the last key`);
       if (pos + suffix > recordsEnd) fail(`block at ${offset}: key runs past the records`);
+      keyBytes += prefix + suffix;
+      if (keyBytes > MAX_KEY_BYTES_FACTOR * recordBytes + MAX_KEY_BYTES_SLACK) {
+        fail(`block at ${offset}: keys expand past ${MAX_KEY_BYTES_FACTOR}x the table's records`);
+      }
       const key = new Uint8Array(prefix + suffix);
       key.set(lastKey.subarray(0, prefix));
       key.set(data.subarray(pos, pos + suffix), prefix);

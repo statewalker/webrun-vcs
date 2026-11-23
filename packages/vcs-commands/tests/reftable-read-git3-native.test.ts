@@ -381,6 +381,9 @@ describe.skipIf(!git3)("reading reftable repositories (git 3.0 oracle)", () => {
       await expect(git.checkout().setName("maint").call()).rejects.toBeInstanceOf(
         ReftableWriteUnsupportedError,
       );
+      // fsck reads reflogs and worktree HEADs as files: refused until it reads them from the
+      // reftable stack (statewalker-root#229), rather than misreport reflog-only objects
+      await expect(git.fsck().call()).rejects.toBeInstanceOf(ReftableWriteUnsupportedError);
       expect(snapshot(join(repo, ".git"))).toEqual(before);
       expect(readFileSync(join(repo, "file1.txt"), "utf8")).toBe(worktreeBefore);
       // native git still reads the repository as before
