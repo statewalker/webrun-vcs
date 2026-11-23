@@ -535,27 +535,4 @@ describeGit("commit -s, --trailer, --author, --date, -C: native twins", () => {
         .failed,
     ).toBe(true);
   });
-
-  // t3900-i18n-commit "commit with -C keeps the encoding" (read_commit_message's
-  // logmsg_reencode): a Latin-1 commit reused or amended in a UTF-8 repository
-  it("-C and --amend of a commit in another encoding: its message and author re-encoded", async () => {
-    const t = twins();
-    literalCommit(
-      t,
-      "latin",
-      "author Ren\xe9 <r@example.com> 1600000000 +0000\ncommitter C <c@example.com> 1600000000 +0000\nencoding ISO-8859-1\n",
-      Buffer.from("caf\xe9 cr\xe8me\n\nna\xefve body\n", "latin1"),
-    );
-    await expectCommit(t, ["-C", "latin"], (c) => c.setReuseMessage("latin"));
-    expect(message(t)).toBe("café crème\n\nnaïve body\n\n");
-    for (const repo of [t.native, t.ours]) {
-      gitOk(repo, envOf(), "checkout", "-q", "latin");
-      put(repo, "l.txt", "l\n");
-      gitOk(repo, envOf(), "add", "l.txt");
-    }
-    await expectCommit(t, ["--amend", "--no-edit"], (c) => c.setAmend(true).setEdit(false));
-    await expectCommit(t, ["--amend", "-s", "--no-edit"], (c) =>
-      c.setAmend(true).setSignoff(true).setEdit(false),
-    );
-  });
 });

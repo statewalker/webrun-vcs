@@ -585,22 +585,6 @@ function reencodeCommit(
   return lines.join("");
 }
 
-/**
- * read_commit_message's repo_logmsg_reencode into UTF-8 (`-C`, `--amend`, `--fixup`'s
- * commit): the message and author of a stored commit (`raw`: its bytes through
- * `decodeGitPath`) converted from its `encoding` header; undefined when nothing changes (no
- * header, a UTF-8 one, or bytes that do not convert, kept as stored as git keeps them).
- */
-export function reencodedCommitForReuse(
-  raw: string,
-): { message: string; author: PersonIdent | undefined } | undefined {
-  const reencoded = reencodeCommit(raw, parseRaw(raw));
-  if (reencoded === undefined) return undefined;
-  const parsed = parseRaw(reencoded);
-  const author = parsed.headerLines.find((l) => l.startsWith("author "));
-  return { message: parsed.body, author: author ? identOf(author) : undefined };
-}
-
 /** An `author`/`committer` header line's ident (`Name <email> time zone`) */
 function identOf(line: string): PersonIdent | undefined {
   const m = /^[a-z]+ (.*?) ?<([^>]*)> ?(\d*) ?([+-]?\d*)\n?$/.exec(line);
