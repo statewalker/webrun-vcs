@@ -23,12 +23,12 @@ import {
 } from "@statewalker/vcs-working-tree";
 
 import { Git } from "../git.js";
+import type { InitResult } from "../results/init-result.js";
 import {
   defaultInitialBranch,
   InvalidInitialBranchError,
   isValidBranchName,
 } from "./default-branch.js";
-import type { InitResult } from "../results/init-result.js";
 
 /**
  * Command to initialize a new Git repository.

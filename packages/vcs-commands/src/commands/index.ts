@@ -12,8 +12,10 @@ export * from "./checkout-paths.js";
 export * from "./cherry-pick-command.js";
 export * from "./clean-command.js";
 export * from "./clone-command.js";
+export * from "./comment-char-config.js";
 export * from "./commit-command.js";
 export * from "./date-format.js";
+export * from "./default-branch.js";
 export * from "./describe-command.js";
 export * from "./diff-command.js";
 export * from "./diff-textconv.js";
@@ -31,8 +33,6 @@ export {
   indexVersionConfigError,
   takeIndexWarnings,
 } from "./index-host.js";
-export * from "./comment-char-config.js";
-export * from "./default-branch.js";
 export * from "./init-command.js";
 export { httpBackendEnv, quarantineEnv, remoteHookSession } from "./local-transport.js";
 export * from "./log-command.js";
