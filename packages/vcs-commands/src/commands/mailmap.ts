@@ -115,6 +115,22 @@ export class Mailmap {
     }
   }
 
+  /**
+   * mailmap.c's map_user where it maps: the canonical name and email of an identity, or
+   * undefined when no entry gives either (git leaves the identity as written then).
+   */
+  lookup(name: string, email: string): { name: string; email: string } | undefined {
+    const entry = this.entries.get(fold(email));
+    if (!entry) return undefined;
+    let info: MailmapInfo = entry;
+    if (entry.names.size > 0) {
+      const sub = entry.names.get(fold(name));
+      if (sub) info = sub;
+    }
+    if (info.name === undefined && info.email === undefined) return undefined;
+    return { name: info.name ?? name, email: info.email ?? email };
+  }
+
   /** mailmap.c's map_user: the canonical name and email of an identity. */
   map(name: string, email: string): { name: string; email: string } {
     const entry = this.entries.get(fold(email));
