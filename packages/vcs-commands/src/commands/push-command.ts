@@ -430,6 +430,10 @@ export class PushCommand extends TransportCommand<PushResult> {
     this.checkCallable();
     this.setCallable(false);
 
+    // pushremote_get: a remote the configuration gives no URL may come from .git/remotes/ or
+    // .git/branches/ (git 2.x)
+    const legacyWarnings = await this.loadLegacyRemote(this.remote);
+    const warnings = legacyWarnings.length > 0 ? { warnings: legacyWarnings } : {};
     const remoteUrl = await this.resolveRemoteUrl(this.remote);
     if (!remoteUrl) {
       throw new InvalidRemoteError(this.remote);
@@ -440,7 +444,14 @@ export class PushCommand extends TransportCommand<PushResult> {
     const resolved = this.resolveRemote(remoteUrl);
     const refspecs = await this.buildRefSpecs();
     if (refspecs.length === 0) {
-      return { uri: remoteUrl, remoteUpdates: [], bytesSent: 0, objectCount: 0, messages: [] };
+      return {
+        uri: remoteUrl,
+        remoteUpdates: [],
+        bytesSent: 0,
+        objectCount: 0,
+        messages: [],
+        ...warnings,
+      };
     }
 
     const remote = await this.openRemote(resolved);
@@ -626,6 +637,7 @@ export class PushCommand extends TransportCommand<PushResult> {
       bytesSent: result.bytesSent,
       objectCount: result.packObjects,
       messages,
+      ...warnings,
       display: formatPushStatus(result, { dest: remoteUrl }),
       porcelain: formatPushStatus(result, { dest: remoteUrl, porcelain: true }),
       ...(trackingErrors.length ? { errors: trackingErrors } : {}),
@@ -726,7 +738,7 @@ export class PushCommand extends TransportCommand<PushResult> {
 
     const store = RemoteConfigStore.from(this.workingCopy);
     if (store.isConfigured(this.remote)) {
-      const configured = store.read(this.remote).pushRefspecs;
+      const configured = store.pushRefspecs(this.remote);
       if (configured.length > 0) return configured;
     }
     const mode = (store.value("push.default") ?? "simple").toLowerCase();

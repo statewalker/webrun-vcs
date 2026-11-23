@@ -26,6 +26,11 @@ export interface PullResult {
   successful: boolean;
   /** Fetch-from remote */
   fetchedFrom: string;
+  /**
+   * git's warnings, one message each: pull.c's `fetch updated the current branch head.`
+   * when the fetch moved the checked-out branch (a branches remote named after it)
+   */
+  warnings?: string[];
 }
 
 /**

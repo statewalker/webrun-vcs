@@ -46,6 +46,7 @@ import { RemoteConfigStore } from "../remote-config/index.js";
 import { applyRefspecs } from "./branch-tracking.js";
 import { configLoadError } from "./core-config.js";
 import { approxidateCareful, formatRfc2822Date } from "./git-date.js";
+import { loadLegacyRemote } from "./legacy-remotes.js";
 
 /** The stores a revision is read from. */
 export interface RevisionSources {
@@ -280,6 +281,8 @@ export class RevisionResolver {
       throw this.fatal(revision, `no upstream configured for branch '${name}'`);
     }
     const src = merges[0] ?? "";
+    // set_merge: remote_get reads a legacy remote (.git/remotes/, .git/branches/: git 2.x)
+    await loadLegacyRemote(this.sources.workingCopy, remote);
     let dst = applyRefspecs(config.configuredFetchRefspecs(remote), src);
     if (dst === undefined && remote === ".") {
       const found = await this.dwimRefAll(src, false);
@@ -319,6 +322,7 @@ export class RevisionResolver {
     const config = this.remoteConfig();
     const refname = `refs/heads/${name}`;
     const remote = this.pushRemoteOf(name);
+    await loadLegacyRemote(this.sources.workingCopy, remote);
     const trackingFor = (dst: string) => {
       const tracking = applyRefspecs(config.configuredFetchRefspecs(remote), dst);
       if (tracking === undefined) {
@@ -329,7 +333,7 @@ export class RevisionResolver {
       }
       return tracking;
     };
-    const pushSpecs = config.values(`remote.${remote}.push`);
+    const pushSpecs = config.pushRefspecs(remote);
     if (pushSpecs.length > 0) {
       const dst = applyRefspecs(pushSpecs, refname);
       if (dst === undefined) {

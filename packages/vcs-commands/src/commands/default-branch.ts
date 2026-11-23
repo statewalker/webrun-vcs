@@ -97,7 +97,7 @@ export async function defaultInitialBranch(
 }
 
 /** git's `default_branch_name_advice` (2.5x, or 3.0), as `advise_if_enabled` prints it. */
-function defaultBranchHint(name: string, breakingChanges: boolean | undefined): string[] {
+export function defaultBranchHint(name: string, breakingChanges: boolean | undefined): string[] {
   const text = breakingChanges
     ? `Using '${name}' as the name for the initial branch since Git 3.0.\n` +
       "If you expected Git to create 'master', the just-created\n" +

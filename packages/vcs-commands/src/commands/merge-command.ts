@@ -451,6 +451,36 @@ export class MergeCommand extends GitCommand<MergeResult> {
     return this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result;
   }
 
+  /**
+   * merge.c's `checkout_fast_forward(head, remote)`: a two-way switch of the index and worktree
+   * from `from`'s tree to `to`'s, refusing (unpack-trees' porcelain "merge" messages) where
+   * local changes are in the way; no ref moves. `git pull` runs it when the fetch moved the
+   * checked-out branch itself.
+   *
+   * @returns git's refusal, or undefined once the index and worktree are at `to`
+   */
+  async callCheckoutFastForward(
+    from: ObjectId,
+    to: ObjectId,
+  ): Promise<{ message: string; paths: string[] } | undefined> {
+    this.checkCallable();
+    this.setCallable(false);
+    await this.readCurrentIndex();
+    const worktree = this.worktreeAccess;
+    const run = async () => {
+      const head = await flatTree(this.trees, await this.commits.getTree(from));
+      const targetTree = await this.commits.getTree(to);
+      const target = await flatTree(this.trees, targetTree);
+      const refused = await switchTrees(this.context(worktree), head, target, {
+        action: "merge",
+        operation: "merge",
+        targetTree,
+      });
+      return refused ? { message: refused.message, paths: [...refused.paths] } : undefined;
+    };
+    return worktree?.batch ? worktree.batch(run) : run();
+  }
+
   /** What the sparse checkout printed while the result was written (see MergeResult.warnings). */
   private readonly sparseWarnings: string[] = [];
 

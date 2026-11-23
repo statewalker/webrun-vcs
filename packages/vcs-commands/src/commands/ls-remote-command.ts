@@ -254,8 +254,10 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
   /** The URL of the remote given, or of git's default remote (see {@link callGetUrl}). */
   private async remoteUrl(): Promise<string> {
     const store = RemoteConfigStore.from(this.workingCopy);
+    // remote_get reads a legacy remote (.git/remotes/, .git/branches/: git 2.x) first
     if (this.remote !== undefined) {
       this.remoteName = this.remote;
+      await this.loadLegacyRemote(this.remote);
       return store.remoteUrlOf(this.remote);
     }
     // remotes_remote_for_branch: an explicit branch remote is "given" (add_url_alias)
@@ -265,11 +267,13 @@ export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
       const explicit = store.value(`branch.${branch}.remote`);
       if (explicit !== undefined) {
         this.remoteName = explicit;
+        await this.loadLegacyRemote(explicit);
         return store.remoteUrlOf(explicit);
       }
     }
     const names = store.configuredNames();
     const name = names.length === 1 ? (names[0] ?? "origin") : "origin";
+    await this.loadLegacyRemote(name);
     const url = store.urlFor(name);
     if (url === undefined) {
       throw new InvalidRemoteError(name, "fatal: No remote configured to list refs from.");
