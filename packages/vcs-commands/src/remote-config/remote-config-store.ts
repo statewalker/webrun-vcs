@@ -288,6 +288,27 @@ export class RemoteConfigStore {
   }
 
   /**
+   * The remote `branch` fetches from (git's `remote_for_branch`): `branch.<name>.remote`, the
+   * one configured remote, else `origin`. A detached HEAD passes no branch.
+   */
+  remoteForBranch(branch: string | undefined): string {
+    const configured = branch === undefined ? undefined : this.value(`branch.${branch}.remote`);
+    if (configured !== undefined) return configured;
+    const names = this.configuredNames();
+    return names.length === 1 ? (names[0] as string) : "origin";
+  }
+
+  /**
+   * The remote `git push` without a remote pushes `branch` to (git's `pushremote_for_branch`):
+   * `branch.<name>.pushRemote`, `remote.pushDefault`, then {@link remoteForBranch}. A detached
+   * HEAD passes no branch, so only `remote.pushDefault` and the fallbacks apply.
+   */
+  pushRemoteForBranch(branch: string | undefined): string {
+    const own = branch === undefined ? undefined : this.value(`branch.${branch}.pushRemote`);
+    return own ?? this.value("remote.pushDefault") ?? this.remoteForBranch(branch);
+  }
+
+  /**
    * Whether the remote is configured (git's `remote_is_configured`): it has a config section,
    * or a legacy remote file loaded for it defines it ({@link legacyOrigin}).
    */

@@ -310,14 +310,7 @@ export class RevisionResolver {
    * configured remote, else `origin`.
    */
   pushRemoteOf(branch: string): string {
-    const config = this.remoteConfig();
-    return (
-      config.value(`branch.${branch}.pushRemote`) ??
-      config.value("remote.pushDefault") ??
-      config.value(`branch.${branch}.remote`) ??
-      (config.configuredNames().length === 1 ? config.configuredNames()[0] : "origin") ??
-      "origin"
-    );
+    return this.remoteConfig().pushRemoteForBranch(branch);
   }
 
   /**
