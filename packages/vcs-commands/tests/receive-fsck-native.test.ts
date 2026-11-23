@@ -15,7 +15,7 @@
  * A pack of fewer than 100 objects goes through unpack-objects `--strict`, a larger one
  * through index-pack `--strict` (their deaths and statuses differ).
  */
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -506,6 +506,91 @@ describeGit("receive-pack checks pushed objects (receive.fsckObjects), as native
       });
     });
   }
+
+  describe("a served repository's skip list stays inside it (confined as config includes)", () => {
+    /**
+     * A target under `<k>/` with `receive.fsck.skipList` at `skipList` (after `prepare`), a
+     * secret beside it, and native git's push of a bogus commit to it over our smart HTTP and
+     * git:// servers.
+     */
+    const servedPush = async (
+      skipList: (dst: string) => string,
+      prepare: (dst: string, secret: string) => void = () => {},
+    ) => {
+      const source = bogusSource();
+      const k = `c${counter++}`;
+      const secret = join(root, k, "other", "secret.env");
+      mkdirSync(join(root, k, "other"), { recursive: true });
+      writeFileSync(secret, "API_TOKEN=s3cr3t-value\n");
+      const outcomes = [];
+      for (const [name, url] of [
+        ["h", (p: string) => `${ourHttp.baseUrl}/${p}`],
+        ["d", (p: string) => `git://127.0.0.1:${ourDaemon.port}/${p}`],
+      ] as const) {
+        const dir = join(root, k, name);
+        cpSync(source.dir, join(dir, "src"), { recursive: true });
+        const dst = join(dir, "dst");
+        target(dst, [["receive.fsckObjects", "true"]], { SKIP: `${source.bogus}\n` });
+        prepare(dst, secret);
+        git(dst, "config", "receive.fsck.skipList", skipList(dst));
+        const r = await gitAsync(root, join(dir, "src"), [
+          "push",
+          "--porcelain",
+          url(`${k}/${name}/dst`),
+          source.spec,
+        ]);
+        expect(r.stdout + r.stderr).not.toContain("s3cr3t");
+        outcomes.push({ ...nativeOutcome(r), refs: stateOf(dst).refs });
+      }
+      return outcomes;
+    };
+
+    const refused = (shown: string) => ({
+      ok: false,
+      porcelain: ["!\trefs/heads/bogus:refs/heads/bogus\t[remote rejected] (unpacker error)"],
+      remote: [`fatal: could not open object name list: ${shown}`],
+      unpack: ["error: remote unpack failed: unpack-objects abnormal exit"],
+      warnings: [],
+      refs: "",
+    });
+
+    it("an absolute path outside the repository is unreadable (nothing of it is shown)", async () => {
+      let shown = "";
+      for (const outcome of await servedPush((dst) => {
+        shown = join(dst, "..", "..", "other", "secret.env");
+        return shown;
+      })) {
+        expect(outcome).toEqual({ ...refused(shown), done: outcome.done });
+      }
+    });
+
+    it("a relative path climbing out of the git directory is unreadable", async () => {
+      for (const outcome of await servedPush(() => "../../other/secret.env")) {
+        expect(outcome).toEqual({ ...refused("../../other/secret.env"), done: outcome.done });
+      }
+    });
+
+    it("a symbolic link in the git directory leading out is unreadable", async () => {
+      const outcomes = await servedPush(
+        () => "LINK",
+        (dst, secret) => symlinkSync(secret, join(dst, "LINK")),
+      );
+      for (const outcome of outcomes) {
+        expect(outcome).toEqual({ ...refused("LINK"), done: outcome.done });
+      }
+    });
+
+    it("a file inside the git directory, named relative or absolute, is read", async () => {
+      for (const name of ["SKIP", "abs"]) {
+        const outcomes = await servedPush((dst) => (name === "abs" ? join(dst, "SKIP") : name));
+        for (const outcome of outcomes) {
+          expect(outcome.ok).toBe(true);
+          expect(outcome.remote).toEqual([]);
+          expect(outcome.refs).toMatch(/^refs\/heads\/bogus [0-9a-f]{40}$/);
+        }
+      }
+    });
+  });
 
   describe("receive-pack dies reading its config", () => {
     for (const [title, config, line] of [

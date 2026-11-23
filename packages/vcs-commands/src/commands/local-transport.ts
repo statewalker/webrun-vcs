@@ -6,6 +6,7 @@
  */
 
 import { historyWithoutLazyFetch, type RefTransactionHook } from "@statewalker/vcs-core";
+import { configFilesApiOf, readConfinedFile } from "@statewalker/vcs-store-files";
 import {
   createRepositoryFacade,
   createTransportRefStore,
@@ -431,12 +432,21 @@ export interface ReceivePackHost {
   environment?: GitHostEnvironment;
   /** Whose messages to give where git 2.43 and 2.5x differ (default 2.5x) */
   compatibility?: "2.43" | "2.56";
+  /**
+   * The repository is someone else's (served): files its configuration names (a
+   * `receive.fsck.skipList`) are read only inside its own git directories, as confined
+   * includes (`configIncludes: "files"`), never from the host; a local push into one's own
+   * repository reads them as git does
+   */
+  confineFiles?: boolean;
 }
 
 /**
  * receive-pack's `receive.fsckObjects` / `transfer.fsckObjects` settings of the repository it
  * serves (`receiveFsckOf`): skip lists named by a relative path are read from its git
- * directory (receive-pack's working directory), absolute ones from the host.
+ * directory (receive-pack's working directory), absolute ones from the host; with
+ * `confineFiles` (a served repository) only files inside its own git directories, where their
+ * links lead and capped as confined includes (`readConfinedFile`), anything else unreadable.
  */
 export function receiveFsckSettingsOf(
   remote: OpenedRepository,
@@ -448,16 +458,32 @@ export function receiveFsckSettingsOf(
   const files = remote.files;
   const environment = host.environment;
   const listWithOrigin = config.listWithOrigin?.bind(config);
+  // receive-pack runs in the git directory: git names its files from there (`config`)
+  const entries = () =>
+    listWithOrigin
+      ? listWithOrigin().map((e) =>
+          e.file?.replace(/^\/+/, "").startsWith(`${gitDir}/`)
+            ? { ...e, file: e.file.replace(/^\/+/, "").slice(gitDir.length + 1) }
+            : e,
+        )
+      : config.list();
+  if (host.confineFiles) {
+    // a served repository's skip list: only its own files, where their links lead, capped
+    const roots = [gitDir];
+    const common = remote.commonDir?.replace(/^\/+/, "").replace(/\/+$/, "");
+    if (common !== undefined && common !== gitDir) roots.push(common);
+    const confined = files ? configFilesApiOf(files) : undefined;
+    return receiveFsckOf({
+      entries,
+      compatibility: host.compatibility ?? "2.56",
+      readFile: async (path) =>
+        confined
+          ? readConfinedFile(confined, path, { baseDir: gitDir, roots }).catch(() => undefined)
+          : undefined,
+    });
+  }
   return receiveFsckOf({
-    // receive-pack runs in the git directory: git names its files from there (`config`)
-    entries: () =>
-      listWithOrigin
-        ? listWithOrigin().map((e) =>
-            e.file?.replace(/^\/+/, "").startsWith(`${gitDir}/`)
-              ? { ...e, file: e.file.replace(/^\/+/, "").slice(gitDir.length + 1) }
-              : e,
-          )
-        : config.list(),
+    entries,
     compatibility: host.compatibility ?? "2.56",
     ...(environment?.home ? { home: environment.home } : {}),
     readFile: async (path) => {
