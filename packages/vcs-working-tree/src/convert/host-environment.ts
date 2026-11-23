@@ -28,6 +28,14 @@ export interface GitHostEnvironment {
    * cache is used.
    */
   systemName?: string;
+  /**
+   * The process: its id and the host's name, which git writes into `gc.pid` (`<pid> <host>`)
+   * while a gc runs, and whether a process of this host still runs (`kill(pid, 0)`): a
+   * `gc.pid` of this host whose process is gone is taken over, as git's `lock_repo_for_gc`
+   * does. Absent (a browser): `gc.pid` says `0 unknown`, and a lock younger than 12 hours is
+   * always taken as held.
+   */
+  gcProcess?: { pid: number; hostName: string; isRunning(pid: number): boolean };
   /** `$GIT_DISABLE_UNTRACKED_CACHE` is true: the untracked cache is never used */
   disableUntrackedCache?: boolean;
   /**
