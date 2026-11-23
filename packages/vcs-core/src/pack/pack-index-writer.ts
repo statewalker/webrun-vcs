@@ -9,7 +9,7 @@
  * - jgit/org.eclipse.jgit/src/org/eclipse/jgit/internal/storage/file/PackIndexWriterV2.java
  */
 
-import { type ObjectFormat, objectFormatByRawLength } from "@statewalker/vcs-utils/hash";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
 /** Magic bytes for V2+ index: 0xFF, 't', 'O', 'c' */
@@ -18,13 +18,11 @@ const TOC_SIGNATURE = new Uint8Array([0xff, 0x74, 0x4f, 0x63]);
 /** Number of fanout buckets (one per possible first byte) */
 const FANOUT_SIZE = 256;
 
-/**
- * The object format of an idx whose pack checksum is `packChecksum`: its width tells SHA-1
- * (20 bytes) from SHA-256 (32), and the ids and the idx's own checksum take the same width.
- */
-function formatOfChecksum(packChecksum: Uint8Array): ObjectFormat {
-  const format = objectFormatByRawLength(packChecksum.length);
-  if (!format) throw new Error(`pack checksum of ${packChecksum.length} bytes`);
+/** Checks that the pack checksum is of `format`'s width (the ids and checksums are). */
+function checkChecksum(packChecksum: Uint8Array, format: ObjectFormat): ObjectFormat {
+  if (packChecksum.length !== format.rawLength) {
+    throw new Error(`pack checksum of ${packChecksum.length} bytes in a ${format.name} pack`);
+  }
   return format;
 }
 
@@ -153,8 +151,9 @@ function buildFanoutTable(entries: readonly PackIndexWriterEntry[]): number[] {
 export async function writePackIndexV1(
   entries: readonly PackIndexWriterEntry[],
   packChecksum: Uint8Array,
+  objectFormat: ObjectFormat = SHA1_OBJECT_FORMAT,
 ): Promise<Uint8Array> {
-  const format = formatOfChecksum(packChecksum);
+  const format = checkChecksum(packChecksum, objectFormat);
   const OBJECT_ID_LENGTH = format.rawLength;
   // Validate all entries can be stored in V1 format
   for (const entry of entries) {
@@ -223,8 +222,9 @@ export async function writePackIndexV1(
 export async function writePackIndexV2(
   entries: readonly PackIndexWriterEntry[],
   packChecksum: Uint8Array,
+  objectFormat: ObjectFormat = SHA1_OBJECT_FORMAT,
 ): Promise<Uint8Array> {
-  const format = formatOfChecksum(packChecksum);
+  const format = checkChecksum(packChecksum, objectFormat);
   const OBJECT_ID_LENGTH = format.rawLength;
   // Count 64-bit offsets needed
   let offset64Count = 0;

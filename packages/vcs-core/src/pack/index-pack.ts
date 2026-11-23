@@ -26,11 +26,7 @@ import {
   type StreamInflater,
 } from "@statewalker/vcs-utils/compression";
 import { applyGitDelta, DeltaError } from "@statewalker/vcs-utils/diff";
-import {
-  type ObjectFormat,
-  objectFormatByRawLength,
-  SHA1_OBJECT_FORMAT,
-} from "@statewalker/vcs-utils/hash";
+import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { CRC32 } from "@statewalker/vcs-utils/hash/crc32";
 import type { Hasher } from "@statewalker/vcs-utils/hash/hasher";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
@@ -1042,15 +1038,17 @@ function writeIdxFrom(
 /**
  * A pack index (`.idx` version 2) laid out byte for byte as `git index-pack` writes it: entries
  * sorted by id (duplicates in the given order), the fan-out table, CRC-32s, 31-bit offsets with
- * 64-bit offsets past 2 GiB, the pack checksum and the index's own hash. The checksum's width
- * gives the object format (20 bytes SHA-1, 32 SHA-256), which the ids must be in.
+ * 64-bit offsets past 2 GiB, the pack checksum and the index's own hash, in the repository's
+ * object format `format` (default SHA-1): ids and the checksum of another width are refused.
  */
 export function writePackIdx(
   entries: readonly PackIdxEntry[],
   packChecksum: Uint8Array,
+  format: ObjectFormat = SHA1_OBJECT_FORMAT,
 ): Uint8Array {
-  const format = objectFormatByRawLength(packChecksum.length);
-  if (!format) throw new PackError(`pack checksum of ${packChecksum.length} bytes`);
+  if (packChecksum.length !== format.rawLength) {
+    throw new PackError(`pack checksum of ${packChecksum.length} bytes in a ${format.name} pack`);
+  }
   const t = new Entries(entries.length, format);
   entries.forEach((e, i) => {
     if (e.id.length !== 2 * t.raw) throw new PackError(`not a ${format.name} object id: ${e.id}`);
@@ -1421,6 +1419,7 @@ export async function installPack(
       ? encodePackMtimes(
           Array.from(order, (i) => mtimesOf(t.idOf(i))),
           packChecksum,
+          format,
         )
       : undefined;
     if ((await files.exists(`${name}.pack`)) && (await files.exists(`${name}.idx`))) {
@@ -1439,7 +1438,7 @@ export async function installPack(
       // entries are in pack order here: the idx position of each (git's write_rev_file)
       const rev = new Uint32Array(t.n);
       for (let k = 0; k < t.n; k++) rev[order[k] as number] = k;
-      await files.write(tmpRev, [encodeReverseIndex(rev, packChecksum)]);
+      await files.write(tmpRev, [encodeReverseIndex(rev, packChecksum, format)]);
     }
     if (mtimesBytes) await files.write(tmpMtimes, [mtimesBytes]);
     // The pack goes first, then its reverse index, then its idx (git's pack_copy_priority):

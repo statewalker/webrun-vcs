@@ -16,10 +16,16 @@ import {
   sweepPackTemporaries,
 } from "@statewalker/vcs-core";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
+import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { assertAlternatesReadable } from "./alternates/index.js";
-import { readCommitGraphSettings, writeCommitGraph } from "./commit-graph.js";
+import {
+  readCommitGraphSettings,
+  removeCommitGraphFiles,
+  writeCommitGraph,
+} from "./commit-graph.js";
 import { objectLinks } from "./cruft-pack.js";
+import { looseFileNamePattern, objectIdPattern, packFilePattern } from "./object-names.js";
 import { configBool, parseConfigSize } from "./pack/delta-base-cache-limit.js";
 import { promisorExclusions } from "./promisor-objects.js";
 import { sweepQuarantines } from "./quarantine/files-quarantine.js";
@@ -44,10 +50,7 @@ import {
 } from "./workspace/working-copy/working-copy-config.files.js";
 
 /** A loose object file name, fan-out directory included. */
-/** A full object id of either format (a repository has one) */
-const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 /** A pack file name. */
-const PACK_FILE = /^pack-(?:[0-9a-f]{40}|[0-9a-f]{64})\.pack$/;
 /** git ignores a `gc.pid` older than this (a gc that crashed). */
 const GC_LOCK_STALE_MS = 12 * 60 * 60 * 1000;
 /** The least age of a `.pack` without an `.idx` that gc removes (one may be being installed). */
@@ -373,7 +376,9 @@ async function collect(options: GcOptions): Promise<GcResult> {
     ? (objects.alternates?.errors ?? [])
     : await assertAlternatesReadable({ files, gitDir, objects }, "gc");
   const storageBefore =
-    dryRun || !packs ? undefined : await storageCount(files, objectsDir, looseStorage, packs);
+    dryRun || !packs
+      ? undefined
+      : await storageCount(files, objectsDir, looseStorage, packs, format.objectFormat);
 
   // git gc's foreground tasks: `pack-refs --all --prune`, then `reflog expire --all`
   let refsPacked = false;
@@ -430,10 +435,19 @@ async function collect(options: GcOptions): Promise<GcResult> {
     if (compatibility === "2.43") await otherTasks();
     // clean_pack_garbage: a lone .idx and the files beside it
     const removedPackGarbage = dryRun ? 0 : await cleanPackGarbage(files, objectsDir);
+    // a SHA-256 repository's graph cannot be rewritten yet: one naming objects this gc
+    // removed would leave git's fsck failing ("Could not read"); it goes, git rebuilds it
+    if (
+      !dryRun &&
+      format.objectFormat.name !== "sha1" &&
+      (partial.repack !== null || partial.removedObjects > 0)
+    ) {
+      await removeCommitGraphFiles(files, objectsDir);
+    }
     const commitGraph = await gcCommitGraph(options, objects);
     const after =
       storageBefore && packs
-        ? await storageCount(files, objectsDir, looseStorage, packs)
+        ? await storageCount(files, objectsDir, looseStorage, packs, format.objectFormat)
         : undefined;
     return {
       ...partial,
@@ -461,6 +475,9 @@ async function collect(options: GcOptions): Promise<GcResult> {
     });
   }
 
+  // loose objects and packs are named by ids of the repository's format only (git's
+  // for_each_loose_file_in_objdir): a name of the other width is no object here
+  const OBJECT_ID = objectIdPattern(format.objectFormat);
   const looseBefore: string[] = [];
   for await (const key of looseStorage.keys()) {
     // Only object files: native git writes objects/ab/tmp_obj_* while it works.
@@ -627,7 +644,15 @@ async function collect(options: GcOptions): Promise<GcResult> {
     const shallow = (await history.refs.getShallow?.().catch(() => [])) ?? [];
     if ((expiredLoose.length > 0 || shallow.length > 0) && pruneExpireMs > 0 && packs) {
       // add_unseen_recent_objects_to_traversal: recent packed objects seed the walk too
-      for (const id of await recentPacked(files, objectsDir, packs, cutoff, kept)) recent.push(id);
+      for (const id of await recentPacked(
+        files,
+        objectsDir,
+        packs,
+        cutoff,
+        kept,
+        format.objectFormat,
+      ))
+        recent.push(id);
     }
     const walked = new Set<string>();
     if ((expiredLoose.length > 0 || shallow.length > 0) && recent.length > 0) {
@@ -674,7 +699,12 @@ async function collect(options: GcOptions): Promise<GcResult> {
       ).sweepTemporaries();
       const orphanExpiry =
         options.orphanPackExpiryMs ?? Math.max(tmpExpiryMs, ORPHAN_PACK_MIN_AGE_MS);
-      removedOrphanPacks = await sweepOrphanPacks(files, packDir, orphanExpiry);
+      removedOrphanPacks = await sweepOrphanPacks(
+        files,
+        packDir,
+        orphanExpiry,
+        format.objectFormat,
+      );
     }
   }
 
@@ -684,7 +714,7 @@ async function collect(options: GcOptions): Promise<GcResult> {
     const fan = joinPath(objectsDir, "17");
     if ((await files.stats(fan))?.kind === "directory")
       for await (const e of files.list(fan))
-        if (/^(?:[0-9a-f]{38}|[0-9a-f]{62})$/.test(e.name)) inSeventeen++;
+        if (looseFileNamePattern(format.objectFormat).test(e.name)) inSeventeen++;
     if (inSeventeen > Math.ceil(gcSettings.gcAuto / 256))
       warnings.push(
         "warning: There are too many unreachable loose objects; run 'git prune' to remove them.",
@@ -756,6 +786,7 @@ async function recentPacked(
   packs: PackSet,
   cutoffMs: number,
   kept: ReadonlySet<string>,
+  objectFormat: ObjectFormat,
 ): Promise<string[]> {
   const out: string[] = [];
   const cutoff = Math.floor(cutoffMs / 1000);
@@ -767,7 +798,7 @@ async function recentPacked(
       try {
         const parts: Uint8Array[] = [];
         for await (const c of files.read(`${base}.mtimes`)) parts.push(c);
-        times = parsePackMtimes(concatBytes(parts), pack.count, `${base}.mtimes`);
+        times = parsePackMtimes(concatBytes(parts), pack.count, `${base}.mtimes`, objectFormat);
       } catch {
         times = undefined;
       }
@@ -823,7 +854,9 @@ async function storageCount(
   objectsDir: string,
   looseStorage: FileRawStorage,
   packs: PackSet,
+  objectFormat: ObjectFormat,
 ): Promise<StorageCount> {
+  const OBJECT_ID = objectIdPattern(objectFormat);
   const ids = new Set<string>();
   let bytes = 0;
   for await (const key of looseStorage.keys()) {
@@ -943,7 +976,13 @@ async function gcCommitGraph(
  * `PackSet.remove`, which deletes the idx first) once they are older than `expiryMs`. A younger
  * one may be a pack being installed (its idx is written last); an unknown age is kept.
  */
-async function sweepOrphanPacks(files: FilesApi, packDir: string, expiryMs: number) {
+async function sweepOrphanPacks(
+  files: FilesApi,
+  packDir: string,
+  expiryMs: number,
+  objectFormat: ObjectFormat,
+) {
+  const PACK_FILE = packFilePattern(objectFormat);
   if ((await files.stats(packDir))?.kind !== "directory") return 0;
   const cutoff = Date.now() - expiryMs;
   const orphans: string[] = [];

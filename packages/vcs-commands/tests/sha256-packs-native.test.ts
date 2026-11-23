@@ -15,7 +15,15 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -446,7 +454,7 @@ describeGit("SHA-256 packs and index files against native git", () => {
       expect(mtimes).toHaveLength(1);
       const bytes = readFileSync(join(dir, ".git", "objects", "pack", mtimes[0] as string));
       expect(bytes.readUInt32BE(8)).toBe(2);
-      expect(parsePackMtimes(new Uint8Array(bytes), 1, "x")).toHaveLength(1);
+      expect(parsePackMtimes(new Uint8Array(bytes), 1, "x", SHA256_OBJECT_FORMAT)).toHaveLength(1);
       expect(g(dir, "cat-file", "-t", loose)).toBe("blob");
       expectNativeFsckClean(dir);
       // native gc reads our cruft pack's times: the object is recent, kept
@@ -752,6 +760,74 @@ describeGit("SHA-256 packs and index files against native git", () => {
   });
 
   // ---------------------------------------------------------------- still refused
+
+  // ---------------------------------------------------------------- review of #236
+
+  describe("gc of names in the other format, and of a stale commit-graph", () => {
+    // H2: git reads loose objects and packs by its own hex length only (for_each_loose_file,
+    // prepare_pack): a name of the other width is no object of the repository and stays
+    for (const objectFormat of ["sha1", "sha256"] as const) {
+      it(`gc in a ${objectFormat} repository keeps names of the other width, as git`, async () => {
+        const other = objectFormat === "sha1" ? 64 : 40;
+        const make = () => {
+          const dir = fresh();
+          g(root, "init", "-q", `--object-format=${objectFormat}`, "-b", "main", dir);
+          put(dir, "a.txt", "a\n");
+          g(dir, "add", "a.txt");
+          g(dir, "commit", "-q", "-m", "a");
+          const loose = join(dir, ".git", "objects", "ab", "c".repeat(other - 2));
+          put(dir, `.git/objects/ab/${"c".repeat(other - 2)}`, "not an object");
+          const pack = join(dir, ".git", "objects", "pack", `pack-${"d".repeat(other)}.pack`);
+          put(dir, `.git/objects/pack/pack-${"d".repeat(other)}.pack`, "x");
+          const old = new Date(Date.now() - 30 * 86400e3);
+          utimesSync(loose, old, old);
+          utimesSync(pack, old, old);
+          return { dir, loose, pack };
+        };
+        const theirs = make();
+        native(theirs.dir, ["gc", "-q", "--prune=now"]);
+        const ours = make();
+        const git = await openOurs(ours.dir);
+        await git.gc().setPrune("now").call();
+        expect([existsSync(ours.loose), existsSync(ours.pack)]).toEqual([
+          existsSync(theirs.loose),
+          existsSync(theirs.pack),
+        ]);
+        expect([existsSync(ours.loose), existsSync(ours.pack)]).toEqual([true, true]);
+      });
+    }
+
+    // H1: a commit-graph native gc wrote names a commit ours then prunes; with no SHA-256
+    // commit-graph writer, ours removes the graph rather than leave it stale
+    it("gc that prunes removes a commit-graph it cannot rewrite", async () => {
+      const dir = nativeRepo();
+      g(dir, "checkout", "-q", "-b", "tmp");
+      put(dir, "x.txt", "x\n");
+      g(dir, "add", "x.txt");
+      g(dir, "commit", "-q", "-m", "doomed");
+      const doomed = g(dir, "rev-parse", "HEAD");
+      g(dir, "checkout", "-q", "main");
+      g(dir, "-c", "gc.writeCommitGraph=true", "gc", "-q");
+      expect(existsSync(join(dir, ".git", "objects", "info", "commit-graph"))).toBe(true);
+      g(dir, "branch", "-D", "tmp");
+      g(dir, "reflog", "expire", "--expire=all", "--all");
+      const git = await openOurs(dir);
+      await git.gc().setPrune("now").call();
+      expect(native(dir, ["cat-file", "-e", doomed]).status).not.toBe(0);
+      expect(existsSync(join(dir, ".git", "objects", "info", "commit-graph"))).toBe(false);
+      expect(existsSync(join(dir, ".git", "objects", "info", "commit-graphs"))).toBe(false);
+      expectNativeFsckClean(dir);
+      expect(native(dir, ["commit-graph", "verify"]).status).toBe(0);
+      expect(native(dir, ["log", "--all", "--oneline"]).status).toBe(0);
+      // a split chain (commit-graphs/) goes too
+      g(dir, "commit-graph", "write", "--reachable", "--split");
+      expect(existsSync(join(dir, ".git", "objects", "info", "commit-graphs"))).toBe(true);
+      const again = await openOurs(dir);
+      await again.gc().setPrune("now").call();
+      expect(existsSync(join(dir, ".git", "objects", "info", "commit-graphs"))).toBe(false);
+      expectNativeFsckClean(dir);
+    });
+  });
 
   describe("what SHA-256 repositories still lack", () => {
     it("refuses a multi-pack-index (read and written) and bitmaps asked for", async () => {

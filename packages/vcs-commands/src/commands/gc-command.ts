@@ -208,9 +208,9 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
     }
     // the loose objects estimated from one fan-out directory, against the limit rounded up
     // to a multiple of 256
-    const inSeventeen = (await names("17")).filter((n) =>
-      /^(?:[0-9a-f]{38}|[0-9a-f]{62})$/.test(n),
-    ).length;
+    // names of the repository's format only (git's for_each_loose_file_in_objdir)
+    const loose = new RegExp(`^[0-9a-f]{${this.objectFormat.hexLength - 2}}$`);
+    const inSeventeen = (await names("17")).filter((n) => loose.test(n)).length;
     return inSeventeen * 256 > Math.ceil(gcAuto / 256) * 256;
   }
 

@@ -12,6 +12,7 @@ import { createInMemoryFilesApi } from "../../src/common/files/index.js";
 import { createGitObjects } from "../../src/history/objects/git-objects.impl.js";
 import {
   encodePackMtimes,
+  encodeReverseIndex,
   installPack,
   type ListedObject,
   listObjects,
@@ -91,7 +92,12 @@ describe("SHA-256 packs", () => {
       // the .rev carries SHA-256's hash id and checksums
       const rev = await bytesOf(files.read(`${name}.rev`));
       expect(new DataView(rev.buffer, rev.byteOffset).getUint32(8)).toBe(2);
-      expect(parseReverseIndex(rev, ids.length, "rev", { verify: true })).toHaveLength(ids.length);
+      expect(
+        parseReverseIndex(rev, ids.length, "rev", {
+          verify: true,
+          objectFormat: SHA256_OBJECT_FORMAT,
+        }),
+      ).toHaveLength(ids.length);
 
       const opened = await openPack(files, `${name}.pack`, `${name}.idx`, {
         objectFormat: SHA256_OBJECT_FORMAT,
@@ -147,7 +153,7 @@ describe("SHA-256 packs", () => {
       offset: e.offset,
       crc32: e.crc32 ?? 0,
     }));
-    const again = writePackIdx(entries, pack.subarray(pack.length - 32));
+    const again = writePackIdx(entries, pack.subarray(pack.length - 32), SHA256_OBJECT_FORMAT);
     expect(Buffer.from(again)).toEqual(Buffer.from(idxBytes));
     // 8 + 1024 + n * (32 + 4 + 4) + 2 * 32
     expect(idxBytes.length).toBe(8 + 1024 + ids.length * 40 + 64);
@@ -171,10 +177,10 @@ describe("SHA-256 packs", () => {
 
   it("encodes and reads .mtimes with SHA-256 checksums", () => {
     const checksum = new Uint8Array(32).fill(7);
-    const bytes = encodePackMtimes([1, 2, 3], checksum);
+    const bytes = encodePackMtimes([1, 2, 3], checksum, SHA256_OBJECT_FORMAT);
     expect(bytes.length).toBe(12 + 3 * 4 + 64);
     expect(new DataView(bytes.buffer).getUint32(8)).toBe(2);
-    expect([...parsePackMtimes(bytes, 3, "x")]).toEqual([1, 2, 3]);
+    expect([...parsePackMtimes(bytes, 3, "x", SHA256_OBJECT_FORMAT)]).toEqual([1, 2, 3]);
   });
 
   it("lists the objects of SHA-256 trees", async () => {
@@ -188,5 +194,59 @@ describe("SHA-256 packs", () => {
       [tree, "tree", ""],
       [blob, "blob", "a.txt"],
     ]);
+  });
+
+  // review of #236 (medium): a `.rev`/`.mtimes` must carry the repository's hash id
+  it("refuses a .rev or .mtimes of the other format", async () => {
+    // git sizes the file by the repository's hash first (`is corrupt`), then wants its id
+    const sha1Rev = encodeReverseIndex([0, 1], new Uint8Array(20));
+    expect(() =>
+      parseReverseIndex(sha1Rev, 2, "x.rev", { objectFormat: SHA256_OBJECT_FORMAT }),
+    ).toThrow(/reverse-index file x.rev is (too small|corrupt)/);
+    const sha256Rev = encodeReverseIndex([0, 1], new Uint8Array(32), SHA256_OBJECT_FORMAT);
+    expect([
+      ...parseReverseIndex(sha256Rev, 2, "x.rev", { objectFormat: SHA256_OBJECT_FORMAT }),
+    ]).toEqual([0, 1]);
+    expect(() => parseReverseIndex(sha256Rev, 2, "x.rev")).toThrow(
+      "reverse-index file x.rev is corrupt",
+    );
+    // the right size, the other hash id
+    const wrongId = sha256Rev.slice();
+    new DataView(wrongId.buffer).setUint32(8, 1);
+    expect(() =>
+      parseReverseIndex(wrongId, 2, "x.rev", { objectFormat: SHA256_OBJECT_FORMAT }),
+    ).toThrow("reverse-index file x.rev has unsupported hash id 1");
+    const mtimes = encodePackMtimes([5], new Uint8Array(32), SHA256_OBJECT_FORMAT);
+    expect([...parsePackMtimes(mtimes, 1, "x.mtimes", SHA256_OBJECT_FORMAT)]).toEqual([5]);
+    const wrongMtimes = mtimes.slice();
+    new DataView(wrongMtimes.buffer).setUint32(8, 1);
+    expect(() => parsePackMtimes(wrongMtimes, 1, "x.mtimes", SHA256_OBJECT_FORMAT)).toThrow(
+      "mtimes file x.mtimes has unsupported hash id 1",
+    );
+    expect(() => parsePackMtimes(mtimes, 1, "x.mtimes")).toThrow();
+    // the encoders are told the format, never guess it from the checksum
+    expect(() => encodeReverseIndex([0], new Uint8Array(32))).toThrow();
+    expect(() => encodePackMtimes([0], new Uint8Array(20), SHA256_OBJECT_FORMAT)).toThrow();
+    expect(() => writePackIdx([], new Uint8Array(32))).toThrow();
+  });
+
+  it("a SHA-256 pack ignores a .rev of the other format", async () => {
+    const { objects, ids } = await history();
+    const pack = await bytesOf(writePack(objects, ids));
+    const files = createInMemoryFilesApi();
+    const installed = await installPack(files, PACK_DIR, once(pack), {
+      objectFormat: SHA256_OBJECT_FORMAT,
+    });
+    const name = `${PACK_DIR}/pack-${installed.packId}`;
+    await files.write(`${name}.rev`, [
+      encodeReverseIndex(new Uint32Array(ids.length), new Uint8Array(20)),
+    ]);
+    const opened = await openPack(files, `${name}.pack`, `${name}.idx`, {
+      objectFormat: SHA256_OBJECT_FORMAT,
+    });
+    expect(await opened.loadReverseIndex?.()).toMatch(
+      /^error: reverse-index file .* (hash id 1|corrupt|too small)$/,
+    );
+    opened.close();
   });
 });

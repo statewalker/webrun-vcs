@@ -24,7 +24,7 @@
  */
 
 import type { FilesApi, History, ObjectId, Refs } from "@statewalker/vcs-core";
-import { createHistoryFromStores, isSymbolicRef } from "@statewalker/vcs-core";
+import { createHistoryFromStores, isSymbolicRef, objectFormatOf } from "@statewalker/vcs-core";
 import { decodeGitPath, encodeGitPath, parseGitBool } from "@statewalker/vcs-utils/encoding";
 import {
   appendByRewrite,
@@ -32,6 +32,7 @@ import {
   type PosixFilesApi,
   tryReadFile,
 } from "@statewalker/vcs-utils/files";
+import { isHexObjectId } from "@statewalker/vcs-utils/hash";
 import type {
   ContentFilterSetup,
   CreatedLinkedWorktree,
@@ -362,7 +363,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       if (text.startsWith("refs/heads/")) return text;
       if (
         text.startsWith("refs/") ||
-        /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(text) ||
+        isHexObjectId(text, objectFormatOf(this.history.objects)) ||
         text === "detached HEAD"
       ) {
         return undefined;

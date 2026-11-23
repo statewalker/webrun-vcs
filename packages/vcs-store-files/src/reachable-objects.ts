@@ -215,7 +215,7 @@ async function collectRoots(
   if (head?.objectId) require(head.objectId, "bad object HEAD");
 
   const logIds = reftable
-    ? await storeReflogIds(refs, await reftable.reflogNames())
+    ? await storeReflogIds(refs, await reftable.reflogNames(), format)
     : await reflogIds(files, joinPath(gitDir, "logs"), format);
   for (const id of logIds) tips.add(id);
   requireIndex(await indexIds(files, joinPath(gitDir, "index"), format));
@@ -262,6 +262,7 @@ async function collectRoots(
             (await reftable.reflogNames(label.slice("worktrees/".length))).filter((n) =>
               n.startsWith(`${label}/`),
             ),
+            format,
           )
         : await reflogIds(files, joinPath(wt.path, "logs"), format);
       for (const id of wtLogIds) tips.add(id);
@@ -407,14 +408,18 @@ function reftableRoots(refs: Refs):
 }
 
 /** The old and new ids of every entry of the reflogs `names`, read through the ref store. */
-async function storeReflogIds(refs: Refs, names: string[]): Promise<ObjectId[]> {
+async function storeReflogIds(
+  refs: Refs,
+  names: string[],
+  format: ObjectFormat,
+): Promise<ObjectId[]> {
   const ids: ObjectId[] = [];
   for (const name of names) {
     const reader = await refs.getReflog?.(name);
     if (!reader) continue;
     for (const e of await reader.getReverseEntries()) {
-      if (isHexObjectId(e.oldId) && !/^0+$/.test(e.oldId)) ids.push(e.oldId);
-      if (isHexObjectId(e.newId) && !/^0+$/.test(e.newId)) ids.push(e.newId);
+      if (isIdOf(e.oldId, format)) ids.push(e.oldId);
+      if (isIdOf(e.newId, format)) ids.push(e.newId);
     }
   }
   return ids;

@@ -1049,7 +1049,9 @@ export async function openPack(
       const st = await files.stats(revPath);
       if (st?.kind !== "file") return "absent";
       try {
-        const order = parseReverseIndex(await readAll(files, revPath), n, revPath);
+        const order = parseReverseIndex(await readAll(files, revPath), n, revPath, {
+          objectFormat: format,
+        });
         // git trusts the positions; a wrong one would misplace every bitmap bit and entry
         // extent, so they must follow the offsets (which also makes them a permutation)
         let prev = -1;
@@ -1924,7 +1926,7 @@ export async function openPack(
     loadReverseIndex,
     async verifyReverseIndex() {
       if (options.readReverseIndex === false) return undefined;
-      return verifyReverseIndexFile(files, packPath, n, (i) => t.offsetOf(i));
+      return verifyReverseIndexFile(files, packPath, n, (i) => t.offsetOf(i), format);
     },
     idAt: (i) => hex(t.idAt(i)),
     offsetAt: (i) => t.offsetOf(i),

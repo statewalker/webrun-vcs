@@ -2123,8 +2123,12 @@ class FsckRun {
     const files = this.files as FilesApi;
     let bad = false;
     for (const p of packs) {
-      const lines = await verifyReverseIndexFile(files, p.packPath, p.idx.objectCount, (i) =>
-        p.idx.getOffset(i),
+      const lines = await verifyReverseIndexFile(
+        files,
+        p.packPath,
+        p.idx.objectCount,
+        (i) => p.idx.getOffset(i),
+        this.format,
       );
       if (!lines) continue;
       for (const line of lines) this.error(line.replace(/^error: /, ""));
