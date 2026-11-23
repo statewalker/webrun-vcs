@@ -75,6 +75,7 @@ export class RmCommand extends GitCommand<RmResult> {
   private recursive = false;
   private ignoreUnmatch = false;
   private force = false;
+  private dryRun = false;
   private compatibility: "2.43" | "2.56" = "2.56";
 
   /**
@@ -121,6 +122,17 @@ export class RmCommand extends GitCommand<RmResult> {
   setForce(force: boolean): this {
     this.checkCallable();
     this.force = force;
+    return this;
+  }
+
+  /**
+   * `-n` / `--dry-run`: run every check git makes (pathspecs, `.gitmodules` staged,
+   * `check_local_mod`) and give the entries that would be removed, changing nothing (what
+   * `git submodule deinit` asks with `git rm -qn <path>`).
+   */
+  setDryRun(dryRun: boolean): this {
+    this.checkCallable();
+    this.dryRun = dryRun;
     return this;
   }
 
@@ -299,6 +311,15 @@ export class RmCommand extends GitCommand<RmResult> {
     // remove_path_from_gitmodules dies on an unmerged .gitmodules (checked before anything
     // changes here, where git has removed the files already)
     const editsGitmodules = removesSubmodule && !this.cached && worktree !== undefined;
+    if (this.dryRun) {
+      // cmd_rm's show_only: check_local_mod, then nothing is changed
+      if (!this.force) {
+        const refusal = await this.checkLocalMod(removedEntries, worktree);
+        if (refusal) throw new RmFailedError(refusal, [], { removedPaths: [] });
+      }
+      if (sparsePaths.length > 0) throw advise();
+      return { removedPaths };
+    }
     if (editsGitmodules && (await this.gitmodulesUnmerged())) {
       throw new RmFailedError(
         "fatal: Cannot change unmerged .gitmodules, resolve merge conflicts first",
