@@ -34,6 +34,15 @@ import {
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { AddCommand } from "./add-command.js";
+import {
+  amendCommitText,
+  autosquashSubject,
+  commitSubjectLength,
+  type FixupKind,
+  parseFixupSpec,
+  refuseIncompatible,
+  skipBlankLines,
+} from "./commit-reuse.js";
 import { worktreeModeTrust } from "./core-config.js";
 import { DEFAULT_DATE_MODE, showDate } from "./date-format.js";
 import { approxidateCareful } from "./git-date.js";
@@ -45,6 +54,7 @@ import {
   withoutCrud,
 } from "./git-ident.js";
 import { IndexAdder, readGitlinkHead } from "./index-adder.js";
+import { reencodedCommitParts } from "./log-output.js";
 import { readRepositoryMailmap } from "./mailmap.js";
 import {
   flatTree,
@@ -192,8 +202,16 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private trailerArgs: string[] = [];
   /** `-C <commit>`: the commit whose message (and author) are reused */
   private reuseMessage?: string;
-  /** The commit `-C` names, read once the options are checked */
+  /** The commit `-C` (or `-c`) names, read once the options are checked */
   private reused?: Commit;
+  /** `-c <commit>` */
+  private reeditMessageFrom?: string;
+  /** `--fixup=[(amend|reword):]<commit>` as given */
+  private fixupSpec?: string;
+  /** `--squash=<commit>` */
+  private squashFrom?: string;
+  /** --fixup, parsed when the commit runs */
+  private fixup?: { kind: FixupKind; target: string };
 
   /**
    * Set the commit message, as git's `commit -m` takes it: its last line is ended and it is
@@ -596,6 +614,50 @@ export class CommitCommand extends GitCommand<CommitResult> {
     return this;
   }
 
+  /**
+   * `-c <commit>` / `--reedit-message=<commit>`: as {@link setReuseMessage} (or `-C` with {@link setEdit}(true)), with the message
+   * then given to the editor ({@link setEditor}; without one it is taken as it is).
+   */
+  setReeditMessage(commit: string): this {
+    this.checkCallable();
+    this.reeditMessageFrom = commit;
+    return this;
+  }
+
+  /**
+   * `--fixup=[(amend|reword):]<commit>`: a commit `rebase --autosquash` folds into `commit`.
+   * Plain, its message is `fixup! <subject>` (then the {@link setMessage} text, if any) and
+   * no editor runs. `amend:<commit>` makes `amend! <subject>` followed by the commit's whole
+   * message (its body alone when it is an `amend!` commit itself) for the editor to change,
+   * empty commits allowed and a message given with {@link setMessage} refused; `reword:` is
+   * `amend:` committing HEAD's tree (only the message changes), refused with paths, `-a`,
+   * `-i`, and during a merge or cherry-pick. An `amend!` message without a body is refused
+   * (`Aborting commit due to empty commit message body.`).
+   *
+   * @example
+   * ```typescript
+   * await git.commit().setFixup("HEAD~1").call();
+   * await git.commit().setFixup("reword:HEAD~1").setEditor(edit).call();
+   * ```
+   */
+  setFixup(commit: string): this {
+    this.checkCallable();
+    this.fixupSpec = commit;
+    return this;
+  }
+
+  /**
+   * `--squash=<commit>`: the message starts with `squash! <subject>` and a blank line, then
+   * the message given ({@link setMessage}, {@link setReuseMessage}: only `squash! ` when it
+   * names the same commit as given here), else what the editor makes of it. Refused with
+   * {@link setFixup}.
+   */
+  setSquash(commit: string): this {
+    this.checkCallable();
+    this.squashFrom = commit;
+    return this;
+  }
+
   /** `-e` / `--no-edit`: edit a given message too, or never edit (default: edit when none is given). */
   setEdit(edit: boolean): this {
     this.checkCallable();
@@ -675,6 +737,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // ... and git_diff_ui_config: a diff.submodule without a value dies
     readDiffSubmoduleConfig(this.workingCopy);
     await this.readCurrentIndex();
+    await this.checkReuseOptions();
     // `-i` refuses what it refuses for a commit, before anything is read
     if (this.include) this.checkIncludeOptions();
     const state = new OperationState(this.workingCopy.checkout, this.refsStore);
@@ -735,7 +798,23 @@ export class CommitCommand extends GitCommand<CommitResult> {
   /** git's use_editor: an editor is set, and no message is given or `-e` asks for it. */
   private usesEditor(): boolean {
     if (!this.editor || this.edit === false) return false;
-    return this.edit === true || (this.message === undefined && this.reuseMessage === undefined);
+    return this.edit === true || this.editsByDefault();
+  }
+
+  /**
+   * git's use_editor before `-e`/`--no-edit`: no message given (`-m`, `-C`) and no plain
+   * `--fixup`, whose messages are taken as they are.
+   */
+  private editsByDefault(): boolean {
+    if (this.message !== undefined || this.reuseMessage !== undefined) return false;
+    if (this.fixupSpec === undefined) return true;
+    const parsed = parseFixupSpec(this.fixupSpec);
+    return !("kind" in parsed) || parsed.kind !== "fixup";
+  }
+
+  /** The revision `-c` or `-C` names (git's use_message), as given. */
+  private reusedName(): string | undefined {
+    return this.reeditMessageFrom ?? this.reuseMessage;
   }
 
   /**
@@ -765,9 +844,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
     const { state } = ctx;
     const config = RemoteConfigStore.from(this.workingCopy);
     const mode = editorCleanupMode(this.workingCopy, this.cleanupMode);
-    // (-m and -C drop the template: git frees template_file)
+    // (-m, -C, -c and --fixup drop the template: git frees template_file)
     const templateText =
-      this.message !== undefined || this.reused ? undefined : await this.readTemplate(config);
+      this.message !== undefined || this.reused || this.fixup
+        ? undefined
+        : await this.readTemplate(config);
     const rebasing = (await state.read("rebase-merge/head-name")) !== undefined;
     const whence: CommitWhence =
       ctx.mergeHeads.length > 0
@@ -782,8 +863,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
     let cutLineAdded = false;
     const mergeMsg = await state.read("MERGE_MSG");
     const squashMsg = await state.read("SQUASH_MSG");
-    if (this.message !== undefined) sb = completeLine(this.message);
-    else if (this.reused) sb = this.reused.message.replace(/^(?:[ \t\r]*\n)+/, "");
+    const reusedMessage = await this.reusedMessage();
+    if (reusedMessage.text !== undefined) sb = reusedMessage.text;
+    else if (this.message !== undefined) sb = completeLine(this.message);
     else if (this.amend && ctx.previousCommit) {
       sb = ctx.previousCommit.message.replace(/^(?:[ \t\r]*\n)+/, "");
     } else if (mergeMsg !== undefined) {
@@ -794,10 +876,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
       }
     } else if (squashMsg !== undefined) sb = squashMsg;
     else if (templateText !== undefined) sb = templateText;
+    sb = reusedMessage.prefix + sb;
     // clean_message_contents: not for a template, which goes in as it is
     const fromTemplate =
+      reusedMessage.text === undefined &&
       this.message === undefined &&
-      !this.reused &&
       !(this.amend && ctx.previousCommit) &&
       mergeMsg === undefined &&
       squashMsg === undefined &&
@@ -1149,7 +1232,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // index at its start), unless this instance holds unwritten edits (refused)
     await this.readCurrentIndex();
     if (this.include) return this.commitIncluded();
-    const partial = this.onlyPaths.length > 0;
+    // `--fixup=reword:` is a partial commit of no path: HEAD's tree (git sets `only`)
+    const partial = this.onlyPaths.length > 0 || this.fixup?.kind === "reword";
     if (!this.all) return this.commitWith(partial, undefined);
     // `-a` (git's COMMIT_NORMAL): the index lock held from before the tracked changes are
     // staged until HEAD has moved
@@ -1212,26 +1296,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       const name = text.slice(0, lt).replace(/[ \t\n\v\f\r]+$/, "");
       this.authorName = { name, email: text.slice(lt + 1, gt) };
     }
-    if (this.message !== undefined && this.reuseMessage !== undefined) {
-      throw new IncompatibleOptionsError(
-        ["-m", "-C"],
-        "fatal: options '-m' and '-C' cannot be used together",
-      );
-    }
-    if (this.reuseMessage !== undefined) {
-      const name = this.reuseMessage;
-      const id = await this.resolveRef(name, (n) => `fatal: could not lookup commit '${n}'`).catch(
-        (error) => {
-          if (error instanceof RefNotFoundError) {
-            throw new RefNotFoundError(name, `fatal: could not lookup commit '${name}'`);
-          }
-          throw error;
-        },
-      );
-      const commit = await this.commits.load(id);
-      if (!commit) throw new RefNotFoundError(name, `fatal: could not lookup commit '${name}'`);
-      this.reused = commit;
-    }
+    await this.checkReuseOptions();
     if (this.forceDate) this.forcedDate();
   }
 
@@ -1355,6 +1420,180 @@ export class CommitCommand extends GitCommand<CommitResult> {
     );
   }
 
+  /**
+   * parse_and_validate_options for `-C`, `-c`, `--fixup` and `--squash`, in git's order: the
+   * incompatible options, the commit `-C`/`-c` names read (`could not lookup commit`), then
+   * `--fixup`'s suboption (`amend:`/`reword:` allow empty commits; `reword:` refuses paths,
+   * `-a`, `-i` and a merge or cherry-pick in progress).
+   */
+  private async checkReuseOptions(): Promise<void> {
+    if (this.fixupSpec !== undefined && this.squashFrom !== undefined) {
+      throw new IncompatibleOptionsError(
+        ["--squash", "--fixup"],
+        "fatal: options '--squash' and '--fixup' cannot be used together",
+      );
+    }
+    refuseIncompatible([
+      ["-C", this.reuseMessage !== undefined],
+      ["-c", this.reeditMessageFrom !== undefined],
+      ["--fixup", this.fixupSpec !== undefined],
+    ]);
+    refuseIncompatible([
+      ["-m", this.message !== undefined],
+      ["-c", this.reeditMessageFrom !== undefined],
+      ["-C", this.reuseMessage !== undefined],
+    ]);
+    const use = this.reusedName();
+    if (use !== undefined) this.reused = await this.lookupCommit(use);
+    if (this.fixupSpec === undefined) return;
+    const parsed = parseFixupSpec(this.fixupSpec);
+    if ("unknown" in parsed) {
+      throw new InvalidArgumentError(
+        "fixup",
+        this.fixupSpec,
+        `fatal: unknown option: --fixup=${parsed.unknown}:${parsed.target}`,
+      );
+    }
+    this.fixup = parsed;
+    if (parsed.kind === "fixup") return;
+    this.allowEmpty = true;
+    if (parsed.kind !== "reword") return;
+    // check_fixup_reword_options
+    const state = new OperationState(this.workingCopy.checkout, this.refsStore);
+    if ((await this.mergeHeads(state)).length > 0) {
+      throw new InvalidArgumentError(
+        "fixup",
+        this.fixupSpec,
+        "fatal: You are in the middle of a merge -- cannot reword.",
+      );
+    }
+    const pick = await state.ref("CHERRY_PICK_HEAD");
+    // (a rebase stopped at a pick is no cherry-pick: git's is_from_cherry_pick)
+    if (
+      pick &&
+      !(
+        (await state.read("rebase-merge/head-name")) !== undefined &&
+        (await state.ref("REBASE_HEAD")) === pick
+      )
+    ) {
+      throw new InvalidArgumentError(
+        "fixup",
+        this.fixupSpec,
+        "fatal: You are in the middle of a cherry-pick -- cannot reword.",
+      );
+    }
+    const path = this.onlyPaths[0] ?? this.includePaths[0];
+    if (path !== undefined) {
+      throw new IncompatibleOptionsError(
+        ["--fixup", "paths"],
+        `fatal: reword option of '--fixup' and path '${path}' cannot be used together`,
+      );
+    }
+    if (this.all || this.include) {
+      throw new IncompatibleOptionsError(
+        ["--fixup", "--all"],
+        "fatal: reword option of '--fixup' and '--patch/--interactive/--all/--include/--only' cannot be used together",
+      );
+    }
+  }
+
+  /** git's lookup_commit_reference_by_name, dying as `could not lookup commit '<name>'`. */
+  private async lookupCommit(name: string): Promise<Commit> {
+    const fatal = `fatal: could not lookup commit '${name}'`;
+    let id: ObjectId;
+    try {
+      id = await this.resolveRevision(name);
+    } catch (error) {
+      if (error instanceof RefNotFoundError) throw new GitApiError(fatal);
+      throw error;
+    }
+    const peeled = await this.revisionResolver().peelTags(id);
+    const commit = peeled.type === "commit" ? await this.commits.load(peeled.id) : undefined;
+    if (!commit) {
+      throw new GitApiError(
+        peeled.type
+          ? `error: object ${peeled.id} is a ${peeled.type}, not a commit\n${fatal}`
+          : fatal,
+      );
+    }
+    return this.inCommitOutputEncoding(peeled.id, commit);
+  }
+
+  /**
+   * A commit's message and author as `git commit` reads another commit's (read_commit_message,
+   * format_commit_message): converted from its `encoding` header into the commit output
+   * encoding (`i18n.commitEncoding`, else UTF-8). Ours writes UTF-8 messages only, so a
+   * commit is converted only when that encoding is UTF-8.
+   */
+  private async inCommitOutputEncoding(id: ObjectId, commit: Commit): Promise<Commit> {
+    if (commit.encoding === undefined) return commit;
+    const configured = RemoteConfigStore.from(this.workingCopy).value("i18n.commitEncoding");
+    const output = configured ? configured : "UTF-8";
+    if (!/^utf-?8$/i.test(output)) return commit;
+    const raw = await this.readRawObject(id);
+    const parts = raw && reencodedCommitParts(raw, output);
+    if (!parts) return commit;
+    return { ...commit, message: parts.message, ...(parts.author ? { author: parts.author } : {}) };
+  }
+
+  /** The stored bytes of an object (undefined where the store cannot give them). */
+  private async readRawObject(id: ObjectId): Promise<Uint8Array | undefined> {
+    const objects = this.workingCopy.history?.objects;
+    if (!objects) return undefined;
+    try {
+      const obj = await objects.get(id);
+      if (!obj) return undefined;
+      if (obj.bytes) return obj.bytes;
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for await (const c of obj.content) {
+        chunks.push(c);
+        size += c.length;
+      }
+      const out = new Uint8Array(size);
+      let at = 0;
+      for (const c of chunks) {
+        out.set(c, at);
+        at += c.length;
+      }
+      return out;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The start of prepare_to_commit's message from `-C`/`-c`/`--fixup`/`--squash`: the
+   * `squash! ` subject (`prefix`, put before whatever message follows) and, for `-C`/`-c`
+   * and `--fixup`, the text that replaces the other sources (undefined: they apply).
+   */
+  private async reusedMessage(): Promise<{ prefix: string; text: string | undefined }> {
+    let prefix = "";
+    if (this.squashFrom !== undefined) {
+      prefix =
+        (this.reusedName() ?? (this.amend && !this.fixup ? "HEAD" : undefined)) === this.squashFrom
+          ? "squash! "
+          : autosquashSubject("squash", (await this.lookupCommit(this.squashFrom)).message);
+    }
+    if (this.reused) return { prefix, text: skipBlankLines(this.reused.message) };
+    if (!this.fixup) return { prefix, text: undefined };
+    const target = await this.lookupCommit(this.fixup.target);
+    if (this.fixup.kind === "fixup") {
+      const given = this.message !== undefined ? completeLine(this.message) : "";
+      return { prefix, text: autosquashSubject("fixup", target.message) + given };
+    }
+    if (this.message !== undefined) {
+      throw new IncompatibleOptionsError(
+        ["-m", "--fixup"],
+        `fatal: options '-m' and '--fixup:${this.fixup.kind}' cannot be used together`,
+      );
+    }
+    return {
+      prefix,
+      text: autosquashSubject("amend", target.message) + amendCommitText(target.message),
+    };
+  }
+
   /** `-i <paths>`: parse_and_validate_options' and prepare_index's refusals. */
   private checkIncludeOptions(): void {
     if (this.onlyPaths.length > 0) {
@@ -1423,8 +1662,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
     const headId = (await this.refsStore.resolve("HEAD"))?.objectId;
     let partialTree: ObjectId | undefined;
     let falseIndexFile: FalseIndexFile | undefined;
+    // (`--fixup=reword:` names no path: the false index is HEAD's tree)
     const partialPaths = partial
-      ? await this.listPartialPaths(state, mergeHeads, headId)
+      ? this.fixup?.kind === "reword"
+        ? new Map<string, boolean>()
+        : await this.listPartialPaths(state, mergeHeads, headId)
       : undefined;
     if (partialPaths) {
       // git's partial commit (prepare_index): the index lock taken once the paths are
@@ -1537,18 +1779,30 @@ export class CommitCommand extends GitCommand<CommitResult> {
       (await state.read("MERGE_MSG")) !== undefined ||
       (await state.read("SQUASH_MSG")) !== undefined;
     const reused = this.reused;
+    // (-c, --squash and --fixup=amend:/reword: prepare a message for the editor: without
+    // one it is taken as it is, as with GIT_EDITOR=:)
+    const preparedForEditor =
+      this.reeditMessageFrom !== undefined ||
+      this.squashFrom !== undefined ||
+      (this.fixup !== undefined && this.fixup.kind !== "fixup");
     const editorLike =
       this.usesEditor() ||
-      (this.message === undefined &&
-        !reused &&
-        !this.amend &&
-        this.edit !== false &&
-        mergeMsgPresent);
+      (this.edit !== false &&
+        this.editsByDefault() &&
+        ((!reused && !this.amend && mergeMsgPresent) || preparedForEditor));
     const editor: CommitEditor = this.usesEditor()
       ? (this.editor as CommitEditor)
       : async () => undefined;
     const message = this.message;
-    if (!editorLike && message === undefined && !reused && !this.amend && !mergeMsgPresent) {
+    if (
+      !editorLike &&
+      message === undefined &&
+      !reused &&
+      !this.amend &&
+      !mergeMsgPresent &&
+      !this.fixup &&
+      this.squashFrom === undefined
+    ) {
       throw new NoMessageError();
     }
 
@@ -1562,6 +1816,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
       if (!previousCommit) {
         throw new NoHeadError("Cannot amend: HEAD commit not found");
       }
+      // (its message and author as git reads them: use_message = "HEAD")
+      previousCommit = await this.inCommitOutputEncoding(headId, previousCommit);
     }
 
     // The author (git's determine_author_info, which prepare_to_commit runs before the
@@ -1569,6 +1825,9 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // a concluded cherry-pick's author (its date too; `--author` replaces only the name and
     // email), unless --reset-author; else resolved as git does (GIT_AUTHOR_*, author.*,
     // user.*, GIT_AUTHOR_DATE or now)
+    // (`--amend --fixup` keeps no author: git's author_message is use_message's, which
+    // --fixup leaves unset)
+    const amendKeeps = this.amend && !!previousCommit && !this.fixup;
     let author = this.author;
     if (!author) {
       // (git's author_message: a cherry-pick's CHERRY_PICK_HEAD, else -C's commit, else the
@@ -1579,8 +1838,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
           ? (await this.commits.load(pickHead))?.author
           : reused
             ? reused.author
-            : this.amend && previousCommit
-              ? previousCommit.author
+            : amendKeeps
+              ? previousCommit?.author
               : undefined;
       // fmt_ident's IDENT_STRICT refusals of the name chosen (an empty one, crud only)
       if (kept || this.authorName) {
@@ -1691,7 +1950,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
           authorKept:
             !this.author &&
             (this.forceDate !== undefined ||
-              (!this.resetAuthor && (!!previousCommit || !!pickHead || !!reused))),
+              (!this.resetAuthor && (amendKeeps || !!pickHead || !!reused))),
           hookEnv,
         },
         editor,
@@ -1706,15 +1965,17 @@ export class CommitCommand extends GitCommand<CommitResult> {
       // whitespace) is written to COMMIT_EDITMSG; then a commit with nothing to commit is
       // refused; then the file's text is cleaned up (cleanup_message) and checked
       cleanup = commitCleanupMode(this.workingCopy, this.cleanupMode);
+      const reusedMessage = await this.reusedMessage();
       let sb: string;
-      if (message !== undefined) sb = completeLine(message);
-      else if (reused) sb = reused.message.replace(/^(?:[ \t\r]*\n)+/, "");
+      if (reusedMessage.text !== undefined) sb = reusedMessage.text;
+      else if (message !== undefined) sb = completeLine(message);
       else if (previousCommit) sb = previousCommit.message.replace(/^(?:[ \t\r]*\n)+/, "");
       else {
         const mergeMsg = await state.read("MERGE_MSG");
         const squashMsg = await state.read("SQUASH_MSG");
         sb = mergeMsg !== undefined ? `${squashMsg ?? ""}${mergeMsg}` : (squashMsg ?? "");
       }
+      sb = reusedMessage.prefix + sb;
       if (cleanup !== CleanupMode.VERBATIM) sb = stripspace(sb);
       sb = this.signedOff(sb, committer);
       await state.write("COMMIT_EDITMSG", sb);
@@ -1761,6 +2022,13 @@ export class CommitCommand extends GitCommand<CommitResult> {
     }
     if (untouched && !this.allowEmptyMessage) {
       throw new NoMessageError("Aborting commit; you did not edit the message.");
+    }
+    // an `amend!` message needs a body (the message the amended commit takes)
+    if (this.fixup && finalMessage.startsWith("amend! ") && !this.allowEmptyMessage) {
+      const body = finalMessage.slice(commitSubjectLength(finalMessage));
+      if ((cleanup !== CleanupMode.VERBATIM || body.length === 0) && isEmptyMessage(body)) {
+        throw new NoMessageError("Aborting commit due to empty commit message body.");
+      }
     }
 
     return this.finishCommit(treeId, parents, mergeHeads, pickHead, {
@@ -1948,8 +2216,12 @@ export class CommitCommand extends GitCommand<CommitResult> {
     mergeHeads: ObjectId[],
     pickHead: ObjectId | undefined,
   ): string[] {
+    // --squash tells "message" whatever the message's source (an empty second argument)
+    if (this.squashFrom !== undefined) return ["message", ""];
     if (this.message !== undefined) return ["message"];
-    if (this.reuseMessage !== undefined) return ["commit", this.reuseMessage];
+    const reusedName = this.reusedName();
+    if (reusedName !== undefined) return ["commit", reusedName];
+    if (this.fixup) return ["message"];
     // --amend without a message reuses HEAD's (git's use_message = "HEAD")
     if (this.amend) return ["commit", "HEAD"];
     if (mergeMsg !== undefined) return [squashMsg !== undefined ? "squash" : "merge"];
