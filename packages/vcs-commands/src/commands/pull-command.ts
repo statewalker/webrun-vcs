@@ -3,10 +3,12 @@ import { parseGitBool } from "@statewalker/vcs-utils";
 import { isIndexUnborn } from "@statewalker/vcs-working-tree";
 
 import { NoHeadError } from "../errors/index.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import { FastForwardMode, isMergeSuccessful, type MergeStrategy } from "../results/merge-result.js";
 import type { PullResult } from "../results/pull-result.js";
 import { isRebaseSuccessful, RebaseStatus } from "../results/rebase-result.js";
 import { TransportCommand } from "../transport-command.js";
+import { applyRefspecs } from "./branch-tracking.js";
 import { FetchCommand, TagOption } from "./fetch-command.js";
 import { commitsBaseSource, MergeBaseGraph } from "./merge-bases.js";
 import { MergeCommand } from "./merge-command.js";
@@ -212,8 +214,17 @@ export class PullCommand extends TransportCommand<PullResult> {
     // Determine remote branch
     const remoteBranch = this.remoteBranchName || localBranchName;
 
+    // a remote read from .git/remotes/ or .git/branches/ (git 2.x) stores the branch where
+    // its own refspecs say (a branches file: `refs/heads/<name>`)
+    await this.loadLegacyRemote(this.remote);
+    const store = RemoteConfigStore.from(this._workingCopy);
+    const legacyTracking = store.legacyOrigin(this.remote)
+      ? applyRefspecs(store.configuredFetchRefspecs(this.remote), `refs/heads/${remoteBranch}`)
+      : undefined;
+    const trackingRef = legacyTracking ?? `refs/remotes/${this.remote}/${remoteBranch}`;
+
     // Build refspec
-    const refspec = `refs/heads/${remoteBranch}:refs/remotes/${this.remote}/${remoteBranch}`;
+    const refspec = `refs/heads/${remoteBranch}:${trackingRef}`;
 
     // git's GIT_REFLOG_ACTION for everything the pull writes: "pull" and its command-line
     // arguments (a rebase or autostash the configuration asks for is not among them)
@@ -314,7 +325,6 @@ export class PullCommand extends TransportCommand<PullResult> {
     }
 
     // Get the remote tracking ref to merge
-    const trackingRef = `refs/remotes/${this.remote}/${remoteBranch}`;
     const trackingRefResolved = await this.refsStore.resolve(trackingRef);
 
     if (!trackingRefResolved?.objectId) {
@@ -370,7 +380,11 @@ export class PullCommand extends TransportCommand<PullResult> {
     const mergeCommand = new MergeCommand(this._workingCopy).shareHooksOf(this);
     mergeCommand.include(trackingRefResolved.objectId);
     // git's fmt-merge-msg shortens the URL: no trailing slash, no `.git`
-    const url = (configValue(this._workingCopy, `remote.${this.remote}.url`) ?? this.remote)
+    const url = (
+      configValue(this._workingCopy, `remote.${this.remote}.url`) ??
+      store.remoteUrls(this.remote)[0] ??
+      this.remote
+    )
       .replace(/\/+$/, "")
       .replace(/\.git$/, "");
     const into =
