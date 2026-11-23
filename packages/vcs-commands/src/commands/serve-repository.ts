@@ -18,6 +18,8 @@ import { type OpenedRepository, sparseFilterMatcher } from "@statewalker/vcs-wor
 import type { HookSession } from "./git-hooks.js";
 import {
   httpBackendEnv,
+  type ReceivePackHost,
+  receiveFsckSettingsOf,
   receivePackSettingsOf,
   servedMaxTreeDepth,
   servedUseBitmaps,
@@ -33,6 +35,12 @@ export interface ServedRepositoryOptions {
    * directory, `GIT_DIR=.`), its output not sent to the client
    */
   hooks?: HookSession;
+  /**
+   * Where receive-pack runs (`ReceivePackHost`): whose fsck messages to give (default the
+   * hooks' runner's compatibility). A served repository's `receive.fsck.skipList` is always
+   * read confined to its own git directories (`confineFiles`), never from the host
+   */
+  host?: ReceivePackHost;
 }
 
 /** What the served repository's config decides: left to `serveGitService`'s layering. */
@@ -87,10 +95,16 @@ export async function servedRepositoryOf(
   remote: OpenedRepository,
   options: ServedRepositoryOptions = {},
 ): Promise<ServedRepository> {
-  const settings: Record<string, unknown> = {
-    ...(await receivePackSettingsOf(remote, options.hooks)),
-  };
+  // someone else's repository: files its config names are read only inside it
+  const host: ReceivePackHost = { ...options.host, confineFiles: true };
+  const full = await receivePackSettingsOf(remote, options.hooks, undefined, host);
+  const settings: Record<string, unknown> = { ...full };
   for (const key of CONFIG_KEYS) delete settings[key];
+  // receive.fsck.* that kills receive-pack is not among the config keys serveGitService reads
+  const fsckError = receiveFsckSettingsOf(remote, host).configError;
+  if (fsckError !== undefined && full.receivePackConfigError === fsckError) {
+    settings.receivePackConfigError = fsckError;
+  }
   const hooks = options.hooks;
   return {
     repository: createRepositoryFacade({

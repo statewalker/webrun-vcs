@@ -31,6 +31,7 @@ import {
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type PushResult, PushStatus, type RemoteRefUpdate } from "../results/push-result.js";
 import { TransportCommand } from "../transport-command.js";
+import { hostEnvironmentOf } from "./git-ident.js";
 import { remoteHookSession } from "./local-transport.js";
 import { withRemoteReceivePack } from "./remote-transport.js";
 import { SIGNING_FAILED_LINES, SigningFailedError } from "./signing.js";
@@ -572,6 +573,8 @@ export class PushCommand extends TransportCommand<PushResult> {
       localRemote === undefined
         ? undefined
         : remoteHookSession(this.workingCopy, localRemote, { localPush: true });
+    const environment = hostEnvironmentOf(this.workingCopy);
+    const receiveWarnings: string[] = [];
     // --receive-pack, else remote.<name>.receivepack
     const receivePack = this.receivePack ?? this.remoteProgram(this.remote, "receivepack");
     try {
@@ -588,6 +591,14 @@ export class PushCommand extends TransportCommand<PushResult> {
           ? undefined
           : remoteHookSession(this.workingCopy, localRemote, { localPush: true }),
         transactionHooks,
+        {
+          host: {
+            ...(environment ? { environment } : {}),
+            compatibility: this.hooks.compatibility,
+          },
+          // receive-pack's config warnings reach the shared stderr
+          onWarning: (line) => receiveWarnings.push(line),
+        },
       );
     } catch (error) {
       // send_pack dies: the remote's repository names objects with another hash
@@ -718,9 +729,11 @@ export class PushCommand extends TransportCommand<PushResult> {
       bytesSent: result.bytesSent,
       objectCount: result.packObjects,
       messages,
-      ...(result.warnings?.length
-        ? { warnings: [...(warnings.warnings ?? []), ...result.warnings] }
-        : warnings),
+      // git's order: the legacy-remote deprecation, receive-pack's startup warnings (a local
+      // push), then send-pack's (an unsent push certificate)
+      ...(legacyWarnings.length + receiveWarnings.length + (result.warnings?.length ?? 0) > 0
+        ? { warnings: [...legacyWarnings, ...receiveWarnings, ...(result.warnings ?? [])] }
+        : {}),
       display: formatPushStatus(result, { dest: remoteUrl }),
       porcelain: formatPushStatus(result, { dest: remoteUrl, porcelain: true }),
       ...(trackingErrors.length ? { errors: trackingErrors } : {}),

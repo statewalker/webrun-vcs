@@ -1395,6 +1395,56 @@ export const MAX_CONFINED_INCLUDE_SIZE = 1024 * 1024;
 const MAX_INCLUDE_LINKS = 40;
 
 /**
+ * A file named by a served repository's own configuration (a `receive.fsck.skipList`), read as
+ * `includes: "files"` reads a confined include: `value` is a host path (an absolute one,
+ * mapped through the files API's root directory) or a path relative to `baseDir`; the file
+ * read is where its symbolic links lead, which must lie inside one of `roots` (the
+ * repository's own git directories, files API paths), and hold at most
+ * {@link MAX_CONFINED_INCLUDE_SIZE} bytes. Undefined for anything else: a `~/` path, a path
+ * outside the root directory or climbing out of `baseDir`, a link leading out, a larger file,
+ * a files API that cannot tell links apart. Its content is never read then.
+ *
+ * @example
+ * ```ts
+ * const bytes = await readConfinedFile(configFilesApiOf(files), "SKIP", {
+ *   baseDir: "srv/repo.git",
+ *   roots: ["srv/repo.git"],
+ * });
+ * ```
+ */
+export async function readConfinedFile(
+  files: ConfigFilesApi,
+  value: string,
+  options: { baseDir: string; roots: readonly string[] },
+): Promise<Uint8Array | undefined> {
+  if (value.startsWith("~") || !files.lstat || !files.readlink) return undefined;
+  let path: string;
+  if (value.startsWith("/")) {
+    const root = files.rootDirectory?.replace(/\/+$/, "");
+    if (root === undefined) return undefined;
+    const host = resolveDots(value);
+    if (host.path !== root && !host.path.startsWith(`${root}/`)) return undefined;
+    path = host.path.slice(root.length + 1);
+  } else {
+    const base = options.baseDir.replace(/^\/+/, "").replace(/\/+$/, "");
+    const joined = resolveDots(base ? `${base}/${value}` : value);
+    if (joined.escapes) return undefined;
+    path = joined.path;
+  }
+  const real = await confinedRealPath(files, path);
+  if (real === undefined) return undefined;
+  const roots = options.roots.map((r) => resolveDots(r).path.replace(/^\/+/, ""));
+  if (!roots.some((r) => r === "" || real === r || real.startsWith(`${r}/`))) return undefined;
+  const stat = await files.lstat(real).catch(() => undefined);
+  if (stat?.kind !== "file" || stat.size === undefined) return undefined;
+  if (stat.size > MAX_CONFINED_INCLUDE_SIZE) return undefined;
+  const content = files.readPrefix
+    ? await files.readPrefix(real, MAX_CONFINED_INCLUDE_SIZE + 1)
+    : await files.read(real);
+  return content && content.length > MAX_CONFINED_INCLUDE_SIZE ? undefined : content;
+}
+
+/**
  * `path` (in `files`) with the symbolic links on it followed through `files.lstat` /
  * `readlink`, without its leading `/`: undefined when a link climbs above the root or
  * names a host path outside `files.rootDirectory`, there are too many, or `files` cannot

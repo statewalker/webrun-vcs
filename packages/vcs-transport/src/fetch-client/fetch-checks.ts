@@ -12,8 +12,13 @@
  */
 
 import { type ObjectFilter, type PackEntryInfo, parseObjectFilter } from "@statewalker/vcs-core";
-import type { GitObjectTypeName, RepositoryFacade } from "../api/repository-facade.js";
-import { type PromisedKinds, PushConnectivity } from "../fsm/push/index.js";
+import type {
+  GitObjectTypeName,
+  RepositoryFacade,
+  TagTargetInfo,
+  TreeEntryInfo,
+} from "../api/repository-facade.js";
+import { type PromisedKinds, PushConnectivity } from "../fsm/push/connectivity.js";
 import { TransportError } from "../protocol/index.js";
 
 /**
@@ -134,6 +139,20 @@ export class ReceivedObjects {
         ? (this.deltas[a] as number) - (this.deltas[b] as number)
         : (this.entries[a] as number) - (this.entries[b] as number),
     );
+    for (const i of order) {
+      let id = "";
+      for (let k = 0; k < this.w; k++) {
+        id += (this.ids[i * this.w + k] as number).toString(16).padStart(2, "0");
+      }
+      yield { id, type: TYPE_BY_CODE[this.types[i] as number] as GitObjectTypeName };
+    }
+  }
+
+  /** The received objects in pack order (unpack-objects' `obj_list`). */
+  *inPackOrder(): Generator<{ id: string; type: GitObjectTypeName }> {
+    const order = new Uint32Array(this.n);
+    for (let i = 0; i < this.n; i++) order[i] = i;
+    order.sort((a, b) => (this.entries[a] as number) - (this.entries[b] as number));
     for (const i of order) {
       let id = "";
       for (let k = 0; k < this.w; k++) {
@@ -418,6 +437,11 @@ export interface ReceivedPackCheckOptions {
   shallow: ReadonlySet<string>;
   /** Whether the pack was kept (git then reads index-pack's output, and words its death so) */
   kept: boolean;
+  /**
+   * The line that ends a refusal after index-pack's own (default: fetch-pack's, by `kept`);
+   * null for none (receive-pack reports the death in its status instead)
+   */
+  tail?: string | null;
 }
 
 /** What {@link checkReceivedPack} found, when nothing stopped the fetch. */
@@ -441,11 +465,14 @@ export async function checkReceivedPack(
   options: ReceivedPackCheckOptions,
 ): Promise<ReceivedPackCheck> {
   const lines: string[] = [];
-  const tail = options.kept
-    ? "fatal: fetch-pack: invalid index-pack output"
-    : "fatal: index-pack failed";
+  const tail =
+    options.tail !== undefined
+      ? options.tail
+      : options.kept
+        ? "fatal: fetch-pack: invalid index-pack output"
+        : "fatal: index-pack failed";
   const fail = (line: string): never => {
-    throw new FetchCheckError("pack", [...lines, line, tail], 128);
+    throw new FetchCheckError("pack", [...lines, line, ...(tail === null ? [] : [tail])], 128);
   };
   const fsck = options.fsck;
   if (fsck?.startError) fail(fsck.startError);
@@ -508,6 +535,93 @@ export async function checkReceivedPack(
     }
   }
   return { messages: lines, selfContained };
+}
+
+/**
+ * unpack-objects' `--strict` over the objects of one pack (receive-pack unpacks a pack of fewer
+ * than `receive.unpackLimit` objects), read through `repository` (the quarantine's view):
+ * `write_rest`'s `check_object` from each received commit, tree and tag in pack order, depth
+ * first, each object's fsck before the objects it names (a commit's tree, then its parents,
+ * except a shallow commit's; a tree's entries in order, gitlinks skipped; a tag's object).
+ * A named object neither received nor here (or of another type) dies `object of unexpected
+ * type`; then `fsck_finish` checks the `.gitmodules` / `.gitattributes` blobs found. Returns
+ * the warnings printed; throws {@link FetchCheckError} (`pack`) with the lines unpack-objects
+ * printed before it died.
+ */
+export async function checkUnpackedObjects(
+  repository: RepositoryFacade,
+  received: ReceivedObjects,
+  options: { fsck: ReceivedObjectsFsck; shallow: ReadonlySet<string> },
+): Promise<string[]> {
+  const { fsck, shallow } = options;
+  const lines: string[] = [];
+  const fail = (line: string): never => {
+    throw new FetchCheckError("pack", [...lines, line], 128);
+  };
+  if (fsck.startError) fail(fsck.startError);
+  const types = new Map<string, GitObjectTypeName>();
+  const order: string[] = [];
+  for (const { id, type } of received.inPackOrder()) {
+    types.set(id, type);
+    if (type !== "blob") order.push(id);
+  }
+  // FLAG_WRITTEN: received blobs are written as they come, the rest once checked
+  const written = new Set<string>();
+  for (const [id, type] of types) if (type === "blob") written.add(id);
+  const check = async (id: string, expected: GitObjectTypeName | undefined): Promise<void> => {
+    if (written.has(id)) return;
+    const type = types.get(id);
+    if (expected !== undefined && type !== undefined && type !== expected) {
+      fail("fatal: object type mismatch");
+    }
+    if (type === undefined) {
+      // not received: it must be here, of the type that names it
+      const here = await repository.getObjectType?.(id);
+      if (here === undefined || (expected !== undefined && here !== expected)) {
+        fail("fatal: object of unexpected type");
+      }
+      written.add(id);
+      return;
+    }
+    const object = await repository.loadObject?.(id);
+    if (!object) fail(`fatal: Whoops! Cannot find object '${id}'`);
+    const content = (object as { content: Uint8Array }).content;
+    if (fsck.checkObject(id, type, content, lines)) fail("fatal: fsck error in packed object");
+    const unreadable = () => fail(`fatal: Error on reachable objects of ${id}`);
+    if (type === "commit") {
+      const info = await repository.getCommitInfo?.(id);
+      if (!info) unreadable();
+      const commit = info as { tree: string; parents: string[] };
+      await check(commit.tree, "tree");
+      if (!shallow.has(id)) for (const parent of commit.parents) await check(parent, "commit");
+    } else if (type === "tree") {
+      const entries = await repository.getTreeEntries?.(id);
+      if (!entries) unreadable();
+      for (const entry of entries as TreeEntryInfo[]) {
+        const kind = entry.mode & 0o170000;
+        if (kind === 0o160000) continue; // a gitlink: not followed
+        if (kind === 0o040000) await check(entry.id, "tree");
+        else if (kind === 0o100000 || kind === 0o120000) await check(entry.id, "blob");
+        else {
+          // fsck_walk_tree stops at the entry
+          const mode = entry.mode.toString(8).padStart(6, "0");
+          lines.push(`error: in tree ${id}: entry ${entry.name} has bad mode ${mode}`);
+          unreadable();
+        }
+      }
+    } else if (type === "tag") {
+      const tag = await repository.getTagInfo?.(id);
+      if (!tag) unreadable();
+      await check((tag as TagTargetInfo).object, undefined);
+    }
+    written.add(id);
+  };
+  for (const id of order) await check(id, undefined);
+  for (const id of fsck.pendingBlobs()) {
+    const object = await repository.loadObject?.(id);
+    if (fsck.checkPendingBlob(id, object, lines)) fail("fatal: fsck error in pack objects");
+  }
+  return lines;
 }
 
 /**
@@ -619,7 +733,20 @@ export async function connectivityErrors(
   });
   await conn.analyze(list);
   if (list.every((tip) => conn.verdict(tip).ok)) return undefined;
-  const failure = conn.failure() ?? { kind: "object" as const, id: list[0] as string };
+  return connectivityFailureLines(repository, conn, list, known);
+}
+
+/**
+ * The lines `git rev-list --objects <tips> --not <known>` prints where the walk `conn` (which
+ * found something missing) stops; see {@link connectivityErrors}.
+ */
+export async function connectivityFailureLines(
+  repository: RepositoryFacade,
+  conn: PushConnectivity,
+  tips: readonly string[],
+  known: readonly string[],
+): Promise<string[]> {
+  const failure = conn.failure() ?? { kind: "object" as const, id: tips[0] as string };
   switch (failure.kind) {
     case "object":
       return [`fatal: bad object ${failure.id}`];
