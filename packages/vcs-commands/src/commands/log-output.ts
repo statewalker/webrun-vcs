@@ -585,6 +585,25 @@ function reencodeCommit(
   return lines.join("");
 }
 
+/**
+ * pretty.c's repo_logmsg_reencode of a stored commit into `outputEncoding`, as `git commit`
+ * reads one for `-C`, `--amend`, `--fixup` and `--squash` (`read_commit_message`,
+ * `format_commit_message` with `get_commit_output_encoding()`): the message and the author
+ * from the converted buffer; undefined when nothing changes (no `encoding` header in another
+ * character set, or bytes that do not convert).
+ */
+export function reencodedCommitParts(
+  raw: Uint8Array,
+  outputEncoding: string,
+): { message: string; author: PersonIdent | undefined } | undefined {
+  const text = decodeGitPath(raw);
+  const reencoded = reencodeCommit(text, parseRaw(text), outputEncoding);
+  if (reencoded === undefined) return undefined;
+  const parsed = parseRaw(reencoded);
+  const author = parsed.headerLines.find((l) => l.startsWith("author "));
+  return { message: parsed.body, author: author ? identOf(author) : undefined };
+}
+
 /** An `author`/`committer` header line's ident (`Name <email> time zone`) */
 function identOf(line: string): PersonIdent | undefined {
   const m = /^[a-z]+ (.*?) ?<([^>]*)> ?(\d*) ?([+-]?\d*)\n?$/.exec(line);
