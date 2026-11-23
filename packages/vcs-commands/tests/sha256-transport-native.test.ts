@@ -610,7 +610,9 @@ describeGit("SHA-256 over the wire, as native git", () => {
         const n = counter++;
         const ours = `op-ours-${n}.git`;
         const native = `op-native-${n}.git`;
-        for (const d of [ours, native]) {
+        // a third copy pushed to by path: our receive-pack in process (local transport)
+        const local = `op-local-${n}.git`;
+        for (const d of [ours, native, local]) {
           git(root, "clone", "-q", "--bare", "--no-local", join(srv, "src256.git"), join(srv, d));
           noMaintenance(join(srv, d));
           writeFileSync(join(srv, d, "hooks/pre-receive"), PRE_RECEIVE, { mode: 0o755 });
@@ -641,6 +643,15 @@ describeGit("SHA-256 over the wire, as native git", () => {
         await push.call();
         expect(stateOf(join(srv, ours))).toEqual(stateOf(join(srv, native)));
         fsckClean(join(srv, ours));
+        const viaPath = mine.push().setRemote(join(srv, local));
+        for (const r of refspecs) viaPath.add(r);
+        await viaPath.call();
+        expect(stateOf(join(srv, local))).toEqual(stateOf(join(srv, native)));
+        fsckClean(join(srv, local));
+        // pre-receive heard the same 64-digit commands from every pusher
+        const hookLog = (d: string) => readFileSync(join(srv, d, "pre-receive.log"), "utf8");
+        expect(hookLog(ours)).toBe(hookLog(native));
+        expect(hookLog(local)).toBe(hookLog(native));
       });
     }
 
