@@ -15,10 +15,19 @@ async function read(files: ReturnType<typeof createInMemoryFilesApi>, path: stri
 }
 
 describe("FileWorktree refuses paths that name .git", () => {
-  const spellings = [".git", ".GIT", "git~1", ".git. ", "‌.git"];
+  // the HFS+ spellings on every platform (defence in depth, whatever git's protectHFS default)
+  const spellings: Array<[string, string | undefined]> = [
+    [".git", undefined],
+    [".GIT", undefined],
+    ["git~1", undefined],
+    [".git. ", undefined],
+    ["‌.git", undefined],
+    ["‌.git", "Linux"],
+    [".g‍it", "Darwin"],
+  ];
 
-  for (const dotgit of spellings) {
-    it(`checkoutTree does not write through a tree entry ${JSON.stringify(dotgit)}`, async () => {
+  for (const [dotgit, systemName] of spellings) {
+    it(`checkoutTree does not write through a tree entry ${JSON.stringify(dotgit)} (${systemName ?? "no system"})`, async () => {
       const files = createInMemoryFilesApi();
       await files.write("/repo/.git/config", [enc.encode("original")]);
       const stores = createMemoryHistory();
@@ -36,6 +45,7 @@ describe("FileWorktree refuses paths that name .git", () => {
         rootPath: "/repo",
         blobs: stores.blobs,
         trees: stores.trees,
+        ...(systemName ? { environment: { systemName, readFile: async () => undefined } } : {}),
       });
 
       const result = await worktree.checkoutTree(root, { force: true });
@@ -45,6 +55,22 @@ describe("FileWorktree refuses paths that name .git", () => {
       expect(await read(files, "/repo/.git/config")).toBe("original");
     });
   }
+
+  it("refuses an HFS+ spelling of .git off macOS too (regression: HFS guard kept on)", async () => {
+    const files = createInMemoryFilesApi();
+    const stores = createMemoryHistory();
+    const worktree = createFileWorktree({
+      files,
+      rootPath: "/repo",
+      blobs: stores.blobs,
+      trees: stores.trees,
+      environment: { systemName: "Linux", readFile: async () => undefined },
+    });
+    await expect(
+      worktree.writeContent("‌.git/hooks/post-checkout", enc.encode("x")),
+    ).rejects.toThrow(/Invalid worktree path/);
+    expect(worktree.capabilities?.protects).toEqual({ ntfs: true, hfs: true });
+  });
 
   it("writeContent, mkdir and rename refuse a .git path", async () => {
     const files = createInMemoryFilesApi();

@@ -8,6 +8,7 @@ import {
   FileMode,
   isValidWorktreePath,
   type ObjectId,
+  type WorktreePathOptions,
 } from "@statewalker/vcs-core";
 import { compareGitPaths, foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 import {
@@ -261,6 +262,8 @@ export class IndexAdder {
     private readonly trust: WorktreeModeTrust,
     /** git's `ADD_CACHE_PRETEND` (`add --dry-run`): nothing is written or edited */
     private readonly pretend: boolean,
+    /** `verify_path`'s rules (`core.protectNTFS`, `core.protectHFS`; default both on) */
+    private readonly pathRules: WorktreePathOptions = {},
   ) {
     this.editor = staging.createEditor();
     this.indexTime = staging.getUpdateTime();
@@ -274,9 +277,15 @@ export class IndexAdder {
     staging: Staging,
     blobs: Blobs,
     trust: WorktreeModeTrust,
-    options: { pretend?: boolean } = {},
+    options: { pretend?: boolean; pathRules?: WorktreePathOptions } = {},
   ): Promise<IndexAdder> {
-    const adder = new IndexAdder(staging, blobs, trust, options.pretend === true);
+    const adder = new IndexAdder(
+      staging,
+      blobs,
+      trust,
+      options.pretend === true,
+      options.pathRules,
+    );
     const take = (entry: StagingEntry) => {
       if (entry.stage === 0) {
         adder.basePaths.push(entry.path);
@@ -396,7 +405,7 @@ export class IndexAdder {
     // add_index_entry's verify_path (after the file is hashed; never with ADD_CACHE_PRETEND)
     if (!this.pretend) {
       const mode = modeFromWorktree(entry.mode, indexed?.mode, this.trust);
-      if (!isValidWorktreePath(name, mode)) {
+      if (!isValidWorktreePath(name, mode, this.pathRules)) {
         const shown = options.displayPath ?? path;
         throw new AddToIndexError(path, [
           `error: invalid path '${shown}'`,

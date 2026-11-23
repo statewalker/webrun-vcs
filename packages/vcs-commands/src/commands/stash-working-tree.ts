@@ -31,13 +31,13 @@ import {
   type WorkingCopy,
   type Worktree,
 } from "@statewalker/vcs-working-tree";
-
 import type { CommandTrees } from "../git-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { markIndexUpdate } from "./post-index-change.js";
 import type { StashResetOptions, StashWorkingTreeProvider } from "./stash-create-command.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import { pruneEmptyParents, removeDirectoryIfEmpty } from "./worktree-overwrite-checks.js";
+import { worktreePathRules } from "./worktree-path-rules.js";
 
 /** Names this operation in restore failure messages. */
 const STASH = "stash";
@@ -323,7 +323,7 @@ export class WorkingCopyStashProvider implements StashWorkingTreeProvider {
       ? await planTreeRestore(trees, blobs, treeId, STASH, {
           symlinks: true,
           ...(await restoreCaseOptions(worktree, coreBool(workingCopy, "ignorecase", false))),
-          windows: worktree.capabilities?.windowsPaths === true,
+          ...worktreePathRules(workingCopy, worktree),
           reservedNames: worktree.capabilities?.reservedNames,
           writing: stale,
         })

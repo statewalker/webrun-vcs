@@ -34,7 +34,6 @@ import {
   type WorktreeEntry,
   type WorktreeModeTrust,
 } from "@statewalker/vcs-working-tree";
-
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { worktreeModeTrust } from "./core-config.js";
 import { planFlatRestore, writeTreeRestorePlan } from "./tree-restore.js";
@@ -44,6 +43,7 @@ import {
   removeDirectoryIfEmpty,
   untrackedUnder,
 } from "./worktree-overwrite-checks.js";
+import { worktreePathRules } from "./worktree-path-rules.js";
 
 /** The sparse checkout's settings, as git reads them into its globals. */
 export interface SparseCheckoutConfig {
@@ -510,7 +510,7 @@ export class SparseUnpack {
         "sparse-checkout",
         {
           symlinks: true,
-          windows: worktree.capabilities?.windowsPaths === true,
+          ...worktreePathRules(ctx.workingCopy, worktree),
           reservedNames: worktree.capabilities?.reservedNames,
         },
       );
