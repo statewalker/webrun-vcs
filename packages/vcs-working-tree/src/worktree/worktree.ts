@@ -178,6 +178,13 @@ export interface WorktreeCapabilities {
    */
   windowsPaths?: boolean;
   /**
+   * The `verify_path` protections the worktree applies itself to every path it writes,
+   * whatever the configuration (`FileWorktree`: NTFS and HFS+ on every platform). Commands
+   * check tree paths at least this strictly before writing anything, so a write is never
+   * refused halfway (`worktreePathRules`).
+   */
+  protects?: { ntfs?: boolean; hfs?: boolean };
+  /**
    * Top-level names the worktree's storage reserves (a simulated-links table at its root):
    * restore plans refuse a tree entry of such a name, in any case.
    */

@@ -43,6 +43,7 @@ import {
   removeDirectoryIfEmpty,
   worktreeDiffers,
 } from "./worktree-overwrite-checks.js";
+import { worktreePathRules } from "./worktree-path-rules.js";
 
 /** A path the index and the stash changed beyond a clean merge, as git leaves it. */
 type MergeConflict = OrtConflict;
@@ -359,7 +360,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     const worktreePlan = await planTreeRestore(this.trees, this.blobs, resultTree, STASH_APPLY, {
       symlinks: true,
       ...caseOptions,
-      windows: worktree.capabilities?.windowsPaths === true,
+      ...worktreePathRules(this.workingCopy, worktree),
       reservedNames: worktree.capabilities?.reservedNames,
     });
 
@@ -833,7 +834,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     const plan = await planTreeRestore(this.trees, this.blobs, untrackedCommit.tree, STASH_APPLY, {
       symlinks: true,
       ...(await restoreCaseOptions(worktree, coreBool(this.workingCopy, "ignorecase", false))),
-      windows: worktree.capabilities?.windowsPaths === true,
+      ...worktreePathRules(this.workingCopy, worktree),
       reservedNames: worktree.capabilities?.reservedNames,
     });
 

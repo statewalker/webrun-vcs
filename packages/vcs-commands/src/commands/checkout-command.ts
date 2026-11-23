@@ -53,6 +53,7 @@ import {
 import {
   IncompatibleOptionsError,
   InvalidArgumentError,
+  InvalidPathError,
   InvalidRefNameError,
   MissingArgumentError,
   NoHeadError,
@@ -103,6 +104,7 @@ import {
   overwriteMessage,
   pruneEmptyParents,
 } from "./worktree-overwrite-checks.js";
+import { firstInvalidPath, withTreePathRefusal, worktreePathRules } from "./worktree-path-rules.js";
 import { refuseIfCheckedOut, shortBranchName } from "./worktree-support.js";
 
 /** git's `apply_save_autostash_oid` advice when the autostash conflicts. */
@@ -1176,13 +1178,22 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     const head = new Map<string, Side>();
     const target = new Map<string, Side>();
     if (headTreeId) await this.collectTreeEntries(headTreeId, "", head);
-    if (targetTreeId) await this.collectTreeEntries(targetTreeId, "", target);
+    const pathRules = worktreePathRules(this.workingCopy, worktree);
+    // a tree entry the decoder refuses (`..`, `/` in a name, an empty name): git's message
+    if (targetTreeId) {
+      await withTreePathRefusal(this.trees, [targetTreeId], pathRules, () =>
+        this.collectTreeEntries(targetTreeId, "", target),
+      );
+    }
     const index = new Map<string, Side>();
     const unmerged = new Set<string>();
     for await (const entry of this.staging.entries()) {
       if (entry.stage === 0) index.set(entry.path, entry);
       else unmerged.add(entry.path);
     }
+    // add_index_entry's verify_path: a path git refuses stops the switch before any write
+    const invalid = firstInvalidPath(target, index, pathRules);
+    if (invalid !== undefined) throw new InvalidPathError(invalid);
 
     // (an orphan branch keeps index and worktree as they are, as git's checkout --orphan;
     // switch --orphan switches to the empty tree)
@@ -1381,7 +1392,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         ? await planTreeRestore(this.trees, this.blobs, targetTreeId, CHECKOUT, {
             symlinks: true,
             ...(await restoreCaseOptions(worktree, ignoreCase)),
-            windows: worktree.capabilities?.windowsPaths === true,
+            ...worktreePathRules(this.workingCopy, worktree),
             reservedNames: worktree.capabilities?.reservedNames,
           })
         : undefined;

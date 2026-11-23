@@ -2,6 +2,7 @@
  * `git mv` (builtin/mv.c): move or rename files, directories and submodules in the worktree
  * and the index together.
  */
+
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
@@ -12,7 +13,6 @@ import {
   type Worktree,
   type WorktreeModeTrust,
 } from "@statewalker/vcs-working-tree";
-
 import { MvFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { worktreeModeTrust } from "./core-config.js";
@@ -27,6 +27,7 @@ import {
   statFollowingLinks,
   statThroughLeadingLinks,
 } from "./worktree-overwrite-checks.js";
+import { worktreePathRules } from "./worktree-path-rules.js";
 
 /** One move `git mv` made (or, with `-n`, would make). */
 export interface MvRename {
@@ -511,7 +512,9 @@ export class MvCommand extends GitCommand<MvResult> {
 
     // the moves
     const sparseConfig = sparseCheckoutConfig(this.workingCopy);
-    const adder = await IndexAdder.open(this.staging, this.blobs, trust);
+    const adder = await IndexAdder.open(this.staging, this.blobs, trust, {
+      pathRules: worktreePathRules(this.workingCopy),
+    });
     const current = new Map<string, IndexEntry>();
     for (const e of cache) if (e.stage === 0) current.set(e.path, e);
     const dirtyPaths: string[] = [];
@@ -679,7 +682,7 @@ export class MvCommand extends GitCommand<MvResult> {
     for (const e of entries) target.set(e.path, e);
     const plan = await planFlatRestore(this.blobs, target, new Set(target.keys()), "mv", {
       symlinks: true,
-      windows: worktree.capabilities?.windowsPaths === true,
+      ...worktreePathRules(this.workingCopy, worktree),
       reservedNames: worktree.capabilities?.reservedNames,
     });
     const attributes = new Map<string, ObjectId>();

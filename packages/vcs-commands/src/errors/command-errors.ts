@@ -99,7 +99,8 @@ export class ReadTreeFailedError extends GitApiError {
     /** The paths unpack-trees refused */
     readonly paths: readonly string[] = [],
   ) {
-    super(message);
+    // read-tree returns 128 when unpack_trees fails, whatever its message
+    super(message, { exitCode: 128 });
     this.name = "ReadTreeFailedError";
   }
 }

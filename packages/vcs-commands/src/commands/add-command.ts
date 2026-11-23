@@ -15,7 +15,6 @@ import {
   withWorktreeEntries,
   worktreeEntryChunks,
 } from "@statewalker/vcs-working-tree";
-
 import {
   AddFailedError,
   IncompatibleOptionsError,
@@ -57,6 +56,7 @@ import {
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
 import { sparsePathAdvice } from "./sparse-checkout-support.js";
+import { worktreePathRules } from "./worktree-path-rules.js";
 /**
  * Result of AddCommand execution.
  *
@@ -737,7 +737,10 @@ export class AddCommand extends GitCommand<AddResult> {
     }
 
     const trust = worktreeModeTrust(this.workingCopy, worktree);
-    const adder = await IndexAdder.open(this.staging, this.blobs, trust, { pretend: this.dryRun });
+    const adder = await IndexAdder.open(this.staging, this.blobs, trust, {
+      pretend: this.dryRun,
+      pathRules: worktreePathRules(this.workingCopy),
+    });
     const failed: string[] = [];
     const errors: string[] = [];
     const addedSet = new Set<string>();
@@ -1374,7 +1377,10 @@ export class AddCommand extends GitCommand<AddResult> {
       }
     }
     const trust = worktreeModeTrust(this.workingCopy, worktree);
-    const adder = await IndexAdder.open(this.staging, this.blobs, trust, { pretend: this.dryRun });
+    const adder = await IndexAdder.open(this.staging, this.blobs, trust, {
+      pretend: this.dryRun,
+      pathRules: worktreePathRules(this.workingCopy),
+    });
     for (const { path, entries } of index) {
       const entry = entries[0] as StagingEntry;
       if (entry.stage !== 0 || entry.skipWorktree || this.outsideSparse(path)) continue;
