@@ -152,3 +152,26 @@ export class NotMergedError extends GitApiError {
     this.branchName = branchName;
   }
 }
+
+/**
+ * A refusal of git's ref-filter (`for-each-ref`, and the listings of `branch` and `tag`): a
+ * format or sort key it cannot parse, a value it cannot compute, a revision an option
+ * cannot name. The message is git's stderr (`fatal: unknown field name: foo`, or an
+ * `error:` line for a usage error), and {@link GitApiError.exitCode} its status (128 where
+ * git dies, 129 where it prints the usage).
+ *
+ * @example
+ * ```typescript
+ * try {
+ *   await git.forEachRef().setFormat("%(bogus)").call();
+ * } catch (e) {
+ *   if (e instanceof RefFilterError) console.error(e.message); // fatal: unknown field name: bogus
+ * }
+ * ```
+ */
+export class RefFilterError extends GitApiError {
+  constructor(message: string, exitCode?: number) {
+    super(message, exitCode !== undefined ? { exitCode } : undefined);
+    this.name = "RefFilterError";
+  }
+}
