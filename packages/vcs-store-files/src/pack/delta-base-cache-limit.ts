@@ -51,7 +51,12 @@ export async function readPackSetSettings(
     /** The config already loaded for these options: read instead of loading it again */
     config?: Pick<GitWorkingCopyConfig, "get">;
   } = {},
-): Promise<{ baseCacheBytes?: number; multiPackIndex: boolean }> {
+): Promise<{
+  baseCacheBytes?: number;
+  multiPackIndex: boolean;
+  writeReverseIndex: boolean;
+  readReverseIndex: boolean;
+}> {
   const config =
     options.config ??
     (await createWorkingCopyConfig(
@@ -73,11 +78,24 @@ export async function readPackSetSettings(
         ? midx
         : (parseGitBool(String(midx)) ?? true);
   const baseCacheBytes = parseConfigSize(config.get("core.deltaBaseCacheLimit"));
-  return { ...(baseCacheBytes !== undefined ? { baseCacheBytes } : {}), multiPackIndex };
+  return {
+    ...(baseCacheBytes !== undefined ? { baseCacheBytes } : {}),
+    multiPackIndex,
+    // git 2.41+ defaults: .rev files written with every pack and read where present
+    writeReverseIndex: configBool(config.get("pack.writeReverseIndex"), true),
+    readReverseIndex: configBool(config.get("pack.readReverseIndex"), true),
+  };
+}
+
+/** A boolean setting with its default (an empty value is false, as git_config_bool). */
+export function configBool(value: unknown, fallback: boolean): boolean {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value === "boolean") return value;
+  return parseGitBool(String(value)) ?? fallback;
 }
 
 /** A size as git_parse_ulong reads it (decimal, 0x hex or 0 octal, then k, m or g). */
-function parseConfigSize(value: unknown): number | undefined {
+export function parseConfigSize(value: unknown): number | undefined {
   if (typeof value === "number")
     return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
   if (typeof value !== "string") return undefined;
@@ -94,4 +112,22 @@ function parseConfigSize(value: unknown): number | undefined {
   const factor = unit === "k" ? 1024 : unit === "m" ? 1024 ** 2 : unit === "g" ? 1024 ** 3 : 1;
   const size = magnitude * factor;
   return Number.isSafeInteger(size) ? size : undefined;
+}
+
+/** An integer as git_config_int reads it (sign, decimal, 0x hex or 0 octal, then k, m or g). */
+export function parseConfigInt(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isSafeInteger(value) ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const match = /^\s*([-+]?)(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)([kKmMgG]?)\s*$/.exec(value);
+  if (!match) return undefined;
+  const digits = match[2] as string;
+  const magnitude =
+    digits.length > 2 && (digits[1] === "x" || digits[1] === "X")
+      ? Number.parseInt(digits.slice(2), 16)
+      : digits.length > 1 && digits.startsWith("0")
+        ? Number.parseInt(digits.slice(1), 8)
+        : Number.parseInt(digits, 10);
+  const unit = { "": 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[(match[3] as string).toLowerCase()];
+  const n = magnitude * (unit ?? 1) * (match[1] === "-" ? -1 : 1);
+  return Number.isSafeInteger(n) ? n : undefined;
 }

@@ -25,6 +25,7 @@ import {
   scanPackObjects,
   type Trees,
   verifyCommitGraph,
+  verifyReverseIndexFile,
 } from "@statewalker/vcs-core";
 import { multiPackIndexVerify } from "@statewalker/vcs-store-files";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
@@ -87,6 +88,8 @@ export const FSCK_ERROR_REFS = 0o10;
 export const FSCK_ERROR_COMMIT_GRAPH = 0o20;
 /** `git multi-pack-index verify` failed, in git 2.43 (its ERROR_MULTI_PACK_INDEX; 2.5x: object bit). */
 export const FSCK_ERROR_MULTI_PACK_INDEX_243 = 0o40;
+/** A pack's `.rev` file is invalid, in git 2.43 (its ERROR_PACK_REV_INDEX; 2.5x: object bit). */
+export const FSCK_ERROR_PACK_REV_INDEX_243 = 0o100;
 /** A bitmap file's checksum is wrong, in git 2.43 (its ERROR_BITMAP; 2.5x sets the object bit). */
 export const FSCK_ERROR_BITMAP_243 = 0o200;
 
@@ -778,6 +781,9 @@ class FsckRun {
           else {
             const packs = step.packs.map((k) => this.packs[k] as RepoPack);
             await this.fsckPacks(packs);
+            // 2.5x's verify_reverse_indices, then verify_bitmap_files
+            if (this.o.compatibility === "2.56" && (await this.verifyReverseIndexes(packs)))
+              this.errorsFound |= FSCK_ERROR_OBJECT;
             // 2.5x's verify_bitmap_files, after the source's packs (2.43: at the end)
             if (
               this.o.compatibility === "2.56" &&
@@ -846,6 +852,13 @@ class FsckRun {
         }
       }
       await this.verifyCommitGraph();
+      // 2.43's check_pack_rev_indexes, --connectivity-only too (ERROR_PACK_REV_INDEX, 0100)
+      if (
+        this.files &&
+        this.o.compatibility === "2.43" &&
+        (await this.verifyReverseIndexes(this.packs))
+      )
+        this.errorsFound |= FSCK_ERROR_PACK_REV_INDEX_243;
       // 2.43 checks every pack's bitmap last, --connectivity-only too (ERROR_BITMAP, 0200)
       if (
         this.files &&
@@ -2076,6 +2089,24 @@ class FsckRun {
       );
       if (r > 0) this.errorsFound |= FSCK_ERROR_OBJECT;
     }
+  }
+
+  /**
+   * git's check of each pack's `.rev` (`verify_reverse_indices`; 2.43's
+   * check_pack_rev_indexes): a missing file is fine. True if one is wrong.
+   */
+  private async verifyReverseIndexes(packs: readonly RepoPack[]): Promise<boolean> {
+    const files = this.files as FilesApi;
+    let bad = false;
+    for (const p of packs) {
+      const lines = await verifyReverseIndexFile(files, p.packPath, p.idx.objectCount, (i) =>
+        p.idx.getOffset(i),
+      );
+      if (!lines) continue;
+      for (const line of lines) this.error(line.replace(/^error: /, ""));
+      bad = true;
+    }
+    return bad;
   }
 
   /**

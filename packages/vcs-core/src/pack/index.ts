@@ -19,6 +19,7 @@ export * from "./pack-file.js";
 export * from "./pack-index-reader.js";
 export * from "./pack-index-writer.js";
 export * from "./pack-order-scan.js";
+export * from "./pack-reverse-index.js";
 export * from "./pack-set.js";
 export * from "./random-access-delta.js";
 export * from "./run-steps.js";

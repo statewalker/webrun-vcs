@@ -38,6 +38,11 @@ import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { assertAlternatesReadable } from "./alternates/index.js";
 import { type MultiPackIndexWriteOptions, multiPackIndexWrite } from "./multi-pack-index.js";
+import {
+  type PackWriteSettings,
+  packDeltaSearch,
+  readPackWriteSettings,
+} from "./pack/pack-write-settings.js";
 import { type PromisorExclusions, promisorExclusions } from "./promisor-objects.js";
 import { listReachableObjects } from "./reachable-objects.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
@@ -152,6 +157,12 @@ export interface RepackOptions extends RepackTarget {
    * `--stdin-packs`). A bitmap asked for (`writeBitmaps`) then goes to the midx, not the pack.
    */
   writeMidx?: boolean;
+  /**
+   * The `pack.*` settings (`readPackWriteSettings`): read from the config (with
+   * `environment`'s system, global and command-line config) when not given. `deltaSearch`
+   * given as an object overrides their window and depth.
+   */
+  packSettings?: PackWriteSettings;
   /** @internal writes the midx bitmap (see `MultiPackIndexWriteOptions.writeBitmap`) */
   writeMidxBitmap?: MultiPackIndexWriteOptions["writeBitmap"];
 }
@@ -497,17 +508,26 @@ export async function repackListed(
     };
   }
 
+  // pack-objects' own settings: pack.window, pack.depth, pack.compression, ...
+  const settings =
+    options.packSettings ??
+    (await readPackWriteSettings(files, gitDir, {
+      ...(options.environment ? { environment: options.environment } : {}),
+    }));
   const packOptions = {
     packs,
     reuseObjects: options.reuseObjects ?? true,
     reuseDeltas: options.reuseDeltas ?? true,
-    deltaSearch: options.deltaSearch ?? true,
+    deltaSearch: packDeltaSearch(settings, options.deltaSearch),
     bigFileThreshold: options.bigFileThreshold,
+    ...(settings.compression !== undefined ? { compression: settings.compression } : {}),
   };
+  // pack.writeReverseIndex: a `.rev` beside each pack written (git 2.41+ default)
+  const installOptions = { writeReverseIndex: settings.writeReverseIndex };
   // the promisor pack first, with its (empty) `.promisor` file, as repack-promisor.c writes it
   let promisorPack: string | undefined;
   if (promised.length > 0) {
-    const written = await packs.install(writePack(objects, promised, packOptions));
+    const written = await packs.install(writePack(objects, promised, packOptions), installOptions);
     promisorPack = written.packId;
     if (packs.writePromisor) await packs.writePromisor(promisorPack, "");
     else await files.write(joinPath(packDir, `pack-${promisorPack}.promisor`), []);
@@ -518,7 +538,7 @@ export async function repackListed(
   }
   // One stream: objects are read one at a time, the pack goes straight into its temporary file
   const stream = writePack(objects, ids, packOptions);
-  const installed = await packs.install(stream);
+  const installed = await packs.install(stream, installOptions);
   // Install before remove: every reader finds each object in the new pack from now on
   await packs.refresh();
   let bitmapWritten: boolean;
@@ -559,7 +579,8 @@ export async function repackListed(
         }
       }
       if (left.length > 0) {
-        filteredPack = (await packs.install(writePack(objects, left, packOptions))).packId;
+        filteredPack = (await packs.install(writePack(objects, left, packOptions), installOptions))
+          .packId;
         newPacks.add(filteredPack);
         await packs.refresh();
       }
