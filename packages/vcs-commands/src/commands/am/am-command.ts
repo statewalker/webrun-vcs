@@ -47,6 +47,7 @@ import { ortResultEntries } from "../ort-merge.js";
 import { mergeStoredTrees, storedBase } from "../ort-recursive.js";
 import { updateHead, updateHeadExpecting } from "../reflog-messages.js";
 import { removeBranchState, resetMerge, resetUnmergedToHead } from "../sequencer-support.js";
+import { SIGNING_FAILED_LINES, signRequestOf } from "../signing.js";
 import { appendSignoff } from "../trailers.js";
 import { mailinfo, mailsplit } from "./mailinfo.js";
 import {
@@ -143,6 +144,8 @@ export class AmCommand extends GitCommand<AmResult> {
   private scissors?: boolean;
   private quiet = false;
   private noVerify = false;
+  /** `-S[<keyid>]` / `--no-gpg-sign` (undefined: `commit.gpgSign`) */
+  private sign?: boolean | string;
   private utf8 = true;
   private ignoreDate = false;
   private committerDateIsAuthorDate = false;
@@ -234,6 +237,26 @@ export class AmCommand extends GitCommand<AmResult> {
   setNoVerify(value: boolean): this {
     this.checkCallable();
     this.noVerify = value;
+    return this;
+  }
+
+  /**
+   * `-S` (true) / `--no-gpg-sign` (false): whether to sign the commits; undefined (the
+   * default) leaves it to `commit.gpgSign`. No signer exists yet: a patch to commit signed
+   * fails as git's does when gpg cannot sign (`error: gpg failed to sign the data:`,
+   * `fatal: failed to write commit object`, exit 128), the patch left applied to the index
+   * in `.git/rebase-apply` and nothing committed.
+   */
+  setSign(sign: boolean | undefined): this {
+    this.checkCallable();
+    this.sign = sign;
+    return this;
+  }
+
+  /** `-S<keyid>`: sign with this key (see {@link setSign}). */
+  setSigningKey(keyId: string): this {
+    this.checkCallable();
+    this.sign = keyId;
     return this;
   }
 
@@ -921,6 +944,11 @@ export class AmCommand extends GitCommand<AmResult> {
     author = { ...author, name: latin1ToPath(author.name), email: latin1ToPath(author.email) };
     const message = latin1ToPath(msg);
     const parents = head ? [head] : [];
+    // commit_tree_extended signs before writing: no signer, git's failure
+    if (signRequestOf(this.workingCopy, this.sign) !== undefined) {
+      this.err += `${SIGNING_FAILED_LINES.join("\n")}\n`;
+      this.fatal("failed to write commit object");
+    }
     const objects = this.workingCopy.history?.objects;
     let id: ObjectId;
     if (!isUtf8Encoding(commitEncoding) && objects) {

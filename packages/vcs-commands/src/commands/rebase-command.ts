@@ -96,6 +96,7 @@ import {
   removeBranchState,
   resetMerge,
 } from "./sequencer-support.js";
+import { SIGNING_FAILED_LINES, type SignRequest, signRequestOf } from "./signing.js";
 import { appendSignoff, trailerConfigOf } from "./trailers.js";
 import { worktreeModified } from "./worktree-overwrite-checks.js";
 import { usesBranch } from "./worktree-support.js";
@@ -259,6 +260,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private ignoreDate = false;
   /** `--signoff` (kept in `rebase-merge/signoff`) */
   private signoff = false;
+  /** `-S[<keyid>]` / `--no-gpg-sign` (undefined: `commit.gpgSign`; kept in `gpg_sign_opt`) */
+  private sign?: boolean | string;
+  /** What this run signs with (git's opts->gpg_sign), once known */
+  private runSign?: { key: SignRequest };
   private autoStash?: boolean;
   private reapplyCherryPicks = false;
   /** `--rebase-merges` (undefined: `rebase.rebaseMerges`) */
@@ -531,6 +536,43 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     this.checkCallable();
     this.signoff = value;
     return this;
+  }
+
+  /**
+   * `-S` (true) / `--no-gpg-sign` (false): whether to sign the commits the rebase makes;
+   * undefined (the default) leaves it to `commit.gpgSign`. Kept in
+   * `rebase-merge/gpg_sign_opt` for `--continue`. No signer exists yet: a pick that must
+   * commit fails as git's does when gpg cannot sign (`error: gpg failed to sign the data:`,
+   * `error: failed to write commit object`) and the rebase stops there (2.5x: `Could not
+   * apply ...`, the pick to commit; 2.43: the pick rescheduled), the branch untouched.
+   * Picks kept as they are (fast-forwarded) sign nothing, as in git.
+   */
+  setSign(sign: boolean | undefined): this {
+    this.checkCallable();
+    this.sign = sign;
+    return this;
+  }
+
+  /** `-S<keyid>`: sign with this key (see {@link setSign}). */
+  setSigningKey(keyId: string): this {
+    this.checkCallable();
+    this.sign = keyId;
+    return this;
+  }
+
+  /**
+   * The key this run's commits are signed with: the one it started with, else (a
+   * `--continue`) `rebase-merge/gpg_sign_opt` over `commit.gpgSign` (read_populate_opts).
+   */
+  private async signRequest(state: OperationState): Promise<SignRequest> {
+    if (this.runSign) return this.runSign.key;
+    const saved = (await state.read(`${DIR}/gpg_sign_opt`))?.replace(/\n$/, "");
+    const key =
+      saved?.startsWith("-S") === true
+        ? saved.slice(2)
+        : signRequestOf(this.workingCopy, undefined);
+    this.runSign = { key };
+    return key;
   }
 
   /**
@@ -900,6 +942,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await state.write(`${DIR}/head-name`, `${headName}\n`);
     await state.write(`${DIR}/onto`, `${onto}\n`);
     await state.write(`${DIR}/orig-head`, `${headId}\n`);
+    // write_basic_state: gpg_sign_opt (`-S<key>`) when the run signs
+    const sign = signRequestOf(this.workingCopy, this.sign);
+    this.runSign = { key: sign };
+    if (sign !== undefined) await state.write(`${DIR}/gpg_sign_opt`, `-S${sign}\n`);
     if (this.signoff) await state.write(`${DIR}/signoff`, "--signoff\n");
     if (emptyMode === "drop") await state.write(`${DIR}/drop_redundant_commits`, "");
     if (emptyMode === "keep") await state.write(`${DIR}/keep_redundant_commits`, "");
@@ -1587,6 +1633,25 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
       // try_to_commit: a signed-off message is cleaned up as whitespace (else verbatim)
       const message = signoff ? stripspace(pickedMessage) : pickedMessage;
+      // commit_tree signs: no signer, git's failure (2.43 reschedules the pick, 2.5x stops
+      // as after a conflict, the merged result staged for `--continue`)
+      if ((await this.signRequest(state)) !== undefined) {
+        const lines = [...SIGNING_FAILED_LINES, "error: failed to write commit object"];
+        if (this.hooks.compatibility === "2.43") {
+          await state.setRef("CHERRY_PICK_HEAD", item.id);
+          return {
+            kind: "reschedule",
+            result: {
+              status: RebaseStatus.FAILED,
+              currentCommit: item.id,
+              message: lines.join("\n"),
+              reschedule: true,
+            },
+          };
+        }
+        await state.setRef("CHERRY_PICK_HEAD", item.id);
+        return { kind: "conflicts", conflicts: [], message: pickedMessage, lines };
+      }
       // do_pick_commit writes CHERRY_PICK_HEAD for the commit to come; do_commit deletes it
       // once try_to_commit made it
       await state.withRefDuring("CHERRY_PICK_HEAD", item.id, () =>

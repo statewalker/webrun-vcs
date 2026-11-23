@@ -65,6 +65,7 @@ import {
 import { PathspecAttributes } from "./pathspec-attributes.js";
 import { type CommitReflogKind, reflogMessages, updateHead } from "./reflog-messages.js";
 import { applyAutostash } from "./sequencer-support.js";
+import { refuseCommitSigning, signRequestOf } from "./signing.js";
 import {
   cutLine,
   readShowUntrackedFiles,
@@ -144,6 +145,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private amend = false;
   private noPostRewrite = false;
   private noVerify = false;
+  /** `-S[<keyid>]` / `--no-gpg-sign` (undefined: `commit.gpgSign`) */
+  private sign?: boolean | string;
   private allowEmpty = false;
   private parents: ObjectId[] = [];
   private onlyPaths: string[] = [];
@@ -303,6 +306,26 @@ export class CommitCommand extends GitCommand<CommitResult> {
   setNoVerify(noVerify: boolean): this {
     this.checkCallable();
     this.noVerify = noVerify;
+    return this;
+  }
+
+  /**
+   * `-S` (true) / `--no-gpg-sign` (false): whether to sign the commit; undefined (the
+   * default) leaves it to `commit.gpgSign`. No signer exists yet, so a commit asked to be
+   * signed fails as git fails when gpg cannot sign (`error: gpg failed to sign the data:`,
+   * `fatal: failed to write commit object`, exit 128: {@link SigningFailedError}) once
+   * everything before the signing is done, and nothing is committed.
+   */
+  setSign(sign: boolean | undefined): this {
+    this.checkCallable();
+    this.sign = sign;
+    return this;
+  }
+
+  /** `-S<keyid>`: sign with this key (see {@link setSign}). */
+  setSigningKey(keyId: string): this {
+    this.checkCallable();
+    this.sign = keyId;
     return this;
   }
 
@@ -1445,6 +1468,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
       message: finalMessage,
     };
 
+    // commit_tree_extended signs the commit before writing it: no signer, git's failure
+    refuseCommitSigning(signRequestOf(this.workingCopy, this.sign));
     const commitId = await this.commits.store(commit);
 
     // Update HEAD/branch ref, with git's reflog line in the branch's log and HEAD's
