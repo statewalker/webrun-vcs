@@ -530,10 +530,20 @@ export async function gcTwins(
         l.split(twin).join("<twin>"),
       );
     expect(aux(ours), `round ${n}`).toEqual(aux(native));
-    return { a, b, result, stderr: theirs.stderr };
+    return { a, b, result, stderr: theirs.stderr, t0 };
   };
   const first = await round(1);
-  if (run.twice ?? true) await round(2);
+  if (run.twice ?? true) {
+    // A cruft pack dates an unreachable object found in a pack by that pack's mtime
+    // (pack-objects.c, `p->mtime`), and each twin's first gc wrote its packs at its own time
+    // (native's first): date the packs written since the first round began a day back, the
+    // same in both twins, so the second round's cruft times are compared exactly and differ
+    // from the current time. A day is inside every expiry the twins use (`now` excepted, which
+    // both times are past). A file's mtime comes from the kernel's coarse clock, which may lag
+    // Date.now() (`t0 - 1`); a fixture's pack of that second is dated alike in both twins.
+    for (const twin of [native, ours]) datePacksSince(gitDirOf(twin), first.t0 - 1, first.t0 - DAY);
+    await round(2);
+  }
   return {
     native: first.a,
     ours: first.b,
@@ -541,6 +551,17 @@ export async function gcTwins(
     nativeStderr: first.stderr,
     twins: { native, ours },
   };
+}
+
+/** Sets the mtime of every `.pack` in `gitDir` dated `since` or later (seconds) to `time`. */
+function datePacksSince(gitDir: string, since: number, time: number) {
+  const packDir = join(gitDir, "objects", "pack");
+  if (!existsSync(packDir)) return;
+  for (const name of readdirSync(packDir)) {
+    if (!name.endsWith(".pack")) continue;
+    const path = join(packDir, name);
+    if (Math.floor(statSync(path).mtimeMs / 1000) >= since) utimesSync(path, time, time);
+  }
 }
 
 /** A scenario directory `<root>/<name>` with an empty `src`; returns the case directory. */
