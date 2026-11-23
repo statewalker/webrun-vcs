@@ -351,6 +351,14 @@ export function gcSnapshot(
   for (const n of existsSync(rr) ? readdirSync(rr) : [])
     if (statSync(join(rr, n)).isDirectory()) rrCache.push(`${n}/`);
   rrCache.sort();
+  // temporaries: objects/tmp_*, objects/<fan-out>/tmp_obj_* (pack/tmp_* are listed above)
+  const objectsDir = join(gitDir, "objects");
+  for (const n of readdirSync(objectsDir)) {
+    if (n.startsWith("tmp_")) other.push(`objects/${n}`);
+    else if (/^[0-9a-f]{2}$/.test(n))
+      for (const m of readdirSync(join(objectsDir, n)))
+        if (!/^[0-9a-f]{38}$/.test(m)) other.push(`objects/${n}/${m}`);
+  }
   for (const n of ["gc.pid", "gc.log", "packed-refs.lock", "shallow.lock"])
     if (existsSync(join(gitDir, n))) other.push(n);
   return {
@@ -369,6 +377,19 @@ export function gcSnapshot(
   };
 }
 
+/**
+ * git's documented reflog expiry defaults, given to native gc on its command line: git 2.56.x
+ * swapped them in `REFLOG_EXPIRE_OPTIONS_INIT` (30 days total, 90 unreachable), so without them
+ * the twins would compare that release's bug. A repository's own `gc.reflogExpire*` must not be
+ * set in such twins (the command line wins).
+ */
+export const REFLOG_EXPIRY_DEFAULTS = [
+  "-c",
+  "gc.reflogExpire=90.days.ago",
+  "-c",
+  "gc.reflogExpireUnreachable=30.days.ago",
+];
+
 /** Native git's result in a twin: exit code, stderr. */
 export function nativeGc(
   home: string,
@@ -376,7 +397,7 @@ export function nativeGc(
   args: string[],
   env: Record<string, string> = {},
 ): { status: number | null; stderr: string } {
-  const r = spawnSync("git", ["gc", ...args], {
+  const r = spawnSync("git", [...REFLOG_EXPIRY_DEFAULTS, "gc", ...args], {
     cwd: repo,
     env: gcEnv(home, { ...bareEnv(repo), ...env }),
   });

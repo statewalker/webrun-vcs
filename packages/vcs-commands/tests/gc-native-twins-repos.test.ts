@@ -299,8 +299,13 @@ describeGit("gc twins: --auto", () => {
     r.git(["repack", "-adq"]);
     r.commit("loose", { "l.txt": "l\n" });
     for (const content of seventeenBlobs(3, "x")) r.blob(content);
-    const { result } = await gcTwins(root, caseDir, { ...auto, twice: false });
+    const { result, nativeStderr } = await gcTwins(root, caseDir, { ...auto, twice: false });
     expect(result.details?.autoRepack).toBe("incremental");
+    // git's messages and its "too many unreachable loose objects" warning
+    const lines = nativeStderr.split("\n").filter(Boolean);
+    expect(lines.filter((l) => l.startsWith("warning:"))).toEqual(result.warnings ?? []);
+    expect(result.warnings?.length).toBe(1);
+    expect(lines.filter((l) => !l.startsWith("warning:"))).toEqual(result.messages);
   });
 
   it("t6500-gc: too many packs (gc.autoPackLimit) makes it a full repack", async () => {

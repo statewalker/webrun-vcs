@@ -211,6 +211,139 @@ describeGit("gc twins: objects", () => {
   });
 });
 
+describeGit("gc twins: expiry and storage", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "gc-twins-expiry-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  function base(name: string) {
+    const caseDir = newCase(root, name);
+    const r = initRepo(root, caseDir);
+    r.commit("one", { "a.txt": "a\n" });
+    r.commit("two", { "a.txt": "a2\n", "b.txt": "b\n" });
+    return { caseDir, r };
+  }
+
+  it("t5304-prune 'prune --expire': --prune=<date> between two ages", async () => {
+    const { caseDir, r } = base("prune-date");
+    r.age(r.blob("three days\n"), 3);
+    r.age(r.blob("ten days\n"), 10);
+    await gcTwins(root, caseDir, {
+      args: ["--prune=1.week.ago"],
+      ours: (g) => g.setPrune("1.week.ago"),
+      graceSeconds: 7 * DAY,
+    });
+  });
+
+  it("t5304-prune 'gc: prune old objects after local clone' / gc.pruneExpire in days", async () => {
+    const { caseDir, r } = base("prune-config");
+    r.age(r.blob("three days\n"), 3);
+    r.age(r.blob("ten days\n"), 10);
+    r.git(["config", "gc.pruneExpire", "5.days.ago"]);
+    await gcTwins(root, caseDir, { graceSeconds: 5 * DAY });
+  });
+
+  it("t5304-prune 'prune: prune former temporary objects' / stale temporaries", async () => {
+    const { caseDir, r } = base("temporaries");
+    const { mkdirSync, writeFileSync, utimesSync } = await import("node:fs");
+    const objects = join(r.gitDir, "objects");
+    const files = [
+      [join(objects, "ab"), "tmp_obj_old", 30],
+      [join(objects, "ab"), "tmp_obj_young", 1],
+      [join(objects, "pack"), "tmp_pack_old", 30],
+      [join(objects, "pack"), "tmp_idx_young", 1],
+    ] as const;
+    for (const [dir, name, days] of files) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, name), "x");
+      utimesSync(join(dir, name), NOW - days * DAY, NOW - days * DAY);
+    }
+    await gcTwins(root, caseDir, { twice: false });
+  });
+
+  it("t5304-prune: --prune=now removes the young temporaries too", async () => {
+    const { caseDir, r } = base("temporaries-now");
+    const { mkdirSync, writeFileSync, utimesSync } = await import("node:fs");
+    const dir = join(r.gitDir, "objects", "cd");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "tmp_obj_young"), "x");
+    utimesSync(join(dir, "tmp_obj_young"), NOW - DAY, NOW - DAY);
+    await gcTwins(root, caseDir, { args: ["--prune=now"], ours: (g) => g.setPrune("now") });
+  });
+
+  it("t6500-gc: gc.cruftPacks=false, an old pack's unreachable objects are dropped", async () => {
+    const { caseDir, r } = base("no-cruft-old");
+    r.git(["checkout", "-q", "-b", "gone"]);
+    r.commit("gone", { "g.txt": "g\n" });
+    r.git(["checkout", "-q", "main"]);
+    r.git(["repack", "-adq"]);
+    r.git(["branch", "-D", "gone"]);
+    r.git(["reflog", "expire", "--expire=now", "--all"]);
+    r.agePacks(30);
+    r.git(["config", "gc.cruftPacks", "false"]);
+    await gcTwins(root, caseDir);
+  });
+
+  it("t5329-pack-objects-cruft 'gc.maxCruftSize'", async () => {
+    const { caseDir, r } = base("max-cruft");
+    for (let i = 0; i < 3; i++) {
+      const noise = Array.from({ length: 30000 }, (_, k) => ((k * 2654435761 + i) >>> 7) % 997).join(",");
+      r.blob(`${i}:${noise}\n`);
+    }
+    r.git(["config", "gc.maxCruftSize", "1m"]);
+    await gcTwins(root, caseDir);
+  });
+
+  it("t5319-multi-pack-index: gc replaces a multi-pack-index over the packs it removes", async () => {
+    const { caseDir, r } = base("midx");
+    r.git(["repack", "-dq"]);
+    r.commit("three", { "c.txt": "c\n" });
+    r.git(["repack", "-dq"]);
+    r.git(["multi-pack-index", "write"]);
+    await gcTwins(root, caseDir);
+  });
+
+  it("t5324-split-commit-graph: gc replaces a split commit-graph chain", async () => {
+    const { caseDir, r } = base("split-graph");
+    r.git(["commit-graph", "write", "--reachable", "--split"]);
+    r.commit("three", { "c.txt": "c\n" });
+    r.git(["commit-graph", "write", "--reachable", "--split"]);
+    await gcTwins(root, caseDir);
+  });
+
+  it("t6500-gc: extensions.preciousObjects skips the repack and prune", async () => {
+    const { caseDir, r } = base("precious");
+    r.age(r.blob("old\n"), 30);
+    r.git(["config", "core.repositoryformatversion", "1"]);
+    r.git(["config", "extensions.preciousObjects", "true"]);
+    await gcTwins(root, caseDir);
+  });
+
+  it("t7700-repack: repack.writeBitmaps=true in a non-bare repository", async () => {
+    const { caseDir, r } = base("bitmap-nonbare");
+    r.git(["config", "repack.writeBitmaps", "true"]);
+    const twins = await gcTwins(root, caseDir);
+    expect(twins.native.packs.some((p) => p.files.includes("bitmap"))).toBe(true);
+  });
+
+  it("t7700-repack: repack.writeBitmaps=true with a .keep pack warns and writes none", async () => {
+    const { caseDir, r } = base("bitmap-keep");
+    r.git(["repack", "-adq"]);
+    const { readdirSync, writeFileSync } = await import("node:fs");
+    const dir = join(r.gitDir, "objects", "pack");
+    const name = readdirSync(dir).find((n) => n.endsWith(".pack")) as string;
+    writeFileSync(join(dir, name.replace(/\.pack$/, ".keep")), "");
+    r.commit("three", { "c.txt": "c\n" });
+    r.git(["config", "repack.writeBitmaps", "true"]);
+    r.git(["config", "repack.packKeptObjects", "false"]);
+    const twins = await gcTwins(root, caseDir, { twice: false });
+    const warnings = twins.nativeStderr.split("\n").filter((l) => l.startsWith("warning:"));
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(twins.result.warnings ?? []).toEqual(warnings);
+  });
+});
+
 describeGit("gc twins: roots", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "gc-twins-roots-"));

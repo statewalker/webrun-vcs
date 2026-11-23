@@ -341,7 +341,6 @@ async function collect(options: GcOptions): Promise<GcResult> {
     files,
     gitDir = ".git",
     dryRun = false,
-    tmpExpiryMs = DEFAULT_PRUNE_EXPIRE_MS,
   } = options;
   const compatibility = options.compatibility ?? "2.56";
   // gc.pruneExpire, gc.cruftPacks, gc.maxCruftSize, ... (git's gc_config)
@@ -351,6 +350,8 @@ async function collect(options: GcOptions): Promise<GcResult> {
   const pruneExpireMs = pruneStep
     ? (options.pruneExpireMs ?? gcSettings.pruneExpireMs)
     : Number.POSITIVE_INFINITY;
+  // git prune removes `tmp_*` with the prune expiry (prune_tmp_file)
+  const tmpExpiryMs = options.tmpExpiryMs ?? pruneExpireMs;
   const objects = (options.objects ?? history.objects) as GitObjects;
   const packs = options.packs ?? history.packs;
   const objectsDir = joinPath(gitDir, "objects");
