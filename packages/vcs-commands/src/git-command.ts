@@ -33,11 +33,13 @@ import {
   overlayMethods,
 } from "@statewalker/vcs-core";
 import { type ObjectFormat, OrderedMap, parseGitBool } from "@statewalker/vcs-utils";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   type AttributesSourceResolver,
   basicStatMatches,
   clearSkipWorktreeFromPresentFiles,
   compareWithWorktree,
+  expandUserPath,
   IndexChangedError,
   type OperationOptions,
   type SparseCheckoutPatterns,
@@ -64,6 +66,7 @@ import {
 } from "./commands/git-ident.js";
 import { indexHostOf, indexVersionConfigError } from "./commands/index-host.js";
 import { loadLegacyRemote } from "./commands/legacy-remotes.js";
+import { Mailmap } from "./commands/mailmap.js";
 import type { NotesContext } from "./commands/notes-support.js";
 import { postIndexChangeHookOf } from "./commands/post-index-change.js";
 import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
@@ -552,6 +555,84 @@ export abstract class GitCommand<T> {
   protected datedIdent(role: IdentRole, who: { name: string; email: string }): PersonIdent {
     const date = resolveIdentDate(role, hostEnvironmentOf(this._workingCopy), this.clock());
     return { name: withoutCrud(who.name), email: withoutCrud(who.email), ...date };
+  }
+
+  /** mailmap.c's read_mailmap: `.mailmap` (not in a bare repository), `mailmap.blob`, `mailmap.file` */
+  protected async loadMailmap(config: RemoteConfigStore): Promise<Mailmap> {
+    const map = new Mailmap();
+    const worktree = this.worktreeAccess;
+    const bare = parseGitBool(config.value("core.bare")) ?? !worktree;
+    if (!bare && worktree) {
+      try {
+        const entry = await worktree.getEntry(".mailmap");
+        if (entry && !entry.isDirectory && (entry.mode & 0o170000) !== 0o120000) {
+          const chunks: Uint8Array[] = [];
+          for await (const c of worktree.readContent(".mailmap")) chunks.push(c);
+          map.read(decodeGitPath(concatBytes(chunks)));
+        }
+      } catch {
+        // no .mailmap
+      }
+    }
+    const blobName = config.value("mailmap.blob") ?? (bare ? "HEAD:.mailmap" : undefined);
+    if (blobName) {
+      const id = await this.revisionResolver()
+        .resolve(blobName)
+        .catch(() => undefined);
+      const bytes = id ? await this.readBlobBytes(id) : undefined;
+      if (bytes) map.read(decodeGitPath(bytes));
+    }
+    const file = config.value("mailmap.file");
+    if (file) {
+      const environment = hostEnvironmentOf(this._workingCopy);
+      const path = expandUserPath(file, environment);
+      const bytes = path !== undefined ? await this.readMailmapFile(path, environment) : undefined;
+      if (bytes) map.read(decodeGitPath(bytes));
+    }
+    return map;
+  }
+
+  /**
+   * `mailmap.file`, read as git reads it: through the host (a relative path from its current
+   * directory). Without a host environment, a relative path is read from the worktree's top
+   * (where git usually runs), and an absolute one inside the worktree through it as well.
+   */
+  protected async readMailmapFile(
+    path: string,
+    environment: ReturnType<typeof hostEnvironmentOf>,
+  ): Promise<Uint8Array | undefined> {
+    if (environment) return environment.readFile(path).catch(() => undefined);
+    const worktree = "worktree" in this._workingCopy ? this.worktreeAccess : undefined;
+    if (!worktree) return undefined;
+    let relative = path;
+    if (path.startsWith("/")) {
+      const top = (worktree as { hostPath?: string }).hostPath?.replace(/\/+$/, "");
+      if (!top || !path.startsWith(`${top}/`)) return undefined;
+      relative = path.slice(top.length + 1);
+    }
+    if (relative.split("/").includes("..")) return undefined;
+    try {
+      const entry = await worktree.getEntry(relative);
+      if (!entry || entry.isDirectory) return undefined;
+      const chunks: Uint8Array[] = [];
+      for await (const c of worktree.readContent(relative)) chunks.push(c);
+      return concatBytes(chunks);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** A blob's bytes, undefined when it cannot be read. */
+  private async readBlobBytes(id: ObjectId): Promise<Uint8Array | undefined> {
+    try {
+      const content = await this.blobs.load(id);
+      if (!content) return undefined;
+      const chunks: Uint8Array[] = [];
+      for await (const c of content) chunks.push(c);
+      return concatBytes(chunks);
+    } catch {
+      return undefined;
+    }
   }
 
   /** What git's notes code reads and writes through this command (`notes-support.ts`). */

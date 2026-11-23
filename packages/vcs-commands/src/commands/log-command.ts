@@ -16,11 +16,7 @@ import { ByteSink, OrderedMap, parseGitBool, type XdiffAlgorithm } from "@statew
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
-import {
-  type AttributesResolver,
-  type ContentAttributesContext,
-  expandUserPath,
-} from "@statewalker/vcs-working-tree";
+import type { AttributesResolver, ContentAttributesContext } from "@statewalker/vcs-working-tree";
 
 import { GitApiError, IncompatibleOptionsError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
@@ -36,7 +32,7 @@ import {
   type LogOutputOptions,
   LogPrinter,
 } from "./log-output.js";
-import { Mailmap } from "./mailmap.js";
+import type { Mailmap } from "./mailmap.js";
 import { configBool, configValue } from "./merge-config.js";
 import {
   addRefsByGlob,
@@ -1402,71 +1398,6 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       }
     }
     return out;
-  }
-
-  /** mailmap.c's read_mailmap: `.mailmap` (not in a bare repository), `mailmap.blob`, `mailmap.file` */
-  private async loadMailmap(config: RemoteConfigStore): Promise<Mailmap> {
-    const map = new Mailmap();
-    const worktree = this.worktreeAccess;
-    const bare = parseGitBool(config.value("core.bare")) ?? !worktree;
-    if (!bare && worktree) {
-      try {
-        const entry = await worktree.getEntry(".mailmap");
-        if (entry && !entry.isDirectory && (entry.mode & 0o170000) !== 0o120000) {
-          const chunks: Uint8Array[] = [];
-          for await (const c of worktree.readContent(".mailmap")) chunks.push(c);
-          map.read(decodeGitPath(concatBytes(chunks)));
-        }
-      } catch {
-        // no .mailmap
-      }
-    }
-    const blobName = config.value("mailmap.blob") ?? (bare ? "HEAD:.mailmap" : undefined);
-    if (blobName) {
-      const id = await this.revisionResolver()
-        .resolve(blobName)
-        .catch(() => undefined);
-      const bytes = id ? await this.readBlob(id) : undefined;
-      if (bytes) map.read(decodeGitPath(bytes));
-    }
-    const file = config.value("mailmap.file");
-    if (file) {
-      const environment = hostEnvironmentOf(this._workingCopy);
-      const path = expandUserPath(file, environment);
-      const bytes = path !== undefined ? await this.readMailmapFile(path, environment) : undefined;
-      if (bytes) map.read(decodeGitPath(bytes));
-    }
-    return map;
-  }
-
-  /**
-   * `mailmap.file`, read as git reads it: through the host (a relative path from its current
-   * directory). Without a host environment, a relative path is read from the worktree's top
-   * (where git usually runs), and an absolute one inside the worktree through it as well.
-   */
-  private async readMailmapFile(
-    path: string,
-    environment: ReturnType<typeof hostEnvironmentOf>,
-  ): Promise<Uint8Array | undefined> {
-    if (environment) return environment.readFile(path).catch(() => undefined);
-    const worktree = "worktree" in this._workingCopy ? this.worktreeAccess : undefined;
-    if (!worktree) return undefined;
-    let relative = path;
-    if (path.startsWith("/")) {
-      const top = (worktree as { hostPath?: string }).hostPath?.replace(/\/+$/, "");
-      if (!top || !path.startsWith(`${top}/`)) return undefined;
-      relative = path.slice(top.length + 1);
-    }
-    if (relative.split("/").includes("..")) return undefined;
-    try {
-      const entry = await worktree.getEntry(relative);
-      if (!entry || entry.isDirectory) return undefined;
-      const chunks: Uint8Array[] = [];
-      for await (const c of worktree.readContent(relative)) chunks.push(c);
-      return concatBytes(chunks);
-    } catch {
-      return undefined;
-    }
   }
 
   /**
