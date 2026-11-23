@@ -524,7 +524,8 @@ describe("a crafted log block cannot inflate into gigabytes of records", () => {
     const header = Buffer.alloc(24);
     header.write("REFT", 0);
     header[4] = 1;
-    header.writeUIntBE(4096, 5, 3);
+    // no block size: git's writer keeps a block within it, so a 4 MiB block needs none
+    header.writeUIntBE(0, 5, 3);
     header.writeBigUInt64BE(1n, 8);
     header.writeBigUInt64BE(1n, 16);
     const skip = 28;
@@ -699,5 +700,132 @@ describe("the lazy reader holds one block, whatever the table stands for", () =>
     expect(() => [...openReftable(copy, "t.ref").logs()]).toThrow(
       /log block at 0 (inflates to|does not inflate)/,
     );
+  });
+});
+
+describe("a stack cannot make a read cost tables times records (merge gate pass 4)", () => {
+  /** A stack directory in memory: tables.list naming `names`, the tables written once. */
+  async function stackOf(tables: Record<string, Uint8Array>, names = Object.keys(tables)) {
+    const files = createInMemoryFilesApi();
+    for (const [name, bytes] of Object.entries(tables)) {
+      await files.write(`.git/reftable/${name}`, [bytes]);
+    }
+    await files.write(".git/reftable/tables.list", [
+      new TextEncoder().encode(names.map((n) => `${n}\n`).join("")),
+    ]);
+    return files;
+  }
+
+  const tableName = (i: number) =>
+    `0x${String(i).padStart(12, "0")}-0x${String(i).padStart(12, "0")}-t.ref`;
+
+  it("lists a stack of 400 tables of 200 deletions each through a heap, in bounded time", async () => {
+    const tables: Record<string, Uint8Array> = {};
+    for (let i = 1; i <= 400; i++) {
+      const refs = [];
+      for (let j = 0; j < 200; j++) {
+        refs.push({
+          name: `refs/heads/${String(j).padStart(5, "0")}-${String(i).padStart(4, "0")}`,
+          updateIndex: i,
+          deleted: true as const,
+        });
+      }
+      refs.push({ name: `refs/tags/t${String(i).padStart(4, "0")}`, updateIndex: i, id: A });
+      tables[tableName(i)] = buildReftable({ minUpdateIndex: i, maxUpdateIndex: i, refs }).bytes;
+    }
+    const refs = createReftableRefStore({ files: await stackOf(tables), gitDir: ".git" });
+    const started = Date.now();
+    const listed: string[] = [];
+    for await (const r of refs.list()) listed.push(r.name);
+    // 80000 records over 400 tables: a scan of every head per record took 400 times longer
+    expect(listed).toHaveLength(400);
+    expect(listed[0]).toBe("refs/tags/t0001");
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  it("merges equal keys newest first, a deletion hiding older tables, through the heap", async () => {
+    const t = (i: number, refs: FixtureTable["refs"]) =>
+      buildReftable({ minUpdateIndex: i, maxUpdateIndex: i, refs }).bytes;
+    const files = await stackOf({
+      [tableName(1)]: t(1, [
+        { name: "refs/heads/a", updateIndex: 1, id: A },
+        { name: "refs/heads/b", updateIndex: 1, id: A },
+        { name: "refs/heads/c", updateIndex: 1, id: A },
+      ]),
+      [tableName(2)]: t(2, [
+        { name: "refs/heads/b", updateIndex: 2, deleted: true },
+        { name: "refs/heads/c", updateIndex: 2, id: B },
+      ]),
+      [tableName(3)]: t(3, [{ name: "refs/heads/c", updateIndex: 3, id: C }]),
+    });
+    const refs = createReftableRefStore({ files, gitDir: ".git" });
+    const listed: string[] = [];
+    for await (const r of refs.list())
+      listed.push(`${r.name} ${"objectId" in r ? r.objectId : ""}`);
+    expect(listed).toEqual([`refs/heads/a ${A}`, `refs/heads/c ${C}`]);
+  });
+
+  it("refuses a tables.list naming one table twice, or update indexes that do not ascend", async () => {
+    const one = buildReftable(sample).bytes;
+    const twice = await stackOf({ "0x01-0x03-aa.ref": one }, [
+      "0x01-0x03-aa.ref",
+      "0x01-0x03-aa.ref",
+    ]);
+    await expect(
+      createReftableRefStore({ files: twice, gitDir: ".git" }).get("HEAD"),
+    ).rejects.toThrow(/table '0x01-0x03-aa\.ref' named twice/);
+    // the same table under two names (hard links): its update indexes do not ascend
+    const linked = await stackOf({ "0x01-0x03-aa.ref": one, "0x01-0x03-bb.ref": one });
+    await expect(
+      createReftableRefStore({ files: linked, gitDir: ".git" }).get("HEAD"),
+    ).rejects.toThrow(/update indexes from 1, not past 3/);
+  });
+
+  it("refuses a stack whose tables hold more bytes than its ceiling, before reading them", async () => {
+    const tables: Record<string, Uint8Array> = {};
+    for (let i = 1; i <= 20; i++) {
+      tables[tableName(i)] = buildReftable({
+        minUpdateIndex: i,
+        maxUpdateIndex: i,
+        refs: [{ name: `refs/heads/b${i}`, updateIndex: i, id: A }],
+      }).bytes;
+    }
+    const files = await stackOf(tables);
+    const size = (tables[tableName(1)] as Uint8Array).length;
+    const small = createReftableStackReader(files, ".git/reftable", 10 * size);
+    await expect(small.read()).rejects.toThrow(/its tables hold more than/);
+    const view = await createReftableStackReader(files, ".git/reftable").read();
+    expect([...view.refs()]).toHaveLength(20);
+  });
+
+  it("bounds the inflated log blocks a merge holds at once, and refuses blocks past the block size", () => {
+    // one log block of `len` inflated bytes for HEAD at update index `i`, block size `size`
+    const logTable = (i: number, len: number, size: number) => {
+      const message = "m".repeat(len - 200);
+      const built = buildReftable({
+        minUpdateIndex: i,
+        maxUpdateIndex: i,
+        logs: [{ name: "HEAD", updateIndex: i, update: update(A, B, message) }],
+      }).bytes;
+      built.set([(size >> 16) & 255, (size >> 8) & 255, size & 255], 5);
+      const footerStart = built.length - 68;
+      built.set([(size >> 16) & 255, (size >> 8) & 255, size & 255], footerStart + 5);
+      fixFooterCrc(built, footerStart);
+      return openReftable(built, `t${i}.ref`);
+    };
+    const tables = [1, 2, 3, 4].map((i) => logTable(i, 64 << 10, 0));
+    const view = mergeReftables(tables);
+    expect([...view.logs("HEAD")]).toHaveLength(4);
+    // four tables each holding a 64 KiB block: past a 192 KiB held ceiling
+    expect(() => {
+      const budget = new ReftableReadBudget(REFTABLE_READ_CEILING, 192 << 10);
+      const its = tables.map((t) => t.logs("HEAD", budget));
+      for (const it of its) it.next();
+    }).toThrow(/holds more than 196608 bytes of inflated log blocks at once/);
+    // a walk lets go of each block: one table read block after block stays under it
+    const budget = new ReftableReadBudget(REFTABLE_READ_CEILING, 192 << 10);
+    for (const t of tables) expect([...t.logs("HEAD", budget)]).toHaveLength(1);
+    expect(budget.held).toBe(0);
+    expect(() => [...logTable(5, 8192, 4096).logs()]).toThrow(/past the block size 4096/);
   });
 });

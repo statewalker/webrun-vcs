@@ -121,6 +121,8 @@ export interface ReftableTable {
   readonly maxUpdateIndex: number;
   /** The footer's `obj_id_len` (0 without obj blocks) */
   readonly objectIdLength: number;
+  /** The file's length in bytes (held in memory while the table is open) */
+  readonly size: number;
   /** The ref record of `name`, a deletion record included; undefined when the table has none */
   getRef(name: string, budget?: ReftableReadBudget): ReftableRefRecord | undefined;
   /** Ref records whose name starts with `prefix`, in key order, deletions included */
@@ -147,6 +149,13 @@ export interface ReftableTable {
  */
 export const REFTABLE_READ_CEILING = 256 * 1024 * 1024;
 
+/**
+ * The most inflated log bytes one read may hold at once: 128 MiB. A walk holds one block, a
+ * merge one per table; git's writer keeps a block within the table's block size (4 KiB by
+ * default), so real stacks hold far less.
+ */
+export const REFTABLE_HELD_CEILING = 128 * 1024 * 1024;
+
 /** What each record visited costs besides its key suffix (its decoding). */
 const RECORD_COST = 16;
 /** Inflating a log block costs its inflated length over this (real logs inflate a few times) */
@@ -156,14 +165,35 @@ const INFLATE_COST_DIVISOR = 8;
  * The bytes one read has decoded: `RECORD_COST` plus the key suffix of each record visited,
  * what it materialises (three bytes per byte of each name or text it decodes, for a copy and
  * a string of two bytes a character at worst; 40 per object id in hex), and an eighth of each
- * log block it inflates. A record passed over (a seek's scan, a value a newer table hides)
+ * log block it inflates. Besides, the inflated log blocks a read holds at once (one per
+ * iterator; a merge has one per table) are counted whole while held and may not exceed
+ * `heldCeiling`. A record passed over (a seek's scan, a value a newer table hides)
  * costs its suffix and `RECORD_COST` only, so a stack of tombstones over a long reflog is
  * read, while the names and values a read returns, and the blocks it inflates, stay bounded.
  * Past `ceiling`, the read is refused with `ReftableFormatError`.
  */
 export class ReftableReadBudget {
   used = 0;
-  constructor(readonly ceiling = REFTABLE_READ_CEILING) {}
+  held = 0;
+  constructor(
+    readonly ceiling = REFTABLE_READ_CEILING,
+    readonly heldCeiling = REFTABLE_HELD_CEILING,
+  ) {}
+
+  /** Counts `bytes` of an inflated block held until `release`. */
+  hold(bytes: number, table: string): void {
+    this.held += bytes;
+    if (this.held > this.heldCeiling) {
+      throw new ReftableFormatError(
+        table,
+        `one read holds more than ${this.heldCeiling} bytes of inflated log blocks at once`,
+      );
+    }
+  }
+
+  release(bytes: number): void {
+    this.held -= bytes;
+  }
 
   charge(bytes: number, table: string): void {
     this.used += bytes;
@@ -245,10 +275,15 @@ interface Block {
   recordsStart: number;
   /** Where the restart table starts: the records end there */
   recordsEnd: number;
-  /** Restart offsets, ascending, inside the records */
-  restarts: Uint32Array;
+  /** How many restart offsets the restart table at `recordsEnd` holds (read by `restartAt`) */
+  restartCount: number;
   /** The bytes the block takes in the file, padding included */
   fullSize: number;
+}
+
+/** The `i`th restart offset of `block`, read from its bytes (as git's block_reader). */
+function restartAt(block: Block, i: number): number {
+  return be24(block.data, block.recordsEnd + 3 * i);
 }
 
 /** A section of blocks of one type: where it starts, the bound of its blocks, its index. */
@@ -298,12 +333,11 @@ class Cursor {
     this.pos = pos;
     this.fresh = true;
     if (!keepOrder) this.hasPrev = false;
-    const r = block.restarts;
     let lo = 0;
-    let hi = r.length;
+    let hi = block.restartCount;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if ((r[mid] as number) < pos) lo = mid + 1;
+      if (restartAt(block, mid) < pos) lo = mid + 1;
       else hi = mid;
     }
     this.nextRestart = lo;
@@ -340,15 +374,15 @@ class Cursor {
     const at = `block at ${b.offset}`;
     if (this.pos >= b.recordsEnd) {
       if (this.pos > b.recordsEnd) fail(this.table, `${at}: record runs past the records`);
-      if (this.nextRestart < b.restarts.length) {
+      if (this.nextRestart < b.restartCount) {
         fail(this.table, `${at}: a restart offset is not a record start`);
       }
       return false;
     }
     const start = this.pos;
     let isRestart = false;
-    if (this.nextRestart < b.restarts.length) {
-      const r = b.restarts[this.nextRestart] as number;
+    if (this.nextRestart < b.restartCount) {
+      const r = restartAt(b, this.nextRestart);
       if (start > r) fail(this.table, `${at}: a restart offset is not a record start`);
       if (start === r) {
         isRestart = true;
@@ -440,6 +474,7 @@ class Reftable implements ReftableTable {
   readonly minUpdateIndex: number;
   readonly maxUpdateIndex: number;
   readonly objectIdLength: number;
+  readonly size: number;
   private readonly hSize: number;
   private readonly footerStart: number;
   private readonly firstType: number | undefined;
@@ -453,6 +488,7 @@ class Reftable implements ReftableTable {
     private readonly bytes: Uint8Array,
     readonly name: string,
   ) {
+    this.size = bytes.length;
     const bad = (detail: string): never => fail(name, detail);
     // header: magic, version, block size, update indexes (and a hash id in version 2)
     if (bytes.length < 24) bad(`truncated: ${bytes.length} bytes, shorter than a header`);
@@ -560,7 +596,17 @@ class Reftable implements ReftableTable {
     if (type === TYPE_LOG) {
       // block_len is the inflated length, block header included; the deflated stream follows
       const skip = headerOff + 4;
+      // git's writer never fills a block past the table's block size (block.c's
+      // block_writer_add), deflated or not
+      if (this.blockSize > 0 && blockLen > this.blockSize) {
+        fail(
+          name,
+          `log block at ${offset} of ${blockLen} bytes, past the block size ${this.blockSize}`,
+        );
+      }
       budget.charge(Math.ceil(blockLen / INFLATE_COST_DIVISOR), name);
+      // held whole while it is read: released by `drop` when the reader moves on
+      budget.hold(blockLen, name);
       data = new Uint8Array(blockLen);
       data.set(bytes.subarray(offset, offset + skip));
       let consumed: number;
@@ -597,17 +643,22 @@ class Reftable implements ReftableTable {
     if (recordsEnd < recordsStart) {
       fail(name, `block at ${offset}: restart table overlaps its header`);
     }
-    const restarts = new Uint32Array(restartCount);
+    // checked once per read of the block, no copy kept: charged as the bytes it reads
+    budget.charge(3 * restartCount, name);
     let previous = -1;
     for (let i = 0; i < restartCount; i++) {
       const r = be24(data, recordsEnd + 3 * i);
       if (r < recordsStart || r >= recordsEnd || r <= previous) {
         fail(name, `block at ${offset}: restart offset ${r} out of range`);
       }
-      restarts[i] = r;
       previous = r;
     }
-    return { offset, type, data, recordsStart, recordsEnd, restarts, fullSize };
+    return { offset, type, data, recordsStart, recordsEnd, restartCount, fullSize };
+  }
+
+  /** Lets go of a block read: an inflated log block no longer counts as held. */
+  private drop(block: Block | undefined, budget: ReftableReadBudget): void {
+    if (block?.type === TYPE_LOG) budget.release(block.data.length);
   }
 
   /** The block of `section` at `offset`, or undefined where the section's blocks end. */
@@ -623,7 +674,7 @@ class Reftable implements ReftableTable {
   private keyAtCompare(block: Block, pos: number, want: Uint8Array, budget: ReftableReadBudget) {
     const c = new Cursor(this.name, budget, "");
     c.enter(block, pos, false);
-    c.nextRestart = block.restarts.length; // checked by the scan that follows, not here
+    c.nextRestart = block.restartCount; // checked by the scan that follows, not here
     c.nextKey();
     if (c.prefix !== 0)
       fail(this.name, `block at ${block.offset}: restart record with a compressed key`);
@@ -636,15 +687,14 @@ class Reftable implements ReftableTable {
    * whose key is not past `want` (git's block_iter_seek_key), else the records' start.
    */
   private restartBefore(block: Block, want: Uint8Array, budget: ReftableReadBudget): number {
-    const r = block.restarts;
     let lo = 0;
-    let hi = r.length;
+    let hi = block.restartCount;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (this.keyAtCompare(block, r[mid] as number, want, budget) > 0) hi = mid;
+      if (this.keyAtCompare(block, restartAt(block, mid), want, budget) > 0) hi = mid;
       else lo = mid + 1;
     }
-    return lo === 0 ? block.recordsStart : (r[lo - 1] as number);
+    return lo === 0 ? block.recordsStart : restartAt(block, lo - 1);
   }
 
   /**
@@ -718,7 +768,11 @@ class Reftable implements ReftableTable {
     for (let offset = section.start; ; ) {
       const block = this.blockAt(section, offset, budget);
       if (!block) break;
-      if (found && this.keyAtCompare(block, block.recordsStart, want, budget) > 0) break;
+      if (found && this.keyAtCompare(block, block.recordsStart, want, budget) > 0) {
+        this.drop(block, budget);
+        break;
+      }
+      this.drop(found, budget);
       found = block;
       offset += block.fullSize;
     }
@@ -754,23 +808,30 @@ class Reftable implements ReftableTable {
     const c = new Cursor(this.name, budget, what);
     c.enter(block, start, false);
     let seeking = want !== undefined;
-    for (;;) {
-      while (c.nextKey()) {
-        if (seeking && c.compareTo(want as Uint8Array) < 0) {
-          skipValue(c);
+    try {
+      for (;;) {
+        while (c.nextKey()) {
+          if (seeking && c.compareTo(want as Uint8Array) < 0) {
+            skipValue(c);
+            c.endValue();
+            continue;
+          }
+          seeking = false;
+          const valueStart = c.pos;
+          yield c;
+          if (c.pos === valueStart) skipValue(c);
           c.endValue();
-          continue;
         }
-        seeking = false;
-        const valueStart = c.pos;
-        yield c;
-        if (c.pos === valueStart) skipValue(c);
-        c.endValue();
+        const offset = block.offset + block.fullSize;
+        this.drop(block, budget);
+        block = undefined;
+        const next = this.blockAt(section, offset, budget);
+        if (!next) return;
+        block = next;
+        c.enter(block, block.recordsStart, true);
       }
-      const next = this.blockAt(section, block.offset + block.fullSize, budget);
-      if (!next) return;
-      block = next;
-      c.enter(block, block.recordsStart, true);
+    } finally {
+      this.drop(block, budget);
     }
   }
 
@@ -1015,6 +1076,7 @@ class Reftable implements ReftableTable {
         }
       }
       offset += block.fullSize;
+      this.drop(block, budget);
     }
     // the footer's index roots start index blocks of their section
     const roots: [number, number, string][] = [

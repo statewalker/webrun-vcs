@@ -29,7 +29,6 @@ import { ReftableFormatError } from "./reftable-errors.js";
 import {
   compareKeys,
   openReftable,
-  type ReftableLogHead,
   type ReftableLogRecord,
   ReftableReadBudget,
   type ReftableRefRecord,
@@ -59,12 +58,21 @@ export interface ReftableStackReader {
 }
 
 const TABLES_LIST = "tables.list";
+/**
+ * The most table bytes one stack may hold in memory: 512 MiB. Tables are read whole (each
+ * read then decodes only what it needs); a stack of more is refused, not read.
+ */
+export const REFTABLE_STACK_BYTES_CEILING = 512 * 1024 * 1024;
 const MAX_RELOADS = 10;
 /** A table name git writes: `0x<min>-0x<max>-<random>.ref`; nothing naming another directory */
 const TABLE_NAME = /^[^/\\]+\.ref$/;
 
 /** A reader of the stack in `dir`, its opened tables cached by name. */
-export function createReftableStackReader(files: FilesApi, dir: string): ReftableStackReader {
+export function createReftableStackReader(
+  files: FilesApi,
+  dir: string,
+  bytesCeiling = REFTABLE_STACK_BYTES_CEILING,
+): ReftableStackReader {
   const tables = new Map<string, ReftableTable>();
   let cached: { list: string; view: ReftableView } | undefined;
 
@@ -92,23 +100,41 @@ export function createReftableStackReader(files: FilesApi, dir: string): Reftabl
       const list = listBytes ? new TextDecoder().decode(listBytes) : "";
       if (cached && cached.list === list) return cached.view;
       const names = list.split("\n").filter((line) => line.length > 0);
+      const seen = new Set<string>();
       for (const name of names) {
         if (!TABLE_NAME.test(name) || name === "." || name === "..") {
           throw new ReftableFormatError(TABLES_LIST, `bad table name '${name}'`);
         }
+        if (seen.has(name))
+          throw new ReftableFormatError(TABLES_LIST, `table '${name}' named twice`);
+        seen.add(name);
       }
       const loaded: ReftableTable[] = [];
       let gone = false;
+      let held = 0;
       for (const name of names) {
         let table = tables.get(name);
         if (!table) {
-          const bytes = await readFile(joinPath(dir, name));
+          const path = joinPath(dir, name);
+          const size = (await files.stats(path))?.size ?? 0;
+          if (held + size > bytesCeiling) throw tooLarge();
+          const bytes = await readFile(path);
           if (!bytes) {
             gone = true;
             break;
           }
           table = openReftable(bytes, name);
           tables.set(name, table);
+        }
+        held += table.size;
+        if (held > bytesCeiling) throw tooLarge();
+        // git's stack writer gives each table update indexes past the last one's (stack.c)
+        const previous = loaded.at(-1);
+        if (previous && table.minUpdateIndex <= previous.maxUpdateIndex) {
+          throw new ReftableFormatError(
+            name,
+            `update indexes from ${table.minUpdateIndex}, not past ${previous.maxUpdateIndex} of '${previous.name}' below it`,
+          );
         }
         loaded.push(table);
       }
@@ -122,7 +148,67 @@ export function createReftableStackReader(files: FilesApi, dir: string): Reftabl
     throw new ReftableFormatError(TABLES_LIST, "a table it names is missing");
   };
 
+  const tooLarge = () =>
+    new ReftableFormatError(TABLES_LIST, `its tables hold more than ${bytesCeiling} bytes`);
+
   return { dir, read };
+}
+
+/**
+ * The records of `iterators` (each in key order) in one key order, a binary heap of their
+ * heads (git's pq.c and merged.c): on equal keys the newest table's (the highest index) comes
+ * first and the others with that key are passed over. `before(a, b)` tells whether `a`'s key
+ * sorts before `b`'s, `same` whether the keys are equal. Each record is yielded before any
+ * iterator moves on, so a lazy record can still be read.
+ */
+function* mergeByHeap<T>(
+  iterators: Iterator<T>[],
+  before: (a: T, b: T) => boolean,
+  same: (a: T, b: T) => boolean,
+): Generator<T> {
+  type Entry = { value: T; table: number };
+  const heap: Entry[] = [];
+  const less = (a: Entry, b: Entry) =>
+    before(a.value, b.value) || (!before(b.value, a.value) && a.table > b.table);
+  const push = (entry: Entry) => {
+    heap.push(entry);
+    for (let i = heap.length - 1; i > 0; ) {
+      const parent = (i - 1) >> 1;
+      if (!less(heap[i] as Entry, heap[parent] as Entry)) break;
+      [heap[i], heap[parent]] = [heap[parent] as Entry, heap[i] as Entry];
+      i = parent;
+    }
+  };
+  const pop = (): Entry => {
+    const top = heap[0] as Entry;
+    const last = heap.pop() as Entry;
+    if (heap.length > 0) {
+      heap[0] = last;
+      for (let i = 0; ; ) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let m = i;
+        if (l < heap.length && less(heap[l] as Entry, heap[m] as Entry)) m = l;
+        if (r < heap.length && less(heap[r] as Entry, heap[m] as Entry)) m = r;
+        if (m === i) break;
+        [heap[i], heap[m]] = [heap[m] as Entry, heap[i] as Entry];
+        i = m;
+      }
+    }
+    return top;
+  };
+  const advance = (table: number) => {
+    const next = (iterators[table] as Iterator<T>).next();
+    if (!next.done) push({ value: next.value, table });
+  };
+  for (let i = 0; i < iterators.length; i++) advance(i);
+  while (heap.length > 0) {
+    const best = pop();
+    yield best.value;
+    // the older tables' records of the same key are hidden
+    while (heap.length > 0 && same((heap[0] as Entry).value, best.value)) advance(pop().table);
+    advance(best.table);
+  }
 }
 
 /**
@@ -141,50 +227,26 @@ export function mergeReftables(tables: readonly ReftableTable[]): ReftableView {
 
   function* refs(prefix = ""): Generator<ReftableRefRecord> {
     const budget = new ReftableReadBudget();
-    const iterators = tables.map((t) => t.refs(prefix, budget));
-    const heads = iterators.map((it) => it.next());
-    for (;;) {
-      // the smallest key; on equal keys the newest table's (scanned newest first)
-      let best: ReftableRefRecord | undefined;
-      for (let i = heads.length - 1; i >= 0; i--) {
-        const head = heads[i] as IteratorResult<ReftableRefRecord>;
-        if (head.done) continue;
-        if (!best || compareKeys(head.value.key, best.key) < 0) best = head.value;
-      }
-      if (!best) return;
-      for (let i = 0; i < heads.length; i++) {
-        const head = heads[i] as IteratorResult<ReftableRefRecord>;
-        if (!head.done && compareKeys(head.value.key, best.key) === 0) {
-          heads[i] = (iterators[i] as Generator<ReftableRefRecord>).next();
-        }
-      }
-      if (best.value.type !== "deletion") yield best;
+    for (const record of mergeByHeap(
+      tables.map((t) => t.refs(prefix, budget)),
+      (a, b) => compareKeys(a.key, b.key) < 0,
+      (a, b) => compareKeys(a.key, b.key) === 0,
+    )) {
+      if (record.value.type !== "deletion") yield record;
     }
   }
 
   function* logs(refName: string): Generator<ReftableLogRecord> {
     const budget = new ReftableReadBudget();
-    const iterators = tables.map((t) => t.logHeads(refName, budget));
-    const heads = iterators.map((it) => it.next());
-    for (;;) {
-      // the newest update index; on equal ones the newest table's
-      let best: ReftableLogHead | undefined;
-      for (let i = heads.length - 1; i >= 0; i--) {
-        const head = heads[i] as IteratorResult<ReftableLogHead>;
-        if (head.done) continue;
-        if (!best || head.value.updateIndex > best.updateIndex) best = head.value;
-      }
-      if (!best) return;
-      // decoded before any iterator moves on; the records it hides never are
-      const update = best.deletion ? undefined : best.read();
-      const { refKey, updateIndex } = best;
-      for (let i = 0; i < heads.length; i++) {
-        const head = heads[i] as IteratorResult<ReftableLogHead>;
-        if (!head.done && head.value.updateIndex === updateIndex) {
-          heads[i] = (iterators[i] as Generator<ReftableLogHead>).next();
-        }
-      }
-      if (update) yield { refName: best.refName, refKey, updateIndex, update };
+    // newest update index first; the records a newer table hides are never decoded
+    for (const head of mergeByHeap(
+      tables.map((t) => t.logHeads(refName, budget)),
+      (a, b) => a.updateIndex > b.updateIndex,
+      (a, b) => a.updateIndex === b.updateIndex,
+    )) {
+      const update = head.deletion ? undefined : head.read();
+      if (update)
+        yield { refName: head.refName, refKey: head.refKey, updateIndex: head.updateIndex, update };
     }
   }
 
