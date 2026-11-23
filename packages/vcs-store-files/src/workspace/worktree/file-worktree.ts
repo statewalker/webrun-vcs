@@ -27,6 +27,7 @@ import {
   normalizePath,
   type PosixFilesApi,
   readFile,
+  type WorktreePathOptions,
 } from "@statewalker/vcs-core";
 import { decodeGitPath, decodeGitPatternFile } from "@statewalker/vcs-utils/encoding";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
@@ -168,6 +169,7 @@ export class FileWorktree implements Worktree {
       executable: !!(files.chmod && files.lstat),
       symlinks: !!(files.symlink && files.lstat && files.readlink),
       windowsPaths: this.windowsPaths,
+      protects: { ntfs: true, hfs: true },
       // reserved names of the storage's root apply only to a worktree rooted there
       ...(this.rootFiles.reservedNames && normalizePath(this.rootPath) === "/"
         ? { reservedNames: this.rootFiles.reservedNames }
@@ -180,9 +182,14 @@ export class FileWorktree implements Worktree {
     return this.files.pathSeparators?.includes("\\") ?? false;
   }
 
-  /** The path rules of this worktree's platform (verify_path). */
-  private get pathRules(): { windows: boolean } {
-    return { windows: this.windowsPaths };
+  /**
+   * The path rules of this worktree's platform (verify_path), as defence in depth: both
+   * `core.protectNTFS` and `core.protectHFS` on, on every platform and whatever the
+   * configuration (the worktree may sit on an NTFS or HFS+ volume it cannot detect).
+   * Commands check tree paths with the configuration first (`worktreePathRules`).
+   */
+  private get pathRules(): WorktreePathOptions {
+    return { windows: this.windowsPaths, protectNTFS: true, protectHFS: true };
   }
 
   /** git init's case and Unicode folding probe, under the repository's `gitDir`. */

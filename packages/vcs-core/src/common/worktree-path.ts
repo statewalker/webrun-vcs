@@ -1,12 +1,13 @@
 /**
- * Worktree path verification, after git's `verify_path` with `core.protectHFS` and
- * `core.protectNTFS` on (CVE-2014-9390, CVE-2019-1354).
+ * Worktree path verification, after git's `verify_path` (CVE-2014-9390, CVE-2019-1354), with
+ * `core.protectHFS` and `core.protectNTFS` on unless the caller turns them off
+ * ({@link WorktreePathOptions}; git's defaults: NTFS on, HFS on macOS only, here also where
+ * the system is unknown: {@link protectHFSDefault}).
  *
  * Paths in trees and in the index come from other people's repositories. Checkout turns them
  * into files under the worktree, which also holds the repository's own `.git`. A path is
- * refused when a component is empty, `.` or `..`, or when a component names `.git` under any
- * spelling a filesystem folds to it (git applies these on every platform, `core.protectHFS`
- * and `core.protectNTFS` being on):
+ * refused when a component is empty, `.` or `..`, or names `.git` in any letter case (always),
+ * or names `.git` under a spelling NTFS or HFS+ folds to it (as the protections say):
  * - any letter case (`.GIT`, `.Git`: case-insensitive filesystems);
  * - NTFS: trailing dots and spaces dropped (`.git. .`), the 8.3 short name `git~1`, an
  *   alternate data stream (`.git::$INDEX_ALLOCATION`), and `\` ending the name (`.git\x`);
@@ -140,6 +141,40 @@ export function isDotGitComponent(component: string): boolean {
 export interface WorktreePathOptions {
   /** The worktree is on Windows: git's Windows path rules apply too (`\` a separator). */
   windows?: boolean;
+  /**
+   * `core.protectNTFS` (default true here and in git): refuse the names NTFS folds to `.git`
+   * (`.git.`, `.git `, `git~1`, `.git::$INDEX_ALLOCATION`, after a `\` too) and, for a
+   * symbolic link, to `.gitmodules` (`gitmod~1`, `gi7eba~1`).
+   */
+  protectNTFS?: boolean;
+  /**
+   * `core.protectHFS`: refuse the names HFS+ folds to `.git` (code points it ignores, `‌.git`)
+   * and, for a symbolic link, to `.gitmodules`. Default true here; git's default is true on
+   * macOS only (`protectHFSDefault`).
+   */
+  protectHFS?: boolean;
+}
+
+/** git's `is_hfs_dot_generic`: whether HFS+ resolves `component` to `.<name>`. */
+function isHfsDot(component: string, name: string): boolean {
+  return foldAsciiCase(component.replace(HFS_IGNORABLE, "")) === `.${name}`;
+}
+
+/**
+ * The `core.protectHFS` default for a system: git's (`PROTECT_HFS_DEFAULT`) on for macOS
+ * (`uname` `Darwin`) and off on a system known to be another, and on where the system is
+ * unknown (no environment, a browser): the storage may be an HFS+ volume, and a name HFS+
+ * folds into `.git` would reach the repository (CVE-2014-9390).
+ *
+ * @example
+ * ```typescript
+ * protectHFSDefault("Darwin"); // true
+ * protectHFSDefault("Linux"); // false
+ * protectHFSDefault(undefined); // true
+ * ```
+ */
+export function protectHFSDefault(systemName: string | undefined): boolean {
+  return systemName === undefined || systemName === "Darwin";
 }
 
 /** Device names Windows reserves in every directory (git's `is_valid_win32_path`). */
@@ -160,7 +195,16 @@ function isValidWin32Path(path: string): boolean {
 /**
  * Whether `path` (relative, `/`-separated, as stored in trees and the index) is safe to check
  * out; with `mode`, also whether an entry of that mode may sit there (no symlinked
- * `.gitmodules`).
+ * `.gitmodules`). git's `verify_path`: an empty, `.` or `..` component, and `.git` in any
+ * case (a symbolic link `.gitmodules` in any case) are always refused; the HFS+ and NTFS
+ * spellings of those names as `protectHFS` / `protectNTFS` say (both on unless turned off).
+ *
+ * @example
+ * ```typescript
+ * isValidWorktreePath("git~1/config"); // false
+ * isValidWorktreePath("git~1/config", undefined, { protectNTFS: false }); // true
+ * isValidWorktreePath(".GIT/config", undefined, { protectNTFS: false }); // false
+ * ```
  */
 export function isValidWorktreePath(
   path: string,
@@ -169,11 +213,24 @@ export function isValidWorktreePath(
 ): boolean {
   if (path === "" || path.includes("\0")) return false;
   if (options.windows && !isValidWin32Path(path)) return false;
-  const components = path.split("/");
-  for (const component of components) {
+  const ntfs = options.protectNTFS !== false;
+  const hfs = options.protectHFS !== false;
+  const link = mode === SYMLINK_MODE;
+  for (const component of path.split("/")) {
     if (component === "" || component === "." || component === "..") return false;
-    if (isDotGitComponent(component)) return false;
-    if (mode === SYMLINK_MODE && isGitWorktreeFile(component, "gitmodules")) return false;
+    // verify_dotfile: `.git` (and a link `.gitmodules`) in any ASCII case, on every platform
+    const folded = foldAsciiCase(component);
+    if (folded === ".git" || (link && folded === ".gitmodules")) return false;
+    if (hfs && (isHfsDot(component, "git") || (link && isHfsDot(component, "gitmodules")))) {
+      return false;
+    }
+    if (ntfs) {
+      // is_ntfs_dotgit runs at each component and after each `\` (a name ends at either)
+      for (const part of component.split("\\")) {
+        if (NTFS_DOTGIT.test(part)) return false;
+        if (link && isNtfsDotGeneric(part, "gitmodules", GIT_FILES.gitmodules)) return false;
+      }
+    }
   }
   return true;
 }
