@@ -18,6 +18,7 @@ export * from "./pack-bitmap-writer.js";
 export * from "./pack-file.js";
 export * from "./pack-index-reader.js";
 export * from "./pack-index-writer.js";
+export * from "./pack-mtimes.js";
 export * from "./pack-order-scan.js";
 export * from "./pack-reverse-index.js";
 export * from "./pack-set.js";

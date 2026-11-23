@@ -34,6 +34,7 @@ import type { FilesApi } from "../common/files/index.js";
 import type { ObjectId } from "../common/id/index.js";
 import { CorruptObjectError } from "../history/objects/git-objects.js";
 import type { ObjectTypeString } from "../history/objects/object-types.js";
+import { encodePackMtimes } from "./pack-mtimes.js";
 import { encodeReverseIndex } from "./pack-reverse-index.js";
 import type { PackEntryInfo } from "./unpack-objects.js";
 
@@ -89,6 +90,12 @@ export interface InstallPackOptions {
    * set's `install` passes its own setting.
    */
   writeReverseIndex?: boolean;
+  /**
+   * Makes the pack a cruft pack: `pack-<id>.mtimes` holds this time (seconds) for each
+   * object, renamed into place after the `.rev` and before the `.idx`, as git's pack-objects
+   * `--cruft` writes it. When the same pack is installed already, its `.mtimes` is replaced.
+   */
+  mtimes?: (id: ObjectId) => number;
 }
 
 /** See `InstallPackOptions.onContent` (and `UnpackObjectsOptions.onContent`). */
@@ -1264,6 +1271,7 @@ export async function installPack(
   const tmpPack = `${dir}/tmp_pack_${id}`;
   const tmpIdx = `${dir}/tmp_idx_${id}`;
   const tmpRev = `${dir}/tmp_rev_${id}`;
+  const tmpMtimes = `${dir}/tmp_mtimes_${id}`;
   const tmpFixed = `${dir}/tmp_pack_${id}_fixed`;
   const win = new WindowReader(files, windowBytes, windowCount);
   let appended: AppendedStore | undefined;
@@ -1355,9 +1363,22 @@ export async function installPack(
     for (let i = 0; i < t.n; i++) types[TYPE_NAMES[t.type[i] as number] as ObjectTypeString]++;
     const result: InstalledPack = { packId, count: t.n, appended: appendedCount, types };
     const name = `${dir}/pack-${packId}`;
+    const mtimesOf = options.mtimes;
+    const mtimesBytes = mtimesOf
+      ? encodePackMtimes(
+          Array.from(order, (i) => mtimesOf(hex(t.oid.subarray(i * 20, i * 20 + 20)))),
+          packChecksum,
+        )
+      : undefined;
     if ((await files.exists(`${name}.pack`)) && (await files.exists(`${name}.idx`))) {
       // the same pack is already installed (a repeated fetch): keep it, as git does
       await files.remove(packFile);
+      if (mtimesBytes) {
+        // the same cruft pack written again: its times are the new ones
+        await files.write(tmpMtimes, [mtimesBytes]);
+        if (!(await files.move(tmpMtimes, `${name}.mtimes`)))
+          throw new Error(`could not move ${tmpMtimes}`);
+      }
       return result;
     }
     await files.write(tmpIdx, [idx]);
@@ -1367,6 +1388,7 @@ export async function installPack(
       for (let k = 0; k < t.n; k++) rev[order[k] as number] = k;
       await files.write(tmpRev, [encodeReverseIndex(rev, packChecksum)]);
     }
+    if (mtimesBytes) await files.write(tmpMtimes, [mtimesBytes]);
     // The pack goes first, then its reverse index, then its idx (git's pack_copy_priority):
     // readers ignore a pack without an idx. A leftover pack-<id>.pack from a crash is
     // replaced here (move overwrites).
@@ -1376,9 +1398,15 @@ export async function installPack(
       await safeRemove(files, `${name}.pack`);
       throw new Error(`could not move ${tmpRev}`);
     }
+    if (mtimesBytes && !(await files.move(tmpMtimes, `${name}.mtimes`))) {
+      await safeRemove(files, `${name}.pack`);
+      if (options.writeReverseIndex) await safeRemove(files, `${name}.rev`);
+      throw new Error(`could not move ${tmpMtimes}`);
+    }
     if (!(await files.move(tmpIdx, `${name}.idx`))) {
       await safeRemove(files, `${name}.pack`); // no orphan pack without its idx
       if (options.writeReverseIndex) await safeRemove(files, `${name}.rev`);
+      if (mtimesBytes) await safeRemove(files, `${name}.mtimes`);
       throw new Error(`could not move ${tmpIdx}`);
     }
     return result;
@@ -1386,7 +1414,7 @@ export async function installPack(
     win.release();
     stash.release();
     appended?.release();
-    for (const p of [tmpPack, tmpIdx, tmpRev, tmpFixed, ...(appended?.allPaths ?? [])]) {
+    for (const p of [tmpPack, tmpIdx, tmpRev, tmpMtimes, tmpFixed, ...(appended?.allPaths ?? [])]) {
       await safeRemove(files, p);
     }
     throw e;

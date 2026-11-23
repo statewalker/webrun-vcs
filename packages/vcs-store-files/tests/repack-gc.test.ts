@@ -162,6 +162,8 @@ describe("repack -d (loose only)", () => {
   });
 });
 
+// gc without cruft packs (`cruftPacks: false`, git's gc.cruftPacks=false) where a test is
+// about the unreachable objects written loose (`repack -A`); cruft-pack.git.test.ts has the rest
 describe("gc", () => {
   const dirs: string[] = [];
   afterAll(() => {
@@ -179,7 +181,7 @@ describe("gc", () => {
     const t = new Date(Date.now() - 15 * 24 * 3600_000);
     utimesSync(join(dir, ".git/objects", old.slice(0, 2), old.slice(2)), t, t);
 
-    const result = await gc({ history: b.history, files });
+    const result = await gc({ history: b.history, files, cruftPacks: false });
 
     expect(result.removedObjects).toBe(1);
     expect(result.keptRecentObjects).toBe(1);
@@ -411,7 +413,7 @@ describe("P2.6 review: unreachable packed objects get the grace period (repack -
 
   it("gc after branch -D keeps the branch's packed commits as loose objects", async () => {
     const { b, main, topic } = await deletedBranch();
-    const result = await gc({ history: b.history, files: b.files });
+    const result = await gc({ history: b.history, files: b.files, cruftPacks: false });
     expect(result.repack?.unpackedObjects).toBe(3);
     for (const id of [topic.commit, topic.tree, topic.blob]) {
       expect(await b.looseStorage.has(id)).toBe(true);
@@ -458,7 +460,7 @@ describe("P2.6 review: unreachable packed objects get the grace period (repack -
       const s = await stats(path);
       return s && path.endsWith(".pack") ? { ...s, lastModified: undefined } : s;
     };
-    await gc({ history: b.history, files: b.files, pruneExpireMs: 1 });
+    await gc({ history: b.history, files: b.files, pruneExpireMs: 1, cruftPacks: false });
     b.files.stats = stats;
     expect(await b.looseStorage.has(topic.commit)).toBe(true);
   });
@@ -653,7 +655,7 @@ describe("P2.6 second review: writes freshen old loose objects (git's freshen_lo
     age(21 * 24 * HOUR);
     await b.history.blobs.store([enc.encode("written again\n")]);
     expect(statSync(path).mtimeMs).toBeGreaterThan(Date.now() - 60_000);
-    const result = await gc({ history: b.history, files });
+    const result = await gc({ history: b.history, files, cruftPacks: false });
     expect(await b.looseStorage.has(blob)).toBe(true);
     expect(result.keptRecentObjects).toBe(1);
   });
@@ -716,7 +718,7 @@ describe("P2.6 second review: writes freshen old loose objects (git's freshen_lo
       writePack(other.objects, [{ id: blob, type: "blob" }]),
     );
     await new Promise((r) => setTimeout(r, 20));
-    const result = await gc({ history: b.history, files });
+    const result = await gc({ history: b.history, files, cruftPacks: false });
     expect(result.repack?.packsRemoved).toContain(`pack-${pushed.packId}`);
     const fresh = await open(files, false);
     expect(await fresh.objects.has(blob)).toBe(true);
@@ -731,7 +733,12 @@ describe("P2.6 second review: writes freshen old loose objects (git's freshen_lo
       writePack(other.objects, [{ id: blob, type: "blob" }]),
     );
     await new Promise((r) => setTimeout(r, 20));
-    const result = await gc({ history: b.history, files, pruneExpireMs: 10 * 60_000 });
+    const result = await gc({
+      history: b.history,
+      files,
+      pruneExpireMs: 10 * 60_000,
+      cruftPacks: false,
+    });
     expect(result.repack?.packsRemoved).toContain(`pack-${pushed.packId}`);
     const fresh = await open(files, false);
     expect(await fresh.objects.has(blob)).toBe(true);

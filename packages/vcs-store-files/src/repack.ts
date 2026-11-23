@@ -37,6 +37,7 @@ import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 
 import { assertAlternatesReadable } from "./alternates/index.js";
+import { writeCruftPacks } from "./cruft-pack.js";
 import { type MultiPackIndexWriteOptions, multiPackIndexWrite } from "./multi-pack-index.js";
 import {
   type PackWriteSettings,
@@ -122,6 +123,21 @@ export interface RepackOptions extends RepackTarget {
   unpackUnreachable?: boolean;
   /** The expiry of `unpackUnreachable` (git's gc.pruneExpire). Default two weeks. */
   unpackUnreachableExpireMs?: number;
+  /**
+   * `git repack --cruft` (with `all`, in place of `unpackUnreachable`): the unreachable
+   * objects of the replaced packs and the unreachable loose objects go into a cruft pack
+   * (`.pack`, `.idx`, `.mtimes`, and `.rev` under `pack.writeReverseIndex`), each with the
+   * newest time of its copies, before the replaced packs are removed (see
+   * `writeCruftPacks`). `gc()` sets it from `gc.cruftPacks` (default true).
+   */
+  cruft?: boolean;
+  /**
+   * `--cruft-expiration` (seconds since the epoch): cruft objects not newer than this are
+   * dropped unless a newer one reaches them. Undefined: none expires.
+   */
+  cruftExpiration?: number;
+  /** `--max-cruft-size` (bytes, at least 1 MiB as git's): cruft packs are split to stay under it. */
+  maxCruftSize?: number;
   /**
    * Reads the grafts file in place of `info/grafts` (git's `GIT_GRAFT_FILE`;
    * `graftFileReader(environment)` makes one): what its grafts reach is packed.
@@ -294,6 +310,10 @@ export interface RepackResult {
   promisorPack?: { packName: string; objectCount: number };
   /** `filter`: the pack of the objects the filter left out (`pack-<id>`), when any was */
   filteredPack?: string;
+  /** `cruft`: the cruft packs written (`pack-<id>`), when any was */
+  cruftPacks?: string[];
+  /** `cruft`: the objects written to them */
+  cruftObjects?: number;
   /**
    * git's error lines from reading the alternates, which git repack prints to stderr and goes
    * on (`repack()` only; gc reports them in its own result); absent when there are none
@@ -597,8 +617,41 @@ export async function repackListed(
       }
     }
 
+    // --cruft: the unreachable objects of the packs about to go, and the unreachable loose
+    // ones, into a cruft pack (pack-objects --cruft, the new packs and .keep packs fresh)
+    let cruft: { packNames: string[]; objectCount: number } | undefined;
+    if (options.cruft && all) {
+      cruft = await writeCruftPacks({
+        files,
+        gitDir,
+        objects,
+        packs,
+        looseStorage,
+        discard: removable,
+        now: Math.floor(Date.now() / 1000),
+        packOptions,
+        writeReverseIndex: settings.writeReverseIndex,
+        ...(options.cruftExpiration !== undefined ? { expiration: options.cruftExpiration } : {}),
+        ...(options.maxCruftSize !== undefined ? { maxSize: options.maxCruftSize } : {}),
+        skip: async (id) => {
+          // -l: what an alternate holds; a partial clone's promisor objects stay out
+          if (exclusions?.excluded.has(id)) return true;
+          if (options.local)
+            for (const alt of alternates) if (await alt.objects.has(id)) return true;
+          return false;
+        },
+      });
+      // a cruft pack that comes out the same as a replaced one stays
+      for (const name of cruft?.packNames ?? []) {
+        const id = name.slice("pack-".length);
+        newPacks.add(id);
+        const at = removable.findIndex((r) => r.pack.packId === id);
+        if (at >= 0) removable.splice(at, 1);
+      }
+    }
+
     let unpackedObjects = 0;
-    if (options.unpackUnreachable && removable.length) {
+    if (options.unpackUnreachable && !options.cruft && removable.length) {
       unpackedObjects = await unpackUnreachable({
         files,
         gitDir,
@@ -672,6 +725,7 @@ export async function repackListed(
         ? { promisorPack: { packName: `pack-${promisorPack}`, objectCount: promised.length } }
         : {}),
       ...(filteredPack ? { filteredPack: `pack-${filteredPack}` } : {}),
+      ...(cruft ? { cruftPacks: cruft.packNames, cruftObjects: cruft.objectCount } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
       ...(midxWritten ? { midx: midxWritten } : {}),
     };

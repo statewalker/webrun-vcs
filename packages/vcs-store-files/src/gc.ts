@@ -17,10 +17,12 @@ import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { assertAlternatesReadable } from "./alternates/index.js";
 import { readCommitGraphSettings, writeCommitGraph } from "./commit-graph.js";
+import { objectLinks } from "./cruft-pack.js";
+import { configBool, parseConfigSize } from "./pack/delta-base-cache-limit.js";
 import { promisorExclusions } from "./promisor-objects.js";
 import { sweepQuarantines } from "./quarantine/files-quarantine.js";
 import { listReachableObjects } from "./reachable-objects.js";
-import { expireReflogs, gcExpiresReflogs } from "./reflog-expire.js";
+import { expireReflogs, gcExpiresReflogs, parseExpiryDate } from "./reflog-expire.js";
 import { createFilesRefOps } from "./refs/index.js";
 import {
   DEFAULT_PRUNE_EXPIRE_MS,
@@ -32,6 +34,10 @@ import {
 import { readRepositoryFormat } from "./repository-format.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
 import { FileRawStorage } from "./storage/raw/file-raw-storage.js";
+import {
+  configFilesApiOf,
+  createWorkingCopyConfig,
+} from "./workspace/working-copy/working-copy-config.files.js";
 
 /** A loose object file name, fan-out directory included. */
 const OBJECT_ID = /^[0-9a-f]{40}$/;
@@ -63,9 +69,21 @@ export interface GcOptions {
    * are kept. Unreachable objects of a replaced pack are written loose unless the pack is older
    * than this (`git repack -A --unpack-unreachable`), and then expire as loose objects; their
    * loose copies get the current time, so they live up to this long beyond git's expiry.
-   * 0 prunes every unreachable object (`--prune=now`).
+   * 0 prunes every unreachable object (`--prune=now`), `Infinity` none (`never`). Default:
+   * the config's `gc.pruneExpire`, else two weeks.
    */
   pruneExpireMs?: number;
+  /**
+   * Store the unreachable objects of the replaced packs, and the unreachable loose objects, in
+   * a cruft pack (`git repack --cruft --cruft-expiration=<gc.pruneExpire>`) instead of writing
+   * them loose: their times go into its `.mtimes`, objects older than the grace period are
+   * dropped unless a younger unreachable object reaches them. Default: `gc.cruftPacks` (true
+   * when unset, as git since 2.37). Never with `--prune=now` (`pruneExpireMs` 0), where git
+   * runs `repack -a` and nothing unreachable is kept.
+   */
+  cruftPacks?: boolean;
+  /** `--max-cruft-size` (bytes): cruft packs no larger. Default: `gc.maxCruftSize`, else no limit. */
+  maxCruftSize?: number;
   /**
    * Remove `tmp_obj_*` and `objects/pack/tmp_*` temporaries (left by a crashed write), and
    * (whatever its age, when `packed-refs.lock` is free) a `packed-refs.new`, and
@@ -182,8 +200,11 @@ export interface GcResult {
  * 4. Packs refs (`history.refs.packRefs`, when the store has it).
  * 5. Repacks what is reachable into one pack and deletes the snapshot's packs (`.keep` packs
  *    stay; a pack installed during the walk is never deleted) and the loose copies now packed.
- *    Unreachable objects of the deleted packs are written loose first, unless their pack is
- *    older than `pruneExpireMs` (`git repack -A -d --unpack-unreachable`).
+ *    Unreachable objects of the deleted packs, and unreachable loose objects, go into a cruft
+ *    pack (`gc.cruftPacks`, default; `git repack --cruft`), dropped once older than
+ *    `pruneExpireMs` unless a younger one reaches them; with `gc.cruftPacks=false` they are
+ *    written loose unless their pack is older than `pruneExpireMs` (`git repack -A -d
+ *    --unpack-unreachable`).
  * 6. Prunes the unreachable loose objects older than `pruneExpireMs`.
  * 7. Sweeps stale temporaries (`tmp_obj_*`, `objects/pack/tmp_*`, `packed-refs.new`) and `.pack` files without
  *    an `.idx`.
@@ -251,9 +272,11 @@ async function collect(options: GcOptions): Promise<GcResult> {
     files,
     gitDir = ".git",
     dryRun = false,
-    pruneExpireMs = DEFAULT_PRUNE_EXPIRE_MS,
     tmpExpiryMs = DEFAULT_PRUNE_EXPIRE_MS,
   } = options;
+  // gc.pruneExpire, gc.cruftPacks, gc.maxCruftSize (git's gc_config)
+  const gcSettings = await readGcSettings(files, gitDir, options.environment);
+  const pruneExpireMs = options.pruneExpireMs ?? gcSettings.pruneExpireMs;
   const objects = (options.objects ?? history.objects) as GitObjects;
   const packs = options.packs ?? history.packs;
   const objectsDir = joinPath(gitDir, "objects");
@@ -368,8 +391,20 @@ async function collect(options: GcOptions): Promise<GcResult> {
         looseStorage,
         files,
         gitDir,
-        unpackUnreachable: true,
-        unpackUnreachableExpireMs: pruneExpireMs,
+        // --prune=now: repack -a (nothing unreachable kept); else --cruft, or -A
+        ...(pruneExpireMs <= 0
+          ? {}
+          : (options.cruftPacks ?? gcSettings.cruftPacks)
+            ? {
+                cruft: true,
+                ...(Number.isFinite(pruneExpireMs)
+                  ? { cruftExpiration: Math.floor((startedAt - pruneExpireMs) / 1000) }
+                  : {}),
+                ...((options.maxCruftSize ?? gcSettings.maxCruftSize)
+                  ? { maxCruftSize: options.maxCruftSize ?? gcSettings.maxCruftSize }
+                  : {}),
+              }
+            : { unpackUnreachable: true, unpackUnreachableExpireMs: pruneExpireMs }),
         // git gc: repack -d -l, what alternates hold stays theirs
         local: true,
         // a bare repository's gc writes a bitmap (git's repack default for -a in a bare one)
@@ -383,15 +418,19 @@ async function collect(options: GcOptions): Promise<GcResult> {
     );
   }
 
-  // Step 5: prune unreachable loose objects older than the grace period
+  // Step 5: prune unreachable loose objects older than the grace period, keeping what a
+  // younger unreachable object reaches (git prune's mark_reachable_objects with mark_recent)
   const cutoff = startedAt - pruneExpireMs;
   let removedObjects = 0;
   let keptRecentObjects = 0;
+  const expiredLoose: string[] = [];
+  const recent: string[] = [];
   for await (const key of looseStorage.keys()) {
     if (!OBJECT_ID.test(key) || reachable.has(key)) continue;
     // written, renewed or found fresh by the unpack step: its pack was young
     if (loosened.has(key)) {
       keptRecentObjects++;
+      recent.push(key);
       continue;
     }
     const path = joinPath(objectsDir, key.slice(0, 2), key.slice(2));
@@ -400,8 +439,29 @@ async function collect(options: GcOptions): Promise<GcResult> {
     const expired = pruneExpireMs <= 0 || (modified !== undefined && modified < cutoff);
     if (!expired) {
       keptRecentObjects++;
+      recent.push(key);
       continue;
     }
+    expiredLoose.push(key);
+  }
+  if (expiredLoose.length > 0 && recent.length > 0) {
+    const candidates = new Set(expiredLoose);
+    const walked = new Set<string>();
+    const pending = [...recent];
+    while (pending.length > 0) {
+      const id = pending.pop() as string;
+      if (walked.has(id)) continue;
+      walked.add(id);
+      for (const link of await objectLinks(objects, id)) {
+        if (walked.has(link) || reachable.has(link)) continue;
+        if (candidates.delete(link)) keptRecentObjects++;
+        pending.push(link);
+      }
+    }
+    expiredLoose.length = 0;
+    expiredLoose.push(...candidates);
+  }
+  for (const key of expiredLoose) {
     if (dryRun || (await looseStorage.remove(key))) removedObjects++;
   }
 
@@ -439,6 +499,40 @@ async function collect(options: GcOptions): Promise<GcResult> {
     skipped: false,
     ...commitGraph,
     ...errors,
+  };
+}
+
+/** git gc's settings of the object step: `gc.pruneExpire`, `gc.cruftPacks`, `gc.maxCruftSize`. */
+async function readGcSettings(
+  files: FilesApi,
+  gitDir: string,
+  environment?: GitHostEnvironment,
+): Promise<{ pruneExpireMs: number; cruftPacks: boolean; maxCruftSize?: number }> {
+  const config = await createWorkingCopyConfig(
+    configFilesApiOf(files, { readOnly: "reading the gc settings never writes the config" }),
+    gitDir,
+    undefined,
+    environment ? { environment } : {},
+  );
+  let pruneExpireMs = DEFAULT_PRUNE_EXPIRE_MS;
+  const expire = config.get("gc.pruneExpire");
+  if (expire !== undefined && expire !== null) {
+    const nowMs = Date.now();
+    const cutoff = parseExpiryDate(String(expire), Math.floor(nowMs / 1000), "gc.pruneexpire");
+    // never: nothing expires; now: everything does
+    pruneExpireMs =
+      cutoff === 0
+        ? Number.POSITIVE_INFINITY
+        : cutoff === Number.POSITIVE_INFINITY
+          ? 0
+          : Math.max(0, nowMs - cutoff * 1000);
+  }
+  const cruft = config.get("gc.cruftPacks");
+  const maxCruftSize = parseConfigSize(config.get("gc.maxCruftSize"));
+  return {
+    pruneExpireMs,
+    cruftPacks: configBool(cruft, true),
+    ...(maxCruftSize ? { maxCruftSize } : {}),
   };
 }
 
