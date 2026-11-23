@@ -229,43 +229,14 @@ export class ForEachRefCommand extends RefListingCommand<ForEachRefResult> {
   async call(): Promise<ForEachRefResult> {
     this.checkCallable();
     this.setCallable(false);
-    const resolver = this.revisionResolver();
     const usage = (message: string) => new RefFilterError(message, 129);
-    const objectOf = async (name: string) =>
-      resolver.resolve(name, { quiet: true }).catch(() => undefined);
-    // the option callbacks, as parse_options runs them
-    const pointsAt: ObjectId[] = [];
-    for (const name of this.pointsAt) {
-      const id = await objectOf(name);
-      if (!id) throw usage(`error: malformed object name '${name}'`);
-      pointsAt.push(id);
-    }
-    const commitsOf = async (names: string[], merge: string | undefined) => {
-      const out: ObjectId[] = [];
-      for (const name of names) {
-        const id = await objectOf(name);
-        if (!id) {
-          if (merge) throw new RefFilterError(`fatal: malformed object name ${name}`, 128);
-          throw usage(`error: malformed object name ${name}`);
-        }
-        const commit = await resolver.commitReference(id).catch(() => undefined);
-        if (!commit) {
-          const type = (await resolver.objectType(id).catch(() => undefined)) ?? "unknown";
-          const notCommit = `error: object ${id} is a ${type}, not a commit`;
-          throw usage(
-            merge
-              ? `${notCommit}\nerror: option \`${merge}' must point to a commit`
-              : `${notCommit}\nerror: no such commit ${name}`,
-          );
-        }
-        out.push(commit);
-      }
-      return out;
-    };
-    const contains = await commitsOf(this.contains, undefined);
-    const noContains = await commitsOf(this.noContains, undefined);
-    const merged = await commitsOf(this.merged, "merged");
-    const noMerged = await commitsOf(this.noMerged, "no-merged");
+    const { pointsAt, contains, noContains, merged, noMerged } = await this.resolveFilterArgs({
+      pointsAt: this.pointsAt,
+      contains: this.contains,
+      noContains: this.noContains,
+      merged: this.merged,
+      noMerged: this.noMerged,
+    });
     if (this.count < 0) throw usage(`error: invalid --count argument: \`${this.count}'`);
     const formatSource = this.formatSource();
     if (this.now !== undefined) formatSource.dateContext = { now: this.now };
