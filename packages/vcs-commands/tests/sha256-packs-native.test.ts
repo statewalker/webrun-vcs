@@ -10,8 +10,9 @@
  * t7063-status-untracked-cache.sh, t2104-update-index-skip-worktree.sh (version 3) and
  * t2108-update-index-refresh-racy.sh (version 4 via `index.version`).
  *
- * What SHA-256 repositories still lack (the multi-pack-index, pack bitmaps, the commit-graph)
- * stays refused or skipped: see the last describe.
+ * The multi-pack-index, pack bitmaps and the commit-graph of SHA-256 repositories (T3c) have
+ * their own twins (`sha256-graph-midx-native.test.ts`); the last describe here checks that gc
+ * and repack no longer refuse or skip them.
  */
 
 import { spawnSync } from "node:child_process";
@@ -39,7 +40,7 @@ import {
   multiPackIndexWrite,
   openGitLinkedWorktrees,
 } from "@statewalker/vcs-store-files";
-import { SHA256_OBJECT_FORMAT, UnsupportedObjectFormatError } from "@statewalker/vcs-utils";
+import { SHA256_OBJECT_FORMAT } from "@statewalker/vcs-utils";
 import {
   createNodeFilesApi,
   createNodeGitHostEnvironment,
@@ -358,8 +359,8 @@ describeGit("SHA-256 packs and index files against native git", () => {
         join(dir, ".git", "objects", "pack", (packs[0] as string).replace(/\.pack$/, ".rev")),
       );
       expect(rev.readUInt32BE(8)).toBe(2);
-      // no commit-graph, no bitmap in a SHA-256 repository yet
-      expect(existsSync(join(dir, ".git", "objects", "info", "commit-graph"))).toBe(false);
+      // the commit-graph git gc writes; no bitmap in a repository with a worktree
+      expect(existsSync(join(dir, ".git", "objects", "info", "commit-graph"))).toBe(true);
       expect(packNames(dir, ".bitmap")).toEqual([]);
       expectNativeFsckClean(dir);
       const idx = `.git/objects/pack/${(packs[0] as string).replace(/\.pack$/, ".idx")}`;
@@ -797,9 +798,9 @@ describeGit("SHA-256 packs and index files against native git", () => {
       });
     }
 
-    // H1: a commit-graph native gc wrote names a commit ours then prunes; with no SHA-256
-    // commit-graph writer, ours removes the graph rather than leave it stale
-    it("gc that prunes removes a commit-graph it cannot rewrite", async () => {
+    // H1: a commit-graph native gc wrote names a commit ours then prunes: ours rewrites the
+    // graph (T3c), as git gc does, rather than leave it stale
+    it("gc that prunes rewrites the commit-graph without the pruned commit", async () => {
       const dir = nativeRepo();
       g(dir, "checkout", "-q", "-b", "tmp");
       put(dir, "x.txt", "x\n");
@@ -814,42 +815,41 @@ describeGit("SHA-256 packs and index files against native git", () => {
       const git = await openOurs(dir);
       await git.gc().setPrune("now").call();
       expect(native(dir, ["cat-file", "-e", doomed]).status).not.toBe(0);
-      expect(existsSync(join(dir, ".git", "objects", "info", "commit-graph"))).toBe(false);
-      expect(existsSync(join(dir, ".git", "objects", "info", "commit-graphs"))).toBe(false);
+      expect(existsSync(join(dir, ".git", "objects", "info", "commit-graph"))).toBe(true);
       expectNativeFsckClean(dir);
       expect(native(dir, ["commit-graph", "verify"]).status).toBe(0);
       expect(native(dir, ["log", "--all", "--oneline"]).status).toBe(0);
-      // a split chain (commit-graphs/) goes too
+      // a split chain (commit-graphs/) is replaced by one file, as git gc writes it
+      rmSync(join(dir, ".git", "objects", "info", "commit-graph"));
       g(dir, "commit-graph", "write", "--reachable", "--split");
       expect(existsSync(join(dir, ".git", "objects", "info", "commit-graphs"))).toBe(true);
       const again = await openOurs(dir);
       await again.gc().setPrune("now").call();
-      expect(existsSync(join(dir, ".git", "objects", "info", "commit-graphs"))).toBe(false);
+      const chain = join(dir, ".git", "objects", "info", "commit-graphs");
+      expect(existsSync(chain) ? readdirSync(chain) : []).toEqual([]);
+      expect(native(dir, ["commit-graph", "verify"]).status).toBe(0);
       expectNativeFsckClean(dir);
     });
   });
 
-  describe("what SHA-256 repositories still lack", () => {
-    it("refuses a multi-pack-index (read and written) and bitmaps asked for", async () => {
+  describe("what SHA-256 repositories no longer lack (T3c)", () => {
+    it("writes a multi-pack-index, bitmaps asked for, and opens a repository with a midx", async () => {
       const dir = nativeRepo();
       g(dir, "repack", "-q", "-a", "-d");
       const files = createNodeFilesApi({ rootDir: dir });
-      await expect(multiPackIndexWrite({ files, gitDir: ".git" })).rejects.toThrow(
-        UnsupportedObjectFormatError,
-      );
+      expect((await multiPackIndexWrite({ files, gitDir: ".git" })).exitCode).toBe(0);
       g(dir, "config", "repack.writeBitmaps", "true");
       const git = await openOurs(dir);
-      await expect(git.gc().call()).rejects.toThrow(
-        "webrun-vcs does not support pack bitmaps in sha256 repositories yet",
-      );
+      await git.gc().call();
+      expect(packNames(dir, ".bitmap")).toHaveLength(1);
       g(dir, "config", "--unset", "repack.writeBitmaps");
       g(dir, "multi-pack-index", "write");
-      await expect(createGitFilesBackend({ files, gitDir: ".git" })).rejects.toThrow(
-        "webrun-vcs does not support the multi-pack-index in sha256 repositories yet",
-      );
+      const { packs } = await createGitFilesBackend({ files, gitDir: ".git" });
+      expect((await packs.multiPackIndex?.())?.checksum).toHaveLength(64);
+      expectNativeFsckClean(dir);
     });
 
-    it("gc of a bare repository writes no bitmap and no commit-graph", async () => {
+    it("gc of a bare repository writes the bitmap and the commit-graph, as git gc", async () => {
       const src = nativeRepo();
       const dir = fresh();
       g(root, "clone", "-q", "--bare", "--no-local", src, dir);
@@ -860,8 +860,8 @@ describeGit("SHA-256 packs and index files against native git", () => {
       const git = Git.fromWorktreeAdmin(await worktrees.openAdmin());
       await git.gc().setPrune("now").call();
       const packDir = join(dir, "objects", "pack");
-      expect(readdirSync(packDir).filter((f) => f.endsWith(".bitmap"))).toEqual([]);
-      expect(existsSync(join(dir, "objects", "info", "commit-graph"))).toBe(false);
+      expect(readdirSync(packDir).filter((f) => f.endsWith(".bitmap"))).toHaveLength(1);
+      expect(existsSync(join(dir, "objects", "info", "commit-graph"))).toBe(true);
       const r = spawnSync("git", fsckArgs(), {
         cwd: dir,
         env: { ...nativeGitEnv(root), GIT_DIR: "." },
