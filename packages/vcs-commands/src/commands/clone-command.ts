@@ -30,6 +30,7 @@ import type { CloneResult } from "../results/clone-result.js";
 import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { defaultInitialBranch } from "./default-branch.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
 import { fetchFsckOf } from "./fsck/index.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
@@ -812,7 +813,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     let checkoutId: ObjectId | undefined;
     // an empty remote without unborn HEAD: git's default branch (the one init named)
     if (!detachedTag && !this.bare && defaultBranch === undefined && result.isEmpty) {
-      defaultBranch = (await this.localHeadBranch()) ?? "main";
+      defaultBranch =
+        (await this.localHeadBranch()) ??
+        (await defaultInitialBranch(hostEnvironmentOf(this._workingCopy))).name;
     }
 
     // git's update_remote_refs (before update_head): refs/remotes/<name>/HEAD names the tracking ref of the
@@ -896,7 +899,11 @@ export class CloneCommand extends TransportCommand<CloneResult> {
 
     const cloneResult: CloneResult = {
       fetchResult,
-      defaultBranch: defaultBranch ?? "main",
+      // as the empty-remote case above: the local HEAD's branch, else git's default
+      defaultBranch:
+        defaultBranch ??
+        (await this.localHeadBranch()) ??
+        (await defaultInitialBranch(hostEnvironmentOf(this._workingCopy))).name,
       remoteName: this.remoteName,
       bare: this.bare,
       headCommit,

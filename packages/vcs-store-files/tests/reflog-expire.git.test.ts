@@ -22,7 +22,13 @@ import { join, relative } from "node:path";
 import type { GitObjects } from "@statewalker/vcs-core";
 import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
 import { afterAll, describe, expect, it } from "vitest";
-import { createGitFilesBackend, expireReflogs, gc, wildmatch } from "../src/index.js";
+import {
+  createGitFilesBackend,
+  expireReflogs,
+  gc,
+  parseExpiryDate,
+  wildmatch,
+} from "../src/index.js";
 
 const DAY = 24 * 3600;
 const now = Math.floor(Date.now() / 1000);
@@ -154,7 +160,18 @@ describe("gc's reflog step (t1410, t6500)", () => {
     // the scenario has entries to expire of both kinds
     expect(before["logs/HEAD"]?.split("\n").length).toBeGreaterThan(5);
     const [native, ours] = twins(dir);
-    git(native, ["gc", "-q", "--prune=now"]);
+    // git's documented defaults, given to native git explicitly: 2.56.x swapped them in
+    // reflog.h (REFLOG_EXPIRE_OPTIONS_INIT: total 30 days, unreachable 90), so it expires
+    // every entry older than 30 days; 2.43 and master keep 90 and 30, as ours does
+    git(native, [
+      "-c",
+      "gc.reflogExpire=90.days.ago",
+      "-c",
+      "gc.reflogExpireUnreachable=30.days.ago",
+      "gc",
+      "-q",
+      "--prune=now",
+    ]);
     const r = await ourGc(ours);
     expect(r.reflogEntriesPruned).toBeGreaterThan(0);
     expect(reflogs(ours)).toEqual(reflogs(native));
@@ -212,5 +229,44 @@ describe("gc's reflog step (t1410, t6500)", () => {
     expect(wildmatch("refs/heads/[a-c]?", "refs/heads/bz")).toBe(true);
     expect(wildmatch("refs/heads/[!a-c]?", "refs/heads/bz")).toBe(false);
     expect(wildmatch("refs/stash", "refs/stash")).toBe(true);
+  });
+});
+
+describe("gc's expiry values as git's approxidate reads them (parse_expiry_date)", () => {
+  // forms native gc accepts that a "<n>.<unit>.ago"-only parser refused
+  for (const value of ["2 weeks", "90.days", "yesterday", "two.weeks.ago", "3.days.ago"]) {
+    it(`gc.reflogExpire=${value} expires as native gc`, async () => {
+      const dir = scenario();
+      git(dir, ["config", "gc.reflogExpire", value]);
+      git(dir, ["config", "gc.reflogExpireUnreachable", value]);
+      const [native, ours] = twins(dir);
+      git(native, ["gc", "-q", "--prune=now"]);
+      await ourGc(ours);
+      expect(reflogs(ours)).toEqual(reflogs(native));
+      expect(allObjects(ours)).toEqual(allObjects(native));
+    });
+  }
+
+  it("refuses a value approxidate cannot read, as native gc dies", async () => {
+    const dir = scenario();
+    git(dir, ["config", "gc.reflogExpire", "blah"]);
+    const [native, ours] = twins(dir);
+    expect(() => git(native, ["gc", "-q"])).toThrow();
+    await expect(ourGc(ours)).rejects.toThrow(
+      /'blah' for 'gc.reflogexpire' is not a valid timestamp/i,
+    );
+  });
+
+  it("reads never/false/all/now exactly, the rest through approxidate", () => {
+    const at = 1_700_000_000;
+    expect(parseExpiryDate("never", at)).toBe(0);
+    expect(parseExpiryDate("false", at)).toBe(0);
+    expect(parseExpiryDate("all", at)).toBe(Number.POSITIVE_INFINITY);
+    expect(parseExpiryDate("now", at)).toBe(Number.POSITIVE_INFINITY);
+    expect(parseExpiryDate("2 weeks", at)).toBe(at - 14 * DAY);
+    expect(parseExpiryDate("90.days", at)).toBe(at - 90 * DAY);
+    expect(parseExpiryDate("two.weeks.ago", at)).toBe(at - 14 * DAY);
+    expect(parseExpiryDate("1600000000", at)).toBe(1_600_000_000);
+    expect(() => parseExpiryDate("blah", at)).toThrow();
   });
 });

@@ -11,6 +11,7 @@
 
 import type { FilesApi, GitObjects, ObjectId, Refs } from "@statewalker/vcs-core";
 import { joinPath } from "@statewalker/vcs-core";
+import { approxidateCareful } from "@statewalker/vcs-utils";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import {
@@ -465,37 +466,17 @@ async function readConfig(files: FilesApi, gitDir: string, environment?: GitHost
 }
 
 /**
- * git's `parse_expiry_date` in seconds: `never`/`false` 0 (nothing expires), `all`/`now`
- * Infinity (git's TIME_MAX), `<n>.<unit>[s].ago` (or with spaces), seconds since the epoch,
- * or a date `Date.parse` reads. Anything else is refused as git dies.
+ * git's `parse_expiry_date` in seconds: exactly `never`/`false` 0 (nothing expires),
+ * `all`/`now` Infinity (git's TIME_MAX), anything else through `approxidate_careful`
+ * (`2.weeks.ago`, `2 weeks`, `90.days`, `yesterday`, `two.weeks.ago`, absolute dates, epoch
+ * seconds). A value approxidate cannot read is refused as git dies.
  */
 export function parseExpiryDate(value: string, now: number, key = "expiry"): number {
-  const text = value.trim().toLowerCase();
-  if (text === "never" || text === "false") return 0;
-  if (text === "all" || text === "now") return Number.POSITIVE_INFINITY;
-  const rel = /^(\d+)[. ](second|minute|hour|day|week|month|year)s?[. ]ago$/.exec(text);
-  if (rel) {
-    const n = Number(rel[1]);
-    const unit = rel[2] as string;
-    if (unit === "month" || unit === "year") {
-      const d = new Date(now * 1000);
-      d.setMonth(d.getMonth() - (unit === "year" ? 12 * n : n));
-      return Math.floor(d.getTime() / 1000);
-    }
-    const secs: Record<string, number> = {
-      second: 1,
-      minute: 60,
-      hour: 3600,
-      day: DAY,
-      week: 7 * DAY,
-    };
-    return now - n * (secs[unit] as number);
-  }
-  if (/^\d+$/.test(text)) return Number(text);
-  const parsed = Date.parse(value);
-  if (Number.isNaN(parsed))
-    throw new ReflogExpiryConfigError(`'${value}' for '${key}' is not a valid timestamp`);
-  return Math.floor(parsed / 1000);
+  if (value === "never" || value === "false") return 0;
+  if (value === "all" || value === "now") return Number.POSITIVE_INFINITY;
+  const { timestamp, error } = approxidateCareful(value, now);
+  if (error) throw new ReflogExpiryConfigError(`'${value}' for '${key}' is not a valid timestamp`);
+  return timestamp;
 }
 
 /**

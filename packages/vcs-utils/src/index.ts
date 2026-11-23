@@ -1,6 +1,7 @@
 export * from "./cache/index.js";
 export * from "./collections/index.js";
 export * from "./compression/index.js";
+export * from "./date/index.js";
 export * from "./diff/index.js";
 export * from "./encoding/index.js";
 export * from "./ewah/index.js";

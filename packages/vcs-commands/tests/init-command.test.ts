@@ -27,7 +27,7 @@ describe("InitCommand", () => {
       expect(result.git).toBeInstanceOf(Git);
       expect(result.workingCopy).toBeDefined();
       expect(result.repository).toBeDefined();
-      expect(result.initialBranch).toBe("main");
+      expect(result.initialBranch).toBe("master"); // git's default (init.defaultBranch unset)
       expect(result.bare).toBe(false);
       expect(result.gitDir).toBe(".git");
     });
@@ -60,7 +60,7 @@ describe("InitCommand", () => {
 
       const head = await result.repository.refs.get("HEAD");
       expect(head).toBeDefined();
-      expect(head && "target" in head && head.target).toBe("refs/heads/main");
+      expect(head && "target" in head && head.target).toBe("refs/heads/master");
     });
   });
 
@@ -172,8 +172,8 @@ describe("InitCommand", () => {
         .call();
 
       const head = new TextDecoder().decode(await collect(files.read(".git/HEAD")));
-      expect(head).toBe("ref: refs/heads/main\n");
-      const branch = new TextDecoder().decode(await collect(files.read(".git/refs/heads/main")));
+      expect(head).toBe("ref: refs/heads/master\n");
+      const branch = new TextDecoder().decode(await collect(files.read(".git/refs/heads/master")));
       expect(branch.trim()).toBe(commit.id);
 
       // Reopening the same files finds the commit.
@@ -229,7 +229,7 @@ describe("InitCommand", () => {
       const after = new TextDecoder().decode(await collect(files.read(".git/config")));
       expect(after).toContain('[remote "origin"]');
       const head = new TextDecoder().decode(await collect(files.read(".git/HEAD")));
-      expect(head.trim()).toBe("ref: refs/heads/main");
+      expect(head.trim()).toBe("ref: refs/heads/master");
     });
 
     it("should write core.bare = true for a bare repository", async () => {
@@ -351,7 +351,8 @@ describe("InitCommand", () => {
       const branchNames = branches.map((b) => b.name);
 
       // Branch names may include full ref path or just the name depending on implementation
-      const hasMain = branchNames.some((n) => n === "main" || n.endsWith("/main"));
+      // git's default initial branch: master (main only with init.defaultBranch or git 3.0)
+      const hasMain = branchNames.some((n) => n === "master" || n.endsWith("/master"));
       const hasFeature = branchNames.some((n) => n === "feature" || n.endsWith("/feature"));
       expect(hasMain).toBe(true);
       expect(hasFeature).toBe(true);
