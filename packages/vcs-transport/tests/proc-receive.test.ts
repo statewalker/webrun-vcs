@@ -5,13 +5,16 @@
  * client, and post-receive told the rewrites.
  */
 
+import { SHA256_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import { describe, expect, it } from "vitest";
 
 import {
+  type ProcReceiveCommand,
   type ProcReceiveProcess,
   parseProcReceiveRef,
   procReceiveRefMatches,
   type ReceiveCommand,
+  runProcReceive,
 } from "../src/index.js";
 import {
   clientWithNewCommits,
@@ -378,5 +381,64 @@ describe("receive-pack: an `ng` of the proc-receive hook", () => {
       { procReceiveRefs: ["refs/for"], hooks: { procReceive: () => hook.process } },
     );
     expect(run.report).toEqual(["unpack ok", "ng refs/for/x ", "ng refs/for/y failed"]);
+  });
+});
+
+describe("receive-pack: the ids of a proc-receive report (git's parse_oid_hex)", () => {
+  it("a SHA-1 repository reads the first 40 digits of a longer id", async () => {
+    const { repo } = await serverRepo();
+    const { client, commits } = await clientWithNewCommits(1);
+    const n0 = commits[0] as string;
+    const hook = scriptedHook([
+      "ok refs/for/main/topic",
+      `option old-oid ${n0}${"a".repeat(24)}`,
+      `option new-oid ${n0.toUpperCase()}${"b".repeat(24)} tail`,
+      "ok refs/for/main/topic",
+      `option new-oid ${n0.slice(0, 39)}`,
+    ]);
+    const run = await runReceivePack(
+      repo,
+      {
+        commands: [`${ZERO} ${n0} refs/for/main/topic`],
+        caps: "report-status-v2 side-band-64k",
+        pack: await fullPackOf(client, [n0]),
+      },
+      { procReceiveRefs: ["refs/for"], hooks: { procReceive: () => hook.process } },
+    );
+    expect(run.report).toEqual([
+      "unpack ok",
+      "ok refs/for/main/topic",
+      `option old-oid ${n0}`,
+      `option new-oid ${n0}`,
+      // 39 digits are no id: the option is ignored
+      "ok refs/for/main/topic",
+    ]);
+  });
+
+  it("a SHA-256 repository reads 64 digits, and ignores a 40-digit id", async () => {
+    const zero = SHA256_OBJECT_FORMAT.nullId;
+    const id = "c".repeat(64);
+    const commands: ProcReceiveCommand[] = [
+      {
+        refName: "refs/for/main/topic",
+        oldOid: zero,
+        newOid: id,
+        type: "CREATE",
+        result: "NOT_ATTEMPTED",
+        procReceive: 1,
+      },
+    ];
+    const hook = scriptedHook([
+      "ok refs/for/main/topic",
+      `option old-oid ${"d".repeat(64)}`,
+      `option new-oid ${"e".repeat(40)}`,
+    ]);
+    const { code } = await runProcReceive(hook.process, commands, {
+      atomic: false,
+      objectFormat: SHA256_OBJECT_FORMAT,
+    });
+    expect(code).toBe(0);
+    expect(hook.read).toEqual(["version=1", "0000", `${zero} ${id} refs/for/main/topic`, "0000"]);
+    expect(commands[0]?.reports).toEqual([{ oldOid: "d".repeat(64) }]);
   });
 });

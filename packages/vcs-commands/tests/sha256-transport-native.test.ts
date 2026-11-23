@@ -680,6 +680,38 @@ describeGit("SHA-256 over the wire, as native git", () => {
       expect(Buffer.concat(chunks).toString()).toBe("file 5\n".repeat(100));
     });
 
+    it("a SHA-1 destination holding an object and alternates refuses a SHA-256 clone and keeps its alternates", async () => {
+      // git refuses a destination that is not empty; ours is checked before the object
+      // format is switched, and nothing is removed from a refused destination
+      const { dir, ours } = await ourEmpty("oc-nonempty");
+      const alternatesFile = join(dir, ".git/objects/info/alternates");
+      const alternates = `${join(srv, "src1.git/objects")}\n`;
+      writeFileSync(alternatesFile, alternates);
+      writeFileSync(join(root, "one-object.txt"), "one object\n");
+      git(dir, "hash-object", "-w", join(root, "one-object.txt"));
+      await expect(ours.clone().setURI(join(srv, "src256.git")).call()).rejects.toThrow(
+        "cannot change the object format of a repository with objects",
+      );
+      expect(readFileSync(alternatesFile, "utf8")).toBe(alternates);
+      expect(git(dir, "rev-parse", "--show-object-format").trim()).toBe("sha1");
+    });
+
+    it("a SHA-1 destination with only alternates clones a SHA-256 remote without them", async () => {
+      // the alternates' objects are not the destination's own: it is switched, and the
+      // alternates (of the old format) are dropped
+      const native = join(root, `oc-native-${counter++}`);
+      gitRun(root, root, ["clone", "-q", join(srv, "src256.git"), native]);
+      const { dir } = await ourEmpty("oc-alternates");
+      const alternatesFile = join(dir, ".git/objects/info/alternates");
+      writeFileSync(alternatesFile, `${join(srv, "src1.git/objects")}\n`);
+      // opened with the alternates read: their objects are listed with the destination's
+      const ours = await openLinked(dir);
+      await ours.clone().setURI(join(srv, "src256.git")).call();
+      expect(existsSync(alternatesFile)).toBe(false);
+      expect(stateOf(dir)).toEqual(stateOf(native));
+      fsckClean(dir);
+    });
+
     const describeHttp = systemGitHasHttp ? describe : describe.skip;
     describeHttp("against http-backend", () => {
       for (const version of ["0", "2"] as const) {
