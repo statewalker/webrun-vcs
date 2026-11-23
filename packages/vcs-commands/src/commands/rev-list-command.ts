@@ -40,6 +40,7 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   private readonly revisions: string[] = [];
   private readonly mixed: string[] = [];
   private committish = true;
+  private logConfig = false;
   private readonly configure: ((log: LogCommand) => void)[] = [];
   /** The log that walks for this command, once called */
   private log?: LogCommand;
@@ -149,11 +150,14 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
-   * Whether `git log`'s configuration applies (`grep.patternType`, `grep.extendedRegexp`,
-   * `log.mailmap`; default true); false for `git rev-list`, which reads none of it.
+   * Whether `git log`'s configuration applies to the patterns (`grep.patternType`,
+   * `grep.extendedRegexp`, `log.mailmap`). Default false, as `git rev-list`, which reads none
+   * of it; true reads the revisions' patterns as `git log` does.
    */
   setLogConfig(read: boolean): this {
-    return this.configured((log) => log.setLogConfig(read));
+    this.checkCallable();
+    this.logConfig = read;
+    return this;
   }
 
   /** A filter of the commits listed (see `CommitFilters`). */
@@ -199,6 +203,7 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     this.log = log;
     if (this.useReplaceRefsOverride !== undefined)
       log.setUseReplaceRefs(this.useReplaceRefsOverride);
+    log.setLogConfig(this.logConfig);
     for (const configure of this.configure) configure(log);
     // `--not` alone names no revision: git log falls back to HEAD (revs->def) as with none
     const named = (args: string[]) => args.some((arg) => arg !== "--not" && arg !== "--");

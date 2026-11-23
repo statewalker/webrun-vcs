@@ -490,8 +490,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 
   /**
    * The patterns' type: `--basic-regexp`, `-E` (`extended`), `-F` (`fixed`) or `-P`
-   * (`perl`: PCRE2 syntax run through `compilePcreSubset`, refusing what it cannot run as
-   * PCRE2 would). Default: `grep.patternType`, else `grep.extendedRegexp`, else basic.
+   * (`perl`: refused as a git built without PCRE refuses it, unless the pattern has no regex
+   * character). Default: `grep.patternType`, else `grep.extendedRegexp`, else basic.
    */
   setPatternType(type: GrepPatternType): this {
     this.checkCallable();
@@ -597,32 +597,25 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 
   /**
    * The walk's filter: git's `--grep`/`--author`/`--committer` options as one `commit_match`
-   * (revision.c), then the filters added. git reads `grep.patternType` whether or not a
-   * pattern is given, and dies on a value it does not know.
+   * (revision.c), then the filters added. The walk reads `grep.patternType` (and refuses a
+   * value git does not know) only when a pattern is given; the log output (`callBytes`, git
+   * log and git show) reads it on every run, as git does.
    */
   private async buildCommitFilter(): Promise<CommitFilter | undefined> {
-    let type = this.patternType;
-    if (this.logConfig) {
-      const value = configValue(this.workingCopy, "grep.patternType");
-      let configured: GrepPatternType | undefined;
-      if (value !== undefined) {
-        if (value === "basic" || value === "extended" || value === "fixed" || value === "perl") {
-          configured = value;
-        } else if (value !== "default") {
-          throw new InvalidConfigError(
-            "grep.patternType",
-            `fatal: bad grep.patterntype argument: ${value}`,
-          );
-        }
-      }
-      if (type === undefined) type = configured;
-      if (type === undefined && configBool(this.workingCopy, "grep.extendedRegexp", false)) {
-        type = "extended";
-      }
-    }
     const filters: CommitFilter[] = [];
     const headers = this.grepAuthors.length > 0 || this.grepCommitters.length > 0;
+    // the grep configuration and the mailmap are read only for a walk that greps: the
+    // commands walking through LogCommand for git's other commands (bisect, notes, rev-list)
+    // never see them
     if (this.grepMessages.length > 0 || headers) {
+      let type = this.patternType;
+      if (this.logConfig) {
+        const configured = this.configuredPatternType();
+        if (type === undefined) type = configured;
+        if (type === undefined && configBool(this.workingCopy, "grep.extendedRegexp", false)) {
+          type = "extended";
+        }
+      }
       let mailmap: Mailmap | undefined;
       const mapped =
         this.useMailmap ??
@@ -644,6 +637,22 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     }
     filters.push(...this.commitFilters);
     return filters.length > 0 ? CommitFilters.and(...filters) : undefined;
+  }
+
+  /**
+   * `grep.patternType` as grep_config reads it (`default` is undefined); a value git does not
+   * know dies, as every `git log`/`git show` dies on it whatever it is asked.
+   */
+  private configuredPatternType(): GrepPatternType | undefined {
+    const value = configValue(this.workingCopy, "grep.patternType");
+    if (value === undefined || value === "default") return undefined;
+    if (value === "basic" || value === "extended" || value === "fixed" || value === "perl") {
+      return value;
+    }
+    throw new InvalidConfigError(
+      "grep.patternType",
+      `fatal: bad grep.patterntype argument: ${value}`,
+    );
   }
 
   /** The bytes of a commit as the walk reads it (the replacement's under replace refs) */
@@ -1175,6 +1184,9 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         "options '--graph' and '--reverse' cannot be used together",
       );
     }
+    // git log and git show read grep_config before anything else (a bad grep.patternType
+    // dies there); the walk alone (rev-list, bisect's own walks) reads it only to grep
+    if (this.logConfig) this.configuredPatternType();
     // --use-mailmap/--no-mailmap: what --author/--committer match too
     if (options.mailmap !== undefined) this.useMailmap ??= options.mailmap;
     const host = this.outputHost(options);

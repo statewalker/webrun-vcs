@@ -7,10 +7,8 @@ import { describe, expect, it } from "vitest";
 import {
   applyMailmapToHeader,
   compileCommitGrep,
-  compilePcreSubset,
   GrepPatternError,
   Mailmap,
-  PcreUnsupportedError,
 } from "../src/index.js";
 
 const enc = new TextEncoder();
@@ -70,21 +68,21 @@ describe("compileCommitGrep", () => {
   });
 });
 
-describe("compilePcreSubset", () => {
-  const line = (s: string) => enc.encode(s);
+describe("-P (a git built without PCRE)", () => {
+  const sec = commit("A U Thor <author@example.com>", "second\n");
 
-  it("runs PCRE2 syntax with byte semantics", () => {
-    expect(compilePcreSubset("fi(?=x)").test(line("fix"))).toBe(true);
-    expect(compilePcreSubset("[\\d]").test(line("d"))).toBe(false);
-    expect(compilePcreSubset("a.b").test(line("a\rb"))).toBe(true);
-    expect(compilePcreSubset("\\s").test(enc.encode("\u00a0"))).toBe(false);
-    expect(compilePcreSubset("(?i)abc").test(line("ABC"))).toBe(true);
-    expect(compilePcreSubset("\\Qa.b\\E").test(line("axb"))).toBe(false);
+  it("takes patterns without a regex character literally", () => {
+    expect(compileCommitGrep({ messages: ["sec"], patternType: "perl" }).matches(sec)).toBe(true);
+    expect(
+      compileCommitGrep({ messages: ["SEC"], patternType: "perl", ignoreCase: true }).matches(sec),
+    ).toBe(true);
   });
 
-  it("refuses what it cannot run as PCRE2 does", () => {
-    for (const p of ["a++", "(?>a)", "\\p{L}", "a(?R)", "\\K", "(*UTF)a", "x(?i)y"]) {
-      expect(() => compilePcreSubset(p)).toThrow(PcreUnsupportedError);
+  it("dies on any other pattern before matching anything", () => {
+    for (const p of ["(.|.)*XYZ", "(a+)+$", "s.c", "a++"]) {
+      expect(() => compileCommitGrep({ messages: [p], patternType: "perl" })).toThrow(
+        "fatal: cannot use Perl-compatible regexes when not compiled with USE_LIBPCRE",
+      );
     }
   });
 });

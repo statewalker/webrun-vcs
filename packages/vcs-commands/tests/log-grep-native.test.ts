@@ -113,7 +113,12 @@ describeGit("log/rev-list commit filters against native git", () => {
   const git = (args: string[], input?: string) =>
     execFileSync("git", args, { cwd: dir, env: gitEnv(), encoding: "utf8", input });
 
-  /** Whether native git was built with PCRE (git dies on -P otherwise, as t4202 expects) */
+  /**
+   * Whether native git was built with PCRE. Ours behaves as a git built without it (NO_PCRE,
+   * as the 2.56.1 build here): `-P` patterns with a regex character die. Twins of such
+   * patterns run only against a native git without PCRE; with PCRE (the sandbox's 2.43) they
+   * are skipped, since that git matches them.
+   */
   let pcre = false;
 
   beforeAll(() => {
@@ -187,9 +192,7 @@ describeGit("log/rev-list commit filters against native git", () => {
     const g = await open(config);
     try {
       const walk =
-        cmd === "log"
-          ? apply(g.log(), args)
-          : apply(g.revList().setLogConfig(false).setCommittish(false), args);
+        cmd === "log" ? apply(g.log(), args) : apply(g.revList().setCommittish(false), args);
       const out: string[] = [];
       for await (const c of await walk.call()) out.push(c.id);
       return { ids: out };
@@ -204,6 +207,7 @@ describeGit("log/rev-list commit filters against native git", () => {
     source: string;
     args: string[];
     config?: Record<string, string>;
+    /** A `-P` pattern with regex characters: compared only with a native git without PCRE */
     perl?: boolean;
     /** Also as `git rev-list` (no `log` configuration, no mailmap) */
     revList?: boolean;
@@ -363,12 +367,15 @@ describeGit("log/rev-list commit filters against native git", () => {
       config: { "grep.extendedRegexp": "true", "grep.patternType": "basic" },
     },
     { source: own, args: ["--grep=(1|2)"], config: { "grep.patternType": "fixed" }, revList: true },
-    { source: own, args: [], config: { "grep.patternType": "nope" } },
+    { source: own, args: ["--grep=i"], config: { "grep.patternType": "nope" }, revList: true },
     { source: own, args: ["--grep=\\("] },
     { source: own, args: ["--author=\\("] },
     { source: own, args: ["-E", "--grep=a{1"] },
     { source: own, args: ["-E", "--grep=("] },
-    // -P
+    // -P: patterns without a regex character take the literal path in every build
+    { source: own, args: ["-P", "--grep=sec"] },
+    { source: own, args: ["-P", "-i", "--grep=SEC"] },
+    { source: own, args: ["--grep=Thor"], config: { "grep.patternType": "perl" } },
     { source: own, args: ["-P", "--grep=fi(?=f)"], perl: true },
     { source: own, args: ["-P", "--grep=\\bthi\\w+"], perl: true },
     { source: own, args: ["-P", "--grep=(?i)SEC"], perl: true },
@@ -390,7 +397,7 @@ describeGit("log/rev-list commit filters against native git", () => {
       .map(([k, v]) => `-c ${k}=${v} `)
       .join("")}log ${s.args.map((a) => JSON.stringify(a)).join(" ")}`;
     it(label, async () => {
-      if (s.perl && !pcre) return;
+      if (s.perl && pcre) return;
       const config = s.config ?? {};
       const expected = native("log", s.args, config);
       expect(await ours("log", s.args, config)).toEqual(expected);
@@ -401,11 +408,105 @@ describeGit("log/rev-list commit filters against native git", () => {
     });
   }
 
-  it("refuses -P syntax it cannot run as PCRE2 does (possessive quantifiers, atomic groups)", async () => {
-    for (const pattern of ["a++", "(?>a)", "\\p{L}", "a(?R)"]) {
-      const result = await ours("log", ["-P", `--grep=${pattern}`], {});
-      expect(result).toHaveProperty("error");
-      expect((result as { error: string }).error).toMatch(/unsupported in -P patterns/);
+  it("dies on -P at once, never running a backtracking matcher: (.|.)*XYZ", async () => {
+    const line = "fatal: cannot use Perl-compatible regexes when not compiled with USE_LIBPCRE";
+    const started = Date.now();
+    expect(await ours("log", ["-P", "--grep=(.|.)*XYZ"], {})).toEqual({ error: line });
+    expect(await ours("log", ["--grep=(a+)+$"], { "grep.patternType": "perl" })).toEqual({
+      error: line,
+    });
+    expect(() => CommitFilters.message("(.|.)*XYZ", { patternType: "perl" })).toThrow(
+      GrepPatternError,
+    );
+    expect(Date.now() - started).toBeLessThan(5000);
+    if (!pcre) {
+      expect(native("log", ["-P", "--grep=(.|.)*XYZ"], {})).toEqual({ error: line });
+    }
+  });
+
+  it("reads no grep configuration where git's commands do not: rev-list, bisect's walk", async () => {
+    const bogus = { "grep.patternType": "bogus" };
+    // git rev-list reads neither grep.* nor log.mailmap
+    expect(await ours("rev-list", [], bogus)).toEqual(native("rev-list", [], bogus));
+    expect(await ours("rev-list", ["--author=New Name"], {})).toEqual(
+      native("rev-list", ["--author=New Name"], {}),
+    );
+    // git log and git show die on it whatever they are asked
+    const g = await open(bogus);
+    await expect(g.log().callText({ pretty: "tformat:%H" })).rejects.toThrow(
+      "fatal: bad grep.patterntype argument: bogus",
+    );
+    expect(native("log", [], bogus)).toEqual({
+      error: "fatal: bad grep.patterntype argument: bogus",
+    });
+  });
+
+  it("notes add dies as git does when its `git show` child refuses grep.patternType", async () => {
+    const copy = join(root, "notes-copy");
+    execFileSync("cp", ["-a", dir, copy]);
+    const bogus = { "grep.patternType": "bogus" };
+    const r = spawnSync("git", ["notes", "add"], {
+      cwd: copy,
+      env: { ...gitEnv(bogus), GIT_EDITOR: "cat" },
+      encoding: "utf8",
+    });
+    const saved = dir;
+    dir = copy;
+    try {
+      const g = await open(bogus);
+      let stderr = "";
+      try {
+        await g
+          .notes()
+          .add()
+          .setEditor(async (t) => t)
+          .call();
+      } catch (e) {
+        const err = e as { errors?: string; message: string };
+        stderr = `${err.errors ?? ""}fatal: ${err.message}\n`;
+      }
+      expect(r.status).toBe(128);
+      expect(stderr).toBe(r.stderr);
+    } finally {
+      dir = saved;
+    }
+  });
+
+  it("bisect works through a bad grep.patternType until its `git show` child dies (2.5x)", async () => {
+    if (!modernGit()) return; // bisect's messages are 2.5x's ("first 'bad' commit")
+    const bogus = { "grep.patternType": "bogus" };
+    const a = join(root, "bisect-native");
+    const b = join(root, "bisect-ours");
+    execFileSync("cp", ["-a", dir, a]);
+    execFileSync("cp", ["-a", dir, b]);
+    const steps = [
+      ["start", ids[9] as string, ids[0] as string],
+      ["bad"],
+      ["good"],
+      ["bad"],
+      ["good"],
+      ["bad"],
+    ];
+    const saved = dir;
+    dir = b;
+    try {
+      for (const step of steps) {
+        const r = spawnSync("git", ["bisect", ...step], {
+          cwd: a,
+          env: gitEnv(bogus),
+          encoding: "utf8",
+        });
+        const g = await open(bogus);
+        const res = await g.bisect().setArguments(step).call();
+        expect({ exit: res.exitCode, stdout: res.stdout, stderr: res.stderr }).toEqual({
+          exit: r.status,
+          stdout: r.stdout,
+          stderr: r.stderr,
+        });
+        if (r.status !== 0 || /first 'bad' commit/.test(r.stdout)) break;
+      }
+    } finally {
+      dir = saved;
     }
   });
 

@@ -31,7 +31,6 @@ import { compilePosixRegex, PosixRegexError } from "@statewalker/vcs-utils";
 
 import { GitApiError } from "../../errors/index.js";
 import type { Mailmap } from "../mailmap.js";
-import { compilePcreSubset, PcreSyntaxError, PcreUnsupportedError } from "./pcre-subset.js";
 
 /** git's grep pattern types (`grep.patternType`; `-G`/`--basic-regexp`, `-E`, `-F`, `-P`) */
 export type GrepPatternType = "basic" | "extended" | "fixed" | "perl";
@@ -61,8 +60,9 @@ export interface CommitGrepOptions {
 
 /**
  * A pattern git cannot compile (`fatal: command line, '<pattern>': <error>`, `header, ` for
- * `--author`/`--committer`; exit 128). `-P` patterns using PCRE2 syntax that has no exact
- * equivalent here are refused with this error too (the message says what is unsupported).
+ * `--author`/`--committer`; exit 128). A `-P` pattern with a regex character dies too, as in a
+ * git built without PCRE (`fatal: cannot use Perl-compatible regexes when not compiled with
+ * USE_LIBPCRE`).
  */
 export class GrepPatternError extends GitApiError {
   readonly pattern: string;
@@ -149,13 +149,13 @@ function compilePattern(
   const isFixed = !bytes.some((b) => REGEX_SPECIAL.has(b));
   if (type === "fixed" || isFixed) return literalMatcher(bytes, ignoreCase);
   if (type === "perl") {
-    try {
-      const re = compilePcreSubset(bytes, { ignoreCase });
-      return (line) => re.test(line);
-    } catch (e) {
-      if (e instanceof PcreUnsupportedError || e instanceof PcreSyntaxError) fail(e.message);
-      throw e;
-    }
+    // a git built without PCRE (NO_PCRE, as the 2.56.1 build here): a pattern with no regex
+    // character took the literal path above; any other dies. No JavaScript RegExp ever runs
+    // a user's pattern (backtracking without git's PCRE2 match limit)
+    throw new GrepPatternError(
+      pattern,
+      "fatal: cannot use Perl-compatible regexes when not compiled with USE_LIBPCRE",
+    );
   }
   try {
     const re = compilePosixRegex(bytes, { extended: type === "extended", icase: ignoreCase });
