@@ -73,6 +73,7 @@ export * from "./push-command.js";
 export * from "./read-tree-command.js";
 export * from "./rebase-command.js";
 export * from "./ref-decoration-filter.js";
+export * from "./ref-filter/index.js";
 export * from "./reflog-command.js";
 export {
   committerIdent,
