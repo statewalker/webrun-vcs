@@ -491,7 +491,7 @@ function expandLiteral(fmt: string, at: number): { text: string; taken: number }
 }
 
 /** pretty.c's expand_string_arg: an argument's `%n`, `%x<hex>` and `%%` expanded. */
-function expandStringArg(arg: string): string {
+export function expandStringArg(arg: string): string {
   let out = "";
   for (let i = 0; i < arg.length; i++) {
     if (arg[i] !== "%") {
@@ -861,7 +861,7 @@ function parsePadding(fmt: string, at: number, st: FormatState): number {
  * pretty.c's match_placeholder_arg_value: `<name>` or `<name>=<value>` at `at`, followed by
  * `,` (taken) or `)` (left); the value runs to the next `,` or `)`.
  */
-function matchArgValue(
+export function matchArgValue(
   fmt: string,
   at: number,
   name: string,
@@ -881,7 +881,7 @@ function matchArgValue(
 }
 
 /** git_parse_maybe_bool: true/yes/on, false/no/off, "" (false), a number; else -1. */
-function parseMaybeBool(value: string): boolean | undefined {
+export function parseMaybeBool(value: string): boolean | undefined {
   const v = value.toLowerCase();
   if (v === "true" || v === "yes" || v === "on") return true;
   if (v === "false" || v === "no" || v === "off" || v === "") return false;
@@ -891,7 +891,7 @@ function parseMaybeBool(value: string): boolean | undefined {
 }
 
 /** pretty.c's match_placeholder_bool_arg: `<name>` (true) or `<name>=<bool>`. */
-function matchBoolArg(
+export function matchBoolArg(
   fmt: string,
   at: number,
   name: string,
