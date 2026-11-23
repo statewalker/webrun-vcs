@@ -154,7 +154,7 @@ export class FileWorktree implements Worktree {
     this.gitDir = options.gitDir;
     this.globalExcludesFile = options.globalExcludesFile;
     // the repository's hash (a SHA-256 repository's files are named in SHA-256), from its blobs
-    this.newHasher = options.newHasher ?? options.blobs.objectFormat?.createHasher ?? createSha1;
+    this.newHasher = options.newHasher ?? options.blobs?.objectFormat?.createHasher ?? createSha1;
     if (options.environment) this.environment = options.environment;
   }
 

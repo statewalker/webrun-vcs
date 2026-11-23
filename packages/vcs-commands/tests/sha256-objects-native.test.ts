@@ -18,6 +18,7 @@ import {
   createGitFilesBackend,
   FileStagingStore,
   GitWorkingCopyConfig,
+  ReftableUnsupportedError,
 } from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
 import { SHA256_OBJECT_FORMAT, UnsupportedObjectFormatError } from "@statewalker/vcs-utils";
@@ -584,6 +585,23 @@ describeGit("SHA-256 repositories against native git", () => {
       g(dir, "repack", "-q", "-a", "-d");
       await expect(openOurs(dir)).rejects.toThrow(UnsupportedObjectFormatError);
     });
+
+    // reftable tables of a SHA-256 repository (hash id `s256`) are not read yet (git 2.45+)
+    it.skipIf(!nativeGitAvailable())(
+      "refuses a SHA-256 reftable repository's refs cleanly",
+      async () => {
+        if (!modern) return;
+        const dir = fresh();
+        g(root, "init", "-q", "--object-format=sha256", "--ref-format=reftable", dir);
+        put(dir, "a.txt", "a\n");
+        g(dir, "add", "a.txt");
+        g(dir, "commit", "-q", "-m", "one");
+        rmSync(join(dir, ".git", "index"));
+        const files = createNodeFilesApi({ rootDir: dir });
+        const { history } = await createGitFilesBackend({ files, gitDir: ".git" });
+        await expect(history.refs.resolve("HEAD")).rejects.toBeInstanceOf(ReftableUnsupportedError);
+      },
+    );
   });
 
   // ---------------------------------------------------------------- notes (t3301-notes.sh)

@@ -75,7 +75,7 @@ export class MemoryWorktree implements Worktree {
     this.blobs = options.blobs;
     this.trees = options.trees;
     // the repository's hash (a SHA-256 repository's files are named in SHA-256), from its blobs
-    this.newHasher = options.newHasher ?? options.blobs.objectFormat?.createHasher ?? createSha1;
+    this.newHasher = options.newHasher ?? options.blobs?.objectFormat?.createHasher ?? createSha1;
     this.ignorePatterns = options.ignorePatterns ?? [];
   }
 
