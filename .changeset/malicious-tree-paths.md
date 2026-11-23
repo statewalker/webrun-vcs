@@ -1,5 +1,6 @@
 ---
 "@statewalker/vcs-core": patch
+"@statewalker/vcs-working-tree": patch
 "@statewalker/vcs-store-files": patch
 "@statewalker/vcs-commands": patch
 ---
