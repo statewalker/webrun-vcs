@@ -623,6 +623,52 @@ describe.skipIf(!git3)("writing reftable repositories (git 3.0 oracle)", () => {
     }
   });
 
+  it("fsck takes a linked worktree's detached HEAD from its stack as a root, from either worktree (webrun-vcs#231)", async () => {
+    const repo = join(root, "repo");
+    g(root, ["init", "-q", "-b", "main", "repo"]);
+    g(repo, ["commit", "-q", "--allow-empty", "-m", "c1"]);
+    g(repo, ["worktree", "add", "-q", "--detach", "../wt"]);
+    const wt = join(root, "wt");
+    // reachable only from the linked worktree's detached HEAD (its own reftable stack)
+    g(wt, ["commit", "-q", "--allow-empty", "-m", "w1"]);
+    const wtHead = g(wt, ["rev-parse", "HEAD"]).trim();
+    // .git/worktrees/wt/HEAD is git's stub: the HEAD lives in .git/worktrees/wt/reftable
+    expect(readFileSync(join(repo, ".git", "worktrees", "wt", "HEAD"), "utf8")).toBe(
+      "ref: refs/heads/.invalid\n",
+    );
+    const env = createNodeGitHostEnvironment({ env: nativeGit3Env(root) });
+    const files = createNodeFilesApi({ rootDir: root });
+    const { history } = await createGitFilesBackend({
+      files,
+      gitDir: "repo/.git",
+      environment: env,
+    });
+    for (const [from, cwd] of [
+      ["repo/.git", repo],
+      ["repo/.git/worktrees/wt", wt],
+    ] as const) {
+      const worktrees = await openGitLinkedWorktrees({
+        files,
+        gitDir: from,
+        history,
+        environment: env,
+      });
+      const git = Git.fromWorkingCopy(await worktrees.openCurrent());
+      for (const reflogs of [true, false]) {
+        const args = ["fsck", "--no-progress", ...(reflogs ? [] : ["--no-reflogs"])];
+        const native = run(git3 as string, cwd, args);
+        const ours = await git
+          .fsck()
+          .setRepositoryFiles({ files, gitDir: "repo/.git" })
+          .setReflogs(reflogs)
+          .call();
+        expect(`${from} ${args} ${ours.output}`).toBe(`${from} ${args} ${native.stdout}`);
+        expect(ours.output).not.toContain(wtHead);
+        expect(ours.exitCode).toBe(native.status);
+      }
+    }
+  });
+
   it("reflog expiry of gc run from a linked worktree reaches through that worktree's own refs, as git's (reflog.c)", async () => {
     // two identical fixtures dated 60 days back (the unreachable entries expire after 30)
     const build = (dir: string) => {
