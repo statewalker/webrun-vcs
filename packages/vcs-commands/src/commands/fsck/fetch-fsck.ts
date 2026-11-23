@@ -127,24 +127,24 @@ export async function fetchFsckOf(
         ? `${source.baseDir.replace(/\/+$/, "")}/${shown}`
         : shown;
     const bytes = await source.readFile?.(path).catch(() => undefined);
-    if (startError) {
-      // index-pack died on the message types already
-    } else if (!bytes) {
-      startError = `fatal: could not open object name list: ${shown}`;
-    } else {
-      for (const raw of new TextDecoder().decode(bytes).split("\n")) {
-        const hash = raw.indexOf("#");
-        const line = (hash >= 0 ? raw.slice(0, hash) : raw).trim();
-        if (line === "") continue;
-        if (!/^[0-9a-fA-F]{40}$/.test(line)) {
-          startError = `fatal: invalid object name: ${line}`;
-          break;
-        }
-        skip.add(line.toLowerCase());
-      }
-    }
+    // (index-pack died on the message types already when startError is set)
+    startError ??= parseSkipList(bytes, shown, skip);
   }
 
+  return receivedObjectsFsck(types, skip, source.compatibility, startError);
+}
+
+/**
+ * index-pack's (or unpack-objects') fsck of received objects under the message types `types`,
+ * reporting nothing for the objects in `skip`; `startError` is the child's death before it
+ * reads the pack.
+ */
+function receivedObjectsFsck(
+  types: FsckMessageTypes,
+  skip: ReadonlySet<string>,
+  compatibility: "2.43" | "2.56",
+  startError: string | undefined,
+): ReceivedObjectsFsck {
   const gitmodulesFound = new Set<string>();
   const gitmodulesDone = new Set<string>();
   const gitattributesFound = new Set<string>();
@@ -180,8 +180,7 @@ export async function fetchFsckOf(
           return !skip.has(id) && fsckCommit(content, report) !== 0;
         case "tag":
           return (
-            !skip.has(id) &&
-            fsckTag(content, report, { gpgsig: source.compatibility !== "2.43" }) !== 0
+            !skip.has(id) && fsckTag(content, report, { gpgsig: compatibility !== "2.43" }) !== 0
           );
         case "tree": {
           const found = { gitmodules: [] as string[], gitattributes: [] as string[] };
@@ -226,4 +225,159 @@ export async function fetchFsckOf(
     },
   };
   return fsck;
+}
+
+/**
+ * oidset_parse_file over a skip list's bytes (undefined: it cannot be read), adding its ids to
+ * `skip`: the line git dies with, or undefined.
+ */
+function parseSkipList(
+  bytes: Uint8Array | undefined,
+  shown: string,
+  skip: Set<string>,
+): string | undefined {
+  if (!bytes) return `fatal: could not open object name list: ${shown}`;
+  for (const raw of new TextDecoder().decode(bytes).split("\n")) {
+    const hash = raw.indexOf("#");
+    const line = (hash >= 0 ? raw.slice(0, hash) : raw).trim();
+    if (line === "") continue;
+    if (!/^[0-9a-fA-F]{40}$/.test(line)) return `fatal: invalid object name: ${line}`;
+    skip.add(line.toLowerCase());
+  }
+  return undefined;
+}
+
+/** What {@link receiveFsckOf} reads: the receiving repository's configuration. */
+export interface ReceiveFsckSource {
+  /**
+   * Every configuration entry in git's order, keys canonical (`receive.fsck.missingemail`), a
+   * key written without `=` with a null value, and where it was read when known
+   */
+  entries(): Iterable<{ key: string; value: string | null; file?: string; line?: number }>;
+  /** Whose messages to give where 2.43 and 2.5x differ (a tag's `gpgsig` header) */
+  compatibility: "2.43" | "2.56";
+  /** Reads a skip list (`receive.fsck.skipList`): its path as {@link baseDir} and `~/` make it */
+  readFile?(path: string): Promise<Uint8Array | undefined>;
+  /** The directory a relative skip list is read from (receive-pack's: the git directory) */
+  baseDir?: string;
+  /** `$HOME`, for a skip list path starting with `~/` */
+  home?: string;
+}
+
+/** What git's receive-pack takes from `receive.fsck*` / `transfer.fsckObjects`. */
+export interface ReceiveFsckSettings {
+  /**
+   * receive-pack's death reading its config (a value that is no boolean, a message type it
+   * does not know, a `receive.fsck.*` key without a value): its lines
+   */
+  configError?: string;
+  /** receive-pack's warnings reading its config (`warning: skipping unknown msg id '<id>'`) */
+  warnings: string[];
+  /** A new fsck for each push, absent when pushes are not checked */
+  fsckObjects?: () => Promise<ReceivedObjectsFsck>;
+}
+
+/**
+ * The fsck git's receive-pack has its unpack-objects or index-pack run over a push (`--strict`
+ * with the `receive.fsck.*` settings) when `receive.fsckObjects` (else `transfer.fsckObjects`)
+ * is true. receive-pack reads `receive.fsck.<msg-id>` and `receive.fsck.skipList` in config
+ * order (never `fsck.*`): a message id it does not know is skipped with a warning, a message
+ * type it does not know kills it (`fatal: Unknown fsck message type: '<type>'`), as does a key
+ * without a value; the child then applies them in that order, dying at the first fatal message
+ * demoted (`fatal: Cannot demote <id> to <type>`) or skip list it cannot read (`fatal: could not
+ * open object name list: <path>`, `fatal: invalid object name: <line>`), relative paths read
+ * from the git directory.
+ *
+ * @example
+ * ```ts
+ * const settings = receiveFsckOf({ entries: () => config.list(), compatibility: "2.56" });
+ * const fsck = await settings.fsckObjects?.();
+ * ```
+ */
+export function receiveFsckOf(source: ReceiveFsckSource): ReceiveFsckSettings {
+  const warnings: string[] = [];
+  let configError: string | undefined;
+  let receiveFsck: boolean | undefined;
+  let transferFsck: boolean | undefined;
+  /** The `--strict=` list, in config order */
+  const strict: Array<{ skipList: string } | { id: FsckMsgId; msgId: string; value: string }> = [];
+  const die = (line: string) => {
+    configError ??= line;
+  };
+  const nonBool = (entry: { key: string; file?: string; line?: number }) => {
+    const error = `error: missing value for '${entry.key}'`;
+    die(
+      entry.file !== undefined && entry.line !== undefined
+        ? `${error}\nfatal: bad config variable '${entry.key}' in file '${entry.file}' at line ${entry.line}`
+        : error,
+    );
+  };
+  const bool = (key: string, value: string | null): boolean | undefined => {
+    if (value === null) return true;
+    const parsed = parseGitBool(value);
+    if (parsed === undefined) die(`fatal: bad boolean config value '${value}' for '${key}'`);
+    return parsed;
+  };
+  for (const entry of source.entries()) {
+    if (configError !== undefined) break;
+    const key = entry.key.toLowerCase();
+    const { value } = entry;
+    if (key === "receive.fsck.skiplist") {
+      // git_config_pathname: a key without a value is an error
+      if (value === null) nonBool({ ...entry, key });
+      else if (value !== "") strict.push({ skipList: value });
+    } else if (key.startsWith("receive.fsck.")) {
+      const msgId = key.slice("receive.fsck.".length);
+      if (value === null) {
+        nonBool({ ...entry, key });
+        continue;
+      }
+      const id = parseFsckMsgId(msgId);
+      if (!id) {
+        warnings.push(`warning: skipping unknown msg id '${msgId}'`);
+        continue;
+      }
+      if (value !== "error" && value !== "warn" && value !== "ignore") {
+        die(`fatal: Unknown fsck message type: '${value}'`);
+        continue;
+      }
+      strict.push({ id, msgId, value });
+    } else if (key === "receive.fsckobjects") {
+      receiveFsck = bool(key, value);
+    } else if (key === "transfer.fsckobjects") {
+      transferFsck = bool(key, value);
+    }
+  }
+  if (configError !== undefined) return { configError, warnings };
+  if (!(receiveFsck ?? transferFsck ?? false)) return { warnings };
+
+  const fsckObjects = async (): Promise<ReceivedObjectsFsck> => {
+    // the child's fsck_set_msg_types, in the order of its --strict list: it dies at the first
+    // fatal message demoted or skip list it cannot read
+    const types = new FsckMessageTypes({ strict: true });
+    const skip = new Set<string>();
+    let startError: string | undefined;
+    for (const item of strict) {
+      if ("skipList" in item) {
+        const path = item.skipList;
+        const shown =
+          path.startsWith("~/") && source.home
+            ? `${source.home.replace(/\/+$/, "")}/${path.slice(2)}`
+            : path;
+        const full =
+          !shown.startsWith("/") && source.baseDir
+            ? `${source.baseDir.replace(/\/+$/, "")}/${shown}`
+            : shown;
+        const bytes = await source.readFile?.(full).catch(() => undefined);
+        startError = parseSkipList(bytes, shown, skip);
+      } else if (item.value !== "error" && FSCK_MSG_IDS[item.id] === "fatal") {
+        startError = `fatal: Cannot demote ${item.msgId} to ${item.value}`;
+      } else {
+        types.set(item.id, item.value as "error" | "warn" | "ignore");
+      }
+      if (startError !== undefined) break;
+    }
+    return receivedObjectsFsck(types, skip, source.compatibility, startError);
+  };
+  return { warnings, fsckObjects };
 }
