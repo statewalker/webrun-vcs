@@ -215,7 +215,7 @@ In both cases, once you're done, continue with:
 }
 
 /**
- * commit_staged_changes' git commit dying on its signature (no signer exists): gpg's lines,
+ * commit_staged_changes' git commit dying on its signature (not signed yet): gpg's lines,
  * git commit's death, then the sequencer's error; nothing committed, the stop kept.
  */
 function commitStagedSigningFailure(error: SigningFailedError): RebaseResult {
@@ -578,7 +578,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   /**
    * `-S` (true) / `--no-gpg-sign` (false): whether to sign the commits the rebase makes;
    * undefined (the default) leaves it to `commit.gpgSign`. Kept in
-   * `rebase-merge/gpg_sign_opt` for `--continue`. No signer exists yet: a pick that must
+   * `rebase-merge/gpg_sign_opt` for `--continue`. Not signed yet: a pick that must
    * commit fails as git's does when gpg cannot sign (`error: gpg failed to sign the data:`,
    * `error: failed to write commit object`) and the rebase stops there (2.5x: `Could not
    * apply ...`, the pick to commit; 2.43: the pick rescheduled), the branch untouched.
@@ -613,7 +613,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
-   * commit_tree's signing of a commit the rebase makes: no signer exists, so a run that
+   * commit_tree's signing of a commit the rebase makes: rebase does not sign yet, so a run that
    * signs fails with gpg's lines ({@link SigningFailedError}); the step says what follows.
    */
   private async refuseSigning(state: OperationState): Promise<void> {

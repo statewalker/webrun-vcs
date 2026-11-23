@@ -195,7 +195,7 @@ export class TagCommand extends GitCommand<Ref> {
    * undefined (the default) leaves it to `tag.gpgSign`, and `tag.forceSignAnnotated` signs
    * a tag with a message not made with {@link setAnnotated}, as git's does.
    *
-   * No signer exists yet: a tag asked to be signed fails as git fails when gpg cannot sign
+   * Not signed yet: a tag asked to be signed fails as git fails when gpg cannot sign
    * (`error: gpg failed to sign the data:`, `error: unable to sign the tag`, exit 128:
    * {@link SigningFailedError}), and neither a tag object nor a ref is written.
    *
