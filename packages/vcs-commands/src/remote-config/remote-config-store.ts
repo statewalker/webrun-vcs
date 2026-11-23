@@ -253,6 +253,16 @@ class PlainObjectConfig implements GitConfigLike {
 }
 
 /**
+ * A remote chosen from the configuration (git's `remote_for_branch` / `pushremote_for_branch`
+ * with their `explicit` flag): an explicit name may be a URL or path, a fallback must name a
+ * configured remote.
+ */
+export interface RemoteChoice {
+  name: string;
+  explicit: boolean;
+}
+
+/**
  * The `[remote "<name>"]` sections of a working copy's configuration.
  *
  * Reading a remote is a **union** of two sources, and stays that way: the
@@ -285,6 +295,44 @@ export class RemoteConfigStore {
   /** Remote names that have a config section (git's `for_each_remote`: no legacy remotes). */
   configuredNames(): string[] {
     return this.config.subsections("remote");
+  }
+
+  /**
+   * The remote `branch` fetches from (git's `remote_for_branch`): `branch.<name>.remote`, the
+   * one configured remote, else `origin`. A detached HEAD passes no branch.
+   */
+  remoteForBranch(branch: string | undefined): string {
+    return this.remoteChoiceForBranch(branch).name;
+  }
+
+  /**
+   * The remote `git push` without a remote pushes `branch` to (git's `pushremote_for_branch`):
+   * `branch.<name>.pushRemote`, `remote.pushDefault`, then {@link remoteForBranch}. A detached
+   * HEAD passes no branch, so only `remote.pushDefault` and the fallbacks apply.
+   */
+  pushRemoteForBranch(branch: string | undefined): string {
+    return this.pushRemoteChoiceForBranch(branch).name;
+  }
+
+  /**
+   * {@link remoteForBranch} with git's `explicit` flag: true when the name comes from the
+   * configuration (`branch.<name>.remote`), so it may be a URL, a path or `.`; false for the
+   * fallbacks (the one configured remote, `origin`), which must name a configured remote.
+   */
+  remoteChoiceForBranch(branch: string | undefined): RemoteChoice {
+    const configured = branch === undefined ? undefined : this.value(`branch.${branch}.remote`);
+    if (configured !== undefined) return { name: configured, explicit: true };
+    const names = this.configuredNames();
+    return { name: names.length === 1 ? (names[0] as string) : "origin", explicit: false };
+  }
+
+  /** {@link pushRemoteForBranch} with git's `explicit` flag (see {@link remoteChoiceForBranch}). */
+  pushRemoteChoiceForBranch(branch: string | undefined): RemoteChoice {
+    const own = branch === undefined ? undefined : this.value(`branch.${branch}.pushRemote`);
+    if (own !== undefined) return { name: own, explicit: true };
+    const pushDefault = this.value("remote.pushDefault");
+    if (pushDefault !== undefined) return { name: pushDefault, explicit: true };
+    return this.remoteChoiceForBranch(branch);
   }
 
   /**

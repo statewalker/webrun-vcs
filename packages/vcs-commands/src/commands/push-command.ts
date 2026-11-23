@@ -118,7 +118,11 @@ function toPushStatus(update: PushRefUpdate): PushStatus {
  * ```
  */
 export class PushCommand extends TransportCommand<PushResult> {
+  /** The remote, once set or resolved in `call` (git's `pushremote_for_branch`) */
   private remote = "origin";
+  private remoteGiven = false;
+  /** Whether the remote was set or came from the configuration (git's `explicit`) */
+  private remoteExplicit = false;
   private refSpecs: string[] = [];
   private force = false;
   private atomic = false;
@@ -145,19 +149,24 @@ export class PushCommand extends TransportCommand<PushResult> {
   /**
    * Set the remote to push to.
    *
-   * Can be either a remote name (e.g., "origin") or a URL.
-   * Default is "origin".
+   * Can be either a remote name (e.g., "origin") or a URL. When none is set, `call` picks
+   * the remote as `git push` does (`pushremote_for_branch`): `branch.<current>.pushRemote`,
+   * `remote.pushDefault`, `branch.<current>.remote`, the one configured remote, else `origin`
+   * (a detached HEAD skips the branch's settings).
    *
    * @param remote Remote name or URL
    */
   setRemote(remote: string): this {
     this.checkCallable();
     this.remote = remote;
+    this.remoteGiven = true;
+    this.remoteExplicit = true;
     return this;
   }
 
   /**
-   * Get the remote being pushed to.
+   * Get the remote being pushed to: the one set, or after `call` the one it chose (`origin`
+   * before then).
    */
   getRemote(): string {
     return this.remote;
@@ -429,10 +438,32 @@ export class PushCommand extends TransportCommand<PushResult> {
     this.checkCallable();
     this.setCallable(false);
 
+    // pushremote_get(NULL): the push remote the configuration names for the current branch
+    if (!this.remoteGiven) {
+      const ref = await this.getCurrentBranch();
+      const branch = ref?.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : undefined;
+      const choice = RemoteConfigStore.from(this.workingCopy).pushRemoteChoiceForBranch(branch);
+      this.remote = choice.name;
+      this.remoteExplicit = choice.explicit;
+    }
     // pushremote_get: a remote the configuration gives no URL may come from .git/remotes/ or
     // .git/branches/ (git 2.x)
     const legacyWarnings = await this.loadLegacyRemote(this.remote);
     const warnings = legacyWarnings.length > 0 ? { warnings: legacyWarnings } : {};
+    // git's push.c: a fallback remote (the one configured, origin) must be configured
+    // (remote_get(NULL) gives no remote otherwise); a name given or taken from the
+    // configuration is also tried as a URL or path (remotes_remote_get_1's add_url_alias)
+    if (
+      !this.remoteExplicit &&
+      !RemoteConfigStore.from(this.workingCopy).isConfigured(this.remote)
+    ) {
+      throw new InvalidRemoteError(
+        this.remote,
+        "No configured push destination.\nEither specify the URL from the command-line or " +
+          "configure a remote repository using\n\n    git remote add <name> <url>\n\n" +
+          "and then push using the remote name\n\n    git push <name>",
+      );
+    }
     const remoteUrl = await this.resolveRemoteUrl(this.remote);
     if (!remoteUrl) {
       throw new InvalidRemoteError(this.remote);
@@ -767,8 +798,9 @@ export class PushCommand extends TransportCommand<PushResult> {
     const branch = ref.slice("refs/heads/".length);
     if (mode === "current") return [`${ref}:${ref}`];
 
-    // the branch's remote (git: branch.<name>.remote, else "origin") and upstream
-    const branchRemote = store.value(`branch.${branch}.remote`) ?? "origin";
+    // the branch's remote (git's remote_for_branch: branch.<name>.remote, the one configured
+    // remote, else "origin") and upstream
+    const branchRemote = store.remoteForBranch(branch);
     const merge = store.value(`branch.${branch}.merge`);
     const triangular = this.remote !== branchRemote;
     const noUpstream = () =>
