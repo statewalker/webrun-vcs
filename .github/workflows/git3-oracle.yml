@@ -1,0 +1,82 @@
+name: git 3.0 oracle
+
+# Native twins of git 3.0 behaviour: a git built from master with WITH_BREAKING_CHANGES=YesPlease
+# (Documentation/BreakingChanges.adoc), exported as $GIT3, against ours with
+# GitHostEnvironment.breakingChanges. Runs the `*-git3-native` test files, which skip without
+# $GIT3 in the main CI. The build is cached under git master's commit; a new commit rebuilds it.
+on:
+  schedule:
+    - cron: "47 3 * * 2"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "packages/*/src/**"
+      - "packages/vcs-commands/tests/*git3*"
+      - "packages/vcs-commands/tests/native-git3.ts"
+      - "pnpm-lock.yaml"
+      - ".github/workflows/git3-oracle.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: git3-oracle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  git3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: git master's commit
+        id: git-master
+        run: echo "sha=$(git ls-remote https://github.com/git/git refs/heads/master | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the git 3.0 build
+        id: git3-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/git3
+          key: git3-${{ runner.os }}-${{ runner.arch }}-${{ steps.git-master.outputs.sha }}
+
+      - name: Build git 3.0 (WITH_BREAKING_CHANGES)
+        if: steps.git3-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libssl-dev zlib1g-dev libexpat1-dev
+          git clone --depth 1 --branch master https://github.com/git/git "$RUNNER_TEMP/git"
+          make -C "$RUNNER_TEMP/git" -j"$(nproc)" WITH_BREAKING_CHANGES=YesPlease NO_GETTEXT=YesPlease \
+            NO_TCLTK=YesPlease NO_PERL=YesPlease NO_PYTHON=YesPlease NO_CURL=YesPlease \
+            prefix="$HOME/git3" install
+
+      - name: Save the git 3.0 build
+        if: steps.git3-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/git3
+          key: ${{ steps.git3-cache.outputs.cache-primary-key }}
+
+      - name: The oracle
+        run: |
+          echo "GIT3=$HOME/git3/bin/git" >> "$GITHUB_ENV"
+          "$HOME/git3/bin/git" version --build-options
+          git --version
+
+      - name: Install
+        run: pnpm install --frozen-lockfile --filter @statewalker/vcs-commands...
+
+      - name: Build
+        run: pnpm --filter "@statewalker/vcs-commands^..." run build
+
+      - name: git 3.0 twins
+        working-directory: packages/vcs-commands
+        run: npx vitest run git3-native
