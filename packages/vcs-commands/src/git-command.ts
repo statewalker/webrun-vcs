@@ -45,6 +45,7 @@ import {
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import { attributesSourceResolver } from "./commands/attributes-source.js";
+import { checkAutoCommentChar } from "./commands/comment-char-config.js";
 import {
   configLoadError,
   createIdAbbreviator,
@@ -1230,6 +1231,8 @@ export abstract class GitCommand<T> {
   protected checkConfigOnLoad(): void {
     const failure = configLoadError(this._workingCopy);
     if (failure) throw new InvalidConfigError(failure.key, failure.message);
+    // repo_read_config's check_deprecated_config: core.commentChar=auto dies in git 3.0
+    checkAutoCommentChar(this._workingCopy);
     // prepare_repo_settings, which every command but `git config` runs before its work
     const indexVersion = indexVersionConfigError(this._workingCopy);
     if (indexVersion) throw indexVersion;
