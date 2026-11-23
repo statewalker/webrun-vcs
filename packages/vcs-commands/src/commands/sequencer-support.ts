@@ -165,7 +165,11 @@ async function resetMergeWith(
   });
   const notUptodate = (path: string) => refuse(`Entry '${path}' not uptodate. Cannot merge.`, path);
   // add_index_entry's verify_path: a path git refuses stops the reset before any write
-  const invalid = firstInvalidPath(target, index, worktreePathRules(ctx.workingCopy, ctx.worktree));
+  const invalid = firstInvalidPath(
+    target,
+    index,
+    worktreePathRules(ctx.workingCopy, options.update === false ? undefined : ctx.worktree),
+  );
   if (invalid !== undefined) return refusedWith(refuse(`invalid path '${invalid}'`, invalid));
   // verify_uptodate_1: an entry whose flags cheat (assume-unchanged, skip-worktree) is checked
   // by its stat even by a hard reset; any other only when not resetting hard

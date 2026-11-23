@@ -201,9 +201,10 @@ describe("isValidWorktreePath with protections off", () => {
     expect(isValidWorktreePath("‌.git/x", undefined, { protectHFS: false })).toBe(true);
     expect(isValidWorktreePath("‌.git/x", undefined, { protectNTFS: false })).toBe(false);
   });
-  it("defaults protectHFS as git: on macOS only", () => {
+  it("defaults protectHFS on for macOS and for an unknown system, off for another", () => {
     expect(protectHFSDefault("Darwin")).toBe(true);
     expect(protectHFSDefault("Linux")).toBe(false);
-    expect(protectHFSDefault(undefined)).toBe(false);
+    // no environment (a browser, a library user without one): the storage may be HFS+
+    expect(protectHFSDefault(undefined)).toBe(true);
   });
 });

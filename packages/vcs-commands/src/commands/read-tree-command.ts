@@ -175,7 +175,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
     return withTreePathRefusal(
       this.trees,
       () => trees,
-      worktreePathRules(this.workingCopy, this.worktreeAccess),
+      worktreePathRules(this.workingCopy, this.update ? this.worktreeAccess : undefined),
       () => this.callOnce(trees),
       (refusal) =>
         refusal instanceof InvalidPathError
@@ -357,7 +357,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
     const invalid = firstInvalidPath(
       entries,
       new Map(),
-      worktreePathRules(this.workingCopy, this.worktreeAccess),
+      worktreePathRules(this.workingCopy, this.update ? this.worktreeAccess : undefined),
     );
     if (invalid !== undefined) {
       throw new ReadTreeFailedError(`error: invalid path '${invalid}'`, [invalid]);

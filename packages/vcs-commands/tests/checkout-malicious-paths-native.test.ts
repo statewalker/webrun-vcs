@@ -16,7 +16,17 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readlinkSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
@@ -117,6 +127,11 @@ const J = "DirCacheCheckoutMaliciousPathTest#";
 const SLASH_NAME =
   "a tree entry name holding `/`: git checks it out as nested directories (fsck warns " +
   "fullPathname), ours refuses to decode such a tree (`invalid path`)";
+
+const HFS_GUARD =
+  "an HFS+ spelling of .git off macOS: git (core.protectHFS off) checks it out, ours " +
+  "refuses it before writing anything (FileWorktree keeps the HFS+ rules on everywhere, as " +
+  "defence in depth: the volume may be HFS+)";
 
 const CASES: Case[] = [
   // JGit's DirCacheCheckoutMaliciousPathTest
@@ -360,8 +375,16 @@ const CASES: Case[] = [
     spec: segments(["a\\.git", "config"]),
   },
   { source: "t1014-read-tree-confusing (backslash: .git\\foo)", spec: segments([".git\\foo"]) },
-  { source: "t1450-fsck (HFS+ ignorable: \\u200c.git)", spec: segments(["\u200c.git", "config"]) },
-  { source: "t1450-fsck (HFS+ ignorable: .g\\u200dit)", spec: segments([".g\u200dit", "config"]) },
+  {
+    source: "t1450-fsck (HFS+ ignorable: \\u200c.git)",
+    spec: segments(["\u200c.git", "config"]),
+    divergence: HFS_GUARD,
+  },
+  {
+    source: "t1450-fsck (HFS+ ignorable: .g\\u200dit)",
+    spec: segments([".g\u200dit", "config"]),
+    divergence: HFS_GUARD,
+  },
   // core.protectNTFS / core.protectHFS as configured
   {
     source: "t1014-read-tree-confusing (core.protectNTFS=false: git~1)",
@@ -376,6 +399,8 @@ const CASES: Case[] = [
     source: "t1014-read-tree-confusing (core.protectHFS=true: \\u200c.git)",
     spec: segments(["\u200c.git", "config"]),
     config: { "core.protectHFS": "true" },
+    // a clone's new repository does not carry the source's core.protectHFS
+    divergence: HFS_GUARD,
   },
   {
     source: "t1014-read-tree-confusing (core.protectNTFS=false: .GIT still refused)",
@@ -600,6 +625,35 @@ async function runOurs(
   };
 }
 
+/**
+ * What git keeps in its directory for itself and rewrites as a command runs: left out when a
+ * git directory is compared before and after (anything else changed, `.git/konfig`,
+ * `.git/b`, a hook, would be a path a tree wrote into the repository).
+ */
+const GIT_BOOKKEEPING =
+  /^(index|HEAD|ORIG_HEAD|FETCH_HEAD|AUTO_MERGE|MERGE_[A-Z_]+|packed-refs|(logs|refs|objects)(\/.*)?)$|\.lock$/;
+
+/** Every file below a git directory but its bookkeeping, with its content's hash (links: target). */
+function gitDirSnapshot(gitDir: string): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!existsSync(gitDir)) return out;
+  const paths = execFileSync("find", [".", "-mindepth", "1"], { cwd: gitDir })
+    .toString()
+    .split("\n")
+    .filter(Boolean)
+    .map((p) => p.slice(2))
+    .filter((p) => !GIT_BOOKKEEPING.test(p))
+    .sort();
+  for (const path of paths) {
+    const abs = join(gitDir, path);
+    const stat = lstatSync(abs);
+    if (stat.isSymbolicLink()) out.set(path, `-> ${readlinkSync(abs)}`);
+    else if (stat.isDirectory()) out.set(path, "dir");
+    else out.set(path, createHash("sha1").update(readFileSync(abs)).digest("hex"));
+  }
+  return out;
+}
+
 /** What a case's outcome must show whoever ran it: nothing outside the worktree. */
 function nothingOutside(outcome: Outcome): void {
   const escaped = outcome.files.filter(
@@ -645,10 +699,24 @@ async function compareCase(
 ): Promise<void> {
   const indexOnly = c.config?.["core.protectNTFS"] === "false";
   const unborn = command === "checkout-unborn" || command === "clone";
-  const native = runNative(copy(f, "native", unborn), command, f.c2, indexOnly);
-  const ours = await runOurs(copy(f, "ours", unborn), command, f.c2, indexOnly);
+  const nativeBase = copy(f, "native", unborn);
+  const oursBase = copy(f, "ours", unborn);
+  const nativeBefore = gitDirSnapshot(join(nativeBase, "r", ".git"));
+  const oursBefore = gitDirSnapshot(join(oursBase, "r", ".git"));
+  const oursFilesBefore = listFiles(oursBase);
+  const native = runNative(nativeBase, command, f.c2, indexOnly);
+  const ours = await runOurs(oursBase, command, f.c2, indexOnly);
   nothingOutside(native);
   nothingOutside(ours);
+  // nothing in the git directory changes but git's own bookkeeping, for either
+  expect(gitDirSnapshot(join(nativeBase, "r", ".git"))).toEqual(nativeBefore);
+  expect(gitDirSnapshot(join(oursBase, "r", ".git"))).toEqual(oursBefore);
+  if (command === "clone" && existsSync(join(nativeBase, "d", ".git"))) {
+    // the clone's git directory: what its init and clone write, nothing a tree put there
+    expect([...gitDirSnapshot(join(oursBase, "d", ".git")).keys()]).toEqual([
+      ...gitDirSnapshot(join(nativeBase, "d", ".git")).keys(),
+    ]);
+  }
   const refused = native.status !== 0;
   if (c.jgit && (c.jgit === "refused") !== refused && command === "checkout") {
     jgitDiffers.push(`${c.source}: JGit ${c.jgit}, git ${refused ? "refuses" : "accepts"}`);
@@ -659,6 +727,14 @@ async function compareCase(
     expect(ours.status).toBe(2);
     expect(ours.stderr).toMatch(/^error: invalid path '.*'\nMerge with strategy ort failed\.$/);
     expect(ours.files).toEqual(native.files);
+    return;
+  }
+  if (c.divergence === HFS_GUARD && !refused) {
+    expect(ours.status).not.toBe(0);
+    expect(ours.stderr).toMatch(/^error: invalid path '/);
+    // refused before any write: the worktree as it was (a clone's destination stays empty)
+    if (command !== "clone") expect(ours.files).toEqual(oursFilesBefore);
+    else expect(ours.files.filter((p) => p.startsWith("./d/") && p !== "./d/.git")).toEqual([]);
     return;
   }
   if (c.divergence === SLASH_NAME && !refused) {

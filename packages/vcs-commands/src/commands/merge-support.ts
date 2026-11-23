@@ -923,7 +923,11 @@ async function switchTreesWith(
 ): Promise<{ refused?: MergeRefusal; written: Set<string> }> {
   const { index, unmerged } = await readIndex(ctx.staging);
   // add_index_entry's verify_path: a path git refuses stops the switch before any write
-  const invalid = firstInvalidPath(target, index, worktreePathRules(ctx.workingCopy, ctx.worktree));
+  const invalid = firstInvalidPath(
+    target,
+    index,
+    worktreePathRules(ctx.workingCopy, options.update === false ? undefined : ctx.worktree),
+  );
   if (invalid !== undefined) {
     return {
       refused: { message: `error: invalid path '${invalid}'`, paths: [invalid] },

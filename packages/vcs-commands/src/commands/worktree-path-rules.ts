@@ -23,7 +23,10 @@ import { hostEnvironmentOf } from "./git-ident.js";
 /**
  * The path rules a command applies to the paths a tree gives the index and the worktree:
  * Windows rules on a Windows worktree, `core.protectNTFS` (default true) and
- * `core.protectHFS` (default true on macOS only, as git's `PROTECT_HFS_DEFAULT`).
+ * `core.protectHFS` (default {@link protectHFSDefault}: on for macOS and for an unknown
+ * system, off for a known other one). A worktree that refuses more itself
+ * (`capabilities.protects`: `FileWorktree` keeps both on everywhere) raises them, so a
+ * command refuses such a path before writing anything rather than halfway through.
  *
  * @example
  * ```typescript
@@ -36,12 +39,16 @@ export function worktreePathRules(
   worktree?: Worktree,
 ): WorktreePathOptions {
   const systemName = workingCopy ? hostEnvironmentOf(workingCopy)?.systemName : undefined;
+  const protects = worktree?.capabilities?.protects;
   return {
     windows: worktree?.capabilities?.windowsPaths === true,
-    protectNTFS: workingCopy ? coreBool(workingCopy, "protectNTFS", true) : true,
-    protectHFS: workingCopy
-      ? coreBool(workingCopy, "protectHFS", protectHFSDefault(systemName))
-      : protectHFSDefault(systemName),
+    protectNTFS:
+      protects?.ntfs === true || (workingCopy ? coreBool(workingCopy, "protectNTFS", true) : true),
+    protectHFS:
+      protects?.hfs === true ||
+      (workingCopy
+        ? coreBool(workingCopy, "protectHFS", protectHFSDefault(systemName))
+        : protectHFSDefault(systemName)),
   };
 }
 

@@ -1,7 +1,8 @@
 /**
  * Worktree path verification, after git's `verify_path` (CVE-2014-9390, CVE-2019-1354), with
  * `core.protectHFS` and `core.protectNTFS` on unless the caller turns them off
- * ({@link WorktreePathOptions}; git's defaults: NTFS on, HFS on macOS only).
+ * ({@link WorktreePathOptions}; git's defaults: NTFS on, HFS on macOS only, here also where
+ * the system is unknown: {@link protectHFSDefault}).
  *
  * Paths in trees and in the index come from other people's repositories. Checkout turns them
  * into files under the worktree, which also holds the repository's own `.git`. A path is
@@ -160,17 +161,20 @@ function isHfsDot(component: string, name: string): boolean {
 }
 
 /**
- * git's `protectHFS` default: on for macOS (`uname` `Darwin`), off elsewhere and where the
- * system is unknown (git's `PROTECT_HFS_DEFAULT`, set only by its macOS build).
+ * The `core.protectHFS` default for a system: git's (`PROTECT_HFS_DEFAULT`) on for macOS
+ * (`uname` `Darwin`) and off on a system known to be another, and on where the system is
+ * unknown (no environment, a browser): the storage may be an HFS+ volume, and a name HFS+
+ * folds into `.git` would reach the repository (CVE-2014-9390).
  *
  * @example
  * ```typescript
  * protectHFSDefault("Darwin"); // true
  * protectHFSDefault("Linux"); // false
+ * protectHFSDefault(undefined); // true
  * ```
  */
 export function protectHFSDefault(systemName: string | undefined): boolean {
-  return systemName === "Darwin";
+  return systemName === undefined || systemName === "Darwin";
 }
 
 /** Device names Windows reserves in every directory (git's `is_valid_win32_path`). */
