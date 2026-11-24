@@ -21,6 +21,7 @@
  */
 
 import type { ObjectId } from "@statewalker/vcs-core";
+import { wildmatch } from "@statewalker/vcs-working-tree";
 
 import { RevisionError } from "../errors/index.js";
 import type { DisambiguateHint, RevisionResolver } from "./revision-resolver.js";
@@ -34,13 +35,40 @@ export interface RevisionArgEntry {
   readonly name?: string;
 }
 
+/** A ref and the object it names (a symbolic ref resolved). */
+export interface RefTip {
+  readonly name: string;
+  readonly id: ObjectId;
+}
+
 /** What {@link parseRevisionArgs} needs besides the resolver. */
 export interface RevisionArgOptions {
   /** The merge bases of two commits in git's order (`repo_get_merge_bases`), for `a...b` */
   mergeBases(a: ObjectId, b: ObjectId): Promise<ObjectId[]>;
   /** Read plain revisions as committishes (git's `REVARG_COMMITTISH`, as `git log` does) */
   committish?: boolean;
+  /**
+   * Every ref under `refs/` in name order (byte order), symbolic ones resolved and broken
+   * ones left out, for `--all`, `--branches`, `--tags`, `--remotes` and `--glob`; without,
+   * those options name nothing
+   */
+  refs?(): Promise<RefTip[]>;
+  /** What HEAD names (`--all` adds it after the refs); undefined when it names nothing */
+  head?(): Promise<ObjectId | undefined>;
 }
+
+/**
+ * The revisions `--stdin` reads (revision.c's read_revisions_from_stdin): one per line, up
+ * to an empty line; `--not`, `--all`, `--branches[=]`, `--tags[=]`, `--remotes[=]`,
+ * `--glob=`, `--exclude=` among them (`--not` there flips only the lines after it), `--`
+ * then paths, `--end-of-options` makes every later line a revision.
+ */
+export interface StdinRevisions {
+  readonly stdin: string;
+}
+
+/** An argument {@link parseRevisionArgs} reads: a command-line argument, or `--stdin`'s text. */
+export type RevisionArg = string | StdinRevisions;
 
 /** The arguments read. */
 export interface ParsedRevisionArgs {
@@ -48,6 +76,105 @@ export interface ParsedRevisionArgs {
   readonly entries: RevisionArgEntry[];
   /** What git printed while reading them (`warning:`, `error:`, `hint:` lines) */
   readonly warnings: string[];
+  /**
+   * git's `rev_input_given`: a revision or a ref option was read, so git does not fall back
+   * to HEAD even when they named nothing (`--glob=nothing`)
+   */
+  readonly inputGiven?: boolean;
+  /** The paths `--stdin` read after its `--` line */
+  readonly stdinPaths?: string[];
+}
+
+/** The state of a revision parse that options share (git's `rev_info`). */
+interface RevisionArgState {
+  /** `--exclude=` patterns, for the next ref option */
+  excludes: string[];
+  inputGiven: boolean;
+  stdinPaths: string[];
+}
+
+/** dir.c's has_glob_specials */
+const hasGlobSpecials = (text: string) => /[*?[\\]/.test(text);
+
+/**
+ * The ref options of `git log`/`git rev-list` (revision.c's handle_revision_pseudo_opt):
+ * the number of arguments `args[at]` takes (1, or 2 for a detached `--glob <pattern>` /
+ * `--exclude <pattern>`), 0 when it is none. Each ref option adds its refs (as
+ * `refs_for_each_ref` lists them, in name order) that no `--exclude=` pattern given since
+ * the last ref option names (wildmatch without `WM_PATHNAME`, on the name the option gives:
+ * `main` for `--branches`, `refs/heads/main` for `--all` and `--glob`), and clears the
+ * patterns.
+ */
+async function handleRefOption(
+  args: readonly string[],
+  at: number,
+  exclude: boolean,
+  options: RevisionArgOptions,
+  state: RevisionArgState,
+  out: RevisionArgEntry[],
+): Promise<number> {
+  const arg = args[at] as string;
+  /** parse_long_opt: `--<name>=<value>` or `--<name> <value>` */
+  const longOpt = (name: string): { value: string; count: number } | undefined => {
+    if (arg.startsWith(`--${name}=`)) return { value: arg.slice(name.length + 3), count: 1 };
+    if (arg !== `--${name}`) return undefined;
+    const value = args[at + 1];
+    if (value === undefined) {
+      throw new RevisionError(arg, `fatal: Option '--${name}' requires a value`);
+    }
+    return { value, count: 2 };
+  };
+  const refs = async () => (options.refs ? options.refs() : []);
+  const add = (name: string, id: ObjectId) => {
+    if (state.excludes.some((pattern) => wildmatch(pattern, name))) return;
+    out.push({ id, exclude, name });
+  };
+  /** refs_for_each_ref_ext with a pattern: refs/ (or the prefix) before it, `/*` after a plain name */
+  const realPattern = (prefix: string | undefined, pattern: string) => {
+    let real = prefix ?? (pattern.startsWith("refs/") ? "" : "refs/");
+    real += pattern;
+    if (!hasGlobSpecials(pattern)) real = `${real.endsWith("/") ? real : `${real}/`}*`;
+    return real;
+  };
+  const kinds: Record<string, string> = {
+    branches: "refs/heads/",
+    tags: "refs/tags/",
+    remotes: "refs/remotes/",
+  };
+  const done = (count: number) => {
+    state.excludes = [];
+    state.inputGiven = true;
+    return count;
+  };
+  if (arg === "--all") {
+    for (const ref of await refs()) add(ref.name, ref.id);
+    const head = await options.head?.();
+    if (head !== undefined) add("HEAD", head);
+    return done(1);
+  }
+  const kind = /^--(branches|tags|remotes)(=(.*))?$/s.exec(arg);
+  if (kind) {
+    const prefix = kinds[kind[1] as string] as string;
+    const pattern = kind[2] !== undefined ? realPattern(prefix, kind[3] as string) : undefined;
+    for (const ref of await refs()) {
+      if (!ref.name.startsWith(prefix) || ref.name.length === prefix.length) continue;
+      if (pattern !== undefined && !wildmatch(pattern, ref.name)) continue;
+      add(ref.name.slice(prefix.length), ref.id);
+    }
+    return done(1);
+  }
+  const glob = longOpt("glob");
+  if (glob) {
+    const pattern = realPattern(undefined, glob.value);
+    for (const ref of await refs()) if (wildmatch(pattern, ref.name)) add(ref.name, ref.id);
+    return done(glob.count);
+  }
+  const excluded = longOpt("exclude");
+  if (excluded) {
+    state.excludes.push(excluded.value);
+    return excluded.count;
+  }
+  return 0;
 }
 
 /** git's die after an argument that is neither a revision nor a path (`git rev-parse x`). */
@@ -68,15 +195,34 @@ export function unknownRevisionMessage(arg: string): string {
  */
 export async function parseRevisionArgs(
   resolver: RevisionResolver,
-  args: readonly string[],
+  args: readonly RevisionArg[],
   options: RevisionArgOptions,
 ): Promise<ParsedRevisionArgs> {
   const entries: RevisionArgEntry[] = [];
+  const state: RevisionArgState = { excludes: [], inputGiven: false, stdinPaths: [] };
   let not = false;
-  for (const arg of args) {
-    if (arg === "--not") {
+  let endOfOptions = false;
+  const strings = args.map((arg) => (typeof arg === "string" ? arg : ""));
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as RevisionArg;
+    if (typeof arg !== "string") {
+      await readStdinRevisions(resolver, arg.stdin, options, state, entries);
+      continue;
+    }
+    if (!endOfOptions && arg === "--end-of-options") {
+      endOfOptions = true;
+      continue;
+    }
+    if (!endOfOptions && arg === "--not") {
       not = !not;
       continue;
+    }
+    if (!endOfOptions && arg.startsWith("--")) {
+      const taken = await handleRefOption(strings, i, not, options, state, entries);
+      if (taken > 0) {
+        i += taken - 1;
+        continue;
+      }
     }
     const ok = await handleRevisionArg(resolver, arg, not, options, entries, true);
     if (ok === false) {
@@ -86,8 +232,62 @@ export async function parseRevisionArgs(
         [...resolver.warnings, `fatal: bad revision '${arg}'`].join("\n"),
       );
     }
+    state.inputGiven = true;
   }
-  return { entries, warnings: resolver.warnings };
+  return {
+    entries,
+    warnings: resolver.warnings,
+    inputGiven: state.inputGiven,
+    stdinPaths: state.stdinPaths,
+  };
+}
+
+/** revision.c's read_revisions_from_stdin over `text`, its `--not` its own. */
+async function readStdinRevisions(
+  resolver: RevisionResolver,
+  text: string,
+  options: RevisionArgOptions,
+  state: RevisionArgState,
+  out: RevisionArgEntry[],
+): Promise<void> {
+  // strbuf_getline: lines end at LF, a CR before it dropped; the last one may lack its LF
+  const lines = text.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  const line = (i: number) => {
+    const l = lines[i] as string;
+    return l.endsWith("\r") ? l.slice(0, -1) : l;
+  };
+  let not = false;
+  let endOfOptions = false;
+  for (let i = 0; i < lines.length; i++) {
+    const arg = line(i);
+    if (arg === "") return;
+    if (arg === "--") {
+      for (let k = i + 1; k < lines.length; k++) state.stdinPaths.push(line(k));
+      return;
+    }
+    if (!endOfOptions && arg.startsWith("-")) {
+      if (arg === "--end-of-options") {
+        endOfOptions = true;
+        continue;
+      }
+      if (arg === "--not") {
+        not = !not;
+        continue;
+      }
+      // the option alone: a detached `--glob` takes no next line (git dies)
+      if (await handleRefOption([arg], 0, not, options, state, out)) continue;
+      throw new RevisionError(arg, `fatal: invalid option '${arg}' in --stdin mode`);
+    }
+    const ok = await handleRevisionArg(resolver, arg, not, options, out, true);
+    if (ok === false) {
+      throw new RevisionError(
+        arg,
+        [...resolver.warnings, `fatal: bad revision '${arg}'`].join("\n"),
+      );
+    }
+    state.inputGiven = true;
+  }
 }
 
 /**
