@@ -20,6 +20,7 @@ import {
   BlameCommand,
   CheckMailmapCommand,
   CheckoutCommand,
+  CherryCommand,
   CherryPickCommand,
   CleanCommand,
   CloneCommand,
@@ -867,6 +868,20 @@ export class Git implements Disposable {
   shortlog(): ShortlogCommand {
     this.checkClosed();
     return new ShortlogCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a CherryCommand (`git cherry`): the commits of a branch not in its upstream, each
+   * marked `-` when upstream has a commit with the same change, `+` otherwise.
+   *
+   * @example
+   * ```typescript
+   * await git.cherry().setUpstream("main").setHead("topic").setVerbose(true).callText();
+   * ```
+   */
+  cherry(): CherryCommand {
+    this.checkClosed();
+    return new CherryCommand(this._workingCopy);
   }
 
   /**
