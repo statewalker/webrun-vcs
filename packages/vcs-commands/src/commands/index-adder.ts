@@ -31,6 +31,7 @@ import {
   wholeSeconds,
 } from "@statewalker/vcs-working-tree";
 import { storeWorktreeFile } from "../core-commands/index.js";
+import { strerror } from "./strerror.js";
 
 const SURROGATE = /[\ud800-\udfff]/;
 
@@ -57,6 +58,19 @@ export interface AddToIndexOptions {
    * holds it already (spares looking it up)
    */
   indexed?: StagingEntry;
+}
+
+/**
+ * A file `index_path` cannot open (an errno such as EACCES): git's `error_errno` of its
+ * `open`, then add_to_index's "unable to index file" line. Anything else is rethrown.
+ */
+function unreadable(path: string, error: unknown): never {
+  const code = (error as { code?: unknown })?.code;
+  if (typeof code !== "string" || !/^E[A-Z]+$/.test(code) || code === "ENOENT") throw error;
+  throw new AddToIndexError(path, [
+    `error: open("${path}"): ${strerror(error)}`,
+    `error: unable to index file '${path}'`,
+  ]);
 }
 
 /** A path `add_to_index` cannot add: git's error lines (`fatal: adding files failed` follows). */
@@ -185,13 +199,29 @@ export async function chmodIndexEntries(
   staging: Staging,
   flip: "+" | "-",
   matches: (entry: StagingEntry) => boolean,
-  options: { pretend?: boolean } = {},
+  /**
+   * `includeSkipWorktree`: skip-worktree entries too (`git add --sparse --chmod`);
+   * `collapsed`: sparse directories git holds as one entry each (`out/`), refused as any
+   * entry that is no regular file when matched
+   */
+  options: { pretend?: boolean; includeSkipWorktree?: boolean; collapsed?: readonly string[] } = {},
 ): Promise<string[]> {
   const errors: string[] = [];
   const editor = staging.createEditor();
   const touched: string[] = [];
+  const collapsed = options.collapsed ?? [];
+  let lastDir: string | undefined;
   for await (const entry of staging.entries()) {
-    if (entry.skipWorktree || !matches(entry)) continue;
+    const dir = collapsed.find((d) => entry.path.startsWith(d));
+    if (dir) {
+      if (dir !== lastDir) {
+        lastDir = dir;
+        const dirEntry: StagingEntry = { ...entry, path: dir, mode: FileMode.TREE };
+        if (matches(dirEntry)) errors.push(`error: cannot chmod ${flip}x '${dir}'`);
+      }
+      continue;
+    }
+    if ((entry.skipWorktree && !options.includeSkipWorktree) || !matches(entry)) continue;
     if ((entry.mode & 0o170000) !== 0o100000) {
       errors.push(`error: cannot chmod ${flip}x '${entry.path}'`);
       continue;
@@ -446,7 +476,7 @@ export class IndexAdder {
     const known = indexed ?? this.unmerged.get(name)?.[0];
     if (this.pretend) {
       // git's ADD_CACHE_PRETEND: hashed, never written
-      const id = await worktree.computeHash(path);
+      const id = await worktree.computeHash(path).catch((error) => unreadable(path, error));
       const mode = modeFromWorktree(entry.mode, known?.mode, this.trust);
       return indexed && indexed.objectId === id && indexed.mode === mode ? "same" : "added";
     }
@@ -454,7 +484,7 @@ export class IndexAdder {
     const stored = await storeWorktreeFile(this.blobs, worktree, path, entry, {
       onWarning: options.onWarning,
       ...(options.renormalize ? { renormalize: true } : {}),
-    });
+    }).catch((error) => unreadable(path, error));
     const mode = modeFromWorktree(stored.entry.mode, known?.mode, this.trust);
     this.stage(name, stored.id, mode, entryStatOf(stored.entry));
     return indexed && indexed.objectId === stored.id && indexed.mode === mode ? "same" : "added";

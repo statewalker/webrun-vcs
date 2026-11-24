@@ -12,6 +12,7 @@
 import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
 import { FileMode } from "@statewalker/vcs-core";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { createCommandLineExcludes, type IgnoreNode } from "../ignore/index.js";
 import {
   type AttributesIndex,
   attributesIndexOfTree,
@@ -116,12 +117,18 @@ export class MemoryWorktree implements Worktree {
 
     // Sort paths
     const sortedPaths = Array.from(paths).sort();
+    // the command line's exclude rules (EXC_CMDL), asked before the worktree's own
+    const commandLine = options?.excludePatterns?.length
+      ? createCommandLineExcludes(options.excludePatterns)
+      : undefined;
 
     for (const path of sortedPaths) {
       const isFile = this.files.has(path);
       const isDirectory = !isFile;
 
-      const isIgnored = this.isIgnoredPath(path, isDirectory);
+      const isIgnored = commandLine
+        ? this.isIgnoredWith(commandLine, path, isDirectory)
+        : this.isIgnoredPath(path, isDirectory);
       if (isIgnored && !includeIgnored) {
         continue;
       }
@@ -463,6 +470,24 @@ export class MemoryWorktree implements Worktree {
       if (filePath.startsWith(prefix)) {
         return true;
       }
+    }
+    return false;
+  }
+
+  /**
+   * Whether `path` is ignored with command-line rules (EXC_CMDL) asked first, level by level
+   * as `GitIgnoreManagerImpl.getStatus` does: for each leading directory, then the path, the
+   * command line's answer wins and this worktree's own patterns answer only where it has none,
+   * so `!a.o` re-includes what `*.o` ignores; an excluded directory excludes what is in it.
+   */
+  private isIgnoredWith(commandLine: IgnoreNode, path: string, isDirectory: boolean): boolean {
+    const parts = path.split("/").filter((p) => p.length > 0);
+    for (let k = 1; k <= parts.length; k++) {
+      const last = k === parts.length;
+      const level = parts.slice(0, k).join("/");
+      const asDirectory = last ? isDirectory : true;
+      const own = commandLine.checkIgnored(level, asDirectory, false);
+      if (own ?? this.isIgnoredPath(level, asDirectory)) return true;
     }
     return false;
   }
