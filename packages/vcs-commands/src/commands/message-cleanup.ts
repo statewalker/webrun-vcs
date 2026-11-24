@@ -145,7 +145,7 @@ function autoCommentChar(text: string): string {
 }
 
 /** A cleanup mode given by name (`--cleanup=<name>`, `commit.cleanup`), as git parses it. */
-function parseCleanupMode(name: string): CleanupMode {
+export function parseCleanupMode(name: string): CleanupMode {
   const mode = Object.values(CleanupMode).find((m) => m === name);
   if (!mode) {
     throw new InvalidArgumentError("cleanup", name, `fatal: Invalid cleanup mode ${name}`);
