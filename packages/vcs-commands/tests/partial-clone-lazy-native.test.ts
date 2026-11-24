@@ -1194,4 +1194,30 @@ describeGit("partial clones with lazy fetch, as native git", () => {
       expect(result.stderr).toBe("git: 'backfill' is not a git command. See 'git --help'.\n");
     });
   });
+
+  it('t0410-partial-clone.sh: "fetching of missing blobs works", through git show <rev>:<path>', async () => {
+    const t = await twins("show");
+    for (const args of [["origin/side:side.txt"], ["origin/side:dir/b.txt", "origin/m2:a.txt"]]) {
+      let theirs = { stdout: "", stderr: "", status: -1 as number | null };
+      const n = await fetchesOf(native.counts, async () => {
+        theirs = await gitAsync(root, t.theirs, ["show", ...args]);
+      });
+      let mine = { stdout: "", errors: [] as string[], exitCode: -1 };
+      const o = await fetchesOf(native.counts, async () => {
+        const show = (await reopen(t.dir)).show();
+        for (const a of args) show.addArgument(a);
+        const r = await show.call();
+        mine = {
+          stdout: new TextDecoder().decode(r.stdout),
+          errors: r.errors,
+          exitCode: r.exitCode,
+        };
+      });
+      expect(theirs.status, theirs.stderr).toBe(0);
+      expect(mine.exitCode, mine.errors.join("\n")).toBe(0);
+      expect(mine.stdout).toBe(theirs.stdout);
+      expect(o, args.join(" ")).toBe(n);
+      expect(n, args.join(" ")).toBe(args.length);
+    }
+  });
 });
