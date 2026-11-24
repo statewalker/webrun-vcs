@@ -87,6 +87,11 @@ export interface PushClientOptions {
    * command is sent, as git fails when gpg cannot sign.
    */
   signed?: "always" | "if-asked";
+  /**
+   * `--mirror` (see `MatchPushRefsOptions.mirror`): with `:` every local ref is pushed, and
+   * every remote ref the refspecs leave out is deleted. git's `--mirror` also forces (`force`)
+   */
+  mirror?: boolean;
   /** Push options for the server's hooks (`-o`); the server must advertise `push-options` */
   pushOptions?: string[];
   /** Delete remote refs a pattern's destination covers whose local source is gone (`--prune`) */
@@ -155,6 +160,11 @@ export interface PushClientResult {
    * helper, whose refused unpack does not fail `transport_push` (porcelain `Done` still printed)
    */
   stateless?: boolean;
+  /**
+   * The remote has no refs and nothing was pushed to it (send_pack's "No refs in common and
+   * none specified; doing nothing."): nothing was sent, and the connection left at once
+   */
+  noRefsInCommon?: boolean;
   /** The capabilities asked for on the first command */
   capabilities: string[];
   /**
@@ -257,12 +267,6 @@ async function sendPack(
   options: PushClientOptions,
 ): Promise<PushClientResult> {
   const caps = connection.capabilities;
-  if (options.atomic && !caps.has("atomic")) {
-    throw new TransportError("the receiving end does not support --atomic push");
-  }
-  if (options.pushOptions?.length && !caps.has("push-options")) {
-    throw new TransportError("the receiving end does not support push options");
-  }
   const { repository, refStore } = options;
   const remoteRefs = [...connection.advertisedRefs];
   // the ids the push sends are of the local repository's format (checked against the
@@ -290,6 +294,7 @@ async function sendPack(
     remoteRefs,
     {
       prune: options.prune,
+      mirror: options.mirror,
       objectFormat: format,
       ...(options.followTags ? { followTags: followTagsSource(repository) } : {}),
     },
@@ -346,6 +351,22 @@ async function sendPack(
   if (options.prePush && !(await options.prePush(updates))) {
     throw new PushRefusedByHookError(updates);
   }
+  // send_pack: a remote with no refs that nothing is pushed to (`git push <empty> :`): nothing
+  // is sent, the connection is left at once
+  if (remoteRefs.length === 0 && updates.length === 0) {
+    return {
+      remoteRefs,
+      updates,
+      ok: true,
+      noRefsInCommon: true,
+      capabilities: [],
+      packObjects: 0,
+      packBytes: 0,
+      bytesSent: 0,
+      abbrevLengths: new Map(),
+      summaryWidth: transportSummaryWidth([]),
+    };
+  }
   // send_pack's server_supports_hash: a server naming no format speaks SHA-1
   const serverFormat = caps.get("object-format");
   if ((serverFormat || "sha1") !== format.name) {
@@ -369,6 +390,14 @@ async function sendPack(
         "warning: not sending a push certificate since the receiving end does not support --signed push",
       );
     }
+  }
+
+  // send_pack checks these after the hash and the push certificate
+  if (options.atomic && !caps.has("atomic")) {
+    throw new TransportError("the receiving end does not support --atomic push");
+  }
+  if (options.pushOptions?.length && !caps.has("push-options")) {
+    throw new TransportError("the receiving end does not support push options");
   }
 
   // what the server allows (send_pack)

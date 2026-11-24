@@ -548,6 +548,7 @@ describe("served settings: the operator's, then what a repository's config sets"
       denyCurrentBranch: "unconfigured",
       denyDeleteCurrent: "unconfigured",
       shallowUpdate: false,
+      advertisePushOptions: false,
       uploadPackHideRefs: [],
       receivePackHideRefs: [],
     });
