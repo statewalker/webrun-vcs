@@ -56,6 +56,19 @@ export function remergeObjectsView(history: History): History {
     has: async (id: ObjectId) => (await top.blobs.has(id)) || base.blobs.has(id),
     size: async (id: ObjectId) =>
       (await top.blobs.has(id)) ? top.blobs.size(id) : base.blobs.size(id),
+    // a partial clone's batch fetch (diff's patches, merge-ort's content merges, rename
+    // detection): only the ids the overlay lacks are the promisor's to send; the re-merge's
+    // own blobs exist nowhere else
+    ...(base.blobs.prefetch
+      ? {
+          prefetch: async (ids: Iterable<ObjectId>) => {
+            const absent: ObjectId[] = [];
+            for (const id of ids) if (!(await top.blobs.has(id))) absent.push(id);
+            if (absent.length > 0) await base.blobs.prefetch?.(absent);
+          },
+        }
+      : {}),
+    ...(base.blobs.mayFetch ? { mayFetch: () => base.blobs.mayFetch?.() ?? false } : {}),
     open: async (id: ObjectId) => {
       if (await top.blobs.has(id)) {
         if (top.blobs.open) return top.blobs.open(id);
