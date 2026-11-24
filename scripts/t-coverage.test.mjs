@@ -1,8 +1,12 @@
 // Tests of scripts/t-coverage.mjs: node --test scripts/t-coverage.test.mjs
 import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
   buildReport,
+  cachedGitSource,
   extractCitations,
   formatMarkdown,
   matchCitation,
@@ -124,6 +128,17 @@ describe("matchCitation", () => {
     });
   });
 
+  it("never takes a title made of variables alone as matching anything", () => {
+    const loose = [
+      { title: "$title", line: 1, dynamic: true },
+      { title: "$1 ($2)", line: 2, dynamic: true },
+    ];
+    assert.deepEqual(matchCitation(loose, "zzqq a paraphrased title"), {
+      status: "unresolved",
+      indexes: [],
+    });
+  });
+
   it("reports what matches nothing", () => {
     assert.deepEqual(matchCitation(titles, "no such test"), { status: "unresolved", indexes: [] });
   });
@@ -197,6 +212,38 @@ describe("buildReport", () => {
     assert.match(md, /\*\*Cited scripts hold\*\* 4 in-scope tests \(66\.7%\)/);
     assert.match(md, /\| t0008-ignores \| 4 \| 2 \| 50\.0% \| 3 \|/);
     assert.match(md, /`a\.test\.ts:3` t0008 "missing": unresolved/);
+  });
+});
+
+describe("cachedGitSource", () => {
+  it("recovers from a clone interrupted before its checkout", () => {
+    const root = mkdtempSync(join(tmpdir(), "t-coverage-"));
+    try {
+      const dir = join(root, "v1");
+      let failCheckout = true;
+      const git = (...args) => {
+        const target = args[0] === "-C" ? args[1] : args.at(-1);
+        if (args[0] === "clone") mkdirSync(join(target, ".git"), { recursive: true });
+        if (args.includes("checkout")) {
+          if (failCheckout) throw new Error("network dropped");
+          mkdirSync(join(target, "t"));
+          writeFileSync(join(target, "t", "t0000-basic.sh"), "");
+        }
+      };
+      assert.throws(() => cachedGitSource(dir, "v1", git), /network dropped/);
+      assert.equal(existsSync(join(dir, "t")), false);
+      failCheckout = false;
+      assert.equal(cachedGitSource(dir, "v1", git), dir);
+      assert.equal(existsSync(join(dir, "t", "t0000-basic.sh")), true);
+      assert.equal(existsSync(`${dir}.partial`), false);
+      // Made once: a later call clones nothing.
+      assert.equal(
+        cachedGitSource(dir, "v1", () => assert.fail("cloned again")),
+        dir,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

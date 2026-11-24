@@ -29,7 +29,7 @@
 //        [--format md|json] [--all] [--out <file>] --all lists every in-scope script
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -151,6 +151,9 @@ export function extractCitations(source, file) {
   return citations;
 }
 
+// Letters and digits a dynamic title must keep outside its variables to be matched against.
+const MIN_DYNAMIC_LITERAL = 4;
+
 const normalize = (s) =>
   s
     .toLowerCase()
@@ -167,7 +170,10 @@ export function matchCitation(titles, citation) {
   const holding = indexesWhere(titles, (t) => normalize(t.title).includes(want));
   if (holding.length === 1) return { status: "matched", indexes: holding };
   if (holding.length > 1) return { status: "ambiguous", indexes: holding };
-  const instances = indexesWhere(titles, (t) => t.dynamic && dynamicPattern(t.title).test(want));
+  const instances = indexesWhere(
+    titles,
+    (t) => t.dynamic && (dynamicPattern(t.title)?.test(want) ?? false),
+  );
   if (instances.length === 1) return { status: "matched", indexes: instances };
   if (instances.length > 1) return { status: "ambiguous", indexes: instances };
   return { status: "unresolved", indexes: [] };
@@ -181,11 +187,16 @@ function indexesWhere(list, predicate) {
   return out;
 }
 
-/** A title holding shell variables, as a pattern its instances match. */
+/**
+ * A title holding shell variables, as a pattern its instances match; none when the title has too
+ * little literal text to tell its instances from anything else (`'$title'` would match every
+ * citation).
+ */
 function dynamicPattern(title) {
   const parts = normalize(title).split(
     /\$(?:\{[^}]*\}|\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*|\d|[@*#?])/,
   );
+  if (parts.join("").replace(/[^a-z0-9]/g, "").length < MIN_DYNAMIC_LITERAL) return null;
   return new RegExp(`^${parts.map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*?")}$`);
 }
 
@@ -387,11 +398,15 @@ export function listTestFiles(root) {
   return files.sort();
 }
 
-/** A sparse, blobless clone of git's t/ scripts at `version`, made once per version. */
-function cachedGitSource(root, version) {
-  const dir = join(root, "node_modules", ".cache", "t-coverage", version);
+/**
+ * A sparse, blobless clone of git's t/ scripts at `version` in `dir`, made once. It is built in a
+ * sibling directory and renamed into place only once complete, so an interrupted clone leaves no
+ * cache that later runs would take as made, or fail to clone over.
+ */
+export function cachedGitSource(dir, version, git = runGit) {
   if (existsSync(join(dir, "t"))) return dir;
-  const git = (...args) => execFileSync("git", args, { stdio: ["ignore", "ignore", "inherit"] });
+  const partial = `${dir}.partial`;
+  rmSync(partial, { recursive: true, force: true });
   git(
     "clone",
     "--quiet",
@@ -400,11 +415,17 @@ function cachedGitSource(root, version) {
     "--no-checkout",
     `--branch=${version}`,
     "https://github.com/git/git",
-    dir,
+    partial,
   );
-  git("-C", dir, "sparse-checkout", "set", "--no-cone", "/t/t[0-9]*.sh");
-  git("-C", dir, "checkout", "--quiet");
+  git("-C", partial, "sparse-checkout", "set", "--no-cone", "/t/t[0-9]*.sh");
+  git("-C", partial, "checkout", "--quiet");
+  rmSync(dir, { recursive: true, force: true });
+  renameSync(partial, dir);
   return dir;
+}
+
+function runGit(...args) {
+  execFileSync("git", args, { stdio: ["ignore", "ignore", "inherit"] });
 }
 
 function parseArgs(argv) {
@@ -429,7 +450,12 @@ function parseArgs(argv) {
 function main(argv) {
   const root = join(dirname(fileURLToPath(import.meta.url)), "..");
   const options = parseArgs(argv);
-  const gitSrc = options.gitSrc ?? cachedGitSource(root, options.gitVersion);
+  const gitSrc =
+    options.gitSrc ??
+    cachedGitSource(
+      join(root, "node_modules", ".cache", "t-coverage", options.gitVersion),
+      options.gitVersion,
+    );
   const testFiles = listTestFiles(root);
   const citations = testFiles.flatMap((file) =>
     extractCitations(readFileSync(file, "utf8"), relative(root, file)),
