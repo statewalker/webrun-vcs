@@ -106,6 +106,8 @@ const MERGE_CHARS = ["/", "|", "\\"];
 /** git's struct git_graph. */
 export class LogGraph {
   private commit: ObjectId | undefined;
+  /** The commit's mark on its line (get_revision_mark: `*`, `<`, `>`, `=`) */
+  private commitMark = "*";
   private numParents = 0;
   private width = 0;
   private expansionRow = 0;
@@ -318,11 +320,12 @@ export class LogGraph {
 
   /**
    * The next commit: `id`, with the commits shown after it that the walk has already read
-   * (git's lookahead of two, for visual roots).
+   * (git's lookahead of two, for visual roots), and the mark drawn for it (`*`, or `<`/`>`/`=`).
    */
-  update(id: ObjectId, lookahead: readonly ObjectId[] = []): void {
+  update(id: ObjectId, lookahead: readonly ObjectId[] = [], mark = "*"): void {
     this.lookahead = lookahead.slice(0, 2);
     this.commit = id;
+    this.commitMark = mark;
     this.numParents = this.interestingParents().length;
     this.prevCommitIndex = this.commitIndex;
     this.updateColumns();
@@ -475,7 +478,7 @@ export class LogGraph {
           LogGraph.add(line, " ".repeat(padding));
           this.width += padding;
         }
-        LogGraph.add(line, "*");
+        LogGraph.add(line, this.commitMark);
         if (this.needsTruncation(i)) {
           LogGraph.add(line, " ");
           break;

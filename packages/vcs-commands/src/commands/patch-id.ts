@@ -202,3 +202,112 @@ export async function patchIdOfChanges(
   }
   return bytesToHex(sum);
 }
+
+/** The change a commit makes, as {@link PatchIds} asks for it. */
+export interface PatchIdCommit {
+  /** Its first parent's tree; undefined for a root commit (diffed against the empty tree) */
+  parentTree?: ObjectId;
+  tree: ObjectId;
+}
+
+/** What {@link PatchIds} reads. */
+export interface PatchIdsHost<K> {
+  trees: PatchIdTrees;
+  blobs: Blobs;
+  objectFormat?: ObjectFormat;
+  /**
+   * The change of a commit, or undefined where git's patch_id_defined says no (a merge: more
+   * than one parent, as the walk has them)
+   */
+  change(key: K): Promise<PatchIdCommit | undefined>;
+  /** The paths the diffs are limited to (the walk's pathspec); every path without */
+  paths?: (path: string) => boolean;
+}
+
+/**
+ * patch-ids.c: a table of commits by patch-id. Each commit added gets only the cheap id of
+ * its diff's headers (names and modes, no content read); a lookup computes the same cheap
+ * id, and the full patch-ids of both sides only where those collide (patch_id_neq), each at
+ * most once. A commit whose diff is empty has the null id, as git's, so empty commits match
+ * one another.
+ *
+ * @example
+ * ```typescript
+ * const ids = new PatchIds({ trees, blobs, change: async (id) => ({ parentTree, tree }) });
+ * for (const id of upstream) await ids.add(id);
+ * const same = await ids.matches(mine); // the upstream commits making mine's change
+ * ```
+ */
+export class PatchIds<K> {
+  private readonly byHeader = new Map<string, K[]>();
+  private readonly full = new Map<K, string | null>();
+  private readonly nullId: string;
+
+  constructor(private readonly host: PatchIdsHost<K>) {
+    const format = host.objectFormat ?? host.blobs.objectFormat ?? SHA1_OBJECT_FORMAT;
+    this.nullId = format.nullId;
+  }
+
+  /** add_commit_patch_id: false for a commit without a patch-id (a merge). */
+  async add(key: K): Promise<boolean> {
+    const header = await this.headerId(key);
+    if (header === undefined) return false;
+    const list = this.byHeader.get(header);
+    if (list) list.push(key);
+    else this.byHeader.set(header, [key]);
+    return true;
+  }
+
+  /**
+   * patch_id_iter_first/next: the commits added whose patch-id is `key`'s, in the order
+   * added (none for a merge).
+   */
+  async matches(key: K): Promise<K[]> {
+    const header = await this.headerId(key);
+    const candidates = header === undefined ? undefined : this.byHeader.get(header);
+    if (!candidates) return [];
+    const mine = await this.fullId(key);
+    if (mine === null) return [];
+    const found: K[] = [];
+    for (const c of candidates) if ((await this.fullId(c)) === mine) found.push(c);
+    return found;
+  }
+
+  /** has_commit_patch_id */
+  async has(key: K): Promise<boolean> {
+    return (await this.matches(key)).length > 0;
+  }
+
+  /**
+   * The full patch-id of a commit (hex; the null id for an empty diff), null when it has
+   * none (a merge, or a commit that could not be read: never equal to another, as git errs on
+   * the side of keeping both).
+   */
+  async fullId(key: K): Promise<string | null> {
+    let id = this.full.get(key);
+    if (id === undefined) {
+      // git's "Could not get patch ID": the commit then equals no other
+      id = (await this.compute(key, false).catch(() => undefined)) ?? null;
+      this.full.set(key, id);
+    }
+    return id;
+  }
+
+  private headerId(key: K): Promise<string | undefined> {
+    return this.compute(key, true);
+  }
+
+  /** commit_patch_id */
+  private async compute(key: K, headerOnly: boolean): Promise<string | undefined> {
+    const change = await this.host.change(key);
+    if (!change) return undefined;
+    const changes = await treeChanges(this.host.trees, change.parentTree, change.tree);
+    const paths = this.host.paths;
+    const kept = paths ? changes.filter((c) => paths(c.path)) : changes;
+    if (kept.length === 0) return this.nullId;
+    return patchIdOfChanges(this.host.blobs, kept, {
+      headerOnly,
+      ...(this.host.objectFormat ? { objectFormat: this.host.objectFormat } : {}),
+    });
+  }
+}
