@@ -451,7 +451,9 @@ export class RmCommand extends GitCommand<RmResult> {
       // cmd_rm's show_only: check_local_mod, then nothing is changed
       if (!this.force) {
         const refusal = await this.checkLocalMod(removedEntries, worktree);
-        if (refusal) throw new RmFailedError(refusal, [], { removedPaths: [], output: [] });
+        if (refusal) {
+          throw new RmFailedError(refusal, [], withMessages({ removedPaths: [], output: [] }));
+        }
       }
       if (sparsePaths.length > 0) throw advise(withMessages({ removedPaths, output }));
       return withMessages({ removedPaths, output });
@@ -460,14 +462,16 @@ export class RmCommand extends GitCommand<RmResult> {
       throw new RmFailedError(
         "fatal: Cannot change unmerged .gitmodules, resolve merge conflicts first",
         [],
-        { removedPaths: [], output: [] },
+        withMessages({ removedPaths: [], output: [] }),
       );
     }
 
     // check_local_mod: unless forced, nothing is removed that the index alone holds
     if (!this.force) {
       const refusal = await this.checkLocalMod(removedEntries, worktree);
-      if (refusal) throw new RmFailedError(refusal, [], { removedPaths: [], output: [] });
+      if (refusal) {
+        throw new RmFailedError(refusal, [], withMessages({ removedPaths: [], output: [] }));
+      }
     }
 
     // the files first (git commits the index only once they are gone): the first that cannot
@@ -491,10 +495,11 @@ export class RmCommand extends GitCommand<RmResult> {
           removed = true;
           if (entry.mode === FileMode.GITLINK) removedSubmodules.push(entry.path);
         } else if (!removed) {
-          throw new RmFailedError(`fatal: git rm: '${entry.path}': ${failure}`, [], {
-            removedPaths: [],
-            output,
-          });
+          throw new RmFailedError(
+            `fatal: git rm: '${entry.path}': ${failure}`,
+            [],
+            withMessages({ removedPaths: [], output }),
+          );
         } else {
           warnings.push(`warning: git rm: '${entry.path}': ${failure}`);
         }
@@ -537,7 +542,9 @@ export class RmCommand extends GitCommand<RmResult> {
    * directory is there, not empty, and whose repository (or a nested one's) is a `.git`
    * directory in it gets that absorbed into the superproject's git directory
    * (`absorb_git_dir_into_superproject`); its `Migrating ...` lines go to `messages`. Where
-   * git dies there, {@link SubmoduleCommandError} is thrown before anything is removed.
+   * git dies there, an {@link RmFailedError} (exit 128, git's last line as its message) is
+   * thrown before anything is removed, its result's `messages` holding every line printed
+   * before, an earlier submodule's too.
    */
   private async absorbSubmoduleGitDirs(
     entries: IndexEntry[],
@@ -558,8 +565,13 @@ export class RmCommand extends GitCommand<RmResult> {
         const result = await absorb.callForPath(entry.path);
         messages.push(...linesOf(result.stderr));
       } catch (error) {
-        if (error instanceof SubmoduleCommandError) messages.push(...linesOf(error.result.stderr));
-        throw error;
+        if (!(error instanceof SubmoduleCommandError)) throw error;
+        messages.push(...linesOf(error.result.stderr));
+        throw new RmFailedError(error.message, [], {
+          removedPaths: [],
+          output: [],
+          messages: [...messages],
+        } satisfies RmResult).withExitCode(128);
       }
     }
   }

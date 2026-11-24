@@ -10,9 +10,14 @@ nested submodules (git's `absorb_git_dir_into_superproject` and its child run pe
 rewrites a nested gitfile that no longer names a repository. The move runs first and its result
 is checked (`relocate_gitdir`), so a failure leaves the repository where git can still read it;
 git's deaths (`could not lookup name`, more than one worktree, broken gitfiles, symlinked paths)
-are reproduced. `submodule deinit` and `git rm` share this code: deinit now absorbs nested
+are reproduced, git's errno included (`could not migrate git directory ...: Directory not empty`).
+Symbolic links are followed as git's `stat` follows them: a linked `.git/modules` and a `.git`
+linked to a repository are migrated where they lead (`physicalFilesPath` resolves them through
+the FilesApi's `lstat`/`readlink`); a link leading beyond the FilesApi is refused with git's
+`could not create directory` line, nothing moved. `submodule deinit` and `git rm` share this code: deinit now absorbs nested
 submodules too, and `git rm` of a submodule holding a `.git` directory absorbs it before removing
-it (`RmResult.messages` carries the `Migrating ...` lines), as git does. `modules/` is now looked
+it (`RmResult.messages` carries the `Migrating ...` lines, also in the result of an
+`RmFailedError` raised afterwards; a failed absorb is an `RmFailedError` with exit 128), as git does. `modules/` is now looked
 up in the worktree's own git directory (a linked worktree's `worktrees/<id>/modules/`), as git
 keeps it per worktree.
 

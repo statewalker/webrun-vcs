@@ -12,6 +12,7 @@
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdtempSync,
@@ -19,6 +20,7 @@ import {
   readFileSync,
   readlinkSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,7 +32,13 @@ import {
 } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { Git, SubmoduleCommandError, type SubmoduleCommandResult } from "../src/index.js";
+import {
+  Git,
+  RmFailedError,
+  type RmResult,
+  SubmoduleCommandError,
+  type SubmoduleCommandResult,
+} from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
@@ -131,6 +139,16 @@ async function ours(dir: string): Promise<Git> {
   return openOurs(dir, environment, undefined, "", true);
 }
 
+/** Our working copy of `<twin>/<sub>`, its FilesApi rooted at the twin. */
+async function oursWide(twin: string, sub: string): Promise<Git> {
+  const env = testEnv(root);
+  const environment = createNodeGitHostEnvironment({
+    env,
+    hookRunner: createNodeHookRunner({ env, compatibility }),
+  });
+  return openOurs(twin, environment, undefined, sub, true);
+}
+
 /** Our command's outcome in native git's shape (a death's lines on stderr). */
 async function oursRun(
   run: () => Promise<SubmoduleCommandResult>,
@@ -151,24 +169,48 @@ async function oursRun(
 
 type Step = [args: string[], run: (git: Git) => Promise<SubmoduleCommandResult>];
 
-/** What native git reads in a twin: status, each submodule's HEAD, fsck of each. */
+/**
+ * What native git reads in a twin: status and fsck of the superproject, each submodule's
+ * HEAD, git directory, fsck and status, then fsck of every repository under the git
+ * directory's `modules/` on its own (worktree or not), each fsck's exit status as `fsck=<n>`.
+ */
 function readBack(dir: string, twin: string): string {
   return sh(
     dir,
     `{ git status --porcelain=v1 --ignore-submodules=none
-git submodule foreach -q --recursive 'git rev-parse HEAD; git rev-parse --git-dir; git fsck -q 2>&1; git status --porcelain=v1'
+git fsck --no-progress 2>&1; echo "fsck=$?"
+git submodule foreach -q --recursive 'git rev-parse HEAD; git rev-parse --git-dir; git fsck --no-progress 2>&1; echo "fsck=$?"; git status --porcelain=v1'
+for m in $(find -L "$(git rev-parse --git-dir)/modules" -name HEAD -type f 2>/dev/null | sort); do
+  d=$(dirname "$m"); [ -d "$d/objects" ] || continue
+  echo "module $d"; GIT_DIR="$d" GIT_WORK_TREE="$d" git fsck --no-progress 2>&1; echo "fsck=$?"
+done
 } 2>&1 || echo "exit $?"`,
   )
     .split(twin)
     .join("<T>");
 }
 
+/** The `fsck=<n>` lines of a {@link readBack} that report a failure. */
+const fsckFailures = (text: string) => text.split("\n").filter((l) => /^fsck=[1-9]/.test(l));
+
 /** Runs each step in both twins (in `sub` of each), comparing outputs and states. */
-async function expectTwins(t: { native: string; ours: string }, steps: Step[], sub = "sup") {
+async function expectTwins(
+  t: { native: string; ours: string },
+  steps: Step[],
+  sub = "sup",
+  options: {
+    /** Native fsck may fail (a broken submodule the scenario made) */
+    fsckFails?: boolean;
+    /** Our FilesApi rooted at the twin, above `sub` (links leading beside the superproject) */
+    wide?: boolean;
+  } = {},
+) {
   for (const [args, run] of steps) {
     const label = `git submodule ${args.join(" ")}`;
     const n = nativeRun(join(t.native, sub), args);
-    const o = await oursRun(async () => run(await ours(join(t.ours, sub))));
+    const o = await oursRun(async () =>
+      run(options.wide ? await oursWide(t.ours, sub) : await ours(join(t.ours, sub))),
+    );
     const norm = (r: SubmoduleCommandResult, twin: string) => ({
       stdout: r.stdout.split(twin).join("<T>"),
       stderr: r.stderr.split(twin).join("<T>"),
@@ -178,9 +220,12 @@ async function expectTwins(t: { native: string; ours: string }, steps: Step[], s
     expect(snapshot(join(t.ours, sub), t.ours), label).toEqual(
       snapshot(join(t.native, sub), t.native),
     );
-    expect(readBack(join(t.ours, sub), t.ours), label).toEqual(
-      readBack(join(t.native, sub), t.native),
-    );
+    if (options.wide) {
+      expect(snapshot(t.ours, t.ours), label).toEqual(snapshot(t.native, t.native));
+    }
+    const back = readBack(join(t.native, sub), t.native);
+    expect(readBack(join(t.ours, sub), t.ours), label).toEqual(back);
+    if (!options.fsckFails) expect(fsckFailures(back), label).toEqual([]);
   }
 }
 
@@ -306,7 +351,12 @@ git init -q -b main sub4; (cd sub4; echo s > s.t; git add s.t; git commit -qm s)
 git submodule add -q ./sub4; git commit -qm sub4
 rm -rf sub4/.git; mkdir sub4/.git
 `);
-    await expectTwins(t, [absorb(["sub2"]), absorb(["sub3"]), absorb(["sub4"]), absorb(["sub1"])]);
+    await expectTwins(
+      t,
+      [absorb(["sub2"]), absorb(["sub3"]), absorb(["sub4"]), absorb(["sub1"])],
+      "sup",
+      { fsckFails: true },
+    );
   });
 
   it('t7412-submodule-absorbgitdirs.sh: "absorb the git dir outside of primary worktree"', async () => {
@@ -411,6 +461,46 @@ git submodule absorbgitdirs 2>/dev/null
     }
   });
 
+  it("git rm keeps the Migrating lines when it fails after absorbing", async () => {
+    const cases: [string, string[]][] = [
+      // check_local_mod refuses after sub1 was absorbed
+      [`${SETUP}echo changed > sub1/first.t\n`, ["sub1"]],
+      // a later submodule's absorb dies after sub1's moved
+      [
+        `${SETUP}
+git init -q -b main sub2; (cd sub2; echo s > s.t; git add s.t; git commit -qm s)
+git add sub2 2>/dev/null; git commit -qm sub2
+`,
+        ["sub1", "sub2"],
+      ],
+    ];
+    for (const [script, paths] of cases) {
+      const t = twins(script);
+      const args = ["rm", "-q", ...paths];
+      const r = spawnSync("git", args, { cwd: join(t.native, "sup"), env: testEnv(root) });
+      const git = await ours(join(t.ours, "sup"));
+      const rm = git.rm().setQuiet(true);
+      for (const p of paths) rm.addFilepattern(p);
+      const error = await rm.call().then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      const label = args.join(" ");
+      expect(error, label).toBeInstanceOf(RmFailedError);
+      const failed = error as RmFailedError<RmResult>;
+      const stderr = [...(failed.result?.messages ?? []), failed.message]
+        .map((l) => `${l}\n`)
+        .join("");
+      expect(stderr.split(t.ours).join("<T>"), label).toEqual(
+        r.stderr.toString("latin1").split(t.native).join("<T>"),
+      );
+      expect(failed.exitCode, label).toBe(r.status);
+      expect(snapshot(join(t.ours, "sup"), t.ours), label).toEqual(
+        snapshot(join(t.native, "sup"), t.native),
+      );
+    }
+  });
+
   it.runIf(hasPathConfig)(
     "absorbs into submodule.<name>.gitdir under extensions.submodulePathConfig",
     async () => {
@@ -426,6 +516,70 @@ git config submodule.sub1.gitdir .git/modules/sub1-moved
       await expectTwins(t, [absorb()]);
     },
   );
+
+  it("readBack's fsck catches a corrupt object in an absorbed submodule", async () => {
+    const t = twins(SETUP);
+    await expectTwins(t, [absorb()]);
+    const objects = join(t.ours, "sup", ".git", "modules", "sub1", "objects");
+    const dir = readdirSync(objects).find((n) => /^[0-9a-f]{2}$/.test(n)) as string;
+    const file = join(objects, dir, readdirSync(join(objects, dir))[0] as string);
+    chmodSync(file, 0o644);
+    writeFileSync(file, "corrupt");
+    expect(fsckFailures(readBack(join(t.ours, "sup"), t.ours)).length).toBeGreaterThan(0);
+  });
+
+  it("reports git's errno when the move is refused (a non-empty directory in the way)", async () => {
+    const t = twins(`${SETUP}
+mkdir -p .git/modules/sub1; echo x > .git/modules/sub1/junk
+`);
+    await expectTwins(t, [absorb()]);
+  });
+
+  it("follows a symbolic link at .git/modules, as git's stat does", async () => {
+    const t = twins(`${SETUP}
+mkdir ../outside; ln -s ../../outside .git/modules
+`);
+    await expectTwins(t, [absorb()], "sup", { wide: true });
+  });
+
+  it("refuses a .git/modules link leading beyond the FilesApi, moving nothing", async () => {
+    const t = twins(`${SETUP}
+mkdir ../outside; ln -s ../../outside .git/modules
+`);
+    const o = await oursRun(async () =>
+      (await ours(join(t.ours, "sup"))).submoduleAbsorbGitDirs().call(),
+    );
+    expect(o.exitCode).toBe(128);
+    expect(o.stderr).toBe("fatal: could not create directory '.git/modules/sub1'\n");
+    expect(lstatSync(join(t.ours, "sup", "sub1", ".git")).isDirectory()).toBe(true);
+    expect(readBack(join(t.ours, "sup"), t.ours)).toEqual(
+      readBack(join(t.native, "sup"), t.native),
+    );
+  });
+
+  it("migrates a .git that is a symbolic link to a repository, as git's stat does", async () => {
+    const t = twins(`${SETUP}
+mv sub1/.git ../out.git; ln -s ../../out.git sub1/.git
+`);
+    await expectTwins(t, [absorb()], "sup", { wide: true });
+  });
+
+  it("deinit -f absorbs a .git linked to a repository first", async () => {
+    const t = twins(`${SETUP}
+mv sub1/.git ../out.git; ln -s ../../out.git sub1/.git
+`);
+    await expectTwins(
+      t,
+      [
+        [
+          ["deinit", "-f", "sub1"],
+          (g) => g.submoduleDeinit().setForce(true).addPath("sub1").call(),
+        ],
+      ],
+      "sup",
+      { wide: true },
+    );
+  });
 
   it("dies before changing anything when the move fails (FilesApi.move returning false)", async () => {
     const t = twins(SETUP);

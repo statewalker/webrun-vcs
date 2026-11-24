@@ -23,7 +23,7 @@ import {
   readRepositoryFormat,
 } from "@statewalker/vcs-store-files";
 import { parseGitBool } from "@statewalker/vcs-utils";
-import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
+import type { FilesApi, PosixFilesApi } from "@statewalker/vcs-utils/files";
 import { collectChunks, type WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { GitApiError, InvalidConfigError } from "../errors/index.js";
@@ -606,6 +606,52 @@ export async function submodulePathConfigOf(workingCopy: WorkingCopy): Promise<b
   const gitDir = config.path.slice(0, Math.max(0, config.path.lastIndexOf("/")));
   const format = await readRepositoryFormat(config.files, gitDir).catch(() => undefined);
   return format?.submodulePathConfig ?? false;
+}
+
+/**
+ * A FilesApi path with every symbolic link on it followed, as `realpath(3)` resolves a host
+ * path (the last component too, a dangling link to where it points), through the FilesApi's
+ * `lstat`/`readlink`: the physical path the FilesApi can then act on, since it never acts
+ * through a link itself. Undefined where a link leads beyond the FilesApi's root (`..` above
+ * it, an absolute target outside its `rootDirectory`) or more than 40 links are met (ELOOP).
+ * Without `lstat`/`readlink` the path is returned as it is.
+ */
+export async function physicalFilesPath(
+  files: FilesApi,
+  path: string,
+): Promise<string | undefined> {
+  const posix = files as PosixFilesApi;
+  if (!posix.lstat || !posix.readlink) return joinFilesPath("", path);
+  const root = (files as { rootDirectory?: string }).rootDirectory?.replace(/\/+$/, "");
+  const done: string[] = [];
+  const pending = path.split("/");
+  let links = 0;
+  while (pending.length > 0) {
+    const part = pending.shift() as string;
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (done.length === 0) return undefined;
+      done.pop();
+      continue;
+    }
+    const candidate = [...done, part].join("/");
+    const st = await posix.lstat(candidate).catch(() => undefined);
+    if (st?.kind !== "symlink") {
+      done.push(part);
+      continue;
+    }
+    if (++links > 40) return undefined;
+    const bytes = await posix.readlink(candidate).catch(() => undefined);
+    if (!bytes) return undefined;
+    const target = new TextDecoder().decode(bytes);
+    if (target.startsWith("/")) {
+      if (root === undefined) return undefined;
+      if (root !== "" && target !== root && !target.startsWith(`${root}/`)) return undefined;
+      done.length = 0;
+      pending.unshift(...target.slice(root.length).split("/"));
+    } else pending.unshift(...target.split("/"));
+  }
+  return done.join("/");
 }
 
 /** `path` joined to `base` with `.` and `..` resolved (FilesApi paths). */

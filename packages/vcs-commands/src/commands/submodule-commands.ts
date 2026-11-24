@@ -10,7 +10,7 @@ import { FileMode, type ObjectId } from "@statewalker/vcs-core";
 import { isGitDirectory } from "@statewalker/vcs-store-files";
 import type { GitTransportRegistry } from "@statewalker/vcs-transport";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
-import { type FilesApi, readFile } from "@statewalker/vcs-utils/files";
+import { type FilesApi, type PosixFilesApi, readFile } from "@statewalker/vcs-utils/files";
 import { computeObjectId } from "@statewalker/vcs-utils/pack";
 import type { GitHostEnvironment, WorkingCopy } from "@statewalker/vcs-working-tree";
 
@@ -32,6 +32,7 @@ import {
   defaultRemoteOf,
   isRelativeSubmoduleUrl,
   joinFilesPath,
+  physicalFilesPath,
   relativeFilesPath,
   remoteFromUrl,
   resolveRelativeUrl,
@@ -126,7 +127,10 @@ export function shellQuote(text: string): string {
 
 /** Where `<path>/.git` leads (setup.c's `resolve_gitdir_gently`). */
 interface ResolvedGitdir {
-  /** The repository directory; null when a gitfile names a place beyond the FilesApi */
+  /**
+   * The repository directory as a physical FilesApi path (links followed); null when a gitfile
+   * or a `.git` link leads beyond the FilesApi
+   */
   gitDir: string | null;
   kind: "directory" | "gitfile";
 }
@@ -141,6 +145,32 @@ type GitfileError =
   | "invalid-format"
   | "no-path"
   | "not-a-repo";
+
+/** The kind of the entry itself at `path` (a link as `symlink`), where the FilesApi tells it. */
+async function lstatKind(files: FilesApi, path: string): Promise<string | undefined> {
+  const posix = files as PosixFilesApi;
+  if (posix.lstat) return (await posix.lstat(path).catch(() => undefined))?.kind;
+  return (await files.stats(path).catch(() => undefined))?.kind;
+}
+
+/**
+ * The `strerror` text of a `rename(2)` of the directory `source` onto `target` that failed
+ * (the FilesApi's `move` answers false without the errno): what is in the way, else what is
+ * missing, else a refusal.
+ */
+async function renameFailure(
+  files: FilesApi,
+  source: string | null,
+  target: string,
+): Promise<string> {
+  if (source === null) return "Permission denied";
+  const there = await files.stats(target).catch(() => undefined);
+  if (there?.kind === "directory") {
+    for await (const _ of files.list(target)) return "Directory not empty";
+  } else if (there) return "Not a directory";
+  if (!(await files.stats(source).catch(() => undefined))) return "No such file or directory";
+  return "Permission denied";
+}
 
 /** Whether resolving the `..` components of a FilesApi path climbs above its root. */
 function climbsAboveRoot(path: string): boolean {
@@ -275,6 +305,15 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
   protected async kindOf(path: string): Promise<string | undefined> {
     const files = this.worktreeAccess?.getFiles?.();
     return (await files?.stats(this.filesPath(path)).catch(() => undefined))?.kind;
+  }
+
+  /** git's `stat(2)` kind of a worktree path: symbolic links on the way followed. */
+  protected async kindThroughLinks(path: string): Promise<string | undefined> {
+    const files = this.worktreeAccess?.getFiles?.();
+    if (!files) return undefined;
+    const physical = await physicalFilesPath(files, this.filesPath(path)).catch(() => undefined);
+    if (physical === undefined) return undefined;
+    return (await files.stats(physical).catch(() => undefined))?.kind;
   }
 
   /** git's `config_set_in_gitmodules_file_gently` (`value` undefined unsets). */
@@ -565,13 +604,13 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
       const gitDir = await this.submoduleGitDir(sub.name, path);
       if (gitDir === undefined) return;
       await this.connectWorkTreeAndGitDir(path, gitDir);
-    } else if (state.gitDir === null) {
+    } else if (state.gitDir === null && state.kind === "gitfile") {
       // its repository lies beyond this FilesApi: nothing to move, nothing reachable to recurse
       return;
     } else {
       // already absorbed into the superproject's git directory? (a string prefix, as git's)
       const common = await commonGitFileOf(this.workingCopy, "");
-      const realSub = await this.realHostPath(state.gitDir);
+      const realSub = await this.realHostPath(state.gitDir ?? this.filesPath(`${path}/.git`));
       const realCommon = common ? await this.realHostPath(common.path) : undefined;
       if (realCommon === undefined || !realSub.startsWith(realCommon)) {
         await this.relocateSingleGitDir(path, state);
@@ -596,29 +635,36 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
       );
     }
     if (state.kind === "gitfile") return;
-    const source = this.filesPath(`${path}/.git`);
-    const from = await this.realHostPath(source);
+    // the `.git` directory, a link to one followed (git's real_pathdup): state.gitDir is the
+    // physical place, null when a link leads beyond this FilesApi
+    const source = state.gitDir;
+    const from = await this.realHostPath(this.filesPath(`${path}/.git`));
     const sub = (await this.model()).fromPath(path);
     if (!sub) this.die(`fatal: could not lookup name for submodule '${path}'`);
     const target = await this.submoduleGitDir(sub.name, path, from);
     if (target === undefined) return;
-    const parent = target.slice(0, Math.max(0, target.lastIndexOf("/")));
-    if (
-      parent &&
-      !(await files.mkdir(parent).then(
+    // safe_create_leading_directories, through links (a linked `.git/modules`) as git's
+    const physical = await physicalFilesPath(files, target);
+    const parent = physical?.slice(0, Math.max(0, physical.lastIndexOf("/")));
+    const made =
+      !parent ||
+      (await files.mkdir(parent).then(
         () => true,
         () => false,
-      ))
-    ) {
+      ));
+    if (physical === undefined || !made) {
       this.die(`fatal: could not create directory '${(await this.model()).shownPath(target)}'`);
     }
     const to = await this.realHostPath(target);
     this.out.stderr += `Migrating git directory of '${this.superPrefix}${path}' from\n'${from}' to\n'${to}'\n`;
-    // relocate_gitdir: nothing else is changed unless the rename succeeded
-    if (!(await files.move(source, target).catch(() => false))) {
-      this.die(`fatal: could not migrate git directory from '${from}' to '${to}'`);
+    // relocate_gitdir: nothing else is changed unless the rename succeeded (the source's data
+    // is never removed: a failed move leaves it where it was)
+    const moved = source !== null && (await files.move(source, physical).catch(() => false));
+    if (!moved) {
+      const reason = await renameFailure(files, source, physical);
+      this.die(`fatal: could not migrate git directory from '${from}' to '${to}': ${reason}`);
     }
-    await this.connectWorkTreeAndGitDir(path, target);
+    await this.connectWorkTreeAndGitDir(path, physical);
   }
 
   /** `submodule_name_to_gitdir`, its deaths (and 2.43's refusal to move) as git's. */
@@ -650,35 +696,47 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
   protected async connectWorkTreeAndGitDir(path: string, gitDir: string): Promise<void> {
     const files = this.worktreeAccess?.getFiles?.();
     if (!files) return;
-    const workTree = this.filesPath(path);
-    await files.mkdir(gitDir).catch(() => undefined);
     const gitfile = `${path}/.git`;
-    const relative = relativeFilesPath(workTree, gitDir);
+    // both sides as their real paths name them (git's real_pathdup): links followed
+    const realGitDir = await physicalFilesPath(files, gitDir);
+    const workTree = (await physicalFilesPath(files, this.filesPath(path))) ?? this.filesPath(path);
+    // write_file opens `<path>/.git` following a link there (to where the link points)
+    const at = await physicalFilesPath(files, this.filesPath(gitfile));
+    if (realGitDir === undefined || at === undefined) {
+      this.die(`fatal: could not open '${gitfile}' for writing: Permission denied`);
+    }
+    await files.mkdir(realGitDir).catch(() => undefined);
+    const relative = relativeFilesPath(workTree, realGitDir);
     // never written over a directory (git's open fails there: EISDIR)
-    if ((await this.kindOf(gitfile)) === "directory") {
+    if ((await files.stats(at).catch(() => undefined))?.kind === "directory") {
       this.die(`fatal: could not open '${gitfile}' for writing: Is a directory`);
     }
-    const written = await files
-      .write(this.filesPath(gitfile), [new TextEncoder().encode(`gitdir: ${relative}\n`)])
-      .then(
-        () => true,
-        () => false,
-      );
+    const written = await files.write(at, [new TextEncoder().encode(`gitdir: ${relative}\n`)]).then(
+      () => true,
+      () => false,
+    );
     if (!written) this.die(`fatal: could not open '${gitfile}' for writing: Permission denied`);
+    const worktreeValue = relativeFilesPath(realGitDir, workTree);
     const set = await setInConfigFile(
       this.workingCopy,
-      `${gitDir}/config`,
+      `${realGitDir}/config`,
       "core.worktree",
-      relativeFilesPath(gitDir, workTree),
+      worktreeValue,
     ).catch(() => false);
-    if (!set)
-      this.die(`fatal: could not set 'core.worktree' to '${relativeFilesPath(gitDir, workTree)}'`);
+    if (!set) this.die(`fatal: could not set 'core.worktree' to '${worktreeValue}'`);
   }
 
   /** git's child `submodule--helper absorbgitdirs --super-prefix=<prefix><path>/` there. */
   private async absorbNested(path: string): Promise<void> {
     await this.validatePath(path);
-    const inner = await this.openSubmodule(path);
+    // a `.git` link git follows to the repository the gitfile now names: opened from
+    // `modules/<name>` where the worktree cannot read through the link
+    const name = (await this.model()).fromPath(path)?.name;
+    const inner =
+      (await this.openSubmodule(path)) ??
+      (name === undefined
+        ? undefined
+        : await this.worktreeAccess?.openGitlink?.(path, { name }).catch(() => undefined));
     if (!inner) this.die(`fatal: could not recurse into submodule '${path}'`);
     const child = new SubmoduleAbsorbGitDirsCommand(inner)
       .setCompatibility(this.compatibility)
@@ -704,18 +762,28 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
     const files = this.worktreeAccess?.getFiles?.();
     if (!files) return { error: "missing" };
     const dotGit = this.filesPath(`${path}/.git`);
-    const st = await files.stats(dotGit).catch(() => undefined);
+    // stat(2), not lstat: a `.git` link is followed to what it names (physically, since the
+    // FilesApi never acts through a link)
+    let at: string | undefined = dotGit;
+    if ((await lstatKind(files, dotGit)) === "symlink") {
+      at = await physicalFilesPath(files, dotGit);
+      if (at === undefined) {
+        // beyond this FilesApi: git would read (and move) it; refused at the move
+        return { gitDir: null, kind: "directory" };
+      }
+    }
+    const st = await files.stats(at).catch(() => undefined);
     if (!st) return { error: "missing" };
     if (st.kind === "directory") {
-      return (await isGitDirectory(files, dotGit))
-        ? { gitDir: dotGit, kind: "directory" }
+      return (await isGitDirectory(files, at))
+        ? { gitDir: at, kind: "directory" }
         : { error: "is-a-dir" };
     }
     if (st.kind !== "file") return { error: "not-a-file" };
     if ((st.size ?? 0) > 1 << 20) return { error: "too-large" };
     let text: string;
     try {
-      text = decodeGitPath(await readFile(files, dotGit));
+      text = decodeGitPath(await readFile(files, at));
     } catch {
       return { error: "read-failed" };
     }
@@ -733,6 +801,7 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
     } else if (!climbsAboveRoot(`${this.filesPath(path)}/${target}`)) {
       resolved = joinFilesPath(this.filesPath(path), target);
     }
+    if (resolved !== undefined) resolved = await physicalFilesPath(files, resolved);
     // a place beyond this FilesApi: a repository git would find, which it would not move
     if (resolved === undefined) return { gitDir: null, kind: "gitfile" };
     if (!(await isGitDirectory(files, resolved))) return { error: "not-a-repo" };
@@ -941,7 +1010,7 @@ export class SubmoduleDeinitCommand extends SubmoduleCommandBase {
     const files = this.worktreeAccess?.getFiles?.();
     if (!files) return;
     if ((await this.kindOf(path)) === "directory") {
-      if ((await this.kindOf(`${path}/.git`)) === "directory") {
+      if ((await this.kindThroughLinks(`${path}/.git`)) === "directory") {
         if (!this.quiet) {
           this.out.stderr += `warning: Submodule work tree '${dp}' contains a .git directory. This will be replaced with a .git file by using absorbgitdirs.\n`;
         }
