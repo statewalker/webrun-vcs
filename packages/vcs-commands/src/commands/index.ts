@@ -60,6 +60,12 @@ export {
   type MergeDriverResult,
   mergeDriversOf,
 } from "./merge-drivers.js";
+export {
+  applyStrategyOption,
+  type MergeStrategyOptions,
+  parseStrategyOptions,
+  UnknownStrategyOptionError,
+} from "./merge-strategy-options.js";
 export { CleanupMode, stripspace } from "./message-cleanup.js";
 export * from "./mv-command.js";
 export * from "./name-rev-command.js";

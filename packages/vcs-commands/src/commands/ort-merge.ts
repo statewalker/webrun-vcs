@@ -82,6 +82,17 @@ export interface OrtMergeOptions {
   ignoreCase?: boolean;
   /** Detect renames (default true) */
   renames?: boolean;
+  /** The rename score (`-X find-renames=<n>`, 0..60000; default 50%) */
+  renameScore?: number;
+  /** The diff algorithm of content merges (`-X diff-algorithm=`; default histogram) */
+  algorithm?: "myers" | "minimal" | "patience" | "histogram";
+  /** xdiff's whitespace bits of content merges (`-X ignore-space-change`, ...) */
+  whitespace?: number;
+  /**
+   * `-s subtree` (`""`) / `-X subtree=<path>`: their tree and the base shifted to ours' shape
+   * before the merge (applied by `mergeStoredTrees`, merge_ort_nonrecursive_internal)
+   */
+  subtreeShift?: string;
   /** merge.directoryRenames (default `conflict`, as git) */
   directoryRenames?: DirectoryRenames;
   /** merge.renameLimit (default 7000, as merge-ort) */
@@ -774,6 +785,7 @@ class OrtMerge {
       {
         renameEmpty: false,
         renameLimit: this.options.renameLimit ?? 7000,
+        ...(this.options.renameScore ? { minimumScore: this.options.renameScore } : {}),
         load: (c) => readBlob(this.blobs, c.id),
         prefetch: async (wanted) => {
           await this.blobs.prefetch?.(
@@ -1252,6 +1264,8 @@ class OrtMerge {
         virtualAncestor: this.depth > 0,
         ...(this.options.favor ? { favor: this.options.favor } : {}),
         ...(this.options.style ? { style: this.options.style } : {}),
+        ...(this.options.algorithm ? { algorithm: this.options.algorithm } : {}),
+        ...(this.options.whitespace ? { whitespace: this.options.whitespace } : {}),
         extraMarkerSize,
         ...(this.options.bigFileThreshold !== undefined
           ? { bigFileThreshold: this.options.bigFileThreshold }
