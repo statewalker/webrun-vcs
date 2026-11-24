@@ -31,6 +31,7 @@ import {
   DiffCommand,
   EditBranchDescriptionCommand,
   FetchCommand,
+  FmtMergeMsgCommand,
   ForEachRefCommand,
   FormatPatchCommand,
   FsckCommand,
@@ -829,6 +830,22 @@ export class Git implements Disposable {
   }
 
   /**
+   * Create a FmtMergeMsgCommand that writes the message of a merge (`git fmt-merge-msg`),
+   * from FETCH_HEAD-style lines or the heads `git merge` would be given, with the `merge.*`
+   * configuration (`merge.log`, `merge.suppressDest`, `merge.branchdesc`).
+   *
+   * @example
+   * ```typescript
+   * await git.fmtMergeMsg().addHead("feature").setLog(true).call();
+   * // "Merge branch 'feature'\n\n* feature:\n  Add the parser\n"
+   * ```
+   */
+  fmtMergeMsg(): FmtMergeMsgCommand {
+    this.checkClosed();
+    return new FmtMergeMsgCommand(this._workingCopy);
+  }
+
+  /**
    * Create an InterpretTrailersCommand that adds or parses the trailers of a message
    * (`git interpret-trailers`), with the `trailer.*` configuration.
    *
@@ -1171,7 +1188,7 @@ export class Git implements Disposable {
    */
   remoteAdd(): RemoteAddCommand {
     this.checkClosed();
-    return new RemoteAddCommand(this._workingCopy);
+    return this.withTransports(new RemoteAddCommand(this._workingCopy));
   }
 
   /**

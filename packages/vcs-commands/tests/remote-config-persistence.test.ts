@@ -169,27 +169,26 @@ describe.each(backends)("Remote config persistence ($name backend)", ({ factory 
       const reopened = await open(files);
       await expect(
         reopened.git.remoteAdd().setName("origin").setUri("https://example.com/b.git").call(),
-      ).rejects.toThrow("Remote 'origin' already exists");
+      ).rejects.toThrow("error: remote origin already exists.");
 
       // ...and the rejected URL was not written.
       const config = await openConfig(files);
       expect(config.getAll("remote.origin.url")).toEqual(["https://example.com/a.git"]);
     });
 
-    it("rejects a duplicate known only from tracking refs, with no config", async () => {
+    it("adds a remote known only from tracking refs, as git (remote_is_configured)", async () => {
       const files = new MemoryConfigFiles();
       const { git, workingCopy } = await open(files);
 
-      // `mirror` was never added: it exists only because something fetched
-      // into its tracking refs. `remoteList` reports it, so `remoteAdd` must
-      // agree that it is already there. (Native git checks config only and
-      // would allow this; we keep the two halves of discovery consistent.)
+      // `mirror` was never added: it has tracking refs only, which git's `remote add`
+      // does not count as a remote
       await workingCopy.history.refs.set("refs/remotes/mirror/main", "a".repeat(40));
       expect((await openConfig(files)).subsections("remote")).toEqual([]);
 
-      await expect(
-        git.remoteAdd().setName("mirror").setUri("https://example.com/mirror.git").call(),
-      ).rejects.toThrow("Remote 'mirror' already exists");
+      await git.remoteAdd().setName("mirror").setUri("https://example.com/mirror.git").call();
+      expect((await openConfig(files)).getAll("remote.mirror.url")).toEqual([
+        "https://example.com/mirror.git",
+      ]);
     });
   });
 
@@ -327,21 +326,21 @@ describe.each(backends)("Remote config persistence ($name backend)", ({ factory 
       expect(config.getAll("remote.origin.url")).toEqual(["https://example.com/fetch.git"]);
     });
 
-    it("configures a remote that was known only from tracking refs", async () => {
+    it("refuses a remote known only from tracking refs, as git (No such remote)", async () => {
       const files = new MemoryConfigFiles();
       const { git, workingCopy } = await open(files);
 
       await workingCopy.history.refs.set("refs/remotes/mirror/main", "a".repeat(40));
 
-      const result = await git
-        .remoteSetUrl()
-        .setRemoteName("mirror")
-        .setRemoteUri("https://example.com/mirror.git")
-        .call();
-
-      expect(result.urls).toEqual(["https://example.com/mirror.git"]);
+      await expect(
+        git
+          .remoteSetUrl()
+          .setRemoteName("mirror")
+          .setRemoteUri("https://example.com/mirror.git")
+          .call(),
+      ).rejects.toThrow("error: No such remote 'mirror'");
       const config = await openConfig(files);
-      expect(config.getAll("remote.mirror.url")).toEqual(["https://example.com/mirror.git"]);
+      expect(config.getAll("remote.mirror.url")).toEqual([]);
     });
 
     it("replaces only the URL given to setOldUri", async () => {
@@ -603,7 +602,7 @@ describe.each(backends)("Remote config without a config file ($name backend)", (
         .setName("origin")
         .setUri("https://example.com/b.git")
         .call(),
-    ).rejects.toThrow("Remote 'origin' already exists");
+    ).rejects.toThrow("error: remote origin already exists.");
   });
 
   it("removes an added remote, leaving its neighbour alone", async () => {
