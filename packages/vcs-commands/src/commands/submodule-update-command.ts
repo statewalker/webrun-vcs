@@ -12,7 +12,7 @@ import {
   type GitTransportRegistry,
 } from "@statewalker/vcs-transport";
 import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
-import type { WorkingCopy } from "@statewalker/vcs-working-tree";
+import { type WorkingCopy, wildmatch } from "@statewalker/vcs-working-tree";
 
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
@@ -25,7 +25,7 @@ import { createDescriber } from "./git-describe.js";
 import { gitFileOf, hookRunnerOf } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { MergeCommand } from "./merge-command.js";
-import { nameRevByTags } from "./name-rev.js";
+import { commitLoaderOf, nameRevByTags, withShallowParents } from "./name-rev.js";
 import { RebaseCommand } from "./rebase-command.js";
 import {
   type CredentialsForUrl,
@@ -128,7 +128,7 @@ class SubmoduleRepository extends GitCommand<never> {
     const source = {
       refs: this.refsStore,
       ...(tags ? { tags } : {}),
-      commits: this.commits,
+      commits: withShallowParents(this.commits, () => this.shallowCommits()),
     };
     const describe = createDescriber({
       ...source,
@@ -142,7 +142,19 @@ class SubmoduleRepository extends GitCommand<never> {
     if (plain) return plain;
     const lightweight = await describe(id, { tags: true }).catch(() => "");
     if (lightweight) return lightweight;
-    const contains = await nameRevByTags(source, id).catch(() => undefined);
+    const resolver = this.revisionResolver();
+    const contains = await nameRevByTags(
+      {
+        refs: this.refsStore,
+        objectType: (oid) => resolver.objectType(oid),
+        loadTag: async (oid) => tags?.load(oid),
+        loadCommit: commitLoaderOf(this.walkCommits, () => this.shallowCommits()),
+        refExists: (name) => this.refsStore.has(name).catch(() => false),
+        abbreviate: (oid) => this.abbreviateObjectId(oid),
+        wildmatch: (pattern, text) => wildmatch(pattern, text),
+      },
+      id,
+    ).catch(() => undefined);
     if (contains) return contains;
     return (await describe(id, { all: true, always: true }).catch(() => "")) || undefined;
   }
