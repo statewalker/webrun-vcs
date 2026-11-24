@@ -315,10 +315,7 @@ describe.skipIf(!exe)("compilePosixRegex against glibc", () => {
           newline: c.flags.includes("n"),
         });
         const subject = Buffer.from(c.s, "latin1");
-        // the subject folded once by the caller matches as the pattern folds it
-        const m = c.flags.includes("i")
-          ? re.exec(re.fold(subject), undefined, 2, { notbol: true, folded: true })
-          : re.exec(subject, undefined, 2, { notbol: true });
+        const m = re.exec(subject, undefined, 2, true);
         ours = m ? `${m.start} ${m.end} ${m.groups[0]?.[0] ?? -1} ${m.groups[0]?.[1] ?? -1}` : "NO";
       } catch (e) {
         if (!(e instanceof PosixRegexError)) throw e;

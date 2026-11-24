@@ -64,21 +64,6 @@ export interface PosixMatch {
   groups: ([number, number] | undefined)[];
 }
 
-/** `regexec`'s flags */
-export interface PosixExecFlags {
-  /**
-   * `REG_NOTBOL`: the subject does not start a line, so `^` never matches at its start (it
-   * still matches after a newline under `REG_NEWLINE`); the byte before the subject stays
-   * unseen, as glibc's
-   */
-  notbol?: boolean;
-  /**
-   * The subject is already folded as {@link PosixRegex.fold} folds it: a caller matching
-   * one buffer many times (a loop over its matches) folds it once instead of on every call
-   */
-  folded?: boolean;
-}
-
 /** A compiled pattern */
 export interface PosixRegex {
   /** Number of subexpressions (`re_nsub`) */
@@ -86,20 +71,18 @@ export interface PosixRegex {
   /**
    * The match in `subject[0, end)`, or undefined. `groups` holds at most `nmatch - 1`
    * subexpressions (default all); with `nmatch` 1 they are not placed at all (faster).
+   * `notbol` is `REG_NOTBOL`: the subject's start is no line start (`^` does not match
+   * there, unless `newline` and a newline precedes), as git passes it when it searches the
+   * rest of a line after a match.
    */
   exec(
     subject: Uint8Array,
     end?: number,
     nmatch?: number,
-    flags?: PosixExecFlags,
+    notbol?: boolean,
   ): PosixMatch | undefined;
   /** Whether `subject[0, end)` matches */
-  test(subject: Uint8Array, end?: number, flags?: PosixExecFlags): boolean;
-  /**
-   * The subject as a case-insensitive pattern compares it (ASCII letters folded; the
-   * subject itself when the pattern is case-sensitive), for {@link PosixExecFlags.folded}
-   */
-  fold(subject: Uint8Array): Uint8Array;
+  test(subject: Uint8Array, end?: number): boolean;
 }
 
 // --- syntax tree (glibc's bin_tree_t) ---------------------------------------------------
@@ -110,7 +93,10 @@ const A_WORD_FIRST: number = 3;
 const A_WORD_LAST: number = 4;
 const A_INSIDE_WORD: number = 5;
 const A_INSIDE_NOTWORD: number = 6;
-/** GNU's buffer anchors (backslash-backquote, backslash-quote): the subject's start and end, whatever REG_NEWLINE and REG_NOTBOL say */
+/**
+ * GNU's buffer anchors (backslash-backquote, backslash-quote): the subject's start and end,
+ * whatever REG_NEWLINE and REG_NOTBOL say
+ */
 const A_BUF_FIRST: number = 7;
 const A_BUF_LAST: number = 8;
 
@@ -722,13 +708,14 @@ class Parser {
   private parseBracket(): Tree {
     const set = new Uint8Array(256);
     let tok = this.peekBracket(this.pos);
-    if (tok.type === T_END) this.fail("REG_EBRACK", "Unmatched [, [^, [:, [., or [=");
+    // glibc's parse_bracket_exp: the pattern ending right after `[` (or `[^`) is REG_BADPAT
+    if (tok.type === T_END) this.fail("REG_BADPAT", "Invalid regular expression");
     let nonMatch = false;
     if (tok.type === B_NON_MATCH) {
       nonMatch = true;
       this.pos += tok.len;
       tok = this.peekBracket(this.pos);
-      if (tok.type === T_END) this.fail("REG_EBRACK", "Unmatched [, [^, [:, [., or [=");
+      if (tok.type === T_END) this.fail("REG_BADPAT", "Invalid regular expression");
     }
     if (tok.type === B_CLOSE) tok = { ...tok, type: B_CHAR };
     let first = true;
@@ -1023,7 +1010,7 @@ class Matcher implements PosixRegex {
   private readonly hasPlural: boolean;
   private mark: Int32Array;
   private gen = 0;
-  /** `REG_NOTBOL` of the running exec */
+  /** REG_NOTBOL of the current exec */
   private notbol = false;
 
   constructor(pattern: Uint8Array, options: PosixRegexOptions) {
@@ -1041,30 +1028,30 @@ class Matcher implements PosixRegex {
     this.nfa = buildNfa(lowered);
     this.hasBackref = parser.nbackref > 0;
     this.icase = options.icase ?? false;
+    if (this.icase) {
+      // REG_ICASE is glibc's translate table (toupper) over the subject: instead of folding
+      // a copy of every subject, each set takes a byte as it takes its upper case
+      for (const set of new Set(this.nfa.sets)) {
+        if (!set) continue;
+        for (let c = 0x61; c <= 0x7a; c++) set[c] = set[c - 0x20] as number;
+      }
+    }
     this.hasPlural = this.nfa.type.some((t) => t === N_ALT);
     this.mark = new Int32Array(this.nfa.type.length).fill(-1);
   }
 
-  test(subject: Uint8Array, end = subject.length, flags?: PosixExecFlags): boolean {
-    return this.exec(subject, end, 1, flags) !== undefined;
-  }
-
-  fold(subject: Uint8Array): Uint8Array {
-    if (!this.icase) return subject;
-    const folded = new Uint8Array(subject.length);
-    for (let i = 0; i < subject.length; i++) folded[i] = toUpper(subject[i]);
-    return folded;
+  test(subject: Uint8Array, end = subject.length): boolean {
+    return this.exec(subject, end, 1) !== undefined;
   }
 
   exec(
     subjectIn: Uint8Array,
     end = subjectIn.length,
     nmatchIn?: number,
-    flags?: PosixExecFlags,
+    notbol = false,
   ): PosixMatch | undefined {
-    let subject = subjectIn.subarray(0, end);
-    if (this.icase && !flags?.folded) subject = this.fold(subject);
-    this.notbol = flags?.notbol ?? false;
+    this.notbol = notbol;
+    const subject = subjectIn.subarray(0, end);
     const nmatch = Math.min(nmatchIn ?? this.groupCount + 1, this.groupCount + 1);
     if (this.hasBackref) return this.execBacktrack(subject, nmatch);
     const found = this.overall(subject);
@@ -1438,7 +1425,9 @@ class Matcher implements PosixRegex {
           if (idx + len > s.length) break;
           let same = true;
           for (let k = 0; k < len; k++) {
-            if (s[so + k] !== s[idx + k]) {
+            const x = s[so + k] as number;
+            const y = s[idx + k] as number;
+            if (x !== y && !(this.icase && toUpper(x) === toUpper(y))) {
               same = false;
               break;
             }

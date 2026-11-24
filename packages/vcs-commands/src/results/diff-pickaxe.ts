@@ -253,11 +253,11 @@ export class DiffPickaxe {
     const regex = this.regex;
     if (regex) {
       // regexec_buf in a loop: REG_NOTBOL after the first match, a step past an empty one
-      const subject = regex.fold(data);
+      const subject = data;
       let at = 0;
       let notbol = false;
       while (at < subject.length) {
-        const m = regex.exec(subject.subarray(at), undefined, 1, { notbol, folded: true });
+        const m = regex.exec(subject.subarray(at), undefined, 1, notbol);
         if (!m) break;
         notbol = true;
         at += m.end;

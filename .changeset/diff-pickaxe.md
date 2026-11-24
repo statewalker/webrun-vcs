@@ -17,6 +17,6 @@ find_paths_generic's way. A partial clone fetches each diff's absent blobs in on
 as diffcore_std does. Option errors are git's (`cannot be used together`, `-S requires a
 non-empty argument`, `unable to resolve`, `invalid regex`). `DiffPickaxe` is the engine.
 
-`PosixRegex.exec`/`test` take `regexec` flags (`notbol` for `REG_NOTBOL`, `folded` with the new
-`fold()` for a subject folded once), and GNU's buffer anchors (backslash-backquote,
-backslash-quote) no longer match at line boundaries under `REG_NEWLINE`.
+`compilePosixRegex`: GNU's buffer anchors (backslash-backquote, backslash-quote) no longer match
+at line boundaries under `REG_NEWLINE`, and the start one matches a `REG_NOTBOL` subject's start,
+as glibc's.
