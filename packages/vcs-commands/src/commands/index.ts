@@ -84,6 +84,7 @@ export {
 export * from "./remote-command.js";
 export * from "./reset-command.js";
 export * from "./restore-command.js";
+export * from "./rev-filter/index.js";
 export * from "./rev-list-command.js";
 export * from "./rev-parse-command.js";
 export * from "./revert-command.js";
@@ -95,6 +96,7 @@ export { SequencerOperation } from "./sequencer-pick.js";
 export * from "./serve-repository.js";
 export * from "./signing.js";
 export * from "./sparse-checkout-command.js";
+export * from "./ssh-signer.js";
 export * from "./stash-apply-command.js";
 export * from "./stash-create-command.js";
 export * from "./stash-drop-command.js";

@@ -163,11 +163,13 @@ export class MergeCommand extends GitCommand<MergeResult> {
 
   /**
    * `-S` (true) / `--no-gpg-sign` (false): whether to sign the merge commit; undefined (the
-   * default) leaves it to `commit.gpgSign`. No signer exists yet: a merge commit asked to be
+   * default) leaves it to `commit.gpgSign`. Not signed yet: a merge commit asked to be
    * signed fails as git's does when gpg cannot sign (`error: gpg failed to sign the data:`,
    * `fatal: failed to write commit object`, exit 128: {@link SigningFailedError}), the merge
    * left in progress as git leaves it (MERGE_HEAD, the merged index and files) and no commit
-   * made. A fast-forward or a merge stopped before its commit signs nothing.
+   * made. A fast-forward or a merge stopped before its commit signs nothing. `merge --continue`
+   * commits through {@link CommitCommand}, as git runs `git commit`, and so signs when the host
+   * has a signer.
    */
   setSign(sign: boolean | undefined): this {
     this.checkCallable();

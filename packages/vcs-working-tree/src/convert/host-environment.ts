@@ -176,6 +176,15 @@ export interface GitHostEnvironment {
    */
   hookRunner?: HookRunner;
   /**
+   * Signs what git signs (commits now; tags and push certificates later): the commands
+   * resolve what git's `sign_buffer` would run (`gpg.format`, the program, the key) and hand
+   * it to this callback with the payload. Absent: every request to sign fails as git fails
+   * when its signing program cannot sign (`createNodeSigner` of
+   * `@statewalker/vcs-utils-node` runs gpg, gpgsm or ssh-keygen as git does; `createSshSigner`
+   * of `@statewalker/vcs-commands` signs with an ssh Ed25519 key in-process).
+   */
+  signer?: Signer;
+  /**
    * The process's effective user id (POSIX `geteuid`): what git compares the owner of a
    * repository with before it uses one (`safe.directory`, "detected dubious ownership").
    * Absent (a browser, Windows), or with a FilesApi whose `lstat` reports no `uid`, the
@@ -340,6 +349,65 @@ export interface HookProcess {
   /** Stops it (receive-pack gave up on it: `hookTimeoutMs`); optional */
   kill?(): void;
 }
+
+/** A signature format (`gpg.format`): its default program is gpg, gpgsm or ssh-keygen. */
+export type SigningFormat = "openpgp" | "x509" | "ssh";
+
+/**
+ * What git's `sign_buffer` (gpg-interface.c) would run to sign `payload`.
+ *
+ * - openpgp, x509: `<program> --status-fd=2 -bsau <key>`, the payload on stdin, the
+ *   signature on stdout; it succeeded only when it exited 0 and its status output has a
+ *   line starting `[GNUPG:] SIG_CREATED `.
+ * - ssh: `<program> -Y sign -n git -f <key file> [-U] <payload file>`, the signature read
+ *   from `<payload file>.sig`; a literal key (`key::<key>`, or one starting `ssh-`) is written
+ *   to a temporary file first and `-U` added. With no key, the first line of
+ *   {@link defaultKeyCommand}'s output names it (`get_default_ssh_signing_key`).
+ */
+export interface SigningRequest {
+  format: SigningFormat;
+  /** The bytes to sign: the object without its signature */
+  payload: Uint8Array;
+  /**
+   * The key: `-S<keyid>`, else `user.signingKey`, else for openpgp and x509 the committer as
+   * `Name <email>` (`git_committer_info(IDENT_STRICT | IDENT_NO_DATE)`); for ssh, absent
+   * when {@link defaultKeyCommand} is to give it
+   */
+  key?: string;
+  /**
+   * The program: `gpg.program` / `gpg.openpgp.program`, `gpg.x509.program`,
+   * `gpg.ssh.program` (the last of them set, `~/` expanded), else `gpg`, `gpgsm`,
+   * `ssh-keygen`
+   */
+  program: string;
+  /** `gpg.ssh.defaultKeyCommand`, given for ssh without a key */
+  defaultKeyCommand?: string;
+  /** The host directory git runs the program in (the worktree top), when it has one */
+  cwd?: string;
+}
+
+/** What signing gave: the signature, or git's lines when it failed. */
+export interface SigningOutcome {
+  /**
+   * The signature as the program wrote it (the commands strip a CR before each LF, as git
+   * does); absent: signing failed
+   */
+  signature?: Uint8Array;
+  /**
+   * What git prints on the way, each message without the newline git ends it with (an
+   * `error: gpg failed to sign the data:\n<status>`, `warning: gpg.ssh.defaultKeyCommand
+   * failed: ...`); on a failure the command then prints its own tail
+   */
+  messages?: string[];
+  /**
+   * git died with {@link messages} (a malformed `gpg.ssh.defaultKeyCommand`): the command
+   * adds no tail of its own
+   */
+  died?: boolean;
+}
+
+/** Signs a payload as git's signing programs do (see {@link SigningRequest}). */
+export type Signer = (request: SigningRequest) => Promise<SigningOutcome>;
 
 const join = (dir: string, name: string) =>
   dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`;

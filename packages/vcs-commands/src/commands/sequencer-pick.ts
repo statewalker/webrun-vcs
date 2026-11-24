@@ -694,7 +694,7 @@ export class PickSequencer {
   }
 
   /**
-   * try_to_commit's failure to sign (no signer exists): gpg's error and `error: failed to
+   * try_to_commit's failure to sign (not signed yet): gpg's error and `error: failed to
    * write commit object`, then in git 2.43 `fatal: <action> failed` (exit 128); 2.5x returns
    * after the error (exit 1). The pick stays in progress (CHERRY_PICK_HEAD, MERGE_MSG), as
    * git leaves it.

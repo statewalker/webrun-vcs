@@ -18,6 +18,7 @@
 
 import { GitCommand } from "../git-command.js";
 import { LogCommand, type LogResult } from "./log-command.js";
+import type { CommitFilter, GrepPatternType } from "./rev-filter/index.js";
 import { revisionMergeBases } from "./rev-parse-command.js";
 import { parseRevisionAndPathArgs, type RevisionAndPathArgs } from "./revision-filenames.js";
 import { type ParsedRevisionArgs, parseRevisionArgs } from "./revision-range.js";
@@ -39,6 +40,7 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   private readonly revisions: string[] = [];
   private readonly mixed: string[] = [];
   private committish = true;
+  private logConfig = false;
   private readonly configure: ((log: LogCommand) => void)[] = [];
   /** The log that walks for this command, once called */
   private log?: LogCommand;
@@ -107,6 +109,68 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     return this;
   }
 
+  /** `--grep=<pattern>` (see `LogCommand.addGrep`). */
+  addGrep(pattern: string): this {
+    return this.configured((log) => log.addGrep(pattern));
+  }
+
+  /** `--author=<pattern>` (see `LogCommand.addAuthor`). */
+  addAuthor(pattern: string): this {
+    return this.configured((log) => log.addAuthor(pattern));
+  }
+
+  /** `--committer=<pattern>` (see `LogCommand.addCommitter`). */
+  addCommitter(pattern: string): this {
+    return this.configured((log) => log.addCommitter(pattern));
+  }
+
+  /** `--all-match`. */
+  setAllMatch(allMatch: boolean): this {
+    return this.configured((log) => log.setAllMatch(allMatch));
+  }
+
+  /** `--invert-grep`. */
+  setInvertGrep(invert: boolean): this {
+    return this.configured((log) => log.setInvertGrep(invert));
+  }
+
+  /** `-i` / `--regexp-ignore-case`. */
+  setRegexpIgnoreCase(ignoreCase: boolean): this {
+    return this.configured((log) => log.setRegexpIgnoreCase(ignoreCase));
+  }
+
+  /** `--basic-regexp`, `-E`, `-F` or `-P` (see `LogCommand.setPatternType`). */
+  setPatternType(type: GrepPatternType): this {
+    return this.configured((log) => log.setPatternType(type));
+  }
+
+  /** `--use-mailmap` / `--no-mailmap` for `--author`/`--committer` (`git log`'s). */
+  setUseMailmap(use: boolean): this {
+    return this.configured((log) => log.setUseMailmap(use));
+  }
+
+  /**
+   * Whether `git log`'s configuration applies to the patterns (`grep.patternType`,
+   * `grep.extendedRegexp`, `log.mailmap`). Default false, as `git rev-list`, which reads none
+   * of it; true reads the revisions' patterns as `git log` does.
+   */
+  setLogConfig(read: boolean): this {
+    this.checkCallable();
+    this.logConfig = read;
+    return this;
+  }
+
+  /** A filter of the commits listed (see `CommitFilters`). */
+  addCommitFilter(filter: CommitFilter): this {
+    return this.configured((log) => log.addCommitFilter(filter));
+  }
+
+  private configured(step: (log: LogCommand) => void): this {
+    this.checkCallable();
+    this.configure.push(step);
+    return this;
+  }
+
   /**
    * The revisions read: what is included and excluded, in git's pending order, and the
    * paths among the arguments of {@link addArgument}.
@@ -139,6 +203,7 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     this.log = log;
     if (this.useReplaceRefsOverride !== undefined)
       log.setUseReplaceRefs(this.useReplaceRefsOverride);
+    log.setLogConfig(this.logConfig);
     for (const configure of this.configure) configure(log);
     // `--not` alone names no revision: git log falls back to HEAD (revs->def) as with none
     const named = (args: string[]) => args.some((arg) => arg !== "--not" && arg !== "--");

@@ -21,7 +21,7 @@
 import { isSymbolicRef, isValidRefName, type ObjectId } from "@statewalker/vcs-core";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
-import { InvalidArgumentError, RevisionError } from "../../errors/index.js";
+import { InvalidArgumentError, InvalidConfigError, RevisionError } from "../../errors/index.js";
 import { GitCommand } from "../../git-command.js";
 import { CheckoutCommand, CheckoutStatus } from "../checkout-command.js";
 import { DiffCommand } from "../diff-command.js";
@@ -267,7 +267,8 @@ export class BisectCommand extends GitCommand<BisectResult> {
         const key = paths.join("\0");
         let log = comparers.get(key);
         if (!log) {
-          log = new LogCommand(this._workingCopy);
+          // a walk of bisect's own: none of git log's configuration
+          log = new LogCommand(this._workingCopy).setLogConfig(false);
           for (const p of paths) log.addPath(p);
           comparers.set(key, log);
         }
@@ -519,6 +520,7 @@ export class BisectCommand extends GitCommand<BisectResult> {
    */
   private async showCommit(id: ObjectId): Promise<string> {
     try {
+      // git runs `git show` as a child, which reads git show's configuration
       const bytes = await new LogCommand(this._workingCopy).add(id).setMaxCount(1).callBytes({
         stat: true,
         summary: true,
@@ -528,7 +530,12 @@ export class BisectCommand extends GitCommand<BisectResult> {
       return decodeGitPath(bytes);
     } catch (error) {
       if (error instanceof BisectDie) throw error;
-      throw new BisectDie(`unable to start 'show' for object '${id}'`);
+      // the child's own death comes first (a bad grep.patternType: `fatal: bad ...`)
+      const child =
+        error instanceof InvalidConfigError
+          ? `${error.message.replace(/^fatal: /, "")}\nfatal: `
+          : "";
+      throw new BisectDie(`${child}unable to start 'show' for object '${id}'`);
     }
   }
 }

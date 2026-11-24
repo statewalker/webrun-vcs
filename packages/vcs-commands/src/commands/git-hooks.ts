@@ -1007,6 +1007,15 @@ export class HookSession {
     return realHostPath(host, this.host.environment());
   }
 
+  /**
+   * The host directory git runs its child processes in (the worktree top, the git directory
+   * when bare), where the repository's files have a host path: a signing program's cwd.
+   */
+  async hostWorkingDirectory(): Promise<string | undefined> {
+    const layout = await this.host.layout();
+    return layout ? hostPathOf(layout.files, layout.cwd) : undefined;
+  }
+
   /** Whether `name` exists as an executable hook (git's `hook_exists`), giving no hint. */
   async exists(name: string): Promise<boolean> {
     if (!this.enabled) return false;

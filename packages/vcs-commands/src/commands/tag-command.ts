@@ -273,7 +273,7 @@ export class TagCommand extends GitCommand<Ref> {
    * undefined (the default) leaves it to `tag.gpgSign`, and `tag.forceSignAnnotated` signs
    * a tag with a message not made with {@link setAnnotated}, as git's does.
    *
-   * No signer exists yet: a tag asked to be signed fails as git fails when gpg cannot sign
+   * Not signed yet: a tag asked to be signed fails as git fails when gpg cannot sign
    * (`error: gpg failed to sign the data:`, `error: unable to sign the tag`, exit 128:
    * {@link SigningFailedError}), and neither a tag object nor a ref is written.
    *
@@ -838,6 +838,18 @@ export interface TagDeleteResult {
   errors: string[];
   /** git's exit status: 1 after any error, else 0 */
   exitCode: number;
+}
+
+/** What `git tag --list` printed ({@link ListTagCommand.callText}). */
+export interface TagListResult {
+  /** git's stdout: each tag's line and its newline (bytes outside UTF-8 as `decodeGitPath` keeps them) */
+  output: string;
+  /** Each shown tag's line, in order (an empty one left out with `--omit-empty`) */
+  lines: string[];
+  /** The tags shown, in order */
+  tags: { refname: string; objectId: ObjectId }[];
+  /** git's warnings on stderr */
+  warnings: string[];
 }
 
 /** What `git tag --list` printed ({@link ListTagCommand.callText}). */
