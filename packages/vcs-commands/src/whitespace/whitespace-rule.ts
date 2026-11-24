@@ -57,12 +57,28 @@ export function isGitSpace(ch: number): boolean {
 /** An invalid rule combination (git dies). */
 export class WhitespaceRuleError extends Error {}
 
+/** Which git's rule names {@link parseWhitespaceRule} knows */
+export interface WhitespaceRuleOptions {
+  /** git 2.43 knows no `incomplete-line` rule: its name (and any prefix of it) names nothing */
+  compatibility?: "2.43" | "2.56";
+}
+
 /**
  * Parses a `core.whitespace` value (or a `whitespace=<rules>` attribute) as
- * `parse_whitespace_rule` does: comma-separated names, `-name` to turn one off,
- * `tabwidth=<n>`.
+ * `parse_whitespace_rule` does: comma-separated names (or a prefix of one), `-name` to turn
+ * one off, `tabwidth=<n>`.
+ *
+ * @throws WhitespaceRuleError for `tab-in-indent` with `indent-with-non-tab` (git dies)
  */
-export function parseWhitespaceRule(value: string, warn?: (message: string) => void): number {
+export function parseWhitespaceRule(
+  value: string,
+  warn?: (message: string) => void,
+  options: WhitespaceRuleOptions = {},
+): number {
+  const names =
+    options.compatibility === "2.43"
+      ? RULE_NAMES.filter((r) => r.bits !== WS_INCOMPLETE_LINE)
+      : RULE_NAMES;
   let rule = WS_DEFAULT_RULE;
   let at = 0;
   while (at <= value.length) {
@@ -79,7 +95,7 @@ export function parseWhitespaceRule(value: string, warn?: (message: string) => v
     }
     if (len <= 0) break;
     const word = value.slice(start, start + len);
-    for (const r of RULE_NAMES) {
+    for (const r of names) {
       // strncmp(rule_name, string, len): a prefix of a name selects it
       if (r.name.slice(0, len) !== word || (len > r.name.length && word !== r.name)) continue;
       if (negated) rule &= ~r.bits;

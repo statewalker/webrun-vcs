@@ -152,6 +152,11 @@ const fatal = (message: string) => new Refusal(128, [`fatal: ${message}`]);
  * `unset`, `get`, `rename-section`, `remove-section`).
  */
 export class ConfigCommand extends GitCommand<ConfigCommandResult> {
+  /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
+  protected override readsCoreConfig(): boolean {
+    return false;
+  }
+
   private action?: ConfigAction;
   private scope?: ConfigCommandScope;
   private file?: string;

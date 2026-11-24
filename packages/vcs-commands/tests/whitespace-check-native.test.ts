@@ -515,3 +515,113 @@ describeGit("t4017-diff-retval", () => {
     expect(out).toEqual([]);
   });
 });
+
+describeGit("core.whitespace dies before a command writes (git_default_core_config)", () => {
+  /** Every file under `dir` (the git directory included) with its bytes' hash */
+  const tree = (dir: string): string => sh(dir, "find . -type f | LC_ALL=C sort | xargs sha1sum");
+  const base = () =>
+    repo(`
+      echo one >a
+      echo two >b
+      git add a b
+      commit -m one
+      git checkout -q -b side
+      echo side >c
+      git add c
+      commit -m side
+      git checkout -q main
+      echo three >>a
+      git add a
+      echo four >>b
+    `);
+  type Run = (git: Git) => Promise<unknown>;
+  const cases: [string[], Run][] = [
+    [["stash", "push", "--staged"], (g) => g.stashCreate().setStaged(true).call()],
+    [["stash", "push"], (g) => g.stashCreate().call()],
+    [["merge", "--no-edit", "side"], (g) => g.merge().include("side").call()],
+    [["status", "-v"], (g) => g.status().callText({ verbose: 1 })],
+    [["commit", "-v", "-m", "msg"], (g) => g.commit().setMessage("msg").setVerbose(1).call()],
+  ];
+
+  for (const [label, rules] of [
+    ["a rule git cannot enforce", "[core]\n\twhitespace = tab-in-indent,indent-with-non-tab\n"],
+    ["a variable without a value", "[core]\n\twhitespace\n"],
+  ] as const) {
+    it(`refuses ${label} in stash push --staged, stash push, merge, status -v and commit -v`, async () => {
+      for (const [args, run] of cases) {
+        const theirs = base();
+        const mine = base();
+        for (const dir of [theirs, mine])
+          sh(dir, `printf '${rules.replace(/\n/g, "\\n").replace(/\t/g, "\\t")}' >>.git/config`);
+        const before = tree(theirs);
+        const beforeMine = tree(mine);
+        const native = spawnSync("git", args, { cwd: theirs, env: configEnv({}) });
+        const nativeOut: Outcome = {
+          status: native.status ?? -1,
+          stdout: native.stdout,
+          messages: messageLines(native.stderr.toString()),
+        };
+        const ourOut = await outcome(async () => {
+          const git = await ours(mine);
+          await run(git);
+          return { bytes: new Uint8Array(0), status: 0 };
+        });
+        const label = `git ${args.join(" ")}`;
+        expect(nativeOut.status, label).toBe(128);
+        expect(ourOut.status, label).toBe(128);
+        expect(ourOut.messages, label).toEqual(nativeOut.messages);
+        expect(nativeOut.messages.at(-1), label).toMatch(/^fatal: /);
+        // nothing written, by either
+        expect(tree(theirs), label).toBe(before);
+        expect(tree(mine), label).toBe(beforeMine);
+        // the stash list stays empty (git stash list itself dies on this configuration)
+        for (const dir of [theirs, mine]) {
+          expect(sh(dir, "ls .git/refs/stash .git/logs/refs/stash 2>&1 || :"), label).toMatch(
+            /No such file.*\n.*No such file/,
+          );
+        }
+      }
+    });
+  }
+
+  it("lets git config, git remote and git ls-remote run, as they read no core settings", async () => {
+    const dir = base();
+    sh(dir, "git config core.whitespace tab-in-indent,indent-with-non-tab");
+    const git = await ours(dir);
+    expect(native(dir, ["config", "core.whitespace"]).status).toBe(0);
+    await git.config().get("core.whitespace").call();
+    expect(native(dir, ["remote"]).status).toBe(0);
+    await git.remoteList().call();
+    expect(native(dir, ["ls-remote", "."]).status).toBe(0);
+    await git.lsRemote().setRemote(dir).call();
+  });
+});
+
+describeGit("2.43's whitespace rules", () => {
+  it("reads the rules after incomplete-line, which git 2.43 does not know, in --check and --color", async () => {
+    const dir = repo(`
+      echo x >f
+      git add f
+      commit -m one
+      echo "        foo ();" >>f
+    `);
+    const out: string[] = [];
+    for (const rule of [
+      "-incomplete-line,indent-with-non-tab",
+      "incomplete-line,indent-with-non-tab",
+      "-incomplete,indent-with-non-tab",
+      "indent-with-non-tab,-incomplete-line,-trailing",
+    ]) {
+      const config = { "core.whitespace": rule };
+      await twinDiff(out, dir, ["--check"], config);
+      await twinDiff(out, dir, ["--color"], config);
+      if (!atLeast(2, 50)) {
+        // git 2.43 still reads the rules after the one it does not know
+        const r = native(dir, ["diff", "--check"], config);
+        expect(r.status).toBe(2);
+        expect(r.stdout.toString()).toContain("f:2: indent with spaces.\n");
+      }
+    }
+    expect(out).toEqual([]);
+  });
+});

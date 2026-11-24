@@ -1918,7 +1918,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const mask = legacy ? ~WS_INCOMPLETE_LINE : ~0;
     const parse = (value: string) => {
       try {
-        return parseWhitespaceRule(legacy ? value.replace(/incomplete-line/g, "") : value);
+        return parseWhitespaceRule(
+          value,
+          undefined,
+          legacy ? { compatibility: "2.43" } : undefined,
+        );
       } catch (e) {
         throw whitespaceRuleError((e as Error).message);
       }
