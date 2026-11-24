@@ -369,6 +369,52 @@ describeGit("t4034-diff-words", () => {
     expect(out).toEqual([]);
   });
 
+  it('t4034-diff-words.sh: "word-diff with no newline at EOF" with NUL bytes under --text and a diff attribute', async () => {
+    const dir = join(tmp(), `repo-${++repoCount}`);
+    sh(
+      dir,
+      `git init -q -b main .
+      ${T4034_SETUP}
+      printf '\\000\\001\\002\\003a b\\n' >bin
+      printf 'x\\000y keep\\nsame\\n' >gone
+      printf 'p\\000q r\\n' >txt
+      git add bin gone txt
+      commit -minitial
+      printf '\\000\\001\\002\\004a c\\n' >bin
+      printf 'same\\n' >gone
+      printf 'p\\000q s\\nt\\000u\\n' >txt
+      commit -mmodified -a`,
+    );
+    const out: string[] = [];
+    for (const [args, options] of [
+      [["--word-diff"], { wordDiff: "plain" }],
+      [["--color-words"], colorWords()],
+      [["--word-diff=porcelain"], { wordDiff: "porcelain" }],
+      [["--word-diff=porcelain", "--color"], { wordDiff: "porcelain", color: true }],
+    ] as [string[], DiffTextOptions][]) {
+      await twinDiff(
+        out,
+        dir,
+        [...args, "--text", "HEAD~", "HEAD"],
+        { ...options, text: true },
+        "HEAD~",
+      );
+    }
+    // a diff attribute makes the files text without --text
+    sh(dir, `echo "* diff" >.gitattributes`);
+    await twinDiff(out, dir, ["--word-diff", "HEAD~"], { wordDiff: "plain" }, "HEAD~");
+    await twinDiff(out, dir, ["--color-words", "HEAD~"], colorWords(), "HEAD~");
+    await twinDiff(
+      out,
+      dir,
+      ["--word-diff=porcelain", "HEAD~"],
+      { wordDiff: "porcelain" },
+      "HEAD~",
+    );
+    await twinShow(out, dir, ["--word-diff"], { wordDiff: "plain" });
+    expect(out).toEqual([]);
+  });
+
   it('t4034-diff-words.sh: "--word-diff=none" with an unknown mode and an invalid regex', async () => {
     const dir = prePost(PRE_SIMPLE, POST_SIMPLE);
     const out: string[] = [];

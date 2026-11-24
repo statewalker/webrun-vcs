@@ -146,13 +146,21 @@ class Pieces {
     if (s) this.parts.push(enc(s));
   }
 
+  /**
+   * Prints the piece as `DIFF_SYMBOL_WORD_DIFF` does (`fprintf("%.*s")`): up to its first NUL
+   * byte, whatever follows (suffix, reset, newline) dropped with it
+   */
   flushTo(sink: ByteSink): void {
-    for (const p of this.parts) sink.push(p);
+    for (const p of this.parts) {
+      const nul = p.indexOf(0);
+      if (nul < 0) {
+        sink.push(p);
+        continue;
+      }
+      if (nul > 0) sink.push(p.subarray(0, nul));
+      break;
+    }
     this.parts = [];
-  }
-
-  get empty(): boolean {
-    return this.parts.length === 0;
   }
 }
 
