@@ -48,6 +48,7 @@ import {
   RefTransactionAbortedError,
   type RefTransactionHook,
   type RefTransactionUpdate,
+  reflogInChain,
   symrefReflogWrites,
 } from "@statewalker/vcs-core";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
@@ -718,7 +719,11 @@ export function createFilesRefOps(
           // (git's REF_NEEDS_COMMIT for a symref: `checkout --detach` logs `<id> <id>`)
           await append(u.name, line, o.createReflog === true);
         }
-        for (const n of u.reflogAlso) await append(n, line);
+        // REF_FORCE_CREATE_REFLOG reaches the symbolic refs the update went through
+        // (split_symref_update keeps the flags), not HEAD logging its branch's update
+        for (const n of u.reflogAlso) {
+          await append(n, line, o.createReflog === true && reflogInChain(u, n));
+        }
       } catch (error) {
         if (strict) {
           const why = error instanceof Error ? error.message : String(error);

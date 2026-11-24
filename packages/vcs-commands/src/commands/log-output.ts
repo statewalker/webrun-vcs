@@ -190,6 +190,28 @@ export interface LogOutputEntry {
   parents: ObjectId[];
   /** The parents before `--graph` rewrote them (git's saved parents, for `--full-diff`) */
   savedParents?: ObjectId[];
+  /** The reflog entry a reflog walk (`git log -g <ref>`) shows this commit for */
+  reflog?: LogReflogEntry;
+}
+
+/** A reflog entry of a reflog walk (reflog-walk.c's `reflog_info`). */
+export interface LogReflogEntry {
+  /** The ref as given (`refs/stash`, `HEAD`) */
+  ref: string;
+  /** Its position, newest first (`<ref>@{n}`) */
+  index: number;
+  /** The entry's message, without its line end */
+  message: string;
+  /** Who made the change, and when */
+  who: PersonIdent;
+}
+
+/** shorten_unambiguous_ref of a reflog's ref, for `%gd` */
+function shortRefName(ref: string): string {
+  for (const prefix of ["refs/heads/", "refs/tags/", "refs/remotes/", "refs/"]) {
+    if (ref.startsWith(prefix)) return ref.slice(prefix.length);
+  }
+  return ref;
 }
 
 /** What the printer reads of the repository (see `LogCommand.callBytes`). */
@@ -870,6 +892,16 @@ export class LogPrinter {
     return this.host.abbreviate(id, this.abbrevLength);
   }
 
+  /**
+   * get_reflog_selector: `<ref>@{n}`, or `<ref>@{<date>}` under an explicit `--date`;
+   * `shorten` for `%gd`
+   */
+  private reflogSelector(reflog: LogReflogEntry, shorten: boolean): string {
+    const ref = shorten ? shortRefName(reflog.ref) : reflog.ref;
+    const at = this.options.date !== undefined ? this.formatDate(reflog.who) : String(reflog.index);
+    return `${ref}@{${at}}`;
+  }
+
   private formatDate(ident: PersonIdent, mode: DateMode = this.dateMode): string {
     return showDate(ident.timestamp, ident.tzOffset, mode, {
       ...(this.options.now !== undefined ? { now: this.options.now } : {}),
@@ -1110,6 +1142,19 @@ export class LogPrinter {
         this.out.text("\n");
         this.out.text(this.oneline());
       }
+      const reflog = entry.reflog;
+      if (reflog) {
+        // show_reflog_message: the selector unshortened; oneline shows nothing else
+        const selector = this.reflogSelector(reflog, false);
+        if (fmt === "oneline") {
+          this.out.text(`${selector}: ${reflog.message}\n`);
+          this.missingNewline = false;
+          return;
+        }
+        this.out.text(
+          `Reflog: ${selector} (${reflog.who.name} <${reflog.who.email}>)\nReflog message: ${reflog.message}\n`,
+        );
+      }
     }
     let notes: string | undefined;
     if (this.showNotes) notes = await this.notesText(entry.id, fmt === "user");
@@ -1181,6 +1226,16 @@ export class LogPrinter {
         mark: this.graph ? "*" : "",
         // %N stays as written unless notes are shown
         ...(this.showNotes ? { notes } : {}),
+        ...(entry.reflog
+          ? {
+              reflog: {
+                selector: this.reflogSelector(entry.reflog, false),
+                shortSelector: this.reflogSelector(entry.reflog, true),
+                message: entry.reflog.message,
+                ident: entry.reflog.who,
+              },
+            }
+          : {}),
         formatDate: (ident) => this.formatDate(ident),
         ...(mailmap && !mailmap.empty ? { mailmap: (n, e) => mailmap.map(n, e) } : {}),
         ...(this.options.now !== undefined ? { now: this.options.now } : {}),
