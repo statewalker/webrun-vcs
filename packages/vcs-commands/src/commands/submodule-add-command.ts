@@ -365,6 +365,12 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
 
   /** submodule--helper.c's `die_on_index_match`. */
   private async dieOnIndexMatch(path: string): Promise<void> {
+    // parse_pathspec's prefix_path: a path outside the worktree dies
+    const top = (await worktreeHostPath(this.workingCopy)) ?? "";
+    const outside = path.startsWith("/")
+      ? path !== top && !path.startsWith(`${top}/`)
+      : path.split("/").includes(".."); // what normalization could not resolve
+    if (outside) this.die(`fatal: ${path}: '${path}' is outside repository at '${top}'`);
     const items = parsePathspec([path]);
     for await (const entry of this.staging.entries()) {
       const isDir = entry.mode === FileMode.GITLINK || entry.mode === FileMode.TREE;
@@ -521,7 +527,9 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
         );
         await worktree.connectGitlink?.(path, gitDir);
         const inner = await worktree.openGitlink?.(path, {
-          ...(environment ? { environment: notFromUser(environment) } : {}),
+          // always: git-submodule.sh exports GIT_PROTOCOL_FROM_USER=0 whatever the host
+          // (without a host environment: one that reads no host files, as none does)
+          environment: notFromUser(environment ?? { readFile: async () => undefined }),
         });
         if (!inner) throw new GitApiError(`fatal: could not open the clone at '${hostPath}'`);
         const clone = new CloneCommand(inner)
@@ -554,6 +562,11 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
       const parent = parentOf(path);
       if (parent) await files.mkdir(this.filesPath(parent));
       await gitFiles.remove(`${gitDir}/index`).catch(() => false);
+      // connect_work_tree_and_git_dir: the gitfile's directory is the path itself
+      const kind = await this.kindOf(path);
+      if (kind !== undefined && kind !== "directory") {
+        this.die(`fatal: could not create directories for ${hostPath}/.git`);
+      }
     }
 
     await worktree.connectGitlink?.(path, gitDir);

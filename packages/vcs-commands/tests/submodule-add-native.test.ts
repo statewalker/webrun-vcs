@@ -132,7 +132,12 @@ function snapshot(dir: string, twin: string): Record<string, string> {
 }
 
 /** Our working copy of `<twin>/sup` (the FilesApi rooted at the twin, so `../up` is in reach). */
-async function ours(twin: string, env: Record<string, string>): Promise<Git> {
+async function ours(
+  twin: string,
+  env: Record<string, string>,
+  noEnvironment = false,
+): Promise<Git> {
+  if (noEnvironment) return openOurs(twin, undefined, undefined, "sup", false);
   const environment = createNodeGitHostEnvironment({
     env,
     hookRunner: createNodeHookRunner({ env, compatibility }),
@@ -175,6 +180,8 @@ interface TwinOptions {
   noAllowFile?: boolean;
   /** `.gitmodules` holds a twin's absolute path: its blob id differs between twins */
   absoluteUrls?: boolean;
+  /** Open ours with no host environment (no `-c` config, no GIT_PROTOCOL_FROM_USER) */
+  noEnvironment?: boolean;
 }
 
 /** Runs each step in both twins (in `sup`), comparing outputs and states. */
@@ -196,7 +203,9 @@ async function expectTwins(
       stderr: r.stderr.toString("utf8"),
       exitCode: r.status ?? -1,
     };
-    const o = await oursRun(async () => run(await ours(t.ours, env), t.ours));
+    const o = await oursRun(async () =>
+      run(await ours(t.ours, env, options.noEnvironment), t.ours),
+    );
     const norm = (x: SubmoduleCommandResult, twin: string) => ({
       stdout: x.stdout.split(twin).join("<T>"),
       stderr: x.stderr.split(twin).join("<T>"),
@@ -542,4 +551,34 @@ git config core.repositoryformatversion 1; git config extensions.submodulePathCo
       ]);
     },
   );
+
+  it("refuses local clones under protocol.file.allow's default user with no host environment too", async () => {
+    const t = twins(BASIC);
+    await expectTwins(t, [add(["../up", "sub"], (c) => c.setURI("../up").setPath("sub"))], {
+      noAllowFile: true,
+      noEnvironment: true,
+    });
+  });
+
+  it("refuses paths outside the repository before creating anything", async () => {
+    const t = twins(BASIC);
+    await expectTwins(t, [
+      add(["../up", "../outside"], (c) => c.setURI("../up").setPath("../outside")),
+      add(["../up", "a/../../x"], (c) => c.setURI("../up").setPath("a/../../x")),
+      [
+        (twin) => ["../up", join(twin, "abs")],
+        (g, twin) => sa(g).setURI("../up").setPath(join(twin, "abs")).call(),
+      ],
+    ]);
+  });
+
+  it('t7400-submodule-basic.sh: "submodule add to reconfigure existing submodule with --force" (a file where the kept git directory\'s worktree goes)', async () => {
+    const t = twins(`${BASIC}
+git submodule add -q ../up k; git commit -qm k
+git rm -q k; git commit -qm gone; echo f > k
+`);
+    await expectTwins(t, [
+      add(["-f", "../up", "k"], (c) => c.setForce(true).setURI("../up").setPath("k")),
+    ]);
+  });
 });
