@@ -126,6 +126,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   private porcelain = false;
   private thin = true;
   private depth?: number;
+  /** `--deepen=<n>`: `deepen <n>` with `deepen-relative` */
+  private deepen?: number;
   private uploadPack?: string;
   private dryRun = false;
   private writeCommitGraphOption?: boolean;
@@ -401,6 +403,20 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
+   * `--deepen=<n>`: deepen a shallow repository by `n` commits from its current shallow
+   * boundary (git's `deepen <n>` with `deepen-relative`), instead of `n` from the tips as
+   * {@link setDepth}.
+   */
+  setDeepen(deepen: number): this {
+    this.checkCallable();
+    if (!Number.isInteger(deepen) || deepen < 1) {
+      throw new InvalidArgumentError("deepen", deepen, "Depth must be at least 1");
+    }
+    this.deepen = deepen;
+    return this;
+  }
+
+  /**
    * Set the program the remote runs for upload-pack (git's `--upload-pack`, over
    * `remote.<name>.uploadpack`): what an ssh connector runs, and what git:// names in its
    * request line.
@@ -657,6 +673,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       ...(this.tagOptionSet && this.tagOption === TagOption.FETCH_TAGS ? ["--tags"] : []),
       ...(this.tagOptionSet && this.tagOption === TagOption.NO_TAGS ? ["--no-tags"] : []),
       ...(this.depth !== undefined ? [`--depth=${this.depth}`] : []),
+      ...(this.deepen !== undefined ? [`--deepen=${this.deepen}`] : []),
       ...(this.unshallow ? ["--unshallow"] : []),
       ...(this.appendFetchHead ? ["--append"] : []),
       ...(this.writeFetchHead ? [] : ["--no-write-fetch-head"]),
@@ -836,7 +853,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
         !this.tagOptionSet && store.followsTagsAlways(this.remote)
           ? "auto-always"
           : toTagMode(this.effectiveTagOption()),
-      depth: this.depth,
+      depth: this.depth ?? this.deepen,
+      ...(this.depth === undefined && this.deepen !== undefined ? { deepenRelative: true } : {}),
       deepenSince: this.shallowSince,
       deepenNot: this.shallowExcludes.length > 0 ? this.shallowExcludes : undefined,
       unshallow: this.unshallow || undefined,
