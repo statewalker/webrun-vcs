@@ -116,6 +116,26 @@ export interface CreateLinkedWorktreeOptions {
    * HEAD resolves to a commit, as git writes `logs/HEAD` on add. Default: the backend's.
    */
   readonly ident?: string;
+  /**
+   * git 2.48+'s `--relative-paths` (`worktree.useRelativePaths`): `gitdir` and the
+   * worktree's `.git` file hold paths relative to each other's directory, and the repository
+   * gets `extensions.relativeWorktrees` (with `core.repositoryformatversion = 1`), which git
+   * before 2.48 refuses. Default: absolute paths.
+   */
+  readonly relativePaths?: boolean;
+}
+
+/**
+ * How {@link LinkedWorktrees.move} and {@link LinkedWorktrees.repair} write the link files.
+ *
+ * With `relativePaths` set (a boolean), as git 2.48+'s `write_worktree_linking_files`: both
+ * files are written together, relative or absolute, and repair also rewrites links of the
+ * other kind (`absolute/relative path mismatch`), so a repair without the option turns
+ * relative links back into absolute ones. Left undefined, as git 2.43: absolute links, and
+ * repair rewrites only the file at fault.
+ */
+export interface WorktreeLinkOptions {
+  readonly relativePaths?: boolean;
 }
 
 /** A linked worktree that {@link LinkedWorktrees.create} set up. */
@@ -134,6 +154,29 @@ export interface WorktreeRepairReport {
   readonly path: string;
   /** git's message (`.git file broken`, `gitdir incorrect`, ...). */
   readonly message: string;
+}
+
+/**
+ * A relative link needs `extensions.relativeWorktrees`, but the repository (version 0) has
+ * an extension git does not know, so its format cannot be upgraded (git's
+ * `upgrade_repository_format`): nothing is written. The message is git's `fatal:` text,
+ * {@link errorLine} the `error:` line before it; `reports` holds what a repair reported
+ * before it stopped.
+ */
+export class WorktreeFormatUpgradeError extends Error {
+  readonly extension: string;
+  reports: WorktreeRepairReport[] = [];
+
+  constructor(extension: string) {
+    super("unable to upgrade repository format to support relative worktrees");
+    this.name = "WorktreeFormatUpgradeError";
+    this.extension = extension;
+  }
+
+  /** git's `error: cannot upgrade repository format: unknown extension <name>`. */
+  get errorLine(): string {
+    return `error: cannot upgrade repository format: unknown extension ${this.extension}`;
+  }
 }
 
 /** The kind of what is at a path: git's `file_exists` / `is_empty_dir` / `is_directory`. */
@@ -263,11 +306,11 @@ export interface LinkedWorktrees {
   deleteWorkTree(entry: WorktreeInfo): Promise<void>;
 
   /** Move `entry`'s directory to `destination` and point its link files there (`update_worktree_location`). */
-  move(entry: WorktreeInfo, destination: string): Promise<void>;
+  move(entry: WorktreeInfo, destination: string, options?: WorktreeLinkOptions): Promise<void>;
 
   /**
    * git's `worktree repair`: each path's `gitdir` back-link (`repair_worktree_at_path`),
    * then every linked worktree's `.git` file (`repair_worktrees`).
    */
-  repair(paths: string[]): Promise<WorktreeRepairReport[]>;
+  repair(paths: string[], options?: WorktreeLinkOptions): Promise<WorktreeRepairReport[]>;
 }

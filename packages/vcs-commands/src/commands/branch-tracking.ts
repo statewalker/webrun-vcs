@@ -127,37 +127,152 @@ export function isRemoteTrackingBranch(workingCopy: WorkingCopy, ref: string): b
   return config.configuredNames().some((remote) => !!sourceForTracking(config, remote, ref));
 }
 
+/** What {@link uniqueTrackingName} found. */
+export interface TrackingNameMatch {
+  /**
+   * The tracking ref picked (a full ref name): the only match, else the one of
+   * `checkout.defaultRemote`; undefined when none or several match without a default.
+   */
+  readonly ref?: string;
+  /** The remotes whose fetch refspecs map `refs/heads/<name>` onto an existing ref, in order. */
+  readonly remotes: string[];
+}
+
 /**
- * The remote-tracking branch git's checkout and switch turn `name` into when no ref has
- * that name (`--guess`, on by default): the one `refs/remotes/<remote>/...` ref that some
- * remote fetches `refs/heads/<name>` into; with several, the one of `checkout.defaultRemote`.
- *
- * @returns the full name of the tracking ref, or undefined when no remote has the branch
- * @throws InvalidArgumentError when several remotes have it (git's `'<name>' matched
- *   multiple (<n>) remote tracking branches`)
+ * git's `unique_tracking_name` (checkout.c): every remote, in configuration order, whose
+ * fetch refspecs map `refs/heads/<name>` onto a ref that exists (in `refs/remotes/` or
+ * anywhere else, as `refs/repo_d/*`); the one match, or with several the one of
+ * `checkout.defaultRemote`.
  */
-export async function guessRemoteBranch(
+export async function uniqueTrackingName(
   workingCopy: WorkingCopy,
   refs: Refs,
   name: string,
-): Promise<string | undefined> {
+): Promise<TrackingNameMatch> {
   const config = RemoteConfigStore.from(workingCopy);
   const defaultRemote = config.value("checkout.defaultRemote");
   const found: string[] = [];
+  const remotes: string[] = [];
   let preferred: string | undefined;
   for (const remote of config.configuredNames()) {
     const dst = trackingForSource(config, remote, `refs/heads/${name}`);
     if (!dst || !(await refs.has(dst))) continue;
     found.push(dst);
-    if (remote === defaultRemote) preferred = dst;
+    remotes.push(remote);
+    if (remote === defaultRemote && preferred === undefined) preferred = dst;
   }
-  if (found.length === 1) return found[0];
-  if (preferred) return preferred;
-  if (found.length > 1) {
+  if (found.length === 1) return { ref: found[0], remotes };
+  return preferred ? { ref: preferred, remotes } : { remotes };
+}
+
+/** Whether `advice.checkoutAmbiguousRemoteBranchName` is on (the default). */
+export function ambiguousRemoteAdvice(workingCopy: WorkingCopy): boolean {
+  return adviceEnabled(RemoteConfigStore.from(workingCopy), "checkoutAmbiguousRemoteBranchName");
+}
+
+/**
+ * builtin/checkout.c's `advise_disambiguating_remotes` for `git checkout` / `git switch`
+ * (git 2.43 words it without the remotes, and always as `git checkout`).
+ */
+export function checkoutAmbiguityHints(
+  command: "checkout" | "switch",
+  name: string,
+  remotes: string[],
+  compatibility: TrackingCompatibility = "2.56",
+): string[] {
+  if (compatibility === "2.43") {
+    return hintLines(
+      [
+        "If you meant to check out a remote tracking branch on, e.g. 'origin',",
+        "you can do so by fully qualifying the name with the --track option:",
+        "",
+        "    git checkout --track origin/<name>",
+        "",
+        "If you'd like to always have checkouts of an ambiguous <name> prefer",
+        "one remote, e.g. the 'origin' remote, consider setting",
+        "checkout.defaultRemote=origin in your config.",
+      ].join("\n"),
+      compatibility,
+    );
+  }
+  return [
+    `hint: Branch name '${name}' appears in multiple remotes:`,
+    ...remotes.map((remote) => `hint:   ${remote}`),
+    ...hintLines(
+      [
+        "If you meant to check out a remote tracking branch on <remote>,",
+        "you can do so by fully qualifying the name with the --track option:",
+        "",
+        `    git ${command} --track <remote>/${name}`,
+        "",
+        "If you'd like to always have checkouts of an ambiguous name prefer",
+        "one remote, e.g. the 'origin' remote, consider setting",
+        "checkout.defaultRemote=origin in your config.",
+      ].join("\n"),
+      compatibility,
+    ),
+  ];
+}
+
+/**
+ * builtin/worktree.c's `advise_disambiguating_remotes` (git 2.5x; 2.43's `worktree add`
+ * takes an ambiguous name for no remote branch at all).
+ */
+export function worktreeAmbiguityHints(path: string, name: string, remotes: string[]): string[] {
+  return [
+    `hint: Branch name '${name}' appears in multiple remotes:`,
+    ...remotes.map((remote) => `hint:   ${remote}`),
+    ...hintLines(
+      [
+        "If you meant to create a worktree from a remote tracking branch on",
+        "<remote>, you can do so by:",
+        "",
+        `    git worktree add -b ${name} ${path} <remote>/${name}`,
+        "",
+        "If you'd like to always prefer some remote, e.g. 'origin',",
+        "consider setting checkout.defaultRemote=origin in your config.",
+      ].join("\n"),
+    ),
+  ];
+}
+
+/** Options of {@link guessRemoteBranch}. */
+export interface GuessRemoteBranchOptions {
+  /** The command whose advice an ambiguous name gets (default `checkout`). */
+  command?: "checkout" | "switch";
+  /** The git version whose advice it follows (default 2.56). */
+  compatibility?: TrackingCompatibility;
+}
+
+/**
+ * The remote-tracking branch git's checkout and switch turn `name` into when no ref has
+ * that name (`--guess`, on by default, git's `parse_remote_branch`): the one ref that some
+ * remote fetches `refs/heads/<name>` into; with several, the one of `checkout.defaultRemote`.
+ *
+ * @returns the full name of the tracking ref, or undefined when no remote has the branch
+ * @throws InvalidArgumentError when several remotes have it: the
+ *   `advice.checkoutAmbiguousRemoteBranchName` hints, then git's `fatal: '<name>' matched
+ *   multiple (<n>) remote tracking branches`
+ */
+export async function guessRemoteBranch(
+  workingCopy: WorkingCopy,
+  refs: Refs,
+  name: string,
+  options: GuessRemoteBranchOptions = {},
+): Promise<string | undefined> {
+  const { ref, remotes } = await uniqueTrackingName(workingCopy, refs, name);
+  if (ref) return ref;
+  if (remotes.length > 1) {
+    const hints = ambiguousRemoteAdvice(workingCopy)
+      ? checkoutAmbiguityHints(options.command ?? "checkout", name, remotes, options.compatibility)
+      : [];
     throw new InvalidArgumentError(
       "name",
       name,
-      `fatal: '${name}' matched multiple (${found.length}) remote tracking branches`,
+      [
+        ...hints,
+        `fatal: '${name}' matched multiple (${remotes.length}) remote tracking branches`,
+      ].join("\n"),
     );
   }
   return undefined;
@@ -192,10 +307,11 @@ export async function trackableStart(
     real = await endOfSymbolicChain(refs, candidate);
     if (real) break;
   }
+  // a local branch, or a ref some remote fetches into (`refs/remotes/...`, or anywhere a
+  // fetch refspec writes, as `refs/repo_d/*`)
   const tracked =
     real !== undefined &&
-    (real.startsWith("refs/heads/") ||
-      (real.startsWith("refs/remotes/") && isRemoteTrackingBranch(workingCopy, real)));
+    (real.startsWith("refs/heads/") || isRemoteTrackingBranch(workingCopy, real));
   if (!tracked) {
     if (explicit) {
       throw new InvalidArgumentError(

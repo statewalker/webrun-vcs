@@ -54,6 +54,12 @@ export interface RepositoryFormat {
   /** `extensions.relativeWorktrees` (version 1): worktree links are relative paths */
   relativeWorktrees: boolean;
   /**
+   * The extensions git does not know, lowercased, in config order: ignored by version 0
+   * (a version 1 repository with any is refused), they forbid `upgrade_repository_format`;
+   * absent when there is none
+   */
+  unknownExtensions?: string[];
+  /**
    * `extensions.refStorage` (version 1): `files` (loose refs and packed-refs, the default) or
    * `reftable` (`.git/reftable/`, `ReftableRefStore`)
    */
@@ -180,6 +186,7 @@ export function checkRepositoryFormat(config: RepositoryFormatConfig): Repositor
         break;
       default:
         unknown.push(ext);
+        format.unknownExtensions = [...(format.unknownExtensions ?? []), ext.toLowerCase()];
         continue;
     }
     v1Only.push(ext);
