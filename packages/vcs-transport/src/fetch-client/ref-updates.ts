@@ -414,6 +414,8 @@ export async function applyRefUpdates(
       {
         ...(options.ident !== undefined ? { ident: options.ident } : {}),
         ...(options.skipReflog ? { skipReflog: true } : {}),
+        // written loose, as git's fetch writes them (not packed like an atomic batch)
+        loose: true,
       },
     );
     if (result.ok) return undefined;
