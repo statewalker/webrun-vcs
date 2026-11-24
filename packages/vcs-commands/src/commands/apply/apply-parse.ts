@@ -632,6 +632,16 @@ export class ApplyParser {
     return 1;
   }
 
+  /**
+   * `parse_git_diff_header` for a reader of `git log -p` output (range-diff's
+   * `read_patches`): the header starting with the `diff --git` line at `at` (`len` bytes)
+   * read into `patch`, with at most `size` bytes left; its length, or a negative number when
+   * git refuses it. Names are taken whole (`p_value` 0, no root).
+   */
+  readGitDiffHeader(buf: string, at: number, len: number, size: number, patch: FilePatch): number {
+    return this.parseGitDiffHeader(buf, at, len, size, patch);
+  }
+
   /** `parse_git_diff_header`: the header's length, or -128. */
   private parseGitDiffHeader(
     buf: string,
