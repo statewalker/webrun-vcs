@@ -45,6 +45,7 @@ import {
   ListTagCommand,
   LogCommand,
   LsRemoteCommand,
+  MergeBaseCommand,
   MergeCommand,
   MvCommand,
   NotesCommands,
@@ -1291,6 +1292,20 @@ export class Git implements Disposable {
   }
 
   // ============ Rebase Operations ============
+
+  /**
+   * Create a MergeBaseCommand (`git merge-base`): merge bases (`--all`, `--octopus`),
+   * `--independent`, `--is-ancestor` and `--fork-point`.
+   *
+   * @example
+   * ```typescript
+   * const { bases } = await git.mergeBase().addCommit("main").addCommit("topic").call();
+   * ```
+   */
+  mergeBase(): MergeBaseCommand {
+    this.checkClosed();
+    return new MergeBaseCommand(this._workingCopy);
+  }
 
   /**
    * Create a RebaseCommand for rebasing commits.

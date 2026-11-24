@@ -280,17 +280,72 @@ export class MergeBaseGraph {
         .map((x) => x.n);
     const result = sortByDate(list.filter((n) => !((flags.get(n.key) ?? 0) & STALE)));
     if (result.length <= 1) return result;
-    // remove_redundant: a base reachable from another is dropped (the array's order kept)
-    const redundant = new Array(result.length).fill(false);
-    for (let i = 0; i < result.length; i++) {
+    return sortByDate(await this.removeRedundant(result));
+  }
+
+  /**
+   * git's remove_redundant: the nodes no other of them reaches, in the order given (the
+   * nodes must be distinct).
+   */
+  async removeRedundant(nodes: BaseNode[]): Promise<BaseNode[]> {
+    const redundant = new Array(nodes.length).fill(false);
+    for (let i = 0; i < nodes.length; i++) {
       if (redundant[i]) continue;
-      const others = result.filter((_, j) => j !== i && !redundant[j]);
-      if (await this.reachable(result[i], others)) redundant[i] = true;
-      for (let j = 0; j < result.length; j++) {
+      const others = nodes.filter((_, j) => j !== i && !redundant[j]);
+      if (await this.reachable(nodes[i], others)) redundant[i] = true;
+      for (let j = 0; j < nodes.length; j++) {
         if (j === i || redundant[j]) continue;
-        if (await this.reachable(result[j], [result[i]])) redundant[j] = true;
+        if (await this.reachable(nodes[j], [nodes[i]])) redundant[j] = true;
       }
     }
-    return sortByDate(result.filter((_, i) => !redundant[i]));
+    return nodes.filter((_, i) => !redundant[i]);
   }
+
+  /**
+   * git's reduce_heads (`git merge-base --independent`): duplicates dropped (the first kept),
+   * then every node another one reaches; the order given is kept.
+   */
+  async reduceHeads(nodes: BaseNode[]): Promise<BaseNode[]> {
+    const seen = new Set<string>();
+    const unique = nodes.filter((n) => !seen.has(n.key) && seen.add(n.key));
+    if (unique.length <= 1) return unique;
+    return this.removeRedundant(unique);
+  }
+
+  /**
+   * git's get_octopus_merge_bases followed by reduce_heads (`git merge-base --octopus`): the
+   * merge bases of the first commit and the second, then of the third and each of those,
+   * and so on.
+   */
+  async octopusMergeBases(nodes: BaseNode[]): Promise<BaseNode[]> {
+    if (nodes.length === 0) return [];
+    let result: BaseNode[] = [nodes[0] as BaseNode];
+    for (const next of nodes.slice(1)) {
+      const bases: BaseNode[] = [];
+      for (const known of result) bases.push(...(await this.mergeBases(next, known)));
+      result = bases;
+    }
+    return this.reduceHeads(result);
+  }
+}
+
+/**
+ * git's get_fork_point (commit.c): where `commit` forked from the ref whose reflog gave
+ * `candidates` (the first entry's old value, then every entry's new value, oldest first,
+ * each commit once; the ref's value when the log has none). It is the one merge base of
+ * `commit` and all candidates, when there is exactly one and it is a candidate.
+ */
+export async function forkPointOf(
+  graph: MergeBaseGraph,
+  commit: ObjectId,
+  candidates: ObjectId[],
+): Promise<ObjectId | undefined> {
+  if (candidates.length === 0) return undefined;
+  const bases = await graph.mergeBasesMany(
+    graph.commit(commit),
+    candidates.map((id) => graph.commit(id)),
+  );
+  if (bases.length !== 1) return undefined;
+  const base = bases[0]?.id;
+  return base !== undefined && candidates.includes(base) ? base : undefined;
 }
