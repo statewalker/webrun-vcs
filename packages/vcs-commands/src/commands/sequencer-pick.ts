@@ -21,6 +21,7 @@ import {
 } from "../errors/merge-errors.js";
 import { NotACommitError, RefNotFoundError } from "../errors/ref-errors.js";
 import type { CommandCommits, CommandRefs, CommandTrees } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import { coreBool, createIdAbbreviator, type IdAbbreviator } from "./core-config.js";
 import { type HookSession, sequencerPostCommit, sequencerPrepareMessage } from "./git-hooks.js";
 import { authorIdentOf, committerIdentOf } from "./git-ident.js";
@@ -56,6 +57,7 @@ import {
   type SignRequest,
   signRequestOf,
 } from "./signing.js";
+import { appendSignoff, signoffLine, trailerConfigOf, trailerLinesOf } from "./trailers.js";
 
 /** What the sequencer does with each commit. */
 export type PickAction = "pick" | "revert";
@@ -111,7 +113,7 @@ export interface SequencerDeps extends MergeWriteContext {
 
 /** The `git commit` the sequencer runs (see {@link SequencerDeps.gitCommit}). */
 export type PickCommitMode =
-  | { kind: "pick"; reflogAction: string }
+  | { kind: "pick"; reflogAction: string; allowEmpty?: boolean }
   | { kind: "continue"; edit: boolean };
 
 /** Options of one sequencer run. */
@@ -142,6 +144,116 @@ export interface PickOptions {
    * Saved in `sequencer/opts` (`options.gpg-sign`) for a run of several commits.
    */
   sign?: boolean | string;
+  /** `-x`: `(cherry picked from commit <id>)` appended to a pick's message (record_origin) */
+  recordOrigin?: boolean;
+  /** `-s` / `--signoff`: the committer's `Signed-off-by:` appended (append_signoff) */
+  signoff?: boolean;
+  /** `--allow-empty`: a commit empty in itself (its tree its first parent's) is committed */
+  allowEmpty?: boolean;
+  /** `--allow-empty-message` (saved in `sequencer/opts`; the sequencer commits any message) */
+  allowEmptyMessage?: boolean;
+  /**
+   * `--keep-redundant-commits` / `--empty=keep`: a commit that becomes empty is committed
+   * (implies {@link allowEmpty})
+   */
+  keepRedundant?: boolean;
+  /** `--empty=drop`: a commit that becomes empty is dropped, git's `dropping ...` line printed */
+  dropRedundant?: boolean;
+  /** `--ff`: a commit whose parent is HEAD is fast-forwarded to, not picked */
+  allowFf?: boolean;
+  /**
+   * `revert --reference` (or `revert.reference`): the reverted commit named as
+   * `<abbrev> (<subject>, <date>)` under a `*** SAY WHY ...` comment for the title
+   */
+  reference?: boolean;
+}
+
+/** The flags of a run, read back from `sequencer/opts` (git's replay_opts). */
+interface PickFlags {
+  noCommit: boolean;
+  mainline?: number;
+  recordOrigin: boolean;
+  signoff: boolean;
+  allowEmpty: boolean;
+  allowEmptyMessage: boolean;
+  keepRedundant: boolean;
+  dropRedundant: boolean;
+  allowFf: boolean;
+}
+
+/** commit.cleanup as the sequencer reads it (git_sequencer_config). */
+type SequencerCleanup = "whitespace" | "verbatim" | "scissors" | "strip";
+
+/**
+ * builtin/revert.c's verify_opt_compatible: the `fatal:` line refusing an option that cannot
+ * go with `--continue`/`--skip`/`--abort`/`--quit` or with `--ff`, as git checks them; undefined
+ * when the options go together.
+ */
+export function pickOptionsConflict(
+  action: PickAction,
+  operation: SequencerOperation,
+  options: PickOptions & { emptyGiven?: boolean },
+  /** git 2.43 lets `--keep-redundant-commits` and `--empty` go with the operations */
+  compatibility?: "2.43" | "2.56",
+): string | undefined {
+  const me = ACTION_NAME[action];
+  const keep = !!options.keepRedundant;
+  if (operation !== SequencerOperation.START) {
+    const op = `--${operation}`;
+    const given: [string, boolean][] = [
+      ["--no-commit", !!options.noCommit],
+      ["--signoff", !!options.signoff],
+      ["--mainline", !!options.mainline],
+      ["-x", !!options.recordOrigin],
+      ["--ff", !!options.allowFf],
+      ["--keep-redundant-commits", keep && compatibility !== "2.43"],
+      ["--empty", !!options.emptyGiven && compatibility !== "2.43"],
+    ];
+    const first = given.find(([, on]) => on);
+    if (first) return `fatal: ${me}: ${first[0]} cannot be used with ${op}`;
+  }
+  if (options.allowFf) {
+    const given: [string, boolean][] = [
+      ["--signoff", !!options.signoff],
+      ["--no-commit", !!options.noCommit],
+      ["-x", !!options.recordOrigin],
+      ["--edit", options.edit === true],
+    ];
+    const first = given.find(([, on]) => on);
+    if (first) return `fatal: ${me}: ${first[0]} cannot be used with --ff`;
+  }
+  return undefined;
+}
+
+/** The boolean options of `sequencer/opts` (populate_opts_cb). */
+const SAVED_FLAGS: Record<string, keyof Omit<PickFlags, "mainline"> | undefined> = {
+  "no-commit": "noCommit",
+  "allow-empty": "allowEmpty",
+  "allow-empty-message": "allowEmptyMessage",
+  "drop-redundant-commits": "dropRedundant",
+  "keep-redundant-commits": "keepRedundant",
+  signoff: "signoff",
+  "record-origin": "recordOrigin",
+  "allow-ff": "allowFf",
+};
+
+/** git_sequencer_config's commit.cleanup (get_cleanup_mode for a saved one). */
+function cleanupOf(value: string | undefined): SequencerCleanup | undefined {
+  switch (value) {
+    case "verbatim":
+    case "whitespace":
+    case "strip":
+    case "scissors":
+      return value;
+    default:
+      return undefined;
+  }
+}
+
+function configuredCleanup(
+  workingCopy: SequencerDeps["workingCopy"],
+): SequencerCleanup | undefined {
+  return cleanupOf(RemoteConfigStore.from(workingCopy).value("commit.cleanup"));
 }
 
 const ACTION_NAME = { pick: "cherry-pick", revert: "revert" } as const;
@@ -165,6 +277,10 @@ export class PickSequencer {
   private edit: boolean | undefined;
   /** What the commits are signed with (git's opts->gpg_sign), read back from the opts */
   private sign: SignRequest;
+  /** The flags of the run (given, or read back from `sequencer/opts`) */
+  private readonly flags: PickFlags;
+  /** commit.cleanup (git's default_msg_cleanup with explicit_cleanup), or saved in the opts */
+  private cleanup: SequencerCleanup | undefined;
 
   constructor(
     private readonly deps: SequencerDeps,
@@ -174,6 +290,24 @@ export class PickSequencer {
     this.abbreviator = createIdAbbreviator(deps.workingCopy);
     this.edit = options.edit;
     this.sign = signRequestOf(deps.workingCopy, options.sign);
+    const keepRedundant = !!options.keepRedundant;
+    this.flags = {
+      noCommit: !!options.noCommit,
+      mainline: options.mainline,
+      recordOrigin: !!options.recordOrigin,
+      signoff: !!options.signoff,
+      // --keep-redundant-commits implies --allow-empty (run_sequencer)
+      allowEmpty: !!options.allowEmpty || keepRedundant,
+      allowEmptyMessage: !!options.allowEmptyMessage,
+      keepRedundant,
+      dropRedundant: !!options.dropRedundant,
+      allowFf: !!options.allowFf,
+    };
+    this.cleanup = configuredCleanup(deps.workingCopy);
+  }
+
+  private config(key: string): string | undefined {
+    return RemoteConfigStore.from(this.deps.workingCopy).value(key);
   }
 
   private get name(): string {
@@ -188,6 +322,10 @@ export class PickSequencer {
   async start(names: string[]): Promise<PickOutcome> {
     const { state } = this.deps;
     const { unmerged } = await readIndex(this.deps.staging);
+    if (unmerged.length > 0 && this.flags.noCommit) {
+      // do_pick_commit's write_index_as_tree fails first
+      return this.fail(`error: your index file is unmerged.\nfatal: ${this.name} failed`);
+    }
     if (unmerged.length > 0) {
       return this.fail(
         [
@@ -206,16 +344,27 @@ export class PickSequencer {
     const ids: ObjectId[] = [];
     for (const name of names) ids.push(await this.resolvePick(name));
     const todo = ids.map((id) => ({ action: this.options.action, id }));
-    const headId = await this.headId();
     if (todo.length > 1) {
+      const headId = await this.headId();
       await state.write("sequencer/head", `${headId}\n`);
       await this.writeTodo(todo);
       await state.write("sequencer/abort-safety", `${headId}\n`);
-      // save_opts: options.no-commit, then options.edit when given (git config's format)
+      // save_opts, in its order (git config's format)
+      const f = this.flags;
       const opts: string[] = [];
-      if (this.options.noCommit) opts.push("\tno-commit = true\n");
+      const flag = (name: string, on: boolean) => on && opts.push(`\t${name} = true\n`);
+      flag("no-commit", f.noCommit);
       if (this.edit !== undefined) opts.push(`\tedit = ${this.edit}\n`);
+      flag("allow-empty", f.allowEmpty);
+      flag("allow-empty-message", f.allowEmptyMessage);
+      flag("drop-redundant-commits", f.dropRedundant);
+      flag("keep-redundant-commits", f.keepRedundant);
+      flag("signoff", f.signoff);
+      flag("record-origin", f.recordOrigin);
+      flag("allow-ff", f.allowFf);
+      if (f.mainline) opts.push(`\tmainline = ${f.mainline}\n`);
       if (this.sign !== undefined) opts.push(`\tgpg-sign = ${this.sign}\n`);
+      if (this.cleanup) opts.push(`\tdefault-msg-cleanup = ${this.cleanup}\n`);
       if (opts.length > 0) await state.write("sequencer/opts", `[options]\n${opts.join("")}`);
     }
     return this.run(todo, todo.length > 1);
@@ -241,7 +390,7 @@ export class PickSequencer {
   private async run(todo: TodoItem[], sequenced: boolean): Promise<PickOutcome> {
     const output: string[] = [];
     const picked: ObjectId[] = [];
-    let newHead = await this.headId();
+    let newHead = await this.headIfBorn();
     for (let k = 0; k < todo.length; k++) {
       const item = todo[k];
       const outcome = await this.pickOne(item, output);
@@ -265,44 +414,58 @@ export class PickSequencer {
 
   /** One commit's change merged into HEAD (do_pick_commit). */
   private async pickOne(item: TodoItem, output: string[]): Promise<PickOutcome> {
-    const { deps } = this;
+    const { deps, flags } = this;
     const action = item.action;
+    const name = ACTION_NAME[action];
+    const format = objectFormatOf(deps.workingCopy.history);
     const commit = await deps.commits.load(item.id);
     if (!commit) throw new RefNotFoundError(item.id, `Cannot find commit: ${item.id}`);
-    const headId = await this.headId();
-    const headCommit = await deps.commits.load(headId);
-    if (!headCommit) throw new RefNotFoundError(headId, "HEAD commit not found");
+    // an unborn HEAD picks onto the empty tree (repo_get_oid fails: `unborn`)
+    const headId = await this.headIfBorn();
+    const headCommit = headId ? await deps.commits.load(headId) : undefined;
+    if (headId && !headCommit) throw new RefNotFoundError(headId, "HEAD commit not found");
+    const headTree = headCommit?.tree ?? format.emptyTreeId;
     // with --no-commit the change is merged into the index as it is (git's
     // write_index_as_tree): each commit's change on top of the previous one's
-    const headTreeId = this.options.noCommit
-      ? await writeIndexAsTree(deps.staging, deps.trees, objectFormatOf(deps.workingCopy.history))
-      : headCommit.tree;
+    const headTreeId = flags.noCommit
+      ? await writeIndexAsTree(deps.staging, deps.trees, format)
+      : headTree;
     // a commit is never made on top of staged changes (error_dirty_index)
     const { index } = await readIndex(deps.staging);
-    if (
-      !this.options.noCommit &&
-      (await indexChangesFromTree(index, deps.trees, headTreeId)).length > 0
-    ) {
+    if (!flags.noCommit && (await indexChangesFromTree(index, deps.trees, headTreeId)).length > 0) {
       return this.fail(
-        `error: your local changes would be overwritten by ${ACTION_NAME[action]}.\nhint: commit your changes or stash them to proceed.\nfatal: ${ACTION_NAME[action]} failed`,
+        `error: your local changes would be overwritten by ${name}.\nhint: commit your changes or stash them to proceed.\nfatal: ${name} failed`,
       );
     }
 
-    // the parent the change is taken against
+    // the parent the change is taken against (`-m`: a merge's parent, at most 1 otherwise)
     let parentId: ObjectId | undefined;
+    const mainline = flags.mainline;
+    const noParent = (n: number) =>
+      new InvalidMainlineParentError(
+        n,
+        commit.parents.length,
+        `error: commit ${item.id} does not have parent ${n}\nfatal: ${name} failed`,
+      );
     if (commit.parents.length > 1) {
-      if (this.options.mainline === undefined) {
+      if (!mainline) {
         throw new MultipleParentsNotAllowedError(
-          `error: commit ${item.id} is a merge but no -m option was given.\nfatal: ${ACTION_NAME[action]} failed`,
+          `error: commit ${item.id} is a merge but no -m option was given.\nfatal: ${name} failed`,
         );
       }
-      if (this.options.mainline < 1 || this.options.mainline > commit.parents.length) {
-        throw new InvalidMainlineParentError(this.options.mainline, commit.parents.length);
-      }
-      parentId = commit.parents[this.options.mainline - 1];
+      if (mainline > commit.parents.length) throw noParent(mainline);
+      parentId = commit.parents[mainline - 1];
+    } else if (mainline !== undefined && mainline > 1) {
+      throw noParent(mainline);
     } else {
       parentId = commit.parents[0];
     }
+
+    // --ff: a commit on HEAD (a root commit on an unborn branch) is fast-forwarded to
+    if (flags.allowFf && ((parentId && parentId === headId) || (!parentId && !headId))) {
+      return this.fastForward(item.id, headId, headTree, commit.tree, output);
+    }
+
     const parentTreeId = parentId ? await deps.commits.getTree(parentId) : undefined;
     const subject = subjectOf(commit.message);
     // get_message: short_commit_name, repo_find_unique_abbrev with DEFAULT_ABBREV
@@ -338,25 +501,25 @@ export class PickSequencer {
     const delta = await treeDelta(deps.trees, headTreeId, treeId);
     const refused = await switchTrees(deps, delta.from, delta.to, {
       action: "merge",
-      operation: ACTION_NAME[action],
+      operation: name,
       conflicts,
       targetTree: treeId,
     });
     if (refused) {
-      return this.fail(`${refused.message}\nfatal: ${ACTION_NAME[action]} failed`);
+      return this.fail(`${refused.message}\nfatal: ${name} failed`);
     }
     output.push(...merge.messages);
     await deps.state.setRef("AUTO_MERGE", treeId);
-    const message = this.messageFor(action, item.id, commit, parentId);
+    const message = await this.messageFor(action, item.id, commit, parentId);
 
     if (conflicts.length > 0 || !merge.clean) {
       const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort(compareGitPaths);
       // git records REVERT_HEAD for a revert -n too (do_pick_commit), never CHERRY_PICK_HEAD
-      if (!this.options.noCommit || action === "revert") {
+      if (!flags.noCommit || action === "revert") {
         await deps.state.setRef(HEAD_REF[action], item.id);
       }
       await deps.state.write("MERGE_MSG", `${message}${conflictsComment(paths, true)}`);
-      const advice = this.options.noCommit
+      const advice = flags.noCommit
         ? [
             "hint: after resolving the conflicts, mark the corrected paths",
             "hint: with 'git add <paths>' or 'git rm <paths>'",
@@ -364,10 +527,10 @@ export class PickSequencer {
         : [
             "hint: After resolving the conflicts, mark them with",
             'hint: "git add/rm <pathspec>", then run',
-            `hint: "git ${ACTION_NAME[action]} --continue".`,
-            `hint: You can instead skip this commit with "git ${ACTION_NAME[action]} --skip".`,
-            `hint: To abort and get back to the state before "git ${ACTION_NAME[action]}",`,
-            `hint: run "git ${ACTION_NAME[action]} --abort".`,
+            `hint: "git ${name} --continue".`,
+            `hint: You can instead skip this commit with "git ${name} --skip".`,
+            `hint: To abort and get back to the state before "git ${name}",`,
+            `hint: run "git ${name} --abort".`,
           ];
       return {
         status: "conflicting",
@@ -380,28 +543,55 @@ export class PickSequencer {
         ].join("\n"),
       };
     }
-    if (this.options.noCommit) {
-      await deps.state.write("MERGE_MSG", message);
-      if (action === "revert") await deps.state.setRef(HEAD_REF[action], item.id);
+    // a clean merge: CHERRY_PICK_HEAD (not with --no-commit), MERGE_MSG, REVERT_HEAD for a
+    // revert -n, before allow_empty and do_commit (a commit that fails leaves them)
+    if (action === "pick" && !flags.noCommit) await deps.state.setRef(HEAD_REF[action], item.id);
+    await deps.state.write("MERGE_MSG", message);
+    if (action === "revert" && flags.noCommit) await deps.state.setRef(HEAD_REF[action], item.id);
+
+    // allow_empty: a result equal to HEAD's tree is committed (1), dropped (2) or stops (0)
+    let allow: 0 | 1 | 2 = 0;
+    if (treeId === headTree) {
+      const firstParentTree = commit.parents[0]
+        ? await deps.commits.getTree(commit.parents[0])
+        : format.emptyTreeId;
+      const originallyEmpty = firstParentTree === commit.tree;
+      allow = originallyEmpty
+        ? flags.allowEmpty
+          ? 1
+          : 0
+        : flags.keepRedundant
+          ? 1
+          : flags.dropRedundant
+            ? 2
+            : 0;
+    }
+    if (allow === 2) {
+      await deps.state.deleteRef("CHERRY_PICK_HEAD");
+      await deps.state.remove("MERGE_MSG");
+      await deps.state.deleteRef("AUTO_MERGE");
+      output.push(`dropping ${item.id} ${subject} -- patch contents already upstream`);
       return { status: "ok", newHead: headId, picked: [item.id], output };
     }
-    if (treeId === headCommit.tree) {
-      // nothing to commit: git stops, the pick in progress, for --allow-empty or --skip
-      // (CHERRY_PICK_HEAD only: git records REVERT_HEAD for a revert that conflicts)
-      if (action === "pick") await deps.state.setRef(HEAD_REF[action], item.id);
-      await deps.state.write("MERGE_MSG", message);
+    if (flags.noCommit) {
+      return { status: "ok", newHead: headId, picked: [item.id], output };
+    }
+    if (treeId === headTree && allow === 0) {
+      // nothing to commit: try_to_commit leaves it to `git commit`, which stops, the pick in
+      // progress, for `git commit --allow-empty` or --skip (CHERRY_PICK_HEAD only: git
+      // records REVERT_HEAD for a revert that conflicts)
       return {
         status: "conflicting",
         conflicts: [],
         picked: [],
         output,
         message: [
-          `The previous ${ACTION_NAME[action]} is now empty, possibly due to conflict resolution.`,
+          `The previous ${name} is now empty, possibly due to conflict resolution.`,
           "If you wish to commit it anyway, use:",
           "",
           "    git commit --allow-empty",
           "",
-          `Otherwise, please use 'git ${ACTION_NAME[action]} --skip'`,
+          `Otherwise, please use 'git ${name} --skip'`,
         ].join("\n"),
       };
     }
@@ -409,13 +599,12 @@ export class PickSequencer {
       // do_pick_commit with EDIT_MSG: the message in MERGE_MSG, CHERRY_PICK_HEAD for a pick
       // (git commit then takes its author and says it concludes a cherry-pick), then
       // run_git_commit; git commit cleans up after itself (CHERRY_PICK_HEAD, MERGE_MSG)
-      if (action === "pick") await deps.state.setRef(HEAD_REF[action], item.id);
-      await deps.state.write("MERGE_MSG", message);
       let newHead: ObjectId;
       try {
         newHead = await deps.gitCommit({
           kind: "pick",
-          reflogAction: this.options.reflogAction ?? ACTION_NAME[action],
+          reflogAction: this.options.reflogAction ?? name,
+          allowEmpty: allow === 1,
         });
       } catch (error) {
         if (!(error instanceof GitApiError)) throw error;
@@ -424,26 +613,44 @@ export class PickSequencer {
       }
       return { status: "ok", newHead, picked: [item.id], output };
     }
-    // do_pick_commit records CHERRY_PICK_HEAD for a clean pick too, and writes MERGE_MSG,
-    // before do_commit: a commit that fails (HEAD's lock held) leaves both
-    if (action === "pick") await deps.state.setRef(HEAD_REF[action], item.id);
-    await deps.state.write("MERGE_MSG", message);
     const committer = this.committer();
-    const commitMessage = action === "pick" ? commit.message : message;
     const newHead = await this.commit(
       treeId,
-      [headId],
+      headId ? [headId] : [],
       action === "pick" ? commit.author : this.revertAuthor(committer),
       committer,
-      commitMessage,
+      message,
       // the sequencer's update_head_with_reflog: "cherry-pick: <subject>", "revert: ..."
-      reflogMessages.pick(this.options.reflogAction ?? ACTION_NAME[action], commitMessage),
+      (text) => reflogMessages.pick(this.options.reflogAction ?? name, text),
     );
     // do_commit after try_to_commit: CHERRY_PICK_HEAD (deleted whether there or not) and
     // MERGE_MSG go, a stopped empty pick's left over included (REVERT_HEAD and AUTO_MERGE stay)
     await deps.state.deleteRef("CHERRY_PICK_HEAD");
     await deps.state.remove("MERGE_MSG");
     return { status: "ok", newHead, picked: [item.id], output };
+  }
+
+  /**
+   * fast_forward_to: the index and worktree switched from HEAD's tree to the commit's
+   * (checkout_fast_forward, a two-way switch refusing over local changes), then HEAD moved
+   * there with the reflog line `<action>: fast-forward`.
+   */
+  private async fastForward(
+    id: ObjectId,
+    headId: ObjectId | undefined,
+    headTree: ObjectId,
+    targetTree: ObjectId,
+    output: string[],
+  ): Promise<PickOutcome> {
+    const delta = await treeDelta(this.deps.trees, headTree, targetTree);
+    const refused = await switchTrees(this.deps, delta.from, delta.to, {
+      action: "merge",
+      operation: this.name,
+      targetTree,
+    });
+    if (refused) return this.fail(`${refused.message}\nfatal: ${this.name} failed`);
+    await this.moveHead(id, `${this.name}: fast-forward`, headId ?? null);
+    return { status: "ok", newHead: id, picked: [id], output };
   }
 
   /** `--continue`: the resolved conflict committed, then the rest picked. */
@@ -467,7 +674,7 @@ export class PickSequencer {
       if (!commit) throw new RefNotFoundError(stopped, "Commit being picked not found");
       const treeId = await this.deps.staging.writeTree(this.deps.trees);
       const headCommit = await this.deps.commits.load(newHead);
-      const fallback = this.messageFor(action, stopped, commit, commit.parents[0]);
+      const fallback = await this.messageFor(action, stopped, commit, commit.parents[0]);
       const prepared = (await state.read("MERGE_MSG")) ?? fallback;
       // continue_single_pick runs `git commit --no-edit --cleanup=strip` (plain `git commit`
       // under --edit): without the editor its prepare_to_commit writes MERGE_MSG with its
@@ -505,7 +712,8 @@ export class PickSequencer {
         message,
         // `--continue` commits as `git commit` does: "commit (cherry-pick): <subject>" (a
         // revert is no whence of git commit: "commit: <subject>")
-        reflogMessages.commit(action === "pick" ? "cherry-pick" : undefined, message),
+        (text) => reflogMessages.commit(action === "pick" ? "cherry-pick" : undefined, text),
+        "verbatim",
       );
       // the commit ends the stopped pick (git commit's remove_merge_branch_state)
       await state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD", "AUTO_MERGE");
@@ -634,9 +842,20 @@ export class PickSequencer {
         this.sign = text;
         continue;
       }
-      if (name !== "edit") continue;
+      if (name === "mainline") {
+        const value = Number.parseInt(text, 10);
+        if (Number.isFinite(value)) this.flags.mainline = value;
+        continue;
+      }
+      if (name === "default-msg-cleanup") {
+        this.cleanup = cleanupOf(text) ?? this.cleanup;
+        continue;
+      }
       const value = parseGitBool(text);
-      if (value !== undefined) this.edit = value;
+      if (value === undefined) continue;
+      if (name === "edit") this.edit = value;
+      const key = SAVED_FLAGS[name];
+      if (key) this.flags[key] = value;
     }
   }
 
@@ -645,22 +864,74 @@ export class PickSequencer {
     await this.deps.state.remove("MERGE_MSG", "sequencer");
   }
 
-  /** git's message for the commit a pick or revert makes. */
-  private messageFor(
+  /**
+   * git's message for the commit a pick or revert makes (do_pick_commit's ctx->message): a
+   * pick's message from its subject on, with `-x`'s `(cherry picked from commit <id>)` (after a
+   * blank line unless the message ends with a trailer block); a revert's `Revert "<subject>"`
+   * (`Reapply "..."` for a revert of a revert, `--reference`'s comment and `<abbrev> (<subject>,
+   * <date>)`); then `-s`'s sign-off (append_signoff).
+   */
+  private async messageFor(
     action: PickAction,
     id: ObjectId,
     commit: Commit,
     parentId: ObjectId | undefined,
-  ): string {
+  ): Promise<string> {
+    let message: string;
     if (action === "pick") {
-      return commit.message.endsWith("\n") ? commit.message : `${commit.message}\n`;
+      // find_commit_subject: the message from its first non-blank line
+      message = commit.message.replace(/^(?:[ \t]*\n)+/, "");
+      if (this.flags.recordOrigin) {
+        if (message.length > 0 && !message.endsWith("\n")) message += "\n";
+        if (trailerLinesOf(message, trailerConfigOf(this.deps.workingCopy)).length === 0) {
+          message += "\n";
+        }
+        message += `(cherry picked from commit ${id})\n`;
+      }
+    } else {
+      message = await this.revertMessage(id, commit, parentId);
     }
+    if (this.flags.signoff) {
+      const committer = this.options.committer ?? committerIdentOf(this.deps.workingCopy);
+      message = appendSignoff(
+        message,
+        signoffLine(committer),
+        trailerConfigOf(this.deps.workingCopy),
+      );
+    }
+    return message;
+  }
+
+  /** sequencer_format_revert_message. */
+  private async revertMessage(
+    id: ObjectId,
+    commit: Commit,
+    parentId: ObjectId | undefined,
+  ): Promise<string> {
     const subject = subjectOf(commit.message);
-    const reverting =
-      commit.parents.length > 1 && parentId
-        ? `This reverts commit ${id}, reversing\nchanges made to ${parentId}.`
-        : `This reverts commit ${id}.`;
-    return `Revert "${subject}"\n\n${reverting}\n`;
+    const reference = this.options.reference ?? revertReferenceOf(this.deps.workingCopy);
+    let out: string;
+    if (reference) {
+      // git 2.43 wrote `#` whatever core.commentChar said (2.45 follows it)
+      const comment =
+        this.deps.hooks?.compatibility === "2.43" ? "#" : commentStringOf(this.deps.workingCopy);
+      out = `${comment} *** SAY WHY WE ARE REVERTING ON THE TITLE LINE ***\n`;
+    } else if (subject.startsWith('Revert "') && !subject.slice(8).startsWith('Revert "')) {
+      out = `Reapply "${subject.slice(8)}\n`;
+    } else {
+      out = `Revert "${subject}"\n`;
+    }
+    const refer = async (target: ObjectId) => {
+      if (!reference) return target;
+      const referred = await this.deps.commits.load(target);
+      const short = await this.abbreviator.abbreviate(target);
+      return `${short} (${subjectOf(referred?.message ?? "")}, ${shortDate(referred?.author)})`;
+    };
+    out += `\nThis reverts commit ${await refer(id)}`;
+    if (commit.parents.length > 1 && parentId) {
+      out += `, reversing\nchanges made to ${await refer(parentId)}`;
+    }
+    return `${out}.\n`;
   }
 
   /**
@@ -688,16 +959,34 @@ export class PickSequencer {
     author: PersonIdent,
     committer: PersonIdent,
     message: string,
-    reflogMessage: string,
+    reflogMessage: (text: string) => string,
+    /** a cleanup of the message after the hook (default: the sequencer's, see cleanupMode) */
+    cleanup: SequencerCleanup = this.commitCleanup(),
   ): Promise<ObjectId> {
     // try_to_commit: prepare-commit-msg may rewrite the message; post-commit after
     const hooks = this.deps.hooks;
-    const text = hooks ? await sequencerPrepareMessage(hooks, this.deps.state, message) : message;
+    let text = hooks ? await sequencerPrepareMessage(hooks, this.deps.state, message) : message;
+    if (cleanup !== "verbatim") {
+      text = stripspace(
+        text,
+        cleanup === "strip" ? commentStringOf(this.deps.workingCopy) : undefined,
+      );
+    }
     if (this.sign !== undefined) throw this.signingFailed(this.sign);
     const id = await this.deps.commits.store({ tree, parents, author, committer, message: text });
-    await this.moveHead(id, reflogMessage);
+    await this.moveHead(id, reflogMessage(text));
     if (hooks) await sequencerPostCommit(hooks);
     return id;
+  }
+
+  /**
+   * try_to_commit's cleanup: whitespace for `-s`/`-x` unless commit.cleanup is set, else
+   * commit.cleanup's (`scissors` is whitespace without an editor), else none.
+   */
+  private commitCleanup(): SequencerCleanup {
+    if ((this.flags.signoff || this.flags.recordOrigin) && !this.cleanup) return "whitespace";
+    if (this.cleanup === "scissors") return "whitespace";
+    return this.cleanup ?? "verbatim";
   }
 
   /**
@@ -720,12 +1009,17 @@ export class PickSequencer {
   }
 
   /** HEAD (its branch, when attached) moved to `id`, with `message` in the reflogs. */
-  private async moveHead(id: ObjectId, message: string): Promise<void> {
+  private async moveHead(
+    id: ObjectId,
+    message: string,
+    /** the old value the transaction expects (default HEAD's, null for an unborn HEAD) */
+    expected?: ObjectId | null,
+  ): Promise<void> {
     this.clock ??= Math.floor(Date.now() / 1000);
     const log = reflogLine(this.deps.workingCopy, message, this.options.committer, this.clock);
     // update_head_with_reflog: one transaction on HEAD expecting the commit's parent, as the
     // reference-transaction hook sees it
-    const current = (await this.deps.refs.resolve("HEAD"))?.objectId;
+    const current = expected !== undefined ? expected : await this.headIfBorn();
     const result = await this.deps.refs.batch(
       [{ name: "HEAD", old: current ?? null, new: id }],
       log,
@@ -779,6 +1073,12 @@ export class PickSequencer {
         ...(legacy ? [`fatal: ${this.name} failed`] : []),
       ].join("\n"),
     );
+  }
+
+  /** HEAD's commit, undefined while HEAD's branch is unborn. */
+  private async headIfBorn(): Promise<ObjectId | undefined> {
+    const resolved = await this.deps.refs.resolve("HEAD").catch(() => undefined);
+    return resolved?.objectId || undefined;
   }
 
   private async headId(): Promise<ObjectId> {
@@ -921,4 +1221,28 @@ export async function expandCommitIds(
     if (!found) throw new RefNotFoundError(id, `Cannot resolve commit ${id}`);
     return found;
   });
+}
+
+/** `revert.reference` (git_sequencer_config, revert only). */
+function revertReferenceOf(workingCopy: SequencerDeps["workingCopy"]): boolean {
+  const value = RemoteConfigStore.from(workingCopy).value("revert.reference");
+  return value === undefined ? false : (parseGitBool(value) ?? false);
+}
+
+/** comment_line_str: `core.commentString`, else `core.commentChar` (`auto`: `#`). */
+function commentStringOf(workingCopy: SequencerDeps["workingCopy"]): string {
+  const config = RemoteConfigStore.from(workingCopy);
+  const value = config.value("core.commentString") ?? config.value("core.commentChar");
+  return value && value !== "auto" ? value : "#";
+}
+
+/** DATE_SHORT of an ident: `YYYY-MM-DD` in its own zone. */
+function shortDate(ident: PersonIdent | undefined): string {
+  if (!ident) return "";
+  const tz = ident.tzOffset || "+0000";
+  const sign = tz.startsWith("-") ? -1 : 1;
+  const minutes = sign * (Number(tz.slice(1, 3)) * 60 + Number(tz.slice(3, 5)));
+  const d = new Date((ident.timestamp + minutes * 60) * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
 }

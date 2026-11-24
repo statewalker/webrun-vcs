@@ -353,7 +353,7 @@ describe.each(backends)("RevertCommand ($name backend)", ({ factory }) => {
         .include(mergeCommit ?? "")
         .setMainlineParentNumber(3)
         .call(),
-    ).rejects.toThrow("Invalid mainline parent: 3");
+    ).rejects.toThrow("does not have parent 3");
   });
 
   /**

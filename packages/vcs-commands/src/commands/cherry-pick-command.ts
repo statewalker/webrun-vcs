@@ -2,6 +2,7 @@ import type { PersonIdent } from "@statewalker/vcs-core";
 
 import { parseGitBool } from "@statewalker/vcs-utils";
 
+import { GitApiError } from "../errors/git-api-error.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type CherryPickResult, CherryPickStatus } from "../results/cherry-pick-result.js";
@@ -14,6 +15,7 @@ import {
   type PickCommitMode,
   type PickOutcome,
   PickSequencer,
+  pickOptionsConflict,
   SequencerOperation,
 } from "./sequencer-pick.js";
 
@@ -55,6 +57,13 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
   /** `-S[<keyid>]` / `--no-gpg-sign` (undefined: `commit.gpgSign`) */
   private sign?: boolean | string;
   private editor?: CommitEditor;
+  private signoff = false;
+  private recordOrigin = false;
+  private allowEmpty = false;
+  private allowEmptyMessage = false;
+  private keepRedundant = false;
+  private empty?: "stop" | "drop" | "keep";
+  private allowFf = false;
 
   /**
    * Add a commit to cherry-pick.
@@ -218,6 +227,77 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
   }
 
   /**
+   * `-s` / `--signoff`: the committer's `Signed-off-by:` added to each message as git's
+   * append_signoff adds it (after a blank line unless the message ends with a trailer block,
+   * nothing when that block's last line is it already; `trailer.*` configuration applies).
+   * The message is then cleaned up as `whitespace` unless `commit.cleanup` says otherwise.
+   */
+  setSignoff(signoff: boolean): this {
+    this.checkCallable();
+    this.signoff = signoff;
+    return this;
+  }
+
+  /**
+   * `-x`: `(cherry picked from commit <id>)` added to each message, after a blank line unless
+   * the message ends with a trailer block; the message is then cleaned up as `whitespace`
+   * unless `commit.cleanup` says otherwise.
+   */
+  setRecordOrigin(recordOrigin: boolean): this {
+    this.checkCallable();
+    this.recordOrigin = recordOrigin;
+    return this;
+  }
+
+  /** `--allow-empty`: a commit that is empty in itself is committed (default: the pick stops). */
+  setAllowEmpty(allowEmpty: boolean): this {
+    this.checkCallable();
+    this.allowEmpty = allowEmpty;
+    return this;
+  }
+
+  /** `--allow-empty-message` (kept in `sequencer/opts`; a message is never refused here). */
+  setAllowEmptyMessage(allowEmptyMessage: boolean): this {
+    this.checkCallable();
+    this.allowEmptyMessage = allowEmptyMessage;
+    return this;
+  }
+
+  /**
+   * `--keep-redundant-commits` (git's deprecated `--empty=keep`): a commit whose change is in
+   * HEAD already is committed empty; implies {@link setAllowEmpty}.
+   */
+  setKeepRedundantCommits(keep: boolean): this {
+    this.checkCallable();
+    this.keepRedundant = keep;
+    return this;
+  }
+
+  /**
+   * `--empty=<mode>` (git 2.45+): what to do with a commit whose change is in HEAD already:
+   * `stop` (the default: the pick stops for `git commit --allow-empty` or `--skip`), `drop`
+   * (skipped, with git's `dropping <id> <subject> -- patch contents already upstream` line in
+   * the result's output) or `keep` (committed empty, as {@link setKeepRedundantCommits}).
+   * A commit empty in itself is still left to {@link setAllowEmpty}.
+   */
+  setEmpty(mode: "stop" | "drop" | "keep"): this {
+    this.checkCallable();
+    this.empty = mode;
+    return this;
+  }
+
+  /**
+   * `--ff`: a commit whose parent (the `-m` one of a merge) is HEAD, or a root commit on an
+   * unborn branch, is fast-forwarded to (reflog `cherry-pick: fast-forward`) instead of
+   * picked. Refused with `-s`, `-x`, `--no-commit` and `--edit`, as git refuses them.
+   */
+  setFastForward(fastForward: boolean): this {
+    this.checkCallable();
+    this.allowFf = fastForward;
+    return this;
+  }
+
+  /**
    * The editor of {@link setEdit} (git's `core.editor` / `GIT_EDITOR`): see
    * `CommitCommand.setEditor`. Without one the template is kept as it is (comments stripped).
    */
@@ -240,6 +320,7 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
         .setNoVerify(true)
         .setEdit(true)
         .setReflogAction(mode.reflogAction);
+      if (mode.allowEmpty) commit.setAllowEmpty(true);
     } else {
       commit.shareHooksOf(this).setEdit(mode.edit);
       if (!mode.edit) commit.setCleanupMode(CleanupMode.STRIP);
@@ -258,6 +339,7 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
   async call(): Promise<CherryPickResult> {
     this.checkCallable();
     this.setCallable(false);
+    this.checkOptions();
     // the index as it is now, before the worktree or a ref is touched: one another writer
     // replaced is read again (git reads the index at its start), unless this instance holds
     // unwritten edits (refused)
@@ -266,6 +348,32 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
     const run = () => this.run();
     const result = toResult(await (worktree?.batch ? worktree.batch(run) : run()));
     return this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result;
+  }
+
+  /** parse_options and verify_opt_compatible: git's refusals before anything is read. */
+  private checkOptions(): void {
+    if (this.mainlineParent !== undefined && !(this.mainlineParent > 0)) {
+      throw new GitApiError("error: option `mainline' expects a number greater than zero", {
+        exitCode: 129,
+      });
+    }
+    const conflict = pickOptionsConflict(
+      "pick",
+      this.operation,
+      {
+        action: "pick",
+        noCommit: this.noCommit,
+        mainline: this.mainlineParent,
+        signoff: this.signoff,
+        edit: this.edit,
+        recordOrigin: this.recordOrigin,
+        allowFf: this.allowFf,
+        keepRedundant: this.keepRedundant || this.empty === "keep",
+        emptyGiven: this.empty !== undefined,
+      },
+      this.hooks.compatibility,
+    );
+    if (conflict) throw new GitApiError(conflict, { exitCode: 128 });
   }
 
   /** What the sparse checkout printed while the result was written. */
@@ -296,6 +404,13 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
         committer: this.committer,
         edit: this.edit,
         sign: this.sign,
+        signoff: this.signoff,
+        recordOrigin: this.recordOrigin,
+        allowEmpty: this.allowEmpty,
+        allowEmptyMessage: this.allowEmptyMessage,
+        keepRedundant: this.keepRedundant || this.empty === "keep",
+        dropRedundant: this.empty === "drop",
+        allowFf: this.allowFf,
         reflogAction: this.reflogAction(this.reflogPrefix.replace(/:$/, "")),
       },
     );
