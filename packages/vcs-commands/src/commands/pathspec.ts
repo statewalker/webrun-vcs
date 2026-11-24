@@ -1170,7 +1170,8 @@ export function prefixOriginElement(
  * parsePathspecFile('a.txt\n"caf\\303\\251"\n'); // ["a.txt", "café"]
  * ```
  *
- * A NUL inside a line ends its element, as `strvec_push` copies a C string.
+ * A NUL inside a line ends it, before unquoting (`"a<NUL>x"` is badly quoted, `"a"<NUL>x`
+ * names `a`), as git hands the line on as a C string.
  *
  * @throws Error "line is badly quoted: <line>" as git dies
  */
@@ -1184,7 +1185,10 @@ export function parsePathspecFile(content: string | Uint8Array, nul = false): st
     if (end < 0) end = bytes.length;
     let lineEnd = end;
     if (!nul && lineEnd > start && bytes[lineEnd - 1] === 0x0d) lineEnd--;
-    const line = bytes.subarray(start, lineEnd);
+    // git reads each line as a C string: a NUL ends it, before any unquoting
+    const raw = bytes.subarray(start, lineEnd);
+    const cut = raw.indexOf(0);
+    const line = cut < 0 ? raw : raw.subarray(0, cut);
     if (!nul && line[0] === 0x22) {
       const unquoted = unquoteGitPath(line);
       // unquote_c_style without endp: what follows the closing quote is ignored
@@ -1193,7 +1197,7 @@ export function parsePathspecFile(content: string | Uint8Array, nul = false): st
       }
       out.push(cString(unquoted.path));
     } else {
-      out.push(cString(decodeGitPath(line)));
+      out.push(decodeGitPath(line));
     }
     start = end + 1;
   }

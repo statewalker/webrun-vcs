@@ -5,7 +5,12 @@ import {
   type Worktree,
   withWorktreeEntries,
 } from "@statewalker/vcs-working-tree";
-import { InvalidConfigError, NoFilepatternError, RmFailedError } from "../errors/index.js";
+import {
+  InvalidArgumentError,
+  InvalidConfigError,
+  NoFilepatternError,
+  RmFailedError,
+} from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { worktreeModeTrust } from "./core-config.js";
 import { IndexAdder } from "./index-adder.js";
@@ -290,7 +295,17 @@ export class RmCommand extends GitCommand<RmResult> {
     // git's pathspec (parse_pathspec, then ce_path_match): `.` and `./d` name everything
     // beneath, a directory its files, a glob's `*` crosses slashes; `seen` tells which
     // elements matched (git's ps_matched)
-    const items = parsePathspec(this.filepatterns, { attr: true });
+    let items: PathspecItem[];
+    try {
+      items = parsePathspec(this.filepatterns, { attr: true });
+    } catch (error) {
+      // parse_pathspec dies (an empty element, bad magic)
+      throw new InvalidArgumentError(
+        "filepattern",
+        this.filepatterns,
+        `fatal: ${(error as Error).message}`,
+      );
+    }
     // `:(attr:...)`: the attributes of the index's paths (match_pathspec_attrs)
     const attributes = PathspecAttributes.forWorktree(items, this.worktreeAccess);
     if (attributes) {

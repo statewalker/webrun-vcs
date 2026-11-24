@@ -660,3 +660,62 @@ describeGit("t3909-stash-pathspec-file.sh", () => {
     );
   });
 });
+
+describeGit("a NUL inside a pathspec file's line (parse_pathspec_file reads C strings)", () => {
+  let template: string;
+  beforeAll(() => {
+    template = init("nul-in-line");
+    writeFiles(template, FILES, () => "1\n");
+    git(template, ["add", ...FILES]);
+    git(template, ["commit", "-qm", "files"]);
+    // staged changes for the commits
+    writeFiles(template, FILES, () => "2\n");
+    git(template, ["add", ...FILES]);
+  });
+
+  const CASES = [
+    ["a NUL before the closing quote: badly quoted", '"fileA.t\0x"\n'],
+    ["a NUL after the closing quote: ignored", '"fileA.t"\0x\nfileB.t\n'],
+    ["an escaped NUL ends the element", '"fileA.t\\000x"\n'],
+  ] as const;
+
+  for (const [label, content] of CASES) {
+    it(`rm: ${label}`, async () => {
+      await expectTwins(
+        template,
+        label,
+        ["rm", "-f", "--pathspec-from-file=-"],
+        (g) => g.rm().setForce(true).setPathspecFromFile(content).call(),
+        content,
+      );
+    });
+    it(`commit: ${label}`, async () => {
+      await expectTwins(
+        template,
+        label,
+        ["commit", "--pathspec-from-file=-", "-m", "Commit"],
+        (g) => g.commit().setPathspecFromFile(content).setMessage("Commit").call(),
+        content,
+      );
+    });
+    it(`stash push: ${label}`, async () => {
+      await expectTwins(
+        template,
+        label,
+        ["stash", "push", "--pathspec-from-file=-"],
+        (g) => g.stashCreate().setPathspecFromFile(content).call(),
+        content,
+      );
+    });
+  }
+
+  it("rm: an empty element dies as parse_pathspec does", async () => {
+    await expectTwins(
+      template,
+      "empty element",
+      ["rm", "-f", "--pathspec-from-file=-"],
+      (g) => g.rm().setForce(true).setPathspecFromFile("fileA.t\n\n").call(),
+      "fileA.t\n\n",
+    );
+  });
+});
