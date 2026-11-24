@@ -21,6 +21,16 @@ import {
   wildmatch,
   xdgConfigPath,
 } from "@statewalker/vcs-working-tree";
+import {
+  ConfigCursor,
+  headerNames,
+  isAlpha,
+  isAsciiKeyChar,
+  isConfigSpace,
+  isKeyChar,
+  readConfigValue,
+  readSectionHeader,
+} from "./config-scanner.js";
 
 /**
  * The config files of a repository in `files`: read and written through it, with its root
@@ -49,6 +59,8 @@ export function configFilesApiOf(
           throw new Error(readOnly);
         }
       : (path, content) => files.write(path, [content]),
+    // `git config`'s own edits go through the storage itself (a lock file renamed into place)
+    ...(readOnly ? {} : { files }),
     ...(posix.rootDirectory ? { rootDirectory: posix.rootDirectory } : {}),
     ...(posix.lstat && posix.readlink
       ? { lstat: posix.lstat.bind(posix), readlink: posix.readlink.bind(posix) }
@@ -115,6 +127,12 @@ export interface ConfigFilesApi {
    */
   readPrefix?(path: string, maxBytes: number): Promise<Uint8Array | undefined>;
   write(path: string, content: Uint8Array): Promise<void>;
+  /**
+   * The storage these paths are in, when the config may be edited as `git config` edits it
+   * (`setConfigMultivarInFile`, `renameConfigSectionInFile`: under `<file>.lock`); absent,
+   * such edits are refused
+   */
+  files?: FilesApi;
   /**
    * The host directory these paths are relative to: an include climbing above it is read
    * from the host (git's), or, with `includes: "files"`, an absolute include inside it is
@@ -306,6 +324,24 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     private readonly options: GitConfigOptions = {},
   ) {
     if (options.environment) this.environment = options.environment;
+  }
+
+  /** The files this configuration is read from and written to */
+  get configFiles(): ConfigFilesApi {
+    return this.files;
+  }
+
+  /** The path of this file in {@link configFiles} (`.git/config`) */
+  get filePath(): string {
+    return this.configPath;
+  }
+
+  /**
+   * The path of the worktree's `config.worktree` in {@link configFiles}, read on top of this
+   * file under `extensions.worktreeConfig` (git's `repo_git_path(r, "config.worktree")`)
+   */
+  get worktreeFilePath(): string {
+    return this.options.worktreeConfigPath ?? `${dirOf(this.configPath)}config.worktree`;
   }
 
   /** The git directory as the host names it ({@link GitConfigOptions.gitDirPath}), when given */
@@ -2000,10 +2036,6 @@ function canonicalizeKey(key: string): string | undefined {
   return `${section}.${key.slice(first + 1, last)}.${name}`;
 }
 
-/** C's `isalnum` or `-`: git's `iskeychar`. */
-const isAsciiKeyChar = (c: string) =>
-  (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c === "-";
-
 /**
  * git's `git_config_parse_key`: the key's canonical form, or git's error. The section
  * (before the first dot) and the name (after the last) are letters, digits and `-`, the
@@ -2077,40 +2109,6 @@ function requireSectionName(section: string): string {
 }
 
 /**
- * git's `section_name_match`: where a header line naming the section `name`
- * (`branch.feat`) ends, the whitespace after it included, or 0 when it names another one.
- * The header is matched as written, case and all (`[Branch "feat"]` is not `branch.feat`).
- */
-function headerNames(text: string, name: string): number {
-  const isSpace = isConfigSpace;
-  let i = 0;
-  while (isSpace(text[i])) i++;
-  if (text[i] !== "[") return 0;
-  let j = 0;
-  let dot = false;
-  for (i++; i < text.length && text[i] !== "]"; i++) {
-    if (!dot && isSpace(text[i])) {
-      dot = true;
-      if (name[j++] !== ".") break;
-      for (i++; isSpace(text[i]); i++);
-      if (text[i] !== '"') break;
-      continue;
-    }
-    if (text[i] === "\\" && dot) i++;
-    else if (text[i] === '"' && dot) {
-      for (i++; isSpace(text[i]); i++);
-      break;
-    }
-    if (text[i] !== name[j++]) break;
-  }
-  if (text[i] === "]" && j === name.length) {
-    for (i++; isSpace(text[i]); i++);
-    return i;
-  }
-  return 0;
-}
-
-/**
  * Whether a section header line has a comment after its `]` (git's parser reports it as
  * a comment, which keeps the section when its last variable is unset).
  */
@@ -2161,48 +2159,6 @@ type ConfigItem =
   | { kind: "section"; section: string; start: number; end: number }
   | { kind: "entry"; name: string; written: string | undefined; start: number; end: number };
 
-/** git's `isspace` (`sane_ctype`): space, tab, newline and carriage return, not `\v` or `\f` */
-const isConfigSpace = (c: string | undefined) =>
-  c === " " || c === "\t" || c === "\n" || c === "\r";
-const isAlpha = (c: string) => (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
-/** git's `iskeychar`: alphanumeric or `-` */
-const isKeyChar = (c: string) => isAlpha(c) || (c >= "0" && c <= "9") || c === "-";
-
-/** git's `config_source` reading a string: `get_next_char` with its line counter. */
-class ConfigCursor {
-  private pos = 0;
-  /** git's `linenr`: from 1, one more for each newline read and for each read at the end */
-  linenr = 1;
-  /** The physical line (from 0) of the next character */
-  physical = 0;
-  /** The physical line of the character read last */
-  last = 0;
-  eof = false;
-
-  constructor(private readonly text: string) {}
-
-  next(): string {
-    if (this.pos >= this.text.length) {
-      this.eof = true;
-      this.linenr++;
-      this.last = this.physical;
-      return "\n";
-    }
-    let c = this.text[this.pos++];
-    // DOS line ends: `\r\n` reads as `\n`, a lone `\r` as itself
-    if (c === "\r" && this.text[this.pos] === "\n") {
-      this.pos++;
-      c = "\n";
-    }
-    this.last = this.physical;
-    if (c === "\n") {
-      this.linenr++;
-      this.physical++;
-    }
-    return c;
-  }
-}
-
 /**
  * git's `git_parse_source` over a whole file: its headers and variables, each with the
  * physical lines it spans (a value continued with a backslash at the end of a line runs on
@@ -2250,112 +2206,6 @@ function scanConfig(text: string): { items: ConfigItem[]; errorLine?: number } {
       if (nul >= 0) written = written.slice(0, nul);
     }
     items.push({ kind: "entry", name, written, start, end: cs.last });
-  }
-}
-
-/**
- * git's `get_base_var` / `get_extended_base_var` after the `[`: `section`, `section.sub`
- * (lower-cased) or `section "sub"` (the subsection's case kept, a backslash escaping the
- * next character, `"]` closing it); undefined where git refuses it.
- */
-function readSectionHeader(cs: ConfigCursor): string | undefined {
-  let name = "";
-  for (;;) {
-    let c = cs.next();
-    if (cs.eof) return undefined;
-    if (c === "]") return name;
-    if (isConfigSpace(c)) {
-      do {
-        if (c === "\n") {
-          cs.linenr--;
-          return undefined;
-        }
-        c = cs.next();
-      } while (isConfigSpace(c));
-      if (c !== '"') return undefined;
-      name += ".";
-      for (;;) {
-        let s = cs.next();
-        if (s === "\n") {
-          cs.linenr--;
-          return undefined;
-        }
-        if (s === '"') break;
-        if (s === "\\") {
-          s = cs.next();
-          if (s === "\n") {
-            cs.linenr--;
-            return undefined;
-          }
-        }
-        name += s;
-      }
-      return cs.next() === "]" ? name : undefined;
-    }
-    if (!isKeyChar(c) && c !== ".") return undefined;
-    name += c.toLowerCase();
-  }
-}
-
-/**
- * git's `parse_value`, after the `=`: blanks around the value dropped, `"..."` keeping them
- * (and `#`, `;`), `\n` `\t` `\b` `\"` `\\` unescaped, a backslash at the end of a line
- * joining the next one, an unquoted `#` or `;` starting a comment; undefined (git refuses
- * the line) for another escape or a quote still open at the end of the line.
- */
-function readConfigValue(cs: ConfigCursor): string | undefined {
-  let quote = false;
-  let comment = false;
-  let trimLength = 0;
-  let value = "";
-  for (;;) {
-    let c = cs.next();
-    if (c === "\n") {
-      if (quote) {
-        cs.linenr--;
-        return undefined;
-      }
-      return trimLength ? value.slice(0, trimLength) : value;
-    }
-    if (comment) continue;
-    if (isConfigSpace(c) && !quote) {
-      if (!trimLength) trimLength = value.length;
-      if (value.length) value += c;
-      continue;
-    }
-    if (!quote && (c === ";" || c === "#")) {
-      comment = true;
-      continue;
-    }
-    trimLength = 0;
-    if (c === "\\") {
-      c = cs.next();
-      switch (c) {
-        case "\n":
-          continue;
-        case "t":
-          c = "\t";
-          break;
-        case "b":
-          c = "\b";
-          break;
-        case "n":
-          c = "\n";
-          break;
-        case "\\":
-        case '"':
-          break;
-        default:
-          return undefined;
-      }
-      value += c;
-      continue;
-    }
-    if (c === '"') {
-      quote = !quote;
-      continue;
-    }
-    value += c;
   }
 }
 

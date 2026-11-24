@@ -16,6 +16,7 @@ export * from "./clean-command.js";
 export * from "./clone-command.js";
 export * from "./comment-char-config.js";
 export * from "./commit-command.js";
+export * from "./config-command.js";
 export * from "./date-format.js";
 export * from "./default-branch.js";
 export * from "./describe-command.js";

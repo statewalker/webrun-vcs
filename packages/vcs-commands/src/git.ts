@@ -23,6 +23,7 @@ import {
   CleanCommand,
   CloneCommand,
   CommitCommand,
+  ConfigCommand,
   CopyBranchCommand,
   CreateBranchCommand,
   DeleteBranchCommand,
@@ -837,6 +838,21 @@ export class Git implements Disposable {
   interpretTrailers(): InterpretTrailersCommand {
     this.checkClosed();
     return new InterpretTrailersCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a ConfigCommand (`git config`): get, set, add, unset (with value patterns and
+   * `--all`), rename-section and remove-section, on the repository's file or a scope's
+   * (`--local`, `--worktree`, `--global`, `--system`, `--file`).
+   *
+   * @example
+   * ```typescript
+   * const { exitCode, stderr } = await git.config().unset("remote.origin.fetch").setAll(true).call();
+   * ```
+   */
+  config(): ConfigCommand {
+    this.checkClosed();
+    return new ConfigCommand(this._workingCopy);
   }
 
   /**
