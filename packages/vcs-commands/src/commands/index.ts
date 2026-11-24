@@ -15,6 +15,7 @@ export * from "./checkout-paths.js";
 export * from "./cherry-command.js";
 export * from "./cherry-pick-command.js";
 export * from "./clean-command.js";
+export * from "./clean-interactive.js";
 export * from "./clone-command.js";
 export * from "./comment-char-config.js";
 export * from "./commit-command.js";

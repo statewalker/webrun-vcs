@@ -135,7 +135,20 @@ export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
       if (args.reverse) apply.setReverse(true);
       if (args.check) apply.setCheck(true);
       const temporary = options.temporaryIndex;
-      if (temporary && args.cached) apply.setTemporaryIndex(new Map(temporary));
+      if (temporary && args.cached) {
+        apply.setTemporaryIndex(
+          new Map(
+            [...temporary].map(([path, e]) => [
+              path,
+              {
+                mode: e.mode,
+                objectId: e.objectId,
+                ...(e.carried?.intentToAdd ? { intentToAdd: true } : {}),
+              },
+            ]),
+          ),
+        );
+      }
       const result = await apply.call();
       if (temporary && args.cached && !args.check && result.exitCode === 0 && result.index) {
         // the paths apply rewrote get new entries (no stat data, no flags); the others stay

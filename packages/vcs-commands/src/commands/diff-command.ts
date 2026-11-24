@@ -832,8 +832,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   }
 
   /**
-   * Show intent-to-add entries in a `--cached` comparison as the empty files they name, as
-   * plumbing's `diff-index --cached` does (porcelain `git diff` sets `ita_invisible_in_index`).
+   * Show intent-to-add entries as the empty files they name, as plumbing's
+   * `diff-index --cached` and `diff-files` do (porcelain `git diff` sets
+   * `ita_invisible_in_index`): in a `--cached` comparison on the index side, against the
+   * worktree as the old side (`git add -e`'s diff).
    *
    * @internal
    */
@@ -3315,7 +3317,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       }
       if (!this.matches(entry.path)) continue;
       const side = await compareWith(entry, current);
-      if (changedOnly && !entry.intentToAdd) {
+      if (changedOnly && (!entry.intentToAdd || this.intentToAddVisible)) {
         // diff-files: an entry its file still holds is no change on either side, left out
         // of both (the index side is the entry, as `indexSide` gives it)
         if (side && side.id === entry.objectId && side.mode === entry.mode && !side.dirty) {
