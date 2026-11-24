@@ -202,10 +202,12 @@ export class RevertCommand extends GitCommand<RevertResult> {
 
   /**
    * `-S` (true) / `--no-gpg-sign` (false): whether to sign the commits made; undefined (the
-   * default) leaves it to `commit.gpgSign`. No signer exists yet: a commit asked to be
-   * signed fails as git's does when gpg cannot sign (`error: gpg failed to sign the data:`,
-   * `error: failed to write commit object`; 2.43 adds `fatal: revert failed`, exit 128, 2.5x
-   * exits 1: {@link SigningFailedError}), the pick left in progress and nothing committed.
+   * default) leaves it to `commit.gpgSign`. Each commit is signed through the host's signer
+   * (`GitHostEnvironment.signer`) as git's sequencer signs it (try_to_commit's commit_tree, or
+   * the `git commit -S<key>` it runs after an edit or a resolved conflict). When it cannot be
+   * signed the pick fails as git's does (`error: gpg failed to sign the data:`, `error: failed
+   * to write commit object`; 2.43 adds `fatal: revert failed`, exit 128, 2.5x exits 1:
+   * {@link SigningFailedError}), left in progress and nothing committed.
    */
   setSign(sign: boolean | undefined): this {
     this.checkCallable();

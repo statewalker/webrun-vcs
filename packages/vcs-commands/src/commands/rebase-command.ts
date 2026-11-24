@@ -102,12 +102,7 @@ import {
   saveAutostash,
 } from "./sequencer-support.js";
 import { showCommit } from "./show-commit.js";
-import {
-  SIGNING_FAILED_LINES,
-  SigningFailedError,
-  type SignRequest,
-  signRequestOf,
-} from "./signing.js";
+import { SigningFailedError, type SignRequest, signRequestOf } from "./signing.js";
 import {
   amendWithTrailers,
   appendSignoff,
@@ -326,6 +321,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private ignoreDate = false;
   /** `--signoff` (kept in `rebase-merge/signoff`) */
   private signoff = false;
+  /** `--force-rebase` (REBASE_FORCE) */
+  private forceRebase = false;
   /** `-S[<keyid>]` / `--no-gpg-sign` (undefined: `commit.gpgSign`; kept in `gpg_sign_opt`) */
   private sign?: boolean | string;
   /** What this run signs with (git's opts->gpg_sign), once known */
@@ -694,8 +691,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   /**
    * `-S` (true) / `--no-gpg-sign` (false): whether to sign the commits the rebase makes;
    * undefined (the default) leaves it to `commit.gpgSign`. Kept in
-   * `rebase-merge/gpg_sign_opt` for `--continue`. Not signed yet: a pick that must
-   * commit fails as git's does when gpg cannot sign (`error: gpg failed to sign the data:`,
+   * `rebase-merge/gpg_sign_opt` for `--continue`. Every commit the rebase writes is signed
+   * through the host's signer (`GitHostEnvironment.signer`) as git's sequencer signs it; when
+   * it cannot be signed the step fails as git's does (`error: gpg failed to sign the data:`,
    * `error: failed to write commit object`) and the rebase stops there (2.5x: `Could not
    * apply ...`, the pick to commit; 2.43: the pick rescheduled), the branch untouched.
    * Picks kept as they are (fast-forwarded) sign nothing, as in git.
@@ -729,12 +727,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
-   * commit_tree's signing of a commit the rebase makes: rebase does not sign yet, so a run that
-   * signs fails with gpg's lines ({@link SigningFailedError}); the step says what follows.
+   * commit_tree's signing of a commit the rebase makes, with this run's key (git's
+   * opts->gpg_sign), the signing program in the worktree top. When it cannot be signed:
+   * {@link SigningFailedError} with gpg's lines alone; the step says what follows.
    */
-  private async refuseSigning(state: OperationState): Promise<void> {
-    const sign = await this.signRequest(state);
-    if (sign !== undefined) throw new SigningFailedError(SIGNING_FAILED_LINES.join("\n"), sign);
+  private async signedRebaseCommit(state: OperationState, commit: Commit): Promise<Commit> {
+    return this.signedCommit(await this.signRequest(state), commit, []);
   }
 
   /** sequencer.c's gpg_sign_opt_quoted: `'-S<key>'` (shell-quoted) when the run signs, else "". */
@@ -841,6 +839,18 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   setAutosquash(value: boolean): this {
     this.checkCallable();
     this.autosquash = value;
+    return this;
+  }
+
+  /**
+   * `--force-rebase` (`-f`, `--no-ff`): every commit is picked again, even one whose parent is
+   * already where the rebase puts it (git's REBASE_FORCE: no allow_ff, no up-to-date
+   * shortcut, `Current branch <name> is up to date, rebase forced.`). Like git, a `--continue`
+   * does not remember it.
+   */
+  setForceRebase(value: boolean): this {
+    this.checkCallable();
+    this.forceRebase = value;
     return this;
   }
 
@@ -1271,6 +1281,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // to do (unless forced, as the date options and --signoff do); an interactive rebase,
     // --exec and --autosquash never take the shortcut (allow_preemptive_ff)
     const forced =
+      this.forceRebase ||
       this.committerDateIsAuthorDate ||
       this.ignoreDate ||
       this.signoff ||
@@ -2791,9 +2802,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       .setCommitter(committer);
     // `merge -c`: --edit, the message cleaned up as an edited one
     if (item.editMessage) command.setCleanupMode(CleanupMode.STRIP);
-    // do_merge passes the run's -S<key> to git merge (which reads commit.gpgSign itself)
+    // do_merge passes the run's -S<key> to git merge, else --no-gpg-sign
     const sign = await this.signRequest(state);
     if (sign !== undefined) command.setSigningKey(sign);
+    else command.setSign(false);
     // the merge inherits pull's GIT_REFLOG_ACTION, not the rebase's own action
     if (this.hasReflogAction()) command.setReflogAction(this.reflogAction("rebase"));
     for (const head of heads) command.include(head.id);
@@ -2841,7 +2853,6 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const commit = await this.commits.load(id);
     if (!commit) return;
     const message = cleanupMessage(commit.message, commentPrefixOf(this.workingCopy));
-    await this.refuseSigning(state);
     this.resetClock();
     let committer = this.committer ?? this.resolveCommitter();
     if (await state.exists(`${DIR}/cdate_is_adate`)) {
@@ -2851,13 +2862,15 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         tzOffset: commit.author.tzOffset,
       };
     }
-    const newId = await this.commits.store({
-      tree: commit.tree,
-      parents: commit.parents,
-      author: commit.author,
-      committer,
-      message,
-    });
+    const newId = await this.commits.store(
+      await this.signedRebaseCommit(state, {
+        tree: commit.tree,
+        parents: commit.parents,
+        author: commit.author,
+        committer,
+        message,
+      }),
+    );
     const action = reflogMessages.rebaseStep(this.reflogAction("rebase"), "merge");
     await this.refsStore.set(
       "HEAD",
@@ -2914,6 +2927,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // --trailer forces the run that starts the rebase (REBASE_FORCE) but, as in git, is not
     // read back as a reason to: a --continue may fast-forward again
     if (this.operation === RebaseOperation.BEGIN && this.trailerArgs.length > 0) return false;
+    // so does --force-rebase (REBASE_FORCE, never saved in the state)
+    if (this.operation === RebaseOperation.BEGIN && this.forceRebase) return false;
     for (const name of ["cdate_is_adate", "ignore_date", "signoff"]) {
       if (await state.exists(`${DIR}/${name}`)) return false;
     }
@@ -3656,15 +3671,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           commentPrefixOf(this.workingCopy),
         )
       : await sequencerPrepareMessage(this.hooks, state, message);
-    // commit_tree signs: no signer, git's failure (each step says what follows)
-    await this.refuseSigning(state);
-    const id = await this.commits.store({
-      tree,
-      parents,
-      author,
-      committer,
-      message: hooked,
-    });
+    // commit_tree signs: when it cannot, git's failure (each step says what follows)
+    const id = await this.commits.store(
+      await this.signedRebaseCommit(state, { tree, parents, author, committer, message: hooked }),
+    );
     const action = reflogMessages.rebaseStep(this.reflogAction("rebase"), step);
     const log = this.reflogLine(reflogMessages.pick(action, hooked), this.committer);
     const refs = this.refsStore;
