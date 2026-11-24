@@ -35,7 +35,7 @@ import {
   MergeStatus,
   MergeStrategy,
 } from "../results/merge-result.js";
-import { CommitCommand, type CommitResult } from "./commit-command.js";
+import { CommitCommand, type CommitEditor, type CommitResult } from "./commit-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import {
   DEFAULT_MERGE_LOG_LENGTH,
@@ -64,6 +64,7 @@ import {
   cleanupWith,
   commitCleanupMode,
   commitMessageFromOption,
+  preparedMessageCleanup,
 } from "./message-cleanup.js";
 import { octopusMerge, threeway } from "./octopus-merge.js";
 import { ortResultEntries } from "./ort-merge.js";
@@ -265,6 +266,9 @@ export class MergeCommand extends GitCommand<MergeResult> {
   /** `--log[=<n>]` / `--no-log` (undefined: `merge.log`) */
   private log?: number;
   private signoff = false;
+  /** `--edit` / `--no-edit` (undefined: no editor, as git without a terminal) */
+  private edit?: boolean;
+  private editor?: CommitEditor;
   private intoName?: string;
   /** FETCH_HEAD-style lines naming the heads (a pull's), instead of merge_name's */
   private mergeNames?: string;
@@ -491,6 +495,32 @@ export class MergeCommand extends GitCommand<MergeResult> {
   setSignoff(signoff: boolean): this {
     this.checkCallable();
     this.signoff = signoff;
+    return this;
+  }
+
+  /**
+   * `--edit` (true) / `--no-edit` (false): with `--edit` the merge commit's message goes
+   * through the editor ({@link setEditor}) as git's prepare_to_commit runs it: MERGE_MSG
+   * written with git's help comment below the message (and the sign-off), the
+   * `prepare-commit-msg` hook, the editor, `commit-msg`, then the text cleaned up as an
+   * edited message (`commit.cleanup`, else comments stripped). Without an editor set the
+   * message is taken as the editor would leave it. Default: no edit (git's without a
+   * terminal); a merge that stops before its commit runs no editor.
+   */
+  setEdit(edit: boolean): this {
+    this.checkCallable();
+    this.edit = edit;
+    return this;
+  }
+
+  /**
+   * The editor `--edit` runs over MERGE_MSG: called with `"MERGE_MSG"` and the text, it
+   * returns the edited text (anything else keeps the text as it is), as
+   * `CommitCommand.setEditor`.
+   */
+  setEditor(editor: CommitEditor): this {
+    this.checkCallable();
+    this.editor = editor;
     return this;
   }
 
@@ -1919,8 +1949,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
     writeState: (text: string) => Promise<void>,
   ): Promise<{ message: string; refused?: string; stateText?: string }> {
     // (a merge a rebase makes in process runs no hooks of its own)
-    const signed = this.signedOff(message);
-    if (!this.hooks.enabled || this.inProcess) {
+    const edit = this.edit === true && !this.inProcess;
+    const signed = this.signedOff(edit ? `${message}\n${this.editorComment()}` : message);
+    const hooksRun = this.hooks.enabled && !this.inProcess;
+    if (!hooksRun && !edit) {
       return { message: this.cleanup(signed), stateText: signed };
     }
     const env = {
@@ -1935,17 +1967,26 @@ export class MergeCommand extends GitCommand<MergeResult> {
         refused: "Not committing merge; use 'git commit' to complete the merge.",
       };
     };
-    if (!this.noVerify) {
+    if (hooksRun && !this.noVerify) {
       const pre = await this.hooks.run("pre-merge-commit", { env });
       if (pre && pre.exitCode !== 0) return abort();
       if (pre) await this.staging.read();
     }
     // prepare_to_commit writes merge_msg as it is (no newline added), signed off
     await writeState(signed);
-    const file = await this.hooks.gitPath("MERGE_MSG");
-    const prepare = await this.hooks.run("prepare-commit-msg", { args: [file, "merge"], env });
-    if (prepare && prepare.exitCode !== 0) return abort();
-    if (!this.noVerify) {
+    if (hooksRun) {
+      const file = await this.hooks.gitPath("MERGE_MSG");
+      const prepare = await this.hooks.run("prepare-commit-msg", { args: [file, "merge"], env });
+      if (prepare && prepare.exitCode !== 0) return abort();
+    }
+    if (edit && this.editor) {
+      // launch_editor over MERGE_MSG
+      const current = (await state.read("MERGE_MSG")) ?? "";
+      const edited = await this.editor("MERGE_MSG", current);
+      if (typeof edited === "string") await state.write("MERGE_MSG", edited);
+    }
+    if (hooksRun && !this.noVerify) {
+      const file = await this.hooks.gitPath("MERGE_MSG");
       const check = await this.hooks.run("commit-msg", { args: [file], env });
       if (check && check.exitCode !== 0) return abort();
     }
@@ -1953,7 +1994,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
     // the commit ends the merge (remove_merge_branch_state)
     await state.removeRef("MERGE_HEAD");
     await state.remove("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE");
-    return { message: this.cleanup(text), stateText: text };
+    const cleaned = edit
+      ? preparedMessageCleanup(this.workingCopy, text, this.cleanupMode)
+      : this.cleanup(text);
+    return { message: cleaned, stateText: text };
   }
 
   /** MERGE_HEAD, MERGE_MSG and MERGE_MODE of a merge stopped before its commit. */
@@ -1982,6 +2026,41 @@ export class MergeCommand extends GitCommand<MergeResult> {
       default:
         return "ort";
     }
+  }
+
+  /**
+   * prepare_to_commit's help below the message for the editor (merge_editor_comment and
+   * its scissors or no-scissors line), each line commented.
+   */
+  private editorComment(): string {
+    const comment = trailerConfigOf(this.workingCopy).commentString;
+    const commented = (text: string) =>
+      text
+        .split("\n")
+        .slice(0, -1)
+        .map((line) => (line === "" ? `${comment}\n` : `${comment} ${line}\n`))
+        .join("");
+    const scissors =
+      (this.cleanupMode ?? RemoteConfigStore.from(this.workingCopy).value("commit.cleanup")) ===
+      "scissors";
+    let out = "";
+    if (scissors) {
+      out += `${comment} ------------------------ >8 ------------------------\n`;
+      out += commented(
+        "Do not modify or remove the line above.\nEverything below it will be ignored.\n",
+      );
+      out += commented("\n");
+    }
+    out += commented(
+      "Please enter a commit message to explain why this merge is necessary,\n" +
+        "especially if it merges an updated upstream into a topic branch.\n\n",
+    );
+    out += scissors
+      ? commented("An empty message aborts the commit.\n")
+      : commented(
+          `Lines starting with '${comment}' will be ignored, and an empty message aborts\nthe commit.\n`,
+        );
+    return out;
   }
 
   /** git's `cleanup_message` of a merge commit's message (prepare_to_commit, no editor). */

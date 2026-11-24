@@ -539,7 +539,8 @@ describe.each(backends)("Remote config persistence ($name backend)", ({ factory 
       const originalFetch = globalThis.fetch;
       globalThis.fetch = server.mockFetch;
       try {
-        const result = await git.pull().call();
+        // no upstream configured: the branch is named, as `git pull origin main`
+        const result = await git.pull().setRemote("origin").setRemoteBranchName("main").call();
         expect(result.successful).toBe(true);
       } finally {
         globalThis.fetch = originalFetch;

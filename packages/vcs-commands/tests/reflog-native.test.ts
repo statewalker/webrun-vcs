@@ -615,6 +615,8 @@ describeGit("reflog lines of clone, fetch and pull, native twins", () => {
     }
 
     run(native, "-c", "pull.rebase=false", "-c", "core.editor=true", "pull");
+    // the same choice for ours: divergent branches need one
+    run(ours, "config", "pull.rebase", "false");
     const result = await (await openPlain(ours)).pull().call();
     expect(result.successful).toBe(true);
     // the merge commit's identities and message; its id differs (the URL in the message)
