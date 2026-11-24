@@ -649,3 +649,29 @@ async function submoduleHasCommits(
 function compareBytes(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
+
+/**
+ * submodule.c's `submodule_touches_in_range`: how many submodules the commits `include --not
+ * exclude` record new commits for (0 when `.gitmodules` names none).
+ */
+export async function submoduleTouchesInRange(
+  workingCopy: WorkingCopy,
+  exclude: ObjectId | undefined,
+  include: ObjectId,
+): Promise<number> {
+  const model = await SubmoduleModel.load(workingCopy);
+  if (model.gitmodules.list().length === 0) return 0;
+  const repo = new SubmoduleFetchRepository(workingCopy);
+  const names = new Set<string>();
+  for (const commit of await repo.walk([include], exclude !== undefined ? [exclude] : [])) {
+    const gitlinks = await repo.changedGitlinks(commit);
+    if (gitlinks.size === 0) continue;
+    const at = await SubmoduleModel.load(workingCopy, { commit });
+    for (const path of gitlinks.keys()) {
+      let name = at.fromPath(path)?.name;
+      if (name === undefined && (await repo.populated(path)) && !at.fromName(path)) name = path;
+      if (name !== undefined) names.add(name);
+    }
+  }
+  return names.size;
+}

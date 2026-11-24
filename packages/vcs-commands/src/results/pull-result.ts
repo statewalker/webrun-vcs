@@ -24,6 +24,11 @@ export interface PullResult {
   rebaseResult?: RebaseResult;
   /** Whether rebase was used instead of merge */
   rebaseUsed: boolean;
+  /**
+   * `--recurse-submodules` / `submodule.recurse`: what the submodules' `git submodule update
+   * --recursive --checkout|--rebase` printed and its exit status (the pull's, when it failed)
+   */
+  submodules?: { stdout: string; stderr: string; exitCode: number };
   /** Whether pull was successful */
   successful: boolean;
   /** Fetch-from remote */

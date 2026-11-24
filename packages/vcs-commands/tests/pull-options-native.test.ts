@@ -370,14 +370,6 @@ describeGit(
       });
     }
 
-    it("pull --recurse-submodules is refused until submodule fetching lands", async () => {
-      const { dirs } = diverged();
-      await expect(
-        (await t.ours(dirs.o)).pull().setRebase(false).setRecurseSubmodules(true).call(),
-      ).rejects.toThrow(/--recurse-submodules is not supported/);
-      // nothing fetched
-      expect(t.git(dirs.o, "rev-parse", "origin/main")).toBe(t.git(dirs.o, "rev-parse", "one"));
-    });
   },
 );
 

@@ -23,6 +23,9 @@ import { configValue } from "./merge-config.js";
 import { OperationState, readIndex } from "./merge-support.js";
 import { type CleanupMode, parseCleanupMode } from "./message-cleanup.js";
 import { RebaseCommand } from "./rebase-command.js";
+import { SubmoduleCommandError, type SubmoduleCommandResult } from "./submodule-commands.js";
+import { type FetchRecurseSubmodules, submoduleTouchesInRange } from "./submodule-fetch.js";
+import { SubmoduleUpdateCommand } from "./submodule-update-command.js";
 
 /** One `FETCH_HEAD` entry to merge (pull.c's get_merge_heads). */
 interface MergeHead {
@@ -103,7 +106,7 @@ export class PullCommand extends GuardedTransportCommand<PullResult> {
   private force = false;
   private compatibility?: "2.43" | "2.56";
   private dryRun = false;
-  private recurseSubmodules?: boolean | "on-demand";
+  private recurseSubmodules?: FetchRecurseSubmodules;
 
   /**
    * `--verify-signatures` (true) / `--no-verify-signatures` (false), passed to the merge as
@@ -414,14 +417,17 @@ export class PullCommand extends GuardedTransportCommand<PullResult> {
   }
 
   /**
-   * `--recurse-submodules[=on-demand]` / `--no-recurse-submodules`. Recursing into
-   * submodules needs the fetch's submodule recursion, which is not implemented yet: a pull
-   * asked to recurse refuses before it fetches (`GitApiError`, exit 128); false is accepted
-   * (nothing recurses).
+   * `--recurse-submodules[=yes|on-demand|no]` / `--no-recurse-submodules` (true is `yes`,
+   * false `no`): passed to the fetch (`FetchCommand.setRecurseSubmodules`), and, unless
+   * `no`, once the merge or rebase succeeded the submodules are updated as `git submodule
+   * update --recursive --checkout` (`--rebase` for a rebasing pull) does, its output in
+   * {@link PullResult.submodules}. Unset, `submodule.recurse` decides (the fetch reads its
+   * own configuration). A rebasing pull that would recurse refuses local commits that
+   * record submodule changes (`cannot rebase with locally recorded submodule modifications`).
    */
-  setRecurseSubmodules(recurse: boolean | "on-demand"): this {
+  setRecurseSubmodules(recurse: boolean | FetchRecurseSubmodules): this {
     this.checkCallable();
-    this.recurseSubmodules = recurse;
+    this.recurseSubmodules = recurse === true ? "yes" : recurse === false ? "no" : recurse;
     return this;
   }
 
@@ -436,12 +442,6 @@ export class PullCommand extends GuardedTransportCommand<PullResult> {
   async call(): Promise<PullResult> {
     this.checkCallable();
     this.setCallable(false);
-    if (this.recurseSubmodules === true || this.recurseSubmodules === "on-demand") {
-      throw new GitApiError(
-        "fatal: --recurse-submodules is not supported by pull yet (fetching submodules is not implemented)",
-        { exitCode: 128 },
-      );
-    }
     // the index as it is now, before the worktree or a ref is touched: one another writer
     // replaced is read again (git reads the index at its start), unless this instance holds
     // unwritten edits (refused)
@@ -566,6 +566,8 @@ export class PullCommand extends GuardedTransportCommand<PullResult> {
       if (this.tagOption !== undefined) multiple.setTagOpt(this.tagOption);
       if (this.dryRun) multiple.setDryRun(true);
       if (this.force) multiple.setForceUpdate(true);
+      if (this.recurseSubmodules !== undefined)
+        multiple.setRecurseSubmodules(this.recurseSubmodules);
       // credentials and headers: decided from every URL the fetch reaches, handed down
       this.resolveAuth(await multiple.plannedUrls(), defaultRemoteUrl);
       this.configureChild(multiple);
@@ -692,6 +694,25 @@ export class PullCommand extends GuardedTransportCommand<PullResult> {
       );
     }
 
+    // pull.c: recurse_submodules from the command line, else submodule.recurse
+    const recurse = this.recurseSubmodules ?? this.configRecurseSubmodules();
+    const updatesSubmodules = recurse === "yes" || recurse === "on-demand";
+    if (
+      rebase &&
+      updatesSubmodules &&
+      (await submoduleTouchesInRange(this._workingCopy, mergeIds[0] as ObjectId, origHead)) > 0
+    ) {
+      throw new GitApiError("fatal: cannot rebase with locally recorded submodule modifications", {
+        exitCode: 128,
+      });
+    }
+    // rebase_submodules / update_submodules once the merge or rebase succeeded
+    const withSubmodules = async (result: PullResult): Promise<PullResult> => {
+      if (!updatesSubmodules || !result.successful) return result;
+      const submodules = await this.updateSubmodules(rebase ? "rebase" : "checkout");
+      return { ...result, submodules, successful: submodules.exitCode === 0 };
+    };
+
     // `git pull --rebase`: the branch rebased onto what was fetched
     // (one that only fast-forwards is a `merge --ff-only`, as git's pull runs it)
     if (rebase && !canFastForward) {
@@ -708,13 +729,13 @@ export class PullCommand extends GuardedTransportCommand<PullResult> {
       if (this.strategyOptions.length > 0) rebaseCommand.setStrategyOptions(this.strategyOptions);
       if (this.signoff !== undefined) rebaseCommand.setSignoff(this.signoff);
       const rebaseResult = await rebaseCommand.call();
-      return {
+      return withSubmodules({
         ...fetched,
         rebaseResult,
         successful: isRebaseSuccessful(rebaseResult.status),
         rebaseUsed: true,
         ...shown(),
-      };
+      });
     }
 
     // run_merge: `git merge [<options>] FETCH_HEAD`
@@ -746,7 +767,7 @@ export class PullCommand extends GuardedTransportCommand<PullResult> {
 
     if (rebase) {
       // a rebasing pull still reports a rebase: the fast-forward it made instead
-      return {
+      return withSubmodules({
         ...fetched,
         mergeResult,
         rebaseResult: successful
@@ -755,9 +776,45 @@ export class PullCommand extends GuardedTransportCommand<PullResult> {
         successful,
         rebaseUsed: true,
         ...shown(),
+      });
+    }
+    return withSubmodules({ ...fetched, mergeResult, successful, rebaseUsed: false, ...shown() });
+  }
+
+  /** pull.c's `submodule.recurse`: a boolean (on or off), undefined when unset. */
+  private configRecurseSubmodules(): FetchRecurseSubmodules | undefined {
+    const values = RemoteConfigStore.from(this._workingCopy).valuesWithOrigin("submodule.recurse");
+    if (values.length === 0) return undefined;
+    const text = values[values.length - 1]?.text;
+    const bool = text === undefined ? true : parseGitBool(text);
+    if (bool === undefined) {
+      throw new GitApiError(`fatal: bad boolean config value '${text}' for 'submodule.recurse'`, {
+        exitCode: 128,
+      });
+    }
+    return bool ? "yes" : "no";
+  }
+
+  /** `git submodule update --recursive --checkout|--rebase`: its output and exit status. */
+  private async updateSubmodules(mode: "checkout" | "rebase"): Promise<SubmoduleCommandResult> {
+    const update = new SubmoduleUpdateCommand(this._workingCopy)
+      .setRecursive(true)
+      .setMode(mode)
+      .setCompatibility(this.compatibility ?? this.hooks.compatibility);
+    update.shareHooksOf(this);
+    // the guarded transports: credentials and headers only where this pull's rule allows
+    update.setTransports(this.getTransports());
+    if (this.timeout !== undefined) update.setTimeout(this.timeout);
+    try {
+      return await update.call();
+    } catch (error) {
+      if (!(error instanceof SubmoduleCommandError)) throw error;
+      return {
+        stdout: error.result.stdout,
+        stderr: `${error.result.stderr}${error.message}\n`,
+        exitCode: error.exitCode,
       };
     }
-    return { ...fetched, mergeResult, successful, rebaseUsed: false, ...shown() };
   }
 
   /**
@@ -837,6 +894,9 @@ export class PullCommand extends GuardedTransportCommand<PullResult> {
     if (this.force) fetchCommand.setForceUpdate(true);
     if (this.dryRun) fetchCommand.setDryRun(true);
     if (this.repositoryFiles) fetchCommand.setRepositoryFiles(this.repositoryFiles);
+    if (this.recurseSubmodules !== undefined) {
+      fetchCommand.setRecurseSubmodules(this.recurseSubmodules);
+    }
     return fetchCommand;
   }
 
