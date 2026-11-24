@@ -564,6 +564,12 @@ export interface LineLogHost {
 
 const S_IFMT = 0o170000;
 const S_IFDIR = 0o040000;
+const S_IFGITLINK = 0o160000;
+
+/** A submodule's content in a diff: `Subproject commit <id>` and a newline */
+export function gitlinkText(id: ObjectId): Uint8Array {
+  return encodeGitPath(`Subproject commit ${id}\n`);
+}
 
 /** The line ranges each commit tracks, filled from the children down (line-log.c's walk) */
 export class LineLogWalk {
@@ -695,10 +701,15 @@ export class LineLogWalk {
     return { path, id: e.id, mode: e.mode };
   }
 
-  private blob(id: ObjectId): Promise<Uint8Array> {
+  /** A side's content as diff_populate_filespec reads it (a submodule: its commit line) */
+  private blob(side: LineLogSide): Promise<Uint8Array> {
+    const id = side.id;
     let found = this.blobs.get(id);
     if (!found) {
-      found = this.host.blob(id);
+      found =
+        (side.mode & S_IFMT) === S_IFGITLINK
+          ? Promise.resolve(gitlinkText(id))
+          : this.host.blob(id);
       this.blobs.set(id, found);
       if (this.blobs.size > 256) this.blobs.deleteOldest();
     }
@@ -734,8 +745,8 @@ export class LineLogWalk {
   ): Promise<DiffRanges | undefined> {
     const rg = range.find((r) => r.path === pair.two.path);
     if (!rg || rg.ranges.length === 0) return undefined;
-    const target = await this.blob(pair.two.id);
-    const parent = pair.one ? await this.blob(pair.one.id) : new Uint8Array(0);
+    const target = await this.blob(pair.two);
+    const parent = pair.one ? await this.blob(pair.one) : new Uint8Array(0);
     const diff = collectDiff(parent, target);
     rg.path = pair.one?.path ?? pair.two.path;
     const { ranges, touched } = mapAcrossDiff(rg.ranges, diff, this.compatibility);
@@ -752,7 +763,19 @@ export class LineLogWalk {
     for (const r of this.ranges.get(commit) ?? []) {
       const pair = r.pair;
       if (!pair) continue;
-      out.push({ ...lineLogEntry(pair), lineRanges: r.ranges.map((x) => ({ ...x })) });
+      // diff_filepair_dup keeps only the two sides: a renamed pair prints as a modification
+      // between two paths (no rename lines, `M` with the old path, no score)
+      const { one, two } = pair;
+      out.push({
+        changeType: one ? ChangeType.MODIFY : ChangeType.ADD,
+        ...(one
+          ? { oldPath: one.path, oldId: one.id, oldMode: one.mode as DiffEntry["oldMode"] }
+          : {}),
+        newPath: two.path,
+        newId: two.id,
+        newMode: two.mode as DiffEntry["newMode"],
+        lineRanges: r.ranges.map((x) => ({ ...x })),
+      });
     }
     return out;
   }
@@ -780,8 +803,8 @@ export class LineLogWalk {
     for (const range of this.ranges.get(commit) ?? []) {
       const { pair, diff } = range;
       if (!pair || !diff) continue;
-      const parentFile = pair.one ? new FileLines(await this.blob(pair.one.id)) : undefined;
-      const targetFile = new FileLines(await this.blob(pair.two.id));
+      const parentFile = pair.one ? new FileLines(await this.blob(pair.one)) : undefined;
+      const targetFile = new FileLines(await this.blob(pair.two));
       const printLine = (first: string, line: number, file: FileLines, color: string) => {
         const begin = file.nth(line);
         let end = file.nth(line + 1);
@@ -853,7 +876,7 @@ export class LineLogWalk {
   }
 }
 
-/** A pair as the diff queue holds it */
+/** A pair as git 2.43's diffcore_std sees it while following renames (renames as `R`) */
 export function lineLogEntry(pair: LineLogPair): DiffEntry {
   const { one, two } = pair;
   const renamed = one !== undefined && one.path !== two.path;

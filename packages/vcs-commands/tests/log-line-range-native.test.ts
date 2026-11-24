@@ -661,3 +661,55 @@ describeGit("git log -L at a missing newline and range ends, native", () => {
     await compare(d, ["-L", "6,12:boundary.c"]);
   });
 });
+
+describeGit("git log -L across a rename that changes the range, native", () => {
+  let dir: string;
+
+  beforeAll(() => {
+    dir = join(home, "rename-change");
+    git(home, "init", "-q", "-b", "main", dir);
+    const body = (n: number, changed = -1) =>
+      Array.from({ length: n }, (_, i) => `line ${i + 1}${i === changed ? " changed" : ""}\n`).join(
+        "",
+      );
+    put(dir, "a.c", body(40));
+    commit(dir, "add a.c");
+    rmSync(join(dir, "a.c"));
+    put(dir, "b.c", body(40, 5));
+    commit(dir, "rename a.c to b.c and change line 6");
+    put(dir, "b.c", body(40, 9));
+    commit(dir, "change line 10 of b.c");
+  });
+
+  // a renamed pair prints as a modification between two paths (diff_filepair_dup)
+  it("prints the rename's pair as git does, with -p, --name-status, --summary and --graph", async () => {
+    await compare(dir, ["-L", "1,21:b.c"]);
+    await compare(dir, ["-L", "1,21:b.c", "-p"]);
+    await compare(dir, ["-L", "1,21:b.c", "--name-status", "--format="]);
+    await compare(dir, ["-L", "1,21:b.c", "--name-only", "--format="]);
+    await compare(dir, ["-L", "1,21:b.c", "--summary", "--format="]);
+    await compare(dir, ["--graph", "-L", "1,21:b.c"]);
+    await compare(dir, ["--graph", "--oneline", "-L", "1,21:b.c"]);
+  });
+});
+
+describeGit("git log -L on a submodule (gitlink) path, native", () => {
+  it("diffs the gitlink as its `Subproject commit` line", async () => {
+    const dir = join(home, "gitlink");
+    git(home, "init", "-q", "-b", "main", dir);
+    put(dir, "f", "one\n");
+    commit(dir, "first");
+    const first = git(dir, "rev-parse", "HEAD").trim();
+    put(dir, "f", "two\n");
+    commit(dir, "second");
+    const second = git(dir, "rev-parse", "HEAD").trim();
+    git(dir, "update-index", "--add", "--cacheinfo", `160000,${first},sub`);
+    clock += 60;
+    git(dir, "commit", "-q", "-m", "add sub");
+    git(dir, "update-index", "--cacheinfo", `160000,${second},sub`);
+    clock += 60;
+    git(dir, "commit", "-q", "-m", "move sub");
+    await compare(dir, ["-L1:sub"]);
+    await compare(dir, ["-L1:sub", "--oneline", "--no-patch"]);
+  });
+});

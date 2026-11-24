@@ -56,6 +56,7 @@ import {
 } from "./diff-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import {
+  gitlinkText,
   type LineLogHost,
   type LineLogPair,
   LineLogWalk,
@@ -1784,6 +1785,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       blob: async (path) => {
         const e = await this.treeEntryAt(tree, path);
         if (!e) return undefined;
+        // a submodule reads as its commit line (diff_populate_filespec)
+        if ((e.mode & 0o170000) === 0o160000) return { ...e, data: gitlinkText(e.id) };
         const data = await this.readBlob(e.id);
         if (!data) throw lineLogDeath(`Cannot read blob ${e.id}`);
         return { ...e, data };
@@ -1884,7 +1887,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
                 sources,
                 created.map((c) => ({ path: c.path, mode: c.mode, id: c.id })),
                 {
-                  load: (c) => blob(c.id),
+                  load: async (c) =>
+                    (c.mode & 0o170000) === 0o160000 ? gitlinkText(c.id) : blob(c.id),
                   renameLimit,
                   ...(score !== undefined ? { minimumScore: score } : {}),
                 },
