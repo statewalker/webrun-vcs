@@ -1311,4 +1311,74 @@ describe.each(backends)("BlameCommand big files ($name backend)", ({ factory }) 
     const full = await git.blame().setFilePath("file.txt").call();
     expect(full.getEntry(1)?.commitId).not.toBe(head?.objectId);
   });
+  it("blames a buffer the caller gives (--contents) on a fake commit above the start", async () => {
+    const { git, workingCopy, repository } = await createInitializedGit();
+    await addFile(workingCopy, "file.txt", "one\ntwo\n");
+    await git.commit().setMessage("first").call();
+    const head = (await repository.refs.resolve("HEAD"))?.objectId;
+
+    const buffer = new TextEncoder().encode("one\nchanged\nthree\n");
+    const result = await git
+      .blame()
+      .setFilePath("file.txt")
+      .setContents(buffer, { name: "edited.txt", time: 1700000000, tzOffset: "+0100" })
+      .call();
+    expect(new TextDecoder().decode(result.content)).toBe("one\nchanged\nthree\n");
+    expect(result.getEntry(1)?.commitId).toBe(head);
+    const fake = result.getEntry(2);
+    expect(fake?.commitId).toBe("0".repeat(40));
+    expect(fake?.lineCount).toBe(2);
+    expect(fake?.commit.author).toEqual({
+      name: "External file (--contents)",
+      email: "external.file",
+      timestamp: 1700000000,
+      tzOffset: "+0100",
+    });
+    expect(fake?.commit.message).toBe("Version of file.txt from edited.txt\n");
+    expect(fake?.previous).toEqual({ commitId: head, path: "file.txt" });
+    // what --incremental prints, in the order blame found it
+    expect(result.incremental?.map((e) => [e.commitId, e.resultStart, e.lineCount])).toEqual([
+      ["0".repeat(40), 2, 2],
+      [head, 1, 1],
+    ]);
+
+    const working = await git
+      .blame()
+      .setFilePath("file.txt")
+      .setContents(buffer, { workingTree: true })
+      .call();
+    expect(working.getEntry(2)?.commit.author.name).toBe("Not Committed Yet");
+    expect(working.getEntry(2)?.commit.message).toBe("Version of file.txt from file.txt\n");
+  });
+
+  it("refuses --contents with --reverse and a path the start commit lacks", async () => {
+    const { git, workingCopy, repository } = await createInitializedGit();
+    await addFile(workingCopy, "file.txt", "one\n");
+    await git.commit().setMessage("first").call();
+    const head = (await repository.refs.resolve("HEAD"))?.objectId ?? "";
+    const buffer = new TextEncoder().encode("x\n");
+    await expect(
+      git.blame().setFilePath("file.txt").setContents(buffer).setReverse(head).call(),
+    ).rejects.toThrow("--contents and --reverse do not blend well.");
+    await expect(git.blame().setFilePath("missing.txt").setContents(buffer).call()).rejects.toThrow(
+      "no such path 'missing.txt' in HEAD",
+    );
+  });
+
+  it("stops at commits older than --since, as boundaries", async () => {
+    const { git, workingCopy } = await createInitializedGit();
+    await addFile(workingCopy, "file.txt", "one\n");
+    await git.commit().setMessage("first").call();
+    await addFile(workingCopy, "file.txt", "one\ntwo\n");
+    await git.commit().setMessage("second").call();
+    const all = await git.blame().setFilePath("file.txt").call();
+    const second = all.getEntry(2)?.commit.committer.timestamp ?? 0;
+    const cut = await git
+      .blame()
+      .setFilePath("file.txt")
+      .setSince(second + 1)
+      .call();
+    expect(cut.entries).toHaveLength(1);
+    expect(cut.entries[0].boundary).toBe(true);
+  });
 });
