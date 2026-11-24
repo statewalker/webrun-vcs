@@ -59,6 +59,8 @@ import { isValidRemoteName } from "./remote-command.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
 import { SparseCheckoutCommand } from "./sparse-checkout-command.js";
 import { SparseUnpack } from "./sparse-checkout-support.js";
+import { SubmoduleCommandError, type SubmoduleCommandResult } from "./submodule-commands.js";
+import { SubmoduleUpdateCommand } from "./submodule-update-command.js";
 import { checkoutFreshTree } from "./tree-restore.js";
 import { worktreePathRules } from "./worktree-path-rules.js";
 import { repositoryPlaceOf, worktreeAdminWorkingCopy } from "./worktree-support.js";
@@ -91,6 +93,10 @@ const CLONE_SETTINGS = [
   "local",
   "dissociate",
   "references",
+  "recurseSubmodules",
+  "shallowSubmodules",
+  "alsoFilterSubmodules",
+  "remoteSubmodules",
   "credentials",
   "timeout",
   "headers",
@@ -207,6 +213,12 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   private dissociate = false;
   /** `--reference` (required) and `--reference-if-able` paths, in the order given */
   private references: { path: string; required: boolean }[] = [];
+  /** `--recurse-submodules[=<pathspec>]` values, in the order given */
+  private recurseSubmodules: string[] = [];
+  private shallowSubmodules = false;
+  /** `--[no-]also-filter-submodules`; unset: `clone.filterSubmodules` */
+  private alsoFilterSubmodules?: boolean;
+  private remoteSubmodules = false;
 
   /**
    * The destination directory as `git clone <url> <directory>` names it, for messages only
@@ -687,6 +699,50 @@ export class CloneCommand extends TransportCommand<CloneResult> {
    * @returns Clone result
    * @throws InvalidRemoteError if URI is not specified
    */
+  /**
+   * `--recurse-submodules[=<pathspec>]` (`--recursive`): `true` is `.` (every submodule), a
+   * list the pathspecs given (each written as a `submodule.active` value, sorted, duplicates
+   * dropped), `false` none (`--no-recurse-submodules`). After the checkout the submodules
+   * are cloned and checked out as `git submodule update --init --require-init --recursive`
+   * does (see `SubmoduleUpdateCommand`), its output in {@link CloneResult.submodules}.
+   * As in git, submodules are cloned with `GIT_PROTOCOL_FROM_USER=0`: a local URL needs
+   * `protocol.file.allow=always`. Credentials and headers reach a submodule's URL only as
+   * `SubmoduleUpdateCommand.setCredentials` allows (the clone's own origin).
+   */
+  setRecurseSubmodules(recurse: boolean | string[]): this {
+    this.checkCallable();
+    this.recurseSubmodules = recurse === true ? ["."] : recurse === false ? [] : [...recurse];
+    return this;
+  }
+
+  /** `--shallow-submodules`: the submodules are cloned with a depth of 1. */
+  setShallowSubmodules(shallow: boolean): this {
+    this.checkCallable();
+    this.shallowSubmodules = shallow;
+    return this;
+  }
+
+  /**
+   * `--[no-]also-filter-submodules`: the submodules are cloned with this clone's filter
+   * ({@link setFilter}); unset, `clone.filterSubmodules` decides. Given true, it needs a
+   * filter and {@link setRecurseSubmodules}.
+   */
+  setAlsoFilterSubmodules(filter: boolean): this {
+    this.checkCallable();
+    this.alsoFilterSubmodules = filter;
+    return this;
+  }
+
+  /**
+   * `--remote-submodules`: each submodule is checked out at its remote-tracking branch
+   * (`submodule update --remote --no-fetch`).
+   */
+  setRemoteSubmodules(remote: boolean): this {
+    this.checkCallable();
+    this.remoteSubmodules = remote;
+    return this;
+  }
+
   async call(): Promise<CloneResult> {
     this.checkCallable();
     this.setCallable(false);
@@ -752,6 +808,41 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     if (!this.uri) {
       throw new InvalidRemoteError("", "URI must be specified for clone");
     }
+    // cmd_clone: what --recurse-submodules adds to the -c values (option_config)
+    const submoduleConfig: string[] = [];
+    if (this.recurseSubmodules.length > 0) {
+      const patterns = [...new Set(this.recurseSubmodules)].sort((a, b) =>
+        a < b ? -1 : a > b ? 1 : 0,
+      );
+      for (const pattern of patterns) submoduleConfig.push(`submodule.active=${pattern}`);
+      const sticky = RemoteConfigStore.from(this.workingCopy).value(
+        "submodule.stickyRecursiveClone",
+      );
+      if (sticky !== undefined && parseGitBool(sticky) === true) {
+        submoduleConfig.push("submodule.recurse=true");
+      }
+      const required = this.references.some((r) => r.required);
+      const optional = this.references.some((r) => !r.required);
+      if (required && optional) {
+        throw new GitApiError(
+          "fatal: clone --recursive is not compatible with both --reference and --reference-if-able",
+        );
+      }
+      if (required || optional) {
+        submoduleConfig.push(
+          "submodule.alternateLocation=superproject",
+          `submodule.alternateErrorStrategy=${required ? "die" : "info"}`,
+        );
+      }
+    }
+    if (this.alsoFilterSubmodules === true && this.filterSpec === undefined) {
+      throw new GitApiError("fatal: the option '--also-filter-submodules' requires '--filter'");
+    }
+    if (this.alsoFilterSubmodules === true && this.recurseSubmodules.length === 0) {
+      throw new GitApiError(
+        "fatal: the option '--also-filter-submodules' requires '--recurse-submodules'",
+      );
+    }
     const compatibility = this.compatibility ?? this.hooks.compatibility;
     // parse_options: --revision is unknown to 2.43
     if (this.revision !== undefined && compatibility === "2.43") {
@@ -783,7 +874,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     await this.refuseNonEmptyDestination();
     // write_config: the -c values, after init_db and before anything reads the config (the
     // remote's name, url.*.insteadOf, protocol.*, the fetch and the checkout)
-    await this.writeCommandLineConfig();
+    await this.writeCommandLineConfig(submoduleConfig);
     const store = RemoteConfigStore.from(this.workingCopy);
     // git_clone_config re-read: clone.defaultRemoteName, then --origin over it
     if (!this.remoteExplicit) this.remoteName = store.value("clone.defaultRemoteName") ?? "origin";
@@ -1260,8 +1351,57 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         false,
       );
       if (code !== 0) cloneResult.hookExitCode = code;
+      // checkout(): the submodules, once the hook succeeded
+      else if (this.recurseSubmodules.length > 0) {
+        cloneResult.submodules = await this.updateSubmodules();
+      }
     }
     return cloneResult;
+  }
+
+  /**
+   * clone.c's `git submodule update --require-init --recursive [--depth=1] [--remote
+   * --no-fetch] [--filter=<spec>] [--[no-]single-branch]` in the new repository: what it
+   * printed and its exit status.
+   */
+  private async updateSubmodules(): Promise<SubmoduleCommandResult> {
+    const store = RemoteConfigStore.from(this.workingCopy);
+    const configured = store.value("clone.filterSubmodules");
+    const filterSubmodules =
+      this.alsoFilterSubmodules ??
+      (configured === undefined ? false : (parseGitBool(configured) ?? false));
+    const update = new SubmoduleUpdateCommand(this.workingCopy)
+      .setRequireInit(true)
+      .setRecursive(true)
+      .setCompatibility(this.compatibility ?? this.hooks.compatibility);
+    update.shareHooksOf(this);
+    if (this.shallowSubmodules) update.setDepth(1);
+    if (this.remoteSubmodules) update.setRemote(true).setNoFetch(true);
+    if (filterSubmodules && this.filterSpec !== undefined) update.setFilter(this.filterSpec);
+    // option_single_branch, settled before (a deepening clone is a single-branch one, a
+    // --revision clone none): always passed on, as --single-branch or --no-single-branch
+    update.setSingleBranch(
+      this.revision !== undefined
+        ? false
+        : (this.singleBranch ??
+            (this.depth !== undefined ||
+              this.shallowSince !== undefined ||
+              this.shallowExcludes.length > 0)),
+    );
+    update.setTransports(this.getTransports());
+    if (this.credentials) update.setCredentials(this.credentials);
+    if (this.headers) update.setHeaders(this.headers);
+    if (this.timeout !== undefined) update.setTimeout(this.timeout);
+    try {
+      return await update.call();
+    } catch (error) {
+      if (!(error instanceof SubmoduleCommandError)) throw error;
+      return {
+        stdout: error.result.stdout,
+        stderr: `${error.result.stderr}${error.message}\n`,
+        exitCode: error.exitCode,
+      };
+    }
   }
 
   /**
@@ -1412,10 +1552,11 @@ export class CloneCommand extends TransportCommand<CloneResult> {
    * added to the new repository's config file (`CONFIG_REGEX_NONE`), saved before the fetch.
    * Every entry is checked before the first is written.
    */
-  private async writeCommandLineConfig(): Promise<void> {
-    if (this.configEntries.length === 0) return;
+  private async writeCommandLineConfig(extra: string[] = []): Promise<void> {
+    const entries = [...this.configEntries, ...extra];
+    if (entries.length === 0) return;
     const parsed: { key: string; value: string }[] = [];
-    for (const entry of this.configEntries) {
+    for (const entry of entries) {
       const eq = entry.indexOf("=");
       const rawKey = eq < 0 ? entry : entry.slice(0, eq);
       const die = (error: string) =>

@@ -61,6 +61,10 @@ export interface SubmoduleCloneOptions {
   references?: string[];
   /** `--require-init`: a non-empty directory at the path is refused */
   requireInit?: boolean;
+  /** `--filter=<spec>` */
+  filter?: string;
+  /** `--single-branch` (true) / `--no-single-branch` (false) */
+  singleBranch?: boolean;
   /**
    * The transports and timeout the clone reaches its remote with. No credentials or headers
    * are taken: a submodule's URL comes from the repository's content, so they are attached
@@ -537,6 +541,8 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
           .setDirectory(hostPath);
         if (options.depth !== undefined && options.depth > 0) clone.setDepth(options.depth);
         for (const reference of options.references ?? []) clone.addReference(reference);
+        if (options.filter !== undefined) clone.setFilter(options.filter);
+        if (options.singleBranch !== undefined) clone.setSingleBranch(options.singleBranch);
         if (options.transports) clone.setTransports(options.transports);
         if (options.timeout !== undefined) clone.setTimeout(options.timeout);
         clone.shareHooksOf(this);

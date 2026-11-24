@@ -119,6 +119,11 @@ export interface PushResult {
    */
   upstreamMessages?: string[];
   /**
+   * `--recurse-submodules`: what the submodules' pushes printed on stderr before this push's
+   * report (`Pushing submodule '<path>'`, each push's report), git's order
+   */
+  submoduleOutput?: string;
+  /**
    * The push failed although every ref's status says otherwise: the server's report broke
    * git's rules (an `option` line without its `ok`; git exits 1, its porcelain output has no
    * `Done`)

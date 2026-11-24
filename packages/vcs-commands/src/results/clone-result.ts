@@ -37,6 +37,12 @@ export interface CloneResult {
   hookExitCode?: number;
 
   /**
+   * `--recurse-submodules`: what the submodules' `git submodule update` printed (stdout,
+   * stderr) and its exit status, which git's clone exits with (the clone itself stands)
+   */
+  submodules?: { stdout: string; stderr: string; exitCode: number };
+
+  /**
    * What git prints on stderr besides progress: `--reference-if-able`'s "info: Could not add
    * alternate for '<path>': <reason>" lines, each with its newline
    */

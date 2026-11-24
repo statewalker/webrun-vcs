@@ -138,6 +138,7 @@ export * from "./status-format.js";
 export * from "./submodule-add-command.js";
 export * from "./submodule-auth.js";
 export * from "./submodule-commands.js";
+export { type FetchRecurseSubmodules, parseFetchRecurseSubmodules } from "./submodule-fetch.js";
 export * from "./submodule-model.js";
 export * from "./submodule-summary.js";
 export * from "./submodule-summary-command.js";
