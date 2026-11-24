@@ -9,7 +9,7 @@ import { quoteCStyleBody } from "./quote-path.js";
  * worktree against the index). `" "` unchanged, `M` modified, `T` type changed, `A` added,
  * `D` deleted, `R` renamed, `U` unmerged, `?` untracked, `!` ignored.
  */
-export type StatusCode = " " | "M" | "T" | "A" | "D" | "R" | "U" | "?" | "!";
+export type StatusCode = " " | "M" | "T" | "A" | "D" | "R" | "C" | "U" | "?" | "!";
 
 /** A side of a path: its mode and object id. */
 export interface StatusSide {
@@ -282,7 +282,7 @@ export function formatStatusPorcelain(
           octal(e.worktreeMode),
           e.head?.id ?? ZERO_ID,
           e.staged?.id ?? ZERO_ID,
-          `R${e.renameScore ?? 100}`,
+          `${e.index === "C" || e.worktree === "C" ? "C" : "R"}${e.renameScore ?? 100}`,
           `${path}${z ? "\0" : "\t"}${from}`,
         ].join(" "),
       );
