@@ -126,6 +126,11 @@ interface GitConfigLike {
    * name in lower case), as `GitWorkingCopyConfig` lists them
    */
   listWithOrigin?(): (ConfigValueWhere & { key: string })[];
+  /**
+   * Optional: every value of a key in the repository's own file only (not the global files,
+   * includes or `config.worktree`), in file order: what git's config writer edits.
+   */
+  getLocal?(key: string): unknown[];
 }
 
 /** A config value, its text as written and where it was read (see {@link RemoteConfigStore.valuesWithOrigin}). */
@@ -341,6 +346,46 @@ export class RemoteConfigStore {
    */
   isConfigured(name: string): boolean {
     return this.hasSection(name) || this.legacy(name) !== undefined;
+  }
+
+  /**
+   * Whether the repository's own configuration names the remote (git's
+   * `remote_is_configured(remote, 1)`): a `remote.<name>.*` variable read from the local or
+   * worktree configuration, or a legacy remote file loaded for it ({@link legacyOrigin}).
+   * A remote of the global or system configuration, or of `git -c`, is not one; a config
+   * that cannot tell where its variables come from counts every section.
+   */
+  isConfiguredInRepo(name: string): boolean {
+    if (this.legacy(name) !== undefined) return true;
+    if (!this.config.listWithOrigin) return this.hasSection(name);
+    return this.config.listWithOrigin().some(
+      (e) =>
+        // a value set in memory (no scope yet) goes to the repository's file
+        (e.scope === undefined || e.scope === "local" || e.scope === "worktree") &&
+        subsectionOf(e.key, "remote") === name,
+    );
+  }
+
+  /**
+   * The values of a variable in the repository's own configuration file, in file order, as
+   * git's config writer sees them (`undefined` for a variable without `=`); a config without
+   * that distinction gives every value.
+   */
+  localValues(key: string): (string | undefined)[] {
+    const raw = this.config.getLocal ? this.config.getLocal(key) : this.config.getAll(key);
+    // a variable without `=` reads as `true` (git's NULL value); other values as their text
+    return raw.map((value) =>
+      value === true || value === undefined || value === null ? undefined : String(value),
+    );
+  }
+
+  /**
+   * git's fetch URLs of a remote (`remote->url` after `alias_all_urls`) or, with `push`, its
+   * `pushurl` list as `alias_all_urls` leaves it (empty when the fetch URLs are pushed to):
+   * what `git remote set-url` matches its `<oldurl>` pattern against.
+   */
+  urlSet(name: string, push: boolean): string[] {
+    return push ? this.aliasedPushUrls(name) : this.remoteUrls(name);
   }
 
   /** Whether the remote has a `[remote "<name>"]` config section. */

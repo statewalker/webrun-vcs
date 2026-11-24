@@ -1,0 +1,43 @@
+name: git t/ coverage
+
+# How much of git's own test suite the tests have ported (scripts/t-coverage.mjs,
+# statewalker/webrun-vcs#218): the script's own tests, then its report as the run's summary. The
+# report is never committed; read it in the run. It needs no workspace install: plain Node and a
+# sparse clone of git's t/ at the pinned version.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "packages/*/tests/**"
+      - "packages/*/src/**/tests/**"
+      - "apps/**/tests/**"
+      - "scripts/t-coverage*"
+      - ".github/workflows/t-coverage.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: t-coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  t-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Test the coverage script
+        run: node --test scripts/t-coverage.test.mjs
+
+      - name: Report
+        run: node scripts/t-coverage.mjs --out "$GITHUB_STEP_SUMMARY"

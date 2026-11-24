@@ -7,6 +7,7 @@ import {
   type RefSpec,
   type RemoteRef as TransportRemoteRef,
 } from "@statewalker/vcs-transport";
+import { compilePosixRegex, type PosixRegex, PosixRegexError } from "@statewalker/vcs-utils";
 
 import {
   GitApiError,
@@ -19,43 +20,63 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import {
-  defaultFetchRefspec,
   deleteRefs,
   listRemoteNames,
   moveRefs,
   type RemoteConfig,
   RemoteConfigStore,
 } from "../remote-config/index.js";
+import type { FetchResult } from "../results/index.js";
 import { TransportCommand } from "../transport-command.js";
+import { FetchCommand } from "./fetch-command.js";
 import { removeLegacyRemoteFile } from "./legacy-remotes.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
 
 export type { RemoteConfig };
 
 /**
+ * How `git remote add --mirror` sets a remote up: `fetch` (`--mirror=fetch`: the fetch
+ * refspec maps every ref to itself), `push` (`--mirror=push`: `remote.<name>.mirror=true`),
+ * `both` (git's deprecated bare `--mirror`).
+ */
+export type RemoteMirrorMode = "fetch" | "push" | "both";
+
+/**
  * Add a remote to the repository.
  *
- * Equivalent to `git remote add`.
+ * Equivalent to `git remote add [-f] [--[no-]tags] [-t <branch>]... [-m <master>]
+ * [--mirror=(fetch|push)] <name> <url>`, as git's builtin/remote.c `add`: `remote.<name>.url`,
+ * then one `remote.<name>.fetch` line per tracked branch (`+refs/heads/<b>:refs/remotes/<name>/<b>`,
+ * every branch by default; a fetch mirror maps `refs/<b>` to itself), `remote.<name>.mirror`
+ * for a push mirror and `remote.<name>.tagOpt` for `--tags`/`--no-tags`; with {@link setFetch}
+ * the remote is fetched (git runs `git fetch <name>`), and with {@link setMaster}
+ * `refs/remotes/<name>/HEAD` names `refs/remotes/<name>/<master>` (reflog `remote add`).
  *
- * Based on JGit's RemoteAddCommand.
- *
- * The remote is written to the working copy configuration as a
- * `[remote "<name>"]` section, so it survives the command that created it.
- * A remote already known from `refs/remotes/<name>/*` counts as existing even
- * without a config section.
+ * A remote counts as existing as git's `remote_is_configured(remote, 1)` decides: a
+ * `remote.<name>.*` variable of the repository's own configuration, or a legacy remote file
+ * (`.git/remotes/`, `.git/branches/`, git 2.x); tracking refs alone do not make one.
  *
  * @example
  * ```typescript
  * await git.remoteAdd()
  *   .setName("upstream")
  *   .setUri("https://github.com/user/repo")
+ *   .setTrack("main", "next")
+ *   .setMaster("main")
  *   .call();
  * ```
  */
-export class RemoteAddCommand extends GitCommand<RemoteConfig> {
+export class RemoteAddCommand extends TransportCommand<RemoteConfig> {
   private name?: string;
   private uri?: string;
   private fetchRefspec?: string;
+  private fetchAfter = false;
+  private track: string[] = [];
+  private master?: string;
+  private mirror?: RemoteMirrorMode;
+  private tags?: boolean;
+  private messages: string[] = [];
+  private fetchResult?: FetchResult;
 
   /**
    * Set the remote name.
@@ -94,7 +115,8 @@ export class RemoteAddCommand extends GitCommand<RemoteConfig> {
   }
 
   /**
-   * Set custom fetch refspec.
+   * Set custom fetch refspec, written instead of the ones {@link setTrack} and
+   * {@link setMirror} make.
    *
    * If not set, defaults to +refs/heads/*:refs/remotes/{name}/*
    *
@@ -106,58 +128,215 @@ export class RemoteAddCommand extends GitCommand<RemoteConfig> {
     return this;
   }
 
+  /** Fetch the remote once it is added (`-f`), as git's `git fetch <name>`. */
+  setFetch(fetch: boolean): this {
+    this.checkCallable();
+    this.fetchAfter = fetch;
+    return this;
+  }
+
+  /**
+   * The branches to track (`-t <branch>`, repeated): one fetch refspec each instead of
+   * every branch. A name may be a pattern (`feat/*`), as git writes it into the refspec.
+   */
+  setTrack(...branches: string[]): this {
+    this.checkCallable();
+    this.track = [...branches];
+    return this;
+  }
+
+  /** Point `refs/remotes/<name>/HEAD` at `refs/remotes/<name>/<branch>` (`-m <branch>`). */
+  setMaster(branch: string): this {
+    this.checkCallable();
+    this.master = branch;
+    return this;
+  }
+
+  /**
+   * Set the remote up as a mirror (`--mirror=fetch`, `--mirror=push`); `true` is git's bare
+   * `--mirror` (both, with git's deprecation warning in {@link getMessages}), `false` none.
+   */
+  setMirror(mirror: "fetch" | "push" | boolean): this {
+    this.checkCallable();
+    if (mirror === true) {
+      this.mirror = "both";
+      this.messages.push(
+        "warning: --mirror is dangerous and deprecated; please\n\t use --mirror=fetch or --mirror=push instead",
+      );
+    } else this.mirror = mirror === false ? undefined : mirror;
+    return this;
+  }
+
+  /**
+   * `--tags` (true: `remote.<name>.tagOpt=--tags`) or `--no-tags` (false: `--no-tags`);
+   * undefined writes no `tagOpt`.
+   */
+  setTags(tags: boolean | undefined): this {
+    this.checkCallable();
+    this.tags = tags;
+    return this;
+  }
+
+  /**
+   * What git prints: the `--mirror` warning, legacy-remote warnings (git 2.5x), `Updating
+   * <name>` (stdout) before a fetch, and the fetch's own messages. Empty before {@link call}.
+   */
+  getMessages(): string[] {
+    return [...this.messages];
+  }
+
+  /** The fetch {@link setFetch} ran, once {@link call} has run it. */
+  getFetchResult(): FetchResult | undefined {
+    return this.fetchResult;
+  }
+
   /**
    * Execute the remote add operation.
    *
    * @returns Remote configuration
-   * @throws Error if name or URI is not set
+   * @throws MissingArgumentError if name or URI is not set
+   * @throws GitApiError (exit 128) for `--mirror` with a master branch (git: "specifying a
+   *   master branch makes no sense with --mirror"), or a push mirror with tracked branches
+   *   ("specifying branches to track makes sense only with fetch mirrors")
+   * @throws RemoteAlreadyExistsError (exit 3) for a configured remote (git: "remote <name>
+   *   already exists.")
+   * @throws InvalidArgumentError (exit 128) for an invalid name ("'<name>' is not a valid
+   *   remote name"); in git 2.5x also for a name inside or around an existing one ("remote
+   *   name 'a/b' is a subset of existing remote 'a'", "... superset ...")
+   * @throws GitApiError (exit 1) when the fetch fails: its error, then "error: Could not fetch
+   *   <name>"; the remote stays configured, as git leaves it
    */
   async call(): Promise<RemoteConfig> {
     this.checkCallable();
     this.setCallable(false);
 
-    if (!this.name) {
+    const name = this.name;
+    if (!name) {
       throw new MissingArgumentError("name", "Remote name must be specified");
     }
     if (!this.uri) {
       throw new MissingArgumentError("uri", "Remote URI must be specified");
     }
-
-    const store = RemoteConfigStore.from(this.workingCopy);
-
-    // A remote exists if it is configured OR if it already has tracking refs.
-    if (store.isConfigured(this.name) || (await this.hasTrackingRefs(this.name))) {
-      throw new RemoteAlreadyExistsError(this.name);
+    const mirror = this.mirror;
+    let store: RemoteConfigStore;
+    try {
+      store = await this.checkAdd(name, mirror);
+    } catch (error) {
+      // what git printed before it died (the --mirror warning, a legacy-remote warning)
+      if (error instanceof GitApiError && this.messages.length > 0) {
+        error.message = [...this.messages, error.message].join("\n");
+      }
+      throw error;
     }
-    // git dies before it writes `remote.<name>.url`: a name with a newline would break the file
-    if (!isValidRemoteName(this.name)) {
-      throw new InvalidArgumentError(
-        "name",
-        this.name,
-        `'${this.name}' is not a valid remote name`,
+
+    store.setValue(`remote.${name}.url`, this.uri);
+    if (this.fetchRefspec !== undefined) {
+      store.addValue(`remote.${name}.fetch`, this.fetchRefspec);
+    } else if (mirror !== "push") {
+      // add_branch
+      for (const branch of this.track.length > 0 ? this.track : ["*"]) {
+        store.addValue(
+          `remote.${name}.fetch`,
+          mirror
+            ? `+refs/${branch}:refs/${branch}`
+            : `+refs/heads/${branch}:refs/remotes/${name}/${branch}`,
+        );
+      }
+    }
+    if (mirror === "push" || mirror === "both") store.setValue(`remote.${name}.mirror`, "true");
+    if (this.tags !== undefined) {
+      store.setValue(`remote.${name}.tagOpt`, this.tags ? "--tags" : "--no-tags");
+    }
+    await store.save();
+
+    if (this.fetchAfter) await this.fetchRemote(name);
+
+    if (this.master !== undefined) {
+      const head = `refs/remotes/${name}/HEAD`;
+      try {
+        await this.refsStore.setSymbolic(
+          head,
+          `refs/remotes/${name}/${this.master}`,
+          this.reflogLine("remote add"),
+        );
+      } catch (cause) {
+        throw new GitApiError(`error: Could not setup master '${this.master}'`, {
+          exitCode: 1,
+          cause,
+        });
+      }
+    }
+
+    return store.read(name);
+  }
+
+  /** git's refusals before `remote add` writes anything; the store to write to. */
+  private async checkAdd(
+    name: string,
+    mirror: RemoteMirrorMode | undefined,
+  ): Promise<RemoteConfigStore> {
+    if (mirror && this.master !== undefined) {
+      throw new GitApiError("fatal: specifying a master branch makes no sense with --mirror");
+    }
+    if (mirror === "push" && this.track.length > 0) {
+      throw new GitApiError(
+        "fatal: specifying branches to track makes sense only with fetch mirrors",
       );
     }
 
-    const config: RemoteConfig = {
-      name: this.name,
-      urls: [this.uri],
-      pushUrls: [],
-      fetchRefspecs: [this.fetchRefspec || defaultFetchRefspec(this.name)],
-      pushRefspecs: [],
-    };
+    // remote_get: a legacy remote file defines the remote too (git 2.x; 2.5x warns)
+    this.messages.push(...(await this.loadLegacyRemote(name)));
+    const store = RemoteConfigStore.from(this.workingCopy);
+    if (store.isConfiguredInRepo(name)) {
+      throw new RemoteAlreadyExistsError(name, `error: remote ${name} already exists.`);
+    }
+    // git dies before it writes `remote.<name>.url`: a name with a newline would break the file
+    if (!isValidRemoteName(name)) {
+      throw new InvalidArgumentError("name", name, `fatal: '${name}' is not a valid remote name`);
+    }
+    // check_remote_collision (git 2.5x): refs/remotes/a/ and refs/remotes/a/b/ would clash
+    if (this.hooks.compatibility !== "2.43") {
+      for (const other of store.configuredNames()) {
+        if (name.startsWith(`${other}/`)) {
+          throw new InvalidArgumentError(
+            "name",
+            name,
+            `fatal: remote name '${name}' is a subset of existing remote '${other}'`,
+          );
+        }
+        if (other.startsWith(`${name}/`)) {
+          throw new InvalidArgumentError(
+            "name",
+            name,
+            `fatal: remote name '${name}' is a superset of existing remote '${other}'`,
+          );
+        }
+      }
+    }
 
-    store.write(config);
-    await store.save();
-
-    return config;
+    return store;
   }
 
-  /** Whether any `refs/remotes/<name>/*` ref exists. */
-  private async hasTrackingRefs(name: string): Promise<boolean> {
-    for await (const _ref of this.refsStore.list(`refs/remotes/${name}/`)) {
-      return true;
+  /** git's fetch_remote: `Updating <name>`, then `git fetch <name>` as a child. */
+  private async fetchRemote(name: string): Promise<void> {
+    this.messages.push(`Updating ${name}`);
+    const fetch = new FetchCommand(this._workingCopy).shareHooksOf(this);
+    fetch.setTransports(this.getTransports());
+    fetch.setRemote(name);
+    if (this.credentials) fetch.setCredentials(this.credentials);
+    if (this.headers) fetch.setHeaders(this.headers);
+    if (this.timeout) fetch.setTimeout(this.timeout);
+    if (this.progressCallback) fetch.setProgressMonitor(this.progressCallback);
+    if (this.progressMessageCallback) {
+      fetch.setProgressMessageCallback(this.progressMessageCallback);
     }
-    return false;
+    try {
+      this.fetchResult = await fetch.call();
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      throw new GitApiError(`${message}\nerror: Could not fetch ${name}`, { exitCode: 1, cause });
+    }
+    this.messages.push(...this.fetchResult.messages);
   }
 }
 
@@ -540,6 +719,58 @@ function formatIdent(who: { name: string; email: string; timestamp: number; tzOf
  * ```
  */
 export class RemoteListCommand extends GitCommand<RemoteConfig[]> {
+  private verbose = false;
+
+  /** List each remote's URLs too (`git remote -v`), for {@link callText}. */
+  setVerbose(verbose: boolean): this {
+    this.checkCallable();
+    this.verbose = verbose;
+    return this;
+  }
+
+  /**
+   * What `git remote` (or with {@link setVerbose}, `git remote -v`) prints, as builtin/remote.c
+   * `show_all`: the remotes of the configuration (every scope; not the names known only
+   * from `refs/remotes/`, nor legacy remote files) in byte order, one per line; verbose,
+   * `<name>\t<url> (fetch)` with its first fetch URL (and ` [<filter>]` for a
+   * `remote.<name>.partialclonefilter`), then `<name>\t<url> (push)` for each push URL
+   * (`pushurl`, else the fetch URLs), `insteadOf`/`pushInsteadOf` applied; a remote without
+   * a URL has the line `<name>\t`.
+   *
+   * @example
+   * ```typescript
+   * const text = await git.remoteList().setVerbose(true).callText();
+   * // "origin\thttps://example.com/r.git (fetch)\norigin\thttps://example.com/r.git (push)\n"
+   * ```
+   */
+  async callText(): Promise<string> {
+    this.checkCallable();
+    this.setCallable(false);
+    const store = RemoteConfigStore.from(this.workingCopy);
+    const entries: { name: string; info: string }[] = [];
+    for (const name of store.configuredNames()) {
+      // get_one_entry
+      const urls = store.remoteUrls(name);
+      if (urls.length > 0) {
+        const filter = store.value(`remote.${name}.partialclonefilter`);
+        entries.push({
+          name,
+          info: `${urls[0]} (fetch)${filter !== undefined ? ` [${filter}]` : ""}`,
+        });
+      } else entries.push({ name, info: "" });
+      for (const url of store.remotePushUrls(name)) entries.push({ name, info: `${url} (push)` });
+    }
+    // string_list_sort: by name only, stable (glibc's merge sort)
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    let out = "";
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i] as { name: string; info: string };
+      if (this.verbose) out += `${entry.name}\t${entry.info}\n`;
+      else if (i === 0 || entries[i - 1]?.name !== entry.name) out += `${entry.name}\n`;
+    }
+    return out;
+  }
+
   /**
    * Execute the remote list operation.
    *
@@ -619,9 +850,21 @@ export class RemoteGetUrlCommand extends GitCommand<string[]> {
 /**
  * Set URL for a remote.
  *
- * Equivalent to `git remote set-url`.
+ * Equivalent to `git remote set-url [--push] <name> <newurl> [<oldurl>]`,
+ * `git remote set-url --add [--push] <name> <newurl>` and
+ * `git remote set-url --delete [--push] <name> <url>`, as git's builtin/remote.c `set_url`:
  *
- * Based on JGit's RemoteSetUrlCommand.
+ * - without `<oldurl>`, `remote.<name>.url` (`pushurl` with {@link setPush}) is set to the new
+ *   URL (git refuses a variable with several values: "could not set ...");
+ * - {@link setAdd} adds a value (one empty value is replaced);
+ * - {@link setOldUri} is a POSIX extended regular expression: one of the remote's URLs (as git
+ *   reads them, `insteadOf` applied) must match it ("No such URL found: <oldurl>"), and the
+ *   configuration's one value it matches is replaced (no value matching: the new one is added);
+ * - {@link setDelete} removes every value matching the pattern given as the URI, refusing to
+ *   remove every fetch URL ("Will not delete all non-push URLs").
+ *
+ * The remote must be configured in the repository (a `remote.<name>.*` variable, or a legacy
+ * remote file); tracking refs alone do not make one.
  *
  * @example
  * ```typescript
@@ -629,6 +872,7 @@ export class RemoteGetUrlCommand extends GitCommand<string[]> {
  *   .setRemoteName("origin")
  *   .setRemoteUri("https://github.com/user/repo")
  *   .call();
+ * await git.remoteSetUrl().setRemoteName("origin").setRemoteUri("^https://old").setDelete(true).call();
  * ```
  */
 export class RemoteSetUrlCommand extends GitCommand<RemoteConfig> {
@@ -636,6 +880,9 @@ export class RemoteSetUrlCommand extends GitCommand<RemoteConfig> {
   private remoteUri?: string;
   private pushUri = false;
   private oldUri?: string;
+  private addMode = false;
+  private deleteMode = false;
+  private messages: string[] = [];
 
   /**
    * Set the remote name.
@@ -656,7 +903,7 @@ export class RemoteSetUrlCommand extends GitCommand<RemoteConfig> {
   }
 
   /**
-   * Set the new remote URI.
+   * Set the new remote URI (with {@link setDelete}: the pattern of the URLs to delete).
    *
    * @param uri New remote URL
    */
@@ -692,13 +939,11 @@ export class RemoteSetUrlCommand extends GitCommand<RemoteConfig> {
   }
 
   /**
-   * Set the URL to replace.
+   * Set the URL to replace: a POSIX extended regular expression (`<oldurl>` of
+   * `git remote set-url <name> <newurl> <oldurl>`), matched anywhere in each URL. Only the
+   * value it matches is replaced; without it, the new URL replaces the variable's value.
    *
-   * Only this URL is replaced, leaving the remote's other URLs alone — the
-   * `<oldurl>` argument of `git remote set-url <name> <newurl> <oldurl>`.
-   * Without it, the new URL replaces all of them.
-   *
-   * @param uri Old URI to replace
+   * @param uri Old URI pattern
    */
   setOldUri(uri: string): this {
     this.checkCallable();
@@ -706,50 +951,150 @@ export class RemoteSetUrlCommand extends GitCommand<RemoteConfig> {
     return this;
   }
 
+  /** Add the URL to the remote's URLs (`--add`) instead of replacing one. */
+  setAdd(add: boolean): this {
+    this.checkCallable();
+    this.addMode = add;
+    return this;
+  }
+
+  /** Delete the URLs matching the URI given, a pattern (`--delete`). */
+  setDelete(del: boolean): this {
+    this.checkCallable();
+    this.deleteMode = del;
+    return this;
+  }
+
+  /** git 2.5x's warnings reading a legacy remote file. Empty before {@link call}. */
+  getMessages(): string[] {
+    return [...this.messages];
+  }
+
   /**
    * Execute the remote set-url operation.
    *
-   * The URL is written to the working copy configuration, so it survives the
-   * command. The remote may be known from its config section or from its
-   * tracking refs; in the latter case, this is what first gives it a URL.
-   *
    * @returns Updated remote configuration
    * @throws MissingArgumentError if remote name or URI is not set
-   * @throws RemoteNotFoundError if the remote is neither configured nor tracked
-   * @throws InvalidArgumentError if {@link setOldUri} names a URL the remote does not have
+   * @throws GitApiError (exit 128) for `--add` with `--delete` ("--add --delete doesn't make
+   *   sense"), or an old URL with either (exit 129, usage)
+   * @throws RemoteNotFoundError (exit 2) if the remote is not configured ("No such remote")
+   * @throws GitApiError (exit 128) for git's other refusals: "No such URL found: <oldurl>",
+   *   "Will not delete all non-push URLs", "could not set '<key>' to '<url>'", "could not
+   *   unset '<key>'", "Invalid old URL pattern: <oldurl>"
    */
   async call(): Promise<RemoteConfig> {
     this.checkCallable();
     this.setCallable(false);
 
-    if (!this.remoteName) {
+    const name = this.remoteName;
+    if (!name) {
       throw new MissingArgumentError("remoteName", "Remote name must be specified");
     }
-    if (!this.remoteUri) {
+    if (this.remoteUri === undefined) {
       throw new MissingArgumentError("remoteUri", "Remote URI must be specified");
     }
+    if (this.addMode && this.deleteMode) {
+      throw new GitApiError("fatal: --add --delete doesn't make sense");
+    }
+    if ((this.addMode || this.deleteMode) && this.oldUri !== undefined) {
+      throw new GitApiError(
+        this.addMode
+          ? "usage: git remote set-url --add <name> <newurl>"
+          : "usage: git remote set-url --delete <name> <url>",
+        { exitCode: 129 },
+      );
+    }
+    const newUrl = this.remoteUri;
+    const oldUrl = this.deleteMode ? newUrl : this.oldUri;
 
+    this.messages.push(...(await this.loadLegacyRemote(name)));
     const store = RemoteConfigStore.from(this.workingCopy);
-    if (!store.isConfigured(this.remoteName) && !(await this.hasTrackingRefs(this.remoteName))) {
-      throw new RemoteNotFoundError(this.remoteName);
+    if (!store.isConfiguredInRepo(name)) {
+      throw new RemoteNotFoundError(name, `error: No such remote '${name}'`);
+    }
+    const key = `remote.${name}.${this.pushUri ? "pushurl" : "url"}`;
+    const values = store.localValues(key);
+
+    if (oldUrl === undefined || this.addMode) {
+      // repo_config_set, or set_multivar with "^$" for --add
+      const pattern = this.addMode ? compileUrlPattern("^$") : undefined;
+      const matching = values.filter((v) => pattern === undefined || matchesUrl(pattern, v));
+      if (matching.length > 1) throw couldNotSet(key, newUrl);
+      if (pattern === undefined) store.setValue(key, newUrl);
+      else replaceMatching(store, key, values, pattern, newUrl);
+      await store.save();
+      return store.read(name);
     }
 
-    store.setUrl(this.remoteName, this.remoteUri, {
-      push: this.pushUri,
-      oldUrl: this.oldUri,
-    });
+    let regex: PosixRegex;
+    try {
+      regex = compileUrlPattern(oldUrl);
+    } catch (cause) {
+      if (!(cause instanceof PosixRegexError)) throw cause;
+      throw new GitApiError(`fatal: Invalid old URL pattern: ${oldUrl}`, { cause });
+    }
+    // matched against the URLs as git reads them (alias_all_urls), not the variable's values
+    const urls = store.urlSet(name, this.pushUri);
+    const matches = urls.filter((url) => matchesUrl(regex, url)).length;
+    if (!this.deleteMode && matches === 0) {
+      throw new GitApiError(`fatal: No such URL found: ${oldUrl}`);
+    }
+    if (this.deleteMode && matches === urls.length && !this.pushUri) {
+      throw new GitApiError("fatal: Will not delete all non-push URLs");
+    }
+    const hits = values.filter((v) => matchesUrl(regex, v)).length;
+    if (this.deleteMode) {
+      if (hits === 0) throw new GitApiError(`fatal: could not unset '${key}'`);
+      store.setValues(
+        key,
+        values.filter((v): v is string => v !== undefined && !matchesUrl(regex, v)),
+      );
+    } else {
+      if (hits > 1) throw couldNotSet(key, newUrl);
+      replaceMatching(store, key, values, regex, newUrl);
+    }
     await store.save();
-
-    return store.read(this.remoteName);
+    return store.read(name);
   }
+}
 
-  /** Whether any `refs/remotes/<name>/*` ref exists. */
-  private async hasTrackingRefs(name: string): Promise<boolean> {
-    for await (const _ref of this.refsStore.list(`refs/remotes/${name}/`)) {
-      return true;
-    }
-    return false;
+/** git's refusal to set one of several values: store_aux's warning, then the death. */
+function couldNotSet(key: string, value: string): GitApiError {
+  return new GitApiError(
+    `warning: ${key} has multiple values\nfatal: could not set '${key}' to '${value}'`,
+    { exitCode: 128 },
+  );
+}
+
+/** git's regcomp(REG_EXTENDED) of a URL pattern. */
+function compileUrlPattern(pattern: string): PosixRegex {
+  return compilePosixRegex(pattern, { extended: true });
+}
+
+/** git's config value match: a variable without `=` never matches. */
+function matchesUrl(regex: PosixRegex, value: string | undefined): boolean {
+  return value !== undefined && regex.test(new TextEncoder().encode(value));
+}
+
+/**
+ * git's set_multivar with a value pattern and no multi-replace (at most one value matches):
+ * the matching value is replaced where it is, or the new one added after the others.
+ */
+function replaceMatching(
+  store: RemoteConfigStore,
+  key: string,
+  values: (string | undefined)[],
+  regex: PosixRegex,
+  newValue: string,
+): void {
+  if (!values.some((v) => matchesUrl(regex, v))) {
+    store.addValue(key, newValue);
+    return;
   }
+  store.setValues(
+    key,
+    values.map((v) => (matchesUrl(regex, v) ? newValue : (v ?? ""))),
+  );
 }
 
 /**
