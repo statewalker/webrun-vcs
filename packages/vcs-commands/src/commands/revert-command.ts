@@ -2,6 +2,7 @@ import type { PersonIdent } from "@statewalker/vcs-core";
 
 import { parseGitBool } from "@statewalker/vcs-utils";
 
+import { GitApiError } from "../errors/git-api-error.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type ContentMergeStrategy, MergeStrategy } from "../results/merge-result.js";
@@ -14,6 +15,7 @@ import {
   type PickCommitMode,
   type PickOutcome,
   PickSequencer,
+  pickOptionsConflict,
   SequencerOperation,
 } from "./sequencer-pick.js";
 
@@ -54,6 +56,8 @@ export class RevertCommand extends GitCommand<RevertResult> {
   /** `-S[<keyid>]` / `--no-gpg-sign` (undefined: `commit.gpgSign`) */
   private sign?: boolean | string;
   private editor?: CommitEditor;
+  private signoff = false;
+  private reference?: boolean;
 
   /**
    * Add a commit to revert.
@@ -217,6 +221,30 @@ export class RevertCommand extends GitCommand<RevertResult> {
   }
 
   /**
+   * `-s` / `--signoff`: the committer's `Signed-off-by:` added to each message as git's
+   * append_signoff adds it (after a blank line unless the message ends with a trailer block,
+   * nothing when that block's last line is it already; `trailer.*` configuration applies).
+   * The message is then cleaned up as `whitespace` unless `commit.cleanup` says otherwise.
+   */
+  setSignoff(signoff: boolean): this {
+    this.checkCallable();
+    this.signoff = signoff;
+    return this;
+  }
+
+  /**
+   * `--reference` (`--no-reference`: false): the reverted commit is named as
+   * `<abbrev> (<subject>, <date>)` and the title is left to the editor as a
+   * `# *** SAY WHY WE ARE REVERTING ON THE TITLE LINE ***` comment (committed as it stands
+   * without `--edit`). Unset: `revert.reference`.
+   */
+  setReference(reference: boolean): this {
+    this.checkCallable();
+    this.reference = reference;
+    return this;
+  }
+
+  /**
    * The editor of {@link setEdit} (git's `core.editor` / `GIT_EDITOR`): see
    * `CommitCommand.setEditor`. Without one the template is kept as it is (comments stripped).
    */
@@ -239,6 +267,7 @@ export class RevertCommand extends GitCommand<RevertResult> {
         .setNoVerify(true)
         .setEdit(true)
         .setReflogAction(mode.reflogAction);
+      if (mode.allowEmpty) commit.setAllowEmpty(true);
     } else {
       commit.shareHooksOf(this).setEdit(mode.edit);
       if (!mode.edit) commit.setCleanupMode(CleanupMode.STRIP);
@@ -257,6 +286,7 @@ export class RevertCommand extends GitCommand<RevertResult> {
   async call(): Promise<RevertResult> {
     this.checkCallable();
     this.setCallable(false);
+    this.checkOptions();
     // the index as it is now, before the worktree or a ref is touched: one another writer
     // replaced is read again (git reads the index at its start), unless this instance holds
     // unwritten edits (refused)
@@ -265,6 +295,28 @@ export class RevertCommand extends GitCommand<RevertResult> {
     const run = () => this.run();
     const result = toResult(await (worktree?.batch ? worktree.batch(run) : run()));
     return this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result;
+  }
+
+  /** parse_options and verify_opt_compatible: git's refusals before anything is read. */
+  private checkOptions(): void {
+    if (this.mainlineParent !== undefined && !(this.mainlineParent > 0)) {
+      throw new GitApiError("error: option `mainline' expects a number greater than zero", {
+        exitCode: 129,
+      });
+    }
+    const conflict = pickOptionsConflict(
+      "revert",
+      this.operation,
+      {
+        action: "revert",
+        noCommit: this.noCommit,
+        mainline: this.mainlineParent,
+        signoff: this.signoff,
+        edit: this.edit,
+      },
+      this.hooks.compatibility,
+    );
+    if (conflict) throw new GitApiError(conflict, { exitCode: 128 });
   }
 
   /** What the sparse checkout printed while the result was written. */
@@ -295,6 +347,8 @@ export class RevertCommand extends GitCommand<RevertResult> {
         committer: this.committer,
         edit: this.edit,
         sign: this.sign,
+        signoff: this.signoff,
+        reference: this.reference,
         reflogAction: this.reflogAction(this.reflogPrefix.replace(/:$/, "")),
       },
     );
