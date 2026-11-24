@@ -13,6 +13,7 @@ import {
   xdlHashRecord,
 } from "@statewalker/vcs-utils";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { computeObjectId } from "@statewalker/vcs-utils/pack";
 import { expandUserPath } from "@statewalker/vcs-working-tree";
 
 import { RefNotFoundError } from "../errors/ref-errors.js";
@@ -30,7 +31,9 @@ import {
   type LineBlame,
   lineFingerprints,
 } from "./blame-ignore.js";
+import { parseGitColor } from "./config-value-types.js";
 import { abbrevLengths } from "./core-config.js";
+import { localTimezoneOffset } from "./git-date.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { type Mailmap, readMailmapFile, readRepositoryMailmap } from "./mailmap.js";
 import { canonicalObjectId } from "./object-id-input.js";
@@ -121,6 +124,14 @@ export interface BlameResult {
    */
   markUnblamableLines?: boolean;
   /**
+   * The entries in the order blame found them, before sorting and coalescing: what
+   * `git blame --incremental` prints (`formatBlameIncremental`). Each entry's `boundary` is
+   * what git knew when it printed the entry.
+   */
+  incremental?: BlameEntry[];
+  /** The output settings of the repository's configuration (defaults of `formatBlame`) */
+  output?: BlameOutputConfig;
+  /**
    * Get the blame entry for a specific line (1-based).
    *
    * @param line Line number (1-based)
@@ -168,6 +179,52 @@ export interface BlameResult {
    * `formatBlame` as `autoAbbrev`.
    */
   autoAbbrev?(): Promise<number>;
+}
+
+/**
+ * The output settings `git blame` reads from the configuration (`git_blame_config`), which
+ * `formatBlame` takes as defaults of its options
+ */
+export interface BlameOutputConfig {
+  /** `blame.date`: the date mode (`--date`), as written */
+  date?: string;
+  /** `blame.showEmail` (`-e`) */
+  showEmail?: boolean;
+  /** `blame.blankBoundary` (`-b`) */
+  blankBoundary?: boolean;
+  /** `blame.coloring=repeatedLines` (`--color-lines`) */
+  colorLines?: boolean;
+  /** `blame.coloring=highlightRecent` (`--color-by-age`) */
+  colorByAge?: boolean;
+  /** `color.blame.repeatedLines`: the escape sequence of the color (default cyan) */
+  repeatedLinesColor?: string;
+  /** `color.blame.highlightRecent`: `<color>,<date>,<color>,...` as written */
+  highlightRecent?: string;
+  /** Warnings git prints while reading these settings (invalid values it skips) */
+  warnings?: string[];
+}
+
+/**
+ * The buffer blamed instead of the file of the start commit (`setContents`): git's fake
+ * working-tree commit on top of the start commit
+ */
+export interface BlameContentsOptions {
+  /**
+   * The `--contents` argument, named in the fake commit's summary (`-` reads "standard
+   * input", the default)
+   */
+  name?: string;
+  /**
+   * The working tree's file blamed as `git blame <path>` without a revision does: the commit
+   * is "Not Committed Yet" instead of "External file (--contents)"
+   */
+  workingTree?: boolean;
+  /** The fake commit's time in seconds (default now) */
+  time?: number;
+  /** Its zone, `+HHMM` (default the local zone at `time`) */
+  tzOffset?: string;
+  /** The file's mode (default `100644`) */
+  mode?: number;
 }
 
 /** A version of the file in a commit (`struct blame_origin`) */
@@ -538,6 +595,16 @@ export class BlameCommand extends GitCommand<BlameResult> {
   /** `--reverse`: the commit whose lines are followed forward */
   private reverseFrom?: ObjectId;
   private firstParent = false;
+  /** The buffer blamed instead of the start commit's file (`--contents`) */
+  private contents?: { content: Uint8Array } & BlameContentsOptions;
+  /** Commits older than this (committer time, seconds) are boundaries (`--since`) */
+  private since?: number;
+  /** Commits `--since` marked uninteresting before they were loaded */
+  private sinceUninteresting = new Set<ObjectId>();
+  /** Blobs that exist only here (the `--contents` buffer: git's `odb_pretend_object`) */
+  private pretend = new Map<ObjectId, Uint8Array>();
+  /** The entries in the order they were found guilty (`--incremental`) */
+  private guilty: Array<{ entry: Entry; origin: Origin; boundary: boolean }> = [];
   /** The commits blamed lines pass to from each commit in reverse (`revs->children`) */
   private children = new Map<ObjectId, ObjectId[]>();
   /** The commits the reverse walk found uninteresting (boundaries) */
@@ -562,6 +629,8 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private finalHashes: Int32Array = new Int32Array(0);
 
   private states = new Map<ObjectId, CommitState>();
+  /** The `--contents` buffer's blob and mode */
+  private fakeEntry?: { id: ObjectId; mode: number };
   /** Numbers the lines of every version compared, so each is split and hashed once */
   private interner?: LineInterner;
 
@@ -755,6 +824,32 @@ export class BlameCommand extends GitCommand<BlameResult> {
   }
 
   /**
+   * Blame a buffer instead of the start commit's file (`--contents <file>`): git's fake
+   * commit on top of the start commit (default HEAD), with null id, holding `content` at the
+   * blamed path. Its lines are blamed on "External file (--contents)" where the start
+   * commit's file differs (`workingTree`: "Not Committed Yet", as `git blame <path>` blames
+   * the working tree's file). The content is taken as git stores it (no clean filters).
+   *
+   * @throws Error `--contents and --reverse do not blend well.` with `setReverse`, and
+   * `no such path '<path>' in HEAD` when the start commit lacks the path
+   */
+  setContents(content: Uint8Array, options: BlameContentsOptions = {}): this {
+    this.checkCallable();
+    this.contents = { ...options, content };
+    return this;
+  }
+
+  /**
+   * Stop at commits older than `timestamp` (seconds, committer time; `--since`): they and
+   * their ancestors are boundaries, as git's `revs->max_age`
+   */
+  setSince(timestamp: number): this {
+    this.checkCallable();
+    this.since = timestamp;
+    return this;
+  }
+
+  /**
    * Details that changed between git versions: `histogramRediff` (git 2.54+, default
    * true), `legacyMinimal` (git before 2.5x), `renameCountLastSpan` (rename scores of
    * git 2.50+, default true) and `optionalPaths` (a `blame.ignoreRevsFile` of
@@ -838,10 +933,14 @@ export class BlameCommand extends GitCommand<BlameResult> {
     this.markUnblamableLines ??= boolValue(config.value("blame.markUnblamableLines")) ?? false;
     await this.buildIgnoreList(config);
 
+    if (this.contents && this.reverseFrom !== undefined) {
+      throw new Error("--contents and --reverse do not blend well.");
+    }
     let startId = this.startCommit;
     if (!startId) {
       const head = await this.refsStore.resolve("HEAD");
       if (!head?.objectId) {
+        if (this.contents) throw new Error("no such ref: HEAD");
         throw new Error(this.reverseFrom ? "No commit to dig up from?" : "No HEAD commit found");
       }
       startId = head.objectId;
@@ -853,16 +952,17 @@ export class BlameCommand extends GitCommand<BlameResult> {
     }
 
     const resultPath = this.filePath;
+    if (this.contents) startId = await this.fakeWorkingTreeCommit(startId, resultPath);
     const start = await this.state(startId);
     if (!start) {
       throw new RefNotFoundError(`Cannot find commit: ${startId}`);
     }
-    const entry = await this.lookup(start.commit.tree, resultPath);
+    const entry = this.contents ? this.fakeEntry : await this.lookup(start.commit.tree, resultPath);
     if (!entry) {
       throw new Error(`File not found: ${resultPath}`);
     }
-    const size = await this.blobs.size(entry.id);
-    if (size > this.bigFileThreshold) {
+    const size = await this.blobSize(entry.id);
+    if (!this.contents && size > this.bigFileThreshold) {
       throw new Error(
         `${resultPath} is ${size} bytes, larger than bigFileThreshold (${this.bigFileThreshold})`,
       );
@@ -952,6 +1052,23 @@ export class BlameCommand extends GitCommand<BlameResult> {
       });
     }
     const result = createBlameResult(resultPath, lineCount, entries, content);
+    result.incremental = [];
+    for (const g of this.guilty) {
+      const st = this.states.get(g.origin.commitId);
+      if (!st) continue;
+      const prev = g.origin.previous;
+      result.incremental.push({
+        commit: commitOf(st, g.origin.commitId),
+        commitId: g.origin.commitId,
+        sourcePath: g.origin.path,
+        sourceStart: g.entry.sLno + 1,
+        resultStart: g.entry.lno + 1,
+        lineCount: g.entry.numLines,
+        ...(prev ? { previous: { commitId: prev.commitId, path: prev.path } } : {}),
+        boundary: g.boundary,
+      });
+    }
+    result.output = blameOutputConfig(config);
     result.markIgnoredLines = this.markIgnoredLines;
     result.markUnblamableLines = this.markUnblamableLines;
     const workingCopy = this.workingCopy;
@@ -1182,19 +1299,96 @@ export class BlameCommand extends GitCommand<BlameResult> {
         commitId = queue.get();
         continue;
       }
-      if (this.reverseFrom !== undefined || !st.uninteresting) await this.passBlame(suspect, queue);
+      if (
+        this.reverseFrom !== undefined ||
+        (!st.uninteresting &&
+          !(this.since !== undefined && st.commit.committer.timestamp < this.since))
+      ) {
+        await this.passBlame(suspect, queue);
+      } else {
+        st.uninteresting = true;
+        this.markParentsUninteresting(st);
+      }
       // treat root commit as boundary
       if (st.commit.parents.length === 0 && !this.showRoot) st.uninteresting = true;
       // take responsibility for the remaining entries
       let ent = suspect.suspects;
       if (ent) {
         suspect.guilty = true;
+        // found_guilty_entry: what --incremental prints, in this order
+        for (let e: Entry | null = ent; e; e = e.next) {
+          this.guilty.push({
+            entry: { ...e, next: null },
+            origin: suspect,
+            boundary: st.uninteresting,
+          });
+        }
         while (ent.next) ent = ent.next;
         ent.next = final.next;
         final.next = suspect.suspects;
         suspect.suspects = null;
       }
     }
+  }
+
+  /**
+   * revision.c's `mark_parents_uninteresting`: the parents marked, and the parents of those
+   * already loaded (parsed) recursively
+   */
+  private markParentsUninteresting(st: CommitState): void {
+    const pending = [...st.commit.parents];
+    while (pending.length > 0) {
+      const id = pending.pop() as ObjectId;
+      const parent = this.states.get(id);
+      if (!parent) {
+        this.sinceUninteresting.add(id);
+        continue;
+      }
+      if (parent.uninteresting) continue;
+      parent.uninteresting = true;
+      pending.push(...parent.commit.parents);
+    }
+  }
+
+  /**
+   * blame.c's `fake_working_tree_commit`: a commit with the null id on top of `parentId`
+   * whose file at `path` is the `--contents` buffer; its id is returned
+   */
+  private async fakeWorkingTreeCommit(parentId: ObjectId, path: string): Promise<ObjectId> {
+    const contents = this.contents as { content: Uint8Array } & BlameContentsOptions;
+    const parent = await this.state(parentId);
+    if (!parent) throw new Error(`no such commit ${parentId}`);
+    // verify_working_tree_path
+    const inParent = await this.lookup(parent.commit.tree, path);
+    if (!inParent) throw new Error(`no such path '${path}' in HEAD`);
+    const time = contents.time ?? Math.floor(Date.now() / 1000);
+    const tzOffset = contents.tzOffset ?? localTimezoneOffset(time);
+    const ident = contents.workingTree
+      ? { name: "Not Committed Yet", email: "not.committed.yet", timestamp: time, tzOffset }
+      : { name: "External file (--contents)", email: "external.file", timestamp: time, tzOffset };
+    const from = contents.workingTree
+      ? path
+      : contents.name === undefined || contents.name === "-"
+        ? "standard input"
+        : contents.name;
+    const id = this.objectFormat.nullId;
+    const blobId = await computeObjectId("blob", contents.content, this.objectFormat);
+    this.pretend.set(blobId, contents.content);
+    this.fakeEntry = { id: blobId, mode: contents.mode ?? 0o100644 };
+    this.states.set(id, {
+      // the parent's tree stands for the index git diffs the fake commit against
+      commit: {
+        tree: parent.commit.tree,
+        parents: [parentId],
+        author: ident,
+        committer: ident,
+        message: `Version of ${path} from ${from}\n`,
+      },
+      origins: null,
+      originsByPath: new Map(),
+      uninteresting: false,
+    });
+    return id;
   }
 
   /** git's `pass_blame` */
@@ -1767,7 +1961,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
         renameLimit: limit,
         minimumScore: Math.round((this.renameScore * GIT_MAX_SCORE) / 100),
         countLastSpan: this.renameCountLastSpan,
-        size: async (c) => this.blobs.size(c.id),
+        size: async (c) => this.blobSize(c.id),
         load: async (c) => this.readBlob(c.id),
       },
     );
@@ -1816,7 +2010,8 @@ export class BlameCommand extends GitCommand<BlameResult> {
       commit,
       origins: null,
       originsByPath: new Map(),
-      uninteresting: this.reverseUninteresting.has(commitId),
+      uninteresting:
+        this.reverseUninteresting.has(commitId) || this.sinceUninteresting.has(commitId),
     };
     this.states.set(commitId, st);
     return st;
@@ -1843,7 +2038,13 @@ export class BlameCommand extends GitCommand<BlameResult> {
 
   /** Whether a blob is over the threshold (from its size, without reading it). */
   private async isBig(blobId: ObjectId): Promise<boolean> {
-    return (await this.blobs.size(blobId)) > this.bigFileThreshold;
+    return (await this.blobSize(blobId)) > this.bigFileThreshold;
+  }
+
+  /** A blob's size, the `--contents` buffer's too */
+  private async blobSize(blobId: ObjectId): Promise<number> {
+    const pretended = this.pretend.get(blobId);
+    return pretended ? pretended.length : this.blobs.size(blobId);
   }
 
   /**
@@ -1851,6 +2052,8 @@ export class BlameCommand extends GitCommand<BlameResult> {
    * comes (a resolved pack object) instead of copying it
    */
   private async readBlob(blobId: ObjectId, shared = false): Promise<Uint8Array> {
+    const pretended = this.pretend.get(blobId);
+    if (pretended) return pretended;
     const chunks: Uint8Array[] = [];
     let total = 0;
     const content = await this.blobs.load(blobId);
@@ -2027,6 +2230,44 @@ function algorithmValue(v: string | undefined): XdiffAlgorithm | undefined {
   const s = v?.trim().toLowerCase();
   if (s === "default") return "myers";
   return s === "myers" || s === "minimal" || s === "patience" || s === "histogram" ? s : undefined;
+}
+
+/**
+ * builtin/blame.c's `git_blame_config` for the output: `blame.date`, `blame.showEmail`,
+ * `blame.blankBoundary`, `blame.coloring`, `color.blame.repeatedLines` and
+ * `color.blame.highlightRecent`, read in config order as git reads them
+ */
+function blameOutputConfig(config: RemoteConfigStore): BlameOutputConfig {
+  const out: BlameOutputConfig = {};
+  const last = (key: string) => {
+    const values = config.values(key);
+    return values.length > 0 ? values[values.length - 1] : undefined;
+  };
+  const date = last("blame.date");
+  if (date !== undefined) out.date = date;
+  const email = last("blame.showEmail");
+  if (email !== undefined) out.showEmail = boolValue(email) ?? false;
+  const blank = last("blame.blankBoundary");
+  if (blank !== undefined) out.blankBoundary = boolValue(blank) ?? false;
+  const warnings: string[] = [];
+  for (const value of config.values("blame.coloring")) {
+    if (value === "repeatedLines") out.colorLines = true;
+    else if (value === "highlightRecent") out.colorByAge = true;
+    else if (value === "none") {
+      out.colorLines = false;
+      out.colorByAge = false;
+    } else warnings.push(`warning: invalid value for 'blame.coloring': '${value}'`);
+  }
+  for (const value of config.values("color.blame.repeatedLines")) {
+    const color = parseGitColor(value);
+    if (color === undefined) {
+      warnings.push(`warning: invalid value for 'color.blame.repeatedLines': '${value}'`);
+    } else out.repeatedLinesColor = color;
+  }
+  const recent = last("color.blame.highlightRecent");
+  if (recent !== undefined) out.highlightRecent = recent;
+  if (warnings.length > 0) out.warnings = warnings;
+  return out;
 }
 
 /**
