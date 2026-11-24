@@ -3,21 +3,25 @@
  * 2001`, `From:`, `Date:`, `Subject: [PATCH n/m] ...`, the message, `---`, the diffstat,
  * the summary, the patch with binary hunks, the `-- ` signature), as git writes them byte
  * for byte: numbered subjects, cover letters with the shortlog and diffstat, threading
- * headers, `--base` prerequisite patch ids, signoffs and the `format.*` settings.
+ * headers, `--base` prerequisite patch ids, signoffs through the trailers engine, MIME
+ * attachments (`--attach`/`--inline`), notes after the `---` line, cover letters from the
+ * branch description, `--ignore-if-in-upstream` and the `format.*` settings.
  */
 
 import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { nullObjectIdLike } from "@statewalker/vcs-utils";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
 import { ChangeType } from "../results/diff-entry.js";
 import { showDate } from "./date-format.js";
 import { DiffCommand } from "./diff-command.js";
 import { LogCommand } from "./log-command.js";
-import { mailFromHeader } from "./log-output.js";
+import { mailFromHeader, mailSubjectLine } from "./log-output.js";
 import { configValue } from "./merge-config.js";
 import { type PatchIdChange, patchIdOfChanges } from "./patch-id.js";
 import { sanitizedSubject, wrapText } from "./pretty-format.js";
+import { trailerConfigOf } from "./trailers.js";
 
 /** One file `git format-patch` writes (or one mail of `--stdout`). */
 export interface FormatPatchFile {
@@ -37,6 +41,24 @@ export interface FormatPatchResult {
 
 /** Thrown where git dies (`fatal: ...`). */
 export class FormatPatchError extends Error {}
+
+/** `--cover-from-description` modes (`default` is `message`). */
+export type CoverFromDescription = "default" | "none" | "message" | "subject" | "auto";
+
+/** diff.c's mime_boundary_leader */
+const MIME_BOUNDARY_LEADER = "------------";
+
+/** builtin/log.c's COVER_FROM_AUTO_MAX_SUBJECT_LEN */
+const COVER_FROM_AUTO_MAX_SUBJECT_LEN = 100;
+
+/** parse_cover_from_description: dies on an unknown mode. */
+function coverFromDescriptionMode(
+  value: string | undefined,
+): "none" | "message" | "subject" | "auto" {
+  if (value === undefined || value === "default" || value === "message") return "message";
+  if (value === "none" || value === "subject" || value === "auto") return value;
+  throw new FormatPatchError(`${value}: invalid cover from description mode`);
+}
 
 /** Whether a version string (`2.56.0`, `2.43.0.windows.1`) is at least `major.minor`. */
 function gitVersionAtLeast(version: string, major: number, minor: number): boolean {
@@ -94,6 +116,11 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
   private versionString = "2.56.0";
   private messageIdTime?: () => number;
   private writeFiles = true;
+  /** `--attach`/`--inline`/`--no-attach`: the boundary (true: the version string, null: none) */
+  private attach?: { boundary: string | true | null; inline: boolean };
+  private notesOptions: (boolean | string)[] = [];
+  private coverFromDescription?: string;
+  private ignoreIfInUpstream = false;
 
   /** A revision argument: `<since>` (to HEAD), `<a>..<b>`, `^<a>`, `<b>`. */
   addRevision(revision: string): this {
@@ -171,6 +198,50 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
   /** `-s` / `--signoff`. */
   setSignoff(value: boolean): this {
     this.signoff = value;
+    return this;
+  }
+
+  /**
+   * `--attach[=<boundary>]` (true: git's version string as the boundary) / `--no-attach`
+   * (false): each patch a MIME attachment (`Content-Disposition: attachment`) after the
+   * message and the diffstat. Default `format.attach`.
+   */
+  setAttach(value: string | boolean): this {
+    this.attach = { boundary: value === false ? null : value, inline: false };
+    return this;
+  }
+
+  /**
+   * `--inline[=<boundary>]` (true: git's version string): as {@link setAttach}, the part
+   * marked `Content-Disposition: inline` (`--no-attach` turns either off).
+   */
+  setInline(value: string | true): this {
+    this.attach = { boundary: value, inline: true };
+    return this;
+  }
+
+  /**
+   * `--notes` (true), `--notes=<ref>` (a ref, `x` is `refs/notes/x`), `--no-notes` (false):
+   * each call is one option, applied in order after `format.notes`. The notes go after the
+   * `---` line.
+   */
+  setNotes(value: boolean | string): this {
+    this.notesOptions.push(value);
+    return this;
+  }
+
+  /**
+   * `--cover-from-description=<mode>`: how the cover letter uses `branch.<name>.description`
+   * (default `format.coverFromDescription`, else `message`).
+   */
+  setCoverFromDescription(mode: CoverFromDescription | (string & {})): this {
+    this.coverFromDescription = mode;
+    return this;
+  }
+
+  /** `--ignore-if-in-upstream`: leave out the patches the upstream side has (patch ids). */
+  setIgnoreIfInUpstream(value: boolean): this {
+    this.ignoreIfInUpstream = value;
     return this;
   }
 
@@ -308,6 +379,11 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     return configValue(this.workingCopy, key);
   }
 
+  /** Every value of a variable in order, `text` undefined for one without `=`. */
+  private configWhere(key: string): { text: string | undefined }[] {
+    return RemoteConfigStore.from(this.workingCopy).valuesWithOrigin(key);
+  }
+
   private configAll(key: string): string[] {
     const store = (this.workingCopy as unknown as { config?: { getAll?(k: string): string[] } })
       .config;
@@ -392,6 +468,49 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       fromSpec = b === undefined ? fromCfg : b ? true : undefined;
     }
 
+    // format.attach: a boundary, an empty value none, no value the version string; then
+    // --attach/--inline/--no-attach
+    let mime: { boundary: string; inline: boolean } | undefined;
+    const attachCfg = this.configWhere("format.attach").at(-1);
+    if (attachCfg) {
+      if (attachCfg.text === undefined) mime = { boundary: this.versionString, inline: false };
+      else if (attachCfg.text !== "") mime = { boundary: attachCfg.text, inline: false };
+      else mime = undefined;
+    }
+    if (this.attach) {
+      const b = this.attach.boundary;
+      mime =
+        b === null
+          ? undefined
+          : { boundary: b === true ? this.versionString : b, inline: this.attach.inline };
+    }
+    // format.notes, then --notes/--notes=<ref>/--no-notes (display_notes_opt)
+    const notes = { show: false, useDefault: false, refs: [] as string[] };
+    const notesOption = (value: boolean | string) => {
+      if (value === true) {
+        notes.useDefault = true;
+        notes.show = true;
+      } else if (value === false) {
+        notes.useDefault = false;
+        notes.refs = [];
+        notes.show = false;
+      } else {
+        notes.refs.push(value);
+        notes.show = true;
+      }
+    };
+    for (const where of this.configWhere("format.notes")) {
+      const b = where.text === undefined ? true : maybeBool(where.text);
+      notesOption(b === undefined ? (where.text as string) : b);
+    }
+    for (const value of this.notesOptions) notesOption(value);
+    // format.coverFromDescription, then --cover-from-description (dies on a bad mode)
+    let coverMode = coverFromDescriptionMode(undefined);
+    const cfgCoverMode = this.config("format.coverFromDescription");
+    if (cfgCoverMode !== undefined) coverMode = coverFromDescriptionMode(cfgCoverMode);
+    if (this.coverFromDescription !== undefined)
+      coverMode = coverFromDescriptionMode(this.coverFromDescription);
+
     let sprefix = this.subjectPrefix ?? this.config("format.subjectPrefix") ?? "PATCH";
     const subjectPrefixGiven = this.subjectPrefix !== undefined;
     if (this.rfc) {
@@ -436,7 +555,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       );
 
     // the commits: newest first, merges left out
-    const { list, origin } = await this.walk();
+    const { list, origin, branchName } = await this.walk();
     if (!list.length) return { patches: [], output: new Uint8Array(0) };
     const total0 = list.length;
     let cover = this.coverLetter;
@@ -480,8 +599,8 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       }
       return h;
     };
-    const fileName = (subject: string | undefined) => {
-      let name = outDir ? (outDir.endsWith("/") ? outDir : `${outDir}/`) : "";
+    const fileName = (subject: string | undefined, inDir = true) => {
+      let name = outDir && inDir ? (outDir.endsWith("/") ? outDir : `${outDir}/`) : "";
       if (this.numberedFiles) return `${name}${nr}`;
       const maxLen = encodeGitPath(name).length + nameMax - (suffix.length + 1);
       if (this.rerollCount) name += `${sanitizedSubject(`v${this.rerollCount}`)}-`;
@@ -516,6 +635,8 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
         encodeHeaders,
         zeroCommit: this.zeroCommit,
         outputEncoding,
+        coverMode,
+        ...(branchName !== undefined ? { branchName } : {}),
       });
       const content = concat([text, latin(bases.text), latin(sig())]);
       bases.text = "";
@@ -537,6 +658,21 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
         ownId = messageId(id);
       }
       const subject = this.numberedFiles ? undefined : await this.fileSubject(id);
+      // log_write_email_headers: a multipart mail, the patch in a part of its own
+      let afterSubject = extraHeaders;
+      let statSep: string | undefined;
+      if (mime) {
+        const boundary = `${MIME_BOUNDARY_LEADER}${mime.boundary}`;
+        const part = fileName(subject, false);
+        afterSubject +=
+          `MIME-Version: 1.0\nContent-Type: multipart/mixed; boundary="${boundary}"\n\n` +
+          `This is a multi-part message in MIME format.\n--${boundary}\n` +
+          "Content-Type: text/plain; charset=UTF-8; format=fixed\nContent-Transfer-Encoding: 8bit\n\n";
+        statSep =
+          `\n--${boundary}\nContent-Type: text/x-patch; name="${part}"\n` +
+          "Content-Transfer-Encoding: 8bit\n" +
+          `Content-Disposition: ${mime.inline ? "inline" : "attachment"}; filename="${part}"\n\n`;
+      }
       const log = new LogCommand(this.workingCopy)
         .add(id)
         .setMaxCount(1)
@@ -548,6 +684,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
           submoduleFormat: "short",
           uiConfig: false,
           ...(noPrefix ? { noPrefix: true } : {}),
+          ...(statSep !== undefined ? { statSep } : {}),
         });
       const bytes = await log.callBytes({
         pretty: this.stdout && bool(this.config("format.mboxrd")) ? "mboxrd" : "email",
@@ -556,16 +693,22 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
         patch: true,
         showRoot: true,
         mailmap: false,
-        notes: false,
+        // load_display_notes: the default refs unless only --notes=<ref> ones were asked for
+        ...(!notes.show
+          ? { notes: false }
+          : notes.useDefault || notes.refs.length === 0
+            ? { notes: true, notesRefs: notes.refs }
+            : { notesRefs: notes.refs }),
         abbrevCommit: false,
         decorate: false,
         mail: {
           subject: subjectOf,
           threadHeaders,
-          afterSubject: extraHeaders,
+          afterSubject,
           zeroCommit: this.zeroCommit,
           preserveSubject: this.keepSubject,
-          ...(sob ? { signoff: sob } : {}),
+          ...(sob ? { signoff: sob, trailerConfig: trailerConfigOf(this.workingCopy) } : {}),
+          ...(mime ? { multipart: true } : {}),
           ...(fromIdent ? { from: fromIdent } : {}),
           forceInBodyFrom: this.forceInBodyFrom,
           encodeHeaders,
@@ -576,7 +719,11 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       // log-tree's shown_one: one blank line between the mails of --stdout
       if (this.stdout && shownOne) parts.push(latin("\n"));
       shownOne = true;
-      parts.push(bytes, latin(bases.text), latin(sig()));
+      parts.push(
+        bytes,
+        latin(bases.text),
+        latin(mime ? `\n--${MIME_BOUNDARY_LEADER}${mime.boundary}--\n\n\n` : sig()),
+      );
       bases.text = "";
       emit(fileName(subject), concat(parts));
     }
@@ -609,6 +756,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
   /** The commits to format (newest first), the single boundary commit, the branch name. */
   private async walk(): Promise<{ list: ObjectId[]; origin?: ObjectId; branchName?: string }> {
     const resolver = this.revisionResolver();
+    /** The object a name gives (a tag as itself) and the commit it peels to */
     const resolve = async (spec: string) => {
       const id = await resolver.resolve(spec, { type: "commit" } as never);
       if (!id)
@@ -616,26 +764,34 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
           `ambiguous argument '${spec}': unknown revision or path not in the working tree.`,
         );
       const peeled = (await resolver.peelToType(id, "commit")) ?? id;
-      return peeled;
+      return { id, peeled };
     };
     const positive: ObjectId[] = [];
     const negative: ObjectId[] = [];
+    /** rev->cmdline's interesting entries: the name as given and its object */
+    const interesting: { name: string; id: ObjectId }[] = [];
     let singleName: string | undefined;
     for (const rev of this.revisions) {
       const dots = rev.indexOf("..");
       if (dots >= 0 && rev[dots + 2] !== ".") {
         const a = rev.slice(0, dots) || "HEAD";
         const b = rev.slice(dots + 2) || "HEAD";
-        negative.push(await resolve(a));
-        positive.push(await resolve(b));
-      } else if (rev.startsWith("^")) negative.push(await resolve(rev.slice(1)));
+        negative.push((await resolve(a)).peeled);
+        const tip = await resolve(b);
+        positive.push(tip.peeled);
+        interesting.push({ name: b, id: tip.id });
+      } else if (rev.startsWith("^")) negative.push((await resolve(rev.slice(1))).peeled);
       else {
-        positive.push(await resolve(rev));
+        const tip = await resolve(rev);
+        positive.push(tip.peeled);
+        interesting.push({ name: rev, id: tip.id });
         singleName = rev;
       }
     }
     if (!positive.length && !negative.length) {
-      positive.push(await resolve("HEAD"));
+      const head = await resolve("HEAD");
+      positive.push(head.peeled);
+      interesting.push({ name: "HEAD", id: head.id });
       singleName = "HEAD";
     }
     let branchName: string | undefined;
@@ -643,7 +799,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       let checkHead = false;
       if (this.maxCount === undefined && !this.root) {
         negative.push(positive.pop() as ObjectId);
-        positive.push(await resolve("HEAD"));
+        positive.push((await resolve("HEAD")).peeled);
         checkHead = true;
       }
       if (singleName === "HEAD") checkHead = true;
@@ -652,28 +808,89 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
         branchName = branch?.startsWith("refs/heads/") ? branch.slice(11) : "";
       }
     }
+    // find_branch_name: the one interesting revision, when it names a branch at its tip
+    if (branchName === undefined && interesting.length === 1) {
+      const only = interesting[0] as { name: string; id: ObjectId };
+      const found = (await resolver.dwimRef(only.name).catch(() => []))[0];
+      if (found?.ref.startsWith("refs/heads/") && found.id === only.id)
+        branchName = found.ref.slice(11);
+    }
+    // --ignore-if-in-upstream: the patch ids of the upstream side (get_patch_ids)
+    let upstream: Set<string> | undefined;
+    if (this.ignoreIfInUpstream) {
+      const pending = [
+        ...negative.map((id) => ({ id, uninteresting: true })),
+        ...positive.map((id) => ({ id, uninteresting: false })),
+      ];
+      // nothing to say when head and upstream are the same
+      if (pending.length === 2 && pending[0]?.id === pending[1]?.id) return { list: [] };
+      if (pending.length !== 2) throw new FormatPatchError("need exactly one range");
+      if (pending[0]?.uninteresting === pending[1]?.uninteresting)
+        throw new FormatPatchError("not a range");
+      upstream = new Set();
+      const check = new LogCommand(this.workingCopy);
+      check.add(negative[0] as ObjectId);
+      check.not(positive[0] as ObjectId);
+      for await (const c of await check.call()) {
+        if (c.parents.length > 1) continue;
+        upstream.add(await this.commitPatchId(c.id, c.parents[0], false));
+      }
+    }
     const log = new LogCommand(this.workingCopy);
     for (const p of positive) log.add(p);
     for (const n of negative) log.not(n);
     const list: ObjectId[] = [];
-    const listed = new Set<ObjectId>();
+    const walked = new Set<ObjectId>();
     const parentsOf = new Map<ObjectId, ObjectId[]>();
     for await (const c of await log.call()) {
       if (c.parents.length > 1) continue;
-      if (this.maxCount !== undefined && list.length >= this.maxCount) break;
-      list.push(c.id);
-      listed.add(c.id);
+      if (this.maxCount !== undefined && walked.size >= this.maxCount) break;
+      walked.add(c.id);
       parentsOf.set(c.id, c.parents);
+      if (upstream?.size && upstream.has(await this.commitPatchId(c.id, c.parents[0], false)))
+        continue;
+      list.push(c.id);
     }
+    // the walk's boundary (commits left out as already upstream still walked)
     const boundary = new Set<ObjectId>();
-    for (const id of list)
-      for (const p of parentsOf.get(id) ?? []) if (!listed.has(p)) boundary.add(p);
+    for (const id of walked)
+      for (const p of parentsOf.get(id) ?? []) if (!walked.has(p)) boundary.add(p);
     const origin = boundary.size === 1 ? [...boundary][0] : undefined;
     return {
       list,
       ...(origin ? { origin } : {}),
       ...(branchName !== undefined ? { branchName } : {}),
     };
+  }
+
+  /**
+   * commit_patch_id: the patch id of a commit's diff against its parent (the empty tree for
+   * a root), rename detection as asked; the null id for an empty diff.
+   */
+  private async commitPatchId(
+    id: ObjectId,
+    parent: ObjectId | undefined,
+    renames: boolean,
+  ): Promise<string> {
+    const diff = new DiffCommand(this.workingCopy).setNewTree(id).setRenames(renames);
+    if (parent) diff.setOldTree(parent);
+    else diff.setOldTree(this.objectFormat.emptyTreeId);
+    const changes: PatchIdChange[] = [];
+    for (const e of await diff.call()) {
+      const del = e.changeType === ChangeType.DELETE;
+      const add = e.changeType === ChangeType.ADD;
+      changes.push({
+        path: (del ? e.oldPath : e.newPath) as string,
+        ...(e.changeType === ChangeType.RENAME || e.changeType === ChangeType.COPY
+          ? { oldPath: e.oldPath as string }
+          : {}),
+        ...(!add && e.oldId ? { old: { mode: e.oldMode as number, id: e.oldId } } : {}),
+        ...(!del && e.newId ? { new: { mode: e.newMode as number, id: e.newId } } : {}),
+      });
+    }
+    return changes.length
+      ? await patchIdOfChanges(this.blobs, changes, { objectFormat: this.objectFormat })
+      : this.objectFormat.nullId;
   }
 
   /** `get_base_commit` + `prepare_bases`: the text `print_bases` writes once. */
@@ -705,27 +922,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     for await (const c of await log.call()) {
       if (c.parents.length > 1 || inList.has(c.id)) continue;
       // commit_patch_id: the diff against the parent with rename detection (diff.renames)
-      const parent = c.parents[0];
-      const diff = new DiffCommand(this.workingCopy).setNewTree(c.id).setRenames(true);
-      if (parent) diff.setOldTree(parent);
-      const changes: PatchIdChange[] = [];
-      for (const e of await diff.call()) {
-        const del = e.changeType === ChangeType.DELETE;
-        const add = e.changeType === ChangeType.ADD;
-        changes.push({
-          path: (del ? e.oldPath : e.newPath) as string,
-          ...(e.changeType === ChangeType.RENAME || e.changeType === ChangeType.COPY
-            ? { oldPath: e.oldPath as string }
-            : {}),
-          ...(!add && e.oldId ? { old: { mode: e.oldMode as number, id: e.oldId } } : {}),
-          ...(!del && e.newId ? { new: { mode: e.newMode as number, id: e.newId } } : {}),
-        });
-      }
-      ids.push(
-        changes.length
-          ? await patchIdOfChanges(this.blobs, changes, { objectFormat: this.objectFormat })
-          : this.objectFormat.nullId,
-      );
+      ids.push(await this.commitPatchId(c.id, c.parents[0], true));
     }
     let text = `\nbase-commit: ${base}\n`;
     for (let i = ids.length - 1; i >= 0; i--) text += `prerequisite-patch-id: ${ids[i]}\n`;
@@ -746,6 +943,10 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       zeroCommit: boolean;
       /** get_log_output_encoding(): the shortlog's (the headers stay UTF-8) */
       outputEncoding: string;
+      /** How the branch description is used (`--cover-from-description`) */
+      coverMode: "none" | "message" | "subject" | "auto";
+      /** The branch whose `branch.<name>.description` is read ("" for none) */
+      branchName?: string;
     },
   ): Promise<Uint8Array> {
     const head = list[0] as ObjectId;
@@ -767,14 +968,49 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       : { timestamp: mail.committer.timestamp, tzOffset: mail.committer.tzOffset };
     let text = `From ${mail.zeroCommit ? nullObjectIdLike(head) : head} Mon Sep 17 00:00:00 2001\n`;
     text += mail.thread;
-    text += mailFromHeader(who.name, who.email, { encodeHeaders: mail.encodeHeaders });
+    // git before 2.44 left the cover letter's headers unencoded (pp.encode_email_headers unset)
+    const encodeHeaders = mail.encodeHeaders && gitVersionAtLeast(this.versionString, 2, 44);
+    text += mailFromHeader(who.name, who.email, { encodeHeaders });
     text += `Date: ${showDate(date.timestamp, date.tzOffset, { type: "rfc2822", local: false })}\n`;
-    text += `${mail.subject}*** SUBJECT HERE ***\n`;
+    // prepare_cover_text
+    let subject = "*** SUBJECT HERE ***";
+    let body = "*** BLURB HERE ***";
+    const description =
+      mail.coverMode !== "none" && mail.branchName
+        ? this.config(`branch.${mail.branchName}.description`)
+        : undefined;
+    if (description) {
+      let firstParagraph: { subject: string; rest: string } | undefined;
+      if (mail.coverMode === "subject" || mail.coverMode === "auto") {
+        firstParagraph = formatSubject(description);
+        body = firstParagraph.rest;
+      }
+      if (
+        mail.coverMode === "message" ||
+        (mail.coverMode === "auto" &&
+          encodeGitPath(firstParagraph?.subject ?? "").length > COVER_FROM_AUTO_MAX_SUBJECT_LEN)
+      )
+        body = description;
+      else subject = firstParagraph?.subject ?? subject;
+    }
+    // pp_email_subject: the title as format_subject joins it
+    text += mailSubjectLine(mail.subject, formatSubject(subject).subject, {
+      encodeHeaders,
+    });
     if (eightBit)
       text +=
         "MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n";
     text += mail.afterSubject;
-    text += "\n*** BLURB HERE ***\n\n";
+    text += "\n";
+    // pp_remainder: leading blank lines dropped, each line without its trailing blanks
+    let first = true;
+    for (const line of linesWithEnds(body)) {
+      const trimmed = line.replace(/[ \t\n\v\f\r]+$/, "");
+      if (trimmed === "" && first) continue;
+      first = false;
+      text += `${trimmed}\n`;
+    }
+    text += "\n";
     const parts: Uint8Array[] = [new TextEncoder().encode(text)];
     text = "";
     // shortlog: authors in byte order, their subjects oldest first, wrapped at 72; each
@@ -928,6 +1164,38 @@ function outputEncoder(output: string, text: string, stored: string): (s: string
         ? latin1Bytes
         : undefined;
   return encoderFor(output) ?? encoderFor(stored) ?? utf8;
+}
+
+/**
+ * pretty.c's format_subject: the first paragraph's lines (each without its trailing
+ * blanks; a blank line, the first one too, ends it) joined by a space, and what follows
+ * the blank line that ends it.
+ */
+function formatSubject(text: string): { subject: string; rest: string } {
+  const parts: string[] = [];
+  let at = 0;
+  while (at < text.length) {
+    const nl = text.indexOf("\n", at);
+    const end = nl < 0 ? text.length : nl + 1;
+    const line = text.slice(at, end).replace(/[ \t\n\v\f\r]+$/, "");
+    at = end;
+    if (line === "") break;
+    parts.push(line);
+  }
+  return { subject: parts.join(" "), rest: text.slice(at) };
+}
+
+/** The lines of a text, each with its LF (get_one_line) */
+function linesWithEnds(text: string): string[] {
+  const out: string[] = [];
+  let at = 0;
+  while (at < text.length) {
+    const nl = text.indexOf("\n", at);
+    const end = nl < 0 ? text.length : nl + 1;
+    out.push(text.slice(at, end));
+    at = end;
+  }
+  return out;
 }
 
 function subjectLine(message: string): string {
