@@ -1790,10 +1790,15 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
             : picked !== undefined
               ? { message: picked }
               : {}),
-          // the picked message (do_pick_commit's, --signoff's and --trailer's trailers added)
+          // the picked message (do_pick_commit's, --signoff's and --trailer's trailers
+          // added); a fast-forwarded pick (possible with --trailer after --continue) has
+          // none, and make_patch writes the commit's own
           picked:
             !conflicts &&
-            ((await state.exists(`${DIR}/signoff`)) || (await state.exists(`${DIR}/trailer`))),
+            ((await state.exists(`${DIR}/signoff`)) ||
+              (outcome.kind === "ok" &&
+                outcome.message !== undefined &&
+                (await state.exists(`${DIR}/trailer`)))),
         })),
       );
       return {

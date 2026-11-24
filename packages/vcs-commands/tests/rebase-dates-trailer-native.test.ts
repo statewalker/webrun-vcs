@@ -14,7 +14,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -762,6 +762,34 @@ describeGit("rebase --committer-date-is-author-date, --ignore-date, --trailer", 
         both(dirs, "checkout", "--theirs", "file");
         both(dirs, "add", "file");
         await continueTwins(dirs);
+      });
+
+      // the run after --continue may fast-forward (the trailer is not read back as a reason
+      // to force): an `edit` stop there writes the commit's own message, no trailer, and the
+      // amend keeps it so (error_with_patch's have_message=0, make_patch)
+      it('t3440-rebase-trailer.sh: "rebase --trailer adds trailer after conflicts" (a fast-forwarded edit after --continue)', async () => {
+        const dirs = twins((s) => {
+          on("ff-edit", "third")(s);
+          s.commit("D", "d");
+          s.commit("E", "e");
+        });
+        const short = (rev: string) =>
+          native(dirs.native, "rev-parse", "--short", rev).stdout.trim();
+        const todo = `exec false\nedit ${short("D")} D\npick ${short("E")} E\n`;
+        const args = ["-i", "--trailer", REVIEWED_BY, "third"];
+        const { status } = await rebaseTwins(
+          dirs,
+          args,
+          configureFor(args, { editTodo: () => todo }),
+          { env: { GIT_SEQUENCE_EDITOR: replaceEditor(todo) } },
+        );
+        expect(status).not.toBe(0);
+        await continueTwins(dirs);
+        expect(readFileSync(join(dirs.ours, ".git/rebase-merge/message"), "utf8")).toBe("D\n\n");
+        for (const dir of [dirs.native, dirs.ours]) writeFileSync(join(dir, "d.t"), "changed\n");
+        both(dirs, "add", "d.t");
+        await continueTwins(dirs);
+        expect(message(dirs.ours, "HEAD^")).toBe("D\n\n");
       });
     });
   });
