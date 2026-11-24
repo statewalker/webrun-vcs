@@ -47,6 +47,7 @@ import {
   type RefDecorations,
   wrapText,
 } from "./pretty-format.js";
+import type { SignatureCheck } from "./signature-check.js";
 import { appendSignoff } from "./trailers.js";
 
 /** How `git log` treats merges in its diffs (`--diff-merges=<mode>`, `-m`, `-c`, `--cc`). */
@@ -166,6 +167,12 @@ export interface LogOutputOptions {
   localTzName?: (time: number) => string;
   /** `git format-patch`'s mail settings (with the `email` or `mboxrd` format) */
   mail?: LogMailOptions;
+  /**
+   * `--show-signature` / `--no-show-signature` (default `log.showSignature`, false; never for
+   * `format-patch`, whose `mail` settings are given): each signed commit's check, then each
+   * `mergetag`'s, after the commit's header
+   */
+  showSignature?: boolean;
 }
 
 /** What `git format-patch` adds to the `email` format (log-tree.c, pretty.c). */
@@ -262,6 +269,13 @@ export interface LogOutputHost {
   notes(id: ObjectId): Promise<{ ref: string; text: string }[]>;
   /** The mailmap */
   mailmap(): Promise<Mailmap>;
+  /** The `%G` check of a commit (`check_commit_signature`), made once per commit */
+  signature?(id: ObjectId): Promise<SignatureCheck>;
+  /**
+   * `--show-signature`'s lines of a commit (log-tree.c's `show_signature` and
+   * `show_mergetag`): each block of text with whether its check failed
+   */
+  signatureLines?(entry: LogOutputEntry): Promise<{ failed: boolean; text: string }[]>;
   /**
    * The diff of a commit against a parent (the empty tree for none): undefined bytes when
    * nothing differs; `follow` the path followed, `followPath` the path to follow in the
@@ -759,6 +773,7 @@ export class LogPrinter {
   private readonly showRoot: boolean;
   private readonly useMailmap: boolean;
   private readonly showNotes: boolean;
+  private readonly showSignature: boolean;
   private readonly decorate: "short" | "full" | undefined;
   private readonly follow: boolean;
   private decorations?: RefDecorations;
@@ -860,6 +875,9 @@ export class LogPrinter {
     this.mergesNeedDiff = mergesNeedDiff;
     this.showRoot = options.showRoot ?? bool(host.config("log.showRoot")) ?? true;
     this.useMailmap = options.mailmap ?? bool(host.config("log.mailmap")) ?? true;
+    this.showSignature =
+      options.showSignature ??
+      (options.mail ? false : (bool(host.config("log.showSignature")) ?? false));
     this.showNotes =
       options.notes ??
       ((options.notesRefs?.length ?? 0) > 0 || !prettyGiven || /%N/.test(this.format.user ?? ""));
@@ -1217,6 +1235,19 @@ export class LogPrinter {
         );
       }
     }
+    if (this.showSignature && this.host.signatureLines) {
+      // show_sig_lines: each line, then the graph's padding for the next one
+      for (const { text } of await this.host.signatureLines(entry)) {
+        let at = 0;
+        while (at < text.length) {
+          const nl = text.indexOf("\n", at);
+          const end = nl < 0 ? text.length : nl;
+          this.out.text(`${text.slice(at, end)}${nl < 0 ? "" : "\n"}`);
+          this.out.text(this.oneline());
+          at = nl < 0 ? end : nl + 1;
+        }
+      }
+    }
     let notes: string | undefined;
     if (this.showNotes) notes = await this.notesText(entry.id, fmt === "user");
     let msg = await this.prettyPrint(entry, notes ?? "");
@@ -1300,6 +1331,12 @@ export class LogPrinter {
             }
           : {}),
         formatDate: (ident) => this.formatDate(ident),
+        ...(this.host.signature
+          ? {
+              signature: () =>
+                (this.host.signature as (id: ObjectId) => Promise<SignatureCheck>)(entry.id),
+            }
+          : {}),
         ...(mailmap && !mailmap.empty ? { mailmap: (n, e) => mailmap.map(n, e) } : {}),
         ...(this.options.now !== undefined ? { now: this.options.now } : {}),
         ...(this.options.localTzOffset ? { localTzOffset: this.options.localTzOffset } : {}),
