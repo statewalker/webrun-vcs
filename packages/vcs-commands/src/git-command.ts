@@ -76,6 +76,7 @@ import {
   type WorktreeLookup,
 } from "./commands/revision-filenames.js";
 import { type ResolveOptions, RevisionResolver } from "./commands/revision-resolver.js";
+import { type SignRequest, signCommit } from "./commands/signing.js";
 import { readSparseCheckoutPatterns } from "./commands/sparse-checkout-support.js";
 import {
   InvalidConfigError,
@@ -440,6 +441,32 @@ export abstract class GitCommand<T> {
   protected get hooks(): HookSession {
     if (!this.hookSession) this.hookSession = new HookSession(this._workingCopy);
     return this.hookSession;
+  }
+
+  /**
+   * `commit` signed for `sign` as git's `commit_tree_extended` signs what a command writes
+   * (`-S[<keyid>]`, `commit.gpgSign`), the signing program run in the worktree top; `commit`
+   * as it is when `sign` is undefined. `tail`: the command's lines after a failed signing
+   * (default `fatal: failed to write commit object`).
+   *
+   * @throws SigningFailedError when the signature cannot be made
+   */
+  protected async signedCommit(
+    sign: SignRequest,
+    commit: Commit,
+    tail?: readonly string[],
+  ): Promise<Commit> {
+    if (sign === undefined) return commit;
+    let cwd: string | undefined;
+    try {
+      cwd = await this.hooks.hostWorkingDirectory();
+    } catch {
+      cwd = undefined;
+    }
+    return signCommit(this._workingCopy, sign, commit, {
+      ...(cwd !== undefined ? { cwd } : {}),
+      ...(tail ? { tail } : {}),
+    });
   }
 
   /**

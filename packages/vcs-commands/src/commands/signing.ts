@@ -9,8 +9,10 @@
  * {@link signPayload} hands the payload to the signer; {@link signCommit} puts the signature
  * in the commit's `gpgsig` header (`gpgsig-sha256` in a SHA-256 repository), as
  * `commit_tree_extended` / `add_header_signature` do. `commit -S` and `tag -s`/`-u` sign (the
- * tag's signature appended to its message, builtin/tag.c's `do_sign`); the other commands
- * still refuse (their tickets follow: rebase/pick/merge/am, push certificates).
+ * tag's signature appended to its message, builtin/tag.c's `do_sign`), and so do the
+ * commands that write commits for the user: rebase, cherry-pick, revert, merge and am
+ * (statewalker/statewalker-root#319, each through {@link signCommit}); push certificates
+ * still refuse.
  *
  * Without a signer every request to sign fails as native git fails when its signing program
  * cannot sign (gpg-interface.c `sign_buffer_gpg`: `error: gpg failed to sign the data:` with
