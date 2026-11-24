@@ -757,6 +757,14 @@ export class RemoteConfigStore {
     return this.config.listWithOrigin().filter((e) => wanted.has(e.key));
   }
 
+  /**
+   * Every variable in the configuration's order with where it was read (canonical keys);
+   * undefined when the config cannot list its variables.
+   */
+  allEntriesWithOrigin(): (ConfigValueWhere & { key: string })[] | undefined {
+    return this.config.listWithOrigin?.();
+  }
+
   /** Every value of a config variable (`branch.main.merge` may repeat). */
   values(key: string): string[] {
     return this.config

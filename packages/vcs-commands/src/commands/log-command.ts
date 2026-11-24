@@ -30,9 +30,15 @@ import {
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type CombinedDiffOptions, writeCombinedDiff } from "../results/combined-diff.js";
+import type { DiffColors } from "../results/diff-color.js";
 import { DiffPickaxe } from "../results/diff-pickaxe.js";
 import { quotePath } from "../results/quote-path.js";
 import { bareAttributesResolver } from "./attributes-source.js";
+import {
+  DEFAULT_DECORATION_COLORS,
+  type DiffColorSettings,
+  readDiffColorSettings,
+} from "./diff-color-config.js";
 import {
   checkPickaxeOptions,
   DiffCommand,
@@ -75,7 +81,7 @@ import {
   treePathspec,
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
-import { loadRefDecorations } from "./pretty-format.js";
+import { type DecorationPalette, loadRefDecorations } from "./pretty-format.js";
 import { openReflogWalk, walkReflogs } from "./reflog-walk.js";
 import {
   type CommitFilter,
@@ -157,6 +163,8 @@ export interface ShowSession {
   tagger(ident: PersonIdent): void;
   /** Everything printed */
   result(): Uint8Array;
+  /** The `color.diff.commit` color and its reset of a tag's or tree's header ("" without color) */
+  readonly commitColor: { set: string; reset: string };
 }
 
 /**
@@ -1462,7 +1470,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
-   * The log printed as `git log <options>` prints it to a pipe (no colors, no pager): the
+   * The log printed as `git log <options>` prints it to a pipe (no pager; colors only when
+   * `setDiffOptions({ color })` or `color.ui`/`color.diff` say `always`): the
    * walk set up by this command (start points, ranges, paths, `-n`, `--skip`, filters), each
    * commit in the format asked for, with the graph and the diffs asked for. See
    * {@link LogOutputOptions}.
@@ -1502,6 +1511,11 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     await this.preparePickaxe();
     // --use-mailmap/--no-mailmap: what --author/--committer match too
     if (options.mailmap !== undefined) this.useMailmap ??= options.mailmap;
+    const colors = this.readColors();
+    if (colors && options.graph) {
+      // graph.c's column colors (`log.graphColors`) are not reproduced
+      throw new NotImplementedError("git log --graph --color");
+    }
     const host = this.outputHost(options);
     const paths = [...this.paths];
     // the pathspec as git holds it: the excluded paths as `:(exclude)` elements, `.` when
@@ -1515,6 +1529,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         interesting: (id) => shownIds.has(id) || unwalkedShown.has(id),
         firstParentOnly: this.firstParentOnly,
         paths: pathspec,
+        ...(colors ? { colors } : {}),
       },
     );
     const follow = printer.followsPath;
@@ -1655,6 +1670,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     await this.preparePickaxe();
     if (options.mailmap !== undefined) this.useMailmap ??= options.mailmap;
     readDiffSubmoduleConfig(this.workingCopy);
+    const colors = this.readColors();
     this.activeFilter = await this.buildCommitFilter();
     const host = this.outputHost(options);
     const pathspec = [...this.paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
@@ -1662,7 +1678,12 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const printer = new LogPrinter(
       host,
       { ...options, diff: { ...options.diff, ...this.diffOptions } },
-      { interesting: () => true, firstParentOnly: this.firstParentOnly, paths: pathspec },
+      {
+        interesting: () => true,
+        firstParentOnly: this.firstParentOnly,
+        paths: pathspec,
+        ...(colors ? { colors } : {}),
+      },
     );
     await printer.start();
     const shown = new Set<ObjectId>();
@@ -1702,6 +1723,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       bytes: (bytes) => printer.writeBytes(bytes),
       tagger: (ident) => printer.writeTagger(ident),
       result: () => printer.result(),
+      commitColor: { set: colors?.diff.commit ?? "", reset: colors?.diff.reset ?? "" },
     };
   }
 
@@ -1967,6 +1989,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           // log's diffcore_rotate starts at the first path after a missing one
           .setRotateStrict(false)
           .shareReadsOf(this);
+        if (this.colorSettings) diff.setColorSettings(this.colorSettings);
         diff.setOptions({
           ...this.diffOptions,
           ...(options.statWidth !== undefined
@@ -1985,6 +2008,29 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   private diffOptions: DiffTextOptions = {};
+  /** The colors {@link callBytes} prints with */
+  private colorSettings?: DiffColorSettings;
+
+  /**
+   * git_log_config (git_diff_ui_config): the colors, read once for every commit's diff; the
+   * palettes of the log's own lines, undefined without color
+   */
+  private readColors(): { diff: DiffColors; decorations: DecorationPalette } | undefined {
+    this.colorSettings = readDiffColorSettings(
+      this.workingCopy,
+      this.diffOptions,
+      this.diffOptions.uiConfig !== false,
+    );
+    const colors = this.colorSettings.colors;
+    if (!colors) return undefined;
+    return {
+      diff: colors,
+      decorations: {
+        ...(this.colorSettings.decorationColors ?? DEFAULT_DECORATION_COLORS),
+        commit: colors.commit,
+      },
+    };
+  }
 
   /**
    * The pickaxe options checked before anything is shown, as git parses them (empty `-S`/
@@ -2263,6 +2309,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           abbreviate: (id) =>
             id.slice(0, this.diffOptions.fullIndex ? id.length : (lengths.get(id) ?? 7)),
           quotePath: quote,
+          ...(this.colorSettings?.colors ? { colors: this.colorSettings.colors } : {}),
         },
       );
     }

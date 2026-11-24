@@ -28,6 +28,7 @@ import {
   createSha1,
   diffLineCounts,
   type FindFunction,
+  formatHunkHeader,
   nullObjectIdLike,
   type UnifiedDiffOptions,
   type UnifiedDiffResult,
@@ -44,6 +45,13 @@ import {
   parseGitBool,
 } from "@statewalker/vcs-utils/encoding";
 import { gitBinaryPatch } from "./binary-patch.js";
+import {
+  type ColoredHunk,
+  type DiffColors,
+  WS_INCOMPLETE_LINE,
+  WSEH_NEW,
+  writeColoredHunks,
+} from "./diff-color.js";
 
 import { quoteCStyleBody, quotePath, quoteTwo } from "./quote-path.js";
 
@@ -166,6 +174,19 @@ export interface DiffOutputOptions
   dstPrefix?: string;
   /** The diff driver of a path (from its `diff` attribute), if any */
   driver?: (path: string) => Promise<DiffDriver | undefined> | DiffDriver | undefined;
+  /**
+   * The colors of the patch (`--color`, `color.diff.<slot>`); unset, none are written. Moved
+   * lines are colored when the sink is a {@link MovedLineBuffer}.
+   */
+  colors?: DiffColors;
+  /** `--ws-error-highlight` (`WSEH_*` bits; default {@link WSEH_NEW}), with `colors` */
+  wsHighlight?: number;
+  /**
+   * The whitespace rule of a path (`core.whitespace`, its `whitespace` attribute: git's
+   * `whitespace_rule`), whose errors a colored patch marks; default git's
+   * `blank-at-eol,space-before-tab,blank-at-eof`
+   */
+  whitespaceRule?: (path: string) => Promise<number> | number;
 }
 
 const S_IFMT = 0o170000;
@@ -378,13 +399,15 @@ function metainfo(
   fullIndex = false,
 ): { text: string; mustShow: boolean } {
   const quote = options.quotePath ?? true;
+  const set = options.colors?.meta ?? "";
+  const reset = options.colors?.reset ?? "";
   let text = "";
   let mustShow = false;
   if (pair.status === "R" || pair.status === "C") {
     const word = pair.status === "R" ? "rename" : "copy";
-    text += `similarity index ${pair.score ?? 0}%\n`;
-    text += `${word} from ${quotePath(name, quote)}\n`;
-    text += `${word} to ${quotePath(other ?? name, quote)}\n`;
+    text += `${set}similarity index ${pair.score ?? 0}%${reset}\n`;
+    text += `${set}${word} from ${quotePath(name, quote)}${reset}\n`;
+    text += `${set}${word} to ${quotePath(other ?? name, quote)}${reset}\n`;
     mustShow = true;
   }
   if (one.id !== two.id) {
@@ -395,9 +418,9 @@ function metainfo(
           ? id.length
           : (options.abbrevLengths?.get(id) ?? options.abbrev ?? 7),
       );
-    text += `index ${abbrev(one.id)}..${abbrev(two.id)}`;
+    text += `${set}index ${abbrev(one.id)}..${abbrev(two.id)}`;
     if (one.mode === two.mode) text += ` ${octal6(one.mode)}`;
-    text += "\n";
+    text += `${reset}\n`;
   }
   return { text, mustShow };
 }
@@ -457,16 +480,18 @@ async function builtinDiff(
   const bTwo = quoteTwo(bPrefix, stripSlash(nameB), quote);
   const lbl0 = one.valid ? aOne : "/dev/null";
   const lbl1 = two.valid ? bTwo : "/dev/null";
-  let header = `diff --git ${aOne} ${bTwo}\n`;
+  const cMeta = options.colors?.meta ?? "";
+  const cReset = options.colors?.reset ?? "";
+  let header = `${cMeta}diff --git ${aOne} ${bTwo}${cReset}\n`;
   if (!one.valid) {
-    header += `new file mode ${octal6(two.mode)}\n${meta.text}`;
+    header += `${cMeta}new file mode ${octal6(two.mode)}${cReset}\n${meta.text}`;
     mustShow = true;
   } else if (!two.valid) {
-    header += `deleted file mode ${octal6(one.mode)}\n${meta.text}`;
+    header += `${cMeta}deleted file mode ${octal6(one.mode)}${cReset}\n${meta.text}`;
     mustShow = true;
   } else {
     if (one.mode !== two.mode) {
-      header += `old mode ${octal6(one.mode)}\nnew mode ${octal6(two.mode)}\n`;
+      header += `${cMeta}old mode ${octal6(one.mode)}${cReset}\n${cMeta}new mode ${octal6(two.mode)}${cReset}\n`;
       mustShow = true;
     }
     header += meta.text;
@@ -474,7 +499,7 @@ async function builtinDiff(
   }
   if (report) {
     report.gitLine = `diff --git ${aOne} ${bTwo}`;
-    report.extended = header.slice(report.gitLine.length + 1);
+    report.extended = header.slice(header.indexOf("\n") + 1);
     report.binary = false;
     report.result = undefined;
     report.oldLabel = undefined;
@@ -537,8 +562,47 @@ async function builtinDiff(
     report.oldLabel = oldLabel;
     report.newLabel = newLabel;
   }
-  sink.text(`${oldLabel}\n${newLabel}\n`);
-  writeHunks(sink, result);
+  const colors = options.colors;
+  if (!colors) {
+    sink.text(`${oldLabel}\n${newLabel}\n`);
+    writeHunks(sink, result);
+    return;
+  }
+  // DIFF_SYMBOL_FILEPAIR_MINUS / _PLUS: the tab after the reset
+  sink.text(
+    `${colors.meta}--- ${lbl0}${colors.reset}${lbl0.includes(" ") ? "\t" : ""}\n` +
+      `${colors.meta}+++ ${lbl1}${colors.reset}${lbl1.includes(" ") ? "\t" : ""}\n`,
+  );
+  // whitespace_rule of name_b; a symlink's incomplete line is no news
+  let wsRule = (await options.whitespaceRule?.(two.valid ? attrTwo : attrOne)) ?? DEFAULT_WS_RULE;
+  if (two.valid && (two.mode & S_IFMT) === 0o120000) wsRule &= ~WS_INCOMPLETE_LINE;
+  writeColoredHunks(sink, coloredHunksOf(result), {
+    colors,
+    wsErrorHighlight: options.wsHighlight ?? WSEH_NEW,
+    wsRule,
+    oldContent: textOne,
+    newContent: textTwo,
+  });
+}
+
+/** `blank-at-eol,space-before-tab,blank-at-eof`, tab width 8 (`WS_DEFAULT_RULE`) */
+const DEFAULT_WS_RULE = (1 << 6) | (1 << 10) | (1 << 7) | 8;
+
+/** The hunks of a text diff with their lines' bytes, for the colored writer */
+function coloredHunksOf(result: UnifiedDiffResult): ColoredHunk[] {
+  return result.hunks.map((hunk) => ({
+    header: formatHunkHeader(hunk),
+    oldStart: hunk.oldStart,
+    newStart: hunk.newStart,
+    lines: hunk.lines.map((line) => {
+      const lines = line.kind === "-" ? result.old : result.new;
+      const starts = lines.lineStarts;
+      return {
+        kind: line.kind,
+        bytes: lines.content.subarray(starts[line.index], starts[line.index + 1]),
+      };
+    }),
+  }));
 }
 
 function stripSlash(name: string): string {
@@ -639,6 +703,8 @@ export interface DiffstatOptions {
   count?: number;
   /** `core.quotePath` (default true) */
   quotePath?: boolean;
+  /** The colors of `--color` (the `+` run in `new`, the `-` run in `old`) */
+  colors?: DiffColors;
 }
 
 /** git's `pprint_rename`: `a/{b => c}/d` */
@@ -849,8 +915,11 @@ export function formatStat(files: DiffstatFile[], options: DiffstatOptions = {})
     }
     out += ` ${prefix}${name}${pad} | ${String(added + deleted).padStart(numberWidth)}`;
     out += added + deleted ? " " : "";
-    out += "+".repeat(Math.max(0, add));
-    out += "-".repeat(Math.max(0, del));
+    // show_graph: each run in its color
+    if (add > 0)
+      out += `${options.colors?.new ?? ""}${"+".repeat(add)}${options.colors?.reset ?? ""}`;
+    if (del > 0)
+      out += `${options.colors?.old ?? ""}${"-".repeat(del)}${options.colors?.reset ?? ""}`;
     out += "\n";
   }
 

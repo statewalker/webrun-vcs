@@ -2,6 +2,7 @@ export * from "./blame-format.js";
 export * from "./cherry-pick-result.js";
 export * from "./clone-result.js";
 export * from "./combined-diff.js";
+export * from "./diff-color.js";
 export * from "./diff-entry.js";
 export * from "./diff-formatter.js";
 export * from "./diff-order.js";

@@ -66,6 +66,8 @@ export interface PrettyFormatOptions {
   reflog?: { selector?: string; shortSelector?: string; message?: string; ident?: PersonIdent };
   /** Whether colors are written (git's want_color; default false, as without a terminal) */
   color?: boolean;
+  /** The decorations' colors after `%C(auto)` (`%d`, `%D`, `%(decorate)`), with `color` */
+  decorationColors?: DecorationPalette;
   /**
    * `%(trailers)`: the trailer configuration (`trailer.separators`, `trailer.<name>.key`,
    * the comment prefix; see {@link trailerConfigOf}); default git's (`:`, `#`, no items)
@@ -262,6 +264,7 @@ export function formatRefDecorations(
   decorations: RefDecorations | undefined,
   id: ObjectId,
   opts: { prefix?: string; suffix?: string; separator?: string; pointer?: string; tag?: string },
+  colors?: DecorationPalette,
 ): string {
   const list = decorations?.get(id);
   if (!list) return "";
@@ -276,18 +279,59 @@ export function formatRefDecorations(
     head && decorations?.headBranch
       ? list.find((d) => d.type === "local" && d.name === decorations.headBranch)
       : undefined;
+  const commit = colors?.commit ?? "";
+  const reset = colors?.reset ?? "";
+  const colorOf = (d: RefDecoration) => (colors ? decorationColor(colors, d.type) : "");
   let out = "";
   for (const d of list) {
     if (d === current) continue;
-    out += prefix;
-    if (tag && d.type === "tag") out += tag;
+    const color = colorOf(d);
+    if (prefix) out += commit + prefix + reset;
+    if (tag && d.type === "tag") out += color + tag + reset;
     // show_name: full names with --decorate=full
     const show = (name: string) => (decorations?.fullRefs ? name : prettifyRefName(name));
-    out += show(d.name);
-    if (current && d.type === "head") out += pointer + show(current.name);
+    out += color + show(d.name) + reset;
+    if (current && d.type === "head") {
+      out += commit + pointer + reset + colorOf(current) + show(current.name) + reset;
+    }
     prefix = separator;
   }
-  return out + suffix;
+  if (suffix) out += commit + suffix + reset;
+  return out;
+}
+
+/**
+ * The colors of decorations (log-tree.c's `format_decorations`): `commit` around the
+ * punctuation (`color.diff.commit`), each kind's `color.decorate.<slot>`
+ */
+export interface DecorationPalette {
+  commit: string;
+  reset: string;
+  branch: string;
+  remoteBranch: string;
+  tag: string;
+  stash: string;
+  HEAD: string;
+  grafted: string;
+}
+
+function decorationColor(p: DecorationPalette, type: RefDecoration["type"]): string {
+  switch (type) {
+    case "local":
+      return p.branch;
+    case "remote":
+      return p.remoteBranch;
+    case "tag":
+      return p.tag;
+    case "stash":
+      return p.stash;
+    case "head":
+      return p.HEAD;
+    case "grafted":
+      return p.grafted;
+    default:
+      return "";
+  }
 }
 
 /** What {@link formatCommitPretty} reads of a commit. */
@@ -1017,10 +1061,15 @@ async function formatOne(
       st.sb += options.mark ?? ">";
       return 1;
     case "d":
-      st.sb += formatRefDecorations(options.decorations, id, {});
+      st.sb += formatRefDecorations(options.decorations, id, {}, autoDecorationColors(st, options));
       return 1;
     case "D":
-      st.sb += formatRefDecorations(options.decorations, id, { prefix: "", suffix: "" });
+      st.sb += formatRefDecorations(
+        options.decorations,
+        id,
+        { prefix: "", suffix: "" },
+        autoDecorationColors(st, options),
+      );
       return 1;
     case "g": {
       const reflog = options.reflog;
@@ -1087,7 +1136,7 @@ async function formatOne(
       }
     }
     if (fmt[i] !== ")") return 0;
-    st.sb += formatRefDecorations(options.decorations, id, opts);
+    st.sb += formatRefDecorations(options.decorations, id, opts, autoDecorationColors(st, options));
     return i - at + 1;
   }
   if (fmt.startsWith("(describe", at)) {
@@ -1429,4 +1478,12 @@ async function formatItem(
     else if (magic === " ") st.sb = `${st.sb.slice(0, before)} ${st.sb.slice(before)}`;
   }
   return consumed + 1;
+}
+
+/** `c->auto_color`: the decorations' colors once `%C(auto)` is in force */
+function autoDecorationColors(
+  st: FormatState,
+  options: PrettyFormatOptions,
+): DecorationPalette | undefined {
+  return st.autoColor ? options.decorationColors : undefined;
 }

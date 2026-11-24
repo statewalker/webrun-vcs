@@ -42,6 +42,7 @@ import {
   scorePercent,
 } from "../rename/index.js";
 import { writeCombinedDiff } from "../results/combined-diff.js";
+import { MovedLineBuffer } from "../results/diff-color.js";
 import { ChangeType, type DiffEntry } from "../results/diff-entry.js";
 import { diffEntryToPair } from "../results/diff-formatter.js";
 import { orderByPatterns, parseOrderFile } from "../results/diff-order.js";
@@ -65,8 +66,20 @@ import {
 } from "../results/diff-output.js";
 import { DiffPickaxe } from "../results/diff-pickaxe.js";
 import { quotePath } from "../results/quote-path.js";
+import {
+  parseWhitespaceRule,
+  WS_DEFAULT_RULE,
+  WS_INCOMPLETE_LINE,
+  whitespaceRuleOf,
+} from "./apply/whitespace.js";
 import { bareAttributesResolver } from "./attributes-source.js";
 import { worktreeModeTrust } from "./core-config.js";
+import {
+  type DiffColorOptions,
+  type DiffColorSettings,
+  readDiffColorSettings,
+  whitespaceRuleError,
+} from "./diff-color-config.js";
 import { textconvRunnerOf } from "./diff-textconv.js";
 import { matchPathspec, type PathspecItem, parsePathspecItem } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
@@ -134,7 +147,17 @@ export type DiffOutputFormat =
 
 /** Options of the text output that `git diff` takes on its command line */
 export interface DiffTextOptions
-  extends Omit<DiffOutputOptions, "driver" | "algorithm" | "indentHeuristic" | "ignoreRegex"> {
+  extends Omit<
+      DiffOutputOptions,
+      | "driver"
+      | "algorithm"
+      | "indentHeuristic"
+      | "ignoreRegex"
+      | "colors"
+      | "wsHighlight"
+      | "whitespaceRule"
+    >,
+    DiffColorOptions {
   /** `--diff-algorithm` (default `diff.algorithm`, else myers) */
   algorithm?: XdiffAlgorithm;
   /** `--indent-heuristic` / `--no-indent-heuristic` (default `diff.indentHeuristic`, true) */
@@ -604,6 +627,20 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private dirtySubmodules?: boolean;
   /** `diff.submodule` (its last value git knows), read by the text outputs */
   private configuredSubmoduleFormat?: SubmoduleDiffFormat;
+  /** The colors of the output, read with the diff configuration (or given by `git log`) */
+  private colorSettings?: DiffColorSettings;
+
+  /**
+   * The colors already read (`readDiffColorSettings`): `git log` reads them once for all its
+   * commits' diffs
+   *
+   * @internal
+   */
+  setColorSettings(settings: DiffColorSettings): this {
+    this.checkCallable();
+    this.colorSettings = settings;
+    return this;
+  }
   private readonly configWarnings: string[] = [];
   /** {@link dirtySubmodules} for the comparison being collected */
   private dirtyThisCall = true;
@@ -814,6 +851,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    * `diff.submodule`, its warnings, and the failure of a variable without a value.
    */
   private readUiConfig(): void {
+    this.colorSettings ??= readDiffColorSettings(
+      this.workingCopy,
+      this.textOptions,
+      this.textOptions.uiConfig !== false,
+    );
     if (this.textOptions.uiConfig === false) return;
     const { format, warnings } = readDiffSubmoduleConfig(this.workingCopy);
     this.configuredSubmoduleFormat = format;
@@ -1284,13 +1326,22 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
             // `--abbrev=<n>`: at least n digits
             options.abbrevLengths = await this.idAbbreviator().lengths(ids, options.abbrev);
           }
+          // diff_flush_patch_all_file_pairs: moved lines are looked for over every pair
+          const moved = this.colorSettings;
+          const out =
+            moved?.colors && moved.colorMoved !== "no"
+              ? new MovedLineBuffer(moved.colorMoved, moved.colorMovedWs)
+              : sink;
           for (const pair of pairs) {
-            const before = sink.length;
+            const before = out.length;
             if (unmerged.has(pair)) {
-              sink.text(`* Unmerged path ${pair.new?.path ?? pair.old?.path}\n`);
-            } else await writePairPatch(sink, pair, options);
+              out.text(`* Unmerged path ${pair.new?.path ?? pair.old?.path}\n`);
+            } else await writePairPatch(out, pair, options);
             // builtin_diff's found_changes: the pair showed something
-            if (sink.length > before) this.changesFound = true;
+            if (out.length > before) this.changesFound = true;
+          }
+          if (out instanceof MovedLineBuffer && moved?.colors) {
+            out.flushTo(sink, { colors: moved.colors, wsErrorHighlight: moved.wsErrorHighlight });
           }
           break;
         }
@@ -1335,6 +1386,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
             graphWidth: intValue(config.value("diff.statGraphWidth")),
             ...this.textOptions.stat,
             quotePath: quote,
+            ...(this.colorSettings?.colors ? { colors: this.colorSettings.colors } : {}),
           };
           if (format === "stat") sink.text(formatStat(files, statOptions));
           else if (format === "numstat") sink.text(formatNumstat(files, { quotePath: quote }));
@@ -1365,7 +1417,27 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const abbreviate = (id: ObjectId) => this.idAbbreviator().abbreviate(id);
     const workingCopy = this.workingCopy;
     if (format === "log") {
-      sink.text(await showSubmoduleDiffSummary({ workingCopy, path, one, two, dirt, abbreviate }));
+      const text = await showSubmoduleDiffSummary({
+        workingCopy,
+        path,
+        one,
+        two,
+        dirt,
+        abbreviate,
+      });
+      const c = options.colors;
+      if (!c) {
+        sink.text(text);
+        return;
+      }
+      // print_submodule_diff_summary: each commit as diff_emit_submodule_del/_add
+      const lines = text.split("\n");
+      lines.pop();
+      lines.forEach((line, i) => {
+        const kind = i > 0 ? /^ {2}([<>]) /.exec(line)?.[1] : undefined;
+        if (kind) sink.text(`${kind === "<" ? c.old : c.new}${line}${c.reset}\n`);
+        else sink.text(`${line}\n`);
+      });
       return;
     }
     const sub = await openSubmoduleRepository(workingCopy, path);
@@ -1389,6 +1461,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       .setOldTree(header.left ? one : this.objectFormat.emptyTreeId)
       .setSubmoduleFormat("diff")
       .setOptions({
+        // the child `git diff --color=always|never` reads the submodule's own color slots
+        color: options.colors !== undefined,
         srcPrefix: `${options.srcPrefix ?? "a/"}${path}/`,
         dstPrefix: `${options.dstPrefix ?? "b/"}${path}/`,
       });
@@ -1733,8 +1807,21 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       pickaxeRegex: _pickaxeRegex,
       pickaxeAll: _pickaxeAll,
       pickaxeIgnoreCase: _pickaxeIgnoreCase,
+      color: _color,
+      colorMoved: _colorMoved,
+      colorMovedWs: _colorMovedWs,
+      wsErrorHighlight: _wsErrorHighlight,
+      colorCompatibility: _colorCompatibility,
       ...text
     } = this.textOptions;
+    const colorSettings = this.colorSettings;
+    const colors = colorSettings?.colors
+      ? {
+          colors: colorSettings.colors,
+          wsHighlight: colorSettings.wsErrorHighlight,
+          whitespaceRule: this.whitespaceRuleOf(filter, context),
+        }
+      : {};
     const ignoreRegex = this.ignoreRegex();
     const abbrev = abbrevOption(this.textOptions.abbrev);
     return {
@@ -1750,6 +1837,50 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       indentHeuristic: text.indentHeuristic ?? boolValue(get("diff.indentHeuristic")) ?? true,
       ...(driver ? { driver } : {}),
       ...(ignoreRegex.length > 0 ? { ignoreRegex } : {}),
+      ...colors,
+    };
+  }
+
+  /**
+   * ws.c's `whitespace_rule`: the `whitespace` attribute of a path over `core.whitespace`
+   * (git 2.43 knows no `incomplete-line` rule)
+   */
+  private whitespaceRuleOf(
+    filter:
+      | {
+          attributes?: (
+            path: string,
+            names?: readonly string[],
+            context?: { direction: "checkin"; index?: AttributesIndex },
+          ) => Promise<Map<string, true | false | string | undefined>>;
+        }
+      | undefined,
+    context: { direction: "checkin"; index: AttributesIndex } | undefined,
+  ): (path: string) => Promise<number> {
+    const legacy = this.textOptions.colorCompatibility === "2.43";
+    const mask = legacy ? ~WS_INCOMPLETE_LINE : ~0;
+    const parse = (value: string) => {
+      try {
+        return parseWhitespaceRule(legacy ? value.replace(/incomplete-line/g, "") : value);
+      } catch (e) {
+        throw whitespaceRuleError((e as Error).message);
+      }
+    };
+    const core = this.config.value("core.whitespace");
+    const configRule = core === undefined ? WS_DEFAULT_RULE : parse(core);
+    const rules = new Map<string, Promise<number>>();
+    return (path: string) => {
+      let found = rules.get(path);
+      if (!found) {
+        found = (async () => {
+          const attrs = await filter?.attributes?.(path, ["whitespace"], context);
+          const attr = attrs?.get("whitespace");
+          if (typeof attr === "string") return parse(attr) & mask;
+          return whitespaceRuleOf(attr ?? undefined, configRule) & mask;
+        })();
+        rules.set(path, found);
+      }
+      return found;
     };
   }
 
