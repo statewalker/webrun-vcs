@@ -1187,7 +1187,7 @@ export class Git implements Disposable {
    */
   remoteAdd(): RemoteAddCommand {
     this.checkClosed();
-    return new RemoteAddCommand(this._workingCopy);
+    return this.withTransports(new RemoteAddCommand(this._workingCopy));
   }
 
   /**

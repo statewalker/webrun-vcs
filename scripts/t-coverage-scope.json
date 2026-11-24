@@ -1,0 +1,22 @@
+{
+  "description": "git t/ scripts outside webrun-vcs's scope: scripts/t-coverage.mjs counts them apart. Each entry is a script-name prefix and the reason. webrun-vcs is a library, so tests of git's own command line, of foreign-SCM bridges and of tools built on other runtimes do not apply.",
+  "outOfScope": [
+    { "prefix": "t0012-help", "reason": "git's own help command" },
+    { "prefix": "t0040-parse-options", "reason": "git's option parser (the API takes setters)" },
+    { "prefix": "t0041-usage", "reason": "git's usage messages" },
+    { "prefix": "t020", "reason": "gettext translations of git's messages" },
+    { "prefix": "t0450-txt-doc-vs-help", "reason": "git's documentation against its help text" },
+    { "prefix": "t9003-help-autocorrect", "reason": "git's command-name autocorrection" },
+    { "prefix": "t91", "reason": "git-svn bridge" },
+    { "prefix": "t9200-git-cvsexportcommit", "reason": "CVS bridge" },
+    { "prefix": "t94", "reason": "git-cvsserver" },
+    { "prefix": "t95", "reason": "gitweb" },
+    { "prefix": "t96", "reason": "git-cvsimport" },
+    { "prefix": "t9700-perl-git", "reason": "Git.pm Perl bindings" },
+    { "prefix": "t98", "reason": "git-p4 bridge" },
+    { "prefix": "t9850-shell", "reason": "git-shell login shell" },
+    { "prefix": "t9901-git-web--browse", "reason": "git web--browse launcher" },
+    { "prefix": "t9902-completion", "reason": "bash completion script" },
+    { "prefix": "t9903-bash-prompt", "reason": "bash prompt script" }
+  ]
+}
