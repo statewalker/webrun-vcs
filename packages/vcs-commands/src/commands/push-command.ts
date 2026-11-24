@@ -725,7 +725,8 @@ export class PushCommand extends TransportCommand<PushResult> {
       leases.length > 0 &&
       (this.forceIfIncludes ?? this.configBool("push.useForceIfIncludes") ?? false);
     // transport_push: the submodules (not of a bare repository) once the hook passed
-    const recurseOnPush = recurse !== undefined && this.worktreeAccess !== undefined;
+    const recurseOnPush =
+      recurse !== undefined && new SubmoduleFetchRepository(this.workingCopy).hasWorktree();
     const submoduleOutput = { text: submoduleWarnings.map((w) => `${w}\n`).join("") };
     const pushOptions: TransportPushOptions = {
       url: remoteUrl,

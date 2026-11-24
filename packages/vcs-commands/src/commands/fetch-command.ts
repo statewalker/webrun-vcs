@@ -1153,7 +1153,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
         exitCode: 128,
       });
     }
-    if (!this.worktreeAccess) return undefined;
+    // fetch_submodules: nothing without a worktree (a bare repository)
+    if (!new SubmoduleFetchRepository(this.workingCopy).hasWorktree()) return undefined;
     let model: SubmoduleModel | undefined;
     if (mode !== "no") {
       model = await SubmoduleModel.load(this.workingCopy).catch(() => undefined);

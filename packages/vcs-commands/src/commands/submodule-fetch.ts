@@ -381,8 +381,13 @@ export class SubmoduleFetchRepository extends GitCommand<never> {
       .catch(() => undefined);
   }
 
+  /** Whether the repository has a worktree (a bare one's working copy refuses to give one). */
   hasWorktree(): boolean {
-    return this.worktreeAccess !== undefined;
+    try {
+      return this.worktreeAccess !== undefined;
+    } catch {
+      return false;
+    }
   }
 }
 
