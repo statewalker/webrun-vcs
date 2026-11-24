@@ -35,7 +35,7 @@ import { decodeGitPath, encodeGitPath, gitCharWidth } from "@statewalker/vcs-uti
 import { InvalidArgumentError } from "../errors/index.js";
 import { ChangeType } from "../results/diff-entry.js";
 import { type DateMode, DEFAULT_DATE_MODE, parseDateMode, showDate } from "./date-format.js";
-import type { DiffOutputFormat, DiffTextOptions } from "./diff-command.js";
+import { type DiffOutputFormat, type DiffTextOptions, hasPickaxe } from "./diff-command.js";
 import { LogGraph } from "./log-graph.js";
 import type { Mailmap } from "./mailmap.js";
 import { parsePathspecItem } from "./pathspec.js";
@@ -871,12 +871,13 @@ export class LogPrinter {
     // revision.c: --full-diff sets revs->diff too
     // revision.c: --diff-filter needs the diffs too, and cmd_log_init_finish shows only
     // the commits whose filtered diff is not empty (always_show_header off)
-    this.diffFiltered = options.diff?.diffFilter !== undefined;
+    this.diffFiltered =
+      options.diff?.diffFilter !== undefined || (!!options.diff && hasPickaxe(options.diff));
     this.allNeedDiff =
       userDiff || implyPatch || this.follow || !!options.fullDiff || this.diffFiltered;
   }
 
-  /** `--diff-filter` given */
+  /** `--diff-filter` or a pickaxe (`-S`, `-G`, `--find-object`) given */
   private readonly diffFiltered: boolean;
 
   /** Whether a commit whose diff is empty is still shown (git's `always_show_header`) */

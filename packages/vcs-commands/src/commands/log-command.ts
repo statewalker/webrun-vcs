@@ -23,15 +23,22 @@ import type { AttributesResolver, ContentAttributesContext } from "@statewalker/
 import {
   GitApiError,
   IncompatibleOptionsError,
+  InvalidArgumentError,
   InvalidConfigError,
   NotImplementedError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type CombinedDiffOptions, writeCombinedDiff } from "../results/combined-diff.js";
+import { DiffPickaxe } from "../results/diff-pickaxe.js";
 import { quotePath } from "../results/quote-path.js";
 import { bareAttributesResolver } from "./attributes-source.js";
-import { DiffCommand, type DiffTextOptions } from "./diff-command.js";
+import {
+  checkPickaxeOptions,
+  DiffCommand,
+  type DiffTextOptions,
+  hasPickaxe,
+} from "./diff-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import {
   type LogOutputEntry,
@@ -1492,6 +1499,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     // git log and git show read grep_config before anything else (a bad grep.patternType
     // dies there); the walk alone (rev-list, bisect's own walks) reads it only to grep
     if (this.logConfig) this.configuredPatternType();
+    await this.preparePickaxe();
     // --use-mailmap/--no-mailmap: what --author/--committer match too
     if (options.mailmap !== undefined) this.useMailmap ??= options.mailmap;
     const host = this.outputHost(options);
@@ -1510,6 +1518,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       },
     );
     const follow = printer.followsPath;
+    const countsShown = !printer.alwaysShowHeader;
     const graph = !!options.graph;
     const topo = graph;
     const boundary = !!options.boundary || this.boundary;
@@ -1551,8 +1560,10 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (maxCount !== undefined && !follow) entries = entries.slice(0, Math.max(maxCount, 0));
       if (maxCount !== undefined && maxCount <= 0) entries = [];
     } else {
-      // --follow counts the commits shown, not those walked; --reverse the newest walked
-      if (follow && !reverse) this.maxCount = undefined;
+      // --follow, pickaxe and --diff-filter count the commits shown, not those walked (log.c
+      // gives max_count back for a commit log_tree_commit did not show); --reverse the
+      // newest walked
+      if (countsShown && !reverse) this.maxCount = undefined;
       entries = [];
       for await (const c of await this.call()) {
         const { id, boundary: isBoundary, source, ...commit } = c;
@@ -1564,7 +1575,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           ...(source !== undefined ? { source } : {}),
         });
       }
-      if (follow) this.maxCount = maxCount;
+      if (countsShown) this.maxCount = maxCount;
     }
     this.simplifyHistory = simplifyHistory;
     this.order = saved.order;
@@ -1583,7 +1594,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     let count = 0;
     // -n 0: nothing is walked
     if (maxCount !== undefined && maxCount <= 0) entries = [];
-    const countShown = follow && maxCount !== undefined && !reverse;
+    const countShown = countsShown && maxCount !== undefined && !reverse;
     for (let k = 0; k < entries.length; k++) {
       const e = entries[k] as LogOutputEntry;
       const lookahead = entries.slice(k + 1, k + 3).map((x) => x.id);
@@ -1612,6 +1623,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       );
     }
     if (this.logConfig) this.configuredPatternType();
+    await this.preparePickaxe();
     if (options.mailmap !== undefined) this.useMailmap ??= options.mailmap;
     readDiffSubmoduleConfig(this.workingCopy);
     this.activeFilter = await this.buildCommitFilter();
@@ -1945,6 +1957,43 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 
   private diffOptions: DiffTextOptions = {};
 
+  /**
+   * The pickaxe options checked before anything is shown, as git parses them (empty `-S`/
+   * `-G`, `--find-object` names resolved once, the combinations, the regex compiled); `-i`
+   * (`setRegexpIgnoreCase`) folds `-S`/`-G` too, as revision.c's `--regexp-ignore-case`
+   */
+  private async preparePickaxe(): Promise<void> {
+    let o = this.diffOptions;
+    if (!hasPickaxe(o)) return;
+    if (this.regexpIgnoreCase && o.pickaxeIgnoreCase === undefined) {
+      o = { ...o, pickaxeIgnoreCase: true };
+    }
+    checkPickaxeOptions(o);
+    if (o.findObjects && o.findObjects.length > 0) {
+      const ids: string[] = [];
+      for (const name of o.findObjects) {
+        const id = await this.revisionResolver()
+          .resolve(name)
+          .catch(() => undefined);
+        if (id === undefined) {
+          throw new InvalidArgumentError(
+            "findObjects",
+            name,
+            `error: unable to resolve '${name}'`,
+          ).withExitCode(129);
+        }
+        ids.push(id);
+      }
+      o = { ...o, findObjects: ids };
+    }
+    DiffPickaxe.compile({
+      ...(o.pickaxeString !== undefined ? { string: o.pickaxeString } : {}),
+      ...(o.pickaxeGrep !== undefined ? { grep: o.pickaxeGrep } : {}),
+      regex: o.pickaxeRegex ?? false,
+    });
+    this.diffOptions = o;
+  }
+
   /** `log` stores no objects: its abbreviations read each loose fan-out directory once */
   protected override writesNoObjects(): boolean {
     return true;
@@ -2002,6 +2051,44 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
+   * The pickaxe of a combined diff: without rename detection `--find-object` keeps the paths
+   * with the object in the merge or a parent (combined_objfind); with it, and for `-S`/`-G`,
+   * find_paths_generic's way: a diff against each parent through diffcore (renames, pickaxe
+   * and `--diff-filter`), keeping the paths every one of them still lists (intersect_paths)
+   */
+  private async combinedPickaxe(
+    entry: LogOutputEntry,
+    paths: string[],
+    idsOf: (path: string) => (ObjectId | undefined)[],
+  ): Promise<string[]> {
+    const d = this.diffOptions;
+    if (!hasPickaxe(d) || paths.length === 0) return paths;
+    // need_generic_pathscan: rename detection (log's diff.renames, default on) or -S/-G
+    const renames = configBool(this.workingCopy, "diff.renames", true);
+    if (d.findObjects && d.findObjects.length > 0 && !renames) {
+      const wanted = new Set(d.findObjects);
+      return paths.filter((path) => idsOf(path).some((id) => id !== undefined && wanted.has(id)));
+    }
+    let kept = paths;
+    for (const p of entry.parents) {
+      const commit = await this.commits.load(p);
+      const diff = new DiffCommand(this._workingCopy)
+        .setOldTree(commit ? commit.tree : this.objectFormat.emptyTreeId)
+        .setNewTree(entry.commit.tree)
+        .shareReadsOf(this)
+        .setRenames(renames)
+        .setOptions(d);
+      // the walk's pathspec: --pickaxe-all looks at the whole queue of each parent
+      const spec = [...this.paths, ...this.excludePaths.map((x) => `:(exclude)${x}`)];
+      if (spec.length > 0) diff.setPathspec(spec);
+      const listed = new Set((await diff.call()).map((e) => e.newPath ?? e.oldPath));
+      kept = kept.filter((path) => listed.has(path));
+      if (kept.length === 0) break;
+    }
+    return kept;
+  }
+
+  /**
    * combine-diff.c's diff_tree_combined for a merge: the paths that differ from every
    * parent (within the pathspec), each as a combined diff of the trees.
    */
@@ -2043,7 +2130,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     }
     const differs = (a?: { mode: number; id: ObjectId }, b?: { mode: number; id: ObjectId }) =>
       !a || !b ? a !== b : a.id !== b.id || a.mode !== b.mode;
-    const paths = [...all]
+    let paths = [...all]
       .filter((path) => items.length === 0 || matchPathspec(items, path, 0) > 0)
       .filter((path) =>
         parents.every(
@@ -2060,6 +2147,10 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         }
         return ea.length - eb.length;
       });
+    paths = await this.combinedPickaxe(entry, paths, (path) => [
+      result.get(path)?.id,
+      ...parents.map((m, k) => sideOf(m, k, path)?.id),
+    ]);
     const sink = new ByteSink();
     const quote =
       parseGitBool(RemoteConfigStore.from(this._workingCopy).value("core.quotePath")) ?? true;
