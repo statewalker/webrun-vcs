@@ -21,6 +21,13 @@ import {
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { ListBranchMode } from "../types.js";
+import {
+  installTracking,
+  planTracking,
+  TrackMode,
+  trackableStart,
+  upstreamMissingError,
+} from "./branch-tracking.js";
 import { configBool } from "./merge-config.js";
 import { OperationState } from "./merge-support.js";
 import { canonicalObjectId } from "./object-id-input.js";
@@ -71,6 +78,11 @@ export class CreateBranchCommand extends GitCommand<Ref> {
   private name?: string;
   private startPoint?: string;
   private force = false;
+  private track = TrackMode.DEFAULT;
+  private createReflog = false;
+  private quiet = false;
+  private readonly output: string[] = [];
+  private readonly warnings: string[] = [];
 
   /**
    * Set the name of the branch to create.
@@ -111,11 +123,69 @@ export class CreateBranchCommand extends GitCommand<Ref> {
   }
 
   /**
-   * Execute the branch creation.
+   * How the new branch tracks its start point: git's `-t`/`--track[=direct]`
+   * (`TrackMode.DIRECT`: the start point must be a branch, a local one tracked with
+   * `remote = .`), `--track=inherit` (the start branch's own upstream copied), `--no-track`;
+   * by default `branch.autoSetupMerge` decides (`true`: a remote-tracking start point is
+   * tracked; `always`, `inherit`, `simple`, `false`). `branch.autoSetupRebase` adds
+   * `branch.<name>.rebase = true`.
+   *
+   * @example
+   * ```typescript
+   * const command = git.branchCreate().setName("topic").setStartPoint("origin/topic");
+   * await command.setTrack(TrackMode.DIRECT).call();
+   * command.getOutput(); // ["branch 'topic' set up to track 'origin/topic'."]
+   * ```
+   */
+  setTrack(mode: TrackMode): this {
+    this.checkCallable();
+    this.track = mode;
+    return this;
+  }
+
+  /**
+   * git's `--create-reflog`: the branch's reflog is created whatever
+   * `core.logAllRefUpdates` says.
+   */
+  setCreateReflog(createReflog: boolean): this {
+    this.checkCallable();
+    this.createReflog = createReflog;
+    return this;
+  }
+
+  /** git's `-q`: no "set up to track" message ({@link getOutput} stays empty). */
+  setQuiet(quiet: boolean): this {
+    this.checkCallable();
+    this.quiet = quiet;
+    return this;
+  }
+
+  /**
+   * What git printed on stdout, line by line: `branch '<b>' set up to track
+   * '<upstream>'.` (see {@link setTrack}). Read after {@link call}.
+   */
+  getOutput(): string[] {
+    return [...this.output];
+  }
+
+  /**
+   * What git printed on stderr, line by line: `warning: asked to inherit tracking from
+   * '<b>', but no remote is set` and the like. Read after {@link call}.
+   */
+  getWarnings(): string[] {
+    return [...this.warnings];
+  }
+
+  /**
+   * Execute the branch creation (git's `create_branch`).
    *
    * @returns The created branch ref
    * @throws InvalidRefNameError if branch name is invalid
    * @throws RefAlreadyExistsError if branch exists and force is false
+   * @throws RefNotFoundError when the start point names nothing (`fatal: not a valid object
+   *   name: '<start>'`), or when several remotes fetch into the tracked start point (once the
+   *   branch is created, as git dies)
+   * @throws InvalidArgumentError when `--track` cannot track the start point
    */
   async call(): Promise<Ref> {
     this.checkCallable();
@@ -148,21 +218,61 @@ export class CreateBranchCommand extends GitCommand<Ref> {
       }
     }
 
-    // Resolve start point
-    const targetId = this.startPoint
-      ? await this.resolveRef(this.startPoint, (n) => `fatal: not a valid branch point: '${n}'`)
-      : await this.resolveHead();
-
-    // git's create_branch: "branch: Created from <start>", "branch: Reset to <start>" (-f);
     // without a start point, cmd_branch names the branch checked out (`HEAD` when detached)
     const current = await this.getCurrentBranch();
     const start = this.startPoint ?? (current ? current.replace(/^refs\/heads\//, "") : "HEAD");
+
+    // git's dwim_branch_start: the object, then (tracking) the branch it names, then a commit
+    const compatibility = this.hooks.compatibility;
+    const objectId = await this.revisionResolver()
+      .resolve(start)
+      .catch((error) => {
+        if (error instanceof RefNotFoundError) return undefined;
+        throw error;
+      });
+    if (objectId === undefined) {
+      if (this.track === TrackMode.DIRECT) {
+        throw upstreamMissingError(this.workingCopy, start, compatibility);
+      }
+      throw new RefNotFoundError(start, `fatal: not a valid object name: '${start}'`);
+    }
+    const startRef =
+      this.track === TrackMode.NONE
+        ? undefined
+        : await trackableStart(this.workingCopy, this.refsStore, start, this.track);
+    const targetId = await this.resolveRef(start, (n) => `fatal: not a valid branch point: '${n}'`);
+
+    // git's create_branch: "branch: Created from <start>", "branch: Reset to <start>" (-f)
     const message = exists
       ? reflogMessages.branchReset(start)
       : reflogMessages.branchCreated(start);
-    await this.refsStore.set(refName, targetId, this.reflogLine(message));
+    if (this.createReflog) {
+      // REF_FORCE_CREATE_REFLOG
+      const result = await this.refsStore.batch([{ name: refName, new: targetId }], {
+        ...this.reflogLine(message),
+        createReflog: true,
+      });
+      if (!result.ok) {
+        const reasons = result.rejected.map((r) => r.reason).join(", ");
+        throw new GitApiError(`fatal: cannot lock ref '${refName}': ${reasons}`);
+      }
+    } else {
+      await this.refsStore.set(refName, targetId, this.reflogLine(message));
+    }
 
     this.setCallable(false);
+
+    // setup_tracking, once the branch exists (its refusals die after the write)
+    if (startRef !== undefined) {
+      const { plan, warnings } = planTracking(this.workingCopy, this.name, startRef, this.track, {
+        compatibility,
+      });
+      this.warnings.push(...warnings);
+      if (plan) {
+        const lines = await installTracking(this.workingCopy, this.name, plan);
+        if (!this.quiet) this.output.push(...lines);
+      }
+    }
 
     const ref = await this.refsStore.get(refName);
     return ref as Ref;

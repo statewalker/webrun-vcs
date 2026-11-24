@@ -306,6 +306,144 @@ describe("GitWorkingCopyConfig <-> native git", () => {
     });
   });
 
+  describe("unsetting, as git config --unset-all and --add write it", () => {
+    /** Applies `edit` to `content` through ours and `gitArgs` through native git; same bytes. */
+    async function both(
+      content: string,
+      edit: (config: GitWorkingCopyConfig) => void,
+      gitArgs: string[][],
+    ): Promise<void> {
+      const ours = path.join(repoDir, ".git", "config");
+      const native = path.join(testDir, "native-config");
+      await fs.writeFile(ours, content);
+      await fs.writeFile(native, content);
+      const config = openConfig();
+      await config.load();
+      edit(config);
+      await config.save();
+      for (const args of gitArgs) await git(["config", "-f", native, ...args], testDir);
+      expect(await fs.readFile(ours, "latin1")).toBe(await fs.readFile(native, "latin1"));
+    }
+
+    it("removes a section left empty, with the blank lines before it", async () => {
+      await both("[b]\n\ty = 2\n\n[a]\n\tx = 1\n\tx = 2\n\n[c]\n\tz = 3\n", (c) => c.unset("a.x"), [
+        ["--unset-all", "a.x"],
+      ]);
+    });
+
+    it("keeps a section with a comment in it or right before it", async () => {
+      await both("[a]\n\tx = 1\n\t# note\n[b]\n\ty = 2\n", (c) => c.unset("a.x"), [
+        ["--unset-all", "a.x"],
+      ]);
+      await both("# about a\n[a]\n\tx = 1\n[b]\n\ty = 2\n", (c) => c.unset("a.x"), [
+        ["--unset-all", "a.x"],
+      ]);
+    });
+
+    it("keeps a section that still has variables", async () => {
+      await both("[a]\n\tx = 1\n\ty = 2\n", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+    });
+
+    it("writes a key unset and added again at its section's end", async () => {
+      await both(
+        '[branch "x"]\n\tmerge = refs/heads/old\n\trebase = true\n[core]\n\tbare = false\n',
+        (c) => {
+          c.set("branch.x.remote", "origin");
+          c.unset("branch.x.merge");
+          c.add("branch.x.merge", "refs/heads/a");
+          c.add("branch.x.merge", "refs/heads/b");
+        },
+        [
+          ["branch.x.remote", "origin"],
+          ["--unset-all", "branch.x.merge"],
+          ["--add", "branch.x.merge", "refs/heads/a"],
+          ["--add", "branch.x.merge", "refs/heads/b"],
+        ],
+      );
+    });
+
+    it("keeps a section whose header line carries a comment", async () => {
+      await both(
+        '[core]\n\tbare = false\n[branch "topic"] # PR 42 review notes\n\tremote = origin\n\tmerge = refs/heads/topic\n',
+        (c) => {
+          c.unset("branch.topic.remote");
+          c.unset("branch.topic.merge");
+        },
+        [
+          ["--unset-all", "branch.topic.remote"],
+          ["--unset-all", "branch.topic.merge"],
+        ],
+      );
+      await both(
+        "[core] ; sparse\n\tsparseCheckout = true\n",
+        (c) => c.unset("core.sparseCheckout"),
+        [["--unset-all", "core.sparseCheckout"]],
+      );
+      await both('[a "x]y"] # c\n\tx = 1\n[b]\n\ty = 1\n', (c) => c.unset("a.x]y.x"), [
+        ["--unset-all", "a.x]y.x"],
+      ]);
+    });
+
+    it("treats a run of headers of one section as one section", async () => {
+      await both("[a]\n\tx = 1\n[a]\n\ty = 2\n", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+      await both("[a]\n\tx = 1\n[a]\n\tx = 2\n[b]\n\ty = 1\n", (c) => c.unset("a.x"), [
+        ["--unset-all", "a.x"],
+      ]);
+      await both("[a] ; c\n\tx = 1\n[a]\n\tx = 2\n", (c) => c.unset("a.x"), [
+        ["--unset-all", "a.x"],
+      ]);
+      await both("[a]\n\tx = 1\n[a] # c\n\tx = 2\n", (c) => c.unset("a.x"), [
+        ["--unset-all", "a.x"],
+      ]);
+      await both("[a]\n\tx = 1\n[b]\n\ty=1\n[a]\n\tz=1\n", (c) => c.unset("a.x"), [
+        ["--unset-all", "a.x"],
+      ]);
+      await both("[a]\n\tx = 1 # c\n[b]\n\ty=1\n", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+    });
+
+    it("adds after the removals: to the section left, else a new one at the end", async () => {
+      await both(
+        "[a]\n\tx = 1\n\ty = 0\n[a]\n\tx = 2\n",
+        (c) => {
+          c.unset("a.x");
+          c.add("a.x", "3");
+        },
+        [
+          ["--unset-all", "a.x"],
+          ["--add", "a.x", "3"],
+        ],
+      );
+      await both(
+        "[a]\n\tx = 1\n[b]\n\ty=1\n",
+        (c) => {
+          c.unset("a.x");
+          c.add("a.x", "3");
+        },
+        [
+          ["--unset-all", "a.x"],
+          ["--add", "a.x", "3"],
+        ],
+      );
+      await both(
+        "[a]\n\tx = 1\n[b]\n\ty=1\n",
+        (c) => {
+          c.unset("a.x");
+          c.set("a.z", "2");
+        },
+        [
+          ["--unset-all", "a.x"],
+          ["a.z", "2"],
+        ],
+      );
+    });
+
+    it("ends the file with a newline once its last lines are removed", async () => {
+      await both("[b]\n\ty=1\n[a]\n\tx = 1", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+      await both("[a]\n\ty=1\n\tx = 1", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+      await both("[a]\n\tx = 1\n[b]\n\ty=1", (c) => c.unset("a.x"), [["--unset-all", "a.x"]]);
+    });
+  });
+
   describe("booleans, as git_config_bool reads them", () => {
     it("a key with no `=` is true, an empty value false, and integers count", async () => {
       const lines = [

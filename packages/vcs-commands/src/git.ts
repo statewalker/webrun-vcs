@@ -29,6 +29,7 @@ import {
   DeleteTagCommand,
   DescribeCommand,
   DiffCommand,
+  EditBranchDescriptionCommand,
   FetchCommand,
   ForEachRefCommand,
   FormatPatchCommand,
@@ -65,6 +66,8 @@ import {
   RevListCommand,
   RevParseCommand,
   RmCommand,
+  SetUpstreamBranchCommand,
+  ShowCurrentBranchCommand,
   SparseCheckoutCommand,
   StashApplyCommand,
   StashCreateCommand,
@@ -80,6 +83,7 @@ import {
   SubmoduleSyncCommand,
   SwitchCommand,
   TagCommand,
+  UnsetUpstreamBranchCommand,
   VerifyPackCommand,
   WorktreeAddCommand,
   WorktreeListCommand,
@@ -455,6 +459,58 @@ export class Git implements Disposable {
   branchCopy(): CopyBranchCommand {
     this.checkClosed();
     return new CopyBranchCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a SetUpstreamBranchCommand (`git branch --set-upstream-to`).
+   *
+   * @example
+   * ```typescript
+   * await git.branchSetUpstream().setUpstream("origin/main").call();
+   * ```
+   */
+  branchSetUpstream(): SetUpstreamBranchCommand {
+    this.checkClosed();
+    return new SetUpstreamBranchCommand(this._workingCopy);
+  }
+
+  /**
+   * Create an UnsetUpstreamBranchCommand (`git branch --unset-upstream`).
+   *
+   * @example
+   * ```typescript
+   * await git.branchUnsetUpstream().setBranch("topic").call();
+   * ```
+   */
+  branchUnsetUpstream(): UnsetUpstreamBranchCommand {
+    this.checkClosed();
+    return new UnsetUpstreamBranchCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a ShowCurrentBranchCommand (`git branch --show-current`).
+   *
+   * @example
+   * ```typescript
+   * const name = await git.branchShowCurrent().call(); // undefined when detached
+   * ```
+   */
+  branchShowCurrent(): ShowCurrentBranchCommand {
+    this.checkClosed();
+    return new ShowCurrentBranchCommand(this._workingCopy);
+  }
+
+  /**
+   * Create an EditBranchDescriptionCommand (`git branch --edit-description`).
+   *
+   * @example
+   * ```typescript
+   * await git.branchEditDescription().setEditor(async () => "Parser work\n").call();
+   * ```
+   */
+  branchEditDescription(): EditBranchDescriptionCommand {
+    this.checkClosed();
+    return new EditBranchDescriptionCommand(this._workingCopy);
   }
 
   // ============ Notes Operations ============
