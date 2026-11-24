@@ -60,7 +60,7 @@ export function configFilesApiOf(
         }
       : (path, content) => files.write(path, [content]),
     // `git config`'s own edits go through the storage itself (a lock file renamed into place)
-    ...(readOnly ? {} : { files }),
+    ...(readOnly ? {} : { storage: files }),
     ...(posix.rootDirectory ? { rootDirectory: posix.rootDirectory } : {}),
     ...(posix.lstat && posix.readlink
       ? { lstat: posix.lstat.bind(posix), readlink: posix.readlink.bind(posix) }
@@ -132,7 +132,7 @@ export interface ConfigFilesApi {
    * (`setConfigMultivarInFile`, `renameConfigSectionInFile`: under `<file>.lock`); absent,
    * such edits are refused
    */
-  files?: FilesApi;
+  storage?: FilesApi;
   /**
    * The host directory these paths are relative to: an include climbing above it is read
    * from the host (git's), or, with `includes: "files"`, an absolute include inside it is

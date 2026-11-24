@@ -436,14 +436,14 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
         );
       }
     }
-    const files = config.configFiles.files as FilesApi;
+    const files = config.configFiles.storage as FilesApi;
     return { files, path, name: path };
   }
 
   /** The repository's configuration, which must be backed by files to be edited. */
   private repositoryConfig(): GitWorkingCopyConfig {
     const config = this.workingCopy.config;
-    if (!(config instanceof GitWorkingCopyConfig) || !config.configFiles.files) {
+    if (!(config instanceof GitWorkingCopyConfig) || !config.configFiles.storage) {
       throw new GitApiError("cannot edit the configuration: it is not stored in files");
     }
     return config;
