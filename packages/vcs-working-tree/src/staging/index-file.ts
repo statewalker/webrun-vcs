@@ -23,7 +23,14 @@
 import { readFile, type Trees } from "@statewalker/vcs-core";
 import { bytesToHex, sha1 } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
-import { atomicFilesOver, type FilesApi, joinPath } from "@statewalker/vcs-utils/files";
+import {
+  adjustSharedPerm,
+  atomicFilesOver,
+  calcSharedPerm,
+  type FilesApi,
+  joinPath,
+  parseSharedRepository,
+} from "@statewalker/vcs-utils/files";
 import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import {
   encodeUntrackedCache,
@@ -1211,6 +1218,8 @@ export class IndexFile {
       await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
     }
     try {
+      // the lock file is a tempfile: git adjusts its mode (core.sharedRepository)
+      await this.adjustLockMode(lockPath);
       if (this.checksum !== undefined) {
         const current = await readIndexChecksum(this.files, this.path, this.rawLength);
         if (current !== this.checksum) throw new IndexChangedError(this.path);
@@ -1230,6 +1239,12 @@ export class IndexFile {
     this.sparseDirs = plan.sparseDirs;
     this.version = plan.version;
     this.wrote(entries, plan.extensions);
+  }
+
+  /** `adjust_shared_perm` of a new lock file, as git's `create_tempfile_mode` applies it. */
+  private async adjustLockMode(lockPath: string): Promise<void> {
+    const shared = (await this.host?.settings?.())?.sharedRepository ?? 0;
+    if (shared) await adjustSharedPerm(this.files, lockPath, shared);
   }
 
   /**
@@ -1256,6 +1271,12 @@ export class IndexFile {
     while (!(await atomic.createExclusive(lockPath, new Uint8Array(0)))) {
       if (Date.now() >= deadline) throw new IndexLockedError(lockPath);
       await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+    }
+    try {
+      await this.adjustLockMode(lockPath);
+    } catch (error) {
+      await atomic.remove(lockPath).catch(() => {});
+      throw error;
     }
     let state: "held" | "done" = "held";
     // what was written into the lock: applied to this instance once it is committed
@@ -1650,66 +1671,8 @@ function randomSuffix(): string {
   return out;
 }
 
-/**
- * git's `adjust_shared_perm` of a file under `core.sharedRepository` (`shared`, as
- * `git_config_perm` returns it; 0 leaves the mode alone): the file's permission bits widened
- * (or, for an octal value, replaced) as `calc_shared_perm` computes them. Nothing where the
- * FilesApi keeps no modes.
- */
-export async function adjustSharedPerm(
-  files: FilesApi,
-  path: string,
-  shared: number,
-): Promise<void> {
-  if (!shared) return;
-  const posix = files as FilesApi & {
-    lstat?(path: string): Promise<{ mode?: number } | undefined>;
-    chmod?(path: string, mode: number): Promise<void>;
-  };
-  if (!posix.lstat || !posix.chmod) return;
-  const mode = (await posix.lstat(path))?.mode;
-  if (mode === undefined) return;
-  const next = calcSharedPerm(mode & 0o7777, shared);
-  if (((mode ^ next) & 0o7777) !== 0) await posix.chmod(path, next & 0o7777);
-}
-
-/** git's `calc_shared_perm` of a file's mode. */
-export function calcSharedPerm(mode: number, shared: number): number {
-  let tweak = shared < 0 ? -shared : shared;
-  if (!(mode & 0o200)) tweak &= ~0o222;
-  if (mode & 0o100) tweak |= (tweak & 0o444) >> 2;
-  return shared < 0 ? (mode & ~0o777) | tweak : mode | tweak;
-}
-
-/**
- * git's `git_config_perm` of a `core.sharedRepository` value: 0 for `umask` (or false),
- * `0660` for `group` (or true), `0664` for `all`/`world`/`everybody`, the negated masked mode
- * for an octal one (`0640` gives `-0640`).
- *
- * @throws Error for an octal mode that leaves the owner without read and write
- */
-export function parseSharedRepository(value: string | undefined): number {
-  if (value === undefined) return 0;
-  if (value === "umask") return 0;
-  if (value === "group") return 0o660;
-  if (value === "all" || value === "world" || value === "everybody") return 0o664;
-  if (/^[0-7]+$/.test(value)) {
-    const i = Number.parseInt(value, 8);
-    if (i === 0) return 0;
-    if (i === 1) return 0o660;
-    if (i === 2) return 0o664;
-    if ((i & 0o600) !== 0o600) {
-      throw new Error(
-        `problem with core.sharedRepository filemode value (0${(i & 0o777).toString(8).padStart(3, "0")}).\n` +
-          "The owner of files must always have read and write permissions.",
-      );
-    }
-    return -(i & 0o666);
-  }
-  const lower = value.toLowerCase();
-  if (["true", "yes", "on"].includes(lower)) return 0o660;
-  return 0;
-}
+// git's shared-repository modes, kept here for the callers of this module
+export { adjustSharedPerm, calcSharedPerm, parseSharedRepository };
 
 /**
  * The entries and extensions of the index file at `indexPath` as git reads them: a split
