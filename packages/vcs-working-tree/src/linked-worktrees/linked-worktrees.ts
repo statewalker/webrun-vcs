@@ -156,6 +156,29 @@ export interface WorktreeRepairReport {
   readonly message: string;
 }
 
+/**
+ * A relative link needs `extensions.relativeWorktrees`, but the repository (version 0) has
+ * an extension git does not know, so its format cannot be upgraded (git's
+ * `upgrade_repository_format`): nothing is written. The message is git's `fatal:` text,
+ * {@link errorLine} the `error:` line before it; `reports` holds what a repair reported
+ * before it stopped.
+ */
+export class WorktreeFormatUpgradeError extends Error {
+  readonly extension: string;
+  reports: WorktreeRepairReport[] = [];
+
+  constructor(extension: string) {
+    super("unable to upgrade repository format to support relative worktrees");
+    this.name = "WorktreeFormatUpgradeError";
+    this.extension = extension;
+  }
+
+  /** git's `error: cannot upgrade repository format: unknown extension <name>`. */
+  get errorLine(): string {
+    return `error: cannot upgrade repository format: unknown extension ${this.extension}`;
+  }
+}
+
 /** The kind of what is at a path: git's `file_exists` / `is_empty_dir` / `is_directory`. */
 export type WorktreePathState = "missing" | "empty-directory" | "directory" | "file";
 

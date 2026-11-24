@@ -1,7 +1,16 @@
-import type { WorktreeRepairReport } from "@statewalker/vcs-working-tree";
+import {
+  WorktreeFormatUpgradeError,
+  type WorktreeRepairReport,
+} from "@statewalker/vcs-working-tree";
+
+import { WorktreeError } from "../errors/index.js";
 
 import { GitCommand } from "../git-command.js";
 import { requireWorktrees, useRelativePaths } from "./worktree-support.js";
+
+/** git's `report_repair` line. */
+const reportLine = (r: WorktreeRepairReport) =>
+  `${r.error ? "error" : "repair"}: ${r.message}: ${r.path}`;
 
 /** What {@link WorktreeRepairCommand} found and fixed. */
 export interface WorktreeRepairResult {
@@ -77,13 +86,20 @@ export class WorktreeRepairCommand extends GitCommand<WorktreeRepairResult> {
       const current = (await worktrees.list()).find((wt) => wt.current);
       paths = current ? [current.path] : [];
     }
-    const reports = await worktrees.repair(
-      paths,
-      this.compatibility === "2.43" ? {} : { relativePaths },
-    );
+    let reports: WorktreeRepairReport[];
+    try {
+      reports = await worktrees.repair(
+        paths,
+        this.compatibility === "2.43" ? {} : { relativePaths },
+      );
+    } catch (error) {
+      if (!(error instanceof WorktreeFormatUpgradeError)) throw error;
+      // what git reported before it died, then its error line
+      throw new WorktreeError(error.message, [...error.reports.map(reportLine), error.errorLine]);
+    }
     return {
       reports,
-      messages: reports.map((r) => `${r.error ? "error" : "repair"}: ${r.message}: ${r.path}`),
+      messages: reports.map(reportLine),
       ok: reports.every((r) => !r.error),
     };
   }

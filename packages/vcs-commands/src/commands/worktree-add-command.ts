@@ -5,11 +5,12 @@ import {
   type PersonIdent,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
-import type {
-  CreatedLinkedWorktree,
-  LinkedWorktrees,
-  NewWorktreeHead,
-  WorkingCopy,
+import {
+  type CreatedLinkedWorktree,
+  type LinkedWorktrees,
+  type NewWorktreeHead,
+  type WorkingCopy,
+  WorktreeFormatUpgradeError,
 } from "@statewalker/vcs-working-tree";
 import { WorktreeError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
@@ -400,6 +401,21 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
   }
 
   /**
+   * git's `remote_get(NULL)` found a remote: the current branch's `branch.<b>.remote` (any
+   * name, git takes one without a section for a URL), else the one configured remote, else
+   * `origin`, which must have a URL.
+   */
+  private async hasDefaultRemote(): Promise<boolean> {
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const head = await this.refsStore.get("HEAD").catch(() => undefined);
+    const target = head && isSymbolicRef(head) ? head.target : undefined;
+    const branch = target?.startsWith("refs/heads/") ? target.slice(11) : undefined;
+    const choice = config.remoteChoiceForBranch(branch);
+    if (choice.explicit) return true;
+    return config.values(`remote.${choice.name}.url`).length > 0;
+  }
+
+  /**
    * git's `dwim_orphan`: no valid HEAD, no branch and (`remote` with --guess-remote) no
    * remote-tracking branch infers `--orphan`; a remote with nothing fetched refuses the add
    * unless forced.
@@ -414,8 +430,7 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
       for await (const ref of this.refsStore.list("refs/remotes/")) {
         if ("objectId" in ref && ref.objectId) return false;
       }
-      const config = RemoteConfigStore.from(this.workingCopy);
-      if (this.force === 0 && config.configuredNames().length > 0) {
+      if (this.force === 0 && (await this.hasDefaultRemote())) {
         throw new WorktreeError(
           "No local or remote refs exist despite at least one remote\npresent, stopping; use 'add -f' to override or fetch a remote first",
           messages,
@@ -579,6 +594,10 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
         ...(relativePaths ? { relativePaths } : {}),
       });
     } catch (error) {
+      if (error instanceof WorktreeFormatUpgradeError) {
+        // git's error and fatal lines; the branch created before stays, as git's child made it
+        throw new WorktreeError(error.message, [...messages, error.errorLine]);
+      }
       throw error instanceof WorktreeError
         ? error
         : new WorktreeError(error instanceof Error ? error.message : String(error));

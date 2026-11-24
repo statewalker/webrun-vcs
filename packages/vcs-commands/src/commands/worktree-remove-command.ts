@@ -1,4 +1,8 @@
-import type { LinkedWorktrees, WorktreeInfo } from "@statewalker/vcs-working-tree";
+import {
+  type LinkedWorktrees,
+  WorktreeFormatUpgradeError,
+  type WorktreeInfo,
+} from "@statewalker/vcs-working-tree";
 
 import { InvalidConfigError, WorktreeError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
@@ -206,6 +210,9 @@ export class WorktreeMoveCommand extends GitCommand<WorktreeInfo> {
     try {
       await worktrees.move(wt, destination, relativePaths ? { relativePaths } : {});
     } catch (error) {
+      if (error instanceof WorktreeFormatUpgradeError) {
+        throw new WorktreeError(error.message, [error.errorLine]);
+      }
       throw new WorktreeError(error instanceof Error ? error.message : String(error));
     }
     return { ...wt, path: worktrees.hostPath(destination) };

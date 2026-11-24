@@ -21,7 +21,10 @@ worktree's `.git` file relative to each other and set `extensions.relativeWorktr
 into absolute ones; both link files are written together, as `write_worktree_linking_files`.
 Under `setCompatibility("2.43")` the option is refused and repair rewrites only the file at
 fault. `LinkedWorktrees.create` takes `relativePaths`, `move`/`repair` take
-`WorktreeLinkOptions`; relative links are read everywhere.
+`WorktreeLinkOptions`; relative links are read everywhere. A version-0 repository with an
+extension git does not know cannot be upgraded: relative add, move and repair are refused
+before anything is written (`WorktreeFormatUpgradeError`, git's `cannot upgrade repository
+format: unknown extension <name>`), and `RepositoryFormat.unknownExtensions` lists them.
 
 Checkout and switch: an ambiguous remote branch name prints git's
 `advice.checkoutAmbiguousRemoteBranchName` hints (2.5x and 2.43 wordings), a name no ref has

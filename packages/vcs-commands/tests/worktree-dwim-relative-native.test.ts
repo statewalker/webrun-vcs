@@ -794,4 +794,146 @@ describeGit("worktree tracking, relative links, checkout DWIM: native twins", ()
     reset(t, "spam");
     await dwimTwin(t, "checkout", "spam");
   });
+
+  // ------------------------------------------------------------------ format upgrade refusal
+
+  /** A version-0 repository `main` with an extension git does not know (v0 ignores it). */
+  function setupUnknownExtension(base: string): void {
+    setupMain(base);
+    run(join(base, "main"), "config", "extensions.foo", "bar");
+  }
+
+  itRelative(
+    "relative add refused in a version-0 repository with an unknown extension (upgrade_repository_format)",
+    async () => {
+      const t = twins(setupUnknownExtension);
+      // the DWIM branch is made before (git's `git branch` child), the worktree never
+      await addTwin(t, "main", ["--relative-paths", "<base>/wt"], (git, base) =>
+        git.worktreeAdd().setPath(join(base, "wt")).setRelativePaths(true).call(),
+      );
+      await addTwin(t, "main", ["--relative-paths", "--detach", "<base>/det"], (git, base) =>
+        git.worktreeAdd().setPath(join(base, "det")).setDetach(true).setRelativePaths(true).call(),
+      );
+      for (const base of [t.native, t.ours]) {
+        expect(existsSync(join(base, "wt"))).toBe(false);
+        expect(existsSync(join(base, "det"))).toBe(false);
+        expect(readFileSync(join(base, "main/.git/config"), "latin1")).toContain(
+          "repositoryformatversion = 0",
+        );
+      }
+    },
+  );
+
+  itRelative(
+    "relative repair refused in a version-0 repository with an unknown extension",
+    async () => {
+      const t = twins((base) => {
+        setupUnknownExtension(base);
+        run(join(base, "main"), "worktree", "add", "-q", "--detach", "../side");
+      });
+      const r = attempt(join(t.native, "main"), [
+        "worktree",
+        "repair",
+        "--relative-paths",
+        "../side",
+      ]);
+      expect(r.status).toBe(128);
+      const ours = await death(() =>
+        open(t.ours, "main/.git").then((git) =>
+          git.worktreeRepair().addPath(join(t.ours, "side")).setRelativePaths(true).call(),
+        ),
+      );
+      expect(norm(ours, t.ours)).toBe(norm(r.stderr, t.native));
+      expectSame(t);
+    },
+  );
+
+  itRelative(
+    "relative move refused in a version-0 repository with an unknown extension",
+    async () => {
+      const t = twins((base) => {
+        setupUnknownExtension(base);
+        run(join(base, "main"), "worktree", "add", "-q", "--detach", "../wt");
+      });
+      const r = attempt(join(t.native, "main"), [
+        "worktree",
+        "move",
+        "--relative-paths",
+        "../wt",
+        "../wt2",
+      ]);
+      const ours = await death(() =>
+        open(t.ours, "main/.git").then((git) =>
+          git
+            .worktreeMove()
+            .setWorktree(join(t.ours, "wt"))
+            .setDestination(join(t.ours, "wt2"))
+            .setRelativePaths(true)
+            .call(),
+        ),
+      );
+      expect(r.status).toBe(128);
+      expect(ours).toBe(r.stderr);
+      // the configuration is untouched on both sides; native git renamed the directory before
+      // dying (its links left stale), ours refuses before the rename (a deliberate divergence)
+      for (const base of [t.native, t.ours]) {
+        expect(readFileSync(join(base, "main/.git/config"), "latin1")).toBe(
+          readFileSync(join(t.native, "main/.git/config"), "latin1"),
+        );
+      }
+      expect(existsSync(join(t.ours, "wt/.git"))).toBe(true);
+      expect(existsSync(join(t.ours, "wt2"))).toBe(false);
+      expect(run(join(t.ours, "wt"), "status", "--porcelain")).toBe("");
+    },
+  );
+
+  // ------------------------------------------------------------------ dwim_orphan's remote
+
+  /** An empty repository `main` with remotes (URLs to an empty upstream), nothing fetched. */
+  function setupEmptyWithRemotes(names: string[]) {
+    return (base: string) => {
+      run(base, "init", "-q", "-b", "main", "up");
+      run(base, "init", "-q", "-b", "main", "main");
+      for (const name of names) run(join(base, "main"), "remote", "add", name, "../up");
+    };
+  }
+
+  it("worktree add --guess-remote infers --orphan when remote_get(NULL) finds no remote (two remotes, no origin)", async () => {
+    const t = twins(setupEmptyWithRemotes(["a", "b"]));
+    await addTwin(t, "main", ["--guess-remote", "<base>/foo"], (git, base) =>
+      git
+        .worktreeAdd()
+        .setPath(join(base, "foo"))
+        .setGuessRemote(true)
+        .setCompatibility(COMPAT)
+        .call(),
+    );
+  });
+
+  it("worktree add --guess-remote dies when the default remote exists but nothing was fetched", async () => {
+    for (const names of [["origin", "b"], ["a"]]) {
+      const t = twins(setupEmptyWithRemotes(names));
+      await addTwin(t, "main", ["--guess-remote", "<base>/foo"], (git, base) =>
+        git
+          .worktreeAdd()
+          .setPath(join(base, "foo"))
+          .setGuessRemote(true)
+          .setCompatibility(COMPAT)
+          .call(),
+      );
+    }
+    // branch.<current>.remote names it, even without a section of its own
+    const t = twins((base) => {
+      setupEmptyWithRemotes(["a", "b"])(base);
+      run(join(base, "main"), "config", "branch.main.remote", "b");
+    });
+    await addTwin(t, "main", ["--guess-remote", "<base>/foo"], (git, base) =>
+      git
+        .worktreeAdd()
+        .setPath(join(base, "foo"))
+        .setGuessRemote(true)
+        .setCompatibility(COMPAT)
+        .call(),
+    );
+  });
 });

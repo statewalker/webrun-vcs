@@ -46,7 +46,7 @@ import type {
   WorktreePruneCheck,
   WorktreeRepairReport,
 } from "@statewalker/vcs-working-tree";
-import { readIndexFileEntries } from "@statewalker/vcs-working-tree";
+import { readIndexFileEntries, WorktreeFormatUpgradeError } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "../../create-git-files-backend.js";
 import {
   createFileRefStore,
@@ -675,13 +675,27 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
    * the repository has the extension already.
    */
   private async enableRelativeWorktrees(): Promise<void> {
-    const format = await readRepositoryFormat(this.files, this.commonDir);
+    const format = await this.checkRelativeUpgrade();
     if (format.relativeWorktrees) return;
     const config = await createWorkingCopyConfig(configFilesApiOf(this.files), this.commonDir);
     if (format.version < 1) config.set("core.repositoryformatversion", "1");
     config.set("extensions.relativeWorktrees", "true");
     await config.save();
     this.config = undefined;
+  }
+
+  /**
+   * The repository's format, refused (`WorktreeFormatUpgradeError`) when relative links would
+   * need `upgrade_repository_format` to version 1 and the repository (version 0) has an
+   * extension git does not know: checked before anything is written.
+   */
+  private async checkRelativeUpgrade() {
+    const format = await readRepositoryFormat(this.files, this.commonDir);
+    const unknown = format.unknownExtensions ?? [];
+    if (!format.relativeWorktrees && format.version < 1 && unknown.length > 0) {
+      throw new WorktreeFormatUpgradeError(unknown[0]);
+    }
+    return format;
   }
 
   async create(options: CreateLinkedWorktreeOptions): Promise<CreatedLinkedWorktree> {
@@ -697,6 +711,10 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       "id" in options.head
         ? options.head.id
         : (await this.history.refs.resolve(options.head.ref).catch(() => undefined))?.objectId;
+
+    // a repository whose format cannot take relative links: refused before any write (git
+    // dies in write_worktree_linking_files and removes what it created)
+    if (options.relativePaths) await this.checkRelativeUpgrade();
 
     // worktrees/<name>, numbered when taken (add_worktree's mkdir loop)
     const root = `${this.commonDir}/worktrees`;
@@ -825,6 +843,9 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     if (entry.id === undefined) throw new Error("can't relocate main worktree");
     const from = this.fromHost(entry.path);
     const to = this.toFiles(destination);
+    // refused before the rename (git renames first, then dies in write_worktree_linking_files,
+    // leaving the worktree moved with stale links)
+    if (options.relativePaths) await this.checkRelativeUpgrade();
     if (from === undefined || !(await this.files.move(from, to))) {
       throw new Error(`failed to move '${entry.path}' to '${this.paths.hostPath(to)}'`);
     }
@@ -841,9 +862,15 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
   ): Promise<WorktreeRepairReport[]> {
     const reports: WorktreeRepairReport[] = [];
     const relative = options.relativePaths;
-    for (const path of paths) await this.repairAtPath(path, reports, relative);
-    const list = await this.list();
-    for (const wt of list.slice(1)) await this.repairGitfile(wt, reports, relative);
+    try {
+      for (const path of paths) await this.repairAtPath(path, reports, relative);
+      const list = await this.list();
+      for (const wt of list.slice(1)) await this.repairGitfile(wt, reports, relative);
+    } catch (error) {
+      // git dies at the first write it cannot make, after what it reported
+      if (error instanceof WorktreeFormatUpgradeError) error.reports = reports;
+      throw error;
+    }
     return reports;
   }
 
