@@ -398,6 +398,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private temporaryIndex?: Staging;
   /** Intent-to-add entries are in the index as empty files (plumbing's `diff-index --cached`) */
   private intentToAddVisible = false;
+  /** The index stands for a tree (see {@link setIndexAsTree}) */
+  private indexAsTree = false;
 
   /**
    * Show intent-to-add entries in a `--cached` comparison as the empty files they name, as
@@ -538,6 +540,21 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
 
   protected override get staging(): Staging {
     return this.temporaryIndex ?? super.staging;
+  }
+
+  /**
+   * Compares the old tree with `index` taken as a tree, as git's `do_diff_cache` of an index
+   * built in memory (`stash show -u`'s worktree and untracked trees): `--cached` against
+   * it, with the prefixes of two trees (no mnemonic `c/` and `i/`).
+   *
+   * @internal
+   */
+  setIndexAsTree(index: Staging): this {
+    this.checkCallable();
+    this.temporaryIndex = index;
+    this.cached = true;
+    this.indexAsTree = true;
+    return this;
   }
 
   /**
@@ -1107,7 +1124,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
 
   /** What this diff compares */
   private get sides(): DiffSides {
-    if (this.newTree) return "trees";
+    if (this.newTree || this.indexAsTree) return "trees";
     if (this.cached) return "cached";
     if (!this.worktreeIfAny) return "trees";
     return this.oldTree ? "commit-worktree" : "index-worktree";
