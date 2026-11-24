@@ -66,7 +66,7 @@ import { CleanupMode, commentPrefixOf, stripspace } from "./message-cleanup.js";
 import { copyNotesForAmend, copyNotesForRebase } from "./notes-support.js";
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeBaseTree, mergeStoredTrees } from "./ort-recursive.js";
-import { type PatchIdTrees, patchId } from "./patch-id.js";
+import { PatchIds, type PatchIdTrees } from "./patch-id.js";
 import { formatCommitPretty, loadRefDecorations, type RefDecorations } from "./pretty-format.js";
 import {
   addExecCommands,
@@ -4695,41 +4695,27 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       },
     };
     const loadTree = (id: ObjectId) => this.trees.loadTree(id);
-    const patchIdOf = async (id: ObjectId, headerOnly: boolean) => {
-      const commit = await this.loadCommit(id);
-      if (!commit || commit.parents.length > 1) return undefined;
-      const parentTree = commit.parents[0]
-        ? (await this.loadCommit(commit.parents[0]))?.tree
-        : undefined;
-      return patchId(trees, this.blobs, parentTree, commit.tree, {
-        headerOnly,
-        objectFormat: this.objectFormat,
-      });
-    };
-    const full = new Map<ObjectId, string | undefined>();
-    const fullOf = async (id: ObjectId) => {
-      if (!full.has(id)) full.set(id, await patchIdOf(id, false));
-      return full.get(id);
-    };
-    // HEAD's side by header id
-    const byHeader = new Map<string, ObjectId[]>();
-    for (const id of range) {
-      const header = await patchIdOf(id, true);
-      if (!header) continue;
-      const list = byHeader.get(header) ?? [];
-      list.push(id);
-      byHeader.set(header, list);
-    }
-    if (byHeader.size === 0) return skipped;
+    // HEAD's side added, upstream's looked up (patch-ids.c)
+    const ids = new PatchIds<ObjectId>({
+      trees,
+      blobs: this.blobs,
+      objectFormat: this.objectFormat,
+      change: async (id) => {
+        const commit = await this.loadCommit(id);
+        if (!commit || commit.parents.length > 1) return undefined;
+        const parentTree = commit.parents[0]
+          ? (await this.loadCommit(commit.parents[0]))?.tree
+          : undefined;
+        return { ...(parentTree ? { parentTree } : {}), tree: commit.tree };
+      },
+    });
+    let added = 0;
+    for (const id of range) if (await ids.add(id)) added++;
+    if (added === 0) return skipped;
+    const empty = this.objectFormat.nullId;
     for (const id of left) {
-      const header = await patchIdOf(id, true);
-      const candidates = header ? byHeader.get(header) : undefined;
-      if (!candidates) continue;
-      const mine = await fullOf(id);
-      if (!mine) continue;
-      for (const c of candidates) {
-        if (!skipped.has(c) && (await fullOf(c)) === mine) skipped.add(c);
-      }
+      // make_script never skips a commit empty from the start
+      for (const c of await ids.matches(id)) if ((await ids.fullId(c)) !== empty) skipped.add(c);
     }
     return skipped;
   }
