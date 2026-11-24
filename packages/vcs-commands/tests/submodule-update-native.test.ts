@@ -556,9 +556,9 @@ git clone -q sup clone; git -C clone remote set-url origin ../sup
 
     it('t7406-submodule-update.sh: "submodule update can handle symbolic links in pwd" (a symbolic link at the submodule path)', async () => {
       // git 2.43.0 has no validate_submodule_path (it follows the link and updates through it);
-    // ours refuses under 2.43 compatibility too, a deliberate divergence for safety
-    if (compatibility === "2.43") return;
-    const t = twins(`${BEHIND}
+      // ours refuses under 2.43 compatibility too, a deliberate divergence for safety
+      if (compatibility === "2.43") return;
+      const t = twins(`${BEHIND}
 (cd clone; mv sub real; ln -s real sub)
 `);
       await expectTwins(t, [update([]), status([])]);
