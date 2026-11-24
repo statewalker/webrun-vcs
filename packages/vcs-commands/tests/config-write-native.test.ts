@@ -616,8 +616,43 @@ const scenarios: Scenario[] = [
       ["--file=d1", "--get", "a.b"],
     ],
   },
-];
-/** git's legacy argv as git 2.46's subcommands write it. */
+  {
+    title:
+      "t1300 symlinked configuration: --global and an absolute --file under a linked directory (macOS /tmp, a linked ~/.config)",
+    env: { GIT_CONFIG_GLOBAL: "{dir}/ldir/global" },
+    files: { "rdir/global": "[a]\n\tx = 1\n", "rdir/c": "[b]\n\ty = 1\n" },
+    watch: ["rdir/global", "rdir/c", "ldir"],
+    steps: [
+      {
+        args: ["--global", "--get", "a.x"],
+        before: (dir) => symlinkSync("rdir", join(dir, "ldir")),
+      },
+      ["--global", "q.r", "s"],
+      ["--global", "--rename-section", "q", "w"],
+      ["--file={dir}/ldir/c", "q.r", "s"],
+      ["--file={dir}/ldir/c", "--get", "b.y"],
+    ],
+  },
+  {
+    title: "t1300 symlinked configuration: a link whose target climbs with ..",
+    env: { GIT_CONFIG_GLOBAL: "{dir}/sub/glink" },
+    files: { x: "[a]\n\tx = 1\n", y: "[b]\n\ty = 1\n", "sub/keep": "" },
+    watch: ["sub/glink", "x", "sub/l", "y"],
+    steps: [
+      {
+        args: ["--global", "q.r", "s"],
+        before: (dir) => {
+          symlinkSync("../x", join(dir, "sub/glink"));
+          symlinkSync("../y", join(dir, "sub/l"));
+        },
+      },
+      ["--global", "--get", "a.x"],
+      ["--file=sub/l", "q.r", "s"],
+      ["--file=sub/l", "--get", "b.y"],
+      ["--file=sub/l", "--rename-section", "b", "c"],
+    ],
+  },
+]; /** git's legacy argv as git 2.46's subcommands write it. */
 function toSubcommands(args: string[]): string[] {
   const opts: string[] = [];
   const pos: string[] = [];

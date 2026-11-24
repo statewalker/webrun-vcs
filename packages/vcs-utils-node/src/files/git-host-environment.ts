@@ -73,7 +73,7 @@ export interface NodeGitHostEnvironmentOptions {
 export interface NodeGitHostEnvironment {
   readFile(path: string): Promise<Uint8Array | undefined>;
   /** The Node storage holding a host path (`git config --global` writes through it) */
-  hostFilesOf(path: string): { files: FilesApi; path: string };
+  hostFilesOf(path: string): Promise<{ files: FilesApi; path: string }>;
   statFile?(path: string): Promise<import("@statewalker/vcs-utils/files").LinkStats | undefined>;
   realPath?(path: string): Promise<string | undefined>;
   systemName?: string;
@@ -439,8 +439,18 @@ export function createNodeGitHostEnvironment(
   };
   return {
     readFile: readHostFile,
-    hostFilesOf: (path: string) => {
-      const [files, relative] = options.files ? [options.files, path] : posixHostFiles(path);
+    hostFilesOf: async (path: string) => {
+      if (options.files) return { files: options.files, path };
+      // the directories' links resolved, as git's open follows them (macOS /tmp, a linked
+      // ~/.config): the Posix FilesApi refuses a path beneath a link; the last component's
+      // links are followed by the config editor, which keeps a linked file a link
+      const slash = path.replaceAll("\\", "/").lastIndexOf("/");
+      let host = path;
+      if (slash > 0) {
+        const dir = await realHostPath(path.slice(0, slash));
+        if (dir !== undefined) host = `${dir.replace(/[\\/]+$/, "")}/${path.slice(slash + 1)}`;
+      }
+      const [files, relative] = posixHostFiles(host);
       return { files, path: relative };
     },
     // `~user/` (git's getpwnam): the user's entry in /etc/passwd, read through the FilesApi,

@@ -419,7 +419,7 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
     if (this.scope === "global") {
       const path = await globalConfigPath(environment);
       if (path === undefined) throw fatal("$HOME not set");
-      return hostLocation(path, environment);
+      return await hostLocation(path, environment);
     }
     if (this.scope === "system") {
       const path = environment?.systemConfig;
@@ -428,7 +428,7 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
           "cannot use --system: the host environment names no system configuration file",
         );
       }
-      return hostLocation(path, environment);
+      return await hostLocation(path, environment);
     }
     const config = this.repositoryConfig();
     let path = config.filePath;
@@ -458,11 +458,11 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
   }
 
   /** `--file <path>`: a host path, or one relative to the worktree top. */
-  private fileLocation(
+  private async fileLocation(
     path: string,
     environment: GitHostEnvironment | undefined,
-  ): ConfigFileLocation {
-    if (path.startsWith("/")) return hostLocation(path, environment);
+  ): Promise<ConfigFileLocation> {
+    if (path.startsWith("/")) return await hostLocation(path, environment);
     const worktree = this.worktreeAccess;
     const files = worktree?.getFiles?.();
     if (!worktree || !files) {
@@ -492,11 +492,11 @@ function prepared(comment: string): string {
 }
 
 /** A host path written through the host environment's storage. */
-function hostLocation(
+async function hostLocation(
   path: string,
   environment: GitHostEnvironment | undefined,
-): ConfigFileLocation {
-  const host = environment?.hostFilesOf?.(path);
+): Promise<ConfigFileLocation> {
+  const host = await environment?.hostFilesOf?.(path);
   if (!host) {
     throw new GitApiError(
       `cannot write ${path}: the host environment gives no access to its files`,

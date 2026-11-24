@@ -638,6 +638,22 @@ function reasonOf(error: unknown): string {
 }
 
 /**
+ * `path` with `.` and `..` resolved and empty components dropped (a leading `/` kept);
+ * undefined when `..` would climb above its start (the storage's root).
+ */
+function normalizeLinkPath(path: string): string | undefined {
+  const out: string[] = [];
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (out.length === 0) return undefined;
+      out.pop();
+    } else out.push(part);
+  }
+  return (path.startsWith("/") ? "/" : "") + out.join("/");
+}
+
+/**
  * `path` with at most `depth` symbolic links followed; `"loop"` when it is still a link
  * after `depth` of them and `strict` (the open's ELOOP), `"outside"` when a link leads where
  * this storage cannot follow (an absolute target outside its root).
@@ -657,17 +673,24 @@ async function followLinks(
     if (hop >= depth) return strict ? "loop" : current;
     const bytes = await posix.readlink(current);
     if (!bytes) return current;
-    const target = decodeGitPath(bytes);
+    let target = decodeGitPath(bytes);
     if (target.startsWith("/")) {
       const root = posix.rootDirectory?.replace(/\/+$/, "");
       if (root === undefined) return "outside";
+      const normal = normalizeLinkPath(target);
+      if (normal === undefined) return "outside";
+      target = normal;
       if (root === "") current = target;
       else if (target === root || target.startsWith(`${root}/`)) {
         current = target.slice(root.length) || "/";
       } else return "outside";
     } else {
       const slash = current.lastIndexOf("/");
-      current = slash < 0 ? target : `${current.slice(0, slash + 1)}${target}`;
+      const joined = slash < 0 ? target : `${current.slice(0, slash + 1)}${target}`;
+      // `..` climbs lexically, never above this storage's root
+      const normal = normalizeLinkPath(joined);
+      if (normal === undefined) return "outside";
+      current = normal;
     }
   }
 }

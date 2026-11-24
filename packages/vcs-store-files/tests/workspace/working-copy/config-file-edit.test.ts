@@ -11,7 +11,11 @@ import {
   setConfigMultivarInFile,
   setConfigMultivarText,
 } from "@statewalker/vcs-store-files";
-import { createInMemoryFilesApi, readFile } from "@statewalker/vcs-utils/files";
+import {
+  createInMemoryFilesApi,
+  createSymlinkFilesApi,
+  readFile,
+} from "@statewalker/vcs-utils/files";
 import { describe, expect, it } from "vitest";
 
 const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
@@ -146,5 +150,28 @@ describe("config file edits (t1300-config)", () => {
       status: 255,
       stderr: ["error: could not lock config file .git/config: Permission denied"],
     });
+  });
+
+  it("follows a link climbing with .. inside the storage, refuses one climbing out of it", async () => {
+    const files = createSymlinkFilesApi(createInMemoryFilesApi());
+    await files.write("/x", [new TextEncoder().encode("[a]\n\tx = 1\n")]);
+    await files.mkdir("/sub");
+    await files.symlink?.(new TextEncoder().encode("../x"), "/sub/l");
+    await files.symlink?.(new TextEncoder().encode("../../etc/gitconfig"), "/sub/out");
+    const inside = await setConfigMultivarInFile(
+      { files, path: "/sub/l", name: "sub/l" },
+      "q.r",
+      "s",
+    );
+    expect(inside.status).toBe(0);
+    expect(text(await readFile(files, "/x"))).toBe("[a]\n\tx = 1\n[q]\n\tr = s\n");
+    expect((await files.lstat?.("/sub/l"))?.kind).toBe("symlink");
+    const outside = await setConfigMultivarInFile(
+      { files, path: "/sub/out", name: "sub/out" },
+      "q.r",
+      "s",
+    );
+    expect(outside.status).toBe(255);
+    expect((await files.lstat?.("/sub/out"))?.kind).toBe("symlink");
   });
 });
