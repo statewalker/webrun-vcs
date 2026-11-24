@@ -188,4 +188,28 @@ describeGit("signed merges and am against native git", () => {
       }
     }
   }, 180_000);
+
+  it("am -S under a non-UTF-8 i18n.commitEncoding in a SHA-256 repository: the signature in `gpgsig-sha256`", async () => {
+    for (const format of FORMATS) {
+      const dirs = fx.twins(format, setup, ["--object-format=sha256"]);
+      const patch =
+        fx.gitOk(dirs.native, "format-patch", "--stdout", "-1", "main") +
+        fx.gitOk(dirs.native, "format-patch", "--stdout", "-1", "side");
+      const mbox = join(fx.root, "am-sha256.mbox");
+      writeFileSync(mbox, patch);
+      for (const dir of [dirs.native, dirs.ours]) {
+        fx.gitOk(dir, "reset", "-q", "--hard", "main~1");
+        fx.gitOk(dir, "config", "i18n.commitEncoding", "ISO-8859-1");
+      }
+      const native = fx.git(dirs.native, ["am", "-S", mbox]);
+      expect(native.status, native.stderr).toBe(0);
+      const result = await (await fx.ours(dirs.ours)).am().addMbox(patch).setSign(true).call();
+      expect(result.exitCode, result.errors).toBe(0);
+      const label = `am -S sha256 encoding=ISO-8859-1 (${format})`;
+      const raw = fx.rawCommit(dirs.ours, "HEAD");
+      expect(raw, label).toContain("encoding ISO-8859-1\ngpgsig-sha256 ");
+      expect(raw, label).not.toMatch(/^gpgsig /m);
+      await fx.expectSameCommits(format, dirs, true, ["main~1..HEAD"], label);
+    }
+  }, 120_000);
 });

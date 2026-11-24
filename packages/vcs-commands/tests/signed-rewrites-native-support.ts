@@ -138,15 +138,15 @@ export class SigningFixture {
   }
 
   /**
-   * Two repositories (native, ours) built by the same steps, the format's settings in both
-   * before `build` runs (so a setup commit may be signed too).
+   * Two repositories (native, ours) built by the same steps (`git init <initArgs>`), the
+   * format's settings in both before `build` runs (so a setup commit may be signed too).
    */
-  twins(format: TwinFormat, build: (dir: string) => void) {
+  twins(format: TwinFormat, build: (dir: string) => void, initArgs: string[] = []) {
     const n = this.counter++;
     const dirs = { native: join(this.root, `native-${n}`), ours: join(this.root, `ours-${n}`) };
     for (const dir of [dirs.native, dirs.ours]) {
       mkdirSync(dir, { recursive: true });
-      this.gitOk(dir, "init", "-q", "-b", "main");
+      this.gitOk(dir, "init", "-q", "-b", "main", ...initArgs);
       for (const [key, value] of Object.entries(this.formatConfig(format))) {
         this.gitOk(dir, "config", key, value);
       }

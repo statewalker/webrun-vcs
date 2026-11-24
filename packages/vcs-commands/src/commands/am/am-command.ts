@@ -1109,9 +1109,10 @@ export class AmCommand extends GitCommand<AmResult> {
             ),
           ),
         );
-        // add_header_signature: `gpgsig` after the other headers, continuation lines indented
+        // add_header_signature: the repository's header (`gpgsig`, `gpgsig-sha256` in a
+        // SHA-256 repository) after the other headers, continuation lines indented
         const lines = (signature.endsWith("\n") ? signature.slice(0, -1) : signature).split("\n");
-        header = `gpgsig ${lines.join("\n ")}\n`;
+        header = `${this.objectFormat.signatureHeader} ${lines.join("\n ")}\n`;
       }
       id = await objects.putUnsized("commit", [encodeGitPath(head + header + body)]);
     } else {
