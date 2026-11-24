@@ -391,12 +391,7 @@ export function planTracking(
     if (merges.length === 0) merges = [startRef];
   }
 
-  // install_branch_config_multiple_remotes
-  const autoRebase = (config.value("branch.autoSetupRebase") ?? "never").toLowerCase();
-  const rebase =
-    autoRebase === "always" ||
-    (autoRebase === "local" && remote === undefined) ||
-    (autoRebase === "remote" && remote !== undefined);
+  const rebase = autoSetupRebase(workingCopy, remote);
   if (rebase && merges.length > 1) {
     throw new InvalidArgumentError(
       "track",
@@ -409,6 +404,20 @@ export function planTracking(
     return { warnings: [`warning: not setting branch '${newBranch}' as its own upstream`] };
   }
   return { plan: { remote, merges, rebase }, warnings: [] };
+}
+
+/**
+ * Whether git's `install_branch_config_multiple_remotes` sets `branch.<name>.rebase` for an
+ * upstream on `remote` (undefined: a local branch), as `branch.autoSetupRebase` says.
+ */
+export function autoSetupRebase(workingCopy: WorkingCopy, remote: string | undefined): boolean {
+  const config = RemoteConfigStore.from(workingCopy);
+  const autoRebase = (config.value("branch.autoSetupRebase") ?? "never").toLowerCase();
+  return (
+    autoRebase === "always" ||
+    (autoRebase === "local" && remote === undefined) ||
+    (autoRebase === "remote" && remote !== undefined)
+  );
 }
 
 /**

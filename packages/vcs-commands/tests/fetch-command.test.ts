@@ -221,7 +221,8 @@ describe.each(backends)("FetchCommand ($name backend)", ({ factory }) => {
       }
     });
 
-    it("should not store objects in dry run mode", async () => {
+    // git's --dry-run stores the objects (fetch_refs runs) and writes no ref
+    it("should store objects but no ref in dry run mode", async () => {
       const server = await createInitializedTestServer();
       const remoteUrl = createTestUrl(server.baseUrl);
 
@@ -246,7 +247,8 @@ describe.each(backends)("FetchCommand ($name backend)", ({ factory }) => {
           .setDryRun(true)
           .call();
 
-        expect(await workingCopy.history.commits.has(commitId)).toBe(false);
+        expect(await workingCopy.history.commits.has(commitId)).toBe(true);
+        expect(await workingCopy.history.refs.get("refs/remotes/origin/main")).toBeUndefined();
       } finally {
         globalThis.fetch = originalFetch;
       }
