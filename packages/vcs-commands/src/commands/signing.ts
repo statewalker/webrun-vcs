@@ -139,6 +139,12 @@ export interface SigningConfig {
   signingKey?: string;
   /** `gpg.ssh.defaultKeyCommand` */
   defaultKeyCommand?: string;
+  /** `gpg.minTrustLevel`, lower case (`undefined`, `never`, `marginal`, `fully`, `ultimate`) */
+  minTrustLevel?: string;
+  /** `gpg.ssh.allowedSignersFile` (`~/` expanded) */
+  allowedSignersFile?: string;
+  /** `gpg.ssh.revocationFile` (`~/` expanded) */
+  revocationFile?: string;
 }
 
 /**
@@ -198,9 +204,16 @@ export function signingConfigOf(workingCopy: WorkingCopy): SigningConfig {
       case "gpg.mintrustlevel":
         if (!TRUST_LEVELS.includes(value.toUpperCase()))
           fail(`error: invalid value for '${key}': '${value}'`);
+        config.minTrustLevel = value.toLowerCase();
         break;
       case "gpg.ssh.defaultkeycommand":
         config.defaultKeyCommand = value;
+        break;
+      case "gpg.ssh.allowedsignersfile":
+        config.allowedSignersFile = expandUserPath(value, environment) ?? value;
+        break;
+      case "gpg.ssh.revocationfile":
+        config.revocationFile = expandUserPath(value, environment) ?? value;
         break;
       case "gpg.program":
       case "gpg.openpgp.program":

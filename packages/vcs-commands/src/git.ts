@@ -93,7 +93,9 @@ import {
   SwitchCommand,
   TagCommand,
   UnsetUpstreamBranchCommand,
+  VerifyCommitCommand,
   VerifyPackCommand,
+  VerifyTagCommand,
   WorktreeAddCommand,
   WorktreeListCommand,
   WorktreeLockCommand,
@@ -1321,6 +1323,34 @@ export class Git implements Disposable {
   mergeBase(): MergeBaseCommand {
     this.checkClosed();
     return new MergeBaseCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a VerifyCommitCommand (`git verify-commit`): each commit's signature checked
+   * through the host's verifier (`GitHostEnvironment.verifier`).
+   *
+   * @example
+   * ```typescript
+   * const { exitCode, stderr } = await git.verifyCommit().addCommit("HEAD").call();
+   * ```
+   */
+  verifyCommit(): VerifyCommitCommand {
+    this.checkClosed();
+    return new VerifyCommitCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a VerifyTagCommand (`git verify-tag`): each tag's signature checked through the
+   * host's verifier (`GitHostEnvironment.verifier`).
+   *
+   * @example
+   * ```typescript
+   * const { exitCode, stderr } = await git.verifyTag().addTag("v1.0").call();
+   * ```
+   */
+  verifyTag(): VerifyTagCommand {
+    this.checkClosed();
+    return new VerifyTagCommand(this._workingCopy);
   }
 
   /**

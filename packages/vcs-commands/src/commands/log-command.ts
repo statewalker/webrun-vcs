@@ -83,6 +83,14 @@ import {
   type FilteredCommit,
   type GrepPatternType,
 } from "./rev-filter/index.js";
+import {
+  checkSignature,
+  mergetagsOf,
+  parseBufferSignedByHeader,
+  parseSignature,
+  type SignatureCheck,
+  verifyCommitBytes,
+} from "./signature-check.js";
 import { readDiffSubmoduleConfig } from "./submodule-summary.js";
 import { shortenUnambiguousRef } from "./worktree-list-command.js";
 
@@ -1912,6 +1920,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         }
         return short;
       },
+      signature: (id) => this.signatureOf(id),
+      signatureLines: (entry) => this.signatureLines(entry),
       rawCommit: async (id) => {
         // the replacement's content, as git's commit buffer is (core.useReplaceRefs)
         const replace = (await this.objectReplacements())?.replace;
@@ -2033,6 +2043,81 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     this.checkCallable();
     this.diffOptions = { ...this.diffOptions, ...options };
     return this;
+  }
+
+  private readonly signatureChecks = new OrderedMap<ObjectId, Promise<SignatureCheck>>();
+  private signatureCwd?: Promise<string | undefined>;
+
+  /** A commit's bytes as its buffer is read (the replacement's, core.useReplaceRefs) */
+  private async commitBuffer(id: ObjectId): Promise<Uint8Array | undefined> {
+    const replace = (await this.objectReplacements())?.replace;
+    return this.readObjectBytes(replace?.size ? replacementOf(replace, id) : id);
+  }
+
+  /** `check_commit_signature` of a commit, made once */
+  private signatureOf(id: ObjectId): Promise<SignatureCheck> {
+    let check = this.signatureChecks.get(id);
+    if (!check) {
+      check = (async () => {
+        const bytes = await this.commitBuffer(id);
+        if (!bytes) return { result: "N", trustLevel: "undefined", failed: true, messages: [] };
+        this.signatureCwd ??= this.hostWorkingDir();
+        const cwd = await this.signatureCwd;
+        return verifyCommitBytes(this._workingCopy, bytes, {
+          objectFormat: this.objectFormat,
+          ...(cwd !== undefined ? { cwd } : {}),
+        });
+      })();
+      this.signatureChecks.set(id, check);
+      if (this.signatureChecks.size > 1024) this.signatureChecks.deleteOldest();
+    }
+    return check;
+  }
+
+  /** log-tree.c's `show_signature` and `show_mergetag` for one commit */
+  private async signatureLines(
+    entry: LogOutputEntry,
+  ): Promise<{ failed: boolean; text: string }[]> {
+    const bytes = await this.commitBuffer(entry.id);
+    if (!bytes) return [];
+    this.signatureCwd ??= this.hostWorkingDir();
+    const cwd = await this.signatureCwd;
+    const out: { failed: boolean; text: string }[] = [];
+    if (parseBufferSignedByHeader(bytes, this.objectFormat.signatureHeader)) {
+      const check = await this.signatureOf(entry.id);
+      out.push(
+        check.failed && check.output === undefined
+          ? { failed: true, text: "No signature\n" }
+          : { failed: check.failed, text: check.output ?? "" },
+      );
+    }
+    const parents = entry.commit.parents;
+    for (const tag of mergetagsOf(bytes)) {
+      const header = parseMergetag(tag, this.objectFormat.hexLength);
+      let text: string;
+      if (!header) text = "malformed mergetag\n";
+      else if (parents.length === 2 && header.object === parents[1])
+        text = `merged tag '${header.tag}'\n`;
+      else {
+        const nth = parents.indexOf(header.object);
+        text =
+          nth < 0
+            ? `tag ${header.tag} names a non-parent ${header.object}\n`
+            : `parent #${nth + 1}, tagged '${header.tag}'\n`;
+      }
+      let failed = true;
+      const signed = parseSignature(tag);
+      if (signed) {
+        const check = await checkSignature(this._workingCopy, signed.payload, signed.signature, {
+          payloadType: "tag",
+          ...(cwd !== undefined ? { cwd } : {}),
+        });
+        failed = check.failed;
+        text += check.output ?? "No signature\n";
+      }
+      out.push({ failed, text });
+    }
+    return out;
   }
 
   /** An object's content as stored (undefined when missing) */
@@ -3151,4 +3236,22 @@ function configAlgorithm(v: string | undefined): XdiffAlgorithm | undefined {
   const s = v?.trim().toLowerCase();
   if (s === "default") return "myers";
   return s === "myers" || s === "minimal" || s === "patience" || s === "histogram" ? s : undefined;
+}
+
+/** tag.c's `parse_tag_buffer` of a mergetag: the object tagged and the tag's name. */
+function parseMergetag(
+  bytes: Uint8Array,
+  hexLength: number,
+): { object: ObjectId; tag: string } | undefined {
+  const text = decodeGitPath(bytes);
+  if (bytes.length < hexLength + 24) return undefined;
+  const object = new RegExp(`^object ([0-9a-f]{${hexLength}})\n`).exec(text);
+  if (!object) return undefined;
+  let rest = text.slice(object[0].length);
+  if (!rest.startsWith("type ")) return undefined;
+  const nl = rest.indexOf("\n");
+  if (nl < 0) return undefined;
+  rest = rest.slice(nl + 1);
+  const tag = /^tag ([^\n]*)\n/.exec(rest);
+  return { object: object[1] as ObjectId, tag: tag ? (tag[1] as string) : "(null)" };
 }

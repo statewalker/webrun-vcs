@@ -77,6 +77,7 @@ import {
   saveAutostash,
   squashMessage,
 } from "./sequencer-support.js";
+import { readStoredObjectBytes, verifyMergeSignature } from "./signature-check.js";
 import { refuseCommitSigning, signRequestOf } from "./signing.js";
 import { readSparseCheckoutPatterns, sparseCheckoutConfig } from "./sparse-checkout-support.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
@@ -156,6 +157,54 @@ export class MergeCommand extends GitCommand<MergeResult> {
   private noVerify = false;
   /** `-S[<keyid>]` / `--no-gpg-sign` (undefined: `commit.gpgSign`) */
   private sign?: boolean | string;
+  /** `--[no-]verify-signatures` (undefined: `merge.verifySignatures`) */
+  private verifySignatures?: boolean;
+  /** git's stdout lines of the signatures checked (`Commit <id> has a good GPG signature`) */
+  private readonly signatureLines: string[] = [];
+
+  /**
+   * `--verify-signatures` (true) / `--no-verify-signatures` (false): every commit merged
+   * must carry a good signature of at least marginal trust (with `gpg.minTrustLevel` set,
+   * that level instead), checked through the host's verifier before anything is written
+   * (commit.c's `verify_merge_signature`); undefined (the default) leaves it to
+   * `merge.verifySignatures`. A refusal throws {@link SignatureVerificationError} with git's
+   * death; a good signature adds `Commit <id> has a good GPG signature by <signer>` to the
+   * output.
+   */
+  setVerifySignatures(verify: boolean | undefined): this {
+    this.checkCallable();
+    this.verifySignatures = verify;
+    return this;
+  }
+
+  /** Whether the commits merged are checked (the option, else `merge.verifySignatures`). */
+  private verifiesSignatures(): boolean {
+    if (this.verifySignatures !== undefined) return this.verifySignatures;
+    if (this.inProcess) return false;
+    return configBool(this.workingCopy, "merge.verifySignatures", false);
+  }
+
+  /** verify_merge_signature of one commit merged, its good line kept for the output */
+  private async verifyMergedCommit(id: ObjectId): Promise<void> {
+    // git_merge_config: any gpg.minTrustLevel turns the marginal-trust check off
+    const checkTrust =
+      !this.workingCopy.config ||
+      RemoteConfigStore.from(this.workingCopy).value("gpg.minTrustLevel") === undefined;
+    const cwd = await this.hostWorkingDir();
+    this.signatureLines.push(
+      await verifyMergeSignature(
+        this.workingCopy,
+        await readStoredObjectBytes(this.workingCopy, id),
+        {
+          commitId: id,
+          abbreviated: await this.abbreviateObjectId(id),
+          objectFormat: this.objectFormat,
+          checkTrust,
+          ...(cwd !== undefined ? { cwd } : {}),
+        },
+      ),
+    );
+  }
 
   /**
    * `--no-verify`: the `pre-merge-commit` and `commit-msg` hooks do not run
@@ -496,7 +545,9 @@ export class MergeCommand extends GitCommand<MergeResult> {
         env: { GIT_REFLOG_ACTION: this.reflogActionValue() },
       });
     }
-    return this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result;
+    return this.withSignatureLines(
+      this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result,
+    );
   }
 
   /**
@@ -511,7 +562,27 @@ export class MergeCommand extends GitCommand<MergeResult> {
     this.setCallable(false);
     await this.readCurrentIndex();
     const worktree = this.worktreeAccess;
-    const run = async (): Promise<MergeResult> => {
+    // pull_into_void: any --[no-]verify-signatures given to pull checks the commit
+    if (this.verifySignatures !== undefined) await this.verifyMergedCommit(mergeHead);
+    const run = () => this.intoVoid(mergeHead, worktree);
+    const result = await (worktree?.batch ? worktree.batch(run) : run());
+    return this.withSignatureLines(
+      this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result,
+    );
+  }
+
+  /** The good-signature lines first in the output, as git prints them before the merge's */
+  private withSignatureLines(result: MergeResult): MergeResult {
+    if (this.signatureLines.length === 0) return result;
+    return { ...result, output: [...this.signatureLines, ...(result.output ?? [])] };
+  }
+
+  /** A two-way switch from the empty tree to `mergeHead`, HEAD's branch created there. */
+  private async intoVoid(
+    mergeHead: ObjectId,
+    worktree: Worktree | undefined,
+  ): Promise<MergeResult> {
+    {
       const targetTree = await this.commits.getTree(mergeHead);
       const target = await flatTree(this.trees, targetTree);
       const refused = await switchTrees(this.context(worktree), new Map(), target, {
@@ -539,9 +610,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
         mergedCommits: [mergeHead],
         output: [],
       };
-    };
-    const result = await (worktree?.batch ? worktree.batch(run) : run());
-    return this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result;
+    }
   }
 
   /**
@@ -616,7 +685,22 @@ export class MergeCommand extends GitCommand<MergeResult> {
     }
     const headResolved = await this.refsStore.resolve("HEAD");
     if (!headResolved?.objectId) {
-      throw new NoHeadError("HEAD does not point to a commit");
+      if (!this.verifiesSignatures()) throw new NoHeadError("HEAD does not point to a commit");
+      // cmd_merge on an unborn branch: one head only, then verify_merge_signature, then
+      // read_empty and HEAD's branch created (the merge into the void)
+      if (this.squash)
+        throw new GitApiError("fatal: Squash commit into empty head not supported yet");
+      if (this.fastForwardMode === FastForwardMode.NO_FF) {
+        throw new GitApiError(
+          "fatal: Non-fast-forward commit does not make sense into an empty head",
+        );
+      }
+      if (this.includes.length > 1) {
+        throw new GitApiError("fatal: Can merge only exactly one commit into empty head");
+      }
+      const target = await this.mergeHeadOf(this.includes[0] as string);
+      await this.verifyMergedCommit(target);
+      return this.intoVoid(target, worktree);
     }
     const headId = headResolved.objectId;
 
@@ -650,6 +734,9 @@ export class MergeCommand extends GitCommand<MergeResult> {
       }
       const headSubsumed = !independent.some((c) => c.id === headId);
       const remotes = independent.filter((c) => c.id !== headId);
+      if (this.verifiesSignatures()) {
+        for (const remote of remotes) await this.verifyMergedCommit(remote.id);
+      }
       if (remotes.length === 0) {
         await state.setRef("ORIG_HEAD", headId);
         return {
@@ -685,6 +772,16 @@ export class MergeCommand extends GitCommand<MergeResult> {
       }
       srcRef = remotes[0].name;
       srcId = remotes[0].id;
+    }
+
+    // reduce_parents: a head HEAD already contains is no merged commit, so nothing to check
+    if (
+      this.includes.length === 1 &&
+      this.verifiesSignatures() &&
+      srcId !== headId &&
+      !(await this.isAncestor(srcId, headId))
+    ) {
+      await this.verifyMergedCommit(srcId);
     }
 
     // git records where HEAD was before every merge
