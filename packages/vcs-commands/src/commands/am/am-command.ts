@@ -11,7 +11,12 @@
  * copies none (only `rebase --apply` does, through `rewritten`).
  */
 
-import { formatPersonIdent, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
+import {
+  type Commit,
+  formatPersonIdent,
+  type ObjectId,
+  type PersonIdent,
+} from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { compareGitPaths, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { wildmatch } from "@statewalker/vcs-working-tree";
@@ -49,7 +54,7 @@ import { mergeStoredTrees, storedBase } from "../ort-recursive.js";
 import { updateHead, updateHeadExpecting } from "../reflog-messages.js";
 import { removeBranchState, resetMerge, resetUnmergedToHead } from "../sequencer-support.js";
 import { showCommitBytes } from "../show-commit.js";
-import { SIGNING_FAILED_LINES, signRequestOf } from "../signing.js";
+import { SigningFailedError, signCommit, signPayload, signRequestOf } from "../signing.js";
 import { appendSignoff } from "../trailers.js";
 import { mailinfo } from "./mailinfo.js";
 import { type MailsplitSource, splitMail } from "./mailsplit.js";
@@ -314,10 +319,11 @@ export class AmCommand extends GitCommand<AmResult> {
 
   /**
    * `-S` (true) / `--no-gpg-sign` (false): whether to sign the commits; undefined (the
-   * default) leaves it to `commit.gpgSign`. Not signed yet: a patch to commit signed
-   * fails as git's does when gpg cannot sign (`error: gpg failed to sign the data:`,
-   * `fatal: failed to write commit object`, exit 128), the patch left applied to the index
-   * in `.git/rebase-apply` and nothing committed.
+   * default) leaves it to `commit.gpgSign`. Each commit is signed through the host's signer
+   * (`GitHostEnvironment.signer`) as git's commit_tree signs it; when it cannot be signed the
+   * am fails as git's does (`error: gpg failed to sign the data:`, `fatal: failed to write
+   * commit object`, exit 128), the patch left applied to the index in `.git/rebase-apply`
+   * and nothing committed.
    */
   setSign(sign: boolean | undefined): this {
     this.checkCallable();
@@ -1077,22 +1083,48 @@ export class AmCommand extends GitCommand<AmResult> {
     author = { ...author, name: latin1ToPath(author.name), email: latin1ToPath(author.email) };
     const message = latin1ToPath(msg);
     const parents = head ? [head] : [];
-    // commit_tree_extended signs before writing: no signer, git's failure
-    if (signRequestOf(this.workingCopy, this.sign) !== undefined) {
-      this.err += `${SIGNING_FAILED_LINES.join("\n")}\n`;
-      this.fatal("failed to write commit object");
-    }
+    // commit_tree_extended signs before writing: when it cannot, git's failure and nothing
+    // written
+    const sign = signRequestOf(this.workingCopy, this.sign);
     const objects = this.workingCopy.history?.objects;
     let id: ObjectId;
     if (!isUtf8Encoding(commitEncoding) && objects) {
       // commit_tree_extended: the `encoding` header, the message and idents as their bytes
-      let text = `tree ${tree}\n`;
-      for (const p of parents) text += `parent ${p}\n`;
-      text += `author ${formatPersonIdent(author)}\ncommitter ${formatPersonIdent(committer)}\n`;
-      text += `encoding ${commitEncoding}\n\n${message}`;
-      id = await objects.putUnsized("commit", [encodeGitPath(text)]);
+      let head = `tree ${tree}\n`;
+      for (const p of parents) head += `parent ${p}\n`;
+      head += `author ${formatPersonIdent(author)}\ncommitter ${formatPersonIdent(committer)}\n`;
+      head += `encoding ${commitEncoding}\n`;
+      const body = `\n${message}`;
+      let header = "";
+      if (sign !== undefined) {
+        const payload = encodeGitPath(head + body);
+        const signature = latin1ToPath(
+          bytesToLatin1(
+            await this.signOrDie((cwd) =>
+              signPayload(this.workingCopy, sign, payload, {
+                committer,
+                tail: [],
+                ...(cwd !== undefined ? { cwd } : {}),
+              }),
+            ),
+          ),
+        );
+        // add_header_signature: `gpgsig` after the other headers, continuation lines indented
+        const lines = (signature.endsWith("\n") ? signature.slice(0, -1) : signature).split("\n");
+        header = `gpgsig ${lines.join("\n ")}\n`;
+      }
+      id = await objects.putUnsized("commit", [encodeGitPath(head + header + body)]);
     } else {
-      id = await this.commits.store({ tree, parents, author, committer, message });
+      let commit: Commit = { tree, parents, author, committer, message };
+      if (sign !== undefined) {
+        commit = await this.signOrDie((cwd) =>
+          signCommit(this.workingCopy, sign, commit, {
+            tail: [],
+            ...(cwd !== undefined ? { cwd } : {}),
+          }),
+        );
+      }
+      id = await this.commits.store(commit);
     }
     const action = this.reflogAction("am");
     // do_commit's update_ref("HEAD", commit, old_oid): HEAD expecting the commit it left
@@ -1104,6 +1136,30 @@ export class AmCommand extends GitCommand<AmResult> {
       this.reflogLine(`${action}: ${latin1ToPath(this.firstLine(st.msg as string))}`, committer),
     );
     await this.runAmHook("post-applypatch");
+  }
+
+  /**
+   * Runs a signing (`run(cwd)`, the signing program in the worktree top) as do_commit's
+   * commit_tree: a signature that cannot be made adds gpg's lines and dies with `fatal:
+   * failed to write commit object` (exit 128), or as the signing itself died.
+   */
+  private async signOrDie<T>(run: (cwd: string | undefined) => Promise<T>): Promise<T> {
+    let cwd: string | undefined;
+    try {
+      cwd = await this.hooks.hostWorkingDirectory();
+    } catch {
+      cwd = undefined;
+    }
+    try {
+      return await run(cwd);
+    } catch (error) {
+      if (!(error instanceof SigningFailedError)) throw error;
+      const lines = error.message.split("\n");
+      this.err += `${lines.map(pathToLatin1).join("\n")}\n`;
+      // the signing died itself (ssh without a key): nothing follows
+      if (lines[lines.length - 1]?.startsWith("fatal: ")) throw new AmStop(128);
+      this.fatal("failed to write commit object");
+    }
   }
 
   private async resolve(st: AmState, allowEmpty: boolean): Promise<AmResult> {
