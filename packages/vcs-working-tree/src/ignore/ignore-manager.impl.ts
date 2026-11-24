@@ -49,7 +49,11 @@ export function createIgnoreManager(options?: GitIgnoreManagerOptions): IgnoreMa
  * ```
  */
 export function createCommandLineExcludes(patterns: readonly string[]): IgnoreNode {
-  const rules = patterns.filter((p) => p.length > 0).map((p) => createIgnoreRule(p));
+  // add_pattern never reads a comment: a leading `#` (after `!` too) is part of the pattern,
+  // escaped here so the rule parser (a .gitignore line's) takes it literally
+  const literal = (p: string) =>
+    p.startsWith("#") ? `\\${p}` : p.startsWith("!#") ? `!\\${p.slice(1)}` : p;
+  const rules = patterns.filter((p) => p.length > 0).map((p) => createIgnoreRule(literal(p)));
   return createIgnoreNode(rules.filter((rule) => !rule.isEmpty));
 }
 

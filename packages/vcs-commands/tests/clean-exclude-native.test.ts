@@ -125,3 +125,46 @@ describeGit("git clean -e against native git (t7300-clean)", () => {
     }
   }
 });
+
+describeGit("git clean -e with patterns git's add_pattern takes whole", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "clean-exclude-hash-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /** t7300's setup plus untracked `#foo`, `#bar` and `x.o` (ignored by `*.o`). */
+  function hashTwins(): { native: string; ours: string } {
+    const out = twins();
+    for (const dir of [out.native, out.ours]) {
+      put(dir, "#foo", "");
+      put(dir, "#bar", "");
+      put(dir, "x.o", "");
+    }
+    return out;
+  }
+
+  const cases: string[][] = [
+    ["-e", "#foo"],
+    ["-x", "-e", "#foo"],
+    ["-d", "-x", "-e", "#foo"],
+    ["-X", "-e", "!x.o"],
+    ["-x", "-e", "*", "-e", "!#foo"],
+  ];
+  for (const args of cases) {
+    for (const mode of ["-n", "-f"]) {
+      const full = [mode, ...args];
+      it(`clean ${full.join(" ")}`, async () => {
+        const { native, ours } = hashTwins();
+        const r = spawnSync("git", ["clean", ...full], {
+          cwd: native,
+          env: nativeGitEnv(root),
+          encoding: "utf8",
+        });
+        expect(r.status).toBe(0);
+        const result = await ourClean(ours, full);
+        expect([...result.cleaned].sort()).toEqual(named(r.stdout));
+        expect(snapshot(root, ours)).toEqual(snapshot(root, native));
+      });
+    }
+  }
+});
