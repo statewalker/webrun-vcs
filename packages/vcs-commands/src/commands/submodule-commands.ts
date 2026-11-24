@@ -26,7 +26,6 @@ import {
   pathspecErrors,
 } from "./pathspec.js";
 import { RmCommand } from "./rm-command.js";
-import type { SubmoduleAuthFor } from "./submodule-auth.js";
 import {
   defaultRemoteOf,
   isRelativeSubmoduleUrl,
@@ -55,15 +54,13 @@ export interface SubmoduleCloneOptions {
   references?: string[];
   /** `--require-init`: a non-empty directory at the path is refused */
   requireInit?: boolean;
-  /** The transports and timeout the clone reaches its remote with */
+  /**
+   * The transports and timeout the clone reaches its remote with. No credentials or headers
+   * are taken: a submodule's URL comes from the repository's content, so they are attached
+   * by the transports themselves, per URL and origin (`guardSubmoduleTransports`).
+   */
   transports?: GitTransportRegistry;
   timeout?: number;
-  /**
-   * The credentials and headers for the URL the clone talks to (after `insteadOf`): never
-   * static values, since a submodule's URL comes from the repository's content (see
-   * `submodule-auth.ts`)
-   */
-  authFor?: SubmoduleAuthFor;
 }
 
 /** What a submodule command printed, and its exit status. */
@@ -462,12 +459,6 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
         if (options.depth !== undefined && options.depth > 0) clone.setDepth(options.depth);
         for (const reference of options.references ?? []) clone.addReference(reference);
         if (options.transports) clone.setTransports(options.transports);
-        if (options.authFor) {
-          // decided on the URL the clone talks to: insteadOf applied, as CloneCommand applies it
-          const auth = options.authFor(RemoteConfigStore.from(inner).remoteUrlOf(cloneUrl));
-          if (auth.credentials) clone.setCredentials(auth.credentials);
-          if (auth.headers) clone.setHeaders(auth.headers);
-        }
         if (options.timeout !== undefined) clone.setTimeout(options.timeout);
         clone.shareHooksOf(this);
         const result = await clone.call();

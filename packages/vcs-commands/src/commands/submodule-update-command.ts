@@ -6,7 +6,11 @@
  * checkout, merge and rebase commands.
  */
 import type { ObjectId } from "@statewalker/vcs-core";
-import type { Credentials, GitTransportRegistry } from "@statewalker/vcs-transport";
+import {
+  type Credentials,
+  createDefaultTransports,
+  type GitTransportRegistry,
+} from "@statewalker/vcs-transport";
 import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 
@@ -26,9 +30,10 @@ import { RebaseCommand } from "./rebase-command.js";
 import {
   type CredentialsForUrl,
   createSubmoduleAuthPolicy,
+  guardSubmoduleTransports,
   type HeadersForUrl,
   type SubmoduleAuthFor,
-  urlOrigin,
+  strictUrlOrigin,
 } from "./submodule-auth.js";
 import {
   notFromUser,
@@ -349,7 +354,7 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
    */
   addCredentialOrigin(url: string): this {
     this.checkCallable();
-    const origin = urlOrigin(url);
+    const origin = strictUrlOrigin(url);
     if (origin === undefined) {
       throw new GitApiError(`fatal: '${url}' names no origin (scheme and host) for credentials`);
     }
@@ -382,6 +387,22 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
     return this;
   }
 
+  private guarded?: GitTransportRegistry;
+
+  /**
+   * The transports clones and fetches go through: the given ones (default
+   * `createDefaultTransports()`) with every connector attaching the policy's credentials and
+   * headers itself, per URL and origin (`guardSubmoduleTransports`); the commands are given
+   * none, so nothing else can send them anywhere.
+   */
+  private async guardedTransports(): Promise<GitTransportRegistry> {
+    this.guarded ??= guardSubmoduleTransports(
+      this.transports ?? createDefaultTransports(),
+      await this.auth(),
+    );
+    return this.guarded;
+  }
+
   /** The policy: inherited, else built from the setters and the superproject's remote. */
   private async auth(): Promise<SubmoduleAuthFor> {
     if (this.authPolicy) return this.authPolicy;
@@ -389,7 +410,7 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
     if (origins.length === 0 && (this.credentials || this.headers)) {
       const store = RemoteConfigStore.from(this.workingCopy);
       const url = store.urlFor(await defaultRemoteOf(this.workingCopy));
-      const origin = url !== undefined ? urlOrigin(url) : undefined;
+      const origin = url !== undefined ? strictUrlOrigin(url) : undefined;
       origins = origin !== undefined ? [origin] : [];
     }
     this.authPolicy = createSubmoduleAuthPolicy({
@@ -588,8 +609,7 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
         ...(depth !== undefined ? { depth } : {}),
         references: this.references,
         requireInit: this.requireInit,
-        ...(this.transports ? { transports: this.transports } : {}),
-        authFor: await this.auth(),
+        transports: await this.guardedTransports(),
         ...(this.timeout !== undefined ? { timeout: this.timeout } : {}),
       });
       return true;
@@ -722,17 +742,13 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
     target?: { remote: string; id: ObjectId },
   ): Promise<boolean> {
     const fetch = new FetchCommand(inner);
-    if (this.transports) fetch.setTransports(this.transports);
+    fetch.setTransports(await this.guardedTransports());
     if (this.timeout !== undefined) fetch.setTimeout(this.timeout);
     if (this.depth) fetch.setDepth(this.depth);
     // the remote named, so its URL is known: `git fetch` alone fetches the default remote
     const remote = target?.remote ?? (await defaultRemoteOf(inner));
     fetch.setRemote(remote);
     if (target) fetch.setRefSpecs(target.id);
-    const url = RemoteConfigStore.from(inner).remoteUrlOf(remote);
-    const auth = (await this.auth())(url);
-    if (auth.credentials) fetch.setCredentials(auth.credentials);
-    if (auth.headers) fetch.setHeaders(auth.headers);
     try {
       const result = await fetch.call();
       if (!quiet) {

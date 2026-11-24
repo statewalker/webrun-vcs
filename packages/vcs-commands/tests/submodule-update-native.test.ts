@@ -24,8 +24,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createGitFilesBackend } from "@statewalker/vcs-store-files";
 import {
   createDefaultTransports,
+  createFetchHandler,
   createRepositoryFacade,
   createTransportRefStore,
   type GitConnectRequest,
@@ -33,13 +35,20 @@ import {
   serveOverDuplex,
 } from "@statewalker/vcs-transport";
 import {
+  createNodeFilesApi,
   createNodeGitHostEnvironment,
   createNodeHookRunner,
 } from "@statewalker/vcs-utils-node/files";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { createDuplexPair, openLocalRemote } from "../src/commands/local-transport.js";
-import { type Git, SubmoduleCommandError, type SubmoduleCommandResult } from "../src/index.js";
+import {
+  type Git,
+  SubmoduleCommandError,
+  type SubmoduleCommandResult,
+  strictUrlOrigin,
+} from "../src/index.js";
+import { serveOnLoopback } from "./http-loopback-support.js";
 import { openOurs } from "./merge-native-helpers.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import { gitAtLeast } from "./native-git-working-copy.js";
@@ -824,5 +833,203 @@ describeGit("git submodule update through the superproject's transports", () => 
       "evil.example/deep - -",
       "evil.example/deeper - -",
     ]);
+  });
+});
+
+/** A smart-HTTP server of `<twin>/<repo>` repositories, recording each request's secrets. */
+interface RecordingServer {
+  origin: string;
+  /** `<path> <Authorization or -> <X-Token or ->` per request */
+  seen: string[];
+  close(): Promise<void>;
+}
+
+/**
+ * Serves the repositories of `twin` over real HTTP on loopback; paths under `/moved/`
+ * redirect (307, the method and body kept) to `redirectTo` with the rest of the path, when given.
+ */
+async function recordingServer(
+  twin: () => string,
+  redirectTo?: () => string,
+): Promise<RecordingServer> {
+  const seen: string[] = [];
+  const handler = createFetchHandler({
+    resolveRepository: async (repoPath) => {
+      const name = repoPath.replace(/^\/+|\/+$/g, "");
+      if (!/^[a-z]+$/.test(name)) return null;
+      const files = createNodeFilesApi({ rootDir: join(twin(), name) });
+      const { history } = await createGitFilesBackend({ files, gitDir: ".git" });
+      return {
+        repository: createRepositoryFacade({ history }),
+        refStore: createTransportRefStore(history.refs),
+      };
+    },
+  });
+  const server = await serveOnLoopback(async (request) => {
+    const url = new URL(request.url);
+    seen.push(
+      `${url.pathname} ${request.headers.get("authorization") ?? "-"} ${request.headers.get("x-token") ?? "-"}`,
+    );
+    if (redirectTo && url.pathname.startsWith("/moved/")) {
+      const rest = url.pathname.slice("/moved".length) + url.search;
+      return new Response(null, { status: 307, headers: { location: `${redirectTo()}${rest}` } });
+    }
+    return handler(request);
+  });
+  return { origin: server.baseUrl, seen, close: () => server.close() };
+}
+
+const HTTP_SECRET = { username: "alice", password: "secret" };
+const HTTP_HEADERS = { "X-Token": "token-for-trusted" };
+const BASIC_ALICE = `Basic ${btoa("alice:secret")}`;
+
+describeGit("git submodule update over HTTP: credentials never leave their origin", () => {
+  let trusted: RecordingServer;
+  let evil: RecordingServer;
+  let t: Twins;
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "submodule-update-http-"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  /**
+   * `deep`, `up` (with `deep` at `<deepUrl>`), `sup` and `clone` (remote
+   * `<trusted>/sup`, `sub` at `<subUrl>`); `$T`/`$E` in the URLs are the two servers'
+   * `127.0.0.1:<port>`.
+   */
+  async function setup(subUrl: string, deepUrl = "../deep"): Promise<void> {
+    let dir = "";
+    evil = await recordingServer(() => dir);
+    trusted = await recordingServer(
+      () => dir,
+      () => evil.origin,
+    );
+    const fill = (u: string) =>
+      u.replace(/\$T/g, trusted.origin.slice(7)).replace(/\$E/g, evil.origin.slice(7));
+    t = twins(`
+git init -q -b main deep; (cd deep; echo d > d; git add d; git commit -qm d)
+git init -q -b main up; (cd up; echo x > x; git add x; git commit -qm x
+  git submodule add -q ../deep deep
+  git config -f .gitmodules submodule.deep.url '${fill(deepUrl)}'; git add .gitmodules
+  git commit -qm deep)
+git init -q -b main sup; (cd sup; echo a > a; git add a; git commit -qm a
+  git submodule add -q ../up sub; git commit -qm sub)
+git clone -q sup clone; git -C clone remote set-url origin '${trusted.origin}/sup'
+git -C clone config -f .gitmodules submodule.sub.url '${fill(subUrl)}'
+`);
+    dir = t.ours;
+  }
+
+  afterEach(async () => {
+    await trusted?.close();
+    await evil?.close();
+  });
+
+  async function update(): Promise<SubmoduleCommandResult> {
+    const env = {
+      ...testEnv(root),
+      GIT_CONFIG_PARAMETERS: "'protocol.file.allow'='always' 'protocol.http.allow'='always'",
+    };
+    const g = await ours(t, "clone", env);
+    return oursRun(() =>
+      g
+        .submoduleUpdate()
+        .setInit(true)
+        .setRecursive(true)
+        .setCredentials(HTTP_SECRET)
+        .setHeaders(HTTP_HEADERS)
+        .call(),
+    );
+  }
+
+  const leaked = (s: RecordingServer) => s.seen.filter((line) => !line.endsWith(" - -"));
+
+  it("the superproject's origin gets them, at depth 1 and 2", async () => {
+    await setup("../up", "http://$T/deep");
+    const result = await update();
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(trusted.seen.length).toBeGreaterThan(0);
+    for (const line of trusted.seen) expect(line).toMatch(` ${BASIC_ALICE} token-for-trusted`);
+  });
+
+  it("a backslash in the authority (WHATWG reads it as `/`): nothing reaches the other host", async () => {
+    await setup("http://$E\\@$T/up");
+    await update();
+    expect(evil.seen.length).toBeGreaterThan(0);
+    expect(leaked(evil)).toEqual([]);
+    await t2(() => setup("../up", "http://$E\\@$T/deep"));
+  });
+
+  /**
+   * Runs a second setup in the same test (depth 2: the nested URL the crafted one) and
+   * checks no request carried a secret to the other host (nor, with `clean`, to any host).
+   */
+  async function t2(again: () => Promise<void>, clean = false): Promise<void> {
+    await trusted.close();
+    await evil.close();
+    await again();
+    await update();
+    expect(leaked(evil)).toEqual([]);
+    if (clean) expect(leaked(trusted).filter((l) => !l.startsWith("/up/"))).toEqual([]);
+  }
+
+  it("`%2f`/`%40`/`%3a` in the authority: no secret reaches either host for that URL", async () => {
+    await setup("http://$E%2f@$T/up");
+    await update();
+    expect(leaked(evil)).toEqual([]);
+    expect(leaked(trusted)).toEqual([]);
+    await t2(() => setup("../up", "http://$E%40$T/deep"), true);
+    await t2(() => setup("../up", "http://$E%3a@$T/deep"), true);
+  });
+
+  it("userinfo holding `@`: no secret reaches either host for that URL", async () => {
+    await setup("http://a@$E@$T/up");
+    await update();
+    expect(leaked(evil)).toEqual([]);
+    expect(leaked(trusted)).toEqual([]);
+    await t2(() => setup("../up", "http://a@$E@$T/deep"), true);
+    await t2(() => setup("../up", "http://a@$T@$E/deep"), true);
+  });
+
+  it("a redirect from the trusted server to another origin goes there without them", async () => {
+    await setup("http://$T/moved/up");
+    const result = await update();
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(
+      trusted.seen.some((line) => line.startsWith("/moved/up/") && line.includes(BASIC_ALICE)),
+    ).toBe(true);
+    expect(evil.seen.length).toBeGreaterThan(0);
+    expect(leaked(evil)).toEqual([]);
+    await t2(() => setup("../up", "http://$T/moved/deep"));
+  });
+
+  it("strictUrlOrigin: one origin from git's and WHATWG's parses, none where they could differ", () => {
+    expect(strictUrlOrigin("HTTPS://user@Git.Example.com:443/x.git")).toBe(
+      "https://git.example.com",
+    );
+    expect(strictUrlOrigin("http://h:8080/x")).toBe("http://h:8080");
+    expect(strictUrlOrigin("git@example.com:org/x.git")).toBe("ssh://example.com");
+    expect(strictUrlOrigin("ssh://git@example.com:22/x")).toBe("ssh://example.com");
+    expect(strictUrlOrigin("git://example.com:9419/x")).toBe("git://example.com:9419");
+    for (const url of [
+      "http://127.0.0.1:1\\@localhost:2/up",
+      "http://evil%2f@trusted/x",
+      "http://evil%40trusted/x",
+      "http://a@b@trusted/x",
+      "http://tr usted/x",
+      "http://trüsted/x",
+      "http://trusted\t/x",
+      "ssh://evil.example%2f@trusted.example/x",
+      "ssh://evil.example\\@trusted.example/x",
+      "git://evil%2f@trusted/x",
+      "evil%2f@trusted:x",
+      "https::https://trusted/x",
+      "file:///srv/x",
+      "../up",
+      "/srv/x",
+    ]) {
+      expect(strictUrlOrigin(url), url).toBeUndefined();
+    }
   });
 });
