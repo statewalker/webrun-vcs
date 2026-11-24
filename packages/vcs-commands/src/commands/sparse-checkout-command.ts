@@ -47,6 +47,7 @@ import {
   sparseWarningText,
   updateSparsity,
 } from "./sparse-checkout-support.js";
+import { SPARSE_INDEX_EXPANDED_HINT } from "./sparse-index-view.js";
 
 /** What a `git sparse-checkout` command did. */
 export interface SparseCheckoutResult {
@@ -773,15 +774,7 @@ export class SparseCheckoutCommand extends GitCommand<SparseCheckoutResult> {
     const config = this.workingCopy.config as { get?(key: string): unknown } | undefined;
     const value = String(config?.get?.("advice.sparseIndexExpanded") ?? "true").toLowerCase();
     if (["false", "no", "off", "0"].includes(value)) return;
-    this.err +=
-      "hint: The sparse index is expanding to a full index, a slow operation.\n" +
-      "hint: Your working directory likely has contents that are outside of\n" +
-      "hint: your sparse-checkout patterns. Use 'git sparse-checkout list' to\n" +
-      "hint: see your sparse-checkout definition and compare it to your working\n" +
-      "hint: directory contents. Cleaning up any merge conflicts or staged\n" +
-      "hint: changes before running 'git sparse-checkout clean' or 'git\n" +
-      "hint: sparse-checkout reapply' may assist in this cleanup.\n" +
-      'hint: Disable this message with "git config set advice.sparseIndexExpanded false"\n';
+    this.err += `${SPARSE_INDEX_EXPANDED_HINT.join("\n")}\n`;
   }
 
   /** set_config: the worktree's config (init_worktree_config first) */

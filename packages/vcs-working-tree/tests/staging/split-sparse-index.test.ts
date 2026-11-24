@@ -286,7 +286,7 @@ describe("sparse index writes stand for the full index", () => {
     const read = createGitStaging(files, ".git/index");
     read.setIndexHost?.(host);
     await read.read();
-    expect(read.indexLayout?.()).toEqual({ split: false, sparse: true });
+    expect(read.indexLayout?.()).toMatchObject({ split: false, sparse: true });
     const ita = entry("out/new.txt", 7, { ...sw, intentToAdd: true, objectId: EMPTY_TREE });
     await read.setEntry(ita);
     await read.write();

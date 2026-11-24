@@ -572,6 +572,14 @@ export class IndexFile {
     return this.sparseDirs !== undefined;
   }
 
+  /**
+   * The sparse directory entries (`out/`) of the index as read (or last written), in index
+   * order; undefined when it was no sparse index.
+   */
+  get sparseDirectories(): readonly string[] | undefined {
+    return this.sparseDirs;
+  }
+
   /** Whether the index was read (or last written) as a split index. */
   get isSplit(): boolean {
     return this.split !== undefined;

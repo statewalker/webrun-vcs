@@ -38,6 +38,7 @@ import type {
   GitHostEnvironment,
   GitlinkHeadState,
   IgnoreManager,
+  IgnoreNode,
   NestedRepositoryState,
   NewHasher,
   OpenedRepository,
@@ -56,6 +57,7 @@ import type {
 } from "@statewalker/vcs-working-tree";
 import {
   attributesIndexOfTree,
+  createCommandLineExcludes,
   createIgnoreManager,
   hashWorktreeFile,
   MemoryCheckout,
@@ -314,6 +316,9 @@ export class FileWorktree implements Worktree {
         enterNonRepositoryGitDirs: options?.enterNonRepositoryGitDirs === true,
         onUnreadable: options?.onUnreadable,
         skipFile: options?.skipFile,
+        ...(options?.excludePatterns?.length
+          ? { commandLine: createCommandLineExcludes(options.excludePatterns) }
+          : {}),
       },
     );
   }
@@ -432,6 +437,7 @@ export class FileWorktree implements Worktree {
       enterNonRepositoryGitDirs: boolean;
       onUnreadable?: (path: string, error?: unknown) => void;
       skipFile?: (path: string) => boolean;
+      commandLine?: IgnoreNode;
     } = {
       enterNonRepositoryGitDirs: false,
     },
@@ -491,7 +497,7 @@ export class FileWorktree implements Worktree {
         if (skipFile(entryPath)) continue;
       }
 
-      const isIgnored = this.ignoreManager.isIgnored(entryPath, isDirectory);
+      const isIgnored = this.ignoreManager.isIgnored(entryPath, isDirectory, extra.commandLine);
 
       if (isIgnored && !includeIgnored) {
         continue;

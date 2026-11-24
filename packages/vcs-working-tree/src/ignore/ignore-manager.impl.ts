@@ -17,6 +17,7 @@ import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 import type { IgnoreManager, IgnoreNode, MatchResultValue } from "./ignore-manager.js";
 import { MatchResult } from "./ignore-manager.js";
 import { createIgnoreNode } from "./ignore-node.js";
+import { createIgnoreRule } from "./ignore-rule.js";
 
 /**
  * Options for creating a GitIgnoreManager.
@@ -33,6 +34,44 @@ export interface GitIgnoreManagerOptions {
  */
 export function createIgnoreManager(options?: GitIgnoreManagerOptions): IgnoreManager {
   return new GitIgnoreManagerImpl(options);
+}
+
+/**
+ * git's `EXC_CMDL` pattern list: rules given on the command line (`git clean -e <pattern>`),
+ * each taken whole as `add_pattern` takes it (no comment lines, no trailing-space trimming),
+ * relative to the top of the worktree. Pass it to {@link IgnoreManager.isIgnored} (or a
+ * walk's `excludePatterns`): it is asked before the `.gitignore` files and exclude files.
+ *
+ * @example
+ * ```typescript
+ * const cmdl = createCommandLineExcludes(["*.o", "!keep.o"]);
+ * commandLineExcluded(cmdl, "a.o", false); // true
+ * ```
+ */
+export function createCommandLineExcludes(patterns: readonly string[]): IgnoreNode {
+  const rules = patterns.filter((p) => p.length > 0).map((p) => createIgnoreRule(p));
+  return createIgnoreNode(rules.filter((rule) => !rule.isEmpty));
+}
+
+/**
+ * Whether command-line rules alone exclude `path`: the path itself, or one of its leading
+ * directories (git's `prep_exclude` keeps an excluded directory's pattern for everything
+ * below it). What `git clean -x -e <pattern>` asks, with no standard excludes set up.
+ */
+export function commandLineExcluded(
+  node: IgnoreNode,
+  path: string,
+  isDirectory: boolean,
+  ignoreCase = false,
+): boolean {
+  const parts = path.split("/").filter((p) => p.length > 0);
+  for (let k = 1; k <= parts.length; k++) {
+    const last = k === parts.length;
+    if (node.checkIgnored(parts.slice(0, k).join("/"), last ? isDirectory : true, ignoreCase)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -66,27 +105,37 @@ class GitIgnoreManagerImpl implements IgnoreManager {
     }
   }
 
-  isIgnored(path: string, isDirectory: boolean): boolean {
-    const status = this.getStatus(path, isDirectory);
+  isIgnored(path: string, isDirectory: boolean, commandLine?: IgnoreNode): boolean {
+    const status = this.getStatus(path, isDirectory, commandLine);
     return status === MatchResult.IGNORED;
   }
 
-  getStatus(path: string, isDirectory: boolean): MatchResultValue {
+  getStatus(path: string, isDirectory: boolean, commandLine?: IgnoreNode): MatchResultValue {
     // Normalize path (remove leading/trailing slashes)
     const normalizedPath = this.normalizePath(path);
     // a path inside an ignored directory is ignored, whatever its own rules say (git never
     // descends into an excluded directory, so nothing in it can be re-included)
     const parts = normalizedPath.split("/");
     for (let k = 1; k < parts.length; k++) {
-      if (this.statusOf(parts.slice(0, k).join("/"), true) === MatchResult.IGNORED) {
+      const dir = parts.slice(0, k).join("/");
+      if (this.statusOf(dir, true, commandLine) === MatchResult.IGNORED) {
         return MatchResult.IGNORED;
       }
     }
-    return this.statusOf(normalizedPath, isDirectory);
+    return this.statusOf(normalizedPath, isDirectory, commandLine);
   }
 
   /** The status of `normalizedPath` by the rules alone, its directories not considered. */
-  private statusOf(normalizedPath: string, isDirectory: boolean): MatchResultValue {
+  private statusOf(
+    normalizedPath: string,
+    isDirectory: boolean,
+    commandLine?: IgnoreNode,
+  ): MatchResultValue {
+    // the command line's rules first (last_matching_pattern_from_lists: EXC_CMDL)
+    if (commandLine) {
+      const result = commandLine.checkIgnored(normalizedPath, isDirectory, this.ignoreCase);
+      if (result !== undefined) return result ? MatchResult.IGNORED : MatchResult.NOT_IGNORED;
+    }
     // Check directory-specific nodes first (most specific to least)
     for (const dirNode of this.directoryNodes) {
       // Only check if this path is under this directory

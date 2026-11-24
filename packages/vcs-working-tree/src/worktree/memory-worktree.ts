@@ -12,6 +12,7 @@
 import type { Blobs, ObjectId, Trees } from "@statewalker/vcs-core";
 import { FileMode } from "@statewalker/vcs-core";
 import { createSha1 } from "@statewalker/vcs-utils/hash/hasher";
+import { commandLineExcluded, createCommandLineExcludes } from "../ignore/index.js";
 import {
   type AttributesIndex,
   attributesIndexOfTree,
@@ -116,12 +117,18 @@ export class MemoryWorktree implements Worktree {
 
     // Sort paths
     const sortedPaths = Array.from(paths).sort();
+    // the command line's exclude rules (EXC_CMDL), asked before the worktree's own
+    const commandLine = options?.excludePatterns?.length
+      ? createCommandLineExcludes(options.excludePatterns)
+      : undefined;
 
     for (const path of sortedPaths) {
       const isFile = this.files.has(path);
       const isDirectory = !isFile;
 
-      const isIgnored = this.isIgnoredPath(path, isDirectory);
+      const isIgnored =
+        (commandLine && commandLineExcluded(commandLine, path, isDirectory)) ||
+        this.isIgnoredPath(path, isDirectory);
       if (isIgnored && !includeIgnored) {
         continue;
       }
