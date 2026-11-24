@@ -1,5 +1,126 @@
 # @statewalker/vcs-working-tree
 
+## 0.8.0
+
+### Minor Changes
+
+- 8b49aa7: `git config`'s write side as a library command, `git.config()` (`ConfigCommand`): get, set, `--add`, unset, `--replace-all` / `--unset-all` with value patterns (`--value`, `--fixed-value`, the legacy positional pattern), `--comment`, `rename-section` and `remove-section`, on the repository's file or a scope's (`--local`, `--worktree`, `--global`, `--system`, `--file`), with git's exit statuses and messages. The file edits (`setConfigMultivarInFile`, `renameConfigSectionInFile` in vcs-store-files) port config.c's `repo_config_set_multivar_in_file_gently`, `maybe_remove_section` and `repo_config_copy_or_rename_section_in_file` over the parser's event offsets, under `<file>.lock`, following symbolic links. `GitHostEnvironment.hostFilesOf` (Node: `createNodeGitHostEnvironment`) gives the storage of host paths for global, system and absolute `--file` writes; `GitWorkingCopyConfig` exposes `configFiles`, `filePath` and `worktreeFilePath`, and `configFilesApiOf` the FilesApi under it.
+- 7fc3415: `git tag -s`, `-u <keyid>`, `tag.gpgSign` and `tag.forceSignAnnotated` now sign the tag through
+  the host's signer (`GitHostEnvironment.signer`), as builtin/tag.c's `do_sign`: the signature is
+  appended to the tag message, with `gpg.format` (openpgp, x509, ssh), `user.signingKey` and
+  `gpg.ssh.defaultKeyCommand` resolved as for `commit -S`. A failed signing dies as git (`error:
+  unable to sign the tag`, `The tag message has been left in .git/TAG_EDITMSG`, exit 128); under 2.43
+  compatibility a failing ssh-keygen leaves the tag unsigned with its error in `warnings`, as git 2.43
+  does (`SigningOutcome.exitCode`, set by `createNodeSigner`). Re-editing a signed tag with `-f`
+  starts from its message without the signature (`write_tag_body`); `signatureStart` is exported
+  from the ref filter.
+- ffc1814: Signed commits (statewalker/statewalker-root#288). A host now supplies a signer, `GitHostEnvironment.signer`, and `commit -S` (`setSign`, `setSigningKey`, `commit.gpgSign`) signs through it. The signature goes in the commit's `gpgsig` header, or `gpgsig-sha256` in a SHA-256 repository, byte for byte as git writes it.
+  
+  - The commands resolve what git's `sign_buffer` would run and pass it to the signer as a `SigningRequest`: the format, the program, the key and the payload. They read `gpg.format`, `gpg.program`, `gpg.<format>.program`, `user.signingKey` (default: the committer's `Name <email>` for openpgp and x509) and `gpg.ssh.defaultKeyCommand`. A bad variable dies as git dies.
+  - `createNodeSigner` (vcs-utils-node) runs gpg, gpgsm or ssh-keygen as git does, with the same arguments, stdin, `--status-fd=2` and `SIG_CREATED` check, and reports failures with git's messages.
+  - `createSshSigner` (vcs-commands) signs in-process with an Ed25519 OpenSSH key through Web Crypto. Its signatures are ssh-keygen's byte for byte.
+  
+  Without a signer, a request to sign is still refused as before. Tags, merge and pick commits made in-process (the merge/pick/rebase/am family) and push certificates still refuse; their own tickets will add signing. Commits these commands leave to `git commit` (`merge --continue`, an edited or resolved pick or revert) go through `commit` and sign.
+- 97746b8: `git rm -q`/`--quiet` (`RmCommand.setQuiet`) and git's `rm '<path>'` lines in `RmResult.output` (dry runs too, one per index entry, a sparse directory `--sparse` removes whole as `out/`); `git clean -e <pattern>` (`CleanCommand.setExcludePatterns`: command-line exclude rules asked before the standard ones, the only ones under `-x`); `git add --sparse` (`AddCommand.setSparse`). `add --ignore-errors` reports an unreadable file as git does (`error: open("<path>"): Permission denied`, `error: unable to index file '<path>'`). `rm`, `add` and `--renormalize` see a sparse index as git does (sparse directories kept collapsed unless a pathspec or a sparse directory on disk expands it, with 2.5x's `advice.sparseIndexExpanded` hint), and a failed `add --chmod` exits 255 as git. vcs-working-tree: `WorktreeWalkOptions.excludePatterns`, `createCommandLineExcludes`/`commandLineExcluded`, an `IgnoreManager.isIgnored` command-line argument, and `Staging.indexLayout().sparseDirectories`.
+- fce4dfb: `git submodule absorbgitdirs [--quiet] [<path>...]` (statewalker/statewalker-root#329):
+  `git.submoduleAbsorbGitDirs()` moves each submodule's embedded `.git` directory into the
+  superproject's git directory (`.git/modules/<name>`, or `submodule.<name>.gitdir` under
+  `extensions.submodulePathConfig`) and leaves a gitfile and `core.worktree`, then does the same in
+  nested submodules (git's `absorb_git_dir_into_superproject` and its child run per submodule), and
+  rewrites a nested gitfile that no longer names a repository. The move runs first and its result
+  is checked (`relocate_gitdir`), so a failure leaves the repository where git can still read it;
+  git's deaths (`could not lookup name`, more than one worktree, broken gitfiles, symlinked paths)
+  are reproduced, git's errno included (`could not migrate git directory ...: Directory not empty`).
+  Symbolic links are followed as git's `stat` follows them: a linked `.git/modules` and a `.git`
+  linked to a repository are migrated where they lead (`physicalFilesPath` resolves them through
+  the FilesApi's `lstat`/`readlink`); a link leading beyond the FilesApi is refused with git's
+  `could not create directory` line, nothing moved.
+  Leading directories are created as git's `safe_create_leading_directories` creates them
+  (`safeCreateLeadingDirectories`): a dangling link on the way refuses with git's line and its
+  target is never created; a loop is git's stat failure. `Worktree.openGitlink` takes `gitDir`, the
+  repository a caller found through a link the storage does not follow, so nested absorption
+  reaches a submodule whose `.git` or gitfile leads through a link. `git rm` removes a submodule
+  whose `.git` is a link (the link only) once it is absorbed. `submodule deinit` and `git rm` share this code: deinit now absorbs nested
+  submodules too, and `git rm` of a submodule holding a `.git` directory absorbs it before removing
+  it (`RmResult.messages` carries the `Migrating ...` lines, also in the result of an
+  `RmFailedError` raised afterwards; a failed absorb is an `RmFailedError` with exit 128), as git does. `modules/` is now looked
+  up in the worktree's own git directory (a linked worktree's `worktrees/<id>/modules/`), as git
+  keeps it per worktree.
+  
+  Migration and rollback: the layout written is git's own, and older webrun versions already read
+  submodules through gitfiles, so no reverse move is needed to go back.
+- 7f8b7d4: `git submodule add` as a library command (statewalker/statewalker-root#326): `git.submoduleAdd()`
+  (`SubmoduleAddCommand`: `setURI`, `setPath`, `setName`, `setBranch`, `setForce`, `setQuiet`,
+  `setReference`, `setDepth`, `setTransports`, `setCompatibility`) follows
+  builtin/submodule--helper.c's `module_add`: the repository cloned into `.git/modules/<name>` (or
+  `submodule.<name>.gitdir` under `extensions.submodulePathConfig`) with `GIT_PROTOCOL_FROM_USER=0`,
+  a gitfile and `core.worktree` linking it to its path, `checkout -f -q [-B <branch>
+  origin/<branch>]`, then `submodule.<name>.url`/`.active` in `.git/config`, `path`/`url`/`branch`
+  in `.gitmodules`, the gitlink and `.gitmodules` staged. Relative URLs resolve against the
+  superproject's remote; an existing repository at the path is added as it is; git's refusals and
+  messages (a path in the index, an ignored path without `-f`, a bad URL or name, a name another
+  path uses in 2.5x, a kept git directory without `-f`, a held index lock, `protocol.file.allow`)
+  are reproduced for 2.43 and 2.56. `Worktree.openGitlink` takes an `environment` to open the
+  submodule with. `git add`'s ignored-path advice now uses git 2.43's wording under 2.43
+  compatibility.
+- e38cea5: Signature verification (statewalker/statewalker-root#318): `GitHostEnvironment.verifier`
+  beside the signer, `createNodeVerifier` (runs gpg, gpgsm or ssh-keygen as git's
+  gpg-interface.c does) and `createSshVerifier` (Ed25519 in-process, honouring
+  `gpg.ssh.allowedSignersFile` validity dates and `gpg.ssh.revocationFile`). New commands
+  `git.verifyCommit()` and `git.verifyTag()` (`-v`, `--raw`); every `%G` placeholder checks the
+  signature; `log --show-signature` / `log.showSignature` (mergetags too); `merge` and `pull`
+  take `setVerifySignatures` (`merge.verifySignatures`) and refuse with git's messages.
+- 8d4bcd5: `git.worktreeAdd()` gets git's tracking options: `setTrack` (`--track`, `--track=inherit`,
+  `--no-track`, refused without a new branch), `setGuessRemote` (`--[no-]guess-remote`,
+  default `worktree.guessRemote`), and git's DWIM of a commit-ish that names no commit but one
+  remote-tracking branch (`checkout.defaultRemote` among several; 2.5x dies with git's advice on
+  an ambiguous name, `setCompatibility("2.43")` takes it for none, as 2.43 did). A new branch
+  now tracks its start as `git branch` does (`branch.autoSetupMerge`), printing
+  `branch 'x' set up to track 'r/x'.`; `WorktreeError.messages` carries what git prints before
+  dying.
+  
+  Relative worktree links (git 2.48+): `setRelativePaths` on `worktreeAdd()`, `worktreeMove()`
+  and `worktreeRepair()` (default `worktree.useRelativePaths`) write `gitdir` and the
+  worktree's `.git` file relative to each other and set `extensions.relativeWorktrees` (with
+  `core.repositoryformatversion = 1`), only on request. Repair rewrites links of the other kind
+  (`absolute/relative path mismatch`), so a repair without the option turns relative links back
+  into absolute ones; both link files are written together, as `write_worktree_linking_files`.
+  Under `setCompatibility("2.43")` the option is refused and repair rewrites only the file at
+  fault. `LinkedWorktrees.create` takes `relativePaths`, `move`/`repair` take
+  `WorktreeLinkOptions`; relative links are read everywhere. A version-0 repository with an
+  extension git does not know cannot be upgraded: relative add, move and repair are refused
+  before anything is written (`WorktreeFormatUpgradeError`, git's `cannot upgrade repository
+  format: unknown extension <name>`), and `RepositoryFormat.unknownExtensions` lists them.
+  
+  Checkout and switch: an ambiguous remote branch name prints git's
+  `advice.checkoutAmbiguousRemoteBranchName` hints (2.5x and 2.43 wordings), a name no ref has
+  dies `fatal: invalid reference: <name>`, and a branch created from a ref some remote fetches
+  outside `refs/remotes/` (`refs/repo_d/*`) tracks it, as git's `dwim_branch_start`
+  (statewalker/statewalker-root#320).
+
+### Patch Changes
+
+- e4e1a0f: gc takes its lock as `git gc` does (`lock_repo_for_gc`): `gc.pid` holds `<pid> <host>` and is written through `gc.pid.lock`. A young lock of another host or of a running process is held, while a dead process's lock, an unreadable one or one older than 12 hours is taken over. `git.gc()` now refuses with git's messages ("gc is already running on machine '<host>' pid <pid> (use --force if not)", or "Unable to create '.../gc.pid.lock': File exists"), and `setForce(true)` is `git gc --force`. Native git and ours now see each other's gc. `GitHostEnvironment.gcProcess` gives the pid, the host name and a process check; `createNodeGitHostEnvironment` fills it.
+  
+  gc keeps what concurrent writers need:
+  
+  - the prune checks each expired loose object's mtime again right before unlinking it, so a write that freshened it meanwhile keeps it (also `FileGcStrategy.prune`);
+  - the repack checks each old pack's mtime again right before removing it, so a pack freshened since the listing stays;
+  - the prune walks the refs again when they moved during the gc, as git's separate prune process does.
+- 0215d69: Checkout, switch, `read-tree -u`, `reset --hard`/`--mixed`/`--merge`/`--keep`, merge and clone now refuse a tree path that git's `verify_path` refuses the way git does, before anything is written. The message is `error: invalid path '<path>'` with the entry's full path, followed by the command's own lines and git's exit code. A tree entry with an empty name dies with `fatal: empty filename in tree entry`. Before this fix, these commands reported internal errors (`Tree entry name cannot be '..'`, `Invalid path: ... (contains .git)`), named the directory instead of the file, and `read-tree -u` and `reset` could remove files or move HEAD before refusing.
+  
+  `core.protectNTFS` (default true) and `core.protectHFS` (default true on macOS, as git, and also where the system is unknown) are now read by checkouts and by `git add`/`mv`/`rm`/`commit` index writes (`worktreePathRules`). `isValidWorktreePath` takes `protectNTFS` and `protectHFS` options; with both off it still refuses `.git` in any case, `.`, `..` and a symlinked `.gitmodules`. `protectHFSDefault(systemName)` gives the default (on for `Darwin` and for an unknown system). `FileWorktree` keeps both protections on, on every platform, and reports them as `capabilities.protects`; commands that write such a worktree check at least that strictly, before writing anything. Tree decoding errors are now `InvalidTreeEntryNameError`. `ReadTreeFailedError` exits 128, as `git read-tree` does.
+- Updated dependencies
+- Updated dependencies [99fa82a]
+- Updated dependencies [1feb9c3]
+- Updated dependencies [3bdea1f]
+- Updated dependencies [92d0fd5]
+- Updated dependencies [0215d69]
+- Updated dependencies [8bbc62f]
+- Updated dependencies [3df714c]
+  - @statewalker/vcs-core@0.8.0
+  - @statewalker/vcs-utils@0.8.0
+
 ## 0.7.0
 
 ### Minor Changes

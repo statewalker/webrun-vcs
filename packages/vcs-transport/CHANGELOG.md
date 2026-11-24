@@ -1,5 +1,68 @@
 # @statewalker/vcs-transport
 
+## 0.8.0
+
+### Minor Changes
+
+- 26fba0e: `git fetch`'s flags now match native git 2.43 and 2.56 (native twins in
+  `fetch-flags-native.test.ts`, from t5510, t5574 and t5553). `FetchCommand.setSetUpstream` is
+  `--set-upstream`: it writes `branch.<name>.remote`/`merge` through the branch-tracking code
+  `git branch -u` uses, or gives git's warnings. `--dry-run` now stores the fetched objects as git
+  does (no ref, no FETCH_HEAD), so it reports forced and refused updates as a real fetch would, and
+  it prints the auto-followed tags twice as git does. A fetch into the checked-out branch is refused
+  in a working copy without linked worktrees too. Under 2.5x, a fetch that is not atomic writes its
+  refs in one batch (`FetchClientOptions.batchNonAtomic`), and the reference-transaction hook hears
+  git's create-only transaction of `refs/remotes/<name>/HEAD`. Under 2.43, a refused update keeps
+  the padded summary column, and `--atomic` prints the empty `error: ` line.
+- b28bc6f: `git push -u`/`--set-upstream` (`PushCommand.setSetUpstream`, through `branch-tracking.ts`'s
+  `installTracking`, git's `branch 'x' set up to track 'origin/x'.` in
+  `PushResult.upstreamMessages`), `--follow-tags` and `push.followTags` (`setFollowTags`;
+  `PushClientOptions.followTags`, remote.c's `add_missing_tags`), and `--force-if-includes` and
+  `push.useForceIfIncludes` (`setForceIfIncludes`; `PushClientOptions.includesRemote`, the
+  `rejected-remote-updated` status, "remote ref updated since checkout"). Native twins for
+  `--force`, `+refspec` and every `--force-with-lease` form (t5523, t5516, t5533).
+- 112c5ce: `git.push()` follows `git push`'s ref modes and push options, checked against native git 2.43
+  and 2.56 (statewalker/statewalker-root#306). New setters: `setMirror` (`--mirror`, also
+  `remote.<name>.mirror`: every local ref pushed and forced, every other remote ref deleted),
+  `setDelete` (`--delete`, with `tag <name>`), `setCompatibility`. `push.default` follows
+  `setup_default_push_refspecs` with git's messages (no upstream, multiple upstreams, an upstream
+  of another name, a triangular workflow, a detached HEAD, `nothing`), `push.autoSetupRemote`, and
+  2.43's triangular check; a branch named alone goes where `remote.<name>.push` or (under
+  `upstream`) its upstream maps it. `--all`, `--tags`, `--delete` and `--mirror` refuse each other
+  and refspecs as each version does, the `tag` shorthand is read, push options come from
+  `push.pushOption` (an empty value clears them, a value-less one is fatal) when none are given,
+  and a refspec git refuses throws git's `error:` lines (exit 1). Pushing to a URL that is the push
+  URL of one configured remote updates that remote's tracking refs (2.5x). In vcs-transport,
+  receive-pack honours `receive.advertisePushOptions` (`advertisePushOptions`, off by default for
+  a served repository's config, as git), `PushClientOptions.mirror` mirrors, send-pack checks
+  `--atomic` and push options where git does (after the pre-push hook), and a push of nothing to
+  a remote without refs reports git's "No refs in common" (`PushClientResult.noRefsInCommon`).
+- 23af095: receive-pack now checks pushed objects as git does under `receive.fsckObjects` (else `transfer.fsckObjects`). Served repositories (`servedRepositoryOf`) and local pushes read `receive.fsck.<msg-id>` and `receive.fsck.skipList` in config order (`receiveFsckOf`). A pack the store unpacks is checked as unpack-objects `--strict` does; a kept pack is checked as index-pack `--strict` does. A refused pack is discarded with its quarantine. The client sees git's `remote: error: object <id>: <msg-id>: ...` lines, the unpack status `unpack-objects abnormal exit` or `index-pack abnormal exit`, and `unpacker error` for each ref. Unknown message ids warn, and a message type receive-pack cannot read kills it as git's does. `ReceivePackConfig.fsckObjects` carries the check in vcs-transport.
+  
+  receive-pack also reports the death of its connectivity check (`fatal: missing blob object ...`) on the progress channel. The push client records `error: remote unpack failed: <status>` in `PushResult.errors`, and keeps porcelain `Done` after a refused unpack over smart HTTP, as git's remote-curl helper does.
+  
+  A served repository's `receive.fsck.skipList` is read only inside its own git directories, as confined config includes are (`readConfinedFile` in vcs-store-files: symbolic links followed and checked, size cap). Any other path reads as unreadable (`could not open object name list`), so a repository's config cannot make the server read or echo another tenant's or the host's files. A local push into one's own repository reads the skip list as git does.
+- be8d9ef: Requests to sign are refused as native git refuses them when gpg cannot sign, since nothing signs objects yet. Before this, `TagCommand.setSigned(true)` wrote an unsigned annotated tag without a word, and `commit.gpgSign`, `tag.gpgSign` and `push.gpgSign` were ignored.
+  
+  A commit, merge, cherry-pick, revert, rebase or am that would sign a commit (`setSign(true)`, `setSigningKey(key)` or `commit.gpgSign=true`) now fails with git's lines (`error: gpg failed to sign the data:`, `(no gpg output)`, `fatal: failed to write commit object`, or the sequencer's variant) and git's exit status, at the point where git signs: no commit is made and no ref moves. A fast-forward signs nothing. The new error class is `SigningFailedError`, and `setSign(false)` is `--no-gpg-sign`.
+  
+  `git.tag()` with `setSigned(true)`, `setSigningKey(key)`, `tag.gpgSign` or `tag.forceSignAnnotated` fails with `error: unable to sign the tag` (exit 128), and writes no tag object or ref. `setSigned(false)` is `--no-sign`.
+  
+  `git.push()` takes `setSigned(true | false | "if-asked")` and reads `push.gpgSign`. A server without `push-cert` refuses a signed push with `fatal: the receiving end does not support --signed push`. An `if-asked` push to such a server goes ahead unsigned, with git's warning in `PushResult.warnings`. A server that takes certificates fails with `fatal: failed to sign the push certificate`, and nothing is sent. In vcs-transport, `PushClientOptions.signed`, `PushClientResult.warnings` and `PushCertificateError` carry these.
+
+### Patch Changes
+
+- Updated dependencies
+- Updated dependencies [99fa82a]
+- Updated dependencies [1feb9c3]
+- Updated dependencies [3bdea1f]
+- Updated dependencies [92d0fd5]
+- Updated dependencies [0215d69]
+- Updated dependencies [8bbc62f]
+- Updated dependencies [3df714c]
+  - @statewalker/vcs-core@0.8.0
+  - @statewalker/vcs-utils@0.8.0
+
 ## 0.7.0
 
 ### Minor Changes

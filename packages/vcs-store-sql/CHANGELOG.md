@@ -1,5 +1,38 @@
 # @statewalker/vcs-store-sql
 
+## 0.8.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-core crosses a breaking line
+  - @statewalker/vcs-utils crosses a breaking line
+  - @statewalker/vcs-working-tree crosses a breaking line
+
+### Patch Changes
+
+- Updated dependencies
+- Updated dependencies [99fa82a]
+- Updated dependencies [8b49aa7]
+- Updated dependencies [1feb9c3]
+- Updated dependencies [3bdea1f]
+- Updated dependencies [e4e1a0f]
+- Updated dependencies [92d0fd5]
+- Updated dependencies [0215d69]
+- Updated dependencies [7fc3415]
+- Updated dependencies [ffc1814]
+- Updated dependencies [97746b8]
+- Updated dependencies [fce4dfb]
+- Updated dependencies [7f8b7d4]
+- Updated dependencies [8bbc62f]
+- Updated dependencies [e38cea5]
+- Updated dependencies [3df714c]
+- Updated dependencies [8d4bcd5]
+  - @statewalker/vcs-core@0.8.0
+  - @statewalker/vcs-utils@0.8.0
+  - @statewalker/vcs-working-tree@0.8.0
+
 ## 0.7.0
 
 ### Minor Changes

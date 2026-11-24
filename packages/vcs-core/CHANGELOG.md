@@ -1,5 +1,39 @@
 # @statewalker/vcs-core
 
+## 0.8.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-utils crosses a breaking line
+
+### Patch Changes
+
+- 0215d69: Checkout, switch, `read-tree -u`, `reset --hard`/`--mixed`/`--merge`/`--keep`, merge and clone now refuse a tree path that git's `verify_path` refuses the way git does, before anything is written. The message is `error: invalid path '<path>'` with the entry's full path, followed by the command's own lines and git's exit code. A tree entry with an empty name dies with `fatal: empty filename in tree entry`. Before this fix, these commands reported internal errors (`Tree entry name cannot be '..'`, `Invalid path: ... (contains .git)`), named the directory instead of the file, and `read-tree -u` and `reset` could remove files or move HEAD before refusing.
+  
+  `core.protectNTFS` (default true) and `core.protectHFS` (default true on macOS, as git, and also where the system is unknown) are now read by checkouts and by `git add`/`mv`/`rm`/`commit` index writes (`worktreePathRules`). `isValidWorktreePath` takes `protectNTFS` and `protectHFS` options; with both off it still refuses `.git` in any case, `.`, `..` and a symlinked `.gitmodules`. `protectHFSDefault(systemName)` gives the default (on for `Darwin` and for an unknown system). `FileWorktree` keeps both protections on, on every platform, and reports them as `capabilities.protects`; commands that write such a worktree check at least that strictly, before writing anything. Tree decoding errors are now `InvalidTreeEntryNameError`. `ReadTreeFailedError` exits 128, as `git read-tree` does.
+- 8bbc62f: `git tag` creation and deletion follow git: `tag().setEdit()`/`setEditor()` (`-e`, git's
+  template and cleanup, the previous tag's body reused under `-f`), `setCreateReflog()`
+  (`--create-reflog`), `addTrailer()` (`--trailer`), `setCompatibility()`, and `callText()`
+  giving `Updated tag 'x' (was abc1234)` and the nested-tag advice; `tagDelete().callText()`
+  gives `Deleted tag 'x' (was abc1234)`, `error: tag 'x' not found.` and the exit status.
+  Refusals carry git's messages (`fatal: tag 'x' already exists`, `fatal: 'x' is not a valid
+  tag name.`, `fatal: no tag message?`); an annotated tag without a message and without an
+  editor now fails as `GIT_EDITOR=: git tag -a` does; a tag of a tree, blob or tag records its
+  real type; `tagDelete()` always deletes `refs/tags/<name>`, as git.
+  `tag -f` over a symbolic tag ref updates the ref it names, as git; a `tag -d` whose deletion
+  fails reports git's `could not delete references` lines (exit 1) after the others. Ref stores
+  create the reflogs of the symbolic refs an update goes through under `createReflog` (git's
+  REF_FORCE_CREATE_REFLOG reaching split_symref_update), not HEAD's when it only records its
+  branch's update (`reflogInChain`).
+- Updated dependencies [99fa82a]
+- Updated dependencies [1feb9c3]
+- Updated dependencies [3bdea1f]
+- Updated dependencies [92d0fd5]
+- Updated dependencies [3df714c]
+  - @statewalker/vcs-utils@0.8.0
+
 ## 0.7.0
 
 ### Minor Changes

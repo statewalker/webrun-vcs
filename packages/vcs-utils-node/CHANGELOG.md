@@ -1,5 +1,50 @@
 # @statewalker/vcs-utils-node
 
+## 0.8.0
+
+### Minor Changes
+
+- 8b49aa7: `git config`'s write side as a library command, `git.config()` (`ConfigCommand`): get, set, `--add`, unset, `--replace-all` / `--unset-all` with value patterns (`--value`, `--fixed-value`, the legacy positional pattern), `--comment`, `rename-section` and `remove-section`, on the repository's file or a scope's (`--local`, `--worktree`, `--global`, `--system`, `--file`), with git's exit statuses and messages. The file edits (`setConfigMultivarInFile`, `renameConfigSectionInFile` in vcs-store-files) port config.c's `repo_config_set_multivar_in_file_gently`, `maybe_remove_section` and `repo_config_copy_or_rename_section_in_file` over the parser's event offsets, under `<file>.lock`, following symbolic links. `GitHostEnvironment.hostFilesOf` (Node: `createNodeGitHostEnvironment`) gives the storage of host paths for global, system and absolute `--file` writes; `GitWorkingCopyConfig` exposes `configFiles`, `filePath` and `worktreeFilePath`, and `configFilesApiOf` the FilesApi under it.
+- 7fc3415: `git tag -s`, `-u <keyid>`, `tag.gpgSign` and `tag.forceSignAnnotated` now sign the tag through
+  the host's signer (`GitHostEnvironment.signer`), as builtin/tag.c's `do_sign`: the signature is
+  appended to the tag message, with `gpg.format` (openpgp, x509, ssh), `user.signingKey` and
+  `gpg.ssh.defaultKeyCommand` resolved as for `commit -S`. A failed signing dies as git (`error:
+  unable to sign the tag`, `The tag message has been left in .git/TAG_EDITMSG`, exit 128); under 2.43
+  compatibility a failing ssh-keygen leaves the tag unsigned with its error in `warnings`, as git 2.43
+  does (`SigningOutcome.exitCode`, set by `createNodeSigner`). Re-editing a signed tag with `-f`
+  starts from its message without the signature (`write_tag_body`); `signatureStart` is exported
+  from the ref filter.
+- ffc1814: Signed commits (statewalker/statewalker-root#288). A host now supplies a signer, `GitHostEnvironment.signer`, and `commit -S` (`setSign`, `setSigningKey`, `commit.gpgSign`) signs through it. The signature goes in the commit's `gpgsig` header, or `gpgsig-sha256` in a SHA-256 repository, byte for byte as git writes it.
+  
+  - The commands resolve what git's `sign_buffer` would run and pass it to the signer as a `SigningRequest`: the format, the program, the key and the payload. They read `gpg.format`, `gpg.program`, `gpg.<format>.program`, `user.signingKey` (default: the committer's `Name <email>` for openpgp and x509) and `gpg.ssh.defaultKeyCommand`. A bad variable dies as git dies.
+  - `createNodeSigner` (vcs-utils-node) runs gpg, gpgsm or ssh-keygen as git does, with the same arguments, stdin, `--status-fd=2` and `SIG_CREATED` check, and reports failures with git's messages.
+  - `createSshSigner` (vcs-commands) signs in-process with an Ed25519 OpenSSH key through Web Crypto. Its signatures are ssh-keygen's byte for byte.
+  
+  Without a signer, a request to sign is still refused as before. Tags, merge and pick commits made in-process (the merge/pick/rebase/am family) and push certificates still refuse; their own tickets will add signing. Commits these commands leave to `git commit` (`merge --continue`, an edited or resolved pick or revert) go through `commit` and sign.
+- e38cea5: Signature verification (statewalker/statewalker-root#318): `GitHostEnvironment.verifier`
+  beside the signer, `createNodeVerifier` (runs gpg, gpgsm or ssh-keygen as git's
+  gpg-interface.c does) and `createSshVerifier` (Ed25519 in-process, honouring
+  `gpg.ssh.allowedSignersFile` validity dates and `gpg.ssh.revocationFile`). New commands
+  `git.verifyCommit()` and `git.verifyTag()` (`-v`, `--raw`); every `%G` placeholder checks the
+  signature; `log --show-signature` / `log.showSignature` (mergetags too); `merge` and `pull`
+  take `setVerifySignatures` (`merge.verifySignatures`) and refuse with git's messages.
+
+### Patch Changes
+
+- e4e1a0f: gc takes its lock as `git gc` does (`lock_repo_for_gc`): `gc.pid` holds `<pid> <host>` and is written through `gc.pid.lock`. A young lock of another host or of a running process is held, while a dead process's lock, an unreadable one or one older than 12 hours is taken over. `git.gc()` now refuses with git's messages ("gc is already running on machine '<host>' pid <pid> (use --force if not)", or "Unable to create '.../gc.pid.lock': File exists"), and `setForce(true)` is `git gc --force`. Native git and ours now see each other's gc. `GitHostEnvironment.gcProcess` gives the pid, the host name and a process check; `createNodeGitHostEnvironment` fills it.
+  
+  gc keeps what concurrent writers need:
+  
+  - the prune checks each expired loose object's mtime again right before unlinking it, so a write that freshened it meanwhile keeps it (also `FileGcStrategy.prune`);
+  - the repack checks each old pack's mtime again right before removing it, so a pack freshened since the listing stays;
+  - the prune walks the refs again when they moved during the gc, as git's separate prune process does.
+- Updated dependencies [99fa82a]
+- Updated dependencies [1feb9c3]
+- Updated dependencies [3bdea1f]
+- Updated dependencies [92d0fd5]
+- Updated dependencies [3df714c]
+  - @statewalker/vcs-utils@0.8.0
+
 ## 0.7.0
 
 ### Minor Changes

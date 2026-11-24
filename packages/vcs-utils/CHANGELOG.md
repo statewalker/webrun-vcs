@@ -1,5 +1,76 @@
 # @statewalker/vcs-utils
 
+## 0.8.0
+
+### Minor Changes
+
+- 99fa82a: `git.config()` answers git's queries as native `git config` does, in the legacy options and in
+  2.46's `get`/`list` subcommands: `getRegexp`, `list`, `getUrlmatch` (`--get-urlmatch`,
+  `get --url=`), `getColor`, `getColorBool`, `setType` (`--type=bool|int|bool-or-int|bool-or-str|
+  path|expiry-date|color`: values canonicalised on get as `format_config`, on set/add as
+  `normalize_value`), `--default` with types, `setShowOrigin`, `setShowScope`, `setNameOnly`,
+  `setShowNames`, `setNullTerminated` (`-z`), `setIncludes`, `setBlob` (`--blob=<rev>:<path>`)
+  and `setCompatibility("2.43")` (`--list` ignoring `--type`, no `:(optional)` paths or `#rgb`
+  colors). vcs-utils gains git's URL matching (urlmatch.c: `normalizeUrl`, `matchUrls`,
+  `selectUrlMatches`) for `<section>.<url>.*` configuration. `GitWorkingCopyConfig` names a
+  relative include as git does (`.git/../include/x`) and takes `fileOnly` to read one file with
+  its includes (statewalker/statewalker-root#302).
+- 1feb9c3: Pickaxe in `git diff`, `git log` and `git show`, as git's diffcore-pickaxe.c: the new
+  `DiffTextOptions` `pickaxeString` (`-S<string>`, occurrence counts that differ; `pickaxeRegex`
+  for `--pickaxe-regex`), `pickaxeGrep` (`-G<regex>`, added or removed lines that match),
+  `findObjects` (`--find-object=<object>`, subtrees of a tree diff included), `pickaxeAll`
+  (`--pickaxe-all`) and `pickaxeIgnoreCase` (`-i`; `LogCommand.setRegexpIgnoreCase` sets it
+  too). Sides are read through textconv (`textconv: false` is `--no-textconv`), `-G` passes over
+  binary pairs unless `text`, regexes run through `compilePosixRegex` with `REG_NEWLINE`. The
+  pickaxe runs in diffcore's order: after rename detection, before `-O`, `--rotate-to` and
+  `--diff-filter`, on the queue `--relative` left. `git log` and `git show` hide commits whose
+  diff it empties and count `-n` in shown commits; combined diffs of merges take
+  find_paths_generic's way. A partial clone fetches each diff's absent blobs in one batch first,
+  as diffcore_std does. Option errors are git's (`cannot be used together`, `-S requires a
+  non-empty argument`, `unable to resolve`, `invalid regex`). `DiffPickaxe` is the engine.
+  
+  `compilePosixRegex`: GNU's buffer anchors (backslash-backquote, backslash-quote) no longer match
+  at line boundaries under `REG_NEWLINE`, and the start one matches a `REG_NOTBOL` subject's start,
+  as glibc's.
+- 3bdea1f: `git.diff()` gets the options that choose what a diff shows, byte for byte as git: the new
+  `DiffTextOptions` `diffFilter` (`--diff-filter=[ACDMRTUXB*]`, lowercase letters exclude, `*` all
+  or none), `relative` (`--relative[=<path>]`, `--no-relative`: paths outside the prefix are not
+  queued, names shown without it, attributes and `--summary` by the full path), `rotateTo` /
+  `skipTo` (`--rotate-to`, `--skip-to`; `git diff` dies on a path not in the diff, `git log` starts
+  at the next one) and `ignoreMatchingLines` (`-I<regex>`, POSIX extended regexes through
+  `compilePosixRegex`, as xdiff's `xdl_mark_ignorable_regex`). `setExitCode` (`--exit-code`) and
+  `setQuiet` (`--quiet`, which prints nothing and stops at the first difference) set `exitCode`
+  (git's `diff_result_code`, with `-w`/`-I` counting only pairs whose patch shows a change) and
+  `hasChanges`; `quietDetectsRenames` keeps git 2.43's rename detection under `--quiet`.
+  `setOldTree("A...B")` diffs from the merge base (git's warning when there are several, its
+  errors when there is none), `"A..B"` is `A B`, and `setMergeBase` is `--merge-base`. `git log`
+  takes `diffFilter` (only the commits whose filtered diff is not empty), `relative`,
+  `ignoreMatchingLines` and non-strict `rotateTo`/`skipTo` through `setDiffOptions`. `exitCodeFromContents` keeps git 2.43's exit status (every queued pair counts). In
+  vcs-utils, `UnifiedDiffOptions.ignoreRegex`, `markIgnorableRegex`, and `compilePosixRegex`'s
+  `newline` option (`REG_NEWLINE`) (statewalker/statewalker-root#313).
+- 3df714c: Word diff in `git diff`, `log -p` and `show`: `DiffTextOptions.wordDiff` (`--word-diff=plain|color|porcelain|none`, `color` is `--color-words` and turns colors on) and `wordDiffRegex` (`--word-diff-regex`, `--color-words=<regex>`), `diff.wordRegex` and `diff.<driver>.wordRegex`, with the builtin drivers' word regexes from userdiff.c (`BUILTIN_WORD_REGEXES`, `userdiffWordRegex`) run through `compilePosixRegex`. `driverCompatibility: "2.43"` selects git 2.43's builtin drivers (word and funcname patterns).
+
+### Patch Changes
+
+- 92d0fd5: `git.grep()` (`GrepCommand`) is `git grep` (builtin/grep.c, grep.c): the worktree's tracked
+  files, `--cached`, `--untracked`, `--no-index` (and `grepNoIndex` outside a repository), trees
+  and revisions (`<rev>:<path>` names, arguments read as git reads them with or without `--`).
+  Patterns `-e`/`-f` with `--and`/`--or`/`--not`/parentheses and `--all-match`, `-E`/`-F`/`-G`
+  (`-P` as a git without PCRE), `-i`, `-w`, `-v`; output `-n`, `-c`, `-l`/`-L`, `-o`, `--column`,
+  `-h`/`-H`, `--full-name`, `-z`, `--break`, `--heading`, `-q`, `-m`, context `-A`/`-B`/`-C`,
+  `-p`/`-W` through the diff driver's funcname pattern, `--color` with `color.grep.<slot>`;
+  `--max-depth`, pathspecs from the current directory (`setPrefix`), `grep.*` settings, binary
+  files (`-a`, `-I`, the `diff` attribute), `--textconv` through the installed runner, and git's
+  threaded output (`--threads`). `--recurse-submodules` is refused. `setCompatibility("2.43")`
+  follows 2.43's `-o` columns, `-W` trailing lines and expression errors.
+  
+  `compilePosixRegex`'s `exec` takes `REG_NOTBOL`, and an unterminated `[` at the pattern's end is
+  glibc's `REG_BADPAT` ("Invalid regular expression").
+  
+  `REG_ICASE` patterns no longer fold a copy of every subject they are run on: their character
+  sets take a lower-case byte as its upper case at compile time (glibc's translate table), and
+  back-references compare folded, so `git grep -i` with a regex is linear again.
+
 ## 0.7.0
 
 ### Minor Changes
