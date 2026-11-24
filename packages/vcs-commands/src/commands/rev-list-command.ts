@@ -78,6 +78,10 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   private cherryMark = false;
   /** `--count` */
   private count = false;
+  /** `--parents`: rev-list prints each commit's parents after it */
+  private printParents = false;
+  /** `--ancestry-path=<commit>` revisions, resolved when called */
+  private readonly ancestryPaths: string[] = [];
 
   /** What git prints while reading replace refs and grafts (see GitCommand). */
   override async replacementMessages(): Promise<string[]> {
@@ -259,6 +263,55 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   setCount(count: boolean): this {
     this.checkCallable();
     this.count = count;
+    return this;
+  }
+
+  /** `--full-history` (see `LogCommand.setFullHistory`). */
+  setFullHistory(fullHistory: boolean): this {
+    return this.configured((log) => log.setFullHistory(fullHistory));
+  }
+
+  /** `--simplify-merges` (see `LogCommand.setSimplifyMerges`). */
+  setSimplifyMerges(simplify: boolean): this {
+    return this.configured((log) => log.setSimplifyMerges(simplify));
+  }
+
+  /** `--simplify-by-decoration` (see `LogCommand.setSimplifyByDecoration`). */
+  setSimplifyByDecoration(simplify: boolean): this {
+    return this.configured((log) => log.setSimplifyByDecoration(simplify));
+  }
+
+  /** `--dense` (true) / `--sparse` (false) (see `LogCommand.setDense`). */
+  setDense(dense: boolean): this {
+    return this.configured((log) => log.setDense(dense));
+  }
+
+  /** `--show-pulls` (see `LogCommand.setShowPulls`). */
+  setShowPulls(showPulls: boolean): this {
+    return this.configured((log) => log.setShowPulls(showPulls));
+  }
+
+  /**
+   * `--parents` (see `LogCommand.setParents`): {@link callText} prints each commit's parents
+   * after its id, as git rev-list does.
+   */
+  setParents(parents: boolean): this {
+    this.printParents = parents;
+    return this.configured((log) => log.setParents(parents));
+  }
+
+  /** `--ancestry-path` (see `LogCommand.setAncestryPath`). */
+  setAncestryPath(ancestryPath: boolean): this {
+    return this.configured((log) => log.setAncestryPath(ancestryPath));
+  }
+
+  /**
+   * `--ancestry-path=<commit>` (see `LogCommand.addAncestryPath`): a revision naming a commit
+   * (`could not get commit for --ancestry-path argument <revision>` otherwise).
+   */
+  addAncestryPath(revision: string): this {
+    this.checkCallable();
+    this.ancestryPaths.push(revision);
     return this;
   }
 
@@ -491,7 +544,8 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
           else right++;
           continue;
         }
-        out += `${this.revisionMark(commit)}${commit.id}\n`;
+        const parents = this.printParents ? commit.parents.map((p) => ` ${p}`).join("") : "";
+        out += `${this.revisionMark(commit)}${commit.id}${parents}\n`;
       }
     }
     if (!this.count) return out;
@@ -582,6 +636,16 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
       log.setUseReplaceRefs(this.useReplaceRefsOverride);
     log.setLogConfig(this.logConfig);
     for (const configure of this.configure) configure(log);
+    // --ancestry-path=<commit>: setup_revisions reads it before the revisions
+    for (const name of this.ancestryPaths) {
+      const resolver = this.revisionResolver();
+      const id = await resolver.resolve(name, { hint: "committish" }).catch(() => undefined);
+      const commit = id !== undefined ? await resolver.commitReference(id) : undefined;
+      if (id === undefined || commit === undefined) {
+        throw new GitApiError(`could not get commit for --ancestry-path argument ${name}`);
+      }
+      log.addAncestryPath(id);
+    }
     // `--not` alone names no revision: git log falls back to HEAD (revs->def) as with none,
     // as it does after `--exclude=` alone or a `--stdin` that read nothing
     const named = (args: string[]) => args.some((arg) => arg !== "--not" && arg !== "--");
