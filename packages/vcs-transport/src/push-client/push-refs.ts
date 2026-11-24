@@ -32,6 +32,7 @@ export type PushRefStatus =
   | "rejected-needs-force"
   | "rejected-already-exists"
   | "rejected-stale"
+  | "rejected-remote-updated"
   | "rejected-nodelete"
   | "atomic-push-failed"
   | "remote-rejected"
@@ -126,6 +127,22 @@ export interface MatchPushRefsOptions {
    * deletions, the width of an object id given as a source
    */
   objectFormat?: ObjectFormat;
+  /**
+   * `--follow-tags` (git's `MATCH_REFS_FOLLOW_TAGS`, remote.c `add_missing_tags`): also push
+   * every local annotated tag the remote lacks whose commit the pushed values (or, for the
+   * remote refs not pushed, their current values) reach
+   */
+  followTags?: FollowTagsSource;
+}
+
+/** What `--follow-tags` asks of the local objects. */
+export interface FollowTagsSource {
+  /** Whether the object is an annotated tag (git's `odb_read_object_info` is `OBJ_TAG`) */
+  isTag(oid: string): Promise<boolean>;
+  /** The commit an object peels to; undefined for no commit or an object not here */
+  peelToCommit(oid: string): Promise<string | undefined>;
+  /** Which of `commits` are reachable from (or equal to) any of `tips` (git's get_reachable_subset) */
+  reachableSubset(tips: readonly string[], commits: readonly string[]): Promise<Set<string>>;
 }
 
 /** git's error for a short destination it cannot place (remote.c). */
@@ -345,6 +362,10 @@ export async function matchPushRefs(
     );
   }
 
+  if (options.followTags) {
+    await addMissingTags(options.followTags, local, remote, matched, ZERO_OID);
+  }
+
   // --prune: remote refs a pattern's destination (its source, without a colon) or ":" covers,
   // whose source is gone here (git's get_ref_match from the destination side)
   if (options.prune) {
@@ -364,6 +385,61 @@ export async function matchPushRefs(
     }
   }
   return [...matched.values()];
+}
+
+/**
+ * remote.c's `add_missing_tags`: the tips the remote will have once the push is done (each
+ * pushed value, else the remote ref's current one; commits here only), and the local annotated
+ * tags the remote has no ref of; each such tag whose commit one of those tips reaches is added,
+ * to the same name, unforced, in local ref order.
+ */
+async function addMissingTags(
+  source: FollowTagsSource,
+  local: LocalRefState,
+  remote: ReadonlyMap<string, string>,
+  matched: Map<string, MatchedPushRef>,
+  zero: string,
+): Promise<void> {
+  const tips = new Set<string>();
+  const dstTags = new Set<string>();
+  const addTip = async (oid: string | undefined) => {
+    if (!oid || isNullId(oid)) return;
+    const commit = await source.peelToCommit(oid);
+    if (commit) tips.add(commit);
+  };
+  for (const [name, oid] of remote) {
+    const m = matched.get(name);
+    await addTip(m && !isNullId(m.newOid) ? m.newOid : oid);
+    if (name.startsWith("refs/tags/")) dstTags.add(name);
+  }
+  for (const [name, m] of matched) {
+    if (remote.has(name)) continue;
+    // a new remote ref: its old value is the null id
+    await addTip(isNullId(m.newOid) ? undefined : m.newOid);
+    if (name.startsWith("refs/tags/")) dstTags.add(name);
+  }
+  const candidates: { name: string; oid: string; commit: string }[] = [];
+  for (const [name, oid] of local.refs) {
+    if (!name.startsWith("refs/tags/") || dstTags.has(name)) continue;
+    if (!(await source.isTag(oid))) continue;
+    const commit = await source.peelToCommit(oid);
+    if (commit) candidates.push({ name, oid, commit });
+  }
+  if (tips.size === 0 || candidates.length === 0) return;
+  const reachable = await source.reachableSubset(
+    [...tips],
+    candidates.map((c) => c.commit),
+  );
+  for (const c of candidates) {
+    if (!reachable.has(c.commit)) continue;
+    matched.set(c.name, {
+      remoteRef: c.name,
+      localRef: c.name,
+      newOid: c.oid,
+      oldOid: zero,
+      force: false,
+    });
+  }
 }
 
 /** What the push decides with: the local objects. */
@@ -403,6 +479,12 @@ export interface PushStatusOptions {
    * allows a non-fast-forward; one that does not is `rejected-stale` (unless forced).
    */
   leases?: ReadonlyMap<string, string>;
+  /**
+   * `--force-if-includes`: the leased remote refs whose remote-tracking value is in no
+   * reflog entry of the local ref (git's `unreachable`): `rejected-remote-updated` while the
+   * lease holds (unless forced)
+   */
+  unreachable?: ReadonlySet<string>;
 }
 
 /**
@@ -460,6 +542,7 @@ export async function setPushStatus(
     // one refuses it (unless forced anyway)
     if (expectedOid !== undefined) {
       if (expectedOid !== m.oldOid) reject = "rejected-stale";
+      else if (options.unreachable?.has(m.remoteRef)) reject = "rejected-remote-updated";
       else force = true;
     }
     update.force = force;
