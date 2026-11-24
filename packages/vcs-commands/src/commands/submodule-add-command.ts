@@ -5,31 +5,21 @@
  */
 import { FileMode } from "@statewalker/vcs-core";
 import type { GitTransportRegistry } from "@statewalker/vcs-transport";
-import type { FilesApi } from "@statewalker/vcs-utils/files";
-import { type GitHostEnvironment, wildmatch } from "@statewalker/vcs-working-tree";
+import { wildmatch } from "@statewalker/vcs-working-tree";
 
 import { GitApiError } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { AddCommand } from "./add-command.js";
 import { CheckoutCommand } from "./checkout-command.js";
-import { CloneCommand } from "./clone-command.js";
 import { checkSubmoduleName } from "./fsck/fsck-object-checks.js";
 import { commonGitFileOf } from "./git-hooks.js";
-import { hostEnvironmentOf } from "./git-ident.js";
-import { InitCommand } from "./init-command.js";
 import { DO_MATCH_DIRECTORY, matchPathspec, parsePathspec } from "./pathspec.js";
-import {
-  SubmoduleCommandBase,
-  SubmoduleCommandError,
-  type SubmoduleCommandResult,
-} from "./submodule-commands.js";
+import { SubmoduleCommandBase, type SubmoduleCommandResult } from "./submodule-commands.js";
 import {
   joinFilesPath,
   relativeFilesPath,
   resolveRelativeUrl,
-  setInConfigFile,
   submodulePathConfigOf,
-  urlIsLocalNotSsh,
   worktreeHostPath,
 } from "./submodule-model.js";
 
@@ -431,7 +421,11 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
       }
       this.out.stdout += `Reactivating local git directory for submodule '${name}'\n`;
     }
-    await this.cloneSubmodule(path, realrepo, gitDir, gitFiles, gitDirKind !== undefined);
+    await this.cloneSubmodule(path, realrepo, gitDir, gitFiles, gitDirKind !== undefined, {
+      ...(this.depth !== undefined ? { depth: this.depth } : {}),
+      ...(this.reference !== undefined ? { references: [this.reference] } : {}),
+      ...(this.transports ? { transports: this.transports } : {}),
+    });
 
     const inner = await worktree.openGitlink?.(path).catch(() => undefined);
     if (!inner) this.die(`fatal: unable to checkout submodule '${path}'`);
@@ -464,121 +458,6 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
       lines.push(`  ${remote}\t${urls[0] ?? ""}`);
     }
     return lines;
-  }
-
-  /**
-   * submodule--helper.c's `clone_submodule`: `git clone --no-checkout --separate-git-dir
-   * <gitdir> -- <url> <path>` with `GIT_PROTOCOL_FROM_USER=0` (or, with the git directory
-   * kept, its index dropped), then `connect_work_tree_and_git_dir`.
-   */
-  private async cloneSubmodule(
-    path: string,
-    realrepo: string,
-    gitDir: string,
-    gitFiles: FilesApi,
-    kept: boolean,
-  ): Promise<void> {
-    const worktree = this.worktreeAccess;
-    const files = worktree?.getFiles?.();
-    if (!worktree || !files) return;
-    const top = (await worktreeHostPath(this.workingCopy)) ?? "";
-    const hostPath = `${top}/${path}`;
-    const parentOf = (p: string) => p.slice(0, Math.max(0, p.lastIndexOf("/")));
-    const leadingOk = async (): Promise<boolean> => {
-      const parts = path.split("/");
-      for (let i = 1; i < parts.length; i++) {
-        const kind = await this.kindOf(parts.slice(0, i).join("/"));
-        if (kind !== undefined && kind !== "directory") return false;
-      }
-      return true;
-    };
-
-    if (!kept) {
-      // safe_create_leading_directories of the git directory
-      const parent = parentOf(gitDir);
-      if (parent) await gitFiles.mkdir(parent);
-      if ((await this.kindOf(path)) !== undefined) {
-        this.out.stderr += `fatal: destination path '${hostPath}' already exists and is not an empty directory.\n`;
-        this.die(`fatal: clone of '${realrepo}' into submodule path '${hostPath}' failed`);
-      }
-      if (!(await leadingOk())) {
-        this.out.stderr += `fatal: could not create leading directories of '${hostPath}': Not a directory\n`;
-        this.die(`fatal: clone of '${realrepo}' into submodule path '${hostPath}' failed`);
-      }
-      if (!this.quiet) this.out.stderr += `Cloning into '${hostPath}'...\n`;
-      const worktreeDir = this.filesPath(path);
-      const createdDir = (await this.kindOf(path)) === undefined;
-      const cleanup = async () => {
-        await gitFiles.remove(gitDir).catch(() => false);
-        if (createdDir) await files.remove(worktreeDir).catch(() => false);
-      };
-      try {
-        const environment = hostEnvironmentOf(this.workingCopy);
-        // git clone --separate-git-dir: a new repository there
-        const init = new InitCommand().setFilesApi(gitFiles).setGitDir(gitDir);
-        if (environment) init.setEnvironment(environment);
-        await init.call();
-        // create_default_files: a repository with a worktree logs its refs
-        await setInConfigFile(
-          this.workingCopy,
-          `${gitDir}/config`,
-          "core.logallrefupdates",
-          "true",
-        );
-        await worktree.connectGitlink?.(path, gitDir);
-        const inner = await worktree.openGitlink?.(path, {
-          // always: git-submodule.sh exports GIT_PROTOCOL_FROM_USER=0 whatever the host
-          // (without a host environment: one that reads no host files, as none does)
-          environment: notFromUser(environment ?? { readFile: async () => undefined }),
-        });
-        if (!inner) throw new GitApiError(`fatal: could not open the clone at '${hostPath}'`);
-        const clone = new CloneCommand(inner)
-          // the clone runs at the superproject's top: a relative path is read from there
-          .setURI(isLocalRelativePath(realrepo) ? `${top}/${realrepo}` : realrepo)
-          .setNoCheckout(true)
-          .setDirectory(hostPath);
-        if (this.depth !== undefined && this.depth > 0) clone.setDepth(this.depth);
-        if (this.reference !== undefined) clone.addReference(this.reference);
-        if (this.transports) clone.setTransports(this.transports);
-        clone.shareHooksOf(this);
-        const result = await clone.call();
-        if (!this.quiet) {
-          for (const line of result.messages ?? []) this.out.stderr += line;
-          const local =
-            !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(realrepo) &&
-            !(result.messages ?? []).some((m) => m.includes("ignoring --local"));
-          if (local) this.out.stderr += "done.\n";
-        }
-      } catch (error) {
-        if (error instanceof SubmoduleCommandError || !(error instanceof Error)) throw error;
-        await cleanup();
-        this.out.stderr += `${error.message}\n`;
-        this.die(`fatal: clone of '${realrepo}' into submodule path '${hostPath}' failed`);
-      }
-    } else {
-      if (!(await leadingOk())) {
-        this.die(`fatal: could not create directory '${hostPath}'`);
-      }
-      const parent = parentOf(path);
-      if (parent) await files.mkdir(this.filesPath(parent));
-      await gitFiles.remove(`${gitDir}/index`).catch(() => false);
-      // connect_work_tree_and_git_dir: the gitfile's directory is the path itself
-      const kind = await this.kindOf(path);
-      if (kind !== undefined && kind !== "directory") {
-        this.die(`fatal: could not create directories for ${hostPath}/.git`);
-      }
-    }
-
-    await worktree.connectGitlink?.(path, gitDir);
-
-    // submodule.alternateLocation and alternateErrorStrategy carried into the submodule
-    const store = RemoteConfigStore.from(this.workingCopy);
-    for (const key of ["submodule.alternateLocation", "submodule.alternateErrorStrategy"]) {
-      const value = store.value(key);
-      if (value !== undefined) {
-        await setInConfigFile(this.workingCopy, `${gitDir}/config`, key, value);
-      }
-    }
   }
 
   /** submodule--helper.c's `configure_added_submodule`. */
@@ -627,16 +506,4 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
       patterns.some((p) => wildmatch(p as string, path));
     if (!matched) await this.setConfig(`submodule.${name}.active`, "true");
   }
-}
-
-/** A local path that is not absolute (`../up`, a remote's relative URL resolved). */
-function isLocalRelativePath(url: string): boolean {
-  return !url.startsWith("/") && urlIsLocalNotSsh(url);
-}
-
-/** The environment with `GIT_PROTOCOL_FROM_USER=0` (git-submodule.sh exports it). */
-function notFromUser(environment: GitHostEnvironment): GitHostEnvironment {
-  return Object.create(environment, {
-    protocolFromUser: { value: false, enumerable: true },
-  }) as GitHostEnvironment;
 }
