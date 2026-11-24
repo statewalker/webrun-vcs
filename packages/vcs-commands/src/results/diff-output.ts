@@ -23,6 +23,10 @@
 
 import { type Blobs, probeBlob } from "@statewalker/vcs-core";
 import {
+  BUILTIN_FUNCNAME_PATTERNS,
+  BUILTIN_FUNCNAME_PATTERNS_2_43,
+  BUILTIN_WORD_REGEXES,
+  BUILTIN_WORD_REGEXES_2_43,
   ByteSink,
   bytesToHex,
   createSha1,
@@ -34,6 +38,7 @@ import {
   type UnifiedDiffResult,
   unifiedDiffHunks,
   userdiffFindFunction,
+  userdiffWordRegex,
   writeHunks,
   type XdiffAlgorithm,
 } from "@statewalker/vcs-utils";
@@ -47,6 +52,7 @@ import {
 import { WS_DEFAULT_RULE, WS_INCOMPLETE_LINE } from "../whitespace/index.js";
 import { gitBinaryPatch } from "./binary-patch.js";
 import { type ColoredHunk, type DiffColors, WSEH_NEW, writeColoredHunks } from "./diff-color.js";
+import { compileWordRegex, writeWordDiffHunks } from "./diff-words.js";
 import { quoteCStyleBody, quotePath, quoteTwo } from "./quote-path.js";
 
 /** One side of a file pair */
@@ -109,6 +115,8 @@ export interface DiffDriver {
   findFunction?: FindFunction;
   /** `diff.<name>.algorithm` */
   algorithm?: XdiffAlgorithm;
+  /** `diff.<name>.wordRegex`, or the builtin driver's word regex (extended POSIX) */
+  wordRegex?: Uint8Array;
   /** The driver's name (`diff=<name>`) */
   name?: string;
   /** `diff.<name>.textconv`: the command git would run to turn the content into text */
@@ -181,6 +189,19 @@ export interface DiffOutputOptions
    * `blank-at-eol,space-before-tab,blank-at-eof`
    */
   whitespaceRule?: (path: string) => Promise<number> | number;
+  /**
+   * `--word-diff=<mode>` (`--color-words` is `color`, which also turns `--color` on); unset
+   * or `none`, the patch shows lines
+   */
+  wordDiff?: "plain" | "color" | "porcelain" | "none";
+  /**
+   * `--word-diff-regex=<regex>` (`--color-words=<regex>`): what a word is, over the drivers'
+   * `wordRegex` and `diff.wordRegex` (extended POSIX, `REG_NEWLINE`); without `wordDiff`, it
+   * asks for the plain word diff
+   */
+  wordDiffRegex?: string;
+  /** `diff.wordRegex`: the word regex of a pair whose drivers give none */
+  defaultWordRegex?: string;
 }
 
 const S_IFMT = 0o170000;
@@ -198,6 +219,8 @@ const encoder = new TextEncoder();
 export function diffDriverOf(
   attribute: true | false | string | undefined | null,
   config?: (key: string) => string | undefined,
+  /** The builtin drivers of that git version (2.43 lacks `ini`, `r`, `swift`, ...) */
+  compatibility: "2.43" | "2.56" = "2.56",
 ): DiffDriver | undefined {
   if (attribute === true) return { binary: false };
   if (attribute === false) return { binary: true };
@@ -205,10 +228,26 @@ export function diffDriverOf(
   const name = attribute;
   const binary = boolValue(config?.(`diff.${name}.binary`));
   const algorithm = config?.(`diff.${name}.algorithm`) as XdiffAlgorithm | undefined;
-  const findFunction = userdiffFindFunction(name, config);
+  const legacy = compatibility === "2.43";
+  const findFunction = userdiffFindFunction(
+    name,
+    config,
+    legacy ? BUILTIN_FUNCNAME_PATTERNS_2_43 : BUILTIN_FUNCNAME_PATTERNS,
+  );
+  const wordRegex = userdiffWordRegex(
+    name,
+    config,
+    legacy ? BUILTIN_WORD_REGEXES_2_43 : BUILTIN_WORD_REGEXES,
+  );
   const textconvCommand = config?.(`diff.${name}.textconv`);
   const cacheTextconv = boolValue(config?.(`diff.${name}.cachetextconv`));
-  if (binary === undefined && !algorithm && !findFunction && textconvCommand === undefined) {
+  if (
+    binary === undefined &&
+    !algorithm &&
+    !findFunction &&
+    !wordRegex &&
+    textconvCommand === undefined
+  ) {
     return undefined;
   }
   return {
@@ -216,6 +255,7 @@ export function diffDriverOf(
     ...(binary !== undefined ? { binary } : {}),
     ...(algorithm ? { algorithm } : {}),
     ...(findFunction ? { findFunction } : {}),
+    ...(wordRegex ? { wordRegex } : {}),
     ...(textconvCommand !== undefined ? { textconvCommand } : {}),
     ...(cacheTextconv !== undefined ? { cacheTextconv } : {}),
   };
@@ -557,6 +597,31 @@ async function builtinDiff(
     report.newLabel = newLabel;
   }
   const colors = options.colors;
+  // diff_opt_word_diff_regex: a regex alone asks for the plain word diff
+  const wordDiff =
+    options.wordDiff === "none"
+      ? undefined
+      : (options.wordDiff ?? (options.wordDiffRegex !== undefined ? "plain" : undefined));
+  if (wordDiff) {
+    sink.text(
+      colors
+        ? `${colors.meta}--- ${lbl0}${colors.reset}${lbl0.includes(" ") ? "\t" : ""}\n` +
+            `${colors.meta}+++ ${lbl1}${colors.reset}${lbl1.includes(" ") ? "\t" : ""}\n`
+        : `${oldLabel}\n${newLabel}\n`,
+    );
+    // init_diff_words_data: the option's regex, else either side's driver's, else the config's
+    const pattern =
+      options.wordDiffRegex ??
+      contentDriver(pair.old, oneDriver)?.wordRegex ??
+      contentDriver(pair.new, twoDriver)?.wordRegex ??
+      options.defaultWordRegex;
+    writeWordDiffHunks(sink, coloredHunksOf(result), {
+      mode: wordDiff,
+      ...(pattern !== undefined ? { regex: compileWordRegex(pattern) } : {}),
+      ...(colors ? { colors } : {}),
+    });
+    return;
+  }
   if (!colors) {
     sink.text(`${oldLabel}\n${newLabel}\n`);
     writeHunks(sink, result);

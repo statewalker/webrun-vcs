@@ -1,0 +1,82 @@
+{
+  "ada": {
+    "pre": "Ada.Text_IO.Put_Line(\"Hello World!\");\n1 1e-10 16#FE12#E2 3.141_592 'x'\na+b a-b\na*b a/b\na**b\na(b)\na:=b\na=b a/= b\na<b a<=b a>b a>=b\na,b\na=>b\na..b\na<>b\n",
+    "post": "Ada.Text_IO.Put_Line(\"Hello World?\");\n1 1e10 16#FE12#E2 3.141_592 'y'\nx+y x-y\nx*y x/y\nx**y\nx(y)\nx:=y\nx=y x/= y\nx<y x<=y x>y x>=y\nx,y\nx=>y\nx..y\nx<>y\n"
+  },
+  "bash": {
+    "pre": "my_var=10\nx=123\necho $1\necho $USER\n${HOME}\n((a+b))\n((a*b))\n((a/b))\n((a%b))\n((a|b))\n((a^b))\n((a=b))\n((a!b))\n((a<b))\n((a>b))\n$((a<b))\n$((a>b))\n$((a&b))\n$((a|b))\n${a:b}\n${a:b}\n${a:b}\n${a:b}\n${a#*/}\n${a%.*}\n${a^}\n${a,}\n${a}\n${a[*]}\nls -a\nls --all\n",
+    "post": "new_var=10\nx=456\necho $2\necho $USERNAME\n${HOMEDIR}\n((a+=b))\n((a*=b))\n((a/=b))\n((a%=b))\n((a|=b))\n((a^=b))\n((a==b))\n((a!=b))\n((a<=b))\n((a>=b))\n$((a<<b))\n$((a>>b))\n$((a&&b))\n$((a||b))\n${a:-b}\n${a:=b}\n${a:+b}\n${a:?b}\n${a##*/}\n${a%%.*}\n${a^^}\n${a,,}\n${!a}\n${a[@]}\nls -x\nls --color\n"
+  },
+  "bibtex": {
+    "pre": "@article{aldous1987uie,\n  title={{Ultimate instability of exponential back-off protocol for acknowledgment-based transmission control of random access communication channels}},\n  author={Aldous, D.},\n  journal={Information Theory, IEEE Transactions on},\n  volume={33},\n  number={2},\n  pages={219--223},\n  year={1987},\n}\n",
+    "post": "@article{aldous1987uie,\n  title={{Ultimate instability of exponential back-off protocol for acknowledgment-based transmission control of random access communication channels}},\n  author={Aldous, David},\n  journal={Information Theory, IEEE Transactions on},\n  volume={Bogus.},\n  number={4},\n  pages={219--223},\n  year=1987,\n  note={This is in fact a rather funny read since ethernet works well in practice. The {\\em pre} reference is the right one, however.}\n}\n"
+  },
+  "cpp": {
+    "pre": "Foo():x(0&&1){ foo0( x.find); }\ncout<<\"Hello World!\\n\"<<endl;\n1 -1e10 0xabcdef 'x'\n// long double\n3.141592653e-10l\n// float\n120E5f\n// hex\n0xdead'1eaF+8ULL\n// octal\n01234567\n// binary\n0b1000+e1\n// expression\n1.5-e+2+f\n// another one\nstr.e+65\n[a] b->v d.e\n!a ~b c++ d-- e*f g&h\na*b c/d e%f\na+b c-d\na<<b c>>d\na<b c<=d e>f g>=h i<=j\na==b c!=d\na^b c|d e&&f\na||b\na?b\na=b c+=d e-=f g*=h i/=j k%=l m<<=n o>>=p q&=r s^=t u|=v\na,b\na::b\n",
+    "post": "Foo() : x(0&42) { bar(x.Find); }\ncout<<\"Hello World?\\n\"<<endl;\n(1 +1e10 0xabcdef) '2'\n// long double\n3.141592654e+10l\n// float\n120E6f\n// hex\n0xdeaf'1eaf+7ULL\n// octal\n01234560\n// binary\n0b1100+e1\n// expression\n1.5-e+3+f\n// another one\nstr.e+75\n[a] b->*v d.*e\n~!a !~b c+ d- e**f g&&h\na*=b c/=d e%=f\na++b c--d\na<<=b c>>=d\na<=b c<d e>=f g>h i<=>j\na!=b c=d\na^=b c|=d e&=f\na|b\na?:b\na==b c+d e-f g*h i/j k%l m<<n o>>p q&r s^t u|v\na,b\na:b\n"
+  },
+  "csharp": {
+    "pre": "Foo():x(0&&1){}\ncout<<\"Hello World!\\n\"<<endl;\n1 -1e10 0xabcdef 'x'\n[a] a->b a.b\n!a ~a a++ a-- a*b a&b\na*b a/b a%b\na+b a-b\na<<b a>>b\na<b a<=b a>b a>=b\na==b a!=b\na&b\na^b\na|b\na&&b\na||b\na?b:z\na=b a+=b a-=b a*=b a/=b a%=b a<<=b a>>=b a&=b a^=b a|=b\na,y\n",
+    "post": "Foo() : x(0&42) { bar(x); }\ncout<<\"Hello World?\\n\"<<endl;\n(1) (-1e10) (0xabcdef) 'y'\n[x] x->y x.y\n!x ~x x++ x-- x*y x&y\nx*y x/y x%y\nx+y x-y\nx<<y x>>y\nx<y x<=y x>y x>=y\nx==y x!=y\nx&y\nx^y\nx|y\nx&&y\nx||y\nx?y:z\nx=y x+=y x-=y x*=y x/=y x%=y x<<=y x>>=y x&=y x^=y x|=y\nx,y\n"
+  },
+  "css": {
+    "pre": ".class-form label.control-label {\n    margin-top: 10px!important;\n    border : 10px dashed #C6C6C6;\n}\n#CCCCCC\n10em\npadding-bottom\n150px\n10px!important\ndiv.class#id\n",
+    "post": ".other-form label.control-label {\n    margin-top: 15px!important;\n    border : 10px dotted #C6C6C6;\n}\n#CCCCCB\n10em\nmargin-left\n150em\n10px\nli.class#id\n"
+  },
+  "dts": {
+    "pre": "/ {\n\tthis_handle: node@f00 {\n\t\tcompatible = \"mydev\";\n\t\tstring-prop = start: \"hello world!\" end: ;\n\t\t#size-cells = <0+0>;\n\t\treg = <0xf00>;\n\t\tprop = <1>;\n\t\tprop = <-1e10>;\n\t\tprop = <(!3)>;\n\t\tprop = <(~3)>;\n\t\tprop = <(3*4)>;\n\t\tprop = <(3&4)>;\n\t\tprop = <(3*4)>;\n\t\tprop = <(3/4)>;\n\t\tprop = <(3%4)>;\n\t\tprop = <(3+4)>;\n\t\tprop = <(3-4)>;\n\t\tprop = /bits/ 64 <(3<<4)>;\n\t\tprop = <(3>>4)>;\n\t\tprop = <(3&4)>;\n\t\tprop = <(3^4)>;\n\t\tprop = <(3|4)>;\n\t\tprop = <(3&&4)>;\n\t\tprop = <(3||4)>;\n\t\tprop = <(4?5:3)>;\n\t\tlist = <&this_handle>, <0 0 0 0>;\n\t};\n\n\t&phandle {\n\t\tpre-phandle = <&this_handle>;\n\t};\n};\n",
+    "post": "/ {\n\tHANDLE_2: new-node@eeda {\n\t\tcompatible = \"vendor,compat\";\n\t\tstring-prop = end: \"hello world?\" start: ;\n\t\t#address-cells = <0+40>;\n\t\treg = <0xeeda>;\n\t\tprop = <(1)>;\n\t\tprop = <(-1e10)>;\n\t\tprop = <(!1)>;\n\t\tprop = <(~1)>;\n\t\tprop = <(1*2)>;\n\t\tprop = <(1&2)>;\n\t\tprop = <(1*2)>;\n\t\tprop = <(1/2)>;\n\t\tprop = <(1%2)>;\n\t\tprop = <(1+2)>;\n\t\tprop = <(1-2)>;\n\t\tprop = /bits/ 32 <(1<<2)>;\n\t\tprop = <(1>>2)>;\n\t\tprop = <(1&2)>;\n\t\tprop = <(1^2)>;\n\t\tprop = <(1|2)>;\n\t\tprop = <(1&&2)>;\n\t\tprop = <(1||2)>;\n\t\tprop = <(1?2:3)>;\n\t\tlist = <&HANDLE_2>, <0 0 0 1>;\n\t};\n\n\t&phandle2 {\n\t\tprop_handle = <&HANDLE_2>;\n\t};\n};\n"
+  },
+  "fortran": {
+    "pre": "print *, \"Hello World!\"\n\nDO10I = 1,10\nDO10I = 1,10\nDO10I = 1,10\n",
+    "post": "print *, \"Hello World?\"\n\nDO10I = 1,10\nDO 10 I = 1,10\nDO 1 0 I = 1,10\n"
+  },
+  "html": {
+    "pre": "<tag>content</tag>\n<tag attr=\"value\">content</tag>\n<tag>content &entity;</tag>\n",
+    "post": "<tag newattr=\"newvalue\">added content</tag>\n<tag attr=\"newvalue\">changed</tag>\n<newtag>content &newentity;</newtag>\n"
+  },
+  "java": {
+    "pre": "Foo():x(0&&1){}\ncout<<\"Hello World!\\n\"<<endl;\n1 -1e10 0xabcdef 'x'\n[a] a->b a.b\n!a ~a a++ a-- a*b a&b\na*b a/b a%b\na+b a-b\na<<b a>>b\na<b a<=b a>b a>=b\na==b a!=b\na&b\na^b\na|b\na&&b\na||b\na?b:z\na=b a+=b a-=b a*=b a/=b a%=b a<<=b a>>=b a&=b a^=b a|=b\na,y\na::b\n",
+    "post": "Foo() : x(0&42) { bar(x); }\ncout<<\"Hello World?\\n\"<<endl;\n(1) (-1e10) (0xabcdef) 'y'\n[x] x->y x.y\n!x ~x x++ x-- x*y x&y\nx*y x/y x%y\nx+y x-y\nx<<y x>>y\nx<y x<=y x>y x>=y\nx==y x!=y\nx&y\nx^y\nx|y\nx&&y\nx||y\nx?y:z\nx=y x+=y x-=y x*=y x/=y x%=y x<<=y x>>=y x&=y x^=y x|=y\nx,y\nx::y\n"
+  },
+  "kotlin": {
+    "pre": "println(\"Hello World!\\n\")\n1 -1e10 0xabcdef 'x'\n[a] a->b a.b\n!a a.inv() a*b a&b\na*b a/b a%b\na+b a-b\na shr b\na<b a<=b a>b a>=b\na==b a!=b a===b\na and b\na^b\na or b\na&&b a||b\na=b a+=b a-=b a*=b a/=b a%=b a<<=b a>>=b a&=b a^=b a|=b\na=b c+=d e-=f g*=h i/=j k%=l m<<=n o>>=p q&=r s^=t u|=v\na<<=b\na||b a&&b\na,y\n--a==--b\na++==++b\n0xFF_EC_DE_5E 0b100_000 100_000\na==b\na!!b\n_32.find(arr)\nX.fill()\nX.u+1\nX.u-2\na.b\na?.b\n.32_00_456\n",
+    "post": "println(\"Hello World?\")\n(1) (-1e10) (0xabcdef) 'y'\n[x] x->y x.y\n!x x.inv() x*y x&y\nx*y x/y x%y\nx+y x-y\na shl b\nx<y x<=y x>y x>=y\nx==y x!=y x===y\nx and y\nx^y\nx or y\nx&&y x||y\nx=y x+=y x-=y x*=y x/=y x%=y x<<=y x>>=y x&=y x^=y x|=y\na+=b c=d e<=f g>=h i/j k%l m<<n o>>p q&r s^t u|v\na<=b\na|b a&b\nx,y\n--a!=--b\na++!=++b\n0xFF_E1_DE_5E 0b100_100 200_000\na===b\na!=b\n_33.find(arr)\nX.find()\nX.f+1\nX.u+2\na..b\na?:b\n.32_00_446\n"
+  },
+  "matlab": {
+    "pre": "(1) (-1e10) 'b';\n[a] {a} a.b;\n~a;\na*b a.*b a/b a./b a^b a.^b a.\\b a.';\na+b a-b;\na&b a&&b a|b a||b;\na<b a<=b a>b a>=b;\na==b a~=b;\na,b;\n",
+    "post": "(0) (-0e10) 'y';\n[x] {x} x.y;\n~x;\nx*y x.*y x/y x./y x^y x.^y x.\\y x.';\nx+y x-y;\nx&y x&&y x|y x||y;\nx<y x<=y x>y x>=y;\nx==y x~=y;\nx,y;\n"
+  },
+  "objc": {
+    "pre": "Foo():x(0&&1){}\ncout<<\"Hello World!\\n\"<<endl;\n1 -1e10 0xabcdef 'x'\n[a] a->b a.b\n!a ~a a++ a-- a*b a&b\na*b a/b a%b\na+b a-b\na<<b a>>b\na<b a<=b a>b a>=b\na==b a!=b\na&b\na^b\na|b\na&&b\na||b\na?b:z\na=b a+=b a-=b a*=b a/=b a%=b a<<=b a>>=b a&=b a^=b a|=b\na,y\n",
+    "post": "Foo() : x(0&42) { bar(x); }\ncout<<\"Hello World?\\n\"<<endl;\n(1) (-1e10) (0xabcdef) 'y'\n[x] x->y x.y\n!x ~x x++ x-- x*y x&y\nx*y x/y x%y\nx+y x-y\nx<<y x>>y\nx<y x<=y x>y x>=y\nx==y x!=y\nx&y\nx^y\nx|y\nx&&y\nx||y\nx?y:z\nx=y x+=y x-=y x*=y x/=y x%=y x<<=y x>>=y x&=y x^=y x|=y\nx,y\n"
+  },
+  "pascal": {
+    "pre": "writeln(\"Hello World!\");\n1 -1e10 0xabcdef 'x'\n[a] a->b a.b\n!a ~a a++ a-- a*b a&b\na*b a/b a%b\na+b a-b\na<<b a>>b\na<b a<=b a>b a>=b\na==b a!=b\na&b\na^b\na|b\na&&b\na||b\na?b:z\na=b a+=b a-=b a*=b a/=b a%=b a<<=b a>>=b a&=b a^=b a|=b\na,y\na::b\n",
+    "post": "writeln(\"Hello World?\");\n(1) (-1e10) (0xabcdef) 'y'\n[x] x->y x.y\n!x ~x x++ x-- x*y x&y\nx*y x/y x%y\nx+y x-y\nx<<y x>>y\nx<y x<=y x>y x>=y\nx==y x!=y\nx&y\nx^y\nx|y\nx&&y\nx||y\nx?y:z\nx=y x+=y x-=y x*=y x/=y x%=y x<<=y x>>=y x&=y x^=y x|=y\nx,y\nx::y\n"
+  },
+  "perl": {
+    "pre": "#!/usr/bin/perl\n\nuse strict;\n\npackage Frotz;\nsub new {\n\tmy $class = shift;\n\treturn bless {}, $class;\n}\n\n__END__\n=head1 NAME\n\nfrotz - Frotz\n\n=head1 SYNOPSIS\n\n  use frotz;\n\n  $nitfol = new Frotz();\n\n=cut\n",
+    "post": "#!/usr/bin/perl\n\nuse strict;\n\npackage Frotz;\nsub new {\n\tmy ($class, %opts) = @_;\n\treturn bless { xyzzy => \"nitfol\", %opts }, $class;\n}\n\n__END__\n=head1 NAME\n\nfrotz - Frotz\n\n=head1 SYNOPSIS\n\n  use frotz;\n\n  $nitfol = new Frotz();\n\n=cut\n"
+  },
+  "php": {
+    "pre": "$var $var\n<?= \"Hello World!\" ?>\n1 -1e10 0xabcdef 'x'\n[a] a->b a.b\n!a ~a a++ a-- a*b a&b\na*b a/b a%b\na+b a-b\na<<b a>>b\na<b a<=b a>b a>=b\na==b a!=b\na&b\na^b\na|b\na&&b\na||b\na?b:z\na=b a+=b a-=b a*=b a/=b a%=b a<<=b a>>=b a&=b a^=b a|=b\na,y\n",
+    "post": "($var) $ var\n<?=\"Hello World?\"?>\n(1) (-1e10) (0xabcdef) 'y'\n[x] x->y x.y\n!x ~x x++ x-- x*y x&y\nx*y x/y x%y\nx+y x-y\nx<<y x>>y\nx<y x<=y x>y x>=y\nx==y x!=y\nx&y\nx^y\nx|y\nx&&y\nx||y\nx?y:z\nx=y x+=y x-=y x*=y x/=y x%=y x<<=y x>>=y x&=y x^=y x|=y\nx,y\n"
+  },
+  "python": {
+    "pre": "print u\"Hello World!\\n\"\n1 -1e10 0xabcdef 'x'\n[a] a->b a.b\n!a ~a a++ a-- a*b a&b\na*b a/b a%b\na+b a-b\na<<b a>>b\na<b a<=b a>b a>=b\na==b a!=b\na&b\na^b\na|b\na&&b\na||b\na?b:z\na=b a+=b a-=b a*=b a/=b a%=b a<<=b a>>=b a&=b a^=b a|=b\na,y\n",
+    "post": "print \"Hello World?\\n\"; print\n(1) (-1e10) (0xabcdef) u'y'\n[x] x->y x.y\n!x ~x x++ x-- x*y x&y\nx*y x/y x%y\nx+y x-y\nx<<y x>>y\nx<y x<=y x>y x>=y\nx==y x!=y\nx&y\nx^y\nx|y\nx&&y\nx||y\nx?y:z\nx=y x+=y x-=y x*=y x/=y x%=y x<<=y x>>=y x&=y x^=y x|=y\nx,y\n"
+  },
+  "ruby": {
+    "pre": "10.downto(1) {|x| puts x}\n1 -1e10 0xabcdef 'x'\n[a] a->b a.b\n!a ~a a++ a-- a*b a&b\na*b a/b a%b\na+b a-b\na<<b a>>b\na<b a<=b a>b a>=b\na==b a!=b\na&b\na^b\na|b\na&&b\na||b\na?b:z\na=b a+=b a-=b a*=b a/=b a%=b a<<=b a>>=b a&=b a^=b a|=b\na,y\n",
+    "post": "10.downto(1) {|y| puts y}\n(1) (-1e10) (0xabcdef) 'y'\n[x] x->y x.y\n!x ~x x++ x-- x*y x&y\nx*y x/y x%y\nx+y x-y\nx<<y x>>y\nx<y x<=y x>y x>=y\nx==y x!=y\nx&y\nx^y\nx|y\nx&&y\nx||y\nx?y:z\nx=y x+=y x-=y x*=y x/=y x%=y x<<=y x>>=y x&=y x^=y x|=y\nx,y\n"
+  },
+  "scheme": {
+    "pre": "(define (myfunc a b)\n  ; This is a really cool function.\n  (this\\place (+ 3 4))\n  (define |the \\| \\greeting| |hello there|)\n  ({}(([](func-n)[])){})\n  (let ((c (+ a b)))\n    (format \"one more than the total is %d\" (add1 c))))\n",
+    "post": "(define (my-func first second)\n  ; This is a (moderately) cool function.\n  (that\\place (+ 3 4))\n  (define |a \\greeting| |hello there|)\n  ({(([(func-n)]))})\n  (let ((c (add1 first)))\n    (format \"one more than the total is %d\" (+ c second))))\n"
+  },
+  "tex": {
+    "pre": "\\section{Something}\n\\emph{Macro style}\n{\\em State toggle style}\n\\\\[1em]\n",
+    "post": "\\section{Something new}\n\\textbf{Macro style}\n{\\bfseries State toggle style}\n\\\\[1cm]\n"
+  }
+}
