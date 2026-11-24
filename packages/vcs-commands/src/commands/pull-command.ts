@@ -3,6 +3,7 @@ import { parseGitBool } from "@statewalker/vcs-utils";
 import { type Checkout, isIndexUnborn } from "@statewalker/vcs-working-tree";
 
 import { GitApiError, NoHeadError } from "../errors/index.js";
+import { GuardedTransportCommand } from "../guarded-transport-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import type { FetchResult } from "../results/fetch-result.js";
 import {
@@ -13,9 +14,9 @@ import {
 } from "../results/merge-result.js";
 import type { PullResult } from "../results/pull-result.js";
 import { isRebaseSuccessful, RebaseStatus } from "../results/rebase-result.js";
-import { TransportCommand } from "../transport-command.js";
 import type { CommitEditor } from "./commit-command.js";
 import { FetchCommand, TagOption } from "./fetch-command.js";
+import { FetchMultipleCommand } from "./fetch-multiple-command.js";
 import { commitsBaseSource, MergeBaseGraph } from "./merge-bases.js";
 import { MergeCommand } from "./merge-command.js";
 import { configValue } from "./merge-config.js";
@@ -38,6 +39,12 @@ interface MergeHead {
  * `pull.rebase`), or branched off on an unborn branch (pull.c's `pull_into_void`). The
  * options pull passes to git's merge, rebase and fetch are passed on the same way.
  *
+ * Credentials and headers follow `GuardedTransportCommand`'s rule: {@link setCredentials} and
+ * {@link setHeaders} go only to the origins named with `addCredentialOrigin`, else to the
+ * default remote's origin while every remote the pull reaches has it; per-URL providers
+ * (`setCredentialsForUrl`, `setHeadersForUrl`) answer for their URL's origin; a redirect to
+ * another origin carries none. `--all` runs `FetchMultipleCommand` (git's fetch_multiple).
+ *
  * @example
  * ```typescript
  * // Pull the current branch's upstream (branch.<name>.remote / .merge)
@@ -57,7 +64,7 @@ interface MergeHead {
  *   .call();
  * ```
  */
-export class PullCommand extends TransportCommand<PullResult> {
+export class PullCommand extends GuardedTransportCommand<PullResult> {
   private remote = "origin";
   /** Whether the remote was named (it is then in the reflog action). */
   private remoteGiven = false;
@@ -544,23 +551,32 @@ export class PullCommand extends TransportCommand<PullResult> {
     // a remote read from .git/remotes/ or .git/branches/ (git 2.x) is fetched with its own
     // refspecs, as any other: `git fetch <remote> [<refspec>...]`
     const fetchResults: FetchResult[] = [];
+    const defaultRemoteUrl = store.urlFor(store.remoteForBranch(localBranchName));
     if (this.all) {
-      const remotes = store
-        .configuredNames()
-        .filter((name) => parseGitBool(store.value(`remote.${name}.skipDefaultUpdate`)) !== true);
-      if (remotes.length === 1) {
-        this.remote = remotes[0] as string;
-        fetchResults.push(await this.fetchCommand(this.remote, [], action, false).call());
-      } else {
-        // fetch_multiple: FETCH_HEAD emptied, then each remote appended
-        if (!this.dryRun) await checkout?.writeFetchHead?.("");
-        for (const name of remotes) {
-          fetchResults.push(await this.fetchCommand(name, [], action, true).call());
-        }
+      // fetch --all: builtin/fetch.c's fetch_multiple (every remote fetched, a failure
+      // reported once all ran, skipDefaultUpdate / skipFetchAll honoured)
+      const multiple = new FetchMultipleCommand(this._workingCopy)
+        .setAll(true)
+        .setUpdateHeadOk(true)
+        .setEnvReflogAction(action);
+      if (this.prune !== undefined) multiple.setPrune(this.prune);
+      if (this.tagOption !== undefined) multiple.setTagOpt(this.tagOption);
+      if (this.dryRun) multiple.setDryRun(true);
+      if (this.force) multiple.setForceUpdate(true);
+      // credentials and headers: decided from every URL the fetch reaches, handed down
+      this.resolveAuth(await multiple.plannedUrls(), defaultRemoteUrl);
+      this.configureChild(multiple);
+      const fetched = await multiple.call();
+      for (const entry of fetched.fetches) if (entry.result) fetchResults.push(entry.result);
+      if (fetched.exitCode !== 0) {
+        // run_fetch failed: pull returns its status before merging anything
+        throw new GitApiError(fetched.stderr.replace(/\n$/, ""), { exitCode: fetched.exitCode });
       }
+      if (fetched.remotes.length === 1) this.remote = fetched.remotes[0] as string;
     } else {
       await this.loadLegacyRemote(this.remote);
-      fetchResults.push(await this.fetchCommand(this.remote, this.refSpecs, action, false).call());
+      this.resolveAuth([store.remoteUrlOf(this.remote)], defaultRemoteUrl);
+      fetchResults.push(await this.fetchCommand(this.remote, this.refSpecs, action).call());
     }
     const fetchResult = fetchResults[fetchResults.length - 1];
     const fetched = {
@@ -795,28 +811,17 @@ export class PullCommand extends TransportCommand<PullResult> {
     ];
   }
 
-  /** run_fetch: `git fetch [<options>] <remote> [<refspec>...]` with the pull's options. */
-  private fetchCommand(
-    remote: string,
-    refSpecs: string[],
-    action: string,
-    append: boolean,
-  ): FetchCommand {
-    const fetchCommand = new FetchCommand(this._workingCopy);
-    fetchCommand.setTransports(this.getTransports());
+  /**
+   * run_fetch: `git fetch [<options>] <remote> [<refspec>...]` with the pull's options, over
+   * the guarded transports (the credentials and headers go only where they are for).
+   */
+  private fetchCommand(remote: string, refSpecs: string[], action: string): FetchCommand {
+    const fetchCommand = this.configureChild(new FetchCommand(this._workingCopy));
     fetchCommand.setRemote(remote);
     fetchCommand.setRefSpecs(...refSpecs);
     // git pull fetches with --update-head-ok
     fetchCommand.setUpdateHeadOk(true);
     fetchCommand.setReflogAction(action);
-    if (append) fetchCommand.setAppend(true);
-    if (this.credentials) fetchCommand.setCredentials(this.credentials);
-    if (this.headers) fetchCommand.setHeaders(this.headers);
-    if (this.timeout) fetchCommand.setTimeout(this.timeout);
-    if (this.progressCallback) fetchCommand.setProgressMonitor(this.progressCallback);
-    if (this.progressMessageCallback) {
-      fetchCommand.setProgressMessageCallback(this.progressMessageCallback);
-    }
     if (this.tagOption) fetchCommand.setTagOpt(this.tagOption);
     if (this.prune !== undefined) fetchCommand.setRemoveDeletedRefs(this.prune);
     if (this.depth !== undefined) fetchCommand.setDepth(this.depth);

@@ -380,3 +380,60 @@ describeGit(
     });
   },
 );
+
+describeGit("git pull --all: fetch_multiple (builtin/fetch.c)", { timeout: 120_000 }, () => {
+  let parent: string;
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "pull-all-native-"));
+    t = new PullTwins(root);
+    parent = source((dir) => testCommit(dir, "one"));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  const rel = (path: string) => `../${path.slice(root.length + 1)}`;
+  const withRemotes = (remotes: [string, string][], extra: string[][] = []) =>
+    t.pair((dir) => {
+      t.git(dir, "init", "-q", "-b", "main");
+      for (const [name, url] of remotes) t.git(dir, "remote", "add", name, url);
+      t.git(dir, "config", "branch.main.remote", "origin");
+      t.git(dir, "config", "branch.main.merge", "refs/heads/main");
+      for (const args of extra) t.git(dir, ...args);
+    });
+
+  it("a remote that fails: every remote fetched, `error: could not fetch <name>`, nothing merged, exit 1", async () => {
+    const dirs = withRemotes([
+      ["origin", rel(parent)],
+      ["bad", "../no-such-repository"],
+      ["zz", rel(parent)],
+    ]);
+    const native = t.run(dirs.n, ["pull", "--all"]);
+    expect(native.status).toBe(1);
+    expect(native.stderr).toContain("error: could not fetch bad");
+    const ours = await t.outcome(async () => (await t.ours(dirs.o)).pull().setAll(true).call());
+    expect(ours.status).toBe(1);
+    expect(ours.stderr).toContain("error: could not fetch bad");
+    t.expectSame("pull --all with a failing remote", dirs, native, ours, { exact: false });
+    // zz, after the failing one, was fetched
+    expect(t.git(dirs.o, "rev-parse", "zz/main")).toBe(t.git(dirs.n, "rev-parse", "zz/main"));
+  });
+
+  it("remote.<name>.skipFetchAll and skipDefaultUpdate: the last of them in config order wins", async () => {
+    const dirs = withRemotes(
+      [
+        ["origin", rel(parent)],
+        ["skipped", rel(parent)],
+        ["back", rel(parent)],
+      ],
+      [
+        ["config", "remote.skipped.skipFetchAll", "true"],
+        ["config", "remote.back.skipDefaultUpdate", "true"],
+        ["config", "remote.back.skipFetchAll", "false"],
+      ],
+    );
+    const native = t.run(dirs.n, ["pull", "--all"]);
+    expect(native.status).toBe(0);
+    const ours = await t.outcome(async () => (await t.ours(dirs.o)).pull().setAll(true).call());
+    t.expectSame("skipFetchAll", dirs, native, ours);
+    expect(t.git(dirs.o, "for-each-ref", "--format=%(refname)", "refs/remotes/skipped")).toBe("");
+  });
+});
