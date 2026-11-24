@@ -678,6 +678,28 @@ describeGit("git blame of the working tree and --contents: the index and MERGE_H
     await expectSame(d, [["blame", "--contents", "-", "--", "file"]], {
       stdin: "zero\none\ntwo\nthree\nfour\nfive\n",
     });
+
+    // MERGE_HEAD read as append_merge_parents reads it: an annotated tag peeled to its
+    // commit, a last line without its newline ignored, an empty line refused
+    const mergeHead = join(d, ".git/MERGE_HEAD");
+    const saved = readFileSync(mergeHead, "utf8");
+    const side = saved.trim();
+    git(d, ["tag", "-a", "-m", "side tag", "side-tag", side], undefined, commitEnv(++tick));
+    writeFileSync(mergeHead, `${git(d, ["rev-parse", "side-tag"])}\n`);
+    await expectSame(d, [
+      ["blame", "file"],
+      ["blame", "--porcelain", "file"],
+    ]);
+    writeFileSync(mergeHead, side);
+    await expectSame(d, [["blame", "file"]]);
+    writeFileSync(mergeHead, `${side}\n\n`);
+    const res = spawnSync("git", ["blame", "file"], { cwd: d, env: nativeGitEnv(tmp()) });
+    expect(res.status).toBe(128);
+    expect(res.stderr.toString()).toBe("fatal: unknown line in '.git/MERGE_HEAD': \n\n");
+    await expect(ours(d, ["blame", "file"], NOW)).rejects.toThrow(
+      "unknown line in '.git/MERGE_HEAD': \n",
+    );
+    writeFileSync(mergeHead, saved);
     git(d, ["merge", "--abort"]);
   });
 });

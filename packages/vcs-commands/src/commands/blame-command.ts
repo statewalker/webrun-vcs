@@ -1369,9 +1369,14 @@ export class BlameCommand extends GitCommand<BlameResult> {
     const parent = await this.state(parentId);
     if (!parent) throw new Error(`no such commit ${parentId}`);
     const parents = [parentId];
+    // append_parent: lookup_commit_reference, an annotated tag peeled to its commit
+    const resolver = this.revisionResolver();
     for (const id of await this.mergeHeadParents()) {
-      if (!(await this.state(id))) throw new Error(`no such commit ${id}`);
-      parents.push(id);
+      const peeled = await resolver.peelTags(id).catch(() => undefined);
+      if (peeled?.type !== "commit" || !(await this.state(peeled.id))) {
+        throw new Error(`no such commit ${id}`);
+      }
+      parents.push(peeled.id);
     }
     const index = await this.indexEntries();
     // verify_working_tree_path: a blob of a parent, else any stage of the index
@@ -1438,11 +1443,14 @@ export class BlameCommand extends GitCommand<BlameResult> {
       return [];
     }
     const out: ObjectId[] = [];
-    for (const line of (text ?? "").split("\n")) {
-      if (line === "") continue;
-      // get_oid_hex reads the line's first digits
+    // strbuf_getwholeline_fd: only lines ending in a newline (a last one without is dropped)
+    const lines = (text ?? "").split(/(?<=\n)/).filter((l) => l.endsWith("\n"));
+    for (const line of lines) {
+      // get_oid_hex: the line's first digits, the rest ignored; an empty line is refused
       const hex = line.slice(0, this.objectFormat.hexLength).toLowerCase();
-      if (!this.isFullObjectId(hex)) throw new Error(`unknown line in 'MERGE_HEAD': ${line}`);
+      if (!this.isFullObjectId(hex)) {
+        throw new Error(`unknown line in '.git/MERGE_HEAD': ${line}`);
+      }
       out.push(hex);
     }
     return out;
