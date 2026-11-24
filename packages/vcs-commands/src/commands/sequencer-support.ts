@@ -559,7 +559,11 @@ export async function moveHeadAsReset(
   /** ORIG_HEAD's reflog message (a log only a symbolic ORIG_HEAD's target keeps) */
   origHeadMessage = "reset: updating ORIG_HEAD",
   /** HEAD detached at `target` (git's RESET_HEAD_DETACH: REF_NO_DEREF) rather than written through */
-  options: { detach?: boolean } = {},
+  options: {
+    detach?: boolean;
+    /** ORIG_HEAD's new value when not `headId` (a rebase of another branch: its tip) */
+    origHead?: ObjectId;
+  } = {},
 ): Promise<string[]> {
   const detach = options.detach === true;
   if (!headId) {
@@ -579,7 +583,10 @@ export async function moveHeadAsReset(
       errors.push("warning: ignoring dangling symref ORIG_HEAD");
     }
     try {
-      await state.setRef("ORIG_HEAD", headId, { old, log: { ...log, message: origHeadMessage } });
+      await state.setRef("ORIG_HEAD", options.origHead ?? headId, {
+        old,
+        log: { ...log, message: origHeadMessage },
+      });
     } catch (error) {
       errors.push(origHeadError(error, old, await resolved()));
     }
