@@ -392,11 +392,7 @@ export function planTracking(
   }
 
   // install_branch_config_multiple_remotes
-  const autoRebase = (config.value("branch.autoSetupRebase") ?? "never").toLowerCase();
-  const rebase =
-    autoRebase === "always" ||
-    (autoRebase === "local" && remote === undefined) ||
-    (autoRebase === "remote" && remote !== undefined);
+  const rebase = shouldSetupRebase(config, remote);
   if (rebase && merges.length > 1) {
     throw new InvalidArgumentError(
       "track",
@@ -409,6 +405,36 @@ export function planTracking(
     return { warnings: [`warning: not setting branch '${newBranch}' as its own upstream`] };
   }
   return { plan: { remote, merges, rebase }, warnings: [] };
+}
+
+/** branch.c's `should_setup_rebase`: `branch.autoSetupRebase` for a remote (or local) upstream. */
+function shouldSetupRebase(config: RemoteConfigStore, remote: string | undefined): boolean {
+  const autoRebase = (config.value("branch.autoSetupRebase") ?? "never").toLowerCase();
+  return (
+    autoRebase === "always" ||
+    (autoRebase === "local" && remote === undefined) ||
+    (autoRebase === "remote" && remote !== undefined)
+  );
+}
+
+/**
+ * The plan of `git push -u` (transport.c `set_upstreams` → `install_branch_config`): the
+ * branch tracks `merge` (a `refs/heads/` ref) of `remote` (the remote's name, or the URL
+ * pushed to), rebasing as `branch.autoSetupRebase` says.
+ *
+ * @example
+ * ```typescript
+ * const plan = pushTrackingPlan(workingCopy, "origin", "refs/heads/topic");
+ * await installTracking(workingCopy, "topic", plan); // ["branch 'topic' set up to track 'origin/topic'."]
+ * ```
+ */
+export function pushTrackingPlan(
+  workingCopy: WorkingCopy,
+  remote: string,
+  merge: string,
+): TrackingPlan {
+  const config = RemoteConfigStore.from(workingCopy);
+  return { remote, merges: [merge], rebase: shouldSetupRebase(config, remote) };
 }
 
 /**
