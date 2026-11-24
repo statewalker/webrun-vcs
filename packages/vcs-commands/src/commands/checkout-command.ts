@@ -191,6 +191,13 @@ export interface CheckoutResult {
   readonly warnings?: string[];
 
   /**
+   * What a branch switch printed on stdout: git's `branch '<b>' set up to track
+   * '<upstream>'.` once a branch it created tracks its start point (`--track`,
+   * `branch.autoSetupMerge`); absent when there was nothing to say.
+   */
+  readonly output?: string[];
+
+  /**
    * git's exit status where `status` alone does not give it (OK: 0, CONFLICTS: 1): a path
    * checkout that could not write an entry exits 255
    */
@@ -219,6 +226,8 @@ const sameSide = (a: Side | undefined, b: Side | undefined) =>
  */
 interface CreateTracking {
   readonly plan?: TrackingPlan;
+  /** git's warnings of setup_tracking (nothing inherited, a branch as its own upstream) */
+  readonly warnings?: string[];
   readonly notABranch?: unknown;
   readonly ambiguous?: unknown;
 }
@@ -1533,6 +1542,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // HEAD's reflog line (git's update_refs_for_switch): "checkout: moving from <branch
     // left, or the detached HEAD's full id> to <the name as interpreted: `-` and @{-N}
     // expanded, the new branch's name>", read before anything moves
+    const output: string[] = [];
     const log = this.reflogLine(
       this.hasReflogAction()
         ? this.reflogAction("checkout")
@@ -1552,7 +1562,10 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         : reflogMessages.branchCreated(switchTo.startName);
       await this.refsStore.set(branchRef, switchTo.targetId, this.reflogLine(message));
       if (tracking.ambiguous !== undefined) throw tracking.ambiguous;
-      if (tracking.plan) await installTracking(this.workingCopy, switchTo.branch, tracking.plan);
+      sparseWarnings.push(...(tracking.warnings ?? []));
+      if (tracking.plan) {
+        output.push(...(await installTracking(this.workingCopy, switchTo.branch, tracking.plan)));
+      }
     }
 
     if (switchTo.kind === "stay") {
@@ -1587,6 +1600,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       conflicts: [],
       ref: ref ?? null,
       ...(sparseWarnings.length > 0 ? { warnings: sparseWarnings } : {}),
+      ...(output.length > 0 ? { output } : {}),
     };
   }
 
@@ -1759,7 +1773,10 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     }
     if (startRef === undefined) return {};
     try {
-      return { plan: planTracking(this.workingCopy, branch, startRef, this.track) };
+      const { plan, warnings } = planTracking(this.workingCopy, branch, startRef, this.track, {
+        compatibility: this.hooks.compatibility,
+      });
+      return { plan, warnings };
     } catch (error) {
       return { ambiguous: error };
     }
