@@ -81,6 +81,7 @@ import {
   pathspecItemMayMatch,
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
+import { PathspecFile } from "./pathspec-file.js";
 import { type CommitReflogKind, reflogMessages, updateHead } from "./reflog-messages.js";
 import { applyAutostash } from "./sequencer-support.js";
 import { signCommit, signRequestOf } from "./signing.js";
@@ -178,6 +179,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private allowEmpty = false;
   private parents: ObjectId[] = [];
   private onlyPaths: string[] = [];
+  /** `--pathspec-from-file` */
+  private readonly pathspecFile = new PathspecFile();
   private all = false;
   private include = false;
   private includePaths: string[] = [];
@@ -510,6 +513,29 @@ export class CommitCommand extends GitCommand<CommitResult> {
   }
 
   /**
+   * `--pathspec-from-file` (and `--pathspec-file-nul` with `nul`): the pathspec elements of
+   * `content`, one per line (a line starting with `"` unquoted as a C string), or separated
+   * by NUL with `nul`, committed as {@link setOnly} paths (or {@link setInclude}'s with
+   * `setInclude()`). As git's prepare_index: refused with {@link setAll} ("options
+   * '--pathspec-from-file' and '-a' cannot be used together") and beside paths given to
+   * `setOnly`/`setInclude` ("'--pathspec-from-file' and pathspec arguments cannot be used
+   * together"); an empty file commits the index as it is (with `setInclude()`: "No paths
+   * with --include/--only does not make sense.").
+   *
+   * @example
+   * ```typescript
+   * await git.commit().setPathspecFromFile("src/a.ts\n").setMessage("Fix a").call();
+   * ```
+   *
+   * @throws InvalidArgumentError "fatal: line is badly quoted: <line>"
+   */
+  setPathspecFromFile(content: string | Uint8Array, nul = false): this {
+    this.checkCallable();
+    this.pathspecFile.read(content, nul);
+    return this;
+  }
+
+  /**
    * Set whether to auto-stage modified tracked files before committing.
    *
    * If true, stages all modified and deleted tracked files before
@@ -738,6 +764,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     readDiffSubmoduleConfig(this.workingCopy);
     await this.readCurrentIndex();
     await this.checkReuseOptions();
+    this.applyPathspecFile();
     // `-i` refuses what it refuses for a commit, before anything is read
     if (this.include) this.checkIncludeOptions();
     const state = new OperationState(this.workingCopy.checkout, this.refsStore);
@@ -1231,6 +1258,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // the index as it is now: one another writer replaced is read again (git reads the
     // index at its start), unless this instance holds unwritten edits (refused)
     await this.readCurrentIndex();
+    this.applyPathspecFile();
     if (this.include) return this.commitIncluded();
     // `--fixup=reword:` is a partial commit of no path: HEAD's tree (git sets `only`)
     const partial = this.onlyPaths.length > 0 || this.fixup?.kind === "reword";
@@ -1592,6 +1620,19 @@ export class CommitCommand extends GitCommand<CommitResult> {
       prefix,
       text: autosquashSubject("amend", target.message) + amendCommitText(target.message),
     };
+  }
+
+  /**
+   * prepare_index's `--pathspec-from-file`: refused with `-a` and beside pathspec arguments
+   * ({@link setOnly}, {@link setInclude}); its elements are then the paths of `-i`, else of
+   * `--only`.
+   */
+  private applyPathspecFile(): void {
+    if (!this.pathspecFile.given) return;
+    this.pathspecFile.refuse("-a", this.all);
+    this.pathspecFile.refuseArguments([...this.onlyPaths, ...this.includePaths]);
+    if (this.include) this.includePaths = [...this.pathspecFile.elements];
+    else this.onlyPaths = [...this.pathspecFile.elements];
   }
 
   /** `-i <paths>`: parse_and_validate_options' and prepare_index's refusals. */

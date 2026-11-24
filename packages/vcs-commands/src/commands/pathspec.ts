@@ -1170,6 +1170,9 @@ export function prefixOriginElement(
  * parsePathspecFile('a.txt\n"caf\\303\\251"\n'); // ["a.txt", "café"]
  * ```
  *
+ * A NUL inside a line ends it, before unquoting (`"a<NUL>x"` is badly quoted, `"a"<NUL>x`
+ * names `a`), as git hands the line on as a C string.
+ *
  * @throws Error "line is badly quoted: <line>" as git dies
  */
 export function parsePathspecFile(content: string | Uint8Array, nul = false): string[] {
@@ -1182,18 +1185,27 @@ export function parsePathspecFile(content: string | Uint8Array, nul = false): st
     if (end < 0) end = bytes.length;
     let lineEnd = end;
     if (!nul && lineEnd > start && bytes[lineEnd - 1] === 0x0d) lineEnd--;
-    const line = bytes.subarray(start, lineEnd);
+    // git reads each line as a C string: a NUL ends it, before any unquoting
+    const raw = bytes.subarray(start, lineEnd);
+    const cut = raw.indexOf(0);
+    const line = cut < 0 ? raw : raw.subarray(0, cut);
     if (!nul && line[0] === 0x22) {
       const unquoted = unquoteGitPath(line);
       // unquote_c_style without endp: what follows the closing quote is ignored
       if (!unquoted) {
         throw new Error(`line is badly quoted: ${decodeGitPath(line)}`);
       }
-      out.push(unquoted.path);
+      out.push(cString(unquoted.path));
     } else {
       out.push(decodeGitPath(line));
     }
     start = end + 1;
   }
   return out;
+}
+
+/** `text` up to its first NUL (a C string's end). */
+function cString(text: string): string {
+  const nul = text.indexOf("\0");
+  return nul < 0 ? text : text.slice(0, nul);
 }
