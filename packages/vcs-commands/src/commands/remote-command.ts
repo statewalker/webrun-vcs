@@ -67,6 +67,11 @@ export type RemoteMirrorMode = "fetch" | "push" | "both";
  * ```
  */
 export class RemoteAddCommand extends TransportCommand<RemoteConfig> {
+  /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
+  protected override readsCoreConfig(): boolean {
+    return false;
+  }
+
   private name?: string;
   private uri?: string;
   private fetchRefspec?: string;
@@ -363,6 +368,11 @@ export class RemoteAddCommand extends TransportCommand<RemoteConfig> {
  * ```
  */
 export class RemoteRemoveCommand extends GitCommand<RemoteConfig> {
+  /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
+  protected override readsCoreConfig(): boolean {
+    return false;
+  }
+
   private remoteName?: string;
   private messages: string[] = [];
 
@@ -498,6 +508,11 @@ export interface RemoteRenameResult {
  * ```
  */
 export class RemoteRenameCommand extends GitCommand<RemoteRenameResult> {
+  /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
+  protected override readsCoreConfig(): boolean {
+    return false;
+  }
+
   private oldName?: string;
   private newName?: string;
 
@@ -719,6 +734,11 @@ function formatIdent(who: { name: string; email: string; timestamp: number; tzOf
  * ```
  */
 export class RemoteListCommand extends GitCommand<RemoteConfig[]> {
+  /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
+  protected override readsCoreConfig(): boolean {
+    return false;
+  }
+
   private verbose = false;
 
   /** List each remote's URLs too (`git remote -v`), for {@link callText}. */
@@ -803,6 +823,11 @@ export class RemoteListCommand extends GitCommand<RemoteConfig[]> {
  * ```
  */
 export class RemoteGetUrlCommand extends GitCommand<string[]> {
+  /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
+  protected override readsCoreConfig(): boolean {
+    return false;
+  }
+
   private remoteName?: string;
   private push = false;
   private all = false;
@@ -876,6 +901,11 @@ export class RemoteGetUrlCommand extends GitCommand<string[]> {
  * ```
  */
 export class RemoteSetUrlCommand extends GitCommand<RemoteConfig> {
+  /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
+  protected override readsCoreConfig(): boolean {
+    return false;
+  }
+
   private remoteName?: string;
   private remoteUri?: string;
   private pushUri = false;
@@ -1116,6 +1146,11 @@ function replaceMatching(
  * ```
  */
 export class RemoteSetHeadCommand extends TransportCommand<string | undefined> {
+  /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
+  protected override readsCoreConfig(): boolean {
+    return false;
+  }
+
   private remoteName?: string;
   private branch?: string;
   private deleteHead = false;

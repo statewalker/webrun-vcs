@@ -51,6 +51,7 @@ import {
   configLoadError,
   createIdAbbreviator,
   type IdAbbreviator,
+  whitespaceConfigError,
   worktreeModeTrust,
 } from "./commands/core-config.js";
 import type { ForkPointSource } from "./commands/fork-point.js";
@@ -1291,9 +1292,24 @@ export abstract class GitCommand<T> {
     if (failure) throw new InvalidConfigError(failure.key, failure.message);
     // repo_read_config's check_deprecated_config: core.commentChar=auto dies in git 3.0
     checkAutoCommentChar(this._workingCopy);
+    // git_default_core_config's core.whitespace, unless the command reads no core settings
+    if (this.readsCoreConfig()) {
+      const whitespace = whitespaceConfigError(this._workingCopy);
+      if (whitespace) throw new InvalidConfigError(whitespace.key, whitespace.message);
+    }
     // prepare_repo_settings, which every command but `git config` runs before its work
     const indexVersion = indexVersionConfigError(this._workingCopy);
     if (indexVersion) throw indexVersion;
+  }
+
+  /**
+   * Whether git's command reads the core settings (`git_default_core_config`, through
+   * `git_default_config`) as it starts, and so dies on a `core.whitespace` it cannot parse
+   * before it does anything. True for nearly every command; `git config`, `git remote`,
+   * `git ls-remote` and `git bisect` (whose checkout dies instead) override it.
+   */
+  protected readsCoreConfig(): boolean {
+    return true;
   }
 
   /**

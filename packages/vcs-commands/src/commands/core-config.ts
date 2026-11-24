@@ -19,6 +19,7 @@ import { parseGitBool } from "@statewalker/vcs-utils";
 import type { WorkingCopy, Worktree, WorktreeModeTrust } from "@statewalker/vcs-working-tree";
 
 import { RemoteConfigStore } from "../remote-config/index.js";
+import { parseWhitespaceRule, WhitespaceRuleError } from "../whitespace/index.js";
 
 /**
  * A git boolean (`git_config_bool`: a key with no `=` is true, an empty value false), else
@@ -89,6 +90,45 @@ export function configLoadError(
         ? `fatal: bad config variable '${key}' in file '${file}' at line ${line}`
         : `fatal: unable to parse '${key}' from command-line config`;
     return { key, message: `${error}\n${fatal}` };
+  }
+  return undefined;
+}
+
+/**
+ * What git dies with reading `core.whitespace` in `git_default_core_config` (before the
+ * command does anything), else undefined: every value is parsed in the configuration's order,
+ * so a rule git cannot enforce (`fatal: cannot enforce both tab-in-indent and
+ * indent-with-non-tab`) or a variable without `=` (`error: missing value for
+ * 'core.whitespace'` and the `bad config variable` line) dies even when a later value
+ * replaces it. `git config`, `git remote` and `git ls-remote` read no core settings, and
+ * `git bisect` dies only in the checkout it runs.
+ *
+ * @example
+ * ```typescript
+ * // .git/config: [core] whitespace = tab-in-indent,indent-with-non-tab
+ * whitespaceConfigError(workingCopy)?.message;
+ * // "fatal: cannot enforce both tab-in-indent and indent-with-non-tab"
+ * ```
+ */
+export function whitespaceConfigError(
+  workingCopy: WorkingCopy,
+): { key: string; message: string } | undefined {
+  if (!workingCopy.config) return undefined;
+  const key = "core.whitespace";
+  for (const { text, file, line } of RemoteConfigStore.from(workingCopy).valuesWithOrigin(key)) {
+    if (text === undefined) {
+      const fatal =
+        file !== undefined && line !== undefined
+          ? `fatal: bad config variable '${key}' in file '${file}' at line ${line}`
+          : `fatal: unable to parse '${key}' from command-line config`;
+      return { key, message: `error: missing value for '${key}'\n${fatal}` };
+    }
+    try {
+      parseWhitespaceRule(text);
+    } catch (error) {
+      if (!(error instanceof WhitespaceRuleError)) throw error;
+      return { key, message: `fatal: ${error.message}` };
+    }
   }
   return undefined;
 }

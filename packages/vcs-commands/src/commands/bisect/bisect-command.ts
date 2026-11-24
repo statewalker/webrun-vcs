@@ -93,6 +93,11 @@ const SUBCOMMANDS = new Set([
  * (it starts gitk or `git log`).
  */
 export class BisectCommand extends GitCommand<BisectResult> {
+  /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
+  protected override readsCoreConfig(): boolean {
+    return false;
+  }
+
   protected args: string[] = [];
   private runHandler?: BisectRunHandler;
   private logText?: string;
@@ -382,9 +387,10 @@ export class BisectCommand extends GitCommand<BisectResult> {
         gitCheckout(
           {
             checkout: async (target, ignoreOtherWorktrees) => {
-              const command = new CheckoutCommand(this._workingCopy).setName(target);
-              if (ignoreOtherWorktrees) command.setIgnoreOtherWorktrees(true);
               try {
+                // the child dies before it changes anything (an unparsable core.whitespace)
+                const command = new CheckoutCommand(this._workingCopy).setName(target);
+                if (ignoreOtherWorktrees) command.setIgnoreOtherWorktrees(true);
                 const result = await command.call();
                 if (result.status === CheckoutStatus.OK) return { ok: true };
                 return { ok: false, message: result.message ?? "" };

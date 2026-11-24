@@ -2009,13 +2009,26 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           const spec = [...this.paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
           if (spec.length > 0) diff.setPathspec(spec);
         }
-        return diff.callFormats(formats, options.follow);
+        const shown = await diff.callFormats(formats, options.follow);
+        if (diff.checkFoundErrors) this.checkFailed = true;
+        return shown;
       },
       combinedDiff: (entry, options) => this.combinedDiff(entry, options),
     };
   }
 
   private diffOptions: DiffTextOptions = {};
+  /** `--check` found errors in a commit's diff (git's `check_failed`) */
+  private checkFailed = false;
+
+  /**
+   * The exit status `git log` ends with: 2 when `--check` ({@link LogOutputOptions.check})
+   * found errors in the diffs shown, else 0 (cmd_log_walk)
+   */
+  get exitCode(): number {
+    return this.checkFailed ? 2 : 0;
+  }
+
   /** The colors {@link callBytes} prints with */
   private colorSettings?: DiffColorSettings;
   private readonly outputWarnings: string[] = [];

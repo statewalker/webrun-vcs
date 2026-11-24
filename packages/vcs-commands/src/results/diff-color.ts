@@ -24,6 +24,16 @@
 
 import { ByteSink, XDF_WHITESPACE_FLAGS, xdlHashRecord, xdlRecmatch } from "@statewalker/vcs-utils";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import {
+  checkBlankAtEof,
+  isGitSpace,
+  WS_BLANK_AT_EOF,
+  WS_INCOMPLETE_LINE,
+  WS_RULE_MASK,
+  WS_TAB_WIDTH_MASK,
+  wsBlankLine,
+  wsCheckEmit,
+} from "../whitespace/index.js";
 
 /** git's color slots of the diff (`color.diff.<slot>`, diff.c's `color_diff_slots`) */
 export const DIFF_COLOR_SLOTS = [
@@ -211,18 +221,6 @@ export function wsErrorHighlightOf(arg: string): number | { badPrefix: string } 
   return val;
 }
 
-// whitespace rules (ws.h)
-const WS_BLANK_AT_EOL = 1 << 6;
-const WS_SPACE_BEFORE_TAB = 1 << 7;
-const WS_INDENT_WITH_NON_TAB = 1 << 8;
-const WS_CR_AT_EOL = 1 << 9;
-const WS_BLANK_AT_EOF = 1 << 10;
-const WS_TAB_IN_INDENT = 1 << 11;
-/** `WS_INCOMPLETE_LINE` (git 2.5x's `incomplete-line` rule) */
-export const WS_INCOMPLETE_LINE = 1 << 12;
-const WS_TAB_WIDTH_MASK = (1 << 6) - 1;
-const WS_RULE_MASK = (1 << 16) - 1;
-
 // flags of the emitted lines (diff.c's DIFF_SYMBOL_*)
 const BLANK_LINE_EOF = 1 << 19;
 const MOVED_LINE = 1 << 20;
@@ -234,8 +232,6 @@ const CONTENT_WS_MASK = WSEH_NEW | WSEH_OLD | WSEH_CONTEXT | WS_RULE_MASK;
 /** `COLOR_MOVED_MIN_ALNUM_COUNT` */
 const MIN_ALNUM_COUNT = 20;
 
-/** git's `isspace` (space, TAB, LF, CR) */
-const isSpace = (c: number) => c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d;
 /** git's `isalnum` (ASCII) */
 const isAlnum = (c: number) =>
   (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a);
@@ -269,83 +265,6 @@ class Out {
     }
     return out;
   }
-}
-
-/**
- * ws.c's `ws_check_emit`: the line (its LF included, if any) with the errors of `rule` in
- * `ws` and the rest in `set`
- */
-function wsCheckEmit(
-  out: Out,
-  line: Uint8Array,
-  rule: number,
-  set: string,
-  reset: string,
-  ws: string,
-): void {
-  let len = line.length;
-  let written = 0;
-  let trailingWhitespace = -1;
-  let trailingNewline = false;
-  let trailingCarriageReturn = false;
-  if (len > 0 && line[len - 1] === 0x0a) {
-    trailingNewline = true;
-    len--;
-  }
-  if (rule & WS_CR_AT_EOL && len > 0 && line[len - 1] === 0x0d) {
-    trailingCarriageReturn = true;
-    len--;
-  }
-  if (rule & WS_BLANK_AT_EOL) {
-    for (let i = len - 1; i >= 0; i--) {
-      if (isSpace(line[i] as number)) trailingWhitespace = i;
-      else break;
-    }
-  }
-  if (trailingWhitespace === -1) trailingWhitespace = len;
-  let i = 0;
-  for (; i < trailingWhitespace; i++) {
-    if (line[i] === 0x20) continue;
-    if (line[i] !== 0x09) break;
-    if (rule & WS_SPACE_BEFORE_TAB && written < i) {
-      out.str(ws);
-      out.bytes(line.subarray(written, i));
-      out.str(reset);
-      out.bytes(line.subarray(i, i + 1));
-    } else if (rule & WS_TAB_IN_INDENT) {
-      out.bytes(line.subarray(written, i));
-      out.str(ws);
-      out.bytes(line.subarray(i, i + 1));
-      out.str(reset);
-    } else {
-      out.bytes(line.subarray(written, i + 1));
-    }
-    written = i + 1;
-  }
-  if (rule & WS_INDENT_WITH_NON_TAB && i - written >= (rule & WS_TAB_WIDTH_MASK)) {
-    out.str(ws);
-    out.bytes(line.subarray(written, i));
-    out.str(reset);
-    written = i;
-  }
-  if (trailingWhitespace - written > 0) {
-    out.str(set);
-    out.bytes(line.subarray(written, trailingWhitespace));
-    out.str(reset);
-  }
-  if (trailingWhitespace !== len) {
-    out.str(ws);
-    out.bytes(line.subarray(trailingWhitespace, len));
-    out.str(reset);
-  }
-  if (trailingCarriageReturn) out.byte(0x0d);
-  if (trailingNewline) out.byte(0x0a);
-}
-
-/** ws.c's `ws_blank_line` */
-function wsBlankLine(bytes: Uint8Array, start: number, end: number): boolean {
-  for (let i = start; i < end; i++) if (!isSpace(bytes[i] as number)) return false;
-  return true;
 }
 
 /**
@@ -413,7 +332,7 @@ function emitLineWsMarkup(
   else if (blankAtEof) emitLine0(out, ws, undefined, reset, sign, line);
   else {
     emitLine0(out, set, undefined, reset, sign, new Uint8Array(0));
-    wsCheckEmit(out, line, wsRule, set, reset, ws);
+    wsCheckEmit(line, wsRule, out, set, reset, ws);
   }
 }
 
@@ -544,7 +463,7 @@ function fillIndentData(s: ContentSymbol): void {
     } else break;
   }
   let i = off;
-  for (; i < len; i++) if (!isSpace(line[i] as number)) break;
+  for (; i < len; i++) if (!isGitSpace(line[i] as number)) break;
   if (i === len) {
     s.indentWidth = INDENT_BLANKLINE;
     s.indentOff = len;
@@ -782,31 +701,6 @@ export interface ColoredPatchContext extends ColoredLineOptions {
   newContent: Uint8Array;
 }
 
-/** `count_trailing_blank` */
-function countTrailingBlank(mf: Uint8Array): number {
-  let cnt = 0;
-  if (mf.length === 0) return 0;
-  let ptr = mf.length - 1;
-  if (mf[ptr] === 0x0a) ptr--;
-  while (0 < ptr) {
-    let prevEol = ptr;
-    for (; 0 <= prevEol; prevEol--) if (mf[prevEol] === 0x0a) break;
-    if (!wsBlankLine(mf, prevEol + 1, prevEol + 1 + (ptr - prevEol))) break;
-    cnt++;
-    ptr = prevEol - 1;
-  }
-  return cnt;
-}
-
-/** diff.c's `count_lines` */
-function countLines(data: Uint8Array): number {
-  if (data.length === 0) return 0;
-  let count = 0;
-  for (const c of data) if (c === 0x0a) count++;
-  if (data[data.length - 1] !== 0x0a) count++;
-  return count;
-}
-
 /**
  * The hunks of a text pair as diff.c's `fn_out_consume` prints them in color: the header
  * in `frag` (`func` for its function line), each line in its color with its whitespace
@@ -825,12 +719,9 @@ export function writeColoredHunks(
   let blankPre = 0;
   let blankPost = 0;
   if (ctx.wsRule & WS_BLANK_AT_EOF) {
-    const l1 = countTrailingBlank(ctx.oldContent);
-    const l2 = countTrailingBlank(ctx.newContent);
-    if (l2 > l1) {
-      blankPre = countLines(ctx.oldContent) - l1 + 1;
-      blankPost = countLines(ctx.newContent) - l2 + 1;
-    }
+    const at = checkBlankAtEof(ctx.oldContent, ctx.newContent);
+    blankPre = at.preimage;
+    blankPost = at.postimage;
   }
   const emit = (out: Out) => sink.push(out.done());
   for (const hunk of hunks) {

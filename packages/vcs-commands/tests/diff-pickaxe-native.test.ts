@@ -194,6 +194,7 @@ async function twinDiff(
     summary: ["--summary"],
     "name-only": ["--name-only"],
     "name-status": ["--name-status"],
+    check: ["--check"],
   };
   const dash = args.indexOf("--");
   const nativeArgs =

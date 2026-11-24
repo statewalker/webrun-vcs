@@ -16,6 +16,12 @@ import {
 } from "@statewalker/vcs-working-tree";
 
 import { GitCommand } from "../../git-command.js";
+import {
+  parseWhitespaceRule,
+  WhitespaceRuleError,
+  WS_DEFAULT_RULE,
+  whitespaceRuleOf,
+} from "../../whitespace/index.js";
 import { coreBool, worktreeModeTrust } from "../core-config.js";
 import { markReaddedEntries } from "../index-host.js";
 import { configValue, conflictStyleOf } from "../merge-config.js";
@@ -36,12 +42,6 @@ import {
   latin1ToText,
   pathToLatin1,
 } from "./latin1.js";
-import {
-  parseWhitespaceRule,
-  WhitespaceRuleError,
-  WS_DEFAULT_RULE,
-  whitespaceRuleOf,
-} from "./whitespace.js";
 
 /** What `git apply` printed and how it ended. */
 export interface ApplyResult {

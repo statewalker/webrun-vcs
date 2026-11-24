@@ -1338,3 +1338,29 @@ describe("bisect arithmetic", () => {
     ]);
   });
 });
+
+describeGit("git bisect under a core.whitespace git cannot parse", () => {
+  // bisect reads no core settings: only the checkout it runs dies (statewalker-root#325)
+  it("fails in its checkout and leaves the state native git leaves", async () => {
+    const { a, b } = twins(67, { commits: 8, merges: false, roots: false, criss: false });
+    const terms = ["bad", "good"];
+    const env = {
+      GIT_CONFIG_COUNT: "3",
+      GIT_CONFIG_KEY_2: "core.whitespace",
+      GIT_CONFIG_VALUE_2: "tab-in-indent,indent-with-non-tab",
+    };
+    const opts = { env };
+    const first = await step(a, b, ["start", "main", "main~5"], terms, opts);
+    expect(first.native.status).toBe(1);
+    expect(first.native.stderr).toContain(
+      "fatal: cannot enforce both tab-in-indent and indent-with-non-tab",
+    );
+    await step(a, b, ["start"], terms, opts);
+    await step(a, b, ["bad", "main"], terms, opts);
+    await step(a, b, ["good", "main~5"], terms, opts);
+    await step(a, b, ["log"], terms, opts);
+    await step(a, b, ["terms"], terms, opts);
+    await step(a, b, ["reset"], terms, opts);
+    await step(a, b, ["reset"], terms);
+  }, 60_000);
+});
