@@ -352,6 +352,8 @@ interface Scope {
   keeping: number;
   /** The directories whose `.gitattributes` changed while they were kept */
   keptChanges: Set<string>;
+  /** The index read where a lookup names none, while an operation sets one (`index`) */
+  index?: AttributesIndex;
 }
 
 /**
@@ -472,9 +474,13 @@ export class GitContentFilter implements WorktreeContentFilter {
     this.scope = scope;
     const keep = options?.keepAttributes === true;
     if (keep) scope.keeping++;
+    const index = options?.index;
+    const indexBefore = scope.index;
+    if (index) scope.index = index;
     try {
       return await fn();
     } finally {
+      if (index) scope.index = indexBefore;
       if (keep && --scope.keeping === 0) {
         // the attributes kept as read are read again from now on
         for (const dir of scope.keptChanges) this.dropDirectory(scope, dir);
@@ -548,10 +554,12 @@ export class GitContentFilter implements WorktreeContentFilter {
         this.indexIds.set(index, indexId);
       }
     }
-    const memoKey = `${context.direction}:${indexId}`;
+    // one memo (git's attribute stack) per direction, index and check
+    const memoKey = `${context.direction}:${indexId}:${context.check ?? ""}`;
     const known = scope.memos.get(memoKey);
     if (known) return known;
-    const fromIndex = (path: string) => this.indexAttributes(path, index);
+    // no index named: the operation's (`OperationOptions.index`) as it is when read
+    const fromIndex = (path: string) => this.indexAttributes(path, index ?? scope.index);
     const fromWorktree = (path: string) => this.worktreeAttributes(path);
     const sources: AttributesSources = {
       ...this.outerSources(scope),

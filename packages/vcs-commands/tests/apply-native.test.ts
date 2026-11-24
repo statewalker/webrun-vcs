@@ -9,6 +9,7 @@
  */
 import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -746,11 +747,31 @@ describeGit("git apply as native git", () => {
         },
       ],
     ];
+    // each twin's files dated a minute before its index: with --index, whether git reads
+    // (and converts) a file to verify it against the index depends on racy git, so twins
+    // built across a second boundary would differ (the racy case: the test after this one)
+    const settled =
+      (build: Setup): Setup =>
+      (d) => {
+        build(d);
+        const past = new Date(Date.now() - 60_000);
+        const walk = (rel: string) => {
+          for (const name of readdirSync(join(d, rel))) {
+            if (!rel && name === ".git") continue;
+            const p = rel ? `${rel}/${name}` : name;
+            if (lstatSync(join(d, p)).isDirectory()) walk(p);
+            else utimesSync(join(d, p), past, past);
+          }
+        };
+        walk("");
+        gitOk(d, "add", "-A");
+        gitOk(d, "commit", "-q", "-m", "base");
+      };
     for (const [label, build, change] of cases) {
-      const { patch, base } = nativeDiff(build, change);
+      const { patch } = nativeDiff(build, change);
       for (const args of [[], ["--index"]]) {
         await compareApply(
-          twins(base),
+          twins(settled(build)),
           patch,
           { args, configure: (c) => configureArgs(c, args) },
           `${label} ${args}`,
@@ -758,6 +779,100 @@ describeGit("git apply as native git", () => {
       }
     }
   }, 180_000);
+
+  it("builds the conversion's attribute stack when git does: on a racy check, else the first write", async () => {
+    // apply --index converts through convert.c's attribute stack, built on its first
+    // conversion: verify_index_match converts a racily clean file to compare it (the stack
+    // then holds the old .gitattributes: CRLF), while a file whose stat settles it is not
+    // read, and the stack is first built when writing the patch's .gitattributes, which
+    // phase 0 removed from the worktree and the index (no attributes: LF). The whitespace
+    // rules read at parse time are a stack of their own. Each twin is dated to force one
+    // case: the index dated a minute back, before its entries (racy), or the files a minute
+    // older than the index (settled by their stat). Only mtimes are set back, never a
+    // file's after it is staged (utimes changes its ctime, which git compares)
+    const build: Setup = (d) => {
+      put(d, ".gitattributes", "*.txt text eol=crlf\n");
+      put(d, "m.txt", "m\n");
+    };
+    const { patch } = nativeDiff(build, (d) => {
+      put(d, ".gitattributes", "*.txt text eol=lf\n");
+      put(d, "m.txt", "m\nn\n");
+      put(d, "new.txt", "new\n");
+    });
+    const dated =
+      (racy: boolean): Setup =>
+      (d) => {
+        const past = new Date(Date.now() - 60_000);
+        build(d);
+        if (!racy) for (const p of [".gitattributes", "m.txt"]) utimesSync(join(d, p), past, past);
+        gitOk(d, "add", "-A");
+        gitOk(d, "commit", "-q", "-m", "base");
+        if (racy) utimesSync(join(d, ".git/index"), past, past);
+      };
+    for (const racy of [true, false]) {
+      const pair = twins(dated(racy));
+      await compareApply(
+        pair,
+        patch,
+        { args: ["--index"], configure: (c) => c.setIndex(true) },
+        `racy=${racy}`,
+      );
+      const eol = readFileSync(join(pair.native, "m.txt"), "latin1").includes("\r") ? "crlf" : "lf";
+      expect(eol, `racy=${racy}`).toBe(racy ? "crlf" : "lf");
+    }
+  }, 60_000);
+
+  it("verifies the index by the stat core.trustctime and core.checkStat compare", async () => {
+    // ie_match_stat compares ctime only under core.trustctime (and inode, owner and group
+    // only without core.checkStat=minimal): a chmod after the commit, a second later, moves
+    // the files' ctime alone, which leaves them clean by their stat, unread (no conversion
+    // before the patch's .gitattributes is written: LF), unless the entry is racy (CRLF)
+    const build: Setup = (d) => {
+      put(d, ".gitattributes", "*.txt text eol=crlf\n");
+      put(d, "m.txt", "m\n");
+    };
+    const { patch } = nativeDiff(build, (d) => {
+      put(d, ".gitattributes", "*.txt text eol=lf\n");
+      put(d, "m.txt", "m\nn\n");
+      put(d, "new.txt", "new\n");
+    });
+    const files = [".gitattributes", "m.txt"];
+    const dated =
+      (config: [string, string], racy: boolean): Setup =>
+      (d) => {
+        gitOk(d, "config", ...config);
+        const past = new Date(Date.now() - 60_000);
+        build(d);
+        if (!racy) for (const p of files) utimesSync(join(d, p), past, past);
+        gitOk(d, "add", "-A");
+        gitOk(d, "commit", "-q", "-m", "base");
+        if (racy) utimesSync(join(d, ".git/index"), past, past);
+      };
+    for (const config of [
+      ["core.trustctime", "false"],
+      ["core.checkStat", "minimal"],
+    ] as [string, string][]) {
+      for (const racy of [true, false]) {
+        const label = `${config.join("=")} racy=${racy}`;
+        const pair = twins(dated(config, racy));
+        // the ctime moves to a later second than the one the index recorded
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+        for (const dir of [pair.native, pair.ours]) {
+          for (const p of files) chmodSync(join(dir, p), 0o644);
+        }
+        await compareApply(
+          pair,
+          patch,
+          { args: ["--index"], configure: (c) => c.setIndex(true) },
+          label,
+        );
+        const eol = readFileSync(join(pair.native, "m.txt"), "latin1").includes("\r")
+          ? "crlf"
+          : "lf";
+        expect(eol, label).toBe(racy ? "crlf" : "lf");
+      }
+    }
+  }, 60_000);
 
   it("applies submodule patches as native git does", async () => {
     const a = "1111111111111111111111111111111111111111";
