@@ -7,7 +7,7 @@
  * whose `result` holds what was printed before.
  */
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
-import type { Credentials, GitTransportRegistry } from "@statewalker/vcs-transport";
+import type { GitTransportRegistry } from "@statewalker/vcs-transport";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import { computeObjectId } from "@statewalker/vcs-utils/pack";
 import type { GitHostEnvironment, WorkingCopy } from "@statewalker/vcs-working-tree";
@@ -26,6 +26,7 @@ import {
   pathspecErrors,
 } from "./pathspec.js";
 import { RmCommand } from "./rm-command.js";
+import type { SubmoduleAuthFor } from "./submodule-auth.js";
 import {
   defaultRemoteOf,
   isRelativeSubmoduleUrl,
@@ -54,11 +55,15 @@ export interface SubmoduleCloneOptions {
   references?: string[];
   /** `--require-init`: a non-empty directory at the path is refused */
   requireInit?: boolean;
-  /** The transports, credentials, headers and timeout the clone reaches its remote with */
+  /** The transports and timeout the clone reaches its remote with */
   transports?: GitTransportRegistry;
-  credentials?: Credentials;
-  headers?: Record<string, string>;
   timeout?: number;
+  /**
+   * The credentials and headers for the URL the clone talks to (after `insteadOf`): never
+   * static values, since a submodule's URL comes from the repository's content (see
+   * `submodule-auth.ts`)
+   */
+  authFor?: SubmoduleAuthFor;
 }
 
 /** What a submodule command printed, and its exit status. */
@@ -448,16 +453,21 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
           environment: notFromUser(environment ?? { readFile: async () => undefined }),
         });
         if (!inner) throw new GitApiError(`fatal: could not open the clone at '${hostPath}'`);
+        // the clone runs at the superproject's top: a relative path is read from there
+        const cloneUrl = isLocalRelativePath(realrepo) ? `${top}/${realrepo}` : realrepo;
         const clone = new CloneCommand(inner)
-          // the clone runs at the superproject's top: a relative path is read from there
-          .setURI(isLocalRelativePath(realrepo) ? `${top}/${realrepo}` : realrepo)
+          .setURI(cloneUrl)
           .setNoCheckout(true)
           .setDirectory(hostPath);
         if (options.depth !== undefined && options.depth > 0) clone.setDepth(options.depth);
         for (const reference of options.references ?? []) clone.addReference(reference);
         if (options.transports) clone.setTransports(options.transports);
-        if (options.credentials) clone.setCredentials(options.credentials);
-        if (options.headers) clone.setHeaders(options.headers);
+        if (options.authFor) {
+          // decided on the URL the clone talks to: insteadOf applied, as CloneCommand applies it
+          const auth = options.authFor(RemoteConfigStore.from(inner).remoteUrlOf(cloneUrl));
+          if (auth.credentials) clone.setCredentials(auth.credentials);
+          if (auth.headers) clone.setHeaders(auth.headers);
+        }
         if (options.timeout !== undefined) clone.setTimeout(options.timeout);
         clone.shareHooksOf(this);
         const result = await clone.call();

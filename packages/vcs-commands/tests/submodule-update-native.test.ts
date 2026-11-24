@@ -245,6 +245,14 @@ const BEHIND = `${BASIC}
 (cd clone; git pull -q --no-recurse-submodules)
 `;
 
+/** BEHIND, the new commit changing `y` too. */
+const BEHIND_Y = `${BASIC}
+(cd clone; git submodule -q update --init)
+(cd up; echo z > z; echo y2 > y; git add z y; git commit -qm z)
+(cd sup/sub; git pull -q origin main); (cd sup; git commit -qam moved)
+(cd clone; git pull -q --no-recurse-submodules)
+`;
+
 /** BEHIND with clone's submodule on its branch main (at y), not detached. */
 const BEHIND_ON_MAIN = `${BEHIND}
 (cd clone/sub; git checkout -q main)
@@ -522,6 +530,44 @@ git clone -q sup clone; git -C clone remote set-url origin ../sup
       await expectTwins(t, [update([]), status([])]);
     });
 
+    it('t7406-submodule-update.sh: "submodule update should fail due to local changes" (an untracked file the target adds)', async () => {
+      const t = twins(`${BEHIND}
+(cd clone/sub; echo untracked > z)
+`);
+      await expectTwins(t, [update([]), status([]), update(["--force"], (c) => c.setForce(true))]);
+    });
+
+    it('t7406-submodule-update.sh: "submodule update should fail due to local changes" (a tracked file the target changes)', async () => {
+      const t = twins(`${BEHIND_Y}
+(cd clone/sub; echo local > y)
+`);
+      await expectTwins(t, [update([]), status([])]);
+    });
+
+    it('t7406-submodule-update.sh: "submodule update - merge in .git/config", "submodule update - rebase in .git/config" (refused by local changes)', async () => {
+      const t = twins(`${BEHIND_Y}
+(cd clone/sub; git checkout -q main; echo local > y)
+`);
+      await expectTwins(t, [
+        update(["--merge"], (c) => c.setMode("merge")),
+        update(["--rebase"], (c) => c.setMode("rebase")),
+      ]);
+    });
+
+    it('t7406-submodule-update.sh: "submodule update can handle symbolic links in pwd" (a symbolic link at the submodule path)', async () => {
+      // git 2.43.0 has no validate_submodule_path (it follows the link and updates through it);
+    // ours refuses under 2.43 compatibility too, a deliberate divergence for safety
+    if (compatibility === "2.43") return;
+    const t = twins(`${BEHIND}
+(cd clone; mv sub real; ln -s real sub)
+`);
+      await expectTwins(t, [update([]), status([])]);
+      const t2 = twins(`${BASIC}
+(cd clone; git submodule -q init; rmdir sub; mkdir real; ln -s real sub)
+`);
+      await expectTwins(t2, [update([])]);
+    });
+
     it('t7400-submodule-basic.sh: "submodule update aborts on missing gitmodules url"', async () => {
       const t = twins(`${BASIC}
 (cd clone; git submodule -q init; git config --unset submodule.sub.url
@@ -595,68 +641,188 @@ mkdir sub; git -C sub init -q
   },
 );
 
+/** git-submodule.sh clones with GIT_PROTOCOL_FROM_USER=0: `test:` is allowed only by config. */
+const TEST_PROTOCOL_ENV = (): Record<string, string> => ({
+  ...testEnv(root),
+  GIT_CONFIG_PARAMETERS: "'protocol.file.allow'='always' 'protocol.test.allow'='always'",
+});
+
+/**
+ * `test://<host>/<repo>` serving `<twin>/<repo>` (whatever the host) through `g`'s working
+ * copy (`clone`), each connect recorded as `<host><path> <user>:<password> <Authorization>`.
+ */
+function testTransports(g: Git, calls: string[]): GitTransportRegistry {
+  const transports = createDefaultTransports();
+  transports.register({
+    name: "test-native",
+    schemes: ["test"],
+    async connect(request: GitConnectRequest) {
+      const creds = request.credentials
+        ? `${request.credentials.username}:${request.credentials.password}`
+        : "-";
+      calls.push(
+        `${request.url.host}${request.url.path} ${creds} ${request.headers?.Authorization ?? "-"}`,
+      );
+      const repo = await openLocalRemote(g.workingCopy, `..${request.url.path}`);
+      const [client, server] = createDuplexPair();
+      const head = await repo.history.refs.get("HEAD");
+      void serveOverDuplex({
+        duplex: server,
+        repository: createRepositoryFacade({ history: repo.history }),
+        refStore: createTransportRefStore(repo.history.refs),
+        service: request.service,
+        bare: repo.bare,
+        ...(head && "target" in head ? { currentBranch: head.target } : {}),
+        ...(request.protocolVersion === 2 ? { protocolVersion: "2" as const } : {}),
+      }).finally(() => server.close?.());
+      return { kind: "native", duplex: client, handshake: "implicit" };
+    },
+  });
+  return transports;
+}
+
+const SECRET = { username: "alice", password: "token-for-trusted" };
+const SECRET_HEADERS = { Authorization: "Bearer trusted-only" };
+
+/**
+ * `deep` (a commit), `up` with `deep` as submodule at `<deepUrl>`, `sup` with `up` as `sub`,
+ * and `clone` of `sup` whose remote is `test://trusted.example/sup` (so `../up` resolves to
+ * `test://trusted.example/up`) and whose `sub` URL is `<subUrl>`.
+ */
+const nested = (subUrl: string, deepUrl: string) => `
+git init -q -b main deeper; (cd deeper; echo e > e; git add e; git commit -qm e)
+git init -q -b main deep; (cd deep; echo d > d; git add d; git commit -qm d
+  git submodule add -q ../deeper deeper
+  git config -f .gitmodules submodule.deeper.url test://evil.example/deeper
+  git add .gitmodules; git commit -qm deeper)
+git init -q -b main up; (cd up; echo x > x; git add x; git commit -qm x
+  git submodule add -q ../deep deep; git config -f .gitmodules submodule.deep.url ${deepUrl}
+  git add .gitmodules; git commit -qm deep)
+git init -q -b main sup; (cd sup; echo a > a; git add a; git commit -qm a
+  git submodule add -q ../up sub; git commit -qm sub)
+git clone -q sup clone; git -C clone remote set-url origin test://trusted.example/sup
+git -C clone config -f .gitmodules submodule.sub.url ${subUrl}
+`;
+
 describeGit("git submodule update through the superproject's transports", () => {
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), "submodule-update-transports-"));
   });
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-  it("clones and fetches go through the given connector with the given credentials", async () => {
+  it("clones and fetches go through the given connector, with credentials for a named origin", async () => {
     const t = twins(`${BASIC}
 (cd clone; git config -f .gitmodules submodule.sub.url test://host/up)
 `);
-    // git-submodule.sh clones with GIT_PROTOCOL_FROM_USER=0: an unknown protocol is allowed only by config
-    const env = {
-      ...testEnv(root),
-      GIT_CONFIG_PARAMETERS: "'protocol.file.allow'='always' 'protocol.test.allow'='always'",
-    };
+    const env = TEST_PROTOCOL_ENV();
     const calls: string[] = [];
-    const transportsOf = (g: Git): GitTransportRegistry => {
-      const transports = createDefaultTransports();
-      transports.register({
-        name: "test-native",
-        schemes: ["test"],
-        async connect(request: GitConnectRequest) {
-          calls.push(
-            `${request.service} ${request.url.path} ${request.credentials?.username}:${request.credentials?.password}`,
-          );
-          const repo = await openLocalRemote(g.workingCopy, `..${request.url.path}`);
-          const [client, server] = createDuplexPair();
-          const head = await repo.history.refs.get("HEAD");
-          void serveOverDuplex({
-            duplex: server,
-            repository: createRepositoryFacade({ history: repo.history }),
-            refStore: createTransportRefStore(repo.history.refs),
-            service: request.service,
-            bare: repo.bare,
-            ...(head && "target" in head ? { currentBranch: head.target } : {}),
-            ...(request.protocolVersion === 2 ? { protocolVersion: "2" as const } : {}),
-          }).finally(() => server.close?.());
-          return { kind: "native", duplex: client, handshake: "implicit" };
-        },
-      });
-      return transports;
-    };
     const g = await ours(t, "clone", env);
     const first = await g
       .submoduleUpdate()
       .setInit(true)
-      .setTransports(transportsOf(g))
+      .setTransports(testTransports(g, calls))
       .setCredentials({ username: "u", password: "p" })
+      .addCredentialOrigin("test://host")
       .call();
     expect(first.stdout).toMatch(/^Submodule path 'sub': checked out '[0-9a-f]{40}'\n$/);
-    expect(calls).toEqual(["git-upload-pack /up u:p"]);
+    expect(calls).toEqual(["host/up u:p -"]);
     sh(join(t.ours, "up"), "echo r > r; git add r; git commit -qm r");
     const g2 = await ours(t, "clone", env);
     await g2
       .submoduleUpdate()
       .setRemote(true)
-      .setTransports(transportsOf(g2))
+      .setTransports(testTransports(g2, calls))
       .setCredentials({ username: "u", password: "p" })
+      .addCredentialOrigin("test://host/anything")
       .call();
-    expect(calls).toEqual(["git-upload-pack /up u:p", "git-upload-pack /up u:p"]);
+    expect(calls).toEqual(["host/up u:p -", "host/up u:p -"]);
     expect(ask(join(t.ours, "clone/sub"), ["rev-parse", "HEAD"])).toBe(
       ask(join(t.ours, "up"), ["rev-parse", "HEAD"]),
     );
+  });
+
+  it("static credentials and headers reach the superproject's origin, never a nested submodule's other host (depth 2 and 3)", async () => {
+    const t = twins(nested("../up", "test://evil.example/deep"));
+    const calls: string[] = [];
+    const g = await ours(t, "clone", TEST_PROTOCOL_ENV());
+    const result = await g
+      .submoduleUpdate()
+      .setInit(true)
+      .setRecursive(true)
+      .setTransports(testTransports(g, calls))
+      .setCredentials(SECRET)
+      .setHeaders(SECRET_HEADERS)
+      .call();
+    expect(result.exitCode).toBe(0);
+    expect(calls).toEqual([
+      "trusted.example/up alice:token-for-trusted Bearer trusted-only",
+      "evil.example/deep - -",
+      "evil.example/deeper - -",
+    ]);
+    // and later fetches inside the nested submodules: still nothing for evil.example
+    sh(join(t.ours, "deep"), "echo n > n; git add n; git commit -qm n");
+    calls.length = 0;
+    const g2 = await ours(t, "clone", TEST_PROTOCOL_ENV());
+    await g2
+      .submoduleUpdate()
+      .setRemote(true)
+      .setRecursive(true)
+      .setTransports(testTransports(g2, calls))
+      .setCredentials(SECRET)
+      .setHeaders(SECRET_HEADERS)
+      .call();
+    expect(calls.filter((c) => c.startsWith("evil.example"))).not.toHaveLength(0);
+    for (const call of calls.filter((c) => c.startsWith("evil.example"))) {
+      expect(call).not.toMatch(/alice|token|Bearer/);
+    }
+  });
+
+  it("a submodule at another host than the superproject's gets no static credentials (depth 1)", async () => {
+    const t = twins(nested("test://evil.example/up", "test://evil.example/deep"));
+    const calls: string[] = [];
+    const g = await ours(t, "clone", TEST_PROTOCOL_ENV());
+    await g
+      .submoduleUpdate()
+      .setInit(true)
+      .setRecursive(true)
+      .setTransports(testTransports(g, calls))
+      .setCredentials(SECRET)
+      .setHeaders(SECRET_HEADERS)
+      .call();
+    expect(calls).toEqual([
+      "evil.example/up - -",
+      "evil.example/deep - -",
+      "evil.example/deeper - -",
+    ]);
+  });
+
+  it("per-URL providers are asked with each URL, and their answers go to that URL alone", async () => {
+    const t = twins(nested("../up", "test://evil.example/deep"));
+    const calls: string[] = [];
+    const asked: string[] = [];
+    const g = await ours(t, "clone", TEST_PROTOCOL_ENV());
+    await g
+      .submoduleUpdate()
+      .setInit(true)
+      .setRecursive(true)
+      .setTransports(testTransports(g, calls))
+      .setCredentialsForUrl((url) => {
+        asked.push(url);
+        return url.startsWith("test://trusted.example/") ? SECRET : undefined;
+      })
+      .setHeadersForUrl((url) =>
+        url.startsWith("test://trusted.example/") ? SECRET_HEADERS : undefined,
+      )
+      .call();
+    expect(asked).toEqual([
+      "test://trusted.example/up",
+      "test://evil.example/deep",
+      "test://evil.example/deeper",
+    ]);
+    expect(calls).toEqual([
+      "trusted.example/up alice:token-for-trusted Bearer trusted-only",
+      "evil.example/deep - -",
+      "evil.example/deeper - -",
+    ]);
   });
 });

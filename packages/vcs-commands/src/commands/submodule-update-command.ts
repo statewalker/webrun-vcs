@@ -7,11 +7,13 @@
  */
 import type { ObjectId } from "@statewalker/vcs-core";
 import type { Credentials, GitTransportRegistry } from "@statewalker/vcs-transport";
+import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
-import { CheckoutCommand } from "./checkout-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
+import { CheckoutCommand, CheckoutStatus } from "./checkout-command.js";
 import { createIdAbbreviator } from "./core-config.js";
 import { DiffCommand } from "./diff-command.js";
 import { FetchCommand } from "./fetch-command.js";
@@ -22,6 +24,13 @@ import { MergeCommand } from "./merge-command.js";
 import { nameRevByTags } from "./name-rev.js";
 import { RebaseCommand } from "./rebase-command.js";
 import {
+  type CredentialsForUrl,
+  createSubmoduleAuthPolicy,
+  type HeadersForUrl,
+  type SubmoduleAuthFor,
+  urlOrigin,
+} from "./submodule-auth.js";
+import {
   notFromUser,
   SUBMODULE_UNSET_ENV,
   SubmoduleCommandBase,
@@ -31,6 +40,7 @@ import {
   type SubmoduleListEntry,
 } from "./submodule-commands.js";
 import {
+  defaultRemoteOf,
   joinFilesPath,
   openConfigFile,
   parseSubmoduleUpdateStrategy,
@@ -189,8 +199,9 @@ const NULL_ID_CHAR = "0";
  * `--remote` takes the commit from the submodule's remote-tracking branch instead
  * (`submodule.<name>.branch`, `.` for the superproject's branch, default `HEAD`), fetched
  * first unless `--no-fetch`. `--init` runs `submodule init` first; `--recursive` goes on in
- * each submodule's own submodules. Fetches and clones go through the transports and
- * credentials given here.
+ * each submodule's own submodules. Fetches and clones go through the transports given here;
+ * credentials and headers reach only the URLs they are given for (see {@link setCredentials},
+ * {@link setCredentialsForUrl}): `.gitmodules` is repository content, and can name any host.
  *
  * Output, refusals and the exit status are git's (stdout, stderr); where git returns 128
  * the command throws {@link SubmoduleCommandError}.
@@ -216,6 +227,11 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
   private transports?: GitTransportRegistry;
   private credentials?: Credentials;
   private headers?: Record<string, string>;
+  private readonly credentialOrigins: string[] = [];
+  private credentialsFor?: CredentialsForUrl;
+  private headersFor?: HeadersForUrl;
+  /** Set once at the top superproject, handed to nested updates unchanged */
+  private authPolicy?: SubmoduleAuthFor;
   private timeout?: number;
 
   /** A path (pathspec element) limiting the submodules; uninitialized ones are then reported. */
@@ -305,18 +321,85 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
     return this;
   }
 
-  /** The credentials clones and fetches authenticate with. */
+  /**
+   * Credentials for clones and fetches of the trusted origins only: those named with
+   * {@link addCredentialOrigin}, or, when none is named, the origin (scheme, host, port) of
+   * the superproject's own remote, against which relative submodule URLs resolve. A
+   * submodule (at any depth) whose URL names another origin gets none; a local path or
+   * `file:` URL has no origin and gets none either. Use {@link setCredentialsForUrl} to
+   * decide per URL.
+   */
   setCredentials(credentials: Credentials): this {
     this.checkCallable();
     this.credentials = credentials;
     return this;
   }
 
-  /** HTTP headers of clones and fetches. */
+  /** HTTP headers for clones and fetches of the trusted origins only (as {@link setCredentials}). */
   setHeaders(headers: Record<string, string>): this {
     this.checkCallable();
     this.headers = headers;
     return this;
+  }
+
+  /**
+   * An origin the static credentials and headers are for: a URL whose `<scheme>://<host>[:<port>]`
+   * is taken (`https://git.example.com`, or any URL of that host). Once one is named, the
+   * superproject's remote is no longer trusted by default.
+   */
+  addCredentialOrigin(url: string): this {
+    this.checkCallable();
+    const origin = urlOrigin(url);
+    if (origin === undefined) {
+      throw new GitApiError(`fatal: '${url}' names no origin (scheme and host) for credentials`);
+    }
+    this.credentialOrigins.push(origin);
+    return this;
+  }
+
+  /**
+   * Asked with the URL of each clone and fetch (after `insteadOf`, at any depth, git's
+   * credential helpers' per-URL match): its credentials, or undefined for the static ones'
+   * rule ({@link setCredentials}).
+   */
+  setCredentialsForUrl(provider: CredentialsForUrl): this {
+    this.checkCallable();
+    this.credentialsFor = provider;
+    return this;
+  }
+
+  /** Asked with the URL of each clone and fetch: its headers (as {@link setCredentialsForUrl}). */
+  setHeadersForUrl(provider: HeadersForUrl): this {
+    this.checkCallable();
+    this.headersFor = provider;
+    return this;
+  }
+
+  /** @internal The top superproject's policy, for a nested update. */
+  setAuthPolicy(policy: SubmoduleAuthFor): this {
+    this.checkCallable();
+    this.authPolicy = policy;
+    return this;
+  }
+
+  /** The policy: inherited, else built from the setters and the superproject's remote. */
+  private async auth(): Promise<SubmoduleAuthFor> {
+    if (this.authPolicy) return this.authPolicy;
+    let origins = this.credentialOrigins;
+    if (origins.length === 0 && (this.credentials || this.headers)) {
+      const store = RemoteConfigStore.from(this.workingCopy);
+      const url = store.urlFor(await defaultRemoteOf(this.workingCopy));
+      const origin = url !== undefined ? urlOrigin(url) : undefined;
+      origins = origin !== undefined ? [origin] : [];
+    }
+    this.authPolicy = createSubmoduleAuthPolicy({
+      ...(this.credentials ? { credentials: this.credentials } : {}),
+      ...(this.headers ? { headers: this.headers } : {}),
+      origins,
+      ...(this.credentialsFor ? { credentialsFor: this.credentialsFor } : {}),
+      ...(this.headersFor ? { headersFor: this.headersFor } : {}),
+    });
+    return this.authPolicy;
   }
 
   /** The timeout of clones and fetches, in milliseconds. */
@@ -443,8 +526,41 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
     }
     if (url === undefined) this.die(`fatal: cannot clone submodule '${sub.name}' without a URL`);
     const path = sub.path ?? entry.path;
-    const justCloned = (await this.kindOf(`${entry.path}/.git`)) === undefined;
+    // file_exists("<path>/.git"): stat follows symbolic links
+    const justCloned = !(await this.existsThroughLinks(`${entry.path}/.git`));
     return { record: { sub, path, id: entry.id, justCloned }, url };
+  }
+
+  /**
+   * Whether a worktree path exists as `stat` sees it: symbolic links on the way followed
+   * (relative ones, inside the storage; an absolute target counts as missing).
+   */
+  private async existsThroughLinks(path: string): Promise<boolean> {
+    const files = this.worktreeAccess?.getFiles?.() as PosixFilesApi | undefined;
+    if (!files?.lstat || !files.readlink) return (await this.kindOf(path)) !== undefined;
+    let parts = this.filesPath(path).split("/").filter(Boolean);
+    const resolved: string[] = [];
+    for (let hops = 0; parts.length > 0; ) {
+      const part = parts.shift() as string;
+      if (part === ".") continue;
+      if (part === "..") {
+        resolved.pop();
+        continue;
+      }
+      const at = [...resolved, part].join("/");
+      const st = await files.lstat(at).catch(() => undefined);
+      if (!st) return false;
+      if (st.kind !== "symlink") {
+        resolved.push(part);
+        continue;
+      }
+      if (++hops > 40) return false;
+      const bytes = await files.readlink(at).catch(() => undefined);
+      const target = bytes ? new TextDecoder().decode(bytes) : undefined;
+      if (target === undefined || target.startsWith("/")) return false;
+      parts = [...target.split("/").filter(Boolean), ...parts];
+    }
+    return true;
   }
 
   /** submodule--helper's `clone` child: false when it failed (its lines printed). */
@@ -473,8 +589,7 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
         references: this.references,
         requireInit: this.requireInit,
         ...(this.transports ? { transports: this.transports } : {}),
-        ...(this.credentials ? { credentials: this.credentials } : {}),
-        ...(this.headers ? { headers: this.headers } : {}),
+        authFor: await this.auth(),
         ...(this.timeout !== undefined ? { timeout: this.timeout } : {}),
       });
       return true;
@@ -608,11 +723,16 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
   ): Promise<boolean> {
     const fetch = new FetchCommand(inner);
     if (this.transports) fetch.setTransports(this.transports);
-    if (this.credentials) fetch.setCredentials(this.credentials);
-    if (this.headers) fetch.setHeaders(this.headers);
     if (this.timeout !== undefined) fetch.setTimeout(this.timeout);
     if (this.depth) fetch.setDepth(this.depth);
-    if (target) fetch.setRemote(target.remote).setRefSpecs(target.id);
+    // the remote named, so its URL is known: `git fetch` alone fetches the default remote
+    const remote = target?.remote ?? (await defaultRemoteOf(inner));
+    fetch.setRemote(remote);
+    if (target) fetch.setRefSpecs(target.id);
+    const url = RemoteConfigStore.from(inner).remoteUrlOf(remote);
+    const auth = (await this.auth())(url);
+    if (auth.credentials) fetch.setCredentials(auth.credentials);
+    if (auth.headers) fetch.setHeaders(auth.headers);
     try {
       const result = await fetch.call();
       if (!quiet) {
@@ -674,6 +794,13 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
             .setForced(subforce)
             .call();
           for (const w of result.warnings ?? []) this.out.stderr += `${w}\n`;
+          if (result.status !== CheckoutStatus.OK) {
+            // a refused checkout (local changes, untracked files in the way): git checkout's
+            // lines, exit 1
+            if (result.message) this.out.stderr += `${result.message.replace(/\n$/, "")}\n`;
+            this.out.stderr += `fatal: Unable to checkout '${id}' in submodule path '${dp}'\n`;
+            return 1;
+          }
         } catch (error) {
           if (!(error instanceof GitApiError)) throw error;
           this.out.stderr += `${error.message}\n`;
@@ -823,8 +950,8 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
     if (this.recommendShallow !== undefined) child.setRecommendShallow(this.recommendShallow);
     for (const reference of this.references) child.addReference(reference);
     if (this.transports) child.setTransports(this.transports);
-    if (this.credentials) child.setCredentials(this.credentials);
-    if (this.headers) child.setHeaders(this.headers);
+    // the top superproject's policy: a nested superproject's remote is no trusted origin
+    child.setAuthPolicy(await this.auth());
     if (this.timeout !== undefined) child.setTimeout(this.timeout);
     let code: number;
     try {
