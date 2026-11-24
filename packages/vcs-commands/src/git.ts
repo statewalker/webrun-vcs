@@ -37,6 +37,7 @@ import {
   FormatPatchCommand,
   FsckCommand,
   GarbageCollectCommand,
+  GrepCommand,
   HookListCommand,
   HookRunCommand,
   InitCommand,
@@ -1401,6 +1402,20 @@ export class Git implements Disposable {
   backfill(): BackfillCommand {
     this.checkClosed();
     return new BackfillCommand(this._workingCopy);
+  }
+
+  /**
+   * `git grep`: lines matching patterns in the worktree, the index, untracked files or
+   * revisions.
+   *
+   * @example
+   * ```typescript
+   * const { output, exitCode } = await git.grep().addPattern("TODO").setLineNumber(true).call();
+   * ```
+   */
+  grep(): GrepCommand {
+    this.checkClosed();
+    return new GrepCommand(this._workingCopy);
   }
 
   // ============ Bisect Operations ============
