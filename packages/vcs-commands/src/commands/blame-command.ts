@@ -36,6 +36,7 @@ import { abbrevLengths } from "./core-config.js";
 import { localTimezoneOffset } from "./git-date.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { type Mailmap, readMailmapFile, readRepositoryMailmap } from "./mailmap.js";
+import { OperationState } from "./merge-support.js";
 import { canonicalObjectId } from "./object-id-input.js";
 
 /** Line bytes the interner holds before blame starts a new one (see `setInternerByteLimit`) */
@@ -223,7 +224,11 @@ export interface BlameContentsOptions {
   time?: number;
   /** Its zone, `+HHMM` (default the local zone at `time`) */
   tzOffset?: string;
-  /** The file's mode (default `100644`) */
+  /**
+   * The file's mode, as git's `canon_mode` of the `--contents` file's stat or the working
+   * tree file's lstat (`120000` for a link, whose content is its target); default, as for
+   * standard input, the index entry's mode at the path, else `100644`
+   */
   mode?: number;
 }
 
@@ -631,6 +636,8 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private states = new Map<ObjectId, CommitState>();
   /** The `--contents` buffer's blob and mode */
   private fakeEntry?: { id: ObjectId; mode: number };
+  /** The index's files with the `--contents` buffer at its path (the fake commit's "tree") */
+  private fakeFiles?: Map<string, { id: ObjectId; mode: number }>;
   /** Numbers the lines of every version compared, so each is split and hashed once */
   private interner?: LineInterner;
 
@@ -825,13 +832,15 @@ export class BlameCommand extends GitCommand<BlameResult> {
 
   /**
    * Blame a buffer instead of the start commit's file (`--contents <file>`): git's fake
-   * commit on top of the start commit (default HEAD), with null id, holding `content` at the
-   * blamed path. Its lines are blamed on "External file (--contents)" where the start
-   * commit's file differs (`workingTree`: "Not Committed Yet", as `git blame <path>` blames
-   * the working tree's file). The content is taken as git stores it (no clean filters).
+   * commit on top of the start commit (default HEAD) and the commits `MERGE_HEAD` names,
+   * with null id, holding `content` at the blamed path of the index. Its lines are blamed on
+   * "External file (--contents)" where the parents' file differs (`workingTree`: "Not
+   * Committed Yet", as `git blame <path>` blames the working tree's file); a path only the
+   * index has is all its own, a rename staged in the index is followed. The content is taken
+   * as git stores it (no clean filters).
    *
    * @throws Error `--contents and --reverse do not blend well.` with `setReverse`, and
-   * `no such path '<path>' in HEAD` when the start commit lacks the path
+   * `no such path '<path>' in HEAD` when neither a parent nor the index has the path
    */
   setContents(content: Uint8Array, options: BlameContentsOptions = {}): this {
     this.checkCallable();
@@ -1352,15 +1361,32 @@ export class BlameCommand extends GitCommand<BlameResult> {
 
   /**
    * blame.c's `fake_working_tree_commit`: a commit with the null id on top of `parentId`
-   * whose file at `path` is the `--contents` buffer; its id is returned
+   * (and the commits MERGE_HEAD names, `append_merge_parents`) whose file at `path` is the
+   * `--contents` buffer; its id is returned
    */
   private async fakeWorkingTreeCommit(parentId: ObjectId, path: string): Promise<ObjectId> {
     const contents = this.contents as { content: Uint8Array } & BlameContentsOptions;
     const parent = await this.state(parentId);
     if (!parent) throw new Error(`no such commit ${parentId}`);
-    // verify_working_tree_path
-    const inParent = await this.lookup(parent.commit.tree, path);
-    if (!inParent) throw new Error(`no such path '${path}' in HEAD`);
+    const parents = [parentId];
+    for (const id of await this.mergeHeadParents()) {
+      if (!(await this.state(id))) throw new Error(`no such commit ${id}`);
+      parents.push(id);
+    }
+    const index = await this.indexEntries();
+    // verify_working_tree_path: a blob of a parent, else any stage of the index
+    let known = false;
+    for (const id of parents) {
+      const st = this.states.get(id);
+      const entry = st && (await this.lookup(st.commit.tree, path));
+      if (entry && (entry.mode & S_IFMT) !== GITLINK_MODE) {
+        known = true;
+        break;
+      }
+    }
+    if (!known && !index.some((e) => e.path === path)) {
+      throw new Error(`no such path '${path}' in HEAD`);
+    }
     const time = contents.time ?? Math.floor(Date.now() / 1000);
     const tzOffset = contents.tzOffset ?? localTimezoneOffset(time);
     const ident = contents.workingTree
@@ -1374,12 +1400,24 @@ export class BlameCommand extends GitCommand<BlameResult> {
     const id = this.objectFormat.nullId;
     const blobId = await computeObjectId("blob", contents.content, this.objectFormat);
     this.pretend.set(blobId, contents.content);
-    this.fakeEntry = { id: blobId, mode: contents.mode ?? 0o100644 };
+    // without a mode (standard input): the index's stage-0 entry's, else a regular file's
+    const staged = index.find((e) => e.path === path && e.stage === 0);
+    const mode = contents.mode ?? staged?.mode ?? 0o100644;
+    this.fakeEntry = { id: blobId, mode };
+    // the index with the path replaced: what git diffs the parents against (do_diff_cache)
+    const files = new Map<string, { id: ObjectId; mode: number }>();
+    for (const e of index) {
+      if (e.stage === 0 && (e.mode & S_IFMT) !== GITLINK_MODE) {
+        files.set(e.path, { id: e.objectId, mode: e.mode });
+      }
+    }
+    files.set(path, { id: blobId, mode });
+    this.fakeFiles = files;
     this.states.set(id, {
-      // the parent's tree stands for the index git diffs the fake commit against
       commit: {
+        // the parent's tree stands for the index where a tree is read (`-C`)
         tree: parent.commit.tree,
-        parents: [parentId],
+        parents,
         author: ident,
         committer: ident,
         message: `Version of ${path} from ${from}\n`,
@@ -1389,6 +1427,47 @@ export class BlameCommand extends GitCommand<BlameResult> {
       uninteresting: false,
     });
     return id;
+  }
+
+  /** The commits `.git/MERGE_HEAD` names, one per line (`append_merge_parents`) */
+  private async mergeHeadParents(): Promise<ObjectId[]> {
+    let text: string | undefined;
+    try {
+      text = await new OperationState(this.workingCopy.checkout, this.refsStore).read("MERGE_HEAD");
+    } catch {
+      return [];
+    }
+    const out: ObjectId[] = [];
+    for (const line of (text ?? "").split("\n")) {
+      if (line === "") continue;
+      // get_oid_hex reads the line's first digits
+      const hex = line.slice(0, this.objectFormat.hexLength).toLowerCase();
+      if (!this.isFullObjectId(hex)) throw new Error(`unknown line in 'MERGE_HEAD': ${line}`);
+      out.push(hex);
+    }
+    return out;
+  }
+
+  /** Every entry of the index, none without one (a bare repository) */
+  private async indexEntries(): Promise<
+    Array<{
+      path: string;
+      mode: number;
+      objectId: ObjectId;
+      stage: number;
+    }>
+  > {
+    try {
+      const staging = this.staging;
+      if (await staging.isOutdated()) await staging.read();
+      const out = [];
+      for await (const e of staging.entries()) {
+        out.push({ path: e.path, mode: e.mode, objectId: e.objectId, stage: e.stage });
+      }
+      return out;
+    } catch {
+      return [];
+    }
   }
 
   /** git's `pass_blame` */
@@ -1946,7 +2025,9 @@ export class BlameCommand extends GitCommand<BlameResult> {
     const before = new Map<string, { id: ObjectId; mode: number }>();
     const after = new Map<string, { id: ObjectId; mode: number }>();
     await this.collectBlobs(parent.commit.tree, "", before);
-    await this.collectBlobs(child.commit.tree, "", after);
+    if (origin.commitId === this.objectFormat.nullId && this.fakeFiles) {
+      for (const [p, e] of this.fakeFiles) after.set(p, e);
+    } else await this.collectBlobs(child.commit.tree, "", after);
     const sources = [];
     for (const [path, e] of before) {
       if (!after.has(path) && !(await this.isBig(e.id))) sources.push({ path, ...e });

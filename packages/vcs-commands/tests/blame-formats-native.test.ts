@@ -11,7 +11,17 @@
  * so ours is run with each second native git's run took.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -144,14 +154,24 @@ async function ours(dir: string, argv: string[], time: number, stdin?: string) {
   if (!atLeast(2, 50)) cmd.setAlgorithm("myers");
   if (p.revs.length > 0) cmd.setStartCommit(resolve(p.revs[0]));
   const contents = p.values.get("--contents")?.[0];
-  if (contents !== undefined) {
-    const content = contents === "-" ? Buffer.from(stdin ?? "") : readFileSync(join(dir, contents));
-    cmd.setContents(new Uint8Array(content), { name: contents, time });
-  } else if (p.revs.length === 0) {
-    cmd.setContents(new Uint8Array(readFileSync(join(dir, p.path))), {
-      workingTree: true,
+  // git's canon_mode of the file's stat: --contents <file> stats it, the working tree's
+  // file is lstat'ed (a link is its target's name); standard input takes the index's mode
+  const canonMode = (st: { mode: number; isSymbolicLink(): boolean }) =>
+    st.isSymbolicLink() ? 0o120000 : st.mode & 0o100 ? 0o100755 : 0o100644;
+  if (contents === "-") {
+    cmd.setContents(new Uint8Array(Buffer.from(stdin ?? "")), { name: contents, time });
+  } else if (contents !== undefined) {
+    const file = join(dir, contents);
+    cmd.setContents(new Uint8Array(readFileSync(file)), {
+      name: contents,
       time,
+      mode: canonMode(statSync(file)),
     });
+  } else if (p.revs.length === 0) {
+    const file = join(dir, p.path);
+    const st = lstatSync(file);
+    const content = st.isSymbolicLink() ? Buffer.from(readlinkSync(file)) : readFileSync(file);
+    cmd.setContents(new Uint8Array(content), { workingTree: true, time, mode: canonMode(st) });
   }
   const since = p.values.get("--since")?.[0];
   if (since !== undefined) {
@@ -590,5 +610,74 @@ describeGit("git blame colors against native git", () => {
       ["blame", "--color-lines", "hello.c"],
     ]);
     git(d, ["checkout", "--", "hello.c"]);
+  });
+});
+
+describeGit("git blame of the working tree and --contents: the index and MERGE_HEAD", () => {
+  it('annotate-tests.sh: "blame working copy", "blame with --contents" with staged paths, links and a merge in progress', async () => {
+    const d = join(tmp(), "fake-commit");
+    mkdirSync(d);
+    git(d, ["init", "-q", "-b", "main"]);
+    let tick = 0;
+    const commit = (args: string[]) =>
+      git(d, ["commit", "-q", ...args], undefined, commitEnv(++tick));
+    writeFileSync(join(d, "file"), "one\ntwo\nthree\n");
+    symlinkSync("file", join(d, "link"));
+    git(d, ["add", "file", "link"]);
+    commit(["-m", "initial"]);
+
+    // a link: --contents - takes the index's mode (120000), so the link's commit keeps it
+    await expectSame(
+      d,
+      [
+        ["blame", "--contents", "-", "HEAD", "--", "link"],
+        ["blame", "--porcelain", "--contents", "-", "--", "link"],
+      ],
+      { stdin: "file" },
+    );
+    await expectSame(d, [["blame", "--contents", "-", "--", "link"]], { stdin: "other" });
+    await expectSame(d, [
+      ["blame", "link"],
+      // a regular file given for a link: the type changed, every line is the fake commit's
+      ["blame", "--contents", "file", "--", "link"],
+    ]);
+
+    // a path only the index has: blamed whole on the fake commit
+    writeFileSync(join(d, "staged"), "x\ny\n");
+    git(d, ["add", "staged"]);
+    await expectSame(d, [
+      ["blame", "staged"],
+      ["blame", "--incremental", "staged"],
+      ["blame", "--contents", "staged", "--", "staged"],
+    ]);
+    await expectSame(d, [["blame", "--contents", "-", "--", "staged"]], { stdin: "x\n" });
+
+    // a staged rename: the index's deletion is the rename's source
+    git(d, ["mv", "file", "renamed"]);
+    writeFileSync(join(d, "renamed"), "one\ntwo\nthree\nfour\n");
+    await expectSame(d, [
+      ["blame", "renamed"],
+      ["blame", "--porcelain", "renamed"],
+    ]);
+    git(d, ["reset", "-q", "--hard"]);
+    rmSync(join(d, "staged"), { force: true });
+
+    // a merge in progress: MERGE_HEAD's commits are the fake commit's other parents
+    git(d, ["checkout", "-q", "-b", "side"]);
+    writeFileSync(join(d, "file"), "zero\none\ntwo\nthree\n");
+    commit(["-a", "-m", "side"]);
+    git(d, ["checkout", "-q", "main"]);
+    writeFileSync(join(d, "file"), "one\ntwo\nthree\nfour\n");
+    commit(["-a", "-m", "main"]);
+    git(d, ["merge", "-q", "--no-commit", "--no-ff", "side"], undefined, commitEnv(++tick));
+    await expectSame(d, [
+      ["blame", "file"],
+      ["blame", "--porcelain", "file"],
+      ["blame", "--first-parent", "file"],
+    ]);
+    await expectSame(d, [["blame", "--contents", "-", "--", "file"]], {
+      stdin: "zero\none\ntwo\nthree\nfour\nfive\n",
+    });
+    git(d, ["merge", "--abort"]);
   });
 });

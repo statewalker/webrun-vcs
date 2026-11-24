@@ -4,7 +4,7 @@
  * and compared byte for byte in the output formats asked for.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   createFileWorktree,
@@ -77,6 +77,8 @@ export async function open(dir: string): Promise<Git> {
   const config = new GitWorkingCopyConfig(io, ".git/config");
   await config.load();
   const staging = new FileStagingStore(files, ".git/index");
+  // the index as git reads it at the start of every command (none: empty)
+  if (existsSync(join(dir, ".git/index"))) await staging.read();
   const checkout = new GitCheckout({
     staging,
     refs: history.refs,
