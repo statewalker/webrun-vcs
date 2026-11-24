@@ -1371,9 +1371,21 @@ export class FileWorktree implements Worktree {
       // the submodule's own format, from its blobs (a superproject's may differ)
       ...environment,
     });
+    const checkout = new MemoryCheckout({ staging });
+    // FETCH_HEAD is the repository's file, as a fetch in the submodule writes it (`git fetch
+    // --recurse-submodules`, `git submodule update`'s fetches); other state stays in memory
+    const fetchHead = joinPath(gitDir, "FETCH_HEAD");
+    checkout.readFetchHead = async () =>
+      (await files.exists(fetchHead))
+        ? new TextDecoder().decode(await readFile(files, fetchHead))
+        : undefined;
+    checkout.writeFetchHead = async (content, options) => {
+      const before = options?.append ? ((await checkout.readFetchHead()) ?? "") : "";
+      await files.write(fetchHead, [new TextEncoder().encode(`${before}${content}`)]);
+    };
     return new MemoryWorkingCopy({
       history,
-      checkout: new MemoryCheckout({ staging }),
+      checkout,
       worktree,
       config,
     });

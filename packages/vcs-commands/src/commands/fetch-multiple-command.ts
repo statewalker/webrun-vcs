@@ -7,6 +7,7 @@ import { GuardedTransportCommand } from "../guarded-transport-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type FetchResult, RefUpdateStatus } from "../results/index.js";
 import { FetchCommand, TagOption } from "./fetch-command.js";
+import type { FetchRecurseSubmodules } from "./submodule-fetch.js";
 
 /** One fetch of a {@link FetchMultipleCommand}: git's child `git fetch <remote>`. */
 export interface FetchMultipleEntry {
@@ -72,6 +73,7 @@ export class FetchMultipleCommand extends GuardedTransportCommand<FetchMultipleR
   private prune?: boolean;
   private pruneTags?: boolean;
   private tagOption?: TagOption;
+  private recurseSubmodules?: FetchRecurseSubmodules;
   private dryRun = false;
   private force = false;
   private updateHeadOk = false;
@@ -142,6 +144,16 @@ export class FetchMultipleCommand extends GuardedTransportCommand<FetchMultipleR
   setDryRun(dryRun: boolean): this {
     this.checkCallable();
     this.dryRun = dryRun;
+    return this;
+  }
+
+  /**
+   * `--[no-]recurse-submodules[=<mode>]`, passed to each fetch (`FetchCommand.setRecurseSubmodules`);
+   * unset, each fetch reads the configuration and recurses on demand.
+   */
+  setRecurseSubmodules(mode: boolean | FetchRecurseSubmodules): this {
+    this.checkCallable();
+    this.recurseSubmodules = mode === true ? "yes" : mode === false ? "no" : mode;
     return this;
   }
 
@@ -410,6 +422,7 @@ export class FetchMultipleCommand extends GuardedTransportCommand<FetchMultipleR
     if (this.tagOption !== undefined) fetch.setTagOpt(this.tagOption);
     if (this.dryRun) fetch.setDryRun(true);
     if (this.force) fetch.setForceUpdate(true);
+    if (this.recurseSubmodules !== undefined) fetch.setRecurseSubmodules(this.recurseSubmodules);
     if (this.updateHeadOk) fetch.setUpdateHeadOk(true);
     if (this.verbose) fetch.setVerbose(true);
     if (this.porcelain) fetch.setPorcelain(true);
@@ -423,7 +436,9 @@ export class FetchMultipleCommand extends GuardedTransportCommand<FetchMultipleR
       const refused =
         result.trackingRefUpdates.some(
           (u) => u.status === RefUpdateStatus.REJECTED || u.status === RefUpdateStatus.LOCK_FAILURE,
-        ) || (result.errors?.length ?? 0) > 0;
+        ) ||
+        (result.errors?.length ?? 0) > 0 ||
+        result.submodulesFailed === true;
       return { remote, result, exitCode: refused ? 1 : 0 };
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -442,6 +457,13 @@ export class FetchMultipleCommand extends GuardedTransportCommand<FetchMultipleR
         : [this.pruneTags ? "--prune-tags" : "--no-prune-tags"]),
       ...(this.updateHeadOk ? ["--update-head-ok"] : []),
       ...(this.force ? ["--force"] : []),
+      ...(this.recurseSubmodules === "yes"
+        ? ["--recurse-submodules"]
+        : this.recurseSubmodules === "no"
+          ? ["--no-recurse-submodules"]
+          : this.recurseSubmodules === "on-demand"
+            ? ["--recurse-submodules=on-demand"]
+            : []),
       ...(this.tagOption === TagOption.FETCH_TAGS ? ["--tags"] : []),
       ...(this.tagOption === TagOption.NO_TAGS ? ["--no-tags"] : []),
       ...(this.verbose ? ["-v"] : []),
@@ -532,13 +554,13 @@ function stderrOf(entry: FetchMultipleEntry, porcelain: boolean): string {
   if (entry.error) return linesOf([entry.error.message]);
   const result = entry.result;
   if (!result) return "";
-  return linesOf([
+  return `${linesOf([
     ...(porcelain ? [] : (result.display ?? [])),
     ...result.messages,
     ...(result.errors ?? []).map((e) =>
       e.startsWith("error: ") || e.startsWith("fatal: ") ? e : `error: ${e}`,
     ),
-  ]);
+  ])}${result.submoduleOutput ?? ""}`;
 }
 
 /**

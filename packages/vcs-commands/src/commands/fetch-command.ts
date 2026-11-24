@@ -39,6 +39,7 @@ import { nullObjectIdLike } from "@statewalker/vcs-utils/hash";
 import type { WorktreeAdmin } from "@statewalker/vcs-working-tree";
 import {
   FetchIntoCheckedOutBranchError,
+  GitApiError,
   InvalidArgumentError,
   InvalidRemoteError,
   TransportError,
@@ -60,6 +61,20 @@ import {
   registerPartialClone,
 } from "./promisor-remote.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
+import {
+  createSubmoduleAuthPolicy,
+  guardSubmoduleTransports,
+  strictUrlOrigin,
+} from "./submodule-auth.js";
+import {
+  type FetchRecurseSubmodules,
+  fetchSubmodules,
+  parseFetchRecurseSubmodules,
+  SubmoduleFetchRepository,
+  type SubmoduleFetchRun,
+  type SubmoduleFetchTask,
+} from "./submodule-fetch.js";
+import { defaultRemoteOf, SubmoduleModel } from "./submodule-model.js";
 import { worktreeUsingBranch } from "./worktree-support.js";
 
 /**
@@ -145,6 +160,15 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   private filterSpec?: string | false;
   private refetch = false;
   private setUpstream = false;
+  /** `--[no-]recurse-submodules[=<mode>]`; unset: the configuration's */
+  private recurseSubmodules?: FetchRecurseSubmodules;
+  /** `--recurse-submodules-default` (a submodule's fetch run by its superproject's) */
+  private recurseSubmodulesDefault: "yes" | "on-demand" = "on-demand";
+  /** `--submodule-prefix` */
+  private submodulePrefix = "";
+  private quiet = false;
+  /** The arguments git's reflog action names, when this fetch is a superproject's child */
+  private childArguments?: string[];
 
   /**
    * Set the remote to fetch from.
@@ -317,6 +341,58 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   setPorcelain(porcelain: boolean): this {
     this.checkCallable();
     this.porcelain = porcelain;
+    return this;
+  }
+
+  /**
+   * `--recurse-submodules[=yes|on-demand|no]` / `--no-recurse-submodules` (true is `yes`,
+   * false `no`). Unset, git's configuration decides (`submodule.recurse`,
+   * `fetch.recurseSubmodules`, in config order; else `.gitmodules`' `fetch.recurseSubmodules`),
+   * and without any the fetch recurses on demand: after the superproject's refs are stored,
+   * each submodule whose recorded commit the fetched history changed is fetched, as
+   * `submodule.<name>.fetchRecurseSubmodules` allows (`yes`: every populated submodule).
+   * The submodules' fetches print into {@link FetchResult.submoduleOutput} and their results
+   * are {@link FetchResult.submodules}; a failed one fails the fetch (git's exit status 1,
+   * {@link FetchResult.submodulesFailed}). Submodules are fetched one at a time (git's
+   * `submodule.fetchJobs`/`-j` only run several at once; one job is this order).
+   *
+   * A submodule's URL comes from repository content: the transports given here reach it, but
+   * this fetch's credentials and headers go to it only when its origin is the origin of the
+   * remote this fetch is for (`guardSubmoduleTransports`).
+   */
+  setRecurseSubmodules(mode: boolean | FetchRecurseSubmodules): this {
+    this.checkCallable();
+    this.recurseSubmodules = mode === true ? "yes" : mode === false ? "no" : mode;
+    return this;
+  }
+
+  /**
+   * `-q`: the submodules' fetches are quiet and no `Fetching submodule` line is printed
+   * ({@link FetchResult.display} is still returned: the caller prints it or not).
+   */
+  setQuiet(quiet: boolean): this {
+    this.checkCallable();
+    this.quiet = quiet;
+    return this;
+  }
+
+  /** @internal `--recurse-submodules-default` and `--submodule-prefix` of a submodule's fetch. */
+  setSubmoduleContext(
+    defaultMode: "yes" | "on-demand",
+    prefix: string,
+    childArguments: string[],
+  ): this {
+    this.checkCallable();
+    this.recurseSubmodulesDefault = defaultMode;
+    this.submodulePrefix = prefix;
+    this.childArguments = childArguments;
+    return this;
+  }
+
+  /** @internal The remote `git fetch` without one fetches (not named on its command line). */
+  setDefaultRemote(remote: string): this {
+    this.checkCallable();
+    this.remote = remote;
     return this;
   }
 
@@ -711,6 +787,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     }
 
     const store = RemoteConfigStore.from(this.workingCopy);
+    // cmd_fetch: how far to recurse into submodules, settled before anything is fetched
+    const recursion = await this.submoduleRecursion(store);
     // git's remote_is_configured: a remote name with a config section, not a URL
     const viaConfig = store.isConfigured(this.remote);
     const prune =
@@ -772,12 +850,13 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const errors: string[] = [];
     const trackingUpdates: TrackingRefUpdate[] = [];
 
+    // the refs before the fetch stores any (ref_tips_before_fetch)
+    let refsBefore = recursion ? await recursion.repository.refTips() : new Map<string, ObjectId>();
+
     // transport_get: git's local transport (upload-pack of the repository at the path, in
     // process), or the connector the transport registry names (smart HTTP by default);
     // anything else fails in git's words. The remote is reached before FETCH_HEAD is touched
     // (transport_get_remote_refs comes first in do_fetch)
-    const remote = await this.prepareRemote(remoteUrl);
-
     // git truncates FETCH_HEAD when the fetch starts: a failed fetch leaves it empty
     // a bare repository writes FETCH_HEAD in its git directory (no checkout to ask)
     const checkout =
@@ -785,6 +864,19 @@ export class FetchCommand extends TransportCommand<FetchResult> {
         ? this._workingCopy.checkout
         : (this._workingCopy as Partial<Pick<WorktreeAdmin, "bareRepository">>).bareRepository;
     const writesFetchHead = !this.dryRun && this.writeFetchHead && !!checkout?.writeFetchHead;
+    const remote = await this.prepareRemote(remoteUrl).catch(async (error: unknown) => {
+      // a local path naming no repository: git's upload-pack child dies only once the
+      // fetch has opened FETCH_HEAD, so it is left empty
+      if (
+        writesFetchHead &&
+        !this.appendFetchHead &&
+        error instanceof Error &&
+        error.message.includes("does not appear to be a git repository")
+      ) {
+        await checkout.writeFetchHead?.("");
+      }
+      throw error;
+    });
     if (writesFetchHead && !this.appendFetchHead) await checkout.writeFetchHead?.("");
 
     // fetch_one_setup_partial: the filter given (the remote registered as a promisor remote),
@@ -846,6 +938,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
         const defer = this.atomic && !this.dryRun;
         const pruned = await this.pruneDeletedRefs(names, pruneSpecs, messages, errors, defer);
         trackingUpdates.push(...pruned);
+        // check_for_new_submodule_commits reads the refs once the stale ones are gone
+        if (recursion && !defer) refsBefore = await recursion.repository.refTips();
         return defer ? { deletes: pruned.map((u) => u.localRef) } : undefined;
       },
       missingRefsOk: useConfig,
@@ -870,9 +964,11 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       reflogAction: this.reflogAction(
         [
           "fetch",
-          ...this.commandLineOptions(),
-          ...(this.remoteGiven || this.refSpecs.length > 0 ? [this.remote] : []),
-          ...this.refSpecs,
+          ...(this.childArguments ?? [
+            ...this.commandLineOptions(),
+            ...(this.remoteGiven || this.refSpecs.length > 0 ? [this.remote] : []),
+            ...this.refSpecs,
+          ]),
         ].join(" "),
       ),
       reflogIdent: this.reflogLine("").ident,
@@ -982,6 +1078,24 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       }
     }
 
+    // cmd_fetch: once the fetch succeeded, its submodules (fetch_submodules)
+    let submodules: Partial<FetchResult> = {};
+    if (recursion && !refused && errors.length === 0) {
+      // store_updated_refs' check_for_new_submodule_commits: each ref of the ref map that
+      // changes its local ref, or is fetched into FETCH_HEAD only
+      const tipsAfter = marked
+        .filter((e) => !e.shallowRejected)
+        .filter((e) => e.localRef === undefined || refsBefore.get(e.localRef) !== e.oid)
+        .map((e) => e.oid);
+      submodules = await this.fetchSubmodulesAfter(
+        recursion.commandLine,
+        tipsAfter.length > 0 ? [...refsBefore.values()] : [],
+        tipsAfter,
+        remoteUrl,
+        compatibility,
+      );
+    }
+
     // fetch.c: after the fetch (and its submodules), a split graph of what the refs reach
     // (write_commit_graph_reachable with COMMIT_GRAPH_WRITE_SPLIT), on --write-commit-graph
     // or fetch.writeCommitGraph
@@ -998,6 +1112,172 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       messages,
       display,
       ...(errors.length > 0 ? { errors } : {}),
+      ...submodules,
+    };
+  }
+
+  /**
+   * cmd_fetch's `config.recurse_submodules`: the command line, else `submodule.recurse` and
+   * `fetch.recurseSubmodules` in config order, else `.gitmodules`' `fetch.recurseSubmodules`;
+   * undefined when the fetch does not recurse (`no`, `--porcelain`, no worktree). git checks
+   * `submodule.fetchJobs` there too (a negative one dies).
+   */
+  private async submoduleRecursion(
+    store: RemoteConfigStore,
+  ): Promise<
+    | { commandLine: FetchRecurseSubmodules | undefined; repository: SubmoduleFetchRepository }
+    | undefined
+  > {
+    let mode: FetchRecurseSubmodules | undefined;
+    for (const entry of store.entriesWithOriginFor([
+      "submodule.recurse",
+      "fetch.recursesubmodules",
+    ]) ?? []) {
+      if (entry.key === "submodule.recurse") {
+        const bool = entry.text === undefined ? true : parseGitBool(entry.text);
+        if (bool === undefined) {
+          throw new GitApiError(
+            `fatal: bad boolean config value '${entry.text}' for 'submodule.recurse'`,
+            { exitCode: 128 },
+          );
+        }
+        mode = bool ? "yes" : "no";
+      } else mode = parseFetchRecurseSubmodules("fetch.recursesubmodules", entry.text);
+    }
+    if (this.recurseSubmodules !== undefined) mode = this.recurseSubmodules;
+    if (!this.worktreeAccess) return undefined;
+    let model: SubmoduleModel | undefined;
+    if (mode !== "no") {
+      model = await SubmoduleModel.load(this.workingCopy).catch(() => undefined);
+      for (const setting of model?.gitmodules.settings ?? []) {
+        if (setting.key === "submodule.fetchjobs") {
+          const jobs = Number(setting.value);
+          if (Number.isInteger(jobs) && jobs < 0) {
+            throw new GitApiError("fatal: negative values not allowed for submodule.fetchJobs", {
+              exitCode: 128,
+            });
+          }
+        } else if (setting.key === "fetch.recursesubmodules" && mode === undefined) {
+          mode = parseFetchRecurseSubmodules("fetch.recursesubmodules", setting.value);
+        }
+      }
+    }
+    if (this.porcelain) {
+      if (this.recurseSubmodules === "yes" || this.recurseSubmodules === "on-demand") {
+        throw new GitApiError(
+          "fatal: options '--porcelain' and '--recurse-submodules' cannot be used together",
+          { exitCode: 128 },
+        );
+      }
+      return undefined;
+    }
+    if (mode === "no") return undefined;
+    const repository = new SubmoduleFetchRepository(this.workingCopy);
+    // on demand, only a submodule .gitmodules names or one kept in modules/ can be fetched
+    if (
+      mode !== "yes" &&
+      (model?.gitmodules.list().length ?? 0) === 0 &&
+      !(await repository.hasAbsorbedSubmodules())
+    ) {
+      return undefined;
+    }
+    return { commandLine: mode, repository };
+  }
+
+  /** fetch_submodules over this fetch's options (add_options_to_argv). */
+  private async fetchSubmodulesAfter(
+    commandLine: FetchRecurseSubmodules | undefined,
+    tipsBefore: ObjectId[],
+    tipsAfter: ObjectId[],
+    remoteUrl: string,
+    compatibility: "2.43" | "2.56",
+  ): Promise<Partial<FetchResult>> {
+    // the submodules' URLs are repository content: this fetch's credentials and headers go
+    // only to the origin of the remote it is for
+    let transports = this.getTransports();
+    if (this.credentials || this.headers) {
+      const origin = strictUrlOrigin(remoteUrl);
+      transports = guardSubmoduleTransports(
+        transports,
+        createSubmoduleAuthPolicy({
+          ...(this.credentials ? { credentials: this.credentials } : {}),
+          ...(this.headers ? { headers: this.headers } : {}),
+          origins: origin !== undefined ? [origin] : [],
+        }),
+      );
+    }
+    // add_options_to_argv, in git's order
+    const options = [
+      ...(this.dryRun ? ["--dry-run"] : []),
+      ...(this.removeDeletedRefs === undefined
+        ? []
+        : [this.removeDeletedRefs ? "--prune" : "--no-prune"]),
+      ...(this.pruneTags === undefined
+        ? []
+        : [this.pruneTags ? "--prune-tags" : "--no-prune-tags"]),
+      ...(this.updateHeadOk ? ["--update-head-ok"] : []),
+      ...(this.forceUpdate ? ["--force"] : []),
+      ...(commandLine === "yes"
+        ? ["--recurse-submodules"]
+        : commandLine === "on-demand"
+          ? ["--recurse-submodules=on-demand"]
+          : []),
+      ...(this.tagOptionSet && this.tagOption === TagOption.FETCH_TAGS ? ["--tags"] : []),
+      ...(this.tagOptionSet && this.tagOption === TagOption.NO_TAGS ? ["--no-tags"] : []),
+      ...(this.verbose ? ["-v"] : this.quiet ? ["-q"] : []),
+      ...(this.writeFetchHead ? [] : ["--no-write-fetch-head"]),
+    ];
+    const runFetch = async (task: SubmoduleFetchTask): Promise<SubmoduleFetchRun> => {
+      const child = new FetchCommand(task.workingCopy);
+      child.shareHooksOf(this);
+      child.setTransports(transports);
+      if (this.timeout) child.setTimeout(this.timeout);
+      if (this.gzipRequests !== undefined) child.setGzipRequests(this.gzipRequests);
+      child.setCompatibility(compatibility);
+      if (this.dryRun) child.setDryRun(true);
+      if (this.removeDeletedRefs !== undefined) child.setRemoveDeletedRefs(this.removeDeletedRefs);
+      if (this.pruneTags !== undefined) child.setPruneTags(this.pruneTags);
+      if (this.updateHeadOk) child.setUpdateHeadOk(true);
+      if (this.forceUpdate) child.setForceUpdate(true);
+      if (commandLine !== undefined) child.setRecurseSubmodules(commandLine);
+      if (this.tagOptionSet) child.setTagOpt(this.tagOption);
+      if (this.verbose) child.setVerbose(true);
+      if (this.quiet) child.setQuiet(true);
+      if (!this.writeFetchHead) child.setWriteFetchHead(false);
+      const args = [
+        ...options,
+        "--recurse-submodules-default",
+        task.defaultMode,
+        `--submodule-prefix=${task.prefix}`,
+      ];
+      if (task.remote !== undefined) {
+        child.setRemote(task.remote);
+        child.setRefSpecs(...(task.commits ?? []));
+        args.push(task.remote, ...(task.commits ?? []));
+      } else child.setDefaultRemote(await defaultRemoteOf(task.workingCopy));
+      child.setSubmoduleContext(task.defaultMode, task.prefix, args);
+      try {
+        const result = await child.call();
+        return { text: fetchOutputText(result, this.quiet), ok: fetchSucceeded(result), result };
+      } catch (error) {
+        if (!(error instanceof Error)) throw error;
+        return { text: `${error.message.replace(/\n$/, "")}\n`, ok: false };
+      }
+    };
+    const outcome = await fetchSubmodules(this.workingCopy, {
+      ...(commandLine !== undefined ? { commandLine } : {}),
+      defaultMode: this.recurseSubmodulesDefault,
+      prefix: this.submodulePrefix,
+      quiet: this.quiet,
+      tipsBefore,
+      tipsAfter,
+      compatibility,
+      runFetch,
+    });
+    return {
+      ...(outcome.results.size > 0 ? { submodules: outcome.results } : {}),
+      ...(outcome.output ? { submoduleOutput: outcome.output } : {}),
+      ...(outcome.failed ? { submodulesFailed: true } : {}),
     };
   }
 
@@ -1643,4 +1923,28 @@ function porcelainLine(entry: FetchDisplayEntry): string {
   // zeros of the width of the entry's other id (the repository's format)
   const zero = nullObjectIdLike(entry.oldOid ?? entry.newOid);
   return `${entry.code} ${entry.oldOid ?? zero} ${entry.newOid ?? zero} ${entry.local}`;
+}
+
+/**
+ * What a fetch prints on stderr, as git's child `git fetch` does: its ref lines (not with
+ * `-q`), its messages, its errors, then its submodules' lines.
+ */
+export function fetchOutputText(result: FetchResult, quiet = false): string {
+  const lines = [
+    ...(quiet ? [] : (result.display ?? [])),
+    ...result.messages,
+    ...(result.errors ?? []).map((e) => `error: ${e}`),
+  ];
+  return `${lines.map((l) => `${l.replace(/\n$/, "")}\n`).join("")}${result.submoduleOutput ?? ""}`;
+}
+
+/** Whether git's fetch exits 0: no error, no refused ref, its submodules fetched. */
+export function fetchSucceeded(result: FetchResult): boolean {
+  return (
+    (result.errors ?? []).length === 0 &&
+    !result.submodulesFailed &&
+    !result.trackingRefUpdates.some(
+      (u) => u.status === RefUpdateStatus.REJECTED || u.status === RefUpdateStatus.LOCK_FAILURE,
+    )
+  );
 }

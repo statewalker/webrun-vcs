@@ -102,6 +102,11 @@ export interface GitmodulesParseOptions {
 export class Gitmodules {
   /** git's `warning:` lines, in order */
   readonly warnings: string[] = [];
+  /**
+   * The variables that name no submodule (`fetch.recurseSubmodules`, `submodule.fetchJobs`),
+   * in the file's order, as `fetch_config_from_gitmodules` reads them
+   */
+  readonly settings: { key: string; value: string | undefined }[] = [];
   private readonly names = new Map<string, SubmoduleSettings>();
   private readonly paths = new Map<string, SubmoduleSettings>();
 
@@ -164,7 +169,10 @@ export class Gitmodules {
       );
     for (const entry of config.listWithOrigin()) {
       const parts = entry.key.split(".");
-      if (parts.length < 3 || parts[0] !== "submodule") continue;
+      if (parts.length < 3 || parts[0] !== "submodule") {
+        out.settings.push({ key: entry.key, value: entry.text });
+        continue;
+      }
       const name = parts.slice(1, -1).join(".");
       const item = parts[parts.length - 1] as string;
       const key = `submodule.${name}.${item}`;

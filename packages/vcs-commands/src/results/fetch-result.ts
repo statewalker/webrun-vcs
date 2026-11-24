@@ -92,8 +92,19 @@ export interface FetchResult {
    * and exits 1; absent when nothing failed
    */
   errors?: string[];
-  /** Submodule fetch results (if any) */
+  /**
+   * The submodules' fetch results (`--recurse-submodules`), by submodule path; absent when
+   * no submodule was fetched
+   */
   submodules?: Map<string, FetchResult>;
+  /**
+   * What the submodule recursion printed on stderr after the superproject's lines, as git
+   * prints it: `Fetching submodule <path>`, each submodule's fetch output, `Errors during
+   * submodule fetch:` and the failed submodules' names
+   */
+  submoduleOutput?: string;
+  /** A submodule's fetch failed (or one could not be accessed): git exits 1 */
+  submodulesFailed?: boolean;
   /**
    * The layer hashes of the commit-graph chain the fetch wrote (`fetch.writeCommitGraph`,
    * `--write-commit-graph`), base first; absent when it wrote none
