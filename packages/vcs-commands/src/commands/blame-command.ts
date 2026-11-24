@@ -12,6 +12,8 @@ import {
   xdiffHunks,
   xdlHashRecord,
 } from "@statewalker/vcs-utils";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { expandUserPath } from "@statewalker/vcs-working-tree";
 
 import { RefNotFoundError } from "../errors/ref-errors.js";
 import { GitCommand } from "../git-command.js";
@@ -22,9 +24,15 @@ import {
   detectRenames,
   GIT_MAX_SCORE,
 } from "../rename/index.js";
+import {
+  type Fingerprint,
+  guessLineBlames,
+  type LineBlame,
+  lineFingerprints,
+} from "./blame-ignore.js";
 import { abbrevLengths } from "./core-config.js";
 import { hostEnvironmentOf } from "./git-ident.js";
-import { type Mailmap, readRepositoryMailmap } from "./mailmap.js";
+import { type Mailmap, readMailmapFile, readRepositoryMailmap } from "./mailmap.js";
 import { canonicalObjectId } from "./object-id-input.js";
 
 /** Line bytes the interner holds before blame starts a new one (see `setInternerByteLimit`) */
@@ -57,6 +65,16 @@ export interface BlameEntry {
   previous?: { commitId: ObjectId; path: string };
   /** A boundary commit (a root commit, unless `setShowRoot(true)`): `^` in git's output */
   boundary?: boolean;
+  /**
+   * Lines an ignored commit changed, blamed on the line of its parent they resemble (`?` in
+   * git's output and `ignored` in the porcelain ones under `blame.markIgnoredLines`)
+   */
+  ignored?: boolean;
+  /**
+   * Lines an ignored commit changed that resemble no line of its parent, so stay its own
+   * (`*` and `unblamable` under `blame.markUnblamableLines`)
+   */
+  unblamable?: boolean;
 }
 
 /**
@@ -93,8 +111,15 @@ export interface BlameResult {
    * line ranges asked for
    */
   entries: BlameEntry[];
-  /** The blamed file's content at the start commit */
+  /** The blamed file's content at the start commit (`--reverse`: at the commit reversed from) */
   content?: Uint8Array;
+  /** Whether git's output marks ignored lines (`blame.markIgnoredLines`, `setMarkIgnoredLines`) */
+  markIgnoredLines?: boolean;
+  /**
+   * Whether git's output marks unblamable lines (`blame.markUnblamableLines`,
+   * `setMarkUnblamableLines`)
+   */
+  markUnblamableLines?: boolean;
   /**
    * Get the blame entry for a specific line (1-based).
    *
@@ -163,6 +188,8 @@ interface Origin {
   prev: Origin | null;
   /** The blob's lines (split and hashed once), while the origin is compared */
   lines?: InternedText;
+  /** The lines' fingerprints, while an ignored commit's origin passes blame */
+  fingerprints?: Fingerprint[];
 }
 
 /** A run of lines (`struct blame_entry`), 0-based */
@@ -174,6 +201,10 @@ interface Entry {
   /** First line in the suspect's file */
   sLno: number;
   numLines: number;
+  /** Blamed on a parent of an ignored commit by resemblance */
+  ignored: boolean;
+  /** Changed by an ignored commit and like no line of its parent */
+  unblamable: boolean;
 }
 
 /** Something with a `next` link: a list head or an entry (`struct blame_entry **`) */
@@ -268,6 +299,8 @@ function splitBlameAt(e: Entry, len: number, suspect: Origin): Entry {
     lno: e.lno + len,
     sLno: e.sLno + len,
     numLines: e.numLines - len,
+    ignored: e.ignored,
+    unblamable: e.unblamable,
   };
   e.numLines = len;
   return n;
@@ -279,13 +312,22 @@ interface Part {
   lno: number;
   sLno: number;
   numLines: number;
+  ignored: boolean;
+  unblamable: boolean;
 }
 
 /** `struct blame_entry split[3]`: before the chunk, the chunk the parent takes, after it */
 type Split = [Part, Part, Part];
 
-const emptyPart = (): Part => ({ suspect: null, lno: 0, sLno: 0, numLines: 0 });
-const emptySplit = (): Split => [emptyPart(), emptyPart(), emptyPart()];
+const emptyPart = (e?: Entry): Part => ({
+  suspect: null,
+  lno: 0,
+  sLno: 0,
+  numLines: 0,
+  ignored: e?.ignored ?? false,
+  unblamable: e?.unblamable ?? false,
+});
+const emptySplit = (e?: Entry): Split => [emptyPart(e), emptyPart(e), emptyPart(e)];
 
 /** A queue appended at its tail (`struct blame_entry ***`); the tail's `next` is set at the end */
 interface Queue {
@@ -294,11 +336,18 @@ interface Queue {
 
 /** git's `split_overlap`: `e` cut where `[tlno, same)` (its suspect's lines) came from `parent` */
 function splitOverlap(e: Entry, tlno: number, plno: number, same: number, parent: Origin): Split {
-  const split = emptySplit();
+  const split = emptySplit(e);
   let chunkEnd: number;
   if (e.sLno < tlno) {
     // a part before the chunk, not blamed on the parent
-    split[0] = { suspect: e.suspect, lno: e.lno, sLno: e.sLno, numLines: tlno - e.sLno };
+    split[0] = {
+      suspect: e.suspect,
+      lno: e.lno,
+      sLno: e.sLno,
+      numLines: tlno - e.sLno,
+      ignored: e.ignored,
+      unblamable: e.unblamable,
+    };
     split[1].lno = e.lno + tlno - e.sLno;
     split[1].sLno = plno;
   } else {
@@ -312,6 +361,8 @@ function splitOverlap(e: Entry, tlno: number, plno: number, same: number, parent
       lno: e.lno + (same - e.sLno),
       sLno: same,
       numLines: e.sLno + e.numLines - same,
+      ignored: e.ignored,
+      unblamable: e.unblamable,
     };
     chunkEnd = split[2].lno;
   } else chunkEnd = e.lno + e.numLines;
@@ -328,6 +379,8 @@ function addBlameEntry(queue: Queue, src: Part): void {
     lno: src.lno,
     sLno: src.sLno,
     numLines: src.numLines,
+    ignored: src.ignored,
+    unblamable: src.unblamable,
   };
   queue.tail.next = e;
   queue.tail = e;
@@ -339,6 +392,8 @@ function dupEntry(queue: Queue, dst: Entry, src: Part): void {
   dst.lno = src.lno;
   dst.sLno = src.sLno;
   dst.numLines = src.numLines;
+  dst.ignored = src.ignored;
+  dst.unblamable = src.unblamable;
   queue.tail.next = dst;
   queue.tail = dst;
 }
@@ -360,15 +415,20 @@ function splitBlame(blamed: Queue, unblamed: Queue, split: Split, e: Entry): voi
   }
 }
 
-/** A priority queue of commits: newest committer date first, ties first in, first out */
+/**
+ * A priority queue of commits: newest committer date first (oldest first in reverse, as
+ * `compare_commits_by_reverse_commit_date`), ties first in, first out
+ */
 class CommitQueue {
   private heap: Array<{ id: ObjectId; date: number; ctr: number }> = [];
   private ctr = 0;
 
+  constructor(private readonly reverse = false) {}
+
   private less(i: number, j: number): boolean {
     const a = this.heap[i];
     const b = this.heap[j];
-    if (a.date !== b.date) return a.date > b.date;
+    if (a.date !== b.date) return this.reverse ? a.date < b.date : a.date > b.date;
     return a.ctr < b.ctr;
   }
 
@@ -382,6 +442,16 @@ class CommitQueue {
       [h[i], h[p]] = [h[p], h[i]];
       i = p;
     }
+  }
+
+  /** The ids queued, in no particular order */
+  ids(): ObjectId[] {
+    return this.heap.map((e) => e.id);
+  }
+
+  /** The date of the commit `get` returns next */
+  peekDate(): number | undefined {
+    return this.heap[0]?.date;
   }
 
   get(): ObjectId | undefined {
@@ -421,7 +491,11 @@ class CommitQueue {
  * Lines moved within the file (`-M`, `setDetectMoves`) and copied from other files (`-C` up
  * to three times, `setDetectCopies`) are found as git's `find_move_in_parent` and
  * `find_copy_in_parent` find them, and names and emails go through the mailmap
- * (`setUseMailmap`). `--reverse` and `--ignore-rev` are not supported.
+ * (`setUseMailmap`). Ignored revisions (`setIgnoreRevs`, `setIgnoreRevsFiles`,
+ * `blame.ignoreRevsFile`) pass their changed lines to the parent lines they resemble, by
+ * git's fingerprint matching (`guess_line_blames`); `setReverse` blames each line of an old
+ * version on the last commit it existed in (`--reverse`), and `setFirstParent` follows
+ * first parents only.
  *
  * @example
  * ```typescript
@@ -455,6 +529,21 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private moveScore = BLAME_DEFAULT_MOVE_SCORE;
   private copyScore = BLAME_DEFAULT_COPY_SCORE;
   private useMailmap = true;
+  private ignoreRevs: string[] = [];
+  private ignoreRevsFiles: string[] = [];
+  private markIgnoredLines?: boolean;
+  private markUnblamableLines?: boolean;
+  /** `:(optional)` paths in the configuration (git 2.52+) */
+  private optionalPaths = true;
+  /** `--reverse`: the commit whose lines are followed forward */
+  private reverseFrom?: ObjectId;
+  private firstParent = false;
+  /** The commits blamed lines pass to from each commit in reverse (`revs->children`) */
+  private children = new Map<ObjectId, ObjectId[]>();
+  /** The commits the reverse walk found uninteresting (boundaries) */
+  private reverseUninteresting = new Set<ObjectId>();
+  /** The commits whose changes are ignored (`sb->ignore_list`) */
+  private ignoreList = new Set<ObjectId>();
 
   /** The blamed file at the start commit, its line starts and alphanumerics before each line */
   private finalContent: Uint8Array = new Uint8Array(0);
@@ -605,19 +694,83 @@ export class BlameCommand extends GitCommand<BlameResult> {
   }
 
   /**
-   * Diff details that changed between git versions: `histogramRediff` (git 2.54+, default
-   * true), `legacyMinimal` (git before 2.5x), and `renameCountLastSpan` (rename scores of
-   * git 2.50+, default true)
+   * Ignore the changes these revisions made (`--ignore-rev <rev>`, each peeled to a commit):
+   * their lines are blamed on the lines of their parents they resemble most (git's fuzzy
+   * matching), or stay theirs (unblamable) when none does.
+   *
+   * @throws Error `cannot find revision <rev> to ignore` when a name gives no commit
+   */
+  setIgnoreRevs(revs: string[]): this {
+    this.checkCallable();
+    this.ignoreRevs = [...revs];
+    return this;
+  }
+
+  /**
+   * Ignore the revisions listed in these files (`--ignore-revs-file <file>`, read after
+   * `blame.ignoreRevsFile`): full object ids, one per line, `#` comments; an empty name
+   * forgets the files before it. A relative path is read from the worktree's top.
+   *
+   * @throws Error `could not open object name list: <file>`, `invalid object name: <line>`
+   */
+  setIgnoreRevsFiles(files: string[]): this {
+    this.checkCallable();
+    this.ignoreRevsFiles = [...files];
+    return this;
+  }
+
+  /** Mark lines blamed through an ignored commit (`?`; default `blame.markIgnoredLines`) */
+  setMarkIgnoredLines(mark: boolean): this {
+    this.checkCallable();
+    this.markIgnoredLines = mark;
+    return this;
+  }
+
+  /** Mark lines an ignored commit keeps (`*`; default `blame.markUnblamableLines`) */
+  setMarkUnblamableLines(mark: boolean): this {
+    this.checkCallable();
+    this.markUnblamableLines = mark;
+    return this;
+  }
+
+  /**
+   * Blame in reverse (`--reverse <from>..<start>`): the lines of the file at `from`, each
+   * blamed on the last commit up to the start commit (default HEAD) it still existed in.
+   */
+  setReverse(from: ObjectId): this {
+    from = canonicalObjectId(from);
+    this.checkCallable();
+    this.reverseFrom = from;
+    return this;
+  }
+
+  /**
+   * Follow only first parents (`--first-parent`); with `setReverse`, the range must lie on
+   * the start commit's first-parent chain.
+   */
+  setFirstParent(first: boolean): this {
+    this.checkCallable();
+    this.firstParent = first;
+    return this;
+  }
+
+  /**
+   * Details that changed between git versions: `histogramRediff` (git 2.54+, default
+   * true), `legacyMinimal` (git before 2.5x), `renameCountLastSpan` (rename scores of
+   * git 2.50+, default true) and `optionalPaths` (a `blame.ignoreRevsFile` of
+   * `:(optional)<path>` naming a missing file is skipped: git 2.52+, default true)
    */
   setCompatibility(
     options: Pick<XdiffOptions, "histogramRediff" | "legacyMinimal"> & {
       renameCountLastSpan?: boolean;
+      optionalPaths?: boolean;
     },
   ): this {
     this.checkCallable();
-    const { renameCountLastSpan, ...diff } = options;
+    const { renameCountLastSpan, optionalPaths, ...diff } = options;
     this.diffOptions = { ...this.diffOptions, ...diff };
     if (renameCountLastSpan !== undefined) this.renameCountLastSpan = renameCountLastSpan;
+    if (optionalPaths !== undefined) this.optionalPaths = optionalPaths;
     return this;
   }
 
@@ -681,14 +834,22 @@ export class BlameCommand extends GitCommand<BlameResult> {
     this.algorithm ??= algorithmValue(config.value("diff.algorithm")) ?? "myers";
     this.indentHeuristic ??= boolValue(config.value("diff.indentHeuristic")) ?? true;
     this.showRoot ??= boolValue(config.value("blame.showRoot")) ?? false;
+    this.markIgnoredLines ??= boolValue(config.value("blame.markIgnoredLines")) ?? false;
+    this.markUnblamableLines ??= boolValue(config.value("blame.markUnblamableLines")) ?? false;
+    await this.buildIgnoreList(config);
 
     let startId = this.startCommit;
     if (!startId) {
       const head = await this.refsStore.resolve("HEAD");
       if (!head?.objectId) {
-        throw new Error("No HEAD commit found");
+        throw new Error(this.reverseFrom ? "No commit to dig up from?" : "No HEAD commit found");
       }
       startId = head.objectId;
+    }
+    if (this.reverseFrom !== undefined) {
+      // --reverse <from>..<start>: the lines of <from>, followed forward to <start>
+      await this.prepareReverse(this.reverseFrom, startId);
+      startId = this.reverseFrom;
     }
 
     const resultPath = this.filePath;
@@ -719,12 +880,20 @@ export class BlameCommand extends GitCommand<BlameResult> {
     let head: Entry | null = null;
     for (let i = ranges.length - 1; i >= 0; i--) {
       const [s, e] = ranges[i];
-      head = { next: head, suspect: finalOrigin, lno: s, sLno: s, numLines: e - s };
+      head = {
+        next: head,
+        suspect: finalOrigin,
+        lno: s,
+        sLno: s,
+        numLines: e - s,
+        ignored: false,
+        unblamable: false,
+      };
     }
     const final: Slot = { next: null };
     if (head) {
       finalOrigin.suspects = head;
-      const queue = new CommitQueue();
+      const queue = new CommitQueue(this.reverseFrom !== undefined);
       queue.put(startId, start.commit.committer.timestamp);
       await this.assignBlame(queue, final);
     }
@@ -740,7 +909,9 @@ export class BlameCommand extends GitCommand<BlameResult> {
         last &&
         last.suspect === e.suspect &&
         last.sLno + last.numLines === e.sLno &&
-        last.lno + last.numLines === e.lno
+        last.lno + last.numLines === e.lno &&
+        last.ignored === e.ignored &&
+        last.unblamable === e.unblamable
       ) {
         last.numLines += e.numLines;
       } else coalesced.push({ ...e });
@@ -776,9 +947,13 @@ export class BlameCommand extends GitCommand<BlameResult> {
         lineCount: e.numLines,
         ...(prev ? { previous: { commitId: prev.commitId, path: prev.path } } : {}),
         boundary: st.uninteresting,
+        ...(e.ignored ? { ignored: true } : {}),
+        ...(e.unblamable ? { unblamable: true } : {}),
       });
     }
     const result = createBlameResult(resultPath, lineCount, entries, content);
+    result.markIgnoredLines = this.markIgnoredLines;
+    result.markUnblamableLines = this.markUnblamableLines;
     const workingCopy = this.workingCopy;
     result.autoAbbrev = async () => {
       const lengths = await abbrevLengths(
@@ -788,6 +963,187 @@ export class BlameCommand extends GitCommand<BlameResult> {
       return lengths.size > 0 ? Math.max(...lengths.values()) : 7;
     };
     return result;
+  }
+
+  /** The commits a commit's lines pass to: its parents, or its children in reverse */
+  private scapegoats(st: CommitState, commitId: ObjectId): ObjectId[] {
+    if (this.reverseFrom !== undefined) return this.children.get(commitId) ?? [];
+    return this.firstParent ? st.commit.parents.slice(0, 1) : st.commit.parents;
+  }
+
+  /**
+   * builtin/blame.c's `build_ignorelist`: `blame.ignoreRevsFile` (sorted, as git inserts
+   * them), the files given, then the revisions given
+   */
+  private async buildIgnoreList(config: RemoteConfigStore): Promise<void> {
+    const environment = hostEnvironmentOf(this.workingCopy);
+    const worktree = this.worktreeAccess;
+    const configured = new Set<string>();
+    for (let value of config.values("blame.ignoreRevsFile")) {
+      const optional = this.optionalPaths && value.startsWith(":(optional)");
+      if (optional) value = value.slice(":(optional)".length);
+      const path = expandUserPath(value, environment);
+      if (path === undefined) throw new Error(`failed to expand user dir in: '${value}'`);
+      if (optional && path && !(await readMailmapFile(path, environment, worktree))) continue;
+      configured.add(path);
+    }
+    // string_list_insert keeps the configured names sorted (strcmp) and unique
+    const files = [...[...configured].sort(compareBytes), ...this.ignoreRevsFiles];
+    const resolver = this.revisionResolver();
+    const peelToCommit = async (id: ObjectId) => {
+      const peeled = await resolver.peelTags(id).catch(() => undefined);
+      return peeled?.type === "commit" ? peeled.id : undefined;
+    };
+    const hexLength = this.objectFormat.hexLength;
+    const list = this.ignoreList;
+    for (const file of files) {
+      if (file === "") {
+        list.clear();
+        continue;
+      }
+      const bytes = await readMailmapFile(file, environment, worktree);
+      if (!bytes) throw new Error(`could not open object name list: ${file}`);
+      const text = decodeGitPath(bytes);
+      const lines = text.split("\n");
+      if (lines[lines.length - 1] === "") lines.pop();
+      for (const raw of lines) {
+        const hash = raw.indexOf("#");
+        const name = (hash < 0 ? raw : raw.slice(0, hash)).replace(/^[ \t\n\r]+|[ \t\n\r]+$/g, "");
+        if (!name) continue;
+        if (name.length !== hexLength || !/^[0-9a-fA-F]+$/.test(name)) {
+          throw new Error(`invalid object name: ${name}`);
+        }
+        const id = await peelToCommit(name.toLowerCase());
+        if (id) list.add(id);
+      }
+    }
+    for (const rev of this.ignoreRevs) {
+      const resolved = await resolver.resolve(rev).catch(() => undefined);
+      const id = resolved ? await peelToCommit(resolved) : undefined;
+      if (!id) throw new Error(`cannot find revision ${rev} to ignore`);
+      list.add(id);
+    }
+  }
+
+  /**
+   * The children each commit passes its lines to in `--reverse` (git's `--children` walk of
+   * `<from>..<start>`: `limit_list` then `set_children`, or the first-parent chain)
+   */
+  private async prepareReverse(from: ObjectId, to: ObjectId): Promise<void> {
+    this.reverseUninteresting.add(from);
+    const children = this.children;
+    if (this.firstParent) {
+      let c = to;
+      for (;;) {
+        const st = await this.state(c);
+        if (!st) throw new RefNotFoundError(`Cannot find commit: ${c}`);
+        if (c === from || st.commit.parents.length === 0) break;
+        const parent = st.commit.parents[0];
+        children.set(parent, [c]);
+        c = parent;
+      }
+      if (c !== from) {
+        throw new Error("--reverse --first-parent together require range along first-parent chain");
+      }
+      return;
+    }
+    const UNINTERESTING = 1;
+    const SEEN = 2;
+    const ADDED = 4;
+    const flags = new Map<ObjectId, number>();
+    const flag = (id: ObjectId) => flags.get(id) ?? 0;
+    const set = (id: ObjectId, f: number) => flags.set(id, flag(id) | f);
+    const parentsOf = (id: ObjectId) => this.states.get(id)?.commit.parents ?? [];
+    const dateOf = (id: ObjectId) => this.states.get(id)?.commit.committer.timestamp ?? 0;
+    const parse = async (id: ObjectId) => (await this.state(id)) !== undefined;
+    // mark_parents_uninteresting: through the commits already parsed
+    const markParentsUninteresting = (id: ObjectId) => {
+      const pending = [...parentsOf(id)];
+      while (pending.length > 0) {
+        const p = pending.pop() as ObjectId;
+        if (flag(p) & UNINTERESTING) continue;
+        set(p, UNINTERESTING);
+        if (this.states.has(p)) pending.push(...parentsOf(p));
+      }
+    };
+    // prepare_revision_walk: the pending commits (<from> first), each once, by date
+    const starts: Array<{ id: ObjectId; uninteresting: boolean }> = [
+      { id: from, uninteresting: true },
+      { id: to, uninteresting: false },
+    ];
+    const queue = new CommitQueue();
+    const initial: ObjectId[] = [];
+    for (const s of starts) {
+      if (!(await parse(s.id))) throw new RefNotFoundError(`Cannot find commit: ${s.id}`);
+      if (s.uninteresting) {
+        set(s.id, UNINTERESTING);
+        markParentsUninteresting(s.id);
+      }
+      if (flag(s.id) & SEEN) continue;
+      set(s.id, SEEN);
+      initial.push(s.id);
+    }
+    initial
+      .map((id, i) => ({ id, i }))
+      .sort((a, b) => dateOf(b.id) - dateOf(a.id) || a.i - b.i)
+      .forEach((e) => {
+        queue.put(e.id, dateOf(e.id));
+      });
+    const everybodyUninteresting = () => queue.ids().every((id) => flag(id) & UNINTERESTING);
+    const newlist: ObjectId[] = [];
+    let slop = 5;
+    let date = Number.POSITIVE_INFINITY;
+    for (let id = queue.get(); id !== undefined; id = queue.get()) {
+      // process_parents
+      if (!(flag(id) & ADDED)) {
+        set(id, ADDED);
+        if (flag(id) & UNINTERESTING) {
+          for (const p of parentsOf(id)) {
+            set(p, UNINTERESTING);
+            if (!(await parse(p))) continue;
+            markParentsUninteresting(p);
+            if (flag(p) & SEEN) continue;
+            set(p, SEEN);
+            queue.put(p, dateOf(p));
+          }
+        } else {
+          for (const p of parentsOf(id)) {
+            if (!(await parse(p))) throw new RefNotFoundError(`Cannot find commit: ${p}`);
+            if (!(flag(p) & SEEN)) {
+              set(p, SEEN);
+              queue.put(p, dateOf(p));
+            }
+          }
+        }
+      }
+      if (flag(id) & UNINTERESTING) {
+        markParentsUninteresting(id);
+        // still_interesting
+        const next = queue.peekDate();
+        if (next === undefined) break;
+        if (date <= next || !everybodyUninteresting()) slop = 5;
+        else slop--;
+        if (slop) continue;
+        break;
+      }
+      date = dateOf(id);
+      newlist.push(id);
+    }
+    // set_children: each child prepended to its parents' lists
+    for (const c of newlist) {
+      for (const p of parentsOf(c)) {
+        const list = children.get(p);
+        if (list) list.unshift(c);
+        else children.set(p, [c]);
+      }
+    }
+    for (const [id, f] of flags) {
+      if (f & UNINTERESTING) {
+        this.reverseUninteresting.add(id);
+        const st = this.states.get(id);
+        if (st) st.uninteresting = true;
+      }
+    }
   }
 
   /** The -L ranges as 0-based half-open ranges, sorted and merged; the whole file otherwise */
@@ -826,7 +1182,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
         commitId = queue.get();
         continue;
       }
-      if (!st.uninteresting) await this.passBlame(suspect, queue);
+      if (this.reverseFrom !== undefined || !st.uninteresting) await this.passBlame(suspect, queue);
       // treat root commit as boundary
       if (st.commit.parents.length === 0 && !this.showRoot) st.uninteresting = true;
       // take responsibility for the remaining entries
@@ -845,7 +1201,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private async passBlame(origin: Origin, queue: CommitQueue): Promise<void> {
     const st = this.states.get(origin.commitId);
     if (!st) return;
-    const parents = st.commit.parents;
+    const parents = this.scapegoats(st, origin.commitId);
     const n = parents.length;
     const sgOrigin: Array<Origin | undefined> = new Array(n).fill(undefined);
     const blames: Slot = { next: null };
@@ -863,6 +1219,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
     }
     for (const porigin of sgOrigin) if (porigin && !porigin.suspects) porigin.lines = undefined;
     origin.lines = undefined;
+    origin.fingerprints = undefined;
   }
 
   /**
@@ -908,6 +1265,15 @@ export class BlameCommand extends GitCommand<BlameResult> {
       if (!origin.previous) origin.previous = porigin;
       await this.passBlameToParent(origin, porigin, queue);
       if (!origin.suspects) return;
+    }
+    // pass the remaining suspects of an ignored commit to its parents
+    if (this.ignoreList.has(origin.commitId)) {
+      for (let i = 0; i < n; i++) {
+        const porigin = sgOrigin[i];
+        if (!porigin) continue;
+        await this.passBlameToParent(origin, porigin, queue, true);
+        if (!origin.suspects) return;
+      }
     }
     // optionally find moves in the parents' files
     if (this.detectMoves) {
@@ -1310,11 +1676,15 @@ export class BlameCommand extends GitCommand<BlameResult> {
     if (st) queue.put(porigin.commitId, st.commit.committer.timestamp);
   }
 
-  /** git's `pass_blame_to_parent` */
+  /**
+   * git's `pass_blame_to_parent`; `ignoreDiffs` (an ignored commit's second pass) passes the
+   * changed lines too, to the parent lines they resemble
+   */
   private async passBlameToParent(
     target: Origin,
     parent: Origin,
     queue: CommitQueue,
+    ignoreDiffs = false,
   ): Promise<void> {
     if (!target.suspects) return;
     const newdest: Slot = { next: null };
@@ -1328,14 +1698,32 @@ export class BlameCommand extends GitCommand<BlameResult> {
     if (fileP.interner !== interner) fileP = parent.lines = interner.text(fileP.content);
     if (fileO.interner !== interner) fileO = target.lines = interner.text(fileO.content);
     const hunks = xdiffHunks(fileP, fileO, this.xdiffOptions(interner));
+    // the parent's fingerprints are fresh for each pass (matching consumes them), the
+    // target's kept while it passes blame
+    const parentFps = ignoreDiffs ? lineFingerprints(fileP.content) : undefined;
+    let targetFps: Fingerprint[] | undefined;
+    if (ignoreDiffs) targetFps = target.fingerprints ??= lineFingerprints(fileO.content);
     for (const h of hunks) {
-      blameChunk(d, h.i2, h.i1 - h.i2, h.i2 + h.chg2, parent);
+      const lineBlames =
+        parentFps && targetFps && h.chg2 > 0
+          ? guessLineBlames(parentFps, targetFps, h.i2, h.i1 - h.i2, h.i2 + h.chg2, h.chg1)
+          : undefined;
+      blameChunk(d, h.i2, h.i1 - h.i2, h.i2 + h.chg2, parent, lineBlames);
       d.offset = h.i1 + h.chg1 - (h.i2 + h.chg2);
     }
     blameChunk(d, INT_MAX, d.offset, INT_MAX, parent);
     d.dstq.next = null;
     target.suspects = src.next;
-    this.queueBlames(parent, newdest.next, queue);
+    let passed = newdest.next;
+    if (ignoreDiffs && passed) {
+      // sort_blame_entries(compare_blame_suspect): one suspect, so by line (stable)
+      const ents: Entry[] = [];
+      for (let e: Entry | null = passed; e; e = e.next) ents.push(e);
+      ents.sort((a, b) => a.sLno - b.sLno);
+      for (let i = 0; i < ents.length; i++) ents[i].next = ents[i + 1] ?? null;
+      passed = ents[0];
+    }
+    this.queueBlames(parent, passed, queue);
   }
 
   /** git's `find_origin`: the parent's version at the same path, of the same kind */
@@ -1428,7 +1816,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
       commit,
       origins: null,
       originsByPath: new Map(),
-      uninteresting: false,
+      uninteresting: this.reverseUninteresting.has(commitId),
     };
     this.states.set(commitId, st);
     return st;
@@ -1513,13 +1901,17 @@ export class BlameCommand extends GitCommand<BlameResult> {
   }
 }
 
-/** git's `blame_chunk`: lines before `tlno` go to the parent, `[tlno, same)` stay */
+/**
+ * git's `blame_chunk`: lines before `tlno` go to the parent, `[tlno, same)` stay, unless
+ * `lineBlames` (an ignored commit's guesses for `[tlno, same)`) passes them to the parent
+ */
 function blameChunk(
   d: { offset: number; dstq: Slot; srcq: Slot },
   tlno: number,
   offset: number,
   same: number,
   parent: Origin,
+  lineBlames?: LineBlame[],
 ): void {
   let e = d.srcq.next;
   let samep: Entry | null = null;
@@ -1544,6 +1936,7 @@ function blameChunk(
   e = reverseBlame(diffp, e);
   samep = null;
   diffp = null;
+  let ignoredp: Entry | null = null;
   while (e && e.sLno < same) {
     const next: Entry | null = e.next;
     if (e.sLno + e.numLines > same) {
@@ -1551,9 +1944,47 @@ function blameChunk(
       n.next = samep;
       samep = n;
     }
-    e.next = diffp;
-    diffp = e;
+    if (lineBlames) {
+      // ignore_blame_entry: e carved into runs of adjacent lines of one side
+      const base = e.sLno - tlno;
+      const nrLines = e.numLines;
+      let entryLen = 1;
+      let cur: Entry | null = e;
+      for (let i = 0; i < nrLines && cur; i++) {
+        let after: Entry | null = null;
+        if (i + 1 < nrLines) {
+          const a = lineBlames[base + i];
+          const b = lineBlames[base + i + 1];
+          if (a.isParent === b.isParent && a.sLno + 1 === b.sLno) {
+            entryLen++;
+            continue;
+          }
+          after = splitBlameAt(cur, entryLen, cur.suspect);
+        }
+        if (lineBlames[base + i].isParent) {
+          cur.ignored = true;
+          cur.suspect = parent;
+          cur.sLno = lineBlames[base + i - entryLen + 1].sLno;
+          cur.next = ignoredp;
+          ignoredp = cur;
+        } else {
+          cur.unblamable = true;
+          cur.next = diffp;
+          diffp = cur;
+        }
+        cur = after;
+        entryLen = 1;
+      }
+    } else {
+      e.next = diffp;
+      diffp = e;
+    }
     e = next;
+  }
+  if (ignoredp) {
+    // not sorted yet: the parent's list is sorted once every chunk is done
+    d.dstq.next = reverseBlame(ignoredp, d.dstq.next);
+    d.dstq = ignoredp;
   }
   d.srcq.next = reverseBlame(diffp, reverseBlame(samep, e));
   if (diffp) d.srcq = diffp;
@@ -1564,6 +1995,14 @@ function mapIdent(mailmap: Mailmap, ident: PersonIdent): PersonIdent {
   const m = mailmap.map(ident.name, ident.email);
   if (m.name === ident.name && m.email === ident.email) return ident;
   return { ...ident, name: m.name, email: m.email };
+}
+
+/** Two names compared as strcmp compares their bytes */
+function compareBytes(a: string, b: string): number {
+  const x = encodeGitPath(a);
+  const y = encodeGitPath(b);
+  for (let i = 0; i < x.length && i < y.length; i++) if (x[i] !== y[i]) return x[i] - y[i];
+  return x.length - y.length;
 }
 
 /** Lines as git counts them: LF-terminated, an unterminated last line one more */
