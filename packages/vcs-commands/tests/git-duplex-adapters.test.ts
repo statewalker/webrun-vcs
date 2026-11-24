@@ -660,6 +660,8 @@ describeGit("git's native protocol over the duplex adapters", () => {
             .fetch()
             .setRemote(setup.url(big))
             .setRefSpecs("main:refs/heads/main")
+            // main is the (unborn) checked-out branch: git refuses without --update-head-ok
+            .setUpdateHeadOk(true)
             .setTransports(transports)
             .call();
           expect(git(join(root, o), "rev-parse", "refs/heads/main")).toBe(

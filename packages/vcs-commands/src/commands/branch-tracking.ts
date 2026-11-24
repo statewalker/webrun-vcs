@@ -392,7 +392,7 @@ export function planTracking(
   }
 
   // install_branch_config_multiple_remotes
-  const rebase = shouldSetupRebase(config, remote);
+  const rebase = autoSetupRebase(workingCopy, remote);
   if (rebase && merges.length > 1) {
     throw new InvalidArgumentError(
       "track",
@@ -435,6 +435,14 @@ export function pushTrackingPlan(
 ): TrackingPlan {
   const config = RemoteConfigStore.from(workingCopy);
   return { remote, merges: [merge], rebase: shouldSetupRebase(config, remote) };
+}
+
+/**
+ * Whether git's `install_branch_config_multiple_remotes` sets `branch.<name>.rebase` for an
+ * upstream on `remote` (undefined: a local branch), as `branch.autoSetupRebase` says.
+ */
+export function autoSetupRebase(workingCopy: WorkingCopy, remote: string | undefined): boolean {
+  return shouldSetupRebase(RemoteConfigStore.from(workingCopy), remote);
 }
 
 /**

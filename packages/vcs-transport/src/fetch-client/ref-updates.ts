@@ -312,6 +312,13 @@ export async function applyRefUpdates(
      * is then written on its own (write_followtags). Git's error when it failed.
      */
     initial?: ReadonlySet<string>;
+    /**
+     * Without `atomic`, write the updates in one batch, each ref still refused on its own
+     * (git 2.5x's batched updates, one transaction with REF_TRANSACTION_ALLOW_FAILURE, as
+     * its reference-transaction hook hears it): a batch the store refuses is applied ref by
+     * ref. Default: one batch per ref (git 2.43).
+     */
+    batchNonAtomic?: boolean;
   } = {},
 ): Promise<string | undefined> {
   // git's fetch --atomic: a ref refused before the transaction (non-fast-forward, a tag it
@@ -397,6 +404,21 @@ export async function applyRefUpdates(
         return transactionError(first, result.rejected, refStore);
       }
     }
+  }
+  if (options.batchNonAtomic && rest.length > 1) {
+    const result = await refStore.batch(
+      rest.map((u) => {
+        const message = logOf(u).message;
+        return { ...command(u), ...(message !== undefined ? { message } : {}) };
+      }),
+      {
+        ...(options.ident !== undefined ? { ident: options.ident } : {}),
+        ...(options.skipReflog ? { skipReflog: true } : {}),
+        // written loose, as git's fetch writes them (not packed like an atomic batch)
+        loose: true,
+      },
+    );
+    if (result.ok) return undefined;
   }
   for (const u of rest) {
     const result = await refStore.batch([command(u)], logOf(u));

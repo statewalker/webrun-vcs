@@ -154,7 +154,16 @@ export interface FetchClientOptions {
   force?: boolean;
   /** Write all ref updates in one transaction, or none (`--atomic`) */
   atomic?: boolean;
-  /** Negotiate and download, but store nothing: no objects, no ref, no shallow change (`--dry-run`) */
+  /**
+   * Without `atomic`, write the ref updates in one batch that refuses each ref on its own
+   * (git 2.5x's batched updates; see `applyRefUpdates`); default one batch per ref (2.43)
+   */
+  batchNonAtomic?: boolean;
+  /**
+   * Negotiate and download, but write no ref, no shallow change (`--dry-run`): the objects are
+   * stored as git's dry run stores them, so each ref's update is told (fast-forward, forced,
+   * rejected) as a real fetch tells it
+   */
   dryRun?: boolean;
   /** Progress messages from the server */
   onProgress?: (message: string) => void;
@@ -473,7 +482,7 @@ export async function fetchFromConnection(
     }
     const links = strictLinks && (!!options.fsckObjects || !deepening);
     const received =
-      !options.dryRun && (links || options.fsckObjects)
+      links || options.fsckObjects
         ? new ReceivedObjects(formatOf(repository).rawLength)
         : undefined;
     // the shallow commits index-pack is given (the shallow file as this fetch leaves it, and a
@@ -484,7 +493,7 @@ export async function fetchFromConnection(
     const receivedLinks =
       received && links ? new ReceivedLinks(grafts, formatOf(repository).rawLength) : undefined;
     // a promisor pack's outgoing links (index-pack --promisor's repack_local_links)
-    const outgoing = filter && !options.dryRun ? new Set<string>() : undefined;
+    const outgoing = filter ? new Set<string>() : undefined;
     const fetched = await fetchPack(connection, source, {
       wants,
       ...(repository.objectFormat ? { objectFormat: repository.objectFormat } : {}),
@@ -495,25 +504,24 @@ export async function fetchFromConnection(
       ...(options.onWarning ? { onWarning: options.onWarning } : {}),
       includeTag: autoTags,
       onProgress: options.onProgress,
-      importPack: options.dryRun
-        ? drainPack
-        : (pack) =>
-            repository.importPack(pack, {
-              // a filtered pack goes through index-pack (`--promisor`): kept, never unpacked
-              ...(options.keepPack || filter ? { keepPack: true } : {}),
-              // checked before anything sees them: a refused pack leaves no object behind
-              ...(received
-                ? { quarantine: true, onObject: (id, type, entry) => received.add(id, type, entry) }
-                : {}),
-              ...(receivedLinks || outgoing
-                ? {
-                    onContent: (id, type, content) => {
-                      receivedLinks?.add(id, type, content);
-                      if (outgoing) for (const l of outgoingLinks(type, content)) outgoing.add(l);
-                    },
-                  }
-                : {}),
-            }),
+      // a dry run stores the objects too (git's fetch_refs runs; only the refs are left)
+      importPack: (pack) =>
+        repository.importPack(pack, {
+          // a filtered pack goes through index-pack (`--promisor`): kept, never unpacked
+          ...(options.keepPack || filter ? { keepPack: true } : {}),
+          // checked before anything sees them: a refused pack leaves no object behind
+          ...(received
+            ? { quarantine: true, onObject: (id, type, entry) => received.add(id, type, entry) }
+            : {}),
+          ...(receivedLinks || outgoing
+            ? {
+                onContent: (id, type, content) => {
+                  receivedLinks?.add(id, type, content);
+                  if (outgoing) for (const l of outgoingLinks(type, content)) outgoing.add(l);
+                },
+              }
+            : {}),
+        }),
       onShallowUpdate: async (u) => {
         if (
           connection.version === 2 &&
@@ -553,7 +561,7 @@ export async function fetchFromConnection(
       // a refused pack (or any failure before the commit) leaves no object behind
       if (!committed) await quarantine?.discard().catch(() => {});
     }
-    if (filter && imported.packId !== undefined && !options.dryRun) {
+    if (filter && imported.packId !== undefined) {
       // a promisor pack: index-pack `--promisor` writes an empty `.promisor`, which fetch-pack
       // replaces with the sought refs for a kept pack (`--keep`, or transfer.unpackLimit's 100
       // objects reached) when it locks the pack itself: not the `git fetch-pack` remote-curl
@@ -566,7 +574,7 @@ export async function fetchFromConnection(
       // git 2.48+: the local objects the pack links to go into a promisor pack of their own
       if (outgoing && outgoing.size > 0) await repository.repackLocalLinks?.(outgoing);
     }
-    if (!options.dryRun) packFetched = true;
+    packFetched = true;
     const after = applyShallow(shallow, update);
     // fetch-pack: a deepening fetch (not a clone) checks what it brought against the new
     // shallow commits, without `--not --all`, before the shallow file changes
@@ -589,7 +597,7 @@ export async function fetchFromConnection(
       for (const want of wants) deepenChecked.add(want);
     }
     // the pack is in (its trailer checked): the wants are complete now
-    if (!options.dryRun) for (const want of wants) complete.addTip(want);
+    for (const want of wants) complete.addTip(want);
     result.imports.push(imported);
     result.packObjects += fetched.packObjects;
     result.packBytes += fetched.packBytes;
@@ -814,7 +822,7 @@ export async function fetchFromConnection(
   // git's check_connected before any ref is written: fetch's store_updated_refs over its ref
   // map (the refs a deepening fetch-pack checked aside), clone's update_remote_refs over the
   // refs it writes (those in a self-contained pack aside)
-  if (!options.dryRun && packFetched) {
+  if (packFetched) {
     const candidates = options.cloning
       ? planned.filter((p) => p.localRef !== undefined)
       : [...planned, ...opportunistic, ...followed];
@@ -857,6 +865,7 @@ export async function fetchFromConnection(
   if (!options.dryRun) {
     const failure = await applyRefUpdates(result.refUpdates, refStore, {
       atomic: options.atomic,
+      ...(options.batchNonAtomic ? { batchNonAtomic: true } : {}),
       deletes,
       message: options.reflogMessage,
       reflogAction: options.reflogAction,
@@ -1066,20 +1075,6 @@ function negotiatorSource(repository: RepositoryFacade): NegotiatorSource {
       ? (oid) => getCommitInfo(oid)
       : async (oid) => ((await repository.has(oid)) ? { parents: [], time: 0 } : undefined),
     peelTag: repository.peelTag?.bind(repository),
-  };
-}
-
-/** A dry run's "import": the pack is read to its end and dropped. */
-async function drainPack(pack: AsyncIterable<Uint8Array>): Promise<PackImportResult> {
-  for await (const _ of pack) {
-    // dropped
-  }
-  return {
-    objectsImported: 0,
-    blobsWithDelta: 0,
-    treesImported: 0,
-    commitsImported: 0,
-    tagsImported: 0,
   };
 }
 

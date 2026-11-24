@@ -1038,7 +1038,11 @@ export function createFilesRefOps(
       // git locks packed-refs only for a transaction that deletes (files_transaction_prepare);
       // one that does not is committed through packed-refs when packed-refs.lock is free at
       // once, else loose as git commits it, so a held packed-refs.lock never fails it
-      if ((await lock(PACKED, deleting.length > 0 ? packedLockTimeout : 0)) === "ok") {
+      // (and `loose` asks for the loose commit outright when nothing is deleted)
+      if (
+        !(o.loose && deleting.length === 0) &&
+        (await lock(PACKED, deleting.length > 0 ? packedLockTimeout : 0)) === "ok"
+      ) {
         packedHeld = true;
       } else if (deleting.length > 0) {
         // the packed store's transaction of the deletions given up (files_transaction_cleanup)
