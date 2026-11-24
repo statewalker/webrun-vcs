@@ -241,6 +241,10 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
   private recommendShallow?: boolean;
   private references: string[] = [];
   private requireInit = false;
+  /** `--filter=<spec>` of the clones */
+  private filter?: string;
+  /** `--[no-]single-branch` of the clones */
+  private singleBranch?: boolean;
   private transports?: GitTransportRegistry;
   private credentials?: Credentials;
   private headers?: Record<string, string>;
@@ -321,6 +325,20 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
   setRecommendShallow(recommend: boolean): this {
     this.checkCallable();
     this.recommendShallow = recommend;
+    return this;
+  }
+
+  /** `--filter=<spec>`: partial clones of the submodules (`CloneCommand.setFilter`). */
+  setFilter(spec: string | undefined): this {
+    this.checkCallable();
+    this.filter = spec;
+    return this;
+  }
+
+  /** `--[no-]single-branch`: how the submodules are cloned (`CloneCommand.setSingleBranch`). */
+  setSingleBranch(singleBranch: boolean | undefined): this {
+    this.checkCallable();
+    this.singleBranch = singleBranch;
     return this;
   }
 
@@ -621,6 +639,8 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
         ...(depth !== undefined ? { depth } : {}),
         references: this.references,
         requireInit: this.requireInit,
+        ...(this.filter !== undefined ? { filter: this.filter } : {}),
+        ...(this.singleBranch !== undefined ? { singleBranch: this.singleBranch } : {}),
         transports: await this.guardedTransports(),
         ...(this.timeout !== undefined ? { timeout: this.timeout } : {}),
       });
@@ -974,7 +994,9 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
       .setNoFetch(this.noFetch)
       .setForce(this.force)
       .setMode(this.mode)
-      .setDepth(this.depth);
+      .setDepth(this.depth)
+      .setFilter(this.filter)
+      .setSingleBranch(this.singleBranch);
     if (this.recommendShallow !== undefined) child.setRecommendShallow(this.recommendShallow);
     for (const reference of this.references) child.addReference(reference);
     if (this.transports) child.setTransports(this.transports);
