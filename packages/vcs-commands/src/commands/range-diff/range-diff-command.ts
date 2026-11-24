@@ -28,8 +28,10 @@ import { RevListCommand } from "../rev-list-command.js";
 import {
   findExactMatches,
   getCorrespondences,
+  parseRangeDiffMaxMemory,
   RANGE_DIFF_CREATION_FACTOR_DEFAULT,
   RangeDiffError,
+  RangeDiffMemoryError,
   type RangeDiffPatch,
   readRangeDiffPatches,
   writeRangeDiff,
@@ -95,6 +97,8 @@ export interface RangeDiffRun {
   noPatch?: boolean;
   /** `--abbrev=<n>` (undefined: the default length) */
   abbrev?: number;
+  /** `--max-memory`: the largest cost matrix in bytes (default 4 GiB) */
+  maxMemory?: bigint;
 }
 
 /**
@@ -119,7 +123,13 @@ export abstract class RangeDiffBase<T> extends GitCommand<T> {
     const a = await this.readPatches(range1, run);
     const b = await this.readPatches(range2, run);
     findExactMatches(a, b);
-    getCorrespondences(a, b, run.creationFactor);
+    try {
+      getCorrespondences(a, b, run.creationFactor, run.maxMemory);
+    } catch (error) {
+      if (error instanceof RangeDiffMemoryError)
+        throw new GitApiError(`fatal: ${error.message}`, { exitCode: 128 });
+      throw error;
+    }
     const colors =
       run.color === false
         ? undefined
@@ -193,13 +203,16 @@ export abstract class RangeDiffBase<T> extends GitCommand<T> {
 
   /** `is_range_diff_range`: a revision argument with both a positive and a negative side. */
   protected async isRangeDiffRange(arg: string): Promise<boolean> {
+    let entries: { id: ObjectId; exclude?: boolean }[];
     try {
-      const resolve = new RevListCommand(this._workingCopy).addRevision(arg);
-      const { entries } = await resolve.resolve();
-      return entries.some((e) => e.exclude) && entries.some((e) => !e.exclude);
+      ({ entries } = await new RevListCommand(this._workingCopy).addRevision(arg).resolve());
     } catch {
-      return false;
+      // setup_revisions with a `--` after the argument: what is no revision dies
+      throw new GitApiError(`fatal: bad revision '${arg}'`, { exitCode: 128 });
     }
+    // the flags are the objects': one named on both sides (`main..main`) is only negative
+    const negative = new Set(entries.filter((e) => e.exclude).map((e) => e.id));
+    return negative.size > 0 && entries.some((e) => !negative.has(e.id));
   }
 
   /** `repo_get_oid_committish` succeeds */
@@ -225,6 +238,7 @@ export class RangeDiffCommand extends RangeDiffBase<Uint8Array> {
   private stat = false;
   private patch = false;
   private abbrev?: number;
+  private maxMemory?: string | bigint;
 
   /**
    * A positional argument as git takes it: a range, a commit, `--`, or what follows the
@@ -314,10 +328,29 @@ export class RangeDiffCommand extends RangeDiffBase<Uint8Array> {
     return this;
   }
 
+  /**
+   * `--max-memory=<size>` (git 2.52): the largest cost matrix built, in bytes or with a `k`,
+   * `m` or `g` unit (default 4 GiB, which ours applies whatever the version). A value git
+   * refuses fails the call with its `invalid max-memory value` and the usage (exit 129).
+   */
+  setMaxMemory(size: string | number | bigint): this {
+    this.checkCallable();
+    this.maxMemory = typeof size === "number" ? BigInt(size) : size;
+    return this;
+  }
+
   /** The output as bytes. */
   async call(): Promise<Uint8Array> {
     this.checkCallable();
     this.setCallable(false);
+    let maxMemory: bigint | undefined;
+    if (typeof this.maxMemory === "string") {
+      maxMemory = parseRangeDiffMaxMemory(this.maxMemory);
+      if (maxMemory === undefined)
+        throw new GitApiError(`error: invalid max-memory value: ${this.maxMemory}\n\n${USAGE}`, {
+          exitCode: 129,
+        });
+    } else maxMemory = this.maxMemory;
     const { range1, range2, logArgs } = await this.ranges();
     const color = this.simpleColor === 0 ? true : this.color;
     return this.showRangeDiff(range1, range2, {
@@ -332,6 +365,7 @@ export class RangeDiffCommand extends RangeDiffBase<Uint8Array> {
       stat: this.stat,
       noPatch: this.noPatch,
       ...(this.abbrev !== undefined ? { abbrev: this.abbrev } : {}),
+      ...(maxMemory !== undefined ? { maxMemory } : {}),
     });
   }
 

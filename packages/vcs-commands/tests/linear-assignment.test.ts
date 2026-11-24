@@ -5,7 +5,12 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { computeAssignment } from "../src/commands/range-diff/index.js";
+import {
+  computeAssignment,
+  humaniseBytes,
+  parseRangeDiffMaxMemory,
+  RANGE_DIFF_MAX_MEMORY_DEFAULT,
+} from "../src/commands/range-diff/index.js";
 
 /** [n, the n*n cost matrix (column + n * row), git's column-to-row result] */
 const GIT_PAIRINGS: [number, number[], number[]][] = [
@@ -131,5 +136,20 @@ describe("computeAssignment (linear-assignment.c)", () => {
   it("pairs everything with 0 below two columns, as git leaves them", () => {
     const { columnToRow, rowToColumn } = computeAssignment(1, 1, [7]);
     expect([...columnToRow, ...rowToColumn]).toEqual([0, 0]);
+  });
+});
+
+describe("range-diff's --max-memory sizes", () => {
+  it("parses as git_parse_unsigned and prints as humanise_bytes", () => {
+    expect(parseRangeDiffMaxMemory("4g")).toBe(4n << 30n);
+    expect(parseRangeDiffMaxMemory("0x10K")).toBe(16n << 10n);
+    expect(parseRangeDiffMaxMemory("017")).toBe(15n);
+    for (const bad of ["", "12x", "-1", "08", "1kb"])
+      expect([bad, parseRangeDiffMaxMemory(bad)]).toEqual([bad, undefined]);
+    expect(humaniseBytes(RANGE_DIFF_MAX_MEMORY_DEFAULT)).toBe("4.00 GiB");
+    expect(humaniseBytes(1536n)).toBe("1.50 KiB");
+    expect(humaniseBytes(3n << 20n)).toBe("3.00 MiB");
+    expect(humaniseBytes(1n)).toBe("1 byte");
+    expect(humaniseBytes(256n)).toBe("256 bytes");
   });
 });

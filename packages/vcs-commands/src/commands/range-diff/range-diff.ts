@@ -43,6 +43,67 @@ import { computeAssignment } from "./linear-assignment.js";
 export const RANGE_DIFF_CREATION_FACTOR_DEFAULT = 60;
 /** range-diff.h's CREATION_FACTOR_FOR_THE_SAME_SERIES (format-patch from 2.46 on) */
 export const CREATION_FACTOR_FOR_THE_SAME_SERIES = 999;
+/**
+ * range-diff.h's RANGE_DIFF_MAX_MEMORY_DEFAULT on 64-bit hosts: the largest cost matrix
+ * (`4 * n * n` bytes) range-diff builds, 4 GiB. git 2.52 added it with `--max-memory`;
+ * ours applies it whatever the version, so that a huge pair of ranges is refused rather than
+ * trying to allocate gigabytes.
+ */
+export const RANGE_DIFF_MAX_MEMORY_DEFAULT = 4n * 1024n * 1024n * 1024n;
+
+/** The largest value git's `git_parse_unsigned` takes for a `size_t` (SIZE_MAX, 64-bit) */
+const SIZE_MAX = (1n << 64n) - 1n;
+
+/**
+ * builtin/range-diff.c's `parse_max_memory` (`git_parse_unsigned` up to SIZE_MAX): a number
+ * (decimal, `0x` hex or `0` octal, as strtoumax reads it) with an optional `k`, `m` or `g`
+ * unit (any case); undefined for what git refuses (`invalid max-memory value`).
+ */
+export function parseRangeDiffMaxMemory(value: string): bigint | undefined {
+  if (!value || value.includes("-")) return undefined;
+  const m = /^[ \t\n\v\f\r]*\+?(?:0[xX]([0-9a-fA-F]+)|(0[0-7]*)|([1-9][0-9]*))(.*)$/s.exec(value);
+  if (!m) return undefined;
+  let val: bigint;
+  if (m[1] !== undefined) val = BigInt(`0x${m[1]}`);
+  else if (m[2] !== undefined) val = BigInt(`0o${m[2] === "0" ? "0" : m[2].slice(1)}`);
+  else val = BigInt(m[3] as string);
+  if (val > SIZE_MAX) return undefined;
+  const unit = (m[4] as string).toLowerCase();
+  const factor =
+    unit === ""
+      ? 1n
+      : unit === "k"
+        ? 1024n
+        : unit === "m"
+          ? 1n << 20n
+          : unit === "g"
+            ? 1n << 30n
+            : 0n;
+  if (factor === 0n || factor * val > SIZE_MAX) return undefined;
+  return factor * val;
+}
+
+/** strbuf.c's `humanise_bytes` (not compact): `4.00 GiB`, `1.50 MiB`, `12 bytes`. */
+export function humaniseBytes(bytes: bigint): string {
+  const two = (n: bigint) => n.toString().padStart(2, "0");
+  if (bytes > 1n << 30n) {
+    const whole = (bytes >> 30n) & 0xffffffffn;
+    return `${whole}.${two((bytes & ((1n << 30n) - 1n)) / 10737419n)} GiB`;
+  }
+  if (bytes > 1n << 20n) {
+    const x = (bytes + 5243n) & 0xffffffffn;
+    return `${x >> 20n}.${two(((x & ((1n << 20n) - 1n)) * 100n) >> 20n)} MiB`;
+  }
+  if (bytes > 1n << 10n) {
+    const x = (bytes + 5n) & 0xffffffffn;
+    return `${x >> 10n}.${two(((x & ((1n << 10n) - 1n)) * 100n) >> 10n)} KiB`;
+  }
+  return `${bytes} ${bytes === 1n ? "byte" : "bytes"}`;
+}
+
+/** Thrown where range-diff dies over the cost matrix's size (exit 128). */
+export class RangeDiffMemoryError extends Error {}
+
 /** linear-assignment.h's COST_MAX */
 const COST_MAX = 1 << 16;
 
@@ -224,8 +285,18 @@ export function getCorrespondences(
   a: RangeDiffPatch[],
   b: RangeDiffPatch[],
   creationFactor: number,
+  maxMemory: bigint = RANGE_DIFF_MAX_MEMORY_DEFAULT,
 ): void {
   const n = a.length + b.length;
+  // the matrix's size checked before it is allocated
+  const costBytes = 4n * BigInt(n) * BigInt(n);
+  if (costBytes >= maxMemory) {
+    throw new RangeDiffMemoryError(
+      "range-diff: unable to compute the range-diff, since it exceeds the maximum memory for " +
+        `the cost matrix: ${humaniseBytes(costBytes)} (${costBytes} bytes) needed, limited to ` +
+        `${humaniseBytes(maxMemory)} (${maxMemory} bytes)`,
+    );
+  }
   const cost = new Int32Array(n * n);
   // C's int division truncates toward zero
   const scaled = (size: number) => Math.trunc((size * creationFactor) / 100);

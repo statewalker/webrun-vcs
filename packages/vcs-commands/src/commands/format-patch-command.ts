@@ -861,7 +861,8 @@ export class FormatPatchCommand extends RangeDiffBase<FormatPatchResult> {
         this.warnings.push(`warning: using '${prev}' as range-diff origin of current series`);
         range2 = `${prev}..${head}`;
       }
-      // get_notes_args: the notes format-patch shows (2.43 passed none to a single patch)
+      // get_notes_args: the notes format-patch shows; a single patch's range-diff got none
+      // before git 2.52 (its log then showed the default notes)
       const notes: RangeDiffNotesOption[] = !state.notes.show
         ? [false]
         : state.notes.useDefault || state.notes.refs.length === 0
@@ -871,7 +872,7 @@ export class FormatPatchCommand extends RangeDiffBase<FormatPatchResult> {
         creationFactor:
           this.creationFactor ??
           (modern ? CREATION_FACTOR_FOR_THE_SAME_SERIES : RANGE_DIFF_CREATION_FACTOR_DEFAULT),
-        notes: !state.cover && !modern ? [] : notes,
+        notes: !state.cover && !gitVersionAtLeast(this.versionString, 2, 52) ? [] : notes,
         dualColor: true,
         color: false,
       });

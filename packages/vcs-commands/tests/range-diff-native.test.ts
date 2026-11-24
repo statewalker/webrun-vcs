@@ -93,6 +93,7 @@ async function ours(dir: string, args: string[]): Promise<Outcome> {
     else if (a === "--no-notes") command.addNotes(false);
     else if (a.startsWith("--notes=")) command.addNotes(a.slice(8));
     else if (a.startsWith("--abbrev=")) command.setAbbrev(Number(a.slice(9)));
+    else if (a.startsWith("--max-memory=")) command.setMaxMemory(a.slice(13));
     else if (a.startsWith("--creation-factor=")) command.setCreationFactor(Number(a.slice(18)));
     else if (a.startsWith("--submodule=")) {
       // the outer diff's: no submodules in it
@@ -183,7 +184,47 @@ describeGit("git range-diff as native git (t3206-range-diff)", () => {
       ["topic"],
       ["--left-only", "--right-only", "topic...changed"],
       ["main", "nosuch", "topic"],
+      // the flags are the objects': main..main has no positive side
+      ["main..main", "main..topic"],
+      ["nope..t1", "main..t2"],
     ]);
+  });
+
+  it("--max-memory (git 2.52)", async () => {
+    const version = git(root, ["--version"]).replace(/^git version /, "");
+    const [major, minor] = version.split(".").map(Number) as [number, number];
+    if (major < 2 || (major === 2 && minor < 52)) return;
+    await expectSame(repo, [
+      ["--max-memory=100", "topic...changed"],
+      ["--max-memory=256", "topic...changed"],
+      ["--max-memory=257", "--no-color", "topic...changed"],
+      ["--max-memory=0x10k", "--no-color", "topic...changed"],
+      ["--max-memory=1M", "--no-color", "topic...changed"],
+      ["--max-memory=3000", "main", "topic", "removed"],
+      ["--max-memory=2g", "--no-color", "topic...changed"],
+      ["--max-memory=12x", "topic...changed"],
+      ["--max-memory=-1", "topic...changed"],
+    ]);
+    // the death's message, as git words it
+    for (const size of ["100", "255", "0x7"]) {
+      const n = spawnSync("git", ["range-diff", `--max-memory=${size}`, "topic...changed"], {
+        cwd: repo,
+        env: env(),
+        encoding: "latin1",
+      });
+      const g = await open(repo);
+      const error = await g
+        .rangeDiff()
+        .setMaxMemory(size)
+        .addArgument("topic...changed")
+        .call()
+        .then(
+          () => undefined,
+          (e: Error) => e.message,
+        );
+      g.close();
+      expect([size, `${error}\n`]).toEqual([size, n.stderr]);
+    }
   });
 
   it('t3206-range-diff.sh "range-diff compares notes by default", "range-diff with --no-notes", "range-diff with multiple --notes", "range-diff with --notes=custom does not show default notes"', async () => {

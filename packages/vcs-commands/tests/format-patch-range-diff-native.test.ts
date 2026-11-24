@@ -239,5 +239,30 @@ describeGit("git format-patch --interdiff/--range-diff as native git", () => {
     gitOk(repo, ["checkout", "-q", "unmodified"]);
     await expectSame(repo, ["--notes=custom", "--range-diff=topic", "-1"]);
     await expectSame(repo, ["--range-diff=topic", "-1"]);
+
+    // a single patch's range-diff takes format-patch's notes options from git 2.52 on
+    const notesOf = async (v: string) => {
+      const g = await open(repo);
+      try {
+        const r = await g
+          .formatPatch()
+          .setStdout(true)
+          .setVersionString(v)
+          .setNotes("custom")
+          .setRangeDiff("topic")
+          .setMaxCount(1)
+          .call();
+        const text = Buffer.from(r.output).toString("latin1");
+        return text.slice(text.indexOf("Range-diff:"));
+      } finally {
+        g.close();
+      }
+    };
+    const before = await notesOf("2.50.0");
+    expect(before).toContain(" ## Notes ##");
+    expect(before).not.toContain("## Notes (custom) ##");
+    const after = await notesOf("2.52.0");
+    expect(after).toContain(" ## Notes (custom) ##");
+    expect(after).not.toContain(" ## Notes ##");
   });
 });
