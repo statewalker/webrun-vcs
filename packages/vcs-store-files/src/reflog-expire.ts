@@ -169,7 +169,9 @@ export async function expireReflogs(options: ExpireReflogsOptions): Promise<Expi
 /**
  * Thrown when the expiry stops midway as git dies (a failed lazy fetch of `--stale-fix`,
  * the `PromisorFetchError` its `cause`):
- * nothing was written; `output` holds what was printed before, `cause` the failure.
+ * the reflog being expired is left as it was (each reflog is written as it is done, as git
+ * does, so those expired before it keep their new logs); `output` holds what was printed
+ * before, `cause` the failure.
  */
 export class ReflogExpiryAbortedError extends Error {
   override name = "ReflogExpiryAbortedError";
@@ -557,6 +559,8 @@ async function expireReftableReflogs(
         },
       );
     } catch (error) {
+      // a failed lazy fetch is git's death, not a lock error: no later reflog is expired
+      if (error instanceof PromisorFetchError) throw error;
       result.errors.push(`error: cannot lock ref '${name}': ${(error as Error).message}`);
     }
   }
@@ -752,7 +756,8 @@ class StaleFix {
     const promisor = this.objects.promisor;
     if (!promisor?.lazyFetchEnabled || !promisor.hasPromisorRemote()) return false;
     // a failed fetch (PromisorFetchError, the remote gone) is no missing object: it
-    // propagates, so the expiry dies before writing, as promisor_remote_get_direct dies
+    // propagates, so the expiry dies before writing this reflog, as promisor_remote_get_direct
+    // dies
     const o = await this.objects.get(id);
     if (!o) return false;
     if (!o.bytes) await o.content[Symbol.asyncIterator]().return?.();

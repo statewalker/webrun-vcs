@@ -748,42 +748,47 @@ describeGit("reflog expire, delete, exists, write and drop against native git", 
       );
       expect(r.out).toContain("keep to side");
     });
-    it('t1410-reflog.sh: "--stale-fix handles missing objects generously" when the promisor remote is gone', async () => {
-      const n = counter++;
-      const srv = new Builder(join(root, `t${n}-srv`), "files");
-      execFileSync("git", ["init", "-q", "-b", "main", srv.repo], { env: env("files") });
-      srv.testCommit("A");
-      srv.git(["checkout", "-q", "-b", "side"]);
-      srv.testCommit("B", srv.repo, false);
-      srv.git(["checkout", "-q", "main"]);
-      srv.git(["config", "uploadpack.allowFilter", "true"]);
-      const make = (side: string) => {
-        const b = new Builder(join(root, `t${n}-${side}`, "repo"), "files");
-        b.tick.time = srv.tick.time;
-        execFileSync(
-          "git",
-          ["clone", "-q", "--no-local", "--filter=blob:none", `file://${srv.repo}`, b.repo],
-          { env: env("files", b.tick.now()) },
+    it.each(FORMATS)(
+      '%s: t1410-reflog.sh: "--stale-fix handles missing objects generously" when the promisor remote is gone',
+      async (format) => {
+        const n = counter++;
+        const srv = new Builder(join(root, `t${n}-srv`), format);
+        execFileSync("git", ["init", "-q", "-b", "main", srv.repo], { env: env(format) });
+        srv.testCommit("A");
+        srv.git(["checkout", "-q", "-b", "side"]);
+        srv.testCommit("B", srv.repo, false);
+        srv.git(["checkout", "-q", "main"]);
+        srv.git(["config", "uploadpack.allowFilter", "true"]);
+        const make = (side: string) => {
+          const b = new Builder(join(root, `t${n}-${side}`, "repo"), format);
+          b.tick.time = srv.tick.time;
+          execFileSync(
+            "git",
+            ["clone", "-q", "--no-local", "--filter=blob:none", `file://${srv.repo}`, b.repo],
+            { env: env(format, b.tick.now()) },
+          );
+          b.git(["config", "gc.reflogExpire", "never"]);
+          b.git(["config", "gc.reflogExpireUnreachable", "never"]);
+          b.git(["branch", "foo"]);
+          b.git(["update-ref", "-m", "to side", "refs/heads/foo", "origin/side"]);
+          b.git(["update-ref", "-m", "back", "refs/heads/foo", "main"]);
+          b.git(["update-ref", "-d", "refs/remotes/origin/side"]);
+          return b;
+        };
+        const t = { native: make("native"), ours: make("ours") };
+        t.ours.filesRoot = root;
+        // the promisor remote is gone: the lazy fetch fails and git dies, writing nothing
+        rmSync(srv.repo, { recursive: true, force: true });
+        const before = format === "files" ? logFiles(t.ours.repo) : await reflogsOf(t.ours);
+        // no --verbose: what 2.43 prints before dying follows its readdir order
+        const r = await compare(t, ["expire", "--stale-fix", "--all"], (r) =>
+          r.setStaleFix(true).setAll(true).callExpire(),
         );
-        b.git(["config", "gc.reflogExpire", "never"]);
-        b.git(["config", "gc.reflogExpireUnreachable", "never"]);
-        b.git(["branch", "foo"]);
-        b.git(["update-ref", "-m", "to side", "refs/heads/foo", "origin/side"]);
-        b.git(["update-ref", "-m", "back", "refs/heads/foo", "main"]);
-        b.git(["update-ref", "-d", "refs/remotes/origin/side"]);
-        return b;
-      };
-      const t = { native: make("native"), ours: make("ours") };
-      t.ours.filesRoot = root;
-      // the promisor remote is gone: the lazy fetch fails and git dies, writing nothing
-      rmSync(srv.repo, { recursive: true, force: true });
-      const before = logFiles(t.ours.repo);
-      // no --verbose: what 2.43 prints before dying follows its readdir order
-      const r = await compare(t, ["expire", "--stale-fix", "--all"], (r) =>
-        r.setStaleFix(true).setAll(true).callExpire(),
-      );
-      expect(r.status).toBe(128);
-      expect(logFiles(t.ours.repo)).toEqual(before);
-    });
+        expect(r.status).toBe(128);
+        expect(format === "files" ? logFiles(t.ours.repo) : await reflogsOf(t.ours)).toEqual(
+          before,
+        );
+      },
+    );
   });
 });
