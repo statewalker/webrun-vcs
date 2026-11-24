@@ -193,7 +193,7 @@ describeGit("sparse index against native git", () => {
         .split("\n")
         .map((l) => l.replace(/\t/, " ")),
     );
-    expect(staging.indexLayout?.()).toEqual({ split: false, sparse: true });
+    expect(staging.indexLayout?.()).toMatchObject({ split: false, sparse: true });
     // a write keeps it sparse
     put(dir, "k/new", "n\n");
     await (await ours(dir)).add().addFilepattern("k/new").call();

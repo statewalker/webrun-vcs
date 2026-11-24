@@ -14,11 +14,17 @@ import {
   DO_MATCH_DIRECTORY,
   MATCHED_RECURSIVELY,
   matchPathspecSeen,
+  type PathspecItem,
   parsePathspec,
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
 import { PathspecFile } from "./pathspec-file.js";
 import { sparsePathAdvice } from "./sparse-checkout-support.js";
+import {
+  collapsedSparseDirectories,
+  SPARSE_INDEX_EXPANDED_HINT,
+  sparseIndexAsRead,
+} from "./sparse-index-view.js";
 import { StatusCommand } from "./status-command.js";
 import { parseGitmodules } from "./submodule-config.js";
 import {
@@ -34,6 +40,18 @@ import { worktreePathRules } from "./worktree-path-rules.js";
 export interface RmResult {
   /** Paths that were removed from the index (each once, whatever its stages) */
   removedPaths: string[];
+  /**
+   * What git prints on its standard output: `rm '<path>'` for each index entry removed (an
+   * unmerged path once per stage), before the files go; a dry run too, nothing with
+   * {@link RmCommand.setQuiet}
+   */
+  output: string[];
+  /**
+   * The advice git prints on its standard error before anything else (2.5x's
+   * `advice.sparseIndexExpanded` hint when a sparse index is expanded), as its lines; an
+   * {@link RmFailedError}'s message starts with them
+   */
+  advice?: string[];
   /**
    * What could not be done once the removal was under way, the index written all the same:
    * a file that could not be deleted after another one was (git passes over it silently),
@@ -79,6 +97,7 @@ export class RmCommand extends GitCommand<RmResult> {
   private ignoreUnmatch = false;
   private force = false;
   private dryRun = false;
+  private quiet = false;
   private compatibility: "2.43" | "2.56" = "2.56";
 
   /**
@@ -136,6 +155,16 @@ export class RmCommand extends GitCommand<RmResult> {
   setDryRun(dryRun: boolean): this {
     this.checkCallable();
     this.dryRun = dryRun;
+    return this;
+  }
+
+  /**
+   * `-q` / `--quiet`: the `rm '<path>'` lines are not given ({@link RmResult.output} stays
+   * empty).
+   */
+  setQuiet(quiet: boolean): this {
+    this.checkCallable();
+    this.quiet = quiet;
     return this;
   }
 
@@ -216,6 +245,24 @@ export class RmCommand extends GitCommand<RmResult> {
   async call(): Promise<RmResult> {
     this.checkCallable();
     this.setCallable(false);
+    this.hint = [];
+    try {
+      const result = await this.remove();
+      return this.hint.length > 0 ? { ...result, advice: this.hint } : result;
+    } catch (error) {
+      // the hint git printed before it died (its exit status unchanged)
+      if (!(error instanceof RmFailedError) || this.hint.length === 0) throw error;
+      const message = [...this.hint, error.message].join("\n");
+      throw new RmFailedError(message, error.sparsePaths, error.result).withExitCode(
+        error.exitCode,
+      );
+    }
+  }
+
+  /** git's advice printed on standard error before anything else, as its lines. */
+  private hint: string[] = [];
+
+  private async remove(): Promise<RmResult> {
     // the index as it is now, before the worktree or a ref is touched: one another writer
     // replaced is read again (git reads the index at its start), unless this instance holds
     // unwritten edits (refused)
@@ -257,7 +304,33 @@ export class RmCommand extends GitCommand<RmResult> {
     const removedSet = new Set<string>();
     let gitmodulesEntry: IndexEntry | undefined;
     let removesSubmodule = false;
+    // `--sparse` over a sparse index: git walks its sparse directory entries as they are
+    // unless the pathspec could match part of one, listing a matched one as `out/`
+    const view = await this.sparseIndexView(items);
+    const collapsed = this.sparse ? view.collapsed : undefined;
+    // ensure_full_index of a sparse index: git 2.5x's hint, before anything else
+    if (view.expands && this.compatibility !== "2.43") this.hint = this.expansionHint();
+    // git's list: the names `rm '<name>'` is printed for
+    const listed: string[] = [];
+    let collapsedDir: { dir: string; matched: boolean } | undefined;
     for await (const entry of this.staging.entries()) {
+      if (collapsed) {
+        if (collapsedDir && !entry.path.startsWith(collapsedDir.dir)) collapsedDir = undefined;
+        const dir = collapsedDir ? undefined : collapsed.find((d) => entry.path.startsWith(d));
+        if (dir) {
+          const how = matchPathspecSeen(items, dir, DO_MATCH_DIRECTORY, seen, exactStopsGlobs);
+          collapsedDir = { dir, matched: how > 0 };
+          if (how > 0) listed.push(dir);
+        }
+        if (collapsedDir) {
+          if (collapsedDir.matched) {
+            if (!removedSet.has(entry.path)) removedPaths.push(entry.path);
+            removedSet.add(entry.path);
+            removedEntries.push(entry);
+          }
+          continue;
+        }
+      }
       if (entry.path === ".gitmodules" && entry.stage === 0) gitmodulesEntry = entry;
       // ce_path_match: a submodule matches `sub/` as a directory would
       const flags = entry.mode === FileMode.GITLINK ? DO_MATCH_DIRECTORY : 0;
@@ -272,6 +345,7 @@ export class RmCommand extends GitCommand<RmResult> {
         if (!removedSet.has(entry.path)) removedPaths.push(entry.path);
         removedSet.add(entry.path);
         removedEntries.push(entry);
+        listed.push(entry.path);
         if (entry.mode === FileMode.GITLINK) removesSubmodule = true;
       }
     }
@@ -293,7 +367,7 @@ export class RmCommand extends GitCommand<RmResult> {
           throw new RmFailedError(
             "fatal: please stage your changes to .gitmodules or stash them to proceed",
             [],
-            { removedPaths: [] },
+            { removedPaths: [], output: [] },
           );
         }
       }
@@ -317,12 +391,14 @@ export class RmCommand extends GitCommand<RmResult> {
         throw new RmFailedError(
           `fatal: not removing '${original || "."}' recursively without -r`,
           [],
-          { removedPaths: [] },
+          { removedPaths: [], output: [] },
         );
       }
     }
     const matched = seenAny;
-    const advise = (result: RmResult = { removedPaths }) =>
+    // cmd_rm prints each entry of its list (one per index entry) before anything changes
+    const output = this.quiet ? [] : listed.map((name) => `rm '${name}'`);
+    const advise = (result: RmResult = { removedPaths, output }) =>
       new RmFailedError(
         sparsePathAdvice(
           sparsePaths,
@@ -335,7 +411,7 @@ export class RmCommand extends GitCommand<RmResult> {
     // nothing else matched: git exits before writing anything
     if (sparsePaths.length > 0 && !matched) throw advise();
     // nothing matched at all (every element passed over by --ignore-unmatch)
-    if (!matched) return { removedPaths: [] };
+    if (!matched) return { removedPaths: [], output: [] };
 
     // remove_path_from_gitmodules dies on an unmerged .gitmodules (checked before anything
     // changes here, where git has removed the files already)
@@ -344,23 +420,23 @@ export class RmCommand extends GitCommand<RmResult> {
       // cmd_rm's show_only: check_local_mod, then nothing is changed
       if (!this.force) {
         const refusal = await this.checkLocalMod(removedEntries, worktree);
-        if (refusal) throw new RmFailedError(refusal, [], { removedPaths: [] });
+        if (refusal) throw new RmFailedError(refusal, [], { removedPaths: [], output: [] });
       }
       if (sparsePaths.length > 0) throw advise();
-      return { removedPaths };
+      return { removedPaths, output };
     }
     if (editsGitmodules && (await this.gitmodulesUnmerged())) {
       throw new RmFailedError(
         "fatal: Cannot change unmerged .gitmodules, resolve merge conflicts first",
         [],
-        { removedPaths: [] },
+        { removedPaths: [], output: [] },
       );
     }
 
     // check_local_mod: unless forced, nothing is removed that the index alone holds
     if (!this.force) {
       const refusal = await this.checkLocalMod(removedEntries, worktree);
-      if (refusal) throw new RmFailedError(refusal, [], { removedPaths: [] });
+      if (refusal) throw new RmFailedError(refusal, [], { removedPaths: [], output: [] });
     }
 
     // the files first (git commits the index only once they are gone): the first that cannot
@@ -386,6 +462,7 @@ export class RmCommand extends GitCommand<RmResult> {
         } else if (!removed) {
           throw new RmFailedError(`fatal: git rm: '${entry.path}': ${failure}`, [], {
             removedPaths: [],
+            output,
           });
         } else {
           warnings.push(`warning: git rm: '${entry.path}': ${failure}`);
@@ -415,9 +492,40 @@ export class RmCommand extends GitCommand<RmResult> {
     await adder.finish();
     await this.staging.write();
 
-    const result: RmResult = { removedPaths, ...(warnings.length > 0 ? { warnings } : {}) };
+    const result: RmResult = { removedPaths, output, ...(warnings.length > 0 ? { warnings } : {}) };
     if (sparsePaths.length > 0) throw advise(result);
     return result;
+  }
+
+  /**
+   * A sparse index as git's `cmd_rm` sees it: the sparse directories it walks without
+   * expanding them (`pathspec_needs_expanded_index` answered no), or whether it expands it.
+   */
+  private async sparseIndexView(
+    items: PathspecItem[],
+  ): Promise<{ collapsed?: string[]; expands: boolean }> {
+    // a sparse directory on disk: git expands the index as it reads it
+    const read = await sparseIndexAsRead(this.staging, this.worktreeAccess, (key, fallback) =>
+      configBool(this.workingCopy, key, fallback),
+    );
+    if (read.expanded) return { expands: true };
+    const sparseDirs = read.sparseDirs;
+    if (!sparseDirs) return { expands: false };
+    const entries: IndexEntry[] = [];
+    for await (const entry of this.staging.entries()) entries.push(entry);
+    const collapsed = collapsedSparseDirectories(
+      items,
+      sparseDirs,
+      entries,
+      await this.sparseCheckoutPatterns(),
+    );
+    return collapsed ? { collapsed, expands: false } : { expands: true };
+  }
+
+  /** git 2.5x's `advice.sparseIndexExpanded` hint (`ensure_full_index`), as its lines. */
+  private expansionHint(): string[] {
+    if (!configBool(this.workingCopy, "advice.sparseIndexExpanded", true)) return [];
+    return [...SPARSE_INDEX_EXPANDED_HINT];
   }
 
   /** Whether `.gitmodules` has conflict stages in the index (git's `is_gitmodules_unmerged`). */
@@ -708,7 +816,7 @@ async function badToRemoveSubmodule(
       throw new RmFailedError(
         `${error.message}\nfatal: could not run 'git status' in submodule '${path}'`,
         [],
-        { removedPaths: [] },
+        { removedPaths: [], output: [] },
       );
     }
     return true;

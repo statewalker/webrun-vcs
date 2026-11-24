@@ -15,6 +15,7 @@ import {
   withWorktreeEntries,
   worktreeEntryChunks,
 } from "@statewalker/vcs-working-tree";
+import { GitApiError } from "../errors/git-api-error.js";
 import {
   AddFailedError,
   IncompatibleOptionsError,
@@ -57,6 +58,7 @@ import {
 import { PathspecAttributes } from "./pathspec-attributes.js";
 import { PathspecFile } from "./pathspec-file.js";
 import { sparsePathAdvice } from "./sparse-checkout-support.js";
+import { SPARSE_INDEX_EXPANDED_HINT, sparseIndexAsRead } from "./sparse-index-view.js";
 import { worktreePathRules } from "./worktree-path-rules.js";
 /**
  * Result of AddCommand execution.
@@ -120,6 +122,11 @@ export class AddCommand extends GitCommand<AddResult> {
   private dryRun = false;
   private ignoreMissing = false;
   private ignoreErrors: boolean | undefined;
+  private includeSparse = false;
+  /** The sparse directories git holds collapsed after reading a sparse index (none: full) */
+  private collapsed: readonly string[] = [];
+  /** git's advice printed on standard error before anything else (2.5x's expansion hint) */
+  private hint: string[] = [];
   private warnEmbeddedRepo = true;
   private worktreeIterator: Worktree | undefined;
   private writeIndex = true;
@@ -205,6 +212,19 @@ export class AddCommand extends GitCommand<AddResult> {
   setIgnoreErrors(ignoreErrors: boolean): this {
     this.checkCallable();
     this.ignoreErrors = ignoreErrors;
+    return this;
+  }
+
+  /**
+   * `--sparse`: entries and files outside the sparse checkout (skip-worktree entries, paths
+   * outside the patterns) are updated and added as any other (git's `include_sparse`).
+   * Without it they are passed over and an element matching only such entries fails the
+   * command with git's advice. A skip-worktree entry still counts as up to date (its file is
+   * not compared), and `--refresh` advises either way, as in git.
+   */
+  setSparse(sparse: boolean): this {
+    this.checkCallable();
+    this.includeSparse = sparse;
     return this;
   }
 
@@ -573,6 +593,35 @@ export class AddCommand extends GitCommand<AddResult> {
   async call(): Promise<AddResult> {
     this.checkCallable();
     this.setCallable(false);
+    this.hint = [];
+    try {
+      const result = await this.addFiles();
+      if (this.hint.length === 0) return result;
+      return { ...result, warnings: [...this.hint, ...result.warnings] };
+    } catch (error) {
+      throw this.withHint(error);
+    }
+  }
+
+  /** `error` as git ends after printing its hint first (the exit status unchanged). */
+  private withHint(error: unknown): unknown {
+    if (this.hint.length === 0 || !(error instanceof GitApiError)) return error;
+    if (error instanceof AddFailedError) {
+      const failed = error as AddFailedError<AddResult>;
+      return new AddFailedError(
+        error.message,
+        error.ignoredPaths,
+        error.failedPaths,
+        failed.result && { ...failed.result, warnings: [...this.hint, ...failed.result.warnings] },
+        error.output,
+        [...this.hint, ...error.warnings],
+      ).withExitCode(error.exitCode);
+    }
+    error.message = [...this.hint, error.message].join("\n");
+    return error;
+  }
+
+  private async addFiles(): Promise<AddResult> {
     // the index as it is now, before the worktree or a ref is touched: one another writer
     // replaced is read again (git reads the index at its start), unless this instance holds
     // unwritten edits (refused)
@@ -580,6 +629,17 @@ export class AddCommand extends GitCommand<AddResult> {
     if (this.patch) return this.callPatch();
     if (this.interactive) return this.callInteractive();
     this.sparsePatterns = await this.sparseCheckoutPatterns();
+    // a sparse index as git holds it once read: expanded at once when a sparse directory is
+    // on disk (with 2.5x's hint), else its sparse directories stay single entries
+    const read = await sparseIndexAsRead(
+      this.staging,
+      this.getWorktreeIterator(),
+      (key, fallback) => configBool(this.workingCopy, key, fallback),
+    );
+    if (read.expanded && this.compatibility !== "2.43") {
+      if (this.advice("sparseIndexExpanded")) this.hint = [...SPARSE_INDEX_EXPANDED_HINT];
+    }
+    this.collapsed = read.sparseDirs ?? [];
 
     // Validate options - update and all are mutually exclusive
     if (this.update && this.all !== undefined) {
@@ -742,8 +802,13 @@ export class AddCommand extends GitCommand<AddResult> {
     for (let i = 0; i < items.length && !this.filesToCache; i++) {
       const item = items[i] as PathspecItem;
       if (item.exclude || seen[i]) continue;
-      skipSeen ??= skipWorktreeSeen(items, index, (path) => this.outsideSparse(path));
-      if (skipSeen[i]) {
+      skipSeen ??= skipWorktreeSeen(
+        items,
+        index,
+        (path) => this.outsideSparse(path),
+        this.collapsed,
+      );
+      if (!this.includeSparse && skipSeen[i]) {
         sparse.push(originals[i] as string);
         continue;
       }
@@ -841,7 +906,7 @@ export class AddCommand extends GitCommand<AddResult> {
         // up to date by promise: skip-worktree, assume-unchanged (CE_VALID)
         if (found === undefined) continue;
         // update_callback passes over paths outside the sparse checkout's patterns
-        if (this.outsideSparse(path)) continue;
+        if (this.excludedSparse(path)) continue;
         // add_to_index of a file whose stat still matches its entry: nothing to do
         if (quick && found && adder.unchangedByStat(first, found)) {
           if (!addedSet.has(path)) {
@@ -937,7 +1002,7 @@ export class AddCommand extends GitCommand<AddResult> {
     for (const file of untracked) {
       // (a repository is the directory entry `sub/`, asked and advised on as such)
       const displayPath = file.repository ? `${file.path}/` : file.path;
-      if (this.outsideSparse(displayPath)) {
+      if (this.excludedSparse(displayPath)) {
         sparseUntracked.push(displayPath);
         continue;
       }
@@ -989,7 +1054,7 @@ export class AddCommand extends GitCommand<AddResult> {
       sparse.length > 0 ||
       sparseUntracked.length > 0
     ) {
-      throw new AddFailedError(
+      const error = new AddFailedError(
         [...messages, ...errors, ...chmodErrors].join("\n"),
         ignored,
         failed,
@@ -997,6 +1062,8 @@ export class AddCommand extends GitCommand<AddResult> {
         output,
         warnings,
       );
+      // chmod_pathspec returns error()'s -1, which cmd_add ORs into its status: exit 255
+      throw chmodErrors.length > 0 ? error.withExitCode(255) : error;
     }
     return result;
   }
@@ -1017,6 +1084,16 @@ export class AddCommand extends GitCommand<AddResult> {
     await this.staging.write();
   }
 
+  /** Whether `path` lies in a sparse directory git holds collapsed (an entry it never sees). */
+  private underCollapsed(path: string): boolean {
+    return this.collapsed.some((dir) => path.startsWith(dir));
+  }
+
+  /** Whether `path` is outside the sparse checkout and `--sparse` was not given. */
+  private excludedSparse(path: string): boolean {
+    return !this.includeSparse && this.outsideSparse(path);
+  }
+
   /** Whether `path` is outside the sparse checkout's patterns (git's `!path_in_sparse_checkout`). */
   private outsideSparse(path: string): boolean {
     return this.sparsePatterns !== undefined && !this.sparsePatterns.includes(path);
@@ -1026,13 +1103,15 @@ export class AddCommand extends GitCommand<AddResult> {
   private async chmodEntries(items: PathspecItem[]): Promise<string[]> {
     const flip = (this.chmod as string)[0] as "+" | "-";
     const flags = (entry: StagingEntry) =>
-      entry.mode === FileMode.GITLINK ? DO_MATCH_DIRECTORY : 0;
+      entry.mode === FileMode.GITLINK || entry.mode === FileMode.TREE ? DO_MATCH_DIRECTORY : 0;
     return chmodIndexEntries(
       this.staging,
       flip,
-      (e) => !this.outsideSparse(e.path) && matchPathspec(items, e.path, flags(e)) > 0,
+      (e) => !this.excludedSparse(e.path) && matchPathspec(items, e.path, flags(e)) > 0,
       {
         pretend: this.dryRun,
+        includeSkipWorktree: this.includeSparse,
+        collapsed: this.includeSparse ? this.collapsed : [],
       },
     );
   }
@@ -1111,8 +1190,11 @@ export class AddCommand extends GitCommand<AddResult> {
     let skipSeen: number[] | undefined;
     for (let i = 0; i < items.length; i++) {
       if ((items[i] as PathspecItem).exclude || seen[i]) continue;
-      skipSeen ??= skipWorktreeSeen(items, entries.map(groupOf), (path) =>
-        this.outsideSparse(path),
+      skipSeen ??= skipWorktreeSeen(
+        items,
+        entries.map(groupOf),
+        (path) => this.outsideSparse(path),
+        this.collapsed,
       );
       // (git asks the element itself as a path too: `path_in_sparse_checkout(original)`)
       if (skipSeen[i] || this.outsideSparse(originals[i] as string)) {
@@ -1389,12 +1471,29 @@ export class AddCommand extends GitCommand<AddResult> {
     const failed: string[] = [];
     const index = await this.indexGroups();
     const seen = items.map(() => 0);
+    // find_pathspecs_matching_against_index with PS_IGNORE_SKIP_WORKTREE
     for (const group of index) {
+      if (isSkipWorktree(group) || this.outsideSparse(group.path)) continue;
       matchPathspecSeen(items, group.path, group.gitlink ? DO_MATCH_DIRECTORY : 0, seen);
     }
+    // an element matching only entries outside the sparse checkout is advised on (unless
+    // --sparse), the command failing once the others are renormalized
+    const sparse: string[] = [];
+    let skipSeen: number[] | undefined;
     for (let i = 0; i < items.length; i++) {
       const item = items[i] as PathspecItem;
-      if (item.exclude || seen[i] || item.match === "") continue;
+      if (item.exclude || seen[i]) continue;
+      skipSeen ??= skipWorktreeSeen(
+        items,
+        index,
+        (path) => this.outsideSparse(path),
+        this.collapsed,
+      );
+      if (!this.includeSparse && skipSeen[i]) {
+        sparse.push(originals[i] as string);
+        continue;
+      }
+      if (item.match === "") continue;
       // with --ignore-missing git collects an ignored one, but reports none here
       if (!this.ignoreMissing && !(await namesFile(worktree, item))) {
         throw new InvalidArgumentError(
@@ -1411,7 +1510,9 @@ export class AddCommand extends GitCommand<AddResult> {
     });
     for (const { path, entries } of index) {
       const entry = entries[0] as StagingEntry;
-      if (entry.stage !== 0 || entry.skipWorktree || this.outsideSparse(path)) continue;
+      // renormalize_tracked_files: entries outside the sparse checkout only with --sparse
+      if (entry.stage !== 0 || this.underCollapsed(path)) continue;
+      if (!this.includeSparse && (entry.skipWorktree || this.outsideSparse(path))) continue;
       const kind = entry.mode & 0o170000;
       if (kind !== 0o100000 && kind !== 0o120000) continue;
       if (!matchPathspec(items, path, 0)) continue;
@@ -1461,8 +1562,16 @@ export class AddCommand extends GitCommand<AddResult> {
       warnings,
       output,
     };
-    if (failed.length > 0) {
-      throw new AddFailedError(errors.join("\n"), [], failed, result, output, warnings);
+    if (failed.length > 0 || sparse.length > 0) {
+      const messages = sparse.length > 0 ? this.sparseAdvice(sparse) : [];
+      throw new AddFailedError(
+        [...messages, ...errors].join("\n"),
+        [],
+        failed,
+        result,
+        output,
+        warnings,
+      );
     }
     return result;
   }
@@ -1494,9 +1603,21 @@ function skipWorktreeSeen(
   items: PathspecItem[],
   index: readonly IndexGroup[],
   outsideSparse: (path: string) => boolean,
+  /** The sparse directories git still holds collapsed: matched as one directory entry each */
+  collapsed: readonly string[] = [],
 ): number[] {
   const seen = items.map(() => 0);
+  let at = 0;
   for (const group of index) {
+    const dir = collapsed.find((d) => group.path.startsWith(d));
+    if (dir) {
+      // (each directory once, where its first entry stands in the index)
+      if (collapsed.indexOf(dir) >= at) {
+        at = collapsed.indexOf(dir) + 1;
+        matchPathspecSeen(items, dir, DO_MATCH_DIRECTORY, seen);
+      }
+      continue;
+    }
     if (!isSkipWorktree(group) && !outsideSparse(group.path)) continue;
     matchPathspecSeen(items, group.path, group.gitlink ? DO_MATCH_DIRECTORY : 0, seen);
   }
