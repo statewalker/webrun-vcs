@@ -206,8 +206,11 @@ export function rstripRef(name: string, len: number): string {
 const isSpace = (c: string) =>
   c === " " || c === "\t" || c === "\n" || c === "\v" || c === "\f" || c === "\r";
 
-/** The offset of a trailing signature (gpg-interface.c's parse_signed_buffer). */
-function signatureStart(text: string): number {
+/**
+ * The offset of a trailing signature in `text` (gpg-interface.c's `parse_signed_buffer`): the
+ * last line starting a PGP, X.509 or SSH signature block, else `text.length`.
+ */
+export function signatureStart(text: string): number {
   const sigs = [
     "-----BEGIN PGP SIGNATURE-----",
     "-----BEGIN PGP MESSAGE-----",
