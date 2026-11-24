@@ -404,12 +404,9 @@ export class PullCommand extends TransportCommand<PullResult> {
     )
       .replace(/\/+$/, "")
       .replace(/\.git$/, "");
-    const into =
-      localBranchName === "main" || localBranchName === "master" ? "" : ` into ${localBranchName}`;
-    mergeCommand.setMessage(
-      mergeTarget.description
-        ? `Merge ${mergeTarget.description}${into}`
-        : `Merge branch '${remoteBranch}' of ${url}${into}`,
+    // git merges FETCH_HEAD: fmt-merge-msg describes the head from its line
+    mergeCommand.setMergeNames(
+      `${trackingRefResolved.objectId}\t\t${mergeTarget.description ?? `branch '${remoteBranch}' of ${url}`}\n`,
     );
     mergeCommand.setReflogAction(action);
     if (canFastForward) mergeCommand.setFastForwardMode(FastForwardMode.FF_ONLY);
