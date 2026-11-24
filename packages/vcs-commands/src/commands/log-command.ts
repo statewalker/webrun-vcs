@@ -18,7 +18,12 @@ import { bytesToHex, hexToBytes } from "@statewalker/vcs-utils/hash/utils";
 
 import type { AttributesResolver, ContentAttributesContext } from "@statewalker/vcs-working-tree";
 
-import { GitApiError, IncompatibleOptionsError, InvalidConfigError } from "../errors/index.js";
+import {
+  GitApiError,
+  IncompatibleOptionsError,
+  InvalidConfigError,
+  NotImplementedError,
+} from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type CombinedDiffOptions, writeCombinedDiff } from "../results/combined-diff.js";
@@ -83,6 +88,20 @@ interface OutputWalk {
   unwalkedShown?: Set<ObjectId>;
 }
 
+/** A commit given to the walk: excluded or not, and the name it was given by. */
+interface PendingCommit {
+  id: ObjectId;
+  exclude: boolean;
+  name?: string;
+}
+
+/** git's get_revision under `--reverse`: every commit read first, then given oldest first. */
+async function* reversed<T>(source: AsyncIterable<T>): AsyncIterable<T> {
+  const all: T[] = [];
+  for await (const item of source) all.push(item);
+  for (let i = all.length - 1; i >= 0; i--) yield all[i] as T;
+}
+
 /** git log reads no index: the in-tree attributes files are the worktree's only. */
 const NO_INDEX = { attributesBlob: () => undefined };
 
@@ -94,7 +113,25 @@ const NO_INDEX = { attributesBlob: () => undefined };
 export interface LogResult extends Commit {
   /** The SHA-1 object ID of the commit */
   id: ObjectId;
+  /**
+   * A boundary commit ({@link LogCommand.setBoundary}): a parent of a commit listed that is
+   * not listed itself, given after the others (git's `BOUNDARY`, the `-` mark)
+   */
+  boundary?: boolean;
+  /**
+   * The name the commit was reached from ({@link LogCommand.setSource}, git's `--source`):
+   * the revision as given, or the ref `--all`, `--branches`... named
+   */
+  source?: string;
 }
+
+/**
+ * The order of the commits listed: git's `--topo-order` (`topo`: no parent before all its
+ * children, a line of history kept together), `--date-order` (`date`: no parent before its
+ * children, else newest commit date first), `--author-date-order` (`author-date`: as `date`
+ * by author date).
+ */
+export type LogOrder = "topo" | "date" | "author-date";
 
 /**
  * What a path-limited walk did (git's trace2 `bloom` statistics, and the tree work behind
@@ -191,7 +228,7 @@ export enum RevFilter {
 export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private startCommits: ObjectId[] = [];
   /** The commits given, included and excluded, in the order given (git's pending list) */
-  private readonly pending: { id: ObjectId; exclude: boolean }[] = [];
+  private readonly pending: PendingCommit[] = [];
   private paths: string[] = [];
   private excludePaths: string[] = [];
   private maxCount?: number;
@@ -237,6 +274,70 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private outputWalk: OutputWalk | undefined;
   /** `-g <ref>`: the reflog walked instead of the history */
   private reflogWalkRef?: string;
+  /** `--topo-order`, `--date-order`, `--author-date-order` */
+  private order?: LogOrder;
+  /** `--reverse` */
+  private reverse = false;
+  /** `--boundary` */
+  private boundary = false;
+  /** `--source` */
+  private source = false;
+
+  /**
+   * The order of the commits ({@link LogOrder}); undefined is git's default, newest commit
+   * date first as the walk meets them. A sorted walk reads the whole history it lists
+   * before giving the first commit.
+   *
+   * @example
+   * ```typescript
+   * // git rev-list --topo-order main
+   * await git.log().add(main).setOrder("topo").call();
+   * ```
+   */
+  setOrder(order: LogOrder | undefined): this {
+    this.checkCallable();
+    this.order = order;
+    return this;
+  }
+
+  /**
+   * `--reverse`: the commits chosen (after `-n` and `--skip`, boundary commits included)
+   * given oldest first.
+   */
+  setReverse(reverse: boolean): this {
+    this.checkCallable();
+    this.reverse = reverse;
+    return this;
+  }
+
+  /**
+   * `--boundary`: after the commits listed, the parents of those that are not listed
+   * themselves (excluded, cut by `-n`, `--since` or a filter), each with `boundary: true`,
+   * as git's get_revision lists them (sorted as `sort_in_topological_order` sorts them).
+   *
+   * @example
+   * ```typescript
+   * // git rev-list --boundary main..topic
+   * for await (const c of await git.log().addRange(main, topic).setBoundary(true).call())
+   *   console.log(`${c.boundary ? "-" : ""}${c.id}`);
+   * ```
+   */
+  setBoundary(boundary: boolean): this {
+    this.checkCallable();
+    this.boundary = boundary;
+    return this;
+  }
+
+  /**
+   * `--source`: each commit carries the name it was reached from (`source`): the name given
+   * to {@link add}/{@link not}, the ref of {@link all}, `HEAD` for the default, passed from
+   * child to parent as the walk goes (the first name to reach a commit wins).
+   */
+  setSource(source: boolean): this {
+    this.checkCallable();
+    this.source = source;
+    return this;
+  }
 
   /**
    * `git log -g <ref>` (`--walk-reflogs`) for the printed log ({@link callText}): the
@@ -259,11 +360,12 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * peels it; with {@link all} the refs are walked besides (`git log --all <commit>`).
    *
    * @param commit ObjectId of commit to start from
+   * @param name The name it was given by, which {@link setSource} reports (the id without)
    */
-  add(commit: ObjectId): this {
+  add(commit: ObjectId, name?: string): this {
     this.checkCallable();
     this.startCommits.push(commit);
-    this.pending.push({ id: commit, exclude: false });
+    this.pending.push({ id: commit, exclude: false, ...(name !== undefined ? { name } : {}) });
     return this;
   }
 
@@ -365,10 +467,11 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * Useful for finding commits in one branch but not another.
    *
    * @param commit ObjectId to exclude along with its ancestors
+   * @param name The name it was given by (see {@link add})
    */
-  not(commit: ObjectId): this {
+  not(commit: ObjectId, name?: string): this {
     this.checkCallable();
-    this.pending.push({ id: commit, exclude: true });
+    this.pending.push({ id: commit, exclude: true, ...(name !== undefined ? { name } : {}) });
     return this;
   }
 
@@ -592,18 +695,25 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 
     // the commits given, in order, the refs of `all()` where it was called; HEAD without
     // either
-    const pending: { id: ObjectId; exclude: boolean }[] = [];
+    const pending: PendingCommit[] = [];
     for (let i = 0; i <= this.pending.length; i++) {
       if (this.includeAll && i === this.allAt) {
-        for (const id of await this.getAllRefs()) pending.push({ id, exclude: false });
+        for (const { id, name } of await this.getAllRefs())
+          pending.push({ id, exclude: false, name });
       }
       const e = this.pending[i];
-      if (e) pending.push({ id: await this.peelToCommit(e.id), exclude: e.exclude });
+      if (e)
+        pending.push({
+          id: await this.peelToCommit(e.id),
+          exclude: e.exclude,
+          name: e.name ?? e.id,
+        });
     }
     if (this.startCommits.length === 0 && !this.includeAll) {
-      pending.push({ id: await this.resolveHead(), exclude: false });
+      pending.push({ id: await this.resolveHead(), exclude: false, name: "HEAD" });
     }
-    return this.walk(pending);
+    const walk = this.walk(pending);
+    return this.reverse ? reversed(walk) : walk;
   }
 
   /**
@@ -674,6 +784,25 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     return bytes;
   }
 
+  /**
+   * The author date of a commit as commit.c's record_author_date reads it (0 when the
+   * header has no well-formed author line).
+   */
+  private async authorDate(id: ObjectId): Promise<number> {
+    const bytes = await this.readObjectBytes(
+      replacementOf((await this.objectReplacements())?.replace ?? new Map(), id),
+    ).catch(() => undefined);
+    if (!bytes) return 0;
+    const text = NAME_DECODER.decode(bytes);
+    const end = text.indexOf("\n\n");
+    for (const line of (end < 0 ? text : text.slice(0, end)).split("\n")) {
+      if (!line.startsWith("author ")) continue;
+      const m = /> (\d+) [+-]?\d+$/.exec(line) ?? /> (\d+)$/.exec(line);
+      return m ? Number(m[1]) : 0;
+    }
+    return 0;
+  }
+
   /** The commit an annotated tag (or a chain of them) tags; any other id as it is. */
   private async peelToCommit(start: ObjectId): Promise<ObjectId> {
     const tags = this.tagsStore;
@@ -691,7 +820,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * (refs_for_each_ref, symbolic ones resolved), then HEAD (refs_head_ref); annotated tags
    * peeled.
    */
-  private async getAllRefs(): Promise<ObjectId[]> {
+  private async getAllRefs(): Promise<{ id: ObjectId; name: string }[]> {
     const named: { name: Uint8Array; id: ObjectId }[] = [];
     for await (const ref of this.refsStore.list()) {
       if (!ref.name.startsWith("refs/")) continue;
@@ -700,10 +829,11 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (id) named.push({ name: encodeGitPath(ref.name), id });
     }
     named.sort((a, b) => compareBytes(a.name, b.name));
-    const ids: ObjectId[] = [];
-    for (const { id } of named) ids.push(await this.peelToCommit(id));
+    const ids: { id: ObjectId; name: string }[] = [];
+    for (const { id, name } of named)
+      ids.push({ id: await this.peelToCommit(id), name: decodeGitPath(name) });
     const head = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
-    if (head) ids.push(await this.peelToCommit(head));
+    if (head) ids.push({ id: await this.peelToCommit(head), name: "HEAD" });
     return ids;
   }
 
@@ -727,7 +857,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * The commits met are held in a `RevTable` (typed arrays, a few dozen bytes each); commits
    * the commit-graph has are reached by their graph positions, without building their ids.
    */
-  private async *walk(pending: { id: ObjectId; exclude: boolean }[]): AsyncIterable<LogResult> {
+  private async *walk(pending: PendingCommit[]): AsyncIterable<LogResult> {
     const prune = this.paths.length > 0 || this.excludePaths.length > 0;
     // a shallow commit has no parents (git's shallow grafts); the graph is off then
     const shallowIds = (await this.refsStore.getShallow?.().catch(() => undefined)) ?? [];
@@ -756,6 +886,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     let trackTreesame = false;
     const t = new RevTable(graph);
     this.lastWalk = t;
+    /** `--source`: the name each commit was reached from (git's revision_sources slab) */
+    const sources = this.source ? new Map<number, string>() : undefined;
     /** Raw commits read by `parse` (no graph), kept until shown: read once, not twice. */
     const raw = new Map<number, Uint8Array>();
 
@@ -876,6 +1008,10 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         if (!(await parse(p))) {
           throw new GitApiError(`Failed to traverse parents of commit ${t.idOf(n)}`);
         }
+        if (sources && !sources.has(p)) {
+          const source = sources.get(n);
+          if (source !== undefined) sources.set(p, source);
+        }
         if (!(t.flag(p) & SEEN)) {
           t.mark(p, SEEN);
           queue.put(p, t.date(p));
@@ -920,7 +1056,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         };
         if (!(await filter.include(view))) return undefined;
       }
-      return { ...commit, id };
+      const source = sources?.get(n);
+      return source !== undefined ? { ...commit, id, source } : { ...commit, id };
     };
 
     // prepare_revision_walk: the flags of every argument first, then handle_commit in order
@@ -951,6 +1088,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     for (const e of pending) {
       const n = t.lookup(e.id);
       if (!(await parse(n))) continue;
+      if (sources && !sources.has(n) && e.name !== undefined) sources.set(n, e.name);
       if (t.flag(n) & UNINTERESTING) {
         markParentsUninteresting(n);
         limited = true;
@@ -965,95 +1103,178 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const queue = new CommitQueue<number>();
     for (const n of list) queue.put(n, t.date(n));
 
+    const none = this.maxCount !== undefined && this.maxCount <= 0;
+    const output = this.outputWalk;
+    const order = this.order;
+    // the output's walk and a sorted one are limited (git without generation numbers limits
+    // a topo walk)
+    trackTreesame =
+      (limited || !!output || !!order) && prune && !simplifyHistory && !firstParentOnly;
+    /** git's sort_in_topological_order of `list` (parents as simplified, unparsed: none) */
+    const sortTopo = async (list: number[], sort: LogOrder | undefined): Promise<number[]> => {
+      if (list.length === 0) return list;
+      const indegree = new Map<number, number>();
+      for (const n of list) indegree.set(n, 1);
+      const parentCount = (n: number) => (t.parsed(n) ? t.parentCount(n) : 0);
+      for (const n of list) {
+        for (let k = 0, c = parentCount(n); k < c; k++) {
+          const p = t.parent(n, k);
+          const d = indegree.get(p);
+          if (d) indegree.set(p, d + 1);
+        }
+      }
+      const out: number[] = [];
+      let put: (n: number) => void;
+      let get: () => number | undefined;
+      if (sort === undefined || sort === "topo") {
+        // REV_SORT_IN_GRAPH_ORDER: a LIFO, the tips first in the order given
+        const stack: number[] = [];
+        for (const n of list) if (indegree.get(n) === 1) stack.push(n);
+        stack.reverse();
+        put = (n) => stack.push(n);
+        get = () => stack.pop();
+      } else {
+        const dates = new Map<number, number>();
+        for (const n of list)
+          dates.set(n, sort === "date" ? t.date(n) : await this.authorDate(t.idOf(n)));
+        const queue = new CommitQueue<number>();
+        put = (n) => queue.put(n, dates.get(n) ?? 0);
+        get = () => queue.get();
+        for (const n of list) if (indegree.get(n) === 1) put(n);
+      }
+      for (let n = get(); n !== undefined; n = get()) {
+        for (let k = 0, c = parentCount(n); k < c; k++) {
+          const p = t.parent(n, k);
+          const d = indegree.get(p);
+          if (!d) continue;
+          indegree.set(p, d - 1);
+          if (d - 1 === 1) put(p);
+        }
+        indegree.set(n, 0);
+        out.push(n);
+      }
+      return out;
+    };
+
+    /** get_revision_1's commits, in the order they come out */
+    let candidates: AsyncIterable<number> | Iterable<number>;
+    if (!limited && !output && !order) {
+      // get_revision_1, streaming
+      const since = this.sinceTime;
+      candidates = (async function* () {
+        for (let n = queue.get(); n !== undefined; n = queue.get()) {
+          // --since: older commits are dropped without walking their parents (max_age)
+          if (since !== undefined && t.date(n) < since) {
+            raw.delete(n);
+            continue;
+          }
+          await processParents(n, queue);
+          yield n;
+        }
+      })();
+    } else {
+      // limit_list
+      const newlist: number[] = [];
+      let date = Number.POSITIVE_INFINITY;
+      let slop = SLOP;
+      let interestingCache = -1;
+      /** git's everybody_uninteresting */
+      const everybodyUninteresting = (): boolean => {
+        if (interestingCache >= 0 && !(t.flag(interestingCache) & UNINTERESTING)) return false;
+        for (const n of queue.items()) {
+          if (t.flag(n) & UNINTERESTING) continue;
+          interestingCache = n;
+          return false;
+        }
+        return true;
+      };
+      /** git's still_interesting */
+      const stillInteresting = (): number => {
+        const head = queue.peek();
+        if (head === undefined) return 0;
+        if (date <= t.date(head)) return SLOP;
+        if (!everybodyUninteresting()) return SLOP;
+        return slop - 1;
+      };
+      for (let n = queue.get(); n !== undefined; n = queue.get()) {
+        // what is shown is read again at the end: a limited walk does not keep raw commits
+        raw.delete(n);
+        if (n === interestingCache) interestingCache = -1;
+        if (this.sinceTime !== undefined && t.date(n) < this.sinceTime) t.mark(n, UNINTERESTING);
+        await processParents(n, queue);
+        if (t.flag(n) & UNINTERESTING) {
+          markParentsUninteresting(n);
+          slop = stillInteresting();
+          if (slop) continue;
+          break;
+        }
+        if (this.untilTime !== undefined && t.date(n) > this.untilTime) continue;
+        date = t.date(n);
+        newlist.push(n);
+      }
+      // commits made TREESAME by parents that became UNINTERESTING
+      if (trackTreesame) {
+        for (const n of newlist) {
+          if (!(t.flag(n) & (UNINTERESTING | TREESAME))) updateTreesame(n);
+        }
+      }
+      raw.clear();
+      if (output) {
+        const sorted = output.topo ? await sortTopo(newlist, order ?? "topo") : newlist;
+        await this.finishOutputWalk(output, t, sorted, shown, relevant, parse);
+        return;
+      }
+      candidates = order ? await sortTopo(newlist, order) : newlist;
+    }
+
+    // get_revision_internal: --skip, -n, then (--boundary) the parents of the commits
+    // shown that were not shown themselves
+    const collectBoundary = this.boundary;
+    /** SHOWN */
+    const shownSet = new Set<number>();
+    /** CHILD_SHOWN, and git's boundary_commits array in the order marked */
+    const childShown = new Set<number>();
+    const boundaryCommits: number[] = [];
     let count = 0;
     let skipped = 0;
     // git's -n 0 reads nothing more in a streaming walk; a limited walk is done before
-    const none = this.maxCount !== undefined && this.maxCount <= 0;
-    const output = this.outputWalk;
-    // the output's walk is limited (git without generation numbers limits a topo walk)
-    trackTreesame = (limited || !!output) && prune && !simplifyHistory && !firstParentOnly;
-    if (!limited && !output) {
-      if (none) return;
-      // get_revision_1, streaming
-      for (let n = queue.get(); n !== undefined; n = queue.get()) {
-        // --since: older commits are dropped without walking their parents (max_age)
-        if (this.sinceTime !== undefined && t.date(n) < this.sinceTime) {
-          raw.delete(n);
-          continue;
-        }
-        await processParents(n, queue);
+    if (!none) {
+      for await (const n of candidates) {
         const commit = await shown(n);
         if (!commit) continue;
         if (skipped < this.skip) {
           skipped++;
           continue;
         }
+        shownSet.add(n);
+        if (collectBoundary) {
+          for (let k = 0, c = t.parentCount(n); k < c; k++) {
+            const p = t.parent(n, k);
+            if (shownSet.has(p) || childShown.has(p)) continue;
+            childShown.add(p);
+            boundaryCommits.push(p);
+          }
+        }
         yield commit;
-        if (this.maxCount !== undefined && ++count >= this.maxCount) return;
-      }
-      return;
-    }
-
-    // limit_list
-    const newlist: number[] = [];
-    let date = Number.POSITIVE_INFINITY;
-    let slop = SLOP;
-    let interestingCache = -1;
-    /** git's everybody_uninteresting */
-    const everybodyUninteresting = (): boolean => {
-      if (interestingCache >= 0 && !(t.flag(interestingCache) & UNINTERESTING)) return false;
-      for (const n of queue.items()) {
-        if (t.flag(n) & UNINTERESTING) continue;
-        interestingCache = n;
-        return false;
-      }
-      return true;
-    };
-    /** git's still_interesting */
-    const stillInteresting = (): number => {
-      const head = queue.peek();
-      if (head === undefined) return 0;
-      if (date <= t.date(head)) return SLOP;
-      if (!everybodyUninteresting()) return SLOP;
-      return slop - 1;
-    };
-    for (let n = queue.get(); n !== undefined; n = queue.get()) {
-      // what is shown is read again at the end: a limited walk does not keep raw commits
-      raw.delete(n);
-      if (n === interestingCache) interestingCache = -1;
-      if (this.sinceTime !== undefined && t.date(n) < this.sinceTime) t.mark(n, UNINTERESTING);
-      await processParents(n, queue);
-      if (t.flag(n) & UNINTERESTING) {
-        markParentsUninteresting(n);
-        slop = stillInteresting();
-        if (slop) continue;
-        break;
-      }
-      if (this.untilTime !== undefined && t.date(n) > this.untilTime) continue;
-      date = t.date(n);
-      newlist.push(n);
-    }
-    // commits made TREESAME by parents that became UNINTERESTING
-    if (trackTreesame) {
-      for (const n of newlist) {
-        if (!(t.flag(n) & (UNINTERESTING | TREESAME))) updateTreesame(n);
+        if (this.maxCount !== undefined && ++count >= this.maxCount) break;
       }
     }
-    raw.clear();
-    if (output) {
-      await this.finishOutputWalk(output, t, newlist, shown, relevant, parse);
-      return;
+    if (!collectBoundary) return;
+    // create_boundary_commit_list: each prepended (commit_list_insert), then sorted
+    const boundaryList: number[] = [];
+    const marked = new Set<number>();
+    for (const n of boundaryCommits) {
+      if (shownSet.has(n) || marked.has(n)) continue;
+      marked.add(n);
+      boundaryList.unshift(n);
     }
-    if (none) return;
-    for (const n of newlist) {
-      const commit = await shown(n);
+    for (const n of await sortTopo(boundaryList, order)) {
+      const id = t.idOf(n);
+      const commit = await this.walkCommits.load(id);
       if (!commit) continue;
-      if (skipped < this.skip) {
-        skipped++;
-        continue;
-      }
-      yield commit;
-      if (this.maxCount !== undefined && ++count >= this.maxCount) return;
+      if (shallow.has(id)) commit.parents = [];
+      const source = sources?.get(n);
+      yield { ...commit, id, boundary: true, ...(source !== undefined ? { source } : {}) };
     }
   }
 
@@ -1070,34 +1291,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     relevant: (n: number) => boolean,
     parse: (n: number) => Promise<boolean>,
   ): Promise<void> {
-    let order = newlist;
-    if (output.topo) {
-      // sort_in_topological_order (REV_SORT_IN_GRAPH_ORDER: a LIFO of the ready commits)
-      const indegree = new Map<number, number>();
-      for (const n of newlist) indegree.set(n, 1);
-      for (const n of newlist) {
-        for (let k = 0, c = t.parentCount(n); k < c; k++) {
-          const p = t.parent(n, k);
-          const d = indegree.get(p);
-          if (d) indegree.set(p, d + 1);
-        }
-      }
-      const stack: number[] = [];
-      for (const n of newlist) if (indegree.get(n) === 1) stack.push(n);
-      stack.reverse();
-      order = [];
-      for (let n = stack.pop(); n !== undefined; n = stack.pop()) {
-        for (let k = 0, c = t.parentCount(n); k < c; k++) {
-          const p = t.parent(n, k);
-          const d = indegree.get(p);
-          if (!d) continue;
-          indegree.set(p, d - 1);
-          if (d - 1 === 1) stack.push(p);
-        }
-        indegree.set(n, 0);
-        order.push(n);
-      }
-    }
+    const order = newlist;
     const firstParentOnly = this.firstParentOnly;
     /** revision.c's one_relevant_parent */
     const oneRelevantParent = (n: number): number | undefined => {
@@ -1148,8 +1342,14 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         }
         parents = ids;
       }
-      const { id, ...rest } = commit;
-      output.entries.push({ id, commit: rest, parents, ...(savedParents ? { savedParents } : {}) });
+      const { id, source, boundary: _boundary, ...rest } = commit;
+      output.entries.push({
+        id,
+        commit: rest,
+        parents,
+        ...(savedParents ? { savedParents } : {}),
+        ...(source !== undefined ? { source } : {}),
+      });
     }
     // graph.c's graph_is_interesting asks get_commit_action about a parent: one the walk
     // never reached has no TREESAME or SHOWN flag, so only the filters can hide it (with
@@ -1188,8 +1388,9 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   private async printLog(options: LogOutputOptions): Promise<Uint8Array> {
+    const reverse = !!options.reverse || this.reverse;
     // revision.c's setup_revisions: the graph cannot be reversed
-    if (options.graph && options.reverse) {
+    if (options.graph && reverse) {
       throw new IncompatibleOptionsError(
         ["--graph", "--reverse"],
         "options '--graph' and '--reverse' cannot be used together",
@@ -1213,7 +1414,21 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     });
     const follow = !printer.alwaysShowHeader;
     const graph = !!options.graph;
-    const topo = graph || !!options.topoOrder;
+    const topo = graph;
+    const boundary = !!options.boundary || this.boundary;
+    if (graph && boundary) {
+      // graph.c draws boundary commits as `o` in columns of their own: not reproduced
+      throw new NotImplementedError("git log --graph --boundary");
+    }
+    // the walk's order, sources and boundary for the output (it reverses the list itself)
+    const saved = { order: this.order, reverse: this.reverse, boundary: this.boundary };
+    const saveSource = this.source;
+    if (options.authorDateOrder) this.order = "author-date";
+    else if (options.dateOrder) this.order = "date";
+    else if (options.topoOrder) this.order ??= "topo";
+    this.reverse = false;
+    this.boundary = boundary;
+    if (options.source || printer.wantsSource) this.source = true;
     const maxCount = this.maxCount;
     const skip = this.skip;
     const simplifyHistory = this.simplifyHistory;
@@ -1240,19 +1455,29 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (maxCount !== undefined && maxCount <= 0) entries = [];
     } else {
       // --follow counts the commits shown, not those walked; --reverse the newest walked
-      if (follow && !options.reverse) this.maxCount = undefined;
+      if (follow && !reverse) this.maxCount = undefined;
       entries = [];
       for await (const c of await this.call()) {
-        const { id, ...commit } = c;
-        entries.push({ id, commit, parents: c.parents });
+        const { id, boundary: isBoundary, source, ...commit } = c;
+        entries.push({
+          id,
+          commit,
+          parents: c.parents,
+          ...(isBoundary ? { boundary: true } : {}),
+          ...(source !== undefined ? { source } : {}),
+        });
       }
       if (follow) this.maxCount = maxCount;
     }
     this.simplifyHistory = simplifyHistory;
-    if (follow && options.reverse && maxCount !== undefined) {
+    this.order = saved.order;
+    this.reverse = saved.reverse;
+    this.boundary = saved.boundary;
+    this.source = saveSource;
+    if (follow && reverse && maxCount !== undefined) {
       entries = entries.slice(0, Math.max(maxCount, 0));
     }
-    if (options.reverse) entries.reverse();
+    if (reverse) entries.reverse();
     await printer.start();
     if (graph) {
       const parentsOf = new Map(entries.map((e) => [e.id, e.parents]));
@@ -1261,7 +1486,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     let count = 0;
     // -n 0: nothing is walked
     if (maxCount !== undefined && maxCount <= 0) entries = [];
-    const countShown = follow && maxCount !== undefined && !options.reverse;
+    const countShown = follow && maxCount !== undefined && !reverse;
     for (let k = 0; k < entries.length; k++) {
       const e = entries[k] as LogOutputEntry;
       const lookahead = entries.slice(k + 1, k + 3).map((x) => x.id);
