@@ -353,6 +353,157 @@ describeGit("signature checks against native git", { timeout: 120_000 }, () => {
     }
   });
 
+  /** Ours over `dir` with the in-process ssh verifier and the `-c` settings given. */
+  function oursInProcess(dir: string, config: Record<string, string> = {}): Promise<Git> {
+    return openOurs(
+      dir,
+      createNodeGitHostEnvironment({
+        env: env(config),
+        verifier: createSshVerifier({
+          readFile: async (path) => {
+            try {
+              return readFileSync(path, "utf8");
+            } catch {
+              return undefined;
+            }
+          },
+          localTzOffset: () => 0,
+          compatibility: nativeIs25x ? "2.56" : "2.43",
+        }),
+      }),
+    );
+  }
+
+  /** verify-commit and the %G formats of `id`, native and the in-process verifier, compared. */
+  async function compareInProcess(id: string, config: Record<string, string>, label: string) {
+    const native = git(repo, ["verify-commit", id], config);
+    const g = await oursInProcess(repo, config);
+    const result = await g.verifyCommit().addCommit(id).call();
+    expect(result.exitCode, `${label}: ${native.stderr}`).toBe(native.status);
+    expect(result.stderr, label).toBe(native.stderr);
+    const format = "%G?|%GS|%GK|%GT|%GG|%x00";
+    const nf = git(repo, ["log", "-1", `--format=${format}`, id], config);
+    const text = await (await oursInProcess(repo, config))
+      .log()
+      .add(id)
+      .setMaxCount(1)
+      .callText({ pretty: `tformat:${format}` });
+    expect(text, label).toBe(nf.stdout);
+    return native;
+  }
+
+  it('t7528-signed-commit-ssh.sh: "verify-commit exits failure on untrusted signature", "verify-commit succeeds with commit date and key validity matching", "verify-commit exits failure with commit date outside of key validity": allowed signers lines ssh-keygen refuses (sshsigopt_parse) match nothing in-process too', async () => {
+    const pub = readFileSync(join(root, "ssh", "trusted.pub"), "utf8").trim();
+    const other = readFileSync(join(root, "ssh", "untrusted.pub"), "utf8").trim();
+    const cases: { options: string; good: boolean }[] = [
+      // refused: unknown options, unquoted values, bad or zero times, repeats, order
+      { options: 'namespace="git"', good: false },
+      { options: "bogus", good: false },
+      { options: "namespaces", good: false },
+      { options: "valid-before=20990101", good: false },
+      { options: 'valid-before="2020-01-01"', good: false },
+      { options: 'valid-before="0"', good: false },
+      { options: 'valid-before="19700101Z"', good: false },
+      { options: 'valid-before="20990101",valid-before="20990102"', good: false },
+      { options: 'namespaces="git",namespaces="git"', good: false },
+      { options: 'valid-after="20990101",valid-before="20980101"', good: false },
+      { options: 'namespaces="git",', good: false },
+      { options: 'namespaces="git', good: false },
+      // accepted
+      { options: 'NAMESPACES="git"', good: true },
+      { options: 'valid-before="20990101Z"', good: true },
+      { options: 'valid-after="20000101",valid-before="20990101"', good: true },
+      { options: 'namespaces="g*"', good: true },
+      { options: "cert-authority,cert-authority", good: false },
+    ];
+    let k = 0;
+    for (const c of cases) {
+      const file = join(root, "ssh", `opts-${k++}`);
+      // a refused line of another key first: reported on the way, the key's own line after
+      writeFileSync(
+        file,
+        `other@example.com bogus ${other}\ninterop@example.com ${c.options} ${pub}\n`,
+      );
+      const native = await compareInProcess(
+        ids["ssh-good"] as string,
+        { "gpg.ssh.allowedSignersFile": file },
+        c.options,
+      );
+      expect(native.status === 0, c.options).toBe(c.good);
+    }
+  });
+
+  it('t7528-signed-commit-ssh.sh: "verify-commit exits failure with commit date outside of key validity": without a verify time keys are checked against now', async () => {
+    // valid only before 2010: the commits' 2005 date passes, now does not
+    const pub = readFileSync(join(root, "ssh", "trusted.pub"), "utf8").trim();
+    const file = join(root, "ssh", "until-2010");
+    writeFileSync(file, `interop@example.com valid-before="20100101" ${pub}\n`);
+    const verifier = createSshVerifier({
+      readFile: async (path) => (path === file ? readFileSync(file, "utf8") : undefined),
+      localTzOffset: () => 0,
+    });
+    const raw = gitOk(repo, ["cat-file", "commit", ids["ssh-good"] as string]);
+    const signature = raw
+      .split("\n")
+      .filter(
+        (l, i, all) =>
+          l.startsWith("gpgsig ") ||
+          (l.startsWith(" ") && all.slice(0, i).some((x) => x.startsWith("gpgsig "))),
+      )
+      .map((l) => (l.startsWith("gpgsig ") ? l.slice(7) : l.slice(1)))
+      .join("\n");
+    const payload = raw.replace(/gpgsig [\s\S]*?-----END SSH SIGNATURE-----\n/, "");
+    const request = {
+      format: "ssh" as const,
+      program: "ssh-keygen",
+      payload: new TextEncoder().encode(payload),
+      signature: new TextEncoder().encode(`${signature}\n`),
+      allowedSignersFile: file,
+    };
+    const dated = await verifier({ ...request, verifyTime: 1112911993 });
+    expect(dated.failed).toBe(false);
+    expect(dated.output).toMatch(/^Good "git" signature for interop@example.com with ED25519 key /);
+    const now = await verifier(request);
+    expect(now.failed).toBe(true);
+    expect(now.output).toMatch(
+      /until-2010:1: key has expired: verify time \S+ > valid-before 2010-01-01T00:00:00\r\nNo principal matched\.\n$/,
+    );
+    // native ssh-keygen without -Overify-time agrees
+    const sigFile = join(root, "ssh", "until-2010.sig");
+    writeFileSync(sigFile, `${signature}\n`);
+    const r = spawnSync("ssh-keygen", ["-Y", "find-principals", "-f", file, "-s", sigFile], {
+      encoding: "utf8",
+    });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/key has expired/);
+  });
+
+  it('t7528-signed-commit-ssh.sh: "detect fudged signature": a signature blob with trailing bytes is refused (sshsig "Signature contains trailing data")', async () => {
+    const raw = gitOk(repo, ["cat-file", "commit", ids["ssh-good"] as string]);
+    const m = /gpgsig -----BEGIN SSH SIGNATURE-----\n([\s\S]*?) -----END SSH SIGNATURE-----\n/.exec(
+      raw,
+    );
+    expect(m).not.toBeNull();
+    const blob = Buffer.from(((m as RegExpExecArray)[1] as string).replace(/\s+/g, ""), "base64");
+    const longer = Buffer.concat([blob, Buffer.from([0, 0, 0, 0])]).toString("base64");
+    const lines = longer.match(/.{1,70}/g) as string[];
+    const header = [
+      "gpgsig -----BEGIN SSH SIGNATURE-----",
+      ...lines.map((l) => ` ${l}`),
+      " -----END SSH SIGNATURE-----",
+      "",
+    ].join("\n");
+    const forged = raw.replace(/gpgsig [\s\S]*?-----END SSH SIGNATURE-----\n/, header);
+    const id = execFileSync("git", ["hash-object", "-w", "-t", "commit", "--stdin"], {
+      cwd: repo,
+      env: env(),
+      input: forged,
+      encoding: "utf8",
+    }).trim();
+    const native = await compareInProcess(id, {}, "trailing data");
+    expect(native.stderr).toMatch(/Signature contains trailing data/);
+  });
+
   it('t7528-signed-commit-ssh.sh: "verify-commit exits failure on untrusted signature": without gpg.ssh.allowedSignersFile', async () => {
     const native = git(repo, [
       "-c",

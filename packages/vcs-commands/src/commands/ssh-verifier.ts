@@ -3,7 +3,9 @@
  * find-principals`, `-Y verify` and `-Y check-novalidate` for Ed25519 signatures, checked
  * with Web Crypto, for hosts that cannot run ssh-keygen (a browser, a worker). It reads
  * `gpg.ssh.allowedSignersFile` (principals with `*`/`?` patterns, `namespaces=`,
- * `valid-after=`, `valid-before=`; `cert-authority` lines are skipped) and
+ * `valid-after=`, `valid-before=`; `cert-authority` lines are skipped; a line `sshsigopt_parse`
+ * refuses, as an unknown, unquoted, repeated option or a bad time, matches nothing, with
+ * ssh-keygen's `bad options:` line; without a verify time keys are checked against now) and
  * `gpg.ssh.revocationFile` (public keys, one per line) through the host callback given, and
  * answers with ssh-keygen's lines, so the commands parse its output as they parse
  * ssh-keygen's.
@@ -105,6 +107,8 @@ interface ParsedSignature {
   hashAlgorithm: string;
   keyType: string;
   raw: Uint8Array;
+  /** Bytes after the signature in the blob: ssh-keygen refuses it ("Signature contains trailing data") */
+  trailing: boolean;
 }
 
 /** sshsig.c's `sshsig_dearmor` and `sshsig_parse_preamble`/`sshsig_get_pubkey`. */
@@ -123,7 +127,8 @@ function parseSignature(armored: Uint8Array): ParsedSignature | undefined {
     const sig = new Reader(r.string());
     const keyType = decoder.decode(sig.string());
     const raw = sig.string();
-    return { publicBlob, namespace, hashAlgorithm, keyType, raw };
+    const trailing = r.at < r.bytes.length;
+    return { publicBlob, namespace, hashAlgorithm, keyType, raw, trailing };
   } catch {
     return undefined;
   }
@@ -217,12 +222,88 @@ function matchPatternList(text: string, list: string): boolean {
 interface AllowedLine {
   line: number;
   principals: string;
-  options: Map<string, string | true>;
+  /** `cert-authority` */
+  ca: boolean;
+  /** `namespaces="..."` */
+  namespaces?: string;
+  /** `valid-after="..."`, seconds */
+  validAfter?: number;
+  /** `valid-before="..."`, seconds */
+  validBefore?: number;
   blob: Uint8Array | undefined;
+  /** Why ssh-keygen refuses the line (`bad options: ...`, `invalid options`): it matches nothing */
+  error?: string;
 }
 
-/** Splits `text` at the first unquoted whitespace (OpenSSH's option scanning). */
-function takeField(text: string): [string, string] {
+/**
+ * sshsig.c's `sshsigopt_parse`: only `cert-authority`, `namespaces="..."`,
+ * `valid-after="..."` and `valid-before="..."` (names in any case), each value quoted, each
+ * time valid and not 0, none repeated, valid-before after valid-after; anything else refuses
+ * the line with ssh-keygen's reason.
+ */
+function parseSigOptions(
+  opts: string,
+  entry: AllowedLine,
+  tz: (t: number) => number,
+): string | undefined {
+  let at = 0;
+  const startsWith = (name: string) =>
+    opts.slice(at, at + name.length).toLowerCase() === name.toLowerCase();
+  /** opt_dequote: a quoted value, backslash escaping a quote */
+  const dequote = (): string | { error: string } => {
+    if (opts[at] !== '"') return { error: "missing start quote" };
+    at++;
+    let value = "";
+    while (at < opts.length && opts[at] !== '"') {
+      if (opts[at] === "\\" && opts[at + 1] === '"') at++;
+      value += opts[at];
+      at++;
+    }
+    if (opts[at] !== '"') return { error: "missing end quote" };
+    at++;
+    return value;
+  };
+  while (at < opts.length) {
+    if (startsWith("cert-authority") && /^(,|$)/.test(opts.slice(at + 14))) {
+      at += 14;
+      entry.ca = true;
+    } else if (startsWith("namespaces=")) {
+      if (entry.namespaces !== undefined) return 'multiple "namespaces" clauses';
+      at += 11;
+      const v = dequote();
+      if (typeof v !== "string") return v.error;
+      entry.namespaces = v;
+    } else if (startsWith("valid-after=") || startsWith("valid-before=")) {
+      const name = startsWith("valid-after=") ? "valid-after" : "valid-before";
+      const key = name === "valid-after" ? "validAfter" : "validBefore";
+      if (entry[key] !== undefined) return `multiple "${name}" clauses`;
+      at += name.length + 1;
+      const v = dequote();
+      if (typeof v !== "string") return v.error;
+      const t = parseValidity(v, tz);
+      if (t === undefined || t === 0) return `invalid "${name}" time`;
+      entry[key] = t;
+    }
+    if (at >= opts.length) break;
+    if (opts[at] !== ",") return "unknown key option";
+    at++;
+    if (at >= opts.length) return "unexpected end-of-options";
+  }
+  if (
+    entry.validAfter !== undefined &&
+    entry.validBefore !== undefined &&
+    entry.validBefore <= entry.validAfter
+  ) {
+    return '"valid-before" time is before "valid-after"';
+  }
+  return undefined;
+}
+
+/**
+ * Splits `text` at the first unquoted whitespace (OpenSSH's `sshkey_advance_past_options`);
+ * undefined for an unterminated quote.
+ */
+function takeField(text: string): [string, string] | undefined {
   let quoted = false;
   let i = 0;
   for (; i < text.length; i++) {
@@ -231,31 +312,42 @@ function takeField(text: string): [string, string] {
     else if (c === "\\" && quoted) i++;
     else if (!quoted && (c === " " || c === "\t")) break;
   }
+  if (quoted) return undefined;
   return [text.slice(0, i), text.slice(i).replace(/^[ \t]+/, "")];
 }
 
 /** sshsig.c's allowed signers lines (`parse_principals_key_and_options`). */
-function parseAllowedSigners(text: string): AllowedLine[] {
+function parseAllowedSigners(text: string, tz: (t: number) => number): AllowedLine[] {
   const out: AllowedLine[] = [];
   const lines = text.split("\n");
   for (let n = 0; n < lines.length; n++) {
     const line = (lines[n] as string).replace(/\r$/, "").replace(/^[ \t]+/, "");
     if (line === "" || line.startsWith("#")) continue;
-    const [principals, rest] = takeField(line);
-    let remaining = rest;
-    const options = new Map<string, string | true>();
+    const entry: AllowedLine = { line: n + 1, principals: "", ca: false, blob: undefined };
+    out.push(entry);
+    const first = takeField(line);
+    if (!first) {
+      entry.error = "invalid options";
+      continue;
+    }
+    entry.principals = first[0];
+    let remaining = first[1];
     // options come before the key type when the next word is not one
     if (!/^(ssh-|ecdsa-|sk-)/.test(remaining)) {
-      const [opts, after] = takeField(remaining);
-      remaining = after;
-      for (const opt of opts.match(/(?:[^,"]|"[^"]*")+/g) ?? []) {
-        const eq = opt.indexOf("=");
-        if (eq < 0) options.set(opt.toLowerCase(), true);
-        else options.set(opt.slice(0, eq).toLowerCase(), opt.slice(eq + 1).replace(/^"|"$/g, ""));
+      const field = takeField(remaining);
+      if (!field) {
+        entry.error = "invalid options";
+        continue;
+      }
+      remaining = field[1];
+      const refused = parseSigOptions(field[0], entry, tz);
+      if (refused !== undefined) {
+        entry.error = `bad options: ${refused}`;
+        continue;
       }
     }
     const [, base64] = remaining.split(/[ \t]+/);
-    out.push({ line: n + 1, principals, options, blob: base64 ? fromBase64(base64) : undefined });
+    entry.blob = base64 ? fromBase64(base64) : undefined;
   }
   return out;
 }
@@ -328,40 +420,41 @@ export function createSshVerifier(options: SshVerifierOptions): Verifier {
     let principalsOut = "";
     let principalsErr = "";
     const allowedText = await options.readFile(allowedPath);
-    const allowed = allowedText === undefined ? [] : parseAllowedSigners(allowedText);
+    const allowed = allowedText === undefined ? [] : parseAllowedSigners(allowedText, tz);
+    // without -Overify-time ssh-keygen checks validity against the current time
+    const checkTime = time ?? Math.floor(Date.now() / 1000);
     if (allowedText === undefined) {
       principalsErr += `${allowedPath}: No such file or directory\n`;
     }
     const validAt = (entry: AllowedLine, label: string): boolean => {
-      if (time === undefined) return true;
-      const after = entry.options.get("valid-after");
-      const before = entry.options.get("valid-before");
-      if (typeof after === "string") {
-        const t = parseValidity(after, tz);
-        if (t !== undefined && time < t) {
-          principalsErr += `${label}:${entry.line}: key is not yet valid: verify time ${formatTime(time, tz)} < valid-after ${formatTime(t, tz)}\r\n`;
-          return false;
-        }
+      const t = checkTime;
+      if (entry.validAfter !== undefined && t < entry.validAfter) {
+        principalsErr += `${label}:${entry.line}: key is not yet valid: verify time ${formatTime(t, tz)} < valid-after ${formatTime(entry.validAfter, tz)}\r\n`;
+        return false;
       }
-      if (typeof before === "string") {
-        const t = parseValidity(before, tz);
-        if (t !== undefined && time > t) {
-          principalsErr += `${label}:${entry.line}: key has expired: verify time ${formatTime(time, tz)} > valid-before ${formatTime(t, tz)}\r\n`;
-          return false;
-        }
+      if (entry.validBefore !== undefined && t > entry.validBefore) {
+        principalsErr += `${label}:${entry.line}: key has expired: verify time ${formatTime(t, tz)} > valid-before ${formatTime(entry.validBefore, tz)}\r\n`;
+        return false;
       }
       return true;
     };
-    const matches = sig
-      ? allowed.filter(
-          (e) =>
-            !e.options.has("cert-authority") &&
-            e.blob !== undefined &&
-            sameBytes(e.blob, sig.publicBlob) &&
-            validAt(e, allowedPath),
-        )
-      : [];
-    if (matches.length > 0) principalsOut = matches.map((e) => `${e.principals}\n`).join("");
+    // the first line whose key is the signature's and valid then; refused lines on the way
+    // are reported and match nothing
+    let match: AllowedLine | undefined;
+    if (sig) {
+      for (const e of allowed) {
+        if (e.error !== undefined) {
+          principalsErr += `${allowedPath}:${e.line}: ${e.error}\r\n`;
+          continue;
+        }
+        if (e.ca || e.blob === undefined || !sameBytes(e.blob, sig.publicBlob)) continue;
+        if (!validAt(e, allowedPath)) continue;
+        match = e;
+        break;
+      }
+    }
+    const matches = match ? [match] : [];
+    if (match) principalsOut = `${match.principals}\n`;
     else if (sig) principalsErr += "No principal matched.\n";
     else principalsErr += "Couldn't parse signature: invalid format\n";
 
@@ -372,7 +465,10 @@ export function createSshVerifier(options: SshVerifierOptions): Verifier {
       `${keyTypeName(keyTypeOf(blob))} key ${await fingerprint(blob)}`;
     if (principalsOut === "") {
       // check-novalidate
-      if (sig && sig.namespace === "git" && (await signatureHolds(sig, request.payload))) {
+      if (sig?.trailing) {
+        out = "Could not verify signature.\n";
+        err = "Signature contains trailing data\n";
+      } else if (sig && sig.namespace === "git" && (await signatureHolds(sig, request.payload))) {
         out = `Good "git" signature with ${await keyLine(sig.publicBlob)}\n`;
       } else if (sig) {
         out = "Could not verify signature.\n";
@@ -395,15 +491,18 @@ export function createSshVerifier(options: SshVerifierOptions): Verifier {
             );
           } else if (text.startsWith("SSHKRL\n")) revoked = true;
           else {
-            for (const entry of parseAllowedSigners(`x ${text.split("\n").join("\nx ")}`)) {
+            for (const entry of parseAllowedSigners(`x ${text.split("\n").join("\nx ")}`, tz)) {
               if (entry.blob && sameBytes(entry.blob, sig.publicBlob)) revoked = true;
             }
           }
         }
         const entry = matches.find((e) => e.principals === principal);
-        const namespaces = entry?.options.get("namespaces");
-        const nsOk = typeof namespaces !== "string" || matchPatternList("git", namespaces);
-        if (revoked || !entry || !nsOk || sig.namespace !== "git") {
+        const namespaces = entry?.namespaces;
+        const nsOk = namespaces === undefined || matchPatternList("git", namespaces);
+        if (sig.trailing) {
+          out = "Could not verify signature.\n";
+          err = "Signature contains trailing data\n";
+        } else if (revoked || !entry || !nsOk || sig.namespace !== "git") {
           out = "Could not verify signature.\n";
         } else if (!(await signatureHolds(sig, request.payload))) {
           out = "Could not verify signature.\n";
