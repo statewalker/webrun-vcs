@@ -479,6 +479,7 @@ function emitScript(
     histogramRediff: options.histogramRediff ?? true,
     legacyMinimal: options.legacyMinimal ?? false,
     whitespace: ws,
+    anchors: options.anchors,
   });
   if (script.length > 0 && options.ignoreBlankLines) markIgnorableLines(script, la, lb, ws);
   if (script.length > 0 && options.ignoreRegex?.length) {
@@ -518,6 +519,7 @@ export function xdiffHunks(
     legacyMinimal: options.legacyMinimal ?? false,
     whitespace: whitespaceFlags(options),
     interner: options.interner,
+    anchors: options.anchors,
   });
 }
 

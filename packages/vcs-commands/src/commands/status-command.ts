@@ -38,6 +38,7 @@ import {
   DEFAULT_RENAME_LIMIT,
   detectRenames,
   type RenameCandidate,
+  renameScoreOption,
   scorePercent,
 } from "../rename/index.js";
 import {
@@ -110,11 +111,11 @@ const isIgnoreFilePath = (path: string) => path === ".gitignore" || path.endsWit
 const typeOf = (mode: number) => mode & S_IFMT;
 const isGitlink = (mode: number | undefined) => mode === FileMode.GITLINK;
 
-/** A git boolean, `copies`/`copy` (rename detection on) or undefined when not one. */
-function renamesValue(value: string | undefined): boolean | undefined {
+/** git_config_rename: `copies`/`copy` (copies too), a git boolean, else undefined. */
+function renamesValue(value: string | undefined): boolean | "copies" | undefined {
   if (value === undefined) return undefined;
   const v = value.toLowerCase();
-  if (v === "copies" || v === "copy") return true;
+  if (v === "copies" || v === "copy") return "copies";
   return parseGitBool(value);
 }
 
@@ -321,6 +322,8 @@ export class StatusCommand extends GitCommand<Status> {
   private resolvedUntracked: UntrackedFilesMode = "normal";
   private renames?: boolean;
   private renameLimit?: number;
+  /** `-M[=<n>]` / `--find-renames[=<n>]`: its score text ("" for none) */
+  private findRenames?: string;
   private ignoreSubmodules?: SubmoduleIgnoreMode;
   private plumbingSubmodules = false;
   private gitmodules?: Promise<GitmodulesEntry[]>;
@@ -393,6 +396,18 @@ export class StatusCommand extends GitCommand<Status> {
   setRenames(renames: boolean): this {
     this.checkCallable();
     this.renames = renames;
+    return this;
+  }
+
+  /**
+   * `-M[=<n>]` / `--find-renames[=<n>]`: renames detected (copies too if `status.renames`
+   * asks for them) at least this similar (git's syntax: `90%`, `9`, `.9`; none, or "", the
+   * default 50%). Trailing text throws git's `error: invalid argument to find-renames`.
+   */
+  setFindRenames(score = ""): this {
+    this.checkCallable();
+    renameScoreOption(score.startsWith("=") ? score.slice(1) : score, "find-renames");
+    this.findRenames = score.startsWith("=") ? score.slice(1) : score;
     return this;
   }
 
@@ -730,7 +745,7 @@ export class StatusCommand extends GitCommand<Status> {
       .setCached(true)
       .setOldTree(o.referenceId ?? this.objectFormat.emptyTreeId)
       .setOptions({ ...(cachedPrefixes ?? {}), ...color });
-    if (this.renames !== undefined) cached.setRenames(this.renames);
+    this.verboseRenames(cached);
     out += await cached.callText("patch");
     if (twoLevels && o.worktreeChanges) {
       out += p("--------------------------------------------------");
@@ -741,10 +756,31 @@ export class StatusCommand extends GitCommand<Status> {
         .setCombineMerges(false)
         .setDirtySubmodules(false)
         .setOptions({ srcPrefix: "i/", dstPrefix: "w/", ...color });
-      if (this.renames !== undefined) files.setRenames(this.renames);
+      this.verboseRenames(files);
       out += await files.callText("patch");
     }
     return out;
+  }
+
+  /**
+   * wt_longstatus_print_verbose: the verbose diffs detect renames as status does
+   * (`s->detect_rename`, `rename_score`, `rename_limit`)
+   */
+  private verboseRenames(diff: DiffCommand): void {
+    const mode = this.renameMode();
+    if (!mode) {
+      diff.setRenames(false);
+      return;
+    }
+    // the mode is decided here: diff.renames=copies must not make -C find copies harder
+    diff.setRenames(true);
+    const score = this.findRenames ?? "";
+    diff.setOptions(
+      mode === "copies" ? { findCopies: score || true } : { findRenames: score || true },
+    );
+    if (this.renameLimit !== undefined || this.config.value("status.renameLimit") !== undefined) {
+      diff.setRenameLimit(this.statusRenameLimit());
+    }
   }
 
   async call(): Promise<Status> {
@@ -1006,7 +1042,8 @@ export class StatusCommand extends GitCommand<Status> {
 
     const renamed = new Map<string, string>();
     const warnings: string[] = [];
-    if (this.detectsRenames()) await this.pairRenames(files, renamed, worktree, warnings);
+    const renameMode = this.renameMode();
+    if (renameMode) await this.pairRenames(files, renamed, worktree, warnings, renameMode);
 
     // the index's untracked cache, as core.untrackedCache has it (git's tweak_untracked_cache)
     const host = worktree ? await worktree.untrackedScanHost?.() : undefined;
@@ -1107,13 +1144,34 @@ export class StatusCommand extends GitCommand<Status> {
     return out;
   }
 
-  /** Whether renames are detected: the setter, else `status.renames`, else `diff.renames`. */
-  private detectsRenames(): boolean {
-    if (this.renames !== undefined) return this.renames;
-    return (
+  /**
+   * What renames are detected (builtin/commit.c): the setter, else `status.renames`, else
+   * `diff.renames`, else renames; `-M` turns them on, keeping copies.
+   */
+  private renameMode(): false | "renames" | "copies" {
+    const value =
+      this.renames ??
       renamesValue(this.config.value("status.renames")) ??
       renamesValue(this.config.value("diff.renames")) ??
-      true
+      true;
+    const mode = value === "copies" ? "copies" : value ? "renames" : false;
+    return this.findRenames !== undefined && !mode ? "renames" : mode;
+  }
+
+  /** The rename threshold of `-M<n>` (git's `rename_score`), undefined for the default */
+  private renameScore(): number | undefined {
+    return this.findRenames !== undefined
+      ? renameScoreOption(this.findRenames, "find-renames")
+      : undefined;
+  }
+
+  /** The rename limit: the setter, else `status.renameLimit`, else `diff.renameLimit` */
+  private statusRenameLimit(): number {
+    return (
+      this.renameLimit ??
+      intValue(this.config.value("status.renameLimit")) ??
+      intValue(this.config.value("diff.renameLimit")) ??
+      DEFAULT_RENAME_LIMIT
     );
   }
 
@@ -1130,12 +1188,15 @@ export class StatusCommand extends GitCommand<Status> {
     renamed: Map<string, string>,
     worktree: Worktree | undefined,
     warnings: string[],
+    mode: "renames" | "copies",
   ): Promise<void> {
-    const limit =
-      this.renameLimit ??
-      intValue(this.config.value("status.renameLimit")) ??
-      intValue(this.config.value("diff.renameLimit")) ??
-      DEFAULT_RENAME_LIMIT;
+    const limit = this.statusRenameLimit();
+    const copies = mode === "copies";
+    const score = this.renameScore();
+    const scoring = {
+      ...(score !== undefined ? { minimumScore: score } : {}),
+      ...(copies ? { copies: true } : {}),
+    };
     const byPath = new Map(files.map((f) => [f.path, f]));
     const blob = async (id: ObjectId) => concat((await this.blobs.load(id)) ?? []);
     const blobSize = async (id: ObjectId) => {
@@ -1170,12 +1231,16 @@ export class StatusCommand extends GitCommand<Status> {
     for (const f of files) {
       if (f.stages) continue;
       if (f.index === "D" && f.head) indexSources.push({ path: f.path, ...side(f.head) });
-      else if (f.index === "A" && f.staged) {
+      else if (copies && (f.index === "M" || f.index === "T") && f.head) {
+        // diff-index -C: a modified path is a source that stays
+        indexSources.push({ path: f.path, ...side(f.head), kept: true });
+      } else if (f.index === "A" && f.staged) {
         indexDestinations.push({ path: f.path, ...side(f.staged) });
       }
     }
     if (indexSources.length > 0 && indexDestinations.length > 0) {
       const pairs = await detectRenames(indexSources, indexDestinations, {
+        ...scoring,
         renameLimit: limit,
         onRenameLimit,
         prefetch: (wanted) => prefetch(wanted),
@@ -1186,16 +1251,18 @@ export class StatusCommand extends GitCommand<Status> {
         const from = byPath.get(pair.from);
         const to = byPath.get(pair.to);
         if (!from || !to) continue;
-        to.index = "R";
+        to.index = pair.copy ? "C" : "R";
         to.head = from.head;
+        to.renamedFrom = pair.from;
+        to.renameScore = scorePercent(pair.score);
+        // a copy's source keeps its own line
+        if (from.index !== "D") continue;
         // an intent-to-add source keeps its worktree side, without a HEAD side ("DA" to " A")
         if (from.intentToAdd && from.worktree !== " ") {
           from.index = " ";
           from.head = from.worktree === "D" ? from.staged : undefined;
         } else drop.add(from);
-        to.renamedFrom = pair.from;
-        to.renameScore = scorePercent(pair.score);
-        renamed.set(pair.to, pair.from);
+        if (!pair.copy) renamed.set(pair.to, pair.from);
       }
     }
 
@@ -1223,6 +1290,10 @@ export class StatusCommand extends GitCommand<Status> {
         if (f.worktree === "D" && f.staged) {
           sources.push({ path: f.path, ...side(f.staged) });
           sourceSides.set(f.path, side(f.staged));
+        } else if (copies && (f.worktree === "M" || f.worktree === "T") && f.staged) {
+          // diff-files -C: a modified file is a source that stays
+          sources.push({ path: f.path, ...side(f.staged), kept: true });
+          sourceSides.set(f.path, side(f.staged));
         } else if (f.worktree === "A" && f.worktreeMode !== undefined) {
           destinations.push([{ path: f.path, mode: f.worktreeMode, id: "" }, f]);
         }
@@ -1247,6 +1318,7 @@ export class StatusCommand extends GitCommand<Status> {
           sources,
           destinations.map(([c]) => c),
           {
+            ...scoring,
             renameLimit: limit,
             onRenameLimit,
             prefetch: (wanted) => prefetch(wanted, true),
@@ -1268,8 +1340,10 @@ export class StatusCommand extends GitCommand<Status> {
           const source = sourceSides.get(pair.from);
           if (!from || !source || !to) continue;
           // the source keeps only its index side, if it has one; an unmerged source keeps
-          // its line (its stage #2 deletion goes)
-          if (from.stages) {
+          // its line (its stage #2 deletion goes); a copy's source stays as it is
+          if (pair.copy || from.worktree !== "D") {
+            // nothing shown changes
+          } else if (from.stages) {
             // nothing shown changes
           } else if (from.index === " ") drop.add(from);
           else {
@@ -1278,12 +1352,12 @@ export class StatusCommand extends GitCommand<Status> {
           }
           // an unmerged destination stays as it is (wt_status shows its stages, no rename)
           if (to.stages) continue;
-          to.worktree = "R";
+          to.worktree = pair.copy ? "C" : "R";
           to.head = source;
           to.staged = source;
           to.renamedFrom = pair.from;
           to.renameScore = scorePercent(pair.score);
-          renamed.set(pair.to, pair.from);
+          if (!pair.copy) renamed.set(pair.to, pair.from);
         }
       }
     }

@@ -35,6 +35,11 @@ export type XdiffAlgorithm = "myers" | "minimal" | "patience" | "histogram";
 export interface XdiffOptions {
   /** Diff algorithm (default `myers`, as `git diff`) */
   algorithm?: XdiffAlgorithm;
+  /**
+   * `--anchored`: with the patience algorithm, lines starting with one of these byte
+   * strings stay matched where they are unique on both sides (`xpp.anchors`)
+   */
+  anchors?: readonly Uint8Array[];
   /** Slide changes to the place the indentation suggests (`diff.indentHeuristic`, default off) */
   indentHeuristic?: boolean;
   /**
@@ -238,6 +243,8 @@ export interface XdFlags {
   whitespace?: number;
   /** Line numbers shared across calls (see {@link XdiffOptions.interner}) */
   interner?: LineInterner;
+  /** The patience diff's anchors (see {@link XdiffOptions.anchors}) */
+  anchors?: readonly Uint8Array[];
 }
 
 const XDL_KPDIS_RUN = 4;
@@ -1221,5 +1228,6 @@ export function xdiff(a: ByteLines, b: ByteLines, options: XdiffOptions = {}): X
     legacyMinimal: options.legacyMinimal ?? false,
     whitespace: whitespaceFlags(options),
     interner: options.interner,
+    anchors: options.anchors,
   });
 }
