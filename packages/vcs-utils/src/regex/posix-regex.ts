@@ -71,8 +71,16 @@ export interface PosixRegex {
   /**
    * The match in `subject[0, end)`, or undefined. `groups` holds at most `nmatch - 1`
    * subexpressions (default all); with `nmatch` 1 they are not placed at all (faster).
+   * `notbol` is `REG_NOTBOL`: the subject's start is no line start (`^` does not match
+   * there, unless `newline` and a newline precedes), as git passes it when it searches the
+   * rest of a line after a match.
    */
-  exec(subject: Uint8Array, end?: number, nmatch?: number): PosixMatch | undefined;
+  exec(
+    subject: Uint8Array,
+    end?: number,
+    nmatch?: number,
+    notbol?: boolean,
+  ): PosixMatch | undefined;
   /** Whether `subject[0, end)` matches */
   test(subject: Uint8Array, end?: number): boolean;
 }
@@ -694,13 +702,14 @@ class Parser {
   private parseBracket(): Tree {
     const set = new Uint8Array(256);
     let tok = this.peekBracket(this.pos);
-    if (tok.type === T_END) this.fail("REG_EBRACK", "Unmatched [, [^, [:, [., or [=");
+    // glibc's parse_bracket_exp: the pattern ending right after `[` (or `[^`) is REG_BADPAT
+    if (tok.type === T_END) this.fail("REG_BADPAT", "Invalid regular expression");
     let nonMatch = false;
     if (tok.type === B_NON_MATCH) {
       nonMatch = true;
       this.pos += tok.len;
       tok = this.peekBracket(this.pos);
-      if (tok.type === T_END) this.fail("REG_EBRACK", "Unmatched [, [^, [:, [., or [=");
+      if (tok.type === T_END) this.fail("REG_BADPAT", "Invalid regular expression");
     }
     if (tok.type === B_CLOSE) tok = { ...tok, type: B_CHAR };
     let first = true;
@@ -995,6 +1004,8 @@ class Matcher implements PosixRegex {
   private readonly hasPlural: boolean;
   private mark: Int32Array;
   private gen = 0;
+  /** REG_NOTBOL of the current exec */
+  private notbol = false;
 
   constructor(pattern: Uint8Array, options: PosixRegexOptions) {
     const parser = new Parser(
@@ -1019,7 +1030,13 @@ class Matcher implements PosixRegex {
     return this.exec(subject, end, 1) !== undefined;
   }
 
-  exec(subjectIn: Uint8Array, end = subjectIn.length, nmatchIn?: number): PosixMatch | undefined {
+  exec(
+    subjectIn: Uint8Array,
+    end = subjectIn.length,
+    nmatchIn?: number,
+    notbol = false,
+  ): PosixMatch | undefined {
+    this.notbol = notbol;
     let subject = subjectIn.subarray(0, end);
     if (this.icase) {
       const folded = new Uint8Array(subject.length);
@@ -1057,7 +1074,7 @@ class Matcher implements PosixRegex {
   private cond(kind: number, s: Uint8Array, idx: number): boolean {
     switch (kind) {
       case A_LINE_FIRST:
-        return idx === 0 || (this.newline && s[idx - 1] === 0x0a);
+        return idx === 0 ? !this.notbol : this.newline && s[idx - 1] === 0x0a;
       case A_LINE_LAST:
         return idx === s.length || (this.newline && s[idx] === 0x0a);
     }

@@ -30,6 +30,7 @@ export * from "./gc-command.js";
 export * from "./git-describe.js";
 export * from "./git-hooks.js";
 export * from "./git-ident.js";
+export * from "./grep/index.js";
 export * from "./hook-command.js";
 export {
   IndexVersionConfigError,

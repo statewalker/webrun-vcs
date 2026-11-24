@@ -96,3 +96,46 @@ describe("compilePosixRegex as glibc", () => {
     }
   });
 });
+
+describe("compilePosixRegex REG_NOTBOL", () => {
+  const enc = (s: string) => new TextEncoder().encode(s);
+  it("keeps `^` from matching at the subject's start", () => {
+    const re = compilePosixRegex("^a", { newline: true });
+    expect(re.exec(enc("ab"))?.start).toBe(0);
+    expect(re.exec(enc("ab"), undefined, 1, true)).toBeUndefined();
+    // after a newline `^` still matches under REG_NEWLINE
+    expect(re.exec(enc("b\na"), undefined, 1, true)?.start).toBe(2);
+  });
+
+  it("leaves word anchors at the start as glibc's buffer start (no word before)", () => {
+    const re = compilePosixRegex("\\<b");
+    expect(re.exec(enc("b"), undefined, 1, true)?.start).toBe(0);
+  });
+
+  it("applies to back-reference patterns too", () => {
+    const re = compilePosixRegex("^\\(a\\)\\1");
+    expect(re.exec(enc("aa"))?.end).toBe(2);
+    expect(re.exec(enc("aa"), undefined, 1, true)).toBeUndefined();
+  });
+});
+
+describe("compilePosixRegex bracket errors", () => {
+  // glibc (git grep -e 'a[', 'a[^', 'a[b'): an end right after `[` is REG_BADPAT
+  it.each([
+    ["a[", "REG_BADPAT"],
+    ["a[^", "REG_BADPAT"],
+    ["[", "REG_BADPAT"],
+    ["a[b", "REG_EBRACK"],
+    ["a[]", "REG_EBRACK"],
+    ["a[[:al", "REG_EBRACK"],
+  ])("%s is %s", (pattern, code) => {
+    let caught: unknown;
+    try {
+      compilePosixRegex(pattern);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(PosixRegexError);
+    expect((caught as PosixRegexError).code).toBe(code);
+  });
+});
