@@ -167,3 +167,38 @@ export class HookFailedError extends GitApiError {
     this.name = "HookFailedError";
   }
 }
+
+/**
+ * Thrown where `git describe` or `git name-rev` dies: the message is git's stderr (its
+ * `fatal:` line last), {@link stdout} what it printed before.
+ *
+ * @example
+ * ```typescript
+ * try {
+ *   await git.describe().setExactMatch(true).callText();
+ * } catch (e) {
+ *   if (e instanceof DescribeError) console.error(e.message); // fatal: no tag exactly matches '...'
+ * }
+ * ```
+ */
+export class DescribeError extends GitApiError {
+  /** What git printed on stdout before it died */
+  readonly stdout: string;
+  /**
+   * A death saying nothing describes the commit (no names, no tag can describe it, no
+   * exact match, name-rev's `cannot describe`), not a failure of the command itself
+   */
+  readonly undescribable: boolean;
+
+  constructor(
+    message: string,
+    stdout = "",
+    exitCode?: number,
+    options: { undescribable?: boolean } = {},
+  ) {
+    super(message, exitCode !== undefined ? { exitCode } : undefined);
+    this.name = "DescribeError";
+    this.stdout = stdout;
+    this.undescribable = options.undescribable ?? false;
+  }
+}

@@ -68,6 +68,7 @@ export {
 } from "./merge-strategy-options.js";
 export { CleanupMode, stripspace } from "./message-cleanup.js";
 export * from "./mv-command.js";
+export * from "./name-rev-command.js";
 export * from "./notes-command.js";
 export * from "./notes-commands.js";
 export * from "./notes-merge-command.js";
