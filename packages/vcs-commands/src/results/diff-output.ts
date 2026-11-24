@@ -893,7 +893,8 @@ export function formatStat(files: DiffstatFile[], options: DiffstatOptions = {})
         out += "\n";
         continue;
       }
-      out += ` ${deleted} -> ${added} bytes\n`;
+      const c = options.colors;
+      out += ` ${c?.old ?? ""}${deleted}${c?.reset ?? ""} -> ${c?.new ?? ""}${added}${c?.reset ?? ""} bytes\n`;
       continue;
     }
     if (file.isUnmerged) {

@@ -1284,3 +1284,90 @@ describeGit("log --graph in color (t4202-log, t4214-log-graph-octopus)", () => {
     expect(out).toEqual([]);
   });
 });
+
+describeGit("commit -v, status -v and binary --stat in color (t4015-diff-whitespace)", () => {
+  const setup = (config: string) => `
+    ${config}
+    test_write_lines a b c >f
+    printf '\\0bin' >bin.dat
+    git add f bin.dat
+    commit -m one
+    test_write_lines a B c >f
+    printf '\\0bin2' >bin.dat
+    git add f
+    echo d >>f
+  `;
+
+  it('t4015-diff-whitespace.sh: "setup diff colors" in the commit -v template (never colored)', async () => {
+    for (const config of ["git config color.ui always", "git config color.diff always"]) {
+      const theirs = repo(setup(config));
+      const mine = repo(setup(config));
+      // the editor leaves the template as it is: the commit is aborted, COMMIT_EDITMSG stays
+      spawnSync("git", ["commit", "-v", "-v"], {
+        cwd: theirs,
+        env: { ...nativeGitEnv(tmp()), GIT_EDITOR: "true" },
+      });
+      let template = "";
+      // the same identity as native git's (no `Committer:` line in the template)
+      const git = await openOurs(mine, createNodeGitHostEnvironment({ env: configEnv({}) }));
+      await git
+        .commit()
+        .setVerbose(2)
+        .setEditor(async (_p, t) => {
+          template = t;
+          return t;
+        })
+        .call()
+        .catch(() => undefined);
+      const expected = execFileSync("cat", [join(theirs, ".git/COMMIT_EDITMSG")]).toString();
+      expect(template).toBe(expected);
+      expect(template).toContain("diff --git");
+      expect(template).not.toContain("\x1b[");
+    }
+  });
+
+  it('t4015-diff-whitespace.sh: "setup diff colors" in status -v (color.diff, not color.status)', async () => {
+    const out: string[] = [];
+    const cases: [string, boolean][] = [
+      ["git config color.diff always", true],
+      ["git config color.status always", false],
+    ];
+    for (const [config, whole] of cases) {
+      const dir = repo(setup(config));
+      for (const level of [1, 2]) {
+        const args = ["status", ...Array(level).fill("-v")];
+        const theirs = native(dir, args).stdout.toString();
+        const git = await ours(dir);
+        const mine = (await git.status().callText({ verbose: level })).text;
+        // status's own lines take color.status, which ours does not color: the diff alone
+        const cut = (t: string) => (whole ? t : t.slice(t.indexOf("diff --git")));
+        if (cut(theirs) !== cut(mine)) {
+          out.push(`${config} git ${args.join(" ")}\n--- git\n${theirs}\n--- ours\n${mine}`);
+        }
+      }
+    }
+    expect(out).toEqual([]);
+  });
+
+  it('t4015-diff-whitespace.sh: "whitespace changes with modification reported (diffstat)" with a binary file in color', async () => {
+    const dir = repo(`${setup("")}
+      git commit -q -a -m two
+    `);
+    const out: string[] = [];
+    await twinDiff(
+      out,
+      dir,
+      ["--color", "--stat", "HEAD~1", "HEAD"],
+      (d) => d.setOldTree("HEAD~1").setNewTree("HEAD").setOptions(COLOR),
+      {},
+      "stat",
+    );
+    await twinLog(out, dir, ["--color", "--stat"], (log) => log.setDiffOptions(COLOR), {
+      stat: true,
+    });
+    await twinShow(out, dir, ["--color", "--stat"], (show) =>
+      show.setDiffOptions(COLOR).setOptions({ stat: true }),
+    );
+    expect(out).toEqual([]);
+  });
+});

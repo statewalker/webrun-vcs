@@ -709,10 +709,13 @@ export class StatusCommand extends GitCommand<Status> {
       out += p("Changes to be committed:");
       cachedPrefixes = { srcPrefix: "c/", dstPrefix: "i/" };
     }
+    // wt_longstatus_print_verbose: the diff to stdout takes color.diff's colors (never
+    // color.status's); into the commit message file it never has any
+    const color = o.toFile ? { color: false } : {};
     const cached = new DiffCommand(this.workingCopy)
       .setCached(true)
       .setOldTree(o.referenceId ?? this.objectFormat.emptyTreeId)
-      .setOptions({ ...(cachedPrefixes ?? {}) });
+      .setOptions({ ...(cachedPrefixes ?? {}), ...color });
     if (this.renames !== undefined) cached.setRenames(this.renames);
     out += await cached.callText("patch");
     if (twoLevels && o.worktreeChanges) {
@@ -723,7 +726,7 @@ export class StatusCommand extends GitCommand<Status> {
       const files = new DiffCommand(this.workingCopy)
         .setCombineMerges(false)
         .setDirtySubmodules(false)
-        .setOptions({ srcPrefix: "i/", dstPrefix: "w/" });
+        .setOptions({ srcPrefix: "i/", dstPrefix: "w/", ...color });
       if (this.renames !== undefined) files.setRenames(this.renames);
       out += await files.callText("patch");
     }
