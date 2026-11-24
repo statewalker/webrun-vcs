@@ -29,6 +29,7 @@ import {
   fetchPack,
   type NegotiationStats,
   type ServerShallowUpdate,
+  serverOptionLines,
   serverSupportsFilter,
 } from "./fetch-pack.js";
 import type { NegotiatorSource } from "./negotiator.js";
@@ -210,6 +211,26 @@ export interface FetchClientOptions {
    * {@link FetchCheckError} (`pack`).
    */
   fsckObjects?: ReceivedObjectsFsck;
+  /**
+   * Protocol v2 server options (`server-option=<option>` in `ls-refs` and every `fetch`
+   * request: git's `--server-option`, `remote.<name>.serverOption`). Never sent over v0,
+   * where the caller decides whether that is an error (git dies for command-line options).
+   */
+  serverOptions?: readonly string[];
+  /**
+   * `--reject-shallow` (fetch-pack's `reject_shallow_remote`): a shallow server (its shallow
+   * commits sent without a deepen request) fails the fetch with
+   * {@link ShallowRemoteRejectedError} before the pack is read
+   */
+  rejectShallow?: boolean;
+}
+
+/** A shallow remote refused under `rejectShallow` (git's "source repository is shallow"). */
+export class ShallowRemoteRejectedError extends TransportError {
+  constructor() {
+    super("source repository is shallow, reject to clone.");
+    this.name = "ShallowRemoteRejectedError";
+  }
 }
 
 /** Refspecs chosen from the remote refs (a clone of the remote HEAD's branch, a tag). */
@@ -367,11 +388,15 @@ export async function fetchFromConnection(
   const listTags = resolver ? tags !== "none" : writesRefs(given as string[]) || tags === "all";
   const remoteRefs =
     connection.version === 2
-      ? await lsRefs(connection, [
-          "HEAD",
-          ...(resolver ? resolver.prefixes : refPrefixes(withTagSpec(given as string[]))),
-          ...(listTags ? ["refs/tags/"] : []),
-        ])
+      ? await lsRefs(
+          connection,
+          [
+            "HEAD",
+            ...(resolver ? resolver.prefixes : refPrefixes(withTagSpec(given as string[]))),
+            ...(listTags ? ["refs/tags/"] : []),
+          ],
+          connection.version === 2 ? options.serverOptions : undefined,
+        )
       : [...(connection.advertisedRefs ?? [])];
   const head = remoteRefs.find((r) => r.name === "HEAD");
   const defaultBranch = head?.symref;
@@ -479,6 +504,9 @@ export async function fetchFromConnection(
       (request.deepenNot?.length ?? 0) > 0;
     if (connection.version === 0 && !deepening && connection.advertisedShallow?.length) {
       serverShallow = await shallowInfoOf(repository, connection.advertisedShallow, shallow);
+      if (options.rejectShallow && serverShallow.ours.length + serverShallow.theirs.length > 0) {
+        throw new ShallowRemoteRejectedError();
+      }
     }
     const links = strictLinks && (!!options.fsckObjects || !deepening);
     const received =
@@ -502,6 +530,7 @@ export async function fetchFromConnection(
       shallow,
       filter: options.filter,
       ...(options.onWarning ? { onWarning: options.onWarning } : {}),
+      ...(options.serverOptions?.length ? { serverOptions: options.serverOptions } : {}),
       includeTag: autoTags,
       onProgress: options.onProgress,
       // a dry run stores the objects too (git's fetch_refs runs; only the refs are left)
@@ -530,6 +559,12 @@ export async function fetchFromConnection(
           u.shallow.length > 0
         ) {
           serverShallow = await shallowInfoOf(repository, u.shallow, shallow);
+          if (
+            options.rejectShallow &&
+            serverShallow.ours.length + serverShallow.theirs.length > 0
+          ) {
+            throw new ShallowRemoteRejectedError();
+          }
           return;
         }
         update = u;
@@ -876,6 +911,7 @@ export async function fetchFromConnection(
             initial: new Set(
               [...planned, ...opportunistic].flatMap((p) => (p.localRef ? [p.localRef] : [])),
             ),
+            initialEvenEmpty: !isEmpty,
           }
         : {}),
     });
@@ -888,6 +924,8 @@ export async function fetchFromConnection(
 export async function lsRefs(
   connection: UploadPackConnection,
   prefixes: string[],
+  /** `server-option=` lines sent after the capabilities (connect.c's get_remote_refs) */
+  serverOptions?: readonly string[],
 ): Promise<RemoteRef[]> {
   const caps = connection.capabilities;
   const body: Uint8Array[] = [encodePacketLine("command=ls-refs")];
@@ -901,6 +939,7 @@ export async function lsRefs(
     );
   }
   if (caps.has("object-format")) body.push(encodePacketLine(`object-format=${format.name}`));
+  body.push(...serverOptionLines(connection, serverOptions));
   body.push(encodeDelim());
   body.push(encodePacketLine("symrefs"));
   body.push(encodePacketLine("peel"));
