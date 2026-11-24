@@ -285,6 +285,26 @@ describeGit("git read-tree against native git", () => {
     });
   });
 
+  it("-n -u three-way refuses an untracked file in the way", async () => {
+    await compareReadTree(history, ["-n", "-u", "-m", "c1", "c2", "side"], (dir) =>
+      put(dir, "s", "u\n"),
+    );
+  });
+
+  it("-n -u three-way checks and writes nothing", async () => {
+    await compareReadTree(history, ["-n", "-u", "-m", "c1", "c2", "side"]);
+  });
+
+  it("-n -u --prefix refuses an untracked file in the way", async () => {
+    await compareReadTree(history, ["-n", "-u", "--prefix=sub/", "side"], (dir) =>
+      put(dir, "sub/s", "u\n"),
+    );
+  });
+
+  it("-n -u --prefix checks and writes nothing", async () => {
+    await compareReadTree(history, ["-n", "-u", "--prefix=sub/", "side"]);
+  });
+
   it("-n --reset without -u writes nothing", async () => {
     await compareReadTree(history, ["-n", "--reset", "side"], (dir) => put(dir, "a", "dirty\n"));
   });

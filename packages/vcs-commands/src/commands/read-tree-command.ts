@@ -480,7 +480,8 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       }
     }
     const checking = traversalOrder(target.keys());
-    const worktree = this.update && !this.dryRun ? ctx.worktree : undefined;
+    // -n keeps o->update: the checks run, nothing is written
+    const worktree = this.update ? ctx.worktree : undefined;
     const sparse = worktree && !this.skipSparseCheckout ? await SparseUnpack.start(ctx) : undefined;
     const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
     const indexTime = this.staging.getUpdateTime();
@@ -519,6 +520,8 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
     const stage0 = new Set<string>(paths);
     for (const p of index.keys()) if (!dropped.has(p)) stage0.add(p);
     assertNoStageZeroClash(stage0);
+    // -n: every check made, neither worktree nor index written
+    if (this.dryRun) return;
 
     const writing = new Set(paths.filter((p) => !sparse || sparse.writes(p)));
     if (worktree) {
@@ -558,7 +561,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
         },
       ]);
     }
-    await rewriteIndex(this.staging, changes, this.dryRun ? { write: false } : {});
+    await rewriteIndex(this.staging, changes);
     if (sparse && worktree) {
       const outcome = await sparse.finish(ctx, { written: writing });
       pushSparseWarnings(result.warnings, sparse, outcome, false);
@@ -620,7 +623,8 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
     const indexEntries = new Map<string, StagingEntry>();
     for (const e of await this.entryList()) if (e.stage === 0) indexEntries.set(e.path, e);
     const checkedWorktree = ctx.worktree;
-    const worktree = this.update && !this.dryRun ? checkedWorktree : undefined;
+    // -n keeps o->update: the checks run, nothing is written
+    const worktree = this.update ? checkedWorktree : undefined;
     const sparse = worktree && !this.skipSparseCheckout ? await SparseUnpack.start(ctx) : undefined;
     const quiet = (p: string) => sparse?.leavesAlone(p) === true;
     const trust = checkedWorktree
@@ -800,6 +804,8 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
     for (const p of indexEntries.keys()) if (!changes.has(p)) stage0.add(p);
     for (const [p, list] of changes) if (list.some((e) => !e.stage)) stage0.add(p);
     assertNoStageZeroClash(stage0);
+    // -n: every check made, neither worktree nor index written
+    if (this.dryRun) return;
 
     // the worktree: removals first, then the files written
     sparse?.conflict(conflicted);
@@ -835,7 +841,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
         if (e && stat && !stat.isDirectory) Object.assign(e, entryStatOf(stat));
       }
     }
-    await rewriteIndex(this.staging, changes, this.dryRun ? { write: false } : {});
+    await rewriteIndex(this.staging, changes);
     if (sparse && worktree) {
       const outcome = await sparse.finish(ctx, { written: worktree ? writing : new Set() });
       pushSparseWarnings(result.warnings, sparse, outcome, false);
