@@ -222,6 +222,13 @@ export interface LogReflogEntry {
   message: string;
   /** Who made the change, and when */
   who: PersonIdent;
+  /** The ref shortened (shorten_unambiguous_ref), for `%gd`; a prefix-stripped `ref` without */
+  shortRef?: string;
+  /**
+   * The selector the walk was given the ref with: `@{<n>}` shows indexes, `@{<date>}` dates,
+   * neither (undefined) indexes unless `--date` is given
+   */
+  selector?: "index" | "date";
 }
 
 /** shorten_unambiguous_ref of a reflog's ref, for `%gd` */
@@ -940,12 +947,15 @@ export class LogPrinter {
   }
 
   /**
-   * get_reflog_selector: `<ref>@{n}`, or `<ref>@{<date>}` under an explicit `--date`;
-   * `shorten` for `%gd`
+   * get_reflog_selector: `<ref>@{n}`, or `<ref>@{<date>}` for a ref given as `@{<date>}` or,
+   * given without a selector, under an explicit `--date`; `shorten` for `%gd`
    */
   private reflogSelector(reflog: LogReflogEntry, shorten: boolean): string {
-    const ref = shorten ? shortRefName(reflog.ref) : reflog.ref;
-    const at = this.options.date !== undefined ? this.formatDate(reflog.who) : String(reflog.index);
+    const ref = shorten ? (reflog.shortRef ?? shortRefName(reflog.ref)) : reflog.ref;
+    const byDate =
+      reflog.selector === "date" ||
+      (reflog.selector === undefined && this.options.date !== undefined);
+    const at = byDate ? this.formatDate(reflog.who) : String(reflog.index);
     return `${ref}@{${at}}`;
   }
 

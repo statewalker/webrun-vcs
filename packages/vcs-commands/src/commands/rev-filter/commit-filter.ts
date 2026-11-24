@@ -42,6 +42,11 @@ export interface FilteredCommit {
   raw(): Promise<Uint8Array>;
   /** The commit decoded */
   commit(): Promise<Commit>;
+  /**
+   * In a reflog walk (`git log -g`), the message of the reflog entry the commit is shown for
+   * (what `--grep-reflog` matches)
+   */
+  readonly reflogMessage?: string;
 }
 
 /** Decides whether the walk shows a commit */
@@ -131,7 +136,7 @@ export const CommitFilters = {
    */
   grep(options: CommitGrepOptions): CommitFilter {
     const grep = compileCommitGrep(options);
-    return { include: async (c) => grep.matches(await c.raw()) };
+    return { include: async (c) => grep.matches(await c.raw(), c.reflogMessage) };
   },
 
   /** `--author=<pattern>` (a basic regex unless `patternType` says otherwise) */

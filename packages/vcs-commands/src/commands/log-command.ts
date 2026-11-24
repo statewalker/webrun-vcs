@@ -7,6 +7,7 @@ import {
   canonTreeMode,
   commitFromBytes,
   type GitObject,
+  isSymbolicRef,
   type ObjectId,
   type ObjectReplacements,
   type PersonIdent,
@@ -37,6 +38,7 @@ import {
   type LogOutputHost,
   type LogOutputOptions,
   LogPrinter,
+  type LogReflogEntry,
 } from "./log-output.js";
 import { type Mailmap, readRepositoryMailmap } from "./mailmap.js";
 import { configBool, configValue } from "./merge-config.js";
@@ -67,6 +69,7 @@ import {
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
 import { loadRefDecorations } from "./pretty-format.js";
+import { openReflogWalk, walkReflogs } from "./reflog-walk.js";
 import {
   type CommitFilter,
   CommitFilters,
@@ -74,6 +77,7 @@ import {
   type GrepPatternType,
 } from "./rev-filter/index.js";
 import { readDiffSubmoduleConfig } from "./submodule-summary.js";
+import { shortenUnambiguousRef } from "./worktree-list-command.js";
 
 /** What {@link LogCommand.callBytes} asks of the walk. */
 interface OutputWalk {
@@ -124,6 +128,8 @@ export interface LogResult extends Commit {
    * the revision as given, or the ref `--all`, `--branches`... named
    */
   source?: string;
+  /** In a reflog walk ({@link LogCommand.addReflogWalk}), the entry the commit is listed for */
+  reflog?: LogReflogEntry;
 }
 
 /**
@@ -293,8 +299,12 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private lastWalk: RevTable | undefined;
   /** Set while {@link callBytes} collects the walk for its output */
   private outputWalk: OutputWalk | undefined;
-  /** `-g <ref>`: the reflog walked instead of the history */
-  private reflogWalkRef?: string;
+  /** `-g <ref>...`: the reflogs walked instead of the history (names as given) */
+  private reflogWalkNames?: string[];
+  /** `--grep-reflog` patterns */
+  private readonly grepReflogs: string[] = [];
+  /** The git version whose behaviour differs where versions differ */
+  private compatibility: "2.43" | "2.56" = "2.56";
   /** `--topo-order`, `--date-order`, `--author-date-order` */
   private order?: LogOrder;
   /** `--reverse` */
@@ -369,7 +379,58 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    */
   setReflogWalk(ref: string): this {
     this.checkCallable();
-    this.reflogWalkRef = ref;
+    this.reflogWalkNames = [ref];
+    return this;
+  }
+
+  /**
+   * One more reflog of a reflog walk (`git log -g <name>...`): `HEAD`, `main`,
+   * `refs/heads/main`, with a selector of its first entry (`main@{2}`, `HEAD@{now}`,
+   * `@{0}` for the current branch, `@{-1}`). The walk takes the newest of the logs' entries
+   * each time (reflog-walk.c), so several logs interleave by date; a name without a reflog
+   * shows nothing. {@link call} gives the commits, {@link callText} the log with each entry.
+   *
+   * @example
+   * ```typescript
+   * // git log -g --format='%gd %gs' HEAD main
+   * await git.log().addReflogWalk("HEAD").addReflogWalk("main").callText({ pretty: "format:%gd %gs" });
+   * ```
+   */
+  addReflogWalk(name: string): this {
+    this.checkCallable();
+    this.reflogWalkNames = [...(this.reflogWalkNames ?? []), name];
+    return this;
+  }
+
+  /**
+   * `-g` / `--walk-reflogs`: walk reflogs instead of history, those {@link addReflogWalk}
+   * names, HEAD's when it names none (`git log -g`).
+   */
+  setWalkReflogs(walk: boolean): this {
+    this.checkCallable();
+    if (!walk) this.reflogWalkNames = undefined;
+    else this.reflogWalkNames ??= [];
+    return this;
+  }
+
+  /**
+   * The git version to follow where versions differ (default 2.56): 2.43 refuses a reflog
+   * walk's `--reverse` before a sorted walk (`--topo-order`, `--graph`), 2.56 after.
+   */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
+
+  /**
+   * `--grep-reflog=<pattern>`: a reflog walk shows only entries whose message matches (a
+   * header pattern beside `--author`/`--committer`, combined with `--grep` as git's
+   * commit_match). Without a reflog walk the log dies, as git does.
+   */
+  addGrepReflog(pattern: string): this {
+    this.checkCallable();
+    this.grepReflogs.push(pattern);
     return this;
   }
 
@@ -712,6 +773,14 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     this.setCallable(false);
     // git_log_config ends in git_diff_ui_config: a diff.submodule without a value dies
     readDiffSubmoduleConfig(this.workingCopy);
+    if (this.reflogWalkNames !== undefined || this.grepReflogs.length > 0) {
+      await this.checkReflogWalkOptions({});
+      const entries = await this.reflogEntries(this.reflogWalkNames ?? [], false);
+      const walk = (async function* () {
+        for (const e of entries) yield { ...e.commit, id: e.id, reflog: e.reflog } as LogResult;
+      })();
+      return walk;
+    }
     this.activeFilter = await this.buildCommitFilter();
 
     // the commits given, in order, the refs of `all()` where it was called; HEAD without
@@ -745,7 +814,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    */
   private async buildCommitFilter(): Promise<CommitFilter | undefined> {
     const filters: CommitFilter[] = [];
-    const headers = this.grepAuthors.length > 0 || this.grepCommitters.length > 0;
+    const headers =
+      this.grepAuthors.length > 0 || this.grepCommitters.length > 0 || this.grepReflogs.length > 0;
     // the grep configuration and the mailmap are read only for a walk that greps: the
     // commands walking through LogCommand for git's other commands (bisect, notes, rev-list)
     // never see them
@@ -769,6 +839,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           messages: this.grepMessages,
           authors: this.grepAuthors,
           committers: this.grepCommitters,
+          ...(this.grepReflogs.length > 0 ? { reflogs: this.grepReflogs } : {}),
           allMatch: this.allMatch,
           invertGrep: this.invertGrep,
           ignoreCase: this.regexpIgnoreCase,
@@ -1410,6 +1481,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 
   private async printLog(options: LogOutputOptions): Promise<Uint8Array> {
     const reverse = !!options.reverse || this.reverse;
+    await this.checkReflogWalkOptions(options);
     // revision.c's setup_revisions: the graph cannot be reversed
     if (options.graph && reverse) {
       throw new IncompatibleOptionsError(
@@ -1463,8 +1535,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const shownIds = new Set<ObjectId>();
     const unwalkedShown = new Set<ObjectId>();
     let entries: LogOutputEntry[];
-    if (this.reflogWalkRef !== undefined) {
-      entries = await this.reflogEntries(this.reflogWalkRef);
+    if (this.reflogWalkNames !== undefined) {
+      entries = await this.reflogEntries(this.reflogWalkNames);
       for (const e of entries) shownIds.add(e.id);
     } else if (topo) {
       this.outputWalk = { topo, rewrite: graph, entries: [] };
@@ -1609,48 +1681,148 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
-   * The entries of a reflog walk (reflog-walk.c's next_reflog_entry over one ref): newest
-   * first, each entry's new commit, filtered and counted as the walk's commits.
+   * setup_revisions' refusals of a reflog walk: a sorted walk (`--topo-order`, `--graph`
+   * without generation numbers: git's `limited`), then `--graph`/`--reverse`, then
+   * `--grep-reflog` without `-g`.
    */
-  private async reflogEntries(ref: string): Promise<LogOutputEntry[]> {
-    this.checkCallable();
-    this.setCallable(false);
-    readDiffSubmoduleConfig(this.workingCopy);
+  private async checkReflogWalkOptions(options: LogOutputOptions): Promise<void> {
+    const walking = this.reflogWalkNames !== undefined;
+    if (walking) {
+      const graph = !!options.graph;
+      const reverse = !!options.reverse || this.reverse;
+      if (reverse && this.compatibility === "2.43") {
+        throw new IncompatibleOptionsError(
+          ["--reverse", "--walk-reflogs"],
+          "options '--reverse' and '--walk-reflogs' cannot be used together",
+        );
+      }
+      const sorted =
+        graph ||
+        this.order !== undefined ||
+        !!options.topoOrder ||
+        !!options.dateOrder ||
+        !!options.authorDateOrder;
+      // a sorted walk is limited unless the commit-graph gives generation numbers
+      if (sorted && !(await this.commits.commitGraph?.get().catch(() => undefined))) {
+        throw new GitApiError("cannot combine --walk-reflogs with history-limiting options");
+      }
+      const set = [
+        ...(graph ? ["--graph"] : []),
+        ...(reverse ? ["--reverse"] : []),
+        "--walk-reflogs",
+      ];
+      if (set.length > 1) {
+        const quoted = set.map((o) => `'${o}'`);
+        const list =
+          quoted.length === 2
+            ? `${quoted[0]} and ${quoted[1]}`
+            : `${quoted[0]}, ${quoted[1]}, and ${quoted[2]}`;
+        throw new IncompatibleOptionsError(set, `options ${list} cannot be used together`);
+      }
+    }
+    if (!walking && this.grepReflogs.length > 0) {
+      throw new GitApiError("the option '--grep-reflog' requires '--walk-reflogs'");
+    }
+  }
+
+  /**
+   * The entries of a reflog walk (reflog-walk.c's next_reflog_entry over the names given,
+   * HEAD without): each entry's new commit, filtered as get_revision_1 filters a reflog walk
+   * (`--since`/`--until` against the entry's date, path limiting against the commit's parents,
+   * get_commit_action), then skipped and counted.
+   */
+  private async reflogEntries(names: readonly string[], claim = true): Promise<LogOutputEntry[]> {
+    if (claim) {
+      this.checkCallable();
+      this.setCallable(false);
+      readDiffSubmoduleConfig(this.workingCopy);
+    }
     this.activeFilter = await this.buildCommitFilter();
-    const reader = await this.refsStore.getReflog?.(ref);
-    const lines = reader ? await reader.getReverseEntries() : [];
+    const resolver = this.revisionResolver();
+    const refs = this.refsStore;
+    const logs = await openReflogWalk(names.length > 0 ? names : ["HEAD"], {
+      reflog: async (ref) => {
+        const reader = await refs.getReflog?.(ref);
+        return reader ? (await reader.getReverseEntries()).reverse() : undefined;
+      },
+      resolveRef: async (ref, reading) => {
+        const value = await refs.get(ref).catch(() => undefined);
+        if (!value) return undefined;
+        if (!isSymbolicRef(value)) return reading && !value.objectId ? undefined : ref;
+        let target = value.target;
+        for (let i = 0; i < 10; i++) {
+          const next = await refs.get(target).catch(() => undefined);
+          if (!next || !isSymbolicRef(next)) {
+            if (reading && !next) return undefined;
+            return target;
+          }
+          target = next.target;
+        }
+        return undefined;
+      },
+      interpretBranchPrefix: (name) => resolver.interpretBranchPrefix(name),
+      dwimLogRefs: (name) => resolver.dwimLogRefs(name),
+      shortenRef: (ref) => shortenUnambiguousRef(refs, ref),
+      now: () => resolver.currentTime(),
+    });
     const out: LogOutputEntry[] = [];
     let skip = this.skip;
     const max = this.maxCount;
-    for (let index = 0; index < lines.length; index++) {
-      if (max !== undefined && out.length >= max) break;
-      const line = lines[index] as (typeof lines)[number];
-      const commit = await this.walkCommits.load(line.newId).catch(() => undefined);
-      if (!commit) continue;
+    if (max !== undefined && max <= 0) return out;
+    const prune = this.paths.length > 0 || this.excludePaths.length > 0;
+    const loadCommit = (id: ObjectId) => this.walkCommits.load(id).catch(() => undefined);
+    for await (const step of walkReflogs(logs, loadCommit)) {
+      const { id, commit } = step;
+      if (this.sinceTime !== undefined && step.time < this.sinceTime) continue;
+      if (this.untilTime !== undefined && step.time > this.untilTime) continue;
+      const parents = commit.parents.length;
+      if (this.revFilter === RevFilter.ONLY_MERGES && parents < 2) continue;
+      if (this.revFilter === RevFilter.NO_MERGES && parents > 1) continue;
+      if (this.authorPattern !== undefined && !this.matchesAuthor(commit)) continue;
+      if (this.committerPattern !== undefined && !this.matchesCommitter(commit)) continue;
       const filter = this.activeFilter;
       if (filter) {
         const view: FilteredCommit = {
-          id: line.newId,
-          parentCount: commit.parents.length,
+          id,
+          parentCount: parents,
           commitTime: commit.committer.timestamp,
-          raw: async () => this.rawCommit(line.newId),
+          raw: async () => this.rawCommit(id),
           commit: async () => commit,
+          reflogMessage: step.reflog.message,
         };
         if (!(await filter.include(view))) continue;
       }
+      if (prune && (await this.reflogCommitTreesame(commit))) continue;
       if (skip > 0) {
         skip--;
         continue;
       }
-      const message = line.comment.endsWith("\n") ? line.comment.slice(0, -1) : line.comment;
-      out.push({
-        id: line.newId,
-        commit,
-        parents: commit.parents,
-        reflog: { ref, index, message, who: line.who },
-      });
+      out.push({ id, commit, parents: commit.parents, reflog: step.reflog });
+      if (max !== undefined && out.length >= max) break;
     }
     return out;
+  }
+
+  /**
+   * try_to_simplify_commit for a commit of a reflog walk (every parent relevant): TREESAME
+   * at the paths to a parent (to every parent under `--full-history`), a root commit to the
+   * empty tree.
+   */
+  private async reflogCommitTreesame(commit: Commit): Promise<boolean> {
+    if (commit.parents.length === 0) return !(await this.pathsDiffer(undefined, commit.tree));
+    let same = 0;
+    let compared = 0;
+    for (const parent of commit.parents) {
+      if (compared === 1 && this.firstParentOnly) break;
+      compared++;
+      const p = await this.walkCommits.load(parent).catch(() => undefined);
+      if (!p) throw new GitApiError(`cannot simplify commit ${parent}`);
+      if (!(await this.pathsDiffer(p.tree, commit.tree))) {
+        if (this.simplifyHistory) return true;
+        same++;
+      }
+    }
+    return same === compared;
   }
 
   /** What the log printer reads of the repository. */
