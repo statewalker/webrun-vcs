@@ -516,9 +516,23 @@ export function planReflog(updates: PlannedRefUpdate[], options: BatchOptions = 
         create: options.createReflog === true || create(u.name),
       });
     for (const name of u.reflogAlso)
-      writes.push({ op: "append", name, line, create: create(name) });
+      writes.push({
+        op: "append",
+        name,
+        line,
+        create: (options.createReflog === true && reflogInChain(u, name)) || create(name),
+      });
   }
   return writes;
+}
+
+/**
+ * Whether `name`, one of `update.reflogAlso`, is a symbolic ref the update went through
+ * (which git's REF_FORCE_CREATE_REFLOG reaches: split_symref_update keeps the flags) rather
+ * than HEAD recording its branch's update (split_head_update, no forced log).
+ */
+export function reflogInChain(update: Pick<PlannedRefUpdate, "requested">, name: string): boolean {
+  return name !== "HEAD" || update.requested === "HEAD";
 }
 
 /** The identity of a reflog line written without one: `webrun-vcs <vcs@localhost>`, now. */
