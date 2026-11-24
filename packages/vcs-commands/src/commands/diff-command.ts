@@ -63,6 +63,7 @@ import {
   formatSummary,
   writePairPatch,
 } from "../results/diff-output.js";
+import { DiffPickaxe } from "../results/diff-pickaxe.js";
 import { quotePath } from "../results/quote-path.js";
 import { bareAttributesResolver } from "./attributes-source.js";
 import { worktreeModeTrust } from "./core-config.js";
@@ -104,7 +105,14 @@ const PREFETCH_FORMATS = new Set<string>(["patch", "stat", "numstat", "shortstat
 function prefetchIds(entries: readonly DiffEntry[]): ObjectId[] {
   const out: ObjectId[] = [];
   const add = (id: ObjectId | undefined, mode: number | undefined) => {
-    if (id && !isNullObjectId(id) && mode !== GITLINK && mode !== undefined && mode !== 0)
+    if (
+      id &&
+      !isNullObjectId(id) &&
+      mode !== GITLINK &&
+      mode !== undefined &&
+      mode !== 0 &&
+      (mode & 0o170000) !== 0o040000
+    )
       out.push(id);
   };
   for (const e of entries) {
@@ -244,6 +252,81 @@ export interface DiffTextOptions
    * pair unless a whitespace option or `-I` is given, as git 2.43
    */
   exitCodeFromContents?: boolean;
+  /**
+   * `-S<string>`: only the pairs whose two sides hold the string a different number of
+   * times (diffcore-pickaxe.c), read through textconv unless `textconv: false`. An empty
+   * string throws git's `error: -S requires a non-empty argument` (exit 129).
+   */
+  pickaxeString?: string;
+  /**
+   * `-G<regex>`: only the pairs whose added or removed lines match this POSIX extended
+   * regex; binary pairs are passed over unless `text` (or textconv makes them text). An
+   * empty one throws `error: -G requires a non-empty argument` (exit 129), an invalid one
+   * `fatal: invalid regex: <message>` (exit 128).
+   */
+  pickaxeGrep?: string;
+  /**
+   * `--find-object=<object>` (each a revision naming an object): only the pairs with one of
+   * them on either side; a diff of two trees also lists the subtrees that changed, so a tree
+   * can be found too (`tree_in_recursive`). One that names nothing throws `error: unable to
+   * resolve '<object>'` (exit 129).
+   */
+  findObjects?: readonly string[];
+  /** `--pickaxe-regex`: `-S` takes a POSIX extended regex */
+  pickaxeRegex?: boolean;
+  /** `--pickaxe-all`: when one pair matches, every pair is kept; when none, none */
+  pickaxeAll?: boolean;
+  /** `-i` / `--regexp-ignore-case` of `-S`/`-G` (ASCII case folded) */
+  pickaxeIgnoreCase?: boolean;
+}
+
+/** Whether options ask for a pickaxe (git's `DIFF_PICKAXE_KINDS_MASK`) */
+export function hasPickaxe(o: DiffTextOptions): boolean {
+  return (
+    o.pickaxeString !== undefined ||
+    o.pickaxeGrep !== undefined ||
+    (o.findObjects !== undefined && o.findObjects.length > 0)
+  );
+}
+
+/**
+ * diff.c's checks of the pickaxe options (the option callbacks' empty-argument errors, then
+ * diff_setup_done's combinations), before anything is read
+ */
+export function checkPickaxeOptions(o: DiffTextOptions): void {
+  if (o.pickaxeString === "") {
+    throw new InvalidArgumentError(
+      "pickaxeString",
+      "",
+      "error: -S requires a non-empty argument",
+    ).withExitCode(129);
+  }
+  if (o.pickaxeGrep === "") {
+    throw new InvalidArgumentError(
+      "pickaxeGrep",
+      "",
+      "error: -G requires a non-empty argument",
+    ).withExitCode(129);
+  }
+  const kinds =
+    (o.pickaxeString !== undefined ? 1 : 0) +
+    (o.pickaxeGrep !== undefined ? 1 : 0) +
+    ((o.findObjects?.length ?? 0) > 0 ? 1 : 0);
+  if (kinds > 1) {
+    throw new GitApiError(
+      "fatal: options '-G', '-S', and '--find-object' cannot be used together",
+    ).withExitCode(128);
+  }
+  if (o.pickaxeGrep !== undefined && o.pickaxeRegex) {
+    throw new GitApiError(
+      "fatal: options '-G' and '--pickaxe-regex' cannot be used together, use '--pickaxe-regex' with '-S'",
+    ).withExitCode(128);
+  }
+  if (o.pickaxeAll && (o.findObjects?.length ?? 0) > 0) {
+    throw new GitApiError(
+      "fatal: options '--pickaxe-all' and '--find-object' cannot be used together, use '--pickaxe-all' with '-G' and '-S'",
+    ).withExitCode(128);
+  }
 }
 
 /** git's status letters `--diff-filter` takes (`diff_status_letters`) */
@@ -551,6 +634,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private changesFound = false;
   /** The revisions given resolved (ranges, `--merge-base`) */
   private sidesResolved = false;
+  /** The compiled pickaxe (`-S`, `-G`, `--find-object`), once the options are checked */
+  private pickaxe?: DiffPickaxe;
+  /**
+   * `--find-object`'s `tree_in_recursive`: the subtrees of a diff of two trees, by the side
+   * map their blobs go to
+   */
+  private treeSides?: Map<Map<string, Side>, Map<string, Side>>;
 
   /**
    * `--exit-code`: {@link exitCode} is 1 when the diff found differences, as git's status
@@ -834,13 +924,14 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.checkCallable();
     this.setCallable(false);
     this.dirtyThisCall = this.dirtySubmodules ?? true;
-    const { entries } = await this.collect(this.renames ?? false);
-    // diffcore_apply_filter (the entries stay in path order, unswapped)
-    const filter = this.textOptions.diffFilter;
-    const out = applyDiffFilter(
-      entries,
-      filter !== undefined ? parseDiffFilter(filter) : undefined,
-    );
+    const run = async () => {
+      const { entries } = await this.collect(this.renames ?? false, false, this.pickaxeReads);
+      // diffcore_pickaxe, diffcore_apply_filter (the entries stay in path order, unswapped)
+      const picked = await this.picked(entries);
+      const filter = this.textOptions.diffFilter;
+      return applyDiffFilter(picked, filter !== undefined ? parseDiffFilter(filter) : undefined);
+    };
+    const out = hasPickaxe(this.textOptions) ? await this.inOneOperation(run) : await run();
     this.changesFound = out.length > 0;
     return out;
   }
@@ -874,7 +965,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       const collected = await this.collect(
         renames,
         format === "patch",
-        PREFETCH_FORMATS.has(format),
+        PREFETCH_FORMATS.has(format) || this.pickaxeReads,
       );
       const sink = new ByteSink();
       await this.writeFormats(sink, [format], collected);
@@ -893,8 +984,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const fromContents = this.fromContents;
     const early = this.textOptions.diffFilter === undefined && !fromContents;
     const detect = !early && (this.textOptions.quietDetectsRenames ?? false);
-    const collected = await this.collect(detect ? renames : false, false, false);
-    const entries = await this.selected(collected.entries);
+    const collected = await this.collect(detect ? renames : false, false, this.pickaxeReads);
+    // diff_can_quit_early: the walk stopped at the first change, which a pickaxe (git 2.43,
+    // whose quiet diff does not look at contents) may then drop
+    const queue = early && this.pickaxe ? collected.entries.slice(0, 1) : collected.entries;
+    const entries = await this.selected(queue);
     this.changesFound = entries.length > 0;
     if (!fromContents || entries.length === 0) return;
     this.changesFound = false;
@@ -996,7 +1090,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         collected = await this.collect(
           renames,
           formats.includes("patch"),
-          formats.some((f) => PREFETCH_FORMATS.has(f)),
+          formats.some((f) => PREFETCH_FORMATS.has(f)) || this.pickaxeReads,
         );
       }
       const followed = {
@@ -1633,6 +1727,12 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       ignoreMatchingLines: _ignoreMatchingLines,
       quietDetectsRenames: _quietDetectsRenames,
       exitCodeFromContents: _exitCodeFromContents,
+      pickaxeString: _pickaxeString,
+      pickaxeGrep: _pickaxeGrep,
+      findObjects: _findObjects,
+      pickaxeRegex: _pickaxeRegex,
+      pickaxeAll: _pickaxeAll,
+      pickaxeIgnoreCase: _pickaxeIgnoreCase,
       ...text
     } = this.textOptions;
     const ignoreRegex = this.ignoreRegex();
@@ -1691,7 +1791,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    * rotated (`--rotate-to`, `--skip-to`), filtered (`--diff-filter`)
    */
   private async selected(entries: DiffEntry[]): Promise<DiffEntry[]> {
-    const ordered = await this.ordered(entries);
+    const ordered = await this.ordered(await this.picked(entries));
     let out = this.textOptions.reverse ? ordered.map(reverseEntry) : ordered;
     const { rotateTo, skipTo } = this.textOptions;
     // diff_opt_rotate_to: the last of the two given wins
@@ -1699,6 +1799,64 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     else if (rotateTo !== undefined) out = rotateEntries(out, rotateTo, false, this.rotateStrict);
     const filter = this.textOptions.diffFilter;
     return applyDiffFilter(out, filter !== undefined ? parseDiffFilter(filter) : undefined);
+  }
+
+  /**
+   * diffcore_std's prefetch condition: any pickaxe kind (`DIFF_PICKAXE_KINDS_MASK`,
+   * `--find-object` included) fetches a partial clone's absent blobs of the queue in one
+   * batch before rename detection
+   */
+  private get pickaxeReads(): boolean {
+    return hasPickaxe(this.textOptions);
+  }
+
+  /** diffcore_pickaxe over the queue (after rename detection, before `-O` and the filter) */
+  private async picked(entries: DiffEntry[]): Promise<DiffEntry[]> {
+    const pickaxe = this.pickaxe;
+    if (!pickaxe) return entries;
+    const options = this.outputOptions();
+    return pickaxe.filter(
+      entries,
+      (e) => (e.unmerged ? undefined : this.withTextconvInputs(diffEntryToPair(e, this.blobs), e)),
+      options,
+    );
+  }
+
+  /**
+   * The pickaxe of the options (checked, compiled, `--find-object`'s revisions resolved),
+   * before anything else is read
+   */
+  private async preparePickaxe(): Promise<void> {
+    const o = this.textOptions;
+    if (this.pickaxe || !hasPickaxe(o)) return;
+    checkPickaxeOptions(o);
+    let objects: Set<string> | undefined;
+    if (o.findObjects && o.findObjects.length > 0) {
+      objects = new Set();
+      for (const name of o.findObjects) {
+        const id = this.isFullObjectId(name)
+          ? name.toLowerCase()
+          : await this.revisionResolver()
+              .resolve(name)
+              .catch(() => undefined);
+        if (id === undefined) {
+          throw new InvalidArgumentError(
+            "findObjects",
+            name,
+            `error: unable to resolve '${name}'`,
+          ).withExitCode(129);
+        }
+        objects.add(id);
+      }
+    }
+    this.pickaxe = DiffPickaxe.compile({
+      ...(o.pickaxeString !== undefined ? { string: o.pickaxeString } : {}),
+      ...(o.pickaxeGrep !== undefined ? { grep: o.pickaxeGrep } : {}),
+      ...(objects ? { objects } : {}),
+      regex: o.pickaxeRegex ?? false,
+      all: o.pickaxeAll ?? false,
+      ignoreCase: o.pickaxeIgnoreCase ?? false,
+    });
   }
 
   /**
@@ -1715,6 +1873,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     // option parsing fails before anything is read
     if (this.textOptions.diffFilter !== undefined) parseDiffFilter(this.textOptions.diffFilter);
     this.ignoreRegex();
+    await this.preparePickaxe();
     await this.resolveRevisions();
     // repo_read_index: in a sparse checkout, a skip-worktree entry whose file is present is
     // read as in the checkout (in memory: diff writes no index)
@@ -1750,6 +1909,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const unmerged = new Map<string, DiffEntry[]>();
     const combined: CombinedEntry[] = [];
     if (this.newTree) {
+      if (this.pickaxe && !this.pickaxe.readsContent) this.treeSides = new Map();
       [oldSide, newSide] = await this.treePairSides(
         this.oldTree ?? "HEAD",
         this.oldTree === undefined,
@@ -1812,7 +1972,41 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     // one batch first (diff_queued_diff_prefetch), before rename detection
     if (prefetch) await this.blobs.prefetch?.(prefetchIds(entries));
     if (renames) await this.detectRenames(entries, renames === "copies");
-    return { entries, combined };
+    return { entries: this.withTreeEntries(entries, oldSide, newSide), combined };
+  }
+
+  /**
+   * `--find-object`'s tree_in_recursive: the changed subtrees of a diff of two trees among
+   * the blob pairs, each before what lies below it (the tree walk's order: `a/` sorts after
+   * `a.txt`); they take no part in rename detection
+   */
+  private withTreeEntries(
+    entries: DiffEntry[],
+    oldSide: Map<string, Side>,
+    newSide: Map<string, Side>,
+  ): DiffEntry[] {
+    const sides = this.treeSides;
+    if (!sides) return entries;
+    this.treeSides = undefined;
+    const trees = this.pairUp(
+      sides.get(oldSide) ?? new Map(),
+      sides.get(newSide) ?? new Map(),
+      new Map(),
+    );
+    if (trees.length === 0) return entries;
+    const keyOf = (e: DiffEntry) => e.newPath ?? e.oldPath ?? "";
+    const treeKey = (e: DiffEntry) => `${e.newPath ?? e.oldPath ?? ""}/`;
+    const out: DiffEntry[] = [];
+    let t = 0;
+    for (const e of entries) {
+      const key = keyOf(e);
+      while (t < trees.length && compareBytes(treeKey(trees[t] as DiffEntry), key) < 0) {
+        out.push(trees[t++] as DiffEntry);
+      }
+      out.push(e);
+    }
+    while (t < trees.length) out.push(trees[t++] as DiffEntry);
+    return out;
   }
 
   /**
@@ -2274,6 +2468,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         if (xe.id === ye.id && xe.mode === ye.mode) continue;
         const path = prefix ? `${prefix}/${xe.name}` : xe.name;
         if (isTreeMode(xe.mode) && isTreeMode(ye.mode)) {
+          this.addTreeSide(path, xe.mode, xe.id, oldSide);
+          this.addTreeSide(path, ye.mode, ye.id, newSide);
           await this.diffTreeSides(xe.id, ye.id, path, oldSide, newSide);
           continue;
         }
@@ -2314,8 +2510,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       } else {
         if (!x.sameAs(y)) {
           const path = pathOf(x.name());
-          if (x.isTree && y.isTree) await this.diffRawTrees(x.id(), y.id(), path, oldSide, newSide);
-          else {
+          if (x.isTree && y.isTree) {
+            this.addTreeSide(path, x.mode, x.id(), oldSide);
+            this.addTreeSide(path, y.mode, y.id(), newSide);
+            await this.diffRawTrees(x.id(), y.id(), path, oldSide, newSide);
+          } else {
             await this.addRawSide(x, path, oldSide);
             await this.addRawSide(y, path, newSide);
           }
@@ -2332,14 +2531,30 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     path: string,
     side: Map<string, Side>,
   ): Promise<void> {
-    if (c.isTree) await this.collectTreeEntries(c.id(), path, side);
-    else side.set(path, { mode: c.mode, id: c.id() });
+    if (c.isTree) {
+      this.addTreeSide(path, c.mode, c.id(), side);
+      await this.collectTreeEntries(c.id(), path, side);
+    } else side.set(path, { mode: c.mode, id: c.id() });
   }
 
   /** A tree entry on one side: a blob as itself, a subtree as its blobs */
   private async addSide(e: TreeEntry, path: string, side: Map<string, Side>): Promise<void> {
-    if (isTreeMode(e.mode)) await this.collectTreeEntries(e.id, path, side);
-    else side.set(path, { mode: e.mode, id: e.id });
+    if (isTreeMode(e.mode)) {
+      this.addTreeSide(path, e.mode, e.id, side);
+      await this.collectTreeEntries(e.id, path, side);
+    } else side.set(path, { mode: e.mode, id: e.id });
+  }
+
+  /** A subtree on one side, kept for `--find-object` (see {@link withTreeEntries}) */
+  private addTreeSide(path: string, mode: number, id: ObjectId, side: Map<string, Side>): void {
+    const sides = this.treeSides;
+    if (!sides) return;
+    let trees = sides.get(side);
+    if (!trees) {
+      trees = new Map();
+      sides.set(side, trees);
+    }
+    trees.set(path, { mode, id });
   }
 
   /**
@@ -2541,6 +2756,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     for (const entry of await this.treeEntries(treeId)) {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
       if ((entry.mode & S_IFMT) === TREE_MODE) {
+        this.addTreeSide(path, entry.mode, entry.id, entries);
         await this.collectTreeEntries(entry.id, path, entries);
       } else {
         // the mode as git's tree walk reads it (canon_mode), as the tree store reads it

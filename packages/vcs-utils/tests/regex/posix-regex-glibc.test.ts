@@ -57,7 +57,9 @@ int main(void) {
       } else {
         regmatch_t m[2];
         m[0].rm_so = 0; m[0].rm_eo = sl;
-        if (regexec(&re, s, 2, m, REG_STARTEND)) snprintf(out, sizeof out, "NO\n");
+        int ef = REG_STARTEND;
+        if (strchr(fl, 'b')) ef |= REG_NOTBOL;
+        if (regexec(&re, s, 2, m, ef)) snprintf(out, sizeof out, "NO\n");
         else snprintf(out, sizeof out, "%d %d %d %d\n", (int)m[0].rm_so, (int)m[0].rm_eo,
                       (int)m[1].rm_so, (int)m[1].rm_eo);
       }
@@ -264,5 +266,70 @@ describe.skipIf(!exe)("compilePosixRegex against glibc", () => {
     }
     for (const m of mismatches.slice(0, SHOW)) console.log(m);
     expect(mismatches).toEqual([]);
+  }, 300_000);
+
+  it(`matches glibc's REG_NOTBOL on ${Math.ceil(SEEDS / 3)} random patterns over lines`, () => {
+    const r = prng(20261125);
+    const atoms = [...ATOMS, "\n", "^", "$", "\\<", "\\b", "\\`"];
+    const cases: Array<{ flags: string; p: string; s: string }> = [];
+    for (let i = 0; i < Math.ceil(SEEDS / 3); i++) {
+      const extended = r() < 0.7;
+      let p = "";
+      const n = 1 + Math.floor(r() * 4);
+      for (let k = 0; k < n; k++) {
+        p += atoms[Math.floor(r() * atoms.length)].replace("\\n", "\n");
+        if (r() < 0.3) p += ["*", "+", "?"][Math.floor(r() * 3)];
+      }
+      if (!extended) p = p.replace(/[+?]/g, (c) => `\\${c}`);
+      if (r() < 0.5) p = `^${p}`;
+      let s = "";
+      const len = Math.floor(r() * 12);
+      for (let j = 0; j < len; j++)
+        s += [...SUBJECT, "\n", "\n"][Math.floor(r() * (SUBJECT.length + 2))];
+      const newline = r() < 0.6;
+      // glibc's REG_ICASE without REG_NEWLINE lets `^` match after a newline (".^" finds
+      // "\n" in "_\nab"): left out, pickaxe compiles with REG_NEWLINE
+      const icase = newline && r() < 0.3;
+      cases.push({
+        flags: `${extended ? "E" : "B"}b${newline ? "n" : ""}${icase ? "i" : ""}`,
+        p,
+        s,
+      });
+    }
+    let input = "";
+    for (const c of cases) {
+      input += `${c.flags}\n${Buffer.from(c.p, "latin1").toString("hex")}\n${Buffer.from(c.s, "latin1").toString("hex")}\n`;
+    }
+    const res = spawnSync(exe as string, { input, maxBuffer: 1 << 28 });
+    const theirs = res.stdout.toString().trim().split("\n");
+    expect(theirs.length).toBe(cases.length);
+    const mismatches: string[] = [];
+    let matched = 0;
+    for (const [i, c] of cases.entries()) {
+      if (theirs[i] === "TIMEOUT") continue;
+      let ours: string;
+      try {
+        const re = compilePosixRegex(Buffer.from(c.p, "latin1"), {
+          extended: c.flags.includes("E"),
+          icase: c.flags.includes("i"),
+          newline: c.flags.includes("n"),
+        });
+        const subject = Buffer.from(c.s, "latin1");
+        const m = re.exec(subject, undefined, 2, true);
+        ours = m ? `${m.start} ${m.end} ${m.groups[0]?.[0] ?? -1} ${m.groups[0]?.[1] ?? -1}` : "NO";
+      } catch (e) {
+        if (!(e instanceof PosixRegexError)) throw e;
+        ours = "ERR";
+      }
+      if (theirs[i] !== "NO" && theirs[i] !== "ERR") matched++;
+      if (ours !== theirs[i]) {
+        mismatches.push(
+          `${c.flags} ${JSON.stringify(c.p)} ${JSON.stringify(c.s)} glibc ${theirs[i]} ours ${ours}`,
+        );
+      }
+    }
+    for (const m of mismatches.slice(0, SHOW)) console.log(m);
+    expect(mismatches).toEqual([]);
+    expect(matched).toBeGreaterThan(0);
   }, 300_000);
 });
