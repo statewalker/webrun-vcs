@@ -5,8 +5,9 @@
  * Tests run against all storage backends (Memory, SQL).
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { DescribeError, Git, NoHeadError, StatusCommand } from "../src/index.js";
 import { addFile, backends, createInitializedGitFromFactory } from "./test-helper.js";
 
 describe.each(backends)("DescribeCommand ($name backend)", ({ factory }) => {
@@ -332,5 +333,94 @@ describe.each(backends)("DescribeCommand - API options ($name backend)", ({ fact
 
     // Should still return something (always is true)
     expect(result.description).toBeDefined();
+  });
+
+  describe("call() answers undefined only where nothing describes the commit", () => {
+    it("throws NoHeadError for an unborn HEAD, with or without setAlways", async () => {
+      // a repository without a commit
+      const ctx = await factory();
+      cleanup = ctx.cleanup;
+      const git = Git.fromWorkingCopy(ctx.workingCopy);
+      await expect(git.describe().call()).rejects.toBeInstanceOf(NoHeadError);
+      await expect(git.describe().setAlways(true).call()).rejects.toBeInstanceOf(NoHeadError);
+      await expect(git.describe().setTags(true).call()).rejects.toBeInstanceOf(NoHeadError);
+    });
+
+    it("throws for a revision that names nothing", async () => {
+      const { git, workingCopy } = await createInitializedGit();
+      await addFile(workingCopy, "file.txt", "content");
+      await git.commit().setMessage("initial").call();
+      await git.tag().setName("v1").setAnnotated(true).setMessage("v1").call();
+      const error = await git
+        .describe()
+        .setRevisions("no-such")
+        .call()
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(DescribeError);
+      expect(error.message).toBe("fatal: Not a valid object name no-such");
+    });
+
+    it("throws for --long with --abbrev=0", async () => {
+      const { git, workingCopy } = await createInitializedGit();
+      await addFile(workingCopy, "file.txt", "content");
+      await git.commit().setMessage("initial").call();
+      const error = await git
+        .describe()
+        .setLong(true)
+        .setAbbrev(0)
+        .call()
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(DescribeError);
+      expect(error.message).toBe(
+        "fatal: options '--long' and '--abbrev=0' cannot be used together",
+      );
+    });
+
+    it("throws when comparing the worktree dies (--dirty)", async () => {
+      const { git, workingCopy } = await createInitializedGit();
+      await addFile(workingCopy, "file.txt", "content");
+      await git.commit().setMessage("initial").call();
+      await git.tag().setName("v1").setAnnotated(true).setMessage("v1").call();
+      const spy = vi
+        .spyOn(StatusCommand.prototype, "call")
+        .mockRejectedValue(new Error("fatal: not a git repository: sub/.git"));
+      try {
+        const error = await git
+          .describe()
+          .setDirty()
+          .call()
+          .catch((e) => e);
+        expect(error).toBeInstanceOf(DescribeError);
+        expect(error.message).toBe("fatal: not a git repository: sub/.git");
+        // --broken marks it instead
+        const broken = await git.describe().setBroken().call();
+        expect(broken.description).toBe("v1-broken");
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("answers undefined for no names, no tag that can describe, no exact match", async () => {
+      const { git, workingCopy } = await createInitializedGit();
+      await addFile(workingCopy, "file.txt", "one");
+      await git.commit().setMessage("one").call();
+      // no names at all
+      expect((await git.describe().call()).description).toBeUndefined();
+      await git.tag().setName("light").call();
+      // a lightweight tag only: no annotated tags can describe it
+      const unannotated = await git.describe().call();
+      expect(unannotated.description).toBeUndefined();
+      expect(unannotated.stderr[0]).toMatch(/^fatal: No annotated tags can describe '/);
+      // no tag the patterns keep
+      const none = await git.describe().setTags(true).setExclude("*").call();
+      expect(none.description).toBeUndefined();
+      await addFile(workingCopy, "file.txt", "two");
+      await git.commit().setMessage("two").call();
+      // no tag exactly matches
+      const exact = await git.describe().setTags(true).setExactMatch(true).call();
+      expect(exact.description).toBeUndefined();
+      expect(exact.stderr[0]).toMatch(/^fatal: no tag exactly matches '/);
+      expect((await git.describe().setTags(true).call()).description).toMatch(/^light-1-g/);
+    });
   });
 });
