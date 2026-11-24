@@ -49,6 +49,8 @@ After any refactoring or multi-file edit, run `tsc --noEmit` and fix ALL TypeScr
 
 When editing existing test files, NEVER overwrite/replace the entire file. Always append or surgically insert new tests alongside existing ones.
 
+A test ported from git's `t/` names its source as the script and the test's exact title, quoted, in the test name or a comment on the same line: `t0008-ignores.sh: "local ignore inside a sub-directory"` (several titles: `t7509 "--author", "--date"`). Native git still decides the expected result. `pnpm t-coverage` (`scripts/t-coverage.mjs`, git's `t/` at a pinned version) counts these citations per script and family, and lists the ones that name no title, several, or a script the pinned version lacks; paraphrased titles port nothing. CI's `git t/ coverage` workflow puts the report in the run's summary.
+
 ## Task Execution
 
 When working from checklist/epic documents, complete ALL items listed — do not skip or forget items. Before reporting done, re-read the checklist and verify every item is addressed.
