@@ -169,6 +169,13 @@ async function* reversed<T>(source: AsyncIterable<T>): AsyncIterable<T> {
   for (let i = all.length - 1; i >= 0; i--) yield all[i] as T;
 }
 
+/** A commit's parents as the walk holds them, by id */
+function lineLogParentIds(t: RevTable, n: number): ObjectId[] {
+  const ids: ObjectId[] = [];
+  for (let k = 0, c = t.parentCount(n); k < c; k++) ids.push(t.idOf(t.parent(n, k)));
+  return ids;
+}
+
 /** A death of `git log -L` (`die()`: `fatal:`, exit 128) */
 function lineLogDeath(message: string): GitApiError {
   return new GitApiError(`fatal: ${message}`).withExitCode(128);
@@ -2040,9 +2047,24 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         // -L sorts topologically (revs->topo_order), children before parents
         const sorted = await sortTopo(newlist, order ?? "topo");
         const lineOutput = output ?? { topo: true, rewrite: false, entries: [] };
-        // want_ancestry (`--graph`, `--parents`): line_log_filter and its own parent rewriting
-        lineOutput.rewrite ||= this.rewriteParents;
-        await this.finishLineLogWalk(lineOutput, t, sorted, shown, parse);
+        if (wantAncestry) {
+          // want_ancestry (`--graph`, `--parents`, `--simplify-merges`,
+          // `--simplify-by-decoration`): line_log_filter with its own parent rewriting, then
+          // simplify_merges (which does nothing without prune: `-L` alone has none,
+          // `--simplify-by-decoration` prunes), then get_commit_action and rewrite_parents
+          const filtered = await this.lineLogFilter(t, sorted);
+          const kept =
+            simplifyMerges && prune ? await simplifyMergesOf(filtered.kept) : filtered.kept;
+          await this.finishOutputWalk(lineOutput, t, kept, shown, relevant, parse, {
+            ancestry: wantAncestry,
+            rewrite,
+          });
+          for (const p of filtered.unwalked) {
+            if (t.flag(p) & SEEN || !(await parse(p)) || !(await shown(p))) continue;
+            lineOutput.unwalkedShown ??= new Set();
+            lineOutput.unwalkedShown.add(t.idOf(p));
+          }
+        } else await this.finishLineLogWalk(lineOutput, t, sorted, shown);
         if (!output) {
           let count = 0;
           let toSkip = this.skip;
@@ -2365,83 +2387,79 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
-   * The walk's commits under `-L`, sorted topologically: each followed in turn (git's
-   * simplify_commit), shown when its diff touched the ranges and the other filters keep it.
-   * With parents rewritten (`--graph`) every commit is followed first (line_log_filter) and
-   * each shown commit's parents are rewritten past the ones not shown (line_log_rewrite_one).
+   * The walk's commits under `-L` without parents rewritten, sorted topologically: each
+   * followed in turn (git's simplify_commit), shown when its diff touched the ranges and the
+   * other filters keep it, with the parents a merge kept (one when a parent took it all).
    */
   private async finishLineLogWalk(
     output: OutputWalk,
     t: RevTable,
     order: number[],
-    shown: (n: number, rewrite?: boolean) => Promise<LogResult | undefined>,
-    parse: (n: number) => Promise<boolean>,
+    shown: (n: number, ancestry?: boolean) => Promise<LogResult | undefined>,
   ): Promise<void> {
     const ll = this.lineLog as LineLogWalk;
-    const parentIds = (n: number): ObjectId[] => {
-      const ids: ObjectId[] = [];
-      for (let k = 0, c = t.parentCount(n); k < c; k++) ids.push(t.idOf(t.parent(n, k)));
-      return ids;
-    };
-    const push = (commit: LogResult, parents: ObjectId[]) => {
-      const { id, source, boundary: _boundary, left, patchSame, ...rest } = commit;
+    for (const n of order) {
+      const id = t.idOf(n);
+      if (!(await ll.process(id, lineLogParentIds(t, n)))) continue;
+      const commit = await shown(n);
+      if (!commit) continue;
+      const { id: _id, source, boundary: _boundary, left, patchSame, ...rest } = commit;
       output.entries.push({
         id,
         commit: rest,
-        parents,
+        parents: ll.parentsOf(id) ?? commit.parents,
         ...(source !== undefined ? { source } : {}),
         ...(left ? { left } : {}),
         ...(patchSame ? { patchSame } : {}),
       });
-    };
-    if (!output.rewrite) {
-      for (const n of order) {
-        const id = t.idOf(n);
-        if (!(await ll.process(id, parentIds(n)))) continue;
-        const commit = await shown(n);
-        if (commit) push(commit, ll.parentsOf(id) ?? commit.parents);
-      }
-      return;
     }
+  }
+
+  /**
+   * line-log.c's line_log_filter: every commit of the sorted list followed, those whose diff
+   * touched no range marked TREESAME (a merge one parent took whole left with that parent),
+   * the others kept with their parents rewritten past TREESAME commits
+   * (line_log_rewrite_one); `unwalked` the parents rewritten to that the walk never reached
+   */
+  private async lineLogFilter(
+    t: RevTable,
+    order: number[],
+  ): Promise<{ kept: number[]; unwalked: Set<number> }> {
+    const ll = this.lineLog as LineLogWalk;
     const kept: number[] = [];
-    for (const n of order) if (await ll.process(t.idOf(n), parentIds(n))) kept.push(n);
-    const parentNodes = (n: number): number[] => {
-      const narrowed = ll.parentsOf(t.idOf(n));
-      if (narrowed) return narrowed.map((id) => t.lookup(id));
-      const out: number[] = [];
-      for (let k = 0, c = t.parentCount(n); k < c; k++) out.push(t.parent(n, k));
-      return out;
-    };
+    for (const n of order) {
+      const id = t.idOf(n);
+      if (await ll.process(id, lineLogParentIds(t, n))) kept.push(n);
+      else t.mark(n, TREESAME);
+      const narrowed = ll.parentsOf(id);
+      if (narrowed)
+        t.setParentList(
+          n,
+          narrowed.map((p) => t.lookup(p)),
+        );
+    }
     /** line_log_rewrite_one */
     const rewriteOne = (start: number): number | undefined => {
       let p = start;
       for (;;) {
-        const parents = parentNodes(p);
-        if (parents.length > 1 || t.flag(p) & UNINTERESTING || !ll.isTreesame(t.idOf(p))) return p;
+        const parents = t.parsed(p) ? t.parentList(p) : [];
+        if (parents.length > 1 || t.flag(p) & UNINTERESTING || !(t.flag(p) & TREESAME)) return p;
         if (parents.length === 0) return undefined;
         p = parents[0] as number;
       }
     };
     const unwalked = new Set<number>();
     for (const n of kept) {
-      const commit = await shown(n);
-      if (!commit) continue;
-      const ids: ObjectId[] = [];
-      for (const q of parentNodes(n)) {
+      const rewritten: number[] = [];
+      for (const q of t.parentList(n)) {
         const p = rewriteOne(q);
         if (p === undefined) continue;
         if (!(t.flag(p) & SEEN)) unwalked.add(p);
-        const id = t.idOf(p);
-        if (!ids.includes(id)) ids.push(id);
+        if (!rewritten.includes(p)) rewritten.push(p);
       }
-      push(commit, ids);
+      t.setParentList(n, rewritten);
     }
-    if (unwalked.size > 0) {
-      output.unwalkedShown = new Set();
-      for (const p of unwalked) {
-        if ((await parse(p)) && (await shown(p))) output.unwalkedShown.add(t.idOf(p));
-      }
-    }
+    return { kept, unwalked };
   }
 
   /**

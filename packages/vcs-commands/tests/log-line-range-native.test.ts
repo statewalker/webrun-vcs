@@ -80,6 +80,9 @@ async function ours(dir: string, args: string[]): Promise<{ status: number; out:
     else if (a === "--oneline") options.oneline = true;
     else if (a === "--graph") options.graph = true;
     else if (a === "--parents") options.parents = true;
+    else if (a === "--simplify-merges") log.setSimplifyMerges(true);
+    else if (a === "--simplify-by-decoration") log.setSimplifyByDecoration(true);
+    else if (a === "--show-pulls") log.setShowPulls(true);
     else if (a === "-s" || a === "--no-patch") options.noPatch = true;
     else if (a === "-p") options.patch = true;
     else if (a === "--name-only") options.nameOnly = true;
@@ -720,4 +723,74 @@ describeGit("git log -L on a submodule (gitlink) path, native", () => {
     await compare(dir, ["-L1:sub"]);
     await compare(dir, ["-L1:sub", "--oneline", "--no-patch"]);
   });
+});
+
+describeGit("git log -L with history simplification, native", () => {
+  let dir: string;
+
+  // merges git's simplify_merges then prunes: one whose side touched only lines outside the
+  // range (its rewritten parent an ancestor of the other), an evil one, a rename on top
+  beforeAll(() => {
+    dir = join(home, "simplify");
+    git(home, "init", "-q", "-b", "main", dir);
+    const lines = new Array(40).fill(0).map((_, i) => `line ${i + 1}`);
+    const write = (path: string) => put(dir, path, `${lines.join("\n")}\n`);
+    write("c");
+    commit(dir, "base");
+    git(dir, "branch", "side");
+    git(dir, "branch", "outside");
+    lines[29] = "line 30 o1";
+    write("c");
+    commit(dir, "o1");
+    lines[3] = "line 4 main";
+    write("c");
+    commit(dir, "main change");
+    git(dir, "tag", "v1");
+    git(dir, "checkout", "-q", "side");
+    const sideLines = new Array(40).fill(0).map((_, i) => `line ${i + 1}`);
+    sideLines[2] = "line 3 side";
+    put(dir, "c", `${sideLines.join("\n")}\n`);
+    commit(dir, "side change");
+    git(dir, "tag", "v2");
+    git(dir, "checkout", "-q", "main");
+    clock += 60;
+    // may stop on conflicts: the merge commit is written below
+    run(dir, ["merge", "-q", "--no-commit", "side"]);
+    lines[2] = "line 3 side";
+    lines[14] = "line 15 evil";
+    write("c");
+    commit(dir, "evil merge");
+    git(dir, "checkout", "-q", "outside");
+    const outLines = new Array(40).fill(0).map((_, i) => `line ${i + 1}`);
+    outLines[34] = "line 35 outside";
+    put(dir, "c", `${outLines.join("\n")}\n`);
+    commit(dir, "outside change");
+    git(dir, "checkout", "-q", "main");
+    clock += 60;
+    // may stop on conflicts: the merge commit is written below
+    run(dir, ["merge", "-q", "--no-commit", "outside"]);
+    lines[34] = "line 35 outside";
+    lines[5] = "line 6 evil again";
+    write("c");
+    commit(dir, "second evil merge");
+    git(dir, "mv", "c", "e");
+    lines[1] = "line 2 renamed";
+    write("e");
+    commit(dir, "rename c to e");
+    git(dir, "tag", "v3");
+  });
+
+  for (const extra of [
+    ["--simplify-merges"],
+    ["--simplify-by-decoration"],
+    ["--simplify-merges", "--show-pulls"],
+    ["--parents"],
+    [],
+  ]) {
+    it(`-L with ${extra.join(" ") || "no simplification"}`, async () => {
+      await compare(dir, ["-L", "1,21:e", ...extra, "--format=%h %p %s", "-s"]);
+      await compare(dir, ["-L", "1,21:e", ...extra, "--oneline"]);
+      await compare(dir, ["--graph", "-L", "1,21:e", ...extra, "--oneline", "-s"]);
+    });
+  }
 });
