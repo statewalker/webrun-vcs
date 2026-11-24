@@ -1380,6 +1380,44 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     };
   }
 
+  /**
+   * diff.c's textconv_object, as `git show --textconv <rev>:<path>` runs it: the output of
+   * the path's `diff.<driver>.textconv` over the blob as checkout writes it, or undefined
+   * when no textconv applies (not a regular file, no driver, no command or no runner
+   * installed, `textconv: false`). The attributes are the worktree's alone (git show reads
+   * no index).
+   */
+  async textconvBlob(
+    path: string,
+    mode: number,
+    read: () => Promise<Uint8Array>,
+  ): Promise<Uint8Array | undefined> {
+    if ((mode & S_IFMT) !== 0o100000) return undefined;
+    const runner =
+      (this.textOptions.textconv ?? true) ? textconvRunnerOf(this.workingCopy) : undefined;
+    const filter = this.worktreeIfAny?.contentFilter as
+      | {
+          attributes?: (
+            path: string,
+            names?: readonly string[],
+            context?: { direction: "checkin"; index?: AttributesIndex },
+          ) => Promise<Map<string, true | false | string | undefined>>;
+        }
+      | undefined;
+    if (!runner || !filter?.attributes) return undefined;
+    const attrs = await filter.attributes(path, ["diff"], WITHOUT_INDEX_ATTRIBUTES);
+    const driver = diffDriverOf(attrs?.get("diff"), (key) => this.config.value(key));
+    const command = driver?.textconvCommand;
+    if (!driver || command === undefined) return undefined;
+    return runner({
+      driver: driver.name ?? "",
+      command,
+      path,
+      content: await this.smudged(path, mode, read),
+      cache: driver.cacheTextconv ?? false,
+    });
+  }
+
   /** A blob's content as checkout writes it to the worktree (the worktree's smudge filter) */
   private async smudged(
     path: string,

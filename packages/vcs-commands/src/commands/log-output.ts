@@ -1383,8 +1383,9 @@ export class LogPrinter {
     ident: PersonIdent,
     mail: boolean,
     inBody: string[] = [],
+    mailmap = true,
   ): string {
-    let { name, email } = this.mapped(ident);
+    let { name, email } = mailmap ? this.mapped(ident) : ident;
     let out = sb;
     const from = mail ? this.options.mail?.from : undefined;
     if (
@@ -1418,6 +1419,39 @@ export class LogPrinter {
         break;
     }
     return out;
+  }
+
+  /**
+   * `git show`'s `putchar('\n')` before a tag or tree header once something was shown
+   * (git's `rev.shown_one`, shared with the commits' separators)
+   */
+  separateObject(): void {
+    if (this.shownOne) this.out.text("\n");
+  }
+
+  /** `git show` showed a tag or tree header (`rev.shown_one = 1`) */
+  markShown(): void {
+    this.shownOne = true;
+  }
+
+  /** Text written as it is (a tag's or tree's header) */
+  writeText(text: string): void {
+    this.out.text(text);
+  }
+
+  /** Bytes written as they are (a blob, a tag's message, tree entry names) */
+  writeBytes(bytes: Uint8Array): void {
+    this.out.bytes(bytes);
+  }
+
+  /**
+   * builtin/log.c's show_tagger: pp_user_info of a tag's `tagger` line in the commits'
+   * format and date mode, without the mailmap (git gives its context none)
+   */
+  writeTagger(ident: PersonIdent): void {
+    if (this.format.fmt === "oneline") return;
+    const mail = this.format.fmt === "email" || this.format.fmt === "mboxrd";
+    this.out.text(this.userInfo("", "Tagger", ident, mail, [], false));
   }
 
   /** The output so far */
