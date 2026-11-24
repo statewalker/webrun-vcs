@@ -247,6 +247,23 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
   }
 
   /**
+   * Gives a command this one runs (git's child `git fetch`) this command's transports,
+   * credentials, headers, timeout, progress callbacks and hook session.
+   */
+  protected configureChild<C extends TransportCommand<unknown>>(child: C): C {
+    child.shareHooksOf(this);
+    child.setTransports(this.getTransports());
+    if (this.credentials) child.setCredentials(this.credentials);
+    if (this.headers) child.setHeaders(this.headers);
+    if (this.timeout) child.setTimeout(this.timeout);
+    if (this.gzipRequests !== undefined) child.setGzipRequests(this.gzipRequests);
+    if (this.progressCallback) child.setProgressMonitor(this.progressCallback);
+    if (this.progressMessageCallback)
+      child.setProgressMessageCallback(this.progressMessageCallback);
+    return child;
+  }
+
+  /**
    * Get transport options for passing to transport operations.
    */
   protected getTransportOptions(): TransportOptions {

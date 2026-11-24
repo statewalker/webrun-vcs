@@ -187,6 +187,51 @@ describeGit("remote commands over registered connectors", () => {
       expect(calls.length).toBe(2);
     });
 
+    it(`${scheme}: remote show queries the remote (not with -n); remote update and prune fetch through it`, async () => {
+      const [n, o] = twins();
+      for (const [d, url] of [
+        [n, "../src"],
+        [o, `${scheme}://peer/src`],
+      ] as const) {
+        git(join(root, d), "remote", "add", "origin", url);
+        git(join(root, d), "remote", "add", "second", url);
+        git(join(root, d), "fetch", "-q", "../src", "+refs/heads/*:refs/remotes/origin/*");
+        git(join(root, d), "update-ref", "refs/remotes/origin/gone", "refs/remotes/origin/main");
+      }
+      const plain = await ours(o);
+      const g = Git.fromWorkingCopy(plain.workingCopy, { transports: transportsFor(plain) });
+      const url = (d: string) => (d === n ? "../src" : `${scheme}://peer/src`);
+      const show = (d: string, text: string) => text.split(url(d)).join("<url>");
+
+      const nativeShow = git(join(root, n), "remote", "show", "origin");
+      const shown = await g.remoteShow().setRemoteNames("origin").callText();
+      expect(show(o, shown)).toBe(show(n, nativeShow));
+      expect(calls).toEqual([`${kind} git-upload-pack /src v2`]);
+
+      calls = [];
+      const nativeOffline = git(join(root, n), "remote", "show", "-n", "origin");
+      const offline = await g.remoteShow().setRemoteNames("origin").setNoQuery(true).callText();
+      expect(show(o, offline)).toBe(show(n, nativeOffline));
+      expect(calls).toEqual([]);
+
+      git(join(root, n), "remote", "prune", "origin");
+      await g.remotePrune().setRemoteNames("origin").call();
+      expect(calls).toEqual([`${kind} git-upload-pack /src v2`]);
+
+      calls = [];
+      git(join(root, n), "remote", "update");
+      const updated = await g.remoteUpdate().call();
+      expect(updated.exitCode).toBe(0);
+      expect(updated.stdout).toBe("Fetching origin\nFetching second\n");
+      expect(calls.length).toBe(2);
+      const tracking = (d: string) =>
+        git(join(root, d), "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/")
+          .split("\n")
+          .filter((l) => !/\/HEAD /.test(l))
+          .join("\n");
+      expect(tracking(o)).toBe(tracking(n));
+    });
+
     it(`${scheme}: clone`, async () => {
       const [n, o] = twins();
       rmSync(join(root, n), { recursive: true, force: true });

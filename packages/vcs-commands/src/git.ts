@@ -33,6 +33,7 @@ import {
   DiffCommand,
   EditBranchDescriptionCommand,
   FetchCommand,
+  FetchMultipleCommand,
   FmtMergeMsgCommand,
   ForEachRefCommand,
   FormatPatchCommand,
@@ -60,10 +61,14 @@ import {
   RemoteAddCommand,
   RemoteGetUrlCommand,
   RemoteListCommand,
+  RemotePruneCommand,
   RemoteRemoveCommand,
   RemoteRenameCommand,
+  RemoteSetBranchesCommand,
   RemoteSetHeadCommand,
   RemoteSetUrlCommand,
+  RemoteShowCommand,
+  RemoteUpdateCommand,
   RenameBranchCommand,
   ResetCommand,
   RestoreCommand,
@@ -1233,6 +1238,19 @@ export class Git implements Disposable {
   }
 
   /**
+   * Create a FetchMultipleCommand: `git fetch --all`, `git fetch --multiple <remote|group>...`.
+   *
+   * @example
+   * ```typescript
+   * const { stdout, stderr, exitCode } = await git.fetchMultiple().setAll(true).call();
+   * ```
+   */
+  fetchMultiple(): FetchMultipleCommand {
+    this.checkClosed();
+    return this.withTransports(new FetchMultipleCommand(this._workingCopy));
+  }
+
+  /**
    * Create a PushCommand for pushing to remotes.
    *
    * @example
@@ -1384,6 +1402,58 @@ export class Git implements Disposable {
   remoteSetHead(): RemoteSetHeadCommand {
     this.checkClosed();
     return this.withTransports(new RemoteSetHeadCommand(this._workingCopy));
+  }
+
+  /**
+   * Create a RemoteShowCommand: `git remote show [-n] <name>...`.
+   *
+   * @example
+   * ```typescript
+   * const text = await git.remoteShow().setRemoteNames("origin").callText();
+   * ```
+   */
+  remoteShow(): RemoteShowCommand {
+    this.checkClosed();
+    return this.withTransports(new RemoteShowCommand(this._workingCopy));
+  }
+
+  /**
+   * Create a RemotePruneCommand: `git remote prune [--dry-run] <name>...`.
+   *
+   * @example
+   * ```typescript
+   * await git.remotePrune().setRemoteNames("origin").call();
+   * ```
+   */
+  remotePrune(): RemotePruneCommand {
+    this.checkClosed();
+    return this.withTransports(new RemotePruneCommand(this._workingCopy));
+  }
+
+  /**
+   * Create a RemoteUpdateCommand: `git remote update [-p] [<group>|<remote>...]`.
+   *
+   * @example
+   * ```typescript
+   * const { exitCode } = await git.remoteUpdate().setPrune(true).call();
+   * ```
+   */
+  remoteUpdate(): RemoteUpdateCommand {
+    this.checkClosed();
+    return this.withTransports(new RemoteUpdateCommand(this._workingCopy));
+  }
+
+  /**
+   * Create a RemoteSetBranchesCommand: `git remote set-branches [--add] <name> <branch>...`.
+   *
+   * @example
+   * ```typescript
+   * await git.remoteSetBranches().setRemoteName("origin").setBranches("main").call();
+   * ```
+   */
+  remoteSetBranches(): RemoteSetBranchesCommand {
+    this.checkClosed();
+    return new RemoteSetBranchesCommand(this._workingCopy);
   }
 
   /**

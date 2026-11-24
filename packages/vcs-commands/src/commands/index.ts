@@ -25,6 +25,7 @@ export * from "./diff-color-config.js";
 export * from "./diff-command.js";
 export * from "./diff-textconv.js";
 export * from "./fetch-command.js";
+export * from "./fetch-multiple-command.js";
 export * from "./fmt-merge-msg-command.js";
 export * from "./format-patch-command.js";
 export * from "./fsck/index.js";
@@ -90,6 +91,7 @@ export {
   reflogSubject,
 } from "./reflog-messages.js";
 export * from "./remote-command.js";
+export * from "./remote-show-command.js";
 export * from "./reset-command.js";
 export * from "./restore-command.js";
 export * from "./rev-filter/index.js";
