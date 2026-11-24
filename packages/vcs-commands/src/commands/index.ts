@@ -12,6 +12,7 @@ export * from "./branch-upstream-command.js";
 export * from "./check-mailmap-command.js";
 export * from "./checkout-command.js";
 export * from "./checkout-paths.js";
+export * from "./cherry-command.js";
 export * from "./cherry-pick-command.js";
 export * from "./clean-command.js";
 export * from "./clone-command.js";
