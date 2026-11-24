@@ -254,9 +254,12 @@ describeGit("git switch, native twins", () => {
       run(repo, "fetch", "-q", "up");
     }
     // topic: only origin's... and up's: ambiguous
-    expect(await refusal(async () => (await open(t.ours)).switch().setName("topic").call())).toBe(
-      "fatal: 'topic' matched multiple (2) remote tracking branches",
-    );
+    // the advice before it is compared in worktree-dwim-relative-native.test.ts
+    expect(
+      (await refusal(async () => (await open(t.ours)).switch().setName("topic").call()))
+        .split("\n")
+        .at(-1),
+    ).toBe("fatal: 'topic' matched multiple (2) remote tracking branches");
     expect(nativeRefusal(t.native, "switch", "topic").split("\n").at(-1)).toBe(
       "fatal: 'topic' matched multiple (2) remote tracking branches",
     );

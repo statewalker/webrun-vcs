@@ -4,6 +4,7 @@ import {
   type ObjectId,
   type PersonIdent,
 } from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import type {
   CreatedLinkedWorktree,
   LinkedWorktrees,
@@ -12,6 +13,16 @@ import type {
 } from "@statewalker/vcs-working-tree";
 import { WorktreeError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
+import {
+  ambiguousRemoteAdvice,
+  installTracking,
+  planTracking,
+  TrackMode,
+  trackableStart,
+  uniqueTrackingName,
+  worktreeAmbiguityHints,
+} from "./branch-tracking.js";
 import { abbrevLengths, coreBool, worktreeModeTrust } from "./core-config.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
 import { checkoutFreshTree } from "./tree-restore.js";
@@ -37,7 +48,11 @@ export interface WorktreeAddResult {
   messages: string[];
   /** The post-checkout hook's exit code when it failed (git exits with it; the worktree stays) */
   hookExitCode?: number;
-  /** What git prints on stdout: the checkout's `HEAD is now at <abbrev> <subject>`, without `--quiet`. */
+  /**
+   * What git prints on stdout without `--quiet`: the new branch's tracking
+   * (`branch 'x' set up to track 'origin/x'.`), then the checkout's
+   * `HEAD is now at <abbrev> <subject>`.
+   */
   output: string[];
   /** A working copy of the new worktree. */
   workingCopy: WorkingCopy;
@@ -47,7 +62,8 @@ export interface WorktreeAddResult {
  * Add a linked worktree.
  *
  * Equivalent to `git worktree add [-f] [--detach] [--no-checkout] [--lock [--reason <r>]]
- * [--orphan] [(-b | -B) <new-branch>] <path> [<commit-ish>]`.
+ * [--orphan] [--[no-]track] [--[no-]guess-remote] [--[no-]relative-paths]
+ * [(-b | -B) <new-branch>] <path> [<commit-ish>]`.
  *
  * @example
  * ```typescript
@@ -56,6 +72,10 @@ export interface WorktreeAddResult {
  * // detached at a tag, locked
  * await git.worktreeAdd().setPath("../v1").setCommitish("v1.0").setDetach(true)
  *   .setLock(true).setLockReason("on a USB disk").call();
+ * // `git worktree add ../foo foo` with only origin/foo: branch foo tracking origin/foo
+ * await git.worktreeAdd().setPath("../foo").setCommitish("foo").call();
+ * // relative links (git 2.48+): extensions.relativeWorktrees is set
+ * await git.worktreeAdd().setPath("../rel").setRelativePaths(true).call();
  * ```
  *
  * As git's `add`: without a commit-ish the new branch is named after the path's last
@@ -72,8 +92,15 @@ export interface WorktreeAddResult {
  * HEAD and its reflog line; then, unless `--no-checkout`, the files and the index are
  * checked out (git runs `reset --hard`: ORIG_HEAD and, on a branch, the reflog line
  * `reset: moving to HEAD`). A failure removes what was created. The `post-checkout`
- * hook runs in the new worktree once it is checked out (`<null> <HEAD> 1`);
- * `--track` / `--guess-remote` are not supported.
+ * hook runs in the new worktree once it is checked out (`<null> <HEAD> 1`).
+ *
+ * Remote branches, as git's DWIM: a commit-ish that names no commit but the one
+ * remote-tracking branch of that name (`unique_tracking_name`, `checkout.defaultRemote`
+ * among several) creates a local branch from it; without a commit-ish,
+ * {@link setGuessRemote} (`worktree.guessRemote`) does the same for the name taken from the
+ * path. A new branch tracks its start as `git branch` does ({@link setTrack},
+ * `branch.autoSetupMerge`). Several matches die with git's advice in 2.5x; git 2.43
+ * ({@link setCompatibility}) takes them for no match.
  */
 export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
   private path?: string;
@@ -88,6 +115,10 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
   private orphan = false;
   private quiet = false;
   private who?: PersonIdent;
+  private track?: TrackMode;
+  private guessRemote?: boolean;
+  private relativePaths?: boolean;
+  private compatibility: "2.43" | "2.56" = "2.56";
 
   /** The new worktree's path (a path of the repository's storage, or an absolute host path). */
   setPath(path: string): this {
@@ -160,6 +191,48 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
     return this;
   }
 
+  /**
+   * `--track[=inherit]` / `--no-track`: how a new branch tracks its start (git passes it to
+   * its `git branch` child); without a new branch the add is refused.
+   */
+  setTrack(mode: TrackMode): this {
+    this.checkCallable();
+    this.track = mode;
+    return this;
+  }
+
+  /**
+   * `--[no-]guess-remote` (default `worktree.guessRemote`, false): without a commit-ish, the
+   * new branch named after the path starts at the remote-tracking branch of that name.
+   */
+  setGuessRemote(guess: boolean): this {
+    this.checkCallable();
+    this.guessRemote = guess;
+    return this;
+  }
+
+  /**
+   * `--[no-]relative-paths` (git 2.48+, default `worktree.useRelativePaths`): the link files
+   * hold relative paths and the repository gets `extensions.relativeWorktrees` (which git
+   * before 2.48 refuses: only on request).
+   */
+  setRelativePaths(relative: boolean): this {
+    this.checkCallable();
+    this.relativePaths = relative;
+    return this;
+  }
+
+  /**
+   * The git version reproduced (default 2.56). 2.43 has no relative links (the option is
+   * refused, `worktree.useRelativePaths` ignored) and takes an ambiguous remote branch name
+   * for none.
+   */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
+
   /** The identity of the reflog lines (default: the repository's `user.name` / `user.email`). */
   setIdent(who: PersonIdent): this {
     this.checkCallable();
@@ -171,6 +244,20 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
     this.checkCallable();
     this.setCallable(false);
     const worktrees = requireWorktrees(this.workingCopy, "add");
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const configBool = (key: string) => {
+      const value = config.value(key);
+      return value === undefined ? undefined : (parseGitBool(value) ?? false);
+    };
+    const legacy = this.compatibility === "2.43";
+    if (legacy && this.relativePaths !== undefined) {
+      throw new WorktreeError(`unknown option \`${this.relativePaths ? "" : "no-"}relative-paths'`);
+    }
+    const relativePaths = legacy
+      ? false
+      : (this.relativePaths ?? configBool("worktree.useRelativePaths") ?? false);
+    const guessRemote = this.guessRemote ?? configBool("worktree.guessRemote") ?? false;
+    const track = this.track;
     const path = this.path;
     if (path === undefined || path === "")
       throw new WorktreeError("worktree add: <path> is required");
@@ -180,6 +267,9 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
     }
     if (this.detach && this.orphan) {
       throw new WorktreeError("options '--orphan' and '--detach' cannot be used together");
+    }
+    if (this.orphan && track !== undefined) {
+      throw new WorktreeError("options '--orphan' and '--track' cannot be used together");
     }
     if (this.orphan && !this.checkout) {
       throw new WorktreeError("options '--orphan' and '--no-checkout' cannot be used together");
@@ -192,7 +282,7 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
     }
     const keepLocked = this.lockReason ?? (this.lock ? "added with --lock" : undefined);
 
-    let branch = this.commitish ?? "HEAD";
+    let branch = this.commitish === "-" ? "@{-1}" : (this.commitish ?? "HEAD");
     let newBranch = this.newBranch;
     let orphan = this.orphan;
     const messages: string[] = [];
@@ -208,43 +298,139 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
 
     if (orphan && newBranch === undefined) {
       newBranch = basename;
-    } else if (orphan || this.detach) {
+    } else if (orphan) {
       // nothing to guess
+    } else if (this.detach) {
+      if (branch === "HEAD") await this.canUseLocalRefs(messages);
     } else if (this.commitish === undefined && newBranch !== undefined) {
-      orphan = await this.dwimOrphan();
+      orphan = await this.dwimOrphan(messages, false, guessRemote);
     } else if (this.commitish === undefined) {
-      // DWIM: the branch named after the path, checked out if it exists, else created
+      // dwim_branch: the branch named after the path, checked out if it exists, else created
+      // (from the remote-tracking branch of that name with --guess-remote)
+      let found: string | undefined;
       if (isValidBranchName(basename) && (await this.refsStore.has(`refs/heads/${basename}`))) {
         branch = basename;
+        found = basename;
       } else {
         newBranch = basename;
-        orphan = await this.dwimOrphan();
+        if (guessRemote) {
+          found = await this.trackingName(basename, path);
+          if (found) branch = found;
+        }
       }
+      if (!found) orphan = await this.dwimOrphan(messages, true, guessRemote);
+    } else if (newBranch !== undefined && !legacy) {
+      if (branch === "HEAD") await this.canUseLocalRefs(messages);
+    } else {
+      // (git 2.43 guesses here even with -b, and the guess replaces the -b branch's name)
+      if ((await this.commitOf(branch)) === undefined) {
+        const remote = await this.trackingName(branch, path);
+        if (remote) {
+          newBranch = branch;
+          branch = remote;
+        }
+      }
+      if (branch === "HEAD") await this.canUseLocalRefs(messages);
     }
 
     const commitId = await this.commitOf(branch);
-    if (!orphan && commitId === undefined) throw new WorktreeError(`invalid reference: ${branch}`);
+    if (!orphan && commitId === undefined) {
+      throw new WorktreeError(`invalid reference: ${branch}`, messages);
+    }
 
     if (!this.quiet) messages.push(await this.preparingLine(branch, newBranch));
 
     if (orphan) {
       branch = newBranch ?? basename;
     } else if (newBranch !== undefined && commitId !== undefined) {
-      await this.createBranch(worktrees, newBranch, branch, commitId);
+      await this.createBranch(worktrees, newBranch, branch, commitId, messages, output);
       branch = newBranch;
+    } else if (track !== undefined) {
+      throw new WorktreeError("--[no-]track can only be used if a new branch is created", messages);
     }
 
-    return this.addWorktree(worktrees, path, branch, orphan, keepLocked, messages, output);
+    return this.addWorktree(
+      worktrees,
+      path,
+      branch,
+      orphan,
+      keepLocked,
+      relativePaths,
+      messages,
+      output,
+    );
   }
 
-  /** git's `dwim_orphan` without remotes: no valid HEAD and no branch at all infers `--orphan`. */
-  private async dwimOrphan(): Promise<boolean> {
-    if ((await this.refsStore.resolve("HEAD"))?.objectId) return false;
+  /**
+   * git's `unique_tracking_name` for `worktree add`: the remote-tracking branch `name` is
+   * guessed from, undefined when none; several without `checkout.defaultRemote` die with
+   * git's advice (2.5x) or count as none (2.43).
+   */
+  private async trackingName(name: string, path: string): Promise<string | undefined> {
+    const { ref, remotes } = await uniqueTrackingName(this.workingCopy, this.refsStore, name);
+    if (ref) return ref;
+    if (remotes.length > 1 && this.compatibility !== "2.43") {
+      const hints =
+        !this.quiet && ambiguousRemoteAdvice(this.workingCopy)
+          ? worktreeAmbiguityHints(path, name, remotes)
+          : [];
+      throw new WorktreeError(
+        `'${name}' matched multiple (${remotes.length}) remote tracking branches`,
+        hints,
+      );
+    }
+    return undefined;
+  }
+
+  /**
+   * git's `can_use_local_refs`: HEAD resolves, or some branch does (then, unless quiet, the
+   * warning that HEAD is invalid).
+   */
+  private async canUseLocalRefs(messages: string[]): Promise<boolean> {
+    if ((await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId) return true;
     for await (const ref of this.refsStore.list("refs/heads/")) {
-      if ("objectId" in ref && ref.objectId) return false;
+      if ("objectId" in ref && ref.objectId) {
+        if (!this.quiet) {
+          messages.push("warning: HEAD points to an invalid (or orphaned) reference.", "");
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * git's `dwim_orphan`: no valid HEAD, no branch and (`remote` with --guess-remote) no
+   * remote-tracking branch infers `--orphan`; a remote with nothing fetched refuses the add
+   * unless forced.
+   */
+  private async dwimOrphan(
+    messages: string[],
+    remote: boolean,
+    guessRemote: boolean,
+  ): Promise<boolean> {
+    if (await this.canUseLocalRefs(messages)) return false;
+    if (remote && guessRemote) {
+      for await (const ref of this.refsStore.list("refs/remotes/")) {
+        if ("objectId" in ref && ref.objectId) return false;
+      }
+      const config = RemoteConfigStore.from(this.workingCopy);
+      if (this.force === 0 && config.configuredNames().length > 0) {
+        throw new WorktreeError(
+          "No local or remote refs exist despite at least one remote\npresent, stopping; use 'add -f' to override or fetch a remote first",
+          messages,
+        );
+      }
+    }
+    if (!this.quiet) messages.push("No possible source branch, inferring '--orphan'");
+    if (this.track !== undefined) {
+      throw new WorktreeError("options '--orphan' and '--track' cannot be used together", messages);
     }
     if (!this.checkout) {
-      throw new WorktreeError("options '--orphan' and '--no-checkout' cannot be used together");
+      throw new WorktreeError(
+        "options '--orphan' and '--no-checkout' cannot be used together",
+        messages,
+      );
     }
     return true;
   }
@@ -289,12 +475,17 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
     return this.reflogLine("", this.who).ident;
   }
 
-  /** `git branch [--force] <new> <start>`, with git's reflog line. */
+  /**
+   * `git branch [--force] [--quiet] <new> <start> [--[no-]track]`, with git's reflog line and
+   * the tracking `create_branch` sets up (its message on `output` unless quiet).
+   */
   private async createBranch(
     worktrees: LinkedWorktrees,
     name: string,
     start: string,
     commitId: ObjectId,
+    messages: string[],
+    output: string[],
   ): Promise<void> {
     if (!isValidBranchName(name)) throw new WorktreeError(`'${name}' is not a valid branch name`);
     const ref = `refs/heads/${name}`;
@@ -311,12 +502,43 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
         );
       }
     }
+    // dwim_branch_start: the branch the start names, refused under --track when none
+    const mode = this.track ?? TrackMode.DEFAULT;
+    const startRef = await this.childStep(messages, () =>
+      trackableStart(this.workingCopy, this.refsStore, start, mode),
+    );
     const message = exists ? `branch: Reset to ${start}` : `branch: Created from ${start}`;
     const result = await this.refsStore.batch([{ name: ref, new: commitId, noDeref: true }], {
       message,
       ...(this.ident() ? { ident: this.ident() } : {}),
     });
     if (!result.ok) throw new WorktreeError(`cannot create branch '${name}'`);
+    if (startRef === undefined) return;
+    // setup_tracking, once the branch is written (a refusal leaves it, as git's child does)
+    const { plan, warnings } = await this.childStep(messages, async () =>
+      planTracking(this.workingCopy, name, startRef, mode, { compatibility: this.compatibility }),
+    );
+    messages.push(...warnings);
+    if (!plan) return;
+    const lines = await installTracking(this.workingCopy, name, plan);
+    if (!this.quiet) output.push(...lines);
+  }
+
+  /**
+   * A step of git's `git branch` child: its death (`fatal: ...` with hints, whatever their
+   * order) becomes a WorktreeError carrying what was printed before.
+   */
+  private async childStep<T>(messages: string[], step: () => Promise<T>): Promise<T> {
+    try {
+      return await step();
+    } catch (error) {
+      if (error instanceof WorktreeError || !(error instanceof Error)) throw error;
+      const lines = error.message.split("\n");
+      const at = lines.findIndex((line) => line.startsWith("fatal: "));
+      if (at < 0) throw error;
+      const rest = [lines[at].slice("fatal: ".length), ...lines.slice(at + 1)].join("\n");
+      throw new WorktreeError(rest, [...messages, ...lines.slice(0, at)]);
+    }
   }
 
   /** git's `add_worktree`. */
@@ -326,6 +548,7 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
     branch: string,
     orphan: boolean,
     keepLocked: string | undefined,
+    relativePaths: boolean,
     messages: string[],
     output: string[],
   ): Promise<WorktreeAddResult> {
@@ -353,6 +576,7 @@ export class WorktreeAddCommand extends GitCommand<WorktreeAddResult> {
         head,
         ...(keepLocked !== undefined ? { lockReason: keepLocked } : {}),
         ...(this.ident() ? { ident: this.ident() } : {}),
+        ...(relativePaths ? { relativePaths } : {}),
       });
     } catch (error) {
       throw error instanceof WorktreeError

@@ -285,6 +285,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private onlyMergeOnSwitchingBranches = false;
   private track = TrackMode.DEFAULT;
   private guess?: boolean;
+  private adviceCommand: "checkout" | "switch" = "checkout";
   private protectUntracked = false;
   private merge = false;
   private overlay?: boolean;
@@ -438,6 +439,19 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   setGuess(guess: boolean): this {
     this.checkCallable();
     this.guess = guess;
+    return this;
+  }
+
+  /**
+   * The command git's advice names when the guess is ambiguous (`git checkout --track
+   * <remote>/<name>` or `git switch --track ...`); `SwitchCommand` sets `switch`.
+   *
+   * @param command The command named
+   * @returns this for chaining
+   */
+  setAdviceCommand(command: "checkout" | "switch"): this {
+    this.checkCallable();
+    this.adviceCommand = command;
     return this;
   }
 
@@ -1724,7 +1738,10 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     const config = RemoteConfigStore.from(this.workingCopy);
     const guess = this.guess ?? parseGitBool(config.value("checkout.guess")) ?? true;
     if (!this.detach && guess && isValidBranchName(arg)) {
-      const remote = await guessRemoteBranch(this.workingCopy, this.refsStore, arg);
+      const remote = await guessRemoteBranch(this.workingCopy, this.refsStore, arg, {
+        command: this.adviceCommand,
+        compatibility: this.patchCompatibility,
+      });
       const remoteId = remote ? await this.resolveCommitId(remote) : undefined;
       if (remote && remoteId) {
         return {
@@ -1737,7 +1754,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         };
       }
     }
-    throw new RefNotFoundError(given);
+    throw new RefNotFoundError(given, `fatal: invalid reference: ${given}`);
   }
 
   /**
