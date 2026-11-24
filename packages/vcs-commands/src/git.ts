@@ -70,9 +70,13 @@ import {
   ShowCurrentBranchCommand,
   SparseCheckoutCommand,
   StashApplyCommand,
+  StashBranchCommand,
   StashCreateCommand,
   StashDropCommand,
   StashListCommand,
+  StashPopCommand,
+  StashShowCommand,
+  StashStoreCommand,
   StatusCommand,
   SubmoduleDeinitCommand,
   SubmoduleForeachCommand,
@@ -1472,6 +1476,59 @@ export class Git implements Disposable {
   stashList(): StashListCommand {
     this.checkClosed();
     return new StashListCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a StashPopCommand: `git stash pop`, the stash applied then dropped (kept on
+   * conflicts).
+   *
+   * @example
+   * ```typescript
+   * const result = await git.stashPop().call();
+   * ```
+   */
+  stashPop(): StashPopCommand {
+    this.checkClosed();
+    return new StashPopCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a StashShowCommand: `git stash show`, the stash's change as a diff.
+   *
+   * @example
+   * ```typescript
+   * const stat = await git.stashShow().call();
+   * ```
+   */
+  stashShow(): StashShowCommand {
+    this.checkClosed();
+    return new StashShowCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a StashBranchCommand: `git stash branch <name> [<stash>]`.
+   *
+   * @example
+   * ```typescript
+   * await git.stashBranch().setBranchName("wip").call();
+   * ```
+   */
+  stashBranch(): StashBranchCommand {
+    this.checkClosed();
+    return new StashBranchCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a StashStoreCommand: `git stash store`, a created stash recorded in `refs/stash`.
+   *
+   * @example
+   * ```typescript
+   * await git.stashStore().setCommit(id).call();
+   * ```
+   */
+  stashStore(): StashStoreCommand {
+    this.checkClosed();
+    return new StashStoreCommand(this._workingCopy);
   }
 
   // ============ Component Access ============

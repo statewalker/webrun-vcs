@@ -235,6 +235,21 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private lastWalk: RevTable | undefined;
   /** Set while {@link callBytes} collects the walk for its output */
   private outputWalk: OutputWalk | undefined;
+  /** `-g <ref>`: the reflog walked instead of the history */
+  private reflogWalkRef?: string;
+
+  /**
+   * `git log -g <ref>` (`--walk-reflogs`) for the printed log ({@link callText}): the
+   * commits of `ref`'s reflog, newest entry first, each shown with its entry (`Reflog:`
+   * lines, `<sel>: <message>` under `--oneline`, `%gd`/`%gD`/`%gs`/`%gn`/`%ge` in a format,
+   * `<ref>@{<date>}` under an explicit `--date`). `-n`, `--skip` and the commit filters
+   * (`--grep`, `--author`...) apply; entries whose object is no commit are passed over.
+   */
+  setReflogWalk(ref: string): this {
+    this.checkCallable();
+    this.reflogWalkRef = ref;
+    return this;
+  }
 
   /**
    * Add a starting commit for the log.
@@ -1208,7 +1223,10 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const shownIds = new Set<ObjectId>();
     const unwalkedShown = new Set<ObjectId>();
     let entries: LogOutputEntry[];
-    if (topo) {
+    if (this.reflogWalkRef !== undefined) {
+      entries = await this.reflogEntries(this.reflogWalkRef);
+      for (const e of entries) shownIds.add(e.id);
+    } else if (topo) {
       this.outputWalk = { topo, rewrite: graph, entries: [] };
       for await (const _ of await this.call()) {
         // the output walk collects its commits
@@ -1252,6 +1270,51 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     }
     if (follow) this.paths = paths;
     return printer.result();
+  }
+
+  /**
+   * The entries of a reflog walk (reflog-walk.c's next_reflog_entry over one ref): newest
+   * first, each entry's new commit, filtered and counted as the walk's commits.
+   */
+  private async reflogEntries(ref: string): Promise<LogOutputEntry[]> {
+    this.checkCallable();
+    this.setCallable(false);
+    readDiffSubmoduleConfig(this.workingCopy);
+    this.activeFilter = await this.buildCommitFilter();
+    const reader = await this.refsStore.getReflog?.(ref);
+    const lines = reader ? await reader.getReverseEntries() : [];
+    const out: LogOutputEntry[] = [];
+    let skip = this.skip;
+    const max = this.maxCount;
+    for (let index = 0; index < lines.length; index++) {
+      if (max !== undefined && out.length >= max) break;
+      const line = lines[index] as (typeof lines)[number];
+      const commit = await this.walkCommits.load(line.newId).catch(() => undefined);
+      if (!commit) continue;
+      const filter = this.activeFilter;
+      if (filter) {
+        const view: FilteredCommit = {
+          id: line.newId,
+          parentCount: commit.parents.length,
+          commitTime: commit.committer.timestamp,
+          raw: async () => this.rawCommit(line.newId),
+          commit: async () => commit,
+        };
+        if (!(await filter.include(view))) continue;
+      }
+      if (skip > 0) {
+        skip--;
+        continue;
+      }
+      const message = line.comment.endsWith("\n") ? line.comment.slice(0, -1) : line.comment;
+      out.push({
+        id: line.newId,
+        commit,
+        parents: commit.parents,
+        reflog: { ref, index, message, who: line.who },
+      });
+    }
+    return out;
   }
 
   /** What the log printer reads of the repository. */

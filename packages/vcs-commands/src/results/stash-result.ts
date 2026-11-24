@@ -59,6 +59,13 @@ export interface StashApplyResult {
   readonly conflicts?: string[];
 
   /**
+   * What the merge printed on stdout (merge-ort's `Auto-merging x`, `CONFLICT (...)` lines,
+   * or `Already up to date.`), line by line, as `git stash apply` prints them before its
+   * status.
+   */
+  readonly messages?: string[];
+
+  /**
    * What the apply printed on stderr while applying the sparse checkout's patterns, line
    * by line; absent when there was nothing to say.
    */

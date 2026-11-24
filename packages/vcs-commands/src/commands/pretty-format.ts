@@ -1026,7 +1026,7 @@ async function formatOne(
       const reflog = options.reflog;
       switch (fmt[at + 1]) {
         case "d":
-          st.sb += reflog?.selector ?? "";
+          st.sb += reflog?.shortSelector ?? reflog?.selector ?? "";
           return 2;
         case "D":
           st.sb += reflog?.selector ?? "";
