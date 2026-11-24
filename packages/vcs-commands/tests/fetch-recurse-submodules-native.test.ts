@@ -469,6 +469,17 @@ git update-ref refs/changes/custom3 HEAD`),
     ]);
   });
 
+  it("submodule.fetchJobs: any count fetches in git's one-job order; a negative one dies", async () => {
+    const t = twins(T5526_SETUP);
+    await expectTwins(t, [
+      up("add_submodule_commits"),
+      fetch(["--recurse-submodules"], (c) => c.setRecurseSubmodules(true), {
+        GIT_CONFIG_PARAMETERS: "'submodule.fetchJobs'='1'",
+      }),
+      fetch([], (c) => c, { GIT_CONFIG_PARAMETERS: "'submodule.fetchJobs'='-1'" }),
+    ]);
+  });
+
   it('t5526-fetch-submodules.sh: "fetching submodule into a broken repository"', async () => {
     const t = twins(
       `git init -q src; (cd src; git init -q sub; git -C sub commit -q --allow-empty -m "initial in sub"

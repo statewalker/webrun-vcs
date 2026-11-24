@@ -1145,6 +1145,14 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       } else mode = parseFetchRecurseSubmodules("fetch.recursesubmodules", entry.text);
     }
     if (this.recurseSubmodules !== undefined) mode = this.recurseSubmodules;
+    // git_fetch_config: submodule.fetchJobs (how many fetches run at once; ours run one by
+    // one, git's order with one job) dies when negative
+    const jobs = store.value("submodule.fetchjobs");
+    if (jobs !== undefined && Number.isInteger(Number(jobs)) && Number(jobs) < 0) {
+      throw new GitApiError("fatal: negative values not allowed for submodule.fetchJobs", {
+        exitCode: 128,
+      });
+    }
     if (!this.worktreeAccess) return undefined;
     let model: SubmoduleModel | undefined;
     if (mode !== "no") {
