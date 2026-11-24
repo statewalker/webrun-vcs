@@ -20,7 +20,8 @@ import { LogCommand } from "./log-command.js";
 import { mailFromHeader, mailSubjectLine } from "./log-output.js";
 import { configValue } from "./merge-config.js";
 import { type PatchIdChange, patchIdOfChanges } from "./patch-id.js";
-import { sanitizedSubject, wrapText } from "./pretty-format.js";
+import { sanitizedSubject } from "./pretty-format.js";
+import { commitSubject, outputEncoderFor, Shortlog } from "./shortlog.js";
 import { trailerConfigOf } from "./trailers.js";
 
 /** One file `git format-patch` writes (or one mail of `--stdout`). */
@@ -1013,40 +1014,27 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     text += "\n";
     const parts: Uint8Array[] = [new TextEncoder().encode(text)];
     text = "";
-    // shortlog: authors in byte order, their subjects oldest first, wrapped at 72; each
-    // commit's name and subject in the log output encoding (shortlog_add_commit), as
-    // stored where they do not convert (logmsg_reencode)
-    const byAuthor = new Map<string, string[]>();
-    const encoderOf = new Map<string, (s: string) => Uint8Array>();
+    // generate_shortlog_cover_letter: authors (%aN, through the mailmap) in byte order, their
+    // subjects oldest first, wrapped at 72; each commit's name and subject in the log output
+    // encoding (shortlog_add_commit), as stored where they do not convert (logmsg_reencode)
+    const mailmap = await this.readMailmap();
+    const shortlog = new Shortlog<(s: string) => Uint8Array>({
+      wrap: { width: MAIL_DEFAULT_WRAP, indent1: 2, indent2: 4 },
+    });
     for (const [k, c] of commits.entries()) {
       if (!c) continue;
       const utf8 = await this.utf8AuthorAndMessage(list[k] as ObjectId, c);
-      const name = utf8.name;
-      const encoder = outputEncoder(mail.outputEncoding, `${name}\n${utf8.message}`, utf8.stored);
-      let subject = subjectLine(utf8.message);
-      if (subject.startsWith("[PATCH")) {
-        const eob = subject.indexOf("]");
-        if (eob >= 0) subject = subject.slice(eob + 1).replace(/^[ \t]+/, "");
-      }
-      const listFor = byAuthor.get(name) ?? [];
-      listFor.push(subject);
-      byAuthor.set(name, listFor);
-      encoderOf.set(`${name}\n${listFor.length - 1}`, encoder);
-      if (!encoderOf.has(name)) encoderOf.set(name, encoder);
+      const name = mailmap.map(utf8.name, c.author.email).name;
+      const encoder = outputEncoderFor(
+        mail.outputEncoding,
+        `${name}\n${utf8.message}`,
+        utf8.stored,
+      );
+      // shortlog_add_commit: `<none>` for an empty subject
+      shortlog.insert(name, commitSubject(utf8.message) || "<none>", encoder);
     }
-    const names = [...byAuthor.keys()].sort(compareBytes);
     const utf8Encode = (x: string) => new TextEncoder().encode(x);
-    for (const name of names) {
-      const subjects = byAuthor.get(name) as string[];
-      parts.push((encoderOf.get(name) ?? utf8Encode)(`${name} (${subjects.length}):\n`));
-      for (let j = subjects.length; j >= 1; j--)
-        parts.push(
-          (encoderOf.get(`${name}\n${j - 1}`) ?? utf8Encode)(
-            `${wrapText(subjects[j - 1] as string, 2, 4, MAIL_DEFAULT_WRAP)}\n`,
-          ),
-        );
-      parts.push(utf8Encode("\n"));
-    }
+    for (const piece of shortlog.pieces()) parts.push((piece.tag ?? utf8Encode)(piece.text));
     if (origin) {
       const originTree = (await this.commits.load(origin))?.tree;
       const headTree = commits[0]?.tree;
@@ -1142,30 +1130,6 @@ function maybeBool(value: string): boolean | undefined {
   return undefined;
 }
 
-const LATIN1_NAME = /^(iso[-_]?8859-1|iso8859-1|latin-?1|l1|iso-ir-100|cp819|ibm819|csisolatin1)$/i;
-
-const latin1Bytes = (s: string) => {
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-  return out;
-};
-
-/**
- * How a commit's text is written in the log output encoding: UTF-8 or ISO-8859-1 (when
- * every character converts); otherwise in the encoding the commit is stored in, as git
- * keeps a message iconv cannot convert.
- */
-function outputEncoder(output: string, text: string, stored: string): (s: string) => Uint8Array {
-  const utf8 = (s: string) => new TextEncoder().encode(s);
-  const encoderFor = (charset: string) =>
-    /^utf-?8$/i.test(charset)
-      ? utf8
-      : LATIN1_NAME.test(charset) && [...text].every((ch) => (ch.codePointAt(0) ?? 0) <= 0xff)
-        ? latin1Bytes
-        : undefined;
-  return encoderFor(output) ?? encoderFor(stored) ?? utf8;
-}
-
 /**
  * pretty.c's format_subject: the first paragraph's lines (each without its trailing
  * blanks; a blank line, the first one too, ends it) joined by a space, and what follows
@@ -1196,24 +1160,6 @@ function linesWithEnds(text: string): string[] {
     at = end;
   }
   return out;
-}
-
-function subjectLine(message: string): string {
-  const lines = message.split("\n");
-  let at = 0;
-  while (at < lines.length && (lines[at] as string).trim() === "") at++;
-  const parts: string[] = [];
-  for (; at < lines.length && (lines[at] as string).trim() !== ""; at++)
-    parts.push((lines[at] as string).trim());
-  return parts.join(" ");
-}
-
-function compareBytes(a: string, b: string): number {
-  const x = encodeGitPath(a);
-  const y = encodeGitPath(b);
-  for (let i = 0; i < Math.min(x.length, y.length); i++)
-    if (x[i] !== y[i]) return (x[i] as number) - (y[i] as number);
-  return x.length - y.length;
 }
 
 /** `clean_message_id`: the id without its angle brackets and surrounding blanks. */

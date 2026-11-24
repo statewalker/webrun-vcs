@@ -54,7 +54,6 @@ import {
 } from "./git-ident.js";
 import { IndexAdder, readGitlinkHead } from "./index-adder.js";
 import { reencodedCommitParts } from "./log-output.js";
-import { readRepositoryMailmap } from "./mailmap.js";
 import {
   flatTree,
   OperationState,
@@ -163,6 +162,8 @@ export interface CommitResult extends Commit {
  * ```
  */
 export class CommitCommand extends GitCommand<CommitResult> {
+  /** git's `error:` lines that do not stop the commit ({@link getWarnings}) */
+  private readonly stderrLines: string[] = [];
   private message?: string;
   private author?: PersonIdent;
   private committer?: PersonIdent;
@@ -1328,29 +1329,6 @@ export class CommitCommand extends GitCommand<CommitResult> {
     if (this.forceDate) this.forcedDate();
   }
 
-  /** A blob's bytes, undefined when it cannot be read. */
-  private async readBlobBytes(id: ObjectId): Promise<Uint8Array | undefined> {
-    try {
-      const content = await this.blobs.load(id);
-      if (!content) return undefined;
-      const chunks: Uint8Array[] = [];
-      let size = 0;
-      for await (const c of content) {
-        chunks.push(c);
-        size += c.length;
-      }
-      const out = new Uint8Array(size);
-      let at = 0;
-      for (const c of chunks) {
-        out.set(c, at);
-        at += c.length;
-      }
-      return out;
-    } catch {
-      return undefined;
-    }
-  }
-
   /**
    * `--date` (parse_force_date): the date as `parse_date` reads it, else as `approxidate`
    * does, refused as git refuses it.
@@ -1368,6 +1346,14 @@ export class CommitCommand extends GitCommand<CommitResult> {
   }
 
   /**
+   * git's `error:` lines that did not stop the command (the mailmap's, read for an
+   * `--author` that is no `Name <email>`), in order; also after a failure.
+   */
+  getWarnings(): string[] {
+    return [...this.stderrLines];
+  }
+
+  /**
    * builtin/commit.c's find_author_by_nickname: the first commit of `rev-list --all -i
    * --author=<name>` (newest first, the mailmap applied before matching) gives `%aN <%aE>`.
    */
@@ -1382,18 +1368,10 @@ export class CommitCommand extends GitCommand<CommitResult> {
         `fatal: '${name}': ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    const config = RemoteConfigStore.from(this.workingCopy);
-    const mailmap = await readRepositoryMailmap({
-      config: (key) => config.value(key),
-      worktree: this.worktreeAccess,
-      environment: hostEnvironmentOf(this.workingCopy),
-      readBlobNamed: async (blob) => {
-        const id = await this.revisionResolver()
-          .resolve(blob)
-          .catch(() => undefined);
-        return id ? this.readBlobBytes(id) : undefined;
-      },
-    });
+    // rev.mailmap's read; pretty.c reads it again for the `%aN <%aE>` of the match
+    const mailmapErrors: string[] = [];
+    const mailmap = await this.readMailmap((line) => mailmapErrors.push(line));
+    this.stderrLines.push(...mailmapErrors);
     const encoder = new TextEncoder();
     // revision.c's walk of --all: refs under refs/ in name order, then HEAD, tags peeled;
     // commits come out by commit date, newest first
@@ -1437,6 +1415,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
       if (!next) break;
       const who = mailmap.map(next.commit.author.name, next.commit.author.email);
       if (pattern.test(encoder.encode(`${who.name} <${who.email}>`))) {
+        this.stderrLines.push(...mailmapErrors);
         return `${who.name} <${who.email}>`;
       }
       for (const parent of next.commit.parents) await put(parent);
