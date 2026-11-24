@@ -301,4 +301,20 @@ describeGit("push --mirror (t5517-push-mirror.sh)", () => {
     await push(t, "--mirror", "--dry-run", "up");
     await push(t, "--mirror", "up");
   });
+
+  // do_push: remote.<name>.push applies under --mirror too; send_mirror deletes the rest
+  it("a mirror push takes remote.<name>.push as its refspecs", async () => {
+    for (const how of ["config", "flag"] as const) {
+      const t = mkRepoPair();
+      commit(t, "main", "foo", "one\n", "one");
+      both(t, "main", "tag", "one");
+      await push(t, "up", "main", "one");
+      if (how === "config") both(t, "main", "config", "remote.up.mirror", "true");
+      both(t, "main", "config", "remote.up.push", "refs/heads/*:refs/heads/*");
+      both(t, "main", "tag", "-d", "one");
+      both(t, "main", "tag", "two");
+      both(t, "main", "update-ref", "refs/remotes/origin/main", "main");
+      await (how === "config" ? push(t, "up") : push(t, "--mirror", "up"));
+    }
+  });
 });

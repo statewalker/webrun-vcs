@@ -1252,7 +1252,8 @@ export class PushCommand extends TransportCommand<PushResult> {
   }
 
   /**
-   * The refspecs to push: `--mirror` (`:` over every ref, see `PushClientOptions.mirror`),
+   * The refspecs to push: `--mirror` (`remote.<name>.push`, else `:` over every ref; see
+   * `PushClientOptions.mirror`),
    * `--tags`, the refspecs
    * given (`givenRefspecs`), `--all` (every branch); else the remote's configured push
    * refspecs; else what `push.default` says (git's builtin/push.c
@@ -1275,15 +1276,20 @@ export class PushCommand extends TransportCommand<PushResult> {
     defaults: { setUpstream: boolean },
     compatibility: "2.43" | "2.56",
   ): Promise<string[]> {
-    // --mirror: ":" over every ref (only a mirror remote's --tags narrows it, in 2.5x)
-    if (mirror) return this.pushTags ? ["refs/tags/*:refs/tags/*"] : [":"];
+    const store = RemoteConfigStore.from(this.workingCopy);
+    // --mirror: do_push's refspecs (a mirror remote's --tags in 2.5x, else remote.<name>.push),
+    // else ":" over every ref; send_mirror then deletes every remote ref they leave out
+    if (mirror) {
+      if (this.pushTags) return ["refs/tags/*:refs/tags/*"];
+      const configured = store.isConfigured(this.remote) ? store.pushRefspecs(this.remote) : [];
+      return configured.length > 0 ? configured : [":"];
+    }
     if (this.pushAll) return ["refs/heads/*:refs/heads/*"];
     const specs: string[] = [];
     if (this.pushTags) specs.push("refs/tags/*:refs/tags/*");
     specs.push(...(await this.givenRefspecs()));
     if (specs.length > 0) return specs;
 
-    const store = RemoteConfigStore.from(this.workingCopy);
     if (store.isConfigured(this.remote)) {
       const configured = store.pushRefspecs(this.remote);
       if (configured.length > 0) return configured;
