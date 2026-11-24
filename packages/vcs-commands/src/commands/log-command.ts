@@ -85,7 +85,12 @@ import {
   treePathspec,
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
-import { type DecorationPalette, loadRefDecorations } from "./pretty-format.js";
+import {
+  type DecorationPalette,
+  type LoadRefDecorationsOptions,
+  loadRefDecorations,
+  type RefDecorations,
+} from "./pretty-format.js";
 import { openReflogWalk, walkReflogs } from "./reflog-walk.js";
 import { RemergeTreeCommand, remergeObjectsView } from "./remerge-diff.js";
 import {
@@ -130,11 +135,12 @@ interface PendingCommit {
 
 /** A commit of the walk as the log printer takes it. */
 function outputEntry(c: LogResult): LogOutputEntry {
-  const { id, boundary, source, left, patchSame, reflog: _reflog, ...commit } = c;
+  const { id, boundary, source, left, patchSame, reflog: _reflog, savedParents, ...commit } = c;
   return {
     id,
     commit,
     parents: c.parents,
+    ...(savedParents ? { savedParents } : {}),
     ...(boundary ? { boundary: true } : {}),
     ...(source !== undefined ? { source } : {}),
     ...(left ? { left: true } : {}),
@@ -182,6 +188,11 @@ export interface LogResult extends Commit {
   source?: string;
   /** In a reflog walk ({@link LogCommand.addReflogWalk}), the entry the commit is listed for */
   reflog?: LogReflogEntry;
+  /**
+   * The parents before {@link LogCommand.setParents} rewrote `parents` (git's saved parents,
+   * which `--full-diff` diffs against)
+   */
+  savedParents?: ObjectId[];
 }
 
 /**
@@ -379,6 +390,29 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private cherryMark = false;
   /** `--cherry`: no merges (git's max_parents 1) */
   private cherry = false;
+  /** `--simplify-merges` (and `--simplify-by-decoration`) */
+  private simplifyMerges = false;
+  /** `--simplify-by-decoration` */
+  private simplifyByDecoration = false;
+  /** git's `dense`: `--dense` (the default), off with `--sparse` */
+  private dense = true;
+  /** `--show-pulls` */
+  private showPulls = false;
+  /** `--parents` (git's `rewrite_parents` by itself) */
+  private rewriteParents = false;
+  /** `--ancestry-path` without a commit: the bottom commits are the ones */
+  private ancestryPathImplicit = false;
+  /** `--ancestry-path=<commit>`: the commits given */
+  private readonly ancestryPathCommits: ObjectId[] = [];
+  /**
+   * Commits a revision reaches through an annotated tag `--ancestry-path=<tag>` names: the
+   * tag's ANCESTRY_PATH passes to them (handle_commit's `object->flags |= flags`)
+   */
+  private readonly ancestryPathPeeled: ObjectId[] = [];
+  /** `git log --reverse` collects the walk itself: shown commits keep their parents */
+  private keepShownParents = false;
+  /** Loads the decorations `--simplify-by-decoration` keeps (the log's filter), when set */
+  private decorationLoader?: () => Promise<RefDecorations>;
 
   /**
    * The order of the commits ({@link LogOrder}); undefined is git's default, newest commit
@@ -719,6 +753,86 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
+   * `--simplify-merges`: a path-limited walk keeps every parent of a merge (as
+   * {@link setFullHistory}), then removes the merges whose parents simplify to one commit and
+   * the parents another parent reaches (revision.c's simplify_merges). Commits come in
+   * topological order (`--topo-order` unless another order is set), with their parents
+   * rewritten past the commits not shown.
+   */
+  setSimplifyMerges(simplify: boolean): this {
+    this.checkCallable();
+    this.simplifyMerges = simplify;
+    return this;
+  }
+
+  /**
+   * `--simplify-by-decoration`: only commits a ref names (git's ref decorations: every ref and
+   * HEAD, or `git log`'s decoration filter in {@link callText}), commits that change the
+   * paths when paths are given, and merges tying them together; merges simplified as
+   * {@link setSimplifyMerges}.
+   */
+  setSimplifyByDecoration(simplify: boolean): this {
+    this.checkCallable();
+    this.simplifyByDecoration = simplify;
+    return this;
+  }
+
+  /**
+   * `--dense` (true, the default) / `--sparse` (false): with `--sparse` a path-limited walk
+   * shows every commit it walks, also those that change none of the paths (merges are still
+   * simplified to the parent they match).
+   */
+  setDense(dense: boolean): this {
+    this.checkCallable();
+    this.dense = dense;
+    return this;
+  }
+
+  /**
+   * `--show-pulls`: a merge that differs from its first parent at the paths but matches
+   * another parent is shown too (it "pulled" the change into the first-parent history).
+   */
+  setShowPulls(showPulls: boolean): this {
+    this.checkCallable();
+    this.showPulls = showPulls;
+    return this;
+  }
+
+  /**
+   * `--parents`: each commit's `parents` are the ones the walk shows (rewritten past the
+   * commits a path-limited walk leaves out, as git's `rewrite_parents`), and TREESAME merges
+   * of two relevant lines are kept to tie them together.
+   */
+  setParents(parents: boolean): this {
+    this.checkCallable();
+    this.rewriteParents = parents;
+    return this;
+  }
+
+  /**
+   * `--ancestry-path`: of `A..B`, only the commits that are descendants of an excluded
+   * (bottom) commit and ancestors of B. A walk without bottom commits fails (`--ancestry-path
+   * given but there are no bottom commits`). Turns history simplification off, as
+   * {@link setFullHistory}.
+   */
+  setAncestryPath(ancestryPath: boolean): this {
+    this.checkCallable();
+    this.ancestryPathImplicit = ancestryPath;
+    return this;
+  }
+
+  /**
+   * `--ancestry-path=<commit>` (repeatable): only the commits that are the commit, its
+   * ancestors or its descendants (of any commit given). A tag is peeled: its commit then
+   * keeps only its descendants, as git marks the tag object and not the commit.
+   */
+  addAncestryPath(commit: ObjectId): this {
+    this.checkCallable();
+    this.ancestryPathCommits.push(canonicalObjectId(commit));
+    return this;
+  }
+
+  /**
    * Follow only the first parent on merges.
    *
    * Useful for seeing the linear history of a branch.
@@ -980,10 +1094,15 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const pending: PendingCommit[] = [];
     for (let i = 0; i <= this.pending.length; i++) {
       if (this.includeAll && i === this.allAt) {
-        for (const { id, name } of await this.getAllRefs())
+        for (const { id, name, raw } of await this.getAllRefs()) {
+          if (raw !== id && this.ancestryPathCommits.includes(raw))
+            this.ancestryPathPeeled.push(id);
           pending.push({ id, exclude: false, name });
+        }
       }
       const e = this.pending[i];
+      if (e && e.id !== (await this.peelToCommit(e.id)) && this.ancestryPathCommits.includes(e.id))
+        this.ancestryPathPeeled.push(await this.peelToCommit(e.id));
       if (e)
         pending.push({
           id: await this.peelToCommit(e.id),
@@ -1104,7 +1223,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * (refs_for_each_ref, symbolic ones resolved), then HEAD (refs_head_ref); annotated tags
    * peeled.
    */
-  private async getAllRefs(): Promise<{ id: ObjectId; name: string }[]> {
+  private async getAllRefs(): Promise<{ id: ObjectId; name: string; raw: ObjectId }[]> {
     const named: { name: Uint8Array; id: ObjectId }[] = [];
     for await (const ref of this.refsStore.list()) {
       if (!ref.name.startsWith("refs/")) continue;
@@ -1113,11 +1232,11 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (id) named.push({ name: encodeGitPath(ref.name), id });
     }
     named.sort((a, b) => compareBytes(a.name, b.name));
-    const ids: { id: ObjectId; name: string }[] = [];
+    const ids: { id: ObjectId; name: string; raw: ObjectId }[] = [];
     for (const { id, name } of named)
-      ids.push({ id: await this.peelToCommit(id), name: decodeGitPath(name) });
+      ids.push({ id: await this.peelToCommit(id), name: decodeGitPath(name), raw: id });
     const head = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
-    if (head) ids.push({ id: await this.peelToCommit(head), name: "HEAD" });
+    if (head) ids.push({ id: await this.peelToCommit(head), name: "HEAD", raw: head });
     return ids;
   }
 
@@ -1142,7 +1261,20 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * the commit-graph has are reached by their graph positions, without building their ids.
    */
   private async *walk(pending: PendingCommit[]): AsyncIterable<LogResult> {
-    const prune = this.paths.length > 0 || this.excludePaths.length > 0;
+    const hasPaths = this.paths.length > 0 || this.excludePaths.length > 0;
+    const simplifyByDecoration = this.simplifyByDecoration;
+    // --simplify-by-decoration prunes without paths: a commit no ref names is TREESAME
+    const prune = hasPaths || simplifyByDecoration;
+    const simplifyMerges = this.simplifyMerges || simplifyByDecoration;
+    const ancestryPath = this.ancestryPathImplicit || this.ancestryPathCommits.length > 0;
+    const dense = this.dense;
+    const showPulls = this.showPulls;
+    // git's want_ancestry: rewrite_parents (--parents, --graph, --simplify-merges)
+    const wantAncestry = this.rewriteParents || simplifyMerges || !!this.outputWalk?.rewrite;
+    const rewrite = prune && dense && wantAncestry;
+    const decorations = simplifyByDecoration
+      ? await (this.decorationLoader?.() ?? this.refDecorations())
+      : undefined;
     // a shallow commit has no parents (git's shallow grafts); the graph is off then
     const shallowIds = (await this.refsStore.getShallow?.().catch(() => undefined)) ?? [];
     const shallow = new Set(shallowIds);
@@ -1155,13 +1287,13 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       shallow.size > 0 || replacements
         ? undefined
         : await this.commits.commitGraph?.get().catch(() => undefined);
-    const pathspec = prune ? this.pathspec() : undefined;
+    const pathspec = hasPaths ? this.pathspec() : undefined;
     const bloom =
       pathspec && this.useBloomFilters ? this.bloomKeys(graph, pathspec.items) : undefined;
     const bloomVersion = bloom ? this.changedPathsVersion() : -1;
     const fast = pathspec?.literal;
     const firstParentOnly = this.firstParentOnly;
-    const simplifyHistory = this.simplifyHistory;
+    const simplifyHistory = this.simplifyHistory && !simplifyMerges && !ancestryPath;
     /**
      * Each merge's TREESAME to each parent (git's `treesame` decoration), kept when limiting
      * can make it TREESAME later (limiting_can_increase_treesame: full history, a limited walk)
@@ -1217,8 +1349,20 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       for (let k = 0, c = t.parentCount(n); k < c; k++) markOne(t.parent(n, k));
       for (let p = stack.pop(); p !== undefined; p = stack.pop()) markOne(p);
     };
-    const differs = (from: ObjectId | undefined, n: number, nth: number) =>
-      this.differsAtPaths(
+    const emptyTree = this.objectFormat.emptyTreeId;
+    /** git's rev_compare_tree (`from` given) and rev_same_tree_as_empty: whether n differs */
+    const differs = async (
+      from: ObjectId | undefined,
+      n: number,
+      nth: number,
+    ): Promise<boolean> => {
+      if (decorations && from !== undefined) {
+        // a commit a ref names is worth showing; without paths, no other is
+        if ((decorations.get(t.idOf(n))?.length ?? 0) > 0) return true;
+        if (!pathspec) return false;
+      }
+      if (!pathspec) return t.treeOf(n) !== emptyTree;
+      return this.differsAtPaths(
         from,
         t.treeOf(n),
         pathspec as TreePathspec,
@@ -1228,14 +1372,18 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         graph,
         t.bloomPos(n),
       );
-    /** git's try_to_simplify_commit (prune, dense, no show_pulls) */
+    };
+    /** git's try_to_simplify_commit */
     const simplify = async (n: number): Promise<void> => {
-      if (!prune) return;
+      // an unparsed commit has no tree (a parent --first-parent never read, met by rewriting)
+      if (!prune || !t.parsed(n)) return;
       const count = t.parentCount(n);
       if (count === 0) {
         if (!(await differs(undefined, n, 0))) t.mark(n, TREESAME);
         return;
       }
+      // --sparse: a non-merge always counts as a change
+      if (!dense && count === 1) return;
       let relevantParents = 0;
       let relevantChange = false;
       let irrelevantChange = false;
@@ -1262,11 +1410,13 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
             continue;
           }
           t.keepOnlyParent(n, p);
-          t.mark(n, TREESAME);
+          // a merge diverted to a later parent is shown under --show-pulls
+          if (!showPulls || nth === 0) t.mark(n, TREESAME);
           return;
         }
         if (relevant(p)) relevantChange = true;
         else irrelevantChange = true;
+        if (nth === 0) t.mark(n, PULL_MERGE);
       }
       if (relevantParents ? !relevantChange : !irrelevantChange) t.mark(n, TREESAME);
     };
@@ -1287,7 +1437,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         return;
       }
       await simplify(n);
-      const passFlags = t.flag(n) & SYMMETRIC_LEFT;
+      const passFlags = t.flag(n) & (SYMMETRIC_LEFT | ANCESTRY_PATH);
       for (let k = 0, c = t.parentCount(n); k < c; k++) {
         const p = t.parent(n, k);
         if (!(await parse(p))) {
@@ -1306,18 +1456,20 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       }
     };
     /** git's get_commit_action (no parent rewriting: TREESAME commits are never shown) */
-    const shown = async (n: number, rewrite = false): Promise<LogResult | undefined> => {
+    const shown = async (n: number, ancestry = false): Promise<LogResult | undefined> => {
       const bytes = raw.get(n);
       if (bytes) raw.delete(n);
       // commit_early_ignore
       if (t.flag(n) & (UNINTERESTING | SHOWN)) return undefined;
-      if (t.flag(n) & TREESAME) {
+      if (dense && t.flag(n) & TREESAME) {
         // with parents rewritten, a merge of two relevant lines ties the topology together
-        if (!rewrite) return undefined;
-        let relevantParents = 0;
-        for (let k = 0, c = t.parentCount(n); k < c; k++)
-          if (relevant(t.parent(n, k))) relevantParents++;
-        if (relevantParents < 2) return undefined;
+        if (!ancestry) return undefined;
+        if (!(showPulls && t.flag(n) & PULL_MERGE)) {
+          let relevantParents = 0;
+          for (let k = 0, c = t.parentCount(n); k < c; k++)
+            if (relevant(t.parent(n, k))) relevantParents++;
+          if (relevantParents < 2) return undefined;
+        }
       }
       if (this.untilTime !== undefined && t.date(n) > this.untilTime) return undefined;
       const parents = t.parentCount(n);
@@ -1360,6 +1512,16 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       };
     };
 
+    // --ancestry-path=<commit>: the commits (git marks the object named: a tag's commit is
+    // not marked, only listed among the bottoms)
+    const ancestryBottoms: number[] = [];
+    for (const id of this.ancestryPathCommits) {
+      const commit = await this.peelToCommit(id);
+      const n = t.lookup(commit);
+      if (commit === id) t.mark(n, ANCESTRY_PATH);
+      ancestryBottoms.unshift(n);
+    }
+    for (const id of this.ancestryPathPeeled) t.mark(t.lookup(id), ANCESTRY_PATH);
     // prepare_revision_walk: the flags of every argument first, then handle_commit in order
     for (const e of pending) {
       if (e.left) t.mark(t.lookup(e.id), SYMMETRIC_LEFT);
@@ -1370,10 +1532,14 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const list: number[] = [];
     // --cherry-pick and --cherry-mark need limit_list, and so do --left-only and
     // --right-only from git 2.44 on (2.43 applies them only to a walk limited otherwise)
+    // --ancestry-path and --simplify-merges limit the walk too (--parents does not: a
+    // streaming walk rewrites parents as it goes)
     let limited =
       this.cherryPick ||
       this.cherryMark ||
-      (this.compatibility !== "2.43" && (this.leftOnly || this.rightOnly));
+      (this.compatibility !== "2.43" && (this.leftOnly || this.rightOnly)) ||
+      ancestryPath ||
+      simplifyMerges;
     /** git's update_treesame: TREESAME again from the per-parent marks, relevance as it is now */
     const updateTreesame = (n: number): void => {
       const count = t.parentCount(n);
@@ -1391,6 +1557,277 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (relevantParents ? relevantChange : irrelevantChange) t.unmark(n, TREESAME);
       else t.mark(n, TREESAME);
     };
+    /**
+     * revision.c's limit_to_ancestry: of `list`, the commits neither descending from a bottom
+     * (TMP_MARK) nor marked ANCESTRY_PATH (ancestors of a commit given) become UNINTERESTING.
+     */
+    const limitToAncestry = (bottoms: number[], list: number[]): void => {
+      const marked = new Set(bottoms);
+      const rlist = [...list].reverse();
+      let progress: boolean;
+      do {
+        progress = false;
+        for (const c of rlist) {
+          if (marked.has(c) || t.flag(c) & UNINTERESTING) continue;
+          for (let k = 0, n = t.parentCount(c); k < n; k++) {
+            if (!marked.has(t.parent(c, k))) continue;
+            marked.add(c);
+            progress = true;
+            break;
+          }
+        }
+      } while (progress);
+      for (const c of list) {
+        if (marked.has(c) || t.flag(c) & ANCESTRY_PATH) continue;
+        t.mark(c, UNINTERESTING);
+      }
+      for (const c of list) t.unmark(c, ANCESTRY_PATH);
+      for (const c of bottoms) t.unmark(c, ANCESTRY_PATH);
+    };
+    /**
+     * revision.c's compact_treesame: parent `nth` was just removed from n's parents (git's
+     * treesame decoration follows; a merge become a non-merge takes its TREESAME at once).
+     */
+    const compactTreesame = async (n: number, nth: number): Promise<void> => {
+      if (t.parentCount(n) === 0) {
+        if (await differs(undefined, n, nth)) t.unmark(n, TREESAME);
+        else t.mark(n, TREESAME);
+        return;
+      }
+      const st = treesame.get(n);
+      if (!st || nth >= st.length) throw new GitApiError(`compact_treesame ${nth}`);
+      const next = new Uint8Array(st.length - 1);
+      next.set(st.subarray(0, nth));
+      next.set(st.subarray(nth + 1), nth);
+      if (next.length === 1) {
+        if (next[0] && dense) t.mark(n, TREESAME);
+        else t.unmark(n, TREESAME);
+        treesame.delete(n);
+      } else treesame.set(n, next);
+    };
+    /** revision.c's remove_duplicate_parents: how many parents are left */
+    const removeDuplicateParents = async (n: number): Promise<number> => {
+      const tracked = treesame.has(n);
+      const parents = t.parentList(n);
+      const current = [...parents];
+      let surviving = 0;
+      for (const p of parents) {
+        if (current.slice(0, surviving).includes(p)) {
+          // the list shrinks before the treesame marks follow
+          current.splice(surviving, 1);
+          t.setParentList(n, current);
+          if (tracked) await compactTreesame(n, surviving);
+          continue;
+        }
+        surviving++;
+      }
+      return surviving;
+    };
+    /**
+     * commit-reach.c's paint_down_to_common for remove_redundant (no generation cut): the
+     * PARENT1 (from `one`) and PARENT2 (from `twos`) marks of the commits, through the
+     * parents as the walk holds them (simplified ones included, as git's in-memory commits).
+     */
+    const paintDown = async (one: number, twos: number[]): Promise<Map<number, number>> => {
+      const P1 = 1;
+      const P2 = 2;
+      const STALE = 4;
+      const RESULT = 8;
+      const marks = new Map<number, number>();
+      const queue = new CommitQueue<number>();
+      const markOf = (c: number) => marks.get(c) ?? 0;
+      marks.set(one, P1);
+      queue.put(one, t.date(one));
+      for (const c of twos) {
+        if (c === one) return marks;
+        marks.set(c, markOf(c) | P2);
+        queue.put(c, t.date(c));
+      }
+      const nonStale = () => queue.items().some((c) => !(markOf(c) & STALE));
+      while (nonStale()) {
+        const c = queue.get() as number;
+        let flags = markOf(c) & (P1 | P2 | STALE);
+        if (flags === (P1 | P2)) {
+          marks.set(c, markOf(c) | RESULT);
+          flags |= STALE;
+        }
+        for (let k = 0, n = t.parentCount(c); k < n; k++) {
+          const p = t.parent(c, k);
+          if ((markOf(p) & flags) === flags) continue;
+          if (!(await parse(p))) {
+            throw new GitApiError(`could not parse commit ${t.idOf(p)}`);
+          }
+          marks.set(p, markOf(p) | flags);
+          queue.put(p, t.date(p));
+        }
+      }
+      return marks;
+    };
+    /** commit-reach.c's reduce_heads: the commits no other one of `heads` reaches, in order */
+    const reduceHeads = async (heads: number[]): Promise<number[]> => {
+      const array = [...new Set(heads)];
+      for (const c of array) await parse(c);
+      const redundant = new Array<boolean>(array.length).fill(false);
+      for (let i = 0; i < array.length; i++) {
+        if (redundant[i]) continue;
+        const others: number[] = [];
+        const index: number[] = [];
+        for (let j = 0; j < array.length; j++) {
+          if (i === j || redundant[j]) continue;
+          others.push(array[j] as number);
+          index.push(j);
+        }
+        const marks = await paintDown(array[i] as number, others);
+        if ((marks.get(array[i] as number) ?? 0) & 2) redundant[i] = true;
+        for (let j = 0; j < others.length; j++) {
+          if ((marks.get(others[j] as number) ?? 0) & 1) redundant[index[j] as number] = true;
+        }
+      }
+      return array.filter((_, i) => !redundant[i]);
+    };
+    /** revision.c's simplify_merges over the sorted list: the commits that stay */
+    const simplifyMergesOf = async (list: number[]): Promise<number[]> => {
+      const simplified = new Map<number, number>();
+      const simplifyOne = async (commit: number, tail: number[]): Promise<void> => {
+        if (simplified.has(commit)) return;
+        // an UNINTERESTING commit and a root simplify to themselves
+        if (t.flag(commit) & UNINTERESTING || t.parentCount(commit) === 0) {
+          simplified.set(commit, commit);
+          return;
+        }
+        let pending = 0;
+        for (let k = 0, c = t.parentCount(commit); k < c; k++) {
+          const p = t.parent(commit, k);
+          if (!simplified.has(p)) {
+            tail.push(p);
+            pending++;
+          }
+          if (firstParentOnly) break;
+        }
+        if (pending) {
+          tail.push(commit);
+          return;
+        }
+        // each parent rewritten to what it simplifies to
+        for (let k = 0, c = t.parentCount(commit); k < c; k++) {
+          t.setParent(commit, k, simplified.get(t.parent(commit, k)) as number);
+          if (firstParentOnly) break;
+        }
+        let cnt = firstParentOnly ? 1 : await removeDuplicateParents(commit);
+        if (cnt > 1) {
+          // mark_redundant_parents and mark_treesame_root_parents (git's TMP_MARK)
+          const parents = t.parentList(commit);
+          const reduced = await reduceHeads(parents);
+          const marked = new Set<number>();
+          let count = 0;
+          for (const p of parents) {
+            if (!reduced.includes(p)) {
+              marked.add(p);
+              count++;
+            }
+          }
+          for (const p of parents) {
+            if (t.parentCount(p) === 0 && t.flag(p) & TREESAME) {
+              marked.add(p);
+              count++;
+            }
+          }
+          if (count) {
+            // leave_one_treesame_to_parent
+            const ts = treesame.get(commit);
+            let unmarked: number | undefined;
+            let markedOne: number | undefined;
+            for (let k = 0; k < parents.length; k++) {
+              if (!ts?.[k]) continue;
+              const p = parents[k] as number;
+              if (marked.has(p)) markedOne ??= p;
+              else {
+                unmarked = p;
+                break;
+              }
+            }
+            if (unmarked === undefined && markedOne !== undefined) {
+              marked.delete(markedOne);
+              count--;
+            }
+          }
+          if (count) {
+            // remove_marked_parents
+            const current = [...parents];
+            let nth = 0;
+            let removed = 0;
+            for (const p of parents) {
+              if (marked.has(p)) {
+                current.splice(nth, 1);
+                t.setParentList(commit, current);
+                removed++;
+                await compactTreesame(commit, nth);
+                continue;
+              }
+              nth++;
+            }
+            // removing parents can only make the commit TREESAME
+            if (removed && !(t.flag(commit) & TREESAME)) updateTreesame(commit);
+            cnt = nth;
+          }
+        }
+        const parent =
+          !cnt || t.flag(commit) & UNINTERESTING || !(t.flag(commit) & TREESAME)
+            ? undefined
+            : oneRelevantParent(t, commit, firstParentOnly, relevant);
+        if (parent === undefined || (showPulls && t.flag(commit) & PULL_MERGE)) {
+          simplified.set(commit, commit);
+        } else simplified.set(commit, simplified.get(parent) as number);
+      };
+      let yetToDo = [...list].reverse();
+      while (yetToDo.length > 0) {
+        const todo = yetToDo;
+        yetToDo = [];
+        for (const commit of todo) await simplifyOne(commit, yetToDo);
+      }
+      return list.filter((c) => simplified.get(c) === c);
+    };
+    /**
+     * revision.c's rewrite_parents with rewrite_one in a streaming walk: each commit passed on
+     * the way down is processed first (process_parents, its parents queued through a queue
+     * of its own merged into the walk's), as git rewrites while it streams.
+     */
+    const rewriteStreaming = async (n: number, walkQueue: CommitQueue<number>) => {
+      const out: number[] = [];
+      for (let k = 0, c = t.parentCount(n); k < c; k++) {
+        let p: number | undefined = t.parent(n, k);
+        const own = new CommitQueue<number>();
+        for (;;) {
+          await processParents(p, own);
+          if (t.flag(p) & UNINTERESTING || !(t.flag(p) & TREESAME)) break;
+          if (t.parentCount(p) === 0) {
+            p = undefined;
+            break;
+          }
+          const next = oneRelevantParent(t, p, firstParentOnly, relevant);
+          if (next === undefined) break;
+          p = next;
+        }
+        for (let q = own.get(); q !== undefined; q = own.get()) walkQueue.put(q, t.date(q));
+        if (p !== undefined && !out.includes(p)) out.push(p);
+      }
+      return out;
+    };
+    // `a...b`: git's get_merge_bases parsed every commit it painted while reading the
+    // arguments, so mark_parents_uninteresting from the merge bases reaches through them
+    for (let i = 0; i + 1 < pending.length; i++) {
+      const a = pending[i] as PendingCommit;
+      const b = pending[i + 1] as PendingCommit;
+      if (!a.left || b.left || a.exclude !== b.exclude) continue;
+      const na = t.lookup(a.id);
+      const nb = t.lookup(b.id);
+      if (!(await parse(na)) || !(await parse(nb))) continue;
+      const marks = await paintDown(na, [nb]);
+      const bases: number[] = [];
+      for (const [c, m] of marks) if (m & 8 && !(m & 4)) bases.push(c);
+      // get_merge_bases_many_0's remove_redundant over several candidates parses more
+      if (bases.length > 1) await reduceHeads(bases);
+    }
     for (const e of pending) {
       const n = t.lookup(e.id);
       if (!(await parse(n))) continue;
@@ -1406,16 +1843,27 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     }
     // commit_list_sort_by_date (stable), then into the date queue in that order
     list.sort((a, b) => t.date(b) - t.date(a));
+    // limit_list's collect_bottom_commits
+    if (this.ancestryPathImplicit) {
+      for (const n of list) if (t.flag(n) & BOTTOM) ancestryBottoms.unshift(n);
+      if (ancestryBottoms.length === 0) {
+        throw new GitApiError("--ancestry-path given but there are no bottom commits");
+      }
+    }
     const queue = new CommitQueue<number>();
     for (const n of list) queue.put(n, t.date(n));
 
     const none = this.maxCount !== undefined && this.maxCount <= 0;
     const output = this.outputWalk;
-    const order = this.order;
+    // --simplify-merges sorts topologically (in graph order unless another order is set)
+    const order = this.order ?? (simplifyMerges ? "topo" : undefined);
     // the output's walk and a sorted one are limited (git without generation numbers limits
-    // a topo walk)
+    // a topo walk); per-parent TREESAME is kept where limiting or simplify_merges needs it
     trackTreesame =
-      (limited || !!output || !!order) && prune && !simplifyHistory && !firstParentOnly;
+      prune &&
+      !simplifyHistory &&
+      !firstParentOnly &&
+      (simplifyMerges || ((limited || !!output || !!order) && dense));
     /** git's sort_in_topological_order of `list` (parents as simplified, unparsed: none) */
     const sortTopo = async (list: number[], sort: LogOrder | undefined): Promise<number[]> => {
       if (list.length === 0) return list;
@@ -1464,7 +1912,10 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 
     /** get_revision_1's commits, in the order they come out */
     let candidates: AsyncIterable<number> | Iterable<number>;
+    /** The streaming walk's queue, which rewriting parents walks on (rewrite_one_1) */
+    let streamQueue: CommitQueue<number> | undefined;
     if (!limited && !output && !order) {
+      streamQueue = queue;
       // get_revision_1, streaming
       const since = this.sinceTime;
       candidates = (async function* () {
@@ -1528,19 +1979,30 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           if (this.rightOnly ? left : !left) t.mark(n, SHOWN);
         }
       }
+      if (ancestryPath) limitToAncestry(ancestryBottoms, newlist);
       // commits made TREESAME by parents that became UNINTERESTING
-      if (trackTreesame) {
+      if (trackTreesame && dense) {
         for (const n of newlist) {
           if (!(t.flag(n) & (UNINTERESTING | TREESAME))) updateTreesame(n);
         }
       }
       raw.clear();
+      let sorted = output
+        ? output.topo
+          ? await sortTopo(newlist, order ?? "topo")
+          : newlist
+        : order
+          ? await sortTopo(newlist, order)
+          : newlist;
+      if (simplifyMerges && prune) sorted = await simplifyMergesOf(sorted);
       if (output) {
-        const sorted = output.topo ? await sortTopo(newlist, order ?? "topo") : newlist;
-        await this.finishOutputWalk(output, t, sorted, shown, relevant, parse);
+        await this.finishOutputWalk(output, t, sorted, shown, relevant, parse, {
+          ancestry: wantAncestry,
+          rewrite,
+        });
         return;
       }
-      candidates = order ? await sortTopo(newlist, order) : newlist;
+      candidates = sorted;
     }
 
     // get_revision_internal: --skip, -n, then (--boundary) the parents of the commits
@@ -1556,8 +2018,21 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     // git's -n 0 reads nothing more in a streaming walk; a limited walk is done before
     if (!none) {
       for await (const n of candidates) {
-        const commit = await shown(n);
+        const commit = await shown(n, wantAncestry);
         if (!commit) continue;
+        if (wantAncestry && t.parsed(n)) {
+          // the parents shown: as the walk holds them (simplified), rewritten past the
+          // commits not shown (simplify_commit's rewrite_parents changes commit->parents)
+          const held = t.parentList(n);
+          if (rewrite) {
+            commit.savedParents = held.map((p) => t.idOf(p));
+            const rewritten = streamQueue
+              ? await rewriteStreaming(n, streamQueue)
+              : rewriteParents(t, n, firstParentOnly, relevant);
+            t.setParentList(n, rewritten);
+            commit.parents = rewritten.map((p) => t.idOf(p));
+          } else commit.parents = held.map((p) => t.idOf(p));
+        }
         if (skipped < this.skip) {
           skipped++;
           continue;
@@ -1572,6 +2047,10 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           }
         }
         yield commit;
+        // git log and rev-list free a shown commit's parents (cmd_log_walk, finish_commit):
+        // a later rewrite passing through it finds none (not under --reverse, which reads
+        // the whole walk first)
+        if (rewrite && !this.reverse && !this.keepShownParents) t.setParentList(n, []);
         if (this.maxCount !== undefined && ++count >= this.maxCount) break;
       }
     }
@@ -1609,62 +2088,31 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     output: OutputWalk,
     t: RevTable,
     newlist: number[],
-    shown: (n: number, rewrite?: boolean) => Promise<LogResult | undefined>,
+    shown: (n: number, ancestry?: boolean) => Promise<LogResult | undefined>,
     relevant: (n: number) => boolean,
     parse: (n: number) => Promise<boolean>,
+    mode: { ancestry: boolean; rewrite: boolean },
   ): Promise<void> {
     const order = newlist;
     const firstParentOnly = this.firstParentOnly;
-    /** revision.c's one_relevant_parent */
-    const oneRelevantParent = (n: number): number | undefined => {
-      const c = t.parentCount(n);
-      if (c === 0) return undefined;
-      if (firstParentOnly || c === 1) return t.parent(n, 0);
-      let found: number | undefined;
-      for (let k = 0; k < c; k++) {
-        const p = t.parent(n, k);
-        if (!relevant(p)) continue;
-        if (found !== undefined) return undefined;
-        found = p;
-      }
-      return found;
-    };
-    /** revision.c's rewrite_one: the parent shown in place of `p`; undefined to drop it */
-    const rewriteOne = (start: number): number | undefined => {
-      let p = start;
-      for (;;) {
-        if (t.flag(p) & UNINTERESTING) return p;
-        if (!(t.flag(p) & TREESAME)) return p;
-        if (t.parentCount(p) === 0) return undefined;
-        const next = oneRelevantParent(p);
-        if (next === undefined) return p;
-        p = next;
-      }
-    };
-    const prune = this.paths.length > 0 || this.excludePaths.length > 0;
     /** Rewritten parents the walk never reached (only with `--first-parent`) */
     const unwalked = new Set<number>();
     for (const n of order) {
-      const commit = await shown(n, output.rewrite && prune);
+      const commit = await shown(n, mode.ancestry);
       if (!commit) continue;
-      let parents = commit.parents;
+      // the parents as the walk holds them (simplified), as git's commit->parents
+      let parents = t.parsed(n) ? t.parentList(n).map((p) => t.idOf(p)) : commit.parents;
       let savedParents: ObjectId[] | undefined;
-      if (output.rewrite && prune) {
+      if (mode.rewrite) {
         // the parents before rewriting, which `--full-diff` diffs against (save_parents)
-        savedParents = [];
-        for (let k = 0, c = t.parentCount(n); k < c; k++) savedParents.push(t.idOf(t.parent(n, k)));
-        const ids: ObjectId[] = [];
-        for (let k = 0, c = t.parentCount(n); k < c; k++) {
-          const p = rewriteOne(t.parent(n, k));
-          if (p === undefined) continue;
-          if (!(t.flag(p) & SEEN)) unwalked.add(p);
-          const id = t.idOf(p);
-          // remove_duplicate_parents
-          if (!ids.includes(id)) ids.push(id);
-        }
-        parents = ids;
+        savedParents = parents;
+        const rewritten = rewriteParents(t, n, firstParentOnly, relevant);
+        for (const p of rewritten) if (!(t.flag(p) & SEEN)) unwalked.add(p);
+        parents = rewritten.map((p) => t.idOf(p));
       }
       const { id, source, boundary: _boundary, left, patchSame, ...rest } = commit;
+      // the parents git frees once the commit is shown (cmd_log_walk; --skip's are not)
+      if (mode.rewrite && output.entries.length >= this.skip) t.setParentList(n, []);
       output.entries.push({
         id,
         commit: rest,
@@ -1773,6 +2221,19 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const skip = this.skip;
     const simplifyHistory = this.simplifyHistory;
     if (printer.fullHistory) this.simplifyHistory = false;
+    // --parents: rewritten parents (the header's ids, %P)
+    if (options.parents) this.rewriteParents = true;
+    // --simplify-by-decoration keeps the commits git log's decoration filter decorates
+    this.decorationLoader = () =>
+      host.decorations({
+        decorate: "short",
+        ...(options.decorateRefs ? { decorateRefs: options.decorateRefs } : {}),
+        ...(options.decorateRefsExclude
+          ? { decorateRefsExclude: options.decorateRefsExclude }
+          : {}),
+        ...(options.clearDecorations ? { clearDecorations: true } : {}),
+      });
+    this.keepShownParents = reverse;
     // --follow walks every commit: its path changes as it goes
     if (follow) this.paths = [];
     const shownIds = new Set<ObjectId>();
@@ -1852,6 +2313,31 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     }
     if (follow) this.paths = paths;
     return printer.result();
+  }
+
+  /**
+   * The refs' decorations (log-tree.c's load_ref_decorations): with `logOptions`, git log's
+   * decoration filter; without, every ref and HEAD (get_name_decoration's own load).
+   */
+  private async refDecorations(
+    logOptions?: LoadRefDecorationsOptions["logOptions"],
+  ): Promise<RefDecorations> {
+    const replacements = await this.objectReplacements();
+    const shallow = (await this.refsStore.getShallow?.().catch(() => undefined)) ?? [];
+    const environment = hostEnvironmentOf(this._workingCopy);
+    const objects = this._workingCopy.history?.objects;
+    const tags = this.tagsStore;
+    return loadRefDecorations({
+      refs: this.refsStore,
+      ...(tags ? { tags } : {}),
+      ...(environment?.replaceRefBase !== undefined
+        ? { replaceRefBase: environment.replaceRefBase }
+        : {}),
+      useReplaceRefs: this.useReplaceRefs(),
+      grafted: new Set([...(replacements?.grafts.keys() ?? []), ...shallow]),
+      ...(objects ? { hasObject: (id: ObjectId) => objects.has(id) } : {}),
+      ...(logOptions ? { logOptions } : {}),
+    });
   }
 
   /** The mailmap, read once for the walk's filters and the output alike. */
@@ -2212,32 +2698,16 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         const bytes = await this.readObjectBytes(replace?.size ? replacementOf(replace, id) : id);
         return bytes ? decodeGitPath(bytes) : undefined;
       },
-      decorations: async (options) => {
-        const replacements = await this.objectReplacements();
-        const shallow = (await this.refsStore.getShallow?.().catch(() => undefined)) ?? [];
-        const environment = hostEnvironmentOf(this._workingCopy);
-        const objects = this._workingCopy.history?.objects;
-        const tags = this.tagsStore;
-        return loadRefDecorations({
-          refs: this.refsStore,
-          ...(tags ? { tags } : {}),
-          ...(environment?.replaceRefBase !== undefined
-            ? { replaceRefBase: environment.replaceRefBase }
+      decorations: (options) =>
+        this.refDecorations({
+          decorate: options.decorate,
+          ...(options.decorateRefs ? { decorateRefs: options.decorateRefs } : {}),
+          ...(options.decorateRefsExclude
+            ? { decorateRefsExclude: options.decorateRefsExclude }
             : {}),
-          useReplaceRefs: this.useReplaceRefs(),
-          grafted: new Set([...(replacements?.grafts.keys() ?? []), ...shallow]),
-          ...(objects ? { hasObject: (id: ObjectId) => objects.has(id) } : {}),
-          logOptions: {
-            decorate: options.decorate,
-            ...(options.decorateRefs ? { decorateRefs: options.decorateRefs } : {}),
-            ...(options.decorateRefsExclude
-              ? { decorateRefsExclude: options.decorateRefsExclude }
-              : {}),
-            ...(options.clearDecorations ? { clearDecorations: true } : {}),
-            config,
-          },
-        });
-      },
+          ...(options.clearDecorations ? { clearDecorations: true } : {}),
+          config,
+        }),
       notes: async (id) => {
         notesTrees ??= this.loadNotes(config, options);
         const out: { ref: string; text: string }[] = [];
@@ -3255,6 +3725,10 @@ const SYMMETRIC_LEFT = 1 << 8;
 const PATCHSAME = 1 << 9;
 /** Shown already, or hidden by `--cherry-pick`/`--left-only`/`--right-only` (git's SHOWN) */
 const SHOWN = 1 << 10;
+/** `--ancestry-path=<commit>`: an ancestor of a commit named (passed from child to parent) */
+const ANCESTRY_PATH = 1 << 11;
+/** `--show-pulls`: a merge that differs from its first parent at the paths */
+const PULL_MERGE = 1 << 12;
 
 /** How many extra uninteresting commits limit_list looks at (git's SLOP). */
 const SLOP = 5;
@@ -3404,6 +3878,21 @@ class RevTable {
     return this.pool[(this.parentAt[n] as number) + k] as number;
   }
 
+  /** The parents of a parsed commit, as numbers. */
+  parentList(n: number): number[] {
+    const out: number[] = [];
+    for (let k = 0, c = this.parentCount(n); k < c; k++) out.push(this.parent(n, k));
+    return out;
+  }
+
+  /** Replaces the parents of a parsed commit by `list`, no longer than they were. */
+  setParentList(n: number, list: readonly number[]): void {
+    if (list.length > this.parentCount(n)) throw new Error("parents cannot grow");
+    const at = this.parentAt[n] as number;
+    for (let k = 0; k < list.length; k++) this.pool[at + k] = list[k] as number;
+    this.parents[n] = list.length;
+  }
+
   /** Simplification keeps only parent `p` (git rewrites `commit->parents`). */
   keepOnlyParent(n: number, p: number): void {
     this.pool[this.parentAt[n] as number] = p;
@@ -3442,6 +3931,55 @@ class RevTable {
 const INITIAL_REVS = 1024;
 /** `RevTable` flag: parsed from the commit-graph (its tree and Bloom filter are there). */
 const GRAPH_PARSED = 1 << 6;
+
+/** revision.c's one_relevant_parent: the one parent a TREESAME commit simplifies to */
+function oneRelevantParent(
+  t: RevTable,
+  n: number,
+  firstParentOnly: boolean,
+  relevant: (n: number) => boolean,
+): number | undefined {
+  const c = t.parentCount(n);
+  if (c === 0) return undefined;
+  if (firstParentOnly || c === 1) return t.parent(n, 0);
+  let found: number | undefined;
+  for (let k = 0; k < c; k++) {
+    const p = t.parent(n, k);
+    if (!relevant(p)) continue;
+    if (found !== undefined) return undefined;
+    found = p;
+  }
+  return found;
+}
+
+/**
+ * revision.c's rewrite_parents: n's parents, each replaced by the first commit shown on its
+ * way down (rewrite_one), roots TREESAME dropped, duplicates removed.
+ */
+function rewriteParents(
+  t: RevTable,
+  n: number,
+  firstParentOnly: boolean,
+  relevant: (n: number) => boolean,
+): number[] {
+  const out: number[] = [];
+  for (let k = 0, c = t.parentCount(n); k < c; k++) {
+    let p: number | undefined = t.parent(n, k);
+    for (;;) {
+      if (t.flag(p) & UNINTERESTING) break;
+      if (!(t.flag(p) & TREESAME)) break;
+      if (t.parentCount(p) === 0) {
+        p = undefined;
+        break;
+      }
+      const next = oneRelevantParent(t, p, firstParentOnly, relevant);
+      if (next === undefined) break;
+      p = next;
+    }
+    if (p !== undefined && !out.includes(p)) out.push(p);
+  }
+  return out;
+}
 
 /** A commit read whole, as the commit store decodes it; undefined if it does not parse. */
 function decodeCommit(bytes: Uint8Array): Commit | undefined {

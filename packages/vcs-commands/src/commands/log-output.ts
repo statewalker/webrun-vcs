@@ -72,6 +72,11 @@ export interface LogOutputOptions {
   /** `--abbrev-commit` / `--no-abbrev-commit` (default `log.abbrevCommit`, false) */
   abbrevCommit?: boolean;
   /**
+   * `--parents`: each commit's parents after its id in the header, rewritten past the commits
+   * a path-limited walk leaves out (as `%P` and the graph see them)
+   */
+  parents?: boolean;
+  /**
    * `--abbrev=<n>` (default `core.abbrev`, automatic): at least n digits (4 to 40, as git
    * clamps it), in the commits' ids and in the diffs' `index` lines (combined diffs keep the
    * default length, as git's do)
@@ -1350,6 +1355,11 @@ export class LogPrinter {
         if (mark) this.out.text(`${mark} `);
       }
       this.out.text(await this.abbrevId(entry.id, this.abbrevCommit));
+      // show_parents
+      if (this.options.parents) {
+        for (const p of entry.parents)
+          this.out.text(` ${await this.abbrevId(p, this.abbrevCommit)}`);
+      }
       if (log.parent)
         this.out.text(` (from ${await this.abbrevId(log.parent, this.abbrevCommit)})`);
       this.out.text(colors?.diff.reset ?? "");
