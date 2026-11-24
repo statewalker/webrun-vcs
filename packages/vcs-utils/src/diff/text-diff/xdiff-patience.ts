@@ -1,5 +1,5 @@
 /**
- * A port of git's patience diff (`xdiff/xpatience.c`), without `--anchored`. Lines are
+ * A port of git's patience diff (`xdiff/xpatience.c`), `--anchored` included. Lines are
  * numbered from 1, as there.
  *
  * @module
@@ -76,10 +76,28 @@ function fillHashmap(
   return map;
 }
 
+/** xpatience.c's `is_anchor`: the line starts with one of the anchors */
+function isAnchor(env: XdEnv, line2: number, anchors: readonly Uint8Array[]): boolean {
+  const file = env.xdf2;
+  const bytes = file.lines.line(file.from + line2 - 1);
+  outer: for (const anchor of anchors) {
+    if (bytes.length < anchor.length) continue;
+    for (let i = 0; i < anchor.length; i++) if (bytes[i] !== anchor[i]) continue outer;
+    return true;
+  }
+  return false;
+}
+
 /** `find_longest_common_sequence`: the first entry of the sequence, or -1 */
-function findLongestCommonSequence(map: PatienceMap): number {
+function findLongestCommonSequence(
+  map: PatienceMap,
+  env: XdEnv,
+  anchors: readonly Uint8Array[] | undefined,
+): number {
   const sequence = new Int32Array(Math.max(map.nr, 1));
   let longest = 0;
+  // an anchor's slot in the sequence is never overridden
+  let anchorI = -1;
   for (let entry = map.first; entry >= 0; entry = map.next[entry]) {
     const l2 = map.line2[entry];
     if (!l2 || l2 === NON_UNIQUE) continue;
@@ -98,8 +116,12 @@ function findLongestCommonSequence(map: PatienceMap): number {
     }
     map.previous[entry] = i < 0 ? -1 : sequence[i];
     ++i;
+    if (i <= anchorI) continue;
     sequence[i] = entry;
-    if (i === longest) longest++;
+    if (anchors && anchors.length > 0 && isAnchor(env, l2, anchors)) {
+      anchorI = i;
+      longest = anchorI + 1;
+    } else if (i === longest) longest++;
   }
   if (!longest) return -1;
   let entry = sequence[longest - 1];
@@ -135,7 +157,7 @@ export function patienceDiff(env: XdEnv, flags: XdFlags, fallBack: FallBackDiff)
       while (count2--) c2[line2++] = 1;
       return;
     }
-    let first = findLongestCommonSequence(map);
+    let first = findLongestCommonSequence(map, env, flags.anchors);
     if (first < 0) {
       fallBack(env.xdf1, line1, count1, env.xdf2, line2, count2, flags);
       return;

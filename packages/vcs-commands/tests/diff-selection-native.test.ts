@@ -198,6 +198,7 @@ const FORMAT_ARGS: Record<DiffOutputFormat, string[]> = {
   "name-only": ["--name-only"],
   "name-status": ["--name-status"],
   check: ["--check"],
+  dirstat: ["--dirstat"],
 };
 
 /**
