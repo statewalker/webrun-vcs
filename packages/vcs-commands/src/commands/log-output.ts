@@ -1383,8 +1383,9 @@ export class LogPrinter {
     ident: PersonIdent,
     mail: boolean,
     inBody: string[] = [],
-    mailmap = true,
+    tagger = false,
   ): string {
+    const mailmap = !tagger;
     let { name, email } = mailmap ? this.mapped(ident) : ident;
     let out = sb;
     const from = mail ? this.options.mail?.from : undefined;
@@ -1398,7 +1399,8 @@ export class LogPrinter {
     }
     if (mail) {
       out += mailFromHeader(name, email, {
-        encodeHeaders: this.options.mail?.encodeHeaders ?? true,
+        // show_tagger's context sets no encode_email_headers
+        encodeHeaders: tagger ? false : (this.options.mail?.encodeHeaders ?? true),
         encoding: this.options.mail?.outputEncoding ?? "UTF-8",
       });
     } else {
@@ -1446,12 +1448,13 @@ export class LogPrinter {
 
   /**
    * builtin/log.c's show_tagger: pp_user_info of a tag's `tagger` line in the commits'
-   * format and date mode, without the mailmap (git gives its context none)
+   * format and date mode, without the mailmap and, in the email formats, without RFC 2047
+   * (git's context sets neither)
    */
   writeTagger(ident: PersonIdent): void {
     if (this.format.fmt === "oneline") return;
     const mail = this.format.fmt === "email" || this.format.fmt === "mboxrd";
-    this.out.text(this.userInfo("", "Tagger", ident, mail, [], false));
+    this.out.text(this.userInfo("", "Tagger", ident, mail, [], true));
   }
 
   /** The output so far */

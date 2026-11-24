@@ -29,15 +29,20 @@
  * @module
  */
 
-import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
-import { parsePersonIdent } from "@statewalker/vcs-core";
+import {
+  CorruptObjectError,
+  type ObjectId,
+  type ObjectTypeString,
+  type PersonIdent,
+  parsePersonIdent,
+} from "@statewalker/vcs-core";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { collect } from "@statewalker/vcs-utils/streams";
 
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { DiffCommand, type DiffTextOptions } from "./diff-command.js";
-import { LogCommand } from "./log-command.js";
+import { LogCommand, type ShowSession } from "./log-command.js";
 import type { LogOutputOptions } from "./log-output.js";
 import { revisionMergeBases } from "./rev-parse-command.js";
 import { parseRevisionAndPathArgs } from "./revision-filenames.js";
@@ -196,13 +201,31 @@ export class ShowCommand extends GitCommand<ShowResult> {
     }
     const session = await log.showSession(output);
     let exitCode = 0;
-    objects: for (const entry of entries) {
+    try {
+      exitCode = await this.showObjects(entries, session, errors, textconv === true);
+    } catch (error) {
+      // a read git dies of: what was printed before stays on stdout
+      if (!(error instanceof ShowDeath)) throw error;
+      errors.push(...error.lines);
+      exitCode = 128;
+    }
+    return { stdout: session.result(), errors, exitCode };
+  }
+
+  /** cmd_show's loop over the pending objects: its exit status (255 after an `error()`) */
+  private async showObjects(
+    entries: readonly RevisionArgEntry[],
+    session: ShowSession,
+    errors: string[],
+    textconv: boolean,
+  ): Promise<number> {
+    for (const entry of entries) {
       const name = entry.name ?? entry.id;
       let id = entry.id;
       for (;;) {
-        const type = await resolver.objectType(id);
+        const type = await this.objectKind(id);
         if (type === "blob") {
-          session.bytes(await this.blobContent(id, name, textconv === true));
+          session.bytes(await this.blobContent(id, name, textconv));
         } else if (type === "tree") {
           session.separate();
           session.text(`tree ${name}\n\n`);
@@ -215,32 +238,38 @@ export class ShowCommand extends GitCommand<ShowResult> {
           await session.commit(id);
         } else if (type === "tag") {
           const target = await this.showTag(id, session);
-          if (target === undefined || (await resolver.objectType(target)) === undefined) {
+          if (target === undefined || (await this.objectKind(target)) === undefined) {
             errors.push(`error: could not read object ${target ?? id}`);
-            exitCode = 255;
-            break objects;
+            return 255;
           }
           id = target;
           continue;
         } else {
           errors.push(`error: could not read object ${id}`);
-          exitCode = 255;
-          break objects;
+          return 255;
         }
         break;
       }
     }
-    return { stdout: session.result(), errors, exitCode };
+    return 0;
+  }
+
+  /**
+   * An object's kind: from its header where the store has it, else by reading it, which
+   * fetches a missing object of a partial clone from its promisor remote (git's
+   * parse_object); undefined when it cannot be found
+   */
+  private async objectKind(id: ObjectId): Promise<ObjectTypeString | undefined> {
+    const known = await this.revisionResolver().objectType(id);
+    if (known) return known;
+    return (await this.readObject(id))?.type;
   }
 
   /**
    * show_tag_object: `tag <name>`, a `Tagger:` line (and date) for each `tagger` header, the
    * rest of the object from its empty line on; the id it tags, undefined when unreadable
    */
-  private async showTag(
-    id: ObjectId,
-    session: Awaited<ReturnType<LogCommand["showSession"]>>,
-  ): Promise<ObjectId | undefined> {
+  private async showTag(id: ObjectId, session: ShowSession): Promise<ObjectId | undefined> {
     const raw = await this.rawObject(id);
     if (!raw) return undefined;
     let tagName = "";
@@ -272,7 +301,12 @@ export class ShowCommand extends GitCommand<ShowResult> {
 
   /** show_blob_object: the blob's bytes, through textconv for a named path under `--textconv` */
   private async blobContent(id: ObjectId, name: string, textconv: boolean): Promise<Uint8Array> {
-    const read = async () => (await this.rawObject(id)) ?? new Uint8Array(0);
+    const read = async () => {
+      const bytes = await this.rawObject(id);
+      // a blob that went missing after its name was read: git's stream fails
+      if (!bytes) throw new ShowDeath([`fatal: unable to read ${id}`]);
+      return bytes;
+    };
     if (textconv) {
       const where = await this.blobPath(name);
       if (where) {
@@ -328,18 +362,54 @@ export class ShowCommand extends GitCommand<ShowResult> {
     return undefined;
   }
 
-  /** An object's content as stored, undefined when it cannot be read */
+  /** An object's content as stored, undefined when it is missing */
   private async rawObject(id: ObjectId): Promise<Uint8Array | undefined> {
+    return (await this.readObject(id))?.bytes;
+  }
+
+  /**
+   * An object as stored (a partial clone's missing object fetched first), undefined when it is
+   * missing. A failed lazy fetch propagates (`PromisorFetchError`); a corrupt copy dies with
+   * git's lines (exit 128).
+   */
+  private async readObject(
+    id: ObjectId,
+  ): Promise<{ type: ObjectTypeString; bytes: Uint8Array } | undefined> {
     const objects = this._workingCopy.history?.objects;
     if (!objects) return undefined;
     try {
       const obj = await objects.get(id);
       if (!obj) return undefined;
-      if (obj.bytes) return obj.bytes;
-      return await collect(obj.content);
-    } catch {
-      return undefined;
+      return { type: obj.type, bytes: obj.bytes ?? (await collect(obj.content)) };
+    } catch (error) {
+      if (error instanceof CorruptObjectError) throw await this.corruptDeath(id, error);
+      throw error;
     }
+  }
+
+  /**
+   * git's death on a corrupt object (unpack_entry, read_object_file's die): zlib's `error:`
+   * line, then `fatal: packed object <id> (stored in <pack>) is corrupt` or the loose
+   * object's
+   */
+  private async corruptDeath(id: ObjectId, error: CorruptObjectError): Promise<ShowDeath> {
+    const lines: string[] = [];
+    const reason = inflateReason(error);
+    if (reason !== undefined) lines.push(`error: inflate: data stream error (${reason})`);
+    const packs = await this._workingCopy.history?.packs?.packs().catch(() => undefined);
+    const pack = packs?.find((p) => p.has(id));
+    if (pack) {
+      const path =
+        "packPath" in pack && typeof pack.packPath === "string"
+          ? pack.packPath.replace(/^\/+/, "")
+          : `.git/objects/pack/pack-${pack.packId}.pack`;
+      lines.push(`fatal: packed object ${id} (stored in ${path}) is corrupt`);
+    } else {
+      lines.push(
+        `fatal: loose object ${id} (stored in .git/objects/${id.slice(0, 2)}/${id.slice(2)}) is corrupt`,
+      );
+    }
+    return new ShowDeath(lines);
   }
 
   /** setup_revisions' default `HEAD`, dying as diagnose_missing_default does */
@@ -366,6 +436,23 @@ export class ShowCommand extends GitCommand<ShowResult> {
     tips.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
     return tips.map(({ name, id }) => ({ name, id }));
   }
+}
+
+/** A read git dies of, with its stderr lines (exit 128). */
+class ShowDeath extends Error {
+  constructor(readonly lines: string[]) {
+    super(lines.join("\n"));
+    this.name = "ShowDeath";
+  }
+}
+
+/** zlib's message of an inflate failure in an error or its causes (`inflate failed: <msg>`) */
+function inflateReason(error: unknown): string | undefined {
+  for (let e = error, depth = 0; e instanceof Error && depth < 8; e = e.cause, depth++) {
+    const m = /inflate failed: ([^\n]+)/.exec(e.message);
+    if (m) return (m[1] as string).trim();
+  }
+  return undefined;
 }
 
 /** Bytes as a string that sorts as the bytes do */

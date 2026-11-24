@@ -459,3 +459,63 @@ git config diff.foo.textconv "\\"$(pwd)\\""/hexdump
     await twin(history(), ["--textconv", ":file", "HEAD~1:file"], withRunner);
   });
 });
+
+describeGit("git show: unreadable objects", () => {
+  /** stderr with zlib's reason left out of the inflate line (pako and the system zlib word it alike, but not always) */
+  const normalise = (stderr: string) =>
+    stderr.replace(
+      /^error: inflate: data stream error \(.*\)$/m,
+      "error: inflate: data stream error",
+    );
+
+  /** A repository whose packed blob `file` (seq 1 2000) has 16 bytes overwritten in its data */
+  const corrupt = (extra = "") =>
+    repo(`
+seq 1 2000 >file
+git add file
+test_tick
+git commit -q -m one
+${extra}
+git gc -q
+pack=$(ls .git/objects/pack/*.pack)
+blob=$(git rev-parse HEAD:file)
+ofs=$(git show-index <\${pack%.pack}.idx | awk -v b=$blob '$2 == b { print $1 }')
+chmod 0644 $pack
+printf '%016d' 0 | dd of=$pack bs=1 conv=notrunc seek=$((ofs + 10)) 2>/dev/null
+`);
+
+  it('t5303-pack-corruption-resilience.sh: "create corruption in data of first object", then git show of the blob', async () => {
+    const dir = corrupt();
+    const theirs = native(dir, ["HEAD:file"]);
+    const mine = await ours(dir, ["HEAD:file"]);
+    expect(theirs.status).toBe(128);
+    expect(mine.status).toBe(theirs.status);
+    expect(normalise(mine.stderr)).toBe(normalise(theirs.stderr));
+    expect(mine.stdout.toString("latin1")).toBe(theirs.stdout.toString("latin1"));
+  });
+
+  it('t5303-pack-corruption-resilience.sh: "create corruption in data of first object", then git show of a tag of the blob', async () => {
+    const dir = corrupt("git tag -m 'tag of a blob' blob-tag HEAD:file");
+    // a commit's diff of the blob dies otherwise (2.56.1 even crashes): -s leaves it out
+    for (const args of [["blob-tag"], ["-s", "HEAD", "HEAD:file"]]) {
+      const theirs = native(dir, args);
+      const mine = await ours(dir, args);
+      expect(theirs.status).toBe(128);
+      expect(mine.status, args.join(" ")).toBe(theirs.status);
+      expect(normalise(mine.stderr), args.join(" ")).toBe(normalise(theirs.stderr));
+      expect(mine.stdout.toString("latin1"), args.join(" ")).toBe(theirs.stdout.toString("latin1"));
+    }
+  });
+
+  it('t7007-show.sh: "set up a bit of history", then --format=email of a tag with a non-ASCII tagger', async () => {
+    const dir = repo(`
+test_commit main1
+test_tick
+GIT_COMMITTER_NAME="Jöhn Dœ" git tag -m "annotated" annotated
+GIT_COMMITTER_NAME="Mr. Dot, Jr." git tag -m "quoted" quoted
+`);
+    await twin(dir, ["--format=email", "annotated"]);
+    await twin(dir, ["--pretty=fuller", "annotated"]);
+    await twin(dir, ["--format=email", "quoted", "annotated"]);
+  });
+});
