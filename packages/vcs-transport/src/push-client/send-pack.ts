@@ -23,6 +23,7 @@ import { formatOf, isNullId } from "../protocol/object-format.js";
 import { type AbbrevLengths, abbrevLengthsOf, transportSummaryWidth } from "../summary/index.js";
 import type { ReceivePackConnection } from "./connection.js";
 import {
+  type FollowTagsSource,
   type ForceWithLease,
   isPushSuccess,
   matchPushRefs,
@@ -64,6 +65,18 @@ export interface PushClientOptions {
    * the remote ref to be absent, as git)
    */
   trackingValue?: (remoteRef: string) => Promise<string | undefined>;
+  /**
+   * `--force-if-includes` (remote.c `check_if_includes_upstream`): asked for each leased ref
+   * whose expected value is its remote-tracking value (`trackingValue` found one) and still
+   * holds, with the remote's value; false refuses the ref as `rejected-remote-updated` ("remote
+   * ref updated since checkout") unless forced. Ignored for leases with an explicit value.
+   */
+  includesRemote?: (remoteRef: string, remoteOid: string) => Promise<boolean>;
+  /**
+   * `--follow-tags` / `push.followTags`: also push the local annotated tags the remote lacks
+   * that the pushed refs (or the remote's other refs) reach (remote.c `add_missing_tags`)
+   */
+  followTags?: boolean;
   /** All refs or none (`--atomic`); the server must advertise `atomic` */
   atomic?: boolean;
   /**
@@ -275,11 +288,17 @@ async function sendPack(
       resolveRevision: revision,
     },
     remoteRefs,
-    { prune: options.prune, objectFormat: format },
+    {
+      prune: options.prune,
+      objectFormat: format,
+      ...(options.followTags ? { followTags: followTagsSource(repository) } : {}),
+    },
   );
   // leases (git's apply_cas): an entry naming the ref wins; one without a ref (or `true`)
   // covers every other pushed ref at its remote-tracking value
   const leases = new Map<string, string>();
+  // --force-if-includes: the leased refs whose expectation is a remote-tracking value
+  const fromTracking = new Set<string>();
   const lease = options.forceWithLease;
   if (lease) {
     const entries: ForceWithLease[] = lease === true ? [{}] : lease;
@@ -298,17 +317,29 @@ async function sendPack(
         (l) => l.ref === m.remoteRef || refnameMatch(l.ref as string, m.remoteRef),
       );
       if (!entry && !rest) continue;
-      const expect =
-        entry && entry.expect !== undefined
-          ? (expected.get(entry) ?? ZERO_OID)
-          : await options.trackingValue?.(m.remoteRef);
+      const explicit = entry !== undefined && entry.expect !== undefined;
+      const expect = explicit
+        ? (expected.get(entry) ?? ZERO_OID)
+        : await options.trackingValue?.(m.remoteRef);
       leases.set(m.remoteRef, expect ?? ZERO_OID);
+      // check_reachable: only where remote_tracking found the value
+      if (!explicit && expect !== undefined) fromTracking.add(m.remoteRef);
+    }
+  }
+  // check_if_includes_upstream: a lease that holds must find the remote's value in the local
+  // ref's reflog (a stale one is refused anyway)
+  const unreachable = new Set<string>();
+  if (options.includesRemote) {
+    for (const m of matched) {
+      if (!fromTracking.has(m.remoteRef) || leases.get(m.remoteRef) !== m.oldOid) continue;
+      if (!(await options.includesRemote(m.remoteRef, m.oldOid))) unreachable.add(m.remoteRef);
     }
   }
   const updates = inRemoteRefOrder(
     await setPushStatus(matched, objectSource(repository), {
       force: options.force,
       leases,
+      unreachable,
     }),
     remoteRefs,
   );
@@ -583,6 +614,46 @@ async function sendPack(
 function setStatus(update: PushRefUpdate, status: PushRefUpdate["status"]): void {
   update.status = status;
   update.summary = pushSummary(update);
+}
+
+/** What `--follow-tags` reads of the local objects (remote.c `add_missing_tags`). */
+function followTagsSource(repository: RepositoryFacade): FollowTagsSource {
+  const objects = objectSource(repository);
+  return {
+    async isTag(oid) {
+      if (repository.getObjectType) return (await repository.getObjectType(oid)) === "tag";
+      const peeled = await repository.peelTag?.(oid);
+      return !!peeled && peeled !== oid;
+    },
+    peelToCommit: (oid) => objects.peelToCommit(oid),
+    async reachableSubset(tips, commits) {
+      const wanted = new Set(commits);
+      const found = new Set<string>();
+      const getCommitInfo = repository.getCommitInfo?.bind(repository);
+      if (!getCommitInfo) {
+        for (const tip of tips) {
+          for await (const oid of repository.walkAncestors(tip)) {
+            if (wanted.has(oid)) found.add(oid);
+          }
+        }
+        return found;
+      }
+      // one walk from every tip, ending once each wanted commit was met
+      const seen = new Set<string>(tips);
+      const queue = [...seen];
+      for (let i = 0; i < queue.length && found.size < wanted.size; i++) {
+        const oid = queue[i];
+        if (wanted.has(oid)) found.add(oid);
+        const info = await getCommitInfo(oid);
+        for (const parent of info?.parents ?? []) {
+          if (seen.has(parent)) continue;
+          seen.add(parent);
+          queue.push(parent);
+        }
+      }
+      return found;
+    },
+  };
 }
 
 /** The local objects, as the push decides with them (git's ref_newer, lookup_commit). */

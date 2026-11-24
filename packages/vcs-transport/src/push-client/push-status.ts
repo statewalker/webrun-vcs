@@ -70,6 +70,8 @@ export function pushStatusParts(
       return rejected("already exists");
     case "rejected-stale":
       return rejected("stale info");
+    case "rejected-remote-updated":
+      return rejected("remote ref updated since checkout");
     case "atomic-push-failed":
       return rejected("atomic push failed");
     case "rejected-nodelete":

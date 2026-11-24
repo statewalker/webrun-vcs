@@ -391,6 +391,7 @@ export function planTracking(
     if (merges.length === 0) merges = [startRef];
   }
 
+  // install_branch_config_multiple_remotes
   const rebase = autoSetupRebase(workingCopy, remote);
   if (rebase && merges.length > 1) {
     throw new InvalidArgumentError(
@@ -406,18 +407,42 @@ export function planTracking(
   return { plan: { remote, merges, rebase }, warnings: [] };
 }
 
-/**
- * Whether git's `install_branch_config_multiple_remotes` sets `branch.<name>.rebase` for an
- * upstream on `remote` (undefined: a local branch), as `branch.autoSetupRebase` says.
- */
-export function autoSetupRebase(workingCopy: WorkingCopy, remote: string | undefined): boolean {
-  const config = RemoteConfigStore.from(workingCopy);
+/** branch.c's `should_setup_rebase`: `branch.autoSetupRebase` for a remote (or local) upstream. */
+function shouldSetupRebase(config: RemoteConfigStore, remote: string | undefined): boolean {
   const autoRebase = (config.value("branch.autoSetupRebase") ?? "never").toLowerCase();
   return (
     autoRebase === "always" ||
     (autoRebase === "local" && remote === undefined) ||
     (autoRebase === "remote" && remote !== undefined)
   );
+}
+
+/**
+ * The plan of `git push -u` (transport.c `set_upstreams` → `install_branch_config`): the
+ * branch tracks `merge` (a `refs/heads/` ref) of `remote` (the remote's name, or the URL
+ * pushed to), rebasing as `branch.autoSetupRebase` says.
+ *
+ * @example
+ * ```typescript
+ * const plan = pushTrackingPlan(workingCopy, "origin", "refs/heads/topic");
+ * await installTracking(workingCopy, "topic", plan); // ["branch 'topic' set up to track 'origin/topic'."]
+ * ```
+ */
+export function pushTrackingPlan(
+  workingCopy: WorkingCopy,
+  remote: string,
+  merge: string,
+): TrackingPlan {
+  const config = RemoteConfigStore.from(workingCopy);
+  return { remote, merges: [merge], rebase: shouldSetupRebase(config, remote) };
+}
+
+/**
+ * Whether git's `install_branch_config_multiple_remotes` sets `branch.<name>.rebase` for an
+ * upstream on `remote` (undefined: a local branch), as `branch.autoSetupRebase` says.
+ */
+export function autoSetupRebase(workingCopy: WorkingCopy, remote: string | undefined): boolean {
+  return shouldSetupRebase(RemoteConfigStore.from(workingCopy), remote);
 }
 
 /**
