@@ -171,7 +171,8 @@ export interface DiffOutputOptions
 const S_IFMT = 0o170000;
 const GITLINK_MODE = 0o160000;
 const FIRST_FEW_BYTES = 8000;
-const GIT_DIFF_BIG_FILE_THRESHOLD = 512 * 1024 * 1024;
+/** @internal git diff's `big_file_threshold` default (512 MiB) */
+export const GIT_DIFF_BIG_FILE_THRESHOLD = 512 * 1024 * 1024;
 
 const encoder = new TextEncoder();
 
@@ -208,8 +209,12 @@ export function diffDriverOf(
 /** A git boolean (`git_config_bool`), undefined when unset or not one. */
 const boolValue = (v: string | undefined): boolean | undefined => parseGitBool(v);
 
-/** A side as the diff reads it: its content and binary state, read once */
-class LoadedSide {
+/**
+ * A side as the diff reads it: its content and binary state, read once
+ *
+ * @internal
+ */
+export class LoadedSide {
   private content?: Promise<Uint8Array>;
   private probed?: Promise<{ size: number; binary: boolean }>;
 
@@ -279,16 +284,22 @@ function octal6(mode: number): string {
 /**
  * The driver a side's content is read with (`diff_filespec_load_driver`): a regular file's;
  * an absent side, a symbolic link and a submodule take the default driver
+ *
+ * @internal
  */
-function contentDriver(
+export function contentDriver(
   spec: DiffSideSpec | undefined,
   driver: DiffDriver | undefined,
 ): DiffDriver | undefined {
   return spec && (spec.mode & S_IFMT) === 0o100000 ? driver : undefined;
 }
 
-/** The full path of a pair's side for attributes; the other side's for an absent one */
-function attrPathOf(
+/**
+ * The full path of a pair's side for attributes; the other side's for an absent one
+ *
+ * @internal
+ */
+export function attrPathOf(
   side: DiffSideSpec | undefined,
   other: DiffSideSpec | undefined,
   fallback: string,
@@ -297,7 +308,8 @@ function attrPathOf(
   return spec ? (spec.attrPath ?? spec.path) : fallback;
 }
 
-async function driverOf(
+/** @internal The diff driver of a path, from {@link DiffOutputOptions.driver} */
+export async function driverOf(
   options: DiffOutputOptions,
   path: string | undefined,
 ): Promise<DiffDriver | undefined> {
@@ -332,6 +344,11 @@ export interface PairPatchReport {
   result?: UnifiedDiffResult;
 }
 
+/** A side that is a directory (a subtree a diff lists for `--find-object`) */
+function isTreeSide(side: DiffSideSpec | undefined): boolean {
+  return side !== undefined && (side.mode & S_IFMT) === 0o040000;
+}
+
 /** Writes one pair as `run_diff` does: a file/symlink change as deletion and addition */
 export async function writePairPatch(
   sink: ByteSink,
@@ -340,6 +357,8 @@ export async function writePairPatch(
   report?: PairPatchReport,
 ): Promise<void> {
   const { old: one, new: two } = pair;
+  // a subtree (`--find-object`'s tree_in_recursive): run_diff shows nothing of a directory
+  if (isTreeSide(one) || isTreeSide(two)) return;
   if (one && two && (one.mode & S_IFMT) !== (two.mode & S_IFMT)) {
     await builtinDiff(sink, { ...pair, new: undefined }, options, two.path, report);
     await builtinDiff(sink, { ...pair, old: undefined }, options, one.path, report);
@@ -550,6 +569,8 @@ export async function computeDiffstat(
   const threshold = options.bigFileThreshold ?? GIT_DIFF_BIG_FILE_THRESHOLD;
   const files: DiffstatFile[] = [];
   for (const pair of pairs) {
+    // builtin_diffstat counts no subtree (`--find-object`'s tree_in_recursive)
+    if (isTreeSide(pair.old) || isTreeSide(pair.new)) continue;
     const nameA = pair.old?.path ?? pair.new?.path ?? "";
     const nameB = pair.new?.path ?? nameA;
     const renamed = nameB !== nameA;
