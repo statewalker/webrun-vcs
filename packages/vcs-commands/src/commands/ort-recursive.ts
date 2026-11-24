@@ -17,6 +17,7 @@ import {
   ortMerge,
   ortResultEntries,
 } from "./ort-merge.js";
+import { shiftTree, shiftTreeBy } from "./subtree-shift.js";
 import type { CheckedEntry } from "./worktree-overwrite-checks.js";
 
 /** The base a merge runs against, and its name after `|||||||`. */
@@ -137,6 +138,22 @@ export async function mergeStoredTrees(
   flat: (id: ObjectId | undefined) => Promise<Map<string, CheckedEntry>> = (id) =>
     flatTree(ctx.trees, id),
 ): Promise<OrtMergeResult & { ours: Map<string, CheckedEntry> }> {
+  if (options.subtreeShift !== undefined) {
+    // merge_ort_nonrecursive_internal: their side and the base shifted to ours' shape
+    const prefix = options.subtreeShift;
+    const emptyTree = () => ctx.trees.storeTree([]);
+    const shift = (two: ObjectId | undefined) =>
+      prefix
+        ? shiftTreeBy(ctx.trees, ours, two, prefix, emptyTree)
+        : shiftTree(ctx.trees, ours, two, emptyTree);
+    theirs = await shift(theirs);
+    if (base.stored) {
+      const shifted = await shift(base.treeId);
+      if (shifted !== base.treeId) {
+        base = { ...base, treeId: shifted, tree: () => flat(shifted) };
+      }
+    }
+  }
   if (base.stored) {
     const { flats, dirs } = await prunedFlatTrees(ctx.trees, [base.treeId, ours, theirs]);
     const merge = await ortMerge(ctx.blobs, flats[0], flats[1], flats[2], {

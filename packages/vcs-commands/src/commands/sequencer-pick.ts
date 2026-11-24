@@ -28,13 +28,17 @@ import { authorIdentOf, committerIdentOf } from "./git-ident.js";
 import { UNMERGED_FILES_MESSAGE } from "./merge-command.js";
 import { conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
+import { parseStrategyOptions, strategyOrtOptions } from "./merge-strategy-options.js";
 import {
   conflictsComment,
   FlatTreeCache,
+  flatTree,
+  indexChanges,
   indexChangesFromTree,
   type MergeWriteContext,
   type OperationState,
   readIndex,
+  storeFlatTree,
   storeFlatTreeOver,
   subjectOf,
   switchTrees,
@@ -42,7 +46,8 @@ import {
   writeIndexAsTree,
 } from "./merge-support.js";
 import { stripspace } from "./message-cleanup.js";
-import { ortResultEntries } from "./ort-merge.js";
+import { octopusMerge } from "./octopus-merge.js";
+import { type OrtConflict, ortResultEntries } from "./ort-merge.js";
 import { mergeStoredTrees, storedBase } from "./ort-recursive.js";
 import { reflogLine, reflogMessages, updateHead } from "./reflog-messages.js";
 import {
@@ -53,6 +58,7 @@ import {
 } from "./sequencer-support.js";
 import { SigningFailedError, type SignRequest, signCommit, signRequestOf } from "./signing.js";
 import { appendSignoff, signoffLine, trailerConfigOf, trailerLinesOf } from "./trailers.js";
+import type { CheckedEntry } from "./worktree-overwrite-checks.js";
 
 /** What the sequencer does with each commit. */
 export type PickAction = "pick" | "revert";
@@ -117,6 +123,14 @@ export interface PickOptions {
   noCommit?: boolean;
   mainline?: number;
   favor?: "ours" | "theirs" | "union";
+  /**
+   * `-s <strategy>` (git's opts->strategy): `ort`/`recursive` (merge-ort, as without one),
+   * `resolve` (git-merge-resolve) or `subtree` (git merge-subtree); a revert always runs
+   * merge-ort. Saved in `sequencer/opts` (`options.strategy`).
+   */
+  strategy?: string;
+  /** `-X <option>`s (saved in `sequencer/opts` as `options.strategy-option`) */
+  strategyOptions?: string[];
   /** The label of HEAD in conflict markers (default `HEAD`) */
   oursLabel?: string;
   /**
@@ -276,6 +290,10 @@ export class PickSequencer {
   private readonly flags: PickFlags;
   /** commit.cleanup (git's default_msg_cleanup with explicit_cleanup), or saved in the opts */
   private cleanup: SequencerCleanup | undefined;
+  /** `-s` (git's opts->strategy), or saved in the opts */
+  private strategy: string | undefined;
+  /** `-X` options (git's opts->xopts), or saved in the opts */
+  private xopts: string[];
 
   constructor(
     private readonly deps: SequencerDeps,
@@ -299,6 +317,8 @@ export class PickSequencer {
       allowFf: !!options.allowFf,
     };
     this.cleanup = configuredCleanup(deps.workingCopy);
+    this.strategy = options.strategy;
+    this.xopts = [...(options.strategyOptions ?? [])];
   }
 
   private config(key: string): string | undefined {
@@ -371,7 +391,9 @@ export class PickSequencer {
       flag("record-origin", f.recordOrigin);
       flag("allow-ff", f.allowFf);
       if (f.mainline) opts.push(`\tmainline = ${f.mainline}\n`);
+      if (this.strategy) opts.push(`\tstrategy = ${this.strategy}\n`);
       if (this.sign !== undefined) opts.push(`\tgpg-sign = ${this.sign}\n`);
+      for (const x of this.xopts) opts.push(`\tstrategy-option = ${x}\n`);
       if (this.cleanup) opts.push(`\tdefault-msg-cleanup = ${this.cleanup}\n`);
       if (opts.length > 0) await state.write("sequencer/opts", `[options]\n${opts.join("")}`);
     }
@@ -421,6 +443,21 @@ export class PickSequencer {
     }
     if (sequenced) await this.deps.state.remove("sequencer");
     return { status: "ok", newHead, picked, output };
+  }
+
+  /** The merge of a pick: {@link mergePickChange} with this run's strategy and options. */
+  private mergePick(p: Omit<PickMergeArgs, "strategy" | "xopts" | "oursLabel" | "favor">) {
+    return mergePickChange(
+      { ...this.deps, flats: this.flats, abbreviate: (id) => this.abbreviator.abbreviate(id) },
+      {
+        ...p,
+        strategy: this.strategy,
+        xopts: this.xopts,
+        oursLabel: this.options.oursLabel ?? "HEAD",
+        favor: this.options.favor,
+        ...(this.deps.hooks?.compatibility ? { compatibility: this.deps.hooks.compatibility } : {}),
+      },
+    );
   }
 
   /** One commit's change merged into HEAD (do_pick_commit). */
@@ -487,49 +524,47 @@ export class PickSequencer {
       action === "pick"
         ? [parentTreeId, commit.tree, parentLabel, label]
         : [commit.tree, parentTreeId, label, parentLabel];
-    const flats = this.flats;
-    const merge = await mergeStoredTrees(
-      deps,
-      storedBase(base, baseLabel, () => flats.get(base)),
+    const merged = await this.mergePick({
+      action,
+      headId,
       headTreeId,
+      base,
       theirs,
-      {
-        oursLabel: this.options.oursLabel ?? "HEAD",
-        theirsLabel,
-        baseLabel,
-        style: conflictStyleOf(deps.workingCopy),
-        favor: this.options.favor,
-        ignoreCase: coreBool(deps.workingCopy, "ignorecase", false),
-        ...ortConfigOptions(deps.workingCopy, deps.worktree),
-      },
-      (id) => flats.get(id),
-    );
-    const target = await ortResultEntries(deps.blobs, merge);
-    // only the directories the pick changes are stored again
-    const treeId = await storeFlatTreeOver(deps.trees, headTreeId, merge.ours, target);
-    const conflicts = [...merge.conflicts.values()];
+      baseLabel,
+      theirsLabel,
+      pickId: item.id,
+      parentId,
+    });
+    if ("failed" in merged) return this.fail(merged.failed, merged.output ?? []);
+    const { treeId, conflicts, clean } = merged;
     // only the paths HEAD and the result differ on are switched
-    const delta = await treeDelta(deps.trees, headTreeId, treeId);
+    const delta = merged.delta ?? (await treeDelta(deps.trees, headTreeId, treeId));
     const refused = await switchTrees(deps, delta.from, delta.to, {
       action: "merge",
       operation: name,
       conflicts,
-      targetTree: treeId,
+      ...(merged.delta ? {} : { targetTree: treeId }),
     });
     if (refused) {
-      return this.fail(`${refused.message}\nfatal: ${name} failed`);
+      return this.fail(`${refused.message}\nfatal: ${name} failed`, merged.refusedOutput ?? []);
     }
-    output.push(...merge.messages);
-    await deps.state.setRef("AUTO_MERGE", treeId);
+    output.push(...merged.messages);
+    // merge-ort records its result tree (git-merge-resolve does not)
+    if (merged.autoMerge) await deps.state.setRef("AUTO_MERGE", treeId);
+    const ort = !merged.external;
     const message = await this.messageFor(action, item.id, commit, parentId);
 
-    if (conflicts.length > 0 || !merge.clean) {
+    if (conflicts.length > 0 || !clean) {
       const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort(compareGitPaths);
       // git records REVERT_HEAD for a revert -n too (do_pick_commit), never CHERRY_PICK_HEAD
       if (!flags.noCommit || action === "revert") {
         await deps.state.setRef(HEAD_REF[action], item.id);
       }
-      await deps.state.write("MERGE_MSG", `${message}${conflictsComment(paths, true)}`);
+      // do_recursive_merge adds the conflicts hint; another strategy's MERGE_MSG has none
+      await deps.state.write(
+        "MERGE_MSG",
+        ort ? `${message}${conflictsComment(paths, true)}` : message,
+      );
       const advice = flags.noCommit
         ? [
             "hint: after resolving the conflicts, mark the corrected paths",
@@ -549,6 +584,8 @@ export class PickSequencer {
         picked: [],
         output,
         message: [
+          // git-merge-one-file's stderr (`ERROR: content conflict in f`, ...)
+          ...(merged.errors ?? []),
           `error: could not ${action === "pick" ? "apply" : "revert"} ${short}... ${subject}`,
           ...advice,
         ].join("\n"),
@@ -845,6 +882,7 @@ export class PickSequencer {
     const text = await this.deps.state.read("sequencer/opts");
     if (text === undefined) return;
     let section = "";
+    let xoptsRead = false;
     for (const raw of text.split("\n")) {
       const line = raw.trim();
       const header = /^\[\s*([^\]\s]+)\s*\]/.exec(line);
@@ -867,6 +905,16 @@ export class PickSequencer {
       }
       if (name === "default-msg-cleanup") {
         this.cleanup = cleanupOf(text) ?? this.cleanup;
+        continue;
+      }
+      if (name === "strategy") {
+        this.strategy = text;
+        continue;
+      }
+      if (name === "strategy-option") {
+        if (!xoptsRead) this.xopts = [];
+        xoptsRead = true;
+        this.xopts.push(text);
         continue;
       }
       const value = parseGitBool(text);
@@ -1284,4 +1332,173 @@ function shortDate(ident: PersonIdent | undefined): string {
   const d = new Date((ident.timestamp + minutes * 60) * 1000);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+}
+
+/** What {@link mergePickChange} reads and writes with. */
+export interface PickMergeContext {
+  workingCopy: SequencerDeps["workingCopy"];
+  worktree?: Worktree;
+  staging: SequencerDeps["staging"];
+  blobs: SequencerDeps["blobs"];
+  trees: CommandTrees;
+  commits: CommandCommits;
+  flats: FlatTreeCache;
+  abbreviate: (id: ObjectId) => Promise<string>;
+}
+
+/** The pick {@link mergePickChange} merges. */
+export interface PickMergeArgs {
+  action: PickAction;
+  headId: ObjectId | undefined;
+  /** HEAD's tree (undefined: the empty tree of an unborn branch) */
+  headTreeId: ObjectId | undefined;
+  base: ObjectId | undefined;
+  theirs: ObjectId | undefined;
+  baseLabel: string;
+  theirsLabel: string;
+  pickId: ObjectId;
+  parentId: ObjectId | undefined;
+  /** `-s` (undefined: merge-ort) */
+  strategy: string | undefined;
+  /** `-X` options */
+  xopts: readonly string[];
+  /** HEAD's label in merge-ort's markers */
+  oursLabel: string;
+  /** `-X ours` / `-X theirs` / union given apart from the options */
+  favor?: "ours" | "theirs" | "union";
+  /** The git version whose behaviour to follow where they differ (default 2.56) */
+  compatibility?: "2.43" | "2.56";
+}
+
+/** What {@link mergePickChange} found: the result to switch to, or git's failure. */
+export type PickMergeResult =
+  | {
+      treeId: ObjectId;
+      conflicts: OrtConflict[];
+      /** The paths the conflicts are about (merge-ort's keys; a file moved aside's own path) */
+      conflictPaths: string[];
+      clean: boolean;
+      /** What the strategy printed (merge-ort's messages, git-merge-resolve's stdout) */
+      messages: string[];
+      /** Whether to record AUTO_MERGE (merge-ort's result tree) */
+      autoMerge: boolean;
+      /** Whether the strategy ran as git's child command (resolve, subtree) */
+      external: boolean;
+      /** What git-merge-one-file printed on stderr */
+      errors?: string[];
+      /** The switch to make, when it is not HEAD's tree to `treeId` */
+      delta?: { from: Map<string, CheckedEntry>; to: Map<string, CheckedEntry> };
+      /** What was printed before a refused switch */
+      refusedOutput?: string[];
+    }
+  | { failed: string; output?: string[] };
+
+/**
+ * The merge of a pick (do_pick_commit): merge-ort (do_recursive_merge, with the `-X`
+ * options) unless `-s` names another strategy; `subtree` is git merge-subtree (merge-ort
+ * with the shift, the commits' full ids as labels), `resolve` git-merge-resolve
+ * (`read-tree -m --aggressive` and git-merge-one-file). Nothing is written but blobs and
+ * trees: the caller switches to the result.
+ */
+export async function mergePickChange(
+  ctx: PickMergeContext,
+  p: PickMergeArgs,
+): Promise<PickMergeResult> {
+  const strategy = p.strategy;
+  const ort =
+    strategy === undefined ||
+    strategy === "recursive" ||
+    strategy === "ort" ||
+    p.action === "revert";
+  if (!ort && strategy === "resolve" && p.headId) {
+    const headFlat = await flatTree(ctx.trees, p.headTreeId);
+    const { index } = await readIndex(ctx.staging);
+    const outcome = await octopusMerge(
+      {
+        commits: ctx.commits,
+        trees: ctx.trees,
+        blobs: ctx.blobs,
+        style: conflictStyleOf(ctx.workingCopy),
+      },
+      p.headId,
+      [{ id: p.pickId, name: p.pickId }],
+      indexChanges(index, headFlat),
+      { resolve: true, bases: p.parentId ? [p.parentId] : [] },
+    );
+    if (outcome.status === 2) {
+      const name = ACTION_NAME[p.action];
+      return {
+        failed: `${outcome.errors.join("\n")}\nfatal: ${name} failed`.trimStart(),
+        output: outcome.output,
+      };
+    }
+    const target = new Map(outcome.index);
+    for (const [path, entry] of outcome.worktree) target.set(path, entry);
+    const treeId = await storeFlatTree(ctx.trees, outcome.index);
+    return {
+      treeId,
+      conflicts: outcome.conflicts,
+      conflictPaths: outcome.conflicts.map((c) => c.stagePath),
+      clean: outcome.status === 0,
+      messages: outcome.output,
+      errors: outcome.errors,
+      autoMerge: false,
+      external: true,
+      delta: { from: headFlat, to: target },
+      refusedOutput: outcome.output.slice(0, outcome.steps[0]?.output ?? 0),
+    };
+  }
+  if (!ort && strategy !== "subtree") {
+    return { failed: `fatal: merge strategy '${strategy}' is not supported here` };
+  }
+  // do_recursive_merge reads the options without checking them (merge-subtree dies on an
+  // unknown one, before merging)
+  const xopts = parseStrategyOptions(p.xopts, ort);
+  const subtree = !ort;
+  const flats = ctx.flats;
+  const labels = subtree
+    ? {
+        oursLabel: p.headId ?? "HEAD",
+        theirsLabel: p.pickId,
+        baseLabel: p.parentId ? await ctx.abbreviate(p.parentId) : "empty tree",
+      }
+    : {
+        oursLabel: p.oursLabel,
+        theirsLabel: p.theirsLabel,
+        baseLabel: p.baseLabel,
+      };
+  const subtreeShift = xopts.subtreeShift ?? (subtree ? "" : undefined);
+  const merge = await mergeStoredTrees(
+    ctx,
+    storedBase(p.base, labels.baseLabel, () => flats.get(p.base)),
+    p.headTreeId,
+    p.theirs,
+    {
+      ...labels,
+      style: conflictStyleOf(ctx.workingCopy),
+      favor: p.favor ?? xopts.favor,
+      ignoreCase: coreBool(ctx.workingCopy, "ignorecase", false),
+      ...ortConfigOptions(ctx.workingCopy, ctx.worktree, {
+        ...(xopts.renormalize !== undefined ? { renormalize: xopts.renormalize } : {}),
+      }),
+      // merge-subtree runs with init_basic_merge_options (no diff.algorithm)
+      ...strategyOrtOptions(subtree ? undefined : ctx.workingCopy, xopts),
+      ...(subtreeShift !== undefined ? { subtreeShift } : {}),
+    },
+    (id) => flats.get(id),
+  );
+  const target = await ortResultEntries(ctx.blobs, merge);
+  // only the directories the pick changes are stored again
+  const treeId = await storeFlatTreeOver(ctx.trees, p.headTreeId, merge.ours, target);
+  return {
+    treeId,
+    conflicts: [...merge.conflicts.values()],
+    conflictPaths: [...merge.conflicts.keys()],
+    clean: merge.clean,
+    messages: merge.messages,
+    // merge-subtree runs as a child: git 2.5x's (merge-ort) records AUTO_MERGE when it leaves
+    // conflicts, 2.43's (merge-recursive) never
+    autoMerge: ort || (!merge.clean && p.compatibility !== "2.43"),
+    external: !ort,
+  };
 }
