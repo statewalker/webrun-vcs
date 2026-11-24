@@ -136,6 +136,7 @@ export function diffEntryToPair(entry: DiffEntry, blobs: Blobs): DiffFilePair {
         : side(entry.oldPath ?? entry.newPath, entry.oldMode, entry.oldId, entry.readOld),
     new: newSide,
     ...(entry.score !== undefined ? { score: entry.score } : {}),
+    ...(entry.lineRanges ? { lineRanges: entry.lineRanges } : {}),
   };
 }
 

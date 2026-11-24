@@ -522,6 +522,7 @@ function reverseEntry(entry: DiffEntry): DiffEntry {
   if (entry.readNew) out.readOld = entry.readNew;
   if (entry.readOld) out.readNew = entry.readOld;
   if (entry.score !== undefined) out.score = entry.score;
+  if (entry.lineRanges) out.lineRanges = entry.lineRanges;
   return out;
 }
 
@@ -628,8 +629,12 @@ function abbrevOption(value: number | undefined): number | undefined {
   return Math.min(40, Math.max(4, Math.trunc(value)));
 }
 
-/** `diff.renames` as git_config_rename reads it: `copies`/`copy` detect copies too. */
-function renamesValue(value: string | undefined): boolean | "copies" | undefined {
+/**
+ * `diff.renames` as git_config_rename reads it: `copies`/`copy` detect copies too.
+ *
+ * @internal
+ */
+export function renamesValue(value: string | undefined): boolean | "copies" | undefined {
   if (value === undefined) return undefined;
   const v = value.trim().toLowerCase();
   if (v === "copies" || v === "copy") return "copies";
@@ -1099,6 +1104,44 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   }
 
   /**
+   * The queue {@link callFormats} prints instead of comparing the trees: pairs a caller found
+   * itself (`git log -L` queues each commit's pairs with their line ranges, line-log.c's
+   * `line_log_queue_pairs`). diffcore's later stages (pickaxe, order, `--diff-filter`) still
+   * apply.
+   *
+   * @internal
+   */
+  setQueue(entries: DiffEntry[]): this {
+    this.checkCallable();
+    this.presetQueue = entries;
+    return this;
+  }
+
+  private presetQueue?: DiffEntry[];
+
+  /**
+   * diffcore's filtering stages over a queue a caller found (the pickaxe, `-O`,
+   * `--diff-filter`): git 2.43's `git log -L` runs them on the pairs it follows renames with
+   *
+   * @internal
+   */
+  async filterQueue(entries: DiffEntry[]): Promise<DiffEntry[]> {
+    await this.preparePickaxe();
+    return this.selected(entries);
+  }
+
+  /**
+   * The diff driver of a path as a diff of two trees finds it (the worktree's attributes,
+   * `diff.<driver>.*`, the builtin drivers): `git log -L :<funcname>:<file>` finds functions
+   * by its funcname pattern (line-range.c's `userdiff_find_by_path`)
+   *
+   * @internal
+   */
+  async driverOf(path: string): Promise<DiffDriver | undefined> {
+    return this.outputOptions().driver?.(path);
+  }
+
+  /**
    * Detect renames (`-M`, `--no-renames`). Default: off for `call()` (each path as added and
    * deleted), `diff.renames` (default on) for `callText()`.
    */
@@ -1289,7 +1332,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       let followPath = follow;
       let followChange: ChangeType.RENAME | ChangeType.COPY | undefined;
       let collected: { entries: DiffEntry[]; combined: CombinedEntry[] };
-      if (follow !== undefined) {
+      if (this.presetQueue) {
+        await this.preparePickaxe();
+        collected = { entries: this.presetQueue, combined: [] };
+      } else if (follow !== undefined) {
         const spec = this.pathspecItems;
         this.pathspecItems = [parsePathspecItem(`:(literal)${follow}`)];
         collected = await this.collect(false, false, false, false);

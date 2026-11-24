@@ -13,6 +13,7 @@ export * from "./diff-pickaxe.js";
 export * from "./diff-words.js";
 export * from "./fetch-result.js";
 export * from "./init-result.js";
+export * from "./line-range-hunks.js";
 export * from "./merge-result.js";
 export * from "./pull-result.js";
 export * from "./push-result.js";

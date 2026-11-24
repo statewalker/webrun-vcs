@@ -90,6 +90,11 @@ export interface EmittedHunk {
   /** The function line of the header (empty when none) */
   func: Uint8Array;
   lines: EmittedLine[];
+  /**
+   * Both counts printed even when 1 (`@@ -3,1 +3,1 @@`), as the hunks `git log -L` cuts to its
+   * line ranges are headed (diff.c's `flush_rhunk`)
+   */
+  countsAlways?: boolean;
 }
 
 /** The two files of a diff after {@link unifiedDiffHunks}, and its hunks */
@@ -607,7 +612,9 @@ export class ByteSink {
  * `sane_truncate_line`: the header cut at the first byte that is not valid UTF-8).
  */
 export function formatHunkHeader(hunk: EmittedHunk): Uint8Array {
-  const range = (start: number, count: number) => (count !== 1 ? `${start},${count}` : `${start}`);
+  const always = hunk.countsAlways === true;
+  const range = (start: number, count: number) =>
+    always || count !== 1 ? `${start},${count}` : `${start}`;
   // ASCII: its char codes are its bytes
   const head = `@@ -${range(hunk.oldStart, hunk.oldCount)} +${range(hunk.newStart, hunk.newCount)} @@`;
   const buf = HEADER_SCRATCH;
