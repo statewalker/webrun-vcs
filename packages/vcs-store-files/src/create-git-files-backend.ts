@@ -27,11 +27,7 @@ import {
   withLazyFetch,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
-import {
-  type AtomicFiles,
-  parseSharedRepository,
-  withSharedPerm,
-} from "@statewalker/vcs-utils/files";
+import { type AtomicFiles, sharedRepositoryOf, withSharedPerm } from "@statewalker/vcs-utils/files";
 import {
   type ObjectFormat,
   SHA1_OBJECT_FORMAT,
@@ -266,10 +262,7 @@ export async function createGitFilesBackend(
   // a value git dies on leaves the modes to the umask here (index-host reads it the same way)
   let shared = 0;
   try {
-    const value = settingsConfig.get("core.sharedRepository");
-    // a key without a value is group (git_config_perm of NULL)
-    shared =
-      value === true ? 0o660 : parseSharedRepository(typeof value === "string" ? value : undefined);
+    shared = sharedRepositoryOf(settingsConfig.get("core.sharedRepository"));
   } catch {
     shared = 0;
   }

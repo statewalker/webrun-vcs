@@ -67,6 +67,18 @@ export function parseSharedRepository(value: string | undefined): number {
 }
 
 /**
+ * {@link parseSharedRepository} of a value as a config reader returns it: a key without a
+ * value (`true`) is group, a number (`1`, `2`, `0660` read as numbers) is read as its digits.
+ *
+ * @throws SharedRepositoryModeError as {@link parseSharedRepository}
+ */
+export function sharedRepositoryOf(value: unknown): number {
+  if (value === true) return PERM_GROUP;
+  if (typeof value === "number") return parseSharedRepository(String(value));
+  return parseSharedRepository(typeof value === "string" ? value : undefined);
+}
+
+/**
  * The `core.sharedRepository` value `git init` writes for `shared` (init_db): an octal mode
  * as `0<mode>`, group as `1`, everybody as `2` (spellings older gits read); undefined for 0.
  */
@@ -173,7 +185,8 @@ export function withSharedPerm(files: FilesApi, shared: () => number, scope = "/
     if (isReadOnlyObjectFile(normalizePath(path))) {
       const stats = await posix.lstat?.(path);
       if (stats?.kind === "file" && stats.mode !== undefined) {
-        await posix.chmod?.(path, (stats.mode & ~0o777) | 0o444);
+        // created 0444 under the umask: the write bits dropped
+        await posix.chmod?.(path, stats.mode & ~0o222);
       }
     }
     await adjustSharedPerm(files, path, mode);

@@ -109,6 +109,13 @@ describeGit("core.sharedRepository, as native git (t1301-shared-repo)", () => {
     writeFileSync(join(root, "templates/hooks/post-update"), "#!/bin/sh\nexit 0\n");
     chmodSync(join(root, "templates/hooks/post-update"), 0o755);
     writeFileSync(join(root, "templates/foo"), "whatever\n");
+    // the repository fetched from
+    expect(native(root, ["init", "-q", "--template=", "-b", "main", "src"]).status).toBe(0);
+    for (const name of ["one", "two"]) {
+      writeFileSync(join(root, "src", `${name}.txt`), `${name}\n`);
+      native(join(root, "src"), ["add", `${name}.txt`]);
+      native(join(root, "src"), ["commit", "-q", "-m", name]);
+    }
   });
   afterAll(() => rmSync(root, { recursive: true, force: true }));
   afterEach(() => process.umask(savedUmask));
@@ -303,4 +310,97 @@ describeGit("core.sharedRepository, as native git (t1301-shared-repo)", () => {
     expect(config).toContain("\tsharedrepository = 0640\n");
     expect(config).toContain("[receive]\n\tdenyNonFastforwards = true\n");
   });
+
+  /** A twin pair made by `init --shared=<shared>` (ours `setShared`), then a fetch from src. */
+  async function sharedAndFetched(shared: string, umask: number): Promise<[string, string]> {
+    const n = `fetched${counter}-native`;
+    const o = `fetched${counter++}-ours`;
+    const refspec = "refs/heads/main:refs/remotes/src/main";
+    expect(native(root, ["init", "-q", "--template=", `--shared=${shared}`, n], umask).status).toBe(
+      0,
+    );
+    const fetched = native(
+      join(root, n),
+      ["fetch", "-q", "--no-write-fetch-head", join(root, "src"), refspec],
+      umask,
+    );
+    expect(fetched.status, fetched.stderr).toBe(0);
+    await oursInit(o, (c) => c.setShared(shared).setTemplate(""), umask);
+    await underUmask(umask, async () => {
+      const git = await openOurs(root, environment(), undefined, o);
+      await git
+        .fetch()
+        .setRemote(join(root, "src"))
+        .setRefSpecs(refspec)
+        .setWriteFetchHead(false)
+        .call();
+    });
+    return [n, o];
+  }
+
+  /** Modes of the files a fetch wrote: refs, reflogs, objects (loose or packed alike). */
+  function fetchedModes(dir: string): Record<string, string> {
+    const all = modes(dir);
+    const out: Record<string, string> = {};
+    for (const [path, mode] of Object.entries(all)) {
+      // our repack leaves emptied loose object directories (git's prune-packed removes them)
+      if (
+        /^\.git\/objects\/[0-9a-f]{2}$/.test(path) &&
+        readdirSync(join(root, dir, path)).length === 0
+      ) {
+        continue;
+      }
+      // native unpacks a small fetch into loose objects, ours keeps the pack: one mode each
+      const key = /^\.git\/objects\/([0-9a-f]{2}(\/.*)?|pack\/.+)$/.test(path)
+        ? `.git/objects/<${mode.startsWith("d") ? "dir" : "file"}>`
+        : path;
+      out[key] = mode;
+    }
+    return out;
+  }
+
+  for (const shared of ["group", "all", "true", "1"]) {
+    for (const umask of [0o077, 0o022]) {
+      it(`--shared=${shared}, then a fetch under umask ${umask.toString(8).padStart(3, "0")}: the fetched files get git's modes`, async () => {
+        const [n, o] = await sharedAndFetched(shared, umask);
+        expect(fetchedModes(o)).toEqual(fetchedModes(n));
+        expect(modeOf(`${o}/.git/refs/remotes/src/main`)).toBe(
+          modeOf(`${n}/.git/refs/remotes/src/main`),
+        );
+        // a re-init reports the repository shared, as git's "Reinitialized existing shared"
+        const again = await oursInit(o, (c) => c.setTemplate(""), umask);
+        expect(again.reinitialized).toBe(true);
+        expect(again.shared).toBe(shared === "all" ? 0o664 : 0o660);
+        expect(native(join(root, n), ["init", "--template="], umask).stdout).toMatch(
+          /^Reinitialized existing shared Git repository/,
+        );
+      });
+    }
+  }
+
+  for (const umask of [0o077, 0o022]) {
+    it(`--shared=0640, a fetch, then gc --prune=now under umask ${umask.toString(8).padStart(3, "0")}`, async () => {
+      const [n, o] = await sharedAndFetched("0640", umask);
+      const gc = [
+        "-c",
+        "gc.reflogExpire=90.days.ago",
+        "-c",
+        "gc.reflogExpireUnreachable=30.days.ago",
+        "gc",
+        "-q",
+        "--prune=now",
+      ];
+      expect(native(join(root, n), gc, umask).status).toBe(0);
+      await underUmask(umask, async () => {
+        const git = await openOurs(root, environment(), undefined, o);
+        await git.gc().setPrune("now").setQuiet(true).call();
+      });
+      const ours = fetchedModes(o);
+      expect(ours).toEqual(fetchedModes(n));
+      for (const path of [".git/info/refs", ".git/objects/info/packs", ".git/packed-refs"]) {
+        expect(ours[path], path).toBe("f 640");
+      }
+      expect(ours[".git/objects/info/commit-graph"]).toBe("f 440");
+    });
+  }
 });

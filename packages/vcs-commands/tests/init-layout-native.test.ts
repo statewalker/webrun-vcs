@@ -74,13 +74,14 @@ function layout(dir: string, rename: Record<string, string> = {}): Record<string
     const at = join(root, dir, rel);
     const st = lstatSync(at);
     const mode = (st.mode & 0o7777).toString(8);
-    if (st.isSymbolicLink()) out[rel || "."] = `link ${mode}`;
+    const key = fix(rel) || ".";
+    if (st.isSymbolicLink()) out[key] = `link ${mode}`;
     else if (st.isDirectory()) {
-      out[rel || "."] = `dir ${mode}`;
+      out[key] = `dir ${mode}`;
       for (const name of readdirSync(at).sort()) walk(rel ? `${rel}/${name}` : name);
     } else {
       const text = st.size < 4096 ? fix(readFileSync(at, "utf8")) : `<${st.size} bytes>`;
-      out[rel || "."] = `file ${mode} ${text}`;
+      out[key] = `file ${mode} ${text}`;
     }
   };
   walk("");
@@ -290,29 +291,185 @@ describeGit("git init's layout, as native git (t0001-init)", () => {
     expect(layout(`${o}-real`)).toEqual(layout(`${n}-real`));
   });
 
-  it('t0001-init.sh: "re-init to move gitdir with linked worktrees (absolute)"', async () => {
-    const [n, o] = twinNames("mainwt");
+  /** t0001's sep_git_dir_worktree: a main worktree and a linked one, links as `mode` says. */
+  function linkedWorktreePair(name: string, mode: "absolute" | "relative") {
+    expect(native(root, ["init", "-q", "--template=", "-b", "main", name]).status).toBe(0);
+    native(join(root, name), ["config", "worktree.useRelativePaths", String(mode === "relative")]);
+    native(join(root, name), ["commit", "-q", "--allow-empty", "-m", "gumby"]);
+    const add = native(join(root, name), ["worktree", "add", "-q", "--detach", `../${name}-link`]);
+    expect(add.status, add.stderr).toBe(0);
+  }
+
+  /** What the twins are compared by once the git directory moved. */
+  function movedState(name: string) {
+    const rename = { [name]: "X" };
+    const fix = (t: string) => t.replaceAll(join(root, name), "R/X").replaceAll(name, "X");
+    const at = (p: string) => join(root, p);
+    return {
+      main: layout(name, rename),
+      sep: layout(`${name}-sep`, rename),
+      link: fix(readFileSync(at(`${name}-link/.git`), "utf8")),
+      common: fix(native(at(`${name}-link`), ["rev-parse", "--git-common-dir"]).stdout),
+      linkCommon: fix(native(at(name), ["rev-parse", "--git-common-dir"]).stdout),
+      list: fix(native(at(name), ["worktree", "list", "--porcelain"]).stdout),
+      status: native(at(`${name}-link`), ["status", "--porcelain"]).status,
+    };
+  }
+
+  for (const from of ["mainwt", "linkwt"] as const) {
+    for (const mode of ["absolute", "relative"] as const) {
+      const title =
+        from === "mainwt"
+          ? `re-init to move gitdir with linked worktrees (${mode})`
+          : `re-init to move gitdir within linked worktree (${mode})`;
+      it(`t0001-init.sh: "${title}"`, async () => {
+        const [n, o] = twinNames(from);
+        for (const name of [n, o]) linkedWorktreePair(name, mode);
+        const at = (name: string) => (from === "mainwt" ? name : `${name}-link`);
+        const theirs = native(join(root, at(n)), [
+          "init",
+          "-q",
+          "--template=",
+          "--separate-git-dir",
+          `../${n}-sep`,
+        ]);
+        expect(theirs.status, theirs.stderr).toBe(0);
+        const result = await ours((c) =>
+          c.setDirectory(at(o)).setSeparateGitDir(`${o}-sep`).setTemplate(""),
+        );
+        expect((result.warnings ?? []).filter((w) => w.startsWith("error"))).toEqual([]);
+        expect(result.gitDir).toBe(`${o}-sep`);
+        const mine = movedState(o);
+        expect(mine).toEqual(movedState(n));
+        expect(mine.status).toBe(0);
+      });
+    }
+  }
+
+  it('t0001-init.sh: "bare & --separate-git-dir incompatible within worktree"', async () => {
+    const [n, o] = twinNames("bare");
     for (const name of [n, o]) {
       expect(native(root, ["init", "-q", "--template=", "-b", "main", name]).status).toBe(0);
-      native(join(root, name), ["config", "worktree.useRelativePaths", "false"]);
       native(join(root, name), ["commit", "-q", "--allow-empty", "-m", "gumby"]);
+      expect(native(root, ["clone", "-q", "--bare", name, `${name}.git`]).status).toBe(0);
+      const add = native(join(root, `${name}.git`), [
+        "worktree",
+        "add",
+        "--detach",
+        `../${name}-wt`,
+      ]);
+      expect(add.status, add.stderr).toBe(0);
+    }
+    const theirs = native(join(root, `${n}-wt`), ["init", "--separate-git-dir", "seprepo"]);
+    expect(theirs.status).toBe(128);
+    const error = await ours((c) =>
+      c.setDirectory(`${o}-wt`).setSeparateGitDir(`${o}-wt/seprepo`).setTemplate(""),
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(InitOptionsError);
+    expect(error.lines).toEqual([theirs.stderr.trimEnd()]);
+    expect(layout(`${o}.git`, { [o]: "X" })).toEqual(layout(`${n}.git`, { [n]: "X" }));
+    expect(layout(`${o}-wt`, { [o]: "X" })).toEqual(layout(`${n}-wt`, { [n]: "X" }));
+  });
+
+  it('t0001-init.sh: "re-init from a linked worktree"', async () => {
+    const [n, o] = twinNames("main-worktree");
+    for (const name of [n, o]) {
+      linkedWorktreePair(name, "absolute");
+      native(join(root, name), ["config", "--unset", "worktree.useRelativePaths"]);
+    }
+    expect(
+      native(join(root, `${n}-link`), ["init", "-q", `--template=${join(root, "template-source")}`])
+        .status,
+    ).toBe(0);
+    const result = await ours((c) => c.setDirectory(`${o}-link`).setTemplate("template-source"));
+    expect(result.reinitialized).toBe(true);
+    expect(layout(o, { [o]: "X" })).toEqual(layout(n, { [n]: "X" }));
+    // the templates and the config went to the common directory, nothing to the worktree's
+    expect(layout(o)[".git/file"]).toBe("file 644 content\n");
+    expect(layout(`${o}-link`, { [o]: "X" })).toEqual(layout(`${n}-link`, { [n]: "X" }));
+  });
+
+  it("a linked worktree outside the FilesApi is repaired through the host's files", async () => {
+    // our FilesApi is rooted at `<name>-box`, the linked worktree lies beside it
+    const [n, o] = twinNames("outside");
+    for (const name of [n, o]) {
+      mkdirSync(join(root, `${name}-box`));
       expect(
-        native(join(root, name), ["worktree", "add", "-q", "--detach", `../${name}-link`]).status,
+        native(join(root, `${name}-box`), ["init", "-q", "--template=", "-b", "main", "main"])
+          .status,
       ).toBe(0);
+      native(join(root, `${name}-box/main`), ["config", "worktree.useRelativePaths", "false"]);
+      native(join(root, `${name}-box/main`), ["commit", "-q", "--allow-empty", "-m", "c"]);
+      const add = native(join(root, `${name}-box/main`), [
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        `../../${name}-wt`,
+      ]);
+      expect(add.status, add.stderr).toBe(0);
     }
-    const sep = ["init", "-q", "--separate-git-dir", `../${n}-sep`];
-    expect(native(join(root, n), sep).status).toBe(0);
-    await ours((c) => c.setDirectory(o).setSeparateGitDir(`${o}-sep`).setTemplate(""));
-    for (const [name, wt] of [
-      [n, `${n}-link`],
-      [o, `${o}-link`],
-    ]) {
-      const common = native(join(root, wt), ["rev-parse", "--git-common-dir"]);
-      expect(common.stdout.trim()).toBe(join(root, `${name}-sep`));
-    }
-    expect(readFileSync(join(root, `${o}-link`, ".git"), "utf8")).toBe(
-      `gitdir: ${join(root, `${o}-sep`)}/worktrees/${o}-link\n`,
-    );
+    expect(
+      native(join(root, `${n}-box/main`), [
+        "init",
+        "-q",
+        "--template=",
+        "--separate-git-dir",
+        "../sep",
+      ]).status,
+    ).toBe(0);
+    const environment = createNodeGitHostEnvironment({ env: testEnv(root) });
+    const files = createNodeFilesApi({ rootDir: join(root, `${o}-box`) });
+    const result = await new InitCommand()
+      .setFilesApi(files)
+      .setEnvironment(environment)
+      .setDirectory("main")
+      .setSeparateGitDir("sep")
+      .setTemplate("")
+      .call();
+    expect((result.warnings ?? []).filter((w) => w.startsWith("error"))).toEqual([]);
+    const linkOf = (name: string) =>
+      readFileSync(join(root, `${name}-wt/.git`), "utf8").replaceAll(name, "X");
+    expect(linkOf(o)).toBe(linkOf(n));
+    expect(native(join(root, `${o}-wt`), ["status", "--porcelain"]).status).toBe(0);
+
+    // without the host's files the worktree is reported, the repository still moved
+    const [n2, o2] = twinNames("unreachable");
+    mkdirSync(join(root, `${o2}-box`));
+    expect(
+      native(join(root, `${o2}-box`), ["init", "-q", "--template=", "-b", "main", "main"]).status,
+    ).toBe(0);
+    native(join(root, `${o2}-box/main`), ["config", "worktree.useRelativePaths", "false"]);
+    native(join(root, `${o2}-box/main`), ["commit", "-q", "--allow-empty", "-m", "c"]);
+    native(join(root, `${o2}-box/main`), ["worktree", "add", "-q", "--detach", `../../${o2}-wt`]);
+    const blind = { ...environment, hostFilesOf: undefined };
+    const reported = await new InitCommand()
+      .setFilesApi(createNodeFilesApi({ rootDir: join(root, `${o2}-box`) }))
+      .setEnvironment(blind)
+      .setDirectory("main")
+      .setSeparateGitDir("sep")
+      .setTemplate("")
+      .call();
+    expect(n2).toBeDefined();
+    expect(reported.warnings).toEqual([
+      `error: could not repair worktree link, not reachable here: ${join(root, `${o2}-wt`)}/.git`,
+    ]);
+    expect(native(join(root, `${o2}-box/main`), ["status", "--porcelain"]).status).toBe(0);
+  });
+
+  it("re-init through a gitfile naming a repository outside the FilesApi is refused", async () => {
+    const [, o] = twinNames("stray");
+    mkdirSync(join(root, `${o}-box/wt`), { recursive: true });
+    expect(native(root, ["init", "-q", "--template=", `${o}-repo`]).status).toBe(0);
+    writeFileSync(join(root, `${o}-box/wt/.git`), `gitdir: ${join(root, `${o}-repo/.git`)}\n`);
+    const error = await new InitCommand()
+      .setFilesApi(createNodeFilesApi({ rootDir: join(root, `${o}-box`) }))
+      .setDirectory("wt")
+      .setTemplate("")
+      .call()
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(InitOptionsError);
+    expect(readdirSync(join(root, `${o}-box/wt`))).toEqual([".git"]);
   });
 
   it("re-init copies only the templates that are missing, and keeps the config's mode", async () => {

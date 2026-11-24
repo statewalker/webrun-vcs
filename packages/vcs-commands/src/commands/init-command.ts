@@ -39,6 +39,7 @@ import {
   PERM_GROUP,
   parseSharedRepository,
   sharedRepositoryConfigValue,
+  sharedRepositoryOf,
   withSharedPerm,
 } from "@statewalker/vcs-utils/files";
 import {
@@ -415,6 +416,9 @@ export class InitCommand {
     let history: History;
     let staging: Staging;
     let resultGitDir = gitDir;
+    // the worktree's top: the directory asked for, or the main worktree when
+    // --separate-git-dir was given inside a linked one
+    let worktreeRoot = (this.directory ?? "").replace(/\/+$/, "");
     let reinitialized = false;
     let shared = 0;
     if (this.files) {
@@ -429,11 +433,21 @@ export class InitCommand {
       let dir = gitDir.replace(/\/+$/, "") || ".";
       if (this.separateGitDir !== undefined) {
         const real = this.separateGitDir.replace(/\/+$/, "") || ".";
-        await this.separateGitDirectory(files, dir, real);
+        const { worktreeTop } = await this.separateGitDirectory(files, dir, real, warnings);
+        if (worktreeTop !== undefined) worktreeRoot = worktreeTop;
         dir = real;
       } else if (!this.bare) {
+        // re-init through a gitfile: the repository it names, a linked worktree's common
+        // directory (templates, config, objects and refs live there)
         const linked = await gitfileTargetOf(files, dir);
-        if (linked !== undefined) dir = linked;
+        if (linked !== undefined) {
+          if (!linked.reachable) {
+            throw new InitOptionsError(
+              `fatal: the repository '${linked.path}' the gitfile '${dir}' names lies outside the storage`,
+            );
+          }
+          dir = (await commonDirectoryOf(files, linked.path)) ?? linked.path;
+        }
       }
       // a relative path stays relative (gitfile targets come back rooted)
       resultGitDir = gitDir.startsWith("/") ? dir : dir.replace(/^\/+/, "") || ".";
@@ -594,7 +608,7 @@ export class InitCommand {
           files,
           // the worktree is the directory asked for (git init <dir>), the FilesApi's root
           // without one
-          rootPath: (this.directory ?? "").replace(/\/+$/, ""),
+          rootPath: worktreeRoot,
           blobs: history.blobs,
           trees: history.trees,
           gitDir: resultGitDir,
@@ -698,28 +712,136 @@ export class InitCommand {
       undefined,
       this.environment ? { environment: this.environment } : {},
     );
-    const value = config.get("core.sharedRepository");
-    if (value === true) return PERM_GROUP;
-    return parseSharedRepository(typeof value === "string" ? value : undefined);
+    return sharedRepositoryOf(config.get("core.sharedRepository"));
   }
 
   /**
-   * setup.c's `separate_git_dir`: a repository at `link` (a `.git` directory, or the one its
-   * gitfile names) is moved to `real` and its linked worktrees repaired, then the gitfile
-   * written at `link`.
+   * cmd_init_db's `--separate-git-dir` and setup.c's `separate_git_dir`: a repository at
+   * `link` (a `.git` directory, or the one its gitfile names; inside a linked worktree the
+   * repository's common directory, its main worktree's `.git` then the link) is moved to
+   * `real`, the gitfile written in its place, then its linked worktrees repaired (best
+   * effort: each one that cannot be is reported in `warnings`). A move that cannot be
+   * completed is rolled back, so the repository is never left without its `.git`.
+   *
+   * @returns the main worktree's top when `link` was a linked worktree's gitfile
    */
-  private async separateGitDirectory(files: FilesApi, link: string, real: string): Promise<void> {
+  private async separateGitDirectory(
+    files: FilesApi,
+    link: string,
+    real: string,
+    warnings: string[],
+  ): Promise<{ worktreeTop?: string }> {
+    let worktreeTop: string | undefined;
     const kind = (await files.stats(link))?.kind;
     let source: string | undefined;
     if (kind === "directory") source = link;
-    else if (kind === "file") source = await gitfileTargetOf(files, link);
+    else if (kind === "file") {
+      const target = await gitfileTargetOf(files, link);
+      if (target && !target.reachable) {
+        throw new InitOptionsError(
+          `fatal: the repository '${target.path}' the gitfile '${link}' names lies outside the storage`,
+        );
+      }
+      source = target?.path;
+      // inside a linked worktree the common directory moves (init-db.c: get_common_dir)
+      const common = source !== undefined ? await commonDirectoryOf(files, source) : undefined;
+      if (common !== undefined) {
+        // guess_repository_type: a common directory not named `.git` is a bare repository
+        if (!/(^|\/)\.git$/.test(normalizePath(common))) {
+          throw new InitOptionsError("fatal: --separate-git-dir incompatible with bare repository");
+        }
+        source = common;
+        link = common;
+        worktreeTop = dirname(normalizePath(common)).replace(/^\/+/, "");
+      }
+    }
     if (source !== undefined && normalizePath(source) !== normalizePath(real)) {
+      // the worktrees' relative links resolve from where the repository was
+      const oldHost = await this.hostPath(files, source);
       if (!(await files.move(source, real))) {
         throw new InitOptionsError(`fatal: unable to move ${source} to ${real}`);
       }
-      await repairWorktreesAfterGitdirMove(files, real, await this.hostPath(files, real), source);
+      try {
+        await this.writeGitfile(files, link, real);
+      } catch (error) {
+        // never leave the repository without its `.git`: the move is undone
+        await files.remove(link).catch(() => false);
+        await files.move(real, source).catch(() => false);
+        throw error;
+      }
+      await this.repairWorktreesAfterGitdirMove(files, real, oldHost, warnings);
+      return worktreeTop !== undefined ? { worktreeTop } : {};
     }
+    await this.writeGitfile(files, link, real);
+    return worktreeTop !== undefined ? { worktreeTop } : {};
+  }
+
+  /** `write_file(git_link, "gitdir: %s", git_dir)`: the git directory's real host path. */
+  private async writeGitfile(files: FilesApi, link: string, real: string): Promise<void> {
     await files.write(link, [encodeGitPath(`gitdir: ${await this.hostPath(files, real)}\n`)]);
+  }
+
+  /**
+   * worktree.c's `repair_worktrees_after_gitdir_move`: each linked worktree of the repository
+   * now at `gitDir` (before at host path `oldHost`) whose `.git` file still exists gets its
+   * gitfile and back-pointer written anew, absolute or relative as they were. A worktree
+   * outside the FilesApi is reached through `GitHostEnvironment.hostFilesOf`; one that cannot
+   * be reached or written is reported in `warnings` and the others go on.
+   */
+  private async repairWorktreesAfterGitdirMove(
+    files: FilesApi,
+    gitDir: string,
+    oldHost: string,
+    warnings: string[],
+  ): Promise<void> {
+    const admin = joinPath(gitDir, "worktrees");
+    if ((await files.stats(admin))?.kind !== "directory") return;
+    const newHost = (await this.hostPath(files, gitDir)).replace(/\/+$/, "");
+    const names: string[] = [];
+    for await (const entry of files.list(admin))
+      if (entry.kind === "directory") names.push(entry.name);
+    for (const id of names.sort()) {
+      const backPointer = joinPath(admin, id, "gitdir");
+      let dotgitHost: string | undefined;
+      try {
+        if ((await files.stats(backPointer))?.kind !== "file") continue;
+        const dotgit = decodeGitPath(await readFile(files, backPointer)).replace(
+          /[ \t\n\v\f\r]+$/,
+          "",
+        );
+        const relative = !isAbsoluteGitPath(dotgit);
+        // strbuf_realpath_forgiving of the old place joined with the relative link
+        dotgitHost = relative ? resolveDots(`${oldHost}/worktrees/${id}/${dotgit}`) : dotgit;
+        const target = await this.reachHostPath(files, dotgitHost);
+        if (!target) {
+          warnings.push(`error: could not repair worktree link, not reachable here: ${dotgitHost}`);
+          continue;
+        }
+        // file_exists: a worktree gone is left alone
+        if ((await target.files.stats(target.path)) === undefined) continue;
+        const adminHost = `${newHost}/worktrees/${id}`;
+        const gitfile = relative ? relativePath(parentOf(dotgitHost), adminHost) : adminHost;
+        const back = relative ? relativePath(adminHost, dotgitHost) : dotgitHost;
+        await target.files.write(target.path, [encodeGitPath(`gitdir: ${gitfile}\n`)]);
+        await files.write(backPointer, [encodeGitPath(`${back}\n`)]);
+      } catch (error) {
+        warnings.push(
+          `error: could not repair worktree link: ${dotgitHost ?? backPointer}: ${(error as Error).message}`,
+        );
+      }
+    }
+  }
+
+  /** A host path as a FilesApi reaches it: this one (under its root), else the host's. */
+  private async reachHostPath(
+    files: FilesApi,
+    host: string,
+  ): Promise<{ files: FilesApi; path: string } | undefined> {
+    const root = hostRootOf(files);
+    if (root === undefined) return { files, path: host };
+    const paths = new HostPaths(root);
+    if (paths.inside(host)) return { files, path: paths.filesPath(host) };
+    return (await this.environment?.hostFilesOf?.(host).catch(() => undefined)) ?? undefined;
   }
 
   /** The host's absolute (real) path of `path` in `files`, as git's real_pathdup names it. */
@@ -892,48 +1014,58 @@ export class InitOptionsError extends Error {
 /**
  * The git directory the gitfile at `path` names, as a path of `files` (an absolute target
  * mapped through the FilesApi's `rootDirectory`, a relative one from the gitfile's
- * directory); undefined when `path` is no gitfile.
+ * directory), and whether the FilesApi reaches it; undefined when `path` is no gitfile.
  */
-async function gitfileTargetOf(files: FilesApi, path: string): Promise<string | undefined> {
+async function gitfileTargetOf(
+  files: FilesApi,
+  path: string,
+): Promise<{ path: string; reachable: boolean } | undefined> {
   if ((await files.stats(path))?.kind !== "file") return undefined;
   const target = parseGitfile(decodeGitPath(await readFile(files, path)));
   if (target === undefined) return undefined;
-  if (isAbsoluteGitPath(target)) return new HostPaths(hostRootOf(files)).filesPath(target);
-  return joinPath(dirname(path), target);
+  if (isAbsoluteGitPath(target)) {
+    const root = hostRootOf(files);
+    if (root === undefined) return { path: target, reachable: true };
+    const paths = new HostPaths(root);
+    return { path: paths.filesPath(target), reachable: paths.inside(target) };
+  }
+  const resolved = resolveDots(joinPath(dirname(path), target));
+  return { path: resolved, reachable: !resolved.startsWith("/..") };
 }
 
 /**
- * worktree.c's `repair_worktrees_after_gitdir_move`: each linked worktree of the repository
- * now at `gitDir` (host path `hostGitDir`) whose `.git` file still exists gets its gitfile
- * and back-pointer written anew, absolute or relative as they were.
+ * The common directory a linked worktree's git directory names (`commondir`, relative to it
+ * unless absolute), as a path of `files`; undefined when `gitDir` has none.
  */
-async function repairWorktreesAfterGitdirMove(
-  files: FilesApi,
-  gitDir: string,
-  hostGitDir: string,
-  oldGitDir?: string,
-): Promise<void> {
-  const paths = new HostPaths(hostRootOf(files));
-  const admin = joinPath(gitDir, "worktrees");
-  if ((await files.stats(admin))?.kind !== "directory") return;
-  for await (const entry of files.list(admin)) {
-    if (entry.kind !== "directory") continue;
-    const backPointer = joinPath(admin, entry.name, "gitdir");
-    if ((await files.stats(backPointer))?.kind !== "file") continue;
-    const dotgit = decodeGitPath(await readFile(files, backPointer)).replace(/[ \t\n\v\f\r]+$/, "");
-    const relative = !isAbsoluteGitPath(dotgit);
-    const dotgitPath = relative
-      ? joinPath(oldGitDir ?? gitDir, "worktrees", entry.name, dotgit)
-      : paths.filesPath(dotgit);
-    if ((await files.stats(dotgitPath)) === undefined) continue;
-    const adminDir = joinPath(admin, entry.name);
-    const gitfile = relative
-      ? relativePath(dirname(dotgitPath), adminDir)
-      : `${hostGitDir.replace(/\/+$/, "")}/worktrees/${entry.name}`;
-    const back = relative ? relativePath(adminDir, dotgitPath) : dotgit;
-    await files.write(dotgitPath, [encodeGitPath(`gitdir: ${gitfile}\n`)]);
-    await files.write(backPointer, [encodeGitPath(`${back}\n`)]);
+async function commonDirectoryOf(files: FilesApi, gitDir: string): Promise<string | undefined> {
+  const file = joinPath(gitDir, "commondir");
+  if ((await files.stats(file))?.kind !== "file") return undefined;
+  const value = decodeGitPath(await readFile(files, file)).replace(/[\r\n]+$/, "");
+  if (!value) return undefined;
+  if (isAbsoluteGitPath(value)) {
+    const root = hostRootOf(files);
+    return root === undefined ? value : new HostPaths(root).filesPath(value);
   }
+  return resolveDots(joinPath(gitDir, value));
+}
+
+/** `path` with its `.` and `..` components resolved lexically (`..` above the root kept). */
+function resolveDots(path: string): string {
+  const absolute = path.startsWith("/");
+  const out: string[] = [];
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === ".." && out.length > 0 && out[out.length - 1] !== "..") out.pop();
+    else if (part === ".." && absolute && out.length === 0) out.push("..");
+    else out.push(part);
+  }
+  return `${absolute ? "/" : ""}${out.join("/")}`;
+}
+
+/** The directory holding `path` (a host path or a path of a FilesApi). */
+function parentOf(path: string): string {
+  const slash = path.replace(/\/+$/, "").lastIndexOf("/");
+  return slash <= 0 ? "/" : path.slice(0, slash);
 }
 
 /** The relative path from directory `from` to `to` (both paths of one FilesApi). */
