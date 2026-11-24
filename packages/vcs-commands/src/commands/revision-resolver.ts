@@ -273,6 +273,28 @@ export class RevisionResolver {
   }
 
   /**
+   * git's `repo_interpret_branch_name` over the start of `name`: how many characters it read
+   * (`@{-1}` of `@{-1}@{2}`) and the branch they stand for; undefined when it reads none.
+   */
+  async interpretBranchPrefix(name: string): Promise<{ used: number; value: string } | undefined> {
+    const interpreted = await this.interpret(name);
+    return typeof interpreted === "object" ? interpreted : undefined;
+  }
+
+  /**
+   * git's `repo_dwim_log`: the refs whose reflog `name` names by the ref rules (its own, or
+   * that of the ref it points to), first found first.
+   */
+  async dwimLogRefs(name: string): Promise<string[]> {
+    return (await this.dwimLog(name)).map((found) => found.ref);
+  }
+
+  /** The time `@{<date>}` selectors are read against (seconds). */
+  currentTime(): number {
+    return this.now();
+  }
+
+  /**
    * The ref `@{upstream}` of `branch` names (git's `branch_get_upstream`); the current
    * branch when undefined.
    *
