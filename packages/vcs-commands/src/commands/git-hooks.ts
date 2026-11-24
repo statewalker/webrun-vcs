@@ -22,7 +22,7 @@
 
 import type { RefTransactionHook } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
-import type { FilesApi } from "@statewalker/vcs-utils/files";
+import { type FilesApi, sharedRepositoryOf, withSharedPerm } from "@statewalker/vcs-utils/files";
 import {
   expandUserPath,
   type GitHostEnvironment,
@@ -892,7 +892,25 @@ export class HookSession {
   /** A file of the git directory as the repository's FilesApi names it (no layout: none). */
   async gitFile(name: string): Promise<{ files: FilesApi; path: string } | undefined> {
     const layout = await this.host.layout();
-    return layout ? { files: layout.files, path: joinFilesPath(layout.gitDir, name) } : undefined;
+    if (!layout) return undefined;
+    return { files: await this.repositoryFiles(layout), path: joinFilesPath(layout.gitDir, name) };
+  }
+
+  /**
+   * The repository's FilesApi for writes in its git directories: under `core.sharedRepository`
+   * wrapped so what is created there gets git's modes (`adjust_shared_perm`), as the files
+   * backend's own FilesApi is.
+   */
+  private async repositoryFiles(layout: HookLayout): Promise<FilesApi> {
+    let shared = 0;
+    try {
+      shared = sharedRepositoryOf(this.host.configValue("core.sharedRepository"));
+    } catch {
+      shared = 0;
+    }
+    if (!shared) return layout.files;
+    const common = await commonDirOf(layout.files, layout.gitDir);
+    return withSharedPerm(layout.files, () => shared, common);
   }
 
   /**
@@ -903,7 +921,7 @@ export class HookSession {
     const layout = await this.host.layout();
     if (!layout) return undefined;
     return {
-      files: layout.files,
+      files: await this.repositoryFiles(layout),
       path: joinFilesPath(await commonDirOf(layout.files, layout.gitDir), name),
     };
   }

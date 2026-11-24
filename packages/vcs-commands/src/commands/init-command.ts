@@ -4,15 +4,25 @@ import {
   type FilesApi,
   type History,
   type PosixFilesApi,
+  readFile,
 } from "@statewalker/vcs-core";
 import {
+  configFilesApiOf,
   createFileWorktree,
   createGitFilesHistoryFromFiles,
+  createWorkingCopyConfig,
   FileStagingStore,
+  HostPaths,
+  hostPathOf,
+  hostRootOf,
+  isAbsoluteGitPath,
+  openGitLinkedWorktrees,
+  parseGitfile,
   probeCaseFolding,
   readProtectedConfig,
   readRepositoryFormat,
   resolveLinkedGitDir,
+  setConfigMultivarText,
 } from "@statewalker/vcs-store-files";
 import { MemoryStagingStore } from "@statewalker/vcs-store-mem";
 import {
@@ -22,6 +32,17 @@ import {
   objectFormatByName,
   SHA1_OBJECT_FORMAT,
 } from "@statewalker/vcs-utils";
+import {
+  adjustSharedPerm,
+  dirname,
+  joinPath,
+  normalizePath,
+  PERM_GROUP,
+  parseSharedRepository,
+  sharedRepositoryConfigValue,
+  sharedRepositoryOf,
+  withSharedPerm,
+} from "@statewalker/vcs-utils/files";
 import {
   createMemoryCheckout,
   type GitHostEnvironment,
@@ -91,7 +112,72 @@ export class InitCommand {
   private objectFormatName?: string;
   /** `--ref-format`; undefined: git's default (see {@link defaultRefFormat}) */
   private refFormat?: string;
+  /** `--separate-git-dir`: the repository's place, `.git` then a gitfile naming it */
+  private separateGitDir?: string;
+  /** `--template`: the directory copied into the repository ("" copies none) */
+  private template?: { path: string; files?: FilesApi };
+  /** `--shared` as git_config_perm reads it; undefined: core.sharedRepository decides */
+  private shared?: number;
   private callable = true;
+
+  /**
+   * Put the repository at `path` (`git init --separate-git-dir <path>`, a path of the
+   * FilesApi) and write a gitfile in its place (`<directory>/.git`: `gitdir: <path>`, the
+   * path as the host names it: under the FilesApi's `rootDirectory`, its links resolved
+   * through `GitHostEnvironment.realPath`). An existing repository there (a `.git`
+   * directory, or the one a `.git` gitfile names) is moved to `path` first, as git's
+   * re-init moves it, and its linked worktrees are pointed at the new place. Refused for a
+   * bare repository (`InitOptionsError`).
+   *
+   * @param path The git directory's place
+   * @returns this for method chaining
+   */
+  setSeparateGitDir(path: string): this {
+    this.checkCallable();
+    this.separateGitDir = path;
+    return this;
+  }
+
+  /**
+   * Copy the templates of `path` into the repository (`git init --template=<path>`): every
+   * file, directory and symbolic link not starting with `.`, an existing file never
+   * replaced (a template `config` included), executables made executable (hooks). `path`
+   * is a directory of `files` (default: the command's FilesApi); "" copies nothing. Without
+   * it, `$GIT_TEMPLATE_DIR` (`GitHostEnvironment.templateDir`) then `init.templateDir`
+   * from the system or global configuration (or `git -c`), read through
+   * `GitHostEnvironment.hostFilesOf`; ours has no built-in templates.
+   *
+   * @param path The template directory, or "" for none
+   * @param files The storage holding it
+   * @returns this for method chaining
+   */
+  setTemplate(path: string, files?: FilesApi): this {
+    this.checkCallable();
+    this.template = files ? { path, files } : { path };
+    return this;
+  }
+
+  /**
+   * Make the repository shared (`git init --shared[=<permissions>]`): true or no value is
+   * `group`; a string is what git accepts (`false`/`umask`, `true`/`group`, `all`/`world`/
+   * `everybody`, an octal mode such as `0640`). Written as `core.sharedRepository` (with
+   * `receive.denyNonFastforwards`), and the files and directories created get git's modes
+   * (`adjust_shared_perm`) where the FilesApi keeps modes. Without it,
+   * `core.sharedRepository` from the configuration (the template's included) decides.
+   *
+   * @throws SharedRepositoryModeError for an octal mode without owner read and write
+   * @returns this for method chaining
+   */
+  setShared(permissions: string | boolean = true): this {
+    this.checkCallable();
+    this.shared =
+      permissions === true
+        ? PERM_GROUP
+        : permissions === false
+          ? 0
+          : parseSharedRepository(permissions);
+    return this;
+  }
 
   /**
    * Set the object format of the new repository (`git init --object-format=<format>`):
@@ -330,15 +416,57 @@ export class InitCommand {
     // one it stays in memory.
     let history: History;
     let staging: Staging;
+    let resultGitDir = gitDir;
+    // re-init from a linked worktree: its administrative directory (the common one gets
+    // the templates, config, objects and refs)
+    let linkedAdmin: string | undefined;
+    // the worktree's top: the directory asked for, or the main worktree when
+    // --separate-git-dir was given inside a linked one
+    let worktreeRoot = (this.directory ?? "").replace(/\/+$/, "");
+    let reinitialized = false;
+    let shared = 0;
     if (this.files) {
-      const dir = gitDir.replace(/\/+$/, "") || ".";
+      if (this.separateGitDir !== undefined && this.bare) {
+        throw new InitOptionsError(
+          "fatal: options '--separate-git-dir' and '--bare' cannot be used together",
+        );
+      }
+      // cmd_init_db's paths: the git directory, or with --separate-git-dir the gitfile's place
+      // and the directory it names (an existing repository moved there first, as
+      // separate_git_dir renames it); a `.git` gitfile names the repository re-initialised
+      let dir = gitDir.replace(/\/+$/, "") || ".";
+      if (this.separateGitDir !== undefined) {
+        const real = this.separateGitDir.replace(/\/+$/, "") || ".";
+        const { worktreeTop } = await this.separateGitDirectory(files, dir, real, warnings);
+        if (worktreeTop !== undefined) worktreeRoot = worktreeTop;
+        dir = real;
+      } else if (!this.bare) {
+        // re-init through a gitfile: the repository it names, a linked worktree's common
+        // directory (templates, config, objects and refs live there)
+        const linked = await gitfileTargetOf(files, dir);
+        if (linked !== undefined) {
+          if (!linked.reachable) {
+            throw new InitOptionsError(
+              `fatal: the repository '${linked.path}' the gitfile '${dir}' names lies outside the storage`,
+            );
+          }
+          const common = await commonDirectoryOf(files, linked.path);
+          // a linked worktree's own git directory: HEAD, index and the working copy are its
+          if (common !== undefined) linkedAdmin = linked.path;
+          dir = common ?? linked.path;
+        }
+      }
+      // a relative path stays relative (gitfile targets come back rooted)
+      resultGitDir = gitDir.startsWith("/") ? dir : dir.replace(/^\/+/, "") || ".";
       // a `.git` the user linked elsewhere is followed (resolved through the FilesApi)
       const repoFiles = await resolveLinkedGitDir(files, dir);
       const isFile = async (path: string) => (await repoFiles.stats(path))?.kind === "file";
       const hasHead = await isFile(`${dir}/HEAD`);
       // A repository with a config but no HEAD (damaged or half-made) is opened, not
       // re-created: creating rewrites the config, and its remotes and settings with it.
-      const fresh = !hasHead && !(await isFile(`${dir}/config`));
+      const hadConfig = await isFile(`${dir}/config`);
+      const fresh = !hasHead && !hadConfig;
+      reinitialized = hasHead;
       if (fresh) {
         objectFormat = explicitFormat ?? (await this.defaultObjectFormat(warnings));
       } else {
@@ -358,26 +486,92 @@ export class InitCommand {
         ? await defaultRefFormat(this.environment, this.refFormat)
         : undefined;
       if (refFormat) warnings.push(...refFormat.warnings);
+
+      // core.sharedRepository: --shared, else the configuration (the repository's own when it
+      // exists); what init creates gets git's modes (adjust_shared_perm)
+      shared = this.shared ?? (await this.configuredShared(repoFiles, dir));
+      const sharedFiles = withSharedPerm(repoFiles, () => shared, dir);
+      // safe_create_dir(git_dir, 0): made under the umask, adjusted below
+      await repoFiles.mkdir(dir);
+      // copy_templates: the template's config may set core.sharedRepository, read after it
+      await this.copyTemplates(sharedFiles, dir, warnings);
+      shared = this.shared ?? (await this.configuredShared(repoFiles, dir));
+      if (shared) await adjustSharedPerm(repoFiles, dir, shared);
+
+      // the config, set as create_default_files and init_db set it
+      const configPath = `${dir}/config`;
+      const configExisted = await isFile(configPath);
+      const readText = async () =>
+        configExisted || (await isFile(configPath))
+          ? decodeGitPath(await readFile(repoFiles, configPath))
+          : undefined;
+      const fullConfig = await createWorkingCopyConfig(
+        configFilesApiOf(repoFiles, { readOnly: "init reads the configuration only" }),
+        dir,
+        undefined,
+        this.environment ? { environment: this.environment } : {},
+      );
+      let text = await readText();
+      const set = (key: string, value: string) => {
+        const result = setConfigMultivarText(text, configPath, key, value);
+        if (result.text !== undefined) text = result.text;
+      };
+      const refStorage = fresh ? (refFormat?.format ?? "files") : undefined;
+      if (fresh && objectFormat.name !== "sha1") set("extensions.objectformat", objectFormat.name);
+      if (refStorage === "reftable") set("extensions.refstorage", "reftable");
+      const v1 =
+        (fresh && (objectFormat.name !== "sha1" || refStorage === "reftable")) ||
+        (!fresh && /^\s*\[\s*extensions\s*\]/im.test(text ?? ""));
+      set("core.repositoryformatversion", v1 ? "1" : "0");
+      set("core.filemode", "true");
+      set("core.bare", this.bare ? "true" : "false");
+      // a template's (or the user's) core.logAllRefUpdates is kept
+      if (!this.bare && fullConfig.get("core.logAllRefUpdates") === undefined) {
+        set("core.logallrefupdates", "true");
+      }
+      const writeConfig = async () => {
+        const bytes = encodeGitPath(text ?? "");
+        // a new config is created as a tempfile (adjusted); a rewrite keeps the file's mode
+        if (configExisted) await repoFiles.write(configPath, [bytes]);
+        else await sharedFiles.write(configPath, [bytes]);
+      };
+      await writeConfig();
+      if (fresh) {
+        // git init's probe: a filesystem that folds case or Unicode composition
+        const folding = await probeCaseFolding(repoFiles as PosixFilesApi, dir);
+        if (folding.ignoreCase) set("core.ignorecase", "true");
+        if (folding.precomposeUnicode) set("core.precomposeunicode", "true");
+      }
+      const sharedValue = sharedRepositoryConfigValue(shared);
+      if (sharedValue !== undefined) {
+        set("core.sharedrepository", sharedValue);
+        set("receive.denyNonFastforwards", "true");
+      }
+      await writeConfig();
+
       const open = (create: boolean) =>
         createGitFilesHistoryFromFiles({
-          files: repoFiles,
-          gitDir,
+          files: sharedFiles,
+          gitDir: dir,
           create,
+          writeConfig: false,
           defaultBranch: initialBranch,
           ...(create ? { objectFormat } : {}),
           ...(create && refFormat ? { refFormat: refFormat.format } : {}),
           ...(this.environment ? { environment: this.environment } : {}),
         });
-      if (fresh && this.bare && dir !== ".") {
-        // The directory layout writes `core.bare = true` only for a gitDir of "."; set it
-        // before opening, so what reads the config (reflog defaults) sees a bare repository.
-        await open(true);
-        await markBare(repoFiles, `${dir}/config`);
-        history = await open(false);
-      } else {
-        history = await open(fresh);
-      }
+      history = await open(fresh);
       await history.initialize();
+      // files_ref_store_create_on_disk: refs (adjusted even when it exists), refs/heads and
+      // refs/tags made where missing
+      if (!fresh && (await readRepositoryFormat(repoFiles, dir)).refStorage === "files") {
+        await sharedFiles.mkdir(`${dir}/refs/heads`);
+        await sharedFiles.mkdir(`${dir}/refs/tags`);
+      }
+      if (shared) await adjustSharedPerm(repoFiles, `${dir}/refs`, shared);
+      // create_object_database: objects/pack and objects/info, made where missing
+      await sharedFiles.mkdir(`${dir}/objects/pack`);
+      await sharedFiles.mkdir(`${dir}/objects/info`);
       if (hasHead) {
         // the branch an existing repository's HEAD names (empty when detached)
         const head = await history.refs.get("HEAD");
@@ -385,15 +579,6 @@ export class InitCommand {
           head && "target" in head && head.target.startsWith("refs/heads/")
             ? head.target.slice("refs/heads/".length)
             : "";
-      }
-      if (fresh) {
-        // git init's probe: a filesystem that folds case or Unicode composition
-        const folding = await probeCaseFolding(repoFiles as PosixFilesApi, dir);
-        if (folding.ignoreCase)
-          await setCoreValue(repoFiles, `${dir}/config`, "ignorecase", "true");
-        if (folding.precomposeUnicode) {
-          await setCoreValue(repoFiles, `${dir}/config`, "precomposeunicode", "true");
-        }
       }
       if (!hasHead && !fresh) {
         await history.refs.setSymbolic("HEAD", `refs/heads/${initialBranch}`);
@@ -405,7 +590,7 @@ export class InitCommand {
       } else if (this.bare) {
         staging = new MemoryStagingStore();
       } else {
-        const fileStaging = new FileStagingStore(repoFiles, `${dir}/index`, { objectFormat });
+        const fileStaging = new FileStagingStore(sharedFiles, `${dir}/index`, { objectFormat });
         // a SHA-256 repository's index is not read yet: its first use refuses
         if (objectFormat.name === "sha1") await fileStaging.read();
         staging = fileStaging;
@@ -413,11 +598,37 @@ export class InitCommand {
     } else {
       objectFormat = explicitFormat ?? (await this.defaultObjectFormat(warnings));
       await chooseBranch();
+      shared = this.shared ?? 0;
       history = createMemoryHistory({ objectFormat });
       await history.initialize();
       // Set initial branch by creating symbolic ref for HEAD
       await history.refs.setSymbolic("HEAD", `refs/heads/${initialBranch}`);
       staging = this.stagingStore ?? new MemoryStagingStore();
+    }
+
+    if (linkedAdmin !== undefined && this.files) {
+      // git's re-init works in the linked worktree: its HEAD, its index, its files
+      const relative = (p: string) => (gitDir.startsWith("/") ? p : p.replace(/^\/+/, "") || ".");
+      const worktrees = await openGitLinkedWorktrees({
+        files,
+        gitDir: linkedAdmin,
+        history,
+        ...(this.environment ? { environment: this.environment } : {}),
+      });
+      const linkedCopy = await worktrees.openCurrent();
+      const branch = await linkedCopy.getCurrentBranch?.();
+      return {
+        git: Git.fromWorkingCopy(linkedCopy),
+        workingCopy: linkedCopy,
+        repository: linkedCopy.history,
+        initialBranch: typeof branch === "string" ? branch.replace(/^refs\/heads\//, "") : "",
+        ...(hints ? { hints } : {}),
+        ...(warnings.length > 0 ? { warnings } : {}),
+        bare: false,
+        gitDir: relative(linkedAdmin),
+        reinitialized,
+        shared,
+      };
     }
 
     // Create worktree if enabled and not bare
@@ -429,10 +640,10 @@ export class InitCommand {
           files,
           // the worktree is the directory asked for (git init <dir>), the FilesApi's root
           // without one
-          rootPath: (this.directory ?? "").replace(/\/+$/, ""),
+          rootPath: worktreeRoot,
           blobs: history.blobs,
           trees: history.trees,
-          gitDir,
+          gitDir: resultGitDir,
           ...(this.environment ? { environment: this.environment } : {}),
         });
     }
@@ -516,8 +727,237 @@ export class InitCommand {
       ...(hints ? { hints } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
       bare: this.bare,
-      gitDir,
+      gitDir: resultGitDir,
+      reinitialized,
+      shared,
     };
+  }
+
+  /**
+   * `core.sharedRepository` of the repository at `dir` as git reads it then (system, global,
+   * the repository's file, command line); 0 when unset.
+   */
+  private async configuredShared(files: FilesApi, dir: string): Promise<number> {
+    const config = await createWorkingCopyConfig(
+      configFilesApiOf(files, { readOnly: "init reads the configuration only" }),
+      dir,
+      undefined,
+      this.environment ? { environment: this.environment } : {},
+    );
+    return sharedRepositoryOf(config.get("core.sharedRepository"));
+  }
+
+  /**
+   * cmd_init_db's `--separate-git-dir` and setup.c's `separate_git_dir`: a repository at
+   * `link` (a `.git` directory, or the one its gitfile names; inside a linked worktree the
+   * repository's common directory, its main worktree's `.git` then the link) is moved to
+   * `real`, the gitfile written in its place, then its linked worktrees repaired (best
+   * effort: each one that cannot be is reported in `warnings`). A move that cannot be
+   * completed is rolled back, so the repository is never left without its `.git`.
+   *
+   * @returns the main worktree's top when `link` was a linked worktree's gitfile
+   */
+  private async separateGitDirectory(
+    files: FilesApi,
+    link: string,
+    real: string,
+    warnings: string[],
+  ): Promise<{ worktreeTop?: string }> {
+    let worktreeTop: string | undefined;
+    const kind = (await files.stats(link))?.kind;
+    let source: string | undefined;
+    if (kind === "directory") source = link;
+    else if (kind === "file") {
+      const target = await gitfileTargetOf(files, link);
+      if (target && !target.reachable) {
+        throw new InitOptionsError(
+          `fatal: the repository '${target.path}' the gitfile '${link}' names lies outside the storage`,
+        );
+      }
+      source = target?.path;
+      // inside a linked worktree the common directory moves (init-db.c: get_common_dir)
+      const common = source !== undefined ? await commonDirectoryOf(files, source) : undefined;
+      if (common !== undefined) {
+        // guess_repository_type: a common directory not named `.git` is a bare repository
+        if (!/(^|\/)\.git$/.test(normalizePath(common))) {
+          throw new InitOptionsError("fatal: --separate-git-dir incompatible with bare repository");
+        }
+        source = common;
+        link = common;
+        worktreeTop = dirname(normalizePath(common)).replace(/^\/+/, "");
+      }
+    }
+    if (source !== undefined && normalizePath(source) !== normalizePath(real)) {
+      // the worktrees' relative links resolve from where the repository was
+      const oldHost = await this.hostPath(files, source);
+      // the gitfile there before (a repository reached through one): restored on a failure
+      const linkMoves = normalizePath(link) === normalizePath(source);
+      const previousGitfile = linkMoves ? undefined : await readFile(files, link);
+      if (!(await files.move(source, real))) {
+        throw new InitOptionsError(`fatal: unable to move ${source} to ${real}`);
+      }
+      try {
+        await this.writeGitfile(files, link, real);
+      } catch (error) {
+        // never leave the repository without its `.git`: the move is undone, and the link
+        // is what it was (a gitfile written where the moved directory was goes first)
+        if (linkMoves && (await files.stats(link).catch(() => undefined))?.kind === "file") {
+          await files.remove(link).catch(() => false);
+        }
+        const movedBack = await files.move(real, source).catch(() => false);
+        if (previousGitfile !== undefined) {
+          await files.write(link, [previousGitfile]).catch(() => undefined);
+        }
+        if (!movedBack) {
+          throw new InitOptionsError(
+            `fatal: could not write the gitfile '${link}' (${(error as Error).message}), and the repository could not be moved back: it is now at '${real}', not '${source}'`,
+          );
+        }
+        throw error;
+      }
+      await this.repairWorktreesAfterGitdirMove(files, real, oldHost, warnings);
+      return worktreeTop !== undefined ? { worktreeTop } : {};
+    }
+    await this.writeGitfile(files, link, real);
+    return worktreeTop !== undefined ? { worktreeTop } : {};
+  }
+
+  /** `write_file(git_link, "gitdir: %s", git_dir)`: the git directory's real host path. */
+  private async writeGitfile(files: FilesApi, link: string, real: string): Promise<void> {
+    await files.write(link, [encodeGitPath(`gitdir: ${await this.hostPath(files, real)}\n`)]);
+  }
+
+  /**
+   * worktree.c's `repair_worktrees_after_gitdir_move`: each linked worktree of the repository
+   * now at `gitDir` (before at host path `oldHost`) whose `.git` file still exists gets its
+   * gitfile and back-pointer written anew, absolute or relative as they were. A worktree
+   * outside the FilesApi is reached through `GitHostEnvironment.hostFilesOf`; one that cannot
+   * be reached or written is reported in `warnings` and the others go on.
+   */
+  private async repairWorktreesAfterGitdirMove(
+    files: FilesApi,
+    gitDir: string,
+    oldHost: string,
+    warnings: string[],
+  ): Promise<void> {
+    const admin = joinPath(gitDir, "worktrees");
+    if ((await files.stats(admin))?.kind !== "directory") return;
+    const newHost = (await this.hostPath(files, gitDir)).replace(/\/+$/, "");
+    const names: string[] = [];
+    for await (const entry of files.list(admin))
+      if (entry.kind === "directory") names.push(entry.name);
+    for (const id of names.sort()) {
+      const backPointer = joinPath(admin, id, "gitdir");
+      let dotgitHost: string | undefined;
+      try {
+        if ((await files.stats(backPointer))?.kind !== "file") continue;
+        const dotgit = decodeGitPath(await readFile(files, backPointer)).replace(
+          /[ \t\n\v\f\r]+$/,
+          "",
+        );
+        const relative = !isAbsoluteGitPath(dotgit);
+        // strbuf_realpath_forgiving of the old place joined with the relative link
+        dotgitHost = relative ? resolveDots(`${oldHost}/worktrees/${id}/${dotgit}`) : dotgit;
+        const target = await this.reachHostPath(files, dotgitHost);
+        if (!target) {
+          warnings.push(
+            `error: could not repair worktree link, not reachable here: ${dotgitHost} (run 'git worktree repair ${parentOf(dotgitHost)}')`,
+          );
+          continue;
+        }
+        // file_exists: a worktree gone is left alone
+        if ((await target.files.stats(target.path)) === undefined) continue;
+        const adminHost = `${newHost}/worktrees/${id}`;
+        const gitfile = relative ? relativePath(parentOf(dotgitHost), adminHost) : adminHost;
+        const back = relative ? relativePath(adminHost, dotgitHost) : dotgitHost;
+        await target.files.write(target.path, [encodeGitPath(`gitdir: ${gitfile}\n`)]);
+        await files.write(backPointer, [encodeGitPath(`${back}\n`)]);
+      } catch (error) {
+        warnings.push(
+          `error: could not repair worktree link: ${dotgitHost ?? backPointer}: ${(error as Error).message}`,
+        );
+      }
+    }
+  }
+
+  /** A host path as a FilesApi reaches it: this one (under its root), else the host's. */
+  private async reachHostPath(
+    files: FilesApi,
+    host: string,
+  ): Promise<{ files: FilesApi; path: string } | undefined> {
+    const root = hostRootOf(files);
+    if (root === undefined) return { files, path: host };
+    const paths = new HostPaths(root);
+    if (paths.inside(host)) return { files, path: paths.filesPath(host) };
+    return (await this.environment?.hostFilesOf?.(host).catch(() => undefined)) ?? undefined;
+  }
+
+  /** The host's absolute (real) path of `path` in `files`, as git's real_pathdup names it. */
+  private async hostPath(files: FilesApi, path: string): Promise<string> {
+    const host = hostPathOf(files, normalizePath(path));
+    const realPath = this.environment?.realPath;
+    if (!realPath) return host;
+    const real = await realPath(host).catch(() => undefined);
+    if (real !== undefined) return real;
+    const slash = host.lastIndexOf("/");
+    const parent =
+      slash > 0 ? await realPath(host.slice(0, slash)).catch(() => undefined) : undefined;
+    return parent !== undefined ? `${parent.replace(/\/+$/, "")}${host.slice(slash)}` : host;
+  }
+
+  /**
+   * setup.c's `copy_templates`: the template directory (option, `$GIT_TEMPLATE_DIR`,
+   * `init.templateDir`) copied into `dir`, unless its config is of a repository version
+   * git does not know.
+   */
+  private async copyTemplates(target: FilesApi, dir: string, warnings: string[]): Promise<void> {
+    const source = await this.templateSource();
+    if (!source) return;
+    const { files, path, display } = source;
+    if ((await files.stats(path).catch(() => undefined))?.kind !== "directory") {
+      warnings.push(`warning: templates not found in ${display}`);
+      return;
+    }
+    // "make sure that template is from the correct vintage"
+    const configPath = joinPath(path, "config");
+    if ((await files.stats(configPath))?.kind === "file") {
+      const text = decodeGitPath(await readFile(files, configPath));
+      const version = templateRepositoryVersion(text);
+      if (version !== undefined && version > 1) {
+        warnings.push(
+          `warning: not copying templates from '${display}': Expected git repo version <= 1, found ${version}`,
+        );
+        return;
+      }
+    }
+    await copyTemplateDirectory(files, path, target, dir);
+  }
+
+  /** The templates to copy, as `get_template_dir` finds them; undefined for none. */
+  private async templateSource(): Promise<
+    { files: FilesApi; path: string; display: string } | undefined
+  > {
+    if (this.template !== undefined) {
+      if (this.template.path === "") return undefined;
+      const files = this.template.files ?? this.files;
+      if (!files) return undefined;
+      // git names it absolute (absolute_pathdup)
+      const display = hostPathOf(files, normalizePath(this.template.path));
+      return { files, path: this.template.path, display };
+    }
+    const environment = this.environment;
+    let hostDir = environment?.templateDir;
+    if (hostDir === undefined) {
+      const configured = (await readProtectedConfig(environment))
+        .filter((e) => e.key.toLowerCase() === "init.templatedir")
+        .at(-1);
+      if (configured?.value !== undefined)
+        hostDir = await expandConfigPath(configured.value, environment);
+    }
+    if (!hostDir || !environment?.hostFilesOf) return undefined;
+    const host = await environment.hostFilesOf(hostDir.replace(/\/+$/, "")).catch(() => undefined);
+    if (!host) return undefined;
+    return { files: host.files, path: host.path, display: hostDir };
   }
 
   /**
@@ -609,34 +1049,148 @@ function knownHashAlgorithm(name: string): ObjectFormat {
   return found;
 }
 
-/** Sets `core.bare = true` in a config file written by the git directory layout. */
-async function markBare(files: FilesApi, configPath: string): Promise<void> {
-  await setCoreValue(files, configPath, "bare", "true");
-}
-
-/** Sets `core.<key>` in the fresh config `init` wrote (one `[core]` section). */
-async function setCoreValue(
-  files: FilesApi,
-  configPath: string,
-  key: string,
-  value: string,
-): Promise<void> {
-  const chunks: Uint8Array[] = [];
-  for await (const chunk of files.read(configPath)) chunks.push(chunk);
-  const text = decodeGitPath(concatChunks(chunks));
-  const existing = new RegExp(`^(\\s*${key}\\s*=\\s*)\\S+`, "mi");
-  const updated = existing.test(text)
-    ? text.replace(existing, `$1${value}`)
-    : text.replace(/^\[core\]\s*$/m, `[core]\n\t${key} = ${value}`);
-  await files.write(configPath, [encodeGitPath(updated)]);
-}
-
-function concatChunks(chunks: Uint8Array[]): Uint8Array {
-  const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
-  let offset = 0;
-  for (const c of chunks) {
-    out.set(c, offset);
-    offset += c.length;
+/** Options `git init` refuses together, or a step of `--separate-git-dir` that failed: git dies. */
+export class InitOptionsError extends Error {
+  override name = "InitOptionsError";
+  readonly lines: string[];
+  constructor(line: string) {
+    super(line);
+    this.lines = [line];
   }
-  return out;
+}
+
+/**
+ * The git directory the gitfile at `path` names, as a path of `files` (an absolute target
+ * mapped through the FilesApi's `rootDirectory`, a relative one from the gitfile's
+ * directory), and whether the FilesApi reaches it; undefined when `path` is no gitfile.
+ */
+async function gitfileTargetOf(
+  files: FilesApi,
+  path: string,
+): Promise<{ path: string; reachable: boolean } | undefined> {
+  if ((await files.stats(path))?.kind !== "file") return undefined;
+  const target = parseGitfile(decodeGitPath(await readFile(files, path)));
+  if (target === undefined) return undefined;
+  if (isAbsoluteGitPath(target)) {
+    const root = hostRootOf(files);
+    if (root === undefined) return { path: target, reachable: true };
+    const paths = new HostPaths(root);
+    return { path: paths.filesPath(target), reachable: paths.inside(target) };
+  }
+  const resolved = resolveDots(joinPath(dirname(path), target));
+  return { path: resolved, reachable: !resolved.startsWith("/..") };
+}
+
+/**
+ * The common directory a linked worktree's git directory names (`commondir`, relative to it
+ * unless absolute), as a path of `files`; undefined when `gitDir` has none.
+ */
+async function commonDirectoryOf(files: FilesApi, gitDir: string): Promise<string | undefined> {
+  const file = joinPath(gitDir, "commondir");
+  if ((await files.stats(file))?.kind !== "file") return undefined;
+  const value = decodeGitPath(await readFile(files, file)).replace(/[\r\n]+$/, "");
+  if (!value) return undefined;
+  if (isAbsoluteGitPath(value)) {
+    const root = hostRootOf(files);
+    return root === undefined ? value : new HostPaths(root).filesPath(value);
+  }
+  return resolveDots(joinPath(gitDir, value));
+}
+
+/** `path` with its `.` and `..` components resolved lexically (`..` above the root kept). */
+function resolveDots(path: string): string {
+  const absolute = path.startsWith("/");
+  const out: string[] = [];
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === ".." && out.length > 0 && out[out.length - 1] !== "..") out.pop();
+    else if (part === ".." && absolute && out.length === 0) out.push("..");
+    else out.push(part);
+  }
+  return `${absolute ? "/" : ""}${out.join("/")}`;
+}
+
+/** The directory holding `path` (a host path or a path of a FilesApi). */
+function parentOf(path: string): string {
+  const slash = path.replace(/\/+$/, "").lastIndexOf("/");
+  return slash <= 0 ? "/" : path.slice(0, slash);
+}
+
+/** The relative path from directory `from` to `to` (both paths of one FilesApi). */
+function relativePath(from: string, to: string): string {
+  const a = normalizePath(from).split("/").filter(Boolean);
+  const b = normalizePath(to).split("/").filter(Boolean);
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return [...a.slice(i).map(() => ".."), ...b.slice(i)].join("/") || ".";
+}
+
+/** `core.repositoryformatversion` of a template's config text (read_repository_format). */
+function templateRepositoryVersion(text: string): number | undefined {
+  let section = "";
+  let version: number | undefined;
+  for (const line of text.split("\n")) {
+    const header = /^\s*\[\s*([^\]\s"]+)/.exec(line);
+    if (header) section = header[1].toLowerCase();
+    const match = /^\s*(?:\[[^\]]*\])?\s*repositoryformatversion\s*=\s*(-?\d+)/i.exec(line);
+    if (match && section === "core") version = Number(match[1]);
+  }
+  return version;
+}
+
+/** git_config_pathname of a value: `~/` and `~user/` expanded (no expansion: as given). */
+async function expandConfigPath(
+  value: string,
+  environment: GitHostEnvironment | undefined,
+): Promise<string> {
+  if (!value.startsWith("~")) return value;
+  const slash = value.indexOf("/");
+  const user = value.slice(1, slash < 0 ? undefined : slash);
+  const rest = slash < 0 ? "" : value.slice(slash);
+  const home = user === "" ? environment?.home : await environment?.expandUserHome?.(user);
+  return home === undefined ? value : `${home.replace(/\/+$/, "")}${rest}`;
+}
+
+/**
+ * setup.c's `copy_templates_1`: `source`'s entries copied into `target`'s `dir` (made
+ * first), names starting with `.` skipped, directories recursed into, an existing entry
+ * kept, a link copied as a link, a file with any execute bit made executable (copy_file's
+ * 0777), anything else left out.
+ */
+async function copyTemplateDirectory(
+  sourceFiles: FilesApi,
+  source: string,
+  targetFiles: FilesApi,
+  dir: string,
+): Promise<void> {
+  const from = sourceFiles as PosixFilesApi;
+  const to = targetFiles as PosixFilesApi;
+  await targetFiles.mkdir(dir);
+  const names: string[] = [];
+  for await (const entry of sourceFiles.list(source)) names.push(entry.name);
+  for (const name of names) {
+    if (name.startsWith(".")) continue;
+    const src = joinPath(source, name);
+    const dst = joinPath(dir, name);
+    const st = from.lstat ? await from.lstat(src) : await sourceFiles.stats(src);
+    if (!st) continue;
+    if (st.kind === "directory") {
+      await copyTemplateDirectory(sourceFiles, src, targetFiles, dst);
+      continue;
+    }
+    const exists = to.lstat ? await to.lstat(dst) : await targetFiles.stats(dst);
+    if (exists) continue;
+    if (st.kind === "symlink") {
+      const link = await from.readlink?.(src);
+      if (link && to.symlink) await to.symlink(link, dst);
+      continue;
+    }
+    if (st.kind !== "file") continue;
+    await targetFiles.write(dst, [await readFile(sourceFiles, src)]);
+    const mode = "mode" in st ? st.mode : undefined;
+    if (mode !== undefined && mode & 0o111 && to.lstat && to.chmod) {
+      const made = (await to.lstat(dst))?.mode;
+      if (made !== undefined) await to.chmod(dst, made | ((made & 0o444) >> 2));
+    }
+  }
 }

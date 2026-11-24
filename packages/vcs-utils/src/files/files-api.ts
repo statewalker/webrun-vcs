@@ -260,7 +260,7 @@ export interface PosixFilesApi extends FilesApi {
    * where the storage has no such directory (memory, browsers): such paths stay unreadable.
    */
   readonly rootDirectory?: string;
-  /** Set the permission bits (`mode & 0o777`) of a file; refuses a link */
+  /** Set the permission bits (`mode & 0o777`, setgid `0o2000` on a directory where kept) of a file or directory; refuses a link */
   chmod?(path: string, mode: number): Promise<void>;
   /**
    * Create a symbolic link at `path` pointing to `target` (bytes, as stored in a tree).
