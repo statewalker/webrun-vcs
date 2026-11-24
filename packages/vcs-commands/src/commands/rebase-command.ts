@@ -31,6 +31,7 @@ import {
 } from "../results/merge-result.js";
 import type { RebaseResult, RebaseTodoLine } from "../results/rebase-result.js";
 import { RebaseAction, RebaseStatus } from "../results/rebase-result.js";
+import { AmCommand } from "./am/index.js";
 import { coreBool, createIdAbbreviator, worktreeModeTrust } from "./core-config.js";
 import { createDescriber, type DescribeOptions } from "./git-describe.js";
 import {
@@ -89,13 +90,16 @@ import { reflogMessages, updateHeadExpecting } from "./reflog-messages.js";
 import { revisionMergeBases } from "./rev-parse-command.js";
 import { expandCommitId } from "./sequencer-pick.js";
 import {
+  AUTOSTASH_SAVED_LINES,
   applyAutostash,
   cleanupMessage,
   createAutostash,
   moveHeadAsReset,
   removeBranchState,
   resetMerge,
+  saveAutostash,
 } from "./sequencer-support.js";
+import { showCommit } from "./show-commit.js";
 import {
   SIGNING_FAILED_LINES,
   SigningFailedError,
@@ -122,6 +126,16 @@ export enum RebaseOperation {
   PROCESS_STEPS = "process-steps",
   /** `--edit-todo`: the rest of the todo list edited (the interactive handler's editTodo) */
   EDIT_TODO = "edit-todo",
+  /**
+   * `--quit`: the rebase forgotten (its state directory removed, its autostash kept on
+   * `refs/stash`), HEAD, the index and the worktree left as they are
+   */
+  QUIT = "quit",
+  /**
+   * `--show-current-patch`: `git show REBASE_HEAD` (merge backend) or `git am
+   * --show-current-patch` (apply backend), in {@link RebaseResult.currentPatch}
+   */
+  SHOW_CURRENT_PATCH = "show-current-patch",
 }
 
 /**
@@ -290,6 +304,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private contentStrategy?: ContentMergeStrategy;
   private preserveMerges = false;
   private interactiveHandler?: InteractiveHandler;
+  /** Whose messages to give where git 2.43 and 2.5x differ (default: the hooks') */
+  private compatibility?: "2.43" | "2.56";
   private committer?: PersonIdent;
   /** `--committer-date-is-author-date` (kept in `rebase-merge/cdate_is_adate`) */
   private committerDateIsAuthorDate = false;
@@ -415,6 +431,17 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
    *
    * @param operation Rebase operation
    */
+  /**
+   * Whose messages to give where git 2.43 and 2.5x differ (`fatal: No rebase in progress?`
+   * in 2.43, `fatal: no rebase in progress` in 2.5x). Default: the hook runner's
+   * compatibility, else 2.56.
+   */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
+
   setOperation(operation: RebaseOperation): this {
     this.checkCallable();
     this.operation = operation;
@@ -769,6 +796,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
     }
     switch (this.operation) {
+      case RebaseOperation.QUIT:
+      case RebaseOperation.SHOW_CURRENT_PATCH:
+        return this.quitOrShow(state, worktree, this.operation);
       case RebaseOperation.ABORT:
         return this.abort(state, worktree);
       case RebaseOperation.CONTINUE:
@@ -2982,6 +3012,63 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // last one leaves it, as git does); AUTO_MERGE deleted twice, as git's hook hears it
     await removeBranchState(this.context(worktree), state);
     return this.resume(state, worktree);
+  }
+
+  /**
+   * `git rebase --quit` and `--show-current-patch` (builtin/rebase.c's ACTION_QUIT and
+   * ACTION_SHOW_CURRENT_PATCH): the backend found as cmd_rebase finds it (`rebase-apply/`
+   * first, `rebase-apply/applying` being git am's), refused when no rebase is in progress.
+   */
+  private async quitOrShow(
+    state: OperationState,
+    worktree: Worktree | undefined,
+    operation: RebaseOperation,
+  ): Promise<RebaseResult> {
+    const APPLY_DIR = "rebase-apply";
+    if (await state.exists(`${APPLY_DIR}/applying`)) {
+      return {
+        status: RebaseStatus.FAILED,
+        message: "fatal: It looks like 'git am' is in progress. Cannot rebase.",
+      };
+    }
+    const apply = await state.exists(APPLY_DIR);
+    if (!apply && !(await state.exists(DIR))) {
+      const legacy = (this.compatibility ?? this.hooks.compatibility) === "2.43";
+      return {
+        status: RebaseStatus.FAILED,
+        message: legacy ? "fatal: No rebase in progress?" : "fatal: no rebase in progress",
+      };
+    }
+    const stateDir = apply ? APPLY_DIR : DIR;
+    if (operation === RebaseOperation.SHOW_CURRENT_PATCH) {
+      if (apply) {
+        // run_am: `git am --show-current-patch` (its rebasing session shows the original
+        // commit, `git show <original-commit>`)
+        const am = await new AmCommand(this.workingCopy).setShowCurrentPatch("raw").call();
+        if (am.exitCode !== 0) {
+          return { status: RebaseStatus.FAILED, message: am.errors.replace(/\n$/, "") };
+        }
+        return { status: RebaseStatus.OK, currentPatch: am.output };
+      }
+      // run_sequencer_rebase: `git show REBASE_HEAD --` (its failure is rebase's exit 1)
+      const id = await state.ref("REBASE_HEAD");
+      if (!id) return { status: RebaseStatus.FAILED, message: "fatal: bad revision 'REBASE_HEAD'" };
+      return { status: RebaseStatus.OK, currentPatch: await showCommit(this.workingCopy, id) };
+    }
+    // ACTION_QUIT: save_autostash (kept on refs/stash), then sequencer_remove_state for the
+    // merge backend (refs-to-delete deleted, the directory removed) or the directory alone;
+    // REBASE_HEAD, AUTO_MERGE, ORIG_HEAD, MERGE_MSG and HEAD stay as they are
+    const output: string[] = [];
+    const autostash = (await state.read(`${stateDir}/autostash`))?.trim();
+    if (autostash) {
+      await saveAutostash(this.context(worktree), autostash);
+      await state.remove(`${stateDir}/autostash`);
+      output.push(...AUTOSTASH_SAVED_LINES);
+    }
+    if (!apply) await this.deleteRewrittenRefs(state);
+    await state.remove(stateDir);
+    const head = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
+    return { status: RebaseStatus.OK, ...(head ? { newHead: head } : {}), output };
   }
 
   /** `git rebase --abort`: back to the original branch and commit (`reset --hard`). */
