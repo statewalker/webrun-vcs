@@ -620,6 +620,19 @@ export async function physicalFilesPath(
   files: FilesApi,
   path: string,
 ): Promise<string | undefined> {
+  const resolved = await resolveFilesLinks(files, path);
+  return typeof resolved === "string" ? resolved : undefined;
+}
+
+/**
+ * {@link physicalFilesPath}, telling why a path does not resolve: `"loop"` past 40 links
+ * (the ELOOP `stat(2)` and `open(2)` fail with), `"outside"` where a link leads beyond the
+ * FilesApi's root.
+ */
+export async function resolveFilesLinks(
+  files: FilesApi,
+  path: string,
+): Promise<string | "loop" | "outside"> {
   const posix = files as PosixFilesApi;
   if (!posix.lstat || !posix.readlink) return joinFilesPath("", path);
   const root = (files as { rootDirectory?: string }).rootDirectory?.replace(/\/+$/, "");
@@ -630,7 +643,7 @@ export async function physicalFilesPath(
     const part = pending.shift() as string;
     if (part === "" || part === ".") continue;
     if (part === "..") {
-      if (done.length === 0) return undefined;
+      if (done.length === 0) return "outside";
       done.pop();
       continue;
     }
@@ -640,18 +653,74 @@ export async function physicalFilesPath(
       done.push(part);
       continue;
     }
-    if (++links > 40) return undefined;
+    if (++links > 40) return "loop";
     const bytes = await posix.readlink(candidate).catch(() => undefined);
-    if (!bytes) return undefined;
+    if (!bytes) return "outside";
     const target = new TextDecoder().decode(bytes);
     if (target.startsWith("/")) {
-      if (root === undefined) return undefined;
-      if (root !== "" && target !== root && !target.startsWith(`${root}/`)) return undefined;
+      if (root === undefined) return "outside";
+      if (root !== "" && target !== root && !target.startsWith(`${root}/`)) return "outside";
       done.length = 0;
       pending.unshift(...target.slice(root.length).split("/"));
     } else pending.unshift(...target.split("/"));
   }
   return done.join("/");
+}
+
+/** The kind of the entry itself at `path` (a link as `symlink`), where the FilesApi tells it. */
+export async function lstatKind(files: FilesApi, path: string): Promise<string | undefined> {
+  const posix = files as PosixFilesApi;
+  if (posix.lstat) return (await posix.lstat(path).catch(() => undefined))?.kind;
+  return (await files.stats(path).catch(() => undefined))?.kind;
+}
+
+/**
+ * git's `safe_create_leading_directories` for the FilesApi path `path`: each leading
+ * component (never `path` itself) that `stat(2)` finds a directory, links followed, is kept;
+ * a missing one is created, only below the last real directory; anything else refuses, with
+ * nothing created at or past it: a file in the way, a link whose target is missing (git's
+ * `mkdir` fails there with EEXIST: the target of a dangling link is never created), a link
+ * leading beyond the FilesApi or looping. True when every leading directory is there.
+ */
+export async function safeCreateLeadingDirectories(
+  files: FilesApi,
+  path: string,
+): Promise<boolean> {
+  const parts = joinFilesPath("", path).split("/");
+  parts.pop();
+  let parent = "";
+  for (let i = 0; i < parts.length; i++) {
+    const prefix = parts.slice(0, i + 1).join("/");
+    const physical = await physicalFilesPath(files, prefix);
+    if (physical === undefined) return false;
+    const st = await files.stats(physical).catch(() => undefined);
+    if (st?.kind === "directory") {
+      parent = physical;
+      continue;
+    }
+    if (st) return false;
+    // nothing at the place: the entry itself is a dangling link, or nothing at all
+    const entry = parent ? `${parent}/${parts[i]}` : (parts[i] as string);
+    if ((await lstatKind(files, entry)) !== undefined) return false;
+    if (
+      !(await files.mkdir(entry).then(
+        () => true,
+        () => false,
+      ))
+    ) {
+      return false;
+    }
+    parent = entry;
+  }
+  return true;
+}
+
+/** Whether the directory holding the physical FilesApi path `path` is there (a real one). */
+export async function parentIsDirectory(files: FilesApi, path: string): Promise<boolean> {
+  const at = joinFilesPath("", path);
+  const slash = at.lastIndexOf("/");
+  if (slash < 0) return true;
+  return (await files.stats(at.slice(0, slash)).catch(() => undefined))?.kind === "directory";
 }
 
 /** `path` joined to `base` with `.` and `..` resolved (FilesApi paths). */

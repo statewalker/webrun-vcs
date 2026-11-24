@@ -1,4 +1,5 @@
 import { FileMode, type ObjectId, type TreeEntry } from "@statewalker/vcs-core";
+import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
 import {
   compareWithWorktree,
   type IndexEntry,
@@ -810,7 +811,14 @@ async function removeWorktreePath(worktree: Worktree, entry: IndexEntry): Promis
   if (current?.isDirectory) {
     if (entry.mode !== FileMode.GITLINK) return false;
     if (!(await removeDirectoryIfEmpty(worktree, entry.path))) {
-      if (!(await usesGitfile(worktree, entry.path))) return true;
+      // a `.git` link goes as a link (its target untouched), as git's remove_dir_recursively
+      // unlinks it once the absorb is done
+      if (
+        !(await usesGitfile(worktree, entry.path)) &&
+        !(await dotGitIsLink(worktree, entry.path))
+      ) {
+        return true;
+      }
       await worktree.remove(entry.path, { recursive: true });
     }
   } else if (current) {
@@ -822,6 +830,15 @@ async function removeWorktreePath(worktree: Worktree, entry: IndexEntry): Promis
   }
   await pruneEmptyParents(worktree, entry.path);
   return true;
+}
+
+/** Whether `<path>/.git` is a symbolic link (removing it never reaches what it names). */
+async function dotGitIsLink(worktree: Worktree, path: string): Promise<boolean> {
+  const files = worktree.getFiles?.() as PosixFilesApi | undefined;
+  if (!files?.lstat) return false;
+  const root = worktree.getRoot?.() ?? "";
+  const at = `${root ? `${root}/` : ""}${path}/.git`;
+  return (await files.lstat(at).catch(() => undefined))?.kind === "symlink";
 }
 
 /** Whether the directory at `path` holds nothing (git's `is_empty_dir`: false when absent). */

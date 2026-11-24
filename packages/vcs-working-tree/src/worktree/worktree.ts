@@ -368,10 +368,15 @@ export interface Worktree {
    *
    * `options.environment` opens it with another environment than this worktree's (`git
    * submodule` runs its children with `GIT_PROTOCOL_FROM_USER=0`).
+   *
+   * `options.gitDir` (a path of this worktree's storage) is the repository to open when the
+   * path's own `.git` cannot be read here: a caller that followed a `.git` link, or a gitfile
+   * naming a place through a link, physically (the storage never reads through a link) passes
+   * where it leads, as git's discovery would find it from the submodule's directory.
    */
   openGitlink?(
     path: string,
-    options?: { name?: string; environment?: GitHostEnvironment },
+    options?: { name?: string; environment?: GitHostEnvironment; gitDir?: string },
   ): Promise<WorkingCopy | undefined>;
 
   /**

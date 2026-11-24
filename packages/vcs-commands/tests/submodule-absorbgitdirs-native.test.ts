@@ -20,6 +20,7 @@ import {
   readFileSync,
   readlinkSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -87,9 +88,20 @@ function snapshot(dir: string, twin: string): Record<string, string> {
       if (existsSync(join(abs, f))) out[`${rel}/${f}`] = "present";
     }
     const modules = join(abs, "modules");
+    if (lstatSync(modules, { throwIfNoEntry: false })?.isSymbolicLink()) {
+      out[`${rel}/modules`] = `link -> ${readlinkSync(modules)}`;
+    }
     if (existsSync(modules)) walkModules(modules, `${rel}/modules`);
   };
+  const isDir = (p: string) => {
+    try {
+      return statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  };
   const walkModules = (abs: string, rel: string) => {
+    if (!isDir(abs)) return;
     for (const name of readdirSync(abs).sort()) {
       const p = join(abs, name);
       if (!lstatSync(p).isDirectory()) continue;
@@ -103,13 +115,18 @@ function snapshot(dir: string, twin: string): Record<string, string> {
       const p = join(abs, name);
       const r = rel ? `${rel}/${name}` : name;
       const st = lstatSync(p);
-      if (name === ".git") {
+      if (st.isSymbolicLink() && name === ".git") out[r] = `link -> ${readlinkSync(p)}`;
+      else if (name === ".git") {
         if (st.isDirectory()) {
           out[`${r}/`] = "gitdir";
           walkGitDir(p, r);
         } else out[r] = norm(readFileSync(p, "latin1"));
       } else if (st.isSymbolicLink()) out[r] = `link -> ${readlinkSync(p)}`;
-      else if (st.isDirectory()) {
+      else if (st.isDirectory() && existsSync(join(p, "HEAD")) && existsSync(join(p, "objects"))) {
+        // a repository beside the worktree (moved or linked to): compared as a git directory
+        out[`${r}/`] = "gitdir";
+        walkGitDir(p, r);
+      } else if (st.isDirectory()) {
         out[`${r}/`] = "dir";
         walk(p, r);
       } else out[r] = norm(readFileSync(p, "latin1"));
@@ -121,7 +138,9 @@ function snapshot(dir: string, twin: string): Record<string, string> {
 
 /** Native `git submodule <args>` in `dir`. */
 function nativeRun(dir: string, args: string[]): SubmoduleCommandResult {
-  const r = spawnSync("git", ["submodule", ...args], { cwd: dir, env: testEnv(root) });
+  // a step `["@rm", ...]` is `git rm ...`, every other one `git submodule ...`
+  const argv = args[0] === "@rm" ? ["rm", ...args.slice(1)] : ["submodule", ...args];
+  const r = spawnSync("git", argv, { cwd: dir, env: testEnv(root) });
   return {
     stdout: r.stdout.toString("latin1"),
     stderr: r.stderr.toString("latin1"),
@@ -232,10 +251,38 @@ async function expectTwins(
 const absorb = (paths: string[] = []): Step => [
   ["absorbgitdirs", ...paths],
   (g) => {
-    const c = g.submoduleAbsorbGitDirs();
+    const c = g.submoduleAbsorbGitDirs().setCompatibility(compatibility);
     for (const p of paths) c.addPath(p);
     return c.call();
   },
+];
+
+/** `git rm -f <path>` as a step: our result in native git's shape. */
+const rmForce = (path: string): Step => [
+  ["@rm", "-f", path],
+  async (g) => {
+    try {
+      const r = await g.rm().addFilepattern(path).setForce(true).call();
+      return {
+        stdout: r.output.map((l) => `${l}\n`).join(""),
+        stderr: (r.messages ?? []).map((l) => `${l}\n`).join(""),
+        exitCode: 0,
+      };
+    } catch (error) {
+      if (!(error instanceof RmFailedError)) throw error;
+      const result = error.result as RmResult | undefined;
+      return {
+        stdout: (result?.output ?? []).map((l) => `${l}\n`).join(""),
+        stderr: [...(result?.messages ?? []), error.message].map((l) => `${l}\n`).join(""),
+        exitCode: error.exitCode,
+      };
+    }
+  },
+];
+
+const deinitForce: Step = [
+  ["deinit", "-f", "sub1"],
+  (g) => g.submoduleDeinit().setCompatibility(compatibility).setForce(true).addPath("sub1").call(),
 ];
 
 /** t7412's setup: `sup` with the submodule `sub1` added from a repository in place. */
@@ -420,7 +467,11 @@ mkdir real; mv sub1 real/sub1; ln -s real/sub1 sub1
   it("deinit absorbs a .git directory and its nested submodules first", async () => {
     const t = twins(`${SETUP}${NESTED}`);
     await expectTwins(t, [
-      [["deinit", "-f", "sub1"], (g) => g.submoduleDeinit().setForce(true).addPath("sub1").call()],
+      [
+        ["deinit", "-f", "sub1"],
+        (g) =>
+          g.submoduleDeinit().setCompatibility(compatibility).setForce(true).addPath("sub1").call(),
+      ],
     ]);
   });
 
@@ -430,7 +481,10 @@ git submodule absorbgitdirs 2>/dev/null
 (cd sub1; rm .git; mv ../.git/modules/sub1 .git; GIT_WORK_TREE=. git config --unset core.worktree)
 `);
     await expectTwins(t, [
-      [["deinit", "sub1"], (g) => g.submoduleDeinit().addPath("sub1").call()],
+      [
+        ["deinit", "sub1"],
+        (g) => g.submoduleDeinit().setCompatibility(compatibility).addPath("sub1").call(),
+      ],
       absorb(),
     ]);
   });
@@ -573,12 +627,73 @@ mv sub1/.git ../out.git; ln -s ../../out.git sub1/.git
       [
         [
           ["deinit", "-f", "sub1"],
-          (g) => g.submoduleDeinit().setForce(true).addPath("sub1").call(),
+          (g) =>
+            g
+              .submoduleDeinit()
+              .setCompatibility(compatibility)
+              .setForce(true)
+              .addPath("sub1")
+              .call(),
         ],
       ],
       "sup",
       { wide: true },
     );
+  });
+
+  // links git follows or refuses (the merge gate's review of statewalker/webrun-vcs#314)
+  const DANGLING_INSIDE = `${SETUP}ln -s ../newdir/m .git/modules\n`;
+  const DANGLING_BESIDE = `${SETUP}ln -s ../../nowhere/m .git/modules\n`;
+  for (const [label, step] of [
+    ["absorbgitdirs", absorb()],
+    ["rm -f", rmForce("sub1")],
+    ["deinit -f", deinitForce],
+  ] as [string, Step][]) {
+    it(`a dangling .git/modules link refuses ${label}, creating nothing (inside the superproject)`, async () => {
+      await expectTwins(twins(DANGLING_INSIDE), [step]);
+    });
+    it(`a dangling .git/modules link refuses ${label}, creating nothing (beside the superproject)`, async () => {
+      await expectTwins(twins(DANGLING_BESIDE), [step], "sup", { wide: true });
+    });
+  }
+
+  it("a dangling modules/<name> link: the repository moves where it points, as git's rename", async () => {
+    const t = twins(`${SETUP}mkdir -p .git/modules; ln -s ../../../made.git .git/modules/sub1\n`);
+    await expectTwins(t, [absorb()], "sup", { wide: true, fsckFails: true });
+  });
+
+  it("a .git/modules link to a file refuses", async () => {
+    const t = twins(`${SETUP}echo x > ../afile; ln -s ../../afile .git/modules\n`);
+    await expectTwins(t, [absorb(), deinitForce], "sup", { wide: true });
+  });
+
+  it("a gitfile naming its repository through a linked directory", async () => {
+    const t = twins(`${SETUP}
+mkdir ../real; mv sub1/.git ../real/repo.git; ln -s ../real linkdir
+echo "gitdir: ../linkdir/repo.git" > sub1/.git
+git -C ../real/repo.git config core.worktree ../../sup/sub1
+`);
+    await expectTwins(t, [absorb(), deinitForce], "sup", { wide: true, fsckFails: true });
+  });
+
+  for (const [label, steps] of [
+    ["absorbgitdirs, deinit -f", [absorb(), deinitForce]],
+    ["rm -f", [rmForce("sub1")]],
+  ] as [string, Step[]][]) {
+    it(`a .git linked to the superproject's own git directory: ${label}`, async () => {
+      const t = twins(`${SETUP}rm -rf sub1/.git; ln -s ../.git sub1/.git\n`);
+      await expectTwins(t, steps, "sup", { wide: true });
+    });
+  }
+
+  it("rm -f of a submodule whose .git links to a repository: absorbed, then the link removed", async () => {
+    const t = twins(`${SETUP}mv sub1/.git ../out.git; ln -s ../../out.git sub1/.git\n`);
+    await expectTwins(t, [rmForce("sub1")], "sup", { wide: true });
+  });
+
+  it("a .git link to itself (a loop): git's stat failure", async () => {
+    const t = twins(`${SETUP}rm -rf sub1/.git; ln -s .git sub1/.git\n`);
+    await expectTwins(t, [absorb(), deinitForce], "sup", { wide: true });
   });
 
   it("dies before changing anything when the move fails (FilesApi.move returning false)", async () => {
