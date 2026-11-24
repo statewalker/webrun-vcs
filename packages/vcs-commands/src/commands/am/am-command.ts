@@ -47,6 +47,7 @@ import { ortResultEntries } from "../ort-merge.js";
 import { mergeStoredTrees, storedBase } from "../ort-recursive.js";
 import { updateHead, updateHeadExpecting } from "../reflog-messages.js";
 import { removeBranchState, resetMerge, resetUnmergedToHead } from "../sequencer-support.js";
+import { showCommitBytes } from "../show-commit.js";
 import { SIGNING_FAILED_LINES, signRequestOf } from "../signing.js";
 import { appendSignoff } from "../trailers.js";
 import { mailinfo, mailsplit } from "./mailinfo.js";
@@ -67,7 +68,15 @@ export interface AmResult {
   errors: string;
 }
 
-type Resume = "apply" | "continue" | "allow-empty" | "skip" | "abort" | "quit";
+type Resume =
+  | "apply"
+  | "continue"
+  | "allow-empty"
+  | "skip"
+  | "abort"
+  | "quit"
+  | "show-raw"
+  | "show-diff";
 
 /** The options `git am` passes to `git apply` (kept in `apply-opt`). */
 export interface AmApplyOptions {
@@ -194,6 +203,17 @@ export class AmCommand extends GitCommand<AmResult> {
   /** `--continue`/`--resolved`, `--allow-empty`, `--skip`, `--abort`, `--quit`. */
   setResume(mode: "continue" | "resolved" | "allow-empty" | "skip" | "abort" | "quit"): this {
     this.resume = mode === "resolved" ? "continue" : mode;
+    return this;
+  }
+
+  /**
+   * `--show-current-patch[=raw|diff]`: the mail of the patch that stopped (`raw`, the
+   * default) or its diff (`diff`, `rebase-apply/patch`) on stdout, as they stand in
+   * `.git/rebase-apply/`; a session of `rebase --apply` shows its original commit
+   * (`git show <original-commit>`).
+   */
+  setShowCurrentPatch(mode: "raw" | "diff" = "raw"): this {
+    this.resume = mode === "diff" ? "show-diff" : "show-raw";
     return this;
   }
 
@@ -374,6 +394,7 @@ export class AmCommand extends GitCommand<AmResult> {
       }
       if (mode === "abort") return this.abort();
       const st = await this.load();
+      if (mode === "show-raw" || mode === "show-diff") return this.showPatch(st, mode);
       if (mode === "skip") {
         // am_skip: clean_index(HEAD, HEAD), then the next patch
         const head = await this.headId();
@@ -394,6 +415,23 @@ export class AmCommand extends GitCommand<AmResult> {
     }
     if (this.resume) this.fatal("Resolve operation not in progress, we are not resuming.");
     return this.setup();
+  }
+
+  /** git's show_patch. */
+  private async showPatch(st: AmState, mode: "show-raw" | "show-diff"): Promise<AmResult> {
+    const original = (await this.read("original-commit"))?.trim();
+    if (original) {
+      // `git show <original-commit> --`
+      this.out += bytesToLatin1(await showCommitBytes(this.workingCopy, original));
+      return this.result(0);
+    }
+    const name = mode === "show-raw" ? String(st.cur).padStart(4, "0") : "patch";
+    const content = await this.read(name);
+    if (content === undefined) {
+      this.fatal(`failed to read '.git/${DIR}/${name}': No such file or directory`);
+    }
+    this.out += content;
+    return this.result(0);
   }
 
   private async setup(): Promise<AmResult> {
