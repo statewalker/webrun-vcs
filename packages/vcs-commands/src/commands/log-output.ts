@@ -16,7 +16,9 @@
  * what `--date=` takes, and so on; unset, the configuration's defaults apply (`format.pretty`,
  * `log.date`, `log.abbrevCommit`, `log.decorate`, `log.showRoot`, `log.mailmap`,
  * `log.follow`, `log.graphIndent`, `log.excludeDecoration`, `notes.displayRef`...). Colors
- * are never written (git without a terminal).
+ * are written as `git log --color=always` writes them when the diff options or `color.ui` /
+ * `color.diff` ask for `always` (`auto` is git without a terminal: none), the graph's columns
+ * in `log.graphColors` (graph.c's `column_colors_ansi` by default).
  *
  * A commit with an `encoding` header is shown in UTF-8 (git's default `i18n.logOutputEncoding`);
  * another output encoding is not supported. One quirk of git is not reproduced: where its C
@@ -33,6 +35,7 @@ import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { decodeGitPath, encodeGitPath, gitCharWidth } from "@statewalker/vcs-utils/encoding";
 
 import { InvalidArgumentError } from "../errors/index.js";
+import type { DiffColors } from "../results/diff-color.js";
 import { ChangeType } from "../results/diff-entry.js";
 import { type DateMode, DEFAULT_DATE_MODE, parseDateMode, showDate } from "./date-format.js";
 import { type DiffOutputFormat, type DiffTextOptions, hasPickaxe } from "./diff-command.js";
@@ -40,6 +43,7 @@ import { LogGraph } from "./log-graph.js";
 import type { Mailmap } from "./mailmap.js";
 import { parsePathspecItem } from "./pathspec.js";
 import {
+  type DecorationPalette,
   formatCommitPretty,
   formatRefDecorations,
   type PrettyCommit,
@@ -814,6 +818,8 @@ export class LogPrinter {
       interesting: (id: ObjectId) => boolean;
       firstParentOnly: boolean;
       paths: string[];
+      /** The colors (`--color`, `color.ui`...), undefined for none */
+      colors?: { diff: DiffColors; decorations: DecorationPalette; graph: readonly string[] };
     },
   ) {
     const prettyGiven = options.pretty !== undefined || !!options.oneline;
@@ -970,6 +976,7 @@ export class LogPrinter {
       firstParentOnly: this.walk.firstParentOnly,
       indent,
       ...(this.options.graphLaneLimit ? { maxLanes: this.options.graphLaneLimit } : {}),
+      ...(this.walk.colors ? { colors: this.walk.colors.graph } : {}),
     });
   }
 
@@ -1229,15 +1236,20 @@ export class LogPrinter {
       const thread = mail?.threadHeaders?.(entry.id);
       if (thread) this.out.text(thread);
     } else if (fmt !== "user") {
+      const colors = this.walk.colors;
+      this.out.text(colors?.diff.commit ?? "");
       if (fmt !== "oneline") this.out.text("commit ");
       // put_revision_mark
       if (!this.graph && entry.boundary) this.out.text("- ");
       this.out.text(await this.abbrevId(entry.id, this.abbrevCommit));
       if (log.parent)
         this.out.text(` (from ${await this.abbrevId(log.parent, this.abbrevCommit)})`);
+      this.out.text(colors?.diff.reset ?? "");
       // show_decorations: the source first
       if (entry.source !== undefined) this.out.text(`\t${entry.source}`);
-      if (this.decorate) this.out.text(formatRefDecorations(this.decorations, entry.id, {}));
+      if (this.decorate) {
+        this.out.text(formatRefDecorations(this.decorations, entry.id, {}, colors?.decorations));
+      }
       if (fmt === "oneline") this.out.text(" ");
       else {
         this.out.text("\n");
@@ -1337,6 +1349,9 @@ export class LogPrinter {
       return formatCommitPretty(this.format.user ?? "", commit, entry.id, {
         abbreviate: (id) => this.abbrevId(id, this.abbrevLength !== 40),
         ...(this.decorations ? { decorations: this.decorations } : {}),
+        ...(this.walk.colors
+          ? { color: true, decorationColors: this.walk.colors.decorations }
+          : {}),
         // get_revision_mark(NULL, commit): `-` for a boundary, else `>`
         mark: entry.boundary ? "-" : ">",
         ...(entry.source !== undefined ? { source: entry.source } : {}),

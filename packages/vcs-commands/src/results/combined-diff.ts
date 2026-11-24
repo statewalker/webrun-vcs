@@ -39,6 +39,7 @@ import {
   xdlIsSpace,
 } from "@statewalker/vcs-utils";
 
+import type { DiffColors } from "./diff-color.js";
 import { quoteTwo } from "./quote-path.js";
 
 /** One version of a combined diff: a parent or the result */
@@ -76,6 +77,8 @@ export interface CombinedDiffOptions
   context?: number;
   /** `core.quotePath` (default true) */
   quotePath?: boolean;
+  /** The colors of `--color` (`color.diff.<slot>`); unset, none are written */
+  colors?: DiffColors;
   /** Treat the files as binary (a `diff` attribute) or text, regardless of content */
   binary?: boolean;
   /** Prefix of old paths (default "a/") */
@@ -402,10 +405,16 @@ function hunkCommentLine(bol: Uint8Array | undefined): boolean {
   return (ch >= 0x41 && ch <= 0x5a) || (ch >= 0x61 && ch <= 0x7a) || ch === 0x5f || ch === 0x24;
 }
 
-/** `show_line_to_eol` without colors: the line and an LF */
-function lineToEol(sink: ByteSink, line: Uint8Array): void {
-  sink.push(line);
-  sink.text("\n");
+/** `show_line_to_eol`: the line, the reset, then its CR and an LF */
+function lineToEol(sink: ByteSink, line: Uint8Array, reset: string): void {
+  if (!reset) {
+    sink.push(line);
+    sink.text("\n");
+    return;
+  }
+  const cr = line.length > 0 && line[line.length - 1] === 0x0d;
+  sink.push(cr ? line.subarray(0, line.length - 1) : line);
+  sink.text(`${reset}${cr ? "\r" : ""}\n`);
 }
 
 /** combine-diff.c's `dump_sline` */
@@ -416,7 +425,14 @@ function dumpSline(
   numParent: number,
   context: number,
   resultDeleted: boolean,
+  colors: DiffColors | undefined,
 ): void {
+  const cFrag = colors?.frag ?? "";
+  const cFunc = colors?.func ?? "";
+  const cNew = colors?.new ?? "";
+  const cOld = colors?.old ?? "";
+  const cContext = colors?.context ?? "";
+  const cReset = colors?.reset ?? "";
   const mark = 1 << numParent;
   const noPreDelete = 2 << numParent;
   if (resultDeleted) return;
@@ -444,7 +460,7 @@ function dumpSline(
       head += ` -${l0},${unsignedLong(l1 - l0 - nullContext)}`;
     }
     head += ` +${lno + 1},${unsignedLong(rlines)} ${"@".repeat(numParent + 1)}`;
-    sink.text(head);
+    sink.text(cFrag + head);
     if (hunkComment) {
       let commentEnd = 0;
       for (let i = 0; i < 40 && i < hunkComment.length; i++) {
@@ -453,26 +469,26 @@ function dumpSline(
         if (!xdlIsSpace(ch)) commentEnd = i;
       }
       if (commentEnd) {
-        sink.text(" ");
+        sink.text(`${cReset}${cContext} ${cReset}${cFunc}`);
         sink.push(hunkComment.subarray(0, commentEnd));
       }
     }
-    sink.text("\n");
+    sink.text(`${cReset}\n`);
     while (lno < hunkEnd) {
       const sl = sline[lno++];
       const lost = sl.flag & noPreDelete ? [] : sl.lost;
       for (const ll of lost) {
         let marks = "";
         for (let j = 0; j < numParent; j++) marks += ll.parentMap & (1 << j) ? "-" : " ";
-        sink.text(marks);
-        lineToEol(sink, ll.line);
+        sink.text(cOld + marks);
+        lineToEol(sink, ll.line, cReset);
       }
       if (cnt < lno) break;
       if (!(sl.flag & (mark - 1)) && !context) continue;
-      let marks = "";
+      let marks = sl.flag & (mark - 1) ? cNew : cContext;
       for (let j = 0; j < numParent; j++) marks += sl.flag & (1 << j) ? "+" : " ";
       sink.text(marks);
-      lineToEol(sink, sl.bol ?? new Uint8Array(0));
+      lineToEol(sink, sl.bol ?? new Uint8Array(0), cReset);
     }
   }
 }
@@ -492,27 +508,31 @@ function writeHeader(
   const quote = options.quotePath ?? true;
   const abbreviate = options.abbreviate ?? ((id: string) => id.slice(0, 7));
   const dense = options.dense ?? true;
-  sink.text(`${dense ? "diff --cc " : "diff --combined "}${quoteTwo("", elem.path, quote)}\n`);
+  const m = options.colors?.meta ?? "";
+  const r = options.colors?.reset ?? "";
   sink.text(
-    `index ${elem.parents.map((p) => abbreviate(p.id)).join(",")}..${abbreviate(elem.result.id)}\n`,
+    `${m}${dense ? "diff --cc " : "diff --combined "}${quoteTwo("", elem.path, quote)}${r}\n`,
+  );
+  sink.text(
+    `${m}index ${elem.parents.map((p) => abbreviate(p.id)).join(",")}..${abbreviate(elem.result.id)}${r}\n`,
   );
   const deleted = !elem.result.mode;
   // "added" when no parent had it
   const added = !deleted && elem.parents.every((p) => !p.mode);
   if (modeDiffers) {
-    if (added) sink.text(`new file mode ${octal6(elem.result.mode)}\n`);
+    if (added) sink.text(`${m}new file mode ${octal6(elem.result.mode)}${r}\n`);
     else {
       let line = deleted ? "deleted file mode " : "mode ";
       line += elem.parents.map((p) => octal6(p.mode)).join(",");
       if (elem.result.mode) line += `..${octal6(elem.result.mode)}`;
-      sink.text(`${line}\n`);
+      sink.text(`${m}${line}${r}\n`);
     }
   }
   if (!showFileHeader) return;
   const aPrefix = options.srcPrefix ?? "a/";
   const bPrefix = options.dstPrefix ?? "b/";
-  sink.text(added ? "--- /dev/null\n" : `--- ${quoteTwo(aPrefix, elem.path, quote)}\n`);
-  sink.text(deleted ? "+++ /dev/null\n" : `+++ ${quoteTwo(bPrefix, elem.path, quote)}\n`);
+  sink.text(`${m}--- ${added ? "/dev/null" : quoteTwo(aPrefix, elem.path, quote)}${r}\n`);
+  sink.text(`${m}+++ ${deleted ? "/dev/null" : quoteTwo(bPrefix, elem.path, quote)}${r}\n`);
 }
 
 /**
@@ -572,7 +592,7 @@ export function writeCombinedDiff(
   const showHunks = makeHunks(sline, cnt, numParent, context, options.dense ?? true);
   if (!showHunks && !modeDiffers && options.workingTreeFile === false) return;
   writeHeader(sink, elem, options, modeDiffers, true);
-  dumpSline(sink, sline, cnt, numParent, context, resultDeleted);
+  dumpSline(sink, sline, cnt, numParent, context, resultDeleted, options.colors);
 }
 
 /**
