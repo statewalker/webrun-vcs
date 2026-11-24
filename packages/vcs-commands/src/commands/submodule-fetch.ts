@@ -143,6 +143,13 @@ export class SubmoduleFetchRepository extends GitCommand<never> {
     return out;
   }
 
+  /** HEAD's full ref name (`refs/heads/x`), `HEAD` when detached, undefined when unreadable. */
+  async headRef(): Promise<string | undefined> {
+    const head = await this.refsStore.get("HEAD").catch(() => undefined);
+    if (!head) return undefined;
+    return "target" in head && typeof head.target === "string" ? head.target : "HEAD";
+  }
+
   /** HEAD's commit, if any. */
   async head(): Promise<ObjectId | undefined> {
     return (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
@@ -159,6 +166,14 @@ export class SubmoduleFetchRepository extends GitCommand<never> {
       if (!target) return undefined;
       oid = target;
     }
+    return undefined;
+  }
+
+  /** The type of a non-commit object here, undefined when absent (or a commit). */
+  async objectTypeOf(id: ObjectId): Promise<"tag" | "tree" | "blob" | undefined> {
+    if (await this.tagsStore?.has(id).catch(() => false)) return "tag";
+    if (await this.trees.has(id).catch(() => false)) return "tree";
+    if (await this.blobs.has(id).catch(() => false)) return "blob";
     return undefined;
   }
 
@@ -283,11 +298,16 @@ export class SubmoduleFetchRepository extends GitCommand<never> {
 
   /** Whether every commit exists here and a ref (or HEAD) reaches it (`rev-list --not --all`). */
   async reachesAll(commits: readonly ObjectId[]): Promise<boolean> {
-    const wanted = new Set(commits);
-    for (const id of wanted) if (!(await this.hasCommit(id))) return false;
     const tips = [...(await this.refTips()).values()];
     const head = await this.head();
     if (head) tips.push(head);
+    return this.reachesAllFrom(commits, tips);
+  }
+
+  /** Whether every commit exists here and one of `tips` reaches it. */
+  async reachesAllFrom(commits: readonly ObjectId[], tips: readonly ObjectId[]): Promise<boolean> {
+    const wanted = new Set(commits);
+    for (const id of wanted) if (!(await this.hasCommit(id))) return false;
     const seen = new Set<ObjectId>();
     const stack: ObjectId[] = [];
     for (const tip of tips) {
@@ -302,6 +322,13 @@ export class SubmoduleFetchRepository extends GitCommand<never> {
       for (const p of (await this.commit(oid))?.parents ?? []) if (!seen.has(p)) stack.push(p);
     }
     return wanted.size === 0;
+  }
+
+  /** The values of the refs below `prefix` (`--remotes`, `--remotes=<name>`). */
+  async refTipsUnder(prefix: string): Promise<ObjectId[]> {
+    return [...(await this.refTips())]
+      .filter(([name]) => name.startsWith(prefix))
+      .map(([, id]) => id);
   }
 
   /** git's DEFAULT_ABBREV abbreviation of an id of this repository. */
@@ -594,29 +621,15 @@ async function calculateChanged(
   outcome: SubmoduleFetchOutcome,
 ): Promise<ChangedSubmodule[]> {
   if (model.gitmodules.list().length === 0 && !(await repo.hasAbsorbedSubmodules())) return [];
-  const changed = new Map<string, ChangedSubmodule>();
-  for (const commit of await repo.walk(options.tipsAfter, options.tipsBefore)) {
-    const gitlinks = await repo.changedGitlinks(commit);
-    if (gitlinks.size === 0) continue;
-    const at = await modelAt(commit);
-    for (const [path, id] of [...gitlinks].sort(([a], [b]) => compareBytes(a, b))) {
-      let name = at.fromPath(path)?.name;
-      if (name === undefined) {
-        name = (await repo.populated(path)) ? path : undefined;
-        if (name !== undefined && at.fromName(name)) {
-          outcome.output += `warning: Submodule in commit ${commit} at path: '${path}' collides with a submodule named the same. Skipping it.\n`;
-          name = undefined;
-        }
-      }
-      if (name === undefined) continue;
-      let data = changed.get(name);
-      if (!data) {
-        data = { name, superOid: commit, path, commits: [] };
-        changed.set(name, data);
-      }
-      data.commits.push(id);
-    }
-  }
+  const changed = await collectChangedSubmodules(
+    repo,
+    modelAt,
+    options.tipsAfter,
+    options.tipsBefore,
+    (line) => {
+      outcome.output += `${line}\n`;
+    },
+  );
   const out: ChangedSubmodule[] = [];
   for (const data of changed.values()) {
     const sub = model.fromName(data.name);
@@ -629,6 +642,88 @@ async function calculateChanged(
   return out.sort((a, b) => compareBytes(a.name, b.name));
 }
 
+/**
+ * submodule.c's `collect_changed_submodules`: the submodules (by name, in the walk's first
+ * order) whose recorded commit the commits `include --not exclude` change, each with the
+ * first commit recording it, its path there and the commits recorded.
+ */
+async function collectChangedSubmodules(
+  repo: SubmoduleFetchRepository,
+  modelAt: (commit: ObjectId) => Promise<SubmoduleModel>,
+  include: readonly ObjectId[],
+  exclude: readonly ObjectId[],
+  warn: (line: string) => void,
+): Promise<Map<string, ChangedSubmodule>> {
+  const changed = new Map<string, ChangedSubmodule>();
+  for (const commit of await repo.walk(include, exclude)) {
+    const gitlinks = await repo.changedGitlinks(commit);
+    if (gitlinks.size === 0) continue;
+    const at = await modelAt(commit);
+    for (const [path, id] of [...gitlinks].sort(([a], [b]) => compareBytes(a, b))) {
+      let name = at.fromPath(path)?.name;
+      if (name === undefined) {
+        name = (await repo.populated(path)) ? path : undefined;
+        if (name !== undefined && at.fromName(name)) {
+          warn(
+            `warning: Submodule in commit ${commit} at path: '${path}' collides with a submodule named the same. Skipping it.`,
+          );
+          name = undefined;
+        }
+      }
+      if (name === undefined) continue;
+      let data = changed.get(name);
+      if (!data) {
+        data = { name, superOid: commit, path, commits: [] };
+        changed.set(name, data);
+      }
+      data.commits.push(id);
+    }
+  }
+  return changed;
+}
+
+/**
+ * submodule.c's `find_unpushed_submodules`: the paths (sorted) of the submodules whose
+ * commits recorded by `commits --not --remotes=<remote>` are in the submodule but on none of
+ * its remote-tracking refs (a submodule with none is left alone, as one lacking the commits).
+ * `warn` gets git's collision warnings.
+ */
+export async function findUnpushedSubmodules(
+  workingCopy: WorkingCopy,
+  commits: readonly ObjectId[],
+  remoteName: string,
+  warn: (line: string) => void,
+): Promise<string[]> {
+  const repo = new SubmoduleFetchRepository(workingCopy);
+  if (!repo.hasWorktree()) return [];
+  const model = await SubmoduleModel.load(workingCopy);
+  const modelsAt = new Map<ObjectId, Promise<SubmoduleModel>>();
+  const modelAt = (commit: ObjectId) => {
+    let found = modelsAt.get(commit);
+    if (!found) {
+      found = SubmoduleModel.load(workingCopy, { commit });
+      modelsAt.set(commit, found);
+    }
+    return found;
+  };
+  const exclude = await repo.refTipsUnder(`refs/remotes/${remoteName}/`);
+  const changed = await collectChangedSubmodules(repo, modelAt, commits, exclude, warn);
+  const out = new Set<string>();
+  for (const data of changed.values()) {
+    const sub = model.fromName(data.name);
+    const path = sub?.path ?? ((await repo.populated(data.name)) ? data.name : undefined);
+    if (path === undefined) continue;
+    if (!(await submoduleHasCommits(repo, path, sub?.name, data.commits))) continue;
+    const inner = await repo.open(path, sub?.name);
+    if (!inner) continue;
+    const subRepo = new SubmoduleFetchRepository(inner);
+    const remotes = await subRepo.refTipsUnder("refs/remotes/");
+    if (remotes.length === 0) continue;
+    if (!(await subRepo.reachesAllFrom(data.commits, remotes))) out.add(path);
+  }
+  return [...out].sort(compareBytes);
+}
+
 /** `submodule_has_commits`: the submodule has every commit and a ref reaches each. */
 async function submoduleHasCommits(
   repo: SubmoduleFetchRepository,
@@ -639,7 +734,17 @@ async function submoduleHasCommits(
   const inner = await repo.open(path, name);
   if (!inner) return false;
   const sub = new SubmoduleFetchRepository(inner);
-  for (const id of commits) if (!(await sub.hasCommit(id))) return false;
+  for (const id of commits) {
+    if (await sub.hasCommit(id)) continue;
+    // check_has_commit: an object of another type is git's death
+    const type = await sub.objectTypeOf(id);
+    if (type !== undefined) {
+      throw new GitApiError(`fatal: submodule entry '${path}' (${id}) is a ${type}, not a commit`, {
+        exitCode: 128,
+      });
+    }
+    return false;
+  }
   // `rev-list -n 1 <commits> --not --all` runs in the submodule's directory: one not checked
   // out runs it in the superproject, which lacks them
   if (!(await repo.populated(path))) return false;

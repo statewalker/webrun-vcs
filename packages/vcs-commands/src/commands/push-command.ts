@@ -24,6 +24,7 @@ import { parseGitBool, parseGitInt } from "@statewalker/vcs-utils/encoding";
 import { isNullObjectId } from "@statewalker/vcs-utils/hash";
 
 import {
+  GitApiError,
   HookFailedError,
   IncompatibleOptionsError,
   InvalidArgumentError,
@@ -41,6 +42,12 @@ import { hostEnvironmentOf } from "./git-ident.js";
 import { remoteHookSession } from "./local-transport.js";
 import { withRemoteReceivePack } from "./remote-transport.js";
 import { SIGNING_FAILED_LINES, SigningFailedError } from "./signing.js";
+import {
+  createSubmoduleAuthPolicy,
+  guardSubmoduleTransports,
+  strictUrlOrigin,
+} from "./submodule-auth.js";
+import { findUnpushedSubmodules, SubmoduleFetchRepository } from "./submodule-fetch.js";
 
 /**
  * How a server's rejection reason (`ng <ref> <reason>`) lands on the statuses this package
@@ -139,6 +146,36 @@ export class PushCommand extends TransportCommand<PushResult> {
   /** `--[no-]signed[=if-asked]` (undefined: `push.gpgSign`) */
   private signed?: boolean | "if-asked";
   private noVerify = false;
+  /** `--recurse-submodules=<mode>`; unset: the configuration's */
+  private recurseSubmodules?: PushRecurseSubmodules;
+  /** `--recurse-submodules=only-is-on-demand`: a superproject's push of this submodule */
+  private recurseFromSuperproject = false;
+
+  /**
+   * `--recurse-submodules=check|on-demand|only|no` (`--no-recurse-submodules` is `no`):
+   * before the refs are sent, the submodules whose recorded commits (in the commits pushed,
+   * not on the remote's tracking refs) are on none of the submodule's remote-tracking refs
+   * are `check`ed (the push dies listing them), pushed first (`on-demand`: `git push` in each,
+   * to the remote and refspecs given here when the remote is configured; then checked again
+   * unless a dry run), or pushed alone (`only`: the superproject's refs are not sent). Unset,
+   * `push.recurseSubmodules` and `submodule.recurse` (on-demand or no) decide, in config
+   * order. What the submodules' pushes printed is {@link PushResult.submoduleOutput}.
+   * A bare repository never recurses.
+   */
+  setRecurseSubmodules(mode: PushRecurseSubmodules | boolean): this {
+    this.checkCallable();
+    // option_parse_recurse_submodules: true, `yes` and other spellings die
+    this.recurseSubmodules =
+      mode === false ? "no" : parsePushRecurseSubmodules("recurse-submodules", String(mode));
+    return this;
+  }
+
+  /** @internal `--recurse-submodules=only-is-on-demand`: run by a superproject's push. */
+  setRecurseFromSuperproject(child: boolean): this {
+    this.checkCallable();
+    this.recurseFromSuperproject = child;
+    return this;
+  }
 
   /** `--no-verify`: the pre-push hook does not run. */
   setNoVerify(noVerify: boolean): this {
@@ -585,6 +622,8 @@ export class PushCommand extends TransportCommand<PushResult> {
     // git_push_config: push.pushOption is read (and a bad one dies) before anything else;
     // the command line's options replace the configured ones
     const configuredOptions = this.configuredPushOptions();
+    const submoduleWarnings: string[] = [];
+    const recurse = this.pushRecursion(submoduleWarnings);
     const transmitted = this.pushOptions.length > 0 ? this.pushOptions : configuredOptions;
     this.checkOptionCombinations(compatibility);
     if (this.deleteRefs && this.refSpecs.length === 0) {
@@ -685,6 +724,9 @@ export class PushCommand extends TransportCommand<PushResult> {
       leases !== undefined &&
       leases.length > 0 &&
       (this.forceIfIncludes ?? this.configBool("push.useForceIfIncludes") ?? false);
+    // transport_push: the submodules (not of a bare repository) once the hook passed
+    const recurseOnPush = recurse !== undefined && this.worktreeAccess !== undefined;
+    const submoduleOutput = { text: submoduleWarnings.map((w) => `${w}\n`).join("") };
     const pushOptions: TransportPushOptions = {
       url: remoteUrl,
       auth: this.credentials,
@@ -719,10 +761,28 @@ export class PushCommand extends TransportCommand<PushResult> {
         this.progressMessageCallback?.(message);
       },
       abbrev: parseCoreAbbrev(RemoteConfigStore.from(this._workingCopy).value("core.abbrev")) ?? -1,
-      ...(!this.noVerify && this.hooks.enabled
+      ...((!this.noVerify && this.hooks.enabled) || recurseOnPush
         ? {
-            prePush: (updates) =>
-              this.runPrePush(updates, remoteUrl, (code) => (prePushExit = code)),
+            prePush: async (updates) => {
+              if (
+                !this.noVerify &&
+                this.hooks.enabled &&
+                !(await this.runPrePush(updates, remoteUrl, (code) => (prePushExit = code)))
+              ) {
+                return false;
+              }
+              if (recurseOnPush) {
+                await this.pushSubmodulesFirst(
+                  recurse,
+                  updates,
+                  refspecs,
+                  transmitted,
+                  remoteUrl,
+                  submoduleOutput,
+                );
+              }
+              return true;
+            },
           }
         : {}),
     };
@@ -797,6 +857,26 @@ export class PushCommand extends TransportCommand<PushResult> {
           "",
           128,
         );
+      }
+      // --recurse-submodules=only: the submodules pushed, nothing sent for the superproject
+      if (error instanceof SubmodulesOnlyPushed) {
+        return {
+          uri: remoteUrl,
+          remoteUpdates: [],
+          bytesSent: 0,
+          objectCount: 0,
+          messages,
+          ...warnings,
+          display: this.quietOutput ? [] : ["Everything up-to-date"],
+          ...(submoduleOutput.text ? { submoduleOutput: submoduleOutput.text } : {}),
+        };
+      }
+      if (
+        error instanceof GitApiError &&
+        submoduleOutput.text &&
+        !error.message.startsWith(submoduleOutput.text)
+      ) {
+        error.message = `${submoduleOutput.text}${error.message}`;
       }
       if (error instanceof PushRefusedByHookError) {
         throw new HookFailedError(
@@ -926,7 +1006,227 @@ export class PushCommand extends TransportCommand<PushResult> {
       // send_pack left at once (nothing to push to a remote without refs): the receiving end
       // hung up, and git fails
       ...(result.reportFailed || result.noRefsInCommon ? { failed: true } : {}),
+      ...(submoduleOutput.text ? { submoduleOutput: submoduleOutput.text } : {}),
     };
+  }
+
+  /**
+   * builtin/push.c's `recurse_submodules`: `push.recurseSubmodules` and `submodule.recurse`
+   * in config order, then the command line; undefined for none (`no`). A superproject's push
+   * of this submodule takes `only` as `on-demand`, with git's warning.
+   */
+  private pushRecursion(warnings: string[]): Exclude<PushRecurseSubmodules, "no"> | undefined {
+    let mode: PushRecurseSubmodules | undefined;
+    const store = RemoteConfigStore.from(this._workingCopy);
+    for (const entry of store.entriesWithOriginFor([
+      "push.recursesubmodules",
+      "submodule.recurse",
+    ]) ?? []) {
+      if (entry.key === "submodule.recurse") {
+        const bool = entry.text === undefined ? true : parseGitBool(entry.text);
+        if (bool === undefined) {
+          throw new GitApiError(
+            `fatal: bad boolean config value '${entry.text}' for 'submodule.recurse'`,
+            { exitCode: 128 },
+          );
+        }
+        mode = bool ? "on-demand" : "no";
+      } else mode = parsePushRecurseSubmodules("push.recursesubmodules", entry.text);
+    }
+    if (this.recurseFromSuperproject) {
+      if (mode === "only") {
+        warnings.push(
+          "warning: recursing into submodule with push.recurseSubmodules=only; using on-demand instead",
+        );
+        mode = "on-demand";
+      }
+    } else if (this.recurseSubmodules !== undefined) mode = this.recurseSubmodules;
+    return mode === undefined || mode === "no" ? undefined : mode;
+  }
+
+  /** git's `-q`: never set here (the report is the caller's to print) */
+  private readonly quietOutput = false;
+
+  /**
+   * transport.c's submodule steps of `transport_push`: `push_unpushed_submodules` for
+   * on-demand and only, then the `find_unpushed_submodules` check for check (and on-demand
+   * and only unless a dry run); `only` then stops the push ({@link SubmodulesOnlyPushed}).
+   */
+  private async pushSubmodulesFirst(
+    mode: Exclude<PushRecurseSubmodules, "no">,
+    updates: readonly PushRefUpdate[],
+    refspecs: readonly string[],
+    pushOptions: readonly string[],
+    remoteUrl: string,
+    output: { text: string },
+  ): Promise<void> {
+    const commits = updates.map((u) => u.newOid).filter((id) => id && !isNullObjectId(id));
+    const store = RemoteConfigStore.from(this._workingCopy);
+    const configured = store.isConfigured(this.remote);
+    const remoteName = configured ? this.remote : remoteUrl;
+    const warn = (line: string) => {
+      output.text += `${line}\n`;
+    };
+    const die = (message: string): never => {
+      throw new GitApiError(`${output.text}${message}`, { exitCode: 128 });
+    };
+    if (mode === "on-demand" || mode === "only") {
+      const needs = await findUnpushedSubmodules(this.workingCopy, commits, remoteName, warn);
+      if (needs.length > 0) {
+        if (configured) {
+          const head = await this.refsStore.get("HEAD").catch(() => undefined);
+          const headName =
+            head && "target" in head && typeof head.target === "string" ? head.target : "HEAD";
+          for (const path of needs) {
+            const refusal = await this.submodulePushCheck(path, headName, refspecs);
+            if (refusal !== undefined) {
+              output.text += `${refusal}\n`;
+              die(`fatal: process for submodule '${path}' failed`);
+            }
+          }
+        }
+        let ok = true;
+        for (const path of needs) {
+          output.text += `Pushing submodule '${path}'\n`;
+          if (!(await this.pushSubmodule(path, configured, refspecs, pushOptions, output))) {
+            output.text += `Unable to push submodule '${path}'\n`;
+            ok = false;
+          }
+        }
+        if (!ok) die("fatal: failed to push all needed submodules");
+      }
+    }
+    if (mode === "check" || !this.dryRun) {
+      const needs = await findUnpushedSubmodules(this.workingCopy, commits, remoteName, warn);
+      if (needs.length > 0) {
+        die(
+          [
+            "The following submodule paths contain changes that can",
+            "not be found on any remote:",
+            ...needs.map((p) => `  ${p}`),
+            "",
+            "Please try",
+            "",
+            "\tgit push --recurse-submodules=on-demand",
+            "",
+            "or cd to the path and use",
+            "",
+            "\tgit push",
+            "",
+            "to push them to a remote.",
+            "",
+            "fatal: Aborting.",
+          ].join("\n"),
+        );
+      }
+    }
+    if (mode === "only") throw new SubmodulesOnlyPushed();
+  }
+
+  /** The submodule's repository at `path` (populated). */
+  private async openSubmodulePath(path: string) {
+    return this.worktreeAccess?.openGitlink?.(path).catch(() => undefined);
+  }
+
+  /**
+   * submodule.c's `push_submodule`: `git push --recurse-submodules=only-is-on-demand
+   * [--dry-run] [--push-option=...] [<remote> <refspec>...]` in the submodule, when it has
+   * remote-tracking refs; false when that push failed.
+   */
+  private async pushSubmodule(
+    path: string,
+    configured: boolean,
+    refspecs: readonly string[],
+    pushOptions: readonly string[],
+    output: { text: string },
+  ): Promise<boolean> {
+    const inner = await this.openSubmodulePath(path);
+    if (!inner) return true;
+    const remotes = await new SubmoduleFetchRepository(inner).refTipsUnder("refs/remotes/");
+    if (remotes.length === 0) return true;
+    const child = new PushCommand(inner).setRecurseFromSuperproject(true);
+    child.shareHooksOf(this);
+    child.setTransports(this.submoduleTransports());
+    if (this.timeout !== undefined) child.setTimeout(this.timeout);
+    if (this.dryRun) child.setDryRun(true);
+    if (pushOptions.length > 0) child.setPushOptions([...pushOptions]);
+    if (configured) {
+      child.setRemote(this.remote);
+      if (refspecs.length > 0) child.setRefSpecs(...refspecs);
+    }
+    if (this.compatibility) child.setCompatibility(this.compatibility);
+    try {
+      const result = await child.call();
+      output.text += pushOutputText(result);
+      return pushSucceeded(result);
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      output.text += `${error.message.replace(/\n$/, "")}\n`;
+      return false;
+    }
+  }
+
+  /**
+   * The transports a submodule's push goes through: a submodule's URL is repository content,
+   * so this push's credentials and headers go only to its own remote's origin.
+   */
+  private submoduleTransports() {
+    const transports = this.getTransports();
+    if (!this.credentials && !this.headers) return transports;
+    const url = RemoteConfigStore.from(this._workingCopy).remoteUrlOf(this.remote);
+    const origin = strictUrlOrigin(url);
+    return guardSubmoduleTransports(
+      transports,
+      createSubmoduleAuthPolicy({
+        ...(this.credentials ? { credentials: this.credentials } : {}),
+        ...(this.headers ? { headers: this.headers } : {}),
+        origins: origin !== undefined ? [origin] : [],
+      }),
+    );
+  }
+
+  /**
+   * `git submodule--helper push-check <head> <remote> <refspec>...` in the submodule: its
+   * `fatal:` line when the remote is not configured there or a refspec's source names no
+   * single ref (`HEAD` only when the submodule is on the superproject's branch).
+   */
+  private async submodulePushCheck(
+    path: string,
+    superHead: string,
+    refspecs: readonly string[],
+  ): Promise<string | undefined> {
+    const inner = await this.openSubmodulePath(path);
+    if (!inner) return undefined;
+    const repo = new SubmoduleFetchRepository(inner);
+    const head = await repo.headRef();
+    if (head === undefined) return "fatal: Failed to resolve HEAD as a valid ref.";
+    if (!RemoteConfigStore.from(inner).isConfigured(this.remote)) {
+      return `fatal: remote '${this.remote}' not configured`;
+    }
+    const names = [...(await repo.refTips()).keys()];
+    for (const raw of refspecs) {
+      const spec = raw.startsWith("+") ? raw.slice(1) : raw;
+      if (spec === ":" || spec.includes("*")) continue;
+      const colon = spec.indexOf(":");
+      const src = colon < 0 ? spec : spec.slice(0, colon);
+      if (src === "") continue;
+      const candidates = [
+        src,
+        `refs/${src}`,
+        `refs/tags/${src}`,
+        `refs/heads/${src}`,
+        `refs/remotes/${src}`,
+        `refs/remotes/${src}/HEAD`,
+      ];
+      const count = new Set(candidates.filter((c) => names.includes(c))).size;
+      if (count === 1) continue;
+      if (count === 0 && src === "HEAD") {
+        if (head !== "HEAD" && head === superHead) continue;
+        return "fatal: HEAD does not match the named branch in the superproject";
+      }
+      return `fatal: src refspec '${src}' must name a ref`;
+    }
+    return undefined;
   }
 
   /**
@@ -1458,4 +1758,50 @@ function refNameIsSafe(name: string): boolean {
     return rest.split("/").every((c) => c !== "" && c !== "." && c !== "..");
   }
   return /^[A-Z_]+$/.test(name);
+}
+
+/** `--recurse-submodules=only` stopped the push once the submodules were pushed. */
+class SubmodulesOnlyPushed extends Error {}
+
+/**
+ * builtin/push.c's `--recurse-submodules` modes (git's `RECURSE_SUBMODULES_CHECK`,
+ * `_ON_DEMAND`, `_ONLY`, `_OFF`).
+ */
+export type PushRecurseSubmodules = "check" | "on-demand" | "only" | "no";
+
+/**
+ * submodule-config.c's `parse_push_recurse_submodules_arg`: false, `on-demand`, `check` or
+ * `only`; true (there is no plain "on" for a push) and anything else die.
+ */
+export function parsePushRecurseSubmodules(
+  key: string,
+  value: string | undefined,
+): PushRecurseSubmodules {
+  const bool = value === undefined ? true : parseGitBool(value);
+  if (bool === false) return "no";
+  if (bool === undefined && (value === "on-demand" || value === "check" || value === "only")) {
+    return value;
+  }
+  throw new GitApiError(`fatal: bad ${key} argument: ${value ?? "true"}`, { exitCode: 128 });
+}
+
+/** What a push prints on stderr: its warnings, its report, its errors, its submodules'. */
+export function pushOutputText(result: PushResult): string {
+  const lines = [
+    ...(result.warnings ?? []),
+    ...(result.display ?? []),
+    ...(result.errors ?? []),
+    ...(pushSucceeded(result) ? [] : [`error: failed to push some refs to '${result.uri}'`]),
+  ];
+  return `${result.submoduleOutput ?? ""}${lines.map((l) => `${l}\n`).join("")}`;
+}
+
+/** Whether git's push exits 0: every ref pushed or up to date, the report sound. */
+export function pushSucceeded(result: PushResult): boolean {
+  return (
+    !result.failed &&
+    result.remoteUpdates.every(
+      (u) => u.status === PushStatus.OK || u.status === PushStatus.UP_TO_DATE,
+    )
+  );
 }
