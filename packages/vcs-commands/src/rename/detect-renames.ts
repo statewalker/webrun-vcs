@@ -28,6 +28,11 @@ export interface RenameCandidate {
    * once from the start (git's `rename_used++` at register_rename_src), so it is only copied
    */
   kept?: boolean;
+  /**
+   * An unmodified path (`--find-copies-harder`): over the rename limit, `-C -C` falls back to
+   * copies from modified paths only (git's `skip_unmodified`)
+   */
+  unmodified?: boolean;
 }
 
 /** A source paired with a destination. */
@@ -109,6 +114,21 @@ export interface DetectRenamesOptions {
    * merge options.
    */
   copies?: boolean;
+  /**
+   * Some sources are halves of broken pairs (`-B`, git's `break_idx`): as with copies, no
+   * basename matches and every source stays in the matrix (used ones only skipped)
+   */
+  breakMode?: boolean;
+  /**
+   * Called when `--find-copies-harder` went over the rename limit and copies were looked for
+   * from modified paths only (git's `degraded_cc_to_c`)
+   */
+  onDegraded?(): void;
+  /**
+   * Called once detection is done with how many times each source (by path) is used (git's
+   * `rename_used`: kept sources count once, each pair once more)
+   */
+  onUses?(uses: Map<string, number>): void;
 }
 
 /** A source a merge needs for its content (the other side changed it). */
@@ -331,7 +351,11 @@ export async function detectRenames(
   };
   // diff_resolve_rename_copy: in destination order, each pair takes one use of its source;
   // a source with uses left is copied, its last use renames it
+  const reportUses = () => {
+    options.onUses?.(new Map(src.map((c, i) => [c.path, useCount[i] ?? 0])));
+  };
   const resolved = () => {
+    reportUses();
     if (!copies) return pairs;
     const left: number[] = [...useCount];
     const bySrc = new Map(src.map((c, i) => [c.path, i]));
@@ -363,7 +387,7 @@ export async function detectRenames(
         continue;
       }
       // higher for a source not used yet; a used one only for a copy
-      if (srcUsed.has(s) && !copies) continue;
+      if (useCount[s] && !copies) continue;
       const score =
         (useCount[s] ? 0 : 1) + (basename(source.path) === basename(target.path) ? 1 : 0);
       if (score > bestScore) {
@@ -413,15 +437,24 @@ export async function detectRenames(
       ? estimateSimilarity(await side(src[s], "source"), await side(dst[d], "destination"), minimum)
       : 0;
 
-  if (copies) {
-    // no basename matches with copies: every source (used ones too) against the
-    // destinations left, within the rename limit
+  if (copies || options.breakMode) {
+    // no basename matches with copies or broken pairs: every source (used ones too) against
+    // the destinations left, within the rename limit
     const destinationsLeft = dst.map((_, i) => i).filter((i) => !dstDone.has(i));
-    const sourcesLeft = src.map((_, i) => i);
+    let sourcesLeft = src.map((_, i) => i);
     if (destinationsLeft.length === 0) return resolved();
     if (sourcesLeft.length * destinationsLeft.length > renameLimit * renameLimit) {
       options.onRenameLimit?.(Math.max(sourcesLeft.length, destinationsLeft.length));
-      return resolved();
+      // too_many_rename_candidates: under -C -C, copies from modified paths only if they fit
+      const limited = sourcesLeft.filter((i) => !src[i].unmodified);
+      if (
+        limited.length === sourcesLeft.length ||
+        limited.length * destinationsLeft.length > renameLimit * renameLimit
+      ) {
+        return resolved();
+      }
+      options.onDegraded?.();
+      sourcesLeft = limited;
     }
     await options.prefetch?.([
       ...destinationsLeft.map((d) => ({ candidate: dst[d], side: "destination" as const })),
@@ -435,7 +468,7 @@ export async function detectRenames(
       dst,
     );
     // find_renames: unused sources first, then (copies) any
-    for (const any of [false, true]) {
+    for (const any of copies ? [false, true] : [false]) {
       for (const m of matrix) {
         if (m.dst < 0 || m.score < minimumScore) break;
         if (dstDone.has(m.dst)) continue;
@@ -485,7 +518,7 @@ export async function detectRenames(
     }
     return map;
   };
-  const liveSources = () => src.map((s, i) => i).filter((i) => !srcUsed.has(i));
+  const liveSources = () => src.map((_s, i) => i).filter((i) => !srcUsed.has(i));
   const srcNames = unique(liveSources().map((i) => [i, src[i].path]));
   const dstNames = unique(
     dst.map((d, i) => [i, d.path] as [number, string]).filter(([i]) => !dstDone.has(i)),
@@ -559,6 +592,7 @@ export async function detectRenames(
     });
   }
   const finish = () => {
+    reportUses();
     // only the removed directories still needed keep their counts (`cleanup_dir_rename_info`)
     if (!info || !dirsRemoved) return pairs;
     for (const [dir, counts] of [...info.counts]) {
