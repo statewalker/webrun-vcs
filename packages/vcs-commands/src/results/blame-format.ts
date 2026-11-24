@@ -24,6 +24,15 @@ export interface BlamePorcelainOptions {
   linePorcelain?: boolean;
   /** `core.quotePath` (default true) */
   quotePath?: boolean;
+  /** An `ignored` line under each ignored line (default the result's `markIgnoredLines`) */
+  markIgnoredLines?: boolean;
+  /** An `unblamable` line under each (default the result's `markUnblamableLines`) */
+  markUnblamableLines?: boolean;
+  /**
+   * Whether the `ignored`/`unblamable` lines are written at all: git 2.50+ writes them
+   * (default true), older git marks only its default output
+   */
+  lineMarks?: boolean;
 }
 
 /** Options of {@link formatBlame} (git's default output) */
@@ -54,6 +63,10 @@ export interface BlameFormatOptions {
    * it only when a boundary commit is shown (default false)
    */
   alwaysWidenAbbrev?: boolean;
+  /** `?` before the ids of ignored lines (default the result's `markIgnoredLines`) */
+  markIgnoredLines?: boolean;
+  /** `*` before the ids of unblamable lines (default the result's `markUnblamableLines`) */
+  markUnblamableLines?: boolean;
 }
 
 /** The commit's subject as `find_commit_subject` finds it: its first non-blank line */
@@ -119,6 +132,15 @@ export function formatBlamePorcelain(
 ): Uint8Array {
   const quote = options.quotePath ?? true;
   const repeat = options.linePorcelain ?? false;
+  const lineMarks = options.lineMarks ?? true;
+  const markIgnored = lineMarks && (options.markIgnoredLines ?? result.markIgnoredLines ?? false);
+  const markUnblamable =
+    lineMarks && (options.markUnblamableLines ?? result.markUnblamableLines ?? false);
+  // emit_porcelain_per_line_details
+  const perLine = (e: BlameEntry) => {
+    if (markUnblamable && e.unblamable) sink.text("unblamable\n");
+    if (markIgnored && e.ignored) sink.text("ignored\n");
+  };
   const lines = fileLines(result.content ?? new Uint8Array(0));
   const multi = multiPathCommits(result.entries);
   const shown = new Set<string>();
@@ -145,11 +167,13 @@ export function formatBlamePorcelain(
   for (const e of result.entries) {
     sink.text(`${e.commitId} ${e.sourceStart} ${e.resultStart} ${e.lineCount}\n`);
     details(e, repeat);
+    perLine(e);
     let last: Uint8Array | undefined;
     for (let cnt = 0; cnt < e.lineCount; cnt++) {
       if (cnt) {
         sink.text(`${e.commitId} ${e.sourceStart + cnt} ${e.resultStart + cnt}\n`);
         if (repeat) details(e, true);
+        perLine(e);
       }
       last = lines[e.resultStart - 1 + cnt] ?? new Uint8Array(0);
       sink.text("\t");
@@ -173,8 +197,15 @@ export function formatBlame(result: BlameResult, options: BlameFormatOptions = {
   const seen = new Set<string>();
   const authorOf = (e: BlameEntry) =>
     options.showEmail ? `<${e.commit.author.email}>` : e.commit.author.name;
+  const markIgnored = options.markIgnoredLines ?? result.markIgnoredLines ?? false;
+  const markUnblamable = options.markUnblamableLines ?? result.markUnblamableLines ?? false;
+  /** print_marks: `^` for a boundary (not with -b), `*` unblamable, `?` ignored */
+  const marksOf = (e: BlameEntry) =>
+    (e.boundary && !options.blankBoundary ? "^" : "") +
+    (markUnblamable && e.unblamable ? "*" : "") +
+    (markIgnored && e.ignored ? "?" : "");
   for (const e of entries) {
-    const marks = e.boundary && !options.blankBoundary ? 1 : 0;
+    const marks = marksOf(e).length;
     if (maxMarks < marks) maxMarks = marks;
     if (e.sourcePath !== result.path) showName = true;
     const len = encodeGitPath(e.sourcePath).length;
@@ -207,12 +238,10 @@ export function formatBlame(result: BlameResult, options: BlameFormatOptions = {
       let length = options.longObjectName ? 40 : abbrev;
       let hex = e.commitId;
       if (e.boundary && options.blankBoundary) hex = " ".repeat(hex.length);
-      let line = "";
-      if (e.boundary && !options.blankBoundary) {
-        line += "^";
-        length--;
-      }
-      line += hex.slice(0, Math.min(length, 40));
+      const marks = marksOf(e);
+      let line = marks;
+      length -= marks.length;
+      line += hex.slice(0, Math.max(0, Math.min(length, 40)));
       if (showName) {
         const pad = Math.max(0, longestFile - encodeGitPath(e.sourcePath).length);
         line += ` ${e.sourcePath}${" ".repeat(pad)}`;
