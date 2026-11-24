@@ -239,9 +239,18 @@ export function createPromisorFetcher(
         return false;
       }
       const message = error instanceof Error ? error.message : String(error);
+      // one die() message: its prefix on the first line only (a local transport's
+      // "Could not read ..." goes on with an empty line and the access advice)
       const lines = message.split("\n");
+      let continued = false;
       for (const line of lines) {
-        warnings?.push(/^(fatal|error|warning):/.test(line) ? line : `fatal: ${line}`);
+        if (/^(fatal|error|warning):/.test(line)) continued = true;
+        else if (!continued) {
+          warnings?.push(`fatal: ${line}`);
+          continued = true;
+          continue;
+        }
+        warnings?.push(line);
       }
       return false;
     }
