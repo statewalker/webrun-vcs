@@ -70,6 +70,7 @@ import {
   RevParseCommand,
   RmCommand,
   SetUpstreamBranchCommand,
+  ShowCommand,
   ShowCurrentBranchCommand,
   SparseCheckoutCommand,
   StashApplyCommand,
@@ -376,6 +377,20 @@ export class Git implements Disposable {
   log(): LogCommand {
     this.checkClosed();
     return new LogCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a ShowCommand (`git show`): commits with their patch, annotated tags, trees and
+   * blobs, as git shows them.
+   *
+   * @example
+   * ```typescript
+   * const text = await git.show().addRevision("v1.0").callText();
+   * ```
+   */
+  show(): ShowCommand {
+    this.checkClosed();
+    return new ShowCommand(this._workingCopy);
   }
 
   /**
