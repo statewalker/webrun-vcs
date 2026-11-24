@@ -84,9 +84,7 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
       if (!promisor) return undefined;
       const previous = promisor.fetcher;
       const fetcher = createPromisorFetcher(this._workingCopy, {
-        ...(this.transportRegistry ? { transports: this.transportRegistry } : {}),
-        ...(this.credentials ? { credentials: this.credentials } : {}),
-        ...(this.headers ? { headers: this.headers } : {}),
+        ...this.promisorFetcherAuth(),
         ...(this.timeout !== undefined ? { timeout: this.timeout } : {}),
       });
       promisor.setFetcher(fetcher);
@@ -94,6 +92,22 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
         if (promisor.fetcher === fetcher) promisor.setFetcher(previous);
       };
     });
+  }
+
+  /**
+   * What a lazy fetch during the call reaches the promisor remote with: this command's
+   * transports, credentials and headers.
+   */
+  protected promisorFetcherAuth(): {
+    transports?: GitTransportRegistry;
+    credentials?: Credentials;
+    headers?: Record<string, string>;
+  } {
+    return {
+      ...(this.transportRegistry ? { transports: this.transportRegistry } : {}),
+      ...(this.credentials ? { credentials: this.credentials } : {}),
+      ...(this.headers ? { headers: this.headers } : {}),
+    };
   }
 
   /**
@@ -244,6 +258,23 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
     const store = RemoteConfigStore.from(this._workingCopy);
     if (store.urlFor(remote) === undefined) return undefined;
     return store.value(`remote.${remote}.${key}`);
+  }
+
+  /**
+   * Gives a command this one runs (git's child `git fetch`) this command's transports,
+   * credentials, headers, timeout, progress callbacks and hook session.
+   */
+  protected configureChild<C extends TransportCommand<unknown>>(child: C): C {
+    child.shareHooksOf(this);
+    child.setTransports(this.getTransports());
+    if (this.credentials) child.setCredentials(this.credentials);
+    if (this.headers) child.setHeaders(this.headers);
+    if (this.timeout) child.setTimeout(this.timeout);
+    if (this.gzipRequests !== undefined) child.setGzipRequests(this.gzipRequests);
+    if (this.progressCallback) child.setProgressMonitor(this.progressCallback);
+    if (this.progressMessageCallback)
+      child.setProgressMessageCallback(this.progressMessageCallback);
+    return child;
   }
 
   /**

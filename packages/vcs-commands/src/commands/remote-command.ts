@@ -7,7 +7,12 @@ import {
   type RefSpec,
   type RemoteRef as TransportRemoteRef,
 } from "@statewalker/vcs-transport";
-import { compilePosixRegex, type PosixRegex, PosixRegexError } from "@statewalker/vcs-utils";
+import {
+  compilePosixRegex,
+  type PosixRegex,
+  PosixRegexError,
+  parseGitBool,
+} from "@statewalker/vcs-utils";
 
 import {
   GitApiError,
@@ -325,16 +330,8 @@ export class RemoteAddCommand extends TransportCommand<RemoteConfig> {
   /** git's fetch_remote: `Updating <name>`, then `git fetch <name>` as a child. */
   private async fetchRemote(name: string): Promise<void> {
     this.messages.push(`Updating ${name}`);
-    const fetch = new FetchCommand(this._workingCopy).shareHooksOf(this);
-    fetch.setTransports(this.getTransports());
+    const fetch = this.configureChild(new FetchCommand(this._workingCopy));
     fetch.setRemote(name);
-    if (this.credentials) fetch.setCredentials(this.credentials);
-    if (this.headers) fetch.setHeaders(this.headers);
-    if (this.timeout) fetch.setTimeout(this.timeout);
-    if (this.progressCallback) fetch.setProgressMonitor(this.progressCallback);
-    if (this.progressMessageCallback) {
-      fetch.setProgressMessageCallback(this.progressMessageCallback);
-    }
     try {
       this.fetchResult = await fetch.call();
     } catch (cause) {
@@ -1272,5 +1269,96 @@ export class RemoteSetHeadCommand extends TransportCommand<string | undefined> {
       ? branches.filter((r) => r.name === head.symref)
       : branches.filter((r) => r.oid === head.oid);
     return matches.map((r) => r.name.slice("refs/heads/".length));
+  }
+}
+
+/**
+ * Change the branches a remote's fetch tracks: `git remote set-branches [--add] <name>
+ * <branch>...`.
+ *
+ * As builtin/remote.c `set_branches`: every `remote.<name>.fetch` is removed (unless
+ * {@link setAdd}), then one `+refs/heads/<branch>:refs/remotes/<name>/<branch>` added per
+ * branch, a pattern written as given (`feat/*`); a remote with `remote.<name>.mirror` gets
+ * `+refs/<branch>:refs/<branch>`. The remote must be configured in the repository.
+ *
+ * @example
+ * ```typescript
+ * await git.remoteSetBranches().setRemoteName("origin").setBranches("main", "next").call();
+ * await git.remoteSetBranches().setRemoteName("origin").setBranches("topic").setAdd(true).call();
+ * ```
+ */
+export class RemoteSetBranchesCommand extends GitCommand<RemoteConfig> {
+  /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
+  protected override readsCoreConfig(): boolean {
+    return false;
+  }
+
+  private remoteName?: string;
+  private branches: string[] = [];
+  private addMode = false;
+  private messages: string[] = [];
+
+  /** The remote whose fetch refspecs change. */
+  setRemoteName(name: string): this {
+    this.checkCallable();
+    this.remoteName = name;
+    return this;
+  }
+
+  /** The branches (or patterns) to track. */
+  setBranches(...branches: string[]): this {
+    this.checkCallable();
+    this.branches = [...branches];
+    return this;
+  }
+
+  /** Add the branches to the ones tracked (`--add`) instead of replacing them. */
+  setAdd(add: boolean): this {
+    this.checkCallable();
+    this.addMode = add;
+    return this;
+  }
+
+  /** git 2.5x's warnings reading a legacy remote file. Empty before {@link call}. */
+  getMessages(): string[] {
+    return [...this.messages];
+  }
+
+  /**
+   * @returns the remote as configured now
+   * @throws MissingArgumentError without a remote (git: "no remote specified" and its usage,
+   *   exit 129)
+   * @throws RemoteNotFoundError (exit 2) when the repository does not configure the remote
+   *   (git: "No such remote '<name>'")
+   * @throws GitApiError (exit 1, no message) without {@link setAdd} when the remote has no
+   *   fetch refspec to remove: git's config write finds nothing to replace, and nothing changes
+   */
+  async call(): Promise<RemoteConfig> {
+    this.checkCallable();
+    this.setCallable(false);
+    const name = this.remoteName;
+    if (!name) throw new MissingArgumentError("remoteName", "error: no remote specified");
+    this.messages.push(...(await this.loadLegacyRemote(name)));
+    const store = RemoteConfigStore.from(this.workingCopy);
+    if (!store.isConfiguredInRepo(name)) {
+      throw new RemoteNotFoundError(name, `error: No such remote '${name}'`);
+    }
+    const key = `remote.${name}.fetch`;
+    if (!this.addMode) {
+      // remove_all_fetch_refspecs: git_config_set_multivar_gently(key, NULL, NULL, MULTI_REPLACE)
+      if (store.localValues(key).length === 0) throw new GitApiError("", { exitCode: 1 });
+      store.unset(key);
+    }
+    const mirror = parseGitBool(store.value(`remote.${name}.mirror`)) === true;
+    for (const branch of this.branches) {
+      store.addValue(
+        key,
+        mirror
+          ? `+refs/${branch}:refs/${branch}`
+          : `+refs/heads/${branch}:refs/remotes/${name}/${branch}`,
+      );
+    }
+    await store.save();
+    return store.read(name);
   }
 }
