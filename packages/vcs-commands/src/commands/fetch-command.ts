@@ -718,8 +718,14 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     const opportunistic = fromConfig
       ? []
       : (this.refmap ?? configured).filter((spec) => spec !== "");
-    // do_fetch: refs/remotes/<name>/HEAD follows the remote HEAD on a configured fetch
-    const followHead = fromConfig && configured.length > 0 ? this.followRemoteHead(store) : null;
+    // do_fetch: refs/remotes/<name>/HEAD follows the remote HEAD on a configured fetch (git
+    // 2.48+; 2.43 leaves it alone)
+    const followHead =
+      fromConfig &&
+      configured.length > 0 &&
+      (this.compatibility ?? this.hooks.compatibility) !== "2.43"
+        ? this.followRemoteHead(store)
+        : null;
     const messages: string[] = [...legacyMessages];
     const errors: string[] = [];
     const trackingUpdates: TrackingRefUpdate[] = [];
