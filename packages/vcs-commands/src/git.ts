@@ -83,6 +83,7 @@ import {
   StashShowCommand,
   StashStoreCommand,
   StatusCommand,
+  SubmoduleAddCommand,
   SubmoduleDeinitCommand,
   SubmoduleForeachCommand,
   SubmoduleInitCommand,
@@ -984,6 +985,20 @@ export class Git implements Disposable {
   submoduleSummary(): SubmoduleSummaryCommand {
     this.checkClosed();
     return new SubmoduleSummaryCommand(this._workingCopy);
+  }
+
+  /**
+   * `git submodule add`: clone a repository into `.git/modules/<name>`, check it out at its
+   * path and register it in `.gitmodules`, `.git/config` and the index.
+   *
+   * @example
+   * ```typescript
+   * await git.submoduleAdd().setURI("../lib").setPath("lib").call();
+   * ```
+   */
+  submoduleAdd(): SubmoduleAddCommand {
+    this.checkClosed();
+    return this.withTransports(new SubmoduleAddCommand(this._workingCopy));
   }
 
   /**

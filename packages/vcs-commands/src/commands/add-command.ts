@@ -990,9 +990,15 @@ export class AddCommand extends GitCommand<AddResult> {
     if (ignored.length > 0) {
       messages.push("The following paths are ignored by one of your .gitignore files:", ...ignored);
       if (this.advice("addIgnoredFile")) {
+        // git 2.43's add_files spelled its own closing lines (advise(), not advise_if_enabled)
         messages.push(
           "hint: Use -f if you really want to add them.",
-          this.disableHint("addIgnoredFile"),
+          ...(this.compatibility === "2.43"
+            ? [
+                "hint: Turn this message off by running",
+                'hint: "git config advice.addIgnoredFile false"',
+              ]
+            : [this.disableHint("addIgnoredFile")]),
         );
       }
     }
