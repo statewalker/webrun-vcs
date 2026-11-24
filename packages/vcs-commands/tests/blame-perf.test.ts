@@ -201,4 +201,44 @@ describeGit("blame reads and diffs each version once", () => {
       expect(Buffer.from(capped.out).equals(Buffer.from(plain.out))).toBe(true);
     }
   }, 60_000);
+  it("looks for copies (-C -C -C) reading each version of every file once", async () => {
+    const env = nativeGitEnv(root);
+    const blobs = execFileSync("git", ["rev-list", "--objects", "--no-object-names", h.tip], {
+      cwd: dir,
+      env,
+    })
+      .toString()
+      .trim()
+      .split("\n")
+      .filter(
+        (id) =>
+          execFileSync("git", ["cat-file", "-t", id], { cwd: dir, env }).toString().trim() ===
+          "blob",
+      ).length;
+    const counts: Counts = {};
+    const git = await openCounted(dir, counts);
+    const started = performance.now();
+    const result = await git
+      .blame()
+      .setFilePath(h.path)
+      .setStartCommit(h.tip)
+      .setDetectCopies(3)
+      .call();
+    const elapsed = performance.now() - started;
+    // every file of every parent is looked in, but each version is read once (and the two
+    // old names of the long-lived file again by rename detection)
+    expect(counts["blobs.load"]).toBeLessThanOrEqual(blobs + 2);
+    expect(elapsed).toBeLessThan(60_000);
+    // the same blame when the interner is replaced while the copies are looked for
+    const capped = await (await openCounted(dir, {}))
+      .blame()
+      .setFilePath(h.path)
+      .setStartCommit(h.tip)
+      .setDetectCopies(3)
+      .setInternerByteLimit(256)
+      .call();
+    expect(
+      Buffer.from(formatBlamePorcelain(capped)).equals(Buffer.from(formatBlamePorcelain(result))),
+    ).toBe(true);
+  }, 120_000);
 });
