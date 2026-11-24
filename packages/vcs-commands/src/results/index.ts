@@ -4,6 +4,7 @@ export * from "./clone-result.js";
 export * from "./combined-diff.js";
 export * from "./diff-check.js";
 export * from "./diff-color.js";
+export * from "./diff-dirstat.js";
 export * from "./diff-entry.js";
 export * from "./diff-formatter.js";
 export * from "./diff-order.js";
