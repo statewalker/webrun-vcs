@@ -8,6 +8,8 @@ import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
 import { mergeLines } from "@statewalker/vcs-utils";
 import { bytesToHex, sha1Of } from "@statewalker/vcs-utils/hash";
 import {
+  type AttributesIndex,
+  type ContentAttributesContext,
   compareWithWorktree,
   type IndexEntry,
   modeFromWorktree,
@@ -360,6 +362,7 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
           attributes?: (
             path: string,
             names?: readonly string[],
+            context?: ContentAttributesContext,
           ) => Promise<Map<string, true | false | string | undefined>>;
           checkin?: (path: string) => Promise<
             | {
@@ -406,7 +409,14 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
       async (name) => {
         let attr: true | false | string | undefined;
         try {
-          attr = (await filter?.attributes?.(toPath(name), ["whitespace"]))?.get("whitespace");
+          // whitespace_rule's own attribute check: its stack is not convert.c's, which is
+          // built on the first conversion (a racy entry's check, else the first write)
+          attr = (
+            await filter?.attributes?.(toPath(name), ["whitespace"], {
+              direction: "checkin",
+              check: "whitespace",
+            })
+          )?.get("whitespace");
         } catch {
           attr = undefined;
         }
@@ -502,7 +512,23 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
       name: p.name ?? "<stdin>",
       fromFile: p.name !== undefined,
     }));
-    const { status, writeIndex } = await engine.applyAll(inputs);
+    // the attributes files of the index as apply.c's istate holds them while it writes:
+    // remove_file_from_index in the first phase, add_index_entry after each file written
+    const editedIndex: AttributesIndex | undefined = this.temporaryIndex
+      ? undefined
+      : {
+          attributesBlob: async (path) => {
+            const changed = engine.indexChanges.get(pathToLatin1(path));
+            if (changed)
+              return (changed.find((e) => !e.stage) ?? changed.find((e) => e.stage === 2))?.oid;
+            const entry = (await staging.getEntry(path, 0)) ?? (await staging.getEntry(path, 2));
+            return entry?.objectId;
+          },
+        };
+    const { status, writeIndex } = await this.inOneOperation(
+      () => engine.applyAll(inputs),
+      editedIndex ? { keepAttributes: true, index: editedIndex } : { keepAttributes: true },
+    );
     if (writeIndex && this.temporaryIndex) {
       for (const [name, entries] of engine.indexChanges) {
         const path = toPath(name);
@@ -541,7 +567,8 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
 
   private makeIO(
     worktree: Worktree | undefined,
-    trust: { executable?: boolean; symlinks?: boolean },
+    /** worktreeModeTrust: modes, and what ce_match_stat_basic compares (ctime, fullStat) */
+    trust: { executable?: boolean; symlinks?: boolean; ctime?: boolean; fullStat?: boolean },
     filter:
       | {
           checkin?: (path: string) => Promise<
@@ -644,8 +671,16 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
         if (isGitlink(entry.mode)) return st !== undefined && (st.mode & 0o170000) === S_IFDIR;
         const staged = await this.staging.getEntry(toPath(name));
         if (!staged) return false;
+        // ie_match_stat: a file whose stat matches an entry older than the index is clean
+        // unread; only a racy one is read (and converted, building convert.c's stack). The
+        // stat compared is core.trustctime's and core.checkStat's (ctime, inode and owner)
         const cmp = await compareWithWorktree(worktree, staged, {
-          trust: { executable: trust.executable !== false, symlinks: trust.symlinks !== false },
+          trust: {
+            ...trust,
+            executable: trust.executable !== false,
+            symlinks: trust.symlinks !== false,
+          },
+          indexTime: this.staging.getUpdateTime(),
         });
         return cmp.kind === undefined;
       },
