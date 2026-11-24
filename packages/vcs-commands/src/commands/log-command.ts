@@ -68,6 +68,7 @@ import {
 } from "./notes-support.js";
 import { combineNotesIgnore } from "./notes-tree.js";
 import { canonicalObjectId } from "./object-id-input.js";
+import { PatchIds } from "./patch-id.js";
 import {
   ALL_ENTRIES_NOT_INTERESTING,
   bloomPathOf,
@@ -121,6 +122,22 @@ interface PendingCommit {
   id: ObjectId;
   exclude: boolean;
   name?: string;
+  /** The left side of a symmetric difference (`a` of `a...b`, git's SYMMETRIC_LEFT) */
+  left?: boolean;
+}
+
+/** A commit of the walk as the log printer takes it. */
+function outputEntry(c: LogResult): LogOutputEntry {
+  const { id, boundary, source, left, patchSame, reflog: _reflog, ...commit } = c;
+  return {
+    id,
+    commit,
+    parents: c.parents,
+    ...(boundary ? { boundary: true } : {}),
+    ...(source !== undefined ? { source } : {}),
+    ...(left ? { left: true } : {}),
+    ...(patchSame ? { patchSame: true } : {}),
+  };
 }
 
 /** git's get_revision under `--reverse`: every commit read first, then given oldest first. */
@@ -146,6 +163,16 @@ export interface LogResult extends Commit {
    * not listed itself, given after the others (git's `BOUNDARY`, the `-` mark)
    */
   boundary?: boolean;
+  /**
+   * On the left side of a symmetric difference (`a` of `a...b`, reached from it only): git's
+   * SYMMETRIC_LEFT, the `<` mark of {@link LogCommand.setLeftRight} (`>` otherwise)
+   */
+  left?: boolean;
+  /**
+   * {@link LogCommand.setCherryMark}: the other side of the symmetric difference has a commit
+   * with the same patch-id (git's PATCHSAME, the `=` mark)
+   */
+  patchSame?: boolean;
   /**
    * The name the commit was reached from ({@link LogCommand.setSource}, git's `--source`):
    * the revision as given, or the ref `--all`, `--branches`... named
@@ -338,6 +365,18 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private boundary = false;
   /** `--source` */
   private source = false;
+  /** `--left-right` */
+  private leftRight = false;
+  /** `--left-only` */
+  private leftOnly = false;
+  /** `--right-only` (and `--cherry`) */
+  private rightOnly = false;
+  /** `--cherry-pick` */
+  private cherryPick = false;
+  /** `--cherry-mark` (and `--cherry`) */
+  private cherryMark = false;
+  /** `--cherry`: no merges (git's max_parents 1) */
+  private cherry = false;
 
   /**
    * The order of the commits ({@link LogOrder}); undefined is git's default, newest commit
@@ -396,6 +435,118 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
+   * `--left-right`: each commit is marked by the side of the symmetric difference it is
+   * reached from: `<` for the left (`a` of `a...b`, {@link add} with `left`), `>` for the
+   * right (`commit < <id>`, `< <id> <subject>` under `--oneline`, the graph's `<`/`>` in place
+   * of `*`); `left` on each {@link LogResult} says it whatever this says.
+   *
+   * @example
+   * ```typescript
+   * // git log --left-right --oneline main...topic
+   * await git.revList().addRevision("main...topic").setLeftRight(true).callLogText({ oneline: true });
+   * ```
+   */
+  setLeftRight(leftRight: boolean): this {
+    this.checkCallable();
+    this.leftRight = leftRight;
+    return this;
+  }
+
+  /**
+   * `--left-only`: only the commits of the left side of a symmetric difference (none without
+   * one). Refused with {@link setRightOnly} or {@link setCherry}, as git refuses them.
+   */
+  setLeftOnly(leftOnly: boolean): this {
+    this.checkCallable();
+    if (leftOnly && this.rightOnly) {
+      throw new IncompatibleOptionsError(
+        ["--left-only", "--right-only/--cherry"],
+        "options '--left-only' and '--right-only/--cherry' cannot be used together",
+      );
+    }
+    this.leftOnly = leftOnly;
+    return this;
+  }
+
+  /** `--right-only`: only the commits of the right side (see {@link setLeftOnly}). */
+  setRightOnly(rightOnly: boolean): this {
+    this.checkCallable();
+    if (rightOnly && this.leftOnly) {
+      throw new IncompatibleOptionsError(
+        ["--right-only", "--left-only"],
+        "options '--right-only' and '--left-only' cannot be used together",
+      );
+    }
+    this.rightOnly = rightOnly;
+    return this;
+  }
+
+  /**
+   * `--cherry-pick`: commits whose change (patch-id, as `git patch-id` computes it, limited to
+   * the paths) a commit on the other side of the symmetric difference makes too are left out,
+   * on both sides. The cheap id of each diff's headers is computed for the smaller side, and
+   * full patch-ids only where those collide (revision.c's cherry_pick_list).
+   *
+   * @example
+   * ```typescript
+   * // git rev-list --left-right --cherry-pick main...topic
+   * await git.revList().addRevision("main...topic").setLeftRight(true).setCherryPick(true).callText();
+   * ```
+   */
+  setCherryPick(cherryPick: boolean): this {
+    this.checkCallable();
+    if (cherryPick && this.cherryMark) {
+      throw new IncompatibleOptionsError(
+        ["--cherry-pick", "--cherry-mark"],
+        "options '--cherry-pick' and '--cherry-mark' cannot be used together",
+      );
+    }
+    this.cherryPick = cherryPick;
+    return this;
+  }
+
+  /**
+   * `--cherry-mark`: as {@link setCherryPick}, but the equivalent commits are kept and marked
+   * (`patchSame`, the `=` mark; the others `+` when nothing else marks them).
+   */
+  setCherryMark(cherryMark: boolean): this {
+    this.checkCallable();
+    if (cherryMark && this.cherryPick) {
+      throw new IncompatibleOptionsError(
+        ["--cherry-mark", "--cherry-pick"],
+        "options '--cherry-mark' and '--cherry-pick' cannot be used together",
+      );
+    }
+    this.cherryMark = cherryMark;
+    return this;
+  }
+
+  /**
+   * `--cherry`: `--right-only --cherry-mark --no-merges`, the commits of the right side marked
+   * by whether the left side has their change (`git cherry` as a walk).
+   */
+  setCherry(cherry: boolean): this {
+    this.checkCallable();
+    if (cherry && this.leftOnly) {
+      throw new IncompatibleOptionsError(
+        ["--cherry", "--left-only"],
+        "options '--cherry' and '--left-only' cannot be used together",
+      );
+    }
+    this.cherry = cherry;
+    if (cherry) {
+      this.cherryMark = true;
+      this.rightOnly = true;
+    }
+    return this;
+  }
+
+  /** The revision options of the marks the output prints (get_revision_mark). */
+  private revisionMarks(): { leftRight: boolean; cherryMark: boolean } {
+    return { leftRight: this.leftRight, cherryMark: this.cherryMark };
+  }
+
+  /**
    * `git log -g <ref>` (`--walk-reflogs`) for the printed log ({@link callText}): the
    * commits of `ref`'s reflog, newest entry first, each shown with its entry (`Reflog:`
    * lines, `<sel>: <message>` under `--oneline`, `%gd`/`%gD`/`%gs`/`%gn`/`%ge` in a format,
@@ -440,7 +591,9 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
 
   /**
    * The git version to follow where versions differ (default 2.56): 2.43 refuses a reflog
-   * walk's `--reverse` before a sorted walk (`--topo-order`, `--graph`), 2.56 after.
+   * walk's `--reverse` before a sorted walk (`--topo-order`, `--graph`), 2.56 after; 2.43's
+   * `--left-only`/`--right-only` hide nothing in a walk nothing else limits (no excluded
+   * commit: `a...b` of unrelated histories, or no range at all).
    */
   setCompatibility(version: "2.43" | "2.56"): this {
     this.checkCallable();
@@ -468,11 +621,18 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    *
    * @param commit ObjectId of commit to start from
    * @param name The name it was given by, which {@link setSource} reports (the id without)
+   * @param options `left`: the commit is the left side of a symmetric difference (`a` of
+   * `a...b`): it and what only it reaches are marked so ({@link setLeftRight})
    */
-  add(commit: ObjectId, name?: string): this {
+  add(commit: ObjectId, name?: string, options: { left?: boolean } = {}): this {
     this.checkCallable();
     this.startCommits.push(commit);
-    this.pending.push({ id: commit, exclude: false, ...(name !== undefined ? { name } : {}) });
+    this.pending.push({
+      id: commit,
+      exclude: false,
+      ...(name !== undefined ? { name } : {}),
+      ...(options.left ? { left: true } : {}),
+    });
     return this;
   }
 
@@ -576,9 +736,14 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * @param commit ObjectId to exclude along with its ancestors
    * @param name The name it was given by (see {@link add})
    */
-  not(commit: ObjectId, name?: string): this {
+  not(commit: ObjectId, name?: string, options: { left?: boolean } = {}): this {
     this.checkCallable();
-    this.pending.push({ id: commit, exclude: true, ...(name !== undefined ? { name } : {}) });
+    this.pending.push({
+      id: commit,
+      exclude: true,
+      ...(name !== undefined ? { name } : {}),
+      ...(options.left ? { left: true } : {}),
+    });
     return this;
   }
 
@@ -822,6 +987,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           id: await this.peelToCommit(e.id),
           exclude: e.exclude,
           name: e.name ?? e.id,
+          ...(e.left ? { left: true } : {}),
         });
     }
     if (this.startCommits.length === 0 && !this.includeAll) {
@@ -1119,11 +1285,13 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         return;
       }
       await simplify(n);
+      const passFlags = t.flag(n) & SYMMETRIC_LEFT;
       for (let k = 0, c = t.parentCount(n); k < c; k++) {
         const p = t.parent(n, k);
         if (!(await parse(p))) {
           throw new GitApiError(`Failed to traverse parents of commit ${t.idOf(n)}`);
         }
+        if (passFlags) t.mark(p, passFlags);
         if (sources && !sources.has(p)) {
           const source = sources.get(n);
           if (source !== undefined) sources.set(p, source);
@@ -1139,7 +1307,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const shown = async (n: number, rewrite = false): Promise<LogResult | undefined> => {
       const bytes = raw.get(n);
       if (bytes) raw.delete(n);
-      if (t.flag(n) & UNINTERESTING) return undefined;
+      // commit_early_ignore
+      if (t.flag(n) & (UNINTERESTING | SHOWN)) return undefined;
       if (t.flag(n) & TREESAME) {
         // with parents rewritten, a merge of two relevant lines ties the topology together
         if (!rewrite) return undefined;
@@ -1151,7 +1320,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (this.untilTime !== undefined && t.date(n) > this.untilTime) return undefined;
       const parents = t.parentCount(n);
       if (this.revFilter === RevFilter.ONLY_MERGES && parents < 2) return undefined;
-      if (this.revFilter === RevFilter.NO_MERGES && parents > 1) return undefined;
+      if ((this.revFilter === RevFilter.NO_MERGES || this.cherry) && parents > 1) return undefined;
       const id = t.idOf(n);
       const commit = bytes ? decodeCommit(bytes) : await this.walkCommits.load(id);
       if (!commit) return undefined;
@@ -1173,17 +1342,36 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         if (!(await filter.include(view))) return undefined;
       }
       const source = sources?.get(n);
-      return source !== undefined ? { ...commit, id, source } : { ...commit, id };
+      return {
+        ...commit,
+        id,
+        ...(source !== undefined ? { source } : {}),
+        ...sideOf(n),
+      };
+    };
+    /** The side marks of a commit (SYMMETRIC_LEFT, PATCHSAME) */
+    const sideOf = (n: number): { left?: true; patchSame?: true } => {
+      const f = t.flag(n);
+      return {
+        ...(f & SYMMETRIC_LEFT ? { left: true } : {}),
+        ...(f & PATCHSAME ? { patchSame: true } : {}),
+      };
     };
 
     // prepare_revision_walk: the flags of every argument first, then handle_commit in order
     for (const e of pending) {
+      if (e.left) t.mark(t.lookup(e.id), SYMMETRIC_LEFT);
       if (!e.exclude) continue;
       const n = t.lookup(e.id);
       t.mark(n, UNINTERESTING | BOTTOM);
     }
     const list: number[] = [];
-    let limited = false;
+    // --cherry-pick and --cherry-mark need limit_list, and so do --left-only and
+    // --right-only from git 2.44 on (2.43 applies them only to a walk limited otherwise)
+    let limited =
+      this.cherryPick ||
+      this.cherryMark ||
+      (this.compatibility !== "2.43" && (this.leftOnly || this.rightOnly));
     /** git's update_treesame: TREESAME again from the per-parent marks, relevance as it is now */
     const updateTreesame = (n: number): void => {
       const count = t.parentCount(n);
@@ -1328,6 +1516,16 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         date = t.date(n);
         newlist.push(n);
       }
+      if (this.cherryPick || this.cherryMark) {
+        await this.cherryPickList(newlist, t, parse, pathspec ? this.pathspecItems() : undefined);
+      }
+      // limit_left_right
+      if (this.leftOnly || this.rightOnly) {
+        for (const n of newlist) {
+          const left = !!(t.flag(n) & SYMMETRIC_LEFT);
+          if (this.rightOnly ? left : !left) t.mark(n, SHOWN);
+        }
+      }
       // commits made TREESAME by parents that became UNINTERESTING
       if (trackTreesame) {
         for (const n of newlist) {
@@ -1366,7 +1564,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         if (collectBoundary) {
           for (let k = 0, c = t.parentCount(n); k < c; k++) {
             const p = t.parent(n, k);
-            if (shownSet.has(p) || childShown.has(p)) continue;
+            if (shownSet.has(p) || childShown.has(p) || t.flag(p) & SHOWN) continue;
             childShown.add(p);
             boundaryCommits.push(p);
           }
@@ -1380,7 +1578,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const boundaryList: number[] = [];
     const marked = new Set<number>();
     for (const n of boundaryCommits) {
-      if (shownSet.has(n) || marked.has(n)) continue;
+      if (shownSet.has(n) || marked.has(n) || t.flag(n) & SHOWN) continue;
       marked.add(n);
       boundaryList.unshift(n);
     }
@@ -1390,7 +1588,13 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (!commit) continue;
       if (shallow.has(id)) commit.parents = [];
       const source = sources?.get(n);
-      yield { ...commit, id, boundary: true, ...(source !== undefined ? { source } : {}) };
+      yield {
+        ...commit,
+        id,
+        boundary: true,
+        ...(source !== undefined ? { source } : {}),
+        ...sideOf(n),
+      };
     }
   }
 
@@ -1458,13 +1662,15 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         }
         parents = ids;
       }
-      const { id, source, boundary: _boundary, ...rest } = commit;
+      const { id, source, boundary: _boundary, left, patchSame, ...rest } = commit;
       output.entries.push({
         id,
         commit: rest,
         parents,
         ...(savedParents ? { savedParents } : {}),
         ...(source !== undefined ? { source } : {}),
+        ...(left ? { left } : {}),
+        ...(patchSame ? { patchSame } : {}),
       });
     }
     // graph.c's graph_is_interesting asks get_commit_action about a parent: one the walk
@@ -1539,6 +1745,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         interesting: (id) => shownIds.has(id) || unwalkedShown.has(id),
         firstParentOnly: this.firstParentOnly,
         paths: pathspec,
+        ...this.revisionMarks(),
         ...(colors ? { colors } : {}),
       },
     );
@@ -1595,14 +1802,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         if (maxCount === undefined || maxCount > 0) {
           let shownCount = 0;
           for await (const c of await this.call()) {
-            const { id, boundary: isBoundary, source, ...commit } = c;
-            const entry: LogOutputEntry = {
-              id,
-              commit,
-              parents: c.parents,
-              ...(isBoundary ? { boundary: true } : {}),
-              ...(source !== undefined ? { source } : {}),
-            };
+            const entry = outputEntry(c);
             const shown = await printer.showCommit(entry, []);
             if (shown && countsShown && maxCount !== undefined && ++shownCount >= maxCount) break;
           }
@@ -1621,14 +1821,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       // --reverse: the newest commits walked, reversed, then shown
       entries = [];
       for await (const c of await this.call()) {
-        const { id, boundary: isBoundary, source, ...commit } = c;
-        entries.push({
-          id,
-          commit,
-          parents: c.parents,
-          ...(isBoundary ? { boundary: true } : {}),
-          ...(source !== undefined ? { source } : {}),
-        });
+        entries.push(outputEntry(c));
       }
     }
     this.simplifyHistory = simplifyHistory;
@@ -2553,11 +2746,66 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * element's path components when all are plain paths (no wildcard, no magic, no trailing
    * slash): those are compared by looking their entries up, without a tree diff.
    */
-  private pathspec(): TreePathspec & { literal: Uint8Array[][] | undefined } {
+  /** The walk's pathspec elements: the paths, the excluded ones, `.` when every one excludes */
+  private pathspecItems(): PathspecItem[] {
     const parse = (p: string) => parsePathspecItem(p, { attr: true });
     const items: PathspecItem[] = this.paths.map(parse);
     for (const p of this.excludePaths) items.push({ ...parse(p), exclude: true });
     if (items.every((i) => i.exclude)) items.push(parse("."));
+    return items;
+  }
+
+  /**
+   * revision.c's cherry_pick_list over the limited list: the patch-ids of the side with fewer
+   * commits are added (header ids only, see {@link PatchIds}), each commit of the other side
+   * looked up, and every match on either side marked PATCHSAME (`--cherry-mark`) or SHOWN
+   * (`--cherry-pick`, hidden). The diffs are limited to the walk's paths, and compare a
+   * commit with its parent as the walk has it (simplified), as git's do.
+   */
+  private async cherryPickList(
+    list: number[],
+    t: RevTable,
+    parse: (n: number) => Promise<boolean>,
+    items: PathspecItem[] | undefined,
+  ): Promise<void> {
+    let leftCount = 0;
+    let rightCount = 0;
+    for (const n of list) {
+      if (t.flag(n) & SYMMETRIC_LEFT) leftCount++;
+      else rightCount++;
+    }
+    if (!leftCount || !rightCount) return;
+    const leftFirst = leftCount < rightCount;
+    const ids = new PatchIds<number>({
+      trees: this.trees,
+      blobs: this.blobs,
+      objectFormat: this.objectFormat,
+      change: async (n) => {
+        const count = t.parentCount(n);
+        if (count > 1) return undefined;
+        if (count === 0) return { tree: t.treeOf(n) };
+        const p = t.parent(n, 0);
+        if (!(await parse(p))) return undefined;
+        return { parentTree: t.treeOf(p), tree: t.treeOf(n) };
+      },
+      ...(items ? { paths: (path: string) => matchPathspec(items, path, 0) > 0 } : {}),
+    });
+    for (const n of list) {
+      if (leftFirst !== !!(t.flag(n) & SYMMETRIC_LEFT)) continue;
+      await ids.add(n);
+    }
+    const flag = this.cherryMark ? PATCHSAME : SHOWN;
+    for (const n of list) {
+      if (leftFirst === !!(t.flag(n) & SYMMETRIC_LEFT)) continue;
+      const found = await ids.matches(n);
+      if (found.length === 0) continue;
+      t.mark(n, flag);
+      for (const m of found) t.mark(m, flag);
+    }
+  }
+
+  private pathspec(): TreePathspec & { literal: Uint8Array[][] | undefined } {
+    const items = this.pathspecItems();
     const plain = items.every(
       (i) =>
         !i.exclude &&
@@ -2951,6 +3199,12 @@ const BOTTOM = 1 << 2;
 const SEEN = 1 << 3;
 const ADDED = 1 << 4;
 const TREESAME = 1 << 5;
+/** The left side of `a...b` (passed from child to parent) */
+const SYMMETRIC_LEFT = 1 << 8;
+/** `--cherry-mark`: a commit whose change the other side has as well */
+const PATCHSAME = 1 << 9;
+/** Shown already, or hidden by `--cherry-pick`/`--left-only`/`--right-only` (git's SHOWN) */
+const SHOWN = 1 << 10;
 
 /** How many extra uninteresting commits limit_list looks at (git's SLOP). */
 const SLOP = 5;
@@ -2966,7 +3220,7 @@ class RevTable {
   /** commits held */
   size = 0;
   /** revision.c flags (UNINTERESTING, SEEN, ...) */
-  flags = new Uint8Array(INITIAL_REVS);
+  flags = new Uint16Array(INITIAL_REVS);
   /** committer dates (seconds) */
   private dates = new Float64Array(INITIAL_REVS);
   /** position in the commit-graph, -1 for a commit it does not have */
@@ -3116,7 +3370,7 @@ class RevTable {
 
   private grow(): void {
     const size = this.flags.length * 2;
-    const flags = new Uint8Array(size);
+    const flags = new Uint16Array(size);
     flags.set(this.flags);
     this.flags = flags;
     const dates = new Float64Array(size);

@@ -231,6 +231,10 @@ export interface LogOutputEntry {
   reflog?: LogReflogEntry;
   /** A boundary commit (`--boundary`), marked `-` */
   boundary?: boolean;
+  /** On the left side of a symmetric difference (`<` under `--left-right` and in `%m`) */
+  left?: boolean;
+  /** `--cherry-mark`: the other side has its change (`=`) */
+  patchSame?: boolean;
   /** The name the commit was reached from (`--source`, `%S`) */
   source?: string;
 }
@@ -823,6 +827,10 @@ export class LogPrinter {
       interesting: (id: ObjectId) => boolean;
       firstParentOnly: boolean;
       paths: string[];
+      /** `--left-right`: commits marked `<` or `>` */
+      leftRight?: boolean;
+      /** `--cherry-mark`: commits marked `=` or `+` */
+      cherryMark?: boolean;
       /** The colors (`--color`, `color.ui`...), undefined for none */
       colors?: { diff: DiffColors; decorations: DecorationPalette; graph: readonly string[] };
     },
@@ -986,6 +994,19 @@ export class LogPrinter {
     });
   }
 
+  /**
+   * revision.c's get_revision_mark: `-` boundary, `=` patch-same, `<`/`>` by side (always
+   * without the walk's options, `%m`'s), else `*` in a graph, `+` under `--cherry-mark`, none.
+   */
+  private revisionMark(entry: LogOutputEntry, withOptions: boolean): string {
+    if (entry.boundary) return "-";
+    if (entry.patchSame) return "=";
+    if (!withOptions || this.walk.leftRight) return entry.left ? "<" : ">";
+    if (this.graph) return "*";
+    if (this.walk.cherryMark) return "+";
+    return "";
+  }
+
   private padding(): string {
     return this.graph ? this.graph.showPadding() : "";
   }
@@ -1032,7 +1053,7 @@ export class LogPrinter {
    * not shown (`--follow` and nothing of the path changed).
    */
   async showCommit(entry: LogOutputEntry, lookahead: ObjectId[]): Promise<boolean> {
-    this.graph?.update(entry.id, lookahead);
+    this.graph?.update(entry.id, lookahead, this.revisionMark(entry, true));
     if (this.follow) {
       const stored = this.followPaths.get(entry.id);
       if (stored !== undefined) this.followPath = stored;
@@ -1246,7 +1267,10 @@ export class LogPrinter {
       this.out.text(colors?.diff.commit ?? "");
       if (fmt !== "oneline") this.out.text("commit ");
       // put_revision_mark
-      if (!this.graph && entry.boundary) this.out.text("- ");
+      if (!this.graph) {
+        const mark = this.revisionMark(entry, true);
+        if (mark) this.out.text(`${mark} `);
+      }
       this.out.text(await this.abbrevId(entry.id, this.abbrevCommit));
       if (log.parent)
         this.out.text(` (from ${await this.abbrevId(log.parent, this.abbrevCommit)})`);
@@ -1358,8 +1382,8 @@ export class LogPrinter {
         ...(this.walk.colors
           ? { color: true, decorationColors: this.walk.colors.decorations }
           : {}),
-        // get_revision_mark(NULL, commit): `-` for a boundary, else `>`
-        mark: entry.boundary ? "-" : ">",
+        // get_revision_mark(NULL, commit)
+        mark: this.revisionMark(entry, false),
         ...(entry.source !== undefined ? { source: entry.source } : {}),
         // %N stays as written unless notes are shown
         ...(this.showNotes ? { notes } : {}),
