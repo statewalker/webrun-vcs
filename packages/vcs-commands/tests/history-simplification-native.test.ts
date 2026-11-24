@@ -118,6 +118,9 @@ async function ours(repo: string, args: string[]): Promise<Outcome> {
     else if (a === "--") paths = true;
     else if (flags[a]) flags[a]();
     else if (a.startsWith("--ancestry-path=")) command.addAncestryPath(a.slice(16));
+    else if (a.startsWith("--since=")) command.setSince(Number(a.slice(8)));
+    else if (a.startsWith("-n")) command.setMaxCount(Number(a.slice(2)));
+    else if (a === "--left-right") command.setLeftRight(true);
     else if (a.startsWith("--format=")) log.pretty = `tformat:${a.slice(9)}`;
     else if (a.startsWith("--pretty=")) log.pretty = a.slice(9);
     else command.addRevision(a);
@@ -458,6 +461,17 @@ describeGit("history simplification against native git", () => {
       ]);
     });
 
+    it('t6019-rev-list-ancestry-path.sh: "log $args" with --ancestry-path=<annotated tag>', async () => {
+      git(repo, ["tag", "-a", "-m", "annotated", "aG", "G"]);
+      await expectSame(repo, [
+        ["rev-list", "--ancestry-path=aG", "D..M"],
+        ["rev-list", "--ancestry-path=aG", "D..M", "aG"],
+        ["rev-list", "--parents", "--ancestry-path=aG", "--all", "^D", "--", "G.t"],
+        ["log", "--format=%s", "--ancestry-path=aG", "--all", "^D"],
+      ]);
+      git(repo, ["tag", "-d", "aG"]);
+    });
+
     it('t6019-rev-list-ancestry-path.sh: "criss-cross: rev-list --ancestry-path cb..bc", "criss-cross: rev-list --ancestry-path --all ^cb"', async () => {
       await expectSame(criss, [
         ["rev-list", "--ancestry-path", "xcb..xbc"],
@@ -548,5 +562,129 @@ describeGit("history simplification against native git", () => {
     it('t6016-rev-list-graph-simplify-history.sh: "--graph ^C3"', async () => {
       await expectSame(repo, [graph("--all", "^C3")]);
     });
+  });
+  /**
+   * Random merge histories (fast-import, merges taking either side, one date for several
+   * commits, clock skew) walked with parent rewriting: streaming walks with `--since` and
+   * `-n` (git rewrites while it streams), symmetric ranges, `--ancestry-path=<annotated
+   * tag>` and the simplification modes. Inputs follow t6012-rev-list-simplify,
+   * t6019-rev-list-ancestry-path and t6016-rev-list-graph-simplify-history, on histories of
+   * their kind generated at random.
+   */
+  describe("random histories", () => {
+    const random = (seed: number) => {
+      let a = seed >>> 0;
+      const next = () => {
+        a = (a + 0x6d2b79f5) >>> 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+      return {
+        next,
+        int: (n: number) => Math.floor(next() * n),
+        chance: (p: number) => next() < p,
+      };
+    };
+    const FILES = ["a", "b", "d/x"];
+    /** A history of `count` commits on `main`, commit k tagged `t<k>` */
+    const build = (seed: number, count: number): { repo: string; dates: number[] } => {
+      const r = random(seed);
+      const out: string[] = [];
+      const trees: Map<string, string>[] = [new Map()];
+      const dates: number[] = [0];
+      let time = 1500000000;
+      const data = (text: string) => out.push(`data ${Buffer.byteLength(text)}\n${text}\n`);
+      for (let mark = 1; mark <= count; mark++) {
+        const parents: number[] = [];
+        if (mark > 1) {
+          parents.push(r.chance(0.7) ? mark - 1 : 1 + r.int(mark - 1));
+          if (mark > 3 && r.chance(0.3)) {
+            const second = 1 + r.int(mark - 1);
+            if (second !== parents[0]) parents.push(second);
+          }
+        }
+        let tree = new Map(trees[parents[0] ?? 0]);
+        if (parents.length > 1) {
+          const other = trees[parents[1] as number] as Map<string, string>;
+          const how = r.int(3);
+          if (how === 1) tree = new Map(other);
+          else if (how === 2)
+            for (const f of FILES) if (r.chance(0.5)) tree.set(f, other.get(f) ?? "");
+        }
+        const changes = parents.length > 1 ? r.int(2) : r.int(3);
+        for (let i = 0; i < changes; i++) {
+          const f = FILES[r.int(FILES.length)] as string;
+          tree.set(f, `${f} ${mark} ${i}\n`);
+        }
+        trees.push(tree);
+        const roll = r.next();
+        if (roll < 0.2) {
+          // same date
+        } else if (roll < 0.3) time -= 50 + r.int(500);
+        else time += 10 + r.int(100);
+        dates.push(time);
+        out.push(`commit refs/heads/main\nmark :${mark}\n`);
+        out.push(`author A U Thor <a@example.com> ${time} +0000\n`);
+        out.push(`committer C O Mitter <c@example.com> ${time} +0000\n`);
+        data(`commit ${mark}\n`);
+        if (parents.length > 0) out.push(`from :${parents[0]}\n`);
+        if (parents.length > 1) out.push(`merge :${parents[1]}\n`);
+        out.push("deleteall\n");
+        for (const [path, content] of [...tree].sort()) {
+          out.push(`M 100644 inline ${path}\n`);
+          data(content);
+        }
+        out.push(`\nreset refs/tags/t${mark}\nfrom :${mark}\n\n`);
+      }
+      const repo = init(`random-${seed}`);
+      execFileSync("git", ["fast-import", "--quiet"], {
+        cwd: repo,
+        env: env(),
+        input: out.join(""),
+      });
+      return { repo, dates };
+    };
+
+    for (const seed of [1, 2, 3, 4, 5, 6]) {
+      it(`t6012-rev-list-simplify.sh: "log $param" and t6019-rev-list-ancestry-path.sh: "log $args" over random history ${seed}`, async () => {
+        const count = 40;
+        const { repo, dates } = build(seed, count);
+        const since = String([...dates].sort((x, y) => x - y)[Math.floor(count / 2)]);
+        const mid = `t${Math.floor(count / 3)}`;
+        const late = `t${Math.floor((2 * count) / 3)}`;
+        git(repo, ["tag", "-a", "-m", "ann", "at1", mid]);
+        const cases: string[][] = [];
+        for (const path of [
+          ["--", "a"],
+          ["--", "d/x"],
+        ]) {
+          cases.push(
+            ["rev-list", "--parents", `--since=${since}`, "--all", ...path],
+            ["rev-list", "--parents", "--show-pulls", `--since=${since}`, "--all", ...path],
+            ["log", "--parents", `--since=${since}`, "--format=%H %P", "main", ...path],
+            ["rev-list", "-n1", "--parents", "main", ...path],
+            ["rev-list", "-n3", "--parents", "main", ...path],
+            ["rev-list", "--parents", "--left-right", `${mid}...main`, ...path],
+            ["rev-list", "--parents", "--left-right", `${late}...${mid}`, ...path],
+            ["log", "--graph", "--format=%p", `${mid}...main`, ...path],
+            ["rev-list", "--parents", "--ancestry-path", `${mid}..main`, ...path],
+            ["rev-list", "--parents", "--ancestry-path=at1", "--all", ...path],
+            ["rev-list", "--parents", "--simplify-merges", "--all", ...path],
+            ["rev-list", "--parents", "--full-history", "--all", ...path],
+            ["rev-list", "--parents", "--sparse", "main", ...path],
+            ["rev-list", "--parents", "--simplify-by-decoration", `${mid}..main`, ...path],
+            ["log", "--graph", "--format=%p", "--simplify-merges", "main", ...path],
+          );
+        }
+        cases.push(
+          ["rev-list", "--ancestry-path=at1", "main", "at1"],
+          ["rev-list", "--ancestry-path=at1", `${late}`],
+          ["rev-list", "--parents", "--ancestry-path", `${mid}..${late}`],
+        );
+        await expectSame(repo, cases);
+      });
+    }
   });
 });

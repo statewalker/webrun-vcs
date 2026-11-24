@@ -636,7 +636,9 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
       log.setUseReplaceRefs(this.useReplaceRefsOverride);
     log.setLogConfig(this.logConfig);
     for (const configure of this.configure) configure(log);
-    // --ancestry-path=<commit>: setup_revisions reads it before the revisions
+    // --ancestry-path=<commit>: setup_revisions reads it before the revisions; an annotated
+    // tag's mark reaches its commit only through a revision naming the tag
+    const ancestryTags = new Set<ObjectId>();
     for (const name of this.ancestryPaths) {
       const resolver = this.revisionResolver();
       const id = await resolver.resolve(name, { hint: "committish" }).catch(() => undefined);
@@ -645,6 +647,7 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
         throw new GitApiError(`could not get commit for --ancestry-path argument ${name}`);
       }
       log.addAncestryPath(id);
+      if (commit !== id) ancestryTags.add(id);
     }
     // `--not` alone names no revision: git log falls back to HEAD (revs->def) as with none,
     // as it does after `--exclude=` alone or a `--stdin` that read nothing
@@ -680,6 +683,7 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
         const peeled = await resolver.peelTags(entry.id);
         if (peeled.type !== "commit") continue;
         pending.push({ id: peeled.id, exclude: entry.exclude });
+        if (ancestryTags.has(entry.id)) log.addAncestryPath(peeled.id);
         const side = entry.left ? { left: true } : {};
         if (entry.exclude) log.not(peeled.id, entry.name ?? entry.id, side);
         else {
