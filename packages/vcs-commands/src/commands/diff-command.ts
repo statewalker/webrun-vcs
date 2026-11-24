@@ -12,7 +12,7 @@ import {
   parseGitBool,
   type XdiffAlgorithm,
 } from "@statewalker/vcs-utils";
-import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { compareGitPaths, decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   type AttributesIndex,
   collectChunks,
@@ -36,14 +36,27 @@ import {
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import {
+  type BreakScores,
+  countChanges,
   DEFAULT_RENAME_LIMIT,
   detectRenames,
   findFollowSource,
+  parseBreakRewrites,
+  renameScoreOption,
   scorePercent,
+  shouldBreak,
+  spanCounts,
 } from "../rename/index.js";
 import { writeCombinedDiff } from "../results/combined-diff.js";
 import { conflictMarkerSizeOf, writePairCheck } from "../results/diff-check.js";
 import { MovedLineBuffer } from "../results/diff-color.js";
+import {
+  DEFAULT_DIRSTAT,
+  type DirstatFile,
+  type DirstatParams,
+  formatDirstat,
+  parseDirstatParams,
+} from "../results/diff-dirstat.js";
 import { ChangeType, type DiffEntry } from "../results/diff-entry.js";
 import { diffEntryToPair } from "../results/diff-formatter.js";
 import { orderByPatterns, parseOrderFile } from "../results/diff-order.js";
@@ -110,7 +123,7 @@ const WITHOUT_INDEX_ATTRIBUTES: { direction: "checkin"; index: AttributesIndex }
  * The outputs whose diff git prefetches (diffcore_std's `output_formats_to_prefetch`: the
  * diffstat kinds, the patch, `--dirstat`)
  */
-const PREFETCH_FORMATS = new Set<string>(["patch", "stat", "numstat", "shortstat"]);
+const PREFETCH_FORMATS = new Set<string>(["patch", "stat", "numstat", "shortstat", "dirstat"]);
 
 /**
  * The repository blobs of a diff's pairs (git's `diff_add_if_missing`: each side whose id is
@@ -146,6 +159,11 @@ export type DiffOutputFormat =
   | "name-only"
   | "name-status"
   /**
+   * `--dirstat`: the share of the change each directory holds (see
+   * {@link DiffTextOptions.dirstat}, `diff.dirstat`)
+   */
+  | "dirstat"
+  /**
    * `--check`: the whitespace errors and leftover conflict markers the change adds (see
    * {@link writePairCheck}); it turns the other formats off, and {@link DiffCommand.exitCode}
    * gets 2 when it found any
@@ -164,6 +182,7 @@ export interface DiffTextOptions
       | "wsHighlight"
       | "whitespaceRule"
       | "defaultWordRegex"
+      | "anchors"
     >,
     DiffColorOptions {
   /**
@@ -314,6 +333,39 @@ export interface DiffTextOptions
   pickaxeAll?: boolean;
   /** `-i` / `--regexp-ignore-case` of `-S`/`-G` (ASCII case folded) */
   pickaxeIgnoreCase?: boolean;
+  /**
+   * `-M[<n>]` / `--find-renames[=<n>]`: detect renames, at least this similar (git's
+   * syntax: `90%`, `9` and `.9` alike; `true` the default 50%); `false` is `--no-renames`.
+   * Wins over {@link DiffCommand.setRenames} and `diff.renames`. Trailing text throws git's
+   * `error: invalid argument to find-renames` (exit 129).
+   */
+  findRenames?: boolean | string;
+  /**
+   * `-C[<n>]` / `--find-copies[=<n>]`: renames and copies, from the modified paths too (the
+   * threshold as {@link findRenames}). With `diff.renames=copies` and nothing else asking,
+   * git's second `-C` is found: copies are then found harder.
+   */
+  findCopies?: boolean | string;
+  /** `--find-copies-harder` (or `-C -C`): unchanged paths are copy sources too */
+  findCopiesHarder?: boolean;
+  /**
+   * `-B[<n>][/<m>]` / `--break-rewrites`: modifications that changed at least `<n>` (default
+   * 50%) are broken into a deletion and a creation for rename detection, and merged back
+   * unless they removed at least `<m>` (default 60%) of the old content, shown then as a
+   * complete rewrite (`dissimilarity index`, `M<score>`)
+   */
+  breakRewrites?: boolean | string;
+  /**
+   * `--dirstat=<params>` for the `dirstat` format: comma-separated `changes`, `lines`,
+   * `files`, `cumulative`, `noncumulative` and a cut-off percentage (default `diff.dirstat`,
+   * else `changes,noncumulative,3`)
+   */
+  dirstat?: string;
+  /**
+   * `--anchored=<text>`: the patience diff, lines starting with one of these texts kept
+   * unchanged where they are unique on both sides
+   */
+  anchored?: readonly string[];
 }
 
 /** Whether options ask for a pickaxe (git's `DIFF_PICKAXE_KINDS_MASK`) */
@@ -415,8 +467,11 @@ function statusOf(entry: DiffEntry): string {
 /** diffcore_apply_filter over the queue */
 function applyDiffFilter(entries: DiffEntry[], filter: Set<string> | undefined): DiffEntry[] {
   if (!filter) return entries;
-  // match_filter: a modification with a score is a broken pair (-B), which we never make
-  const matches = (e: DiffEntry) => filter.has(statusOf(e));
+  // match_filter: a modification with a score is a broken pair (-B), filtered as `B`
+  const matches = (e: DiffEntry) => {
+    const status = statusOf(e);
+    return status === "M" && e.score ? filter.has("B") : filter.has(status);
+  };
   if (filter.has("*")) return entries.some(matches) ? entries : [];
   return entries.filter(matches);
 }
@@ -500,6 +555,17 @@ interface Side {
    * side holds (`show_modified`), and no exact rename pairs with it.
    */
   unknownId?: boolean;
+}
+
+/** diffcore's settings of one run (see `DiffCommand.diffcoreSettings`) */
+interface DiffcoreSettings {
+  detect: false | "renames" | "copies";
+  /** The rename/copy threshold (git's `rename_score`), default 50% */
+  score?: number;
+  /** `--find-copies-harder` */
+  harder: boolean;
+  /** `-B` */
+  breaks?: BreakScores;
 }
 
 /** An index entry, of any stage */
@@ -884,6 +950,86 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const { format, warnings } = readDiffSubmoduleConfig(this.workingCopy);
     this.configuredSubmoduleFormat = format;
     this.configWarnings.splice(0, this.configWarnings.length, ...warnings);
+    // git_diff_ui_config: a diff.dirstat with errors is warned about, the rest applied
+    const dirstat = this.config.value("diff.dirstat");
+    this.configuredDirstat = { ...DEFAULT_DIRSTAT };
+    if (dirstat !== undefined) {
+      const errors = parseDirstatParams(dirstat, this.configuredDirstat);
+      if (errors.length > 0) {
+        this.configWarnings.push(
+          `warning: Found errors in 'diff.dirstat' config variable:\n${errors.join("\n")}\n`,
+        );
+      }
+    }
+  }
+
+  /** `diff.dirstat`'s parameters (git's defaults without it) */
+  private configuredDirstat?: DirstatParams;
+
+  /** The dirstat's parameters: `diff.dirstat`, then {@link DiffTextOptions.dirstat} */
+  private dirstatParams(): DirstatParams {
+    const params = { ...(this.configuredDirstat ?? DEFAULT_DIRSTAT) };
+    const text = this.textOptions.dirstat;
+    if (text !== undefined) {
+      const errors = parseDirstatParams(text, params);
+      if (errors.length > 0) {
+        throw new GitApiError(
+          `fatal: Failed to parse --dirstat/-X option parameter:\n${errors.join("\n")}\n`,
+        ).withExitCode(128);
+      }
+    }
+    return params;
+  }
+
+  /** show_dirstat (or show_dirstat_by_line): the dirstat of the pairs */
+  private async writeDirstat(
+    sink: ByteSink,
+    pairs: DiffFilePair[],
+    unmerged: Set<DiffFilePair>,
+    options: DiffOutputOptions,
+    params: DirstatParams,
+  ): Promise<void> {
+    const files: DirstatFile[] = [];
+    if (params.byLine) {
+      for (const pair of pairs) {
+        if (unmerged.has(pair)) {
+          files.push({ name: pair.new?.path ?? pair.old?.path ?? "", changed: 0 });
+          continue;
+        }
+        for (const f of await computeDiffstat([pair], options)) {
+          const damage = f.added + f.deleted;
+          // binary files count bytes: 64 of them a line
+          files.push({ name: f.name, changed: f.isBinary ? Math.ceil(damage / 64) : damage });
+        }
+      }
+    } else {
+      const countLastSpan = this.textOptions.renameCountLastSpan;
+      for (const pair of pairs) {
+        if (unmerged.has(pair)) continue;
+        const { old: one, new: two } = pair;
+        const name = two?.path ?? one?.path ?? "";
+        let damage: number;
+        if (one && two && one.idValid !== false && two.idValid !== false && one.id === two.id) {
+          damage = 0;
+        } else if (params.byFile) damage = 1;
+        else {
+          if (one && two) {
+            const a = await one.read();
+            const b = await two.read();
+            const { copied, added } = countChanges(
+              spanCounts(a, { countLastSpan }),
+              spanCounts(b, { countLastSpan }),
+            );
+            damage = a.length - copied + added;
+          } else if (one) damage = (await one.read()).length;
+          else if (two) damage = (await two.read()).length;
+          else continue;
+          if (!damage) damage = 1;
+        }
+        files.push({ name, changed: damage });
+      }
+    }
+    sink.text(formatDirstat(files, params));
   }
 
   /**
@@ -1050,7 +1196,12 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     const fromContents = this.fromContents;
     const early = this.textOptions.diffFilter === undefined && !fromContents;
     const detect = !early && (this.textOptions.quietDetectsRenames ?? false);
-    const collected = await this.collect(detect ? renames : false, false, this.pickaxeReads);
+    const collected = await this.collect(
+      detect ? renames : false,
+      false,
+      this.pickaxeReads,
+      !early,
+    );
     // diff_can_quit_early: the walk stopped at the first change, which a pickaxe (git 2.43,
     // whose quiet diff does not look at contents) may then drop
     const queue = early && this.pickaxe ? collected.entries.slice(0, 1) : collected.entries;
@@ -1141,7 +1292,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       if (follow !== undefined) {
         const spec = this.pathspecItems;
         this.pathspecItems = [parsePathspecItem(`:(literal)${follow}`)];
-        collected = await this.collect(false, false);
+        collected = await this.collect(false, false, false, false);
         const only = collected.entries[0];
         if (collected.entries.length === 1 && only?.changeType === ChangeType.ADD) {
           this.pathspecItems = spec;
@@ -1292,6 +1443,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       "numstat",
       "stat",
       "shortstat",
+      "dirstat",
       "summary",
       "patch",
     ];
@@ -1348,6 +1500,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           sink.text(text);
           separator = true;
         }
+        continue;
+      }
+      if (format === "dirstat") {
+        const params = this.dirstatParams();
+        await this.writeDirstat(sink, pairs, unmerged, options, params);
+        // only the dirstat by lines comes with the diffstat's separator
+        if (params.byLine) separator = true;
         continue;
       }
       separator = true;
@@ -1859,6 +2018,12 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       wsErrorHighlight: _wsErrorHighlight,
       colorCompatibility: _colorCompatibility,
       driverCompatibility: _driverCompatibility,
+      findRenames: _findRenames,
+      findCopies: _findCopies,
+      findCopiesHarder: _findCopiesHarder,
+      breakRewrites: _breakRewrites,
+      dirstat: _dirstat,
+      anchored,
       ...text
     } = this.textOptions;
     const colorSettings = this.colorSettings;
@@ -1878,7 +2043,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         : {}),
       ...text,
       ...(abbrev !== undefined ? { abbrev } : {}),
-      algorithm: text.algorithm ?? algorithmValue(get("diff.algorithm")) ?? "myers",
+      algorithm:
+        anchored && anchored.length > 0
+          ? "patience"
+          : (text.algorithm ?? algorithmValue(get("diff.algorithm")) ?? "myers"),
+      ...(anchored && anchored.length > 0
+        ? { anchors: anchored.map((a) => encodeGitPath(a)) }
+        : {}),
       indentHeuristic: text.indentHeuristic ?? boolValue(get("diff.indentHeuristic")) ?? true,
       ...(driver ? { driver } : {}),
       ...(ignoreRegex.length > 0 ? { ignoreRegex } : {}),
@@ -2073,8 +2244,12 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     renames: boolean | "copies",
     patch = false,
     prefetch = false,
+    diffcore = true,
   ): Promise<{ entries: DiffEntry[]; combined: CombinedEntry[] }> {
     // option parsing fails before anything is read
+    const core = diffcore
+      ? this.diffcoreSettings(renames)
+      : { detect: false as const, harder: false };
     if (this.textOptions.diffFilter !== undefined) parseDiffFilter(this.textOptions.diffFilter);
     this.ignoreRegex();
     await this.preparePickaxe();
@@ -2175,7 +2350,24 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     // diffcore_std: an output that reads the blobs fetches a partial clone's absent ones in
     // one batch first (diff_queued_diff_prefetch), before rename detection
     if (prefetch) await this.blobs.prefetch?.(prefetchIds(entries));
-    if (renames) await this.detectRenames(entries, renames === "copies");
+    if (core.breaks || core.detect) {
+      const oldFiles = async (): Promise<Map<string, Side>> => {
+        if (this.newTree || this.cached || this.oldTree || !worktree) {
+          return this.newTree
+            ? this.treeSide(this.oldTree ?? "HEAD", this.oldTree === undefined)
+            : oldSide;
+        }
+        // diff-files: the index's entries
+        const out = new Map<string, Side>();
+        for await (const entry of this.staging.entries()) {
+          if (entry.stage === 0 && !entry.intentToAdd) {
+            out.set(entry.path, { mode: entry.mode, id: entry.objectId });
+          }
+        }
+        return out;
+      };
+      await this.diffcore(entries, core, oldFiles);
+    }
     return { entries: this.withTreeEntries(entries, oldSide, newSide), combined };
   }
 
@@ -2481,51 +2673,264 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   }
 
   /**
-   * git's `diffcore_rename` over the added and deleted paths; `copies` (DIFF_DETECT_COPY,
-   * `diff.renames=copies`): the modified paths are sources too, which stay (copied only)
+   * diffcore's settings of a run: rename or copy detection (`renames` as configured or set,
+   * then `-M`/`-C`), its threshold, `--find-copies-harder`, `-B`; option errors are thrown here
    */
-  private async detectRenames(entries: DiffEntry[], copies = false): Promise<void> {
+  private diffcoreSettings(renames: boolean | "copies"): DiffcoreSettings {
+    const o = this.textOptions;
+    let detect: DiffcoreSettings["detect"] =
+      renames === "copies" ? "copies" : renames ? "renames" : false;
+    let score: number | undefined;
+    let harder = o.findCopiesHarder === true;
+    if (o.findRenames !== undefined) {
+      if (o.findRenames === false) detect = false;
+      else {
+        detect = "renames";
+        score = renameScoreOption(o.findRenames, "find-renames");
+      }
+    }
+    if (o.findCopies !== undefined && o.findCopies !== false) {
+      // diff_opt_find_copies: a second -C (copies already on, from diff.renames) finds harder
+      if (detect === "copies" && o.findRenames === undefined) harder = true;
+      detect = "copies";
+      score = renameScoreOption(o.findCopies, "find-copies") ?? score;
+    }
+    const breaks =
+      o.breakRewrites !== undefined && o.breakRewrites !== false
+        ? parseBreakRewrites(o.breakRewrites)
+        : undefined;
+    return {
+      detect,
+      harder: detect === "copies" && harder,
+      ...(score !== undefined ? { score } : {}),
+      ...(breaks ? { breaks } : {}),
+    };
+  }
+
+  /**
+   * diffcore_std's pair stages: `diffcore_break` (`-B`), `diffcore_rename` (renames, copies,
+   * `--find-copies-harder`), `diffcore_merge_broken`, then `diff_resolve_rename_copy`. The
+   * entries are changed in place, in git's queue order.
+   */
+  private async diffcore(
+    entries: DiffEntry[],
+    core: DiffcoreSettings,
+    oldFiles: () => Promise<Map<string, Side>>,
+  ): Promise<void> {
+    const readBlob = async (id: ObjectId) => collectChunks((await this.blobs.load(id)) ?? []);
+    const countLastSpan = this.textOptions.renameCountLastSpan;
+    /** git's diff_filepair extras: a broken half's score, a renamed creation's source */
+    const broken = new Map<DiffEntry, number>();
+    const source = new Map<DiffEntry, { path: string; breakScore?: number }>();
+    const uses = new Map<string, number>();
+
+    if (core.breaks) {
+      const { breakScore, mergeScore } = core.breaks;
+      const out: DiffEntry[] = [];
+      for (const e of entries) {
+        const blobMode = (m: number | undefined) =>
+          m !== undefined && m !== 0 && m !== GITLINK && (m & 0o170000) !== 0o040000;
+        if (
+          e.changeType !== ChangeType.MODIFY ||
+          e.unmerged ||
+          !blobMode(e.oldMode) ||
+          !blobMode(e.newMode) ||
+          e.oldId === undefined
+        ) {
+          out.push(e);
+          continue;
+        }
+        const oldContent = () => (e.readOld ? e.readOld() : readBlob(e.oldId as ObjectId));
+        const newContent = () => (e.readNew ? e.readNew() : readBlob(e.newId as ObjectId));
+        const sideOf = async (mode: number, read: () => Promise<Uint8Array>) => {
+          const content = await read();
+          return {
+            mode,
+            size: content.length,
+            spans: async () => spanCounts(content, { countLastSpan }),
+          };
+        };
+        const same = !e.readOld && !e.readNew && !e.newIdUnknown && e.oldId === e.newId;
+        const verdict = await shouldBreak(
+          await sideOf(e.oldMode as number, oldContent),
+          await sideOf(e.newMode as number, newContent),
+          breakScore,
+          same,
+        );
+        if (!verdict.broken) {
+          out.push(e);
+          continue;
+        }
+        const score = verdict.mergeScore < mergeScore ? 0 : verdict.mergeScore;
+        const del: DiffEntry = {
+          changeType: ChangeType.DELETE,
+          oldPath: e.oldPath,
+          oldId: e.oldId,
+          oldMode: e.oldMode,
+          ...(e.readOld ? { readOld: e.readOld } : {}),
+        };
+        const add: DiffEntry = {
+          changeType: ChangeType.ADD,
+          newPath: e.newPath,
+          newId: e.newId,
+          newMode: e.newMode,
+          ...(e.readNew ? { readNew: e.readNew } : {}),
+        };
+        broken.set(del, score);
+        broken.set(add, score);
+        out.push(del, add);
+      }
+      entries.splice(0, entries.length, ...out);
+    }
+
+    if (core.detect) await this.detectRenames(entries, core, oldFiles, broken, source, uses);
+
+    if (core.breaks) {
+      // diffcore_merge_broken: halves that both survived are one modification again
+      const onePath = (e: DiffEntry) =>
+        source.get(e)?.path ?? (e.changeType === ChangeType.ADD ? e.newPath : e.oldPath);
+      const twoPath = (e: DiffEntry) =>
+        e.changeType === ChangeType.DELETE ? e.oldPath : e.newPath;
+      const samePath = (e: DiffEntry) => broken.has(e) && onePath(e) === twoPath(e);
+      const out: DiffEntry[] = [];
+      const merged = new Set<DiffEntry>();
+      for (let i = 0; i < entries.length; i++) {
+        const p = entries[i] as DiffEntry;
+        if (merged.has(p)) continue;
+        if (samePath(p)) {
+          let peer: DiffEntry | undefined;
+          for (let j = i + 1; j < entries.length; j++) {
+            const pp = entries[j] as DiffEntry;
+            if (!merged.has(pp) && samePath(pp) && onePath(p) === twoPath(pp)) {
+              peer = pp;
+              break;
+            }
+          }
+          if (peer) {
+            merged.add(peer);
+            const d = p.changeType === ChangeType.DELETE ? p : peer;
+            const c = d === p ? peer : p;
+            const score = broken.get(p) ?? 0;
+            out.push({
+              changeType: ChangeType.MODIFY,
+              oldPath: d.oldPath,
+              newPath: c.newPath,
+              oldId: d.oldId,
+              newId: c.newId,
+              oldMode: d.oldMode,
+              newMode: c.newMode,
+              ...(d.readOld ? { readOld: d.readOld } : {}),
+              ...(c.readNew ? { readNew: c.readNew } : {}),
+              ...(score ? { score: scorePercent(score) } : {}),
+            });
+            const from = d.oldPath ?? "";
+            uses.set(from, (uses.get(from) ?? 0) + 1);
+            continue;
+          }
+        }
+        out.push(p);
+      }
+      entries.splice(0, entries.length, ...out);
+    }
+
+    // diff_resolve_rename_copy: in queue order, each renamed pair takes one use of its source
+    for (const e of entries) {
+      const from = source.get(e);
+      if (!from) continue;
+      if (from.path === e.newPath) {
+        // a rename joined a broken pair again: a modification (a rewrite with its score)
+        e.changeType = ChangeType.MODIFY;
+        if (from.breakScore) e.score = scorePercent(from.breakScore);
+        else delete e.score;
+        continue;
+      }
+      const left = (uses.get(from.path) ?? 0) - 1;
+      uses.set(from.path, left);
+      e.changeType = left > 0 ? ChangeType.COPY : ChangeType.RENAME;
+    }
+  }
+
+  /**
+   * git's `diffcore_rename` over the queue: deleted paths (broken deletions too) as sources,
+   * with copies the modified paths (and, harder, the unmodified ones) as sources that stay,
+   * created paths as destinations. A destination paired becomes a rename (resolved into a
+   * copy or a rename by {@link diffcore}); a deletion its rename takes is dropped.
+   */
+  private async detectRenames(
+    entries: DiffEntry[],
+    core: DiffcoreSettings,
+    oldFiles: () => Promise<Map<string, Side>>,
+    broken: Map<DiffEntry, number>,
+    source: Map<DiffEntry, { path: string; breakScore?: number }>,
+    uses: Map<string, number>,
+  ): Promise<void> {
+    const copies = core.detect === "copies";
     const sources = entries.filter(
       (e) =>
-        e.changeType === ChangeType.DELETE ||
+        (e.changeType === ChangeType.DELETE && !e.unmerged) ||
         (copies && e.changeType === ChangeType.MODIFY && !e.unmerged),
     );
     // a submodule of git's null id (diff-index of a moved one) matches no source exactly,
     // and gitlinks pair only exactly
     const destinations = entries.filter((e) => e.changeType === ChangeType.ADD && !e.newIdUnknown);
+    // --find-copies-harder: every unchanged path of the old side is a source too
+    const unmodified: DiffEntry[] = [];
+    if (copies && core.harder && destinations.length > 0) {
+      const listed = new Set(entries.map((e) => e.oldPath ?? e.newPath));
+      for (const [path, side] of await oldFiles()) {
+        if (listed.has(path) || !this.matches(path)) continue;
+        unmodified.push({
+          changeType: ChangeType.MODIFY,
+          oldPath: path,
+          newPath: path,
+          oldId: side.id,
+          newId: side.id,
+          oldMode: side.mode as FileModeValue,
+          newMode: side.mode as FileModeValue,
+        });
+      }
+      sources.push(...unmodified);
+    }
+    for (const e of sources) {
+      const kept = e.changeType === ChangeType.MODIFY || (broken.has(e) && !broken.get(e));
+      uses.set(e.oldPath ?? "", kept ? 1 : 0);
+    }
     if (sources.length === 0 || destinations.length === 0) return;
     const byPath = new Map<string, DiffEntry>();
     for (const e of sources) byPath.set(`s:${e.oldPath}`, e);
     for (const e of destinations) byPath.set(`d:${e.newPath}`, e);
-    const readBlob = async (id: ObjectId) => {
-      const chunks: Uint8Array[] = [];
-      let size = 0;
-      for await (const c of (await this.blobs.load(id)) ?? []) {
-        chunks.push(c);
-        size += c.length;
-      }
-      const out = new Uint8Array(size);
-      let at = 0;
-      for (const c of chunks) {
-        out.set(c, at);
-        at += c.length;
-      }
-      return out;
-    };
+    const unmodifiedSet = new Set(unmodified);
     const limit =
       this.renameLimit ?? intValue(this.config.value("diff.renameLimit")) ?? DEFAULT_RENAME_LIMIT;
+    let needed = 0;
+    let degraded = false;
     const pairs = await detectRenames(
-      sources.map((e) => ({
-        path: e.oldPath ?? "",
-        mode: e.oldMode ?? 0,
-        id: e.oldId ?? "",
-        ...(e.changeType === ChangeType.MODIFY ? { kept: true } : {}),
-      })),
+      sources.map((e) => {
+        const kept = e.changeType === ChangeType.MODIFY || (broken.has(e) && !broken.get(e));
+        return {
+          path: e.oldPath ?? "",
+          mode: e.oldMode ?? 0,
+          id: e.oldId ?? "",
+          ...(kept ? { kept: true } : {}),
+          ...(unmodifiedSet.has(e) ? { unmodified: true } : {}),
+        };
+      }),
       destinations.map((e) => ({ path: e.newPath ?? "", mode: e.newMode ?? 0, id: e.newId ?? "" })),
       {
         renameLimit: limit,
         countLastSpan: this.textOptions.renameCountLastSpan,
         copies,
+        breakMode: sources.some((e) => broken.has(e)),
+        ...(core.score !== undefined ? { minimumScore: core.score } : {}),
+        onRenameLimit: (n) => {
+          needed = n;
+        },
+        onDegraded: () => {
+          degraded = true;
+        },
+        onUses: (counted) => {
+          for (const [path, n] of counted) uses.set(path, n);
+        },
         // a partial clone's absent blobs, fetched in one batch (a worktree file is no blob)
         prefetch: async (wanted) => {
           const ids: ObjectId[] = [];
@@ -2548,27 +2953,51 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         load: async (c, role) => {
           const e = byPath.get(`${role === "source" ? "s" : "d"}:${c.path}`);
           if (role === "destination" && e?.readNew) return e.readNew();
-          return readBlob(c.id);
+          return collectChunks((await this.blobs.load(c.id)) ?? []);
         },
       },
     );
-    const drop = new Set<DiffEntry>();
+    // diff_warn_rename_limit
+    if (degraded) {
+      this.configWarnings.push(
+        "warning: only found copies from modified paths due to too many files.",
+      );
+    } else if (needed) {
+      this.configWarnings.push(
+        "warning: exhaustive rename detection was skipped due to too many files.",
+      );
+    }
+    if (needed) {
+      this.configWarnings.push(
+        `warning: you may want to set your diff.renameLimit variable to at least ${needed} and retry the command.`,
+      );
+    }
+    const renamedHalves = new Set<string>();
     for (const pair of pairs) {
       const src = byPath.get(`s:${pair.from}`);
       const dst = byPath.get(`d:${pair.to}`);
       if (!src || !dst) continue;
-      // a deleted source taken by a rename or copy is no deletion any more
-      if (src.changeType === ChangeType.DELETE) drop.add(src);
-      dst.changeType = pair.copy ? ChangeType.COPY : ChangeType.RENAME;
+      const breakScore = broken.get(src);
+      source.set(dst, {
+        path: pair.from,
+        ...(breakScore !== undefined ? { breakScore } : {}),
+      });
+      if (broken.has(dst)) renamedHalves.add(dst.newPath ?? "");
+      dst.changeType = ChangeType.RENAME;
       dst.oldPath = src.oldPath;
       dst.oldId = src.oldId;
       dst.oldMode = src.oldMode;
-      dst.score = scorePercent(pair.score);
+      if (src.readOld) dst.readOld = src.readOld;
+      dst.score = scorePercent(pair.from === pair.to ? (breakScore ?? 0) : pair.score);
     }
-    if (drop.size > 0) {
-      const kept = entries.filter((e) => !drop.has(e));
-      entries.splice(0, entries.length, ...kept);
-    }
+    // the deletions a rename or copy takes away: a broken one when its own creation was
+    // paired, any other once used
+    const kept = entries.filter((e) => {
+      if (e.changeType !== ChangeType.DELETE || e.unmerged) return true;
+      if (broken.has(e)) return !renamedHalves.has(e.oldPath ?? "");
+      return !(uses.get(e.oldPath ?? "") ?? 0);
+    });
+    entries.splice(0, entries.length, ...kept);
   }
 
   /**

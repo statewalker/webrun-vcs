@@ -443,6 +443,10 @@ function metainfo(
     text += `${set}${word} from ${quotePath(name, quote)}${reset}\n`;
     text += `${set}${word} to ${quotePath(other ?? name, quote)}${reset}\n`;
     mustShow = true;
+  } else if (pair.status === "M" && pair.score) {
+    // a broken pair merged back (`-B`): a complete rewrite
+    text += `${set}dissimilarity index ${pair.score}%${reset}\n`;
+    mustShow = true;
   }
   if (one.id !== two.id) {
     const abbrev = (id: string) =>
@@ -530,6 +534,23 @@ async function builtinDiff(
     }
     header += meta.text;
     if ((one.mode ^ two.mode) & S_IFMT) return;
+    // a complete rewrite (a broken pair, `-B`) of text: every line removed, then added
+    if (
+      pair.status === "M" &&
+      pair.score &&
+      (textconvOne || options.text || !(await one.isBinary(threshold))) &&
+      (textconvTwo || options.text || !(await two.isBinary(threshold)))
+    ) {
+      const a = textconvOne
+        ? await textconvOne(await one.textconvInput(), attrOne)
+        : await one.read();
+      const b = textconvTwo
+        ? await textconvTwo(await two.textconvInput(), attrTwo)
+        : await two.read();
+      sink.text(header);
+      writeRewriteDiff(sink, a, b, lbl0, lbl1, options.colors);
+      return;
+    }
   }
   if (report) {
     report.gitLine = `diff --git ${aOne} ${bTwo}`;
@@ -644,6 +665,55 @@ async function builtinDiff(
   });
 }
 
+/** diff.c's `count_lines`: lines, a last one without a newline counted */
+export function countLines(data: Uint8Array): number {
+  let count = 0;
+  let completeLine = 0;
+  for (const ch of data) {
+    if (ch === 0x0a) {
+      count++;
+      completeLine = 0;
+    } else completeLine++;
+  }
+  return completeLine ? count + 1 : count;
+}
+
+/** diff.c's `emit_rewrite_diff`: a complete rewrite as one hunk */
+function writeRewriteDiff(
+  sink: ByteSink,
+  a: Uint8Array,
+  b: Uint8Array,
+  lbl0: string,
+  lbl1: string,
+  colors: DiffOutputOptions["colors"],
+): void {
+  const lcA = countLines(a);
+  const lcB = countLines(b);
+  const count = (n: number) => (n === 0 ? "0,0" : n === 1 ? "1" : `1,${n}`);
+  const meta = colors?.meta ?? "";
+  const reset = colors?.reset ?? "";
+  sink.text(
+    `${meta}--- ${lbl0}${reset}${lbl0.includes(" ") ? "\t" : ""}\n` +
+      `${meta}+++ ${lbl1}${reset}${lbl1.includes(" ") ? "\t" : ""}\n`,
+  );
+  sink.text(`${colors?.frag ?? ""}@@ -${count(lcA)} +${count(lcB)} @@${reset}\n`);
+  const lines = (data: Uint8Array, prefix: string, color: string) => {
+    let at = 0;
+    while (at < data.length) {
+      let end = data.indexOf(0x0a, at);
+      const complete = end >= 0;
+      if (!complete) end = data.length;
+      sink.text(`${color}${prefix}`);
+      sink.push(data.subarray(at, end));
+      sink.text(`${color ? reset : ""}\n`);
+      if (!complete) sink.text("\\ No newline at end of file\n");
+      at = end + 1;
+    }
+  };
+  if (lcA) lines(a, "-", colors?.old ?? "");
+  if (lcB) lines(b, "+", colors?.new ?? "");
+}
+
 /** The hunks of a text diff with their lines' bytes, for the colored writer */
 function coloredHunksOf(result: UnifiedDiffResult): ColoredHunk[] {
   return result.hunks.map((hunk) => ({
@@ -724,6 +794,10 @@ export async function computeDiffstat(
         file.added = await two.size(threshold);
         file.deleted = await one.size(threshold);
       }
+    } else if (pair.status === "M" && pair.score) {
+      // a complete rewrite counts every line of both sides
+      file.deleted = countLines(await one.read());
+      file.added = countLines(await two.read());
     } else if (mayDiffer) {
       const counts = diffLineCounts(await one.read(), await two.read(), {
         ...options,
@@ -1049,7 +1123,7 @@ export function formatNameStatus(
   const quote = options.quotePath ?? true;
   let out = "";
   for (const p of pairs) {
-    const score = p.status === "R" || p.status === "C" ? (p.score ?? 0) : 0;
+    const score = p.score ?? 0;
     out += score ? `${p.status}${String(score).padStart(3, "0")}\t` : `${p.status}\t`;
     if (p.status === "R" || p.status === "C") {
       out += `${quotePath(p.old?.path ?? "", quote)}\t${quotePath(p.new?.path ?? "", quote)}\n`;
