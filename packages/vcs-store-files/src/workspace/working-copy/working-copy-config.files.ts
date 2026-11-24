@@ -1006,6 +1006,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     this.lines = parsed.lines;
     this.trailingNewline = parsed.trailingNewline;
     this.dirtyKeys.clear();
+    this.relocated.clear();
     this.removedSections.clear();
     this.includedEntries = new Map();
     this.resolvedCache = undefined;
@@ -1064,6 +1065,100 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
   }
 
   /**
+   * The lines a save leaves out, as git's `config --unset-all` (one run per key, its
+   * `maybe_remove_section`) leaves them out: each variable unset in this session (no
+   * values left, or {@link relocated}), and the whole section around it when every variable
+   * of its run of headers goes (consecutive headers of one section count as one, the blank
+   * lines before the first header going with it), unless a comment stands in the run, right
+   * before it, or after a header's `]`.
+   */
+  private removedLines(): boolean[] {
+    type Event =
+      | { kind: "section"; section: string }
+      | { kind: "entry"; section: string; gone: boolean }
+      | { kind: "comment" | "blank" };
+    const events: { event: Event; line: number }[] = [];
+    this.lines.forEach((line, index) => {
+      if (line.kind === "section") {
+        events.push({ event: { kind: "section", section: line.section }, line: index });
+        if (line.inlineKey !== undefined || headerHasComment(line.text)) {
+          // a variable on the header line is left alone; a comment there keeps the section
+          events.push({ event: { kind: "comment" }, line: index });
+        }
+      } else if (line.kind === "entry") {
+        const gone =
+          this.relocated.has(line.key) ||
+          (this.dirtyKeys.has(line.key) && (this.values.get(line.key)?.length ?? 0) === 0);
+        events.push({ event: { kind: "entry", section: line.section, gone }, line: index });
+      } else if (line.topLevel) {
+        events.push({ event: { kind: "entry", section: "", gone: false }, line: index });
+      } else {
+        const blank = line.text.trim() === "";
+        events.push({ event: { kind: blank ? "blank" : "comment" }, line: index });
+      }
+    });
+
+    const removed: boolean[] = new Array(this.lines.length).fill(false);
+    const done = new Set<number>();
+    for (let j = 0; j < events.length; j++) {
+      const at = events[j]?.event;
+      if (at?.kind !== "entry" || !at.gone || done.has(j)) continue;
+      const section = at.section;
+      done.add(j);
+      removed[events[j]?.line as number] = true;
+      // backward: the first variable of its run, no comment before it
+      let begin: number | undefined;
+      let sectionSeen = false;
+      let i = j;
+      for (; i > 0; i--) {
+        const e = events[i - 1]?.event as Event;
+        if (e.kind === "comment") break;
+        if (e.kind === "entry") {
+          if (sectionSeen) begin = i;
+          break;
+        }
+        if (e.kind === "section") {
+          if (e.section !== section) {
+            begin = i;
+            break;
+          }
+          sectionSeen = true;
+        }
+      }
+      if (i === 0) begin = 0;
+      if (begin === undefined) continue;
+      // forward: the run's other variables all go, no comment in it
+      const consumed: number[] = [];
+      let end = events.length;
+      let keep = false;
+      for (let k = j + 1; k < events.length; k++) {
+        const e = events[k]?.event as Event;
+        if (e.kind === "comment") {
+          keep = true;
+          break;
+        }
+        if (e.kind === "section") {
+          if (e.section === section) continue;
+          end = k;
+          break;
+        }
+        if (e.kind === "entry") {
+          if (e.gone && e.section === section && !done.has(k)) {
+            consumed.push(k);
+            continue;
+          }
+          keep = true;
+          break;
+        }
+      }
+      if (keep) continue;
+      for (const k of consumed) done.add(k);
+      for (let k = begin; k < end; k++) removed[events[k]?.line as number] = true;
+    }
+    return removed;
+  }
+
+  /**
    * Serialize config to Git format, preserving untouched lines verbatim.
    */
   private serializeGitConfig(): string {
@@ -1090,12 +1185,18 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
       else newKeysBySection.set(section, [key]);
     }
 
+    // Which lines go (git's unset with `maybe_remove_section`, see removedLines)
+    const removed = this.removedLines();
+
     // Where to append new keys of an existing section: after its last
-    // non-blank line, so they land inside the section and not after a blank
-    // separator that visually belongs to the next one.
+    // non-blank line left, so they land inside the section and not after a blank
+    // separator that visually belongs to the next one. A section whose every line
+    // goes gets its new keys in a section of its own at the end of the file, as git
+    // writes a key set after the unset emptied its section.
     const insertionPoint = new Map<string, number>();
     let walked = "";
     this.lines.forEach((line, index) => {
+      if (removed[index]) return;
       if (line.kind === "section") walked = line.section;
       const blank = line.kind === "text" && line.text.trim() === "";
       if (walked && !blank) insertionPoint.set(walked, index);
@@ -1112,66 +1213,24 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
       for (const value of this.values.get(key) ?? []) out.push(formatEntry(name, value));
     };
 
-    // git's maybe_remove_section: a section block whose every variable this write unsets
-    // loses its header too, unless a comment stands in it or right before it
-    let block: { start: number; removed: boolean; kept: boolean; comment: boolean } | undefined;
-    let commentBefore = false;
-    // blank lines right before a header go with it (git removes from the previous entry on)
-    let blankRun = 0;
-    const finishBlock = (): void => {
-      if (block?.removed && !block.kept && !block.comment) out.splice(block.start);
-      block = undefined;
-    };
-
     this.lines.forEach((line, index) => {
       const section = sectionOfLine(line);
       const dropped = section !== undefined && this.removedSections.has(section);
 
-      if (!dropped) {
+      if (!dropped && !removed[index]) {
         if (line.kind === "entry") {
-          if (this.relocated.has(line.key)) {
-            if (block) block.removed = true;
-          } else if (this.dirtyKeys.has(line.key)) {
-            const before = out.length;
-            emitValues(line.key);
-            if (block) {
-              if (out.length === before) block.removed = true;
-              else block.kept = true;
-            }
-          } else {
-            out.push(line.text);
-            if (block) block.kept = true;
-          }
-          commentBefore = false;
-          blankRun = 0;
-        } else if (line.kind === "section") {
-          finishBlock();
-          block = {
-            start: out.length - blankRun,
-            removed: false,
-            kept: false,
-            comment: commentBefore,
-          };
-          commentBefore = false;
-          blankRun = 0;
-          if (line.inlineKey !== undefined && this.dirtyKeys.has(line.inlineKey)) {
-            // Rewrite the header without its inline variable, then re-emit it.
-            out.push(formatSectionHeader(line.section));
-            const before = out.length;
-            emitValues(line.inlineKey);
-            if (out.length === before) block.removed = true;
-            else block.kept = true;
-          } else {
-            out.push(line.text);
-            if (line.inlineKey !== undefined) block.kept = true;
-          }
+          if (this.dirtyKeys.has(line.key)) emitValues(line.key);
+          else out.push(line.text);
+        } else if (
+          line.kind === "section" &&
+          line.inlineKey !== undefined &&
+          this.dirtyKeys.has(line.inlineKey)
+        ) {
+          // Rewrite the header without its inline variable, then re-emit it.
+          out.push(formatSectionHeader(line.section));
+          emitValues(line.inlineKey);
         } else {
           out.push(line.text);
-          if (line.text.trim() !== "") {
-            commentBefore = true;
-            blankRun = 0;
-            if (block) block.comment = true;
-          } else blankRun++;
         }
       }
 
@@ -1179,13 +1238,13 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
         if (at !== index || this.removedSections.has(section2)) continue;
         const keys = newKeysBySection.get(section2);
         if (!keys) continue;
-        const before = out.length;
         for (const key of keys) emitValues(key);
-        if (block && out.length > before) block.kept = true;
         filledSections.add(section2);
       }
     });
-    finishBlock();
+    // git keeps the newline of the line before the lines it removed at the end
+    const lastIndex = this.lines.length - 1;
+    const endRemoved = lastIndex >= 0 && removed[lastIndex] === true;
 
     // Sections that do not exist in the file yet.
     for (const [section, keys] of newKeysBySection) {
@@ -1195,7 +1254,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     }
 
     if (out.length === 0) return "";
-    return out.join("\n") + (this.trailingNewline ? "\n" : "");
+    const ends = this.trailingNewline || (endRemoved && out.length > 0);
+    return out.join("\n") + (ends ? "\n" : "");
   }
 }
 
@@ -2048,6 +2108,26 @@ function headerNames(text: string, name: string): number {
     return i;
   }
   return 0;
+}
+
+/**
+ * Whether a section header line has a comment after its `]` (git's parser reports it as
+ * a comment, which keeps the section when its last variable is unset).
+ */
+function headerHasComment(text: string): boolean {
+  let i = text.indexOf("[");
+  if (i < 0) return false;
+  let quoted = false;
+  for (i++; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === "\\") i++;
+      else if (c === '"') quoted = false;
+    } else if (c === '"') quoted = true;
+    else if (c === "]") break;
+  }
+  const rest = text.slice(i + 1).trimStart();
+  return rest.startsWith("#") || rest.startsWith(";");
 }
 
 function keyOfLine(line: ConfigLine): string | undefined {

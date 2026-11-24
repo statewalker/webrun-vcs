@@ -15,7 +15,10 @@ New `git.branchShowCurrent()` (`--show-current`) and `git.branchEditDescription(
 tracking code and returns the message in `CheckoutResult.output`, inherit and own-upstream
 warnings in `warnings`; ambiguous remotes get git's `advice.ambiguousFetchRefspec` hint.
 
-`GitWorkingCopyConfig.save()` writes unsets as `git config` does: a section block left without
-variables loses its header (and the blank lines before it) unless a comment is in or right before
-it, and a key unset then given values again is written at its section's end
-(statewalker/statewalker-root#295).
+`GitWorkingCopyConfig.save()` writes unsets as `git config --unset-all` does (its
+`maybe_remove_section`): a run of headers of one section whose every variable goes is removed
+with the blank lines before it, unless a comment stands in the run, right before it or after a
+header's `]`; consecutive headers of one section count as one run; a file whose last lines go
+still ends with a newline. A key unset and then given values again is written after the
+removals: at the end of what is left of its section, or in a new section at the end of the file
+when its section went (statewalker/statewalker-root#295).
