@@ -152,6 +152,104 @@ export const BUILTIN_FUNCNAME_PATTERNS_2_43: Readonly<Record<string, FuncnamePat
 })();
 
 /**
+ * The word regexes of the builtin diff drivers (git 2.56), as userdiff.c's `PATTERNS` give
+ * them before appending `|[^[:space:]]|[\xc0-\xff][\x80-\xbf]+` (see
+ * {@link userdiffWordRegex}): what `--word-diff` and `--color-words` take for a word in a
+ * file of that driver.
+ */
+export const BUILTIN_WORD_REGEXES: Readonly<Record<string, string>> = {
+  ada: "[a-zA-Z][a-zA-Z0-9_]*|[-+]?[0-9][0-9#_.aAbBcCdDeEfF]*([eE][+-]?[0-9_]+)?|=>|\\.\\.|\\*\\*|:=|/=|>=|<=|<<|>>|<>",
+  bash: "[a-zA-Z_][a-zA-Z0-9_]*|\\$[a-zA-Z0-9_]+|\\$\\{|\\|\\||&&|<<|>>|==|!=|<=|>=|[-+*/%&|^]=|:=|:-|:\\+|:\\?|##|%%|\\^\\^|,,|[-a-zA-Z0-9_]+|\\(|\\)|\\{|\\}|\\[|\\]",
+  bibtex: '[={}"]|[^={}" \t]+',
+  cpp: "[a-zA-Z_][a-zA-Z0-9_]*|[0-9][0-9.]*([Ee][-+]?[0-9]+)?[fFlLuU]*|0[xXbB][0-9a-fA-F]+[lLuU]*|\\.[0-9][0-9]*([Ee][-+]?[0-9]+)?[fFlL]?|[-+*/<>%&^|=!]=|--|\\+\\+|<<=?|>>=?|&&|\\|\\||::|->\\*?|\\.\\*|<=>",
+  csharp:
+    "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+[fFlL]?|0[xXbB]?[0-9a-fA-F]+[lL]?|[-+*/<>%&^|=!]=|--|\\+\\+|<<=?|>>=?|&&|\\|\\||::|->",
+  css: "-?[_a-zA-Z][-_a-zA-Z0-9]*|-?[0-9]+|\\#[0-9a-fA-F]+",
+  dts: "[a-zA-Z0-9,._+?#-]+|[-+*/%&^|!~]|>>|<<|&&|\\|\\|",
+  elixir:
+    "[@:]?[a-zA-Z0-9@_?!]+|[-+]?0[xob][0-9a-fA-F]+|[-+]?[0-9][0-9_.]*([eE][-+]?[0-9_]+)?|:?(\\+\\+|--|\\.\\.|~~~|<>|\\^\\^\\^|<?\\|>|<<<?|>?>>|<<?~|~>?>|<~>|<=|>=|===?|!==?|=~|&&&?|\\|\\|\\|?|=>|<-|\\\\\\\\|->)|:?%[A-Za-z0-9_.]\\{\\}?",
+  fortran:
+    "[a-zA-Z][a-zA-Z0-9_]*|\\.([Ee][Qq]|[Nn][Ee]|[Gg][TtEe]|[Ll][TtEe]|[Tt][Rr][Uu][Ee]|[Ff][Aa][Ll][Ss][Ee]|[Aa][Nn][Dd]|[Oo][Rr]|[Nn]?[Ee][Qq][Vv]|[Nn][Oo][Tt])\\.|[-+]?[0-9.]+([AaIiDdEeFfLlTtXx][Ss]?[-+]?[0-9.]*)?(_[a-zA-Z0-9][a-zA-Z0-9_]*)?|//|\\*\\*|::|[/<>=]=",
+  fountain: "[^ \t-]+",
+  golang:
+    "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.eE]+i?|0[xX]?[0-9a-fA-F]+i?|[-+*/<>%&^|=!:]=|--|\\+\\+|<<=?|>>=?|&\\^=?|&&|\\|\\||<-|\\.{3}",
+  html: "[^<>= \t]+",
+  ini: "[^ \t]+",
+  java: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+[fFlL]?|0[xXbB]?[0-9a-fA-F]+[lL]?|[-+*/<>%&^|=!]=|--|\\+\\+|<<=?|>>>?=?|&&|\\|\\|",
+  kotlin:
+    "[a-zA-Z_][a-zA-Z0-9_]*|0[xXbB][0-9a-fA-F_]+[lLuU]*|[0-9][0-9_]*([.][0-9_]*)?([Ee][-+]?[0-9]+)?[fFlLuU]*|[.][0-9][0-9_]*([Ee][-+]?[0-9]+)?[fFlLuU]?|[-+*/<>%&^|=!]==?|--|\\+\\+|<<=|>>=|&&|\\|\\||->|\\.\\*|!!|[?:.][.:]",
+  markdown: "[^<>= \t]+",
+  matlab: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+|[=~<>]=|\\.[*/\\^']|\\|\\||&&",
+  objc: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+[fFlL]?|0[xXbB]?[0-9a-fA-F]+[lL]?|[-+*/<>%&^|=!]=|--|\\+\\+|<<=?|>>=?|&&|\\|\\||::|->",
+  pascal: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+|0[xXbB]?[0-9a-fA-F]+|<>|<=|>=|:=|\\.\\.",
+  perl: "[[:alpha:]_'][[:alnum:]_']*|0[xb]?[0-9a-fA-F_]*|[0-9a-fA-F_]+(\\.[0-9a-fA-F_]+)?([eE][-+]?[0-9_]+)?|=>|-[rwxoRWXOezsfdlpSugkbctTBMAC>]|~~|::|&&=|\\|\\|=|//=|\\*\\*=|&&|\\|\\||//|\\+\\+|--|\\*\\*|\\.\\.\\.?|[-+*/%.^&<>=!|]=|=~|!~|<<|<>|<=>|>>",
+  php: "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+|0[xXbB]?[0-9a-fA-F]+|[-+*/<>%&^|=!.]=|--|\\+\\+|<<=?|>>=?|===|&&|\\|\\||::|->",
+  python:
+    "[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+[jJlL]?|0[xX]?[0-9a-fA-F]+[lL]?|[-+*/<>%&^|=!]=|//=?|<<=?|>>=?|\\*\\*=?",
+  r: "[^ \t]+",
+  ruby: "(@|@@|\\$)?[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+|0[xXbB]?[0-9a-fA-F]+|\\?(\\\\C-)?(\\\\M-)?.|//=?|[-+*/<>%&^|=!]=|<<=?|>>=?|===|\\.{1,3}|::|[!=]~",
+  rust: "[a-zA-Z_][a-zA-Z0-9_]*|[0-9][0-9_a-fA-Fiosuxz]*(\\.([0-9]*[eE][+-]?)?[0-9_fF]*)?|[-+*\\/<>%&^|=!:]=|<<=?|>>=?|&&|\\|\\||->|=>|\\.{2}=|\\.{3}|::",
+  scheme: "\\|([^|\\\\]|\\\\.)*\\||([^][)(}{ \t])+",
+  swift:
+    "[a-zA-Z_][a-zA-Z0-9_]*|0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|[0-9][0-9_]*([.][0-9_]+)?([eE][-+]?[0-9]+)?|[-+*/%<>=!&|^~?]=|&&|\\|\\||<<=?|>>=?|\\?\\?|\\.\\.[.<]|->",
+  tex: "\\\\[a-zA-Z@]+|\\\\.|([a-zA-Z0-9]|[^\u0001-\u007f])+",
+};
+
+/**
+ * The word regexes of the builtin diff drivers of git 2.43 and 2.44: `bash` split on spaces
+ * and tabs only (2.50 gave it a regex of its own), `scheme` took no escapes between vertical
+ * bars (2.55), and `ini`, `r` and `swift` were no drivers yet.
+ */
+export const BUILTIN_WORD_REGEXES_2_43: Readonly<Record<string, string>> = (() => {
+  const { ini: _ini, r: _r, swift: _swift, ...kept } = BUILTIN_WORD_REGEXES;
+  return {
+    ...kept,
+    bash: "[^ \t]+",
+    scheme: "\\|([^\\\\]*)\\||([^][)(}{[ \t])+",
+  };
+})();
+
+/**
+ * What every builtin word regex ends with (`PATTERNS`): any other non-space byte is a word,
+ * and so is a UTF-8 sequence (git in the C locale, whose regexec reads bytes)
+ */
+const WORD_REGEX_SUFFIX = Uint8Array.from([
+  ...new TextEncoder().encode("|[^[:space:]]|["),
+  0xc0,
+  0x2d,
+  0xff,
+  0x5d,
+  0x5b,
+  0x80,
+  0x2d,
+  0xbf,
+  0x5d,
+  0x2b,
+]);
+
+/**
+ * The word regex of a diff driver (userdiff.c's `word_regex`), as bytes of an extended
+ * POSIX expression: `diff.<name>.wordRegex` from `config` when set, else the builtin
+ * driver's (from `builtins`, default git 2.56's {@link BUILTIN_WORD_REGEXES}) with the suffix
+ * every builtin gets; undefined when neither exists (words are then runs of non-spaces).
+ */
+export function userdiffWordRegex(
+  name: string,
+  config?: (key: string) => string | undefined,
+  builtins: Readonly<Record<string, string>> = BUILTIN_WORD_REGEXES,
+): Uint8Array | undefined {
+  const configured = config?.(`diff.${name}.wordRegex`);
+  if (configured !== undefined) return new TextEncoder().encode(configured);
+  const builtin = Object.hasOwn(builtins, name) ? builtins[name] : undefined;
+  if (builtin === undefined) return undefined;
+  const head = new TextEncoder().encode(builtin);
+  const out = new Uint8Array(head.length + WORD_REGEX_SUFFIX.length);
+  out.set(head);
+  out.set(WORD_REGEX_SUFFIX, head.length);
+  return out;
+}
+
+/**
  * The function line finder of a funcname pattern (`xdiff_set_find_func` and `ff_regexp` of
  * git). Throws, as git dies, when an expression does not compile ("Invalid regexp to look
  * for hunk header") or the last one is negated.

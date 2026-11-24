@@ -967,3 +967,11 @@ function hunkHeader(line: Uint8Array, c: DiffColors): Out {
   if (orgLen === len || line[orgLen - 1] !== 0x0a) out.byte(0x0a);
   return out;
 }
+
+/**
+ * diff.c's `emit_hunk_header` in color: the `@@ ... @@` part in `frag`, the function line in
+ * `func` (the header as xdiff made it, LF included)
+ */
+export function coloredHunkHeader(line: Uint8Array, c: DiffColors): Uint8Array {
+  return hunkHeader(line, c).done();
+}

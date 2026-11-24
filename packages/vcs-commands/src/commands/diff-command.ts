@@ -156,8 +156,14 @@ export interface DiffTextOptions
       | "colors"
       | "wsHighlight"
       | "whitespaceRule"
+      | "defaultWordRegex"
     >,
     DiffColorOptions {
+  /**
+   * The builtin diff drivers (funcname and word regexes) of that git version (default 2.56):
+   * 2.43 has no `ini`, `r` and `swift` drivers and older `bash`, `csharp` and `scheme` ones
+   */
+  driverCompatibility?: "2.43" | "2.56";
   /** `--diff-algorithm` (default `diff.algorithm`, else myers) */
   algorithm?: XdiffAlgorithm;
   /** `--indent-heuristic` / `--no-indent-heuristic` (default `diff.indentHeuristic`, true) */
@@ -1777,7 +1783,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
           if (!found) {
             found = (async () => {
               const attrs = await filter.attributes?.(path, ["diff"], context);
-              return withTextconv(diffDriverOf(attrs?.get("diff"), get));
+              return withTextconv(
+                diffDriverOf(attrs?.get("diff"), get, this.textOptions.driverCompatibility),
+              );
             })();
             drivers.set(path, found);
           }
@@ -1812,6 +1820,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       colorMovedWs: _colorMovedWs,
       wsErrorHighlight: _wsErrorHighlight,
       colorCompatibility: _colorCompatibility,
+      driverCompatibility: _driverCompatibility,
       ...text
     } = this.textOptions;
     const colorSettings = this.colorSettings;
@@ -1838,6 +1847,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       ...(driver ? { driver } : {}),
       ...(ignoreRegex.length > 0 ? { ignoreRegex } : {}),
       ...colors,
+      ...(get("diff.wordRegex") !== undefined
+        ? { defaultWordRegex: get("diff.wordRegex") as string }
+        : {}),
     };
   }
 
