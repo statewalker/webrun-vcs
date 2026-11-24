@@ -943,7 +943,8 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
     if (this.blob !== undefined) return this.readBlobEntries(list);
     if (this.scope === undefined && this.file === undefined) {
       const config = this.workingCopy.config as GitWorkingCopyConfig | undefined;
-      if (!config || typeof config.listWithOrigin !== "function") return [];
+      if (!config) return [];
+      if (typeof config.listWithOrigin !== "function") return plainConfigEntries(config);
       return config.listWithOrigin().map((e) => ({
         key: e.key,
         text: e.text,
@@ -1057,7 +1058,8 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
         },
       },
       "blob",
-      { includes: false },
+      // the blob alone: its own `extensions.worktreeConfig` adds no `config.worktree`
+      { includes: false, fileOnly: true },
     );
     try {
       await reader.load();
@@ -1161,6 +1163,28 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
     const root = worktree.getRoot().replace(/\/+$/, "");
     return { files, path: root ? `${root}/${path}` : path, name: path };
   }
+}
+
+/**
+ * The entries of a configuration held as a plain object (a `MemoryWorkingCopy`'s): `true`
+ * for a key without a value, an array for several values, anything else as its string.
+ */
+function plainConfigEntries(config: Record<string, unknown>): QueryEntry[] {
+  const out: QueryEntry[] = [];
+  for (const [name, raw] of Object.entries(config)) {
+    if (typeof raw === "function" || raw === undefined || raw === null) continue;
+    const parsed = parseConfigKey(name);
+    const key = "status" in parsed ? name : parsed.key;
+    for (const v of Array.isArray(raw) ? raw : [raw]) {
+      out.push({
+        key,
+        text: v === true ? undefined : String(v),
+        origin: "",
+        name: "",
+      });
+    }
+  }
+  return out;
 }
 
 /** A result of the lines git wrote on stderr. */

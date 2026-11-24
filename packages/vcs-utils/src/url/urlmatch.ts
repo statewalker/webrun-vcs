@@ -224,35 +224,23 @@ export function normalizeUrl(
   const hostLength = hostOffset ? norm.length - hostOffset - (portLength ? portLength + 1 : 0) : 0;
 
   const pathOffset = norm.length;
-  norm += "/";
   if (url[at] === "/") at++;
+  // the path's segments, `.` dropped and `..` taking the one before it (a stack, joined once:
+  // rebuilding the string per segment would be quadratic in their number)
+  const segments: string[] = [];
   for (;;) {
-    const segStart = norm.length;
     const next = at + cspan(url, at, "/?#");
-    let skipSlash = false;
-    const escaped = normalizedEscapes(url.slice(at, next), RESERVED);
-    if (escaped === undefined) return { error: "invalid %XX escape sequence" };
-    norm += escaped;
-    const segment = norm.slice(segStart);
-    if (segment === ".") {
-      if (segStart === pathOffset + 1) {
-        norm = norm.slice(0, -1);
-        skipSlash = true;
-      } else norm = norm.slice(0, -2);
-    } else if (segment === "..") {
-      let prev = norm.length - 3;
-      if (prev === pathOffset) return { error: "invalid '..' path segment" };
-      while (norm[--prev] !== "/") {}
-      if (prev === pathOffset) {
-        norm = norm.slice(0, prev + 1);
-        skipSlash = true;
-      } else norm = norm.slice(0, prev);
-    }
+    const segment = normalizedEscapes(url.slice(at, next), RESERVED);
+    if (segment === undefined) return { error: "invalid %XX escape sequence" };
+    if (segment === "..") {
+      if (segments.length === 0) return { error: "invalid '..' path segment" };
+      segments.pop();
+    } else if (segment !== ".") segments.push(segment);
     at = next;
     if (url[at] !== "/") break;
     at++;
-    if (!skipSlash) norm += "/";
   }
+  norm += `/${segments.join("/")}`;
   const pathLength = norm.length - pathOffset;
 
   if (at < url.length) {

@@ -39,6 +39,29 @@ describe("normalizeUrl (urlmatch.c url_normalize)", () => {
   });
 });
 
+describe("normalizeUrl path segments", () => {
+  it("resolves . and .. as url_normalize does, trailing and empty segments kept", () => {
+    expect(norm("http://h/a/.").url).toBe("http://h/a");
+    expect(norm("http://h/a/./").url).toBe("http://h/a/");
+    expect(norm("http://h/./b").url).toBe("http://h/b");
+    expect(norm("http://h/a/b/../").url).toBe("http://h/a/");
+    expect(norm("http://h/a//..").url).toBe("http://h/a");
+    expect(norm("http://h//..").url).toBe("http://h/");
+    expect(norm("http://h/a/%2e%2E/b?x=/../#f").url).toBe("http://h/b?x=/../#f");
+    expect(isUrlNormalizeError(normalizeUrl("http://h/a/../.."))).toBe(true);
+  });
+
+  it("is linear in the number of segments", () => {
+    const url = `http://h/${"a/".repeat(100000)}${"../".repeat(50000)}`;
+    const started = performance.now();
+    const n = norm(url);
+    const elapsed = performance.now() - started;
+    expect(n.url.length).toBe("http://h/".length + 50000 * 2);
+    // quadratic string rebuilding took tens of seconds at this size
+    expect(elapsed).toBeLessThan(2000);
+  });
+});
+
 describe("selectUrlMatches (urlmatch_config_entry)", () => {
   const entries = [
     { key: "http.sslverify", value: "plain" },

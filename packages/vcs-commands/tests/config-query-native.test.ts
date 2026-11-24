@@ -604,6 +604,25 @@ const scenarios: Scenario[] = [
       ["--get-colorbool", "--int", "color.other"],
     ],
   },
+  {
+    title:
+      't1307-config-blob.sh: "list config blob contents", "fetch value from blob" (a blob setting extensions.worktreeConfig reads no config.worktree)',
+    files: {
+      wtconfig: "[extensions]\n\tworktreeConfig = true\n[some]\n\tvalue = 1\n\tvalue = 2\n",
+      ".git/config.worktree": "[some]\n\tvalue = worktree\n",
+    },
+    setup: [
+      ["add", "wtconfig"],
+      ["commit", "-q", "-m", "wt"],
+    ],
+    steps: [
+      ["--blob=HEAD:wtconfig", "--list"],
+      ["--blob=HEAD:wtconfig", "--get-all", "some.value"],
+      ["--blob=HEAD:wtconfig", "--get-regexp", "--show-origin", "--show-scope", "."],
+      { args: ["list", "--blob=HEAD:wtconfig"], min: SUB },
+      { args: ["get", "--all", "--blob=HEAD:wtconfig", "some.value"], min: SUB },
+    ],
+  },
 ];
 
 /** Our command for `git config <args>` (either syntax). */
