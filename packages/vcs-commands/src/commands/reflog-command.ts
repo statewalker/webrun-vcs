@@ -1,6 +1,8 @@
 import type { ReflogEntry } from "@statewalker/vcs-core";
 
 import { GitCommand } from "../git-command.js";
+import type { LogOutputOptions } from "./log-output.js";
+import { RevListCommand } from "./rev-list-command.js";
 
 /**
  * Read reflog entries for a ref.
@@ -26,10 +28,18 @@ import { GitCommand } from "../git-command.js";
  * for (const entry of entries) {
  *   console.log(`${entry.newId.slice(0, 7)} ${entry.comment}`);
  * }
+ *
+ * // git reflog show -2 main: "1a2b3c4 main@{0}: commit: Second\n..."
+ * const text = await git.reflog().setRef("main").setMaxCount(2).callText();
+ *
+ * // git reflog exists refs/heads/main
+ * const exists = await git.reflog().setRef("refs/heads/main").callExists();
  * ```
  */
 export class ReflogCommand extends GitCommand<ReflogEntry[]> {
   private ref = "HEAD";
+  private maxCount?: number;
+  private warnings: string[] = [];
 
   /**
    * Set the ref to show reflog for.
@@ -40,6 +50,52 @@ export class ReflogCommand extends GitCommand<ReflogEntry[]> {
     this.checkCallable();
     this.ref = ref;
     return this;
+  }
+
+  /** `-<n>` / `-n <n>` of `git reflog show`: at most `n` entries. */
+  setMaxCount(maxCount: number): this {
+    this.checkCallable();
+    this.maxCount = maxCount;
+    return this;
+  }
+
+  /**
+   * `git reflog [show] [<ref>]`'s output: `git log -g --abbrev-commit --pretty=oneline` of
+   * the ref (`%h <ref>@{n}: <message>` per entry; the ref may carry a selector, `main@{2}`,
+   * `HEAD@{now}`). `options` are log options over those defaults (`{ pretty: "short" }`
+   * still abbreviates, `{ abbrevCommit: false }` is `--no-abbrev-commit`). Throws where git
+   * dies (a ref that names nothing: `ambiguous argument`); {@link getWarnings} holds what it
+   * warned.
+   */
+  async callText(options: LogOutputOptions = {}): Promise<string> {
+    this.checkCallable();
+    this.setCallable(false);
+    const command = new RevListCommand(this._workingCopy)
+      .setWalkReflogs(true)
+      .addRevision(this.ref);
+    if (this.maxCount !== undefined) command.setMaxCount(this.maxCount);
+    try {
+      const pretty = options.oneline ? {} : { pretty: "oneline" };
+      return await command.callLogText({ ...pretty, abbrevCommit: true, ...options });
+    } finally {
+      this.warnings = command.getWarnings();
+    }
+  }
+
+  /** What {@link callText} warned while reading the ref (`warning: log for ...`). */
+  getWarnings(): string[] {
+    return [...this.warnings];
+  }
+
+  /**
+   * `git reflog exists <ref>`: whether the ref (a full name, `refs/heads/main`, or `HEAD`)
+   * has a reflog, an empty one too.
+   */
+  async callExists(): Promise<boolean> {
+    this.checkCallable();
+    this.setCallable(false);
+    const reader = await this.refsStore.getReflog?.(this.ref).catch(() => undefined);
+    return reader !== undefined;
   }
 
   /**

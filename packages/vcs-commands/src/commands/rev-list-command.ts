@@ -19,6 +19,7 @@
 import type { ObjectId } from "@statewalker/vcs-core";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 
+import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import {
   BisectGraph,
@@ -67,6 +68,10 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   private prepared?: { pending: BisectPending[]; paths: string[] };
   /** The log that walks for this command, once called */
   private log?: LogCommand;
+  /** `-g`: the revisions name reflogs to walk */
+  private walkReflogs = false;
+  /** What reading the revisions printed (`warning:` lines) */
+  private warnings: string[] = [];
 
   /** What git prints while reading replace refs and grafts (see GitCommand). */
   override async replacementMessages(): Promise<string[]> {
@@ -92,6 +97,43 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     this.checkCallable();
     this.revisions.push(revision);
     return this;
+  }
+
+  /**
+   * `-g` / `--walk-reflogs`: each revision names a reflog to walk (`HEAD`, `main@{2}`,
+   * `HEAD@{now}`; HEAD without one) instead of history: the commits come newest entry first,
+   * each with its entry ({@link callLogText} prints them as `git log -g`). As git, an excluded
+   * revision (`^a`, `a..b`) dies (`cannot walk reflogs for a`), and so do a sorted walk and
+   * `--reverse` (see `LogCommand.addReflogWalk`).
+   *
+   * @example
+   * ```typescript
+   * // git log -g --oneline main
+   * await git.revList().setWalkReflogs(true).addRevision("main").callLogText({ oneline: true });
+   * ```
+   */
+  setWalkReflogs(walk: boolean): this {
+    this.checkCallable();
+    this.walkReflogs = walk;
+    return this;
+  }
+
+  /** The git version to follow where versions differ (see `LogCommand.setCompatibility`). */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    return this.configured((log) => log.setCompatibility(version));
+  }
+
+  /** `--grep-reflog=<pattern>` (see `LogCommand.addGrepReflog`). */
+  addGrepReflog(pattern: string): this {
+    return this.configured((log) => log.addGrepReflog(pattern));
+  }
+
+  /**
+   * What git printed on stderr while reading the revisions and still went on (`warning: log
+   * for 'HEAD' only goes back to ...`), once called.
+   */
+  getWarnings(): string[] {
+    return [...this.warnings];
   }
 
   /** `--all`: every ref under `refs/` (in name order), then HEAD. */
@@ -457,8 +499,26 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     // as it does after `--exclude=` alone or a `--stdin` that read nothing
     const named = (args: string[]) => args.some((arg) => arg !== "--not" && arg !== "--");
     if (this.revisions.length > 0 || named(this.mixed)) {
-      const { entries, paths, inputGiven } = await this.resolve();
+      const { entries, paths, inputGiven, warnings } = await this.resolve();
+      this.warnings = [...warnings];
       for (const path of paths) log.addPath(path);
+      if (this.walkReflogs) {
+        // add_pending_object_with_path: a commit named is a reflog to walk, an excluded one
+        // dies; other objects are pending, which a reflog walk never reads
+        let named = false;
+        for (const entry of entries) {
+          const name = entry.name ?? entry.id;
+          const peeled = await this.revisionResolver().peelTags(entry.id);
+          if (peeled.type !== "commit" || peeled.id !== entry.id) continue;
+          if (entry.exclude) throw new GitApiError(`cannot walk reflogs for ${name}`);
+          log.addReflogWalk(name);
+          named = true;
+        }
+        // no revision: HEAD's reflog (revs->def); revisions naming no reflog walk nothing
+        if (!named && entries.length === 0 && !inputGiven) log.setWalkReflogs(true);
+        else if (!named) return undefined;
+        return log;
+      }
       const revised = entries.length > 0 || !!inputGiven;
       const resolver = this.revisionResolver();
       let included = 0;
@@ -477,6 +537,7 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
       }
       if (included === 0 && (revised || !defaultHead)) return undefined;
     } else if (!defaultHead) return undefined;
+    else if (this.walkReflogs) log.setWalkReflogs(true);
     return log;
   }
 }
