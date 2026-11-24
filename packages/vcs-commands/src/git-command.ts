@@ -53,6 +53,7 @@ import {
   type IdAbbreviator,
   worktreeModeTrust,
 } from "./commands/core-config.js";
+import type { ForkPointSource } from "./commands/fork-point.js";
 import { HookSession, refTransactionHookOf } from "./commands/git-hooks.js";
 import {
   authorIdentOf,
@@ -64,6 +65,7 @@ import {
 } from "./commands/git-ident.js";
 import { indexHostOf, indexVersionConfigError } from "./commands/index-host.js";
 import { loadLegacyRemote } from "./commands/legacy-remotes.js";
+import type { MergeBaseGraph } from "./commands/merge-bases.js";
 import type { NotesContext } from "./commands/notes-support.js";
 import { postIndexChangeHookOf } from "./commands/post-index-change.js";
 import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
@@ -1311,6 +1313,24 @@ export abstract class GitCommand<T> {
       abbreviate: (ids) => this.idAbbreviator().lengths(ids),
       ...this.worktreeSources(),
     });
+  }
+
+  /**
+   * What git's get_fork_point reads (`merge-base --fork-point`, `rebase --fork-point`): refs
+   * by git's rules, their reflogs oldest first, and which ids are commits.
+   */
+  protected forkPointSource(graph: MergeBaseGraph): ForkPointSource {
+    const resolver = this.revisionResolver();
+    return {
+      dwimRef: (name) => resolver.dwimRef(name),
+      reflog: async (ref) => {
+        const log = await this.refsStore.getReflog?.(ref);
+        return log ? (await log.getReverseEntries()).reverse() : undefined;
+      },
+      isCommit: async (id) =>
+        (await this.walkCommits.load(id).catch(() => undefined)) !== undefined,
+      graph,
+    };
   }
 
   /**
