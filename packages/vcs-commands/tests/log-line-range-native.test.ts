@@ -79,6 +79,7 @@ async function ours(dir: string, args: string[]): Promise<{ status: number; out:
     else if (a.startsWith("-L")) log.addLineRange(a.slice(2));
     else if (a === "--oneline") options.oneline = true;
     else if (a === "--graph") options.graph = true;
+    else if (a === "--parents") options.parents = true;
     else if (a === "-s" || a === "--no-patch") options.noPatch = true;
     else if (a === "-p") options.patch = true;
     else if (a === "--name-only") options.nameOnly = true;
@@ -385,6 +386,8 @@ describeGit("git log -L following renames through a merge, native", () => {
     await compare(dir, ["--graph", "-L1:renamed-1"]);
     await compare(dir, ["--first-parent", "-L1:renamed-2", "--oneline"]);
     await compare(dir, ["--format=%h %p %s", "-L1:renamed-1", "-s"]);
+    await compare(dir, ["--format=%h %p %s", "-L1:renamed-2", "-s", "--parents"]);
+    await compare(dir, ["-L1:renamed-1", "--parents", "--oneline"]);
   });
 });
 
@@ -427,6 +430,11 @@ describeGit("git log -L :funcname over a linear history, native", () => {
 
   it(t4211("parent oids without parent rewriting"), async () => {
     await compare(dir, ["--format=%h %p %s", "--no-patch", "-L:func2:file.c"]);
+  });
+
+  it(t4211("parent oids with parent rewriting"), async () => {
+    await compare(dir, ["--format=%h %p %s", "--no-patch", "-L:func2:file.c", "--parents"]);
+    await compare(dir, ["--oneline", "-L:func2:file.c", "--parents"]);
   });
 
   it(t4211("line-log with --before"), async () => {
