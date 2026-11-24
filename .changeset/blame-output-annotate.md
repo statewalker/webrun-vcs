@@ -1,5 +1,0 @@
----
-"@statewalker/vcs-commands": minor
----
-
-`git blame` output modes and `git annotate`: `BlameCommand.setContents` blames a buffer the caller gives (`--contents <file>`, `-` as standard input, or the working tree's file as "Not Committed Yet") on git's fake commit above the start commit, and `setSince` stops at older commits (`--since`, boundaries as git's `max_age`). `BlameResult.incremental` keeps the entries in the order blame found them, printed by `formatBlameIncremental` (`--incremental`); `formatBlame` takes `--date` modes (`date`, padded to git's widths), `-c` (`annotate`), `--color-lines`/`--color-by-age` with `color.blame.repeatedLines`/`color.blame.highlightRecent`, and `formatAnnotate` is `git annotate`. `BlameResult.output` carries `blame.date`, `blame.showEmail`, `blame.blankBoundary`, `blame.coloring` and the colors as the formatters' defaults; `colorLinesWithinEntries` is git before 2.54, whose `--color-lines` did not continue across adjacent entries of one commit. Native twins of t8008, t8012 and t/annotate-tests.sh (t8001). Ported from statewalker/statewalker-root#345.

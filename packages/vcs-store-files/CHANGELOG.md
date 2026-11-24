@@ -1,5 +1,25 @@
 # @statewalker/vcs-store-files
 
+## 0.9.0
+
+### Minor Changes
+
+- dcc865f: `git init` and `git clone` layouts as git writes them (statewalker-root#348): `InitCommand.setSeparateGitDir` (the gitfile as git writes it; re-init moves an existing git directory and repairs its linked worktrees), `setTemplate` (and `$GIT_TEMPLATE_DIR` / `init.templateDir`, copied from a FilesApi directory with git's skip rules), `setShared` and `core.sharedRepository` with git's `adjust_shared_perm` modes on what a shared repository's commands create (objects, packs, refs, reflogs, the index, `info/refs`), new repositories get `objects/info` and `core.logallrefupdates`. vcs-utils: `parseSharedRepository`, `calcSharedPerm`, `adjustSharedPerm` (directories too), `withSharedPerm`; the Node FilesApi's `chmod` keeps setgid on directories.
+
+### Patch Changes
+
+- bef150f: More `git clone` options (statewalker/statewalker-root#349). `CloneCommand.setConfig`/`addConfig` is `-c`/`--config`: the values are written to the new repository's config before anything is fetched, where git's config writer places them, so the fetch and the checkout use them (`url.*.insteadOf`, `protocol.*`, `fetch.fsckObjects`, `core.autocrlf`, and `remote.<name>.fetch` refspecs fetched before the clone's own, whose value is then added after them). The remote's name comes from `clone.defaultRemoteName` unless `setRemote` (`-o`) names it. `setRevision` is git 2.49's `--revision` (HEAD detached at the revision's commit, no ref or fetch refspec written; refused with `--branch`/`--mirror`, and as an unknown option under 2.43 compatibility, `setCompatibility`). `setRejectShallow` is `--[no-]reject-shallow` with `clone.rejectShallow`, for local and fetched sources. `setServerOptions` is `--server-option`, with `remote.<name>.serverOption` (git 2.5x) when none is given; a v0 server fails a clone given options, as git. vcs-transport: `FetchClientOptions.serverOptions` (sent in `ls-refs` and every v2 `fetch`; `lsRefs` takes them too) and `rejectShallow` (`ShallowRemoteRejectedError`); a clone's initial ref transaction is committed even when it writes no ref (git writes an empty `packed-refs`), which vcs-store-files' files ref store now does.
+- dec0760: `--recurse-submodules` for clone, fetch, pull and push (statewalker/statewalker-root#332). `FetchCommand.setRecurseSubmodules` (yes, on-demand, no) and the configuration (`fetch.recurseSubmodules`, `submodule.recurse`, `.gitmodules`' `fetch.recurseSubmodules`, `submodule.<name>.fetchRecurseSubmodules`) recurse as submodule.c's `fetch_submodules`: on demand by default, the changed submodules found by walking the fetched history (also those not in the index, `at commit <id>`), a second fetch of recorded commits still missing, git's lines in `FetchResult.submoduleOutput`, the results in `FetchResult.submodules`, failures in `submodulesFailed`; submodules are fetched one at a time (`submodule.fetchJobs` only parallelises). `CloneCommand.setRecurseSubmodules` (pathspecs), `setShallowSubmodules`, `setAlsoFilterSubmodules` (`clone.filterSubmodules`) and `setRemoteSubmodules` write `submodule.active` and run `submodule update --require-init --recursive` after the checkout (`CloneResult.submodules`); `SubmoduleUpdateCommand` gains `setFilter` and `setSingleBranch`. `PullCommand.setRecurseSubmodules` and `submodule.recurse` pass the mode to the fetch and update the submodules after the merge or rebase (`PullResult.submodules`), refusing a rebase over locally recorded submodule changes. `PushCommand.setRecurseSubmodules` (check, on-demand, only, no) and `push.recurseSubmodules` check or push the submodules first (`submodule--helper push-check` included, `PushResult.submoduleOutput`). Submodule fetches, clones and pushes reach the submodules' URLs through guarded transports: credentials go only to the superproject remote's origin. A submodule's FETCH_HEAD is now written to its git directory (vcs-store-files `openGitlink`), and a fetch from a local path naming no repository leaves FETCH_HEAD empty, as git does.
+- Updated dependencies [563818b]
+- Updated dependencies
+- Updated dependencies [4f01ece]
+- Updated dependencies [dcc865f]
+- Updated dependencies [906ce19]
+- Updated dependencies [fa1b0c4]
+  - @statewalker/vcs-working-tree@0.9.0
+  - @statewalker/vcs-core@0.9.0
+  - @statewalker/vcs-utils@0.9.0
+
 ## 0.8.0
 
 ### Minor Changes
