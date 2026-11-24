@@ -686,9 +686,35 @@ export interface NameRevCommitStore {
 
 /**
  * `loadCommit` over a commit store: from the commit-graph loaded at the first read where it
- * has the commit (its generation), else from the object (generation Infinity).
+ * has the commit (its generation), else from the object (generation Infinity). In a shallow
+ * repository (`shallow`: its `.git/shallow` commits, given or read on first use) a shallow
+ * commit has no parents and no commit-graph is read (git's `commit_graph_compatible`).
  */
 export function commitLoaderOf(
+  commits: NameRevCommitStore,
+  shallow?: () => Promise<readonly ObjectId[] | undefined>,
+): (id: ObjectId) => Promise<NameRevCommit | undefined> {
+  let cut: Promise<Set<ObjectId>> | undefined;
+  const plain = graphLoaderOf(commits);
+  const fromObjects = async (id: ObjectId) => {
+    const c = await commits.load(id).catch(() => undefined);
+    return c
+      ? { parents: c.parents, date: c.committer.timestamp, generation: INFINITY }
+      : undefined;
+  };
+  return async (id) => {
+    cut ??= (shallow?.().catch(() => undefined) ?? Promise.resolve(undefined)).then(
+      (ids) => new Set(ids ?? []),
+    );
+    const boundary = await cut;
+    if (boundary.size === 0) return plain(id);
+    const c = await fromObjects(id);
+    return c && boundary.has(id) ? { ...c, parents: [] } : c;
+  };
+}
+
+/** {@link commitLoaderOf} without shallow commits. */
+function graphLoaderOf(
   commits: NameRevCommitStore,
 ): (id: ObjectId) => Promise<NameRevCommit | undefined> {
   let reader:
@@ -712,5 +738,25 @@ export function commitLoaderOf(
     return c
       ? { parents: c.parents, date: c.committer.timestamp, generation: INFINITY }
       : undefined;
+  };
+}
+
+/**
+ * A commit store's `load` as a shallow repository's walks read it: the commits of
+ * `.git/shallow` without parents (git's shallow grafts), others as stored.
+ */
+export function withShallowParents<C extends { parents: ObjectId[] }>(
+  commits: { load(id: ObjectId): Promise<C | undefined> },
+  shallow: () => Promise<readonly ObjectId[] | undefined>,
+): { load(id: ObjectId): Promise<C | undefined> } {
+  let cut: Promise<Set<ObjectId>> | undefined;
+  return {
+    load: async (id) => {
+      cut ??= shallow()
+        .catch(() => undefined)
+        .then((ids) => new Set(ids ?? []));
+      const c = await commits.load(id);
+      return c && (await cut).has(id) ? { ...c, parents: [] } : c;
+    },
   };
 }

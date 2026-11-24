@@ -5,7 +5,7 @@ import { DescribeError } from "../errors/command-errors.js";
 import { RefNotFoundError } from "../errors/ref-errors.js";
 import { GitCommand } from "../git-command.js";
 import { DESCRIBE_MAX_TAGS, DescribeDeath, Describer } from "./git-describe.js";
-import { commitLoaderOf, type NameRevSource, runNameRev } from "./name-rev.js";
+import { commitLoaderOf, type NameRevSource, runNameRev, withShallowParents } from "./name-rev.js";
 import { canonicalObjectId } from "./object-id-input.js";
 import { StatusCommand } from "./status-command.js";
 
@@ -275,10 +275,13 @@ export class DescribeCommand extends GitCommand<DescribeResult> {
   async call(): Promise<DescribeResult> {
     this.checkCallable();
     this.setCallable(false);
+    // describing HEAD: an unborn or missing HEAD is NoHeadError, before anything else
+    if (this.revisions.length === 0 && !this.target) await this.resolveHead();
     try {
       return await this.run();
     } catch (e) {
-      if (e instanceof DescribeError) {
+      // only git's "nothing describes it" deaths answer undefined; the rest is thrown
+      if (e instanceof DescribeError && e.undescribable) {
         return { description: undefined, descriptions: [], stderr: [e.message] };
       }
       throw e;
@@ -315,7 +318,7 @@ export class DescribeCommand extends GitCommand<DescribeResult> {
       refs: this.refsStore,
       objectType: (id) => resolver.objectType(id),
       loadTag: async (id) => tags?.load(id),
-      loadCommit: commitLoaderOf(this.walkCommits),
+      loadCommit: commitLoaderOf(this.walkCommits, () => this.shallowCommits()),
       refExists: (name) => this.refsStore.has(name).catch(() => false),
       abbreviate: (id) => this.abbreviateObjectId(id),
       wildmatch: (pattern, text) => wildmatch(pattern, text),
@@ -324,7 +327,9 @@ export class DescribeCommand extends GitCommand<DescribeResult> {
 
   private async run(): Promise<DescribeResult> {
     const fail = (message: string, stdout = "", stderr: string[] = []) =>
-      new DescribeError([...stderr, `fatal: ${message}`].join("\n"), stdout, 128);
+      new DescribeError([...stderr, `fatal: ${message}`].join("\n"), stdout, 128, {
+        undescribable: UNDESCRIBABLE.some((prefix) => message.startsWith(prefix)),
+      });
     const revs = [...this.revisions];
     if (this.target) revs.push(this.target);
     const candidates = Math.min(Math.max(this.maxCandidates, 0), DESCRIBE_MAX_TAGS);
@@ -337,7 +342,7 @@ export class DescribeCommand extends GitCommand<DescribeResult> {
       {
         refs: this.refsStore,
         ...(this.tagsStore ? { tags: this.tagsStore } : {}),
-        commits: this.commits,
+        commits: withShallowParents(this.commits, () => this.shallowCommits()),
         trees: this.trees,
         abbreviate: this.abbreviate,
         wildmatch: (pattern, text) => wildmatch(pattern, text),
@@ -419,7 +424,10 @@ export class DescribeCommand extends GitCommand<DescribeResult> {
   /** `--dirty`/`--broken`: the mark the worktree's state against HEAD gives. */
   private async worktreeSuffix(): Promise<string | undefined> {
     if (this.dirty === undefined && this.broken === undefined) return undefined;
-    const status = new StatusCommand(this._workingCopy).setUntrackedFiles("no").setRenames(false);
+    const status = new StatusCommand(this._workingCopy)
+      .setUntrackedFiles("no")
+      .setRenames(false)
+      .setPlumbingSubmodules(true);
     if (this.broken !== undefined) {
       // 2.43 runs diff-index without refreshing the index first: a file whose stat
       // changed counts as dirty
@@ -496,15 +504,40 @@ export class DescribeCommand extends GitCommand<DescribeResult> {
       { revs: input },
     );
     if (run.fatal) {
-      throw new DescribeError([...run.stderr, run.fatal].join("\n"), run.stdout, 128);
+      throw new DescribeError([...run.stderr, run.fatal].join("\n"), run.stdout, 128, {
+        undescribable: true,
+      });
     }
     const descriptions = run.stdout === "" ? [] : run.stdout.replace(/\n$/, "").split("\n");
     return { description: descriptions[0], descriptions, stderr: run.stderr };
   }
 }
 
+/** The deaths of git describe that say nothing describes the commit. */
+const UNDESCRIBABLE = [
+  "No names found, cannot describe anything.",
+  "No tags can describe ",
+  "No annotated tags can describe ",
+  "no tag exactly matches ",
+];
+
 /** diff-index HEAD's answer: a tracked path differs between HEAD and the worktree. */
-function isDirty(status: { files: { index: string; worktree: string }[] }): boolean {
+function isDirty(status: {
+  files: {
+    index: string;
+    worktree: string;
+    submoduleCommitChanged?: boolean;
+    submoduleModified?: boolean;
+    submoduleUntracked?: boolean;
+  }[];
+}): boolean {
   const changed = (c: string) => c !== " " && c !== "?" && c !== "!";
-  return status.files.some((f) => changed(f.index) || changed(f.worktree));
+  return status.files.some(
+    (f) =>
+      changed(f.index) ||
+      changed(f.worktree) ||
+      !!f.submoduleCommitChanged ||
+      !!f.submoduleModified ||
+      !!f.submoduleUntracked,
+  );
 }

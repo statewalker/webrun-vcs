@@ -25,7 +25,7 @@ import { createDescriber } from "./git-describe.js";
 import { gitFileOf, hookRunnerOf } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { MergeCommand } from "./merge-command.js";
-import { commitLoaderOf, nameRevByTags } from "./name-rev.js";
+import { commitLoaderOf, nameRevByTags, withShallowParents } from "./name-rev.js";
 import { RebaseCommand } from "./rebase-command.js";
 import {
   type CredentialsForUrl,
@@ -128,7 +128,7 @@ class SubmoduleRepository extends GitCommand<never> {
     const source = {
       refs: this.refsStore,
       ...(tags ? { tags } : {}),
-      commits: this.commits,
+      commits: withShallowParents(this.commits, () => this.shallowCommits()),
     };
     const describe = createDescriber({
       ...source,
@@ -148,7 +148,7 @@ class SubmoduleRepository extends GitCommand<never> {
         refs: this.refsStore,
         objectType: (oid) => resolver.objectType(oid),
         loadTag: async (oid) => tags?.load(oid),
-        loadCommit: commitLoaderOf(this.walkCommits),
+        loadCommit: commitLoaderOf(this.walkCommits, () => this.shallowCommits()),
         refExists: (name) => this.refsStore.has(name).catch(() => false),
         abbreviate: (oid) => this.abbreviateObjectId(oid),
         wildmatch: (pattern, text) => wildmatch(pattern, text),

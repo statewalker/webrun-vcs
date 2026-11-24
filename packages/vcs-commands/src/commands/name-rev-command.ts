@@ -147,7 +147,7 @@ export class NameRevCommand extends GitCommand<NameRevResult> {
         refs: this.refsStore,
         objectType: (id) => resolver.objectType(id),
         loadTag: async (id) => tags?.load(id),
-        loadCommit: commitLoaderOf(this.walkCommits),
+        loadCommit: commitLoaderOf(this.walkCommits, () => this.shallowCommits()),
         refExists: (name) => this.refsStore.has(name).catch(() => false),
         abbreviate: (id) => this.abbreviateObjectId(id),
         wildmatch: (pattern, text) => wildmatch(pattern, text),

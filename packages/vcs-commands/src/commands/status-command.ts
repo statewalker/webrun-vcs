@@ -322,6 +322,7 @@ export class StatusCommand extends GitCommand<Status> {
   private renames?: boolean;
   private renameLimit?: number;
   private ignoreSubmodules?: SubmoduleIgnoreMode;
+  private plumbingSubmodules = false;
   private gitmodules?: Promise<GitmodulesEntry[]>;
   /** The commit the index is compared with: undefined is HEAD, null none (initial) */
   private reference?: ObjectId | null;
@@ -415,6 +416,19 @@ export class StatusCommand extends GitCommand<Status> {
   setIgnoreSubmodules(mode: SubmoduleIgnoreMode): this {
     this.checkCallable();
     this.ignoreSubmodules = mode;
+    return this;
+  }
+
+  /**
+   * Submodules as a plumbing `git diff-index HEAD` sees them (git describe's `--dirty`):
+   * `diff.ignoreSubmodules` is not read (only `git_diff_ui_config` reads it), a submodule
+   * without `submodule.<name>.ignore` counts its changes but not its untracked files, and
+   * one with it follows it (`none`: untracked files too) whatever {@link setUntrackedFiles}
+   * says.
+   */
+  setPlumbingSubmodules(plumbing: boolean): this {
+    this.checkCallable();
+    this.plumbingSubmodules = plumbing;
     return this;
   }
 
@@ -1332,6 +1346,8 @@ export class StatusCommand extends GitCommand<Status> {
     if (this.ignoreSubmodules) return submoduleIgnoreFlags(this.ignoreSubmodules);
     const own = await this.submoduleIgnore(path);
     if (own) return submoduleIgnoreFlags(own);
+    // diff-index without submodule config of its own leaves untracked files inside out
+    if (this.plumbingSubmodules) return submoduleIgnoreFlags("untracked");
     const configured = this.config.value("diff.ignoreSubmodules")?.trim();
     const flags = submoduleIgnoreFlags(isSubmoduleIgnoreMode(configured) ? configured : "none");
     if (this.resolvedUntracked === "no") flags.untracked = true;

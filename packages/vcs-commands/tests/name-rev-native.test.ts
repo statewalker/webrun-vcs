@@ -10,7 +10,7 @@ import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { nameRevTwin, type Outcome, Shell } from "./describe-native-support.js";
+import { describeTwin, nameRevTwin, type Outcome, Shell } from "./describe-native-support.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 
 const describeGit = nativeGitAvailable() && process.platform !== "win32" ? describe : describe.skip;
@@ -329,5 +329,70 @@ describeGit("git name-rev, native twins", () => {
     expect(twin.ours.status).toBe(twin.native.status);
     expect(twin.ours.stdout).toBe(twin.native.stdout);
     expect(twin.ours.stderr.split("\n")[0]).toBe(twin.native.stderr.split("\n")[0]);
+  });
+});
+
+describeGit("git name-rev and describe in a shallow clone, native twins", () => {
+  let dir: string;
+  let bare: string;
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "name-rev-shallow-"));
+    shell = new Shell(root);
+    const src = join(root, "src");
+    shell.ok(root, "init", "-q", "-b", "main", src);
+    shell.commit(src, "--annotate", "base");
+    shell.commit(src, "one");
+    shell.ok(src, "checkout", "-q", "-b", "side", "base");
+    shell.commit(src, "--annotate", "two");
+    shell.ok(src, "checkout", "-q", "main");
+    shell.tick();
+    shell.ok(src, "merge", "-q", "--no-ff", "-m", "merge", "side");
+    shell.commit(src, "--no-tag", "top");
+    // without the tags, the merge's parents are absent
+    bare = join(root, "bare");
+    shell.ok(root, "clone", "-q", "--no-local", "--depth=2", src, bare);
+    dir = join(root, "s");
+    shell.ok(root, "clone", "-q", "--no-local", "--depth=2", src, dir);
+    shell.ok(dir, "fetch", "-q", "--tags", "--depth=2");
+  });
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("name-rev --all lists no parent the shallow boundary cuts off", async () => {
+    const sorted = (s: string) => s.split("\n").sort().join("\n");
+    for (const repo of [dir, bare]) {
+      for (const argv of [["--all"], ["--tags", "--all"]]) {
+        const twin = await nameRevTwin(shell, repo, argv);
+        expect(sorted(twin.ours.stdout)).toBe(sorted(twin.native.stdout));
+        expect(twin.ours.status).toBe(twin.native.status);
+      }
+    }
+    for (const argv of [["--always"], ["--all"], ["--debug", "--always"]]) {
+      const twin = await describeTwin(shell, bare, argv);
+      expect(twin.ours).toEqual(twin.native);
+    }
+  });
+
+  it("name-rev and describe stop at the shallow boundary", async () => {
+    const all = shell.ok(dir, "rev-list", "--all").trim().split("\n");
+    await check(dir, all);
+    await check(dir, ["--tags", ...all]);
+    await check(dir, ["--annotate-stdin"], all.join("\n"));
+    for (const argv of [
+      [],
+      ["--tags"],
+      ["--all"],
+      ["--always"],
+      ["--debug", "--tags"],
+      ["--contains", "HEAD~1"],
+    ]) {
+      const twin = await describeTwin(shell, dir, argv);
+      expect(twin.ours).toEqual(twin.native);
+    }
+    for (const rev of all) {
+      const twin = await describeTwin(shell, dir, ["--tags", "--always", rev]);
+      expect(twin.ours).toEqual(twin.native);
+    }
   });
 });

@@ -357,6 +357,50 @@ describeGit("git describe, native twins (t6120-describe)", () => {
     }
   });
 
+  it("describe --dirty reads submodules as diff-index does: no diff.ignoreSubmodules", async () => {
+    const sub = join(repo, "sub1");
+    const head = shell.ok(sub, "rev-parse", "HEAD").trim();
+    try {
+      // an untracked file in the submodule
+      writeFileSync(join(sub, "untracked"), "u\n");
+      await check(["--dirty", "--tags"]);
+      shell.ok(repo, "config", "diff.ignoreSubmodules", "none");
+      await check(["--dirty", "--tags"]);
+      shell.ok(repo, "config", "--unset", "diff.ignoreSubmodules");
+      for (const value of ["none", "untracked"]) {
+        shell.ok(repo, "config", "submodule.sub1.ignore", value);
+        await check(["--dirty", "--tags"]);
+      }
+      shell.ok(repo, "config", "--unset", "submodule.sub1.ignore");
+      rmSync(join(sub, "untracked"));
+      // a change inside the submodule
+      writeFileSync(join(sub, "initial.t"), "changed\n");
+      shell.ok(repo, "config", "diff.ignoreSubmodules", "all");
+      await check(["--dirty", "--tags"]);
+      shell.ok(repo, "config", "--unset", "diff.ignoreSubmodules");
+      await check(["--dirty", "--tags"]);
+      shell.ok(sub, "checkout", "-q", "--", "initial.t");
+      // a new commit in the submodule
+      shell.commit(sub, "--no-tag", "moved");
+      for (const value of ["all", "dirty", "untracked", "none"]) {
+        shell.ok(repo, "config", "diff.ignoreSubmodules", value);
+        await check(["--dirty", "--tags"]);
+        await check(["--broken", "--tags"]);
+      }
+      shell.ok(repo, "config", "--unset", "diff.ignoreSubmodules");
+      // submodule.<name>.ignore still applies
+      for (const value of ["all", "dirty", "none"]) {
+        shell.ok(repo, "config", "submodule.sub1.ignore", value);
+        await check(["--dirty", "--tags"]);
+      }
+    } finally {
+      shell.git(repo, ["config", "--unset", "diff.ignoreSubmodules"]);
+      shell.git(repo, ["config", "--unset", "submodule.sub1.ignore"]);
+      shell.ok(sub, "reset", "-q", "--hard", head);
+    }
+    await check(["--dirty"]);
+  });
+
   it('t6120-describe.sh: "describe a blob at a directly tagged commit"', async () => {
     writeFileSync(join(repo, "file"), "make it a unique blob\n");
     shell.ok(repo, "add", "file");

@@ -184,10 +184,21 @@ export class HookFailedError extends GitApiError {
 export class DescribeError extends GitApiError {
   /** What git printed on stdout before it died */
   readonly stdout: string;
+  /**
+   * A death saying nothing describes the commit (no names, no tag can describe it, no
+   * exact match, name-rev's `cannot describe`), not a failure of the command itself
+   */
+  readonly undescribable: boolean;
 
-  constructor(message: string, stdout = "", exitCode?: number) {
+  constructor(
+    message: string,
+    stdout = "",
+    exitCode?: number,
+    options: { undescribable?: boolean } = {},
+  ) {
     super(message, exitCode !== undefined ? { exitCode } : undefined);
     this.name = "DescribeError";
     this.stdout = stdout;
+    this.undescribable = options.undescribable ?? false;
   }
 }

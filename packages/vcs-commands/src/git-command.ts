@@ -1501,6 +1501,11 @@ export abstract class GitCommand<T> {
     return entries;
   }
 
+  /** The commits of `.git/shallow` (none in a complete repository). */
+  protected async shallowCommits(): Promise<ObjectId[]> {
+    return (await this.refsStore.getShallow?.().catch(() => undefined)) ?? [];
+  }
+
   /** `id` abbreviated as git prints it, through {@link idAbbreviator}. */
   protected abbreviateObjectId(id: ObjectId): Promise<string> {
     return this.idAbbreviator().abbreviate(id);
