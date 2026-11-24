@@ -17,5 +17,7 @@ export { createInMemoryFilesApi } from "./mem-files-api.js";
 export * from "./mounted-files-api.js";
 // Node.js filesystem: use @statewalker/vcs-utils-node/files
 export * from "./path-utils.js";
+// core.sharedRepository modes (adjust_shared_perm)
+export * from "./shared-perm.js";
 // Portable simulated symbolic links (and modes, case folding) over any FilesApi
 export * from "./symlink-files-api.js";
