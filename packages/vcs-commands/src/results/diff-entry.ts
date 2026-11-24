@@ -101,6 +101,18 @@ export interface DiffEntry {
    * when that commit is the old side's, and no rename pairs with it.
    */
   newIdUnknown?: boolean;
+
+  /**
+   * `git log -L`: the line ranges of the new side the patch is cut to (0-based, end
+   * exclusive, sorted and apart; line-log.c's `line_ranges` of the pair)
+   */
+  lineRanges?: readonly LineRange[];
+}
+
+/** Lines `[start, end)` of a file, 0-based (line-log.c's `struct range`) */
+export interface LineRange {
+  start: number;
+  end: number;
 }
 
 /**

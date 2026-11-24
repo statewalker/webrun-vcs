@@ -370,6 +370,20 @@ export interface LogOutputHost {
       parentStatus?: (string | undefined)[];
     },
   ): Promise<{ paths: number; names: Uint8Array; patch: Uint8Array }>;
+  /**
+   * `git log -L` (2.5x): the commit's pairs that touched the line ranges, through the diff
+   * pipeline with each patch cut to the ranges (line_log_queue_pairs, log_tree_diff_flush)
+   */
+  lineLogDiff?(
+    entry: LogOutputEntry,
+    formats: DiffOutputFormat[],
+    options: { abbrev?: number },
+  ): Promise<{ bytes?: Uint8Array }>;
+  /**
+   * `git log -L` (2.43): line-log's own diff of the commit (dump_diff_hacky), each line after
+   * `prefix`
+   */
+  lineLogHacky?(entry: LogOutputEntry, prefix: string, colors?: DiffColors): Promise<Uint8Array>;
 }
 
 type Fmt = "raw" | "medium" | "short" | "email" | "mboxrd" | "fuller" | "full" | "oneline" | "user";
@@ -874,6 +888,8 @@ export class LogPrinter {
       cherryMark?: boolean;
       /** The colors (`--color`, `color.ui`...), undefined for none */
       colors?: { diff: DiffColors; decorations: DecorationPalette; graph: readonly string[] };
+      /** `-L`: the line-log of that git version prints each commit's diff */
+      lineLog?: "2.43" | "2.56";
     },
   ) {
     const prettyGiven = options.pretty !== undefined || !!options.oneline;
@@ -957,6 +973,8 @@ export class LogPrinter {
       diffMerges = "first-parent";
     }
     if ((implyPatch || mergesNeedDiff) && formats.length === 0) formats.push("patch");
+    // revision.c: -L shows patches unless a format (or -s) is given
+    if (walk.lineLog && formats.length === 0 && !options.noPatch) formats.push("patch");
     // --name-only, --name-status and --check turn the other formats off (diff_setup_done)
     const names = formats.find((f) => f === "name-only" || f === "name-status" || f === "check");
     this.formats = options.noPatch ? [] : names ? [names] : formats;
@@ -981,7 +999,12 @@ export class LogPrinter {
     this.diffFiltered =
       options.diff?.diffFilter !== undefined || (!!options.diff && hasPickaxe(options.diff));
     this.allNeedDiff =
-      userDiff || implyPatch || this.follow || !!options.fullDiff || this.diffFiltered;
+      userDiff ||
+      implyPatch ||
+      this.follow ||
+      !!options.fullDiff ||
+      this.diffFiltered ||
+      (!!walk.lineLog && this.formats.length > 0);
   }
 
   /** `--diff-filter` or a pickaxe (`-S`, `-G`, `--find-object`) given */
@@ -1144,8 +1167,21 @@ export class LogPrinter {
     entry: LogOutputEntry,
     log: { pending: boolean; parent: ObjectId | undefined },
   ): Promise<boolean> {
+    if (this.walk.lineLog === "2.43") {
+      // line_log_print: the log, then line-log's own diff unless -s
+      await this.showLog(entry, log);
+      if (!this.options.noPatch && this.host.lineLogHacky) {
+        this.out.bytes(await this.host.lineLogHacky(entry, this.padding(), this.walk.colors?.diff));
+      }
+      return true;
+    }
     const allNeedDiff = this.allNeedDiff;
     if (!allNeedDiff && !this.mergesNeedDiff) return false;
+    if (this.walk.lineLog) {
+      // log_tree_diff: line_log_queue_pairs, then log_tree_diff_flush
+      await this.diffFlush(entry, undefined, log, undefined, true);
+      return !log.pending;
+    }
     const parents = this.diffParents(entry);
     const isMerge = parents.length > 1;
     if (!isMerge && !allNeedDiff) return false;
@@ -1209,6 +1245,8 @@ export class LogPrinter {
     log: { pending: boolean; parent: ObjectId | undefined },
     /** do_remerge_diff: the diff from these parents' re-merge instead of from `parent` */
     remerge?: [ObjectId, ObjectId],
+    /** `-L`: the commit's pairs cut to the line ranges (line_log_queue_pairs) */
+    lineLog = false,
   ): Promise<void> {
     this.shownDashes = false;
     const width = this.graph ? this.graph.getWidth() : 0;
@@ -1221,13 +1259,15 @@ export class LogPrinter {
     if (remerge && !this.host.remergeDiff) {
       throw new Error("--remerge-diff: the log's host cannot re-merge");
     }
-    const result =
-      remerge && this.host.remergeDiff
-        ? await this.host.remergeDiff(entry, remerge, this.formats, {
-            ...diffOptions,
-            processed: this.processed,
-          })
-        : await this.host.diff(entry, parent, this.formats, diffOptions);
+    const result: { bytes?: Uint8Array; followPath?: string } =
+      lineLog && this.host.lineLogDiff
+        ? await this.host.lineLogDiff(entry, this.formats, this.diffAbbrev())
+        : remerge && this.host.remergeDiff
+          ? await this.host.remergeDiff(entry, remerge, this.formats, {
+              ...diffOptions,
+              processed: this.processed,
+            })
+          : await this.host.diff(entry, parent, this.formats, diffOptions);
     if (this.follow && result.followPath !== undefined) this.followPath = result.followPath;
     if (!result.bytes) return;
     if (log.pending) {

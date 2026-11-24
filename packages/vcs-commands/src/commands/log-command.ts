@@ -29,8 +29,15 @@ import {
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
+import {
+  DEFAULT_RENAME_LIMIT,
+  detectRenames,
+  renameScoreOption,
+  scorePercent,
+} from "../rename/index.js";
 import { type CombinedDiffOptions, writeCombinedDiff } from "../results/combined-diff.js";
 import type { DiffColors } from "../results/diff-color.js";
+import type { DiffEntry } from "../results/diff-entry.js";
 import { DiffPickaxe } from "../results/diff-pickaxe.js";
 import { quotePath } from "../results/quote-path.js";
 import { bareAttributesResolver } from "./attributes-source.js";
@@ -46,8 +53,17 @@ import {
   type DiffOutputFormat,
   type DiffTextOptions,
   hasPickaxe,
+  renamesValue,
 } from "./diff-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import {
+  gitlinkText,
+  type LineLogHost,
+  type LineLogPair,
+  LineLogWalk,
+  lineLogEntry,
+  parseLineRanges,
+} from "./line-log.js";
 import { GRAPH_COLUMN_COLORS_ANSI, graphColumnColors } from "./log-graph.js";
 import {
   type LogOutputEntry,
@@ -153,6 +169,18 @@ async function* reversed<T>(source: AsyncIterable<T>): AsyncIterable<T> {
   const all: T[] = [];
   for await (const item of source) all.push(item);
   for (let i = all.length - 1; i >= 0; i--) yield all[i] as T;
+}
+
+/** A commit's parents as the walk holds them, by id */
+function lineLogParentIds(t: RevTable, n: number): ObjectId[] {
+  const ids: ObjectId[] = [];
+  for (let k = 0, c = t.parentCount(n); k < c; k++) ids.push(t.idOf(t.parent(n, k)));
+  return ids;
+}
+
+/** A death of `git log -L` (`die()`: `fatal:`, exit 128) */
+function lineLogDeath(message: string): GitApiError {
+  return new GitApiError(`fatal: ${message}`).withExitCode(128);
 }
 
 /** git log reads no index: the in-tree attributes files are the worktree's only. */
@@ -370,6 +398,10 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private readonly grepReflogs: string[] = [];
   /** The git version whose behaviour differs where versions differ */
   private compatibility: "2.43" | "2.56" = "2.56";
+  /** `-L` arguments, as given */
+  private readonly lineRangeArgs: string[] = [];
+  /** The ranges `-L` follows through the walk under way */
+  private lineLog?: LineLogWalk;
   /** `--topo-order`, `--date-order`, `--author-date-order` */
   private order?: LogOrder;
   /** `--reverse` */
@@ -669,6 +701,29 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       ...(name !== undefined ? { name } : {}),
       ...(options.left ? { left: true } : {}),
     });
+    return this;
+  }
+
+  /**
+   * `-L <start>,<end>:<file>` / `-L :<funcname>:<file>`: follow lines of a file back through
+   * history ({@link callBytes} only). The range is given as git takes it: `<start>` and
+   * `<end>` line numbers, `+<n>`/`-<n>` offsets, `/<regex>/` (searched from the previous
+   * range of the file, or the top with `^/<regex>/`), or `:<regex>` naming a function as the
+   * path's diff driver finds them (`diff.<driver>.xfuncname`, the builtin drivers). Each
+   * commit whose change touches the lines is shown with its diff cut to them; renames are
+   * followed (`diff.renames`, `-M`). Several ranges, of one file or several, are followed
+   * together. The log starts from one commit (HEAD by default), and paths cannot be given.
+   * Errors are git's deaths (`fatal: ...`, exit 128).
+   *
+   * @example
+   * ```typescript
+   * // git log -L 4,12:a.c -L :main:a.c
+   * await git.log().addLineRange("4,12:a.c").addLineRange(":main:a.c").callText();
+   * ```
+   */
+  addLineRange(range: string): this {
+    this.checkCallable();
+    this.lineRangeArgs.push(range);
     return this;
   }
 
@@ -1114,6 +1169,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     if (this.startCommits.length === 0 && !this.includeAll) {
       pending.push({ id: await this.resolveHead(), exclude: false, name: "HEAD" });
     }
+    if (this.lineRangeArgs.length > 0) await this.startLineLog(pending);
     const walk = this.walk(pending);
     return this.reverse ? reversed(walk) : walk;
   }
@@ -1535,6 +1591,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     // --ancestry-path and --simplify-merges limit the walk too (--parents does not: a
     // streaming walk rewrites parents as it goes)
     let limited =
+      !!this.lineLog ||
       this.cherryPick ||
       this.cherryMark ||
       (this.compatibility !== "2.43" && (this.leftOnly || this.rightOnly)) ||
@@ -1965,7 +2022,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           if (slop) continue;
           break;
         }
-        if (this.untilTime !== undefined && t.date(n) > this.untilTime) continue;
+        // -L: every commit is followed, --until hides it when shown (get_commit_action)
+        if (this.untilTime !== undefined && t.date(n) > this.untilTime && !this.lineLog) continue;
         date = t.date(n);
         newlist.push(n);
       }
@@ -1987,6 +2045,42 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         }
       }
       raw.clear();
+      if (this.lineLog) {
+        // -L sorts topologically (revs->topo_order), children before parents
+        const sorted = await sortTopo(newlist, order ?? "topo");
+        const lineOutput = output ?? { topo: true, rewrite: false, entries: [] };
+        if (wantAncestry) {
+          // want_ancestry (`--graph`, `--parents`, `--simplify-merges`,
+          // `--simplify-by-decoration`): line_log_filter with its own parent rewriting, then
+          // simplify_merges (which does nothing without prune: `-L` alone has none,
+          // `--simplify-by-decoration` prunes), then get_commit_action and rewrite_parents
+          const filtered = await this.lineLogFilter(t, sorted);
+          const kept =
+            simplifyMerges && prune ? await simplifyMergesOf(filtered.kept) : filtered.kept;
+          await this.finishOutputWalk(lineOutput, t, kept, shown, relevant, parse, {
+            ancestry: wantAncestry,
+            rewrite,
+          });
+          for (const p of filtered.unwalked) {
+            if (t.flag(p) & SEEN || !(await parse(p)) || !(await shown(p))) continue;
+            lineOutput.unwalkedShown ??= new Set();
+            lineOutput.unwalkedShown.add(t.idOf(p));
+          }
+        } else await this.finishLineLogWalk(lineOutput, t, sorted, shown);
+        if (!output) {
+          let count = 0;
+          let toSkip = this.skip;
+          for (const e of lineOutput.entries) {
+            if (toSkip > 0) {
+              toSkip--;
+              continue;
+            }
+            yield { ...e.commit, id: e.id, parents: e.parents };
+            if (this.maxCount !== undefined && ++count >= this.maxCount) break;
+          }
+        }
+        return;
+      }
       let sorted = output
         ? output.topo
           ? await sortTopo(newlist, order ?? "topo")
@@ -2135,6 +2229,268 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
+   * line-log.c's line_log_init: the one commit the log starts from (check_single_commit),
+   * the `-L` ranges parsed against it, and the walk that follows them
+   */
+  private async startLineLog(pending: PendingCommit[]): Promise<void> {
+    let found: PendingCommit | undefined;
+    for (const e of pending) {
+      if (e.exclude) continue;
+      const name = e.name ?? e.id;
+      if (!(await this.readCommitHeader(e.id).catch(() => undefined))) {
+        throw lineLogDeath(`Non commit ${name}?`);
+      }
+      if (found) {
+        throw lineLogDeath(
+          `More than one commit to dig from: ${name} and ${found.name ?? found.id}?`,
+        );
+      }
+      found = e;
+    }
+    if (!found) throw lineLogDeath("No commit specified?");
+    const host = this.lineLogHost();
+    const tree = await host.treeOf(found.id);
+    const drivers = new DiffCommand(this._workingCopy)
+      .setOldTree(tree)
+      .setNewTree(tree)
+      .shareReadsOf(this)
+      .setOptions(this.lineLogDiffOptions());
+    const ranges = await parseLineRanges(this.lineRangeArgs, {
+      blob: async (path) => {
+        const e = await this.treeEntryAt(tree, path);
+        if (!e) return undefined;
+        // a submodule reads as its commit line (diff_populate_filespec)
+        if ((e.mode & 0o170000) === 0o160000) return { ...e, data: gitlinkText(e.id) };
+        const data = await this.readBlob(e.id);
+        if (!data) throw lineLogDeath(`Cannot read blob ${e.id}`);
+        return { ...e, data };
+      },
+      findFunction: async (path) => (await drivers.driverOf(path))?.findFunction,
+    });
+    this.lineLog = new LineLogWalk(host, this.compatibility, this.firstParentOnly);
+    this.lineLog.start(found.id, ranges);
+  }
+
+  /** The diff options of `-L`'s diffs: the builtin drivers of the version followed */
+  private lineLogDiffOptions(): DiffTextOptions {
+    return {
+      ...this.diffOptions,
+      driverCompatibility: this.diffOptions.driverCompatibility ?? this.compatibility,
+    };
+  }
+
+  /** The entry at a path of a tree (its mode canonical), undefined when none */
+  private async treeEntryAt(
+    tree: ObjectId,
+    path: string,
+  ): Promise<{ id: ObjectId; mode: number } | undefined> {
+    const parts = path.split("/");
+    let cur = tree;
+    for (let i = 0; i < parts.length; i++) {
+      const e = await this.entryOf(cur, encodeGitPath(parts[i] as string));
+      if (!e) return undefined;
+      if (i === parts.length - 1) return { id: e.id, mode: canonTreeMode(e.mode) };
+      if (!isTreeMode(e.mode)) return undefined;
+      cur = e.id;
+    }
+    return undefined;
+  }
+
+  /** What `-L`'s walk reads: trees, entries, blobs, and renames as queue_diffs finds them */
+  private lineLogHost(): LineLogHost {
+    const o = this.diffOptions;
+    let detect =
+      o.findRenames !== undefined
+        ? o.findRenames !== false
+        : (renamesValue(configValue(this.workingCopy, "diff.renames")) ?? true) !== false;
+    if (o.findCopies !== undefined && o.findCopies !== false) detect = true;
+    const score =
+      typeof o.findRenames === "string"
+        ? renameScoreOption(o.findRenames, "find-renames")
+        : undefined;
+    const limit = Number(configValue(this.workingCopy, "diff.renameLimit"));
+    const renameLimit =
+      Number.isFinite(limit) && configValue(this.workingCopy, "diff.renameLimit") !== undefined
+        ? limit
+        : DEFAULT_RENAME_LIMIT;
+    const blob = async (id: ObjectId): Promise<Uint8Array> => {
+      const data = await this.readBlob(id);
+      if (!data) throw lineLogDeath(`Cannot read blob ${id}`);
+      return data;
+    };
+    return {
+      treeOf: async (id) => {
+        const header = await this.readCommitHeader(id, await this.objectReplacements());
+        if (!header) throw new GitApiError(`could not parse commit ${id}`);
+        return header.tree;
+      },
+      entry: (tree, path) => this.treeEntryAt(tree, path),
+      blob,
+      ...(hasPickaxe(o) || o.diffFilter !== undefined
+        ? {
+            diffcore: async (pairs: LineLogPair[]) => {
+              const entries = new Map<DiffEntry, LineLogPair>();
+              for (const pair of pairs) entries.set(lineLogEntry(pair), pair);
+              const kept = await new DiffCommand(this._workingCopy)
+                .shareReadsOf(this)
+                .setOptions(this.lineLogDiffOptions())
+                .filterQueue([...entries.keys()]);
+              const out: LineLogPair[] = [];
+              for (const e of kept) {
+                const pair = entries.get(e) ?? pairs.find((p) => p.two.path === e.newPath);
+                if (pair) out.push(pair);
+              }
+              return out;
+            },
+          }
+        : {}),
+      ...(detect
+        ? {
+            renames: async (
+              parentTree: ObjectId,
+              tree: ObjectId,
+              created: { path: string; id: ObjectId; mode: number }[],
+            ) => {
+              const before = await this.flatTree(parentTree);
+              const after = await this.flatTree(tree);
+              const sources = [...before]
+                .filter(([path]) => !after.has(path))
+                .map(([path, e]) => ({ path, mode: e.mode, id: e.id }));
+              if (sources.length === 0) return [];
+              const pairs = await detectRenames(
+                sources,
+                created.map((c) => ({ path: c.path, mode: c.mode, id: c.id })),
+                {
+                  load: async (c) =>
+                    (c.mode & 0o170000) === 0o160000 ? gitlinkText(c.id) : blob(c.id),
+                  renameLimit,
+                  ...(score !== undefined ? { minimumScore: score } : {}),
+                },
+              );
+              const out: {
+                from: { path: string; id: ObjectId; mode: number };
+                to: string;
+                score: number;
+              }[] = [];
+              for (const pair of pairs) {
+                const from = before.get(pair.from);
+                if (!from) continue;
+                out.push({
+                  from: { path: pair.from, id: from.id, mode: canonTreeMode(from.mode) },
+                  to: pair.to,
+                  score: scorePercent(pair.score),
+                });
+              }
+              return out;
+            },
+          }
+        : {}),
+    };
+  }
+
+  /**
+   * The walk's commits under `-L` without parents rewritten, sorted topologically: each
+   * followed in turn (git's simplify_commit), shown when its diff touched the ranges and the
+   * other filters keep it, with the parents a merge kept (one when a parent took it all).
+   */
+  private async finishLineLogWalk(
+    output: OutputWalk,
+    t: RevTable,
+    order: number[],
+    shown: (n: number, ancestry?: boolean) => Promise<LogResult | undefined>,
+  ): Promise<void> {
+    const ll = this.lineLog as LineLogWalk;
+    for (const n of order) {
+      const id = t.idOf(n);
+      if (!(await ll.process(id, lineLogParentIds(t, n)))) continue;
+      const commit = await shown(n);
+      if (!commit) continue;
+      const { id: _id, source, boundary: _boundary, left, patchSame, ...rest } = commit;
+      output.entries.push({
+        id,
+        commit: rest,
+        parents: ll.parentsOf(id) ?? commit.parents,
+        ...(source !== undefined ? { source } : {}),
+        ...(left ? { left } : {}),
+        ...(patchSame ? { patchSame } : {}),
+      });
+    }
+  }
+
+  /**
+   * line-log.c's line_log_filter: every commit of the sorted list followed, those whose diff
+   * touched no range marked TREESAME (a merge one parent took whole left with that parent),
+   * the others kept with their parents rewritten past TREESAME commits
+   * (line_log_rewrite_one); `unwalked` the parents rewritten to that the walk never reached
+   */
+  private async lineLogFilter(
+    t: RevTable,
+    order: number[],
+  ): Promise<{ kept: number[]; unwalked: Set<number> }> {
+    const ll = this.lineLog as LineLogWalk;
+    const kept: number[] = [];
+    for (const n of order) {
+      const id = t.idOf(n);
+      if (await ll.process(id, lineLogParentIds(t, n))) kept.push(n);
+      else t.mark(n, TREESAME);
+      const narrowed = ll.parentsOf(id);
+      if (narrowed)
+        t.setParentList(
+          n,
+          narrowed.map((p) => t.lookup(p)),
+        );
+    }
+    /** line_log_rewrite_one */
+    const rewriteOne = (start: number): number | undefined => {
+      let p = start;
+      for (;;) {
+        const parents = t.parsed(p) ? t.parentList(p) : [];
+        if (parents.length > 1 || t.flag(p) & UNINTERESTING || !(t.flag(p) & TREESAME)) return p;
+        if (parents.length === 0) return undefined;
+        p = parents[0] as number;
+      }
+    };
+    const unwalked = new Set<number>();
+    for (const n of kept) {
+      const rewritten: number[] = [];
+      for (const q of t.parentList(n)) {
+        const p = rewriteOne(q);
+        if (p === undefined) continue;
+        if (!(t.flag(p) & SEEN)) unwalked.add(p);
+        if (!rewritten.includes(p)) rewritten.push(p);
+      }
+      t.setParentList(n, rewritten);
+    }
+    return { kept, unwalked };
+  }
+
+  /**
+   * setup_revisions' and cmd_log_init_finish's refusals of `-L`: the diff formats it cannot
+   * show (2.43: anything but `-p` and `-s`), then a pathspec
+   */
+  private checkLineLogOptions(options: LogOutputOptions): void {
+    const o = options;
+    if (this.compatibility === "2.43") {
+      if (
+        o.stat ||
+        o.shortstat ||
+        o.numstat ||
+        o.nameOnly ||
+        o.nameStatus ||
+        o.summary ||
+        o.check
+      ) {
+        throw lineLogDeath("-L does not yet support diff formats besides -p and -s");
+      }
+    } else if (o.stat || o.shortstat || o.numstat || o.check || o.fullDiff) {
+      throw lineLogDeath("-L does not yet support the requested diff format");
+    }
+    if (this.paths.length > 0 || this.excludePaths.length > 0) {
+      throw lineLogDeath("-L<range>:<file> cannot be used with pathspec");
+    }
+  }
+
+  /**
    * The log printed as `git log <options>` prints it to a pipe (no pager; colors only when
    * `setDiffOptions({ color })` or `color.ui`/`color.diff` say `always`): the
    * walk set up by this command (start points, ranges, paths, `-n`, `--skip`, filters), each
@@ -2184,6 +2540,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const colors = this.readColors();
     const host = this.outputHost(options);
     const paths = [...this.paths];
+    // -L: the walk is sorted, its commits followed before the first is shown
+    const lineLog = this.lineRangeArgs.length > 0;
     // the pathspec as git holds it: the excluded paths as `:(exclude)` elements, `.` when
     // every element excludes
     const pathspec = [...paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
@@ -2197,12 +2555,14 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         paths: pathspec,
         ...this.revisionMarks(),
         ...(colors ? { colors } : {}),
+        ...(lineLog ? { lineLog: this.compatibility } : {}),
       },
     );
+    if (lineLog) this.checkLineLogOptions(options);
     const follow = printer.followsPath;
     const countsShown = !printer.alwaysShowHeader;
     const graph = !!options.graph;
-    const topo = graph;
+    const topo = graph || lineLog;
     const boundary = !!options.boundary || this.boundary;
     if (graph && boundary) {
       // graph.c draws boundary commits as `o` in columns of their own: not reproduced
@@ -2755,6 +3115,25 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         );
       },
       combinedDiff: (entry, options) => this.combinedDiff(entry, options),
+      lineLogDiff: async (entry, formats, options) => {
+        const lineLog = this.lineLog;
+        if (!lineLog) return {};
+        const tree = entry.commit.tree;
+        const diff = new DiffCommand(this._workingCopy)
+          .setOldTree(tree)
+          .setNewTree(tree)
+          .setRotateStrict(false)
+          .shareReadsOf(this)
+          .setQueue(lineLog.queuedPairs(entry.id));
+        if (this.colorSettings) diff.setColorSettings(this.colorSettings);
+        diff.setOptions({
+          ...this.lineLogDiffOptions(),
+          ...(options.abbrev !== undefined ? { abbrev: options.abbrev } : {}),
+        });
+        return diff.callFormats(formats);
+      },
+      lineLogHacky: async (entry, prefix, colors) =>
+        this.lineLog ? this.lineLog.hackyDiff(entry.id, prefix, colors) : new Uint8Array(0),
     };
   }
 
