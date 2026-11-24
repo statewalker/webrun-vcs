@@ -43,6 +43,13 @@ export interface WorktreeWalkOptions {
   pathPrefix?: string;
   /** Custom ignore patterns (in addition to .gitignore) */
   ignorePatterns?: string[];
+  /**
+   * Exclude rules given on the command line (git's `EXC_CMDL`: `git clean -e <pattern>`),
+   * for this walk only: asked before the `.gitignore` files and exclude files, each pattern
+   * taken whole (`createCommandLineExcludes`), so `!x` re-includes what they ignore and a
+   * directory they exclude excludes everything in it.
+   */
+  excludePatterns?: readonly string[];
   /** Maximum depth to traverse (undefined = unlimited) */
   maxDepth?: number;
   /**

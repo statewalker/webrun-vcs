@@ -365,9 +365,11 @@ export interface Staging {
 
   /**
    * How the index file was last read or written: split (`link`), sparse (`sdir`). The entries
-   * are always held merged and expanded. Absent: a staging with no index file.
+   * are always held merged and expanded; `sparseDirectories` names the sparse directory
+   * entries a sparse index held (`out/`, what git's commands see before they expand it).
+   * Absent: a staging with no index file.
    */
-  indexLayout?(): { split: boolean; sparse: boolean };
+  indexLayout?(): { split: boolean; sparse: boolean; sparseDirectories?: readonly string[] };
 
   /**
    * Holds back `write()` until the returned function is called, which then writes once if

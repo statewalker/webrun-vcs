@@ -660,8 +660,13 @@ export class FileStagingStore implements Staging {
     return this.indexFile.getHost();
   }
 
-  indexLayout(): { split: boolean; sparse: boolean } {
-    return { split: this.indexFile.isSplit, sparse: this.indexFile.isSparse };
+  indexLayout(): { split: boolean; sparse: boolean; sparseDirectories?: readonly string[] } {
+    const sparseDirectories = this.indexFile.sparseDirectories;
+    return {
+      split: this.indexFile.isSplit,
+      sparse: this.indexFile.isSparse,
+      ...(sparseDirectories ? { sparseDirectories } : {}),
+    };
   }
 
   /** The index file's own mtime (0 when unknown: every entry is then racy). */

@@ -137,18 +137,21 @@ export interface IgnoreManager {
    *
    * @param path Path relative to repository root
    * @param isDirectory Whether the path is a directory
+   * @param commandLine Rules given on the command line (git's `EXC_CMDL`, `git clean -e`):
+   *   asked before every other source, for this check only
    * @returns true if the path should be ignored
    */
-  isIgnored(path: string, isDirectory: boolean): boolean;
+  isIgnored(path: string, isDirectory: boolean, commandLine?: IgnoreNode): boolean;
 
   /**
    * Get detailed ignore status for a path.
    *
    * @param path Path relative to repository root
    * @param isDirectory Whether the path is a directory
+   * @param commandLine Rules given on the command line, asked first (see {@link isIgnored})
    * @returns Match result with full status
    */
-  getStatus(path: string, isDirectory: boolean): MatchResultValue;
+  getStatus(path: string, isDirectory: boolean, commandLine?: IgnoreNode): MatchResultValue;
 
   /**
    * Add ignore patterns from a gitignore file at a specific path.

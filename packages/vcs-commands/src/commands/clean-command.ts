@@ -1,6 +1,8 @@
 import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
 import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
+  commandLineExcluded,
+  createCommandLineExcludes,
   IndexPathLookup,
   unreadableDirectoryWarning,
   type Worktree,
@@ -84,6 +86,7 @@ export class CleanCommand extends GitCommand<CleanResult> {
   private ignore = true; // Respect .gitignore
   private ignoredOnly = false;
   private forceNested = false;
+  private excludePatterns: string[] = [];
 
   /**
    * Limit clean to specific paths.
@@ -163,6 +166,22 @@ export class CleanCommand extends GitCommand<CleanResult> {
   }
 
   /**
+   * `-e <pattern>` / `--exclude=<pattern>`, once per pattern: ignore rules added on top of the
+   * standard ones (git's `add_pattern` into an `EXC_CMDL` list, asked before `.gitignore`,
+   * `info/exclude` and `core.excludesFile`), so a path they exclude is kept as an ignored one
+   * (`!<pattern>` re-includes what the standard rules ignore). They apply with
+   * {@link setIgnore}(false) (`-x`) too, where they are the only rules, and with
+   * {@link setIgnoredOnly} (`-X`) what they exclude is removed.
+   *
+   * @param patterns The patterns, in command-line order (later ones win)
+   */
+  setExcludePatterns(patterns: readonly string[]): this {
+    this.checkCallable();
+    this.excludePatterns = [...patterns];
+    return this;
+  }
+
+  /**
    * Execute the clean command, as `git clean -f` (`-d` with `setCleanDirectories(true)`,
    * `-x` with `setIgnore(false)`, `-X` with `setIgnoredOnly(true)`, `-ff` with
    * `setForceNestedRepositories(true)`, `-n` with dry run, path filters as git's
@@ -225,8 +244,8 @@ export class CleanCommand extends GitCommand<CleanResult> {
       tracked,
       index,
       pathspec,
-      // -x: no ignore rules at all (git does not set up the standard excludes)
-      excludes: this.ignoredOnly || this.ignore,
+      // -x: no standard ignore rules (git does not set them up), only the -e ones
+      excludes: this.ignoredOnly || this.ignore || this.excludePatterns.length > 0,
       showIgnored: this.ignoredOnly,
       showIgnoredToo: removeDirectories && !this.ignoredOnly,
       modeMatching: removeDirectories && !this.ignoredOnly && this.ignore,
@@ -277,8 +296,18 @@ export class CleanCommand extends GitCommand<CleanResult> {
       return made;
     };
     const unreadable = new Map<string, unknown>();
+    // -e: EXC_CMDL rules, asked by the walk before the standard ones, or alone under -x
+    const standard = this.ignoredOnly || this.ignore;
+    const commandLine =
+      !standard && this.excludePatterns.length > 0
+        ? createCommandLineExcludes(this.excludePatterns)
+        : undefined;
+    const ignoreCase = coreBool(this.workingCopy, "ignorecase", false);
     const load = async (pathPrefix?: string) => {
       for await (const entry of worktree.walk({
+        ...(standard && this.excludePatterns.length > 0
+          ? { excludePatterns: this.excludePatterns }
+          : {}),
         includeIgnored: true,
         includeDirectories: true,
         enterNonRepositoryGitDirs: true,
@@ -290,7 +319,9 @@ export class CleanCommand extends GitCommand<CleanResult> {
         // ours to look at
         if (!parent?.directory || (parent.repository && !parent.entered)) continue;
         const n = node(entry.path, entry.isDirectory);
-        n.ignored = entry.isIgnored === true;
+        n.ignored = commandLine
+          ? commandLineExcluded(commandLine, entry.path, entry.isDirectory, ignoreCase)
+          : entry.isIgnored === true;
         n.tracked = index.has(entry.path);
         n.gitDir = entry.name === ".git" || parent.gitDir;
         if (entry.isDirectory && entry.mode === FileMode.GITLINK) {
