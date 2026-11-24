@@ -34,6 +34,7 @@ import {
   textToLatin1,
 } from "../apply/latin1.js";
 import { coreBool } from "../core-config.js";
+import { DiffCommand } from "../diff-command.js";
 import { localTimezoneOffset, parseGitDate } from "../git-date.js";
 import { withoutCrud } from "../git-ident.js";
 import { configValue, conflictStyleOf } from "../merge-config.js";
@@ -196,6 +197,8 @@ export class AmCommand extends GitCommand<AmResult> {
   private emptyMode: "stop" | "drop" | "keep" = "stop";
   private applyOptions: AmApplyOptions = {};
   private legacyMessages = false;
+  private interactive?: AmInteractiveReader;
+  private editor?: AmMessageEditor;
   private out = "";
   private err = "";
 
@@ -386,6 +389,100 @@ export class AmCommand extends GitCommand<AmResult> {
     return this;
   }
 
+  /**
+   * `git am -i` (`--interactive`): before each patch is applied (and before a resolved one
+   * is committed), builtin/am.c's `do_interactive` shows its message and asks "Apply?
+   * [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all: ". `reader` answers each such read of
+   * standard input with the line typed (only its first letter counts, either case; others
+   * ask again), or undefined at the end of input, which stops the am as git dies ("unable to
+   * read from stdin; aborting"). `y` applies, `n` skips the patch, `a` applies this one and
+   * the rest without asking, `e` hands `final-commit` to {@link setEditor} and asks again
+   * with its result, `v` prints the patch (`rebase-apply/patch`, as git's pager shows it).
+   * Give it again with `setResume("continue")` to be asked about a resolved patch (git's
+   * `am -i --resolved`, which shows the index's diff from HEAD as the patch).
+   *
+   * @example
+   * ```typescript
+   * const answers = ["y", "n"];
+   * const { output } = await git.am().addMbox(mbox, "mbox")
+   *   .setInteractive(() => answers.shift()).call();
+   * ```
+   */
+  setInteractive(reader: AmInteractiveReader | undefined): this {
+    this.checkCallable();
+    this.interactive = reader;
+    return this;
+  }
+
+  /**
+   * The editor of `git am -i`'s `e`: given the path of `final-commit` and the message, the
+   * edited message (taken as it stands), or undefined when it failed (the message is kept).
+   */
+  setEditor(editor: AmMessageEditor): this {
+    this.checkCallable();
+    this.editor = editor;
+    return this;
+  }
+
+  /**
+   * `do_interactive`: true when the patch is to be skipped (`n`); `a` turns the questions
+   * off for the rest of this run.
+   */
+  private async doInteractive(st: AmState): Promise<boolean> {
+    const reader = this.interactive as AmInteractiveReader;
+    for (;;) {
+      this.out += `Commit Body is:\n--------------------------\n${st.msg ?? ""}--------------------------\n`;
+      const prompt = "Apply? [y]es/[n]o/[e]dit/[v]iew patch/[a]ccept all: ";
+      this.out += prompt;
+      const reply = await reader({
+        prompt,
+        message: latin1ToText(st.msg ?? ""),
+        output: latin1ToText(this.out),
+      });
+      if (reply === undefined) this.fatal("unable to read from stdin; aborting");
+      const c = reply.charAt(0).toLowerCase();
+      if (c === "y") return false;
+      if (c === "a") {
+        this.interactive = undefined;
+        return false;
+      }
+      if (c === "n") return true;
+      if (c === "e") {
+        if (!this.editor) continue;
+        const path = await this.hooks.gitPath(`${DIR}/final-commit`);
+        const edited = await this.editor(
+          path,
+          latin1ToText((await this.read("final-commit")) ?? ""),
+        );
+        if (edited !== undefined) {
+          const text = textToLatin1(edited);
+          await this.write("final-commit", text);
+          st.msg = text;
+        }
+      } else if (c === "v") {
+        this.out += (await this.read("patch")) ?? "";
+      }
+    }
+  }
+
+  /** `write_index_patch`: the index's diff from HEAD's tree into `patch`. */
+  private async writeIndexPatch(): Promise<void> {
+    const head = await this.headId();
+    const diff = new DiffCommand(this.workingCopy)
+      .setCached(true)
+      .setOldTree(head ?? this.objectFormat.emptyTreeId)
+      .setRenames(false)
+      .setOptions({
+        defaultPrefix: true,
+        ignoreConfigNoPrefix: true,
+        textconv: false,
+        uiConfig: false,
+        submoduleFormat: "short",
+        orderFile: "",
+      });
+    await this.write("patch", bytesToLatin1(await diff.callBytes("patch")));
+  }
+
   private state(): OperationState {
     return new OperationState(this.workingCopy.checkout, this.refsStore);
   }
@@ -472,6 +569,9 @@ export class AmCommand extends GitCommand<AmResult> {
       this.fatal(`Stray .git/${DIR} directory found.\nUse "git am --abort" to remove it.`);
     }
     if (this.resume) this.fatal("Resolve operation not in progress, we are not resuming.");
+    if (this.interactive && !this.mboxes.length) {
+      this.fatal("interactive mode requires patches on the command line");
+    }
     return this.setup();
   }
 
@@ -676,13 +776,14 @@ export class AmCommand extends GitCommand<AmResult> {
       (await this.patchIsEmpty()) &&
       (await this.indexHasChanges()).length === 0;
     if (bool("advice.mergeConflict") === false && !this.legacyMessages) throw new AmStop(128);
+    const cmd = this.interactive ? "git am -i" : "git am";
     const lines = [
-      'When you have resolved this problem, run "git am --continue".',
-      'If you prefer to skip this patch, run "git am --skip" instead.',
+      `When you have resolved this problem, run "${cmd} --continue".`,
+      `If you prefer to skip this patch, run "${cmd} --skip" instead.`,
       ...(patchEmptyAndClean
-        ? ['To record the empty patch as an empty commit, run "git am --allow-empty".']
+        ? [`To record the empty patch as an empty commit, run "${cmd} --allow-empty".`]
         : []),
-      'To restore the original branch and stop patching, run "git am --abort".',
+      `To restore the original branch and stop patching, run "${cmd} --abort".`,
     ];
     if (this.legacyMessages) this.out += `${lines.join("\n")}\n`;
     else {
@@ -758,6 +859,11 @@ export class AmCommand extends GitCommand<AmResult> {
           `GIT_AUTHOR_NAME=${sqQuote(mi.author)}\nGIT_AUTHOR_EMAIL=${sqQuote(mi.email)}\nGIT_AUTHOR_DATE=${sqQuote(mi.date)}\n`,
         );
         await this.write("final-commit", msg);
+      }
+      if (this.interactive && (await this.doInteractive(st))) {
+        await this.next(st);
+        resume = false;
+        continue;
       }
       let msg = st.msg as string;
       let toKeep = false;
@@ -1182,6 +1288,13 @@ export class AmCommand extends GitCommand<AmResult> {
         "You still have unmerged paths in your index.\nYou should 'git add' each file with resolved conflicts to mark them as such.\nYou might run `git rm` on a file to accept \"deleted by them\" for it.\n";
       await this.dieUserResolve();
     }
+    if (this.interactive) {
+      await this.writeIndexPatch();
+      if (await this.doInteractive(st)) {
+        await this.next(st);
+        return this.amRun(await this.load(), false);
+      }
+    }
     await this.doCommit(st);
     await this.next(st);
     return this.amRun(await this.load(), false);
@@ -1243,6 +1356,27 @@ export class AmCommand extends GitCommand<AmResult> {
     };
   }
 }
+
+/** A read of `git am -i`'s "Apply?" prompt (see `AmCommand.setInteractive`). */
+export interface AmInteractiveRequest {
+  /** The prompt as git prints it */
+  prompt: string;
+  /** The commit message shown ("Commit Body is:") */
+  message: string;
+  /** What `git am` printed so far on standard output */
+  output: string;
+}
+
+/** Answers `git am -i`'s question: the line typed, or undefined at the end of input. */
+export type AmInteractiveReader = (
+  request: AmInteractiveRequest,
+) => string | undefined | Promise<string | undefined>;
+
+/** The editor of `git am -i`'s `e`: the edited message, or undefined when it failed. */
+export type AmMessageEditor = (
+  path: string,
+  message: string,
+) => string | undefined | Promise<string | undefined>;
 
 interface AmState {
   cur: number;

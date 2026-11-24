@@ -64,6 +64,14 @@ export type PatchRequest =
       prompt: string;
     }
   | {
+      /** A line of free text: `git clean -i`'s "Input ignore patterns>> " */
+      type: "line";
+      /** The prompt as git prints it */
+      prompt: string;
+      /** What git would have printed so far */
+      output: string;
+    }
+  | {
       /**
        * `git add -i`'s menus (add-interactive.c's `list_and_choose`): the main loop's
        * "What now> " (one item), or a selection of files ("Update>> ", "Revert>> ", "Add
