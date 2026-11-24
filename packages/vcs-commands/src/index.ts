@@ -11,6 +11,7 @@ export * from "./errors/index.js";
 export { Git, type GitOptions } from "./git.js";
 // Base classes
 export { GitCommand } from "./git-command.js";
+export { GuardedTransportCommand } from "./guarded-transport-command.js";
 // Results
 export * from "./results/index.js";
 export { TransportCommand } from "./transport-command.js";
