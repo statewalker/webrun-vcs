@@ -52,6 +52,8 @@ describeGit("pull writes the worktree as native git", () => {
     gitOk(root, work, "commit", "-q", "-m", "upstream");
     gitOk(root, work, "push", "-q", src, "main");
     gitOk(root, ours, "config", "remote.origin.url", URL);
+    // divergent branches need a choice (native git also gets `-c pull.rebase=...`)
+    for (const dir of [native, ours]) gitOk(root, dir, "config", "pull.rebase", "false");
     return { native, ours };
   }
 
