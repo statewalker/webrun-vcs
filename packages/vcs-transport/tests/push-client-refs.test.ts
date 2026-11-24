@@ -161,6 +161,67 @@ describe("matchPushRefs: refspecs as git push maps them", () => {
   });
 });
 
+describe("matchPushRefs --follow-tags: remote.c's add_missing_tags", () => {
+  // history: R <- A; B unrelated; T tags A, U tags B, `light` is a lightweight tag at A,
+  // V a tag the remote has already
+  const U = oid("8");
+  const V = oid("d");
+  const tagRefs = new Map([
+    ["refs/heads/main", A],
+    ["refs/heads/topic", B],
+    ["refs/tags/v1", T],
+    ["refs/tags/u", U],
+    ["refs/tags/light", A],
+    ["refs/tags/v0", V],
+  ]);
+  const peeled = new Map([
+    [T, A],
+    [U, B],
+    [V, A],
+  ]);
+  const followTags = {
+    isTag: async (o: string) => peeled.has(o),
+    peelToCommit: async (o: string) => peeled.get(o) ?? ([A, B, R].includes(o) ? o : undefined),
+    reachableSubset: async (tips: readonly string[], commits: readonly string[]) => {
+      const reach = new Set<string>();
+      for (const tip of tips) {
+        reach.add(tip);
+        if (tip === A) reach.add(R);
+      }
+      return new Set(commits.filter((c) => reach.has(c)));
+    },
+  };
+  const run = (specs: string[], remoteRefs: { name: string; oid: string }[]) =>
+    matchPushRefs(
+      specs,
+      { refs: tagRefs, head: { target: "refs/heads/main", oid: A } },
+      remoteRefs,
+      {
+        followTags,
+      },
+    );
+
+  it("adds the annotated tags the pushed values reach, not lightweight ones nor those the remote has", async () => {
+    const m = await run(["main"], [{ name: "refs/tags/v0", oid: V }]);
+    expect(m.map((x) => x.remoteRef)).toEqual(["refs/heads/main", "refs/tags/v1"]);
+    expect(m[1]).toMatchObject({
+      localRef: "refs/tags/v1",
+      newOid: T,
+      oldOid: ZERO_OID,
+      force: false,
+    });
+  });
+  it("counts the remote's refs that are not pushed as tips", async () => {
+    const m = await run(["main"], [{ name: "refs/heads/topic", oid: B }]);
+    expect(m.map((x) => x.remoteRef).sort()).toEqual([
+      "refs/heads/main",
+      "refs/tags/u",
+      "refs/tags/v0",
+      "refs/tags/v1",
+    ]);
+  });
+});
+
 describe("setPushStatus: git's per-ref rules", () => {
   // history: R <- A (A fast-forwards R); X is unrelated; TREE is no commit; G is not here
   const X = oid("9");
@@ -293,6 +354,25 @@ describe("setPushStatus: git's per-ref rules", () => {
     it("a lease on a tag lets it move", async () => {
       const [u] = await setPushStatus([m("refs/tags/v1", R, A)], objects, lease("refs/tags/v1", R));
       expect(u?.status).toBe("ok");
+    });
+    it("--force-if-includes: a holding lease whose remote value no reflog entry includes is refused", async () => {
+      const [u] = await setPushStatus([m("refs/heads/main", A, X)], objects, {
+        ...lease("refs/heads/main", A),
+        unreachable: new Set(["refs/heads/main"]),
+      });
+      expect(u?.status).toBe("rejected-remote-updated");
+      expect(u?.summary).toBe("[rejected] (remote ref updated since checkout)");
+    });
+    it("--force-if-includes: a stale lease stays stale, --force overrides", async () => {
+      const options = { ...lease("refs/heads/main", R), unreachable: new Set(["refs/heads/main"]) };
+      const [stale] = await setPushStatus([m("refs/heads/main", A, X)], objects, options);
+      expect(stale?.status).toBe("rejected-stale");
+      const [forced] = await setPushStatus([m("refs/heads/main", A, X)], objects, {
+        ...lease("refs/heads/main", A),
+        unreachable: new Set(["refs/heads/main"]),
+        force: true,
+      });
+      expect(forced?.status).toBe("ok");
     });
   });
 
