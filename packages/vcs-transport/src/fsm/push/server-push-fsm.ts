@@ -351,7 +351,9 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const output = getOutput(ctx);
       const maxOptions = receivePackConfig(ctx).maxCommands ?? DEFAULT_MAX_PUSH_COMMANDS;
       try {
-        if (!state.capabilities.has("push-options")) {
+        // receive-pack reads options only when it advertised them (use_push_options)
+        const advertised = getConfig(ctx).serverCapabilities ?? RECEIVE_PACK_CAPABILITIES;
+        if (!state.capabilities.has("push-options") || !advertised.includes("push-options")) {
           return "NO_OPTIONS";
         }
 
