@@ -91,6 +91,20 @@ export interface LogOutputOptions {
   topoOrder?: boolean;
   /** `--reverse` */
   reverse?: boolean;
+  /** `--date-order` */
+  dateOrder?: boolean;
+  /** `--author-date-order` */
+  authorDateOrder?: boolean;
+  /**
+   * `--boundary`: the excluded parents of the commits shown too, marked `-` (`commit - <id>`,
+   * `- <id> <subject>` with `--oneline`, `%m`)
+   */
+  boundary?: boolean;
+  /**
+   * `--source`: after each commit's id, a tab and the name it was reached from (a `%S` in
+   * the format asks for the names too)
+   */
+  source?: boolean;
   /** `-p` / `--patch` */
   patch?: boolean;
   /** `-s` / `--no-patch`: no diff output, whatever else asks for it */
@@ -192,6 +206,10 @@ export interface LogOutputEntry {
   savedParents?: ObjectId[];
   /** The reflog entry a reflog walk (`git log -g <ref>`) shows this commit for */
   reflog?: LogReflogEntry;
+  /** A boundary commit (`--boundary`), marked `-` */
+  boundary?: boolean;
+  /** The name the commit was reached from (`--source`, `%S`) */
+  source?: string;
 }
 
 /** A reflog entry of a reflog walk (reflog-walk.c's `reflog_info`). */
@@ -859,6 +877,23 @@ export class LogPrinter {
     return !this.follow && !this.diffFiltered;
   }
 
+  /**
+   * Whether the format shows the names commits were reached from (`%S`, as pretty.c's
+   * userformat_find_requirements finds it): the walk keeps them then, as with `--source`.
+   */
+  get wantsSource(): boolean {
+    if (this.format.fmt !== "user") return false;
+    const text = this.format.user ?? "";
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] !== "%") continue;
+      i++;
+      if (text[i] === "%") continue;
+      if (text[i] === "+" || text[i] === "-" || text[i] === " ") i++;
+      if (text[i] === "S") return true;
+    }
+    return false;
+  }
+
   /** Whether commits not shown (their diff empty) do not count (`--follow`) */
   get followsPath(): boolean {
     return this.follow;
@@ -1145,9 +1180,13 @@ export class LogPrinter {
       if (thread) this.out.text(thread);
     } else if (fmt !== "user") {
       if (fmt !== "oneline") this.out.text("commit ");
+      // put_revision_mark
+      if (!this.graph && entry.boundary) this.out.text("- ");
       this.out.text(await this.abbrevId(entry.id, this.abbrevCommit));
       if (log.parent)
         this.out.text(` (from ${await this.abbrevId(log.parent, this.abbrevCommit)})`);
+      // show_decorations: the source first
+      if (entry.source !== undefined) this.out.text(`\t${entry.source}`);
       if (this.decorate) this.out.text(formatRefDecorations(this.decorations, entry.id, {}));
       if (fmt === "oneline") this.out.text(" ");
       else {
@@ -1235,7 +1274,9 @@ export class LogPrinter {
       return formatCommitPretty(this.format.user ?? "", commit, entry.id, {
         abbreviate: (id) => this.abbrevId(id, this.abbrevLength !== 40),
         ...(this.decorations ? { decorations: this.decorations } : {}),
-        mark: this.graph ? "*" : "",
+        // get_revision_mark(NULL, commit): `-` for a boundary, else `>`
+        mark: entry.boundary ? "-" : ">",
+        ...(entry.source !== undefined ? { source: entry.source } : {}),
         // %N stays as written unless notes are shown
         ...(this.showNotes ? { notes } : {}),
         ...(entry.reflog
