@@ -1022,6 +1022,14 @@ class Matcher implements PosixRegex {
     this.nfa = buildNfa(lowered);
     this.hasBackref = parser.nbackref > 0;
     this.icase = options.icase ?? false;
+    if (this.icase) {
+      // REG_ICASE is glibc's translate table (toupper) over the subject: instead of folding
+      // a copy of every subject, each set takes a byte as it takes its upper case
+      for (const set of new Set(this.nfa.sets)) {
+        if (!set) continue;
+        for (let c = 0x61; c <= 0x7a; c++) set[c] = set[c - 0x20] as number;
+      }
+    }
     this.hasPlural = this.nfa.type.some((t) => t === N_ALT);
     this.mark = new Int32Array(this.nfa.type.length).fill(-1);
   }
@@ -1037,12 +1045,7 @@ class Matcher implements PosixRegex {
     notbol = false,
   ): PosixMatch | undefined {
     this.notbol = notbol;
-    let subject = subjectIn.subarray(0, end);
-    if (this.icase) {
-      const folded = new Uint8Array(subject.length);
-      for (let i = 0; i < subject.length; i++) folded[i] = toUpper(subject[i]);
-      subject = folded;
-    }
+    const subject = subjectIn.subarray(0, end);
     const nmatch = Math.min(nmatchIn ?? this.groupCount + 1, this.groupCount + 1);
     if (this.hasBackref) return this.execBacktrack(subject, nmatch);
     const found = this.overall(subject);
@@ -1412,7 +1415,9 @@ class Matcher implements PosixRegex {
           if (idx + len > s.length) break;
           let same = true;
           for (let k = 0; k < len; k++) {
-            if (s[so + k] !== s[idx + k]) {
+            const x = s[so + k] as number;
+            const y = s[idx + k] as number;
+            if (x !== y && !(this.icase && toUpper(x) === toUpper(y))) {
               same = false;
               break;
             }

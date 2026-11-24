@@ -17,3 +17,7 @@ follows 2.43's `-o` columns, `-W` trailing lines and expression errors.
 
 `compilePosixRegex`'s `exec` takes `REG_NOTBOL`, and an unterminated `[` at the pattern's end is
 glibc's `REG_BADPAT` ("Invalid regular expression").
+
+`REG_ICASE` patterns no longer fold a copy of every subject they are run on: their character
+sets take a lower-case byte as its upper case at compile time (glibc's translate table), and
+back-references compare folded, so `git grep -i` with a regex is linear again.
