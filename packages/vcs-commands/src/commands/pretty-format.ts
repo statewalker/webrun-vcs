@@ -16,8 +16,8 @@
  * `%s %f %b %B %e`, `%n %%` and `%x<hex>` (a byte above 0x7f as the repository's byte strings
  * keep a raw byte: U+DC80 to U+DCFF, which `encodeGitPath` writes back as that byte), `%d %D`
  * and `%(decorate:…)` from {@link loadRefDecorations}, `%m` (`>`, or the mark given), `%G?`
- * (`N` unsigned; a signed commit is `E`, as git prints for a signature it cannot check) and
- * the other `%G` parts (empty; `%GT` `undefined`), `%N` (the notes given, else kept as
+ * `%GG %GS %GK %GF %GP %GT` (the signature check given; without one, `%G?` is `N` unsigned and
+ * `E` signed, the others empty and `%GT` `undefined`), `%N` (the notes given, else kept as
  * written, as git's sequencer keeps it), `%gd %gD %gs %gn %gN %ge %gE` (the reflog entry
  * given, else empty), colors (`%Cred`, `%C(...)`: written only with `color`, or `always,`),
  * padding (`%<(N)`, `%>(N)`, `%><(N)`, `%>>(N)`, the `|` column forms, `trunc`, `ltrunc`,
@@ -40,6 +40,7 @@ import {
   type RefDecorationFilterOptions,
 } from "./ref-decoration-filter.js";
 import { formatGitDate } from "./sequencer-support.js";
+import { type SignatureCheck, signatureLetter } from "./signature-check.js";
 import { appendTrailers, type TrailerConfig, type TrailerFormatOptions } from "./trailers.js";
 
 /** What a format reads of the commit besides its fields. */
@@ -100,6 +101,12 @@ export interface PrettyFormatOptions {
    * without, they are `%an`, `%ae`, `%al`
    */
   mailmap?: (name: string, email: string) => { name: string; email: string };
+  /**
+   * The `%G` placeholders: the commit's signature checked (see `verifyCommitBytes`), asked
+   * for once, at the first `%G`; without, `%G?` is `N` for an unsigned commit and `E` for a
+   * signed one, the others empty (`%GT` `undefined`)
+   */
+  signature?: () => Promise<SignatureCheck>;
 }
 
 /** One name a commit is decorated with (log-tree.c's name_decoration). */
@@ -830,6 +837,8 @@ interface FormatState {
   truncate: "none" | "left" | "middle" | "right";
   /** whether %C(auto) is in force (colors only with options.color) */
   autoColor: boolean;
+  /** the `%G` check, made at the first `%G` (pretty.c's `signature_check`) */
+  signature?: Promise<SignatureCheck>;
 }
 
 /** git's rewrap_message_tail. */
@@ -1100,19 +1109,37 @@ async function formatOne(
       st.sb += options.notes;
       return 1;
     case "G": {
-      const signed = !!(commit as { gpgSignature?: string }).gpgSignature;
+      // pretty.c: check_commit_signature once, before the letter is looked at
+      st.signature ??= options.signature
+        ? options.signature()
+        : Promise.resolve<SignatureCheck>({
+            result: (commit as { gpgSignature?: string }).gpgSignature ? "E" : "N",
+            trustLevel: "undefined",
+            failed: true,
+            messages: [],
+          });
+      const check = await st.signature;
       switch (fmt[at + 1]) {
-        case "?":
-          st.sb += signed ? "E" : "N";
-          return 2;
         case "G":
+          if (check.output) st.sb += check.output;
+          return 2;
+        case "?":
+          st.sb += signatureLetter(check);
+          return 2;
         case "S":
+          if (check.signer) st.sb += check.signer;
+          return 2;
         case "K":
+          if (check.key) st.sb += check.key;
+          return 2;
         case "F":
+          if (check.fingerprint) st.sb += check.fingerprint;
+          return 2;
         case "P":
+          if (check.primaryKeyFingerprint) st.sb += check.primaryKeyFingerprint;
           return 2;
         case "T":
-          st.sb += "undefined";
+          st.sb += check.trustLevel;
           return 2;
       }
       return 0;

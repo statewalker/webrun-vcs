@@ -193,6 +193,18 @@ export interface GitHostEnvironment {
    */
   signer?: Signer;
   /**
+   * Checks what git checks (`verify-commit`, `verify-tag`, the `%G` placeholders, `log
+   * --show-signature`, `merge --verify-signatures`): the commands find the signature, read
+   * what git's `check_signature` reads (`gpg.format` of the signature, the program,
+   * `gpg.ssh.allowedSignersFile`, `gpg.ssh.revocationFile`, the signer's date) and hand it to
+   * this callback, then parse its output as git's `parse_gpg_output` / `parse_ssh_output`.
+   * Absent: every check goes as git's goes when its program cannot be run
+   * (`createNodeVerifier` of `@statewalker/vcs-utils-node` runs gpg, gpgsm or ssh-keygen as
+   * git does; `createSshVerifier` of `@statewalker/vcs-commands` checks ssh Ed25519
+   * signatures in-process).
+   */
+  verifier?: Verifier;
+  /**
    * The process's effective user id (POSIX `geteuid`): what git compares the owner of a
    * repository with before it uses one (`safe.directory`, "detected dubious ownership").
    * Absent (a browser, Windows), or with a FilesApi whose `lstat` reports no `uid`, the
@@ -422,6 +434,81 @@ export interface SigningOutcome {
 
 /** Signs a payload as git's signing programs do (see {@link SigningRequest}). */
 export type Signer = (request: SigningRequest) => Promise<SigningOutcome>;
+
+/**
+ * What git's `check_signature` (gpg-interface.c) would run to check `signature` over
+ * `payload`.
+ *
+ * - openpgp, x509 (`verify_gpg_signed_buffer`): the signature in a temporary file,
+ *   `<program> [--keyid-format=long] --status-fd=1 --verify <file> -` (the option for
+ *   openpgp only), the payload on stdin.
+ * - ssh (`verify_ssh_signed_buffer`): the signature in a temporary file, `<program> -Y
+ *   find-principals -f <allowedSignersFile> -s <file> <verify-time>`, then for each principal
+ *   found `<program> -Y verify -n git -f <allowedSignersFile> -I <principal> -s <file>
+ *   <verify-time> [-r <revocationFile>]` (payload on stdin) until one is good; none found:
+ *   `<program> -Y check-novalidate -n git -s <file> <verify-time>`. `<verify-time>` is
+ *   `-Overify-time=<local %Y%m%d%H%M%S of verifyTime>`, an empty argument without a time.
+ */
+export interface VerificationRequest {
+  format: SigningFormat;
+  /** The signed bytes: the object without its signature */
+  payload: Uint8Array;
+  /** The signature as stored (armored) */
+  signature: Uint8Array;
+  /** The program: as for {@link SigningRequest.program} */
+  program: string;
+  /** ssh: `gpg.ssh.allowedSignersFile` (`~/` expanded); the commands never ask without it */
+  allowedSignersFile?: string;
+  /** ssh: `gpg.ssh.revocationFile` (`~/` expanded) */
+  revocationFile?: string;
+  /**
+   * ssh: the date of the payload's committer (or tagger), seconds since the epoch: keys are
+   * checked as valid then (`valid-after`, `valid-before`); absent when it has none
+   */
+  verifyTime?: number;
+  /** The host directory git runs the program in (the worktree top), when it has one */
+  cwd?: string;
+}
+
+/**
+ * What a check gave, as git's `verify_*_signed_buffer` leaves it: the program's output, which
+ * the commands parse (`parse_gpg_output`: `[GNUPG:]` status lines; `parse_ssh_output`: the
+ * first line of {@link output}).
+ */
+export interface VerificationOutcome {
+  /**
+   * The check failed as the program saw it: gpg exited non-zero or printed neither
+   * `GOODSIG` nor `EXPKEYSIG` on a line of its own; ssh found no principal or no good
+   * verification (git's non-zero return)
+   */
+  failed: boolean;
+  /**
+   * What `verify-commit` prints (git's `sigc->output`): gpg's stderr; for ssh the last
+   * ssh-keygen's stdout and stderr (blank lines squeezed) and find-principals' stderr.
+   * Absent: nothing to show (git's NULL)
+   */
+  output?: string;
+  /**
+   * What `--raw` prints (git's `sigc->gpg_status`): gpg's status output (stdout); for ssh
+   * {@link output}
+   */
+  status?: string;
+  /**
+   * What git printed itself on the way (`error: cannot run gpg: ...`, `warning: ssh signing
+   * revocation file configured but not found: ...`), each without its newline
+   */
+  messages?: string[];
+}
+
+/**
+ * Checks a signature as git's verification programs do (see {@link VerificationRequest}).
+ * Its `compatibility` names the git version whose rules the commands follow where versions
+ * differ (default `2.56`): git 2.43's `check_signature` takes only `G` for good, 2.5x also
+ * `Y` (a good signature by a key that has expired since).
+ */
+export type Verifier = ((request: VerificationRequest) => Promise<VerificationOutcome>) & {
+  compatibility?: "2.43" | "2.56";
+};
 
 const join = (dir: string, name: string) =>
   dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`;

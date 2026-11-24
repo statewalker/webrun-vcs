@@ -4,15 +4,20 @@
  * hands back the signature or git's messages. Its shape is `Signer` of
  * `@statewalker/vcs-working-tree`; pass it to `createNodeGitHostEnvironment({ signer })`.
  *
+ * The verifier of Node hosts (`createNodeVerifier`) lives here too: it runs gpg, gpgsm or
+ * ssh-keygen as git's `check_signature` runs them.
+ *
  * This is the one file of vcs-utils-node besides the hook runner that starts processes, and
  * the one that writes host files outside a FilesApi: ssh-keygen signs a file and writes the
  * signature beside it, so the payload (and a literal key) go to temporary files in the host's
- * temporary directory, as git's `mks_tempfile_t` puts them, never into the repository.
+ * temporary directory, as git's `mks_tempfile_t` puts them, never into the repository; a
+ * signature to check goes to such a file too (`.git_vtag_tmp*`).
  */
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 /** What to sign and how (`SigningRequest` of `@statewalker/vcs-working-tree`). */
 export interface NodeSigningRequest {
@@ -295,4 +300,196 @@ async function signSsh(
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+/** What to check and how (`VerificationRequest` of `@statewalker/vcs-working-tree`). */
+export interface NodeVerificationRequest {
+  format: "openpgp" | "x509" | "ssh";
+  payload: Uint8Array;
+  signature: Uint8Array;
+  program: string;
+  allowedSignersFile?: string;
+  revocationFile?: string;
+  verifyTime?: number;
+  cwd?: string;
+}
+
+/** What a check gave (`VerificationOutcome`). */
+export interface NodeVerificationOutcome {
+  failed: boolean;
+  output?: string;
+  status?: string;
+  messages?: string[];
+}
+
+/** The verifier (`Verifier`). */
+export type NodeVerifier = ((
+  request: NodeVerificationRequest,
+) => Promise<NodeVerificationOutcome>) & { compatibility?: "2.43" | "2.56" };
+
+/** How the verifier runs programs: {@link NodeSignerOptions} and the git version followed. */
+export interface NodeVerifierOptions extends NodeSignerOptions {
+  /** The git version whose rules the commands follow where versions differ (default 2.56) */
+  compatibility?: "2.43" | "2.56";
+}
+
+/**
+ * A verifier that runs the configured program as git's gpg-interface.c does: openpgp as
+ * `<program> --keyid-format=long --status-fd=1 --verify <signature file> -` (x509 without
+ * the key id format), ssh as `-Y find-principals` against `gpg.ssh.allowedSignersFile`, then
+ * `-Y verify` for each principal found (with `-r <revocationFile>` when it exists), or `-Y
+ * check-novalidate` when none is. Options as {@link createNodeSigner}'s.
+ *
+ * @example
+ * ```typescript
+ * const environment = createNodeGitHostEnvironment({ verifier: createNodeVerifier() });
+ * ```
+ */
+export function createNodeVerifier(options: NodeVerifierOptions = {}): NodeVerifier {
+  const verifier: NodeVerifier = async (request) => {
+    const base = options.tmpdir ?? (options.env ?? process.env).TMPDIR ?? tmpdir();
+    const dir = await mkdtemp(join(base, ".git_vtag_"));
+    try {
+      const file = join(dir, `.git_vtag_tmp${Math.random().toString(36).slice(2, 8)}`);
+      await writeFile(file, request.signature, { mode: 0o600 });
+      return request.format === "ssh"
+        ? await verifySsh(request, file, options)
+        : await verifyGpg(request, file, options);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  };
+  if (options.compatibility) verifier.compatibility = options.compatibility;
+  return verifier;
+}
+
+/** gpg-interface.c's `verify_gpg_signed_buffer`. */
+async function verifyGpg(
+  request: NodeVerificationRequest,
+  file: string,
+  options: NodeSignerOptions,
+): Promise<NodeVerificationOutcome> {
+  const args = [request.program];
+  if (request.format === "openpgp") args.push("--keyid-format=long");
+  args.push("--status-fd=1", "--verify", file, "-");
+  const result = await run(args, request.payload, request.cwd, options);
+  const status = result.stdout.toString("utf8");
+  const failed =
+    result.code !== 0 ||
+    (!status.includes("\n[GNUPG:] GOODSIG ") && !status.includes("\n[GNUPG:] EXPKEYSIG "));
+  return {
+    failed,
+    output: result.stderr.toString("utf8"),
+    status,
+    ...(result.startError ? { messages: [result.startError] } : {}),
+  };
+}
+
+/** git's `show_date(t, 0, DATE_STRFTIME "%Y%m%d%H%M%S", local)`. */
+function localStamp(seconds: number): string {
+  const d = new Date(seconds * 1000);
+  const two = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`;
+}
+
+/** git's `strbuf_stripspace(sb, NULL)`. */
+export function stripSpace(text: string): string {
+  const lines = text.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  let out = "";
+  let empties = 0;
+  for (const raw of lines) {
+    const line = raw.replace(/[ \t\n\v\f\r]+$/, "");
+    if (line === "") {
+      empties++;
+      continue;
+    }
+    if (out !== "" && empties > 0) out += "\n";
+    empties = 0;
+    out += `${line}\n`;
+  }
+  return out;
+}
+
+/** gpg-interface.c's `verify_ssh_signed_buffer` (the allowed signers file is given). */
+async function verifySsh(
+  request: NodeVerificationRequest,
+  file: string,
+  options: NodeSignerOptions,
+): Promise<NodeVerificationOutcome> {
+  const messages: string[] = [];
+  const allowed = request.allowedSignersFile ?? "";
+  const verifyTime =
+    request.verifyTime !== undefined && request.verifyTime !== 0
+      ? `-Overify-time=${localStamp(request.verifyTime)}`
+      : "";
+  const principals = await run(
+    [request.program, "-Y", "find-principals", "-f", allowed, "-s", file, verifyTime],
+    undefined,
+    request.cwd,
+    options,
+  );
+  if (principals.startError) messages.push(principals.startError);
+  const principalsErr = principals.stderr.toString("utf8");
+  const principalsOut = principals.stdout.toString("utf8");
+  if (principals.code !== 0 && principalsErr.includes("usage:")) {
+    messages.push(
+      "error: ssh-keygen -Y find-principals/verify is needed for ssh signature verification (available in openssh version 8.2p1+)",
+    );
+    return { failed: true, messages };
+  }
+  let failed = true;
+  let out = "";
+  let err = "";
+  if (principals.code !== 0 || principalsOut === "") {
+    // no principal in the allowed signers: checked without validation, to show what it is
+    const check = await run(
+      [request.program, "-Y", "check-novalidate", "-n", "git", "-s", file, verifyTime],
+      request.payload,
+      request.cwd,
+      options,
+    );
+    if (check.startError) messages.push(check.startError);
+    out = check.stdout.toString("utf8");
+    err = check.stderr.toString("utf8");
+  } else {
+    // find-principals succeeded: a list of nothing but empty lines leaves that success
+    failed = false;
+    for (const rawLine of principalsOut.split("\n")) {
+      const principal = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      if (principal === "") continue;
+      const args = [
+        request.program,
+        "-Y",
+        "verify",
+        "-n",
+        "git",
+        "-f",
+        allowed,
+        "-I",
+        principal,
+        "-s",
+        file,
+        verifyTime,
+      ];
+      if (request.revocationFile !== undefined) {
+        const cwd = request.cwd ?? options.defaultCwd ?? process.cwd();
+        if (existsSync(resolve(cwd, request.revocationFile))) {
+          args.push("-r", request.revocationFile);
+        } else {
+          messages.push(
+            `warning: ssh signing revocation file configured but not found: ${request.revocationFile}`,
+          );
+        }
+      }
+      const verified = await run(args, request.payload, request.cwd, options);
+      if (verified.startError) messages.push(verified.startError);
+      out = verified.stdout.toString("utf8");
+      err = verified.stderr.toString("utf8");
+      failed = verified.code !== 0 || !out.startsWith("Good");
+      if (!failed) break;
+    }
+  }
+  const output = stripSpace(out) + principalsErr + stripSpace(err);
+  return { failed, output, status: output, ...(messages.length ? { messages } : {}) };
 }
