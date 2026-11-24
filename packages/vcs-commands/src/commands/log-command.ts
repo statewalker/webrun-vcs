@@ -1557,13 +1557,43 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       this.outputWalk = undefined;
       for (const e of entries) shownIds.add(e.id);
       entries = entries.slice(skip);
-      if (maxCount !== undefined && !follow) entries = entries.slice(0, Math.max(maxCount, 0));
+      // the commits shown count (--follow, pickaxe, --diff-filter): the print loop stops
+      if (maxCount !== undefined && !countsShown) entries = entries.slice(0, Math.max(maxCount, 0));
       if (maxCount !== undefined && maxCount <= 0) entries = [];
+    } else if (!reverse) {
+      // cmd_log_walk: each commit shown as the walk gives it; --follow, pickaxe and
+      // --diff-filter count the commits shown, not those walked (log.c gives max_count back
+      // for a commit log_tree_commit did not show), so the walk stops once enough are shown
+      if (countsShown) this.maxCount = undefined;
+      await printer.start();
+      try {
+        if (maxCount === undefined || maxCount > 0) {
+          let shownCount = 0;
+          for await (const c of await this.call()) {
+            const { id, boundary: isBoundary, source, ...commit } = c;
+            const entry: LogOutputEntry = {
+              id,
+              commit,
+              parents: c.parents,
+              ...(isBoundary ? { boundary: true } : {}),
+              ...(source !== undefined ? { source } : {}),
+            };
+            const shown = await printer.showCommit(entry, []);
+            if (shown && countsShown && maxCount !== undefined && ++shownCount >= maxCount) break;
+          }
+        }
+      } finally {
+        this.maxCount = maxCount;
+        this.simplifyHistory = simplifyHistory;
+        this.order = saved.order;
+        this.reverse = saved.reverse;
+        this.boundary = saved.boundary;
+        this.source = saveSource;
+        if (follow) this.paths = paths;
+      }
+      return printer.result();
     } else {
-      // --follow, pickaxe and --diff-filter count the commits shown, not those walked (log.c
-      // gives max_count back for a commit log_tree_commit did not show); --reverse the
-      // newest walked
-      if (countsShown && !reverse) this.maxCount = undefined;
+      // --reverse: the newest commits walked, reversed, then shown
       entries = [];
       for await (const c of await this.call()) {
         const { id, boundary: isBoundary, source, ...commit } = c;
@@ -1575,7 +1605,6 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           ...(source !== undefined ? { source } : {}),
         });
       }
-      if (countsShown) this.maxCount = maxCount;
     }
     this.simplifyHistory = simplifyHistory;
     this.order = saved.order;

@@ -905,3 +905,93 @@ describeHttp("pickaxe in a partial clone", () => {
     expect(ourFetches).toBe(nativeFetches);
   });
 });
+
+describeGit("pickaxe and --diff-filter with -n (log.c counts the commits shown)", () => {
+  it('t4209-log-pickaxe.sh: "log -S<pat> is not a regex, but -S<pat> --pickaxe-regex is" with --graph -n (hidden commits drawn as ...)', async () => {
+    const dir = repo(`
+      for c in one two three four five six; do echo "$c" >"$c.t"; git add "$c.t"; commit -m "$c"; done
+      git switch -q -c side HEAD~2
+      echo a >s1.t && git add s1.t && commit -m s1
+      echo b >s2.t && git add s2.t && commit -m s2
+      git switch -q main
+      test_tick && git merge -q -m merge side
+      echo a >seven.t && git add seven.t && commit -m seven
+    `);
+    const out: string[] = [];
+    for (const n of [1, 2, 3]) {
+      await twinLog(
+        out,
+        dir,
+        ["--graph", "-Sa", `-n${n}`, "--format=%s"],
+        (log) => log.setMaxCount(n).setDiffOptions({ pickaxeString: "a" }),
+        { pretty: "tformat:%s", graph: true },
+      );
+      await twinLog(
+        out,
+        dir,
+        ["--graph", "--diff-filter=A", `-n${n}`, "--format=%s"],
+        (log) => log.setMaxCount(n).setDiffOptions({ diffFilter: "A" }),
+        { pretty: "tformat:%s", graph: true },
+      );
+      await twinLog(
+        out,
+        dir,
+        ["-Sa", `-n${n}`, "--format=%s"],
+        (log) => log.setMaxCount(n).setDiffOptions({ pickaxeString: "a" }),
+        { pretty: "tformat:%s" },
+      );
+    }
+    expect(out).toEqual([]);
+  });
+
+  it("log -n1 --diff-filter=M and -S stop walking once a commit is shown (2000 commits)", async () => {
+    const dir = join(tmp(), `repo-${++repoCount}`);
+    mkdirSync(dir);
+    sh(dir, "git init -q -b main .");
+    // a long history by fast-import: each commit adds a file, the last one modifies one
+    let stream = "";
+    const total = 2000;
+    for (let i = 1; i <= total; i++) {
+      const path = i === total ? "f1.t" : `f${i}.t`;
+      stream += `commit refs/heads/main\nmark :${i}\ncommitter T <t@example.com> ${1112911993 + i} +0000\ndata 2\nc\n`;
+      if (i > 1) stream += `from :${i - 1}\n`;
+      stream += `M 100644 inline ${path}\ndata ${String(i).length + 1}\n${i}\n\n`;
+    }
+    execFileSync("git", ["fast-import", "--quiet"], {
+      cwd: dir,
+      input: stream,
+      env: nativeGitEnv(tmp()),
+    });
+    const out: string[] = [];
+    await twinLog(
+      out,
+      dir,
+      ["-n1", "--diff-filter=M", "--format=%s %H"],
+      (log) => log.setMaxCount(1).setDiffOptions({ diffFilter: "M" }),
+      { pretty: "tformat:%s %H" },
+    );
+    expect(out).toEqual([]);
+    const time = async (build: (log: LogCommand) => LogCommand, output: LogOutputOptions) => {
+      const git = await ours(dir);
+      const log = build(git.log());
+      const start = performance.now();
+      await log.callBytes(output);
+      return { ms: performance.now() - start, walked: log.getStatistics().commitsWalked };
+    };
+    const first = await time((log) => log.setMaxCount(1).setDiffOptions({ diffFilter: "M" }), {
+      pretty: "tformat:%H",
+    });
+    const firstS = await time(
+      (log) => log.setMaxCount(1).setDiffOptions({ pickaxeString: String(total) }),
+      { pretty: "tformat:%H" },
+    );
+    const all = await time((log) => log.setDiffOptions({ diffFilter: "M" }), {
+      pretty: "tformat:%H",
+    });
+    // the walk reads a few commits ahead of the one shown, never the whole history
+    expect(first.walked).toBeLessThan(50);
+    expect(firstS.walked).toBeLessThan(50);
+    expect(all.walked).toBeGreaterThanOrEqual(total);
+    expect(first.ms * 5).toBeLessThan(all.ms);
+  }, 120_000);
+});
