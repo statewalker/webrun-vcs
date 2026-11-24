@@ -369,7 +369,6 @@ describeGit(
         expect(log(dirs.o)).toBe(log(dirs.n));
       });
     }
-
   },
 );
 
