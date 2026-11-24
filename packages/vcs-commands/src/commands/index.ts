@@ -123,6 +123,7 @@ export * from "./submodule-commands.js";
 export * from "./submodule-model.js";
 export * from "./submodule-summary.js";
 export * from "./submodule-summary-command.js";
+export * from "./submodule-update-command.js";
 export * from "./switch-command.js";
 export * from "./tag-command.js";
 export * from "./trailers.js";
