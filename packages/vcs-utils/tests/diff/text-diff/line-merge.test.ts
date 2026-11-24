@@ -174,3 +174,26 @@ describe("mergeLines diffs as git's xdiff", () => {
     expect(performance.now() - start).toBeLessThan(15_000);
   }, 60_000);
 });
+
+describe("mergeLines with whitespace flags (merge-ort's -X ignore-space-change)", () => {
+  const ws = (base: string, ours: string, theirs: string, whitespace: number) =>
+    text(
+      mergeLines(latin1(base), latin1(ours), latin1(theirs), {
+        oursLabel: "A",
+        theirsLabel: "B",
+        whitespace,
+      }).content,
+    );
+  const IGNORE_WHITESPACE_CHANGE = 1 << 2;
+
+  it("a side changing only whitespace counts as unchanged: the other side is taken whole", () => {
+    expect(ws("a\nb\nc\n", "a\nb  \nc\n", "a\nx\nc\n", IGNORE_WHITESPACE_CHANGE)).toBe("a\nx\nc\n");
+    expect(ws("a\nb\nc\n", "a\nb  \nc\n", "a\nx\nc\n", 0)).toContain("<<<<<<< A");
+  });
+
+  it("changes equal but for whitespace are no conflict, and ours' bytes are written", () => {
+    expect(
+      ws("a\nb\nc\nd\ne\n", "a\nx  y\nc\nd\nE\n", "a\nx y\nc\nd\ne\n", IGNORE_WHITESPACE_CHANGE),
+    ).toBe("a\nx  y\nc\nd\nE\n");
+  });
+});
