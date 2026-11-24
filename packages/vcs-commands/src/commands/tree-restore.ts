@@ -334,7 +334,12 @@ async function writePlan(
   }
   // a submodule is an empty directory, as git checks out an unpopulated one
   if (options.gitlinks) {
-    for (const { path } of plan.gitlinks) await worktree.mkdir(path);
+    for (const { path } of plan.gitlinks) {
+      // checkout_entry with force: a file or link standing there is unlinked first (a
+      // directory, its contents included, stays)
+      if (options.replaceInTheWay) await worktree.remove(path);
+      await worktree.mkdir(path);
+    }
   }
 }
 

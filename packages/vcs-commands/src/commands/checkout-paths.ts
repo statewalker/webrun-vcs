@@ -40,6 +40,7 @@ import {
   pathspecErrors,
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
+import { recursesIntoSubmodules, SubmoduleUnpack } from "./submodule-unpack.js";
 import {
   pruneEmptyParents,
   removeDirectoryIfEmpty,
@@ -87,6 +88,8 @@ export interface CheckoutPathsOptions {
   quiet?: boolean;
   /** `count_checkout_paths`: "Updated N paths from ..." (checkout without `--`) */
   countCheckoutPaths?: boolean;
+  /** `--recurse-submodules` given (default `submodule.recurse`) */
+  recurseSubmodules?: boolean;
 }
 
 /** What {@link checkoutPaths} did. */
@@ -137,6 +140,8 @@ export interface PathCheckoutRequest {
   ignoreUnmerged?: boolean;
   quiet?: boolean;
   countCheckoutPaths?: boolean;
+  /** `--[no-]recurse-submodules`: the matched submodules' worktrees checked out too */
+  recurseSubmodules?: boolean;
   /** The global pathspec magic (`GIT_LITERAL_PATHSPECS`, ...) */
   globalMagic?: GlobalPathspecMagic;
 }
@@ -267,6 +272,7 @@ export async function runPathCheckout(
     ignoreUnmerged,
     quiet: req.quiet === true,
     countCheckoutPaths: req.countCheckoutPaths === true,
+    ...(req.recurseSubmodules !== undefined ? { recurseSubmodules: req.recurseSubmodules } : {}),
   });
 }
 
@@ -588,6 +594,17 @@ async function checkoutWorktree(
     const trust = worktreeModeTrust(ctx.workingCopy, worktree);
     const indexTime = ctx.staging.getUpdateTime();
     const symlinks = trust.symlinks;
+    // --recurse-submodules: checkout_entry and unlink_entry move the submodules (state.force)
+    const subs = await SubmoduleUnpack.start(ctx.workingCopy, {
+      recurse: recursesIntoSubmodules(ctx.workingCopy, o.recurseSubmodules),
+      reset: true,
+    });
+    const flushSubmoduleLines = () => {
+      if (!subs) return;
+      for (const text of subs.lines.splice(0)) {
+        out.errors.push(...text.replace(/\n$/, "").split("\n"));
+      }
+    };
     // git's unlink_entry: nothing beneath a missing leading directory or a symbolic link
     // (check_leading_path); a file already gone counts as removed (unlink_or_warn takes
     // ENOENT as success), so its emptied directories are pruned all the same
@@ -595,6 +612,10 @@ async function checkoutWorktree(
     const unlink = async (rec: Rec) => {
       const path = rec.entry.path;
       if (!(await leadingDirectoriesExist(worktree, path))) return;
+      if (subs && isGitlink(rec.entry.mode)) {
+        await subs.moveAway(path, rec.entry);
+        flushSubmoduleLines();
+      }
       const current = await worktree.getEntry(path).catch(() => undefined);
       if (isGitlink(rec.entry.mode)) {
         // rmdir_or_warn
@@ -656,6 +677,13 @@ async function checkoutWorktree(
       const e = rec.entry;
       if (rec.wtRemove) {
         await unlink(rec);
+        return "unchanged";
+      }
+      if (subs && isGitlink(e.mode) && (await subs.isSubmodule(e.path, e))) {
+        // checkout_entry of a submodule: moved to its commit (a failure is an error)
+        const moved = await subs.checkout(worktree, e.path, e);
+        flushSubmoduleLines();
+        if (!moved) return "failed";
         return "unchanged";
       }
       const current = await worktree.getEntry(e.path).catch(() => undefined);

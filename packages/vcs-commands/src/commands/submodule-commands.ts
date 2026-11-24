@@ -6,7 +6,7 @@
  * (`fatal:`, exit 128; a usage error, 129) the command throws {@link SubmoduleCommandError},
  * whose `result` holds what was printed before.
  */
-import { FileMode, type ObjectId } from "@statewalker/vcs-core";
+import { FileMode, type ObjectId, objectFormatOf } from "@statewalker/vcs-core";
 import { isGitDirectory } from "@statewalker/vcs-store-files";
 import type { GitTransportRegistry } from "@statewalker/vcs-transport";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
@@ -27,6 +27,7 @@ import {
   parsePathspec,
   pathspecErrors,
 } from "./pathspec.js";
+import { ReadTreeCommand } from "./read-tree-command.js";
 import { RmCommand } from "./rm-command.js";
 import {
   defaultRemoteOf,
@@ -632,7 +633,7 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
     await this.absorbNested(path, innerGitDir ?? undefined);
   }
 
-  private filesOrFail(): FilesApi {
+  protected filesOrFail(): FilesApi {
     const files = this.worktreeAccess?.getFiles?.();
     if (!files) throw new GitApiError("fatal: no worktree");
     return files;
@@ -799,7 +800,7 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
    * repository, else what `read_gitfile_gently` makes of it (the repository a gitfile names,
    * `gitDir` null when it lies beyond this FilesApi, or git's error code).
    */
-  private async resolveGitdirGently(
+  protected async resolveGitdirGently(
     path: string,
   ): Promise<ResolvedGitdir | { error: GitfileError }> {
     const files = this.worktreeAccess?.getFiles?.();
@@ -908,6 +909,317 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
 
   protected finish(): SubmoduleCommandResult {
     return { ...this.out };
+  }
+}
+
+/** Flags of {@link SubmoduleHeadMover.moveHead} (submodule.c's `SUBMODULE_MOVE_HEAD_*`). */
+export interface SubmoduleMoveHeadFlags {
+  /** `SUBMODULE_MOVE_HEAD_DRY_RUN`: only check (`read-tree -n`), change nothing */
+  dryRun?: boolean;
+  /** `SUBMODULE_MOVE_HEAD_FORCE`: local changes are thrown away (`read-tree --reset`) */
+  force?: boolean;
+}
+
+/**
+ * submodule.c's `submodule_move_head` for the unpack-trees runs of a superproject
+ * (`checkout`, `switch`, `reset`, `restore`, `read-tree` with `--recurse-submodules`): the
+ * submodule at a path moved from one commit to another (`null` for none: a submodule coming
+ * into existence or going away) by its own `read-tree --recurse-submodules` (in-process, the
+ * nested submodules moved the same way), its HEAD then detached at the new commit, or, for
+ * one going away, its gitfile removed, its directory if empty and its `core.worktree` unset.
+ * Its `error:` lines collect in the output ({@link takeStderr}); git's deaths throw
+ * `SubmoduleCommandError`. Not a command of its own.
+ *
+ * @internal
+ */
+export class SubmoduleHeadMover extends SubmoduleCommandBase {
+  constructor(workingCopy: WorkingCopy, superPrefix: string) {
+    super(workingCopy);
+    this.superPrefix = superPrefix;
+    // `.gitmodules` warnings are printed by the commands that read it for themselves
+    this.modelWarningsShown = true;
+  }
+
+  async call(): Promise<SubmoduleCommandResult> {
+    throw new GitApiError("SubmoduleHeadMover is not a command");
+  }
+
+  /** What was printed since the last call (git's immediate `error:` lines). */
+  takeStderr(): string {
+    const text = this.out.stderr;
+    this.out.stderr = "";
+    return text;
+  }
+
+  /** `repo_read_gitmodules` again (after `.gitmodules` was checked out). */
+  reload(): void {
+    this.forgetModel();
+  }
+
+  /** `submodule_from_ce` of a gitlink at `path`: `.gitmodules` names a submodule there. */
+  async isSubmodule(path: string): Promise<boolean> {
+    return (await this.model()).fromPath(path) !== undefined;
+  }
+
+  /** git's `file_exists` (`lstat`) of a worktree path. */
+  async exists(path: string): Promise<boolean> {
+    return (await this.kindOf(path)) !== undefined;
+  }
+
+  /** The kind of what `lstat` finds at a worktree path (`symlink` for a link). */
+  async kind(path: string): Promise<string | undefined> {
+    const files = this.worktreeAccess?.getFiles?.();
+    if (!files) return undefined;
+    return lstatKind(files, this.filesPath(path));
+  }
+
+  /**
+   * A submodule path that is a symbolic link to a repository: git's stat follows it, finds the
+   * submodule populated and dies in `validate_submodule_path` before any change.
+   */
+  async validateLinked(path: string): Promise<void> {
+    if ((await this.kind(path)) !== "symlink") return;
+    if ((await this.kindThroughLinks(`${path}/.git`)) === undefined) return;
+    await this.validatePath(path);
+  }
+
+  /** `is_submodule_populated_gently` (with an error pointer: never dies). */
+  async populated(path: string): Promise<boolean> {
+    return !("error" in (await this.resolveGitdirGently(path)));
+  }
+
+  /** Whether `<path>/.git` is a repository directory (not absorbed into the superproject). */
+  async hasGitDirectory(path: string): Promise<boolean> {
+    const state = await this.resolveGitdirGently(path);
+    return !("error" in state) && state.kind === "directory";
+  }
+
+  /** `submodule_move_head`; false where git's returns an error (its lines in the output). */
+  async moveHead(
+    path: string,
+    oldHead: string | null,
+    newHead: string | null,
+    flags: SubmoduleMoveHeadFlags = {},
+  ): Promise<boolean> {
+    const model = await this.model();
+    if (!model.isActive(path)) return true;
+    if (oldHead !== null) await this.validateLinked(path);
+    if (oldHead !== null && !(await this.populatedGently(path, flags.force === true))) return true;
+    const sub = model.fromPath(path);
+    if (!sub) return true;
+    await this.validatePath(path);
+    if (oldHead !== null && !flags.force && (await this.hasDirtyIndex(path))) {
+      this.out.stderr += `error: submodule '${path}' has dirty index\n`;
+      return false;
+    }
+    const gitDir = await model.gitDirOf(sub.name);
+    if (!flags.dryRun) {
+      if (oldHead !== null) {
+        if (!(await this.usesGitfile(path))) await this.absorbGitDirIntoSuperproject(path);
+      } else if (gitDir !== undefined) {
+        await this.connectWorkTreeAndGitDir(path, gitDir);
+        // make sure the index is clean as well (submodule_reset_index)
+        if (
+          !(await this.readTreeIn(path, (c) => c.setReset(true).setUpdate(true), [null], false))
+        ) {
+          this.die("fatal: could not reset submodule index");
+        }
+      }
+      if (oldHead !== null && flags.force && gitDir !== undefined) {
+        await this.connectRecursively(path, gitDir, 0);
+      }
+    }
+    const merged = await this.readTreeIn(
+      path,
+      (c) => {
+        c.setRecurseSubmodules(true);
+        if (flags.dryRun) c.setDryRun(true);
+        else c.setUpdate(true);
+        return flags.force ? c.setReset(true) : c.setMerge(true);
+      },
+      flags.force ? [newHead] : [oldHead, newHead],
+      true,
+    );
+    if (!merged) {
+      this.out.stderr += `error: Submodule '${path}' could not be updated.\n`;
+      return false;
+    }
+    if (flags.dryRun) return true;
+    if (newHead !== null) {
+      const inner = await this.openSubmodule(path);
+      if (!inner || !(await this.detachHead(inner, newHead))) return false;
+    } else {
+      const files = this.filesOrFail();
+      await files.remove(this.filesPath(`${path}/.git`)).catch(() => false);
+      const dir = this.filesPath(path);
+      if ((await files.stats(dir).catch(() => undefined))?.kind === "directory") {
+        let empty = true;
+        for await (const _ of files.list(dir)) {
+          empty = false;
+          break;
+        }
+        if (empty) await files.remove(dir).catch(() => false);
+      }
+      // submodule_unset_core_worktree
+      const unset =
+        gitDir !== undefined &&
+        (await setInConfigFile(this.workingCopy, `${gitDir}/config`, "core.worktree", undefined)
+          .then(() => true)
+          .catch(() => false));
+      if (!unset) {
+        this.out.stderr += `warning: Could not unset core.worktree setting in submodule '${path}'\n`;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * `is_submodule_populated_gently`: `<path>/.git` names a repository. Without `gentle`
+   * (no error code pointer) the gitfile errors `read_gitfile_error_die` dies on are deaths.
+   */
+  private async populatedGently(path: string, gentle: boolean): Promise<boolean> {
+    const state = await this.resolveGitdirGently(path);
+    if (!("error" in state)) return true;
+    if (!gentle) {
+      if (state.error === "not-a-repo") {
+        const files = this.filesOrFail();
+        const text = decodeGitPath(
+          await readFile(files, this.filesPath(`${path}/.git`)).catch(() => new Uint8Array()),
+        );
+        this.die(`fatal: not a git repository: ${text.replace(/^gitdir: /, "").trim()}`);
+      }
+      const fatal = GITFILE_ERRORS[state.error];
+      if (fatal) this.die(`fatal: ${fatal}${path}/.git`);
+    }
+    return false;
+  }
+
+  /** `submodule_has_dirty_index`: `git diff-index --quiet --cached HEAD` there fails. */
+  private async hasDirtyIndex(path: string): Promise<boolean> {
+    const inner = await this.openSubmodule(path);
+    if (!inner) return true;
+    return new SubmoduleIndexProbe(inner).call();
+  }
+
+  /**
+   * `submodule_uses_gitfile`: `<path>/.git` is a gitfile, and so is every populated nested
+   * submodule's (`submodule foreach --recursive test -f .git`).
+   */
+  private async usesGitfile(path: string): Promise<boolean> {
+    const state = await this.resolveGitdirGently(path);
+    if ("error" in state || state.kind !== "gitfile") return false;
+    const files = this.filesOrFail();
+    const inner = await this.openSubmodule(path);
+    if (!inner) return true;
+    const nested = async (wc: WorkingCopy, prefix: string, depth: number): Promise<boolean> => {
+      if (depth > MAX_ABSORB_DEPTH) return false;
+      for await (const entry of wc.checkout.staging.entries()) {
+        if (entry.mode !== FileMode.GITLINK || entry.stage !== 0) continue;
+        const at = `${prefix}/${entry.path}`;
+        const kind = (await files.stats(this.filesPath(`${at}/.git`)).catch(() => undefined))?.kind;
+        if (kind === undefined) continue;
+        if (kind !== "file") return false;
+        const deeper = await wc.worktree.openGitlink?.(entry.path).catch(() => undefined);
+        if (deeper && !(await nested(deeper, at, depth + 1))) return false;
+      }
+      return true;
+    };
+    return nested(inner, path, 0);
+  }
+
+  /**
+   * dir.c's `connect_work_tree_and_git_dir(path, gitDir, 1)`: the gitfile and `core.worktree`,
+   * then the same for every nested submodule `.gitmodules` names and that is active
+   * (`connect_wt_gitdir_in_nested`), populated or not.
+   */
+  private async connectRecursively(path: string, gitDir: string, depth: number): Promise<void> {
+    await this.connectWorkTreeAndGitDir(path, gitDir);
+    if (depth > MAX_ABSORB_DEPTH) return;
+    const inner = await this.worktreeAccess?.openGitlink?.(path, { gitDir }).catch(() => undefined);
+    if (!inner) return;
+    const model = await SubmoduleModel.load(inner).catch(() => undefined);
+    if (!model) return;
+    for await (const entry of inner.checkout.staging.entries()) {
+      if (entry.mode !== FileMode.GITLINK || entry.stage !== 0) continue;
+      const sub = model.fromPath(entry.path);
+      if (!sub || !model.isActive(entry.path)) continue;
+      const nestedGitDir = await model.gitDirOf(sub.name).catch(() => undefined);
+      if (nestedGitDir === undefined) continue;
+      await this.connectRecursively(`${path}/${sub.path}`, nestedGitDir, depth + 1);
+    }
+  }
+
+  /**
+   * git's child `read-tree --super-prefix=<prefix><path>/ ...` in the submodule
+   * (`prepare_submodule_repo_env`: its own `.git`), `null` trees being the empty tree; its
+   * error lines go to the output. False when it failed.
+   */
+  private async readTreeIn(
+    path: string,
+    configure: (command: ReadTreeCommand) => ReadTreeCommand,
+    trees: (string | null)[],
+    recursing: boolean,
+  ): Promise<boolean> {
+    const inner = await this.openSubmodule(path);
+    if (!inner) {
+      this.out.stderr += "fatal: not a git repository: '.git'\n";
+      return false;
+    }
+    const command = configure(new ReadTreeCommand(inner)).setSuperPrefix(
+      `${this.superPrefix}${path}/`,
+    );
+    if (!recursing) command.setRecurseSubmodules(false);
+    const empty = objectFormatOf(inner.history).emptyTreeId;
+    for (const tree of trees) command.addTree(tree ?? empty);
+    try {
+      const result = await command.call();
+      for (const w of result.warnings) this.out.stderr += `${w}\n`;
+      return true;
+    } catch (error) {
+      if (error instanceof SubmoduleCommandError) {
+        this.out.stderr += error.result.stderr;
+        this.out.stderr += `${error.message}\n`;
+        return false;
+      }
+      if (!(error instanceof GitApiError)) throw error;
+      this.out.stderr += `${error.message.replace(/\n$/, "")}\n`;
+      return false;
+    }
+  }
+
+  /** `git update-ref HEAD --no-deref <id>` in the submodule. */
+  private async detachHead(inner: WorkingCopy, id: string): Promise<boolean> {
+    const refs = inner.history.refs;
+    const result = await refs.batch([{ name: "HEAD", new: id, noDeref: true }]);
+    if (!result.ok) await refs.set("HEAD", id);
+    return true;
+  }
+}
+
+/** `git diff-index --quiet --cached HEAD` of a working copy (true: it differs or fails). */
+class SubmoduleIndexProbe extends GitCommand<boolean> {
+  async call(): Promise<boolean> {
+    const headId = (await this.refsStore.resolve("HEAD").catch(() => undefined))?.objectId;
+    if (!headId) return true;
+    const treeId = await this.commits.getTree(headId).catch(() => undefined);
+    if (!treeId) return true;
+    const head = new Map<string, { objectId: string; mode: number }>();
+    const walk = async (id: string, prefix: string): Promise<void> => {
+      for await (const entry of this.trees.loadTree(id)) {
+        const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.mode === FileMode.TREE) await walk(entry.id, path);
+        else head.set(path, { objectId: entry.id, mode: entry.mode });
+      }
+    };
+    await walk(treeId, "");
+    for await (const entry of this.staging.entries()) {
+      const h = head.get(entry.path);
+      if (entry.stage !== 0 || !h || h.objectId !== entry.objectId || h.mode !== entry.mode) {
+        return true;
+      }
+      head.delete(entry.path);
+    }
+    return head.size > 0;
   }
 }
 
