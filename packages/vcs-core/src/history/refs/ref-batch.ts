@@ -153,6 +153,14 @@ export interface BatchOptions extends RefLogOptions {
    */
   emptyTransaction?: boolean;
   /**
+   * Commit a batch that deletes nothing as git's files backend does: each ref written into
+   * its own lock and renamed over its loose file, packed-refs left alone (git 2.5x's
+   * batched fetch updates). Stores that commit a multi-ref batch through packed-refs for
+   * atomicity otherwise; a crash in the renames can leave some refs updated. Other stores
+   * ignore it.
+   */
+  loose?: boolean;
+  /**
    * The reference-transaction hook of this batch alone, told in place of the one the store
    * has installed (a wrapping store tells each batch's updates as that batch asked for them)
    */

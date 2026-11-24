@@ -6,6 +6,8 @@ import {
   historyWithoutLazyFetch,
   isSymbolicRef,
   parseCoreAbbrev,
+  RefTransactionAbortedError,
+  type RefTransactionHook,
 } from "@statewalker/vcs-core";
 import { writeCommitGraph } from "@statewalker/vcs-store-files";
 import {
@@ -48,6 +50,7 @@ import {
   type TrackingRefUpdate,
 } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
+import { autoSetupRebase, installTracking } from "./branch-tracking.js";
 import { fetchFsckOf } from "./fsck/index.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import {
@@ -139,6 +142,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   /** `--filter=<spec>` (a string), `--no-filter` (false), or neither */
   private filterSpec?: string | false;
   private refetch = false;
+  private setUpstream = false;
 
   /**
    * Set the remote to fetch from.
@@ -342,6 +346,26 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     this.checkCallable();
     this.refetch = refetch;
     return this;
+  }
+
+  /**
+   * `git fetch --set-upstream`: once the refs are written, the one ref fetched only into
+   * `FETCH_HEAD` (a branch, or `HEAD`) becomes the current branch's upstream,
+   * `branch.<name>.remote` the remote as named (a URL for a URL) and `branch.<name>.merge`
+   * the ref, written as `git branch -u` writes them (`branch.autoSetupRebase` included).
+   * Nothing is set, with git's warning in {@link FetchResult.messages}, when several refs or
+   * none are fetched that way, HEAD is detached, or the ref is a tag or a remote-tracking
+   * ref; nor when an update was refused. A dry run sets it too, as git's does.
+   */
+  setSetUpstream(setUpstream: boolean): this {
+    this.checkCallable();
+    this.setUpstream = setUpstream;
+    return this;
+  }
+
+  /** Whether the fetch sets the current branch's upstream (`--set-upstream`). */
+  isSetUpstream(): boolean {
+    return this.setUpstream;
   }
 
   /**
@@ -640,6 +664,7 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       ...(typeof this.filterSpec === "string" ? [`--filter=${this.filterSpec}`] : []),
       ...(this.filterSpec === false ? ["--no-filter"] : []),
       ...(this.refetch ? ["--refetch"] : []),
+      ...(this.setUpstream ? ["--set-upstream"] : []),
     ];
   }
 
@@ -818,6 +843,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       updateShallow: this.updateShallow || undefined,
       force: this.forceUpdate,
       atomic: this.atomic || undefined,
+      // git 2.5x writes a fetch's refs in one transaction that refuses each on its own
+      ...(compatibility !== "2.43" ? { batchNonAtomic: true } : {}),
       dryRun: this.dryRun,
       onProgress: this.progressMessageCallback,
       // git's "fetch <args>: <what>" per ref; the action from the options, the remote and
@@ -909,9 +936,16 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     // jumps to the cleanup as well, past set_head; without --atomic the fetch goes on
     const atomicFailed = this.atomic && result.refUpdates.some((u) => u.status === "rejected");
     const refused = refusedUpdate(result) || atomicFailed;
+    // git 2.43's do_fetch: an --atomic fetch that refused an update aborts its transaction
+    // and prints the abort's (empty) error, `error: `
+    if (this.atomic && refusedUpdate(result) && compatibility === "2.43") errors.push("");
     if (writesFetchHead && checkout?.writeFetchHead && !atomicFailed) {
       // after the truncation above, every fetch adds its lines
       await checkout.writeFetchHead(formatFetchHead(entries, remoteUrl), { append: true });
+    }
+    // do_fetch: after commit_fetch_head, unless an update was refused (or --atomic failed)
+    if (this.setUpstream && !refused) {
+      await this.setUpstreamOf(result, useConfig ? mergeRefs : [], messages);
     }
     const display = await this.displayLines(remoteUrl, trackingUpdates, result, entries, {
       verbose: this.verbose,
@@ -923,7 +957,9 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       // git: "way too many cases where this can go wrong ... fail silently"
       try {
         await this.setRemoteHead(result.remoteRefs, followHead, store, messages);
-      } catch {
+      } catch (error) {
+        // a refusing reference-transaction hook is no silent failure: git dies
+        if (error instanceof RefTransactionAbortedError) throw error;
         // the refs are updated; refs/remotes/<name>/HEAD is left as it was
       }
     }
@@ -948,19 +984,87 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   }
 
   /**
+   * git's `--set-upstream` (do_fetch): the ref map's one ref without a local ref (fetched
+   * only into FETCH_HEAD; a ref add_merge_config marked among those the refspecs took has
+   * one) becomes the current branch's upstream through {@link installTracking}, or git's
+   * warning is added to `messages`.
+   */
+  private async setUpstreamOf(
+    result: FetchClientResult,
+    mergeRefs: readonly string[],
+    messages: string[],
+  ): Promise<void> {
+    const merged = new Set(mergeRefs);
+    const sources = result.fetched.filter(
+      (f) =>
+        !f.localRef &&
+        !(
+          merged.has(f.remoteRef) &&
+          result.fetched.some((o) => o.localRef && o.remoteRef === f.remoteRef)
+        ),
+    );
+    if (sources.length > 1) {
+      messages.push("warning: multiple branches detected, incompatible with --set-upstream");
+      return;
+    }
+    const source = sources[0]?.remoteRef;
+    if (source === undefined) {
+      messages.push(
+        "warning: no source branch found;",
+        "you need to specify exactly one branch with the --set-upstream option",
+      );
+      return;
+    }
+    const head = await this.refsStore.get("HEAD");
+    const branch =
+      head && isSymbolicRef(head) && head.target.startsWith("refs/heads/")
+        ? head.target.slice("refs/heads/".length)
+        : undefined;
+    if (branch === undefined) {
+      const short = source.replace(/^refs\/heads\//, "");
+      messages.push(
+        `warning: could not set upstream of HEAD to '${short}' from '${this.remote}' when it does not point to any branch.`,
+      );
+      return;
+    }
+    if (source === "HEAD" || source.startsWith("refs/heads/")) {
+      // install_branch_config(0, ...): written quietly
+      await installTracking(this._workingCopy, branch, {
+        remote: this.remote,
+        merges: [source],
+        rebase: autoSetupRebase(this._workingCopy, this.remote),
+      });
+    } else if (source.startsWith("refs/remotes/")) {
+      messages.push("warning: not setting upstream for a remote remote-tracking branch");
+    } else if (source.startsWith("refs/tags/")) {
+      messages.push("warning: not setting upstream for a remote tag");
+    } else {
+      messages.push("warning: unknown branch type");
+    }
+  }
+
+  /**
    * git's check_not_current_branch: the first branch of the ref map (the refs the refspecs
    * took, then their opportunistic updates) that a worktree has checked out makes the fetch
    * die, naming that worktree's path.
    */
   private async refuseCheckedOutBranch(refMap: readonly { localRef?: string }[]): Promise<void> {
     const worktrees = this._workingCopy.worktrees;
-    if (!worktrees) return;
     const branches = refMap
       .map((p) => p.localRef)
       .filter((ref): ref is string => ref?.startsWith("refs/heads/") ?? false);
+    // a working copy without linked worktrees: its own HEAD's branch (unless it is bare)
+    const head =
+      worktrees || !("checkout" in this._workingCopy)
+        ? undefined
+        : await this.refsStore.get("HEAD");
     for (const ref of new Set(branches)) {
-      const wt = await worktreeUsingBranch(worktrees, ref);
-      if (wt) throw new FetchIntoCheckedOutBranchError(ref, wt.path);
+      if (worktrees) {
+        const wt = await worktreeUsingBranch(worktrees, ref);
+        if (wt) throw new FetchIntoCheckedOutBranchError(ref, wt.path);
+      } else if (head && isSymbolicRef(head) && head.target === ref) {
+        throw new FetchIntoCheckedOutBranchError(ref, (await this.hostWorkingDir()) ?? ".");
+      }
     }
   }
 
@@ -1054,12 +1158,24 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       }
     }
     for (const u of result.refUpdates) if (!fetchedLocal.has(u.localRef)) lineOf(u);
-    for (const tag of result.backfilledTags) lineOf(byLocal.get(tag));
+    if (this.dryRun && !refusedUpdate(result)) {
+      // a dry run queues no update, so git's backfill_tags finds the tags of the ref map
+      // (whose objects are here now) still missing and stores them again: their lines come
+      // twice, the backfill's in name order with those found in the fetched history
+      const again = [...result.followedTags.filter((t) => !backfilled.has(t)), ...backfilled];
+      for (const tag of again.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))) {
+        const u = byLocal.get(tag);
+        const entry = u && fetchUpdateDisplay(u, verbose);
+        if (entry) shown.push(entry);
+      }
+    } else for (const tag of result.backfilledTags) lineOf(byLocal.get(tag));
     // git 2.5x (do_fetch): a ref update refused (non-fast-forward, a tag it would clobber)
     // jumps to the cleanup before transport_summary_width is computed, so every line is
     // printed with a summary width of 0 (2.43 printed them as they come, padded)
     if (porcelain) return [...lines, ...shown.map(porcelainLine)];
-    const summaryWidth = refusedUpdate(result) ? 0 : result.summaryWidth;
+    const compatibility = this.compatibility ?? this.hooks.compatibility;
+    const summaryWidth =
+      refusedUpdate(result) && compatibility !== "2.43" ? 0 : result.summaryWidth;
     const main = formatFetchDisplay(shown, { url, summaryWidth, refcolWidth, compact });
     // the URL line once, before whichever line comes first
     return lines.length > 0 ? [...lines, ...main.slice(1)] : main;
@@ -1145,6 +1261,18 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     // refs_update_symref_extended(..., "fetch", ...): logged with the literal "fetch"
     if (!createOnly || !previous) {
       await this.refsStore.setSymbolic(name, target, this.reflogLine("fetch"));
+    } else {
+      // git 2.5x's create-only symref transaction over an existing ref: its hook hears
+      // `preparing`, then the prepare fails ("reference already exists") and nothing follows;
+      // a hook refusing in `preparing` aborts it (`aborted`) and git dies (refs.c)
+      const store = this.refsStore as { getTransactionHook?(): RefTransactionHook | undefined };
+      const hook = store.getTransactionHook?.();
+      const updates = [{ requested: name, name, old: null, new: null, newTarget: target }];
+      const verdict = await hook?.("preparing", updates, { only: "2.56" });
+      if (verdict === false || typeof verdict === "string") {
+        await hook?.("aborted", updates, { only: "2.56", asAsked: true });
+        throw new RefTransactionAbortedError("preparing", verdict || undefined);
+      }
     }
     if (follow.mode !== "warn" || follow.noWarnBranch === headName || !previous) return;
     // warn_set_head
