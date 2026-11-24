@@ -65,6 +65,13 @@ export interface ContentAttributesContext {
    * ending in `/` may match it, as git's `git_check_attr` of a name ending in `/`
    */
   isDirectory?: boolean;
+  /**
+   * The attribute check the lookup belongs to (default: the conversion's). git keeps one
+   * attribute stack per check, built on its first lookup and kept: `git apply`'s whitespace
+   * rules (`whitespace_rule`) read the attributes as they are when the patch is parsed,
+   * which does not build convert.c's stack for the files it converts later
+   */
+  check?: string;
 }
 
 /**
@@ -158,6 +165,13 @@ export interface OperationOptions {
    * files written with it.
    */
   keepAttributes?: boolean;
+  /**
+   * The index the in-tree attributes files are read from while `fn` runs, where a lookup
+   * names none (default: the working copy's current index): git's `istate` as the command
+   * edits it. `git apply --index` removes and adds entries as it writes the files, before
+   * it writes the index, so a stack first built midway reads the index as edited so far.
+   */
+  index?: AttributesIndex;
 }
 
 /** Collects an iterable of chunks into one array. */
