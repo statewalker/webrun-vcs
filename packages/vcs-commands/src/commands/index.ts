@@ -45,6 +45,7 @@ export * from "./log-graph.js";
 export * from "./log-output.js";
 export * from "./ls-remote-command.js";
 export * from "./mailmap.js";
+export * from "./merge-base-command.js";
 export * from "./merge-command.js";
 export {
   createMergeDriver,

@@ -13,12 +13,12 @@ import { isIndexUnborn, type Worktree } from "@statewalker/vcs-working-tree";
 
 import {
   CommitNotFoundError,
+  GitApiError,
   InvalidArgumentError,
   NoHeadError,
   NoRebaseInProgressError,
   RebaseTodoMissingError,
   RefNotFoundError,
-  UpstreamRequiredError,
 } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
@@ -33,6 +33,7 @@ import type { RebaseResult, RebaseTodoLine } from "../results/rebase-result.js";
 import { RebaseAction, RebaseStatus } from "../results/rebase-result.js";
 import { AmCommand } from "./am/index.js";
 import { coreBool, createIdAbbreviator, worktreeModeTrust } from "./core-config.js";
+import { findForkPoint } from "./fork-point.js";
 import { createDescriber, type DescribeOptions } from "./git-describe.js";
 import {
   type GitCommitHookRun,
@@ -43,6 +44,7 @@ import {
   sequencerPrepareMessage,
 } from "./git-hooks.js";
 import { hostEnvironmentOf, localTimezoneOffset } from "./git-ident.js";
+import { commitsBaseSource, MergeBaseGraph } from "./merge-bases.js";
 import { favorOf, MergeCommand } from "./merge-command.js";
 import { configBool, configValue, conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
@@ -108,7 +110,7 @@ import {
 } from "./signing.js";
 import { appendSignoff, trailerConfigOf } from "./trailers.js";
 import { worktreeModified } from "./worktree-overwrite-checks.js";
-import { usesBranch } from "./worktree-support.js";
+import { refuseIfCheckedOut, usesBranch } from "./worktree-support.js";
 
 /**
  * Rebase operation types.
@@ -318,7 +320,17 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   /** What this run signs with (git's opts->gpg_sign), once known */
   private runSign?: { key: SignRequest };
   private autoStash?: boolean;
-  private reapplyCherryPicks = false;
+  private reapplyCherryPicks?: boolean;
+  /** `--onto <newbase>` as given (`A...B` included) */
+  private ontoName?: string;
+  /** The `<branch>` argument: switched to before the rebase */
+  private branchArg?: string;
+  /** `--keep-base` */
+  private keepBase = false;
+  /** `--[no-]fork-point`; undefined: git's default (on for an implicit upstream) */
+  private forkPoint?: boolean;
+  /** The onto name of the rebase running (git's `onto_name`), for the reflog */
+  private runOntoName?: string;
   /** `--rebase-merges` (undefined: `rebase.rebaseMerges`) */
   private rebaseMerges?: boolean;
   /** `--rebase-merges=rebase-cousins` */
@@ -391,16 +403,64 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
    * builtin/rebase.c's `lookup_commit_reference_by_name(options.upstream_name)`: the commit
    * an upstream names, or git's "fatal: invalid upstream '<name>'" (exit 128).
    */
-  private async resolveUpstream(name: string): Promise<ObjectId> {
-    const fatal = (n: string) => `fatal: invalid upstream '${n}'`;
+  private async resolveUpstream(name: string, shown = name): Promise<ObjectId> {
+    const fatal = () => `fatal: invalid upstream '${shown}'`;
     try {
       return await this.resolveRef(name, fatal);
     } catch (error) {
       if (error instanceof RefNotFoundError) {
-        throw new RefNotFoundError(name, fatal(name)).withExitCode(128);
+        throw new RefNotFoundError(name, fatal()).withExitCode(128);
       }
       throw error;
     }
+  }
+
+  /**
+   * `--onto <newbase>`: the commits of `<upstream>..HEAD` go onto `newbase` instead of onto
+   * the upstream. Any revision, or `A...B` for the one merge base of A and B (either side
+   * empty is HEAD): git's `fatal: '<A...B>': need exactly one merge base` when there are
+   * none or several, `fatal: Does not point to a valid commit '<newbase>'` when it names no
+   * commit. With {@link setRoot} it is `--root --onto <newbase>`.
+   */
+  setOnto(newbase: string): this {
+    this.checkCallable();
+    this.ontoName = newbase;
+    return this;
+  }
+
+  /**
+   * The `<branch>` argument: `git rebase <upstream> <branch>` switches to it first (a local
+   * branch, which then moves; or any commit, rebased on a detached HEAD), as
+   * `git switch <branch>` would; a branch another worktree has checked out is refused.
+   */
+  setBranch(branch: string): this {
+    this.checkCallable();
+    this.branchArg = branch;
+    return this;
+  }
+
+  /**
+   * `--keep-base`: onto the merge base of the upstream and the branch (`<upstream>...<branch>`),
+   * so the commits stay where they are while the upstream's are left out. Implies
+   * `--no-fork-point` and `--reapply-cherry-picks` unless set; refused with `--onto` and
+   * `--root`.
+   */
+  setKeepBase(keepBase: boolean): this {
+    this.checkCallable();
+    this.keepBase = keepBase;
+    return this;
+  }
+
+  /**
+   * `--fork-point` / `--no-fork-point`: leave out the commits the upstream's reflog shows
+   * were once on it (git's get_fork_point: the one merge base of the branch and the values
+   * the upstream's reflog records, when it is one of them). Default: on when no upstream is
+   * given (the branch's `@{upstream}`), unless `rebase.forkPoint` is false; off otherwise.
+   */
+  setForkPoint(forkPoint: boolean): this {
+    this.checkCallable();
+    this.forkPoint = forkPoint;
+    return this;
   }
 
   /**
@@ -832,19 +892,260 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     );
   }
 
+  /**
+   * cmd_rebase's checks of the options among themselves; the fork-point setting as git
+   * settles it then (1 on, 0 off, -1 the default: on for an implicit upstream).
+   */
+  private checkBeginOptions(): number {
+    // rebase_config: rebase.forkPoint=false turns the default off, true leaves it
+    const configured = configValue(this.workingCopy, "rebase.forkPoint");
+    let forkPoint = configured !== undefined && parseGitBool(configured) === false ? 0 : -1;
+    if (this.forkPoint !== undefined) forkPoint = this.forkPoint ? 1 : 0;
+    const together = (a: string, b: string) =>
+      new GitApiError(`fatal: options '${a}' and '${b}' cannot be used together`);
+    if (this.keepBase) {
+      if (this.ontoName !== undefined) throw together("--keep-base", "--onto");
+      if (this.root) throw together("--keep-base", "--root");
+      // --keep-base defaults to --no-fork-point to keep the base the same
+      if (forkPoint < 0) forkPoint = 0;
+    }
+    if (this.root && forkPoint > 0) throw together("--root", "--fork-point");
+    return forkPoint;
+  }
+
+  /**
+   * cmd_rebase's names and commits: the upstream (given, else the branch's `@{upstream}`),
+   * the branch rebased (the `<branch>` argument, else HEAD's), onto (`--onto`, `A...B`,
+   * `--keep-base`, `--root`'s squash-onto), the fork point and the branch base (the one
+   * merge base of onto and the branch, which can_fast_forward reads).
+   */
+  private async settleBegin(
+    forkPoint: number,
+    /** What git prints reading the names (`warning: refname 'x' is ambiguous.`) */
+    warnings: string[],
+  ): Promise<
+    | RebaseResult
+    | {
+        currentHead: ObjectId;
+        origHead: ObjectId;
+        headName: string;
+        branchName: string;
+        onto: ObjectId;
+        ontoName: string;
+        upstream?: ObjectId;
+        upstreamName?: string;
+        restrict?: ObjectId;
+        branchBase?: ObjectId;
+        squashOnto?: ObjectId;
+      }
+  > {
+    const fatal = (message: string) => new GitApiError(`fatal: ${message}`);
+    let upstreamName: string | undefined;
+    let upstream: ObjectId | undefined;
+    let ontoName = this.ontoName;
+    let onto: ObjectId | undefined;
+    let squashOnto: ObjectId | undefined;
+    if (!this.root) {
+      if (this.upstreamCommit === undefined) {
+        const missing = await this.defaultUpstream();
+        if (typeof missing !== "string") return missing;
+        upstreamName = missing;
+        if (forkPoint < 0) forkPoint = 1;
+      } else {
+        upstreamName = this.upstreamCommitName === "-" ? "@{-1}" : this.upstreamCommitName;
+      }
+      // the upstream as given (setUpstream takes a name too) peeled to the commit it names
+      // before anything is written, so HEAD is never set to a name ("main\n" in .git/HEAD);
+      // an empty name too: "fatal: invalid upstream ''"
+      const given =
+        this.upstreamCommit === undefined || this.upstreamCommit === "-"
+          ? (upstreamName as string)
+          : this.upstreamCommit;
+      upstream = await this.resolveUpstream(given, upstreamName as string);
+      warnings.push(...(await this.nameWarnings(given)));
+    } else if (ontoName === undefined) {
+      if (this.upstreamCommit !== undefined) {
+        // setRoot with setUpstream: `--root --onto <upstream>`
+        onto = await this.resolveUpstream(this.upstreamCommit);
+        ontoName = this.upstreamCommitName ?? onto;
+      } else {
+        // --root without --onto: the commits go onto git's squash_onto, a commit of the
+        // empty tree with no parent (their root is then a root again)
+        squashOnto = await this.createSquashOnto();
+        onto = squashOnto;
+        ontoName = squashOnto;
+      }
+    }
+
+    const headResolved = await this.refsStore.resolve("HEAD");
+    if (!headResolved?.objectId) throw new NoHeadError("HEAD cannot be resolved");
+    const currentHead = headResolved.objectId;
+    let headName: string;
+    let branchName: string;
+    let origHead: ObjectId;
+    if (this.branchArg !== undefined) {
+      // "rebase other branchname" or "rebase other commit"
+      branchName = this.branchArg;
+      const ref = `refs/heads/${branchName}`;
+      const local = (await this.refsStore.resolve(ref).catch(() => undefined))?.objectId;
+      if (local) {
+        const worktrees = this.workingCopy.worktrees;
+        if (worktrees) await refuseIfCheckedOut(worktrees, ref, true);
+        if (!(await this.loadCommit(local))) {
+          throw fatal(`no such branch/commit '${branchName}'`);
+        }
+        headName = ref;
+        origHead = local;
+      } else {
+        const id = await this.revisionResolver()
+          .resolve(branchName, { hint: "committish" })
+          .catch(() => undefined);
+        const commit = id && (await this.revisionResolver().commitReference(id));
+        if (!commit) throw fatal(`no such branch/commit '${branchName}'`);
+        headName = "detached HEAD";
+        origHead = commit;
+      }
+    } else {
+      const headRef = await this.refsStore.get("HEAD");
+      if (headRef && isSymbolicRef(headRef)) {
+        headName = headRef.target;
+        branchName = headName.startsWith("refs/heads/")
+          ? headName.slice("refs/heads/".length)
+          : headName;
+      } else {
+        headName = "detached HEAD";
+        branchName = "HEAD";
+      }
+      origHead = currentHead;
+    }
+
+    // make sure the branch to rebase onto is valid
+    let branchBase: ObjectId | undefined;
+    if (this.keepBase) ontoName = `${upstreamName}...${branchName}`;
+    else if (ontoName === undefined) ontoName = upstreamName as string;
+    if (onto === undefined && !ontoName.includes("...")) {
+      warnings.push(...(await this.nameWarnings(ontoName)));
+    }
+    if (onto === undefined && ontoName.includes("...")) {
+      onto = await this.mergeBaseOfDots(ontoName);
+      if (onto === undefined) {
+        throw this.keepBase
+          ? fatal(`'${upstreamName}': need exactly one merge base with branch`)
+          : fatal(`'${ontoName}': need exactly one merge base`);
+      }
+      branchBase = onto;
+    } else {
+      if (onto === undefined) {
+        const id =
+          ontoName === upstreamName && upstream !== undefined
+            ? upstream
+            : await this.resolveRef(
+                ontoName,
+                (n) => `fatal: Does not point to a valid commit '${n}'`,
+              ).catch((error: unknown) => {
+                if (error instanceof RefNotFoundError) {
+                  throw fatal(`Does not point to a valid commit '${ontoName}'`);
+                }
+                throw error;
+              });
+        onto = id;
+      }
+      // fill_branch_base: the one merge base of onto and the branch, else none
+      const bases = await revisionMergeBases(this.commits, onto, origHead);
+      branchBase = bases.length === 1 ? bases[0] : undefined;
+    }
+    // --keep-base keeps cherry-picks (unless --no-reapply-cherry-picks): the upstream is
+    // onto, so none can be detected
+    if (this.keepBase && (this.reapplyCherryPicks ?? true)) upstream = onto;
+    let restrict: ObjectId | undefined;
+    if (forkPoint > 0 && upstreamName !== undefined) {
+      const graph = new MergeBaseGraph(commitsBaseSource(this.commits, async () => new Map()));
+      restrict = await findForkPoint(this.forkPointSource(graph), upstreamName, origHead);
+    }
+    return {
+      currentHead,
+      origHead,
+      headName,
+      branchName,
+      onto,
+      ontoName,
+      upstream,
+      upstreamName,
+      restrict,
+      branchBase,
+      squashOnto,
+    };
+  }
+
+  /**
+   * branch_get_upstream for `git rebase` without an upstream: the current branch's
+   * `@{upstream}`, else error_on_missing_default_upstream's advice (stdout, exit 1).
+   */
+  private async defaultUpstream(): Promise<string | RebaseResult> {
+    const headRef = await this.refsStore.get("HEAD").catch(() => undefined);
+    const branch =
+      headRef && isSymbolicRef(headRef) && headRef.target.startsWith("refs/heads/")
+        ? headRef.target.slice("refs/heads/".length)
+        : undefined;
+    if (branch !== undefined) {
+      try {
+        return await this.revisionResolver().upstreamOf(branch);
+      } catch {
+        // no upstream: the advice below
+      }
+    }
+    const output = [
+      branch !== undefined
+        ? "There is no tracking information for the current branch."
+        : "You are not currently on a branch.",
+      "Please specify which branch you want to rebase against.",
+      "See git-rebase(1) for details.",
+      "",
+      "    git rebase '<branch>'",
+      "",
+    ];
+    if (branch !== undefined) {
+      const remote =
+        RemoteConfigStore.from(this.workingCopy).value(`branch.${branch}.remote`) ?? "<remote>";
+      output.push(
+        "If you wish to set tracking information for this branch you can do so with:",
+        "",
+        `    git branch --set-upstream-to=${remote}/<branch> ${branch}`,
+        "",
+      );
+    }
+    return { status: RebaseStatus.FAILED, output };
+  }
+
+  /** What git prints while it reads `name` (an ambiguous refname's warning). */
+  private async nameWarnings(name: string): Promise<string[]> {
+    const resolver = this.revisionResolver();
+    await resolver.resolve(name, { hint: "committish" }).catch(() => undefined);
+    return resolver.warnings;
+  }
+
+  /** repo_get_oid_mb: the one merge base of `A...B` (either side empty is HEAD). */
+  private async mergeBaseOfDots(name: string): Promise<ObjectId | undefined> {
+    const dots = name.indexOf("...");
+    const resolver = this.revisionResolver();
+    const commitOf = async (rev: string) => {
+      const id = await resolver.resolve(rev, { hint: "committish" }).catch(() => undefined);
+      return id === undefined ? undefined : resolver.commitReference(id);
+    };
+    const one = await commitOf(dots === 0 ? "HEAD" : name.slice(0, dots));
+    if (one === undefined) return undefined;
+    const rest = name.slice(dots + 3);
+    const two = await commitOf(rest === "" ? "HEAD" : rest);
+    if (two === undefined) return undefined;
+    const bases = await revisionMergeBases(this.commits, one, two);
+    return bases.length === 1 ? bases[0] : undefined;
+  }
+
   private async begin(
     state: OperationState,
     worktree: Worktree | undefined,
   ): Promise<RebaseResult> {
-    if (this.upstreamCommit === undefined && !this.root) {
-      throw new UpstreamRequiredError("Upstream commit is required for rebase BEGIN operation");
-    }
-    // the upstream as given (setUpstream takes a name too) peeled to the commit it names
-    // before anything is written, so HEAD is never set to a name ("main\n" in .git/HEAD)
-    // an empty name too: "fatal: invalid upstream ''"
-    if (this.upstreamCommit !== undefined) {
-      this.upstreamCommit = await this.resolveUpstream(this.upstreamCommit);
-    }
+    const forkPoint = this.checkBeginOptions();
     if (await this.inProgress(state)) {
       return {
         status: RebaseStatus.FAILED,
@@ -863,23 +1164,35 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       if (command === "")
         return { status: RebaseStatus.FAILED, message: "error: empty exec command" };
     }
-    const headResolved = await this.refsStore.resolve("HEAD");
-    if (!headResolved?.objectId) throw new NoHeadError("HEAD cannot be resolved");
-    const headId = headResolved.objectId;
-    const headRef = await this.refsStore.get("HEAD");
-    const headName = headRef && isSymbolicRef(headRef) ? headRef.target : "detached HEAD";
-    // --root without --onto: the commits go onto git's squash_onto, a commit of the empty
-    // tree with no parent (their root is then a root again)
-    let squashOnto: ObjectId | undefined;
-    if (!this.upstreamCommit) {
-      squashOnto = await this.createSquashOnto();
-      this.upstreamCommitName = squashOnto;
+    const nameWarnings: string[] = [];
+    let settled: Awaited<ReturnType<RebaseCommand["settleBegin"]>>;
+    try {
+      settled = await this.settleBegin(forkPoint, nameWarnings);
+    } catch (error) {
+      if (error instanceof GitApiError && nameWarnings.length > 0) {
+        error.message = [...nameWarnings, error.message].join("\n");
+      }
+      throw error;
     }
-    const onto = (this.upstreamCommit ?? squashOnto) as ObjectId;
+    if ("status" in settled) return settled;
+    const {
+      currentHead: headId,
+      origHead,
+      headName,
+      branchName,
+      onto,
+      ontoName,
+      upstream,
+      upstreamName,
+      restrict,
+      branchBase,
+      squashOnto,
+    } = settled;
+    this.runOntoName = ontoName;
 
     // git's require_clean_work_tree: no unstaged, no staged changes, unless they are
     // stashed away for the rebase (rebase.autoStash) and applied again after it
-    const output: string[] = [];
+    const output: string[] = [...nameWarnings];
     let autostash: ObjectId | undefined;
     const refusal = await this.uncleanWorktree(headId, worktree);
     if (refusal) {
@@ -922,25 +1235,32 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // --exec and --autosquash never take the shortcut (allow_preemptive_ff)
     const forced = this.committerDateIsAuthorDate || this.ignoreDate || this.signoff;
     const preemptive = !interactive && execs.length === 0 && this.autosquash !== true;
-    if (preemptive && !this.root && (await this.canFastForward(onto, headId))) {
-      const upToDate = headName.startsWith("refs/")
-        ? `Current branch ${headName.replace(/^refs\/heads\//, "")} is up to date`
-        : "HEAD is up to date";
+    if (preemptive && (await this.canFastForward(onto, upstream, restrict, origHead, branchBase))) {
+      const upToDate =
+        branchName === "HEAD" ? "HEAD is up to date" : `Current branch ${branchName} is up to date`;
       if (!forced) {
+        // lazily switch to the target branch if needed (checkout_up_to_date)
+        if (this.branchArg !== undefined) {
+          const refused = await this.checkoutUpToDate(worktree, headId, origHead, headName);
+          if (refused) {
+            await unstash();
+            return { ...refused, output: [...output, ...(refused.output ?? [])] };
+          }
+        }
         output.push(`${upToDate}.`);
         // finish_rebase: what an earlier rebase left removed
         await state.removeRef("REBASE_HEAD", "AUTO_MERGE");
         await unstash();
-        return { status: RebaseStatus.UP_TO_DATE, newHead: headId, output };
+        return { status: RebaseStatus.UP_TO_DATE, newHead: origHead, output };
       }
       output.push(`${upToDate}, rebase forced.`);
     }
 
     // the pre-rebase hook, told the upstream as given (`--root` with --root), may refuse
     if (!this.noVerify) {
-      const upstreamArg =
-        this.root && !this.upstreamCommit ? "--root" : (this.upstreamCommitName ?? onto);
-      const pre = await this.hooks.run("pre-rebase", { args: [upstreamArg] });
+      const upstreamArg = this.root ? "--root" : (upstreamName as string);
+      const args = this.branchArg !== undefined ? [upstreamArg, this.branchArg] : [upstreamArg];
+      const pre = await this.hooks.run("pre-rebase", { args });
       if (pre && pre.exitCode !== 0) {
         await unstash();
         return {
@@ -972,7 +1292,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           output,
         };
       }
-      await state.setRef("ORIG_HEAD", headId);
+      await state.setRef("ORIG_HEAD", origHead);
       await this.refsStore.set("HEAD", onto, this.startLog());
       await runPostCheckoutHook(this.hooks, headId, onto, true);
       await this.finishBranch(headName, onto, onto);
@@ -980,7 +1300,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       return { status, newHead: onto, output };
     };
     // nothing of HEAD's to replay: HEAD moves to upstream
-    if (await this.isAncestor(headId, onto)) return moveToOnto(RebaseStatus.FAST_FORWARD);
+    // get_revision_ranges' base: the upstream, else (--root) onto
+    const base = upstream ?? onto;
+    if (base === onto && !restrict && (await this.isAncestor(origHead, onto))) {
+      return moveToOnto(RebaseStatus.FAST_FORWARD);
+    }
 
     // `--rebase-merges` (else `rebase.rebaseMerges`, a boolean or a cousins mode)
     let rebaseMerges = this.rebaseMerges;
@@ -995,15 +1319,19 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     }
     // the commits to pick: HEAD's, not upstream's, merges dropped (kept with
     // --rebase-merges), oldest first
-    const range = await this.commitsToRebase(headId, onto, !!rebaseMerges);
+    // (git's `<upstream>...<branch>` right side, `^<fork point>` excluded; with --root
+    // everything below the branch)
+    const excluded = [base, restrict].filter((id): id is ObjectId => id !== undefined);
+    const range = await this.commitsToRebase(origHead, excluded, !!rebaseMerges);
     // only merges since upstream (dropped without --rebase-merges): git's todo is a `noop`,
     // and the branch still moves to upstream
     if (range.length === 0) return moveToOnto(RebaseStatus.OK);
     // commits whose change upstream has already (`--cherry-mark`): left out, with git's
     // warnings (`make_script`), unless --reapply-cherry-picks
-    const skipped = this.reapplyCherryPicks
-      ? new Set<ObjectId>()
-      : await this.appliedUpstream(headId, onto, range);
+    const skipped =
+      (this.reapplyCherryPicks ?? this.keepBase)
+        ? new Set<ObjectId>()
+        : await this.appliedUpstream(origHead, base, range, restrict);
     const ids = range.filter((id) => !skipped.has(id));
     if (skipped.size > 0) {
       for (const id of range) {
@@ -1015,7 +1343,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       if (configBool(this.workingCopy, "advice.skippedCherryPicks", true)) {
         output.push(
           "hint: use --reapply-cherry-picks to include skipped commits",
-          'hint: Disable this message with "git config set advice.skippedCherryPicks false"',
+          // 2.43's advice: `git config <key> false`
+          `hint: Disable this message with "git config${(this.compatibility ?? this.hooks.compatibility) === "2.43" ? "" : " set"} advice.skippedCherryPicks false"`,
         );
       }
     }
@@ -1024,8 +1353,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     let script = "";
     if (rebaseMerges) {
       script = await this.makeScriptWithMerges(
-        headId,
-        onto,
+        origHead,
+        base,
         range,
         skipped,
         rebaseCousins,
@@ -1048,7 +1377,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // init_basic_state / write_basic_state
     await state.write(`${DIR}/head-name`, `${headName}\n`);
     await state.write(`${DIR}/onto`, `${onto}\n`);
-    await state.write(`${DIR}/orig-head`, `${headId}\n`);
+    await state.write(`${DIR}/orig-head`, `${origHead}\n`);
     // write_basic_state: gpg_sign_opt (`-S<key>`) when the run signs
     const sign = signRequestOf(this.workingCopy, this.sign);
     this.runSign = { key: sign };
@@ -1099,8 +1428,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       comment,
       {
         shortRevisions: this.root
-          ? await this.abbreviateObjectId(headId)
-          : `${shortOnto}..${await this.abbreviateObjectId(headId)}`,
+          ? await this.abbreviateObjectId(origHead)
+          : `${await this.abbreviateObjectId(base)}..${await this.abbreviateObjectId(origHead)}`,
         shortOnto,
       },
       missingCheck === "error",
@@ -1137,7 +1466,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         targetTree: ontoTreeId,
       });
       if (!refused) {
-        await state.setRef("ORIG_HEAD", headId);
+        await state.setRef("ORIG_HEAD", origHead);
         await this.refsStore.set("HEAD", onto, this.startLog());
       }
       return { status: RebaseStatus.FAILED, message: lines.join("\n"), output };
@@ -1212,7 +1541,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         start,
         this.startLog(),
         "rebase: updating ORIG_HEAD",
-        { detach: true },
+        { detach: true, origHead },
       )),
     );
     // checkout_onto's post-checkout hook: the HEAD left, the commit the picks start from
@@ -3254,7 +3583,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
 
   /** HEAD detached at upstream: `rebase (start): checkout <upstream as given>`. */
   private startLog(): RefLogOptions {
-    const onto = this.upstreamCommitName ?? this.upstreamCommit ?? "";
+    const onto = this.runOntoName ?? this.upstreamCommitName ?? this.upstreamCommit ?? "";
     return this.reflogLine(
       reflogMessages.rebaseStart(this.reflogAction("rebase"), onto),
       this.committer,
@@ -4060,11 +4389,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
    */
   private async commitsToRebase(
     head: ObjectId,
-    upstream: ObjectId,
+    excluded: ObjectId[],
     keepMerges = false,
   ): Promise<ObjectId[]> {
     const upstreamCommits = new Set<ObjectId>();
-    const walk = [upstream];
+    const walk = [...excluded];
     while (walk.length > 0) {
       const id = walk.pop() as ObjectId;
       if (upstreamCommits.has(id)) continue;
@@ -4120,9 +4449,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     head: ObjectId,
     upstream: ObjectId,
     range: ObjectId[],
+    /** The fork point (`^<fork point>`), which limits upstream's side too */
+    restrict?: ObjectId,
   ): Promise<Set<ObjectId>> {
     const skipped = new Set<ObjectId>();
-    const left = await this.onlyReachableFrom(upstream, head);
+    const left = await this.onlyReachableFrom(upstream, restrict ? [head, restrict] : [head]);
     if (left.length === 0 || range.length === 0) return skipped;
     // each tree read once: a commit's tree is its child's parent tree
     const treeEntries = new Map<ObjectId, TreeEntry[]>();
@@ -4183,7 +4514,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
    * what `other` reaches painted uninteresting, done once every commit still queued is
    * uninteresting (and a few more, git's slop against clock skew).
    */
-  private async onlyReachableFrom(tip: ObjectId, other: ObjectId): Promise<ObjectId[]> {
+  private async onlyReachableFrom(tip: ObjectId, others: ObjectId[]): Promise<ObjectId[]> {
     interface Node {
       id: ObjectId;
       time: number;
@@ -4225,7 +4556,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         }
       }
     };
-    await push(other, true);
+    for (const other of others) await push(other, true);
     await push(tip, false);
     const out: Node[] = [];
     let slop = 5;
@@ -4255,13 +4586,63 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
-   * builtin/rebase.c's can_fast_forward for `git rebase <upstream>` (onto the upstream, no
-   * fork point, no --keep-base): HEAD and upstream have one merge base, upstream itself, and
-   * the first-parent line from HEAD down to it has no merge (is_linear_history). Upstream
-   * in HEAD's history is that one merge base.
+   * builtin/rebase.c's checkout_up_to_date: the `<branch>` argument checked out when there
+   * is nothing to rebase (reset_working_tree: the worktree switched from HEAD, the branch
+   * and HEAD logged `rebase: checkout <branch>`, the post-checkout hook run).
    */
-  private async canFastForward(onto: ObjectId, head: ObjectId): Promise<boolean> {
-    if (!(await this.isAncestor(onto, head))) return false;
+  private async checkoutUpToDate(
+    worktree: Worktree | undefined,
+    headId: ObjectId,
+    origHead: ObjectId,
+    headName: string,
+  ): Promise<RebaseResult | undefined> {
+    const branch = this.branchArg as string;
+    const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
+    const targetTreeId = await this.commits.getTree(origHead);
+    const targetTree = await flatTree(this.trees, targetTreeId);
+    const refused = await switchTrees(this.context(worktree), headTree, targetTree, {
+      action: "checkout",
+      operation: "rebase",
+      targetTree: targetTreeId,
+    });
+    if (refused) {
+      return {
+        status: RebaseStatus.FAILED,
+        message: `${refused.message}\nerror: could not switch to ${branch}`,
+      };
+    }
+    const log = this.reflogLine(
+      `${this.reflogAction("rebase")}: checkout ${branch}`,
+      this.committer,
+    );
+    if (headName.startsWith("refs/")) {
+      await this.refsStore.set(headName, origHead, log);
+      await this.refsStore.setSymbolic("HEAD", headName, log);
+    } else {
+      await this.refsStore.set("HEAD", origHead, log);
+    }
+    await runPostCheckoutHook(this.hooks, headId, origHead, true);
+    return undefined;
+  }
+
+  /**
+   * builtin/rebase.c's can_fast_forward: the branch's one merge base with onto is onto
+   * (`branchBase`), the fork point (if any) is that base too, the upstream (none with
+   * --root) and the branch have one merge base, onto, and the first-parent line from the
+   * branch down to onto has no merge (is_linear_history).
+   */
+  private async canFastForward(
+    onto: ObjectId,
+    upstream: ObjectId | undefined,
+    restrict: ObjectId | undefined,
+    head: ObjectId,
+    branchBase: ObjectId | undefined,
+  ): Promise<boolean> {
+    if (branchBase === undefined || branchBase !== onto) return false;
+    if (restrict !== undefined && restrict !== branchBase) return false;
+    if (upstream === undefined) return false;
+    const bases = await revisionMergeBases(this.commits, upstream, head);
+    if (bases.length !== 1 || bases[0] !== onto) return false;
     let id: ObjectId | undefined = head;
     while (id !== undefined && id !== onto) {
       const parents: ObjectId[] = (await this.loadCommit(id))?.parents ?? [];
