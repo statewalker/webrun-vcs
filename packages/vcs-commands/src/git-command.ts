@@ -66,6 +66,7 @@ import {
 } from "./commands/git-ident.js";
 import { indexHostOf, indexVersionConfigError } from "./commands/index-host.js";
 import { loadLegacyRemote } from "./commands/legacy-remotes.js";
+import { type Mailmap, readRepositoryMailmap } from "./commands/mailmap.js";
 import type { MergeBaseGraph } from "./commands/merge-bases.js";
 import type { NotesContext } from "./commands/notes-support.js";
 import { postIndexChangeHookOf } from "./commands/post-index-change.js";
@@ -1337,6 +1338,58 @@ export abstract class GitCommand<T> {
       return head.target;
     }
     return undefined;
+  }
+
+  /**
+   * The repository's mailmap as mailmap.c's read_mailmap reads it: the worktree's
+   * `.mailmap` (not in a bare repository), `mailmap.blob` (default `HEAD:.mailmap` in a bare
+   * repository), `mailmap.file`. git's `error:` lines (a `mailmap.blob` that is no blob) go
+   * to `onError`.
+   */
+  protected readMailmap(onError?: (line: string) => void): Promise<Mailmap> {
+    const config = RemoteConfigStore.from(this._workingCopy);
+    let worktree: Worktree | undefined;
+    try {
+      worktree = this.worktreeAccess;
+    } catch {
+      // a bare repository's working copy refuses its worktree
+    }
+    return readRepositoryMailmap({
+      config: (key) => config.value(key),
+      worktree,
+      environment: hostEnvironmentOf(this._workingCopy),
+      readObjectNamed: (name) => this.readObjectNamed(name),
+      ...(onError ? { onError } : {}),
+    });
+  }
+
+  /** The object a revision names, with its type (`bytes` undefined when it cannot be read). */
+  protected async readObjectNamed(
+    name: string,
+  ): Promise<{ type: string; bytes?: Uint8Array } | undefined> {
+    const resolver = this.revisionResolver();
+    const id = await resolver.resolve(name).catch(() => undefined);
+    if (!id) return undefined;
+    const type = await resolver.objectType(id).catch(() => undefined);
+    if (!type) return { type: "unknown" };
+    if (type !== "blob") return { type, bytes: new Uint8Array(0) };
+    try {
+      const content = await this.blobs.load(id);
+      if (!content) return { type };
+      const chunks: Uint8Array[] = [];
+      for await (const c of content) chunks.push(c);
+      let size = 0;
+      for (const c of chunks) size += c.length;
+      const bytes = new Uint8Array(size);
+      let at = 0;
+      for (const c of chunks) {
+        bytes.set(c, at);
+        at += c.length;
+      }
+      return { type, bytes };
+    } catch {
+      return { type };
+    }
   }
 
   /**
