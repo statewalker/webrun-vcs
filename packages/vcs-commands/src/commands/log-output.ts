@@ -17,8 +17,8 @@
  * `log.date`, `log.abbrevCommit`, `log.decorate`, `log.showRoot`, `log.mailmap`,
  * `log.follow`, `log.graphIndent`, `log.excludeDecoration`, `notes.displayRef`...). Colors
  * are written as `git log --color=always` writes them when the diff options or `color.ui` /
- * `color.diff` ask for `always` (`auto` is git without a terminal: none); `--graph` in color is
- * refused (graph.c's column colors are not reproduced).
+ * `color.diff` ask for `always` (`auto` is git without a terminal: none), the graph's columns
+ * in `log.graphColors` (graph.c's `column_colors_ansi` by default).
  *
  * A commit with an `encoding` header is shown in UTF-8 (git's default `i18n.logOutputEncoding`);
  * another output encoding is not supported. One quirk of git is not reproduced: where its C
@@ -804,7 +804,7 @@ export class LogPrinter {
       firstParentOnly: boolean;
       paths: string[];
       /** The colors (`--color`, `color.ui`...), undefined for none */
-      colors?: { diff: DiffColors; decorations: DecorationPalette };
+      colors?: { diff: DiffColors; decorations: DecorationPalette; graph: readonly string[] };
     },
   ) {
     const prettyGiven = options.pretty !== undefined || !!options.oneline;
@@ -958,6 +958,7 @@ export class LogPrinter {
       firstParentOnly: this.walk.firstParentOnly,
       indent,
       ...(this.options.graphLaneLimit ? { maxLanes: this.options.graphLaneLimit } : {}),
+      ...(this.walk.colors ? { colors: this.walk.colors.graph } : {}),
     });
   }
 

@@ -17,5 +17,6 @@ functions, moved lines are detected over one diff's files (`MovedLineBuffer`:
 `add_lines_to_move_detection`, `mark_color_as_moved`, `dim_moved_lines`), and `--stat`,
 combined diffs (`--cc`), `--submodule=log|diff`, log's commit lines and decorations, `%C(auto)`
 decorations and show's `tag`/`tree` headers take their colors. `colorCompatibility: "2.43"`
-drops what git 2.43 lacks (`#rgb`, the `incomplete-line` whitespace rule). `git log --graph` in
-color is refused (`NotImplementedError`): graph.c's column colors are not reproduced.
+drops what git 2.43 lacks (`#rgb`, the `incomplete-line` whitespace rule). `git log --graph` draws
+its columns in color as graph.c does (`column_colors_ansi`, or `log.graphColors`; its invalid
+colors reported in the new `LogCommand.warnings`).

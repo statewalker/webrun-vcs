@@ -34,6 +34,7 @@ import type { DiffColors } from "../results/diff-color.js";
 import { DiffPickaxe } from "../results/diff-pickaxe.js";
 import { quotePath } from "../results/quote-path.js";
 import { bareAttributesResolver } from "./attributes-source.js";
+import { parseGitColor } from "./config-value-types.js";
 import {
   DEFAULT_DECORATION_COLORS,
   type DiffColorSettings,
@@ -46,6 +47,7 @@ import {
   hasPickaxe,
 } from "./diff-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import { GRAPH_COLUMN_COLORS_ANSI, graphColumnColors } from "./log-graph.js";
 import {
   type LogOutputEntry,
   type LogOutputHost,
@@ -1512,10 +1514,6 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     // --use-mailmap/--no-mailmap: what --author/--committer match too
     if (options.mailmap !== undefined) this.useMailmap ??= options.mailmap;
     const colors = this.readColors();
-    if (colors && options.graph) {
-      // graph.c's column colors (`log.graphColors`) are not reproduced
-      throw new NotImplementedError("git log --graph --color");
-    }
     const host = this.outputHost(options);
     const paths = [...this.paths];
     // the pathspec as git holds it: the excluded paths as `:(exclude)` elements, `.` when
@@ -2010,12 +2008,24 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   private diffOptions: DiffTextOptions = {};
   /** The colors {@link callBytes} prints with */
   private colorSettings?: DiffColorSettings;
+  private readonly outputWarnings: string[] = [];
+
+  /**
+   * What git prints on stderr while {@link callBytes} prints the log without dying: the
+   * `log.graphColors` colors it cannot parse (`error: invalid color value: <c>`, then
+   * `warning: ignored invalid color '<c>' in log.graphColors`)
+   */
+  get warnings(): readonly string[] {
+    return this.outputWarnings;
+  }
 
   /**
    * git_log_config (git_diff_ui_config): the colors, read once for every commit's diff; the
    * palettes of the log's own lines, undefined without color
    */
-  private readColors(): { diff: DiffColors; decorations: DecorationPalette } | undefined {
+  private readColors():
+    | { diff: DiffColors; decorations: DecorationPalette; graph: readonly string[] }
+    | undefined {
     this.colorSettings = readDiffColorSettings(
       this.workingCopy,
       this.diffOptions,
@@ -2023,12 +2033,30 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     );
     const colors = this.colorSettings.colors;
     if (!colors) return undefined;
+    // graph_read_config: `log.graphColors` (its invalid colors left out with git's warning)
+    const configured = configValue(this.workingCopy, "log.graphColors");
+    const compatibility = this.diffOptions.colorCompatibility ?? "2.56";
+    const graph =
+      configured === undefined
+        ? GRAPH_COLUMN_COLORS_ANSI
+        : graphColumnColors(
+            configured,
+            (spec) => {
+              const color = parseGitColor(spec, compatibility);
+              // color_parse_mem's own error, before graph.c's warning
+              if (color === undefined)
+                this.outputWarnings.push(`error: invalid color value: ${spec}`);
+              return color;
+            },
+            (message) => this.outputWarnings.push(message),
+          );
     return {
       diff: colors,
       decorations: {
         ...(this.colorSettings.decorationColors ?? DEFAULT_DECORATION_COLORS),
         commit: colors.commit,
       },
+      graph,
     };
   }
 

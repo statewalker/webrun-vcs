@@ -119,11 +119,15 @@ async function ours(dir: string, config: CommandLineConfig = {}): Promise<Git> {
 
 /** What ours gave, or the error it threw as git's exit status and lines */
 async function outcome(
-  run: () => Promise<{ bytes: Uint8Array; status?: number }>,
+  run: () => Promise<{ bytes: Uint8Array; status?: number; stderr?: readonly string[] }>,
 ): Promise<Outcome> {
   try {
-    const { bytes, status } = await run();
-    return { status: status ?? 0, stdout: Buffer.from(bytes), messages: [] };
+    const { bytes, status, stderr } = await run();
+    return {
+      status: status ?? 0,
+      stdout: Buffer.from(bytes),
+      messages: messageLines((stderr ?? []).join("\n")),
+    };
   } catch (e) {
     const err = e as { exitCode?: number; message: string };
     if (err.exitCode === undefined) throw e;
@@ -179,7 +183,8 @@ async function twinLog(
   const theirs = native(dir, ["log", ...args], config);
   const mine = await outcome(async () => {
     const git = await ours(dir, config);
-    return { bytes: await build(git.log()).callBytes(output) };
+    const log = build(git.log());
+    return { bytes: await log.callBytes(output), stderr: log.warnings };
   });
   const m = differs(`git log ${args.join(" ")}`, theirs, mine);
   if (m) out.push(m);
@@ -1169,6 +1174,112 @@ describeGit("submodules in color (t4015-diff-whitespace)", () => {
       await twinDiff(out, dir, [`--submodule=${format}`, "--color"], (d) =>
         d.setSubmoduleFormat(format).setOptions(COLOR),
       );
+    }
+    expect(out).toEqual([]);
+  });
+});
+
+describeGit("log --graph in color (t4202-log, t4214-log-graph-octopus)", () => {
+  const graphOptions: LogOutputOptions = { graph: true, dateOrder: true, pretty: "tformat:%s" };
+  const twinGraph = async (
+    out: string[],
+    dir: string,
+    revs: string[],
+    config: CommandLineConfig = {},
+    extra: { args: string[]; output: LogOutputOptions } = { args: [], output: {} },
+  ) => {
+    const ids = revs.map((r) => sh(dir, `git rev-parse ${r}`).trim());
+    await twinLog(
+      out,
+      dir,
+      ["--graph", "--color=always", "--date-order", "--format=%s", ...extra.args, ...revs],
+      (log) => {
+        for (const id of ids) log.add(id);
+        return log.setDiffOptions({ ...versionOptions, color: "always" });
+      },
+      { ...graphOptions, ...extra.output },
+      config,
+    );
+  };
+
+  const t4202Setup = `
+    for n in one two three four five; do echo $n >$n; git add $n; commit -m $n; done
+    git checkout -q -b side HEAD~4
+    echo side-1 >1; git add 1; commit -m side-1; git tag side-1
+    echo side-2 >2; git add 2; commit -m side-2; git tag side-2
+    git checkout -q main
+    test_tick
+    git merge -q --no-edit side
+  `;
+
+  it('t4202-log.sh: "log --graph with merge with log.graphColors"', async () => {
+    const dir = repo(t4202Setup);
+    const out: string[] = [];
+    await twinGraph(out, dir, ["main"], {
+      "log.graphColors": " blue,invalid-color, cyan, red  , ",
+    });
+    // the default palette, and color through color.ui alone
+    await twinGraph(out, dir, ["main"]);
+    const ids = [sh(dir, "git rev-parse main").trim()];
+    await twinLog(
+      out,
+      dir,
+      ["--graph", "--date-order", "--format=%s", "main"],
+      (log) => {
+        for (const id of ids) log.add(id);
+        return log.setDiffOptions(versionOptions);
+      },
+      graphOptions,
+      { "color.ui": "always" },
+    );
+    // a graph with the patch and stat beside it
+    await twinGraph(
+      out,
+      dir,
+      ["main"],
+      {},
+      {
+        args: ["--stat", "-p"],
+        output: { stat: true, patch: true },
+      },
+    );
+    expect(out).toEqual([]);
+  });
+
+  const t4214Setup = `
+    test_commit () { echo "\${3:-$1}" >"\${2:-$1.t}"; git add "\${2:-$1.t}"; commit -m "$1"; git tag "\${4:-$1}"; }
+    test_commit initial
+    for i in 1 2 3 4; do
+      git checkout -q main -b $i
+      test_commit $i $i $i tag$i
+    done
+    git checkout -q 1 -b merge
+    test_tick
+    git merge -q -m octopus-merge 1 2 3 4
+    git tag octopus-merge
+    test_commit after-merge
+    git checkout -q 1 -b L
+    test_commit left
+    git checkout -q 4 -b crossover
+    test_commit after-4
+    git checkout -q initial -b more-L
+    test_commit after-initial
+  `;
+
+  it('t4214-log-graph-octopus.sh: "log --graph with tricky octopus merge with colors", "log --graph with normal octopus merge with colors", "log --graph with normal octopus and child merge with colors", "log --graph with tricky octopus merge and its child with colors", "log --graph with crossover in octopus merge with colors", "log --graph with crossover in octopus merge and its child with colors", "log --graph with unrelated commit and octopus tip with colors", "log --graph with unrelated commit and octopus child with colors"', async () => {
+    const dir = repo(t4214Setup);
+    const out: string[] = [];
+    for (const revs of [
+      ["left", "octopus-merge"],
+      ["octopus-merge"],
+      ["after-merge"],
+      ["left", "after-merge"],
+      ["after-4", "octopus-merge"],
+      ["after-4", "after-merge"],
+      ["after-initial", "octopus-merge"],
+      ["after-initial", "after-merge"],
+    ]) {
+      await twinGraph(out, dir, revs);
     }
     expect(out).toEqual([]);
   });
