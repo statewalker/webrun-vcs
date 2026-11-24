@@ -522,6 +522,7 @@ export function createNodeGitHostEnvironment(
     ...(options.breakingChanges ? { breakingChanges: true } : {}),
     // the object format of a new repository (validate_hash_algorithm), as given
     ...(env.GIT_DEFAULT_HASH !== undefined ? { defaultHash: env.GIT_DEFAULT_HASH } : {}),
+    ...(env.GIT_TEMPLATE_DIR !== undefined ? { templateDir: env.GIT_TEMPLATE_DIR } : {}),
     // the version of a new index (get_index_format_default), as given
     ...(env.GIT_INDEX_VERSION !== undefined ? { indexVersion: env.GIT_INDEX_VERSION } : {}),
     ...(env.GIT_DEFAULT_REF_FORMAT !== undefined

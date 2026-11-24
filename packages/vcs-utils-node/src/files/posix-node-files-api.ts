@@ -654,15 +654,17 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
   // ========== PosixFilesApi ==========
 
   /**
-   * Sets the permission bits (`mode & 0o777`: never setuid, setgid or sticky) on a
-   * descriptor opened without following a link, so a link swapped in is never chmod'ed
-   * through.
+   * Sets the permission bits (`mode & 0o777`: never setuid or sticky, and setgid only on a
+   * directory, as git's shared repositories set it) on a descriptor opened without following
+   * a link, so a link swapped in is never chmod'ed through.
    */
   async chmod(path: string, mode: number): Promise<void> {
     const real = await this.realNoLinks(path);
-    if ((await fs.lstat(fsPath(real))).isSymbolicLink()) {
+    const before = await fs.lstat(fsPath(real));
+    if (before.isSymbolicLink()) {
       throw new Error(`PosixNodeFilesApi: will not chmod through a symbolic link: ${path}`);
     }
+    mode &= before.isDirectory() ? 0o2777 : 0o777;
     let handle: fs.FileHandle;
     try {
       handle = await fs.open(fsPath(real), fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
@@ -676,11 +678,11 @@ export class PosixNodeFilesApi extends NodeFilesApi implements PosixFilesApi {
       if ((await fs.lstat(fsPath(real))).isSymbolicLink()) {
         throw new Error(`PosixNodeFilesApi: will not chmod through a symbolic link: ${path}`);
       }
-      await fs.chmod(fsPath(real), mode & 0o777);
+      await fs.chmod(fsPath(real), mode);
       return;
     }
     try {
-      await handle.chmod(mode & 0o777);
+      await handle.chmod(mode);
     } finally {
       await handle.close();
     }

@@ -27,7 +27,11 @@ import {
   withLazyFetch,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
-import type { AtomicFiles } from "@statewalker/vcs-utils/files";
+import {
+  type AtomicFiles,
+  parseSharedRepository,
+  withSharedPerm,
+} from "@statewalker/vcs-utils/files";
 import {
   type ObjectFormat,
   SHA1_OBJECT_FORMAT,
@@ -81,6 +85,12 @@ export interface GitFilesBackendOptions {
    * --ref-format=reftable` lays them out)
    */
   refFormat?: "files" | "reftable";
+  /**
+   * With `create`: false leaves the config file to the caller, who wrote it before (`git
+   * init` writes it as its own sequence of settings, templates and `--shared` included);
+   * default true, a fresh config of the layout's.
+   */
+  writeConfig?: boolean;
   /**
    * Lock-file primitives rooted at the `.git` directory, for atomic ref batches.
    * Defaults to `atomicFilesOver(files, ".git")`: cross-process when the FilesApi has
@@ -212,7 +222,7 @@ export async function createGitFilesBackend(
 ): Promise<GitFilesBackendResult> {
   const { gitDir = ".git", create = false, defaultBranch = "main" } = options;
   // a `.git` or `.git/objects` the user linked elsewhere is followed, as git follows it
-  const files = await resolveLinkedGitDir(options.files, gitDir);
+  const linked = await resolveLinkedGitDir(options.files, gitDir);
 
   const objectsDir = joinPath(gitDir, "objects");
   const packDir = joinPath(objectsDir, "pack");
@@ -220,7 +230,7 @@ export async function createGitFilesBackend(
   // git's check_repository_format: a version or extension we cannot honour (a compatibility
   // object format, an unknown v1 extension) is refused before anything is read or written.
   // Like git's read_repository_format it reads the config file alone, without includes.
-  const format = await readRepositoryFormat(files, gitDir);
+  const format = await readRepositoryFormat(linked, gitDir);
   const refStorage = create && options.refFormat === "reftable" ? "reftable" : format.refStorage;
   // the hash naming the objects (`extensions.objectFormat`): SHA-1, or SHA-256
   const objectFormat = options.objectFormat ?? format.objectFormat;
@@ -240,8 +250,30 @@ export async function createGitFilesBackend(
   };
 
   if (create) {
-    await createGitDirectoryStructure(files, gitDir, objectsDir, refStorage, objectFormat);
+    await createGitDirectoryStructure(linked, gitDir, objectsDir, refStorage, objectFormat, {
+      writeConfig: options.writeConfig !== false,
+    });
   }
+  // one load of the sequence for the pack and ref store settings (nothing writes the config
+  // in between: a created repository's is written above)
+  const settingsConfig = await createWorkingCopyConfig(
+    configFilesApiOf(linked, { readOnly: "reading the store settings never writes the config" }),
+    gitDir,
+    undefined,
+    settingsOptions,
+  );
+  // core.sharedRepository: what the stores create below gets git's modes (adjust_shared_perm);
+  // a value git dies on leaves the modes to the umask here (index-host reads it the same way)
+  let shared = 0;
+  try {
+    const value = settingsConfig.get("core.sharedRepository");
+    // a key without a value is group (git_config_perm of NULL)
+    shared =
+      value === true ? 0o660 : parseSharedRepository(typeof value === "string" ? value : undefined);
+  } catch {
+    shared = 0;
+  }
+  const files = shared ? withSharedPerm(linked, () => shared, gitDir) : linked;
 
   // Objects: the installed packs first, then the kernel over git's loose layout
   // (tmp_obj_* and a rename). A REF_DELTA base outside its pack resolves through the
@@ -255,14 +287,6 @@ export async function createGitFilesBackend(
   });
   const looseOnly = createGitObjects(staging, { objectFormat });
   // git's core.deltaBaseCacheLimit (96 MiB when unset) and core.multiPackIndex (default on)
-  // one load of the sequence for the pack and ref store settings (nothing writes the config
-  // in between: a created repository's is written above)
-  const settingsConfig = await createWorkingCopyConfig(
-    configFilesApiOf(files, { readOnly: "reading the store settings never writes the config" }),
-    gitDir,
-    undefined,
-    settingsOptions,
-  );
   const packSettings = await readPackSetSettings(files, gitDir, {
     ...settingsOptions,
     config: settingsConfig,
@@ -477,10 +501,13 @@ async function createGitDirectoryStructure(
   objectsDir: string,
   refStorage: "files" | "reftable" = "files",
   objectFormat: ObjectFormat = SHA1_OBJECT_FORMAT,
+  { writeConfig = true }: { writeConfig?: boolean } = {},
 ): Promise<void> {
   await files.mkdir(gitDir);
   await files.mkdir(objectsDir);
+  // odb_source_create_on_disk: objects/pack and objects/info
   await files.mkdir(joinPath(objectsDir, "pack"));
+  await files.mkdir(joinPath(objectsDir, "info"));
   await files.mkdir(joinPath(gitDir, "refs"));
   const encoder = new TextEncoder();
   const bare = gitDir === "." ? "true" : "false";
@@ -495,6 +522,7 @@ async function createGitDirectoryStructure(
     await files.mkdir(joinPath(gitDir, "reftable"));
     // git writes `objectformat` before `refstorage` (initialize_repository_version)
     const hash = objectFormat.name === "sha1" ? "" : `\tobjectformat = ${objectFormat.name}\n`;
+    if (!writeConfig) return;
     await files.write(joinPath(gitDir, "config"), [
       encoder.encode(
         `[extensions]\n${hash}\trefstorage = reftable\n[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = ${bare}\n`,
@@ -508,6 +536,7 @@ async function createGitDirectoryStructure(
   // a SHA-256 repository is version 1 with `extensions.objectformat` (git's
   // initialize_repository_version)
   const sha1 = objectFormat.name === "sha1";
+  if (!writeConfig) return;
   await files.write(joinPath(gitDir, "config"), [
     encoder.encode(
       `[core]\n\trepositoryformatversion = ${sha1 ? 0 : 1}\n\tfilemode = true\n\tbare = ${bare}\n` +
