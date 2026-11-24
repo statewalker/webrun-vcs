@@ -34,6 +34,7 @@ import {
   prefixOriginElement,
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
+import { PathspecFile } from "./pathspec-file.js";
 import { reflogMessages, updateHead } from "./reflog-messages.js";
 import { ResetCommand } from "./reset-command.js";
 import { STASH_REF } from "./stash-list-command.js";
@@ -207,6 +208,8 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   private customMessage?: string;
   private author?: PersonIdent;
   private readonly pathspec: string[] = [];
+  /** `--pathspec-from-file` */
+  private readonly pathspecFile = new PathspecFile();
   private staged = false;
   private compatibility: PathspecOriginStyle = "2.56";
   private quiet = false;
@@ -319,6 +322,26 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   addPath(path: string): this {
     this.checkCallable();
     this.pathspec.push(path);
+    return this;
+  }
+
+  /**
+   * `--pathspec-from-file` (and `--pathspec-file-nul` with `nul`): the pathspec elements of
+   * `content`, one per line (a line starting with `"` unquoted as a C string), or separated
+   * by NUL with `nul`, stashed as {@link addPath} elements are. As git's push_stash: refused
+   * with {@link setPatch}, with {@link setStaged} and beside `addPath` elements ("'--pathspec-from-file'
+   * and pathspec arguments cannot be used together").
+   *
+   * @example
+   * ```typescript
+   * await git.stashCreate().setPathspecFromFile("src/a.ts\n").call();
+   * ```
+   *
+   * @throws InvalidArgumentError "fatal: line is badly quoted: <line>"
+   */
+  setPathspecFromFile(content: string | Uint8Array, nul = false): this {
+    this.checkCallable();
+    this.pathspecFile.read(content, nul);
     return this;
   }
 
@@ -493,6 +516,11 @@ export class StashCreateCommand extends GitCommand<ObjectId | undefined> {
   async call(): Promise<ObjectId | undefined> {
     this.checkCallable();
     this.setCallable(false);
+    // push_stash's checks of --pathspec-from-file, before anything is read
+    this.pathspecFile.refuse("--patch", this.patch);
+    this.pathspecFile.refuse("--staged", this.staged);
+    const pathspec = this.pathspecFile.pathspec(this.pathspec);
+    this.pathspec.splice(0, this.pathspec.length, ...pathspec);
     // the index as it is now, before the worktree or a ref is touched: one another writer
     // replaced is read again (git reads the index at its start), unless this instance holds
     // unwritten edits (refused)
