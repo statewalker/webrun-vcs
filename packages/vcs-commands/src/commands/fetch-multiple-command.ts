@@ -3,9 +3,9 @@ import { parseGitBool } from "@statewalker/vcs-utils";
 import type { WorktreeAdmin } from "@statewalker/vcs-working-tree";
 
 import { GitApiError, InvalidArgumentError } from "../errors/index.js";
+import { GuardedTransportCommand } from "../guarded-transport-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type FetchResult, RefUpdateStatus } from "../results/index.js";
-import { TransportCommand } from "../transport-command.js";
 import { FetchCommand, TagOption } from "./fetch-command.js";
 
 /** One fetch of a {@link FetchMultipleCommand}: git's child `git fetch <remote>`. */
@@ -15,6 +15,8 @@ export interface FetchMultipleEntry {
   result?: FetchResult;
   /** Why it failed (git's child died) */
   error?: Error;
+  /** A remote group nested in a group: the child's own fetch of its remotes */
+  nested?: FetchMultipleResult;
   /** The child's exit status: 0, 1 for a refused ref or an error it reported, else its death's */
   exitCode: number;
 }
@@ -61,7 +63,8 @@ export interface FetchMultipleResult {
  * await git.fetchMultiple().setRemotes("upstream", "mirrors").setPrune(true).call();
  * ```
  */
-export class FetchMultipleCommand extends TransportCommand<FetchMultipleResult> {
+export class FetchMultipleCommand extends GuardedTransportCommand<FetchMultipleResult> {
+  private groupDepth = 0;
   private all?: boolean;
   private multiple = true;
   private names: string[] = [];
@@ -199,47 +202,12 @@ export class FetchMultipleCommand extends TransportCommand<FetchMultipleResult> 
     }
     for (const name of this.names) await this.loadLegacyRemote(name);
 
-    let all = this.all;
-    if (all === undefined) {
-      // fetch.all (git 2.44+): only when no remote is named
-      all =
-        this.names.length === 0 &&
-        this.hooks.compatibility !== "2.43" &&
-        parseGitBool(store.value("fetch.all")) === true;
-    }
-    let list: string[] = [];
-    let single: string | undefined;
-    if (all) {
-      if (this.names.length === 1) {
-        throw new GitApiError("fatal: fetch --all does not take a repository argument");
-      }
-      if (this.names.length > 1) {
-        throw new GitApiError("fatal: fetch --all does not make sense with refspecs");
-      }
-      // get_one_remote_for_fetch
-      list = store.configuredNames().filter((name) => !skipsDefaultUpdate(store, name));
-      if (list.length === 1) single = list[0];
-    } else if (this.names.length === 0) {
-      single = await this.defaultRemote(store);
-    } else if (this.multiple) {
-      for (const name of this.names) {
-        if (!addRemoteOrGroup(store, name, list)) {
-          throw new GitApiError(`fatal: no such remote or remote group: ${name}`);
-        }
-      }
-    } else {
-      if (this.names.length > 1) {
-        throw new InvalidArgumentError(
-          "remotes",
-          this.names,
-          "only one remote or group without --multiple (the rest would be refspecs)",
-        );
-      }
-      addRemoteOrGroup(store, this.names[0] as string, list);
-      if (list.length <= 1) single = this.names[0];
-    }
-    // string_list_remove_duplicates: repeats in a row
-    list = list.filter((name, i) => i === 0 || list[i - 1] !== name);
+    const { list, single } = await this.targets(store);
+    // who gets the static credentials and headers: decided from every URL this call reaches
+    this.resolveAuth(
+      single !== undefined ? [store.remoteUrlOf(single)] : reachedUrls(store, list),
+      store.urlFor(await this.defaultRemote(store)),
+    );
 
     if (single !== undefined) {
       const entry = await this.fetchOne(single, false, this.commandLine());
@@ -281,8 +249,13 @@ export class FetchMultipleCommand extends TransportCommand<FetchMultipleResult> 
       if (!this.porcelain) stdout += `Fetching ${name}\n`;
       const entry = await this.fetchOne(name, true, [...childArgs, name].join(" "));
       fetches.push(entry);
-      if (this.porcelain) stdout += linesOf(entry.result?.display);
-      stderr += stderrOf(entry, this.porcelain);
+      if (entry.nested) {
+        stdout += entry.nested.stdout;
+        stderr += entry.nested.stderr;
+      } else {
+        if (this.porcelain) stdout += linesOf(entry.result?.display);
+        stderr += stderrOf(entry, this.porcelain);
+      }
       if (entry.exitCode !== 0) {
         failed = true;
         stderr += parallel
@@ -293,12 +266,127 @@ export class FetchMultipleCommand extends TransportCommand<FetchMultipleResult> 
     return { remotes: list, fetches, stdout, stderr, exitCode: failed ? 1 : 0 };
   }
 
+  /**
+   * The remotes to fetch (fetch.c's list: `--all`, each name as a group or remote, repeats in
+   * a row dropped), or the one remote fetched as `git fetch <remote>`.
+   */
+  private async targets(store: RemoteConfigStore): Promise<{ list: string[]; single?: string }> {
+    let all = this.all;
+    if (all === undefined) {
+      // fetch.all (git 2.44+): only when no remote is named
+      all =
+        this.names.length === 0 &&
+        this.hooks.compatibility !== "2.43" &&
+        parseGitBool(store.value("fetch.all")) === true;
+    }
+    let list: string[] = [];
+    let single: string | undefined;
+    if (all) {
+      if (this.names.length === 1) {
+        throw new GitApiError("fatal: fetch --all does not take a repository argument");
+      }
+      if (this.names.length > 1) {
+        throw new GitApiError("fatal: fetch --all does not make sense with refspecs");
+      }
+      // get_one_remote_for_fetch
+      list = store.configuredNames().filter((name) => !skipsDefaultUpdate(store, name));
+      if (list.length === 1) single = list[0];
+    } else if (this.names.length === 0) {
+      single = await this.defaultRemote(store);
+    } else if (this.multiple) {
+      for (const name of this.names) {
+        if (!addRemoteOrGroup(store, name, list)) {
+          throw new GitApiError(`fatal: no such remote or remote group: ${name}`);
+        }
+      }
+    } else {
+      if (this.names.length > 1) {
+        throw new InvalidArgumentError(
+          "remotes",
+          this.names,
+          "only one remote or group without --multiple (the rest would be refspecs)",
+        );
+      }
+      addRemoteOrGroup(store, this.names[0] as string, list);
+      if (list.length <= 1) single = this.names[0];
+    }
+    // string_list_remove_duplicates: repeats in a row
+    list = list.filter((name, i) => i === 0 || list[i - 1] !== name);
+    return single !== undefined ? { list, single } : { list };
+  }
+
+  /**
+   * @internal The URLs this fetch would reach, nested groups expanded (none when it would
+   * die): what a command running it decides credentials from.
+   */
+  async plannedUrls(): Promise<string[]> {
+    const store = RemoteConfigStore.from(this.workingCopy);
+    try {
+      const { list, single } = await this.targets(store);
+      return single !== undefined ? [store.remoteUrlOf(single)] : reachedUrls(store, list);
+    } catch {
+      return [];
+    }
+  }
+
+  /** @internal How deep in nested remote groups this fetch runs (a child's child: 1, ...). */
+  setGroupDepth(depth: number): this {
+    this.checkCallable();
+    this.groupDepth = depth;
+    return this;
+  }
+
+  /**
+   * A child `git fetch ... <name>` whose name is a group of several remotes: that child runs
+   * fetch_multiple itself (`Fetching <remote>` for each, FETCH_HEAD appended to); git
+   * recurses without bound on a group naming itself, ours stops at {@link MAX_GROUP_DEPTH}.
+   */
+  private async fetchNestedGroup(name: string): Promise<FetchMultipleEntry> {
+    if (this.groupDepth + 1 >= MAX_GROUP_DEPTH) {
+      const error = new GitApiError(
+        `fatal: remote group '${name}' nests deeper than ${MAX_GROUP_DEPTH} levels (does a group name itself?)`,
+      );
+      return { remote: name, error, exitCode: 128 };
+    }
+    const nested = this.configureChild(new FetchMultipleCommand(this._workingCopy));
+    nested
+      .setMultiple(false)
+      .setRemotes(name)
+      .setAppend(true)
+      .setGroupDepth(this.groupDepth + 1);
+    if (this.prune !== undefined) nested.setPrune(this.prune);
+    if (this.pruneTags !== undefined) nested.setPruneTags(this.pruneTags);
+    if (this.tagOption !== undefined) nested.setTagOpt(this.tagOption);
+    if (this.dryRun) nested.setDryRun(true);
+    if (this.force) nested.setForceUpdate(true);
+    if (this.updateHeadOk) nested.setUpdateHeadOk(true);
+    if (this.verbose) nested.setVerbose(true);
+    if (this.porcelain) nested.setPorcelain(true);
+    if (!this.writeFetchHead) nested.setWriteFetchHead(false);
+    try {
+      const result = await nested.call();
+      return { remote: name, nested: result, exitCode: result.exitCode };
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      const exitCode = (err as Partial<GitApiError>).exitCode;
+      return { remote: name, error: err, exitCode: typeof exitCode === "number" ? exitCode : 128 };
+    }
+  }
+
   /** One `git fetch <remote>`: as a child of fetch_multiple (`append`), or fetch_one. */
   private async fetchOne(
     remote: string,
     append: boolean,
     reflogAction: string,
   ): Promise<FetchMultipleEntry> {
+    if (append) {
+      // the child expands the name again: a group of several remotes is a fetch_multiple
+      const expanded: string[] = [];
+      addRemoteOrGroup(RemoteConfigStore.from(this.workingCopy), remote, expanded);
+      if (expanded.filter((n, i) => i === 0 || expanded[i - 1] !== n).length > 1) {
+        return this.fetchNestedGroup(remote);
+      }
+    }
     const fetch = this.configureChild(new FetchCommand(this._workingCopy));
     fetch.setRemote(remote);
     if (append || this.append) fetch.setAppend(true);
@@ -369,6 +457,23 @@ export class FetchMultipleCommand extends TransportCommand<FetchMultipleResult> 
   }
 }
 
+/** The URLs of `names` (remotes or URLs), groups of several remotes expanded as children do. */
+function reachedUrls(store: RemoteConfigStore, names: readonly string[], depth = 0): string[] {
+  const urls: string[] = [];
+  for (const name of names) {
+    const expanded: string[] = [];
+    addRemoteOrGroup(store, name, expanded);
+    const unique = expanded.filter((n, i) => i === 0 || expanded[i - 1] !== n);
+    if (unique.length > 1 && depth + 1 < MAX_GROUP_DEPTH) {
+      urls.push(...reachedUrls(store, unique, depth + 1));
+    } else if (unique.length <= 1) urls.push(store.remoteUrlOf(name));
+  }
+  return urls;
+}
+
+/** How deep remote groups may nest in a fetch (git has no bound: a group naming itself loops). */
+export const MAX_GROUP_DEPTH = 16;
+
 /** `remote.<name>.skipDefaultUpdate` / `skipFetchAll`: the last of either set wins. */
 function skipsDefaultUpdate(store: RemoteConfigStore, name: string): boolean {
   const value = store.lastValueOf([
@@ -434,7 +539,7 @@ function stderrOf(entry: FetchMultipleEntry, porcelain: boolean): string {
  * await git.remoteUpdate().setGroups("mirrors").call();
  * ```
  */
-export class RemoteUpdateCommand extends TransportCommand<FetchMultipleResult> {
+export class RemoteUpdateCommand extends GuardedTransportCommand<FetchMultipleResult> {
   /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
   protected override readsCoreConfig(): boolean {
     return false;
@@ -456,6 +561,13 @@ export class RemoteUpdateCommand extends TransportCommand<FetchMultipleResult> {
     this.checkCallable();
     this.prune = prune;
     return this;
+  }
+
+  private async currentBranch(): Promise<string | undefined> {
+    const head = await this.refsStore.get("HEAD");
+    return head && isSymbolicRef(head) && head.target.startsWith("refs/heads/")
+      ? head.target.slice("refs/heads/".length)
+      : undefined;
   }
 
   /** `git remote -v update`: `-v` passed to the fetch. */
@@ -481,7 +593,7 @@ export class RemoteUpdateCommand extends TransportCommand<FetchMultipleResult> {
       ...names,
       ...(all ? ["--all"] : []),
     ];
-    const fetch = this.configureChild(new FetchMultipleCommand(this._workingCopy));
+    const fetch = new FetchMultipleCommand(this._workingCopy);
     fetch
       .setRemotes(...names)
       .setMultiple(true)
@@ -489,9 +601,14 @@ export class RemoteUpdateCommand extends TransportCommand<FetchMultipleResult> {
     if (all) fetch.setAll(true);
     if (this.prune !== undefined) fetch.setPrune(this.prune);
     if (this.verbose) fetch.setVerbose(true);
+    // credentials and headers: decided here from what the fetch will reach, handed down
+    this.resolveAuth(
+      await fetch.plannedUrls(),
+      store.urlFor(store.remoteForBranch(await this.currentBranch())),
+    );
+    this.configureChild(fetch);
     try {
-      const result = await fetch.call();
-      return result;
+      return await fetch.call();
     } catch (error) {
       // the child git fetch died: git remote update exits 1
       if (error instanceof GitApiError) {

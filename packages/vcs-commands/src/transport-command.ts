@@ -84,9 +84,7 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
       if (!promisor) return undefined;
       const previous = promisor.fetcher;
       const fetcher = createPromisorFetcher(this._workingCopy, {
-        ...(this.transportRegistry ? { transports: this.transportRegistry } : {}),
-        ...(this.credentials ? { credentials: this.credentials } : {}),
-        ...(this.headers ? { headers: this.headers } : {}),
+        ...this.promisorFetcherAuth(),
         ...(this.timeout !== undefined ? { timeout: this.timeout } : {}),
       });
       promisor.setFetcher(fetcher);
@@ -94,6 +92,22 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
         if (promisor.fetcher === fetcher) promisor.setFetcher(previous);
       };
     });
+  }
+
+  /**
+   * What a lazy fetch during the call reaches the promisor remote with: this command's
+   * transports, credentials and headers.
+   */
+  protected promisorFetcherAuth(): {
+    transports?: GitTransportRegistry;
+    credentials?: Credentials;
+    headers?: Record<string, string>;
+  } {
+    return {
+      ...(this.transportRegistry ? { transports: this.transportRegistry } : {}),
+      ...(this.credentials ? { credentials: this.credentials } : {}),
+      ...(this.headers ? { headers: this.headers } : {}),
+    };
   }
 
   /**

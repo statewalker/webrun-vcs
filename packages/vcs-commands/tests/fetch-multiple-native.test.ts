@@ -330,6 +330,24 @@ describeGit("git fetch --all / --multiple / <group>, git remote update, as nativ
     );
   });
 
+  // a group naming a group: each child expands its name again (git's child `git fetch <name>`)
+  it('t5506-remote-groups.sh: "updating group updates all members (remote update)" (a group of groups)', async () => {
+    const [n, o] = twins((dir) => {
+      addRemotes("two", "three")(dir);
+      git(dir, "config", "remotes.inner", "two three");
+      git(dir, "config", "remotes.outer", "inner origin");
+    });
+    const { native } = await run(n, o, ["remote", "update", "outer"], (g) =>
+      g.remoteUpdate().setGroups("outer"),
+    );
+    expect(native.stdout).toBe("Fetching inner\nFetching two\nFetching three\nFetching origin\n");
+    // git recurses without end on a group naming itself; ours stops with an error
+    for (const d of [n, o]) git(join(root, d), "config", "remotes.loop", "loop origin");
+    const looped = await (await ours(o)).remoteUpdate().setGroups("loop").call();
+    expect(looped.exitCode).toBe(1);
+    expect(looped.stderr).toContain("nests deeper than");
+  });
+
   it('t5505-remote.sh: "update", "update with arguments", "update --prune", "update default", "update default (overridden, with funny whitespace)", "update (with remotes.default defined)"', async () => {
     let [n, o] = twins(addRemotes("two", "three"));
     await run(n, o, ["remote", "update"], (g) => g.remoteUpdate());

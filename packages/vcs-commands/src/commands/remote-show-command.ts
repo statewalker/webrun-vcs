@@ -15,8 +15,8 @@ import {
 import { parseGitBool } from "@statewalker/vcs-utils";
 
 import { GitApiError, MissingArgumentError } from "../errors/index.js";
+import { GuardedTransportCommand } from "../guarded-transport-command.js";
 import { deleteRefs, RemoteConfigStore } from "../remote-config/index.js";
-import { TransportCommand } from "../transport-command.js";
 import { RemoteListCommand } from "./remote-command.js";
 import { withRemoteUploadPack } from "./remote-transport.js";
 
@@ -84,7 +84,7 @@ export interface RemotePruneResult {
  * The commands that read a remote's refs as builtin/remote.c's `get_remote_ref_states`:
  * `git remote show` and `git remote prune`.
  */
-abstract class RemoteStatesCommand<T> extends TransportCommand<T> {
+abstract class RemoteStatesCommand<T> extends GuardedTransportCommand<T> {
   /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
   protected override readsCoreConfig(): boolean {
     return false;
@@ -98,6 +98,25 @@ abstract class RemoteStatesCommand<T> extends TransportCommand<T> {
    */
   getMessages(): string[] {
     return [...this.messages];
+  }
+
+  /**
+   * Reads the legacy remotes of `names` (git's remote_get) and decides who gets the static
+   * credentials and headers from the URLs of every remote this call asks (see
+   * `GuardedTransportCommand`), before the first connection.
+   */
+  protected async prepareRemotes(names: readonly string[]): Promise<void> {
+    for (const name of names) this.messages.push(...(await this.loadLegacyRemote(name)));
+    const store = RemoteConfigStore.from(this.workingCopy);
+    const head = await this.refsStore.get("HEAD");
+    const branch =
+      head && isSymbolicRef(head) && head.target.startsWith("refs/heads/")
+        ? head.target.slice("refs/heads/".length)
+        : undefined;
+    this.resolveAuth(
+      names.map((name) => this.urlsOf(store, name).fetch),
+      store.urlFor(store.remoteForBranch(branch)),
+    );
   }
 
   /** The remote as `remote_get` gives it: its first URL and its push URLs. */
@@ -255,6 +274,8 @@ export class RemoteShowCommand extends RemoteStatesCommand<RemoteShowInfo[]> {
     this.checkCallable();
     this.setCallable(false);
     const infos: RemoteShowInfo[] = [];
+    if (!this.noQuery) await this.prepareRemotes(this.names);
+    else for (const name of this.names) this.messages.push(...(await this.loadLegacyRemote(name)));
     for (const name of this.names) infos.push(await this.collect(name));
     return infos;
   }
@@ -275,6 +296,8 @@ export class RemoteShowCommand extends RemoteStatesCommand<RemoteShowInfo[]> {
       return new RemoteListCommand(this._workingCopy).callText();
     }
     this.setCallable(false);
+    if (!this.noQuery) await this.prepareRemotes(this.names);
+    else for (const name of this.names) this.messages.push(...(await this.loadLegacyRemote(name)));
     let out = "";
     for (const name of this.names) {
       let info: RemoteShowInfo;
@@ -290,7 +313,6 @@ export class RemoteShowCommand extends RemoteStatesCommand<RemoteShowInfo[]> {
   }
 
   private async collect(name: string): Promise<RemoteShowInfo> {
-    this.messages.push(...(await this.loadLegacyRemote(name)));
     const store = RemoteConfigStore.from(this.workingCopy);
     const specs = store.configuredFetchRefspecs(name).map((s) => parseRefSpec(s));
     const urls = this.urlsOf(store, name);
@@ -507,8 +529,8 @@ export class RemotePruneCommand extends RemoteStatesCommand<RemotePruneResult[]>
     }
     const results: RemotePruneResult[] = [];
     let failure: string | undefined;
+    await this.prepareRemotes(this.names);
     for (const name of this.names) {
-      this.messages.push(...(await this.loadLegacyRemote(name)));
       const store = RemoteConfigStore.from(this.workingCopy);
       const specs = store.configuredFetchRefspecs(name).map((s) => parseRefSpec(s));
       const url = this.urlsOf(store, name).fetch;
