@@ -313,6 +313,12 @@ export async function applyRefUpdates(
      */
     initial?: ReadonlySet<string>;
     /**
+     * Commit the initial transaction even when none of the writes is in it (git's
+     * write_remote_refs runs whenever the remote listed refs: an empty packed-refs, and the
+     * reference-transaction hook told of no update)
+     */
+    initialEvenEmpty?: boolean;
+    /**
      * Without `atomic`, write the updates in one batch, each ref still refused on its own
      * (git 2.5x's batched updates, one transaction with REF_TRANSACTION_ALLOW_FAILURE, as
      * its reference-transaction hook hears it): a batch the store refuses is applied ref by
@@ -327,7 +333,7 @@ export async function applyRefUpdates(
   if (options.atomic && updates.some((u) => u.status === "rejected")) return undefined;
   const writes = updates.filter((u) => u.status !== "rejected" && u.status !== "up-to-date");
   const deletes = options.atomic ? (options.deletes ?? []) : [];
-  if (writes.length === 0 && deletes.length === 0) return undefined;
+  if (writes.length === 0 && deletes.length === 0 && !options.initialEvenEmpty) return undefined;
   // git's update_local_ref: "<action>: <what>" per ref, else the one message given
   const logOf = (u: FetchRefUpdate) => ({
     message:
@@ -386,7 +392,7 @@ export async function applyRefUpdates(
     const initial = options.initial;
     const first = writes.filter((u) => initial.has(u.localRef));
     rest = writes.filter((u) => !initial.has(u.localRef));
-    if (first.length > 0) {
+    if (first.length > 0 || options.initialEvenEmpty) {
       const result = await refStore.batch(
         first.map((u) => ({ name: u.localRef, old: null, new: u.newOid })),
         {
