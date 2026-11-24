@@ -21,7 +21,7 @@ import { mailFromHeader, mailSubjectLine } from "./log-output.js";
 import { configValue } from "./merge-config.js";
 import { type PatchIdChange, patchIdOfChanges } from "./patch-id.js";
 import { sanitizedSubject } from "./pretty-format.js";
-import { commitSubject, Shortlog } from "./shortlog.js";
+import { commitSubject, outputEncoderFor, Shortlog } from "./shortlog.js";
 import { trailerConfigOf } from "./trailers.js";
 
 /** One file `git format-patch` writes (or one mail of `--stdout`). */
@@ -1025,8 +1025,13 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       if (!c) continue;
       const utf8 = await this.utf8AuthorAndMessage(list[k] as ObjectId, c);
       const name = mailmap.map(utf8.name, c.author.email).name;
-      const encoder = outputEncoder(mail.outputEncoding, `${name}\n${utf8.message}`, utf8.stored);
-      shortlog.insert(name, commitSubject(utf8.message), encoder);
+      const encoder = outputEncoderFor(
+        mail.outputEncoding,
+        `${name}\n${utf8.message}`,
+        utf8.stored,
+      );
+      // shortlog_add_commit: `<none>` for an empty subject
+      shortlog.insert(name, commitSubject(utf8.message) || "<none>", encoder);
     }
     const utf8Encode = (x: string) => new TextEncoder().encode(x);
     for (const piece of shortlog.pieces()) parts.push((piece.tag ?? utf8Encode)(piece.text));
@@ -1123,30 +1128,6 @@ function maybeBool(value: string): boolean | undefined {
   const m = /^\s*[+-]?(0x[0-9a-f]+|\d+)[kmg]?$/i.exec(value);
   if (m) return Number(m[1]) !== 0;
   return undefined;
-}
-
-const LATIN1_NAME = /^(iso[-_]?8859-1|iso8859-1|latin-?1|l1|iso-ir-100|cp819|ibm819|csisolatin1)$/i;
-
-const latin1Bytes = (s: string) => {
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-  return out;
-};
-
-/**
- * How a commit's text is written in the log output encoding: UTF-8 or ISO-8859-1 (when
- * every character converts); otherwise in the encoding the commit is stored in, as git
- * keeps a message iconv cannot convert.
- */
-function outputEncoder(output: string, text: string, stored: string): (s: string) => Uint8Array {
-  const utf8 = (s: string) => new TextEncoder().encode(s);
-  const encoderFor = (charset: string) =>
-    /^utf-?8$/i.test(charset)
-      ? utf8
-      : LATIN1_NAME.test(charset) && [...text].every((ch) => (ch.codePointAt(0) ?? 0) <= 0xff)
-        ? latin1Bytes
-        : undefined;
-  return encoderFor(output) ?? encoderFor(stored) ?? utf8;
 }
 
 /**

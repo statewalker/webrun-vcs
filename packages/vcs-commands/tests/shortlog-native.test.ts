@@ -180,6 +180,20 @@ describeGit("git shortlog, native (t4201-shortlog)", () => {
       await expectSame(["HEAD~2.."]);
     });
 
+    it('t4201-shortlog.sh: "shortlog encoding" under i18n.logOutputEncoding=ISO-8859-1', async () => {
+      repo.git(["commit", "-q", "--allow-empty", "-m", "Süß utf8"]);
+      repo.git(["config", "i18n.logOutputEncoding", "ISO-8859-1"]);
+      try {
+        await expectSame(["HEAD~3.."]);
+        await expectSame(["-e", "-w", "HEAD~3.."]);
+        await expectSame(["--format=%s|%an", "HEAD~3.."]);
+        // a broken non-UTF-8 commit keeps its bytes
+        await expectSame(["HEAD"]);
+      } finally {
+        repo.git(["config", "--unset", "i18n.logOutputEncoding"]);
+      }
+    });
+
     it('t4201-shortlog.sh: "shortlog --committer (internal)", "shortlog --committer (external)", "--group=committer is the same as --committer"', async () => {
       repo.git(["checkout", "-q", "--orphan", "side"]);
       repo.git(["commit", "-q", "--allow-empty", "-m", "one"]);
@@ -205,6 +219,14 @@ describeGit("git shortlog, native (t4201-shortlog)", () => {
       repo.git(["config", "mailmap.file", "mail.map"]);
       await expectSame(["-ns", "--group=trailer:signed-off-by", "HEAD"]);
       repo.git(["config", "--unset", "mailmap.file"]);
+    });
+
+    it('t4201-shortlog.sh: "shortlog --group=format" with column padding and wrapping', async () => {
+      await expectSame(["-s", "--group=format:%<|(30)%an|", "HEAD"]);
+      await expectSame(["-s", "--group=format:%>|(30)%cn|", "--group=%><|(25)%an|", "HEAD"]);
+      await expectSame(["--format=%>|(20)%s|", "HEAD"]);
+      await expectSame(["--format=%<(12)%h|%s", "-w", "--group=format:%w(8,2)%an", "HEAD"]);
+      await expectSame(["--format=x%n%-s", "HEAD"]);
     });
 
     it('t4201-shortlog.sh: "shortlog --group=format", "shortlog --group=<format> DWIM"', async () => {

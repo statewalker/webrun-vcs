@@ -456,5 +456,12 @@ describeGit("git format-patch as native git", () => {
       await compareBytes(["-2"], (c) => c.setMaxCount(2), `format.from=${value}`);
     }
     gitOk(repo, ["config", "--unset", "format.from"]);
+    // shortlog_add_commit: an empty subject is `<none>` in the cover letter
+    gitOk(repo, ["commit", "-q", "--allow-empty", "--allow-empty-message", "-m", ""]);
+    await compareBytes(
+      ["-4", "--cover-letter"],
+      (c) => c.setMaxCount(4).setCoverLetter(true),
+      "cover shortlog of an empty subject",
+    );
   }, 120_000);
 });

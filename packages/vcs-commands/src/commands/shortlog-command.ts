@@ -14,12 +14,14 @@
  * ```
  */
 
-import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import type { Mailmap } from "./mailmap.js";
+import { configValue } from "./merge-config.js";
 import { RevListCommand } from "./rev-list-command.js";
 import {
+  outputEncoderFor,
   parseShortlogGroup,
   parseShortlogWrap,
   readShortlogInput,
@@ -254,6 +256,15 @@ export class ShortlogCommand extends GitCommand<ShortlogEntry[]> {
     const onelineAt = this.summary ? -1 : parts.push(this.format ?? "%s") - 1;
     const bodyAt = keys.size > 0 ? parts.push("%B") - 1 : -1;
     const formatAt = formats.map((f) => parts.push(f) - 1);
+    // get_log_output_encoding(): what each commit's records are written in (log's user
+    // formats give UTF-8); a commit that does not convert keeps its own encoding
+    const outputEncoding =
+      configValue(this._workingCopy, "i18n.logOutputEncoding") ||
+      configValue(this._workingCopy, "i18n.commitEncoding") ||
+      "UTF-8";
+    const reencode = !/^utf-?8$/i.test(outputEncoding);
+    const encodingAt = reencode ? parts.push("%e") - 1 : -1;
+    const commitTextAt = reencode ? parts.push("%an <%ae>%n%cn <%ce>%n%B") - 1 : -1;
     const values = await this.formatParts(parts);
     // pretty.c reads the mailmap again (its own copy) at the first mapped placeholder, and
     // prints its errors again
@@ -262,7 +273,17 @@ export class ShortlogCommand extends GitCommand<ShortlogEntry[]> {
     const trailerConfig = keys.size > 0 ? trailerConfigOf(this._workingCopy) : undefined;
     const needsDedup =
       new Set(groups.map((g) => g.kind)).size > 1 || formats.length > 1 || keys.size > 0;
-    for (const commit of values) {
+    for (const raw of values) {
+      let commit = raw;
+      if (reencode) {
+        // the records as the output encoding's bytes (escaped where they are no UTF-8)
+        const encoder = outputEncoderFor(
+          outputEncoding,
+          raw[commitTextAt] as string,
+          (raw[encodingAt] as string) || "UTF-8",
+        );
+        commit = raw.map((v) => decodeGitPath(encoder(v)));
+      }
       const oneline = onelineAt >= 0 ? (commit[onelineAt] as string) : "";
       const shown = oneline !== "" ? oneline : "<none>";
       const dups = new Set<string>();
@@ -301,7 +322,9 @@ export class ShortlogCommand extends GitCommand<ShortlogEntry[]> {
     }
     let commits: string[][] | undefined;
     for (const walk of walks) {
-      const format = `%x00%x01%H${walk.map((k) => `%x00%x02${parts[k]}`).join("")}`;
+      // each part on a line of its own, so column padding (`%<|(N)`) counts from where the
+      // part starts, as in git's format of that part alone
+      const format = `%x00%x01%H${walk.map((k) => `%x00%x02%n${parts[k]}`).join("")}`;
       const revisions = new RevListCommand(this._workingCopy);
       for (const step of this.revisionSteps) step(revisions);
       const text = await revisions.callLogText({
@@ -320,7 +343,9 @@ export class ShortlogCommand extends GitCommand<ShortlogEntry[]> {
         const whole = chunk.endsWith("\n") ? chunk.slice(0, -1) : chunk;
         const values = whole.split(PART_MARK).slice(1);
         walk.forEach((k, i) => {
-          row[k] = values[i] ?? "";
+          const value = values[i] ?? "";
+          // the part's own line break (a `%-` at its start may have eaten it)
+          row[k] = value.startsWith("\n") ? value.slice(1) : value;
         });
       });
     }

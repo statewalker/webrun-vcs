@@ -6,17 +6,21 @@
  * default in a bare repository), name entries after email entries, case, and the complex
  * mapping. Run with the system git (2.43) and with 2.56.1 first on `PATH`.
  */
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import type { GitApiError } from "../src/index.js";
 import { nativeGitAvailable } from "./native-git-http-backend.js";
 import {
   Fixture,
+  gitEnv,
   native,
   nativeCompatibility,
   type Outcome,
+  openRepo,
   oursCheckMailmap,
   oursShortlog,
 } from "./shortlog-native-support.js";
@@ -211,6 +215,79 @@ describeGit("git check-mailmap and mailmap sources, native (t4203-mailmap)", () 
       await withMailmap({ ".mailmap": DEFAULT_MAP }, { "mailmap.blob": "HEAD:" }, async () => {
         const n = await shortlog(["HEAD"]);
         expect(n.err).toContain("mailmap is not a blob");
+      });
+    });
+
+    it('t4203-mailmap.sh: "mailmap.blob might be the wrong type": git log and git commit --author print its error as git does', async () => {
+      await withMailmap({}, { "mailmap.blob": "HEAD:" }, async () => {
+        const cases: { args: string[]; pretty?: string; mailmap?: boolean; author?: string }[] = [
+          { args: [] },
+          { args: ["--format=%an"], pretty: "tformat:%an" },
+          { args: ["--format=%aN"], pretty: "tformat:%aN" },
+          { args: ["--format=%aN%n%cE"], pretty: "tformat:%aN%n%cE" },
+          { args: ["--no-mailmap"], mailmap: false },
+          { args: ["--no-mailmap", "--format=%cL"], pretty: "tformat:%cL", mailmap: false },
+          { args: ["--oneline"], pretty: "oneline" },
+          { args: ["--author=nick"], author: "nick" },
+          { args: ["--author=nobody", "--format=%aN"], author: "nobody", pretty: "tformat:%aN" },
+        ];
+        for (const c of cases) {
+          const r = spawnSync("git", ["log", ...c.args, "HEAD"], {
+            cwd: repo.dir,
+            env: gitEnv(root),
+            encoding: "utf8",
+          });
+          const git = await openRepo(repo.dir);
+          const revs = git.revList().addArgument("HEAD");
+          if (c.author) revs.addAuthor(c.author);
+          if (c.mailmap === false) revs.setUseMailmap(false);
+          const out = await revs.callLogText({
+            ...(c.pretty ? { pretty: c.pretty } : {}),
+            ...(c.pretty === "oneline" ? { oneline: true, pretty: undefined } : {}),
+          });
+          const err = revs
+            .getWarnings()
+            .map((l) => `${l}\n`)
+            .join("");
+          expect({ args: c.args, out, err }).toEqual({
+            args: c.args,
+            out: r.stdout,
+            err: r.stderr,
+          });
+        }
+        // find_author_by_nickname: its walk's read, then pretty.c's for the match
+        for (const author of ["nick", "nobody"]) {
+          const mine = join(root, `commit-ours-${author}`);
+          const theirs = join(root, `commit-native-${author}`);
+          execFileSync("cp", ["-a", repo.dir, mine]);
+          execFileSync("cp", ["-a", repo.dir, theirs]);
+          const r = spawnSync(
+            "git",
+            ["commit", "-q", "--allow-empty", "-m", "x", `--author=${author}`],
+            { cwd: theirs, env: gitEnv(root), encoding: "utf8" },
+          );
+          const git = await openRepo(mine);
+          const commit = git.commit().setAllowEmpty(true).setMessage("x").setAuthor(author);
+          const status = await commit.call().then(
+            () => 0,
+            (e: GitApiError) => e.exitCode,
+          );
+          const err = commit
+            .getWarnings()
+            .map((l) => `${l}\n`)
+            .join("");
+          expect({ author, status, err }).toEqual({
+            author,
+            status: r.status,
+            err: r.stderr
+              .split("\n")
+              .filter((l) => l.startsWith("error:"))
+              .map((l) => `${l}\n`)
+              .join(""),
+          });
+          rmSync(mine, { recursive: true, force: true });
+          rmSync(theirs, { recursive: true, force: true });
+        }
       });
     });
 

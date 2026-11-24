@@ -16,6 +16,7 @@
  * @module
  */
 
+import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { GitApiError } from "../errors/index.js";
 import type { Mailmap } from "./mailmap.js";
 import { wrapText } from "./pretty-format.js";
@@ -49,6 +50,39 @@ export interface ShortlogEntry {
   count: number;
   /** The subjects, oldest first (empty with `-s`) */
   subjects: string[];
+}
+
+const LATIN1_NAME = /^(iso[-_]?8859-1|iso8859-1|latin-?1|l1|iso-ir-100|cp819|ibm819|csisolatin1)$/i;
+
+/** The bytes of a text whose characters are all below 256, one byte each. */
+const latin1Bytes = (s: string) => {
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+};
+
+/**
+ * How a commit's records are written in the log output encoding (logmsg_reencode): in
+ * `output` when its text (`text`, as UTF-8) converts, else in the commit's own encoding
+ * (`stored`), else as stored (UTF-8, bytes that are no UTF-8 kept as they were). Only UTF-8
+ * and ISO-8859-1 are converted.
+ */
+export function outputEncoderFor(
+  output: string,
+  text: string,
+  stored: string,
+): (s: string) => Uint8Array {
+  const fitsLatin1 = (t: string) => {
+    for (let i = 0; i < t.length; i++) if (t.charCodeAt(i) > 0xff) return false;
+    return true;
+  };
+  const encoderFor = (charset: string) =>
+    /^utf-?8$/i.test(charset)
+      ? encodeGitPath
+      : LATIN1_NAME.test(charset) && fitsLatin1(text)
+        ? latin1Bytes
+        : undefined;
+  return encoderFor(output) ?? encoderFor(stored) ?? encodeGitPath;
 }
 
 /** git's `-w` without a value. */
