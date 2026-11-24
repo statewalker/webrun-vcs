@@ -10,7 +10,12 @@
  */
 
 import type { FilesApi, GitObjects, ObjectId, ReflogLine, Refs } from "@statewalker/vcs-core";
-import { decodeTreeBytes, joinPath, objectFormatOf } from "@statewalker/vcs-core";
+import {
+  decodeTreeBytes,
+  joinPath,
+  objectFormatOf,
+  PromisorFetchError,
+} from "@statewalker/vcs-core";
 import { approxidateCareful } from "@statewalker/vcs-utils";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
@@ -149,6 +154,38 @@ export async function gcExpiresReflogs(
  * ```
  */
 export async function expireReflogs(options: ExpireReflogsOptions): Promise<ExpireReflogsResult> {
+  const output: string[] = [];
+  try {
+    return await runExpiry(options, output);
+  } catch (error) {
+    // git dies (a lazy fetch that failed): what it printed before stays printed
+    if (error instanceof PromisorFetchError) {
+      throw new ReflogExpiryAbortedError(error, output.join(""));
+    }
+    throw error;
+  }
+}
+
+/**
+ * Thrown when the expiry stops midway as git dies (a failed lazy fetch of `--stale-fix`,
+ * the `PromisorFetchError` its `cause`):
+ * nothing was written; `output` holds what was printed before, `cause` the failure.
+ */
+export class ReflogExpiryAbortedError extends Error {
+  override name = "ReflogExpiryAbortedError";
+  constructor(
+    override readonly cause: Error,
+    /** git's stdout up to the failure */
+    readonly output: string,
+  ) {
+    super(cause.message, { cause });
+  }
+}
+
+async function runExpiry(
+  options: ExpireReflogsOptions,
+  output: string[],
+): Promise<ExpireReflogsResult> {
   const { files, gitDir = ".git", objects } = options;
   // ids of the repository's format (git's parse_oid_hex reads the_hash_algo's digits)
   const format = objectFormatOf(objects);
@@ -171,7 +208,6 @@ export async function expireReflogs(options: ExpireReflogsOptions): Promise<Expi
   const reftable = repository as Partial<ReftableReflogs>;
   const isReftable = Boolean(reftable.reflogNames && reftable.expireReflog);
 
-  const output: string[] = [];
   let stale: StaleFix | undefined;
   if (options.staleFix) {
     // cmd_reflog_expire: mark_reachable_objects from the refs and HEADs first
@@ -709,20 +745,18 @@ class StaleFix {
    * odb_has_object with HAS_OBJECT_FETCH_PROMISOR: an absent object of a partial clone is
    * fetched from its promisor remote (one read through the lazily fetching store) and counts
    * as present once it arrives; without a fetcher, or with lazy fetching off
-   * (`GIT_NO_LAZY_FETCH`), it stays missing.
+   * (`GIT_NO_LAZY_FETCH`), it stays missing. A fetch that fails throws.
    */
   private async isPresent(id: ObjectId): Promise<boolean> {
     if (await this.objects.has(id).catch(() => false)) return true;
     const promisor = this.objects.promisor;
     if (!promisor?.lazyFetchEnabled || !promisor.hasPromisorRemote()) return false;
-    try {
-      const o = await this.objects.get(id);
-      if (!o) return false;
-      if (!o.bytes) await o.content[Symbol.asyncIterator]().return?.();
-      return true;
-    } catch {
-      return false;
-    }
+    // a failed fetch (PromisorFetchError, the remote gone) is no missing object: it
+    // propagates, so the expiry dies before writing, as promisor_remote_get_direct dies
+    const o = await this.objects.get(id);
+    if (!o) return false;
+    if (!o.bytes) await o.content[Symbol.asyncIterator]().return?.();
+    return true;
   }
 
   private async treeIsComplete(tree: ObjectId): Promise<boolean> {

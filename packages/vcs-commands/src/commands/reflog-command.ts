@@ -1,11 +1,12 @@
 import type { FilesApi, GitObjects, ReflogEntry } from "@statewalker/vcs-core";
-import { isValidRefName } from "@statewalker/vcs-core";
+import { isValidRefName, PromisorFetchError } from "@statewalker/vcs-core";
 import {
   dropReflogs,
   type ExpireReflogsOptions,
   expireReflogs,
   parseExpiryDate,
   type ReflogEntrySelector,
+  ReflogExpiryAbortedError,
   ReflogExpiryConfigError,
   writeReflogEntry,
 } from "@statewalker/vcs-store-files";
@@ -256,7 +257,15 @@ export class ReflogCommand extends GitCommand<ReflogEntry[]> {
         if (error instanceof ReflogExpiryConfigError) {
           throw new GitApiError(`fatal: ${error.message}`);
         }
-        throw error;
+        const fetch = error instanceof ReflogExpiryAbortedError ? error.cause : undefined;
+        if (fetch instanceof PromisorFetchError) {
+          // promisor_remote_get_direct dies: the fetch's lines, then its own
+          result.output += (error as ReflogExpiryAbortedError).output;
+          result.errors.push(...fetch.warnings, `fatal: ${fetch.message}`);
+          result.status = 128;
+          return;
+        }
+        throw error instanceof ReflogExpiryAbortedError ? error.cause : error;
       }
     };
     // --stale-fix marks once, then every reflog (--all) and those named are expired
