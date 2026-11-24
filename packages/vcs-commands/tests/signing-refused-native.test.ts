@@ -19,6 +19,7 @@ import { join } from "node:path";
 import {
   createNodeGitHostEnvironment,
   createNodeHookRunner,
+  createNodeSigner,
 } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -76,13 +77,15 @@ function twins(config: Record<string, string> = {}, branch = "main") {
 }
 
 /** Our working copy over `dir`, as the native git of the sandbox (2.43 or 2.5x) behaves. */
-function ours(dir: string): Promise<Git> {
+function ours(dir: string, options: { signer?: boolean } = {}): Promise<Git> {
   const env = { ...nativeGitEnv(root), GIT_EDITOR: "true" };
   return openOurs(
     dir,
     createNodeGitHostEnvironment({
       env,
       hookRunner: createNodeHookRunner({ env, compatibility: nativeIs25x ? "2.56" : "2.43" }),
+      // the Node signer runs the failing gpg.program as git does
+      ...(options.signer ? { signer: createNodeSigner({ env }) } : {}),
     }),
   );
 }
@@ -695,6 +698,70 @@ describeGit("requests to sign refused as git refuses them when gpg fails", () =>
         }
         expect(refs(join(dirs.ours, "remote.git"))).toBe(refs(join(dirs.native, "remote.git")));
       }
+    });
+  });
+
+  describe("the commands that sign, through a signer that fails (statewalker/statewalker-root#319)", () => {
+    it("merge -S, cherry-pick, revert and am under commit.gpgSign: gpg's failure as git reports it, the state git leaves", async () => {
+      // merge -S: commit_tree dies, the merge left in progress
+      let dirs = twins();
+      let native = git(root, dirs.native, "merge", "-S", "-m", "merged", "side");
+      const merge = (await ours(dirs.ours, { signer: true }))
+        .merge()
+        .include("side")
+        .setMessage("merged")
+        .setSign(true);
+      const mergeError = await thrown(() => merge.call());
+      expect(native.status).toBe(128);
+      expect(mergeError).toBeInstanceOf(SigningFailedError);
+      expect(`${mergeError?.message}\n`).toBe(native.stderr);
+      same(dirs);
+
+      for (const action of ["cherry-pick", "revert"] as const) {
+        dirs = twins({ "commit.gpgSign": "true" });
+        native =
+          action === "cherry-pick"
+            ? git(root, dirs.native, "cherry-pick", "side")
+            : git(root, dirs.native, "revert", "--no-edit", "HEAD");
+        const g = await ours(dirs.ours, { signer: true });
+        const error = await thrown(() =>
+          action === "cherry-pick"
+            ? g.cherryPick().include("side").call()
+            : g.revert().include("HEAD").call(),
+        );
+        expect(error).toBeInstanceOf(SigningFailedError);
+        expect((error as SigningFailedError).exitCode).toBe(native.status);
+        expect(`${error?.message}\n`).toBe(native.stderr);
+        same(dirs);
+      }
+
+      dirs = twins({ "commit.gpgSign": "true" });
+      const patch = gitOk(root, dirs.native, "format-patch", "--stdout", "-1", "main");
+      for (const dir of [dirs.native, dirs.ours])
+        gitOk(root, dir, "reset", "-q", "--hard", "main~1");
+      writeFileSync(join(root, "p.mbox"), patch);
+      native = git(root, dirs.native, "am", join(root, "p.mbox"));
+      const am = await (await ours(dirs.ours, { signer: true })).am().addMbox(patch).call();
+      expect({ status: am.exitCode, stderr: am.errors }).toEqual({
+        status: native.status,
+        stderr: native.stderr,
+      });
+      same(dirs);
+    });
+
+    it("rebase under commit.gpgSign: the pick stops as git's does", async () => {
+      const dirs = twins({ "commit.gpgSign": "true" }, "side");
+      const native = git(root, dirs.native, "rebase", "main");
+      const command = (await ours(dirs.ours, { signer: true })).rebase();
+      await command.setUpstreamBranch("main");
+      const result = await command.call();
+      expect(native.status).toBe(1);
+      expect(result.status).not.toBe(RebaseStatus.OK);
+      expect(result.message ?? "").toContain(GPG_FAILED.join("\n"));
+      expect(refs(dirs.ours)).toBe(refs(dirs.native));
+      expect(snapshot(root, dirs.ours, normalizeState)).toEqual(
+        snapshot(root, dirs.native, normalizeState),
+      );
     });
   });
 });

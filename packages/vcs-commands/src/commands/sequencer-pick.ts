@@ -51,12 +51,7 @@ import {
   removeBranchState,
   resetMerge,
 } from "./sequencer-support.js";
-import {
-  SIGNING_FAILED_LINES,
-  SigningFailedError,
-  type SignRequest,
-  signRequestOf,
-} from "./signing.js";
+import { SigningFailedError, type SignRequest, signCommit, signRequestOf } from "./signing.js";
 import { appendSignoff, signoffLine, trailerConfigOf, trailerLinesOf } from "./trailers.js";
 
 /** What the sequencer does with each commit. */
@@ -995,8 +990,9 @@ export class PickSequencer {
         cleanup === "strip" ? commentStringOf(this.deps.workingCopy) : undefined,
       );
     }
-    if (this.sign !== undefined) throw this.signingFailed(this.sign);
-    const id = await this.deps.commits.store({ tree, parents, author, committer, message: text });
+    const id = await this.deps.commits.store(
+      await this.signed({ tree, parents, author, committer, message: text }),
+    );
     await this.moveHead(id, reflogMessage(text));
     if (hooks) await sequencerPostCommit(hooks);
     return id;
@@ -1013,22 +1009,42 @@ export class PickSequencer {
   }
 
   /**
-   * try_to_commit's failure to sign (not signed yet): gpg's error and `error: failed to
-   * write commit object`, then in git 2.43 `fatal: <action> failed` (exit 128); 2.5x returns
-   * after the error (exit 1). The pick stays in progress (CHERRY_PICK_HEAD, MERGE_MSG), as
-   * git leaves it.
+   * try_to_commit's commit_tree signing `commit` for the run's key (git's opts->gpg_sign),
+   * the signing program in the worktree top. When it cannot be signed: gpg's error and
+   * `error: failed to write commit object`, then in git 2.43 `fatal: <action> failed` (exit
+   * 128); 2.5x returns after the error (exit 1). The pick stays in progress
+   * (CHERRY_PICK_HEAD, MERGE_MSG), as git leaves it.
    */
-  private signingFailed(sign: string): SigningFailedError {
+  private async signed(commit: Commit): Promise<Commit> {
+    const sign = this.sign;
+    if (sign === undefined) return commit;
     const legacy = this.deps.hooks?.compatibility === "2.43";
-    return new SigningFailedError(
-      [
-        ...SIGNING_FAILED_LINES,
-        "error: failed to write commit object",
-        ...(legacy ? [`fatal: ${this.name} failed`] : []),
-      ].join("\n"),
-      sign,
-      legacy ? 128 : 1,
-    );
+    const cwd = await this.deps.hooks?.hostWorkingDirectory().catch(() => undefined);
+    try {
+      return await signCommit(this.deps.workingCopy, sign, commit, {
+        tail: [],
+        ...(cwd !== undefined ? { cwd } : {}),
+      });
+    } catch (error) {
+      if (!(error instanceof SigningFailedError)) throw error;
+      // the signing died itself (ssh without a key): git dies there
+      if (/(^|\n)fatal: [^\n]*$/.test(error.message)) throw error;
+      throw new SigningFailedError(
+        [
+          error.message,
+          "error: failed to write commit object",
+          ...(legacy ? [`fatal: ${this.name} failed`] : []),
+        ].join("\n"),
+        sign,
+        legacy ? 128 : 1,
+        {
+          ...(error.signerMessages ? { signerMessages: error.signerMessages } : {}),
+          ...(error.programExitCode !== undefined
+            ? { programExitCode: error.programExitCode }
+            : {}),
+        },
+      );
+    }
   }
 
   /** HEAD (its branch, when attached) moved to `id`, with `message` in the reflogs. */
