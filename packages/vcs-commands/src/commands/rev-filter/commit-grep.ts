@@ -43,6 +43,12 @@ export interface CommitGrepOptions {
   authors?: readonly string[];
   /** `--committer` patterns */
   committers?: readonly string[];
+  /**
+   * `--grep-reflog` patterns, matched against the reflog entry's message of a reflog walk
+   * (`git log -g`), a `reflog <message>` header line put before the commit (revision.c's
+   * commit_match)
+   */
+  reflogs?: readonly string[];
   /** `--all-match`: every `--grep` pattern must match (header patterns always must) */
   allMatch?: boolean;
   /** `--invert-grep`: commits whose message matches no `--grep` pattern */
@@ -79,13 +85,18 @@ export class GrepPatternError extends GitApiError {
 
 /** A compiled commit grep */
 export interface CommitGrep {
-  /** Whether the commit (its raw object bytes) matches, as `commit_match` answers */
-  matches(raw: Uint8Array): boolean;
+  /**
+   * Whether the commit (its raw object bytes) matches, as `commit_match` answers; `reflog`
+   * is the message of the reflog entry a reflog walk shows it for (`--grep-reflog`)
+   */
+  matches(raw: Uint8Array, reflog?: string): boolean;
 }
 
 const FIELD_AUTHOR = 0;
 const FIELD_COMMITTER = 1;
+const FIELD_REFLOG = 2;
 const FIELD_PREFIX = [new TextEncoder().encode("author "), new TextEncoder().encode("committer ")];
+const REFLOG_PREFIX = new TextEncoder().encode("reflog ");
 
 interface Pattern {
   head: boolean;
@@ -189,21 +200,24 @@ export function compileCommitGrep(options: CommitGrepOptions): CommitGrep {
   const ignoreCase = !!options.ignoreCase;
   const headerList: Pattern[] = [];
   const addHeader = (field: number, list: readonly string[] | undefined) => {
-    const prefix = FIELD_PREFIX[field] as Uint8Array;
+    const prefix = field === FIELD_REFLOG ? REFLOG_PREFIX : (FIELD_PREFIX[field] as Uint8Array);
+    // match_one_pattern strips the timestamp of author and committer lines only
+    const strip = field === FIELD_REFLOG ? (l: Uint8Array) => l : stripTimestamp;
     for (const pattern of list ?? []) {
       for (const part of splitPattern(pattern)) {
         const match = compilePattern(part, type, ignoreCase, "header");
         headerList.push({
           head: true,
           field,
-          test: (line) =>
-            startsWith(line, prefix) && match(stripTimestamp(line.subarray(prefix.length))),
+          test: (line) => startsWith(line, prefix) && match(strip(line.subarray(prefix.length))),
         });
       }
     }
   };
   addHeader(FIELD_AUTHOR, options.authors);
   addHeader(FIELD_COMMITTER, options.committers);
+  addHeader(FIELD_REFLOG, options.reflogs);
+  const useReflog = (options.reflogs?.length ?? 0) > 0;
   const bodyList: Pattern[] = [];
   for (const pattern of options.messages ?? []) {
     for (const part of splitPattern(pattern)) {
@@ -219,7 +233,7 @@ export function compileCommitGrep(options: CommitGrepOptions): CommitGrep {
   // prep_header_patterns: each field's patterns or-ed (newest first), fields or-ed in field
   // order before a TRUE node
   let headerExpr: Expr | undefined;
-  const groups: (Expr | undefined)[] = [undefined, undefined];
+  const groups: (Expr | undefined)[] = [undefined, undefined, undefined];
   for (const p of headerList) {
     const atom: Expr = { k: "atom", p, hit: false };
     const g = groups[p.field];
@@ -308,7 +322,11 @@ export function compileCommitGrep(options: CommitGrepOptions): CommitGrep {
 
   const mailmap = options.mailmap && !options.mailmap.empty ? options.mailmap : undefined;
   return {
-    matches(raw: Uint8Array): boolean {
+    matches(commit: Uint8Array, reflog?: string): boolean {
+      // the "fake" header: `reflog <message>` before the commit's own headers
+      const raw = useReflog
+        ? concat([REFLOG_PREFIX, new TextEncoder().encode(`${reflog ?? ""}\n`), commit])
+        : commit;
       const buf = mailmap && headerList.length > 0 ? applyMailmapToHeader(raw, mailmap) : raw;
       if (!allMatch && !invert) return pass(buf, false);
       if (!expr) return true;
