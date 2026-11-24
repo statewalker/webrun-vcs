@@ -161,7 +161,16 @@ export interface MailmapSources {
   /** The host `mailmap.file` is read through (a relative path from its current directory) */
   environment?: GitHostEnvironment;
   /** The blob a revision names (`mailmap.blob`), undefined when it names none */
-  readBlobNamed(name: string): Promise<Uint8Array | undefined>;
+  readBlobNamed?(name: string): Promise<Uint8Array | undefined>;
+  /**
+   * The object a revision names (`mailmap.blob`) with its type, undefined when it names
+   * none; `bytes` undefined when it cannot be read. Preferred over {@link readBlobNamed}:
+   * with it, git's `mailmap is not a blob` and `unable to read mailmap object` errors are
+   * reported.
+   */
+  readObjectNamed?(name: string): Promise<{ type: string; bytes?: Uint8Array } | undefined>;
+  /** git's `error:` lines while reading (read_mailmap_blob's), each with its prefix */
+  onError?(line: string): void;
 }
 
 function joinChunks(chunks: Uint8Array[]): Uint8Array {
@@ -203,7 +212,7 @@ export async function readRepositoryMailmap(sources: MailmapSources): Promise<Ma
   }
   const blobName = sources.config("mailmap.blob") ?? (bare ? "HEAD:.mailmap" : undefined);
   if (blobName) {
-    const bytes = await sources.readBlobNamed(blobName);
+    const bytes = await readMailmapBlob(sources, blobName);
     if (bytes) map.read(decodeGitPath(bytes));
   }
   const file = sources.config("mailmap.file");
@@ -218,20 +227,47 @@ export async function readRepositoryMailmap(sources: MailmapSources): Promise<Ma
 }
 
 /**
+ * mailmap.c's read_mailmap_blob: the blob `name` names (nothing when it names none), git's
+ * errors reported for an object that cannot be read or is no blob.
+ */
+export async function readMailmapBlob(
+  sources: Pick<MailmapSources, "readBlobNamed" | "readObjectNamed" | "onError">,
+  name: string,
+): Promise<Uint8Array | undefined> {
+  if (!sources.readObjectNamed) return sources.readBlobNamed?.(name);
+  const object = await sources.readObjectNamed(name);
+  if (!object) return undefined;
+  if (!object.bytes) {
+    sources.onError?.(`error: unable to read mailmap object at ${name}`);
+    return undefined;
+  }
+  if (object.type !== "blob") {
+    sources.onError?.(`error: mailmap is not a blob: ${name}`);
+    return undefined;
+  }
+  return object.bytes;
+}
+
+/**
  * `mailmap.file`, read as git reads it: through the host (a relative path from its current
  * directory). Without a host environment, a relative path is read from the worktree's top
  * (where git usually runs), and an absolute one inside the worktree through it as well.
  */
-async function readMailmapFile(
+export async function readMailmapFile(
   path: string,
   environment: GitHostEnvironment | undefined,
   worktree: Worktree | undefined,
 ): Promise<Uint8Array | undefined> {
-  if (environment) return environment.readFile(path).catch(() => undefined);
+  if (environment) {
+    // git reads a relative path from its working directory, the worktree's top
+    const top = worktree?.hostPath?.replace(/\/+$/, "");
+    const full = !path.startsWith("/") && top ? `${top}/${path}` : path;
+    return environment.readFile(full).catch(() => undefined);
+  }
   if (!worktree) return undefined;
   let relative = path;
   if (path.startsWith("/")) {
-    const top = (worktree as { hostPath?: string }).hostPath?.replace(/\/+$/, "");
+    const top = worktree.hostPath?.replace(/\/+$/, "");
     if (!top || !path.startsWith(`${top}/`)) return undefined;
     relative = path.slice(top.length + 1);
   }

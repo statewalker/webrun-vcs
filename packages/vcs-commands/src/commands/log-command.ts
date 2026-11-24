@@ -55,7 +55,7 @@ import {
   LogPrinter,
   type LogReflogEntry,
 } from "./log-output.js";
-import { type Mailmap, readRepositoryMailmap } from "./mailmap.js";
+import type { Mailmap } from "./mailmap.js";
 import { configBool, configValue } from "./merge-config.js";
 import {
   addRefsByGlob,
@@ -857,8 +857,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       const mapped =
         this.useMailmap ??
         (this.logConfig ? configBool(this.workingCopy, "log.mailmap", true) : false);
-      if (headers && mapped)
-        mailmap = await this.loadMailmap(RemoteConfigStore.from(this._workingCopy));
+      if (headers && mapped) mailmap = await this.loadedMailmap();
       filters.push(
         CommitFilters.grep({
           messages: this.grepMessages,
@@ -1499,13 +1498,18 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   /** {@link callText} as bytes (messages and file contents that are not UTF-8 kept as they are). */
   async callBytes(options: LogOutputOptions = {}): Promise<Uint8Array> {
     // one operation for the worktree: its attributes files (diff drivers) and configuration
-    // are read once for every commit's diff, as git keeps its attribute stack
-    const worktree = this.worktreeAccess;
-    if (worktree?.batch) return worktree.batch(() => this.printLog(options));
-    return this.printLog(options);
+    // are read once for every commit's diff, as git keeps its attribute stack (a bare
+    // repository's working copy has none)
+    return this.inOneOperation(() => this.printLog(options));
   }
 
   private async printLog(options: LogOutputOptions): Promise<Uint8Array> {
+    const result = await this.printLogOutput(options);
+    if (this.logConfig) await this.reportMailmapErrors(options, result.length > 0);
+    return result;
+  }
+
+  private async printLogOutput(options: LogOutputOptions): Promise<Uint8Array> {
     const reverse = !!options.reverse || this.reverse;
     await this.checkReflogWalkOptions(options);
     // revision.c's setup_revisions: the graph cannot be reversed
@@ -1653,6 +1657,30 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     }
     if (follow) this.paths = paths;
     return printer.result();
+  }
+
+  /** The mailmap, read once for the walk's filters and the output alike. */
+  private loadedMailmap(): Promise<Mailmap> {
+    this.mailmapLoad ??= this.readMailmap((line) => this.mailmapErrors.push(line));
+    return this.mailmapLoad;
+  }
+
+  /**
+   * git's `error:` lines of reading the mailmap (a `mailmap.blob` that is no blob), as git
+   * log prints them: once when it reads the mailmap for the log (`log.mailmap`,
+   * `--use-mailmap`), once more when a user format maps an identity (`%aN`, pretty.c's own
+   * read) of a commit it shows.
+   */
+  private async reportMailmapErrors(options: LogOutputOptions, shown: boolean): Promise<void> {
+    const forLog =
+      options.mailmap ?? this.useMailmap ?? configBool(this.workingCopy, "log.mailmap", true);
+    const pretty = options.pretty ?? configValue(this.workingCopy, "format.pretty") ?? "";
+    const user = /^t?format:/.test(pretty) || (pretty.includes("%") && !options.oneline);
+    const forFormat = shown && user && /%[ac][NEL]/.test(pretty);
+    const times = (forLog ? 1 : 0) + (forFormat ? 1 : 0);
+    if (times === 0) return;
+    await this.loadedMailmap();
+    for (let k = 0; k < times; k++) this.outputWarnings.push(...this.mailmapErrors);
   }
 
   /**
@@ -1986,7 +2014,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         return out;
       },
       mailmap: () => {
-        mailmap ??= this.loadMailmap(config);
+        mailmap ??= this.loadedMailmap();
         return mailmap;
       },
       diff: async (entry, parent, formats, options) => {
@@ -2032,6 +2060,9 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   /** The colors {@link callBytes} prints with */
   private colorSettings?: DiffColorSettings;
   private readonly outputWarnings: string[] = [];
+  /** The mailmap as read once ({@link loadedMailmap}), and git's errors of reading it */
+  private mailmapLoad?: Promise<Mailmap>;
+  private readonly mailmapErrors: string[] = [];
 
   /**
    * What git prints on stderr while {@link callBytes} prints the log without dying: the
@@ -2470,21 +2501,6 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       }
     }
     return out;
-  }
-
-  /** mailmap.c's read_mailmap: `.mailmap` (not in a bare repository), `mailmap.blob`, `mailmap.file` */
-  private async loadMailmap(config: RemoteConfigStore): Promise<Mailmap> {
-    return readRepositoryMailmap({
-      config: (key) => config.value(key),
-      worktree: this.worktreeAccess,
-      environment: hostEnvironmentOf(this._workingCopy),
-      readBlobNamed: async (name) => {
-        const id = await this.revisionResolver()
-          .resolve(name)
-          .catch(() => undefined);
-        return id ? this.readBlob(id) : undefined;
-      },
-    });
   }
 
   /**
