@@ -9,6 +9,7 @@ export * from "./hash/index.js";
 export * from "./ids/index.js";
 export * from "./regex/index.js";
 export * from "./streams/index.js";
+export * from "./url/index.js";
 
 // Note: files/ is exported via subpath "@statewalker/vcs-utils/files"
 // to avoid naming conflicts with diff/patch FileMode interface

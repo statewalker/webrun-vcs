@@ -18,12 +18,27 @@
  * unset that is not there or several values without `setAll`, 1 or 2 for an invalid key, 6
  * for an invalid pattern, 3 for a file whose header git cannot name, 255 for a lock held,
  * 128 where git dies (`no such section`, a bad config line).
+ *
+ * Reads follow `git config --get`, `--get-all`, `--get-regexp`, `--get-urlmatch`, `--list`,
+ * `--get-color` and `--get-colorbool` (and 2.46's `get [--all] [--regexp] [--url=<url>]` and
+ * `list`): values canonicalised by {@link ConfigCommand.setType} as builtin/config.c's
+ * `format_config` (`--type=bool|int|bool-or-int|bool-or-str|path|expiry-date|color`; `set`
+ * writes them as `normalize_value`), `--default`, `--show-origin`, `--show-scope`,
+ * `--name-only`, `--show-names`, `-z`, and `--blob=<rev>:<path>`.
+ *
+ * ```typescript
+ * const { stdout } = await git.config().list().setShowOrigin(true).call(); // "file:.git/config\tcore.bare=false\n"
+ * await git.config().get("pack.window").setType("int").call(); // "1024\n" for `1k`
+ * await git.config().getUrlmatch("http", "https://example.com/repo").call(); // "http.sslverify false\n"
+ * await git.config().getRegexp("^remote\\.").setBlob("HEAD:shared.config").call();
+ * ```
  */
 
 import {
   CONFIG_REGEX_NONE,
   type ConfigFileLocation,
   ConfigParseError,
+  type ConfigScope,
   GitWorkingCopyConfig,
   parseConfigKey,
   prepareConfigComment,
@@ -31,7 +46,13 @@ import {
   renameConfigSectionInFile,
   setConfigMultivarInFile,
 } from "@statewalker/vcs-store-files";
-import { compilePosixRegex, PosixRegexError } from "@statewalker/vcs-utils";
+import {
+  compilePosixRegex,
+  isUrlNormalizeError,
+  normalizeUrl,
+  PosixRegexError,
+  selectUrlMatches,
+} from "@statewalker/vcs-utils";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
 import {
@@ -41,6 +62,20 @@ import {
 } from "@statewalker/vcs-working-tree";
 import { GitApiError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
+import { quotePath } from "../results/quote-path.js";
+import {
+  CONFIG_VALUE_TYPES,
+  type ConfigValueContext,
+  ConfigValueDeath,
+  type ConfigValueSource,
+  type ConfigValueType,
+  type FormattedConfigValue,
+  formatConfigValue,
+  gitConfigBool,
+  gitConfigColorBool,
+  normalizeConfigValue,
+  parseGitColor,
+} from "./config-value-types.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 
 /** The file `git config` reads or writes: `--local`, `--worktree`, `--global`, `--system`. */
@@ -60,11 +95,36 @@ export interface ConfigCommandResult {
 
 type ConfigAction =
   | { kind: "get"; key: string }
+  | { kind: "get-regexp"; pattern: string }
+  | { kind: "get-urlmatch"; name: string; url: string }
+  | { kind: "list" }
+  | { kind: "get-color"; slot: string; defaultColor?: string }
+  | { kind: "get-colorbool"; slot: string; stdoutIsTty?: string }
   | { kind: "set"; key: string; value: string }
   | { kind: "add"; key: string; value: string }
   | { kind: "unset"; key: string }
   | { kind: "rename-section"; from: string; to: string }
   | { kind: "remove-section"; name: string };
+
+/** One value as a query reads it, with where it was read (git's `key_value_info`). */
+interface QueryEntry extends ConfigValueSource {
+  /** The canonical key */
+  key: string;
+  /** The value as written; undefined for a key without `=` */
+  text: string | undefined;
+  /** The scope of the value (`--show-scope`) */
+  scope?: ConfigScope;
+  /** Its line in its file or blob */
+  line?: number;
+}
+
+/** builtin/config.c's display terminators. */
+interface Display {
+  term: string;
+  keyDelim: string;
+  showKeys: boolean;
+  omitValues: boolean;
+}
 
 /** A refusal of git's: its exit status and its lines. */
 class Refusal {
@@ -101,6 +161,16 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
   private comment?: string;
   private defaultValue?: string;
   private legacy = false;
+  private type?: ConfigValueType;
+  private blob?: string;
+  private includes?: boolean;
+  private showOrigin = false;
+  private showScope = false;
+  private nameOnly = false;
+  private showNames = false;
+  private nullTerminated = false;
+  private compatibility: "2.43" | "2.56" = "2.56";
+  private dumbTerminal = false;
   /** git's warnings of a read (a file it cannot open), printed before the values */
   private warnings: string[] = [];
 
@@ -141,6 +211,138 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
   setScope(scope: ConfigCommandScope | undefined): this {
     this.checkCallable();
     this.scope = scope;
+    return this;
+  }
+
+  /**
+   * `--get-regexp <pattern>` / `get --regexp <pattern>`: the keys matching a POSIX extended
+   * regex (its section and last part lowered, as git does). The legacy syntax prints every
+   * value with its key; the subcommand only the last value unless {@link setAll}, with its
+   * key under {@link setShowNames}.
+   */
+  getRegexp(pattern: string): this {
+    return this.setAction({ kind: "get-regexp", pattern });
+  }
+
+  /**
+   * `--get-urlmatch <name> <url>` / `get --url=<url> <name>`: the value of `<section>.<key>`
+   * (or, for a bare section, of each of its keys with the key) that best matches the URL
+   * among `<section>.<url-pattern>.<key>` entries (urlmatch.c).
+   */
+  getUrlmatch(name: string, url: string): this {
+    return this.setAction({ kind: "get-urlmatch", name, url });
+  }
+
+  /** `--list` / `list`: every value, `key=value` per line. */
+  list(): this {
+    return this.setAction({ kind: "list" });
+  }
+
+  /**
+   * `--get-color <slot> [<default>]`: the escape sequence of the color the slot is set to
+   * (the default's when unset), with no newline.
+   */
+  getColor(slot: string, defaultColor?: string): this {
+    return this.setAction({
+      kind: "get-color",
+      slot,
+      ...(defaultColor !== undefined ? { defaultColor } : {}),
+    });
+  }
+
+  /**
+   * `--get-colorbool <slot> [<stdout-is-tty>]`: whether color is wanted for the slot (falling
+   * back to `diff.color` for `color.diff`, then `color.ui`). With `stdoutIsTty` (a boolean as
+   * git reads it) git prints `true`/`false`; without, the exit status tells (stdout is no
+   * terminal here). `auto` needs a terminal that is not dumb ({@link setDumbTerminal}).
+   */
+  getColorBool(slot: string, stdoutIsTty?: string): this {
+    return this.setAction({
+      kind: "get-colorbool",
+      slot,
+      ...(stdoutIsTty !== undefined ? { stdoutIsTty } : {}),
+    });
+  }
+
+  /**
+   * `--type=<type>` (`--bool`, `--int`, `--bool-or-int`, `--bool-or-str`, `--path`,
+   * `--expiry-date`, `--type=color`): values printed canonical, and written canonical by
+   * `set`/`add`. A name git does not know is refused when the command runs (git's
+   * `unrecognized --type argument`).
+   */
+  setType(type: ConfigValueType | string | undefined): this {
+    this.checkCallable();
+    this.type = type as ConfigValueType | undefined;
+    return this;
+  }
+
+  /** `--blob=<blob-ish>`: read the configuration from a blob (`HEAD:shared.config`). */
+  setBlob(blob: string | undefined): this {
+    this.checkCallable();
+    this.blob = blob;
+    return this;
+  }
+
+  /**
+   * `--includes` / `--no-includes` for a file read with {@link setScope} or {@link setFile}
+   * (default off there, as git; the whole configuration always follows them).
+   */
+  setIncludes(includes: boolean | undefined): this {
+    this.checkCallable();
+    this.includes = includes;
+    return this;
+  }
+
+  /** `--show-origin`: each value after `file:<name>`, `blob:<name>` or `command line:`. */
+  setShowOrigin(show: boolean): this {
+    this.checkCallable();
+    this.showOrigin = show;
+    return this;
+  }
+
+  /** `--show-scope`: each value after its scope (`local`, `global`, `command`, ...). */
+  setShowScope(show: boolean): this {
+    this.checkCallable();
+    this.showScope = show;
+    return this;
+  }
+
+  /** `--name-only`: keys without their values (`--list`, `--get-regexp`). */
+  setNameOnly(nameOnly: boolean): this {
+    this.checkCallable();
+    this.nameOnly = nameOnly;
+    return this;
+  }
+
+  /** `--show-names` (2.46's `get`): each value after its key. */
+  setShowNames(show: boolean): this {
+    this.checkCallable();
+    this.showNames = show;
+    return this;
+  }
+
+  /** `-z` / `--null`: values end with NUL, a key and its value separated by a newline. */
+  setNullTerminated(nul: boolean): this {
+    this.checkCallable();
+    this.nullTerminated = nul;
+    return this;
+  }
+
+  /**
+   * The git version whose behaviour applies where they differ (default 2.56): 2.43's `--list`
+   * ignores `--type`, knows no `:(optional)` paths nor `#rgb` colors, and dies on a
+   * `--get-color` default it cannot parse (2.5x: an error, exit 255).
+   */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
+
+  /** Whether the terminal is dumb (`TERM` unset or `dumb`): `--get-colorbool`'s `auto`. */
+  setDumbTerminal(dumb: boolean): this {
+    this.checkCallable();
+    this.dumbTerminal = dumb;
     return this;
   }
 
@@ -219,12 +421,40 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
   }
 
   private async run(action: ConfigAction): Promise<ConfigCommandResult> {
+    if (this.type !== undefined && !CONFIG_VALUE_TYPES.includes(this.type)) {
+      throw fatal(`unrecognized --type argument, ${this.type}`);
+    }
+    const sources =
+      (this.scope !== undefined ? 1 : 0) +
+      (this.file !== undefined ? 1 : 0) +
+      (this.blob !== undefined ? 1 : 0);
+    if (sources > 1) throw new Refusal(129, ["error: only one config file at a time"]);
     this.checkOptions(action);
     const comment = this.comment === undefined ? undefined : prepared(this.comment);
-    if (this.scope !== undefined && this.file !== undefined) {
-      throw new Refusal(129, ["error: only one config file at a time"]);
+    switch (action.kind) {
+      case "get":
+        // cmd_config_get: `get --type=color --default=<color> ""` is `--get-color "" <color>`
+        if (
+          !this.legacy &&
+          this.type === "color" &&
+          action.key === "" &&
+          this.defaultValue !== undefined
+        ) {
+          return this.runGetColor("", this.defaultValue);
+        }
+        return this.runGet(action.key, false);
+      case "get-regexp":
+        return this.runGet(action.pattern, true);
+      case "list":
+        return this.runList();
+      case "get-urlmatch":
+        return this.runUrlmatch(action.name, action.url);
+      case "get-color":
+        return this.runGetColor(action.slot, action.defaultColor);
+      case "get-colorbool":
+        return this.runGetColorBool(action.slot, action.stdoutIsTty);
     }
-    if (action.kind === "get") return this.runGet(action.key);
+    if (this.blob !== undefined) throw fatal("writing config blobs is not supported");
     const location = await this.location();
     let outcome: { status: number; stderr: string[] };
     switch (action.kind) {
@@ -232,7 +462,8 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
       case "add": {
         const pattern =
           action.kind === "add" ? CONFIG_REGEX_NONE : (this.valuePattern ?? undefined);
-        outcome = await setConfigMultivarInFile(location, action.key, action.value, {
+        const value = this.normalized(action.key, action.value);
+        outcome = await setConfigMultivarInFile(location, action.key, value, {
           ...(pattern !== undefined ? { valuePattern: pattern } : {}),
           fixedValue: this.fixedValue,
           multiReplace: action.kind === "set" && this.all,
@@ -279,17 +510,52 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
     return result(outcome.status, outcome.stderr);
   }
 
+  /** builtin/config.c's `normalize_value` of a value to write, or git's death. */
+  private normalized(key: string, value: string): string {
+    try {
+      return normalizeConfigValue(this.type, key, value, this.compatibility);
+    } catch (error) {
+      if (error instanceof ConfigValueDeath) throw new Refusal(128, error.lines);
+      throw error;
+    }
+  }
+
   /** The option checks git makes before it reads or writes anything. */
   private checkOptions(action: ConfigAction): void {
     const hasPattern = this.valuePattern !== undefined;
     const sectionAction = action.kind === "rename-section" || action.kind === "remove-section";
+    const reads = new Set([
+      "get",
+      "get-regexp",
+      "get-urlmatch",
+      "list",
+      "get-color",
+      "get-colorbool",
+    ]);
     if (this.legacy) {
       // cmd_config_actions: the action's argument count, then the option combinations
+      if (
+        (action.kind === "get-color" || action.kind === "get-colorbool") &&
+        this.type !== undefined
+      ) {
+        throw new Refusal(129, ["error: --get-color and variable type are incoherent"]);
+      }
       if (action.kind === "add" && hasPattern) {
         throw new Refusal(129, ["error: wrong number of arguments, should be 2"]);
       }
       if (sectionAction && (hasPattern || this.all)) {
         throw new Refusal(129, ["error: only one action at a time"]);
+      }
+      if (this.nameOnly && !(action.kind === "list" || action.kind === "get-regexp")) {
+        throw new Refusal(129, ["error: --name-only is only applicable to --list or --get-regexp"]);
+      }
+      if (
+        this.showOrigin &&
+        !(action.kind === "get" || action.kind === "get-regexp" || action.kind === "list")
+      ) {
+        throw new Refusal(129, [
+          "error: --show-origin is only applicable to --get, --get-all, --get-regexp, and --list",
+        ]);
       }
       if (this.defaultValue !== undefined && (action.kind !== "get" || this.all)) {
         throw new Refusal(129, ["error: --default is only applicable to --get"]);
@@ -299,16 +565,37 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
           "error: --comment is only applicable to add/set/replace operations",
         ]);
       }
-      if (this.fixedValue && (!hasPattern || action.kind === "add" || sectionAction)) {
+      if (
+        this.fixedValue &&
+        (!hasPattern ||
+          action.kind === "add" ||
+          sectionAction ||
+          action.kind === "list" ||
+          action.kind === "get-urlmatch" ||
+          action.kind === "get-color" ||
+          action.kind === "get-colorbool")
+      ) {
         throw new Refusal(129, ["error: --fixed-value only applies with 'value-pattern'"]);
       }
       return;
     }
+    if (action.kind === "get-color" || action.kind === "get-colorbool") {
+      throw new GitApiError(
+        "git config has no get-color subcommand: use the legacy syntax (setLegacySyntax)",
+      );
+    }
     if (sectionAction && (hasPattern || this.all || this.fixedValue)) {
       throw new Refusal(129, [`error: unknown option for ${action.kind}`]);
     }
-    if ((action.kind === "unset" || action.kind === "get") && this.comment !== undefined) {
+    if (reads.has(action.kind) && this.comment !== undefined) {
       throw new Refusal(129, ["error: unknown option `comment'"]);
+    }
+    if (action.kind === "list") {
+      if (hasPattern) throw new Refusal(129, ["error: unknown option `value'"]);
+      if (this.defaultValue !== undefined) {
+        throw new Refusal(129, ["error: unknown option `default'"]);
+      }
+      return;
     }
     if (this.fixedValue && !hasPattern) {
       throw fatal(
@@ -320,18 +607,150 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
     if (action.kind === "add" && hasPattern) {
       throw fatal("--append cannot be used with --value=<pattern>");
     }
-    if (action.kind === "get" && this.defaultValue !== undefined && this.all) {
+    const getLike =
+      action.kind === "get" || action.kind === "get-regexp" || action.kind === "get-urlmatch";
+    if (
+      getLike &&
+      this.defaultValue !== undefined &&
+      (this.all || action.kind === "get-urlmatch")
+    ) {
       throw fatal("--default= cannot be used with --all or --url=");
     }
-    if (action.kind !== "get" && this.defaultValue !== undefined) {
+    if (action.kind === "get-urlmatch" && (this.all || hasPattern)) {
+      throw fatal("--url= cannot be used with --all, --regexp or --value");
+    }
+    if (!getLike && this.defaultValue !== undefined) {
       throw new Refusal(129, ["error: unknown option `default'"]);
     }
   }
 
-  /** `get`: the values of the key in the file or the whole configuration, filtered. */
-  private async runGet(key: string): Promise<ConfigCommandResult> {
-    const parsed = parseConfigKey(key);
-    if ("status" in parsed) return result(1, [`error: ${parsed.error}`]);
+  /** The display options as builtin/config.c's `display_options_init` sets them. */
+  private display(list: boolean): Display {
+    const nul = this.nullTerminated;
+    return {
+      term: nul ? "\0" : "\n",
+      keyDelim: nul ? "\n" : list ? "=" : " ",
+      showKeys: list,
+      omitValues: this.nameOnly,
+    };
+  }
+
+  /** What a value's formatting needs from the host. */
+  private valueContext(): ConfigValueContext {
+    const environment = hostEnvironmentOf(this.workingCopy);
+    return {
+      compatibility: this.compatibility,
+      home: environment?.home,
+      now: this.clock(),
+      userHome: async (name) => environment?.expandUserHome?.(name),
+      isMissing: async (path) => {
+        try {
+          if (path.startsWith("/")) {
+            if (environment?.statFile) return (await environment.statFile(path)) === undefined;
+            return (await environment?.readFile(path)) === undefined;
+          }
+          const worktree = this.worktreeAccess;
+          const files = worktree?.getFiles?.();
+          if (!worktree || !files) return true;
+          const root = worktree.getRoot().replace(/\/+$/, "");
+          return (await files.stats(root ? `${root}/${path}` : path)) === undefined;
+        } catch {
+          return true;
+        }
+      },
+    };
+  }
+
+  /**
+   * builtin/config.c's `format_config`: scope, origin, key and the value as typed, ended
+   * with the terminator; a death of git's thrown as a {@link Refusal}.
+   */
+  private async format(
+    display: Display,
+    entry: QueryEntry,
+    key: string,
+    gently: boolean,
+    typed = true,
+  ): Promise<{ text: string } | { skip: true } | { error: string[]; partial: string }> {
+    const sep = this.nullTerminated ? "\0" : "\t";
+    let text = "";
+    if (this.showScope) text += `${entry.scope ?? "unknown"}${sep}`;
+    if (this.showOrigin) {
+      text += `${entry.origin}:${this.nullTerminated ? entry.name : quotePath(entry.name)}${sep}`;
+    }
+    if (display.showKeys) text += key;
+    if (!display.omitValues) {
+      if (display.showKeys) text += display.keyDelim;
+      if (this.type === undefined || !typed) {
+        if (entry.text !== undefined) text += entry.text;
+        else if (display.showKeys) text = text.slice(0, -display.keyDelim.length);
+      } else {
+        let formatted: FormattedConfigValue;
+        try {
+          formatted = await formatConfigValue(
+            this.type,
+            key,
+            entry.text,
+            entry,
+            this.valueContext(),
+            gently,
+          );
+        } catch (error) {
+          if (error instanceof ConfigValueDeath) throw new Refusal(128, error.lines);
+          throw error;
+        }
+        if ("skip" in formatted) return formatted;
+        if ("error" in formatted) return { error: formatted.error, partial: text };
+        text += formatted.ok;
+      }
+    }
+    return { text: text + display.term };
+  }
+
+  /**
+   * A value that failed to format while git read the configuration: the read stops with git's
+   * `bad config line` (or the command line's) death after the formatter's error.
+   */
+  private configReadDeath(entry: QueryEntry, lines: string[]): Refusal {
+    const where =
+      entry.origin === "command line"
+        ? "fatal: unable to parse command-line config"
+        : entry.origin === "blob"
+          ? `fatal: bad config line ${entry.line ?? 0} in blob ${entry.name}`
+          : entry.origin === "file"
+            ? `fatal: bad config line ${entry.line ?? 0} in file ${entry.name}`
+            : `fatal: bad config line ${entry.line ?? 0} in ${entry.name}`;
+    return new Refusal(128, [...this.warnings, ...lines, where]);
+  }
+
+  /** `get` / `--get[-all]` / `--get-regexp`: builtin/config.c's `get_value`. */
+  private async runGet(name: string, keyRegexp: boolean): Promise<ConfigCommandResult> {
+    let matchKey: (key: string) => boolean;
+    if (keyRegexp) {
+      // git lowers the section (up to the first dot) and the part after the last dot
+      const lastDot = name.lastIndexOf(".");
+      const firstDot = name.indexOf(".");
+      let lowered = name;
+      if (lastDot < 0) lowered = name.toLowerCase();
+      else {
+        lowered =
+          name.slice(0, firstDot).toLowerCase() +
+          name.slice(firstDot, lastDot + 1) +
+          name.slice(lastDot + 1).toLowerCase();
+      }
+      let regex: ReturnType<typeof compilePosixRegex>;
+      try {
+        regex = compilePosixRegex(encodeGitPath(lowered), { extended: true });
+      } catch (error) {
+        if (!(error instanceof PosixRegexError)) throw error;
+        return result(6, [`error: invalid key pattern: ${name}`]);
+      }
+      matchKey = (key) => regex.test(encodeGitPath(key));
+    } else {
+      const parsed = parseConfigKey(name);
+      if ("status" in parsed) return result(1, [`error: ${parsed.error}`]);
+      matchKey = (key) => key === parsed.key;
+    }
     let matcher: ((value: string | undefined) => boolean) | undefined;
     const pattern = this.valuePattern;
     if (pattern !== undefined && this.fixedValue) {
@@ -348,34 +767,203 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
       }
       matcher = (value) => invert !== regex.test(encodeGitPath(value ?? ""));
     }
-    const all = await this.readValues(parsed.key);
-    const values = matcher ? all.filter(matcher) : all;
-    if (values.length === 0 && this.defaultValue !== undefined) {
-      return {
-        ...result(0, this.warnings),
-        stdout: `${this.defaultValue}\n`,
-        values: [this.defaultValue],
-      };
+    const entries = await this.readEntries(false);
+    const display = this.display(false);
+    const all = keyRegexp && this.legacy ? true : this.all;
+    display.showKeys = keyRegexp && this.legacy ? true : this.showNames;
+    const matched = entries.filter((e) => matchKey(e.key) && (!matcher || matcher(e.text)));
+    const shown: string[] = [];
+    const values: (string | undefined)[] = [];
+    for (const entry of matched) {
+      const formatted = await this.format(display, entry, entry.key, false);
+      if ("error" in formatted) throw this.configReadDeath(entry, formatted.error);
+      if ("skip" in formatted) continue;
+      shown.push(formatted.text);
+      values.push(entry.text);
     }
-    const shown = this.all ? values : values.slice(-1);
+    if (shown.length === 0 && this.defaultValue !== undefined) {
+      const param: QueryEntry = {
+        key: name,
+        text: this.defaultValue,
+        origin: "command line",
+        name: "",
+        scope: "command",
+      };
+      const formatted = await this.format(display, param, name, false);
+      if ("error" in formatted) {
+        throw new Refusal(128, [
+          ...this.warnings,
+          ...formatted.error,
+          `fatal: failed to format default config value: ${this.defaultValue}`,
+        ]);
+      }
+      if ("text" in formatted) {
+        return {
+          ...result(0, this.warnings),
+          stdout: formatted.text,
+          values: [this.defaultValue],
+        };
+      }
+    }
+    const printed = all ? shown : shown.slice(-1);
     return {
-      ...result(values.length > 0 ? 0 : 1, this.warnings),
-      stdout: shown.map((v) => `${v ?? ""}\n`).join(""),
+      ...result(shown.length > 0 ? 0 : 1, this.warnings),
+      stdout: printed.join(""),
       values,
     };
   }
 
-  /** Every value of the canonical `key`: in the scope's file, or the whole configuration. */
-  private async readValues(key: string): Promise<(string | undefined)[]> {
+  /** `list` / `--list`: builtin/config.c's `show_all_config` over the whole read. */
+  private async runList(): Promise<ConfigCommandResult> {
+    const entries = await this.readEntries(true);
+    const display = this.display(true);
+    const errors: string[] = [];
+    let stdout = "";
+    for (const entry of entries) {
+      // 2.43 prints values as written whatever the type; 2.5x drops those it cannot format
+      const formatted = await this.format(
+        display,
+        entry,
+        entry.key,
+        true,
+        this.compatibility !== "2.43",
+      );
+      if ("text" in formatted) stdout += formatted.text;
+      else if ("error" in formatted) errors.push(...formatted.error);
+    }
+    return { ...result(0, [...this.warnings, ...errors]), stdout };
+  }
+
+  /** `--get-urlmatch` / `get --url=`: builtin/config.c's `get_urlmatch`. */
+  private async runUrlmatch(name: string, url: string): Promise<ConfigCommandResult> {
+    const normalized = normalizeUrl(url);
+    if (isUrlNormalizeError(normalized)) throw fatal(normalized.error);
+    const lowered = name.toLowerCase();
+    const dot = lowered.indexOf(".");
+    const section = dot < 0 ? lowered : lowered.slice(0, dot);
+    const key = dot < 0 ? undefined : lowered.slice(dot + 1);
+    const entries = await this.readEntries(false);
+    const chosen = selectUrlMatches(entries, section, normalized, key);
+    const display = this.display(false);
+    display.showKeys = key === undefined;
+    display.omitValues = false;
+    let stdout = "";
+    const errors: string[] = [];
+    for (const [synthetic, entry] of chosen) {
+      const formatted = await this.format(display, entry, synthetic, false);
+      if ("text" in formatted) stdout += formatted.text;
+      else if ("error" in formatted) {
+        errors.push(...formatted.error);
+        // 2.43 writes what it formatted before the failure, unterminated
+        if (this.compatibility === "2.43") stdout += formatted.partial;
+      }
+    }
+    return { ...result(chosen.size > 0 ? 0 : 1, [...this.warnings, ...errors]), stdout };
+  }
+
+  /** `--get-color`: builtin/config.c's `get_color`. */
+  private async runGetColor(
+    slot: string,
+    defaultColor: string | undefined,
+  ): Promise<ConfigCommandResult> {
+    const entries = await this.readEntries(false);
+    let parsed = "";
+    let found = false;
+    for (const entry of entries) {
+      if (entry.key !== slot) continue;
+      const lines = entry.text === undefined ? [`error: missing value for '${slot}'`] : [];
+      const color =
+        entry.text === undefined ? undefined : parseGitColor(entry.text, this.compatibility);
+      if (color === undefined) {
+        throw this.configReadDeath(entry, [
+          ...lines,
+          `error: invalid color value: ${entry.text ?? ""}`,
+        ]);
+      }
+      parsed = color;
+      found = true;
+    }
+    if (!found && defaultColor !== undefined) {
+      const color = parseGitColor(defaultColor, this.compatibility);
+      if (color === undefined) {
+        const invalid = `error: invalid color value: ${defaultColor}`;
+        if (this.compatibility === "2.43") {
+          throw new Refusal(128, [invalid, "fatal: unable to parse default color value"]);
+        }
+        return result(255, [
+          ...this.warnings,
+          invalid,
+          "error: unable to parse default color value",
+        ]);
+      }
+      parsed = color;
+    }
+    return { ...result(0, this.warnings), stdout: parsed };
+  }
+
+  /** `--get-colorbool`: builtin/config.c's `get_colorbool`. */
+  private async runGetColorBool(
+    slot: string,
+    stdoutIsTty: string | undefined,
+  ): Promise<ConfigCommandResult> {
+    let tty = false;
+    try {
+      if (stdoutIsTty !== undefined) tty = gitConfigBool("command line", stdoutIsTty);
+      const entries = await this.readEntries(false);
+      let found: "never" | "always" | "auto" | undefined;
+      let diff: typeof found;
+      let ui: typeof found;
+      for (const entry of entries) {
+        if (entry.key === slot) found = gitConfigColorBool(entry.key, entry.text);
+        else if (entry.key === "diff.color") diff = gitConfigColorBool(entry.key, entry.text);
+        else if (entry.key === "color.ui") ui = gitConfigColorBool(entry.key, entry.text);
+      }
+      if (found === undefined) {
+        if (slot === "color.diff") found = diff;
+        if (found === undefined) found = ui;
+      }
+      const wanted = (found ?? "auto") === "auto" ? tty && !this.dumbTerminal : found === "always";
+      if (stdoutIsTty !== undefined) {
+        return { ...result(0, this.warnings), stdout: wanted ? "true\n" : "false\n" };
+      }
+      return result(wanted ? 0 : 1, this.warnings);
+    } catch (error) {
+      if (error instanceof ConfigValueDeath)
+        throw new Refusal(128, [...this.warnings, ...error.lines]);
+      throw error;
+    }
+  }
+
+  /**
+   * The entries read, in git's order: of the blob, of the scope's file or `--file`, or of the
+   * whole configuration. A source `list` cannot read is git's death there; `get` reads it as
+   * empty.
+   */
+  private async readEntries(list: boolean): Promise<QueryEntry[]> {
+    if (this.blob !== undefined) return this.readBlobEntries(list);
     if (this.scope === undefined && this.file === undefined) {
       const config = this.workingCopy.config as GitWorkingCopyConfig | undefined;
-      if (!config || typeof config.getAllWithOrigin !== "function") {
-        const value = this.workingCopy.config?.[key];
-        return value === undefined ? [] : [value === true ? undefined : String(value)];
-      }
-      return config.getAllWithOrigin(key).map((e) => e.text);
+      if (!config || typeof config.listWithOrigin !== "function") return [];
+      return config.listWithOrigin().map((e) => ({
+        key: e.key,
+        text: e.text,
+        origin: e.file !== undefined ? "file" : e.scope === "command" ? "command line" : "",
+        name: e.file ?? "",
+        ...(e.scope !== undefined ? { scope: e.scope } : {}),
+        ...(e.line !== undefined ? { line: e.line } : {}),
+      }));
     }
     const location = await this.location();
+    const environment = hostEnvironmentOf(this.workingCopy);
+    const scope: ConfigScope =
+      this.file !== undefined
+        ? "command"
+        : this.scope === "global"
+          ? "global"
+          : this.scope === "system"
+            ? "system"
+            : "local";
+    let failure: string | undefined;
     const reader = new GitWorkingCopyConfig(
       {
         read: async (path) => {
@@ -383,8 +971,14 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
           const read = await readConfigFileThroughLinks(location.files, path);
           if (read.kind === "error" || read.kind === "directory") {
             const reason = read.kind === "error" ? read.reason : "Is a directory";
-            this.warnings.push(`warning: unable to access '${location.name}': ${reason}`);
+            if (path === location.path) {
+              this.warnings.push(`warning: unable to access '${location.name}': ${reason}`);
+              failure = reason;
+            }
             return undefined;
+          }
+          if (read.kind === "absent" && path === location.path) {
+            failure = "No such file or directory";
           }
           return read.kind === "file" ? read.bytes : undefined;
         },
@@ -393,7 +987,11 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
         },
       },
       location.path,
-      { includes: false },
+      {
+        includes: this.includes ?? false,
+        fileOnly: true,
+        ...(environment ? { environment } : {}),
+      },
     );
     try {
       await reader.load();
@@ -403,7 +1001,99 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
       }
       throw error;
     }
-    return reader.getAllWithOrigin(key).map((e) => e.text);
+    if (failure !== undefined && list) {
+      throw new Refusal(128, [
+        ...this.warnings,
+        `fatal: unable to read config file '${location.name}': ${failure}`,
+      ]);
+    }
+    // the file alone: not the `config.worktree` its `extensions.worktreeConfig` would add
+    return reader
+      .listWithOrigin()
+      .filter((e) => e.scope !== "worktree")
+      .map((e) => {
+        const bare = (path: string) => path.replace(/^\/+/, "");
+        const own = e.file === undefined || bare(e.file) === bare(location.path);
+        return {
+          key: e.key,
+          text: e.text,
+          origin: "file",
+          name: own
+            ? scope === "local"
+              ? bare(location.name)
+              : location.name
+            : (e.file as string),
+          scope,
+          ...(e.line !== undefined ? { line: e.line } : {}),
+        };
+      });
+  }
+
+  /** `--blob=<blob-ish>`: git's `git_config_from_blob_ref`. */
+  private async readBlobEntries(list: boolean): Promise<QueryEntry[]> {
+    const name = this.blob as string;
+    const refuse = (line: string): QueryEntry[] => {
+      if (list) throw new Refusal(128, [line, "fatal: error processing config file(s)"]);
+      this.warnings.push(line);
+      return [];
+    };
+    let id: string | undefined;
+    try {
+      id = await this.revisionResolver().resolve(name);
+    } catch {
+      id = undefined;
+    }
+    if (id === undefined) return refuse(`error: unable to resolve config blob '${name}'`);
+    const bytes =
+      (await this.revisionResolver().objectType(id)) === "blob"
+        ? await this.readBlob(id)
+        : undefined;
+    if (bytes === undefined) return refuse(`error: reference '${name}' does not point to a blob`);
+    const reader = new GitWorkingCopyConfig(
+      {
+        read: async () => bytes,
+        write: async () => {
+          throw new Error("read only");
+        },
+      },
+      "blob",
+      { includes: false },
+    );
+    try {
+      await reader.load();
+    } catch (error) {
+      if (error instanceof ConfigParseError) {
+        return refuse(`error: bad config line ${error.line} in blob ${name}`);
+      }
+      throw error;
+    }
+    return reader.listWithOrigin().map((e) => ({
+      key: e.key,
+      text: e.text,
+      origin: "blob",
+      name,
+      scope: "command",
+      ...(e.line !== undefined ? { line: e.line } : {}),
+    }));
+  }
+
+  /** A blob's bytes. */
+  private async readBlob(id: string): Promise<Uint8Array | undefined> {
+    const content = await this.blobs.load(id);
+    if (!content) return undefined;
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for await (const c of content) {
+      chunks.push(c);
+      size += c.length;
+    }
+    const out = new Uint8Array(size);
+    let at = 0;
+    for (const c of chunks) {
+      out.set(c, at);
+      at += c.length;
+    }
+    return out;
   }
 
   /** The working copy's configuration, read again after a write (git's `repo_config_clear`). */
