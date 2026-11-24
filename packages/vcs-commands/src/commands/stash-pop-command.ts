@@ -72,7 +72,8 @@ export class StashPopCommand extends StashInfoCommand<StashPopResult> {
       this.output.push("The stash entry is kept in case you need it again.");
       throw error;
     }
-    if (result.status === StashApplyStatus.CONFLICTS) {
+    // only a clean apply drops the entry (any other status keeps it, as git keeps it on a failed apply)
+    if (result.status !== StashApplyStatus.OK) {
       this.output.push("The stash entry is kept in case you need it again.");
       return { ...result, dropped: false };
     }

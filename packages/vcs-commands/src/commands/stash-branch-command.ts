@@ -77,7 +77,8 @@ export class StashBranchCommand extends StashInfoCommand<StashBranchResult> {
 
     const result = await this.applyStash(info, { index: true, quiet: false });
     const branch = `refs/heads/${name}`;
-    if (result.status === StashApplyStatus.CONFLICTS) {
+    // only a clean apply drops the entry
+    if (result.status !== StashApplyStatus.OK) {
       return { ...result, branch, dropped: false };
     }
     if (!info.isStashRef) return { ...result, branch, dropped: false };
