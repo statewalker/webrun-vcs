@@ -131,6 +131,11 @@ export interface OrtMergeResult {
   clean: boolean;
   /** merge-ort's messages (`Auto-merging x`, `CONFLICT (...)`), in git's order */
   messages: string[];
+  /**
+   * The messages by the path they are about, without merge-ort's omittable hints
+   * (`Auto-merging`, `Path updated`, ...): `--remerge-diff`'s `remerge` headers
+   */
+  pathMessages?: Map<string, string[]>;
   /** Whether directory renames were found (paths may move into any directory) */
   directoryRenames?: boolean;
 }
@@ -316,7 +321,7 @@ class OrtMerge {
   /** Folded keys of `paths` (core.ignorecase), for unique names */
   private readonly folded = new Set<string>();
   private readonly conflicted = new Map<string, Info>();
-  private readonly notes: { path: string; order: number; text: string }[] = [];
+  private readonly notes: { path: string; order: number; text: string; hint: boolean }[] = [];
   private order = 0;
   private readonly depth: number;
   private readonly branch1: string;
@@ -379,10 +384,14 @@ class OrtMerge {
     this.dirRenamesMode = options.directoryRenames ?? "conflict";
   }
 
-  private say(path: string, text: string): void {
+  /**
+   * path_msg: a message about `path`; `hint` marks merge-ort's omittable hints (`Auto-merging`,
+   * applied or suggested directory renames), which `--remerge-diff` leaves out of its headers
+   */
+  private say(path: string, text: string, hint = false): void {
     // inner merges are silent (path_msg at call_depth > 0)
     if (this.depth > 0) return;
-    this.notes.push({ path, order: this.order++, text });
+    this.notes.push({ path, order: this.order++, text, hint });
   }
 
   /** A name as git's case-insensitive name hashing sees it (`memihash`: ASCII folded) */
@@ -1008,6 +1017,7 @@ class OrtMerge {
       this.say(
         oldDir,
         `WARNING: Avoiding applying ${oldDir} -> ${newDir} rename to ${path}, because ${newDir} itself was renamed.`,
+        true,
       );
       return undefined;
     }
@@ -1091,6 +1101,7 @@ class OrtMerge {
         pair.status === "A"
           ? `Path updated: ${oldPath} added in ${withNewPath} inside a directory that was renamed in ${withDirRename}; moving it to ${newPath}.`
           : `Path updated: ${pair.one} renamed to ${oldPath} in ${withNewPath}, inside a directory that was renamed in ${withDirRename}; moving it to ${newPath}.`,
+        true,
       );
     } else {
       ci.pathConflict = true;
@@ -1099,6 +1110,7 @@ class OrtMerge {
         pair.status === "A"
           ? `CONFLICT (file location): ${oldPath} added in ${withNewPath} inside a directory that was renamed in ${withDirRename}, suggesting it should perhaps be moved to ${newPath}.`
           : `CONFLICT (file location): ${pair.one} renamed to ${oldPath} in ${withNewPath}, inside a directory that was renamed in ${withDirRename}, suggesting it should perhaps be moved to ${newPath}.`,
+        true,
       );
     }
     pair.two = newPath;
@@ -1316,7 +1328,7 @@ class OrtMerge {
               ];
         this.say(path, `warning: Cannot merge binary files: ${path} (${n1} vs. ${n2})`);
       }
-      this.say(path, `Auto-merging ${path}`);
+      this.say(path, `Auto-merging ${path}`, true);
       return { entry: { objectId, mode }, clean: clean && merged.status === "ok" };
     }
     if (isGitlink(a)) {
@@ -1638,13 +1650,21 @@ class OrtMerge {
       if (ci.movedFrom && o && ours.has(ci.movedFrom)) conflict.moveFrom = ci.movedFrom;
       conflicts.set(ci.dfMoved && ci.movedFrom ? ci.movedFrom : path, conflict);
     }
-    const messages = this.notes
-      .sort((x, y) => compareStrings(x.path, y.path) || x.order - y.order)
-      .map((n) => n.text);
+    const sorted = this.notes.sort((x, y) => compareStrings(x.path, y.path) || x.order - y.order);
+    const messages = sorted.map((n) => n.text);
+    // merge-ort's priv->conflicts without the omittable hints (record_conflict_msgs_as_headers)
+    const pathMessages = new Map<string, string[]>();
+    for (const n of sorted) {
+      if (n.hint) continue;
+      const list = pathMessages.get(n.path);
+      if (list) list.push(n.text);
+      else pathMessages.set(n.path, [n.text]);
+    }
     return {
       result,
       conflicts,
       messages,
+      pathMessages,
       clean: this.renamesClean && this.conflicted.size === 0,
       directoryRenames: this.dirRenames[1].size > 0 || this.dirRenames[2].size > 0,
     };
