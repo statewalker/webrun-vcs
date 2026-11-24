@@ -414,6 +414,8 @@ async function collect(options: GcOptions): Promise<GcResult> {
     const expired = await expireReflogs({
       files,
       gitDir,
+      // checked above (assertAlternatesReadable)
+      alternatesChecked: true,
       refs: history.refs,
       objects,
       ...(options.environment ? { environment: options.environment } : {}),

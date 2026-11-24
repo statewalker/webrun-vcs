@@ -306,9 +306,9 @@ export class ReflogCommand extends GitCommand<ReflogEntry[]> {
         continue;
       }
       const spec = rev.slice(at + 2);
-      const digits = /^\d+/.exec(spec)?.[0];
+      const recno = strtoulPrefix(spec);
       let select: ReflogEntrySelector;
-      if (digits !== undefined && spec[digits.length] === "}") select = { index: Number(digits) };
+      if (spec[recno.end] === "}") select = { index: recno.value };
       else {
         const text = spec.endsWith("}") ? spec.slice(0, -1) : spec;
         select = { before: approxidateCareful(text, this.clock()).timestamp };
@@ -531,4 +531,19 @@ function isPerWorktree(name: string): boolean {
     name.startsWith("refs/worktree/") ||
     name.startsWith("refs/rewritten/")
   );
+}
+
+/**
+ * C's `strtoul(text, &end, 10)` as reflog_delete reads `@{<n>}`, the result then stored in an
+ * int: leading whitespace skipped, an optional sign (`-1` wraps to -1, a selector past the
+ * end), the digits; with no digits nothing is read (`end` 0, value 0).
+ */
+function strtoulPrefix(text: string): { value: number; end: number } {
+  const m = /^[ \t\n\v\f\r]*([+-]?)(\d+)/.exec(text);
+  if (!m) return { value: 0, end: 0 };
+  let value = 0n;
+  for (const d of m[2] as string) value = (value * 10n + BigInt(d)) & 0xffffffffffffffffn;
+  if (m[1] === "-") value = (0x10000000000000000n - value) & 0xffffffffffffffffn;
+  // (int) of the unsigned long
+  return { value: Number(BigInt.asIntN(32, value)), end: m[0].length };
 }

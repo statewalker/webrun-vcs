@@ -30,7 +30,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
 import {
   createNodeFilesApi,
@@ -92,6 +92,8 @@ function env(format: Format, extra: Record<string, string> = {}): Record<string,
 /** One twin being built: native git commands at the twin's own clock. */
 class Builder {
   readonly tick = new Tick();
+  /** The root of our FilesApi (default the repository; above it to reach an alternate) */
+  filesRoot?: string;
   constructor(
     readonly repo: string,
     readonly format: Format,
@@ -143,10 +145,11 @@ function twins(format: Format, setup: (b: Builder) => void): Twins {
 }
 
 async function open(b: Builder): Promise<Git> {
-  const files = createNodeFilesApi({ rootDir: b.repo });
+  const files = createNodeFilesApi({ rootDir: b.filesRoot ?? b.repo });
+  const gitDir = b.filesRoot ? join(relative(b.filesRoot, b.repo), ".git") : ".git";
   const environment = createNodeGitHostEnvironment({ env: env(b.format, b.tick.now()) });
-  const { history } = await createGitFilesBackend({ files, gitDir: ".git", environment });
-  const worktrees = await openGitLinkedWorktrees({ files, gitDir: ".git", history, environment });
+  const { history } = await createGitFilesBackend({ files, gitDir, environment });
+  const worktrees = await openGitLinkedWorktrees({ files, gitDir, history, environment });
   return Git.fromWorkingCopy(await worktrees.openCurrent());
 }
 
@@ -628,5 +631,122 @@ describeGit("reflog expire, delete, exists, write and drop against native git", 
     await compare(t, ["write", "refs/heads/x", ZERO, ZERO, "m"], (r) =>
       r.callWrite("refs/heads/x", ZERO, ZERO, "m"),
     );
+  });
+  describe.each(FORMATS)("%s: selectors as strtoul reads them", (format) => {
+    it('t1410-reflog.sh: "delete" with main@{-1}, main@{ 1}, main@{+1} and --updateref', async () => {
+      const t = twins(format, t1410Delete);
+      for (const selector of ["main@{-1}", "main@{ 1}", "main@{+1}", "main@{}"]) {
+        await compare(t, ["delete", "--updateref", "--rewrite", selector], (r) =>
+          r.setUpdateRef(true).setRewrite(true).callDelete(selector),
+        );
+      }
+    });
+  });
+
+  describe("alternates and partial clones", () => {
+    /** Twins cloned with `--shared` from one source (the same clone messages in both) */
+    function sharedTwins(): Twins {
+      const n = counter++;
+      const src = new Builder(join(root, `t${n}-src`), "files");
+      execFileSync("git", ["init", "-q", "-b", "main", src.repo], { env: env("files") });
+      t1410Setup(src);
+      const make = (side: string) => {
+        const b = new Builder(join(root, `t${n}-${side}`, "repo"), "files");
+        b.tick.time = src.tick.time;
+        execFileSync("git", ["clone", "-q", "--shared", src.repo, b.repo], {
+          env: env("files", b.tick.now()),
+        });
+        b.git(["config", "gc.reflogExpire", "90.days.ago"]);
+        b.git(["config", "gc.reflogExpireUnreachable", "30.days.ago"]);
+        b.tick.next();
+        b.git(["reset", "-q", "--hard", "HEAD~1"]);
+        b.git(["branch", "side", "origin/main"]);
+        b.tick.next();
+        b.git(["branch", "-f", "side", "HEAD"]);
+        return b;
+      };
+      return { native: make("native"), ours: make("ours") };
+    }
+
+    it('t1410-reflog.sh: "reflog expire" (--stale-fix --all) refuses an alternate it cannot read', async () => {
+      const t = sharedTwins();
+      const before = logFiles(t.ours.repo);
+      const git = await open(t.ours);
+      try {
+        await expect(
+          git.reflog().setStaleFix(true).setAll(true).setExpire("never").callExpire(),
+        ).rejects.toThrow(/cannot expire reflogs: an alternate object directory/);
+        await expect(
+          (await open(t.ours)).reflog().setRewrite(true).callDelete("main@{1}"),
+        ).rejects.toThrow(/cannot expire reflogs/);
+      } finally {
+        await git.close?.();
+      }
+      expect(logFiles(t.ours.repo)).toEqual(before);
+    });
+
+    it('t1410-reflog.sh: "reflog expire" (--stale-fix --all) through a readable alternate', async () => {
+      const t = sharedTwins();
+      t.ours.filesRoot = root;
+      await compare(
+        t,
+        [
+          "expire",
+          "--verbose",
+          "--stale-fix",
+          "--all",
+          "--expire=never",
+          "--expire-unreachable=now",
+        ],
+        (r) =>
+          r
+            .setVerbose(true)
+            .setStaleFix(true)
+            .setAll(true)
+            .setExpire("never")
+            .setExpireUnreachable("now")
+            .callExpire(),
+      );
+    });
+
+    it('t1410-reflog.sh: "--stale-fix handles missing objects generously" in a blob:none partial clone', async () => {
+      const n = counter++;
+      const srv = new Builder(join(root, `t${n}-srv`), "files");
+      execFileSync("git", ["init", "-q", "-b", "main", srv.repo], { env: env("files") });
+      srv.testCommit("A");
+      srv.git(["checkout", "-q", "-b", "side"]);
+      srv.testCommit("B", srv.repo, false);
+      srv.testCommit("C", srv.repo, false);
+      srv.git(["checkout", "-q", "main"]);
+      srv.git(["config", "uploadpack.allowFilter", "true"]);
+      srv.git(["config", "uploadpack.allowAnySHA1InWant", "true"]);
+      const make = (side: string) => {
+        const b = new Builder(join(root, `t${n}-${side}`, "repo"), "files");
+        b.tick.time = srv.tick.time;
+        execFileSync(
+          "git",
+          ["clone", "-q", "--no-local", "--filter=blob:none", `file://${srv.repo}`, b.repo],
+          { env: env("files", b.tick.now()) },
+        );
+        b.git(["config", "gc.reflogExpire", "never"]);
+        b.git(["config", "gc.reflogExpireUnreachable", "never"]);
+        b.git(["branch", "foo"]);
+        // foo at a commit whose blobs were never fetched, then back
+        b.git(["update-ref", "-m", "to side", "refs/heads/foo", "origin/side"]);
+        b.git(["update-ref", "-m", "back", "refs/heads/foo", "main"]);
+        b.git(["update-ref", "-d", "refs/remotes/origin/side"]);
+        return b;
+      };
+      const t = { native: make("native"), ours: make("ours") };
+      // our FilesApi reaches the promisor remote (file://) too
+      t.ours.filesRoot = root;
+      const missing = (b: Builder) =>
+        b.git(["rev-list", "--objects", "--missing=print", "refs/heads/foo@{1}"]);
+      expect(missing(t.native)).toMatch(/^\?/m);
+      const r = await compare(t, ["expire", "--verbose", "--stale-fix", "--all"], (r) =>
+        r.setVerbose(true).setStaleFix(true).setAll(true).callExpire(),
+      );
+      expect(r.out).toContain("keep to side");
+    });
   });
 });

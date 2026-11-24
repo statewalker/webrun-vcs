@@ -15,6 +15,7 @@ import { approxidateCareful } from "@statewalker/vcs-utils";
 import { atomicFilesOver } from "@statewalker/vcs-utils/files";
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
+import { assertAlternatesReadable } from "./alternates/index.js";
 import { objectIdPattern } from "./object-names.js";
 import {
   configFilesApiOf,
@@ -74,6 +75,12 @@ export interface ExpireReflogsOptions {
    * unreachable entries all go
    */
   compatibility?: "2.43" | "2.56";
+  /**
+   * The caller already refused alternates this store cannot read (gc). Otherwise expiry
+   * refuses them itself (`AlternatesUnreadableError`): their objects would look missing, so
+   * `--stale-fix` and the reachability checks would drop entries git keeps
+   */
+  alternatesChecked?: boolean;
   /**
    * `--stale-fix`: entries naming a commit that is missing, or whose history or trees miss
    * objects (reflog.c's `keep_entry`), go too; what the refs reach counts as complete
@@ -146,6 +153,9 @@ export async function expireReflogs(options: ExpireReflogsOptions): Promise<Expi
   // ids of the repository's format (git's parse_oid_hex reads the_hash_algo's digits)
   const format = objectFormatOf(objects);
   const now = options.now ?? Math.floor(Date.now() / 1000);
+  if (!options.alternatesChecked) {
+    await assertAlternatesReadable({ files, gitDir, objects }, "expire reflogs");
+  }
   const policyOf = options.select
     ? // reflog_delete: no configured expiry, both cutoffs 0
       (): Policy => ({ total: 0, unreachable: 0 })
@@ -695,6 +705,26 @@ class StaleFix {
     return !incomplete;
   }
 
+  /**
+   * odb_has_object with HAS_OBJECT_FETCH_PROMISOR: an absent object of a partial clone is
+   * fetched from its promisor remote (one read through the lazily fetching store) and counts
+   * as present once it arrives; without a fetcher, or with lazy fetching off
+   * (`GIT_NO_LAZY_FETCH`), it stays missing.
+   */
+  private async isPresent(id: ObjectId): Promise<boolean> {
+    if (await this.objects.has(id).catch(() => false)) return true;
+    const promisor = this.objects.promisor;
+    if (!promisor?.lazyFetchEnabled || !promisor.hasPromisorRemote()) return false;
+    try {
+      const o = await this.objects.get(id);
+      if (!o) return false;
+      if (!o.bytes) await o.content[Symbol.asyncIterator]().return?.();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async treeIsComplete(tree: ObjectId): Promise<boolean> {
     if (this.seenTrees.has(tree)) return true;
     if (this.incompleteTrees.has(tree)) return false;
@@ -705,7 +735,7 @@ class StaleFix {
     }
     let complete = true;
     for (const e of entries) {
-      const present = await this.objects.has(e.id).catch(() => false);
+      const present = await this.isPresent(e.id);
       if (!present || (e.mode === 0o040000 && !(await this.treeIsComplete(e.id)))) {
         this.incompleteTrees.add(tree);
         complete = false;
