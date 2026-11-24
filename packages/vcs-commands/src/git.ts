@@ -89,8 +89,10 @@ import {
   SubmoduleInitCommand,
   SubmoduleSetBranchCommand,
   SubmoduleSetUrlCommand,
+  SubmoduleStatusCommand,
   SubmoduleSummaryCommand,
   SubmoduleSyncCommand,
+  SubmoduleUpdateCommand,
   SwitchCommand,
   TagCommand,
   UnsetUpstreamBranchCommand,
@@ -1001,6 +1003,34 @@ export class Git implements Disposable {
   submoduleAdd(): SubmoduleAddCommand {
     this.checkClosed();
     return this.withTransports(new SubmoduleAddCommand(this._workingCopy));
+  }
+
+  /**
+   * `git submodule update`: clone missing submodules and bring each to the commit the index
+   * records (checkout, merge, rebase or a configured command), the facade's transports used
+   * for clones and fetches.
+   *
+   * @example
+   * ```typescript
+   * await git.submoduleUpdate().setInit(true).setRecursive(true).call();
+   * ```
+   */
+  submoduleUpdate(): SubmoduleUpdateCommand {
+    this.checkClosed();
+    return this.withTransports(new SubmoduleUpdateCommand(this._workingCopy));
+  }
+
+  /**
+   * `git submodule status`: one line per submodule, its state, commit and name.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.submoduleStatus().setRecursive(true).call();
+   * ```
+   */
+  submoduleStatus(): SubmoduleStatusCommand {
+    this.checkClosed();
+    return new SubmoduleStatusCommand(this._workingCopy);
   }
 
   /**

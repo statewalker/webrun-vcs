@@ -26,6 +26,10 @@ export interface DescribeOptions {
   match?: readonly string[];
   /** No tags whose name matches one of these globs (`--exclude`) */
   exclude?: readonly string[];
+  /** Any ref, not only tags (`--all`): names below `refs/`, an annotated tag as `tags/<name>` */
+  all?: boolean;
+  /** The abbreviated id when nothing describes the commit (`--always`) */
+  always?: boolean;
 }
 
 /** What {@link createDescriber} reads. */
@@ -100,8 +104,9 @@ export function createDescriber(
   const match = source.wildmatch ?? globMatch;
   return async (id, options = {}) => {
     const names = await knownNames(source, options, match);
-    if (names.size === 0) return "";
-    return describeCommit(source, names, id, options);
+    const described = names.size === 0 ? "" : await describeCommit(source, names, id, options);
+    if (described === "" && options.always) return source.abbreviate(id, options.abbrev);
+    return described;
   };
 }
 
@@ -112,15 +117,29 @@ async function knownNames(
   match: (pattern: string, text: string) => boolean,
 ): Promise<Map<ObjectId, CommitName>> {
   const refs: { name: string; objectId?: ObjectId; target?: string }[] = [];
-  for await (const ref of source.refs.list("refs/tags/")) {
-    if (ref.name.startsWith("refs/tags/")) refs.push(ref);
+  const prefix = options.all ? "refs/" : "refs/tags/";
+  for await (const ref of source.refs.list(prefix)) {
+    if (ref.name.startsWith(prefix)) refs.push(ref);
   }
   refs.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   const names = new Map<ObjectId, CommitName>();
+  const filtered = !!(options.exclude?.length || options.match?.length);
   for (const ref of refs) {
-    const path = ref.name.slice("refs/tags/".length);
-    if ((options.exclude ?? []).some((p) => match(p, path))) continue;
-    if (options.match?.length && !options.match.some((p) => match(p, path))) continue;
+    const isTag = ref.name.startsWith("refs/tags/");
+    let matched = isTag ? ref.name.slice("refs/tags/".length) : undefined;
+    if (!isTag && filtered) {
+      // with --all, only refs of a known kind take match/exclude patterns
+      for (const kind of ["refs/heads/", "refs/remotes/"]) {
+        if (ref.name.startsWith(kind)) matched = ref.name.slice(kind.length);
+      }
+      if (matched === undefined) continue;
+    }
+    const path = options.all ? ref.name.slice("refs/".length) : (matched as string);
+    if (matched !== undefined) {
+      if ((options.exclude ?? []).some((p) => match(p, matched as string))) continue;
+      if (options.match?.length && !options.match.some((p) => match(p, matched as string)))
+        continue;
+    }
     const oid =
       ref.objectId && ref.target === undefined
         ? ref.objectId
@@ -135,7 +154,7 @@ async function knownNames(
       first ??= { name: tag.tag, date: tag.tagger?.timestamp ?? 0 };
       peeled = tag.object;
     }
-    const prio = peeled !== oid ? 2 : 1;
+    const prio = peeled !== oid ? 2 : isTag ? 1 : 0;
     const known = names.get(peeled);
     // replace_name: a better kind, or the newer of two annotated tags
     let replace = !known || known.prio < prio;
@@ -170,14 +189,15 @@ async function describeCommit(
   id: ObjectId,
   options: DescribeOptions,
 ): Promise<string> {
-  const tags = !!options.tags;
+  const all = !!options.all;
+  const tags = !!options.tags || all;
   const abbrev = options.abbrev;
   const suffix = async (depth: number, oid: ObjectId) =>
     `-${depth}-g${await source.abbreviate(oid, abbrev)}`;
   // append_name: an annotated tag by its own name (a different ref name is "misnamed")
   const nameOf = (n: CommitName) => ({
-    text: n.tag ? n.tag.name : n.path,
-    misnamed: !!n.tag && n.tag.name !== n.path,
+    text: n.tag ? `${all ? "tags/" : ""}${n.tag.name}` : n.path,
+    misnamed: !!n.tag && n.tag.name !== (all ? n.path.slice("tags/".length) : n.path),
   });
   const exact = names.get(id);
   if (exact && (tags || exact.prio === 2)) {
