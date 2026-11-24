@@ -12,7 +12,15 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RefTransactionAbortedError } from "@statewalker/vcs-core";
@@ -33,6 +41,7 @@ import {
   hookTwins,
   installHooks,
   nativeIn,
+  nativeIs25x,
   oursIn,
 } from "./hooks-native-support.js";
 import { openOurs } from "./merge-native-helpers.js";
@@ -543,3 +552,54 @@ describeGit("git fetch --atomic: the reference-transaction hook, as native git",
     await expectHookTwins(dir, ["--tags", "origin"]);
   });
 });
+
+// git 2.5x only: 2.43's set_head writes no symbolic ref in a transaction (and fetch has none)
+describe.skipIf(!nativeGitAvailable() || process.platform !== "linux" || !nativeIs25x)(
+  "git fetch: a hook refusing the create-only transaction of the remote HEAD, as native git",
+  () => {
+    beforeAll(() => {
+      root = mkdtempSync(join(tmpdir(), "fetch-head-hook-"));
+    });
+    afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+    it("the hook hears preparing, then aborted, and the fetch dies (refs.c)", async () => {
+      const dir = join(root, "r");
+      mkdirSync(dir);
+      git(dir, "init", "-q", "-b", "main");
+      putFile(dir, "a.txt", "a\n");
+      git(dir, "add", "a.txt");
+      git(dir, "commit", "-qm", "base");
+      git(dir, "clone", "-q", "--bare", ".", "up.git");
+      git(dir, "remote", "add", "origin", "up.git");
+      // refs/remotes/origin/HEAD exists after this first fetch (followRemoteHEAD)
+      git(dir, "fetch", "-q", "origin");
+      git(join(dir, "up.git"), "branch", "new-branch", "main");
+      // a hook refusing only the symbolic ref's transaction
+      const hook = join(dir, ".git/hooks/reference-transaction");
+      writeFileSync(
+        hook,
+        '#!/bin/sh\ninput=$(cat)\nprintf "== %s\\n%s\\n" "$1" "$input" >> "$HOOK_LOG"\ncase "$input" in *ref:*) exit 1;; esac\nexit 0\n',
+      );
+      chmodSync(hook, 0o755);
+      const [theirs, mine] = hookTwins(root, dir);
+      const native = nativeIn(theirs, root, ["fetch", "origin"]);
+      let error: Error | undefined;
+      try {
+        await (await oursIn(mine)).fetch().setRemote("origin").call();
+      } catch (e) {
+        error = e as Error;
+      }
+      expect(native.status).toBe(128);
+      expect(error).toBeInstanceOf(RefTransactionAbortedError);
+      expect(native.stderr).toContain(`fatal: ${error?.message}`);
+      expect(hookLog(theirs)).toMatch(
+        /== preparing\n0+ ref:refs\/remotes\/origin\/main refs\/remotes\/origin\/HEAD\n== aborted\n/,
+      );
+      expect(hookLog(mine)).toBe(hookLog(theirs));
+      const refsOf = (d: string) => git(d, "for-each-ref", "--format=%(refname) %(objectname)");
+      expect(refsOf(mine.dir)).toBe(refsOf(theirs.dir));
+      const head = (d: string) => readFileSync(join(d, ".git/FETCH_HEAD"), "utf8");
+      expect(head(mine.dir)).toBe(head(theirs.dir));
+    });
+  },
+);

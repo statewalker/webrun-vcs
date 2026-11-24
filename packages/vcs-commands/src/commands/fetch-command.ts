@@ -6,6 +6,7 @@ import {
   historyWithoutLazyFetch,
   isSymbolicRef,
   parseCoreAbbrev,
+  RefTransactionAbortedError,
   type RefTransactionHook,
 } from "@statewalker/vcs-core";
 import { writeCommitGraph } from "@statewalker/vcs-store-files";
@@ -956,7 +957,9 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       // git: "way too many cases where this can go wrong ... fail silently"
       try {
         await this.setRemoteHead(result.remoteRefs, followHead, store, messages);
-      } catch {
+      } catch (error) {
+        // a refusing reference-transaction hook is no silent failure: git dies
+        if (error instanceof RefTransactionAbortedError) throw error;
         // the refs are updated; refs/remotes/<name>/HEAD is left as it was
       }
     }
@@ -1260,13 +1263,16 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       await this.refsStore.setSymbolic(name, target, this.reflogLine("fetch"));
     } else {
       // git 2.5x's create-only symref transaction over an existing ref: its hook hears
-      // `preparing`, then the prepare fails ("reference already exists") and nothing follows
+      // `preparing`, then the prepare fails ("reference already exists") and nothing follows;
+      // a hook refusing in `preparing` aborts it (`aborted`) and git dies (refs.c)
       const store = this.refsStore as { getTransactionHook?(): RefTransactionHook | undefined };
-      await store.getTransactionHook?.()?.(
-        "preparing",
-        [{ requested: name, name, old: null, new: null, newTarget: target }],
-        { only: "2.56" },
-      );
+      const hook = store.getTransactionHook?.();
+      const updates = [{ requested: name, name, old: null, new: null, newTarget: target }];
+      const verdict = await hook?.("preparing", updates, { only: "2.56" });
+      if (verdict === false || typeof verdict === "string") {
+        await hook?.("aborted", updates, { only: "2.56", asAsked: true });
+        throw new RefTransactionAbortedError("preparing", verdict || undefined);
+      }
     }
     if (follow.mode !== "warn" || follow.noWarnBranch === headName || !previous) return;
     // warn_set_head
