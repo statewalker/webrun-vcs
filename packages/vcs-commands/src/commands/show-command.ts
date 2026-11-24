@@ -228,7 +228,7 @@ export class ShowCommand extends GitCommand<ShowResult> {
           session.bytes(await this.blobContent(id, name, textconv));
         } else if (type === "tree") {
           session.separate();
-          session.text(`tree ${name}\n\n`);
+          session.text(`${session.commitColor.set}tree ${name}${session.commitColor.reset}\n\n`);
           for (const e of await this.treeEntries(id)) {
             const dir = (e.mode & S_IFMT) === S_IFDIR;
             session.bytes(encodeGitPath(`${e.name}${dir ? "/" : ""}\n`));
@@ -292,7 +292,7 @@ export class ShowCommand extends GitCommand<ShowResult> {
       offset = end + 1;
     }
     session.separate();
-    session.text(`tag ${tagName}\n`);
+    session.text(`${session.commitColor.set}tag ${tagName}${session.commitColor.reset}\n`);
     for (const t of taggers) session.tagger(t);
     if (offset < raw.length) session.bytes(raw.subarray(offset));
     session.markShown();
