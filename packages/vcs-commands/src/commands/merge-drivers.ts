@@ -150,6 +150,8 @@ export interface LowLevelMergeOptions {
   bigFileThreshold?: number;
   /** The diff algorithm: merge-ort's histogram, `checkout -m`'s myers */
   algorithm?: LineMergeOptions["algorithm"];
+  /** xdiff's whitespace bits (merge-ort's `-X ignore-space-change` and the like) */
+  whitespace?: number;
 }
 
 /** What {@link lowLevelMerge} gives: `binary` is git's `LL_MERGE_BINARY_CONFLICT`. */
@@ -217,6 +219,7 @@ export async function lowLevelMerge(
     favor: driver.name === "union" ? "union" : favor,
     markerSize,
     ...(options.algorithm ? { algorithm: options.algorithm } : {}),
+    ...(options.whitespace ? { whitespace: options.whitespace } : {}),
   });
   return { status: lines.conflicts > 0 ? "conflict" : "ok", content: lines.content };
 }

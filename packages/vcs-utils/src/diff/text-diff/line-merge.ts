@@ -28,7 +28,14 @@
 
 import { ByteLines } from "./byte-lines.js";
 import type { SupportedAlgorithm } from "./diff-algorithm.js";
-import { diffScript, type XdFlags, type XdiffAlgorithm, type XdiffChange } from "./xdiff.js";
+import {
+  diffScript,
+  XDF_WHITESPACE_FLAGS,
+  type XdFlags,
+  type XdiffAlgorithm,
+  type XdiffChange,
+  xdlRecmatch,
+} from "./xdiff.js";
 
 /**
  * How a conflict is written (git's `merge.conflictStyle`): `merge` (ours and theirs),
@@ -66,6 +73,13 @@ export interface LineMergeOptions {
    * and later do (default true; false merges as older git)
    */
   histogramRediff?: boolean;
+  /**
+   * xdiff's whitespace bits (`XDF_IGNORE_WHITESPACE`, ..., as merge-ort's `-X
+   * ignore-space-change` and the like set them): lines equal under them are the same line, in
+   * the diffs and when the two sides' changes are compared; the lines written are ours
+   * wherever ours and theirs agree (default 0)
+   */
+  whitespace?: number;
 }
 
 /** What {@link mergeLines} produced. */
@@ -111,8 +125,29 @@ function appendHunk(list: Hunk[], h: Hunk): void {
   }
 }
 
-function sameLines(a: ByteLines, ai: number, b: ByteLines, bi: number, count: number): boolean {
-  for (let k = 0; k < count; k++) if (!a.lineEquals(ai + k, b, bi + k)) return false;
+/** xdiff's `xdl_recmatch` of line `ai` of `a` and line `bi` of `b` under `ws` */
+function lineMatches(a: ByteLines, ai: number, b: ByteLines, bi: number, ws: number): boolean {
+  if (!(ws & XDF_WHITESPACE_FLAGS)) return a.lineEquals(ai, b, bi);
+  return xdlRecmatch(
+    a.content,
+    a.start(ai),
+    a.start(ai + 1),
+    b.content,
+    b.start(bi),
+    b.start(bi + 1),
+    ws,
+  );
+}
+
+function sameLines(
+  a: ByteLines,
+  ai: number,
+  b: ByteLines,
+  bi: number,
+  count: number,
+  ws: number,
+): boolean {
+  for (let k = 0; k < count; k++) if (!lineMatches(a, ai + k, b, bi + k, ws)) return false;
   return true;
 }
 
@@ -124,6 +159,7 @@ function mergeHunks(
   e1: XdiffChange[],
   e2: XdiffChange[],
   level: number,
+  ws: number,
 ): Hunk[] {
   const out: Hunk[] = [];
   let a = 0;
@@ -162,7 +198,7 @@ function mergeHunks(
       x1.i1 !== x2.i1 ||
       x1.chg1 !== x2.chg1 ||
       x1.chg2 !== x2.chg2 ||
-      !sameLines(o, x1.i2, t, x2.i2, x1.chg2)
+      !sameLines(o, x1.i2, t, x2.i2, x1.chg2, ws)
     ) {
       const off = x1.i1 - x2.i1;
       const ffo = off + x1.chg1 - x2.chg1;
@@ -281,16 +317,16 @@ function simplifyNonConflicts(hunks: Hunk[], o: ByteLines, alnum: boolean): Hunk
 }
 
 /** xdiff's `xdl_refine_zdiff3_conflicts`: shared leading and trailing lines move out. */
-function refineZdiff3(hunks: Hunk[], o: ByteLines, t: ByteLines): void {
+function refineZdiff3(hunks: Hunk[], o: ByteLines, t: ByteLines, ws: number): void {
   for (const m of hunks) {
     if (m.mode !== 0) continue;
-    while (m.chg1 && m.chg2 && o.lineEquals(m.i1, t, m.i2)) {
+    while (m.chg1 && m.chg2 && lineMatches(o, m.i1, t, m.i2, ws)) {
       m.chg1--;
       m.chg2--;
       m.i1++;
       m.i2++;
     }
-    while (m.chg1 && m.chg2 && o.lineEquals(m.i1 + m.chg1 - 1, t, m.i2 + m.chg2 - 1)) {
+    while (m.chg1 && m.chg2 && lineMatches(o, m.i1 + m.chg1 - 1, t, m.i2 + m.chg2 - 1, ws)) {
       m.chg1--;
       m.chg2--;
     }
@@ -341,7 +377,9 @@ export function mergeLines(
     algorithm: String(options.algorithm ?? "histogram") as XdiffAlgorithm,
     indentHeuristic: false,
     histogramRediff: options.histogramRediff ?? true,
+    ...(options.whitespace ? { whitespace: options.whitespace } : {}),
   };
+  const ws = options.whitespace ?? 0;
   const b = new ByteLines(base);
   const o = new ByteLines(ours);
   const t = new ByteLines(theirs);
@@ -355,8 +393,8 @@ export function mergeLines(
   let level = LEVELS[options.level ?? "zealous"];
   // "diff3 -m" output does not make sense for anything more aggressive than XDL_MERGE_EAGER
   if (style !== "merge" && level > 1) level = 1;
-  let hunks = mergeHunks(b, o, t, oursEdits, theirsEdits, level);
-  if (style === "zdiff3") refineZdiff3(hunks, o, t);
+  let hunks = mergeHunks(b, o, t, oursEdits, theirsEdits, level, ws);
+  if (style === "zdiff3") refineZdiff3(hunks, o, t, ws);
   else if (level >= 2) {
     hunks = simplifyNonConflicts(refineConflicts(hunks, o, t, flags), o, level > 2);
   }

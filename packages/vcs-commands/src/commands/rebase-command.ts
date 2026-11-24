@@ -23,7 +23,7 @@ import {
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import {
-  type ContentMergeStrategy,
+  ContentMergeStrategy,
   FastForwardMode,
   type MergeResult,
   MergeStatus,
@@ -48,6 +48,7 @@ import { commitsBaseSource, MergeBaseGraph } from "./merge-bases.js";
 import { favorOf, MergeCommand } from "./merge-command.js";
 import { configBool, configValue, conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
+import { quoteStrategyOptions, splitStrategyOptions } from "./merge-strategy-options.js";
 import {
   conflictsComment,
   FlatTreeCache,
@@ -64,7 +65,7 @@ import {
 import { CleanupMode, commentPrefixOf, stripspace } from "./message-cleanup.js";
 import { copyNotesForAmend, copyNotesForRebase } from "./notes-support.js";
 import { ortResultEntries } from "./ort-merge.js";
-import { mergeBaseTree, mergeStoredTrees, storedBase } from "./ort-recursive.js";
+import { mergeBaseTree, mergeStoredTrees } from "./ort-recursive.js";
 import { PatchIds, type PatchIdTrees } from "./patch-id.js";
 import { formatCommitPretty, loadRefDecorations, type RefDecorations } from "./pretty-format.js";
 import {
@@ -90,7 +91,7 @@ import {
 } from "./rebase-todo.js";
 import { reflogMessages, updateHeadExpecting } from "./reflog-messages.js";
 import { revisionMergeBases } from "./rev-parse-command.js";
-import { expandCommitId } from "./sequencer-pick.js";
+import { expandCommitId, mergePickChange } from "./sequencer-pick.js";
 import {
   AUTOSTASH_SAVED_LINES,
   applyAutostash,
@@ -309,7 +310,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private upstreamCommit?: ObjectId;
   private upstreamCommitName?: string;
   private strategy = MergeStrategy.RECURSIVE;
+  private strategyGiven = false;
   private contentStrategy?: ContentMergeStrategy;
+  /** `-X <option>`s */
+  private strategyOptions: string[] = [];
+  /** The run's `-s` and `-X` (rebase-merge/strategy, strategy_opts), once read */
+  private runStrategyState?: { strategy?: string; xopts: string[] };
   private preserveMerges = false;
   private interactiveHandler?: InteractiveHandler;
   /** Whose messages to give where git 2.43 and 2.5x differ (default: the hooks') */
@@ -542,14 +548,68 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
-   * Set the merge strategy (only git's merge-ort is run; kept for compatibility).
+   * Set the merge strategy (`-s`): merge-ort (RECURSIVE, ORT), RESOLVE (git-merge-resolve)
+   * or SUBTREE (git merge-subtree) for each pick; kept in `rebase-merge/strategy`.
    *
    * @param strategy Merge strategy
    */
   setStrategy(strategy: MergeStrategy): this {
     this.checkCallable();
     this.strategy = strategy;
+    this.strategyGiven = true;
     return this;
+  }
+
+  /**
+   * The `-X <option>`s of each pick (see `MergeCommand.setStrategyOptions`), kept in
+   * `rebase-merge/strategy_opts`; with no `-s`, the strategy is `ort` (builtin/rebase.c).
+   */
+  setStrategyOptions(options: readonly string[]): this {
+    this.checkCallable();
+    this.strategyOptions = [...options];
+    return this;
+  }
+
+  /** Adds one `-X <option>` (see {@link setStrategyOptions}). */
+  addStrategyOption(option: string): this {
+    this.checkCallable();
+    this.strategyOptions.push(option);
+    return this;
+  }
+
+  /** The `-X` options as given: `-X ours`/`-X theirs` of the content strategy first. */
+  private givenStrategyOptions(): string[] {
+    const favor =
+      this.contentStrategy === ContentMergeStrategy.OURS
+        ? ["ours"]
+        : this.contentStrategy === ContentMergeStrategy.THEIRS
+          ? ["theirs"]
+          : [];
+    return [...favor, ...this.strategyOptions];
+  }
+
+  /** The run's `-s` (`ort` when only `-X` was given) as builtin/rebase.c settles it. */
+  private givenStrategyName(): string | undefined {
+    if (this.strategyGiven) return this.strategy;
+    return this.givenStrategyOptions().length > 0 ? "ort" : undefined;
+  }
+
+  /** The run's `-s` and `-X`: read back from `rebase-merge/` (read_strategy_opts), else given. */
+  private async runStrategy(
+    state: OperationState,
+  ): Promise<{ strategy: string | undefined; xopts: string[] }> {
+    if (!this.runStrategyState) {
+      const strategy = (await state.read(`${DIR}/strategy`))?.trim();
+      const opts = await state.read(`${DIR}/strategy_opts`);
+      this.runStrategyState =
+        strategy !== undefined || opts !== undefined
+          ? {
+              ...(strategy ? { strategy } : {}),
+              xopts: opts !== undefined ? splitStrategyOptions(opts.trim()) : [],
+            }
+          : { strategy: this.givenStrategyName(), xopts: this.givenStrategyOptions() };
+    }
+    return { strategy: this.runStrategyState.strategy, xopts: this.runStrategyState.xopts };
   }
 
   /**
@@ -1431,6 +1491,13 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await state.write(`${DIR}/head-name`, `${headName}\n`);
     await state.write(`${DIR}/onto`, `${onto}\n`);
     await state.write(`${DIR}/orig-head`, `${origHead}\n`);
+    // write_basic_state: strategy, strategy_opts
+    const strategyName = this.givenStrategyName();
+    if (strategyName) await state.write(`${DIR}/strategy`, `${strategyName}\n`);
+    const xopts = this.givenStrategyOptions();
+    if (xopts.length > 0) {
+      await state.write(`${DIR}/strategy_opts`, `${quoteStrategyOptions(xopts)}\n`);
+    }
     // write_basic_state: gpg_sign_opt (`-S<key>`) when the run signs
     const sign = signRequestOf(this.workingCopy, this.sign);
     this.runSign = { key: sign };
@@ -1989,34 +2056,48 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const short = await this.abbreviateObjectId(item.id);
     const label = `${short} (${subject})`;
     const baseLabel = parentId ? `parent of ${label}` : "(empty tree)";
-    // the trees as merge-ort reads them: what all three hold alike is never read
-    const merge = await mergeStoredTrees(
-      this.context(worktree),
-      storedBase(parentTreeId, baseLabel, () => flats.get(parentTreeId)),
-      headTreeId,
-      commit.tree,
+    // the trees as merge-ort reads them: what all three hold alike is never read; `-s`
+    // and `-X` as the sequencer gives them to the pick
+    const { strategy, xopts } = await this.runStrategy(state);
+    const merge = await mergePickChange(
       {
-        oursLabel: "HEAD",
-        theirsLabel: label,
-        baseLabel,
-        style: conflictStyleOf(this.workingCopy),
-        favor: favorOf(this.contentStrategy),
-        ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
-        ...ortConfigOptions(this.workingCopy, worktree),
+        ...this.context(worktree),
+        commits: this.commits,
+        flats,
+        abbreviate: (id) => this.abbreviateObjectId(id),
       },
-      (id) => flats.get(id),
+      {
+        action: "pick",
+        headId,
+        headTreeId,
+        base: parentTreeId,
+        theirs: commit.tree,
+        baseLabel,
+        theirsLabel: label,
+        pickId: item.id,
+        parentId,
+        strategy,
+        xopts,
+        oursLabel: "HEAD",
+        favor: this.contentStrategy === ContentMergeStrategy.UNION ? "union" : undefined,
+        compatibility: this.compatibility ?? this.hooks.compatibility ?? "2.56",
+      },
     );
-    const target = await ortResultEntries(this.blobs, merge);
-    // only the directories the pick changes are stored again
-    const treeId = await storeFlatTreeOver(this.trees, headTreeId, merge.ours, target);
-    const conflicts = [...merge.conflicts.values()];
+    if ("failed" in merge) {
+      output.push(...(merge.output ?? []));
+      return {
+        kind: "reschedule",
+        result: { status: RebaseStatus.FAILED, currentCommit: item.id, message: merge.failed },
+      };
+    }
+    const { treeId, conflicts } = merge;
     // only the paths HEAD and the result differ on are switched
-    const delta = await treeDelta(this.trees, headTreeId, treeId);
+    const delta = merge.delta ?? (await treeDelta(this.trees, headTreeId, treeId));
     const refused = await switchTrees(this.context(worktree), delta.from, delta.to, {
       action: "merge",
       operation: "rebase",
       conflicts,
-      targetTree: treeId,
+      ...(merge.delta ? {} : { targetTree: treeId }),
     });
     if (refused) {
       // nothing written: the pick is rescheduled (git keeps the author and REBASE_HEAD)
@@ -2031,13 +2112,18 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         },
       };
     }
-    // the sequencer shows merge-ort's messages of a rebase only when the pick conflicts
-    if (conflicts.length > 0 || !merge.clean) output.push(...merge.messages);
-    await state.setRef("AUTO_MERGE", treeId);
+    // the sequencer shows merge-ort's messages of a rebase only when the pick conflicts (an
+    // external strategy prints its own)
+    if (merge.external || conflicts.length > 0 || !merge.clean) output.push(...merge.messages);
+    if (merge.autoMerge) await state.setRef("AUTO_MERGE", treeId);
     const merged = pickedMessage.endsWith("\n") ? pickedMessage : `${pickedMessage}\n`;
     if (conflicts.length > 0 || !merge.clean) {
       const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort(compareGitPaths);
-      await state.write("MERGE_MSG", `${merged}${conflictsComment(paths, true)}`);
+      // do_recursive_merge adds the conflicts hint; another strategy's MERGE_MSG has none
+      await state.write(
+        "MERGE_MSG",
+        merge.external ? merged : `${merged}${conflictsComment(paths, true)}`,
+      );
       if (!fixup) {
         // do_pick_commit writes CHERRY_PICK_HEAD after a conflicted merge too; the rebase
         // stopping there deletes it again (REBASE_HEAD names the commit instead)
@@ -2045,9 +2131,13 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
       return {
         kind: "conflicts",
-        conflicts: [...new Set(merge.conflicts.keys())].sort(),
-        // git 2.43 writes the message and a blank line (2.5x the conflict list after it)
-        message: `${merged}\n`,
+        conflicts: [...new Set(merge.conflictPaths)].sort(),
+        // git 2.43 writes the message and a blank line (2.5x the conflict list after it, which
+        // another strategy than merge-ort does not add)
+        message:
+          !merge.external || (this.compatibility ?? this.hooks.compatibility) === "2.43"
+            ? `${merged}\n`
+            : merged,
         lines: [`error: could not apply ${short}... ${subject}`, ...this.mergeConflictAdvice()],
       };
     }
