@@ -7,6 +7,7 @@
 
 import { decodeGitBinaryDelta } from "@statewalker/vcs-utils";
 import { statSummary } from "../../results/diff-output.js";
+import { isGitSpace, WS_BLANK_AT_EOF, wsBlankLine, wsFixCopy } from "../../whitespace/index.js";
 import { ApplyParser, linelen } from "./apply-parse.js";
 import {
   BINARY_DELTA,
@@ -20,7 +21,6 @@ import {
   S_IFREG,
 } from "./apply-types.js";
 import { bytesToLatin1, cQuote, latin1ToBytes } from "./latin1.js";
-import { isGitSpace, WS_BLANK_AT_EOF, wsBlankLine, wsFixCopy } from "./whitespace.js";
 
 const LINE_COMMON = 1;
 const LINE_PATCHED = 2;

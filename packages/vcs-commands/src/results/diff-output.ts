@@ -44,15 +44,9 @@ import {
   gitStrWidth,
   parseGitBool,
 } from "@statewalker/vcs-utils/encoding";
+import { WS_DEFAULT_RULE, WS_INCOMPLETE_LINE } from "../whitespace/index.js";
 import { gitBinaryPatch } from "./binary-patch.js";
-import {
-  type ColoredHunk,
-  type DiffColors,
-  WS_INCOMPLETE_LINE,
-  WSEH_NEW,
-  writeColoredHunks,
-} from "./diff-color.js";
-
+import { type ColoredHunk, type DiffColors, WSEH_NEW, writeColoredHunks } from "./diff-color.js";
 import { quoteCStyleBody, quotePath, quoteTwo } from "./quote-path.js";
 
 /** One side of a file pair */
@@ -574,7 +568,7 @@ async function builtinDiff(
       `${colors.meta}+++ ${lbl1}${colors.reset}${lbl1.includes(" ") ? "\t" : ""}\n`,
   );
   // whitespace_rule of name_b; a symlink's incomplete line is no news
-  let wsRule = (await options.whitespaceRule?.(two.valid ? attrTwo : attrOne)) ?? DEFAULT_WS_RULE;
+  let wsRule = (await options.whitespaceRule?.(two.valid ? attrTwo : attrOne)) ?? WS_DEFAULT_RULE;
   if (two.valid && (two.mode & S_IFMT) === 0o120000) wsRule &= ~WS_INCOMPLETE_LINE;
   writeColoredHunks(sink, coloredHunksOf(result), {
     colors,
@@ -584,9 +578,6 @@ async function builtinDiff(
     newContent: textTwo,
   });
 }
-
-/** `blank-at-eol,space-before-tab,blank-at-eof`, tab width 8 (`WS_DEFAULT_RULE`) */
-const DEFAULT_WS_RULE = (1 << 6) | (1 << 10) | (1 << 7) | 8;
 
 /** The hunks of a text diff with their lines' bytes, for the colored writer */
 function coloredHunksOf(result: UnifiedDiffResult): ColoredHunk[] {

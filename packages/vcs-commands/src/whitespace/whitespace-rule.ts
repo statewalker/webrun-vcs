@@ -3,8 +3,9 @@
  * check `git apply` and `git diff --check` run on added lines, and the fix
  * `--whitespace=fix` applies.
  *
- * Lines are "binary strings": one character per byte (latin1), so a line's length is its
- * byte count and any encoding passes through unchanged.
+ * `git apply` reads lines as "binary strings" (one character per byte, latin1), the diff
+ * output as bytes; the checks take either, so apply, `--check` and the colored diff share one
+ * implementation of each rule.
  *
  * @example
  * ```typescript
@@ -24,6 +25,8 @@ export const WS_INCOMPLETE_LINE = 1 << 12;
 export const WS_TRAILING_SPACE = WS_BLANK_AT_EOL | WS_BLANK_AT_EOF;
 export const WS_DEFAULT_RULE = WS_TRAILING_SPACE | WS_SPACE_BEFORE_TAB | 8;
 export const WS_TAB_WIDTH_MASK = (1 << 6) - 1;
+/** The bits a rule may hold (`WS_RULE_MASK`) */
+export const WS_RULE_MASK = (1 << 16) - 1;
 
 /** The tab width a rule carries (`ws_tab_width`). */
 export function wsTabWidth(rule: number): number {
@@ -54,12 +57,28 @@ export function isGitSpace(ch: number): boolean {
 /** An invalid rule combination (git dies). */
 export class WhitespaceRuleError extends Error {}
 
+/** Which git's rule names {@link parseWhitespaceRule} knows */
+export interface WhitespaceRuleOptions {
+  /** git 2.43 knows no `incomplete-line` rule: its name (and any prefix of it) names nothing */
+  compatibility?: "2.43" | "2.56";
+}
+
 /**
  * Parses a `core.whitespace` value (or a `whitespace=<rules>` attribute) as
- * `parse_whitespace_rule` does: comma-separated names, `-name` to turn one off,
- * `tabwidth=<n>`.
+ * `parse_whitespace_rule` does: comma-separated names (or a prefix of one), `-name` to turn
+ * one off, `tabwidth=<n>`.
+ *
+ * @throws WhitespaceRuleError for `tab-in-indent` with `indent-with-non-tab` (git dies)
  */
-export function parseWhitespaceRule(value: string, warn?: (message: string) => void): number {
+export function parseWhitespaceRule(
+  value: string,
+  warn?: (message: string) => void,
+  options: WhitespaceRuleOptions = {},
+): number {
+  const names =
+    options.compatibility === "2.43"
+      ? RULE_NAMES.filter((r) => r.bits !== WS_INCOMPLETE_LINE)
+      : RULE_NAMES;
   let rule = WS_DEFAULT_RULE;
   let at = 0;
   while (at <= value.length) {
@@ -76,7 +95,7 @@ export function parseWhitespaceRule(value: string, warn?: (message: string) => v
     }
     if (len <= 0) break;
     const word = value.slice(start, start + len);
-    for (const r of RULE_NAMES) {
+    for (const r of names) {
       // strncmp(rule_name, string, len): a prefix of a name selects it
       if (r.name.slice(0, len) !== word || (len > r.name.length && word !== r.name)) continue;
       if (negated) rule &= ~r.bits;
@@ -135,47 +154,178 @@ export function whitespaceErrorString(ws: number): string {
   return parts.join(", ");
 }
 
-/** The whitespace errors of one line (with or without its LF), as `ws_check` finds them. */
-export function wsCheck(line: string, rule: number): number {
+/** A line as the checks read it: a binary string (one character per byte) or bytes */
+export type WsLine = string | Uint8Array;
+
+/** Where {@link wsCheckEmit} writes a checked line */
+export interface WsEmitTarget {
+  /** A color (or any text) */
+  str(s: string): void;
+  /** Bytes of the line */
+  bytes(b: Uint8Array): void;
+}
+
+const codeAt = (line: WsLine, i: number): number =>
+  typeof line === "string" ? line.charCodeAt(i) : (line[i] as number);
+
+/**
+ * ws.c's `ws_check_emit_1`: the errors of `rule` in `line` (its LF included, if any),
+ * writing the line to `out` with the errors in `ws` and the rest in `set` when given.
+ */
+function wsCheckEmit1(
+  line: WsLine,
+  rule: number,
+  emit?: { out: WsEmitTarget; set: string; reset: string; ws: string },
+): number {
   let result = 0;
-  let len = line.length;
+  let written = 0;
+  let trailingWhitespace = -1;
   let trailingNewline = false;
-  if (len > 0 && line.charCodeAt(len - 1) === 0x0a) {
+  let trailingCarriageReturn = false;
+  let len = line.length;
+  const out = emit?.out;
+  const part = (from: number, to: number) => {
+    if (!out || to <= from) return;
+    if (typeof line === "string") {
+      const bytes = new Uint8Array(to - from);
+      for (let i = from; i < to; i++) bytes[i - from] = line.charCodeAt(i) & 0xff;
+      out.bytes(bytes);
+    } else out.bytes(line.subarray(from, to));
+  };
+  if (len > 0 && codeAt(line, len - 1) === 0x0a) {
     trailingNewline = true;
     len--;
   }
-  if (rule & WS_CR_AT_EOL && len > 0 && line.charCodeAt(len - 1) === 0x0d) len--;
-  let trailing = -1;
+  if (rule & WS_CR_AT_EOL && len > 0 && codeAt(line, len - 1) === 0x0d) {
+    trailingCarriageReturn = true;
+    len--;
+  }
   if (rule & WS_BLANK_AT_EOL) {
     for (let i = len - 1; i >= 0; i--) {
-      if (isGitSpace(line.charCodeAt(i))) {
-        trailing = i;
+      if (isGitSpace(codeAt(line, i))) {
+        trailingWhitespace = i;
         result |= WS_BLANK_AT_EOL;
       } else break;
     }
   }
-  if (trailing === -1) trailing = len;
+  if (trailingWhitespace === -1) trailingWhitespace = len;
   if (!trailingNewline && rule & WS_INCOMPLETE_LINE) result |= WS_INCOMPLETE_LINE;
-  let written = 0;
   let i = 0;
-  for (; i < trailing; i++) {
-    const ch = line.charCodeAt(i);
+  for (; i < trailingWhitespace; i++) {
+    const ch = codeAt(line, i);
     if (ch === 0x20) continue;
     if (ch !== 0x09) break;
-    if (rule & WS_SPACE_BEFORE_TAB && written < i) result |= WS_SPACE_BEFORE_TAB;
-    else if (rule & WS_TAB_IN_INDENT) result |= WS_TAB_IN_INDENT;
+    if (rule & WS_SPACE_BEFORE_TAB && written < i) {
+      result |= WS_SPACE_BEFORE_TAB;
+      if (emit) {
+        emit.out.str(emit.ws);
+        part(written, i);
+        emit.out.str(emit.reset);
+        part(i, i + 1);
+      }
+    } else if (rule & WS_TAB_IN_INDENT) {
+      result |= WS_TAB_IN_INDENT;
+      if (emit) {
+        part(written, i);
+        emit.out.str(emit.ws);
+        part(i, i + 1);
+        emit.out.str(emit.reset);
+      }
+    } else part(written, i + 1);
     written = i + 1;
   }
   if (rule & WS_INDENT_WITH_NON_TAB && i - written >= wsTabWidth(rule)) {
     result |= WS_INDENT_WITH_NON_TAB;
+    if (emit) {
+      emit.out.str(emit.ws);
+      part(written, i);
+      emit.out.str(emit.reset);
+    }
+    written = i;
+  }
+  if (emit) {
+    if (trailingWhitespace - written > 0) {
+      emit.out.str(emit.set);
+      part(written, trailingWhitespace);
+      emit.out.str(emit.reset);
+    }
+    if (trailingWhitespace !== len) {
+      emit.out.str(emit.ws);
+      part(trailingWhitespace, len);
+      emit.out.str(emit.reset);
+    }
+    if (trailingCarriageReturn) part(len, len + 1);
+    if (trailingNewline) part(line.length - 1, line.length);
   }
   return result;
 }
 
-/** Whether a line holds whitespace only (`ws_blank_line`). */
-export function wsBlankLine(line: string, start = 0, end = line.length): boolean {
-  for (let i = start; i < end; i++) if (!isGitSpace(line.charCodeAt(i))) return false;
+/** The whitespace errors of one line (with or without its LF), as `ws_check` finds them. */
+export function wsCheck(line: WsLine, rule: number): number {
+  return wsCheckEmit1(line, rule);
+}
+
+/**
+ * ws.c's `ws_check_emit`: writes the line (its LF included, if any) to `out`, the errors of
+ * `rule` in the `ws` color and the rest in `set`; returns the errors.
+ */
+export function wsCheckEmit(
+  line: Uint8Array,
+  rule: number,
+  out: WsEmitTarget,
+  set: string,
+  reset: string,
+  ws: string,
+): number {
+  return wsCheckEmit1(line, rule, { out, set, reset, ws });
+}
+
+/** Whether a line (or its part from `start` to `end`) holds whitespace only (`ws_blank_line`). */
+export function wsBlankLine(line: WsLine, start = 0, end = line.length): boolean {
+  for (let i = start; i < end; i++) if (!isGitSpace(codeAt(line, i))) return false;
   return true;
+}
+
+/** diff.c's `count_trailing_blank`: the blank lines at the end of a file */
+export function countTrailingBlank(mf: Uint8Array): number {
+  let cnt = 0;
+  if (mf.length === 0) return 0;
+  let ptr = mf.length - 1;
+  if (mf[ptr] === 0x0a) ptr--;
+  while (0 < ptr) {
+    let prevEol = ptr;
+    for (; 0 <= prevEol; prevEol--) if (mf[prevEol] === 0x0a) break;
+    if (!wsBlankLine(mf, prevEol + 1, ptr + 1)) break;
+    cnt++;
+    ptr = prevEol - 1;
+  }
+  return cnt;
+}
+
+/** diff.c's `count_lines` */
+export function countLines(data: Uint8Array): number {
+  if (data.length === 0) return 0;
+  let count = 0;
+  for (const c of data) if (c === 0x0a) count++;
+  if (data[data.length - 1] !== 0x0a) count++;
+  return count;
+}
+
+/**
+ * diff.c's `check_blank_at_eof`: where the blank lines a change adds at the end of the file
+ * start, in each image (1-based), or zeros when it adds none
+ */
+export function checkBlankAtEof(
+  preimage: Uint8Array,
+  postimage: Uint8Array,
+): { preimage: number; postimage: number } {
+  const l1 = countTrailingBlank(preimage);
+  const l2 = countTrailingBlank(postimage);
+  if (l2 <= l1) return { preimage: 0, postimage: 0 };
+  return {
+    preimage: countLines(preimage) - l1 + 1,
+    postimage: countLines(postimage) - l2 + 1,
+  };
 }
 
 /**

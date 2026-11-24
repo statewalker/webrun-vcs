@@ -64,6 +64,11 @@ export interface LsRemoteResult {
  * ```
  */
 export class LsRemoteCommand extends TransportCommand<LsRemoteResult> {
+  /** git's command reads no core settings: an unparsable `core.whitespace` does not stop it */
+  protected override readsCoreConfig(): boolean {
+    return false;
+  }
+
   private remote?: string;
   private heads = false;
   private tags = false;
