@@ -232,6 +232,13 @@ export interface DiffTextOptions
    * finds nothing there)
    */
   quietDetectsRenames?: boolean;
+  /**
+   * `--exit-code` and `--quiet` count only the pairs an output shows (default true, git 2.5x,
+   * whose porcelain diff turns `diff_from_contents` on with an exit status: `--summary` alone
+   * then exits 0, a pair whose patch shows nothing does not count); false counts every queued
+   * pair unless a whitespace option or `-I` is given, as git 2.43
+   */
+  exitCodeFromContents?: boolean;
 }
 
 /** git's status letters `--diff-filter` takes (`diff_status_letters`) */
@@ -1186,13 +1193,15 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         }
         case "name-only": {
           const names = await this.shownNames(pairs, unmerged, options);
-          if (names.length > 0 && this.namesFromContents) this.changesFound = true;
+          // flush_one_pair: found_changes for each name listed
+          if (names.length > 0) this.changesFound = true;
           sink.text(formatNameOnly(names, { quotePath: quote }));
           break;
         }
         case "name-status": {
           const names = await this.shownNames(pairs, unmerged, options);
-          if (names.length > 0 && this.namesFromContents) this.changesFound = true;
+          // flush_one_pair: found_changes for each name listed
+          if (names.length > 0) this.changesFound = true;
           for (const pair of names) {
             if (unmerged.has(pair)) {
               sink.text(`U\t${quotePath(pair.new?.path ?? pair.old?.path ?? "", quote)}\n`);
@@ -1576,6 +1585,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       skipTo: _skipTo,
       ignoreMatchingLines: _ignoreMatchingLines,
       quietDetectsRenames: _quietDetectsRenames,
+      exitCodeFromContents: _exitCodeFromContents,
       ...text
     } = this.textOptions;
     const ignoreRegex = this.ignoreRegex();
@@ -1600,7 +1610,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private ignoreRegex(): PosixRegex[] {
     return (this.textOptions.ignoreMatchingLines ?? []).map((pattern) => {
       try {
-        return compilePosixRegex(pattern, { extended: true });
+        return compilePosixRegex(pattern, { extended: true, newline: true });
       } catch {
         throw new InvalidArgumentError(
           "ignoreMatchingLines",
@@ -1612,11 +1622,14 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   }
 
   /**
-   * git's `diff_from_contents`: whitespace options and `-I` make a pair count as a change
-   * only when its patch shows one
+   * git's `diff_from_contents`: whitespace options and `-I` (and, in git 2.5x, an exit status
+   * asked for) make a pair count as a change only when its output shows one
    */
   private get fromContents(): boolean {
     const o = this.textOptions;
+    // diff_setup_done (git 2.5x): porcelain diff allows external diffs, so an exit status
+    // asked for (`--exit-code`, `--quiet`) always looks at the contents
+    if ((this.exitWithStatus || this.quiet) && (o.exitCodeFromContents ?? true)) return true;
     return !!(
       o.ignoreWhitespace ||
       o.ignoreWhitespaceChange ||

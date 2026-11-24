@@ -43,6 +43,7 @@ const versionOptions: DiffTextOptions = {
   renameCountLastSpan: atLeast(2, 50),
   namesFromContents: atLeast(2, 50),
   quietDetectsRenames: !atLeast(2, 50),
+  exitCodeFromContents: atLeast(2, 50),
 };
 
 let root: string | undefined;
@@ -210,7 +211,12 @@ async function twin(
   format: DiffOutputFormat = "patch",
   cwd = ".",
 ): Promise<void> {
-  const nativeArgs = ["-C", cwd, ...args, ...FORMAT_ARGS[format]];
+  // the format's options go before `--` and the paths after it
+  const dash = args.indexOf("--");
+  const nativeArgs =
+    dash < 0
+      ? ["-C", cwd, ...args, ...FORMAT_ARGS[format]]
+      : ["-C", cwd, ...args.slice(0, dash), ...FORMAT_ARGS[format], ...args.slice(dash)];
   const theirs = native(dir, nativeArgs);
   const mine = await oursDiff(dir, build, format);
   const m = differs(`git ${nativeArgs.join(" ")}`, theirs, mine);
@@ -1089,5 +1095,91 @@ describe("DiffCommand selection options", () => {
       .setOptions({ relative: "d" })
       .call();
     expect(relative.map((e) => e.oldPath ?? e.newPath)).toEqual(["d/a", "d/c"]);
+  });
+});
+
+describeGit("--exit-code with content options and every format", () => {
+  it('t4017-diff-retval.sh: "git diff --quiet -w  HEAD^ HEAD", "git diff --exit-code returns 1 for changed binary file" with -w, -I and each format', async () => {
+    const dir = repo(`
+      echo y >a
+      echo w >b
+      echo m >m
+      git add .
+      commit -m one
+      echo z >a
+      echo "w " >b
+      chmod +x m
+      echo new >n
+      git add .
+      commit -m two
+      echo q >a
+      echo "w  " >b
+      git add a b
+      echo r >a
+      echo "w   " >b
+    `);
+    const out: string[] = [];
+    const flagSets: Array<[string[], DiffTextOptions]> = [
+      [[], {}],
+      [["-w"], { ignoreWhitespace: true }],
+      [["-I[a-z]"], { ignoreMatchingLines: ["[a-z]"] }],
+    ];
+    for (const [args, make] of modes("HEAD^", "HEAD")) {
+      for (const paths of [[], ["b"], ["a"]]) {
+        for (const [flags, options] of flagSets) {
+          for (const format of [
+            "patch",
+            "stat",
+            "numstat",
+            "shortstat",
+            "summary",
+            "name-only",
+            "name-status",
+          ] as DiffOutputFormat[]) {
+            await twin(
+              out,
+              dir,
+              ["diff", "--exit-code", ...flags, ...args, "--", ...paths],
+              (d) => {
+                const x = make(d).setOptions(options).setExitCode(true);
+                return paths.length > 0 ? x.setPathspec(paths) : x;
+              },
+              format,
+            );
+          }
+          await twin(out, dir, ["diff", "--quiet", ...flags, ...args, "--", ...paths], (d) => {
+            const x = make(d).setOptions(options).setQuiet(true);
+            return paths.length > 0 ? x.setPathspec(paths) : x;
+          });
+        }
+      }
+    }
+    expect(out).toEqual([]);
+  });
+});
+
+describeGit("-I matches the whole line, its newline included", () => {
+  it('t4013-diff-various.sh: "diff -I<regex>" with patterns that match the LF', async () => {
+    const dir = repo(`
+      printf "x\\nkeep\\n" >f
+      git add f
+      commit -m one
+      printf "y\\nkeep\\n" >f
+      git add f
+      commit -m two
+      printf "y\\nkeep\\nlast" >f
+    `);
+    const out: string[] = [];
+    const patterns = ["[[:space:]]", "y$", "^$", "x.", "x[^a]", "\\s", "y[[:space:]]$", "^k"];
+    for (const [args, make] of modes("HEAD^", "HEAD")) {
+      for (const pattern of patterns) {
+        await twin(out, dir, ["diff", "--exit-code", `-I${pattern}`, ...args], (d) =>
+          make(d)
+            .setOptions({ ignoreMatchingLines: [pattern] })
+            .setExitCode(true),
+        );
+      }
+    }
+    expect(out).toEqual([]);
   });
 });

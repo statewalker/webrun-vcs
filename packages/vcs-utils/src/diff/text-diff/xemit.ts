@@ -50,9 +50,9 @@ export interface UnifiedDiffOptions extends XdiffOptions {
   ignoreBlankLines?: boolean;
   /**
    * `-I<regex>` (`--ignore-matching-lines`): ignore changes whose lines all match one of
-   * these patterns (xdiff's `xdl_mark_ignorable_regex`). Each line is tested without its
-   * LF, as glibc's `regexec` under `REG_NEWLINE` sees it (the empty line after it too); compile them with
-   * `compilePosixRegex(pattern, { extended: true })`, as git does.
+   * these patterns (xdiff's `xdl_mark_ignorable_regex`). Each line is tested whole, its LF
+   * included; compile them as git does, `compilePosixRegex(pattern, { extended: true,
+   * newline: true })` (`REG_EXTENDED | REG_NEWLINE`).
    */
   ignoreRegex?: readonly LineMatcher[];
   /**
@@ -130,16 +130,9 @@ export function markIgnorableLines(
 
 /** Whether line `i` matches one of the patterns (xdiff's `record_matches_regex`) */
 function lineMatches(lines: ByteLines, i: number, patterns: readonly LineMatcher[]): boolean {
-  const start = lines.start(i);
-  let end = lines.start(i + 1);
-  // regexec_buf over the record, LF included, under REG_NEWLINE: a match lies in the line
-  // before the LF, or in the empty line after it (where `^` and `$` both hold)
-  const newline = end > start && lines.content[end - 1] === 0x0a;
-  if (newline) end--;
-  const line = lines.content.subarray(start, end);
-  for (const p of patterns) {
-    if (p.test(line, line.length) || (newline && p.test(EMPTY, 0))) return true;
-  }
+  // regexec_buf over the whole record, its LF included
+  const line = lines.content.subarray(lines.start(i), lines.start(i + 1));
+  for (const p of patterns) if (p.test(line, line.length)) return true;
   return false;
 }
 

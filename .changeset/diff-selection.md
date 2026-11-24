@@ -16,5 +16,6 @@ at the next one) and `ignoreMatchingLines` (`-I<regex>`, POSIX extended regexes 
 `setOldTree("A...B")` diffs from the merge base (git's warning when there are several, its
 errors when there is none), `"A..B"` is `A B`, and `setMergeBase` is `--merge-base`. `git log`
 takes `diffFilter` (only the commits whose filtered diff is not empty), `relative`,
-`ignoreMatchingLines` and non-strict `rotateTo`/`skipTo` through `setDiffOptions`. In
-vcs-utils, `UnifiedDiffOptions.ignoreRegex` and `markIgnorableRegex` (statewalker/statewalker-root#313).
+`ignoreMatchingLines` and non-strict `rotateTo`/`skipTo` through `setDiffOptions`. `exitCodeFromContents` keeps git 2.43's exit status (every queued pair counts). In
+vcs-utils, `UnifiedDiffOptions.ignoreRegex`, `markIgnorableRegex`, and `compilePosixRegex`'s
+`newline` option (`REG_NEWLINE`) (statewalker/statewalker-root#313).
