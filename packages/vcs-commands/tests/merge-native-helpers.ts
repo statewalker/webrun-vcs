@@ -100,9 +100,11 @@ export async function openOurs(
   worktreePath = "",
   /** Give the worktree the environment too (its local remotes' ownership checks) */
   worktreeEnvironment = false,
+  /** The git directory within `dir` (default the worktree's `.git`): a separate one */
+  gitDirPath?: string,
 ): Promise<Git> {
   const files = createNodeFilesApi({ rootDir: dir });
-  const gitDir = worktreePath ? `${worktreePath}/.git` : ".git";
+  const gitDir = gitDirPath ?? (worktreePath ? `${worktreePath}/.git` : ".git");
   const { history } = await createGitFilesBackend({ files, gitDir });
   const io = {
     read: async (path: string) => {
