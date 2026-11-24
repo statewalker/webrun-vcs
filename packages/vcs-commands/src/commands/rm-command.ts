@@ -5,7 +5,12 @@ import {
   type Worktree,
   withWorktreeEntries,
 } from "@statewalker/vcs-working-tree";
-import { InvalidConfigError, NoFilepatternError, RmFailedError } from "../errors/index.js";
+import {
+  InvalidArgumentError,
+  InvalidConfigError,
+  NoFilepatternError,
+  RmFailedError,
+} from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { worktreeModeTrust } from "./core-config.js";
 import { IndexAdder } from "./index-adder.js";
@@ -18,6 +23,7 @@ import {
   parsePathspec,
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
+import { PathspecFile } from "./pathspec-file.js";
 import { sparsePathAdvice } from "./sparse-checkout-support.js";
 import {
   collapsedSparseDirectories,
@@ -88,6 +94,8 @@ export interface RmResult {
  */
 export class RmCommand extends GitCommand<RmResult> {
   private filepatterns: string[] = [];
+  /** `--pathspec-from-file` */
+  private readonly pathspecFile = new PathspecFile();
   private cached = false;
   private sparse = false;
   private recursive = false;
@@ -189,6 +197,26 @@ export class RmCommand extends GitCommand<RmResult> {
   }
 
   /**
+   * `--pathspec-from-file` (and `--pathspec-file-nul` with `nul`): the pathspec elements of
+   * `content`, one per line (a line starting with `"` unquoted as a C string), or separated
+   * by NUL with `nul`. As git's `cmd_rm`: refused beside {@link addFilepattern} patterns
+   * ("'--pathspec-from-file' and pathspec arguments cannot be used together"); an empty file
+   * is "No pathspec was given. Which files should I remove?".
+   *
+   * @example
+   * ```typescript
+   * await git.rm().setPathspecFromFile("a.txt\0b.txt\0", true).call();
+   * ```
+   *
+   * @throws InvalidArgumentError "fatal: line is badly quoted: <line>"
+   */
+  setPathspecFromFile(content: string | Uint8Array, nul = false): this {
+    this.checkCallable();
+    this.pathspecFile.read(content, nul);
+    return this;
+  }
+
+  /**
    * Set whether to only remove from index (keep in working tree).
    *
    * When true, files are only removed from the staging area
@@ -245,8 +273,14 @@ export class RmCommand extends GitCommand<RmResult> {
     // unwritten edits (refused)
     await this.readCurrentIndex();
 
+    // --pathspec-from-file: the file's elements are the pathspec (cmd_rm)
+    this.filepatterns = this.pathspecFile.pathspec(this.filepatterns);
     if (this.filepatterns.length === 0) {
-      throw new NoFilepatternError("At least one file pattern is required");
+      throw new NoFilepatternError(
+        this.pathspecFile.given
+          ? "fatal: No pathspec was given. Which files should I remove?"
+          : "At least one file pattern is required",
+      );
     }
 
     const removedPaths: string[] = [];
@@ -261,7 +295,17 @@ export class RmCommand extends GitCommand<RmResult> {
     // git's pathspec (parse_pathspec, then ce_path_match): `.` and `./d` name everything
     // beneath, a directory its files, a glob's `*` crosses slashes; `seen` tells which
     // elements matched (git's ps_matched)
-    const items = parsePathspec(this.filepatterns, { attr: true });
+    let items: PathspecItem[];
+    try {
+      items = parsePathspec(this.filepatterns, { attr: true });
+    } catch (error) {
+      // parse_pathspec dies (an empty element, bad magic)
+      throw new InvalidArgumentError(
+        "filepattern",
+        this.filepatterns,
+        `fatal: ${(error as Error).message}`,
+      );
+    }
     // `:(attr:...)`: the attributes of the index's paths (match_pathspec_attrs)
     const attributes = PathspecAttributes.forWorktree(items, this.worktreeAccess);
     if (attributes) {

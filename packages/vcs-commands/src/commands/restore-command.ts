@@ -20,11 +20,7 @@
 import type { ObjectId } from "@statewalker/vcs-core";
 import type { ConflictStyle } from "@statewalker/vcs-utils";
 
-import {
-  IncompatibleOptionsError,
-  InvalidArgumentError,
-  RefNotFoundError,
-} from "../errors/index.js";
+import { InvalidArgumentError, RefNotFoundError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import {
   type PatchCompatibility,
@@ -43,7 +39,8 @@ import {
 import { runPathCheckout } from "./checkout-paths.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
-import { globalPathspecMagic, parsePathspecFile } from "./pathspec.js";
+import { globalPathspecMagic } from "./pathspec.js";
+import { PathspecFile } from "./pathspec-file.js";
 
 /**
  * `git restore [--source=<tree>] [--staged] [--worktree] [--overlay] [--ours|--theirs|-m]
@@ -56,9 +53,8 @@ import { globalPathspecMagic, parsePathspecFile } from "./pathspec.js";
  */
 export class RestoreCommand extends GitCommand<CheckoutResult> {
   private readonly paths: string[] = [];
-  private pathspecFromFile: string[] = [];
-  /** Whether `--pathspec-from-file` was given (an empty file included) */
-  private pathspecFileGiven = false;
+  /** `--pathspec-from-file` */
+  private readonly pathspecFile = new PathspecFile();
   private source?: string;
   private staged?: boolean;
   private worktree?: boolean;
@@ -140,19 +136,9 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
     // checkout_main resolves the source first (an unborn HEAD included: unlike reset -p,
     // restore has no empty-tree fallback)
     if (source !== undefined) await this.resolvePatchSource(source);
-    if (this.pathspecFileGiven) {
-      if (this.paths.length > 0) {
-        throw new InvalidArgumentError(
-          "pathspecFromFile",
-          this.pathspecFromFile,
-          "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together",
-        );
-      }
-      throw new IncompatibleOptionsError(
-        ["--pathspec-from-file", "--patch"],
-        "fatal: options '--pathspec-from-file' and '--patch' cannot be used together",
-      );
-    }
+    // checkout_main: the pathspec arguments first, then -p
+    this.pathspecFile.refuseArguments(this.paths);
+    this.pathspecFile.refuse("--patch", true);
     const { revision, diffRevision } = await patchRevisionOf(source, {
       headId: async () => (await this.refsStore.resolve("HEAD"))?.objectId,
       resolve: (name) => this.resolveRevision(name),
@@ -164,7 +150,7 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
       mode: pathPatchMode(index, worktree, revision),
       selector: this.patchSelector,
       ...(diffRevision !== undefined ? { diffRevision } : {}),
-      paths: [...this.pathspecFromFile, ...this.paths],
+      paths: [...this.pathspecFile.elements, ...this.paths],
       compatibility: this.patchCompatibility,
     });
     return {
@@ -205,16 +191,7 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
   /** `--pathspec-from-file` (and `--pathspec-file-nul` with `nul`): the elements of `content`. */
   setPathspecFromFile(content: string | Uint8Array, nul = false): this {
     this.checkCallable();
-    this.pathspecFileGiven = true;
-    try {
-      this.pathspecFromFile = parsePathspecFile(content, nul);
-    } catch (error) {
-      throw new InvalidArgumentError(
-        "pathspecFromFile",
-        content,
-        `fatal: ${(error as Error).message}`,
-      );
-    }
+    this.pathspecFile.read(content, nul);
     return this;
   }
 
@@ -293,13 +270,7 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
     this.setCallable(false);
     await this.readCurrentIndex();
     if (this.patch) return this.callPatch();
-    if (this.paths.length > 0 && this.pathspecFromFile.length > 0) {
-      throw new InvalidArgumentError(
-        "pathspecFromFile",
-        this.pathspecFromFile,
-        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together",
-      );
-    }
+    this.pathspecFile.refuseArguments(this.paths);
     let globalMagic: ReturnType<typeof globalPathspecMagic>;
     try {
       globalMagic = globalPathspecMagic(hostEnvironmentOf(this.workingCopy)?.pathspecs);
@@ -323,7 +294,7 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
           },
           {
             command: "restore",
-            paths: [...this.pathspecFromFile, ...this.paths],
+            paths: [...this.pathspecFile.elements, ...this.paths],
             ...(this.source !== undefined ? { source: this.source } : {}),
             ...(this.staged !== undefined ? { staged: this.staged } : {}),
             ...(this.worktree !== undefined ? { worktree: this.worktree } : {}),

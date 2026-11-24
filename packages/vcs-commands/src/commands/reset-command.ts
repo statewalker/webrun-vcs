@@ -46,9 +46,9 @@ import {
   matchPathspec,
   type PathspecItem,
   parsePathspec,
-  parsePathspecFile,
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
+import { PathspecFile } from "./pathspec-file.js";
 import { markIndexUpdate } from "./post-index-change.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { moveHeadAsReset, removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
@@ -96,9 +96,8 @@ export class ResetCommand extends GitCommand<Ref> {
   private ref?: string;
   private mode = ResetMode.MIXED;
   private paths: string[] = [];
-  private pathspecFromFile: string[] = [];
-  /** Whether `--pathspec-from-file` was given (an empty file included) */
-  private pathspecFileGiven = false;
+  /** `--pathspec-from-file` */
+  private readonly pathspecFile = new PathspecFile();
   private modeSet = false;
   private intentToAdd = false;
   private quiet = false;
@@ -187,7 +186,7 @@ export class ResetCommand extends GitCommand<Ref> {
       mode: patchModeFor("reset", rev),
       selector: this.patchSelector,
       diffRevision,
-      paths: [...this.pathspecFromFile, ...this.paths],
+      paths: [...this.pathspecFile.elements, ...this.paths],
       compatibility: this.compatibility,
     });
     return (await this.refsStore.resolve("HEAD")) as Ref;
@@ -295,16 +294,7 @@ export class ResetCommand extends GitCommand<Ref> {
    */
   setPathspecFromFile(content: string | Uint8Array, nul = false): this {
     this.checkCallable();
-    this.pathspecFileGiven = true;
-    try {
-      this.pathspecFromFile = parsePathspecFile(content, nul);
-    } catch (error) {
-      throw new InvalidArgumentError(
-        "pathspecFromFile",
-        content,
-        `fatal: ${(error as Error).message}`,
-      );
-    }
+    this.pathspecFile.read(content, nul);
     return this;
   }
 
@@ -318,7 +308,7 @@ export class ResetCommand extends GitCommand<Ref> {
     // git writes the index once: one post-index-change run, after the worktree is updated
     // a whole-tree reset writes the index and then the stat of the files it wrote: held back
     // and written once, as git's one write (the patch and path modes read the index back)
-    const wholeTree = !this.patch && this.paths.length === 0 && !this.pathspecFileGiven;
+    const wholeTree = !this.patch && this.paths.length === 0 && !this.pathspecFile.given;
     // one worktree operation: the files refreshed or written convert with attributes read
     // once, not once per file
     return this.withOneIndexWrite("last", () => this.inOneOperation(() => this.resetOnce()), {
@@ -334,18 +324,8 @@ export class ResetCommand extends GitCommand<Ref> {
     // unwritten edits (refused)
     await this.readCurrentIndex();
 
-    if (this.pathspecFileGiven && this.patch)
-      throw new IncompatibleOptionsError(
-        ["--pathspec-from-file", "--patch"],
-        "fatal: options '--pathspec-from-file' and '--patch' cannot be used together",
-      );
-    if (this.paths.length > 0 && this.pathspecFromFile.length > 0) {
-      throw new InvalidArgumentError(
-        "pathspecFromFile",
-        this.pathspecFromFile,
-        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together",
-      );
-    }
+    this.pathspecFile.refuse("--patch", this.patch);
+    this.pathspecFile.refuseArguments(this.paths);
     if (this.intentToAdd && this.mode !== ResetMode.MIXED) {
       throw new IncompatibleOptionsError(
         ["-N", "--mixed"],
@@ -354,7 +334,7 @@ export class ResetCommand extends GitCommand<Ref> {
     }
     if (this.patch) return this.callPatch();
     // If paths are specified, do path reset
-    if (this.paths.length > 0 || this.pathspecFromFile.length > 0) {
+    if (this.paths.length > 0 || this.pathspecFile.elements.length > 0) {
       return this.resetPaths();
     }
 
@@ -547,7 +527,7 @@ export class ResetCommand extends GitCommand<Ref> {
     let items: PathspecItem[];
     try {
       const global = globalPathspecMagic(hostEnvironmentOf(this.workingCopy)?.pathspecs);
-      items = parsePathspec([...this.pathspecFromFile, ...this.paths], { attr: true, global });
+      items = parsePathspec([...this.pathspecFile.elements, ...this.paths], { attr: true, global });
     } catch (error) {
       throw new InvalidArgumentError("path", this.paths, `fatal: ${(error as Error).message}`);
     }

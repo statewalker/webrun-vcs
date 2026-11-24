@@ -56,6 +56,7 @@ import {
   pathspecItemPath,
 } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
+import { PathspecFile } from "./pathspec-file.js";
 import { sparsePathAdvice } from "./sparse-checkout-support.js";
 import { SPARSE_INDEX_EXPANDED_HINT, sparseIndexAsRead } from "./sparse-index-view.js";
 import { worktreePathRules } from "./worktree-path-rules.js";
@@ -111,6 +112,8 @@ export interface AddResult {
  */
 export class AddCommand extends GitCommand<AddResult> {
   private filepatterns: string[] = [];
+  /** `--pathspec-from-file` */
+  private readonly pathspecFile = new PathspecFile();
   private update = false;
   private all: boolean | undefined;
   private force = false;
@@ -255,6 +258,27 @@ export class AddCommand extends GitCommand<AddResult> {
   addFilepattern(filepattern: string): this {
     this.checkCallable();
     this.filepatterns.push(filepattern);
+    return this;
+  }
+
+  /**
+   * `--pathspec-from-file` (and `--pathspec-file-nul` with `nul`): the pathspec elements of
+   * `content`, one per line (a line starting with `"` unquoted as a C string), or separated
+   * by NUL with `nul`. As git's `cmd_add`: refused beside {@link addFilepattern} patterns
+   * ("'--pathspec-from-file' and pathspec arguments cannot be used together") and with
+   * {@link setPatch} or {@link setInteractive}; an empty file adds nothing ("Nothing
+   * specified, nothing added.", exit status 0).
+   *
+   * @example
+   * ```typescript
+   * await git.add().setPathspecFromFile("src/a.ts\nsrc/b.ts\n").call();
+   * ```
+   *
+   * @throws InvalidArgumentError "fatal: line is badly quoted: <line>"
+   */
+  setPathspecFromFile(content: string | Uint8Array, nul = false): this {
+    this.checkCallable();
+    this.pathspecFile.read(content, nul);
     return this;
   }
 
@@ -502,6 +526,7 @@ export class AddCommand extends GitCommand<AddResult> {
         "fatal: options '--dry-run' and '--interactive/--patch' cannot be used together",
       );
     }
+    this.pathspecFile.refuse("--interactive/--patch", true);
     const patch = await runPatchSelection(this.workingCopy, {
       hookSource: this,
       ...this.patchOptions,
@@ -530,6 +555,7 @@ export class AddCommand extends GitCommand<AddResult> {
         "fatal: options '--dry-run' and '--interactive/--patch' cannot be used together",
       );
     }
+    this.pathspecFile.refuse("--interactive/--patch", true);
     const selector = this.patchSelector;
     if (!selector) {
       throw new InvalidArgumentError(
@@ -633,6 +659,8 @@ export class AddCommand extends GitCommand<AddResult> {
         `fatal: --chmod param '${this.chmod}' must be either -x or +x`,
       );
     }
+    // --pathspec-from-file: the file's elements are the pathspec (cmd_add)
+    this.filepatterns = this.pathspecFile.pathspec(this.filepatterns);
     // git's require_pathspec ("Nothing specified, nothing added."), a renormalisation
     // included: only `-u` and `-A` go without one
     if (this.filepatterns.length === 0 && !(this.update || this.all === true)) {
