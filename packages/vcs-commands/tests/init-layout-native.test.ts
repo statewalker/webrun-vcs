@@ -452,9 +452,82 @@ describeGit("git init's layout, as native git (t0001-init)", () => {
       .call();
     expect(n2).toBeDefined();
     expect(reported.warnings).toEqual([
-      `error: could not repair worktree link, not reachable here: ${join(root, `${o2}-wt`)}/.git`,
+      `error: could not repair worktree link, not reachable here: ${join(root, `${o2}-wt`)}/.git (run 'git worktree repair ${join(root, `${o2}-wt`)}')`,
     ]);
     expect(native(join(root, `${o2}-box/main`), ["status", "--porcelain"]).status).toBe(0);
+  });
+
+  it("a gitfile that cannot be written leaves the repository and its old gitfile in place", async () => {
+    const [, o] = twinNames("enospc");
+    const init = ["init", "-q", "--template=", "-b", "main"];
+    expect(native(root, [...init, "--separate-git-dir", `${o}-old`, o]).status).toBe(0);
+    const before = readFileSync(join(root, o, ".git"), "utf8");
+    const base = createNodeFilesApi({ rootDir: root });
+    const failing = new Proxy(base, {
+      get(target, prop) {
+        if (prop === "write") {
+          return async (path: string, content: Parameters<typeof base.write>[1]) => {
+            if (path.replace(/^\/+/, "") === `${o}/.git`) {
+              throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+            }
+            return target.write(path, content);
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const error = await new InitCommand()
+      .setFilesApi(failing)
+      .setEnvironment(createNodeGitHostEnvironment({ env: testEnv(root) }))
+      .setDirectory(o)
+      .setSeparateGitDir(`${o}-sep`)
+      .setTemplate("")
+      .call()
+      .catch((e) => e);
+    expect((error as Error).message).toContain("ENOSPC");
+    expect(readFileSync(join(root, o, ".git"), "utf8")).toBe(before);
+    expect(existsSync(join(root, `${o}-old/HEAD`))).toBe(true);
+    expect(existsSync(join(root, `${o}-sep`))).toBe(false);
+    expect(native(join(root, o), ["status", "--porcelain"]).status).toBe(0);
+  });
+
+  it('t0001-init.sh: "re-init from a linked worktree": the result works in that worktree', async () => {
+    const [n, o] = twinNames("reinit-linked");
+    for (const name of [n, o]) {
+      expect(native(root, ["init", "-q", "--template=", "-b", "main", name]).status).toBe(0);
+      native(join(root, name), ["commit", "-q", "--allow-empty", "-m", "c"]);
+      expect(
+        native(join(root, name), ["worktree", "add", "-q", "-b", "wtb", `../${name}-wt`]).status,
+      ).toBe(0);
+      writeFileSync(join(root, name, "staged"), "s\n");
+      native(join(root, name), ["add", "staged"]);
+      writeFileSync(join(root, `${name}-wt`, "g"), "g\n");
+    }
+    const theirs = native(join(root, `${n}-wt`), ["init", "--template="]);
+    expect(theirs.stdout).toBe(
+      `Reinitialized existing Git repository in ${join(root, n)}/.git/worktrees/${n}-wt/\n`,
+    );
+    process.umask(0o022);
+    const result = await new InitCommand()
+      .setFilesApi(createNodeFilesApi({ rootDir: root }))
+      .setEnvironment(createNodeGitHostEnvironment({ env: testEnv(root) }))
+      .setDirectory(`${o}-wt`)
+      .setTemplate("")
+      .call();
+    expect(result.reinitialized).toBe(true);
+    expect(result.gitDir).toBe(`${o}/.git/worktrees/${o}-wt`);
+    expect(result.initialBranch).toBe("wtb");
+    const status = await result.git.status().call();
+    expect([...status.added]).toEqual([]);
+    expect([...status.untracked]).toEqual(["g"]);
+    await result.git.add().addFilepattern("g").call();
+    native(join(root, `${n}-wt`), ["add", "g"]);
+    const staged = (name: string) =>
+      native(join(root, `${name}-wt`), ["status", "--porcelain"]).stdout;
+    expect(staged(o)).toBe(staged(n));
+    expect(staged(o)).toBe("A  g\n");
+    expect(native(join(root, o), ["status", "--porcelain"]).stdout).toBe("A  staged\n");
   });
 
   it("re-init through a gitfile naming a repository outside the FilesApi is refused", async () => {

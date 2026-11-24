@@ -16,6 +16,7 @@ import {
   hostPathOf,
   hostRootOf,
   isAbsoluteGitPath,
+  openGitLinkedWorktrees,
   parseGitfile,
   probeCaseFolding,
   readProtectedConfig,
@@ -416,6 +417,9 @@ export class InitCommand {
     let history: History;
     let staging: Staging;
     let resultGitDir = gitDir;
+    // re-init from a linked worktree: its administrative directory (the common one gets
+    // the templates, config, objects and refs)
+    let linkedAdmin: string | undefined;
     // the worktree's top: the directory asked for, or the main worktree when
     // --separate-git-dir was given inside a linked one
     let worktreeRoot = (this.directory ?? "").replace(/\/+$/, "");
@@ -446,7 +450,10 @@ export class InitCommand {
               `fatal: the repository '${linked.path}' the gitfile '${dir}' names lies outside the storage`,
             );
           }
-          dir = (await commonDirectoryOf(files, linked.path)) ?? linked.path;
+          const common = await commonDirectoryOf(files, linked.path);
+          // a linked worktree's own git directory: HEAD, index and the working copy are its
+          if (common !== undefined) linkedAdmin = linked.path;
+          dir = common ?? linked.path;
         }
       }
       // a relative path stays relative (gitfile targets come back rooted)
@@ -597,6 +604,31 @@ export class InitCommand {
       // Set initial branch by creating symbolic ref for HEAD
       await history.refs.setSymbolic("HEAD", `refs/heads/${initialBranch}`);
       staging = this.stagingStore ?? new MemoryStagingStore();
+    }
+
+    if (linkedAdmin !== undefined && this.files) {
+      // git's re-init works in the linked worktree: its HEAD, its index, its files
+      const relative = (p: string) => (gitDir.startsWith("/") ? p : p.replace(/^\/+/, "") || ".");
+      const worktrees = await openGitLinkedWorktrees({
+        files,
+        gitDir: linkedAdmin,
+        history,
+        ...(this.environment ? { environment: this.environment } : {}),
+      });
+      const linkedCopy = await worktrees.openCurrent();
+      const branch = await linkedCopy.getCurrentBranch?.();
+      return {
+        git: Git.fromWorkingCopy(linkedCopy),
+        workingCopy: linkedCopy,
+        repository: linkedCopy.history,
+        initialBranch: typeof branch === "string" ? branch.replace(/^refs\/heads\//, "") : "",
+        ...(hints ? { hints } : {}),
+        ...(warnings.length > 0 ? { warnings } : {}),
+        bare: false,
+        gitDir: relative(linkedAdmin),
+        reinitialized,
+        shared,
+      };
     }
 
     // Create worktree if enabled and not bare
@@ -758,15 +790,29 @@ export class InitCommand {
     if (source !== undefined && normalizePath(source) !== normalizePath(real)) {
       // the worktrees' relative links resolve from where the repository was
       const oldHost = await this.hostPath(files, source);
+      // the gitfile there before (a repository reached through one): restored on a failure
+      const linkMoves = normalizePath(link) === normalizePath(source);
+      const previousGitfile = linkMoves ? undefined : await readFile(files, link);
       if (!(await files.move(source, real))) {
         throw new InitOptionsError(`fatal: unable to move ${source} to ${real}`);
       }
       try {
         await this.writeGitfile(files, link, real);
       } catch (error) {
-        // never leave the repository without its `.git`: the move is undone
-        await files.remove(link).catch(() => false);
-        await files.move(real, source).catch(() => false);
+        // never leave the repository without its `.git`: the move is undone, and the link
+        // is what it was (a gitfile written where the moved directory was goes first)
+        if (linkMoves && (await files.stats(link).catch(() => undefined))?.kind === "file") {
+          await files.remove(link).catch(() => false);
+        }
+        const movedBack = await files.move(real, source).catch(() => false);
+        if (previousGitfile !== undefined) {
+          await files.write(link, [previousGitfile]).catch(() => undefined);
+        }
+        if (!movedBack) {
+          throw new InitOptionsError(
+            `fatal: could not write the gitfile '${link}' (${(error as Error).message}), and the repository could not be moved back: it is now at '${real}', not '${source}'`,
+          );
+        }
         throw error;
       }
       await this.repairWorktreesAfterGitdirMove(files, real, oldHost, warnings);
@@ -814,7 +860,9 @@ export class InitCommand {
         dotgitHost = relative ? resolveDots(`${oldHost}/worktrees/${id}/${dotgit}`) : dotgit;
         const target = await this.reachHostPath(files, dotgitHost);
         if (!target) {
-          warnings.push(`error: could not repair worktree link, not reachable here: ${dotgitHost}`);
+          warnings.push(
+            `error: could not repair worktree link, not reachable here: ${dotgitHost} (run 'git worktree repair ${parentOf(dotgitHost)}')`,
+          );
           continue;
         }
         // file_exists: a worktree gone is left alone
