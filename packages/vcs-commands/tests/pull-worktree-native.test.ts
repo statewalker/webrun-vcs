@@ -5,7 +5,7 @@
  * and state files compared.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -96,6 +96,39 @@ describeGit("pull writes the worktree as native git", () => {
       /^Merge branch 'main' of <url>\n\n\* 'main' of <url>:\n {2}upstream\n/,
     );
   });
+
+  for (const [line, first] of [
+    ["log = -1", "error: merge.log: negative length -1"],
+    ["log = abc", "fatal: bad numeric config value 'abc' for 'merge.log'"],
+    ["suppressDest", "error: missing value for 'merge.suppressdest'"],
+  ] as const) {
+    it(`[merge] ${line}: the pull's merge dies before writing anything, as git's (t7600)`, async () => {
+      const { native, ours } = setup();
+      for (const dir of [native, ours]) {
+        const path = join(dir, ".git/config");
+        writeFileSync(path, `${readFileSync(path, "utf8")}[merge]\n\t${line}\n`);
+      }
+      const expected = git(root, native, "-c", "pull.rebase=false", "pull", "origin", "main");
+      expect(expected.status).toBe(128);
+      expect(expected.stderr).toContain(first);
+      await expect(
+        (await openOurs(ours)).pull().setRemoteBranchName("main").call(),
+      ).rejects.toThrow(
+        expect.objectContaining({
+          // the merge's lines, after what the fetch printed
+          message: expected.stderr
+            .split("\n")
+            .filter((l) => /^(error|fatal): /.test(l))
+            .join("\n"),
+          exitCode: 128,
+        }) as unknown as Error,
+      );
+      expect(snapshot(root, ours, normalize)).toEqual(snapshot(root, native, normalize));
+      expect(gitOk(root, ours, "rev-parse", "origin/main")).toBe(
+        gitOk(root, native, "rev-parse", "origin/main"),
+      );
+    });
+  }
 
   it("a pull --rebase stops at the conflict as git pull --rebase does", async () => {
     const { native, ours } = setup();

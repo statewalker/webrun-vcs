@@ -14,10 +14,10 @@
  */
 
 import type { Commit, ObjectId } from "@statewalker/vcs-core";
-import { parseGitInt } from "@statewalker/vcs-utils";
+import { parseGitBool, parseGitInt } from "@statewalker/vcs-utils";
 import { wildmatch } from "@statewalker/vcs-working-tree";
 
-import { GitApiError, NotACommitError } from "../errors/index.js";
+import { GitApiError, InvalidConfigError, NotACommitError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { subjectOf } from "./merge-support.js";
@@ -473,18 +473,32 @@ const BOOL_TEXT: Record<string, boolean> = {
   "": false,
 };
 
-/** fmt_merge_msg_config over a repository's configuration, in its order. */
+/**
+ * fmt_merge_msg_config over a repository's configuration, in its order: what `git merge` and
+ * `git fmt-merge-msg` read as they load their configuration (git_merge_config), before they
+ * do anything.
+ *
+ * @throws InvalidConfigError with git's lines (exit 128) for the first value git refuses: a
+ *   negative `merge.log`/`merge.summary` (`error: merge.log: negative length -1`, then `fatal:
+ *   bad config variable 'merge.log' in file '.git/config' at line 4`), one that is no boolean
+ *   or number (`fatal: bad numeric config value 'abc' for 'merge.log' in file .git/config:
+ *   invalid unit`), a `merge.suppressDest` without a value (`error: missing value for
+ *   'merge.suppressdest'` and the `bad config variable` line), a `merge.branchdesc` that is no
+ *   boolean (`fatal: bad boolean config value 'abc' for 'merge.branchdesc'`)
+ */
 export function fmtMergeMsgConfigOf(config: RemoteConfigStore): FmtMergeMsgConfig {
-  const entries = config.entriesWithPrefix("merge.") ?? [
-    ...(config.lastValueOf(["merge.log", "merge.summary"]) !== undefined
-      ? [{ key: "merge.log", value: config.lastValueOf(["merge.log", "merge.summary"]) }]
-      : []),
-    ...config.values("merge.branchdesc").map((value) => ({ key: "merge.branchdesc", value })),
-    ...config.values("merge.suppressdest").map((value) => ({ key: "merge.suppressdest", value })),
-  ];
+  const keys = ["merge.log", "merge.summary", "merge.branchdesc", "merge.suppressdest"];
+  const entries =
+    config.entriesWithOriginFor(keys) ??
+    keys.flatMap((key) => config.valuesWithOrigin(key).map((where) => ({ ...where, key })));
   const out: FmtMergeMsgConfig = { log: -1, branchDesc: false, suppressDest: [] };
   let suppressSeen = false;
-  for (const { key, value } of entries) {
+  for (const { key, text: value, file, line } of entries) {
+    // git_parse_source's death after a callback's error
+    const badVariable = () =>
+      file !== undefined && line !== undefined
+        ? `fatal: bad config variable '${key}' in file '${file}' at line ${line}`
+        : `fatal: unable to parse '${key}' from command-line config`;
     if (key === "merge.log" || key === "merge.summary") {
       // git_config_bool_or_int: a boolean is the default length, a number itself
       const bool = value === undefined ? true : BOOL_TEXT[value.toLowerCase()];
@@ -492,21 +506,32 @@ export function fmtMergeMsgConfigOf(config: RemoteConfigStore): FmtMergeMsgConfi
       else {
         const n = parseGitInt(value);
         if (n === undefined) {
-          throw new GitApiError(`fatal: bad numeric config value '${value}' for '${key}'`, {
-            exitCode: 128,
-          });
+          const where = file !== undefined ? ` in file ${file}` : "";
+          throw new InvalidConfigError(
+            key,
+            `fatal: bad numeric config value '${value}' for '${key}'${where}: invalid unit`,
+          );
         }
         if (n < 0) {
-          throw new GitApiError(`error: ${key}: negative length ${value}`, { exitCode: 128 });
+          throw new InvalidConfigError(
+            key,
+            `error: ${key}: negative length ${value}\n${badVariable()}`,
+          );
         }
         out.log = n;
       }
     } else if (key === "merge.branchdesc") {
-      out.branchDesc =
-        value === undefined ? true : (BOOL_TEXT[value.toLowerCase()] ?? Number(value) !== 0);
+      const bool = value === undefined ? true : parseGitBool(value);
+      if (bool === undefined) {
+        throw new InvalidConfigError(
+          key,
+          `fatal: bad boolean config value '${value}' for '${key}'`,
+        );
+      }
+      out.branchDesc = bool;
     } else if (key === "merge.suppressdest") {
       if (value === undefined) {
-        throw new GitApiError(`error: missing value for '${key}'`, { exitCode: 128 });
+        throw new InvalidConfigError(key, `error: missing value for '${key}'\n${badVariable()}`);
       }
       if (value === "") out.suppressDest = [];
       else out.suppressDest.push(value);

@@ -468,6 +468,9 @@ export class MergeCommand extends GitCommand<MergeResult> {
     // git_merge_config ends in git_diff_ui_config: a diff.submodule without a value dies
     // (not for the merges a rebase makes in process)
     if (!this.inProcess) readDiffSubmoduleConfig(this.workingCopy);
+    // ... and its fmt_merge_msg_config: a merge.* value git refuses dies before anything is
+    // read or written (the message is built only after the tree merge)
+    if (!this.inProcess) fmtMergeMsgConfigOf(RemoteConfigStore.from(this.workingCopy));
     // the index as it is now, before the worktree or a ref is touched: one another writer
     // replaced is read again (git reads the index at its start), unless this instance holds
     // unwritten edits (refused)

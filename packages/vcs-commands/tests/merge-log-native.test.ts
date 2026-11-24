@@ -507,6 +507,56 @@ describeGit("merge messages, --log and --signoff against native git", () => {
     });
   });
 
+  describe("merge.* settings git refuses on loading its configuration (fmt_merge_msg_config)", () => {
+    /** The `[merge]` lines, appended to `.git/config` as written (a bare key too). */
+    const settings: [string, string][] = [
+      ["log = -1", "error: merge.log: negative length -1"],
+      ["summary = -2", "error: merge.summary: negative length -2"],
+      ["log = abc", "fatal: bad numeric config value 'abc' for 'merge.log'"],
+      ["log = 1x", "fatal: bad numeric config value '1x' for 'merge.log'"],
+      ["suppressDest", "error: missing value for 'merge.suppressdest'"],
+      ["branchdesc = abc", "fatal: bad boolean config value 'abc' for 'merge.branchdesc'"],
+    ];
+    const withSetting = (line: string) => (d: string) => {
+      const path = join(d, ".git/config");
+      writeFileSync(path, `${readFileSync(path, "utf8")}[merge]\n\t${line}\n`);
+    };
+
+    for (const [line, first] of settings) {
+      it(`[merge] ${line}: the merge dies before it writes anything`, async () => {
+        const n = counter;
+        await twins({
+          build: (d) => sideHistory(d),
+          prepare: withSetting(line),
+          args: ["side"],
+          merge: (g) => g.merge().include("side"),
+          throws: first,
+        });
+        // git's whole stderr, file and line included
+        const native = join(root, `native-${n}`);
+        const expected = git(native, ["merge", "side"]).stderr.trim();
+        await expect((await ours(native)).merge().include("side").call()).rejects.toThrow(
+          expect.objectContaining({ message: expected, exitCode: 128 }) as unknown as Error,
+        );
+      });
+    }
+
+    it("a fast-forward and a -m merge without --log die too", async () => {
+      for (const [args, merge] of [
+        [["side"], (g: Git) => g.merge().include("side")],
+        [["-m", "x", "side"], (g: Git) => g.merge().include("side").setMessage("x")],
+      ] as const) {
+        await twins({
+          build: (d) => sideHistory(d, (b) => b.run("reset", "-q", "--hard", "main~1")),
+          prepare: withSetting("log = -1"),
+          args: [...args],
+          merge,
+          throws: "error: merge.log: negative length -1",
+        });
+      }
+    });
+  });
+
   describe("unrelated histories (t7600-merge)", () => {
     /** main, and `other`, a root of its own. */
     const unrelated = (d: string) =>
