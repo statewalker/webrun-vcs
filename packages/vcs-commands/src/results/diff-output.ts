@@ -52,7 +52,9 @@ import {
 import { WS_DEFAULT_RULE, WS_INCOMPLETE_LINE } from "../whitespace/index.js";
 import { gitBinaryPatch } from "./binary-patch.js";
 import { type ColoredHunk, type DiffColors, WSEH_NEW, writeColoredHunks } from "./diff-color.js";
+import type { LineRange } from "./diff-entry.js";
 import { compileWordRegex, writeWordDiffHunks } from "./diff-words.js";
+import { cutToLineRanges, lineRangesSpan } from "./line-range-hunks.js";
 import { quoteCStyleBody, quotePath, quoteTwo } from "./quote-path.js";
 
 /** One side of a file pair */
@@ -105,6 +107,11 @@ export interface DiffFilePair {
   new?: DiffSideSpec;
   /** Similarity percentage of a rename or copy */
   score?: number;
+  /**
+   * `git log -L`: the patch shows only the changes of these lines of the new side (diff.c's
+   * `line_ranges`, see {@link cutToLineRanges})
+   */
+  lineRanges?: readonly LineRange[];
 }
 
 /** What a diff driver (`diff=<name>` attribute) changes */
@@ -639,12 +646,19 @@ async function builtinDiff(
   const textTwo = textconvTwo
     ? await textconvTwo(await two.textconvInput(), attrTwo)
     : await two.read();
-  const result = unifiedDiffHunks(textOne, textTwo, {
+  // `git log -L`: the context widened to the widest range, the hunks then cut to the ranges
+  const lineRanges = pair.lineRanges;
+  const context = lineRanges
+    ? Math.max(options.context ?? 3, lineRangesSpan(lineRanges))
+    : options.context;
+  let result = unifiedDiffHunks(textOne, textTwo, {
     ...options,
+    ...(context !== undefined ? { context } : {}),
     algorithm,
     indentHeuristic: options.indentHeuristic ?? true,
     findFunction: driver?.findFunction,
   });
+  if (lineRanges) result = { ...result, hunks: cutToLineRanges(result.hunks, lineRanges) };
   if (report) report.result = result;
   if (result.hunks.length === 0) return;
   if (header) sink.text(header);
