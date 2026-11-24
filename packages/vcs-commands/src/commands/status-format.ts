@@ -666,7 +666,7 @@ function changeLine(
   }
   const what = DIFF_LABELS[status] ?? `${status}:`;
   const pad = " ".repeat(DIFF_LABEL_WIDTH - what.length);
-  const renamed = e.renamedFrom !== undefined && status === "R";
+  const renamed = e.renamedFrom !== undefined && (status === "R" || status === "C");
   p.printf("\t");
   p.more(
     renamed
