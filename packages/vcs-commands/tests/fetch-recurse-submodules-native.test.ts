@@ -190,7 +190,8 @@ async function expectTwins(t: Twins, steps: Step[], dir = "downstream"): Promise
       if (step.quiet) command.setQuiet(true);
       const result = await command.call();
       mine = {
-        stderr: fetchOutputText(result, step.quiet),
+        // the superproject's hooks (reference-transaction) write before its ref lines
+        stderr: `${command.getHookOutput()}${fetchOutputText(result, step.quiet)}`,
         exitCode: fetchSucceeded(result) ? 0 : 1,
       };
     } catch (error) {
@@ -477,6 +478,21 @@ git update-ref refs/changes/custom3 HEAD`),
         GIT_CONFIG_PARAMETERS: "'submodule.fetchJobs'='1'",
       }),
       fetch([], (c) => c, { GIT_CONFIG_PARAMETERS: "'submodule.fetchJobs'='-1'" }),
+    ]);
+  });
+
+  it("each repository's reference-transaction hook runs for its own refs (the submodule's fetch runs in the submodule)", async () => {
+    const t = twins(`${T5526_SETUP}
+for d in downstream/.git:super downstream/.git/modules/submodule:sub; do
+  printf '#!/bin/sh\\necho "%s $1" >&2\\n' "\${d#*:}" > "\${d%%:*}/hooks/reference-transaction"
+  chmod +x "\${d%%:*}/hooks/reference-transaction"; done`);
+    await expectTwins(t, [
+      up("add_submodule_commits; add_superproject_commits"),
+      fetch([]),
+      // the superproject moves on too: git 2.5x runs the hook for a fetch's empty ref
+      // transaction as well, which ours does not (a divergence of the superproject's own fetch)
+      up("add_submodule_commits; add_superproject_commits"),
+      fetch(["--recurse-submodules"], (c) => c.setRecurseSubmodules(true)),
     ]);
   });
 

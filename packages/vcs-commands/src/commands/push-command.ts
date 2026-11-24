@@ -1146,7 +1146,8 @@ export class PushCommand extends TransportCommand<PushResult> {
     const remotes = await new SubmoduleFetchRepository(inner).refTipsUnder("refs/remotes/");
     if (remotes.length === 0) return true;
     const child = new PushCommand(inner).setRecurseFromSuperproject(true);
-    child.shareHooksOf(this);
+    // git's child `git push` runs in the submodule: its own hooks (the submodule's hooks
+    // directory, its directory as cwd), their output relayed where the child prints it
     child.setTransports(this.submoduleTransports());
     if (this.timeout !== undefined) child.setTimeout(this.timeout);
     if (this.dryRun) child.setDryRun(true);
@@ -1158,11 +1159,13 @@ export class PushCommand extends TransportCommand<PushResult> {
     if (this.compatibility) child.setCompatibility(this.compatibility);
     try {
       const result = await child.call();
-      output.text += pushOutputText(result);
+      output.text += `${child.getHookOutput()}${pushOutputText(result)}`;
+      this.hooks.appendStdout(child.getHookStdout());
       return pushSucceeded(result);
     } catch (error) {
       if (!(error instanceof Error)) throw error;
-      output.text += `${error.message.replace(/\n$/, "")}\n`;
+      output.text += `${child.getHookOutput()}${error.message.replace(/\n$/, "")}\n`;
+      this.hooks.appendStdout(child.getHookStdout());
       return false;
     }
   }

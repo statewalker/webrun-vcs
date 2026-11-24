@@ -1238,7 +1238,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     ];
     const runFetch = async (task: SubmoduleFetchTask): Promise<SubmoduleFetchRun> => {
       const child = new FetchCommand(task.workingCopy);
-      child.shareHooksOf(this);
+      // git's child `git fetch` runs in the submodule: its own hooks (reference-transaction
+      // of the submodule's refs), their output relayed where the child prints it
       child.setTransports(transports);
       if (this.timeout) child.setTimeout(this.timeout);
       if (this.gzipRequests !== undefined) child.setGzipRequests(this.gzipRequests);
@@ -1267,10 +1268,17 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       child.setSubmoduleContext(task.defaultMode, task.prefix, args);
       try {
         const result = await child.call();
-        return { text: fetchOutputText(result, this.quiet), ok: fetchSucceeded(result), result };
+        return {
+          text: `${child.getHookOutput()}${fetchOutputText(result, this.quiet)}`,
+          ok: fetchSucceeded(result),
+          result,
+        };
       } catch (error) {
         if (!(error instanceof Error)) throw error;
-        return { text: `${error.message.replace(/\n$/, "")}\n`, ok: false };
+        return {
+          text: `${child.getHookOutput()}${error.message.replace(/\n$/, "")}\n`,
+          ok: false,
+        };
       }
     };
     const outcome = await fetchSubmodules(this.workingCopy, {

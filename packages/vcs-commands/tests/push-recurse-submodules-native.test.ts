@@ -37,6 +37,9 @@ let ours: string;
 
 /** The repositories whose refs are compared after each push. */
 const REPOS = [
+  "hk/up.git",
+  "hk/sup.git",
+  "hk/work",
   "pub.git",
   "submodule.git",
   "work",
@@ -129,13 +132,18 @@ async function push(cwd: string, argv: string[]): Promise<void> {
       const result = await configurePush(command, rest).call();
       return {
         exitCode: pushSucceeded(result) ? 0 : 1,
-        lines: kept(pushOutputText(result)).filter((l) => !l.startsWith("error: failed to push")),
+        // the superproject's hooks (pre-push) write before its submodules' pushes
+        lines: kept(`${command.getHookOutput()}${pushOutputText(result)}`).filter(
+          (l) => !l.startsWith("error: failed to push"),
+        ),
       };
     } catch (error) {
       const err = error as Error & { exitCode?: number };
       return {
         exitCode: err.exitCode ?? 128,
-        lines: kept(`${err.message}\n`).filter((l) => !l.startsWith("error: failed to push")),
+        lines: kept(`${command.getHookOutput()}${err.message}\n`).filter(
+          (l) => !l.startsWith("error: failed to push"),
+        ),
       };
     }
   })().catch((error: Error & { exitCode?: number }) => ({
@@ -342,5 +350,18 @@ git -C work commit -qm "updating gar/bage in branch2"`);
       "origin",
       "HEAD:refs/heads/branch2",
     ]);
+  });
+  it("each repository's pre-push hook runs for its own push (the submodule's push runs in the submodule)", async () => {
+    const hook = (dir: string, name: string, code: number) =>
+      `printf '#!/bin/sh\\necho "${name} pre-push $1" >&2\\nexit ${code}\\n' > ${dir}/pre-push; chmod +x ${dir}/pre-push`;
+    both(`mkdir hk; cd hk; git init -q --bare up.git; git init -q --bare sup.git
+git clone -q up.git upw 2>/dev/null; (cd upw; echo a > a; git add a; git commit -qm a; git push -q origin main)
+git clone -q sup.git work 2>/dev/null; cd work; echo s > s; git add s; git commit -qm s
+git submodule add -q ../up.git sub; git commit -qm "add sub"; git push -q origin main
+(cd sub; echo b > b; git add b; git commit -qm b); git add sub; git commit -qm "move sub"
+${hook(".git/hooks", "super", 0)}; ${hook(".git/modules/sub/hooks", "sub", 1)}`);
+    await push("hk/work", ["push", "--recurse-submodules=on-demand", "origin", "main"]);
+    both(hook("hk/work/.git/modules/sub/hooks", "sub", 0));
+    await push("hk/work", ["push", "--recurse-submodules=on-demand", "origin", "main"]);
   });
 });

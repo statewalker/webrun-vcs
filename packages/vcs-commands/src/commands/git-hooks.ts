@@ -865,6 +865,11 @@ export class HookSession {
     return this.stdoutChunks.join("");
   }
 
+  /** Text added to what hooks wrote on git's stdout (a child git's pre-push hook's). */
+  appendStdout(text: string): void {
+    if (text) this.stdoutChunks.push(text);
+  }
+
   /** Text added to the output, as git writes its own messages between the hooks' output. */
   append(text: string): void {
     if (text) this.chunks.push(text);
