@@ -130,10 +130,11 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
 
   /**
    * What git printed on stderr while reading the revisions and still went on (`warning: log
-   * for 'HEAD' only goes back to ...`), once called.
+   * for 'HEAD' only goes back to ...`), then what the log printed there (see
+   * `LogCommand.warnings`: the mailmap's errors), once called.
    */
   getWarnings(): string[] {
-    return [...this.warnings];
+    return [...this.warnings, ...(this.log?.warnings ?? [])];
   }
 
   /** `--all`: every ref under `refs/` (in name order), then HEAD. */
