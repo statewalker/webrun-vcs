@@ -567,7 +567,8 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
 
   private makeIO(
     worktree: Worktree | undefined,
-    trust: { executable?: boolean; symlinks?: boolean },
+    /** worktreeModeTrust: modes, and what ce_match_stat_basic compares (ctime, fullStat) */
+    trust: { executable?: boolean; symlinks?: boolean; ctime?: boolean; fullStat?: boolean },
     filter:
       | {
           checkin?: (path: string) => Promise<
@@ -671,9 +672,14 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
         const staged = await this.staging.getEntry(toPath(name));
         if (!staged) return false;
         // ie_match_stat: a file whose stat matches an entry older than the index is clean
-        // unread; only a racy one is read (and converted, building convert.c's stack)
+        // unread; only a racy one is read (and converted, building convert.c's stack). The
+        // stat compared is core.trustctime's and core.checkStat's (ctime, inode and owner)
         const cmp = await compareWithWorktree(worktree, staged, {
-          trust: { executable: trust.executable !== false, symlinks: trust.symlinks !== false },
+          trust: {
+            ...trust,
+            executable: trust.executable !== false,
+            symlinks: trust.symlinks !== false,
+          },
           indexTime: this.staging.getUpdateTime(),
         });
         return cmp.kind === undefined;

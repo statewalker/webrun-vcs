@@ -9,6 +9,7 @@
  */
 import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -818,6 +819,58 @@ describeGit("git apply as native git", () => {
       );
       const eol = readFileSync(join(pair.native, "m.txt"), "latin1").includes("\r") ? "crlf" : "lf";
       expect(eol, `racy=${racy}`).toBe(racy ? "crlf" : "lf");
+    }
+  }, 60_000);
+
+  it("verifies the index by the stat core.trustctime and core.checkStat compare", async () => {
+    // ie_match_stat compares ctime only under core.trustctime (and inode, owner and group
+    // only without core.checkStat=minimal): a chmod after the commit, a second later, moves
+    // the files' ctime alone, which leaves them clean by their stat, unread (no conversion
+    // before the patch's .gitattributes is written: LF), unless the entry is racy (CRLF)
+    const build: Setup = (d) => {
+      put(d, ".gitattributes", "*.txt text eol=crlf\n");
+      put(d, "m.txt", "m\n");
+    };
+    const { patch } = nativeDiff(build, (d) => {
+      put(d, ".gitattributes", "*.txt text eol=lf\n");
+      put(d, "m.txt", "m\nn\n");
+      put(d, "new.txt", "new\n");
+    });
+    const files = [".gitattributes", "m.txt"];
+    const dated =
+      (config: [string, string], racy: boolean): Setup =>
+      (d) => {
+        gitOk(d, "config", ...config);
+        const past = new Date(Date.now() - 60_000);
+        build(d);
+        if (!racy) for (const p of files) utimesSync(join(d, p), past, past);
+        gitOk(d, "add", "-A");
+        gitOk(d, "commit", "-q", "-m", "base");
+        if (racy) utimesSync(join(d, ".git/index"), past, past);
+      };
+    for (const config of [
+      ["core.trustctime", "false"],
+      ["core.checkStat", "minimal"],
+    ] as [string, string][]) {
+      for (const racy of [true, false]) {
+        const label = `${config.join("=")} racy=${racy}`;
+        const pair = twins(dated(config, racy));
+        // the ctime moves to a later second than the one the index recorded
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+        for (const dir of [pair.native, pair.ours]) {
+          for (const p of files) chmodSync(join(dir, p), 0o644);
+        }
+        await compareApply(
+          pair,
+          patch,
+          { args: ["--index"], configure: (c) => c.setIndex(true) },
+          label,
+        );
+        const eol = readFileSync(join(pair.native, "m.txt"), "latin1").includes("\r")
+          ? "crlf"
+          : "lf";
+        expect(eol, label).toBe(racy ? "crlf" : "lf");
+      }
     }
   }, 60_000);
 
