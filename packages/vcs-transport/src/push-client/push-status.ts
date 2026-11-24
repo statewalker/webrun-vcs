@@ -164,6 +164,8 @@ export interface PushStatusSource {
   stateless?: boolean;
   /** The server's report was broken (`PushClientResult.reportFailed`): no `Done` */
   reportFailed?: boolean;
+  /** Nothing to push to a remote with no refs (`PushClientResult.noRefsInCommon`) */
+  noRefsInCommon?: boolean;
 }
 
 /**
@@ -176,6 +178,13 @@ export function formatPushStatus(
   result: PushStatusSource,
   options: FormatPushStatusOptions,
 ): string[] {
+  // send_pack's message (its stderr, porcelain or not); the push then fails on the hang-up
+  if (result.noRefsInCommon) {
+    return [
+      "No refs in common and none specified; doing nothing.",
+      "Perhaps you should specify a branch.",
+    ];
+  }
   const lengths = result.abbrevLengths;
   const width =
     result.summaryWidth ??

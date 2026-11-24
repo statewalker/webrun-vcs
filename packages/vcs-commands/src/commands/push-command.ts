@@ -1,5 +1,6 @@
 import { isValidRefName, parseCoreAbbrev } from "@statewalker/vcs-core";
 import {
+  countRefspecMatch,
   createRepositoryFacade,
   createTransportRefStore,
   expandFromSource,
@@ -12,6 +13,7 @@ import {
   PushCertificateError,
   type PushClientResult,
   type PushCommandResult,
+  PushRefspecError,
   type PushRefUpdate,
   PushRefusedByHookError,
   parseRefSpec,
@@ -23,7 +25,9 @@ import { isNullObjectId } from "@statewalker/vcs-utils/hash";
 
 import {
   HookFailedError,
+  IncompatibleOptionsError,
   InvalidArgumentError,
+  InvalidConfigError,
   InvalidRemoteError,
   NonFastForwardError,
   PushRejectedException,
@@ -159,6 +163,57 @@ export class PushCommand extends TransportCommand<PushResult> {
   private followTags?: boolean;
   /** `--[no-]force-if-includes` (undefined: `push.useForceIfIncludes`) */
   private forceIfIncludes?: boolean;
+  /** `--mirror` (undefined: `remote.<name>.mirror`) */
+  private mirror?: boolean;
+  /** `-d` / `--delete` */
+  private deleteRefs = false;
+  /** Whose messages to give where git 2.43 and 2.5x differ (undefined: the hook runner's) */
+  private compatibility?: "2.43" | "2.56";
+
+  /**
+   * `--mirror` (true): every local ref (`refs/*`) is pushed to the same name, forced, and every
+   * remote ref without a local one is deleted, as git's `TRANSPORT_PUSH_MIRROR`. Undefined
+   * (the default) reads `remote.<name>.mirror` of a configured remote; false is no mirror,
+   * whatever that says. A mirror push takes no refspecs, nor `setPushAll`, `setPushTags` or
+   * `setDelete` (git's refusals).
+   */
+  setMirror(mirror: boolean | undefined): this {
+    this.checkCallable();
+    this.mirror = mirror;
+    return this;
+  }
+
+  /** `--mirror` as set (undefined: `remote.<name>.mirror` decides in `call`). */
+  isMirror(): boolean | undefined {
+    return this.mirror;
+  }
+
+  /**
+   * `-d` / `--delete`: each refspec is a remote ref to delete (`main` as `:main`, `tag v1` as
+   * `:refs/tags/v1`); a `src:dst` refspec or an empty one is refused, and so is a delete with
+   * no refspec, `setPushAll`, `setPushTags` or `setMirror`, as git refuses them.
+   */
+  setDelete(deleteRefs: boolean): this {
+    this.checkCallable();
+    this.deleteRefs = deleteRefs;
+    return this;
+  }
+
+  /** Whether `setDelete` is on. */
+  isDelete(): boolean {
+    return this.deleteRefs;
+  }
+
+  /**
+   * Whose messages to give where git 2.43 and 2.5x differ (the incompatible options of
+   * `--delete`, `--tags`, `--all` and `--mirror`, and when they are checked). Default: the hook
+   * runner's compatibility, else 2.56.
+   */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
 
   /**
    * `-u` / `--set-upstream`: each local branch pushed to a remote branch (accepted or already
@@ -467,7 +522,10 @@ export class PushCommand extends TransportCommand<PushResult> {
    * Set push options associated with the push operation.
    *
    * Push options are strings passed to the receive-pack on the server
-   * side, where they can be used by hooks.
+   * side, where they can be used by hooks (`GIT_PUSH_OPTION_COUNT`, `GIT_PUSH_OPTION_<n>`).
+   * As git's `-o`: when none are given, `push.pushOption` gives them (each value added in
+   * order, an empty value clearing the list). A server that does not advertise them
+   * (`receive.advertisePushOptions`) refuses the push before anything is sent.
    *
    * @param options Push option strings
    */
@@ -522,6 +580,22 @@ export class PushCommand extends TransportCommand<PushResult> {
   async call(): Promise<PushResult> {
     this.checkCallable();
     this.setCallable(false);
+    const compatibility = this.compatibility ?? this.hooks.compatibility;
+
+    // git_push_config: push.pushOption is read (and a bad one dies) before anything else;
+    // the command line's options replace the configured ones
+    const configuredOptions = this.configuredPushOptions();
+    const transmitted = this.pushOptions.length > 0 ? this.pushOptions : configuredOptions;
+    this.checkOptionCombinations(compatibility);
+    if (this.deleteRefs && this.refSpecs.length === 0) {
+      throw new InvalidArgumentError(
+        "refspecs",
+        undefined,
+        "--delete doesn't make sense without any refs",
+      );
+    }
+    // 2.43 checks the refspecs given before it looks the remote up
+    if (compatibility === "2.43") this.checkRefspecArguments();
 
     // pushremote_get(NULL): the push remote the configuration names for the current branch
     if (!this.remoteGiven) {
@@ -546,18 +620,43 @@ export class PushCommand extends TransportCommand<PushResult> {
         this.remote,
         "No configured push destination.\nEither specify the URL from the command-line or " +
           "configure a remote repository using\n\n    git remote add <name> <url>\n\n" +
-          "and then push using the remote name\n\n    git push <name>",
+          "and then push using the remote name\n\n    git push <name>" +
+          // 2.5x's remote groups
+          (compatibility === "2.43"
+            ? ""
+            : "\n\nTo push to multiple remotes at once, configure a remote group using\n\n" +
+              '    git config remotes.<groupname> "<remote1> <remote2>"\n\n' +
+              "and then push using the group name\n\n    git push <groupname>"),
       );
     }
     const remoteUrl = await this.resolveRemoteUrl(this.remote);
     if (!remoteUrl) {
       throw new InvalidRemoteError(this.remote);
     }
+    // a mirror remote (remote.<name>.mirror) pushes as --mirror; --mirror implies --force
+    const mirror = this.mirror ?? this.remoteMirror();
+    const checks = this.remoteChecks(compatibility, mirror);
+    if (compatibility === "2.43") checks();
+    for (const option of transmitted) {
+      if (option.includes("\n")) {
+        throw new InvalidArgumentError(
+          "pushOptions",
+          option,
+          "push options must not have new line characters",
+        );
+      }
+    }
+    if (compatibility !== "2.43") {
+      checks();
+      this.checkRefspecArguments();
+    }
 
     // transport_get: the remote's transport is decided (git's errors for one that cannot be
     // reached) before the refspecs are worked out
     const resolved = this.resolveRemote(remoteUrl);
-    const refspecs = await this.buildRefSpecs();
+    const defaults = { setUpstream: false };
+    const refspecs = await this.buildRefSpecs(mirror, defaults, compatibility);
+    const setUpstream = this.setUpstream || defaults.setUpstream;
     if (refspecs.length === 0) {
       return {
         uri: remoteUrl,
@@ -572,7 +671,7 @@ export class PushCommand extends TransportCommand<PushResult> {
     const remote = await this.openRemote(resolved);
     const localRemote = remote.kind === "local" ? remote.repository : undefined;
     const history = this._workingCopy.history;
-    const tracking = this.trackingRefMapper();
+    const tracking = this.trackingRefMapper(remoteUrl, compatibility);
     const messages: string[] = [];
     const leases = this.leases;
     const repository = createRepositoryFacade({
@@ -594,14 +693,15 @@ export class PushCommand extends TransportCommand<PushResult> {
       repository,
       refStore: createTransportRefStore(history.refs),
       refspecs,
-      force: this.force,
+      force: this.force || mirror,
       atomic: this.atomic,
       ...(this.pushCertMode() ? { signed: this.pushCertMode() } : {}),
       thin: this.thin,
       dryRun: this.dryRun,
       prune: this.prune,
+      mirror,
       streamRequestBody: this.streamRequestBody,
-      pushOptions: this.pushOptions.length > 0 ? this.pushOptions : undefined,
+      pushOptions: transmitted.length > 0 ? transmitted : undefined,
       forceWithLease: leases,
       trackingValue: async (remoteRef) => {
         const local = tracking(remoteRef);
@@ -663,6 +763,26 @@ export class PushCommand extends TransportCommand<PushResult> {
         },
       );
     } catch (error) {
+      // match_push_refs' refusals: errors (git exits 1 with "failed to push some refs"), or
+      // deaths for a refspec or a lease it cannot parse
+      if (error instanceof PushRefspecError) {
+        if (/^(invalid refspec|cannot parse expected object name) /.test(error.message)) {
+          throw new TransportError(`fatal: ${error.message}`, undefined, { cause: error });
+        }
+        throw new TransportError(
+          `error: ${error.message}\nerror: failed to push some refs to '${remoteUrl}'`,
+          undefined,
+          { cause: error, exitCode: 1 },
+        );
+      }
+      // send_pack dies: --atomic or push options the server does not advertise
+      if (
+        error instanceof Error &&
+        !(error instanceof TransportError) &&
+        /^the receiving end does not support (--atomic push|push options)$/.test(error.message)
+      ) {
+        throw new TransportError(`fatal: ${error.message}`, undefined, { cause: error });
+      }
       // send_pack dies: the remote's repository names objects with another hash
       if (error instanceof ObjectFormatMismatchError) {
         throw new TransportError(`fatal: ${error.message}`, undefined, { cause: error });
@@ -692,7 +812,7 @@ export class PushCommand extends TransportCommand<PushResult> {
     }
 
     // transport_push: set_upstreams, before the remote-tracking refs are updated
-    const upstreamMessages = this.setUpstream ? await this.setUpstreams(result.updates) : [];
+    const upstreamMessages = setUpstream ? await this.setUpstreams(result.updates) : [];
 
     // git updates the remote-tracking refs of what the server accepted, and of what it had
     // already (transport.c: update_tracking_ref for ok and up-to-date refs)
@@ -803,7 +923,9 @@ export class PushCommand extends TransportCommand<PushResult> {
       porcelain: formatPushStatus(result, { dest: remoteUrl, porcelain: true }),
       ...(trackingErrors.length ? { errors: trackingErrors } : {}),
       ...(upstreamMessages.length ? { upstreamMessages } : {}),
-      ...(result.reportFailed ? { failed: true } : {}),
+      // send_pack left at once (nothing to push to a remote without refs): the receiving end
+      // hung up, and git fails
+      ...(result.reportFailed || result.noRefsInCommon ? { failed: true } : {}),
     };
   }
 
@@ -952,9 +1074,189 @@ export class PushCommand extends TransportCommand<PushResult> {
   }
 
   /**
-   * The refspecs to push: the explicit ones, `--all` (every branch), `--tags` (every tag);
-   * else the remote's configured push refspecs; else what `push.default` says (git's
-   * builtin/push.c `setup_default_push_refspecs`, default `simple`):
+   * `push.pushOption` in config order (git's `parse_transport_option`): each value added, an
+   * empty one clearing the list; a value-less one dies as git's config reader dies.
+   */
+  private configuredPushOptions(): string[] {
+    const key = "push.pushoption";
+    const out: string[] = [];
+    for (const { text, file, line } of RemoteConfigStore.from(this._workingCopy).valuesWithOrigin(
+      "push.pushOption",
+    )) {
+      if (text === undefined) {
+        const fatal =
+          file !== undefined && line !== undefined
+            ? `fatal: bad config variable '${key}' in file '${file}' at line ${line}`
+            : `fatal: unable to parse '${key}' from command-line config`;
+        throw new InvalidConfigError(key, `error: missing value for '${key}'\n${fatal}`);
+      }
+      if (text === "") out.length = 0;
+      else out.push(text);
+    }
+    return out;
+  }
+
+  /**
+   * The options that cannot go together: 2.5x's `die_for_incompatible_opt4` (`--delete`,
+   * `--tags`, `--all/--branches`, `--mirror`, all named), 2.43's `--delete` with any of the
+   * others (the rest it checks once the remote is known, `remoteChecks`).
+   */
+  private checkOptionCombinations(compatibility: "2.43" | "2.56"): void {
+    if (compatibility === "2.43") {
+      if (this.deleteRefs && (this.pushTags || this.pushAll || this.mirror)) {
+        throw new IncompatibleOptionsError(
+          ["--delete", "--all/--branches/--mirror/--tags"],
+          "options '--delete' and '--all/--branches/--mirror/--tags' cannot be used together",
+        );
+      }
+      return;
+    }
+    const given = [
+      this.deleteRefs && "--delete",
+      this.pushTags && "--tags",
+      this.pushAll && "--all/--branches",
+      this.mirror && "--mirror",
+    ].filter((o): o is string => typeof o === "string");
+    if (given.length < 2) return;
+    const quoted = given.map((o) => `'${o}'`);
+    const list =
+      quoted.length === 2
+        ? `${quoted[0]} and ${quoted[1]}`
+        : `${quoted.slice(0, -1).join(", ")}, and ${quoted.at(-1)}`;
+    throw new IncompatibleOptionsError(given, `options ${list} cannot be used together`);
+  }
+
+  /** `remote.<name>.mirror` of a configured remote (git_config_bool). */
+  private remoteMirror(): boolean {
+    const store = RemoteConfigStore.from(this._workingCopy);
+    if (!store.isConfigured(this.remote)) return false;
+    const value = store.value(`remote.${this.remote}.mirror`);
+    return value === undefined ? false : (parseGitBool(value) ?? false);
+  }
+
+  /**
+   * The checks git makes once the remote is known (a mirror remote counts as `--mirror`):
+   * `--all` or `--mirror` with refspecs, and in 2.43 their combinations with `--tags` and
+   * each other.
+   */
+  private remoteChecks(compatibility: "2.43" | "2.56", mirror: boolean): () => void {
+    const refused = (options: string[], message: string) => {
+      throw new IncompatibleOptionsError(options, message);
+    };
+    const together = (a: string, b: string) =>
+      refused([a, b], `options '${a}' and '${b}' cannot be used together`);
+    return () => {
+      const legacy = compatibility === "2.43";
+      if (this.pushAll) {
+        if (legacy && this.pushTags) together("--all", "--tags");
+        if (this.refSpecs.length > 0) {
+          refused(["--all"], "--all can't be combined with refspecs");
+        }
+      }
+      if (mirror) {
+        if (legacy && this.pushTags) together("--mirror", "--tags");
+        if (this.refSpecs.length > 0) {
+          refused(["--mirror"], "--mirror can't be combined with refspecs");
+        }
+      }
+      if (legacy && this.pushAll && mirror) together("--all", "--mirror");
+    };
+  }
+
+  /** set_refspecs' refusals of the refspecs given: `tag` without a name, `--delete` of `a:b`. */
+  private checkRefspecArguments(): void {
+    const refs = this.refSpecs;
+    for (let i = 0; i < refs.length; i++) {
+      const ref = refs[i] as string;
+      if (ref === "tag") {
+        if (++i >= refs.length) {
+          throw new InvalidArgumentError("refspecs", ref, "tag shorthand without <tag>");
+        }
+      } else if (this.deleteRefs && (ref === "" || ref.includes(":"))) {
+        throw new InvalidArgumentError(
+          "refspecs",
+          ref,
+          "--delete only accepts plain target ref names",
+        );
+      }
+    }
+  }
+
+  /**
+   * git's `set_refspecs`: the refspecs given, `tag <name>` as `refs/tags/<name>`, each a
+   * deletion under `--delete`; a name without `:` that names exactly one local ref goes where
+   * `remote.<name>.push` maps that ref, else (`push.default=upstream`) a branch to its single
+   * upstream (`refspec_append_mapped`).
+   */
+  private async givenRefspecs(): Promise<string[]> {
+    const out: string[] = [];
+    const refs = this.refSpecs;
+    let local: string[] | undefined;
+    for (let i = 0; i < refs.length; i++) {
+      let ref = refs[i] as string;
+      if (ref === "tag") {
+        ref = refs[++i] as string;
+        out.push(this.deleteRefs ? `:refs/tags/${ref}` : `refs/tags/${ref}`);
+      } else if (this.deleteRefs) {
+        out.push(`:${ref}`);
+      } else if (!ref.includes(":")) {
+        local ??= [...(await createTransportRefStore(this._workingCopy.history.refs).listAll())]
+          .map(([name]) => name)
+          .filter((name) => name.startsWith("refs/"));
+        const { count, match } = countRefspecMatch(ref, local);
+        out.push(count === 1 && match ? this.mappedRefspec(ref, match) : ref);
+      } else {
+        out.push(ref);
+      }
+    }
+    return out;
+  }
+
+  /** git's `refspec_append_mapped`: where `ref` (naming the local ref `matched`) is pushed. */
+  private mappedRefspec(ref: string, matched: string): string {
+    const store = RemoteConfigStore.from(this._workingCopy);
+    if (store.isConfigured(this.remote)) {
+      for (const text of store.pushRefspecs(this.remote)) {
+        const spec = parseRefSpec(text);
+        if (spec.negative || !spec.source || !matchSource(spec, matched)) continue;
+        const dst = spec.wildcard
+          ? expandFromSource(spec, matched).destination
+          : (spec.destination ?? spec.source);
+        if (dst) return `${spec.force ? "+" : ""}${matched}:${dst}`;
+      }
+    }
+    if (this.pushDefault() === "upstream" && matched.startsWith("refs/heads/")) {
+      const merges = this.upstreamsOf(matched.slice("refs/heads/".length));
+      if (merges.length === 1) return `${ref}:${merges[0]}`;
+    }
+    return ref;
+  }
+
+  /**
+   * `push.default` as git reads it: `tracking` is `upstream`; undefined when unset (git's
+   * `PUSH_DEFAULT_UNSPECIFIED`, which acts as `simple`).
+   */
+  private pushDefault(): string | undefined {
+    const value = RemoteConfigStore.from(this._workingCopy).value("push.default");
+    return value === "tracking" ? "upstream" : value;
+  }
+
+  /**
+   * A branch's upstream merges (`branch.<name>.merge`), counted only while it has a remote
+   * (`branch.<name>.remote`), as remote.c's `set_merge`.
+   */
+  private upstreamsOf(branch: string): string[] {
+    const store = RemoteConfigStore.from(this._workingCopy);
+    if (!store.value(`branch.${branch}.remote`)) return [];
+    return store.values(`branch.${branch}.merge`);
+  }
+
+  /**
+   * The refspecs to push: `--mirror` (`:` over every ref, see `PushClientOptions.mirror`),
+   * `--tags`, the refspecs
+   * given (`givenRefspecs`), `--all` (every branch); else the remote's configured push
+   * refspecs; else what `push.default` says (git's builtin/push.c
+   * `setup_default_push_refspecs`, default `simple`):
    *
    * - `simple`: the current branch to its upstream of the same name when pushing to the
    *   branch's own remote (refused without an upstream, or with one of another name); to the
@@ -964,12 +1266,21 @@ export class PushCommand extends TransportCommand<PushResult> {
    * - `matching`: `:` (the branches both sides have)
    * - `nothing`: refused
    *
-   * A detached HEAD is refused, except with `matching`.
+   * A detached HEAD is refused, except with `matching`. Under `push.autoSetupRemote` a branch
+   * without an upstream is pushed to its own name and gets it as its upstream
+   * (`defaults.setUpstream`).
    */
-  private async buildRefSpecs(): Promise<string[]> {
-    const specs = [...this.refSpecs];
-    if (this.pushAll) specs.push("refs/heads/*:refs/heads/*");
+  private async buildRefSpecs(
+    mirror: boolean,
+    defaults: { setUpstream: boolean },
+    compatibility: "2.43" | "2.56",
+  ): Promise<string[]> {
+    // --mirror: ":" over every ref (only a mirror remote's --tags narrows it, in 2.5x)
+    if (mirror) return this.pushTags ? ["refs/tags/*:refs/tags/*"] : [":"];
+    if (this.pushAll) return ["refs/heads/*:refs/heads/*"];
+    const specs: string[] = [];
     if (this.pushTags) specs.push("refs/tags/*:refs/tags/*");
+    specs.push(...(await this.givenRefspecs()));
     if (specs.length > 0) return specs;
 
     const store = RemoteConfigStore.from(this.workingCopy);
@@ -977,7 +1288,7 @@ export class PushCommand extends TransportCommand<PushResult> {
       const configured = store.pushRefspecs(this.remote);
       if (configured.length > 0) return configured;
     }
-    const mode = (store.value("push.default") ?? "simple").toLowerCase();
+    const mode = this.pushDefault();
     if (mode === "matching") return [":"];
     if (mode === "nothing") {
       throw new InvalidArgumentError(
@@ -993,62 +1304,128 @@ export class PushCommand extends TransportCommand<PushResult> {
       throw new InvalidArgumentError(
         "refspecs",
         undefined,
-        "You are not currently on a branch. To push the history leading to the current " +
-          "(detached HEAD) state now, use git push <remote> HEAD:<name-of-remote-branch>",
+        "You are not currently on a branch.\n" +
+          "To push the history leading to the current (detached HEAD)\n" +
+          "state now, use\n\n" +
+          `    git push ${this.remote} HEAD:<name-of-remote-branch>\n`,
       );
     }
     const branch = ref.slice("refs/heads/".length);
-    if (mode === "current") return [`${ref}:${ref}`];
-
-    // the branch's remote (git's remote_for_branch: branch.<name>.remote, the one configured
-    // remote, else "origin") and upstream
-    const branchRemote = store.remoteForBranch(branch);
-    const merge = store.value(`branch.${branch}.merge`);
-    const triangular = this.remote !== branchRemote;
-    const noUpstream = () =>
-      new InvalidArgumentError(
-        "refspecs",
-        undefined,
-        `The current branch ${branch} has no upstream branch. To push the current branch and ` +
-          `set the remote as upstream, use git push --set-upstream ${this.remote} ${branch}`,
-      );
-    if (mode === "upstream" || mode === "tracking") {
-      if (triangular) {
+    const autoUpstream = this.configBool("push.autoSetupRemote") ?? false;
+    const merges = this.upstreamsOf(branch);
+    // get_upstream_ref
+    const upstreamRef = (): string => {
+      if (merges.length === 0 && autoUpstream) return ref;
+      if (merges.length === 0) {
         throw new InvalidArgumentError(
           "refspecs",
           undefined,
-          `You are pushing to remote '${this.remote}', which is not the upstream of your ` +
-            `current branch '${branch}', without telling me what to push to update which ` +
-            "remote branch.",
+          `The current branch ${branch} has no upstream branch.\n` +
+            "To push the current branch and set the remote as upstream, use\n\n" +
+            `    git push --set-upstream ${this.remote} ${branch}\n` +
+            (autoUpstream
+              ? ""
+              : "\nTo have this happen automatically for branches without a tracking\n" +
+                "upstream, see 'push.autoSetupRemote' in 'git help config'.\n"),
         );
       }
-      if (!merge) throw noUpstream();
-      return [`${ref}:${merge}`];
+      if (merges.length !== 1) {
+        throw new InvalidArgumentError(
+          "refspecs",
+          undefined,
+          `The current branch ${branch} has multiple upstream branches, refusing to push.`,
+        );
+      }
+      return merges[0] as string;
+    };
+    // 2.5x: remote_for_branch (branch.<name>.remote, the one configured remote, else
+    // "origin") names the pushed-to remote; 2.43's is_workflow_triangular: the fetch remote
+    // (remote_get(NULL)) exists and is another one
+    // remote_state's remotes are the configured ones and the one pushed to (a URL is made a
+    // remote of its own by remote_get), so pushing to a URL from a repository without
+    // remotes counts that URL as "the one remote"
+    const own = store.value(`branch.${branch}.remote`);
+    const known = new Set(store.configuredNames());
+    known.add(this.remote);
+    const fetchName = own ?? (known.size === 1 ? this.remote : "origin");
+    const fetchValid =
+      own !== undefined || fetchName === this.remote || store.isConfigured(fetchName);
+    const sameRemote =
+      compatibility === "2.43"
+        ? !(fetchValid && fetchName !== this.remote)
+        : this.remote === fetchName;
+    let dst = ref;
+    if (mode === "current") {
+      // the same name
+    } else if (mode === "upstream") {
+      if (!sameRemote) {
+        throw new InvalidArgumentError(
+          "refspecs",
+          undefined,
+          `You are pushing to remote '${this.remote}', which is not the upstream of\n` +
+            `your current branch '${branch}', without telling me what to push\n` +
+            "to update which remote branch.",
+        );
+      }
+      dst = upstreamRef();
+    } else if (sameRemote) {
+      // simple, unspecified (and anything git does not know)
+      const upstream = upstreamRef();
+      if (upstream !== ref) throw this.simpleRefusal(upstream, mode === undefined);
     }
-    // simple (and anything unknown, as git's default)
-    if (triangular) return [`${ref}:${ref}`];
-    if (!merge) throw noUpstream();
-    if (merge !== ref) {
-      throw new InvalidArgumentError(
-        "refspecs",
-        undefined,
-        "The upstream branch of your current branch does not match\n" +
-          `the name of your current branch. To push to the upstream branch on the remote, use\n` +
-          `    git push ${this.remote} HEAD:${merge.replace(/^refs\/heads\//, "")}`,
-      );
-    }
-    return [`${ref}:${ref}`];
+    if (autoUpstream && merges.length === 0) defaults.setUpstream = true;
+    return [`${ref}:${dst}`];
+  }
+
+  /** builtin/push.c's `die_push_simple`: an upstream of another name than the branch. */
+  private simpleRefusal(upstream: string, unspecified: boolean): InvalidArgumentError {
+    const short = upstream.startsWith("refs/heads/")
+      ? upstream.slice("refs/heads/".length)
+      : upstream;
+    const autoSetupMerge = RemoteConfigStore.from(this._workingCopy).value("branch.autoSetupMerge");
+    return new InvalidArgumentError(
+      "refspecs",
+      undefined,
+      "The upstream branch of your current branch does not match\n" +
+        "the name of your current branch.  To push to the upstream branch\n" +
+        "on the remote, use\n\n" +
+        `    git push ${this.remote} HEAD:${short}\n\n` +
+        "To push to the branch of the same name on the remote, use\n\n" +
+        `    git push ${this.remote} HEAD\n` +
+        (unspecified
+          ? "\nTo choose either option permanently, see push.default in 'git help config'.\n"
+          : "") +
+        (autoSetupMerge !== "simple"
+          ? "\nTo avoid automatically configuring an upstream branch when its name\n" +
+            "won't match the local branch, see option 'simple' of branch.autoSetupMerge\n" +
+            "in 'git help config'.\n"
+          : ""),
+    );
   }
 
   /**
    * The remote-tracking ref of a remote ref (`refs/heads/main` → `refs/remotes/origin/main`)
-   * through the named remote's fetch refspecs; none for a URL.
+   * through the named remote's fetch refspecs; for a URL, none (2.5x: those of the one remote
+   * pushing to that URL).
    */
-  private trackingRefMapper(): (remoteRef: string) => string | undefined {
+  private trackingRefMapper(
+    remoteUrl: string,
+    compatibility: "2.43" | "2.56",
+  ): (remoteRef: string) => string | undefined {
     const store = RemoteConfigStore.from(this.workingCopy);
-    if (!store.isConfigured(this.remote)) return () => undefined;
+    let tracking = this.remote;
+    if (!store.isConfigured(this.remote)) {
+      // 2.5x's remote_for_push_tracking: a URL that is the push URL of exactly one configured
+      // remote updates that remote's tracking refs
+      if (compatibility === "2.43") return () => undefined;
+      const matches = store
+        .configuredNames()
+        .filter((name) => store.remotePushUrls(name).includes(remoteUrl));
+      if (matches.length !== 1) return () => undefined;
+      tracking = matches[0] as string;
+    }
     const specs = store
-      .read(this.remote)
+      .read(tracking)
       .fetchRefspecs.map((spec) => parseRefSpec(spec))
       .filter((spec) => !spec.negative && spec.source && spec.destination);
     return (remoteRef) => {
