@@ -12,7 +12,7 @@ import { type FilesApi, readFile } from "@statewalker/vcs-utils/files";
 import { NodeFilesApi } from "@statewalker/webrun-files-node";
 
 import type { NodeHookRunner } from "./node-hook-runner.js";
-import type { NodeSigner } from "./node-signer.js";
+import type { NodeSigner, NodeVerifier } from "./node-signer.js";
 import { PosixNodeFilesApi, realHostPath, statHostFile } from "./posix-node-files-api.js";
 
 /** Where the files are; each defaults to the process environment, as git reads it. */
@@ -61,6 +61,11 @@ export interface NodeGitHostEnvironmentOptions {
    */
   signer?: NodeSigner;
   /**
+   * Checks signatures (`createNodeVerifier`); absent: every check goes as git's does when gpg
+   * or ssh-keygen cannot be run
+   */
+  verifier?: NodeVerifier;
+  /**
    * The effective user id the ownership checks compare repository owners with (default:
    * `process.geteuid()`, absent on Windows); `null` turns the checks off
    */
@@ -107,6 +112,7 @@ export interface NodeGitHostEnvironment {
   pathspecs?: { literal?: string; glob?: string; noglob?: string; icase?: string };
   hookRunner?: NodeHookRunner;
   signer?: NodeSigner;
+  verifier?: NodeVerifier;
   effectiveUid?: number;
   sudoUid?: string;
   assumeDifferentOwner?: boolean;
@@ -553,6 +559,7 @@ export function createNodeGitHostEnvironment(
     ...(pathspecs ? { pathspecs } : {}),
     ...(options.hookRunner ? { hookRunner: options.hookRunner } : {}),
     ...(options.signer ? { signer: options.signer } : {}),
+    ...(options.verifier ? { verifier: options.verifier } : {}),
     // the ownership checks (safe.directory): the effective uid, sudo's, git's test switch
     ...(effectiveUid !== undefined ? { effectiveUid } : {}),
     ...(env.SUDO_UID !== undefined ? { sudoUid: env.SUDO_UID } : {}),

@@ -49,6 +49,21 @@ export class PullCommand extends TransportCommand<PullResult> {
   private remoteBranchName?: string;
   /** `--rebase` / `--no-rebase`; undefined: branch.<name>.rebase, then pull.rebase */
   private rebase?: boolean;
+  /** `--verify-signatures` / `--no-verify-signatures`, passed to the merge */
+  private verifySignatures?: boolean;
+
+  /**
+   * `--verify-signatures` (true) / `--no-verify-signatures` (false), passed to the merge as
+   * git's pull passes it (see `MergeCommand.setVerifySignatures`; undefined: the merge's
+   * `merge.verifySignatures`). Pulling into an unborn branch checks the commit whichever of
+   * the two is given (pull.c's `pull_into_void`); a rebasing pull ignores
+   * `--verify-signatures` with git's warning.
+   */
+  setVerifySignatures(verify: boolean | undefined): this {
+    this.checkCallable();
+    this.verifySignatures = verify;
+    return this;
+  }
   /** `--autostash` / `--no-autostash`; undefined: pull.autoStash, then rebase.autoStash */
   private autoStash?: boolean;
   private strategy?: MergeStrategy;
@@ -358,6 +373,7 @@ export class PullCommand extends TransportCommand<PullResult> {
     if (origHead === undefined && headNow === undefined) {
       const mergeResult = await new MergeCommand(this._workingCopy)
         .shareHooksOf(this)
+        .setVerifySignatures(this.verifySignatures)
         .callIntoVoid(trackingRefResolved.objectId);
       return {
         fetchResult,
@@ -377,6 +393,10 @@ export class PullCommand extends TransportCommand<PullResult> {
       headId !== undefined &&
       (await this.canFastForward(headId, trackingRefResolved.objectId));
     if (rebase && !canFastForward) {
+      // run_rebase
+      if (this.verifySignatures === true) {
+        warnings = [...warnings, "warning: ignoring --verify-signatures for rebase"];
+      }
       const rebaseResult = await new RebaseCommand(this._workingCopy)
         .shareHooksOf(this)
         .setUpstream(trackingRefResolved.objectId)
@@ -389,7 +409,7 @@ export class PullCommand extends TransportCommand<PullResult> {
         successful: isRebaseSuccessful(rebaseResult.status),
         rebaseUsed: true,
         fetchedFrom: this.remote,
-        ...shown,
+        ...(warnings.length > 0 ? { warnings } : {}),
       };
     }
 
@@ -410,6 +430,8 @@ export class PullCommand extends TransportCommand<PullResult> {
     );
     mergeCommand.setReflogAction(action);
     if (canFastForward) mergeCommand.setFastForwardMode(FastForwardMode.FF_ONLY);
+    if (this.verifySignatures !== undefined)
+      mergeCommand.setVerifySignatures(this.verifySignatures);
     // run_merge passes --autostash / --no-autostash only when pull has one to give
     if (autoStash !== undefined) mergeCommand.setAutoStash(autoStash);
 
