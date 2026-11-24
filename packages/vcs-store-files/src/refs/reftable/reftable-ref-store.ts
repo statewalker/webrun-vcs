@@ -681,6 +681,53 @@ export class ReftableRefStore implements Refs {
   }
 
   /**
+   * git's reftable_be_delete_reflog (`git reflog drop`): one table holding a tombstone for
+   * every live log record of `name` (its existence marker too), so the reflog is gone.
+   */
+  async dropReflog(name: string): Promise<void> {
+    const where = this.stackFor(name);
+    if (!where) throw new RefUpdateRejectedError([{ name, reason: "invalid-name" }]);
+    const tx = new Transaction();
+    try {
+      const addition = await tx.lock(where.stack);
+      const ts = addition.nextUpdateIndex;
+      const logs: ReftableLogWrite[] = [];
+      for (const log of addition.view.logs(where.name)) {
+        if (!log.update) continue;
+        logs.push({ refName: where.name, updateIndex: log.updateIndex });
+      }
+      tx.content(where.stack, { refs: [], logs, maxUpdateIndex: ts });
+      await tx.commit();
+    } catch (error) {
+      await tx.rollback();
+      throw error;
+    }
+  }
+
+  /**
+   * git's ref_transaction_update_reflog (`git reflog write`): one table holding `line` as
+   * `name`'s log record at the next update index, the ref left alone.
+   */
+  async appendReflog(name: string, line: ReflogLine): Promise<void> {
+    const where = this.stackFor(name);
+    if (!where) throw new RefUpdateRejectedError([{ name, reason: "invalid-name" }]);
+    const tx = new Transaction();
+    try {
+      const addition = await tx.lock(where.stack);
+      const ts = addition.nextUpdateIndex;
+      tx.content(where.stack, {
+        refs: [],
+        logs: [this.logLine(where.name, ts, line)],
+        maxUpdateIndex: ts,
+      });
+      await tx.commit();
+    } catch (error) {
+      await tx.rollback();
+      throw error;
+    }
+  }
+
+  /**
    * The names of the refs that have a reflog, in byte order, as git's reflog iterator lists
    * them (gc, fsck): this store's own (a linked worktree's per-worktree refs from its stack,
    * the shared ones from the repository's); with `worktree`, that linked worktree's own refs
