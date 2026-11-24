@@ -638,10 +638,26 @@ export abstract class GitCommand<T> {
 
   /** The stored objects, as {@link storedCommits} reads commits. */
   private historyOf(): NonNullable<WorkingCopy["history"]> {
+    if (this.objectsView) return this.objectsView;
     if (!this._workingCopy.history) {
       throw new Error("WorkingCopy.history is required for commands");
     }
     return this._workingCopy.history;
+  }
+
+  /** The stores this command reads and writes objects through (see {@link setObjectsView}) */
+  private objectsView?: NonNullable<WorkingCopy["history"]>;
+
+  /**
+   * Read and write blobs, trees and commits through `history` instead of the working copy's
+   * stores: a view over them, such as `--remerge-diff`'s in-memory overlay (git's
+   * `tmp_objdir`), so what this command stores never reaches the repository.
+   */
+  setObjectsView(history: NonNullable<WorkingCopy["history"]>): this {
+    this.checkCallable();
+    this.objectsView = history;
+    this.replacedViews = undefined;
+    return this;
   }
 
   /** Whether an object was read through the replacements (git then read them, and printed) */

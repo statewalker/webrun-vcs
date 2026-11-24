@@ -142,6 +142,11 @@ export interface DiffOutputOptions
   /** Length of abbreviated object ids in `index` lines (default 7) */
   abbrev?: number;
   /**
+   * diff.c's `additional_path_headers` (`--remerge-diff`'s `remerge CONFLICT` lines): the
+   * headers shown after a pair's rename lines, by the pair's first name
+   */
+  additionalHeaders?: (name: string) => readonly string[] | undefined;
+  /**
    * The length of each id in `index` lines, as git abbreviates them (`DiffCommand` finds
    * them from `core.abbrev`, the repository's size and the other objects); ids not in it
    * take `abbrev`
@@ -422,6 +427,33 @@ export async function writePairPatch(
   await builtinDiff(sink, pair, options, undefined, report);
 }
 
+/** add_formatted_headers: each line of each header, in the meta color */
+function formattedHeaders(headers: readonly string[], set: string, reset: string): string {
+  let text = "";
+  for (const header of headers) {
+    for (const line of header.split("\n")) text += `${set}${line}${reset}\n`;
+  }
+  return text;
+}
+
+/**
+ * A pair create_filepairs_for_header_only_notifications adds for a path with headers but no
+ * change (`--remerge-diff`): its `diff --git` line and the headers alone.
+ */
+export function writeHeaderOnlyPatch(
+  sink: ByteSink,
+  path: string,
+  headers: readonly string[],
+  options: DiffOutputOptions = {},
+): void {
+  const quote = options.quotePath ?? true;
+  const set = options.colors?.meta ?? "";
+  const reset = options.colors?.reset ?? "";
+  const aOne = quoteTwo(options.srcPrefix ?? "a/", stripSlash(path), quote);
+  const bTwo = quoteTwo(options.dstPrefix ?? "b/", stripSlash(path), quote);
+  sink.text(`${set}diff --git ${aOne} ${bTwo}${reset}\n${formattedHeaders(headers, set, reset)}`);
+}
+
 /** `fill_metainfo`: rename/copy lines and the index line; whether they force the header */
 function metainfo(
   pair: DiffFilePair,
@@ -446,6 +478,11 @@ function metainfo(
   } else if (pair.status === "M" && pair.score) {
     // a broken pair merged back (`-B`): a complete rewrite
     text += `${set}dissimilarity index ${pair.score}%${reset}\n`;
+    mustShow = true;
+  }
+  const more = options.additionalHeaders?.(name);
+  if (more && more.length > 0) {
+    text += formattedHeaders(more, set, reset);
     mustShow = true;
   }
   if (one.id !== two.id) {

@@ -481,7 +481,8 @@ function showDefaults(options: LogOutputOptions, firstParent: boolean): LogOutpu
     !!options.nameStatus ||
     !!options.check ||
     !!options.summary;
-  const mergesGiven = !!options.m || !!options.c || !!options.cc || !!options.diffMerges;
+  const mergesGiven =
+    !!options.m || !!options.c || !!options.cc || !!options.diffMerges || !!options.remergeDiff;
   return {
     ...options,
     ...(!formatGiven && !options.noPatch ? { patch: true } : {}),
