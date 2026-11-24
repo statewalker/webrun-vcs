@@ -67,11 +67,12 @@ type Threeway =
   | { kind: "removed" }
   | { kind: "stages"; base?: CheckedEntry; ours?: CheckedEntry; theirs?: CheckedEntry };
 
-function threeway(
+export function threeway(
   bases: (CheckedEntry | undefined)[],
   head: CheckedEntry | undefined,
   remote: CheckedEntry | undefined,
-): Threeway {
+  aggressive = true,
+): Threeway | { kind: "nontrivial" } {
   let headMatch = 0;
   let remoteMatch = 0;
   const anyAncMissing = bases.some((b) => !b);
@@ -88,6 +89,8 @@ function threeway(
     if (remoteMatch && !headMatch) return { kind: "merged", entry: head };
   }
   if (!head && !remote && anyAncMissing) return { kind: "removed" };
+  // without --aggressive, what is left is no trivial merge (trivial_merges_only)
+  if (!aggressive) return { kind: "nontrivial" };
   // --aggressive: a deletion against an unchanged side, an identical addition
   if ((!head && !remote) || (!head && remote && remoteMatch) || (!remote && head && headMatch)) {
     return { kind: "removed" };
@@ -106,7 +109,17 @@ export async function octopusMerge(
   headId: ObjectId,
   heads: OctopusHead[],
   indexDiffers: string[],
+  /**
+   * git-merge-resolve instead (one head): its messages, no fast-forward, and a merge without
+   * a base given up
+   */
+  options: {
+    resolve?: boolean;
+    /** The merge bases of the (one) head, as given (a pick's parent) instead of computed */
+    bases?: ObjectId[];
+  } = {},
 ): Promise<OctopusOutcome> {
+  const resolve = options.resolve === true;
   const output: string[] = [];
   const errors: string[] = [];
   const outcome = (status: 0 | 1 | 2, extra: Partial<OctopusOutcome> = {}): OctopusOutcome => ({
@@ -157,13 +170,17 @@ export async function octopusMerge(
       output.push("Automated merge did not work.", "Should not be doing an octopus.");
       return outcome(2);
     }
-    const common = (
-      await graph.mergeBasesMany(
-        graph.commit(head.id),
-        mrc.map((id) => graph.commit(id)),
-      )
-    ).map((n) => n.id as ObjectId);
+    const common =
+      options.bases ??
+      (
+        await graph.mergeBasesMany(
+          graph.commit(head.id),
+          mrc.map((id) => graph.commit(id)),
+        )
+      ).map((n) => n.id as ObjectId);
     if (common.length === 0) {
+      // git-merge-resolve gives up a baseless merge (exit 2)
+      if (resolve) return outcome(2);
       // the script's `die` (exit 1): what is merged so far stays, as a merge with conflicts
       errors.push(`Unable to find common commit with ${head.name}`);
       return outcome(1, { index, worktree, conflicts });
@@ -172,7 +189,7 @@ export async function octopusMerge(
       output.push(`Already up to date with ${head.name}`);
       continue;
     }
-    if (!nonFf && common.length === 1 && mrc.length === 1 && common[0] === mrc[0]) {
+    if (!resolve && !nonFf && common.length === 1 && mrc.length === 1 && common[0] === mrc[0]) {
       // the first head is a fast-forward: its tree is the running result
       output.push(`Fast-forwarding to: ${head.name}`);
       const ff = await treeOf(head.id);
@@ -182,9 +199,11 @@ export async function octopusMerge(
       continue;
     }
     nonFf = true;
-    output.push(`Trying simple merge with ${head.name}`);
+    // git-merge-resolve prints its line once read-tree has done its work
+    if (!resolve) output.push(`Trying simple merge with ${head.name}`);
     const step = { output: output.length, paths: new Set<string>() };
     steps.push(step);
+    if (resolve) output.push("Trying simple merge.");
     const bases = await Promise.all(common.map((id) => treeOf(id)));
     const remote = await treeOf(head.id);
     const paths = new Set<string>([...index.keys(), ...remote.keys()]);
@@ -203,13 +222,18 @@ export async function octopusMerge(
         remote.get(path),
       );
       if (r.kind === "merged") next.set(path, r.entry);
+      else if (r.kind === "nontrivial") throw new Error("aggressive threeway is never nontrivial");
       else if (r.kind === "stages")
         staged.push({ path, base: r.base, ours: r.ours, theirs: r.theirs });
     }
     worktree = new Map();
     conflicts = [];
     if (staged.length > 0) {
-      output.push("Simple merge did not work, trying automatic merge.");
+      output.push(
+        resolve
+          ? "Simple merge failed, trying Automatic merge."
+          : "Simple merge did not work, trying automatic merge.",
+      );
       let failed = false;
       for (const s of staged) {
         const ok = await mergeOneFile(ctx, s, next, worktree, conflicts, output, errors, tempName);

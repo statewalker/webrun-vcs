@@ -48,6 +48,10 @@ export class RevertCommand extends GitCommand<RevertResult> {
   private mainlineParent?: number;
   private strategy: MergeStrategy = MergeStrategy.RECURSIVE;
   private contentStrategy?: ContentMergeStrategy;
+  private strategyGiven = false;
+  private strategyOptions: string[] = [];
+  /** Whose behaviour to follow where git 2.43 and 2.5x differ (default: the hooks') */
+  private compatibility?: "2.43" | "2.56";
   private ourCommitName?: string;
   private reflogPrefix = "revert:";
   private operation = SequencerOperation.START;
@@ -93,13 +97,46 @@ export class RevertCommand extends GitCommand<RevertResult> {
   }
 
   /**
-   * Set the merge strategy (only git's merge-ort is run; kept for compatibility).
+   * Set the merge strategy (`-s`): a revert always runs merge-ort, but a strategy given is
+   * saved in `sequencer/opts` for a run of several commits.
    *
    * @param strategy Merge strategy to use
    */
   setStrategy(strategy: MergeStrategy): this {
     this.checkCallable();
     this.strategy = strategy;
+    this.strategyGiven = true;
+    return this;
+  }
+
+  /**
+   * The `-X <option>`s (merge-ort's parse_merge_opt: `ours`, `theirs`, `subtree[=<path>]`,
+   * `patience`, `diff-algorithm=<name>`, `ignore-space-change`, `ignore-all-space`,
+   * `ignore-space-at-eol`, `ignore-cr-at-eol`, `renormalize`, `no-renames`,
+   * `find-renames[=<n>]`, `rename-threshold=<n>`); unknown ones are ignored, as the
+   * sequencer ignores them.
+   */
+  setStrategyOptions(options: readonly string[]): this {
+    this.checkCallable();
+    this.strategyOptions = [...options];
+    return this;
+  }
+
+  /**
+   * Whose behaviour to follow where git 2.43 and 2.5x differ (a strategy that gives up dies
+   * in 2.5x only; 2.43's merge-subtree records no AUTO_MERGE). Default: the hook runner's,
+   * else 2.56.
+   */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
+
+  /** Adds one `-X <option>` (see {@link setStrategyOptions}). */
+  addStrategyOption(option: string): this {
+    this.checkCallable();
+    this.strategyOptions.push(option);
     return this;
   }
 
@@ -345,6 +382,9 @@ export class RevertCommand extends GitCommand<RevertResult> {
         noCommit: this.noCommit,
         mainline: this.mainlineParent,
         favor: favorOf(this.contentStrategy),
+        ...(this.strategyGiven ? { strategy: this.strategy } : {}),
+        strategyOptions: this.strategyOptions,
+        ...(this.compatibility ? { compatibility: this.compatibility } : {}),
         oursLabel: this.ourCommitName,
         committer: this.committer,
         edit: this.edit,
