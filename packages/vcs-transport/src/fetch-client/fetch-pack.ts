@@ -75,6 +75,12 @@ export interface FetchPackRequest {
    * not support this repository's object format" in v0)
    */
   objectFormat?: ObjectFormat;
+  /**
+   * Protocol v2 `server-option=<option>` lines sent with each `fetch` command (git's
+   * `--server-option`, `remote.<name>.serverOption`); a server that does not advertise
+   * `server-option` is refused as git's `ensure_server_supports_v2` refuses it
+   */
+  serverOptions?: readonly string[];
   /** Stores the pack as it arrives (never buffered whole) */
   importPack(pack: AsyncIterable<Uint8Array>): Promise<PackImportResult>;
   /**
@@ -382,6 +388,7 @@ async function fetchPackV2(
   const caps = connection.capabilities;
   const head: Uint8Array[] = [encodePacketLine("command=fetch")];
   if (caps.has("agent")) head.push(encodePacketLine(`agent=${CLIENT_AGENT}`));
+  for (const line of serverOptionLines(connection, request.serverOptions)) head.push(line);
   // write_command_and_capabilities: the client's own format, once checked against the
   // server's (checkObjectFormat)
   if (caps.has("object-format")) {
@@ -550,4 +557,19 @@ async function* countPack(
     out.bytes += chunk.length;
     yield chunk;
   }
+}
+
+/**
+ * connect.c's `server-option=<option>` lines (v2 `ls-refs` and `fetch`): none without options;
+ * a server that does not advertise `server-option` refused as `ensure_server_supports_v2`.
+ */
+export function serverOptionLines(
+  connection: UploadPackConnection,
+  options: readonly string[] | undefined,
+): Uint8Array[] {
+  if (!options?.length) return [];
+  if (!connection.capabilities.has("server-option")) {
+    throw new TransportError("server doesn't support 'server-option'");
+  }
+  return options.map((option) => encodePacketLine(`server-option=${option}`));
 }
