@@ -44,6 +44,7 @@ import {
 } from "./fmt-merge-msg-command.js";
 import { configBool, conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
+import { parseStrategyOptions, strategyOrtOptions } from "./merge-strategy-options.js";
 import {
   conflictsComment,
   flatTree,
@@ -64,7 +65,7 @@ import {
   commitCleanupMode,
   commitMessageFromOption,
 } from "./message-cleanup.js";
-import { octopusMerge } from "./octopus-merge.js";
+import { octopusMerge, threeway } from "./octopus-merge.js";
 import { ortResultEntries } from "./ort-merge.js";
 import { mergeBaseTree, mergeStoredTrees } from "./ort-recursive.js";
 import { reflogMessages, updateHead, updateHeadExpecting } from "./reflog-messages.js";
@@ -148,7 +149,11 @@ export class MergeCommand extends GitCommand<MergeResult> {
   private includes: string[] = [];
   private fastForwardMode = FastForwardMode.FF;
   private strategy = MergeStrategy.RECURSIVE;
+  /** Whether `-s` was given (`-s recursive` names itself in git's messages) */
+  private strategyGiven = false;
   private contentStrategy?: ContentMergeStrategy;
+  /** `-X <option>`s, in order */
+  private strategyOptions: string[] = [];
   private squash = false;
   private commit = true;
   private message?: string;
@@ -296,13 +301,37 @@ export class MergeCommand extends GitCommand<MergeResult> {
    * - RECURSIVE (default): git's merge-ort
    * - OURS: Keep our tree, ignore their changes (creates merge commit)
    * - THEIRS: Replace our tree with theirs (creates merge commit)
-   * - RESOLVE: as RECURSIVE
+   * - RESOLVE: git-merge-resolve (a trivial in-index merge, else `read-tree -m --aggressive`
+   *   and git-merge-one-file)
+   * - SUBTREE: merge-ort with the other side shifted to ours' shape (never a fast-forward)
    *
    * @param strategy Merge strategy
    */
   setStrategy(strategy: MergeStrategy): this {
     this.checkCallable();
     this.strategy = strategy;
+    this.strategyGiven = true;
+    return this;
+  }
+
+  /**
+   * git's `-X <option>`s, in order (merge-ort's parse_merge_opt): `ours`, `theirs`,
+   * `subtree[=<path>]`, `patience`, `histogram`, `diff-algorithm=<name>`,
+   * `ignore-space-change`, `ignore-all-space`, `ignore-space-at-eol`, `ignore-cr-at-eol`,
+   * `renormalize`, `no-renormalize`, `no-renames`, `find-renames[=<n>]`,
+   * `rename-threshold=<n>`. An unknown one fails the merge when merge-ort runs
+   * ({@link UnknownStrategyOptionError}, git's `unknown strategy option`).
+   */
+  setStrategyOptions(options: readonly string[]): this {
+    this.checkCallable();
+    this.strategyOptions = [...options];
+    return this;
+  }
+
+  /** Adds one `-X <option>` (see {@link setStrategyOptions}). */
+  addStrategyOption(option: string): this {
+    this.checkCallable();
+    this.strategyOptions.push(option);
     return this;
   }
 
@@ -872,7 +901,9 @@ export class MergeCommand extends GitCommand<MergeResult> {
    * makes a merge commit, whatever was asked.
    */
   private ffMode(): FastForwardMode {
-    return this.strategy === MergeStrategy.OURS ? FastForwardMode.NO_FF : this.fastForwardMode;
+    return this.strategy === MergeStrategy.OURS || this.strategy === MergeStrategy.SUBTREE
+      ? FastForwardMode.NO_FF
+      : this.fastForwardMode;
   }
 
   /** git's get_octopus_merge_bases: the merge bases of HEAD and every head, folded. */
@@ -1024,6 +1055,9 @@ export class MergeCommand extends GitCommand<MergeResult> {
     worktree: Worktree | undefined,
     mergeBases: ObjectId[],
   ): Promise<MergeResult> {
+    if (this.strategy === MergeStrategy.RESOLVE) {
+      return this.doResolve(headId, srcId, srcName, head, state, worktree, mergeBases);
+    }
     // no merge base (unrelated histories allowed): merge-ort merges against the empty tree
     const baseId = mergeBases[0] as ObjectId | undefined;
     const headCommit = await this.commits.load(headId);
@@ -1041,12 +1075,22 @@ export class MergeCommand extends GitCommand<MergeResult> {
     } else if (this.strategy === MergeStrategy.THEIRS) {
       target = await flatTree(this.trees, srcCommit.tree);
     } else {
+      // try_merge_strategy: `-X` read (and refused) before anything is merged
+      const xopts = parseStrategyOptions(this.strategyOptions);
+      const subtreeShift =
+        xopts.subtreeShift ?? (this.strategy === MergeStrategy.SUBTREE ? "" : undefined);
       const common = {
         style: conflictStyleOf(this.workingCopy),
         ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
         bigFileThreshold: this.bigFileThreshold,
-        ...ortConfigOptions(this.workingCopy, worktree, { renormalize: this.renormalize }),
+        ...ortConfigOptions(this.workingCopy, worktree, {
+          renormalize: xopts.renormalize ?? this.renormalize,
+        }),
+        ...strategyOrtOptions(this.inProcess ? undefined : this.workingCopy, xopts),
+        // the inner merges of a virtual merge base are shifted too
+        ...(subtreeShift !== undefined ? { subtreeShift } : {}),
       };
+
       // several merge bases: merge-ort's virtual merge base, built in memory
       const base = await mergeBaseTree(
         {
@@ -1070,7 +1114,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
           oursLabel: "HEAD",
           theirsLabel: srcName,
           baseLabel: base.label,
-          favor: favorOf(this.contentStrategy),
+          favor: favorOf(this.contentStrategy) ?? xopts.favor,
         },
       );
       target = await ortResultEntries(this.blobs, merge);
@@ -1217,6 +1261,96 @@ export class MergeCommand extends GitCommand<MergeResult> {
   }
 
   /**
+   * `-s resolve` of one head (builtin/merge.c with git-merge-resolve): with one merge base and
+   * a commit to make, first git's "really trivial in-index merge" (`read-tree` with
+   * trivial_merges_only: every path taken whole from a side, committed as `In-index merge`);
+   * otherwise, or when that is not trivial ("Nope."), git-merge-resolve's
+   * `read-tree -m --aggressive` and git-merge-one-file for the paths left.
+   */
+  private async doResolve(
+    headId: ObjectId,
+    srcId: ObjectId,
+    srcName: string,
+    head: Awaited<ReturnType<typeof this.refsStore.get>>,
+    state: OperationState,
+    worktree: Worktree | undefined,
+    mergeBases: ObjectId[],
+  ): Promise<MergeResult> {
+    const output: string[] = [];
+    const message = await this.mergeMessage(headId, [{ id: srcId, name: srcName }]);
+    const mergedCommits = [headId, srcId];
+    let refusedTrivial = "";
+    if (mergeBases.length === 1 && this.commit && !this.squash) {
+      const headTreeId = await this.commits.getTree(headId);
+      const headTree = await flatTree(this.trees, headTreeId);
+      const { index } = await readIndex(this.staging);
+      const staged = indexChanges(index, headTree);
+      if (staged.length > 0) {
+        return {
+          status: MergeStatus.FAILED,
+          newHead: headId,
+          mergedCommits,
+          message: `error: Your local changes to the following files would be overwritten by merge:\n  ${staged.join(" ")}`,
+          failingPaths: new Map(staged.map((p) => [p, MergeFailureReason.DIRTY_INDEX])),
+        };
+      }
+      output.push("Trying really trivial in-index merge...");
+      const base = await flatTree(this.trees, await this.commits.getTree(mergeBases[0]));
+      const remote = await flatTree(this.trees, await this.commits.getTree(srcId));
+      const target = trivialMerge(base, headTree, remote);
+      if (target) {
+        const refused = await switchTrees(this.context(worktree), headTree, target, {
+          action: "merge",
+          operation: "merge",
+        });
+        if (!refused) {
+          output.push("Wonderful.");
+          const treeId = await storeFlatTree(this.trees, target);
+          const writeState = async (text: string) => this.writeMergeState(state, srcId, text);
+          const hooked = await this.mergeCommitHooks(state, message, writeState);
+          if (hooked.refused !== undefined) {
+            return {
+              status: MergeStatus.FAILED,
+              newHead: headId,
+              mergedCommits,
+              message: hooked.refused,
+              output,
+            };
+          }
+          const newCommitId = await this.storeCommit(treeId, mergedCommits, hooked.message, () =>
+            writeState(hooked.stateText ?? message),
+          );
+          await this.updateHead(head, newCommitId, "In-index merge");
+          await state.removeRef("AUTO_MERGE");
+          output.push("In-index merge");
+          return { status: MergeStatus.MERGED, newHead: newCommitId, mergedCommits, output };
+        }
+        refusedTrivial = `${refused.message}\n`;
+      } else {
+        // unpack-trees' trivial_merges_only refusal
+        refusedTrivial = "error: Merge requires file-level merging\n";
+      }
+      output.push("Nope.");
+    }
+    const result = await this.doOctopus(
+      headId,
+      head,
+      [{ id: srcId, name: srcName }],
+      false,
+      message,
+      state,
+      worktree,
+    );
+    return {
+      ...result,
+      output: [...output, ...(result.output ?? [])],
+      ...(refusedTrivial && result.message !== undefined
+        ? { message: `${refusedTrivial}${result.message}` }
+        : {}),
+    };
+  }
+
+  /**
    * A merge of several heads: git-merge-octopus (the heads merged one after the other) or,
    * with strategy `ours`, git-merge-ours (HEAD's tree); written when it merged or left
    * conflicts with the last head, nothing written when it gave up. As git's merge for any
@@ -1237,7 +1371,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
     const headTree = await flatTree(this.trees, await this.commits.getTree(headId));
     const { index } = await readIndex(this.staging);
     const staged = indexChanges(index, headTree);
-    const strategy = this.strategy === MergeStrategy.OURS ? "ours" : "octopus";
+    const strategy =
+      this.strategy === MergeStrategy.OURS
+        ? "ours"
+        : this.strategy === MergeStrategy.RESOLVE
+          ? "resolve"
+          : "octopus";
     // git restores the state it saved (reset --hard, stash apply): AUTO_MERGE as for ort
     const giveUp = async (lines: string[], output: string[] = []): Promise<MergeResult> => {
       const tree = (await this.commits.getTree(headId)) as ObjectId;
@@ -1251,10 +1390,17 @@ export class MergeCommand extends GitCommand<MergeResult> {
       };
     };
     // git-merge-resolve and merge-ort handle two heads only
-    if (this.strategy === MergeStrategy.RESOLVE) {
+    if (this.strategy === MergeStrategy.RESOLVE && remotes.length > 1) {
       const tree = (await this.commits.getTree(headId)) as ObjectId;
       const restored = await this.restoreStateQuirk(state, tree, worktree);
       return failed(`${restored}Merge with strategy resolve failed.`);
+    }
+    if (this.strategy === MergeStrategy.SUBTREE) {
+      const tree = (await this.commits.getTree(headId)) as ObjectId;
+      const restored = await this.restoreStateQuirk(state, tree, worktree);
+      return failed(
+        `error: Not handling anything other than two heads merge.\n${restored}Merge with strategy subtree failed.`,
+      );
     }
     let outcome: Awaited<ReturnType<typeof octopusMerge>>;
     if (this.strategy === MergeStrategy.OURS) {
@@ -1280,6 +1426,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
         headId,
         remotes,
         staged,
+        { resolve: this.strategy === MergeStrategy.RESOLVE },
       );
     }
     const output = [...outcome.output];
@@ -1826,6 +1973,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
         return "ours";
       case MergeStrategy.THEIRS:
         return "theirs";
+      case MergeStrategy.RESOLVE:
+        return "resolve";
+      case MergeStrategy.SUBTREE:
+        return "subtree";
+      case MergeStrategy.RECURSIVE:
+        return this.strategyGiven ? "recursive" : "ort";
       default:
         return "ort";
     }
@@ -1953,4 +2106,30 @@ export function favorOf(
     default:
       return undefined;
   }
+}
+
+/**
+ * builtin/merge.c's read_tree_trivial: the merge of `head` and `remote` against `base` when
+ * every path is trivial (taken whole from a side: unpack-trees' threeway_merge without
+ * `--aggressive`), else undefined. A path that is a file on one side and a directory on
+ * another is never trivial.
+ */
+function trivialMerge(
+  base: Map<string, CheckedEntry>,
+  head: Map<string, CheckedEntry>,
+  remote: Map<string, CheckedEntry>,
+): Map<string, CheckedEntry> | undefined {
+  const paths = new Set([...base.keys(), ...head.keys(), ...remote.keys()]);
+  const dirs = new Set<string>();
+  for (const p of paths) {
+    for (let i = p.indexOf("/"); i >= 0; i = p.indexOf("/", i + 1)) dirs.add(p.slice(0, i));
+  }
+  const out = new Map<string, CheckedEntry>();
+  for (const path of [...paths].sort(compareGitPaths)) {
+    if (dirs.has(path)) return undefined;
+    const r = threeway([base.get(path)], head.get(path), remote.get(path), false);
+    if (r.kind === "merged") out.set(path, r.entry);
+    else if (r.kind !== "removed") return undefined;
+  }
+  return out;
 }

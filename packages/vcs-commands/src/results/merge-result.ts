@@ -71,6 +71,9 @@ export enum MergeStrategy {
    */
   RECURSIVE = "recursive",
 
+  /** git's merge-ort by its own name (`-s ort`): as RECURSIVE */
+  ORT = "ort",
+
   /**
    * Always take our side.
    *
@@ -96,6 +99,12 @@ export enum MergeStrategy {
    * Uses a single merge base.
    */
   RESOLVE = "resolve",
+
+  /**
+   * git's subtree strategy: merge-ort with the other side (and the base) shifted to match
+   * ours' tree shape (`match-trees.c`'s shift_tree); never a fast-forward.
+   */
+  SUBTREE = "subtree",
 }
 
 /**
