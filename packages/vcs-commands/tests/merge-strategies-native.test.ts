@@ -20,7 +20,9 @@ import {
   type Git,
   MergeStatus,
   MergeStrategy,
+  RebaseOperation,
   RebaseStatus,
+  SequencerOperation,
   UnknownStrategyOptionError,
 } from "../src/index.js";
 import {
@@ -810,6 +812,211 @@ describeGit("merge strategies against native git", () => {
         .call();
       expect(result.status).toBe(CherryPickStatus.CONFLICTING);
       same(dirs.ours, dirs.native);
+    });
+  });
+
+  // ---- review of statewalker/webrun-vcs#318 ---------------------------------------------
+
+  describe("strategies with --no-commit, criss-crosses and saved options", () => {
+    /** f and g; side changes g (s1) then f (s2). */
+    const twoFiles = (run: Run, dir: string) => {
+      put(dir, "f", lines(5));
+      put(dir, "g", lines(5));
+      commitAll(run, "base");
+      run("checkout", "-q", "-b", "side");
+      put(dir, "g", lines(5, { 2: "side" }));
+      commitAll(run, "s1");
+      put(dir, "f", lines(5, { 2: "side" }));
+      commitAll(run, "s2");
+      run("checkout", "-q", "main");
+    };
+
+    const oursPickN = async (dir: string, strategy: MergeStrategy, picks: string[]) => {
+      const command = (await openOurs(dir))
+        .cherryPick()
+        .setCommitter(INTEROP_IDENT)
+        .setNoCommit(true)
+        .setStrategy(strategy)
+        .setCompatibility(modern ? "2.56" : "2.43");
+      for (const p of picks) command.include(p);
+      return command.call();
+    };
+
+    it("cherry-pick -n --strategy=resolve refuses an index that differs from HEAD", async () => {
+      const dirs = twins((run, dir) => {
+        twoFiles(run, dir);
+        put(dir, "f", lines(5, { 4: "staged" }));
+        run("add", "f");
+      });
+      const expected = git(root, dirs.native, "cherry-pick", "-n", "--strategy=resolve", "side~1");
+      expect(expected.status).not.toBe(0);
+      const result = await oursPickN(dirs.ours, MergeStrategy.RESOLVE, ["side~1"]);
+      expect(result.status).toBe(CherryPickStatus.FAILED);
+      expect(result.message?.split("\n")[0]).toBe(expected.stderr.split("\n")[0]);
+      same(dirs.ours, dirs.native);
+    });
+
+    it("cherry-pick -n --strategy=resolve of two commits stops at the second", async () => {
+      const dirs = twins(twoFiles);
+      git(root, dirs.native, "cherry-pick", "-n", "--strategy=resolve", "side~1", "side");
+      await oursPickN(dirs.ours, MergeStrategy.RESOLVE, ["side~1", "side"]);
+      same(dirs.ours, dirs.native);
+    });
+
+    it("cherry-pick -n --strategy=subtree of two commits merges onto the index", async () => {
+      const dirs = twins(twoFiles);
+      git(root, dirs.native, "cherry-pick", "-n", "--strategy=subtree", "side~1", "side");
+      await oursPickN(dirs.ours, MergeStrategy.SUBTREE, ["side~1", "side"]);
+      same(dirs.ours, dirs.native);
+    });
+
+    /**
+     * main with `sub/` imported from the orphan `sub` (old.txt, s.txt), A and B merged into it
+     * by `-s subtree`, T a merge of A and B: HEAD and T have two merge bases (A, B), so the
+     * virtual merge base must be shifted too. main then deletes sub/old.txt (or edits s.txt).
+     */
+    const crissCross = (edit: boolean) => (run: Run, dir: string) => {
+      put(dir, "LICENSE", "L\n");
+      put(dir, "main.txt", "m\n");
+      commitAll(run, "M0");
+      run("checkout", "-q", "--orphan", "sub");
+      run("rm", "-rqf", ".");
+      put(dir, "old.txt", "old\n");
+      put(dir, "s.txt", lines(10));
+      commitAll(run, "S0");
+      run("checkout", "-q", "-b", "A");
+      put(dir, "s.txt", lines(10, { 1: "A" }));
+      commitAll(run, "A");
+      run("checkout", "-q", "-b", "B", "sub");
+      put(dir, "s.txt", lines(10, { 9: "B" }));
+      commitAll(run, "B");
+      run("checkout", "-q", "-b", "T", "A");
+      run("merge", "-q", "--no-edit", "B");
+      put(dir, "t.txt", "t\n");
+      if (edit) put(dir, "s.txt", lines(10, { 1: "A", 3: "T", 9: "B" }));
+      commitAll(run, "T");
+      run("checkout", "-q", "main");
+      run("merge", "-q", "-s", "ours", "--no-commit", "--allow-unrelated-histories", "sub");
+      run("read-tree", "--prefix=sub/", "-u", "sub");
+      run("commit", "-q", "-m", "M1");
+      run("merge", "-q", "-s", "subtree", "--no-edit", "A");
+      run("merge", "-q", "-s", "subtree", "--no-edit", "B");
+      if (edit) put(dir, "sub/s.txt", lines(10, { 1: "A", 6: "main", 9: "B" }));
+      else run("rm", "-q", "sub/old.txt");
+      commitAll(run, "M4");
+    };
+
+    for (const [name, edit, xopts] of [
+      ["a deletion, -X no-renames", false, ["no-renames"]],
+      ["a deletion, renames on", false, []],
+      ["edits of one file on both sides", true, []],
+      ["edits of one file, -X subtree=sub", true, ["subtree=sub"]],
+    ] as const) {
+      it(`-s subtree over two merge bases shifts the virtual base: ${name}`, async () => {
+        const dirs = twins(crissCross(edit));
+        await compareMerge(
+          dirs,
+          ["-s", "subtree", ...xopts.map((x) => `-X${x}`), "--no-edit", "T"],
+          (g) =>
+            g.merge().setStrategy(MergeStrategy.SUBTREE).setStrategyOptions(xopts).include("T"),
+        );
+      });
+    }
+
+    /** side: s1 deletes d (main modified it: a stop), s2 changes a.txt line 5. */
+    const stopSetup = (run: Run, dir: string) => {
+      put(dir, "a.txt", lines(10));
+      put(dir, "d", "d\n");
+      commitAll(run, "base");
+      run("checkout", "-q", "-b", "side");
+      run("rm", "-q", "d");
+      commitAll(run, "s1");
+      put(dir, "a.txt", lines(10, { 5: "side" }));
+      commitAll(run, "s2");
+      run("checkout", "-q", "main");
+      put(dir, "a.txt", lines(10, { 5: "main" }));
+      put(dir, "d", "d main\n");
+      commitAll(run, "main");
+    };
+    const special = ["subtree=a;b", 'subtree=q"x', "subtree=c\\d", "find-renames=40% ", "theirs"];
+
+    it("sequencer/opts quotes -X values as git config does; either side continues", async () => {
+      // ours starts, native continues
+      const a = twins(stopSetup);
+      git(root, a.native, "cherry-pick", ...special.map((x) => `-X${x}`), "side~1", "side");
+      await (await openOurs(a.ours))
+        .cherryPick()
+        .setCommitter(INTEROP_IDENT)
+        .setStrategyOptions(special)
+        .include("side~1")
+        .include("side")
+        .call();
+      same(a.ours, a.native);
+      for (const dir of [a.native, a.ours]) {
+        expect(
+          gitOk(
+            root,
+            dir,
+            "config",
+            "-f",
+            ".git/sequencer/opts",
+            "--get-all",
+            "options.strategy-option",
+          ),
+        ).toBe(special.map((x) => `${x}\n`).join(""));
+        gitOk(root, dir, "rm", "-q", "d");
+        git(root, dir, "cherry-pick", "--continue");
+      }
+      same(a.ours, a.native);
+
+      // native starts, ours continues (the options read back)
+      const b = twins(stopSetup);
+      for (const dir of [b.native, b.ours]) {
+        git(root, dir, "cherry-pick", ...special.map((x) => `-X${x}`), "side~1", "side");
+        gitOk(root, dir, "rm", "-q", "d");
+      }
+      git(root, b.native, "cherry-pick", "--continue");
+      await (await openOurs(b.ours))
+        .cherryPick()
+        .setCommitter(INTEROP_IDENT)
+        .setOperation(SequencerOperation.CONTINUE)
+        .call();
+      same(b.ours, b.native);
+    });
+
+    it("rebase-merge/strategy_opts read back by either side's --continue", async () => {
+      const setup = (run: Run, dir: string) => {
+        stopSetup(run, dir);
+        run("checkout", "-q", "side");
+      };
+      const xopts = ["theirs", 'subtree=q"x', "subtree=c\\d"];
+      const a = twins(setup);
+      git(root, a.native, "rebase", ...xopts.map((x) => `-X${x}`), "main");
+      await (await openOurs(a.ours))
+        .rebase()
+        .setCommitter(INTEROP_IDENT)
+        .setStrategyOptions(xopts)
+        .setUpstream("main")
+        .call();
+      same(a.ours, a.native);
+      for (const dir of [a.native, a.ours]) {
+        gitOk(root, dir, "rm", "-q", "d");
+        git(root, dir, "rebase", "--continue");
+      }
+      same(a.ours, a.native);
+
+      const b = twins(setup);
+      for (const dir of [b.native, b.ours]) {
+        git(root, dir, "rebase", ...xopts.map((x) => `-X${x}`), "main");
+        gitOk(root, dir, "rm", "-q", "d");
+      }
+      git(root, b.native, "rebase", "--continue");
+      await (await openOurs(b.ours))
+        .rebase()
+        .setCommitter(INTEROP_IDENT)
+        .setOperation(RebaseOperation.CONTINUE)
+        .call();
+      same(b.ours, b.native);
     });
   });
 });

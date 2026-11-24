@@ -131,6 +131,8 @@ export interface PickOptions {
   strategy?: string;
   /** `-X <option>`s (saved in `sequencer/opts` as `options.strategy-option`) */
   strategyOptions?: string[];
+  /** The git version to follow where they differ (default: the hook runner's) */
+  compatibility?: "2.43" | "2.56";
   /** The label of HEAD in conflict markers (default `HEAD`) */
   oursLabel?: string;
   /**
@@ -321,6 +323,11 @@ export class PickSequencer {
     this.xopts = [...(options.strategyOptions ?? [])];
   }
 
+  /** The git version to follow where they differ */
+  private get compatibility(): "2.43" | "2.56" {
+    return this.options.compatibility ?? this.deps.hooks?.compatibility ?? "2.56";
+  }
+
   private config(key: string): string | undefined {
     return RemoteConfigStore.from(this.deps.workingCopy).value(key);
   }
@@ -391,9 +398,11 @@ export class PickSequencer {
       flag("record-origin", f.recordOrigin);
       flag("allow-ff", f.allowFf);
       if (f.mainline) opts.push(`\tmainline = ${f.mainline}\n`);
-      if (this.strategy) opts.push(`\tstrategy = ${this.strategy}\n`);
-      if (this.sign !== undefined) opts.push(`\tgpg-sign = ${this.sign}\n`);
-      for (const x of this.xopts) opts.push(`\tstrategy-option = ${x}\n`);
+      if (this.strategy) opts.push(`\tstrategy = ${configValueText(this.strategy)}\n`);
+      if (this.sign !== undefined) {
+        opts.push(`\tgpg-sign = ${configValueText(String(this.sign))}\n`);
+      }
+      for (const x of this.xopts) opts.push(`\tstrategy-option = ${configValueText(x)}\n`);
       if (this.cleanup) opts.push(`\tdefault-msg-cleanup = ${this.cleanup}\n`);
       if (opts.length > 0) await state.write("sequencer/opts", `[options]\n${opts.join("")}`);
     }
@@ -455,7 +464,7 @@ export class PickSequencer {
         xopts: this.xopts,
         oursLabel: this.options.oursLabel ?? "HEAD",
         favor: this.options.favor,
-        ...(this.deps.hooks?.compatibility ? { compatibility: this.deps.hooks.compatibility } : {}),
+        compatibility: this.compatibility,
       },
     );
   }
@@ -535,7 +544,20 @@ export class PickSequencer {
       pickId: item.id,
       parentId,
     });
-    if ("failed" in merged) return this.fail(merged.failed, merged.output ?? []);
+    if ("failed" in merged) {
+      if (!merged.strategyFailed) return this.fail(merged.failed, merged.output ?? []);
+      // do_pick_commit wrote MERGE_MSG before running the strategy; no CHERRY_PICK_HEAD
+      await deps.state.write("MERGE_MSG", await this.messageFor(action, item.id, commit, parentId));
+      const short = await this.abbreviator.abbreviate(item.id);
+      const verb = action === "pick" ? "apply" : "revert";
+      const lines = [
+        ...(merged.failed ? [merged.failed] : []),
+        `error: could not ${verb} ${short}... ${subjectOf(commit.message)}`,
+        // git 2.43's sequencer returns the error without dying
+        ...(this.compatibility === "2.43" ? [] : [`fatal: ${name} failed`]),
+      ];
+      return this.fail(lines.join("\n"), merged.output ?? []);
+    }
     const { treeId, conflicts, clean } = merged;
     // only the paths HEAD and the result differ on are switched
     const delta = merged.delta ?? (await treeDelta(deps.trees, headTreeId, treeId));
@@ -893,7 +915,8 @@ export class PickSequencer {
       const entry = /^([A-Za-z][A-Za-z0-9-]*)\s*=\s*(.*)$/.exec(line);
       if (section !== "options" || !entry) continue;
       const name = entry[1].toLowerCase();
-      const text = entry[2].replace(/^"(.*)"$/, "$1");
+      const text = parseConfigValueText(entry[2]);
+      if (text === undefined) continue;
       if (name === "gpg-sign") {
         this.sign = text;
         continue;
@@ -1391,7 +1414,12 @@ export type PickMergeResult =
       /** What was printed before a refused switch */
       refusedOutput?: string[];
     }
-  | { failed: string; output?: string[] };
+  | {
+      failed: string;
+      /** The strategy gave up (exit 2): the pick fails as do_pick_commit's res -1 */
+      strategyFailed?: boolean;
+      output?: string[];
+    };
 
 /**
  * The merge of a pick (do_pick_commit): merge-ort (do_recursive_merge, with the `-X`
@@ -1411,7 +1439,10 @@ export async function mergePickChange(
     strategy === "ort" ||
     p.action === "revert";
   if (!ort && strategy === "resolve" && p.headId) {
+    // git-merge-resolve refuses an index that differs from HEAD's commit (`git diff-index
+    // --cached HEAD`), whatever tree the sequencer merges onto (`--no-commit`: the index's)
     const headFlat = await flatTree(ctx.trees, p.headTreeId);
+    const headCommitFlat = await flatTree(ctx.trees, await ctx.commits.getTree(p.headId));
     const { index } = await readIndex(ctx.staging);
     const outcome = await octopusMerge(
       {
@@ -1422,15 +1453,12 @@ export async function mergePickChange(
       },
       p.headId,
       [{ id: p.pickId, name: p.pickId }],
-      indexChanges(index, headFlat),
+      indexChanges(index, headCommitFlat),
       { resolve: true, bases: p.parentId ? [p.parentId] : [] },
     );
     if (outcome.status === 2) {
-      const name = ACTION_NAME[p.action];
-      return {
-        failed: `${outcome.errors.join("\n")}\nfatal: ${name} failed`.trimStart(),
-        output: outcome.output,
-      };
+      // the strategy did not handle the merge: do_pick_commit's "could not apply" (no hints)
+      return { failed: outcome.errors.join("\n"), strategyFailed: true, output: outcome.output };
     }
     const target = new Map(outcome.index);
     for (const [path, entry] of outcome.worktree) target.set(path, entry);
@@ -1496,9 +1524,58 @@ export async function mergePickChange(
     conflictPaths: [...merge.conflicts.keys()],
     clean: merge.clean,
     messages: merge.messages,
-    // merge-subtree runs as a child: git 2.5x's (merge-ort) records AUTO_MERGE when it leaves
-    // conflicts, 2.43's (merge-recursive) never
-    autoMerge: ort || (!merge.clean && p.compatibility !== "2.43"),
+    // merge-subtree runs as a child: git 2.5x's (merge-ort's merge_switch_to_result) records
+    // AUTO_MERGE, 2.43's (merge-recursive) never
+    autoMerge: ort || p.compatibility !== "2.43",
     external: !ort,
   };
+}
+
+/**
+ * config.c's write_pair: a value as `git config` writes it (quoted when it starts or ends
+ * with a space or holds `;`, `#` or CR; `\n`, `\t`, `"` and `\` escaped).
+ */
+export function configValueText(value: string): string {
+  const quote = value.startsWith(" ") || value.endsWith(" ") || /[;#\r]/.test(value) ? '"' : "";
+  const body = value.replace(/[\n\t"\\]/g, (c) =>
+    c === "\n" ? "\\n" : c === "\t" ? "\\t" : `\\${c}`,
+  );
+  return `${quote}${body}${quote}`;
+}
+
+/**
+ * config.c's parse_value of the text after a variable's `=` on one line: blanks around it
+ * dropped, `"..."` keeping them, escapes undone, an unquoted `;` or `#` starting a comment;
+ * undefined where git refuses the line.
+ */
+export function parseConfigValueText(text: string): string | undefined {
+  let quote = false;
+  let value = "";
+  let trimLength = 0;
+  for (let i = 0; i < text.length; i++) {
+    let c = text[i];
+    if ((c === " " || c === "\t") && !quote) {
+      if (!trimLength) trimLength = value.length;
+      if (value.length) value += c;
+      continue;
+    }
+    if (!quote && (c === ";" || c === "#")) break;
+    trimLength = 0;
+    if (c === "\\") {
+      c = text[++i] ?? "";
+      if (c === "t") c = "\t";
+      else if (c === "b") c = "\b";
+      else if (c === "n") c = "\n";
+      else if (c !== "\\" && c !== '"') return undefined;
+      value += c;
+      continue;
+    }
+    if (c === '"') {
+      quote = !quote;
+      continue;
+    }
+    value += c;
+  }
+  if (quote) return undefined;
+  return trimLength ? value.slice(0, trimLength) : value;
 }

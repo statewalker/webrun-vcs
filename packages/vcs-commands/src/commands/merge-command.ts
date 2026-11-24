@@ -1077,6 +1077,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
     } else {
       // try_merge_strategy: `-X` read (and refused) before anything is merged
       const xopts = parseStrategyOptions(this.strategyOptions);
+      const subtreeShift =
+        xopts.subtreeShift ?? (this.strategy === MergeStrategy.SUBTREE ? "" : undefined);
       const common = {
         style: conflictStyleOf(this.workingCopy),
         ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
@@ -1085,9 +1087,10 @@ export class MergeCommand extends GitCommand<MergeResult> {
           renormalize: xopts.renormalize ?? this.renormalize,
         }),
         ...strategyOrtOptions(this.inProcess ? undefined : this.workingCopy, xopts),
+        // the inner merges of a virtual merge base are shifted too
+        ...(subtreeShift !== undefined ? { subtreeShift } : {}),
       };
-      const subtreeShift =
-        xopts.subtreeShift ?? (this.strategy === MergeStrategy.SUBTREE ? "" : undefined);
+
       // several merge bases: merge-ort's virtual merge base, built in memory
       const base = await mergeBaseTree(
         {
@@ -1112,7 +1115,6 @@ export class MergeCommand extends GitCommand<MergeResult> {
           theirsLabel: srcName,
           baseLabel: base.label,
           favor: favorOf(this.contentStrategy) ?? xopts.favor,
-          ...(subtreeShift !== undefined ? { subtreeShift } : {}),
         },
       );
       target = await ortResultEntries(this.blobs, merge);

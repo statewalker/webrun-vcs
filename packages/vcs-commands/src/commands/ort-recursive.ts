@@ -10,7 +10,7 @@ import type { Blobs, ObjectId } from "@statewalker/vcs-core";
 
 import type { CommandCommits, CommandTrees } from "../git-command.js";
 import { type BaseNode, commitsBaseSource, MergeBaseGraph } from "./merge-bases.js";
-import { flatTree, prunedFlatTrees } from "./merge-support.js";
+import { flatTree, prunedFlatTrees, storeFlatTree } from "./merge-support.js";
 import {
   type OrtMergeOptions,
   type OrtMergeResult,
@@ -111,7 +111,16 @@ async function innerMerge(
 ): Promise<Map<string, CheckedEntry>> {
   const bases = [...(await graph.mergeBases(h1, h2))].reverse();
   const base = await mergedBases(ctx, graph, bases, depth, options);
-  const merge = await ortMerge(ctx.blobs, await base.tree(), await h1.tree(), await h2.tree(), {
+  let [baseFlat, h1Flat, h2Flat] = [await base.tree(), await h1.tree(), await h2.tree()];
+  if (options.subtreeShift !== undefined) {
+    // merge_ort_nonrecursive_internal shifts in the inner merges too
+    const one = await storeFlatTree(ctx.trees, h1Flat);
+    const shift = subtreeShifter(ctx.trees, one, options.subtreeShift);
+    h2Flat = await flatTree(ctx.trees, await shift(await storeFlatTree(ctx.trees, h2Flat)));
+    baseFlat = await flatTree(ctx.trees, await shift(await storeFlatTree(ctx.trees, baseFlat)));
+    h1Flat = await flatTree(ctx.trees, one);
+  }
+  const merge = await ortMerge(ctx.blobs, baseFlat, h1Flat, h2Flat, {
     ...options,
     oursLabel: "Temporary merge branch 1",
     theirsLabel: "Temporary merge branch 2",
@@ -139,19 +148,18 @@ export async function mergeStoredTrees(
     flatTree(ctx.trees, id),
 ): Promise<OrtMergeResult & { ours: Map<string, CheckedEntry> }> {
   if (options.subtreeShift !== undefined) {
-    // merge_ort_nonrecursive_internal: their side and the base shifted to ours' shape
-    const prefix = options.subtreeShift;
-    const emptyTree = () => ctx.trees.storeTree([]);
-    const shift = (two: ObjectId | undefined) =>
-      prefix
-        ? shiftTreeBy(ctx.trees, ours, two, prefix, emptyTree)
-        : shiftTree(ctx.trees, ours, two, emptyTree);
+    // merge_ort_nonrecursive_internal: their side and the base shifted to ours' shape, a
+    // virtual merge base (kept in memory) as well
+    const shift = subtreeShifter(ctx.trees, ours, options.subtreeShift);
     theirs = await shift(theirs);
     if (base.stored) {
       const shifted = await shift(base.treeId);
       if (shifted !== base.treeId) {
         base = { ...base, treeId: shifted, tree: () => flat(shifted) };
       }
+    } else {
+      const shifted = await shift(await storeFlatTree(ctx.trees, await base.tree()));
+      base = { ...base, tree: () => flatTree(ctx.trees, shifted) };
     }
   }
   if (base.stored) {
@@ -174,4 +182,17 @@ export function storedBase(
   flat: () => Promise<Map<string, CheckedEntry>>,
 ): MergeBaseTree {
   return { tree: flat, stored: true, treeId, label };
+}
+
+/** merge-ort's shift_tree_object: a tree shifted to `ours`' shape (`""`: detected). */
+function subtreeShifter(
+  trees: CommandTrees,
+  ours: ObjectId | undefined,
+  prefix: string,
+): (two: ObjectId | undefined) => Promise<ObjectId | undefined> {
+  const emptyTree = () => trees.storeTree([]);
+  return (two) =>
+    prefix
+      ? shiftTreeBy(trees, ours, two, prefix, emptyTree)
+      : shiftTree(trees, ours, two, emptyTree);
 }
