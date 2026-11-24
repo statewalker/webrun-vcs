@@ -48,6 +48,12 @@ export interface PosixRegexOptions {
   extended?: boolean;
   /** Case-insensitive (`REG_ICASE`): ASCII letters only, as the C locale folds */
   icase?: boolean;
+  /**
+   * `REG_NEWLINE`: `.` and non-matching lists (`[^...]`) never match a newline, `^` also
+   * matches right after one and `$` right before one (glibc's `newline_anchor`); other
+   * expressions (`[[:space:]]`, a literal newline) still match it
+   */
+  newline?: boolean;
 }
 
 /** A match: overall `[start, end)` and the subexpressions' (undefined when unset) */
@@ -215,6 +221,7 @@ class Parser {
     private readonly pat: Uint8Array,
     private readonly extended: boolean,
     private readonly icase: boolean,
+    private readonly newline = false,
   ) {}
 
   private byte(i: number): number {
@@ -474,6 +481,8 @@ class Parser {
         this.count();
         const set = new Uint8Array(256).fill(1);
         set[0] = 0;
+        // REG_NEWLINE clears RE_DOT_NEWLINE
+        if (this.newline) set[0x0a] = 0;
         tree = { k: "set", set };
         break;
       }
@@ -724,7 +733,11 @@ class Parser {
       if (tok.type === B_CLOSE) break;
     }
     this.pos += tok.len;
-    if (nonMatch) for (let c = 0; c < 256; c++) set[c] ^= 1;
+    if (nonMatch) {
+      for (let c = 0; c < 256; c++) set[c] ^= 1;
+      // REG_NEWLINE sets RE_HAT_LISTS_NOT_NEWLINE
+      if (this.newline) set[0x0a] = 0;
+    }
     this.count();
     return { k: "set", set };
   }
@@ -977,12 +990,20 @@ class Matcher implements PosixRegex {
   private readonly subexpMap: number[];
   private readonly hasBackref: boolean;
   private readonly icase: boolean;
+  /** REG_NEWLINE: `^` and `$` hold at line boundaries too */
+  private readonly newline: boolean;
   private readonly hasPlural: boolean;
   private mark: Int32Array;
   private gen = 0;
 
   constructor(pattern: Uint8Array, options: PosixRegexOptions) {
-    const parser = new Parser(pattern, options.extended ?? false, options.icase ?? false);
+    const parser = new Parser(
+      pattern,
+      options.extended ?? false,
+      options.icase ?? false,
+      options.newline ?? false,
+    );
+    this.newline = options.newline ?? false;
     const tree = parser.parse();
     this.groupCount = parser.nsub;
     this.subexpMap = Array.from({ length: parser.nsub }, (_, i) => i);
@@ -1036,9 +1057,9 @@ class Matcher implements PosixRegex {
   private cond(kind: number, s: Uint8Array, idx: number): boolean {
     switch (kind) {
       case A_LINE_FIRST:
-        return idx === 0;
+        return idx === 0 || (this.newline && s[idx - 1] === 0x0a);
       case A_LINE_LAST:
-        return idx === s.length;
+        return idx === s.length || (this.newline && s[idx] === 0x0a);
     }
     const prev = idx > 0 && isWordByte(s[idx - 1]);
     const next = idx < s.length && isWordByte(s[idx]);

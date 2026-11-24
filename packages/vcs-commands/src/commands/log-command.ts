@@ -1407,12 +1407,16 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     // every element excludes
     const pathspec = [...paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
     if (paths.length === 0 && this.excludePaths.length > 0) pathspec.push(".");
-    const printer = new LogPrinter(host, options, {
-      interesting: (id) => shownIds.has(id) || unwalkedShown.has(id),
-      firstParentOnly: this.firstParentOnly,
-      paths: pathspec,
-    });
-    const follow = !printer.alwaysShowHeader;
+    const printer = new LogPrinter(
+      host,
+      { ...options, diff: { ...options.diff, ...this.diffOptions } },
+      {
+        interesting: (id) => shownIds.has(id) || unwalkedShown.has(id),
+        firstParentOnly: this.firstParentOnly,
+        paths: pathspec,
+      },
+    );
+    const follow = printer.followsPath;
     const graph = !!options.graph;
     const topo = graph;
     const boundary = !!options.boundary || this.boundary;
@@ -1640,6 +1644,8 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         const diff = new DiffCommand(this._workingCopy)
           .setOldTree(parent ? await treeOf(parent) : this.objectFormat.emptyTreeId)
           .setNewTree(entry.commit.tree)
+          // log's diffcore_rotate starts at the first path after a missing one
+          .setRotateStrict(false)
           .shareReadsOf(this);
         diff.setOptions({
           ...this.diffOptions,
