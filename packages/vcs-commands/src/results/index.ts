@@ -9,6 +9,7 @@ export * from "./diff-formatter.js";
 export * from "./diff-order.js";
 export * from "./diff-output.js";
 export * from "./diff-pickaxe.js";
+export * from "./diff-words.js";
 export * from "./fetch-result.js";
 export * from "./init-result.js";
 export * from "./merge-result.js";

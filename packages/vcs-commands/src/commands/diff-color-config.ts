@@ -33,6 +33,7 @@ import {
   WSEH_NEW,
   wsErrorHighlightOf,
 } from "../results/diff-color.js";
+import { WORD_DIFF_MODES } from "../results/diff-words.js";
 import { parseGitColor } from "./config-value-types.js";
 
 /** The decoration slots of `color.decorate.<slot>` (log-tree.c's `color_decorate_slots`) */
@@ -125,9 +126,20 @@ const DECORATION_SLOTS: (keyof DecorationColors)[] = [
  */
 export function readDiffColorSettings(
   workingCopy: WorkingCopy,
-  options: DiffColorOptions,
+  options: DiffColorOptions & { wordDiff?: string },
   uiConfig = true,
 ): DiffColorSettings {
+  // diff_opt_word_diff: an unknown mode dies while the options are parsed
+  if (
+    options.wordDiff !== undefined &&
+    !(WORD_DIFF_MODES as readonly string[]).includes(options.wordDiff)
+  ) {
+    throw new InvalidArgumentError(
+      "wordDiff",
+      options.wordDiff,
+      `error: bad --word-diff argument: ${options.wordDiff}`,
+    ).withExitCode(129);
+  }
   const compatibility = options.colorCompatibility ?? "2.56";
   const colors: DiffColors = { ...DEFAULT_DIFF_COLORS };
   const decorationColors: DecorationColors = { ...DEFAULT_DECORATION_COLORS };
@@ -201,6 +213,8 @@ export function readDiffColorSettings(
 
   // the command line
   let want: "never" | "always" | "auto" = diff ?? ui ?? "auto";
+  // `--word-diff=color` and `--color-words` turn colors on (a `color` given wins, as if after)
+  if (options.wordDiff === "color") want = "always";
   if (options.color !== undefined) {
     want = options.color === true ? "always" : options.color === false ? "never" : options.color;
   }
