@@ -277,6 +277,10 @@ export abstract class RefListingCommand<T> extends GitCommand<T> {
         return commit;
       },
       configValues: (key) => this.config().values(key),
+      configMissingValue: (key) =>
+        this.config()
+          .valuesWithOrigin(key)
+          .some((v) => v.text === undefined),
     };
   }
 

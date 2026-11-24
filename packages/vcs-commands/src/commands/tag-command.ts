@@ -7,6 +7,7 @@ import {
   GitApiError,
   InvalidTagNameError,
   RefAlreadyExistsError,
+  RefFilterError,
   RefNotFoundError,
   StoreNotAvailableError,
 } from "../errors/index.js";
@@ -15,6 +16,16 @@ import { RemoteConfigStore } from "../remote-config/index.js";
 import { abbrevLengths } from "./core-config.js";
 import { type CleanupMode, tagMessageFromOption } from "./message-cleanup.js";
 import { canonicalObjectId, isFullHexObjectId } from "./object-id-input.js";
+import {
+  filterAndFormatRefs,
+  filterRefs,
+  parseRefSorting,
+  type RefFilterOptions,
+  RefFormat,
+  RefKind,
+  RefListingCommand,
+  type RefSortKey,
+} from "./ref-filter/index.js";
 import { SIGNING_FAILED_LINES, SigningFailedError } from "./signing.js";
 
 /**
@@ -404,40 +415,291 @@ export class DeleteTagCommand extends GitCommand<string[]> {
   }
 }
 
+/** What `git tag --list` printed ({@link ListTagCommand.callText}). */
+export interface TagListResult {
+  /** git's stdout: each tag's line and its newline (bytes outside UTF-8 as `decodeGitPath` keeps them) */
+  output: string;
+  /** Each shown tag's line, in order (an empty one left out with `--omit-empty`) */
+  lines: string[];
+  /** The tags shown, in order */
+  tags: { refname: string; objectId: ObjectId }[];
+  /** git's warnings on stderr */
+  warnings: string[];
+}
+
 /**
  * List tags.
  *
- * Equivalent to `git tag -l`.
+ * Equivalent to `git tag --list [-n[<num>]] [--contains <commit>] [--no-contains <commit>]
+ * [--points-at <object>] [--merged <commit>] [--no-merged <commit>] [--sort=<key>]
+ * [--format=<format>] [--omit-empty] [--[no-]color] [-i] [<pattern>...]`, on git's ref
+ * filter: {@link call} gives the refs the filters keep, in name order; {@link callText}
+ * gives git's output (`tag.sort` and `--sort` keys, `versionsort.suffix`, `-n<num>`'s
+ * annotations as builtin/tag.c's `list_tags` formats them).
  *
  * @example
  * ```typescript
  * // List all tags
  * const tags = await git.tagList().call();
+ *
+ * // git tag -n2 --sort=-version:refname 'v*'
+ * const { output } = await git
+ *   .tagList()
+ *   .setLines(2)
+ *   .setSort("-version:refname")
+ *   .setPatterns("v*")
+ *   .callText();
  * ```
  */
-export class ListTagCommand extends GitCommand<Ref[]> {
+export class ListTagCommand extends RefListingCommand<Ref[]> {
+  private patterns: string[] = [];
+  private lines?: number;
+  private format?: string;
+  /** git starts its sort list with `tag.sort` (else `refname`); `--no-sort` clears it */
+  private configSort = true;
+  private sortKeys: string[] = [];
+  private ignoreCase = false;
+  private omitEmpty = false;
+  private color?: boolean;
+  private pointsAt: string[] = [];
+  private contains: string[] = [];
+  private noContains: string[] = [];
+  private merged: string[] = [];
+  private noMerged: string[] = [];
+  private compatibility: "2.43" | "2.56" = "2.56";
+
+  /** `<pattern>...`: tags whose name (after `refs/tags/`) matches one of these globs. */
+  setPatterns(...patterns: string[]): this {
+    this.checkCallable();
+    this.patterns = patterns;
+    return this;
+  }
+
+  /**
+   * `-n<num>` (`-n` alone is 1): each tag followed by `num` lines of its annotation (a
+   * lightweight tag's commit message, a signed tag's message without the signature, nothing
+   * for a tree or blob), as `%(align:15)%(refname:lstrip=2)%(end) %(contents:lines=<num>)`;
+   * 0 lists the names alone. Ignored with {@link setFormat}.
+   */
+  setLines(lines = 1): this {
+    this.checkCallable();
+    this.lines = lines;
+    return this;
+  }
+
+  /** `--format=<format>`: each tag through git's ref format language. */
+  setFormat(format: string): this {
+    this.checkCallable();
+    this.format = format;
+    return this;
+  }
+
+  /**
+   * `--sort=<key>` for each key, in command-line order (the last is the primary key), after
+   * the `tag.sort` keys; `version:refname` (`v:`) compares as versions (`versionsort.suffix`).
+   */
+  setSort(...keys: string[]): this {
+    this.checkCallable();
+    this.sortKeys = keys;
+    return this;
+  }
+
+  /** `--no-sort`: the `tag.sort` keys, the default `refname` and the keys given so far dropped. */
+  setNoSort(): this {
+    this.checkCallable();
+    this.configSort = false;
+    this.sortKeys = [];
+    return this;
+  }
+
+  /** `-i`: patterns and sorting without case. */
+  setIgnoreCase(ignore: boolean): this {
+    this.checkCallable();
+    this.ignoreCase = ignore;
+    return this;
+  }
+
+  /** `--omit-empty`: no line for a tag whose format expands to nothing. */
+  setOmitEmpty(omit: boolean): this {
+    this.checkCallable();
+    this.omitEmpty = omit;
+    return this;
+  }
+
+  /** `--color` (true) or `--no-color` (false); default: colors only under `color.ui=always`. */
+  setColor(color: boolean): this {
+    this.checkCallable();
+    this.color = color;
+    return this;
+  }
+
+  /** `--points-at[=<object>]` (HEAD without one): tags naming one of these, directly or through tags. */
+  setPointsAt(...objects: string[]): this {
+    this.checkCallable();
+    this.pointsAt = objects.length ? objects.map(canonicalName) : ["HEAD"];
+    return this;
+  }
+
+  /** `--contains[=<commit>]` (HEAD without one): tags whose commit reaches one of these. */
+  setContains(...commits: string[]): this {
+    this.checkCallable();
+    this.contains = commits.length ? commits.map(canonicalName) : ["HEAD"];
+    return this;
+  }
+
+  /** `--no-contains[=<commit>]` (HEAD without one): tags whose commit reaches none of these. */
+  setNoContains(...commits: string[]): this {
+    this.checkCallable();
+    this.noContains = commits.length ? commits.map(canonicalName) : ["HEAD"];
+    return this;
+  }
+
+  /** `--merged[=<commit>]` (HEAD without one): tags whose commit one of these reaches. */
+  setMerged(...commits: string[]): this {
+    this.checkCallable();
+    this.merged = commits.length ? commits.map(canonicalName) : ["HEAD"];
+    return this;
+  }
+
+  /** `--no-merged[=<commit>]` (HEAD without one): tags whose commit none of these reaches. */
+  setNoMerged(...commits: string[]): this {
+    this.checkCallable();
+    this.noMerged = commits.length ? commits.map(canonicalName) : ["HEAD"];
+    return this;
+  }
+
+  /**
+   * The git version whose `--format` output to follow where versions differ (default 2.56;
+   * see `ForEachRefCommand.setCompatibility`).
+   */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
+
+  private async filterOptions(): Promise<RefFilterOptions> {
+    const resolved = await this.resolveFilterArgs({
+      pointsAt: this.pointsAt,
+      contains: this.contains,
+      noContains: this.noContains,
+      merged: this.merged,
+      noMerged: this.noMerged,
+    });
+    return {
+      kind: RefKind.TAGS,
+      patterns: this.patterns,
+      ignoreCase: this.ignoreCase,
+      ...resolved,
+    };
+  }
+
   /**
    * Execute the tag listing.
    *
-   * @returns List of tag refs
+   * @returns The tag refs the filters keep, in name order
+   * @throws RefFilterError where git refuses an option (a name that is no commit)
    */
   async call(): Promise<Ref[]> {
     this.checkCallable();
     this.setCallable(false);
-
-    const tags: Ref[] = [];
-
+    const { items } = await filterRefs(this.filterSource(), await this.filterOptions());
+    // one listing of the tags, not a lookup per kept tag (a packed ref's lookup reads
+    // packed-refs again: quadratic over thousands of tags)
+    const listed = new Map<string, Ref>();
     for await (const ref of this.refsStore.list("refs/tags/")) {
-      if ("objectId" in ref) {
-        tags.push(ref);
-      }
+      if ("objectId" in ref) listed.set(ref.name, ref);
     }
-
-    // Sort by name
+    const tags: Ref[] = [];
+    for (const item of items) {
+      if (item.flags.symref) continue;
+      const ref = listed.get(item.refname);
+      if (ref) tags.push(ref);
+    }
     tags.sort((a, b) => compareRefNames(a.name, b.name));
-
     return tags;
   }
+
+  /**
+   * `git tag --list`'s output.
+   *
+   * @throws RefFilterError where git refuses an option or dies (bad format, bad sort key,
+   *   a name that is no commit)
+   */
+  async callText(): Promise<TagListResult> {
+    this.checkCallable();
+    this.setCallable(false);
+    const config = RemoteConfigStore.from(this.workingCopy);
+    // parse_options resolves --contains & co. in its callbacks, before anything else
+    const filter = await this.filterOptions();
+    // repo_config: tag.sort keys, else "refname"; --sort appends, --no-sort clears
+    const configured = config.values("tag.sort");
+    const sortKeys = this.configSort
+      ? [...(configured.length ? configured : ["refname"]), ...this.sortKeys]
+      : [...this.sortKeys];
+    // want_color(GIT_COLOR_UNKNOWN): color.ui, and only `always` colors without a terminal
+    const useColor = this.color ?? config.value("color.ui")?.trim().toLowerCase() === "always";
+    const formatSource = this.formatSource();
+    const compatibility = this.compatibility;
+    const formatOptions = { useColor, compatibility } as const;
+    // ref_sorting_options runs before list_tags verifies the format
+    const sortFormat = new RefFormat("", formatSource, formatOptions);
+    parseRefSorting(sortKeys, sortFormat);
+    // git 2.43 collects `%(ahead-behind)` bases per format: atoms the sort keys parsed first
+    // (into a dummy format) get none
+    const sortedFirst = new Set(
+      compatibility === "2.43" ? sortFormat.atoms.map((a) => a.name) : [],
+    );
+    // list_tags: -n<num> (negative: none) annotates with %(contents:lines=<num>)
+    const lines = this.lines === undefined || this.lines === -1 ? 0 : this.lines;
+    const formatText =
+      this.format ??
+      (lines
+        ? `%(align:15)%(refname:lstrip=2)%(end) %(contents:lines=${lines})`
+        : "%(refname:lstrip=2)");
+    let format: RefFormat;
+    try {
+      format = new RefFormat(formatText, formatSource, formatOptions);
+    } catch (e) {
+      // verify_ref_format's error, then tag's death
+      if (e instanceof RefFilterError && e.message.startsWith("error: malformed format string")) {
+        throw new RefFilterError(`${e.message}\nfatal: unable to parse format string`, 128);
+      }
+      throw e;
+    }
+    const sorting: RefSortKey[] = parseRefSorting(sortKeys, format).map((key) =>
+      this.ignoreCase ? { ...key, icase: true } : key,
+    );
+    const source = this.filterSource();
+    const aheadBehindBases: ObjectId[] = [];
+    const isBaseTips: { name: string; commit: ObjectId }[] = [];
+    const baseWarnings: string[] = [];
+    for (const atom of format.atoms) {
+      if (atom.type !== "ahead-behind" && atom.type !== "is-base") continue;
+      if (sortedFirst.has(atom.name)) continue;
+      const name = atom.base as string;
+      const commit = await source.commitByName(name, baseWarnings);
+      if (!commit) throw new RefFilterError(`fatal: failed to find '${name}'`, 128);
+      if (atom.type === "ahead-behind") aheadBehindBases.push(commit);
+      else isBaseTips.push({ name, commit });
+    }
+    const result = await filterAndFormatRefs(source, filter, sorting, format, {
+      omitEmpty: this.omitEmpty,
+      aheadBehindBases,
+      isBaseTips,
+    });
+    return {
+      output: result.output,
+      lines: result.lines,
+      tags: result.items.map((i) => ({ refname: i.refname, objectId: i.objectId })),
+      warnings: [...baseWarnings, ...result.warnings],
+    };
+  }
+}
+
+/** A full object id canonicalised (lowercase), any other name as given. */
+function canonicalName(name: string): string {
+  return isFullHexObjectId(name) ? canonicalObjectId(name) : name;
 }
 
 /**
