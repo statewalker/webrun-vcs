@@ -862,7 +862,19 @@ export class LogPrinter {
     this.follow = (options.follow ?? bool(host.config("log.follow")) ?? false) && !!followPath;
     if (this.follow) this.followPath = followPath;
     // revision.c: --full-diff sets revs->diff too
-    this.allNeedDiff = userDiff || implyPatch || this.follow || !!options.fullDiff;
+    // revision.c: --diff-filter needs the diffs too, and cmd_log_init_finish shows only
+    // the commits whose filtered diff is not empty (always_show_header off)
+    this.diffFiltered = options.diff?.diffFilter !== undefined;
+    this.allNeedDiff =
+      userDiff || implyPatch || this.follow || !!options.fullDiff || this.diffFiltered;
+  }
+
+  /** `--diff-filter` given */
+  private readonly diffFiltered: boolean;
+
+  /** Whether a commit whose diff is empty is still shown (git's `always_show_header`) */
+  get alwaysShowHeader(): boolean {
+    return !this.follow && !this.diffFiltered;
   }
 
   /**
@@ -883,8 +895,8 @@ export class LogPrinter {
   }
 
   /** Whether commits not shown (their diff empty) do not count (`--follow`) */
-  get alwaysShowHeader(): boolean {
-    return !this.follow;
+  get followsPath(): boolean {
+    return this.follow;
   }
 
   /** Prepares what the format reads (decorations, mailmap) and the graph */
