@@ -12,10 +12,11 @@
  */
 
 import { formatPersonIdent, type ObjectId, type PersonIdent } from "@statewalker/vcs-core";
-
+import { parseGitBool } from "@statewalker/vcs-utils";
 import { compareGitPaths, encodeGitPath } from "@statewalker/vcs-utils/encoding";
-
+import { wildmatch } from "@statewalker/vcs-working-tree";
 import { GitCommand } from "../../git-command.js";
+import { RemoteConfigStore } from "../../remote-config/index.js";
 import { quotePath } from "../../results/quote-path.js";
 import { ApplyCommand } from "../apply/apply-command.js";
 import { ApplyEngine, type ApplyIO } from "../apply/apply-engine.js";
@@ -50,7 +51,8 @@ import { removeBranchState, resetMerge, resetUnmergedToHead } from "../sequencer
 import { showCommitBytes } from "../show-commit.js";
 import { SIGNING_FAILED_LINES, signRequestOf } from "../signing.js";
 import { appendSignoff } from "../trailers.js";
-import { mailinfo, mailsplit } from "./mailinfo.js";
+import { mailinfo } from "./mailinfo.js";
+import { type MailsplitSource, splitMail } from "./mailsplit.js";
 import {
   type AmPatchFormat,
   detectPatchFormat,
@@ -96,6 +98,28 @@ export interface AmApplyOptions {
   reject?: boolean;
   /** `--ignore-whitespace` */
   ignoreWhitespace?: boolean;
+  /** `--ignore-space-change` */
+  ignoreSpaceChange?: boolean;
+}
+
+/**
+ * The `git apply` options `git am` keeps in `apply-opt`, set on an apply: both the first
+ * attempt and the 3-way fallback's apply to the fake ancestor take all of them
+ * (`run_apply`).
+ */
+function configureApply(cmd: ApplyCommand, opts: string[]): ApplyCommand {
+  for (const a of opts) {
+    if (a.startsWith("-C")) cmd.setContext(Number(a.slice(2)));
+    else if (a.startsWith("-p")) cmd.setStrip(Number(a.slice(2)));
+    else if (a.startsWith("--whitespace=")) cmd.setWhitespace(a.slice(13));
+    else if (a.startsWith("--directory=")) cmd.setDirectory(a.slice(12));
+    else if (a.startsWith("--exclude=")) cmd.addExclude(a.slice(10));
+    else if (a.startsWith("--include=")) cmd.addInclude(a.slice(10));
+    else if (a === "--reject") cmd.setReject(true);
+    else if (a === "--ignore-whitespace" || a === "--ignore-space-change")
+      cmd.setIgnoreWhitespace(true);
+  }
+  return cmd;
 }
 
 /** `sq_quote_buf`. */
@@ -141,7 +165,11 @@ function sqDequoteAll(s: string): string[] {
  * ```
  */
 export class AmCommand extends GitCommand<AmResult> {
-  private mboxes: { content: string; name?: string }[] = [];
+  private mboxes: {
+    content: string;
+    name?: string;
+    maildir?: { name: string; content: Uint8Array | string }[];
+  }[] = [];
   private patchFormat?: AmPatchFormat;
   private fixedClock?: number;
   private resume?: Resume;
@@ -151,6 +179,7 @@ export class AmCommand extends GitCommand<AmResult> {
   private keep: "t" | "b" | "f" = "f";
   private messageId?: boolean;
   private scissors?: boolean;
+  private quotedCr?: "nowarn" | "warn" | "strip";
   private quiet = false;
   private noVerify = false;
   /** `-S[<keyid>]` / `--no-gpg-sign` (undefined: `commit.gpgSign`) */
@@ -173,6 +202,18 @@ export class AmCommand extends GitCommand<AmResult> {
   addMbox(mbox: Uint8Array | string, name?: string): this {
     const content = typeof mbox === "string" ? textToLatin1(mbox) : bytesToLatin1(mbox);
     this.mboxes.push({ content, ...(name !== undefined ? { name } : {}) });
+    return this;
+  }
+
+  /**
+   * A Maildir to apply, in order (`git am <dir>`): its messages, each named by its path in
+   * the Maildir (`cur/<file>`, `new/<file>`), split as `git mailsplit` splits a Maildir
+   * (`cur/` then `new/`, numbers in names compared as numbers). `name` is the directory as
+   * git names it in messages. A Maildir given first is read as mailboxes (git's format
+   * detection takes a directory for mbox).
+   */
+  addMaildir(messages: { name: string; content: Uint8Array | string }[], name: string): this {
+    this.mboxes.push({ content: "", name, maildir: messages });
     return this;
   }
 
@@ -247,9 +288,20 @@ export class AmCommand extends GitCommand<AmResult> {
     return this;
   }
 
-  /** `-c` / `--scissors`, `--no-scissors`. */
+  /** `-c` / `--scissors`, `--no-scissors` (default `mailinfo.scissors`). */
   setScissors(value: boolean): this {
     this.scissors = value;
+    return this;
+  }
+
+  /**
+   * `--quoted-cr=<action>`: what mailinfo does with a CRLF line ending of a base64 or
+   * quoted-printable body (`warn`, the default from `mailinfo.quotedCr`, warns `quoted CRLF
+   * detected`; `strip` drops the CR; `nowarn` keeps it silently). Kept in `quoted-cr` for the
+   * whole session.
+   */
+  setQuotedCr(action: "nowarn" | "warn" | "strip"): this {
+    this.quotedCr = action;
     return this;
   }
 
@@ -449,7 +501,7 @@ export class AmCommand extends GitCommand<AmResult> {
       this.patchFormat ??
       (this.mboxrd
         ? "mboxrd"
-        : first?.name !== undefined
+        : first?.name !== undefined && !first.maildir
           ? detectPatchFormat(first.content)
           : "mbox");
     if (!format) {
@@ -464,15 +516,18 @@ export class AmCommand extends GitCommand<AmResult> {
     };
     const inputs = this.mboxes.length ? this.mboxes : [{ content: "" }];
     if (format === "mbox" || format === "mboxrd") {
-      for (const mbox of inputs) {
-        // mailsplit: an empty file (git's isspace: space, tab, LF, CR) is an error, empty
-        // standard input is not
-        if (mbox.name !== undefined && /^[ \t\n\r]*$/.test(mbox.content)) {
-          this.err += `error: empty mbox: '${mbox.name}'\n`;
-          failSplit(`cannot split patches from ${mbox.name}`);
-        }
-        mails.push(...mailsplit(mbox.content, { keepCr, mboxrd: format === "mboxrd" }));
+      // split_mail_mbox: git mailsplit -d4 -b [--keep-cr] [--mboxrd] -- <paths>
+      const sources: MailsplitSource[] = inputs.map((m) =>
+        m.maildir
+          ? { maildir: m.maildir, name: m.name as string }
+          : { mbox: latin1ToBytes(m.content), ...(m.name !== undefined ? { name: m.name } : {}) },
+      );
+      const split = splitMail(sources, { allowBare: true, keepCr, mboxrd: format === "mboxrd" });
+      if (split.exitCode) {
+        this.err += split.errors;
+        this.fatal("Failed to split patches.");
       }
+      for (const f of split.files) mails.push(bytesToLatin1(f.content));
     } else if (format === "stgit-series") {
       // split_mail_stgit_series: one named series file, whose patches are files next to it
       // (this command reads no files: the first one cannot be opened)
@@ -491,6 +546,7 @@ export class AmCommand extends GitCommand<AmResult> {
       mails.push(stgitPatchToMail(""));
     } else {
       for (const mbox of inputs) {
+        if (mbox.maildir) failSplit(`could not open '${mbox.name}' for reading: Is a directory`);
         if (format === "stgit") mails.push(stgitPatchToMail(mbox.content));
         else {
           const r = hgPatchToMail(mbox.content);
@@ -511,7 +567,7 @@ export class AmCommand extends GitCommand<AmResult> {
     await this.writeText("keep", this.keep);
     await this.writeText("messageid", messageId ? "t" : "f");
     await this.writeText("scissors", this.scissors === undefined ? "" : this.scissors ? "t" : "f");
-    await this.writeText("quoted-cr", "");
+    await this.writeText("quoted-cr", this.quotedCr ?? "");
     await this.writeText(
       "apply-opt",
       this.applyArgs()
@@ -543,6 +599,7 @@ export class AmCommand extends GitCommand<AmResult> {
     for (const e of o.include ?? []) args.push(`--include=${e}`);
     if (o.reject) args.push("--reject");
     if (o.ignoreWhitespace) args.push("--ignore-whitespace");
+    if (o.ignoreSpaceChange) args.push("--ignore-space-change");
     return args;
   }
 
@@ -558,6 +615,7 @@ export class AmCommand extends GitCommand<AmResult> {
       keep: ((await t("keep")) || "f") as "t" | "b" | "f",
       messageId: (await t("messageid")) === "t",
       scissors: await t("scissors"),
+      quotedCr: await t("quoted-cr"),
       applyOpts: sqDequoteAll(await t("apply-opt")),
     };
     const script = await this.read("author-script");
@@ -655,11 +713,16 @@ export class AmCommand extends GitCommand<AmResult> {
           this.fatal(`cannot resume: .git/${DIR}/final-commit does not exist.`);
         if (!st.author) this.fatal(`cannot resume: .git/${DIR}/author-script does not exist.`);
       } else {
+        // setup_mailinfo: mailinfo.scissors and mailinfo.quotedCr, then the session's options
+        const config = this.mailinfoConfig();
+        const quotedCr = (st.quotedCr || config.quotedCr) as "nowarn" | "warn" | "strip";
+        const useScissors = st.scissors ? st.scissors === "t" : config.scissors;
         const mi = mailinfo(mail, {
           keepSubject: st.keep === "t",
           keepNonPatchBrackets: st.keep === "b",
           addMessageId: st.messageId,
-          ...(st.scissors ? { useScissors: st.scissors === "t" } : {}),
+          useScissors,
+          quotedCr,
           utf8: st.utf8,
           // metainfo_charset: get_commit_output_encoding()
           charset: configValue(this.workingCopy, "i18n.commitEncoding") ?? "UTF-8",
@@ -750,22 +813,54 @@ export class AmCommand extends GitCommand<AmResult> {
     return this.result(0);
   }
 
+  /**
+   * `setup_mailinfo`'s config (`git_mailinfo_config`, in config order): `mailinfo.scissors`
+   * and `mailinfo.quotedCr`; a value git refuses dies as git's config callback does.
+   */
+  private mailinfoConfig(): { scissors: boolean; quotedCr: "nowarn" | "warn" | "strip" } {
+    const out: { scissors: boolean; quotedCr: "nowarn" | "warn" | "strip" } = {
+      scissors: false,
+      quotedCr: "warn",
+    };
+    if (!this.workingCopy.config) return out;
+    const store = RemoteConfigStore.from(this.workingCopy);
+    const where = (key: string, file?: string, line?: number) =>
+      file !== undefined && line !== undefined
+        ? `bad config variable '${key}' in file '${file}' at line ${line}`
+        : `unable to parse '${key}' from command-line config`;
+    const entries = store.entriesWithOriginFor(["mailinfo.scissors", "mailinfo.quotedcr"]) ?? [
+      ...store
+        .valuesWithOrigin("mailinfo.scissors")
+        .map((e) => ({ ...e, key: "mailinfo.scissors" })),
+      ...store
+        .valuesWithOrigin("mailinfo.quotedcr")
+        .map((e) => ({ ...e, key: "mailinfo.quotedcr" })),
+    ];
+    for (const e of entries) {
+      if (e.key === "mailinfo.scissors") {
+        const v = e.text === undefined ? true : parseGitBool(e.text);
+        if (v === undefined) this.fatal(`bad boolean config value '${e.text}' for '${e.key}'`);
+        out.scissors = v;
+      } else if (e.text === undefined) {
+        this.err += `error: missing value for '${e.key}'\n`;
+        this.fatal(where(e.key, e.file, e.line));
+      } else if (e.text === "nowarn" || e.text === "warn" || e.text === "strip") {
+        out.quotedCr = e.text;
+      } else {
+        this.err += `error: bad action '${e.text}' for '${e.key}'\n`;
+        this.fatal(where(e.key, e.file, e.line));
+      }
+    }
+    return out;
+  }
+
   private async runApply(st: AmState): Promise<number> {
     const patch = (await this.read("patch")) ?? "";
     const cmd = new ApplyCommand(this.workingCopy)
       .addPatch(latin1ToBytes(patch), `.git/${DIR}/patch`)
       .setIndex(true)
       .setLegacyMessages(this.legacyMessages);
-    for (const a of st.applyOpts) {
-      if (a.startsWith("-C")) cmd.setContext(Number(a.slice(2)));
-      else if (a.startsWith("-p")) cmd.setStrip(Number(a.slice(2)));
-      else if (a.startsWith("--whitespace=")) cmd.setWhitespace(a.slice(13));
-      else if (a.startsWith("--directory=")) cmd.setDirectory(a.slice(12));
-      else if (a.startsWith("--exclude=")) cmd.addExclude(a.slice(10));
-      else if (a.startsWith("--include=")) cmd.addInclude(a.slice(10));
-      else if (a === "--reject") cmd.setReject(true);
-      else if (a === "--ignore-whitespace") cmd.setIgnoreWhitespace(true);
-    }
+    configureApply(cmd, st.applyOpts);
     if (st.threeway) cmd.setVerbose(false);
     const r = await cmd.call();
     this.out += pathToLatin1(r.output);
@@ -783,10 +878,15 @@ export class AmCommand extends GitCommand<AmResult> {
       undefined as unknown as ApplyIO,
       () => undefined,
       async () => 0,
-      () => false,
+      (pattern, text) => wildmatch(latin1ToPath(pattern), latin1ToPath(text)),
     );
     for (const a of st.applyOpts) {
-      if (a.startsWith("-p")) {
+      // --include/--exclude limit the patches the fake ancestor is built from too
+      if (a.startsWith("--exclude=") || a.startsWith("--include=")) {
+        const include = a.startsWith("--include=");
+        parser.limitByName.push({ pattern: pathToLatin1(a.slice(10)), include });
+        if (include) parser.hasInclude = true;
+      } else if (a.startsWith("-p")) {
         parser.pValue = Number(a.slice(2));
         parser.pValueKnown = true;
       } else if (a.startsWith("--directory="))
@@ -864,12 +964,7 @@ export class AmCommand extends GitCommand<AmResult> {
       .addPatch(latin1ToBytes(patch), `.git/${DIR}/patch`)
       .setTemporaryIndex(fake)
       .setLegacyMessages(this.legacyMessages);
-    for (const a of st.applyOpts) {
-      if (a.startsWith("-C")) apply.setContext(Number(a.slice(2)));
-      else if (a.startsWith("-p")) apply.setStrip(Number(a.slice(2)));
-      else if (a.startsWith("--whitespace=")) apply.setWhitespace(a.slice(13));
-      else if (a.startsWith("--directory=")) apply.setDirectory(a.slice(12));
-    }
+    configureApply(apply, st.applyOpts);
     const applied = await apply.call();
     this.out += pathToLatin1(applied.output);
     this.err += pathToLatin1(applied.errors);
@@ -1102,6 +1197,8 @@ interface AmState {
   keep: "t" | "b" | "f";
   messageId: boolean;
   scissors: string;
+  /** `quoted-cr`: nowarn, warn, strip, or empty (`mailinfo.quotedCr`) */
+  quotedCr: string;
   applyOpts: string[];
   author?: { name: string; email: string; date: string };
   msg?: string;
