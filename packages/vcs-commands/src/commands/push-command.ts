@@ -8,6 +8,7 @@ import {
   mapRejectReason,
   matchSource,
   ObjectFormatMismatchError,
+  objectSource,
   PushCertificateError,
   type PushClientResult,
   type PushCommandResult,
@@ -31,6 +32,7 @@ import {
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { type PushResult, PushStatus, type RemoteRefUpdate } from "../results/push-result.js";
 import { TransportCommand } from "../transport-command.js";
+import { endOfSymbolicChain, installTracking, pushTrackingPlan } from "./branch-tracking.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { remoteHookSession } from "./local-transport.js";
 import { withRemoteReceivePack } from "./remote-transport.js";
@@ -71,6 +73,7 @@ function toPushStatus(update: PushRefUpdate): PushStatus {
     case "rejected-fetch-first":
       return PushStatus.REJECTED_NONFASTFORWARD;
     case "rejected-stale":
+    case "rejected-remote-updated":
       return PushStatus.REJECTED_REMOTE_CHANGED;
     case "remote-rejected":
       return REJECT_REASON_STATUS[mapRejectReason(update.message ?? "")];
@@ -150,6 +153,52 @@ export class PushCommand extends TransportCommand<PushResult> {
   private streamRequestBody?: boolean;
   /** Leases (an entry without a ref: every other pushed ref at its tracking value) */
   private leases?: ForceWithLease[];
+  /** `-u` / `--set-upstream` */
+  private setUpstream = false;
+  /** `--[no-]follow-tags` (undefined: `push.followTags`) */
+  private followTags?: boolean;
+  /** `--[no-]force-if-includes` (undefined: `push.useForceIfIncludes`) */
+  private forceIfIncludes?: boolean;
+
+  /**
+   * `-u` / `--set-upstream`: each local branch pushed to a remote branch (accepted or already
+   * up to date, not deleted) gets that branch of this remote as its upstream
+   * (`branch.<name>.remote` = the remote's name, or the URL as given; `.merge` = the remote
+   * ref), written as `git branch --set-upstream-to` writes it; git's `branch '<b>' set up to
+   * track '<remote>/<branch>'.` lines are {@link PushResult.upstreamMessages}. A dry run
+   * writes nothing and tells `Would set upstream of '<b>' to '<branch>' of '<remote>'`.
+   */
+  setSetUpstream(setUpstream: boolean): this {
+    this.checkCallable();
+    this.setUpstream = setUpstream;
+    return this;
+  }
+
+  /**
+   * `--follow-tags` (true) / `--no-follow-tags` (false); undefined (the default) reads
+   * `push.followTags`. Also pushes every local annotated tag the remote lacks whose commit
+   * the pushed refs reach (or the remote's refs that are not pushed), as git's
+   * `add_missing_tags`; lightweight tags and tags of trees or blobs are never followed.
+   */
+  setFollowTags(followTags: boolean | undefined): this {
+    this.checkCallable();
+    this.followTags = followTags;
+    return this;
+  }
+
+  /**
+   * `--force-if-includes` (true) / `--no-force-if-includes` (false); undefined (the default)
+   * reads `push.useForceIfIncludes`. With a `--force-with-lease` that expects a
+   * remote-tracking value (no explicit value), a ref whose remote value is in no reflog entry
+   * of the local ref of the same name, nor reachable from one made since the tracking ref's
+   * last update, is refused ("remote ref updated since checkout",
+   * {@link PushStatus.REJECTED_REMOTE_CHANGED}). Without a lease it does nothing, as in git.
+   */
+  setForceIfIncludes(forceIfIncludes: boolean | undefined): this {
+    this.checkCallable();
+    this.forceIfIncludes = forceIfIncludes;
+    return this;
+  }
 
   /**
    * Set the remote to push to.
@@ -526,17 +575,23 @@ export class PushCommand extends TransportCommand<PushResult> {
     const tracking = this.trackingRefMapper();
     const messages: string[] = [];
     const leases = this.leases;
+    const repository = createRepositoryFacade({
+      history,
+      useBitmaps: this.bitmapsInUse(),
+      // send-pack's pack-objects reads core.maxTreeDepth
+      maxTreeDepth: this.maxTreeDepth(),
+    });
+    // builtin/push.c: --force-if-includes counts only with a lease
+    const forceIfIncludes =
+      leases !== undefined &&
+      leases.length > 0 &&
+      (this.forceIfIncludes ?? this.configBool("push.useForceIfIncludes") ?? false);
     const pushOptions: TransportPushOptions = {
       url: remoteUrl,
       auth: this.credentials,
       headers: this.headers,
       timeout: this.timeout,
-      repository: createRepositoryFacade({
-        history,
-        useBitmaps: this.bitmapsInUse(),
-        // send-pack's pack-objects reads core.maxTreeDepth
-        maxTreeDepth: this.maxTreeDepth(),
-      }),
+      repository,
       refStore: createTransportRefStore(history.refs),
       refspecs,
       force: this.force,
@@ -552,6 +607,13 @@ export class PushCommand extends TransportCommand<PushResult> {
         const local = tracking(remoteRef);
         return local ? (await history.refs.resolve(local))?.objectId : undefined;
       },
+      ...(forceIfIncludes
+        ? {
+            includesRemote: (remoteRef: string, remoteOid: string) =>
+              this.isReachableInReflog(remoteRef, tracking(remoteRef), remoteOid, repository),
+          }
+        : {}),
+      followTags: this.followTags ?? this.configBool("push.followTags") ?? false,
       onProgress: (message) => {
         messages.push(message);
         this.progressMessageCallback?.(message);
@@ -628,6 +690,9 @@ export class PushCommand extends TransportCommand<PushResult> {
     } finally {
       if (transactionHooks) this.hooks.append(transactionHooks.output);
     }
+
+    // transport_push: set_upstreams, before the remote-tracking refs are updated
+    const upstreamMessages = this.setUpstream ? await this.setUpstreams(result.updates) : [];
 
     // git updates the remote-tracking refs of what the server accepted, and of what it had
     // already (transport.c: update_tracking_ref for ok and up-to-date refs)
@@ -737,6 +802,7 @@ export class PushCommand extends TransportCommand<PushResult> {
       display: formatPushStatus(result, { dest: remoteUrl }),
       porcelain: formatPushStatus(result, { dest: remoteUrl, porcelain: true }),
       ...(trackingErrors.length ? { errors: trackingErrors } : {}),
+      ...(upstreamMessages.length ? { upstreamMessages } : {}),
       ...(result.reportFailed ? { failed: true } : {}),
     };
   }
@@ -752,7 +818,12 @@ export class PushCommand extends TransportCommand<PushResult> {
     remoteUrl: string,
     exit: (code: number) => void,
   ): Promise<boolean> {
-    const skipped = new Set(["rejected-nonfastforward", "rejected-stale", "up-to-date"]);
+    const skipped = new Set([
+      "rejected-nonfastforward",
+      "rejected-remote-updated",
+      "rejected-stale",
+      "up-to-date",
+    ]);
     const zero = this.objectFormat.nullId;
     const stdin = updates
       .filter((u) => !skipped.has(u.status))
@@ -768,6 +839,75 @@ export class PushCommand extends TransportCommand<PushResult> {
     });
     if (!result || result.exitCode === 0) return true;
     exit(result.exitCode);
+    return false;
+  }
+
+  /**
+   * transport.c's `set_upstreams`: each update accepted or up to date, not a delete, whose
+   * local side is a branch (a symbolic ref such as HEAD followed to its branch) and whose
+   * remote side is a branch, sets that branch's upstream through `installTracking`; a dry run
+   * only says what it would set. git's stdout lines.
+   */
+  private async setUpstreams(updates: readonly PushRefUpdate[]): Promise<string[]> {
+    const lines: string[] = [];
+    for (const update of updates) {
+      if (update.status !== "ok" && update.status !== "up-to-date") continue;
+      if (isNullObjectId(update.newOid)) continue;
+      // the peer ref: the local ref matched, else HEAD for a `HEAD` source
+      let local = update.localRef ?? (update.source === "HEAD" ? "HEAD" : undefined);
+      if (!local) continue;
+      const end = await endOfSymbolicChain(this.refsStore, local);
+      if (end?.startsWith("refs/heads/")) local = end;
+      if (!local.startsWith("refs/heads/") || !update.remoteRef.startsWith("refs/heads/")) {
+        continue;
+      }
+      const branch = local.slice("refs/heads/".length);
+      if (this.dryRun) {
+        lines.push(
+          `Would set upstream of '${branch}' to '${update.remoteRef.slice("refs/heads/".length)}' of '${this.remote}'`,
+        );
+        continue;
+      }
+      const plan = pushTrackingPlan(this.workingCopy, this.remote, update.remoteRef);
+      lines.push(...(await installTracking(this.workingCopy, branch, plan)));
+    }
+    return lines;
+  }
+
+  /**
+   * remote.c's `is_reachable_in_reflog` for `--force-if-includes`: whether the remote's value
+   * (peeled to a commit) is the new value of an entry of the local ref's reflog (the local ref
+   * of the remote ref's name), or an ancestor of one of the entries read until one older than
+   * the remote-tracking ref's latest reflog entry.
+   */
+  private async isReachableInReflog(
+    localRef: string,
+    trackingRef: string | undefined,
+    remoteOid: string,
+    repository: ReturnType<typeof createRepositoryFacade>,
+  ): Promise<boolean> {
+    const objects = objectSource(repository);
+    const commit = await objects.peelToCommit(remoteOid);
+    if (!commit) return false;
+    const refs = this.refsStore;
+    // git leaves the date unset without a tracking reflog: nothing stops the walk early
+    const latest = trackingRef
+      ? (await (await refs.getReflog?.(trackingRef))?.getLastEntry())?.who.timestamp
+      : undefined;
+    const since = latest ?? Number.NEGATIVE_INFINITY;
+    const entries = (await (await refs.getReflog?.(localRef))?.getReverseEntries()) ?? [];
+    const collected: string[] = [];
+    for (const entry of entries) {
+      if (entry.newId === commit) return true;
+      const entryCommit = isNullObjectId(entry.newId)
+        ? undefined
+        : await objects.peelToCommit(entry.newId);
+      if (entryCommit) collected.push(entryCommit);
+      if (entry.who.timestamp < since) break;
+    }
+    for (const c of collected) {
+      if (await objects.isAncestor(commit, c)) return true;
+    }
     return false;
   }
 

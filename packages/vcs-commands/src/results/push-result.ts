@@ -112,6 +112,13 @@ export interface PushResult {
    */
   errors?: string[];
   /**
+   * What `-u` printed on stdout (transport.c's `set_upstreams`): `branch '<b>' set up to
+   * track '<remote>/<branch>'.` per branch whose upstream was set (`... by rebasing.` under
+   * `branch.autoSetupRebase`), or in a dry run `Would set upstream of '<b>' to '<branch>' of
+   * '<remote>'`; absent when none. Under `--porcelain` git prints them before `Done`.
+   */
+  upstreamMessages?: string[];
+  /**
    * The push failed although every ref's status says otherwise: the server's report broke
    * git's rules (an `option` line without its `ok`; git exits 1, its porcelain output has no
    * `Done`)
