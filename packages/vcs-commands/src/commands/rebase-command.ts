@@ -108,7 +108,14 @@ import {
   type SignRequest,
   signRequestOf,
 } from "./signing.js";
-import { appendSignoff, trailerConfigOf } from "./trailers.js";
+import {
+  amendWithTrailers,
+  appendSignoff,
+  type TrailerCommandRunner,
+  type TrailerConfig,
+  trailerConfigOf,
+  validateTrailerArgs,
+} from "./trailers.js";
 import { worktreeModified } from "./worktree-overwrite-checks.js";
 import { refuseIfCheckedOut, usesBranch } from "./worktree-support.js";
 
@@ -192,7 +199,11 @@ interface UpdateRefRecord {
 
 /** What a pick (do_pick_commit) did. */
 type PickOutcome =
-  | { kind: "ok" }
+  | {
+      kind: "ok";
+      /** The message picked (do_pick_commit's ctx->message), when the pick was not fast-forwarded */
+      message?: string;
+    }
   | { kind: "dropped" }
   | {
       kind: "conflicts";
@@ -362,6 +373,24 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   /** `--root`: every commit of the branch rebased (onto the upstream given, else a new root) */
   private root = false;
   private noVerify = false;
+  /** `--trailer` arguments (kept in `rebase-merge/trailer`, one per line) */
+  private trailerArgs: string[] = [];
+
+  /**
+   * `--trailer <token>[(=|:)<value>]` (git 2.46+): each rebased commit's message gets the
+   * trailer as `git interpret-trailers --no-divider --trailer` adds it (`trailer.*`
+   * configuration applies; a fixup or squash none, a `fixup -C` the message it takes). Like
+   * git, it implies `--force-rebase` and is kept in `rebase-merge/trailer` for `--continue`;
+   * an empty argument or one without a key is refused before anything is done, and under
+   * 2.43 compatibility the option itself (`error: unknown option \`trailer'`, exit 129).
+   * git's apply backend refuses it (`--trailer requires the merge backend`); ours has only
+   * the merge backend.
+   */
+  addTrailer(trailer: string): this {
+    this.checkCallable();
+    this.trailerArgs.push(trailer);
+    return this;
+  }
 
   /** `--no-verify`: the pre-rebase hook does not run. */
   setNoVerify(noVerify: boolean): this {
@@ -855,6 +884,14 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         };
       }
     }
+    // parse_options: --trailer is unknown to 2.43; validate_trailer_args, then die(NULL)
+    if (this.trailerArgs.length > 0) {
+      if ((this.compatibility ?? this.hooks.compatibility) === "2.43") {
+        throw new GitApiError("error: unknown option `trailer'", { exitCode: 129 });
+      }
+      const refused = validateTrailerArgs(this.trailerArgs, this.trailerConfig());
+      if (refused !== undefined) throw new GitApiError(refused, { exitCode: 128 });
+    }
     switch (this.operation) {
       case RebaseOperation.QUIT:
       case RebaseOperation.SHOW_CURRENT_PATCH:
@@ -1233,7 +1270,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     // git's can_fast_forward: HEAD already on upstream with a linear history since, nothing
     // to do (unless forced, as the date options and --signoff do); an interactive rebase,
     // --exec and --autosquash never take the shortcut (allow_preemptive_ff)
-    const forced = this.committerDateIsAuthorDate || this.ignoreDate || this.signoff;
+    const forced =
+      this.committerDateIsAuthorDate ||
+      this.ignoreDate ||
+      this.signoff ||
+      this.trailerArgs.length > 0;
     const preemptive = !interactive && execs.length === 0 && this.autosquash !== true;
     if (preemptive && (await this.canFastForward(onto, upstream, restrict, origHead, branchBase))) {
       const upToDate =
@@ -1299,10 +1340,11 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       await unstash();
       return { status, newHead: onto, output };
     };
-    // nothing of HEAD's to replay: HEAD moves to upstream
+    // nothing of HEAD's to replay: HEAD moves to upstream (an interactive rebase still
+    // shows its `noop` list to the editor, which may add commands)
     // get_revision_ranges' base: the upstream, else (--root) onto
     const base = upstream ?? onto;
-    if (base === onto && !restrict && (await this.isAncestor(origHead, onto))) {
+    if (!interactive && base === onto && !restrict && (await this.isAncestor(origHead, onto))) {
       return moveToOnto(RebaseStatus.FAST_FORWARD);
     }
 
@@ -1324,8 +1366,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const excluded = [base, restrict].filter((id): id is ObjectId => id !== undefined);
     const range = await this.commitsToRebase(origHead, excluded, !!rebaseMerges);
     // only merges since upstream (dropped without --rebase-merges): git's todo is a `noop`,
-    // and the branch still moves to upstream
-    if (range.length === 0) return moveToOnto(RebaseStatus.OK);
+    // and the branch still moves to upstream (an interactive rebase shows that `noop`)
+    if (range.length === 0 && !interactive) return moveToOnto(RebaseStatus.OK);
     // commits whose change upstream has already (`--cherry-mark`): left out, with git's
     // warnings (`make_script`), unless --reapply-cherry-picks
     const skipped =
@@ -1387,6 +1429,9 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     if (emptyMode === "keep") await state.write(`${DIR}/keep_redundant_commits`, "");
     if (this.committerDateIsAuthorDate) await state.write(`${DIR}/cdate_is_adate`, "");
     if (this.ignoreDate) await state.write(`${DIR}/ignore_date`, "");
+    if (this.trailerArgs.length > 0) {
+      await state.write(`${DIR}/trailer`, this.trailerArgs.map((t) => `${t}\n`).join(""));
+    }
     await state.write(
       `${DIR}/${reschedule ? "reschedule-failed-exec" : "no-reschedule-failed-exec"}`,
       "",
@@ -1730,13 +1775,30 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       if (!conflicts) {
         lines.push(`Stopped at ${await this.abbreviateObjectId(item.id)}...  ${rest}`);
       }
+      // error_with_patch: 2.5x writes the picked message as it is (have_message), 2.43 and a
+      // fast-forwarded pick leave it to make_patch (the commit's, a line end added)
+      const picked =
+        outcome.kind === "ok" && (this.compatibility ?? this.hooks.compatibility) !== "2.43"
+          ? outcome.message
+          : undefined;
       lines.push(
         ...(await this.errorWithPatch(state, item.id, rest, {
           exitCode: conflicts ? 1 : 0,
           toAmend: outcome.kind === "ok",
-          ...(conflicts ? { message: outcome.message } : {}),
-          // the picked message (do_pick_commit's, --signoff's trailer appended)
-          signoff: !conflicts && (await state.exists(`${DIR}/signoff`)),
+          ...(conflicts
+            ? { message: outcome.message }
+            : picked !== undefined
+              ? { message: picked }
+              : {}),
+          // the picked message (do_pick_commit's, --signoff's and --trailer's trailers
+          // added); a fast-forwarded pick (possible with --trailer after --continue) has
+          // none, and make_patch writes the commit's own
+          picked:
+            !conflicts &&
+            ((await state.exists(`${DIR}/signoff`)) ||
+              (outcome.kind === "ok" &&
+                outcome.message !== undefined &&
+                (await state.exists(`${DIR}/trailer`)))),
         })),
       );
       return {
@@ -1804,7 +1866,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     state: OperationState,
     id: ObjectId,
     rest: string,
-    options: { exitCode: number; toAmend: boolean; message?: string; signoff?: boolean },
+    options: { exitCode: number; toAmend: boolean; message?: string; picked?: boolean },
   ): Promise<string[]> {
     if (options.message !== undefined && !(await state.exists(`${DIR}/message`))) {
       await state.write(`${DIR}/message`, options.message);
@@ -1818,9 +1880,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       const body = messageBody(commit?.message ?? "");
       await state.write(
         `${DIR}/message`,
-        options.signoff
-          ? appendSignoff(body, this.signoffLine(), trailerConfigOf(this.workingCopy))
-          : `${body}\n`,
+        options.picked ? await this.pickedMessageOf(state, body) : `${body}\n`,
       );
     }
     if (options.toAmend) {
@@ -1898,12 +1958,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const parentTreeId = parentId ? await this.commits.getTree(parentId) : undefined;
     const subject = subjectOf(commit.message);
     // do_pick_commit: the message from its subject on; --signoff appends the committer's
-    // sign-off (not for a fixup or squash), before the merge (MERGE_MSG has it)
+    // sign-off and --trailer its trailers (not for a fixup or squash), before the merge
+    // (MERGE_MSG has them)
     const body = messageBody(commit.message);
-    const pickedMessage =
-      signoff && !fixup
-        ? appendSignoff(body, this.signoffLine(), trailerConfigOf(this.workingCopy))
-        : body;
+    const pickedMessage = fixup ? body : await this.pickedMessageOf(state, body);
     let messageFile: "squash" | "fixup" | "edit" | undefined;
     if (fixup) {
       await this.updateSquashMessages(state, item, commit.message);
@@ -1979,13 +2037,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         conflicts: [...new Set(merge.conflicts.keys())].sort(),
         // git 2.43 writes the message and a blank line (2.5x the conflict list after it)
         message: `${merged}\n`,
-        lines: [
-          `error: could not apply ${short}... ${subject}`,
-          "hint: Resolve all conflicts manually, mark them as resolved with",
-          'hint: "git add/rm <conflicted_files>", then run "git rebase --continue".',
-          'hint: You can instead skip this commit: run "git rebase --skip".',
-          'hint: To abort and get back to the state before "git rebase", run "git rebase --abort".',
-        ],
+        lines: [`error: could not apply ${short}... ${subject}`, ...this.mergeConflictAdvice()],
       };
     }
     await state.write("MERGE_MSG", pickedMessage);
@@ -2124,7 +2176,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       }
     }
     if (finalFixup) await this.endFixupChain(state);
-    return { kind: "ok" };
+    return fixup ? { kind: "ok" } : { kind: "ok", message: pickedMessage };
   }
 
   /** do_pick_commit after a final fixup: the chain's files removed. */
@@ -2267,10 +2319,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       const fixupOff = buf.length;
       buf += body.slice(commented);
       if (fixupFlag && !seenSquash) {
-        // the message replaced: --signoff's trailer appended (append_squash_message)
+        // the message replaced: --signoff's and --trailer's trailers appended
+        // (append_squash_message)
         if (await state.exists(`${DIR}/signoff`)) {
-          buf = appendSignoff(buf, this.signoffLine(), trailerConfigOf(this.workingCopy));
+          buf = appendSignoff(buf, this.signoffLine(), this.trailerConfig());
         }
+        buf = await this.withTrailers(state, buf);
         if (
           item.replaceMessage &&
           ((await state.exists(`${DIR}/message-fixup`)) ||
@@ -2857,10 +2911,82 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
    * options and --signoff imply (`cdate_is_adate`, `ignore_date`, `signoff` in the state).
    */
   private async allowFastForward(state: OperationState): Promise<boolean> {
+    // --trailer forces the run that starts the rebase (REBASE_FORCE) but, as in git, is not
+    // read back as a reason to: a --continue may fast-forward again
+    if (this.operation === RebaseOperation.BEGIN && this.trailerArgs.length > 0) return false;
     for (const name of ["cdate_is_adate", "ignore_date", "signoff"]) {
       if (await state.exists(`${DIR}/${name}`)) return false;
     }
     return true;
+  }
+
+  /** The trailer configuration `--trailer` and `--signoff` apply (`trailer.*`). */
+  private trailerConfig(): TrailerConfig {
+    return {
+      ...trailerConfigOf(this.workingCopy),
+      compatibility: this.compatibility ?? this.hooks.compatibility,
+    };
+  }
+
+  /**
+   * do_pick_commit's message of a pick: `--signoff`'s trailer, then the `--trailer`s
+   * (amend_strbuf_with_trailers) kept in `rebase-merge/trailer`.
+   */
+  private async pickedMessageOf(state: OperationState, body: string): Promise<string> {
+    let message = body;
+    if (await state.exists(`${DIR}/signoff`)) {
+      message = appendSignoff(message, this.signoffLine(), this.trailerConfig());
+    }
+    return this.withTrailers(state, message);
+  }
+
+  /** amend_strbuf_with_trailers with the run's `--trailer`s (read_trailers), if any. */
+  private async withTrailers(state: OperationState, message: string): Promise<string> {
+    const args = await this.runTrailers(state);
+    if (args.length === 0) return message;
+    const hooks = this.hooks;
+    const runCommand: TrailerCommandRunner | undefined = hooks.enabled
+      ? (command) => hooks.runShellCommand("trailer", command.command, command.args)
+      : undefined;
+    return (await amendWithTrailers(message, args, this.trailerConfig(), runCommand)).output;
+  }
+
+  /** read_trailers: the lines of `rebase-merge/trailer` (none without the file). */
+  private async runTrailers(state: OperationState): Promise<string[]> {
+    const text = await state.read(`${DIR}/trailer`);
+    if (text === undefined) return [];
+    if (text === "") {
+      throw new GitApiError("error: trailers file is empty", { exitCode: 1 });
+    }
+    const lines = text.split("\n");
+    // a last line without its newline is not read (strchr finds none)
+    lines.pop();
+    if (lines.some((l) => l === "")) {
+      throw new GitApiError("error: trailers file contains empty line", { exitCode: 1 });
+    }
+    return lines;
+  }
+
+  /**
+   * print_advice's hints at a conflicting pick (`advice.mergeConflict`, 2.45+: off drops
+   * them, unset adds how to turn them off; 2.43 always gives them as they are).
+   */
+  private mergeConflictAdvice(): string[] {
+    const hints = [
+      "hint: Resolve all conflicts manually, mark them as resolved with",
+      'hint: "git add/rm <conflicted_files>", then run "git rebase --continue".',
+      'hint: You can instead skip this commit: run "git rebase --skip".',
+      'hint: To abort and get back to the state before "git rebase", run "git rebase --abort".',
+    ];
+    if ((this.compatibility ?? this.hooks.compatibility) === "2.43") return hints;
+    const value = configValue(this.workingCopy, "advice.mergeConflict");
+    if (value === undefined) {
+      return [
+        ...hints,
+        'hint: Disable this message with "git config set advice.mergeConflict false"',
+      ];
+    }
+    return (parseGitBool(value) ?? true) ? hints : [];
   }
 
   /** append_signoff's `Signed-off-by: <committer name> <email>` line. */
