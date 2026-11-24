@@ -1,0 +1,5 @@
+---
+"@statewalker/vcs-commands": minor
+---
+
+Interactive extras as callbacks (statewalker/statewalker-root#350): `commit -p` (`CommitCommand.setPatch`, `setPatchSelector`, `setPatchOptions`, `setCompatibility`, `getPatchResult`: add-patch's selection into the held index lock, as builtin/commit.c's `interactive_add` into a temporary index, then the commit), `add -e` (`AddCommand.setEdit`/`setEditor`: `edit_patch`'s seven-line diff in `.git/ADD_EDIT.patch`, the editor callback, `apply --cached --recount`), `clean -i` (`CleanCommand.setInteractive`/`setColumns`/`setCompatibility`: `interactive_main_loop`'s clean, filter by pattern, select by numbers, ask each, quit and help, listings laid out as column.c with `column.ui`/`column.clean`; `cleaned` now lists in git's order) and `am -i` (`AmCommand.setInteractive`/`setEditor`: `do_interactive`'s y/n/e/v/a, also for `--resolved`). `PatchRequest` gains a `line` request (clean's patterns); `DiffCommand.setIntentToAddVisible` now applies to the worktree diff too. Native twins port t7514, t3702, t7301 and t4257.

@@ -135,7 +135,20 @@ export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
       if (args.reverse) apply.setReverse(true);
       if (args.check) apply.setCheck(true);
       const temporary = options.temporaryIndex;
-      if (temporary && args.cached) apply.setTemporaryIndex(new Map(temporary));
+      if (temporary && args.cached) {
+        apply.setTemporaryIndex(
+          new Map(
+            [...temporary].map(([path, e]) => [
+              path,
+              {
+                mode: e.mode,
+                objectId: e.objectId,
+                ...(e.carried?.intentToAdd ? { intentToAdd: true } : {}),
+              },
+            ]),
+          ),
+        );
+      }
       const result = await apply.call();
       if (temporary && args.cached && !args.check && result.exitCode === 0 && result.index) {
         // the paths apply rewrote get new entries (no stat data, no flags); the others stay
@@ -143,7 +156,12 @@ export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
         temporary.clear();
         for (const [path, entry] of result.index) {
           const old = before.get(path);
-          const same = old && old.mode === entry.mode && old.objectId === entry.objectId;
+          // the same blob staged over an intent-to-add entry (an empty file) is a new entry
+          const same =
+            old &&
+            old.mode === entry.mode &&
+            old.objectId === entry.objectId &&
+            !!old.carried?.intentToAdd === !!entry.intentToAdd;
           temporary.set(path, same ? old : { mode: entry.mode, objectId: entry.objectId });
         }
       }
