@@ -1,5 +1,22 @@
 # @statewalker/vcs-transport-lfs
 
+## 0.7.0
+
+### Minor Changes
+
+- Release of the changes since the last published version:
+  
+  - @statewalker/vcs-utils crosses a breaking line
+
+### Patch Changes
+
+- Updated dependencies [99fa82a]
+- Updated dependencies [1feb9c3]
+- Updated dependencies [3bdea1f]
+- Updated dependencies [92d0fd5]
+- Updated dependencies [3df714c]
+  - @statewalker/vcs-utils@0.8.0
+
 ## 0.6.0
 
 ### Minor Changes

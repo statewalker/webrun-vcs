@@ -1,5 +1,167 @@
 # @statewalker/vcs-store-files
 
+## 0.8.0
+
+### Minor Changes
+
+- 99fa82a: `git.config()` answers git's queries as native `git config` does, in the legacy options and in
+  2.46's `get`/`list` subcommands: `getRegexp`, `list`, `getUrlmatch` (`--get-urlmatch`,
+  `get --url=`), `getColor`, `getColorBool`, `setType` (`--type=bool|int|bool-or-int|bool-or-str|
+  path|expiry-date|color`: values canonicalised on get as `format_config`, on set/add as
+  `normalize_value`), `--default` with types, `setShowOrigin`, `setShowScope`, `setNameOnly`,
+  `setShowNames`, `setNullTerminated` (`-z`), `setIncludes`, `setBlob` (`--blob=<rev>:<path>`)
+  and `setCompatibility("2.43")` (`--list` ignoring `--type`, no `:(optional)` paths or `#rgb`
+  colors). vcs-utils gains git's URL matching (urlmatch.c: `normalizeUrl`, `matchUrls`,
+  `selectUrlMatches`) for `<section>.<url>.*` configuration. `GitWorkingCopyConfig` names a
+  relative include as git does (`.git/../include/x`) and takes `fileOnly` to read one file with
+  its includes (statewalker/statewalker-root#302).
+- 8b49aa7: `git config`'s write side as a library command, `git.config()` (`ConfigCommand`): get, set, `--add`, unset, `--replace-all` / `--unset-all` with value patterns (`--value`, `--fixed-value`, the legacy positional pattern), `--comment`, `rename-section` and `remove-section`, on the repository's file or a scope's (`--local`, `--worktree`, `--global`, `--system`, `--file`), with git's exit statuses and messages. The file edits (`setConfigMultivarInFile`, `renameConfigSectionInFile` in vcs-store-files) port config.c's `repo_config_set_multivar_in_file_gently`, `maybe_remove_section` and `repo_config_copy_or_rename_section_in_file` over the parser's event offsets, under `<file>.lock`, following symbolic links. `GitHostEnvironment.hostFilesOf` (Node: `createNodeGitHostEnvironment`) gives the storage of host paths for global, system and absolute `--file` writes; `GitWorkingCopyConfig` exposes `configFiles`, `filePath` and `worktreeFilePath`, and `configFilesApiOf` the FilesApi under it.
+- 23af095: receive-pack now checks pushed objects as git does under `receive.fsckObjects` (else `transfer.fsckObjects`). Served repositories (`servedRepositoryOf`) and local pushes read `receive.fsck.<msg-id>` and `receive.fsck.skipList` in config order (`receiveFsckOf`). A pack the store unpacks is checked as unpack-objects `--strict` does; a kept pack is checked as index-pack `--strict` does. A refused pack is discarded with its quarantine. The client sees git's `remote: error: object <id>: <msg-id>: ...` lines, the unpack status `unpack-objects abnormal exit` or `index-pack abnormal exit`, and `unpacker error` for each ref. Unknown message ids warn, and a message type receive-pack cannot read kills it as git's does. `ReceivePackConfig.fsckObjects` carries the check in vcs-transport.
+  
+  receive-pack also reports the death of its connectivity check (`fatal: missing blob object ...`) on the progress channel. The push client records `error: remote unpack failed: <status>` in `PushResult.errors`, and keeps porcelain `Done` after a refused unpack over smart HTTP, as git's remote-curl helper does.
+  
+  A served repository's `receive.fsck.skipList` is read only inside its own git directories, as confined config includes are (`readConfinedFile` in vcs-store-files: symbolic links followed and checked, size cap). Any other path reads as unreadable (`could not open object name list`), so a repository's config cannot make the server read or echo another tenant's or the host's files. A local push into one's own repository reads the skip list as git does.
+- 0b3a4e6: `git reflog expire`, `delete`, `exists`, `write` and `drop` as library commands on `ReflogCommand` (builtin/reflog.c, reflog.c): `callExpire(...refs)` with `setExpire`, `setExpireUnreachable`, `setAll`, `setSingleWorktree`, `setStaleFix`, `setRewrite`, `setUpdateRef`, `setDryRun` and `setVerbose`, plus `gc.reflogExpire*` and `gc.<pattern>.reflogExpire*`; `callDelete(...selectors)` for `<ref>@{<n>}` and `<ref>@{<date>}`; `callExists()` refuses invalid ref names as git; 2.5x's `callWrite(ref, old, new, message)` and `callDrop(...refs)`, refused under `setCompatibility("2.43")` as git 2.43 refuses them. Each returns git's stdout, error lines and exit status (`ReflogUpdateResult`).
+  
+  vcs-store-files' `expireReflogs` takes named reflogs, `--single-worktree`, `--stale-fix` (reflog.c's `keep_entry`), `--rewrite`, `--updateref`, `--verbose` and a delete's entry selector on both the files and the reftable backends; `dropReflogs` and `writeReflogEntry` are `refs_delete_reflog` and `ref_transaction_update_reflog`, and the reftable store gains `dropReflog` and `appendReflog`. Reflogs are rewritten in git's own format: nothing new is stored, and older versions read the result.
+- 6229b25: SHA-256 reftable repositories (`extensions.objectFormat = sha256` with `extensions.refStorage = reftable`, what git 3.0's `init --object-format=sha256` creates) now open and init. The reftable reader and writer handle version 2 tables with hash id `s256` (28-byte header, 72-byte footer, 32-byte ids in ref and log records and obj keys), byte for byte as git writes them; the ref store, stack reader and writer take the repository's `objectFormat` and refuse a table of another hash as git does ("corrupt reftable file"). `openReftable` takes `{ objectFormat }`, `createReftableStackReader` an options object, `ReftableWriteOptions` an `objectFormat`, and tables expose their `objectFormat`.
+- fce4dfb: `git submodule absorbgitdirs [--quiet] [<path>...]` (statewalker/statewalker-root#329):
+  `git.submoduleAbsorbGitDirs()` moves each submodule's embedded `.git` directory into the
+  superproject's git directory (`.git/modules/<name>`, or `submodule.<name>.gitdir` under
+  `extensions.submodulePathConfig`) and leaves a gitfile and `core.worktree`, then does the same in
+  nested submodules (git's `absorb_git_dir_into_superproject` and its child run per submodule), and
+  rewrites a nested gitfile that no longer names a repository. The move runs first and its result
+  is checked (`relocate_gitdir`), so a failure leaves the repository where git can still read it;
+  git's deaths (`could not lookup name`, more than one worktree, broken gitfiles, symlinked paths)
+  are reproduced, git's errno included (`could not migrate git directory ...: Directory not empty`).
+  Symbolic links are followed as git's `stat` follows them: a linked `.git/modules` and a `.git`
+  linked to a repository are migrated where they lead (`physicalFilesPath` resolves them through
+  the FilesApi's `lstat`/`readlink`); a link leading beyond the FilesApi is refused with git's
+  `could not create directory` line, nothing moved.
+  Leading directories are created as git's `safe_create_leading_directories` creates them
+  (`safeCreateLeadingDirectories`): a dangling link on the way refuses with git's line and its
+  target is never created; a loop is git's stat failure. `Worktree.openGitlink` takes `gitDir`, the
+  repository a caller found through a link the storage does not follow, so nested absorption
+  reaches a submodule whose `.git` or gitfile leads through a link. `git rm` removes a submodule
+  whose `.git` is a link (the link only) once it is absorbed. `submodule deinit` and `git rm` share this code: deinit now absorbs nested
+  submodules too, and `git rm` of a submodule holding a `.git` directory absorbs it before removing
+  it (`RmResult.messages` carries the `Migrating ...` lines, also in the result of an
+  `RmFailedError` raised afterwards; a failed absorb is an `RmFailedError` with exit 128), as git does. `modules/` is now looked
+  up in the worktree's own git directory (a linked worktree's `worktrees/<id>/modules/`), as git
+  keeps it per worktree.
+  
+  Migration and rollback: the layout written is git's own, and older webrun versions already read
+  submodules through gitfiles, so no reverse move is needed to go back.
+- 7f8b7d4: `git submodule add` as a library command (statewalker/statewalker-root#326): `git.submoduleAdd()`
+  (`SubmoduleAddCommand`: `setURI`, `setPath`, `setName`, `setBranch`, `setForce`, `setQuiet`,
+  `setReference`, `setDepth`, `setTransports`, `setCompatibility`) follows
+  builtin/submodule--helper.c's `module_add`: the repository cloned into `.git/modules/<name>` (or
+  `submodule.<name>.gitdir` under `extensions.submodulePathConfig`) with `GIT_PROTOCOL_FROM_USER=0`,
+  a gitfile and `core.worktree` linking it to its path, `checkout -f -q [-B <branch>
+  origin/<branch>]`, then `submodule.<name>.url`/`.active` in `.git/config`, `path`/`url`/`branch`
+  in `.gitmodules`, the gitlink and `.gitmodules` staged. Relative URLs resolve against the
+  superproject's remote; an existing repository at the path is added as it is; git's refusals and
+  messages (a path in the index, an ignored path without `-f`, a bad URL or name, a name another
+  path uses in 2.5x, a kept git directory without `-f`, a held index lock, `protocol.file.allow`)
+  are reproduced for 2.43 and 2.56. `Worktree.openGitlink` takes an `environment` to open the
+  submodule with. `git add`'s ignored-path advice now uses git 2.43's wording under 2.43
+  compatibility.
+- bb6d5d3: The submodule model (`SubmoduleModel`, `Gitmodules`, `relativeUrl`: git's submodule-config.c) and `git submodule init`, `deinit`, `sync`, `set-url`, `set-branch` and `foreach` (`git.submoduleInit()` and the rest); `RmCommand.setDryRun`; `RepositoryFormat.submodulePathConfig` for `extensions.submodulePathConfig`.
+- 8d4bcd5: `git.worktreeAdd()` gets git's tracking options: `setTrack` (`--track`, `--track=inherit`,
+  `--no-track`, refused without a new branch), `setGuessRemote` (`--[no-]guess-remote`,
+  default `worktree.guessRemote`), and git's DWIM of a commit-ish that names no commit but one
+  remote-tracking branch (`checkout.defaultRemote` among several; 2.5x dies with git's advice on
+  an ambiguous name, `setCompatibility("2.43")` takes it for none, as 2.43 did). A new branch
+  now tracks its start as `git branch` does (`branch.autoSetupMerge`), printing
+  `branch 'x' set up to track 'r/x'.`; `WorktreeError.messages` carries what git prints before
+  dying.
+  
+  Relative worktree links (git 2.48+): `setRelativePaths` on `worktreeAdd()`, `worktreeMove()`
+  and `worktreeRepair()` (default `worktree.useRelativePaths`) write `gitdir` and the
+  worktree's `.git` file relative to each other and set `extensions.relativeWorktrees` (with
+  `core.repositoryformatversion = 1`), only on request. Repair rewrites links of the other kind
+  (`absolute/relative path mismatch`), so a repair without the option turns relative links back
+  into absolute ones; both link files are written together, as `write_worktree_linking_files`.
+  Under `setCompatibility("2.43")` the option is refused and repair rewrites only the file at
+  fault. `LinkedWorktrees.create` takes `relativePaths`, `move`/`repair` take
+  `WorktreeLinkOptions`; relative links are read everywhere. A version-0 repository with an
+  extension git does not know cannot be upgraded: relative add, move and repair are refused
+  before anything is written (`WorktreeFormatUpgradeError`, git's `cannot upgrade repository
+  format: unknown extension <name>`), and `RepositoryFormat.unknownExtensions` lists them.
+  
+  Checkout and switch: an ambiguous remote branch name prints git's
+  `advice.checkoutAmbiguousRemoteBranchName` hints (2.5x and 2.43 wordings), a name no ref has
+  dies `fatal: invalid reference: <name>`, and a branch created from a ref some remote fetches
+  outside `refs/remotes/` (`refs/repo_d/*`) tracks it, as git's `dwim_branch_start`
+  (statewalker/statewalker-root#320).
+
+### Patch Changes
+
+- 5906bba: `git branch`'s upstream management: `git.branchSetUpstream()` (`-u`/`--set-upstream-to`, with
+  git 2.5x's `<remote> <branch>` slip refusal and the `advice.setUpstreamFailure` hint) and
+  `git.branchUnsetUpstream()` (`--unset-upstream`); `branchCreate()` gains `setTrack(TrackMode)`
+  (`-t`/`--track[=direct|inherit]`, `--no-track`, `branch.autoSetupMerge` `false`/`true`/`always`/
+  `inherit`/`simple`, `branch.autoSetupRebase`), `setCreateReflog` (`--create-reflog`) and
+  `setQuiet`, and reports git's `branch 'x' set up to track 'origin/y'.` and its warnings through
+  `getOutput()`/`getWarnings()`; a missing start point fails as git's `not a valid object name`.
+  New `git.branchShowCurrent()` (`--show-current`) and `git.branchEditDescription()`
+  (`--edit-description`, an editor callback as `CommitCommand.setEditor`). `checkout -b` shares the
+  tracking code and returns the message in `CheckoutResult.output`, inherit and own-upstream
+  warnings in `warnings`; ambiguous remotes get git's `advice.ambiguousFetchRefspec` hint.
+  
+  `GitWorkingCopyConfig.save()` writes unsets as `git config --unset-all` does (its
+  `maybe_remove_section`): a run of headers of one section whose every variable goes is removed
+  with the blank lines before it, unless a comment stands in the run, right before it or after a
+  header's `]`; consecutive headers of one section count as one run; a file whose last lines go
+  still ends with a newline. A key unset and then given values again is written after the
+  removals: at the end of what is left of its section, or in a new section at the end of the file
+  when its section went (statewalker/statewalker-root#295).
+- e4e1a0f: gc takes its lock as `git gc` does (`lock_repo_for_gc`): `gc.pid` holds `<pid> <host>` and is written through `gc.pid.lock`. A young lock of another host or of a running process is held, while a dead process's lock, an unreadable one or one older than 12 hours is taken over. `git.gc()` now refuses with git's messages ("gc is already running on machine '<host>' pid <pid> (use --force if not)", or "Unable to create '.../gc.pid.lock': File exists"), and `setForce(true)` is `git gc --force`. Native git and ours now see each other's gc. `GitHostEnvironment.gcProcess` gives the pid, the host name and a process check; `createNodeGitHostEnvironment` fills it.
+  
+  gc keeps what concurrent writers need:
+  
+  - the prune checks each expired loose object's mtime again right before unlinking it, so a write that freshened it meanwhile keeps it (also `FileGcStrategy.prune`);
+  - the repack checks each old pack's mtime again right before removing it, so a pack freshened since the listing stays;
+  - the prune walks the refs again when they moved during the gc, as git's separate prune process does.
+- 0215d69: Checkout, switch, `read-tree -u`, `reset --hard`/`--mixed`/`--merge`/`--keep`, merge and clone now refuse a tree path that git's `verify_path` refuses the way git does, before anything is written. The message is `error: invalid path '<path>'` with the entry's full path, followed by the command's own lines and git's exit code. A tree entry with an empty name dies with `fatal: empty filename in tree entry`. Before this fix, these commands reported internal errors (`Tree entry name cannot be '..'`, `Invalid path: ... (contains .git)`), named the directory instead of the file, and `read-tree -u` and `reset` could remove files or move HEAD before refusing.
+  
+  `core.protectNTFS` (default true) and `core.protectHFS` (default true on macOS, as git, and also where the system is unknown) are now read by checkouts and by `git add`/`mv`/`rm`/`commit` index writes (`worktreePathRules`). `isValidWorktreePath` takes `protectNTFS` and `protectHFS` options; with both off it still refuses `.git` in any case, `.`, `..` and a symlinked `.gitmodules`. `protectHFSDefault(systemName)` gives the default (on for `Darwin` and for an unknown system). `FileWorktree` keeps both protections on, on every platform, and reports them as `capabilities.protects`; commands that write such a worktree check at least that strictly, before writing anything. Tree decoding errors are now `InvalidTreeEntryNameError`. `ReadTreeFailedError` exits 128, as `git read-tree` does.
+- 97746b8: `git rm -q`/`--quiet` (`RmCommand.setQuiet`) and git's `rm '<path>'` lines in `RmResult.output` (dry runs too, one per index entry, a sparse directory `--sparse` removes whole as `out/`); `git clean -e <pattern>` (`CleanCommand.setExcludePatterns`: command-line exclude rules asked before the standard ones, the only ones under `-x`); `git add --sparse` (`AddCommand.setSparse`). `add --ignore-errors` reports an unreadable file as git does (`error: open("<path>"): Permission denied`, `error: unable to index file '<path>'`). `rm`, `add` and `--renormalize` see a sparse index as git does (sparse directories kept collapsed unless a pathspec or a sparse directory on disk expands it, with 2.5x's `advice.sparseIndexExpanded` hint), and a failed `add --chmod` exits 255 as git. vcs-working-tree: `WorktreeWalkOptions.excludePatterns`, `createCommandLineExcludes`/`commandLineExcluded`, an `IgnoreManager.isIgnored` command-line argument, and `Staging.indexLayout().sparseDirectories`.
+- 8bbc62f: `git tag` creation and deletion follow git: `tag().setEdit()`/`setEditor()` (`-e`, git's
+  template and cleanup, the previous tag's body reused under `-f`), `setCreateReflog()`
+  (`--create-reflog`), `addTrailer()` (`--trailer`), `setCompatibility()`, and `callText()`
+  giving `Updated tag 'x' (was abc1234)` and the nested-tag advice; `tagDelete().callText()`
+  gives `Deleted tag 'x' (was abc1234)`, `error: tag 'x' not found.` and the exit status.
+  Refusals carry git's messages (`fatal: tag 'x' already exists`, `fatal: 'x' is not a valid
+  tag name.`, `fatal: no tag message?`); an annotated tag without a message and without an
+  editor now fails as `GIT_EDITOR=: git tag -a` does; a tag of a tree, blob or tag records its
+  real type; `tagDelete()` always deletes `refs/tags/<name>`, as git.
+  `tag -f` over a symbolic tag ref updates the ref it names, as git; a `tag -d` whose deletion
+  fails reports git's `could not delete references` lines (exit 1) after the others. Ref stores
+  create the reflogs of the symbolic refs an update goes through under `createReflog` (git's
+  REF_FORCE_CREATE_REFLOG reaching split_symref_update), not HEAD's when it only records its
+  branch's update (`reflogInChain`).
+- Updated dependencies
+- Updated dependencies [99fa82a]
+- Updated dependencies [8b49aa7]
+- Updated dependencies [1feb9c3]
+- Updated dependencies [3bdea1f]
+- Updated dependencies [e4e1a0f]
+- Updated dependencies [92d0fd5]
+- Updated dependencies [0215d69]
+- Updated dependencies [7fc3415]
+- Updated dependencies [ffc1814]
+- Updated dependencies [97746b8]
+- Updated dependencies [fce4dfb]
+- Updated dependencies [7f8b7d4]
+- Updated dependencies [8bbc62f]
+- Updated dependencies [e38cea5]
+- Updated dependencies [3df714c]
+- Updated dependencies [8d4bcd5]
+  - @statewalker/vcs-core@0.8.0
+  - @statewalker/vcs-utils@0.8.0
+  - @statewalker/vcs-working-tree@0.8.0
+
 ## 0.7.0
 
 ### Minor Changes

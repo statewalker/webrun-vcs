@@ -1,5 +1,539 @@
 # @statewalker/vcs-commands
 
+## 0.8.0
+
+### Minor Changes
+
+- 9c6fc3b: `git am`'s options get native twins (statewalker/statewalker-root#330). New: `AmCommand.setQuotedCr`
+  (`--quoted-cr=nowarn|warn|strip`, kept in `rebase-apply/quoted-cr`) and `mailinfo.quotedCr`,
+  `mailinfo.scissors` read for a session without `--[no-]scissors` (both as git's
+  `setup_mailinfo`, a bad value dying as git), `AmCommand.addMaildir` (`git am <Maildir>`),
+  `AmApplyOptions.ignoreSpaceChange`; the 3-way fallback now passes every apply option to its
+  apply on the fake ancestor and `--include`/`--exclude` to the fake ancestor itself, as git's
+  `run_apply`/`build_fake_ancestor`. `git mailsplit` is a library call: `splitMail` over contents
+  and `mailsplitFiles` over a FilesApi (mbox, mboxrd and Maildir input, `-b`, `--keep-cr`,
+  `-d<prec>`, `-f<n>`, `-o<dir>`, git's output files, count and errors).
+- f5e94d6: `git.branchList()` gets git's list mode on the ref filter: `callText()` prints `git branch`'s
+  listing byte for byte (`*`/`+` markers, the detached HEAD's description while detached,
+  rebasing or bisecting, symbolic refs as `name -> target`, `--color` and `color.branch.<slot>`),
+  with `setPatterns`, `-r`/`-a` (`setListMode`), `setVerbose(1|2)` (ids, subjects, upstream
+  tracking, worktree paths, aligned), `setFormat`, `setSort` after `branch.sort`, `setAbbrev`,
+  `setIgnoreCase`, `setOmitEmpty`, and the reachability filters `setContains`/`setNoContains`/
+  `setMerged`/`setNoMerged`/`setPointsAt`, which now take revision names. `call()` applies the
+  same filters. `ListBranchCommand` now extends `RefListingCommand` (statewalker/statewalker-root#294).
+- 5906bba: `git branch`'s upstream management: `git.branchSetUpstream()` (`-u`/`--set-upstream-to`, with
+  git 2.5x's `<remote> <branch>` slip refusal and the `advice.setUpstreamFailure` hint) and
+  `git.branchUnsetUpstream()` (`--unset-upstream`); `branchCreate()` gains `setTrack(TrackMode)`
+  (`-t`/`--track[=direct|inherit]`, `--no-track`, `branch.autoSetupMerge` `false`/`true`/`always`/
+  `inherit`/`simple`, `branch.autoSetupRebase`), `setCreateReflog` (`--create-reflog`) and
+  `setQuiet`, and reports git's `branch 'x' set up to track 'origin/y'.` and its warnings through
+  `getOutput()`/`getWarnings()`; a missing start point fails as git's `not a valid object name`.
+  New `git.branchShowCurrent()` (`--show-current`) and `git.branchEditDescription()`
+  (`--edit-description`, an editor callback as `CommitCommand.setEditor`). `checkout -b` shares the
+  tracking code and returns the message in `CheckoutResult.output`, inherit and own-upstream
+  warnings in `warnings`; ambiguous remotes get git's `advice.ambiguousFetchRefspec` hint.
+  
+  `GitWorkingCopyConfig.save()` writes unsets as `git config --unset-all` does (its
+  `maybe_remove_section`): a run of headers of one section whose every variable goes is removed
+  with the blank lines before it, unless a comment stands in the run, right before it or after a
+  header's `]`; consecutive headers of one section count as one run; a file whose last lines go
+  still ends with a newline. A key unset and then given values again is written after the
+  removals: at the end of what is left of its section, or in a new section at the end of the file
+  when its section went (statewalker/statewalker-root#295).
+- 0bfbbbd: `git commit -c`, `--fixup` and `--squash` (statewalker/statewalker-root#292). `CommitCommand.setReeditMessage(commit)` is `-c`: the commit's message and authorship, as `setReuseMessage` (`-C`) takes them, given to the editor (`setEditor`; without one the message is taken as it is). `setFixup("<commit>")` makes `fixup! <subject>` (then the `-m` text), `setFixup("amend:<commit>")` makes `amend! <subject>` followed by the commit's message (its body when it is an `amend!` commit) for the editor, and `setFixup("reword:<commit>")` does the same committing HEAD's tree; `setSquash(commit)` puts `squash! <subject>` before the message (`-m`, `-C`, `-c` or the editor's). The refusals are git's, with its texts and exit codes: `-m` with `-C`/`-c` or `--fixup=amend:`/`reword:`, `-C`/`-c`/`--fixup` together, `--fixup` with `--squash`, an unknown `--fixup` suboption, a revision that names no commit or names a tree (`could not lookup commit`), `reword:` with paths, `-a`, `-i` or during a merge or cherry-pick, and an `amend!` message without a body. `--amend --fixup` keeps no author, as git. Such commits fold under `rebase -i --autosquash`, native or ours. The template (`-t`, `commit.template`) is also dropped with `-c` and `--fixup`.
+- c316f82: `git commit` gains `-s`/`--signoff` (`setSignoff`), `--trailer` (`addTrailer`), `--author` as one
+  string (`setAuthor("Name <email>")`, or a pattern resolved as git's `find_author_by_nickname`:
+  the newest matching, mailmapped author of `--all`), `--date` (`setDate`: `parse_date` forms, then
+  approxidate) and `-C` (`setReuseMessage`), with git's refusals (`--reset-author` without `-C`/`--amend`,
+  `--reset-author` with `--author`, `-m` with `-C`). Sign-offs and trailers go through the trailers
+  engine (`appendSignoff`, `amendWithTrailers`).
+- 99fa82a: `git.config()` answers git's queries as native `git config` does, in the legacy options and in
+  2.46's `get`/`list` subcommands: `getRegexp`, `list`, `getUrlmatch` (`--get-urlmatch`,
+  `get --url=`), `getColor`, `getColorBool`, `setType` (`--type=bool|int|bool-or-int|bool-or-str|
+  path|expiry-date|color`: values canonicalised on get as `format_config`, on set/add as
+  `normalize_value`), `--default` with types, `setShowOrigin`, `setShowScope`, `setNameOnly`,
+  `setShowNames`, `setNullTerminated` (`-z`), `setIncludes`, `setBlob` (`--blob=<rev>:<path>`)
+  and `setCompatibility("2.43")` (`--list` ignoring `--type`, no `:(optional)` paths or `#rgb`
+  colors). vcs-utils gains git's URL matching (urlmatch.c: `normalizeUrl`, `matchUrls`,
+  `selectUrlMatches`) for `<section>.<url>.*` configuration. `GitWorkingCopyConfig` names a
+  relative include as git does (`.git/../include/x`) and takes `fileOnly` to read one file with
+  its includes (statewalker/statewalker-root#302).
+- 8b49aa7: `git config`'s write side as a library command, `git.config()` (`ConfigCommand`): get, set, `--add`, unset, `--replace-all` / `--unset-all` with value patterns (`--value`, `--fixed-value`, the legacy positional pattern), `--comment`, `rename-section` and `remove-section`, on the repository's file or a scope's (`--local`, `--worktree`, `--global`, `--system`, `--file`), with git's exit statuses and messages. The file edits (`setConfigMultivarInFile`, `renameConfigSectionInFile` in vcs-store-files) port config.c's `repo_config_set_multivar_in_file_gently`, `maybe_remove_section` and `repo_config_copy_or_rename_section_in_file` over the parser's event offsets, under `<file>.lock`, following symbolic links. `GitHostEnvironment.hostFilesOf` (Node: `createNodeGitHostEnvironment`) gives the storage of host paths for global, system and absolute `--file` writes; `GitWorkingCopyConfig` exposes `configFiles`, `filePath` and `worktreeFilePath`, and `configFilesApiOf` the FilesApi under it.
+- e506e89: `git diff --check`, `git log --check` and `git show --check` (statewalker/statewalker-root#325):
+  the `check` output format of `DiffCommand` (`callBytes("check")`, `LogOutputOptions.check`)
+  prints diff.c's `<file>:<line>: <error>.` lines with the offending line (its errors in the
+  `whitespace` color under `--color`), `leftover conflict marker` lines (the
+  `conflict-marker-size` attribute) and `new blank line at EOF.`; `DiffCommand.exitCode` adds 2
+  when it found errors (3 with `--exit-code` and changes), `LogCommand.exitCode` and `git show`'s
+  exit status are 2, as git's. The `whitespace` attribute overrides `core.whitespace` per path,
+  and a `core.whitespace` git cannot parse (`tab-in-indent,indent-with-non-tab`, or a variable
+  without a value) now stops every command before it reads or writes anything
+  (`GitCommand.checkConfigOnLoad`, git's `git_default_core_config`), except those git lets
+  through: `git config`, `git remote`, `git ls-remote`, and `git bisect`, whose checkout fails
+  instead. Under git 2.43 compatibility `incomplete-line` names no rule, and the rules after it
+  still apply. `git apply`, the colored diff and `--check` share one implementation of ws.c's rules
+  (vcs-commands `whitespace/`: `parseWhitespaceRule`, `wsCheck`, `wsCheckEmit`, `wsBlankLine`,
+  `wsFixCopy`, `checkBlankAtEof`).
+- eef0afb: Colored `git diff`, `git log` and `git show` output, byte for byte as git's `--color=always`:
+  the new `DiffTextOptions` `color` (`--color[=always|never|auto]`, `--no-color`; `auto` is git
+  without a terminal), `colorMoved` (`--color-moved[=no|default|plain|blocks|zebra|dimmed-zebra]`,
+  `--no-color-moved`), `colorMovedWs` (`--color-moved-ws=no|ignore-space-at-eol|
+  ignore-space-change|ignore-all-space|allow-indentation-change`) and `wsErrorHighlight`
+  (`--ws-error-highlight`), over the configuration's `color.ui`, `color.diff`/`diff.color`,
+  `color.diff.<slot>` (every slot of diff.c, `plain` too), `diff.colorMoved`, `diff.colorMovedWS`,
+  `diff.wsErrorHighlight`, `color.decorate.<slot>`, `core.whitespace` and the `whitespace`
+  attribute. Color values are parsed as color.c's `color_parse_mem` (names, `bright`, attributes
+  and their negations, 256 colors, `#rrggbb`/`#rgb`); a value git refuses dies as git dies. The
+  patch's headers, hunk headers, lines and whitespace errors are colored as diff.c's `emit_*`
+  functions, moved lines are detected over one diff's files (`MovedLineBuffer`:
+  `add_lines_to_move_detection`, `mark_color_as_moved`, `dim_moved_lines`), and `--stat`,
+  combined diffs (`--cc`), `--submodule=log|diff`, log's commit lines and decorations, `%C(auto)`
+  decorations and show's `tag`/`tree` headers take their colors. `colorCompatibility: "2.43"`
+  drops what git 2.43 lacks (`#rgb`, the `incomplete-line` whitespace rule). `git log --graph` draws
+  its columns in color as graph.c does (`column_colors_ansi`, or `log.graphColors`; its invalid
+  colors reported in the new `LogCommand.warnings`).
+- 1feb9c3: Pickaxe in `git diff`, `git log` and `git show`, as git's diffcore-pickaxe.c: the new
+  `DiffTextOptions` `pickaxeString` (`-S<string>`, occurrence counts that differ; `pickaxeRegex`
+  for `--pickaxe-regex`), `pickaxeGrep` (`-G<regex>`, added or removed lines that match),
+  `findObjects` (`--find-object=<object>`, subtrees of a tree diff included), `pickaxeAll`
+  (`--pickaxe-all`) and `pickaxeIgnoreCase` (`-i`; `LogCommand.setRegexpIgnoreCase` sets it
+  too). Sides are read through textconv (`textconv: false` is `--no-textconv`), `-G` passes over
+  binary pairs unless `text`, regexes run through `compilePosixRegex` with `REG_NEWLINE`. The
+  pickaxe runs in diffcore's order: after rename detection, before `-O`, `--rotate-to` and
+  `--diff-filter`, on the queue `--relative` left. `git log` and `git show` hide commits whose
+  diff it empties and count `-n` in shown commits; combined diffs of merges take
+  find_paths_generic's way. A partial clone fetches each diff's absent blobs in one batch first,
+  as diffcore_std does. Option errors are git's (`cannot be used together`, `-S requires a
+  non-empty argument`, `unable to resolve`, `invalid regex`). `DiffPickaxe` is the engine.
+  
+  `compilePosixRegex`: GNU's buffer anchors (backslash-backquote, backslash-quote) no longer match
+  at line boundaries under `REG_NEWLINE`, and the start one matches a `REG_NOTBOL` subject's start,
+  as glibc's.
+- 3bdea1f: `git.diff()` gets the options that choose what a diff shows, byte for byte as git: the new
+  `DiffTextOptions` `diffFilter` (`--diff-filter=[ACDMRTUXB*]`, lowercase letters exclude, `*` all
+  or none), `relative` (`--relative[=<path>]`, `--no-relative`: paths outside the prefix are not
+  queued, names shown without it, attributes and `--summary` by the full path), `rotateTo` /
+  `skipTo` (`--rotate-to`, `--skip-to`; `git diff` dies on a path not in the diff, `git log` starts
+  at the next one) and `ignoreMatchingLines` (`-I<regex>`, POSIX extended regexes through
+  `compilePosixRegex`, as xdiff's `xdl_mark_ignorable_regex`). `setExitCode` (`--exit-code`) and
+  `setQuiet` (`--quiet`, which prints nothing and stops at the first difference) set `exitCode`
+  (git's `diff_result_code`, with `-w`/`-I` counting only pairs whose patch shows a change) and
+  `hasChanges`; `quietDetectsRenames` keeps git 2.43's rename detection under `--quiet`.
+  `setOldTree("A...B")` diffs from the merge base (git's warning when there are several, its
+  errors when there is none), `"A..B"` is `A B`, and `setMergeBase` is `--merge-base`. `git log`
+  takes `diffFilter` (only the commits whose filtered diff is not empty), `relative`,
+  `ignoreMatchingLines` and non-strict `rotateTo`/`skipTo` through `setDiffOptions`. `exitCodeFromContents` keeps git 2.43's exit status (every queued pair counts). In
+  vcs-utils, `UnifiedDiffOptions.ignoreRegex`, `markIgnorableRegex`, and `compilePosixRegex`'s
+  `newline` option (`REG_NEWLINE`) (statewalker/statewalker-root#313).
+- 26fba0e: `git fetch`'s flags now match native git 2.43 and 2.56 (native twins in
+  `fetch-flags-native.test.ts`, from t5510, t5574 and t5553). `FetchCommand.setSetUpstream` is
+  `--set-upstream`: it writes `branch.<name>.remote`/`merge` through the branch-tracking code
+  `git branch -u` uses, or gives git's warnings. `--dry-run` now stores the fetched objects as git
+  does (no ref, no FETCH_HEAD), so it reports forced and refused updates as a real fetch would, and
+  it prints the auto-followed tags twice as git does. A fetch into the checked-out branch is refused
+  in a working copy without linked worktrees too. Under 2.5x, a fetch that is not atomic writes its
+  refs in one batch (`FetchClientOptions.batchNonAtomic`), and the reference-transaction hook hears
+  git's create-only transaction of `refs/remotes/<name>/HEAD`. Under 2.43, a refused update keeps
+  the padded summary column, and `--atomic` prints the empty `error: ` line.
+- 55e8d20: `git format-patch` gets more of its options, with native twins (statewalker/statewalker-root#331).
+  New on `FormatPatchCommand`: `setAttach` / `setInline` (`--attach[=<boundary>]`,
+  `--inline[=<boundary>]`, `--no-attach`, and `format.attach`: multipart mails as log-tree.c
+  writes them, the patch in a `text/x-patch` part after the diffstat, the closing boundary in
+  place of the signature, the cover letter left plain), `setNotes` (`--notes[=<ref>]`,
+  `--no-notes`, applied in order after `format.notes`; the notes after the `---` line),
+  `setCoverFromDescription` (`--cover-from-description=message|subject|auto|none|default` and
+  `format.coverFromDescription`, from `branch.<name>.description` of the branch git's
+  `find_branch_name` picks, a bad mode dying as git) and `setIgnoreIfInUpstream`
+  (`--ignore-if-in-upstream`: patch ids of the upstream side, `need exactly one range` / `not a
+  range` as git). `--signoff` now reads the `trailer.*` settings (`trailerConfigOf`), and a
+  committer ident that is not ASCII adds the 8bit MIME headers, as git's `need_8bit_cte`. The
+  cover letter's subject and `From:` are RFC 2047-encoded from git 2.44 on (`setVersionString`
+  picks older behaviour). `DiffTextOptions.statSep` is diff.c's `stat_sep`, and `mailSubjectLine`
+  (log-output) is pretty.c's subject header.
+- 92d0fd5: `git.grep()` (`GrepCommand`) is `git grep` (builtin/grep.c, grep.c): the worktree's tracked
+  files, `--cached`, `--untracked`, `--no-index` (and `grepNoIndex` outside a repository), trees
+  and revisions (`<rev>:<path>` names, arguments read as git reads them with or without `--`).
+  Patterns `-e`/`-f` with `--and`/`--or`/`--not`/parentheses and `--all-match`, `-E`/`-F`/`-G`
+  (`-P` as a git without PCRE), `-i`, `-w`, `-v`; output `-n`, `-c`, `-l`/`-L`, `-o`, `--column`,
+  `-h`/`-H`, `--full-name`, `-z`, `--break`, `--heading`, `-q`, `-m`, context `-A`/`-B`/`-C`,
+  `-p`/`-W` through the diff driver's funcname pattern, `--color` with `color.grep.<slot>`;
+  `--max-depth`, pathspecs from the current directory (`setPrefix`), `grep.*` settings, binary
+  files (`-a`, `-I`, the `diff` attribute), `--textconv` through the installed runner, and git's
+  threaded output (`--threads`). `--recurse-submodules` is refused. `setCompatibility("2.43")`
+  follows 2.43's `-o` columns, `-W` trailing lines and expression errors.
+  
+  `compilePosixRegex`'s `exec` takes `REG_NOTBOL`, and an unterminated `[` at the pattern's end is
+  glibc's `REG_BADPAT` ("Invalid regular expression").
+  
+  `REG_ICASE` patterns no longer fold a copy of every subject they are run on: their character
+  sets take a lower-case byte as its upper case at compile time (glibc's translate table), and
+  back-references compare folded, so `git grep -i` with a regex is linear again.
+- 72023c3: `git.show()` (`ShowCommand`) is `git show`: commits as `git log -1 -p` shows them with show's
+  defaults (merges' dense combined diff, `--stat`, `--name-only`, `--format`, `-s`, `-m`, `-c`,
+  `--first-parent`), annotated tags (`tag <name>`, the tagger, the message, then the tagged
+  object, nested tags followed), trees (`tree <name>` and the top-level entries), blobs (raw, or
+  through the path's textconv under `--textconv` for `<rev>:<path>` and `:<path>`), several objects
+  at once with git's separators (a commit named twice shown once, path-limited commits that change
+  none of the paths left out), and ranges or `-<n>` walking as `git log`. `call()` returns stdout,
+  stderr lines and the exit status (255 for a tag whose object is missing); `callText()` the text.
+  `DiffCommand.textconvBlob` runs a path's textconv on a blob (statewalker/statewalker-root#312).
+- 73efcae: `git log`/`git rev-list` revision selection and order (statewalker/statewalker-root#314).
+  `RevListCommand.addRevision` takes git's ref options: `--all`, `--branches[=<pattern>]`,
+  `--tags[=<pattern>]`, `--remotes[=<pattern>]`, `--glob=<pattern>` and `--exclude=<pattern>`
+  (which applies to the next ref option only), with `addAll`/`addBranches`/`addTags`/
+  `addRemotes`/`addGlob`/`addExclude` as shortcuts, and `--end-of-options`; `addStdin(text)` is
+  `--stdin` (its own `--not`, ref options, `--` then paths). `LogCommand` and `RevListCommand`
+  get `setOrder("topo" | "date" | "author-date")`, `setReverse`, `setBoundary` (boundary commits
+  after the others, `boundary: true`) and `setSource` (`source` on each commit, also turned on
+  by `%S`); `LogOutputOptions` gets `dateOrder`, `authorDateOrder`, `boundary` and `source`, and
+  log's output prints the `-` mark (`commit - <id>`, `- <id>` under `--oneline`, `%m`) and the
+  `\t<source>` after the id. `RevListCommand.callText()` prints rev-list's output (`-<id>` for
+  boundaries), `callLogText(options)` git log's, and `setBisect("bisect" | "vars")` gives
+  `--bisect` and `--bisect-vars` (`getExitStatus()`). `%m` in log formats is now `>` as git's.
+  `--graph --boundary` is refused (`NotImplementedError`).
+- 881c199: Merge messages as git's fmt-merge-msg writes them. `git.fmtMergeMsg()` (`FmtMergeMsgCommand`) is
+  `git fmt-merge-msg` over FETCH_HEAD-style lines or the heads `git merge` would be given:
+  the title (`merge.suppressDest`, `--into-name`), annotated tags' messages, and the shortlog
+  (`--log[=<n>]`, `--no-log`, `merge.log` and its old name `merge.summary`, `merge.branchdesc`,
+  `# By`/`# Via` credits). `MergeCommand` builds its message through it and gains `setLog`,
+  `setSignoff` (git's `Signed-off-by:` trailer, added before the hooks see MERGE_MSG) and
+  `setIntoName`; its default title now follows git's `dwim_ref` (a tag before a branch of one
+  name, `branch 'x' (early part)` for `x~2`) and `merge.suppressDest`, and MERGE_MSG holds the
+  generated message without a final newline while the hooks run, as git writes it. `git pull`
+  describes the merged head from FETCH_HEAD, so `merge.log` lists the pulled commits.
+- fabc71f: `--pathspec-from-file` and `--pathspec-file-nul` for add, rm, commit and stash push:
+  `AddCommand`, `RmCommand`, `CommitCommand` and `StashCreateCommand` get
+  `setPathspecFromFile(content, nul?)`, as reset, restore and checkout have it. The commands
+  share one reader (`PathspecFile` over `parsePathspecFile`: C-quoted lines, CRLF, NUL mode, a
+  NUL inside a line ending it before any unquoting; `rm` dies with `fatal:` on an empty element) and git's refusals: beside pathspec arguments (now
+  whatever the file holds, an empty file too, in reset, restore and checkout as well), with
+  `-p`/`--interactive` (add), `-a` (commit), `--patch`/`--staged` (stash push) and `--detach`
+  (checkout, which now refuses it with git's message). An empty file is git's "Nothing
+  specified, nothing added." for add, "No pathspec was given. Which files should I remove?" for
+  rm, and a commit of the index as it is (statewalker/statewalker-root#299).
+- 2336f4b: `cherry-pick` and `revert` take git's remaining flags (statewalker/statewalker-root#311):
+  `CherryPickCommand.setRecordOrigin` (`-x`, its `(cherry picked from commit …)` line after a
+  blank line unless the message ends with a trailer block), `setSignoff` on both commands (`-s`,
+  through the trailers engine and `trailer.*`), `setAllowEmpty`, `setAllowEmptyMessage`,
+  `setKeepRedundantCommits` and `setEmpty("stop" | "drop" | "keep")` (`--empty`, git 2.45+:
+  a dropped commit prints git's `dropping … -- patch contents already upstream` in the output),
+  `setFastForward` (`--ff`, also onto an unborn branch, reflog `cherry-pick: fast-forward`), and
+  `RevertCommand.setReference` (`--reference`, `revert.reference`). The commit message is cleaned
+  up as git's try_to_commit cleans it (`whitespace` for `-s`/`-x`, else `commit.cleanup`), a pick's
+  message starts at its subject, a revert of a revert is titled `Reapply "…"`, and every flag is
+  saved in and read back from `sequencer/opts`, so native git continues our sequences and the
+  other way round. Options git refuses together (`--ff` with `-s`/`-x`/`-n`/`--edit`; `-n`, `-s`,
+  `-m`, `-x`, `--ff`, `--keep-redundant-commits`, `--empty` with `--continue`/`--skip`/`--abort`/
+  `--quit`, the last two only from 2.45) throw git's `fatal:` line. `-m` follows git: a parent a
+  merge does not have, or `-m 2` on a non-merge, refuses with `error: commit <id> does not have
+  parent <n>`; `-m 0` with exit 129. Picking onto an unborn branch commits a root commit, and
+  `-n` over an unmerged index refuses with `error: your index file is unmerged.`.
+  A sequence of picks onto an unborn branch runs as git's (`sequencer/head` as git leaves it, an
+  empty abort-safety), a revert sequence there refuses with `can't revert as initial commit`, a
+  commit named twice is picked once, and `--skip` with nothing stopped says
+  `no cherry-pick in progress` / `no revert in progress`.
+- b28bc6f: `git push -u`/`--set-upstream` (`PushCommand.setSetUpstream`, through `branch-tracking.ts`'s
+  `installTracking`, git's `branch 'x' set up to track 'origin/x'.` in
+  `PushResult.upstreamMessages`), `--follow-tags` and `push.followTags` (`setFollowTags`;
+  `PushClientOptions.followTags`, remote.c's `add_missing_tags`), and `--force-if-includes` and
+  `push.useForceIfIncludes` (`setForceIfIncludes`; `PushClientOptions.includesRemote`, the
+  `rejected-remote-updated` status, "remote ref updated since checkout"). Native twins for
+  `--force`, `+refspec` and every `--force-with-lease` form (t5523, t5516, t5533).
+- 112c5ce: `git.push()` follows `git push`'s ref modes and push options, checked against native git 2.43
+  and 2.56 (statewalker/statewalker-root#306). New setters: `setMirror` (`--mirror`, also
+  `remote.<name>.mirror`: every local ref pushed and forced, every other remote ref deleted),
+  `setDelete` (`--delete`, with `tag <name>`), `setCompatibility`. `push.default` follows
+  `setup_default_push_refspecs` with git's messages (no upstream, multiple upstreams, an upstream
+  of another name, a triangular workflow, a detached HEAD, `nothing`), `push.autoSetupRemote`, and
+  2.43's triangular check; a branch named alone goes where `remote.<name>.push` or (under
+  `upstream`) its upstream maps it. `--all`, `--tags`, `--delete` and `--mirror` refuse each other
+  and refspecs as each version does, the `tag` shorthand is read, push options come from
+  `push.pushOption` (an empty value clears them, a value-less one is fatal) when none are given,
+  and a refspec git refuses throws git's `error:` lines (exit 1). Pushing to a URL that is the push
+  URL of one configured remote updates that remote's tracking refs (2.5x). In vcs-transport,
+  receive-pack honours `receive.advertisePushOptions` (`advertisePushOptions`, off by default for
+  a served repository's config, as git), `PushClientOptions.mirror` mirrors, send-pack checks
+  `--atomic` and push options where git does (after the pre-push hook), and a push of nothing to
+  a remote without refs reports git's "No refs in common" (`PushClientResult.noRefsInCommon`).
+- 85a3ea4: `git.rebase()` gets `addTrailer` (`--trailer <token>=<value>`, git 2.46+): each rebased
+  commit's message gets the trailer through the trailers engine (`trailer.*` configuration and
+  commands apply; fixups and squashes add none, `fixup -C` adds them to the message it takes),
+  kept in `rebase-merge/trailer` for `--continue`. Like git it forces the rebase, refuses an
+  empty argument or one without a key before anything is done, and is an unknown option
+  (exit 129) under 2.43 compatibility. The date options (`setCommitterDateIsAuthorDate`,
+  `setIgnoreDate`) are checked against native git across picks, rewords, squashes, `exec`,
+  `--rebase-merges` and conflict resolutions. Conflicting picks now give git 2.45+'s
+  `advice.mergeConflict` hints (off drops them, unset adds how to turn them off), an `edit`
+  stop writes the picked message to `rebase-merge/message` as 2.5x does, and an interactive
+  rebase with nothing to replay shows its `noop` list to the editor instead of moving to the
+  upstream at once (statewalker/statewalker-root#310).
+- b9d7b54: `git rebase` separates onto from the upstream, as native git 2.43 and 2.56 do (native twins in
+  `rebase-onto-fork-point-native.test.ts`, from t3400, t3416, t3431, t6010 and t6099).
+  `RebaseCommand.setOnto` is `--onto <newbase>`, `A...B` included (the one merge base, git's
+  `need exactly one merge base` otherwise); `setBranch` is the `<branch>` argument (a local branch
+  switched to and moved, or any commit rebased on a detached HEAD; up to date, it is checked out
+  with `rebase: checkout <branch>`); `setKeepBase` is `--keep-base` (onto `<upstream>...<branch>`,
+  cherry-picks kept unless `setReapplyCherryPicks(false)`); `setForkPoint` is
+  `--[no-]fork-point`: the commits the upstream's reflog shows were once on it are left out (git's
+  get_fork_point). Without an upstream the branch's `@{upstream}` is used with the fork point on
+  (unless `rebase.forkPoint=false`), or git's advice is returned when it has none.
+  `can_fast_forward`, the todo list's range and its cherry-pick detection follow git's upstream,
+  onto and fork point; ORIG_HEAD is the rebased branch's tip. The new `git.mergeBase()`
+  (`MergeBaseCommand`) is `git merge-base` with `--all`, `--octopus`, `--independent`,
+  `--is-ancestor` and `--fork-point`, with git's messages and exit statuses.
+- 23af095: receive-pack now checks pushed objects as git does under `receive.fsckObjects` (else `transfer.fsckObjects`). Served repositories (`servedRepositoryOf`) and local pushes read `receive.fsck.<msg-id>` and `receive.fsck.skipList` in config order (`receiveFsckOf`). A pack the store unpacks is checked as unpack-objects `--strict` does; a kept pack is checked as index-pack `--strict` does. A refused pack is discarded with its quarantine. The client sees git's `remote: error: object <id>: <msg-id>: ...` lines, the unpack status `unpack-objects abnormal exit` or `index-pack abnormal exit`, and `unpacker error` for each ref. Unknown message ids warn, and a message type receive-pack cannot read kills it as git's does. `ReceivePackConfig.fsckObjects` carries the check in vcs-transport.
+  
+  receive-pack also reports the death of its connectivity check (`fatal: missing blob object ...`) on the progress channel. The push client records `error: remote unpack failed: <status>` in `PushResult.errors`, and keeps porcelain `Done` after a refused unpack over smart HTTP, as git's remote-curl helper does.
+  
+  A served repository's `receive.fsck.skipList` is read only inside its own git directories, as confined config includes are (`readConfinedFile` in vcs-store-files: symbolic links followed and checked, size cap). Any other path reads as unreadable (`could not open object name list`), so a repository's config cannot make the server read or echo another tenant's or the host's files. A local push into one's own repository reads the skip list as git does.
+- 3fab0ba: feat: git's ref-filter and `git.forEachRef()` (`for-each-ref`): the `%(atom)` format language (refname/upstream/push with short/lstrip/rstrip and track/trackshort/remotename/remoteref, objectname/tree/parent abbreviations, person, email and date atoms with mailmap and every date format, subject/body/contents/trailers, raw, `*` dereferencing, symref, flag, HEAD, worktreepath, describe, ahead-behind, is-base, if/then/else, align, color, `%xx`), `--shell/--perl/--python/--tcl` quoting, multiple sort keys with `-` and `version:` (`versionsort.suffix`), path and glob patterns, `--exclude`, `--points-at`, `--contains/--no-contains`, `--merged/--no-merged` (commit-graph aware), `--count`, `--omit-empty`, `--ignore-case`, `--include-root-refs`, `--start-after` (statewalker/statewalker-root#289)
+- 0b3a4e6: `git reflog expire`, `delete`, `exists`, `write` and `drop` as library commands on `ReflogCommand` (builtin/reflog.c, reflog.c): `callExpire(...refs)` with `setExpire`, `setExpireUnreachable`, `setAll`, `setSingleWorktree`, `setStaleFix`, `setRewrite`, `setUpdateRef`, `setDryRun` and `setVerbose`, plus `gc.reflogExpire*` and `gc.<pattern>.reflogExpire*`; `callDelete(...selectors)` for `<ref>@{<n>}` and `<ref>@{<date>}`; `callExists()` refuses invalid ref names as git; 2.5x's `callWrite(ref, old, new, message)` and `callDrop(...refs)`, refused under `setCompatibility("2.43")` as git 2.43 refuses them. Each returns git's stdout, error lines and exit status (`ReflogUpdateResult`).
+  
+  vcs-store-files' `expireReflogs` takes named reflogs, `--single-worktree`, `--stale-fix` (reflog.c's `keep_entry`), `--rewrite`, `--updateref`, `--verbose` and a delete's entry selector on both the files and the reftable backends; `dropReflogs` and `writeReflogEntry` are `refs_delete_reflog` and `ref_transaction_update_reflog`, and the reftable store gains `dropReflog` and `appendReflog`. Reflogs are rewritten in git's own format: nothing new is stored, and older versions read the result.
+- ee229c5: Reflog walks follow `git log -g` and `git reflog show`, checked against native git 2.43 and 2.56
+  (statewalker/statewalker-root#315). `RevListCommand.setWalkReflogs` (`-g`/`--walk-reflogs`) reads
+  each revision as a reflog to walk, as reflog-walk.c does: `HEAD`, `main` and `refs/heads/main`
+  keep the name given in `<ref>@{n}`, `@{0}` walks the current branch's reflog, `@{-1}` the branch
+  left before, `<ref>@{<n>}` starts at that entry and `<ref>@{<date>}` (`HEAD@{now}`) at the entry
+  of that date, shown as `<ref>@{<date>}`; an explicit `--date` shows dates for refs named without a
+  selector, `log.date` does not. Several reflogs interleave by entry date, entries whose value is no
+  commit are passed over, `--since`/`--until` compare the entry's date, paths are limited against
+  the commit's parents, and `-n`/`--skip`/`--grep`/`--no-merges` apply. New: `--grep-reflog`
+  (`addGrepReflog` on `LogCommand` and `RevListCommand`, the `reflogs` of `CommitGrepOptions`), git's
+  refusals (`cannot walk reflogs for <rev>` for `^a`/`a..b`, a sorted walk, `--reverse`,
+  `--grep-reflog` without `-g`, in each version's order: `setCompatibility("2.43" | "2.56")`),
+  `LogCommand.addReflogWalk`/`setWalkReflogs`, `LogResult.reflog` (rev-list's `-g`),
+  `RevListCommand.getWarnings`, `%gd` shortened as `shorten_unambiguous_ref`, and on
+  `ReflogCommand` `callText` (`git reflog [show] [<ref>]`: `%h <ref>@{n}: <message>`, its defaults
+  under other log options), `setMaxCount` and `callExists` (`git reflog exists`).
+- be8d9ef: Requests to sign are refused as native git refuses them when gpg cannot sign, since nothing signs objects yet. Before this, `TagCommand.setSigned(true)` wrote an unsigned annotated tag without a word, and `commit.gpgSign`, `tag.gpgSign` and `push.gpgSign` were ignored.
+  
+  A commit, merge, cherry-pick, revert, rebase or am that would sign a commit (`setSign(true)`, `setSigningKey(key)` or `commit.gpgSign=true`) now fails with git's lines (`error: gpg failed to sign the data:`, `(no gpg output)`, `fatal: failed to write commit object`, or the sequencer's variant) and git's exit status, at the point where git signs: no commit is made and no ref moves. A fast-forward signs nothing. The new error class is `SigningFailedError`, and `setSign(false)` is `--no-gpg-sign`.
+  
+  `git.tag()` with `setSigned(true)`, `setSigningKey(key)`, `tag.gpgSign` or `tag.forceSignAnnotated` fails with `error: unable to sign the tag` (exit 128), and writes no tag object or ref. `setSigned(false)` is `--no-sign`.
+  
+  `git.push()` takes `setSigned(true | false | "if-asked")` and reads `push.gpgSign`. A server without `push-cert` refuses a signed push with `fatal: the receiving end does not support --signed push`. An `if-asked` push to such a server goes ahead unsigned, with git's warning in `PushResult.warnings`. A server that takes certificates fails with `fatal: failed to sign the push certificate`, and nothing is sent. In vcs-transport, `PushClientOptions.signed`, `PushClientResult.warnings` and `PushCertificateError` carry these.
+- ea943ee: `git remote add` completes its options as git's builtin/remote.c `add`: `setFetch` (`-f`, through
+  `FetchCommand`), `setTrack` (`-t`), `setMaster` (`-m`, the remote HEAD symref), `setMirror`
+  (`--mirror=fetch|push`, bare `--mirror` with git's warning) and `setTags` (`--[no-]tags`), with
+  git's refusals and messages; a remote exists as `remote_is_configured` says (the repository's own
+  configuration or a legacy remote file, not tracking refs alone), and 2.5x refuses names inside or
+  around another remote's. `git remote set-url` gains `setAdd`/`setDelete`, takes `<oldurl>` as a
+  POSIX regular expression matched against the URLs as git reads them, and refuses as git does.
+  `RemoteListCommand.setVerbose(...).callText()` gives `git remote [-v]`'s text. A fetch under git
+  2.43 compatibility no longer creates `refs/remotes/<name>/HEAD` (2.48+'s `followRemoteHEAD`).
+- cb3f36a: `git log` and `git rev-list` commit filters (statewalker/statewalker-root#290). `LogCommand` and `RevListCommand` gain `addGrep`, `addAuthor`, `addCommitter`, `setAllMatch`, `setInvertGrep`, `setRegexpIgnoreCase`, `setPatternType` (`basic`, `extended`, `fixed`, `perl`), `setUseMailmap` and `setLogConfig`. They match as git's `commit_match` and grep.c do: author and committer patterns on their header lines without the date, through the mailmap under `log.mailmap`; `--grep` from the message's empty line on; `--all-match`; `--invert-grep` inverting `--grep` only; `grep.patternType` and `grep.extendedRegexp`; and git's `fatal:` line for a bad pattern (`GrepPatternError`).
+  
+  `-P` (`--perl-regexp`, `grep.patternType=perl`) is refused the way a git built without PCRE refuses it (`cannot use Perl-compatible regexes when not compiled with USE_LIBPCRE`). A pattern with no regex character still matches literally. No JavaScript RegExp ever runs a user's pattern. `grep.*` and `log.mailmap` are read only when a pattern is set, and `RevListCommand` reads neither by default, as `git rev-list` does. The log output (`callBytes`/`callText`) dies on a bad `grep.patternType` as `git log`/`git show` do.
+  
+  Filters compose through `CommitFilters` (`all`, `none`, `and`, `or`, `not`, `noMerges`, `onlyMerges`, `parents`, `commitTime`, `grep`, `author`, `committer`, `message`) and `addCommitFilter`. They form one stage of the walk that log, rev-list and the log output share. A `CommitFilter` may be async and reads the commit's raw bytes, so pickaxe and line-log filters can plug in later.
+- 633e638: `rebase --quit` (`RebaseOperation.QUIT`) and `--show-current-patch`
+  (`RebaseOperation.SHOW_CURRENT_PATCH`, the text in `RebaseResult.currentPatch`) as git: quit
+  removes `rebase-merge/` (deleting its `refs-to-delete`) or `rebase-apply/`, keeps an autostash
+  on `refs/stash` with git's lines, and leaves HEAD, the index, the worktree, ORIG_HEAD,
+  REBASE_HEAD and AUTO_MERGE; show is `git show REBASE_HEAD --` (or `git am
+  --show-current-patch` for an apply-backend rebase). Without a rebase both refuse with
+  `fatal: no rebase in progress` (2.43: `No rebase in progress?`, `RebaseCommand.setCompatibility`).
+  `am().setShowCurrentPatch("raw" | "diff")` prints the stopped mail or `rebase-apply/patch`.
+  `cherry-pick --quit` and `revert --quit` now run git's remove_branch_state after removing
+  `sequencer/`: CHERRY_PICK_HEAD, REVERT_HEAD, MERGE_MSG, AUTO_MERGE and the rest of the merge
+  state go, as in git (statewalker/statewalker-root#308).
+- d164891: Rebase, cherry-pick, revert, merge and am sign the commits they write
+  (statewalker/statewalker-root#319): `-S[<keyid>]` (`setSign`/`setSigningKey`), `--no-gpg-sign`
+  (`setSign(false)`, over the configuration) and `commit.gpgSign` now go through the host's signer
+  (`GitHostEnvironment.signer`) as git's sequencer, `builtin/merge.c` and `builtin/am.c` sign
+  (`commit_tree` with `gpg_sign`), instead of refusing; without a signer, or when it fails, each
+  command still fails as git's does when gpg cannot sign, leaving the state git leaves. A rebase's
+  recreated octopus merge gets `--no-gpg-sign` when the run does not sign, and `merge --continue`
+  signs only under `commit.gpgSign`, as the plain `git commit` git runs. am signs under a non-UTF-8
+  `i18n.commitEncoding` too (the signature after the `encoding` header). New:
+  `RebaseCommand.setForceRebase` (`--force-rebase`/`-f`: every commit picked again, not
+  remembered by `--continue`). Native twins: `tests/rebase-gpg-sign-native.test.ts`
+  (t3435-rebase-gpg-sign), `tests/cherry-pick-revert-gpg-native.test.ts`
+  (t3514-cherry-pick-revert-gpg) and `tests/signed-merge-am-native.test.ts`, in ssh (byte for byte)
+  and openpgp (verified).
+- 7fc3415: `git tag -s`, `-u <keyid>`, `tag.gpgSign` and `tag.forceSignAnnotated` now sign the tag through
+  the host's signer (`GitHostEnvironment.signer`), as builtin/tag.c's `do_sign`: the signature is
+  appended to the tag message, with `gpg.format` (openpgp, x509, ssh), `user.signingKey` and
+  `gpg.ssh.defaultKeyCommand` resolved as for `commit -S`. A failed signing dies as git (`error:
+  unable to sign the tag`, `The tag message has been left in .git/TAG_EDITMSG`, exit 128); under 2.43
+  compatibility a failing ssh-keygen leaves the tag unsigned with its error in `warnings`, as git 2.43
+  does (`SigningOutcome.exitCode`, set by `createNodeSigner`). Re-editing a signed tag with `-f`
+  starts from its message without the signature (`write_tag_body`); `signatureStart` is exported
+  from the ref filter.
+- ffc1814: Signed commits (statewalker/statewalker-root#288). A host now supplies a signer, `GitHostEnvironment.signer`, and `commit -S` (`setSign`, `setSigningKey`, `commit.gpgSign`) signs through it. The signature goes in the commit's `gpgsig` header, or `gpgsig-sha256` in a SHA-256 repository, byte for byte as git writes it.
+  
+  - The commands resolve what git's `sign_buffer` would run and pass it to the signer as a `SigningRequest`: the format, the program, the key and the payload. They read `gpg.format`, `gpg.program`, `gpg.<format>.program`, `user.signingKey` (default: the committer's `Name <email>` for openpgp and x509) and `gpg.ssh.defaultKeyCommand`. A bad variable dies as git dies.
+  - `createNodeSigner` (vcs-utils-node) runs gpg, gpgsm or ssh-keygen as git does, with the same arguments, stdin, `--status-fd=2` and `SIG_CREATED` check, and reports failures with git's messages.
+  - `createSshSigner` (vcs-commands) signs in-process with an Ed25519 OpenSSH key through Web Crypto. Its signatures are ssh-keygen's byte for byte.
+  
+  Without a signer, a request to sign is still refused as before. Tags, merge and pick commits made in-process (the merge/pick/rebase/am family) and push certificates still refuse; their own tickets will add signing. Commits these commands leave to `git commit` (`merge --continue`, an edited or resolved pick or revert) go through `commit` and sign.
+- 97746b8: `git rm -q`/`--quiet` (`RmCommand.setQuiet`) and git's `rm '<path>'` lines in `RmResult.output` (dry runs too, one per index entry, a sparse directory `--sparse` removes whole as `out/`); `git clean -e <pattern>` (`CleanCommand.setExcludePatterns`: command-line exclude rules asked before the standard ones, the only ones under `-x`); `git add --sparse` (`AddCommand.setSparse`). `add --ignore-errors` reports an unreadable file as git does (`error: open("<path>"): Permission denied`, `error: unable to index file '<path>'`). `rm`, `add` and `--renormalize` see a sparse index as git does (sparse directories kept collapsed unless a pathspec or a sparse directory on disk expands it, with 2.5x's `advice.sparseIndexExpanded` hint), and a failed `add --chmod` exits 255 as git. vcs-working-tree: `WorktreeWalkOptions.excludePatterns`, `createCommandLineExcludes`/`commandLineExcluded`, an `IgnoreManager.isIgnored` command-line argument, and `Staging.indexLayout().sparseDirectories`.
+- 9353801: `git stash` is complete: `git.stashPop()` (apply then drop, the entry kept on conflicts with
+  git's message, `stash.index` in 2.5x), `git.stashShow()` (`--stat`/`-p`/any diff format and
+  option through `DiffCommand`, `stash.showStat`/`showPatch`/`showIncludeUntracked`, `-u` and
+  `--only-untracked`), `git.stashBranch()` (`checkout -b` at the stash's base, apply with
+  `--index`, drop on success) and `git.stashStore()` (a created stash recorded with its reflog
+  message). `stashList().callText(options, walk)` prints `git stash list [<log-options>]`
+  through `LogCommand`, which gains `setReflogWalk(ref)` (`git log -g`: `Reflog:` lines,
+  `--oneline` selectors, `%gd`/`%gD`/`%gs`/`%gn`/`%ge`, date selectors). Pop, branch and show
+  print git's stdout (`getOutput()`) and fail with git's messages and exit statuses
+  (`setCompatibility("2.43")` for 2.43's). `StashApplyResult.messages` holds merge-ort's
+  messages (statewalker/statewalker-root#298).
+- fce4dfb: `git submodule absorbgitdirs [--quiet] [<path>...]` (statewalker/statewalker-root#329):
+  `git.submoduleAbsorbGitDirs()` moves each submodule's embedded `.git` directory into the
+  superproject's git directory (`.git/modules/<name>`, or `submodule.<name>.gitdir` under
+  `extensions.submodulePathConfig`) and leaves a gitfile and `core.worktree`, then does the same in
+  nested submodules (git's `absorb_git_dir_into_superproject` and its child run per submodule), and
+  rewrites a nested gitfile that no longer names a repository. The move runs first and its result
+  is checked (`relocate_gitdir`), so a failure leaves the repository where git can still read it;
+  git's deaths (`could not lookup name`, more than one worktree, broken gitfiles, symlinked paths)
+  are reproduced, git's errno included (`could not migrate git directory ...: Directory not empty`).
+  Symbolic links are followed as git's `stat` follows them: a linked `.git/modules` and a `.git`
+  linked to a repository are migrated where they lead (`physicalFilesPath` resolves them through
+  the FilesApi's `lstat`/`readlink`); a link leading beyond the FilesApi is refused with git's
+  `could not create directory` line, nothing moved.
+  Leading directories are created as git's `safe_create_leading_directories` creates them
+  (`safeCreateLeadingDirectories`): a dangling link on the way refuses with git's line and its
+  target is never created; a loop is git's stat failure. `Worktree.openGitlink` takes `gitDir`, the
+  repository a caller found through a link the storage does not follow, so nested absorption
+  reaches a submodule whose `.git` or gitfile leads through a link. `git rm` removes a submodule
+  whose `.git` is a link (the link only) once it is absorbed. `submodule deinit` and `git rm` share this code: deinit now absorbs nested
+  submodules too, and `git rm` of a submodule holding a `.git` directory absorbs it before removing
+  it (`RmResult.messages` carries the `Migrating ...` lines, also in the result of an
+  `RmFailedError` raised afterwards; a failed absorb is an `RmFailedError` with exit 128), as git does. `modules/` is now looked
+  up in the worktree's own git directory (a linked worktree's `worktrees/<id>/modules/`), as git
+  keeps it per worktree.
+  
+  Migration and rollback: the layout written is git's own, and older webrun versions already read
+  submodules through gitfiles, so no reverse move is needed to go back.
+- 7f8b7d4: `git submodule add` as a library command (statewalker/statewalker-root#326): `git.submoduleAdd()`
+  (`SubmoduleAddCommand`: `setURI`, `setPath`, `setName`, `setBranch`, `setForce`, `setQuiet`,
+  `setReference`, `setDepth`, `setTransports`, `setCompatibility`) follows
+  builtin/submodule--helper.c's `module_add`: the repository cloned into `.git/modules/<name>` (or
+  `submodule.<name>.gitdir` under `extensions.submodulePathConfig`) with `GIT_PROTOCOL_FROM_USER=0`,
+  a gitfile and `core.worktree` linking it to its path, `checkout -f -q [-B <branch>
+  origin/<branch>]`, then `submodule.<name>.url`/`.active` in `.git/config`, `path`/`url`/`branch`
+  in `.gitmodules`, the gitlink and `.gitmodules` staged. Relative URLs resolve against the
+  superproject's remote; an existing repository at the path is added as it is; git's refusals and
+  messages (a path in the index, an ignored path without `-f`, a bad URL or name, a name another
+  path uses in 2.5x, a kept git directory without `-f`, a held index lock, `protocol.file.allow`)
+  are reproduced for 2.43 and 2.56. `Worktree.openGitlink` takes an `environment` to open the
+  submodule with. `git add`'s ignored-path advice now uses git 2.43's wording under 2.43
+  compatibility.
+- bb6d5d3: The submodule model (`SubmoduleModel`, `Gitmodules`, `relativeUrl`: git's submodule-config.c) and `git submodule init`, `deinit`, `sync`, `set-url`, `set-branch` and `foreach` (`git.submoduleInit()` and the rest); `RmCommand.setDryRun`; `RepositoryFormat.submodulePathConfig` for `extensions.submodulePathConfig`.
+- 907c434: `git submodule update` and `git submodule status` (`git.submoduleUpdate()`, `git.submoduleStatus()`): update clones missing submodules into `.git/modules/<name>` and brings each to the commit the index records with its strategy (checkout, rebase, merge, `none`, or a configured `!command`), with `--init`, `--remote` (`submodule.<name>.branch`), `--recursive`, `--force`, `--no-fetch`, `--depth` and `--[no-]recommend-shallow`; its clones and fetches go through the command's transports, and credentials and headers reach only the URLs they are given for (`setCredentialsForUrl`/`setHeadersForUrl` per URL; static `setCredentials`/`setHeaders` only for the origins named with `addCredentialOrigin`, else the superproject's remote's origin), never another host a `.gitmodules` names: the transports attach them per request and origin (`guardSubmoduleTransports`, `strictUrlOrigin`), redirects to another origin included. Status prints git's `-`/`+`/`U`/` ` lines with `describe`'s names, `--cached` and `--recursive`. `%(describe)` takes `all` and `always`.
+- 8bbc62f: `git tag` creation and deletion follow git: `tag().setEdit()`/`setEditor()` (`-e`, git's
+  template and cleanup, the previous tag's body reused under `-f`), `setCreateReflog()`
+  (`--create-reflog`), `addTrailer()` (`--trailer`), `setCompatibility()`, and `callText()`
+  giving `Updated tag 'x' (was abc1234)` and the nested-tag advice; `tagDelete().callText()`
+  gives `Deleted tag 'x' (was abc1234)`, `error: tag 'x' not found.` and the exit status.
+  Refusals carry git's messages (`fatal: tag 'x' already exists`, `fatal: 'x' is not a valid
+  tag name.`, `fatal: no tag message?`); an annotated tag without a message and without an
+  editor now fails as `GIT_EDITOR=: git tag -a` does; a tag of a tree, blob or tag records its
+  real type; `tagDelete()` always deletes `refs/tags/<name>`, as git.
+  `tag -f` over a symbolic tag ref updates the ref it names, as git; a `tag -d` whose deletion
+  fails reports git's `could not delete references` lines (exit 1) after the others. Ref stores
+  create the reflogs of the symbolic refs an update goes through under `createReflog` (git's
+  REF_FORCE_CREATE_REFLOG reaching split_symref_update), not HEAD's when it only records its
+  branch's update (`reflogInChain`).
+- 30c65f5: `git.tagList()` gets git's list mode on the ref filter: `callText()` prints `git tag --list`'s
+  output byte for byte, with `setPatterns`, `setIgnoreCase` (`-i`), `setLines` (`-n<num>`: each
+  tag's annotation, a signed tag's message without its signature, a lightweight tag's commit
+  message), `setSort` after `tag.sort` and `setNoSort` (`version:refname` with
+  `versionsort.suffix`), `setFormat`, `setOmitEmpty`, `setColor`, and the reachability filters
+  `setContains`/`setNoContains`/`setMerged`/`setNoMerged`/`setPointsAt`. `call()` applies the same
+  filters. `ListTagCommand` now extends `RefListingCommand`. Version sorting reports a
+  `versionsort.suffix`/`versionsort.prereleaseSuffix` without a value as git does
+  (`error: missing value for ...`, the key then ignored) (statewalker/statewalker-root#296).
+- 39eb170: Trailers engine (git's trailer.c) and `git.interpretTrailers()`: `interpretTrailers`/`processTrailers` add and edit trailers with `--where`, `--if-exists`, `--if-missing`, `--trim-empty`, `--only-trailers`, `--only-input`, `--unfold`, `--parse`, `--no-divider` and the `trailer.*` configuration (`key`, `where`, `ifexists`, `ifmissing`, `cmd`, `command`, `trailer.separators`); trailer commands run through the host's hook runner. `amendWithTrailers` and `validateTrailerArgs` are the `--trailer` of commit, tag, merge, rebase and cherry-pick; `appendSignoff` takes the footer to keep (`ignoredLogMessageBytes`), `signoffLine` builds the line, `trailerLinesOf` is git's trailer iterator.
+- e38cea5: Signature verification (statewalker/statewalker-root#318): `GitHostEnvironment.verifier`
+  beside the signer, `createNodeVerifier` (runs gpg, gpgsm or ssh-keygen as git's
+  gpg-interface.c does) and `createSshVerifier` (Ed25519 in-process, honouring
+  `gpg.ssh.allowedSignersFile` validity dates and `gpg.ssh.revocationFile`). New commands
+  `git.verifyCommit()` and `git.verifyTag()` (`-v`, `--raw`); every `%G` placeholder checks the
+  signature; `log --show-signature` / `log.showSignature` (mergetags too); `merge` and `pull`
+  take `setVerifySignatures` (`merge.verifySignatures`) and refuse with git's messages.
+- 3df714c: Word diff in `git diff`, `log -p` and `show`: `DiffTextOptions.wordDiff` (`--word-diff=plain|color|porcelain|none`, `color` is `--color-words` and turns colors on) and `wordDiffRegex` (`--word-diff-regex`, `--color-words=<regex>`), `diff.wordRegex` and `diff.<driver>.wordRegex`, with the builtin drivers' word regexes from userdiff.c (`BUILTIN_WORD_REGEXES`, `userdiffWordRegex`) run through `compilePosixRegex`. `driverCompatibility: "2.43"` selects git 2.43's builtin drivers (word and funcname patterns).
+- 8d4bcd5: `git.worktreeAdd()` gets git's tracking options: `setTrack` (`--track`, `--track=inherit`,
+  `--no-track`, refused without a new branch), `setGuessRemote` (`--[no-]guess-remote`,
+  default `worktree.guessRemote`), and git's DWIM of a commit-ish that names no commit but one
+  remote-tracking branch (`checkout.defaultRemote` among several; 2.5x dies with git's advice on
+  an ambiguous name, `setCompatibility("2.43")` takes it for none, as 2.43 did). A new branch
+  now tracks its start as `git branch` does (`branch.autoSetupMerge`), printing
+  `branch 'x' set up to track 'r/x'.`; `WorktreeError.messages` carries what git prints before
+  dying.
+  
+  Relative worktree links (git 2.48+): `setRelativePaths` on `worktreeAdd()`, `worktreeMove()`
+  and `worktreeRepair()` (default `worktree.useRelativePaths`) write `gitdir` and the
+  worktree's `.git` file relative to each other and set `extensions.relativeWorktrees` (with
+  `core.repositoryformatversion = 1`), only on request. Repair rewrites links of the other kind
+  (`absolute/relative path mismatch`), so a repair without the option turns relative links back
+  into absolute ones; both link files are written together, as `write_worktree_linking_files`.
+  Under `setCompatibility("2.43")` the option is refused and repair rewrites only the file at
+  fault. `LinkedWorktrees.create` takes `relativePaths`, `move`/`repair` take
+  `WorktreeLinkOptions`; relative links are read everywhere. A version-0 repository with an
+  extension git does not know cannot be upgraded: relative add, move and repair are refused
+  before anything is written (`WorktreeFormatUpgradeError`, git's `cannot upgrade repository
+  format: unknown extension <name>`), and `RepositoryFormat.unknownExtensions` lists them.
+  
+  Checkout and switch: an ambiguous remote branch name prints git's
+  `advice.checkoutAmbiguousRemoteBranchName` hints (2.5x and 2.43 wordings), a name no ref has
+  dies `fatal: invalid reference: <name>`, and a branch created from a ref some remote fetches
+  outside `refs/remotes/` (`refs/repo_d/*`) tracks it, as git's `dwim_branch_start`
+  (statewalker/statewalker-root#320).
+
+### Patch Changes
+
+- e4e1a0f: gc takes its lock as `git gc` does (`lock_repo_for_gc`): `gc.pid` holds `<pid> <host>` and is written through `gc.pid.lock`. A young lock of another host or of a running process is held, while a dead process's lock, an unreadable one or one older than 12 hours is taken over. `git.gc()` now refuses with git's messages ("gc is already running on machine '<host>' pid <pid> (use --force if not)", or "Unable to create '.../gc.pid.lock': File exists"), and `setForce(true)` is `git gc --force`. Native git and ours now see each other's gc. `GitHostEnvironment.gcProcess` gives the pid, the host name and a process check; `createNodeGitHostEnvironment` fills it.
+  
+  gc keeps what concurrent writers need:
+  
+  - the prune checks each expired loose object's mtime again right before unlinking it, so a write that freshened it meanwhile keeps it (also `FileGcStrategy.prune`);
+  - the repack checks each old pack's mtime again right before removing it, so a pack freshened since the listing stays;
+  - the prune walks the refs again when they moved during the gc, as git's separate prune process does.
+- 0215d69: Checkout, switch, `read-tree -u`, `reset --hard`/`--mixed`/`--merge`/`--keep`, merge and clone now refuse a tree path that git's `verify_path` refuses the way git does, before anything is written. The message is `error: invalid path '<path>'` with the entry's full path, followed by the command's own lines and git's exit code. A tree entry with an empty name dies with `fatal: empty filename in tree entry`. Before this fix, these commands reported internal errors (`Tree entry name cannot be '..'`, `Invalid path: ... (contains .git)`), named the directory instead of the file, and `read-tree -u` and `reset` could remove files or move HEAD before refusing.
+  
+  `core.protectNTFS` (default true) and `core.protectHFS` (default true on macOS, as git, and also where the system is unknown) are now read by checkouts and by `git add`/`mv`/`rm`/`commit` index writes (`worktreePathRules`). `isValidWorktreePath` takes `protectNTFS` and `protectHFS` options; with both off it still refuses `.git` in any case, `.`, `..` and a symlinked `.gitmodules`. `protectHFSDefault(systemName)` gives the default (on for `Darwin` and for an unknown system). `FileWorktree` keeps both protections on, on every platform, and reports them as `capabilities.protects`; commands that write such a worktree check at least that strictly, before writing anything. Tree decoding errors are now `InvalidTreeEntryNameError`. `ReadTreeFailedError` exits 128, as `git read-tree` does.
+- 5012bc8: `git.push()` without `setRemote` now picks the remote as `git push` does (`pushremote_for_branch`). The order is `branch.<current>.pushRemote`, then `remote.pushDefault`, then `branch.<current>.remote`, then the one configured remote, then `origin`; a detached HEAD skips the branch's settings. Before this fix it always pushed to `origin`.
+  
+  A remote named in the configuration may be a URL, a path or `.`, as in git. When push falls back to the single configured remote or to `origin` and that remote is not configured, it refuses with git's "No configured push destination." It no longer treats the name `origin` as a path.
+  
+  The branch's own remote for `push.default=simple` follows git's `remote_for_branch`, including the single-remote fallback. `RemoteConfigStore` gains `remoteForBranch` and `pushRemoteForBranch`, which `@{push}` now shares with push.
+- Updated dependencies
+- Updated dependencies
+- Updated dependencies [5906bba]
+- Updated dependencies [99fa82a]
+- Updated dependencies [8b49aa7]
+- Updated dependencies [1feb9c3]
+- Updated dependencies [3bdea1f]
+- Updated dependencies [26fba0e]
+- Updated dependencies [e4e1a0f]
+- Updated dependencies [92d0fd5]
+- Updated dependencies [0215d69]
+- Updated dependencies [b28bc6f]
+- Updated dependencies [112c5ce]
+- Updated dependencies [23af095]
+- Updated dependencies [0b3a4e6]
+- Updated dependencies [be8d9ef]
+- Updated dependencies [6229b25]
+- Updated dependencies [7fc3415]
+- Updated dependencies [ffc1814]
+- Updated dependencies [97746b8]
+- Updated dependencies [fce4dfb]
+- Updated dependencies [7f8b7d4]
+- Updated dependencies [bb6d5d3]
+- Updated dependencies [8bbc62f]
+- Updated dependencies [e38cea5]
+- Updated dependencies [3df714c]
+- Updated dependencies [8d4bcd5]
+  - @statewalker/vcs-core@0.8.0
+  - @statewalker/vcs-store-mem@0.8.0
+  - @statewalker/vcs-store-files@0.8.0
+  - @statewalker/vcs-utils@0.8.0
+  - @statewalker/vcs-working-tree@0.8.0
+  - @statewalker/vcs-transport@0.8.0
+
 ## 0.7.0
 
 ### Minor Changes
