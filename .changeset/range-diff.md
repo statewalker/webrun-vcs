@@ -1,0 +1,5 @@
+---
+"@statewalker/vcs-commands": minor
+---
+
+`git range-diff` (`git.rangeDiff()`, `RangeDiffCommand`): range-diff.c's reading of each range's `git log -p` into patches (metadata, message, notes and per-file sections), exact matches, then the cheapest pairing of the rest through linear-assignment.c's Jonker-Volgenant solver (`computeAssignment`, git's tie-breaking), and the output in the second range's order with each pair's diff of patches, plain, dual-colored or `--no-dual-color`. The three argument forms (`a...b`, `base r1 r2`, `r1 r2`, `--` and pathspecs), `--creation-factor`, `--left-only`/`--right-only`, `--notes`/`--no-notes`, `--no-patch`, `--stat`, `--abbrev` and `--color`. `git format-patch` gains `--interdiff=<rev>`, `--range-diff=<prev>` and `--creation-factor` (`setInterdiff`, `setRangeDiff`, `setCreationFactor`): the blocks in the cover letter, or for a single patch after it (git 2.46 and later) or as commentary below its `---` (before), with git's titles, notes and deaths, the version's default creation factor and implied cover letter.
