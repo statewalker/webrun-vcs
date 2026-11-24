@@ -378,7 +378,8 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     const base: ConfigEntry[] = [];
     this.commandEntries = [];
     this.errorLines = [];
-    if (env) {
+    const fileOnly = this.options.fileOnly === true;
+    if (env && !fileOnly) {
       const hostSource = (path: string, scope: ConfigScope): ConfigSource => ({
         read: env.readFile,
         path,
@@ -400,7 +401,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     await this.resolveOwnIncludes(reader);
     this.overlayEntries = [];
     this.resolvedCache = undefined;
-    if (isTrue(this.get("extensions.worktreeconfig"))) {
+    if (!fileOnly && isTrue(this.get("extensions.worktreeconfig"))) {
       const overlay: ConfigEntry[] = [];
       const path = this.options.worktreeConfigPath ?? `${dirOf(this.configPath)}config.worktree`;
       await reader.readFile(
@@ -413,7 +414,7 @@ export class GitWorkingCopyConfig implements WorkingCopyConfig {
     this.resolvedCache = undefined;
     // do_git_config_sequence: the command line last, once every file is read (a file git
     // cannot parse dies first); git dies on command-line config it cannot parse
-    if (env && this.options.commandLine !== false) {
+    if (env && !fileOnly && this.options.commandLine !== false) {
       if (env.commandLineConfigError !== undefined) {
         throw new CommandLineConfigError(env.commandLineConfigError);
       }
@@ -1359,6 +1360,12 @@ export interface GitConfigOptions {
    * from files` ({@link GitWorkingCopyConfig.loadErrors}).
    */
   compatibility?: "2.43" | "2.56";
+  /**
+   * Read this file alone (and what it includes): no system or global file, no
+   * `config.worktree`, no command line, as `git config --file <f> --includes` reads one file.
+   * The environment is still used to expand and read includes.
+   */
+  fileOnly?: boolean;
   /** Each of git's `error:` lines while the chain is read (see {@link GitWorkingCopyConfig.loadErrors}) */
   onError?: (line: string) => void;
   /**
@@ -1470,6 +1477,12 @@ export type ConfigScope = "system" | "global" | "local" | "worktree" | "command"
 interface ConfigSource {
   read(path: string): Promise<Uint8Array | undefined>;
   path: string;
+  /**
+   * The file as git names it, when that differs from {@link path}: a relative include is
+   * named as the including file's directory plus the include's value, `..` kept
+   * (`.git/../include/x`), as `handle_path_include` builds it
+   */
+  name?: string;
   /** Read through the host's environment (a host path), not the repository's files API */
   host?: boolean;
   /** The scope of its values (an included file's: the including file's) */
@@ -1692,7 +1705,7 @@ class ChainReader {
     }
     if (!content) return;
     const { lines, errorLine } = parseConfigText(decodeGitPatternFile(content));
-    const file = originName(source.path, source.host);
+    const file = source.name ?? originName(source.path, source.host);
     if (errorLine !== undefined) throw new ConfigParseError(file, errorLine);
     let lineEnd = 0;
     for (const line of lines) {
@@ -1791,8 +1804,8 @@ class ChainReader {
     if (depth > MAX_INCLUDE_DEPTH) {
       // git's include_depth_advice: the path resolved, and the file including it
       throw new ConfigIncludeDepthError(
-        originName(target.path, target.host),
-        from.commandLine ? "the command line" : originName(from.path, from.host),
+        target.name ?? originName(target.path, target.host),
+        from.commandLine ? "the command line" : (from.name ?? originName(from.path, from.host)),
       );
     }
     await this.readFile(target, out, depth, forbid);
@@ -1817,7 +1830,9 @@ class ChainReader {
         commandLineFailure("relative config includes must come from files"),
       );
     }
-    // beside `from`, its `.` and `..` resolved (a FilesApi does not resolve them itself)
+    // beside `from`, its `.` and `..` resolved (a FilesApi does not resolve them itself);
+    // named as git names it, beside the including file's name with `..` kept
+    const name = `${dirOf(from.name ?? originName(from.path, from.host))}${value}`;
     const joined = resolveDots(`${dirOf(from.path)}${value}`);
     if (joined.escapes && !from.host) {
       // above the repository's files API: the host file, where its root has a host path
@@ -1826,9 +1841,9 @@ class ChainReader {
         .rootDirectory;
       if (!root || !env) return undefined;
       const host = resolveDots(`${root.replace(/\/+$/, "")}/${dirOf(from.path)}${value}`);
-      return { read: env.readFile, path: host.path, host: true, ...scopeOf(from) };
+      return { read: env.readFile, path: host.path, host: true, name, ...scopeOf(from) };
     }
-    return { read: from.read, path: joined.path, host: from.host, ...scopeOf(from) };
+    return { read: from.read, path: joined.path, host: from.host, name, ...scopeOf(from) };
   }
 
   /**
@@ -1928,7 +1943,8 @@ class ChainReader {
     const env = this.env;
     const pass = new ChainReader(this.config, env, this.options, this.followIncludes, true);
     const entries: ConfigEntry[] = [];
-    if (env) {
+    const fileOnly = this.options.fileOnly === true;
+    if (env && !fileOnly) {
       const hostSource = (path: string, scope: ConfigScope): ConfigSource => ({
         read: env.readFile,
         path,
