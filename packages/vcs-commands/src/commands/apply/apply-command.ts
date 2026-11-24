@@ -54,7 +54,7 @@ export interface ApplyResult {
   /** Paths left with conflicts by `--3way` */
   conflicts: string[];
   /** With {@link ApplyCommand.setTemporaryIndex}: that index after the patches */
-  index?: Map<string, { mode: number; objectId: string }>;
+  index?: Map<string, { mode: number; objectId: string; intentToAdd?: boolean }>;
 }
 
 /** One patch to apply. */
@@ -510,8 +510,13 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
       for (const [name, entries] of engine.indexChanges) {
         const path = toPath(name);
         const e = entries.find((x) => !x.stage);
-        if (e) this.temporaryIndex.set(path, { mode: e.mode, objectId: e.oid });
-        else this.temporaryIndex.delete(path);
+        if (e) {
+          this.temporaryIndex.set(path, {
+            mode: e.mode,
+            objectId: e.oid,
+            ...(e.intentToAdd ? { intentToAdd: true } : {}),
+          });
+        } else this.temporaryIndex.delete(path);
       }
     } else if (writeIndex && engine.indexChanges.size) {
       const changes = new Map<string, IndexEntryInput[]>();

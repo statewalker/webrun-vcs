@@ -1397,7 +1397,16 @@ export class CommitCommand extends GitCommand<CommitResult> {
       const changes = new Map<string, StagingEntry[]>();
       for (const [path, entry] of temporary) {
         const old = entries.get(path);
-        if (old && old.mode === entry.mode && old.objectId === entry.objectId) continue;
+        // an entry apply rewrote with the same blob (an empty intent-to-add file staged)
+        // loses its intent-to-add flag, so it is no longer the entry it was
+        if (
+          old &&
+          old.mode === entry.mode &&
+          old.objectId === entry.objectId &&
+          !!old.intentToAdd === !!entry.carried?.intentToAdd
+        ) {
+          continue;
+        }
         changes.set(path, [
           {
             path,
@@ -1636,7 +1645,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
         `fatal: reword option of '--fixup' and path '${path}' cannot be used together`,
       );
     }
-    if (this.all || this.include) {
+    // check_fixup_reword_options: patch_interactive || interactive || all || also || only
+    if (this.all || this.include || this.patch) {
       throw new IncompatibleOptionsError(
         ["--fixup", "--all"],
         "fatal: reword option of '--fixup' and '--patch/--interactive/--all/--include/--only' cannot be used together",

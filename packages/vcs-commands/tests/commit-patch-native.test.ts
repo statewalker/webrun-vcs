@@ -177,6 +177,47 @@ describeGit("commit -p as native git", () => {
     });
   });
 
+  it("commits a selected empty intent-to-add file, clearing its flag", async () => {
+    const withEmpty = (dir: string) => {
+      hunks(dir);
+      put(dir, "e", "");
+      gitOk(root, dir, ["add", "-N", "e"]);
+    };
+    await compare(twins(withEmpty), {
+      args: ["-m", "all"],
+      answers: ["y", "y", "y", "y", "y", "y"],
+      message: "all",
+    });
+    await compare(twins(withEmpty), {
+      args: ["-m", "only e", "--", "e"],
+      answers: ["y"],
+      paths: ["e"],
+      message: "only e",
+    });
+    await compare(twins(withEmpty), {
+      args: ["-m", "not e", "--", "e", "g"],
+      answers: ["n", "y"],
+      paths: ["e", "g"],
+      message: "not e",
+    });
+  });
+
+  it("refuses --fixup=reword: with -p as git does", async () => {
+    const dirs = twins(hunks);
+    const n = native(root, dirs.native, ["commit", "-p", "--fixup=reword:HEAD"], ["y"]);
+    expect(n.status).toBe(128);
+    const git = await openOurs(root, dirs.ours);
+    await expect(
+      git
+        .commit()
+        .setFixup("reword:HEAD")
+        .setPatch(true)
+        .setPatchSelector(selector(["y"]))
+        .call(),
+    ).rejects.toThrow(n.stderr.trim());
+    expect(view(root, dirs.ours)).toEqual(view(root, dirs.native));
+  });
+
   it("refuses -a, -i and unmerged entries as git does", async () => {
     const dirs = twins(hunks);
     const git = await openOurs(root, dirs.ours);

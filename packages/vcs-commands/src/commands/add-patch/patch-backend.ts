@@ -156,7 +156,12 @@ export function createPatchBackend(options: PatchBackendOptions): PatchBackend {
         temporary.clear();
         for (const [path, entry] of result.index) {
           const old = before.get(path);
-          const same = old && old.mode === entry.mode && old.objectId === entry.objectId;
+          // the same blob staged over an intent-to-add entry (an empty file) is a new entry
+          const same =
+            old &&
+            old.mode === entry.mode &&
+            old.objectId === entry.objectId &&
+            !!old.carried?.intentToAdd === !!entry.intentToAdd;
           temporary.set(path, same ? old : { mode: entry.mode, objectId: entry.objectId });
         }
       }
