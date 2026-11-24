@@ -1,15 +1,16 @@
 import type { Commit, ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { DEFAULT_BIG_FILE_THRESHOLD } from "@statewalker/vcs-core";
 import {
+  ByteLines,
   type InternedText,
   LineInterner,
-  OrderedMap,
   parseGitBool,
   type SupportedAlgorithm,
   whitespaceFlags,
   type XdiffAlgorithm,
   type XdiffOptions,
   xdiffHunks,
+  xdlHashRecord,
 } from "@statewalker/vcs-utils";
 
 import { RefNotFoundError } from "../errors/ref-errors.js";
@@ -30,6 +31,8 @@ import { canonicalObjectId } from "./object-id-input.js";
 const DEFAULT_INTERNER_BYTE_LIMIT = 64 * 1024 * 1024;
 /** Bytes of the files looked in for copies kept interned between commits */
 const COPY_SOURCE_CACHE_BYTES = 16 * 1024 * 1024;
+/** Bytes of line hashes of the files looked in for copies kept between commits */
+const COPY_HASH_CACHE_BYTES = 32 * 1024 * 1024;
 
 /**
  * A single blame entry - represents authorship of one or more consecutive lines.
@@ -156,6 +159,8 @@ interface Origin {
   guilty: boolean;
   /** The next origin of the same commit */
   next: Origin | null;
+  /** The previous origin of the same commit (the list is doubly linked to move one in O(1)) */
+  prev: Origin | null;
   /** The blob's lines (split and hashed once), while the origin is compared */
   lines?: InternedText;
 }
@@ -179,6 +184,8 @@ interface Slot {
 interface CommitState {
   commit: Commit;
   origins: Origin | null;
+  /** The origins by path (git's list is searched linearly; `-C -C -C` makes it long) */
+  originsByPath: Map<string, Origin>;
   uninteresting: boolean;
 }
 
@@ -189,6 +196,33 @@ const GITLINK_MODE = 0o160000;
 const BLAME_DEFAULT_MOVE_SCORE = 20;
 const BLAME_DEFAULT_COPY_SCORE = 40;
 const INT_MAX = Number.MAX_SAFE_INTEGER;
+
+/** Whether any line hash is among `wanted` */
+function sharesLine(hashes: Int32Array, wanted: Set<number>): boolean {
+  for (let i = 0; i < hashes.length; i++) if (wanted.has(hashes[i])) return true;
+  return false;
+}
+
+/** An origin moved to the front of its commit's list (`get_origin` finding it) */
+function moveOriginToFront(st: CommitState, o: Origin): void {
+  if (!o.prev) return;
+  o.prev.next = o.next;
+  if (o.next) o.next.prev = o.prev;
+  o.prev = null;
+  o.next = st.origins;
+  if (st.origins) st.origins.prev = o;
+  st.origins = o;
+}
+
+/** An origin no entry refers to taken off its commit's list (`blame_origin_decref` freeing it) */
+function unlinkOrigin(st: CommitState, o: Origin): void {
+  if (o.prev) o.prev.next = o.next;
+  else if (st.origins === o) st.origins = o.next;
+  if (o.next) o.next.prev = o.prev;
+  o.prev = null;
+  o.next = null;
+  if (st.originsByPath.get(o.path) === o) st.originsByPath.delete(o.path);
+}
 
 /** `reverse_blame`: `head` reversed, ending in `tail` */
 function reverseBlame(head: Entry | null, tail: Entry | null): Entry | null {
@@ -428,8 +462,15 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private finalAlnum: Int32Array = new Int32Array(1);
   private originSeq = 0;
   /** Files looked in for copies, interned, the most recently used last (`copySourceText`) */
-  private copySources = new OrderedMap<ObjectId, InternedText>();
+  private copySources = new Map<ObjectId, InternedText>();
   private copySourceBytes = 0;
+  /** Line hashes of the files looked in for copies (null: over the big file threshold) */
+  private copyHashes = new Map<ObjectId, Int32Array | null>();
+  private copyHashBytes = 0;
+  private copyHashCacheBytes = COPY_HASH_CACHE_BYTES;
+  private copySourceCacheBytes = COPY_SOURCE_CACHE_BYTES;
+  /** The hash of each line of the final file (`lineHashesOf`) */
+  private finalHashes: Int32Array = new Int32Array(0);
 
   private states = new Map<ObjectId, CommitState>();
   /** Numbers the lines of every version compared, so each is split and hashed once */
@@ -607,6 +648,20 @@ export class BlameCommand extends GitCommand<BlameResult> {
   setInternerByteLimit(bytes: number): this {
     this.checkCallable();
     this.internerByteLimit = bytes;
+    return this;
+  }
+
+  /**
+   * Set how many bytes the caches of `-C` keep between commits (default 32 MiB of line hashes
+   * of the files looked in, 16 MiB of their contents): a file not kept is read again for the
+   * next commit, as git reads it. The output does not change.
+   *
+   * @param bytes Size in bytes
+   */
+  setCopyCacheByteLimit(bytes: number): this {
+    this.checkCallable();
+    this.copyHashCacheBytes = bytes;
+    this.copySourceCacheBytes = bytes;
     return this;
   }
 
@@ -939,6 +994,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
     this.finalContent = content;
     this.finalStarts = starts;
     this.finalAlnum = alnum;
+    if (this.copyLevel > 0) this.finalHashes = this.lineHashesOf(content);
   }
 
   /** git's `copy_split_if_better`: `potential` kept in `best` when it scores no lower */
@@ -1039,27 +1095,52 @@ export class BlameCommand extends GitCommand<BlameResult> {
     const harder =
       this.copyLevel >= 3 || (this.copyLevel >= 2 && (!porigin || target.path !== porigin.path));
     const candidates = await this.copyCandidates(parent.commit.tree, child.commit.tree, harder);
-    const texts = new Map<string, { text: InternedText }>();
+    /** Origins this call made: git frees those no split took (`blame_origin_decref`) */
+    const created = new Set<Origin>();
+    const taken = new Set<Origin>();
     let toosmall = toosmallHead;
     let leftover: Entry | null = null;
     do {
       const head: Slot = { next: null };
       const rest: Queue = { tail: head };
       const list: Array<{ ent: Entry; split: Split }> = [];
-      for (let e: Entry | null = unblamed; e; e = e.next)
+      // the line hashes of the entries: a file sharing none of them cannot give a split
+      const wanted = new Set<number>();
+      for (let e: Entry | null = unblamed; e; e = e.next) {
         list.push({ ent: e, split: emptySplit() });
+        for (let l = e.lno; l < e.lno + e.numLines; l++) wanted.add(this.finalHashes[l]);
+      }
       for (const c of candidates) {
         // find_move already dealt with this path
         if (porigin && c.path === porigin.path) continue;
-        if (c.id !== target.blobId && (await this.isBig(c.id))) continue;
+        let hashes = this.copyHashes.get(c.id);
+        let content: Uint8Array | undefined;
+        if (hashes === undefined) {
+          if (c.id !== target.blobId && (await this.isBig(c.id))) hashes = null;
+          else {
+            content = await this.readBlob(c.id, true);
+            hashes = this.lineHashesOf(content);
+          }
+          this.keepCopyHashes(c.id, hashes);
+        }
+        if (hashes === null) continue;
+        if (!sharesLine(hashes, wanted)) {
+          // git's get_origin still moves a known origin to the front
+          const known = parent.originsByPath.get(c.path);
+          if (known) moveOriginToFront(parent, known);
+          continue;
+        }
+        const isNew = !parent.originsByPath.has(c.path);
         const norigin = this.getOrigin(parentId, c.path);
+        if (isNew) created.add(norigin);
         norigin.blobId = c.id;
         norigin.mode = c.mode;
-        let file = texts.get(c.path);
-        if (!file) {
-          file = { text: norigin.lines ?? (await this.copySourceText(c.id)) };
-          texts.set(c.path, file);
-        }
+        const file = {
+          text:
+            norigin.lines ??
+            this.copySources.get(c.id) ??
+            this.lineInterner().text(content ?? (await this.readBlob(c.id, true))),
+        };
         for (const item of list) {
           this.copySplitIfBetter(item.split, this.findCopyInBlob(item.ent, norigin, file));
         }
@@ -1067,6 +1148,7 @@ export class BlameCommand extends GitCommand<BlameResult> {
       }
       for (const { ent, split } of list) {
         if (split[1].suspect && this.copyScore < this.entryScore(split[1].lno, split[1].numLines)) {
+          taken.add(split[1].suspect);
           splitBlame(blamed, rest, split, ent);
         } else {
           ent.next = leftover;
@@ -1078,30 +1160,46 @@ export class BlameCommand extends GitCommand<BlameResult> {
       unblamed = head.next;
     } while (unblamed);
     target.suspects = reverseBlame(leftover, null);
+    for (const o of created) if (!taken.has(o) && !o.suspects) unlinkOrigin(parent, o);
   }
 
   /**
-   * A file `find_copy_in_parent` looks in, interned: most files of one commit are the same in
-   * the next one blame visits, so the versions read last are kept (up to
-   * `COPY_SOURCE_CACHE_BYTES`) instead of being read and split again for every commit
+   * The hash of each line, as the line interner hashes it (`xdl_hash_record` under
+   * whitespace flags): lines a diff can match hash alike
    */
-  private async copySourceText(blobId: ObjectId): Promise<InternedText> {
-    const known = this.copySources.touch(blobId);
-    if (known) return known;
-    return this.lineInterner().text(await this.readBlob(blobId, true));
+  private lineHashesOf(content: Uint8Array): Int32Array {
+    const lines = new ByteLines(content);
+    const ws = whitespaceFlags({ ignoreWhitespace: this.ignoreWhitespace });
+    const n = lines.size();
+    if (!ws) return lines.lineHashes.slice(0, n);
+    const out = new Int32Array(n);
+    for (let i = 0; i < n; i++)
+      out[i] = xdlHashRecord(content, lines.start(i), lines.start(i + 1), ws);
+    return out;
   }
 
+  /**
+   * Kept while the cache has room (and never evicted): a commit scans its parent's files in
+   * the order the next one scans them, so evicting the oldest would evict every file before
+   * its next use
+   */
+  private keepCopyHashes(blobId: ObjectId, hashes: Int32Array | null): void {
+    const size = 64 + (hashes ? hashes.byteLength : 0);
+    if (this.copyHashBytes + size > this.copyHashCacheBytes) return;
+    this.copyHashes.set(blobId, hashes);
+    this.copyHashBytes += size;
+  }
+
+  /** A file a copy was looked for in, interned, kept as `keepCopyHashes` keeps hashes */
   private keepCopySourceText(blobId: ObjectId, text: InternedText): void {
-    const sources = this.copySources;
-    const old = sources.get(blobId);
-    if (old) this.copySourceBytes -= old.content.length;
-    sources.set(blobId, text);
-    this.copySourceBytes += text.content.length;
-    while (this.copySourceBytes > COPY_SOURCE_CACHE_BYTES && sources.size > 1) {
-      const oldest = sources.oldestValue();
-      sources.deleteOldest();
-      if (oldest) this.copySourceBytes -= oldest.content.length;
+    const old = this.copySources.get(blobId);
+    if (old) {
+      this.copySources.set(blobId, text);
+      return;
     }
+    if (this.copySourceBytes + text.content.length > this.copySourceCacheBytes) return;
+    this.copySources.set(blobId, text);
+    this.copySourceBytes += text.content.length;
   }
 
   /**
@@ -1244,7 +1342,8 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private async findOrigin(parentId: ObjectId, origin: Origin): Promise<Origin | undefined> {
     const parent = this.states.get(parentId);
     if (!parent) return undefined;
-    for (let o = parent.origins; o; o = o.next) if (o.path === origin.path) return o;
+    const known = parent.originsByPath.get(origin.path);
+    if (known) return known;
     const entry = await this.lookup(parent.commit.tree, origin.path);
     if (!entry || (entry.mode & S_IFMT) !== (origin.mode & S_IFMT)) return undefined;
     if (entry.id !== origin.blobId && (await this.isBig(entry.id))) return undefined;
@@ -1298,16 +1397,10 @@ export class BlameCommand extends GitCommand<BlameResult> {
   private getOrigin(commitId: ObjectId, path: string): Origin {
     const st = this.states.get(commitId);
     if (!st) throw new Error(`commit ${commitId} not loaded`);
-    let l: Origin | null = null;
-    for (let o = st.origins; o; l = o, o = o.next) {
-      if (o.path === path) {
-        if (l) {
-          l.next = o.next;
-          o.next = st.origins;
-          st.origins = o;
-        }
-        return o;
-      }
+    const known = st.originsByPath.get(path);
+    if (known) {
+      moveOriginToFront(st, known);
+      return known;
     }
     const o: Origin = {
       seq: this.originSeq++,
@@ -1318,8 +1411,11 @@ export class BlameCommand extends GitCommand<BlameResult> {
       suspects: null,
       guilty: false,
       next: st.origins,
+      prev: null,
     };
+    if (st.origins) st.origins.prev = o;
     st.origins = o;
+    st.originsByPath.set(path, o);
     return o;
   }
 
@@ -1328,7 +1424,12 @@ export class BlameCommand extends GitCommand<BlameResult> {
     if (known) return known;
     const commit = await this.commits.load(commitId).catch(() => undefined);
     if (!commit) return undefined;
-    const st: CommitState = { commit, origins: null, uninteresting: false };
+    const st: CommitState = {
+      commit,
+      origins: null,
+      originsByPath: new Map(),
+      uninteresting: false,
+    };
     this.states.set(commitId, st);
     return st;
   }

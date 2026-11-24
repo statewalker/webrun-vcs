@@ -242,3 +242,100 @@ describeGit("blame reads and diffs each version once", () => {
     ).toBe(true);
   }, 120_000);
 });
+
+describeGit("blame -C -C -C over parents with many files", () => {
+  let root: string;
+  let dir: string;
+  let tip: string;
+  const FILES = 600;
+  const COMMITS = 30;
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "blame-wide-"));
+    dir = join(root, "repo");
+    const env = nativeGitEnv(root);
+    execFileSync("git", ["init", "-q", "-b", "main", dir], { env });
+    // as the review's gen.py: files of distinct lines in 50 directories, three changed per
+    // commit, and a target file growing by blocks copied from them
+    let seed = 1;
+    const rand = (n: number) => {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+      return (seed >>> 8) % n;
+    };
+    const content = (i: number, v: number) =>
+      Array.from(
+        { length: 40 },
+        (_, j) => `file ${i} line ${j} version ${v} payload ${rand(1e6)}\n`,
+      ).join("");
+    const files: string[] = [];
+    const target: string[] = [];
+    const chunks: string[] = [];
+    const data = (text: string) => chunks.push(`data ${Buffer.byteLength(text)}\n${text}\n`);
+    for (let c = 0; c < COMMITS; c++) {
+      const t = 1112911993 + c * 60;
+      chunks.push(`commit refs/heads/main\nmark :${c + 1}\n`);
+      chunks.push(`author A U Thor <a@x> ${t} +0000\ncommitter C O M <c@x> ${t} +0000\n`);
+      data(`c${c}\n`);
+      if (c) chunks.push(`from :${c}\n`);
+      const changed =
+        c === 0
+          ? Array.from({ length: FILES }, (_, i) => i)
+          : [rand(FILES), rand(FILES), rand(FILES)];
+      for (const i of changed) {
+        files[i] = content(i, c);
+        chunks.push(`M 100644 inline d${i % 50}/f${i}.txt\n`);
+        data(files[i]);
+      }
+      if (c) {
+        const src = files[rand(FILES)].split(/(?<=\n)/);
+        const a = rand(30);
+        target.splice(rand(target.length + 1), 0, ...src.slice(a, a + 5));
+      }
+      target.push(`own line ${c}\n`);
+      chunks.push("M 100644 inline target.txt\n");
+      data(target.join(""));
+    }
+    execFileSync("git", ["fast-import", "--quiet"], { cwd: dir, env, input: chunks.join("") });
+    tip = execFileSync("git", ["rev-parse", "main"], { cwd: dir, env }).toString().trim();
+  }, 120_000);
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("interns only the files sharing lines with the blamed ones, whatever the caches keep", async () => {
+    const native = execFileSync(
+      "git",
+      ["blame", "--porcelain", "-C", "-C", "-C", tip, "--", "target.txt"],
+      { cwd: dir, env: nativeGitEnv(root), maxBuffer: 1 << 26 },
+    );
+    // the caches far below the parents' files (a 24 KiB file each): nothing stays between commits
+    for (const limit of [undefined, 4096]) {
+      const counts: Counts = {};
+      const text = vi.spyOn(LineInterner.prototype, "text");
+      let texts = 0;
+      const started = performance.now();
+      let out: Uint8Array;
+      try {
+        const cmd = (await openCounted(dir, counts))
+          .blame()
+          .setFilePath("target.txt")
+          .setStartCommit(tip)
+          .setDetectCopies(3);
+        if (limit !== undefined) cmd.setCopyCacheByteLimit(limit);
+        out = formatBlamePorcelain(await cmd.call());
+        texts = text.mock.calls.length;
+      } finally {
+        text.mockRestore();
+      }
+      const elapsed = performance.now() - started;
+      expect(Buffer.from(out).equals(native)).toBe(true);
+      // each commit looks in all its parent's files, but splits and diffs only the few the
+      // target's lines come from (a file sharing no line cannot give a copy)
+      expect(texts).toBeLessThan(COMMITS * 10);
+      // with the caches, each version of a file is read once
+      if (limit === undefined) expect(counts["blobs.load"]).toBeLessThan(FILES + COMMITS * 5);
+      else expect(counts["blobs.load"]).toBeLessThan(FILES * COMMITS * 2);
+      expect(elapsed).toBeLessThan(60_000);
+    }
+  }, 180_000);
+});
