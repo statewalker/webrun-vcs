@@ -278,4 +278,99 @@ describeGit("git clone -c, -o, --reject-shallow, --sparse, as native git", () =>
     expect(cloneStateOf(root, o)).toEqual(cloneStateOf(root, n));
     expect(Object.keys(cloneStateOf(root, o).files ?? {})).toEqual(["file"]);
   });
+
+  describe("configured refspecs over two branches", () => {
+    let two: string;
+    beforeAll(() => {
+      two = join(root, "two");
+      git(root, "clone", "-q", "--no-local", src, two);
+      git(two, "branch", "other", "HEAD");
+      putFile(two, "other.txt", "other\n");
+      git(two, "add", "other.txt");
+      git(two, "commit", "-qm", "main moves on");
+    });
+
+    type Clone = Parameters<Parameters<typeof ourClone>[2]>[0];
+    const cases: [string, string[], string[], (c: Clone) => Clone][] = [
+      [
+        "plain",
+        ["-c", "remote.origin.fetch=+refs/heads/*:refs/foo/*"],
+        ["+refs/heads/*:refs/foo/*"],
+        (c) => c,
+      ],
+      [
+        "--single-branch",
+        ["--single-branch", "-c", "remote.origin.fetch=+refs/heads/*:refs/foo/*"],
+        ["+refs/heads/*:refs/foo/*"],
+        (c) => c.setSingleBranch(true),
+      ],
+      [
+        "an exact refspec, --single-branch",
+        ["--single-branch", "-c", "remote.origin.fetch=refs/heads/main:refs/x/main"],
+        ["refs/heads/main:refs/x/main"],
+        (c) => c.setSingleBranch(true),
+      ],
+    ];
+    for (const [name, args, fetch, configure] of cases) {
+      for (const local of [true, false]) {
+        it(`t5611-clone-config.sh: "clone -c remote.origin.fetch=<refspec> works" (refs/remotes/origin/HEAD: ${name}${local ? "" : ", --no-local"})`, async () => {
+          const [n, o] = twins();
+          const flags = local ? [] : ["--no-local"];
+          expect(gitRun(root, root, ["clone", "-q", ...flags, ...args, two, n]).status).toBe(0);
+          await ourClone(root, o, (c) => {
+            const d = configure(
+              c.setURI(two).setConfig(fetch.map((f) => `remote.origin.fetch=${f}`)),
+            );
+            return local ? d : d.setLocal(false);
+          });
+          expect(cloneStateOf(root, o)).toEqual(cloneStateOf(root, n));
+        });
+      }
+    }
+
+    it("t5611-clone-config.sh: configured refspecs git's clone dies on (a missing ref, a ref written twice)", async () => {
+      const deaths: [string[], (c: Clone) => Clone][] = [
+        [
+          ["--mirror", "-c", "remote.origin.fetch=+refs/heads/*:refs/heads/*"],
+          (c) => c.setMirror(true).setConfig(["remote.origin.fetch=+refs/heads/*:refs/heads/*"]),
+        ],
+        [
+          ["-c", "remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*"],
+          (c) => c.setConfig(["remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*"]),
+        ],
+        [
+          ["-c", "remote.origin.fetch=+refs/tags/*:refs/tags/*"],
+          (c) => c.setConfig(["remote.origin.fetch=+refs/tags/*:refs/tags/*"]),
+        ],
+        [
+          [
+            "--single-branch",
+            "-b",
+            "other",
+            "-c",
+            "remote.origin.fetch=refs/heads/main:refs/x/main",
+          ],
+          (c) =>
+            c
+              .setSingleBranch(true)
+              .setBranch("other")
+              .setConfig(["remote.origin.fetch=refs/heads/main:refs/x/main"]),
+        ],
+        [
+          ["-c", "remote.origin.fetch=refs/heads/nope:refs/x/nope"],
+          (c) => c.setConfig(["remote.origin.fetch=refs/heads/nope:refs/x/nope"]),
+        ],
+      ];
+      for (const [args, configure] of deaths) {
+        const [n, o] = twins();
+        const theirs = gitRun(root, root, ["clone", "-q", ...args, two, n]);
+        expect(theirs.status).toBe(128);
+        const ours = await ourCloneFails(root, o, (c) => configure(c.setURI(two)), {
+          bare: args.includes("--mirror"),
+        });
+        expect(ours.message).toBe(stderrLines(theirs.stderr));
+        expect(ours.exitCode).toBe(128);
+      }
+    });
+  });
 });

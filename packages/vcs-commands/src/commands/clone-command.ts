@@ -1,4 +1,5 @@
 import {
+  compareRefNames,
   type FilesApi,
   historyWithoutLazyFetch,
   isSymbolicRef,
@@ -21,6 +22,7 @@ import {
   FetchCheckError,
   fetchFromConnection,
   mapRefs,
+  missingSources,
   type RefspecResolver,
   type RemoteRef,
   refPrefixes,
@@ -992,7 +994,13 @@ export class CloneCommand extends TransportCommand<CloneResult> {
               return head ? remoteRefs.find((r) => r.name === head && r.oid) : undefined;
             }
           : undefined;
-      refspecs = withConfiguredRefspecs(refspecs, configuredFetch, selected);
+      // (tags: "all" below maps git's TAG_REFSPEC after them)
+      const allTags =
+        this.revision === undefined &&
+        this.tagOption === TagOption.AUTO_FOLLOW &&
+        !singleBranch &&
+        !this.mirror;
+      refspecs = withConfiguredRefspecs(refspecs, configuredFetch, selected, allTags);
     }
     // git clone takes every tag, unless one branch is cloned (then tags follow) or --no-tags;
     // none with --revision
@@ -1126,8 +1134,13 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       this.revision === undefined && advertisedDefaultBranch?.startsWith("refs/heads/")
         ? toBranchName(advertisedDefaultBranch)
         : undefined;
-    if (!this.bare && remoteHead) {
-      const target = `refs/remotes/${this.remoteName}/${remoteHead}`;
+    // (guess_remote_head over the mapped refs: the first mapping of the remote HEAD's branch,
+    // configured refspecs before the clone's own, whose peer ref HEAD then names)
+    const headMapping = remoteHead
+      ? result.fetched.find((f) => f.remoteRef === advertisedDefaultBranch)
+      : undefined;
+    if (!this.bare && remoteHead && headMapping?.localRef) {
+      const target = headMapping.localRef;
       if ((await this.refsStore.resolve(target))?.objectId) {
         await this.refsStore.setSymbolic(`refs/remotes/${this.remoteName}/HEAD`, target, cloneLog);
       }
@@ -1682,7 +1695,8 @@ function isRevisionRefspec(revision: string): boolean {
 function withConfiguredRefspecs(
   own: string[] | RefspecResolver,
   configured: string[],
-  selected?: (remoteRefs: readonly RemoteRef[]) => RemoteRef | undefined,
+  selected: ((remoteRefs: readonly RemoteRef[]) => RemoteRef | undefined) | undefined,
+  allTags: boolean,
 ): RefspecResolver {
   return {
     prefixes: [
@@ -1691,14 +1705,34 @@ function withConfiguredRefspecs(
     ],
     resolve: (remoteRefs) => {
       const ownSpecs = Array.isArray(own) ? own : own.resolve(remoteRefs);
-      if (!selected) return [...configured, ...ownSpecs];
-      const ref = selected(remoteRefs);
-      const mapped = ref
-        ? mapRefs([ref], configured)
+      // get_fetch_map with missing_ok 0: an exact source the (narrowed) list lacks dies
+      const ref = selected?.(remoteRefs);
+      const mappedOver = selected ? (ref ? [ref] : []) : remoteRefs;
+      const listsRefs = remoteRefs.some((r) => r.oid);
+      const missing = listsRefs ? missingSources(mappedOver, configured) : [];
+      if (missing.length > 0) {
+        throw new TransportError(`fatal: couldn't find remote ref ${missing[0]}`);
+      }
+      const mapped = selected
+        ? mapRefs(mappedOver, configured)
             .filter((p) => p.localRef !== undefined)
             .map((p) => `${p.force ? "+" : ""}${p.remoteRef}:${p.localRef}`)
-        : [];
-      return [...mapped, ...ownSpecs];
+        : configured;
+      const specs = [...mapped, ...ownSpecs];
+      // write_remote_refs' one transaction refuses a ref two mappings write (wanted_peer_refs
+      // removes no duplicate): ref_transaction's "multiple updates", the first name in order
+      const counts = new Map<string, number>();
+      for (const spec of allTags ? [...specs, "refs/tags/*:refs/tags/*"] : specs) {
+        for (const p of mapRefs(remoteRefs, [spec])) {
+          if (p.localRef !== undefined) counts.set(p.localRef, (counts.get(p.localRef) ?? 0) + 1);
+        }
+      }
+      const twice = [...counts].filter(([, n]) => n > 1).map(([name]) => name);
+      if (twice.length > 0) {
+        twice.sort(compareRefNames);
+        throw new TransportError(`fatal: multiple updates for ref '${twice[0]}' not allowed`);
+      }
+      return specs;
     },
   };
 }
