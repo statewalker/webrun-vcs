@@ -196,7 +196,6 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
     return this;
   }
 
-  /** `--source=<tree-ish>`: restore from it (default: the index, or HEAD with `--staged`). */
   /**
    * `--[no-]recurse-submodules` (default `submodule.recurse`): a restored submodule's worktree
    * is checked out at the recorded commit too (its local changes discarded), its HEAD detached
@@ -208,6 +207,7 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
     return this;
   }
 
+  /** `--source=<tree-ish>`: restore from it (default: the index, or HEAD with `--staged`). */
   setSource(source: string): this {
     this.checkCallable();
     this.source = source;

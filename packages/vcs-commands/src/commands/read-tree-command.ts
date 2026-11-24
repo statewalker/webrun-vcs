@@ -311,7 +311,9 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
             superPrefix: this.superPrefix,
           })
         : undefined;
-    const update = this.update && !this.dryRun;
+    // -n keeps o->update: the checks an update makes still run, nothing is written
+    const update = this.update;
+    const dryRunOptions = this.dryRun ? { writeIndex: false, checkOnly: true } : {};
 
     if (!merge) {
       await this.readWithoutMerge(treeIds);
@@ -324,7 +326,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
         hard: this.reset,
         update,
         submodules,
-        ...(this.dryRun ? { writeIndex: false } : {}),
+        ...dryRunOptions,
         overwriteUntracked: this.reset,
         skipSparseCheckout: this.skipSparseCheckout,
         targetTree: tree,
@@ -342,7 +344,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
           operation: "read-tree",
           update,
           submodules,
-          ...(this.dryRun ? { writeIndex: false } : {}),
+          ...dryRunOptions,
           skipSparseCheckout: this.skipSparseCheckout,
           plainErrors: true,
           initialCheckout: await isIndexUnborn(this.staging),
@@ -478,7 +480,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       }
     }
     const checking = traversalOrder(target.keys());
-    const worktree = this.update ? ctx.worktree : undefined;
+    const worktree = this.update && !this.dryRun ? ctx.worktree : undefined;
     const sparse = worktree && !this.skipSparseCheckout ? await SparseUnpack.start(ctx) : undefined;
     const trust = worktree ? worktreeModeTrust(this.workingCopy, worktree) : undefined;
     const indexTime = this.staging.getUpdateTime();
@@ -556,7 +558,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
         },
       ]);
     }
-    await rewriteIndex(this.staging, changes);
+    await rewriteIndex(this.staging, changes, this.dryRun ? { write: false } : {});
     if (sparse && worktree) {
       const outcome = await sparse.finish(ctx, { written: writing });
       pushSparseWarnings(result.warnings, sparse, outcome, false);
@@ -618,7 +620,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
     const indexEntries = new Map<string, StagingEntry>();
     for (const e of await this.entryList()) if (e.stage === 0) indexEntries.set(e.path, e);
     const checkedWorktree = ctx.worktree;
-    const worktree = this.update ? checkedWorktree : undefined;
+    const worktree = this.update && !this.dryRun ? checkedWorktree : undefined;
     const sparse = worktree && !this.skipSparseCheckout ? await SparseUnpack.start(ctx) : undefined;
     const quiet = (p: string) => sparse?.leavesAlone(p) === true;
     const trust = checkedWorktree
@@ -833,7 +835,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
         if (e && stat && !stat.isDirectory) Object.assign(e, entryStatOf(stat));
       }
     }
-    await rewriteIndex(this.staging, changes);
+    await rewriteIndex(this.staging, changes, this.dryRun ? { write: false } : {});
     if (sparse && worktree) {
       const outcome = await sparse.finish(ctx, { written: worktree ? writing : new Set() });
       pushSparseWarnings(result.warnings, sparse, outcome, false);

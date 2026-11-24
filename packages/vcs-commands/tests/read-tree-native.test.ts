@@ -90,6 +90,7 @@ async function ours(dir: string, args: string[]) {
     else if (arg === "--reset") cmd.setReset(true);
     else if (arg === "-u") cmd.setUpdate(true);
     else if (arg === "-i") cmd.setIndexOnly(true);
+    else if (arg === "-n") cmd.setDryRun(true);
     else if (arg === "--empty") cmd.setEmpty(true);
     else if (arg === "--trivial") cmd.setTrivial(true);
     else if (arg === "--aggressive") cmd.setAggressive(true);
@@ -258,6 +259,34 @@ describeGit("git read-tree against native git", () => {
 
   it("-m -u two-way refuses an untracked file in the way", async () => {
     await compareReadTree(history, ["-m", "-u", "c2", "side"], (dir) => put(dir, "s", "u\n"));
+  });
+
+  // -n keeps o->update: verify_absent and the other update checks run, nothing is written
+  it("-n -u -m two-way refuses an untracked file in the way, writing nothing", async () => {
+    await compareReadTree(history, ["-n", "-u", "-m", "c2", "side"], (dir) => put(dir, "s", "u\n"));
+  });
+
+  it("-n -u -m two-way checks and writes nothing", async () => {
+    await compareReadTree(history, ["-n", "-u", "-m", "c2", "side"]);
+  });
+
+  it("-n -u -m one tree refuses an untracked file in the way", async () => {
+    await compareReadTree(history, ["-n", "-u", "-m", "side"], (dir) => put(dir, "s", "u\n"));
+  });
+
+  it("-n -u -m two-way refuses a dirty file it changes", async () => {
+    await compareReadTree(history, ["-n", "-u", "-m", "c2", "side"], (dir) => put(dir, "b", "x\n"));
+  });
+
+  it("-n -u --reset writes nothing over dirty and untracked files", async () => {
+    await compareReadTree(history, ["-n", "-u", "--reset", "side"], (dir) => {
+      put(dir, "s", "u\n");
+      put(dir, "a", "dirty\n");
+    });
+  });
+
+  it("-n --reset without -u writes nothing", async () => {
+    await compareReadTree(history, ["-n", "--reset", "side"], (dir) => put(dir, "a", "dirty\n"));
   });
 
   it("a three-way merge leaves stages", async () => {

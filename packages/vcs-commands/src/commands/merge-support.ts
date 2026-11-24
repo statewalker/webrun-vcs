@@ -854,7 +854,7 @@ export async function switchTrees(
   sparse?.conflict(conflicts.map((c) => c.stagePath));
   const switched = await switchTreesWith(ctx, head, target, { ...options, conflicts }, sparse);
   if (switched.refused) return switched.refused;
-  if (sparse) {
+  if (sparse && !options.checkOnly) {
     const outcome = await sparse.finish(ctx, { written: switched.written });
     pushSparseWarnings(ctx.sparseWarnings, sparse, outcome, true);
   }
@@ -898,6 +898,11 @@ export interface SwitchTreesOptions {
   submodules?: SubmoduleUnpack;
   /** False (`read-tree -n`): the index is not written */
   writeIndex?: boolean;
+  /**
+   * `read-tree -n` with `-u`: the checks an update makes (untracked files in the way, the
+   * submodules' dry runs) run, then nothing is written, neither worktree nor index
+   */
+  checkOnly?: boolean;
 }
 
 /** git's default unpack-trees messages (`unpack_plumbing_errors`) for one refused path. */
@@ -1067,6 +1072,8 @@ async function switchTreesWith(
       written: new Set(),
     };
   }
+  // `read-tree -n -u`: every check made (o->update stays on), nothing written
+  if (options.checkOnly) return { written: new Set() };
 
   // record_conflicted_index_entries checks out a conflict's stage-0 entry left skip-worktree
   // (the switch kept it: the trees agree on it, or the index holds the target's already):

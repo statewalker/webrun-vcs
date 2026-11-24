@@ -225,6 +225,18 @@ export class ResetCommand extends GitCommand<Ref> {
   }
 
   /**
+   * `--[no-]recurse-submodules` (default `submodule.recurse`): `--hard`, `--keep` and
+   * `--merge` reset the active submodules' worktrees too, their HEADs detached at the recorded
+   * commits (unpack-trees' submodule support); local changes in them refuse `--keep` and
+   * `--merge` as git refuses them.
+   */
+  setRecurseSubmodules(recurse: boolean): this {
+    this.checkCallable();
+    this.recurseSubmodules = recurse;
+    return this;
+  }
+
+  /**
    * Set the reset mode.
    *
    * - SOFT: Move HEAD only
@@ -244,18 +256,6 @@ export class ResetCommand extends GitCommand<Ref> {
    *
    * @param mode Reset mode
    */
-  /**
-   * `--[no-]recurse-submodules` (default `submodule.recurse`): `--hard`, `--keep` and
-   * `--merge` reset the active submodules' worktrees too, their HEADs detached at the recorded
-   * commits (unpack-trees' submodule support); local changes in them refuse `--keep` and
-   * `--merge` as git refuses them.
-   */
-  setRecurseSubmodules(recurse: boolean): this {
-    this.checkCallable();
-    this.recurseSubmodules = recurse;
-    return this;
-  }
-
   setMode(mode: ResetMode): this {
     this.checkCallable();
     this.mode = mode;

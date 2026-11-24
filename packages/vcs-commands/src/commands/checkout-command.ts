@@ -644,7 +644,6 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     return this;
   }
 
-  /** `-q`: a path checkout reports no counts and no "path is unmerged" warnings. */
   /**
    * `--[no-]recurse-submodules` (default `submodule.recurse`): the active submodules' worktrees
    * are switched with the superproject's, their HEADs detached at the recorded commits, and
@@ -656,6 +655,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     return this;
   }
 
+  /** `-q`: a path checkout reports no counts and no "path is unmerged" warnings. */
   setQuiet(quiet: boolean): this {
     this.checkCallable();
     this.quiet = quiet;

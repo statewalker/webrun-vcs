@@ -606,7 +606,7 @@ describeGit("--recurse-submodules on checkout, switch and reset (native twins)",
   }, 120_000);
   afterAll(() => {
     if (root) rmSync(root, { recursive: true, force: true });
-  });
+  }, 120_000);
 
   // t2013 `test_submodule_switch_recursing_with_args "checkout"`, t7112 `... "reset --keep"`,
   // t1013 `... "read-tree -u -m"`; switch runs the same scenarios

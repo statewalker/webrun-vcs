@@ -90,7 +90,7 @@ export async function resetMerge(
       : await SparseUnpack.start(ctx);
   const done = await resetMergeWith(ctx, targetId, label, options, sparse);
   if (done.refused) return done.refused;
-  if (sparse) {
+  if (sparse && !options.checkOnly) {
     const outcome = await sparse.finish(ctx, {
       written: done.written,
       overwrite: options.hard === true,
@@ -121,6 +121,8 @@ export interface OnewayMergeOptions {
   submodules?: SubmoduleUnpack;
   /** False (`read-tree -n`): the index is not written */
   writeIndex?: boolean;
+  /** `read-tree -n` with `-u`: every check made, then nothing written (worktree or index) */
+  checkOnly?: boolean;
 }
 
 async function resetMergeWith(
@@ -314,6 +316,9 @@ async function resetMergeWith(
     }
     changes.push(path);
   }
+
+  // `read-tree -n -u`: every check made (o->update stays on), nothing written
+  if (options.checkOnly) return { written: new Set() };
 
   // the files written: in a sparse checkout, those of the paths in its patterns only
   const writing = new Set(changes.filter((p) => target.has(p) && (!sparse || sparse.writes(p))));

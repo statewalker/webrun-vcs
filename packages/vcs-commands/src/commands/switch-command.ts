@@ -187,7 +187,6 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     return this;
   }
 
-  /** `--ignore-other-worktrees`: switch to a branch another worktree has checked out. */
   /** `--[no-]recurse-submodules` (default `submodule.recurse`): see `CheckoutCommand`. */
   setRecurseSubmodules(recurse: boolean): this {
     this.checkCallable();
@@ -195,6 +194,7 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
     return this;
   }
 
+  /** `--ignore-other-worktrees`: switch to a branch another worktree has checked out. */
   setIgnoreOtherWorktrees(ignore: boolean): this {
     this.checkCallable();
     this.ignoreOtherWorktrees = ignore;
