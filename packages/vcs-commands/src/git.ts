@@ -83,6 +83,7 @@ import {
   StashShowCommand,
   StashStoreCommand,
   StatusCommand,
+  SubmoduleAbsorbGitDirsCommand,
   SubmoduleAddCommand,
   SubmoduleDeinitCommand,
   SubmoduleForeachCommand,
@@ -1057,6 +1058,20 @@ export class Git implements Disposable {
   submoduleDeinit(): SubmoduleDeinitCommand {
     this.checkClosed();
     return new SubmoduleDeinitCommand(this._workingCopy);
+  }
+
+  /**
+   * `git submodule absorbgitdirs`: move submodules' embedded `.git` directories into the
+   * superproject's `.git/modules/`, leaving gitfiles.
+   *
+   * @example
+   * ```typescript
+   * await git.submoduleAbsorbGitDirs().addPath("lib").call();
+   * ```
+   */
+  submoduleAbsorbGitDirs(): SubmoduleAbsorbGitDirsCommand {
+    this.checkClosed();
+    return new SubmoduleAbsorbGitDirsCommand(this._workingCopy);
   }
 
   /**

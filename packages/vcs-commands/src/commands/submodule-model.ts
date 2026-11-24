@@ -30,7 +30,7 @@ import { GitApiError, InvalidConfigError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { checkSubmoduleName } from "./fsck/fsck-object-checks.js";
-import { commonGitFileOf } from "./git-hooks.js";
+import { commonGitFileOf, gitFileOf } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { DO_MATCH_DIRECTORY, matchPathspec, parsePathspec } from "./pathspec.js";
 import { isSubmoduleIgnoreMode, type SubmoduleIgnoreMode } from "./submodule-config.js";
@@ -427,7 +427,8 @@ export class SubmoduleModel {
 
   /**
    * git's `submodule_name_to_gitdir`: where the repository of the submodule `name` lives,
-   * as a path of the working copy's FilesApi: `<common git dir>/modules/<name>`, or under
+   * as a path of the working copy's FilesApi: `<git dir>/modules/<name>` (`modules/` is kept per
+   * worktree: a linked worktree's are in `worktrees/<id>/modules/`), or under
    * `extensions.submodulePathConfig` the `submodule.<name>.gitdir` setting (relative to the
    * worktree top). The place is checked as git checks it (`validate_submodule_git_dir`):
    * a legacy git directory inside another submodule's (`modules/hippo/hooks` while
@@ -438,7 +439,7 @@ export class SubmoduleModel {
    * extension, or a git directory the check refuses
    */
   async gitDirOf(name: string): Promise<string | undefined> {
-    const common = await commonGitFileOf(this.workingCopy, "modules");
+    const common = await gitFileOf(this.workingCopy, "modules");
     if (!common) return undefined;
     const encoded = await submodulePathConfigOf(this.workingCopy);
     let gitDir: string;

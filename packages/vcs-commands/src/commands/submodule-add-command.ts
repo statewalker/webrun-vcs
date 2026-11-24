@@ -12,7 +12,7 @@ import { RemoteConfigStore } from "../remote-config/index.js";
 import { AddCommand } from "./add-command.js";
 import { CheckoutCommand } from "./checkout-command.js";
 import { checkSubmoduleName } from "./fsck/fsck-object-checks.js";
-import { commonGitFileOf } from "./git-hooks.js";
+import { gitFileOf } from "./git-hooks.js";
 import { DO_MATCH_DIRECTORY, matchPathspec, parsePathspec } from "./pathspec.js";
 import { SubmoduleCommandBase, type SubmoduleCommandResult } from "./submodule-commands.js";
 import {
@@ -402,7 +402,7 @@ export class SubmoduleAddCommand extends SubmoduleCommandBase {
       throw error;
     }
     if (gitDir === undefined) this.die("fatal: no git directory to keep the submodule in");
-    const common = await commonGitFileOf(this.workingCopy, "modules");
+    const common = await gitFileOf(this.workingCopy, "modules");
     const gitFiles = common?.files ?? files;
     const gitDirKind = (await gitFiles.stats(gitDir).catch(() => undefined))?.kind;
     if (gitDirKind === "directory") {

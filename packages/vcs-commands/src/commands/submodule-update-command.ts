@@ -22,7 +22,7 @@ import { createIdAbbreviator } from "./core-config.js";
 import { DiffCommand } from "./diff-command.js";
 import { FetchCommand } from "./fetch-command.js";
 import { createDescriber } from "./git-describe.js";
-import { commonGitFileOf, hookRunnerOf } from "./git-hooks.js";
+import { gitFileOf, hookRunnerOf } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { MergeCommand } from "./merge-command.js";
 import { nameRevByTags } from "./name-rev.js";
@@ -598,7 +598,7 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
         throw error;
       }
       if (gitDir === undefined) this.die("fatal: no git directory to keep the submodule in");
-      const common = await commonGitFileOf(this.workingCopy, "modules");
+      const common = await gitFileOf(this.workingCopy, "modules");
       const files = this.worktreeAccess?.getFiles?.();
       const gitFiles = common?.files ?? files;
       if (!gitFiles) this.die("fatal: no worktree to clone a submodule into");

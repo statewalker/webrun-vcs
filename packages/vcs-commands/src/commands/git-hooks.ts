@@ -649,6 +649,25 @@ export async function commonGitFileOf(
   return new HookSession(hookHostOf(workingCopy)).commonGitFile(name);
 }
 
+/**
+ * A file of a working copy's own git directory (a linked worktree's `worktrees/<id>/`:
+ * `modules/`, which git keeps per worktree) as the repository's FilesApi names it; undefined
+ * when the working copy has no files layout.
+ */
+export async function gitFileOf(
+  workingCopy: WorkingCopy,
+  name: string,
+): Promise<{ files: FilesApi; path: string } | undefined> {
+  const session = new HookSession(hookHostOf(workingCopy));
+  // a linked worktree's own git directory is `<common>/worktrees/<id>` (its worktree's
+  // FilesApi layout names the common directory)
+  const current = (await workingCopy.worktrees?.list().catch(() => undefined))?.find(
+    (w) => w.current,
+  );
+  if (current?.id !== undefined) return session.commonGitFile(`worktrees/${current.id}/${name}`);
+  return session.gitFile(name);
+}
+
 /** The common git directory of `gitDir` (its `commondir` file), as a FilesApi path. */
 async function commonDirOf(files: FilesApi, gitDir: string): Promise<string> {
   const path = joinFilesPath(gitDir, "commondir");
