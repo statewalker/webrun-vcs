@@ -129,6 +129,11 @@ export interface LogOutputOptions {
   nameOnly?: boolean;
   /** `--name-status` */
   nameStatus?: boolean;
+  /**
+   * `--check`: each commit's whitespace errors and leftover conflict markers, in place of
+   * the other formats; the log's exit status is then 2 when any were found
+   */
+  check?: boolean;
   /** `-m`: merges' diffs against each parent (`log.diffMerges`, default `separate`) */
   m?: boolean;
   /** `-c`: combined diffs of merges (implies `-p`) */
@@ -859,6 +864,7 @@ export class LogPrinter {
     const formats: DiffOutputFormat[] = [];
     if (options.nameOnly) formats.push("name-only");
     else if (options.nameStatus) formats.push("name-status");
+    else if (options.check) formats.push("check");
     if (options.numstat) formats.push("numstat");
     if (options.stat) formats.push("stat");
     if (options.shortstat) formats.push("shortstat");
@@ -895,8 +901,8 @@ export class LogPrinter {
       diffMerges = "first-parent";
     }
     if ((implyPatch || mergesNeedDiff) && formats.length === 0) formats.push("patch");
-    // --name-only and --name-status turn the other formats off (diff_setup_done)
-    const names = formats.find((f) => f === "name-only" || f === "name-status");
+    // --name-only, --name-status and --check turn the other formats off (diff_setup_done)
+    const names = formats.find((f) => f === "name-only" || f === "name-status" || f === "check");
     this.formats = options.noPatch ? [] : names ? [names] : formats;
     this.diffMerges = diffMerges;
     this.mergesNeedDiff = mergesNeedDiff;

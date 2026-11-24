@@ -42,6 +42,7 @@ import {
   scorePercent,
 } from "../rename/index.js";
 import { writeCombinedDiff } from "../results/combined-diff.js";
+import { conflictMarkerSizeOf, writePairCheck } from "../results/diff-check.js";
 import { MovedLineBuffer } from "../results/diff-color.js";
 import { ChangeType, type DiffEntry } from "../results/diff-entry.js";
 import { diffEntryToPair } from "../results/diff-formatter.js";
@@ -71,7 +72,7 @@ import {
   WS_DEFAULT_RULE,
   WS_INCOMPLETE_LINE,
   whitespaceRuleOf,
-} from "./apply/whitespace.js";
+} from "../whitespace/index.js";
 import { bareAttributesResolver } from "./attributes-source.js";
 import { worktreeModeTrust } from "./core-config.js";
 import {
@@ -143,7 +144,13 @@ export type DiffOutputFormat =
   | "shortstat"
   | "summary"
   | "name-only"
-  | "name-status";
+  | "name-status"
+  /**
+   * `--check`: the whitespace errors and leftover conflict markers the change adds (see
+   * {@link writePairCheck}); it turns the other formats off, and {@link DiffCommand.exitCode}
+   * gets 2 when it found any
+   */
+  | "check";
 
 /** Options of the text output that `git diff` takes on its command line */
 export interface DiffTextOptions
@@ -669,6 +676,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private rotateStrict = true;
   /** git's `has_changes` of the last call */
   private changesFound = false;
+  /** git's `check_failed`: `--check` found an error in the last call */
+  private checkFailed = false;
   /** The revisions given resolved (ranges, `--merge-base`) */
   private sidesResolved = false;
   /** The compiled pickaxe (`-S`, `-G`, `--find-object`), once the options are checked */
@@ -729,11 +738,20 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   }
 
   /**
-   * The exit status `git diff` ends with (`diff_result_code`): 1 when `--exit-code` or
-   * `--quiet` is set and the last call found differences, else 0.
+   * The exit status `git diff` ends with (`diff_result_code`): bit 1 when `--exit-code` or
+   * `--quiet` is set and the last call found differences, bit 2 when its `--check` (the
+   * `check` format) found errors.
    */
   get exitCode(): number {
-    return (this.exitWithStatus || this.quiet) && this.changesFound ? 1 : 0;
+    return (
+      ((this.exitWithStatus || this.quiet) && this.changesFound ? 1 : 0) |
+      (this.checkFailed ? 2 : 0)
+    );
+  }
+
+  /** Whether the last call's `--check` found errors (git's `check_failed`) */
+  get checkFoundErrors(): boolean {
+    return this.checkFailed;
   }
 
   /** Whether the last call found differences (git's `has_changes`) */
@@ -1288,6 +1306,26 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     }
     // diff_flush of an empty queue prints nothing
     if (pairs.length === 0) return 0;
+    // diff_setup_done: --check turns the other formats off
+    if (formats.includes("check")) {
+      const check = { conflictMarkerSize: this.conflictMarkerSizeOf() };
+      for (const pair of pairs) {
+        if (unmerged.has(pair)) continue;
+        if (fromContents && this.namesFromContents) {
+          // diff_flush_patch_quietly (git 2.50+): the changes are what the patch shows, and
+          // a pair whose patch shows nothing is not checked
+          const scratch = new ByteSink();
+          await writePairPatch(scratch, pair, options);
+          if (scratch.length === 0) continue;
+          this.changesFound = true;
+        } else if (fromContents) {
+          // git 2.43 checks every pair, and each one checked counts as a change
+          this.changesFound = true;
+        }
+        if (await writePairCheck(sink, pair, options, check)) this.checkFailed = true;
+      }
+      return pairs.length;
+    }
     let separator = false;
     for (const format of order) {
       if (!formats.includes(format)) continue;
@@ -1815,12 +1853,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       ...text
     } = this.textOptions;
     const colorSettings = this.colorSettings;
+    // git_default_core_config: a core.whitespace git cannot parse dies in every diff
+    const whitespaceRule = this.whitespaceRuleOf(filter, context);
     const colors = colorSettings?.colors
-      ? {
-          colors: colorSettings.colors,
-          wsHighlight: colorSettings.wsErrorHighlight,
-          whitespaceRule: this.whitespaceRuleOf(filter, context),
-        }
+      ? { colors: colorSettings.colors, wsHighlight: colorSettings.wsErrorHighlight }
       : {};
     const ignoreRegex = this.ignoreRegex();
     const abbrev = abbrevOption(this.textOptions.abbrev);
@@ -1838,6 +1874,27 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       ...(driver ? { driver } : {}),
       ...(ignoreRegex.length > 0 ? { ignoreRegex } : {}),
       ...colors,
+      whitespaceRule,
+    };
+  }
+
+  /** `ll_merge_marker_size`: each path's `conflict-marker-size` attribute */
+  private conflictMarkerSizeOf(): (path: string) => Promise<number> {
+    const filter = this.worktreeIfAny?.contentFilter as
+      | {
+          attributes?: (
+            path: string,
+            names?: readonly string[],
+            context?: { direction: "checkin"; index?: AttributesIndex },
+          ) => Promise<Map<string, true | false | string | undefined>>;
+        }
+      | undefined;
+    const context = this.newTree !== undefined ? WITHOUT_INDEX_ATTRIBUTES : undefined;
+    return async (path: string) => {
+      const attrs = await filter?.attributes?.(path, ["conflict-marker-size"], context);
+      return conflictMarkerSizeOf(attrs?.get("conflict-marker-size") ?? undefined, (m) =>
+        this.configWarnings.push(`warning: ${m}`),
+      );
     };
   }
 

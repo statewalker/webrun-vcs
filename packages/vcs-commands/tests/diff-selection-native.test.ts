@@ -197,6 +197,7 @@ const FORMAT_ARGS: Record<DiffOutputFormat, string[]> = {
   summary: ["--summary"],
   "name-only": ["--name-only"],
   "name-status": ["--name-status"],
+  check: ["--check"],
 };
 
 /**
