@@ -58,6 +58,8 @@ export interface SubmoduleFetchTask {
   defaultMode: "yes" | "on-demand";
   /** `--submodule-prefix` of the child: the path its nested submodules are shown under */
   prefix: string;
+  /** git runs the child with `--work-tree=.` (a submodule only the fetched history records) */
+  workTreeDot?: boolean;
   /** For the fetch of missing commits: the remote and the commits named on its command line */
   remote?: string;
   commits?: ObjectId[];
@@ -485,7 +487,7 @@ export async function fetchSubmodules(
       const failure = await chdirFailure(fetchTask.workingCopy);
       if (failure !== undefined) return { text: `${failure}\n`, ok: false };
     }
-    return options.runFetch(fetchTask);
+    return options.runFetch(workTreeDot ? { ...fetchTask, workTreeDot } : fetchTask);
   };
 
   const run = async (task: Task, workTreeDot: boolean) => {

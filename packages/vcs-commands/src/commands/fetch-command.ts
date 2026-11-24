@@ -53,6 +53,7 @@ import {
 import { TransportCommand } from "../transport-command.js";
 import { autoSetupRebase, installTracking } from "./branch-tracking.js";
 import { fetchFsckOf } from "./fsck/index.js";
+import { hookHostInGitDir } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import {
   hasPromisorRemote,
@@ -1238,8 +1239,15 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     ];
     const runFetch = async (task: SubmoduleFetchTask): Promise<SubmoduleFetchRun> => {
       const child = new FetchCommand(task.workingCopy);
-      // git's child `git fetch` runs in the submodule: its own hooks (reference-transaction
-      // of the submodule's refs), their output relayed where the child prints it
+      // git's child `git fetch` runs in the submodule's git directory with GIT_DIR=.
+      // (get_next_submodule, prepare_submodule_repo_env_in_gitdir): its own hooks
+      // (reference-transaction of the submodule's refs) run there, their output relayed
+      // where the child prints it
+      // (`--work-tree=.` sets GIT_WORK_TREE for its hooks too)
+      child.useHookHost(
+        hookHostInGitDir(task.workingCopy),
+        task.workTreeDot ? { GIT_WORK_TREE: "." } : undefined,
+      );
       child.setTransports(transports);
       if (this.timeout) child.setTimeout(this.timeout);
       if (this.gzipRequests !== undefined) child.setGzipRequests(this.gzipRequests);

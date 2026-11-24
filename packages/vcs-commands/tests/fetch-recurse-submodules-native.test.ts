@@ -198,7 +198,12 @@ async function expectTwins(t: Twins, steps: Step[], dir = "downstream"): Promise
       const e = error as Error & { exitCode?: number };
       mine = { stderr: `${e.message}\n`, exitCode: e.exitCode ?? 128 };
     }
-    expect(mine, label).toEqual(native);
+    // hooks print where they run: the twin's own path
+    const twinless = (x: { stderr: string; exitCode: number }, twin: string) => ({
+      ...x,
+      stderr: x.stderr.split(twin).join("<T>"),
+    });
+    expect(twinless(mine, t.ours), label).toEqual(twinless(native, t.native));
     expect(snapshot(join(t.ours, dir)), label).toEqual(snapshot(join(t.native, dir)));
   }
 }
@@ -484,7 +489,7 @@ git update-ref refs/changes/custom3 HEAD`),
   it("each repository's reference-transaction hook runs for its own refs (the submodule's fetch runs in the submodule)", async () => {
     const t = twins(`${T5526_SETUP}
 for d in downstream/.git:super downstream/.git/modules/submodule:sub; do
-  printf '#!/bin/sh\\necho "%s $1" >&2\\n' "\${d#*:}" > "\${d%%:*}/hooks/reference-transaction"
+  printf '#!/bin/sh\\necho "%s $1 pwd=$PWD dir=$GIT_DIR wt=$GIT_WORK_TREE" >&2\\n' "\${d#*:}" > "\${d%%:*}/hooks/reference-transaction"
   chmod +x "\${d%%:*}/hooks/reference-transaction"; done`);
     await expectTwins(t, [
       up("add_submodule_commits; add_superproject_commits"),
@@ -493,6 +498,12 @@ for d in downstream/.git:super downstream/.git/modules/submodule:sub; do
       // transaction as well, which ours does not (a divergence of the superproject's own fetch)
       up("add_submodule_commits; add_superproject_commits"),
       fetch(["--recurse-submodules"], (c) => c.setRecurseSubmodules(true)),
+      // a submodule the index no longer has: fetched as a changed one (`--work-tree=.`)
+      both(
+        "git checkout -q -b no-submodules; git rm -q .gitmodules; git rm -q submodule; git commit -qm none",
+      ),
+      up("add_submodule_commits; add_superproject_commits"),
+      fetch(["--recurse-submodules=on-demand"], (c) => c.setRecurseSubmodules("on-demand")),
     ]);
   });
 

@@ -55,7 +55,7 @@ import {
   worktreeModeTrust,
 } from "./commands/core-config.js";
 import type { ForkPointSource } from "./commands/fork-point.js";
-import { HookSession, refTransactionHookOf } from "./commands/git-hooks.js";
+import { type HookHost, HookSession, refTransactionHookOf } from "./commands/git-hooks.js";
 import {
   authorIdentOf,
   committerIdentOf,
@@ -490,6 +490,18 @@ export abstract class GitCommand<T> {
    */
   shareHooksOf(source: GitCommand<unknown>, env?: Record<string, string>): this {
     this.hookSession = env ? source.hooks.withEnv(env) : source.hooks;
+    return this;
+  }
+
+  /**
+   * @internal Runs this command's hooks in their own session over `host` (where they are
+   * found, the directory they run in, `GIT_DIR`): a git child process started elsewhere than
+   * the worktree top, as a submodule's fetch runs in its git directory; `env`: variables its
+   * hooks get too (the child's own, as `GIT_WORK_TREE` from `--work-tree`).
+   */
+  useHookHost(host: HookHost, env?: Record<string, string>): this {
+    const session = new HookSession(host);
+    this.hookSession = env ? session.withEnv(env) : session;
     return this;
   }
 

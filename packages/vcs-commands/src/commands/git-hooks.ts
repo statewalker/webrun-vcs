@@ -260,6 +260,22 @@ export function hookHostOf(workingCopy: WorkingCopy): HookHost {
   };
 }
 
+/**
+ * The hook host of a working copy whose git commands git starts in its git directory with
+ * `GIT_DIR=.` (submodule.c's `prepare_submodule_repo_env_in_gitdir`: a submodule's fetch run
+ * by its superproject): hooks run there, told `GIT_DIR=.`.
+ */
+export function hookHostInGitDir(workingCopy: WorkingCopy): HookHost {
+  const host = hookHostOf(workingCopy);
+  return {
+    ...host,
+    layout: async () => {
+      const layout = await host.layout();
+      return layout ? { ...layout, cwd: layout.gitDir, gitDirEnv: "." } : undefined;
+    },
+  };
+}
+
 const HOOK_VARIABLES = ["event", "command", "enabled"] as const;
 
 /**
