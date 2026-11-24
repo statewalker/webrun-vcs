@@ -82,6 +82,21 @@ describeGit("pull writes the worktree as native git", () => {
     );
   });
 
+  it("a merging pull under merge.log puts the shortlog in MERGE_MSG (t7600 'merge log message')", async () => {
+    const { native, ours } = setup();
+    for (const dir of [native, ours]) gitOk(root, dir, "config", "merge.log", "true");
+    git(root, native, "-c", "pull.rebase=false", "pull", "origin", "main");
+    const result = await (await openOurs(ours)).pull().setRemoteBranchName("main").call();
+    expect(result.mergeResult?.status).toBe(MergeStatus.CONFLICTING);
+    // the URL in the title and in the shortlog's name
+    const urls = (name: string, content: string) =>
+      normalizeState(name, content).replace(/ of \S+?(?=:?\n)/g, " of <url>");
+    expect(snapshot(root, ours, urls)).toEqual(snapshot(root, native, urls));
+    expect(snapshot(root, ours, urls).state.MERGE_MSG).toMatch(
+      /^Merge branch 'main' of <url>\n\n\* 'main' of <url>:\n {2}upstream\n/,
+    );
+  });
+
   it("a pull --rebase stops at the conflict as git pull --rebase does", async () => {
     const { native, ours } = setup();
     git(root, native, "-c", "pull.rebase=true", "pull", "origin", "main");

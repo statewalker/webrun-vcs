@@ -37,6 +37,11 @@ import {
 } from "../results/merge-result.js";
 import { CommitCommand, type CommitResult } from "./commit-command.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
+import {
+  DEFAULT_MERGE_LOG_LENGTH,
+  FmtMergeMsgCommand,
+  fmtMergeMsgConfigOf,
+} from "./fmt-merge-msg-command.js";
 import { configBool, conflictStyleOf } from "./merge-config.js";
 import { ortConfigOptions } from "./merge-drivers.js";
 import {
@@ -76,6 +81,7 @@ import { refuseCommitSigning, signRequestOf } from "./signing.js";
 import { readSparseCheckoutPatterns, sparseCheckoutConfig } from "./sparse-checkout-support.js";
 import { WorkingCopyStashProvider } from "./stash-working-tree.js";
 import { readDiffSubmoduleConfig } from "./submodule-summary.js";
+import { appendSignoff, ignoredLogMessageBytes, signoffLine, trailerConfigOf } from "./trailers.js";
 import {
   type CheckedEntry,
   pruneEmptyParents,
@@ -201,6 +207,12 @@ export class MergeCommand extends GitCommand<MergeResult> {
   private autoStash?: boolean;
   private renormalize?: boolean;
   private allowUnrelated = false;
+  /** `--log[=<n>]` / `--no-log` (undefined: `merge.log`) */
+  private log?: number;
+  private signoff = false;
+  private intoName?: string;
+  /** FETCH_HEAD-style lines naming the heads (a pull's), instead of merge_name's */
+  private mergeNames?: string;
 
   /**
    * Add a commit/branch to merge.
@@ -376,6 +388,52 @@ export class MergeCommand extends GitCommand<MergeResult> {
   setAllowUnrelatedHistories(allow: boolean): this {
     this.checkCallable();
     this.allowUnrelated = allow;
+    return this;
+  }
+
+  /**
+   * `--log[=<n>]`: the merge message lists the commits each head brings, at most `n` of them
+   * (true: 20), as git's fmt-merge-msg shortlog (`* <name>:` and their subjects; see
+   * {@link FmtMergeMsgCommand}); `--no-log` (false or 0) lists none. Undefined (the default)
+   * takes `merge.log` (or its old name `merge.summary`). With {@link setMessage} the list
+   * follows the message given.
+   */
+  setLog(log: boolean | number | undefined): this {
+    this.checkCallable();
+    this.log = log === true ? DEFAULT_MERGE_LOG_LENGTH : log === false ? 0 : log;
+    return this;
+  }
+
+  /**
+   * `--signoff`: the merge commit's message gets the committer's `Signed-off-by:` trailer
+   * (git's append_signoff, before the hooks see MERGE_MSG); `--no-signoff` (false, the
+   * default) none. A merge stopped before its commit (conflicts, `--no-commit`) adds none.
+   */
+  setSignoff(signoff: boolean): this {
+    this.checkCallable();
+    this.signoff = signoff;
+    return this;
+  }
+
+  /**
+   * `--into-name <branch>`: the default message names this branch as the one merged into
+   * (`into <branch>` left out as for HEAD's under `merge.suppressDest`).
+   */
+  setIntoName(name: string | undefined): this {
+    this.checkCallable();
+    this.intoName = name;
+    return this;
+  }
+
+  /**
+   * The heads described as FETCH_HEAD describes them (`<id>\t\tbranch 'x' of <url>`), as
+   * `git pull` hands them to the merge, instead of describing the names included.
+   *
+   * @internal
+   */
+  setMergeNames(lines: string): this {
+    this.checkCallable();
+    this.mergeNames = lines;
     return this;
   }
 
@@ -609,7 +667,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
           );
         }
         // the message names the heads left (fmt-merge-msg of the reduced heads)
-        const message = this.message ?? (await this.octopusMessage(remotes));
+        const message = await this.mergeMessage(headId, remotes);
         await state.setRef("ORIG_HEAD", headId);
         const ids = remotes.map((r) => r.id);
         if (!this.allowUnrelated && (await this.octopusBases(headId, ids)).length === 0) {
@@ -874,7 +932,6 @@ export class MergeCommand extends GitCommand<MergeResult> {
     }
     const { index } = await readIndex(this.staging);
 
-    const mergeName = await this.describeMergeSource(srcName, srcId);
     const output: string[] = [];
     let target: Map<string, { objectId: ObjectId; mode: number }>;
     let merge: Awaited<ReturnType<typeof mergeStoredTrees>> | undefined;
@@ -959,8 +1016,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
       };
     }
     output.push(...(merge?.messages ?? []));
-    // a message given is the commit's as it is; git's default ends with a newline
-    const message = this.message ?? (await this.defaultMessage(mergeName));
+    // git's merge_msg: the message given, or fmt-merge-msg's, without its last newline
+    const message = await this.mergeMessage(headId, [{ id: srcId, name: srcName }]);
 
     if (conflicts.length > 0 || merge?.clean === false) {
       const paths = [...new Set(conflicts.map((c) => c.stagePath))].sort(compareGitPaths);
@@ -1042,9 +1099,7 @@ export class MergeCommand extends GitCommand<MergeResult> {
         output,
       };
     }
-    await this.refuseSigning(() =>
-      this.writeMergeState(state, srcId, hooked.stateText ?? this.message ?? message),
-    );
+    await this.refuseSigning(() => this.writeMergeState(state, srcId, hooked.stateText ?? message));
     const newCommitId = await this.storeCommit(treeId, [headId, srcId], cleaned);
     await this.updateHead(head, newCommitId, reflogMessages.mergeMade(this.strategyName()));
     // the commit ends the merge: git's remove_merge_branch_state
@@ -1208,44 +1263,11 @@ export class MergeCommand extends GitCommand<MergeResult> {
         output,
       };
     }
-    await this.refuseSigning(() => writeState(hooked.stateText ?? this.message ?? message));
+    await this.refuseSigning(() => writeState(hooked.stateText ?? message));
     const newCommitId = await this.storeCommit(treeId, parents, cleaned);
     await this.updateHead(head, newCommitId, reflogMessages.mergeMade(strategy));
     output.push(`Merge made by the '${strategy}' strategy.`);
     return { status: MergeStatus.MERGED, newHead: newCommitId, mergedCommits, output };
-  }
-
-  /** git's fmt-merge-msg title for several heads: `Merge branches 'a', 'b' and tag 'v1'`. */
-  private async octopusMessage(heads: { id: ObjectId; name: string }[]): Promise<string> {
-    const groups = new Map<string, string[]>();
-    for (const { id, name } of heads) {
-      const described = await this.describeMergeSource(name, id);
-      const k = described.indexOf(" '");
-      const kind = described.slice(0, k);
-      const list = groups.get(kind) ?? [];
-      list.push(described.slice(k + 1));
-      groups.set(kind, list);
-    }
-    const plural: Record<string, string> = {
-      branch: "branches",
-      "remote-tracking branch": "remote-tracking branches",
-      tag: "tags",
-      commit: "commits",
-    };
-    const parts: string[] = [];
-    for (const kind of ["branch", "remote-tracking branch", "tag", "commit"]) {
-      const list = groups.get(kind);
-      if (!list) continue;
-      const joined =
-        list.length === 1
-          ? list[0]
-          : `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}`;
-      parts.push(`${list.length === 1 ? kind : plural[kind]} ${joined}`);
-    }
-    const branch = await this.getCurrentBranch();
-    const short = branch?.startsWith("refs/heads/") ? branch.slice("refs/heads/".length) : "HEAD";
-    const into = short === "main" || short === "master" ? "" : ` into ${short}`;
-    return `Merge ${parts.join(", ")}${into}\n`;
   }
 
   /** The heads MERGE_HEAD names (one per line: several for an octopus). */
@@ -1568,12 +1590,56 @@ export class MergeCommand extends GitCommand<MergeResult> {
   }
 
   /**
-   * MERGE_MSG's text before any conflicts hint (git's `write_merge_state`): the message as
-   * given with a newline added, always (`-m "x\n"` gives `x` and a blank line), or git's
-   * default message (already one line ended).
+   * MERGE_MSG's text before any conflicts hint (git's `write_merge_state`): merge_msg with
+   * a newline added, always (`-m "x\n"` gives `x` and a blank line).
    */
   private stateMessage(message: string): string {
-    return this.message !== undefined ? `${this.message}\n` : message;
+    return `${message}\n`;
+  }
+
+  /**
+   * git's merge_msg (collect_parents): the message given (`-m`), followed by fmt-merge-msg's
+   * shortlog and tag messages under `--log`, or fmt-merge-msg's whole message without one;
+   * its last newline dropped (prepare_merge_message).
+   */
+  private async mergeMessage(
+    headId: ObjectId,
+    heads: { id: ObjectId; name: string }[],
+  ): Promise<string> {
+    const log =
+      this.log ??
+      (this.inProcess
+        ? 0
+        : Math.max(0, fmtMergeMsgConfigOf(RemoteConfigStore.from(this.workingCopy)).log));
+    if (this.message !== undefined && log === 0) return this.message;
+    const fmt = new FmtMergeMsgCommand(this.workingCopy)
+      .setHead(headId)
+      .setLog(log)
+      .setCreditPeople(false)
+      .setMessage(this.message)
+      .setIntoName(this.intoName);
+    if (this.mergeNames !== undefined) fmt.setInput(this.mergeNames);
+    else for (const { name } of heads) fmt.addHead(name);
+    const text = await fmt.call();
+    return text.endsWith("\n") ? text.slice(0, -1) : text;
+  }
+
+  /**
+   * prepare_to_commit's `--signoff`: the committer's sign-off added to merge_msg
+   * (append_signoff with ignored_log_message_bytes).
+   */
+  private signedOff(message: string): string {
+    if (!this.signoff) return message;
+    const author = this.author ?? this.resolveAuthor(this.committer);
+    const committer = this.committer ?? this.resolveCommitter(author);
+    const config = trailerConfigOf(this.workingCopy);
+    return appendSignoff(
+      message,
+      signoffLine(committer),
+      config,
+      false,
+      ignoredLogMessageBytes(message, config.commentString),
+    );
   }
 
   /** git's merge exports GIT_REFLOG_ACTION before it writes a ref (see reflogActionValue). */
@@ -1600,8 +1666,9 @@ export class MergeCommand extends GitCommand<MergeResult> {
     writeState: (text: string) => Promise<void>,
   ): Promise<{ message: string; refused?: string; stateText?: string }> {
     // (a merge a rebase makes in process runs no hooks of its own)
+    const signed = this.signedOff(message);
     if (!this.hooks.enabled || this.inProcess) {
-      return { message: this.cleanup(message), stateText: this.message ?? message };
+      return { message: this.cleanup(signed), stateText: signed };
     }
     const env = {
       GIT_INDEX_FILE: await this.hooks.gitPath("index"),
@@ -1620,8 +1687,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
       if (pre && pre.exitCode !== 0) return abort();
       if (pre) await this.staging.read();
     }
-    // prepare_to_commit writes merge_msg as it is (`-m`'s text without a newline added)
-    await writeState(this.message ?? message);
+    // prepare_to_commit writes merge_msg as it is (no newline added), signed off
+    await writeState(signed);
     const file = await this.hooks.gitPath("MERGE_MSG");
     const prepare = await this.hooks.run("prepare-commit-msg", { args: [file, "merge"], env });
     if (prepare && prepare.exitCode !== 0) return abort();
@@ -1711,27 +1778,6 @@ export class MergeCommand extends GitCommand<MergeResult> {
       return;
     }
     await updateHeadExpecting(this.refsStore, id, old, log);
-  }
-
-  /** How git's merge message names what is merged: `branch 'x'`, `tag 'v1'`, ... */
-  private async describeMergeSource(name: string, id: ObjectId): Promise<string> {
-    const strip = (prefix: string) => (name.startsWith(prefix) ? name.slice(prefix.length) : name);
-    if (name.startsWith("refs/heads/")) return `branch '${strip("refs/heads/")}'`;
-    if (name.startsWith("refs/remotes/"))
-      return `remote-tracking branch '${strip("refs/remotes/")}'`;
-    if (name.startsWith("refs/tags/")) return `tag '${strip("refs/tags/")}'`;
-    if (await this.refsStore.has(`refs/heads/${name}`)) return `branch '${name}'`;
-    if (await this.refsStore.has(`refs/tags/${name}`)) return `tag '${name}'`;
-    if (await this.refsStore.has(`refs/remotes/${name}`)) return `remote-tracking branch '${name}'`;
-    return `commit '${name || id}'`;
-  }
-
-  /** git's default merge message: `Merge branch 'x'` (`into <branch>` off main/master). */
-  private async defaultMessage(description: string): Promise<string> {
-    const branch = await this.getCurrentBranch();
-    const short = branch?.startsWith("refs/heads/") ? branch.slice("refs/heads/".length) : "HEAD";
-    const into = short === "main" || short === "master" ? "" : ` into ${short}`;
-    return `Merge ${description}${into}\n`;
   }
 
   /**
