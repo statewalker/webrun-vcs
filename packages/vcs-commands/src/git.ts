@@ -57,6 +57,7 @@ import {
   PackRefsCommand,
   PullCommand,
   PushCommand,
+  RangeDiffCommand,
   ReadTreeCommand,
   RebaseCommand,
   ReflogCommand,
@@ -903,6 +904,20 @@ export class Git implements Disposable {
   cherry(): CherryCommand {
     this.checkClosed();
     return new CherryCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a RangeDiffCommand (`git range-diff`): two versions of a patch series compared
+   * commit by commit.
+   *
+   * @example
+   * ```typescript
+   * await git.rangeDiff().addArgument("main..topic").addArgument("main..topic-v2").callText();
+   * ```
+   */
+  rangeDiff(): RangeDiffCommand {
+    this.checkClosed();
+    return new RangeDiffCommand(this._workingCopy);
   }
 
   /**
