@@ -8,8 +8,9 @@
  * `user.signingKey`, `gpg.ssh.defaultKeyCommand`), picks the key as `sign_buffer` does and
  * {@link signPayload} hands the payload to the signer; {@link signCommit} puts the signature
  * in the commit's `gpgsig` header (`gpgsig-sha256` in a SHA-256 repository), as
- * `commit_tree_extended` / `add_header_signature` do. `commit -S` signs; the other commands
- * still refuse (their tickets follow: tags, rebase/pick/merge/am, push certificates).
+ * `commit_tree_extended` / `add_header_signature` do. `commit -S` and `tag -s`/`-u` sign (the
+ * tag's signature appended to its message, builtin/tag.c's `do_sign`); the other commands
+ * still refuse (their tickets follow: rebase/pick/merge/am, push certificates).
  *
  * Without a signer every request to sign fails as native git fails when its signing program
  * cannot sign (gpg-interface.c `sign_buffer_gpg`: `error: gpg failed to sign the data:` with
@@ -85,11 +86,22 @@ export const SIGNING_FAILED_LINES: readonly string[] = [
 export class SigningFailedError extends GitApiError {
   /** The key that was asked for (`""`: the default key) */
   readonly signingKey: string;
+  /** What the signer said, without the command's tail (absent: no signer ran) */
+  readonly signerMessages?: readonly string[];
+  /** The ssh signing program's exit status when it ran and failed (`SigningOutcome.exitCode`) */
+  readonly programExitCode?: number;
 
-  constructor(message: string, signingKey: string, exitCode?: number) {
+  constructor(
+    message: string,
+    signingKey: string,
+    exitCode?: number,
+    details: { signerMessages?: readonly string[]; programExitCode?: number } = {},
+  ) {
     super(message, exitCode === undefined ? undefined : { exitCode });
     this.name = "SigningFailedError";
     this.signingKey = signingKey;
+    if (details.signerMessages !== undefined) this.signerMessages = details.signerMessages;
+    if (details.programExitCode !== undefined) this.programExitCode = details.programExitCode;
   }
 }
 
@@ -306,7 +318,17 @@ export async function signPayload(
     const messages = outcome.messages?.length
       ? outcome.messages.map(reportedMessage)
       : SIGNING_FAILED_LINES;
-    throw new SigningFailedError([...messages, ...(outcome.died ? [] : tail)].join("\n"), sign);
+    throw new SigningFailedError(
+      [...messages, ...(outcome.died ? [] : tail)].join("\n"),
+      sign,
+      undefined,
+      {
+        signerMessages: messages,
+        ...(outcome.exitCode !== undefined && resolved.format === "ssh"
+          ? { programExitCode: outcome.exitCode }
+          : {}),
+      },
+    );
   }
   return stripCrBeforeLf(outcome.signature);
 }
