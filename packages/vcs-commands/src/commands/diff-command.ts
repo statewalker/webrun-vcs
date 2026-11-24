@@ -76,6 +76,7 @@ import {
   formatShortstat,
   formatStat,
   formatSummary,
+  writeHeaderOnlyPatch,
   writePairPatch,
 } from "../results/diff-output.js";
 import { DiffPickaxe } from "../results/diff-pickaxe.js";
@@ -1122,6 +1123,52 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     return true;
   }
 
+  /** diff.c's `additional_path_headers` (see {@link setAdditionalHeaders}) */
+  private additionalHeaders?: Map<string, readonly string[]>;
+
+  /**
+   * diff.c's `additional_path_headers` (`--remerge-diff`'s `remerge CONFLICT` lines), by path:
+   * the paths within the pathspec keep theirs (log-tree.c's setup_additional_headers). A
+   * pair's headers follow its rename lines; a path with headers and no change is shown as a
+   * `diff --git` line with its headers alone, unless a pickaxe or a `--diff-filter` without
+   * `U` is given (`include_conflict_headers`).
+   */
+  setAdditionalHeaders(headers: ReadonlyMap<string, readonly string[]>): this {
+    this.checkCallable();
+    this.additionalHeaders = new Map(headers);
+    return this;
+  }
+
+  /** The additional headers within the pathspec, undefined for none */
+  private headersInPathspec(): Map<string, readonly string[]> | undefined {
+    const all = this.additionalHeaders;
+    if (!all || all.size === 0) return undefined;
+    if (!this.pathspecItems) return all;
+    const out = new Map<string, readonly string[]>();
+    for (const [path, headers] of all) {
+      if (matchPathspec(this.pathspecItems, path, 0) > 0) out.set(path, headers);
+    }
+    return out.size > 0 ? out : undefined;
+  }
+
+  /**
+   * diff.c's `include_conflict_headers`: headers present, no pickaxe, and no `--diff-filter`
+   * or one that keeps `U`
+   */
+  private includesConflictHeaders(headers: Map<string, readonly string[]> | undefined): boolean {
+    if (!headers || hasPickaxe(this.textOptions)) return false;
+    const filter = this.textOptions.diffFilter;
+    if (filter === undefined) return true;
+    // diff_opt_diff_filter: a lowercase letter starts from every status, each letter then
+    // adds (uppercase) or removes (lowercase) its own
+    let keepsU = /[a-z]/.test(filter);
+    for (const c of filter) {
+      if (c === "U") keepsU = true;
+      else if (c === "u") keepsU = false;
+    }
+    return keepsU;
+  }
+
   /** Text output options: context, algorithm, whitespace, `--stat` widths, ... */
   setOptions(options: DiffTextOptions): this {
     this.checkCallable();
@@ -1316,11 +1363,15 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         ...(followPath !== undefined ? { followPath } : {}),
         ...(followChange !== undefined ? { followChange } : {}),
       };
-      if (collected.entries.length === 0 && collected.combined.length === 0) return followed;
+      // diff_queue_is_empty: headers to include count as a change
+      const headers = this.headersInPathspec();
+      const withHeaders = this.includesConflictHeaders(headers);
+      if (collected.entries.length === 0 && collected.combined.length === 0 && !withHeaders)
+        return followed;
       const sink = new ByteSink();
-      const queued = await this.writeFormats(sink, formats, collected);
+      const queued = await this.writeFormats(sink, formats, collected, headers);
       // diffcore_std left nothing (`--diff-filter`, `--skip-to`): no diff, as an empty one
-      if (queued === 0 && collected.combined.length === 0) return followed;
+      if (queued === 0 && collected.combined.length === 0 && !withHeaders) return followed;
       return { bytes: sink.bytes(), ...followed };
     });
   }
@@ -1374,6 +1425,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     sink: ByteSink,
     formats: DiffOutputFormat[],
     collected: { entries: DiffEntry[]; combined: CombinedEntry[] },
+    headers?: Map<string, readonly string[]>,
   ): Promise<number> {
     const config = this.config;
     const { combined } = collected;
@@ -1464,8 +1516,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       }
       for (const c of combined) await this.writeCombined(sink, c, options, combinedLengths);
     }
-    // diff_flush of an empty queue prints nothing
-    if (pairs.length === 0) return 0;
+    // diff_flush of an empty queue prints nothing (unless headers are to be shown)
+    if (pairs.length === 0 && !headers) return 0;
+    if (headers) options.additionalHeaders = (name) => headers.get(name);
     // diff_setup_done: --check turns the other formats off
     if (formats.includes("check")) {
       const check = { conflictMarkerSize: this.conflictMarkerSizeOf() };
@@ -1537,9 +1590,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
             moved?.colors && moved.colorMoved !== "no"
               ? new MovedLineBuffer(moved.colorMoved, moved.colorMovedWs)
               : sink;
-          for (const pair of pairs) {
+          for (const pair of this.withHeaderOnlyPairs(pairs, full, headers)) {
             const before = out.length;
-            if (unmerged.has(pair)) {
+            if (typeof pair === "string") {
+              if (this.includesConflictHeaders(headers)) {
+                writeHeaderOnlyPatch(out, pair, headers?.get(pair) ?? [], options);
+              }
+            } else if (unmerged.has(pair)) {
               out.text(`* Unmerged path ${pair.new?.path ?? pair.old?.path}\n`);
             } else await writePairPatch(out, pair, options);
             // builtin_diff's found_changes: the pair showed something
@@ -1600,6 +1657,32 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       }
     }
     return pairs.length;
+  }
+
+  /**
+   * create_filepairs_for_header_only_notifications: the pairs, and the paths with headers
+   * none of them names first (as strings), sorted by first name (diffcore_fix_diff_index)
+   */
+  private withHeaderOnlyPairs(
+    pairs: DiffFilePair[],
+    full: (pair: DiffFilePair) => DiffFilePair,
+    headers: Map<string, readonly string[]> | undefined,
+  ): (DiffFilePair | string)[] {
+    if (!headers) return pairs;
+    const nameOf = (pair: DiffFilePair) => {
+      const f = full(pair);
+      return f.old?.path ?? f.new?.path ?? "";
+    };
+    const present = new Set(pairs.map(nameOf));
+    const out: { name: string; item: DiffFilePair | string }[] = pairs.map((pair) => ({
+      name: nameOf(pair),
+      item: pair,
+    }));
+    for (const path of headers.keys()) {
+      if (!present.has(path)) out.push({ name: path, item: path });
+    }
+    out.sort((a, b) => compareBytes(a.name, b.name));
+    return out.map((e) => e.item);
   }
 
   /**
