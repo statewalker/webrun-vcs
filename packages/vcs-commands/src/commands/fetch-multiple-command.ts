@@ -79,6 +79,8 @@ export class FetchMultipleCommand extends GuardedTransportCommand<FetchMultipleR
   private porcelain = false;
   private writeFetchHead = true;
   private append = false;
+  /** GIT_REFLOG_ACTION in the environment (a pull's): every fetch's reflog action */
+  private envReflogAction?: string;
 
   /**
    * Fetch every configured remote (`--all`; false is `--no-all`); left unset, `fetch.all`
@@ -182,6 +184,17 @@ export class FetchMultipleCommand extends GuardedTransportCommand<FetchMultipleR
   setAppend(append: boolean): this {
     this.checkCallable();
     this.append = append;
+    return this;
+  }
+
+  /**
+   * `GIT_REFLOG_ACTION` as the environment sets it for git's children (a `git pull --all`
+   * exports `pull --all`): every fetch, each child included, names it in its reflog lines
+   * instead of its own command line.
+   */
+  setEnvReflogAction(action: string): this {
+    this.checkCallable();
+    this.envReflogAction = action;
     return this;
   }
 
@@ -354,6 +367,7 @@ export class FetchMultipleCommand extends GuardedTransportCommand<FetchMultipleR
       .setRemotes(name)
       .setAppend(true)
       .setGroupDepth(this.groupDepth + 1);
+    if (this.envReflogAction !== undefined) nested.setEnvReflogAction(this.envReflogAction);
     if (this.prune !== undefined) nested.setPrune(this.prune);
     if (this.pruneTags !== undefined) nested.setPruneTags(this.pruneTags);
     if (this.tagOption !== undefined) nested.setTagOpt(this.tagOption);
@@ -400,7 +414,10 @@ export class FetchMultipleCommand extends GuardedTransportCommand<FetchMultipleR
     if (this.verbose) fetch.setVerbose(true);
     if (this.porcelain) fetch.setPorcelain(true);
     if (!this.writeFetchHead) fetch.setWriteFetchHead(false);
-    fetch.setReflogAction(this.hasReflogAction() && !append ? this.reflogAction("") : reflogAction);
+    fetch.setReflogAction(
+      this.envReflogAction ??
+        (this.hasReflogAction() && !append ? this.reflogAction("") : reflogAction),
+    );
     try {
       const result = await fetch.call();
       const refused =

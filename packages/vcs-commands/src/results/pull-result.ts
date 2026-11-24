@@ -13,6 +13,8 @@ export interface PullResult {
    * fetching (`rebaseResult` then holds git's refusal, `UNCOMMITTED_CHANGES`)
    */
   fetchResult?: FetchResult;
+  /** Every remote's fetch of a `--all` pull over several remotes (`fetchResult` is the last) */
+  fetchResults?: FetchResult[];
   /** Result of the merge phase (if applicable; also the fast-forward of a rebasing pull) */
   mergeResult?: MergeResult;
   /**
