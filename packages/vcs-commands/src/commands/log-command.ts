@@ -50,6 +50,7 @@ import {
 import {
   checkPickaxeOptions,
   DiffCommand,
+  type DiffOutputFormat,
   type DiffTextOptions,
   hasPickaxe,
   renamesValue,
@@ -107,6 +108,7 @@ import {
   type RefDecorations,
 } from "./pretty-format.js";
 import { openReflogWalk, walkReflogs } from "./reflog-walk.js";
+import { RemergeTreeCommand, remergeObjectsView } from "./remerge-diff.js";
 import {
   type CommitFilter,
   CommitFilters,
@@ -2768,7 +2770,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       if (!loaded) throw new GitApiError(`fatal: bad object ${id}`);
       // try_to_simplify_commit, then get_commit_action: a commit TREESAME to a parent (a
       // root without the paths) is ignored
-      if (limited && (await this.treesameForShow(id, loaded))) return false;
+      if (limited && (await this.treesameForShow(id, loaded, printer.fullHistory))) return false;
       const filter = this.activeFilter;
       if (filter) {
         const view: FilteredCommit = {
@@ -2800,9 +2802,15 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     };
   }
 
-  /** revision.c's try_to_simplify_commit for a commit git shows without walking */
-  private async treesameForShow(id: ObjectId, commit: Commit): Promise<boolean> {
+  /**
+   * revision.c's try_to_simplify_commit for a commit git shows without walking; without
+   * `simplify_history` (`--full-history`, `-m`, `--remerge-diff`) a merge is TREESAME only
+   * to every parent it looks at (update_treesame)
+   */
+  private async treesameForShow(id: ObjectId, commit: Commit, full = false): Promise<boolean> {
     if (commit.parents.length === 0) return !(await this.pathsDiffer(undefined, commit.tree));
+    const merge = commit.parents.length > 1 && !this.firstParentOnly;
+    const all = full || !this.simplifyHistory;
     for (let k = 0; k < commit.parents.length; k++) {
       if (k === 1 && this.firstParentOnly) break;
       const parent = await this.walkCommits.load(commit.parents[k] as ObjectId);
@@ -2811,9 +2819,12 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
           `fatal: cannot simplify commit ${id} (because of ${commit.parents[k]})`,
         );
       }
-      if (!(await this.pathsDiffer(parent.tree, commit.tree))) return true;
+      const same = !(await this.pathsDiffer(parent.tree, commit.tree));
+      if (merge && all) {
+        if (!same) return false;
+      } else if (same) return true;
     }
-    return false;
+    return merge && all;
   }
 
   /**
@@ -2983,6 +2994,38 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       }
       return tree;
     };
+    const runDiff = async (
+      oldTree: ObjectId,
+      newTree: ObjectId,
+      formats: DiffOutputFormat[],
+      options: { statWidth?: number; follow?: string; fullDiff?: boolean; abbrev?: number },
+      prepare?: (diff: DiffCommand) => void,
+    ) => {
+      // the trees themselves: a full id names its object, so no revision is looked up
+      const diff = new DiffCommand(this._workingCopy);
+      prepare?.(diff);
+      diff
+        .setOldTree(oldTree)
+        .setNewTree(newTree)
+        // log's diffcore_rotate starts at the first path after a missing one
+        .setRotateStrict(false)
+        .shareReadsOf(this);
+      if (this.colorSettings) diff.setColorSettings(this.colorSettings);
+      diff.setOptions({
+        ...this.diffOptions,
+        ...(options.statWidth !== undefined
+          ? { stat: { ...this.diffOptions.stat, width: options.statWidth } }
+          : {}),
+        ...(options.abbrev !== undefined ? { abbrev: options.abbrev } : {}),
+      });
+      if (!options.fullDiff && options.follow === undefined) {
+        const spec = [...this.paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
+        if (spec.length > 0) diff.setPathspec(spec);
+      }
+      const shown = await diff.callFormats(formats, options.follow);
+      if (diff.checkFoundErrors) this.checkFailed = true;
+      return shown;
+    };
     return {
       config: (key) => config.value(key),
       configAll: (key) => config.values(key),
@@ -3040,29 +3083,36 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         mailmap ??= this.loadedMailmap();
         return mailmap;
       },
-      diff: async (entry, parent, formats, options) => {
-        // the trees themselves: a full id names its object, so no revision is looked up
-        const diff = new DiffCommand(this._workingCopy)
-          .setOldTree(parent ? await treeOf(parent) : this.objectFormat.emptyTreeId)
-          .setNewTree(entry.commit.tree)
-          // log's diffcore_rotate starts at the first path after a missing one
-          .setRotateStrict(false)
-          .shareReadsOf(this);
-        if (this.colorSettings) diff.setColorSettings(this.colorSettings);
-        diff.setOptions({
-          ...this.diffOptions,
-          ...(options.statWidth !== undefined
-            ? { stat: { ...this.diffOptions.stat, width: options.statWidth } }
-            : {}),
-          ...(options.abbrev !== undefined ? { abbrev: options.abbrev } : {}),
-        });
-        if (!options.fullDiff && options.follow === undefined) {
-          const spec = [...this.paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
-          if (spec.length > 0) diff.setPathspec(spec);
+      diff: async (entry, parent, formats, options) =>
+        runDiff(
+          parent ? await treeOf(parent) : this.objectFormat.emptyTreeId,
+          entry.commit.tree,
+          formats,
+          options,
+        ),
+      remergeDiff: async (entry, parents, formats, options) => {
+        // log-tree.c's do_remerge_diff: the re-merge's objects live in a view of their own
+        // (git's tmp_objdir), dropped after this merge
+        const history = this._workingCopy.history;
+        if (!history) throw new Error("WorkingCopy.history is required for commands");
+        const view = remergeObjectsView(history);
+        const remerge = new RemergeTreeCommand(this._workingCopy)
+          .setObjectsView(view)
+          .shareReadsOf(this)
+          .setParents(parents[0], parents[1]);
+        // git 2.43's cmd_log_walk freed the parents of every commit it had processed (2.44
+        // keeps them under --remerge-diff), so its merge bases stop there (`--reverse`)
+        if (
+          this.compatibility === "2.43" &&
+          this.reflogWalkNames === undefined &&
+          options.processed?.size
+        ) {
+          remerge.setParentlessCommits(options.processed);
         }
-        const shown = await diff.callFormats(formats, options.follow);
-        if (diff.checkFoundErrors) this.checkFailed = true;
-        return shown;
+        const remerged = await remerge.call();
+        return runDiff(remerged.treeId, entry.commit.tree, formats, options, (diff) =>
+          diff.setObjectsView(view).setAdditionalHeaders(remerged.pathMessages),
+        );
       },
       combinedDiff: (entry, options) => this.combinedDiff(entry, options),
       lineLogDiff: async (entry, formats, options) => {

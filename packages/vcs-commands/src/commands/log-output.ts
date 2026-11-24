@@ -55,7 +55,13 @@ import type { SignatureCheck } from "./signature-check.js";
 import { appendSignoff, type TrailerConfig } from "./trailers.js";
 
 /** How `git log` treats merges in its diffs (`--diff-merges=<mode>`, `-m`, `-c`, `--cc`). */
-export type LogDiffMerges = "off" | "first-parent" | "separate" | "combined" | "dense-combined";
+export type LogDiffMerges =
+  | "off"
+  | "first-parent"
+  | "separate"
+  | "combined"
+  | "dense-combined"
+  | "remerge";
 
 /** What `git log` prints of each commit (its command-line options). */
 export interface LogOutputOptions {
@@ -147,6 +153,12 @@ export interface LogOutputOptions {
   cc?: boolean;
   /** `--diff-merges=<mode>` */
   diffMerges?: LogDiffMerges;
+  /**
+   * `--remerge-diff`: each two-parent merge shown as the diff from merge-ort's automatic
+   * result of its parents (conflict markers included, merged in memory) to the merge, with
+   * the merge's conflicts as `remerge CONFLICT` headers (implies `-p`)
+   */
+  remergeDiff?: boolean;
   /**
    * `--full-diff`: a path-limited log shows the commits' whole diffs (against their parents
    * before `--graph` rewrote them)
@@ -327,6 +339,24 @@ export interface LogOutputHost {
    * `names` as `--name-only` / `--name-status` list them (undefined for neither), `patch`
    * the combined patch (when asked); `follow` the one path `--follow` limits it to
    */
+  /**
+   * `--remerge-diff`'s diff of a two-parent merge: from merge-ort's in-memory re-merge of
+   * `parents` to the merge, with the re-merge's `remerge CONFLICT` headers; nothing it
+   * stores reaches the repository
+   */
+  remergeDiff?(
+    entry: LogOutputEntry,
+    parents: [ObjectId, ObjectId],
+    formats: DiffOutputFormat[],
+    options: {
+      statWidth?: number;
+      follow?: string;
+      fullDiff?: boolean;
+      abbrev?: number;
+      /** The commits the log has processed before this one (git 2.43 freed their parents) */
+      processed?: ReadonlySet<ObjectId>;
+    },
+  ): Promise<{ bytes?: Uint8Array; followPath?: string }>;
   combinedDiff(
     entry: LogOutputEntry,
     options: {
@@ -916,8 +946,15 @@ export class LogPrinter {
     this.fullHistory =
       diffMerges === "separate" ||
       diffMerges === "first-parent" ||
-      (!!options.m && (mDefault === "separate" || mDefault === "first-parent"));
-    if (options.cc) {
+      diffMerges === "remerge" ||
+      !!options.remergeDiff ||
+      (!!options.m &&
+        (mDefault === "separate" || mDefault === "first-parent" || mDefault === "remerge"));
+    if (options.remergeDiff) {
+      diffMerges = "remerge";
+      mergesNeedDiff = true;
+      implyPatch = true;
+    } else if (options.cc) {
       diffMerges = "dense-combined";
       mergesNeedDiff = true;
       implyPatch = true;
@@ -1087,6 +1124,17 @@ export class LogPrinter {
    * not shown (`--follow` and nothing of the path changed).
    */
   async showCommit(entry: LogOutputEntry, lookahead: ObjectId[]): Promise<boolean> {
+    try {
+      return await this.showCommitOnce(entry, lookahead);
+    } finally {
+      this.processed.add(entry.id);
+    }
+  }
+
+  /** The commits {@link showCommit} was given so far (cmd_log_walk's loop) */
+  private readonly processed = new Set<ObjectId>();
+
+  private async showCommitOnce(entry: LogOutputEntry, lookahead: ObjectId[]): Promise<boolean> {
     this.graph?.update(entry.id, lookahead, this.revisionMark(entry, true));
     if (this.follow) {
       const stored = this.followPaths.get(entry.id);
@@ -1131,7 +1179,7 @@ export class LogPrinter {
     if (!allNeedDiff && !this.mergesNeedDiff) return false;
     if (this.walk.lineLog) {
       // log_tree_diff: line_log_queue_pairs, then log_tree_diff_flush
-      await this.diffFlush(entry, undefined, log, true);
+      await this.diffFlush(entry, undefined, log, undefined, true);
       return !log.pending;
     }
     const parents = this.diffParents(entry);
@@ -1142,6 +1190,18 @@ export class LogPrinter {
       return !log.pending;
     }
     const firstParentMerges = this.diffMerges === "first-parent";
+    if (isMerge && this.diffMerges === "remerge") {
+      if (parents.length > 2) {
+        await this.showLog(entry, log);
+        this.out.text("diff: warning: Skipping remerge-diff for octopus merges.\n");
+        return true;
+      }
+      await this.diffFlush(entry, parents[0], log, [
+        parents[0] as ObjectId,
+        parents[1] as ObjectId,
+      ]);
+      return !log.pending;
+    }
     if (isMerge) {
       if (this.diffMerges === "combined" || this.diffMerges === "dense-combined") {
         await this.combined(entry, log, this.diffMerges === "dense-combined");
@@ -1183,19 +1243,31 @@ export class LogPrinter {
     entry: LogOutputEntry,
     parent: ObjectId | undefined,
     log: { pending: boolean; parent: ObjectId | undefined },
+    /** do_remerge_diff: the diff from these parents' re-merge instead of from `parent` */
+    remerge?: [ObjectId, ObjectId],
+    /** `-L`: the commit's pairs cut to the line ranges (line_log_queue_pairs) */
     lineLog = false,
   ): Promise<void> {
     this.shownDashes = false;
     const width = this.graph ? this.graph.getWidth() : 0;
+    const diffOptions = {
+      ...(width ? { statWidth: 80 - width } : {}),
+      ...(this.follow && this.followPath !== undefined ? { follow: this.followPath } : {}),
+      ...(this.options.fullDiff ? { fullDiff: true } : {}),
+      ...this.diffAbbrev(),
+    };
+    if (remerge && !this.host.remergeDiff) {
+      throw new Error("--remerge-diff: the log's host cannot re-merge");
+    }
     const result: { bytes?: Uint8Array; followPath?: string } =
       lineLog && this.host.lineLogDiff
         ? await this.host.lineLogDiff(entry, this.formats, this.diffAbbrev())
-        : await this.host.diff(entry, parent, this.formats, {
-            ...(width ? { statWidth: 80 - width } : {}),
-            ...(this.follow && this.followPath !== undefined ? { follow: this.followPath } : {}),
-            ...(this.options.fullDiff ? { fullDiff: true } : {}),
-            ...this.diffAbbrev(),
-          });
+        : remerge && this.host.remergeDiff
+          ? await this.host.remergeDiff(entry, remerge, this.formats, {
+              ...diffOptions,
+              processed: this.processed,
+            })
+          : await this.host.diff(entry, parent, this.formats, diffOptions);
     if (this.follow && result.followPath !== undefined) this.followPath = result.followPath;
     if (!result.bytes) return;
     if (log.pending) {
@@ -1700,6 +1772,9 @@ export function mergesMode(value: string): LogDiffMerges | undefined {
     case "cc":
     case "dense-combined":
       return "dense-combined";
+    case "r":
+    case "remerge":
+      return "remerge";
     default:
       return undefined;
   }
