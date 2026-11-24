@@ -24,9 +24,16 @@ export class WorktreesUnsupportedError extends GitApiError {
  * ```
  */
 export class WorktreeError extends GitApiError {
-  constructor(message: string) {
+  /**
+   * What git prints on stderr before its `fatal:` line (`Preparing worktree ...`, `hint:`
+   * lines), each line as printed.
+   */
+  readonly messages: string[];
+
+  constructor(message: string, messages: string[] = []) {
     super(message);
     this.name = "WorktreeError";
+    this.messages = messages;
   }
 }
 

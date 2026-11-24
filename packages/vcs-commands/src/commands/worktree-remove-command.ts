@@ -1,9 +1,18 @@
-import type { LinkedWorktrees, WorktreeInfo } from "@statewalker/vcs-working-tree";
+import {
+  type LinkedWorktrees,
+  WorktreeFormatUpgradeError,
+  type WorktreeInfo,
+} from "@statewalker/vcs-working-tree";
 
 import { InvalidConfigError, WorktreeError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { StatusCommand } from "./status-command.js";
-import { checkCandidatePath, findLinkedWorktree, requireWorktrees } from "./worktree-support.js";
+import {
+  checkCandidatePath,
+  findLinkedWorktree,
+  requireWorktrees,
+  useRelativePaths,
+} from "./worktree-support.js";
 
 /** The refusals `move` and `remove` share for a locked worktree. */
 function refuseLocked(wt: WorktreeInfo, force: number, verb: "move" | "remove"): void {
@@ -115,7 +124,7 @@ export class WorktreeRemoveCommand extends GitCommand<WorktreeInfo> {
 /**
  * Move a linked worktree.
  *
- * Equivalent to `git worktree move [-f] <worktree> <new-path>`.
+ * Equivalent to `git worktree move [-f] [--[no-]relative-paths] <worktree> <new-path>`.
  *
  * @example
  * ```typescript
@@ -127,12 +136,29 @@ export class WorktreeRemoveCommand extends GitCommand<WorktreeInfo> {
  * not an empty directory, or where a missing worktree is registered (unless forced);
  * submodules; a locked worktree unless forced twice; a worktree whose `.git` file does not
  * point back; a worktree beyond this storage. The directory is renamed, then `gitdir` and the worktree's `.git` file name
- * the new place.
+ * the new place: absolute paths, or relative ones with {@link setRelativePaths} (git 2.48+,
+ * default `worktree.useRelativePaths`; the repository then gets `extensions.relativeWorktrees`).
  */
 export class WorktreeMoveCommand extends GitCommand<WorktreeInfo> {
   private worktree?: string;
   private destination?: string;
   private force = 0;
+  private relativePaths?: boolean;
+  private compatibility: "2.43" | "2.56" = "2.56";
+
+  /** `--[no-]relative-paths` (git 2.48+; default `worktree.useRelativePaths`). */
+  setRelativePaths(relative: boolean): this {
+    this.checkCallable();
+    this.relativePaths = relative;
+    return this;
+  }
+
+  /** The git version reproduced (default 2.56): 2.43 has no relative links. */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
 
   /** The worktree: a path, or a unique suffix of one. */
   setWorktree(worktree: string): this {
@@ -159,6 +185,11 @@ export class WorktreeMoveCommand extends GitCommand<WorktreeInfo> {
     this.checkCallable();
     this.setCallable(false);
     const worktrees = requireWorktrees(this.workingCopy, "move");
+    const relativePaths = useRelativePaths(
+      this.workingCopy,
+      this.relativePaths,
+      this.compatibility,
+    );
     if (this.destination === undefined) throw new WorktreeError("<new-path> is required");
     let destination = this.destination;
     const wt = await findLinkedWorktree(worktrees, this.worktree, "'%s' is a main working tree");
@@ -177,8 +208,11 @@ export class WorktreeMoveCommand extends GitCommand<WorktreeInfo> {
     const invalid = await worktrees.validate(wt);
     if (invalid) throw new WorktreeError(`validation failed, cannot move working tree: ${invalid}`);
     try {
-      await worktrees.move(wt, destination);
+      await worktrees.move(wt, destination, relativePaths ? { relativePaths } : {});
     } catch (error) {
+      if (error instanceof WorktreeFormatUpgradeError) {
+        throw new WorktreeError(error.message, [error.errorLine]);
+      }
       throw new WorktreeError(error instanceof Error ? error.message : String(error));
     }
     return { ...wt, path: worktrees.hostPath(destination) };

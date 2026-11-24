@@ -6,18 +6,39 @@
  * @module
  */
 
+import { parseGitBool } from "@statewalker/vcs-utils";
 import type {
   LinkedWorktrees,
   WorkingCopy,
   WorktreeAdmin,
   WorktreeInfo,
 } from "@statewalker/vcs-working-tree";
-
 import {
   BranchUsedByWorktreeError,
   WorktreeError,
   WorktreesUnsupportedError,
 } from "../errors/index.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
+
+/**
+ * Whether `worktree move`/`repair` write relative links: the option, else
+ * `worktree.useRelativePaths` (false). git 2.43 has neither: the option is refused there.
+ */
+export function useRelativePaths(
+  workingCopy: WorkingCopy,
+  option: boolean | undefined,
+  compatibility: "2.43" | "2.56",
+): boolean {
+  if (compatibility === "2.43") {
+    if (option !== undefined) {
+      throw new WorktreeError(`unknown option \`${option ? "" : "no-"}relative-paths'`);
+    }
+    return false;
+  }
+  if (option !== undefined) return option;
+  const value = RemoteConfigStore.from(workingCopy).value("worktree.useRelativePaths");
+  return value === undefined ? false : (parseGitBool(value) ?? false);
+}
 
 /**
  * A working copy for the `git worktree` commands from a {@link WorktreeAdmin}: the admin's

@@ -41,11 +41,12 @@ import type {
   WorkingCopy,
   WorktreeAdmin,
   WorktreeInfo,
+  WorktreeLinkOptions,
   WorktreePathState,
   WorktreePruneCheck,
   WorktreeRepairReport,
 } from "@statewalker/vcs-working-tree";
-import { readIndexFileEntries } from "@statewalker/vcs-working-tree";
+import { readIndexFileEntries, WorktreeFormatUpgradeError } from "@statewalker/vcs-working-tree";
 import { createGitFilesBackend } from "../../create-git-files-backend.js";
 import {
   createFileRefStore,
@@ -53,6 +54,7 @@ import {
   peelTag,
   ReftableRefStore,
 } from "../../refs/index.js";
+import { readRepositoryFormat } from "../../repository-format.js";
 import { GitCheckout, type GitCheckoutFilesApi } from "../checkout/index.js";
 import {
   HostPaths,
@@ -137,6 +139,62 @@ async function readIfFile(files: FilesApi, path: string): Promise<Uint8Array | u
   const kind = (await files.stats(path).catch(() => undefined))?.kind;
   if (kind !== "file") return undefined;
   return tryReadFile(files, path).catch(() => undefined);
+}
+
+/**
+ * git's `relative_path(in, prefix)` (path.c) for two absolute host paths: `in` relative to the
+ * directory `prefix`, `./` when they are the same.
+ */
+export function relativeGitPath(inPath: string, prefix: string): string {
+  const isSep = (c: string | undefined) => c === "/";
+  const inLen = inPath.length;
+  const prefixLen = prefix.length;
+  if (!inLen) return "./";
+  if (!prefixLen) return inPath;
+  if (isSep(inPath[0]) !== isSep(prefix[0])) return inPath;
+  let inOff = 0;
+  let prefixOff = 0;
+  let i = 0;
+  let j = 0;
+  while (i < prefixLen && j < inLen && prefix[i] === inPath[j]) {
+    if (isSep(prefix[i])) {
+      while (isSep(prefix[i])) i++;
+      while (isSep(inPath[j])) j++;
+      prefixOff = i;
+      inOff = j;
+    } else {
+      i++;
+      j++;
+    }
+  }
+  if (i >= prefixLen && prefixOff < prefixLen) {
+    if (j >= inLen) {
+      inOff = inLen;
+    } else if (isSep(inPath[j])) {
+      while (isSep(inPath[j])) j++;
+      inOff = j;
+    } else {
+      i = prefixOff;
+    }
+  } else if (j >= inLen && inOff < inLen) {
+    if (isSep(prefix[i])) {
+      while (isSep(prefix[i])) i++;
+      inOff = inLen;
+    }
+  }
+  const rest = inPath.slice(inOff);
+  if (i >= prefixLen) return rest === "" ? "./" : rest;
+  let out = "";
+  while (i < prefixLen) {
+    if (isSep(prefix[i])) {
+      out += "../";
+      while (isSep(prefix[i])) i++;
+      continue;
+    }
+    i++;
+  }
+  if (!isSep(prefix[prefixLen - 1])) out += "../";
+  return out + rest;
 }
 
 /** git's `strbuf_trim`: ASCII white space (space, tab, line feed, carriage return) only. */
@@ -504,7 +562,9 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
   }
 
   /** git's `read_gitfile_gently` of the `.git` file at the FilesApi path `dotGit`. */
-  private async readGitfile(dotGit: string): Promise<{ error?: number; target?: string }> {
+  private async readGitfile(
+    dotGit: string,
+  ): Promise<{ error?: number; target?: string; written?: string }> {
     const kind = await this.kind(dotGit);
     if (kind === undefined) return { error: GITFILE_STAT_FAILED };
     if (kind === "directory") return { error: GITFILE_NOT_A_FILE };
@@ -517,9 +577,9 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       ? this.paths.normalize(written)
       : this.paths.normalize(`${dir}/${written}`);
     if (!(await this.isGitDirectory(this.fromHost(target)))) {
-      return { error: GITFILE_NOT_A_REPO, target };
+      return { error: GITFILE_NOT_A_REPO, target, written };
     }
-    return { target };
+    return { target, written };
   }
 
   /** git's `is_git_directory`: a HEAD, and objects (here or through `commondir`). */
@@ -595,6 +655,49 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     await this.files.write(path, [encodeGitPath(text)]);
   }
 
+  /**
+   * git's `write_worktree_linking_files`: `<admin>/gitdir` naming the worktree's `.git`, the
+   * worktree's `.git` file naming `<admin>`, both absolute, or (`relative`) relative to each
+   * other's directory, the repository upgraded to `extensions.relativeWorktrees` first.
+   */
+  private async writeLinkingFiles(root: string, admin: string, relative: boolean): Promise<void> {
+    const worktree = this.paths.normalize(this.paths.hostPath(root));
+    const repository = this.paths.normalize(this.paths.hostPath(admin));
+    if (relative) await this.enableRelativeWorktrees();
+    const gitdir = relative ? relativeGitPath(worktree, repository) : worktree;
+    const dotGit = relative ? relativeGitPath(repository, worktree) : repository;
+    await this.writeText(`${admin}/gitdir`, `${gitdir}/.git\n`);
+    await this.writeText(`${root}/.git`, `gitdir: ${dotGit}\n`);
+  }
+
+  /**
+   * `upgrade_repository_format(repo, 1)` and `extensions.relativeWorktrees = true`, unless
+   * the repository has the extension already.
+   */
+  private async enableRelativeWorktrees(): Promise<void> {
+    const format = await this.checkRelativeUpgrade();
+    if (format.relativeWorktrees) return;
+    const config = await createWorkingCopyConfig(configFilesApiOf(this.files), this.commonDir);
+    if (format.version < 1) config.set("core.repositoryformatversion", "1");
+    config.set("extensions.relativeWorktrees", "true");
+    await config.save();
+    this.config = undefined;
+  }
+
+  /**
+   * The repository's format, refused (`WorktreeFormatUpgradeError`) when relative links would
+   * need `upgrade_repository_format` to version 1 and the repository (version 0) has an
+   * extension git does not know: checked before anything is written.
+   */
+  private async checkRelativeUpgrade() {
+    const format = await readRepositoryFormat(this.files, this.commonDir);
+    const unknown = format.unknownExtensions ?? [];
+    if (!format.relativeWorktrees && format.version < 1 && unknown.length > 0) {
+      throw new WorktreeFormatUpgradeError(unknown[0]);
+    }
+    return format;
+  }
+
   async create(options: CreateLinkedWorktreeOptions): Promise<CreatedLinkedWorktree> {
     const path = this.toFiles(options.path);
     // worktree_basename: the last component, trailing separators aside
@@ -608,6 +711,10 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       "id" in options.head
         ? options.head.id
         : (await this.history.refs.resolve(options.head.ref).catch(() => undefined))?.objectId;
+
+    // a repository whose format cannot take relative links: refused before any write (git
+    // dies in write_worktree_linking_files and removes what it created)
+    if (options.relativePaths) await this.checkRelativeUpgrade();
 
     // worktrees/<name>, numbered when taken (add_worktree's mkdir loop)
     const root = `${this.commonDir}/worktrees`;
@@ -623,8 +730,7 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       // locked while it is set up, so a concurrent prune keeps it
       await this.writeText(`${admin}/locked`, lineText(options.lockReason ?? "initializing"));
       await this.files.mkdir(path);
-      await this.writeText(`${admin}/gitdir`, `${this.paths.hostPath(`${path}/.git`)}\n`);
-      await this.writeText(`${path}/.git`, `gitdir: ${this.paths.hostPath(admin)}\n`);
+      await this.writeLinkingFiles(path, admin, options.relativePaths === true);
       const head = "id" in options.head ? options.head.id : `ref: ${options.head.ref}`;
       const reftable = this.history.refs instanceof ReftableRefStore;
       // a reftable repository: HEAD and `refs/heads` are stubs for older gits, the worktree's
@@ -729,31 +835,51 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     await this.files.remove(path);
   }
 
-  async move(entry: WorktreeInfo, destination: string): Promise<void> {
+  async move(
+    entry: WorktreeInfo,
+    destination: string,
+    options: WorktreeLinkOptions = {},
+  ): Promise<void> {
     if (entry.id === undefined) throw new Error("can't relocate main worktree");
     const from = this.fromHost(entry.path);
     const to = this.toFiles(destination);
+    // refused before the rename (git renames first, then dies in write_worktree_linking_files,
+    // leaving the worktree moved with stale links)
+    if (options.relativePaths) await this.checkRelativeUpgrade();
     if (from === undefined || !(await this.files.move(from, to))) {
       throw new Error(`failed to move '${entry.path}' to '${this.paths.hostPath(to)}'`);
     }
     // update_worktree_location: both link files name the new place
     const admin = this.adminDir(entry.id);
     if (!this.paths.same(entry.path, this.paths.hostPath(to))) {
-      await this.writeText(`${to}/.git`, `gitdir: ${this.paths.hostPath(admin)}\n`);
-      await this.writeText(`${admin}/gitdir`, `${this.paths.hostPath(`${to}/.git`)}\n`);
+      await this.writeLinkingFiles(to, admin, options.relativePaths === true);
     }
   }
 
-  async repair(paths: string[]): Promise<WorktreeRepairReport[]> {
+  async repair(
+    paths: string[],
+    options: WorktreeLinkOptions = {},
+  ): Promise<WorktreeRepairReport[]> {
     const reports: WorktreeRepairReport[] = [];
-    for (const path of paths) await this.repairAtPath(path, reports);
-    const list = await this.list();
-    for (const wt of list.slice(1)) await this.repairGitfile(wt, reports);
+    const relative = options.relativePaths;
+    try {
+      for (const path of paths) await this.repairAtPath(path, reports, relative);
+      const list = await this.list();
+      for (const wt of list.slice(1)) await this.repairGitfile(wt, reports, relative);
+    } catch (error) {
+      // git dies at the first write it cannot make, after what it reported
+      if (error instanceof WorktreeFormatUpgradeError) error.reports = reports;
+      throw error;
+    }
     return reports;
   }
 
   /** git's `repair_worktree_at_path`: the `gitdir` back-link of the worktree at `path`. */
-  private async repairAtPath(path: string, reports: WorktreeRepairReport[]): Promise<void> {
+  private async repairAtPath(
+    path: string,
+    reports: WorktreeRepairReport[],
+    relative: boolean | undefined,
+  ): Promise<void> {
     const at = this.toFiles(path);
     if (this.paths.same(this.paths.hostPath(at), this.paths.hostPath(this.mainPath()))) return;
     const dotGit = `${at}/.git`;
@@ -799,10 +925,19 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
     const old = await this.readText(gitdir);
     let message: string | undefined;
     if (old === undefined) message = "gitdir unreadable";
-    else if (!this.paths.same(parseWorktreeGitdir(old), hostDotGit)) message = "gitdir incorrect";
+    else if (relative !== undefined && relative === isAbsoluteGitPath(old)) {
+      message = "gitdir absolute/relative path mismatch";
+    } else {
+      // a relative gitdir names the .git file from the administrative directory
+      let written = parseWorktreeGitdir(old);
+      if (!isAbsoluteGitPath(written)) written = this.paths.normalize(`${backlink}/${written}`);
+      if (!this.paths.same(written, hostDotGit)) message = "gitdir incorrect";
+    }
     if (message) {
       reports.push({ error: false, path: this.paths.hostPath(gitdir), message });
-      await this.writeText(gitdir, `${hostDotGit}\n`);
+      // 2.48+ writes both link files; 2.43 the gitdir file alone
+      if (relative !== undefined) await this.writeLinkingFiles(at, admin, relative);
+      else await this.writeText(gitdir, `${hostDotGit}\n`);
     }
   }
 
@@ -820,7 +955,11 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
   }
 
   /** git's `repair_gitfile`: a linked worktree's `.git` file. */
-  private async repairGitfile(wt: WorktreeInfo, reports: WorktreeRepairReport[]): Promise<void> {
+  private async repairGitfile(
+    wt: WorktreeInfo,
+    reports: WorktreeRepairReport[],
+    relative: boolean | undefined,
+  ): Promise<void> {
     if (wt.id === undefined) return;
     const root = this.fromHost(wt.path);
     const kind = await this.kind(root);
@@ -841,10 +980,19 @@ export class GitLinkedWorktrees implements LinkedWorktrees {
       message = ".git file broken";
     } else if (read.target === undefined || !this.paths.same(read.target, admin)) {
       message = ".git file incorrect";
+    } else if (
+      relative !== undefined &&
+      read.written !== undefined &&
+      relative === isAbsoluteGitPath(read.written)
+    ) {
+      message = ".git file absolute/relative path mismatch";
     }
     if (message) {
       reports.push({ error: false, path: wt.path, message });
-      await this.writeText(dotGit, `gitdir: ${admin}\n`);
+      // 2.48+ writes both link files; 2.43 the .git file alone
+      if (relative !== undefined)
+        await this.writeLinkingFiles(root, this.adminDir(wt.id), relative);
+      else await this.writeText(dotGit, `gitdir: ${admin}\n`);
     }
   }
 

@@ -283,6 +283,7 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
       .setTrack(this.track)
       .setMerge(this.merge)
       .setCompatibility(this.compatibility)
+      .setAdviceCommand("switch")
       .setOnlyMergeOnSwitchingBranches(true);
     if (this.guess !== undefined) checkout.setGuess(this.guess);
     if (this.hasReflogAction()) checkout.setReflogAction(this.reflogAction("checkout"));
@@ -333,7 +334,8 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
       const configured = RemoteConfigStore.from(this.workingCopy).value("checkout.guess");
       const guess = this.guess ?? parseGitBool(configured) ?? true;
       if (guess && isValidBranchName(arg)) {
-        if (await guessRemoteBranch(this.workingCopy, this.refsStore, arg)) return;
+        const options = { command: "switch", compatibility: this.compatibility } as const;
+        if (await guessRemoteBranch(this.workingCopy, this.refsStore, arg, options)) return;
       }
       throw new SwitchRefusedError(`fatal: invalid reference: ${arg}`);
     }
