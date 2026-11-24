@@ -1,5 +1,5 @@
 /**
- * `git log --graph`: a port of git's graph.c (2.5x), without colors. The graph is fed one
+ * `git log --graph`: a port of git's graph.c (2.5x). The graph is fed one
  * commit at a time, in the order `git log` shows them, and draws the lines before, at and
  * after each commit: columns of `|`, merges (`|\`, octopus `*-.`), collapsing (`/`, `_`),
  * and (git 2.5x) the indentation of a "visual root", a commit without visible parents
@@ -32,6 +32,52 @@ export interface LogGraphOptions {
   indent?: boolean;
   /** `--graph-lane-limit=<n>`: lanes past it are truncated with `~` (default none) */
   maxLanes?: number;
+  /**
+   * Draw each column in its color (want_color): the palette, its reset last
+   * (`column_colors_ansi`, or `log.graphColors` through {@link graphColumnColors})
+   */
+  colors?: readonly string[];
+}
+
+/** color.c's `column_colors_ansi`: the graph's default palette, its reset last */
+export const GRAPH_COLUMN_COLORS_ANSI: readonly string[] = [
+  "\x1b[31m",
+  "\x1b[32m",
+  "\x1b[33m",
+  "\x1b[34m",
+  "\x1b[35m",
+  "\x1b[36m",
+  "\x1b[1;31m",
+  "\x1b[1;32m",
+  "\x1b[1;33m",
+  "\x1b[1;34m",
+  "\x1b[1;35m",
+  "\x1b[1;36m",
+  "\x1b[m",
+];
+
+/**
+ * graph.c's `parse_graph_colors_config`: the colors of `log.graphColors` (comma separated),
+ * the reset appended; `warn` gets git's warning for each color it cannot parse
+ */
+export function graphColumnColors(
+  value: string,
+  parse: (spec: string) => string | undefined,
+  warn: (message: string) => void,
+): string[] {
+  const out: string[] = [];
+  let start = 0;
+  while (start < value.length) {
+    let comma = value.indexOf(",", start);
+    if (comma < 0) comma = value.length;
+    const spec = value.slice(start, comma);
+    const color = parse(spec);
+    if (color !== undefined) out.push(color);
+    else warn(`warning: ignored invalid color '${spec}' in log.graphColors`);
+    start = comma + 1;
+  }
+  out.push("\x1b[m");
+  return out;
 }
 
 type State =
@@ -45,6 +91,8 @@ type State =
 
 interface Column {
   commit: ObjectId | undefined;
+  /** The index of its color in the palette (the reset's index: none) */
+  color: number;
   isMergeParent: boolean;
 }
 
@@ -81,7 +129,46 @@ export class LogGraph {
   private visualRootCascade = false;
   private commitInColumns = false;
 
-  constructor(private readonly options: LogGraphOptions) {}
+  /** column_colors and column_colors_max (the reset's index) */
+  private readonly palette: readonly string[];
+  private readonly colorsMax: number;
+  /** default_column_color: starts at the last color, incremented for the first commit */
+  private defaultColumnColor: number;
+
+  constructor(private readonly options: LogGraphOptions) {
+    this.palette = options.colors ?? GRAPH_COLUMN_COLORS_ANSI;
+    this.colorsMax = this.palette.length - 1;
+    this.defaultColumnColor = this.colorsMax - 1;
+  }
+
+  /** graph_get_current_column_color */
+  private currentColumnColor(): number {
+    return this.options.colors ? this.defaultColumnColor : this.colorsMax;
+  }
+
+  /** graph_increment_column_color */
+  private incrementColumnColor(): void {
+    if (this.colorsMax > 0)
+      this.defaultColumnColor = (this.defaultColumnColor + 1) % this.colorsMax;
+  }
+
+  /** graph_find_commit_color */
+  private findCommitColor(id: ObjectId): number {
+    for (let i = 0; i < this.numColumns; i++) {
+      const c = this.columns[i];
+      if (c && c.commit === id) return c.color;
+    }
+    return this.currentColumnColor();
+  }
+
+  /** graph_line_write_column: the character in its column's color */
+  private writeColumn(line: Line, c: Column, ch: string): void {
+    const colored = c.color < this.colorsMax;
+    if (colored) line.buf += this.palette[c.color];
+    line.buf += ch;
+    line.width++;
+    if (colored) line.buf += this.palette[this.colorsMax];
+  }
 
   private get noIndent(): boolean {
     return this.options.indent === false;
@@ -124,7 +211,7 @@ export class LogGraph {
   private col(arr: Column[], i: number): Column {
     let c = arr[i];
     if (!c) {
-      c = { commit: undefined, isMergeParent: false };
+      c = { commit: undefined, color: this.colorsMax, isMergeParent: false };
       arr[i] = c;
     }
     return c;
@@ -138,6 +225,7 @@ export class LogGraph {
       i = this.numNewColumns++;
       const c = this.col(this.newColumns, i);
       c.commit = id;
+      c.color = this.findCommitColor(id);
       c.isMergeParent = false;
     }
     if (this.numParents > 1 && idx > -1 && this.mergeLayout === -1) {
@@ -184,6 +272,8 @@ export class LogGraph {
         this.commitIndex = i;
         this.mergeLayout = -1;
         for (const parent of this.interestingParents()) {
+          // a merge, or the start of a new childless column, takes the next color
+          if (this.numParents > 1 || !isCommitInColumns) this.incrementColumnColor();
           this.insertIntoNewColumns(parent, i);
         }
         if (this.numParents === 0) this.width += 2;
@@ -311,7 +401,8 @@ export class LogGraph {
         LogGraph.add(line, "~ ");
         break;
       }
-      LogGraph.add(line, "| ");
+      this.writeColumn(line, this.col(this.newColumns, i), "|");
+      LogGraph.add(line, " ");
     }
   }
 
@@ -332,18 +423,19 @@ export class LogGraph {
       const col = this.columns[i] as Column;
       if (col.commit === this.commit) {
         seenThis = true;
-        LogGraph.add(line, "|");
+        this.writeColumn(line, col, "|");
         LogGraph.add(line, " ".repeat(this.expansionRow));
       } else if (seenThis && this.needsTruncation(i)) {
         LogGraph.add(line, "~ ");
         break;
       } else if (seenThis && this.expansionRow === 0) {
-        if (this.prevState === "post-merge" && this.prevCommitIndex < i) LogGraph.add(line, "\\");
-        else LogGraph.add(line, "|");
+        if (this.prevState === "post-merge" && this.prevCommitIndex < i)
+          this.writeColumn(line, col, "\\");
+        else this.writeColumn(line, col, "|");
       } else if (seenThis && this.expansionRow > 0) {
-        LogGraph.add(line, "\\");
+        this.writeColumn(line, col, "\\");
       } else {
-        LogGraph.add(line, "|");
+        this.writeColumn(line, col, "|");
       }
       LogGraph.add(line, " ");
     }
@@ -354,12 +446,15 @@ export class LogGraph {
   private drawOctopusMerge(line: Line): void {
     const dashed = this.numDashedParents();
     for (let i = 0; i < dashed; i++) {
-      LogGraph.add(line, "-");
+      // the column each edge collapses to gives the dash its color
+      const j = this.mapping[(this.commitIndex + i + 2) * 2] as number;
+      const col = this.col(this.newColumns, j);
+      this.writeColumn(line, col, "-");
       if (this.needsTruncation(this.commitIndex + 1 + i)) {
         LogGraph.add(line, "~ ");
         break;
       }
-      LogGraph.add(line, i === dashed - 1 ? "." : "-");
+      this.writeColumn(line, col, i === dashed - 1 ? "." : "-");
     }
   }
 
@@ -391,23 +486,23 @@ export class LogGraph {
         seenThis = true;
         break;
       } else if (seenThis && this.edgesAdded > 1) {
-        LogGraph.add(line, "\\");
+        this.writeColumn(line, col as Column, "\\");
       } else if (seenThis && this.edgesAdded === 1) {
         if (
           this.prevState === "post-merge" &&
           this.prevEdgesAdded > 0 &&
           this.prevCommitIndex < i
         ) {
-          LogGraph.add(line, "\\");
-        } else LogGraph.add(line, "|");
+          this.writeColumn(line, col as Column, "\\");
+        } else this.writeColumn(line, col as Column, "|");
       } else if (
         this.prevState === "collapsing" &&
         this.oldMapping[2 * i + 1] === i &&
         (this.mapping[2 * i] as number) < i
       ) {
-        LogGraph.add(line, "/");
+        this.writeColumn(line, col as Column, "/");
       } else {
-        LogGraph.add(line, "|");
+        this.writeColumn(line, col as Column, "|");
       }
       LogGraph.add(line, " ");
     }
@@ -444,7 +539,8 @@ export class LogGraph {
         let truncated = false;
         seenThis = true;
         for (let j = 0; j < this.numParents; j++) {
-          LogGraph.add(line, MERGE_CHARS[idx] as string);
+          const parCol = this.findNewColumnByCommit(parents[j] as ObjectId);
+          this.writeColumn(line, this.col(this.newColumns, parCol), MERGE_CHARS[idx] as string);
           if (
             this.needsTruncation(Math.floor(j / 2) + i) &&
             Math.floor(j / 2) + i <= this.numColumns
@@ -468,12 +564,13 @@ export class LogGraph {
         LogGraph.add(line, "~ ");
         break;
       } else if (seenThis) {
-        LogGraph.add(line, this.edgesAdded > 0 ? "\\" : "|");
+        this.writeColumn(line, col as Column, this.edgesAdded > 0 ? "\\" : "|");
         if (!this.needsTruncation(i + 1)) LogGraph.add(line, " ");
       } else {
-        LogGraph.add(line, "|");
+        this.writeColumn(line, col as Column, "|");
         if (this.mergeLayout !== 0 || i !== this.commitIndex - 1) {
-          LogGraph.add(line, parentCol ? "_" : " ");
+          if (parentCol) this.writeColumn(line, parentCol, "_");
+          else LogGraph.add(line, " ");
         }
       }
       if (colCommit === firstParent) parentCol = col;
@@ -523,14 +620,14 @@ export class LogGraph {
       if (target < 0) {
         if (!truncated) LogGraph.add(line, " ");
       } else if (target * 2 === i) {
-        if (!truncated) LogGraph.add(line, "|");
+        if (!truncated) this.writeColumn(line, this.col(this.newColumns, target), "|");
       } else if (target === horizontalEdgeTarget && i !== horizontalEdge - 1) {
         if (i !== target * 2 + 3) this.mapping[i] = -1;
         usedHorizontal = true;
-        if (!truncated) LogGraph.add(line, "_");
+        if (!truncated) this.writeColumn(line, this.col(this.newColumns, target), "_");
       } else {
         if (usedHorizontal && i < horizontalEdge) this.mapping[i] = -1;
-        if (!truncated) LogGraph.add(line, "/");
+        if (!truncated) this.writeColumn(line, this.col(this.newColumns, target), "/");
       }
     }
     if (this.isMappingCorrect()) this.updateState("padding");
@@ -541,8 +638,8 @@ export class LogGraph {
       const col = this.columns[i] as Column;
       if (col.commit === this.commit) {
         LogGraph.add(line, " ");
-        LogGraph.add(line, "\\");
-      } else LogGraph.add(line, "|");
+        this.writeColumn(line, col, "\\");
+      } else this.writeColumn(line, col, "|");
       LogGraph.add(line, " ");
     }
     this.updateState("commit");
@@ -591,7 +688,7 @@ export class LogGraph {
         LogGraph.add(line, "~ ");
         break;
       }
-      LogGraph.add(line, "|");
+      this.writeColumn(line, col, "|");
       if (col.commit === this.commit && this.numParents > 2) {
         LogGraph.add(line, " ".repeat((this.numParents - 2) * 2));
       } else LogGraph.add(line, " ");
