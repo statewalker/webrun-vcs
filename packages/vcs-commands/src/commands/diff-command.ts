@@ -140,6 +140,11 @@ export interface DiffTextOptions
   /** `--indent-heuristic` / `--no-indent-heuristic` (default `diff.indentHeuristic`, true) */
   indentHeuristic?: boolean;
   /**
+   * diff_options.stat_sep: text written after the blank line that separates a stat or
+   * summary from the patch (format-patch's MIME part header with `--attach`/`--inline`)
+   */
+  statSep?: string;
+  /**
    * `--abbrev=<n>`: the `index` lines' ids at least n digits, clamped as git clamps it (below
    * 4, 0 too, is 4; above 40 is 40); the combined diffs of conflicted paths ignore it, as
    * git's do
@@ -1244,7 +1249,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     let separator = false;
     for (const format of order) {
       if (!formats.includes(format)) continue;
-      if (format === "patch" && separator) sink.text("\n");
+      if (format === "patch" && separator) {
+        sink.text("\n");
+        // attach the patch instead of inlining it
+        if (this.textOptions.statSep) sink.text(this.textOptions.statSep);
+      }
       // diff_flush: an empty summary (is_summary_empty) prints nothing and asks no separator
       if (format === "summary") {
         // diff_summary names the paths in full, whatever `--relative` says

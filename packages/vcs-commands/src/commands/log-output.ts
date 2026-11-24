@@ -47,7 +47,7 @@ import {
   type RefDecorations,
   wrapText,
 } from "./pretty-format.js";
-import { appendSignoff } from "./trailers.js";
+import { appendSignoff, type TrailerConfig } from "./trailers.js";
 
 /** How `git log` treats merges in its diffs (`--diff-merges=<mode>`, `-m`, `-c`, `--cc`). */
 export type LogDiffMerges = "off" | "first-parent" | "separate" | "combined" | "dense-combined";
@@ -182,6 +182,13 @@ export interface LogMailOptions {
   preserveSubject?: boolean;
   /** `--signoff`: this `Signed-off-by: ...` line (with LF) appended, unless already there */
   signoff?: string;
+  /** The `trailer.*` settings the sign-off is added with (see `trailerConfigOf`) */
+  trailerConfig?: TrailerConfig;
+  /**
+   * A multipart mail (`--attach`, `--inline`): `afterSubject` carries the MIME headers, and
+   * no 8bit `Content-Type` header is added (log-tree.c's need_8bit_cte of -1)
+   */
+  multipart?: boolean;
   /** `--from=<ident>`: the `From:` header's ident (the author moves to an in-body From) */
   from?: { name: string; email: string };
   /** `--force-in-body-from` */
@@ -515,6 +522,20 @@ function addRfc2047(sb: string, text: string, address: boolean, encoding = "UTF-
     i += len;
   }
   return `${out}?=`;
+}
+
+/**
+ * pp_email_subject's subject header: `start` (`Subject: [PATCH 1/2] `) and the title, in
+ * RFC 2047 (unless `encodeHeaders` is false) or wrapped at 78 columns, with its LF.
+ */
+export function mailSubjectLine(
+  start: string,
+  title: string,
+  options: { encodeHeaders?: boolean; encoding?: string } = {},
+): string {
+  if ((options.encodeHeaders ?? true) && needsRfc2047(title))
+    return `${start}${addRfc2047(start, title, false, options.encoding ?? "UTF-8")}\n`;
+  return `${start}${wrapText(title, -lastLineLength(start), 1, 78)}\n`;
 }
 
 /**
@@ -1222,7 +1243,7 @@ export class LogPrinter {
     if (this.showNotes) notes = await this.notesText(entry.id, fmt === "user");
     let msg = await this.prettyPrint(entry, notes ?? "");
     if (isMail && this.options.mail?.signoff)
-      msg = appendSignoff(msg, this.options.mail.signoff, {}, true);
+      msg = appendSignoff(msg, this.options.mail.signoff, this.options.mail.trailerConfig, true);
     if (fmt !== "user" && notes) {
       if (isMail) {
         msg += this.shownDashes ? "\n" : "---\n";
@@ -1343,14 +1364,19 @@ export class LogPrinter {
       const title = parts.join(mail?.preserveSubject ? "\n" : " ");
       if (fmt === "oneline") sb += `${title}\n`;
       else {
-        sb += mail?.subject ? mail.subject(entry.id) : "Subject: [PATCH] ";
-        if ((mail?.encodeHeaders ?? true) && needsRfc2047(title))
-          sb += addRfc2047(sb, title, false, mail?.outputEncoding ?? "UTF-8");
-        else sb += wrapText(title, -lastLineLength(sb), 1, 78);
-        sb += "\n";
-        // need_8bit_cte: a body (after the header) with a byte above 0x7f, or an in-body
-        // header with one
-        if (hasNonAscii(parsed.body) || inBody.some(hasNonAscii)) {
+        sb += mailSubjectLine(mail?.subject ? mail.subject(entry.id) : "Subject: [PATCH] ", title, {
+          encodeHeaders: mail?.encodeHeaders ?? true,
+          encoding: mail?.outputEncoding ?? "UTF-8",
+        });
+        // need_8bit_cte: never in a multipart mail; else a sign-off by a committer whose
+        // ident is not ASCII, a body (after the header) with a byte above 0x7f, or an
+        // in-body header with one
+        if (
+          !mail?.multipart &&
+          ((mail?.signoff !== undefined && hasNonAscii(mail.signoff)) ||
+            hasNonAscii(parsed.body) ||
+            inBody.some(hasNonAscii))
+        ) {
           sb += `MIME-Version: 1.0\nContent-Type: text/plain; charset=${mail?.outputEncoding ?? "UTF-8"}\nContent-Transfer-Encoding: 8bit\n`;
         }
         if (mail?.afterSubject) sb += mail.afterSubject;
