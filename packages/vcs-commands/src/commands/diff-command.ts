@@ -6,7 +6,9 @@ import {
 } from "@statewalker/vcs-core";
 import {
   ByteSink,
+  compilePosixRegex,
   isNullObjectId,
+  type PosixRegex,
   parseGitBool,
   type XdiffAlgorithm,
 } from "@statewalker/vcs-utils";
@@ -25,7 +27,12 @@ import {
   withWorktreeEntries,
 } from "@statewalker/vcs-working-tree";
 
-import { NoHeadError, RefNotFoundError } from "../errors/index.js";
+import {
+  GitApiError,
+  InvalidArgumentError,
+  NoHeadError,
+  RefNotFoundError,
+} from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import {
@@ -62,6 +69,7 @@ import { worktreeModeTrust } from "./core-config.js";
 import { textconvRunnerOf } from "./diff-textconv.js";
 import { matchPathspec, type PathspecItem, parsePathspecItem } from "./pathspec.js";
 import { PathspecAttributes } from "./pathspec-attributes.js";
+import { revisionMergeBases } from "./rev-parse-command.js";
 import { readSubmoduleDirt, type SubmoduleDirt } from "./status-command.js";
 import {
   isSubmoduleIgnoreMode,
@@ -118,7 +126,7 @@ export type DiffOutputFormat =
 
 /** Options of the text output that `git diff` takes on its command line */
 export interface DiffTextOptions
-  extends Omit<DiffOutputOptions, "driver" | "algorithm" | "indentHeuristic"> {
+  extends Omit<DiffOutputOptions, "driver" | "algorithm" | "indentHeuristic" | "ignoreRegex"> {
   /** `--diff-algorithm` (default `diff.algorithm`, else myers) */
   algorithm?: XdiffAlgorithm;
   /** `--indent-heuristic` / `--no-indent-heuristic` (default `diff.indentHeuristic`, true) */
@@ -188,6 +196,125 @@ export interface DiffTextOptions
    * prefixes with them (`diff --git b/f a/f`). Combined diffs of conflicted paths are not swapped.
    */
   reverse?: boolean;
+  /**
+   * `--diff-filter=<letters>`: only the pairs of these statuses (`A`dded, `C`opied,
+   * `D`eleted, `M`odified, `R`enamed, `T`ype changed, `U`nmerged, `X` unknown, `B`roken);
+   * a lowercase letter leaves its status out instead, and `*` keeps every pair as long as one
+   * of them matches (all or none). An unknown letter throws git's
+   * `error: unknown change class '<c>' in --diff-filter=<letters>` (exit 129). The combined
+   * diff (`diff --cc`) of a conflicted path is not filtered, as git's is not.
+   */
+  diffFilter?: string;
+  /**
+   * `--relative=<path>`: only the paths that start with `<path>` (a string prefix, as git's
+   * `strncmp`: `sub` takes `subdir/` too), shown without it (and the `/` after it);
+   * `--no-relative` is `false`. The commands run at the top of the worktree, so `true`
+   * (`--relative` without a path, or `diff.relative`) shows every path as it is.
+   */
+  relative?: string | boolean;
+  /**
+   * `--rotate-to=<path>`: the output starts at this path, the ones before it moved to the end;
+   * `git diff` throws `fatal: No such path '<path>' in the diff` when no pair has it, `git
+   * log` starts at the first path after it
+   */
+  rotateTo?: string;
+  /** `--skip-to=<path>`: as {@link rotateTo}, the paths before it left out */
+  skipTo?: string;
+  /**
+   * `-I<regex>` (`--ignore-matching-lines`): changes whose lines all match one of these POSIX
+   * extended regexes are not shown (xdiff's `xdl_mark_ignorable_regex`); an invalid one
+   * throws git's `error: invalid regex given to -I: '<regex>'` (exit 129)
+   */
+  ignoreMatchingLines?: readonly string[];
+  /**
+   * `--quiet` still detects renames and copies (git 2.43; default false: git 2.5x's
+   * diff_setup_done turns `detect_rename` off under `quick`, so `--quiet --diff-filter=R`
+   * finds nothing there)
+   */
+  quietDetectsRenames?: boolean;
+}
+
+/** git's status letters `--diff-filter` takes (`diff_status_letters`) */
+const FILTER_LETTERS = "ACDMRTXU*B";
+
+/** The bits of `--diff-filter=<letters>` (git's `filter`, `filter_not` folded in) */
+function parseDiffFilter(spec: string): Set<string> {
+  const on = new Set<string>();
+  const off = new Set<string>();
+  for (const c of spec) {
+    const upper = c >= "a" && c <= "z" ? c.toUpperCase() : c;
+    if (!FILTER_LETTERS.includes(upper) || upper.length !== 1) {
+      throw new InvalidArgumentError(
+        "diffFilter",
+        spec,
+        `error: unknown change class '${c}' in --diff-filter=${spec}`,
+      ).withExitCode(129);
+    }
+    (upper === c ? on : off).add(upper);
+  }
+  // diff_setup_done: a negation alone starts from every bit but `*`
+  if (off.size > 0 && on.size === 0) {
+    for (const l of FILTER_LETTERS) if (l !== "*") on.add(l);
+  }
+  for (const l of off) on.delete(l);
+  return on;
+}
+
+/** git's status letter of a queued entry */
+function statusOf(entry: DiffEntry): string {
+  if (entry.unmerged) return "U";
+  switch (entry.changeType) {
+    case ChangeType.ADD:
+      return "A";
+    case ChangeType.DELETE:
+      return "D";
+    case ChangeType.RENAME:
+      return "R";
+    case ChangeType.COPY:
+      return "C";
+    default:
+      return entry.oldMode !== undefined &&
+        entry.newMode !== undefined &&
+        (entry.oldMode & S_IFMT) !== (entry.newMode & S_IFMT)
+        ? "T"
+        : "M";
+  }
+}
+
+/** diffcore_apply_filter over the queue */
+function applyDiffFilter(entries: DiffEntry[], filter: Set<string> | undefined): DiffEntry[] {
+  if (!filter) return entries;
+  // match_filter: a modification with a score is a broken pair (-B), which we never make
+  const matches = (e: DiffEntry) => filter.has(statusOf(e));
+  if (filter.has("*")) return entries.some(matches) ? entries : [];
+  return entries.filter(matches);
+}
+
+/**
+ * diffcore_rotate: the queue from the pair whose (new side's) path is `to`, the ones before
+ * it after it (`skip`: dropped); `strict` (`git diff`) needs that exact path, else the first
+ * path after it starts, and a path past every pair changes nothing.
+ */
+function rotateEntries(entries: DiffEntry[], to: string, skip: boolean, strict: boolean) {
+  if (entries.length === 0) return entries;
+  let at = 0;
+  for (; at < entries.length; at++) {
+    const e = entries[at] as DiffEntry;
+    const cmp = compareGitPaths(to, e.newPath ?? e.oldPath ?? "");
+    if (cmp === 0) break;
+    if (!strict && cmp < 0) break;
+  }
+  if (at >= entries.length) {
+    if (strict) throw new GitApiError(`fatal: No such path '${to}' in the diff`);
+    return entries;
+  }
+  return skip ? entries.slice(at) : [...entries.slice(at), ...entries.slice(0, at)];
+}
+
+/** strip_prefix: the path without `prefix` and the `/` after it */
+function stripPrefix(path: string, prefix: string): string {
+  const rest = path.slice(prefix.length);
+  return rest.startsWith("/") ? rest.slice(1) : rest;
 }
 
 /** An entry with its two sides swapped (`diff -R`). */
@@ -400,6 +527,80 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   private intentToAddVisible = false;
   /** The index stands for a tree (see {@link setIndexAsTree}) */
   private indexAsTree = false;
+  /** `--exit-code` */
+  private exitWithStatus = false;
+  /** `--quiet` */
+  private quiet = false;
+  /** `--merge-base` */
+  private mergeBase = false;
+  /** Whether `--rotate-to`/`--skip-to` need their exact path (`git diff`; not `git log`) */
+  private rotateStrict = true;
+  /** git's `has_changes` of the last call */
+  private changesFound = false;
+  /** The revisions given resolved (ranges, `--merge-base`) */
+  private sidesResolved = false;
+
+  /**
+   * `--exit-code`: {@link exitCode} is 1 when the diff found differences, as git's status
+   * (`diff_result_code`). With whitespace options or `-I`, only pairs whose patch shows a
+   * change count (git's `diff_from_contents`).
+   */
+  setExitCode(exitCode: boolean): this {
+    this.checkCallable();
+    this.exitWithStatus = exitCode;
+    return this;
+  }
+
+  /**
+   * `--quiet`: {@link callText} and {@link callBytes} print nothing and {@link exitCode} is
+   * 1 when anything differs (`--exit-code`). As git's `quick` flag, the diff stops at its
+   * first difference: no rename detection (git 2.5x; see
+   * {@link DiffTextOptions.quietDetectsRenames}), no content read past the first pair that
+   * shows a change.
+   */
+  setQuiet(quiet: boolean): this {
+    this.checkCallable();
+    this.quiet = quiet;
+    return this;
+  }
+
+  /**
+   * `--merge-base`: diff from the merge base of the old tree and the new one (`git diff
+   * --merge-base A B`), or of the old tree and HEAD against the index (`--cached`) or the
+   * worktree (`git diff --merge-base A`). Both must be commits with exactly one merge base,
+   * else git's `fatal: no merge base found` / `fatal: multiple merge bases found`; a range
+   * throws `fatal: --merge-base does not work with ranges`.
+   */
+  setMergeBase(mergeBase: boolean): this {
+    this.checkCallable();
+    this.mergeBase = mergeBase;
+    return this;
+  }
+
+  /**
+   * `--rotate-to`/`--skip-to` take the first path after a missing one, as `git log` does,
+   * instead of failing as `git diff` does.
+   *
+   * @internal
+   */
+  setRotateStrict(strict: boolean): this {
+    this.checkCallable();
+    this.rotateStrict = strict;
+    return this;
+  }
+
+  /**
+   * The exit status `git diff` ends with (`diff_result_code`): 1 when `--exit-code` or
+   * `--quiet` is set and the last call found differences, else 0.
+   */
+  get exitCode(): number {
+    return (this.exitWithStatus || this.quiet) && this.changesFound ? 1 : 0;
+  }
+
+  /** Whether the last call found differences (git's `has_changes`) */
+  get hasChanges(): boolean {
+    return this.changesFound;
+  }
 
   /**
    * Show intent-to-add entries in a `--cached` comparison as the empty files they name, as
@@ -417,9 +618,11 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
    * Set the old (base) tree/commit for comparison.
    *
    * Can be a commit ID, branch name, tag name, or tree ID.
-   * If not set, defaults to HEAD (or the index, for the worktree diff).
+   * If not set, defaults to HEAD (or the index, for the worktree diff). Without a new tree, a
+   * range compares two commits as `git diff` does: `A..B` is `A B`, `A...B` diffs B from the
+   * merge base of A and B (an empty side is HEAD).
    *
-   * @param refOrId Commit-ish or tree ID
+   * @param refOrId Commit-ish or tree ID, or a range
    */
   setOldTree(refOrId: string): this {
     this.checkCallable();
@@ -619,7 +822,15 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.checkCallable();
     this.setCallable(false);
     this.dirtyThisCall = this.dirtySubmodules ?? true;
-    return (await this.collect(this.renames ?? false)).entries;
+    const { entries } = await this.collect(this.renames ?? false);
+    // diffcore_apply_filter (the entries stay in path order, unswapped)
+    const filter = this.textOptions.diffFilter;
+    const out = applyDiffFilter(
+      entries,
+      filter !== undefined ? parseDiffFilter(filter) : undefined,
+    );
+    this.changesFound = out.length > 0;
+    return out;
   }
 
   /**
@@ -641,9 +852,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     this.setCallable(false);
     const config = this.config;
     const renames = this.renames ?? renamesValue(config.value("diff.renames")) ?? true;
-    this.dirtyThisCall = this.dirtySubmodules ?? format === "patch";
+    this.dirtyThisCall = this.dirtySubmodules ?? (format === "patch" && !this.quiet);
     this.readUiConfig();
     return this.inOneOperation(async () => {
+      if (this.quiet) {
+        await this.quietCheck(renames);
+        return new Uint8Array(0);
+      }
       const collected = await this.collect(
         renames,
         format === "patch",
@@ -653,6 +868,38 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       await this.writeFormats(sink, [format], collected);
       return sink.bytes();
     });
+  }
+
+  /**
+   * `--quiet` (git's `quick` flag, `DIFF_FORMAT_NO_OUTPUT`): whether anything differs, stopping
+   * early. Without `--diff-filter` and content options the first queued pair answers
+   * (diff_can_quit_early): no renames are detected and no content is read; with content
+   * options (`-w`, `-I`, ...) pairs are diffed until one shows a change (diff_flush's
+   * `diff_flush_patch_quietly` loop).
+   */
+  private async quietCheck(renames: boolean | "copies"): Promise<void> {
+    const fromContents = this.fromContents;
+    const early = this.textOptions.diffFilter === undefined && !fromContents;
+    const detect = !early && (this.textOptions.quietDetectsRenames ?? false);
+    const collected = await this.collect(detect ? renames : false, false, false);
+    const entries = await this.selected(collected.entries);
+    this.changesFound = entries.length > 0;
+    if (!fromContents || entries.length === 0) return;
+    this.changesFound = false;
+    const options = this.outputOptions();
+    Object.assign(options, this.prefixes());
+    for (const entry of entries) {
+      if (entry.unmerged) {
+        this.changesFound = true;
+        break;
+      }
+      const scratch = new ByteSink();
+      await writePairPatch(scratch, diffEntryToPair(entry, this.blobs), options);
+      if (scratch.length > 0) {
+        this.changesFound = true;
+        break;
+      }
+    }
   }
 
   /**
@@ -746,7 +993,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       };
       if (collected.entries.length === 0 && collected.combined.length === 0) return followed;
       const sink = new ByteSink();
-      await this.writeFormats(sink, formats, collected);
+      const queued = await this.writeFormats(sink, formats, collected);
+      // diffcore_std left nothing (`--diff-filter`, `--skip-to`): no diff, as an empty one
+      if (queued === 0 && collected.combined.length === 0) return followed;
       return { bytes: sink.bytes(), ...followed };
     });
   }
@@ -800,11 +1049,13 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     sink: ByteSink,
     formats: DiffOutputFormat[],
     collected: { entries: DiffEntry[]; combined: CombinedEntry[] },
-  ): Promise<void> {
+  ): Promise<number> {
     const config = this.config;
     const { combined } = collected;
-    const ordered = await this.ordered(collected.entries);
-    const entries = this.textOptions.reverse ? ordered.map(reverseEntry) : ordered;
+    const entries = await this.selected(collected.entries);
+    // diffcore_std's has_changes; with diff_from_contents, what the outputs show (below)
+    const fromContents = this.fromContents;
+    this.changesFound = !fromContents && entries.length > 0;
     const options = this.outputOptions();
     Object.assign(options, this.prefixes());
     if (this.textOptions.reverse) {
@@ -816,6 +1067,9 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     }
     const pairs: DiffFilePair[] = [];
     const unmerged = new Set<DiffFilePair>();
+    /** The pairs with their full paths, for what git does not shorten (`--summary`) */
+    const fullPairs = new Map<DiffFilePair, DiffFilePair>();
+    const prefix = this.relativePrefix;
     for (const entry of entries) {
       // an unmerged path: only its name is printed
       const pair: DiffFilePair = entry.unmerged
@@ -829,9 +1083,36 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
             ),
           }
         : this.withTextconvInputs(diffEntryToPair(entry, this.blobs), entry);
-      if (entry.unmerged) unmerged.add(pair);
-      pairs.push(pair);
+      // strip_prefix: names without the `--relative` prefix, attributes by the full path
+      const shown: DiffFilePair =
+        prefix === undefined
+          ? pair
+          : {
+              ...pair,
+              ...(pair.old
+                ? {
+                    old: {
+                      ...pair.old,
+                      path: stripPrefix(pair.old.path, prefix),
+                      attrPath: pair.old.path,
+                    },
+                  }
+                : {}),
+              ...(pair.new
+                ? {
+                    new: {
+                      ...pair.new,
+                      path: stripPrefix(pair.new.path, prefix),
+                      attrPath: pair.new.path,
+                    },
+                  }
+                : {}),
+            };
+      fullPairs.set(shown, pair);
+      if (entry.unmerged) unmerged.add(shown);
+      pairs.push(shown);
     }
+    const full = (pair: DiffFilePair) => fullPairs.get(pair) ?? pair;
     const quote = options.quotePath;
     const order: DiffOutputFormat[] = [
       "name-only",
@@ -858,17 +1139,15 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       for (const c of combined) await this.writeCombined(sink, c, options, combinedLengths);
     }
     // diff_flush of an empty queue prints nothing
-    if (pairs.length === 0) return;
+    if (pairs.length === 0) return 0;
     let separator = false;
     for (const format of order) {
       if (!formats.includes(format)) continue;
       if (format === "patch" && separator) sink.text("\n");
       // diff_flush: an empty summary (is_summary_empty) prints nothing and asks no separator
       if (format === "summary") {
-        const text = formatSummary(
-          pairs.filter((p) => !unmerged.has(p)),
-          quote,
-        );
+        // diff_summary names the paths in full, whatever `--relative` says
+        const text = formatSummary(pairs.filter((p) => !unmerged.has(p)).map(full), quote);
         if (text) {
           sink.text(text);
           separator = true;
@@ -896,29 +1175,37 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
             options.abbrevLengths = await this.idAbbreviator().lengths(ids, options.abbrev);
           }
           for (const pair of pairs) {
+            const before = sink.length;
             if (unmerged.has(pair)) {
               sink.text(`* Unmerged path ${pair.new?.path ?? pair.old?.path}\n`);
             } else await writePairPatch(sink, pair, options);
+            // builtin_diff's found_changes: the pair showed something
+            if (sink.length > before) this.changesFound = true;
           }
           break;
         }
-        case "name-only":
-          sink.text(
-            formatNameOnly(await this.shownNames(pairs, unmerged, options), { quotePath: quote }),
-          );
+        case "name-only": {
+          const names = await this.shownNames(pairs, unmerged, options);
+          if (names.length > 0 && this.namesFromContents) this.changesFound = true;
+          sink.text(formatNameOnly(names, { quotePath: quote }));
           break;
-        case "name-status":
-          for (const pair of await this.shownNames(pairs, unmerged, options)) {
+        }
+        case "name-status": {
+          const names = await this.shownNames(pairs, unmerged, options);
+          if (names.length > 0 && this.namesFromContents) this.changesFound = true;
+          for (const pair of names) {
             if (unmerged.has(pair)) {
               sink.text(`U\t${quotePath(pair.new?.path ?? pair.old?.path ?? "", quote)}\n`);
             } else sink.text(formatNameStatus([pair], { quotePath: quote }));
           }
           break;
+        }
         default: {
           const files = [];
           for (const pair of pairs) {
             if (unmerged.has(pair)) {
-              const name = pair.new?.path ?? pair.old?.path ?? "";
+              // builtin_diffstat of an unmerged pair: its full path
+              const name = full(pair).new?.path ?? full(pair).old?.path ?? "";
               files.push({
                 name,
                 isRenamed: false,
@@ -929,6 +1216,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
               });
             } else files.push(...(await computeDiffstat([pair], options)));
           }
+          // compute_diffstat: found_changes when the diffstat lists a file
+          if (files.length > 0) this.changesFound = true;
           const statOptions: DiffstatOptions = {
             nameWidth: intValue(config.value("diff.statNameWidth")),
             graphWidth: intValue(config.value("diff.statGraphWidth")),
@@ -941,6 +1230,7 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
         }
       }
     }
+    return pairs.length;
   }
 
   /**
@@ -954,7 +1244,8 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     options: DiffOutputOptions,
     format: SubmoduleDiffFormat,
   ): Promise<void> {
-    const path = pair.old?.path ?? pair.new?.path ?? "";
+    // `one->path`: the full path, whatever `--relative` shows
+    const path = pair.old?.attrPath ?? pair.old?.path ?? pair.new?.attrPath ?? pair.new?.path ?? "";
     const one = pair.old?.id ?? this.objectFormat.nullId;
     const two = pair.new?.id ?? this.objectFormat.nullId;
     const dirt = pair.new?.submoduleDirt;
@@ -1092,18 +1383,18 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     );
   }
 
-  /** The pairs `--name-only` lists: with whitespace options, those whose patch shows a change */
+  /** git 2.5x's names from contents (see {@link DiffTextOptions.namesFromContents}) */
+  private get namesFromContents(): boolean {
+    return this.textOptions.namesFromContents ?? true;
+  }
+
+  /** The pairs `--name-only` lists: with whitespace options or `-I`, those whose patch shows a change */
   private async shownNames(
     pairs: DiffFilePair[],
     unmerged: Set<DiffFilePair>,
     options: DiffOutputOptions,
   ): Promise<DiffFilePair[]> {
-    const fromContents =
-      (this.textOptions.namesFromContents ?? true) &&
-      (options.ignoreWhitespace ||
-        options.ignoreWhitespaceChange ||
-        options.ignoreWhitespaceAtEol ||
-        options.ignoreCrAtEol);
+    const fromContents = this.namesFromContents && this.fromContents;
     if (!fromContents) return pairs;
     const shown: DiffFilePair[] = [];
     for (const pair of pairs) {
@@ -1279,8 +1570,15 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       orderFile: _orderFile,
       textconv: _textconv,
       abbrev: _abbrev,
+      diffFilter: _diffFilter,
+      relative: _relative,
+      rotateTo: _rotateTo,
+      skipTo: _skipTo,
+      ignoreMatchingLines: _ignoreMatchingLines,
+      quietDetectsRenames: _quietDetectsRenames,
       ...text
     } = this.textOptions;
+    const ignoreRegex = this.ignoreRegex();
     const abbrev = abbrevOption(this.textOptions.abbrev);
     return {
       context: intValue(get("diff.context")) ?? 3,
@@ -1294,7 +1592,53 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
       algorithm: text.algorithm ?? algorithmValue(get("diff.algorithm")) ?? "myers",
       indentHeuristic: text.indentHeuristic ?? boolValue(get("diff.indentHeuristic")) ?? true,
       ...(driver ? { driver } : {}),
+      ...(ignoreRegex.length > 0 ? { ignoreRegex } : {}),
     };
+  }
+
+  /** `-I<regex>` compiled as git's `regcomp(REG_EXTENDED | REG_NEWLINE)` */
+  private ignoreRegex(): PosixRegex[] {
+    return (this.textOptions.ignoreMatchingLines ?? []).map((pattern) => {
+      try {
+        return compilePosixRegex(pattern, { extended: true });
+      } catch {
+        throw new InvalidArgumentError(
+          "ignoreMatchingLines",
+          pattern,
+          `error: invalid regex given to -I: '${pattern}'`,
+        ).withExitCode(129);
+      }
+    });
+  }
+
+  /**
+   * git's `diff_from_contents`: whitespace options and `-I` make a pair count as a change
+   * only when its patch shows one
+   */
+  private get fromContents(): boolean {
+    const o = this.textOptions;
+    return !!(
+      o.ignoreWhitespace ||
+      o.ignoreWhitespaceChange ||
+      o.ignoreWhitespaceAtEol ||
+      o.ignoreCrAtEol ||
+      (o.ignoreMatchingLines?.length ?? 0) > 0
+    );
+  }
+
+  /**
+   * The queue diffcore_std leaves of the collected entries: in `-O` order, swapped by `-R`,
+   * rotated (`--rotate-to`, `--skip-to`), filtered (`--diff-filter`)
+   */
+  private async selected(entries: DiffEntry[]): Promise<DiffEntry[]> {
+    const ordered = await this.ordered(entries);
+    let out = this.textOptions.reverse ? ordered.map(reverseEntry) : ordered;
+    const { rotateTo, skipTo } = this.textOptions;
+    // diff_opt_rotate_to: the last of the two given wins
+    if (skipTo !== undefined) out = rotateEntries(out, skipTo, true, this.rotateStrict);
+    else if (rotateTo !== undefined) out = rotateEntries(out, rotateTo, false, this.rotateStrict);
+    const filter = this.textOptions.diffFilter;
+    return applyDiffFilter(out, filter !== undefined ? parseDiffFilter(filter) : undefined);
   }
 
   /**
@@ -1308,6 +1652,10 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     patch = false,
     prefetch = false,
   ): Promise<{ entries: DiffEntry[]; combined: CombinedEntry[] }> {
+    // option parsing fails before anything is read
+    if (this.textOptions.diffFilter !== undefined) parseDiffFilter(this.textOptions.diffFilter);
+    this.ignoreRegex();
+    await this.resolveRevisions();
     // repo_read_index: in a sparse checkout, a skip-worktree entry whose file is present is
     // read as in the checkout (in memory: diff writes no index)
     await this.clearPresentSkipWorktree();
@@ -1408,6 +1756,112 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
   }
 
   /**
+   * builtin/diff.c's revision handling: `A..B` is `A B`, `A...B` the merge base of A and B
+   * against B (symdiff_prepare: the first base, with git's warning when there are several),
+   * `--merge-base` the merge base of the two sides (diff_get_merge_base); an empty side of a
+   * range is HEAD.
+   */
+  private async resolveRevisions(): Promise<void> {
+    if (this.sidesResolved) return;
+    this.sidesResolved = true;
+    const old = this.oldTree;
+    const range =
+      old !== undefined && this.newTree === undefined && !old.includes(":")
+        ? /^(.*?)(\.\.\.?)(.*)$/s.exec(old)
+        : null;
+    if (range) {
+      if (this.mergeBase) throw new GitApiError("fatal: --merge-base does not work with ranges");
+      const left = range[1] || "HEAD";
+      const right = range[3] || "HEAD";
+      if (range[2] === "..") {
+        this.oldTree = left;
+        this.newTree = right;
+        return;
+      }
+      const errors: string[] = [];
+      const a = await this.commitOf(left, errors, old);
+      const b = await this.commitOf(right, errors, old);
+      if (a === undefined || b === undefined) {
+        throw new GitApiError(
+          [...errors, `fatal: Invalid symmetric difference expression ${old}`].join("\n"),
+        );
+      }
+      const bases = await revisionMergeBases(this.commits, a, b);
+      const base = bases[0];
+      if (base === undefined) throw new GitApiError(`fatal: ${left}...${right}: no merge base`);
+      if (bases.length > 1) {
+        this.configWarnings.push(
+          `warning: ${left}...${right}: multiple merge bases, using ${base}`,
+        );
+      }
+      this.oldTree = base;
+      this.newTree = b;
+      return;
+    }
+    if (!this.mergeBase) return;
+    // `git diff --cached --merge-base`: HEAD, the default of --cached
+    if (old === undefined && this.cached) this.oldTree = "HEAD";
+    if (this.oldTree === undefined) {
+      throw new InvalidArgumentError(
+        "mergeBase",
+        true,
+        "error: invalid option: --merge-base",
+      ).withExitCode(129);
+    }
+    const errors: string[] = [];
+    const a = await this.commitOf(this.oldTree, errors);
+    let b: ObjectId | undefined;
+    if (this.newTree !== undefined) b = await this.commitOf(this.newTree, errors);
+    else {
+      let head: ObjectId;
+      try {
+        head = await this.resolveRevision("HEAD");
+      } catch {
+        throw new GitApiError("fatal: unable to get HEAD");
+      }
+      b = await this.commitOf(head, errors);
+    }
+    const bases =
+      a !== undefined && b !== undefined ? await revisionMergeBases(this.commits, a, b) : [];
+    if (bases.length === 0) {
+      throw new GitApiError([...errors, "fatal: no merge base found"].join("\n"));
+    }
+    if (bases.length > 1) throw new GitApiError("fatal: multiple merge bases found");
+    this.oldTree = bases[0];
+  }
+
+  /**
+   * lookup_commit_reference of a revision: the commit it names (tags peeled); for another
+   * object git's `error: object <id> is a <type>, not a commit` goes to `errors`. A name that
+   * resolves to nothing throws git's `ambiguous argument` (of the whole `argument`).
+   */
+  private async commitOf(
+    name: string,
+    errors: string[],
+    argument = name,
+  ): Promise<ObjectId | undefined> {
+    let id: ObjectId;
+    try {
+      id = await this.resolveRevision(name);
+    } catch (e) {
+      if (e instanceof RefNotFoundError || e instanceof NoHeadError) {
+        // setup_revisions: an argument that names no revision (nor a path)
+        throw new RefNotFoundError(
+          argument,
+          `fatal: ambiguous argument '${argument}': unknown revision or path not in the working tree.`,
+        );
+      }
+      throw e;
+    }
+    const peeled = await this.revisionResolver().peelTags(id);
+    if (peeled.type === "commit") return peeled.id;
+    if (peeled.type !== undefined) {
+      errors.push(`error: object ${peeled.id} is a ${peeled.type}, not a commit`);
+    }
+    return undefined;
+  }
+
+  /**
    * What the submodule at a path ignores (git's `set_diffopt_flags_from_submodule_config`
    * over `diff.ignoreSubmodules`): its `submodule.<name>.ignore` (the configuration, else
    * `.gitmodules`), else `diff.ignoreSubmodules`; undefined when neither is set.
@@ -1489,8 +1943,17 @@ export class DiffCommand extends GitCommand<DiffEntry[]> {
     ];
   }
 
+  /** The `--relative=<path>` prefix paths are limited to and shown without */
+  private get relativePrefix(): string | undefined {
+    const relative = this.textOptions.relative;
+    return typeof relative === "string" && relative !== "" ? relative : undefined;
+  }
+
   private matches(path: string): boolean {
     if (this.pathFilter && !path.startsWith(this.pathFilter)) return false;
+    // diff_queue_addremove / diff_change / diff_unmerge: outside the prefix, nothing is queued
+    const prefix = this.relativePrefix;
+    if (prefix !== undefined && !path.startsWith(prefix)) return false;
     return !this.pathspecItems || matchPathspec(this.pathspecItems, path, 0) > 0;
   }
 
