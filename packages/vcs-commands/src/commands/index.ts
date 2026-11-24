@@ -22,6 +22,7 @@ export * from "./describe-command.js";
 export * from "./diff-command.js";
 export * from "./diff-textconv.js";
 export * from "./fetch-command.js";
+export * from "./fmt-merge-msg-command.js";
 export * from "./format-patch-command.js";
 export * from "./fsck/index.js";
 export * from "./gc-command.js";
