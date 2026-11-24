@@ -23,14 +23,14 @@ import {
   readRepositoryFormat,
 } from "@statewalker/vcs-store-files";
 import { parseGitBool } from "@statewalker/vcs-utils";
-import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
+import type { FilesApi, PosixFilesApi } from "@statewalker/vcs-utils/files";
 import { collectChunks, type WorkingCopy } from "@statewalker/vcs-working-tree";
 
 import { GitApiError, InvalidConfigError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { checkSubmoduleName } from "./fsck/fsck-object-checks.js";
-import { commonGitFileOf } from "./git-hooks.js";
+import { commonGitFileOf, gitFileOf } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { DO_MATCH_DIRECTORY, matchPathspec, parsePathspec } from "./pathspec.js";
 import { isSubmoduleIgnoreMode, type SubmoduleIgnoreMode } from "./submodule-config.js";
@@ -427,7 +427,8 @@ export class SubmoduleModel {
 
   /**
    * git's `submodule_name_to_gitdir`: where the repository of the submodule `name` lives,
-   * as a path of the working copy's FilesApi: `<common git dir>/modules/<name>`, or under
+   * as a path of the working copy's FilesApi: `<git dir>/modules/<name>` (`modules/` is kept per
+   * worktree: a linked worktree's are in `worktrees/<id>/modules/`), or under
    * `extensions.submodulePathConfig` the `submodule.<name>.gitdir` setting (relative to the
    * worktree top). The place is checked as git checks it (`validate_submodule_git_dir`):
    * a legacy git directory inside another submodule's (`modules/hippo/hooks` while
@@ -438,7 +439,7 @@ export class SubmoduleModel {
    * extension, or a git directory the check refuses
    */
   async gitDirOf(name: string): Promise<string | undefined> {
-    const common = await commonGitFileOf(this.workingCopy, "modules");
+    const common = await gitFileOf(this.workingCopy, "modules");
     if (!common) return undefined;
     const encoded = await submodulePathConfigOf(this.workingCopy);
     let gitDir: string;
@@ -605,6 +606,121 @@ export async function submodulePathConfigOf(workingCopy: WorkingCopy): Promise<b
   const gitDir = config.path.slice(0, Math.max(0, config.path.lastIndexOf("/")));
   const format = await readRepositoryFormat(config.files, gitDir).catch(() => undefined);
   return format?.submodulePathConfig ?? false;
+}
+
+/**
+ * A FilesApi path with every symbolic link on it followed, as `realpath(3)` resolves a host
+ * path (the last component too, a dangling link to where it points), through the FilesApi's
+ * `lstat`/`readlink`: the physical path the FilesApi can then act on, since it never acts
+ * through a link itself. Undefined where a link leads beyond the FilesApi's root (`..` above
+ * it, an absolute target outside its `rootDirectory`) or more than 40 links are met (ELOOP).
+ * Without `lstat`/`readlink` the path is returned as it is.
+ */
+export async function physicalFilesPath(
+  files: FilesApi,
+  path: string,
+): Promise<string | undefined> {
+  const resolved = await resolveFilesLinks(files, path);
+  return typeof resolved === "string" ? resolved : undefined;
+}
+
+/**
+ * {@link physicalFilesPath}, telling why a path does not resolve: `"loop"` past 40 links
+ * (the ELOOP `stat(2)` and `open(2)` fail with), `"outside"` where a link leads beyond the
+ * FilesApi's root.
+ */
+export async function resolveFilesLinks(
+  files: FilesApi,
+  path: string,
+): Promise<string | "loop" | "outside"> {
+  const posix = files as PosixFilesApi;
+  if (!posix.lstat || !posix.readlink) return joinFilesPath("", path);
+  const root = (files as { rootDirectory?: string }).rootDirectory?.replace(/\/+$/, "");
+  const done: string[] = [];
+  const pending = path.split("/");
+  let links = 0;
+  while (pending.length > 0) {
+    const part = pending.shift() as string;
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (done.length === 0) return "outside";
+      done.pop();
+      continue;
+    }
+    const candidate = [...done, part].join("/");
+    const st = await posix.lstat(candidate).catch(() => undefined);
+    if (st?.kind !== "symlink") {
+      done.push(part);
+      continue;
+    }
+    if (++links > 40) return "loop";
+    const bytes = await posix.readlink(candidate).catch(() => undefined);
+    if (!bytes) return "outside";
+    const target = new TextDecoder().decode(bytes);
+    if (target.startsWith("/")) {
+      if (root === undefined) return "outside";
+      if (root !== "" && target !== root && !target.startsWith(`${root}/`)) return "outside";
+      done.length = 0;
+      pending.unshift(...target.slice(root.length).split("/"));
+    } else pending.unshift(...target.split("/"));
+  }
+  return done.join("/");
+}
+
+/** The kind of the entry itself at `path` (a link as `symlink`), where the FilesApi tells it. */
+export async function lstatKind(files: FilesApi, path: string): Promise<string | undefined> {
+  const posix = files as PosixFilesApi;
+  if (posix.lstat) return (await posix.lstat(path).catch(() => undefined))?.kind;
+  return (await files.stats(path).catch(() => undefined))?.kind;
+}
+
+/**
+ * git's `safe_create_leading_directories` for the FilesApi path `path`: each leading
+ * component (never `path` itself) that `stat(2)` finds a directory, links followed, is kept;
+ * a missing one is created, only below the last real directory; anything else refuses, with
+ * nothing created at or past it: a file in the way, a link whose target is missing (git's
+ * `mkdir` fails there with EEXIST: the target of a dangling link is never created), a link
+ * leading beyond the FilesApi or looping. True when every leading directory is there.
+ */
+export async function safeCreateLeadingDirectories(
+  files: FilesApi,
+  path: string,
+): Promise<boolean> {
+  const parts = joinFilesPath("", path).split("/");
+  parts.pop();
+  let parent = "";
+  for (let i = 0; i < parts.length; i++) {
+    const prefix = parts.slice(0, i + 1).join("/");
+    const physical = await physicalFilesPath(files, prefix);
+    if (physical === undefined) return false;
+    const st = await files.stats(physical).catch(() => undefined);
+    if (st?.kind === "directory") {
+      parent = physical;
+      continue;
+    }
+    if (st) return false;
+    // nothing at the place: the entry itself is a dangling link, or nothing at all
+    const entry = parent ? `${parent}/${parts[i]}` : (parts[i] as string);
+    if ((await lstatKind(files, entry)) !== undefined) return false;
+    if (
+      !(await files.mkdir(entry).then(
+        () => true,
+        () => false,
+      ))
+    ) {
+      return false;
+    }
+    parent = entry;
+  }
+  return true;
+}
+
+/** Whether the directory holding the physical FilesApi path `path` is there (a real one). */
+export async function parentIsDirectory(files: FilesApi, path: string): Promise<boolean> {
+  const at = joinFilesPath("", path);
+  const slash = at.lastIndexOf("/");
+  if (slash < 0) return true;
+  return (await files.stats(at.slice(0, slash)).catch(() => undefined))?.kind === "directory";
 }
 
 /** `path` joined to `base` with `.` and `..` resolved (FilesApi paths). */

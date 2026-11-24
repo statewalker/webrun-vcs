@@ -1,4 +1,5 @@
 import { FileMode, type ObjectId, type TreeEntry } from "@statewalker/vcs-core";
+import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
 import {
   compareWithWorktree,
   type IndexEntry,
@@ -31,6 +32,7 @@ import {
   sparseIndexAsRead,
 } from "./sparse-index-view.js";
 import { StatusCommand } from "./status-command.js";
+import { SubmoduleAbsorbGitDirsCommand, SubmoduleCommandError } from "./submodule-commands.js";
 import { parseGitmodules } from "./submodule-config.js";
 import {
   pruneEmptyParents,
@@ -57,6 +59,12 @@ export interface RmResult {
    * {@link RmFailedError}'s message starts with them
    */
   advice?: string[];
+  /**
+   * What git prints on its standard error while it works: the `Migrating git directory of
+   * ...` lines of submodules whose `.git` directory was absorbed into the superproject's
+   * first (`git rm` of such a submodule, a dry run too)
+   */
+  messages?: string[];
   /**
    * What could not be done once the removal was under way, the index written all the same:
    * a file that could not be deleted after another one was (git passes over it silently),
@@ -224,8 +232,8 @@ export class RmCommand extends GitCommand<RmResult> {
    * the removed entries are deleted too and the directories they leave empty pruned (git's
    * `remove_path`); a submodule's directory goes with everything in it where its repository
    * lives in the superproject (a gitfile), its `.gitmodules` section is removed and the
-   * file staged again. A submodule holding its own `.git` directory keeps its directory (git
-   * absorbs the repository first, which is not reproduced).
+   * file staged again. A submodule holding its own `.git` directory has it absorbed into the
+   * superproject's git directory first (`git submodule absorbgitdirs`), as git does.
    *
    * @param cached true to only remove from index
    */
@@ -428,6 +436,15 @@ export class RmCommand extends GitCommand<RmResult> {
     // nothing matched at all (every element passed over by --ignore-unmatch)
     if (!matched) return { removedPaths: [], output: [] };
 
+    // submodules_absorb_gitdir_if_needed: a submodule's `.git` directory moved into the
+    // superproject's first (a dry run too), so its worktree can go
+    const messages: string[] = [];
+    if (!this.cached && worktree) {
+      await this.absorbSubmoduleGitDirs(removedEntries, worktree, messages);
+    }
+    const withMessages = (result: RmResult): RmResult =>
+      messages.length > 0 ? { ...result, messages } : result;
+
     // remove_path_from_gitmodules dies on an unmerged .gitmodules (checked before anything
     // changes here, where git has removed the files already)
     const editsGitmodules = removesSubmodule && !this.cached && worktree !== undefined;
@@ -435,23 +452,27 @@ export class RmCommand extends GitCommand<RmResult> {
       // cmd_rm's show_only: check_local_mod, then nothing is changed
       if (!this.force) {
         const refusal = await this.checkLocalMod(removedEntries, worktree);
-        if (refusal) throw new RmFailedError(refusal, [], { removedPaths: [], output: [] });
+        if (refusal) {
+          throw new RmFailedError(refusal, [], withMessages({ removedPaths: [], output: [] }));
+        }
       }
-      if (sparsePaths.length > 0) throw advise();
-      return { removedPaths, output };
+      if (sparsePaths.length > 0) throw advise(withMessages({ removedPaths, output }));
+      return withMessages({ removedPaths, output });
     }
     if (editsGitmodules && (await this.gitmodulesUnmerged())) {
       throw new RmFailedError(
         "fatal: Cannot change unmerged .gitmodules, resolve merge conflicts first",
         [],
-        { removedPaths: [], output: [] },
+        withMessages({ removedPaths: [], output: [] }),
       );
     }
 
     // check_local_mod: unless forced, nothing is removed that the index alone holds
     if (!this.force) {
       const refusal = await this.checkLocalMod(removedEntries, worktree);
-      if (refusal) throw new RmFailedError(refusal, [], { removedPaths: [], output: [] });
+      if (refusal) {
+        throw new RmFailedError(refusal, [], withMessages({ removedPaths: [], output: [] }));
+      }
     }
 
     // the files first (git commits the index only once they are gone): the first that cannot
@@ -475,10 +496,11 @@ export class RmCommand extends GitCommand<RmResult> {
           removed = true;
           if (entry.mode === FileMode.GITLINK) removedSubmodules.push(entry.path);
         } else if (!removed) {
-          throw new RmFailedError(`fatal: git rm: '${entry.path}': ${failure}`, [], {
-            removedPaths: [],
-            output,
-          });
+          throw new RmFailedError(
+            `fatal: git rm: '${entry.path}': ${failure}`,
+            [],
+            withMessages({ removedPaths: [], output }),
+          );
         } else {
           warnings.push(`warning: git rm: '${entry.path}': ${failure}`);
         }
@@ -507,9 +529,52 @@ export class RmCommand extends GitCommand<RmResult> {
     await adder.finish();
     await this.staging.write();
 
-    const result: RmResult = { removedPaths, output, ...(warnings.length > 0 ? { warnings } : {}) };
+    const result: RmResult = withMessages({
+      removedPaths,
+      output,
+      ...(warnings.length > 0 ? { warnings } : {}),
+    });
     if (sparsePaths.length > 0) throw advise(result);
     return result;
+  }
+
+  /**
+   * builtin/rm.c's `submodules_absorb_gitdir_if_needed`: each submodule removed whose
+   * directory is there, not empty, and whose repository (or a nested one's) is a `.git`
+   * directory in it gets that absorbed into the superproject's git directory
+   * (`absorb_git_dir_into_superproject`); its `Migrating ...` lines go to `messages`. Where
+   * git dies there, an {@link RmFailedError} (exit 128, git's last line as its message) is
+   * thrown before anything is removed, its result's `messages` holding every line printed
+   * before, an earlier submodule's too.
+   */
+  private async absorbSubmoduleGitDirs(
+    entries: IndexEntry[],
+    worktree: Worktree,
+    messages: string[],
+  ): Promise<void> {
+    const done = new Set<string>();
+    for (const entry of entries) {
+      if (entry.mode !== FileMode.GITLINK || done.has(entry.path)) continue;
+      done.add(entry.path);
+      if (!(await worktree.getEntry(entry.path))) continue;
+      if (await isEmptyDirectory(worktree, entry.path)) continue;
+      if (await usesGitfile(worktree, entry.path)) continue;
+      const absorb = new SubmoduleAbsorbGitDirsCommand(this.workingCopy).setCompatibility(
+        this.compatibility,
+      );
+      try {
+        const result = await absorb.callForPath(entry.path);
+        messages.push(...linesOf(result.stderr));
+      } catch (error) {
+        if (!(error instanceof SubmoduleCommandError)) throw error;
+        messages.push(...linesOf(error.result.stderr));
+        throw new RmFailedError(error.message, [], {
+          removedPaths: [],
+          output: [],
+          messages: [...messages],
+        } satisfies RmResult).withExitCode(128);
+      }
+    }
   }
 
   /**
@@ -738,15 +803,22 @@ function treeLookup(trees: {
  * the leading directories; a file reached that way is left alone (nothing is ever removed
  * through a link). A submodule's directory goes with everything in it (git's
  * `remove_dir_recursively`) where its repository lives elsewhere (a gitfile, nested
- * submodules alike); one holding its own `.git` directory stays (git absorbs it into the
- * superproject first, which is not reproduced).
+ * submodules alike); one still holding its own `.git` directory (one git could not absorb
+ * first) stays.
  */
 async function removeWorktreePath(worktree: Worktree, entry: IndexEntry): Promise<boolean> {
   const current = await worktree.getEntry(entry.path);
   if (current?.isDirectory) {
     if (entry.mode !== FileMode.GITLINK) return false;
     if (!(await removeDirectoryIfEmpty(worktree, entry.path))) {
-      if (!(await usesGitfile(worktree, entry.path))) return true;
+      // a `.git` link goes as a link (its target untouched), as git's remove_dir_recursively
+      // unlinks it once the absorb is done
+      if (
+        !(await usesGitfile(worktree, entry.path)) &&
+        !(await dotGitIsLink(worktree, entry.path))
+      ) {
+        return true;
+      }
       await worktree.remove(entry.path, { recursive: true });
     }
   } else if (current) {
@@ -758,6 +830,15 @@ async function removeWorktreePath(worktree: Worktree, entry: IndexEntry): Promis
   }
   await pruneEmptyParents(worktree, entry.path);
   return true;
+}
+
+/** Whether `<path>/.git` is a symbolic link (removing it never reaches what it names). */
+async function dotGitIsLink(worktree: Worktree, path: string): Promise<boolean> {
+  const files = worktree.getFiles?.() as PosixFilesApi | undefined;
+  if (!files?.lstat) return false;
+  const root = worktree.getRoot?.() ?? "";
+  const at = `${root ? `${root}/` : ""}${path}/.git`;
+  return (await files.lstat(at).catch(() => undefined))?.kind === "symlink";
 }
 
 /** Whether the directory at `path` holds nothing (git's `is_empty_dir`: false when absent). */
@@ -896,4 +977,9 @@ function sectionNameMatch(line: string, name: string): boolean {
     if (line[i] !== name[j++]) break;
   }
   return line[i] === "]" && j === name.length;
+}
+
+/** A command's stderr as its lines. */
+function linesOf(text: string): string[] {
+  return text === "" ? [] : text.replace(/\n$/, "").split("\n");
 }

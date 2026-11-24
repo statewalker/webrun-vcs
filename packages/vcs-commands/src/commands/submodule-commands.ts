@@ -7,8 +7,10 @@
  * whose `result` holds what was printed before.
  */
 import { FileMode, type ObjectId } from "@statewalker/vcs-core";
+import { isGitDirectory } from "@statewalker/vcs-store-files";
 import type { GitTransportRegistry } from "@statewalker/vcs-transport";
-import type { FilesApi } from "@statewalker/vcs-utils/files";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { type FilesApi, type PosixFilesApi, readFile } from "@statewalker/vcs-utils/files";
 import { computeObjectId } from "@statewalker/vcs-utils/pack";
 import type { GitHostEnvironment, WorkingCopy } from "@statewalker/vcs-working-tree";
 
@@ -16,7 +18,7 @@ import { GitApiError, RmFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { CloneCommand } from "./clone-command.js";
-import { commonGitFileOf, hookRunnerOf } from "./git-hooks.js";
+import { commonGitFileOf, gitFileOf, hookRunnerOf } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { InitCommand } from "./init-command.js";
 import {
@@ -30,12 +32,17 @@ import {
   defaultRemoteOf,
   isRelativeSubmoduleUrl,
   joinFilesPath,
+  lstatKind,
+  parentIsDirectory,
+  physicalFilesPath,
   relativeFilesPath,
   remoteFromUrl,
+  resolveFilesLinks,
   resolveRelativeUrl,
   SubmoduleGitDirError,
   SubmoduleModel,
   type SubmoduleSettings,
+  safeCreateLeadingDirectories,
   setInConfigFile,
   submodulePathConfigOf,
   submoduleUpdateTypeName,
@@ -121,6 +128,69 @@ export const SUBMODULE_UNSET_ENV = [
 export function shellQuote(text: string): string {
   return `'${text.replace(/['!]/g, (c) => `'\\${c}'`)}'`;
 }
+
+/** Where `<path>/.git` leads (setup.c's `resolve_gitdir_gently`). */
+interface ResolvedGitdir {
+  /**
+   * The repository directory as a physical FilesApi path (links followed); null when a gitfile
+   * or a `.git` link leads beyond the FilesApi
+   */
+  gitDir: string | null;
+  kind: "directory" | "gitfile";
+}
+
+/** How deep absorbgitdirs recurses into nested submodules before it gives up. */
+const MAX_ABSORB_DEPTH = 64;
+
+/** setup.c's `READ_GITFILE_ERR_*` codes. */
+type GitfileError =
+  | "missing"
+  | "stat-failed"
+  | "is-a-dir"
+  | "not-a-file"
+  | "too-large"
+  | "read-failed"
+  | "invalid-format"
+  | "no-path"
+  | "not-a-repo";
+
+/**
+ * The `strerror` text of a `rename(2)` of the directory `source` onto `target` that failed
+ * (the FilesApi's `move` answers false without the errno): what is in the way, else what is
+ * missing, else a refusal.
+ */
+async function renameFailure(
+  files: FilesApi,
+  source: string | null,
+  target: string,
+): Promise<string> {
+  if (source === null) return "Permission denied";
+  const there = await files.stats(target).catch(() => undefined);
+  if (there?.kind === "directory") {
+    for await (const _ of files.list(target)) return "Directory not empty";
+  } else if (there) return "Not a directory";
+  if (!(await files.stats(source).catch(() => undefined))) return "No such file or directory";
+  return "Permission denied";
+}
+
+/** Whether resolving the `..` components of a FilesApi path climbs above its root. */
+function climbsAboveRoot(path: string): boolean {
+  let depth = 0;
+  for (const part of path.split("/")) {
+    if (!part || part === ".") continue;
+    depth += part === ".." ? -1 : 1;
+    if (depth < 0) return true;
+  }
+  return false;
+}
+
+/** `read_gitfile_error_die`'s message prefixes; codes without one are not fatal there. */
+const GITFILE_ERRORS: Partial<Record<GitfileError, string>> = {
+  "too-large": "too large to be a .git file: ",
+  "read-failed": "error reading ",
+  "invalid-format": "invalid gitfile format: ",
+  "no-path": "no path in gitfile: ",
+};
 
 /**
  * The parts every submodule command shares: output, the index's gitlinks, the model.
@@ -238,6 +308,15 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
     return (await files?.stats(this.filesPath(path)).catch(() => undefined))?.kind;
   }
 
+  /** git's `stat(2)` kind of a worktree path: symbolic links on the way followed. */
+  protected async kindThroughLinks(path: string): Promise<string | undefined> {
+    const files = this.worktreeAccess?.getFiles?.();
+    if (!files) return undefined;
+    const physical = await physicalFilesPath(files, this.filesPath(path)).catch(() => undefined);
+    if (physical === undefined) return undefined;
+    return (await files.stats(physical).catch(() => undefined))?.kind;
+  }
+
   /** git's `config_set_in_gitmodules_file_gently` (`value` undefined unsets). */
   protected async setInGitmodules(key: string, value: string | undefined): Promise<boolean> {
     return setInConfigFile(this.workingCopy, this.filesPath(".gitmodules"), key, value);
@@ -325,7 +404,7 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
    * `submodule.<name>.gitdir`, unless that is set.
    */
   protected async createDefaultGitdirConfig(name: string): Promise<void> {
-    const modules = await commonGitFileOf(this.workingCopy, "modules");
+    const modules = await gitFileOf(this.workingCopy, "modules");
     const root = this.worktreeAccess?.getRoot() ?? "";
     if (!modules) return;
     const base = relativeFilesPath(root, modules.path);
@@ -501,6 +580,315 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
     }
   }
 
+  /**
+   * submodule.c's `absorb_git_dir_into_superproject`: the submodule at `path` whose
+   * repository is a `.git` directory in its worktree gets it moved into the superproject's
+   * git directory (`.git/modules/<name>`, or `submodule.<name>.gitdir` under
+   * `extensions.submodulePathConfig`) and a gitfile in its place; one whose gitfile names no
+   * repository (its superproject's git directory moved under it) is connected again to
+   * where the repository now lives; nothing for one not populated. Then the same in its own
+   * submodules (`--super-prefix=<path>/`), as git's child `submodule--helper absorbgitdirs`.
+   */
+  protected async absorbGitDirIntoSuperproject(path: string): Promise<void> {
+    await this.validatePath(path);
+    const state = await this.resolveGitdirGently(path);
+    // where the submodule's repository is once absorbed (physically), for the child run
+    let innerGitDir: string | null | undefined;
+    if ("error" in state) {
+      // 2.43 took a failed stat for an unpopulated submodule too
+      if (state.error === "missing") return;
+      if (state.error === "stat-failed" && this.compatibility === "2.43") return;
+      if (state.error !== "not-a-repo") {
+        // read_gitfile_error_die: the fatal codes die, the others go on to connect
+        const fatal = GITFILE_ERRORS[state.error];
+        if (fatal) this.die(`fatal: ${fatal}${path}`);
+      }
+      // populated, but its gitfile names no repository: the superproject was absorbed itself
+      const sub = (await this.model()).fromPath(path);
+      if (!sub) this.die(`fatal: could not lookup name for submodule '${path}'`);
+      const gitDir = await this.submoduleGitDir(sub.name, path);
+      if (gitDir === undefined) return;
+      await this.connectWorkTreeAndGitDir(path, gitDir);
+      innerGitDir = (await physicalFilesPath(this.filesOrFail(), gitDir)) ?? gitDir;
+    } else if (state.gitDir === null && state.kind === "gitfile") {
+      // its repository lies beyond this FilesApi: nothing to move, nothing reachable to recurse
+      return;
+    } else {
+      // already absorbed into the superproject's git directory? (a string prefix, as git's)
+      const common = await commonGitFileOf(this.workingCopy, "");
+      const realSub = await this.realHostPath(state.gitDir ?? this.filesPath(`${path}/.git`));
+      const realCommon = common ? await this.realHostPath(common.path) : undefined;
+      innerGitDir = state.gitDir;
+      if (realCommon === undefined || !realSub.startsWith(realCommon)) {
+        innerGitDir = await this.relocateSingleGitDir(path, state);
+      }
+    }
+    await this.absorbNested(path, innerGitDir ?? undefined);
+  }
+
+  private filesOrFail(): FilesApi {
+    const files = this.worktreeAccess?.getFiles?.();
+    if (!files) throw new GitApiError("fatal: no worktree");
+    return files;
+  }
+
+  /**
+   * submodule.c's `relocate_single_git_dir_into_superproject`: the `.git` directory moved
+   * (git's `rename`, its result checked before anything else changes) to the submodule's
+   * place in the superproject's git directory, then the gitfile written and `core.worktree`
+   * set (`connect_work_tree_and_git_dir`). A gitfile needs no migration.
+   */
+  private async relocateSingleGitDir(
+    path: string,
+    state: ResolvedGitdir,
+  ): Promise<string | null | undefined> {
+    const files = this.worktreeAccess?.getFiles?.();
+    if (!files) return;
+    await this.validatePath(path);
+    if (await this.usesWorktrees(files, state.gitDir)) {
+      this.die(
+        `fatal: relocate_gitdir for submodule '${path}' with more than one worktree not supported`,
+      );
+    }
+    if (state.kind === "gitfile") return state.gitDir;
+    // the `.git` directory, a link to one followed (git's real_pathdup): state.gitDir is the
+    // physical place, null when a link leads beyond this FilesApi
+    const source = state.gitDir;
+    const from = await this.realHostPath(this.filesPath(`${path}/.git`));
+    const sub = (await this.model()).fromPath(path);
+    if (!sub) this.die(`fatal: could not lookup name for submodule '${path}'`);
+    const target = await this.submoduleGitDir(sub.name, path, from);
+    if (target === undefined) return;
+    // safe_create_leading_directories, links followed as git's stat follows them: a dangling
+    // link on the way (or one beyond the FilesApi) refuses before anything is created
+    const physical = (await safeCreateLeadingDirectories(files, target))
+      ? await physicalFilesPath(files, target)
+      : undefined;
+    if (physical === undefined) {
+      this.die(`fatal: could not create directory '${(await this.model()).shownPath(target)}'`);
+    }
+    const to = await this.realHostPath(target);
+    this.out.stderr += `Migrating git directory of '${this.superPrefix}${path}' from\n'${from}' to\n'${to}'\n`;
+    // relocate_gitdir: nothing else is changed unless the rename succeeded (the source's data
+    // is never removed: a failed move leaves it where it was). rename(2) creates no
+    // directory: the place's parent must be there (the FilesApi's move would create it)
+    const moved =
+      source !== null &&
+      (await parentIsDirectory(files, physical)) &&
+      (await files.move(source, physical).catch(() => false));
+    if (!moved) {
+      const reason = await renameFailure(files, source, physical);
+      this.die(`fatal: could not migrate git directory from '${from}' to '${to}': ${reason}`);
+    }
+    await this.connectWorkTreeAndGitDir(path, physical);
+    return physical;
+  }
+
+  /** `submodule_name_to_gitdir`, its deaths (and 2.43's refusal to move) as git's. */
+  private async submoduleGitDir(
+    name: string,
+    path: string,
+    movedFrom?: string,
+  ): Promise<string | undefined> {
+    try {
+      return await (await this.model()).gitDirOf(name);
+    } catch (error) {
+      if (error instanceof SubmoduleGitDirError && this.compatibility === "2.43") {
+        // 2.43's relocate_single_git_dir_into_superproject checked the place itself
+        this.out.stderr += error.refusal.map((l) => `${l}\n`).join("");
+        const from = movedFrom ?? (await this.realHostPath(this.filesPath(`${path}/.git`)));
+        this.die(`fatal: refusing to move '${from}' into an existing git dir`);
+      }
+      if (error instanceof GitApiError) this.die(error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * dir.c's `connect_work_tree_and_git_dir` (no nested ones): the gitfile at `<path>/.git`
+   * naming `gitDir` relative to the worktree, then `core.worktree` in `<gitDir>/config`
+   * naming the worktree relative to it (the directory created when missing, as git's
+   * `safe_create_leading_directories` of the config file).
+   */
+  protected async connectWorkTreeAndGitDir(path: string, gitDir: string): Promise<void> {
+    const files = this.worktreeAccess?.getFiles?.();
+    if (!files) return;
+    const gitfile = `${path}/.git`;
+    // the leading directories of the gitfile and of `<gitDir>/config`, as git creates them
+    // (never through a dangling link)
+    if (!(await safeCreateLeadingDirectories(files, this.filesPath(gitfile)))) {
+      this.die(`fatal: could not create directories for ${gitfile}`);
+    }
+    if (!(await safeCreateLeadingDirectories(files, `${gitDir}/config`))) {
+      this.die(
+        `fatal: could not create directories for ${(await this.model()).shownPath(gitDir)}/config`,
+      );
+    }
+    // both sides as their real paths name them (git's real_pathdup): links followed
+    const realGitDir = await physicalFilesPath(files, gitDir);
+    const workTree = (await physicalFilesPath(files, this.filesPath(path))) ?? this.filesPath(path);
+    // write_file opens `<path>/.git` following a link there (to where the link points), which
+    // creates no directory: the place's parent must be there
+    const at = await resolveFilesLinks(files, this.filesPath(gitfile));
+    if (at === "loop") {
+      this.die(`fatal: could not open '${gitfile}' for writing: Too many levels of symbolic links`);
+    }
+    if (realGitDir === undefined || at === "outside") {
+      this.die(`fatal: could not open '${gitfile}' for writing: Permission denied`);
+    }
+    if (!(await parentIsDirectory(files, at))) {
+      this.die(`fatal: could not open '${gitfile}' for writing: No such file or directory`);
+    }
+    const relative = relativeFilesPath(workTree, realGitDir);
+    // never written over a directory (git's open fails there: EISDIR)
+    if ((await files.stats(at).catch(() => undefined))?.kind === "directory") {
+      this.die(`fatal: could not open '${gitfile}' for writing: Is a directory`);
+    }
+    const written = await files.write(at, [new TextEncoder().encode(`gitdir: ${relative}\n`)]).then(
+      () => true,
+      () => false,
+    );
+    if (!written) this.die(`fatal: could not open '${gitfile}' for writing: Permission denied`);
+    const worktreeValue = relativeFilesPath(realGitDir, workTree);
+    const set = await setInConfigFile(
+      this.workingCopy,
+      `${realGitDir}/config`,
+      "core.worktree",
+      worktreeValue,
+    ).catch(() => false);
+    if (!set) this.die(`fatal: could not set 'core.worktree' to '${worktreeValue}'`);
+  }
+
+  /** git's child `submodule--helper absorbgitdirs --super-prefix=<prefix><path>/` there. */
+  private async absorbNested(path: string, gitDir: string | undefined): Promise<void> {
+    await this.validatePath(path);
+    // the child git runs in the submodule finds its repository through `.git`, links and a
+    // gitfile naming a place through a link followed: where the worktree cannot read through
+    // them, the repository is opened from the physical place found here
+    const inner =
+      (await this.openSubmodule(path)) ??
+      (gitDir === undefined
+        ? undefined
+        : await this.worktreeAccess?.openGitlink?.(path, { gitDir }).catch(() => undefined));
+    // a chain of links cannot make this recurse forever
+    const depth = this.superPrefix.split("/").length;
+    if (!inner || depth > MAX_ABSORB_DEPTH) {
+      this.die(`fatal: could not recurse into submodule '${path}'`);
+    }
+    const child = new SubmoduleAbsorbGitDirsCommand(inner)
+      .setCompatibility(this.compatibility)
+      .setSuperPrefix(`${this.superPrefix}${path}/`);
+    try {
+      this.append(await child.call());
+    } catch (error) {
+      if (!(error instanceof SubmoduleCommandError)) throw error;
+      this.append(error.result);
+      this.out.stderr += `${error.message}\n`;
+      this.die(`fatal: could not recurse into submodule '${path}'`);
+    }
+  }
+
+  /**
+   * setup.c's `resolve_gitdir_gently` of `<path>/.git`: a `.git` directory that is a
+   * repository, else what `read_gitfile_gently` makes of it (the repository a gitfile names,
+   * `gitDir` null when it lies beyond this FilesApi, or git's error code).
+   */
+  private async resolveGitdirGently(
+    path: string,
+  ): Promise<ResolvedGitdir | { error: GitfileError }> {
+    const files = this.worktreeAccess?.getFiles?.();
+    if (!files) return { error: "missing" };
+    const dotGit = this.filesPath(`${path}/.git`);
+    // stat(2), not lstat: a `.git` link is followed to what it names (physically, since the
+    // FilesApi never acts through a link)
+    let at: string = dotGit;
+    if ((await lstatKind(files, dotGit)) === "symlink") {
+      const resolved = await resolveFilesLinks(files, dotGit);
+      // a loop: stat(2) fails with ELOOP (READ_GITFILE_ERR_STAT_FAILED)
+      if (resolved === "loop") return { error: "stat-failed" };
+      if (resolved === "outside") {
+        // beyond this FilesApi: git would read (and move) it; refused at the move
+        return { gitDir: null, kind: "directory" };
+      }
+      at = resolved;
+    }
+    const st = await files.stats(at).catch(() => undefined);
+    if (!st) return { error: "missing" };
+    if (st.kind === "directory") {
+      return (await isGitDirectory(files, at))
+        ? { gitDir: at, kind: "directory" }
+        : { error: "is-a-dir" };
+    }
+    if (st.kind !== "file") return { error: "not-a-file" };
+    if ((st.size ?? 0) > 1 << 20) return { error: "too-large" };
+    let text: string;
+    try {
+      text = decodeGitPath(await readFile(files, at));
+    } catch {
+      return { error: "read-failed" };
+    }
+    if (!text.startsWith("gitdir: ")) return { error: "invalid-format" };
+    text = text.replace(/[\r\n]+$/, "");
+    if (text.length < 9) return { error: "no-path" };
+    const target = text.slice(8);
+    let resolved: string | undefined;
+    if (target.startsWith("/")) {
+      const root = (files as { rootDirectory?: string }).rootDirectory?.replace(/\/+$/, "");
+      if (root === undefined) resolved = joinFilesPath("", target);
+      else if (target === root || target.startsWith(`${root}/`)) {
+        resolved = joinFilesPath("", target.slice(root.length));
+      }
+    } else if (!climbsAboveRoot(`${this.filesPath(path)}/${target}`)) {
+      resolved = joinFilesPath(this.filesPath(path), target);
+    }
+    if (resolved !== undefined) resolved = await physicalFilesPath(files, resolved);
+    // a place beyond this FilesApi: a repository git would find, which it would not move
+    if (resolved === undefined) return { gitDir: null, kind: "gitfile" };
+    if (!(await isGitDirectory(files, resolved))) return { error: "not-a-repo" };
+    return { gitDir: resolved, kind: "gitfile" };
+  }
+
+  /**
+   * worktree.c's `submodule_uses_worktrees`: whether the submodule's common git directory
+   * (its `commondir`) has anything in `worktrees/`.
+   */
+  private async usesWorktrees(files: FilesApi, gitDir: string | null): Promise<boolean> {
+    if (gitDir === null) return false;
+    let common = gitDir;
+    const commondir = `${gitDir}/commondir`;
+    if ((await files.stats(commondir).catch(() => undefined))?.kind === "file") {
+      const value = decodeGitPath(await readFile(files, commondir)).replace(/[\r\n]+$/, "");
+      if (value && !value.startsWith("/")) common = joinFilesPath(gitDir, value);
+    }
+    try {
+      for await (const _ of files.list(`${common}/worktrees`)) return true;
+    } catch {
+      return false;
+    }
+    return false;
+  }
+
+  /** git's `real_pathdup` of a FilesApi path: its host path, links resolved where possible. */
+  private async realHostPath(path: string): Promise<string> {
+    const files = this.worktreeAccess?.getFiles?.();
+    const root = (files as { rootDirectory?: string } | undefined)?.rootDirectory;
+    const clean = joinFilesPath("", path);
+    const host = root ? `${root.replace(/\/+$/, "")}/${clean}` : clean;
+    const environment = hostEnvironmentOf(this.workingCopy);
+    const real = await environment?.realPath?.(host).catch(() => undefined);
+    if (real !== undefined) return real;
+    // a dangling link resolved to where it points; a missing last component: its parent
+    // resolved (`real_pathdup(path, 1)`)
+    const physical = files ? await physicalFilesPath(files, clean) : undefined;
+    if (physical !== undefined && physical !== clean) return this.realHostPath(physical);
+    const slash = host.lastIndexOf("/");
+    if (slash > 0) {
+      const parent = await environment?.realPath?.(host.slice(0, slash)).catch(() => undefined);
+      if (parent !== undefined) return `${parent}${host.slice(slash)}`;
+    }
+    return host;
+  }
+
   protected append(result: SubmoduleCommandResult): void {
     this.out.stdout += result.stdout;
     this.out.stderr += result.stderr;
@@ -665,11 +1053,17 @@ export class SubmoduleDeinitCommand extends SubmoduleCommandBase {
     const files = this.worktreeAccess?.getFiles?.();
     if (!files) return;
     if ((await this.kindOf(path)) === "directory") {
-      if ((await this.kindOf(`${path}/.git`)) === "directory") {
+      // stat(2) of `.git`: a link followed; one this FilesApi cannot follow is taken for the
+      // directory git would find (the absorb then refuses rather than leave it behind)
+      const dotGitKind = await this.kindThroughLinks(`${path}/.git`);
+      const unfollowed =
+        dotGitKind === undefined &&
+        (await resolveFilesLinks(files, this.filesPath(`${path}/.git`))) === "outside";
+      if (dotGitKind === "directory" || unfollowed) {
         if (!this.quiet) {
           this.out.stderr += `warning: Submodule work tree '${dp}' contains a .git directory. This will be replaced with a .git file by using absorbgitdirs.\n`;
         }
-        await this.absorbGitDir(path, sub.name);
+        await this.absorbGitDirIntoSuperproject(path);
       }
       if (!this.force) {
         try {
@@ -734,58 +1128,65 @@ export class SubmoduleDeinitCommand extends SubmoduleCommandBase {
       }
       throw error;
     }
+    const files = this.worktreeAccess?.getFiles?.();
+    // the config file as git's lock finds it: its directory through links, or the lock fails
+    const physical =
+      gitDir !== undefined && files ? await physicalFilesPath(files, gitDir) : undefined;
+    const directory =
+      physical !== undefined &&
+      (await files?.stats(physical).catch(() => undefined))?.kind === "directory";
+    if (gitDir !== undefined && !directory) {
+      this.out.stderr += `error: could not lock config file ${model.shownPath(gitDir)}/config: No such file or directory\n`;
+    }
     const done =
-      gitDir !== undefined &&
-      (await setInConfigFile(this.workingCopy, `${gitDir}/config`, "core.worktree", undefined));
+      directory &&
+      (await setInConfigFile(this.workingCopy, `${physical}/config`, "core.worktree", undefined));
     if (!done) {
       this.out.stderr += `warning: Could not unset core.worktree setting in submodule '${sub.path ?? ""}'\n`;
     }
   }
+}
+
+/**
+ * `git submodule absorbgitdirs [-q] [<path>...]` (submodule--helper's `absorbgitdirs`): each
+ * submodule of the index (matching the paths) whose repository is a `.git` directory in its
+ * worktree gets it moved into the superproject's git directory (`.git/modules/<name>`, or
+ * `submodule.<name>.gitdir` under `extensions.submodulePathConfig`), a gitfile and
+ * `core.worktree` linking the two, then the same for its own submodules, at every depth.
+ * git prints each move on stderr whatever `-q` says.
+ *
+ * @example
+ * ```typescript
+ * const { stderr } = await git.submoduleAbsorbGitDirs().call();
+ * // "Migrating git directory of 'lib' from\n'/w/sup/lib/.git' to\n'/w/sup/.git/modules/lib'\n"
+ * ```
+ */
+export class SubmoduleAbsorbGitDirsCommand extends SubmoduleCommandBase {
+  private readonly paths: string[] = [];
+
+  /** A path (pathspec element) limiting the submodules. */
+  addPath(path: string): this {
+    this.checkCallable();
+    this.paths.push(path);
+    return this;
+  }
+
+  async call(): Promise<SubmoduleCommandResult> {
+    this.start();
+    const list = await this.moduleList(this.paths);
+    if (!list) return this.finish();
+    for (const entry of list) await this.absorbGitDirIntoSuperproject(entry.path);
+    return this.finish();
+  }
 
   /**
-   * submodule.c's `relocate_single_git_dir_into_superproject`: the submodule's `.git`
-   * directory moved to its place in the superproject's git directory, a gitfile and
-   * `core.worktree` linking the two. Nested submodules are not absorbed.
+   * @internal `absorb_git_dir_into_superproject` of the submodule at `path` alone (no
+   * pathspec, no module list), as `git rm` runs it before removing a submodule.
    */
-  private async absorbGitDir(path: string, name: string): Promise<void> {
-    const worktree = this.worktreeAccess;
-    const files = worktree?.getFiles?.();
-    if (!worktree || !files) return;
-    await this.validatePath(path);
-    const model = await this.model();
-    const source = this.filesPath(`${path}/.git`);
-    const host = (p: string) => {
-      const root = (files as { rootDirectory?: string }).rootDirectory;
-      return root ? `${root.replace(/\/+$/, "")}/${p}` : p;
-    };
-    const environment = (
-      this.workingCopy.config as
-        | { environment?: { realPath?(p: string): Promise<string> } }
-        | undefined
-    )?.environment;
-    const real = async (p: string) =>
-      (await environment?.realPath?.(host(p)).catch(() => undefined)) ?? host(p);
-    let target: string | undefined;
-    try {
-      target = await model.gitDirOf(name);
-    } catch (error) {
-      if (error instanceof SubmoduleGitDirError && this.compatibility === "2.43") {
-        // relocate_single_git_dir_into_superproject of 2.43
-        this.out.stderr += error.refusal.map((l) => `${l}\n`).join("");
-        this.die(`fatal: refusing to move '${await real(source)}' into an existing git dir`);
-      }
-      if (error instanceof GitApiError) this.die(error.message);
-      throw error;
-    }
-    if (target === undefined) return;
-    const parent = target.slice(0, Math.max(0, target.lastIndexOf("/")));
-    if (parent) await files.mkdir(parent);
-    const from = await real(source);
-    this.out.stderr += `Migrating git directory of '${this.superPrefix}${path}' from\n'${from}' to\n'${host(target)}'\n`;
-    if (!(await files.move(source, target))) {
-      this.die(`fatal: could not migrate git directory from '${from}' to '${host(target)}'`);
-    }
-    await worktree.connectGitlink?.(path, target);
+  async callForPath(path: string): Promise<SubmoduleCommandResult> {
+    this.start();
+    await this.absorbGitDirIntoSuperproject(path);
+    return this.finish();
   }
 }
 

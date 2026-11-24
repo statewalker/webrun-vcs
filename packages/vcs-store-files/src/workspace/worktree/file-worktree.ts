@@ -1315,10 +1315,17 @@ export class FileWorktree implements Worktree {
    */
   async openGitlink(
     path: string,
-    options: { name?: string; environment?: GitHostEnvironment } = {},
+    options: { name?: string; environment?: GitHostEnvironment; gitDir?: string } = {},
   ): Promise<WorkingCopy | undefined> {
-    let gitDir = await this.gitlinkDir(path);
+    let gitDir = await this.gitlinkDir(path).catch((error: unknown) => {
+      if (options.gitDir === undefined) throw error;
+      return undefined;
+    });
     if (gitDir !== undefined && !(await this.isRepositoryDir(gitDir))) gitDir = undefined;
+    // the repository the caller found through a link this storage does not follow
+    if (gitDir === undefined && options.gitDir !== undefined) {
+      if (await this.isRepositoryDir(options.gitDir)) gitDir = options.gitDir;
+    }
     if (gitDir === undefined) {
       // submodule_to_gitdir: no repository at the path, the one kept under modules/<name>
       const name = options.name;
