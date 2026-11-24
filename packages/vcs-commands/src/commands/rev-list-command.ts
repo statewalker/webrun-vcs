@@ -28,7 +28,8 @@ import {
   FIND_BISECTION_FIRST_PARENT_ONLY,
   findBisection,
 } from "./bisect/index.js";
-import { LogCommand, type LogOrder, type LogResult } from "./log-command.js";
+import type { DiffTextOptions } from "./diff-command.js";
+import { LogCommand, type LogOrder, type LogResult, RevFilter } from "./log-command.js";
 import type { LogOutputOptions } from "./log-output.js";
 import type { CommitFilter, GrepPatternType } from "./rev-filter/index.js";
 import { revisionMergeBases } from "./rev-parse-command.js";
@@ -196,6 +197,18 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   /** `--topo-order`, `--date-order`, `--author-date-order` (see `LogCommand.setOrder`). */
   setOrder(order: LogOrder | undefined): this {
     return this.configured((log) => log.setOrder(order));
+  }
+
+  /** `--no-merges`: commits with more than one parent left out. */
+  setNoMerges(noMerges: boolean): this {
+    return this.configured((log) => {
+      if (noMerges) log.setRevFilter(RevFilter.NO_MERGES);
+    });
+  }
+
+  /** The options of the diffs {@link callLogText} prints (see `LogCommand.setDiffOptions`). */
+  setDiffOptions(options: DiffTextOptions): this {
+    return this.configured((log) => log.setDiffOptions(options));
   }
 
   /** `--reverse` (see `LogCommand.setReverse`). */
@@ -526,6 +539,13 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
     if (!log) return "";
     // git log's configuration (grep.patternType, log.mailmap...), whatever setLogConfig says
     return log.setLogConfig(true).callText(options);
+  }
+
+  /** {@link callLogText} as bytes (messages and contents that are not UTF-8 kept as they are). */
+  async callLogBytes(options: LogOutputOptions = {}): Promise<Uint8Array> {
+    const log = await this.prepare();
+    if (!log) return new Uint8Array(0);
+    return log.setLogConfig(true).callBytes(options);
   }
 
   /** rev-list's `--bisect` / `--bisect-vars` output (builtin/rev-list.c, show_bisect_vars). */

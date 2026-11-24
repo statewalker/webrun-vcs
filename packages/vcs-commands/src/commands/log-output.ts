@@ -218,6 +218,12 @@ export interface LogMailOptions {
    * commit that cannot be converted is shown as stored, as git shows it when iconv fails.
    */
   outputEncoding?: string;
+  /**
+   * Blocks shown after the message as commentary (git before 2.46 writes format-patch's
+   * `Interdiff:` and `Range-diff:` there): each after `---` (the first) or an empty line,
+   * its title line included
+   */
+  commentary?: Uint8Array[];
 }
 
 /** A commit the walk shows, with the parents it is shown with (rewritten under `--graph`). */
@@ -1329,6 +1335,14 @@ export class LogPrinter {
     if (this.format.useTerminator && !this.formatIsEmpty()) {
       if (!this.missingNewline) this.out.text(this.padding());
       this.out.text("\n");
+    }
+    // git before 2.46: format-patch's interdiff and range-diff as commentary blocks
+    if (isMail) {
+      for (const block of this.options.mail?.commentary ?? []) {
+        this.out.text(this.shownDashes ? "\n" : "---\n");
+        this.shownDashes = true;
+        this.out.bytes(block);
+      }
     }
   }
 

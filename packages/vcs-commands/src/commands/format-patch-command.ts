@@ -11,9 +11,9 @@
 import type { ObjectId, PersonIdent } from "@statewalker/vcs-core";
 import { nullObjectIdLike } from "@statewalker/vcs-utils";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
-import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { ChangeType } from "../results/diff-entry.js";
+import { bytesToLatin1, latin1ToBytes } from "./apply/latin1.js";
 import { showDate } from "./date-format.js";
 import { DiffCommand } from "./diff-command.js";
 import { LogCommand } from "./log-command.js";
@@ -21,6 +21,12 @@ import { mailFromHeader, mailSubjectLine } from "./log-output.js";
 import { configValue } from "./merge-config.js";
 import { type PatchIdChange, patchIdOfChanges } from "./patch-id.js";
 import { sanitizedSubject } from "./pretty-format.js";
+import {
+  CREATION_FACTOR_FOR_THE_SAME_SERIES,
+  RANGE_DIFF_CREATION_FACTOR_DEFAULT,
+  RangeDiffBase,
+  type RangeDiffNotesOption,
+} from "./range-diff/index.js";
 import { commitSubject, outputEncoderFor, Shortlog } from "./shortlog.js";
 import { trailerConfigOf } from "./trailers.js";
 
@@ -38,6 +44,8 @@ export interface FormatPatchResult {
   patches: FormatPatchFile[];
   /** Standard output: the file names, or the mails with `--stdout` */
   output: Uint8Array;
+  /** git's `warning:` lines (`using '<prev>' as range-diff origin of current series`) */
+  warnings?: string[];
 }
 
 /** Thrown where git dies (`fatal: ...`). */
@@ -81,7 +89,7 @@ const MAIL_DEFAULT_WRAP = 72;
  * const { output } = await git.formatPatch().setMaxCount(1).setStdout(true).call();
  * ```
  */
-export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
+export class FormatPatchCommand extends RangeDiffBase<FormatPatchResult> {
   private revisions: string[] = [];
   private maxCount?: number;
   private root = false;
@@ -122,6 +130,11 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
   private notesOptions: (boolean | string)[] = [];
   private coverFromDescription?: string;
   private ignoreIfInUpstream = false;
+  private interdiff?: string;
+  private rangeDiff?: string;
+  private creationFactor?: number;
+  /** What git prints on stderr without dying */
+  private readonly warnings: string[] = [];
 
   /** A revision argument: `<since>` (to HEAD), `<a>..<b>`, `^<a>`, `<b>`. */
   addRevision(revision: string): this {
@@ -243,6 +256,31 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
   /** `--ignore-if-in-upstream`: leave out the patches the upstream side has (patch ids). */
   setIgnoreIfInUpstream(value: boolean): this {
     this.ignoreIfInUpstream = value;
+    return this;
+  }
+
+  /**
+   * `--interdiff=<rev>`: the diff from `<rev>` (the previous version's tip) to this series'
+   * tip, in the cover letter or after the single patch (the last one given counts).
+   */
+  setInterdiff(rev: string): this {
+    this.interdiff = rev;
+    return this;
+  }
+
+  /**
+   * `--range-diff=<prev>`: the range-diff of the previous version (a range, or its tip, the
+   * range then reaching back to this series' base) against this series, in the cover letter
+   * or after the single patch.
+   */
+  setRangeDiff(prev: string): this {
+    this.rangeDiff = prev;
+    return this;
+  }
+
+  /** `--creation-factor=<n>` of `--range-diff` (default 999 from git 2.46 on, 60 before). */
+  setCreationFactor(factor: number): this {
+    this.creationFactor = factor;
     return this;
   }
 
@@ -430,7 +468,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     }
     if (this.thread !== undefined) thread = this.thread;
     const cfgCover = this.config("format.coverLetter");
-    let configCover: "on" | "off" | "auto" = "off";
+    let configCover: "on" | "off" | "auto" | "unset" = "unset";
     if (cfgCover !== undefined)
       configCover = cfgCover.toLowerCase() === "auto" ? "auto" : bool(cfgCover) ? "on" : "off";
     const encodeHeaders = bool(this.config("format.encodeEmailHeaders")) ?? true;
@@ -562,11 +600,25 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     let cover = this.coverLetter;
     if (cover === undefined) {
       if (configCover === "auto") cover = total0 > 1;
+      else if (
+        // git 2.46 and later: a series with an interdiff or range-diff gets one
+        gitVersionAtLeast(this.versionString, 2, 46) &&
+        (this.interdiff !== undefined || this.rangeDiff !== undefined) &&
+        total0 > 1
+      )
+        cover = configCover !== "off";
       else cover = configCover === "on";
     }
     if (!this.keepSubject && autoNumber && (total0 > 1 || cover)) numbered = true;
     // rev.total: the last number shown (0: not numbered, -1: -k)
     const total = numbered ? total0 + startNumber - 1 : this.keepSubject ? -1 : 0;
+
+    // --interdiff and --range-diff: in the cover letter, else after the single patch
+    const diffOfDiff = await this.diffOfDiffBlocks(list, origin, {
+      cover,
+      notes,
+      noPrefix,
+    });
 
     // --base
     const bases = await this.prepareBases(list);
@@ -639,7 +691,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
         coverMode,
         ...(branchName !== undefined ? { branchName } : {}),
       });
-      const content = concat([text, latin(bases.text), latin(sig())]);
+      const content = concat([text, ...diffOfDiff.cover, latin(bases.text), latin(sig())]);
       bases.text = "";
       emit(fileName(this.numberedFiles ? undefined : "cover-letter"), content);
     }
@@ -714,6 +766,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
           forceInBodyFrom: this.forceInBodyFrom,
           encodeHeaders,
           outputEncoding,
+          ...(diffOfDiff.commentary.length ? { commentary: diffOfDiff.commentary } : {}),
         },
       });
       const parts: Uint8Array[] = [];
@@ -722,6 +775,7 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       shownOne = true;
       parts.push(
         bytes,
+        ...diffOfDiff.afterPatch,
         latin(bases.text),
         latin(mime ? `\n--${MIME_BOUNDARY_LEADER}${mime.boundary}--\n\n\n` : sig()),
       );
@@ -738,7 +792,108 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
       }
     }
     const output = this.stdout ? concat(stdoutParts) : new TextEncoder().encode(out.join(""));
-    return { patches, output };
+    return { patches, output, ...(this.warnings.length ? { warnings: this.warnings } : {}) };
+  }
+
+  /**
+   * The `Interdiff:` and `Range-diff:` blocks (title line and output) where git puts them:
+   * in the cover letter; else after the patch from 2.46 on (each after an empty line), as
+   * commentary after the message before.
+   */
+  private async diffOfDiffBlocks(
+    list: ObjectId[],
+    origin: ObjectId | undefined,
+    state: {
+      cover: boolean;
+      notes: { show: boolean; useDefault: boolean; refs: string[] };
+      noPrefix: boolean;
+    },
+  ): Promise<{ cover: Uint8Array[]; afterPatch: Uint8Array[]; commentary: Uint8Array[] }> {
+    const none = { cover: [], afterPatch: [], commentary: [] };
+    const modern = gitVersionAtLeast(this.versionString, 2, 46);
+    const single = state.cover || list.length === 1;
+    if (this.interdiff !== undefined && !single)
+      throw new FormatPatchError("--interdiff requires --cover-letter or single patch");
+    if (this.creationFactor !== undefined && this.rangeDiff === undefined)
+      throw new FormatPatchError("the option '--creation-factor' requires '--range-diff'");
+    if (this.rangeDiff !== undefined && !single)
+      throw new FormatPatchError("--range-diff requires --cover-letter or single patch");
+    const head = list[0] as ObjectId;
+    // diff_title: "against v<n-1>" for an integer reroll count of at least 1
+    const title = (generic: string, rerolled: string) => {
+      const v =
+        this.rerollCount !== undefined && /^[+-]?\d+$/.test(this.rerollCount.trim())
+          ? Number(this.rerollCount)
+          : undefined;
+      return v !== undefined && v >= 1 ? `${rerolled} v${v - 1}:` : `${generic}:`;
+    };
+    const blocks: { title: string; body: Uint8Array; indented: Uint8Array }[] = [];
+    if (this.interdiff !== undefined) {
+      const resolver = this.revisionResolver();
+      const id = await resolver.resolve(this.interdiff).catch(() => undefined);
+      if (id === undefined) throw new FormatPatchError(`Not a git revision: ${this.interdiff}`);
+      const diff = new DiffCommand(this.workingCopy)
+        .setOldTree(id)
+        .setNewTree(head)
+        .setOptions({
+          binaryPatch: !this.noBinary,
+          ignoreConfigNoPrefix: true,
+          submoduleFormat: "short",
+          uiConfig: false,
+          ...(state.noPrefix ? { noPrefix: true } : {}),
+        });
+      const body = await diff.callBytes("patch");
+      blocks.push({
+        title: title("Interdiff", "Interdiff against"),
+        body,
+        indented: indentLines(body, "  "),
+      });
+    }
+    if (this.rangeDiff !== undefined) {
+      const prev = this.rangeDiff;
+      const prevIsRange = await this.isRangeDiffRange(prev);
+      const range1 = prevIsRange ? prev : `${head}..${prev}`;
+      let range2: string;
+      if (origin) range2 = `${origin}..${head}`;
+      else if (prevIsRange)
+        throw new FormatPatchError("failed to infer range-diff origin of current series");
+      else {
+        this.warnings.push(`warning: using '${prev}' as range-diff origin of current series`);
+        range2 = `${prev}..${head}`;
+      }
+      // get_notes_args: the notes format-patch shows; a single patch's range-diff got none
+      // before git 2.52 (its log then showed the default notes)
+      const notes: RangeDiffNotesOption[] = !state.notes.show
+        ? [false]
+        : state.notes.useDefault || state.notes.refs.length === 0
+          ? [true]
+          : state.notes.refs;
+      const body = await this.showRangeDiff(range1, range2, {
+        creationFactor:
+          this.creationFactor ??
+          (modern ? CREATION_FACTOR_FOR_THE_SAME_SERIES : RANGE_DIFF_CREATION_FACTOR_DEFAULT),
+        notes: !state.cover && !gitVersionAtLeast(this.versionString, 2, 52) ? [] : notes,
+        dualColor: true,
+        color: false,
+      });
+      blocks.push({ title: title("Range-diff", "Range-diff against"), body, indented: body });
+    }
+    if (blocks.length === 0) return none;
+    const enc = new TextEncoder();
+    if (state.cover)
+      return {
+        ...none,
+        cover: blocks.flatMap((b) => [enc.encode(`${b.title}\n`), b.body]),
+      };
+    if (modern)
+      return {
+        ...none,
+        afterPatch: blocks.flatMap((b) => [enc.encode(`\n${b.title}\n`), b.indented]),
+      };
+    return {
+      ...none,
+      commentary: blocks.map((b) => concat([enc.encode(`${b.title}\n`), b.indented])),
+    };
   }
 
   /** The subject for the file name (`%f`). */
@@ -1117,6 +1272,17 @@ export class FormatPatchCommand extends GitCommand<FormatPatchResult> {
     const r = await diff.callFormats(["stat", "summary"]);
     return r.bytes ? decodeGitPath(r.bytes) : "";
   }
+}
+
+/** Each line of `bytes` after `prefix` (diff_line_prefix). */
+function indentLines(bytes: Uint8Array, prefix: string): Uint8Array {
+  const text = bytesToLatin1(bytes);
+  if (!text) return bytes;
+  const lines = text.split("\n");
+  const last = lines.pop();
+  let out = lines.map((l) => `${prefix}${l}\n`).join("");
+  if (last) out += `${prefix}${last}`;
+  return latin1ToBytes(out);
 }
 
 /** git_parse_maybe_bool: undefined (git's -1) for a value that is not a boolean. */
