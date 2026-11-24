@@ -49,10 +49,22 @@ export interface UnifiedDiffOptions extends XdiffOptions {
   /** Ignore changes whose lines are all blank (`--ignore-blank-lines`) */
   ignoreBlankLines?: boolean;
   /**
+   * `-I<regex>` (`--ignore-matching-lines`): ignore changes whose lines all match one of
+   * these patterns (xdiff's `xdl_mark_ignorable_regex`). Each line is tested whole, its LF
+   * included; compile them as git does, `compilePosixRegex(pattern, { extended: true,
+   * newline: true })` (`REG_EXTENDED | REG_NEWLINE`).
+   */
+  ignoreRegex?: readonly LineMatcher[];
+  /**
    * The function line finder of hunk headers: a diff driver's (see
    * {@link userdiffFindFunction}), or by default xdiff's `def_ff`
    */
   findFunction?: FindFunction;
+}
+
+/** A compiled pattern a line is tested against (a compiled `PosixRegex`) */
+export interface LineMatcher {
+  test(subject: Uint8Array, end?: number): boolean;
 }
 
 /** A change of a diff script with xdiff's `ignore` mark */
@@ -112,6 +124,33 @@ export function markIgnorableLines(
     let ignore = true;
     for (let i = 0; i < ch.chg1 && ignore; i++) ignore = blankLine(a, ch.i1 + i, flags);
     for (let i = 0; i < ch.chg2 && ignore; i++) ignore = blankLine(b, ch.i2 + i, flags);
+    ch.ignore = ignore;
+  }
+}
+
+/** Whether line `i` matches one of the patterns (xdiff's `record_matches_regex`) */
+function lineMatches(lines: ByteLines, i: number, patterns: readonly LineMatcher[]): boolean {
+  // regexec_buf over the whole record, its LF included
+  const line = lines.content.subarray(lines.start(i), lines.start(i + 1));
+  for (const p of patterns) if (p.test(line, line.length)) return true;
+  return false;
+}
+
+/**
+ * xdiff's `xdl_mark_ignorable_regex`: a change whose lines all match one of the patterns is
+ * ignorable; one `--ignore-blank-lines` marked already stays so.
+ */
+export function markIgnorableRegex(
+  script: XdiffEmitChange[],
+  a: ByteLines,
+  b: ByteLines,
+  patterns: readonly LineMatcher[],
+): void {
+  for (const ch of script) {
+    if (ch.ignore) continue;
+    let ignore = true;
+    for (let i = 0; i < ch.chg1 && ignore; i++) ignore = lineMatches(a, ch.i1 + i, patterns);
+    for (let i = 0; i < ch.chg2 && ignore; i++) ignore = lineMatches(b, ch.i2 + i, patterns);
     ch.ignore = ignore;
   }
 }
@@ -442,6 +481,9 @@ function emitScript(
     whitespace: ws,
   });
   if (script.length > 0 && options.ignoreBlankLines) markIgnorableLines(script, la, lb, ws);
+  if (script.length > 0 && options.ignoreRegex?.length) {
+    markIgnorableRegex(script, la, lb, options.ignoreRegex);
+  }
   return { la, lb, script };
 }
 
@@ -662,7 +704,7 @@ export function diffLineCounts(
   const { la, lb, script } = emitScript(oldContent, newContent, opts);
   let added = 0;
   let deleted = 0;
-  if (!options.ignoreBlankLines) {
+  if (!options.ignoreBlankLines && !options.ignoreRegex?.length) {
     // every change is emitted whole: its lines are the hunks' `-` and `+` lines
     for (const c of script) {
       added += c.chg2;

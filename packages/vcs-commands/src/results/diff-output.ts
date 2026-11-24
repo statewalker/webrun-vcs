@@ -50,6 +50,11 @@ import { quoteCStyleBody, quotePath, quoteTwo } from "./quote-path.js";
 /** One side of a file pair */
 export interface DiffSideSpec {
   path: string;
+  /**
+   * The path attributes (the diff driver, textconv) are looked up by, when {@link path} is
+   * shown shortened (`--relative` strips its prefix from the names, not from attributes)
+   */
+  attrPath?: string;
   /** git file mode, e.g. `0o100644` */
   mode: number;
   /** Object id of the content (a worktree file: the id of its cleaned content) */
@@ -282,6 +287,16 @@ function contentDriver(
   return spec && (spec.mode & S_IFMT) === 0o100000 ? driver : undefined;
 }
 
+/** The full path of a pair's side for attributes; the other side's for an absent one */
+function attrPathOf(
+  side: DiffSideSpec | undefined,
+  other: DiffSideSpec | undefined,
+  fallback: string,
+): string {
+  const spec = side ?? other;
+  return spec ? (spec.attrPath ?? spec.path) : fallback;
+}
+
 async function driverOf(
   options: DiffOutputOptions,
   path: string | undefined,
@@ -393,8 +408,10 @@ async function builtinDiff(
   const pathTwo = pair.new?.path ?? absentPath ?? pair.old?.path ?? "";
   const name = pathOne;
   const other = pathTwo !== name ? pathTwo : undefined;
-  const oneDriver = await driverOf(options, pathOne);
-  const twoDriver = pathTwo === pathOne ? oneDriver : await driverOf(options, pathTwo);
+  const attrOne = attrPathOf(pair.old, pair.new, pathOne);
+  const attrTwo = attrPathOf(pair.new, pair.old, pathTwo);
+  const oneDriver = await driverOf(options, attrOne);
+  const twoDriver = attrTwo === attrOne ? oneDriver : await driverOf(options, attrTwo);
   const one = new LoadedSide(pair.old, contentDriver(pair.old, oneDriver), pair.new?.id);
   const two = new LoadedSide(pair.new, contentDriver(pair.new, twoDriver), pair.old?.id);
   // a side with a textconv driver (git's get_textconv: valid sides only) is text
@@ -481,10 +498,10 @@ async function builtinDiff(
   const driver = one.driver?.findFunction ? one.driver : two.driver;
   const algorithm = oneDriver?.algorithm ?? options.algorithm;
   const textOne = textconvOne
-    ? await textconvOne(await one.textconvInput(), pathOne)
+    ? await textconvOne(await one.textconvInput(), attrOne)
     : await one.read();
   const textTwo = textconvTwo
-    ? await textconvTwo(await two.textconvInput(), pathTwo)
+    ? await textconvTwo(await two.textconvInput(), attrTwo)
     : await two.read();
   const result = unifiedDiffHunks(textOne, textTwo, {
     ...options,
@@ -545,9 +562,10 @@ export async function computeDiffstat(
       deleted: 0,
     };
     files.push(file);
-    const pathOne = nameA;
-    const oneDriver = await driverOf(options, pathOne);
-    const twoDriver = nameB === nameA ? oneDriver : await driverOf(options, nameB);
+    const attrOne = attrPathOf(pair.old, pair.new, nameA);
+    const attrTwo = attrPathOf(pair.new, pair.old, nameB);
+    const oneDriver = await driverOf(options, attrOne);
+    const twoDriver = attrTwo === attrOne ? oneDriver : await driverOf(options, attrTwo);
     const one = new LoadedSide(pair.old, contentDriver(pair.old, oneDriver), pair.new?.id);
     const two = new LoadedSide(pair.new, contentDriver(pair.new, twoDriver), pair.old?.id);
     // git's may_differ: both ids known and equal, or the contents are compared
