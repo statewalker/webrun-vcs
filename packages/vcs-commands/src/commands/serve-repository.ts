@@ -50,6 +50,7 @@ const CONFIG_KEYS = [
   "denyCurrentBranch",
   "denyDeleteCurrent",
   "shallowUpdate",
+  "advertisePushOptions",
   "uploadPackHideRefs",
   "receivePackHideRefs",
   "procReceiveRefs",

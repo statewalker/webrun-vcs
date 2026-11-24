@@ -27,6 +27,7 @@ import {
   type ReceivePackLogger,
 } from "../fsm/push/receive-pack-types.js";
 import {
+  RECEIVE_PACK_CAPABILITIES,
   releaseReceivePack,
   serverPushHandlers,
   serverPushTransitions,
@@ -96,6 +97,13 @@ export interface ServeOverDuplexOptions {
   procReceiveRefs?: readonly string[];
   /** receive-pack: a setting git cannot read (see `ReceivePackConfig.configError`) */
   receivePackConfigError?: string;
+  /**
+   * receive-pack: git's `receive.advertisePushOptions`; false leaves `push-options` out of
+   * the advertised capabilities (a client sending options anyway has them ignored). Default:
+   * advertised (git's default is false: a served repository's config gives it, see
+   * `GIT_SERVER_SETTINGS_DEFAULTS`)
+   */
+  advertisePushOptions?: boolean;
   /** receive-pack: `receive.fsckObjects` (see `ReceivePackConfig.fsckObjects`) */
   fsckObjects?: ReceivePackConfig["fsckObjects"];
   /** upload-pack hooks: authorize (before the negotiation), postUpload (after the pack) */
@@ -240,7 +248,10 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
   const config: ProcessConfiguration = {
     localHead: options.currentBranch ?? "refs/heads/main",
     maxHaves: 256,
-    serverCapabilities: options.capabilities,
+    serverCapabilities:
+      service === "git-receive-pack" && options.advertisePushOptions === false
+        ? (options.capabilities ?? RECEIVE_PACK_CAPABILITIES).filter((c) => c !== "push-options")
+        : options.capabilities,
     requestPolicy: options.requestPolicy,
     advertiseObjectInfo: options.advertiseObjectInfo,
     ...(options.uploadPackFilter ? { uploadPackFilter: options.uploadPackFilter } : {}),

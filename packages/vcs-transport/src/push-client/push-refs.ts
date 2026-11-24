@@ -123,6 +123,12 @@ export interface MatchPushRefsOptions {
    */
   prune?: boolean;
   /**
+   * `git push --mirror` (git's `MATCH_REFS_MIRROR` and `set_ref_status_for_push`'s
+   * `send_mirror`): `:` pushes every local ref to the same name, the remote has it or not, and
+   * every remote ref no refspec matched is deleted
+   */
+  mirror?: boolean;
+  /**
    * The local repository's object format (SHA-1 when absent): the null id of creations and
    * deletions, the width of an object id given as a source
    */
@@ -343,8 +349,8 @@ export async function matchPushRefs(
     if (!p) continue;
     let remoteRef: string;
     if (p.matching) {
-      // ":" pushes branches the remote has under the same name
-      if (!name.startsWith("refs/heads/") || !remote.has(name)) continue;
+      // ":" pushes branches the remote has under the same name (every ref under --mirror)
+      if (!options.mirror && (!name.startsWith("refs/heads/") || !remote.has(name))) continue;
       remoteRef = name;
     } else {
       remoteRef = expandPattern(p.src ?? "", p.dst ?? p.src ?? "", name);
@@ -382,6 +388,13 @@ export async function matchPushRefs(
       }
       if (local.refs.has(src) || excluded(src)) continue;
       link({ remoteRef: name, newOid: ZERO_OID, oldOid: oid, force: p.force }, false);
+    }
+  }
+  // --mirror: every remote ref nothing is pushed to goes (set_ref_status_for_push)
+  if (options.mirror) {
+    for (const [name, oid] of remote) {
+      if (matched.has(name)) continue;
+      link({ remoteRef: name, newOid: ZERO_OID, oldOid: oid, force: false }, false);
     }
   }
   return [...matched.values()];

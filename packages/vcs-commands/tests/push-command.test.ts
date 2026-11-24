@@ -927,7 +927,12 @@ describe.each(backends)("PushCommand as git push ($name backend)", ({ factory })
     const originalFetch = globalThis.fetch;
     globalThis.fetch = server.mockFetch;
     try {
-      const result = await git.push().setRemote(createTestUrl(server.baseUrl)).call();
+      const result = await git
+        .push()
+        .setRemote(createTestUrl(server.baseUrl))
+        // git: a URL pushed to without remotes is "the one remote", so simple wants an upstream
+        .add("main")
+        .call();
       expect(result.remoteUpdates[0]).toMatchObject({
         remoteName: "refs/heads/main",
         status: PushStatus.REJECTED_NONFASTFORWARD,

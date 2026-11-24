@@ -220,6 +220,7 @@ const DEFAULT_SETTINGS: ServerConfigSettings = {
   denyCurrentBranch: "unconfigured",
   denyDeleteCurrent: "unconfigured",
   shallowUpdate: false,
+  advertisePushOptions: false,
   uploadPackHideRefs: [],
   receivePackHideRefs: [],
 };
@@ -529,6 +530,8 @@ export async function receivePackSettingsOf(
     denyCurrentBranch: settings.denyCurrentBranch,
     denyDeleteCurrent: settings.denyDeleteCurrent,
     shallowUpdate: settings.shallowUpdate,
+    // receive.advertisePushOptions (git's default false)
+    advertisePushOptions: settings.advertisePushOptions,
     uploadPackHideRefs: settings.uploadPackHideRefs,
     receivePackHideRefs: settings.receivePackHideRefs,
     ...(receiveHooks ? { hooks: receiveHooks, relayPostReceive: true } : {}),

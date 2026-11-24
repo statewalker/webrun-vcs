@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   checkConnectivity,
+  explicitServerSettingsFromConfig,
   findNewCommits,
   mapRejectReason,
   serverSettingsFromConfig,
@@ -844,6 +845,7 @@ describe("receive-pack: the settings git reads from the repository's config", ()
       denyCurrentBranch: "unconfigured",
       denyDeleteCurrent: "unconfigured",
       shallowUpdate: false,
+      advertisePushOptions: false,
       uploadPackHideRefs: [],
       receivePackHideRefs: [],
     });
@@ -869,8 +871,19 @@ describe("receive-pack: the settings git reads from the repository's config", ()
       denyCurrentBranch: "updateInstead",
       denyDeleteCurrent: "ignore",
       shallowUpdate: true,
+      advertisePushOptions: false,
       uploadPackHideRefs: ["refs/a", "refs/c", "!refs/a/x"],
       receivePackHideRefs: ["refs/a", "refs/b", "!refs/a/x"],
     });
+  });
+
+  it("maps receive.advertisePushOptions (git's default false), set only when configured", () => {
+    expect(serverSettingsFromConfig(reader([["receive.advertisePushOptions", "true"]]))).toEqual(
+      expect.objectContaining({ advertisePushOptions: true }),
+    );
+    expect(explicitServerSettingsFromConfig(reader([]))).toEqual({});
+    expect(
+      explicitServerSettingsFromConfig(reader([["receive.advertisePushOptions", null]])),
+    ).toEqual({ advertisePushOptions: true });
   });
 });

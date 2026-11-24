@@ -284,6 +284,8 @@ export interface ReceivePackServerOptions {
   procReceiveRefs?: readonly string[];
   /** A receive-pack setting git cannot read (see `ReceivePackConfig.configError`) */
   receivePackConfigError?: string;
+  /** git's `receive.advertisePushOptions` (default: advertised; see `ServeOverDuplexOptions`) */
+  advertisePushOptions?: boolean;
   /** `receive.fsckObjects`: the fsck of each push's objects (see `ReceivePackConfig.fsckObjects`) */
   fsckObjects?: ReceivePackConfig["fsckObjects"];
 }
@@ -931,6 +933,14 @@ function concatBytes(chunks: Uint8Array[]): Uint8Array {
   return body;
 }
 
+/** receive-pack's capabilities: `push-options` only while `receive.advertisePushOptions` allows. */
+function receivePackCapabilities(options: HttpServerOptions): string[] {
+  const capabilities = [...(options.capabilities ?? RECEIVE_PACK_CAPABILITIES)];
+  return options.receivePack?.advertisePushOptions === false
+    ? capabilities.filter((c) => c !== "push-options")
+    : capabilities;
+}
+
 /**
  * Handles GET /info/refs?service=git-receive-pack
  *
@@ -973,10 +983,7 @@ export async function handleReceivePackInfoRefs(
   // Default capabilities for receive-pack
   // `object-format=sha256` for a SHA-256 repository (a SHA-1 one advertises as before)
   const format = formatOf(repository);
-  const capabilities = v0ObjectFormatCapabilities(
-    options.capabilities ?? RECEIVE_PACK_CAPABILITIES,
-    format,
-  );
+  const capabilities = v0ObjectFormatCapabilities(receivePackCapabilities(options), format);
 
   // First ref with capabilities
   if (refs.length > 0) {
@@ -1092,6 +1099,7 @@ export async function handleReceivePack(
   const afterReport: Array<() => Promise<void>> = [];
 
   const config: ProcessConfiguration = {
+    serverCapabilities: receivePackCapabilities(options),
     requestPolicy: options.requestPolicy ?? "ADVERTISED",
     maxEmptyBatches: 10,
     allowDeletes: rp.allowDeletes ?? true,
