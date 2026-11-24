@@ -38,6 +38,7 @@ import { coreBool, worktreeModeTrust } from "./core-config.js";
 import type { OrtConflict } from "./ort-merge.js";
 import { markIndexUpdate } from "./post-index-change.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
+import type { SubmoduleUnpack } from "./submodule-unpack.js";
 import {
   planFlatRestore,
   planTreeRestore,
@@ -893,6 +894,10 @@ export interface SwitchTreesOptions {
    * (written, untracked files in the way refused), never as a staged deletion
    */
   initialCheckout?: boolean;
+  /** `--recurse-submodules`: the active submodules checked and moved with the worktree */
+  submodules?: SubmoduleUnpack;
+  /** False (`read-tree -n`): the index is not written */
+  writeIndex?: boolean;
 }
 
 /** git's default unpack-trees messages (`unpack_plumbing_errors`) for one refused path. */
@@ -947,6 +952,9 @@ async function switchTreesWith(
   const untrackedRemoved: string[] = [];
   const updates: string[] = [];
   const removes: string[] = [];
+  const subs = options.submodules;
+  /** Paths whose submodule checks replace the untracked-file checks (verify_absent_1) */
+  const submodulePaths = new Set<string>();
   const paths = [...new Set([...head.keys(), ...target.keys()])].sort();
   for (const path of paths) {
     const h = head.get(path);
@@ -960,17 +968,44 @@ async function switchTreesWith(
         staged.push(path);
         continue;
       }
+      if (subs && checked && !quiet(path) && i.mode === FileMode.GITLINK) {
+        // deleted_entry's verify_absent_if_directory of the submodule going away
+        if (!t && update && (await subs.isSubmodule(path, i)) && (await subs.exists(path))) {
+          await subs.refuses(path, (h ?? i).objectId, null);
+        }
+        const refused = await subs.notUptodate(path, i);
+        if (refused) {
+          local.push(path);
+          continue;
+        }
+        if (refused === false) {
+          if (t && t.mode !== FileMode.GITLINK) await subs.fileReplacesRefuses(path, i);
+          if (t) await subs.mergedRefuses(path, i, t);
+          (t ? updates : removes).push(path);
+          continue;
+        }
+      }
       if (checked && !quiet(path) && (await entryNotUptodate(checked, path, i, trust, indexTime))) {
         local.push(path);
         continue;
       }
+      if (subs && t && !quiet(path)) await subs.mergedRefuses(path, i, t);
       (t ? updates : removes).push(path);
       continue;
     }
     if (t) {
       // a staged deletion of a path the target changes (none in an initial checkout)
-      if (h && !options.initialCheckout) staged.push(path);
-      else updates.push(path);
+      if (h && !options.initialCheckout) {
+        staged.push(path);
+        continue;
+      }
+      if (subs && !quiet(path)) {
+        // merged_entry of a new submodule: verify_absent_1's submodule check, then its own
+        const absent = update ? await subs.absentRefuses(path, t) : undefined;
+        if (absent !== undefined) submodulePaths.add(path);
+        if (!absent) await subs.mergedRefuses(path, undefined, t);
+      }
+      updates.push(path);
       continue;
     }
     // a deletion already staged: an untracked file there would be removed
@@ -983,7 +1018,7 @@ async function switchTreesWith(
   const writing = new Set(updates.filter((p) => !sparse || sparse.writes(p)));
   const found = worktree
     ? await findInTheWay(worktree, {
-        writes: [...writing],
+        writes: [...writing].filter((p) => !submodulePaths.has(p)),
         removes: new Set(deleting),
         index,
         ...(await restoreCaseOptions(worktree, ignoreCase)),
@@ -991,26 +1026,43 @@ async function switchTreesWith(
         caseVariantsExpendable: true,
       })
     : { untracked: [], lostDirs: [], caseVariants: [] };
+  const submoduleRejected = subs?.rejected ?? [];
+  const plainMessage = () => {
+    // unpack-trees without show_all_errors stops at the first refusal; the submodule lines
+    // come with it, printed as the checks ran
+    if (subs && submoduleRejected.length > 0) {
+      const first = submoduleRejected[0] as string;
+      return subs.plainRefusal(first, local.includes(first));
+    }
+    return firstPlainError({
+      wouldOverwrite: staged,
+      notUptodate: local,
+      lostDir: found.lostDirs,
+      untracked: found.untracked,
+      untrackedRemoved,
+    });
+  };
+  const porcelain = overwriteMessage(options.action, {
+    staged,
+    local,
+    lostDirs: found.lostDirs,
+    untracked: found.untracked,
+    untrackedRemoved,
+    submodules: submoduleRejected,
+  });
   const message = options.plainErrors
-    ? firstPlainError({
-        wouldOverwrite: staged,
-        notUptodate: local,
-        lostDir: found.lostDirs,
-        untracked: found.untracked,
-        untrackedRemoved,
-      })
-    : overwriteMessage(options.action, {
-        staged,
-        local,
-        lostDirs: found.lostDirs,
-        untracked: found.untracked,
-        untrackedRemoved,
-      });
+    ? plainMessage()
+    : porcelain && subs
+      ? `${subs.printed()}${porcelain}`
+      : porcelain;
   if (message) {
     return {
       refused: {
         message,
-        paths: [...staged, ...local, ...found.lostDirs, ...found.untracked, ...untrackedRemoved],
+        paths:
+          subs && submoduleRejected.length > 0 && options.plainErrors
+            ? []
+            : [...staged, ...local, ...found.lostDirs, ...found.untracked, ...untrackedRemoved],
       },
       written: new Set(),
     };
@@ -1048,12 +1100,22 @@ async function switchTreesWith(
     }
     for (const path of removes) {
       if (quiet(path)) continue;
-      await worktree.remove(path);
+      const old = index.get(path);
+      if (subs && old?.mode === FileMode.GITLINK) await subs.unlink(worktree, path, old);
+      else await worktree.remove(path);
       await pruneEmptyParents(worktree, path);
     }
     // core.ignorecase: what verify_clean_subdirectory took as tracked in a directory a file
     // replaces goes with the directory (checkout_entry removes the subtree)
     await removeCaseVariants(worktree, found.caseVariants ?? []);
+    if (subs) {
+      for (const path of writing) {
+        const old = index.get(path);
+        if (old?.mode === FileMode.GITLINK && target.get(path)?.mode !== FileMode.GITLINK) {
+          await subs.removeForFile(worktree, path, old);
+        }
+      }
+    }
     if (writing.size > 0) {
       // only the written paths are planned (each validated, its blob checked)
       const plan = await planPathsRestore(
@@ -1087,6 +1149,14 @@ async function switchTreesWith(
           attributes: { direction: "checkout", index: attributesIndexOf(result) },
         },
       );
+    }
+    if (subs) {
+      // check_updates: `.gitmodules` read again, then the submodules checked out
+      subs.reload();
+      for (const path of [...writing].sort()) {
+        const t = planTarget.get(path);
+        if (t?.mode === FileMode.GITLINK) await subs.checkout(worktree, path, t);
+      }
     }
   }
 
@@ -1189,7 +1259,10 @@ async function switchTreesWith(
     switchedCacheTree = cacheTree;
   }
   // set once the changes are in: it describes the index they leave
-  await rewriteIndex(ctx.staging, changes, { cacheTree: switchedCacheTree });
+  await rewriteIndex(ctx.staging, changes, {
+    cacheTree: switchedCacheTree,
+    ...(options.writeIndex === false ? { write: false } : {}),
+  });
   return { written: worktree ? writing : new Set() };
 }
 

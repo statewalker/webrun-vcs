@@ -414,6 +414,8 @@ export function overwriteMessage(
     lostDirs?: string[];
     untracked?: string[];
     untrackedRemoved?: string[];
+    /** Submodules that cannot be moved (git's ERROR_WOULD_LOSE_SUBMODULE), listed last */
+    submodules?: string[];
   },
 ): string | undefined {
   const list = (paths: string[]) => paths.map((p) => `\t${p}`);
@@ -462,6 +464,9 @@ export function overwriteMessage(
         move,
       ].join("\n"),
     );
+  }
+  if (found.submodules?.length) {
+    parts.push(["error: Cannot update submodule:", ...list(found.submodules), ""].join("\n"));
   }
   return parts.length > 0 ? [...parts, "Aborting"].join("\n") : undefined;
 }

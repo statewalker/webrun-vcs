@@ -38,6 +38,7 @@ import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
 import { StashCreateCommand } from "./stash-create-command.js";
 import { STASH_REF } from "./stash-list-command.js";
+import type { SubmoduleUnpack } from "./submodule-unpack.js";
 import { restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import {
   type CheckedEntry,
@@ -116,6 +117,10 @@ export interface OnewayMergeOptions {
   targetTree?: ObjectId;
   /** `read-tree`'s refusal: the `error:` line alone, without `fatal: Could not reset ...` */
   plain?: boolean;
+  /** `--recurse-submodules`: the active submodules checked and moved with the worktree */
+  submodules?: SubmoduleUnpack;
+  /** False (`read-tree -n`): the index is not written */
+  writeIndex?: boolean;
 }
 
 async function resetMergeWith(
@@ -182,6 +187,18 @@ async function resetMergeWith(
     }
     return checkUptodate && worktreeDiffers(worktree, e.path, i, trust, indexTime);
   };
+  const subs = options.submodules;
+  /** The submodules the reset keeps and checks out again (oneway_merge's CE_UPDATE) */
+  const submoduleCheckouts: string[] = [];
+  const subRefusal = (path: string, notUptodateToo: boolean): MergeRefusal => {
+    const text = (subs as SubmoduleUnpack).plainRefusal(path, notUptodateToo);
+    return {
+      message: options.plain
+        ? text
+        : `${text}\nfatal: Could not reset index file to revision '${label}'.`,
+      paths: [],
+    };
+  };
   const changes: string[] = [];
   /** Paths the reset removes from the index (git's CE_REMOVE in the result) */
   const removing = new Set<string>();
@@ -203,11 +220,37 @@ async function resetMergeWith(
       ) {
         return refusedWith(refuse(`Updating '${path}' would lose untracked files in it`, path));
       }
+      if (subs && i && !conflicted && !quiet(path) && i.mode === FileMode.GITLINK) {
+        // deleted_entry: verify_absent_if_directory, then verify_uptodate, of a submodule
+        if (
+          absentWorktree &&
+          (await subs.isSubmodule(path, i)) &&
+          (await subs.exists(path)) &&
+          (await subs.refuses(path, i.objectId, null))
+        ) {
+          return refusedWith(subRefusal(path, false));
+        }
+        const refused = await subs.notUptodate(path, i);
+        if (refused) return refusedWith(subRefusal(path, true));
+        if (refused === false) {
+          removing.add(path);
+          changes.push(path);
+          continue;
+        }
+      }
       if (!conflicted && i && !quiet(path) && (await notUptodateEntry(i))) {
         return refusedWith(notUptodate(path));
       }
       removing.add(path);
       changes.push(path);
+      continue;
+    }
+    if (subs && worktree && i && !conflicted && sameEntry(i, t) && t.mode === FileMode.GITLINK) {
+      // oneway_merge: a submodule the reset keeps is checked out again when up to date
+      if (!quiet(path) && (await subs.isSubmodule(path, i))) {
+        if (await subs.notUptodate(path, i)) return refusedWith(subRefusal(path, true));
+        submoduleCheckouts.push(path);
+      }
       continue;
     }
     if (!conflicted && sameEntry(i, t)) {
@@ -224,6 +267,32 @@ async function resetMergeWith(
         changes.push(path);
       }
       continue;
+    }
+    if (subs && !conflicted && !quiet(path)) {
+      // a submodule's checks: verify_absent or verify_uptodate, then merged_entry's
+      if (!i && absentWorktree) {
+        const refused = await subs.absentRefuses(path, t);
+        if (refused) return refusedWith(subRefusal(path, false));
+        if (refused === false) {
+          if (await subs.mergedRefuses(path, undefined, t)) {
+            return refusedWith(subRefusal(path, false));
+          }
+          changes.push(path);
+          continue;
+        }
+      } else if (i && i.mode === FileMode.GITLINK) {
+        const refused = await subs.notUptodate(path, i);
+        if (refused) return refusedWith(subRefusal(path, true));
+        if (refused === false) {
+          if (t.mode !== FileMode.GITLINK && (await subs.fileReplacesRefuses(path, i))) {
+            return refusedWith(subRefusal(path, false));
+          }
+          if (await subs.mergedRefuses(path, i, t)) return refusedWith(subRefusal(path, false));
+          changes.push(path);
+          continue;
+        }
+      }
+      if (await subs.mergedRefuses(path, i, t)) return refusedWith(subRefusal(path, false));
     }
     if (worktree && !i && !conflicted && !quiet(path)) {
       // a new path: verify_absent
@@ -261,6 +330,12 @@ async function resetMergeWith(
     }
     for (const path of changes) {
       if (target.has(path) || quiet(path)) continue;
+      const old = index.get(path);
+      if (subs && old?.mode === FileMode.GITLINK) {
+        await subs.unlink(worktree, path, old);
+        await pruneEmptyParents(worktree, path);
+        continue;
+      }
       const entry = await worktree.getEntry(path);
       if (entry && !entry.isDirectory) {
         await worktree.remove(path);
@@ -270,6 +345,14 @@ async function resetMergeWith(
     // core.ignorecase: what verify_clean_subdirectory took as tracked in a directory a file
     // replaces goes with the directory (checkout_entry removes the subtree)
     await removeCaseVariants(worktree, caseVariants);
+    if (subs) {
+      for (const path of writing) {
+        const old = index.get(path);
+        if (old?.mode === FileMode.GITLINK && target.get(path)?.mode !== FileMode.GITLINK) {
+          await subs.removeForFile(worktree, path, old);
+        }
+      }
+    }
     if (writing.size > 0) {
       const plan = await planPathsRestore(ctx, target, targetTree, writing, "reset");
       await writeTreeRestorePlan(worktree, ctx.blobs, plan, "reset", {
@@ -278,6 +361,14 @@ async function resetMergeWith(
         replaceInTheWay: true,
         ...(options.overwriteUntracked ? { discardUntracked: true } : {}),
       });
+    }
+    if (subs) {
+      // check_updates: `.gitmodules` read again, then the submodules checked out
+      subs.reload();
+      for (const path of [...writing, ...submoduleCheckouts].sort(compareBytes)) {
+        const t = target.get(path);
+        if (t?.mode === FileMode.GITLINK) await subs.checkout(worktree, path, t);
+      }
     }
   }
   const edits = new Map<string, IndexEntryOptions[]>();
@@ -308,6 +399,7 @@ async function resetMergeWith(
   ctx.staging.clearResolveUndo?.();
   await rewriteIndex(ctx.staging, edits, {
     updateCacheTreeWith: { trees: ctx.trees, format: objectFormatOf(ctx.workingCopy.history) },
+    ...(options.writeIndex === false ? { write: false } : {}),
   });
   return { written: worktree ? writing : new Set() };
 }
@@ -391,13 +483,15 @@ export async function resetKeep(
   headId: ObjectId,
   targetId: ObjectId,
   label: string,
+  /** `--recurse-submodules`: the active submodules checked and moved with the worktree */
+  submodules?: SubmoduleUnpack,
 ): Promise<MergeRefusal | undefined> {
   // unpack-trees: post-index-change's worktree flag for the index written next
   markIndexUpdate(ctx.staging, { workdir: true });
   // in a sparse checkout: unpack-trees with its patterns; reset prints its sparse warnings
   // as plain errors (no porcelain messages)
   const sparse = await SparseUnpack.start(ctx);
-  const done = await resetKeepWith(ctx, headId, targetId, label, sparse);
+  const done = await resetKeepWith(ctx, headId, targetId, label, sparse, submodules);
   if (done.refused) return done.refused;
   if (sparse) {
     const outcome = await sparse.finish(ctx, { written: done.written });
@@ -412,8 +506,13 @@ async function resetKeepWith(
   targetId: ObjectId,
   label: string,
   sparse: SparseUnpack | undefined,
+  subs: SubmoduleUnpack | undefined,
 ): Promise<{ refused?: MergeRefusal; written: Set<string> }> {
   const refusedWith = (refused: MergeRefusal) => ({ refused, written: new Set<string>() });
+  const subRefusal = (path: string, notUptodateToo: boolean): MergeRefusal => ({
+    message: `${(subs as SubmoduleUnpack).plainRefusal(path, notUptodateToo)}\nfatal: Could not reset index file to revision '${label}'.`,
+    paths: [],
+  });
   // a path staying outside the sparse checkout: neither checked nor touched in the worktree
   const quiet = (path: string) => sparse?.leavesAlone(path) === true;
   const head = await flatTree(ctx.trees, await ctx.commits.getTree(headId));
@@ -454,6 +553,30 @@ async function resetKeepWith(
         refuse(`Entry '${path}' would be overwritten by merge. Cannot merge.`, path),
       );
     }
+    if (subs && worktree && i && !quiet(path) && i.mode === FileMode.GITLINK) {
+      // a submodule: deleted_entry's verify_absent_if_directory, verify_uptodate, merged_entry
+      if (
+        !t &&
+        (await subs.isSubmodule(path, i)) &&
+        (await subs.exists(path)) &&
+        (await subs.refuses(path, (h ?? i).objectId, null))
+      ) {
+        return refusedWith(subRefusal(path, false));
+      }
+      const refused = await subs.notUptodate(path, i);
+      if (refused) return refusedWith(subRefusal(path, true));
+      if (refused === false) {
+        if (t && t.mode !== FileMode.GITLINK && (await subs.fileReplacesRefuses(path, i))) {
+          return refusedWith(subRefusal(path, false));
+        }
+        if (t && (await subs.mergedRefuses(path, i, t))) {
+          return refusedWith(subRefusal(path, false));
+        }
+        if (!t) removing.add(path);
+        changes.push(path);
+        continue;
+      }
+    }
     if (worktree && i && !quiet(path)) {
       // verify_uptodate_1: an entry whose flags cheat is checked by its stat
       const e = i as StagingEntry;
@@ -466,6 +589,15 @@ async function resetKeepWith(
     if (!t) {
       removing.add(path);
     } else if (worktree && !i && !quiet(path)) {
+      const absent = subs ? await subs.absentRefuses(path, t) : undefined;
+      if (absent) return refusedWith(subRefusal(path, false));
+      if (absent === false) {
+        if (await (subs as SubmoduleUnpack).mergedRefuses(path, undefined, t)) {
+          return refusedWith(subRefusal(path, false));
+        }
+        changes.push(path);
+        continue;
+      }
       const refusal = await verifyAbsent(worktree, path, t, index, removing, {
         hard: false,
         tracked: (p) => index.has(p),
@@ -477,6 +609,9 @@ async function resetKeepWith(
         caseVariants,
       });
       if (refusal) return refusedWith(refusal);
+    }
+    if (subs && t && worktree && !quiet(path) && (await subs.mergedRefuses(path, i, t))) {
+      return refusedWith(subRefusal(path, false));
     }
     changes.push(path);
   }
@@ -496,6 +631,12 @@ async function resetKeepWith(
     }
     for (const path of removing) {
       if (quiet(path)) continue;
+      const old = index.get(path);
+      if (subs && old?.mode === FileMode.GITLINK) {
+        await subs.unlink(worktree, path, old);
+        await pruneEmptyParents(worktree, path);
+        continue;
+      }
       const entry = await worktree.getEntry(path);
       if (entry && !entry.isDirectory) {
         await worktree.remove(path);
@@ -505,6 +646,14 @@ async function resetKeepWith(
     // core.ignorecase: what verify_clean_subdirectory took as tracked in a directory a file
     // replaces goes with the directory (checkout_entry removes the subtree)
     await removeCaseVariants(worktree, caseVariants);
+    if (subs) {
+      for (const path of writing) {
+        const old = index.get(path);
+        if (old?.mode === FileMode.GITLINK && target.get(path)?.mode !== FileMode.GITLINK) {
+          await subs.removeForFile(worktree, path, old);
+        }
+      }
+    }
     if (writing.size > 0) {
       const plan = await planPathsRestore(ctx, target, targetTree, writing, "reset");
       await writeTreeRestorePlan(worktree, ctx.blobs, plan, "reset", {
@@ -512,6 +661,14 @@ async function resetKeepWith(
         gitlinks: true,
         replaceInTheWay: true,
       });
+    }
+    if (subs) {
+      // check_updates: `.gitmodules` read again, then the submodules checked out
+      subs.reload();
+      for (const path of [...writing].sort(compareBytes)) {
+        const t = target.get(path);
+        if (t?.mode === FileMode.GITLINK) await subs.checkout(worktree, path, t);
+      }
     }
   }
   // the index is the commit's tree: an entry that holds it already keeps its stat, a file

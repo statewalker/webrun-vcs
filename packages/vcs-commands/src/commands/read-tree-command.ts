@@ -30,6 +30,7 @@ import {
 } from "./merge-support.js";
 import { resetMerge } from "./sequencer-support.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
+import { recursesIntoSubmodules, SubmoduleUnpack } from "./submodule-unpack.js";
 import { restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import {
   type CheckedEntry,
@@ -89,6 +90,9 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
   private trivial = false;
   private aggressive = false;
   private skipSparseCheckout = false;
+  private recurseSubmodules?: boolean;
+  private dryRun = false;
+  private superPrefix = "";
 
   /** A tree-ish to read (up to eight). */
   addTree(treeish: string): this {
@@ -162,6 +166,30 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
     return this;
   }
 
+  /**
+   * `--[no-]recurse-submodules` (default `submodule.recurse`): the active submodules' worktrees
+   * are checked and moved with the superproject's (unpack-trees' `check_submodule_move_head`,
+   * entry.c's `submodule_move_head`).
+   */
+  setRecurseSubmodules(recurse: boolean): this {
+    this.checkCallable();
+    this.recurseSubmodules = recurse;
+    return this;
+  }
+
+  /** `-n` / `--dry-run`: everything checked, neither the index nor the worktree written. */
+  setDryRun(dryRun: boolean): this {
+    this.checkCallable();
+    this.dryRun = dryRun;
+    return this;
+  }
+
+  /** @internal git's `--super-prefix`: the submodule's path in its superproject, in messages. */
+  setSuperPrefix(prefix: string): this {
+    this.superPrefix = prefix;
+    return this;
+  }
+
   /** `--no-sparse-checkout`: the sparse-checkout patterns are not applied. */
   setSkipSparseCheckout(skip: boolean): this {
     this.checkCallable();
@@ -172,6 +200,18 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
   async call(): Promise<ReadTreeResult> {
     // a tree entry the decoder refuses (`..`, `/` in a name, an empty name): git's message
     const trees: ObjectId[] = [];
+    if (this.dryRun) {
+      // -n: nothing the run changed in memory outlives it
+      try {
+        return await this.callChecked(trees);
+      } finally {
+        await this.staging.read();
+      }
+    }
+    return this.callChecked(trees);
+  }
+
+  private callChecked(trees: ObjectId[]): Promise<ReadTreeResult> {
     return withTreePathRefusal(
       this.trees,
       () => trees,
@@ -252,8 +292,26 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       sparseWarnings: result.warnings,
     };
     const refused = (message: string | undefined, paths: string[] = []) => {
-      if (message) throw new ReadTreeFailedError(message, paths);
+      if (!message) return;
+      // --super-prefix: the paths as the superproject names them
+      let text = message;
+      if (this.superPrefix) {
+        for (const p of new Set(paths)) {
+          text = text.split(`'${p}'`).join(`'${this.superPrefix}${p}'`);
+        }
+      }
+      throw new ReadTreeFailedError(text, paths);
     };
+    // unpack-trees' submodule support (only for the merges that update or check the worktree)
+    const submodules =
+      merge && !prefixSet && treeIds.length <= 2 && !this.indexOnly
+        ? await SubmoduleUnpack.start(this.workingCopy, {
+            recurse: recursesIntoSubmodules(this.workingCopy, this.recurseSubmodules),
+            reset: this.reset,
+            superPrefix: this.superPrefix,
+          })
+        : undefined;
+    const update = this.update && !this.dryRun;
 
     if (!merge) {
       await this.readWithoutMerge(treeIds);
@@ -264,7 +322,9 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
       const tree = treeIds[0] as ObjectId;
       const refusal = await resetMerge(sequencerCtx, tree, tree, {
         hard: this.reset,
-        update: this.update,
+        update,
+        submodules,
+        ...(this.dryRun ? { writeIndex: false } : {}),
         overwriteUntracked: this.reset,
         skipSparseCheckout: this.skipSparseCheckout,
         targetTree: tree,
@@ -280,7 +340,9 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
         {
           action: "merge",
           operation: "read-tree",
-          update: this.update,
+          update,
+          submodules,
+          ...(this.dryRun ? { writeIndex: false } : {}),
           skipSparseCheckout: this.skipSparseCheckout,
           plainErrors: true,
           initialCheckout: await isIndexUnborn(this.staging),
@@ -293,6 +355,7 @@ export class ReadTreeCommand extends GitCommand<ReadTreeResult> {
 
     // read-tree starts from no cache-tree and resolve-undo (cache_tree_free,
     // resolve_undo_clear_index); one tree read whole primes it
+    if (this.dryRun) return result;
     this.staging.clearResolveUndo?.();
     if (treeIds.length === 1 && !prefixSet) {
       this.staging.setCacheTree?.(await cacheTreeOfTree(this.trees, treeIds[0] as ObjectId));

@@ -53,6 +53,7 @@ import { markIndexUpdate } from "./post-index-change.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { moveHeadAsReset, removeBranchState, resetKeep, resetMerge } from "./sequencer-support.js";
 import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
+import { recursesIntoSubmodules, SubmoduleUnpack } from "./submodule-unpack.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import { flaggedEntryDiffers, pruneEmptyParents } from "./worktree-overwrite-checks.js";
 import { treePathRefusal, worktreePathRules } from "./worktree-path-rules.js";
@@ -95,6 +96,7 @@ const RESET_HARD = "reset --hard";
 export class ResetCommand extends GitCommand<Ref> {
   private ref?: string;
   private mode = ResetMode.MIXED;
+  private recurseSubmodules?: boolean;
   private paths: string[] = [];
   /** `--pathspec-from-file` */
   private readonly pathspecFile = new PathspecFile();
@@ -242,6 +244,18 @@ export class ResetCommand extends GitCommand<Ref> {
    *
    * @param mode Reset mode
    */
+  /**
+   * `--[no-]recurse-submodules` (default `submodule.recurse`): `--hard`, `--keep` and
+   * `--merge` reset the active submodules' worktrees too, their HEADs detached at the recorded
+   * commits (unpack-trees' submodule support); local changes in them refuse `--keep` and
+   * `--merge` as git refuses them.
+   */
+  setRecurseSubmodules(recurse: boolean): this {
+    this.checkCallable();
+    this.recurseSubmodules = recurse;
+    return this;
+  }
+
   setMode(mode: ResetMode): this {
     this.checkCallable();
     this.mode = mode;
@@ -383,6 +397,14 @@ export class ResetCommand extends GitCommand<Ref> {
       }
       if (refusal) throw refusal;
     }
+    // --recurse-submodules: unpack-trees' submodule checks and moves (--hard: o->reset)
+    const submodules =
+      this.worktreeAccess && this.mode !== ResetMode.SOFT && this.mode !== ResetMode.MIXED
+        ? await SubmoduleUnpack.start(this.workingCopy, {
+            recurse: recursesIntoSubmodules(this.workingCopy, this.recurseSubmodules),
+            reset: this.mode === ResetMode.HARD,
+          })
+        : undefined;
     // --merge and --keep: the index and worktree first, refused before anything changes
     if (this.mode === ResetMode.MERGE || this.mode === ResetMode.KEEP) {
       const ctx = {
@@ -397,8 +419,8 @@ export class ResetCommand extends GitCommand<Ref> {
       };
       const refused =
         this.mode === ResetMode.MERGE
-          ? await resetMerge(ctx, targetId, targetRef)
-          : await resetKeep(ctx, headId ?? targetId, targetId, targetRef);
+          ? await resetMerge(ctx, targetId, targetRef, { submodules })
+          : await resetKeep(ctx, headId ?? targetId, targetId, targetRef, submodules);
       if (refused) throw new ResetRefusedError(refused.message, refused.paths);
     }
 
@@ -434,6 +456,28 @@ export class ResetCommand extends GitCommand<Ref> {
             `error: Entry '${flagged.refused}' not uptodate. Cannot merge.\n` +
               `fatal: Could not reset index file to revision '${targetRef}'.`,
             [flagged.refused],
+          );
+        }
+      }
+    }
+
+    // --hard --recurse-submodules: oneway_merge's merged_entry checks each submodule the
+    // reset moves (a forced dry run: the commit must be there to check out)
+    const oldIndex = new Map<string, { objectId: ObjectId; mode: number }>();
+    if (submodules && this.mode === ResetMode.HARD) {
+      for await (const entry of this.staging.entries()) {
+        if (entry.stage === 0) oldIndex.set(entry.path, entry);
+      }
+      const commit = await this.commits.load(targetId);
+      const target = commit ? await flatTree(this.trees, commit.tree) : new Map();
+      for (const [path, t] of target) {
+        if (t.mode !== FileMode.GITLINK || sparse?.leavesAlone(path)) continue;
+        const i = oldIndex.get(path);
+        if (i && i.mode === t.mode && i.objectId === t.objectId) continue;
+        if (await submodules.mergedRefuses(path, i, t)) {
+          throw new ResetRefusedError(
+            `${submodules.plainRefusal(path, false)}\nfatal: Could not reset index file to revision '${targetRef}'.`,
+            [path],
           );
         }
       }
@@ -478,6 +522,7 @@ export class ResetCommand extends GitCommand<Ref> {
         trackedBefore ?? new Set(),
         flagged?.keptOut,
         sparse,
+        submodules && { unpack: submodules, oldIndex },
       );
       // check_updates: the entries written carry the stat of their new files
       if (this.worktreeAccess && written.size > 0) {
@@ -774,6 +819,7 @@ export class ResetCommand extends GitCommand<Ref> {
     trackedBefore: Set<string>,
     keptOut?: ReadonlySet<string>,
     sparse?: SparseUnpack,
+    submodules?: HardResetSubmodules,
   ): Promise<Set<string>> {
     const worktree = this.worktreeAccess;
     if (!worktree) {
@@ -791,6 +837,7 @@ export class ResetCommand extends GitCommand<Ref> {
       trackedBefore,
       keptOut,
       sparse,
+      submodules,
     );
   }
 
@@ -886,8 +933,14 @@ export async function restoreWorktreeHard(
   trackedBefore: Set<string>,
   keptOut?: ReadonlySet<string>,
   sparse?: SparseUnpack,
+  submodules?: HardResetSubmodules,
 ): Promise<Set<string>> {
   const { trees, blobs, workingCopy, worktree } = deps;
+  const subs = submodules?.unpack;
+  const oldGitlink = (path: string) => {
+    const old = submodules?.oldIndex.get(path);
+    return old?.mode === FileMode.GITLINK ? old : undefined;
+  };
   // Plan the whole restore first. Anything unrestorable then fails while the
   // working tree is still untouched, instead of half-way through rewriting it.
   const fullPlan = await planTreeRestore(trees, blobs, treeId, RESET_HARD, {
@@ -931,8 +984,17 @@ export async function restoreWorktreeHard(
   // keeps its file.
   for (const path of trackedBefore) {
     if (plan.paths.has(path) || sparse?.leavesAlone(path)) continue;
-    await worktree.remove(path);
+    const old = oldGitlink(path);
+    if (subs && old) await subs.unlink(worktree, path, old);
+    else await worktree.remove(path);
     await pruneEmptyParents(worktree, path);
+  }
+  // a file replacing a submodule: its directory goes (checkout_entry's remove_subtree)
+  if (subs) {
+    for (const e of plan.entries) {
+      const old = oldGitlink(e.path);
+      if (old) await subs.removeForFile(worktree, e.path, old);
+    }
   }
 
   // a forced checkout: a file or link where a directory must go is unlinked, never
@@ -943,7 +1005,20 @@ export async function restoreWorktreeHard(
     // git's reset --hard overwrites untracked files (UNPACK_RESET_OVERWRITE_UNTRACKED)
     discardUntracked: true,
   });
+  if (subs) {
+    // check_updates: `.gitmodules` read again, then every submodule checked out (oneway_merge
+    // marks each gitlink for update under a reset)
+    subs.reload();
+    for (const e of plan.gitlinks) await subs.checkout(worktree, e.path, e);
+  }
   return new Set([...plan.entries, ...plan.gitlinks].map((e) => e.path));
+}
+
+/** The submodule handling of a hard reset's worktree half: the run, and the index it left. */
+export interface HardResetSubmodules {
+  unpack: SubmoduleUnpack;
+  /** The stage-0 entries of the index before the reset */
+  oldIndex: ReadonlyMap<string, { objectId: ObjectId; mode: number }>;
 }
 
 /**

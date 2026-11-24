@@ -96,6 +96,7 @@ import { pushSparseWarnings, SparseUnpack } from "./sparse-checkout-support.js";
 import { StashApplyCommand } from "./stash-apply-command.js";
 import { StashCreateCommand } from "./stash-create-command.js";
 import { STASH_REF } from "./stash-list-command.js";
+import { recursesIntoSubmodules, SubmoduleUnpack } from "./submodule-unpack.js";
 import { planTreeRestore, restoreCaseOptions, writeTreeRestorePlan } from "./tree-restore.js";
 import {
   entryNotUptodate,
@@ -293,6 +294,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private conflictStyle?: ConflictStyle;
   private quiet = false;
   private countCheckoutPaths = false;
+  private recurseSubmodules?: boolean;
   /** `--pathspec-from-file` */
   private readonly pathspecFile = new PathspecFile();
   /** Set by a `merge` checkout the two-way merge refused: what the autostash needs */
@@ -643,6 +645,17 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   }
 
   /** `-q`: a path checkout reports no counts and no "path is unmerged" warnings. */
+  /**
+   * `--[no-]recurse-submodules` (default `submodule.recurse`): the active submodules' worktrees
+   * are switched with the superproject's, their HEADs detached at the recorded commits, and
+   * local changes in them refuse the switch as git's unpack-trees refuses them.
+   */
+  setRecurseSubmodules(recurse: boolean): this {
+    this.checkCallable();
+    this.recurseSubmodules = recurse;
+    return this;
+  }
+
   setQuiet(quiet: boolean): this {
     this.checkCallable();
     this.quiet = quiet;
@@ -1021,6 +1034,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     if (this.startPoint !== undefined) copy.setStartPoint(this.startPoint);
     if (this.guess !== undefined) copy.setGuess(this.guess);
     if (this.hasReflogAction()) copy.setReflogAction(this.reflogAction("checkout"));
+    if (this.recurseSubmodules !== undefined) copy.setRecurseSubmodules(this.recurseSubmodules);
     return copy;
   }
 
@@ -1059,6 +1073,9 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       quiet: this.quiet,
       countCheckoutPaths: this.countCheckoutPaths,
       globalMagic: this.globalPathspecMagic(),
+      ...(this.recurseSubmodules !== undefined
+        ? { recurseSubmodules: this.recurseSubmodules }
+        : {}),
     });
     return pathCheckoutResult(outcome);
   }
@@ -1171,6 +1188,15 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     });
     const quiet = (path: string) => sparse?.leavesAlone(path) === true;
     const writes = (path: string) => !sparse || sparse.writes(path);
+    // --recurse-submodules: unpack-trees' submodule checks and moves (forced: o->reset)
+    const subs = this.worktreeAccess
+      ? await SubmoduleUnpack.start(this.workingCopy, {
+          recurse: recursesIntoSubmodules(this.workingCopy, this.recurseSubmodules),
+          reset: this.force,
+        })
+      : undefined;
+    /** New submodules whose checks replace the untracked-file checks (verify_absent_1) */
+    const submodulePaths = new Set<string>();
 
     // git's two-way merge (unpack-trees `twoway_merge`, checkout without -f): a path HEAD
     // and the target agree on keeps its index entry and worktree file as they are (local
@@ -1230,6 +1256,11 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       const h = head.get(path);
       const t = target.get(path);
       if (initial && t) {
+        if (subs && !quiet(path)) {
+          const absent = await subs.absentRefuses(path, t);
+          if (absent !== undefined) submodulePaths.add(path);
+          if (!absent) await subs.mergedRefuses(path, index.get(path), t);
+        }
         switched.push(path);
         continue;
       }
@@ -1242,6 +1273,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           continue;
         }
         if (quiet(path)) continue;
+        // merged_entry's submodule check (FORCE): the submodule must be able to move
+        if (subs && t && !sameSide(i, t)) await subs.mergedRefuses(path, i, t);
         if (!sameSide(i, t) || t) switched.push(path);
         continue;
       }
@@ -1258,6 +1291,29 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         if (i !== undefined || t !== undefined) local.push(path);
         continue;
       }
+      if (subs && worktree && !quiet(path)) {
+        if (i !== undefined && i.mode === FileMode.GITLINK) {
+          // deleted_entry's verify_absent_if_directory of the submodule going away
+          if (!t && (await subs.isSubmodule(path, i)) && (await subs.exists(path))) {
+            await subs.refuses(path, (h ?? i).objectId, null);
+          }
+          const refused = await subs.notUptodate(path, i);
+          if (refused) {
+            local.push(path);
+            continue;
+          }
+          if (refused === false) {
+            if (t && t.mode !== FileMode.GITLINK) await subs.fileReplacesRefuses(path, i);
+            if (t) await subs.mergedRefuses(path, i, t);
+            switched.push(path);
+            continue;
+          }
+        } else if (i === undefined && t) {
+          const absent = await subs.absentRefuses(path, t);
+          if (absent !== undefined) submodulePaths.add(path);
+          if (!absent) await subs.mergedRefuses(path, undefined, t);
+        }
+      }
       if (
         i !== undefined &&
         worktree &&
@@ -1267,6 +1323,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         local.push(path);
         continue;
       }
+      if (subs && i !== undefined && t && !quiet(path)) await subs.mergedRefuses(path, i, t);
       switched.push(path);
     }
 
@@ -1275,7 +1332,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // component, untracked files in a directory a file replaces
     if (worktree && !this.force) {
       const found = await findInTheWay(worktree, {
-        writes: switched.filter((p) => target.has(p) && writes(p)),
+        writes: switched.filter((p) => target.has(p) && writes(p) && !submodulePaths.has(p)),
         removes: new Set(switched.filter((p) => !target.has(p))),
         index,
         ...(await restoreCaseOptions(worktree, ignoreCase)),
@@ -1366,20 +1423,29 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           : await this.abbreviateObjectId(headId),
       };
     }
-    if (local.length + untracked.length + untrackedRemoved.length + lostDirs.length > 0) {
-      const message = overwriteMessage("checkout", {
-        local,
-        lostDirs,
-        untracked,
-        untrackedRemoved,
-      });
+    const submodules = subs?.rejected ?? [];
+    if (
+      local.length + untracked.length + untrackedRemoved.length + lostDirs.length > 0 ||
+      submodules.length > 0
+    ) {
+      // a forced switch runs unpack-trees without porcelain messages (reset_tree)
+      const message =
+        this.force && subs
+          ? subs.refusalLines(true).join("\n")
+          : overwriteMessage("checkout", {
+              local,
+              lostDirs,
+              untracked,
+              untrackedRemoved,
+              submodules,
+            });
       return {
         status: CheckoutStatus.CONFLICTS,
         updated: [],
         removed: [],
-        conflicts: [...local, ...lostDirs, ...untracked, ...untrackedRemoved],
+        conflicts: [...local, ...lostDirs, ...untracked, ...untrackedRemoved, ...submodules],
         ref: null,
-        message,
+        message: `${subs?.printed() ?? ""}${message ?? ""}`,
       };
     }
 
@@ -1411,7 +1477,9 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       }
       for (const path of switched) {
         if (target.has(path) || quiet(path)) continue;
-        await worktree.remove(path);
+        const old = index.get(path);
+        if (subs && old?.mode === FileMode.GITLINK) await subs.unlink(worktree, path, old);
+        else await worktree.remove(path);
         await pruneEmptyParents(worktree, path);
         removed.push(path);
       }
@@ -1425,8 +1493,20 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       if (this.force) {
         for (const path of index.keys()) {
           if (!target.has(path) && !switching.has(path) && !quiet(path)) {
-            await worktree.remove(path);
+            const old = index.get(path);
+            if (subs && old?.mode === FileMode.GITLINK) await subs.unlink(worktree, path, old);
+            else await worktree.remove(path);
             removed.push(path);
+          }
+        }
+      }
+      // a file replacing a submodule: its directory goes (checkout_entry's remove_subtree)
+      if (subs) {
+        for (const path of switched) {
+          const old = index.get(path);
+          const t = target.get(path);
+          if (old?.mode === FileMode.GITLINK && t && t.mode !== FileMode.GITLINK && writes(path)) {
+            await subs.removeForFile(worktree, path, old);
           }
         }
       }
@@ -1458,6 +1538,11 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         });
         updated.push(...only.entries.map((e) => e.path));
         for (const e of [...only.entries, ...only.gitlinks]) written.add(e.path);
+        if (subs) {
+          // check_updates: `.gitmodules` read again, then the submodules checked out
+          subs.reload();
+          for (const e of only.gitlinks) await subs.checkout(worktree, e.path, e);
+        }
       }
     }
 

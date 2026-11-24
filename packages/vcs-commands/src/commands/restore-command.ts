@@ -69,6 +69,7 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
   private patchSelector?: PatchSelector;
   private patchOptions: PatchOptions = {};
   private patchCompatibility: PatchCompatibility = "2.56";
+  private recurseSubmodules?: boolean;
 
   /**
    * `git restore -p`: the differences between the source and the worktree (with
@@ -196,6 +197,17 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
   }
 
   /** `--source=<tree-ish>`: restore from it (default: the index, or HEAD with `--staged`). */
+  /**
+   * `--[no-]recurse-submodules` (default `submodule.recurse`): a restored submodule's worktree
+   * is checked out at the recorded commit too (its local changes discarded), its HEAD detached
+   * there, as entry.c's `checkout_entry` moves it.
+   */
+  setRecurseSubmodules(recurse: boolean): this {
+    this.checkCallable();
+    this.recurseSubmodules = recurse;
+    return this;
+  }
+
   setSource(source: string): this {
     this.checkCallable();
     this.source = source;
@@ -295,6 +307,9 @@ export class RestoreCommand extends GitCommand<CheckoutResult> {
           {
             command: "restore",
             paths: [...this.pathspecFile.elements, ...this.paths],
+            ...(this.recurseSubmodules !== undefined
+              ? { recurseSubmodules: this.recurseSubmodules }
+              : {}),
             ...(this.source !== undefined ? { source: this.source } : {}),
             ...(this.staged !== undefined ? { staged: this.staged } : {}),
             ...(this.worktree !== undefined ? { worktree: this.worktree } : {}),

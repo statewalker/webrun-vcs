@@ -63,6 +63,7 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
   private ignoreOtherWorktrees = false;
   private merge = false;
   private compatibility: "2.43" | "2.56" = "2.56";
+  private recurseSubmodules?: boolean;
 
   /**
    * The branch to switch to; with `-c`/`-C` the start point, with `--detach` the commit.
@@ -187,6 +188,13 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
   }
 
   /** `--ignore-other-worktrees`: switch to a branch another worktree has checked out. */
+  /** `--[no-]recurse-submodules` (default `submodule.recurse`): see `CheckoutCommand`. */
+  setRecurseSubmodules(recurse: boolean): this {
+    this.checkCallable();
+    this.recurseSubmodules = recurse;
+    return this;
+  }
+
   setIgnoreOtherWorktrees(ignore: boolean): this {
     this.checkCallable();
     this.ignoreOtherWorktrees = ignore;
@@ -286,6 +294,7 @@ export class SwitchCommand extends GitCommand<CheckoutResult> {
       .setAdviceCommand("switch")
       .setOnlyMergeOnSwitchingBranches(true);
     if (this.guess !== undefined) checkout.setGuess(this.guess);
+    if (this.recurseSubmodules !== undefined) checkout.setRecurseSubmodules(this.recurseSubmodules);
     if (this.hasReflogAction()) checkout.setReflogAction(this.reflogAction("checkout"));
     if (this.orphan !== undefined) {
       checkout.setOrphan(true).setOrphanFromEmptyTree(true).setName(this.orphan);
