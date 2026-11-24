@@ -5,7 +5,7 @@
  */
 
 import { afterEach, describe, expect, it } from "vitest";
-
+import type { BlameResult } from "../src/index.js";
 import { addFile, backends, createInitializedGitFromFactory } from "./test-helper.js";
 
 describe.each(backends)("BlameCommand ($name backend)", ({ factory }) => {
@@ -1214,6 +1214,55 @@ describe.each(backends)("BlameCommand ($name backend)", ({ factory }) => {
       expect(tracking[1].commitId).toBe(commit1Id);
       expect(tracking[1].sourcePath).toBe("file1.txt");
       expect(tracking[1].sourceLine).toBe(2);
+    });
+  });
+
+  describe("moves and copies (-M, -C)", () => {
+    const block = "alpha function one();\nbeta function two();\ngamma function three();\n";
+
+    it("finds a block moved within the file only with -M", async () => {
+      const { git, workingCopy } = await createInitializedGit();
+      const rest = "delta line four;\nepsilon line five;\nzeta line six;\neta line seven;\n";
+      await addFile(workingCopy, "f.c", `${block}${rest}`);
+      await git.commit().setMessage("first").call();
+      await addFile(workingCopy, "f.c", `${rest}${block}`);
+      await git.commit().setMessage("move").call();
+
+      const subject = (r: BlameResult, line: number) => r.getSourceCommit(line)?.message.trim();
+      const plain = await git.blame().setFilePath("f.c").call();
+      expect(subject(plain, 5)).toBe("move");
+      const moves = await git.blame().setFilePath("f.c").setDetectMoves(true).call();
+      for (const line of [1, 5, 6, 7]) expect(subject(moves, line)).toBe("first");
+    });
+
+    it("finds lines copied from another file with -C, and from an unchanged one with -C -C", async () => {
+      const { git, workingCopy } = await createInitializedGit();
+      await addFile(workingCopy, "a.c", block);
+      await addFile(workingCopy, "b.c", "unrelated content here;\n");
+      await git.commit().setMessage("first").call();
+      // the block copied from a.c (unchanged) and b.c changed
+      await addFile(workingCopy, "b.c", `unrelated content here;\n${block}`);
+      await git.commit().setMessage("copy").call();
+
+      const one = await git.blame().setFilePath("b.c").setDetectCopies(1).call();
+      expect(one.getSourceCommit(2)?.message.trim()).toBe("copy");
+      const all = await git.blame().setFilePath("b.c").setDetectCopies(3).call();
+      expect(all.getSourcePath(2)).toBe("a.c");
+      expect(all.getSourceCommit(2)?.message.trim()).toBe("first");
+      expect(all.getSourceLine(4)).toBe(3);
+    });
+
+    it("keeps blocks with no more alphanumerics than the score", async () => {
+      const { git, workingCopy } = await createInitializedGit();
+      await addFile(workingCopy, "f.c", "ab\ncd\nxyz\n");
+      await git.commit().setMessage("first").call();
+      await addFile(workingCopy, "f.c", "xyz\nab\ncd\n");
+      await git.commit().setMessage("move").call();
+      // "xyz" scores 4: only a score below that moves it
+      const strict = await git.blame().setFilePath("f.c").setDetectMoves(true).call();
+      expect(strict.getSourceCommit(1)?.message.trim()).toBe("move");
+      const loose = await git.blame().setFilePath("f.c").setDetectMoves(true, 3).call();
+      expect(loose.getSourceCommit(1)?.message.trim()).toBe("first");
     });
   });
 });
