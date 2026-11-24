@@ -412,6 +412,12 @@ export interface SigningOutcome {
    * adds no tail of its own
    */
   died?: boolean;
+  /**
+   * The ssh signing program's exit status when it ran and exited non-zero. git 2.43's
+   * `sign_buffer_ssh` returns that status (2.44+ returns -1), which its `tag -s` takes for
+   * success: the error is printed and the tag written unsigned
+   */
+  exitCode?: number;
 }
 
 /** Signs a payload as git's signing programs do (see {@link SigningRequest}). */

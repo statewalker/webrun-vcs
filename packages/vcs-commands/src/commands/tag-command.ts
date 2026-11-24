@@ -1,5 +1,10 @@
 import type { AnnotatedTag, ObjectId, PersonIdent, Ref } from "@statewalker/vcs-core";
-import { compareRefNames, isValidTagName, ObjectType } from "@statewalker/vcs-core";
+import {
+  collectTagBytes,
+  compareRefNames,
+  isValidTagName,
+  ObjectType,
+} from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 
@@ -28,8 +33,9 @@ import {
   RefKind,
   RefListingCommand,
   type RefSortKey,
+  signatureStart,
 } from "./ref-filter/index.js";
-import { SIGNING_FAILED_LINES, SigningFailedError } from "./signing.js";
+import { SigningFailedError, signPayload } from "./signing.js";
 import {
   amendWithTrailers,
   type TrailerCommandRunner,
@@ -273,9 +279,17 @@ export class TagCommand extends GitCommand<Ref> {
    * undefined (the default) leaves it to `tag.gpgSign`, and `tag.forceSignAnnotated` signs
    * a tag with a message not made with {@link setAnnotated}, as git's does.
    *
-   * Not signed yet: a tag asked to be signed fails as git fails when gpg cannot sign
+   * The tag object is signed through the host's signer (`GitHostEnvironment.signer`) as
+   * builtin/tag.c's `do_sign` signs it: `gpg.format`, the `-u` key, else `user.signingKey`,
+   * else `gpg.ssh.defaultKeyCommand` (ssh) or the committer (openpgp, x509), the signature
+   * appended to the message. Without a signer, or when signing fails, it fails as git
    * (`error: gpg failed to sign the data:`, `error: unable to sign the tag`, exit 128:
    * {@link SigningFailedError}), and neither a tag object nor a ref is written.
+   *
+   * @example
+   * ```typescript
+   * await git.tag().setName("v1.0").setMessage("Release").setSigned(true).call();
+   * ```
    *
    * @param signed Whether to sign
    */
@@ -487,8 +501,17 @@ export class TagCommand extends GitCommand<Ref> {
         message,
       };
 
-      // build_tag_object signs before writing: no signer, git's failure (exit(128))
-      if (sign) throw await this.tagSigningFailed();
+      // build_tag_object signs before writing (do_sign): the signature appended to the tag
+      // object, so to its message
+      if (sign) {
+        const signature = await this.signTag(
+          await collectTagBytes(tag),
+          tagger,
+          compatibility,
+          warnings,
+        );
+        if (signature) tag.message = `${message}${new TextDecoder().decode(signature)}`;
+      }
       tagObjectId = await this.tagsStore.storeTag(tag);
     } else {
       // Lightweight tag - just point to the object
@@ -596,15 +619,28 @@ export class TagCommand extends GitCommand<Ref> {
   private async tagBody(prev: ObjectId): Promise<string> {
     if ((await this.revisionResolver().objectType(prev)) !== "tag") return "";
     const tag = await this.tagsStore?.loadTag(prev).catch(() => undefined);
-    return tag?.message ?? "";
+    // parse_signature: the payload before a trailing signature
+    const message = tag?.message ?? "";
+    return message.slice(0, signatureStart(message));
   }
 
   /**
-   * git's failure to sign a tag (create_tag): gpg's error, `error: unable to sign the tag`,
-   * and where the message was left (`TAG_EDITMSG` in the git directory, named as git names
-   * it from the top of the worktree: `.git/TAG_EDITMSG`), exit 128.
+   * builtin/tag.c's `do_sign`: `payload` (the tag object without a signature) signed with the
+   * `-u` key, else `user.signingKey`, else the format's default (`get_signing_key`: ssh's
+   * `gpg.ssh.defaultKeyCommand`, openpgp's and x509's the committer as `Name <email>`), the
+   * program run in the worktree top. A failure is create_tag's: the signer's lines, `error:
+   * unable to sign the tag` and where the message was left (`TAG_EDITMSG` in the git
+   * directory, named as git names it from the top of the worktree: `.git/TAG_EDITMSG`),
+   * exit 128; a death of the signing (ssh without a key) only its `fatal:` line. Under 2.43
+   * an ssh-keygen that ran and failed leaves the tag unsigned, its error in `warnings`
+   * (undefined returned).
    */
-  private async tagSigningFailed(): Promise<SigningFailedError> {
+  private async signTag(
+    payload: Uint8Array,
+    tagger: PersonIdent,
+    compatibility: "2.43" | "2.56",
+    warnings: string[],
+  ): Promise<Uint8Array | undefined> {
     const gitDir = (await this.hooks.hostGitDir({ real: false }).catch(() => undefined))?.replace(
       /\/+$/,
       "",
@@ -616,15 +652,23 @@ export class TagCommand extends GitCommand<Ref> {
         : top !== undefined && gitDir.startsWith(`${top}/`)
           ? `${gitDir.slice(top.length + 1)}/TAG_EDITMSG`
           : `${gitDir}/TAG_EDITMSG`;
-    return new SigningFailedError(
-      [
-        ...SIGNING_FAILED_LINES,
-        "error: unable to sign the tag",
-        `The tag message has been left in ${path}`,
-      ].join("\n"),
-      this.signingKey ?? "",
-      128,
-    );
+    const cwd = await this.hooks.hostWorkingDirectory().catch(() => undefined);
+    try {
+      return await signPayload(this.workingCopy, this.signingKey ?? "", payload, {
+        committer: tagger,
+        ...(cwd !== undefined ? { cwd } : {}),
+        tail: ["error: unable to sign the tag", `The tag message has been left in ${path}`],
+      });
+    } catch (e) {
+      if (!(e instanceof SigningFailedError)) throw e;
+      // git 2.43's do_sign fails only on a negative return, and its sign_buffer_ssh returns
+      // ssh-keygen's exit status: the error printed, the tag made unsigned
+      if (compatibility === "2.43" && (e.programExitCode ?? 0) > 0) {
+        warnings.push(...(e.signerMessages ?? []));
+        return undefined;
+      }
+      throw new SigningFailedError(e.message, e.signingKey, 128);
+    }
   }
 }
 

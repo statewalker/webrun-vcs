@@ -29,6 +29,7 @@ export interface NodeSigningOutcome {
   signature?: Uint8Array;
   messages?: string[];
   died?: boolean;
+  exitCode?: number;
 }
 
 /** The signer (`Signer`). */
@@ -276,7 +277,11 @@ async function signSsh(
         );
       }
       messages.push(`error: ${stderr}`);
-      return { messages };
+      // the program ran and failed: sign_buffer_ssh's return in git 2.43
+      return {
+        messages,
+        ...(result.startError || result.code < 0 ? {} : { exitCode: result.code }),
+      };
     }
     try {
       const signature = await readFile(`${bufferFile}.sig`);
