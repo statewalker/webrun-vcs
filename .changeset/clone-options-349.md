@@ -1,0 +1,7 @@
+---
+"@statewalker/vcs-commands": minor
+"@statewalker/vcs-transport": minor
+"@statewalker/vcs-store-files": patch
+---
+
+More `git clone` options (statewalker/statewalker-root#349). `CloneCommand.setConfig`/`addConfig` is `-c`/`--config`: the values are written to the new repository's config before anything is fetched, where git's config writer places them, so the fetch and the checkout use them (`url.*.insteadOf`, `protocol.*`, `fetch.fsckObjects`, `core.autocrlf`, and `remote.<name>.fetch` refspecs fetched before the clone's own, whose value is then added after them). The remote's name comes from `clone.defaultRemoteName` unless `setRemote` (`-o`) names it. `setRevision` is git 2.49's `--revision` (HEAD detached at the revision's commit, no ref or fetch refspec written; refused with `--branch`/`--mirror`, and as an unknown option under 2.43 compatibility, `setCompatibility`). `setRejectShallow` is `--[no-]reject-shallow` with `clone.rejectShallow`, for local and fetched sources. `setServerOptions` is `--server-option`, with `remote.<name>.serverOption` (git 2.5x) when none is given; a v0 server fails a clone given options, as git. vcs-transport: `FetchClientOptions.serverOptions` (sent in `ls-refs` and every v2 `fetch`; `lsRefs` takes them too) and `rejectShallow` (`ShallowRemoteRejectedError`); a clone's initial ref transaction is committed even when it writes no ref (git writes an empty `packed-refs`), which vcs-store-files' files ref store now does.

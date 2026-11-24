@@ -1311,7 +1311,8 @@ export function createFilesRefOps(
     requestedAs?: string,
     through: string[] = [],
   ): Promise<BatchResult> => {
-    if (commands.length === 0) {
+    // (an empty initial transaction still writes packed-refs: git's write_remote_refs)
+    if (commands.length === 0 && !batchOptions.initial) {
       const hook = batchOptions.emptyTransaction
         ? (batchOptions.transactionHook ?? options.transactionHook?.())
         : undefined;

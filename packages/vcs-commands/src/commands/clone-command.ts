@@ -1,25 +1,42 @@
 import {
+  compareRefNames,
   type FilesApi,
   historyWithoutLazyFetch,
   isSymbolicRef,
+  isValidRefName,
   type ObjectId,
   parseObjectFilter,
 } from "@statewalker/vcs-core";
-import { computeAlternatePath, HostPaths, hostRootOf } from "@statewalker/vcs-store-files";
+import {
+  CONFIG_REGEX_NONE,
+  computeAlternatePath,
+  GitWorkingCopyConfig,
+  HostPaths,
+  hostRootOf,
+  parseConfigKey,
+  setConfigMultivarText,
+} from "@statewalker/vcs-store-files";
 import {
   createRepositoryFacade,
   createTransportRefStore,
   FetchCheckError,
   fetchFromConnection,
+  mapRefs,
+  missingSources,
   type RefspecResolver,
+  type RemoteRef,
+  refPrefixes,
+  ShallowRemoteRejectedError,
   type FetchOptions as TransportFetchOptions,
 } from "@statewalker/vcs-transport";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import { parseGitInt } from "@statewalker/vcs-utils/encoding";
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { OpenedRepository, WorkingCopy, Worktree } from "@statewalker/vcs-working-tree";
 import {
   CloneCheckoutError,
   CloneDestinationError,
+  GitApiError,
   InvalidArgumentError,
   InvalidRemoteError,
   RefNotFoundError,
@@ -57,6 +74,11 @@ const CLONE_SETTINGS = [
   "noCheckout",
   "sparse",
   "remoteName",
+  "remoteExplicit",
+  "revision",
+  "rejectShallow",
+  "serverOptions",
+  "compatibility",
   "cloneAllBranches",
   "mirror",
   "singleBranch",
@@ -159,6 +181,18 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   private noCheckout = false;
   private sparse = false;
   private remoteName = "origin";
+  /** `-o`/`--origin` given: `clone.defaultRemoteName` is not read */
+  private remoteExplicit = false;
+  /** `-c`/`--config` entries (`key=value`, or `key` for true) */
+  private configEntries: string[] = [];
+  /** `--revision` (git 2.49+) */
+  private revision?: string;
+  /** `--[no-]reject-shallow`; unset: `clone.rejectShallow` */
+  private rejectShallow?: boolean;
+  /** `--server-option` values */
+  private serverOptions: string[] = [];
+  /** The git version reproduced; default the hooks' */
+  private compatibility?: "2.43" | "2.56";
   private cloneAllBranches = true;
   private mirror = false;
   private singleBranch?: boolean;
@@ -325,15 +359,84 @@ export class CloneCommand extends TransportCommand<CloneResult> {
   }
 
   /**
-   * Set the remote name.
+   * Set the remote name (`-o`/`--origin`).
    *
-   * Default is "origin".
+   * Default `clone.defaultRemoteName` (the `-c` values included), else "origin".
    *
    * @param remoteName Remote name
    */
   setRemote(remoteName: string): this {
     this.checkCallable();
     this.remoteName = remoteName;
+    this.remoteExplicit = true;
+    return this;
+  }
+
+  /**
+   * `git clone -c <key>=<value>` (repeatable; `<key>` alone is `true`): each value is added
+   * to the new repository's config before anything is fetched (clone.c's `write_config`), so
+   * the fetch and the checkout use it: `url.<base>.insteadOf`, `protocol.*`,
+   * `fetch.fsckObjects`, `remote.<name>.fetch` (fetched with the clone's own refspec, which
+   * is added after it), `core.autocrlf`, `clone.defaultRemoteName`, `clone.rejectShallow`.
+   * A key git cannot parse fails the clone before any is written.
+   *
+   * @example
+   * ```ts
+   * await git.clone().setURI(url).setConfig(["core.autocrlf=true", "remote.origin.fetch=+refs/pull/*:refs/pull/*"]).call();
+   * ```
+   */
+  setConfig(entries: string[]): this {
+    this.checkCallable();
+    this.configEntries = [...entries];
+    return this;
+  }
+
+  /** Adds one `-c <key>=<value>` entry (see {@link setConfig}). */
+  addConfig(entry: string): this {
+    this.checkCallable();
+    this.configEntries.push(entry);
+    return this;
+  }
+
+  /**
+   * `git clone --revision=<rev>` (git 2.49+): fetch the history of one ref or commit id and
+   * detach HEAD at its commit (a tag peeled); no ref is written for it, no
+   * `remote.<name>.fetch` is configured and no tag is followed. A ref name is looked up as
+   * `git fetch` looks up a refspec's source; a commit id must be complete. Refused with
+   * `--branch` and `--mirror`, and as an unknown option under 2.43 compatibility.
+   */
+  setRevision(revision: string): this {
+    this.checkCallable();
+    this.revision = revision;
+    return this;
+  }
+
+  /**
+   * `git clone --[no-]reject-shallow`: refuse a shallow source (local or not) with git's
+   * "source repository is shallow, reject to clone."; unset, `clone.rejectShallow` decides.
+   */
+  setRejectShallow(reject: boolean): this {
+    this.checkCallable();
+    this.rejectShallow = reject;
+    return this;
+  }
+
+  /**
+   * `git clone --server-option=<option>` (repeatable): sent to the server with each protocol
+   * v2 request; they replace `remote.<name>.serverOption` (git 2.5x), which is used without
+   * them. A server speaking v0 fails the clone when options were given here (git's "server
+   * options require protocol version 2 or later"); configured ones are then dropped.
+   */
+  setServerOptions(options: string[]): this {
+    this.checkCallable();
+    this.serverOptions = [...options];
+    return this;
+  }
+
+  /** The git version reproduced (default the hook runner's, else 2.56). */
+  setCompatibility(compatibility: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = compatibility;
     return this;
   }
 
@@ -649,12 +752,12 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     if (!this.uri) {
       throw new InvalidRemoteError("", "URI must be specified for clone");
     }
-    if (!isValidRemoteName(this.remoteName)) {
-      throw new InvalidArgumentError(
-        "remote",
-        this.remoteName,
-        `'${this.remoteName}' is not a valid remote name`,
-      );
+    const compatibility = this.compatibility ?? this.hooks.compatibility;
+    // parse_options: --revision is unknown to 2.43
+    if (this.revision !== undefined && compatibility === "2.43") {
+      throw new GitApiError(`error: unknown option \`revision=${this.revision}'`, {
+        exitCode: 129,
+      });
     }
 
     // clone.c: the source is a path or a URL before anything else (get_repo_path): an
@@ -675,15 +778,54 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     if (isRepositoryPath) repo = absolutePathOf(worktree, uri);
     else if (uri.includes(":")) repo = uri;
     else throw new TransportError(`fatal: repository '${uri}' does not exist`);
+    // clone.c: a destination that exists and is not empty is refused before anything is
+    // written; here the destination is the working copy, empty once `git init` made it
+    await this.refuseNonEmptyDestination();
+    // write_config: the -c values, after init_db and before anything reads the config (the
+    // remote's name, url.*.insteadOf, protocol.*, the fetch and the checkout)
+    await this.writeCommandLineConfig();
+    const store = RemoteConfigStore.from(this.workingCopy);
+    // git_clone_config re-read: clone.defaultRemoteName, then --origin over it
+    if (!this.remoteExplicit) this.remoteName = store.value("clone.defaultRemoteName") ?? "origin";
+    if (!isValidRemoteName(this.remoteName)) {
+      throw new InvalidArgumentError(
+        "remote",
+        this.remoteName,
+        `'${this.remoteName}' is not a valid remote name`,
+      );
+    }
+    const rejectShallowConfig = store.value("clone.rejectShallow");
+    const rejectShallow =
+      this.rejectShallow ??
+      (rejectShallowConfig === undefined ? false : (parseGitBool(rejectShallowConfig) ?? false));
+    if (this.revision !== undefined) {
+      if (this.branch !== undefined) {
+        throw new GitApiError("fatal: options '--revision' and '--branch' cannot be used together");
+      }
+      if (this.mirror) {
+        throw new GitApiError("fatal: options '--revision' and '--mirror' cannot be used together");
+      }
+      if (!isRevisionRefspec(this.revision)) {
+        throw new GitApiError(`fatal: invalid refspec '${this.revision}'`);
+      }
+    }
+    // transport.c's handshake: --server-option, else remote.<name>.serverOption (2.5x), an
+    // empty value clearing the list
+    let serverOptions = this.serverOptions;
+    if (serverOptions.length === 0 && compatibility !== "2.43") {
+      serverOptions = [];
+      for (const value of store.values(`remote.${this.remoteName}.serverOption`)) {
+        if (value === "") serverOptions.length = 0;
+        else serverOptions.push(value);
+      }
+    }
+
     this.repoUrl = repo;
-    const sourceUrl = RemoteConfigStore.from(this.workingCopy).aliasUrl(repo) ?? repo;
+    const sourceUrl = store.aliasUrl(repo) ?? repo;
     const remote = await this.prepareRemote(sourceUrl);
     const localRemote: OpenedRepository | undefined =
       remote.kind === "local" ? remote.repository : undefined;
-
-    // clone.c: a destination that exists and is not empty is refused before anything is
-    // written; here the destination is the working copy, empty once `git init` made it
-    await this.refuseNonEmptyDestination(localRemote);
+    if (localRemote) await this.refuseSourceAsDestination(localRemote);
 
     // clone.c's is_local: a local repository path (remote.<name>.url as rewritten; never a
     // URL, file:// included), unless --no-local or the source is shallow
@@ -713,6 +855,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         localWarnings.push("warning: --filter is ignored in local clones; use file:// instead.\n");
       }
       if (await sourceIsShallow(localRemote, worktree?.getFiles?.())) {
+        if (rejectShallow) {
+          throw new TransportError("fatal: source repository is shallow, reject to clone.");
+        }
         if (this.local === true) {
           localWarnings.push("warning: source repository is shallow, ignoring --local\n");
         }
@@ -747,6 +892,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       this.bare ? `refs/heads/${branch}` : `refs/remotes/${this.remoteName}/${branch}`;
     // git: a shallow clone is a single-branch clone (of --branch, else the remote HEAD's branch)
     const singleBranch =
+      this.revision === undefined &&
       !this.mirror &&
       (this.singleBranch ??
         (branchesToClone.length > 0 ||
@@ -812,11 +958,58 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     } else {
       refspecs = [`+refs/heads/*:${tracking("*")}`];
     }
-    // git clone takes every tag, unless one branch is cloned (then tags follow) or --no-tags
+    // --revision: the revision alone, as a refspec without destination (no ref written)
+    let revisionRef: { name: string; oid: string } | undefined;
+    if (this.revision !== undefined) {
+      const rev = this.revision;
+      refspecs = {
+        prefixes: FULL_HEX_ID.test(rev) ? [] : refPrefixes([rev]),
+        resolve: (remoteRefs) => {
+          const found = mapRefs(remoteRefs, [rev])[0];
+          if (!found) {
+            throw new RefNotFoundError(
+              rev,
+              `fatal: Remote revision ${rev} not found in upstream ${this.remoteName}`,
+            );
+          }
+          revisionRef = { name: found.remoteRef, oid: found.oid };
+          return [rev];
+        },
+      };
+    }
+    // remote_get_early: the configured remote.<name>.fetch refspecs (the -c values and the
+    // command line's included) come first; a single-branch clone maps them over its one ref
+    const configuredFetch = store.values(`remote.${this.remoteName}.fetch`);
+    if (configuredFetch.length > 0) {
+      const selected =
+        singleBranch && !this.mirror
+          ? (remoteRefs: readonly RemoteRef[]) => {
+              if (branchToClone !== undefined) {
+                return (
+                  remoteRefs.find((r) => r.name === `refs/heads/${branchToClone}` && r.oid) ??
+                  remoteRefs.find((r) => r.name === `refs/tags/${branchToClone}` && r.oid)
+                );
+              }
+              const head = remoteRefs.find((r) => r.name === "HEAD")?.symref;
+              return head ? remoteRefs.find((r) => r.name === head && r.oid) : undefined;
+            }
+          : undefined;
+      // (tags: "all" below maps git's TAG_REFSPEC after them)
+      const allTags =
+        this.revision === undefined &&
+        this.tagOption === TagOption.AUTO_FOLLOW &&
+        !singleBranch &&
+        !this.mirror;
+      refspecs = withConfiguredRefspecs(refspecs, configuredFetch, selected, allTags);
+    }
+    // git clone takes every tag, unless one branch is cloned (then tags follow) or --no-tags;
+    // none with --revision
     const tags =
-      this.tagOption === TagOption.AUTO_FOLLOW && !singleBranch && !this.mirror
-        ? "all"
-        : toTagMode(this.tagOption);
+      this.revision !== undefined
+        ? "none"
+        : this.tagOption === TagOption.AUTO_FOLLOW && !singleBranch && !this.mirror
+          ? "all"
+          : toTagMode(this.tagOption);
 
     // fetch.fsckObjects / transfer.fsckObjects (the clone's own config, `-c` settings included)
     const environment = hostEnvironmentOf(this.workingCopy);
@@ -859,6 +1052,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         ? { filter: this.filterSpec, onWarning: (line: string) => messages.push(`${line}\n`) }
         : {}),
       ...(fsck ? { fsckObjects: fsck } : {}),
+      ...(serverOptions.length > 0 ? { serverOptions } : {}),
+      ...(rejectShallow ? { rejectShallow: true } : {}),
       // git's clone takes the remote's hash: a destination of another one is reopened with it
       // before anything is fetched (cloneReopenedAs)
       onRemoteObjectFormat: (format) => {
@@ -884,9 +1079,19 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     };
     // fetch_if_missing = 0 while the fetch runs: its walks read through the history's view
     // without lazy fetch (the facade above)
-    const result = await withRemoteUploadPack(remote, sessionOptions, (connection) =>
-      fetchFromConnection(connection, fetchOptions),
-    ).catch((error: unknown) => {
+    const result = await withRemoteUploadPack(remote, sessionOptions, (connection) => {
+      // transport.c's die_if_server_options: command-line options need v2
+      if (connection.version !== 2 && this.serverOptions.length > 0) {
+        throw new TransportError(
+          "hint: see protocol.version in 'git help config' for more details\n" +
+            "fatal: server options require protocol version 2 or later",
+        );
+      }
+      return fetchFromConnection(connection, fetchOptions);
+    }).catch((error: unknown) => {
+      if (error instanceof ShallowRemoteRejectedError) {
+        throw new TransportError(`fatal: ${error.message}`);
+      }
       if (!(error instanceof FetchCheckError)) throw error;
       // what was received is refused before any ref is written: index-pack died, or
       // update_remote_refs' check of the refs found history missing (git then removes the
@@ -925,17 +1130,31 @@ export class CloneCommand extends TransportCommand<CloneResult> {
 
     // git's update_remote_refs (before update_head): refs/remotes/<name>/HEAD names the tracking ref of the
     // remote's default branch, when the clone took that branch
-    const remoteHead = advertisedDefaultBranch?.startsWith("refs/heads/")
-      ? toBranchName(advertisedDefaultBranch)
+    const remoteHead =
+      this.revision === undefined && advertisedDefaultBranch?.startsWith("refs/heads/")
+        ? toBranchName(advertisedDefaultBranch)
+        : undefined;
+    // (guess_remote_head over the mapped refs: the first mapping of the remote HEAD's branch,
+    // configured refspecs before the clone's own, whose peer ref HEAD then names)
+    const headMapping = remoteHead
+      ? result.fetched.find((f) => f.remoteRef === advertisedDefaultBranch)
       : undefined;
-    if (!this.bare && remoteHead) {
-      const target = `refs/remotes/${this.remoteName}/${remoteHead}`;
+    if (!this.bare && remoteHead && headMapping?.localRef) {
+      const target = headMapping.localRef;
       if ((await this.refsStore.resolve(target))?.objectId) {
         await this.refsStore.setSymbolic(`refs/remotes/${this.remoteName}/HEAD`, target, cloneLog);
       }
     }
 
-    if (detachedTag) {
+    if (revisionRef) {
+      // update_head with opts->detach: HEAD detached at the revision's commit (a tag peeled,
+      // lookup_commit_or_die), bare or not
+      defaultBranch = toBranchName(advertisedDefaultBranch);
+      const id = await this.revisionCommit(revisionRef, messages);
+      await this.refsStore.set("HEAD", id, cloneLog);
+      headCommit = id;
+      if (!this.bare && !this.noCheckout) checkoutId = id;
+    } else if (detachedTag) {
       // git clone --branch <tag>: a detached HEAD at the tag's commit
       defaultBranch = toBranchName(advertisedDefaultBranch);
       const tag = await this.refsStore.resolve(detachedTag);
@@ -984,6 +1203,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       remoteHead,
       checkedOutBranch,
       isEmpty: result.isEmpty,
+      revision: this.revision !== undefined,
     });
 
     // Build fetch result
@@ -1136,14 +1356,17 @@ export class CloneCommand extends TransportCommand<CloneResult> {
    * resolves to (`git clone . .`). The directory is named as the worktree's top is
    * ({@link setDirectory}, else its last component, `.` for the root).
    */
-  private async refuseNonEmptyDestination(source: OpenedRepository | undefined): Promise<void> {
-    const refuse = () => {
-      const root = repositoryPlaceOf(this._workingCopy)?.getRoot?.() ?? "";
-      const name = this.directory ?? (root.replace(/\/+$/, "").split("/").pop() || ".");
-      return new CloneDestinationError(
-        `fatal: destination path '${name}' already exists and is not an empty directory.`,
-      );
-    };
+  /** git's "destination path ... already exists and is not an empty directory." */
+  private destinationRefused(): CloneDestinationError {
+    const root = repositoryPlaceOf(this._workingCopy)?.getRoot?.() ?? "";
+    const name = this.directory ?? (root.replace(/\/+$/, "").split("/").pop() || ".");
+    return new CloneDestinationError(
+      `fatal: destination path '${name}' already exists and is not an empty directory.`,
+    );
+  }
+
+  private async refuseNonEmptyDestination(): Promise<void> {
+    const refuse = () => this.destinationRefused();
     const history = this._workingCopy.history;
     for await (const ref of history.refs.list()) {
       if (!isSymbolicRef(ref)) throw refuse();
@@ -1168,15 +1391,119 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         if (own && (entry.path === own || entry.path.startsWith(`${own}/`))) continue;
         throw refuse();
       }
-      if (source) {
-        const self = await worktree
-          .openRepository?.(".", { checkOwnership: false })
-          .catch(() => undefined);
-        if (self && (self.commonDir ?? self.gitDir) === (source.commonDir ?? source.gitDir)) {
-          throw refuse();
-        }
-      }
     }
+  }
+
+  /** A local source that is the destination itself is refused as a non-empty destination. */
+  private async refuseSourceAsDestination(source: OpenedRepository): Promise<void> {
+    const worktree = this.bare ? undefined : this.worktreeAccess;
+    if (!worktree) return;
+    const self = await worktree
+      .openRepository?.(".", { checkOwnership: false })
+      .catch(() => undefined);
+    if (self && (self.commonDir ?? self.gitDir) === (source.commonDir ?? source.gitDir)) {
+      throw this.destinationRefused();
+    }
+  }
+
+  /**
+   * clone.c's `write_config`: each `-c` entry parsed as `git_config_parse_parameter` (split at
+   * the first `=`, no `=` meaning `true`), its key canonical (`git_config_parse_key`), then
+   * added to the new repository's config file (`CONFIG_REGEX_NONE`), saved before the fetch.
+   * Every entry is checked before the first is written.
+   */
+  private async writeCommandLineConfig(): Promise<void> {
+    if (this.configEntries.length === 0) return;
+    const parsed: { key: string; value: string }[] = [];
+    for (const entry of this.configEntries) {
+      const eq = entry.indexOf("=");
+      const rawKey = eq < 0 ? entry : entry.slice(0, eq);
+      const die = (error: string) =>
+        new GitApiError(`error: ${error}\nfatal: unable to write parameters to config file`);
+      if (rawKey === "") throw die(`bogus config parameter: ${entry}`);
+      const key = parseConfigKey(rawKey);
+      if ("error" in key) throw die(key.error);
+      parsed.push({ key: key.key, value: eq < 0 ? "true" : entry.slice(eq + 1) });
+    }
+    for (const { key, value } of parsed) await this.writeConfigValue(key, value, "add");
+  }
+
+  /**
+   * One config write as git's config writer places it (`repo_config_set_multivar`): through
+   * `git config` (`ConfigCommand`) where the config is a file, so a value added to an existing
+   * section goes at its end; pending edits are saved first and the config is read again
+   * after. `add` is `CONFIG_REGEX_NONE`; `set-empty` replaces an empty value, else adds (the
+   * `^$` pattern of `write_refspec_config`).
+   */
+  private async writeConfigValue(
+    key: string,
+    value: string,
+    mode: "add" | "set-empty",
+  ): Promise<void> {
+    const store = RemoteConfigStore.from(this.workingCopy);
+    const config = this.workingCopy.config;
+    if (!(config instanceof GitWorkingCopyConfig)) {
+      const values = store.localValues(key);
+      const empty = values.indexOf("");
+      if (mode === "set-empty" && empty >= 0) {
+        store.setValues(
+          key,
+          values.map((v, i) => (i === empty ? value : (v ?? "true"))),
+        );
+      } else store.addValue(key, value);
+      await store.save();
+      return;
+    }
+    // config.c's writer over the file's text (as `git config` edits it), then read again
+    await store.save();
+    const files = config.configFiles;
+    const path = config.filePath;
+    const bytes = await files.read(path);
+    const written = setConfigMultivarText(
+      bytes === undefined ? undefined : new TextDecoder().decode(bytes),
+      path,
+      key,
+      value,
+      { valuePattern: mode === "add" ? CONFIG_REGEX_NONE : "^$" },
+    );
+    if (written.status !== 0 || written.text === undefined) {
+      throw new GitApiError(written.stderr.join("\n") || `fatal: could not write ${key}`);
+    }
+    await files.write(path, new TextEncoder().encode(written.text));
+    await config.load();
+  }
+
+  /**
+   * `--revision`'s commit: the fetched object, tags peeled (lookup_commit_or_die, its
+   * "is not a commit!" warning added to `messages`); anything else dies as git
+   * ("object <id> is a tree, not a commit", "could not parse <name>").
+   */
+  private async revisionCommit(
+    revision: { name: string; oid: string },
+    messages: string[],
+  ): Promise<ObjectId> {
+    const tags = this.tagsStore ?? this._workingCopy.history.tags;
+    let id = revision.oid;
+    for (let i = 0; i < 16; i++) {
+      if (!(await tags.has(id))) break;
+      const target = await tags.getTarget(id);
+      if (!target) break;
+      id = target;
+    }
+    if (!(await this.commits.load(id).catch(() => undefined))) {
+      const type = (await this.trees.has(id).catch(() => false))
+        ? "tree"
+        : (await this.blobs.has(id).catch(() => false))
+          ? "blob"
+          : undefined;
+      throw new GitApiError(
+        `${type ? `error: object ${id} is a ${type}, not a commit\n` : ""}fatal: could not parse ${revision.name}`,
+      );
+    }
+    if (id !== revision.oid) {
+      messages.push(`warning: ${revision.name} ${revision.oid} is not a commit!\n`);
+    }
+    return id;
   }
 
   /**
@@ -1194,6 +1521,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     remoteHead?: string;
     checkedOutBranch?: string;
     isEmpty?: boolean;
+    /** --revision: no fetch refspec (write_refspec_config is skipped) */
+    revision?: boolean;
   }): Promise<void> {
     const store = RemoteConfigStore.from(this.workingCopy);
     // git init probes the filesystem: what the worktree cannot represent is turned off
@@ -1213,7 +1542,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     let fetchRefspec: string | undefined;
     if (this.mirror) {
       fetchRefspec = "+refs/*:refs/*";
-    } else if (!this.bare) {
+    } else if (!this.bare && !clone.revision) {
       const top = `refs/remotes/${this.remoteName}/`;
       if (!clone.singleBranch) fetchRefspec = `+refs/heads/*:${top}*`;
       else if (clone.detachedTag) fetchRefspec = `+${clone.detachedTag}:${clone.detachedTag}`;
@@ -1224,7 +1553,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         fetchRefspec = `+refs/heads/${clone.remoteHead}:${top}${clone.remoteHead}`;
     }
     if (fetchRefspec) {
-      store.setValue(`${remote}.fetch`, fetchRefspec);
+      // repo_config_set_multivar(key, value, "^$", 0): at the end of the section, after the
+      // values -c wrote, or in place of an empty one
+      await this.writeConfigValue(`${remote}.fetch`, fetchRefspec, "set-empty");
       if (this.mirror) store.setValue(`${remote}.mirror`, "true");
     }
     if (this.filterSpec !== undefined) {
@@ -1234,6 +1565,16 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       if (version < 1) store.setValue("core.repositoryformatversion", "1");
       store.setValue(`${remote}.promisor`, "true");
       store.setValue(`${remote}.partialclonefilter`, this.filterSpec);
+    }
+    // git 2.43 initialized the sparse checkout before update_head's branch config
+    if (
+      this.sparse &&
+      !this.sparseInitialized &&
+      clone.worktree &&
+      (this.compatibility ?? this.hooks.compatibility) === "2.43"
+    ) {
+      await store.save();
+      await this.initSparseCheckout();
     }
     if (!this.bare && clone.checkedOutBranch) {
       store.setValue(`branch.${clone.checkedOutBranch}.remote`, this.remoteName);
@@ -1280,7 +1621,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     const sparse =
       this.sparse && worktree
         ? await (async () => {
-            await new SparseCheckoutCommand(this.workingCopy).setArguments(["set"]).call();
+            if (!this.sparseInitialized) await this.initSparseCheckout();
             return SparseUnpack.start({
               workingCopy: this.workingCopy,
               worktree,
@@ -1312,6 +1653,14 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     return collided;
   }
 
+  /** `git sparse-checkout set` in the new repository (git_sparse_checkout_init), once. */
+  private async initSparseCheckout(): Promise<void> {
+    this.sparseInitialized = true;
+    await new SparseCheckoutCommand(this.workingCopy).setArguments(["set"]).call();
+  }
+
+  private sparseInitialized = false;
+
   /** Whether symlinks are written as links: the worktree can, and `core.symlinks` allows. */
   private symlinksEnabled(worktree: Worktree): boolean {
     return worktreeModeTrust(this.workingCopy, worktree).symlinks;
@@ -1326,6 +1675,68 @@ export class CloneCommand extends TransportCommand<CloneResult> {
  * bare name (`main`) is equally legitimate. Both are accepted, and both yield
  * the bare name the ref-building code below prefixes.
  */
+/** A complete object id (SHA-1 or SHA-256), as a refspec source names one. */
+const FULL_HEX_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/**
+ * Whether `--revision`'s value parses as a fetch refspec's source (refspec.c: a complete
+ * object id, or a ref name allowed one level, `HEAD` included): `refs/heads/main^` does not.
+ */
+function isRevisionRefspec(revision: string): boolean {
+  return FULL_HEX_ID.test(revision) || isValidRefName(revision, { allowOneLevel: true });
+}
+
+/**
+ * The clone's refspecs after the configured `remote.<name>.fetch` ones (remote_get_early,
+ * then the clone's own appended): every remote ref is mapped through them, or, for a
+ * single-branch clone (`selected`), only the one ref it clones (wanted_peer_refs narrows the
+ * list before mapping).
+ */
+function withConfiguredRefspecs(
+  own: string[] | RefspecResolver,
+  configured: string[],
+  selected: ((remoteRefs: readonly RemoteRef[]) => RemoteRef | undefined) | undefined,
+  allTags: boolean,
+): RefspecResolver {
+  return {
+    prefixes: [
+      ...refPrefixes(configured),
+      ...(Array.isArray(own) ? refPrefixes(own) : own.prefixes),
+    ],
+    resolve: (remoteRefs) => {
+      const ownSpecs = Array.isArray(own) ? own : own.resolve(remoteRefs);
+      // get_fetch_map with missing_ok 0: an exact source the (narrowed) list lacks dies
+      const ref = selected?.(remoteRefs);
+      const mappedOver = selected ? (ref ? [ref] : []) : remoteRefs;
+      const listsRefs = remoteRefs.some((r) => r.oid);
+      const missing = listsRefs ? missingSources(mappedOver, configured) : [];
+      if (missing.length > 0) {
+        throw new TransportError(`fatal: couldn't find remote ref ${missing[0]}`);
+      }
+      const mapped = selected
+        ? mapRefs(mappedOver, configured)
+            .filter((p) => p.localRef !== undefined)
+            .map((p) => `${p.force ? "+" : ""}${p.remoteRef}:${p.localRef}`)
+        : configured;
+      const specs = [...mapped, ...ownSpecs];
+      // write_remote_refs' one transaction refuses a ref two mappings write (wanted_peer_refs
+      // removes no duplicate): ref_transaction's "multiple updates", the first name in order
+      const counts = new Map<string, number>();
+      for (const spec of allTags ? [...specs, "refs/tags/*:refs/tags/*"] : specs) {
+        for (const p of mapRefs(remoteRefs, [spec])) {
+          if (p.localRef !== undefined) counts.set(p.localRef, (counts.get(p.localRef) ?? 0) + 1);
+        }
+      }
+      const twice = [...counts].filter(([, n]) => n > 1).map(([name]) => name);
+      if (twice.length > 0) {
+        twice.sort(compareRefNames);
+        throw new TransportError(`fatal: multiple updates for ref '${twice[0]}' not allowed`);
+      }
+      return specs;
+    },
+  };
+}
+
 /**
  * clone.c's `absolute_pathdup` of a local source: an absolute path as given, a relative one
  * after the directory clone runs in (the worktree top, as the host sees it when the storage
