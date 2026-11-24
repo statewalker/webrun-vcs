@@ -33,6 +33,8 @@ export interface RevisionArgEntry {
   readonly exclude: boolean;
   /** The name it was given by (`a` of `a..b`; undefined for a merge base of `a...b`) */
   readonly name?: string;
+  /** The left side of a symmetric difference (`a` of `a...b`, git's SYMMETRIC_LEFT) */
+  readonly left?: boolean;
 }
 
 /** A ref and the object it names (a symbolic ref resolved). */
@@ -378,7 +380,7 @@ async function handleDotdot(
   const bc = ac === undefined ? undefined : await resolver.commitReference(b);
   if (ac === undefined || bc === undefined) throw dotdotMissing(resolver, arg, symmetric);
   for (const base of await options.mergeBases(ac, bc)) out.push({ id: base, exclude: !exclude });
-  out.push({ id: a, exclude, name: aName }, { id: b, exclude, name: bName });
+  out.push({ id: a, exclude, name: aName, left: true }, { id: b, exclude, name: bName });
   return true;
 }
 

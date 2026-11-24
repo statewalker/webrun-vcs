@@ -72,6 +72,12 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   private walkReflogs = false;
   /** What reading the revisions printed (`warning:` lines) */
   private warnings: string[] = [];
+  /** `--left-right`, for rev-list's marks */
+  private leftRight = false;
+  /** `--cherry-mark` (or `--cherry`), for rev-list's marks */
+  private cherryMark = false;
+  /** `--count` */
+  private count = false;
 
   /** What git prints while reading replace refs and grafts (see GitCommand). */
   override async replacementMessages(): Promise<string[]> {
@@ -200,6 +206,60 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   /** `--boundary` (see `LogCommand.setBoundary`). */
   setBoundary(boundary: boolean): this {
     return this.configured((log) => log.setBoundary(boundary));
+  }
+
+  /** `--left-right` (see `LogCommand.setLeftRight`): rev-list prints `<<id>` and `><id>`. */
+  setLeftRight(leftRight: boolean): this {
+    this.leftRight = leftRight;
+    return this.configured((log) => log.setLeftRight(leftRight));
+  }
+
+  /** `--left-only` (see `LogCommand.setLeftOnly`). */
+  setLeftOnly(leftOnly: boolean): this {
+    return this.configured((log) => log.setLeftOnly(leftOnly));
+  }
+
+  /** `--right-only` (see `LogCommand.setRightOnly`). */
+  setRightOnly(rightOnly: boolean): this {
+    return this.configured((log) => log.setRightOnly(rightOnly));
+  }
+
+  /** `--cherry-pick` (see `LogCommand.setCherryPick`). */
+  setCherryPick(cherryPick: boolean): this {
+    return this.configured((log) => log.setCherryPick(cherryPick));
+  }
+
+  /**
+   * `--cherry-mark` (see `LogCommand.setCherryMark`): rev-list prints `=<id>` for the commits
+   * the other side has, `+<id>` for the others (unless `--left-right` marks them).
+   */
+  setCherryMark(cherryMark: boolean): this {
+    this.cherryMark = cherryMark;
+    return this.configured((log) => log.setCherryMark(cherryMark));
+  }
+
+  /** `--cherry` (see `LogCommand.setCherry`). */
+  setCherry(cherry: boolean): this {
+    if (cherry) this.cherryMark = true;
+    return this.configured((log) => log.setCherry(cherry));
+  }
+
+  /**
+   * `--count`: {@link callText} prints how many commits it would list instead: `<n>`;
+   * `<left>\t<right>` with `--left-right`; `<n>\t<same>` with `--cherry-mark`; all three
+   * with both (builtin/rev-list.c).
+   *
+   * @example
+   * ```typescript
+   * // git rev-list --count --left-right main...topic
+   * await git.revList().addRevision("main...topic").setLeftRight(true).setCount(true).callText();
+   * // "2\t3\n"
+   * ```
+   */
+  setCount(count: boolean): this {
+    this.checkCallable();
+    this.count = count;
+    return this;
   }
 
   /** `--source` (`git log`'s; see `LogCommand.setSource`). */
@@ -410,18 +470,44 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
-   * `git rev-list <revisions>`'s output: each commit's id on a line, a boundary commit's
-   * after a `-` (`--boundary`).
+   * `git rev-list <revisions>`'s output: each commit's id on a line after its mark
+   * (get_revision_mark): `-` for a boundary commit (`--boundary`), `=` for one the other
+   * side has (`--cherry-mark`), `<`/`>` by side (`--left-right`), `+` for the others under
+   * `--cherry-mark`. With {@link setCount}, the counts instead.
    */
   async callText(): Promise<string> {
     let out = "";
     // git rev-list has no default revision: nothing given, nothing listed
     const log = await this.prepare(false);
     if (this.bisect) return this.bisectText(log !== undefined);
-    if (!log) return out;
-    for await (const commit of await log.call())
-      out += `${commit.boundary ? "-" : ""}${commit.id}\n`;
-    return out;
+    let left = 0;
+    let right = 0;
+    let same = 0;
+    if (log) {
+      for await (const commit of await log.call()) {
+        if (this.count) {
+          if (commit.patchSame) same++;
+          else if (commit.left) left++;
+          else right++;
+          continue;
+        }
+        out += `${this.revisionMark(commit)}${commit.id}\n`;
+      }
+    }
+    if (!this.count) return out;
+    if (this.leftRight && this.cherryMark) return `${left}\t${right}\t${same}\n`;
+    if (this.leftRight) return `${left}\t${right}\n`;
+    if (this.cherryMark) return `${left + right}\t${same}\n`;
+    return `${left + right}\n`;
+  }
+
+  /** revision.c's get_revision_mark for rev-list (no graph). */
+  private revisionMark(commit: LogResult): string {
+    if (commit.boundary) return "-";
+    if (commit.patchSame) return "=";
+    if (this.leftRight) return commit.left ? "<" : ">";
+    if (this.cherryMark) return "+";
+    return "";
   }
 
   /**
@@ -530,9 +616,10 @@ export class RevListCommand extends GitCommand<AsyncIterable<LogResult>> {
         const peeled = await resolver.peelTags(entry.id);
         if (peeled.type !== "commit") continue;
         pending.push({ id: peeled.id, exclude: entry.exclude });
-        if (entry.exclude) log.not(peeled.id, entry.name ?? entry.id);
+        const side = entry.left ? { left: true } : {};
+        if (entry.exclude) log.not(peeled.id, entry.name ?? entry.id, side);
         else {
-          log.add(peeled.id, entry.name ?? entry.id);
+          log.add(peeled.id, entry.name ?? entry.id, side);
           included++;
         }
       }
