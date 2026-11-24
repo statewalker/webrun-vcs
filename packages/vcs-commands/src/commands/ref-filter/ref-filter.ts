@@ -66,6 +66,8 @@ export interface RefFilterSource {
   commitByName(name: string, warnings?: string[], quiet?: boolean): Promise<ObjectId | undefined>;
   /** Every value of a configuration key, in order */
   configValues(key: string): string[];
+  /** Whether a value of the key is missing (`[section] key` without `=`) */
+  configMissingValue?(key: string): boolean;
 }
 
 /** Which refs a listing keeps (git's `struct ref_filter`). */
@@ -378,16 +380,28 @@ export function parseRefSorting(keys: readonly string[], format: RefFormat): Ref
   return out;
 }
 
-/** The `versionsort.suffix` list, and the warning git prints when both names are set. */
+/**
+ * The `versionsort.suffix` list (versioncmp.c's `repo_config_get_string_multi` of both
+ * names): a name with a value missing is git's `error: missing value for ...` and counts as
+ * unset; the warning when both names are set.
+ */
 function versionSuffixes(source: RefFilterSource, warnings: string[]): string[] {
-  const suffix = source.configValues("versionsort.suffix");
-  const old = source.configValues("versionsort.prereleasesuffix");
-  if (suffix.length && old.length) {
+  const read = (key: string): string[] | undefined => {
+    if (source.configMissingValue?.(key)) {
+      warnings.push(`error: missing value for '${key}'`);
+      return undefined;
+    }
+    const values = source.configValues(key);
+    return values.length ? values : undefined;
+  };
+  const suffix = read("versionsort.suffix");
+  const old = read("versionsort.prereleasesuffix");
+  if (suffix && old) {
     warnings.push(
       "warning: ignoring versionsort.prereleasesuffix because versionsort.suffix is set",
     );
   }
-  return suffix.length ? suffix : old;
+  return suffix ?? old ?? [];
 }
 
 /**
