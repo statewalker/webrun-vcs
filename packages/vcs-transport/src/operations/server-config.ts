@@ -52,6 +52,8 @@ export interface ServerConfigSettings {
   denyDeleteCurrent: ReceiveDenyAction;
   /** `receive.shallowUpdate` */
   shallowUpdate: boolean;
+  /** `receive.advertisePushOptions` (git's default: false) */
+  advertisePushOptions: boolean;
   /** upload-pack's hidden ref patterns: `transfer.hideRefs` and `uploadpack.hideRefs` */
   uploadPackHideRefs: string[];
   /** receive-pack's hidden ref patterns: `transfer.hideRefs` and `receive.hideRefs` */
@@ -197,6 +199,7 @@ export const GIT_SERVER_SETTINGS_DEFAULTS: Readonly<ServerConfigSettings> = Obje
   denyCurrentBranch: "unconfigured",
   denyDeleteCurrent: "unconfigured",
   shallowUpdate: false,
+  advertisePushOptions: false,
   uploadPackHideRefs: [],
   receivePackHideRefs: [],
 });
@@ -226,6 +229,8 @@ export function explicitServerSettingsFromConfig(
   if (deleteCurrent.length > 0) out.denyDeleteCurrent = denyAction(deleteCurrent);
   const shallow = last(config, "receive.shallowUpdate");
   if (shallow !== undefined) out.shallowUpdate = configBool(shallow, false);
+  const pushOptions = last(config, "receive.advertisePushOptions");
+  if (pushOptions !== undefined) out.advertisePushOptions = configBool(pushOptions, false);
   const upload = hideRefs(config, "uploadpack");
   if (upload.length > 0) out.uploadPackHideRefs = upload;
   const receive = hideRefs(config, "receive");
@@ -267,6 +272,7 @@ export function httpServerSettings(settings: ServerConfigSettings): {
     denyCurrentBranch: ReceiveDenyAction;
     denyDeleteCurrent: ReceiveDenyAction;
     shallowUpdate: boolean;
+    advertisePushOptions: boolean;
     hideRefs: string[];
   };
   uploadPack: { hideRefs: string[] };
@@ -278,6 +284,7 @@ export function httpServerSettings(settings: ServerConfigSettings): {
       denyCurrentBranch: settings.denyCurrentBranch,
       denyDeleteCurrent: settings.denyDeleteCurrent,
       shallowUpdate: settings.shallowUpdate,
+      advertisePushOptions: settings.advertisePushOptions,
       hideRefs: settings.receivePackHideRefs,
     },
     uploadPack: { hideRefs: settings.uploadPackHideRefs },
