@@ -13,7 +13,7 @@ import { NodeFilesApi } from "@statewalker/webrun-files-node";
 
 import type { NodeHookRunner } from "./node-hook-runner.js";
 import type { NodeSigner } from "./node-signer.js";
-import { realHostPath, statHostFile } from "./posix-node-files-api.js";
+import { PosixNodeFilesApi, realHostPath, statHostFile } from "./posix-node-files-api.js";
 
 /** Where the files are; each defaults to the process environment, as git reads it. */
 export interface NodeGitHostEnvironmentOptions {
@@ -133,19 +133,45 @@ const hostRoots = new Map<string, FilesApi>();
  * `graftFileReader` of vcs-core with its base).
  */
 function hostFiles(path: string, windows = process.platform === "win32"): [FilesApi, string] {
+  const { key, rootDir, relative } = splitHostPath(path, windows);
+  let files = hostRoots.get(key);
+  if (!files) {
+    files = new NodeFilesApi({ rootDir });
+    hostRoots.set(key, files);
+  }
+  return [files, relative];
+}
+
+/** The file-system root holding a host path (its key and directory), and the path inside it. */
+function splitHostPath(
+  path: string,
+  windows: boolean,
+): { key: string; rootDir: string; relative: string } {
   let full = path.replaceAll("\\", "/");
   const absolute = full.startsWith("/") || /^[A-Za-z]:\//.test(full);
   if (!absolute) full = `${process.cwd().replaceAll("\\", "/").replace(/\/$/, "")}/${full}`;
   const unc = windows ? /^\/\/[^/]+\/[^/]+/.exec(full) : null;
   const drive = /^[A-Za-z]:\//.exec(full);
   const prefix = unc ? unc[0] : drive ? full.slice(0, 2) : "";
-  const root = `${prefix.toUpperCase()}/`;
-  let files = hostRoots.get(root);
+  const key = `${prefix.toUpperCase()}/`;
+  return { key, rootDir: unc ? prefix : key, relative: full.slice(prefix.length) };
+}
+/** The Posix Node FilesApi of each file-system root, for host files git writes. */
+const posixHostRoots = new Map<string, FilesApi>();
+
+/**
+ * The Posix Node FilesApi (`lstat`, `readlink`, `chmod`; never following a link by itself)
+ * that holds a host path, and the path inside it: what `git config --global` / `--system` /
+ * `--file` writes through, so links are followed as git follows them and modes are kept.
+ */
+function posixHostFiles(path: string, windows = process.platform === "win32"): [FilesApi, string] {
+  const { key, rootDir, relative } = splitHostPath(path, windows);
+  let files = posixHostRoots.get(key);
   if (!files) {
-    files = new NodeFilesApi({ rootDir: unc ? prefix : root });
-    hostRoots.set(root, files);
+    files = new PosixNodeFilesApi({ rootDir });
+    posixHostRoots.set(key, files);
   }
-  return [files, full.slice(prefix.length)];
+  return [files, relative];
 }
 
 /** git's `git_env_bool`: set to anything but a false value. */
@@ -414,7 +440,7 @@ export function createNodeGitHostEnvironment(
   return {
     readFile: readHostFile,
     hostFilesOf: (path: string) => {
-      const [files, relative] = options.files ? [options.files, path] : hostFiles(path);
+      const [files, relative] = options.files ? [options.files, path] : posixHostFiles(path);
       return { files, path: relative };
     },
     // `~user/` (git's getpwnam): the user's entry in /etc/passwd, read through the FilesApi,

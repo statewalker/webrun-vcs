@@ -27,13 +27,13 @@ import {
   GitWorkingCopyConfig,
   parseConfigKey,
   prepareConfigComment,
+  readConfigFileThroughLinks,
   renameConfigSectionInFile,
-  resolveConfigFileLink,
   setConfigMultivarInFile,
 } from "@statewalker/vcs-store-files";
 import { compilePosixRegex, PosixRegexError } from "@statewalker/vcs-utils";
 import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
-import { type FilesApi, readFile } from "@statewalker/vcs-utils/files";
+import type { FilesApi } from "@statewalker/vcs-utils/files";
 import {
   expandUserPath,
   type GitHostEnvironment,
@@ -101,6 +101,8 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
   private comment?: string;
   private defaultValue?: string;
   private legacy = false;
+  /** git's warnings of a read (a file it cannot open), printed before the values */
+  private warnings: string[] = [];
 
   /** `get <key>` / `--get <key>` (`--get-all` with {@link setAll}). */
   get(key: string): this {
@@ -349,11 +351,15 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
     const all = await this.readValues(parsed.key);
     const values = matcher ? all.filter(matcher) : all;
     if (values.length === 0 && this.defaultValue !== undefined) {
-      return { ...result(0, []), stdout: `${this.defaultValue}\n`, values: [this.defaultValue] };
+      return {
+        ...result(0, this.warnings),
+        stdout: `${this.defaultValue}\n`,
+        values: [this.defaultValue],
+      };
     }
     const shown = this.all ? values : values.slice(-1);
     return {
-      ...result(values.length > 0 ? 0 : 1, []),
+      ...result(values.length > 0 ? 0 : 1, this.warnings),
       stdout: shown.map((v) => `${v ?? ""}\n`).join(""),
       values,
     };
@@ -373,12 +379,14 @@ export class ConfigCommand extends GitCommand<ConfigCommandResult> {
     const reader = new GitWorkingCopyConfig(
       {
         read: async (path) => {
-          // a link to the file is read through (git opens the path)
-          const real = await resolveConfigFileLink(location.files, path);
-          if (real === undefined) return undefined;
-          const kind = (await location.files.stats(real).catch(() => undefined))?.kind;
-          if (kind !== "file") return undefined;
-          return readFile(location.files, real).catch(() => undefined);
+          // read through its links, as git's open; one it cannot open is warned about
+          const read = await readConfigFileThroughLinks(location.files, path);
+          if (read.kind === "error" || read.kind === "directory") {
+            const reason = read.kind === "error" ? read.reason : "Is a directory";
+            this.warnings.push(`warning: unable to access '${location.name}': ${reason}`);
+            return undefined;
+          }
+          return read.kind === "file" ? read.bytes : undefined;
         },
         write: async () => {
           throw new Error("read only");

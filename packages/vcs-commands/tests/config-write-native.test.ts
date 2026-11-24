@@ -12,11 +12,13 @@
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import {
-  existsSync,
+  chmodSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -541,8 +543,80 @@ const scenarios: Scenario[] = [
       ["--worktree", "a.b", "c"],
     ],
   },
+  {
+    title:
+      "t1300 preserves existing permissions: a 0600 file stays 0600 through set, unset, rename and remove-section",
+    files: { global: "[user]\n\tname = A\n\ttoken = secret\n", cfg: "[a]\n\tx = 1\n" },
+    watch: ["cfg"],
+    steps: [
+      {
+        args: ["--global", "user.email", "e"],
+        before: (dir) => {
+          chmodSync(join(dir, "global"), 0o600);
+          chmodSync(join(dir, ".git/config"), 0o600);
+          chmodSync(join(dir, "cfg"), 0o640);
+        },
+      },
+      ["--global", "--unset", "user.name"],
+      ["--global", "--rename-section", "user", "person"],
+      ["imap.pass", "Hunter2"],
+      ["--rename-section", "imap", "pop"],
+      ["--remove-section", "pop"],
+      ["--file=cfg", "a.y", "2"],
+      ["--file=cfg", "--unset-all", "a.x"],
+    ],
+  },
+  {
+    title: "t1300 symlinked configuration: --global and an absolute --file through a link",
+    env: { GIT_CONFIG_GLOBAL: "{dir}/glink" },
+    files: { "sub/real": "[a]\n\tx = 1\n", "sub/other": "[b]\n\ty = 1\n" },
+    watch: ["glink", "flink", "sub/real", "sub/other"],
+    steps: [
+      {
+        args: ["--global", "q.r", "s"],
+        before: (dir) => {
+          symlinkSync("sub/real", join(dir, "glink"));
+          symlinkSync(join(dir, "sub/other"), join(dir, "flink"));
+          chmodSync(join(dir, "sub/real"), 0o600);
+        },
+      },
+      ["--global", "--rename-section", "q", "w"],
+      ["--global", "--get", "a.x"],
+      ["--file={dir}/flink", "b.z", "2"],
+      ["--file={dir}/flink", "--unset", "b.y"],
+    ],
+  },
+  {
+    title:
+      "t1300 symlinked configuration: a chain of more than five links (resolve_symlink's depth)",
+    files: { "sub/real": "[a]\n\tx = 1\n" },
+    watch: ["c1", "c2", "c3", "c4", "c5", "c6", "sub/real"],
+    steps: [
+      {
+        args: ["--file=c1", "q.r", "s"],
+        before: (dir) => {
+          symlinkSync("sub/real", join(dir, "c6"));
+          for (let i = 5; i >= 1; i--) symlinkSync(`c${i + 1}`, join(dir, `c${i}`));
+        },
+      },
+      ["--file=c1", "--get", "a.x"],
+      ["--file=c1", "--rename-section", "a", "b"],
+      ["--file=c2", "--unset", "q.r"],
+    ],
+  },
+  {
+    title:
+      "t1300 symlink to nonexistent configuration: a link to itself is refused, never replaced",
+    watch: ["d1"],
+    steps: [
+      { args: ["--file=d1", "a.b", "c"], before: (dir) => symlinkSync("d1", join(dir, "d1")) },
+      ["--file=d1", "--unset", "a.b"],
+      ["--file=d1", "--rename-section", "a", "b"],
+      ["--file=d1", "--remove-section", "a"],
+      ["--file=d1", "--get", "a.b"],
+    ],
+  },
 ];
-
 /** git's legacy argv as git 2.46's subcommands write it. */
 function toSubcommands(args: string[]): string[] {
   const opts: string[] = [];
@@ -668,11 +742,30 @@ async function openOurs(dir: string, env: Record<string, string>): Promise<Git> 
 }
 
 /** The bytes of the config files of a twin (absent as null). */
-function snapshot(dir: string, watch: string[]): Record<string, string | null> {
-  const out: Record<string, string | null> = {};
+function snapshot(dir: string, watch: string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
   for (const name of [".git/config", "global", "system", ...watch]) {
     const path = join(dir, name);
-    out[name] = existsSync(path) ? readFileSync(path).toString("latin1") : null;
+    let entry: ReturnType<typeof lstatSync> | undefined;
+    try {
+      entry = lstatSync(path);
+    } catch {
+      entry = undefined;
+    }
+    if (!entry) {
+      out[name] = null;
+      continue;
+    }
+    let content: string | null = null;
+    try {
+      content = readFileSync(path).toString("latin1");
+    } catch {
+      content = null;
+    }
+    // the bytes (through links), the permission bits, and whether it is a link (and to what)
+    out[name] = entry.isSymbolicLink()
+      ? { link: readlinkSync(path).replaceAll(dir, "<dir>"), content }
+      : { mode: (entry.mode & 0o7777).toString(8), content };
   }
   // no lock left behind but the ones a step made
   out.locks = readdirSync(dir)

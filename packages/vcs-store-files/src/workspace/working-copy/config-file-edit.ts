@@ -613,39 +613,118 @@ export function renameConfigSectionText(
 
 /** At most this many links are followed to the file a lock is taken for (git's `resolve_symlink`) */
 const MAXDEPTH = 5;
+/** At most this many links are followed when the file is opened (Linux's `MAXSYMLINKS`) */
+const MAXSYMLINKS = 40;
+
+/** C's `strerror` text of the errno codes a config file's open or lock meets */
+const STRERROR: Record<string, string> = {
+  EACCES: "Permission denied",
+  EPERM: "Operation not permitted",
+  EEXIST: "File exists",
+  ENOENT: "No such file or directory",
+  ENOTDIR: "Not a directory",
+  EISDIR: "Is a directory",
+  ELOOP: "Too many levels of symbolic links",
+  EROFS: "Read-only file system",
+  ENOSPC: "No space left on device",
+  ENAMETOOLONG: "File name too long",
+};
+
+/** The `strerror` text of an error (its `code`), else its message. */
+function reasonOf(error: unknown): string {
+  const code = (error as { code?: string } | undefined)?.code;
+  if (code && STRERROR[code]) return STRERROR[code];
+  return error instanceof Error ? error.message : String(error);
+}
 
 /**
- * The file `path` names, its symbolic links followed (at most five, as git's
- * `resolve_symlink`): what git opens to read a config file and what its lock is taken for, so
- * a linked `~/.gitconfig` stays a link. Undefined when a link leads where this storage cannot
- * follow (an absolute target outside its root).
+ * `path` with at most `depth` symbolic links followed; `"loop"` when it is still a link
+ * after `depth` of them and `strict` (the open's ELOOP), `"outside"` when a link leads where
+ * this storage cannot follow (an absolute target outside its root).
  */
-export async function resolveConfigFileLink(
+async function followLinks(
   files: FilesApi,
   path: string,
-): Promise<string | undefined> {
+  depth: number,
+  strict: boolean,
+): Promise<string | "loop" | "outside"> {
   const posix = files as PosixFilesApi;
   if (!posix.lstat || !posix.readlink) return path;
   let current = path;
-  for (let depth = 0; depth < MAXDEPTH; depth++) {
+  for (let hop = 0; ; hop++) {
     const stats = await posix.lstat(current).catch(() => undefined);
     if (stats?.kind !== "symlink") return current;
+    if (hop >= depth) return strict ? "loop" : current;
     const bytes = await posix.readlink(current);
     if (!bytes) return current;
     const target = decodeGitPath(bytes);
     if (target.startsWith("/")) {
       const root = posix.rootDirectory?.replace(/\/+$/, "");
-      if (root === undefined) return undefined;
+      if (root === undefined) return "outside";
       if (root === "") current = target;
       else if (target === root || target.startsWith(`${root}/`)) {
         current = target.slice(root.length) || "/";
-      } else return undefined;
+      } else return "outside";
     } else {
       const slash = current.lastIndexOf("/");
       current = slash < 0 ? target : `${current.slice(0, slash + 1)}${target}`;
     }
   }
-  return current;
+}
+
+/**
+ * The file `path` names, its symbolic links followed (at most five, as git's
+ * `resolve_symlink`): what git's lock is taken for, so a linked `~/.gitconfig` stays a link
+ * (the lock is renamed over the last link followed). Undefined when a link leads where this
+ * storage cannot follow (an absolute target outside its root).
+ */
+export async function resolveConfigFileLink(
+  files: FilesApi,
+  path: string,
+): Promise<string | undefined> {
+  const resolved = await followLinks(files, path, MAXDEPTH, false);
+  return resolved === "outside" || resolved === "loop" ? undefined : resolved;
+}
+
+/** What {@link readConfigFileThroughLinks} found. */
+export type ConfigFileRead =
+  | { kind: "file"; bytes: Uint8Array; path: string; mode?: number }
+  | { kind: "absent" }
+  | { kind: "directory" }
+  | { kind: "error"; reason: string };
+
+/**
+ * A config file as git's `open` reads it: every symbolic link followed (a link to a link
+ * whose end is missing is absent; more than {@link MAXSYMLINKS} links, a link to itself, is
+ * `Too many levels of symbolic links`), with the permission bits of the file read, where the
+ * storage keeps them. A link this storage cannot follow is an error, never absent.
+ */
+export async function readConfigFileThroughLinks(
+  files: FilesApi,
+  path: string,
+): Promise<ConfigFileRead> {
+  const real = await followLinks(files, path, MAXSYMLINKS, true);
+  if (real === "loop") return { kind: "error", reason: STRERROR.ELOOP };
+  if (real === "outside") {
+    return { kind: "error", reason: "symbolic link leads outside the storage" };
+  }
+  try {
+    const posix = files as PosixFilesApi;
+    const entry = posix.lstat ? await posix.lstat(real) : undefined;
+    const kind = posix.lstat ? entry?.kind : (await files.stats(real))?.kind;
+    if (kind === undefined) return { kind: "absent" };
+    if (kind === "directory") return { kind: "directory" };
+    if (kind !== "file") return { kind: "error", reason: "not a regular file" };
+    const bytes = await readFile(files, real);
+    return {
+      kind: "file",
+      bytes,
+      path: real,
+      ...(entry?.mode !== undefined ? { mode: entry.mode } : {}),
+    };
+  } catch (error) {
+    return { kind: "error", reason: reasonOf(error) };
+  }
 }
 
 /** A lock taken on a config file: its text, and how to commit or drop it. */
@@ -655,29 +734,34 @@ interface ConfigLock {
   rollback(): Promise<void>;
 }
 
+type LockRefusal = { error: string; status: number };
+
 /**
- * Takes `<file>.lock` (git's `hold_lock_file_for_update`) and reads the file. Undefined
- * with git's error when the lock is held (or cannot be made).
+ * Takes `<file>.lock` (git's `hold_lock_file_for_update`), reads the file through its links
+ * and gives the lock the file's permission bits (git's `chmod` of the lock to `st_mode &
+ * 07777`), so the rename never widens them. A refusal is git's message and status; the lock
+ * is removed on every refusal after it was made.
  */
 async function lockConfigFile(
   location: ConfigFileLocation,
-  withErrno: boolean,
-): Promise<ConfigLock | { error: string; status: number }> {
+  kind: "set" | "rename",
+): Promise<ConfigLock | LockRefusal> {
   const { files, name } = location;
   const failure = (reason: string) => ({
-    error: withErrno
-      ? `error: could not lock config file ${name}: ${reason}`
-      : `error: could not lock config file ${name}`,
+    error:
+      kind === "set"
+        ? `error: could not lock config file ${name}: ${reason}`
+        : `error: could not lock config file ${name}`,
     status: 255,
   });
   const path = await resolveConfigFileLink(files, location.path);
-  if (path === undefined) return failure("Too many levels of symbolic links");
+  if (path === undefined) return failure("symbolic link leads outside the storage");
   // git's lock is an open(O_CREAT | O_EXCL) in the file's directory: it creates no directory
   const slash = path.lastIndexOf("/");
   if (slash > 0) {
-    const kind = (await files.stats(path.slice(0, slash)).catch(() => undefined))?.kind;
-    if (kind === undefined) return failure("No such file or directory");
-    if (kind !== "directory") return failure("Not a directory");
+    const dirKind = (await files.stats(path.slice(0, slash)).catch(() => undefined))?.kind;
+    if (dirKind === undefined) return failure(STRERROR.ENOENT);
+    if (dirKind !== "directory") return failure(STRERROR.ENOTDIR);
   }
   const atomic = atomicFilesOver(files, "");
   const lockPath = `${path}.lock`;
@@ -685,40 +769,69 @@ async function lockConfigFile(
   try {
     created = await atomic.createExclusive(lockPath, new Uint8Array(0));
   } catch (error) {
-    const code = (error as { code?: string }).code;
-    return failure(code === "ENOTDIR" ? "Not a directory" : "No such file or directory");
+    return failure(reasonOf(error));
   }
-  if (!created) return failure("File exists");
+  if (!created) return failure(STRERROR.EEXIST);
   const rollback = async () => {
     await files.remove(lockPath).catch(() => false);
   };
-  let contents: string | undefined;
   try {
-    const kind = (await files.stats(path))?.kind;
-    if (kind === "directory") {
+    const read = await readConfigFileThroughLinks(files, location.path);
+    if (read.kind === "error" || read.kind === "directory") {
       await rollback();
-      return { error: `error: unable to mmap '${name}': Is a directory`, status: 3 };
+      const reason = read.kind === "error" ? read.reason : STRERROR.EISDIR;
+      if (kind === "rename") {
+        // warn_on_fopen_errors
+        return { error: `warning: unable to access '${name}': ${reason}`, status: 255 };
+      }
+      return read.kind === "directory"
+        ? { error: `error: unable to mmap '${name}': ${reason}`, status: 3 }
+        : { error: `error: opening ${name}: ${reason}`, status: 3 };
     }
-    if (kind === "file") contents = decodeGitPath(await readFile(files, path));
+    if (read.kind === "file" && read.mode !== undefined) {
+      // the lock gets the file's bits before the rename; a storage that keeps bits but
+      // cannot set them refuses rather than widen them
+      const chmod = (files as PosixFilesApi).chmod;
+      try {
+        if (!chmod) throw new Error("the storage cannot set file modes");
+        await chmod.call(files, lockPath, read.mode & 0o7777);
+      } catch (error) {
+        await rollback();
+        return {
+          error: `error: chmod on ${name}.lock failed: ${reasonOf(error)}`,
+          status: kind === "set" ? 4 : 255,
+        };
+      }
+    }
+    const contents = read.kind === "file" ? decodeGitPath(read.bytes) : undefined;
+    return {
+      contents,
+      rollback,
+      commit: async (text: string) => {
+        try {
+          await files.write(lockPath, [encodeGitPath(text)]);
+          await atomic.replace(lockPath, path);
+          return undefined;
+        } catch (error) {
+          await rollback();
+          return `error: could not write config file ${name}: ${reasonOf(error)}`;
+        }
+      },
+    };
   } catch (error) {
     await rollback();
     throw error;
   }
-  return {
-    contents,
-    rollback,
-    commit: async (text: string) => {
-      try {
-        await files.write(lockPath, [encodeGitPath(text)]);
-        await atomic.replace(lockPath, path);
-        return undefined;
-      } catch (error) {
-        await rollback();
-        const reason = error instanceof Error ? error.message : String(error);
-        return `error: could not write config file ${name}: ${reason}`;
-      }
-    },
-  };
+}
+
+/** Runs `body` on a taken lock, which is removed if `body` throws (git's atexit rollback). */
+async function withLock<T>(lock: ConfigLock, body: () => Promise<T>): Promise<T> {
+  try {
+    return await body();
+  } catch (error) {
+    await lock.rollback();
+    throw error;
+  }
 }
 
 /**
@@ -743,16 +856,18 @@ export async function setConfigMultivarInFile(
   if ("status" in parsedKey) {
     return { status: parsedKey.status, stderr: [`error: ${parsedKey.error}`] };
   }
-  const lock = await lockConfigFile(location, true);
+  const lock = await lockConfigFile(location, "set");
   if ("error" in lock) return { status: lock.status, stderr: [lock.error] };
-  const result = setConfigMultivarText(lock.contents, location.name, key, value, options);
-  if (result.status !== 0 || result.text === undefined) {
-    await lock.rollback();
-    return { status: result.status, stderr: result.stderr };
-  }
-  const failed = await lock.commit(result.text);
-  if (failed) return { status: 4, stderr: [...result.stderr, failed] };
-  return { status: 0, stderr: result.stderr };
+  return withLock(lock, async () => {
+    const result = setConfigMultivarText(lock.contents, location.name, key, value, options);
+    if (result.status !== 0 || result.text === undefined) {
+      await lock.rollback();
+      return { status: result.status, stderr: result.stderr };
+    }
+    const failed = await lock.commit(result.text);
+    if (failed) return { status: 4, stderr: [...result.stderr, failed] };
+    return { status: 0, stderr: result.stderr };
+  });
 }
 
 /**
@@ -773,14 +888,16 @@ export async function renameConfigSectionInFile(
   if (newName !== undefined && !sectionNameIsOk(newName)) {
     return { count: -1, stderr: [`error: invalid section name: ${newName}`] };
   }
-  const lock = await lockConfigFile(location, false);
+  const lock = await lockConfigFile(location, "rename");
   if ("error" in lock) return { count: -1, stderr: [lock.error] };
-  const result = renameConfigSectionText(lock.contents, location.name, oldName, newName);
-  if (result.count < 0 || result.text === undefined) {
-    await lock.rollback();
-    return { count: -1, stderr: result.stderr };
-  }
-  const failed = await lock.commit(result.text);
-  if (failed) return { count: -1, stderr: [...result.stderr, failed] };
-  return { count: result.count, stderr: result.stderr };
+  return withLock(lock, async () => {
+    const result = renameConfigSectionText(lock.contents, location.name, oldName, newName);
+    if (result.count < 0 || result.text === undefined) {
+      await lock.rollback();
+      return { count: -1, stderr: result.stderr };
+    }
+    const failed = await lock.commit(result.text);
+    if (failed) return { count: -1, stderr: [...result.stderr, failed] };
+    return { count: result.count, stderr: result.stderr };
+  });
 }

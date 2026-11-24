@@ -95,4 +95,56 @@ describe("config file edits (t1300-config)", () => {
     // the comment before the section keeps it
     expect(unset.text).toBe("[include]\n\tpath = other\n# about a\n[a]\n[b]\n\ty = 1\n");
   });
+
+  it("refuses rather than widen a file's mode on a storage that keeps modes but cannot set them", async () => {
+    const at = await setup("[a]\n\tx = 1\n");
+    // a storage reporting 0600 for the file, with no chmod
+    const files = Object.assign(Object.create(at.files), {
+      lstat: async (path: string) => {
+        const stats = await at.files.stats(path);
+        if (!stats) return undefined;
+        return { kind: stats.kind, size: 0, lastModified: 0, mode: 0o600 };
+      },
+      readlink: async () => undefined,
+    });
+    const outcome = await setConfigMultivarInFile({ ...at, files }, "a.y", "2");
+    expect(outcome).toEqual({
+      status: 4,
+      stderr: ["error: chmod on .git/config.lock failed: the storage cannot set file modes"],
+    });
+    expect(text(await readFile(at.files, at.path))).toBe("[a]\n\tx = 1\n");
+    expect(await at.files.exists("/repo/.git/config.lock")).toBe(false);
+  });
+
+  it("gives the lock the file's mode before the rename where the storage can set it", async () => {
+    const at = await setup("[a]\n\tx = 1\n");
+    const chmods: [string, number][] = [];
+    const files = Object.assign(Object.create(at.files), {
+      lstat: async (path: string) => {
+        const stats = await at.files.stats(path);
+        if (!stats) return undefined;
+        return { kind: stats.kind, size: 0, lastModified: 0, mode: 0o600 };
+      },
+      readlink: async () => undefined,
+      chmod: async (path: string, mode: number) => {
+        chmods.push([path, mode]);
+      },
+    });
+    expect((await setConfigMultivarInFile({ ...at, files }, "a.y", "2")).status).toBe(0);
+    expect(chmods).toEqual([["/repo/.git/config.lock", 0o600]]);
+  });
+
+  it("reports a lock it cannot create with its errno text (EACCES)", async () => {
+    const at = await setup("[a]\n\tx = 1\n");
+    const files = Object.assign(Object.create(at.files), {
+      createExclusive: async () => {
+        throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      },
+    });
+    const outcome = await setConfigMultivarInFile({ ...at, files }, "a.y", "2");
+    expect(outcome).toEqual({
+      status: 255,
+      stderr: ["error: could not lock config file .git/config: Permission denied"],
+    });
+  });
 });
