@@ -33,6 +33,15 @@ export interface InitResult {
   /** Whether this is a bare repository */
   bare: boolean;
 
-  /** Path to the .git directory */
+  /** Path to the .git directory (with `--separate-git-dir`, where the repository is) */
   gitDir: string;
+
+  /** Whether an existing repository was re-initialised (git's "Reinitialized existing") */
+  reinitialized?: boolean;
+
+  /**
+   * `core.sharedRepository` as the repository got it (git_config_perm: 0 not shared,
+   * `0o660` group, `0o664` everybody, a negated octal mode): git's "shared" in its message
+   */
+  shared?: number;
 }

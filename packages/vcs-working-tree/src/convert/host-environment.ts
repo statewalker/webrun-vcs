@@ -115,6 +115,12 @@ export interface GitHostEnvironment {
    */
   defaultHash?: string;
   /**
+   * `$GIT_TEMPLATE_DIR` as given: the template directory `init` (and `clone`) copies into a
+   * new repository without `--template`, before `init.templateDir` (setup.c
+   * `get_template_dir`); an empty value copies none
+   */
+  templateDir?: string;
+  /**
    * `$GIT_INDEX_VERSION` as given: the version a new index is written in, before
    * `index.version` and `feature.manyFiles` (read-cache.c `get_index_format_default`; a
    * value that is not 2, 3 or 4 falls back to 3 with a warning)
