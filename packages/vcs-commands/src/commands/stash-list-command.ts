@@ -2,6 +2,8 @@ import type { ObjectId } from "@statewalker/vcs-core";
 
 import { GitCommand } from "../git-command.js";
 import type { StashEntry } from "../results/stash-result.js";
+import { LogCommand } from "./log-command.js";
+import type { LogOutputOptions } from "./log-output.js";
 
 /**
  * Reference name for stash.
@@ -55,6 +57,37 @@ export class StashListCommand extends GitCommand<StashEntry[]> {
     }
 
     return stashes;
+  }
+
+  /**
+   * `git stash list [<log-options>]` as git prints it: `git log --format="%gd: %gs" -g
+   * --first-parent <options> refs/stash --`, so `stash@{0}: WIP on main: ...` by default,
+   * and the log's formats, dates and diffs (`-p`, `--stat`: each entry against the commit
+   * it was made on) when asked. `walk` sets the walk's options on the log command (`-n`,
+   * `--skip`, `--grep`, `--author`...). Nothing is printed without a stash.
+   *
+   * @example
+   * ```typescript
+   * await git.stashList().callText(); // "stash@{0}: On main: msg\n"
+   * await git.stashList().callText({ stat: true }, (log) => log.setMaxCount(1));
+   * ```
+   */
+  async callText(
+    options: LogOutputOptions = {},
+    walk?: (log: LogCommand) => void,
+  ): Promise<string> {
+    this.checkCallable();
+    this.setCallable(false);
+    const stashRef = await this.refsStore.get(STASH_REF);
+    if (!stashRef) return "";
+    const log = new LogCommand(this.workingCopy)
+      .shareReadsOf(this)
+      .setReflogWalk(STASH_REF)
+      .setFirstParent(true);
+    walk?.(log);
+    // git's own --format comes first: the caller's format options win over it
+    const pretty = options.pretty ?? (options.oneline ? undefined : "%gd: %gs");
+    return log.callText({ ...options, ...(pretty !== undefined ? { pretty } : {}) });
   }
 
   /**

@@ -592,6 +592,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
         status: StashApplyStatus.CONFLICTS,
         stashCommit: stashId,
         conflicts: [...conflicts.keys()].sort(),
+        messages: this.mergeMessages(merge.messages, stashCommit.tree, stashHeadCommitObj.tree),
         ...(warnings.length > 0 ? { warnings } : {}),
       };
     }
@@ -645,8 +646,17 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
     return {
       status: StashApplyStatus.OK,
       stashCommit: stashId,
+      messages: this.mergeMessages(merge.messages, stashCommit.tree, stashHeadCommitObj.tree),
       ...(warnings.length > 0 ? { warnings } : {}),
     };
+  }
+
+  /**
+   * What merge_ort_nonrecursive printed: "Already up to date." for a stash whose tree is its
+   * base's (no merge runs), else merge-ort's messages.
+   */
+  private mergeMessages(messages: string[], stashTree: ObjectId, baseTree: ObjectId): string[] {
+    return stashTree === baseTree ? ["Already up to date."] : [...messages];
   }
 
   /**
@@ -703,8 +713,9 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
   ): Promise<{
     result: Map<string, CheckedEntry>;
     conflicts: Map<string, MergeConflict>;
+    messages: string[];
   }> {
-    const { result, conflicts } = await ortMerge(this.blobs, baseIn, oursIn, theirsIn, {
+    const { result, conflicts, messages } = await ortMerge(this.blobs, baseIn, oursIn, theirsIn, {
       oursLabel: this.labelOurs,
       theirsLabel: this.labelTheirs,
       baseLabel: this.labelBase,
@@ -712,7 +723,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       ignoreCase,
       ...ortConfigOptions(this.workingCopy, this.worktreeAccess),
     });
-    return { result, conflicts };
+    return { result, conflicts, messages };
   }
 
   /**
