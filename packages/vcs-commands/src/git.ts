@@ -18,6 +18,7 @@ import {
   BisectStateCommand,
   BisectTermsCommand,
   BlameCommand,
+  CheckMailmapCommand,
   CheckoutCommand,
   CherryPickCommand,
   CleanCommand,
@@ -71,6 +72,7 @@ import {
   RevParseCommand,
   RmCommand,
   SetUpstreamBranchCommand,
+  ShortlogCommand,
   ShowCommand,
   ShowCurrentBranchCommand,
   SparseCheckoutCommand,
@@ -851,6 +853,34 @@ export class Git implements Disposable {
   verifyPack(): VerifyPackCommand {
     this.checkClosed();
     return new VerifyPackCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a ShortlogCommand (`git shortlog`): commits grouped by author, committer,
+   * trailer values or formats, from a walk or from `git log` output.
+   *
+   * @example
+   * ```typescript
+   * await git.shortlog().addRevision("HEAD").setSummary(true).setNumbered(true).callText();
+   * ```
+   */
+  shortlog(): ShortlogCommand {
+    this.checkClosed();
+    return new ShortlogCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a CheckMailmapCommand (`git check-mailmap`): contacts mapped through the
+   * repository's mailmap.
+   *
+   * @example
+   * ```typescript
+   * await git.checkMailmap().addContact("nick1 <bugs@company.xx>").call();
+   * ```
+   */
+  checkMailmap(): CheckMailmapCommand {
+    this.checkClosed();
+    return new CheckMailmapCommand(this._workingCopy);
   }
 
   /**

@@ -436,6 +436,20 @@ describeGit("git format-patch as native git", () => {
       );
     }
     gitOk(repo, ["config", "--unset", "i18n.logOutputEncoding"]);
+    // the cover letter's shortlog names authors through the mailmap (shortlog_init)
+    const emails = [...new Set(gitOk(repo, ["log", "-3", "--format=%ae"]).trim().split("\n"))];
+    writeFileSync(
+      join(repo, "cover.map"),
+      emails.map((e, k) => `Mapped ${k} <m${k}@example.com> <${e}>\n`).join(""),
+    );
+    gitOk(repo, ["config", "mailmap.file", "cover.map"]);
+    await compareBytes(
+      ["-3", "--cover-letter"],
+      (c) => c.setMaxCount(3).setCoverLetter(true),
+      "cover shortlog through the mailmap",
+    );
+    gitOk(repo, ["config", "--unset", "mailmap.file"]);
+    rmSync(join(repo, "cover.map"));
     // format.from: a boolean (git_parse_maybe_bool) or an ident, in-body From included
     for (const value of ["Cfg From <cfg@x>", "Ann <ann@x>", "true", "false", "1", "0", "yes"]) {
       gitOk(repo, ["config", "format.from", value]);

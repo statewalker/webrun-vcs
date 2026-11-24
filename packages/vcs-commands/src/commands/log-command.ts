@@ -55,7 +55,7 @@ import {
   LogPrinter,
   type LogReflogEntry,
 } from "./log-output.js";
-import { type Mailmap, readRepositoryMailmap } from "./mailmap.js";
+import type { Mailmap } from "./mailmap.js";
 import { configBool, configValue } from "./merge-config.js";
 import {
   addRefsByGlob,
@@ -857,8 +857,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       const mapped =
         this.useMailmap ??
         (this.logConfig ? configBool(this.workingCopy, "log.mailmap", true) : false);
-      if (headers && mapped)
-        mailmap = await this.loadMailmap(RemoteConfigStore.from(this._workingCopy));
+      if (headers && mapped) mailmap = await this.readMailmap();
       filters.push(
         CommitFilters.grep({
           messages: this.grepMessages,
@@ -1499,10 +1498,9 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   /** {@link callText} as bytes (messages and file contents that are not UTF-8 kept as they are). */
   async callBytes(options: LogOutputOptions = {}): Promise<Uint8Array> {
     // one operation for the worktree: its attributes files (diff drivers) and configuration
-    // are read once for every commit's diff, as git keeps its attribute stack
-    const worktree = this.worktreeAccess;
-    if (worktree?.batch) return worktree.batch(() => this.printLog(options));
-    return this.printLog(options);
+    // are read once for every commit's diff, as git keeps its attribute stack (a bare
+    // repository's working copy has none)
+    return this.inOneOperation(() => this.printLog(options));
   }
 
   private async printLog(options: LogOutputOptions): Promise<Uint8Array> {
@@ -1986,7 +1984,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         return out;
       },
       mailmap: () => {
-        mailmap ??= this.loadMailmap(config);
+        mailmap ??= this.readMailmap();
         return mailmap;
       },
       diff: async (entry, parent, formats, options) => {
@@ -2470,21 +2468,6 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       }
     }
     return out;
-  }
-
-  /** mailmap.c's read_mailmap: `.mailmap` (not in a bare repository), `mailmap.blob`, `mailmap.file` */
-  private async loadMailmap(config: RemoteConfigStore): Promise<Mailmap> {
-    return readRepositoryMailmap({
-      config: (key) => config.value(key),
-      worktree: this.worktreeAccess,
-      environment: hostEnvironmentOf(this._workingCopy),
-      readBlobNamed: async (name) => {
-        const id = await this.revisionResolver()
-          .resolve(name)
-          .catch(() => undefined);
-        return id ? this.readBlob(id) : undefined;
-      },
-    });
   }
 
   /**
