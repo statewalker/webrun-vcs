@@ -354,6 +354,45 @@ describeGit("credentials of git pull (statewalker-root#334)", () => {
     expect(seen).toEqual(["evil.example - -"]);
   });
 
+  it("pull <url> [<branch>] into an empty repository: the URL named gets them", async () => {
+    for (const branch of ["main", undefined]) {
+      seen = [];
+      const g = await repo({});
+      const pull = g.pull().setRemote(TRUSTED).setCredentials(CREDENTIALS).setHeaders(HEADERS);
+      if (branch) pull.setRemoteBranchName(branch);
+      const result = await pull.call();
+      expect(result.successful).toBe(true);
+      expect(seen).toEqual(["trusted.example alice s3cret"]);
+    }
+  });
+
+  it("pull with a URL in branch.<name>.remote: that URL gets them", async () => {
+    const g = await repo({}, [
+      ["config", "branch.main.remote", TRUSTED],
+      ["config", "branch.main.merge", "refs/heads/main"],
+    ]);
+    const result = await g.pull().setCredentials(CREDENTIALS).setHeaders(HEADERS).call();
+    expect(result.successful).toBe(true);
+    expect(seen).toEqual(["trusted.example alice s3cret"]);
+  });
+
+  it("pull <url> over smart HTTP: a redirect from it to another origin carries none", async () => {
+    const g = await repo({});
+    await g
+      .pull()
+      .setRemote("testhttp://redirect.example/src")
+      .setRemoteBranchName("main")
+      .setCredentials(CREDENTIALS)
+      .setHeaders(HEADERS)
+      .call();
+    const evil = seen.filter((l) => l.startsWith("evil.example "));
+    expect(evil.length).toBeGreaterThan(0);
+    for (const line of evil) expect(line).toBe("evil.example - -");
+    for (const line of seen.filter((l) => !l.startsWith("evil.example "))) {
+      expect(line).toBe("redirect.example auth s3cret");
+    }
+  });
+
   it("pull over smart HTTP: a redirect to another origin carries no credentials", async () => {
     const g = await repo({ origin: "testhttp://redirect.example/src" }, upstream);
     await g.pull().setCredentials(CREDENTIALS).setHeaders(HEADERS).call();

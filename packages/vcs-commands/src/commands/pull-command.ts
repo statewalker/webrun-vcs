@@ -41,7 +41,9 @@ interface MergeHead {
  *
  * Credentials and headers follow `GuardedTransportCommand`'s rule: {@link setCredentials} and
  * {@link setHeaders} go only to the origins named with `addCredentialOrigin`, else to the
- * default remote's origin while every remote the pull reaches has it; per-URL providers
+ * default remote's origin (`branch.<name>.remote`, a name or a URL) while every remote the
+ * pull reaches has it, or to the URL given to {@link setRemote} when it names no configured
+ * remote; per-URL providers
  * (`setCredentialsForUrl`, `setHeadersForUrl`) answer for their URL's origin; a redirect to
  * another origin carries none. `--all` runs `FetchMultipleCommand` (git's fetch_multiple).
  *
@@ -551,7 +553,8 @@ export class PullCommand extends GuardedTransportCommand<PullResult> {
     // a remote read from .git/remotes/ or .git/branches/ (git 2.x) is fetched with its own
     // refspecs, as any other: `git fetch <remote> [<refspec>...]`
     const fetchResults: FetchResult[] = [];
-    const defaultRemoteUrl = store.urlFor(store.remoteForBranch(localBranchName));
+    // remote_get(NULL): the branch's remote (a name, or a URL or path git allows there too)
+    const defaultRemoteUrl = store.remoteUrlOf(store.remoteForBranch(localBranchName));
     if (this.all) {
       // fetch --all: builtin/fetch.c's fetch_multiple (every remote fetched, a failure
       // reported once all ran, skipDefaultUpdate / skipFetchAll honoured)
@@ -575,7 +578,11 @@ export class PullCommand extends GuardedTransportCommand<PullResult> {
       if (fetched.remotes.length === 1) this.remote = fetched.remotes[0] as string;
     } else {
       await this.loadLegacyRemote(this.remote);
-      this.resolveAuth([store.remoteUrlOf(this.remote)], defaultRemoteUrl);
+      // a URL the caller names (no configured remote) is the one this fetch is for: its
+      // origin is trusted, as FetchCommand trusts the URL it is given
+      const url = store.remoteUrlOf(this.remote);
+      const named = this.remoteGiven && !store.isConfigured(this.remote);
+      this.resolveAuth([url], named ? url : defaultRemoteUrl);
       fetchResults.push(await this.fetchCommand(this.remote, this.refSpecs, action).call());
     }
     const fetchResult = fetchResults[fetchResults.length - 1];
