@@ -6,7 +6,13 @@
  */
 
 import { createInflater } from "@statewalker/vcs-utils";
-
+import {
+  isGitSpace,
+  WS_CR_AT_EOL,
+  WS_INCOMPLETE_LINE,
+  whitespaceErrorString,
+  wsCheck,
+} from "../../whitespace/index.js";
 import {
   BINARY_DELTA,
   BINARY_LITERAL,
@@ -17,13 +23,6 @@ import {
   type WsErrorAction,
 } from "./apply-types.js";
 import { bytesToLatin1, cQuote, cUnquote, latin1ToBytes } from "./latin1.js";
-import {
-  isGitSpace,
-  WS_CR_AT_EOL,
-  WS_INCOMPLETE_LINE,
-  whitespaceErrorString,
-  wsCheck,
-} from "./whitespace.js";
 
 const TERM_SPACE = 1;
 const TERM_TAB = 2;

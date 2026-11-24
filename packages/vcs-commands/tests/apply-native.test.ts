@@ -1013,6 +1013,111 @@ describeGit("git apply as native git", () => {
   });
 });
 
+describeGit("t4124-apply-ws-rule", () => {
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "apply-ws-rule-"));
+    home = join(root, "home");
+    mkdirSync(home, { recursive: true });
+    modern = gitAtLeast(gitOk(root, "--version"), 2, 46);
+  });
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  // prepare_test_file: a line with X is touched iff RULE is in effect (! trailing-space,
+  // @ space-before-tab, # indent-with-non-tab, = indent-with-non-tab,tabwidth=16, % tab-in-indent)
+  const testFile = [
+    "An_SP in an ordinary line>and a HT.",
+    ">A HT (%).",
+    "_>A SP and a HT (@%).",
+    "_>_A SP, a HT and a SP (@%).",
+    "_______Seven SP.",
+    "________Eight SP (#).",
+    "_______>Seven SP and a HT (@%).",
+    "________>Eight SP and a HT (@#%).",
+    "_______>_Seven SP, a HT and a SP (@%).",
+    "________>_Eight SP, a HT and a SP (@#%).",
+    "_______________Fifteen SP (#).",
+    "_______________>Fifteen SP and a HT (@#%).",
+    "________________Sixteen SP (#=).",
+    "________________>Sixteen SP and a HT (@#%=).",
+    "_____a__Five SP, a non WS, two SP.",
+    "A line with a (!) trailing SP_",
+    "A line with a (!) trailing HT>",
+  ]
+    .map((l) => `${l.replace(/_/g, " ").replace(">", "\t")}\n`)
+    .join("");
+  // setup: `git diff-files -p` of the file, renamed to target as apply_patch's sed does
+  const patch = `diff --git a/target b/target
+index e69de29..${"0".repeat(7)} 100644
+--- a/target
++++ b/target
+@@ -0,0 +1,${testFile.split("\n").length - 1} @@
+${testFile
+  .split("\n")
+  .slice(0, -1)
+  .map((l) => `+${l}\n`)
+  .join("")}`;
+  const base = (rules: { config?: string; attributes?: string }): Setup => {
+    return (repo) => {
+      put(repo, "target", "");
+      gitOk(repo, "add", "target");
+      if (rules.config !== undefined) gitOk(repo, "config", "core.whitespace", rules.config);
+      if (rules.attributes !== undefined) put(repo, ".gitattributes", rules.attributes);
+    };
+  };
+  const cases = (rule: string) => [
+    { config: rule },
+    { config: `${rule},tabwidth=16` },
+    { attributes: `target whitespace=${rule}\n` },
+    { attributes: `target whitespace=${rule},tabwidth=16\n` },
+    // the attribute wins over core.whitespace, per path
+    { config: "-trailing,-space,-indent,-tab", attributes: `target whitespace=${rule}\n` },
+    { config: rule, attributes: "target -whitespace\n" },
+    { config: rule, attributes: "other -whitespace\ntarget whitespace\n" },
+  ];
+
+  it('t4124-apply-ws-rule.sh: "whitespace=nowarn, default rule", "whitespace=warn, default rule", "whitespace=error-all, default rule", "whitespace=error-all, no rule", "whitespace=error-all, no rule (attribute)"', async () => {
+    for (const [rules, args] of [
+      [{}, ["--whitespace=nowarn"]],
+      [{}, ["--whitespace=warn"]],
+      [{}, ["--whitespace=error-all"]],
+      [{ config: "-trailing,-space-before,-indent" }, ["--whitespace=error-all"]],
+      [{ attributes: "target -whitespace\n" }, ["--whitespace=error-all"]],
+    ] as [{ config?: string; attributes?: string }, string[]][]) {
+      await compareApply(
+        twins(base(rules)),
+        patch,
+        { args, configure: (c) => configureArgs(c, args) },
+        `${JSON.stringify(rules)} ${args.join(" ")}`,
+      );
+    }
+  }, 120_000);
+
+  it('t4124-apply-ws-rule.sh: "spaces inserted by tab-in-indent", "rule=<rule>", "rule=<rule>,tabwidth=16", "rule=<rule> (attributes)", "rule=<rule>,tabwidth=16 (attributes)"', async () => {
+    const rules: string[] = ["-trailing,-space,-indent,tab"];
+    for (const t of ["-", ""])
+      for (const s of ["-", ""])
+        for (const i of ["-", ""])
+          for (const h of ["-", ""]) {
+            if (h === "" && i === "") continue;
+            rules.push(`${t}trailing,${s}space,${i}indent,${h}tab`);
+          }
+    for (const rule of rules) {
+      for (const rulesOf of cases(rule)) {
+        for (const args of [["--whitespace=fix"], ["--whitespace=error-all"]]) {
+          await compareApply(
+            twins(base(rulesOf)),
+            patch,
+            { args, configure: (c) => configureArgs(c, args) },
+            `${JSON.stringify(rulesOf)} ${args.join(" ")}`,
+          );
+        }
+      }
+    }
+  }, 600_000);
+});
+
 /** Our command configured as native `git apply <args>`. */
 function configureArgs(c: ApplyCommand, args: string[]): ApplyCommand {
   for (const a of args) {

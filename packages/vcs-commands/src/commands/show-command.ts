@@ -66,7 +66,7 @@ export interface ShowResult {
   readonly stdout: Uint8Array;
   /** git's stderr lines (`error: could not read object <id>`, revision warnings) */
   readonly errors: string[];
-  /** 0, or 255 when an object could not be read (cmd_show's `error()` return) */
+  /** 0, 2 when `--check` found errors, or 255 when an object could not be read (cmd_show's `error()` return) */
   readonly exitCode: number;
 }
 
@@ -197,12 +197,13 @@ export class ShowCommand extends GitCommand<ShowResult> {
       }
       if (this.maxCount !== undefined) log.setMaxCount(this.maxCount);
       if (this.skip) log.setSkip(this.skip);
-      return { stdout: await log.callBytes(output), errors, exitCode: 0 };
+      const stdout = await log.callBytes(output);
+      return { stdout, errors, exitCode: log.exitCode };
     }
     const session = await log.showSession(output);
     let exitCode = 0;
     try {
-      exitCode = await this.showObjects(entries, session, errors, textconv === true);
+      exitCode = await this.showObjects(entries, session, errors, textconv === true, log);
     } catch (error) {
       // a read git dies of: what was printed before stays on stdout
       if (!(error instanceof ShowDeath)) throw error;
@@ -218,6 +219,7 @@ export class ShowCommand extends GitCommand<ShowResult> {
     session: ShowSession,
     errors: string[],
     textconv: boolean,
+    log: LogCommand,
   ): Promise<number> {
     for (const entry of entries) {
       const name = entry.name ?? entry.id;
@@ -236,6 +238,8 @@ export class ShowCommand extends GitCommand<ShowResult> {
           session.markShown();
         } else if (type === "commit") {
           await session.commit(id);
+          // cmd_log_walk's status: --check's errors end the loop with 2
+          if (log.exitCode !== 0) return log.exitCode;
         } else if (type === "tag") {
           const target = await this.showTag(id, session);
           if (target === undefined || (await this.objectKind(target)) === undefined) {
@@ -475,6 +479,7 @@ function showDefaults(options: LogOutputOptions, firstParent: boolean): LogOutpu
     !!options.numstat ||
     !!options.nameOnly ||
     !!options.nameStatus ||
+    !!options.check ||
     !!options.summary;
   const mergesGiven = !!options.m || !!options.c || !!options.cc || !!options.diffMerges;
   return {
