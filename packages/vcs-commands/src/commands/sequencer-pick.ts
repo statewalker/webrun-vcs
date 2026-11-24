@@ -577,11 +577,18 @@ export class PickSequencer {
     return { status: "ok", newHead: origHead, picked: [], output: errors };
   }
 
-  /** `--quit`: the operation forgotten, index, worktree and HEAD kept. */
+  /**
+   * `--quit` (builtin/revert.c): sequencer_remove_state (`sequencer/` removed), then
+   * remove_branch_state (CHERRY_PICK_HEAD, REVERT_HEAD, AUTO_MERGE, SQUASH_MSG, MERGE_MSG,
+   * MERGE_HEAD, MERGE_MODE, MERGE_RR go, a MERGE_AUTOSTASH is kept on `refs/stash`); the
+   * index, the worktree, HEAD and ORIG_HEAD are kept. Nothing in progress is no error.
+   */
   async quit(): Promise<PickOutcome> {
     await this.deps.state.remove("sequencer");
-    await this.deps.state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD");
-    return { status: "ok", newHead: await this.headId(), picked: [], output: [] };
+    const output = await removeBranchState(this.deps, this.deps.state);
+    // an unborn HEAD is no error here
+    const head = (await this.deps.refs.resolve("HEAD").catch(() => undefined))?.objectId;
+    return { status: "ok", ...(head ? { newHead: head } : {}), picked: [], output };
   }
 
   /**
