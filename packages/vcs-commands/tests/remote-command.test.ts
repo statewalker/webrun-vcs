@@ -65,16 +65,13 @@ describe.each(backends)("RemoteAddCommand ($name backend)", ({ factory }) => {
       // Add first remote
       await git.remoteAdd().setName("origin").setUri("https://github.com/user/repo").call();
 
-      // A tracking ref too: either half — the config section written by the
-      // add above, or a ref under refs/remotes/origin/ — makes the remote
-      // exist. (See remote-config-persistence.test.ts for the config-only
-      // case, which this working copy's plain `{}` config cannot outlive.)
-      await workingCopy.history.refs.set("refs/remotes/origin/main", "a".repeat(40));
+      // The config section written by the add above makes the remote exist (git's
+      // remote_is_configured); tracking refs alone would not.
 
       // Try to add duplicate
       await expect(
         git.remoteAdd().setName("origin").setUri("https://github.com/other/repo").call(),
-      ).rejects.toThrow("Remote 'origin' already exists");
+      ).rejects.toThrow("error: remote origin already exists.");
     });
 
     it("should throw for missing name", async () => {
@@ -279,8 +276,8 @@ describe.each(backends)("RemoteSetUrlCommand ($name backend)", ({ factory }) => 
       const workingCopy = await createTestWorkingCopy();
       const git = Git.fromWorkingCopy(workingCopy);
 
-      // Create remote tracking refs
-      await workingCopy.history.refs.set("refs/remotes/origin/main", "a".repeat(40));
+      // A configured remote (tracking refs alone are none to git's set-url)
+      await git.remoteAdd().setName("origin").setUri("https://github.com/old/repo").call();
 
       const result = await git
         .remoteSetUrl()
@@ -296,8 +293,8 @@ describe.each(backends)("RemoteSetUrlCommand ($name backend)", ({ factory }) => 
       const workingCopy = await createTestWorkingCopy();
       const git = Git.fromWorkingCopy(workingCopy);
 
-      // Create remote tracking refs
-      await workingCopy.history.refs.set("refs/remotes/origin/main", "a".repeat(40));
+      // A configured remote (tracking refs alone are none to git's set-url)
+      await git.remoteAdd().setName("origin").setUri("https://github.com/old/repo").call();
 
       const result = await git
         .remoteSetUrl()
@@ -320,7 +317,7 @@ describe.each(backends)("RemoteSetUrlCommand ($name backend)", ({ factory }) => 
           .setRemoteName("nonexistent")
           .setRemoteUri("https://github.com/user/repo")
           .call(),
-      ).rejects.toThrow("Remote 'nonexistent' does not exist");
+      ).rejects.toThrow("error: No such remote 'nonexistent'");
     });
 
     it("should throw for missing name", async () => {
