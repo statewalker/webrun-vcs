@@ -51,7 +51,6 @@ import {
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import {
-  IncompatibleOptionsError,
   InvalidArgumentError,
   InvalidPathError,
   InvalidRefNameError,
@@ -87,7 +86,8 @@ import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { runPostCheckoutHook } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { OperationState, updateIndexCacheTree } from "./merge-support.js";
-import { globalPathspecMagic, parsePathspecFile } from "./pathspec.js";
+import { globalPathspecMagic } from "./pathspec.js";
+import { PathspecFile } from "./pathspec-file.js";
 import { markIndexUpdate } from "./post-index-change.js";
 import { reflogMessages } from "./reflog-messages.js";
 import { checkFlaggedEntries, recordWrittenStat, restoreWorktreeHard } from "./reset-command.js";
@@ -292,9 +292,8 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
   private conflictStyle?: ConflictStyle;
   private quiet = false;
   private countCheckoutPaths = false;
-  private pathspecFromFile: string[] = [];
-  /** Whether `--pathspec-from-file` was given (an empty file included) */
-  private pathspecFileGiven = false;
+  /** `--pathspec-from-file` */
+  private readonly pathspecFile = new PathspecFile();
   /** Set by a `merge` checkout the two-way merge refused: what the autostash needs */
   private autostashSwitch?: { label: string; base: string };
 
@@ -653,16 +652,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
    */
   setPathspecFromFile(content: string | Uint8Array, nul = false): this {
     this.checkCallable();
-    this.pathspecFileGiven = true;
-    try {
-      this.pathspecFromFile = parsePathspecFile(content, nul);
-    } catch (error) {
-      throw new InvalidArgumentError(
-        "pathspecFromFile",
-        content,
-        `fatal: ${(error as Error).message}`,
-      );
-    }
+    this.pathspecFile.read(content, nul);
     return this;
   }
 
@@ -721,20 +711,16 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     return this;
   }
 
+  /** checkout_main's checks of `--pathspec-from-file`: pathspec arguments, then `--detach`. */
+  private refusePathspecFileOptions(): void {
+    this.pathspecFile.refuseArguments(this.paths);
+    this.pathspecFile.refuse("--detach", this.detach);
+  }
+
   /** checkout_main's checks of `--pathspec-from-file` with `-p`. */
   private refusePathspecFileWithPatch(): void {
-    if (!this.pathspecFileGiven) return;
-    if (this.paths.length > 0) {
-      throw new InvalidArgumentError(
-        "pathspecFromFile",
-        this.pathspecFromFile,
-        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together",
-      );
-    }
-    throw new IncompatibleOptionsError(
-      ["--pathspec-from-file", "--patch"],
-      "fatal: options '--pathspec-from-file' and '--patch' cannot be used together",
-    );
+    this.refusePathspecFileOptions();
+    this.pathspecFile.refuse("--patch", true);
   }
 
   /** `git checkout -p`: run_add_p(ADD_P_CHECKOUT, rev). */
@@ -758,7 +744,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
       mode: pathPatchMode(true, true, revision),
       selector: this.patchSelector,
       ...(diffRevision !== undefined ? { diffRevision } : {}),
-      paths: [...this.pathspecFromFile, ...this.paths],
+      paths: [...this.pathspecFile.elements, ...this.paths],
       compatibility: this.patchCompatibility,
     });
     return {
@@ -779,10 +765,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     // unwritten edits (refused)
     await this.readCurrentIndex();
     if (this.patch) return this.callPatch();
+    this.refusePathspecFileOptions();
 
     // path checkout, or branch checkout; one worktree batch, so the checks and the writes
     // share one reading of the ignore rules
-    const pathCheckout = this.allPaths || this.paths.length > 0 || this.pathspecFromFile.length > 0;
+    const pathCheckout =
+      this.allPaths || this.paths.length > 0 || this.pathspecFile.elements.length > 0;
     const oldHead = this.hooks.enabled
       ? (await this.refsStore.resolve("HEAD"))?.objectId
       : undefined;
@@ -1042,17 +1030,10 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
     if (this.track !== TrackMode.DEFAULT) {
       throw new SwitchRefusedError("fatal: '--track' cannot be used with updating paths");
     }
-    if (this.paths.length > 0 && this.pathspecFromFile.length > 0) {
-      throw new InvalidArgumentError(
-        "pathspecFromFile",
-        this.pathspecFromFile,
-        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together",
-      );
-    }
     const source = this.startPoint ?? this.name;
     const outcome = await runPathCheckout(this.pathCheckoutContext(), {
       command: "checkout",
-      paths: [...this.pathspecFromFile, ...this.paths],
+      paths: [...this.pathspecFile.elements, ...this.paths],
       allPaths: this.allPaths,
       ...(source !== undefined ? { source } : {}),
       ...(this.overlay !== undefined ? { overlay: this.overlay } : {}),
