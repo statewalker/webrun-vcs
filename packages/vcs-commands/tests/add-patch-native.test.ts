@@ -180,6 +180,18 @@ describeGit("add -p as native git", () => {
     await compare(twins(threeHunks), ["add", "-p"], more, add(more));
   });
 
+  it("stages an empty intent-to-add file, clearing its flag", async () => {
+    const build = (dir: string) => {
+      threeHunks(dir);
+      put(dir, "e", "");
+      gitOk(root, dir, "add", "-N", "e");
+    };
+    const all = ["y", "y", "y", "y", "y"];
+    await compare(twins(build), ["add", "-p"], all, add(all));
+    await compare(twins(build), ["add", "-p", "--", "e"], ["y"], add(["y"], ["e"]));
+    await compare(twins(build), ["add", "-p", "--", "e"], ["n"], add(["n"], ["e"]));
+  });
+
   it("stops at the end of input", async () => {
     const answers = ["y"];
     await compare(twins(threeHunks), ["add", "-p"], answers, add(answers));

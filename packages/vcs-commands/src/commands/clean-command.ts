@@ -1,4 +1,5 @@
 import { FileMode, isValidWorktreePath } from "@statewalker/vcs-core";
+import { parseGitBool } from "@statewalker/vcs-utils";
 import { compareGitPaths, decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   commandLineExcluded,
@@ -8,6 +9,13 @@ import {
   type Worktree,
 } from "@statewalker/vcs-working-tree";
 import { GitCommand } from "../git-command.js";
+import { RemoteConfigStore } from "../remote-config/index.js";
+import type { PatchSelector } from "./add-patch/index.js";
+import {
+  type CleanInteractiveResult,
+  parseColumnLayout,
+  runCleanInteractive,
+} from "./clean-interactive.js";
 import { coreBool } from "./core-config.js";
 import {
   DO_MATCH_LEADING_PATHSPEC,
@@ -43,6 +51,8 @@ export interface CleanResult {
    * remove (git then exits with status 1)
    */
   warnings: string[];
+  /** With {@link CleanCommand.setInteractive}: what `git clean -i` printed */
+  interactive?: CleanInteractiveResult;
 }
 
 /**
@@ -87,6 +97,9 @@ export class CleanCommand extends GitCommand<CleanResult> {
   private ignoredOnly = false;
   private forceNested = false;
   private excludePatterns: string[] = [];
+  private interactive?: PatchSelector;
+  private columns?: number;
+  private compatibility: "2.43" | "2.56" = "2.56";
 
   /**
    * Limit clean to specific paths.
@@ -182,6 +195,46 @@ export class CleanCommand extends GitCommand<CleanResult> {
   }
 
   /**
+   * `git clean -i` (`--interactive`): builtin/clean.c's `interactive_main_loop` over the
+   * items to delete before anything is removed. The items are listed in columns
+   * (`column.ui`/`column.clean` layout, {@link setColumns} wide), then the "*** Commands ***"
+   * menu offers clean, filter by pattern (items matching ignore patterns are kept), select by
+   * numbers, ask each ("Remove <item> [y/N]? "), quit and help. Every read git makes from
+   * standard input goes to `selector`: the menus as `choose` requests ("What now> ", "Select
+   * items to delete>> "), the patterns as a `line`, each question as a `yesno`; undefined is
+   * the end of input. What is left is removed as {@link setDryRun} says (git's `-i` alone
+   * removes: pass `setDryRun(false)`), and `cleaned` lists it in git's order; the result's
+   * `interactive` carries the transcript.
+   *
+   * @example
+   * ```typescript
+   * const answers = ["s", "1,3", "", "c"];
+   * const result = await git.clean().setDryRun(false)
+   *   .setInteractive(() => answers.shift()).call();
+   * process.stdout.write(result.interactive?.output ?? "");
+   * ```
+   */
+  setInteractive(selector: PatchSelector | undefined): this {
+    this.checkCallable();
+    this.interactive = selector;
+    return this;
+  }
+
+  /** The terminal width `git clean -i` lays its columns out in (git's `term_columns`, 80). */
+  setColumns(columns: number): this {
+    this.checkCallable();
+    this.columns = columns;
+    return this;
+  }
+
+  /** The git version `git clean -i` reproduces (2.43 differs in one warning). */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
+    return this;
+  }
+
+  /**
    * Execute the clean command, as `git clean -f` (`-d` with `setCleanDirectories(true)`,
    * `-x` with `setIgnore(false)`, `-X` with `setIgnoredOnly(true)`, `-ff` with
    * `setForceNestedRepositories(true)`, `-n` with dry run, path filters as git's
@@ -254,20 +307,44 @@ export class CleanCommand extends GitCommand<CleanResult> {
     scan.readDirectory(root);
     const entries = scan.correctedEntries();
 
-    // what git deletes: entries the index does not have; directories only with -d (or a
-    // path filter)
-    const files: string[] = [];
-    const dirs: CleanNode[] = [];
+    // what git deletes (del_list): entries the index does not have; directories only with
+    // -d (or a path filter)
+    let names: string[] = [];
     for (const name of entries) {
       if (!scan.isOther(name)) continue;
       const path = name.endsWith("/") ? name.slice(0, -1) : name;
       const n = nodes.get(path);
       if (!n) continue;
       if (n.directory) {
-        if (removeDirectories) dirs.push(n);
-      } else if (isValidWorktreePath(path)) files.push(path);
+        if (removeDirectories) names.push(name);
+      } else if (isValidWorktreePath(path)) names.push(name);
     }
-    return this.removeEntries(worktree, files, dirs, scan.warnings);
+    let interactive: CleanInteractiveResult | undefined;
+    if (this.interactive && names.length > 0) {
+      const config = RemoteConfigStore.from(this.workingCopy);
+      const layout = parseColumnLayout(
+        ["column.ui", "column.clean"].flatMap((key) => config.value(key) ?? []),
+      );
+      const session = await runCleanInteractive({
+        selector: this.interactive,
+        items: names,
+        isDirectory: (item) => item.endsWith("/"),
+        ...(this.columns !== undefined ? { columns: this.columns } : {}),
+        layout,
+        quotePath: parseGitBool(config.value("core.quotePath") ?? "true") ?? true,
+        ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
+        compatibility: this.compatibility,
+      });
+      names = session.items;
+      interactive = { output: session.output };
+    }
+    const items: (string | CleanNode)[] = [];
+    for (const name of names) {
+      const n = nodes.get(name.endsWith("/") ? name.slice(0, -1) : name) as CleanNode;
+      items.push(n.directory ? n : n.path);
+    }
+    const result = await this.removeEntries(worktree, items, scan.warnings);
+    return interactive ? { ...result, interactive } : result;
   }
 
   /**
@@ -371,13 +448,13 @@ export class CleanCommand extends GitCommand<CleanResult> {
    */
   private async removeEntries(
     worktree: Worktree,
-    files: string[],
-    dirs: CleanNode[],
+    items: (string | CleanNode)[],
     warnings: string[],
   ): Promise<CleanResult> {
     const cleaned = new Set<string>();
     const skipped = new Set<string>();
-    const removeFiles = [...files];
+    const dirs = items.filter((item): item is CleanNode => typeof item !== "string");
+    const removeFiles = items.filter((item): item is string => typeof item === "string");
     const removeDirs: string[] = [];
     const repositories: string[] = [];
     const options = { nonRepositoryGitDirs: true };
@@ -422,8 +499,11 @@ export class CleanCommand extends GitCommand<CleanResult> {
       if (!all) for (const d of dels) cleaned.add(d);
       return all;
     };
-    for (const path of files) cleaned.add(path);
-    for (const dir of dirs) if (await remove(dir)) cleaned.add(`${dir.path}/`);
+    // in git's order (del_list's): what a directory's removal prints comes in its place
+    for (const item of items) {
+      if (typeof item === "string") cleaned.add(item);
+      else if (await remove(item)) cleaned.add(`${item.path}/`);
+    }
 
     if (!this.dryRun) {
       for (const path of removeFiles) await worktree.remove(path, options);

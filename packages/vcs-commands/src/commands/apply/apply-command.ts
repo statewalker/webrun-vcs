@@ -56,7 +56,7 @@ export interface ApplyResult {
   /** Paths left with conflicts by `--3way` */
   conflicts: string[];
   /** With {@link ApplyCommand.setTemporaryIndex}: that index after the patches */
-  index?: Map<string, { mode: number; objectId: string }>;
+  index?: Map<string, { mode: number; objectId: string; intentToAdd?: boolean }>;
 }
 
 /** One patch to apply. */
@@ -104,7 +104,7 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
   private verbosity: ApplyVerbosity = 0;
   private mergeVariant?: "ours" | "theirs" | "union";
   private legacyMessages = false;
-  private temporaryIndex?: Map<string, { mode: number; objectId: string }>;
+  private temporaryIndex?: Map<string, { mode: number; objectId: string; intentToAdd?: boolean }>;
 
   /**
    * Adds a patch. `name` is the patch file's name as git shows it in messages (the file
@@ -305,7 +305,9 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
    * Applies to this index instead of the repository's (`--cached` with git's
    * `index_file`, as `git am --3way` applies to its fake ancestor); the result has it.
    */
-  setTemporaryIndex(index: Map<string, { mode: number; objectId: string }>): this {
+  setTemporaryIndex(
+    index: Map<string, { mode: number; objectId: string; intentToAdd?: boolean }>,
+  ): this {
     this.temporaryIndex = new Map(index);
     this.cached = true;
     return this;
@@ -387,6 +389,7 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
             mode: e.mode,
             objectId: e.objectId,
             stage: 0,
+            ...(e.intentToAdd ? { intentToAdd: true } : {}),
           } as IndexEntry);
         return indexEntries;
       }
@@ -533,8 +536,13 @@ export class ApplyCommand extends GitCommand<ApplyResult> {
       for (const [name, entries] of engine.indexChanges) {
         const path = toPath(name);
         const e = entries.find((x) => !x.stage);
-        if (e) this.temporaryIndex.set(path, { mode: e.mode, objectId: e.oid });
-        else this.temporaryIndex.delete(path);
+        if (e) {
+          this.temporaryIndex.set(path, {
+            mode: e.mode,
+            objectId: e.oid,
+            ...(e.intentToAdd ? { intentToAdd: true } : {}),
+          });
+        } else this.temporaryIndex.delete(path);
       }
     } else if (writeIndex && engine.indexChanges.size) {
       const changes = new Map<string, IndexEntryInput[]>();

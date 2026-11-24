@@ -34,6 +34,15 @@ import { GitCommand } from "../git-command.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { AddCommand } from "./add-command.js";
 import {
+  type PatchCompatibility,
+  type PatchOptions,
+  type PatchResult,
+  type PatchSelector,
+  patchModeFor,
+  runPatchSelection,
+  type TemporaryIndex,
+} from "./add-patch/index.js";
+import {
   amendCommitText,
   autosquashSubject,
   commitSubjectLength,
@@ -57,6 +66,7 @@ import { reencodedCommitParts } from "./log-output.js";
 import {
   flatTree,
   OperationState,
+  rewriteIndex,
   updateIndexCacheTree,
   writeIndexAsTree,
 } from "./merge-support.js";
@@ -216,6 +226,12 @@ export class CommitCommand extends GitCommand<CommitResult> {
   private squashFrom?: string;
   /** --fixup, parsed when the commit runs */
   private fixup?: { kind: FixupKind; target: string };
+  /** `-p` / `--patch` */
+  private patch = false;
+  private patchSelector?: PatchSelector;
+  private patchOptions: PatchOptions = {};
+  private patchCompatibility: PatchCompatibility = "2.56";
+  private patchResult?: PatchResult;
 
   /**
    * Set the commit message, as git's `commit -m` takes it: its last line is ended and it is
@@ -534,6 +550,59 @@ export class CommitCommand extends GitCommand<CommitResult> {
     this.checkCallable();
     this.pathspecFile.read(content, nul);
     return this;
+  }
+
+  /**
+   * `git commit -p` (`--patch`): the changes between the index and the worktree are offered
+   * hunk by hunk as `git add -p` offers them, and the selected hunks are committed along
+   * with what is staged already. As git's prepare_index for `--interactive`: the index lock
+   * is taken and the refreshed index written into it, the hunks are applied to that
+   * temporary index (`GIT_INDEX_FILE` at the lock), and the commit is made from it; the lock
+   * becomes the index once HEAD has moved, and on any failure (nothing selected: "no changes
+   * added to commit") the index stays as it was. The paths of {@link setOnly} limit the
+   * hunks offered. The prompts are answered by {@link setPatchSelector}; what patch mode
+   * printed is {@link getPatchResult}'s. Refused with {@link setAll} and
+   * {@link setInclude}.
+   *
+   * @example
+   * ```typescript
+   * const answers = ["y", "n"];
+   * const commit = git.commit().setMessage("Part").setPatch(true)
+   *   .setPatchSelector(() => answers.shift());
+   * await commit.call();
+   * process.stdout.write(commit.getPatchResult()?.output ?? "");
+   * ```
+   */
+  setPatch(patch: boolean): this {
+    this.checkCallable();
+    this.patch = patch;
+    return this;
+  }
+
+  /** Answers the prompts of {@link setPatch} (git's reads from standard input and its editor). */
+  setPatchSelector(selector: PatchSelector): this {
+    this.checkCallable();
+    this.patchSelector = selector;
+    return this;
+  }
+
+  /** `-U<n>` and `--inter-hunk-context=<n>` of {@link setPatch}. */
+  setPatchOptions(options: PatchOptions): this {
+    this.checkCallable();
+    this.patchOptions = { ...options };
+    return this;
+  }
+
+  /** The git version whose patch-mode prompts {@link setPatch} reproduces (default 2.56). */
+  setCompatibility(version: PatchCompatibility): this {
+    this.checkCallable();
+    this.patchCompatibility = version;
+    return this;
+  }
+
+  /** What {@link setPatch}'s selection printed and applied; read after {@link call}. */
+  getPatchResult(): PatchResult | undefined {
+    return this.patchResult;
   }
 
   /**
@@ -1259,6 +1328,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // the index as it is now: one another writer replaced is read again (git reads the
     // index at its start), unless this instance holds unwritten edits (refused)
     await this.readCurrentIndex();
+    if (this.patch) return this.commitPatch();
     this.applyPathspecFile();
     if (this.include) return this.commitIncluded();
     // `--fixup=reword:` is a partial commit of no path: HEAD's tree (git sets `only`)
@@ -1274,6 +1344,85 @@ export class CommitCommand extends GitCommand<CommitResult> {
         await this.stageTrackedChanges();
         return await this.commitWith(partial, index);
       });
+    } catch (error) {
+      await index.release();
+      throw error;
+    }
+  }
+
+  /**
+   * `-p` (git's prepare_index for `interactive`): the option checks, then the index lock held
+   * and the hunks selected into the index it holds (`interactive_add` with `GIT_INDEX_FILE`
+   * at the lock), then the commit from it.
+   */
+  private async commitPatch(): Promise<CommitResult> {
+    // parse_and_validate_options: -i, -o, -a and --interactive/-p exclude each other
+    if (this.include || this.all) {
+      const other = this.include ? "-i/--include" : "-a/--all";
+      throw new IncompatibleOptionsError(
+        [other, "--interactive/-p/--patch"],
+        `fatal: options '${other}' and '--interactive/-p/--patch' cannot be used together`,
+      );
+    }
+    if (this.pathspecFile.given) {
+      throw new IncompatibleOptionsError(
+        ["--pathspec-from-file", "--interactive/--patch"],
+        "fatal: options '--pathspec-from-file' and '--interactive/--patch' cannot be used together",
+      );
+    }
+    const index = await this.holdIndex();
+    try {
+      // refresh_cache_or_die: an unmerged entry dies before anything is asked
+      if (await this.staging.hasConflicts())
+        throw unmergedPathsError(await this.staging.getConflictedPaths());
+      const temporary: TemporaryIndex = new Map();
+      const entries = new Map<string, StagingEntry>();
+      for await (const entry of this.staging.entries()) {
+        if (entry.stage !== 0) continue;
+        entries.set(entry.path, entry);
+        const { path: _p, mode, objectId, stage: _s, ...carried } = entry;
+        temporary.set(entry.path, { mode, objectId, carried });
+      }
+      this.patchResult = await runPatchSelection(this.workingCopy, {
+        hookSource: this,
+        ...this.patchOptions,
+        mode: patchModeFor("add"),
+        selector: this.patchSelector,
+        paths: this.onlyPaths,
+        compatibility: this.patchCompatibility,
+        temporaryIndex: temporary,
+      });
+      // the temporary index read back into the held index: entries apply rewrote (no stat
+      // data, as `apply --cached` writes them), and the paths it removed
+      const changes = new Map<string, StagingEntry[]>();
+      for (const [path, entry] of temporary) {
+        const old = entries.get(path);
+        // an entry apply rewrote with the same blob (an empty intent-to-add file staged)
+        // loses its intent-to-add flag, so it is no longer the entry it was
+        if (
+          old &&
+          old.mode === entry.mode &&
+          old.objectId === entry.objectId &&
+          !!old.intentToAdd === !!entry.carried?.intentToAdd
+        ) {
+          continue;
+        }
+        changes.set(path, [
+          {
+            path,
+            mode: entry.mode,
+            objectId: entry.objectId,
+            stage: 0,
+            size: 0,
+            mtime: 0,
+          } as StagingEntry,
+        ]);
+      }
+      for (const path of entries.keys()) if (!temporary.has(path)) changes.set(path, []);
+      if (changes.size > 0) {
+        await rewriteIndex(this.staging, changes, { upToDate: false, write: false });
+      }
+      return await this.withOneIndexWrite("first", () => this.commitWith(false, index));
     } catch (error) {
       await index.release();
       throw error;
@@ -1496,7 +1645,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
         `fatal: reword option of '--fixup' and path '${path}' cannot be used together`,
       );
     }
-    if (this.all || this.include) {
+    // check_fixup_reword_options: patch_interactive || interactive || all || also || only
+    if (this.all || this.include || this.patch) {
       throw new IncompatibleOptionsError(
         ["--fixup", "--all"],
         "fatal: reword option of '--fixup' and '--patch/--interactive/--all/--include/--only' cannot be used together",
@@ -1647,16 +1797,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // Check for conflicts (a partial commit records HEAD and the named paths: other
     // unmerged paths stay in the index, as git's)
     if (!partial && (await this.staging.hasConflicts())) {
-      const conflictPaths = await this.staging.getConflictedPaths();
-      throw new UnmergedPathsError(
-        conflictPaths,
-        [
-          "error: Committing is not possible because you have unmerged files.",
-          "hint: Fix them up in the work tree, and then use 'git add/rm <file>'",
-          "hint: as appropriate to mark resolution and make a commit.",
-          "fatal: Exiting because of an unresolved conflict.",
-        ].join("\n"),
-      );
+      throw unmergedPathsError(await this.staging.getConflictedPaths());
     }
 
     // a merge, cherry-pick or revert in progress (git's whence: MERGE_HEAD,
@@ -2696,6 +2837,19 @@ export class CommitCommand extends GitCommand<CommitResult> {
     // Get worktree from WorkingCopy
     return this.worktreeAccess;
   }
+}
+
+/** git's `die_resolve_conflict("commit")`. */
+function unmergedPathsError(paths: string[]): UnmergedPathsError {
+  return new UnmergedPathsError(
+    paths,
+    [
+      "error: Committing is not possible because you have unmerged files.",
+      "hint: Fix them up in the work tree, and then use 'git add/rm <file>'",
+      "hint: as appropriate to mark resolution and make a commit.",
+      "fatal: Exiting because of an unresolved conflict.",
+    ].join("\n"),
+  );
 }
 
 /** git's "paths '<first> ...' with -a does not make sense". */

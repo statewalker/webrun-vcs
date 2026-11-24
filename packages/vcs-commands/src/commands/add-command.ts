@@ -33,7 +33,15 @@ import {
   runAddInteractive,
   runPatchSelection,
 } from "./add-patch/index.js";
+import {
+  ApplyCommand,
+  bytesToLatin1,
+  latin1ToBytes,
+  latin1ToText,
+  textToLatin1,
+} from "./apply/index.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
+import { DiffCommand } from "./diff-command.js";
 import {
   AddToIndexError,
   chmodIndexEntries,
@@ -102,7 +110,19 @@ export interface AddResult {
 
   /** With {@link AddCommand.setInteractive}: what `git add -i` printed and did */
   readonly interactive?: AddInteractiveResult;
+
+  /** With {@link AddCommand.setEdit}: what `git apply` printed on standard error (warnings) */
+  readonly edit?: { errors: string };
 }
+
+/**
+ * The editor of `git add -e`: given the patch file's path (from the worktree top) and its
+ * text, the edited text; undefined when the editor failed.
+ */
+export type AddPatchEditor = (
+  path: string,
+  text: string,
+) => string | undefined | Promise<string | undefined>;
 
 /**
  * Command to stage files from working tree to index.
@@ -142,6 +162,8 @@ export class AddCommand extends GitCommand<AddResult> {
   private patch = false;
   private interactive = false;
   private patchSelector?: PatchSelector;
+  private edit = false;
+  private editor?: AddPatchEditor;
   private patchOptions: PatchOptions = {};
 
   /**
@@ -504,6 +526,98 @@ export class AddCommand extends GitCommand<AddResult> {
     return this;
   }
 
+  /**
+   * `git add -e` (`--edit`): builtin/add.c's `edit_patch`. The changes between the index and
+   * the worktree (`diff-files -p` with seven lines of context, limited to the pathspec) are
+   * written to `.git/ADD_EDIT.patch`, the editor ({@link setEditor}; without one the patch
+   * is taken as it is) edits them, and the result is applied to the index with
+   * `git apply --cached --recount`; the file is removed after. An editor failing ("editing
+   * patch failed"), an empty patch ("empty patch. aborted") and a patch that does not apply
+   * ("could not apply '.git/ADD_EDIT.patch'", after apply's errors) reject with a
+   * `GitApiError` of exit code 128, the file left in place as git leaves it.
+   *
+   * @example
+   * ```typescript
+   * await git.add().setEdit(true)
+   *   .setEditor((_path, patch) => patch.replace(/^\+debug.*\n/gm, "")).call();
+   * ```
+   */
+  setEdit(edit: boolean): this {
+    this.checkCallable();
+    this.edit = edit;
+    return this;
+  }
+
+  /** The editor of {@link setEdit} (git's `GIT_EDITOR` over `ADD_EDIT.patch`). */
+  setEditor(editor: AddPatchEditor): this {
+    this.checkCallable();
+    this.editor = editor;
+    return this;
+  }
+
+  /** `git add -e`: the diff edited and applied to the index (`edit_patch`). */
+  private async callEdit(): Promise<AddResult> {
+    if (this.pathspecFile.given) {
+      throw new IncompatibleOptionsError(
+        ["--pathspec-from-file", "--edit"],
+        "fatal: options '--pathspec-from-file' and '--edit' cannot be used together",
+      );
+    }
+    const diff = new DiffCommand(this.workingCopy)
+      .setRenames(false)
+      .setIgnoreSubmodules("dirty")
+      .setCombineMerges(false)
+      // run_diff_files without ita_invisible_in_index: an intent-to-add entry is the empty
+      // blob it holds
+      .setIntentToAddVisible(true);
+    if (this.filepatterns.length > 0) diff.setPathspec(this.filepatterns);
+    const bytes = await diff
+      .setOptions({
+        defaultPrefix: true,
+        ignoreConfigNoPrefix: true,
+        textconv: false,
+        uiConfig: false,
+        submoduleFormat: "short",
+        orderFile: "",
+        context: 7,
+      })
+      .callBytes("patch");
+    const name = "ADD_EDIT.patch";
+    const shown = await this.hooks.gitPath(name);
+    const checkout = this.workingCopy.checkout;
+    await checkout.writeStateFile?.(name, bytes);
+    let edited = bytesToLatin1(bytes);
+    if (this.editor) {
+      const text = await this.editor(shown, latin1ToText(edited));
+      if (text === undefined)
+        throw new GitApiError("fatal: editing patch failed", { exitCode: 128 });
+      edited = textToLatin1(text);
+      await checkout.writeStateFile?.(name, latin1ToBytes(edited));
+    }
+    if (edited.length === 0)
+      throw new GitApiError("fatal: empty patch. aborted", { exitCode: 128 });
+    const apply = await new ApplyCommand(this.workingCopy)
+      .shareHooksOf(this)
+      .addPatch(latin1ToBytes(edited), shown)
+      .setCached(true)
+      .setRecount(true)
+      .call();
+    if (apply.exitCode !== 0) {
+      throw new GitApiError(`${apply.errors}fatal: could not apply '${shown}'`, { exitCode: 128 });
+    }
+    await checkout.removeStateFile?.(name);
+    return {
+      added: [],
+      skipped: [],
+      ignored: [],
+      removed: [],
+      totalProcessed: 0,
+      warnings: [],
+      output: [],
+      edit: { errors: apply.errors },
+    };
+  }
+
   /** Answers the prompts of {@link setPatch} (git's reads from standard input and its editor). */
   setPatchSelector(selector: PatchSelector): this {
     this.checkCallable();
@@ -628,6 +742,7 @@ export class AddCommand extends GitCommand<AddResult> {
     await this.readCurrentIndex();
     if (this.patch) return this.callPatch();
     if (this.interactive) return this.callInteractive();
+    if (this.edit) return this.callEdit();
     this.sparsePatterns = await this.sparseCheckoutPatterns();
     // a sparse index as git holds it once read: expanded at once when a sparse directory is
     // on disk (with 2.5x's hint), else its sparse directories stay single entries
