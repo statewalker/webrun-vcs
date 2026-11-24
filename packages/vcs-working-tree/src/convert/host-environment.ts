@@ -6,12 +6,20 @@
  * `@statewalker/vcs-utils-node`).
  */
 
-import type { LinkStats } from "@statewalker/vcs-utils/files";
+import type { FilesApi, LinkStats } from "@statewalker/vcs-utils/files";
 
 /** The user's environment, as a host provides it. */
 export interface GitHostEnvironment {
   /** Reads a file of the host by its path (as the paths below name it); undefined when absent */
   readFile(path: string): Promise<Uint8Array | undefined>;
+  /**
+   * The storage holding a host path and the path inside it, for the files git writes
+   * outside a repository: `git config --global` / `--system` / `--file <absolute path>`
+   * (under `<file>.lock`, renamed into place). The links of the path's directories are
+   * resolved (as git's `open` follows them); its last component is left for the caller,
+   * which follows links there as git does. Absent (a browser): such writes are refused.
+   */
+  hostFilesOf?(path: string): Promise<{ files: FilesApi; path: string } | undefined>;
   /**
    * The stat of a host file (links followed), for what git records of it: the untracked
    * cache keeps the stat of `core.excludesFile`. Absent: recorded as zeros.
