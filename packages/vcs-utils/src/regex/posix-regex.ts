@@ -93,6 +93,12 @@ const A_WORD_FIRST: number = 3;
 const A_WORD_LAST: number = 4;
 const A_INSIDE_WORD: number = 5;
 const A_INSIDE_NOTWORD: number = 6;
+/**
+ * GNU's buffer anchors (backslash-backquote, backslash-quote): the subject's start and end,
+ * whatever REG_NEWLINE and REG_NOTBOL say
+ */
+const A_BUF_FIRST: number = 7;
+const A_BUF_LAST: number = 8;
 
 type Tree =
   | { k: "set"; set: Uint8Array }
@@ -299,11 +305,11 @@ class Parser {
           break;
         case 0x60: // `
           t.type = T_ANCHOR;
-          t.arg = A_LINE_FIRST;
+          t.arg = A_BUF_FIRST;
           break;
         case 0x27: // '
           t.type = T_ANCHOR;
-          t.arg = A_LINE_LAST;
+          t.arg = A_BUF_LAST;
           break;
         case 0x28:
           if (!ext) t.type = T_OPEN_SUB;
@@ -1080,6 +1086,10 @@ class Matcher implements PosixRegex {
         return idx === 0 ? !this.notbol : this.newline && s[idx - 1] === 0x0a;
       case A_LINE_LAST:
         return idx === s.length || (this.newline && s[idx] === 0x0a);
+      case A_BUF_FIRST:
+        return idx === 0;
+      case A_BUF_LAST:
+        return idx === s.length;
     }
     const prev = idx > 0 && isWordByte(s[idx - 1]);
     const next = idx < s.length && isWordByte(s[idx]);
