@@ -10,6 +10,7 @@ import {
   isSymbolicRef,
   type ObjectId,
   type ObjectReplacements,
+  type PersonIdent,
   parseGraphCommit,
   replacementOf,
 } from "@statewalker/vcs-core";
@@ -129,6 +130,26 @@ export interface LogResult extends Commit {
   source?: string;
   /** In a reflog walk ({@link LogCommand.addReflogWalk}), the entry the commit is listed for */
   reflog?: LogReflogEntry;
+}
+
+/**
+ * What `git show` prints through one log printer (see {@link LogCommand.showSession}).
+ *
+ * @internal
+ */
+export interface ShowSession {
+  /** Shows a commit as git show does; false when it was not shown (already, or TREESAME) */
+  commit(id: ObjectId): Promise<boolean>;
+  /** The newline before a tag or tree once something was shown */
+  separate(): void;
+  /** Marks something shown (a tag's or tree's header) */
+  markShown(): void;
+  text(text: string): void;
+  bytes(bytes: Uint8Array): void;
+  /** A tag's `tagger` line as `Tagger:` (and its date) in the format */
+  tagger(ident: PersonIdent): void;
+  /** Everything printed */
+  result(): Uint8Array;
 }
 
 /**
@@ -1571,6 +1592,92 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     }
     if (follow) this.paths = paths;
     return printer.result();
+  }
+
+  /**
+   * `git show`'s output of objects one at a time (builtin/log.c's cmd_show without a walk):
+   * one printer for every object, so commits, tags and trees share git's `shown_one`
+   * separators. Used by {@link ShowCommand}; the paths and filters set on this command
+   * decide which commits show, as revision.c's no-walk mode simplifies each one.
+   *
+   * @internal
+   */
+  async showSession(options: LogOutputOptions): Promise<ShowSession> {
+    this.checkCallable();
+    this.setCallable(false);
+    if (options.graph) {
+      throw new IncompatibleOptionsError(
+        ["--no-walk", "--graph"],
+        "fatal: options '--no-walk' and '--graph' cannot be used together",
+      );
+    }
+    if (this.logConfig) this.configuredPatternType();
+    if (options.mailmap !== undefined) this.useMailmap ??= options.mailmap;
+    readDiffSubmoduleConfig(this.workingCopy);
+    this.activeFilter = await this.buildCommitFilter();
+    const host = this.outputHost(options);
+    const pathspec = [...this.paths, ...this.excludePaths.map((p) => `:(exclude)${p}`)];
+    if (this.paths.length === 0 && this.excludePaths.length > 0) pathspec.push(".");
+    const printer = new LogPrinter(
+      host,
+      { ...options, diff: { ...options.diff, ...this.diffOptions } },
+      { interesting: () => true, firstParentOnly: this.firstParentOnly, paths: pathspec },
+    );
+    await printer.start();
+    const shown = new Set<ObjectId>();
+    const limited = pathspec.length > 0;
+    const commit = async (id: ObjectId): Promise<boolean> => {
+      // get_revision's SHOWN flag: a commit named again is not shown again
+      if (shown.has(id)) return false;
+      const loaded = await this.walkCommits.load(id);
+      if (!loaded) throw new GitApiError(`fatal: bad object ${id}`);
+      // try_to_simplify_commit, then get_commit_action: a commit TREESAME to a parent (a
+      // root without the paths) is ignored
+      if (limited && (await this.treesameForShow(id, loaded))) return false;
+      const filter = this.activeFilter;
+      if (filter) {
+        const view: FilteredCommit = {
+          id,
+          parentCount: loaded.parents.length,
+          commitTime: loaded.committer.timestamp,
+          raw: async () => this.rawCommit(id),
+          commit: async () => loaded,
+        };
+        if (!(await filter.include(view))) return false;
+      }
+      shown.add(id);
+      await printer.showCommit({ id, commit: loaded, parents: loaded.parents }, []);
+      return true;
+    };
+    const run = <T>(fn: () => Promise<T>): Promise<T> => {
+      const worktree = this.worktreeAccess;
+      return worktree?.batch ? worktree.batch(fn) : fn();
+    };
+    return {
+      commit: (id) => run(() => commit(id)),
+      separate: () => printer.separateObject(),
+      markShown: () => printer.markShown(),
+      text: (text) => printer.writeText(text),
+      bytes: (bytes) => printer.writeBytes(bytes),
+      tagger: (ident) => printer.writeTagger(ident),
+      result: () => printer.result(),
+    };
+  }
+
+  /** revision.c's try_to_simplify_commit for a commit git shows without walking */
+  private async treesameForShow(id: ObjectId, commit: Commit): Promise<boolean> {
+    if (commit.parents.length === 0) return !(await this.pathsDiffer(undefined, commit.tree));
+    for (let k = 0; k < commit.parents.length; k++) {
+      if (k === 1 && this.firstParentOnly) break;
+      const parent = await this.walkCommits.load(commit.parents[k] as ObjectId);
+      if (!parent) {
+        throw new GitApiError(
+          `fatal: cannot simplify commit ${id} (because of ${commit.parents[k]})`,
+        );
+      }
+      if (!(await this.pathsDiffer(parent.tree, commit.tree))) return true;
+    }
+    return false;
   }
 
   /**
