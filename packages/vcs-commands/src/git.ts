@@ -49,6 +49,7 @@ import {
   MergeBaseCommand,
   MergeCommand,
   MvCommand,
+  NameRevCommand,
   NotesCommands,
   PackRefsCommand,
   PullCommand,
@@ -798,6 +799,21 @@ export class Git implements Disposable {
   describe(): DescribeCommand {
     this.checkClosed();
     return new DescribeCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a NameRevCommand: symbolic names of commits by the refs that reach them
+   * (`git name-rev`).
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.nameRev().setNameOnly(true).addRevisions("HEAD~2").call();
+   * // "main~2\n"
+   * ```
+   */
+  nameRev(): NameRevCommand {
+    this.checkClosed();
+    return new NameRevCommand(this._workingCopy);
   }
 
   // ============ Maintenance Operations ============
