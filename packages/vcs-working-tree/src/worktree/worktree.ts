@@ -17,6 +17,7 @@
 
 import type { History, ObjectId } from "@statewalker/vcs-core";
 import type { FilesApi } from "@statewalker/vcs-utils/files";
+import type { GitHostEnvironment } from "../convert/host-environment.js";
 import type { LinkedWorktrees } from "../linked-worktrees/index.js";
 import type { UntrackedScanHost } from "../status/untracked-scan.js";
 import type { WorkingCopy } from "../working-copy.js";
@@ -364,8 +365,14 @@ export interface Worktree {
    * one whose directory is gone) falls back to the repository git keeps for the submodule
    * of that name, `<gitdir>/modules/<name>` (git's `submodule_to_gitdir`); its worktree is
    * still rooted at `path`.
+   *
+   * `options.environment` opens it with another environment than this worktree's (`git
+   * submodule` runs its children with `GIT_PROTOCOL_FROM_USER=0`).
    */
-  openGitlink?(path: string, options?: { name?: string }): Promise<WorkingCopy | undefined>;
+  openGitlink?(
+    path: string,
+    options?: { name?: string; environment?: GitHostEnvironment },
+  ): Promise<WorkingCopy | undefined>;
 
   /**
    * The repository a local remote names (`../other`, `/srv/repo.git`, the path of a

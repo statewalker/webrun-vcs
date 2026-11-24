@@ -93,8 +93,12 @@ export function shellQuote(text: string): string {
   return `'${text.replace(/['!]/g, (c) => `'\\${c}'`)}'`;
 }
 
-/** The parts every submodule command shares: output, the index's gitlinks, the model. */
-abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandResult> {
+/**
+ * The parts every submodule command shares: output, the index's gitlinks, the model.
+ *
+ * @internal
+ */
+export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandResult> {
   protected quiet = false;
   protected superPrefix = "";
   protected compatibility: "2.43" | "2.56" = "2.56";
@@ -281,6 +285,45 @@ abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandResult> {
     return defaultRemoteOf(inner);
   }
 
+  /**
+   * submodule--helper.c's `create_default_gitdir_config`: the first of git's candidates for
+   * the submodule's git directory that no other submodule's `gitdir` names (the plain name,
+   * then its RFC 3986 encodings, with a digit appended, then the hash of the name) written to
+   * `submodule.<name>.gitdir`, unless that is set.
+   */
+  protected async createDefaultGitdirConfig(name: string): Promise<void> {
+    const modules = await commonGitFileOf(this.workingCopy, "modules");
+    const root = this.worktreeAccess?.getRoot() ?? "";
+    if (!modules) return;
+    const base = relativeFilesPath(root, modules.path);
+    const encode = (upper: boolean) =>
+      [...new TextEncoder().encode(name)]
+        .map((b) => {
+          const c = String.fromCharCode(b);
+          const ok = upper ? /[a-z0-9\-._~]/.test(c) : /[A-Za-z0-9\-._~]/.test(c);
+          return ok ? c : `%${b.toString(16).padStart(2, "0")}`;
+        })
+        .join("");
+    const candidates = [`${base}/${name}`, `${base}/${encode(false)}`, `${base}/${encode(true)}`];
+    for (let d = 0; d <= 9; d++) {
+      candidates.push(`${base}/${encode(false)}${d}`, `${base}/${encode(true)}${d}`);
+    }
+    const hash = await computeObjectId("blob", new TextEncoder().encode(name), this.objectFormat);
+    candidates.push(`${base}/${hash}`);
+    const key = `submodule.${name}.gitdir`;
+    const model = await this.model();
+    for (const candidate of candidates) {
+      const path = joinFilesPath(root, candidate);
+      if (await validateSubmoduleGitDir(this.workingCopy, path, name, { encoded: true })) continue;
+      if (typeof model.configText(key) === "string") return;
+      await this.setConfig(key, candidate);
+      return;
+    }
+    this.die(
+      `fatal: failed to set a valid default config for '${key}'. Please ensure it is set, for example by running something like: 'git config ${key} .git/modules/${name}'`,
+    );
+  }
+
   protected append(result: SubmoduleCommandResult): void {
     this.out.stdout += result.stdout;
     this.out.stderr += result.stderr;
@@ -372,45 +415,6 @@ export class SubmoduleInitCommand extends SubmoduleCommandBase {
     }
     if (await submodulePathConfigOf(this.workingCopy))
       await this.createDefaultGitdirConfig(sub.name);
-  }
-
-  /**
-   * submodule--helper.c's `create_default_gitdir_config`: the first of git's candidates for
-   * the submodule's git directory that no other submodule's `gitdir` names (the plain name,
-   * then its RFC 3986 encodings, with a digit appended, then the hash of the name) written to
-   * `submodule.<name>.gitdir`, unless that is set.
-   */
-  private async createDefaultGitdirConfig(name: string): Promise<void> {
-    const modules = await commonGitFileOf(this.workingCopy, "modules");
-    const root = this.worktreeAccess?.getRoot() ?? "";
-    if (!modules) return;
-    const base = relativeFilesPath(root, modules.path);
-    const encode = (upper: boolean) =>
-      [...new TextEncoder().encode(name)]
-        .map((b) => {
-          const c = String.fromCharCode(b);
-          const ok = upper ? /[a-z0-9\-._~]/.test(c) : /[A-Za-z0-9\-._~]/.test(c);
-          return ok ? c : `%${b.toString(16).padStart(2, "0")}`;
-        })
-        .join("");
-    const candidates = [`${base}/${name}`, `${base}/${encode(false)}`, `${base}/${encode(true)}`];
-    for (let d = 0; d <= 9; d++) {
-      candidates.push(`${base}/${encode(false)}${d}`, `${base}/${encode(true)}${d}`);
-    }
-    const hash = await computeObjectId("blob", new TextEncoder().encode(name), this.objectFormat);
-    candidates.push(`${base}/${hash}`);
-    const key = `submodule.${name}.gitdir`;
-    const model = await this.model();
-    for (const candidate of candidates) {
-      const path = joinFilesPath(root, candidate);
-      if (await validateSubmoduleGitDir(this.workingCopy, path, name, { encoded: true })) continue;
-      if (typeof model.configText(key) === "string") return;
-      await this.setConfig(key, candidate);
-      return;
-    }
-    this.die(
-      `fatal: failed to set a valid default config for '${key}'. Please ensure it is set, for example by running something like: 'git config ${key} .git/modules/${name}'`,
-    );
   }
 }
 

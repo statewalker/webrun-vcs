@@ -118,6 +118,7 @@ export * from "./stash-store-command.js";
 export * from "./stash-working-tree.js";
 export * from "./status-command.js";
 export * from "./status-format.js";
+export * from "./submodule-add-command.js";
 export * from "./submodule-commands.js";
 export * from "./submodule-model.js";
 export * from "./submodule-summary.js";

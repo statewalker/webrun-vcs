@@ -1315,7 +1315,7 @@ export class FileWorktree implements Worktree {
    */
   async openGitlink(
     path: string,
-    options: { name?: string } = {},
+    options: { name?: string; environment?: GitHostEnvironment } = {},
   ): Promise<WorkingCopy | undefined> {
     let gitDir = await this.gitlinkDir(path);
     if (gitDir !== undefined && !(await this.isRepositoryDir(gitDir))) gitDir = undefined;
@@ -1334,7 +1334,8 @@ export class FileWorktree implements Worktree {
       if (!(await this.isRepositoryDir(gitDir))) return undefined;
     }
     const files = this.rootFiles;
-    const environment = this.environment ? { environment: this.environment } : {};
+    const hostEnvironment = options.environment ?? this.environment;
+    const environment = hostEnvironment ? { environment: hostEnvironment } : {};
     // only the superproject's object database honours $GIT_ALTERNATE_OBJECT_DIRECTORIES (git
     // opens a submodule's without ODB_NEW_HONOR_ENV)
     const { history } = await createGitFilesBackend({
