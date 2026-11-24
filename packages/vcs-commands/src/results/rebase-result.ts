@@ -163,6 +163,9 @@ export interface RebaseResult {
 
   /** Uncommitted changes that prevented rebase */
   readonly uncommittedChanges?: string[];
+
+  /** What `--show-current-patch` prints on stdout (`git show REBASE_HEAD`) */
+  readonly currentPatch?: string;
 }
 
 /**
