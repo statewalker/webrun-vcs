@@ -19,3 +19,7 @@ other way round. Options git refuses together (`--ff` with `-s`/`-x`/`-n`/`--edi
 merge does not have, or `-m 2` on a non-merge, refuses with `error: commit <id> does not have
 parent <n>`; `-m 0` with exit 129. Picking onto an unborn branch commits a root commit, and
 `-n` over an unmerged index refuses with `error: your index file is unmerged.`.
+A sequence of picks onto an unborn branch runs as git's (`sequencer/head` as git leaves it, an
+empty abort-safety), a revert sequence there refuses with `can't revert as initial commit`, a
+commit named twice is picked once, and `--skip` with nothing stopped says
+`no cherry-pick in progress` / `no revert in progress`.

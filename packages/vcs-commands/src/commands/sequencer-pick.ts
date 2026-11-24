@@ -342,13 +342,26 @@ export class PickSequencer {
       );
     }
     const ids: ObjectId[] = [];
-    for (const name of names) ids.push(await this.resolvePick(name));
+    let lastNamed = "";
+    for (const name of names) {
+      const id = await this.resolvePick(name);
+      lastNamed = id;
+      // the revision walk lists each commit once (its SEEN flag), first naming first
+      if (!ids.includes(id)) ids.push(id);
+    }
     const todo = ids.map((id) => ({ action: this.options.action, id }));
     if (todo.length > 1) {
-      const headId = await this.headId();
-      await state.write("sequencer/head", `${headId}\n`);
+      // sequencer_pick_revisions on an unborn HEAD refuses only a revert; a pick saves as
+      // sequencer/head what its failed repo_get_oid("HEAD") left in `oid`, which in git 2.43
+      // and 2.56 builds alike is the id of the last commit named (the loop over the pending
+      // revisions shares its stack slot), and an empty abort-safety
+      const headId = await this.headIfBorn();
+      if (!headId && this.options.action === "revert") {
+        return this.fail(`error: can't revert as initial commit\nfatal: ${this.name} failed`);
+      }
+      await state.write("sequencer/head", `${headId ?? lastNamed}\n`);
       await this.writeTodo(todo);
-      await state.write("sequencer/abort-safety", `${headId}\n`);
+      await state.write("sequencer/abort-safety", `${headId ?? ""}\n`);
       // save_opts, in its order (git config's format)
       const f = this.flags;
       const opts: string[] = [];
@@ -397,7 +410,10 @@ export class PickSequencer {
       if (outcome.status !== "ok") {
         if (sequenced) {
           await this.writeTodo(todo.slice(k));
-          await this.deps.state.write("sequencer/abort-safety", `${await this.headId()}\n`);
+          await this.deps.state.write(
+            "sequencer/abort-safety",
+            `${(await this.headIfBorn()) ?? ""}\n`,
+          );
         }
         return { ...outcome, picked, output };
       }
@@ -405,7 +421,7 @@ export class PickSequencer {
       newHead = outcome.newHead ?? newHead;
       if (sequenced) {
         await this.writeTodo(todo.slice(k + 1));
-        await this.deps.state.write("sequencer/abort-safety", `${newHead}\n`);
+        await this.deps.state.write("sequencer/abort-safety", `${newHead ?? ""}\n`);
       }
     }
     if (sequenced) await this.deps.state.remove("sequencer");
@@ -732,7 +748,8 @@ export class PickSequencer {
     const { state } = this.deps;
     const stopped = (await state.ref("CHERRY_PICK_HEAD")) ?? (await state.ref("REVERT_HEAD"));
     if (!stopped) {
-      return this.fail(`error: no cherry-pick or revert in progress\nfatal: ${this.name} failed`);
+      // sequencer_skip: neither this action's head nor a sequence of it to go on with
+      return this.fail(`error: no ${this.name} in progress\nfatal: ${this.name} failed`);
     }
     await this.readSavedOptions();
     const headId = await this.headId();
@@ -770,6 +787,12 @@ export class PickSequencer {
     if (!origHead) {
       await state.remove("sequencer");
       return this.fail(`error: could not read 'sequencer/head'\nfatal: ${this.name} failed`);
+    }
+    if (/^0+$/.test(origHead)) {
+      // sequencer_rollback: a run started on an unborn branch is not rewound (state kept)
+      return this.fail(
+        `error: cannot abort from a branch yet to be born\nfatal: ${this.name} failed`,
+      );
     }
     if (safety && safety !== headId) {
       await state.remove("sequencer");

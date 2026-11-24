@@ -804,3 +804,39 @@ describeGit("root commits as native git (t3503-cherry-pick-root)", () => {
     await both(t.native, t.ours, ["revert", "--no-edit", "-s", "main"]);
   });
 });
+
+describeGit("sequences onto an unborn branch as native git", () => {
+  /** t3506's history, then an unborn branch with an empty index and worktree. */
+  function unborn(dir: string): void {
+    t3506(dir);
+    // a root commit of second's tree: picked after first and second, it becomes empty
+    const tree = gitOk(root, dir, "rev-parse", "second^{tree}").trim();
+    gitOk(root, dir, "tag", "again", commitTree(dir, tree, [], "again"));
+    gitOk(root, dir, "checkout", "-q", "--orphan", "unborn");
+    gitOk(root, dir, "rm", "-q", "--cached", "-r", ".");
+    rmSync(join(dir, "file1"));
+  }
+
+  it("a multi-commit cherry-pick onto an unborn branch commits every pick", async () => {
+    const t = twins(unborn);
+    await both(t.native, t.ours, ["cherry-pick", "first", "second"]);
+  });
+
+  it("a multi-commit cherry-pick onto an unborn branch stopped saves the null head; --abort refuses", async () => {
+    const t = twins(unborn);
+    // `again` on top of second is empty: the sequence stops with sequencer/head null
+    await both(t.native, t.ours, ["cherry-pick", "first", "second", "again"]);
+    await both(t.native, t.ours, ["cherry-pick", "--abort"]);
+    await both(t.native, t.ours, ["cherry-pick", "--skip"]);
+  });
+
+  it("a commit named twice is picked once, as git's revision walk lists it", async () => {
+    const t = twins(unborn);
+    await both(t.native, t.ours, ["cherry-pick", "first", "second", "second"]);
+  });
+
+  it("a multi-commit revert onto an unborn branch refuses as git (can't revert as initial commit)", async () => {
+    const t = twins(unborn);
+    await both(t.native, t.ours, ["revert", "--no-edit", "second", "first"]);
+  });
+});
