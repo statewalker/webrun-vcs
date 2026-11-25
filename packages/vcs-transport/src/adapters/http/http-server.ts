@@ -292,6 +292,8 @@ export interface ReceivePackServerOptions {
   maxInputSize?: number;
   /** git's `receive.keepAlive` in ms, over {@link keepAliveMs} (see `ServeOverDuplexOptions`) */
   receiveKeepAliveMs?: number;
+  /** git's `receive.unpackLimit` (see `ReceivePackConfig.unpackLimit`) */
+  unpackLimit?: number;
   /** What runs once a push is done (see `ReceivePackConfig.afterPush`) */
   afterPush?: ReceivePackConfig["afterPush"];
   /** `receive.fsckObjects`: the fsck of each push's objects (see `ReceivePackConfig.fsckObjects`) */
@@ -1120,6 +1122,7 @@ export async function handleReceivePack(
       maxCommands: rp.maxCommands,
       keepAliveMs: rp.receiveKeepAliveMs ?? rp.keepAliveMs,
       ...(rp.maxInputSize ? { maxInputSize: rp.maxInputSize } : {}),
+      ...(rp.unpackLimit !== undefined ? { unpackLimit: rp.unpackLimit } : {}),
       ...(rp.afterPush ? { afterPush: rp.afterPush } : {}),
       hookTimeoutMs: rp.hookTimeoutMs,
       bare: rp.bare,

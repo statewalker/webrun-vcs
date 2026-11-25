@@ -544,6 +544,7 @@ export async function receivePackSettingsOf(
       ? { advertiseAtomic: settings.advertiseAtomic }
       : {}),
     ...(settings.maxInputSize !== undefined ? { maxInputSize: settings.maxInputSize } : {}),
+    ...(settings.unpackLimit !== undefined ? { unpackLimit: settings.unpackLimit } : {}),
     ...(settings.receiveKeepAliveMs !== undefined
       ? { receiveKeepAliveMs: settings.receiveKeepAliveMs }
       : {}),

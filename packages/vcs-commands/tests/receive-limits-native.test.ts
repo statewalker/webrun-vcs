@@ -6,7 +6,7 @@
  * client to a local path, and compares the outcomes and what the targets hold. git master's
  * receive-report hook is in `receive-report-git3-native.test.ts`.
  */
-import { readFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -18,25 +18,68 @@ import {
   nativeAsync,
   nativeOutcome,
   ourOutcome,
+  ours,
   receiveTwins,
   rootDir,
   source,
   stateOf,
 } from "./receive-limits-native-support.js";
+import { putFile } from "./status-native-support.js";
 
 describeGit("receive-pack's limits and policies, as native git", () => {
   const { twins, pushAll, daemonPort } = receiveTwins();
 
   describe("t5546-receive-limits.sh: receive.maxInputSize", () => {
-    // t5546 pushes a known-size (1024 bytes) commit: a few objects go through unpack-objects
-    // (receive.unpackLimit's default 100); 120 files go through index-pack
-    for (const [store, files, size] of [
-      ["unpack", 1, 1024],
-      ["index", 120, 40],
-    ] as const) {
-      it(`t5546-receive-limits.sh: "setting receive.maxInputSize to 512 rejects push" (${store})`, async () => {
+    // t5546 pushes a known-size (1024 bytes) commit with receive.unpackLimit 1 (index-pack) and
+    // 10000 (unpack-objects); the last two cases take the child by the pack's object count and by
+    // receive.unpackLimit over transfer.unpackLimit
+    for (const { store, label, files, size, limits, bigger } of [
+      {
+        store: "index",
+        label: "index",
+        files: 1,
+        size: 1024,
+        limits: [["receive.unpackLimit", "1"]],
+        bigger: "4k",
+      },
+      {
+        store: "unpack",
+        label: "unpack",
+        files: 1,
+        size: 1024,
+        limits: [["receive.unpackLimit", "10000"]],
+        bigger: "4k",
+      },
+      {
+        store: "index",
+        label: "index, 120 objects",
+        files: 120,
+        size: 40,
+        limits: [],
+        bigger: "1m",
+      },
+      {
+        store: "index",
+        label: "index, receive.unpackLimit over transfer.unpackLimit",
+        files: 1,
+        size: 1024,
+        limits: [
+          ["receive.unpackLimit", "1"],
+          ["transfer.unpackLimit", "10000"],
+        ],
+        bigger: "4k",
+      },
+    ] as {
+      store: string;
+      label: string;
+      files: number;
+      size: number;
+      limits: [string, string][];
+      bigger: string;
+    }[]) {
+      it(`t5546-receive-limits.sh: "setting receive.maxInputSize to 512 rejects push" (${label})`, async () => {
         const src = source(files, size);
-        const t = twins(src, [["receive.maxInputSize", "512"]]);
+        const t = twins(src, [...limits, ["receive.maxInputSize", "512"]]);
         const { native, served, ours: mine } = await pushAll(t, "HEAD:refs/heads/main");
         const theirs = nativeOutcome(native);
         expect(theirs.ok).toBe(false);
@@ -57,12 +100,12 @@ describeGit("receive-pack's limits and policies, as native git", () => {
       });
 
       for (const [title, limit] of [
-        ['"bumping limit to 4k allows push"', "1m"],
+        ['"bumping limit to 4k allows push"', bigger],
         ['"lifting the limit allows push"', "0"],
       ] as const) {
-        it(`t5546-receive-limits.sh: ${title} (${store})`, async () => {
+        it(`t5546-receive-limits.sh: ${title} (${label})`, async () => {
           const src = source(files, size);
-          const t = twins(src, [["receive.maxInputSize", limit]]);
+          const t = twins(src, [...limits, ["receive.maxInputSize", limit]]);
           const { native, served, ours: mine } = await pushAll(t, "HEAD:refs/heads/main");
           const theirs = nativeOutcome(native);
           expect(theirs.ok).toBe(true);
@@ -75,6 +118,7 @@ describeGit("receive-pack's limits and policies, as native git", () => {
       }
     }
 
+    // no git t/ test: receive_pack_config's death on a bad number (die_bad_number)
     it("a receive.maxInputSize git cannot read kills receive-pack before the advertisement", async () => {
       const src = source(1, 10);
       const t = twins(src, [["receive.maxInputSize", "lots"]]);
@@ -88,6 +132,8 @@ describeGit("receive-pack's limits and policies, as native git", () => {
     });
   });
 
+  // receive.advertiseAtomic, receive.keepAlive, receive.updateServerInfo: no git t/ test exercises
+  // them (git's own suite only sets them); these twins compare with native receive-pack directly
   describe("receive.advertiseAtomic", () => {
     it("false: native git's `push --atomic` refuses our server as git's receive-pack", async () => {
       const src = source(1, 10);
@@ -205,6 +251,68 @@ describeGit("receive-pack's limits and policies, as native git", () => {
       }, 60_000);
     }
   });
+
+  it('t5400-send-pack.sh: "receive-pack runs auto-gc in remote repo"', async () => {
+    const k = `g${Date.now()}`;
+    const dirs: Record<"n" | "o", string> = { n: "", o: "" };
+    for (const name of ["n", "o"] as const) {
+      const base = join(rootDir(), k, name);
+      const parent = join(base, "parent");
+      const child = join(base, "child");
+      mkdirSync(base, { recursive: true });
+      // a repository with two packs
+      git(rootDir(), "init", "-q", "-b", "main", parent);
+      putFile(parent, "file.txt", "Some text\n");
+      git(parent, "add", ".");
+      git(parent, "commit", "-qm", "Initial commit");
+      git(parent, "repack", "-adlq");
+      putFile(parent, "file.txt", "Some text\nSome more text\n");
+      git(parent, "commit", "-qam", "Second commit");
+      git(parent, "repack", "-q");
+      cpSync(parent, child, { recursive: true });
+      // the child auto-packs when it has more than one pack; t5400 turns its auto gc on
+      for (const [key, value] of [
+        ["gc.autopacklimit", "1"],
+        ["gc.autodetach", "false"],
+        ["maintenance.strategy", "gc"],
+        ["maintenance.autoDetach", "false"],
+        ["maintenance.auto", "true"],
+        ["gc.auto", "6700"],
+      ]) {
+        git(child, "config", key, value);
+      }
+      git(child, "branch", "test_auto_gc");
+      // a file named as a temporary object, old enough for the auto gc to remove
+      const tmp = join(child, ".git", "objects", "tmp_test_object");
+      writeFileSync(tmp, "");
+      const old = Date.now() / 1000 - 1209601;
+      utimesSync(tmp, old, old);
+      putFile(parent, "file.txt", "Some text\nSome more text\nEven more text\n");
+      git(parent, "commit", "-qam", "Third commit");
+      dirs[name] = base;
+    }
+    const native = await nativeAsync(join(dirs.n, "parent"), [
+      "send-pack",
+      "../child",
+      "HEAD:refs/heads/test_auto_gc",
+    ]);
+    expect(native.status).toBe(0);
+    const mine = await (await ours(`${k}/o/parent`))
+      .push()
+      .setRemote("../child")
+      .setRefSpecs("HEAD:refs/heads/test_auto_gc")
+      .call();
+    expect(mine.remoteUpdates.map((u) => u.status)).toEqual(["ok"]);
+    for (const base of [dirs.n, dirs.o]) {
+      expect([base, existsSync(join(base, "child", ".git", "objects", "tmp_test_object"))]).toEqual([
+        base,
+        false,
+      ]);
+    }
+    const state = stateOf(join(dirs.n, "child", ".git"));
+    expect(state.packs).toBe(1);
+    expect(stateOf(join(dirs.o, "child", ".git"))).toEqual(state);
+  }, 60_000);
 
   describe("receive.updateServerInfo", () => {
     for (const value of ["true", "false"]) {

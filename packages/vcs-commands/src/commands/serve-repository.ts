@@ -54,6 +54,7 @@ const CONFIG_KEYS = [
   "advertiseAtomic",
   "maxInputSize",
   "receiveKeepAliveMs",
+  "unpackLimit",
   "uploadPackHideRefs",
   "receivePackHideRefs",
   "procReceiveRefs",

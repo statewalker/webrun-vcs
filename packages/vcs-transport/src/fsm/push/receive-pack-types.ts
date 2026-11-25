@@ -241,15 +241,16 @@ export interface ReceivePackConfig {
    */
   maxInputSize?: number;
   /**
-   * git's `receive.unpackLimit` as far as receive-pack's messages go (which child it names);
-   * default 100
+   * git's `receive.unpackLimit` (else `transfer.unpackLimit`) as far as receive-pack's messages
+   * go: which child it names when it refuses a pack (index-pack from this many objects on).
+   * Default 100. The store's own choice to keep or unpack a pack is not changed by it.
    */
   unpackLimit?: number;
   /**
    * Runs once a push is done, after post-receive (git's `receive.autogc` auto maintenance and
    * `receive.updateServerInfo`), for every push that sent commands; with
-   * {@link relayPostReceive} awaited before the side-band closes (its `ctx.message` text
-   * reaching the client), else detached with post-receive. What it throws is logged.
+   * awaited before receive-pack ends and the side-band closes (its `ctx.message` text reaching
+   * the client), whether post-receive is relayed or detached. What it throws is logged.
    */
   afterPush?: (ctx: ReceivePackHookContext) => unknown;
   /**

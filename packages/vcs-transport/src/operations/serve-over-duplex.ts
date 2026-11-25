@@ -115,6 +115,8 @@ export interface ServeOverDuplexOptions {
    * receive-pack: git's `receive.keepAlive` in ms (0: none), over {@link keepAliveMs} for a push
    */
   receiveKeepAliveMs?: number;
+  /** receive-pack: `receive.unpackLimit` (see `ReceivePackConfig.unpackLimit`) */
+  unpackLimit?: number;
   /** receive-pack: what runs once a push is done (see `ReceivePackConfig.afterPush`) */
   afterPush?: ReceivePackConfig["afterPush"];
   /** receive-pack: `receive.fsckObjects` (see `ReceivePackConfig.fsckObjects`) */
@@ -284,6 +286,7 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
       maxCommands: options.maxCommands,
       keepAliveMs: options.receiveKeepAliveMs ?? options.keepAliveMs,
       ...(options.maxInputSize ? { maxInputSize: options.maxInputSize } : {}),
+      ...(options.unpackLimit !== undefined ? { unpackLimit: options.unpackLimit } : {}),
       ...(options.afterPush ? { afterPush: options.afterPush } : {}),
       hookTimeoutMs: options.hookTimeoutMs,
       bare: options.bare,

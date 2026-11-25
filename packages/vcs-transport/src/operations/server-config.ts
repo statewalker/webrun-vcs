@@ -69,6 +69,11 @@ export interface ServerConfigSettings {
    * keep-alive interval while a push is checked; 0 turns keep-alives off (git: 0 or less)
    */
   receiveKeepAliveMs?: number;
+  /**
+   * `receive.unpackLimit`, else `transfer.unpackLimit` (git's default 100 when neither): which
+   * child receive-pack names when it refuses a pack (index-pack from this many objects on)
+   */
+  unpackLimit?: number;
   /** upload-pack's hidden ref patterns: `transfer.hideRefs` and `uploadpack.hideRefs` */
   uploadPackHideRefs: string[];
   /** receive-pack's hidden ref patterns: `transfer.hideRefs` and `receive.hideRefs` */
@@ -331,6 +336,16 @@ export function explicitServerSettingsFromConfig(
   if (maxInput !== undefined) out.maxInputSize = maxInput;
   const keepAlive = numeric("receive.keepAlive", configInt);
   if (keepAlive !== undefined) out.receiveKeepAliveMs = Math.max(0, keepAlive) * 1000;
+  // receive_pack_config: receive.unpackLimit wins over transfer.unpackLimit, in any order
+  const receiveLimit = numeric("receive.unpackLimit", configInt);
+  const transferLimit = numeric("transfer.unpackLimit", configInt);
+  const unpackLimit =
+    receiveLimit !== undefined && receiveLimit >= 0
+      ? receiveLimit
+      : transferLimit !== undefined && transferLimit >= 0
+        ? transferLimit
+        : undefined;
+  if (unpackLimit !== undefined) out.unpackLimit = unpackLimit;
   const upload = hideRefs(config, "uploadpack");
   if (upload.length > 0) out.uploadPackHideRefs = upload;
   const receive = hideRefs(config, "receive");
@@ -379,6 +394,7 @@ export function httpServerSettings(settings: ServerConfigSettings): {
     advertiseAtomic?: boolean;
     maxInputSize?: number;
     receiveKeepAliveMs?: number;
+    unpackLimit?: number;
     hideRefs: string[];
   };
   uploadPack: { hideRefs: string[] };
@@ -398,6 +414,7 @@ export function httpServerSettings(settings: ServerConfigSettings): {
       ...(settings.receiveKeepAliveMs !== undefined
         ? { receiveKeepAliveMs: settings.receiveKeepAliveMs }
         : {}),
+      ...(settings.unpackLimit !== undefined ? { unpackLimit: settings.unpackLimit } : {}),
       hideRefs: settings.receivePackHideRefs,
     },
     uploadPack: { hideRefs: settings.uploadPackHideRefs },
