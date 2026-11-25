@@ -120,8 +120,6 @@ export async function openUploadPack(
       ...(request.credentials ? { auth: request.credentials } : {}),
       ...(request.http ? { http: request.http } : {}),
       ...(request.credentialHelper ? { credentialHelper: request.credentialHelper } : {}),
-      ...(request.http ? { http: request.http } : {}),
-      ...(request.credentialHelper ? { credentialHelper: request.credentialHelper } : {}),
       ...(request.timeout !== undefined ? { timeout: request.timeout } : {}),
       ...(request.signal ? { signal: request.signal } : {}),
       ...(options.gzipRequests !== undefined ? { gzipRequests: options.gzipRequests } : {}),
@@ -159,8 +157,6 @@ export async function openReceivePack(
         ? { headers: { ...session.headers, ...request.headers } }
         : {}),
       ...(request.credentials ? { auth: request.credentials } : {}),
-      ...(request.http ? { http: request.http } : {}),
-      ...(request.credentialHelper ? { credentialHelper: request.credentialHelper } : {}),
       ...(request.http ? { http: request.http } : {}),
       ...(request.credentialHelper ? { credentialHelper: request.credentialHelper } : {}),
       ...(request.timeout !== undefined ? { timeout: request.timeout } : {}),

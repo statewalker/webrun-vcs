@@ -51,6 +51,8 @@ export class SmartHttpClient {
   private filled = false;
   private approved = false;
   private wwwAuthenticate: string[] = [];
+  /** After a re-root to another origin: the caller's Authorization/Cookie headers stay home */
+  private dropCallerCredentials = false;
   /** Empty credentials a server took (`http.emptyAuth`), sent from then on */
   private emptyAuth?: Credentials;
 
@@ -190,6 +192,9 @@ export class SmartHttpClient {
    */
   private headersFor(own: Record<string, string>, auth: Credentials | undefined): Headers {
     const headers = new Headers(this.options.headers);
+    if (this.dropCallerCredentials) {
+      for (const name of ["authorization", "cookie", "proxy-authorization"]) headers.delete(name);
+    }
     for (const [name, value] of Object.entries(own)) headers.set(name, value);
     const settings = this.settings;
     if (settings.userAgent !== undefined) headers.set("User-Agent", settings.userAgent);
@@ -278,10 +283,12 @@ export class SmartHttpClient {
     }
     const previous = this.baseUrl;
     this.baseUrl = effective.slice(0, effective.length - tail.length);
-    if (originOf(previous) !== originOf(this.baseUrl) && !this.filled) {
-      // the caller's credentials were for the URL asked; git's credential_from_url
-      // starts over at the new one
+    if (originOf(previous) !== originOf(this.baseUrl)) {
+      // the credentials were for the URL asked; git's credential_from_url starts over at the
+      // new one, and nothing of the caller's that identifies the user follows it
       delete this.auth;
+      this.filled = false;
+      this.dropCallerCredentials = true;
     }
     return effective;
   }

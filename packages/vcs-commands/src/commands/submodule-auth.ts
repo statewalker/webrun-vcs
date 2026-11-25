@@ -232,6 +232,20 @@ function landedAt(response: Response, url: string): Response {
   return response;
 }
 
+/** Headers that identify the user: never carried to another origin (curl's rule). */
+const CREDENTIAL_HEADERS = ["authorization", "cookie", "proxy-authorization"];
+
+/**
+ * The caller's headers for the next hop of a redirect: whatever identifies the user (an
+ * `Authorization` from a credential helper or `http.extraHeader`, cookies) is dropped when
+ * the hop changes origin, as curl drops it when the host changes.
+ */
+function hopHeaders(headers: Headers, from: URL, to: URL): Headers {
+  const out = new Headers(headers);
+  if (from.origin !== to.origin) for (const name of CREDENTIAL_HEADERS) out.delete(name);
+  return out;
+}
+
 /** A redirect as the response shows it (a browser's `opaqueredirect` included). */
 function isRedirect(response: Response): boolean {
   return response.type === "opaqueredirect" || REDIRECTS.has(response.status);
@@ -278,7 +292,7 @@ function guardedFetch(
         const body = kept.method === "GET" || kept.method === "HEAD" ? null : kept.body;
         current = new Request(landed, {
           method: kept.method,
-          headers: kept.headers,
+          headers: hopHeaders(kept.headers, target, landed),
           ...(body ? { body, duplex: "half" } : {}),
           signal: kept.signal,
         } as RequestInit);
@@ -298,7 +312,7 @@ function guardedFetch(
       const body = toGet || method === "GET" || method === "HEAD" ? null : kept.body;
       current = new Request(next, {
         method,
-        headers: kept.headers,
+        headers: hopHeaders(kept.headers, target, next),
         ...(body ? { body, duplex: "half" } : {}),
         signal: kept.signal,
       } as RequestInit);

@@ -78,7 +78,7 @@ export interface NodeGitHostEnvironmentOptions {
   defaultPager?: string;
 }
 
-/** The variables naming the user's editor and pager, as `git var` reads them. */
+/** The variables of git's HTTP client that override `http.*` (http.c's `set_from_env`). */
 const HTTP_VARIABLES = [
   "GIT_HTTP_USER_AGENT",
   "GIT_HTTP_MAX_RETRIES",
@@ -86,6 +86,7 @@ const HTTP_VARIABLES = [
   "GIT_HTTP_MAX_RETRY_TIME",
 ] as const;
 
+/** The variables naming the user's editor and pager, as `git var` reads them. */
 const PROGRAM_VARIABLES = [
   "GIT_EDITOR",
   "GIT_SEQUENCE_EDITOR",

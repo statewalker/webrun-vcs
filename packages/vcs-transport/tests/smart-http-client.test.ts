@@ -201,3 +201,32 @@ describe("retryAfterOf", () => {
     expect(at("soon")).toBe(-1);
   });
 });
+
+describe("SmartHttpClient re-rooted at another origin", () => {
+  it("sends none of the caller's Authorization or Cookie headers to the new origin", async () => {
+    const requests: Request[] = [];
+    const instance = new SmartHttpClient({
+      url: "https://a.example/repo.git",
+      fetchImpl: async (request) => {
+        requests.push(request);
+        const response = new Response("ok");
+        if (request.url.startsWith("https://a.example/")) {
+          Object.defineProperty(response, "url", {
+            value: "https://b.example/repo.git/info/refs?service=git-upload-pack",
+          });
+        }
+        return response;
+      },
+      headers: { Authorization: "Bearer T", Cookie: "c=1", "X-Other": "kept" },
+      auth: { username: "u", password: "p" },
+      signal: new AbortController().signal,
+    });
+    await instance.discover("git-upload-pack", {}, direct);
+    await instance.post("git-upload-pack", {}, { body: new Uint8Array([1]) }, direct);
+    const post = requests[1];
+    expect(post?.url).toBe("https://b.example/repo.git/git-upload-pack");
+    expect(post?.headers.get("authorization")).toBeNull();
+    expect(post?.headers.get("cookie")).toBeNull();
+    expect(post?.headers.get("x-other")).toBe("kept");
+  });
+});
