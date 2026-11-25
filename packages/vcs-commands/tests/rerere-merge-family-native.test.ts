@@ -394,4 +394,46 @@ describeGit("rerere in the merge family as native git", () => {
     expect(result.rerereOutput).toEqual(["Resolved 'foo' using previous resolution."]);
     same(t);
   });
+
+  it("commit records the resolution before it applies MERGE_AUTOSTASH (webrun-vcs#361)", async () => {
+    // git's cmd_commit: repo_rerere, post-commit, then apply_autostash_ref(MERGE_AUTOSTASH);
+    // the autostash changes a line of the conflicted file the merge does not touch, so a
+    // rerere run after it would record the stashed line in the postimage
+    const lines = (second: string, ninth: string) =>
+      ["1", second, "3", "4", "5", "6", "7", "8", ninth, "10", ""].join("\n");
+    const n = counter++;
+    const t = { native: join(root, `native-${n}`), ours: join(root, `ours-${n}`) };
+    for (const dir of [t.native, t.ours]) {
+      mkdirSync(dir, { recursive: true });
+      gitOk(root, dir, "init", "-q", "-b", "main");
+      gitOk(root, dir, "config", "rerere.enabled", "true");
+      put(dir, "foo", lines("2", "9"));
+      gitOk(root, dir, "add", "foo");
+      gitOk(root, dir, "commit", "-q", "-m", "base");
+      gitOk(root, dir, "checkout", "-q", "-b", "dev");
+      put(dir, "foo", lines("2-dev", "9"));
+      gitOk(root, dir, "commit", "-q", "-am", "dev");
+      gitOk(root, dir, "checkout", "-q", "main");
+      put(dir, "foo", lines("2-main", "9"));
+      gitOk(root, dir, "commit", "-q", "-am", "main");
+      put(dir, "foo", lines("2-main", "9-stashed"));
+      git(root, dir, "merge", "--autostash", "dev");
+      put(dir, "foo", lines("2-resolved", "9"));
+      gitOk(root, dir, "add", "foo");
+    }
+    same(t);
+    const committed = git(root, t.native, "commit", "-q", "-m", "resolved");
+    const made = await (await openOurs(t.ours))
+      .commit()
+      .setMessage("resolved")
+      .setAuthorIdent(INTEROP_IDENT)
+      .setCommitterIdent(INTEROP_IDENT)
+      .call();
+    expect(made.rerereOutput).toEqual(rerereLines(committed.stderr));
+    const postimages = Object.entries(rerereState(t.native)).filter(([k]) =>
+      k.endsWith("/postimage"),
+    );
+    expect(postimages.map(([, v]) => v)).toEqual([lines("2-resolved", "9")]);
+    same(t);
+  });
 });
