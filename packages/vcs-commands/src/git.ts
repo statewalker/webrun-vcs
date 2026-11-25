@@ -36,6 +36,7 @@ import {
   CommitCommand,
   ConfigCommand,
   CopyBranchCommand,
+  CountObjectsCommand,
   CreateBranchCommand,
   DeleteBranchCommand,
   DeleteTagCommand,
@@ -71,6 +72,7 @@ import {
   NotesCommands,
   PackRefsCommand,
   PatchIdCommand,
+  PruneCommand,
   PullCommand,
   PushCommand,
   RangeDiffCommand,
@@ -104,6 +106,7 @@ import {
   ShortlogCommand,
   ShowCommand,
   ShowCurrentBranchCommand,
+  ShowIndexCommand,
   ShowRefCommand,
   SparseCheckoutCommand,
   StashApplyCommand,
@@ -994,6 +997,46 @@ export class Git implements Disposable {
   verifyPack(): VerifyPackCommand {
     this.checkClosed();
     return new VerifyPackCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a PruneCommand (`git prune [-n] [-v] [--expire <time>] [<head>...]`): unreachable
+   * loose objects go, without the rest of gc.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.prune().setDryRun(true).callOutput(); // git prune -n
+   * ```
+   */
+  prune(): PruneCommand {
+    this.checkClosed();
+    return new PruneCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a CountObjectsCommand (`git count-objects [-v] [-H]`).
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.countObjects().setVerbose(true).callOutput();
+   * ```
+   */
+  countObjects(): CountObjectsCommand {
+    this.checkClosed();
+    return new CountObjectsCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a ShowIndexCommand (`git show-index < <pack-idx-file>`).
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.showIndex().setInput(idxBytes).callOutput();
+   * ```
+   */
+  showIndex(): ShowIndexCommand {
+    this.checkClosed();
+    return new ShowIndexCommand(this._workingCopy);
   }
 
   /**

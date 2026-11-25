@@ -171,7 +171,7 @@ export async function writeCruftPacks(o: CruftPackInput): Promise<CruftPackResul
   // the listing: types from the headers (never a whole read in a loop)
   const listed: ListedObject[] = [];
   for (const id of [...chosen.keys()].sort()) {
-    const type = await typeOf(objects, id);
+    const type = await typeOfObject(objects, id);
     if (!type) continue;
     listed.push({ id, type });
   }
@@ -225,7 +225,11 @@ export async function writeCruftPacks(o: CruftPackInput): Promise<CruftPackResul
 }
 
 /** An object's type from its header, else a read. */
-async function typeOf(objects: GitObjects, id: ObjectId): Promise<ObjectTypeString | undefined> {
+/** An object's type (its header where the store reads one), undefined when unreadable. @internal */
+export async function typeOfObject(
+  objects: GitObjects,
+  id: ObjectId,
+): Promise<ObjectTypeString | undefined> {
   const t = await objects.objectType?.(id).catch(() => undefined);
   if (t) return t;
   const o = await objects.get(id).catch(() => undefined);
@@ -258,7 +262,7 @@ async function entryExtents(o: CruftPackInput, pack: Pack): Promise<number[] | u
  * @internal
  */
 export async function objectLinks(objects: GitObjects, id: ObjectId): Promise<ObjectId[]> {
-  const type = await typeOf(objects, id);
+  const type = await typeOfObject(objects, id);
   if (type !== "commit" && type !== "tag" && type !== "tree") return [];
   const o = await objects.get(id).catch(() => undefined);
   if (!o) return [];
