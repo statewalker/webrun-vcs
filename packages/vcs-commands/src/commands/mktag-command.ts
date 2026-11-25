@@ -14,8 +14,8 @@
 import { replacementOf } from "@statewalker/vcs-core";
 import { MktagFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
-import { fsckTag, type IdShape } from "./fsck/fsck-object-checks.js";
 import { FSCK_MSG_IDS, FsckMessageTypes, type FsckMsgId } from "./fsck/fsck-msg-ids.js";
+import { fsckTag, type IdShape } from "./fsck/fsck-object-checks.js";
 import { configValue } from "./merge-config.js";
 
 /** Result of {@link MktagCommand}. */
@@ -109,15 +109,15 @@ export class MktagCommand extends GitCommand<MktagResult> {
     };
     const format = this.objectFormat;
     const shape: IdShape = { rawLength: format.rawLength, hexLength: format.hexLength };
-    if (
-      fsckTag(this.input, report, { gpgsig: this.compatibility !== "2.43", shape }) !== 0
-    ) {
+    if (fsckTag(this.input, report, { gpgsig: this.compatibility !== "2.43", shape }) !== 0) {
       die("tag on stdin did not pass our strict fsck check");
     }
 
     // what fsck_tag_standalone parsed: the object line's id and the type line's name
     const text = decoder.decode(this.input);
-    const taggedId = text.slice("object ".length, "object ".length + format.hexLength).toLowerCase();
+    const taggedId = text
+      .slice("object ".length, "object ".length + format.hexLength)
+      .toLowerCase();
     const typeLine = text.slice(text.indexOf("\n") + 1);
     const taggedType = typeLine.slice("type ".length, typeLine.indexOf("\n"));
     if (!TYPES.has(taggedType)) die("tag on stdin did not pass our strict fsck check");

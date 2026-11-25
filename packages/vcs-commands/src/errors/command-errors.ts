@@ -231,3 +231,19 @@ export class UpdateIndexFailedError extends GitApiError {
     this.name = "UpdateIndexFailedError";
   }
 }
+
+/**
+ * Thrown by `checkout-index` where git dies (exit status 128): options it refuses together
+ * (`--stage=all` with `--no-temp`, `--all` with paths), a badly quoted `--stdin` line, a file
+ * standing where a directory must be created without `-f`. The message is git's stderr.
+ */
+export class CheckoutIndexFailedError extends GitApiError {
+  constructor(
+    message: string,
+    /** What git printed on stdout before dying */
+    readonly output = "",
+  ) {
+    super(message, { exitCode: 128 });
+    this.name = "CheckoutIndexFailedError";
+  }
+}

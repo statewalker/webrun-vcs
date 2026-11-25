@@ -56,7 +56,8 @@ async function compare(input: string, strict = true, config: string[] = []) {
     const actual = await oursMktag(input, strict);
     expect(actual).toEqual(expected);
   } finally {
-    for (const dir of [native, ours]) for (const key of keys) gitOk(root, dir, "config", "--unset", key);
+    for (const dir of [native, ours])
+      for (const key of keys) gitOk(root, dir, "config", "--unset", key);
   }
   if (expected.status === 0) {
     // the object ours wrote is native git's
@@ -102,7 +103,7 @@ describeGit("git mktag against native git", () => {
     );
   });
 
-  it("t3800-mktag.sh: \"fail with [--[no-]strict]: Tag object length check\"", async () => {
+  it('t3800-mktag.sh: "fail with [--[no-]strict]: Tag object length check"', async () => {
     await failure("too short for a tag\n");
   });
 
@@ -180,7 +181,9 @@ describeGit("git mktag against native git", () => {
   });
 
   it('t3800-mktag.sh: "fail with [--[no-]strict]: disallow missing tag timestamp"', async () => {
-    await failure(`object ${head}\ntype commit\ntag mytag\ntagger T A Gger <tagger@example.com>  \n\n`);
+    await failure(
+      `object ${head}\ntype commit\ntag mytag\ntagger T A Gger <tagger@example.com>  \n\n`,
+    );
   });
 
   it('t3800-mktag.sh: "fail with [--[no-]strict]: detect invalid tag timestamp1"', async () => {

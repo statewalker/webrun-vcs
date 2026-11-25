@@ -39,6 +39,7 @@ import {
 import { UpdateIndexFailedError } from "../errors/index.js";
 import { GitCommand } from "../git-command.js";
 import { worktreeModeTrust } from "./core-config.js";
+import { inputLines, inputPaths, unquoteLine } from "./plumbing-input.js";
 import { worktreePathRules } from "./worktree-path-rules.js";
 
 /** Result of {@link UpdateIndexCommand}. */
@@ -321,7 +322,10 @@ export class UpdateIndexCommand extends GitCommand<UpdateIndexResult> {
         if (this.indexInfo) await run.readIndexInfo(this.indexInfo.text, this.nulTerminated);
         this.applyIndexVersion(run);
         if (this.stdinPaths !== undefined) {
-          for (const path of splitInput(this.stdinPaths, this.nulTerminated, "line")) {
+          const badlyQuoted = (): never => {
+            throw new Death("line is badly quoted");
+          };
+          for (const path of inputPaths(this.stdinPaths, this.nulTerminated, badlyQuoted)) {
             await run.updateOne(path);
           }
         }
@@ -768,8 +772,7 @@ class UpdateIndexRun {
     if (modeFromWorktree(current.mode, old.mode, trust) !== old.mode) return false;
     if (!basicStatMatches(old, current, trust)) return false;
     const racy =
-      this.indexTime === 0 ||
-      wholeSeconds(old.mtime, old.mtimeNs) >= wholeSeconds(this.indexTime);
+      this.indexTime === 0 || wholeSeconds(old.mtime, old.mtimeNs) >= wholeSeconds(this.indexTime);
     if (!racy) return true;
     const worktree = this.ctx.worktree as Worktree;
     return (await worktree.computeHash(old.path).catch(() => undefined)) === old.objectId;
@@ -847,7 +850,7 @@ class UpdateIndexRun {
     s.replace = true;
     s.remove = true;
     const hex = this.ctx.hexLength;
-    for (const line of splitInput(input, nul, "raw")) {
+    for (const line of inputLines(input, nul)) {
       const bad = (): never => {
         throw new Death(`malformed index info ${line}`);
       };
@@ -859,7 +862,11 @@ class UpdateIndexRun {
       if (tab < 0 || tab - (m as RegExpExecArray)[0].length + 1 < hex + 1) bad();
       let stage = 0;
       const pathAt = tab + 1;
-      if (line[tab - 2] === " " && line[tab - 1] !== undefined && /[0-3]/.test(line[tab - 1] as string)) {
+      if (
+        line[tab - 2] === " " &&
+        line[tab - 1] !== undefined &&
+        /[0-3]/.test(line[tab - 1] as string)
+      ) {
         stage = Number(line[tab - 1]);
         tab -= 2;
       }
@@ -867,7 +874,7 @@ class UpdateIndexRun {
       if (!/^[0-9a-fA-F]+$/.test(id) || id.length !== hex || line[tab - hex - 1] !== " ") bad();
       let path = line.slice(pathAt);
       if (!nul && path.startsWith('"')) {
-        const unquoted = unquoteCStyle(path);
+        const unquoted = unquoteLine(path);
         if (unquoted === undefined) throw new Death("git update-index: bad quoting of path name");
         path = unquoted;
       }
@@ -1003,65 +1010,4 @@ function createCeMode(mode: number): number {
   if ((mode & S_IFMT) === FileMode.SYMLINK) return FileMode.SYMLINK;
   if ((mode & S_IFMT) === 0o040000 || (mode & S_IFMT) === FileMode.GITLINK) return FileMode.GITLINK;
   return S_IFREG | ((mode & 0o100) !== 0 ? 0o755 : 0o644);
-}
-
-const textDecoder = new TextDecoder();
-
-/** Lines of `input` (`strbuf_getline_lf` / `strbuf_getline_nul`), quoting handled for paths. */
-function splitInput(input: string | Uint8Array, nul: boolean, kind: "line" | "raw"): string[] {
-  const text = typeof input === "string" ? input : textDecoder.decode(input);
-  const sep = nul ? "\0" : "\n";
-  const lines = text.split(sep);
-  if (lines[lines.length - 1] === "") lines.pop();
-  if (nul || kind === "raw") return lines;
-  return lines.map((line) => {
-    if (!line.startsWith('"')) return line;
-    const unquoted = unquoteCStyle(line);
-    if (unquoted === undefined) throw new Death("line is badly quoted");
-    return unquoted;
-  });
-}
-
-/** git's `unquote_c_style` of a whole line; undefined when badly quoted. */
-function unquoteCStyle(text: string): string | undefined {
-  if (!text.startsWith('"')) return undefined;
-  const bytes: number[] = [];
-  const enc = new TextEncoder();
-  const escapes: Record<string, number> = {
-    a: 7,
-    b: 8,
-    f: 12,
-    n: 10,
-    r: 13,
-    t: 9,
-    v: 11,
-    "\\": 92,
-    '"': 34,
-  };
-  for (let i = 1; i < text.length; i++) {
-    const c = text[i] as string;
-    if (c === '"') {
-      return i === text.length - 1 ? textDecoder.decode(new Uint8Array(bytes)) : undefined;
-    }
-    if (c !== "\\") {
-      for (const b of enc.encode(c)) bytes.push(b);
-      continue;
-    }
-    const n = text[++i];
-    if (n === undefined) return undefined;
-    const e = escapes[n];
-    if (e !== undefined) {
-      bytes.push(e);
-      continue;
-    }
-    if (n >= "0" && n <= "3") {
-      const oct = text.slice(i, i + 3);
-      if (!/^[0-3][0-7][0-7]$/.test(oct)) return undefined;
-      bytes.push(Number.parseInt(oct, 8));
-      i += 2;
-      continue;
-    }
-    return undefined;
-  }
-  return undefined;
 }

@@ -24,6 +24,7 @@ import {
   BundleVerifyCommand,
   CheckMailmapCommand,
   CheckoutCommand,
+  CheckoutIndexCommand,
   CherryCommand,
   CherryPickCommand,
   CleanCommand,
@@ -55,6 +56,7 @@ import {
   LsRemoteCommand,
   MergeBaseCommand,
   MergeCommand,
+  MktagCommand,
   MvCommand,
   NameRevCommand,
   NotesCommands,
@@ -62,9 +64,7 @@ import {
   PullCommand,
   PushCommand,
   RangeDiffCommand,
-  MktagCommand,
   ReadTreeCommand,
-  UpdateIndexCommand,
   RebaseCommand,
   ReflogCommand,
   RemoteAddCommand,
@@ -114,6 +114,7 @@ import {
   SwitchCommand,
   TagCommand,
   UnsetUpstreamBranchCommand,
+  UpdateIndexCommand,
   VerifyCommitCommand,
   VerifyPackCommand,
   VerifyTagCommand,
@@ -717,6 +718,20 @@ export class Git implements Disposable {
   readTree(): ReadTreeCommand {
     this.checkClosed();
     return new ReadTreeCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a CheckoutIndexCommand writing index entries into the worktree, under a prefix
+   * or into temporary files (`git checkout-index`).
+   *
+   * @example
+   * ```typescript
+   * await git.checkoutIndex().setAll(true).setForce(true).setUpdateIndex(true).call();
+   * ```
+   */
+  checkoutIndex(): CheckoutIndexCommand {
+    this.checkClosed();
+    return new CheckoutIndexCommand(this._workingCopy);
   }
 
   /**
