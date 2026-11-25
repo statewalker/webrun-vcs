@@ -51,6 +51,7 @@ export * from "./log-command.js";
 export * from "./log-graph.js";
 export * from "./log-output.js";
 export * from "./ls-remote-command.js";
+export * from "./ls-tree-command.js";
 export * from "./mailmap.js";
 export * from "./merge-base-command.js";
 export * from "./merge-command.js";

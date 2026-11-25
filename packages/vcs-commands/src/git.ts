@@ -50,6 +50,7 @@ import {
   ListTagCommand,
   LogCommand,
   LsRemoteCommand,
+  LsTreeCommand,
   MergeBaseCommand,
   MergeCommand,
   MvCommand,
@@ -1390,6 +1391,19 @@ export class Git implements Disposable {
   lsRemote(): LsRemoteCommand {
     this.checkClosed();
     return this.withTransports(new LsRemoteCommand(this._workingCopy));
+  }
+
+  /**
+   * Create an LsTreeCommand (`git ls-tree`): a tree's entries as git prints them.
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.lsTree().setTreeish("HEAD").setRecursive().callOutput();
+   * ```
+   */
+  lsTree(): LsTreeCommand {
+    this.checkClosed();
+    return new LsTreeCommand(this._workingCopy);
   }
 
   // ============ Remote Configuration Operations ============
