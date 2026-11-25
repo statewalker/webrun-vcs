@@ -20,6 +20,7 @@ import {
 } from "@statewalker/vcs-core";
 import {
   checkUnpackedObjects,
+  createRepositoryFacade,
   FetchCheckError,
   parseConfigInt,
   ReceivedObjects,
@@ -150,17 +151,22 @@ export class UnpackObjectsCommand extends PlumbingCommand {
     const imported = await importPack(objects, this.input, {
       ...options,
       quarantine: true,
+      // exploded whatever its size: never a pack, even inside the quarantine
+      unpackLimit: Number.POSITIVE_INFINITY,
       onObject: (id, type, entry) => received.add(id, type, entry),
     });
     const quarantine = imported.quarantine;
     const history = this._workingCopy.history;
-    if (!quarantine || !history) return; // a store that cannot keep objects aside: written
+    if (!history) throw new Error("unpack-objects needs the history (history.objects)");
     let lines: string[];
     // what git has written when a check dies: every blob, and the objects checked before
     const written = new Set<string>();
     for (const { id, type } of received.inPackOrder()) if (type === "blob") written.add(id);
     try {
-      const view = repositoryQuarantine(quarantine, history).repository;
+      // a store that cannot keep objects aside has them already: checked there all the same
+      const view = quarantine
+        ? repositoryQuarantine(quarantine, history).repository
+        : createRepositoryFacade({ history });
       const shallow = new Set((await this.refsStore.getShallow?.().catch(() => [])) ?? []);
       lines = await checkUnpackedObjects(view, received, {
         fsck,
@@ -169,9 +175,10 @@ export class UnpackObjectsCommand extends PlumbingCommand {
       });
     } catch (error) {
       if (!(error instanceof FetchCheckError)) {
-        await quarantine.discard().catch(() => {});
+        await quarantine?.discard().catch(() => {});
         throw error;
       }
+      if (!quarantine) throw new PlumbingError(error.lines.join("\n"), error.exitCode);
       // git writes each blob as it comes and the rest once checked: those stay
       for (const id of written) {
         if (await objects.has(id)) continue;
@@ -180,7 +187,7 @@ export class UnpackObjectsCommand extends PlumbingCommand {
       await quarantine.discard().catch(() => {});
       throw new PlumbingError(error.lines.join("\n"), error.exitCode);
     }
-    await quarantine.commit();
+    await quarantine?.commit();
     for (const line of lines) this.warn(line);
   }
 }

@@ -308,6 +308,26 @@ describeGit("git unpack-objects (native twins)", () => {
     expect(r.status).toBe(0);
   });
 
+  it("a pack of more than 100 objects is exploded too, with and without --strict", async () => {
+    const many = join(root, "many");
+    git(root, "init", "-q", "-b", "main", many);
+    noMaintenance(many);
+    for (let n = 0; n < 120; n++) putFile(many, `m${n}`, `file ${n}\n`);
+    git(many, "add", "-A");
+    git(many, "commit", "-qm", "many");
+    const base = join(root, `many-pack-${counter++}`);
+    const name = gitWithInput(
+      many,
+      ["pack-objects", "--revs", base],
+      Buffer.from("HEAD\n"),
+    ).stdout.trim();
+    const pack = new Uint8Array(readFileSync(`${base}-${name}.pack`));
+    const strict = twins();
+    await unpackBoth(strict, pack, ["--strict"], { strict: true });
+    expect(layout(strict.n)).toMatchObject({ loose: 122, packs: 0 });
+    await unpackBoth(twins(), pack, []);
+  });
+
   it("--strict with a value without '=' dies", async () => {
     await unpackBoth(twins(), packOf(all), ["--strict=bogus"], { strict: "bogus" });
   });
