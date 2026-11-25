@@ -53,7 +53,7 @@ export function encodePackMtimes(
   }
   out.set(checksum, p);
   p += HASH_SIZE;
-  out.set(format.createHasher().update(out.subarray(0, p)).digest(), p);
+  out.set(format.createUnsafeHasher().update(out.subarray(0, p)).digest(), p);
   return out;
 }
 

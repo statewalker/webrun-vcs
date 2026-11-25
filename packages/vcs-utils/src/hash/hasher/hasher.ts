@@ -51,9 +51,21 @@ function wrap(h: NobleHash): Hasher {
   return self;
 }
 
-/** SHA-1, 20-byte digest. */
+/**
+ * SHA-1, 20-byte digest, with git's collision detection (sha1dc): `digest` throws
+ * `Sha1CollisionError` ("SHA-1 appears to be part of a collision attack: <id>") when the data
+ * holds a known collision attack's blocks (SHAttered, Shambles). Object ids are hashed so.
+ */
 export function createSha1(): Hasher {
   return wrap(new Sha1());
+}
+
+/**
+ * git's "unsafe" SHA-1 (`unsafe_init_fn`, csum-file.c): no collision detection, for checksums
+ * of files whose content is not an object id (pack, idx, index, commit-graph trailers).
+ */
+export function createSha1Unsafe(): Hasher {
+  return wrap(new Sha1(false));
 }
 
 /**

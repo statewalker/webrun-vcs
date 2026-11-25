@@ -173,7 +173,7 @@ export async function checkPack(
   }
   // verify_pack_index
   const idxSum = format
-    .createHasher()
+    .createUnsafeHasher()
     .update(idxBytes.subarray(0, idxBytes.length - raw))
     .digest();
   if (!sameBytes(idxSum, 0, idxBytes, idxBytes.length - raw, raw)) {
@@ -337,7 +337,7 @@ export async function checkPack(
     };
 
     // One pass: the pack's hash, each entry's CRC-32 and bytes
-    const sha = format.createHasher();
+    const sha = format.createUnsafeHasher();
     const trailer = new Uint8Array(raw);
     let at = 0;
     let k = 0;

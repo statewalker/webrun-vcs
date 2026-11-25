@@ -4,6 +4,7 @@ name: git 3.0 oracle
 # (Documentation/BreakingChanges.adoc), exported as $GIT3, against ours with
 # GitHostEnvironment.breakingChanges. Runs the `*-git3-native` test files, which skip without
 # $GIT3 in the main CI. The build is cached under git master's commit; a new commit rebuilds it.
+# It also installs git's test-tool as $GIT_TEST_TOOL for `sha1dc-native` (t0013-sha1dc.sh).
 on:
   schedule:
     - cron: "47 3 * * 2"
@@ -13,6 +14,7 @@ on:
       - "packages/*/src/**"
       - "packages/vcs-commands/tests/*git3*"
       - "packages/vcs-commands/tests/native-git3.ts"
+      - "packages/vcs-commands/tests/sha1dc-native.test.ts"
       - "pnpm-lock.yaml"
       - ".github/workflows/git3-oracle.yml"
 
@@ -52,7 +54,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ~/git3
-          key: git3-${{ runner.os }}-${{ runner.arch }}-${{ steps.git-master.outputs.sha }}
+          key: git3-tt-${{ runner.os }}-${{ runner.arch }}-${{ steps.git-master.outputs.sha }}
 
       - name: Build git 3.0 (WITH_BREAKING_CHANGES)
         if: steps.git3-cache.outputs.cache-hit != 'true'
@@ -63,6 +65,8 @@ jobs:
           make -C "$RUNNER_TEMP/git" -j"$(nproc)" WITH_BREAKING_CHANGES=YesPlease NO_GETTEXT=YesPlease \
             NO_TCLTK=YesPlease NO_PERL=YesPlease NO_PYTHON=YesPlease NO_CURL=YesPlease \
             prefix="$HOME/git3" install
+          # git's test-tool (t/helper), for twins of t/ scripts that drive it (t0013-sha1dc.sh)
+          cp "$RUNNER_TEMP/git/t/helper/test-tool" "$HOME/git3/bin/test-tool"
 
       - name: Save the git 3.0 build
         if: steps.git3-cache.outputs.cache-hit != 'true'
@@ -74,6 +78,7 @@ jobs:
       - name: The oracle
         run: |
           echo "GIT3=$HOME/git3/bin/git" >> "$GITHUB_ENV"
+          echo "GIT_TEST_TOOL=$HOME/git3/bin/test-tool" >> "$GITHUB_ENV"
           "$HOME/git3/bin/git" version --build-options
           git --version
 
@@ -85,4 +90,4 @@ jobs:
 
       - name: git 3.0 twins
         working-directory: packages/vcs-commands
-        run: npx vitest run git3-native
+        run: npx vitest run git3-native sha1dc-native

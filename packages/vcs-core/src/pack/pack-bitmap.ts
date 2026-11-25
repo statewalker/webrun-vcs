@@ -137,7 +137,7 @@ export function parsePackBitmap(bytes: Uint8Array, pack: BitmapPack, path = ""):
       "unsupported options for bitmap index file (Git requires BITMAP_OPT_FULL_DAG)",
     );
   const sum = format
-    .createHasher()
+    .createUnsafeHasher()
     .update(bytes.subarray(0, size - HASH_SIZE))
     .digest();
   for (let i = 0; i < HASH_SIZE; i++) {

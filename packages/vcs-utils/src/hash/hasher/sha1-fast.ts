@@ -1,5 +1,6 @@
 /**
- * Portable incremental SHA-1 (FIPS 180-4). Runs of whole blocks go to a WebAssembly block
+ * Portable incremental SHA-1 (FIPS 180-4), with git's sha1dc collision detection unless asked
+ * for the "unsafe" hash (`new Sha1(false)`, checksums). Runs of whole blocks go to a WebAssembly block
  * function where the runtime can compile one (`sha1-wasm.ts`), else to a JavaScript one
  * written for the JIT: fully unrolled, the state and the 16 schedule words in locals, the
  * words read straight from the caller's bytes. Only a block split across `update` calls is
@@ -11,6 +12,8 @@
  * of tens of KiB.
  */
 import { type Sha1Wasm, sha1Wasm } from "./sha1-wasm.js";
+import { Sha1CollisionError } from "./sha1dc.js";
+import { dcBlocks } from "./sha1dc-blocks.js";
 
 /** Runs shorter than this (in bytes) stay in JavaScript: the call costs more than it saves. */
 const WASM_MIN = 128;
@@ -31,6 +34,31 @@ function wasmBlocks(wasm: Sha1Wasm, s: Int32Array, p: Uint8Array, at: number, en
     at += length;
   }
   s.set(wasm.state);
+}
+
+/**
+ * `hashBlocks` with sha1dc's collision detection: true when a block is part of a collision
+ * attack (hashed all the same, as git's sha1dc does).
+ */
+function dcHashBlocks(s: Int32Array, p: Uint8Array, at: number, end: number): boolean {
+  const wasm = end - at >= WASM_MIN ? sha1Wasm() : undefined;
+  if (!wasm) return dcBlocks(s, p, at, end);
+  let found = false;
+  wasm.state.set(s);
+  while (at < end) {
+    const length = Math.min(end - at, wasm.capacity);
+    wasm.input.set(p.subarray(at, at + length));
+    if (wasm.dcBlocks(0, length >>> 6)) found = true;
+    at += length;
+  }
+  s.set(wasm.state);
+  return found;
+}
+
+function hexOf(bytes: Uint8Array): string {
+  let hex = "";
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, "0");
+  return hex;
 }
 
 /**
@@ -431,11 +459,25 @@ function blocks(s: Int32Array, p: Uint8Array, at: number, end: number): void {
   s[4] = h4;
 }
 
-/** An incremental SHA-1: `update` any number of times, then `digest` once. */
 /** The largest piece `update` hashes in one go (larger inputs are fed in pieces). */
 const UPDATE_PIECE = 2 ** 30;
 
+/**
+ * An incremental SHA-1: `update` any number of times, then `digest` once. By default with
+ * sha1dc's collision detection, as git hashes objects: `digest` throws `Sha1CollisionError`
+ * (git's message) when a block was part of a collision attack. `new Sha1(false)` is git's
+ * "unsafe" SHA-1 (`unsafe_init_fn`), for checksums of files that are not object ids.
+ */
 export class Sha1 {
+  /** whether a block so far was part of a collision attack */
+  private collision = false;
+  constructor(private readonly detect = true) {}
+
+  private run(p: Uint8Array, at: number, end: number): void {
+    if (!this.detect) hashBlocks(this.s, p, at, end);
+    else if (dcHashBlocks(this.s, p, at, end)) this.collision = true;
+  }
+
   private readonly s = new Int32Array([0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0]);
   /** a partial block carried between `update` calls */
   private readonly buf = new Uint8Array(64);
@@ -462,11 +504,11 @@ export class Sha1 {
       this.used += take;
       at = take;
       if (this.used < 64) return this;
-      blocks(this.s, this.buf, 0, 64);
+      this.run(this.buf, 0, 64);
       this.used = 0;
     }
     const end = at + ((n - at) & ~63);
-    if (end > at) hashBlocks(this.s, data, at, end);
+    if (end > at) this.run(data, at, end);
     if (end < n) {
       this.buf.set(data.subarray(end), 0);
       this.used = n - end;
@@ -483,7 +525,7 @@ export class Sha1 {
     buf[used++] = 0x80;
     if (used > 56) {
       buf.fill(0, used);
-      blocks(this.s, buf, 0, 64);
+      this.run(buf, 0, 64);
       used = 0;
     }
     buf.fill(0, used, 56);
@@ -498,7 +540,7 @@ export class Sha1 {
     buf[61] = lo >>> 16;
     buf[62] = lo >>> 8;
     buf[63] = lo;
-    blocks(this.s, buf, 0, 64);
+    this.run(buf, 0, 64);
     const out = new Uint8Array(20);
     for (let i = 0; i < 5; i++) {
       const v = this.s[i] as number;
@@ -507,12 +549,14 @@ export class Sha1 {
       out[i * 4 + 2] = v >>> 8;
       out[i * 4 + 3] = v;
     }
+    if (this.collision) throw new Sha1CollisionError(hexOf(out));
     return out;
   }
 
   /** A copy of the current state. */
   clone(): Sha1 {
-    const c = new Sha1();
+    const c = new Sha1(this.detect);
+    c.collision = this.collision;
     c.s.set(this.s);
     c.buf.set(this.buf);
     c.used = this.used;
@@ -528,7 +572,8 @@ const NOTHING = new Uint8Array(0);
  * The SHA-1 of `head` followed by `body` (a git object's header and content), in one call:
  * where the WebAssembly block function is available and the padded message fits its memory,
  * the message is copied there whole, padding included, and hashed in a single run, which
- * saves the per-call costs that dominate for small objects.
+ * saves the per-call costs that dominate for small objects. With collision detection (an
+ * object id): throws `Sha1CollisionError` as git dies.
  *
  * @example
  * ```typescript
@@ -560,7 +605,7 @@ export function sha1Of(head: Uint8Array, body: Uint8Array = NOTHING): Uint8Array
   input[padded - 1] = lo;
   const state = wasm.state;
   state.set(INITIAL);
-  wasm.blocks(padded >>> 6);
+  const collision = wasm.dcBlocks(0, padded >>> 6);
   const out = new Uint8Array(20);
   for (let i = 0; i < 5; i++) {
     const v = state[i] as number;
@@ -569,5 +614,6 @@ export function sha1Of(head: Uint8Array, body: Uint8Array = NOTHING): Uint8Array
     out[i * 4 + 2] = v >>> 8;
     out[i * 4 + 3] = v;
   }
+  if (collision) throw new Sha1CollisionError(hexOf(out));
   return out;
 }
