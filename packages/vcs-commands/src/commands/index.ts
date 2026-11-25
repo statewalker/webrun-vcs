@@ -11,6 +11,7 @@ export * from "./branch-info-command.js";
 export { TrackMode } from "./branch-tracking.js";
 export * from "./branch-upstream-command.js";
 export * from "./bundle/index.js";
+export * from "./cat-file/index.js";
 export * from "./check-mailmap-command.js";
 export * from "./checkout-command.js";
 export * from "./checkout-index-command.js";
@@ -52,7 +53,9 @@ export { httpBackendEnv, quarantineEnv, remoteHookSession } from "./local-transp
 export * from "./log-command.js";
 export * from "./log-graph.js";
 export * from "./log-output.js";
+export * from "./ls-files-command.js";
 export * from "./ls-remote-command.js";
+export * from "./ls-tree-command.js";
 export * from "./mailmap.js";
 export * from "./merge-base-command.js";
 export * from "./merge-command.js";
@@ -89,6 +92,7 @@ export {
   NotesTree,
 } from "./notes-tree.js";
 export * from "./pack-refs-command.js";
+export * from "./plumbing-command.js";
 export * from "./pretty-format.js";
 export * from "./promisor-remote.js";
 export * from "./pull-command.js";
@@ -123,6 +127,7 @@ export * from "./serve-repository.js";
 export * from "./shortlog.js";
 export * from "./shortlog-command.js";
 export * from "./show-command.js";
+export * from "./show-ref-command.js";
 export * from "./signature-check.js";
 export * from "./signing.js";
 export * from "./sparse-checkout-command.js";
