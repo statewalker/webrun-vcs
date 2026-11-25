@@ -335,6 +335,8 @@ describeGit("filter.<driver>.required against native git (t0021)", () => {
       },
     };
     await compareAdd(tw, "test.q", { hostFilters: upper });
+    // changed again, so git does not skip the add of a stat-clean file
+    for (const dir of [tw.native, tw.ours]) sh(dir, "echo changed >test.q");
     await compareAdd(tw, "test.q", {
       hostFilters: upper,
       commandLine: { "filter.req.clean": "" },
@@ -610,6 +612,40 @@ describeGit("merge.<driver>.driver and .recursive against native git (t6406)", (
       await compareMerge(tw, "recursive-a", ["custom"]);
     },
   );
+
+  it("checkout -m of a path whose driver is killed leaves the file, as git", async () => {
+    const tw = twins(
+      [
+        T6406_SETUP,
+        "git config merge.custom.driver './custom-merge %O %A %B 1 %P %S %X %Y'",
+        "echo 'text merge=custom' >.gitattributes",
+        "git merge main >/dev/null 2>&1 || true",
+        "echo edited >text",
+        ">please-abort",
+      ].join("\n"),
+    );
+    const native = git(tw.native, ["checkout", "-m", "--", "text"]);
+    const repo = await open(tw.ours, { merges: ["custom"] });
+    let status = 0;
+    let errors: string[] = [];
+    try {
+      const result = await repo.checkout().setMerge(true).addPath("text").call();
+      status = result.exitCode ?? (String(result.status) === "OK" ? 0 : 1);
+      errors = (result.message ?? "").split("\n").filter((l) => l.startsWith("error: "));
+    } catch (error) {
+      const e = error as { exitCode?: number; message: string };
+      status = e.exitCode ?? 1;
+      errors = e.message.split("\n").filter((l) => l.startsWith("error: "));
+    }
+    expect({ status, errors }).toEqual({
+      status: native.status,
+      errors: native.stderr
+        .split("\n")
+        .filter((l) => l.startsWith("error: ") && !/ died of signal /.test(l)),
+    });
+    expect(readFileSync(join(tw.ours, "text"), "utf8")).toBe("edited\n");
+    expect(readFileSync(join(tw.native, "text"), "utf8")).toBe("edited\n");
+  });
 
   for (const recursive of ["binary", "union", "text", "inner"]) {
     it(`merge.<driver>.recursive=${recursive} merges the merge bases with that driver`, async () => {
