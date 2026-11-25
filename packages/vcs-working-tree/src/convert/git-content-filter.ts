@@ -354,6 +354,8 @@ interface Scope {
   keptChanges: Set<string>;
   /** The index read where a lookup names none, while an operation sets one (`index`) */
   index?: AttributesIndex;
+  /** Where the attributes files' warnings go (`onAttributeWarning`) */
+  onWarning?: (message: string) => void;
 }
 
 /**
@@ -471,6 +473,7 @@ export class GitContentFilter implements WorktreeContentFilter {
   async batch<T>(fn: () => Promise<T>, options?: OperationOptions): Promise<T> {
     const outer = this.scope;
     const scope = outer ?? (await this.openScope());
+    if (!outer && options?.onAttributeWarning) scope.onWarning = options.onAttributeWarning;
     this.scope = scope;
     const keep = options?.keepAttributes === true;
     if (keep) scope.keeping++;
@@ -576,7 +579,7 @@ export class GitContentFilter implements WorktreeContentFilter {
         return (await fromWorktree(path)) ?? (await fromIndex(path));
       },
     };
-    const found = { sources, memo: new AttributesMemo() };
+    const found = { sources, memo: new AttributesMemo(scope.onWarning) };
     scope.memos.set(memoKey, found);
     return found;
   }
@@ -664,6 +667,21 @@ export class GitContentFilter implements WorktreeContentFilter {
   ): Promise<Map<string, AttributeValue>> {
     const context = typeof direction === "string" ? { direction } : direction;
     return this.attributesIn(await this.currentScope(), path, names, context);
+  }
+
+  /**
+   * The attribute names the files read for `path` mention, in git's interning order, added
+   * to `order` (see `AttributesResolver.nameOrder`): the order `git check-attr --all` lists
+   * a path's attributes in.
+   */
+  async attributeNameOrder(
+    path: string,
+    order: Set<string>,
+    direction: AttributesDirection | ContentAttributesContext = "checkin",
+  ): Promise<Set<string>> {
+    const context = typeof direction === "string" ? { direction } : direction;
+    const { sources, memo } = this.sourcesFor(await this.currentScope(), context);
+    return this.resolver.nameOrder(path, order, { sources, memo });
   }
 
   private async convAttrsIn(

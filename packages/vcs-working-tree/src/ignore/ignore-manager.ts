@@ -96,6 +96,16 @@ export interface IgnoreNode {
    */
   checkIgnored(entryPath: string, isDirectory: boolean, ignoreCase?: boolean): boolean | undefined;
 
+  /**
+   * The last rule matching a path (negated or not) and its line in the parsed text (git's
+   * `last_matching_pattern_from_list`); undefined when none matches.
+   */
+  matchingRule?(
+    entryPath: string,
+    isDirectory: boolean,
+    ignoreCase?: boolean,
+  ): { rule: IgnoreRule; line: number } | undefined;
+
   /** All rules in this node */
   readonly rules: readonly IgnoreRule[];
 
@@ -105,6 +115,32 @@ export interface IgnoreNode {
    * @param content Content of gitignore file
    */
   parse(content: string): void;
+}
+
+/** Where an ignore rule was read (see {@link IgnoreMatch}). */
+export type IgnoreSource =
+  /** The `.gitignore` of a directory ("" for the top) */
+  | { kind: "directory"; directory: string }
+  /** A named exclude file (`info/exclude`, `core.excludesFile`) */
+  | { kind: "exclude"; name: string }
+  /** The patterns given by `addGlobalPatterns` */
+  | { kind: "global" }
+  /** The command line's rules (`EXC_CMDL`) */
+  | { kind: "commandLine" };
+
+/**
+ * The pattern that decides whether a path is ignored, as `git check-ignore -v` reports it:
+ * an excluded leading directory's (whatever the path's own rules say), else the path's last
+ * matching one, negated or not.
+ */
+export interface IgnoreMatch {
+  source: IgnoreSource;
+  /** Its line in its file, from 1 (0 for patterns not read from a file) */
+  line: number;
+  /** The pattern as written (a leading `!` and a trailing `/` included) */
+  pattern: string;
+  /** Whether it re-includes (`!`) */
+  negated: boolean;
 }
 
 /**
@@ -152,6 +188,13 @@ export interface IgnoreManager {
    * @returns Match result with full status
    */
   getStatus(path: string, isDirectory: boolean, commandLine?: IgnoreNode): MatchResultValue;
+
+  /**
+   * git's `last_matching_pattern`: the pattern of the first leading directory an ignoring
+   * pattern excludes, else the path's own last matching pattern (negated ones too); undefined
+   * when nothing matches.
+   */
+  matchingPattern?(path: string, isDirectory: boolean): IgnoreMatch | undefined;
 
   /**
    * Add ignore patterns from a gitignore file at a specific path.

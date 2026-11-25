@@ -33,7 +33,8 @@ export interface ContentFilterSetup {
 
 /**
  * Lets the worktree read `core.ignoreCase` for its ignore rules, and the global excludes file
- * as git does: `core.excludesFile` from the configuration chain (`~/` in the home), else
+ * as git does: `core.excludesFile` from the configuration chain (`~/` in the home, a relative
+ * path from the top of the worktree), else
  * `$XDG_CONFIG_HOME/git/ignore`, through the host's environment. Without an environment no
  * excludes file is read (the worktree's own `globalExcludesFile` option, if any, still
  * applies).
@@ -58,7 +59,13 @@ export function installExcludesFile(
         ? expandUserPath(configured, env)
         : xdgConfigPath(env, "ignore");
     if (!path) return undefined;
-    const content = await env.readFile(path);
+    // a relative path is read from the top of the worktree, where git's setup has moved
+    const top = (worktree as { hostPath?: string }).hostPath;
+    const content = await env.readFile(
+      /^([A-Za-z]:)?[\\/]/.test(path) || top === undefined
+        ? path
+        : `${top.replace(/\/+$/, "")}/${path}`,
+    );
     return content ? decodeGitPatternFile(content) : undefined;
   });
 }

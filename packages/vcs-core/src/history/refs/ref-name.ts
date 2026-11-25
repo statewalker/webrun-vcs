@@ -11,15 +11,19 @@
  */
 
 const LONE_SURROGATE = /\p{Cs}/u;
-const FORBIDDEN = new Set([" ", "~", "^", ":", "?", "[", "\\", "*", "\u007f"]);
+const FORBIDDEN = new Set([" ", "~", "^", ":", "?", "[", "\\", "\u007f"]);
 
-function badComponent(component: string): boolean {
+/** `pattern.allowed`: a `*` may still come (`REFNAME_REFSPEC_PATTERN`, cleared by the first). */
+function badComponent(component: string, pattern: { allowed: boolean }): boolean {
   if (component.length === 0 || component.startsWith(".") || component.endsWith(".lock")) {
     return true;
   }
   let prev = "";
   for (const ch of component) {
-    if ((ch.codePointAt(0) ?? 0) < 0x20 || FORBIDDEN.has(ch)) return true;
+    if (ch === "*") {
+      if (!pattern.allowed) return true;
+      pattern.allowed = false;
+    } else if ((ch.codePointAt(0) ?? 0) < 0x20 || FORBIDDEN.has(ch)) return true;
     if (ch === "." && prev === ".") return true;
     if (ch === "{" && prev === "@") return true;
     prev = ch;
@@ -30,6 +34,11 @@ function badComponent(component: string): boolean {
 export interface RefNameOptions {
   /** Accept a single component such as `HEAD` or `main` (`--allow-onelevel`). */
   allowOneLevel?: boolean;
+  /**
+   * Accept one `*` in the whole name, as a refspec's side has it (`--refspec-pattern`,
+   * `REFNAME_REFSPEC_PATTERN`)
+   */
+  refspecPattern?: boolean;
 }
 
 /**
@@ -42,12 +51,14 @@ export interface RefNameOptions {
  * isValidRefName("refs/heads/.hidden");   // false: a component starts with "."
  * isValidRefName("main");                 // false: one level
  * isValidRefName("main", { allowOneLevel: true }); // true
+ * isValidRefName("refs/heads/*", { refspecPattern: true }); // true: one `*`
  * ```
  */
 export function isValidRefName(name: string, options: RefNameOptions = {}): boolean {
   if (name === "@" || name.endsWith(".") || LONE_SURROGATE.test(name)) return false;
   const parts = name.split("/");
-  if (parts.some(badComponent)) return false;
+  const pattern = { allowed: options.refspecPattern === true };
+  if (parts.some((part) => badComponent(part, pattern))) return false;
   return options.allowOneLevel === true || parts.length >= 2;
 }
 
@@ -112,4 +123,24 @@ export function isValidTagName(name: string): boolean {
     name !== "HEAD" &&
     isValidRefName(`refs/tags/${name}`)
   );
+}
+
+/**
+ * `git check-ref-format --normalize`'s `collapse_slashes`: leading slashes dropped, runs of
+ * slashes collapsed to one.
+ *
+ * @example
+ * ```typescript
+ * collapseRefNameSlashes("///heads//foo"); // "heads/foo"
+ * ```
+ */
+export function collapseRefNameSlashes(name: string): string {
+  let out = "";
+  let prev = "/";
+  for (const ch of name) {
+    if (prev === "/" && ch === "/") continue;
+    out += ch;
+    prev = ch;
+  }
+  return out;
 }

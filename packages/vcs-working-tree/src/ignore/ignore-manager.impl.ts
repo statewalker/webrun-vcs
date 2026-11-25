@@ -14,7 +14,13 @@
 
 import { foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 
-import type { IgnoreManager, IgnoreNode, MatchResultValue } from "./ignore-manager.js";
+import type {
+  IgnoreManager,
+  IgnoreMatch,
+  IgnoreNode,
+  IgnoreSource,
+  MatchResultValue,
+} from "./ignore-manager.js";
 import { MatchResult } from "./ignore-manager.js";
 import { createIgnoreNode } from "./ignore-node.js";
 import { createIgnoreRule } from "./ignore-rule.js";
@@ -127,6 +133,54 @@ class GitIgnoreManagerImpl implements IgnoreManager {
       }
     }
     return this.statusOf(normalizedPath, isDirectory, commandLine);
+  }
+
+  matchingPattern(path: string, isDirectory: boolean): IgnoreMatch | undefined {
+    const normalizedPath = this.normalizePath(path);
+    const parts = normalizedPath.split("/");
+    // prep_exclude: an excluded leading directory decides for everything below it
+    for (let k = 1; k < parts.length; k++) {
+      const found = this.matchOf(parts.slice(0, k).join("/"), true);
+      if (found && !found.negated) return found;
+    }
+    return normalizedPath === "" ? undefined : this.matchOf(normalizedPath, isDirectory);
+  }
+
+  /** The last matching pattern of `normalizedPath` by the rules alone. */
+  private matchOf(normalizedPath: string, isDirectory: boolean): IgnoreMatch | undefined {
+    const matchIn = (node: IgnoreNode, relative: string, source: IgnoreSource) => {
+      const found = node.matchingRule?.(relative, isDirectory, this.ignoreCase);
+      if (!found) return undefined;
+      return {
+        source,
+        line: found.line,
+        pattern: found.rule.pattern,
+        negated: found.rule.isNegated,
+      };
+    };
+    for (const dirNode of this.directoryNodes) {
+      // a directory's own .gitignore is read only for what lies below it
+      if (dirNode.path !== "" && this.sameDirectory(normalizedPath, dirNode.path)) continue;
+      if (!this.isUnderDirectory(normalizedPath, dirNode.path)) continue;
+      const relative = this.getRelativePath(normalizedPath, dirNode.path);
+      const found = matchIn(dirNode.node, relative, {
+        kind: "directory",
+        directory: dirNode.path,
+      });
+      if (found) return found;
+    }
+    const rank = (source: string) =>
+      source === "info/exclude" ? 0 : source === "core.excludesFile" ? 1 : 2;
+    for (const name of [...this.excludeNodes.keys()].sort((a, b) => rank(a) - rank(b))) {
+      const node = this.excludeNodes.get(name) as IgnoreNode;
+      const found = matchIn(node, normalizedPath, { kind: "exclude", name });
+      if (found) return found;
+    }
+    return matchIn(this.globalNode, normalizedPath, { kind: "global" });
+  }
+
+  private sameDirectory(path: string, dirPath: string): boolean {
+    return this.ignoreCase ? foldAsciiCase(path) === foldAsciiCase(dirPath) : path === dirPath;
   }
 
   /** The status of `normalizedPath` by the rules alone, its directories not considered. */

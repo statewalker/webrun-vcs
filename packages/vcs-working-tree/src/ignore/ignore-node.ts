@@ -18,10 +18,13 @@ export function createIgnoreNode(initialRules?: IgnoreRule[]): IgnoreNode {
 
 class GitIgnoreNode implements IgnoreNode {
   private readonly _rules: IgnoreRule[] = [];
+  /** The line of each rule in the parsed text (0 for rules given otherwise) */
+  private readonly lines: number[] = [];
 
   constructor(initialRules?: IgnoreRule[]) {
     if (initialRules) {
       this._rules.push(...initialRules);
+      this.lines.push(...initialRules.map(() => 0));
     }
   }
 
@@ -60,6 +63,7 @@ class GitIgnoreNode implements IgnoreNode {
         const rule = createIgnoreRule(line);
         if (!rule.isEmpty) {
           this._rules.push(rule);
+          this.lines.push(_lineNumber);
         }
       } catch (_error) {
         // Skip invalid patterns (JGit logs but continues)
@@ -79,16 +83,23 @@ class GitIgnoreNode implements IgnoreNode {
   }
 
   checkIgnored(entryPath: string, isDirectory: boolean, ignoreCase = false): boolean | undefined {
-    // Parse rules in reverse order (later rules have higher priority)
+    const found = this.matchingRule(entryPath, isDirectory, ignoreCase);
+    // true if ignoring, false if negated (un-ignoring)
+    return found === undefined ? undefined : !found.rule.isNegated;
+  }
+
+  matchingRule(
+    entryPath: string,
+    isDirectory: boolean,
+    ignoreCase = false,
+  ): { rule: IgnoreRule; line: number } | undefined {
+    // later rules have higher priority
     for (let i = this._rules.length - 1; i >= 0; i--) {
       const rule = this._rules[i];
       const matched = rule.matchesPath
         ? rule.matchesPath(entryPath, isDirectory, ignoreCase)
         : rule.isMatchWithMode(entryPath, isDirectory, true);
-      if (matched) {
-        // Return true if ignoring, false if negated (un-ignoring)
-        return !rule.isNegated;
-      }
+      if (matched) return { rule, line: this.lines[i] ?? 0 };
     }
     return undefined;
   }
