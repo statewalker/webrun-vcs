@@ -10,6 +10,7 @@
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
   readdirSync,
@@ -652,6 +653,8 @@ describeGit("object-store commands twins", () => {
       spawnSync("cp", ["-a", join(caseDir, "src/repo"), join(caseV1, "src/repo")]);
       const gitDirV1 = join(caseV1, "src/repo/.git");
       const idxV1 = packOf(gitDirV1);
+      // git writes .idx files 0444; CI does not run as root
+      chmodSync(idxV1, 0o644);
       writeFileSync(idxV1, readFileSync(v1));
       rmSync(idxV1.replace(/\.idx$/, ".rev"), { force: true });
       const rel = relative(join(caseV1, "src/repo"), idxV1);
