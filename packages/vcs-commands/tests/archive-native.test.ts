@@ -754,6 +754,19 @@ describeGit("git archive edge cases, native", () => {
     }
   });
 
+  it("working-tree-encoding without a value dies, bare or not", async () => {
+    git(repo, ["config", "core.attributesFile", join(root, "attributes")]);
+    put(root, "attributes", "*.crlf working-tree-encoding\n");
+    try {
+      expect((await twins(repo, ["HEAD"])).status).toBe(128);
+      put(bare, "info/attributes", "*.crlf working-tree-encoding\n");
+      expect((await twins(bare, ["HEAD"])).status).toBe(128);
+    } finally {
+      git(repo, ["config", "--unset", "core.attributesFile"]);
+      rmSync(join(bare, "info/attributes"), { force: true });
+    }
+  });
+
   it("checkout's verify_path: trees with paths git refuses", async () => {
     const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], {
       cwd: repo,

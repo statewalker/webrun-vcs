@@ -958,7 +958,13 @@ class ArchiveRun {
       // the host's filter drivers (`setFilterDrivers`)
       const attrs = await this.bareResolver.get(path, CONVERT_ATTRS);
       this.conversionSettings ??= readConversionSettings(this.cmd.archiveConfigObject(), "lf");
-      const ca = convAttrsOf(new Map(attrs), this.conversionSettings, this.cmd.archiveDrivers());
+      const ca = asGitDeath(() =>
+        convAttrsOf(
+          new Map(attrs),
+          this.conversionSettings as ConversionSettings,
+          this.cmd.archiveDrivers(),
+        ),
+      );
       let out = content;
       if (ca.ident) out = identToWorktree(out, id);
       out = crlfToWorktree(out, ca.crlfAction, this.conversionSettings);
@@ -987,8 +993,8 @@ class ArchiveRun {
     try {
       out = await smudgeContent(filter, path, content, mode, this.filterContext);
     } catch (error) {
-      if (error instanceof FilterDriverError) {
-        throw new GitApiError(`fatal: ${error.message}`);
+      if (error instanceof FilterDriverError || isEncodingAttributeError(error)) {
+        throw new GitApiError(`fatal: ${(error as Error).message}`);
       }
       throw error;
     }
@@ -1046,6 +1052,24 @@ class ArchiveRun {
       out += format[i];
     }
     return { format: out, describe };
+  }
+}
+
+/** convert.c's death for `working-tree-encoding` set or unset (no value). */
+function isEncodingAttributeError(error: unknown): boolean {
+  return (
+    error instanceof Error && error.message === "true/false are no valid working-tree-encodings"
+  );
+}
+
+/** `fn`'s result, convert.c's attribute deaths turned into git's `fatal:`. */
+function asGitDeath<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (error) {
+    if (isEncodingAttributeError(error))
+      throw new GitApiError(`fatal: ${(error as Error).message}`);
+    throw error;
   }
 }
 
