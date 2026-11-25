@@ -40,15 +40,24 @@ export class Shell {
   git(
     cwd: string,
     args: string[],
-    options: { env?: Record<string, string>; input?: string } = {},
+    options: {
+      env?: Record<string, string>;
+      input?: string | Uint8Array;
+      /** stdout as latin1 (one char per byte), for byte comparisons; stderr stays UTF-8 */
+      latin1Stdout?: boolean;
+    } = {},
   ): Outcome {
     const r = spawnSync("git", args, {
       cwd,
       env: { ...nativeGitEnv(this.home), GIT_EDITOR: "true", ...this.dates(), ...options.env },
-      encoding: "utf8",
       ...(options.input !== undefined ? { input: options.input } : {}),
     });
-    return { status: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+    const stdout = r.stdout ?? Buffer.alloc(0);
+    return {
+      status: r.status ?? 1,
+      stdout: stdout.toString(options.latin1Stdout ? "latin1" : "utf8"),
+      stderr: (r.stderr ?? Buffer.alloc(0)).toString("utf8"),
+    };
   }
 
   /** Native git that must succeed; its stdout. */

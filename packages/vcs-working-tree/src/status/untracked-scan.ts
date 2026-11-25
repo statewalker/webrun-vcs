@@ -33,6 +33,7 @@
 import { compareGitPaths, foldAsciiCase } from "@statewalker/vcs-utils/encoding";
 import type { DirectoryEntry, LinkStats } from "@statewalker/vcs-utils/files";
 import {
+  DIR_COLLECT_KILLED_ONLY,
   DIR_HIDE_EMPTY_DIRECTORIES,
   DIR_SHOW_IGNORED,
   DIR_SHOW_IGNORED_TOO,
@@ -130,7 +131,9 @@ export interface UntrackedScanOptions {
   /**
    * git's `dir_struct` flags: 0 (`-uall`, the default here), `DIR_SHOW_OTHER_DIRECTORIES |
    * DIR_HIDE_EMPTY_DIRECTORIES` (`-unormal`), with `DIR_SHOW_IGNORED_TOO` (and
-   * `DIR_SHOW_IGNORED_TOO_MODE_MATCHING`) for `--ignored`
+   * `DIR_SHOW_IGNORED_TOO_MODE_MATCHING`) for `--ignored`; `DIR_SHOW_IGNORED` (`git ls-files
+   * -i -o`: the ignored paths in {@link UntrackedScanResult.paths} instead of the untracked
+   * ones) and `DIR_COLLECT_KILLED_ONLY` (`git ls-files -k`)
    */
   flags?: number;
   /**
@@ -154,6 +157,12 @@ export interface UntrackedScanOptions {
   stat?: StatMatchOptions;
   /** Called for each directory (not the root) that could not be listed */
   onUnreadable?(path: string, error: unknown): void;
+  /**
+   * Give {@link UntrackedScanResult.paths} as dir.c collects them (`dir->entries`, sorted),
+   * without dropping the directories named as an index file (`git ls-files -k` lists them
+   * as killed; `-o` asks `index_name_is_other` itself)
+   */
+  allEntries?: boolean;
 }
 
 /**
@@ -308,6 +317,8 @@ export async function scanUntracked(
   const cache = pathspec || flags & DIR_SHOW_IGNORED_TOO ? undefined : options.cache;
   const indexSeconds = options.indexSeconds ?? 0;
   const showIgnoredToo = (flags & DIR_SHOW_IGNORED_TOO) !== 0;
+  const showIgnored = (flags & DIR_SHOW_IGNORED) !== 0;
+  const killedOnly = (flags & DIR_COLLECT_KILLED_ONLY) !== 0;
   const matching = showIgnoredToo && (flags & DIR_SHOW_IGNORED_TOO_MODE_MATCHING) !== 0;
   const hideEmpty = (flags & DIR_HIDE_EMPTY_DIRECTORIES) !== 0;
   const otherDirectories = (flags & DIR_SHOW_OTHER_DIRECTORIES) !== 0;
@@ -407,7 +418,7 @@ export async function scanUntracked(
     ignored.push(path);
   };
 
-  /** `add_path_to_appropriate_result_list` (without `DIR_SHOW_IGNORED`/`COLLECT_IGNORED`). */
+  /** `add_path_to_appropriate_result_list` (without `DIR_COLLECT_IGNORED`). */
   const addToResult = (
     path: string,
     state: number,
@@ -416,8 +427,11 @@ export async function scanUntracked(
     fromDisk: boolean,
   ) => {
     if (state === PATH_EXCLUDED) {
-      if (showIgnoredToo) addIgnored(path);
+      if (showIgnored) addName(path);
+      else if (showIgnoredToo) addIgnored(path);
     } else if (state === PATH_UNTRACKED) {
+      // `ls-files -i -o` lists the ignored paths alone
+      if (showIgnored) return;
       addName(path);
       if (fromDisk && node) node.untracked.push(name);
     }
@@ -503,13 +517,19 @@ export async function scanUntracked(
     if (kind === undefined) kind = (await host.lstat(path))?.kind;
     if (kind === undefined) return { state: PATH_NONE, path, name };
     const isDirectory = kind === "directory";
-    if (!isDirectory && (trackedHere ? trackedHere.has(name) : options.isTracked(path))) {
+    const inIndex = trackedHere ? trackedHere.has(name) : options.isTracked(path);
+    if (!isDirectory && inIndex) {
+      return { state: PATH_NONE, path, name };
+    }
+    // `ls-files -k`: a directory neither a file of the index nor holding entries cannot hold
+    // anything a checkout would remove
+    if (killedOnly && isDirectory && !inIndex && options.indexDirectory(path) === undefined) {
       return { state: PATH_NONE, path, name };
     }
     // is_excluded: the rules of the directory and its parents
     await prep(dir);
     const excluded = host.isExcluded(path, isDirectory);
-    if (excluded && !showIgnoredToo) return { state: PATH_EXCLUDED, path, name };
+    if (excluded && !showIgnoredToo && !showIgnored) return { state: PATH_EXCLUDED, path, name };
     if (isDirectory) {
       const state = await treatDirectory(path, node, name, excluded);
       return { state, path: `${path}/`, name: `${name}/` };
@@ -689,7 +709,10 @@ export async function scanUntracked(
   // as git status: the index decides what is untracked (`index_name_is_other`), and each
   // path is listed once (`string_list_sort_u`), in byte order
   const finish = (list: string[]) => {
-    const out = [...new Set(list)].filter((p) => !options.isTracked(stripSlash(p)));
+    const unique = [...new Set(list)];
+    const out = options.allEntries
+      ? unique
+      : unique.filter((p) => !options.isTracked(stripSlash(p)));
     out.sort(compareGitPaths);
     return out;
   };
