@@ -80,6 +80,7 @@ export {
   parseStrategyOptions,
   UnknownStrategyOptionError,
 } from "./merge-strategy-options.js";
+export * from "./merge-tree-command.js";
 export { CleanupMode, stripspace } from "./message-cleanup.js";
 export * from "./mktag-command.js";
 export * from "./mv-command.js";
