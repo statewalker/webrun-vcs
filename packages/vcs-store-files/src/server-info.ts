@@ -54,8 +54,8 @@ async function infoRefs(o: ServerInfoOptions, gitDir: string): Promise<string> {
       target = byName.get(target.target);
     if (!target || isSymbolicRef(target) || !target.objectId) continue;
     const id = target.objectId;
-    const type = await o.objects.objectType?.(id).catch(() => undefined);
-    if (!type && !(await o.objects.has(id).catch(() => false))) continue;
+    const type = await typeOf(o.objects, id);
+    if (!type) continue;
     out += `${id}\t${ref.name}\n`;
     if (type === "tag") {
       const peeled = await peel(o.objects, id);
@@ -65,11 +65,26 @@ async function infoRefs(o: ServerInfoOptions, gitDir: string): Promise<string> {
   return out;
 }
 
+/**
+ * An object's type from its header (`objectType`, `header`), else read whole: a store wrapper
+ * may answer neither. Undefined for an object the store does not have.
+ */
+async function typeOf(objects: GitObjects, id: ObjectId): Promise<string | undefined> {
+  const quick =
+    (await objects.objectType?.(id).catch(() => undefined)) ??
+    (await objects.header?.(id).catch(() => undefined))?.type;
+  if (quick) return quick;
+  const object = await objects.get(id).catch(() => undefined);
+  if (!object) return undefined;
+  await object.content[Symbol.asyncIterator]().return?.();
+  return object.type;
+}
+
 /** The object an annotated tag (chain) finally names. */
 async function peel(objects: GitObjects, id: ObjectId): Promise<ObjectId | undefined> {
   let current = id;
   for (let depth = 0; depth < 64; depth++) {
-    const type = await objects.objectType?.(current).catch(() => undefined);
+    const type = await typeOf(objects, current);
     if (type !== "tag") return current;
     const [next] = await objectLinks(objects, current);
     if (!next) return undefined;

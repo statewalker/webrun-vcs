@@ -27,7 +27,7 @@ import {
   type ReceivePackLogger,
 } from "../fsm/push/receive-pack-types.js";
 import {
-  RECEIVE_PACK_CAPABILITIES,
+  receivePackCapabilitiesOf,
   releaseReceivePack,
   serverPushHandlers,
   serverPushTransitions,
@@ -104,6 +104,19 @@ export interface ServeOverDuplexOptions {
    * `GIT_SERVER_SETTINGS_DEFAULTS`)
    */
   advertisePushOptions?: boolean;
+  /**
+   * receive-pack: git's `receive.advertiseAtomic` (default true); false leaves `atomic` out of
+   * the advertised capabilities, and a client asking for it anyway pushes without it
+   */
+  advertiseAtomic?: boolean;
+  /** receive-pack: git's `receive.maxInputSize` (see `ReceivePackConfig.maxInputSize`) */
+  maxInputSize?: number;
+  /**
+   * receive-pack: git's `receive.keepAlive` in ms (0: none), over {@link keepAliveMs} for a push
+   */
+  receiveKeepAliveMs?: number;
+  /** receive-pack: what runs once a push is done (see `ReceivePackConfig.afterPush`) */
+  afterPush?: ReceivePackConfig["afterPush"];
   /** receive-pack: `receive.fsckObjects` (see `ReceivePackConfig.fsckObjects`) */
   fsckObjects?: ReceivePackConfig["fsckObjects"];
   /** upload-pack hooks: authorize (before the negotiation), postUpload (after the pack) */
@@ -249,8 +262,8 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
     localHead: options.currentBranch ?? "refs/heads/main",
     maxHaves: 256,
     serverCapabilities:
-      service === "git-receive-pack" && options.advertisePushOptions === false
-        ? (options.capabilities ?? RECEIVE_PACK_CAPABILITIES).filter((c) => c !== "push-options")
+      service === "git-receive-pack"
+        ? receivePackCapabilitiesOf(options.capabilities, options)
         : options.capabilities,
     requestPolicy: options.requestPolicy,
     advertiseObjectInfo: options.advertiseObjectInfo,
@@ -269,7 +282,9 @@ export async function serveOverDuplex(options: ServeOverDuplexOptions): Promise<
     receivePack: {
       hooks: options.hooks,
       maxCommands: options.maxCommands,
-      keepAliveMs: options.keepAliveMs,
+      keepAliveMs: options.receiveKeepAliveMs ?? options.keepAliveMs,
+      ...(options.maxInputSize ? { maxInputSize: options.maxInputSize } : {}),
+      ...(options.afterPush ? { afterPush: options.afterPush } : {}),
       hookTimeoutMs: options.hookTimeoutMs,
       bare: options.bare,
       denyDeleteCurrent: options.denyDeleteCurrent,
