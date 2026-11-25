@@ -36,6 +36,7 @@ import {
   writePack,
   writePackBitmap,
 } from "@statewalker/vcs-core";
+import { type ProgressMonitor, startProgress } from "@statewalker/vcs-utils";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
@@ -85,6 +86,14 @@ export interface RepackTarget {
  * Options for the repack operation.
  */
 export interface RepackOptions extends RepackTarget {
+  /**
+   * pack-objects' and prune-packed's progress (a repack whose stderr is a terminal):
+   * "Enumerating objects", then the pack writer's "Counting objects", "Compressing objects",
+   * "Writing objects" (see `WritePackOptions.progress`), and with `deleteRedundant` "Removing
+   * duplicate objects" over the 256 loose object directories. A monitor that throws stops the
+   * repack: a pack being written is removed, nothing is replaced.
+   */
+  progress?: ProgressMonitor;
   /**
    * Pack everything reachable into one pack and delete the packs it replaces (`git repack -a
    * -d`, the default). `false` packs only the reachable objects that are loose and deletes
@@ -607,6 +616,12 @@ export async function repackListed(
       promised.push({ id, type: o.type });
     }
   }
+  // pack-objects' "Enumerating objects": every object the traversal meets (nr_seen), the
+  // loose and replaced packs' unreachable ones of -k included
+  const enumerating = startProgress(options.progress, "Enumerating objects");
+  const seen = reachable.length + unreachable.length;
+  if (seen > 0) enumerating.update(seen);
+  enumerating.stop();
   if (ids.length === 0 && promised.length === 0 && unreachable.length === 0) return null;
   if ((exclusions || options.filter) && bitmaps.mode !== "off") {
     // the promisor objects are not packed with the rest: no closure for a bitmap
@@ -665,11 +680,10 @@ export async function repackListed(
     return finishRepack(promisorPack as string, promised.length, false);
   }
   // One stream: objects are read one at a time, the pack goes straight into its temporary file
-  const stream = writePack(
-    objects,
-    unreachable.length ? [...ids, ...unreachable] : ids,
-    packOptions,
-  );
+  const stream = writePack(objects, unreachable.length ? [...ids, ...unreachable] : ids, {
+    ...packOptions,
+    ...(options.progress ? { progress: options.progress } : {}),
+  });
   const installed = await packs.install(stream, installOptions);
   // Install before remove: every reader finds each object in the new pack from now on
   await packs.refresh();
@@ -837,6 +851,12 @@ export async function repackListed(
     const looseObjectsRemoved = deleteRedundant
       ? await prunePacked(looseStorage, packs, objectFormatOf(objects), alternates)
       : 0;
+    // prune_packed_objects with PRUNE_PACKED_VERBOSE: shown at 256 whatever it removed
+    if (deleteRedundant) {
+      const removing = startProgress(options.progress, "Removing duplicate objects", 256);
+      removing.update(256);
+      removing.stop();
+    }
 
     return {
       packName: `pack-${packId}`,

@@ -10,6 +10,7 @@
 
 import type { Blobs, ObjectId } from "@statewalker/vcs-core";
 import { FileMode, isValidWorktreePath, type WorktreePathOptions } from "@statewalker/vcs-core";
+import { type ProgressMonitor, type ProgressTask, startProgress } from "@statewalker/vcs-utils";
 import {
   attributesIndexOf,
   type ContentAttributesContext,
@@ -331,6 +332,7 @@ async function writePlan(
       ...(options.replaceInTheWay ? { replaceInTheWay: true } : {}),
       ...(options.discardUntracked ? { discardUntracked: true } : {}),
     });
+    options.progress?.tick();
   }
   // a submodule is an empty directory, as git checks out an unpopulated one
   if (options.gitlinks) {
@@ -339,6 +341,7 @@ async function writePlan(
       // directory, its contents included, stays)
       if (options.replaceInTheWay) await worktree.remove(path);
       await worktree.mkdir(path);
+      options.progress?.tick();
     }
   }
 }
@@ -363,6 +366,8 @@ export interface TreeWriteOptions {
    * does (`checkout-index`: the worktree's, then the current index's).
    */
   attributes?: ContentAttributesContext | false;
+  /** Ticked once per file written and per gitlink created ("Updating files") */
+  progress?: ProgressTask;
 }
 
 /**
@@ -430,6 +435,8 @@ export interface FreshCheckoutTarget {
   writes?: (path: string) => boolean;
   /** git's `verify_path` rules (`worktreePathRules`); default both protections on */
   pathRules?: WorktreePathOptions;
+  /** clone's `--progress`: "Updating files", one unit per file and gitlink written */
+  progress?: ProgressMonitor;
 }
 
 /**
@@ -466,10 +473,17 @@ export async function checkoutFreshTree(
         gitlinks: fullPlan.gitlinks.filter((e) => writes(e.path)),
       }
     : fullPlan;
+  const progress = startProgress(
+    target.progress,
+    "Updating files",
+    plan.entries.length + plan.gitlinks.length,
+  );
   await writeTreeRestorePlan(worktree, blobs, plan, operation, {
     symlinks: target.symlinks,
     gitlinks: true,
+    progress,
   });
+  progress.stop();
   // the index records what was written (the worktree's stat of each file, a link's own
   // when the worktree can lstat)
   await staging.readTree(trees, treeId);

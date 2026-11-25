@@ -336,6 +336,8 @@ export class RepackCommand extends GitCommand<RepackCommandResult> {
         gitDir,
         ...(environment ? { environment } : {}),
         compatibility: this.hooks.compatibility,
+        // -q: no progress (git's show_progress = !quiet && isatty(2))
+        ...(this.progress && !this._quiet ? { progress: this.progress } : {}),
         all,
         deleteRedundant: this._delete,
         local: this._local,

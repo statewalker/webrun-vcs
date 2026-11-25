@@ -7,6 +7,7 @@ export * from "./encoding/index.js";
 export * from "./ewah/index.js";
 export * from "./hash/index.js";
 export * from "./ids/index.js";
+export * from "./progress/index.js";
 export * from "./regex/index.js";
 export * from "./streams/index.js";
 export * from "./url/index.js";
