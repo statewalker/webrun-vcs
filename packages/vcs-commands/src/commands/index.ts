@@ -17,6 +17,7 @@ export * from "./check-ignore-command.js";
 export * from "./check-mailmap-command.js";
 export * from "./check-ref-format-command.js";
 export * from "./checkout-command.js";
+export * from "./checkout-index-command.js";
 export * from "./checkout-paths.js";
 export * from "./cherry-command.js";
 export * from "./cherry-pick-command.js";
@@ -80,6 +81,7 @@ export {
   UnknownStrategyOptionError,
 } from "./merge-strategy-options.js";
 export { CleanupMode, stripspace } from "./message-cleanup.js";
+export * from "./mktag-command.js";
 export * from "./mv-command.js";
 export * from "./name-rev-command.js";
 export * from "./notes-command.js";
@@ -167,6 +169,7 @@ export * from "./submodule-update-command.js";
 export * from "./switch-command.js";
 export * from "./tag-command.js";
 export * from "./trailers.js";
+export * from "./update-index-command.js";
 export * from "./url-parse-command.js";
 export * from "./var-command.js";
 export * from "./verify-command.js";

@@ -1,10 +1,12 @@
 /**
- * What `git check-attr` and `git check-ignore` share: their `--stdin` records (lines, a line
- * starting with `"` unquoted as a C string, or NUL-terminated with `-z`) and their paths read
- * against the current directory (`prefix_path`).
+ * What the plumbing commands reading paths or entries from stdin share: `git check-attr` and
+ * `git check-ignore`'s `--stdin` records (lines, a line starting with `"` unquoted as a C
+ * string, or NUL-terminated with `-z`) and their paths read against the current directory
+ * (`prefix_path`); `update-index --stdin`/`--index-info` and `checkout-index --stdin` lines
+ * (git's `strbuf_getline_lf` / `strbuf_getline_nul` and `unquote_c_style`).
  */
 
-import { decodeGitPath, unquoteGitPath } from "@statewalker/vcs-utils/encoding";
+import { decodeGitPath, encodeGitPath, unquoteGitPath } from "@statewalker/vcs-utils/encoding";
 
 import { prefixPathGently } from "./git-paths.js";
 
@@ -52,4 +54,34 @@ export function prefixPath(
 export function directoryPrefix(dir: string): string {
   const trimmed = dir.replace(/^\/+|\/+$/g, "");
   return trimmed === "" || trimmed === "." ? "" : `${trimmed}/`;
+}
+
+/** The lines of `input` (LF- or, with `nul`, NUL-separated; a last empty one dropped). */
+export function inputLines(input: string | Uint8Array, nul: boolean): string[] {
+  const text = typeof input === "string" ? input : decodeGitPath(input);
+  const lines = text.split(nul ? "\0" : "\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+/**
+ * `unquote_c_style` of a line starting with `"` (what follows the closing quote ignored);
+ * undefined when it is badly quoted.
+ */
+export function unquoteLine(line: string): string | undefined {
+  return unquoteGitPath(encodeGitPath(line))?.path;
+}
+
+/**
+ * `--stdin`'s paths: {@link inputLines}, each LF-separated line starting with `"`
+ * unquoted; `badlyQuoted` is thrown for one that cannot be.
+ */
+export function inputPaths(
+  input: string | Uint8Array,
+  nul: boolean,
+  badlyQuoted: () => never,
+): string[] {
+  const lines = inputLines(input, nul);
+  if (nul) return lines;
+  return lines.map((line) => (line.startsWith('"') ? (unquoteLine(line) ?? badlyQuoted()) : line));
 }
