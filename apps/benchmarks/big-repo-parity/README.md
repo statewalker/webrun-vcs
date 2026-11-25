@@ -152,9 +152,12 @@ native git finds our clone and our gc'd repository sound.
 **The SQL backend cannot store git.git.** Its stores parse objects into rows, so an object whose
 bytes the rows cannot reproduce is refused. The first is commit 7eb93c89 (2005): the author's name
 is Latin-1 ("David K\xe5gedal"), not UTF-8, and the row keeps it as text
-(`ObjectIdMismatchError: ... would keep e863b60b...`). The import stops there, so we do not know
-how many other objects are affected; git.git's 99 fsck warnings (zero-padded `040000` modes,
-tags without a tagger) are likely candidates too. On clean data it is correct but slow: 60 times
+(`ObjectIdMismatchError: ... would keep e863b60b...`). The import stops there; `scripts/sql-census.mjs`
+stores every commit, tree and tag one at a time instead and reads each back. Of git.git's 257,624
+non-blob objects, 137 commits come back changed: 134 lose their `mergetag` header, 2 their
+non-UTF-8 bytes, 1 an unknown `change-id` header. Every tree and tag survives. The loss is in the
+typed commit model (no extra headers, text decoded with U+FFFD), and `importObject` returns the
+changed object's id without an error (statewalker/webrun-vcs#399). On clean data it is correct but slow: 60 times
 slower to import and 37 times slower to export than fsbare, and 17 times larger on disk
 (547 MB for a 32 MB pack).
 
