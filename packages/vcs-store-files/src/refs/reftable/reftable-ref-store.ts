@@ -422,6 +422,10 @@ export class ReftableRefStore implements Refs {
     return this.fileState.readGrafts();
   }
 
+  removeGrafts(): Promise<boolean> {
+    return this.fileState.removeGrafts();
+  }
+
   setShallow(commits: Iterable<ObjectId>, expected?: Iterable<ObjectId>): Promise<void> {
     return this.fileState.setShallow(commits, expected);
   }
