@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { bytesToHex, createSha1, type Hasher } from "../../../src/hash/index.js";
+import {
+  bytesToHex,
+  createSha1,
+  type Hasher,
+  SHA256_OBJECT_FORMAT,
+} from "../../../src/hash/index.js";
 import {
   computeObjectId,
   computeObjectIdFromStream,
@@ -99,13 +104,23 @@ describe("computeObjectId on large content", () => {
 });
 
 describe("computeObjectId path choice", () => {
-  it("uses Web Crypto from 64 KiB and the portable hasher below", async () => {
+  it("uses Web Crypto for SHA-256 from 64 KiB and the portable hasher below", async () => {
     const digest = vi.spyOn(globalThis.crypto.subtle, "digest");
     try {
-      await computeObjectId("blob", vectorInput(64 * 1024 - 1));
+      await computeObjectId("blob", vectorInput(64 * 1024 - 1), SHA256_OBJECT_FORMAT);
       expect(digest).not.toHaveBeenCalled();
-      await computeObjectId("blob", vectorInput(64 * 1024));
+      await computeObjectId("blob", vectorInput(64 * 1024), SHA256_OBJECT_FORMAT);
       expect(digest).toHaveBeenCalledTimes(1);
+    } finally {
+      digest.mockRestore();
+    }
+  });
+
+  it("never uses Web Crypto for SHA-1 object ids: they need sha1dc's collision detection", async () => {
+    const digest = vi.spyOn(globalThis.crypto.subtle, "digest");
+    try {
+      await computeObjectId("blob", vectorInput(300_000));
+      expect(digest).not.toHaveBeenCalled();
     } finally {
       digest.mockRestore();
     }

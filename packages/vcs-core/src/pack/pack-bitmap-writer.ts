@@ -380,7 +380,7 @@ export async function writePackBitmap(options: PackBitmapWriteOptions): Promise<
       at += 4;
     }
   }
-  out.set(format.createHasher().update(out.subarray(0, at)).digest(), at);
+  out.set(format.createUnsafeHasher().update(out.subarray(0, at)).digest(), at);
   return out;
 }
 

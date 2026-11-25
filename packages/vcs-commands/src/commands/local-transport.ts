@@ -6,7 +6,7 @@
  */
 
 import { historyWithoutLazyFetch, type RefTransactionHook } from "@statewalker/vcs-core";
-import { configFilesApiOf, readConfinedFile } from "@statewalker/vcs-store-files";
+import { configFilesApiOf, readConfinedFile, updateServerInfo } from "@statewalker/vcs-store-files";
 import {
   createRepositoryFacade,
   createTransportRefStore,
@@ -15,6 +15,7 @@ import {
   openDuplexConnection,
   openDuplexReceivePackConnection,
   type ReceiveCommand,
+  type ReceivePackConfig,
   type ReceivePackConnection,
   ReceivePackDiedError,
   type ReceivePackHookContext,
@@ -37,6 +38,7 @@ import {
 import { GitApiError, TransportError } from "../errors/index.js";
 import { quoteCStyleBody } from "../results/index.js";
 import { type ReceiveFsckSettings, receiveFsckOf } from "./fsck/index.js";
+import { GarbageCollectCommand } from "./gc-command.js";
 import {
   HookSession,
   hookHostOf,
@@ -46,7 +48,12 @@ import {
 } from "./git-hooks.js";
 import { ReadTreeCommand } from "./read-tree-command.js";
 import { StatusCommand } from "./status-command.js";
-import { repositoryPlaceOf, usesBranch, worktreeUsingBranch } from "./worktree-support.js";
+import {
+  repositoryPlaceOf,
+  usesBranch,
+  worktreeAdminWorkingCopy,
+  worktreeUsingBranch,
+} from "./worktree-support.js";
 
 /** The client's lines when the remote end of a local transport died. */
 const COULD_NOT_READ =
@@ -540,6 +547,15 @@ export async function receivePackSettingsOf(
     advertisePushOptions: settings.advertisePushOptions,
     // transfer.advertiseSID
     ...(settings.advertiseSID ? { advertiseSID: true } : {}),
+    // receive.advertiseAtomic, receive.maxInputSize, receive.keepAlive
+    ...(settings.advertiseAtomic !== undefined
+      ? { advertiseAtomic: settings.advertiseAtomic }
+      : {}),
+    ...(settings.maxInputSize !== undefined ? { maxInputSize: settings.maxInputSize } : {}),
+    ...(settings.unpackLimit !== undefined ? { unpackLimit: settings.unpackLimit } : {}),
+    ...(settings.receiveKeepAliveMs !== undefined
+      ? { receiveKeepAliveMs: settings.receiveKeepAliveMs }
+      : {}),
     uploadPackHideRefs: settings.uploadPackHideRefs,
     receivePackHideRefs: settings.receivePackHideRefs,
     ...(receiveHooks ? { hooks: receiveHooks, relayPostReceive: true } : {}),
@@ -557,6 +573,8 @@ export async function receivePackSettingsOf(
     // ... git 2.43 updates each ref after its update hook
     ...(hooks?.enabled && hooks.compatibility === "2.43" ? { interleaveUpdateHook: true } : {}),
     ...(checkedOut ? { checkedOutBranches: checkedOut } : {}),
+    // receive.autogc and receive.updateServerInfo, once the push is done
+    ...afterPushOf(remote, hooks),
     ...(worktrees
       ? {
           updateWorktree: async (ref: string, newOid: string, ctx?: ReceivePackHookContext) => {
@@ -566,6 +584,97 @@ export async function receivePackSettingsOf(
         }
       : {}),
   };
+}
+
+/** git's `git_config_bool` of the last value of `key` in `remote`'s config, else `fallback`. */
+function remoteBool(remote: OpenedRepository, key: string, fallback: boolean): boolean {
+  const value = remote.config?.getAll(key).at(-1);
+  if (value === undefined) return fallback;
+  if (value === null) return true;
+  return parseGitBool(value) ?? fallback;
+}
+
+/**
+ * run-command.c's `prepare_auto_maintenance`: whether git runs `maintenance run --auto` after a
+ * command (`maintenance.auto`, else `gc.auto` greater than 0, else yes).
+ */
+function autoMaintenanceEnabled(remote: OpenedRepository): boolean {
+  const auto = remote.config?.getAll("maintenance.auto").at(-1);
+  if (auto !== undefined) return auto === null ? true : (parseGitBool(auto) ?? true);
+  const gcAuto = remote.config?.getAll("gc.auto").at(-1);
+  if (gcAuto !== undefined && gcAuto !== null) {
+    const n = parseGitInt(gcAuto);
+    if (n !== undefined) return n > 0;
+  }
+  return true;
+}
+
+/**
+ * What git's receive-pack does once a push is done (`ReceivePackConfig.afterPush`), after
+ * post-receive and post-update: `receive.autogc` (default true) runs the auto maintenance as
+ * `gc --auto --quiet` (git's `maintenance run --auto` with the `gc` strategy: git 2.5x's
+ * default `geometric` strategy is not reproduced), `receive.updateServerInfo` (default false)
+ * `update-server-info`. Nothing when neither applies.
+ */
+function afterPushOf(
+  remote: OpenedRepository,
+  hooks: HookSession | undefined,
+): { afterPush?: ReceivePackConfig["afterPush"] } {
+  const autoGc =
+    remoteBool(remote, "receive.autogc", true) &&
+    autoMaintenanceEnabled(remote) &&
+    remote.worktrees !== undefined &&
+    remote.history.packs !== undefined;
+  const serverInfo =
+    remoteBool(remote, "receive.updateServerInfo", false) &&
+    remote.files !== undefined &&
+    remote.history.objects !== undefined &&
+    remote.history.packs !== undefined;
+  if (!autoGc && !serverInfo) return {};
+  return {
+    afterPush: async (ctx: ReceivePackHookContext) => {
+      if (autoGc && remote.worktrees) {
+        const admin = await remote.worktrees.openAdmin();
+        // receive-pack's environment (its hook runner: pre-auto-gc, the git version followed)
+        const result = await new GarbageCollectCommand(
+          withEnvironment(worktreeAdminWorkingCopy(admin), hooks?.hostEnvironment),
+        )
+          .setAuto(true)
+          .setQuiet(true)
+          .call();
+        // the child's stderr reaches the pusher on the side-band
+        const lines = [...(result.errors ?? []), ...(result.warnings ?? [])];
+        if (lines.length > 0) await ctx.message(`${lines.join("\n")}\n`);
+      }
+      const { files } = remote;
+      const { objects, packs } = remote.history;
+      if (serverInfo && files && objects && packs) {
+        const gitDir = (remote.commonDir ?? remote.gitDir).replace(/^\/+/, "").replace(/\/+$/, "");
+        await updateServerInfo({ files, gitDir, objects, packs });
+      }
+    },
+  };
+}
+
+/**
+ * `workingCopy` whose configuration answers `environment` (see `hostEnvironmentOf`) with
+ * `environment`; itself without one.
+ */
+function withEnvironment(
+  workingCopy: WorkingCopy,
+  environment: GitHostEnvironment | undefined,
+): WorkingCopy {
+  if (!environment) return workingCopy;
+  const own = <T extends object>(target: T, key: string | symbol): unknown => {
+    const value = Reflect.get(target, key, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  };
+  const config = new Proxy(workingCopy.config, {
+    get: (target, key) => (key === "environment" ? environment : own(target, key)),
+  });
+  return new Proxy(workingCopy, {
+    get: (target, key) => (key === "config" ? config : own(target, key)),
+  });
 }
 
 async function receiveOver<T>(
@@ -857,6 +966,37 @@ function scriptReceiveHooks(hooks: HookSession): ReceivePackHooks {
       const refs = commands.filter((c) => !c.report).map((c) => c.pushedRef ?? c.refName);
       if (refs.length > 0) await run("post-update", ctx, { args: refs });
     },
+    // git master's receive-report hook (run_receive_report_hook, found as find_hook finds it):
+    // the report on stdin, its stdout the new report, its stderr to the user; not in 2.43
+    ...(hooks.compatibility === "2.43"
+      ? {}
+      : {
+          receiveReport: async (report: Uint8Array, ctx: ReceivePackHookContext) => {
+            const started = await hooks.start("receive-report", {
+              env: { ...hookClientEnv(hooks, ctx), GIT_DIR: "." },
+              prefix: false,
+              onStderr: (text) => ctx.message(text),
+            });
+            if (!started) return undefined;
+            const chunks: Uint8Array[] = [];
+            const reading = (async () => {
+              for await (const chunk of started.stdout) chunks.push(chunk);
+            })().catch(() => {});
+            // a hook that does not read its stdin: git ignores SIGPIPE there
+            await started.write(report).catch(() => {});
+            await started.closeStdin().catch(() => {});
+            await reading;
+            const code = await started.wait();
+            if (code !== 0) return false;
+            const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+            let at = 0;
+            for (const c of chunks) {
+              out.set(c, at);
+              at += c.length;
+            }
+            return out;
+          },
+        }),
     // run_proc_receive_hook: its stdin and stdout piped, its stderr relayed to the user; the
     // objects are published by now (no quarantine variables) and no push option variables
     procReceive: (ctx) =>

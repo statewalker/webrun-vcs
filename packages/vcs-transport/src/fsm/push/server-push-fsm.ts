@@ -166,6 +166,22 @@ export const RECEIVE_PACK_CAPABILITIES: readonly string[] = [
   "quiet",
 ];
 
+/**
+ * The capabilities receive-pack advertises (`capabilities`, else
+ * {@link RECEIVE_PACK_CAPABILITIES}) less those its settings turn off: `push-options` unless
+ * `receive.advertisePushOptions`, `atomic` when `receive.advertiseAtomic` is false.
+ */
+export function receivePackCapabilitiesOf(
+  capabilities: readonly string[] | undefined,
+  settings: { advertisePushOptions?: boolean; advertiseAtomic?: boolean },
+): string[] {
+  return (capabilities ?? RECEIVE_PACK_CAPABILITIES).filter(
+    (c) =>
+      !(c === "push-options" && settings.advertisePushOptions === false) &&
+      !(c === "atomic" && settings.advertiseAtomic === false),
+  );
+}
+
 /** The reason given for every command when the authorize hook throws (details: the log). */
 const AUTHORIZE_FAILED = "authorization failed";
 
@@ -175,6 +191,10 @@ const FAILED_TO_UPDATE = "failed to update ref";
 const INVALID_NEW_VALUE = "invalid new value provided";
 const ATOMIC_TRANSACTION_FAILED = "atomic transaction failed";
 const ATOMIC_PUSH_FAILURE = "atomic push failure";
+/** git master's override_cmds_error when its receive-report hook fails */
+const RECEIVE_REPORT_FAILED = "receive-report hook failed";
+/** git's `receive.unpackLimit` default (`transfer.unpackLimit`'s) */
+const DEFAULT_RECEIVE_UNPACK_LIMIT = 100;
 
 /**
  * Server push FSM handlers.
@@ -302,6 +322,9 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
             // the client's session id (read_head_info's trace2 `client-sid`)
             const sid = features.find((c) => c.startsWith("session-id="));
             if (sid !== undefined) getOutput(ctx).clientSessionId = sid.slice("session-id=".length);
+            // read_head_info: `atomic` counts only when advertised (receive.advertiseAtomic)
+            const advertised = getConfig(ctx).serverCapabilities ?? RECEIVE_PACK_CAPABILITIES;
+            if (!advertised.includes("atomic")) state.capabilities.delete("atomic");
             // read_head_info: a client naming no object format speaks SHA-1; another one
             // than the repository's dies (git: `die("error: unsupported object format ...")`)
             const named = features.find((c) => c.startsWith("object-format="));
@@ -493,8 +516,11 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
           // receive.fsckObjects: unpack-objects / index-pack `--strict`
           const fsck = await receivePackConfig(ctx).fsckObjects?.();
           const received = fsck ? new ReceivedObjects(formatOf(repository).rawLength) : undefined;
+          // receive.maxInputSize: the child dies once it has read more than the limit
+          const limited = limitPackInput(state.packStream, receivePackConfig(ctx).maxInputSize);
+          state.limitedPack = limited;
           // kept aside until the push is accepted (when the repository can quarantine)
-          const { quarantine, ...result } = await repository.importPack(state.packStream, {
+          const { quarantine, ...result } = await repository.importPack(limited.stream, {
             quarantine: true,
             ...(received ? { onObject: (id, type, entry) => received.add(id, type, entry) } : {}),
           });
@@ -506,7 +532,7 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
             if (refused !== undefined) {
               // git: the child died; nothing it received is kept
               await discardQuarantine(ctx);
-              state.unpackStatus = refused;
+              state.unpackStatus = await unpackErrorStatus(ctx, refused, undefined);
               for (const cmd of state.pushCommands ?? []) {
                 if (cmd.result === "NOT_ATTEMPTED") reject(cmd, "unpacker error");
               }
@@ -516,9 +542,35 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         }
         return "UNPACK_OK";
       } catch (e) {
+        // the limit's error, however the importer wrapped it
+        const tooLarge =
+          e instanceof PackInputTooLargeError
+            ? e
+            : getState<ServerPushState>(ctx).limitedPack?.error;
+        if (tooLarge) {
+          const e = tooLarge;
+          // index-pack or unpack-objects died (git's choice by receive.unpackLimit): its death
+          // on the progress channel, the rest of the pack taken from a client that blocks
+          await sendMessage(ctx, `${e.death(receivePackConfig(ctx).unpackLimit)}\n`);
+          state.unpackStatus = await unpackErrorStatus(
+            ctx,
+            e.isKept(receivePackConfig(ctx).unpackLimit)
+              ? "index-pack abnormal exit"
+              : "unpack-objects abnormal exit",
+            e,
+          );
+          if (receivePackConfig(ctx).drainRefusedPack) await state.limitedPack?.drain();
+          for (const cmd of state.pushCommands ?? []) {
+            if (cmd.result === "NOT_ATTEMPTED") reject(cmd, "unpacker error");
+          }
+          return "UNPACK_FAILED";
+        }
         // git: "unpack <error>", and every command "unpacker error"
-        state.unpackStatus =
-          oneLine(e instanceof Error ? e.message : String(e)).slice(0, 200) || "failed";
+        state.unpackStatus = await unpackErrorStatus(
+          ctx,
+          oneLine(e instanceof Error ? e.message : String(e)).slice(0, 200) || "failed",
+          e,
+        );
         for (const cmd of state.pushCommands ?? []) {
           if (cmd.result === "NOT_ATTEMPTED") reject(cmd, "unpacker error");
         }
@@ -791,19 +843,43 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         // option lines: git's report_v2), else report-status
         const v2 = state.capabilities.has("report-status-v2");
         if (v2 || state.capabilities.has("report-status")) {
-          const lines = [`unpack ${state.unpackStatus ?? "ok"}`];
-          for (const cmd of state.pushCommands ?? []) {
-            // a proc-receive `ng <ref> ` keeps its empty reason (git's report: `ng <ref> `,
-            // the client's `[remote rejected] ... ()`)
-            const reason =
-              cmd.procReceive && cmd.message !== undefined
-                ? oneLine(cmd.message)
-                : oneLine(cmd.message ?? "") || "rejected";
-            if (v2) lines.push(...reportV2Lines(cmd, reason));
-            else
-              lines.push(cmd.result === "OK" ? `ok ${cmd.refName}` : `ng ${cmd.refName} ${reason}`);
+          await applyCommandErrorHandler(ctx);
+          let lines = reportLines(state, v2);
+          // git master's receive-report hook: its stdout replaces the report; a failure
+          // rejects every command ("receive-report hook failed")
+          let replaced: Uint8Array | false | undefined;
+          const hook = receivePackHooks(ctx)?.receiveReport;
+          if (hook) {
+            try {
+              replaced = await hook(encodeReport(lines), hookContext(ctx));
+            } catch (e) {
+              logError(ctx, "receive-report hook failed", e);
+              replaced = false;
+            }
+            await state.bandQueue;
+            if (replaced === false) {
+              for (const cmd of state.pushCommands ?? []) {
+                cmd.result = "REJECTED_OTHER_REASON";
+                cmd.message = RECEIVE_REPORT_FAILED;
+                cmd.procReceive = undefined;
+                cmd.reports = undefined;
+              }
+              // post-receive and post-update skip commands with an error (skip_broken)
+              state.appliedCommands = [];
+              state.eagerlyApplied = [];
+              lines = reportLines(state, v2);
+            }
           }
-          if (useSideband) {
+          if (replaced instanceof Uint8Array) {
+            // the hook's bytes as they are
+            if (useSideband) await transport.writeSideband(1, replaced);
+            else
+              await transport.writeRawPack(
+                (async function* () {
+                  yield replaced;
+                })(),
+              );
+          } else if (useSideband) {
             // The report is a pkt-line stream inside channel 1
             for (const line of lines) {
               await transport.writeSideband(1, encodePacketLine(`${line}\n`));
@@ -817,7 +893,8 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
         // git ends a side-band answer with a flush, report or not (after post-receive when
         // its output is relayed)
         if (useSideband) {
-          if (receivePackConfig(ctx).relayPostReceive) state.flushAfterPostReceive = true;
+          const rp = receivePackConfig(ctx);
+          if (rp.relayPostReceive || rp.afterPush) state.flushAfterPostReceive = true;
           else await transport.writeFlush();
         }
         state.reportSent = true;
@@ -836,28 +913,43 @@ export const serverPushHandlers = new Map<string, FsmStateHandler<ProcessContext
       const state = getState<ServerPushState>(ctx);
       const hook = receivePackHooks(ctx)?.postReceive;
       const applied = postReceiveCommands(state);
-      if (!hook || applied.length === 0) {
-        await closeRelayedBand(ctx);
-        return "NO_HOOK";
-      }
+      const rp = receivePackConfig(ctx);
       const hookCtx = hookContext(ctx);
-      const task = async () => {
+      const postReceive =
+        hook && applied.length > 0
+          ? async () => {
+              try {
+                await hook(applied, hookCtx);
+              } catch (e) {
+                logError(ctx, "post-receive hook failed", e);
+              }
+            }
+          : undefined;
+      // git's auto maintenance and update-server-info, after post-receive and post-update and
+      // before receive-pack exits (its client waits for them)
+      const afterPush = async () => {
+        if (!rp.afterPush) return;
         try {
-          await hook(applied, hookCtx);
+          await rp.afterPush(hookCtx);
         } catch (e) {
-          logError(ctx, "post-receive hook failed", e);
+          logError(ctx, "after-push task failed", e);
         }
       };
-      if (receivePackConfig(ctx).relayPostReceive) {
-        await task();
+      if (rp.relayPostReceive) {
+        await postReceive?.();
+        await afterPush();
         await state.bandQueue;
         await closeRelayedBand(ctx);
-        return "HOOK_STARTED";
+        return postReceive ? "HOOK_STARTED" : "NO_HOOK";
       }
-      const afterReport = receivePackConfig(ctx).afterReport;
-      if (afterReport) afterReport(task);
-      else setTimeout(() => void task(), 0);
-      return "HOOK_STARTED";
+      if (postReceive) {
+        if (rp.afterReport) rp.afterReport(postReceive);
+        else setTimeout(() => void postReceive(), 0);
+      }
+      await afterPush();
+      await state.bandQueue;
+      await closeRelayedBand(ctx);
+      return postReceive ? "HOOK_STARTED" : "NO_HOOK";
     },
   ],
 ]);
@@ -905,6 +997,8 @@ interface ServerPushState extends ProtocolState {
   procReceiveRan?: boolean;
   /** An atomic push's transaction failed: the error its commands without one get */
   atomicFailure?: string;
+  /** The pack stream as read through `receive.maxInputSize`'s limit */
+  limitedPack?: LimitedPackInput;
 }
 
 /** Context with hooks set directly (older callers). */
@@ -2007,4 +2101,172 @@ function postReceiveCommands(state: ServerPushState): ReceiveCommand[] {
     });
   }
   return out;
+}
+
+/** git's `generate_report`: `unpack <status>`, `ok`/`ng` per command, report-status-v2's options. */
+function reportLines(state: ServerPushState, v2: boolean): string[] {
+  const lines = [`unpack ${state.unpackStatus ?? "ok"}`];
+  for (const cmd of state.pushCommands ?? []) {
+    // a proc-receive `ng <ref> ` keeps its empty reason (git's report: `ng <ref> `, the
+    // client's `[remote rejected] ... ()`)
+    const reason =
+      cmd.procReceive && cmd.message !== undefined
+        ? oneLine(cmd.message)
+        : oneLine(cmd.message ?? "") || "rejected";
+    if (v2) lines.push(...reportV2Lines(cmd, reason));
+    else lines.push(cmd.result === "OK" ? `ok ${cmd.refName}` : `ng ${cmd.refName} ${reason}`);
+  }
+  return lines;
+}
+
+/** The report's lines as pkt-lines ending with a flush (what the receive-report hook reads). */
+function encodeReport(lines: string[]): Uint8Array {
+  const packets = [...lines.map((line) => encodePacketLine(`${line}\n`)), encodeFlush()];
+  const out = new Uint8Array(packets.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of packets) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+
+/**
+ * `ReceivePackHooks.commandError`: each refused command's reason as the server's handler words
+ * it (JGit's `ReceiveCommandErrorHandler`), before the report is written.
+ */
+async function applyCommandErrorHandler(ctx: ProcessContext): Promise<void> {
+  const handler = receivePackHooks(ctx)?.commandError;
+  if (!handler) return;
+  const state = getState<ServerPushState>(ctx);
+  for (const cmd of state.pushCommands ?? []) {
+    if (cmd.result === "OK" || cmd.result === "NOT_ATTEMPTED") continue;
+    try {
+      const reason = await handler(toReceiveCommand(cmd), cmd.message ?? "", hookContext(ctx));
+      if (typeof reason === "string" && reason.length > 0) cmd.message = reason;
+    } catch (e) {
+      logError(ctx, "command error handler failed", e);
+    }
+  }
+}
+
+/**
+ * The unpack status of a failed unpack (`status`, git's wording), as
+ * `ReceivePackHooks.unpackError` (JGit's `UnpackErrorHandler`) rewords it.
+ */
+async function unpackErrorStatus(
+  ctx: ProcessContext,
+  status: string,
+  error: unknown,
+): Promise<string> {
+  const handler = receivePackHooks(ctx)?.unpackError;
+  if (!handler) return status;
+  try {
+    const replaced = await handler(status, error, hookContext(ctx));
+    return typeof replaced === "string" && replaced.length > 0 ? oneLine(replaced) : status;
+  } catch (e) {
+    logError(ctx, "unpack error handler failed", e);
+    return status;
+  }
+}
+
+/** A pushed pack over `receive.maxInputSize` (git's index-pack / unpack-objects death). */
+export class PackInputTooLargeError extends Error {
+  constructor(
+    /** The limit in bytes */
+    readonly limit: number,
+    /** The object count of the pack's header (undefined: not read) */
+    readonly objectCount: number | undefined,
+  ) {
+    super(`pack exceeds maximum allowed size (${humaniseBytes(limit)})`);
+    this.name = "PackInputTooLargeError";
+  }
+
+  /** Whether git would have kept the pack (index-pack: `receive.unpackLimit` objects or more). */
+  isKept(unpackLimit = DEFAULT_RECEIVE_UNPACK_LIMIT): boolean {
+    return (this.objectCount ?? 0) >= unpackLimit;
+  }
+
+  /** The child's death as it prints it: index-pack names the limit, unpack-objects does not. */
+  death(unpackLimit?: number): string {
+    return this.isKept(unpackLimit)
+      ? `fatal: ${this.message}`
+      : "fatal: pack exceeds maximum allowed size";
+  }
+}
+
+/** git's `strbuf_humanise_bytes`: `512 bytes`, `4.00 KiB`, `1.50 MiB`, `2.00 GiB`. */
+export function humaniseBytes(bytes: number): string {
+  if (bytes > 2 ** 30) {
+    const frac = Math.floor((bytes % 2 ** 30) / 10737419);
+    return `${Math.floor(bytes / 2 ** 30)}.${String(frac).padStart(2, "0")} GiB`;
+  }
+  if (bytes > 2 ** 20) {
+    const x = bytes + 5243;
+    const frac = Math.floor(((x % 2 ** 20) * 100) / 2 ** 20);
+    return `${Math.floor(x / 2 ** 20)}.${String(frac).padStart(2, "0")} MiB`;
+  }
+  if (bytes > 2 ** 10) {
+    const x = bytes + 5;
+    const frac = Math.floor(((x % 2 ** 10) * 100) / 2 ** 10);
+    return `${Math.floor(x / 2 ** 10)}.${String(frac).padStart(2, "0")} KiB`;
+  }
+  return `${bytes} ${bytes === 1 ? "byte" : "bytes"}`;
+}
+
+/** A pack stream read through `receive.maxInputSize`. */
+interface LimitedPackInput {
+  stream: AsyncIterable<Uint8Array>;
+  /** Reads the rest of the client's pack and drops it (after the limit was passed) */
+  drain(): Promise<void>;
+  /** The limit's error once it was passed */
+  readonly error?: PackInputTooLargeError;
+}
+
+/**
+ * `source` failing with {@link PackInputTooLargeError} once more than `limit` bytes came
+ * (git's `consumed_bytes > max_input_size`); no limit for an absent, 0 or negative one. Past
+ * the limit the source is left open, so the rest can be drained.
+ */
+function limitPackInput(source: AsyncIterable<Uint8Array>, limit?: number): LimitedPackInput {
+  if (!limit || limit <= 0) return { stream: source, drain: async () => {} };
+  const it = source[Symbol.asyncIterator]();
+  let exceeded = false;
+  const out: { error?: PackInputTooLargeError } = {};
+  const stream = (async function* () {
+    let total = 0;
+    const header = new Uint8Array(12);
+    try {
+      for (let r = await it.next(); !r.done; r = await it.next()) {
+        const chunk = r.value;
+        if (total < 12) header.set(chunk.subarray(0, 12 - total), total);
+        total += chunk.length;
+        if (total > limit) {
+          exceeded = true;
+          const count = total >= 12 ? new DataView(header.buffer).getUint32(8) : undefined;
+          out.error = new PackInputTooLargeError(limit, count);
+          throw out.error;
+        }
+        yield chunk;
+      }
+    } finally {
+      if (!exceeded) await it.return?.()?.catch?.(() => {});
+    }
+  })();
+  return {
+    stream,
+    get error() {
+      return out.error;
+    },
+    drain: async () => {
+      if (!exceeded) return;
+      try {
+        for (let r = await it.next(); !r.done; r = await it.next()) {
+          // dropped
+        }
+      } catch {
+        // a broken rest nobody wanted
+      }
+    },
+  };
 }

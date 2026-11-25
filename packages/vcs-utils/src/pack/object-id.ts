@@ -33,10 +33,11 @@ export class SizeMismatchError extends Error {
 const encoder = new TextEncoder();
 
 /**
- * Above this size Web Crypto's native SHA-1 wins even after copying header and
+ * Above this size Web Crypto's native hash wins even after copying header and
  * content into one buffer (64 MiB: 93 ms against 349 ms for the portable hasher
  * of the time, `@noble/hashes`, on Node 24); below it the async round trip costs
  * more than the hash (100k small objects: 443 ms against Web Crypto's 3.7 s).
+ * Only SHA-256 takes it: a SHA-1 object id needs sha1dc's collision detection.
  */
 const NATIVE_THRESHOLD = 64 * 1024;
 
@@ -56,7 +57,8 @@ export async function computeObjectId(
   format: ObjectFormat = SHA1_OBJECT_FORMAT,
 ): Promise<string> {
   const header = encoder.encode(`${typeStr} ${content.length}\0`);
-  if (content.length >= NATIVE_THRESHOLD && hasWebCrypto()) {
+  // Web Crypto's SHA-1 detects no collision attack: object ids use the sha1dc hasher
+  if (content.length >= NATIVE_THRESHOLD && format.name !== "sha1" && hasWebCrypto()) {
     const full = new Uint8Array(header.length + content.length);
     full.set(header, 0);
     full.set(content, header.length);

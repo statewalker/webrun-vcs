@@ -837,6 +837,11 @@ export class HookSession {
     return derived;
   }
 
+  /** The host environment the hooks run in (its hook runner, variables, compatibility). */
+  get hostEnvironment(): GitHostEnvironment | undefined {
+    return this.host.environment();
+  }
+
   private get runner(): HookRunner | undefined {
     return this.host.environment()?.hookRunner;
   }
@@ -859,11 +864,6 @@ export class HookSession {
     // the receive side of a local push runs without them (local_repo_env)
     if (this.host.unsetEnv?.includes("GIT_ALTERNATE_OBJECT_DIRECTORIES")) return undefined;
     return this.host.environment()?.alternateObjectDirectories;
-  }
-
-  /** The host environment the hooks run in (its runner, protected config), when there is one. */
-  get hostEnvironment(): GitHostEnvironment | undefined {
-    return this.host.environment();
   }
 
   /**
