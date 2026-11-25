@@ -1462,6 +1462,9 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       );
       child.setTransports(transports);
       if (this.timeout) child.setTimeout(this.timeout);
+      // git's child reads credential.helper itself: asked per URL, never carried across origins
+      if (this.credentialHelper) child.setCredentialHelper(this.credentialHelper);
+      if (this.warningCallback) child.setWarningCallback(this.warningCallback);
       if (this.gzipRequests !== undefined) child.setGzipRequests(this.gzipRequests);
       child.setCompatibility(compatibility);
       if (this.dryRun) child.setDryRun(true);

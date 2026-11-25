@@ -10,6 +10,7 @@ import {
   type Credentials,
   createDefaultTransports,
   type GitTransportRegistry,
+  type HttpCredentialHelper,
 } from "@statewalker/vcs-transport";
 import type { PosixFilesApi } from "@statewalker/vcs-utils/files";
 import { type WorkingCopy, wildmatch } from "@statewalker/vcs-working-tree";
@@ -254,6 +255,8 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
   /** Set once at the top superproject, handed to nested updates unchanged */
   private authPolicy?: SubmoduleAuthFor;
   private timeout?: number;
+  private credentialHelper?: HttpCredentialHelper;
+  private warningCallback?: (line: string) => void;
 
   /** A path (pathspec element) limiting the submodules; uninitialized ones are then reported. */
   addPath(path: string): this {
@@ -453,6 +456,26 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
     return this.authPolicy;
   }
 
+  /**
+   * A credential helper, as git's `credential.helper` read by its child clones and fetches:
+   * asked with each submodule's own URL when its server answers 401 (so it decides per host,
+   * at any depth), told when the credentials worked or were refused. Unlike
+   * {@link setCredentials}, its answer for one host never goes to another: the client asks
+   * it per URL, and the guarded transports drop it on a redirect to another origin.
+   */
+  setCredentialHelper(helper: HttpCredentialHelper): this {
+    this.checkCallable();
+    this.credentialHelper = helper;
+    return this;
+  }
+
+  /** Receives the `warning:` lines of the clones' and fetches' HTTP clients. */
+  setWarningCallback(callback: (line: string) => void): this {
+    this.checkCallable();
+    this.warningCallback = callback;
+    return this;
+  }
+
   /** The timeout of clones and fetches, in milliseconds. */
   setTimeout(timeout: number): this {
     this.checkCallable();
@@ -643,6 +666,8 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
         ...(this.singleBranch !== undefined ? { singleBranch: this.singleBranch } : {}),
         transports: await this.guardedTransports(),
         ...(this.timeout !== undefined ? { timeout: this.timeout } : {}),
+        ...(this.credentialHelper ? { credentialHelper: this.credentialHelper } : {}),
+        ...(this.warningCallback ? { warningCallback: this.warningCallback } : {}),
       });
       return true;
     } catch (error) {
@@ -776,6 +801,8 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
     const fetch = new FetchCommand(inner);
     fetch.setTransports(await this.guardedTransports());
     if (this.timeout !== undefined) fetch.setTimeout(this.timeout);
+    if (this.credentialHelper) fetch.setCredentialHelper(this.credentialHelper);
+    if (this.warningCallback) fetch.setWarningCallback(this.warningCallback);
     if (this.depth) fetch.setDepth(this.depth);
     // the remote named, so its URL is known: `git fetch` alone fetches the default remote
     const remote = target?.remote ?? (await defaultRemoteOf(inner));
@@ -1003,6 +1030,8 @@ export class SubmoduleUpdateCommand extends SubmoduleCommandBase {
     // the top superproject's policy: a nested superproject's remote is no trusted origin
     child.setAuthPolicy(await this.auth());
     if (this.timeout !== undefined) child.setTimeout(this.timeout);
+    if (this.credentialHelper) child.setCredentialHelper(this.credentialHelper);
+    if (this.warningCallback) child.setWarningCallback(this.warningCallback);
     let code: number;
     try {
       const result = await child.call();
