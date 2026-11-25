@@ -22,7 +22,6 @@ import {
   notOurRef,
   okToGiveUp,
   packFromHook,
-  packObjectsHookArgs,
   packObjectsHookInput,
   peelFully,
   prepareServedShallow,
@@ -767,14 +766,14 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
           ? // uploadpack.packObjectsHook: the host's command builds the pack (create_pack_file)
             packFromHook(
               hook,
-              packObjectsHookArgs({
+              {
                 shallow: (packShallow?.size ?? 0) > 0,
                 thin,
                 progress: !(req?.noProgress ?? false),
                 ofsDelta: req?.ofsDeltas ?? false,
                 includeTag: req?.includeTags ?? false,
                 ...(req?.filter ? { filter: req.filter } : {}),
-              }),
+              },
               packObjectsHookInput({
                 shallow: packShallow ?? [],
                 wants: ctx.state.wants,

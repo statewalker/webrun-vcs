@@ -22,11 +22,15 @@ import { PackObjectsError } from "./pack-objects-error.js";
 /** What a {@link PackObjectsHook} is asked to run. */
 export interface PackObjectsHookRequest {
   /**
-   * The arguments git appends to the hook's command: `git`, then (for a shallow request)
-   * `--shallow-file ""`, then `pack-objects --revs [--thin] --stdout [--shallow] [--progress]
-   * [--delta-base-offset] [--include-tag] [--filter=<spec>]`
+   * The arguments git appends to the hook's command, as git 2.56's `odb_generate_pack` gives
+   * them: `git`, then (for a shallow request) `--shallow-file ""`, then `pack-objects --revs
+   * --stdout [--thin] [--shallow] [--delta-base-offset] [--include-tag] --quiet|--progress
+   * [--filter=<spec>]` ({@link packObjectsHookArgs}; a host imitating an older git rebuilds
+   * them from {@link options})
    */
   args: readonly string[];
+  /** What the arguments say, for {@link packObjectsHookArgs} */
+  options: PackObjectsHookArgsOptions;
   /**
    * pack-objects' input: `--shallow <id>` lines, the wanted ids, `--not`, the client's haves
    * the server has, the extra edges, and an empty line
@@ -65,18 +69,35 @@ export interface PackObjectsHookArgsOptions {
 }
 
 /**
- * The arguments create_pack_file gives the hook after its command, in git's order.
+ * The arguments upload-pack gives the hook after its command, in git's order: 2.56's
+ * `odb_generate_pack` (default), or, for `"2.43"`, create_pack_file's own (`--thin` before
+ * `--stdout`, `--progress` or nothing, as up to 2.52).
  *
  * @example
  * ```ts
  * packObjectsHookArgs({ ofsDelta: true, includeTag: true });
+ * // ["git", "pack-objects", "--revs", "--stdout", "--delta-base-offset", "--include-tag", "--quiet"]
+ * packObjectsHookArgs({ ofsDelta: true, includeTag: true }, "2.43");
  * // ["git", "pack-objects", "--revs", "--stdout", "--delta-base-offset", "--include-tag"]
  * ```
  */
-export function packObjectsHookArgs(options: PackObjectsHookArgsOptions): string[] {
+export function packObjectsHookArgs(
+  options: PackObjectsHookArgsOptions,
+  compatibility: "2.43" | "2.56" = "2.56",
+): string[] {
   const args = ["git"];
   if (options.shallow) args.push("--shallow-file", "");
   args.push("pack-objects", "--revs");
+  if (compatibility === "2.56") {
+    args.push("--stdout");
+    if (options.thin) args.push("--thin");
+    if (options.shallow) args.push("--shallow");
+    if (options.ofsDelta) args.push("--delta-base-offset");
+    if (options.includeTag) args.push("--include-tag");
+    args.push(options.progress ? "--progress" : "--quiet");
+    if (options.filter !== undefined) args.push(`--filter=${options.filter}`);
+    return args;
+  }
   if (options.thin) args.push("--thin");
   args.push("--stdout");
   if (options.shallow) args.push("--shallow");
@@ -114,11 +135,12 @@ export function packObjectsHookInput(input: {
  */
 export async function* packFromHook(
   hook: PackObjectsHook,
-  args: readonly string[],
+  options: PackObjectsHookArgsOptions,
   stdin: Uint8Array,
   relayStderr: (chunk: Uint8Array) => void,
 ): AsyncGenerator<Uint8Array> {
-  const process = await hook({ args, stdin, onStderr: relayStderr });
+  const args = packObjectsHookArgs(options);
+  const process = await hook({ args, options, stdin, onStderr: relayStderr });
   if (!process) {
     throw new PackObjectsError("git upload-pack: unable to fork git-pack-objects", {
       abortOnly: true,

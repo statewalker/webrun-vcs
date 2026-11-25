@@ -23,7 +23,7 @@ import {
 import { visibleRefs } from "../../protocol/hidden-refs.js";
 import { formatOf, v0ObjectFormatCapabilities } from "../../protocol/object-format.js";
 import type { FsmStateHandler, FsmTransition } from "../types.js";
-import { packFromHook, packObjectsHookArgs, packObjectsHookInput } from "./pack-objects-hook.js";
+import { packFromHook, packObjectsHookInput } from "./pack-objects-hook.js";
 import { sendPackStream } from "./send-pack-stream.js";
 import { checkUploadPackFilter, withFilterCapability } from "./upload-pack-filter.js";
 import {
@@ -788,14 +788,14 @@ export const serverFetchHandlers = new Map<string, FsmStateHandler<ProcessContex
             // its stderr is the progress band
             packFromHook(
               hook,
-              packObjectsHookArgs({
+              {
                 shallow: (packShallow?.size ?? 0) > 0,
                 thin,
                 progress: !noProgress,
                 ofsDelta: state.capabilities.has("ofs-delta"),
                 includeTag,
                 ...(state.filterSpec ? { filter: state.filterSpec } : {}),
-              }),
+              },
               packObjectsHookInput({
                 shallow: packShallow ?? [],
                 wants: state.wants,

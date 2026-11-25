@@ -52,6 +52,14 @@ import { gitOut, gitRun, testEnv } from "./status-native-support.js";
 
 const describeGit = nativeGitAvailable() && process.platform === "linux" ? describe : describe.skip;
 
+/** Whether native git is 2.56 or later (its pack-objects hook arguments, `odb_generate_pack`). */
+function nativeIs256(): boolean {
+  const m = /git version (\d+)\.(\d+)/.exec(
+    nativeGitAvailable() ? gitOut(tmpdir(), tmpdir(), ["--version"]) : "",
+  );
+  return m ? Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 56) : false;
+}
+
 let root: string;
 let srv: string;
 let counter = 0;
@@ -68,7 +76,7 @@ interface OurDaemon {
 async function startOurDaemon(env: Record<string, string>): Promise<OurDaemon> {
   const environment = createNodeGitHostEnvironment({
     env,
-    hookRunner: createNodeHookRunner({ env }),
+    hookRunner: createNodeHookRunner({ env, compatibility: nativeIs256() ? "2.56" : "2.43" }),
   });
   const host: Git = await openOurs(srv, environment, undefined, "repo");
   const resolveRepository = createBasePathResolver({
@@ -654,7 +662,7 @@ describeGit("upload-pack configuration, as native git", () => {
             root,
             dir,
             ["-c", `protocol.version=${version}`, "fetch", "-q", url, "main"],
-            { GIT_TRACE2_EVENT: events, ...serverEnv },
+            { GIT_TRACE2_EVENT_NESTING: "100", GIT_TRACE2_EVENT: events, ...serverEnv },
           );
           expect(r.status, r.stderr).toBe(0);
           return trace2(events);
@@ -699,7 +707,7 @@ describeGit("upload-pack configuration, as native git", () => {
             `${url}/${target.slice(srv.length + 1)}`,
             "FETCH_HEAD:refs/heads/new-branch",
           ],
-          { GIT_TRACE2_EVENT: events, ...env },
+          { GIT_TRACE2_EVENT_NESTING: "100", GIT_TRACE2_EVENT: events, ...env },
         );
         expect(r.status, r.stderr).toBe(0);
         return trace2(events);
@@ -731,7 +739,8 @@ describeGit("upload-pack configuration, as native git", () => {
         .setRefSpecs("main")
         .setTransports(
           createDefaultTransports({
-            openSocket: async () => nativeDaemon({ GIT_TRACE2_EVENT: events }),
+            openSocket: async () =>
+              nativeDaemon({ GIT_TRACE2_EVENT_NESTING: "100", GIT_TRACE2_EVENT: events }),
           }),
         )
         .call();
@@ -747,7 +756,8 @@ describeGit("upload-pack configuration, as native git", () => {
         .setRefSpecs("main")
         .setTransports(
           createDefaultTransports({
-            openSocket: async () => nativeDaemon({ GIT_TRACE2_EVENT: quiet }),
+            openSocket: async () =>
+              nativeDaemon({ GIT_TRACE2_EVENT_NESTING: "100", GIT_TRACE2_EVENT: quiet }),
           }),
         )
         .call();
@@ -771,7 +781,8 @@ describeGit("upload-pack configuration, as native git", () => {
       .setRefSpecs("refs/heads/topic:refs/heads/new-branch")
       .setTransports(
         createDefaultTransports({
-          openSocket: async () => nativeDaemon({ GIT_TRACE2_EVENT: events }),
+          openSocket: async () =>
+            nativeDaemon({ GIT_TRACE2_EVENT_NESTING: "100", GIT_TRACE2_EVENT: events }),
         }),
       )
       .call();

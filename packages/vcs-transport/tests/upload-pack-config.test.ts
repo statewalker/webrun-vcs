@@ -105,9 +105,35 @@ describe("upload-pack config", () => {
       "--stdout",
       "--delta-base-offset",
       "--include-tag",
+      "--quiet",
     ]);
     expect(
       packObjectsHookArgs({ shallow: true, thin: true, progress: true, filter: "blob:none" }),
+    ).toEqual([
+      "git",
+      "--shallow-file",
+      "",
+      "pack-objects",
+      "--revs",
+      "--stdout",
+      "--thin",
+      "--shallow",
+      "--progress",
+      "--filter=blob:none",
+    ]);
+    expect(packObjectsHookArgs({ ofsDelta: true, includeTag: true }, "2.43")).toEqual([
+      "git",
+      "pack-objects",
+      "--revs",
+      "--stdout",
+      "--delta-base-offset",
+      "--include-tag",
+    ]);
+    expect(
+      packObjectsHookArgs(
+        { shallow: true, thin: true, progress: true, filter: "blob:none" },
+        "2.43",
+      ),
     ).toEqual([
       "git",
       "--shallow-file",

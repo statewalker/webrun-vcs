@@ -11,6 +11,7 @@ import {
   createTransportRefStore,
   type GitServeSettings,
   type PackObjectsHook,
+  packObjectsHookArgs,
   type ServedRepository,
   type ServedRequestContext,
   type ServerConfigReader,
@@ -178,6 +179,14 @@ export async function packObjectsHookOf(
   }
   if (!command) return undefined;
   const hookCommand = command;
-  return ({ args, stdin, onStderr }) =>
-    hooks.startShellCommand("pack-objects-hook", hookCommand, args, stdin, onStderr);
+  // git before 2.56 (create_pack_file's own argv) orders the arguments otherwise
+  const legacy = hooks.compatibility === "2.43";
+  return ({ args, options, stdin, onStderr }) =>
+    hooks.startShellCommand(
+      "pack-objects-hook",
+      hookCommand,
+      legacy ? packObjectsHookArgs(options, "2.43") : args,
+      stdin,
+      onStderr,
+    );
 }
