@@ -73,6 +73,7 @@ import type { NotesContext } from "./commands/notes-support.js";
 import { postIndexChangeHookOf } from "./commands/post-index-change.js";
 import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
 import { reflogLine } from "./commands/reflog-messages.js";
+import { rerereClear, runRerere } from "./commands/rerere.js";
 import {
   type ArgumentFiles,
   lstatExists,
@@ -1141,6 +1142,39 @@ export abstract class GitCommand<T> {
     if (current === undefined || current === this.refTransactionHook) {
       installed.store.setTransactionHook?.(installed.previous);
     }
+  }
+
+  /**
+   * git's `repo_rerere` where a command stops on conflicts (merge's `suggest_conflicts`, a
+   * failed pick, am's three-way fallback, stash apply) and after `git commit`: conflicts'
+   * preimages recorded, recorded resolutions replayed (staged with `autoUpdate`, else as
+   * `rerere.autoUpdate` says), resolved paths' postimages recorded. Returns what rerere
+   * printed on stderr; nothing where rerere is off or there is no worktree.
+   */
+  protected async rerere(options: { autoUpdate?: boolean } = {}): Promise<string[]> {
+    const worktree = this.worktreeAccess;
+    if (!worktree) return [];
+    const host = {
+      workingCopy: this.workingCopy,
+      staging: this.staging,
+      worktree,
+      blobs: this.blobs,
+      objectFormat: this.objectFormat,
+    };
+    return (await runRerere(host, options)).messages;
+  }
+
+  /** git's `rerere_clear` (`rebase --skip`/`--abort`, `am --skip`/`--abort`). */
+  protected async rerereClear(): Promise<void> {
+    const worktree = this.worktreeAccess;
+    if (!worktree) return;
+    await rerereClear({
+      workingCopy: this.workingCopy,
+      staging: this.staging,
+      worktree,
+      blobs: this.blobs,
+      objectFormat: this.objectFormat,
+    });
   }
 
   /**

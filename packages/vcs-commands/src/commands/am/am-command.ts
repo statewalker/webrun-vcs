@@ -6,8 +6,10 @@
  * (`am: <subject>`, `am --abort`), the output ("Applying: <subject>", "Patch failed at
  * ...") and the advice, and `--continue`, `--skip`, `--abort`, `--quit`.
  *
- * Not run: the `applypatch-msg`, `pre-applypatch` and `post-applypatch` hooks, rerere,
- * and the auto maintenance git starts at the end. Notes are not copied: plain `git am`
+ * rerere runs where git's does: on the three-way fallback's conflicts (`--[no-]rerere-autoupdate`,
+ * kept in `rerere-autoupdate`), before `--continue`'s commit, `rerere clear` on `--skip`,
+ * `--abort` and `--quit`. Not run: the `applypatch-msg`, `pre-applypatch` and
+ * `post-applypatch` hooks, and the auto maintenance git starts at the end. Notes are not copied: plain `git am`
  * copies none (only `rebase --apply` does, through `rewritten`).
  */
 
@@ -180,6 +182,8 @@ export class AmCommand extends GitCommand<AmResult> {
   private fixedClock?: number;
   private resume?: Resume;
   private threeWay?: boolean;
+  /** `--[no-]rerere-autoupdate` (undefined: `rerere.autoUpdate`) */
+  private rerereAutoUpdate?: boolean;
   private signoff = false;
   private keepCr?: boolean;
   private keep: "t" | "b" | "f" = "f";
@@ -267,6 +271,17 @@ export class AmCommand extends GitCommand<AmResult> {
   }
 
   /** `-3` / `--3way` (default `am.threeWay`). */
+  /**
+   * `--rerere-autoupdate` (true) / `--no-rerere-autoupdate` (false): whether resolutions
+   * rerere replays when the three-way fallback conflicts are staged (default
+   * `rerere.autoUpdate`); kept in the session (`rerere-autoupdate`).
+   */
+  setRerereAutoUpdate(value: boolean): this {
+    this.checkCallable();
+    this.rerereAutoUpdate = value;
+    return this;
+  }
+
   setThreeWay(value: boolean): this {
     this.threeWay = value;
     return this;
@@ -544,6 +559,7 @@ export class AmCommand extends GitCommand<AmResult> {
         this.fatal(`previous rebase directory .git/${DIR} still exists but mbox given.`);
       const mode = this.resume ?? "apply";
       if (mode === "quit") {
+        await this.rerereClear();
         await state.remove(DIR);
         return this.result(0);
       }
@@ -551,6 +567,7 @@ export class AmCommand extends GitCommand<AmResult> {
       const st = await this.load();
       if (mode === "show-raw" || mode === "show-diff") return this.showPatch(st, mode);
       if (mode === "skip") {
+        await this.rerereClear();
         // am_skip: clean_index(HEAD, HEAD), then the next patch
         const head = await this.headId();
         await this.cleanIndex(head, head);
@@ -670,6 +687,9 @@ export class AmCommand extends GitCommand<AmResult> {
     await this.writeText("quiet", this.quiet ? "t" : "f");
     await this.writeText("sign", this.signoff ? "t" : "f");
     await this.writeText("utf8", this.utf8 ? "t" : "f");
+    if (this.rerereAutoUpdate !== undefined) {
+      await this.writeText("rerere-autoupdate", this.rerereAutoUpdate ? "t" : "f");
+    }
     await this.writeText("keep", this.keep);
     await this.writeText("messageid", messageId ? "t" : "f");
     await this.writeText("scissors", this.scissors === undefined ? "" : this.scissors ? "t" : "f");
@@ -1121,6 +1141,12 @@ export class AmCommand extends GitCommand<AmResult> {
     if (!this.quiet) for (const m of merge.messages) this.out += `${pathToLatin1(m)}\n`;
     if (conflicts.length || !merge.clean) {
       await this.state().setRef("AUTO_MERGE", treeId);
+      // fall_back_threeway: rerere with the session's --[no-]rerere-autoupdate
+      const saved = (await this.read("rerere-autoupdate"))?.trim();
+      const lines = await this.rerere(
+        saved === "t" ? { autoUpdate: true } : saved === "f" ? { autoUpdate: false } : {},
+      );
+      for (const line of lines) this.err += `${pathToLatin1(line)}\n`;
       this.err += "error: Failed to merge in the changes.\n";
       return 1;
     }
@@ -1295,6 +1321,8 @@ export class AmCommand extends GitCommand<AmResult> {
         return this.amRun(await this.load(), false);
       }
     }
+    // am_resolve: the resolutions recorded before the commit
+    for (const line of await this.rerere()) this.err += `${pathToLatin1(line)}\n`;
     await this.doCommit(st);
     await this.next(st);
     return this.amRun(await this.load(), false);
@@ -1311,6 +1339,7 @@ export class AmCommand extends GitCommand<AmResult> {
       await state.remove(DIR);
       return this.result(0);
     }
+    await this.rerereClear();
     const orig = await state.ref("ORIG_HEAD");
     await this.cleanIndex(head, orig ?? head);
     if (orig) await updateHead(this.refsStore, orig, this.reflogLine("am --abort"));
