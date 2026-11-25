@@ -6,6 +6,7 @@
 
 export * from "./bitmap-walk.js";
 export * from "./delta-instruction-analyzer.js";
+export * from "./delta-islands.js";
 export * from "./delta-reverse-index.js";
 export * from "./import-pack.js";
 export * from "./index-pack.js";

@@ -11,6 +11,7 @@
  */
 
 import type {
+  DeltaIslandRules,
   DeltaSearchOptions,
   FilesApi,
   GitObjects,
@@ -24,6 +25,7 @@ import type {
 import {
   BitmapClosureError,
   clearMultiPackIndexNaming,
+  computeDeltaIslands,
   createGitObjects,
   joinPath,
   objectFormatOf,
@@ -48,6 +50,7 @@ import {
 } from "./pack/pack-write-settings.js";
 import { type PromisorExclusions, promisorExclusions } from "./promisor-objects.js";
 import { listReachableObjects } from "./reachable-objects.js";
+import { geometricRepack } from "./repack-geometric.js";
 import { assertObjectsDeletable, readRepositoryFormat } from "./repository-format.js";
 import { updateServerInfo } from "./server-info.js";
 import { filesStagingStore } from "./storage/loose/files-staging-store.js";
@@ -194,6 +197,36 @@ export interface RepackOptions extends RepackTarget {
   updateServerInfo?: boolean;
   /** @internal writes the midx bitmap (see `MultiPackIndexWriteOptions.writeBitmap`) */
   writeMidxBitmap?: MultiPackIndexWriteOptions["writeBitmap"];
+  /**
+   * `-d`: remove what the new pack makes redundant (the replaced packs with `all`, the loose
+   * objects now packed). Default true; false writes the new pack and removes nothing (`git
+   * repack -a`, or `git repack` alone), and then `unpackUnreachable` and `keepUnreachable` do
+   * nothing, as in git.
+   */
+  deleteRedundant?: boolean;
+  /**
+   * `git repack -k` (with `all` and `deleteRedundant`): the unreachable objects of the replaced
+   * packs go into the new pack (`pack-objects --keep-unreachable`), and so do every loose
+   * object (`--pack-loose-unreachable`; under 2.43 compatibility only when a non-kept pack
+   * existed), so nothing is dropped. Not with `unpackUnreachable` or `cruft`.
+   */
+  keepUnreachable?: boolean;
+  /**
+   * `git repack --geometric=<factor>` (not with `all`): the smallest packs are rolled up with
+   * the loose objects into one new pack so that the packs left form a geometric progression of
+   * object counts (see `geometricRepack`).
+   */
+  geometric?: number;
+  /**
+   * `git repack -i` (`--delta-islands`): `pack.island` and `pack.islandCore` (read from the
+   * config) restrict the deltas (see `computeDeltaIslands`).
+   */
+  deltaIslands?: boolean;
+  /**
+   * The `delta` attribute (git's `no_try_delta`): true for a path whose attribute is unset
+   * (`-delta`): its objects are never searched for a delta. Asked once per path listed.
+   */
+  noDelta?: (path: string) => boolean | Promise<boolean>;
 }
 
 /** The bitmap settings of a repository's config. */
@@ -409,6 +442,17 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
     });
     alternatesErrors = await assertAlternatesReadable(options, "repack");
   }
+  if (options.geometric !== undefined) {
+    const result = await geometricRepack({
+      ...options,
+      objects: objectsWithoutLazyFetch(options.objects),
+    });
+    if (!options.dryRun && (options.updateServerInfo ?? true))
+      await updateServerInfo({ ...options, gitDir: options.gitDir ?? ".git" });
+    return result && alternatesErrors.length > 0
+      ? { ...result, errors: [...alternatesErrors] }
+      : result;
+  }
   // pack-objects runs with fetch_if_missing = 0: every read goes through the store's view
   // without lazy fetch
   const run = async (options: RepackOptions) => {
@@ -463,6 +507,7 @@ export async function repackListed(
   exclusions?: PromisorExclusions,
 ): Promise<RepackResult | null> {
   const { files, packs, looseStorage, objects, all = true, dryRun = false } = options;
+  const deleteRedundant = options.deleteRedundant ?? true;
   const gitDir = options.gitDir ?? ".git";
   const packDir = joinPath(gitDir, "objects", "pack");
 
@@ -512,6 +557,42 @@ export async function repackListed(
     if (alternates.length > 0 && (await borrowed(o.id))) continue;
     ids.push(o);
   }
+  // -k: what the replaced packs hold unreachable (--keep-unreachable, when non-kept packs
+  // exist), and every loose object (--pack-loose-unreachable), each once; never what a .keep
+  // pack (want_object_in_pack honours them) or, with -l, an alternate holds
+  const unreachable: ListedObject[] = [];
+  if (options.keepUnreachable && all && deleteRedundant && !options.cruft) {
+    const seen = new Set(reachable.map((o) => o.id));
+    const keptOnDisk = [...kept, ...keptInCore];
+    const add = async (id: ObjectId) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      if (keptOnDisk.some((p) => p.has(id))) return;
+      if (options.local) for (const alt of alternates) if (await alt.objects.has(id)) return;
+      const o = await objects.get(id);
+      if (!o) return;
+      if (!o.bytes) await o.content[Symbol.asyncIterator]().return?.();
+      unreachable.push({ id, type: o.type });
+    };
+    for (const p of replaced) for (const id of p.ids()) await add(id);
+    if (replaced.length > 0 || options.compatibility !== "2.43")
+      for await (const key of looseStorage.keys())
+        if (objectIdPattern(objectFormatOf(objects)).test(key)) await add(key);
+  }
+  // the delta attribute: objects at an unset `delta` path are not searched
+  if (options.noDelta) {
+    const byPath = new Map<string, boolean>();
+    const noDelta = options.noDelta;
+    for (const o of ids) {
+      if (!o.path) continue;
+      let off = byPath.get(o.path);
+      if (off === undefined) {
+        off = await noDelta(o.path);
+        byPath.set(o.path, off);
+      }
+      if (off) (o as ListedObject & { noDelta?: boolean }).noDelta = true;
+    }
+  }
   // repack_promisor_objects (-a): every object of the promisor packs goes into a new promisor
   // pack, which the main pack then leaves out (`--keep-pack`)
   const promised: ListedObject[] = [];
@@ -524,7 +605,7 @@ export async function repackListed(
       promised.push({ id, type: o.type });
     }
   }
-  if (ids.length === 0 && promised.length === 0) return null;
+  if (ids.length === 0 && promised.length === 0 && unreachable.length === 0) return null;
   if ((exclusions || options.filter) && bitmaps.mode !== "off") {
     // the promisor objects are not packed with the rest: no closure for a bitmap
     if (bitmaps.mode === "loud") warnings.push(NO_CLOSURE_BITMAP_WARNING);
@@ -555,6 +636,9 @@ export async function repackListed(
     (await readPackWriteSettings(files, gitDir, {
       ...(options.environment ? { environment: options.environment } : {}),
     }));
+  const islands = options.deltaIslands
+    ? await deltaIslandsOf(options, [...ids, ...unreachable], warnings)
+    : undefined;
   const packOptions = {
     packs,
     reuseObjects: options.reuseObjects ?? true,
@@ -562,6 +646,7 @@ export async function repackListed(
     deltaSearch: packDeltaSearch(settings, options.deltaSearch),
     bigFileThreshold: options.bigFileThreshold,
     ...(settings.compression !== undefined ? { compression: settings.compression } : {}),
+    ...(islands ? { islands } : {}),
   };
   // pack.writeReverseIndex: a `.rev` beside each pack written (git 2.41+ default)
   const installOptions = { writeReverseIndex: settings.writeReverseIndex };
@@ -573,12 +658,16 @@ export async function repackListed(
     if (packs.writePromisor) await packs.writePromisor(promisorPack, "");
     else await files.write(joinPath(packDir, `pack-${promisorPack}.promisor`), []);
   }
-  if (ids.length === 0) {
+  if (ids.length === 0 && unreachable.length === 0) {
     await packs.refresh();
     return finishRepack(promisorPack as string, promised.length, false);
   }
   // One stream: objects are read one at a time, the pack goes straight into its temporary file
-  const stream = writePack(objects, ids, packOptions);
+  const stream = writePack(
+    objects,
+    unreachable.length ? [...ids, ...unreachable] : ids,
+    packOptions,
+  );
   const installed = await packs.install(stream, installOptions);
   // Install before remove: every reader finds each object in the new pack from now on
   await packs.refresh();
@@ -628,7 +717,7 @@ export async function repackListed(
     }
     // Only packs of the snapshot, and none modified since the walk started (defence in depth)
     const removable: { pack: Pack; modified?: number }[] = [];
-    if (all) {
+    if (all && deleteRedundant) {
       for (const p of replaced) {
         if (newPacks.has(p.packId)) continue;
         const modified = (await files.stats(joinPath(packDir, `pack-${p.packId}.pack`)))
@@ -743,12 +832,9 @@ export async function repackListed(
       );
     if (packsRemoved.length) await packs.remove(removable.map((r) => r.pack.packId));
 
-    const looseObjectsRemoved = await prunePacked(
-      looseStorage,
-      packs,
-      objectFormatOf(objects),
-      alternates,
-    );
+    const looseObjectsRemoved = deleteRedundant
+      ? await prunePacked(looseStorage, packs, objectFormatOf(objects), alternates)
+      : 0;
 
     return {
       packName: `pack-${packId}`,
@@ -960,4 +1046,47 @@ export async function prunePacked(
     if ((await packed(id)) && (await looseStorage.remove(id))) removed++;
   }
   return removed;
+}
+
+/**
+ * The delta islands of a repack (`-i`): `pack.island` (config order) and `pack.islandCore`
+ * over every ref under `refs/`, marks propagated through the objects packed.
+ */
+async function deltaIslandsOf(
+  options: RepackOptions,
+  listed: readonly ListedObject[],
+  warnings: string[],
+): Promise<DeltaIslandRules> {
+  const config = await createWorkingCopyConfig(
+    configFilesApiOf(options.files, { readOnly: "reading pack.island never writes the config" }),
+    options.gitDir ?? ".git",
+    undefined,
+    options.environment ? { environment: options.environment } : {},
+  );
+  const patterns: string[] = [];
+  for (const v of config.getAll("pack.island")) {
+    // config_error_nonbool
+    if (v === null || v === undefined || v === true)
+      throw new Error("error: missing value for 'pack.island'");
+    patterns.push(String(v));
+  }
+  const core = config.get("pack.islandCore");
+  const refs: { name: string; id: ObjectId }[] = [];
+  if (patterns.length > 0) {
+    for await (const ref of options.history.refs.list()) {
+      if (!ref.name.startsWith("refs/")) continue;
+      const resolved = await options.history.refs.resolve(ref.name).catch(() => undefined);
+      if (resolved?.objectId) refs.push({ name: ref.name, id: resolved.objectId });
+    }
+    refs.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  }
+  return computeDeltaIslands({
+    patterns,
+    ...(typeof core === "string" ? { core } : {}),
+    refs,
+    objects: options.objects,
+    listed,
+    idLength: objectFormatOf(options.objects).rawLength,
+    warn: (line) => warnings.push(line),
+  });
 }
