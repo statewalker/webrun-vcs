@@ -5,7 +5,13 @@
  * computes, parses, prints or sizes an object id asks the repository's format: the raw and
  * hex lengths, the null id, the empty tree and blob, the hasher.
  */
-import { createSha1, createSha256, type Hasher } from "../hasher/index.js";
+import {
+  createSha1,
+  createSha1Unsafe,
+  createSha256,
+  type Hasher,
+  sha1Of,
+} from "../hasher/index.js";
 import { sha1 } from "../sha1/index.js";
 import { sha256 } from "../sha256/index.js";
 
@@ -32,9 +38,25 @@ export interface ObjectFormat {
   readonly emptyBlobId: string;
   /** The commit header carrying this format's signature (`gpg_sig_headers`) */
   readonly signatureHeader: "gpgsig" | "gpgsig-sha256";
-  /** A fresh incremental hasher (streams: hashed chunk by chunk) */
+  /**
+   * A fresh incremental hasher (streams: hashed chunk by chunk) for object ids: SHA-1 with
+   * git's collision detection (sha1dc), whose `digest` throws `Sha1CollisionError`
+   */
   createHasher(): Hasher;
-  /** One-shot digest of a buffer: Web Crypto where the runtime has it */
+  /**
+   * git's "unsafe" hash (`unsafe_init_fn`, csum-file.c), for checksums of files that are not
+   * object ids (pack, idx, index, commit-graph trailers): SHA-1 without collision detection
+   */
+  createUnsafeHasher(): Hasher;
+  /**
+   * The object id of `header` (`<type> <size>\0`) followed by `body`, in one call: for SHA-1
+   * one WebAssembly run where it can (`sha1Of`), with collision detection
+   */
+  hashObject(header: Uint8Array, body: Uint8Array): Uint8Array;
+  /**
+   * One-shot digest of a buffer, Web Crypto where the runtime has it: the unsafe hash, for
+   * checksums (Web Crypto's SHA-1 detects no collision)
+   */
   digest(data: Uint8Array): Promise<Uint8Array>;
 }
 
@@ -50,6 +72,8 @@ export const SHA1_OBJECT_FORMAT: ObjectFormat = Object.freeze({
   emptyBlobId: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
   signatureHeader: "gpgsig",
   createHasher: createSha1,
+  createUnsafeHasher: createSha1Unsafe,
+  hashObject: sha1Of,
   digest: sha1,
 });
 
@@ -65,6 +89,9 @@ export const SHA256_OBJECT_FORMAT: ObjectFormat = Object.freeze({
   emptyBlobId: "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
   signatureHeader: "gpgsig-sha256",
   createHasher: createSha256,
+  createUnsafeHasher: createSha256,
+  hashObject: (header: Uint8Array, body: Uint8Array) =>
+    createSha256().update(header).update(body).digest(),
   digest: sha256,
 });
 

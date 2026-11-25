@@ -678,7 +678,7 @@ export async function writeCommitGraphFile(
       );
     }
   }
-  const hash = format.createHasher().update(w.buf.subarray(0, w.at)).digest();
+  const hash = format.createUnsafeHasher().update(w.buf.subarray(0, w.at)).digest();
   w.bytes(hash);
   const fileHash = bytesToHex(hash);
   const content = w.buf;

@@ -2184,7 +2184,7 @@ class FsckRun {
       const raw = this.format.rawLength;
       let valid = size >= raw;
       if (valid) {
-        const hasher = this.format.createHasher();
+        const hasher = this.format.createUnsafeHasher();
         for await (const c of files.read(path, { start: 0, length: size - raw })) hasher.update(c);
         const sum = hasher.digest();
         const tail: number[] = [];

@@ -573,7 +573,7 @@ function openPackIndex(bytes: Uint8Array, format: ObjectFormat): PackIndex | und
   const minimum = v2 ? 8 + 1024 + n * (raw + 8) + 2 * raw : 1024 + n * (raw + 4) + 2 * raw;
   if (bytes.length < minimum || (!v2 && bytes.length !== minimum)) return undefined;
   if (v2 && bytes.length > minimum + Math.max(0, n - 1) * 8) return undefined;
-  const hasher = format.createHasher();
+  const hasher = format.createUnsafeHasher();
   hasher.update(bytes.subarray(0, bytes.length - raw));
   const sum = hasher.digest();
   const trailer = bytes.subarray(bytes.length - raw);
@@ -631,7 +631,7 @@ async function encodePack(
     }
     chunks.push(Uint8Array.from(head), await compressBlock(object.content));
   }
-  const hasher = format.createHasher();
+  const hasher = format.createUnsafeHasher();
   for (const chunk of chunks) hasher.update(chunk);
   chunks.push(hasher.digest());
   return chunks;

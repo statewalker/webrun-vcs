@@ -58,7 +58,7 @@ export function encodeReverseIndex(
   }
   out.set(checksum, p);
   p += HASH_SIZE;
-  out.set(format.createHasher().update(out.subarray(0, p)).digest(), p);
+  out.set(format.createUnsafeHasher().update(out.subarray(0, p)).digest(), p);
   return out;
 }
 
@@ -93,7 +93,7 @@ export function parseReverseIndex(
     throw new ReverseIndexError(`reverse-index file ${name} has unsupported hash id ${hashId}`);
   if (options.verify) {
     const end = bytes.length - HASH_SIZE;
-    const sum = format.createHasher().update(bytes.subarray(0, end)).digest();
+    const sum = format.createUnsafeHasher().update(bytes.subarray(0, end)).digest();
     for (let i = 0; i < HASH_SIZE; i++)
       if (sum[i] !== bytes[end + i]) throw new ReverseIndexError("invalid checksum");
   }
