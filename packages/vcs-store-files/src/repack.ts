@@ -464,6 +464,8 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
   }
   // pack-objects runs with fetch_if_missing = 0: every read goes through the store's view
   // without lazy fetch
+  // the refs git's ref iterator skips without ref paranoia (`does not point to a valid object!`)
+  const refErrors: string[] = [];
   const run = async (options: RepackOptions) => {
     // a partial clone: its promisor objects stay out of the walk (--exclude-promisor-objects)
     const exclusions = await promisorExclusions(options.objects, options.files, options.gitDir);
@@ -479,15 +481,16 @@ export async function repack(options: RepackOptions): Promise<RepackResult | nul
       ...(options.readGraftFile ? { readGraftFile: options.readGraftFile } : {}),
       ...(exclusions ? { excludeObjects: exclusions.excluded, extraRoots: exclusions.roots } : {}),
       ...(filter ? { filter } : {}),
+      refParanoia: options.environment?.refParanoia !== false,
+      onRefError: (line) => refErrors.push(line),
     });
     return repackListed(options, listed, snapshot, undefined, exclusions);
   };
   const result = await run({ ...options, objects: objectsWithoutLazyFetch(options.objects) });
   if (!options.dryRun && (options.updateServerInfo ?? true))
     await updateServerInfo({ ...options, gitDir: options.gitDir ?? ".git" });
-  return result && alternatesErrors.length > 0
-    ? { ...result, errors: [...alternatesErrors] }
-    : result;
+  const errors = [...alternatesErrors, ...refErrors];
+  return result && errors.length > 0 ? { ...result, errors } : result;
 }
 
 /** The filter of a repack, parsed and resolved (a `sparse:oid` one must come resolved). */

@@ -293,6 +293,38 @@ export interface GitHostEnvironment {
    */
   discoveryAcrossFilesystem?: boolean;
   /**
+   * `$GIT_DIR` as set (`--git-dir`): the repository, a host path relative to the current
+   * directory unless absolute. Discovery is skipped (setup.c's `setup_explicit_git_dir`):
+   * no ownership, ceiling or `safe.bareRepository` check, as in git.
+   */
+  gitDir?: string;
+  /** `$GIT_WORK_TREE` as set (`--work-tree`): relative to the current directory unless absolute */
+  workTree?: string;
+  /** `$GIT_COMMON_DIR` as set: the common git directory in place of `commondir`'s */
+  commonDir?: string;
+  /** `$GIT_INDEX_FILE` as set: the index in place of `<git dir>/index` */
+  indexFile?: string;
+  /** `$GIT_OBJECT_DIRECTORY` as set: the objects in place of `<common dir>/objects` */
+  objectDirectory?: string;
+  /**
+   * `$GIT_IMPLICIT_WORK_TREE` as a boolean (default true): false makes an explicit `$GIT_DIR`
+   * without a worktree setting bare rather than taking the current directory as its worktree
+   */
+  implicitWorkTree?: boolean;
+  /**
+   * `$GIT_OPTIONAL_LOCKS` as a boolean (git's `git_env_bool`, default true; `git
+   * --no-optional-locks` sets it to 0): false makes commands skip the writes they take a lock
+   * for only as an optimisation, status's refresh of the index above all
+   */
+  optionalLocks?: boolean;
+  /**
+   * `$GIT_REF_PARANOIA` as a boolean (default true since git 2.36, so in 2.43 and 2.5x): a ref
+   * with a bad name or naming a missing object makes gc, repack and prune die instead of
+   * deleting what it would have kept. False skips such refs (git warns for the missing ones),
+   * so what only they reach can be deleted.
+   */
+  refParanoia?: boolean;
+  /**
    * The home directory of user `name`, for `~name/` in path settings (git's `getpwnam`):
    * undefined when there is no such user (git then dies "failed to expand user dir").
    * Absent, `~name/` cannot be expanded here: the ownership checks skip such a
