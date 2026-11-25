@@ -14,13 +14,12 @@ import { looksLikeInfoRefs } from "../fetch-client/dumb-http.js";
 import { anonymizeUrl } from "../fetch-client/fetch-head.js";
 // the idle timer is internal to the clients: not exported from the package
 import { abortErrorOf, IdleTimer } from "../fetch-client/idle-timer.js";
+import { PktStream, type RemoteRef, readServerGreeting } from "../fetch-client/index.js";
 import {
-  httpRefsError,
-  PktStream,
-  type RemoteRef,
-  readServerGreeting,
-} from "../fetch-client/index.js";
-import { authorizationHeader } from "../operations/http-auth.js";
+  type HttpClientSettings,
+  type HttpCredentialHelper,
+  SmartHttpClient,
+} from "../http-client/index.js";
 import { AuthenticationError, TransportError } from "../protocol/index.js";
 
 /** A connection to receive-pack, after its ref advertisement. */
@@ -79,6 +78,10 @@ export interface HttpReceivePackOptions {
   streamRequestBody?: boolean;
   /** Aborts every request of the connection */
   signal?: AbortSignal;
+  /** git's `http.*` settings for the URL (extra headers, user agent, redirects, retries) */
+  http?: HttpClientSettings;
+  /** Asked for credentials after a 401, told whether they worked */
+  credentialHelper?: HttpCredentialHelper;
 }
 
 /**
@@ -88,10 +91,8 @@ export interface HttpReceivePackOptions {
 export async function openHttpReceivePackConnection(
   options: HttpReceivePackOptions,
 ): Promise<ReceivePackConnection> {
-  const baseUrl = options.url.replace(/\/+$/, "");
   const doFetch = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
-  const headers: Record<string, string> = { ...options.headers };
-  if (options.auth) headers.Authorization = authorizationHeader(options.auth);
+  const headers: Record<string, string> = {};
   if (options.protocolVersion === 1) headers["Git-Protocol"] = "version=1";
 
   const { signal } = options;
@@ -102,7 +103,16 @@ export async function openHttpReceivePackConnection(
   const idle = new IdleTimer(options.timeout, () => controller.abort(), signal, "Push aborted");
   const wait = <T>(next: () => Promise<T>): Promise<T> => idle.wait(next);
   try {
-    return await openHttp(options, baseUrl, doFetch, headers, controller, idle, wait, () =>
+    const client = new SmartHttpClient({
+      url: options.url,
+      fetchImpl: doFetch,
+      ...(options.headers ? { headers: options.headers } : {}),
+      ...(options.auth ? { auth: options.auth } : {}),
+      ...(options.http ? { settings: options.http } : {}),
+      ...(options.credentialHelper ? { credentialHelper: options.credentialHelper } : {}),
+      signal: controller.signal,
+    });
+    return await openHttp(options, client, headers, idle, wait, () =>
       signal?.removeEventListener("abort", onAbort),
     );
   } catch (error) {
@@ -113,24 +123,17 @@ export async function openHttpReceivePackConnection(
 
 async function openHttp(
   options: HttpReceivePackOptions,
-  baseUrl: string,
-  doFetch: (request: Request) => Promise<Response>,
+  client: SmartHttpClient,
   headers: Record<string, string>,
-  controller: AbortController,
   idle: IdleTimer,
   wait: <T>(next: () => Promise<T>) => Promise<T>,
   release: () => void,
 ): Promise<ReceivePackConnection> {
-  const response = await wait(() =>
-    doFetch(
-      new Request(`${baseUrl}/info/refs?service=git-receive-pack`, {
-        method: "GET",
-        headers: { ...headers, Accept: "application/x-git-receive-pack-advertisement" },
-        signal: controller.signal,
-      }),
-    ),
+  const response = await client.discover(
+    "git-receive-pack",
+    { ...headers, Accept: "application/x-git-receive-pack-advertisement" },
+    wait,
   );
-  if (!response.ok) throw await httpRefsError(response, baseUrl);
   if (!response.body) throw new TransportError("Empty response from info/refs");
   const type = (response.headers.get("content-type") ?? "").split(";")[0]?.trim().toLowerCase();
   let advertBody: ReadableStream<Uint8Array> = response.body;
@@ -139,7 +142,7 @@ async function openHttp(
     if (looksLikeInfoRefs(body)) {
       // a dumb server: git would push with http-push over WebDAV, which is not implemented
       throw new TransportError(
-        `fatal: ${anonymizeUrl(baseUrl)}/: not a smart-HTTP git server (a dumb one: pushing over WebDAV, git's http-push, is not supported)`,
+        `fatal: ${anonymizeUrl(client.base)}/: not a smart-HTTP git server (a dumb one: pushing over WebDAV, git's http-push, is not supported)`,
       );
     }
     advertBody = new Response(body).body as ReadableStream<Uint8Array>;
@@ -155,7 +158,7 @@ async function openHttp(
     first = await advert.read();
   } else {
     // git: a server that does not announce the service is not a smart-HTTP server
-    throw new TransportError(`${baseUrl}: not a smart-HTTP git server (no service line)`);
+    throw new TransportError(`${client.base}: not a smart-HTTP git server (no service line)`);
   }
   const greeting = await readServerGreeting(advert, first);
   await advert.cancel();
@@ -178,17 +181,15 @@ async function openHttp(
         fetchWithRequestBody(
           watched,
           (init) =>
-            doFetch(
-              new Request(`${baseUrl}/git-receive-pack`, {
-                method: "POST",
-                headers: {
-                  ...headers,
-                  "Content-Type": "application/x-git-receive-pack-request",
-                  Accept: "application/x-git-receive-pack-result",
-                },
-                ...init,
-                signal: controller.signal,
-              } as RequestInit),
+            client.post(
+              "git-receive-pack",
+              {
+                ...headers,
+                "Content-Type": "application/x-git-receive-pack-request",
+                Accept: "application/x-git-receive-pack-result",
+              },
+              init,
+              (next) => next(),
             ),
           shouldStreamRequestBody(options.streamRequestBody),
         ),

@@ -39,6 +39,7 @@ import { parseGitBool } from "@statewalker/vcs-utils";
 import type { WorkingCopy } from "@statewalker/vcs-working-tree";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { hostEnvironmentOf } from "./git-ident.js";
+import { httpClientSettingsOf } from "./http-config.js";
 
 /** A promisor remote (git's `struct promisor_remote`). */
 export interface PromisorRemote {
@@ -203,6 +204,8 @@ export function createPromisorFetcher(
           ...(options.headers ? { headers: options.headers } : {}),
           ...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
           protocolVersion: protocolVersionOf(config),
+          httpSettings: (remoteUrl) =>
+            httpClientSettingsOf(config, remoteUrl, environment, { compatibility }),
         },
         async (connection) => {
           try {

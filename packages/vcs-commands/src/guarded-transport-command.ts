@@ -153,7 +153,9 @@ export abstract class GuardedTransportCommand<T> extends TransportCommand<T> {
 
   /**
    * A command this one runs: a guarded one gets the transports and this command's policy, any
-   * other the guarded transports; neither gets the credentials or headers.
+   * other the guarded transports; neither gets the credentials or headers. The credential
+   * helper and warning sink go to both (the helper is asked per URL, and the guard drops
+   * whatever identifies the user on a redirect to another origin).
    */
   protected override configureChild<C extends TransportCommand<unknown>>(child: C): C {
     child.shareHooksOf(this);
@@ -163,6 +165,8 @@ export abstract class GuardedTransportCommand<T> extends TransportCommand<T> {
     } else child.setTransports(this.getTransports());
     if (this.timeout) child.setTimeout(this.timeout);
     if (this.gzipRequests !== undefined) child.setGzipRequests(this.gzipRequests);
+    if (this.credentialHelper) child.setCredentialHelper(this.credentialHelper);
+    if (this.warningCallback) child.setWarningCallback(this.warningCallback);
     if (this.progressCallback) child.setProgressMonitor(this.progressCallback);
     if (this.progressMessageCallback)
       child.setProgressMessageCallback(this.progressMessageCallback);

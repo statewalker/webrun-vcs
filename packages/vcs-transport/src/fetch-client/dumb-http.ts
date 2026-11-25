@@ -27,33 +27,23 @@ import type {
   PackImportResult,
   RepositoryFacade,
 } from "../api/repository-facade.js";
+import type { FollowRedirects } from "../http-client/index.js";
 import { TransportError } from "../protocol/index.js";
 import { OBJECT_FORMAT_CAPABILITY } from "../protocol/object-format.js";
 import type { RemoteRef, UploadPackConnection } from "./connection.js";
 import { anonymizeUrl } from "./fetch-head.js";
 
-/**
- * `http.followRedirects`: `always` (`true`) follows every redirect and lets a dumb fetch use
- * the remote's alternates; `initial` (git's default) only the first request's; `never`
- * (`false`) none.
- */
-export type FollowRedirects = "always" | "initial" | "never";
-
 /** What a dumb connection's requests are sent with. */
 export interface DumbHttpOptions {
-  /** How requests are sent */
-  fetchImpl: (request: Request) => Promise<Response>;
   /**
-   * Headers (`Authorization` included) sent only with requests to `credentialOrigin`: a base
-   * the first request's redirect moved to another origin, and an alternate elsewhere, get none.
-   * Under `followRedirects: "always"` a later request's own redirect is followed by `fetch`,
-   * which drops `Authorization` across origins but carries other headers along (as curl does
-   * under git's `http.followRedirects=true`)
+   * Sends a GET (the connection's `SmartHttpClient.get`): the connection's headers and
+   * credentials only on the base's origin (dropped already when the first request's redirect
+   * moved the base to another one), none to an alternate elsewhere; redirects followed only
+   * under `http.followRedirects=true`, where `fetch` drops `Authorization` across origins but
+   * carries other headers along (as curl does under git's setting)
    */
-  headers: Record<string, string>;
-  /** The origin of the URL as given, before any redirect: the one `headers` are meant for */
-  credentialOrigin: string;
-  /** `http.followRedirects` (default `initial`) */
+  get: (url: string) => Promise<Response>;
+  /** `http.followRedirects` (default `initial`): only `always` lets alternates be used */
   followRedirects?: FollowRedirects;
   /**
    * Whether an alternate of the scheme may be used (git's `is_transport_allowed(<scheme>, 0)`:
@@ -63,7 +53,6 @@ export interface DumbHttpOptions {
   alternateAllowed?: (scheme: string) => boolean;
   /** Bounds each wait for the server */
   wait: <T>(next: () => Promise<T>) => Promise<T>;
-  signal?: AbortSignal;
 }
 
 /** The dumb protocol's remote, as a connection carries it ({@link UploadPackConnection.dumb}). */
@@ -133,28 +122,9 @@ function urlOf(base: string, path: string): string {
   return base.endsWith("/") ? `${base}${path}` : `${base}/${path}`;
 }
 
-/** A GET of the dumb protocol: headers only to the origin of the URL as given. */
-async function get(remote: DumbHttpRemote, url: string, initial = false): Promise<Response> {
-  const { options } = remote;
-  const follow = options.followRedirects ?? "initial";
-  const sameOrigin = (() => {
-    try {
-      return new URL(url).origin === options.credentialOrigin;
-    } catch {
-      return false;
-    }
-  })();
-  return options.wait(() =>
-    options.fetchImpl(
-      new Request(url, {
-        method: "GET",
-        // no Pragma: a header outside the CORS safelist would cost a browser a preflight
-        headers: sameOrigin ? options.headers : {},
-        redirect: follow === "always" || (initial && follow === "initial") ? "follow" : "manual",
-        ...(options.signal ? { signal: options.signal } : {}),
-      }),
-    ),
-  );
+/** A GET of the dumb protocol, through the connection's client. */
+function get(remote: DumbHttpRemote, url: string): Promise<Response> {
+  return remote.options.get(url);
 }
 
 /** A GET's body, or undefined with why: missing (404, 410) or another failure. */

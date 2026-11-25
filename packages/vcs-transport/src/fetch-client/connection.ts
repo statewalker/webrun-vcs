@@ -10,16 +10,11 @@
 import { SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 import type { Credentials } from "../api/credentials.js";
 import { type Duplex, endDuplex } from "../api/duplex.js";
-import { authorizationHeader } from "../operations/http-auth.js";
-import { AuthenticationError, ServerError, TransportError } from "../protocol/index.js";
+import type { HttpClientSettings, HttpCredentialHelper } from "../http-client/index.js";
+import { httpRefsErrorOf, SmartHttpClient } from "../http-client/index.js";
+import { ServerError, TransportError } from "../protocol/index.js";
 import { isObjectIdOf, remoteObjectFormat } from "../protocol/object-format.js";
-import {
-  type DumbHttpRemote,
-  type FollowRedirects,
-  looksLikeInfoRefs,
-  openDumbHttpConnection,
-} from "./dumb-http.js";
-import { anonymizeUrl } from "./fetch-head.js";
+import { type DumbHttpRemote, looksLikeInfoRefs, openDumbHttpConnection } from "./dumb-http.js";
 import { abortErrorOf, IdleTimer } from "./idle-timer.js";
 import { type Pkt, PktStream } from "./pkt-stream.js";
 
@@ -91,12 +86,10 @@ export interface HttpConnectionOptions {
    * behind a CORS proxy that does not allow it fails the preflight.
    */
   gzipRequests?: boolean;
-  /**
-   * `http.followRedirects` (default `initial`): whether the first request may be redirected
-   * (`never` refuses it), and whether every later one of a dumb fetch may be (`always`, which
-   * also lets it use the remote's alternates)
-   */
-  followRedirects?: FollowRedirects;
+  /** git's `http.*` settings for the URL (extra headers, user agent, redirects, retries) */
+  http?: HttpClientSettings;
+  /** Asked for credentials after a 401, told whether they worked */
+  credentialHelper?: HttpCredentialHelper;
   /**
    * Whether a dumb fetch may use an alternate of the scheme (git's `protocol.<scheme>.allow`
    * for a transport not from the user); default: http, https, ftp and ftps
@@ -123,53 +116,46 @@ const SMART_ADVERTISEMENT = "application/x-git-upload-pack-advertisement";
 export async function openHttpConnection(
   options: HttpConnectionOptions,
 ): Promise<UploadPackConnection> {
-  const baseUrl = options.url.replace(/\/+$/, "");
   const doFetch = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const asked = options.protocolVersion ?? 2;
   const protocolHeader: Record<string, string> =
     asked > 0 ? { "Git-Protocol": `version=${asked}` } : {};
-  const headers: Record<string, string> = { ...options.headers };
-  if (options.auth) headers.Authorization = authorizationHeader(options.auth);
 
   const controller = new AbortController();
   const onAbort = () => controller.abort(options.signal?.reason);
   options.signal?.addEventListener("abort", onAbort, { once: true });
   const wait = <T>(next: () => Promise<T>): Promise<T> =>
     withTimeout(next, options.timeout, controller);
+  const client = new SmartHttpClient({
+    url: options.url,
+    fetchImpl: doFetch,
+    ...(options.headers ? { headers: options.headers } : {}),
+    ...(options.auth ? { auth: options.auth } : {}),
+    ...(options.http ? { settings: options.http } : {}),
+    ...(options.credentialHelper ? { credentialHelper: options.credentialHelper } : {}),
+    signal: controller.signal,
+  });
 
   const smart = options.smart ?? true;
-  const tail = smart ? "info/refs?service=git-upload-pack" : "info/refs";
-  const response = await wait(() =>
-    doFetch(
-      new Request(`${baseUrl}/${tail}`, {
-        method: "GET",
-        headers: {
-          ...headers,
-          Accept: "application/x-git-upload-pack-advertisement",
-          ...protocolHeader,
-        },
-        // http.followRedirects=false: the first request is not redirected either
-        ...(options.followRedirects === "never" ? { redirect: "manual" as const } : {}),
-        signal: controller.signal,
-      }),
-    ),
+  const response = await client.discover(
+    // $GIT_SMART_HTTP=0: asked without `?service=`, so any server answers the dumb way
+    smart ? "git-upload-pack" : undefined,
+    { Accept: "application/x-git-upload-pack-advertisement", ...protocolHeader },
+    wait,
   );
-  if (!response.ok) throw await httpRefsError(response, baseUrl);
   if (!response.body) throw new TransportError("Empty response from info/refs");
   const type = (response.headers.get("content-type") ?? "").split(";")[0]?.trim().toLowerCase();
   let advertBody: ReadableStream<Uint8Array> = response.body;
   if (!smart || type !== SMART_ADVERTISEMENT) {
     const body = new Uint8Array(await wait(() => response.arrayBuffer()));
     if (!smart || looksLikeInfoRefs(body)) {
-      return openDumbHttpConnection(redirectedBase(baseUrl, tail, response.url), body, {
-        fetchImpl: doFetch,
-        headers,
-        // the URL as given: a redirect to another origin takes no credentials along
-        credentialOrigin: originOf(baseUrl),
-        ...(options.followRedirects ? { followRedirects: options.followRedirects } : {}),
+      // the client's base is where the first request's redirect led, its credentials
+      // dropped there when that is another origin (update_url_from_redirect)
+      return openDumbHttpConnection(client.base, body, {
+        get: (url) => client.get(url, wait),
+        ...(options.http?.followRedirects ? { followRedirects: options.http.followRedirects } : {}),
         ...(options.alternateAllowed ? { alternateAllowed: options.alternateAllowed } : {}),
         wait,
-        signal: controller.signal,
       });
     }
     // an advertisement served with another content type: read as one
@@ -198,27 +184,22 @@ export async function openHttpConnection(
         options.gzipRequests === false
           ? { bytes: concat(body), gzip: false }
           : await gzipLargeBody(concat(body));
-      const res = await wait(() =>
-        doFetch(
-          new Request(`${baseUrl}/git-upload-pack`, {
-            method: "POST",
-            headers: {
-              ...headers,
-              "Content-Type": "application/x-git-upload-pack-request",
-              Accept: "application/x-git-upload-pack-result",
-              // the version spoken: v2 as answered, v1 as asked (git's remote-curl sends its
-              // protocol header with every request)
-              ...(greeting.version === 2
-                ? { "Git-Protocol": "version=2" }
-                : asked === 1
-                  ? protocolHeader
-                  : {}),
-              ...(payload.gzip ? { "Content-Encoding": "gzip" } : {}),
-            },
-            body: payload.bytes,
-            signal: controller.signal,
-          }),
-        ),
+      const res = await client.post(
+        "git-upload-pack",
+        {
+          "Content-Type": "application/x-git-upload-pack-request",
+          Accept: "application/x-git-upload-pack-result",
+          // the version spoken: v2 as answered, v1 as asked (git's remote-curl sends its
+          // protocol header with every request)
+          ...(greeting.version === 2
+            ? { "Git-Protocol": "version=2" }
+            : asked === 1
+              ? protocolHeader
+              : {}),
+          ...(payload.gzip ? { "Content-Encoding": "gzip" } : {}),
+        },
+        { body: payload.bytes },
+        wait,
       );
       if (!res.ok) {
         await res.body?.cancel().catch(() => {});
@@ -235,65 +216,15 @@ export async function openHttpConnection(
   };
 }
 
-/** A URL's origin; "" for one that does not parse (no headers ever match it). */
-function originOf(url: string): string {
-  try {
-    return new URL(url).origin;
-  } catch {
-    return "";
-  }
-}
-
-/**
- * http.c's `update_url_from_redirect`: the base URL where the first request's redirect led
- * (the effective URL less what was asked after the base); the base as given when nothing
- * redirected.
- *
- * @throws TransportError git's death when the redirect's URL does not end as asked
- */
-function redirectedBase(baseUrl: string, tail: string, effective: string): string {
-  const asked = `${baseUrl}/${tail}`;
-  if (!effective || effective === asked) return baseUrl;
-  if (!effective.endsWith(`/${tail}`)) {
-    throw new TransportError(
-      `fatal: unable to update url base from redirection:\n  asked for: ${anonymizeUrl(asked)}\n   redirect: ${anonymizeUrl(effective)}`,
-    );
-  }
-  return effective.slice(0, -tail.length - 1);
-}
-
 /**
  * The error git's remote-curl dies with when `info/refs` fails (`discover_refs`): a 404 is
  * "repository '<url>/' not found", a 401 "Authentication failed for '<url>/'" (an
- * {@link AuthenticationError}, as is a 403), any other "unable to access '<url>/': The
+ * `AuthenticationError`, as is a 403), any other "unable to access '<url>/': The
  * requested URL returned error: <code>"; a `text/plain` body comes first as `remote: ` lines
  * (`show_http_message`). The URL ends with a slash and carries no credentials, as git prints it.
  */
-export async function httpRefsError(response: Response, baseUrl: string): Promise<TransportError> {
-  let body = "";
-  const type = (response.headers.get("content-type") ?? "").split(";")[0]?.trim().toLowerCase();
-  if (type === "text/plain") {
-    body = await response.text().catch(() => "");
-  } else {
-    await response.body?.cancel().catch(() => {});
-  }
-  const text = body.trim();
-  const lines = text
-    ? text
-        .split("\n")
-        .map((line) => `remote: ${line}\n`)
-        .join("")
-    : "";
-  const url = `${anonymizeUrl(baseUrl.replace(/\/+$/, ""))}/`;
-  if (response.status === 404) {
-    return new TransportError(`${lines}fatal: repository '${url}' not found`);
-  }
-  const unable = `fatal: unable to access '${url}': The requested URL returned error: ${response.status}`;
-  if (response.status === 401) {
-    return new AuthenticationError(`${lines}fatal: Authentication failed for '${url}'`);
-  }
-  if (response.status === 403) return new AuthenticationError(`${lines}${unable}`);
-  return new TransportError(`${lines}${unable}`);
+export function httpRefsError(response: Response, baseUrl: string): Promise<TransportError> {
+  return httpRefsErrorOf(response, baseUrl);
 }
 
 /** Options of {@link openDuplexConnection}. */

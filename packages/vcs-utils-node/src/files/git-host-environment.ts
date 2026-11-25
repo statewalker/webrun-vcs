@@ -78,6 +78,14 @@ export interface NodeGitHostEnvironmentOptions {
   defaultPager?: string;
 }
 
+/** The variables of git's HTTP client that override `http.*` (http.c's `set_from_env`). */
+const HTTP_VARIABLES = [
+  "GIT_HTTP_USER_AGENT",
+  "GIT_HTTP_MAX_RETRIES",
+  "GIT_HTTP_RETRY_AFTER",
+  "GIT_HTTP_MAX_RETRY_TIME",
+] as const;
+
 /** The variables naming the user's editor and pager, as `git var` reads them. */
 const PROGRAM_VARIABLES = [
   "GIT_EDITOR",
@@ -99,6 +107,7 @@ export interface NodeGitHostEnvironment {
       string
     >
   >;
+  httpVariables?: Partial<Record<(typeof HTTP_VARIABLES)[number], string>>;
   readFile(path: string): Promise<Uint8Array | undefined>;
   /** The Node storage holding a host path (`git config --global` writes through it) */
   hostFilesOf(path: string): Promise<{ files: FilesApi; path: string }>;
@@ -470,8 +479,12 @@ export function createNodeGitHostEnvironment(
       return undefined;
     }
   };
+  const httpVariables = Object.fromEntries(
+    HTTP_VARIABLES.filter((name) => env[name] !== undefined).map((name) => [name, env[name]]),
+  ) as Partial<Record<(typeof HTTP_VARIABLES)[number], string>>;
   return {
     programVariables,
+    httpVariables,
     ...(options.defaultEditor !== undefined ? { defaultEditor: options.defaultEditor } : {}),
     ...(options.defaultPager !== undefined ? { defaultPager: options.defaultPager } : {}),
     readFile: readHostFile,

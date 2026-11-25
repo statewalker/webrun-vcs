@@ -4,7 +4,6 @@
  */
 
 import {
-  type FollowRedirects,
   openDuplexConnection,
   openHttpConnection,
   type UploadPackConnection,
@@ -23,8 +22,6 @@ export interface OpenSessionOptions {
   gzipRequests?: boolean;
   /** Smart HTTP: stream the push request body (see `HttpReceivePackOptions.streamRequestBody`) */
   streamRequestBody?: boolean;
-  /** HTTP: `http.followRedirects` (see `HttpConnectionOptions.followRedirects`) */
-  followRedirects?: FollowRedirects;
   /** Dumb HTTP: the alternates' schemes allowed (see `HttpConnectionOptions.alternateAllowed`) */
   alternateAllowed?: (scheme: string) => boolean;
   /** HTTP: `$GIT_SMART_HTTP` (default true; false asks for the dumb protocol) */
@@ -125,10 +122,11 @@ export async function openUploadPack(
         ? { headers: { ...session.headers, ...request.headers } }
         : {}),
       ...(request.credentials ? { auth: request.credentials } : {}),
+      ...(request.http ? { http: request.http } : {}),
+      ...(request.credentialHelper ? { credentialHelper: request.credentialHelper } : {}),
       ...(request.timeout !== undefined ? { timeout: request.timeout } : {}),
       ...(request.signal ? { signal: request.signal } : {}),
       ...(options.gzipRequests !== undefined ? { gzipRequests: options.gzipRequests } : {}),
-      ...(options.followRedirects ? { followRedirects: options.followRedirects } : {}),
       ...(options.alternateAllowed ? { alternateAllowed: options.alternateAllowed } : {}),
       ...(options.smartHttp === false ? { smart: false } : {}),
       protocolVersion: request.protocolVersion,
@@ -165,6 +163,8 @@ export async function openReceivePack(
         ? { headers: { ...session.headers, ...request.headers } }
         : {}),
       ...(request.credentials ? { auth: request.credentials } : {}),
+      ...(request.http ? { http: request.http } : {}),
+      ...(request.credentialHelper ? { credentialHelper: request.credentialHelper } : {}),
       ...(request.timeout !== undefined ? { timeout: request.timeout } : {}),
       ...(request.signal ? { signal: request.signal } : {}),
       ...(options.streamRequestBody !== undefined

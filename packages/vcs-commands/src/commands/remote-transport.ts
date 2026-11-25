@@ -9,13 +9,14 @@
 import {
   type Credentials,
   type Duplex,
-  type FollowRedirects,
   type GitConnectRequest,
   type GitService,
   type GitSession,
   type GitTransportConnector,
   type GitTransportRegistry,
   type GitUrl,
+  type HttpClientSettings,
+  type HttpCredentialHelper,
   isGitUrl,
   openReceivePack,
   openUploadPack,
@@ -24,7 +25,6 @@ import {
   type ReceivePackConnection,
   type UploadPackConnection,
 } from "@statewalker/vcs-transport";
-import { parseGitBool } from "@statewalker/vcs-utils";
 import type {
   GitHostEnvironment,
   OpenedRepository,
@@ -328,14 +328,16 @@ export interface RemoteSessionOptions {
   streamRequestBody?: boolean;
   /** `protocol.version` ({@link protocolVersionOf}) */
   protocolVersion: 0 | 1 | 2;
+  /** git's `http.*` settings for a remote's URL (`http.<url>.*`) */
+  httpSettings?: (url: string) => HttpClientSettings;
+  /** Asked for HTTP credentials after a 401 */
+  credentialHelper?: HttpCredentialHelper;
   /**
    * The program the remote runs for the service (git's `--upload-pack` / `--receive-pack`,
    * `remote.<name>.uploadpack` / `receivepack`); connectors that run one (ssh, git://) use it
    */
   program?: string;
   signal?: AbortSignal;
-  /** HTTP: `http.followRedirects` ({@link httpSessionSettings}) */
-  followRedirects?: FollowRedirects;
   /** Dumb HTTP: whether an alternate of the scheme may be used ({@link httpSessionSettings}) */
   alternateAllowed?: (scheme: string) => boolean;
   /** HTTP: `$GIT_SMART_HTTP` (false: the dumb protocol) */
@@ -343,26 +345,18 @@ export interface RemoteSessionOptions {
 }
 
 /**
- * The HTTP settings a session takes from the configuration and the environment:
- * `http.followRedirects` (http.c: `initial` by default, `initial` or a boolean), which
+ * The dumb-HTTP settings a session takes from the configuration and the environment
+ * (`http.followRedirects` and the other `http.*` keys come with `httpSettings`): which
  * alternates a dumb fetch may use (http-walker's `is_transport_allowed(<scheme>, 0)`: as a
- * transport not from the user), and `$GIT_SMART_HTTP`. A `http.followRedirects` that is no
- * boolean reads as `initial` here (git dies on it, but only once an HTTP transport reads it).
+ * transport not from the user) and `$GIT_SMART_HTTP`.
  */
 export function httpSessionSettings(
   workingCopy: WorkingCopy,
-): Pick<RemoteSessionOptions, "followRedirects" | "alternateAllowed" | "smartHttp"> {
+): Pick<RemoteSessionOptions, "alternateAllowed" | "smartHttp"> {
   const config = RemoteConfigStore.from(workingCopy);
   const environment = hostEnvironmentOf(workingCopy);
-  const value = config.value("http.followRedirects");
-  let followRedirects: FollowRedirects = "initial";
-  if (value !== undefined && value !== "initial") {
-    const bool = parseGitBool(value);
-    if (bool !== undefined) followRedirects = bool ? "always" : "never";
-  }
   const notFromUser = { ...environment, protocolFromUser: false } as GitHostEnvironment;
   return {
-    followRedirects,
     alternateAllowed: (scheme) => isTransportAllowed(scheme, config, notFromUser),
     ...(environment?.smartHttp === false ? { smartHttp: false } : {}),
   };
@@ -383,6 +377,8 @@ function connectRequest(
     ...(options.headers ? { headers: options.headers } : {}),
     ...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
     ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.httpSettings ? { http: options.httpSettings(remote.url) } : {}),
+    ...(options.credentialHelper ? { credentialHelper: options.credentialHelper } : {}),
   };
 }
 
@@ -446,7 +442,6 @@ export async function withRemoteUploadPack<T>(
   return withRemoteSession(remote, "git-upload-pack", options, async (session, request) => {
     const connection = await openUploadPack(session, request, {
       ...(options.gzipRequests !== undefined ? { gzipRequests: options.gzipRequests } : {}),
-      ...(options.followRedirects ? { followRedirects: options.followRedirects } : {}),
       ...(options.alternateAllowed ? { alternateAllowed: options.alternateAllowed } : {}),
       ...(options.smartHttp === false ? { smartHttp: false } : {}),
     });
