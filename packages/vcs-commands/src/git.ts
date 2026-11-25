@@ -18,6 +18,7 @@ import {
   BisectStateCommand,
   BisectTermsCommand,
   BlameCommand,
+  CatFileCommand,
   CheckMailmapCommand,
   CheckoutCommand,
   CherryCommand,
@@ -932,6 +933,20 @@ export class Git implements Disposable {
   checkMailmap(): CheckMailmapCommand {
     this.checkClosed();
     return new CheckMailmapCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a CatFileCommand (`git cat-file`): an object's type, size or content, or many
+   * objects named on stdin (`--batch`, `--batch-check`, `--batch-command`).
+   *
+   * @example
+   * ```typescript
+   * const { stdout } = await git.catFile().setBatch("info").setStdin("HEAD\n").callOutput();
+   * ```
+   */
+  catFile(): CatFileCommand {
+    this.checkClosed();
+    return new CatFileCommand(this._workingCopy);
   }
 
   /**

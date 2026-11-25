@@ -186,6 +186,12 @@ export class RevisionResolver {
    * against which `<rev>:./<path>`, `<rev>:../<path>` and `:./<path>` are read
    */
   cwdPrefix = "";
+  /**
+   * The mode of the tree or index entry the last {@link resolve} read a path from (git's
+   * `GET_OID_RECORD_PATH` `object_context.mode`: `<rev>:<path>`, `:<path>`); undefined for a
+   * name that read no entry (`S_IFINVALID`), `<rev>:` (the tree itself) included
+   */
+  lastMode: number | undefined;
   private config?: RemoteConfigStore;
   private disambiguateChecked = false;
   /** Refs read while resolving one revision (`HEAD~3` reads HEAD once) */
@@ -213,6 +219,7 @@ export class RevisionResolver {
    */
   async resolve(name: string, options: ResolveOptions = {}): Promise<ObjectId | undefined> {
     this.checkDisambiguateConfig(name);
+    this.lastMode = undefined;
     const direct = await this.oid1(name, options);
     if (direct !== undefined) return direct;
     if (name.startsWith(":")) {
@@ -913,10 +920,16 @@ export class RevisionResolver {
       if (name === "") return undefined;
       const entry = await safe(() => this.sources.trees.getEntry(current, name));
       if (!entry) return undefined;
-      if (slash < 0) return entry.id;
+      if (slash < 0) {
+        this.lastMode = entry.mode;
+        return entry.id;
+      }
       if ((entry.mode & 0o170000) !== 0o040000) return undefined;
       rest = rest.slice(slash + 1);
-      if (rest === "") return entry.id;
+      if (rest === "") {
+        this.lastMode = entry.mode;
+        return entry.id;
+      }
       current = entry.id;
     }
   }
@@ -935,6 +948,7 @@ export class RevisionResolver {
     }
     if (!staging) return undefined;
     const entry = await staging.getEntry(path, stage as 0 | 1 | 2 | 3);
+    if (entry) this.lastMode = entry.mode;
     return entry?.objectId;
   }
 
