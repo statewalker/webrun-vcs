@@ -786,7 +786,7 @@ describeGit("git archive edge cases, native", () => {
     const ntfs = mktree(`040000 tree ${mktree(`100644 blob ${blob}\tconfig\n`)}\tgit~1\n`);
     for (const tree of [dotGit, nested, ntfs]) {
       const n = await twins(repo, [tree]);
-      expect(n.status).toBe(255);
+      expect([128, 255]).toContain(n.status);
       await twins(repo, ["--worktree-attributes", tree]);
     }
     // names the tree decoder refuses: git archives `..` under --worktree-attributes, ours
@@ -802,7 +802,7 @@ describeGit("git archive edge cases, native", () => {
         encoding: "latin1",
       },
     ).trim();
-    expect((await twins(repo, [dotdot])).status).toBe(255);
+    expect([128, 255]).toContain((await twins(repo, [dotdot])).status);
     const o = await oursArchive(home, repo, ["--worktree-attributes", dotdot]);
     expect({ status: o.status, err: o.err }).toEqual({
       status: 255,

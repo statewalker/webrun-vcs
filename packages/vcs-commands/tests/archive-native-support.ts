@@ -16,7 +16,7 @@ import {
 } from "@statewalker/vcs-utils-node/files";
 import { Git, GitApiError, getTarCommitId } from "../src/index.js";
 import { openOurs } from "./merge-native-helpers.js";
-import { gitEnv } from "./shortlog-native-support.js";
+import { gitEnv, nativeCompatibility } from "./shortlog-native-support.js";
 
 export type ArchiveOutcome = { status: number; out: Buffer; err: string };
 
@@ -98,7 +98,8 @@ export async function oursArchive(
   const cmd = git
     .archive()
     .setFilterRunner(shellFilter)
-    .setLocalTimezone(() => 0);
+    .setLocalTimezone(() => 0)
+    .setCompatibility(nativeCompatibility());
   if (options.cwd) cmd.setCurrentDirectory(options.cwd);
   if (options.filterDrivers) cmd.setFilterDrivers(options.filterDrivers);
   let list = false;

@@ -128,6 +128,7 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
   private userUmask = 0o022;
   private localTzOffset?: (time: number) => number;
   private filterDrivers?: FilterDriverRegistry;
+  private compatibility: "2.43" | "2.56" = "2.56";
   private readonly messages: string[] = [];
 
   /** The tree-ish archived (a commit, a tag, a tree). */
@@ -276,6 +277,17 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
   setLocalTimezone(offset: (time: number) => number): this {
     this.checkCallable();
     this.localTzOffset = offset;
+    return this;
+  }
+
+  /**
+   * The git version whose behaviour to follow (default 2.56): 2.43 ends a tree holding a
+   * path `verify_path` refuses with the `error:` line alone and exit 255, 2.5x adds
+   * `fatal: failed to unpack tree object <tree>` (exit 128).
+   */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
     return this;
   }
 
@@ -480,7 +492,13 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
       // the tree is unpacked into an index first: verify_path refuses what git refuses
       const refusal = await treePathRefusal(this.trees, tree, worktreePathRules(this._workingCopy));
       if (refusal instanceof InvalidPathError) {
-        throw new GitApiError(refusal.message, { exitCode: 255 });
+        // 2.43: unpack_trees' error, then write_archive's -1 (255); 2.5x dies after it
+        if (this.compatibility === "2.43") {
+          throw new GitApiError(refusal.message, { exitCode: 255 });
+        }
+        throw new GitApiError(`${refusal.message}\nfatal: failed to unpack tree object ${tree}`, {
+          exitCode: 128,
+        });
       }
       if (refusal) throw refusal;
     }
