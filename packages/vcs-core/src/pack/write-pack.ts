@@ -325,7 +325,7 @@ export async function* writePack(
 
   // Output goes through one buffer, hashed and yielded when full (or at a streamed object):
   // entries are mostly small, and a chunk (and a hash update) per header costs more than they do.
-  const hasher = format.createHasher();
+  const hasher = format.createUnsafeHasher();
   let offset = 0;
   let crc: CRC32 | undefined;
   let buf = new Uint8Array(OUT_CHUNK);
