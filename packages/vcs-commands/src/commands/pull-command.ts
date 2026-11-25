@@ -805,6 +805,8 @@ export class PullCommand extends GuardedTransportCommand<PullResult> {
     // the guarded transports: credentials and headers only where this pull's rule allows
     update.setTransports(this.getTransports());
     if (this.timeout !== undefined) update.setTimeout(this.timeout);
+    if (this.credentialHelper) update.setCredentialHelper(this.credentialHelper);
+    if (this.warningCallback) update.setWarningCallback(this.warningCallback);
     try {
       return await update.call();
     } catch (error) {
