@@ -4280,6 +4280,49 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
+   * The sequence editor program git would launch (`git_sequence_editor`):
+   * `$GIT_SEQUENCE_EDITOR`, `sequence.editor`, then git's editor (`$GIT_EDITOR`,
+   * `core.editor`, `$VISUAL` unless the terminal is dumb, `$EDITOR`); undefined where only the
+   * build's default editor is left (a library never starts an interactive `vi` on its own).
+   */
+  private sequenceEditorProgram(): string | undefined {
+    const programs = hostEnvironmentOf(this.workingCopy)?.programVariables ?? {};
+    const config = RemoteConfigStore.from(this.workingCopy);
+    const sequence = programs.GIT_SEQUENCE_EDITOR ?? config.value("sequence.editor");
+    if (sequence !== undefined) return sequence;
+    const dumb = programs.TERM === undefined || programs.TERM === "dumb";
+    let editor = programs.GIT_EDITOR ?? config.value("core.editor");
+    if (editor === undefined && !dumb) editor = programs.VISUAL;
+    return editor ?? programs.EDITOR;
+  }
+
+  /**
+   * launch_sequence_editor without an interactive handler's `editTodo`: the program of
+   * {@link sequenceEditorProgram} edits `rebase-merge/git-rebase-todo` (already holding
+   * `text`) through the host's hook runner, as git's `launch_specified_editor` runs it (`:`
+   * edits nothing); the file's new content, or undefined when no program runs (no program,
+   * no runner). A failing program throws git's "there was a problem with the editor".
+   */
+  private async runSequenceEditorProgram(text: string): Promise<string | undefined> {
+    const program = this.sequenceEditorProgram();
+    if (program === undefined || program === ":") return undefined;
+    const todo = `${DIR}/git-rebase-todo`;
+    const state = new OperationState(this.workingCopy.checkout, this.refsStore);
+    await state.write(todo, text);
+    const path = await this.hooks.gitPath(todo);
+    const run = await this.hooks.runShellCommand("sequence-editor", program, [path]);
+    if (!run) return undefined;
+    // launch_specified_editor's error (2.43's wording, capitalised with a period)
+    if (run.exitCode !== 0)
+      throw new EditorProgramFailure(
+        (this.compatibility ?? this.hooks.compatibility) === "2.43"
+          ? `error: There was a problem with the editor '${program}'.`
+          : `error: there was a problem with the editor '${program}'`,
+      );
+    return (await state.read(todo)) ?? "";
+  }
+
+  /**
    * launch_sequence_editor: the interactive handler edits the list (editTodo, then the
    * steps of prepareSteps); without one the list is kept.
    */
@@ -4291,6 +4334,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     const handler = this.interactiveHandler;
     let out = text;
     if (handler?.editTodo) out = await handler.editTodo(out);
+    else out = (await this.runSequenceEditorProgram(out)) ?? out;
     if (handler?.prepareSteps) {
       const comment = commentPrefixOf(this.workingCopy);
       const items = parseTodo(stripspace(out, comment), comment).items.filter(
@@ -5015,6 +5059,7 @@ function editorFailure(error: unknown): Extract<PickOutcome, { kind: "conflicts"
 
 /** launch_sequence_editor failing (the interactive handler's editTodo or prepareSteps threw). */
 function sequenceEditorFailure(error: unknown): string {
+  if (error instanceof EditorProgramFailure) return error.message;
   return error instanceof HandlerFailure
     ? editorProblem(error.editor, error.reason)
     : editorProblem("editTodo", error);
@@ -5028,6 +5073,9 @@ function editorProblem(editor: string, error: unknown): string {
   const reason = error instanceof Error ? error.message : String(error);
   return `error: there was a problem with the editor '${editor}': ${reason}`;
 }
+
+/** The sequence editor program failed: git's line as its message. */
+class EditorProgramFailure extends Error {}
 
 /** An interactive handler's method that threw, named. */
 class HandlerFailure extends Error {

@@ -462,7 +462,8 @@ export class StatusCommand extends GitCommand<Status> {
   /**
    * Whether the stats refreshed while comparing (and a changed untracked cache) are written
    * back to the index (default true, as `git status`). A caller holding the index with
-   * edits of its own (a commit's prepared index) passes false.
+   * edits of its own (a commit's prepared index) passes false. The environment's
+   * `optionalLocks: false` (`GIT_OPTIONAL_LOCKS=0`) turns the write off too.
    */
   setWriteIndex(write: boolean): this {
     this.checkCallable();
@@ -1102,8 +1103,9 @@ export class StatusCommand extends GitCommand<Status> {
     }
 
     // as git status: the refreshed stats written back when the index is free and unchanged,
-    // with the untracked cache when it changed
-    if (this.writeIndex) {
+    // with the untracked cache when it changed; never under `GIT_OPTIONAL_LOCKS=0` (`git
+    // --no-optional-locks`: cmd_status takes the index lock only when use_optional_locks())
+    if (this.writeIndex && hostEnvironmentOf(this.workingCopy)?.optionalLocks !== false) {
       await refreshIndexStats(
         this.staging,
         refresh,
