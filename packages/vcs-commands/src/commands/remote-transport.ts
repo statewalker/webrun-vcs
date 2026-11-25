@@ -338,6 +338,28 @@ export interface RemoteSessionOptions {
    */
   program?: string;
   signal?: AbortSignal;
+  /** Dumb HTTP: whether an alternate of the scheme may be used ({@link httpSessionSettings}) */
+  alternateAllowed?: (scheme: string) => boolean;
+  /** HTTP: `$GIT_SMART_HTTP` (false: the dumb protocol) */
+  smartHttp?: boolean;
+}
+
+/**
+ * The dumb-HTTP settings a session takes from the configuration and the environment
+ * (`http.followRedirects` and the other `http.*` keys come with `httpSettings`): which
+ * alternates a dumb fetch may use (http-walker's `is_transport_allowed(<scheme>, 0)`: as a
+ * transport not from the user) and `$GIT_SMART_HTTP`.
+ */
+export function httpSessionSettings(
+  workingCopy: WorkingCopy,
+): Pick<RemoteSessionOptions, "alternateAllowed" | "smartHttp"> {
+  const config = RemoteConfigStore.from(workingCopy);
+  const environment = hostEnvironmentOf(workingCopy);
+  const notFromUser = { ...environment, protocolFromUser: false } as GitHostEnvironment;
+  return {
+    alternateAllowed: (scheme) => isTransportAllowed(scheme, config, notFromUser),
+    ...(environment?.smartHttp === false ? { smartHttp: false } : {}),
+  };
 }
 
 function connectRequest(
@@ -420,6 +442,8 @@ export async function withRemoteUploadPack<T>(
   return withRemoteSession(remote, "git-upload-pack", options, async (session, request) => {
     const connection = await openUploadPack(session, request, {
       ...(options.gzipRequests !== undefined ? { gzipRequests: options.gzipRequests } : {}),
+      ...(options.alternateAllowed ? { alternateAllowed: options.alternateAllowed } : {}),
+      ...(options.smartHttp === false ? { smartHttp: false } : {}),
     });
     try {
       return await run(connection);

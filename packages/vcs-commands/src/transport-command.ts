@@ -11,6 +11,7 @@ import { hostEnvironmentOf } from "./commands/git-ident.js";
 import { httpClientSettingsOf } from "./commands/http-config.js";
 import { createPromisorFetcher, promisorOf } from "./commands/promisor-remote.js";
 import {
+  httpSessionSettings,
   openResolvedRemote,
   type PreparedRemote,
   prepareRemote,
@@ -302,6 +303,7 @@ export abstract class TransportCommand<T> extends GitCommand<T> {
       protocolVersion: protocolVersionOf(RemoteConfigStore.from(this._workingCopy)),
       httpSettings: (url) => this.httpSettingsFor(url),
       ...(this.credentialHelper ? { credentialHelper: this.credentialHelper } : {}),
+      ...httpSessionSettings(this._workingCopy),
     };
   }
 

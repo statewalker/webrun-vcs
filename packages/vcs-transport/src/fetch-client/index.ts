@@ -5,6 +5,7 @@
 
 export * from "./completeness.js";
 export * from "./connection.js";
+export * from "./dumb-http.js";
 export * from "./fetch-checks.js";
 export * from "./fetch-display.js";
 export * from "./fetch-head.js";
