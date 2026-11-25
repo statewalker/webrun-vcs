@@ -31,11 +31,12 @@ import {
   type FetchPackRequest,
   fetchPack,
   type NegotiationStats,
+  negotiateUsingFetch,
   type ServerShallowUpdate,
   serverOptionLines,
   serverSupportsFilter,
 } from "./fetch-pack.js";
-import type { NegotiatorSource } from "./negotiator.js";
+import type { NegotiationAlgorithm, NegotiatorSource } from "./negotiator.js";
 
 /** git's default `transfer.unpackLimit`: a fetched pack of this many objects is kept as is. */
 const DEFAULT_UNPACK_LIMIT = 100;
@@ -168,6 +169,13 @@ export interface FetchClientOptions {
    * again (under `filter`, what it keeps), as when the repository was cloned
    */
   refetch?: boolean;
+  /** `fetch.negotiationAlgorithm`: which negotiator chooses the haves (default `consecutive`) */
+  negotiationAlgorithm?: NegotiationAlgorithm;
+  /**
+   * `--negotiation-tip`: the only local commits the negotiator walks from (fetch-pack's
+   * mark_tips), in place of every local ref; what is complete here still follows every ref
+   */
+  negotiationTips?: readonly string[];
   /** Warnings fetch-pack prints (`warning: ...`) */
   onWarning?: (line: string) => void;
   /** Allow every update to be a non-fast-forward (`--force`) */
@@ -523,6 +531,8 @@ export async function fetchFromConnection(
   const deepenChecked = new Set<string>();
   const packMessages: string[] = [];
   let packFetched = false;
+  /** The commits git has parsed (the skipping negotiator's dates), across fetch-pack rounds */
+  let parsedCommits: Set<string> | undefined;
   const runFetchPack = async (wants: string[], request: Partial<FetchPackRequest>) => {
     if (connection.dumb) {
       // remote-curl's fetch_dumb: http-walker over the remote's files, objects stored as they
@@ -583,11 +593,21 @@ export async function fetchFromConnection(
       received && links ? new ReceivedLinks(grafts, formatOf(repository).rawLength) : undefined;
     // a promisor pack's outgoing links (index-pack --promisor's repack_local_links)
     const outgoing = filter ? new Set<string>() : undefined;
+    if (options.negotiationAlgorithm === "skipping" && !parsedCommits) {
+      parsedCommits = await parsedBeforeNegotiation(repository, remoteRefs, localTips, {
+        refetch: !!options.refetch,
+        deepen: deepening,
+      });
+    }
     const fetched = await fetchPack(connection, source, {
       wants,
       ...(repository.objectFormat ? { objectFormat: repository.objectFormat } : {}),
-      localTips: options.refetch ? [] : localTips,
+      localTips: options.refetch ? [] : (options.negotiationTips ?? localTips),
       knownCommon,
+      ...(options.negotiationAlgorithm
+        ? { negotiationAlgorithm: options.negotiationAlgorithm }
+        : {}),
+      ...(parsedCommits ? { parsedCommits } : {}),
       shallow,
       filter: options.filter,
       ...(options.onWarning ? { onWarning: options.onWarning } : {}),
@@ -1216,6 +1236,109 @@ export async function fetchPromisedObjects(
     if (outgoing.size > 0) await repository.repackLocalLinks?.(outgoing);
   }
   return { imported, packObjects: fetched.packObjects, packBytes: fetched.packBytes };
+}
+
+/** What {@link negotiateOnly} needs. */
+export interface NegotiateOnlyOptions {
+  /** The local history the negotiator walks */
+  repository: RepositoryFacade;
+  /** The `--negotiation-tip` commits */
+  tips: readonly string[];
+  negotiationAlgorithm?: NegotiationAlgorithm;
+  /** The local shallow commits */
+  shallow?: Iterable<string>;
+  serverOptions?: readonly string[];
+  sessionId?: string;
+}
+
+/**
+ * `git fetch --negotiate-only --negotiation-tip=<tip>...`: negotiates over `connection`
+ * (protocol v2 with `wait-for-done`, else {@link NegotiateOnlyUnsupportedError}) and returns
+ * the commits the server acknowledged, fetching nothing and writing nothing.
+ *
+ * @example
+ * ```typescript
+ * const common = await negotiateOnly(connection, { repository, tips: [headId] });
+ * ```
+ */
+export async function negotiateOnly(
+  connection: UploadPackConnection,
+  options: NegotiateOnlyOptions,
+): Promise<string[]> {
+  const { repository } = options;
+  return negotiateUsingFetch(connection, negotiatorSource(repository), {
+    tips: options.tips,
+    ...(options.negotiationAlgorithm ? { negotiationAlgorithm: options.negotiationAlgorithm } : {}),
+    ...(options.shallow ? { shallow: options.shallow } : {}),
+    ...(repository.objectFormat ? { objectFormat: repository.objectFormat } : {}),
+    ...(options.serverOptions?.length ? { serverOptions: options.serverOptions } : {}),
+    ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
+  });
+}
+
+/**
+ * The commits git has parsed when fetch-pack's negotiation starts (mark_complete_and_common_ref
+ * and mark_tips): the remote refs here that are commits, the commits the local refs peel to,
+ * and the parents of every commit `mark_recent_complete_commits` pops (reachable from the
+ * local refs, newest first, while not older than the newest remote ref here). None of it for
+ * `--refetch`, and only the remote refs for a deepening fetch.
+ */
+async function parsedBeforeNegotiation(
+  repository: RepositoryFacade,
+  remoteRefs: readonly RemoteRef[],
+  localTips: Iterable<string>,
+  options: { refetch: boolean; deepen: boolean },
+): Promise<Set<string>> {
+  const parsed = new Set<string>();
+  if (options.refetch) return parsed;
+  const info = async (oid: string) =>
+    (await repository.has(oid)) ? await repository.getCommitInfo?.(oid) : undefined;
+  let cutoff = 0;
+  for (const ref of remoteRefs) {
+    if (!ref.oid || parsed.has(ref.oid)) continue;
+    const commit = await info(ref.oid);
+    if (!commit) continue;
+    parsed.add(ref.oid);
+    if (!cutoff || cutoff < commit.time) cutoff = commit.time;
+  }
+  if (options.deepen) return parsed;
+  const queue: { oid: string; time: number }[] = [];
+  const queued = new Set<string>();
+  for (const tip of localTips) {
+    let id = tip;
+    for (let i = 0; i < 16; i++) {
+      const target = await repository.peelTag?.(id);
+      if (!target || target === id) break;
+      id = target;
+    }
+    const commit = await info(id);
+    if (!commit) continue;
+    parsed.add(id);
+    if (!queued.has(id)) {
+      queued.add(id);
+      queue.push({ oid: id, time: commit.time });
+    }
+  }
+  if (!cutoff) return parsed;
+  while (queue.length > 0) {
+    let best = 0;
+    for (let i = 1; i < queue.length; i++) {
+      if ((queue[i] as { time: number }).time > (queue[best] as { time: number }).time) best = i;
+    }
+    const top = queue[best] as { oid: string; time: number };
+    if (top.time < cutoff) break;
+    queue.splice(best, 1);
+    for (const parent of (await info(top.oid))?.parents ?? []) {
+      const commit = await info(parent);
+      if (!commit) continue;
+      parsed.add(parent);
+      if (!queued.has(parent)) {
+        queued.add(parent);
+        queue.push({ oid: parent, time: commit.time });
+      }
+    }
+  }
+  return parsed;
 }
 
 /** The local history as the negotiator reads it. */

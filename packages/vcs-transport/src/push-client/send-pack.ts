@@ -125,6 +125,16 @@ export interface PushClientOptions {
    * whole push, which then throws {@link PushRefusedByHookError}
    */
   prePush?: (updates: readonly PushRefUpdate[]) => Promise<boolean>;
+  /**
+   * `push.negotiate`: called with the new id of every ref the push matched (send-pack's
+   * get_commons_through_negotiation, git's child `git fetch --negotiate-only
+   * --negotiation-tip=<id>... <url>`), it returns the commits the remote has in common; the
+   * pack then leaves out their history. Its `warnings` come first in the push's; failing (no
+   * `commons`), git adds `push negotiation failed; proceeding anyway with push`
+   */
+  negotiate?: (
+    tips: readonly string[],
+  ) => Promise<{ commons?: readonly string[]; warnings?: readonly string[] }>;
 }
 
 /**
@@ -386,6 +396,18 @@ async function sendPack(
   // send_pack: a push certificate for a server that takes one (its nonce advertised as
   // `push-cert=<nonce>`), else a refusal (always) or a warning (if-asked)
   const warnings: string[] = [];
+  // push.negotiate: the commits the remote has, through a fetch negotiation of its own
+  const negotiated: string[] = [];
+  const negotiationTips = updates.map((u) => u.newOid).filter((oid) => !isNullId(oid));
+  if (options.negotiate && negotiationTips.length > 0) {
+    const answer = await options.negotiate(negotiationTips).catch((error: unknown) => ({
+      warnings: [`error: ${error instanceof Error ? error.message : String(error)}`],
+      commons: undefined,
+    }));
+    warnings.push(...(answer.warnings ?? []));
+    if (answer.commons) negotiated.push(...answer.commons);
+    else warnings.push("warning: push negotiation failed; proceeding anyway with push");
+  }
   const pushCert = options.signed !== undefined && caps.has("push-cert");
   if (options.signed && !pushCert) {
     if (options.signed === "always") {
@@ -482,7 +504,7 @@ async function sendPack(
   // the edges: every advertised tip (and `.have`) here, as send-pack feeds `^old` to
   // pack-objects; the receiver has their whole history
   const haves = new Set<string>();
-  for (const oid of [...remoteRefs.map((r) => r.oid), ...connection.extraHaves]) {
+  for (const oid of [...remoteRefs.map((r) => r.oid), ...connection.extraHaves, ...negotiated]) {
     if (oid && !isNullId(oid) && !haves.has(oid) && (await repository.has(oid))) {
       haves.add(oid);
     }
