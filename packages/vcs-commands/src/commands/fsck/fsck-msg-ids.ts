@@ -23,9 +23,8 @@ export type FsckMsgLevel = "fatal" | "error" | "warn" | "info" | "ignore";
 export type FsckSeverity = "error" | "warning" | "ignore";
 
 /**
- * Every object message id git knows, with its default level, in git's order. The ref ids git
- * 2.45+ added for `git refs verify` (`badRefContent`, ...) are not here: fsck's ref database
- * checks are not done.
+ * Every message id git knows, with its default level: the object ids in git's order, then
+ * the ref ids `git refs verify` reports (git 2.47+: `badRefContent`, ...; `RefsVerifyCommand`).
  */
 export const FSCK_MSG_IDS = {
   // fatal errors
@@ -93,6 +92,23 @@ export const FSCK_MSG_IDS = {
   missingTaggerEntry: "info",
   // ignored unless asked for
   extraHeaderEntry: "ignore",
+  // the ref database's (`git refs verify`)
+  badHeadTarget: "error",
+  badPackedRefEntry: "error",
+  badPackedRefHeader: "error",
+  badReferentName: "error",
+  badRefContent: "error",
+  badRefFiletype: "error",
+  badRefName: "error",
+  badRefOid: "error",
+  packedRefEntryNotTerminated: "error",
+  packedRefUnsorted: "error",
+  badReftableTableName: "warn",
+  emptyPackedRefsFile: "info",
+  refMissingNewline: "info",
+  symlinkRef: "info",
+  symrefTargetIsNotARef: "info",
+  trailingRefContent: "info",
 } as const satisfies Record<string, FsckMsgLevel>;
 
 /** A message id, in git's camel case. */

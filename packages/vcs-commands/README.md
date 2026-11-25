@@ -71,7 +71,7 @@ For a Git-compatible on-disk repository, build the `WorkingCopy` from the file-b
 | Inspection | `diff()`, `describe()` |
 | Remotes | `fetch()`, `push()`, `pull()`, `clone()`, `lsRemote()`, `remoteAdd()`, `remoteRemove()`, `remoteList()`, `remoteSetUrl()` |
 | Stash | `stashCreate()`, `stashApply()`, `stashDrop()`, `stashList()` |
-| Maintenance | `gc()`, `packRefs()`, `fsck()`, `verifyPack()` |
+| Maintenance | `gc()`, `packRefs()`, `fsck()`, `verifyPack()`, `refsMigrate()` (files ⇄ reftable), `refsVerify()`, `refsExists()`, `refsList()`, `refsOptimize()` |
 | Static | `Git.fromWorkingCopy(wc)`, `Git.init()` |
 | Components | `workingCopy`, `history`, `checkoutState`, `worktree` |
 

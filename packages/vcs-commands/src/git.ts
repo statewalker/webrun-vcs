@@ -69,6 +69,9 @@ import {
   ReadTreeCommand,
   RebaseCommand,
   ReflogCommand,
+  RefsExistsCommand,
+  RefsMigrateCommand,
+  RefsVerifyCommand,
   RemoteAddCommand,
   RemoteGetUrlCommand,
   RemoteListCommand,
@@ -432,6 +435,71 @@ export class Git implements Disposable {
   showRef(): ShowRefCommand {
     this.checkClosed();
     return new ShowRefCommand(this._workingCopy);
+  }
+
+  /**
+   * `git refs migrate`: converts the repository's ref storage (`files` or `reftable`), its
+   * reflogs too unless `setNoReflog`; open the repository again afterwards.
+   *
+   * @example
+   * ```typescript
+   * const { exitCode, stderr } = await git.refsMigrate().setRefFormat("reftable").call();
+   * ```
+   */
+  refsMigrate(): RefsMigrateCommand {
+    this.checkClosed();
+    return new RefsMigrateCommand(this._workingCopy);
+  }
+
+  /**
+   * `git refs verify`: checks the ref database (loose refs, packed-refs, reftables), git's
+   * findings on stderr.
+   *
+   * @example
+   * ```typescript
+   * const { exitCode, stderr } = await git.refsVerify().setStrict(true).call();
+   * ```
+   */
+  refsVerify(): RefsVerifyCommand {
+    this.checkClosed();
+    return new RefsVerifyCommand(this._workingCopy);
+  }
+
+  /**
+   * `git refs exists <ref>`: exit 0 when the ref exists, 2 when it does not.
+   *
+   * @example
+   * ```typescript
+   * const { exitCode } = await git.refsExists().setRef("refs/heads/main").call();
+   * ```
+   */
+  refsExists(): RefsExistsCommand {
+    this.checkClosed();
+    return new RefsExistsCommand(this._workingCopy);
+  }
+
+  /**
+   * `git refs list`: git's front end of `git for-each-ref`, the same command.
+   *
+   * @example
+   * ```typescript
+   * const { output } = await git.refsList().setFormat("%(refname)").call();
+   * ```
+   */
+  refsList(): ForEachRefCommand {
+    return this.forEachRef();
+  }
+
+  /**
+   * `git refs optimize`: git's front end of `git pack-refs` (a reftable stack is compacted).
+   *
+   * @example
+   * ```typescript
+   * await git.refsOptimize().setAll(true).call();
+   * ```
+   */
+  refsOptimize(): PackRefsCommand {
+    return this.packRefs();
   }
 
   /**

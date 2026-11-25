@@ -894,6 +894,48 @@ export async function setConfigMultivarInFile(
 }
 
 /**
+ * Several `repo_config_set_gently` calls on one file under one lock: each edit is applied to
+ * the text the previous one left (as git's successive sets rewrite it), and the result is
+ * renamed over the file once, so a reader sees the file before every edit or after all of
+ * them (`git refs migrate` switches `extensions.refStorage` and the format version this way).
+ * An unset of a missing key is skipped (git's `_gently`); any other refusal leaves the file
+ * untouched.
+ *
+ * @example
+ * ```typescript
+ * await editConfigFile(location, [
+ *   { key: "extensions.refstorage", value: "reftable" },
+ *   { key: "core.repositoryformatversion", value: "1" },
+ * ]);
+ * ```
+ */
+export async function editConfigFile(
+  location: ConfigFileLocation,
+  edits: readonly { key: string; value: string | undefined }[],
+): Promise<ConfigWriteOutcome> {
+  const lock = await lockConfigFile(location, "set");
+  if ("error" in lock) return { status: lock.status, stderr: [lock.error] };
+  return withLock(lock, async () => {
+    let text = lock.contents;
+    const stderr: string[] = [];
+    for (const { key, value } of edits) {
+      const result = setConfigMultivarText(text, location.name, key, value);
+      stderr.push(...result.stderr);
+      // 5: nothing to unset (git's CONFIG_NOTHING_SET, ignored by the gentle unset)
+      if (result.status === 5 && value === undefined) continue;
+      if (result.status !== 0 || result.text === undefined) {
+        await lock.rollback();
+        return { status: result.status, stderr };
+      }
+      text = result.text;
+    }
+    const failed = await lock.commit(text ?? "");
+    if (failed) return { status: 4, stderr: [...stderr, failed] };
+    return { status: 0, stderr };
+  });
+}
+
+/**
  * `repo_config_rename_section_in_file` (`newName` undefined: remove the section) under the
  * file's lock (see {@link renameConfigSectionText}). `count` is git's return: the headers
  * that named the section (0: git's `no such section`), -1 where git refuses.
