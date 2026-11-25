@@ -178,7 +178,8 @@ async function filesReflogNames(files: FilesApi, gitDir: string): Promise<string
     const names = (await listNames(files, joinPath(gitDir, dir))).sort(compareRefNames);
     for (const name of names) {
       const path = `${dir}/${name}`;
-      const kind = (await files.stats(joinPath(gitDir, path)))?.kind;
+      const kind = await kindOf(files, joinPath(gitDir, path));
+      if (kind === "symlink") throw new Error(`cannot migrate the symbolic link '${path}'`);
       if (kind === "directory") await walk(path, `${prefix}${name}/`);
       else if (kind === "file" && isValidRefName(name, { allowOneLevel: true })) {
         out.push(`${prefix}${name}`);
@@ -244,6 +245,7 @@ interface SourceContent {
 async function readLooseRefFile(
   files: FilesApi,
   path: string,
+  refName: string,
   hexLength: number,
 ): Promise<{ objectId?: string; target?: string } | undefined> {
   const posix = files as PosixFilesApi;
@@ -268,6 +270,10 @@ async function readLooseRefFile(
       .slice(4)
       .replace(/^[ \t\n\v\f\r]+/, "")
       .replace(/[ \t\n\v\f\r]+$/, "");
+    // refs_resolve_ref_unsafe: a target failing check_refname_format is a broken ref
+    if (!isValidRefName(target, { allowOneLevel: true })) {
+      throw new Error(`cannot migrate the broken ref '${refName}'`);
+    }
     return { target };
   }
   const id = text.slice(0, hexLength);
@@ -275,12 +281,9 @@ async function readLooseRefFile(
   const broken =
     !new RegExp(`^[0-9a-fA-F]{${hexLength}}$`).test(id) ||
     (next !== undefined && !/[ \t\n\v\f\r]/.test(next));
-  if (broken) throw new Error(`cannot migrate the broken ref '${shownRef(path)}'`);
+  if (broken) throw new Error(`cannot migrate the broken ref '${refName}'`);
   return { objectId: id.toLowerCase() };
 }
-
-/** A ref file's path as its ref name (its path below the git directory). */
-const shownRef = (path: string) => path.replace(/^.*?\/(refs\/|(?=[A-Z_-]+$))/, "$1");
 
 /** `a/b/../c` as `a/c`; undefined when it climbs above the root. */
 function normalizeRelative(path: string): string | undefined {
@@ -315,7 +318,15 @@ async function readFilesSource(
     if (name !== "HEAD" && !isRootRefName(name)) continue;
     const path = joinPath(gitDir, name);
     if ((await kindOf(files, path)) === "directory") continue;
-    add(name, await readLooseRefFile(files, path, hex));
+    add(name, await readLooseRefFile(files, path, name, hex));
+  }
+  // `refs`, `packed-refs` and `logs` linked elsewhere (contrib/git-new-workdir) are refused:
+  // git follows such links, but the old storage is removed after the commit point, and
+  // removing a link here would leave what it shares behind
+  for (const name of ["refs", "packed-refs", "logs"]) {
+    if ((await kindOf(files, joinPath(gitDir, name))) === "symlink") {
+      throw new Error(`cannot migrate the symbolic link '${name}'`);
+    }
   }
   // the loose refs (every listing error stops the migration), then the packed ones they do
   // not shadow, in name order
@@ -331,7 +342,7 @@ async function readFilesSource(
       if (name.endsWith(".lock")) continue;
       const refName = `${prefix}${name}`;
       if (!isValidRefName(refName)) continue;
-      loose.set(refName, await readLooseRefFile(files, path, hex));
+      loose.set(refName, await readLooseRefFile(files, path, refName, hex));
     }
   };
   if ((await files.stats(joinPath(gitDir, "refs")))?.kind === "directory") {

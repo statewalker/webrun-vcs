@@ -555,6 +555,33 @@ describe.skipIf(!canMigrate)("git refs migrate", () => {
     expect(readdirSync(join(dir, ".git")).filter((n) => n.startsWith("ref_migration"))).toEqual([]);
   });
 
+  it("refuses what it would lose: a linked packed-refs (git-new-workdir) or a broken symref target", async () => {
+    const dir = repository("files");
+    commit(dir, "initial");
+    ok(dir, "pack-refs", "--all");
+    const git = join(dir, ".git");
+    cpSync(join(git, "packed-refs"), join(dir, "shared-packed-refs"));
+    rmSync(join(git, "packed-refs"));
+    symlinkSync("../shared-packed-refs", join(git, "packed-refs"));
+    const before = refListing(dir);
+    expect(await oursMigrate(dir, { format: "reftable" })).toEqual({
+      status: 255,
+      stdout: "",
+      stderr: "error: cannot migrate the symbolic link 'packed-refs'\n",
+    });
+    expect(refListing(dir)).toBe(before);
+
+    const other = repository("files");
+    commit(other, "initial");
+    writeFileSync(join(other, ".git", "refs", "heads", "x"), "ref: not a/valid..name\n");
+    expect(await oursMigrate(other, { format: "reftable" })).toEqual({
+      status: 255,
+      stdout: "",
+      stderr: "error: cannot migrate the broken ref 'refs/heads/x'\n",
+    });
+    expect(ok(other, "rev-parse", "--show-ref-format")).toBe("files\n");
+  });
+
   it('t1460-refs-migrate.sh: "multiple reftable blocks with multiple entries"', async () => {
     const dir = repository("files");
     commit(dir, "first");
