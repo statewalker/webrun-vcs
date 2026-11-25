@@ -11,7 +11,15 @@
  * and t5300-pack-object, each named by its source.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -277,6 +285,99 @@ describeGit("repack twins", () => {
       );
       expect(ours.loose.length).toBeGreaterThan(0);
     });
+
+    it("t7701-repack-unpack-unreachable 'do not bother loosening old objects'", async () => {
+      // one commit more than git's test: with nothing reachable git writes no pack but still
+      // removes the old ones, where ours leaves everything (statewalker/webrun-vcs#389)
+      const caseDir = newCase(root, "unpack-old-pack");
+      const r = initRepo(root, caseDir);
+      r.commit("base", { "a.txt": "a\n" });
+      const obj1 = r.blob("one\n");
+      const obj2 = r.blob("two\n");
+      const pack1 = r.git(["pack-objects", join(r.gitDir, "objects/pack/pack")], {
+        input: `${obj1}\n`,
+      });
+      const pack2 = r.git(["pack-objects", join(r.gitDir, "objects/pack/pack")], {
+        input: `${obj2}\n`,
+      });
+      r.git(["prune-packed"]);
+      expect(pack1).not.toEqual(pack2);
+      // test-tool chmtime =-86400
+      const day = Date.now() / 1000 - 86400;
+      utimesSync(join(r.gitDir, `objects/pack/pack-${pack2.trim()}.pack`), day, day);
+      const { ours } = await repackTwins(
+        caseDir,
+        ["-A", "-d", "--unpack-unreachable=1.hour.ago"],
+        (c) =>
+          c.setLoosenUnreachable(true).setDeleteRedundant(true).setUnpackUnreachable("1.hour.ago"),
+      );
+      expect(ours.loose).toContain(obj1);
+      expect(ours.loose).not.toContain(obj2);
+    });
+
+    it("t7701-repack-unpack-unreachable: a pack exactly as old as the cutoff is not loosened (git keeps mtime > expiration)", async () => {
+      const caseDir = newCase(root, "unpack-at-cutoff");
+      const r = initRepo(root, caseDir);
+      r.commit("base", { "a.txt": "a\n" });
+      const obj = r.blob("at the cutoff\n");
+      const pack = r.git(["pack-objects", join(r.gitDir, "objects/pack/pack")], {
+        input: `${obj}\n`,
+      });
+      r.git(["prune-packed"]);
+      const cutoff = Math.floor(Date.now() / 1000) - 3 * 86400;
+      // half a second past the cutoff: still the cutoff's second, which git compares
+      const at = cutoff + 0.5;
+      utimesSync(join(r.gitDir, `objects/pack/pack-${pack.trim()}.pack`), at, at);
+      const { ours } = await repackTwins(
+        caseDir,
+        ["-A", "-d", `--unpack-unreachable=@${cutoff}`],
+        (c) =>
+          c.setLoosenUnreachable(true).setDeleteRedundant(true).setUnpackUnreachable(`@${cutoff}`),
+      );
+      expect(ours.loose).not.toContain(obj);
+    });
+
+    /**
+     * statewalker/webrun-vcs#348: an old pack's unreachable tree that a recent unreachable
+     * commit names is loosened (pack-objects' recent_objects), loose or packed young.
+     */
+    for (const where of ["loose", "young pack"] as const) {
+      it(`t7701-repack-unpack-unreachable: an expired pack keeps what a recent unreachable commit (${where}) reaches`, async () => {
+        const { caseDir, r } = history(`unpack-recent-${where.replace(" ", "-")}`);
+        r.git(["repack", "-q", "-a", "-d"]);
+        // tree T (and its blob) only in a three-week-old pack
+        const blob = r.blob("only under T\n");
+        const tree = r.git(["mktree"], { input: `100644 blob ${blob}\tt.txt\n` }).trim();
+        const old = r
+          .git(["pack-objects", join(r.gitDir, "objects/pack/pack")], {
+            input: `${tree}\n${blob}\n`,
+          })
+          .trim();
+        r.git(["prune-packed"]);
+        const weeks3 = Date.now() / 1000 - 21 * 86400;
+        utimesSync(join(r.gitDir, `objects/pack/pack-${old}.pack`), weeks3, weeks3);
+        // commit C, unreachable, two days old, names T
+        const commit = r.git(["commit-tree", tree, "-p", "HEAD", "-m", "recent"]).trim();
+        const days2 = Date.now() / 1000 - 2 * 86400;
+        if (where === "loose") {
+          utimesSync(join(r.gitDir, "objects", commit.slice(0, 2), commit.slice(2)), days2, days2);
+        } else {
+          const young = r
+            .git(["pack-objects", join(r.gitDir, "objects/pack/pack")], { input: `${commit}\n` })
+            .trim();
+          r.git(["prune-packed"]);
+          utimesSync(join(r.gitDir, `objects/pack/pack-${young}.pack`), days2, days2);
+        }
+        const { ours } = await repackTwins(
+          caseDir,
+          ["-a", "-d", "--unpack-unreachable=2.weeks.ago"],
+          (c) => c.setAll(true).setDeleteRedundant(true).setUnpackUnreachable("2.weeks.ago"),
+        );
+        expect(ours.loose).toContain(tree);
+        expect(ours.loose).toContain(blob);
+        expect(ours.loose).toContain(commit);
+      });
+    }
 
     it("t7703-repack-geometric: --geometric=0 is no geometric repack", async () => {
       const { caseDir, r } = history("geo-zero");
