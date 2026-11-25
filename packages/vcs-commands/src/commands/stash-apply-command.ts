@@ -587,6 +587,8 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
       await editor.finish();
       await this.staging.write();
       const warnings = await this.finishSparse(sparse, worktree, writing);
+      // do_apply_stash: rerere on the conflicts, before the untracked files come back
+      const rerereOutput = await this.rerere();
       await this.writeUntracked(untrackedPlan, worktree, stashId, trust.symlinks);
       return {
         status: StashApplyStatus.CONFLICTS,
@@ -594,6 +596,7 @@ export class StashApplyCommand extends GitCommand<StashApplyResult> {
         conflicts: [...conflicts.keys()].sort(),
         messages: this.mergeMessages(merge.messages, stashCommit.tree, stashHeadCommitObj.tree),
         ...(warnings.length > 0 ? { warnings } : {}),
+        ...(rerereOutput.length > 0 ? { rerereOutput } : {}),
       };
     }
     if (restoredIndex) {

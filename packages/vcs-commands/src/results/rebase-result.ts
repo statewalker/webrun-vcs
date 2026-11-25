@@ -166,6 +166,13 @@ export interface RebaseResult {
 
   /** What `--show-current-patch` prints on stdout (`git show REBASE_HEAD`) */
   readonly currentPatch?: string;
+  /**
+   * What rerere printed on stderr during the run: at a stopped pick (`Recorded preimage for
+   * 'f'`, `Resolved 'f' using previous resolution.`), after `--continue`'s commit (`Recorded
+   * resolution for 'f'.`); also in {@link message} where git prints them. Absent when it
+   * said nothing.
+   */
+  readonly rerereOutput?: string[];
 }
 
 /**

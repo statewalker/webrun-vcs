@@ -156,6 +156,8 @@ export class MergeCommand extends GitCommand<MergeResult> {
   /** `-X <option>`s, in order */
   private strategyOptions: string[] = [];
   private squash = false;
+  /** `--[no-]rerere-autoupdate` (undefined: `rerere.autoUpdate`) */
+  private rerereAutoUpdate?: boolean;
   private commit = true;
   private message?: string;
   private cleanupMode?: CleanupMode;
@@ -381,6 +383,16 @@ export class MergeCommand extends GitCommand<MergeResult> {
   }
 
   /**
+   * `--rerere-autoupdate` (true) / `--no-rerere-autoupdate` (false): whether resolutions
+   * rerere replays on a conflict are staged (default `rerere.autoUpdate`).
+   */
+  setRerereAutoUpdate(autoUpdate: boolean): this {
+    this.checkCallable();
+    this.rerereAutoUpdate = autoUpdate;
+    return this;
+  }
+
+  /**
    * Set whether to commit after merge (`--no-commit` when false: the merge stops before
    * committing, with `MERGE_HEAD` and `MERGE_MSG` written for a later commit).
    *
@@ -586,7 +598,18 @@ export class MergeCommand extends GitCommand<MergeResult> {
     await this.readCurrentIndex();
     const worktree = this.worktreeAccess;
     const run = () => this.run(worktree);
-    const result = await (worktree?.batch ? worktree.batch(run) : run());
+    let result = await (worktree?.batch ? worktree.batch(run) : run());
+    // suggest_conflicts: rerere records the conflicts or replays recorded resolutions
+    if (
+      result.status === MergeStatus.CONFLICTING &&
+      this.operation === MergeOperation.MERGE &&
+      !this.inProcess
+    ) {
+      const lines = await this.rerere(
+        this.rerereAutoUpdate === undefined ? {} : { autoUpdate: this.rerereAutoUpdate },
+      );
+      if (lines.length > 0) result = { ...result, rerereOutput: lines };
+    }
     // finish's post-merge hook, told whether the merge was squashed: after a fast-forward, a
     // merge commit or a squash (not when already up to date, nor when stopped)
     if (

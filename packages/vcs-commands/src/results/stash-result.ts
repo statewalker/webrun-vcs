@@ -70,4 +70,10 @@ export interface StashApplyResult {
    * by line; absent when there was nothing to say.
    */
   readonly warnings?: string[];
+
+  /**
+   * What rerere printed on stderr when the apply conflicted (`Recorded preimage for 'f'`,
+   * `Resolved 'f' using previous resolution.`); absent when it said nothing.
+   */
+  readonly rerereOutput?: string[];
 }
