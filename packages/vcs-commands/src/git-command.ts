@@ -22,6 +22,7 @@ import {
   createReplacedCommits,
   createReplacedTags,
   createReplacedTrees,
+  decodeTreeBytes,
   type GraftFileBase,
   graftFileBaseDir,
   graftFileReader,
@@ -1580,6 +1581,30 @@ export abstract class GitCommand<T> {
       while (cache.size > SHARED_TREES) cache.delete(cache.oldestKey() as ObjectId);
     }
     return entries;
+  }
+
+  /**
+   * A tree's entries for a listing (`ls-tree`, `cat-file -p`), as git's readers list them: a
+   * tree holding a name fsck refuses (`..`, `a/b`), which the store will not decode, is read
+   * from its stored bytes without the name check. Undefined when the tree cannot be read.
+   */
+  protected async listedTreeEntries(id: ObjectId): Promise<readonly TreeEntry[] | undefined> {
+    try {
+      const loaded = await this.trees.load(id);
+      if (!loaded) return undefined;
+      const entries: TreeEntry[] = [];
+      for await (const e of loaded) entries.push(e);
+      return entries;
+    } catch (e) {
+      if ((e as Error)?.name !== "InvalidTreeEntryNameError") return undefined;
+      const raw = await this.trees.raw?.(id).catch(() => undefined);
+      if (!raw) return undefined;
+      return decodeTreeBytes(raw, {
+        canonicalModes: true,
+        idLength: this.objectFormat.rawLength,
+        checkNames: false,
+      });
+    }
   }
 
   /** The commits of `.git/shallow` (none in a complete repository). */

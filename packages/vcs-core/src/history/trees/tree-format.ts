@@ -267,14 +267,17 @@ export async function* decodeTreeEntries(
  *
  * @param buffer Serialized tree content
  * @param options `canonicalModes`: modes as git's walks see them; `idLength`: raw id bytes
- *   per entry, 20 (SHA-1, the default) or 32 (a SHA-256 repository's trees)
+ *   per entry, 20 (SHA-1, the default) or 32 (a SHA-256 repository's trees);
+ *   `checkNames: false` keeps names git's readers list but fsck refuses (`..`, `a/b`, empty),
+ *   for listings that never turn them into paths (`ls-tree`, `cat-file -p`)
  * @returns Tree entries in stored order
  */
 export function decodeTreeBytes(
   buffer: Uint8Array,
-  options?: { canonicalModes?: boolean; idLength?: number },
+  options?: { canonicalModes?: boolean; idLength?: number; checkNames?: boolean },
 ): TreeEntry[] {
   const canonical = options?.canonicalModes === true;
+  const checkNames = options?.checkNames !== false;
   const OBJECT_ID_LENGTH = options?.idLength ?? GitFormat.OBJECT_ID_LENGTH;
   let rewritten = false;
   const out: TreeEntry[] = [];
@@ -291,7 +294,7 @@ export function decodeTreeBytes(
     const name = decodeGitPath(buffer.subarray(spacePos + 1, nullPos));
     // A decoded tree may come from a remote. Its names become worktree paths, and
     // the FilesApi resolves `..` (webrun-files 0.12), so refuse what git fsck refuses.
-    validateEntryName(name);
+    if (checkNames) validateEntryName(name);
     const id = bytesToHex(buffer.subarray(nullPos + 1, nullPos + 1 + OBJECT_ID_LENGTH));
     out.push({ mode, name, id });
     offset = nullPos + 1 + OBJECT_ID_LENGTH;
