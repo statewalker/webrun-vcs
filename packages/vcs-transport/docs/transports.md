@@ -105,6 +105,61 @@ handler speaks protocol v2 to clients that ask for it. It has no on/off switch f
 `resolveRepository` that returns `null`, or a `receivePack.hooks.authorize` that refuses, is how a
 server says no.
 
+### git's `http.*` configuration on the client
+
+```ini
+[http]
+	extraHeader = X-Request-Source: notes-app
+	followRedirects = initial
+[http "https://git.example.com/"]
+	userAgent = git/2.56.1
+	maxRetries = 3
+	retryAfter = 2
+```
+
+```typescript
+await git
+  .fetch()
+  .setCredentialHelper({
+    fill: ({ host, wwwAuthenticate }) => vault.lookup(host, wwwAuthenticate),
+    approve: (credentials, { host }) => vault.save(host, credentials),
+    reject: (_credentials, { host }) => vault.forget(host),
+  })
+  .setWarningCallback((line) => console.warn(line)) // "warning: rate limited, waiting 2 seconds before retry"
+  .call();
+```
+
+Every remote command reads the repository's `http.*` keys for the remote's URL, with git's
+URL matching (`http.<url>.<key>`: scheme, user, host with `*` components, port, path prefix;
+the best match wins, `git config --get-urlmatch` gives the same answer), and hands them to the
+smart-HTTP client as `HttpClientSettings`. The client then behaves as git's remote-curl:
+
+- `http.extraHeader` lines go on every request, each value of every matching entry, an empty
+  value clearing the list; a line overrides a header the client sets (`Authorization` from
+  config wins over credentials, as curl lets a custom header win).
+- `http.userAgent` (or `GIT_HTTP_USER_AGENT`) is the `User-Agent`; without it the host's
+  `fetch` picks one (a browser keeps its own).
+- `http.followRedirects` defaults to `initial`: the first request (`info/refs`) follows
+  redirects and the later ones go to the base URL it ended at (git's "redirects re-root
+  further requests"; a redirect that does not end in `/info/refs?service=...` is git's
+  "unable to update url base from redirection"); `false` makes any redirect an error, `true`
+  follows every one.
+- A 401 asks the credential helper (`setCredentialHelper`) with the server's challenges, at
+  most three times in all; credentials that worked are approved, refused ones rejected. The
+  helper may answer `{ authtype, credential }` (`Bearer`, ...) as git 2.46's helpers do.
+  `setCredentials` credentials go out from the first request on and never reach the helper.
+  `http.emptyAuth=true` answers the first 401 with empty credentials before asking.
+- A 429 on the first request is retried as git 2.52 does: `http.maxRetries` requests in all
+  (git counts the first), waiting the response's `Retry-After` or `http.retryAfter`, failing at
+  once past `http.maxRetryTime`; `GIT_HTTP_MAX_RETRIES`, `GIT_HTTP_RETRY_AFTER` and
+  `GIT_HTTP_MAX_RETRY_TIME` override them. Under git 2.43 compatibility a 429 fails at once.
+
+What stays with the host's `fetch`: TLS (`http.sslVerify`, CA files, client certificates),
+proxies (`http.proxy`, `HTTPS_PROXY`), cookies, HTTP versions, speed limits and the
+Negotiate/NTLM schemes; none of those keys is read. Digest authentication and
+`http.proactiveAuth` are not implemented. In a browser a redirect that is not followed is
+opaque: it fails as git's redirect error (reported as 302, the real status being hidden).
+
 ### Serving repositories on disk as `git http-backend` does
 
 A server for repositories on disk usually wants what native git's `http-backend` gives: the

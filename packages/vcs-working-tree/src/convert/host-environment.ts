@@ -73,6 +73,20 @@ export interface GitHostEnvironment {
       string
     >
   >;
+  /**
+   * The variables of git's HTTP client that override `http.*` (http.c's `set_from_env`):
+   * `GIT_HTTP_USER_AGENT`, `GIT_HTTP_MAX_RETRIES`, `GIT_HTTP_RETRY_AFTER`,
+   * `GIT_HTTP_MAX_RETRY_TIME`; absent ones unset
+   */
+  httpVariables?: Partial<
+    Record<
+      | "GIT_HTTP_USER_AGENT"
+      | "GIT_HTTP_MAX_RETRIES"
+      | "GIT_HTTP_RETRY_AFTER"
+      | "GIT_HTTP_MAX_RETRY_TIME",
+      string
+    >
+  >;
   /** The build's `DEFAULT_EDITOR` (default `vi`; Debian's git: `editor`) */
   defaultEditor?: string;
   /** The build's `DEFAULT_PAGER` (default `less`; Debian's git: `pager`) */
