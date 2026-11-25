@@ -417,6 +417,17 @@ describeGit("upload-pack configuration, as native git", () => {
       ["no-progress", "want-ref refs/hidden/h", "done"],
     ],
     [
+      // another spelling of the hidden ref is no ref name (check_refname_format): unknown too
+      `t5703-upload-pack-ref-in-want.sh: "invalid want-ref line" (refs//hidden/h)`,
+      "refinwant",
+      ["no-progress", "want-ref refs//hidden/h", "done"],
+    ],
+    [
+      `t5703-upload-pack-ref-in-want.sh: "invalid want-ref line" (refs/./hidden/h)`,
+      "refinwant",
+      ["no-progress", "want-ref refs/./hidden/h", "done"],
+    ],
+    [
       `t5703-upload-pack-ref-in-want.sh: "config controls ref-in-want advertisement" (want-ref refused)`,
       "none",
       ["no-progress", "want-ref refs/heads/main", "done"],

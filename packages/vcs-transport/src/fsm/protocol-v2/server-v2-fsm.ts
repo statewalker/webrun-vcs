@@ -7,6 +7,7 @@
  * 3. Send appropriate responses
  */
 
+import { isValidRefName } from "@statewalker/vcs-core";
 import type { PktLineResult } from "../../api/transport-api.js";
 import type { ProcessContext } from "../../context/process-context.js";
 import { isRefHidden, visibleRefs } from "../../protocol/hidden-refs.js";
@@ -435,9 +436,13 @@ export const serverV2Handlers = new Map<string, FsmStateHandler<ProcessContext>>
 
         // Resolve want-refs to OIDs; a hidden ref is unknown (git's parse_want_ref)
         for (const refName of req.wantRefs) {
-          const oid = isRefHidden(refName, ctx.config.hiddenRefs)
-            ? undefined
-            : await ctx.refStore.get(refName);
+          // refs_read_ref reads only well-formed names: another spelling of a hidden ref
+          // (`refs//hidden/x`, `refs/./hidden/x`) is an unknown ref, never read
+          const oid =
+            !isValidRefName(refName, { allowOneLevel: true }) ||
+            isRefHidden(refName, ctx.config.hiddenRefs)
+              ? undefined
+              : await ctx.refStore.get(refName);
           if (!oid) {
             ctx.output.error = `unknown ref ${refName}`;
             ctx.output.invalidWant = refName;

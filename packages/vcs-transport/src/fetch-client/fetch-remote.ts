@@ -622,6 +622,13 @@ export async function fetchFromConnection(
       },
       ...request,
     });
+    // a ref asked for by name that moved since it was listed: its want is the id the server
+    // sent (the pack holds that one), for the checks below and the completeness of the tips
+    for (const r of request.wantRefs ?? []) {
+      const now = fetched.wantedRefs?.get(r.name);
+      if (now === undefined || now === r.oid) continue;
+      for (let i = 0; i < wants.length; i++) if (wants[i] === r.oid) wants[i] = now;
+    }
     const { quarantine, ...imported } = fetched.imported;
     let committed = false;
     try {
@@ -684,7 +691,6 @@ export async function fetchFromConnection(
     for (const [name, oid] of fetched.wantedRefs ?? []) {
       for (const p of planned) if (p.remoteRef === name) p.oid = oid;
       for (const f of result.fetched) if (f.remoteRef === name) f.oid = oid;
-      complete.addTip(oid);
     }
     for (const want of wants) complete.addTip(want);
     result.imports.push(imported);
@@ -748,7 +754,6 @@ export async function fetchFromConnection(
       if (!(await complete.isComplete(oid))) {
         wants.push(oid);
         wanted.add(oid);
-        wantRefs.push({ name: ref.name, oid });
       }
     }
   }
@@ -763,8 +768,11 @@ export async function fetchFromConnection(
     const soughtNames = new Set([...sought, ...opportunistic].map((p) => p.remoteRef));
     if (options.cloning) soughtNames.add("HEAD");
     promisorSought = remoteRefs.filter((r) => r.oid && soughtNames.has(r.name));
+    // an id an exact-id refspec asks for too stays a `want <id>` (its ref may move)
+    const exact = new Set(planned.filter((p) => !listedNames.has(p.remoteRef)).map((p) => p.oid));
+    const byName = wantRefs.filter((r) => !exact.has(r.oid));
     await runFetchPack(wants, {
-      ...(wantRefs.length > 0 ? { wantRefs } : {}),
+      ...(byName.length > 0 ? { wantRefs: byName } : {}),
       depth,
       deepenRelative: options.deepenRelative,
       deepenSince,
