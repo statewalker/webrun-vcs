@@ -220,6 +220,18 @@ function guardConnector(
 
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 
+/**
+ * A response the guard reached by following redirects itself, telling where it ended
+ * (`response.url`, which the client re-roots its later requests at) when the `fetch` that
+ * answered left it empty.
+ */
+function landedAt(response: Response, url: string): Response {
+  if (response.url) return response;
+  Object.defineProperty(response, "url", { value: url });
+  Object.defineProperty(response, "redirected", { value: true });
+  return response;
+}
+
 /** A redirect as the response shows it (a browser's `opaqueredirect` included). */
 function isRedirect(response: Response): boolean {
   return response.type === "opaqueredirect" || REDIRECTS.has(response.status);
@@ -273,7 +285,9 @@ function guardedFetch(
         continue;
       }
       const location = response.headers.get("location");
-      if (!REDIRECTS.has(response.status) || location === null) return response;
+      if (!REDIRECTS.has(response.status) || location === null) {
+        return hops > 0 ? landedAt(response, current.url) : response;
+      }
       if (hops >= MAX_REDIRECTS) throw new TransportError("too many redirects");
       await response.body?.cancel().catch(() => undefined);
       const next = new URL(location, target);
