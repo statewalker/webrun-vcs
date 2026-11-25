@@ -14,6 +14,7 @@ import type { HttpClientSettings, HttpCredentialHelper } from "../http-client/in
 import { httpRefsErrorOf, SmartHttpClient } from "../http-client/index.js";
 import { ServerError, TransportError } from "../protocol/index.js";
 import { isObjectIdOf, remoteObjectFormat } from "../protocol/object-format.js";
+import { type DumbHttpRemote, looksLikeInfoRefs, openDumbHttpConnection } from "./dumb-http.js";
 import { abortErrorOf, IdleTimer } from "./idle-timer.js";
 import { type Pkt, PktStream } from "./pkt-stream.js";
 
@@ -49,6 +50,11 @@ export interface UploadPackConnection {
    * advertise_shallow_grafts); empty for a complete repository. v2 sends them in `shallow-info`.
    */
   readonly advertisedShallow?: readonly string[];
+  /**
+   * A dumb HTTP server (no smart answer to `info/refs`): there is no upload-pack to ask, a
+   * fetch walks the remote's objects instead (`walkDumbHttp`); `request` throws.
+   */
+  readonly dumb?: DumbHttpRemote;
   /** Sends one request and returns the stream its answer is read from. */
   request(body: Uint8Array[]): Promise<PktStream>;
   /** Ends the exchange (v2 over a duplex: a final flush), releasing the stream. */
@@ -84,12 +90,28 @@ export interface HttpConnectionOptions {
   http?: HttpClientSettings;
   /** Asked for credentials after a 401, told whether they worked */
   credentialHelper?: HttpCredentialHelper;
+  /**
+   * Whether a dumb fetch may use an alternate of the scheme (git's `protocol.<scheme>.allow`
+   * for a transport not from the user); default: http, https, ftp and ftps
+   */
+  alternateAllowed?: (scheme: string) => boolean;
+  /**
+   * `$GIT_SMART_HTTP` (default true): false asks for `info/refs` without `?service=`, so the
+   * server answers with the dumb protocol's file and the fetch walks the remote's objects
+   */
+  smart?: boolean;
 }
+
+/** The content type of a smart server's ref advertisement (remote-curl's `check_smart_http`). */
+const SMART_ADVERTISEMENT = "application/x-git-upload-pack-advertisement";
 
 /**
  * Opens a smart-HTTP connection to `git-upload-pack`: `GET info/refs` with
  * `Git-Protocol: version=2`. A v2 server answers with its capabilities; any other answers
- * with the v0 ref advertisement, and the connection speaks v0.
+ * with the v0 ref advertisement, and the connection speaks v0. Any other answer (not of the
+ * advertisement's content type) is the dumb protocol's `info/refs` file: the connection is a
+ * dumb one ({@link UploadPackConnection.dumb}), its base URL where the first request's
+ * redirect led.
  */
 export async function openHttpConnection(
   options: HttpConnectionOptions,
@@ -114,13 +136,32 @@ export async function openHttpConnection(
     signal: controller.signal,
   });
 
+  const smart = options.smart ?? true;
   const response = await client.discover(
-    "git-upload-pack",
+    // $GIT_SMART_HTTP=0: asked without `?service=`, so any server answers the dumb way
+    smart ? "git-upload-pack" : undefined,
     { Accept: "application/x-git-upload-pack-advertisement", ...protocolHeader },
     wait,
   );
   if (!response.body) throw new TransportError("Empty response from info/refs");
-  const advert = new PktStream(response.body, wait);
+  const type = (response.headers.get("content-type") ?? "").split(";")[0]?.trim().toLowerCase();
+  let advertBody: ReadableStream<Uint8Array> = response.body;
+  if (!smart || type !== SMART_ADVERTISEMENT) {
+    const body = new Uint8Array(await wait(() => response.arrayBuffer()));
+    if (!smart || looksLikeInfoRefs(body)) {
+      // the client's base is where the first request's redirect led, its credentials
+      // dropped there when that is another origin (update_url_from_redirect)
+      return openDumbHttpConnection(client.base, body, {
+        get: (url) => client.get(url, wait),
+        ...(options.http?.followRedirects ? { followRedirects: options.http.followRedirects } : {}),
+        ...(options.alternateAllowed ? { alternateAllowed: options.alternateAllowed } : {}),
+        wait,
+      });
+    }
+    // an advertisement served with another content type: read as one
+    advertBody = new Response(body).body as ReadableStream<Uint8Array>;
+  }
+  const advert = new PktStream(advertBody, wait);
   let first = await advert.read();
   if (first?.type === "data" && first.text.startsWith("# service=")) {
     const flush = await advert.read();

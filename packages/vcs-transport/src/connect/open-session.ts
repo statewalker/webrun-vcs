@@ -22,6 +22,10 @@ export interface OpenSessionOptions {
   gzipRequests?: boolean;
   /** Smart HTTP: stream the push request body (see `HttpReceivePackOptions.streamRequestBody`) */
   streamRequestBody?: boolean;
+  /** Dumb HTTP: the alternates' schemes allowed (see `HttpConnectionOptions.alternateAllowed`) */
+  alternateAllowed?: (scheme: string) => boolean;
+  /** HTTP: `$GIT_SMART_HTTP` (default true; false asks for the dumb protocol) */
+  smartHttp?: boolean;
 }
 
 /**
@@ -123,6 +127,8 @@ export async function openUploadPack(
       ...(request.timeout !== undefined ? { timeout: request.timeout } : {}),
       ...(request.signal ? { signal: request.signal } : {}),
       ...(options.gzipRequests !== undefined ? { gzipRequests: options.gzipRequests } : {}),
+      ...(options.alternateAllowed ? { alternateAllowed: options.alternateAllowed } : {}),
+      ...(options.smartHttp === false ? { smart: false } : {}),
       protocolVersion: request.protocolVersion,
     });
   }
