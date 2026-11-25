@@ -371,6 +371,7 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
     const status = RemoteConfigStore.from(this.workingCopy).value("commit.status");
     commit.setIncludeStatus(status === undefined ? true : (parseGitBool(status) ?? true));
     const made = await commit.call();
+    this.rerereLines.push(...(made.rerereOutput ?? []));
     return made.id;
   }
 
@@ -384,7 +385,8 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
     await this.readCurrentIndex();
     const worktree = this.worktreeAccess;
     const run = () => this.run();
-    const result = toResult(await (worktree?.batch ? worktree.batch(run) : run()));
+    let result = toResult(await (worktree?.batch ? worktree.batch(run) : run()));
+    if (this.rerereLines.length > 0) result = { ...result, rerereOutput: [...this.rerereLines] };
     return this.sparseWarnings.length > 0 ? { ...result, warnings: this.sparseWarnings } : result;
   }
 
@@ -408,6 +410,7 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
         allowFf: this.allowFf,
         keepRedundant: this.keepRedundant || this.empty === "keep",
         emptyGiven: this.empty !== undefined,
+        ...(this.rerereAutoUpdate === undefined ? {} : { rerereAutoUpdate: this.rerereAutoUpdate }),
       },
       this.hooks.compatibility,
     );
@@ -416,6 +419,21 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
 
   /** What the sparse checkout printed while the result was written. */
   private readonly sparseWarnings: string[] = [];
+  /** What rerere printed on stderr (a stopped pick, a `--continue`'s commit) */
+  private readonly rerereLines: string[] = [];
+  /** `--[no-]rerere-autoupdate` */
+  private rerereAutoUpdate?: boolean;
+
+  /**
+   * `--rerere-autoupdate` (true) / `--no-rerere-autoupdate` (false): whether resolutions
+   * rerere replays at a conflict are staged (default `rerere.autoUpdate`); kept for the
+   * picks `--continue` makes, refused with `--continue`, `--skip`, `--abort`, `--quit`.
+   */
+  setRerereAutoUpdate(autoUpdate: boolean): this {
+    this.checkCallable();
+    this.rerereAutoUpdate = autoUpdate;
+    return this;
+  }
 
   private async run(): Promise<PickOutcome> {
     const sequencer = new PickSequencer(
@@ -432,6 +450,7 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
         resolve: (name) => this.resolveRef(name),
         hooks: this.hooks,
         gitCommit: (mode) => this.gitCommit(mode),
+        rerereOutput: this.rerereLines,
       },
       {
         action: "pick",
@@ -453,6 +472,7 @@ export class CherryPickCommand extends GitCommand<CherryPickResult> {
         dropRedundant: this.empty === "drop",
         allowFf: this.allowFf,
         reflogAction: this.reflogAction(this.reflogPrefix.replace(/:$/, "")),
+        ...(this.rerereAutoUpdate === undefined ? {} : { rerereAutoUpdate: this.rerereAutoUpdate }),
       },
     );
     switch (this.operation) {

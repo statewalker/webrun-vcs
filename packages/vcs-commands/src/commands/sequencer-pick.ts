@@ -50,6 +50,7 @@ import { octopusMerge } from "./octopus-merge.js";
 import { type OrtConflict, ortResultEntries } from "./ort-merge.js";
 import { mergeStoredTrees, storedBase } from "./ort-recursive.js";
 import { reflogLine, reflogMessages, updateHead } from "./reflog-messages.js";
+import { runRerere } from "./rerere.js";
 import {
   cleanupMessage,
   moveHeadAsReset,
@@ -110,6 +111,11 @@ export interface SequencerDeps extends MergeWriteContext {
    * resolved conflict is committed in process.
    */
   gitCommit?: (mode: PickCommitMode) => Promise<ObjectId>;
+  /**
+   * Where what rerere prints on stderr is collected: at a stopped pick (do_pick_commit's
+   * `repo_rerere`) and after a commit made in process for `--continue` (git's `git commit`)
+   */
+  rerereOutput?: string[];
 }
 
 /** The `git commit` the sequencer runs (see {@link SequencerDeps.gitCommit}). */
@@ -164,6 +170,12 @@ export interface PickOptions {
   /** `--allow-empty-message` (saved in `sequencer/opts`; the sequencer commits any message) */
   allowEmptyMessage?: boolean;
   /**
+   * `--rerere-autoupdate` (true) / `--no-rerere-autoupdate` (false): whether resolutions
+   * rerere replays at a conflict are staged (default `rerere.autoUpdate`); saved in
+   * `sequencer/opts` (`options.allow-rerere-auto`)
+   */
+  rerereAutoUpdate?: boolean;
+  /**
    * `--keep-redundant-commits` / `--empty=keep`: a commit that becomes empty is committed
    * (implies {@link allowEmpty})
    */
@@ -217,6 +229,8 @@ export function pickOptionsConflict(
       ["--mainline", !!options.mainline],
       ["-x", !!options.recordOrigin],
       ["--ff", !!options.allowFf],
+      ["--rerere-autoupdate", options.rerereAutoUpdate === true],
+      ["--no-rerere-autoupdate", options.rerereAutoUpdate === false],
       ["--keep-redundant-commits", keep && compatibility !== "2.43"],
       ["--empty", !!options.emptyGiven && compatibility !== "2.43"],
     ];
@@ -296,6 +310,8 @@ export class PickSequencer {
   private strategy: string | undefined;
   /** `-X` options (git's opts->xopts), or saved in the opts */
   private xopts: string[];
+  /** `--[no-]rerere-autoupdate` (git's opts->allow_rerere_auto), or saved in the opts */
+  private rerereAutoUpdate: boolean | undefined;
 
   constructor(
     private readonly deps: SequencerDeps,
@@ -321,6 +337,28 @@ export class PickSequencer {
     this.cleanup = configuredCleanup(deps.workingCopy);
     this.strategy = options.strategy;
     this.xopts = [...(options.strategyOptions ?? [])];
+    this.rerereAutoUpdate = options.rerereAutoUpdate;
+  }
+
+  /**
+   * `repo_rerere` with the run's `allow_rerere_auto` (none: `rerere.autoUpdate`); `commit`:
+   * git commit's `repo_rerere(0)`.
+   */
+  private async rerere(commit = false): Promise<void> {
+    const { deps } = this;
+    const autoUpdate = commit ? undefined : this.rerereAutoUpdate;
+    if (!deps.worktree) return;
+    const out = await runRerere(
+      {
+        workingCopy: deps.workingCopy,
+        staging: deps.staging,
+        worktree: deps.worktree,
+        blobs: deps.blobs,
+        objectFormat: objectFormatOf(deps.workingCopy.history),
+      },
+      autoUpdate === undefined ? {} : { autoUpdate },
+    );
+    deps.rerereOutput?.push(...out.messages);
   }
 
   /** The git version to follow where they differ */
@@ -403,6 +441,9 @@ export class PickSequencer {
         opts.push(`\tgpg-sign = ${configValueText(String(this.sign))}\n`);
       }
       for (const x of this.xopts) opts.push(`\tstrategy-option = ${configValueText(x)}\n`);
+      if (this.rerereAutoUpdate !== undefined) {
+        opts.push(`\tallow-rerere-auto = ${this.rerereAutoUpdate}\n`);
+      }
       if (this.cleanup) opts.push(`\tdefault-msg-cleanup = ${this.cleanup}\n`);
       if (opts.length > 0) await state.write("sequencer/opts", `[options]\n${opts.join("")}`);
     }
@@ -556,6 +597,7 @@ export class PickSequencer {
         // git 2.43's sequencer returns the error without dying
         ...(this.compatibility === "2.43" ? [] : [`fatal: ${name} failed`]),
       ];
+      await this.rerere();
       return this.fail(lines.join("\n"), merged.output ?? []);
     }
     const { treeId, conflicts, clean } = merged;
@@ -600,6 +642,8 @@ export class PickSequencer {
             `hint: To abort and get back to the state before "git ${name}",`,
             `hint: run "git ${name} --abort".`,
           ];
+      // do_pick_commit: rerere records the conflicts or replays a recorded resolution
+      await this.rerere();
       return {
         status: "conflicting",
         conflicts: paths,
@@ -788,6 +832,8 @@ export class PickSequencer {
       // the commit ends the stopped pick (git commit's remove_merge_branch_state)
       await state.removeRef("CHERRY_PICK_HEAD", "REVERT_HEAD", "AUTO_MERGE");
       await state.remove("MERGE_MSG");
+      // git commit's repo_rerere: the resolutions recorded
+      await this.rerere(true);
       if (todo[0]?.id === stopped) todo = todo.slice(1);
     }
     if (!sequenced) return { status: "ok", newHead, picked: stopped ? [stopped] : [], output: [] };
@@ -943,6 +989,7 @@ export class PickSequencer {
       const value = parseGitBool(text);
       if (value === undefined) continue;
       if (name === "edit") this.edit = value;
+      if (name === "allow-rerere-auto") this.rerereAutoUpdate = value;
       const key = SAVED_FLAGS[name];
       if (key) this.flags[key] = value;
     }
