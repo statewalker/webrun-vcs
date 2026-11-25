@@ -44,6 +44,7 @@ export * from "./git-hooks.js";
 export * from "./git-ident.js";
 export * from "./grep/index.js";
 export * from "./hook-command.js";
+export * from "./http-config.js";
 export {
   IndexVersionConfigError,
   indexFormatDefault,

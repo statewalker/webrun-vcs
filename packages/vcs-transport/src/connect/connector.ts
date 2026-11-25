@@ -10,6 +10,7 @@
 
 import type { Credentials } from "../api/credentials.js";
 import type { Duplex } from "../api/duplex.js";
+import type { HttpClientSettings, HttpCredentialHelper } from "../http-client/index.js";
 import type { GitUrl } from "./git-url.js";
 
 /** The service a session talks to. */
@@ -38,6 +39,13 @@ export interface GitConnectRequest {
   credentials?: Credentials;
   /** Additional HTTP headers, for HTTP transports */
   headers?: Readonly<Record<string, string>>;
+  /**
+   * git's `http.*` settings for the URL (`http.extraHeader`, `userAgent`, `followRedirects`,
+   * `emptyAuth`, the 429 retries), for HTTP transports
+   */
+  http?: HttpClientSettings;
+  /** Asked for credentials after a 401 and told whether they worked, for HTTP transports */
+  credentialHelper?: HttpCredentialHelper;
   /** Bounds each wait for the server, in milliseconds */
   timeout?: number;
   /** Aborts the connection */

@@ -3,14 +3,17 @@ import { encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { Credentials } from "../api/credentials.js";
 
 /**
- * The HTTP `Authorization` header value for the given credentials: Basic auth.
- * A token is sent as the password, with `username` defaulting to `x-access-token`.
+ * The HTTP `Authorization` header value for the given credentials: `<authtype> <credential>`
+ * when they carry a scheme (git's credential `authtype`), else Basic auth. A token is sent as
+ * the password, with `username` defaulting to `x-access-token`.
  *
  * The `user:password` text goes out as its bytes, as curl sends what git hands it: UTF-8,
  * with a byte that was not UTF-8 in the config (a lone surrogate U+DC80..U+DCFF, see
  * `decodeGitPath`) restored. `btoa` alone would throw on any character above U+00FF.
  */
 export function authorizationHeader(auth: Credentials): string {
+  // http.c's http_append_auth_header: a helper's scheme and credential as they are
+  if (auth.authtype && auth.credential) return `${auth.authtype} ${auth.credential}`;
   if (auth.token) return `Basic ${base64(`${auth.username ?? "x-access-token"}:${auth.token}`)}`;
   const { username, password } = auth;
   return `Basic ${base64(`${username}:${password}`)}`;
