@@ -609,7 +609,7 @@ describeGit("git archive conversions and settings, native", () => {
   });
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-  it("t5003-archive-zip.sh: the checkout conversions (eol, ident) from the tree's attributes", async () => {
+  it("the checkout conversions (eol, ident) from the tree's attributes", async () => {
     await twins(repo, ["HEAD"]);
     await twins(repo, ["--format=zip", "-0", "HEAD"]);
     await twins(repo, ["--worktree-attributes", "HEAD"]);
@@ -621,7 +621,7 @@ describeGit("git archive conversions and settings, native", () => {
     }
   });
 
-  it("t5000-tar-tree.sh: tar.umask", async () => {
+  it("tar.umask", async () => {
     for (const umask of ["0", "077", "0022"]) {
       git(repo, ["config", "tar.umask", umask]);
       await twins(repo, ["HEAD"]);
@@ -629,7 +629,7 @@ describeGit("git archive conversions and settings, native", () => {
     git(repo, ["config", "--unset", "tar.umask"]);
   });
 
-  it("t5000-tar-tree.sh: get-tar-commit-id of a short or foreign input", () => {
+  it("get-tar-commit-id of a short or foreign input", () => {
     for (const input of [
       Buffer.alloc(100),
       Buffer.alloc(1024),
@@ -674,12 +674,12 @@ describeGit("git archive edge cases, native", () => {
   });
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-  it("t5001-archive-attr.sh: a bare repository converts (eol, ident) by the archived tree", async () => {
+  it("a bare repository converts (eol, ident) by the archived tree", async () => {
     await twins(bare, ["HEAD"]);
     await twins(bare, ["--format=zip", "-0", "HEAD"]);
   });
 
-  it("t5001-archive-attr.sh: attr.tree and GIT_ATTR_SOURCE give way to the archived tree", async () => {
+  it("attr.tree and GIT_ATTR_SOURCE give way to the archived tree", async () => {
     for (const dir of [repo, bare]) {
       git(dir, ["config", "attr.tree", "plain"]);
       try {
@@ -692,25 +692,25 @@ describeGit("git archive edge cases, native", () => {
     }
   });
 
-  it("t5000-tar-tree.sh: a subdirectory's run converts by the path below it", async () => {
+  it("a subdirectory's run converts by the path below it", async () => {
     await twins(repo, ["HEAD"], { cwd: "sub" });
   });
 
-  it("t5003-archive-zip.sh: an added file's text flag follows the diff attribute", async () => {
+  it("an added file's text flag follows the diff attribute", async () => {
     await twins(repo, ["--format=zip", "-0", "--prefix=p/", "--add-file=x.bin", "HEAD"]);
   });
 
-  it("t5000-tar-tree.sh: --add-file with .. from a subdirectory", async () => {
+  it("--add-file with .. from a subdirectory", async () => {
     await twins(repo, ["--add-file=../x.bin", "HEAD"], { cwd: "sub" });
     await twins(repo, ["--add-file=nosuch", "HEAD"]);
   });
 
-  it("t5003-archive-zip.sh: a C-quoted virtual path with octal escapes", async () => {
+  it("a C-quoted virtual path with octal escapes", async () => {
     await twins(repo, ['--add-virtual-file="\\303\\251t\\303\\251":caf\u00e9', "HEAD"]);
     await twins(repo, ["--add-virtual-file=caf\u00e9.txt:x", "HEAD"]);
   });
 
-  it("t5000-tar-tree.sh: tgz levels zlib refuses", async () => {
+  it("tgz levels zlib refuses", async () => {
     await twins(repo, ["--format=tgz", "-10", "HEAD"]);
   });
 
@@ -721,6 +721,36 @@ describeGit("git archive edge cases, native", () => {
       expect(n.err.trim().split("\n")).toHaveLength(1);
     } finally {
       git(repo, ["config", "--unset", "tar.invalid.command"]);
+    }
+  });
+
+  it("a bare repository's filter drivers: a required one that cannot run dies", async () => {
+    put(bare, "info/attributes", "*.crlf filter=x\n");
+    git(bare, ["config", "filter.x.required", "true"]);
+    try {
+      const n = await twins(bare, ["HEAD"]);
+      expect(n.status).toBe(128);
+    } finally {
+      rmSync(join(bare, "info/attributes"));
+      git(bare, ["config", "--unset", "filter.x.required"]);
+    }
+  });
+
+  it("a bare repository's host filter drivers smudge (setFilterDrivers)", async () => {
+    put(bare, "info/attributes", "*.crlf filter=up\n");
+    git(bare, ["config", "filter.up.smudge", "tr a-z A-Z"]);
+    try {
+      const upper = {
+        smudge: async (content: Uint8Array) =>
+          new TextEncoder().encode(new TextDecoder().decode(content).toUpperCase()),
+      };
+      const n = nativeArchive(home, bare, ["HEAD"]);
+      const o = await oursArchive(home, bare, ["HEAD"], { filterDrivers: { up: upper } });
+      expect(o.err).toBe(n.err);
+      expect(o.out.equals(n.out)).toBe(true);
+    } finally {
+      rmSync(join(bare, "info/attributes"));
+      git(bare, ["config", "--unset", "filter.up.smudge"]);
     }
   });
 
@@ -746,6 +776,25 @@ describeGit("git archive edge cases, native", () => {
       expect(n.status).toBe(255);
       await twins(repo, ["--worktree-attributes", tree]);
     }
+    // names the tree decoder refuses: git archives `..` under --worktree-attributes, ours
+    // refuses it as verify_path does (an entry that escapes on extraction)
+    const raw = Buffer.concat([Buffer.from("100644 ..\0"), Buffer.from(blob, "hex")]);
+    const dotdot = execFileSync(
+      "git",
+      ["hash-object", "-t", "tree", "-w", "--literally", "--stdin"],
+      {
+        cwd: repo,
+        env: archiveEnv(home),
+        input: raw,
+        encoding: "latin1",
+      },
+    ).trim();
+    expect((await twins(repo, [dotdot])).status).toBe(255);
+    const o = await oursArchive(home, repo, ["--worktree-attributes", dotdot]);
+    expect({ status: o.status, err: o.err }).toEqual({
+      status: 255,
+      err: "error: invalid path '..'\n",
+    });
   });
 });
 

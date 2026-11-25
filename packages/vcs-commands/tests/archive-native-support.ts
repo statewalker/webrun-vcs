@@ -88,7 +88,11 @@ export async function oursArchive(
   home: string,
   dir: string,
   args: string[],
-  options: { cwd?: string; env?: Record<string, string> } = {},
+  options: {
+    cwd?: string;
+    env?: Record<string, string>;
+    filterDrivers?: Parameters<ReturnType<Git["archive"]>["setFilterDrivers"]>[0];
+  } = {},
 ): Promise<ArchiveOutcome> {
   const git = await openArchiveRepo(home, dir, options.env);
   const cmd = git
@@ -96,6 +100,7 @@ export async function oursArchive(
     .setFilterRunner(shellFilter)
     .setLocalTimezone(() => 0);
   if (options.cwd) cmd.setCurrentDirectory(options.cwd);
+  if (options.filterDrivers) cmd.setFilterDrivers(options.filterDrivers);
   let list = false;
   let tree = false;
   let paths = false;

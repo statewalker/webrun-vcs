@@ -24,6 +24,8 @@ import {
   type ConversionSettings,
   convAttrsOf,
   crlfToWorktree,
+  FilterDriverError,
+  type FilterDriverRegistry,
   identToWorktree,
   readConversionSettings,
   reencode,
@@ -46,7 +48,7 @@ import {
   parsePathspec,
 } from "../pathspec.js";
 import { formatCommitPretty } from "../pretty-format.js";
-import { treePathRefusal, worktreePathRules } from "../worktree-path-rules.js";
+import { treePathRefusal, withTreePathRefusal, worktreePathRules } from "../worktree-path-rules.js";
 import {
   type ArchiveEntry,
   type ArchiveWriter,
@@ -125,6 +127,7 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
   private filterRunner?: ArchiveFilterRunner;
   private userUmask = 0o022;
   private localTzOffset?: (time: number) => number;
+  private filterDrivers?: FilterDriverRegistry;
   private readonly messages: string[] = [];
 
   /** The tree-ish archived (a commit, a tag, a tree). */
@@ -378,8 +381,21 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
             })
           : new TarArchiveWriter({ ...settings, umask: this.tarUmask() });
       const run = new ArchiveRun(this, target, writer, extras);
-      await run.prepare();
-      await run.writeEntries();
+      // with --worktree-attributes a name the tree decoder refuses (`..`, `a/b`) is only met
+      // here: refused as verify_path would (git archives it; such paths escape on extraction)
+      await withTreePathRefusal(
+        this.trees,
+        [target.tree],
+        worktreePathRules(this._workingCopy),
+        async () => {
+          await run.prepare();
+          await run.writeEntries();
+        },
+        (refusal) =>
+          refusal instanceof InvalidPathError
+            ? new GitApiError(refusal.message, { exitCode: 255 })
+            : refusal,
+      );
       const archive = writer.finish();
       if (archiver.command === undefined) return archive;
       return this.filter(archiver.command, archive, level);
@@ -506,6 +522,21 @@ export class ArchiveCommand extends GitCommand<Uint8Array> {
       return undefined;
     }
     return join(chunks);
+  }
+
+  /**
+   * The host's filter drivers (`filter=<name>`) for a repository without a worktree; a
+   * worktree's content filter brings its own.
+   */
+  setFilterDrivers(drivers: FilterDriverRegistry): this {
+    this.checkCallable();
+    this.filterDrivers = drivers;
+    return this;
+  }
+
+  /** @internal */
+  archiveDrivers(): FilterDriverRegistry | undefined {
+    return this.filterDrivers;
   }
 
   /** @internal */
@@ -923,21 +954,44 @@ class ArchiveRun {
     mode: number,
   ): Promise<Uint8Array> {
     if (this.bareResolver) {
-      // no worktree: eol, ident and encoding from the archive's attributes (no filter drivers)
+      // no worktree: convert.c's convert_to_working_tree with the archive's attributes and
+      // the host's filter drivers (`setFilterDrivers`)
       const attrs = await this.bareResolver.get(path, CONVERT_ATTRS);
       this.conversionSettings ??= readConversionSettings(this.cmd.archiveConfigObject(), "lf");
-      const ca = convAttrsOf(new Map(attrs), this.conversionSettings);
+      const ca = convAttrsOf(new Map(attrs), this.conversionSettings, this.cmd.archiveDrivers());
       let out = content;
       if (ca.ident) out = identToWorktree(out, id);
       out = crlfToWorktree(out, ca.crlfAction, this.conversionSettings);
       if (ca.workingTreeEncoding && out.length > 0) {
-        out = reencode(out, ca.workingTreeEncoding, "UTF-8") ?? out;
+        const encoded = reencode(out, ca.workingTreeEncoding, "UTF-8");
+        if (encoded) out = encoded;
+        else {
+          this.settings.messages.push(
+            `error: failed to encode '${path}' from UTF-8 to ${ca.workingTreeEncoding}`,
+          );
+        }
       }
-      return out;
+      const smudge = ca.driver?.host?.smudge;
+      let filtered: Uint8Array | undefined;
+      if (smudge) {
+        filtered = await smudge.call(ca.driver?.host, out, { path }).catch(() => undefined);
+      }
+      if (filtered === undefined && ca.driver?.required) {
+        throw new GitApiError(`fatal: ${path}: smudge filter ${ca.driver.name} failed`);
+      }
+      return filtered ?? out;
     }
     const filter = this.worktree?.contentFilter;
     if (!filter) return content;
-    const out = await smudgeContent(filter, path, content, mode, this.filterContext);
+    let out: Awaited<ReturnType<typeof smudgeContent>>;
+    try {
+      out = await smudgeContent(filter, path, content, mode, this.filterContext);
+    } catch (error) {
+      if (error instanceof FilterDriverError) {
+        throw new GitApiError(`fatal: ${error.message}`);
+      }
+      throw error;
+    }
     if (out instanceof Uint8Array) return out;
     const chunks: Uint8Array[] = [];
     for await (const c of out as AsyncIterable<Uint8Array>) chunks.push(c);
