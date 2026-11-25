@@ -202,3 +202,15 @@ export class DescribeError extends GitApiError {
     this.undescribable = options.undescribable ?? false;
   }
 }
+
+/**
+ * Thrown by `mktag` when git dies (exit status 128): the input fails the strict fsck check
+ * (its `error: tag input does not pass fsck: ...` lines first), the tagged object is
+ * missing or of another type, or the tag cannot be written. The message is git's stderr.
+ */
+export class MktagFailedError extends GitApiError {
+  constructor(message: string) {
+    super(message, { exitCode: 128 });
+    this.name = "MktagFailedError";
+  }
+}

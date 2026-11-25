@@ -62,6 +62,7 @@ import {
   PullCommand,
   PushCommand,
   RangeDiffCommand,
+  MktagCommand,
   ReadTreeCommand,
   RebaseCommand,
   ReflogCommand,
@@ -715,6 +716,20 @@ export class Git implements Disposable {
   readTree(): ReadTreeCommand {
     this.checkClosed();
     return new ReadTreeCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a MktagCommand writing a tag object from its text after git's strict fsck check
+   * (`git mktag`).
+   *
+   * @example
+   * ```typescript
+   * const { id } = await git.mktag().setInput(tagText).call();
+   * ```
+   */
+  mktag(): MktagCommand {
+    this.checkClosed();
+    return new MktagCommand(this._workingCopy);
   }
 
   // ============ Rm Operations ============

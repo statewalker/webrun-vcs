@@ -91,6 +91,7 @@ export * from "./promisor-remote.js";
 export * from "./pull-command.js";
 export * from "./push-command.js";
 export * from "./range-diff/index.js";
+export * from "./mktag-command.js";
 export * from "./read-tree-command.js";
 export * from "./rebase-command.js";
 export * from "./ref-decoration-filter.js";
