@@ -103,3 +103,31 @@ describe("compareRefNames agrees with UTF-8 byte order", () => {
     }
   });
 });
+
+describe("ref names holding non-UTF-8 bytes (statewalker/webrun-vcs#376)", () => {
+  // decodeGitPath gives each byte outside a valid UTF-8 sequence as U+DC80..U+DCFF
+  it("accepts escaped bytes 0x80..0xff, as git accepts every byte from 0x80 up", () => {
+    expect(isValidRefName("refs/heads/caf\udce9")).toBe(true);
+    expect(isValidRefName("refs/heads/\udc80\udcff")).toBe(true);
+    expect(isValidRefName("caf\udce9", { allowOneLevel: true })).toBe(true);
+    expect(isValidBranchName("caf\udce9")).toBe(true);
+    // still refused: what the other rules refuse, and lone surrogates that are no byte
+    expect(isValidRefName("refs/heads/caf\udce9.lock")).toBe(false);
+    expect(isValidRefName("refs/heads/a\udc7fb")).toBe(false);
+    expect(isValidRefName("refs/heads/a\ud800b")).toBe(false);
+    expect(isValidRefName("refs/heads/a\ud800")).toBe(false);
+    expect(isValidRefName("refs/heads/a\udd00b")).toBe(false);
+    // a pair is a character, not two escapes
+    expect(isValidRefName("refs/heads/😀")).toBe(true);
+  });
+
+  it("orders them by their bytes, as packed-refs and reftables are sorted", () => {
+    // caf\xc3\xa9 (UTF-8) before caf\xe9 (Latin-1) before caf\xf0\x9f\x98\x80
+    const names = ["refs/heads/caf😀", "refs/heads/caf\udce9", "refs/heads/café"];
+    expect([...names].sort(compareRefNames)).toEqual([
+      "refs/heads/café",
+      "refs/heads/caf\udce9",
+      "refs/heads/caf😀",
+    ]);
+  });
+});
