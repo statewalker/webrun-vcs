@@ -12,6 +12,7 @@ import {
   type RefsVerifyWorktree,
   readReftableWriteOptions,
   readRepositoryFormat,
+  retireRefStore,
   verifyRefStorage,
 } from "@statewalker/vcs-store-files";
 import { RemoteConfigStore } from "../remote-config/index.js";
@@ -47,8 +48,9 @@ const shownIn = (gitDir: string, path: string) =>
  * already uses '<f>' format`, `error: migrating repositories with worktrees is not supported
  * yet` (255).
  *
- * The working copy this command ran on keeps the ref store of the old format: open the
- * repository again after a migration.
+ * Once the repository's storage was switched, the ref store of the working copy this command
+ * ran on (the old format's) is retired (`retireRefStore`): every later use of it, and every
+ * command of a `Git` over it, throws, so open the repository again after a migration.
  *
  * @example
  * ```typescript
@@ -121,6 +123,15 @@ export class RefsMigrateCommand extends PlumbingCommand {
       if (!(error instanceof RefMigrationError)) throw error;
       this.warn(`error: ${error.message}`);
       return 255;
+    } finally {
+      // past the commit point (even if a later step failed) the repository reads only the
+      // new storage: the store this working copy opened must not write the old one
+      if (!this.dryRun && (await readRepositoryFormat(files, gitDir)).refStorage === format) {
+        retireRefStore(
+          this.workingCopy.history.refs,
+          `the ref storage was migrated to '${format}'`,
+        );
+      }
     }
     if (this.dryRun) {
       await this.write(

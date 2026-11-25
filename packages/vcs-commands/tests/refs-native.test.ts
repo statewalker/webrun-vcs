@@ -29,6 +29,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inflateSync } from "node:zlib";
 
+import { createNodeGitHostEnvironment } from "@statewalker/vcs-utils-node/files";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { Git } from "../src/index.js";
@@ -963,6 +964,47 @@ describe.skipIf(!canOptimize)("git refs optimize", () => {
               .split("\n")
               .filter(Boolean).length;
       expect(storage(t.ours)).toEqual(storage(t.native));
+    });
+  }
+});
+
+describe.skipIf(!canMigrate)("git refs migrate: the instance that migrated (#357)", () => {
+  for (const [from, to] of FORMATS) {
+    it(`a commit after the migration lands in the new storage or nowhere (${from} -> ${to})`, async () => {
+      // native git runs each command in a process of its own, which reads the new format;
+      // ours must not keep writing through the store of the old one
+      const dir = repository(from);
+      commit(dir, "first");
+      const t = twins(dir);
+      time += 60;
+      writeFileSync(join(t.native, "second.t"), "second\n");
+      writeFileSync(join(t.ours, "second.t"), "second\n");
+      ok(t.native, "refs", "migrate", `--ref-format=${to}`);
+      ok(t.native, "add", "second.t");
+      ok(t.native, "commit", "-q", "-m", "second");
+
+      const host = createNodeGitHostEnvironment({ env: env() });
+      const git = await openOurs(t.ours, host);
+      const migrated = outcomeOf(await git.refsMigrate().setRefFormat(to).callOutput());
+      expect(migrated).toEqual({ status: 0, stdout: "", stderr: "" });
+      // the stale instance refuses rather than updating refs the repository no longer reads
+      await expect(
+        (async () => {
+          await git.add().addFilepattern("second.t").call();
+          await git.commit().setMessage("second").call();
+        })(),
+      ).rejects.toThrow(/migrated|closed/);
+      expect(ok(t.ours, "rev-parse", "main")).toBe(ok(dir, "rev-parse", "main"));
+      expect(run(t.ours, ["refs", "verify"]).status).toBe(0);
+      if (to === "reftable")
+        expect(existsSync(join(t.ours, ".git", "refs", "heads", "main"))).toBe(false);
+
+      // opened again, ours commits what native git committed
+      const again = await openOurs(t.ours, host);
+      await again.add().addFilepattern("second.t").call();
+      await again.commit().setMessage("second").call();
+      expect(ok(t.ours, "rev-parse", "main")).toBe(ok(t.native, "rev-parse", "main"));
+      expect(refListing(t.ours)).toBe(refListing(t.native));
     });
   }
 });

@@ -1,4 +1,5 @@
 import type { History } from "@statewalker/vcs-core";
+import { refStoreRetirement } from "@statewalker/vcs-store-files";
 import type { GitTransportRegistry } from "@statewalker/vcs-transport";
 import type { Checkout, WorkingCopy, Worktree, WorktreeAdmin } from "@statewalker/vcs-working-tree";
 
@@ -2562,6 +2563,12 @@ export class Git implements Disposable {
   private checkClosed(): void {
     if (this.closed) {
       throw new Error("Git instance is closed");
+    }
+    // a `refs migrate` retired the ref store this instance opened (the old format's)
+    const retired = refStoreRetirement(this._workingCopy.history?.refs);
+    if (retired !== undefined) {
+      this.closed = true;
+      throw new Error(`Git instance is closed: ${retired}: open the repository again`);
     }
   }
 }
