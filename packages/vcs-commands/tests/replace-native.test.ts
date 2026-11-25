@@ -483,7 +483,7 @@ describeGit("git replace, native twins (t6050-replace.sh)", () => {
     await step(t, ["-g", a, b]);
   });
 
-  it('t6050-replace.sh: "--convert-graft-file" (git replace parsing commits while info/grafts exists)', async () => {
+  it("git replace parsing commits while info/grafts exists (statewalker/webrun-vcs#364)", async () => {
     // statewalker/webrun-vcs#364: the first commit a revision parses loads the grafts file and
     // prints its advice, outside --graft too; `~` follows the grafted parents
     const t = twins(fixture);
