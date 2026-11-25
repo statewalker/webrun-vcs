@@ -17,7 +17,7 @@ import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { RefNotFoundError } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
 import { quotePath } from "../results/quote-path.js";
-import { prefixPathGently } from "./git-paths.js";
+import { prefixedElement } from "./ls-files-command.js";
 import { configBool, configValue } from "./merge-config.js";
 import {
   ENTRY_NOT_INTERESTING,
@@ -474,20 +474,12 @@ export class LastModifiedCommand extends PlumbingCommand {
 
   /** The pathspec, its elements relative to the prefix (prefix_path). */
   private async parsePaths(): Promise<PathspecItem[]> {
-    const paths: string[] = [];
-    for (const p of this.paths) {
-      if (!this.prefix || p.startsWith(":")) {
-        paths.push(p);
-        continue;
-      }
-      const full = prefixPathGently(
-        `${this.prefix}/`,
-        p,
-        p.startsWith("/") ? await this.hostWorkingDir() : undefined,
-      );
-      if (full === undefined) throw new PlumbingError(`fatal: ${p}: '${p}' is outside repository`);
-      paths.push(full === "" ? "." : full);
-    }
+    // each element, magic ones too, read against the current directory (prefix_path_gently);
+    // no element, or only excludes, is the whole tree (parse_pathspec without PREFER_CWD)
+    const top = this.paths.length > 0 ? await this.hostWorkingDir() : undefined;
+    const paths = this.paths.map((p) =>
+      prefixedElement(p, this.prefix ? `${this.prefix}/` : "", top),
+    );
     try {
       return parsePathspec(paths);
     } catch (e) {

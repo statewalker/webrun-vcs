@@ -194,6 +194,16 @@ describeGit("git last-modified, native twins", () => {
     it('t8020-last-modified.sh: "last-modified from subdir uses relative pathspecs"', async () => {
       await check(dir, ["-r", "b"], { sub: "a" });
     });
+    it('t8020-last-modified.sh: "last-modified subdir non-recursive"', async () => {
+      await check(dir, ["a"]);
+    });
+    it("pathspec magic from a subdirectory is read against it", async () => {
+      await check(dir, ["-r", ":(literal)b"], { sub: "a" });
+      await check(dir, [":(glob)b"], { sub: "a" });
+      await check(dir, ["-r", ":!b"], { sub: "a" });
+      await check(dir, ["-r", ":/a/b"], { sub: "a" });
+      await check(dir, ["-r", "--", ":(top)file"], { sub: "a" });
+    });
     it('t8020-last-modified.sh: "limit last-modified traversal by count"', async () => {
       const { native } = await check(dir, ["-1"]);
       expect(native.stdout).toContain("^");

@@ -1142,7 +1142,7 @@ const SHORT_MAGIC = new Set([..."!\"#%&',-;<=>@_`~^/"]);
  * `prefix_path_gently` reads it (`:(top)` and `:/` from the top; an absolute path against the
  * worktree's host directory `top`); dies as git when it leaves the worktree.
  */
-function prefixedElement(arg: string, prefix: string, top: string | undefined): string {
+export function prefixedElement(arg: string, prefix: string, top: string | undefined): string {
   let magicEnd = 0;
   let fromTop = false;
   if (arg.startsWith(":(")) {
