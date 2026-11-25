@@ -13,6 +13,7 @@ import {
   clearMultiPackIndexNaming,
   joinPath,
   objectFormatOf,
+  packNameOf,
   writePack,
 } from "@statewalker/vcs-core";
 import { multiPackIndexWrite } from "./multi-pack-index.js";
@@ -87,7 +88,7 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
   );
   const info = await Promise.all(
     all.map(async (p) => {
-      const base = joinPath(packDir, `pack-${p.packId}`);
+      const base = joinPath(packDir, packNameOf(p));
       return {
         pack: p,
         keep: (await files.exists(`${base}.keep`)) || inCore.has(p.packId),
@@ -131,7 +132,7 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
   const idPattern = objectIdPattern(format);
   for await (const key of looseStorage.keys()) if (idPattern.test(key)) await add(key);
 
-  const keptPacks = info.filter((i) => i.keep).map((i) => `pack-${i.pack.packId}`);
+  const keptPacks = info.filter((i) => i.keep).map((i) => packNameOf(i.pack));
   if (options.dryRun) {
     return listed.length === 0
       ? null
@@ -139,7 +140,7 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
           packName: "",
           objectCount: listed.length,
           looseObjectsRemoved: 0,
-          packsRemoved: deleteRedundant ? rolled.map((g) => `pack-${g.pack.packId}`) : [],
+          packsRemoved: deleteRedundant ? rolled.map((g) => packNameOf(g.pack)) : [],
           keptPacks,
           unpackedObjects: 0,
         };
@@ -172,12 +173,12 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
   let midxWritten: string | undefined;
   if (options.writeMidx) {
     const include = new Set<string>();
-    for (const i of info) if (i.keep || i.cruft) include.add(`pack-${i.pack.packId}.idx`);
+    for (const i of info) if (i.keep || i.cruft) include.add(`${packNameOf(i.pack)}.idx`);
     if (installed) include.add(`pack-${installed.packId}.idx`);
-    for (const g of above) include.add(`pack-${g.pack.packId}.idx`);
+    for (const g of above) include.add(`${packNameOf(g.pack)}.idx`);
     const preferred = above.length
-      ? (above[above.length - 1] as (typeof above)[number]).pack.packId
-      : installed?.packId;
+      ? packNameOf((above[above.length - 1] as (typeof above)[number]).pack)
+      : installed && `pack-${installed.packId}`;
     if (include.size > 0) {
       const midx = await multiPackIndexWrite({
         files,
@@ -185,7 +186,7 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
         compatibility: options.compatibility ?? "2.56",
         ...(options.environment ? { environment: options.environment } : {}),
         stdinPacks: [...include].sort(),
-        ...(preferred ? { preferredPack: `pack-${preferred}.pack` } : {}),
+        ...(preferred ? { preferredPack: `${preferred}.pack` } : {}),
         bitmap: writeBitmaps,
         ...(options.writeMidxBitmap ? { writeBitmap: options.writeMidxBitmap } : {}),
       });
@@ -199,7 +200,7 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
   let looseObjectsRemoved = 0;
   if (deleteRedundant) {
     const removable = rolled.filter((g) => g.pack.packId !== installed?.packId && !g.keep);
-    const names = removable.map((g) => `pack-${g.pack.packId}`);
+    const names = removable.map((g) => packNameOf(g.pack));
     if (names.length) {
       await clearMultiPackIndexNaming(
         files,
@@ -207,7 +208,7 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
         names.map((n) => `${n}.pack`),
         { wroteIncremental: false, objectFormat: format },
       );
-      await packs.remove(removable.map((g) => g.pack.packId));
+      await packs.remove(removable.map((g) => g.pack));
       packsRemoved.push(...names);
     }
     looseObjectsRemoved = await prunePacked(looseStorage, packs, format, alternates);

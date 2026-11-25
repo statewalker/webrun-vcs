@@ -26,6 +26,7 @@ import {
   decodeTreeBytes,
   joinPath,
   objectFormatOf,
+  packNameOf,
   parsePackMtimes,
   writePack,
 } from "@statewalker/vcs-core";
@@ -100,7 +101,7 @@ export async function writeCruftPacks(o: CruftPackInput): Promise<CruftPackResul
     return s;
   };
   for (const { pack, modified } of o.discard) {
-    const base = joinPath(o.gitDir, "objects", "pack", `pack-${pack.packId}`);
+    const base = joinPath(o.gitDir, "objects", "pack", packNameOf(pack));
     let perObject: Uint32Array | undefined;
     if ((await files.stats(`${base}.mtimes`))?.kind === "file") {
       try {
@@ -244,7 +245,7 @@ async function entryExtents(o: CruftPackInput, pack: Pack): Promise<number[] | u
   const p = pack as Pack & { offsetAt?(i: number): number; packOrder?(): Uint32Array };
   if (!p.offsetAt || !p.packOrder) return undefined;
   const size = (
-    await o.files.stats(joinPath(o.gitDir, "objects", "pack", `pack-${pack.packId}.pack`))
+    await o.files.stats(joinPath(o.gitDir, "objects", "pack", `${packNameOf(pack)}.pack`))
   )?.size;
   if (size === undefined) return undefined;
   const order = p.packOrder();
@@ -333,7 +334,7 @@ export async function recentPackedObjects(
   const cutoff = Math.floor(cutoffMs / 1000);
   await packs.refresh();
   for (const pack of await packs.packs()) {
-    const base = joinPath(objectsDir, "pack", `pack-${pack.packId}`);
+    const base = joinPath(objectsDir, "pack", packNameOf(pack));
     let times: Uint32Array | undefined;
     if ((await files.stats(`${base}.mtimes`))?.kind === "file") {
       try {

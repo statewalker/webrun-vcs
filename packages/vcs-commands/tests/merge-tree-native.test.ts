@@ -432,15 +432,15 @@ git commit -q -am theirs`,
     await check(dir, ["--trivial-merge", "-X", "ours", "side1", "side2", "side3"]);
   });
 
-  // t4301 names these packs `side3-tree-is-missing-<id>.pack`; git reads any `*.idx` in
-  // objects/pack, our store only `pack-<id>.idx`, so the packs here are named `pack-<id>`
+  // t4301's pack names (`side3-tree-is-missing-<id>.pack`): git reads any `*.idx` in
+  // objects/pack, and so does ours (statewalker/webrun-vcs#363)
   it('t4301: "error out on missing tree objects"', async () => {
     const bare = join(root, `missing-tree-${counter++}.git`);
     shell.ok(root, "init", "-q", "--bare", bare);
     script(
       dir,
       `{ git rev-list side3; git rev-parse side3^:; } |
-git pack-objects -q ${JSON.stringify(bare)}/objects/pack/pack`,
+git pack-objects -q ${JSON.stringify(bare)}/objects/pack/side3-tree-is-missing`,
     );
     const side3 = shell.ok(dir, "rev-parse", "side3").trim();
     const out = await checkBare(bare, [`${side3}^`, side3]);
@@ -459,7 +459,7 @@ git pack-objects -q ${JSON.stringify(bare)}/objects/pack/pack`,
       (id) =>
         shell.git(dir, ["mktree"], { input: `100644 blob ${id}\tblob\n` }).stdout.trim() as string,
     );
-    shell.git(dir, ["pack-objects", "-q", `${bare}/objects/pack/pack`], {
+    shell.git(dir, ["pack-objects", "-q", `${bare}/objects/pack/side1-whatever-is-missing`], {
       input: [ids[0], ids[2], ...trees].join("\n"),
     });
     const out = await checkBare(bare, [`--merge-base=${trees[0]}`, trees[1], trees[2]]);
