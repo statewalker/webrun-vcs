@@ -17,7 +17,7 @@ import {
   writePack,
 } from "@statewalker/vcs-core";
 import { multiPackIndexWrite } from "./multi-pack-index.js";
-import { objectIdPattern } from "./object-names.js";
+import { keepPackNames, objectIdPattern } from "./object-names.js";
 import { packDeltaSearch, readPackWriteSettings } from "./pack/pack-write-settings.js";
 import {
   IncrementalBitmapError,
@@ -83,15 +83,14 @@ export async function geometricRepack(options: RepackOptions): Promise<RepackRes
 
   await packs.refresh();
   const all = await packs.packs();
-  const inCore = new Set(
-    (options.keepPacks ?? []).map((n) => n.replace(/^pack-/, "").replace(/\.pack$/, "")),
-  );
+  // by base name, as git's --keep-pack compares pack_basename (`custom-<id>.pack` too)
+  const inCore = keepPackNames(options.keepPacks);
   const info = await Promise.all(
     all.map(async (p) => {
       const base = joinPath(packDir, packNameOf(p));
       return {
         pack: p,
-        keep: (await files.exists(`${base}.keep`)) || inCore.has(p.packId),
+        keep: (await files.exists(`${base}.keep`)) || inCore.has(packNameOf(p)),
         cruft: await files.exists(`${base}.mtimes`),
         promisor: await files.exists(`${base}.promisor`),
         mtime: (await files.stats(`${base}.pack`))?.lastModified ?? 0,

@@ -44,7 +44,7 @@ import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { assertAlternatesReadable } from "./alternates/index.js";
 import { objectLinks, recentPackedObjects, writeCruftPacks } from "./cruft-pack.js";
 import { type MultiPackIndexWriteOptions, multiPackIndexWrite } from "./multi-pack-index.js";
-import { objectIdPattern } from "./object-names.js";
+import { keepPackNames, objectIdPattern } from "./object-names.js";
 import {
   type PackWriteSettings,
   packDeltaSearch,
@@ -529,12 +529,7 @@ export async function repackListed(
   const replaced: Pack[] = [];
   // --keep-pack: kept in core, whatever --pack-kept-objects says
   // by base name, as git's --keep-pack compares pack_basename (`custom-<id>.pack` too)
-  const inCore = new Set(
-    (options.keepPacks ?? []).map((n) => {
-      const base = n.replace(/\.pack$/, "");
-      return /^[0-9a-f]+$/.test(base) ? `pack-${base}` : base;
-    }),
-  );
+  const inCore = keepPackNames(options.keepPacks);
   const keptInCore: Pack[] = [];
   for (const p of before) {
     if (inCore.has(packNameOf(p))) keptInCore.push(p);

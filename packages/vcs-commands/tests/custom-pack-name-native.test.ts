@@ -87,7 +87,7 @@ async function catFileBoth(caseDir: string, home: string, ids: string[]) {
   const native = git(home, join(caseDir, "native", "repo"), ["cat-file", "--batch-check"], input);
   const ours = await (await openOursGc(home, join(caseDir, "ours")))
     .catFile()
-    .setBatch("check")
+    .setBatch("info")
     .setStdin(input)
     .callOutput();
   return { native, ours };
@@ -193,6 +193,29 @@ describeGit("packs not named pack-<id> against native git (#363)", () => {
       .call();
     const custom = (r: string) => packFiles(r).filter((n) => n.startsWith("custom-"));
     expect(custom(nativeDir).filter((n) => n.endsWith(".keep")).length).toBe(1);
+    expect(custom(oursDir)).toEqual(custom(nativeDir));
+    expect(fsck(home, oursDir).status).toBe(0);
+    const check = git(home, oursDir, ["cat-file", "--batch-check"], `${ids.join("\n")}\n`);
+    expect(check.stdout).not.toContain("missing");
+  });
+
+  it("repack --geometric -d --keep-pack=<custom>.pack keeps that pack, as git's repack", async () => {
+    const caseDir = newCase(root, "geometric-keep-pack");
+    const { repo, ids } = customPackedRepo(caseDir, home, ["alpha", "beta", "gamma"]);
+    const keep = packFiles(repo.dir).find((n) => n.startsWith("beta-") && n.endsWith(".pack"));
+    expect(keep).toBeDefined();
+    const nativeDir = join(copyTwin(caseDir, "native"), "repo");
+    const oursDir = join(copyTwin(caseDir, "ours"), "repo");
+    const n = git(home, nativeDir, ["repack", "-q", "--geometric=2", "-d", `--keep-pack=${keep}`]);
+    expect(n.status).toBe(0);
+    await (await openOursGc(home, join(caseDir, "ours")))
+      .repack()
+      .setGeometric(2)
+      .setDeleteRedundant(true)
+      .addKeepPack(keep as string)
+      .call();
+    const custom = (r: string) => packFiles(r).filter((f) => /^(alpha|beta|gamma)-/.test(f));
+    expect(custom(nativeDir).some((f) => f === keep)).toBe(true);
     expect(custom(oursDir)).toEqual(custom(nativeDir));
     expect(fsck(home, oursDir).status).toBe(0);
     const check = git(home, oursDir, ["cat-file", "--batch-check"], `${ids.join("\n")}\n`);
