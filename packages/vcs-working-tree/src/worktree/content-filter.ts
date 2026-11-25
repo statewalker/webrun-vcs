@@ -55,9 +55,11 @@ export interface AttributesIndex {
  *   worktree's when the index holds none.
  * - `checkin` (the default, as for `checkout -- <path>`, `checkout-index`, `restore`): the
  *   worktree's file first, the index's when the worktree has none.
+ * - `index` (git's `GIT_ATTR_INDEX`, `git archive` without `--worktree-attributes`): the
+ *   index's file alone, the worktree never read.
  */
 export interface ContentAttributesContext {
-  direction: "checkin" | "checkout";
+  direction: "checkin" | "checkout" | "index";
   /** The index read (default: the working copy's current index) */
   index?: AttributesIndex;
   /**

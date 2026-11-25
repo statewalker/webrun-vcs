@@ -30,8 +30,21 @@ const STRATEGY = 0;
 /** git's default level for loose objects (`core.looseCompression`: `Z_BEST_SPEED`). */
 export const LOOSE_OBJECT_COMPRESSION_LEVEL = 1;
 
-/** Pooled deflate states, by level (-1 to 9). */
-const pool = new Map<number, ZStream>();
+/**
+ * The stream a deflate writes: a zlib stream (header and Adler-32 trailer), raw deflate data
+ * (zlib's negative `windowBits`: zip entries) or a gzip member with zlib's default header
+ * (no name, time 0, the OS byte 3, as git's `git archive --format=tgz` writes it).
+ */
+export type DeflateFormat = "zlib" | "raw" | "gzip";
+
+const WINDOW_BITS_OF: Record<DeflateFormat, number> = {
+  zlib: WINDOW_BITS,
+  raw: -WINDOW_BITS,
+  gzip: WINDOW_BITS + 16,
+};
+
+/** Pooled deflate states, by format and level (-1 to 9). */
+const pool = new Map<string, ZStream>();
 
 /** zlib's `deflateBound` for a zlib stream (wrapper included) of `n` input bytes. */
 function deflateBound(n: number): number {
@@ -41,7 +54,9 @@ function deflateBound(n: number): number {
 /**
  * The zlib stream (header, deflate data, Adler-32 trailer) of `chunks` taken as one input,
  * compressed at `level` (default 6, zlib's default; git writes loose objects at
- * {@link LOOSE_OBJECT_COMPRESSION_LEVEL}).
+ * {@link LOOSE_OBJECT_COMPRESSION_LEVEL}). `format` asks for raw deflate data or a gzip
+ * member instead (see {@link DeflateFormat}). The deflate data is pako's: for inputs past a
+ * few KiB it can differ from what a newer system zlib writes, though it inflates the same.
  *
  * @example
  * ```typescript
@@ -52,9 +67,11 @@ function deflateBound(n: number): number {
  */
 export function deflateSync(
   chunks: readonly Uint8Array[],
-  options?: { level?: number },
+  options?: { level?: number; format?: DeflateFormat },
 ): Uint8Array {
   const level = options?.level ?? 6;
+  const format = options?.format ?? "zlib";
+  const windowBits = WINDOW_BITS_OF[format];
   if (!Number.isInteger(level) || level < -1 || level > 9) {
     throw new RangeError(`bad compression level ${level}`);
   }
@@ -70,18 +87,20 @@ export function deflateSync(
       at += chunk.length;
     }
   }
-  let strm = pool.get(level);
+  const key = `${format}:${level}`;
+  let strm = pool.get(key);
   if (strm) {
-    pool.delete(level); // taken: a reentrant call (none today) gets a state of its own
+    pool.delete(key); // taken: a reentrant call (none today) gets a state of its own
     if (zlibDeflateReset(strm) !== Z_OK) strm = undefined;
   }
   if (!strm) {
     strm = new ZStream();
-    if (zlibDeflateInit2(strm, level, Z_DEFLATED, WINDOW_BITS, MEM_LEVEL, STRATEGY) !== Z_OK) {
+    if (zlibDeflateInit2(strm, level, Z_DEFLATED, windowBits, MEM_LEVEL, STRATEGY) !== Z_OK) {
       throw new CompressionError(`deflate init failed: ${strm.msg || "unknown error"}`);
     }
   }
-  const out = new Uint8Array(deflateBound(total));
+  // a gzip wrapper is 18 bytes against zlib's 6
+  const out = new Uint8Array(deflateBound(total) + 12);
   strm.input = input;
   strm.next_in = 0;
   strm.avail_in = input.length;
@@ -96,6 +115,6 @@ export function deflateSync(
   // release the input and output, keep the state for the next call
   strm.input = null as unknown as Uint8Array;
   strm.output = null as unknown as Uint8Array<ArrayBuffer>;
-  pool.set(level, strm);
+  pool.set(key, strm);
   return out.subarray(0, length);
 }
