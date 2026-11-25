@@ -52,7 +52,28 @@ export type PackObjectRef =
       path?: string;
       /** The path's name hash, when known without the path (a bitmap's name-hash cache) */
       nameHash?: number;
+      /**
+       * Never searched for a delta, as target or base (git's `no_try_delta`: the path's `delta`
+       * attribute is unset). A stored delta is still copied.
+       */
+      noDelta?: boolean;
     };
+
+/**
+ * Delta islands (git's `--delta-islands`, delta-islands.c): which objects may be deltas of
+ * which. `computeDeltaIslands` builds them from `pack.island`.
+ */
+export interface DeltaIslandRules {
+  /** git's `in_same_island`: may `target` be a delta of `base` (copied or searched) */
+  sameIsland(target: ObjectId, base: ObjectId): boolean;
+  /** git's `island_delta_cmp`, a key of the delta search's sort (before the size) */
+  compare(a: ObjectId, b: ObjectId): number;
+  /**
+   * git's `compute_pack_layers` (`pack.islandCore`): the write order's layer of an object (0
+   * first); undefined writes every object in one layer
+   */
+  layer?(id: ObjectId): number;
+}
 
 /** A stored entry `writePack` may copy (a `PackSet` is one source of them). */
 export type ReusableEntry = Pick<PackedEntry, "kind" | "size" | "baseId" | "raw" | "data"> & {
@@ -104,6 +125,8 @@ export interface WritePackOptions {
   haves?: Iterable<PackObjectRef>;
   /** Blobs larger than this are written whole, never searched (git's core.bigFileThreshold). Default 50 MiB. */
   bigFileThreshold?: number;
+  /** Delta islands: reused and searched deltas stay within them, core objects first. */
+  islands?: DeltaIslandRules;
   /** Called after each entry is written (for an idx: offsets and CRC-32). */
   onEntry?: (entry: WrittenPackEntry) => void;
   /**
@@ -170,6 +193,8 @@ interface Planned {
   reusedAbove?: number;
   /** a have: a base only, never written */
   have: boolean;
+  /** never a delta target or base of the search (the `delta` attribute unset) */
+  noDelta?: boolean;
   offset?: number;
   /** walk marks of breakReuseCycles (1 on the path, 2 done) and limitReusedChains (3 depth known) */
   mark?: number;
@@ -207,6 +232,7 @@ export async function* writePack(
   const search =
     options.deltaSearch === true ? {} : options.deltaSearch ? options.deltaSearch : undefined;
   const onEntry = options.onEntry;
+  const islands = options.islands;
 
   // ---- plan: one record per object, in order, without duplicates ----
   const byId = new Map<ObjectId, Planned>();
@@ -220,6 +246,7 @@ export async function* writePack(
       nameHash: r.nameHash ?? packNameHash(r.path),
       depth: 0,
       have: false,
+      ...(r.noDelta ? { noDelta: true } : {}),
     };
     byId.set(r.id, p);
     order.push(p);
@@ -253,6 +280,8 @@ export async function* writePack(
       } else if ((e.kind === OFS_DELTA || e.kind === REF_DELTA) && reuseDeltas && e.baseId) {
         // kept only if its base is written or is a have of a thin pack
         const base = byId.get(e.baseId);
+        // can_reuse_delta: not across islands
+        if (islands && !islands.sameIsland(p.id, e.baseId)) continue;
         if (base || haves.has(e.baseId)) {
           p.reuse = e;
           p.reuseBase = base;
@@ -266,7 +295,16 @@ export async function* writePack(
   }
 
   if (search) {
-    await searchDeltas(objects, order, haves, search, bigFileThreshold, format.rawLength);
+    await searchDeltas(objects, order, haves, search, bigFileThreshold, format.rawLength, islands);
+  }
+
+  // pack.islandCore: the core island's objects are written first (compute_pack_layers; the
+  // order within a layer is kept)
+  if (islands?.layer) {
+    const layerOf = islands.layer.bind(islands);
+    const layered = order.map((p, i) => ({ p, i, layer: layerOf(p.id) }));
+    layered.sort((a, b) => a.layer - b.layer || a.i - b.i);
+    order.splice(0, order.length, ...layered.map((l) => l.p));
   }
 
   // ---- write ----
@@ -593,6 +631,7 @@ async function searchDeltas(
   o: DeltaSearchOptions,
   bigFileThreshold: number,
   rawLength: number,
+  islands?: DeltaIslandRules,
 ) {
   const windowSize = o.window ?? 10;
   const maxDepth = o.depth ?? 50;
@@ -607,6 +646,7 @@ async function searchDeltas(
   const candidates: Planned[] = [];
   for (const p of [...order, ...bases]) {
     if (p.reuse && p.reuse.kind > 4) continue; // a reused delta
+    if (p.noDelta) continue; // the delta attribute unset: neither target nor base
     if (!(await header(objects, p))) continue;
     const size = p.size as number;
     if (size > maxObjectSize || (!p.have && size < MIN_DELTA_TARGET)) continue;
@@ -619,6 +659,7 @@ async function searchDeltas(
       a.nameHash - b.nameHash ||
       // the receiver's objects first: bases for what follows (git's preferred_base)
       Number(b.have) - Number(a.have) ||
+      (islands ? islands.compare(a.id, b.id) : 0) ||
       (b.size as number) - (a.size as number) ||
       (rank.get(a) as number) - (rank.get(b) as number),
   );
@@ -644,6 +685,8 @@ async function searchDeltas(
         // a delta between two objects of one pack, the target stored whole, was tried (and
         // discarded) when that pack was written; a have is always tried
         if (p.wholeIn !== undefined && p.wholeIn === w.p.wholeIn && !w.p.have) continue;
+        // try_delta: never across islands
+        if (islands && !islands.sameIsland(p.id, w.p.id)) continue;
         // the reused deltas on p get as much deeper as p does
         if (w.p.depth + 1 + (p.reusedAbove ?? 0) > maxDepth) continue;
         // git's try_delta size limit, tighter for bases deep in a chain

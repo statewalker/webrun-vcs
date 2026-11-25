@@ -34,6 +34,7 @@ export * from "./reflog-expire.js";
 export * from "./refs/index.js";
 // Repack
 export * from "./repack.js";
+export * from "./repack-geometric.js";
 // core.repositoryformatversion and extensions.*, checked as git does
 export * from "./repository-format.js";
 // `git rerere gc`, as gc runs it
