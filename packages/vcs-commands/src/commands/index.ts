@@ -85,6 +85,7 @@ export {
   NotesTree,
 } from "./notes-tree.js";
 export * from "./pack-refs-command.js";
+export * from "./plumbing-command.js";
 export * from "./pretty-format.js";
 export * from "./promisor-remote.js";
 export * from "./pull-command.js";
