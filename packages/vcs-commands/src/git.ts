@@ -61,6 +61,7 @@ import {
   HookRunCommand,
   InitCommand,
   InterpretTrailersCommand,
+  LastModifiedCommand,
   LfsConfig,
   type LfsConfigLoadOptions,
   LfsEndpointCommand,
@@ -1834,6 +1835,19 @@ export class Git implements Disposable {
   lsRemote(): LsRemoteCommand {
     this.checkClosed();
     return this.withTransports(new LsRemoteCommand(this._workingCopy));
+  }
+
+  /**
+   * Create a LastModifiedCommand (`git last-modified`): the commit that last changed each path.
+   *
+   * @example
+   * ```typescript
+   * const entries = await git.lastModified().setRecursive().callEntries();
+   * ```
+   */
+  lastModified(): LastModifiedCommand {
+    this.checkClosed();
+    return new LastModifiedCommand(this._workingCopy);
   }
 
   /**
