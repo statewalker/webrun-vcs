@@ -38,6 +38,7 @@ import { RemoteConfigStore } from "../remote-config/index.js";
 import { type PushResult, PushStatus, type RemoteRefUpdate } from "../results/push-result.js";
 import { TransportCommand } from "../transport-command.js";
 import { endOfSymbolicChain, installTracking, pushTrackingPlan } from "./branch-tracking.js";
+import { FetchCommand } from "./fetch-command.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import { remoteHookSession } from "./local-transport.js";
 import { withRemoteReceivePack } from "./remote-transport.js";
@@ -760,6 +761,10 @@ export class PushCommand extends TransportCommand<PushResult> {
           }
         : {}),
       followTags: this.followTags ?? this.configBool("push.followTags") ?? false,
+      // push.negotiate: send-pack's child `git fetch --negotiate-only` to the same URL
+      ...(this.configBool("push.negotiate")
+        ? { negotiate: (tips: readonly string[]) => this.negotiateCommons(remoteUrl, tips) }
+        : {}),
       onProgress: (message) => {
         messages.push(message);
         this.progressMessageCallback?.(message);
@@ -1310,6 +1315,30 @@ export class PushCommand extends TransportCommand<PushResult> {
    * of the remote ref's name), or an ancestor of one of the entries read until one older than
    * the remote-tracking ref's latest reflog entry.
    */
+  /**
+   * get_commons_through_negotiation: `git fetch --negotiate-only --negotiation-tip=<id>...
+   * <url>` run as git's child, its acknowledged commits the commons; its warnings (stderr)
+   * passed on, and no commons when it fails (git's "push negotiation failed").
+   */
+  private async negotiateCommons(
+    url: string,
+    tips: readonly string[],
+  ): Promise<{ commons?: readonly string[]; warnings?: readonly string[] }> {
+    const fetch = this.configureChild(new FetchCommand(this._workingCopy))
+      .setRemote(url)
+      .setNegotiationTips(...tips)
+      .setNegotiateOnly(true);
+    try {
+      const result = await fetch.call();
+      return {
+        warnings: result.messages,
+        ...(result.exitCode ? {} : { commons: result.negotiatedCommits ?? [] }),
+      };
+    } catch (error) {
+      return { warnings: [error instanceof Error ? error.message : String(error)] };
+    }
+  }
+
   private async isReachableInReflog(
     localRef: string,
     trackingRef: string | undefined,

@@ -27,6 +27,10 @@ import {
   formatFetchHead,
   matchDestination,
   matchSource,
+  NegotiateOnlyUnsupportedError,
+  type NegotiationAlgorithm,
+  negotiateOnly,
+  negotiationAlgorithmOf,
   ObjectFormatMismatchError,
   parseRefSpec,
   type RefSpec,
@@ -37,7 +41,7 @@ import {
 } from "@statewalker/vcs-transport";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { nullObjectIdLike } from "@statewalker/vcs-utils/hash";
-import type { WorktreeAdmin } from "@statewalker/vcs-working-tree";
+import { type WorktreeAdmin, wildmatch } from "@statewalker/vcs-working-tree";
 import {
   FetchIntoCheckedOutBranchError,
   GitApiError,
@@ -162,6 +166,9 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   /** `--filter=<spec>` (a string), `--no-filter` (false), or neither */
   private filterSpec?: string | false;
   private refetch = false;
+  /** `--negotiation-tip=<revision>` (a revision, or a ref glob), in order */
+  private negotiationTips: string[] = [];
+  private negotiateOnlyMode = false;
   private setUpstream = false;
   /** `--[no-]recurse-submodules[=<mode>]`; unset: the configuration's */
   private recurseSubmodules?: FetchRecurseSubmodules;
@@ -426,6 +433,32 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   setRefetch(refetch: boolean): this {
     this.checkCallable();
     this.refetch = refetch;
+    return this;
+  }
+
+  /**
+   * `git fetch --negotiation-tip=<revision>`: the negotiation offers only the history of these
+   * (a revision, or a glob of refs such as `refs/heads/feature-*`) instead of every local
+   * ref's; what the fetch counts as here still follows every ref. A revision that names
+   * nothing dies `<rev> is not a valid object`; a glob matching no ref is ignored with git's
+   * warning.
+   */
+  setNegotiationTips(...tips: string[]): this {
+    this.checkCallable();
+    this.negotiationTips = [...tips];
+    return this;
+  }
+
+  /**
+   * `git fetch --negotiate-only`: negotiates with the remote from {@link setNegotiationTips}
+   * (protocol v2, a server with `wait-for-done`) and fetches nothing; the commits the server
+   * acknowledged come back as {@link FetchResult.negotiatedCommits} (git prints them on
+   * stdout). Without a tip it dies as git does; over protocol v0, or a server without
+   * `wait-for-done`, the result carries git's warning in `messages` and `exitCode` 255.
+   */
+  setNegotiateOnly(negotiateOnly: boolean): this {
+    this.checkCallable();
+    this.negotiateOnlyMode = negotiateOnly;
     return this;
   }
 
@@ -779,6 +812,24 @@ export class FetchCommand extends TransportCommand<FetchResult> {
   async call(): Promise<FetchResult> {
     this.checkCallable();
     this.setCallable(false);
+    if (this.negotiateOnlyMode) {
+      // cmd_fetch: --negotiate-only never recurses, and needs a tip
+      if (this.recurseSubmodules === "yes" || this.recurseSubmodules === "on-demand") {
+        throw new GitApiError(
+          "fatal: options '--negotiate-only' and '--recurse-submodules' cannot be used together",
+          { exitCode: 128 },
+        );
+      }
+      // git 2.43 dies before the remote is reached; 2.5x once it is (the tips may come from
+      // remote.<name>.negotiationRestrict), naming --negotiation-restrict
+      if (this.negotiationTips.length === 0 && this.negotiationCompatibility() === "2.43") {
+        throw new GitApiError("fatal: --negotiate-only needs one or more --negotiation-tip=*", {
+          exitCode: 128,
+        });
+      }
+    }
+    const negotiationAlgorithm = this.negotiationAlgorithm();
+    if (this.negotiateOnlyMode) return this.callNegotiateOnly(negotiationAlgorithm);
 
     // remote_get: a remote the configuration gives no URL may come from .git/remotes/ or
     // .git/branches/ (git 2.x); 2.5x warns that it read one
@@ -917,6 +968,10 @@ export class FetchCommand extends TransportCommand<FetchResult> {
     );
 
     const sessionId = clientSessionIdOf(this.workingCopy);
+    // --negotiation-tip: resolved before anything is fetched (add_negotiation_tips)
+    const tipsGiven = this.negotiationTipsGiven();
+    const negotiationTips =
+      tipsGiven.length > 0 ? await this.resolveNegotiationTips(messages, tipsGiven) : undefined;
     const unpackLimit = unpackLimitOf({ getAll: (key) => store.values(key) }, "fetch");
     const fetchOptions: TransportFetchOptions = {
       ...(sessionId !== undefined ? { sessionId } : {}),
@@ -986,6 +1041,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       ...(unpackLimit !== undefined ? { unpackLimit } : {}),
       ...(filter ? { filter } : {}),
       ...(this.refetch ? { refetch: true } : {}),
+      ...(negotiationAlgorithm !== "consecutive" ? { negotiationAlgorithm } : {}),
+      ...(negotiationTips ? { negotiationTips } : {}),
       // the transport's warnings (a filter the server ignores, the dumb walker's alternates)
       onWarning: (line: string) => messages.push(line),
     };
@@ -1135,6 +1192,149 @@ export class FetchCommand extends TransportCommand<FetchResult> {
    * undefined when the fetch does not recurse (`no`, `--porcelain`, no worktree). git checks
    * `submodule.fetchJobs` there too (a negative one dies).
    */
+  /**
+   * `fetch.negotiationAlgorithm` (repo-settings.c): `feature.experimental` makes `skipping` the
+   * default; a variable without a value or an unknown value dies as git does.
+   */
+  private negotiationAlgorithm(): NegotiationAlgorithm {
+    const store = RemoteConfigStore.from(this.workingCopy);
+    const key = "fetch.negotiationalgorithm";
+    const entries = store.valuesWithOrigin(key);
+    const last = entries[entries.length - 1];
+    if (last && last.text === undefined) {
+      const where =
+        last.file !== undefined && last.line !== undefined
+          ? `fatal: bad config variable '${key}' in file '${last.file}' at line ${last.line}`
+          : `fatal: unable to parse '${key}' from command-line config`;
+      throw new GitApiError(`error: missing value for '${key}'\n${where}`, { exitCode: 128 });
+    }
+    const experimental = configBool(store.value("feature.experimental")) ?? false;
+    try {
+      return negotiationAlgorithmOf(last?.text, experimental);
+    } catch (error) {
+      throw new GitApiError(`fatal: ${(error as Error).message}`, { exitCode: 128 });
+    }
+  }
+
+  /** The git version negotiation options follow (2.5x renamed `--negotiation-tip`). */
+  private negotiationCompatibility(): "2.43" | "2.56" {
+    return this.compatibility ?? this.hooks.compatibility;
+  }
+
+  /**
+   * The negotiation tips given (`--negotiation-tip`), else (git 2.5x) the remote's
+   * `remote.<name>.negotiationRestrict` values.
+   */
+  private negotiationTipsGiven(): string[] {
+    if (this.negotiationTips.length > 0 || this.negotiationCompatibility() === "2.43") {
+      return this.negotiationTips;
+    }
+    const store = RemoteConfigStore.from(this.workingCopy);
+    if (!store.isConfigured(this.remote)) return [];
+    return store.values(`remote.${this.remote}.negotiationRestrict`).filter((v) => v !== "");
+  }
+
+  /**
+   * add_negotiation_tips: a revision (no glob characters) must name an object here, else git
+   * dies (git 2.5x skips a name that resolves to nothing); a glob adds every ref it matches
+   * (`refs/` put before a pattern without it), with git's warning when it matches none.
+   */
+  private async resolveNegotiationTips(
+    messages: string[],
+    given: readonly string[] = this.negotiationTips,
+  ): Promise<ObjectId[]> {
+    const legacy = this.negotiationCompatibility() === "2.43";
+    const option = legacy ? "--negotiation-tip" : "--negotiation-restrict";
+    const tips: ObjectId[] = [];
+    const glob = (text: string) => /[*?[\\]/.test(text);
+    const refs = given.some(glob)
+      ? await createTransportRefStore(this._workingCopy.history.refs).listAll()
+      : [];
+    for (const tip of given) {
+      if (!glob(tip)) {
+        let id: ObjectId;
+        try {
+          id = await this.resolveRevision(tip);
+        } catch (error) {
+          if (!legacy) continue;
+          throw new GitApiError(`fatal: ${tip} is not a valid object`, {
+            exitCode: 128,
+            cause: error,
+          });
+        }
+        if (!(await this._workingCopy.history.objects?.has(id))) {
+          throw new GitApiError(`fatal: the object ${tip} does not exist`, { exitCode: 128 });
+        }
+        tips.push(id);
+        continue;
+      }
+      const pattern = tip.startsWith("refs/") ? tip : `refs/${tip}`;
+      const before = tips.length;
+      for (const [name, id] of refs) if (wildmatch(pattern, name)) tips.push(id);
+      if (tips.length === before) {
+        messages.push(`warning: ignoring ${option}=${tip} because it does not match any refs`);
+      }
+    }
+    return tips;
+  }
+
+  /**
+   * `git fetch --negotiate-only`: the negotiation alone, over the remote's upload-pack; the
+   * acknowledged commits in {@link FetchResult.negotiatedCommits}. transport.c's refusals
+   * (protocol v0, no `wait-for-done`) are its warning and exit status 255.
+   */
+  private async callNegotiateOnly(algorithm: NegotiationAlgorithm): Promise<FetchResult> {
+    const legacyMessages = await this.loadLegacyRemote(this.remote);
+    const remoteUrl = await this.resolveRemoteUrl(this.remote);
+    if (!remoteUrl) throw new InvalidRemoteError(this.remote);
+    const messages: string[] = [...legacyMessages];
+    const given = this.negotiationTipsGiven();
+    const tips = await this.resolveNegotiationTips(messages, given);
+    const remote = await this.prepareRemote(remoteUrl);
+    if (given.length === 0) {
+      throw new GitApiError("fatal: --negotiate-only needs one or more --negotiation-restrict=*", {
+        exitCode: 128,
+      });
+    }
+    const uploadPack = this.uploadPack ?? this.remoteProgram(this.remote, "uploadpack");
+    const sessionOptions = {
+      ...this.remoteSessionOptions(),
+      ...(uploadPack !== undefined ? { program: uploadPack } : {}),
+    };
+    const history = this._workingCopy.history;
+    const sessionId = clientSessionIdOf(this.workingCopy);
+    const result: FetchResult = {
+      uri: remoteUrl,
+      advertisedRefs: new Map(),
+      trackingRefUpdates: [],
+      bytesReceived: 0,
+      isEmpty: false,
+      messages,
+      negotiatedCommits: [],
+    };
+    const shallow = (await history.refs.getShallow?.()) ?? [];
+    try {
+      result.negotiatedCommits = await withRemoteUploadPack(remote, sessionOptions, (connection) =>
+        negotiateOnly(connection, {
+          repository: createRepositoryFacade({ history: historyWithoutLazyFetch(history) }),
+          tips,
+          negotiationAlgorithm: algorithm,
+          shallow,
+          ...(sessionId !== undefined ? { sessionId } : {}),
+        }),
+      );
+    } catch (error) {
+      if (error instanceof NegotiateOnlyUnsupportedError) {
+        messages.push(error.message);
+        // transport_fetch_refs' -1, git's exit status 255
+        result.exitCode = 255;
+        return result;
+      }
+      throw error;
+    }
+    return result;
+  }
+
   private async submoduleRecursion(
     store: RemoteConfigStore,
   ): Promise<
