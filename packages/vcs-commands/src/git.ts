@@ -83,6 +83,7 @@ import {
   ShortlogCommand,
   ShowCommand,
   ShowCurrentBranchCommand,
+  ShowRefCommand,
   SparseCheckoutCommand,
   StashApplyCommand,
   StashBranchCommand,
@@ -408,6 +409,20 @@ export class Git implements Disposable {
   show(): ShowCommand {
     this.checkClosed();
     return new ShowCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a ShowRefCommand (`git show-ref`): refs and their ids, `--verify`, `--exists`,
+   * `--exclude-existing`, with git's stdout, stderr and exit status.
+   *
+   * @example
+   * ```typescript
+   * const { stdout, exitCode } = await git.showRef().setTags(true).setDereference(true).callOutput();
+   * ```
+   */
+  showRef(): ShowRefCommand {
+    this.checkClosed();
+    return new ShowRefCommand(this._workingCopy);
   }
 
   /**

@@ -119,6 +119,7 @@ export * from "./serve-repository.js";
 export * from "./shortlog.js";
 export * from "./shortlog-command.js";
 export * from "./show-command.js";
+export * from "./show-ref-command.js";
 export * from "./signature-check.js";
 export * from "./signing.js";
 export * from "./sparse-checkout-command.js";
