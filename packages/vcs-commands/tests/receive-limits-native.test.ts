@@ -304,10 +304,7 @@ describeGit("receive-pack's limits and policies, as native git", () => {
       .call();
     expect(mine.remoteUpdates.map((u) => u.status)).toEqual(["ok"]);
     for (const base of [dirs.n, dirs.o]) {
-      expect([base, existsSync(join(base, "child", ".git", "objects", "tmp_test_object"))]).toEqual([
-        base,
-        false,
-      ]);
+      expect(existsSync(join(base, "child", ".git", "objects", "tmp_test_object"))).toBe(false);
     }
     const state = stateOf(join(dirs.n, "child", ".git"));
     expect(state.packs).toBe(1);
