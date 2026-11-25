@@ -253,7 +253,7 @@ function chunkAt(bytes: Uint8Array, name: string): number {
 }
 
 describe("crafted multi-pack-indexes (served repositories)", () => {
-  it("refuses PNAM entries that are not plain pack-<hex>.idx names", async () => {
+  it("refuses PNAM entries naming files outside the pack directory", async () => {
     for (const name of ["../x.idx", "../../../victim/pack-v.idx", "sub/pack-aaaa.idx"]) {
       const e = encodeMultiPackIndex({ packs: [pack(name, [id(1)], 1)] });
       expect(() => parseMultiPackIndex(e.bytes, "midx")).toThrow(MultiPackIndexError);

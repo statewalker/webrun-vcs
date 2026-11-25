@@ -90,6 +90,8 @@ export interface PackedEntry {
 export interface Pack {
   /** hex hash of the pack (its trailer, recorded in the idx): SHA-1, or SHA-256's 64 digits */
   readonly packId: string;
+  /** The base name of its files (`PackFile.name`); `pack-<packId>` when absent ({@link packNameOf}). */
+  readonly name?: string;
   /** objects in the pack */
   readonly count: number;
   /** The object format of its ids and checksums (SHA-1 when absent) */
@@ -182,8 +184,28 @@ export interface PackStats {
   readonly idCompares: number;
 }
 
+/**
+ * The base name of a pack's files in the pack directory: its `name`, else `pack-<packId>`.
+ * Code naming a pack's `.keep`, `.mtimes`, `.promisor`… goes through this, never through
+ * `pack-${packId}`: git reads packs of any name (`custom-<id>.pack`).
+ */
+export function packNameOf(pack: { readonly packId: string; readonly name?: string }): string {
+  return pack.name ?? `pack-${pack.packId}`;
+}
+
+/** The base name of a pack's files: `dir/custom-<id>.pack` gives `custom-<id>`. */
+export function packBaseName(path: string): string {
+  return path.slice(path.lastIndexOf("/") + 1).replace(/\.(?:pack|idx)$/, "");
+}
+
 /** A pack opened by `openPack`: `Pack`, plus its paths and counters. */
 export interface PackFile extends Pack {
+  /**
+   * The base name of its files in the pack directory: `pack-<packId>` as git and ours write
+   * them, or any other name git reads (`git pack-objects objects/pack/custom` writes
+   * `custom-<id>.pack`). Its `.keep`, `.rev`, `.bitmap`, `.promisor`, `.mtimes` share it.
+   */
+  readonly name: string;
   readonly packPath: string;
   readonly idxPath: string;
   readonly stats: PackStats;
@@ -1884,6 +1906,7 @@ export async function openPack(
     packId,
     count: n,
     objectFormat: format,
+    name: packBaseName(packPath),
     packPath,
     idxPath,
     stats: {

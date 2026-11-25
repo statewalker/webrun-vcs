@@ -24,6 +24,7 @@ import {
   joinPath,
   openPackSet,
   type PromisorPack,
+  packNameOf,
   withLazyFetch,
 } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils/encoding";
@@ -604,7 +605,7 @@ export function promisorPacksOf(
       let marked = known.get(pack.packId);
       if (!marked) {
         marked = files
-          .stats(joinPath(packDir, `pack-${pack.packId}.promisor`))
+          .stats(joinPath(packDir, `${packNameOf(pack)}.promisor`))
           .then((s) => s?.kind === "file")
           .catch(() => false);
         known.set(pack.packId, marked);
