@@ -8,9 +8,9 @@
  */
 import { FileMode, type ObjectId, objectFormatOf } from "@statewalker/vcs-core";
 import { isGitDirectory } from "@statewalker/vcs-store-files";
-import type { GitTransportRegistry } from "@statewalker/vcs-transport";
+import type { GitTransportRegistry, HttpCredentialHelper } from "@statewalker/vcs-transport";
 import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
-import { type FilesApi, type PosixFilesApi, readFile } from "@statewalker/vcs-utils/files";
+import { type FilesApi, readFile } from "@statewalker/vcs-utils/files";
 import { computeObjectId } from "@statewalker/vcs-utils/pack";
 import type { GitHostEnvironment, WorkingCopy } from "@statewalker/vcs-working-tree";
 
@@ -73,6 +73,14 @@ export interface SubmoduleCloneOptions {
    */
   transports?: GitTransportRegistry;
   timeout?: number;
+  /**
+   * The credential helper (git's `credential.helper`, which the child clone reads): asked
+   * with the submodule's own URL after a 401, so it decides per host; the guarded transports
+   * drop what it gave on a redirect to another origin.
+   */
+  credentialHelper?: HttpCredentialHelper;
+  /** git's `warning:` lines of the clone's HTTP client */
+  warningCallback?: (line: string) => void;
 }
 
 /** What a submodule command printed, and its exit status. */
@@ -546,6 +554,8 @@ export abstract class SubmoduleCommandBase extends GitCommand<SubmoduleCommandRe
         if (options.singleBranch !== undefined) clone.setSingleBranch(options.singleBranch);
         if (options.transports) clone.setTransports(options.transports);
         if (options.timeout !== undefined) clone.setTimeout(options.timeout);
+        if (options.credentialHelper) clone.setCredentialHelper(options.credentialHelper);
+        if (options.warningCallback) clone.setWarningCallback(options.warningCallback);
         clone.shareHooksOf(this);
         const result = await clone.call();
         if (!this.quiet) {

@@ -103,6 +103,8 @@ const CLONE_SETTINGS = [
   "timeout",
   "headers",
   "gzipRequests",
+  "credentialHelper",
+  "warningCallback",
   "progressCallback",
   "progressMessageCallback",
   "progress",
@@ -1458,6 +1460,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     if (this.credentials) update.setCredentials(this.credentials);
     if (this.headers) update.setHeaders(this.headers);
     if (this.timeout !== undefined) update.setTimeout(this.timeout);
+    if (this.credentialHelper) update.setCredentialHelper(this.credentialHelper);
+    if (this.warningCallback) update.setWarningCallback(this.warningCallback);
     try {
       return await update.call();
     } catch (error) {
