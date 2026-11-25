@@ -1067,9 +1067,15 @@ export async function prunePacked(
     if (OBJECT_ID.test(id)) loose.push(id);
   }
   let removed = 0;
+  const gone: ObjectId[] = [];
   for (const id of loose) {
-    if ((await packed(id)) && (await looseStorage.remove(id))) removed++;
+    if ((await packed(id)) && (await looseStorage.remove(id))) {
+      removed++;
+      gone.push(id);
+    }
   }
+  // prune_subdir's rmdir of each fan-out directory it went through
+  await looseStorage.removeEmptyDirectories(gone);
   return removed;
 }
 

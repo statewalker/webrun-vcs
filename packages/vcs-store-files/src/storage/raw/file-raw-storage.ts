@@ -105,6 +105,27 @@ export class FileRawStorage implements RawStorage {
     return true;
   }
 
+  /**
+   * Removes the fan-out directories of `keys` (`objects/ab`) that are empty (rmdir: anything
+   * left in one keeps it), as git's prune-packed does after emptying them.
+   */
+  async removeEmptyDirectories(keys: Iterable<string>): Promise<void> {
+    const dirs = new Set<string>();
+    for (const key of keys) {
+      const path = this.getPath(key);
+      dirs.add(path.slice(0, path.lastIndexOf("/")));
+    }
+    for (const dir of dirs) {
+      if (dir === this.basePath || (await this.files.stats(dir))?.kind !== "directory") continue;
+      let empty = true;
+      for await (const _ of this.files.list(dir)) {
+        empty = false;
+        break;
+      }
+      if (empty) await this.files.remove(dir).catch(() => false);
+    }
+  }
+
   async *keys(): AsyncIterable<string> {
     try {
       const seenPrefixes = new Set<string>();

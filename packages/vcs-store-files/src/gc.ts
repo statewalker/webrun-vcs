@@ -726,6 +726,8 @@ async function collect(options: GcOptions): Promise<GcResult> {
     if (!dryRun) {
       const packDir = joinPath(objectsDir, "pack");
       removedTemporaries += await filesStagingStore(files, objectsDir).sweepStaged(tmpExpiryMs);
+      // prune's remove_temporary_files: the objects directory's `tmp_*` files, then the pack's
+      removedTemporaries += (await sweepPackTemporaries(files, objectsDir, tmpExpiryMs)).length;
       removedTemporaries += (await sweepPackTemporaries(files, packDir, tmpExpiryMs)).length;
       removedQuarantines = await sweepQuarantines(files, objectsDir, tmpExpiryMs);
       // packed-refs.new is written only under packed-refs.lock: stale whenever the lock is free
