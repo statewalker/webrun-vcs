@@ -1457,6 +1457,25 @@ export class FileWorktree implements Worktree {
     return undefined;
   }
 
+  async readLocalFile(location: string): Promise<Uint8Array | undefined> {
+    let path = this.locate(location);
+    const files = this.rootFiles;
+    // git's is_file (stat): links are followed, within the storage's root (ELOOP after 40)
+    for (let hops = 0; path !== undefined && hops <= 40; hops++) {
+      const kind = files.lstat
+        ? (await files.lstat(path).catch(() => undefined))?.kind
+        : (await files.stats(path).catch(() => undefined))?.kind;
+      if (kind === "file") return readFile(files, path).catch(() => undefined);
+      if (kind !== "symlink" || !files.readlink) return undefined;
+      const bytes = await files.readlink(path).catch(() => undefined);
+      const target = bytes ? decodeGitPath(bytes) : undefined;
+      if (!target) return undefined;
+      const parent = path.slice(0, Math.max(path.lastIndexOf("/"), 0)) || "/";
+      path = target.startsWith("/") ? this.locate(target) : resolveDots(joinPath(parent, target));
+    }
+    return undefined;
+  }
+
   /**
    * The repository whose git directory is `gitDir` and repository directory `commonDir`
    * (the same, unless `gitDir` is a linked worktree's): its history (HEAD the git
