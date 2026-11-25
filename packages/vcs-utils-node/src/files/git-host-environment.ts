@@ -407,7 +407,9 @@ export function commandLineConfigOf(
  * `GIT_NOTES_DISPLAY_REF`, `GIT_NOTES_REWRITE_REF`, `GIT_NOTES_REWRITE_MODE` for notes,
  * `GIT_CONFIG_COUNT` / `GIT_CONFIG_PARAMETERS` for the command-line config every config read
  * applies last, `GIT_CEILING_DIRECTORIES` and `GIT_DISCOVERY_ACROSS_FILESYSTEM` for
- * repository discovery), files read by absolute path. The system files default to `/etc/gitconfig` and
+ * repository discovery, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
+ * `GIT_OBJECT_DIRECTORY` and `GIT_IMPLICIT_WORK_TREE` for the repository's location
+ * (`setupGitDirectory`), `GIT_OPTIONAL_LOCKS` and `GIT_REF_PARANOIA`), files read by absolute path. The system files default to `/etc/gitconfig` and
  * `/etc/gitattributes`.
  *
  * @example
@@ -614,6 +616,25 @@ export function createNodeGitHostEnvironment(
       ? { ceilingDirectories: env.GIT_CEILING_DIRECTORIES }
       : {}),
     ...(envBool(env.GIT_DISCOVERY_ACROSS_FILESYSTEM) ? { discoveryAcrossFilesystem: true } : {}),
+    // the repository's location (setup.c): an explicit git directory, worktree, common
+    // directory, index and object directory, each as set (git takes an empty value as unset
+    // only for GIT_DIR's discovery: `getenv` then an empty path, which fails as git's does)
+    ...(env.GIT_DIR !== undefined ? { gitDir: env.GIT_DIR } : {}),
+    ...(env.GIT_WORK_TREE !== undefined ? { workTree: env.GIT_WORK_TREE } : {}),
+    ...(env.GIT_COMMON_DIR !== undefined ? { commonDir: env.GIT_COMMON_DIR } : {}),
+    ...(env.GIT_INDEX_FILE !== undefined ? { indexFile: env.GIT_INDEX_FILE } : {}),
+    ...(env.GIT_OBJECT_DIRECTORY !== undefined
+      ? { objectDirectory: env.GIT_OBJECT_DIRECTORY }
+      : {}),
+    ...(env.GIT_IMPLICIT_WORK_TREE !== undefined
+      ? { implicitWorkTree: envBool(env.GIT_IMPLICIT_WORK_TREE) }
+      : {}),
+    // git_env_bool(GIT_OPTIONAL_LOCKS_ENVIRONMENT, 1)
+    ...(env.GIT_OPTIONAL_LOCKS !== undefined
+      ? { optionalLocks: envBool(env.GIT_OPTIONAL_LOCKS) }
+      : {}),
+    // git_env_bool("GIT_REF_PARANOIA", 1) (refs.c's ref_paranoia, on by default since 2.36)
+    ...(env.GIT_REF_PARANOIA !== undefined ? { refParanoia: envBool(env.GIT_REF_PARANOIA) } : {}),
     prefix: options.prefix ?? "/usr",
   };
 }

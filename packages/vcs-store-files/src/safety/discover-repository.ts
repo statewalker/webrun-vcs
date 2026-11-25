@@ -6,7 +6,7 @@
  * bare one) when `safe.bareRepository` allows it.
  */
 
-import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { decodeGitPath, parseGitBool } from "@statewalker/vcs-utils/encoding";
 import {
   type FilesApi,
   joinPath,
@@ -126,16 +126,61 @@ export class FilesystemBoundaryError extends NotAGitRepositoryError {
 export async function discoverRepository(
   options: DiscoverRepositoryOptions,
 ): Promise<DiscoveredRepository> {
-  const { files, environment } = options;
-  const compatibility = options.compatibility ?? "2.56";
+  const { environment } = options;
   if (options.gitDir !== undefined) {
     const gitDir = normalizePath(options.gitDir);
     return { gitDir, bare: !/\/\.git$/.test(gitDir), warnings: [] };
   }
+  // $GIT_DIR / $GIT_WORK_TREE: git's whole setup (setup_explicit_git_dir and the worktree
+  // settings of a discovered repository)
+  if (environment?.gitDir !== undefined || environment?.workTree !== undefined) {
+    const setup = await setupGitDirectory(options);
+    return {
+      gitDir: setup.gitDir,
+      ...(setup.workTree !== undefined ? { workTree: setup.workTree } : {}),
+      ...(setup.gitfile !== undefined ? { gitfile: setup.gitfile } : {}),
+      bare: setup.workTree === undefined,
+      warnings: setup.warnings,
+    };
+  }
+  const found = await discoverFrom(options);
+  return {
+    gitDir: found.gitDir,
+    ...(found.kind === "discovered" ? { workTree: found.dir } : {}),
+    ...(found.gitfile !== undefined ? { gitfile: found.gitfile } : {}),
+    bare: found.kind === "bare",
+    warnings: found.warnings,
+  };
+}
+
+/** What setup.c's `setup_git_directory_gently_1` found by climbing. */
+interface DiscoveryFind {
+  /** GIT_DIR_DISCOVERED (a `.git` in `dir`) or GIT_DIR_BARE (`dir` is the repository) */
+  kind: "discovered" | "bare";
+  /** The directory the repository was found in */
+  dir: string;
+  /** The git directory: `dir/.git`, a gitfile's target, or `dir` itself */
+  gitDir: string;
+  gitfile?: string;
+  warnings: string[];
+  /** The physical current directory discovery started from (a FilesApi path) */
+  cwd: string;
+}
+
+/**
+ * The climb of {@link discoverRepository} (`setup_git_directory_gently_1` without `$GIT_DIR`):
+ * the first directory from `cwd` up holding a `.git` (gitfile or git directory) or being a
+ * bare repository, its ownership and `safe.bareRepository` checked, ceilings and file system
+ * boundaries obeyed.
+ */
+async function discoverFrom(options: DiscoverRepositoryOptions): Promise<DiscoveryFind> {
+  const { files, environment } = options;
+  const compatibility = options.compatibility ?? "2.56";
   const check = options.checkOwnership !== false;
   // strbuf_getcwd: git climbs the physical directory (a cwd reached through a symbolic link
   // is searched where it really is, its ceiling and device counted there)
-  let dir = await physicalPath(files, environment, normalizePath(options.cwd ?? "/"));
+  const start = await physicalPath(files, environment, normalizePath(options.cwd ?? "/"));
+  let dir = start;
   const cwdHost = hostPathOf(files, dir);
   // GIT_CEILING_DIRECTORIES: how many directories above cwd may be searched
   const levels = await ceilingLevels(environment, cwdHost);
@@ -180,11 +225,12 @@ export async function discoverRepository(
           })
         : [];
       return {
+        kind: "discovered",
+        dir,
         gitDir,
-        workTree: dir,
         ...(gitfile !== undefined ? { gitfile } : {}),
-        bare: false,
         warnings,
+        cwd: start,
       };
     }
     if (await isGitDirectory(files, dir)) {
@@ -208,7 +254,7 @@ export async function discoverRepository(
             protectedConfig: entries,
           })
         : [];
-      return { gitDir: dir, bare: true, warnings };
+      return { kind: "bare", dir, gitDir: dir, warnings, cwd: start };
     }
     if (dir === "/") throw new NotAGitRepositoryError();
     if (levels !== undefined && level >= levels) throw new NotAGitRepositoryError();
@@ -221,6 +267,439 @@ export async function discoverRepository(
       }
     }
   }
+}
+
+/** The repository setup.c's `setup_git_directory_gently` arrives at. */
+export interface GitDirectorySetup {
+  /** The git directory (a FilesApi path; a gitfile `$GIT_DIR` names is followed) */
+  gitDir: string;
+  /** The common git directory: `$GIT_COMMON_DIR`, else `commondir`'s, else {@link gitDir} */
+  commonDir: string;
+  /** The worktree top; undefined without one (a bare repository, or `core.bare`) */
+  workTree?: string;
+  /**
+   * git's current directory after the setup: the worktree top when the original directory is
+   * inside it (git's `chdir_to_toplevel`), else the original (physical) directory
+   */
+  cwd: string;
+  /**
+   * The original directory relative to the worktree top with a trailing `/` (`sub/dir/`);
+   * undefined at the top, outside the worktree, or without one (git's `(null)` prefix)
+   */
+  prefix?: string;
+  /** The index file: `$GIT_INDEX_FILE` (relative to {@link cwd}), else `<git dir>/index` */
+  indexFile: string;
+  /** The objects: `$GIT_OBJECT_DIRECTORY` (relative to {@link cwd}), else `<common dir>/objects` */
+  objectDirectory: string;
+  /** The gitfile the repository was reached through (`.git` file, or `$GIT_DIR` naming one) */
+  gitfile?: string;
+  /** `git rev-parse --is-inside-git-dir` */
+  insideGitDir: boolean;
+  /** `git rev-parse --is-inside-work-tree` */
+  insideWorkTree: boolean;
+  /**
+   * `git rev-parse --is-bare-repository`: no worktree, and `core.bare` not false
+   * (`is_bare_repository`)
+   */
+  bare: boolean;
+  /**
+   * Both `core.bare` and `core.worktree` are set for an explicit or settings-driven setup:
+   * git warns and has no worktree (`work_tree_config_is_bogus`); a command needing the
+   * worktree then dies "unable to set up work tree using invalid config"
+   */
+  workTreeConfigIsBogus?: boolean;
+  /** git's warnings on the way (`safe.directory`, `core.bare and core.worktree do not make sense`) */
+  warnings: string[];
+}
+
+/** A failure of setup git reports with `fatal:` and exit 128 (a bad `$GIT_DIR` or worktree). */
+export class GitSetupError extends Error {
+  readonly exitCode = 128;
+  constructor(message: string) {
+    super(message);
+    this.name = "GitSetupError";
+  }
+}
+
+/**
+ * git's repository setup (setup.c's `setup_git_directory_gently`) honouring the
+ * repository-location variables of the environment: `$GIT_DIR` (`setup_explicit_git_dir`,
+ * relative to `cwd`, a gitfile followed; no discovery, so neither ownership nor ceiling
+ * checks), `$GIT_WORK_TREE` (relative to `cwd`, it overrides `core.worktree` and `core.bare`),
+ * `core.worktree` (relative to the git directory; it takes effect with `$GIT_DIR`, and with a
+ * discovered repository too), `core.bare`, `$GIT_IMPLICIT_WORK_TREE`, `$GIT_COMMON_DIR`,
+ * `$GIT_INDEX_FILE` and `$GIT_OBJECT_DIRECTORY` (the last three relative to the directory
+ * git ends up in), with t1510-repo-setup.sh's rules: an explicit git directory without a
+ * worktree setting takes `cwd` as its worktree, a discovered repository found as a bare one
+ * has none, and git moves to the worktree top when `cwd` lies inside it (the `prefix` is
+ * the way back). Without `$GIT_DIR` the repository is found as {@link discoverRepository}
+ * finds it (ownership, `safe.bareRepository`, ceilings, file system boundaries). Linked
+ * worktrees (`commondir`) ignore `core.bare` and `core.worktree` unless
+ * `extensions.worktreeConfig` points them at `config.worktree`, as git's
+ * `check_repository_format_gently`.
+ *
+ * `options.gitDir` wins over the environment's `$GIT_DIR`.
+ *
+ * @example
+ * ```typescript
+ * const environment = createNodeGitHostEnvironment(); // GIT_DIR=../repo.git GIT_WORK_TREE=..
+ * const files = createNodeFilesApi({ rootDir: "/" });
+ * const setup = await setupGitDirectory({ files, cwd: process.cwd(), environment });
+ * // setup.gitDir, setup.workTree, setup.prefix ("sub/"), setup.indexFile, ...
+ * ```
+ */
+export async function setupGitDirectory(
+  options: DiscoverRepositoryOptions,
+): Promise<GitDirectorySetup> {
+  const { files, environment } = options;
+  const cwd = await physicalPath(files, environment, normalizePath(options.cwd ?? "/"));
+  const paths = new SetupPaths(files, environment);
+  const explicit = options.gitDir ?? environment?.gitDir;
+  const workTreeEnv = environment?.workTree;
+  let core: Omit<GitDirectorySetup, "commonDir" | "indexFile" | "objectDirectory" | "bare">;
+  let bareConfig: boolean | undefined;
+  if (explicit !== undefined) {
+    const r = await setupExplicit(paths, cwd, explicit, workTreeEnv, environment?.implicitWorkTree);
+    core = r.setup;
+    bareConfig = r.bareConfig;
+  } else {
+    const found = await discoverFrom(options);
+    const format = await worktreeSettings(files, found.gitDir);
+    bareConfig = format.bare;
+    if (workTreeEnv !== undefined || format.workTree !== undefined) {
+      // --work-tree without --git-dir (or core.worktree): the discovered one made explicit
+      const r = await setupExplicit(
+        paths,
+        cwd,
+        hostPathOf(files, found.gitDir),
+        workTreeEnv,
+        found.kind === "bare" ? false : environment?.implicitWorkTree,
+        format,
+      );
+      core = { ...r.setup, warnings: [...found.warnings, ...r.setup.warnings] };
+    } else if (found.kind === "bare" || format.bare === true) {
+      // #16.2, #17.2, ...: no worktree; git comes back to cwd
+      core = {
+        gitDir: found.gitDir,
+        cwd,
+        insideGitDir: found.kind === "bare" || isInside(cwd, found.gitDir),
+        insideWorkTree: false,
+        ...(found.gitfile !== undefined ? { gitfile: found.gitfile } : {}),
+        warnings: found.warnings,
+      };
+    } else {
+      // #0, #1, #5, #8, ...: the directory holding .git is the worktree, git moves there
+      const top = found.dir;
+      const rest = cwd === top ? "" : cwd.slice(top === "/" ? 1 : top.length + 1);
+      core = {
+        gitDir: found.gitDir,
+        workTree: top,
+        cwd: top,
+        ...(rest ? { prefix: `${rest}/` } : {}),
+        insideGitDir: false,
+        insideWorkTree: true,
+        ...(found.gitfile !== undefined ? { gitfile: found.gitfile } : {}),
+        warnings: found.warnings,
+      };
+    }
+  }
+  // setup_git_env: the variables read as given, relative to where git now is
+  const at = (value: string) => paths.resolve(core.cwd, value);
+  const commonDir =
+    environment?.commonDir !== undefined
+      ? at(environment.commonDir)
+      : await commonDirOf(files, core.gitDir);
+  return {
+    ...core,
+    commonDir,
+    indexFile:
+      environment?.indexFile !== undefined
+        ? at(environment.indexFile)
+        : joinPath(core.gitDir, "index"),
+    objectDirectory:
+      environment?.objectDirectory !== undefined
+        ? at(environment.objectDirectory)
+        : joinPath(commonDir, "objects"),
+    bare: core.workTree === undefined && bareConfig !== false,
+  };
+}
+
+/** core.bare and core.worktree as git's `check_repository_format_gently` takes them. */
+interface WorktreeSettings {
+  bare?: boolean;
+  workTree?: string;
+}
+
+/**
+ * `core.bare` and `core.worktree` of the repository's own config file (no includes, as
+ * `read_repository_format`), from the common directory's; a linked worktree's git directory
+ * (`commondir`) ignores both unless `extensions.worktreeConfig` is set, when its
+ * `config.worktree` may set them.
+ */
+async function worktreeSettings(files: FilesApi, gitDir: string): Promise<WorktreeSettings> {
+  const commonDir = await commonDirOf(files, gitDir);
+  const read = async (path: string) => {
+    if ((await files.stats(path).catch(() => undefined))?.kind !== "file") return undefined;
+    return parseConfigText(decodeGitPath(await readFile(files, path)));
+  };
+  const main = (await read(joinPath(commonDir, "config"))) ?? new Map<string, ConfigValue>();
+  let hasCommon = commonDir !== gitDir;
+  const settings: WorktreeSettings = {};
+  const apply = (entries: Map<string, ConfigValue>) => {
+    const bare = entries.get("core.bare");
+    if (bare !== undefined) {
+      const value = bare === null ? true : parseGitBool(bare);
+      if (value !== undefined) settings.bare = value;
+    }
+    const workTree = entries.get("core.worktree");
+    if (typeof workTree === "string") settings.workTree = workTree;
+  };
+  const worktreeConfig = main.get("extensions.worktreeconfig");
+  if (
+    worktreeConfig !== undefined &&
+    (worktreeConfig === null || parseGitBool(worktreeConfig) === true)
+  ) {
+    apply(main);
+    const own = await read(joinPath(gitDir, "config.worktree"));
+    if (own) apply(own);
+    hasCommon = false;
+  } else if (!hasCommon) apply(main);
+  return settings;
+}
+
+/** A config value: the text after `=`, or null for a key without one (true). */
+type ConfigValue = string | null;
+
+/**
+ * The last value of each key of a config file's text (section and key lower-cased, a
+ * subsection kept): enough for the `core.*` and `extensions.*` setup reads.
+ */
+function parseConfigText(text: string): Map<string, ConfigValue> {
+  const out = new Map<string, ConfigValue>();
+  let section = "";
+  for (const raw of text.split("\n")) {
+    let line = raw.trim();
+    const header = /^\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]/.exec(line);
+    if (header) {
+      section = header[1].toLowerCase();
+      if (header[2] !== undefined) section += `.${header[2].replace(/\\(.)/g, "$1")}`;
+      line = line.slice(header[0].length).trim();
+      if (line === "") continue;
+    }
+    if (line === "" || line.startsWith("#") || line.startsWith(";")) continue;
+    const m = /^([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?$/.exec(line);
+    if (!m || section === "") continue;
+    const key = `${section}.${m[1].toLowerCase()}`;
+    out.set(key, m[2] === undefined ? null : configValueText(m[2]));
+  }
+  return out;
+}
+
+/** A config value's text: quotes removed, escapes applied, a trailing comment dropped. */
+function configValueText(value: string): string {
+  let out = "";
+  let quoted = false;
+  let pendingSpace = "";
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i];
+    if (!quoted && (c === "#" || c === ";")) break;
+    if (!quoted && (c === " " || c === "\t")) {
+      pendingSpace += c;
+      continue;
+    }
+    if (pendingSpace) {
+      if (out !== "") out += pendingSpace;
+      pendingSpace = "";
+    }
+    if (c === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (c === "\\" && i + 1 < value.length) {
+      const n = value[++i];
+      out += n === "n" ? "\n" : n === "t" ? "\t" : n === "b" ? "\b" : n;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+/** git's `get_common_dir_noenv`: `commondir`, relative to the git directory unless absolute. */
+async function commonDirOf(files: FilesApi, gitDir: string): Promise<string> {
+  const path = joinPath(gitDir, "commondir");
+  if ((await files.stats(path).catch(() => undefined))?.kind !== "file") return gitDir;
+  const value = decodeGitPath(await readFile(files, path)).replace(/[\r\n]+$/, "");
+  if (value === "") return gitDir;
+  return gitfileTarget(files, gitDir, value) ?? gitDir;
+}
+
+/** Host paths of a setup: resolution against a directory, real paths, FilesApi mapping. */
+class SetupPaths {
+  constructor(
+    readonly files: FilesApi,
+    readonly environment: GitHostEnvironment | undefined,
+  ) {}
+
+  /** `value` (a host path, or relative to the FilesApi directory `dir`) as a FilesApi path */
+  resolve(dir: string, value: string): string {
+    const host = value.startsWith("/") ? value : `${hostPathOf(this.files, dir)}/${value}`;
+    return this.filesPath(resolveDots(host) ?? "/");
+  }
+
+  /** A host path as a FilesApi path; a path outside the storage cannot be reached */
+  filesPath(host: string): string {
+    const root = (this.files as { rootDirectory?: string }).rootDirectory?.replace(/\/+$/, "");
+    if (root === undefined || root === "") return normalizePath(host);
+    if (host === root) return "/";
+    if (host.startsWith(`${root}/`)) return normalizePath(host.slice(root.length));
+    throw new GitSetupError(`fatal: '${host}' is outside the repository's storage`);
+  }
+
+  /**
+   * git's `strbuf_realpath(..., die_on_error = 1)` of a FilesApi path: links resolved; the
+   * last component may be missing, a missing directory above it dies "Invalid path"
+   */
+  async realPath(path: string): Promise<string> {
+    const realPath = this.environment?.realPath;
+    const host = hostPathOf(this.files, path);
+    const exists = async (p: string) =>
+      (await this.files.stats(p).catch(() => undefined)) !== undefined;
+    if (path !== "/" && !(await exists(path))) {
+      const parent = path.slice(0, path.lastIndexOf("/")) || "/";
+      if (!(await exists(parent))) {
+        // the first missing component, as git names it
+        let missing = parent;
+        for (;;) {
+          const up = missing.slice(0, missing.lastIndexOf("/")) || "/";
+          if (up === missing || (await exists(up))) break;
+          missing = up;
+        }
+        throw new GitSetupError(
+          `fatal: Invalid path '${hostPathOf(this.files, missing)}': No such file or directory`,
+        );
+      }
+      const base = path.slice(path.lastIndexOf("/") + 1);
+      return joinPath(await this.realPath(parent), base);
+    }
+    if (!realPath) return path;
+    const real = await realPath(host).catch(() => undefined);
+    if (real === undefined) return path;
+    try {
+      return this.filesPath(real);
+    } catch {
+      return path;
+    }
+  }
+}
+
+/** Whether FilesApi path `path` is `dir` or below it (git's `is_inside_dir`). */
+function isInside(path: string, dir: string): boolean {
+  return dir === "/" || path === dir || path.startsWith(`${dir}/`);
+}
+
+/**
+ * setup.c's `setup_explicit_git_dir`: `gitDirValue` (`$GIT_DIR` as set, relative to `cwd`)
+ * followed through a gitfile and checked; the worktree from `$GIT_WORK_TREE`, `core.bare`,
+ * `core.worktree`, `$GIT_IMPLICIT_WORK_TREE` or `cwd`, in that order.
+ */
+async function setupExplicit(
+  paths: SetupPaths,
+  cwd: string,
+  gitDirValue: string,
+  workTreeEnv: string | undefined,
+  implicitWorkTree: boolean | undefined,
+  known?: WorktreeSettings,
+): Promise<{
+  setup: Omit<GitDirectorySetup, "commonDir" | "indexFile" | "objectDirectory" | "bare">;
+  bareConfig: boolean | undefined;
+}> {
+  const { files } = paths;
+  let gitDir = paths.resolve(cwd, gitDirValue);
+  let gitfile: string | undefined;
+  // read_gitfile: a regular file is a gitfile (its errors fatal); anything else is not
+  if ((await files.stats(gitDir).catch(() => undefined))?.kind === "file") {
+    const text = decodeGitPath(await readFile(files, gitDir));
+    const shown = hostPathOf(files, gitDir);
+    if (!text.startsWith("gitdir: "))
+      throw new GitSetupError(`fatal: invalid gitfile format: ${shown}`);
+    const target = parseGitfile(text);
+    if (target === undefined || target === "")
+      throw new GitSetupError(`fatal: no path in gitfile: ${shown}`);
+    const dir = gitDir.slice(0, gitDir.lastIndexOf("/")) || "/";
+    const resolved = target.startsWith("/")
+      ? paths.resolve("/", target)
+      : paths.resolve(dir, target);
+    if (!(await isGitDirectory(files, resolved, paths.environment?.objectDirectory, paths, cwd))) {
+      throw new GitSetupError(`fatal: not a git repository: ${target}`);
+    }
+    gitfile = gitDir;
+    gitDir = await paths.realPath(resolved);
+  }
+  if (!(await isGitDirectory(files, gitDir, paths.environment?.objectDirectory, paths, cwd))) {
+    throw new GitSetupError(`fatal: not a git repository: '${gitDirValue}'`);
+  }
+  const settings = known ?? (await worktreeSettings(files, gitDir));
+  const warnings: string[] = [];
+  const base = {
+    gitDir,
+    ...(gitfile !== undefined ? { gitfile } : {}),
+  };
+  const noWorkTree = (bogus = false) => ({
+    setup: {
+      ...base,
+      cwd,
+      insideGitDir: isInside(cwd, gitDir),
+      insideWorkTree: false,
+      ...(bogus ? { workTreeConfigIsBogus: true } : {}),
+      warnings,
+    },
+    bareConfig: settings.bare,
+  });
+  let workTree: string;
+  if (workTreeEnv !== undefined) {
+    workTree = await paths.realPath(paths.resolve(cwd, workTreeEnv));
+  } else if (settings.bare === true) {
+    if (settings.workTree !== undefined) {
+      // #22.2, #30
+      warnings.push("warning: core.bare and core.worktree do not make sense");
+      return noWorkTree(true);
+    }
+    // #18, #26
+    return noWorkTree();
+  } else if (settings.workTree !== undefined) {
+    // #6, #14: relative to the git directory (chdir there, then to it)
+    const value = settings.workTree;
+    const from = value.startsWith("/") ? "/" : await paths.realPath(gitDir);
+    const target = paths.resolve(from, value);
+    if ((await files.stats(target).catch(() => undefined))?.kind !== "directory") {
+      throw new GitSetupError(`fatal: cannot chdir to '${value}': No such file or directory`);
+    }
+    workTree = await paths.realPath(target);
+  } else if (implicitWorkTree === false) {
+    // #16d
+    return noWorkTree();
+  } else {
+    // #2, #10: the current directory
+    workTree = cwd;
+  }
+  const inside = isInside(cwd, workTree);
+  // cwd inside the worktree: git moves to its top, the prefix leads back
+  const finalCwd = inside ? workTree : cwd;
+  const rest =
+    !inside || cwd === workTree ? "" : cwd.slice(workTree === "/" ? 1 : workTree.length + 1);
+  return {
+    setup: {
+      ...base,
+      workTree,
+      cwd: finalCwd,
+      ...(rest ? { prefix: `${rest}/` } : {}),
+      insideGitDir: isInside(finalCwd, await paths.realPath(gitDir)),
+      insideWorkTree: inside,
+      warnings,
+    },
+    bareConfig: settings.bare,
+  };
 }
 
 /**
@@ -312,7 +791,15 @@ function gitfileTarget(files: FilesApi, dir: string, target: string): string | u
  * git's `is_git_directory`: a valid HEAD (a symbolic ref into `refs/`, or an object id),
  * and `objects` and `refs` directories in its common directory (`commondir`).
  */
-export async function isGitDirectory(files: FilesApi, dir: string): Promise<boolean> {
+export async function isGitDirectory(
+  files: FilesApi,
+  dir: string,
+  /** `$GIT_OBJECT_DIRECTORY` as set: it must exist in place of the objects directory */
+  objectDirectory?: string,
+  /** Resolves a relative `objectDirectory` (from `cwd`) */
+  paths?: { resolve(dir: string, value: string): string },
+  cwd = "/",
+): Promise<boolean> {
   const kindOf = async (path: string) => (await files.stats(path).catch(() => undefined))?.kind;
   const head = joinPath(dir, "HEAD");
   if ((await kindOf(head)) !== "file") return false;
@@ -333,8 +820,15 @@ export async function isGitDirectory(files: FilesApi, dir: string): Promise<bool
     if (resolved === undefined) return false;
     common = resolved;
   }
+  // is_git_directory: $GIT_OBJECT_DIRECTORY replaces the objects directory's check
+  const objects =
+    objectDirectory !== undefined
+      ? paths
+        ? paths.resolve(cwd, objectDirectory)
+        : normalizePath(objectDirectory)
+      : joinPath(common, "objects");
   return (
-    (await kindOf(joinPath(common, "objects"))) === "directory" &&
+    (await kindOf(objects)) === "directory" &&
     (await kindOf(joinPath(common, "refs"))) === "directory"
   );
 }

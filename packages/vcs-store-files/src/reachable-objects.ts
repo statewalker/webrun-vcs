@@ -37,6 +37,7 @@ import type {
 } from "@statewalker/vcs-core";
 import {
   isSymbolicRef,
+  isValidRefName,
   joinPath,
   listObjects,
   objectFormatOf,
@@ -74,8 +75,10 @@ function isIdOf(id: string | undefined, format: ObjectFormat): id is string {
 export class MissingRootError extends Error {
   constructor(
     message: string,
-    /** The missing object */
+    /** The missing object (the null id for a ref git cannot read: a bad name) */
     readonly objectId: ObjectId,
+    /** The ref that names it, when a ref does (`refs/heads/main`, `HEAD`) */
+    readonly refName?: string,
   ) {
     super(message);
     this.name = "MissingRootError";
@@ -121,6 +124,18 @@ export interface ReachabilityRoots {
    * linked worktree: git 2.5x's prune (`add_rebase_files`); repack and 2.43 do not
    */
   rebaseFiles?: boolean;
+  /**
+   * git's ref paranoia (`$GIT_REF_PARANOIA`, on by default since git 2.36, so in 2.43 and
+   * 2.5x alike): a ref with a name `check_refname_format` refuses (`refs/heads/bogus..name`)
+   * or naming an object that is not stored aborts the walk ({@link MissingRootError}). False
+   * (`GIT_REF_PARANOIA=0`) skips such refs as git's ref iterator does: a broken name
+   * silently, a missing object with `error: <ref> does not point to a valid object!`
+   * ({@link onRefError}), so what only they reach is unreachable. HEAD and the linked
+   * worktrees' HEADs are resolved, not iterated: they stay required either way.
+   */
+  refParanoia?: boolean;
+  /** Each of git's `error:` lines for a ref skipped without paranoia */
+  onRefError?: (line: string) => void;
 }
 
 /**
@@ -169,9 +184,9 @@ async function collectRoots(
   const format = objectFormatOf(objects as GitObjects);
   const tips = new Set<ObjectId>();
   // roots that must be stored, with git's message when one is not (the first naming wins)
-  const required = new Map<ObjectId, string>();
-  const require = (id: ObjectId, message: string) => {
-    if (!required.has(id)) required.set(id, message);
+  const required = new Map<ObjectId, { message: string; refName?: string }>();
+  const require = (id: ObjectId, message: string, refName?: string) => {
+    if (!required.has(id)) required.set(id, { message, ...(refName ? { refName } : {}) });
   };
   // the name of a tree or blob the index adds before anything else names it (git's pending
   // path: an object a ref names first is listed as "")
@@ -202,17 +217,34 @@ async function collectRoots(
       ref = byName.get(ref.target);
     return ref && !isSymbolicRef(ref) ? ref.objectId : undefined;
   };
-  for (const ref of stored) {
-    const id = resolveStored(ref.name);
-    if (id) require(id, `bad object ${ref.name}`);
-  }
+  const paranoia = roots.refParanoia !== false;
+  // the refs git's iterator gives (files_ref_iterator): a name check_refname_format refuses is
+  // REF_ISBROKEN (fatal with paranoia, skipped without); a missing object is fatal with
+  // paranoia, skipped with ref_resolves_to_object's error without
+  const refRoot = async (name: string, id: ObjectId | undefined) => {
+    if (name.startsWith("refs/") && !isValidRefName(name)) {
+      if (paranoia) throw new MissingRootError(`bad object ${name}`, format.nullId, name);
+      return;
+    }
+    if (!id) return;
+    if (!paranoia && !VIRTUAL.has(id) && !(await objects.has(id))) {
+      roots.onRefError?.(`error: ${name} does not point to a valid object!`);
+      return;
+    }
+    require(id, `bad object ${name}`, name);
+  };
+  for (const ref of stored) await refRoot(ref.name, resolveStored(ref.name));
   // and through the Refs API too (a store that keeps refs elsewhere)
   for await (const ref of refs.list()) {
-    const resolved = await refs.resolve(ref.name);
-    if (resolved?.objectId) require(resolved.objectId, `bad object ${ref.name}`);
+    if (byName.has(ref.name)) continue;
+    const resolved =
+      ref.name.startsWith("refs/") && !isValidRefName(ref.name)
+        ? undefined
+        : await refs.resolve(ref.name);
+    await refRoot(ref.name, resolved?.objectId);
   }
   const head = await refs.resolve("HEAD");
-  if (head?.objectId) require(head.objectId, "bad object HEAD");
+  if (head?.objectId) require(head.objectId, "bad object HEAD", "HEAD");
 
   const logIds = reftable
     ? await storeReflogIds(refs, await reftable.reflogNames(), format)
@@ -274,8 +306,9 @@ async function collectRoots(
   }
 
   const present: ObjectId[] = [];
-  for (const [id, message] of required) {
-    if (!VIRTUAL.has(id) && !(await objects.has(id))) throw new MissingRootError(message, id);
+  for (const [id, { message, refName }] of required) {
+    if (!VIRTUAL.has(id) && !(await objects.has(id)))
+      throw new MissingRootError(message, id, refName);
     present.push(id);
     tips.delete(id);
   }
