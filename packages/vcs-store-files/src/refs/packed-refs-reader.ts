@@ -27,6 +27,7 @@ import {
   RefStorage,
   readFile,
 } from "@statewalker/vcs-core";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { isBeyondSymlinkError } from "@statewalker/vcs-utils/files";
 
 /**
@@ -57,7 +58,7 @@ export async function readPackedRefs(
   if (options.strict) {
     // Only a missing file is no packed refs: a failed read or a bad line throws
     if ((await files.stats(packedRefsPath))?.kind !== "file") return { refs: [], peeled: false };
-    const parsed = parsePackedRefs(new TextDecoder().decode(await readFile(files, packedRefsPath)));
+    const parsed = parsePackedRefs(decodeGitPath(await readFile(files, packedRefsPath)));
     for (const r of parsed.refs) {
       if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(r.objectId ?? "") || !r.name) {
         throw new Error(`Invalid packed ref ${r.name || "(no name)"} in ${PACKED_REFS}`);
@@ -67,7 +68,7 @@ export async function readPackedRefs(
   }
   try {
     const data = await readFile(files, packedRefsPath);
-    content = new TextDecoder().decode(data);
+    content = decodeGitPath(data);
   } catch (error) {
     // beneath a symbolic link is an error, never "no packed refs"
     if (isBeyondSymlinkError(error)) throw error;

@@ -25,6 +25,7 @@
  */
 
 import type { FilesApi } from "@statewalker/vcs-core";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { joinPath } from "@statewalker/vcs-utils/files";
 import { type ObjectFormat, SHA1_OBJECT_FORMAT } from "@statewalker/vcs-utils/hash";
 
@@ -358,7 +359,7 @@ export function mergeReftables(tables: readonly ReftableTable[]): ReftableView {
           names.set(head.refName, head.refKey);
         }
       }
-      return [...names.values()].sort(compareKeys).map((k) => new TextDecoder().decode(k));
+      return [...names.values()].sort(compareKeys).map((k) => decodeGitPath(k));
     },
   };
 }
