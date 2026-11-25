@@ -541,6 +541,8 @@ async function collect(options: GcOptions): Promise<GcResult> {
       commitGraph: history.commitGraph,
       ...(readGraftFile ? { readGraftFile } : {}),
       ...(exclusions ? { excludeObjects: exclusions.excluded, extraRoots: exclusions.roots } : {}),
+      refParanoia: options.environment?.refParanoia !== false,
+      onRefError: (line) => allErrors.push(line),
     });
   // the refs as the walk saw them: git's prune is a process of its own that walks the refs again
   // after the repack, so a ref moved meanwhile (to an object no write freshened: `branch`,

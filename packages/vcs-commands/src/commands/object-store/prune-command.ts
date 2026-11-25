@@ -1,5 +1,6 @@
 import type { FilesApi, History, ObjectId } from "@statewalker/vcs-core";
 import {
+  MissingRootError,
   parseExpiryDate,
   ReflogExpiryConfigError,
   prune as storePrune,
@@ -115,6 +116,10 @@ export class PruneCommand extends PlumbingCommand {
     } catch (e) {
       if (e instanceof Error && e.name === "UnsupportedRepositoryFormatError")
         throw new PlumbingError("fatal: cannot prune in a precious-objects repo");
+      // mark_reachable's add_one_ref: parse_object_or_die (a ref with a bad name or naming a
+      // missing object, under GIT_REF_PARANOIA's default)
+      if (e instanceof MissingRootError && e.refName !== undefined && e.refName !== "HEAD")
+        throw new PlumbingError(`fatal: unable to parse object: ${e.refName}`);
       throw e;
     }
     for (const line of result.errorOutput.split("\n")) if (line) this.warn(line);

@@ -117,6 +117,8 @@ export async function prune(options: PruneOptions): Promise<PruneResult> {
       ...(readGraftFile ? { readGraftFile } : {}),
       extraRoots: [...(exclusions?.roots ?? []), ...(options.heads ?? [])],
       ...(exclusions ? { excludeObjects: exclusions.excluded } : {}),
+      refParanoia: options.environment?.refParanoia !== false,
+      onRefError: (line) => err.push(`${line}\n`),
     });
     const kept = new Set<ObjectId>(listed.map((o) => o.id));
     for (const id of exclusions?.excluded ?? []) kept.add(id);
