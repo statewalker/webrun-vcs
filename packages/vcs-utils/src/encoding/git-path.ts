@@ -76,22 +76,57 @@ export function decodeGitPath(bytes: Uint8Array): string {
   } catch {
     // not valid UTF-8: decoded sequence by sequence below
   }
-  let out = "";
-  let start = 0;
+  return decodeEscaping(bytes);
+}
+
+/** UTF-16 units turned into a string at once (String.fromCharCode's argument limit). */
+const UNITS_PER_CALL = 8192;
+
+/**
+ * {@link decodeGitPath} of bytes that are not valid UTF-8, in time linear in their length
+ * (a reftable key or a packed-refs file may be megabytes of such bytes): every sequence
+ * decoded into UTF-16 units, each byte outside one as U+DC00 + byte, turned into a string
+ * in chunks. (A UTF-16 TextDecoder would make the escapes U+FFFD.)
+ */
+function decodeEscaping(bytes: Uint8Array): string {
+  const units = new Uint16Array(bytes.length);
+  let n = 0;
   let i = 0;
   while (i < bytes.length) {
-    const len = sequenceLength(bytes, i);
-    if (len > 0) {
-      i += len;
+    const b0 = bytes[i];
+    if (b0 < 0x80) {
+      units[n++] = b0;
+      i++;
       continue;
     }
-    if (i > start) out += fatalDecoder.decode(bytes.subarray(start, i));
-    out += String.fromCharCode(0xdc00 + bytes[i]);
-    i++;
-    start = i;
+    const len = sequenceLength(bytes, i);
+    if (len === 0) {
+      units[n++] = 0xdc00 + b0;
+      i++;
+    } else if (len === 2) {
+      units[n++] = ((b0 & 0x1f) << 6) | (bytes[i + 1] & 0x3f);
+      i += 2;
+    } else if (len === 3) {
+      units[n++] = ((b0 & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f);
+      i += 3;
+    } else {
+      const cp =
+        (((b0 & 0x07) << 18) |
+          ((bytes[i + 1] & 0x3f) << 12) |
+          ((bytes[i + 2] & 0x3f) << 6) |
+          (bytes[i + 3] & 0x3f)) -
+        0x10000;
+      units[n++] = 0xd800 + (cp >> 10);
+      units[n++] = 0xdc00 + (cp & 0x3ff);
+      i += 4;
+    }
   }
-  if (i > start) out += fatalDecoder.decode(bytes.subarray(start, i));
-  return out;
+  const parts: string[] = [];
+  for (let at = 0; at < n; at += UNITS_PER_CALL) {
+    const chunk = units.subarray(at, Math.min(n, at + UNITS_PER_CALL));
+    parts.push(String.fromCharCode.apply(null, chunk as unknown as number[]));
+  }
+  return parts.join("");
 }
 
 /**

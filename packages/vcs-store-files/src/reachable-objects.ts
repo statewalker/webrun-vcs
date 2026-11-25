@@ -315,11 +315,11 @@ async function collectRoots(
 
 /**
  * A `refs/...` name git's `check_refname_format` refuses (REF_BAD_NAME). Names hold non-UTF-8
- * bytes as U+DC80..U+DCFF (`decodeGitPath`); git allows every byte from 0x80 on, so those
- * stand for an ordinary non-ASCII character here.
+ * bytes as U+DC80..U+DCFF (`decodeGitPath`), which `isValidRefName` accepts as git accepts
+ * every byte from 0x80 on.
  */
 function brokenRefName(name: string): boolean {
-  return name.startsWith("refs/") && !isValidRefName(name.replace(/[\uDC80-\uDCFF]/g, "\u00e9"));
+  return name.startsWith("refs/") && !isValidRefName(name);
 }
 
 /** A worktree's HEAD: a detached object id, or `ref: <name>` resolved through `resolve`. */

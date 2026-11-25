@@ -47,6 +47,7 @@
  */
 
 import { inflateWhole } from "@statewalker/vcs-utils/compression";
+import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import {
   type ObjectFormat,
   SHA1_OBJECT_FORMAT,
@@ -224,9 +225,6 @@ const TYPE_OBJ = 0x6f; // 'o'
 const TYPE_INDEX = 0x69; // 'i'
 /** Index levels a seek follows at most (git writes as many as it needs; each is 1/n the last) */
 const MAX_INDEX_DEPTH = 32;
-
-const utf8 = new TextDecoder();
-const encoder = new TextEncoder();
 
 /** The header's length for a version (24, or 28 with the hash id). */
 function headerSize(version: number): number {
@@ -467,7 +465,7 @@ class Cursor {
   materialise(n: number): [Uint8Array, string] {
     this.budget.charge(3 * n, this.table);
     const bytes = this.key.slice(0, n);
-    return [bytes, utf8.decode(bytes)];
+    return [bytes, decodeGitPath(bytes)];
   }
 }
 
@@ -861,7 +859,7 @@ class Reftable implements ReftableTable {
   }
 
   getRef(name: string, budget = new ReftableReadBudget()): ReftableRefRecord | undefined {
-    const want = encoder.encode(name);
+    const want = encodeGitPath(name);
     for (const c of this.walk(this.section(TYPE_REF), want, budget, (c) => this.refValue(c))) {
       if (c.compareTo(want) !== 0) return undefined;
       return this.refRecord(c);
@@ -870,7 +868,7 @@ class Reftable implements ReftableTable {
   }
 
   *refs(prefix = "", budget = new ReftableReadBudget()): Generator<ReftableRefRecord> {
-    const want = prefix ? encoder.encode(prefix) : undefined;
+    const want = prefix ? encodeGitPath(prefix) : undefined;
     for (const c of this.walk(this.section(TYPE_REF), want, budget, (c) => this.refValue(c))) {
       if (want && !c.startsWith(want)) return;
       yield this.refRecord(c);
@@ -887,7 +885,7 @@ class Reftable implements ReftableTable {
   *logHeads(refName?: string, budget = new ReftableReadBudget()): Generator<ReftableLogHead> {
     let want: Uint8Array | undefined;
     if (refName !== undefined) {
-      const nameBytes = encoder.encode(refName);
+      const nameBytes = encodeGitPath(refName);
       want = new Uint8Array(nameBytes.length + 1);
       want.set(nameBytes);
     }
@@ -955,7 +953,7 @@ class Reftable implements ReftableTable {
         const target = c.take(len, "symref target");
         if (materialise) {
           c.budget.charge(3 * len, this.name);
-          value = { type: "symref", target: utf8.decode(target) };
+          value = { type: "symref", target: decodeGitPath(target) };
         }
         break;
       }
@@ -992,11 +990,11 @@ class Reftable implements ReftableTable {
     return {
       oldId: bytesToHex(oldId),
       newId: bytesToHex(newId),
-      name: utf8.decode(who),
-      email: utf8.decode(email),
+      name: decodeGitPath(who),
+      email: decodeGitPath(email),
       time,
       tzOffset: tzRaw >= 0x8000 ? tzRaw - 0x10000 : tzRaw,
-      message: utf8.decode(message),
+      message: decodeGitPath(message),
     };
   }
 

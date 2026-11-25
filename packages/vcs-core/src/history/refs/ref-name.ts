@@ -6,11 +6,20 @@
  * empty, start with `.`, contain `..` or `@{`, end with `.lock`, or contain a
  * control character, DEL, space or any of `~ ^ : ? [ \ *`. The whole name may
  * not be `@` or end with `.`, and needs two components unless one level is
- * allowed. Non-ASCII characters are allowed; a lone UTF-16 surrogate is not,
- * since it has no UTF-8 encoding (it would be written as U+FFFD, another name).
+ * allowed. Non-ASCII characters are allowed, and so are names that are not valid
+ * UTF-8: git checks bytes and accepts every byte from 0x80 up (`refname_disposition`).
+ * Such names reach this code as vcs-utils' `decodeGitPath` gives them (a FilesApi
+ * listing, packed-refs, a reftable): each byte outside a valid UTF-8 sequence as the lone
+ * surrogate U+DC80..U+DCFF, which `encodeGitPath` turns back into the byte. Any other lone
+ * UTF-16 surrogate is refused, since it has no encoding (it would be written as U+FFFD,
+ * another name).
  */
 
-const LONE_SURROGATE = /\p{Cs}/u;
+import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
+
+/** A lone surrogate that is not an escaped byte (U+DC80..U+DCFF). */
+const LONE_SURROGATE =
+  /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDC7F\uDD00-\uDFFF]/;
 const FORBIDDEN = new Set([" ", "~", "^", ":", "?", "[", "\\", "\u007f"]);
 
 /** `pattern.allowed`: a `*` may still come (`REFNAME_REFSPEC_PATTERN`, cleared by the first). */
@@ -63,10 +72,11 @@ export function isValidRefName(name: string, options: RefNameOptions = {}): bool
 }
 
 /**
- * Compare two ref names in git's order: the byte order of their UTF-8
- * encodings, which is code-point order (uppercase before lowercase, non-ASCII
- * last). Unlike `localeCompare` and plain `<` (UTF-16 units), it matches the
- * order git lists refs and writes packed-refs in.
+ * Compare two ref names in git's order: the byte order of their encodings (UTF-8, each
+ * escaped byte U+DC80..U+DCFF as that byte: vcs-utils' `compareGitPaths`), which for UTF-8
+ * names is code-point order (uppercase before lowercase, non-ASCII last). Unlike
+ * `localeCompare` and plain `<` (UTF-16 units), it matches the order git lists refs and
+ * writes packed-refs and reftables in.
  *
  * @example
  * ```typescript
@@ -74,20 +84,7 @@ export function isValidRefName(name: string, options: RefNameOptions = {}): bool
  * ```
  */
 export function compareRefNames(a: string, b: string): number {
-  const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) {
-    let x = a.charCodeAt(i);
-    let y = b.charCodeAt(i);
-    if (x === y) continue;
-    // UTF-16 order equals code-point order except that surrogates (U+D800–DFFF,
-    // which encode U+10000 and up) sort below U+E000–FFFF. Move them above.
-    if (x >= 0xd800 && y >= 0xd800) {
-      x = x >= 0xe000 ? x - 0x800 : x + 0x2000;
-      y = y >= 0xe000 ? y - 0x800 : y + 0x2000;
-    }
-    return x - y;
-  }
-  return a.length - b.length;
+  return compareGitPaths(a, b);
 }
 
 /**

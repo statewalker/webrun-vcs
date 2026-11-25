@@ -26,7 +26,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { join } from "node:path";
 import { inflateSync } from "node:zlib";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -201,17 +201,18 @@ function reflogFiles(dir: string, bare: boolean): Record<string, string> {
     ok(copy, "refs", "migrate", "--ref-format=files");
     gitDir = gitDirOf(copy, bare);
   }
+  // names as bytes (latin-1 keys): a ref name need not be UTF-8
   const out: Record<string, string> = {};
-  const logs = join(gitDir, "logs");
-  const walk = (d: string) => {
+  const walk = (d: Buffer, rel: string) => {
     if (!existsSync(d)) return;
-    for (const e of readdirSync(d, { withFileTypes: true })) {
-      const p = join(d, e.name);
-      if (e.isDirectory()) walk(p);
-      else out[relative(logs, p)] = readFileSync(p, "latin1");
+    for (const e of readdirSync(d, { withFileTypes: true, encoding: "buffer" })) {
+      const p = Buffer.concat([d, Buffer.from("/"), e.name]);
+      const name = `${rel}${e.name.toString("latin1")}`;
+      if (e.isDirectory()) walk(p, `${name}/`);
+      else out[name] = readFileSync(p, "latin1");
     }
   };
-  walk(logs);
+  walk(Buffer.from(join(gitDir, "logs")), "");
   return out;
 }
 
@@ -223,17 +224,20 @@ function layout(dir: string, bare: boolean): Record<string, string> {
   const gitDir = gitDirOf(dir, bare);
   const out: Record<string, string> = {};
   const skip = new Set(["objects", "hooks", "info", "description", "index", "COMMIT_EDITMSG"]);
-  const walk = (d: string) => {
-    for (const e of readdirSync(d, { withFileTypes: true }).sort((a, b) =>
-      a.name < b.name ? -1 : 1,
+  // names as bytes (latin-1 keys): a ref name need not be UTF-8
+  const walk = (d: Buffer, prefix: string) => {
+    const top = prefix === "";
+    for (const e of readdirSync(d, { withFileTypes: true, encoding: "buffer" }).sort((a, b) =>
+      Buffer.compare(a.name, b.name),
     )) {
-      const p = join(d, e.name);
-      const rel = relative(gitDir, p);
-      if (d === gitDir && skip.has(e.name)) continue;
-      if (bare && d === gitDir && e.name !== "config" && !isRefStorage(e.name)) continue;
+      const p = Buffer.concat([d, Buffer.from("/"), e.name]);
+      const name = e.name.toString("latin1");
+      const rel = `${prefix}${name}`;
+      if (top && skip.has(name)) continue;
+      if (bare && top && name !== "config" && !isRefStorage(name)) continue;
       if (e.isDirectory()) {
         out[`${rel}/`] = "";
-        walk(p);
+        walk(p, `${rel}/`);
       } else if (/(^|\/)reftable\/[^/]+\.ref$/.test(rel)) {
         out[rel.replace(/[^/]+$/, "<table>")] = normalizedTable(readFileSync(p)).toString("hex");
       } else if (/(^|\/)reftable\/tables\.list$/.test(rel)) {
@@ -243,7 +247,7 @@ function layout(dir: string, bare: boolean): Record<string, string> {
       }
     }
   };
-  walk(gitDir);
+  walk(Buffer.from(gitDir), "");
   return out;
 }
 
@@ -640,6 +644,41 @@ describe.skipIf(!canMigrate)("git refs migrate", () => {
   });
 });
 
+/**
+ * A branch whose name holds a non-UTF-8 byte, `refs/heads/caf\xe9` (Latin-1), and its UTF-8
+ * neighbour `refs/heads/caf\xc3\xa9`, created by native git (argv bytes through `sh`). The
+ * Node FilesApi lists such a name as `caf\udce9`; git's check_refname_format accepts every
+ * byte from 0x80 up (statewalker/webrun-vcs#376).
+ */
+function latin1Branches(dir: string): void {
+  shell(dir, `git branch "$(printf 'caf\\351')" && git branch "$(printf 'caf\\303\\251')"`);
+}
+
+/** A shell script running native git in `dir`, which must succeed. */
+function shell(dir: string, script: string): void {
+  const r = spawnSync("sh", ["-c", script], { cwd: dir, env: env() });
+  if (r.status !== 0) throw new Error(`${script} failed: ${r.stderr}`);
+}
+
+describe.skipIf(!canMigrate)("git refs migrate: ref names holding non-UTF-8 bytes (#376)", () => {
+  for (const [from, to] of FORMATS) {
+    it(`${from} -> ${to}: a Latin-1 branch and its reflog migrate as native's`, async () => {
+      const dir = repository(from);
+      commit(dir, "first");
+      latin1Branches(dir);
+      commit(dir, "second");
+      shell(dir, `git update-ref -m move "$(printf 'refs/heads/caf\\351')" HEAD`);
+      const { ours } = await checkMigrate(dir, { format: to });
+      const listing = refListing(ours);
+      expect(listing).toContain("refs/heads/caf\xe9 ");
+      expect(listing).toContain("refs/heads/caf\xc3\xa9 ");
+      // byte order: 0xc3 before 0xe9
+      expect(listing.indexOf("caf\xc3\xa9")).toBeLessThan(listing.indexOf("caf\xe9 "));
+      expect(reflogFiles(ours, false)["refs/heads/caf\xe9"]).toContain("\tmove\n");
+    });
+  }
+});
+
 /** `git refs verify [--strict] [--verbose]` by native git and by ours on twins of `dir`. */
 async function checkVerify(dir: string, args: string[] = [], sortLines = false): Promise<Outcome> {
   const t = twins(dir);
@@ -809,6 +848,20 @@ describe.skipIf(!canVerify)("git refs verify", () => {
     writeFileSync(join(admin, "ORIG_HEAD"), "garbage\n");
     await checkVerify(dir, [], true);
   });
+
+  for (const format of ["files", "reftable"]) {
+    it(`a Latin-1 branch, loose and packed, is a valid ref name (${format}, #376)`, async () => {
+      const dir = repository(format);
+      commit(dir, "initial");
+      latin1Branches(dir);
+      expect((await checkVerify(dir)).status).toBe(0);
+      expect((await checkVerify(dir, ["--strict"])).status).toBe(0);
+      if (format === "files") {
+        ok(dir, "pack-refs", "--all");
+        expect((await checkVerify(dir, ["--strict"])).status).toBe(0);
+      }
+    });
+  }
 
   it('t0614-reftable-fsck.sh: "no errors reported on a well formed repository"', async () => {
     const dir = repository("reftable");

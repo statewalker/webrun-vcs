@@ -25,6 +25,7 @@ import {
   SYMREF_PREFIX,
   type SymbolicRef,
 } from "@statewalker/vcs-core";
+import { decodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { isBeyondSymlinkError } from "@statewalker/vcs-utils/files";
 import { findPackedRef, readPackedRefs } from "./packed-refs-reader.js";
 
@@ -127,13 +128,13 @@ export function parseRefContent(refName: string, content: Uint8Array): Ref | Sym
   // Check for symbolic ref (starts with "ref: ")
   if (isSymbolicRefContent(content)) {
     // Decode and extract target
-    const str = new TextDecoder().decode(content);
+    const str = decodeGitPath(content);
     const target = str.substring(SYMREF_PREFIX.length).trim();
     return createSymbolicRef(refName, target, RefStorage.LOOSE);
   }
 
   // Parse as object ID
-  const str = new TextDecoder().decode(content);
+  const str = decodeGitPath(content);
   const objectId = str.trim().toLowerCase() as ObjectId;
 
   if (objectId.length < OBJECT_ID_STRING_LENGTH) {
