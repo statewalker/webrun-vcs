@@ -47,7 +47,7 @@ const editors: Record<string, ReplaceEditor> = {
 
 /** `git replace <argv>` mapped onto our ReplaceCommand (parse_options: last value wins). */
 function replaceArgs(git: Git, argv: string[], editor?: string): ReplaceCommand {
-  const command = git.replace();
+  const command = git.replace().setCompatibility(compatibilityOf(shell));
   if (editor !== undefined) command.setEditor(editors[editor] as ReplaceEditor);
   let options = true;
   for (let i = 0; i < argv.length; i++) {
@@ -476,5 +476,10 @@ describeGit("git replace, native twins (t6050-replace.sh)", () => {
     }
     await step(t, ["--convert-graft-file"]);
     await step(t, ["-f", "--convert-graft-file"]);
+    // --graft while the grafts file is there: git's advice on its first commit parse, and
+    // (2.5x) the missing object the file names as a commit
+    await step(t, ["-g", b]);
+    await step(t, ["-g", b, emptyBlob]);
+    await step(t, ["-g", a, b]);
   });
 });

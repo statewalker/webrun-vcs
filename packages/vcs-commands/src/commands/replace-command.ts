@@ -15,7 +15,7 @@
  * ```
  */
 
-import type { ObjectId } from "@statewalker/vcs-core";
+import { type ObjectId, parseGraftFile } from "@statewalker/vcs-core";
 import { parseGitBool } from "@statewalker/vcs-utils";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import { computeObjectId } from "@statewalker/vcs-utils/pack";
@@ -98,6 +98,14 @@ export class ReplaceCommand extends PlumbingCommand {
   private raw = false;
   private format?: string;
   private editor?: ReplaceEditor;
+  private compatibility: "2.43" | "2.56" = "2.56";
+  /** The grafts file as git loads it on the first commit parse (prepare_commit_graft) */
+  private graftsLoad?: Promise<Map<ObjectId, ObjectId[]> | undefined>;
+  /** Whether the grafts file was loaded (a commit was parsed) */
+  private graftsLoaded = false;
+  /** Commit objects git holds in memory: the grafts' commits, parsed commits' grafted parents */
+  private readonly knownCommits = new Set<ObjectId>();
+  private convertingGraftFile = false;
 
   /** The command mode (`-l`, `-d`, `-e`, `-g`, `--convert-graft-file`); one per command. */
   setMode(mode: ReplaceMode): this {
@@ -141,6 +149,17 @@ export class ReplaceCommand extends PlumbingCommand {
   setEditor(editor: ReplaceEditor): this {
     this.checkCallable();
     this.editor = editor;
+    return this;
+  }
+
+  /**
+   * The git version whose behaviour to follow (default 2.56): 2.5x reports a missing object
+   * the grafts file names as a commit (`Could not read <id>`), and words the advice on the
+   * grafts file as `git config set`.
+   */
+  setCompatibility(version: "2.43" | "2.56"): this {
+    this.checkCallable();
+    this.compatibility = version;
     return this;
   }
 
@@ -573,11 +592,66 @@ export class ReplaceCommand extends PlumbingCommand {
     const peeled = await this.revisionResolver()
       .peelTags(id)
       .catch(() => ({ id, type: undefined }));
-    if (peeled.type === "commit") return peeled.id;
+    if (peeled.type === "commit") {
+      await this.commitParsed(peeled.id);
+      return peeled.id;
+    }
     if (peeled.type !== undefined) {
       this.warn(`error: object ${peeled.id} is a ${peeled.type}, not a commit`);
+    } else if (this.compatibility !== "2.43" && this.knownCommits.has(id)) {
+      // repo_parse_commit of a commit object the grafts created, its object missing
+      this.warn(`error: Could not read ${id}`);
     }
     return undefined;
+  }
+
+  /**
+   * A commit was parsed: the first parse loads the grafts file (prepare_commit_graft, with
+   * its deprecation advice unless converting it), which makes each graft's commit known; a
+   * grafted commit's parse makes its grafted parents known.
+   */
+  private async commitParsed(id: ObjectId): Promise<void> {
+    if (!this.graftsLoaded) {
+      this.graftsLoaded = true;
+      this.graftsLoad ??= this.readGraftFile();
+      const grafts = await this.graftsLoad;
+      if (grafts) {
+        for (const commit of grafts.keys()) this.knownCommits.add(commit);
+        if (!this.convertingGraftFile) this.adviseGraftFile();
+      }
+    }
+    const grafts = await this.graftsLoad;
+    for (const parent of grafts?.get(id) ?? []) this.knownCommits.add(parent);
+  }
+
+  /** The grafts file's grafts; undefined when there is none. */
+  private async readGraftFile(): Promise<Map<ObjectId, ObjectId[]> | undefined> {
+    const text = await this._workingCopy.history?.refs?.readGrafts?.();
+    if (text === undefined) return undefined;
+    return parseGraftFile(text).grafts;
+  }
+
+  /** advice.graftFileDeprecated, as git words it. */
+  private adviseGraftFile(): void {
+    const value = RemoteConfigStore.from(this._workingCopy).value("advice.graftFileDeprecated");
+    if (value !== undefined && parseGitBool(value) === false) return;
+    const empty = this.compatibility === "2.43" ? "hint: " : "hint:";
+    const turnOff =
+      this.compatibility === "2.43"
+        ? 'hint: "git config advice.graftFileDeprecated false"'
+        : 'hint: "git config set advice.graftFileDeprecated false"';
+    for (const line of [
+      "hint: Support for <GIT_DIR>/info/grafts is deprecated",
+      "hint: and will be removed in a future Git version.",
+      empty,
+      'hint: Please use "git replace --convert-graft-file"',
+      "hint: to convert the grafts into replace refs.",
+      empty,
+      "hint: Turn this message off by running",
+      turnOff,
+    ]) {
+      this.warn(line);
+    }
   }
 
   /** `git replace --convert-graft-file` (convert_graft_file) */
@@ -589,6 +663,7 @@ export class ReplaceCommand extends PlumbingCommand {
         128,
       );
     }
+    this.convertingGraftFile = true;
     // fopen_or_warn: a missing file fails silently
     const text = await refs?.readGrafts?.();
     if (text === undefined) return 1;
