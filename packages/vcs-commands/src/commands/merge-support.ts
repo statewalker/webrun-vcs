@@ -15,7 +15,13 @@ import {
   type RefLogOptions,
   type TreeEntry,
 } from "@statewalker/vcs-core";
-import { bytesToHex, createSha1, objectFormatByHexLength } from "@statewalker/vcs-utils";
+import {
+  bytesToHex,
+  createSha1,
+  objectFormatByHexLength,
+  type ProgressMonitor,
+  startProgress,
+} from "@statewalker/vcs-utils";
 import { compareGitPaths, decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import {
@@ -903,6 +909,11 @@ export interface SwitchTreesOptions {
    * submodules' dry runs) run, then nothing is written, neither worktree nor index
    */
   checkOnly?: boolean;
+  /**
+   * check_updates' "Updating files" (unpack-trees' `verbose_update`): one unit per file
+   * removed or written, files leaving a sparse checkout included
+   */
+  progress?: ProgressMonitor;
 }
 
 /** git's default unpack-trees messages (`unpack_plumbing_errors`) for one refused path. */
@@ -1094,23 +1105,34 @@ async function switchTreesWith(
 
   // the worktree: deletions first (a deleted file `d` makes way for `d/x`), then the files
   if (worktree) {
+    let unlink: readonly string[] = [];
     if (sparse) {
       // apply_sparse_checkout before check_updates: the files leaving the checkout
       const removing = new Set(removes);
       const updating = new Set(updates);
-      const unlink = await sparse.leaving(
+      unlink = await sparse.leaving(
         worktree,
         (p) => (removing.has(p) ? undefined : updating.has(p) ? target.get(p) : index.get(p)),
         { trust },
       );
-      await sparse.unlink(worktree, unlink);
     }
-    for (const path of removes) {
-      if (quiet(path)) continue;
+    // check_updates: every CE_WT_REMOVE and CE_UPDATE entry is one unit of "Updating files"
+    const removed = removes.filter((path) => !quiet(path));
+    const progress = startProgress(
+      options.progress,
+      "Updating files",
+      unlink.length + removed.length + writing.size,
+    );
+    if (unlink.length > 0) {
+      await sparse?.unlink(worktree, unlink);
+      progress.update(unlink.length);
+    }
+    for (const path of removed) {
       const old = index.get(path);
       if (subs && old?.mode === FileMode.GITLINK) await subs.unlink(worktree, path, old);
       else await worktree.remove(path);
       await pruneEmptyParents(worktree, path);
+      progress.tick();
     }
     // core.ignorecase: what verify_clean_subdirectory took as tracked in a directory a file
     // replaces goes with the directory (checkout_entry removes the subtree)
@@ -1154,9 +1176,11 @@ async function switchTreesWith(
           gitlinks: true,
           replaceInTheWay: true,
           attributes: { direction: "checkout", index: attributesIndexOf(result) },
+          progress,
         },
       );
     }
+    progress.stop();
     if (subs) {
       // check_updates: `.gitmodules` read again, then the submodules checked out
       subs.reload();

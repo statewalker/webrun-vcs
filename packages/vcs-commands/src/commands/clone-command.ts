@@ -104,6 +104,7 @@ const CLONE_SETTINGS = [
   "gzipRequests",
   "progressCallback",
   "progressMessageCallback",
+  "progress",
   "transportRegistry",
   "useReplaceRefsOverride",
   "reflogActionOverride",
@@ -1146,6 +1147,8 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       deepenSince: shallowSince,
       deepenNot: shallowExcludes.length > 0 ? shallowExcludes : undefined,
       onProgress: this.progressMessageCallback,
+      // index-pack's "Receiving objects" and "Resolving deltas"
+      ...(this.progress ? { progress: this.progress } : {}),
       // git's write_remote_refs: one initial transaction (packed-refs), no reflog; the
       // followed tags of a single-branch clone each on their own (write_followtags)
       skipReflog: true,
@@ -1840,6 +1843,7 @@ export class CloneCommand extends TransportCommand<CloneResult> {
         ignoreCase: coreBool(this.workingCopy, "ignorecase", false),
         pathRules: worktreePathRules(this.workingCopy, worktree),
         ...(sparse ? { writes: (path: string) => sparse.writes(path) } : {}),
+        ...(this.progress ? { progress: this.progress } : {}),
       },
       commit.tree,
       CLONE,

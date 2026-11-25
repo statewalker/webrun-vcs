@@ -374,6 +374,8 @@ export class GarbageCollectCommand extends GitCommand<GCCommandResult> {
       gitDir: repository.gitDir,
       compatibility: this.hooks.compatibility,
       ...(environment ? { environment } : {}),
+      // -q suppresses progress reporting
+      ...(this.progress && !this._quiet ? { progress: this.progress } : {}),
       packRefs: this.packRefsConfigured(),
       packRefsStep: packRefs,
       beforeObjects: pruneWorktrees,
