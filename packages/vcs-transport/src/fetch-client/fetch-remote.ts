@@ -642,7 +642,13 @@ export async function fetchFromConnection(
           links,
           ...(receivedLinks ? { receivedLinks } : {}),
           shallow: grafts(),
-          kept: imported.packId !== undefined,
+          // fetch-pack's do_keep (its lock on the pack), not whether index-pack ran: a
+          // checked pack under the limit is index-pack's without --keep
+          kept:
+            imported.packId !== undefined &&
+            (!!options.keepPack ||
+              !!filter ||
+              keepsBySize(fetched.packObjects, options.unpackLimit)),
         });
         packMessages.push(...checked.messages);
         if (links && checked.selfContained) selfContained.push(received);
