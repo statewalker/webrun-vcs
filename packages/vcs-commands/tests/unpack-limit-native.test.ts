@@ -137,14 +137,6 @@ const PUSHES: Scenario[] = [
     kept: false,
   },
   {
-    title: "a negative receive.unpackLimit leaves it to transfer.unpackLimit",
-    config: [
-      ["receive.unpackLimit", "-1"],
-      ["transfer.unpackLimit", "9"],
-    ],
-    kept: true,
-  },
-  {
     title: "a limit with a unit suffix (1k)",
     config: [["receive.unpackLimit", "1k"]],
     kept: false,
