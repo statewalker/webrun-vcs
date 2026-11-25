@@ -69,6 +69,7 @@ export {
   installMergeDrivers,
   type MergeAttributeValue,
   type MergeDriver,
+  MergeDriverFailedError,
   type MergeDriverInput,
   type MergeDriverRegistry,
   type MergeDriverResult,

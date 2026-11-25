@@ -201,7 +201,7 @@ export class DiffPickaxe {
       if (!side.valid) return new Uint8Array(0);
       if (!textconv) return side.read();
       try {
-        return await textconv(await side.textconvInput(), attrPath);
+        return await textconv(await side.textconvInput(), attrPath, side.textconvId);
       } catch (e) {
         // fill_textconv: run_textconv's error, then the death
         const message = e instanceof Error ? e.message : String(e);

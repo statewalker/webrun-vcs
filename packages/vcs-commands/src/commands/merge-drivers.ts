@@ -45,12 +45,25 @@ export interface MergeDriverInput {
   theirsLabel: string;
   /** The conflict marker length to use (`%L`) */
   markerSize: number;
+  /**
+   * The command git would run (`merge.<driver>.driver`), when the configuration has one: a
+   * host that runs commands runs it (its `%O`, `%A`, `%B` temporary files of the three
+   * versions, `%A` read back as the result), others ignore it
+   */
+  command?: string;
 }
 
-/** What a merge driver gives back: the merged content, and whether it holds conflicts. */
+/**
+ * What a merge driver gives back: the merged content, and whether it holds conflicts (git:
+ * the command exited with a status from 1 to 128). `error` is a driver that could not merge
+ * at all (git: the command died of a signal): the merge stops with git's `error: failed to
+ * execute internal merge`, as ll_ext_merge's `LL_MERGE_ERROR`; a driver that throws is
+ * taken the same way.
+ */
 export interface MergeDriverResult {
   content: Uint8Array;
   conflict: boolean;
+  error?: boolean;
 }
 
 /** A merge driver a host registers. */
@@ -72,6 +85,30 @@ export function createMergeDriver(
   options: { recursive?: string } = {},
 ): MergeDriver {
   return { merge, ...(options.recursive ? { recursive: options.recursive } : {}) };
+}
+
+/**
+ * A merge driver failed to run (ll_merge's `LL_MERGE_ERROR`): merge-ort gives up, the
+ * merge's result `clean < 0`. git 2.5x reports it as `error: failed to execute internal
+ * merge for <path>` (an ERROR path message, printed only for the outer merge: an inner
+ * merge of merge bases fails without it); git 2.43 said `error: failed to execute internal
+ * merge` and aborted on a failure in an inner merge.
+ */
+export class MergeDriverFailedError extends Error {
+  constructor(
+    /** The path whose merge failed */
+    readonly path: string,
+    /** Whether it failed in a merge of merge bases (merge-ort's call_depth > 0) */
+    readonly inner = false,
+  ) {
+    super(`failed to execute internal merge for ${path}`);
+    this.name = "MergeDriverFailedError";
+  }
+
+  /** The lines git 2.5x prints on stderr for it (none for an inner merge) */
+  get lines(): string[] {
+    return this.inner ? [] : [`error: ${this.message}`];
+  }
 }
 
 /** The driver registered under `name`, if any. */
@@ -139,6 +176,8 @@ export interface LowLevelMergeOptions {
   drivers?: MergeDriverRegistry;
   defaultDriver?: string;
   recursiveDriver?: (name: string) => string | undefined;
+  /** merge.<driver>.driver: the command a registered driver is given ({@link MergeDriverInput.command}) */
+  driverCommand?: (name: string) => string | undefined;
   /** A merge of merge bases (`virtual_ancestor`): the recursive driver, the base on binary */
   virtualAncestor?: boolean;
   /** `-X ours` / `-X theirs` / `-X union` (ignored for a merge of merge bases) */
@@ -154,9 +193,12 @@ export interface LowLevelMergeOptions {
   whitespace?: number;
 }
 
-/** What {@link lowLevelMerge} gives: `binary` is git's `LL_MERGE_BINARY_CONFLICT`. */
+/**
+ * What {@link lowLevelMerge} gives: `binary` is git's `LL_MERGE_BINARY_CONFLICT`, `error`
+ * its `LL_MERGE_ERROR` (a driver that failed to run).
+ */
 export interface LowLevelMergeResult {
-  status: "ok" | "conflict" | "binary";
+  status: "ok" | "conflict" | "binary" | "error";
   content: Uint8Array;
 }
 
@@ -179,7 +221,8 @@ export async function lowLevelMerge(
   }
   let driver = findMergeDriver(attrs.merge, options.drivers, options.defaultDriver);
   if (options.virtualAncestor) {
-    const recursive = driver.custom?.recursive ?? options.recursiveDriver?.(driver.name);
+    // merge.<driver>.recursive wins over the registered driver's own
+    const recursive = options.recursiveDriver?.(driver.name) ?? driver.custom?.recursive;
     if (recursive) driver = findMergeDriver(recursive, options.drivers, options.defaultDriver);
   }
   markerSize += options.extraMarkerSize ?? 0;
@@ -192,16 +235,24 @@ export async function lowLevelMerge(
     return { status: "binary", content: src1 };
   };
   if (driver.custom) {
-    const out = await driver.custom.merge({
-      path,
-      base: orig,
-      ours: src1,
-      theirs: src2,
-      baseLabel: input.baseLabel,
-      oursLabel: input.oursLabel,
-      theirsLabel: input.theirsLabel,
-      markerSize,
-    });
+    const command = options.driverCommand?.(driver.name);
+    let out: MergeDriverResult;
+    try {
+      out = await driver.custom.merge({
+        path,
+        base: orig,
+        ours: src1,
+        theirs: src2,
+        baseLabel: input.baseLabel,
+        oursLabel: input.oursLabel,
+        theirsLabel: input.theirsLabel,
+        markerSize,
+        ...(command !== undefined ? { command } : {}),
+      });
+    } catch {
+      return { status: "error", content: new Uint8Array(0) };
+    }
+    if (out.error) return { status: "error", content: out.content };
     return { status: out.conflict ? "conflict" : "ok", content: out.content };
   }
   if (driver.name === "binary") return binaryMerge();
@@ -283,6 +334,7 @@ export function ortConfigOptions(
   const defaultDriver = configValue(workingCopy, "merge.default");
   if (defaultDriver) out.defaultDriver = defaultDriver;
   out.recursiveDriver = (name) => configValue(workingCopy, `merge.${name}.recursive`);
+  out.driverCommand = (name) => configValue(workingCopy, `merge.${name}.driver`);
   const drivers = mergeDriversOf(workingCopy);
   if (drivers) out.drivers = drivers;
   const filter = worktree?.contentFilter as AttributeReader | undefined;

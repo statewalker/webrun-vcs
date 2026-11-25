@@ -741,10 +741,16 @@ export class GitContentFilter implements WorktreeContentFilter {
     content: Uint8Array,
   ): Promise<Uint8Array | undefined> {
     if (!driver) return undefined;
+    const command = driver[direction];
+    // an empty command turns the direction off (git's `-c filter.<driver>.smudge=`)
+    if (command === "") return undefined;
     const run = driver.host?.[direction];
     if (!run) return undefined;
     try {
-      return await run.call(driver.host, content, { path });
+      return await run.call(driver.host, content, {
+        path,
+        ...(command !== undefined ? { command } : {}),
+      });
     } catch {
       return undefined;
     }
