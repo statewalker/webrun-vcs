@@ -64,6 +64,7 @@ import {
   RangeDiffCommand,
   MktagCommand,
   ReadTreeCommand,
+  UpdateIndexCommand,
   RebaseCommand,
   ReflogCommand,
   RemoteAddCommand,
@@ -716,6 +717,20 @@ export class Git implements Disposable {
   readTree(): ReadTreeCommand {
     this.checkClosed();
     return new ReadTreeCommand(this._workingCopy);
+  }
+
+  /**
+   * Create an UpdateIndexCommand editing index entries as `git update-index` does, its
+   * options and paths applied in the order given.
+   *
+   * @example
+   * ```typescript
+   * await git.updateIndex().setAdd(true).addPath("new.txt").setChmod("+x").addPath("run.sh").call();
+   * ```
+   */
+  updateIndex(): UpdateIndexCommand {
+    this.checkClosed();
+    return new UpdateIndexCommand(this._workingCopy);
   }
 
   /**

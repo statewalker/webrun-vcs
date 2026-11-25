@@ -214,3 +214,20 @@ export class MktagFailedError extends GitApiError {
     this.name = "MktagFailedError";
   }
 }
+
+/**
+ * Thrown by `update-index` where git dies (exit status 128), before the index is written:
+ * a path it cannot add or remove (`Unable to process path <path>`), an entry it cannot mark,
+ * a malformed `--index-info` line. The message is git's stderr, `output` what it printed on
+ * stdout before (`--verbose`'s report).
+ */
+export class UpdateIndexFailedError extends GitApiError {
+  constructor(
+    message: string,
+    /** What git printed on stdout before dying */
+    readonly output = "",
+  ) {
+    super(message, { exitCode: 128 });
+    this.name = "UpdateIndexFailedError";
+  }
+}
