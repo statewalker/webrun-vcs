@@ -79,8 +79,12 @@ export const REFTABLE_STACK_BYTES_CEILING = 512 * 1024 * 1024;
  */
 export const REFTABLE_RELOAD_DEADLINE_MS = 3000;
 const RELOAD_TRIES_BEFORE_DEADLINE = 3;
-/** A table name git writes: `0x<min>-0x<max>-<random>.ref`; nothing naming another directory */
-const TABLE_NAME = /^[^/\\]+\.ref$/;
+/**
+ * A table name `tables.list` may hold: git opens any name in the stack's directory (writers
+ * name them `0x<min>-0x<max>-<random>.ref`, and `git refs verify` warns of others,
+ * badReftableTableName), but never one naming another directory
+ */
+const TABLE_NAME = /^[^/\\]+$/;
 
 /** Options of {@link createReftableStackReader}. */
 export interface ReftableStackReaderOptions {
