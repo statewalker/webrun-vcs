@@ -140,9 +140,13 @@ function cspan(s: string, from: number, chars: string): number {
  */
 export function normalizeUrl(
   input: string,
-  options: { allowGlobs?: boolean } = {},
+  options: {
+    allowGlobs?: boolean;
+    /** `input` is already bytes, one character each (as the result's `url` is) */
+    bytes?: boolean;
+  } = {},
 ): NormalizedUrl | UrlNormalizeError {
-  const url = toBytes(input);
+  const url = options.bytes ? input : toBytes(input);
   let at = 0;
   let spanned = span(url, 0, SCHEME_CHARS);
   if (

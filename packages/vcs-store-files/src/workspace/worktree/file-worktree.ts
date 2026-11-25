@@ -38,6 +38,7 @@ import type {
   GitHostEnvironment,
   GitlinkHeadState,
   IgnoreManager,
+  IgnoreMatch,
   IgnoreNode,
   NestedRepositoryState,
   NewHasher,
@@ -790,6 +791,14 @@ export class FileWorktree implements Worktree {
     // a directory (an empty one too), never a link to one: as git's lstat decides
     const kind = await this.kindOrError(joinPath(this.rootPath, path));
     return this.ignoreManager.isIgnored(path, kind === "directory");
+  }
+
+  async ignoreMatch(path: string, asDirectory = false): Promise<IgnoreMatch | undefined> {
+    await this.loadIgnoresFor(path, this.batchIgnores ?? new Set<string>());
+    if (!this.ignoreManager.matchingPattern) return undefined;
+    const isDirectory =
+      asDirectory || (await this.kindOrError(joinPath(this.rootPath, path))) === "directory";
+    return this.ignoreManager.matchingPattern(path, isDirectory);
   }
 
   // ========== Writing ==========

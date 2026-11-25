@@ -62,6 +62,21 @@ export interface GitHostEnvironment {
    * `$XDG_CONFIG_HOME/git/config` and `~/.gitconfig`
    */
   globalConfig?: string;
+  /**
+   * The variables naming the user's editor and pager as git reads them (`git var
+   * GIT_EDITOR`, `GIT_PAGER`): `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `VISUAL`, `EDITOR`,
+   * `TERM` (a dumb or missing terminal skips `VISUAL`), `GIT_PAGER`, `PAGER`; absent ones unset
+   */
+  programVariables?: Partial<
+    Record<
+      "GIT_EDITOR" | "GIT_SEQUENCE_EDITOR" | "VISUAL" | "EDITOR" | "TERM" | "GIT_PAGER" | "PAGER",
+      string
+    >
+  >;
+  /** The build's `DEFAULT_EDITOR` (default `vi`; Debian's git: `editor`) */
+  defaultEditor?: string;
+  /** The build's `DEFAULT_PAGER` (default `less`; Debian's git: `pager`) */
+  defaultPager?: string;
   /** The system attributes file (`$(prefix)/etc/gitattributes`); not read when absent */
   systemAttributes?: string;
   /**

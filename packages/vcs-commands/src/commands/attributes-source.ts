@@ -56,6 +56,11 @@ export function bareAttributesResolver(o: {
    * `git archive` reads one): its files replace any attribute source
    */
   indexTree?: string;
+  /**
+   * The tree the in-tree files are read from instead of the attribute source's (`git
+   * check-attr --source`); the index tree still wins
+   */
+  sourceTree?: string;
 }): AttributesResolver {
   const { workingCopy } = o;
   const environment = hostEnvironmentOf(workingCopy);
@@ -77,7 +82,7 @@ export function bareAttributesResolver(o: {
       info: async () => read(gitDir ? `${gitDir.replace(/\/+$/, "")}/info/attributes` : undefined),
       // from an attribute source (`$GIT_ATTR_SOURCE`, `attr.tree`), else the index's tree
       inTree: async (dir) => {
-        if (!o.indexTree) {
+        if (!o.indexTree && o.sourceTree === undefined) {
           source ??= (async () => {
             const setting = attributesSourceSetting(
               environment?.attrSource,
@@ -89,7 +94,7 @@ export function bareAttributesResolver(o: {
         }
         // GIT_ATTR_INDEX (an index tree given) wins over the attribute source (attr.c's read_attr)
         const found = o.indexTree ? undefined : await source;
-        const tree = o.indexTree ?? found?.tree;
+        const tree = o.indexTree ?? o.sourceTree ?? found?.tree;
         if (!tree) return undefined;
         const file = await readTreeAttributesFile(
           o.trees,
