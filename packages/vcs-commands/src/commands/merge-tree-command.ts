@@ -207,6 +207,8 @@ export class MergeTreeCommand extends PlumbingCommand {
   protected async run(): Promise<number> {
     const legacy = this.compatibility === "2.43";
     let messages = this.messages;
+    // git 2.43 has no --quiet (parse_options' refusal; its usage text is not repeated)
+    if (this.quiet && legacy) throw new PlumbingError("error: unknown option `quiet'", 129);
     if (this.quiet && !legacy) {
       messages ??= false;
       const incompatible = (other: string) => {
@@ -324,18 +326,26 @@ export class MergeTreeCommand extends PlumbingCommand {
         if (bases.length === 0 && !this.allowUnrelated) {
           throw new PlumbingError("fatal: refusing to merge unrelated histories");
         }
-        base = await mergeBaseTree(
-          {
-            commits: this.commits,
-            trees,
-            blobs,
-            abbreviate: (id) => this.abbreviateObjectId(id),
-          },
-          parent1,
-          parent2,
-          bases,
-          common,
-        );
+        try {
+          base = await mergeBaseTree(
+            {
+              commits: this.commits,
+              trees,
+              blobs,
+              abbreviate: (id) => this.abbreviateObjectId(id),
+            },
+            parent1,
+            parent2,
+            bases,
+            common,
+          );
+        } catch (e) {
+          // a tree missing in a merge of merge bases (the virtual base) fails the merge too
+          if (e instanceof MissingMergeObject && e.kind === "tree") {
+            throw new PlumbingError(`error: Could not read ${e.id}\nfatal: failure to merge`);
+          }
+          throw e;
+        }
       }
     }
 

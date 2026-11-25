@@ -467,7 +467,17 @@ git pack-objects -q ${JSON.stringify(bare)}/objects/pack/pack`,
   });
 
   it('t4301: "--quiet on clean merge", "--quiet on conflicted merge"', async () => {
-    if (compatibility === "2.43") return; // --quiet is 2.5x's
+    if (compatibility === "2.43") {
+      // --quiet is 2.5x's: 2.43 refuses the option (usage errors compare their first line)
+      const argv = ["--write-tree", "--quiet", "side1", "side3"];
+      const native = shell.git(dir, ["merge-tree", ...argv]);
+      const out = await mergeTreeArgs(await openOurs(dir), argv).callOutput();
+      expect([out.exitCode, out.stderr.split("\n")[0]]).toEqual([
+        native.status,
+        native.stderr.split("\n")[0],
+      ]);
+      return;
+    }
     const objects = () => shell.ok(dir, "count-objects");
     shell.ok(dir, "gc", "-q");
     const before = objects();
