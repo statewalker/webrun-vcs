@@ -378,7 +378,12 @@ const decoder = new TextDecoder();
  * ident.c's apply_mailmap_to_header: the `author`/`committer` lines of the header part
  * rewritten to the mailmap's name and email (`Name <email>`, the rest of the line kept).
  */
-export function applyMailmapToHeader(raw: Uint8Array, mailmap: Mailmap): Uint8Array {
+export function applyMailmapToHeader(
+  raw: Uint8Array,
+  mailmap: Mailmap,
+  /** The header lines rewritten (default `author `, `committer `; cat-file adds `tagger `) */
+  prefixes: readonly Uint8Array[] = FIELD_PREFIX,
+): Uint8Array {
   const parts: Uint8Array[] = [];
   let changed = false;
   let pos = 0;
@@ -386,7 +391,7 @@ export function applyMailmapToHeader(raw: Uint8Array, mailmap: Mailmap): Uint8Ar
     let end = raw.indexOf(0x0a, pos);
     if (end < 0) end = raw.length;
     const line = raw.subarray(pos, end);
-    const prefix = FIELD_PREFIX.find((p) => startsWith(line, p));
+    const prefix = prefixes.find((p) => startsWith(line, p));
     let out: Uint8Array = line;
     if (prefix) {
       const mapped = rewriteIdent(line.subarray(prefix.length), mailmap);
