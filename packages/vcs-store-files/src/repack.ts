@@ -41,7 +41,7 @@ import { parseGitBool } from "@statewalker/vcs-utils/encoding";
 import type { ObjectFormat } from "@statewalker/vcs-utils/hash";
 import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
 import { assertAlternatesReadable } from "./alternates/index.js";
-import { writeCruftPacks } from "./cruft-pack.js";
+import { objectLinks, recentPackedObjects, writeCruftPacks } from "./cruft-pack.js";
 import { type MultiPackIndexWriteOptions, multiPackIndexWrite } from "./multi-pack-index.js";
 import { objectIdPattern } from "./object-names.js";
 import {
@@ -785,6 +785,7 @@ export async function repackListed(
         files,
         gitDir,
         objects,
+        packs,
         removable,
         // the new pack holds only reachable objects; .keep packs and the promisor pack stay
         keep: [
@@ -1004,17 +1005,23 @@ async function installBitmap(
 
 /**
  * `--unpack-unreachable`: writes loose the objects of the packs about to be removed that are
- * not reachable and not held by a pack that stays, unless their pack was modified before
- * `cutoff`. Each object is streamed from its pack into a staged loose file (temporary file and
- * rename); none is collected. An object already loose is rewritten when its loose file is older
- * than the freshen window (one hour), which renews its mtime: git gives it the pack's mtime, and
- * an old loose copy of an object of a young pack must not expire with the pack gone. Every id
- * left loose goes into `loosened`. Returns how many were written or renewed.
+ * not reachable and not held by a pack that stays, unless their pack expired (its mtime, in
+ * whole seconds, is not after `cutoff`'s, as git keeps only `mtime > expiration`) and no
+ * recent unreachable object reaches them: pack-objects' `loosened_object_can_be_discarded`
+ * keeps what `recent_objects` holds, the objects reached from the unreachable loose objects and
+ * packed objects younger than the cutoff (`add_unseen_recent_objects_to_traversal`), so a
+ * recent commit never loses the tree an old pack held. Each object is streamed from its pack
+ * into a staged loose file (temporary file and rename); none is collected. An object already
+ * loose is rewritten when its loose file is older than the freshen window (one hour), which
+ * renews its mtime: git gives it the pack's mtime, and an old loose copy of an object of a
+ * young pack must not expire with the pack gone. Every id left loose goes into `loosened`.
+ * Returns how many were written or renewed.
  */
 async function unpackUnreachable(o: {
   files: FilesApi;
   gitDir: string;
   objects: GitObjects;
+  packs: PackSet;
   removable: readonly { pack: Pack; modified?: number }[];
   keep: readonly Pack[];
   reachable: ReadonlySet<ObjectId>;
@@ -1022,13 +1029,20 @@ async function unpackUnreachable(o: {
   loosened: Set<ObjectId>;
 }): Promise<number> {
   // Straight into the loose store: the object kernel would skip an object it finds packed
-  const staging = filesStagingStore(o.files, joinPath(o.gitDir, "objects"));
+  const objectsDir = joinPath(o.gitDir, "objects");
+  const staging = filesStagingStore(o.files, objectsDir);
   const loose = createGitObjects(staging);
+  // git compares whole seconds; an unknown age is never expired
+  const cutoffSeconds = Math.floor(o.cutoff / 1000);
+  const young = (modified: number | undefined) =>
+    modified === undefined || Math.floor(modified / 1000) > cutoffSeconds;
+  const expired = o.removable.filter((r) => !young(r.modified));
+  const recent = expired.length > 0 ? await recentObjects(o, objectsDir, young) : new Set();
   let written = 0;
   for (const { pack, modified } of o.removable) {
-    // An expired pack's unreachable objects are dropped; an unknown age is never expired
-    if (modified !== undefined && modified < o.cutoff) continue;
+    const packYoung = young(modified);
     for (const id of pack.ids()) {
+      if (!packYoung && !recent.has(id)) continue;
       if (o.reachable.has(id) || o.keep.some((p) => p.has(id))) continue;
       if (o.loosened.has(id)) continue;
       o.loosened.add(id);
@@ -1042,6 +1056,55 @@ async function unpackUnreachable(o: {
     }
   }
   return written;
+}
+
+/**
+ * pack-objects' `recent_objects`: the unreachable objects reached from the unreachable loose
+ * objects and packed objects (every local pack, a cruft pack's by its `.mtimes`) younger than
+ * the cutoff, the walk stopping at reachable objects and passing over missing links
+ * (`ignore_missing_links`).
+ */
+async function recentObjects(
+  o: {
+    files: FilesApi;
+    objects: GitObjects;
+    packs: PackSet;
+    reachable: ReadonlySet<ObjectId>;
+    cutoff: number;
+  },
+  objectsDir: string,
+  young: (modified: number | undefined) => boolean,
+): Promise<Set<ObjectId>> {
+  const format = objectFormatOf(o.objects);
+  const pending: ObjectId[] = [];
+  const name = objectIdPattern(format);
+  for await (const dir of o.files.list(objectsDir)) {
+    if (dir.kind !== "directory" || !/^[0-9a-f]{2}$/.test(dir.name)) continue;
+    for await (const e of o.files.list(dir.path)) {
+      const id = `${dir.name}${e.name}`;
+      if (e.kind !== "file" || !name.test(id) || o.reachable.has(id)) continue;
+      // an unknown age is recent (as an unknown pack age is never expired)
+      if (young((await o.files.stats(e.path))?.lastModified)) pending.push(id);
+    }
+  }
+  for (const id of await recentPackedObjects(
+    o.files,
+    objectsDir,
+    o.packs,
+    o.cutoff,
+    o.reachable,
+    format,
+  ))
+    pending.push(id);
+  const recent = new Set<ObjectId>();
+  while (pending.length > 0) {
+    const id = pending.pop() as ObjectId;
+    if (recent.has(id) || o.reachable.has(id)) continue;
+    recent.add(id);
+    for (const link of await objectLinks(o.objects, id))
+      if (!recent.has(link) && !o.reachable.has(link)) pending.push(link);
+  }
+  return recent;
 }
 
 /**
