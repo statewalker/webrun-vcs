@@ -53,11 +53,14 @@ export class SmartHttpClient {
   private wwwAuthenticate: string[] = [];
   /** After a re-root to another origin: the caller's Authorization/Cookie headers stay home */
   private dropCallerCredentials = false;
+  /** The origin of the URL as given: the only one a dumb GET sends any header to */
+  private readonly givenOrigin: string;
   /** Empty credentials a server took (`http.emptyAuth`), sent from then on */
   private emptyAuth?: Credentials;
 
   constructor(private readonly options: SmartHttpClientOptions) {
     this.baseUrl = options.url.replace(/\/+$/, "");
+    this.givenOrigin = originOf(this.baseUrl);
     if (options.auth) this.auth = options.auth;
   }
 
@@ -143,11 +146,13 @@ export class SmartHttpClient {
   /**
    * A later GET of the dumb protocol (`HEAD`, `objects/...`, an alternate's files), as
    * http-walker sends it: redirects followed only under `http.followRedirects=true`. A URL on
-   * the base's origin gets the connection's headers and credentials; one elsewhere (an
-   * alternate on another server) gets none of them.
+   * the base's origin gets the connection's headers and credentials while that is still the
+   * origin of the URL as given; any other (a base the first redirect moved to another server,
+   * an alternate elsewhere) gets none of them: no caller headers, no `http.extraHeader`.
    */
   async get(url: string, wait: ServerWait): Promise<Response> {
-    if (originOf(url) === originOf(this.baseUrl)) {
+    const origin = originOf(url);
+    if (origin === originOf(this.baseUrl) && origin === this.givenOrigin) {
       return this.send(url, { method: "GET", headers: {} }, wait, false);
     }
     const follow = (this.settings.followRedirects ?? "initial") === "always";

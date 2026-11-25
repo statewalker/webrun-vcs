@@ -87,9 +87,15 @@ describe("alternateTargets (http-walker's process_alternates_response)", () => {
 
 describe("credentials of a dumb connection", () => {
   it("a first request redirected to another origin takes no credentials along", async () => {
-    const seen: Array<{ url: string; authorization: string | null }> = [];
+    const seen: Array<{ url: string; authorization: string | null; token?: string | null }> = [];
     const fetchImpl = async (request: Request): Promise<Response> => {
-      seen.push({ url: request.url, authorization: request.headers.get("authorization") });
+      seen.push({
+        url: request.url,
+        authorization: request.headers.get("authorization"),
+        ...(new URL(request.url).pathname.endsWith("/HEAD")
+          ? { token: request.headers.get("private-token") }
+          : {}),
+      });
       const url = new URL(request.url);
       if (url.pathname.endsWith("/info/refs")) {
         // where the redirect led (fetch dropped the header on the way, as it does)
@@ -107,6 +113,8 @@ describe("credentials of a dumb connection", () => {
       url: "https://good.example/repo",
       fetchImpl,
       auth: { username: "u", password: "secret" },
+      headers: { "Private-Token": "t" },
+      http: { extraHeaders: ["X-Extra: e"] },
     });
     expect(connection.dumb?.baseUrl).toBe("https://evil.example/repo");
     expect(connection.advertisedRefs?.[0]).toEqual({
@@ -116,7 +124,10 @@ describe("credentials of a dumb connection", () => {
     });
     // the first request went where the user asked, with credentials; HEAD went elsewhere
     expect(seen[0]?.authorization).not.toBeNull();
-    expect(seen.slice(1)).toEqual([{ url: "https://evil.example/repo/HEAD", authorization: null }]);
+    // no header of the user's at all there: neither the caller's nor http.extraHeader
+    expect(seen.slice(1)).toEqual([
+      { url: "https://evil.example/repo/HEAD", authorization: null, token: null },
+    ]);
   });
 });
 
