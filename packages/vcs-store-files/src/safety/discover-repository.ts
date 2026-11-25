@@ -61,6 +61,14 @@ export interface DiscoveredRepository {
   bare: boolean;
   /** git's warnings on the way (`safe.directory '<x>' not absolute`) */
   warnings: string[];
+  /**
+   * With `$GIT_DIR`/`$GIT_WORK_TREE` in the environment ({@link setupGitDirectory}): the
+   * common directory, index file and objects directory the variables give. Opening a backend
+   * or staging at them is the caller's: `createGitFilesBackend` still takes `gitDir` alone.
+   */
+  commonDir?: string;
+  indexFile?: string;
+  objectDirectory?: string;
 }
 
 /** No repository at or above the directory (git's exit 128). */
@@ -141,6 +149,9 @@ export async function discoverRepository(
       ...(setup.gitfile !== undefined ? { gitfile: setup.gitfile } : {}),
       bare: setup.workTree === undefined,
       warnings: setup.warnings,
+      commonDir: setup.commonDir,
+      indexFile: setup.indexFile,
+      objectDirectory: setup.objectDirectory,
     };
   }
   const found = await discoverFrom(options);

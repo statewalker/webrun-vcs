@@ -222,7 +222,7 @@ async function collectRoots(
   // REF_ISBROKEN (fatal with paranoia, skipped without); a missing object is fatal with
   // paranoia, skipped with ref_resolves_to_object's error without
   const refRoot = async (name: string, id: ObjectId | undefined) => {
-    if (name.startsWith("refs/") && !isValidRefName(name)) {
+    if (brokenRefName(name)) {
       if (paranoia) throw new MissingRootError(`bad object ${name}`, format.nullId, name);
       return;
     }
@@ -237,10 +237,7 @@ async function collectRoots(
   // and through the Refs API too (a store that keeps refs elsewhere)
   for await (const ref of refs.list()) {
     if (byName.has(ref.name)) continue;
-    const resolved =
-      ref.name.startsWith("refs/") && !isValidRefName(ref.name)
-        ? undefined
-        : await refs.resolve(ref.name);
+    const resolved = brokenRefName(ref.name) ? undefined : await refs.resolve(ref.name);
     await refRoot(ref.name, resolved?.objectId);
   }
   const head = await refs.resolve("HEAD");
@@ -314,6 +311,15 @@ async function collectRoots(
   }
   for (const id of tips) if (await objects.has(id)) present.push(id);
   return { ids: present, paths };
+}
+
+/**
+ * A `refs/...` name git's `check_refname_format` refuses (REF_BAD_NAME). Names hold non-UTF-8
+ * bytes as U+DC80..U+DCFF (`decodeGitPath`); git allows every byte from 0x80 on, so those
+ * stand for an ordinary non-ASCII character here.
+ */
+function brokenRefName(name: string): boolean {
+  return name.startsWith("refs/") && !isValidRefName(name.replace(/[\uDC80-\uDCFF]/g, "\u00e9"));
 }
 
 /** A worktree's HEAD: a detached object id, or `ref: <name>` resolved through `resolve`. */

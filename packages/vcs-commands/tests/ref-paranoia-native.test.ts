@@ -223,6 +223,31 @@ describeGit("GIT_REF_PARANOIA twins", () => {
     expect(t.ours).toEqual(t.native);
   });
 
+  it("a branch name with non-UTF-8 bytes is a valid root (paranoia on and off)", async () => {
+    for (const paranoia of ["1", "0"]) {
+      const caseDir = newCase(root, `latin1-${paranoia}`);
+      const r = initRepo(root, caseDir);
+      r.git(["config", "core.logallrefupdates", "false"]);
+      r.commit("main");
+      r.commit("only-latin1");
+      const kept = r.git(["rev-parse", "HEAD"]);
+      // `refs/heads/caf\xe9` (a Latin-1 name, valid to check_refname_format), by its bytes
+      writeFileSync(
+        Buffer.concat([Buffer.from(join(r.dir, ".git/refs/heads/caf")), Buffer.from([0xe9])]),
+        `${kept}\n`,
+      );
+      r.git(["reset", "-q", "--hard", "HEAD^"]);
+      r.git(["reflog", "expire", "--expire=all", "--all"]);
+      const t = await twins(caseDir, "prune", ["prune", "--expire=now"], prune, {
+        GIT_REF_PARANOIA: paranoia,
+      });
+      expect(t.native.status).toBe(0);
+      expect(t.ours).toEqual(t.native);
+      expect(hasObject(t.repos.native, kept)).toBe(true);
+      expect(hasObject(t.repos.ours, kept)).toBe(true);
+    }
+  });
+
   it('t5312-prune-corruption.sh: "pruning with a corrupted tip does not drop history"', async () => {
     const { caseDir, recoverable } = missingTipCase("missing-tip");
     const t = await twins(caseDir, "prune", ["prune", "--expire=now"], prune);
