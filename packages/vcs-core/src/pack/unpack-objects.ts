@@ -113,7 +113,7 @@ class StreamReader {
   private hasher: Hasher | undefined;
   constructor(source: AsyncIterable<Uint8Array>, format: ObjectFormat) {
     this.it = source[Symbol.asyncIterator]();
-    this.hasher = format.createHasher();
+    this.hasher = format.createUnsafeHasher();
   }
   private consumed(bytes: Uint8Array) {
     this.hasher?.update(bytes);

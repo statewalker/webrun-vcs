@@ -438,7 +438,7 @@ export function parseMultiPackIndex(
     },
     checksumValid() {
       const sum = objectFormat
-        .createHasher()
+        .createUnsafeHasher()
         .update(bytes.subarray(0, bytes.length - HASH_SIZE))
         .digest();
       return bytesToHex(sum) === checksum;
@@ -821,7 +821,7 @@ export function encodeMultiPackIndex(options: EncodeMultiPackIndexOptions): Enco
     toc += TOC_ENTRY;
   }
   setBig(toc + 4, offset);
-  const sum = objectFormat.createHasher().update(out.subarray(0, offset)).digest();
+  const sum = objectFormat.createUnsafeHasher().update(out.subarray(0, offset)).digest();
   out.set(sum, offset);
   const packOf = new Uint32Array(n);
   for (let i = 0; i < n; i++) packOf[i] = perm[(entries[i] as Entry).pack] as number;

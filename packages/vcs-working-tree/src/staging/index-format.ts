@@ -972,7 +972,7 @@ function hasExtendedFlags(entry: StagingEntry): boolean {
 
 /** The first `size` bytes of `out` in chunks of {@link INDEX_CHUNK_SIZE}, then their hash. */
 function* chunked(out: Uint8Array, size: number, layout: IndexLayout): Generator<Uint8Array> {
-  const hasher = layout.format.createHasher();
+  const hasher = layout.format.createUnsafeHasher();
   for (let at = 0; at < size; at += INDEX_CHUNK_SIZE) {
     // a copy: the entries' records point into `out` (see encodeIndexFileBytes)
     const chunk = out.slice(at, Math.min(size, at + INDEX_CHUNK_SIZE));
@@ -988,7 +988,7 @@ function* encodeSorted(
   extensions: readonly IndexExtension[],
   layout: IndexLayout,
 ): Generator<Uint8Array> {
-  const hasher = layout.format.createHasher();
+  const hasher = layout.format.createUnsafeHasher();
 
   const header = new Uint8Array(HEADER_SIZE);
   const headerView = new DataView(header.buffer);

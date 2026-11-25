@@ -184,7 +184,7 @@ function objectHeaderBytes(type: ObjectTypeString, size: number): Uint8Array {
 }
 
 const objectId = (type: ObjectTypeString, data: Uint8Array, format: ObjectFormat) =>
-  format.createHasher().update(objectHeaderBytes(type, data.length)).update(data).digest();
+  format.hashObject(objectHeaderBytes(type, data.length), data);
 
 /**
  * Struct-of-arrays entry table. Entries are in pack order (offsets ascending), appended bases
@@ -299,7 +299,7 @@ class SequentialReader {
     format: ObjectFormat,
   ) {
     this.it = source[Symbol.asyncIterator]();
-    this.hasher = format.createHasher();
+    this.hasher = format.createUnsafeHasher();
   }
   /** Feeds the consumed bytes not yet accounted for to the CRC and the hash. */
   private account() {
@@ -562,9 +562,9 @@ async function parseWith(
     t.hdr[i] = r.pos - offset;
     let got = 0;
     const typeName = TYPE_NAMES[kind];
-    const objHash = typeName
-      ? format.createHasher().update(objectHeaderBytes(typeName, size))
-      : undefined;
+    const header = typeName ? objectHeaderBytes(typeName, size) : undefined;
+    let objHash: Hasher | undefined;
+    let oid: Uint8Array | undefined;
     // a commit, tree or tag sent whole is kept while it inflates, for `onContent`
     const content =
       onContent && typeName && typeName !== "blob"
@@ -577,8 +577,10 @@ async function parseWith(
     const whole = size <= WHOLE_INFLATE_MAX ? (content ?? scratch.take(size)) : undefined;
     if (whole && r.inflateWholeInChunk(whole)) {
       got = size;
-      objHash?.update(whole);
+      // the whole object at hand: its id in one call
+      if (header) oid = format.hashObject(header, whole);
     } else {
+      if (header) objHash = format.createHasher().update(header);
       const inflater = pool.acquire();
       try {
         await r.inflate(inflater, (out) => {
@@ -602,8 +604,8 @@ async function parseWith(
     if (got !== size)
       throw new PackError(`entry at ${offset} inflates to ${got} bytes, header says ${size}`);
     t.crc[i] = r.crcValue();
-    if (objHash) {
-      t.oid.set(objHash.digest(), i * raw);
+    if (header) {
+      t.oid.set(oid ?? (objHash as Hasher).digest(), i * raw);
       t.type[i] = kind;
       if (content && onContent && typeName) {
         onContent(t.idOf(i), typeName as ObjectTypeString, content);
@@ -1052,7 +1054,7 @@ function writeIdxFrom(
   }
   out.set(packChecksum.subarray(0, raw), p);
   p += raw;
-  out.set(t.format.createHasher().update(out.subarray(0, p)).digest(), p);
+  out.set(t.format.createUnsafeHasher().update(out.subarray(0, p)).digest(), p);
   return out;
 }
 
@@ -1272,8 +1274,8 @@ async function* completedPack(
   done: (trailer: Uint8Array) => void,
   format: ObjectFormat,
 ): AsyncGenerator<Uint8Array> {
-  const h = format.createHasher();
-  const original = format.createHasher();
+  const h = format.createUnsafeHasher();
+  const original = format.createUnsafeHasher();
   const head = new Uint8Array(12);
   let o = 0;
   for await (const c of files.read(tmpPack, { start: 0, length: 12 })) {

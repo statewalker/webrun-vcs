@@ -40,7 +40,7 @@
  */
 
 import { objectIdToBytes } from "@statewalker/vcs-core";
-import { bytesToHex, createSha1 } from "@statewalker/vcs-utils";
+import { bytesToHex, createSha1Unsafe } from "@statewalker/vcs-utils";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
 import type { IndexExtension } from "./index-format.js";
 import type { StagingEntry } from "./types.js";
@@ -84,7 +84,7 @@ export function assertWritableIndexExtensions(extensions: readonly IndexExtensio
  * stage, mode, object id and intent-to-add flag, in order.
  */
 export function indexEntriesDigest(entries: readonly StagingEntry[]): string {
-  const hasher = createSha1();
+  const hasher = createSha1Unsafe();
   for (const e of entries) {
     hasher.update(
       encodeGitPath(`${e.path}\0${e.stage} ${e.mode} ${e.objectId} ${e.intentToAdd ? 1 : 0}\n`),
