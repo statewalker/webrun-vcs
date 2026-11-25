@@ -120,16 +120,22 @@ export class LfsEndpointCommand extends GitCommand<LfsEndpointResult> {
     this.checkCallable();
     this.setCallable(false);
     const lfs = await LfsConfig.load(this._workingCopy);
-    const remote = this.remote ?? (this.operation === "upload" ? lfs.pushRemote() : lfs.remote());
+    const choice =
+      this.remote !== undefined
+        ? { name: this.remote, fromLfsconfig: false }
+        : lfs.remoteChoice(this.operation);
+    const remote = choice.name;
     const endpoint = await lfs.endpoint(this.operation, remote);
+    if (choice.fromLfsconfig) endpoint.fromLfsconfig = true;
     let origins = this.credentialOrigins;
     if (origins.length === 0 && (this.credentials || this.headers)) {
-      const own = endpoint.fromLfsconfig
-        ? await (await LfsConfig.load(this._workingCopy, { withoutLfsconfig: true })).endpoint(
-            this.operation,
-            remote,
-          )
-        : endpoint;
+      // the user's own endpoint: `.lfsconfig` left out entirely, its remote choice too (it may
+      // name a URL as the default remote, or turn `git://` into `http://`)
+      const mine = await LfsConfig.load(this._workingCopy, { withoutLfsconfig: true });
+      const own = await mine.endpoint(
+        this.operation,
+        this.remote ?? mine.remoteChoice(this.operation).name,
+      );
       const origin = own.url ? strictUrlOrigin(own.url) : undefined;
       origins = origin !== undefined ? [origin] : [];
     }

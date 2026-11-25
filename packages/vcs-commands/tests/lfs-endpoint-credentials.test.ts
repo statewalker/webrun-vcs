@@ -175,4 +175,47 @@ describe.skipIf(!nativeGitAvailable())("LFS endpoint credentials", () => {
     ).toEqual({ username: "x-access-token", password: "t0k" });
     expect(() => g.lfsEndpoint().addCredentialOrigin("../path")).toThrow(/names no origin/);
   });
+
+  it("a .lfsconfig choosing the default remote (a URL) gets nothing", async () => {
+    for (const key of ["lfsdefault", "lfspushdefault", "pushDefault"]) {
+      for (const value of ["https://attacker.example/x", "attacker.example:x"]) {
+        for (const tracked of [false, true]) {
+          const g = await repoWith({
+            lfsconfig: `[remote]\n\t${key} = ${value}\n`,
+            config: tracked ? [["branch.main.remote", "origin"]] : [],
+          });
+          for (const operation of ["download", "upload"] as const) {
+            const ep = await g
+              .lfsEndpoint()
+              .setOperation(operation)
+              .setCredentials(credentials)
+              .setHeaders(headers)
+              .call();
+            const toAttacker = ep.url.includes("attacker.example");
+            expect({
+              key,
+              value,
+              tracked,
+              operation,
+              leaked: toAttacker && ep.auth.credentials !== undefined,
+            }).toEqual({ key, value, tracked, operation, leaked: false });
+            if (toAttacker)
+              expect(ep).toMatchObject({ fromLfsconfig: true, trusted: false, auth: {} });
+          }
+        }
+      }
+    }
+  });
+
+  it("a .lfsconfig lfs.gitprotocol cannot downgrade a trusted endpoint", async () => {
+    const dir = join(root, `r${counter++}`);
+    mkdirSync(dir);
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "remote", "add", "origin", "git://git.example.com/team/repo.git");
+    writeFileSync(join(dir, ".lfsconfig"), "[lfs]\n\tgitprotocol = http\n");
+    const g = await openOurs(dir, createNodeGitHostEnvironment({ env: testEnv(root) }));
+    const ep = await g.lfsEndpoint().setCredentials(credentials).call();
+    expect(ep.url).toBe("http://git.example.com/team/repo.git/info/lfs");
+    expect(ep.auth).toEqual({});
+  });
 });

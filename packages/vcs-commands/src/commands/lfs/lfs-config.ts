@@ -73,7 +73,10 @@ export interface LfsEndpoint {
   ssh?: LfsSshMetadata;
   /** The setting that gave it; absent when nothing did */
   source?: LfsEndpointSource;
-  /** The setting's value came from `.lfsconfig` (repository content), not the git configuration */
+  /**
+   * The setting's value came from `.lfsconfig` (repository content), not the git
+   * configuration; {@link LfsEndpointCommand} also sets it when `.lfsconfig` chose the remote
+   */
   fromLfsconfig: boolean;
 }
 
@@ -376,14 +379,7 @@ export class LfsConfig {
    * `remote.lfsdefault`, else the only remote, else `origin`.
    */
   remote(): string {
-    if (this.currentBranch !== undefined) {
-      const tracked = this.get(`branch.${this.currentBranch}.remote`);
-      if (tracked !== undefined) return tracked;
-    }
-    const lfsDefault = this.get("remote.lfsdefault");
-    if (lfsDefault !== undefined) return lfsDefault;
-    if (this.remotes.length === 1) return this.remotes[0] as string;
-    return "origin";
+    return this.remoteChoice("download").name;
   }
 
   /**
@@ -391,13 +387,37 @@ export class LfsConfig {
    * `remote.pushDefault`, else {@link remote}.
    */
   pushRemote(): string {
+    return this.remoteChoice("upload").name;
+  }
+
+  /**
+   * {@link remote} (download) or {@link pushRemote} (upload), and whether `.lfsconfig` chose
+   * it: git-lfs takes `remote.lfsdefault`, `remote.lfspushdefault` and `remote.pushDefault`
+   * from `.lfsconfig` (and a remote with a URL-like name is read as that URL), so a remote it
+   * picks is repository content too.
+   */
+  remoteChoice(operation: LfsEndpointOperation): { name: string; fromLfsconfig: boolean } {
+    const pick = (key: string) => {
+      const e = this.entry(key);
+      return e ? { name: e.value, fromLfsconfig: e.lfsconfig } : undefined;
+    };
+    const branch = (name: string) =>
+      this.currentBranch !== undefined ? pick(`branch.${this.currentBranch}.${name}`) : undefined;
+    const download = () =>
+      branch("remote") ??
+      pick("remote.lfsdefault") ??
+      (this.remotes.length === 1
+        ? {
+            name: this.remotes[0] as string,
+            fromLfsconfig: !this.gitRemotes.includes(this.remotes[0] as string),
+          }
+        : { name: "origin", fromLfsconfig: false });
+    if (operation === "download") return download();
     return (
-      (this.currentBranch !== undefined
-        ? this.get(`branch.${this.currentBranch}.pushRemote`)
-        : undefined) ??
-      this.get("remote.lfspushdefault") ??
-      this.get("remote.pushDefault") ??
-      this.remote()
+      branch("pushremote") ??
+      pick("remote.lfspushdefault") ??
+      pick("remote.pushdefault") ??
+      download()
     );
   }
 
