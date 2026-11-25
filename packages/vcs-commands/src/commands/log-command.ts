@@ -2599,7 +2599,10 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     const shownIds = new Set<ObjectId>();
     const unwalkedShown = new Set<ObjectId>();
     let entries: LogOutputEntry[];
-    if (this.reflogWalkNames !== undefined) {
+    if (this.noWalkCommits !== undefined) {
+      entries = await this.noWalkEntries(this.noWalkCommits);
+      for (const e of entries) shownIds.add(e.id);
+    } else if (this.reflogWalkNames !== undefined) {
       entries = await this.reflogEntries(this.reflogWalkNames);
       for (const e of entries) shownIds.add(e.id);
     } else if (topo) {
@@ -2878,6 +2881,36 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
    * (`--since`/`--until` against the entry's date, path limiting against the commit's parents,
    * get_commit_action), then skipped and counted.
    */
+  /**
+   * Show these commits as they are, nothing walked (`git diff-tree <commit>`, `--stdin`'s
+   * lines): each with its own parents, or the ones given (a `--stdin` line's grafts)
+   *
+   * @internal
+   */
+  setNoWalk(commits: readonly { id: ObjectId; parents?: readonly ObjectId[] }[]): this {
+    this.checkCallable();
+    this.noWalkCommits = commits;
+    return this;
+  }
+
+  private noWalkCommits?: readonly { id: ObjectId; parents?: readonly ObjectId[] }[];
+
+  /** {@link setNoWalk}'s commits as the output shows them */
+  private async noWalkEntries(
+    commits: readonly { id: ObjectId; parents?: readonly ObjectId[] }[],
+  ): Promise<LogOutputEntry[]> {
+    this.checkCallable();
+    this.setCallable(false);
+    readDiffSubmoduleConfig(this.workingCopy);
+    const out: LogOutputEntry[] = [];
+    for (const { id, parents } of commits) {
+      const commit = await this.walkCommits.load(id);
+      if (!commit) throw new GitApiError(`fatal: bad object ${id}`);
+      out.push({ id, commit, parents: parents ? [...parents] : [...commit.parents] });
+    }
+    return out;
+  }
+
   private async reflogEntries(names: readonly string[], claim = true): Promise<LogOutputEntry[]> {
     if (claim) {
       this.checkCallable();
@@ -3009,6 +3042,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
         .setNewTree(newTree)
         // log's diffcore_rotate starts at the first path after a missing one
         .setRotateStrict(false)
+        .setTreeWalk(this.treeWalk)
         .shareReadsOf(this);
       if (this.colorSettings) diff.setColorSettings(this.colorSettings);
       diff.setOptions({
@@ -3248,6 +3282,20 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     return true;
   }
 
+  /**
+   * How the commits' trees are compared (`DiffCommand.setTreeWalk`): `git diff-tree` without
+   * `-r` lists the top tree's differing entries
+   *
+   * @internal
+   */
+  setTreeWalk(walk: "recursive" | "flat" | "show-trees"): this {
+    this.checkCallable();
+    this.treeWalk = walk;
+    return this;
+  }
+
+  private treeWalk: "recursive" | "flat" | "show-trees" = "recursive";
+
   /** Options of the diffs {@link callBytes} prints (context, algorithm, `--stat` widths...) */
   setDiffOptions(options: DiffTextOptions): this {
     this.checkCallable();
@@ -3413,6 +3461,37 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
   }
 
   /**
+   * The combined raw output's ids (`diff_aligned_abbrev`): full under `rawFullIds` without
+   * `--abbrev`, else each abbreviated uniquely
+   */
+  private async combinedRawAbbreviator(
+    raw: boolean,
+    paths: string[],
+    result: Map<string, { mode: number; id: ObjectId }>,
+    parents: Map<string, { mode: number; id: ObjectId }>[],
+  ): Promise<(id: ObjectId | undefined) => string> {
+    const nullId = this.objectFormat.nullId;
+    const o = this.diffOptions;
+    if (!raw || (o.rawFullIds && o.abbrev === undefined)) return (id) => id ?? nullId;
+    const ids = new Set<string>([nullId]);
+    for (const path of paths) {
+      const r = result.get(path);
+      if (r) ids.add(r.id);
+      for (const m of parents) {
+        const side = m.get(path);
+        if (side) ids.add(side.id);
+      }
+    }
+    const min =
+      o.abbrev === undefined ? undefined : Math.min(40, Math.max(4, Math.trunc(o.abbrev)));
+    const lengths = await this.idAbbreviator().lengths(ids, min);
+    return (id) => {
+      const full = id ?? nullId;
+      return full.slice(0, lengths.get(full) ?? min ?? 7);
+    };
+  }
+
+  /**
    * combine-diff.c's diff_tree_combined for a merge: the paths that differ from every
    * parent (within the pathspec), each as a combined diff of the trees.
    */
@@ -3420,7 +3499,7 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
     entry: LogOutputEntry,
     options: {
       dense: boolean;
-      names?: "name-only" | "name-status";
+      names?: "name-only" | "name-status" | "raw";
       patch: boolean;
       follow?: string;
       parentPaths?: string[];
@@ -3480,16 +3559,36 @@ export class LogCommand extends GitCommand<AsyncIterable<LogResult>> {
       parseGitBool(RemoteConfigStore.from(this._workingCopy).value("core.quotePath")) ?? true;
     const names = new ByteSink();
     if (options.names) {
+      // show_raw_diff: `-z` ends each field with a NUL, its paths unquoted
+      const z = this.diffOptions.nullTerminated === true;
+      const inter = z ? "\0" : "\t";
+      const term = z ? "\0" : "\n";
+      const rawId = await this.combinedRawAbbreviator(
+        options.names === "raw",
+        paths,
+        result,
+        parents,
+      );
+      const mode6 = (mode: number | undefined) => (mode ?? 0).toString(8).padStart(6, "0");
       for (const path of paths) {
-        if (options.names === "name-status") {
+        if (options.names === "raw") {
+          const r = result.get(path);
+          const sides = parents.map((m, k) => sideOf(m, k, path));
+          names.text(":".repeat(parents.length));
+          for (const side of sides) names.text(`${mode6(side?.mode)} `);
+          names.text(mode6(r?.mode));
+          for (const side of sides) names.text(` ${rawId(side?.id)}`);
+          names.text(` ${rawId(r?.id)} `);
+        }
+        if (options.names === "name-status" || options.names === "raw") {
           const r = result.get(path);
           parents.forEach((m, k) => {
             const found = options.parentStatus?.[k];
             names.text(found ?? (!sideOf(m, k, path) ? "A" : !r ? "D" : "M"));
           });
-          names.text("\t");
+          names.text(inter);
         }
-        names.text(`${quotePath(path, quote)}\n`);
+        names.text(`${z ? path : quotePath(path, quote)}${term}`);
       }
     }
     if (paths.length === 0 || !options.patch) {

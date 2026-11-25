@@ -38,6 +38,10 @@ import {
   DeleteTagCommand,
   DescribeCommand,
   DiffCommand,
+  DiffFilesCommand,
+  DiffIndexCommand,
+  DiffPairsCommand,
+  DiffTreeCommand,
   EditBranchDescriptionCommand,
   FetchCommand,
   FetchMultipleCommand,
@@ -1275,6 +1279,61 @@ export class Git implements Disposable {
   }
 
   // ============ Diff Operations ============
+
+  /**
+   * Create a DiffTreeCommand (`git diff-tree`): two trees compared, or a commit against its
+   * parents, in the raw format unless another is asked for.
+   *
+   * @example
+   * ```typescript
+   * await git.diffTree().addArgument("HEAD").setRecursive(true).callText();
+   * ```
+   */
+  diffTree(): DiffTreeCommand {
+    this.checkClosed();
+    return new DiffTreeCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a DiffIndexCommand (`git diff-index`): a tree against the index (`--cached`) or
+   * the worktree.
+   *
+   * @example
+   * ```typescript
+   * await git.diffIndex().setTree("HEAD").setCached(true).callText();
+   * ```
+   */
+  diffIndex(): DiffIndexCommand {
+    this.checkClosed();
+    return new DiffIndexCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a DiffFilesCommand (`git diff-files`): the index against the worktree, by stat.
+   *
+   * @example
+   * ```typescript
+   * await git.diffFiles().setFormats(["name-status"]).callText();
+   * ```
+   */
+  diffFiles(): DiffFilesCommand {
+    this.checkClosed();
+    return new DiffFilesCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a DiffPairsCommand (`git diff-pairs -z`): the pairs of a NUL-terminated raw diff
+   * shown in any format (a patch by default).
+   *
+   * @example
+   * ```typescript
+   * await git.diffPairs().setNullTerminated(true).setInput(rawZ).callText();
+   * ```
+   */
+  diffPairs(): DiffPairsCommand {
+    this.checkClosed();
+    return new DiffPairsCommand(this._workingCopy);
+  }
 
   /**
    * Create a DiffCommand for comparing trees/commits.
