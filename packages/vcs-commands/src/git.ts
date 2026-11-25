@@ -97,6 +97,7 @@ import {
   RemoteUpdateCommand,
   RenameBranchCommand,
   RepackCommand,
+  RerereCommand,
   ResetCommand,
   RestoreCommand,
   RevertCommand,
@@ -1194,6 +1195,20 @@ export class Git implements Disposable {
   checkAttr(): CheckAttrCommand {
     this.checkClosed();
     return new CheckAttrCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a RerereCommand (`git rerere`): record conflicts and replay recorded resolutions
+   * (`rr-cache/`, `MERGE_RR`), or `clear`, `forget <pathspec>`, `status`, `remaining`, `diff`, `gc`.
+   *
+   * @example
+   * ```typescript
+   * await git.rerere().setSubcommand("status").call(); // stdout "f\n"
+   * ```
+   */
+  rerere(): RerereCommand {
+    this.checkClosed();
+    return new RerereCommand(this._workingCopy);
   }
 
   /**

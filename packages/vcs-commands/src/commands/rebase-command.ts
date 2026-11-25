@@ -327,6 +327,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   private ignoreDate = false;
   /** `--signoff` (kept in `rebase-merge/signoff`) */
   private signoff = false;
+  /** `--[no-]rerere-autoupdate` (undefined: `rerere.autoUpdate`) */
+  private rerereAutoUpdate?: boolean;
+  /** What rerere printed on stderr during this run */
+  private readonly rerereLines: string[] = [];
   /** `--force-rebase` (REBASE_FORCE) */
   private forceRebase = false;
   /** `-S[<keyid>]` / `--no-gpg-sign` (undefined: `commit.gpgSign`; kept in `gpg_sign_opt`) */
@@ -749,6 +753,17 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   }
 
   /**
+   * `--rerere-autoupdate` (true) / `--no-rerere-autoupdate` (false): whether resolutions
+   * rerere replays at a stopped pick are staged (default `rerere.autoUpdate`); kept in
+   * `rebase-merge/allow_rerere_autoupdate` for `--continue`.
+   */
+  setRerereAutoUpdate(value: boolean): this {
+    this.checkCallable();
+    this.rerereAutoUpdate = value;
+    return this;
+  }
+
+  /**
    * `-S` (true) / `--no-gpg-sign` (false): whether to sign the commits the rebase makes;
    * undefined (the default) leaves it to `commit.gpgSign`. Kept in
    * `rebase-merge/gpg_sign_opt` for `--continue`. Every commit the rebase writes is signed
@@ -935,7 +950,10 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     await this.readCurrentIndex();
     const worktree = this.worktreeAccess;
     const run = () => this.run(worktree);
-    return worktree?.batch ? worktree.batch(run) : run();
+    const result = await (worktree?.batch ? worktree.batch(run) : run());
+    return this.rerereLines.length > 0
+      ? { ...result, rerereOutput: [...this.rerereLines] }
+      : result;
   }
 
   private async run(worktree: Worktree | undefined): Promise<RebaseResult> {
@@ -977,6 +995,24 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       default:
         return this.begin(state, worktree);
     }
+  }
+
+  /**
+   * The sequencer's `repo_rerere(r, opts->allow_rerere_auto)` at a stopped pick or merge:
+   * `rebase-merge/allow_rerere_autoupdate` (`--[no-]rerere-autoupdate`), else
+   * `rerere.autoUpdate`. Returns rerere's lines (kept for the result's `rerereOutput` too).
+   */
+  private async pickRerere(state: OperationState): Promise<string[]> {
+    const saved = (await state.read(`${DIR}/allow_rerere_autoupdate`))?.trim();
+    const autoUpdate =
+      saved === "--rerere-autoupdate"
+        ? true
+        : saved === "--no-rerere-autoupdate"
+          ? false
+          : undefined;
+    const lines = await this.rerere(autoUpdate === undefined ? {} : { autoUpdate });
+    this.rerereLines.push(...lines);
+    return lines;
   }
 
   private context(worktree: Worktree | undefined) {
@@ -1503,6 +1539,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     this.runSign = { key: sign };
     if (sign !== undefined) await state.write(`${DIR}/gpg_sign_opt`, `-S${sign}\n`);
     if (this.signoff) await state.write(`${DIR}/signoff`, "--signoff\n");
+    if (this.rerereAutoUpdate !== undefined) {
+      await state.write(
+        `${DIR}/allow_rerere_autoupdate`,
+        `--${this.rerereAutoUpdate ? "" : "no-"}rerere-autoupdate\n`,
+      );
+    }
     if (emptyMode === "drop") await state.write(`${DIR}/drop_redundant_commits`, "");
     if (emptyMode === "keep") await state.write(`${DIR}/keep_redundant_commits`, "");
     if (this.committerDateIsAuthorDate) await state.write(`${DIR}/cdate_is_adate`, "");
@@ -2138,7 +2180,12 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
           !merge.external || (this.compatibility ?? this.hooks.compatibility) === "2.43"
             ? `${merged}\n`
             : merged,
-        lines: [`error: could not apply ${short}... ${subject}`, ...this.mergeConflictAdvice()],
+        lines: [
+          `error: could not apply ${short}... ${subject}`,
+          ...this.mergeConflictAdvice(),
+          // do_pick_commit's repo_rerere, after the advice
+          ...(await this.pickRerere(state)),
+        ],
       };
     }
     await state.write("MERGE_MSG", pickedMessage);
@@ -2812,11 +2859,16 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
         await state.write(`${DIR}/patch`, "");
       }
       const short = item.id ? await this.abbreviateObjectId(item.id) : "";
+      // do_merge's repo_rerere, before the stop is reported
+      const rerere = await this.pickRerere(state);
       return {
         status: RebaseStatus.STOPPED,
         ...(item.id ? { currentCommit: item.id } : {}),
         conflicts: [...new Set(merge.conflicts.keys())].sort(),
-        message: item.id ? `Could not apply ${short}... ${arg}` : `Could not merge ${arg}`,
+        message: [
+          ...rerere,
+          item.id ? `Could not apply ${short}... ${arg}` : `Could not merge ${arg}`,
+        ].join("\n"),
       };
     }
     // git commit -n -F MERGE_MSG --cleanup=verbatim (whitespace with --signoff, which the
@@ -2910,6 +2962,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
       };
     }
     output.push(...(result.output ?? []));
+    // git merge's suggest_conflicts runs rerere (no --rerere-autoupdate passed to it)
+    if (result.status === MergeStatus.CONFLICTING) this.rerereLines.push(...(await this.rerere()));
     if (result.status === MergeStatus.MERGED || result.status === MergeStatus.ALREADY_UP_TO_DATE) {
       // remove_merge_branch_state
       await state.remove("MERGE_MSG", "MERGE_HEAD", "MERGE_MODE");
@@ -3549,6 +3603,8 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     }
     // git commit's cleanup (SQUASH_MSG of a final squash too), then commit_staged_changes'
     await state.remove(`${DIR}/amend`, "MERGE_HEAD", "MERGE_MODE", "MERGE_MSG", "SQUASH_MSG");
+    // git commit's repo_rerere: the resolutions recorded
+    this.rerereLines.push(...(await this.rerere()));
     await state.removeRef("CHERRY_PICK_HEAD");
     // commit_staged_changes deletes AUTO_MERGE once git commit is done, whether it exists
     await state.deleteRef("AUTO_MERGE");
@@ -3560,6 +3616,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
   /** `git rebase --skip`: the stopped pick dropped (`reset --hard`), then as `--continue`. */
   private async skip(state: OperationState, worktree: Worktree | undefined): Promise<RebaseResult> {
     if (!(await this.inProgress(state))) throw new NoRebaseInProgressError();
+    await this.rerereClear();
     const headId = await this.resolveHead();
     const refused = await resetMerge(this.context(worktree), headId, "HEAD", { hard: true });
     if (refused) {
@@ -3637,6 +3694,7 @@ export class RebaseCommand extends GitCommand<RebaseResult> {
     worktree: Worktree | undefined,
   ): Promise<RebaseResult> {
     if (!(await this.inProgress(state))) return { status: RebaseStatus.ABORTED };
+    await this.rerereClear();
     const origHead = (await state.read(`${DIR}/orig-head`))?.trim();
     const headName = (await state.read(`${DIR}/head-name`))?.trim() ?? "detached HEAD";
     if (!origHead)
