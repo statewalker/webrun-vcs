@@ -1158,9 +1158,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       // clone.c sets TRANS_OPT_KEEP: the pack is kept whatever its size
       keepPack: true,
       // --filter (TRANS_OPT_LIST_OBJECTS_FILTER, TRANS_OPT_FROM_PROMISOR); not in a local clone
-      ...(this.filterSpec !== undefined && !isLocal
-        ? { filter: this.filterSpec, onWarning: (line: string) => messages.push(`${line}\n`) }
-        : {}),
+      ...(this.filterSpec !== undefined && !isLocal ? { filter: this.filterSpec } : {}),
+      // the transport's warnings (a filter the server ignores, the dumb walker's alternates)
+      onWarning: (line: string) => messages.push(`${line}\n`),
       ...(fsck ? { fsckObjects: fsck } : {}),
       ...(serverOptions.length > 0 ? { serverOptions } : {}),
       ...(rejectShallow ? { rejectShallow: true } : {}),
