@@ -174,6 +174,12 @@ export interface OperationOptions {
    * it writes the index, so a stack first built midway reads the index as edited so far.
    */
   index?: AttributesIndex;
+  /**
+   * Receives the warnings of every attributes file read while `fn` runs (git prints them as
+   * it reads each file: `git check-attr`); default: the filter's own `onWarning`, only the
+   * first time a file's content is parsed
+   */
+  onAttributeWarning?: (message: string) => void;
 }
 
 /** Collects an iterable of chunks into one array. */

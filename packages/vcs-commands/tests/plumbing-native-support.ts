@@ -8,7 +8,12 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { createGitFilesBackend, openGitLinkedWorktrees } from "@statewalker/vcs-store-files";
 import { decodeGitPath, encodeGitPath } from "@statewalker/vcs-utils/encoding";
+import { createNodeFilesApi } from "@statewalker/vcs-utils-node/files";
+import type { GitHostEnvironment } from "@statewalker/vcs-working-tree";
+
+import { Git } from "../src/index.js";
 
 import { nativeGitEnv } from "./native-git-http-backend.js";
 
@@ -92,4 +97,17 @@ export const asBytes = (text: string): string =>
 /** What our command gave, as an {@link Outcome}. */
 export function outcomeOf(result: { exitCode: number; stdout: string; stderr: string }): Outcome {
   return { status: result.exitCode, out: asBytes(result.stdout), err: asBytes(result.stderr) };
+}
+
+/** Our bare repository in `dir`, with a host environment. */
+export async function openBare(dir: string, environment?: GitHostEnvironment): Promise<Git> {
+  const files = createNodeFilesApi({ rootDir: dir });
+  const { history } = await createGitFilesBackend({ files, gitDir: "." });
+  const worktrees = await openGitLinkedWorktrees({
+    files,
+    gitDir: ".",
+    history,
+    ...(environment ? { environment } : {}),
+  });
+  return Git.fromWorktreeAdmin(await worktrees.openAdmin());
 }

@@ -24,6 +24,7 @@ import {
   BundleUnbundleCommand,
   BundleVerifyCommand,
   CheckMailmapCommand,
+  CheckAttrCommand,
   VarCommand,
   PatchIdCommand,
   UrlParseCommand,
@@ -972,6 +973,20 @@ export class Git implements Disposable {
   checkMailmap(): CheckMailmapCommand {
     this.checkClosed();
     return new CheckMailmapCommand(this._workingCopy);
+  }
+
+  /**
+   * Create a CheckAttrCommand (`git check-attr`): the attributes of paths, from the worktree's
+   * `.gitattributes` files, the index's (`--cached`) or a tree's (`--source`); `--all`, `--stdin`, `-z`.
+   *
+   * @example
+   * ```typescript
+   * await git.checkAttr().addAttribute("text").addPath("a.txt").call(); // stdout "a.txt: text: set\\n"
+   * ```
+   */
+  checkAttr(): CheckAttrCommand {
+    this.checkClosed();
+    return new CheckAttrCommand(this._workingCopy);
   }
 
   /**
