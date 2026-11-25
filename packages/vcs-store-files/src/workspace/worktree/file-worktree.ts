@@ -1457,6 +1457,17 @@ export class FileWorktree implements Worktree {
     return undefined;
   }
 
+  async readLocalFile(location: string): Promise<Uint8Array | undefined> {
+    const path = this.locate(location);
+    if (path === undefined) return undefined;
+    const files = this.rootFiles;
+    const kind = files.lstat
+      ? (await files.lstat(path).catch(() => undefined))?.kind
+      : (await files.stats(path).catch(() => undefined))?.kind;
+    if (kind !== "file") return undefined;
+    return readFile(files, path).catch(() => undefined);
+  }
+
   /**
    * The repository whose git directory is `gitDir` and repository directory `commonDir`
    * (the same, unless `gitDir` is a linked worktree's): its history (HEAD the git

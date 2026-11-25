@@ -46,6 +46,7 @@ import { RemoteConfigStore } from "../remote-config/index.js";
 import type { CloneResult } from "../results/clone-result.js";
 import type { FetchResult, TrackingRefUpdate } from "../results/fetch-result.js";
 import { TransportCommand } from "../transport-command.js";
+import { BundlePrerequisitesError } from "./bundle/index.js";
 import { coreBool, worktreeModeTrust } from "./core-config.js";
 import { defaultInitialBranch } from "./default-branch.js";
 import { TagOption, toTagMode, toTrackingRefUpdate } from "./fetch-command.js";
@@ -865,8 +866,20 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       ?.openRepository?.(uri, { checkOwnership: false, commandLineConfig: false })
       .then((opened) => opened !== undefined)
       .catch(() => false);
+    // get_repo_path: then a regular file, `<path>.bundle` first (a bundle: the transport reads
+    // it there, remote.<name>.url keeps the path as given)
+    let bundleFile: string | undefined;
+    if (!isRepositoryPath) {
+      for (const suffix of [".bundle", ""]) {
+        const bytes = await worktree?.readLocalFile?.(`${uri}${suffix}`).catch(() => undefined);
+        if (bytes) {
+          bundleFile = absolutePathOf(worktree, `${uri}${suffix}`);
+          break;
+        }
+      }
+    }
     let repo: string;
-    if (isRepositoryPath) repo = absolutePathOf(worktree, uri);
+    if (isRepositoryPath || bundleFile !== undefined) repo = absolutePathOf(worktree, uri);
     else if (uri.includes(":")) repo = uri;
     else throw new TransportError(`fatal: repository '${uri}' does not exist`);
     // clone.c: a destination that exists and is not empty is refused before anything is
@@ -913,7 +926,10 @@ export class CloneCommand extends TransportCommand<CloneResult> {
 
     this.repoUrl = repo;
     const sourceUrl = store.aliasUrl(repo) ?? repo;
-    const remote = await this.prepareRemote(sourceUrl);
+    const remote = await this.prepareRemote(bundleFile ?? sourceUrl);
+    if (remote.kind === "bundle" && remote.remote.bundle.header.filter !== undefined) {
+      throw new TransportError("fatal: cannot clone from filtered bundle");
+    }
     const localRemote: OpenedRepository | undefined =
       remote.kind === "local" ? remote.repository : undefined;
     if (localRemote) await this.refuseSourceAsDestination(localRemote);
@@ -1183,6 +1199,9 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       if (error instanceof ShallowRemoteRejectedError) {
         throw new TransportError(`fatal: ${error.message}`);
       }
+      if (error instanceof BundlePrerequisitesError) {
+        throw new TransportError(`${error.lines}fatal: remote transport reported error`);
+      }
       if (!(error instanceof FetchCheckError)) throw error;
       // what was received is refused before any ref is written: index-pack died, or
       // update_remote_refs' check of the refs found history missing (git then removes the
@@ -1206,7 +1225,24 @@ export class CloneCommand extends TransportCommand<CloneResult> {
     // Two forms, deliberately kept apart: the advertised form goes out on
     // FetchResult unchanged (it is what the remote said), while the ref work
     // below and CloneResult use the bare branch name.
-    const advertisedDefaultBranch = result.defaultBranch;
+    // guess_remote_head: without HEAD's symref (a bundle, a dumb server), the branch at HEAD's
+    // commit among the refs cloned: init.defaultBranch's (else master), then master, then the
+    // first in the remote's order
+    let advertisedDefaultBranch = result.defaultBranch;
+    const remoteHeadRef = result.remoteRefs.find((r) => r.name === "HEAD");
+    if (advertisedDefaultBranch === undefined && remoteHeadRef?.oid !== undefined) {
+      const cloned = new Set(result.fetched.map((f) => f.remoteRef));
+      const branches = result.remoteRefs.filter(
+        (r) =>
+          r.name.startsWith("refs/heads/") && cloned.has(r.name) && r.oid === remoteHeadRef.oid,
+      );
+      const preferred = (await defaultInitialBranch(hostEnvironmentOf(this._workingCopy))).name;
+      advertisedDefaultBranch = (
+        branches.find((r) => r.name === `refs/heads/${preferred}`) ??
+        branches.find((r) => r.name === "refs/heads/master") ??
+        branches[0]
+      )?.name;
+    }
     let defaultBranch = branchToClone ?? toBranchName(advertisedDefaultBranch);
     let headCommit: ObjectId | undefined;
     let checkedOutBranch: string | undefined;
@@ -1325,6 +1361,19 @@ export class CloneCommand extends TransportCommand<CloneResult> {
       headCommit,
       ...(messages.length > 0 ? { messages } : {}),
     };
+
+    // clone.c's checkout(): a HEAD that names no commit (a remote without HEAD, a bundle
+    // whose HEAD no branch matches) leaves nothing to check out
+    if (
+      checkoutId === undefined &&
+      !this.bare &&
+      !this.noCheckout &&
+      !result.isEmpty &&
+      headCommit === undefined
+    ) {
+      messages.push("warning: remote HEAD refers to nonexistent ref, unable to checkout\n");
+      if (cloneResult.messages === undefined) cloneResult.messages = messages;
+    }
 
     // dissociate_from_references: before the checkout, the borrowed objects copied in
     // (a store without alternates has nothing to dissociate from)

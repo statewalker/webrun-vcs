@@ -30,14 +30,18 @@ import type {
 } from "@statewalker/vcs-working-tree";
 import { InvalidConfigError, TransportError } from "../errors/index.js";
 import { RemoteConfigStore } from "../remote-config/index.js";
+import { type BundleRemote, withBundleUploadPack } from "./bundle/bundle-transport.js";
+import { openBundle, verifyBundleIn } from "./bundle/bundle-verify.js";
 import type { HookSession } from "./git-hooks.js";
 import { hostEnvironmentOf } from "./git-ident.js";
 import {
+  createDuplexPair,
   openLocalRemote,
   type ReceivePackHost,
   withLocalReceivePack,
   withLocalUploadPack,
 } from "./local-transport.js";
+import { repositoryPlaceOf } from "./worktree-support.js";
 
 /** A remote URL resolved to the transport that reaches it. */
 export type ResolvedRemote =
@@ -55,9 +59,20 @@ export type ResolvedRemote =
       connector: GitTransportConnector;
     };
 
-/** A resolved remote, its local repository opened. */
+/**
+ * A resolved remote, its local repository opened; a local path naming a bundle file is a
+ * bundle remote (transport.c's `bundle_vtable`, see `bundle-transport.ts`).
+ */
 export type PreparedRemote =
   | (Extract<ResolvedRemote, { kind: "local" }> & { repository: OpenedRepository })
+  | {
+      kind: "bundle";
+      /** The URL as given (rewritten) */
+      url: string;
+      /** The bundle file's path, as given */
+      path: string;
+      remote: BundleRemote;
+    }
   | Extract<ResolvedRemote, { kind: "connector" }>;
 
 /** What {@link resolveRemote} reads: the configuration, the environment and the registry. */
@@ -235,7 +250,56 @@ export async function openResolvedRemote(
   resolved: ResolvedRemote,
 ): Promise<PreparedRemote> {
   if (resolved.kind !== "local") return resolved;
+  const bundle = await openBundleRemote(workingCopy, resolved.url, resolved.path);
+  if (bundle) return { kind: "bundle", url: resolved.url, path: resolved.path, remote: bundle };
   return { ...resolved, repository: await openLocalRemote(workingCopy, resolved.path) };
+}
+
+/**
+ * transport_get's `url_is_local_not_ssh(url) && is_file(url) && is_bundle(url, 1)`: a path
+ * (not a `file://` URL) to a regular file whose header reads as a bundle's, with what checks
+ * it against `workingCopy` (the repository fetching); undefined for anything else.
+ */
+export async function openBundleRemote(
+  workingCopy: WorkingCopy,
+  url: string,
+  path: string,
+): Promise<BundleRemote | undefined> {
+  if (/^file:/i.test(url)) return undefined;
+  const bytes = await repositoryPlaceOf(workingCopy)
+    ?.readLocalFile?.(path)
+    .catch(() => undefined);
+  if (!bytes) return undefined;
+  const opened = openBundle(bytes, path);
+  if (!opened.ok) return undefined;
+  const history = workingCopy.history;
+  return {
+    bundle: opened.bundle,
+    verify: () =>
+      verifyBundleIn(
+        {
+          history,
+          refValues: () => refValuesOf(history.refs),
+          shallow: async () => (await history.refs.getShallow?.().catch(() => undefined)) ?? [],
+        },
+        opened.bundle.header,
+      ),
+  };
+}
+
+/** Every ref's value and HEAD's (what `rev-list --all` starts from). */
+async function refValuesOf(refs: WorkingCopy["history"]["refs"]): Promise<string[]> {
+  const out = new Set<string>();
+  for await (const ref of refs.list()) {
+    const id =
+      "objectId" in ref && ref.objectId
+        ? ref.objectId
+        : (await refs.resolve(ref.name).catch(() => undefined))?.objectId;
+    if (id) out.add(id);
+  }
+  const head = (await refs.resolve("HEAD").catch(() => undefined))?.objectId;
+  if (head) out.add(head);
+  return [...out];
 }
 
 /** The resolution context of a working copy: its configuration and host environment. */
@@ -344,6 +408,7 @@ export async function withRemoteUploadPack<T>(
       protocolVersion: options.protocolVersion,
     });
   }
+  if (remote.kind === "bundle") return withBundleUploadPack(remote.remote, createDuplexPair, run);
   return withRemoteSession(remote, "git-upload-pack", options, async (session, request) => {
     const connection = await openUploadPack(session, request, {
       ...(options.gzipRequests !== undefined ? { gzipRequests: options.gzipRequests } : {}),
@@ -370,6 +435,12 @@ export async function withRemoteReceivePack<T>(
   /** A local receive-pack's host and its config warnings (see `withLocalReceivePack`) */
   local: { host?: ReceivePackHost; onWarning?: (line: string) => void } = {},
 ): Promise<T> {
+  if (remote.kind === "bundle") {
+    // the bundle transport has no push_refs: transport_push reports the failure
+    throw new TransportError(`error: failed to push some refs to '${remote.url}'`, undefined, {
+      exitCode: 1,
+    });
+  }
   if (remote.kind === "local") {
     return withLocalReceivePack(remote.repository, run, hooks, transactionHooks, {
       protocolVersion: options.protocolVersion,

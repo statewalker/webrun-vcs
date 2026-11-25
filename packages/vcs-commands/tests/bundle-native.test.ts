@@ -7,7 +7,16 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -140,11 +149,19 @@ async function ourCreate(args: string[], version?: number, stdin?: string) {
     return { status: result.exitCode, stderr: result.stderr, bytes: result.bundle, file };
   } catch (error) {
     if (!(error instanceof GitApiError)) throw error;
-    return { status: error.exitCode, stderr: `${error.message}\n`, bytes: undefined, file: undefined };
+    return {
+      status: error.exitCode,
+      stderr: `${error.message}\n`,
+      bytes: undefined,
+      file: undefined,
+    };
   }
 }
 
-async function expectSameCreate(args: string[], options: { version?: number; stdin?: string } = {}) {
+async function expectSameCreate(
+  args: string[],
+  options: { version?: number; stdin?: string } = {},
+) {
   const native = nativeCreate(
     args,
     options.version !== undefined ? [`--version=${options.version}`] : [],
@@ -298,7 +315,13 @@ describeGit("git bundle (t6020-bundle-misc, t5607-clone-bundle)", () => {
   }
 
   it('t6020-bundle-misc.sh: "fail to verify bundle without prerequisites"', async () => {
-    const native = nativeCreate(["--ignore-missing", "^topic/deleted", "^topic/1", "^topic/2", "release"]);
+    const native = nativeCreate([
+      "--ignore-missing",
+      "^topic/deleted",
+      "^topic/1",
+      "^topic/2",
+      "release",
+    ]);
     const empty = join(root, "test1.git");
     gitOk(root, ["init", "-q", "--bare", empty]);
     const expected = run(empty, ["bundle", "verify", native.file]);
@@ -319,11 +342,21 @@ describeGit("git bundle (t6020-bundle-misc, t5607-clone-bundle)", () => {
       .setBundle(bundle, native.file)
       .call();
     const nativeUnbundle = run(empty, ["bundle", "unbundle", native.file]);
-    expect({ status: unbundled.exitCode, stdout: unbundled.stdout, stderr: unbundled.stderr }).toEqual(
-      { status: nativeUnbundle.status, stdout: nativeUnbundle.stdout, stderr: nativeUnbundle.stderr },
-    );
+    expect({
+      status: unbundled.exitCode,
+      stdout: unbundled.stdout,
+      stderr: unbundled.stderr,
+    }).toEqual({
+      status: nativeUnbundle.status,
+      stdout: nativeUnbundle.stdout,
+      stderr: nativeUnbundle.stderr,
+    });
     // -q: no line per prerequisite
-    const quiet = await (await openOurs(empty, true)).bundleVerify().setBundle(bundle).setQuiet(true).call();
+    const quiet = await (await openOurs(empty, true))
+      .bundleVerify()
+      .setBundle(bundle)
+      .setQuiet(true)
+      .call();
     const nativeQuiet = run(empty, ["bundle", "verify", "-q", native.file]);
     expect({ status: quiet.exitCode, stdout: quiet.stdout, stderr: quiet.stderr }).toEqual({
       status: nativeQuiet.status,
@@ -419,7 +452,11 @@ describeGit("git bundle (t6020-bundle-misc, t5607-clone-bundle)", () => {
         stderr: expected.stderr,
       });
       const objects = (dir: string) =>
-        gitOk(dir, ["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"]);
+        gitOk(dir, [
+          "cat-file",
+          "--batch-all-objects",
+          "--batch-check=%(objectname) %(objecttype)",
+        ]);
       expect(objects(b)).toBe(objects(a));
       const promisors = (dir: string) =>
         readdirSync(join(dir, ".git/objects/pack"))
@@ -502,7 +539,10 @@ describeGit("git bundle (t6020-bundle-misc, t5607-clone-bundle)", () => {
       }
       gitOk(dir, ["fetch", "-q", mine.file as string, "refs/heads/*:refs/heads/*"]);
       expect(gitOk(dir, ["for-each-ref", "refs/heads"])).toBe(
-        gitOk(repo, ["for-each-ref", ...args.filter((a) => !a.startsWith("^")).map((a) => `refs/heads/${a}`)]),
+        gitOk(repo, [
+          "for-each-ref",
+          ...args.filter((a) => !a.startsWith("^")).map((a) => `refs/heads/${a}`),
+        ]),
       );
       expect(run(dir, ["fsck", "--strict", "--no-dangling"]).status).toBe(0);
     }
@@ -520,9 +560,15 @@ describeGit("git bundle (t6020-bundle-misc, t5607-clone-bundle)", () => {
       await expectSameCreate(["main"], { version: 2 });
       const native = nativeCreate(["--all"]);
       const bytes = new Uint8Array(readFileSync(native.file));
-      const heads = await (await openOurs(dir)).bundleListHeads().setBundle(bytes, native.file).call();
+      const heads = await (await openOurs(dir))
+        .bundleListHeads()
+        .setBundle(bytes, native.file)
+        .call();
       expect(heads.stdout).toBe(run(dir, ["bundle", "list-heads", native.file]).stdout);
-      const verify = await (await openOurs(dir)).bundleVerify().setBundle(bytes, native.file).call();
+      const verify = await (await openOurs(dir))
+        .bundleVerify()
+        .setBundle(bytes, native.file)
+        .call();
       expect(verify.stdout).toBe(run(dir, ["bundle", "verify", native.file]).stdout);
       const target = join(root, "sha256-target");
       cpSync(dir, target, { recursive: true });

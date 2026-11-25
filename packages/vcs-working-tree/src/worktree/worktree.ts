@@ -395,6 +395,15 @@ export interface Worktree {
   ): Promise<OpenedRepository | undefined>;
 
   /**
+   * The bytes of the regular file a local path names (a bundle given as a remote: git's
+   * `is_file` before `is_bundle`), read as {@link openRepository} finds its location: a
+   * relative one from the worktree top, an absolute one in the real directory the storage is
+   * rooted at. Undefined when nothing, or no regular file, is there, or it lies beyond the
+   * storage's root.
+   */
+  readLocalFile?(location: string): Promise<Uint8Array | undefined>;
+
+  /**
    * The repository directory of the submodule at `path`, in this worktree's FilesApi: its
    * `.git` directory, or the place its gitfile names (resolved as git resolves it, whether a
    * repository is there or not). Null when the gitfile names a place this FilesApi cannot

@@ -16,13 +16,13 @@
 
 import type { BundleHeader, BundleRef } from "./bundle-format.js";
 import { listBundleRefs } from "./bundle-format.js";
+import { BundleCommandBase } from "./bundle-support.js";
 import {
   type BundleCommandResult,
-  BundleCommandBase,
   type BundleInput,
   bundleBytes,
   openBundle,
-} from "./bundle-support.js";
+} from "./bundle-verify.js";
 
 /** What a bundle command read. */
 export interface BundleReadResult extends BundleCommandResult {

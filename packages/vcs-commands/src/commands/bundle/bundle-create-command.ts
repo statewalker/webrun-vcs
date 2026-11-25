@@ -16,8 +16,8 @@
 
 import {
   historyWithoutLazyFetch,
-  type ObjectId,
   ObjectFilterError,
+  type ObjectId,
   parseObjectFilter,
 } from "@statewalker/vcs-core";
 import { createRepositoryFacade } from "@statewalker/vcs-transport";
@@ -34,7 +34,7 @@ import {
   type BundleRef,
   encodeBundleHeader,
 } from "./bundle-format.js";
-import type { BundleCommandResult } from "./bundle-support.js";
+import type { BundleCommandResult } from "./bundle-verify.js";
 
 /** What {@link BundleCreateCommand} made. */
 export interface BundleCreateResult extends BundleCommandResult {
@@ -137,11 +137,21 @@ export class BundleCreateCommand extends GitCommand<BundleCreateResult> {
         revisions.push(arg);
         continue;
       }
-      let m: RegExpExecArray | null;
+      /** The groups of the last pattern {@link take} matched */
+      let m: string[] = [];
+      const take = (re: RegExp): boolean => {
+        const found = re.exec(arg);
+        m = found ? [...found] : [];
+        return found !== null;
+      };
       if (arg === "--end-of-options") {
         endOfOptions = true;
         revisions.push(arg);
-      } else if (arg === "--not" || arg === "--all" || /^--(branches|tags|remotes)(=|$)/.test(arg)) {
+      } else if (
+        arg === "--not" ||
+        arg === "--all" ||
+        /^--(branches|tags|remotes)(=|$)/.test(arg)
+      ) {
         revisions.push(arg);
       } else if (/^--(glob|exclude)=/.test(arg)) {
         revisions.push(arg);
@@ -152,31 +162,30 @@ export class BundleCreateCommand extends GitCommand<BundleCreateResult> {
         revisions.push({ stdin: this.stdin ?? "" });
       } else if (arg === "--ignore-missing") {
         ignoreMissing = true;
-      } else if ((m = /^--max-count=(.*)$/s.exec(arg))) {
+      } else if (take(/^--max-count=(.*)$/s)) {
         maxCount(m[1] as string);
       } else if (arg === "--max-count" || arg === "-n") {
         maxCount(takeValue(i, "max-count"));
         i++;
-      } else if ((m = /^-n(\d+)$/.exec(arg)) || (m = /^-(\d+)$/.exec(arg))) {
+      } else if (take(/^-n(\d+)$/) || take(/^-(\d+)$/)) {
         maxCount(m[1] as string);
-      } else if ((m = /^--(since|after|until|before)=(.*)$/s.exec(arg))) {
+      } else if (take(/^--(since|after|until|before)=(.*)$/s)) {
         if (m[1] === "since" || m[1] === "after") sinceTime = date(m[2] as string);
         else untilTime = date(m[2] as string);
-      } else if ((m = /^--(since|after|until|before)$/.exec(arg))) {
+      } else if (take(/^--(since|after|until|before)$/)) {
         const value = takeValue(i, m[1] as string);
         i++;
         if (m[1] === "since" || m[1] === "after") sinceTime = date(value);
         else untilTime = date(value);
-      } else if ((m = /^--max-age=(\d+)$/.exec(arg))) {
+      } else if (take(/^--max-age=(\d+)$/)) {
         sinceTime = Number(m[1]);
-      } else if ((m = /^--min-age=(\d+)$/.exec(arg))) {
+      } else if (take(/^--min-age=(\d+)$/)) {
         untilTime = Number(m[1]);
-      } else if ((m = /^--filter=(.*)$/s.exec(arg))) {
+      } else if (take(/^--filter=(.*)$/s)) {
         try {
           const parsed = parseObjectFilter(m[1] as string);
           // expand_list_objects_filter_spec: a blob limit in bytes
-          filter =
-            parsed.choice === "blob:limit" ? `blob:limit=${parsed.limit}` : (m[1] as string);
+          filter = parsed.choice === "blob:limit" ? `blob:limit=${parsed.limit}` : (m[1] as string);
         } catch (error) {
           if (error instanceof ObjectFilterError) {
             throw new GitApiError(`fatal: ${error.message}`, { exitCode: 128 });
@@ -201,7 +210,6 @@ export class BundleCreateCommand extends GitCommand<BundleCreateResult> {
     }
     if (sinceTime !== undefined) revList.setSince(sinceTime);
     if (untilTime !== undefined) revList.setUntil(untilTime);
-
 
     // setup_revisions: the pending objects in order, with the names they were given
     for (const revision of revisions) {

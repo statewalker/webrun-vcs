@@ -7,3 +7,5 @@ export * from "./bundle-create-command.js";
 export * from "./bundle-format.js";
 export * from "./bundle-read-commands.js";
 export * from "./bundle-support.js";
+export * from "./bundle-transport.js";
+export * from "./bundle-verify.js";
