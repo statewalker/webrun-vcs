@@ -1,4 +1,4 @@
-import { inflateSync, deflateSync as zlibDeflateSync } from "node:zlib";
+import { gunzipSync, inflateRawSync, inflateSync, deflateSync as zlibDeflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import {
   deflateSync,
@@ -64,5 +64,23 @@ describe("deflateSync", () => {
     // zlib's header for level 1: 0x78 0x01
     const out = deflateSync([enc.encode("blob 0\0")], { level: LOOSE_OBJECT_COMPRESSION_LEVEL });
     expect([out[0], out[1]]).toEqual([0x78, 0x01]);
+  });
+  it("writes raw deflate data and gzip members (zip entries, git archive's tgz)", () => {
+    const data = enc.encode("archive member\n".repeat(200));
+    const raw = deflateSync([data], { format: "raw" });
+    expect(Buffer.from(inflateRawSync(raw)).equals(Buffer.from(data))).toBe(true);
+    // pooled per format: a zlib stream after a raw one keeps its header
+    expect([deflateSync([data])[0]]).toEqual([0x78]);
+    const gz = deflateSync([data], { format: "gzip", level: 9 });
+    // zlib's default header: no flags, time 0, XFL 2 for level 9, OS 3 (Unix)
+    expect(Buffer.from(gz.subarray(0, 10)).toString("hex")).toBe("1f8b0800000000000203");
+    expect(Buffer.from(gunzipSync(gz)).equals(Buffer.from(data))).toBe(true);
+    // incompressible input still fits the output buffer
+    const random = noise(70000, 7);
+    expect(
+      Buffer.from(gunzipSync(deflateSync([random], { format: "gzip" }))).equals(
+        Buffer.from(random),
+      ),
+    ).toBe(true);
   });
 });
