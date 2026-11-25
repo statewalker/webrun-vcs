@@ -40,7 +40,7 @@ import {
   type ObjectId,
   type Ref,
 } from "@statewalker/vcs-core";
-import { type ConflictStyle, parseGitBool } from "@statewalker/vcs-utils";
+import { type ConflictStyle, parseGitBool, startProgress } from "@statewalker/vcs-utils";
 import { compareGitPaths } from "@statewalker/vcs-utils/encoding";
 import {
   attributesIndexOf,
@@ -1466,22 +1466,48 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
             reservedNames: worktree.capabilities?.reservedNames,
           })
         : undefined;
+      let unlink: readonly string[] = [];
       if (sparse && !keepAll) {
         // apply_sparse_checkout before check_updates: the files leaving the checkout
-        const unlink = await sparse.leaving(
+        unlink = await sparse.leaving(
           worktree,
           (p) => (this.force || switching.has(p) ? target.get(p) : index.get(p)),
           { reset: this.force, trust },
         );
-        await sparse.unlink(worktree, unlink);
       }
-      for (const path of switched) {
-        if (target.has(path) || quiet(path)) continue;
+      // in a sparse checkout, only the paths in its patterns are written
+      const only = plan && {
+        ...plan,
+        entries: plan.entries.filter((e) => switching.has(e.path) && writes(e.path)),
+        gitlinks: plan.gitlinks.filter((e) => switching.has(e.path) && writes(e.path)),
+      };
+      const removing = switched.filter((path) => !target.has(path) && !quiet(path));
+      // a forced checkout also drops tracked files no tree holds any more
+      const dropping = this.force
+        ? [...index.keys()].filter(
+            (path) => !target.has(path) && !switching.has(path) && !quiet(path),
+          )
+        : [];
+      // check_updates' "Updating files": every file removed or written is one unit
+      const progress = startProgress(
+        this.progress,
+        "Updating files",
+        unlink.length +
+          removing.length +
+          dropping.length +
+          (only ? only.entries.length + only.gitlinks.length : 0),
+      );
+      if (unlink.length > 0) {
+        await sparse?.unlink(worktree, unlink);
+        progress.update(unlink.length);
+      }
+      for (const path of removing) {
         const old = index.get(path);
         if (subs && old?.mode === FileMode.GITLINK) await subs.unlink(worktree, path, old);
         else await worktree.remove(path);
         await pruneEmptyParents(worktree, path);
         removed.push(path);
+        progress.tick();
       }
       // core.ignorecase: what verify_clean_subdirectory took as tracked in a directory a
       // file replaces goes with the directory, as git's checkout_entry removes the subtree
@@ -1489,16 +1515,12 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
         await worktree.remove(path);
         await pruneEmptyParents(worktree, path);
       }
-      // a forced checkout also drops tracked files no tree holds any more
-      if (this.force) {
-        for (const path of index.keys()) {
-          if (!target.has(path) && !switching.has(path) && !quiet(path)) {
-            const old = index.get(path);
-            if (subs && old?.mode === FileMode.GITLINK) await subs.unlink(worktree, path, old);
-            else await worktree.remove(path);
-            removed.push(path);
-          }
-        }
+      for (const path of dropping) {
+        const old = index.get(path);
+        if (subs && old?.mode === FileMode.GITLINK) await subs.unlink(worktree, path, old);
+        else await worktree.remove(path);
+        removed.push(path);
+        progress.tick();
       }
       // a file replacing a submodule: its directory goes (checkout_entry's remove_subtree)
       if (subs) {
@@ -1510,12 +1532,6 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           }
         }
       }
-      // in a sparse checkout, only the paths in its patterns are written
-      const only = plan && {
-        ...plan,
-        entries: plan.entries.filter((e) => switching.has(e.path) && writes(e.path)),
-        gitlinks: plan.gitlinks.filter((e) => switching.has(e.path) && writes(e.path)),
-      };
       // the attributes of the index the switch leaves (git's o->result): the target's
       // entries for the switched paths, the index's own for every other
       const result = new Map<string, ObjectId>();
@@ -1535,6 +1551,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           // a forced checkout overwrites untracked files, as git's checkout -f
           ...(this.force && !this.protectUntracked ? { discardUntracked: true } : {}),
           attributes: { direction: "checkout", index: attributesIndexOf(result) },
+          progress,
         });
         updated.push(...only.entries.map((e) => e.path));
         for (const e of [...only.entries, ...only.gitlinks]) written.add(e.path);
@@ -1544,6 +1561,7 @@ export class CheckoutCommand extends GitCommand<CheckoutResult> {
           for (const e of only.gitlinks) await subs.checkout(worktree, e.path, e);
         }
       }
+      progress.stop();
     }
 
     // The index (written with the worktree, as git's merge_working_tree, before any ref

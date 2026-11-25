@@ -960,6 +960,8 @@ export class FetchCommand extends TransportCommand<FetchResult> {
       ...(compatibility !== "2.43" ? { batchNonAtomic: true } : {}),
       dryRun: this.dryRun,
       onProgress: this.progressMessageCallback,
+      // index-pack's "Receiving objects" and "Resolving deltas"
+      ...(this.progress ? { progress: this.progress } : {}),
       // git's "fetch <args>: <what>" per ref; the action from the options, the remote and
       // the refspecs given (git's argv)
       reflogAction: this.reflogAction(

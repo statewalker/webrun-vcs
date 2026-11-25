@@ -17,6 +17,8 @@
  * Per-entry state lives in typed arrays (about 80 bytes an entry), so 200 000 objects fit in a
  * Durable Object. Any failure removes every temporary.
  */
+
+import { type ProgressMonitor, type ProgressTask, startProgress } from "@statewalker/vcs-utils";
 import {
   CompressionError,
   compressBlockPako,
@@ -102,6 +104,17 @@ export interface InstallPackOptions {
    * trailer, the width of REF_DELTA bases, of the idx's ids and of its checksums.
    */
   objectFormat?: ObjectFormat;
+  /**
+   * index-pack's progress (`-v`): `progressTitle` over the pack's entries as they are parsed,
+   * then "Resolving deltas" over its deltas (shown only when it has some). A monitor that
+   * throws stops the install, leaving nothing behind (as git's index-pack dying).
+   */
+  progress?: ProgressMonitor;
+  /**
+   * The first phase's title: "Receiving objects" (the default, git's `--stdin`), "Indexing
+   * objects" (a pack file), or a caller's (`--progress-title`).
+   */
+  progressTitle?: string;
 }
 
 /** See `InstallPackOptions.onContent` (and `UnpackObjectsOptions.onContent`). */
@@ -451,12 +464,13 @@ async function parse(
   stash: DeltaStash,
   format: ObjectFormat,
   onContent?: ObjectContentCallback,
+  progress?: { monitor?: ProgressMonitor; title: string },
 ) {
   if (packLen < 12 + format.rawLength) throw new PackError("pack too short");
   const pool = createInflaterPool();
   const r = new SequentialReader(files.read(path), packLen - format.rawLength, format);
   try {
-    return await parseWith(r, pool, packLen, maxObjectSize, stash, format, onContent);
+    return await parseWith(r, pool, packLen, maxObjectSize, stash, format, onContent, progress);
   } finally {
     await r.close();
   }
@@ -470,6 +484,7 @@ async function parseWith(
   stash: DeltaStash,
   format: ObjectFormat,
   onContent?: ObjectContentCallback,
+  progress?: { monitor?: ProgressMonitor; title: string },
 ) {
   const raw = format.rawLength;
   const head = await r.bytes(12);
@@ -489,6 +504,7 @@ async function parseWith(
   // a header can claim up to (size - 32) / 9 entries, and only parsed entries earn memory.
   const t = new Entries(Math.min(count, 4096), format);
   const scratch = new Scratch();
+  const parsing = startProgress(progress?.monitor, progress?.title ?? "", count);
   for (let i = 0; i < count; i++) {
     if (i === t.cap) {
       // grow towards the count the bytes parsed so far predict (average entry size, +6%), but
@@ -593,7 +609,9 @@ async function parseWith(
         onContent(t.idOf(i), typeName as ObjectTypeString, content);
       }
     }
+    parsing.update(i + 1);
   }
+  parsing.stop();
   t.n = count;
   if (r.pos !== packLen - raw) {
     throw new PackError(
@@ -779,6 +797,8 @@ class Resolver {
       maxObjectSize: number;
       baseCacheBytes: number;
       onContent?: ObjectContentCallback;
+      /** "Resolving deltas": one unit per delta resolved */
+      resolving?: ProgressTask;
     },
   ) {
     const n = t.n;
@@ -966,6 +986,7 @@ class Resolver {
       t.type[child] = type;
       t.base[child] = this.sI[d] as number;
       t.oid.set(objectId(TYPE_NAMES[type] as ObjectTypeString, result, t.format), child * t.raw);
+      this.opts.resolving?.tick();
       if (this.opts.onContent && TYPE_NAMES[type] !== "blob") {
         this.opts.onContent(t.idOf(child), TYPE_NAMES[type] as ObjectTypeString, result);
       }
@@ -1324,8 +1345,17 @@ export async function installPack(
       stash,
       format,
       options.onContent,
+      { monitor: options.progress, title: options.progressTitle ?? "Receiving objects" },
     );
     const t = parsed.t;
+    // threaded_second_pass: "Resolving deltas" over the pack's deltas
+    let deltas = 0;
+    for (let i = 0; i < t.n; i++) if (t.kind[i] === OFS_DELTA || t.kind[i] === REF_DELTA) deltas++;
+    const resolving = startProgress(
+      deltas > 0 ? options.progress : undefined,
+      "Resolving deltas",
+      deltas,
+    );
     const received = t.n;
     const dataEnd = packLen - format.rawLength;
     appended = new AppendedStore(files, `${dir}/tmp_thin_${id}_`, dataEnd);
@@ -1345,6 +1375,7 @@ export async function installPack(
         maxObjectSize,
         baseCacheBytes,
         ...(options.onContent ? { onContent: options.onContent } : {}),
+        resolving,
       },
     );
     for (let i = 0; i < received; i++)
@@ -1352,6 +1383,7 @@ export async function installPack(
         await resolver.resolveFrom(i);
     if (options.externalBase)
       await completeThin(t, resolver, options.externalBase, store, maxObjectSize);
+    resolving.stop();
     store.release();
     win.release();
     stash.release();

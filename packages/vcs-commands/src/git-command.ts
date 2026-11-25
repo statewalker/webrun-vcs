@@ -33,7 +33,12 @@ import {
   objectFormatOf,
   overlayMethods,
 } from "@statewalker/vcs-core";
-import { type ObjectFormat, OrderedMap, parseGitBool } from "@statewalker/vcs-utils";
+import {
+  type ObjectFormat,
+  OrderedMap,
+  type ProgressMonitor,
+  parseGitBool,
+} from "@statewalker/vcs-utils";
 import {
   type AttributesSourceResolver,
   basicStatMatches,
@@ -520,6 +525,37 @@ export abstract class GitCommand<T> {
   getHookStdout(): string {
     return this.hookSession?.stdout ?? "";
   }
+
+  /**
+   * Reports the progress of the command's long local phases, as `--progress` makes git print
+   * them, with git's phase names and totals (JGit's `ProgressMonitor`): checkout and clone's
+   * checkout ("Updating files"), gc and repack ("Enumerating objects", "Counting objects",
+   * "Compressing objects", "Writing objects", "Removing duplicate objects"), a clone's or
+   * fetch's index-pack ("Receiving objects", "Resolving deltas") and fsck ("Checking object
+   * directories", "Checking objects", "Verifying reverse pack-indexes", "Checking
+   * connectivity"). Commands without such phases report nothing. One total differs from git's:
+   * "Compressing objects" counts our delta search's targets, which are not pack-objects'
+   * (`prepare_pack`); gc's commit-graph phases and cruft packs report nothing.
+   *
+   * A monitor that throws cancels the command: the error propagates out of `call()`, and the
+   * repository is left as git leaves the command interrupted there (no temporary pack, no
+   * index lock, refs and HEAD unchanged).
+   *
+   * @example
+   * ```typescript
+   * await git.checkout().setName("main").setProgress(({ phase, done, total }) => {
+   *   console.error(`${phase}: ${done}/${total}`);
+   * }).call();
+   * ```
+   */
+  setProgress(monitor: ProgressMonitor | undefined): this {
+    this.checkCallable();
+    this.progress = monitor;
+    return this;
+  }
+
+  /** The monitor given to {@link setProgress}. */
+  protected progress?: ProgressMonitor;
 
   /**
    * The action named in the reflog lines this command writes, in place of its own (git's

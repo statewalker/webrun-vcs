@@ -206,6 +206,7 @@ export class DefaultSerializationApi implements SerializationApi {
       quarantine: options.quarantine,
       ...(options.onObject ? { onObject: options.onObject } : {}),
       ...(options.onContent ? { onContent: options.onContent } : {}),
+      ...(options.progress ? { progress: options.progress } : {}),
     });
     return {
       objectsImported: r.count,
