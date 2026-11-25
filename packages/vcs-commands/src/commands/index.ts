@@ -90,6 +90,7 @@ export {
   combineNotesOverwrite,
   NotesTree,
 } from "./notes-tree.js";
+export * from "./object-store/index.js";
 export * from "./pack-refs-command.js";
 export * from "./plumbing-command.js";
 export * from "./pretty-format.js";
