@@ -2295,8 +2295,7 @@ export class CommitCommand extends GitCommand<CommitResult> {
     this.setCallable(false);
 
     // the commit ends what was in progress (git's sequencer_post_commit_cleanup and the
-    // state files cmd_commit unlinks), then the new index (commit_index_files), then applies
-    // a merge's autostash
+    // state files cmd_commit unlinks), then the new index (commit_index_files)
     await this.cleanupAfterCommit(state, info.commitIndex);
 
     // repo_rerere: the resolutions of the paths MERGE_RR lists recorded
@@ -2321,6 +2320,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
         });
       }
     }
+
+    // apply_autostash_ref(MERGE_AUTOSTASH) comes last in cmd_commit: after rerere recorded
+    // the resolutions and after the post-commit and post-rewrite hooks, which all see the
+    // committed files without the stashed changes
+    await this.applyMergeAutostash(state);
 
     // Return commit with its ID (like JGit's RevCommit)
     return { ...commit, id: commitId, ...(rerereOutput.length > 0 ? { rerereOutput } : {}) };
@@ -2455,7 +2459,8 @@ export class CommitCommand extends GitCommand<CommitResult> {
   /**
    * After the commit: the merge state removed (MERGE_HEAD, MERGE_MSG, MERGE_MODE,
    * SQUASH_MSG, AUTO_MERGE), a stopped cherry-pick or revert ended (its sequencer state
-   * too once it was the last pick), and MERGE_AUTOSTASH applied back, as `git commit`.
+   * too once it was the last pick), as `git commit`; MERGE_AUTOSTASH is applied later
+   * (`applyMergeAutostash`).
    */
   private async cleanupAfterCommit(
     state: OperationState,
@@ -2481,6 +2486,11 @@ export class CommitCommand extends GitCommand<CommitResult> {
       if (left.length <= 1) await state.remove("sequencer");
     }
     await commitIndex?.();
+  }
+
+  /** MERGE_AUTOSTASH applied back and removed (git's `apply_autostash_ref`). */
+  private async applyMergeAutostash(state: OperationState): Promise<void> {
+    if (!state.supported) return;
     const autostash = (await state.read("MERGE_AUTOSTASH"))?.trim();
     if (autostash) {
       await state.remove("MERGE_AUTOSTASH");
